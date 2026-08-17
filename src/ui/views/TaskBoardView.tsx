@@ -40,24 +40,12 @@ export const TaskBoardView: React.FC = () => {
       .map((c) => c.trim())
       .filter((c) => c.length > 0);
 
-    const taskId = `TSK-${Math.floor(100 + Math.random() * 900)}`;
-
     await createTask({
-      id: taskId,
       title: newTitle,
       description: newDesc,
-      state: 'PLANNED',
-      paused_from_state: null,
       priority: newPriority,
       risk: newRisk,
-      assigned_agent_id: null,
-      revision_count: 0,
-      max_revisions: 3,
-      base_sha: null,
-      current_sha: null,
-      progress_cache_percent: 10,
-      progress_computed_at: new Date().toISOString(),
-      acceptance_criteria: criteriaList,
+      acceptanceCriteria: criteriaList,
       constraints: [],
     });
 

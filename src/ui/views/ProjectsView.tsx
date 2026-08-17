@@ -1,23 +1,53 @@
 import React, { useState } from 'react';
 import { useOrchestrator } from '../context/OrchestratorContext';
-import { FolderGit2, Plus, FileCode, Check } from 'lucide-react';
+import { FolderGit2, Plus, FileCode, FolderOpen } from 'lucide-react';
 
 export const ProjectsView: React.FC = () => {
   const { projects, activeProject, createProject, importContract } = useOrchestrator();
   const [isCreateOpen, setIsCreateOpen] = useState<boolean>(false);
   const [name, setName] = useState<string>('');
   const [desc, setDesc] = useState<string>('');
-  const [repoPath, setRepoPath] = useState<string>('d:\\Projects\\Agent-Forge');
+  const [selectionId, setSelectionId] = useState<string>('');
+  const [displayPath, setDisplayPath] = useState<string>('');
   const [contractJson, setContractJson] = useState<string>('');
   const [importStatus, setImportStatus] = useState<string | null>(null);
+  const [errorStatus, setErrorStatus] = useState<string | null>(null);
+
+  const handleSelectDirectory = async () => {
+    setErrorStatus(null);
+    try {
+      if ((window as any).orchestrator?.selectRepositoryDirectory) {
+        const res = await (window as any).orchestrator.selectRepositoryDirectory();
+        if (res.success && res.selectionId) {
+          setSelectionId(res.selectionId);
+          setDisplayPath(res.displayPath || '');
+        } else if (res.error) {
+          setErrorStatus(res.error);
+        }
+      }
+    } catch (err: any) {
+      setErrorStatus(`Dialog error: ${err.message}`);
+    }
+  };
 
   const handleCreate = async (e: React.FormEvent) => {
     e.preventDefault();
-    if (!name.trim() || !repoPath.trim()) return;
-    await createProject({ name, description: desc, repositoryPath: repoPath });
-    setName('');
-    setDesc('');
-    setIsCreateOpen(false);
+    if (!name.trim() || !selectionId.trim()) return;
+    setErrorStatus(null);
+    try {
+      await createProject({
+        name: name.trim(),
+        description: desc.trim(),
+        repositorySelectionId: selectionId,
+      });
+      setName('');
+      setDesc('');
+      setSelectionId('');
+      setDisplayPath('');
+      setIsCreateOpen(false);
+    } catch (err: any) {
+      setErrorStatus(`Creation failed: ${err.message}`);
+    }
   };
 
   const handleImportContract = async () => {
@@ -45,7 +75,10 @@ export const ProjectsView: React.FC = () => {
         </div>
 
         <button
-          onClick={() => setIsCreateOpen(true)}
+          onClick={() => {
+            setIsCreateOpen(true);
+            setErrorStatus(null);
+          }}
           className="px-4 py-2 bg-forge-cyan hover:bg-cyan-600 text-slate-950 font-mono font-bold text-xs rounded-lg shadow flex items-center space-x-2 transition"
         >
           <Plus className="w-4 h-4" />
@@ -120,15 +153,37 @@ export const ProjectsView: React.FC = () => {
               </div>
 
               <div>
-                <label className="block text-slate-400 mb-1">Repository Path (Absolute):</label>
-                <input
-                  type="text"
-                  required
-                  value={repoPath}
-                  onChange={(e) => setRepoPath(e.target.value)}
-                  className="w-full bg-surface-card border border-surface-border rounded-lg px-3 py-2 text-white focus:outline-none focus:border-forge-cyan"
-                />
+                <label className="block text-slate-400 mb-1">Git Repository:</label>
+                <div className="space-y-2">
+                  <div className="flex items-center space-x-2">
+                    <button
+                      type="button"
+                      onClick={handleSelectDirectory}
+                      className="px-3 py-2 bg-surface-border hover:bg-slate-700 text-slate-200 rounded-lg flex items-center space-x-1.5 transition font-semibold"
+                    >
+                      <FolderOpen className="w-3.5 h-3.5 text-forge-cyan" />
+                      <span>Choose Repository...</span>
+                    </button>
+                    <span className="text-[10px] text-slate-400 font-mono">
+                      {selectionId ? '✓ Token Verified' : 'Select Git Root'}
+                    </span>
+                  </div>
+
+                  <input
+                    type="text"
+                    readOnly
+                    value={displayPath}
+                    placeholder="No repository selected (click Choose Repository)"
+                    className="w-full bg-surface-card/60 border border-surface-border text-slate-300 rounded-lg px-3 py-2 text-xs font-mono cursor-not-allowed focus:outline-none"
+                  />
+                </div>
               </div>
+
+              {errorStatus && (
+                <div className="p-2.5 bg-rose-950/40 border border-rose-800/50 text-rose-300 rounded-lg text-xs font-mono">
+                  {errorStatus}
+                </div>
+              )}
 
               <div className="flex justify-end space-x-3 pt-3 border-t border-surface-border">
                 <button
@@ -140,7 +195,8 @@ export const ProjectsView: React.FC = () => {
                 </button>
                 <button
                   type="submit"
-                  className="px-5 py-2 bg-forge-cyan hover:bg-cyan-600 text-slate-950 font-bold rounded-lg text-xs shadow"
+                  disabled={!selectionId}
+                  className="px-5 py-2 bg-forge-cyan hover:bg-cyan-600 disabled:opacity-40 disabled:cursor-not-allowed text-slate-950 font-bold rounded-lg text-xs shadow"
                 >
                   Initialize Project
                 </button>

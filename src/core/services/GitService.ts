@@ -154,7 +154,7 @@ export class GitService {
       };
     }
 
-    const args = baseSha ? ['diff', baseSha] : ['diff', 'HEAD'];
+    const args = baseSha ? ['diff', baseSha] : ['diff'];
 
     // 1. Get raw diff
     const diffRes = await ProcessRunner.execute({

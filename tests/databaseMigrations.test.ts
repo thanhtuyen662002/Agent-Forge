@@ -14,7 +14,7 @@ describe('Database Migrations & Upgrade Integrity', () => {
     db.close();
   });
 
-  it('should run initial migrations cleanly and create all tables', () => {
+  it('should run all migrations cleanly and create all tables', () => {
     MigrationRunner.run(db);
 
     const tables = db
@@ -34,10 +34,10 @@ describe('Database Migrations & Upgrade Integrity', () => {
     expect(tableNames).toContain('schema_migrations');
 
     const applied = db.prepare('SELECT COUNT(*) as count FROM schema_migrations').get() as { count: number };
-    expect(applied.count).toBe(2);
+    expect(applied.count).toBe(3);
   });
 
-  it('should cleanly upgrade an existing database from schema v1 to v2 while preserving data', () => {
+  it('should cleanly upgrade an existing database from schema v1 to v2 to v3 while preserving data', () => {
     // 1. Manually apply v1 schema
     db.exec(`
       CREATE TABLE IF NOT EXISTS schema_migrations (
@@ -54,13 +54,19 @@ describe('Database Migrations & Upgrade Integrity', () => {
       new Date().toISOString()
     );
 
-    // Insert sample project, task, and evidence in v1 schema
+    // Insert sample project, task, provider, and evidence in v1 schema
     db.exec(`
       INSERT INTO projects (id, name, repository_path, default_branch, status, created_at, updated_at)
       VALUES ('PROJ-MIG-1', 'Upgrade Test Project', 'd:/test', 'main', 'READY', '2026-08-17T00:00:00Z', '2026-08-17T00:00:00Z');
 
       INSERT INTO tasks (id, project_id, title, state, priority, risk, revision_count, max_revisions, progress_cache_percent, acceptance_criteria_json, constraints_json, created_at, updated_at)
       VALUES ('TSK-MIG-1', 'PROJ-MIG-1', 'Migrated Task', 'PLANNED', 'HIGH', 'MEDIUM', 0, 3, 0, '[]', '[]', '2026-08-17T00:00:00Z', '2026-08-17T00:00:00Z');
+
+      INSERT INTO providers (id, name, adapter_type, enabled, created_at)
+      VALUES ('prov-1', 'Manual Bridge', 'MANUAL_BRIDGE', 1, '2026-08-17T00:00:00Z');
+
+      INSERT INTO provider_resources (id, provider_id, model_name, health_status, capabilities_json, enabled, total_quota, remaining_quota, quota_unit, quota_reset_at, quota_source, quota_confidence, last_health_check)
+      VALUES ('res-1', 'prov-1', 'ChatGPT', 'AVAILABLE', '[]', 1, 100, 50, 'REQUESTS', NULL, 'MANUAL', 1.0, '2026-08-17T00:00:00Z');
 
       INSERT INTO evidence (id, project_id, task_id, evidence_type, storage_type, hash, byte_size, content_type, summary, raw_payload, created_at)
       VALUES ('EV-MIG-1', 'PROJ-MIG-1', 'TSK-MIG-1', 'GIT_STATUS', 'INLINE', 'sha123', 10, 'text/plain', 'Initial Evidence', 'clean', '2026-08-17T00:00:00Z');
@@ -70,15 +76,16 @@ describe('Database Migrations & Upgrade Integrity', () => {
     const v1Tables = (db.prepare("SELECT name FROM sqlite_master WHERE type='table'").all() as { name: string }[]).map((t) => t.name);
     expect(v1Tables).not.toContain('verification_commands');
 
-    // 2. Run MigrationRunner to upgrade to v2
+    // 2. Run MigrationRunner to upgrade to latest (v3)
     MigrationRunner.run(db);
 
-    // 3. Assert migration v2 applied
-    const v2Tables = (db.prepare("SELECT name FROM sqlite_master WHERE type='table'").all() as { name: string }[]).map((t) => t.name);
-    expect(v2Tables).toContain('verification_commands');
+    // 3. Assert migrations applied
+    const v3Tables = (db.prepare("SELECT name FROM sqlite_master WHERE type='table'").all() as { name: string }[]).map((t) => t.name);
+    expect(v3Tables).toContain('verification_commands');
+    expect(v3Tables).toContain('provider_resources');
 
     const migrationCount = (db.prepare('SELECT COUNT(*) as count FROM schema_migrations').get() as { count: number }).count;
-    expect(migrationCount).toBe(2);
+    expect(migrationCount).toBe(3);
 
     // 4. Assert pre-existing data survived unchanged
     const proj = db.prepare('SELECT * FROM projects WHERE id = ?').get('PROJ-MIG-1') as any;
@@ -87,12 +94,15 @@ describe('Database Migrations & Upgrade Integrity', () => {
     const task = db.prepare('SELECT * FROM tasks WHERE id = ?').get('TSK-MIG-1') as any;
     expect(task.title).toBe('Migrated Task');
 
+    const res = db.prepare('SELECT * FROM provider_resources WHERE id = ?').get('res-1') as any;
+    expect(res.model_name).toBe('ChatGPT');
+
     const ev = db.prepare('SELECT * FROM evidence WHERE id = ?').get('EV-MIG-1') as any;
     expect(ev.summary).toBe('Initial Evidence');
 
     // 5. Run MigrationRunner again and prove idempotency
     expect(() => MigrationRunner.run(db)).not.toThrow();
     const finalCount = (db.prepare('SELECT COUNT(*) as count FROM schema_migrations').get() as { count: number }).count;
-    expect(finalCount).toBe(2);
+    expect(finalCount).toBe(3);
   });
 });

@@ -10,11 +10,13 @@ import { PackageGenerator } from '../core/protocol/packageGenerator';
 import { defaultArtifactStore } from '../core/services/ArtifactStore';
 import { EmergencyStopService } from '../core/services/EmergencyStopService';
 import { PolicyService } from '../core/services/PolicyService';
+import { RepositorySelectionService } from '../core/services/RepositorySelectionService';
 import {
   CreateProjectIpcSchema,
   ImportContractIpcSchema,
   TransitionProjectIpcSchema,
   CreateTaskIpcSchema,
+  ParseProtocolIpcSchema,
   ApplyProtocolIpcSchema,
   GenerateWorkOrderIpcSchema,
   GenerateReviewPackageIpcSchema,
@@ -22,6 +24,8 @@ import {
   ProjectScopedIpcSchema,
   TaskScopedIpcSchema,
   RunVerificationIpcSchema,
+  EmergencyStopIpcSchema,
+  ResumeProjectIpcSchema,
 } from '../core/types/ipc';
 
 export function registerIpcHandlers(
@@ -61,7 +65,14 @@ export function registerIpcHandlers(
       };
     }
 
-    return { success: true, repositoryPath: selectedPath };
+    // Issue short-lived, single-use selection token
+    const token = RepositorySelectionService.issueToken(selectedPath);
+
+    return {
+      success: true,
+      selectionId: token.selectionId,
+      displayPath: token.displayPath,
+    };
   });
 
   // ==========================================
@@ -73,15 +84,21 @@ export function registerIpcHandlers(
       return { success: false, error: parsed.error.issues.map((i) => i.message).join(', ') };
     }
 
-    const repoPath = path.normalize(path.resolve(parsed.data.repositoryPath));
+    // Consume native selection token
+    const tokenRes = RepositorySelectionService.consumeToken(parsed.data.repositorySelectionId);
+    if (!tokenRes.success || !tokenRes.canonicalPath) {
+      return { success: false, error: tokenRes.error || 'Invalid repository selection token.' };
+    }
+
+    const canonicalRepoPath = tokenRes.canonicalPath;
 
     // Validate path security and Git repository validity
-    const policy = PolicyService.evaluatePathAccess(repoPath, repoPath, false);
+    const policy = PolicyService.evaluatePathAccess(canonicalRepoPath, canonicalRepoPath, false);
     if (!policy.allowed) {
       return { success: false, error: `Unauthorized repository path: ${policy.reason}` };
     }
 
-    const gitStatus = await GitService.getStatus(repoPath);
+    const gitStatus = await GitService.getStatus(canonicalRepoPath);
     if (gitStatus.status !== 'SUCCESS') {
       return {
         success: false,
@@ -89,7 +106,14 @@ export function registerIpcHandlers(
       };
     }
 
-    return projectService.createProject(parsed.data.name, parsed.data.description, repoPath);
+    const project = projectService.createProject(
+      parsed.data.name,
+      parsed.data.description,
+      canonicalRepoPath,
+      parsed.data.defaultBranch
+    );
+
+    return { success: true, project };
   });
 
   ipcMain.handle('project:get', async (_, payload: unknown) => {
@@ -126,7 +150,12 @@ export function registerIpcHandlers(
     if (!parsed.success) {
       return { success: false, error: parsed.error.issues.map((i) => i.message).join(', ') };
     }
-    return repo.createTask(parsed.data as any);
+    try {
+      const task = taskService.createTask(parsed.data);
+      return { success: true, task };
+    } catch (err: any) {
+      return { success: false, error: err.message };
+    }
   });
 
   ipcMain.handle('task:get', async (_, payload: unknown) => {
@@ -152,8 +181,12 @@ export function registerIpcHandlers(
   // ==========================================
   // Protocols & Package Generation
   // ==========================================
-  ipcMain.handle('protocol:parse', async (_, rawInput: string) => {
-    return ProtocolParser.parse(rawInput);
+  ipcMain.handle('protocol:parse', async (_, payload: unknown) => {
+    const parsed = ParseProtocolIpcSchema.safeParse(payload);
+    if (!parsed.success) {
+      return { success: false, error: parsed.error.issues.map((i) => i.message).join(', ') };
+    }
+    return ProtocolParser.parse(parsed.data.rawInput);
   });
 
   ipcMain.handle('protocol:apply', async (_, payload: unknown) => {
@@ -188,6 +221,14 @@ export function registerIpcHandlers(
       return { success: false, error: 'Project or Task not found.' };
     }
 
+    // Cross-project guard
+    if (task.project_id !== project.id) {
+      return {
+        success: false,
+        error: `Cross-project guard: Task "${task.id}" belongs to project "${task.project_id}", not "${project.id}".`,
+      };
+    }
+
     const workOrder = PackageGenerator.generateWorkOrder(project, task);
     return { success: true, workOrder };
   });
@@ -204,9 +245,17 @@ export function registerIpcHandlers(
       return { success: false, error: 'Project or Task not found.' };
     }
 
+    // Cross-project guard
+    if (task.project_id !== project.id) {
+      return {
+        success: false,
+        error: `Cross-project guard: Task "${task.id}" belongs to project "${task.project_id}", not "${project.id}".`,
+      };
+    }
+
     // Atomically advance task to REVIEWING if in REVIEW_READY
     if (task.state === 'REVIEW_READY') {
-      const reviewStartRes = taskService.startReview(task.id);
+      const reviewStartRes = taskService.startReview(task.id, project.id);
       if (reviewStartRes.success && reviewStartRes.task) {
         task = reviewStartRes.task;
       }
@@ -257,7 +306,8 @@ export function registerIpcHandlers(
       diffStat,
       diffContent,
       latestTestRun,
-      reviews
+      reviews,
+      gitDiffEv
     );
 
     return { success: true, reviewPackage };
@@ -269,12 +319,30 @@ export function registerIpcHandlers(
   ipcMain.handle('git:getStatus', async (_, payload: unknown) => {
     const parsed = ProjectScopedIpcSchema.safeParse(payload);
     if (!parsed.success) {
-      return { status: 'ERROR', branch: 'UNKNOWN', isClean: false, modifiedFiles: [], untrackedFiles: [], aheadCount: 0, behindCount: 0, errorMessage: 'Invalid project ID' };
+      return {
+        status: 'ERROR',
+        branch: 'UNKNOWN',
+        isClean: false,
+        modifiedFiles: [],
+        untrackedFiles: [],
+        aheadCount: 0,
+        behindCount: 0,
+        errorMessage: 'Invalid project ID',
+      };
     }
 
     const project = repo.getProject(parsed.data.projectId);
     if (!project) {
-      return { status: 'ERROR', branch: 'UNKNOWN', isClean: false, modifiedFiles: [], untrackedFiles: [], aheadCount: 0, behindCount: 0, errorMessage: 'Project not found' };
+      return {
+        status: 'ERROR',
+        branch: 'UNKNOWN',
+        isClean: false,
+        modifiedFiles: [],
+        untrackedFiles: [],
+        aheadCount: 0,
+        behindCount: 0,
+        errorMessage: 'Project not found',
+      };
     }
 
     return GitService.getStatus(project.repository_path);
@@ -283,17 +351,41 @@ export function registerIpcHandlers(
   ipcMain.handle('git:getDiff', async (_, payload: unknown) => {
     const parsed = TaskScopedIpcSchema.safeParse(payload);
     if (!parsed.success) {
-      return { status: 'ERROR', diffStat: '', diffContent: '', filesChanged: [], insertions: 0, deletions: 0, errorMessage: 'Invalid task ID' };
+      return {
+        status: 'ERROR',
+        diffStat: '',
+        diffContent: '',
+        filesChanged: [],
+        insertions: 0,
+        deletions: 0,
+        errorMessage: 'Invalid task ID',
+      };
     }
 
     const task = repo.getTask(parsed.data.taskId);
     if (!task) {
-      return { status: 'ERROR', diffStat: '', diffContent: '', filesChanged: [], insertions: 0, deletions: 0, errorMessage: 'Task not found' };
+      return {
+        status: 'ERROR',
+        diffStat: '',
+        diffContent: '',
+        filesChanged: [],
+        insertions: 0,
+        deletions: 0,
+        errorMessage: 'Task not found',
+      };
     }
 
     const project = repo.getProject(task.project_id);
     if (!project) {
-      return { status: 'ERROR', diffStat: '', diffContent: '', filesChanged: [], insertions: 0, deletions: 0, errorMessage: 'Project not found' };
+      return {
+        status: 'ERROR',
+        diffStat: '',
+        diffContent: '',
+        filesChanged: [],
+        insertions: 0,
+        deletions: 0,
+        errorMessage: 'Project not found',
+      };
     }
 
     return GitService.getDiff(project.repository_path, task.base_sha);
@@ -353,11 +445,17 @@ export function registerIpcHandlers(
   // ==========================================
   // Emergency Controls
   // ==========================================
-  ipcMain.handle('control:emergencyStop', async (_, reason?: string) => {
+  ipcMain.handle('control:emergencyStop', async (_, payload: unknown) => {
+    const parsed = EmergencyStopIpcSchema.safeParse(payload || {});
+    const reason = parsed.success ? parsed.data.reason : 'Manual Owner Emergency Stop';
     return emergencyStopService.triggerEmergencyStop(reason);
   });
 
-  ipcMain.handle('control:resume', async (_, projectId: string) => {
-    return emergencyStopService.resumeProject(projectId);
+  ipcMain.handle('control:resume', async (_, payload: unknown) => {
+    const parsed = ResumeProjectIpcSchema.safeParse(payload);
+    if (!parsed.success) {
+      return false;
+    }
+    return emergencyStopService.resumeProject(parsed.data.projectId);
   });
 }

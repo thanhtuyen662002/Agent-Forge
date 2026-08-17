@@ -9,6 +9,19 @@ import { TaskStateMachine, TaskTrigger } from '../state/taskStateMachine';
 import { ManagerProtocol, CoderProtocol } from '../types/protocols';
 import { Task, TestRun, GitStatusSummary, GitDiffSummary } from '../types/domain';
 
+export interface TaskCreationSpec {
+  projectId: string;
+  id?: string;
+  milestoneId?: string | null;
+  title: string;
+  description?: string | null;
+  priority?: 'LOW' | 'MEDIUM' | 'HIGH' | 'CRITICAL';
+  risk?: 'LOW' | 'MEDIUM' | 'HIGH' | 'CRITICAL';
+  acceptanceCriteria?: string[];
+  constraints?: string[];
+  baseSha?: string | null;
+}
+
 export interface ApplyProtocolResult {
   success: boolean;
   isDuplicate?: boolean;
@@ -34,6 +47,50 @@ export class TaskService {
     private verificationService?: VerificationService,
     private artifactStore?: ArtifactStore
   ) {}
+
+  public createTask(spec: TaskCreationSpec): Task {
+    const project = this.repo.getProject(spec.projectId);
+    if (!project) {
+      throw new Error(`Project "${spec.projectId}" not found.`);
+    }
+
+    const now = new Date().toISOString();
+    const taskId = spec.id || `TSK-${crypto.randomUUID().substring(0, 8).toUpperCase()}`;
+
+    const task: Task = {
+      id: taskId,
+      project_id: spec.projectId,
+      milestone_id: spec.milestoneId ?? null,
+      title: spec.title,
+      description: spec.description ?? null,
+      state: 'PLANNED',
+      paused_from_state: null,
+      priority: spec.priority ?? 'MEDIUM',
+      risk: spec.risk ?? 'MEDIUM',
+      assigned_agent_id: null,
+      revision_count: 0,
+      max_revisions: 3,
+      base_sha: spec.baseSha !== undefined ? spec.baseSha : (project.default_branch || null),
+      current_sha: null,
+      progress_cache_percent: 0,
+      progress_computed_at: now,
+      acceptance_criteria: spec.acceptanceCriteria ?? [],
+      constraints: spec.constraints ?? [],
+      created_at: now,
+      updated_at: now,
+    };
+
+    this.repo.createTask(task);
+    this.eventService.record(
+      project.id,
+      'TASK_CREATED',
+      `Task "${task.title}" (${task.id}) created in PLANNED state.`,
+      { taskId: task.id, priority: task.priority, risk: task.risk },
+      task.id
+    );
+
+    return task;
+  }
 
   public applyManagerDecision(
     managerMsg: ManagerProtocol,
@@ -323,9 +380,22 @@ export class TaskService {
       return { success: false, error: reason };
     }
 
-    let trigger: TaskTrigger = 'SUBMIT_REPORT';
-    if (coderMsg.status === 'BLOCKED') {
-      trigger = 'SET_BLOCKED';
+    // 4. Determine state machine trigger based on discrete coder status
+    let trigger: TaskTrigger;
+    if (coderMsg.status === 'COMPLETED') {
+      if (coderMsg.review_requested) {
+        trigger = 'SUBMIT_REPORT'; // Moves to VALIDATING
+      } else {
+        trigger = 'START_CODING'; // Remains in CODING
+      }
+    } else if (coderMsg.status === 'IN_PROGRESS') {
+      trigger = 'START_CODING'; // Remains in CODING
+    } else if (coderMsg.status === 'BLOCKED') {
+      trigger = 'SET_BLOCKED'; // Moves to BLOCKED
+    } else if (coderMsg.status === 'FAILED') {
+      trigger = 'FIX_VERDICT'; // Increments revision or escalates to NEEDS_HUMAN
+    } else {
+      trigger = 'SUBMIT_REPORT';
     }
 
     let transitionRes;
@@ -397,10 +467,18 @@ export class TaskService {
     }
   }
 
-  public startReview(taskId: string): { success: boolean; task?: Task; error?: string } {
+  public startReview(taskId: string, expectedProjectId?: string): { success: boolean; task?: Task; error?: string } {
     const task = this.repo.getTask(taskId);
     if (!task) {
       return { success: false, error: `Task ${taskId} not found.` };
+    }
+
+    // Cross-project guard
+    if (expectedProjectId && task.project_id !== expectedProjectId) {
+      return {
+        success: false,
+        error: `Cross-project guard: Task ${taskId} belongs to "${task.project_id}", not "${expectedProjectId}".`,
+      };
     }
 
     if (task.state === 'REVIEWING') {
@@ -440,11 +518,19 @@ export class TaskService {
 
   public async executeValidationFlow(
     taskId: string,
-    commandConfigId?: string
+    commandConfigId?: string,
+    expectedProjectId?: string
   ): Promise<ValidationFlowResult> {
     const task = this.repo.getTask(taskId);
     if (!task) {
       throw new Error(`Task ${taskId} not found.`);
+    }
+
+    // Cross-project guard
+    if (expectedProjectId && task.project_id !== expectedProjectId) {
+      throw new Error(
+        `Cross-project guard: Task ${taskId} belongs to "${task.project_id}", not "${expectedProjectId}".`
+      );
     }
 
     const project = this.repo.getProject(task.project_id);

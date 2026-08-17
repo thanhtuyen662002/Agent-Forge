@@ -98,9 +98,16 @@ export class TaskStateMachine {
         break;
 
       case 'CODING':
+        if (trigger === 'START_CODING') return { nextState: 'CODING', pausedFromState: null, incrementRevision: false };
         if (trigger === 'SUBMIT_REPORT') return { nextState: 'VALIDATING', pausedFromState: null, incrementRevision: false };
         if (trigger === 'QUOTA_EXHAUSTED') return { nextState: 'HANDOFF_REQUIRED', pausedFromState: null, incrementRevision: false };
         if (trigger === 'SET_BLOCKED') return { nextState: 'BLOCKED', pausedFromState: null, incrementRevision: false };
+        if (trigger === 'FIX_VERDICT' || trigger === 'TESTS_FAILED') {
+          if (revisionCount + 1 >= maxRevisions) {
+            return { nextState: 'NEEDS_HUMAN', pausedFromState: null, incrementRevision: true };
+          }
+          return { nextState: 'CODING', pausedFromState: null, incrementRevision: true };
+        }
         if (trigger === 'FATAL_FAILURE') return { nextState: 'FAILED', pausedFromState: null, incrementRevision: false };
         if (trigger === 'CANCEL') return { nextState: 'CANCELLED', pausedFromState: null, incrementRevision: false };
         break;

@@ -49,11 +49,12 @@ export class PolicyService {
     repositoryRoot: string,
     isWrite: boolean = false
   ): PolicyEvaluationResult {
-    const normalizedTarget = path.normalize(path.resolve(targetPath)).toLowerCase();
-    const normalizedRoot = path.normalize(path.resolve(repositoryRoot)).toLowerCase();
+    const canonicalTarget = path.normalize(path.resolve(targetPath));
+    const canonicalRoot = path.normalize(path.resolve(repositoryRoot));
 
-    // 1. Sensitive credential directory check across full path
-    for (const part of normalizedTarget.split(/[\\/]/)) {
+    // 1. Sensitive credential directory check across full target path
+    const normalizedLower = canonicalTarget.toLowerCase();
+    for (const part of normalizedLower.split(/[\\/]/)) {
       if (['.ssh', '.aws', '.gnupg', '.env'].includes(part)) {
         return {
           allowed: false,
@@ -63,8 +64,15 @@ export class PolicyService {
       }
     }
 
-    // 2. Boundary check: must stay within repo root
-    if (!normalizedTarget.startsWith(normalizedRoot)) {
+    // 2. Strict path containment using path.relative() to avoid prefix confusion (e.g. repo vs repo-evil)
+    const relPath = path.relative(canonicalRoot, canonicalTarget);
+    if (
+      relPath === '..' ||
+      relPath.startsWith('..' + path.sep) ||
+      relPath.startsWith('../') ||
+      relPath.startsWith('..\\') ||
+      path.isAbsolute(relPath)
+    ) {
       return {
         allowed: false,
         decision: 'DENY',
@@ -73,8 +81,7 @@ export class PolicyService {
     }
 
     // 3. Sensitive directory check within repository root
-    const relPath = path.relative(normalizedRoot, normalizedTarget).toLowerCase();
-    const pathParts = relPath.split(path.sep);
+    const pathParts = relPath.toLowerCase().split(path.sep);
 
     for (const part of pathParts) {
       if (this.SENSITIVE_DIRS.includes(part)) {
@@ -99,13 +106,38 @@ export class PolicyService {
 
   public static evaluateGitCommand(args: string[]): PolicyEvaluationResult {
     const lowerArgs = args.map((a) => a.toLowerCase());
-    if (lowerArgs.includes('--force') || lowerArgs.includes('-f') || lowerArgs.includes('--force-with-lease')) {
+
+    // Deny destructive git push operations
+    if (
+      lowerArgs.includes('--force') ||
+      lowerArgs.includes('-f') ||
+      lowerArgs.includes('--force-with-lease') ||
+      lowerArgs.some((a) => a.startsWith('-f='))
+    ) {
       return {
         allowed: false,
         decision: 'DENY',
         reason: 'Force-pushing or force operations on Git branches are prohibited by security policy.',
       };
     }
+
+    // Deny destructive reset/clean operations
+    if (lowerArgs.includes('reset') && lowerArgs.includes('--hard')) {
+      return {
+        allowed: false,
+        decision: 'DENY',
+        reason: 'Destructive git reset --hard operations require manual owner intervention.',
+      };
+    }
+
+    if (lowerArgs.includes('clean') && lowerArgs.some((a) => a.includes('-f') || a.includes('-fdx'))) {
+      return {
+        allowed: false,
+        decision: 'DENY',
+        reason: 'Destructive git clean operations require manual owner intervention.',
+      };
+    }
+
     return {
       allowed: true,
       decision: 'ALLOW',
@@ -138,12 +170,30 @@ export class PolicyService {
       };
     }
 
+    // 3. Automatic Git policy delegation
+    if (execBase === 'git' || execBase === 'git.exe') {
+      const gitPolicy = this.evaluateGitCommand(args);
+      if (!gitPolicy.allowed) {
+        return gitPolicy;
+      }
+    }
+
     const lowerArgs = args.map((a) => a.toLowerCase());
 
-    // 3. Block inline code-eval modes across runtimes
+    // 4. Block inline code-eval modes across runtimes
     // Node.js: -e, --eval, -p, --print
     if (['node', 'node.exe'].includes(execBase)) {
-      if (lowerArgs.some((a) => a === '-e' || a === '--eval' || a === '-p' || a === '--print' || a.startsWith('-e=') || a.startsWith('--eval='))) {
+      if (
+        lowerArgs.some(
+          (a) =>
+            a === '-e' ||
+            a === '--eval' ||
+            a === '-p' ||
+            a === '--print' ||
+            a.startsWith('-e=') ||
+            a.startsWith('--eval=')
+        )
+      ) {
         return {
           allowed: false,
           decision: 'REQUIRES_OWNER_APPROVAL',
@@ -207,7 +257,7 @@ export class PolicyService {
       }
     }
 
-    // 4. External dependency installation requires owner approval
+    // 5. External dependency installation requires owner approval
     if (['npm', 'npm.cmd', 'pnpm', 'pnpm.cmd', 'yarn', 'yarn.cmd'].includes(execBase)) {
       const isInstallCmd = lowerArgs.some((a) => a === 'install' || a === 'i' || a === 'add');
       const hasSpecificPackage = lowerArgs.some(

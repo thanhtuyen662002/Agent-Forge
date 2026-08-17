@@ -400,7 +400,7 @@ export class Repository {
       quota_reset_at: r.quota_reset_at ? String(r.quota_reset_at) : null,
       quota_source: r.quota_source as any,
       quota_confidence: Number(r.quota_confidence),
-      last_health_check: String(r.last_health_check),
+      last_health_check: r.last_health_check ? String(r.last_health_check) : null,
     }));
   }
 
@@ -525,6 +525,30 @@ export class Repository {
 
   public getEvidenceByProject(projectId: string): Evidence[] {
     return this.getAllEvidence(projectId);
+  }
+
+  public getEvidenceById(id: string): Evidence | null {
+    const r = this.db.prepare('SELECT * FROM evidence WHERE id = ?').get(id) as Record<string, unknown> | undefined;
+    if (!r) return null;
+    return {
+      id: String(r.id),
+      project_id: String(r.project_id),
+      task_id: r.task_id ? String(r.task_id) : null,
+      attempt_id: r.attempt_id ? String(r.attempt_id) : null,
+      evidence_type: r.evidence_type as any,
+      storage_type: r.storage_type as any,
+      file_path: r.file_path ? String(r.file_path) : null,
+      hash: String(r.hash),
+      byte_size: Number(r.byte_size),
+      content_type: String(r.content_type),
+      summary: String(r.summary),
+      raw_payload: r.raw_payload ? String(r.raw_payload) : null,
+      created_at: String(r.created_at),
+    };
+  }
+
+  public getEvidence(id: string): Evidence | null {
+    return this.getEvidenceById(id);
   }
 
   // ==========================================
@@ -883,5 +907,20 @@ export class Repository {
   public getProcessRun(id: string): any | null {
     const row = this.db.prepare('SELECT * FROM process_runs WHERE id = ?').get(id) as Record<string, unknown> | undefined;
     return row ?? null;
+  }
+
+  public getAllProcessRuns(): any[] {
+    return this.db.prepare('SELECT * FROM process_runs ORDER BY start_time DESC').all();
+  }
+
+  public getProcessRunsByTask(taskId: string): any[] {
+    return this.db
+      .prepare(`
+        SELECT pr.* FROM process_runs pr
+        LEFT JOIN evidence e ON pr.stdout_evidence_id = e.id
+        WHERE e.task_id = ?
+        ORDER BY pr.start_time DESC
+      `)
+      .all(taskId);
   }
 }

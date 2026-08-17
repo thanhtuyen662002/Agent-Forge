@@ -116,30 +116,18 @@ describe('Real End-to-End Orchestration Integration Lifecycle', () => {
       enabled: true,
     });
 
-    // 2. Create Task through Repository
-    const task: Task = {
+    // 2. Create Task through trusted TaskService
+    const task = taskService.createTask({
       id: 'TSK-REAL-001',
-      project_id: project.id,
-      milestone_id: null,
+      projectId: project.id,
       title: 'Update feature to 42',
       description: 'Modify feature.js to return 42 so tests pass',
-      state: 'PLANNED',
-      paused_from_state: null,
       priority: 'HIGH',
       risk: 'LOW',
-      assigned_agent_id: null,
-      revision_count: 0,
-      max_revisions: 3,
-      base_sha: baseSha,
-      current_sha: null,
-      progress_cache_percent: 0,
-      progress_computed_at: new Date().toISOString(),
-      acceptance_criteria: ['feature.js returns 42', 'run_tests.js passes'],
+      acceptanceCriteria: ['feature.js returns 42', 'run_tests.js passes'],
       constraints: [],
-      created_at: new Date().toISOString(),
-      updated_at: new Date().toISOString(),
-    };
-    repo.createTask(task);
+      baseSha: baseSha,
+    });
 
     // 3. Manager EXECUTE Protocol Applied -> Task transitions to CODING
     const managerExecMsg: ManagerProtocol = {
@@ -269,6 +257,11 @@ describe('Real End-to-End Orchestration Integration Lifecycle', () => {
 
     const persistedTestRun = restartedRepo.getLatestTestRun(task.id)!;
     expect(persistedTestRun.exit_code).toBe(0);
+    expect(persistedTestRun.evidence_id).toBeDefined();
+
+    const processRuns = restartedRepo.getProcessRunsByTask(task.id);
+    expect(processRuns.length).toBeGreaterThan(0);
+    expect(processRuns[0].stdout_evidence_id).toBeDefined();
 
     const persistedMessages = restartedRepo.getProtocolMessagesByTask(task.id);
     expect(persistedMessages.length).toBe(3); // EXECUTE, CODER, PASS

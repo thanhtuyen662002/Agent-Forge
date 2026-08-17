@@ -25,10 +25,10 @@ interface OrchestratorContextType {
   setSelectedTaskId: (taskId: string | null) => void;
   setIsEmergencyStopOpen: (open: boolean) => void;
   refreshData: () => Promise<void>;
-  createProject: (data: { name: string; description?: string; repositoryPath: string; defaultBranch?: string }) => Promise<Project>;
+  createProject: (data: { name: string; description?: string; repositorySelectionId: string; defaultBranch?: string }) => Promise<Project>;
   importContract: (contract: any) => Promise<boolean>;
   transitionProject: (trigger: string) => Promise<void>;
-  createTask: (task: Partial<Task>) => Promise<void>;
+  createTask: (spec: { title: string; description?: string | null; priority?: 'LOW' | 'MEDIUM' | 'HIGH' | 'CRITICAL'; risk?: 'LOW' | 'MEDIUM' | 'HIGH' | 'CRITICAL'; acceptanceCriteria?: string[]; constraints?: string[] }) => Promise<void>;
   parseProtocol: (input: string) => Promise<any>;
   applyProtocol: (rawInput: string) => Promise<any>;
   generateWorkOrder: (taskId: string) => Promise<string>;
@@ -191,13 +191,13 @@ export const OrchestratorProvider: React.FC<{ children: React.ReactNode }> = ({ 
     return () => clearInterval(interval);
   }, [refreshData]);
 
-  const createProject = async (data: { name: string; description?: string; repositoryPath: string; defaultBranch?: string }) => {
+  const createProject = async (data: { name: string; description?: string; repositorySelectionId: string; defaultBranch?: string }) => {
     if (!orchestrator) throw new Error('Desktop IPC unavailable.');
     const res = await orchestrator.createProject(data);
     await refreshData();
-    if (res && res.id) {
-      setActiveProject(res);
-      return res;
+    if (res && res.project) {
+      setActiveProject(res.project);
+      return res.project;
     }
     return res;
   };
@@ -215,13 +215,16 @@ export const OrchestratorProvider: React.FC<{ children: React.ReactNode }> = ({ 
     await refreshData();
   };
 
-  const createTask = async (task: Partial<Task>) => {
+  const createTask = async (spec: { title: string; description?: string | null; priority?: 'LOW' | 'MEDIUM' | 'HIGH' | 'CRITICAL'; risk?: 'LOW' | 'MEDIUM' | 'HIGH' | 'CRITICAL'; acceptanceCriteria?: string[]; constraints?: string[] }) => {
     if (!orchestrator || !activeProject) return;
     await orchestrator.createTask({
-      ...task,
-      project_id: activeProject.id,
-      created_at: new Date().toISOString(),
-      updated_at: new Date().toISOString(),
+      projectId: activeProject.id,
+      title: spec.title,
+      description: spec.description,
+      priority: spec.priority || 'MEDIUM',
+      risk: spec.risk || 'MEDIUM',
+      acceptanceCriteria: spec.acceptanceCriteria || [],
+      constraints: spec.constraints || [],
     });
     await refreshData();
   };

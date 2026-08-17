@@ -1,11 +1,11 @@
 import { z } from 'zod';
 
-// Zod schemas for all IPC requests to enforce main process security boundary
+// Strict Zod schemas for all IPC channels across the main process security boundary
 
 export const CreateProjectIpcSchema = z.object({
-  name: z.string().min(1, 'Project name is required'),
-  description: z.string().optional().default(''),
-  repositoryPath: z.string().min(1, 'Repository path is required'),
+  name: z.string().min(1, 'Project name is required').max(100),
+  description: z.string().max(500).optional().default(''),
+  repositorySelectionId: z.string().uuid('A valid native repository selection token is required'),
   defaultBranch: z.string().optional().default('main'),
 });
 export type CreateProjectIpc = z.infer<typeof CreateProjectIpcSchema>;
@@ -33,30 +33,23 @@ export const TransitionProjectIpcSchema = z.object({
 });
 export type TransitionProjectIpc = z.infer<typeof TransitionProjectIpcSchema>;
 
-export const GetTasksIpcSchema = z.object({
-  projectId: z.string().min(1),
-});
-
-export const GetTaskIpcSchema = z.object({
-  taskId: z.string().min(1),
-});
-
 export const CreateTaskIpcSchema = z.object({
-  id: z.string().min(1),
-  project_id: z.string().min(1),
-  milestone_id: z.string().nullable().optional(),
-  title: z.string().min(1),
+  projectId: z.string().min(1, 'Project ID is required'),
+  id: z.string().optional(),
+  milestoneId: z.string().nullable().optional(),
+  title: z.string().min(1, 'Task title is required').max(200),
   description: z.string().nullable().optional(),
   priority: z.enum(['LOW', 'MEDIUM', 'HIGH', 'CRITICAL']).default('MEDIUM'),
   risk: z.enum(['LOW', 'MEDIUM', 'HIGH', 'CRITICAL']).default('MEDIUM'),
-  acceptance_criteria: z.array(z.string()).default([]),
+  acceptanceCriteria: z.array(z.string()).default([]),
   constraints: z.array(z.string()).default([]),
 });
 export type CreateTaskIpc = z.infer<typeof CreateTaskIpcSchema>;
 
 export const ParseProtocolIpcSchema = z.object({
-  input: z.string().min(1, 'Protocol input text is required'),
+  rawInput: z.string().min(1, 'Protocol input text is required'),
 });
+export type ParseProtocolIpc = z.infer<typeof ParseProtocolIpcSchema>;
 
 export const ApplyProtocolIpcSchema = z.object({
   rawInput: z.string().min(1, 'Raw protocol input is required'),
@@ -99,7 +92,9 @@ export type UpdateResourceQuotaIpc = z.infer<typeof UpdateResourceQuotaIpcSchema
 export const EmergencyStopIpcSchema = z.object({
   reason: z.string().optional().default('Manual Owner Emergency Stop'),
 });
+export type EmergencyStopIpc = z.infer<typeof EmergencyStopIpcSchema>;
 
 export const ResumeProjectIpcSchema = z.object({
   projectId: z.string().min(1),
 });
+export type ResumeProjectIpc = z.infer<typeof ResumeProjectIpcSchema>;

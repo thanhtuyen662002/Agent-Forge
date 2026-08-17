@@ -3,29 +3,63 @@ import {
   CreateProjectIpcSchema,
   CreateTaskIpcSchema,
   UpdateResourceQuotaIpcSchema,
+  ParseProtocolIpcSchema,
+  EmergencyStopIpcSchema,
+  ResumeProjectIpcSchema,
 } from '../src/core/types/ipc';
 import { PolicyService } from '../src/core/services/PolicyService';
 
 describe('IPC Validation & Security Gates', () => {
-  it('should reject invalid project creation payloads', () => {
+  it('should validate project creation payloads and reject raw repository paths', () => {
     const invalidEmpty = CreateProjectIpcSchema.safeParse({});
     expect(invalidEmpty.success).toBe(false);
 
-    const invalidName = CreateProjectIpcSchema.safeParse({ name: '', repositoryPath: 'd:/test' });
-    expect(invalidName.success).toBe(false);
+    // Raw repository path without valid UUID selection token is rejected
+    const invalidRaw = CreateProjectIpcSchema.safeParse({
+      name: 'Test Project',
+      repositoryPath: 'd:/Projects/Agent-Forge',
+    });
+    expect(invalidRaw.success).toBe(false);
 
-    const valid = CreateProjectIpcSchema.safeParse({ name: 'Valid Proj', repositoryPath: 'd:/test' });
-    expect(valid.success).toBe(true);
+    const validWithToken = CreateProjectIpcSchema.safeParse({
+      name: 'Valid Proj',
+      repositorySelectionId: '123e4567-e89b-12d3-a456-426614174000',
+    });
+    expect(validWithToken.success).toBe(true);
   });
 
-  it('should reject invalid task creation payloads', () => {
+  it('should validate task creation payloads and reject internal domain field overrides', () => {
     const invalidPriority = CreateTaskIpcSchema.safeParse({
-      id: 'TSK-1',
-      project_id: 'PROJ-1',
+      projectId: 'PROJ-1',
       title: 'Title',
       priority: 'SUPER_CRITICAL', // invalid enum
     });
     expect(invalidPriority.success).toBe(false);
+
+    const validOwnerSpec = CreateTaskIpcSchema.safeParse({
+      projectId: 'PROJ-1',
+      title: 'Valid Task Title',
+      description: 'Owner description',
+      priority: 'HIGH',
+      risk: 'MEDIUM',
+      acceptanceCriteria: ['Must pass tests'],
+      constraints: [],
+    });
+    expect(validOwnerSpec.success).toBe(true);
+  });
+
+  it('should validate protocol parse payloads', () => {
+    expect(ParseProtocolIpcSchema.safeParse({}).success).toBe(false);
+    expect(ParseProtocolIpcSchema.safeParse({ rawInput: '' }).success).toBe(false);
+    expect(ParseProtocolIpcSchema.safeParse({ rawInput: '{"protocol":"manager.v1"}' }).success).toBe(true);
+  });
+
+  it('should validate emergency stop and resume payloads', () => {
+    expect(EmergencyStopIpcSchema.safeParse({}).success).toBe(true);
+    expect(EmergencyStopIpcSchema.safeParse({ reason: 'Security incident' }).success).toBe(true);
+
+    expect(ResumeProjectIpcSchema.safeParse({}).success).toBe(false);
+    expect(ResumeProjectIpcSchema.safeParse({ projectId: 'PROJ-1' }).success).toBe(true);
   });
 
   it('should reject invalid quota updates with confidence out of bounds', () => {

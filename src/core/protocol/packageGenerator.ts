@@ -2,6 +2,7 @@ import {
   Project,
   Task,
   Review,
+  Evidence,
   TestRun,
 } from '../types/domain';
 import { CoderProtocol } from '../types/protocols';
@@ -91,7 +92,8 @@ When work is complete, return your final report strictly in the following JSON f
     gitDiffStat: string,
     gitDiffContent: string,
     testRun: TestRun | null,
-    previousReviews: Review[] = []
+    previousReviews: Review[] = [],
+    gitDiffEvidence?: Evidence | null
   ): string {
     const criteriaList = task.acceptance_criteria.length > 0
       ? task.acceptance_criteria.map((c, i) => `${i + 1}. ${c}`).join('\n')
@@ -126,7 +128,7 @@ ${coderReport.tests_claimed.map((t) => `  - ${t}`).join('\n') || '  - None'}
 `
       : '⚠️ [TEST EVIDENCE UNAVAILABLE / NOT RUN / ERROR]';
 
-    // Format Bounded Diff Content
+    // Format Bounded Diff Content with Artifact Metadata for Large Diffs
     const MAX_DIFF_LENGTH = 32 * 1024;
     let formattedDiff = '';
     if (!gitDiffContent || !gitDiffContent.trim()) {
@@ -134,9 +136,18 @@ ${coderReport.tests_claimed.map((t) => `  - ${t}`).join('\n') || '  - None'}
     } else if (gitDiffContent.length <= MAX_DIFF_LENGTH) {
       formattedDiff = gitDiffContent;
     } else {
+      const evId = gitDiffEvidence?.id || 'EV-LARGE-DIFF';
+      const evHash = gitDiffEvidence?.hash || 'UNKNOWN';
+      const byteSize = gitDiffEvidence?.byte_size || Buffer.byteLength(gitDiffContent, 'utf8');
+      const storageType = gitDiffEvidence?.storage_type || 'FILE';
+
       formattedDiff =
         gitDiffContent.substring(0, MAX_DIFF_LENGTH) +
-        `\n\n... [TRUNCATED: Diff is ${gitDiffContent.length} characters. Full diff stored in ArtifactStore]`;
+        `\n\n... [TRUNCATED: Diff is ${byteSize} bytes]\n` +
+        `- **Evidence ID**: \`${evId}\`\n` +
+        `- **SHA-256 Checksum**: \`${evHash}\`\n` +
+        `- **Byte Size**: \`${byteSize} bytes\`\n` +
+        `- **Storage Type**: \`${storageType}\``;
     }
 
     return `# REVIEW PACKAGE: ${task.id} — ${task.title}
