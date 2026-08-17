@@ -2,6 +2,7 @@ import { spawn, ChildProcess } from 'child_process';
 import crypto from 'crypto';
 import { PolicyService } from './PolicyService';
 import { Repository } from '../database/repositories';
+import { ArtifactStore } from './ArtifactStore';
 
 export interface ProcessRunResult {
   executionId: string;
@@ -14,6 +15,8 @@ export interface ProcessRunResult {
   durationMs: number;
   timedOut: boolean;
   cancelled: boolean;
+  stdoutEvidenceId?: string | null;
+  stderrEvidenceId?: string | null;
 }
 
 export interface StructuredProcessOptions {
@@ -24,12 +27,15 @@ export interface StructuredProcessOptions {
   env?: Record<string, string>;
   allowShell?: boolean;
   repo?: Repository;
+  artifactStore?: ArtifactStore;
+  projectId?: string;
+  taskId?: string;
 }
 
 export class ProcessRunner {
   private static activeProcesses = new Map<
     string,
-    { process: ChildProcess; command: string; isCancelled: boolean }
+    { process: ChildProcess; command: string; isCancelled: boolean; repo?: Repository }
   >();
 
   private static SECRET_PATTERNS = [
@@ -146,7 +152,11 @@ export class ProcessRunner {
         windowsHide: true,
       });
 
-      const procEntry = { process: child, command: commandStr, isCancelled: false };
+      if (child.pid && options.repo) {
+        options.repo.updateProcessRunPid(executionId, child.pid);
+      }
+
+      const procEntry = { process: child, command: commandStr, isCancelled: false, repo: options.repo };
       this.activeProcesses.set(executionId, procEntry);
 
       const timer = setTimeout(() => {
@@ -212,8 +222,54 @@ export class ProcessRunner {
           terminalStatus = 'FAILED';
         }
 
+        let stdoutEvidenceId: string | null = null;
+        let stderrEvidenceId: string | null = null;
+
+        // Persist outputs as Evidence if artifactStore & projectId are configured
+        if (options.artifactStore && options.repo && options.projectId) {
+          if (stdoutAcc.trim().length > 0) {
+            const ev = options.artifactStore.store(
+              crypto.randomUUID(),
+              options.projectId,
+              options.taskId ?? null,
+              null,
+              'PROCESS_LOG',
+              `Stdout for ${commandStr}`,
+              this.scrubSecrets(stdoutAcc),
+              'text/plain'
+            );
+            options.repo.createEvidence(ev);
+            stdoutEvidenceId = ev.id;
+          }
+          if (stderrAcc.trim().length > 0) {
+            const ev = options.artifactStore.store(
+              crypto.randomUUID(),
+              options.projectId,
+              options.taskId ?? null,
+              null,
+              'PROCESS_LOG',
+              `Stderr for ${commandStr}`,
+              this.scrubSecrets(stderrAcc),
+              'text/plain'
+            );
+            options.repo.createEvidence(ev);
+            stderrEvidenceId = ev.id;
+          }
+        }
+
         if (options.repo) {
-          options.repo.updateProcessRun(executionId, terminalStatus, code ?? (isTimedOut ? -2 : 0), endIso);
+          try {
+            options.repo.updateProcessRun(
+              executionId,
+              terminalStatus,
+              code ?? (isTimedOut ? -2 : wasCancelled ? -1 : 0),
+              endIso,
+              stdoutEvidenceId,
+              stderrEvidenceId
+            );
+          } catch {
+            // DB connection may be closed if test teardown completed
+          }
         }
 
         resolve({
@@ -221,12 +277,14 @@ export class ProcessRunner {
           pid: child.pid ?? null,
           command: commandStr,
           cwd: options.cwd,
-          exitCode: code ?? (isTimedOut ? -2 : 0),
+          exitCode: code ?? (isTimedOut ? -2 : wasCancelled ? -1 : 0),
           stdout: this.scrubSecrets(stdoutAcc),
           stderr: this.scrubSecrets(stderrAcc),
           durationMs,
           timedOut: isTimedOut,
           cancelled: wasCancelled,
+          stdoutEvidenceId,
+          stderrEvidenceId,
         });
       });
     });
@@ -236,8 +294,10 @@ export class ProcessRunner {
     const entry = this.activeProcesses.get(executionId);
     if (entry) {
       entry.isCancelled = true;
+      if (entry.repo) {
+        entry.repo.updateProcessRun(executionId, 'CANCELLED', -1, new Date().toISOString());
+      }
       this.killProcessTree(entry.process);
-      this.activeProcesses.delete(executionId);
       return true;
     }
     return false;
@@ -247,6 +307,9 @@ export class ProcessRunner {
     const count = this.activeProcesses.size;
     for (const [id, entry] of this.activeProcesses.entries()) {
       entry.isCancelled = true;
+      if (entry.repo) {
+        entry.repo.updateProcessRun(id, 'CANCELLED', -1, new Date().toISOString());
+      }
       this.killProcessTree(entry.process);
       this.activeProcesses.delete(id);
     }

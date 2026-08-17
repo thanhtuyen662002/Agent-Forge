@@ -4,23 +4,26 @@ import path from 'path';
 import { Evidence, EvidenceType, EvidenceStorageType } from '../types/domain';
 
 export class ArtifactStore {
-  private baseDir: string;
+  private baseDir: string | null = null;
   private thresholdBytes: number;
 
   constructor(customBaseDir?: string, thresholdBytes: number = 32 * 1024) {
-    this.baseDir = customBaseDir ?? path.resolve(process.cwd(), '.agent-forge', 'artifacts');
+    this.baseDir = customBaseDir ?? null;
     this.thresholdBytes = thresholdBytes;
-
-    if (!fs.existsSync(this.baseDir)) {
-      fs.mkdirSync(this.baseDir, { recursive: true });
-    }
   }
 
   public setBaseDir(customBaseDir: string): void {
     this.baseDir = customBaseDir;
+  }
+
+  public getBaseDir(): string {
+    if (!this.baseDir) {
+      throw new Error('[ArtifactStore] Base directory is not configured. Call setBaseDir() first.');
+    }
     if (!fs.existsSync(this.baseDir)) {
       fs.mkdirSync(this.baseDir, { recursive: true });
     }
+    return this.baseDir;
   }
 
   public store(
@@ -55,7 +58,8 @@ export class ArtifactStore {
       };
     }
 
-    const filePath = path.join(this.baseDir, `${hash}.bin`);
+    const baseDir = this.getBaseDir();
+    const filePath = path.join(baseDir, `${hash}.bin`);
     fs.writeFileSync(filePath, payload, 'utf8');
 
     return {

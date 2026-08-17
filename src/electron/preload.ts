@@ -1,6 +1,9 @@
 import { contextBridge, ipcRenderer } from 'electron';
 
 export interface OrchestratorApi {
+  // Repository Dialog
+  selectRepositoryDirectory: () => Promise<any>;
+
   // Projects
   getProjects: () => Promise<any[]>;
   createProject: (data: { name: string; description?: string; repositoryPath: string; defaultBranch?: string }) => Promise<any>;
@@ -11,6 +14,7 @@ export interface OrchestratorApi {
   getTasks: (projectId: string) => Promise<any[]>;
   getTask: (taskId: string) => Promise<any>;
   createTask: (data: any) => Promise<any>;
+  startReview: (taskId: string) => Promise<any>;
 
   // Protocols & Manual Bridge
   parseProtocol: (input: string) => Promise<any>;
@@ -38,33 +42,36 @@ export interface OrchestratorApi {
 }
 
 const api: OrchestratorApi = {
+  selectRepositoryDirectory: () => ipcRenderer.invoke('dialog:selectRepository'),
   getProjects: () => ipcRenderer.invoke('project:list'),
   createProject: (data) => ipcRenderer.invoke('project:create', data),
   importContract: (data) => ipcRenderer.invoke('project:importContract', data),
   transitionProject: (data) => ipcRenderer.invoke('project:transition', data),
 
-  getTasks: (projectId) => ipcRenderer.invoke('task:list', { projectId }),
-  getTask: (taskId) => ipcRenderer.invoke('task:get', { taskId }),
+  getTasks: (projectId: string) => ipcRenderer.invoke('task:list', { projectId }),
+  getTask: (taskId: string) => ipcRenderer.invoke('task:get', { taskId }),
   createTask: (data) => ipcRenderer.invoke('task:create', data),
+  startReview: (taskId: string) => ipcRenderer.invoke('task:startReview', { taskId }),
 
-  parseProtocol: (input) => ipcRenderer.invoke('protocol:parse', { input }),
-  applyProtocol: (rawInput) => ipcRenderer.invoke('protocol:apply', { rawInput }),
+  parseProtocol: (input: string) => ipcRenderer.invoke('protocol:parse', input),
+  applyProtocol: (rawInput: string) => ipcRenderer.invoke('protocol:apply', { rawInput }),
   generateWorkOrder: (data) => ipcRenderer.invoke('protocol:generateWorkOrder', data),
   generateReviewPackage: (data) => ipcRenderer.invoke('protocol:generateReviewPackage', data),
 
-  getGitStatus: (projectId) => ipcRenderer.invoke('git:getStatus', { projectId }),
-  getGitDiff: (taskId) => ipcRenderer.invoke('git:getDiff', { taskId }),
-  runVerificationTests: (taskId, commandConfigId) => ipcRenderer.invoke('verification:runTests', { taskId, commandConfigId }),
+  getGitStatus: (projectId: string) => ipcRenderer.invoke('git:getStatus', { projectId }),
+  getGitDiff: (taskId: string) => ipcRenderer.invoke('git:getDiff', { taskId }),
+  runVerificationTests: (taskId: string, commandConfigId?: string) =>
+    ipcRenderer.invoke('verification:runTests', { taskId, commandConfigId }),
 
   getAgents: () => ipcRenderer.invoke('agents:list'),
-  getProviderResources: () => ipcRenderer.invoke('resources:list'),
-  updateResourceQuota: (data) => ipcRenderer.invoke('resources:updateQuota', data),
+  getProviderResources: () => ipcRenderer.invoke('providers:listResources'),
+  updateResourceQuota: (data) => ipcRenderer.invoke('providers:updateResourceQuota', data),
 
-  getEvidence: (projectId) => ipcRenderer.invoke('evidence:list', { projectId }),
-  getEvents: (projectId) => ipcRenderer.invoke('events:list', { projectId }),
+  getEvidence: (projectId: string) => ipcRenderer.invoke('evidence:list', { projectId }),
+  getEvents: (projectId: string) => ipcRenderer.invoke('events:list', { projectId }),
 
-  triggerEmergencyStop: (reason) => ipcRenderer.invoke('emergency:stop', { reason }),
-  resumeProject: (projectId) => ipcRenderer.invoke('emergency:resumeProject', { projectId }),
+  triggerEmergencyStop: (reason?: string) => ipcRenderer.invoke('control:emergencyStop', reason),
+  resumeProject: (projectId: string) => ipcRenderer.invoke('control:resume', projectId),
 };
 
 contextBridge.exposeInMainWorld('orchestrator', api);

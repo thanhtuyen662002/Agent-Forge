@@ -24,6 +24,11 @@ import {
 export class Repository {
   constructor(private db: Database.Database) {}
 
+  public runInTransaction<T>(fn: () => T): T {
+    const tx = this.db.transaction(fn);
+    return tx();
+  }
+
   // ==========================================
   // Projects
   // ==========================================
@@ -518,6 +523,10 @@ export class Repository {
     }));
   }
 
+  public getEvidenceByProject(projectId: string): Evidence[] {
+    return this.getAllEvidence(projectId);
+  }
+
   // ==========================================
   // Reviews & Issues
   // ==========================================
@@ -848,6 +857,10 @@ export class Repository {
         VALUES (?, ?, ?, ?, ?, ?, NULL, NULL, NULL, NULL, ?)
       `)
       .run(run.id, run.pid, run.command, run.working_directory, run.status, run.start_time, run.start_time);
+  }
+
+  public updateProcessRunPid(id: string, pid: number): void {
+    this.db.prepare('UPDATE process_runs SET pid = ? WHERE id = ?').run(pid, id);
   }
 
   public updateProcessRun(

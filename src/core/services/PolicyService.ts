@@ -1,6 +1,6 @@
 import path from 'path';
-import os from 'os';
-import { PolicyDecision } from '../types/domain';
+
+export type PolicyDecision = 'ALLOW' | 'DENY' | 'REQUIRES_OWNER_APPROVAL';
 
 export interface PolicyEvaluationResult {
   allowed: boolean;
@@ -9,74 +9,107 @@ export interface PolicyEvaluationResult {
 }
 
 export class PolicyService {
-  private static SENSITIVE_PATHS = [
+  private static SENSITIVE_DIRS = [
+    '.git',
     '.ssh',
-    '.aws',
     '.gnupg',
-    '.config/gcloud',
-    '.azure',
-    'id_rsa',
-    'id_ed25519',
-    '.bash_history',
-    '.zsh_history',
+    '.aws',
+    '.env',
+    '.config',
+    'windows',
+    'system32',
+    'etc',
+    'var',
   ];
 
-  public static evaluatePathAccess(targetPath: string, projectRoot: string, isWrite: boolean = false): PolicyEvaluationResult {
-    const normalizedTarget = path.resolve(targetPath);
-    const normalizedProjectRoot = path.resolve(projectRoot);
-    const userHome = os.homedir();
+  private static PROHIBITED_SHELLS = new Set([
+    'bash',
+    'bash.exe',
+    'sh',
+    'sh.exe',
+    'zsh',
+    'zsh.exe',
+    'cmd',
+    'cmd.exe',
+    'powershell',
+    'powershell.exe',
+    'pwsh',
+    'pwsh.exe',
+  ]);
 
-    // 1. Check sensitive credential paths
-    for (const sens of this.SENSITIVE_PATHS) {
-      if (normalizedTarget.includes(path.sep + sens) || normalizedTarget.endsWith(sens)) {
+  private static PROHIBITED_DOWNLOAD_TOOLS = new Set([
+    'curl',
+    'curl.exe',
+    'wget',
+    'wget.exe',
+  ]);
+
+  public static evaluatePathAccess(
+    targetPath: string,
+    repositoryRoot: string,
+    isWrite: boolean = false
+  ): PolicyEvaluationResult {
+    const normalizedTarget = path.normalize(path.resolve(targetPath)).toLowerCase();
+    const normalizedRoot = path.normalize(path.resolve(repositoryRoot)).toLowerCase();
+
+    // 1. Sensitive credential directory check across full path
+    for (const part of normalizedTarget.split(/[\\/]/)) {
+      if (['.ssh', '.aws', '.gnupg', '.env'].includes(part)) {
         return {
           allowed: false,
           decision: 'DENY',
-          reason: `Access to sensitive credential path "${sens}" is strictly prohibited.`,
+          reason: `Access to sensitive credential path element "${part}" is blocked by security policy.`,
         };
       }
     }
 
-    // 2. Check if write is outside project root
-    if (isWrite && !normalizedTarget.startsWith(normalizedProjectRoot)) {
+    // 2. Boundary check: must stay within repo root
+    if (!normalizedTarget.startsWith(normalizedRoot)) {
       return {
         allowed: false,
         decision: 'DENY',
-        reason: `Write operation outside project directory ("${normalizedTarget}") is strictly denied.`,
+        reason: `Target path "${targetPath}" is outside the authorized project root "${repositoryRoot}".`,
       };
+    }
+
+    // 3. Sensitive directory check within repository root
+    const relPath = path.relative(normalizedRoot, normalizedTarget).toLowerCase();
+    const pathParts = relPath.split(path.sep);
+
+    for (const part of pathParts) {
+      if (this.SENSITIVE_DIRS.includes(part)) {
+        // Allow read on .git for internal git operations, but deny arbitrary direct file write
+        if (part === '.git' && !isWrite) {
+          continue;
+        }
+        return {
+          allowed: false,
+          decision: 'DENY',
+          reason: `Access to sensitive path element "${part}" is blocked by security policy.`,
+        };
+      }
     }
 
     return {
       allowed: true,
       decision: 'ALLOW',
-      reason: 'Path access conforms to project security policy.',
+      reason: 'Path access conforms to security policy.',
     };
   }
 
   public static evaluateGitCommand(args: string[]): PolicyEvaluationResult {
-    const commandStr = args.join(' ').toLowerCase();
-
-    // Check destructive operations
-    if (commandStr.includes('--force') || commandStr.includes('-f') || commandStr.includes('push -f')) {
+    const lowerArgs = args.map((a) => a.toLowerCase());
+    if (lowerArgs.includes('--force') || lowerArgs.includes('-f') || lowerArgs.includes('--force-with-lease')) {
       return {
         allowed: false,
         decision: 'DENY',
-        reason: 'Force-pushing Git branches is strictly denied by security policy.',
+        reason: 'Force-pushing or force operations on Git branches are prohibited by security policy.',
       };
     }
-
-    if (commandStr.includes('push') && (commandStr.includes('main') || commandStr.includes('master'))) {
-      return {
-        allowed: false,
-        decision: 'DENY',
-        reason: 'Direct pushes to main/master branch are prohibited. Use task branches and pull requests.',
-      };
-    }
-
     return {
       allowed: true,
       decision: 'ALLOW',
-      reason: 'Git operation permitted.',
+      reason: 'Git operation approved by policy.',
     };
   }
 
@@ -85,30 +118,114 @@ export class PolicyService {
     args: string[],
     allowShell: boolean = false
   ): PolicyEvaluationResult {
-    const execLower = executable.toLowerCase();
+    const execBase = path.basename(executable).toLowerCase();
 
-    // Direct shell interpreters without approval are prohibited
-    if (allowShell || ['bash', 'sh', 'cmd', 'cmd.exe', 'powershell', 'pwsh'].includes(execLower)) {
+    // 1. Direct shell execution or explicit allowShell is prohibited without owner approval
+    if (allowShell || this.PROHIBITED_SHELLS.has(execBase)) {
       return {
         allowed: false,
         decision: 'REQUIRES_OWNER_APPROVAL',
-        reason: 'Raw shell execution requires explicit human owner authorization.',
+        reason: `Direct shell execution (${execBase}) requires explicit human owner approval.`,
       };
     }
 
-    // Dependency installation requires owner approval
-    if (execLower === 'npm' && (args.includes('install') || args.includes('i')) && args.some((a) => !a.startsWith('-') && a !== 'install' && a !== 'i')) {
+    // 2. Arbitrary network download tools
+    if (this.PROHIBITED_DOWNLOAD_TOOLS.has(execBase)) {
       return {
         allowed: false,
         decision: 'REQUIRES_OWNER_APPROVAL',
-        reason: 'Installing new external packages requires human owner approval.',
+        reason: `Invoking network download utility (${execBase}) requires explicit human owner approval.`,
       };
+    }
+
+    const lowerArgs = args.map((a) => a.toLowerCase());
+
+    // 3. Block inline code-eval modes across runtimes
+    // Node.js: -e, --eval, -p, --print
+    if (['node', 'node.exe'].includes(execBase)) {
+      if (lowerArgs.some((a) => a === '-e' || a === '--eval' || a === '-p' || a === '--print' || a.startsWith('-e=') || a.startsWith('--eval='))) {
+        return {
+          allowed: false,
+          decision: 'REQUIRES_OWNER_APPROVAL',
+          reason: 'Executing inline code via Node.js evaluation flags (-e / --eval / -p) requires owner approval.',
+        };
+      }
+    }
+
+    // Python: -c
+    if (['python', 'python.exe', 'python3', 'python3.exe', 'py', 'py.exe'].includes(execBase)) {
+      if (lowerArgs.some((a) => a === '-c' || a.startsWith('-c='))) {
+        return {
+          allowed: false,
+          decision: 'REQUIRES_OWNER_APPROVAL',
+          reason: 'Executing inline code via Python evaluation flag (-c) requires owner approval.',
+        };
+      }
+    }
+
+    // Ruby / Perl: -e
+    if (['ruby', 'ruby.exe', 'perl', 'perl.exe'].includes(execBase)) {
+      if (lowerArgs.some((a) => a === '-e')) {
+        return {
+          allowed: false,
+          decision: 'REQUIRES_OWNER_APPROVAL',
+          reason: `Executing inline code via ${execBase} evaluation flag (-e) requires owner approval.`,
+        };
+      }
+    }
+
+    // PHP: -r
+    if (['php', 'php.exe'].includes(execBase)) {
+      if (lowerArgs.some((a) => a === '-r')) {
+        return {
+          allowed: false,
+          decision: 'REQUIRES_OWNER_APPROVAL',
+          reason: 'Executing inline code via PHP evaluation flag (-r) requires owner approval.',
+        };
+      }
+    }
+
+    // Bun: -e, --eval
+    if (['bun', 'bun.exe'].includes(execBase)) {
+      if (lowerArgs.some((a) => a === '-e' || a === '--eval')) {
+        return {
+          allowed: false,
+          decision: 'REQUIRES_OWNER_APPROVAL',
+          reason: 'Executing inline code via Bun evaluation flag (-e / --eval) requires owner approval.',
+        };
+      }
+    }
+
+    // Deno: eval
+    if (['deno', 'deno.exe'].includes(execBase)) {
+      if (lowerArgs.includes('eval')) {
+        return {
+          allowed: false,
+          decision: 'REQUIRES_OWNER_APPROVAL',
+          reason: 'Executing inline code via Deno eval requires owner approval.',
+        };
+      }
+    }
+
+    // 4. External dependency installation requires owner approval
+    if (['npm', 'npm.cmd', 'pnpm', 'pnpm.cmd', 'yarn', 'yarn.cmd'].includes(execBase)) {
+      const isInstallCmd = lowerArgs.some((a) => a === 'install' || a === 'i' || a === 'add');
+      const hasSpecificPackage = lowerArgs.some(
+        (a) => !a.startsWith('-') && a !== 'install' && a !== 'i' && a !== 'add' && a !== 'run' && a !== 'test'
+      );
+      if (isInstallCmd && hasSpecificPackage) {
+        return {
+          allowed: false,
+          decision: 'REQUIRES_OWNER_APPROVAL',
+          reason: 'Installing new external packages requires human owner approval.',
+        };
+      }
     }
 
     return {
       allowed: true,
       decision: 'ALLOW',
-      reason: 'Structured process execution approved.',
+      reason: 'Structured process execution approved by policy.',
     };
   }
 }

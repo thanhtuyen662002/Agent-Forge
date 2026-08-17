@@ -1,29 +1,28 @@
 import crypto from 'crypto';
 import { Repository } from '../database/repositories';
 import { EventService } from './EventService';
-import { ProgressService } from './ProgressService';
-import { GitService } from './GitService';
 import { VerificationService } from './VerificationService';
 import { ArtifactStore } from './ArtifactStore';
+import { GitService } from './GitService';
+import { ProgressService } from './ProgressService';
 import { TaskStateMachine, TaskTrigger } from '../state/taskStateMachine';
 import { ManagerProtocol, CoderProtocol } from '../types/protocols';
-import { Task, TestRun } from '../types/domain';
-import { DatabaseEngine } from '../database/db';
+import { Task, TestRun, GitStatusSummary, GitDiffSummary } from '../types/domain';
 
 export interface ApplyProtocolResult {
   success: boolean;
+  isDuplicate?: boolean;
   message?: string;
   task?: Task;
   error?: string;
-  isDuplicate?: boolean;
 }
 
 export interface ValidationFlowResult {
   success: boolean;
   taskId: string;
   testRun: TestRun;
-  gitStatus: any;
-  gitDiff: any;
+  gitStatus: GitStatusSummary;
+  gitDiff: GitDiffSummary;
   finalTaskState: string;
   error?: string;
 }
@@ -33,8 +32,7 @@ export class TaskService {
     private repo: Repository,
     private eventService: EventService,
     private verificationService?: VerificationService,
-    private artifactStore?: ArtifactStore,
-    private dbEngine?: DatabaseEngine
+    private artifactStore?: ArtifactStore
   ) {}
 
   public applyManagerDecision(
@@ -49,46 +47,20 @@ export class TaskService {
       return {
         success: true,
         isDuplicate: true,
-        message: `Message "${managerMsg.message_id}" was already processed.`,
+        message: `Manager decision "${managerMsg.message_id}" was already processed.`,
       };
     }
 
-    // 2. Locate task
     if (!managerMsg.task_id) {
-      this.repo.recordProtocolMessage(
-        crypto.randomUUID(),
-        managerMsg.message_id,
-        'manager.v1',
-        managerMsg.project_id,
-        null,
-        null,
-        null,
-        computedHash,
-        rawPayload,
-        'APPLIED'
-      );
-      return { success: true, message: 'Manager general decision recorded.' };
+      return { success: false, error: 'Protocol message is missing required task_id.' };
     }
 
     const task = this.repo.getTask(managerMsg.task_id);
     if (!task) {
-      this.repo.recordProtocolMessage(
-        crypto.randomUUID(),
-        managerMsg.message_id,
-        'manager.v1',
-        managerMsg.project_id,
-        managerMsg.task_id,
-        managerMsg.expected_task_state ?? null,
-        managerMsg.expected_revision ?? null,
-        computedHash,
-        rawPayload,
-        'REJECTED',
-        `Task "${managerMsg.task_id}" not found.`
-      );
       return { success: false, error: `Task "${managerMsg.task_id}" does not exist.` };
     }
 
-    // 3. Cross-Project Guard
+    // 2. Cross-Project Guard
     if (managerMsg.project_id !== task.project_id) {
       const reason = `Cross-project conflict: Protocol targets project "${managerMsg.project_id}", but task belongs to "${task.project_id}".`;
       this.repo.recordProtocolMessage(
@@ -107,14 +79,14 @@ export class TaskService {
       return { success: false, error: reason };
     }
 
-    // 4. Stale-State and Revision Guard
+    // 3. Stale State & Revision Guard
     if (managerMsg.expected_task_state && managerMsg.expected_task_state !== task.state) {
       const reason = `Stale state conflict: Manager expected state "${managerMsg.expected_task_state}", but task is in "${task.state}".`;
       this.repo.recordProtocolMessage(
         crypto.randomUUID(),
         managerMsg.message_id,
         'manager.v1',
-        managerMsg.project_id,
+        task.project_id,
         task.id,
         managerMsg.expected_task_state,
         managerMsg.expected_revision ?? null,
@@ -131,12 +103,12 @@ export class TaskService {
       managerMsg.expected_revision !== undefined &&
       managerMsg.expected_revision !== task.revision_count
     ) {
-      const reason = `Stale revision conflict: Manager expected revision ${managerMsg.expected_revision}, but current task revision is ${task.revision_count}.`;
+      const reason = `Stale revision conflict: Manager expected revision ${managerMsg.expected_revision}, but task revision is ${task.revision_count}.`;
       this.repo.recordProtocolMessage(
         crypto.randomUUID(),
         managerMsg.message_id,
         'manager.v1',
-        managerMsg.project_id,
+        task.project_id,
         task.id,
         managerMsg.expected_task_state ?? null,
         managerMsg.expected_revision,
@@ -148,11 +120,11 @@ export class TaskService {
       return { success: false, error: reason };
     }
 
-    // 5. Map Decision to State Machine Trigger
+    // 4. Map decision to trigger
     let trigger: TaskTrigger;
     switch (managerMsg.decision) {
       case 'EXECUTE':
-        trigger = task.state === 'APPROVED' ? 'ENQUEUE' : 'START_CODING';
+        trigger = 'START_CODING';
         break;
       case 'PASS':
         trigger = 'PASS_VERDICT';
@@ -163,24 +135,41 @@ export class TaskService {
       case 'BLOCK':
         trigger = 'SET_BLOCKED';
         break;
-      case 'PAUSE':
-        trigger = 'PAUSE';
-        break;
       case 'CANCEL':
         trigger = 'CANCEL';
         break;
       default:
-        trigger = 'START_CODING';
+        return { success: false, error: `Unsupported decision: ${(managerMsg as any).decision}` };
     }
 
-    // 6. Atomic Transaction Mutation
-    const mutate = () => {
-      const transitionRes = TaskStateMachine.transition(task.state, trigger, {
+    // 5. Evaluate state machine transition
+    let transitionRes;
+    try {
+      transitionRes = TaskStateMachine.transition(task.state, trigger, {
         revisionCount: task.revision_count,
         maxRevisions: task.max_revisions,
         pausedFromState: task.paused_from_state,
       });
+    } catch (err: any) {
+      const reason = `State Machine Error: ${err.message}`;
+      this.repo.recordProtocolMessage(
+        crypto.randomUUID(),
+        managerMsg.message_id,
+        'manager.v1',
+        task.project_id,
+        task.id,
+        managerMsg.expected_task_state ?? null,
+        managerMsg.expected_revision ?? null,
+        computedHash,
+        rawPayload,
+        'REJECTED',
+        reason
+      );
+      return { success: false, error: reason };
+    }
 
+    // 6. Execute atomic database transaction
+    const mutate = () => {
       this.repo.updateTaskState(
         task.id,
         transitionRes.nextState,
@@ -188,22 +177,23 @@ export class TaskService {
         transitionRes.incrementRevision
       );
 
-      // Record Review issues if FIX_REQUIRED or PASS
-      if (['PASS', 'FIX_REQUIRED'].includes(managerMsg.decision)) {
+      // Record review entity if this was a review decision
+      if (managerMsg.decision === 'PASS' || managerMsg.decision === 'FIX_REQUIRED') {
+        const reviewId = crypto.randomUUID();
         this.repo.createReview({
-          id: crypto.randomUUID(),
+          id: reviewId,
           task_id: task.id,
           attempt_id: null,
           reviewer_agent_id: null,
           verdict: managerMsg.decision === 'PASS' ? 'PASS' : 'FIX_REQUIRED',
-          summary: `Manager review verdict: ${managerMsg.decision}`,
-          issues: managerMsg.review_issues.map((iss: any) => ({
+          summary: managerMsg.instructions.join('\n') || `Manager decision: ${managerMsg.decision}`,
+          issues: (managerMsg.review_issues || []).map((iss) => ({
             id: crypto.randomUUID(),
-            review_id: '',
+            review_id: reviewId,
             severity: iss.severity,
+            file_path: iss.file_path || null,
+            line_number: iss.line_number || null,
             title: iss.title,
-            file_path: iss.file_path ?? null,
-            line_number: iss.line_number ?? null,
             description: iss.description,
             resolved: false,
           })),
@@ -246,10 +236,7 @@ export class TaskService {
     };
 
     try {
-      if (this.dbEngine) {
-        return this.dbEngine.runInTransaction(mutate);
-      }
-      return mutate();
+      return this.repo.runInTransaction(mutate);
     } catch (err: any) {
       return { success: false, error: err.message };
     }
@@ -336,16 +323,45 @@ export class TaskService {
       return { success: false, error: reason };
     }
 
-    // 4. Atomic Transition to VALIDATING
-    const mutate = () => {
-      const transitionRes = TaskStateMachine.transition(task.state, 'SUBMIT_REPORT', {
+    let trigger: TaskTrigger = 'SUBMIT_REPORT';
+    if (coderMsg.status === 'BLOCKED') {
+      trigger = 'SET_BLOCKED';
+    }
+
+    let transitionRes;
+    try {
+      transitionRes = TaskStateMachine.transition(task.state, trigger, {
         revisionCount: task.revision_count,
         maxRevisions: task.max_revisions,
+        pausedFromState: task.paused_from_state,
       });
+    } catch (err: any) {
+      const reason = `State Machine Error: ${err.message}`;
+      this.repo.recordProtocolMessage(
+        crypto.randomUUID(),
+        coderMsg.message_id,
+        'coder.v1',
+        task.project_id,
+        task.id,
+        coderMsg.expected_task_state ?? null,
+        coderMsg.expected_revision ?? null,
+        computedHash,
+        rawPayload,
+        'REJECTED',
+        reason
+      );
+      return { success: false, error: reason };
+    }
 
-      this.repo.updateTaskState(task.id, transitionRes.nextState);
+    const mutate = () => {
+      this.repo.updateTaskState(
+        task.id,
+        transitionRes.nextState,
+        transitionRes.pausedFromState,
+        transitionRes.incrementRevision
+      );
 
-      // Record protocol message
+      // Record in protocol ledger
       this.repo.recordProtocolMessage(
         crypto.randomUUID(),
         coderMsg.message_id,
@@ -362,27 +378,61 @@ export class TaskService {
       this.eventService.record(
         coderMsg.project_id,
         'CODER_REPORT_APPLIED',
-        `Coder report received for task ${task.id}. Status: ${coderMsg.status}. Transitioned to VALIDATING.`,
-        { status: coderMsg.status, claimedFiles: coderMsg.files_claimed_changed },
+        `Coder report applied to task ${task.id} (${task.state} -> ${transitionRes.nextState}). Status: ${coderMsg.status}.`,
+        { status: coderMsg.status, fromState: task.state, toState: transitionRes.nextState },
         task.id
       );
 
-      const updatedTask = this.repo.getTask(task.id)!;
-      const progress = ProgressService.calculateTaskProgress(updatedTask);
-      this.repo.updateTaskProgressCache(task.id, progress.percent);
-
       return {
         success: true,
-        message: `Coder report processed. Task ${task.id} entered VALIDATING state.`,
+        message: `Task ${task.id} transitioned to ${transitionRes.nextState}.`,
         task: this.repo.getTask(task.id)!,
       };
     };
 
     try {
-      if (this.dbEngine) {
-        return this.dbEngine.runInTransaction(mutate);
-      }
-      return mutate();
+      return this.repo.runInTransaction(mutate);
+    } catch (err: any) {
+      return { success: false, error: err.message };
+    }
+  }
+
+  public startReview(taskId: string): { success: boolean; task?: Task; error?: string } {
+    const task = this.repo.getTask(taskId);
+    if (!task) {
+      return { success: false, error: `Task ${taskId} not found.` };
+    }
+
+    if (task.state === 'REVIEWING') {
+      return { success: true, task };
+    }
+
+    if (task.state !== 'REVIEW_READY') {
+      return {
+        success: false,
+        error: `Cannot start review: Task is in state "${task.state}", expected "REVIEW_READY".`,
+      };
+    }
+
+    const trans = TaskStateMachine.transition(task.state, 'START_REVIEW', {
+      revisionCount: task.revision_count,
+      maxRevisions: task.max_revisions,
+    });
+
+    const mutate = () => {
+      this.repo.updateTaskState(task.id, trans.nextState);
+      this.eventService.record(
+        task.project_id,
+        'REVIEW_STARTED',
+        `Review started for task ${task.id}. State: REVIEWING.`,
+        { fromState: task.state, toState: trans.nextState },
+        task.id
+      );
+      return { success: true, task: this.repo.getTask(task.id)! };
+    };
+
+    try {
+      return this.repo.runInTransaction(mutate);
     } catch (err: any) {
       return { success: false, error: err.message };
     }
@@ -394,30 +444,21 @@ export class TaskService {
   ): Promise<ValidationFlowResult> {
     const task = this.repo.getTask(taskId);
     if (!task) {
-      throw new Error(`Task "${taskId}" not found.`);
+      throw new Error(`Task ${taskId} not found.`);
     }
 
     const project = this.repo.getProject(task.project_id);
     if (!project) {
-      throw new Error(`Project "${task.project_id}" not found.`);
+      throw new Error(`Project ${task.project_id} not found.`);
     }
 
     const repoPath = project.repository_path;
 
-    // Ensure task is in VALIDATING state
-    if (task.state === 'CODING') {
-      const trans = TaskStateMachine.transition(task.state, 'SUBMIT_REPORT', {
-        revisionCount: task.revision_count,
-        maxRevisions: task.max_revisions,
-      });
-      this.repo.updateTaskState(task.id, trans.nextState);
-    }
-
-    // 1. Gather Authoritative Git Evidence
+    // 1. Gather authoritative Git status & diff
     const gitStatus = await GitService.getStatus(repoPath);
     const gitDiff = await GitService.getDiff(repoPath, task.base_sha);
     const headShaRes = await GitService.getHeadSha(repoPath);
-    const currentSha = headShaRes.status === 'SUCCESS' && headShaRes.sha ? headShaRes.sha : null;
+    const currentSha = headShaRes.status === 'SUCCESS' ? headShaRes.sha : null;
 
     if (this.artifactStore) {
       if (gitStatus.status === 'SUCCESS') {
@@ -462,12 +503,19 @@ export class TaskService {
       commandConfigId
     );
 
-    // 3. Evaluate verification pass/fail gate
+    // 3. Authoritative Evidence Gate: Require Git Success AND Test Exit Code 0
+    const gitEvidenceSuccess =
+      gitStatus.status === 'SUCCESS' &&
+      gitDiff.status === 'SUCCESS' &&
+      headShaRes.status === 'SUCCESS';
+
+    const verificationPassed = gitEvidenceSuccess && testRun.exit_code === 0;
+
     const currentTask = this.repo.getTask(task.id)!;
     let nextState = currentTask.state;
 
-    if (testRun.exit_code === 0) {
-      // Verification Passed -> Advance to REVIEW_READY
+    if (verificationPassed) {
+      // Verification & Git Evidence Passed -> Advance to REVIEW_READY
       const trans = TaskStateMachine.transition(currentTask.state, 'EVIDENCE_GATHERED', {
         revisionCount: currentTask.revision_count,
         maxRevisions: currentTask.max_revisions,
@@ -482,11 +530,11 @@ export class TaskService {
         project.id,
         'VERIFICATION_PASSED',
         `Task ${task.id} verification tests passed (${testRun.passed_count} passed). Transitioned to REVIEW_READY.`,
-        { passed: testRun.passed_count, exitCode: testRun.exit_code },
+        { passed: testRun.passed_count, exitCode: testRun.exit_code, sha: currentSha },
         task.id
       );
     } else {
-      // Verification Failed -> Do NOT advance to REVIEW_READY
+      // Verification or Git Evidence Failed -> Do NOT advance to REVIEW_READY
       const trans = TaskStateMachine.transition(currentTask.state, 'TESTS_FAILED', {
         revisionCount: currentTask.revision_count,
         maxRevisions: currentTask.max_revisions,
@@ -494,11 +542,20 @@ export class TaskService {
       this.repo.updateTaskState(task.id, trans.nextState, null, trans.incrementRevision);
       nextState = trans.nextState;
 
+      const failureReason = !gitEvidenceSuccess
+        ? `Authoritative Git evidence failed (Status: ${gitStatus.status}, Diff: ${gitDiff.status}, SHA: ${headShaRes.status}).`
+        : `Verification tests failed (exit code ${testRun.exit_code}, ${testRun.failed_count} failures).`;
+
       this.eventService.record(
         project.id,
         'VERIFICATION_FAILED',
-        `Task ${task.id} verification tests failed (exit code ${testRun.exit_code}, ${testRun.failed_count} failures). Returned to ${trans.nextState}.`,
-        { failed: testRun.failed_count, exitCode: testRun.exit_code },
+        `Task ${task.id} verification failed: ${failureReason}. Returned to ${trans.nextState}.`,
+        {
+          gitStatus: gitStatus.status,
+          gitDiff: gitDiff.status,
+          testExitCode: testRun.exit_code,
+          failedCount: testRun.failed_count,
+        },
         task.id
       );
     }
@@ -513,12 +570,17 @@ export class TaskService {
     this.repo.updateTaskProgressCache(task.id, progress.percent);
 
     return {
-      success: testRun.exit_code === 0,
+      success: verificationPassed,
       taskId: task.id,
       testRun,
       gitStatus,
       gitDiff,
       finalTaskState: nextState,
+      error: !verificationPassed
+        ? !gitEvidenceSuccess
+          ? 'Git evidence collection failed.'
+          : 'Verification tests failed.'
+        : undefined,
     };
   }
 }

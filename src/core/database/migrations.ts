@@ -379,8 +379,12 @@ export const MIGRATIONS: Migration[] = [
           PRIMARY KEY(project_id, key)
         );
       `);
-
-      // 23. Verification Commands
+    },
+  },
+  {
+    version: 2,
+    name: '002_verification_commands',
+    up: (db: Database.Database) => {
       db.exec(`
         CREATE TABLE IF NOT EXISTS verification_commands (
           id TEXT PRIMARY KEY,

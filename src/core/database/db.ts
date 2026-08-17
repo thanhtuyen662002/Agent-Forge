@@ -4,18 +4,10 @@ import fs from 'fs';
 
 export class DatabaseEngine {
   private db: Database.Database | null = null;
-  private dbPath: string;
+  private dbPath: string | null = null;
 
   constructor(customPath?: string) {
-    if (customPath) {
-      this.dbPath = customPath;
-    } else {
-      const defaultDir = path.resolve(process.cwd(), '.agent-forge');
-      if (!fs.existsSync(defaultDir)) {
-        fs.mkdirSync(defaultDir, { recursive: true });
-      }
-      this.dbPath = path.join(defaultDir, 'agent-forge.db');
-    }
+    this.dbPath = customPath ?? null;
   }
 
   public setDatabasePath(customPath: string): void {
@@ -25,10 +17,20 @@ export class DatabaseEngine {
     this.dbPath = customPath;
   }
 
+  public getDatabasePath(): string | null {
+    return this.dbPath;
+  }
+
   public init(): Database.Database {
     try {
       if (this.db) {
         return this.db;
+      }
+
+      if (!this.dbPath) {
+        throw new Error(
+          '[Agent-Forge DatabaseEngine] Database path is not configured. Set database path explicitly before initialization.'
+        );
       }
 
       if (this.dbPath !== ':memory:') {

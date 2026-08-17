@@ -1,42 +1,68 @@
-import { ipcMain } from 'electron';
-import { defaultDb } from '../core/database/db';
+import { ipcMain, dialog } from 'electron';
+import path from 'path';
 import { Repository } from '../core/database/repositories';
-import { EventService } from '../core/services/EventService';
 import { ProjectService } from '../core/services/ProjectService';
 import { TaskService } from '../core/services/TaskService';
 import { GitService } from '../core/services/GitService';
 import { VerificationService } from '../core/services/VerificationService';
-import { defaultArtifactStore } from '../core/services/ArtifactStore';
-import { EmergencyStopService } from '../core/services/EmergencyStopService';
 import { ProtocolParser } from '../core/protocol/parser';
 import { PackageGenerator } from '../core/protocol/packageGenerator';
+import { defaultArtifactStore } from '../core/services/ArtifactStore';
+import { EmergencyStopService } from '../core/services/EmergencyStopService';
+import { PolicyService } from '../core/services/PolicyService';
 import {
   CreateProjectIpcSchema,
   ImportContractIpcSchema,
   TransitionProjectIpcSchema,
-  GetTasksIpcSchema,
-  GetTaskIpcSchema,
   CreateTaskIpcSchema,
-  ParseProtocolIpcSchema,
   ApplyProtocolIpcSchema,
   GenerateWorkOrderIpcSchema,
   GenerateReviewPackageIpcSchema,
+  UpdateResourceQuotaIpcSchema,
   ProjectScopedIpcSchema,
   TaskScopedIpcSchema,
   RunVerificationIpcSchema,
-  UpdateResourceQuotaIpcSchema,
-  EmergencyStopIpcSchema,
-  ResumeProjectIpcSchema,
 } from '../core/types/ipc';
 
-export function registerIpcHandlers(): void {
-  const db = defaultDb.getDb();
-  const repo = new Repository(db);
-  const eventService = new EventService(repo);
-  const projectService = new ProjectService(repo, eventService);
-  const verificationService = new VerificationService(repo, defaultArtifactStore);
-  const taskService = new TaskService(repo, eventService, verificationService, defaultArtifactStore, defaultDb);
-  const emergencyStopService = new EmergencyStopService(repo, eventService);
+export function registerIpcHandlers(
+  repo: Repository,
+  projectService: ProjectService,
+  taskService: TaskService,
+  verificationService: VerificationService,
+  emergencyStopService: EmergencyStopService
+): void {
+  // ==========================================
+  // Trusted Repository Selection Dialog
+  // ==========================================
+  ipcMain.handle('dialog:selectRepository', async () => {
+    const { canceled, filePaths } = await dialog.showOpenDialog({
+      properties: ['openDirectory'],
+      title: 'Select Git Repository for Project',
+    });
+
+    if (canceled || filePaths.length === 0) {
+      return { success: false, cancelled: true };
+    }
+
+    const selectedPath = path.normalize(path.resolve(filePaths[0]));
+
+    // Validate path against security policy
+    const policy = PolicyService.evaluatePathAccess(selectedPath, selectedPath, false);
+    if (!policy.allowed) {
+      return { success: false, error: `Invalid repository location: ${policy.reason}` };
+    }
+
+    // Verify directory is a genuine Git working tree
+    const gitStatus = await GitService.getStatus(selectedPath);
+    if (gitStatus.status !== 'SUCCESS') {
+      return {
+        success: false,
+        error: `Selected directory is not a valid Git repository (${gitStatus.errorMessage || 'git status failed'}).`,
+      };
+    }
+
+    return { success: true, repositoryPath: selectedPath };
+  });
 
   // ==========================================
   // Projects
@@ -46,7 +72,24 @@ export function registerIpcHandlers(): void {
     if (!parsed.success) {
       return { success: false, error: parsed.error.issues.map((i) => i.message).join(', ') };
     }
-    return projectService.createProject(parsed.data.name, parsed.data.description, parsed.data.repositoryPath);
+
+    const repoPath = path.normalize(path.resolve(parsed.data.repositoryPath));
+
+    // Validate path security and Git repository validity
+    const policy = PolicyService.evaluatePathAccess(repoPath, repoPath, false);
+    if (!policy.allowed) {
+      return { success: false, error: `Unauthorized repository path: ${policy.reason}` };
+    }
+
+    const gitStatus = await GitService.getStatus(repoPath);
+    if (gitStatus.status !== 'SUCCESS') {
+      return {
+        success: false,
+        error: `Repository path is not a valid Git repository: ${gitStatus.errorMessage || 'git status failed'}`,
+      };
+    }
+
+    return projectService.createProject(parsed.data.name, parsed.data.description, repoPath);
   });
 
   ipcMain.handle('project:get', async (_, payload: unknown) => {
@@ -78,59 +121,39 @@ export function registerIpcHandlers(): void {
   // ==========================================
   // Tasks
   // ==========================================
-  ipcMain.handle('task:list', async (_, payload: unknown) => {
-    const parsed = GetTasksIpcSchema.safeParse(payload);
-    if (!parsed.success) return [];
-    return repo.getTasksByProject(parsed.data.projectId);
-  });
-
-  ipcMain.handle('task:get', async (_, payload: unknown) => {
-    const parsed = GetTaskIpcSchema.safeParse(payload);
-    if (!parsed.success) return null;
-    return repo.getTask(parsed.data.taskId);
-  });
-
   ipcMain.handle('task:create', async (_, payload: unknown) => {
     const parsed = CreateTaskIpcSchema.safeParse(payload);
     if (!parsed.success) {
       return { success: false, error: parsed.error.issues.map((i) => i.message).join(', ') };
     }
-    const now = new Date().toISOString();
-    const task = {
-      id: parsed.data.id,
-      project_id: parsed.data.project_id,
-      milestone_id: parsed.data.milestone_id ?? null,
-      title: parsed.data.title,
-      description: parsed.data.description ?? null,
-      state: 'CREATED' as const,
-      paused_from_state: null,
-      priority: parsed.data.priority,
-      risk: parsed.data.risk,
-      assigned_agent_id: null,
-      revision_count: 0,
-      max_revisions: 3,
-      base_sha: null,
-      current_sha: null,
-      progress_cache_percent: 0,
-      progress_computed_at: null,
-      acceptance_criteria: parsed.data.acceptance_criteria,
-      constraints: parsed.data.constraints,
-      created_at: now,
-      updated_at: now,
-    };
-    repo.createTask(task);
-    return { success: true, task };
+    return repo.createTask(parsed.data as any);
   });
 
-  // ==========================================
-  // Protocols & Manual Bridge
-  // ==========================================
-  ipcMain.handle('protocol:parse', async (_, payload: unknown) => {
-    const parsed = ParseProtocolIpcSchema.safeParse(payload);
+  ipcMain.handle('task:get', async (_, payload: unknown) => {
+    const parsed = TaskScopedIpcSchema.safeParse(payload);
+    if (!parsed.success) return null;
+    return repo.getTask(parsed.data.taskId);
+  });
+
+  ipcMain.handle('task:list', async (_, payload: unknown) => {
+    const parsed = ProjectScopedIpcSchema.safeParse(payload);
+    if (!parsed.success) return [];
+    return repo.getTasksByProject(parsed.data.projectId);
+  });
+
+  ipcMain.handle('task:startReview', async (_, payload: unknown) => {
+    const parsed = TaskScopedIpcSchema.safeParse(payload);
     if (!parsed.success) {
       return { success: false, error: parsed.error.issues.map((i) => i.message).join(', ') };
     }
-    return ProtocolParser.parse(parsed.data.input);
+    return taskService.startReview(parsed.data.taskId);
+  });
+
+  // ==========================================
+  // Protocols & Package Generation
+  // ==========================================
+  ipcMain.handle('protocol:parse', async (_, rawInput: string) => {
+    return ProtocolParser.parse(rawInput);
   });
 
   ipcMain.handle('protocol:apply', async (_, payload: unknown) => {
@@ -139,18 +162,18 @@ export function registerIpcHandlers(): void {
       return { success: false, error: parsed.error.issues.map((i) => i.message).join(', ') };
     }
 
-    const parseResult = ProtocolParser.parse(parsed.data.rawInput);
-    if (!parseResult.success || !parseResult.protocolType || !parseResult.data) {
-      return { success: false, error: parseResult.error || 'Failed to parse protocol envelope.' };
+    const parseRes = ProtocolParser.parse(parsed.data.rawInput);
+    if (!parseRes.success || !parseRes.data) {
+      return { success: false, error: `Invalid protocol format: ${parseRes.error}` };
     }
 
-    if (parseResult.protocolType === 'manager.v1') {
-      return taskService.applyManagerDecision(parseResult.data as any, parsed.data.rawInput);
-    } else if (parseResult.protocolType === 'coder.v1') {
-      return taskService.applyCoderReport(parseResult.data as any, parsed.data.rawInput);
+    if (parseRes.data.type === 'manager.v1') {
+      return taskService.applyManagerDecision(parseRes.data.data, parsed.data.rawInput);
+    } else if (parseRes.data.type === 'coder.v1') {
+      return taskService.applyCoderReport(parseRes.data.data, parsed.data.rawInput);
     }
 
-    return { success: false, error: `Unsupported protocol type for auto-apply: ${parseResult.protocolType}` };
+    return { success: false, error: 'Unrecognized protocol payload type.' };
   });
 
   ipcMain.handle('protocol:generateWorkOrder', async (_, payload: unknown) => {
@@ -176,9 +199,17 @@ export function registerIpcHandlers(): void {
     }
 
     const project = repo.getProject(parsed.data.projectId);
-    const task = repo.getTask(parsed.data.taskId);
+    let task = repo.getTask(parsed.data.taskId);
     if (!project || !task) {
       return { success: false, error: 'Project or Task not found.' };
+    }
+
+    // Atomically advance task to REVIEWING if in REVIEW_READY
+    if (task.state === 'REVIEW_READY') {
+      const reviewStartRes = taskService.startReview(task.id);
+      if (reviewStartRes.success && reviewStartRes.task) {
+        task = reviewStartRes.task;
+      }
     }
 
     // Authoritative evidence loaded from SQLite
@@ -186,13 +217,43 @@ export function registerIpcHandlers(): void {
     const gitDiffEv = repo.getLatestEvidence(task.id, 'GIT_DIFF');
     const reviews = repo.getReviewsByTask(task.id);
 
-    const diffContent = gitDiffEv ? defaultArtifactStore.read(gitDiffEv) : '';
-    const diffStat = gitDiffEv ? gitDiffEv.summary : 'No Git diff evidence recorded.';
+    let diffContent = '';
+    let diffStat = 'No Git diff evidence recorded.';
+
+    if (gitDiffEv) {
+      try {
+        diffContent = defaultArtifactStore.read(gitDiffEv);
+        diffStat = gitDiffEv.summary;
+      } catch {
+        diffContent = gitDiffEv.raw_payload || '';
+      }
+    } else {
+      // Fallback: query live git diff
+      const liveDiff = await GitService.getDiff(project.repository_path, task.base_sha);
+      if (liveDiff.status === 'SUCCESS') {
+        diffContent = liveDiff.diffContent;
+        diffStat = liveDiff.diffStat;
+      }
+    }
+
+    // Restore latest applied coder report from protocol ledger
+    const taskMessages = repo.getProtocolMessagesByTask(task.id);
+    const coderMsgRecord = taskMessages
+      .filter((m) => m.protocol === 'coder.v1' && m.status === 'APPLIED')
+      .pop();
+
+    let coderReport = null;
+    if (coderMsgRecord && coderMsgRecord.raw_payload) {
+      const parsedCoder = ProtocolParser.parse(String(coderMsgRecord.raw_payload));
+      if (parsedCoder.success && parsedCoder.data?.type === 'coder.v1') {
+        coderReport = parsedCoder.data.data;
+      }
+    }
 
     const reviewPackage = PackageGenerator.generateReviewPackage(
       project,
       task,
-      null,
+      coderReport,
       diffStat,
       diffContent,
       latestTestRun,
@@ -248,17 +309,22 @@ export function registerIpcHandlers(): void {
   });
 
   // ==========================================
-  // Resources & Agents
+  // Providers & Agents
   // ==========================================
-  ipcMain.handle('resources:list', async () => {
+  ipcMain.handle('providers:listResources', async () => {
     return repo.getAllProviderResources();
   });
 
-  ipcMain.handle('resources:updateQuota', async (_, payload: unknown) => {
+  ipcMain.handle('agents:list', async () => {
+    return repo.getAllAgents();
+  });
+
+  ipcMain.handle('providers:updateResourceQuota', async (_, payload: unknown) => {
     const parsed = UpdateResourceQuotaIpcSchema.safeParse(payload);
     if (!parsed.success) {
       return { success: false, error: parsed.error.issues.map((i) => i.message).join(', ') };
     }
+
     repo.updateProviderResourceQuota(
       parsed.data.id,
       parsed.data.remaining,
@@ -269,39 +335,29 @@ export function registerIpcHandlers(): void {
     return { success: true };
   });
 
-  ipcMain.handle('agents:list', async () => {
-    return repo.getAllAgents();
-  });
-
   // ==========================================
-  // Evidence & Audit Events
+  // Events & Evidence Queries
   // ==========================================
-  ipcMain.handle('evidence:list', async (_, payload: unknown) => {
-    const parsed = ProjectScopedIpcSchema.safeParse(payload);
-    if (!parsed.success) return [];
-    return repo.getAllEvidence(parsed.data.projectId);
-  });
-
   ipcMain.handle('events:list', async (_, payload: unknown) => {
     const parsed = ProjectScopedIpcSchema.safeParse(payload);
     if (!parsed.success) return [];
     return repo.getEventsByProject(parsed.data.projectId);
   });
 
+  ipcMain.handle('evidence:list', async (_, payload: unknown) => {
+    const parsed = ProjectScopedIpcSchema.safeParse(payload);
+    if (!parsed.success) return [];
+    return repo.getEvidenceByProject(parsed.data.projectId);
+  });
+
   // ==========================================
-  // Safety & Emergency Stop
+  // Emergency Controls
   // ==========================================
-  ipcMain.handle('emergency:stop', async (_, payload: unknown) => {
-    const parsed = EmergencyStopIpcSchema.safeParse(payload);
-    const reason = parsed.success ? parsed.data.reason : 'Manual Owner Emergency Stop';
+  ipcMain.handle('control:emergencyStop', async (_, reason?: string) => {
     return emergencyStopService.triggerEmergencyStop(reason);
   });
 
-  ipcMain.handle('emergency:resumeProject', async (_, payload: unknown) => {
-    const parsed = ResumeProjectIpcSchema.safeParse(payload);
-    if (!parsed.success) {
-      return { success: false, error: parsed.error.issues.map((i) => i.message).join(', ') };
-    }
-    return emergencyStopService.resumeProject(parsed.data.projectId);
+  ipcMain.handle('control:resume', async (_, projectId: string) => {
+    return emergencyStopService.resumeProject(projectId);
   });
 }

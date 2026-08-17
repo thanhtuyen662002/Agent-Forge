@@ -6,6 +6,10 @@ import { defaultDb } from '../core/database/db';
 import { defaultArtifactStore } from '../core/services/ArtifactStore';
 import { Repository } from '../core/database/repositories';
 import { EventService } from '../core/services/EventService';
+import { ProjectService } from '../core/services/ProjectService';
+import { TaskService } from '../core/services/TaskService';
+import { VerificationService } from '../core/services/VerificationService';
+import { EmergencyStopService } from '../core/services/EmergencyStopService';
 import { CrashRecoveryService } from '../core/services/CrashRecoveryService';
 import { registerIpcHandlers } from './ipcHandlers';
 
@@ -174,10 +178,16 @@ app.whenReady().then(() => {
   // 4. Seed default resources if database is empty
   seedDefaultResources(repo);
 
-  // 5. Register Typed & Validated IPC Handlers
-  registerIpcHandlers();
+  // 5. Initialize Application Core Services
+  const projectService = new ProjectService(repo, eventService);
+  const verificationService = new VerificationService(repo, defaultArtifactStore);
+  const taskService = new TaskService(repo, eventService, verificationService, defaultArtifactStore);
+  const emergencyStopService = new EmergencyStopService(repo, eventService);
 
-  // 6. Create Desktop Window
+  // 6. Register Typed & Validated IPC Handlers
+  registerIpcHandlers(repo, projectService, taskService, verificationService, emergencyStopService);
+
+  // 7. Create Desktop Window
   createWindow();
 
   app.on('activate', () => {

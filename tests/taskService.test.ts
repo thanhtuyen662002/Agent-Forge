@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeEach, afterEach } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import Database from 'better-sqlite3';
 import { MigrationRunner } from '../src/core/database/migrations';
 import { Repository } from '../src/core/database/repositories';
@@ -211,5 +211,64 @@ describe('TaskService & Protocol Idempotency', () => {
     const res = taskService.applyCoderReport(coderMsg, JSON.stringify(coderMsg));
     expect(res.success).toBe(false);
     expect(res.error).toContain('Stale revision conflict');
+  });
+
+  it('should rollback transaction on injected failure and allow clean retry', () => {
+    const managerMsg: ManagerProtocol = {
+      protocol: 'manager.v1',
+      message_id: 'msg-fail-inject-1',
+      project_id: 'PROJ-TEST',
+      task_id: 'TSK-001',
+      decision: 'EXECUTE',
+      priority: 'HIGH',
+      risk: 'MEDIUM',
+      instructions: ['Execute feature'],
+      acceptance_criteria: [],
+      constraints: [],
+      review_issues: [],
+      expected_task_state: 'PLANNED',
+      expected_revision: 0,
+    };
+
+    // Inject failure into recordProtocolMessage midway through mutation
+    const origRecord = repo.recordProtocolMessage.bind(repo);
+    const spy = vi.spyOn(repo, 'recordProtocolMessage').mockImplementation(() => {
+      throw new Error('Injected Database Write Failure');
+    });
+
+    const res1 = taskService.applyManagerDecision(managerMsg, JSON.stringify(managerMsg));
+    expect(res1.success).toBe(false);
+    expect(res1.error).toContain('Injected Database Write Failure');
+
+    // Assert complete rollback
+    const taskAfterFail = repo.getTask('TSK-001')!;
+    expect(taskAfterFail.state).toBe('PLANNED'); // Unchanged!
+
+    const events = repo.getEvents('PROJ-TEST');
+    expect(events.filter((e) => e.type === 'MANAGER_DECISION_APPLIED').length).toBe(0);
+
+    const msgs = repo.getProtocolMessagesByTask('TSK-001');
+    expect(msgs.length).toBe(0);
+
+    // Restore original method and retry
+    spy.mockRestore();
+
+    const res2 = taskService.applyManagerDecision(managerMsg, JSON.stringify(managerMsg));
+    expect(res2.success).toBe(true);
+
+    const taskAfterSuccess = repo.getTask('TSK-001')!;
+    expect(taskAfterSuccess.state).toBe('CODING');
+    expect(repo.getProtocolMessagesByTask('TSK-001').length).toBe(1);
+  });
+
+  it('should transition REVIEW_READY to REVIEWING via startReview', () => {
+    repo.updateTaskState('TSK-001', 'REVIEW_READY');
+
+    const res = taskService.startReview('TSK-001');
+    expect(res.success).toBe(true);
+    expect(res.task!.state).toBe('REVIEWING');
+
+    const dbTask = repo.getTask('TSK-001')!;
+    expect(dbTask.state).toBe('REVIEWING');
   });
 });

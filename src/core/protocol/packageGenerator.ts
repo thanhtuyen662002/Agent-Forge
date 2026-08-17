@@ -2,8 +2,6 @@ import {
   Project,
   Task,
   Review,
-  ReviewIssue,
-  Evidence,
   TestRun,
 } from '../types/domain';
 import { CoderProtocol } from '../types/protocols';
@@ -128,6 +126,19 @@ ${coderReport.tests_claimed.map((t) => `  - ${t}`).join('\n') || '  - None'}
 `
       : '⚠️ [TEST EVIDENCE UNAVAILABLE / NOT RUN / ERROR]';
 
+    // Format Bounded Diff Content
+    const MAX_DIFF_LENGTH = 32 * 1024;
+    let formattedDiff = '';
+    if (!gitDiffContent || !gitDiffContent.trim()) {
+      formattedDiff = '(No git diff detected)';
+    } else if (gitDiffContent.length <= MAX_DIFF_LENGTH) {
+      formattedDiff = gitDiffContent;
+    } else {
+      formattedDiff =
+        gitDiffContent.substring(0, MAX_DIFF_LENGTH) +
+        `\n\n... [TRUNCATED: Diff is ${gitDiffContent.length} characters. Full diff stored in ArtifactStore]`;
+    }
+
     return `# REVIEW PACKAGE: ${task.id} — ${task.title}
 
 ## Task Overview
@@ -148,6 +159,11 @@ ${criteriaList}
 ### Git Diff Statistics
 \`\`\`text
 ${gitDiffStat || 'No Git diff statistics available.'}
+\`\`\`
+
+### Real Git Diff
+\`\`\`diff
+${formattedDiff}
 \`\`\`
 
 ### Automated Test Execution Evidence

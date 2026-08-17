@@ -184,6 +184,18 @@ export class GitService {
       timeoutMs: 20000,
     });
 
+    if (statRes.exitCode !== 0) {
+      return {
+        status: 'ERROR',
+        diffStat: '',
+        diffContent: '',
+        filesChanged: [],
+        insertions: 0,
+        deletions: 0,
+        errorMessage: statRes.stderr.trim() || 'Git diff --stat command failed',
+      };
+    }
+
     // 3. Get list of changed files
     const nameRes = await ProcessRunner.execute({
       executable: 'git',
@@ -191,6 +203,18 @@ export class GitService {
       cwd: repoPath,
       timeoutMs: 20000,
     });
+
+    if (nameRes.exitCode !== 0) {
+      return {
+        status: 'ERROR',
+        diffStat: '',
+        diffContent: '',
+        filesChanged: [],
+        insertions: 0,
+        deletions: 0,
+        errorMessage: nameRes.stderr.trim() || 'Git diff --name-only command failed',
+      };
+    }
 
     const filesChanged = nameRes.stdout
       .split('\n')
