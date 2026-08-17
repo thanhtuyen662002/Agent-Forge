@@ -1,52 +1,100 @@
 import { ProcessRunner } from './ProcessRunner';
 import { PolicyService } from './PolicyService';
+import { GitStatusSummary, GitDiffSummary } from '../types/domain';
 
-export interface GitStatusSummary {
-  branch: string;
-  isClean: boolean;
-  modifiedFiles: string[];
-  untrackedFiles: string[];
-  aheadCount: number;
-  behindCount: number;
+export interface GitShaResult {
+  status: 'SUCCESS' | 'ERROR' | 'UNKNOWN';
+  sha: string | null;
+  errorMessage?: string;
 }
 
-export interface GitDiffSummary {
-  diffStat: string;
-  diffContent: string;
-  filesChanged: string[];
-  insertions: number;
-  deletions: number;
+export interface GitBranchResult {
+  status: 'SUCCESS' | 'ERROR' | 'UNKNOWN';
+  branch: string | null;
+  errorMessage?: string;
 }
 
 export class GitService {
-  public static async getHeadSha(repoPath: string): Promise<string> {
+  public static async getHeadSha(repoPath: string): Promise<GitShaResult> {
+    const policy = PolicyService.evaluatePathAccess(repoPath, repoPath, false);
+    if (!policy.allowed) {
+      return {
+        status: 'ERROR',
+        sha: null,
+        errorMessage: `Path policy denial: ${policy.reason}`,
+      };
+    }
+
     const res = await ProcessRunner.execute({
       executable: 'git',
       args: ['rev-parse', 'HEAD'],
       cwd: repoPath,
       timeoutMs: 10000,
     });
-    if (res.exitCode !== 0) {
-      return 'UNKNOWN_SHA';
+
+    if (res.exitCode !== 0 || !res.stdout.trim()) {
+      return {
+        status: 'ERROR',
+        sha: null,
+        errorMessage: res.stderr.trim() || 'Failed to resolve HEAD SHA (not a git repository or no commits)',
+      };
     }
-    return res.stdout.trim();
+
+    return {
+      status: 'SUCCESS',
+      sha: res.stdout.trim(),
+    };
   }
 
-  public static async getCurrentBranch(repoPath: string): Promise<string> {
+  public static async getCurrentBranch(repoPath: string): Promise<GitBranchResult> {
+    const policy = PolicyService.evaluatePathAccess(repoPath, repoPath, false);
+    if (!policy.allowed) {
+      return {
+        status: 'ERROR',
+        branch: null,
+        errorMessage: `Path policy denial: ${policy.reason}`,
+      };
+    }
+
     const res = await ProcessRunner.execute({
       executable: 'git',
       args: ['branch', '--show-current'],
       cwd: repoPath,
       timeoutMs: 10000,
     });
+
     if (res.exitCode !== 0) {
-      return 'main';
+      return {
+        status: 'ERROR',
+        branch: null,
+        errorMessage: res.stderr.trim() || 'Failed to determine current branch',
+      };
     }
-    return res.stdout.trim() || 'HEAD';
+
+    return {
+      status: 'SUCCESS',
+      branch: res.stdout.trim() || 'HEAD',
+    };
   }
 
   public static async getStatus(repoPath: string): Promise<GitStatusSummary> {
-    const branch = await this.getCurrentBranch(repoPath);
+    const policy = PolicyService.evaluatePathAccess(repoPath, repoPath, false);
+    if (!policy.allowed) {
+      return {
+        status: 'ERROR',
+        branch: 'UNKNOWN',
+        isClean: false,
+        modifiedFiles: [],
+        untrackedFiles: [],
+        aheadCount: 0,
+        behindCount: 0,
+        errorMessage: `Path policy denial: ${policy.reason}`,
+      };
+    }
+
+    const branchRes = await this.getCurrentBranch(repoPath);
+    const branchName = branchRes.status === 'SUCCESS' && branchRes.branch ? branchRes.branch : 'UNKNOWN';
+
     const res = await ProcessRunner.execute({
       executable: 'git',
       args: ['status', '--porcelain'],
@@ -56,12 +104,14 @@ export class GitService {
 
     if (res.exitCode !== 0) {
       return {
-        branch,
-        isClean: true,
+        status: 'ERROR',
+        branch: branchName,
+        isClean: false,
         modifiedFiles: [],
         untrackedFiles: [],
         aheadCount: 0,
         behindCount: 0,
+        errorMessage: res.stderr.trim() || 'Git status command failed',
       };
     }
 
@@ -80,7 +130,8 @@ export class GitService {
     }
 
     return {
-      branch,
+      status: 'SUCCESS',
+      branch: branchName,
       isClean: lines.length === 0,
       modifiedFiles,
       untrackedFiles,
@@ -90,6 +141,19 @@ export class GitService {
   }
 
   public static async getDiff(repoPath: string, baseSha?: string | null): Promise<GitDiffSummary> {
+    const policy = PolicyService.evaluatePathAccess(repoPath, repoPath, false);
+    if (!policy.allowed) {
+      return {
+        status: 'ERROR',
+        diffStat: '',
+        diffContent: '',
+        filesChanged: [],
+        insertions: 0,
+        deletions: 0,
+        errorMessage: `Path policy denial: ${policy.reason}`,
+      };
+    }
+
     const args = baseSha ? ['diff', baseSha] : ['diff', 'HEAD'];
 
     // 1. Get raw diff
@@ -99,6 +163,18 @@ export class GitService {
       cwd: repoPath,
       timeoutMs: 20000,
     });
+
+    if (diffRes.exitCode !== 0) {
+      return {
+        status: 'ERROR',
+        diffStat: '',
+        diffContent: '',
+        filesChanged: [],
+        insertions: 0,
+        deletions: 0,
+        errorMessage: diffRes.stderr.trim() || 'Git diff command failed',
+      };
+    }
 
     // 2. Get diff stat
     const statRes = await ProcessRunner.execute({
@@ -122,7 +198,8 @@ export class GitService {
       .filter((f) => f.length > 0);
 
     return {
-      diffStat: statRes.stdout.trim() || 'No changes detected.',
+      status: 'SUCCESS',
+      diffStat: statRes.stdout.trim() || '0 files changed',
       diffContent: diffRes.stdout.trim(),
       filesChanged,
       insertions: 0,

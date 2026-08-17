@@ -91,7 +91,7 @@ When work is complete, return your final report strictly in the following JSON f
     task: Task,
     coderReport: CoderProtocol | null,
     gitDiffStat: string,
-    gitDiffSummary: string,
+    gitDiffContent: string,
     testRun: TestRun | null,
     previousReviews: Review[] = []
   ): string {
@@ -121,11 +121,12 @@ ${coderReport.tests_claimed.map((t) => `  - ${t}`).join('\n') || '  - None'}
     const testEvidenceText = testRun
       ? `
 - **Command**: \`${testRun.command}\`
-- **Exit Code**: \`${testRun.exit_code}\` (${testRun.exit_code === 0 ? 'PASSED' : 'FAILED'})
-- **Results**: ${testRun.passed_count} Passed | ${testRun.failed_count} Failed | ${testRun.skipped_count} Skipped
+- **Authoritative Verdict**: ${testRun.exit_code === 0 ? '🟢 PASSED' : '🔴 FAILED'} (Exit Code: \`${testRun.exit_code}\`)
+- **Metrics**: ${testRun.passed_count} Passed | ${testRun.failed_count} Failed | ${testRun.skipped_count} Skipped
 - **Duration**: ${testRun.duration_ms}ms
+- **Evidence Reference**: \`${testRun.evidence_id || 'INLINE'}\`
 `
-      : 'No automated test run executed.';
+      : '⚠️ [TEST EVIDENCE UNAVAILABLE / NOT RUN / ERROR]';
 
     return `# REVIEW PACKAGE: ${task.id} — ${task.title}
 
@@ -134,26 +135,27 @@ ${coderReport.tests_claimed.map((t) => `  - ${t}`).join('\n') || '  - None'}
 - **Task ID**: \`${task.id}\`
 - **Priority**: \`${task.priority}\` | **Risk**: \`${task.risk}\`
 - **Current Revision**: ${task.revision_count} / ${task.max_revisions}
-- **Current SHA**: \`${task.current_sha || 'UNKNOWN'}\`
+- **Base SHA**: \`${task.base_sha || 'HEAD'}\`
+- **Working SHA**: \`${task.current_sha || 'UNCOMMITTED / UNKNOWN'}\`
 
 ### Acceptance Criteria
 ${criteriaList}
 
 ---
 
-## Authoritative Verification Evidence
+## Authoritative Verification Evidence (Ground Truth)
 
-### Git Changes (Authoritative Git CLI)
+### Git Diff Statistics
 \`\`\`text
-${gitDiffStat || 'No changes detected in working tree / commit.'}
+${gitDiffStat || 'No Git diff statistics available.'}
 \`\`\`
 
-### Automated Test Verification
+### Automated Test Execution Evidence
 ${testEvidenceText}
 
 ---
 
-## Coder Self-Report (Informational)
+## Coder Self-Report (Informational — Non-Authoritative)
 ${coderClaimsText}
 
 ---

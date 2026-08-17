@@ -19,6 +19,13 @@ Agent-Forge guarantees that the durable source of truth resides entirely in:
 
 ---
 
+## Current Status: `MVP_CORE_HARDENING`
+
+- **Automated Provider Adapters**: **NOT YET IMPLEMENTED** (Intentionally deferred; system operates via the **Owner Manual Bridge**).
+- **Desktop Packaging**: **NOT YET IMPLEMENTED** (Windows `.exe` installer packaging is deferred; production bundle compilation via `npm run build` is fully verified).
+
+---
+
 ## Operating Modes
 
 ### MVP Operating Mode (Manual Bridge)
@@ -41,16 +48,15 @@ In the initial release, the human owner serves as the manual transport bridge:
 │                 React 19 Owner Control Center               │
 │         (Dashboard, Manual Bridge, Kanban, Timeline)        │
 └──────────────────────────────┬──────────────────────────────┘
-                               │ Typed IPC API (contextIsolation)
+                               │ Typed IPC API (contextIsolation=true)
                                ▼
 ┌─────────────────────────────────────────────────────────────┐
 │                 Electron Main Process Core                  │
 │                                                             │
-│   ProjectService      TaskService         AgentService      │
-│   StateMachine        EventService        EvidenceService   │
-│   GitService          PolicyService       QuotaService      │
-│   HandoffService      ProgressService     ArtifactStore     │
-│   ProcessRunner       CheckpointService   RecoveryService   │
+│   ProjectService      TaskService         EventService      │
+│   StateMachine        GitService          PolicyService     │
+│   ProgressService     ArtifactStore       Verification      │
+│   ProcessRunner       CrashRecovery       EmergencyStop     │
 └──────────────┬───────────────────────────────┬──────────────┘
                │                               │
                ▼                               ▼
@@ -70,18 +76,21 @@ In the initial release, the human owner serves as the manual transport bridge:
 - **Git**: `v2.40+`
 - **C/C++ Build Tools**: Required for compiling `better-sqlite3` native binaries (`node-gyp`, Visual Studio C++ Build Tools on Windows).
 
-### Installation & Build
+### Commands & Scripts
 ```powershell
 # Install dependencies
 npm install
 
-# Start Vite dev server + Electron desktop window
+# Start Vite dev server (browser preview)
 npm run dev
+
+# Start Electron desktop application
+npm run dev:electron
 
 # Run automated tests
 npm test
 
-# Build production desktop bundle
+# Build production bundle (frontend + electron main)
 npm run build
 ```
 

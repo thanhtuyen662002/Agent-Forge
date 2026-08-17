@@ -30,6 +30,7 @@ describe('Database Migrations', () => {
     expect(tableNames).toContain('evidence');
     expect(tableNames).toContain('events');
     expect(tableNames).toContain('decisions');
+    expect(tableNames).toContain('verification_commands');
     expect(tableNames).toContain('schema_migrations');
   });
 

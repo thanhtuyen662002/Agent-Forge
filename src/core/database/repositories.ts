@@ -328,6 +328,12 @@ export class Repository {
     return row ?? null;
   }
 
+  public getProtocolMessagesByTask(taskId: string): Record<string, unknown>[] {
+    return this.db
+      .prepare('SELECT * FROM protocol_messages WHERE task_id = ? ORDER BY created_at ASC')
+      .all(taskId) as Record<string, unknown>[];
+  }
+
   // ==========================================
   // Providers & Provider Resources
   // ==========================================
@@ -395,7 +401,7 @@ export class Repository {
 
   public updateProviderResourceQuota(
     id: string,
-    remaining: number,
+    remaining: number | null,
     total: number | null,
     source: string,
     confidence: number
@@ -625,6 +631,10 @@ export class Repository {
     }));
   }
 
+  public getEventsByProject(projectId: string, limit: number = 100): EventRecord[] {
+    return this.getEvents(projectId, limit);
+  }
+
   // ==========================================
   // Checkpoints & Handoffs
   // ==========================================
@@ -682,18 +692,183 @@ export class Repository {
       .run(h.id, h.task_id, h.attempt_id, h.previous_agent_id, h.reason, JSON.stringify(h.payload), h.created_at);
   }
 
-  public getHandoffsByTask(taskId: string): Handoff[] {
+  public getAgent(id: string): Agent | null {
+    const row = this.db.prepare('SELECT * FROM agents WHERE id = ?').get(id) as Record<string, unknown> | undefined;
+    if (!row) return null;
+    return {
+      id: String(row.id),
+      display_name: String(row.display_name),
+      role: row.role as any,
+      provider_resource_id: row.provider_resource_id ? String(row.provider_resource_id) : null,
+      status: row.status as any,
+      current_task_id: row.current_task_id ? String(row.current_task_id) : null,
+      last_seen_at: String(row.last_seen_at),
+    };
+  }
+
+  // ==========================================
+  // Verification Commands
+  // ==========================================
+  public createVerificationCommand(cmd: {
+    id: string;
+    project_id: string;
+    name: string;
+    command_type: string;
+    executable: string;
+    args: string[];
+    timeout_ms?: number;
+    enabled?: boolean;
+  }): void {
+    this.db
+      .prepare(`
+        INSERT INTO verification_commands (id, project_id, name, command_type, executable, args_json, timeout_ms, enabled)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+      `)
+      .run(
+        cmd.id,
+        cmd.project_id,
+        cmd.name,
+        cmd.command_type,
+        cmd.executable,
+        JSON.stringify(cmd.args),
+        cmd.timeout_ms ?? 60000,
+        cmd.enabled !== false ? 1 : 0
+      );
+  }
+
+  public getVerificationCommandsByProject(projectId: string): any[] {
     const rows = this.db
-      .prepare('SELECT * FROM handoffs WHERE task_id = ? ORDER BY created_at DESC')
-      .all(taskId) as Record<string, unknown>[];
+      .prepare('SELECT * FROM verification_commands WHERE project_id = ? AND enabled = 1')
+      .all(projectId) as Record<string, unknown>[];
     return rows.map((r) => ({
       id: String(r.id),
-      task_id: String(r.task_id),
-      attempt_id: r.attempt_id ? String(r.attempt_id) : null,
-      previous_agent_id: r.previous_agent_id ? String(r.previous_agent_id) : null,
-      reason: r.reason as any,
-      payload: r.payload_json ? JSON.parse(String(r.payload_json)) : {},
-      created_at: String(r.created_at),
+      project_id: String(r.project_id),
+      name: String(r.name),
+      command_type: String(r.command_type),
+      executable: String(r.executable),
+      args: r.args_json ? JSON.parse(String(r.args_json)) : [],
+      timeout_ms: Number(r.timeout_ms),
+      enabled: Boolean(r.enabled),
     }));
+  }
+
+  public getVerificationCommandById(id: string): any | null {
+    const row = this.db.prepare('SELECT * FROM verification_commands WHERE id = ?').get(id) as Record<string, unknown> | undefined;
+    if (!row) return null;
+    return {
+      id: String(row.id),
+      project_id: String(row.project_id),
+      name: String(row.name),
+      command_type: String(row.command_type),
+      executable: String(row.executable),
+      args: row.args_json ? JSON.parse(String(row.args_json)) : [],
+      timeout_ms: Number(row.timeout_ms),
+      enabled: Boolean(row.enabled),
+    };
+  }
+
+  // ==========================================
+  // Test Runs
+  // ==========================================
+  public createTestRun(testRun: TestRun): void {
+    this.db
+      .prepare(`
+        INSERT INTO test_runs (id, task_id, command, passed_count, failed_count, skipped_count, duration_ms, exit_code, evidence_id, created_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      `)
+      .run(
+        testRun.id,
+        testRun.task_id,
+        testRun.command,
+        testRun.passed_count,
+        testRun.failed_count,
+        testRun.skipped_count,
+        testRun.duration_ms,
+        testRun.exit_code,
+        testRun.evidence_id,
+        testRun.created_at
+      );
+  }
+
+  public getLatestTestRun(taskId: string): TestRun | null {
+    const row = this.db
+      .prepare('SELECT * FROM test_runs WHERE task_id = ? ORDER BY created_at DESC LIMIT 1')
+      .get(taskId) as Record<string, unknown> | undefined;
+    if (!row) return null;
+    return {
+      id: String(row.id),
+      task_id: String(row.task_id),
+      command: String(row.command),
+      passed_count: Number(row.passed_count),
+      failed_count: Number(row.failed_count),
+      skipped_count: Number(row.skipped_count),
+      duration_ms: Number(row.duration_ms),
+      exit_code: Number(row.exit_code),
+      evidence_id: row.evidence_id ? String(row.evidence_id) : null,
+      created_at: String(row.created_at),
+    };
+  }
+
+  public getLatestEvidence(taskId: string, evidenceType: string): Evidence | null {
+    const row = this.db
+      .prepare('SELECT * FROM evidence WHERE task_id = ? AND evidence_type = ? ORDER BY created_at DESC LIMIT 1')
+      .get(taskId, evidenceType) as Record<string, unknown> | undefined;
+    if (!row) return null;
+    return {
+      id: String(row.id),
+      project_id: String(row.project_id),
+      task_id: row.task_id ? String(row.task_id) : null,
+      attempt_id: row.attempt_id ? String(row.attempt_id) : null,
+      evidence_type: row.evidence_type as any,
+      storage_type: row.storage_type as any,
+      file_path: row.file_path ? String(row.file_path) : null,
+      hash: String(row.hash),
+      byte_size: Number(row.byte_size),
+      content_type: String(row.content_type),
+      summary: String(row.summary),
+      raw_payload: row.raw_payload ? String(row.raw_payload) : null,
+      created_at: String(row.created_at),
+    };
+  }
+
+  // ==========================================
+  // Process Runs
+  // ==========================================
+  public createProcessRun(run: {
+    id: string;
+    pid: number | null;
+    command: string;
+    working_directory: string;
+    status: 'RUNNING' | 'COMPLETED' | 'FAILED' | 'CANCELLED' | 'TIMED_OUT';
+    start_time: string;
+  }): void {
+    this.db
+      .prepare(`
+        INSERT INTO process_runs (id, pid, command, working_directory, status, start_time, end_time, exit_code, stdout_evidence_id, stderr_evidence_id, created_at)
+        VALUES (?, ?, ?, ?, ?, ?, NULL, NULL, NULL, NULL, ?)
+      `)
+      .run(run.id, run.pid, run.command, run.working_directory, run.status, run.start_time, run.start_time);
+  }
+
+  public updateProcessRun(
+    id: string,
+    status: 'COMPLETED' | 'FAILED' | 'CANCELLED' | 'TIMED_OUT',
+    exitCode: number | null,
+    endTime: string,
+    stdoutEvidenceId?: string | null,
+    stderrEvidenceId?: string | null
+  ): void {
+    this.db
+      .prepare(`
+        UPDATE process_runs
+        SET status = ?, exit_code = ?, end_time = ?, stdout_evidence_id = COALESCE(?, stdout_evidence_id), stderr_evidence_id = COALESCE(?, stderr_evidence_id)
+        WHERE id = ?
+      `)
+      .run(status, exitCode, endTime, stdoutEvidenceId ?? null, stderrEvidenceId ?? null, id);
+  }
+
+  public getProcessRun(id: string): any | null {
+    const row = this.db.prepare('SELECT * FROM process_runs WHERE id = ?').get(id) as Record<string, unknown> | undefined;
+    return row ?? null;
   }
 }

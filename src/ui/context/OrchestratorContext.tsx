@@ -25,17 +25,16 @@ interface OrchestratorContextType {
   setSelectedTaskId: (taskId: string | null) => void;
   setIsEmergencyStopOpen: (open: boolean) => void;
   refreshData: () => Promise<void>;
-  createProject: (data: { name: string; description: string; repositoryPath: string; defaultBranch?: string }) => Promise<Project>;
+  createProject: (data: { name: string; description?: string; repositoryPath: string; defaultBranch?: string }) => Promise<Project>;
   importContract: (contract: any) => Promise<boolean>;
   transitionProject: (trigger: string) => Promise<void>;
   createTask: (task: Partial<Task>) => Promise<void>;
   parseProtocol: (input: string) => Promise<any>;
-  applyManagerProtocol: (data: { managerMsg: any; rawPayload: string; payloadHash: string }) => Promise<any>;
-  applyCoderProtocol: (data: { coderMsg: any; rawPayload: string; payloadHash: string }) => Promise<any>;
+  applyProtocol: (rawInput: string) => Promise<any>;
   generateWorkOrder: (taskId: string) => Promise<string>;
-  generateReviewPackage: (taskId: string, coderReport: any) => Promise<string>;
-  runVerificationTests: (taskId: string, command?: string) => Promise<any>;
-  updateResourceQuota: (id: string, remaining: number, total: number | null, source: string, confidence: number) => Promise<void>;
+  generateReviewPackage: (taskId: string) => Promise<string>;
+  runVerificationTests: (taskId: string, commandConfigId?: string) => Promise<any>;
+  updateResourceQuota: (id: string, remaining: number | null, total: number | null, source: string, confidence: number) => Promise<void>;
   triggerEmergencyStop: (reason?: string) => Promise<any>;
   resumeProject: () => Promise<void>;
 }
@@ -58,18 +57,18 @@ export const OrchestratorProvider: React.FC<{ children: React.ReactNode }> = ({ 
 
   const refreshData = useCallback(async () => {
     if (!orchestrator) {
-      // Mock data for preview mode
+      // Browser preview fallback with unmeasured initial values
       const mockProj: Project = {
         id: 'PROJ-DEMO',
         name: 'Agent-Forge Core Engine',
         description: 'Local AI engineering orchestrator desktop platform',
         repository_path: 'd:\\Projects\\Agent-Forge',
         default_branch: 'main',
-        status: 'RUNNING',
+        status: 'READY',
         contract: null,
         created_at: new Date().toISOString(),
         updated_at: new Date().toISOString(),
-        started_at: new Date().toISOString(),
+        started_at: null,
         completed_at: null,
       };
       setProjects([mockProj]);
@@ -82,41 +81,19 @@ export const OrchestratorProvider: React.FC<{ children: React.ReactNode }> = ({ 
           milestone_id: null,
           title: 'Implement JWT Validation and Verification Middleware',
           description: 'Add token signature verification, claims validation, and test suite.',
-          state: 'CODING',
+          state: 'PLANNED',
           paused_from_state: null,
           priority: 'HIGH',
           risk: 'MEDIUM',
           assigned_agent_id: 'agent-gemini-coder',
-          revision_count: 1,
+          revision_count: 0,
           max_revisions: 3,
-          base_sha: '7a8b9c0',
-          current_sha: 'd1e2f3a',
-          progress_cache_percent: 62,
+          base_sha: 'HEAD',
+          current_sha: null,
+          progress_cache_percent: 0,
           progress_computed_at: new Date().toISOString(),
           acceptance_criteria: ['Returns 401 on expired token', 'All unit tests pass'],
           constraints: ['Do not modify user schema'],
-          created_at: new Date().toISOString(),
-          updated_at: new Date().toISOString(),
-        },
-        {
-          id: 'SEC-021',
-          project_id: 'PROJ-DEMO',
-          milestone_id: null,
-          title: 'Audit ProcessRunner Shell Security and Path Restrictions',
-          description: 'Verify shell is disabled by default and credential paths are blocked.',
-          state: 'REVIEW_READY',
-          paused_from_state: null,
-          priority: 'CRITICAL',
-          risk: 'HIGH',
-          assigned_agent_id: 'agent-primary-manager',
-          revision_count: 0,
-          max_revisions: 3,
-          base_sha: '7a8b9c0',
-          current_sha: 'b4c5d6e',
-          progress_cache_percent: 85,
-          progress_computed_at: new Date().toISOString(),
-          acceptance_criteria: ['Path boundaries enforced', 'Secret redaction active'],
-          constraints: [],
           created_at: new Date().toISOString(),
           updated_at: new Date().toISOString(),
         },
@@ -125,20 +102,20 @@ export const OrchestratorProvider: React.FC<{ children: React.ReactNode }> = ({ 
       setAgents([
         {
           id: 'agent-primary-manager',
-          display_name: 'GPT Manager',
+          display_name: 'ChatGPT Manager (Manual)',
           role: 'PRIMARY_MANAGER',
           provider_resource_id: 'res-chatgpt-manager',
           status: 'ACTIVE',
-          current_task_id: 'SEC-021',
+          current_task_id: null,
           last_seen_at: new Date().toISOString(),
         },
         {
           id: 'agent-gemini-coder',
-          display_name: 'Gemini Coder #1',
+          display_name: 'Gemini Coder (Manual)',
           role: 'CODER',
           provider_resource_id: 'res-gemini-coder',
-          status: 'ACTIVE',
-          current_task_id: 'AUTH-014',
+          status: 'IDLE',
+          current_task_id: null,
           last_seen_at: new Date().toISOString(),
         },
       ]);
@@ -147,55 +124,32 @@ export const OrchestratorProvider: React.FC<{ children: React.ReactNode }> = ({ 
         {
           id: 'res-chatgpt-manager',
           provider_id: 'prov-manual-bridge',
-          model_name: 'ChatGPT Manager (GPT-4o)',
-          health_status: 'AVAILABLE',
-          capabilities: ['PLANNING', 'REVIEW', 'SECURITY_REVIEW'],
+          model_name: 'ChatGPT Manager',
+          health_status: 'UNKNOWN',
+          capabilities: ['PLANNING', 'REVIEW', 'SECURITY_REVIEW', 'LARGE_CONTEXT'],
           enabled: true,
-          total_quota: 100,
-          remaining_quota: 85,
+          total_quota: null,
+          remaining_quota: null,
           quota_unit: 'REQUESTS',
           quota_reset_at: null,
-          quota_source: 'MANUAL',
-          quota_confidence: 0.9,
-          last_health_check: new Date().toISOString(),
+          quota_source: 'UNKNOWN',
+          quota_confidence: 0.0,
+          last_health_check: null,
         },
         {
           id: 'res-gemini-coder',
           provider_id: 'prov-manual-bridge',
-          model_name: 'Gemini Coder (Gemini 1.5 Pro)',
-          health_status: 'AVAILABLE',
-          capabilities: ['CODING', 'FILESYSTEM_EDIT', 'TEST_EXECUTION'],
+          model_name: 'Gemini Coder',
+          health_status: 'UNKNOWN',
+          capabilities: ['CODING', 'FILESYSTEM_EDIT', 'TEST_EXECUTION', 'LARGE_CONTEXT'],
           enabled: true,
-          total_quota: 50,
-          remaining_quota: 42,
+          total_quota: null,
+          remaining_quota: null,
           quota_unit: 'REQUESTS',
           quota_reset_at: null,
-          quota_source: 'MANUAL',
-          quota_confidence: 0.95,
-          last_health_check: new Date().toISOString(),
-        },
-      ]);
-
-      setEvents([
-        {
-          id: 'ev-1',
-          project_id: 'PROJ-DEMO',
-          task_id: 'AUTH-014',
-          agent_id: 'agent-gemini-coder',
-          type: 'CODER_REPORT_APPLIED',
-          summary: 'Coder submitted report for AUTH-014. Status: COMPLETED.',
-          structured_payload: { status: 'COMPLETED' },
-          timestamp: new Date().toISOString(),
-        },
-        {
-          id: 'ev-2',
-          project_id: 'PROJ-DEMO',
-          task_id: 'AUTH-014',
-          agent_id: null,
-          type: 'TEST_RUN_PASSED',
-          summary: 'Verification test suite passed: 142 passed, 0 failed.',
-          structured_payload: { passed: 142, failed: 0 },
-          timestamp: new Date(Date.now() - 60000).toISOString(),
+          quota_source: 'UNKNOWN',
+          quota_confidence: 0.0,
+          last_health_check: null,
         },
       ]);
       return;
@@ -219,10 +173,13 @@ export const OrchestratorProvider: React.FC<{ children: React.ReactNode }> = ({ 
         setEvidence(evidenceList);
       }
 
-      const [resList] = await Promise.all([
+      // Load real DB-backed agents and resources
+      const [resList, agentList] = await Promise.all([
         orchestrator.getProviderResources(),
+        orchestrator.getAgents(),
       ]);
       setResources(resList);
+      setAgents(agentList);
     } catch (err) {
       console.error('[OrchestratorContext] Error refreshing data:', err);
     }
@@ -234,12 +191,15 @@ export const OrchestratorProvider: React.FC<{ children: React.ReactNode }> = ({ 
     return () => clearInterval(interval);
   }, [refreshData]);
 
-  const createProject = async (data: { name: string; description: string; repositoryPath: string; defaultBranch?: string }) => {
+  const createProject = async (data: { name: string; description?: string; repositoryPath: string; defaultBranch?: string }) => {
     if (!orchestrator) throw new Error('Desktop IPC unavailable.');
-    const proj = await orchestrator.createProject(data);
+    const res = await orchestrator.createProject(data);
     await refreshData();
-    setActiveProject(proj);
-    return proj;
+    if (res && res.id) {
+      setActiveProject(res);
+      return res;
+    }
+    return res;
   };
 
   const importContract = async (contract: any) => {
@@ -268,56 +228,51 @@ export const OrchestratorProvider: React.FC<{ children: React.ReactNode }> = ({ 
 
   const parseProtocol = async (input: string) => {
     if (!orchestrator) {
-      // Fallback for browser preview
       return { success: false, error: 'Protocol parser requires Electron desktop shell.' };
     }
     return orchestrator.parseProtocol(input);
   };
 
-  const applyManagerProtocol = async (data: { managerMsg: any; rawPayload: string; payloadHash: string }) => {
+  const applyProtocol = async (rawInput: string) => {
     if (!orchestrator) return { success: false, error: 'Desktop shell required' };
-    const res = await orchestrator.applyManagerProtocol(data);
-    await refreshData();
-    return res;
-  };
-
-  const applyCoderProtocol = async (data: { coderMsg: any; rawPayload: string; payloadHash: string }) => {
-    if (!orchestrator) return { success: false, error: 'Desktop shell required' };
-    const res = await orchestrator.applyCoderProtocol(data);
+    const res = await orchestrator.applyProtocol(rawInput);
     await refreshData();
     return res;
   };
 
   const generateWorkOrder = async (taskId: string) => {
     if (!orchestrator || !activeProject) return 'Desktop required.';
-    return orchestrator.generateWorkOrder({ projectId: activeProject.id, taskId });
+    const res = await orchestrator.generateWorkOrder({ projectId: activeProject.id, taskId });
+    return res.workOrder || res;
   };
 
-  const generateReviewPackage = async (taskId: string, coderReport: any) => {
+  const generateReviewPackage = async (taskId: string) => {
     if (!orchestrator || !activeProject) return 'Desktop required.';
-    return orchestrator.generateReviewPackage({ projectId: activeProject.id, taskId, coderReport });
+    const res = await orchestrator.generateReviewPackage({ projectId: activeProject.id, taskId });
+    return res.reviewPackage || res;
   };
 
-  const runVerificationTests = async (taskId: string, command?: string) => {
-    if (!orchestrator || !activeProject) return null;
-    const res = await orchestrator.runVerificationTests({
-      projectId: activeProject.id,
-      taskId,
-      repoPath: activeProject.repository_path,
-      command,
-    });
+  const runVerificationTests = async (taskId: string, commandConfigId?: string) => {
+    if (!orchestrator) throw new Error('Desktop IPC unavailable.');
+    const res = await orchestrator.runVerificationTests(taskId, commandConfigId);
     await refreshData();
     return res;
   };
 
-  const updateResourceQuota = async (id: string, remaining: number, total: number | null, source: string, confidence: number) => {
+  const updateResourceQuota = async (
+    id: string,
+    remaining: number | null,
+    total: number | null,
+    source: string,
+    confidence: number
+  ) => {
     if (!orchestrator) return;
     await orchestrator.updateResourceQuota({ id, remaining, total, source, confidence });
     await refreshData();
   };
 
   const triggerEmergencyStop = async (reason?: string) => {
-    if (!orchestrator) return null;
+    if (!orchestrator) return;
     const res = await orchestrator.triggerEmergencyStop(reason);
     await refreshData();
     return res;
@@ -356,8 +311,7 @@ export const OrchestratorProvider: React.FC<{ children: React.ReactNode }> = ({ 
         transitionProject,
         createTask,
         parseProtocol,
-        applyManagerProtocol,
-        applyCoderProtocol,
+        applyProtocol,
         generateWorkOrder,
         generateReviewPackage,
         runVerificationTests,
@@ -372,7 +326,9 @@ export const OrchestratorProvider: React.FC<{ children: React.ReactNode }> = ({ 
 };
 
 export const useOrchestrator = () => {
-  const ctx = useContext(OrchestratorContext);
-  if (!ctx) throw new Error('useOrchestrator must be used within OrchestratorProvider');
-  return ctx;
+  const context = useContext(OrchestratorContext);
+  if (!context) {
+    throw new Error('useOrchestrator must be used within an OrchestratorProvider');
+  }
+  return context;
 };

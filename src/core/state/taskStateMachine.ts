@@ -8,6 +8,7 @@ export type TaskTrigger =
   | 'START_CODING'
   | 'SUBMIT_REPORT'
   | 'EVIDENCE_GATHERED'
+  | 'TESTS_FAILED'
   | 'START_REVIEW'
   | 'PASS_VERDICT'
   | 'FIX_VERDICT'
@@ -106,7 +107,14 @@ export class TaskStateMachine {
 
       case 'VALIDATING':
         if (trigger === 'EVIDENCE_GATHERED') return { nextState: 'REVIEW_READY', pausedFromState: null, incrementRevision: false };
+        if (trigger === 'TESTS_FAILED') {
+          if (revisionCount + 1 >= maxRevisions) {
+            return { nextState: 'NEEDS_HUMAN', pausedFromState: null, incrementRevision: true };
+          }
+          return { nextState: 'CODING', pausedFromState: null, incrementRevision: true };
+        }
         if (trigger === 'FATAL_FAILURE') return { nextState: 'FAILED', pausedFromState: null, incrementRevision: false };
+        if (trigger === 'CANCEL') return { nextState: 'CANCELLED', pausedFromState: null, incrementRevision: false };
         break;
 
       case 'REVIEW_READY':

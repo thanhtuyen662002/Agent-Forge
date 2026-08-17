@@ -6,189 +6,302 @@ import { ProjectService } from '../core/services/ProjectService';
 import { TaskService } from '../core/services/TaskService';
 import { GitService } from '../core/services/GitService';
 import { VerificationService } from '../core/services/VerificationService';
-import { ArtifactStore } from '../core/services/ArtifactStore';
+import { defaultArtifactStore } from '../core/services/ArtifactStore';
 import { EmergencyStopService } from '../core/services/EmergencyStopService';
 import { ProtocolParser } from '../core/protocol/parser';
 import { PackageGenerator } from '../core/protocol/packageGenerator';
-import { ManagerProtocol, CoderProtocol } from '../core/types/protocols';
-import { ProjectTrigger } from '../core/state/projectStateMachine';
+import {
+  CreateProjectIpcSchema,
+  ImportContractIpcSchema,
+  TransitionProjectIpcSchema,
+  GetTasksIpcSchema,
+  GetTaskIpcSchema,
+  CreateTaskIpcSchema,
+  ParseProtocolIpcSchema,
+  ApplyProtocolIpcSchema,
+  GenerateWorkOrderIpcSchema,
+  GenerateReviewPackageIpcSchema,
+  ProjectScopedIpcSchema,
+  TaskScopedIpcSchema,
+  RunVerificationIpcSchema,
+  UpdateResourceQuotaIpcSchema,
+  EmergencyStopIpcSchema,
+  ResumeProjectIpcSchema,
+} from '../core/types/ipc';
 
 export function registerIpcHandlers(): void {
   const db = defaultDb.getDb();
   const repo = new Repository(db);
   const eventService = new EventService(repo);
   const projectService = new ProjectService(repo, eventService);
-  const taskService = new TaskService(repo, eventService);
-  const artifactStore = new ArtifactStore();
-  const verificationService = new VerificationService(repo, artifactStore);
+  const verificationService = new VerificationService(repo, defaultArtifactStore);
+  const taskService = new TaskService(repo, eventService, verificationService, defaultArtifactStore, defaultDb);
   const emergencyStopService = new EmergencyStopService(repo, eventService);
 
   // ==========================================
   // Projects
   // ==========================================
-  ipcMain.handle('orchestrator:getProjects', async () => {
+  ipcMain.handle('project:create', async (_, payload: unknown) => {
+    const parsed = CreateProjectIpcSchema.safeParse(payload);
+    if (!parsed.success) {
+      return { success: false, error: parsed.error.issues.map((i) => i.message).join(', ') };
+    }
+    return projectService.createProject(parsed.data.name, parsed.data.description, parsed.data.repositoryPath);
+  });
+
+  ipcMain.handle('project:get', async (_, payload: unknown) => {
+    const parsed = ProjectScopedIpcSchema.safeParse(payload);
+    if (!parsed.success) return null;
+    return repo.getProject(parsed.data.projectId);
+  });
+
+  ipcMain.handle('project:list', async () => {
     return repo.getAllProjects();
   });
 
-  ipcMain.handle('orchestrator:createProject', async (_, data) => {
-    return projectService.createProject(
-      data.name,
-      data.description,
-      data.repositoryPath,
-      data.defaultBranch ?? 'main'
-    );
+  ipcMain.handle('project:importContract', async (_, payload: unknown) => {
+    const parsed = ImportContractIpcSchema.safeParse(payload);
+    if (!parsed.success) {
+      return { success: false, error: parsed.error.issues.map((i) => i.message).join(', ') };
+    }
+    return projectService.importContract(parsed.data.projectId, parsed.data.contract as any);
   });
 
-  ipcMain.handle('orchestrator:importContract', async (_, data) => {
-    return projectService.importContract(data.projectId, data.contract);
-  });
-
-  ipcMain.handle('orchestrator:transitionProject', async (_, data) => {
-    return projectService.transitionStatus(data.projectId, data.trigger as ProjectTrigger);
+  ipcMain.handle('project:transition', async (_, payload: unknown) => {
+    const parsed = TransitionProjectIpcSchema.safeParse(payload);
+    if (!parsed.success) {
+      return { success: false, error: parsed.error.issues.map((i) => i.message).join(', ') };
+    }
+    return projectService.transitionStatus(parsed.data.projectId, parsed.data.trigger as any);
   });
 
   // ==========================================
   // Tasks
   // ==========================================
-  ipcMain.handle('orchestrator:getTasks', async (_, projectId: string) => {
-    return repo.getTasksByProject(projectId);
+  ipcMain.handle('task:list', async (_, payload: unknown) => {
+    const parsed = GetTasksIpcSchema.safeParse(payload);
+    if (!parsed.success) return [];
+    return repo.getTasksByProject(parsed.data.projectId);
   });
 
-  ipcMain.handle('orchestrator:getTask', async (_, taskId: string) => {
-    return repo.getTask(taskId);
+  ipcMain.handle('task:get', async (_, payload: unknown) => {
+    const parsed = GetTaskIpcSchema.safeParse(payload);
+    if (!parsed.success) return null;
+    return repo.getTask(parsed.data.taskId);
   });
 
-  ipcMain.handle('orchestrator:createTask', async (_, taskData) => {
-    repo.createTask(taskData);
-    eventService.record(
-      taskData.project_id,
-      'TASK_CREATED',
-      `Task "${taskData.title}" (${taskData.id}) created in state ${taskData.state}.`,
-      taskData,
-      taskData.id
-    );
+  ipcMain.handle('task:create', async (_, payload: unknown) => {
+    const parsed = CreateTaskIpcSchema.safeParse(payload);
+    if (!parsed.success) {
+      return { success: false, error: parsed.error.issues.map((i) => i.message).join(', ') };
+    }
+    const now = new Date().toISOString();
+    const task = {
+      id: parsed.data.id,
+      project_id: parsed.data.project_id,
+      milestone_id: parsed.data.milestone_id ?? null,
+      title: parsed.data.title,
+      description: parsed.data.description ?? null,
+      state: 'CREATED' as const,
+      paused_from_state: null,
+      priority: parsed.data.priority,
+      risk: parsed.data.risk,
+      assigned_agent_id: null,
+      revision_count: 0,
+      max_revisions: 3,
+      base_sha: null,
+      current_sha: null,
+      progress_cache_percent: 0,
+      progress_computed_at: null,
+      acceptance_criteria: parsed.data.acceptance_criteria,
+      constraints: parsed.data.constraints,
+      created_at: now,
+      updated_at: now,
+    };
+    repo.createTask(task);
+    return { success: true, task };
   });
 
   // ==========================================
   // Protocols & Manual Bridge
   // ==========================================
-  ipcMain.handle('orchestrator:parseProtocol', async (_, input: string) => {
-    return ProtocolParser.parse(input);
+  ipcMain.handle('protocol:parse', async (_, payload: unknown) => {
+    const parsed = ParseProtocolIpcSchema.safeParse(payload);
+    if (!parsed.success) {
+      return { success: false, error: parsed.error.issues.map((i) => i.message).join(', ') };
+    }
+    return ProtocolParser.parse(parsed.data.input);
   });
 
-  ipcMain.handle('orchestrator:applyManagerProtocol', async (_, data) => {
-    return taskService.applyManagerDecision(
-      data.managerMsg as ManagerProtocol,
-      data.rawPayload,
-      data.payloadHash
-    );
+  ipcMain.handle('protocol:apply', async (_, payload: unknown) => {
+    const parsed = ApplyProtocolIpcSchema.safeParse(payload);
+    if (!parsed.success) {
+      return { success: false, error: parsed.error.issues.map((i) => i.message).join(', ') };
+    }
+
+    const parseResult = ProtocolParser.parse(parsed.data.rawInput);
+    if (!parseResult.success || !parseResult.protocolType || !parseResult.data) {
+      return { success: false, error: parseResult.error || 'Failed to parse protocol envelope.' };
+    }
+
+    if (parseResult.protocolType === 'manager.v1') {
+      return taskService.applyManagerDecision(parseResult.data as any, parsed.data.rawInput);
+    } else if (parseResult.protocolType === 'coder.v1') {
+      return taskService.applyCoderReport(parseResult.data as any, parsed.data.rawInput);
+    }
+
+    return { success: false, error: `Unsupported protocol type for auto-apply: ${parseResult.protocolType}` };
   });
 
-  ipcMain.handle('orchestrator:applyCoderProtocol', async (_, data) => {
-    return taskService.applyCoderReport(
-      data.coderMsg as CoderProtocol,
-      data.rawPayload,
-      data.payloadHash
-    );
+  ipcMain.handle('protocol:generateWorkOrder', async (_, payload: unknown) => {
+    const parsed = GenerateWorkOrderIpcSchema.safeParse(payload);
+    if (!parsed.success) {
+      return { success: false, error: parsed.error.issues.map((i) => i.message).join(', ') };
+    }
+
+    const project = repo.getProject(parsed.data.projectId);
+    const task = repo.getTask(parsed.data.taskId);
+    if (!project || !task) {
+      return { success: false, error: 'Project or Task not found.' };
+    }
+
+    const workOrder = PackageGenerator.generateWorkOrder(project, task);
+    return { success: true, workOrder };
   });
 
-  ipcMain.handle('orchestrator:generateWorkOrder', async (_, data) => {
-    const project = repo.getProject(data.projectId);
-    const task = repo.getTask(data.taskId);
-    if (!project || !task) throw new Error('Project or task not found.');
-    return PackageGenerator.generateWorkOrder(project, task, {
-      test: data.testCmd,
-      lint: data.lintCmd,
-      build: data.buildCmd,
-    });
-  });
+  ipcMain.handle('protocol:generateReviewPackage', async (_, payload: unknown) => {
+    const parsed = GenerateReviewPackageIpcSchema.safeParse(payload);
+    if (!parsed.success) {
+      return { success: false, error: parsed.error.issues.map((i) => i.message).join(', ') };
+    }
 
-  ipcMain.handle('orchestrator:generateReviewPackage', async (_, data) => {
-    const project = repo.getProject(data.projectId);
-    const task = repo.getTask(data.taskId);
-    if (!project || !task) throw new Error('Project or task not found.');
+    const project = repo.getProject(parsed.data.projectId);
+    const task = repo.getTask(parsed.data.taskId);
+    if (!project || !task) {
+      return { success: false, error: 'Project or Task not found.' };
+    }
 
-    const gitDiff = await GitService.getDiff(project.repository_path, task.base_sha);
-    const previousReviews = repo.getReviewsByTask(task.id);
+    // Authoritative evidence loaded from SQLite
+    const latestTestRun = repo.getLatestTestRun(task.id);
+    const gitDiffEv = repo.getLatestEvidence(task.id, 'GIT_DIFF');
+    const reviews = repo.getReviewsByTask(task.id);
 
-    return PackageGenerator.generateReviewPackage(
+    const diffContent = gitDiffEv ? defaultArtifactStore.read(gitDiffEv) : '';
+    const diffStat = gitDiffEv ? gitDiffEv.summary : 'No Git diff evidence recorded.';
+
+    const reviewPackage = PackageGenerator.generateReviewPackage(
       project,
       task,
-      data.coderReport,
-      gitDiff.diffStat,
-      gitDiff.diffContent,
       null,
-      previousReviews
-    );
-  });
-
-  // ==========================================
-  // Git & Verification
-  // ==========================================
-  ipcMain.handle('orchestrator:getGitStatus', async (_, repoPath: string) => {
-    return GitService.getStatus(repoPath);
-  });
-
-  ipcMain.handle('orchestrator:getGitDiff', async (_, repoPath: string, baseSha?: string) => {
-    return GitService.getDiff(repoPath, baseSha);
-  });
-
-  ipcMain.handle('orchestrator:runVerificationTests', async (_, data) => {
-    const testRun = await verificationService.runTests(
-      data.projectId,
-      data.taskId,
-      null,
-      data.repoPath,
-      data.command || 'npm test'
+      diffStat,
+      diffContent,
+      latestTestRun,
+      reviews
     );
 
-    // If tests ran, update current SHA from git
-    const headSha = await GitService.getHeadSha(data.repoPath);
-    repo.updateTaskShas(data.taskId, undefined, headSha);
-
-    return testRun;
+    return { success: true, reviewPackage };
   });
 
   // ==========================================
-  // Evidence & Events
+  // Git & Verification (Derives path securely from SQLite)
   // ==========================================
-  ipcMain.handle('orchestrator:getEvidence', async (_, projectId: string) => {
-    return repo.getAllEvidence(projectId);
+  ipcMain.handle('git:getStatus', async (_, payload: unknown) => {
+    const parsed = ProjectScopedIpcSchema.safeParse(payload);
+    if (!parsed.success) {
+      return { status: 'ERROR', branch: 'UNKNOWN', isClean: false, modifiedFiles: [], untrackedFiles: [], aheadCount: 0, behindCount: 0, errorMessage: 'Invalid project ID' };
+    }
+
+    const project = repo.getProject(parsed.data.projectId);
+    if (!project) {
+      return { status: 'ERROR', branch: 'UNKNOWN', isClean: false, modifiedFiles: [], untrackedFiles: [], aheadCount: 0, behindCount: 0, errorMessage: 'Project not found' };
+    }
+
+    return GitService.getStatus(project.repository_path);
   });
 
-  ipcMain.handle('orchestrator:getEvents', async (_, projectId?: string) => {
-    return eventService.getEvents(projectId, 150);
+  ipcMain.handle('git:getDiff', async (_, payload: unknown) => {
+    const parsed = TaskScopedIpcSchema.safeParse(payload);
+    if (!parsed.success) {
+      return { status: 'ERROR', diffStat: '', diffContent: '', filesChanged: [], insertions: 0, deletions: 0, errorMessage: 'Invalid task ID' };
+    }
+
+    const task = repo.getTask(parsed.data.taskId);
+    if (!task) {
+      return { status: 'ERROR', diffStat: '', diffContent: '', filesChanged: [], insertions: 0, deletions: 0, errorMessage: 'Task not found' };
+    }
+
+    const project = repo.getProject(task.project_id);
+    if (!project) {
+      return { status: 'ERROR', diffStat: '', diffContent: '', filesChanged: [], insertions: 0, deletions: 0, errorMessage: 'Project not found' };
+    }
+
+    return GitService.getDiff(project.repository_path, task.base_sha);
+  });
+
+  ipcMain.handle('verification:runTests', async (_, payload: unknown) => {
+    const parsed = RunVerificationIpcSchema.safeParse(payload);
+    if (!parsed.success) {
+      return { success: false, error: parsed.error.issues.map((i) => i.message).join(', ') };
+    }
+
+    return taskService.executeValidationFlow(parsed.data.taskId, parsed.data.commandConfigId);
   });
 
   // ==========================================
-  // Providers & Quota
+  // Resources & Agents
   // ==========================================
-  ipcMain.handle('orchestrator:getProviders', async () => {
-    return repo.getAllProviders();
-  });
-
-  ipcMain.handle('orchestrator:getProviderResources', async () => {
+  ipcMain.handle('resources:list', async () => {
     return repo.getAllProviderResources();
   });
 
-  ipcMain.handle('orchestrator:updateResourceQuota', async (_, data) => {
+  ipcMain.handle('resources:updateQuota', async (_, payload: unknown) => {
+    const parsed = UpdateResourceQuotaIpcSchema.safeParse(payload);
+    if (!parsed.success) {
+      return { success: false, error: parsed.error.issues.map((i) => i.message).join(', ') };
+    }
     repo.updateProviderResourceQuota(
-      data.id,
-      data.remaining,
-      data.total,
-      data.source,
-      data.confidence
+      parsed.data.id,
+      parsed.data.remaining,
+      parsed.data.total,
+      parsed.data.source,
+      parsed.data.confidence
     );
+    return { success: true };
+  });
+
+  ipcMain.handle('agents:list', async () => {
+    return repo.getAllAgents();
   });
 
   // ==========================================
-  // Emergency Stop & Safety
+  // Evidence & Audit Events
   // ==========================================
-  ipcMain.handle('orchestrator:triggerEmergencyStop', async (_, reason?: string) => {
+  ipcMain.handle('evidence:list', async (_, payload: unknown) => {
+    const parsed = ProjectScopedIpcSchema.safeParse(payload);
+    if (!parsed.success) return [];
+    return repo.getAllEvidence(parsed.data.projectId);
+  });
+
+  ipcMain.handle('events:list', async (_, payload: unknown) => {
+    const parsed = ProjectScopedIpcSchema.safeParse(payload);
+    if (!parsed.success) return [];
+    return repo.getEventsByProject(parsed.data.projectId);
+  });
+
+  // ==========================================
+  // Safety & Emergency Stop
+  // ==========================================
+  ipcMain.handle('emergency:stop', async (_, payload: unknown) => {
+    const parsed = EmergencyStopIpcSchema.safeParse(payload);
+    const reason = parsed.success ? parsed.data.reason : 'Manual Owner Emergency Stop';
     return emergencyStopService.triggerEmergencyStop(reason);
   });
 
-  ipcMain.handle('orchestrator:resumeProject', async (_, projectId: string) => {
-    return emergencyStopService.resumeProject(projectId);
+  ipcMain.handle('emergency:resumeProject', async (_, payload: unknown) => {
+    const parsed = ResumeProjectIpcSchema.safeParse(payload);
+    if (!parsed.success) {
+      return { success: false, error: parsed.error.issues.map((i) => i.message).join(', ') };
+    }
+    return emergencyStopService.resumeProject(parsed.data.projectId);
   });
 }

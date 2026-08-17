@@ -16,6 +16,13 @@ export class ArtifactStore {
     }
   }
 
+  public setBaseDir(customBaseDir: string): void {
+    this.baseDir = customBaseDir;
+    if (!fs.existsSync(this.baseDir)) {
+      fs.mkdirSync(this.baseDir, { recursive: true });
+    }
+  }
+
   public store(
     id: string,
     projectId: string,
@@ -92,3 +99,5 @@ export class ArtifactStore {
     return content;
   }
 }
+
+export const defaultArtifactStore = new ArtifactStore();

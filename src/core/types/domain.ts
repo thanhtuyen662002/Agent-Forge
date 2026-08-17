@@ -297,7 +297,7 @@ export interface ProviderResource {
   quota_reset_at: string | null;
   quota_source: QuotaSource;
   quota_confidence: number;
-  last_health_check: string;
+  last_health_check: string | null;
 }
 
 export interface Agent {
@@ -423,6 +423,38 @@ export interface EventRecord {
   summary: string;
   structured_payload: Record<string, unknown>;
   timestamp: string;
+}
+
+export interface VerificationCommandConfig {
+  id: string;
+  project_id: string;
+  name: string;
+  command_type: 'TEST' | 'LINT' | 'TYPECHECK' | 'BUILD';
+  executable: string;
+  args: string[];
+  timeout_ms: number;
+  enabled: boolean;
+}
+
+export interface GitStatusSummary {
+  status: 'SUCCESS' | 'ERROR' | 'UNKNOWN';
+  branch: string;
+  isClean: boolean;
+  modifiedFiles: string[];
+  untrackedFiles: string[];
+  aheadCount: number;
+  behindCount: number;
+  errorMessage?: string;
+}
+
+export interface GitDiffSummary {
+  status: 'SUCCESS' | 'ERROR' | 'UNKNOWN';
+  diffStat: string;
+  diffContent: string;
+  filesChanged: string[];
+  insertions: number;
+  deletions: number;
+  errorMessage?: string;
 }
 
 export interface PolicyRule {

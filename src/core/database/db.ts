@@ -18,6 +18,13 @@ export class DatabaseEngine {
     }
   }
 
+  public setDatabasePath(customPath: string): void {
+    if (this.db) {
+      this.close();
+    }
+    this.dbPath = customPath;
+  }
+
   public init(): Database.Database {
     try {
       if (this.db) {

@@ -20,8 +20,7 @@ export const ManualBridgeView: React.FC = () => {
     tasks,
     activeProject,
     parseProtocol,
-    applyManagerProtocol,
-    applyCoderProtocol,
+    applyProtocol,
     generateWorkOrder,
     generateReviewPackage,
     runVerificationTests,
@@ -57,17 +56,12 @@ export const ManualBridgeView: React.FC = () => {
 
   // Apply Manager Decision
   const handleApplyManager = async () => {
-    if (!managerParseResult?.data?.data) return;
-    const res = await applyManagerProtocol({
-      managerMsg: managerParseResult.data.data,
-      rawPayload: managerParseResult.rawJson || managerInput,
-      payloadHash: managerParseResult.payloadHash || 'hash',
-    });
-
+    if (!managerInput.trim()) return;
+    const res = await applyProtocol(managerInput);
     if (res.success) {
-      setManagerApplyStatus(`Success: ${res.message}`);
+      setManagerApplyStatus(`Success: ${res.message || 'Manager decision applied.'}`);
     } else {
-      setManagerApplyStatus(`Error: ${res.error}`);
+      setManagerApplyStatus(`Error: ${res.error || 'Failed to apply manager decision.'}`);
     }
   };
 
@@ -81,20 +75,17 @@ export const ManualBridgeView: React.FC = () => {
 
   // Apply Coder Report & Trigger Automated Verification
   const handleApplyCoder = async () => {
-    if (!coderParseResult?.data?.data) return;
+    if (!coderInput.trim()) return;
     setIsVerifying(true);
     try {
-      const res = await applyCoderProtocol({
-        coderMsg: coderParseResult.data.data,
-        rawPayload: coderParseResult.rawJson || coderInput,
-        payloadHash: coderParseResult.payloadHash || 'hash',
-      });
-
+      const res = await applyProtocol(coderInput);
       if (res.success) {
-        setCoderApplyStatus(`Success: ${res.message}. Running verification tests...`);
+        setCoderApplyStatus(`Success: ${res.message || 'Coder report applied.'}. Running verification tests...`);
         // Trigger automated verification tests
-        await runVerificationTests(coderParseResult.data.data.task_id);
-        setCoderApplyStatus(`Success: Coder report applied and verification evidence recorded.`);
+        if (res.task?.id) {
+          const verifRes = await runVerificationTests(res.task.id);
+          setCoderApplyStatus(`Success: Coder report applied. Tests ${verifRes.success ? 'PASSED' : 'FAILED'} (Exit code: ${verifRes.testRun?.exit_code}). Task state: ${verifRes.finalTaskState}.`);
+        }
       } else {
         setCoderApplyStatus(`Error: ${res.error}`);
       }
@@ -114,7 +105,7 @@ export const ManualBridgeView: React.FC = () => {
         const text = await generateWorkOrder(selectedOutboxTaskId);
         setOutboxContent(text);
       } else {
-        const text = await generateReviewPackage(selectedOutboxTaskId, null);
+        const text = await generateReviewPackage(selectedOutboxTaskId);
         setOutboxContent(text);
       }
     } catch (err: any) {

@@ -33,7 +33,27 @@ export const DashboardView: React.FC = () => {
     ? Math.round(tasks.reduce((sum, t) => sum + t.progress_cache_percent, 0) / tasks.length)
     : 0;
 
-  const activeAgentsList = agents.filter((a) => a.status === 'ACTIVE' || a.status === 'BUSY');
+  // Real capacity risk computation based on observable resource quotas
+  const measuredResources = resources.filter((r) => r.remaining_quota !== null && r.total_quota !== null && r.total_quota > 0);
+  let capacityRiskLabel = 'UNKNOWN';
+  let capacityRiskSubtext = 'Quota unmeasured (Manual Bridge)';
+
+  if (measuredResources.length > 0) {
+    const minPercent = Math.min(...measuredResources.map((r) => (r.remaining_quota! / r.total_quota!) * 100));
+    if (minPercent < 15) {
+      capacityRiskLabel = 'HIGH';
+      capacityRiskSubtext = 'Provider quota critically depleted (<15%)';
+    } else if (minPercent < 35) {
+      capacityRiskLabel = 'MODERATE';
+      capacityRiskSubtext = 'Provider quota running low (<35%)';
+    } else {
+      capacityRiskLabel = 'LOW';
+      capacityRiskSubtext = 'Measured provider quota sufficient';
+    }
+  }
+
+  // Real project status label
+  const projectStatusLabel = activeProject?.status || 'UNKNOWN';
 
   return (
     <div className="p-8 space-y-8 max-w-7xl mx-auto overflow-y-auto">
@@ -75,7 +95,7 @@ export const DashboardView: React.FC = () => {
             <ProgressIndicator percent={totalProgress} size="lg" />
             <div className="flex justify-between text-[11px] font-mono text-slate-400">
               <span>{completedTasks}/{tasks.length} Tasks Finished</span>
-              <span className="text-emerald-400 font-semibold">HEALTHY</span>
+              <span className="text-forge-cyan font-semibold">{projectStatusLabel}</span>
             </div>
           </div>
         </div>
@@ -115,8 +135,10 @@ export const DashboardView: React.FC = () => {
             <span>CAPACITY RISK</span>
             <Zap className="w-4 h-4 text-forge-amber" />
           </div>
-          <div className="text-2xl font-bold text-emerald-400 font-mono">LOW</div>
-          <div className="text-xs text-slate-400">Active quotas sufficient for tasks</div>
+          <div className={`text-2xl font-bold font-mono ${capacityRiskLabel === 'LOW' ? 'text-emerald-400' : capacityRiskLabel === 'HIGH' ? 'text-rose-400' : 'text-slate-400'}`}>
+            {capacityRiskLabel}
+          </div>
+          <div className="text-xs text-slate-400">{capacityRiskSubtext}</div>
         </div>
       </div>
 

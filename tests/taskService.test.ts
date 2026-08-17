@@ -83,7 +83,7 @@ describe('TaskService & Protocol Idempotency', () => {
       expected_revision: 0,
     };
 
-    const res = taskService.applyManagerDecision(managerMsg, JSON.stringify(managerMsg), 'hash-1');
+    const res = taskService.applyManagerDecision(managerMsg, JSON.stringify(managerMsg));
     expect(res.success).toBe(true);
 
     const updated = repo.getTask('TSK-001')!;
@@ -107,12 +107,12 @@ describe('TaskService & Protocol Idempotency', () => {
       expected_revision: 0,
     };
 
-    const res1 = taskService.applyManagerDecision(managerMsg, JSON.stringify(managerMsg), 'hash-dup');
+    const res1 = taskService.applyManagerDecision(managerMsg, JSON.stringify(managerMsg));
     expect(res1.success).toBe(true);
     expect(res1.isDuplicate).toBeFalsy();
 
     // Second apply with identical message_id
-    const res2 = taskService.applyManagerDecision(managerMsg, JSON.stringify(managerMsg), 'hash-dup');
+    const res2 = taskService.applyManagerDecision(managerMsg, JSON.stringify(managerMsg));
     expect(res2.success).toBe(true);
     expect(res2.isDuplicate).toBe(true);
   });
@@ -134,13 +134,34 @@ describe('TaskService & Protocol Idempotency', () => {
       expected_revision: 0,
     };
 
-    const res = taskService.applyManagerDecision(managerMsg, JSON.stringify(managerMsg), 'hash-stale');
+    const res = taskService.applyManagerDecision(managerMsg, JSON.stringify(managerMsg));
     expect(res.success).toBe(false);
     expect(res.error).toContain('Stale state conflict');
   });
 
+  it('should reject cross-project protocol message targeting wrong project', () => {
+    const managerMsg: ManagerProtocol = {
+      protocol: 'manager.v1',
+      message_id: 'msg-cross-1',
+      project_id: 'PROJ-WRONG',
+      task_id: 'TSK-001',
+      decision: 'EXECUTE',
+      priority: 'HIGH',
+      risk: 'MEDIUM',
+      instructions: [],
+      acceptance_criteria: [],
+      constraints: [],
+      review_issues: [],
+      expected_task_state: 'PLANNED',
+      expected_revision: 0,
+    };
+
+    const res = taskService.applyManagerDecision(managerMsg, JSON.stringify(managerMsg));
+    expect(res.success).toBe(false);
+    expect(res.error).toContain('Cross-project conflict');
+  });
+
   it('should process coder report and transition task to VALIDATING', () => {
-    // First move task to CODING
     repo.updateTaskState('TSK-001', 'CODING');
 
     const coderMsg: CoderProtocol = {
@@ -160,10 +181,35 @@ describe('TaskService & Protocol Idempotency', () => {
       expected_revision: 0,
     };
 
-    const res = taskService.applyCoderReport(coderMsg, JSON.stringify(coderMsg), 'hash-cdr');
+    const res = taskService.applyCoderReport(coderMsg, JSON.stringify(coderMsg));
     expect(res.success).toBe(true);
 
     const updated = repo.getTask('TSK-001')!;
     expect(updated.state).toBe('VALIDATING');
+  });
+
+  it('should reject coder report with stale revision count', () => {
+    repo.updateTaskState('TSK-001', 'CODING');
+
+    const coderMsg: CoderProtocol = {
+      protocol: 'coder.v1',
+      message_id: 'msg-cdr-stale',
+      project_id: 'PROJ-TEST',
+      task_id: 'TSK-001',
+      attempt: 1,
+      status: 'COMPLETED',
+      completed: ['Done'],
+      remaining: [],
+      files_claimed_changed: ['src/auth.ts'],
+      tests_claimed: ['All pass'],
+      blockers: [],
+      review_requested: true,
+      expected_task_state: 'CODING',
+      expected_revision: 5, // Task is at revision 0
+    };
+
+    const res = taskService.applyCoderReport(coderMsg, JSON.stringify(coderMsg));
+    expect(res.success).toBe(false);
+    expect(res.error).toContain('Stale revision conflict');
   });
 });
