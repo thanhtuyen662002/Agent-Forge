@@ -1,0 +1,125 @@
+import { z } from 'zod';
+
+// Strict Zod schemas for all IPC channels across the main process security boundary
+
+export const CreateProjectIpcSchema = z.object({
+  name: z.string().min(1, 'Project name is required').max(100),
+  description: z.string().max(500).optional().default(''),
+  repositorySelectionId: z.string().uuid('A valid native repository selection token is required'),
+  defaultBranch: z.string().optional().default('main'),
+});
+export type CreateProjectIpc = z.infer<typeof CreateProjectIpcSchema>;
+
+export const ImportContractIpcSchema = z.object({
+  projectId: z.string().min(1),
+  contract: z.object({
+    goal: z.string().min(1),
+    business_context: z.string().optional(),
+    architecture_constraints: z.array(z.string()).default([]),
+    technical_constraints: z.array(z.string()).default([]),
+    security_requirements: z.array(z.string()).default([]),
+    acceptance_criteria: z.array(z.string()).default([]),
+    non_goals: z.array(z.string()).default([]),
+    definition_of_done: z.array(z.string()).default([]),
+    testing_requirements: z.array(z.string()).default([]),
+    owner_policies: z.array(z.string()).default([]),
+  }),
+});
+export type ImportContractIpc = z.infer<typeof ImportContractIpcSchema>;
+
+export const ProjectTriggerSchema = z.enum([
+  'IMPORT_CONTRACT',
+  'PLAN_APPROVED',
+  'START_PROJECT',
+  'PAUSE',
+  'RESUME',
+  'BLOCKER_DETECTED',
+  'BLOCKER_RESOLVED',
+  'QUOTA_EXHAUSTED',
+  'CAPACITY_RESTORED',
+  'ESCALATE_TO_OWNER',
+  'OWNER_APPROVED',
+  'ALL_TASKS_DONE',
+  'FINAL_PASS',
+  'FINAL_FIX_REQUIRED',
+  'FATAL_ERROR',
+  'CANCEL_PROJECT',
+]);
+export type ProjectTriggerType = z.infer<typeof ProjectTriggerSchema>;
+
+export const TransitionProjectIpcSchema = z.object({
+  projectId: z.string().min(1, 'Project ID is required'),
+  trigger: ProjectTriggerSchema,
+});
+export type TransitionProjectIpc = z.infer<typeof TransitionProjectIpcSchema>;
+
+export const CreateTaskIpcSchema = z.object({
+  projectId: z.string().min(1, 'Project ID is required'),
+  id: z.string().optional(),
+  milestoneId: z.string().nullable().optional(),
+  title: z.string().min(1, 'Task title is required').max(200),
+  description: z.string().nullable().optional(),
+  priority: z.enum(['LOW', 'MEDIUM', 'HIGH', 'CRITICAL']).default('MEDIUM'),
+  risk: z.enum(['LOW', 'MEDIUM', 'HIGH', 'CRITICAL']).default('MEDIUM'),
+  acceptanceCriteria: z.array(z.string()).default([]),
+  constraints: z.array(z.string()).default([]),
+});
+export type CreateTaskIpc = z.infer<typeof CreateTaskIpcSchema>;
+
+export const ParseProtocolIpcSchema = z.object({
+  rawInput: z.string().min(1, 'Protocol input text is required'),
+});
+export type ParseProtocolIpc = z.infer<typeof ParseProtocolIpcSchema>;
+
+export const ApplyProtocolIpcSchema = z.object({
+  rawInput: z.string().min(1, 'Raw protocol input is required'),
+});
+export type ApplyProtocolIpc = z.infer<typeof ApplyProtocolIpcSchema>;
+
+export const GenerateWorkOrderIpcSchema = z.object({
+  projectId: z.string().min(1),
+  taskId: z.string().min(1),
+});
+
+export const GenerateReviewPackageIpcSchema = z.object({
+  projectId: z.string().min(1),
+  taskId: z.string().min(1),
+});
+
+export const ProjectScopedIpcSchema = z.object({
+  projectId: z.string().min(1),
+});
+
+export const TaskScopedIpcSchema = z.object({
+  taskId: z.string().min(1),
+});
+
+export const RunVerificationIpcSchema = z.object({
+  taskId: z.string().min(1),
+  commandConfigId: z.string().optional(),
+});
+export type RunVerificationIpc = z.infer<typeof RunVerificationIpcSchema>;
+
+export const UpdateResourceQuotaIpcSchema = z.object({
+  id: z.string().min(1),
+  remaining: z.number().nullable(),
+  total: z.number().nullable(),
+  source: z.enum(['MEASURED', 'PROVIDER_REPORTED', 'MANUAL', 'ESTIMATED', 'UNKNOWN']),
+  confidence: z.number().min(0).max(1),
+});
+export type UpdateResourceQuotaIpc = z.infer<typeof UpdateResourceQuotaIpcSchema>;
+
+/**
+ * Emergency Stop Schema.
+ * Uses deliberate fail-safe semantics: if no reason or an empty object is supplied,
+ * it safely defaults to 'Manual Owner Emergency Stop' rather than rejecting the safety action.
+ */
+export const EmergencyStopIpcSchema = z.object({
+  reason: z.string().optional().default('Manual Owner Emergency Stop'),
+});
+export type EmergencyStopIpc = z.infer<typeof EmergencyStopIpcSchema>;
+
+export const ResumeProjectIpcSchema = z.object({
+  projectId: z.string().min(1),
+});
+export type ResumeProjectIpc = z.infer<typeof ResumeProjectIpcSchema>;
