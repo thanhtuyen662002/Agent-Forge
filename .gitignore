@@ -1,0 +1,38 @@
+# Dependencies
+node_modules/
+.pnp
+.pnp.js
+
+# Build & Test Outputs
+dist/
+dist-electron/
+out/
+release/
+coverage/
+
+# Local SQLite & Runtime Data
+.agent-forge/
+.test-artifacts/
+*.log
+*.sqlite
+*.sqlite-wal
+*.sqlite-shm
+*.db
+*.db-journal
+
+# Environment & Secrets
+.env
+.env.*
+*.env
+*.pem
+*.key
+
+# Antigravity & IDE Private State
+.gemini/
+.vscode/
+.idea/
+*.swp
+
+# OS Files
+.DS_Store
+Thumbs.db

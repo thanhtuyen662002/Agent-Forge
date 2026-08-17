@@ -1,0 +1,122 @@
+import React, { useState } from 'react';
+import { useOrchestrator } from '../context/OrchestratorContext';
+import { ShieldAlert, AlertTriangle, X, Check } from 'lucide-react';
+
+export const EmergencyStopModal: React.FC = () => {
+  const { isEmergencyStopOpen, setIsEmergencyStopOpen, triggerEmergencyStop } = useOrchestrator();
+  const [reason, setReason] = useState<string>('Manual Owner Emergency Stop');
+  const [isProcessing, setIsProcessing] = useState<boolean>(false);
+  const [stopResult, setStopResult] = useState<any>(null);
+
+  if (!isEmergencyStopOpen) return null;
+
+  const handleConfirm = async () => {
+    setIsProcessing(true);
+    try {
+      const res = await triggerEmergencyStop(reason);
+      setStopResult(res);
+    } catch (err) {
+      console.error('Emergency stop error:', err);
+    } finally {
+      setIsProcessing(false);
+    }
+  };
+
+  const handleClose = () => {
+    setStopResult(null);
+    setIsEmergencyStopOpen(false);
+  };
+
+  return (
+    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/80 backdrop-blur-sm p-4">
+      <div className="bg-surface border-2 border-rose-600/80 rounded-xl shadow-2xl max-w-lg w-full overflow-hidden glow-rose">
+        {/* Modal Header */}
+        <div className="bg-rose-950/40 border-b border-rose-800/40 px-6 py-4 flex items-center justify-between">
+          <div className="flex items-center space-x-3 text-rose-400">
+            <ShieldAlert className="w-6 h-6 shrink-0" />
+            <h2 className="font-mono font-bold text-lg tracking-wide uppercase">Emergency Stop Controller</h2>
+          </div>
+          <button
+            onClick={handleClose}
+            className="text-slate-400 hover:text-white p-1 rounded-md transition"
+          >
+            <X className="w-5 h-5" />
+          </button>
+        </div>
+
+        {/* Modal Body */}
+        <div className="p-6 space-y-4 text-sm text-slate-200">
+          {!stopResult ? (
+            <>
+              <div className="flex items-start space-x-3 p-3.5 bg-rose-950/20 border border-rose-900/40 rounded-lg text-xs text-rose-200">
+                <AlertTriangle className="w-5 h-5 text-rose-400 shrink-0 mt-0.5" />
+                <p>
+                  Triggering Emergency Stop will <strong>immediately terminate all running child processes</strong>, freeze task dispatch, and transition active tasks to a <strong>safe, recoverable PAUSED state</strong>.
+                </p>
+              </div>
+
+              <div>
+                <label className="block text-xs font-mono text-slate-400 mb-1.5">Reason for Emergency Stop:</label>
+                <input
+                  type="text"
+                  value={reason}
+                  onChange={(e) => setReason(e.target.value)}
+                  className="w-full bg-surface-card border border-surface-border rounded-lg px-3 py-2 text-sm text-white focus:outline-none focus:border-rose-500 font-mono"
+                  placeholder="e.g. Quota run, unexpected code loop, manual review needed"
+                />
+              </div>
+
+              <div className="text-xs text-slate-400 space-y-1 font-mono">
+                <div>• All active subprocesses (test runners, git commands) will receive SIGKILL.</div>
+                <div>• Database state, repository changes, and checkpoints are fully preserved.</div>
+                <div>• Projects and tasks can be deterministically resumed by the owner.</div>
+              </div>
+
+              {/* Action Buttons */}
+              <div className="flex items-center justify-end space-x-3 pt-4 border-t border-surface-border">
+                <button
+                  onClick={handleClose}
+                  disabled={isProcessing}
+                  className="px-4 py-2 bg-surface-card hover:bg-surface-border text-slate-300 text-xs font-semibold rounded-lg transition"
+                >
+                  Cancel
+                </button>
+                <button
+                  onClick={handleConfirm}
+                  disabled={isProcessing}
+                  className="px-5 py-2 bg-rose-600 hover:bg-rose-700 text-white font-mono font-bold text-xs rounded-lg shadow-lg shadow-rose-950/80 flex items-center space-x-2 transition"
+                >
+                  <ShieldAlert className="w-4 h-4" />
+                  <span>{isProcessing ? 'TERMINATING...' : 'CONFIRM EMERGENCY STOP'}</span>
+                </button>
+              </div>
+            </>
+          ) : (
+            <div className="space-y-4">
+              <div className="flex items-center space-x-3 text-emerald-400 p-3 bg-emerald-950/30 border border-emerald-800/40 rounded-lg">
+                <Check className="w-5 h-5 shrink-0" />
+                <span className="font-semibold text-xs">Emergency Stop executed successfully. System is safe.</span>
+              </div>
+
+              <div className="bg-surface-card p-4 rounded-lg border border-surface-border space-y-2 text-xs font-mono">
+                <div>Processes Terminated: <strong className="text-white">{stopResult.processesTerminated}</strong></div>
+                <div>Tasks Safely Paused: <strong className="text-white">{stopResult.tasksPaused?.length || 0}</strong></div>
+                <div>Projects Paused: <strong className="text-white">{stopResult.projectsPaused?.length || 0}</strong></div>
+                <div>Timestamp: <span className="text-slate-400">{stopResult.timestamp}</span></div>
+              </div>
+
+              <div className="flex justify-end pt-2">
+                <button
+                  onClick={handleClose}
+                  className="px-5 py-2 bg-surface-card hover:bg-surface-border text-white text-xs font-semibold rounded-lg transition"
+                >
+                  Close Controller
+                </button>
+              </div>
+            </div>
+          )}
+        </div>
+      </div>
+    </div>
+  );
+};
