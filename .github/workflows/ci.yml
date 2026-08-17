@@ -33,15 +33,24 @@ jobs:
       - name: Checkout exact source
         uses: actions/checkout@v4
         with:
+          ref: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
           fetch-depth: 0
+          persist-credentials: false
 
-      - name: Show build identity
+      - name: Show and verify build identity
         shell: bash
         run: |
           echo "=== CI Build Identity ==="
           echo "Event Name: ${{ github.event_name }}"
           echo "Git Reference: ${{ github.ref }}"
-          echo "Exact Tested HEAD SHA: $(git rev-parse HEAD)"
+          EXPECTED_SHA="${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}"
+          ACTUAL_SHA="$(git rev-parse HEAD)"
+          echo "Expected Source SHA: $EXPECTED_SHA"
+          echo "Actual Tested SHA:   $ACTUAL_SHA"
+          if [ "$ACTUAL_SHA" != "$EXPECTED_SHA" ]; then
+            echo "ERROR: Exact-head identity mismatch. Expected $EXPECTED_SHA but got $ACTUAL_SHA"
+            exit 1
+          fi
           echo "Working Tree Status:"
           git status --short
 
