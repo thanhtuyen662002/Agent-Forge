@@ -30,12 +30,51 @@ describe('ProcessRunner Persistence, PID Tracking & Cancellation', () => {
     } catch {}
   });
 
-  it('should block node -e inline evaluation without spawning child process', async () => {
+  it('should block node -e inline evaluation without spawning child process and preserve direct task/project ownership', async () => {
+    repo.createProject({
+      id: 'PROJ-DENIED',
+      name: 'Policy Denied Project',
+      description: null,
+      repository_path: tmpDir,
+      default_branch: 'main',
+      status: 'READY',
+      contract: null,
+      created_at: new Date().toISOString(),
+      updated_at: new Date().toISOString(),
+      started_at: null,
+      completed_at: null,
+    });
+
+    repo.createTask({
+      id: 'TSK-DENIED',
+      project_id: 'PROJ-DENIED',
+      milestone_id: null,
+      title: 'Task with policy violation',
+      description: null,
+      state: 'CODING',
+      paused_from_state: null,
+      priority: 'HIGH',
+      risk: 'HIGH',
+      assigned_agent_id: null,
+      revision_count: 0,
+      max_revisions: 3,
+      base_sha: null,
+      current_sha: null,
+      progress_cache_percent: 0,
+      progress_computed_at: null,
+      acceptance_criteria: [],
+      constraints: [],
+      created_at: new Date().toISOString(),
+      updated_at: new Date().toISOString(),
+    });
+
     const res = await ProcessRunner.execute({
       executable: 'node',
       args: ['-e', 'console.log("blocked");'],
-      cwd: process.cwd(),
+      cwd: tmpDir,
       repo,
+      projectId: 'PROJ-DENIED',
+      taskId: 'TSK-DENIED',
     });
 
     expect(res.exitCode).toBe(-1);
@@ -45,6 +84,16 @@ describe('ProcessRunner Persistence, PID Tracking & Cancellation', () => {
     const runRecord = repo.getProcessRun(res.executionId);
     expect(runRecord).not.toBeNull();
     expect(runRecord.status).toBe('FAILED');
+    expect(runRecord.task_id).toBe('TSK-DENIED');
+    expect(runRecord.project_id).toBe('PROJ-DENIED');
+    expect(runRecord.pid).toBeNull();
+
+    // Verify discoverable via getProcessRunsByTask
+    const taskRuns = repo.getProcessRunsByTask('TSK-DENIED');
+    expect(taskRuns).toHaveLength(1);
+    expect(taskRuns[0].id).toBe(res.executionId);
+    expect(taskRuns[0].project_id).toBe('PROJ-DENIED');
+    expect(taskRuns[0].status).toBe('FAILED');
   });
 
   it('should execute a safe script file, track PID, and persist stdout evidence in SQLite', async () => {

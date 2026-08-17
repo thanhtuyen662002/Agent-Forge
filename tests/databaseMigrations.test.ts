@@ -14,7 +14,7 @@ describe('Database Migrations & Upgrade Integrity', () => {
     db.close();
   });
 
-  it('should run all migrations cleanly and create all tables', () => {
+  it('should run all migrations cleanly and create all tables (v1 through v5)', () => {
     MigrationRunner.run(db);
 
     const tables = db
@@ -36,14 +36,19 @@ describe('Database Migrations & Upgrade Integrity', () => {
     expect(tableNames).toContain('schema_migrations');
 
     const applied = db.prepare('SELECT COUNT(*) as count FROM schema_migrations').get() as { count: number };
-    expect(applied.count).toBe(4);
+    expect(applied.count).toBe(5);
 
     // Foreign key integrity check
     const fkViolations = db.prepare('PRAGMA foreign_key_check').all();
     expect(fkViolations).toHaveLength(0);
+
+    // Idempotency check: running MigrationRunner again applies 0 new migrations
+    MigrationRunner.run(db);
+    const appliedAgain = db.prepare('SELECT COUNT(*) as count FROM schema_migrations').get() as { count: number };
+    expect(appliedAgain.count).toBe(5);
   });
 
-  it('should cleanly upgrade an existing database from schema v1/v2 to v3 to v4 preserving agent-resource associations and FK integrity', () => {
+  it('should cleanly upgrade an existing database through historical path (v1 -> v2 -> original v3 -> v4 -> v5) and repair default agent links', () => {
     // 1. Manually apply v1 schema
     db.exec(`
       CREATE TABLE IF NOT EXISTS schema_migrations (
@@ -60,7 +65,7 @@ describe('Database Migrations & Upgrade Integrity', () => {
       new Date().toISOString()
     );
 
-    // Insert sample project, task, provider, provider_resource, and agent in v1 schema
+    // Insert sample project, task, provider, supported default resources, and agents in v1 schema
     db.exec(`
       INSERT INTO projects (id, name, repository_path, default_branch, status, created_at, updated_at)
       VALUES ('PROJ-MIG-1', 'Upgrade Test Project', 'd:/test', 'main', 'READY', '2026-08-17T00:00:00Z', '2026-08-17T00:00:00Z');
@@ -69,46 +74,58 @@ describe('Database Migrations & Upgrade Integrity', () => {
       VALUES ('TSK-MIG-1', 'PROJ-MIG-1', 'Migrated Task', 'PLANNED', 'HIGH', 'MEDIUM', 0, 3, 0, '[]', '[]', '2026-08-17T00:00:00Z', '2026-08-17T00:00:00Z');
 
       INSERT INTO providers (id, name, adapter_type, enabled, created_at)
-      VALUES ('prov-1', 'Manual Bridge', 'MANUAL_BRIDGE', 1, '2026-08-17T00:00:00Z');
+      VALUES ('prov-manual-bridge', 'Manual Bridge', 'MANUAL_BRIDGE', 1, '2026-08-17T00:00:00Z');
 
       INSERT INTO provider_resources (id, provider_id, model_name, health_status, capabilities_json, enabled, total_quota, remaining_quota, quota_unit, quota_reset_at, quota_source, quota_confidence, last_health_check)
-      VALUES ('res-1', 'prov-1', 'ChatGPT-4o', 'AVAILABLE', '[]', 1, 100, 50, 'REQUESTS', NULL, 'MANUAL', 1.0, '2026-08-17T00:00:00Z');
+      VALUES ('res-chatgpt-manager', 'prov-manual-bridge', 'ChatGPT-4o', 'AVAILABLE', '[]', 1, 100, 50, 'REQUESTS', NULL, 'MANUAL', 1.0, '2026-08-17T00:00:00Z');
+
+      INSERT INTO provider_resources (id, provider_id, model_name, health_status, capabilities_json, enabled, total_quota, remaining_quota, quota_unit, quota_reset_at, quota_source, quota_confidence, last_health_check)
+      VALUES ('res-gemini-coder', 'prov-manual-bridge', 'Gemini 2.5 Pro', 'AVAILABLE', '[]', 1, 500, 450, 'REQUESTS', NULL, 'MANUAL', 1.0, '2026-08-17T00:00:00Z');
 
       INSERT INTO agents (id, display_name, role, provider_resource_id, status, current_task_id, last_seen_at)
-      VALUES ('agt-1', 'Lead Architect', 'PRIMARY_MANAGER', 'res-1', 'IDLE', NULL, '2026-08-17T00:00:00Z');
+      VALUES ('agent-primary-manager', 'Lead Architect', 'PRIMARY_MANAGER', 'res-chatgpt-manager', 'IDLE', NULL, '2026-08-17T00:00:00Z');
+
+      INSERT INTO agents (id, display_name, role, provider_resource_id, status, current_task_id, last_seen_at)
+      VALUES ('agent-gemini-coder', 'Implementation Coder', 'CODER', 'res-gemini-coder', 'IDLE', NULL, '2026-08-17T00:00:00Z');
 
       INSERT INTO evidence (id, project_id, task_id, evidence_type, storage_type, hash, byte_size, content_type, summary, raw_payload, created_at)
       VALUES ('EV-MIG-1', 'PROJ-MIG-1', 'TSK-MIG-1', 'GIT_STATUS', 'INLINE', 'sha123', 10, 'text/plain', 'Initial Evidence', 'clean', '2026-08-17T00:00:00Z');
     `);
 
-    // Verify initial agent-resource mapping BEFORE migration
-    const agentBefore = db.prepare('SELECT * FROM agents WHERE id = ?').get('agt-1') as any;
-    expect(agentBefore.provider_resource_id).toBe('res-1');
+    // Verify initial agent-resource mappings BEFORE upgrade
+    const mgrBefore = db.prepare('SELECT * FROM agents WHERE id = ?').get('agent-primary-manager') as any;
+    expect(mgrBefore.provider_resource_id).toBe('res-chatgpt-manager');
 
-    // 2. Run MigrationRunner to upgrade to latest (v4)
+    // 2. Run MigrationRunner to upgrade from v1 to latest (v5)
     MigrationRunner.run(db);
 
     // 3. Assert migrations applied
-    const v4Tables = (db.prepare("SELECT name FROM sqlite_master WHERE type='table'").all() as { name: string }[]).map((t) => t.name);
-    expect(v4Tables).toContain('verification_commands');
-    expect(v4Tables).toContain('provider_resources');
-    expect(v4Tables).toContain('process_runs');
+    const v5Tables = (db.prepare("SELECT name FROM sqlite_master WHERE type='table'").all() as { name: string }[]).map((t) => t.name);
+    expect(v5Tables).toContain('verification_commands');
+    expect(v5Tables).toContain('provider_resources');
+    expect(v5Tables).toContain('process_runs');
 
     const migrationCount = (db.prepare('SELECT COUNT(*) as count FROM schema_migrations').get() as { count: number }).count;
-    expect(migrationCount).toBe(4);
+    expect(migrationCount).toBe(5);
 
-    // 4. Assert agent.provider_resource_id BEFORE === AFTER (Preserved!)
-    const agentAfter = db.prepare('SELECT * FROM agents WHERE id = ?').get('agt-1') as any;
-    expect(agentAfter.provider_resource_id).toBe('res-1');
-    expect(agentAfter.provider_resource_id).toBe(agentBefore.provider_resource_id);
+    // 4. Assert default agent links are repaired by migration 005
+    const mgrAfter = db.prepare('SELECT * FROM agents WHERE id = ?').get('agent-primary-manager') as any;
+    expect(mgrAfter.provider_resource_id).toBe('res-chatgpt-manager');
 
-    // 5. Assert resource data preserved
-    const res = db.prepare('SELECT * FROM provider_resources WHERE id = ?').get('res-1') as any;
+    const coderAfter = db.prepare('SELECT * FROM agents WHERE id = ?').get('agent-gemini-coder') as any;
+    expect(coderAfter.provider_resource_id).toBe('res-gemini-coder');
+
+    // 5. Assert absent legacy Claude records are NOT created
+    const absentClaudeResource = db.prepare('SELECT * FROM provider_resources WHERE id = ?').get('res-claude-reviewer');
+    expect(absentClaudeResource).toBeUndefined();
+
+    // 6. Assert resource metadata is preserved
+    const res = db.prepare('SELECT * FROM provider_resources WHERE id = ?').get('res-chatgpt-manager') as any;
     expect(res.model_name).toBe('ChatGPT-4o');
     expect(res.remaining_quota).toBe(50);
     expect(res.health_status).toBe('AVAILABLE');
 
-    // 6. Assert PRAGMA foreign_key_check passes with 0 violations
+    // 7. Assert PRAGMA foreign_key_check passes with 0 violations
     const fkViolations = db.prepare('PRAGMA foreign_key_check').all();
     expect(fkViolations).toHaveLength(0);
   });

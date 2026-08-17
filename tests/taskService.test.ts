@@ -5,6 +5,7 @@ import { Repository } from '../src/core/database/repositories';
 import { EventService } from '../src/core/services/EventService';
 import { TaskService } from '../src/core/services/TaskService';
 import { GitService } from '../src/core/services/GitService';
+import { ProgressService } from '../src/core/services/ProgressService';
 import { ManagerProtocol, CoderProtocol } from '../src/core/types/protocols';
 import { Task, Project } from '../src/core/types/domain';
 
@@ -267,5 +268,51 @@ describe('TaskService & Protocol Idempotency', () => {
     expect(res.success).toBe(true);
     expect(res.task!.state).toBe('REVIEWING');
     expect(repo.getTask('TSK-001')!.state).toBe('REVIEWING');
+  });
+
+  it('should NOT award test progress or fake lint pass when Manager PASS is applied without passing TestRun evidence', async () => {
+    repo.updateTaskState('TSK-001', 'REVIEWING');
+
+    // No TestRun was ever recorded for TSK-001
+    expect(repo.getLatestTestRun('TSK-001')).toBeNull();
+
+    const managerPassMsg: ManagerProtocol = {
+      protocol: 'manager.v1',
+      message_id: 'msg-pass-no-test',
+      project_id: 'PROJ-TEST',
+      task_id: 'TSK-001',
+      decision: 'PASS',
+      priority: 'HIGH',
+      risk: 'MEDIUM',
+      instructions: ['Manual owner approval without automated tests'],
+      acceptance_criteria: [],
+      constraints: [],
+      review_issues: [],
+      expected_task_state: 'REVIEWING',
+      expected_revision: 0,
+    };
+
+    const res = await taskService.applyManagerDecision(managerPassMsg, JSON.stringify(managerPassMsg));
+    expect(res.success).toBe(true);
+
+    const taskDone = repo.getTask('TSK-001')!;
+    expect(taskDone.state).toBe('DONE');
+
+    // Re-evaluate breakdown: targetedTesting MUST be 0 and regressionAndLint MUST be 0
+    const latestTest = repo.getLatestTestRun('TSK-001');
+    const latestDiffEv = repo.getLatestEvidence('TSK-001', 'GIT_DIFF');
+    const breakdown = ProgressService.calculateTaskProgress(taskDone, {
+      hasGitDiff: Boolean(latestDiffEv) || taskDone.current_sha !== null,
+      testsPassed: latestTest?.exit_code === 0,
+      hasEvidence: Boolean(latestDiffEv),
+      excludeUnconfiguredLint: true,
+      lintPassed: false,
+    });
+
+    expect(breakdown.breakdown.targetedTesting).toBe(0);
+    expect(breakdown.breakdown.regressionAndLint).toBe(0);
+    expect(breakdown.breakdown.managerReview).toBe(10);
+    // Planning (10) + ManagerReview (10) = 20 points earned out of 85 applicable = 24%
+    expect(taskDone.progress_cache_percent).toBe(24);
   });
 });

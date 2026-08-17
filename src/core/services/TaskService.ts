@@ -303,7 +303,7 @@ export class TaskService {
 
       const progress = ProgressService.calculateTaskProgress(updatedTask, {
         hasGitDiff: Boolean(latestDiffEv) || updatedTask.current_sha !== null,
-        testsPassed: latestTest?.exit_code === 0 || managerMsg.decision === 'PASS',
+        testsPassed: latestTest?.exit_code === 0,
         hasEvidence: Boolean(latestDiffEv),
         excludeUnconfiguredLint: !hasLintConfig,
         lintPassed: false,

@@ -1,3 +1,10 @@
+/**
+ * MIGRATION IMMUTABILITY RULE:
+ * Once a migration version has been published/pushed to a review branch or release,
+ * DO NOT EDIT OR IMPROVE IT. Always append a new migration version for subsequent
+ * schema changes or data repairs.
+ */
+
 import Database from 'better-sqlite3';
 
 export interface Migration {
@@ -404,17 +411,6 @@ export const MIGRATIONS: Migration[] = [
     version: 3,
     name: '003_nullable_health_check',
     up: (db: Database.Database) => {
-      // 1. Back up agent-to-resource associations in a temp table
-      db.exec(`
-        CREATE TEMP TABLE IF NOT EXISTS temp_agent_resource_backup (
-          agent_id TEXT PRIMARY KEY,
-          provider_resource_id TEXT
-        );
-        INSERT INTO temp_agent_resource_backup (agent_id, provider_resource_id)
-        SELECT id, provider_resource_id FROM agents WHERE provider_resource_id IS NOT NULL;
-      `);
-
-      // 2. Rebuild provider_resources table with nullable last_health_check
       db.exec(`
         CREATE TABLE IF NOT EXISTS provider_resources_new (
           id TEXT PRIMARY KEY,
@@ -442,17 +438,6 @@ export const MIGRATIONS: Migration[] = [
         ALTER TABLE provider_resources_new RENAME TO provider_resources;
         CREATE INDEX IF NOT EXISTS idx_resources_provider ON provider_resources(provider_id);
       `);
-
-      // 3. Restore agent-to-resource associations after provider_resources is reconstituted
-      db.exec(`
-        UPDATE agents
-        SET provider_resource_id = (
-          SELECT provider_resource_id FROM temp_agent_resource_backup WHERE agent_id = agents.id
-        )
-        WHERE id IN (SELECT agent_id FROM temp_agent_resource_backup);
-
-        DROP TABLE IF EXISTS temp_agent_resource_backup;
-      `);
     },
   },
   {
@@ -465,6 +450,34 @@ export const MIGRATIONS: Migration[] = [
         ALTER TABLE process_runs ADD COLUMN attempt_id TEXT REFERENCES task_attempts(id) ON DELETE SET NULL;
         CREATE INDEX IF NOT EXISTS idx_process_runs_task ON process_runs(task_id);
         CREATE INDEX IF NOT EXISTS idx_process_runs_project ON process_runs(project_id);
+      `);
+    },
+  },
+  {
+    version: 5,
+    name: '005_repair_default_agent_resource_links',
+    up: (db: Database.Database) => {
+      // Repair supported default Agent -> ProviderResource relationships for databases
+      // that previously executed original migration v3 and had provider_resource_id set to NULL.
+      // Operates ONLY when both expected records exist, and does NOT overwrite existing valid IDs.
+      db.exec(`
+        UPDATE agents
+        SET provider_resource_id = 'res-chatgpt-manager'
+        WHERE id = 'agent-primary-manager'
+          AND provider_resource_id IS NULL
+          AND EXISTS (SELECT 1 FROM provider_resources WHERE id = 'res-chatgpt-manager');
+
+        UPDATE agents
+        SET provider_resource_id = 'res-gemini-coder'
+        WHERE id = 'agent-gemini-coder'
+          AND provider_resource_id IS NULL
+          AND EXISTS (SELECT 1 FROM provider_resources WHERE id = 'res-gemini-coder');
+
+        UPDATE agents
+        SET provider_resource_id = 'res-claude-reviewer'
+        WHERE id = 'agent-claude-reviewer'
+          AND provider_resource_id IS NULL
+          AND EXISTS (SELECT 1 FROM provider_resources WHERE id = 'res-claude-reviewer');
       `);
     },
   },
