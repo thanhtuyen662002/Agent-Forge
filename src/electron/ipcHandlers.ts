@@ -139,7 +139,7 @@ export function registerIpcHandlers(
     if (!parsed.success) {
       return { success: false, error: parsed.error.issues.map((i) => i.message).join(', ') };
     }
-    return projectService.transitionStatus(parsed.data.projectId, parsed.data.trigger as any);
+    return projectService.transitionStatus(parsed.data.projectId, parsed.data.trigger);
   });
 
   // ==========================================
@@ -201,7 +201,7 @@ export function registerIpcHandlers(
     }
 
     if (parseRes.data.type === 'manager.v1') {
-      return taskService.applyManagerDecision(parseRes.data.data, parsed.data.rawInput);
+      return await taskService.applyManagerDecision(parseRes.data.data, parsed.data.rawInput);
     } else if (parseRes.data.type === 'coder.v1') {
       return taskService.applyCoderReport(parseRes.data.data, parsed.data.rawInput);
     }
@@ -253,6 +253,18 @@ export function registerIpcHandlers(
       };
     }
 
+    // Authoritative evidence loaded from SQLite
+    const latestTestRun = repo.getLatestTestRun(task.id);
+    const gitDiffEv = repo.getLatestEvidence(task.id, 'GIT_DIFF');
+    const reviews = repo.getReviewsByTask(task.id);
+
+    if (!gitDiffEv) {
+      return {
+        success: false,
+        error: 'AUTHORITATIVE_DIFF_EVIDENCE_MISSING: No durable Git diff validation evidence found for this task. Run validation flow before requesting review.',
+      };
+    }
+
     // Atomically advance task to REVIEWING if in REVIEW_READY
     if (task.state === 'REVIEW_READY') {
       const reviewStartRes = taskService.startReview(task.id, project.id);
@@ -261,28 +273,13 @@ export function registerIpcHandlers(
       }
     }
 
-    // Authoritative evidence loaded from SQLite
-    const latestTestRun = repo.getLatestTestRun(task.id);
-    const gitDiffEv = repo.getLatestEvidence(task.id, 'GIT_DIFF');
-    const reviews = repo.getReviewsByTask(task.id);
-
     let diffContent = '';
-    let diffStat = 'No Git diff evidence recorded.';
+    const diffStat = gitDiffEv.summary || 'Git Diff recorded.';
 
-    if (gitDiffEv) {
-      try {
-        diffContent = defaultArtifactStore.read(gitDiffEv);
-        diffStat = gitDiffEv.summary;
-      } catch {
-        diffContent = gitDiffEv.raw_payload || '';
-      }
-    } else {
-      // Fallback: query live git diff
-      const liveDiff = await GitService.getDiff(project.repository_path, task.base_sha);
-      if (liveDiff.status === 'SUCCESS') {
-        diffContent = liveDiff.diffContent;
-        diffStat = liveDiff.diffStat;
-      }
+    try {
+      diffContent = defaultArtifactStore.read(gitDiffEv);
+    } catch {
+      diffContent = gitDiffEv.raw_payload || '';
     }
 
     // Restore latest applied coder report from protocol ledger

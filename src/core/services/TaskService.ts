@@ -19,7 +19,6 @@ export interface TaskCreationSpec {
   risk?: 'LOW' | 'MEDIUM' | 'HIGH' | 'CRITICAL';
   acceptanceCriteria?: string[];
   constraints?: string[];
-  baseSha?: string | null;
 }
 
 export interface ApplyProtocolResult {
@@ -57,6 +56,7 @@ export class TaskService {
     const now = new Date().toISOString();
     const taskId = spec.id || `TSK-${crypto.randomUUID().substring(0, 8).toUpperCase()}`;
 
+    // Base SHA is initialized as NULL. It will be immutably bound to the exact Git HEAD commit SHA upon Manager EXECUTE.
     const task: Task = {
       id: taskId,
       project_id: spec.projectId,
@@ -70,7 +70,7 @@ export class TaskService {
       assigned_agent_id: null,
       revision_count: 0,
       max_revisions: 3,
-      base_sha: spec.baseSha !== undefined ? spec.baseSha : (project.default_branch || null),
+      base_sha: null,
       current_sha: null,
       progress_cache_percent: 0,
       progress_computed_at: now,
@@ -92,10 +92,10 @@ export class TaskService {
     return task;
   }
 
-  public applyManagerDecision(
+  public async applyManagerDecision(
     managerMsg: ManagerProtocol,
     rawPayload: string
-  ): ApplyProtocolResult {
+  ): Promise<ApplyProtocolResult> {
     const computedHash = crypto.createHash('sha256').update(rawPayload, 'utf8').digest('hex');
 
     // 1. Idempotency Check
@@ -199,7 +199,38 @@ export class TaskService {
         return { success: false, error: `Unsupported decision: ${(managerMsg as any).decision}` };
     }
 
-    // 5. Evaluate state machine transition
+    // 5. Authoritative Git Base SHA Resolution on EXECUTE
+    let boundBaseSha: string | null = task.base_sha;
+    if (managerMsg.decision === 'EXECUTE') {
+      if (!boundBaseSha) {
+        const project = this.repo.getProject(task.project_id);
+        if (!project) {
+          return { success: false, error: `Project "${task.project_id}" not found.` };
+        }
+
+        const headShaRes = await GitService.getHeadSha(project.repository_path);
+        if (headShaRes.status !== 'SUCCESS' || !headShaRes.sha) {
+          const reason = `Cannot begin coding: Git repository HEAD SHA could not be authoritatively resolved (${headShaRes.errorMessage || 'git rev-parse HEAD failed'}).`;
+          this.repo.recordProtocolMessage(
+            crypto.randomUUID(),
+            managerMsg.message_id,
+            'manager.v1',
+            task.project_id,
+            task.id,
+            managerMsg.expected_task_state ?? null,
+            managerMsg.expected_revision ?? null,
+            computedHash,
+            rawPayload,
+            'REJECTED',
+            reason
+          );
+          return { success: false, error: reason };
+        }
+        boundBaseSha = headShaRes.sha;
+      }
+    }
+
+    // 6. Evaluate state machine transition
     let transitionRes;
     try {
       transitionRes = TaskStateMachine.transition(task.state, trigger, {
@@ -225,7 +256,7 @@ export class TaskService {
       return { success: false, error: reason };
     }
 
-    // 6. Execute atomic database transaction
+    // 7. Execute atomic database transaction
     const mutate = () => {
       this.repo.updateTaskState(
         task.id,
@@ -233,6 +264,11 @@ export class TaskService {
         transitionRes.pausedFromState,
         transitionRes.incrementRevision
       );
+
+      // Immutably bind base commit SHA if determined
+      if (boundBaseSha && boundBaseSha !== task.base_sha) {
+        this.repo.updateTaskShas(task.id, boundBaseSha, task.current_sha);
+      }
 
       // Record review entity if this was a review decision
       if (managerMsg.decision === 'PASS' || managerMsg.decision === 'FIX_REQUIRED') {
@@ -260,7 +296,18 @@ export class TaskService {
 
       // Update derived progress
       const updatedTask = this.repo.getTask(task.id)!;
-      const progress = ProgressService.calculateTaskProgress(updatedTask);
+      const latestTest = this.repo.getLatestTestRun(task.id);
+      const latestDiffEv = this.repo.getLatestEvidence(task.id, 'GIT_DIFF');
+      const verifCmds = this.repo.getVerificationCommandsByProject(task.project_id);
+      const hasLintConfig = verifCmds.some((c) => c.command_type === 'LINT' && c.enabled);
+
+      const progress = ProgressService.calculateTaskProgress(updatedTask, {
+        hasGitDiff: Boolean(latestDiffEv) || updatedTask.current_sha !== null,
+        testsPassed: latestTest?.exit_code === 0 || managerMsg.decision === 'PASS',
+        hasEvidence: Boolean(latestDiffEv),
+        excludeUnconfiguredLint: !hasLintConfig,
+        lintPassed: false,
+      });
       this.repo.updateTaskProgressCache(task.id, progress.percent);
 
       // Record in protocol messages ledger
@@ -281,7 +328,7 @@ export class TaskService {
         managerMsg.project_id,
         'MANAGER_DECISION_APPLIED',
         `Manager decision "${managerMsg.decision}" applied to task ${task.id} (${task.state} -> ${transitionRes.nextState}).`,
-        { decision: managerMsg.decision, fromState: task.state, toState: transitionRes.nextState },
+        { decision: managerMsg.decision, fromState: task.state, toState: transitionRes.nextState, baseSha: boundBaseSha },
         task.id
       );
 
@@ -646,12 +693,17 @@ export class TaskService {
       );
     }
 
-    // Update derived progress
+    // Update derived progress strictly from verified evidence
     const finalTask = this.repo.getTask(task.id)!;
+    const verifCmds = this.repo.getVerificationCommandsByProject(project.id);
+    const hasLintConfig = verifCmds.some((c) => c.command_type === 'LINT' && c.enabled);
+
     const progress = ProgressService.calculateTaskProgress(finalTask, {
       hasGitDiff: gitDiff.status === 'SUCCESS' && gitDiff.filesChanged.length > 0,
-      hasEvidence: true,
+      hasEvidence: gitEvidenceSuccess && (gitDiff.filesChanged.length > 0 || gitStatus.isClean),
       testsPassed: testRun.exit_code === 0,
+      excludeUnconfiguredLint: !hasLintConfig,
+      lintPassed: false,
     });
     this.repo.updateTaskProgressCache(task.id, progress.percent);
 

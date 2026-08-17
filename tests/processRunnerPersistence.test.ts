@@ -87,6 +87,69 @@ describe('ProcessRunner Persistence, PID Tracking & Cancellation', () => {
     expect(runRecord.stdout_evidence_id).toBeDefined();
   });
 
+  it('should associate process runs directly with task_id and remain discoverable even with empty output or policy denials', async () => {
+    repo.createProject({
+      id: 'PROJ-EMPTY',
+      name: 'Empty Process Project',
+      description: null,
+      repository_path: tmpDir,
+      default_branch: 'main',
+      status: 'READY',
+      contract: null,
+      created_at: new Date().toISOString(),
+      updated_at: new Date().toISOString(),
+      started_at: null,
+      completed_at: null,
+    });
+
+    repo.createTask({
+      id: 'TSK-EMPTY-PROC',
+      project_id: 'PROJ-EMPTY',
+      milestone_id: null,
+      title: 'Task with silent process',
+      description: null,
+      state: 'CODING',
+      paused_from_state: null,
+      priority: 'LOW',
+      risk: 'LOW',
+      assigned_agent_id: null,
+      revision_count: 0,
+      max_revisions: 3,
+      base_sha: null,
+      current_sha: null,
+      progress_cache_percent: 0,
+      progress_computed_at: null,
+      acceptance_criteria: [],
+      constraints: [],
+      created_at: new Date().toISOString(),
+      updated_at: new Date().toISOString(),
+    });
+
+    const silentScript = path.join(tmpDir, 'silent.js');
+    fs.writeFileSync(silentScript, 'process.exit(0);', 'utf8'); // Emits zero stdout and stderr
+
+    const res = await ProcessRunner.execute({
+      executable: 'node',
+      args: [silentScript],
+      cwd: tmpDir,
+      repo,
+      projectId: 'PROJ-EMPTY',
+      taskId: 'TSK-EMPTY-PROC',
+    });
+
+    expect(res.exitCode).toBe(0);
+    expect(res.stdout).toBe('');
+
+    // Query directly by task_id - must be discoverable despite zero output / no evidence record
+    const taskRuns = repo.getProcessRunsByTask('TSK-EMPTY-PROC');
+    expect(taskRuns).toHaveLength(1);
+    expect(taskRuns[0].id).toBe(res.executionId);
+    expect(taskRuns[0].task_id).toBe('TSK-EMPTY-PROC');
+    expect(taskRuns[0].project_id).toBe('PROJ-EMPTY');
+    expect(taskRuns[0].status).toBe('COMPLETED');
+    expect(taskRuns[0].stdout_evidence_id).toBeNull();
+  });
+
   it('should cancel a running process, terminate its tree, and record CANCELLED in DB', async () => {
     const longScript = path.join(tmpDir, 'long_script.js');
     fs.writeFileSync(

@@ -870,6 +870,9 @@ export class Repository {
   public createProcessRun(run: {
     id: string;
     pid: number | null;
+    project_id?: string | null;
+    task_id?: string | null;
+    attempt_id?: string | null;
     command: string;
     working_directory: string;
     status: 'RUNNING' | 'COMPLETED' | 'FAILED' | 'CANCELLED' | 'TIMED_OUT';
@@ -877,10 +880,21 @@ export class Repository {
   }): void {
     this.db
       .prepare(`
-        INSERT INTO process_runs (id, pid, command, working_directory, status, start_time, end_time, exit_code, stdout_evidence_id, stderr_evidence_id, created_at)
-        VALUES (?, ?, ?, ?, ?, ?, NULL, NULL, NULL, NULL, ?)
+        INSERT INTO process_runs (id, pid, project_id, task_id, attempt_id, command, working_directory, status, start_time, end_time, exit_code, stdout_evidence_id, stderr_evidence_id, created_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, NULL, NULL, ?)
       `)
-      .run(run.id, run.pid, run.command, run.working_directory, run.status, run.start_time, run.start_time);
+      .run(
+        run.id,
+        run.pid,
+        run.project_id ?? null,
+        run.task_id ?? null,
+        run.attempt_id ?? null,
+        run.command,
+        run.working_directory,
+        run.status,
+        run.start_time,
+        run.start_time
+      );
   }
 
   public updateProcessRunPid(id: string, pid: number): void {
@@ -915,12 +929,13 @@ export class Repository {
 
   public getProcessRunsByTask(taskId: string): any[] {
     return this.db
-      .prepare(`
-        SELECT pr.* FROM process_runs pr
-        LEFT JOIN evidence e ON pr.stdout_evidence_id = e.id
-        WHERE e.task_id = ?
-        ORDER BY pr.start_time DESC
-      `)
+      .prepare('SELECT * FROM process_runs WHERE task_id = ? ORDER BY start_time DESC')
       .all(taskId);
+  }
+
+  public getProcessRunsByProject(projectId: string): any[] {
+    return this.db
+      .prepare('SELECT * FROM process_runs WHERE project_id = ? ORDER BY start_time DESC')
+      .all(projectId);
   }
 }

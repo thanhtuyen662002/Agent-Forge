@@ -97,6 +97,8 @@ describe('Bootstrap Smoke & Fresh Database Startup', () => {
     expect(persistedTask.title).toBe('Bootstrap Task');
     expect(persistedTask.state).toBe('PLANNED');
 
-    bootstrap.db.close();
+    // Clean database shutdown
+    expect(bootstrap.dbEngine).toBeDefined();
+    bootstrap.dbEngine.close();
   });
 });

@@ -404,6 +404,17 @@ export const MIGRATIONS: Migration[] = [
     version: 3,
     name: '003_nullable_health_check',
     up: (db: Database.Database) => {
+      // 1. Back up agent-to-resource associations in a temp table
+      db.exec(`
+        CREATE TEMP TABLE IF NOT EXISTS temp_agent_resource_backup (
+          agent_id TEXT PRIMARY KEY,
+          provider_resource_id TEXT
+        );
+        INSERT INTO temp_agent_resource_backup (agent_id, provider_resource_id)
+        SELECT id, provider_resource_id FROM agents WHERE provider_resource_id IS NOT NULL;
+      `);
+
+      // 2. Rebuild provider_resources table with nullable last_health_check
       db.exec(`
         CREATE TABLE IF NOT EXISTS provider_resources_new (
           id TEXT PRIMARY KEY,
@@ -430,6 +441,30 @@ export const MIGRATIONS: Migration[] = [
         DROP TABLE provider_resources;
         ALTER TABLE provider_resources_new RENAME TO provider_resources;
         CREATE INDEX IF NOT EXISTS idx_resources_provider ON provider_resources(provider_id);
+      `);
+
+      // 3. Restore agent-to-resource associations after provider_resources is reconstituted
+      db.exec(`
+        UPDATE agents
+        SET provider_resource_id = (
+          SELECT provider_resource_id FROM temp_agent_resource_backup WHERE agent_id = agents.id
+        )
+        WHERE id IN (SELECT agent_id FROM temp_agent_resource_backup);
+
+        DROP TABLE IF EXISTS temp_agent_resource_backup;
+      `);
+    },
+  },
+  {
+    version: 4,
+    name: '004_process_run_ownership',
+    up: (db: Database.Database) => {
+      db.exec(`
+        ALTER TABLE process_runs ADD COLUMN project_id TEXT REFERENCES projects(id) ON DELETE CASCADE;
+        ALTER TABLE process_runs ADD COLUMN task_id TEXT REFERENCES tasks(id) ON DELETE CASCADE;
+        ALTER TABLE process_runs ADD COLUMN attempt_id TEXT REFERENCES task_attempts(id) ON DELETE SET NULL;
+        CREATE INDEX IF NOT EXISTS idx_process_runs_task ON process_runs(task_id);
+        CREATE INDEX IF NOT EXISTS idx_process_runs_project ON process_runs(project_id);
       `);
     },
   },

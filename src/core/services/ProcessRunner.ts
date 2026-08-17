@@ -30,6 +30,7 @@ export interface StructuredProcessOptions {
   artifactStore?: ArtifactStore;
   projectId?: string;
   taskId?: string;
+  attemptId?: string | null;
 }
 
 export class ProcessRunner {
@@ -132,6 +133,9 @@ export class ProcessRunner {
       options.repo.createProcessRun({
         id: executionId,
         pid: null,
+        project_id: options.projectId ?? null,
+        task_id: options.taskId ?? null,
+        attempt_id: options.attemptId ?? null,
         command: commandStr,
         working_directory: options.cwd,
         status: 'RUNNING',

@@ -27,9 +27,29 @@ export const ImportContractIpcSchema = z.object({
 });
 export type ImportContractIpc = z.infer<typeof ImportContractIpcSchema>;
 
+export const ProjectTriggerSchema = z.enum([
+  'IMPORT_CONTRACT',
+  'PLAN_APPROVED',
+  'START_PROJECT',
+  'PAUSE',
+  'RESUME',
+  'BLOCKER_DETECTED',
+  'BLOCKER_RESOLVED',
+  'QUOTA_EXHAUSTED',
+  'CAPACITY_RESTORED',
+  'ESCALATE_TO_OWNER',
+  'OWNER_APPROVED',
+  'ALL_TASKS_DONE',
+  'FINAL_PASS',
+  'FINAL_FIX_REQUIRED',
+  'FATAL_ERROR',
+  'CANCEL_PROJECT',
+]);
+export type ProjectTriggerType = z.infer<typeof ProjectTriggerSchema>;
+
 export const TransitionProjectIpcSchema = z.object({
-  projectId: z.string().min(1),
-  trigger: z.string().min(1),
+  projectId: z.string().min(1, 'Project ID is required'),
+  trigger: ProjectTriggerSchema,
 });
 export type TransitionProjectIpc = z.infer<typeof TransitionProjectIpcSchema>;
 
@@ -89,6 +109,11 @@ export const UpdateResourceQuotaIpcSchema = z.object({
 });
 export type UpdateResourceQuotaIpc = z.infer<typeof UpdateResourceQuotaIpcSchema>;
 
+/**
+ * Emergency Stop Schema.
+ * Uses deliberate fail-safe semantics: if no reason or an empty object is supplied,
+ * it safely defaults to 'Manual Owner Emergency Stop' rather than rejecting the safety action.
+ */
 export const EmergencyStopIpcSchema = z.object({
   reason: z.string().optional().default('Manual Owner Emergency Stop'),
 });

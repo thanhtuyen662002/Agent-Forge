@@ -116,7 +116,7 @@ describe('Real End-to-End Orchestration Integration Lifecycle', () => {
       enabled: true,
     });
 
-    // 2. Create Task through trusted TaskService
+    // 2. Create Task through trusted TaskService WITHOUT manual baseSha injection
     const task = taskService.createTask({
       id: 'TSK-REAL-001',
       projectId: project.id,
@@ -126,10 +126,13 @@ describe('Real End-to-End Orchestration Integration Lifecycle', () => {
       risk: 'LOW',
       acceptanceCriteria: ['feature.js returns 42', 'run_tests.js passes'],
       constraints: [],
-      baseSha: baseSha,
     });
 
-    // 3. Manager EXECUTE Protocol Applied -> Task transitions to CODING
+    // Assert base_sha is NULL before execution begins
+    expect(task.base_sha).toBeNull();
+    expect(repo.getTask(task.id)!.base_sha).toBeNull();
+
+    // 3. Manager EXECUTE Protocol Applied -> Binds exact Git commit HEAD SHA and transitions to CODING
     const managerExecMsg: ManagerProtocol = {
       protocol: 'manager.v1',
       message_id: 'msg-exec-real-1',
@@ -145,13 +148,17 @@ describe('Real End-to-End Orchestration Integration Lifecycle', () => {
       expected_task_state: 'PLANNED',
       expected_revision: 0,
     };
-    const execRes = taskService.applyManagerDecision(managerExecMsg, JSON.stringify(managerExecMsg));
+    const execRes = await taskService.applyManagerDecision(managerExecMsg, JSON.stringify(managerExecMsg));
     expect(execRes.success).toBe(true);
-    expect(repo.getTask(task.id)!.state).toBe('CODING');
 
-    // 4. Generate Work Order
-    const workOrder = PackageGenerator.generateWorkOrder(project, repo.getTask(task.id)!);
+    const taskInCoding = repo.getTask(task.id)!;
+    expect(taskInCoding.state).toBe('CODING');
+    expect(taskInCoding.base_sha).toBe(baseSha); // Immutably bound to exact git rev-parse HEAD commit!
+
+    // 4. Generate Work Order containing exact bound commit SHA
+    const workOrder = PackageGenerator.generateWorkOrder(project, taskInCoding);
     expect(workOrder).toContain(`WORK ORDER: ${task.id}`);
+    expect(workOrder).toContain(baseSha);
     expect(workOrder).toContain('Update feature to 42');
 
     // 5. Simulate Coder Modifying the Tracked File in Real Git
@@ -236,7 +243,7 @@ describe('Real End-to-End Orchestration Integration Lifecycle', () => {
       expected_task_state: 'REVIEWING',
       expected_revision: 0,
     };
-    const passRes = taskService.applyManagerDecision(managerPassMsg, JSON.stringify(managerPassMsg));
+    const passRes = await taskService.applyManagerDecision(managerPassMsg, JSON.stringify(managerPassMsg));
     expect(passRes.success).toBe(true);
 
     const taskDone = repo.getTask(task.id)!;

@@ -1,9 +1,10 @@
 import { app, BrowserWindow } from 'electron';
 import path from 'path';
-import { BootstrapService } from '../core/services/BootstrapService';
+import { BootstrapService, BootstrapResult } from '../core/services/BootstrapService';
 import { registerIpcHandlers } from './ipcHandlers';
 
 let mainWindow: BrowserWindow | null = null;
+let bootstrapInstance: BootstrapResult | null = null;
 
 function createWindow(): void {
   mainWindow = new BrowserWindow({
@@ -52,15 +53,15 @@ function createWindow(): void {
 
 app.whenReady().then(() => {
   const userDataDir = app.getPath('userData');
-  const bootstrap = BootstrapService.initialize(userDataDir);
+  bootstrapInstance = BootstrapService.initialize(userDataDir);
 
   // Register Typed & Validated IPC Handlers
   registerIpcHandlers(
-    bootstrap.repo,
-    bootstrap.projectService,
-    bootstrap.taskService,
-    bootstrap.verificationService,
-    bootstrap.emergencyStopService
+    bootstrapInstance.repo,
+    bootstrapInstance.projectService,
+    bootstrapInstance.taskService,
+    bootstrapInstance.verificationService,
+    bootstrapInstance.emergencyStopService
   );
 
   // Create Desktop Window
@@ -76,5 +77,16 @@ app.whenReady().then(() => {
 app.on('window-all-closed', () => {
   if (process.platform !== 'darwin') {
     app.quit();
+  }
+});
+
+app.on('before-quit', () => {
+  if (bootstrapInstance) {
+    try {
+      bootstrapInstance.dbEngine.close();
+      bootstrapInstance = null;
+    } catch (err) {
+      console.error('[Shutdown] Error cleanly closing SQLite database engine:', err);
+    }
   }
 });

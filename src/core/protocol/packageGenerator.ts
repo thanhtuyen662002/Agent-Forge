@@ -136,18 +136,16 @@ ${coderReport.tests_claimed.map((t) => `  - ${t}`).join('\n') || '  - None'}
     } else if (gitDiffContent.length <= MAX_DIFF_LENGTH) {
       formattedDiff = gitDiffContent;
     } else {
-      const evId = gitDiffEvidence?.id || 'EV-LARGE-DIFF';
-      const evHash = gitDiffEvidence?.hash || 'UNKNOWN';
-      const byteSize = gitDiffEvidence?.byte_size || Buffer.byteLength(gitDiffContent, 'utf8');
-      const storageType = gitDiffEvidence?.storage_type || 'FILE';
-
+      if (!gitDiffEvidence) {
+        throw new Error('AUTHORITATIVE_DIFF_EVIDENCE_MISSING: Large Git diff cannot be rendered in review package without authoritative evidence record.');
+      }
       formattedDiff =
         gitDiffContent.substring(0, MAX_DIFF_LENGTH) +
-        `\n\n... [TRUNCATED: Diff is ${byteSize} bytes]\n` +
-        `- **Evidence ID**: \`${evId}\`\n` +
-        `- **SHA-256 Checksum**: \`${evHash}\`\n` +
-        `- **Byte Size**: \`${byteSize} bytes\`\n` +
-        `- **Storage Type**: \`${storageType}\``;
+        `\n\n... [TRUNCATED: Diff is ${gitDiffEvidence.byte_size} bytes]\n` +
+        `- **Evidence ID**: \`${gitDiffEvidence.id}\`\n` +
+        `- **SHA-256 Checksum**: \`${gitDiffEvidence.hash}\`\n` +
+        `- **Byte Size**: \`${gitDiffEvidence.byte_size} bytes\`\n` +
+        `- **Storage Type**: \`${gitDiffEvidence.storage_type}\``;
     }
 
     return `# REVIEW PACKAGE: ${task.id} — ${task.title}

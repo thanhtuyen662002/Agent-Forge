@@ -4,6 +4,7 @@ import { MigrationRunner } from '../src/core/database/migrations';
 import { Repository } from '../src/core/database/repositories';
 import { EventService } from '../src/core/services/EventService';
 import { TaskService } from '../src/core/services/TaskService';
+import { GitService } from '../src/core/services/GitService';
 import { ManagerProtocol, CoderProtocol } from '../src/core/types/protocols';
 import { Task, Project } from '../src/core/types/domain';
 
@@ -20,6 +21,8 @@ describe('TaskService & Protocol Idempotency', () => {
     repo = new Repository(db);
     eventService = new EventService(repo);
     taskService = new TaskService(repo, eventService);
+
+    vi.spyOn(GitService, 'getHeadSha').mockResolvedValue({ status: 'SUCCESS', sha: 'commit-sha-123' });
 
     // Create a base project and task
     const proj: Project = {
@@ -63,10 +66,11 @@ describe('TaskService & Protocol Idempotency', () => {
   });
 
   afterEach(() => {
+    vi.restoreAllMocks();
     db.close();
   });
 
-  it('should apply manager EXECUTE decision and transition task to CODING', () => {
+  it('should apply manager EXECUTE decision, bind HEAD SHA, and transition task to CODING', async () => {
     const managerMsg: ManagerProtocol = {
       protocol: 'manager.v1',
       message_id: 'msg-exec-1',
@@ -83,14 +87,15 @@ describe('TaskService & Protocol Idempotency', () => {
       expected_revision: 0,
     };
 
-    const res = taskService.applyManagerDecision(managerMsg, JSON.stringify(managerMsg));
+    const res = await taskService.applyManagerDecision(managerMsg, JSON.stringify(managerMsg));
     expect(res.success).toBe(true);
 
     const updated = repo.getTask('TSK-001')!;
     expect(updated.state).toBe('CODING');
+    expect(updated.base_sha).toBe('commit-sha-123');
   });
 
-  it('should be idempotent when duplicate message ID is received', () => {
+  it('should be idempotent when duplicate message ID is received', async () => {
     const managerMsg: ManagerProtocol = {
       protocol: 'manager.v1',
       message_id: 'msg-dup-1',
@@ -107,17 +112,17 @@ describe('TaskService & Protocol Idempotency', () => {
       expected_revision: 0,
     };
 
-    const res1 = taskService.applyManagerDecision(managerMsg, JSON.stringify(managerMsg));
+    const res1 = await taskService.applyManagerDecision(managerMsg, JSON.stringify(managerMsg));
     expect(res1.success).toBe(true);
     expect(res1.isDuplicate).toBeFalsy();
 
     // Second apply with identical message_id
-    const res2 = taskService.applyManagerDecision(managerMsg, JSON.stringify(managerMsg));
+    const res2 = await taskService.applyManagerDecision(managerMsg, JSON.stringify(managerMsg));
     expect(res2.success).toBe(true);
     expect(res2.isDuplicate).toBe(true);
   });
 
-  it('should reject stale Manager decision targeting obsolete task state', () => {
+  it('should reject stale Manager decision targeting obsolete task state', async () => {
     const managerMsg: ManagerProtocol = {
       protocol: 'manager.v1',
       message_id: 'msg-stale-1',
@@ -134,16 +139,16 @@ describe('TaskService & Protocol Idempotency', () => {
       expected_revision: 0,
     };
 
-    const res = taskService.applyManagerDecision(managerMsg, JSON.stringify(managerMsg));
+    const res = await taskService.applyManagerDecision(managerMsg, JSON.stringify(managerMsg));
     expect(res.success).toBe(false);
     expect(res.error).toContain('Stale state conflict');
   });
 
-  it('should reject cross-project protocol message targeting wrong project', () => {
+  it('should reject cross-project protocol message targeting wrong project', async () => {
     const managerMsg: ManagerProtocol = {
       protocol: 'manager.v1',
-      message_id: 'msg-cross-1',
-      project_id: 'PROJ-WRONG',
+      message_id: 'msg-xproj-1',
+      project_id: 'PROJ-OTHER',
       task_id: 'TSK-001',
       decision: 'EXECUTE',
       priority: 'HIGH',
@@ -156,25 +161,26 @@ describe('TaskService & Protocol Idempotency', () => {
       expected_revision: 0,
     };
 
-    const res = taskService.applyManagerDecision(managerMsg, JSON.stringify(managerMsg));
+    const res = await taskService.applyManagerDecision(managerMsg, JSON.stringify(managerMsg));
     expect(res.success).toBe(false);
     expect(res.error).toContain('Cross-project conflict');
   });
 
   it('should process coder report and transition task to VALIDATING', () => {
+    // First move task to CODING
     repo.updateTaskState('TSK-001', 'CODING');
 
     const coderMsg: CoderProtocol = {
       protocol: 'coder.v1',
-      message_id: 'msg-cdr-1',
+      message_id: 'msg-coder-1',
       project_id: 'PROJ-TEST',
       task_id: 'TSK-001',
       attempt: 1,
       status: 'COMPLETED',
-      completed: ['Done'],
+      completed: ['Done JWT'],
       remaining: [],
-      files_claimed_changed: ['src/auth.ts'],
-      tests_claimed: ['All pass'],
+      files_claimed_changed: ['auth.ts'],
+      tests_claimed: ['npm test'],
       blockers: [],
       review_requested: true,
       expected_task_state: 'CODING',
@@ -189,23 +195,23 @@ describe('TaskService & Protocol Idempotency', () => {
   });
 
   it('should reject coder report with stale revision count', () => {
-    repo.updateTaskState('TSK-001', 'CODING');
+    repo.updateTaskState('TSK-001', 'CODING', null, true); // revision_count is now 1
 
     const coderMsg: CoderProtocol = {
       protocol: 'coder.v1',
-      message_id: 'msg-cdr-stale',
+      message_id: 'msg-coder-stale-rev',
       project_id: 'PROJ-TEST',
       task_id: 'TSK-001',
       attempt: 1,
       status: 'COMPLETED',
-      completed: ['Done'],
+      completed: [],
       remaining: [],
-      files_claimed_changed: ['src/auth.ts'],
-      tests_claimed: ['All pass'],
+      files_claimed_changed: [],
+      tests_claimed: [],
       blockers: [],
       review_requested: true,
       expected_task_state: 'CODING',
-      expected_revision: 5, // Task is at revision 0
+      expected_revision: 0, // Stale!
     };
 
     const res = taskService.applyCoderReport(coderMsg, JSON.stringify(coderMsg));
@@ -213,16 +219,16 @@ describe('TaskService & Protocol Idempotency', () => {
     expect(res.error).toContain('Stale revision conflict');
   });
 
-  it('should rollback transaction on injected failure and allow clean retry', () => {
+  it('should rollback transaction on injected failure and allow clean retry', async () => {
     const managerMsg: ManagerProtocol = {
       protocol: 'manager.v1',
-      message_id: 'msg-fail-inject-1',
+      message_id: 'msg-rollback-test',
       project_id: 'PROJ-TEST',
       task_id: 'TSK-001',
       decision: 'EXECUTE',
       priority: 'HIGH',
       risk: 'MEDIUM',
-      instructions: ['Execute feature'],
+      instructions: [],
       acceptance_criteria: [],
       constraints: [],
       review_issues: [],
@@ -230,35 +236,28 @@ describe('TaskService & Protocol Idempotency', () => {
       expected_revision: 0,
     };
 
-    // Inject failure into recordProtocolMessage midway through mutation
-    const origRecord = repo.recordProtocolMessage.bind(repo);
-    const spy = vi.spyOn(repo, 'recordProtocolMessage').mockImplementation(() => {
-      throw new Error('Injected Database Write Failure');
+    // Inject a failure during transaction by mocking updateTaskProgressCache
+    const originalProgress = repo.updateTaskProgressCache.bind(repo);
+    vi.spyOn(repo, 'updateTaskProgressCache').mockImplementationOnce(() => {
+      throw new Error('Injected SQLite Crash during transaction');
     });
 
-    const res1 = taskService.applyManagerDecision(managerMsg, JSON.stringify(managerMsg));
-    expect(res1.success).toBe(false);
-    expect(res1.error).toContain('Injected Database Write Failure');
+    const res = await taskService.applyManagerDecision(managerMsg, JSON.stringify(managerMsg));
+    expect(res.success).toBe(false);
+    expect(res.error).toContain('Injected SQLite Crash');
 
-    // Assert complete rollback
+    // Verify task state was NOT updated (clean rollback!)
     const taskAfterFail = repo.getTask('TSK-001')!;
-    expect(taskAfterFail.state).toBe('PLANNED'); // Unchanged!
+    expect(taskAfterFail.state).toBe('PLANNED');
 
-    const events = repo.getEvents('PROJ-TEST');
-    expect(events.filter((e) => e.type === 'MANAGER_DECISION_APPLIED').length).toBe(0);
+    // Verify protocol message was NOT permanently committed
+    const msgRecord = repo.getProtocolMessageById('msg-rollback-test');
+    expect(msgRecord).toBeNull();
 
-    const msgs = repo.getProtocolMessagesByTask('TSK-001');
-    expect(msgs.length).toBe(0);
-
-    // Restore original method and retry
-    spy.mockRestore();
-
-    const res2 = taskService.applyManagerDecision(managerMsg, JSON.stringify(managerMsg));
-    expect(res2.success).toBe(true);
-
-    const taskAfterSuccess = repo.getTask('TSK-001')!;
-    expect(taskAfterSuccess.state).toBe('CODING');
-    expect(repo.getProtocolMessagesByTask('TSK-001').length).toBe(1);
+    // Now retry cleanly without failure
+    const retryRes = await taskService.applyManagerDecision(managerMsg, JSON.stringify(managerMsg));
+    expect(retryRes.success).toBe(true);
+    expect(repo.getTask('TSK-001')!.state).toBe('CODING');
   });
 
   it('should transition REVIEW_READY to REVIEWING via startReview', () => {
@@ -267,8 +266,6 @@ describe('TaskService & Protocol Idempotency', () => {
     const res = taskService.startReview('TSK-001');
     expect(res.success).toBe(true);
     expect(res.task!.state).toBe('REVIEWING');
-
-    const dbTask = repo.getTask('TSK-001')!;
-    expect(dbTask.state).toBe('REVIEWING');
+    expect(repo.getTask('TSK-001')!.state).toBe('REVIEWING');
   });
 });

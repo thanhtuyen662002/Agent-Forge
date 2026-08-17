@@ -77,4 +77,58 @@ describe('Review Package Artifact Metadata for Large Diffs', () => {
     expect(reviewPackage).toContain(`**Byte Size**: \`${largeDiff.length} bytes\``);
     expect(reviewPackage).toContain('**Storage Type**: `FILE`');
   });
+
+  it('should fail closed and reject package generation when large diff lacks durable evidence metadata', () => {
+    const project: Project = {
+      id: 'PROJ-DIFF-2',
+      name: 'Diff Test Project 2',
+      description: null,
+      repository_path: 'd:/test2',
+      default_branch: 'main',
+      status: 'RUNNING',
+      contract: null,
+      created_at: new Date().toISOString(),
+      updated_at: new Date().toISOString(),
+      started_at: new Date().toISOString(),
+      completed_at: null,
+    };
+
+    const task: Task = {
+      id: 'TSK-LARGE-DIFF-NO-EV',
+      project_id: project.id,
+      milestone_id: null,
+      title: 'Large Diff Missing Evidence',
+      description: null,
+      state: 'REVIEWING',
+      paused_from_state: null,
+      priority: 'HIGH',
+      risk: 'MEDIUM',
+      assigned_agent_id: null,
+      revision_count: 0,
+      max_revisions: 3,
+      base_sha: 'abc1234',
+      current_sha: 'def5678',
+      progress_cache_percent: 80,
+      progress_computed_at: new Date().toISOString(),
+      acceptance_criteria: ['Large diff handled cleanly'],
+      constraints: [],
+      created_at: new Date().toISOString(),
+      updated_at: new Date().toISOString(),
+    };
+
+    const largeDiff = '+ line of changed code\n'.repeat(2000); // ~46KB
+
+    expect(() => {
+      PackageGenerator.generateReviewPackage(
+        project,
+        task,
+        null,
+        '2000 lines changed',
+        largeDiff,
+        null,
+        [],
+        undefined // Missing durable evidence!
+      );
+    }).toThrowError(/AUTHORITATIVE_DIFF_EVIDENCE_MISSING/);
+  });
 });

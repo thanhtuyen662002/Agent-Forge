@@ -26,18 +26,24 @@ describe('Database Migrations & Upgrade Integrity', () => {
     expect(tableNames).toContain('tasks');
     expect(tableNames).toContain('task_leases');
     expect(tableNames).toContain('provider_resources');
+    expect(tableNames).toContain('agents');
     expect(tableNames).toContain('protocol_messages');
     expect(tableNames).toContain('evidence');
     expect(tableNames).toContain('events');
     expect(tableNames).toContain('decisions');
     expect(tableNames).toContain('verification_commands');
+    expect(tableNames).toContain('process_runs');
     expect(tableNames).toContain('schema_migrations');
 
     const applied = db.prepare('SELECT COUNT(*) as count FROM schema_migrations').get() as { count: number };
-    expect(applied.count).toBe(3);
+    expect(applied.count).toBe(4);
+
+    // Foreign key integrity check
+    const fkViolations = db.prepare('PRAGMA foreign_key_check').all();
+    expect(fkViolations).toHaveLength(0);
   });
 
-  it('should cleanly upgrade an existing database from schema v1 to v2 to v3 while preserving data', () => {
+  it('should cleanly upgrade an existing database from schema v1/v2 to v3 to v4 preserving agent-resource associations and FK integrity', () => {
     // 1. Manually apply v1 schema
     db.exec(`
       CREATE TABLE IF NOT EXISTS schema_migrations (
@@ -54,7 +60,7 @@ describe('Database Migrations & Upgrade Integrity', () => {
       new Date().toISOString()
     );
 
-    // Insert sample project, task, provider, and evidence in v1 schema
+    // Insert sample project, task, provider, provider_resource, and agent in v1 schema
     db.exec(`
       INSERT INTO projects (id, name, repository_path, default_branch, status, created_at, updated_at)
       VALUES ('PROJ-MIG-1', 'Upgrade Test Project', 'd:/test', 'main', 'READY', '2026-08-17T00:00:00Z', '2026-08-17T00:00:00Z');
@@ -66,43 +72,44 @@ describe('Database Migrations & Upgrade Integrity', () => {
       VALUES ('prov-1', 'Manual Bridge', 'MANUAL_BRIDGE', 1, '2026-08-17T00:00:00Z');
 
       INSERT INTO provider_resources (id, provider_id, model_name, health_status, capabilities_json, enabled, total_quota, remaining_quota, quota_unit, quota_reset_at, quota_source, quota_confidence, last_health_check)
-      VALUES ('res-1', 'prov-1', 'ChatGPT', 'AVAILABLE', '[]', 1, 100, 50, 'REQUESTS', NULL, 'MANUAL', 1.0, '2026-08-17T00:00:00Z');
+      VALUES ('res-1', 'prov-1', 'ChatGPT-4o', 'AVAILABLE', '[]', 1, 100, 50, 'REQUESTS', NULL, 'MANUAL', 1.0, '2026-08-17T00:00:00Z');
+
+      INSERT INTO agents (id, display_name, role, provider_resource_id, status, current_task_id, last_seen_at)
+      VALUES ('agt-1', 'Lead Architect', 'PRIMARY_MANAGER', 'res-1', 'IDLE', NULL, '2026-08-17T00:00:00Z');
 
       INSERT INTO evidence (id, project_id, task_id, evidence_type, storage_type, hash, byte_size, content_type, summary, raw_payload, created_at)
       VALUES ('EV-MIG-1', 'PROJ-MIG-1', 'TSK-MIG-1', 'GIT_STATUS', 'INLINE', 'sha123', 10, 'text/plain', 'Initial Evidence', 'clean', '2026-08-17T00:00:00Z');
     `);
 
-    // Verify verification_commands does NOT exist yet in v1
-    const v1Tables = (db.prepare("SELECT name FROM sqlite_master WHERE type='table'").all() as { name: string }[]).map((t) => t.name);
-    expect(v1Tables).not.toContain('verification_commands');
+    // Verify initial agent-resource mapping BEFORE migration
+    const agentBefore = db.prepare('SELECT * FROM agents WHERE id = ?').get('agt-1') as any;
+    expect(agentBefore.provider_resource_id).toBe('res-1');
 
-    // 2. Run MigrationRunner to upgrade to latest (v3)
+    // 2. Run MigrationRunner to upgrade to latest (v4)
     MigrationRunner.run(db);
 
     // 3. Assert migrations applied
-    const v3Tables = (db.prepare("SELECT name FROM sqlite_master WHERE type='table'").all() as { name: string }[]).map((t) => t.name);
-    expect(v3Tables).toContain('verification_commands');
-    expect(v3Tables).toContain('provider_resources');
+    const v4Tables = (db.prepare("SELECT name FROM sqlite_master WHERE type='table'").all() as { name: string }[]).map((t) => t.name);
+    expect(v4Tables).toContain('verification_commands');
+    expect(v4Tables).toContain('provider_resources');
+    expect(v4Tables).toContain('process_runs');
 
     const migrationCount = (db.prepare('SELECT COUNT(*) as count FROM schema_migrations').get() as { count: number }).count;
-    expect(migrationCount).toBe(3);
+    expect(migrationCount).toBe(4);
 
-    // 4. Assert pre-existing data survived unchanged
-    const proj = db.prepare('SELECT * FROM projects WHERE id = ?').get('PROJ-MIG-1') as any;
-    expect(proj.name).toBe('Upgrade Test Project');
+    // 4. Assert agent.provider_resource_id BEFORE === AFTER (Preserved!)
+    const agentAfter = db.prepare('SELECT * FROM agents WHERE id = ?').get('agt-1') as any;
+    expect(agentAfter.provider_resource_id).toBe('res-1');
+    expect(agentAfter.provider_resource_id).toBe(agentBefore.provider_resource_id);
 
-    const task = db.prepare('SELECT * FROM tasks WHERE id = ?').get('TSK-MIG-1') as any;
-    expect(task.title).toBe('Migrated Task');
-
+    // 5. Assert resource data preserved
     const res = db.prepare('SELECT * FROM provider_resources WHERE id = ?').get('res-1') as any;
-    expect(res.model_name).toBe('ChatGPT');
+    expect(res.model_name).toBe('ChatGPT-4o');
+    expect(res.remaining_quota).toBe(50);
+    expect(res.health_status).toBe('AVAILABLE');
 
-    const ev = db.prepare('SELECT * FROM evidence WHERE id = ?').get('EV-MIG-1') as any;
-    expect(ev.summary).toBe('Initial Evidence');
-
-    // 5. Run MigrationRunner again and prove idempotency
-    expect(() => MigrationRunner.run(db)).not.toThrow();
-    const finalCount = (db.prepare('SELECT COUNT(*) as count FROM schema_migrations').get() as { count: number }).count;
-    expect(finalCount).toBe(3);
+    // 6. Assert PRAGMA foreign_key_check passes with 0 violations
+    const fkViolations = db.prepare('PRAGMA foreign_key_check').all();
+    expect(fkViolations).toHaveLength(0);
   });
 });

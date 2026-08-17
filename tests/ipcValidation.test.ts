@@ -2,6 +2,7 @@ import { describe, it, expect } from 'vitest';
 import {
   CreateProjectIpcSchema,
   CreateTaskIpcSchema,
+  TransitionProjectIpcSchema,
   UpdateResourceQuotaIpcSchema,
   ParseProtocolIpcSchema,
   EmergencyStopIpcSchema,
@@ -54,9 +55,30 @@ describe('IPC Validation & Security Gates', () => {
     expect(ParseProtocolIpcSchema.safeParse({ rawInput: '{"protocol":"manager.v1"}' }).success).toBe(true);
   });
 
-  it('should validate emergency stop and resume payloads', () => {
-    expect(EmergencyStopIpcSchema.safeParse({}).success).toBe(true);
-    expect(EmergencyStopIpcSchema.safeParse({ reason: 'Security incident' }).success).toBe(true);
+  it('should validate transition project payloads and reject untyped/invalid triggers', () => {
+    const invalidTrigger = TransitionProjectIpcSchema.safeParse({
+      projectId: 'PROJ-1',
+      trigger: 'INVALID_RANDOM_TRIGGER',
+    });
+    expect(invalidTrigger.success).toBe(false);
+
+    const validTrigger = TransitionProjectIpcSchema.safeParse({
+      projectId: 'PROJ-1',
+      trigger: 'START_PROJECT',
+    });
+    expect(validTrigger.success).toBe(true);
+  });
+
+  it('should validate emergency stop with deliberate fail-safe defaults and validate resume payloads', () => {
+    // Empty object safely defaults reason
+    const emptyStop = EmergencyStopIpcSchema.safeParse({});
+    expect(emptyStop.success).toBe(true);
+    if (emptyStop.success) {
+      expect(emptyStop.data.reason).toBe('Manual Owner Emergency Stop');
+    }
+
+    const explicitStop = EmergencyStopIpcSchema.safeParse({ reason: 'Security incident' });
+    expect(explicitStop.success).toBe(true);
 
     expect(ResumeProjectIpcSchema.safeParse({}).success).toBe(false);
     expect(ResumeProjectIpcSchema.safeParse({ projectId: 'PROJ-1' }).success).toBe(true);
