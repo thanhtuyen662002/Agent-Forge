@@ -67,6 +67,7 @@ export interface OrchestratorApi {
   }) => Promise<any>;
   dispatchAuthorization: (authorizationId: string) => Promise<any>;
   getOwnerHandoffSnapshot: (taskId: string) => Promise<any>;
+  generateAuthorizedWorkOrder: (authorizationId: string) => Promise<any>;
 }
 
 const api: OrchestratorApi = {
@@ -107,6 +108,8 @@ const api: OrchestratorApi = {
     ipcRenderer.invoke('routing:dispatchAuthorization', { authorizationId }),
   getOwnerHandoffSnapshot: (taskId: string) =>
     ipcRenderer.invoke('routing:getHandoffSnapshot', { taskId }),
+  generateAuthorizedWorkOrder: (authorizationId: string) =>
+    ipcRenderer.invoke('routing:generateAuthorizedWorkOrder', { authorizationId }),
 };
 
 contextBridge.exposeInMainWorld('orchestrator', api);

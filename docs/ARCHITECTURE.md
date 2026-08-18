@@ -260,11 +260,12 @@ AgentForge PR #8 introduces the complete Owner-facing Human-in-the-Loop routing 
 ```
 Manager Inbox (APPLY EXECUTE / FIX_REQUIRED)
                    ↓
-Owner Selects Task & Verifies Manager Authority
+Owner Selects Task & Verifies Manager Authority Status
                    ↓
-Owner Selects & Orders Candidate ProviderResources (Move Up / Down)
+Owner Explicitly Selects & Orders Candidate ProviderResources (Move Up / Down)
+(Candidates list starts empty; no implicit provider auto-selection)
                    ↓
-Owner Toggles `Allow Manual Bridge Fallback`
+Owner Explicitly Opts-In: `Allow Manual Bridge Fallback` (Default: disabled)
                    ↓
 `routing:routeTask` IPC → `ProviderRoutingService.route` → Durable RoutingDecision
                    ↓
@@ -272,9 +273,13 @@ Owner Toggles `Allow Manual Bridge Fallback`
                    ↓
 `routing:dispatchAuthorization` IPC → `ProviderDispatchService.dispatch(authorizationId)`
                    ↓
-ManualBridgeAdapter returns `AWAITING_OWNER` & consumes authorization (`DISPATCHED`)
+If `MANUAL_HANDOFF_REQUIRED`: Status becomes `AWAITING_OWNER` / `DISPATCHED`
+If `SELECTED`: Status becomes `DISPATCHED TO AUTHORIZED PROVIDER` / `DISPATCHED`
                    ↓
-Owner clicks `GENERATE WORKORDER` & `1-CLICK COPY WORKORDER`
+Owner clicks `GENERATE AUTHORIZED WORKORDER` (`routing:generateAuthorizedWorkOrder`)
+(Reconstructed strictly from immutable ExecutionAuthorization canonical instructions)
+                   ↓
+Owner clicks `1-CLICK COPY WORKORDER` (explicit Owner button click only)
                    ↓
 Owner manually relays prompt to Gemini Coder (zero browser or clipboard scraping)
                    ↓
@@ -282,9 +287,16 @@ Owner pastes Gemini report into Coder Inbox → Protocol validation & Verificati
 ```
 
 ### IPC Security & Process Isolation Invariants
-- **Strict Schema Enforcement**: All routing IPC payloads (`RouteTaskIpcSchema`, `AuthorizeRoutedTaskIpcSchema`, `DispatchAuthorizationIpcSchema`, `GetOwnerHandoffSnapshotIpcSchema`) are validated with strict Zod schemas in the Electron main process.
+- **Strict Schema Enforcement**: All routing IPC payloads (`RouteTaskIpcSchema`, `AuthorizeRoutedTaskIpcSchema`, `DispatchAuthorizationIpcSchema`, `GetOwnerHandoffSnapshotIpcSchema`, `GenerateAuthorizedWorkOrderIpcSchema`) are validated with strict Zod schemas in the Electron main process.
 - **Zero Renderer Prompt/Instruction Overrides**: IPC schemas strictly prohibit `instructions`, `prompt`, `selectedProvider`, or `AgentExecutionRequest` payloads from being supplied by the untrusted renderer process. All execution payloads are constructed internally by core services from durable SQLite truth.
-- **Single-Identifier Dispatch**: `routing:dispatchAuthorization` accepts **ONLY** `{ authorizationId: string }`.
+- **Single-Identifier Dispatch & Authorized WorkOrder Generation**:
+  - `routing:dispatchAuthorization` accepts **ONLY** `{ authorizationId: string }`.
+  - `routing:generateAuthorizedWorkOrder` accepts **ONLY** `{ authorizationId: string }`.
+- **Authorization-Bound Immutable WorkOrder**: The Manual Bridge relay WorkOrder is generated strictly from the consumed `ExecutionAuthorization.canonical_instructions_json` and `context_files_json` with verified context and instruction hashes. Mutations to task fields after dispatch do not silently alter the authorized instructions.
+- **Distinct Routing Concepts**: `routing:getHandoffSnapshot` distinctly exposes `latestRoutingDecision` (newest routing candidate for a new authorization) and `authorizationRoutingDecision` (the exact durable route bound to the existing authorization via `routing_decision_id`), preventing route cross-wiring.
+- **Awaiting Owner Semantics**: `AWAITING_OWNER` is derived strictly when `authorization.status === 'DISPATCHED' && authorizationRoutingDecision.outcome === 'MANUAL_HANDOFF_REQUIRED'`. Automated provider dispatches (`outcome === 'SELECTED'`) display `DISPATCHED TO AUTHORIZED PROVIDER` and do not show Manual Bridge relay.
+- **Explicit Candidate Selection & Manual Bridge Opt-In**: The candidate list is initially empty and never auto-populates enabled resources on page load or task switch. Manual Bridge permission defaults to `false` and requires explicit Owner opt-in.
 - **Durable Snapshot Reconstruction**: The UI does not maintain ephemeral React state as ground truth. `routing:getHandoffSnapshot` reloads task status, Manager authority ledger records, Git repository HEAD SHA, provider resources, latest routing decisions, and execution authorizations directly from SQLite.
 - **Truthful UI Quota Semantics**: Provider resources with `quota_source = 'UNKNOWN'` or `remaining_quota = null` render truthfully as `UNKNOWN (conf: 0.0)` in the UI and are never falsified as `0`, `unlimited`, or `healthy`.
 - **Atomic Replay Prevention**: Once dispatched, authorizations remain in `DISPATCHED` state across application restarts and reject subsequent dispatch attempts fail-closed.
+- **Zero Automation**: No browser automation, Gemini web scraping, Antigravity GUI automation, or background clipboard polling. WorkOrder clipboard writing is strictly human-triggered on explicit button click.

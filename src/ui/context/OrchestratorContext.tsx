@@ -53,6 +53,7 @@ interface OrchestratorContextType {
   }) => Promise<any>;
   dispatchAuthorization: (authorizationId: string) => Promise<any>;
   getOwnerHandoffSnapshot: (taskId: string) => Promise<any>;
+  generateAuthorizedWorkOrder: (authorizationId: string) => Promise<any>;
 }
 
 const OrchestratorContext = createContext<OrchestratorContextType | null>(null);
@@ -341,6 +342,11 @@ export const OrchestratorProvider: React.FC<{ children: React.ReactNode }> = ({ 
     return orchestrator.getOwnerHandoffSnapshot(taskId);
   };
 
+  const generateAuthorizedWorkOrder = async (authorizationId: string) => {
+    if (!orchestrator) return { success: false, error: 'Desktop required.' };
+    return orchestrator.generateAuthorizedWorkOrder(authorizationId);
+  };
+
   return (
     <OrchestratorContext.Provider
       value={{
@@ -379,6 +385,7 @@ export const OrchestratorProvider: React.FC<{ children: React.ReactNode }> = ({ 
         authorizeRoutedTask,
         dispatchAuthorization,
         getOwnerHandoffSnapshot,
+        generateAuthorizedWorkOrder,
       }}
     >
       {children}

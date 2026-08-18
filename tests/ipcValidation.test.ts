@@ -11,6 +11,7 @@ import {
   AuthorizeRoutedTaskIpcSchema,
   DispatchAuthorizationIpcSchema,
   GetOwnerHandoffSnapshotIpcSchema,
+  GenerateAuthorizedWorkOrderIpcSchema,
 } from '../src/core/types/ipc';
 import { PolicyService } from '../src/core/services/PolicyService';
 
@@ -213,5 +214,23 @@ describe('IPC Validation & Security Gates', () => {
     expect(GetOwnerHandoffSnapshotIpcSchema.safeParse({ taskId: 'TASK-1' }).success).toBe(true);
     expect(GetOwnerHandoffSnapshotIpcSchema.safeParse({}).success).toBe(false);
     expect(GetOwnerHandoffSnapshotIpcSchema.safeParse({ taskId: '' }).success).toBe(false);
+  });
+
+  it('should validate generate authorized work order IPC schema and strictly accept authorizationId only', () => {
+    expect(GenerateAuthorizedWorkOrderIpcSchema.safeParse({ authorizationId: 'AUTH-123' }).success).toBe(true);
+    expect(GenerateAuthorizedWorkOrderIpcSchema.safeParse({}).success).toBe(false);
+    expect(GenerateAuthorizedWorkOrderIpcSchema.safeParse({ authorizationId: '' }).success).toBe(false);
+    expect(
+      GenerateAuthorizedWorkOrderIpcSchema.safeParse({
+        authorizationId: 'AUTH-123',
+        instructions: ['override instructions'], // forbidden
+      }).success
+    ).toBe(false);
+    expect(
+      GenerateAuthorizedWorkOrderIpcSchema.safeParse({
+        authorizationId: 'AUTH-123',
+        prompt: 'override prompt', // forbidden
+      }).success
+    ).toBe(false);
   });
 });

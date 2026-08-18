@@ -30,27 +30,30 @@ export const ManualBridgeView: React.FC = () => {
     tasks,
     activeProject,
     resources,
-    parseProtocol,
-    applyProtocol,
     generateWorkOrder,
     generateReviewPackage,
     runVerificationTests,
+    parseProtocol,
+    applyProtocol,
     routeTask,
     authorizeRoutedTask,
     dispatchAuthorization,
     getOwnerHandoffSnapshot,
+    generateAuthorizedWorkOrder,
   } = useOrchestrator();
 
-  const [activeTab, setActiveTab] = useState<'routing-handoff' | 'manager-inbox' | 'coder-inbox' | 'outbox'>('routing-handoff');
+  const [activeTab, setActiveTab] = useState<'routing-handoff' | 'manager-inbox' | 'coder-inbox' | 'outbox'>(
+    'routing-handoff'
+  );
 
   // ==========================================
-  // Routing & Manual Handoff State
+  // PR #8 Owner Routing & Manual Bridge State
   // ==========================================
   const [selectedHandoffTaskId, setSelectedHandoffTaskId] = useState<string>(tasks[0]?.id || '');
   const [snapshot, setSnapshot] = useState<any>(null);
   const [loadingSnapshot, setLoadingSnapshot] = useState<boolean>(false);
   const [candidateIds, setCandidateIds] = useState<string[]>([]);
-  const [allowManualBridge, setAllowManualBridge] = useState<boolean>(true);
+  const [allowManualBridge, setAllowManualBridge] = useState<boolean>(false);
 
   const [routingDecision, setRoutingDecision] = useState<any>(null);
   const [isRouting, setIsRouting] = useState<boolean>(false);
@@ -125,14 +128,29 @@ export const ManualBridgeView: React.FC = () => {
     loadSnapshot();
   }, [loadSnapshot]);
 
-  // Initialize candidates list from resources if empty
+  // When resources/snapshot refresh: preserve only Owner selections that are still valid.
+  // DO NOT auto-populate candidates if none were selected!
   useEffect(() => {
-    if (resources.length > 0 && candidateIds.length === 0) {
-      // Default ordered candidate list: enabled resources
-      const enabledIds = resources.filter((r) => r.enabled).map((r) => r.id);
-      setCandidateIds(enabledIds);
+    if (candidateIds.length > 0) {
+      const availableIds = (snapshot?.providerResources || resources).map((r: any) => r.id);
+      setCandidateIds((prev) => prev.filter((id) => availableIds.includes(id)));
     }
-  }, [resources, candidateIds.length]);
+  }, [resources, snapshot?.providerResources]);
+
+  // Reset task-scoped state on task change
+  const handleTaskChange = (newTaskId: string) => {
+    if (newTaskId === selectedHandoffTaskId) return;
+    setSelectedHandoffTaskId(newTaskId);
+    setCandidateIds([]);
+    setAllowManualBridge(false);
+    setRoutingDecision(null);
+    setAuthorization(null);
+    setDispatchResult(null);
+    setHandoffWorkOrder('');
+    setRoutingError(null);
+    setAuthError(null);
+    setDispatchError(null);
+  };
 
   // Candidate Reordering Controls
   const moveCandidateUp = (index: number) => {
@@ -239,15 +257,19 @@ export const ManualBridgeView: React.FC = () => {
     }
   };
 
-  // Generate Handoff WorkOrder
+  // Generate Authorized Handoff WorkOrder
   const handleGenerateHandoffWorkOrder = async () => {
-    if (!selectedHandoffTaskId) return;
+    if (!authorization?.id) return;
     setIsGeneratingHandoffWorkOrder(true);
     try {
-      const wo = await generateWorkOrder(selectedHandoffTaskId);
-      setHandoffWorkOrder(wo);
+      const res = await generateAuthorizedWorkOrder(authorization.id);
+      if (res && res.success && res.workOrder) {
+        setHandoffWorkOrder(res.workOrder);
+      } else {
+        setHandoffWorkOrder(`Error generating authorized work order: ${res?.error || 'Unknown error'}`);
+      }
     } catch (err: any) {
-      setHandoffWorkOrder(`Error generating work order: ${err.message}`);
+      setHandoffWorkOrder(`Error generating authorized work order: ${err.message}`);
     } finally {
       setIsGeneratingHandoffWorkOrder(false);
     }
@@ -349,10 +371,15 @@ export const ManualBridgeView: React.FC = () => {
   // Helper values for handoff view
   const currentTask = snapshot?.task || tasks.find((t) => t.id === selectedHandoffTaskId);
   const managerAuth = snapshot?.managerAuthority;
-  const isAwaitingOwner =
-    authorization?.status === 'DISPATCHED' ||
-    dispatchResult?.status === 'AWAITING_OWNER' ||
-    currentTask?.state === 'HANDOFF_REQUIRED';
+  const authBoundRoutingDecision = snapshot?.authorizationRoutingDecision;
+
+  const isManualHandoffAwaitingOwner =
+    authorization?.status === 'DISPATCHED' &&
+    authBoundRoutingDecision?.outcome === 'MANUAL_HANDOFF_REQUIRED';
+
+  const isSelectedDispatched =
+    authorization?.status === 'DISPATCHED' &&
+    authBoundRoutingDecision?.outcome === 'SELECTED';
 
   const canRoute =
     Boolean(currentTask) &&
@@ -386,7 +413,7 @@ export const ManualBridgeView: React.FC = () => {
             </div>
           </div>
           <p className="text-xs text-slate-400">
-            Deterministic Quota Routing $\rightarrow$ Durable Authorization $\rightarrow$ Manual Bridge WorkOrder Relay $\rightarrow$ Coder Verification.
+            Deterministic Quota Routing &rarr; Durable Authorization &rarr; Authorized Manual WorkOrder Relay &rarr; Coder Verification.
           </p>
         </div>
 
@@ -475,18 +502,12 @@ export const ManualBridgeView: React.FC = () => {
                 <label className="block text-xs font-mono text-slate-400 mb-1.5">Select Target Task:</label>
                 <select
                   value={selectedHandoffTaskId}
-                  onChange={(e) => {
-                    setSelectedHandoffTaskId(e.target.value);
-                    setRoutingDecision(null);
-                    setAuthorization(null);
-                    setDispatchResult(null);
-                    setHandoffWorkOrder('');
-                  }}
+                  onChange={(e) => handleTaskChange(e.target.value)}
                   className="w-full bg-surface border border-surface-border rounded-lg px-3 py-2 text-xs text-white focus:outline-none focus:border-forge-amber font-mono"
                 >
                   {tasks.map((t) => (
                     <option key={t.id} value={t.id}>
-                      {t.id}: {t.title} ({t.state} — Rev {t.revision_count})
+                      {t.id}: {t.title} ({t.state} &mdash; Rev {t.revision_count})
                     </option>
                   ))}
                 </select>
@@ -583,14 +604,37 @@ export const ManualBridgeView: React.FC = () => {
                   <span className="w-5 h-5 rounded-full bg-forge-amber/20 text-forge-amber flex items-center justify-center text-[10px] font-bold">2</span>
                   <span>Candidate Resources (Ordered)</span>
                 </h3>
-                <span className="text-[11px] text-slate-400 font-mono">
-                  {candidateIds.length} candidate(s) selected
-                </span>
+                <div className="flex items-center space-x-2">
+                  <button
+                    type="button"
+                    onClick={() => {
+                      const enabledIds = (snapshot?.providerResources || resources)
+                        .filter((r: ProviderResource) => r.enabled)
+                        .map((r: ProviderResource) => r.id);
+                      setCandidateIds(enabledIds);
+                    }}
+                    className="text-[11px] text-forge-amber hover:underline font-mono"
+                  >
+                    Select all enabled
+                  </button>
+                  {candidateIds.length > 0 && (
+                    <button
+                      type="button"
+                      onClick={() => setCandidateIds([])}
+                      className="text-[11px] text-slate-400 hover:text-white font-mono"
+                    >
+                      Clear
+                    </button>
+                  )}
+                  <span className="text-[11px] text-slate-400 font-mono ml-1">
+                    ({candidateIds.length} selected)
+                  </span>
+                </div>
               </div>
 
               {/* Resource List with Reordering Controls */}
               <div className="space-y-2.5 max-h-72 overflow-y-auto pr-1">
-                {(snapshot?.providerResources || resources).map((res: ProviderResource, idx: number) => {
+                {(snapshot?.providerResources || resources).map((res: ProviderResource) => {
                   const isSelected = candidateIds.includes(res.id);
                   const candidateOrder = candidateIds.indexOf(res.id);
 
@@ -686,7 +730,7 @@ export const ManualBridgeView: React.FC = () => {
                 <div>
                   <div className="font-semibold text-white">Explicit Manual Bridge Permission</div>
                   <div className="text-[11px] text-slate-400">
-                    If enabled, falls back to Manual Relay when automated providers are unavailable.
+                    If enabled, falls back to Manual Relay when automated providers are unavailable. Default: disabled.
                   </div>
                 </div>
                 <input
@@ -832,6 +876,18 @@ export const ManualBridgeView: React.FC = () => {
                   <div className="bg-surface p-3.5 rounded-lg border border-surface-border space-y-1.5 text-[11px]">
                     <div>Authorization ID: <strong className="text-white">{authorization.id}</strong></div>
                     <div>Task Revision: <strong className="text-forge-cyan">Rev {authorization.task_revision}</strong></div>
+                    <div>
+                      Bound Route: <strong className="text-forge-amber">{authorization.routing_decision_id}</strong>
+                      {authBoundRoutingDecision && (
+                        <span className="ml-1 text-slate-400">({authBoundRoutingDecision.outcome})</span>
+                      )}
+                    </div>
+                    {snapshot?.latestRoutingDecision &&
+                      snapshot.latestRoutingDecision.decisionId !== authorization.routing_decision_id && (
+                        <div className="p-2 rounded bg-amber-950/30 border border-amber-800/40 text-[10px] text-forge-amber">
+                          Latest Route ({snapshot.latestRoutingDecision.decisionId}) is newer than Authorized Route ({authorization.routing_decision_id}). Authorization remains bound to {authorization.routing_decision_id}.
+                        </div>
+                      )}
                     <div>Repository HEAD: <span className="text-slate-300 truncate block">{authorization.repository_head_sha}</span></div>
                     <div>Instruction Payload Hash: <span className="text-slate-400 truncate block">{authorization.instruction_payload_hash}</span></div>
                     <div>Context Manifest Hash: <span className="text-slate-400 truncate block">{authorization.context_manifest_hash}</span></div>
@@ -854,16 +910,32 @@ export const ManualBridgeView: React.FC = () => {
                       className="w-full py-2.5 bg-forge-cyan hover:bg-cyan-500 text-slate-950 font-bold text-xs rounded-lg shadow-lg transition flex items-center justify-center space-x-2 disabled:opacity-40"
                     >
                       <Play className="w-3.5 h-3.5 fill-current" />
-                      <span>{isDispatching ? 'DISPATCHING...' : 'DISPATCH TO MANUAL BRIDGE'}</span>
+                      <span>
+                        {isDispatching
+                          ? 'DISPATCHING...'
+                          : routingDecision?.outcome === 'MANUAL_HANDOFF_REQUIRED'
+                          ? 'DISPATCH MANUAL HANDOFF'
+                          : 'DISPATCH AUTHORIZED PROVIDER'}
+                      </span>
                     </button>
-                  ) : authorization.status === 'DISPATCHED' ? (
+                  ) : isManualHandoffAwaitingOwner ? (
                     <div className="p-3 bg-emerald-950/20 border border-emerald-800/40 rounded-lg text-emerald-300 text-center space-y-1">
                       <div className="font-bold flex items-center justify-center space-x-1.5">
                         <CheckCircle2 className="w-4 h-4 text-emerald-400" />
                         <span>AWAITING_OWNER / CONSUMED</span>
                       </div>
                       <p className="text-[11px] text-slate-300">
-                        Authorization claimed. Replay protection active. Generate WorkOrder below to proceed with Owner relay.
+                        Manual Bridge authorization claimed. Replay protection active. Generate Authorized WorkOrder below for Gemini relay.
+                      </p>
+                    </div>
+                  ) : isSelectedDispatched ? (
+                    <div className="p-3 bg-cyan-950/20 border border-cyan-800/40 rounded-lg text-cyan-300 text-center space-y-1">
+                      <div className="font-bold flex items-center justify-center space-x-1.5">
+                        <CheckCircle2 className="w-4 h-4 text-cyan-400" />
+                        <span>DISPATCHED TO AUTHORIZED PROVIDER / CONSUMED</span>
+                      </div>
+                      <p className="text-[11px] text-slate-300">
+                        Automated provider execution started. Replay protection active.
                       </p>
                     </div>
                   ) : (
@@ -879,16 +951,16 @@ export const ManualBridgeView: React.FC = () => {
           {/* ---------------------------------------------------- */}
           {/* STEP 5 & 6: MANUAL RELAY WORKORDER & CODER INBOX LINK */}
           {/* ---------------------------------------------------- */}
-          {isAwaitingOwner && (
+          {isManualHandoffAwaitingOwner && (
             <div className="bg-surface-card border border-surface-border rounded-xl p-6 shadow space-y-4">
               <div className="flex flex-col md:flex-row md:items-center justify-between gap-2 border-b border-surface-border pb-4">
                 <div>
                   <h3 className="text-xs font-mono font-semibold text-slate-300 uppercase tracking-wider flex items-center space-x-2">
                     <span className="w-5 h-5 rounded-full bg-forge-emerald/20 text-forge-emerald flex items-center justify-center text-[10px] font-bold">5</span>
-                    <span>Manual WorkOrder Relay & Gemini Dispatch</span>
+                    <span>Authorized Manual WorkOrder Relay & Gemini Dispatch</span>
                   </h3>
                   <p className="text-[11px] text-slate-400 font-mono mt-0.5">
-                    Generate the authoritative WorkOrder, 1-click copy it to clipboard, and paste into Gemini.
+                    Generate the immutable authorized WorkOrder, 1-click copy it to clipboard, and paste into Gemini.
                   </p>
                 </div>
 
@@ -899,7 +971,7 @@ export const ManualBridgeView: React.FC = () => {
                     className="px-3.5 py-1.5 bg-surface hover:bg-surface-hover border border-surface-border text-white text-xs font-mono font-bold rounded-lg shadow transition flex items-center space-x-1.5"
                   >
                     <Sparkles className="w-3.5 h-3.5 text-forge-emerald" />
-                    <span>{isGeneratingHandoffWorkOrder ? 'GENERATING...' : 'GENERATE WORKORDER'}</span>
+                    <span>{isGeneratingHandoffWorkOrder ? 'GENERATING...' : 'GENERATE AUTHORIZED WORKORDER'}</span>
                   </button>
 
                   {handoffWorkOrder && (
@@ -947,7 +1019,7 @@ export const ManualBridgeView: React.FC = () => {
               ) : (
                 <div className="p-6 bg-surface rounded-lg border border-surface-border text-center space-y-2 text-xs font-mono text-slate-400">
                   <FileCheck className="w-8 h-8 mx-auto text-slate-500" />
-                  <p>Click "Generate WorkOrder" above to construct the Markdown prompt for Gemini Coder.</p>
+                  <p>Click "Generate Authorized WorkOrder" above to construct the immutable Markdown prompt for Gemini Coder.</p>
                 </div>
               )}
             </div>
@@ -1149,8 +1221,12 @@ export const ManualBridgeView: React.FC = () => {
         <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
           {/* Left: Configuration Form (1 col) */}
           <div className="bg-surface-card border border-surface-border rounded-xl p-5 shadow space-y-4">
+            <div className="p-3 bg-slate-900/50 border border-slate-700/50 rounded-lg text-[11px] font-mono text-slate-300">
+              <span className="font-bold text-slate-200">Notice:</span> General WorkOrder / Review Package generator for pre-routing inspection. For authorized execution handoffs, use the <strong className="text-forge-amber">Owner Routing / Handoff</strong> tab.
+            </div>
+
             <h3 className="text-xs font-mono font-semibold text-slate-300 uppercase tracking-wider">
-              Package Configuration
+              Package Configuration (Pre-Routing / General)
             </h3>
 
             <div>

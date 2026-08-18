@@ -33,6 +33,7 @@ import {
   AuthorizeRoutedTaskIpcSchema,
   DispatchAuthorizationIpcSchema,
   GetOwnerHandoffSnapshotIpcSchema,
+  GenerateAuthorizedWorkOrderIpcSchema,
 } from '../core/types/ipc';
 
 export function registerIpcHandlers(
@@ -554,24 +555,31 @@ export function registerIpcHandlers(
     let decisionValidForCurrentRevision = false;
     let authorityReason: string | undefined;
     let instructionsCount = 0;
+    let parsedDecision: string | null = null;
+    let parsedExpectedRevision: number | null = null;
 
     if (latestManagerRecord && latestManagerRecord.raw_payload) {
       const parsedProto = ProtocolParser.parse(String(latestManagerRecord.raw_payload));
       if (parsedProto.success && parsedProto.data?.type === 'manager.v1') {
         const mData = parsedProto.data.data;
         instructionsCount = Array.isArray(mData.instructions) ? mData.instructions.length : 0;
-        const expectedRev = typeof mData.expected_revision === 'number' ? mData.expected_revision : null;
+        parsedDecision = mData.decision ?? null;
+        parsedExpectedRevision = typeof mData.expected_revision === 'number' ? mData.expected_revision : null;
+
         if (mData.decision === 'EXECUTE') {
           hasAuthority = true;
-          decisionValidForCurrentRevision = expectedRev === task.revision_count;
+          decisionValidForCurrentRevision = parsedExpectedRevision === task.revision_count;
           if (!decisionValidForCurrentRevision) {
-            authorityReason = `Manager EXECUTE expected revision (${expectedRev}) does not match task revision (${task.revision_count}).`;
+            authorityReason = `Manager EXECUTE expected revision (${parsedExpectedRevision}) does not match task revision (${task.revision_count}).`;
           }
         } else if (mData.decision === 'FIX_REQUIRED') {
           hasAuthority = true;
-          decisionValidForCurrentRevision = expectedRev !== null && expectedRev + 1 === task.revision_count;
+          decisionValidForCurrentRevision =
+            parsedExpectedRevision !== null && parsedExpectedRevision + 1 === task.revision_count;
           if (!decisionValidForCurrentRevision) {
-            authorityReason = `Manager FIX_REQUIRED expected revision (${expectedRev !== null ? expectedRev + 1 : 'null'}) does not match task revision (${task.revision_count}).`;
+            authorityReason = `Manager FIX_REQUIRED expected revision (${
+              parsedExpectedRevision !== null ? parsedExpectedRevision + 1 : 'null'
+            }) does not match task revision (${task.revision_count}).`;
           }
         } else {
           authorityReason = `Latest Manager decision is non-authorizing: ${mData.decision}.`;
@@ -593,7 +601,7 @@ export function registerIpcHandlers(
     const authorizations = repo.getExecutionAuthorizationsByTask(task.id);
     const latestAuthorization = authorizations.length > 0 ? authorizations[0] : null;
 
-    // Retrieve latest routing decision event from SQLite
+    // Retrieve latest routing decision event from SQLite (candidate for a NEW authorization)
     let latestRoutingDecision: any = null;
     if (project) {
       const events = repo.getEventsByProject(project.id, 50);
@@ -607,6 +615,15 @@ export function registerIpcHandlers(
       }
     }
 
+    // Retrieve EXACT routing decision referenced by latestAuthorization.routing_decision_id
+    let authorizationRoutingDecision: any = null;
+    if (latestAuthorization && latestAuthorization.routing_decision_id) {
+      const authRoutingEvent = repo.getRoutingDecisionEvent(latestAuthorization.routing_decision_id);
+      if (authRoutingEvent && authRoutingEvent.structured_payload) {
+        authorizationRoutingDecision = authRoutingEvent.structured_payload;
+      }
+    }
+
     return {
       success: true,
       snapshot: {
@@ -615,10 +632,9 @@ export function registerIpcHandlers(
         managerAuthority: {
           hasAuthority,
           messageId: latestManagerRecord?.id ? String(latestManagerRecord.id) : null,
-          decision: latestManagerRecord?.decision ? String(latestManagerRecord.decision) : null,
+          decision: parsedDecision,
           payloadHash: latestManagerRecord?.payload_hash ? String(latestManagerRecord.payload_hash) : null,
-          expectedRevision:
-            latestManagerRecord?.expected_revision !== undefined ? Number(latestManagerRecord.expected_revision) : null,
+          expectedRevision: parsedExpectedRevision,
           instructionsCount,
           createdAt: latestManagerRecord?.created_at ? String(latestManagerRecord.created_at) : null,
           decisionValidForCurrentRevision,
@@ -627,8 +643,23 @@ export function registerIpcHandlers(
         gitHeadSha,
         providerResources,
         latestRoutingDecision,
+        authorizationRoutingDecision,
         latestAuthorization,
       },
     };
+  });
+
+  ipcMain.handle('routing:generateAuthorizedWorkOrder', async (_, payload: unknown) => {
+    const parsed = GenerateAuthorizedWorkOrderIpcSchema.safeParse(payload);
+    if (!parsed.success) {
+      return { success: false, error: parsed.error.issues.map((i) => i.message).join(', ') };
+    }
+
+    try {
+      const workOrder = PackageGenerator.generateAuthorizedManualWorkOrder(parsed.data.authorizationId, repo);
+      return { success: true, workOrder };
+    } catch (err: any) {
+      return { success: false, error: err.message || 'Failed to generate authorized manual WorkOrder.' };
+    }
   });
 }

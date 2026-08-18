@@ -38,13 +38,14 @@ Agent-Forge guarantees that the durable source of truth resides entirely in:
 ### Human-in-the-Loop Operating Mode (Owner Manual Relay)
 In the current release, the human owner operates the manual routing and handoff loop from the desktop UI:
 1. Owner pastes **ChatGPT Manager** responses into the **Manager Inbox** to record and apply `EXECUTE` / `FIX_REQUIRED` protocol decisions.
-2. In the **Owner Routing / Handoff** view, the Owner reviews task authority, orders candidate `ProviderResource` instances, and triggers deterministic quota-aware routing.
-3. The Owner generates an immutable `ExecutionAuthorization` bound to durable Manager authority and Git repository HEAD.
-4. The Owner dispatches to the **Manual Bridge**, consuming the authorization (`DISPATCHED`) with atomic replay protection.
-5. The Owner clicks **1-Click Copy WorkOrder** to copy the generated prompt into the clipboard, then manually pastes it into **Gemini Coder**.
-6. The Owner pastes Gemini's `coder.v1` response into the **Coder Inbox** to execute verification tests and capture authoritative Git diff evidence.
+2. In the **Owner Routing / Handoff** view, the Owner reviews task authority, explicitly selects and orders candidate `ProviderResource` instances (starts empty; no implicit provider auto-selection), and explicitly opts into Manual Bridge fallback.
+3. The Owner triggers deterministic routing (`ProviderRoutingService.route`) and generates an immutable `ExecutionAuthorization` bound to durable Manager authority and Git repository HEAD.
+4. The Owner dispatches the execution, consuming the authorization (`DISPATCHED`) with atomic replay protection.
+5. If the outcome is `MANUAL_HANDOFF_REQUIRED`, the task enters `AWAITING_OWNER`. The Owner clicks **Generate Authorized WorkOrder** to construct the canonical prompt derived strictly from the immutable execution authorization instructions, then clicks **1-Click Copy WorkOrder** to copy the prompt to clipboard.
+6. The Owner manually pastes the prompt into **Gemini Coder**.
+7. The Owner pastes Gemini's `coder.v1` response into the **Coder Inbox** to execute verification tests and capture authoritative Git diff evidence.
 
-> **Zero Scraping Policy**: Agent-Forge does **NOT** automate ChatGPT Web, extract session cookies, or bypass provider rate limits. All automated adapters in future phases will use official, supported provider APIs and CLI tools.
+> **Zero Automation & Zero Scraping Policy**: Agent-Forge does **NOT** automate ChatGPT Web, Gemini Web, or Antigravity GUI, extract session cookies, or run background clipboard polling. All automated adapters in future phases will use official, supported provider APIs and CLI tools.
 
 ---
 

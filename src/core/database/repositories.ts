@@ -406,21 +406,21 @@ export class Repository {
             AND project_id = ?
             AND protocol = 'manager.v1'
             AND status = 'APPLIED'
-          ORDER BY created_at DESC, id DESC
+          ORDER BY created_at DESC, rowid DESC
           LIMIT 1
         `)
         .get(taskId, projectId) as Record<string, unknown> | undefined;
       return row ?? null;
     }
     const row = this.db
-      .prepare(`
-        SELECT * FROM protocol_messages
-        WHERE task_id = ?
-          AND protocol = 'manager.v1'
-          AND status = 'APPLIED'
-        ORDER BY created_at DESC, id DESC
-        LIMIT 1
-      `)
+        .prepare(`
+          SELECT * FROM protocol_messages
+          WHERE task_id = ?
+            AND protocol = 'manager.v1'
+            AND status = 'APPLIED'
+          ORDER BY created_at DESC, rowid DESC
+          LIMIT 1
+        `)
       .get(taskId) as Record<string, unknown> | undefined;
     return row ?? null;
   }

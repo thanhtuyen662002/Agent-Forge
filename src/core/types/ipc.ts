@@ -165,3 +165,10 @@ export const GetOwnerHandoffSnapshotIpcSchema = z
   })
   .strict();
 export type GetOwnerHandoffSnapshotIpc = z.infer<typeof GetOwnerHandoffSnapshotIpcSchema>;
+
+export const GenerateAuthorizedWorkOrderIpcSchema = z
+  .object({
+    authorizationId: z.string().min(1, 'Authorization ID is required'),
+  })
+  .strict();
+export type GenerateAuthorizedWorkOrderIpc = z.infer<typeof GenerateAuthorizedWorkOrderIpcSchema>;
