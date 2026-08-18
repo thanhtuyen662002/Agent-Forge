@@ -27,7 +27,7 @@ jobs:
           - windows-latest
           - ubuntu-latest
         node-version:
-          - '20.x'
+          - '22.x'
 
     steps:
       - name: Checkout exact source
@@ -88,7 +88,7 @@ jobs:
           echo "- **Result**: \`${{ job.status }}\`" >> $GITHUB_STEP_SUMMARY
 
   package-windows:
-    name: Package Windows (windows-latest, Node 20.x)
+    name: Package Windows (windows-latest, Node 22.x)
     needs: validate
     runs-on: windows-latest
     steps:
@@ -116,10 +116,10 @@ jobs:
           echo "Working Tree Status:"
           git status --short
 
-      - name: Setup Node.js 20.x
+      - name: Setup Node.js 22.x
         uses: actions/setup-node@v4
         with:
-          node-version: '20.x'
+          node-version: '22.x'
           cache: 'npm'
 
       - name: Install dependencies
@@ -130,6 +130,16 @@ jobs:
 
       - name: Build application
         run: npm run build
+
+      - name: Verify generated relative asset base
+        shell: pwsh
+        run: |
+          $html = Get-Content -Path "dist\index.html" -Raw
+          if ($html -match 'src="/assets/' -or $html -match 'href="/assets/') {
+            Write-Error "dist\index.html contains root-absolute asset paths (/assets/). Must use relative paths."
+            exit 1
+          }
+          Write-Host "dist\index.html relative asset path check: PASS"
 
       - name: Generate unpacked Windows directory
         run: npm run package:win:dir
@@ -154,11 +164,16 @@ jobs:
           $hash = (Get-FileHash -Path $installerPath -Algorithm SHA256).Hash
           $size = (Get-Item $installerPath).Length
           $sha = (git rev-parse HEAD).Trim()
+          $sig = Get-AuthenticodeSignature -FilePath $installerPath
+          $sigStatus = $sig.Status.ToString()
+          $codeSigned = if ($sig.Status -eq "Valid") { "YES" } else { "NO" }
 
           Write-Host "=== Windows Installer Verification ==="
           Write-Host "Installer: $installerPath"
           Write-Host "Size: $size bytes"
           Write-Host "SHA256: $hash"
+          Write-Host "Authenticode Status: $sigStatus"
+          Write-Host "Code Signed: $codeSigned"
           Write-Host "Source SHA: $sha"
 
           $metadataContent = @"
@@ -166,9 +181,10 @@ jobs:
           INSTALLER_FILENAME=AgentForge Setup 0.1.0.exe
           INSTALLER_SIZE_BYTES=$size
           INSTALLER_SHA256=$hash
+          AUTHENTICODE_STATUS=$sigStatus
+          CODE_SIGNED=$codeSigned
           BUILD_OS=windows-latest
           APP_VERSION=0.1.0
-          CODE_SIGNED=NO
           "@
 
           Set-Content -Path "release\installer-metadata.txt" -Value $metadataContent

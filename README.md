@@ -72,7 +72,7 @@ In the initial release, the human owner serves as the manual transport bridge:
 ## Prerequisites & Development Setup
 
 ### System Requirements
-- **Node.js**: `v20.x` or higher (Active LTS / `v23.x` supported)
+- **Node.js**: `v22.x` (LTS `>=22.12.0` required by packaging toolchain)
 - **npm**: `v10.x` or higher
 - **Git**: `v2.40+`
 - **C/C++ Build Tools**: Required for compiling `better-sqlite3` native binaries (`node-gyp`, Visual Studio C++ Build Tools on Windows).
@@ -88,7 +88,7 @@ npm run dev
 # Run development Electron window smoke test against Vite dev server
 npm run smoke:dev:electron
 
-# Run full automated test suite (21 test suites, 83 tests)
+# Run full automated test suite (22 test suites, 85 tests)
 npm test
 
 # Build production bundle (frontend + electron main & preload)
@@ -108,6 +108,11 @@ npm run package:win
 - In unit and integration tests (`npm test`), `better-sqlite3` runs on the local Node runtime (`NODE_MODULE_VERSION 131` / `127`).
 - During Windows packaging (`npm run package:win:dir` / `npm run package:win`), `electron-builder` automatically rebuilds `better-sqlite3` native binaries for the Electron runtime (`NODE_MODULE_VERSION 132` / Electron 34) and places them in `release/win-unpacked/resources/app.asar.unpacked/`.
 - If switching between dev Electron and local Node test runs, `npm rebuild better-sqlite3` restores Node runtime ABI.
+
+### Packaging Limitations & Code Signing
+- **Code Signing**: `CODE_SIGNED=NO`. The generated NSIS installer is unsigned in this milestone foundation. Standard Windows SmartScreen / unknown publisher prompts are expected.
+- **Application Icon**: The default Electron executable icon is currently used pending custom asset design.
+- **Auto-Update**: Intentionally deferred; not enabled in this packaging milestone.
 
 ---
 

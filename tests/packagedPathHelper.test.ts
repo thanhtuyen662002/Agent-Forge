@@ -2,8 +2,36 @@ import { describe, it, expect } from 'vitest';
 import path from 'path';
 import { resolveRendererTarget } from '../src/electron/pathHelper';
 
-describe('Renderer Path Resolution Helper', () => {
-  it('should prioritize explicit VITE_DEV_SERVER_URL when provided', () => {
+describe('Renderer Path Resolution Helper (Strict Precedence & Fail-Closed)', () => {
+  it('should ignore VITE_DEV_SERVER_URL in packaged mode and return canonical appPath file target', () => {
+    const appPath = 'C:\\Program Files\\AgentForge\\resources\\app.asar';
+    const res = resolveRendererTarget({
+      isPackaged: true,
+      appPath,
+      devServerUrl: 'http://malicious-or-dev-server:5173',
+    });
+
+    expect(res.type).toBe('file');
+    expect(res.target).toBe(path.join(appPath, 'dist', 'index.html'));
+    expect(res.target).not.toContain('dist-electron');
+  });
+
+  it('should throw deterministic error in packaged mode if appPath is missing or empty', () => {
+    expect(() => {
+      resolveRendererTarget({
+        isPackaged: true,
+      });
+    }).toThrow('[Security/Path] Canonical appPath is required in packaged mode to resolve embedded renderer.');
+
+    expect(() => {
+      resolveRendererTarget({
+        isPackaged: true,
+        appPath: '   ',
+      });
+    }).toThrow('[Security/Path] Canonical appPath is required in packaged mode to resolve embedded renderer.');
+  });
+
+  it('should prioritize explicit devServerUrl in unpackaged development mode', () => {
     const res = resolveRendererTarget({
       isPackaged: false,
       devServerUrl: 'http://localhost:3000',
@@ -14,7 +42,7 @@ describe('Renderer Path Resolution Helper', () => {
     });
   });
 
-  it('should default to localhost:5173 in unpackaged development mode', () => {
+  it('should default to localhost:5173 in unpackaged development mode when devServerUrl is omitted', () => {
     const res = resolveRendererTarget({
       isPackaged: false,
     });
@@ -22,26 +50,5 @@ describe('Renderer Path Resolution Helper', () => {
       type: 'url',
       target: 'http://localhost:5173',
     });
-  });
-
-  it('should resolve to <appPath>/dist/index.html in packaged mode without referencing dist-electron', () => {
-    const appPath = 'C:\\Program Files\\AgentForge\\resources\\app.asar';
-    const res = resolveRendererTarget({
-      isPackaged: true,
-      appPath,
-    });
-
-    expect(res.type).toBe('file');
-    expect(res.target).toBe(path.join(appPath, 'dist', 'index.html'));
-    expect(res.target).not.toContain('dist-electron');
-  });
-
-  it('should fallback to cwd/dist/index.html when appPath is omitted in packaged mode', () => {
-    const res = resolveRendererTarget({
-      isPackaged: true,
-    });
-
-    expect(res.type).toBe('file');
-    expect(res.target).toBe(path.join(process.cwd(), 'dist', 'index.html'));
   });
 });
