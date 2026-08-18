@@ -1005,6 +1005,108 @@ describe('Owner Routing & Manual Bridge Handoff Loop (PR #8)', () => {
       expect(() => {
         PackageGenerator.generateAuthorizedManualWorkOrder(auth.id, repo);
       }).toThrow(/EXECUTION_AUTHORIZATION_TAMPERED: Canonical payload managerPayloadHash mismatch/);
+
+      // 5. attemptId mismatch
+      const p5 = JSON.parse(auth.canonical_payload_json!);
+      p5.attemptId = 'ATTEMPT-TAMPERED-SCOPE';
+      db.prepare('UPDATE execution_authorizations SET canonical_payload_json = ? WHERE id = ?').run(
+        JSON.stringify(p5),
+        auth.id
+      );
+      expect(() => {
+        PackageGenerator.generateAuthorizedManualWorkOrder(auth.id, repo);
+      }).toThrow(/EXECUTION_AUTHORIZATION_TAMPERED: Canonical payload attemptId mismatch/);
+    });
+
+    it('24b. Context manifest hash tampered with valid 64-hex SHA-256 digest fails closed', async () => {
+      const managerMsg = {
+        protocol: 'manager.v1',
+        message_id: 'MSG-MGR-CTXHASH-24B',
+        project_id: testProjectId,
+        task_id: testTaskId,
+        decision: 'EXECUTE',
+        expected_task_state: 'PLANNED',
+        expected_revision: 0,
+        instructions: ['Context hash tamper test'],
+        priority: 'HIGH',
+        risk: 'LOW',
+      };
+      await taskService.applyManagerDecision(managerMsg as any, JSON.stringify(managerMsg));
+
+      const routingDecision = await routingService.route({
+        projectId: testProjectId,
+        taskId: testTaskId,
+        candidateResourceIds: ['res-gemini-coder'],
+        allowManualBridge: true,
+        requiredCapabilities: ['CODING'],
+      });
+
+      const auth = await authorizationService.createAuthorization({
+        projectId: testProjectId,
+        taskId: testTaskId,
+        routingDecisionId: routingDecision.decisionId,
+        contextFiles: ['README.md'],
+      });
+
+      await dispatchService.dispatch(auth.id);
+
+      // Tamper ONLY context_manifest_hash with a valid 64-hex SHA-256 that differs from genuine digest
+      const tamperedHash = 'f'.repeat(64);
+      expect(tamperedHash).not.toBe(auth.context_manifest_hash);
+
+      db.prepare('UPDATE execution_authorizations SET context_manifest_hash = ? WHERE id = ?').run(
+        tamperedHash,
+        auth.id
+      );
+
+      expect(() => {
+        PackageGenerator.generateAuthorizedManualWorkOrder(auth.id, repo);
+      }).toThrow(/EXECUTION_AUTHORIZATION_TAMPERED: Context manifest hash mismatch/);
+    });
+
+    it('25b. Canonical payload attemptId tamper fails closed with specific scope mismatch', async () => {
+      const managerMsg = {
+        protocol: 'manager.v1',
+        message_id: 'MSG-MGR-ATTEMPT-25B',
+        project_id: testProjectId,
+        task_id: testTaskId,
+        decision: 'EXECUTE',
+        expected_task_state: 'PLANNED',
+        expected_revision: 0,
+        instructions: ['Attempt tamper test'],
+        priority: 'HIGH',
+        risk: 'LOW',
+      };
+      await taskService.applyManagerDecision(managerMsg as any, JSON.stringify(managerMsg));
+
+      const routingDecision = await routingService.route({
+        projectId: testProjectId,
+        taskId: testTaskId,
+        candidateResourceIds: ['res-gemini-coder'],
+        allowManualBridge: true,
+        requiredCapabilities: ['CODING'],
+      });
+
+      const auth = await authorizationService.createAuthorization({
+        projectId: testProjectId,
+        taskId: testTaskId,
+        routingDecisionId: routingDecision.decisionId,
+        contextFiles: [],
+      });
+
+      await dispatchService.dispatch(auth.id);
+
+      const parsedPayload = JSON.parse(auth.canonical_payload_json!);
+      parsedPayload.attemptId = auth.attempt_id ? `${auth.attempt_id}-TAMPERED` : 'ATTEMPT-TAMPERED';
+
+      db.prepare('UPDATE execution_authorizations SET canonical_payload_json = ? WHERE id = ?').run(
+        JSON.stringify(parsedPayload),
+        auth.id
+      );
+
+      expect(() => {
+        PackageGenerator.generateAuthorizedManualWorkOrder(auth.id, repo);
+      }).toThrow(/EXECUTION_AUTHORIZATION_TAMPERED: Canonical payload attemptId mismatch/);
     });
 
     it('26. Legacy authorization with canonical_payload_json NULL fails closed', async () => {
