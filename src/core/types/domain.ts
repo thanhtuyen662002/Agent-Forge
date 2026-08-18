@@ -476,6 +476,9 @@ export interface ExecutionAuthorization {
   attempt_id: string | null;
   task_revision: number;
   base_sha: string;
+  repository_head_sha: string;
+  manager_message_id: string;
+  manager_payload_hash: string;
   routing_decision_id: string;
   selected_resource_id: string;
   selected_provider_id: string;

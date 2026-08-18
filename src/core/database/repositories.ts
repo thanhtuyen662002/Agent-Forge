@@ -385,6 +385,11 @@ export class Repository {
     return row ?? null;
   }
 
+  public getProtocolMessageByRecordId(id: string): Record<string, unknown> | null {
+    const row = this.db.prepare('SELECT * FROM protocol_messages WHERE id = ?').get(id) as Record<string, unknown> | undefined;
+    return row ?? null;
+  }
+
   public getProtocolMessagesByTask(taskId: string): Record<string, unknown>[] {
     return this.db
       .prepare('SELECT * FROM protocol_messages WHERE task_id = ? ORDER BY created_at ASC')
@@ -798,11 +803,12 @@ export class Repository {
       .prepare(`
         INSERT INTO execution_authorizations (
           id, project_id, task_id, attempt_id, task_revision, base_sha,
+          repository_head_sha, manager_message_id, manager_payload_hash,
           routing_decision_id, selected_resource_id, selected_provider_id,
           instruction_payload_hash, context_manifest_hash,
           canonical_instructions_json, context_files_json, status,
           created_at, dispatched_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       `)
       .run(
         auth.id,
@@ -811,6 +817,9 @@ export class Repository {
         auth.attempt_id,
         auth.task_revision,
         auth.base_sha,
+        auth.repository_head_sha,
+        auth.manager_message_id,
+        auth.manager_payload_hash,
         auth.routing_decision_id,
         auth.selected_resource_id,
         auth.selected_provider_id,
@@ -834,6 +843,9 @@ export class Repository {
       attempt_id: row.attempt_id ? String(row.attempt_id) : null,
       task_revision: Number(row.task_revision),
       base_sha: String(row.base_sha),
+      repository_head_sha: String(row.repository_head_sha),
+      manager_message_id: String(row.manager_message_id),
+      manager_payload_hash: String(row.manager_payload_hash),
       routing_decision_id: String(row.routing_decision_id),
       selected_resource_id: String(row.selected_resource_id),
       selected_provider_id: String(row.selected_provider_id),
@@ -858,6 +870,17 @@ export class Repository {
     return res.changes === 1;
   }
 
+  public invalidateExecutionAuthorization(id: string): boolean {
+    const res = this.db
+      .prepare(`
+        UPDATE execution_authorizations
+        SET status = 'INVALIDATED'
+        WHERE id = ? AND status = 'AUTHORIZED'
+      `)
+      .run(id);
+    return res.changes === 1;
+  }
+
   public updateExecutionAuthorizationStatus(id: string, status: ExecutionAuthorizationStatus): void {
     this.db
       .prepare(`
@@ -879,6 +902,9 @@ export class Repository {
       attempt_id: row.attempt_id ? String(row.attempt_id) : null,
       task_revision: Number(row.task_revision),
       base_sha: String(row.base_sha),
+      repository_head_sha: String(row.repository_head_sha),
+      manager_message_id: String(row.manager_message_id),
+      manager_payload_hash: String(row.manager_payload_hash),
       routing_decision_id: String(row.routing_decision_id),
       selected_resource_id: String(row.selected_resource_id),
       selected_provider_id: String(row.selected_provider_id),

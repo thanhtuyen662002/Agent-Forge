@@ -177,18 +177,20 @@ Agent-Forge does not treat raw model strings as architectural truth. Providers, 
 
 ## 7. Durable Execution Authorization & Orchestration Binding
 
-**Routing Authority $\neq$ Execution Payload Authority.**
+**Routing Authority $\neq$ Execution Payload Authority $\neq$ Task State Alone.**
 
-- **RoutingDecision** decides *which ProviderResource may execute*.
-- **ExecutionAuthorization** decides *what exact approved work that provider is authorized to execute*.
+- **ManagerProtocol Truth**: Approved work authority originates strictly from the applied Manager protocol ledger (`manager.v1` with decision `EXECUTE` or `FIX_REQUIRED`). Non-authorizing decisions (`PASS`, `BLOCK`, `PAUSE`, `CANCEL`, `NEEDS_OWNER`, `CREATE_TASKS`) and arbitrary task states alone cannot authorize execution.
+- **RoutingDecision**: Decides *which ProviderResource may execute* (`SELECTED` or `MANUAL_HANDOFF_REQUIRED`).
+- **ExecutionAuthorization**: Decides *what exact approved work that provider is authorized to execute*.
+- **Git Authority**: Distinguishes `base_sha` (the task/diff baseline) from `repository_head_sha` (actual repository Git HEAD captured at authorization creation and verified prior to dispatch).
 
 No provider execution may be authorized solely by a `decisionId` plus caller-supplied instructions. All execution payloads and context manifests originate strictly from approved durable AgentForge state.
 
 ### Security & Authority Chain
 ```text
-ManagerDecision / Approved Task State
+Manager Protocol Ledger (manager.v1 APPLIED: EXECUTE | FIX_REQUIRED)
         ↓
-ExecutionAuthorization (Canonical Payload Hash & Context Manifest Hash)
+ExecutionAuthorization (Canonical Payload Hash, Context Manifest Hash, Real Git HEAD)
         ↓
 ProviderRoutingDecision (Selected Resource & Provider Mapping)
         ↓
@@ -198,13 +200,24 @@ EXACTLY ONE Provider Execution
 ```
 
 ### Execution Authorization Invariants (`ExecutionAuthorizationService`, `ProviderDispatchService`)
-- **Durable Immutable Record**: Persisted in SQLite `execution_authorizations` with fields: `id`, `project_id`, `task_id`, `attempt_id`, `task_revision`, `base_sha`, `routing_decision_id`, `selected_resource_id`, `selected_provider_id`, `instruction_payload_hash`, `context_manifest_hash`, `canonical_instructions_json`, `context_files_json`, `status: AUTHORIZED | DISPATCHED | INVALIDATED`.
-- **Approved State Gate**: Only tasks with approved execution authority (`APPROVED`, `CODING`, `FIX_REQUIRED`, `REVIEWING`, `VALIDATING`, `DISPATCHED`, `HANDOFF_REQUIRED`, `REVIEW_READY`) may produce an `ExecutionAuthorization`.
+- **Durable Immutable Record**: Persisted in SQLite `execution_authorizations` (Migration 6) with foreign keys enforcing `ON DELETE RESTRICT` to prevent historical scope tampering:
+  `id`, `project_id`, `task_id`, `attempt_id`, `task_revision`, `base_sha`, `repository_head_sha`, `manager_message_id`, `manager_payload_hash`, `routing_decision_id`, `selected_resource_id`, `selected_provider_id`, `instruction_payload_hash`, `context_manifest_hash`, `canonical_instructions_json`, `context_files_json`, `status: AUTHORIZED | DISPATCHED | INVALIDATED`.
+- **Manager Ledger Authority Binding**:
+  - Requires an applied `manager.v1` protocol message with `EXECUTE` or `FIX_REQUIRED` matching the current coding revision.
+  - Re-verified at dispatch by checking message presence, `APPLIED` status, project/task scope, payload hash equality, and parsing decision validity.
+- **Real Git Repository Authority**:
+  - Captures live `repository_head_sha` via `GitService.getHeadSha(project.repository_path)`.
+  - Re-probes live Git repository HEAD at dispatch before claiming authorization. If repository HEAD has moved, dispatch fails closed with `EXECUTION_AUTHORIZATION_STALE_GIT_HEAD` and permanently invalidates the authorization.
+- **Task State Gate**:
+  - Automated `SELECTED` execution requires `task.state === 'CODING'`.
+  - `MANUAL_HANDOFF_REQUIRED` requires `task.state === 'CODING' || task.state === 'HANDOFF_REQUIRED'`.
+  - States `REVIEWING`, `VALIDATING`, `REVIEW_READY` alone cannot authorize execution.
 - **Canonical Payload & Manifest Hashing**:
-  - `instructionPayloadHash = SHA-256(canonicalPayload)` derived from task title, description, acceptance criteria, constraints, approved instructions, and context files.
-  - `contextManifestHash = SHA-256(canonicalContextFiles)` with strict path containment, no traversal (`../`), no sensitive credential paths (`.env`, `.ssh`, `.aws`), and deterministic lexicographical sorting.
-- **Zero Caller-Supplied Instructions at Dispatch**: `ProviderDispatchService.dispatch(authorizationId)` accepts ONLY `authorizationId`. The request is reconstructed internally from durable state.
+  - `instructionPayloadHash = SHA-256(canonicalPayload)` derived deterministically from task title, description, acceptance criteria, constraints, Manager instructions, and context files.
+  - `contextManifestHash = SHA-256(canonicalContextFiles)` with strict relative path containment, no traversal (`../`), no sensitive credential paths (`.env`, `.ssh`, `.aws`, `.gnupg`), and deterministic lexicographical sorting.
+- **Zero Caller-Supplied Instructions at Dispatch**: `ProviderDispatchService.dispatch(authorizationId)` accepts **ONLY** `authorizationId`. The execution payload is reconstructed internally from durable state.
 - **Atomic One-Time Claim**: Compare-and-set claim (`UPDATE ... SET status = 'DISPATCHED' WHERE id = ? AND status = 'AUTHORIZED'`) guarantees that concurrent calls or replayed authorizations execute zero additional times.
+- **Permanent Invalidation on Stale Checks**: Any validation failure (stale task revision, changed Git HEAD, Manager hash mismatch, routing scope mismatch, malformed payload JSON) permanently consumes the row as `INVALIDATED` (`UPDATE ... SET status = 'INVALIDATED' WHERE id = ? AND status = 'AUTHORIZED'`).
 - **Zero Post-Dispatch Failover**: If execution fails (process crash, protocol invalid, timeout, cancellation), the authorization remains consumed (`DISPATCHED`) and never automatically triggers a second provider execution.
 
 ---

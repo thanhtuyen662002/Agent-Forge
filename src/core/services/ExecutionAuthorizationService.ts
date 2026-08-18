@@ -3,17 +3,19 @@ import path from 'path';
 import { Repository } from '../database/repositories';
 import { EventService } from './EventService';
 import { PolicyService } from './PolicyService';
+import { GitService } from './GitService';
+import { ProtocolParser } from '../protocol/parser';
 import {
   ExecutionAuthorization,
   TaskState,
 } from '../types/domain';
+import { ManagerProtocol } from '../types/protocols';
 
 export interface CreateAuthorizationParams {
   projectId: string;
   taskId: string;
   attemptId?: string | null;
   routingDecisionId: string;
-  instructions?: string[];
   contextFiles?: string[];
 }
 
@@ -27,18 +29,44 @@ export interface CanonicalExecutionPayload {
   constraints: string[];
   instructions: string[];
   contextFiles: string[];
+  managerMessageId: string;
+  managerPayloadHash: string;
 }
 
-export const ALLOWED_TASK_STATES_FOR_AUTHORIZATION = new Set<TaskState>([
-  'APPROVED',
-  'CODING',
-  'FIX_REQUIRED',
-  'REVIEWING',
-  'VALIDATING',
-  'DISPATCHED',
-  'HANDOFF_REQUIRED',
-  'REVIEW_READY',
-]);
+export function buildCanonicalInstructions(
+  task: {
+    title: string;
+    description: string | null;
+    acceptance_criteria?: string[];
+    constraints?: string[];
+  },
+  managerData: ManagerProtocol
+): string[] {
+  const lines: string[] = [];
+  lines.push(`Task: ${task.title}`);
+  if (task.description) {
+    lines.push(`Description: ${task.description}`);
+  }
+  if (task.acceptance_criteria && task.acceptance_criteria.length > 0) {
+    lines.push('Acceptance Criteria:');
+    for (const ac of task.acceptance_criteria) {
+      lines.push(`- ${ac}`);
+    }
+  }
+  if (task.constraints && task.constraints.length > 0) {
+    lines.push('Constraints:');
+    for (const c of task.constraints) {
+      lines.push(`- ${c}`);
+    }
+  }
+  if (managerData.instructions && managerData.instructions.length > 0) {
+    lines.push(`Manager Instructions (${managerData.decision}):`);
+    for (const inst of managerData.instructions) {
+      lines.push(`- ${inst}`);
+    }
+  }
+  return lines;
+}
 
 export function computeCanonicalPayload(params: {
   projectId: string;
@@ -50,6 +78,8 @@ export function computeCanonicalPayload(params: {
   constraints: string[];
   instructions: string[];
   contextFiles: string[];
+  managerMessageId: string;
+  managerPayloadHash: string;
 }): CanonicalExecutionPayload {
   return {
     projectId: params.projectId,
@@ -61,6 +91,8 @@ export function computeCanonicalPayload(params: {
     constraints: [...params.constraints],
     instructions: [...params.instructions],
     contextFiles: [...params.contextFiles],
+    managerMessageId: params.managerMessageId,
+    managerPayloadHash: params.managerPayloadHash,
   };
 }
 
@@ -71,6 +103,8 @@ export function computePayloadHash(payload: CanonicalExecutionPayload): string {
     constraints: payload.constraints,
     contextFiles: payload.contextFiles,
     instructions: payload.instructions,
+    managerMessageId: payload.managerMessageId,
+    managerPayloadHash: payload.managerPayloadHash,
     projectId: payload.projectId,
     taskDescription: payload.taskDescription,
     taskId: payload.taskId,
@@ -148,9 +182,10 @@ export class ExecutionAuthorizationService {
   ) {}
 
   /**
-   * Creates an immutable, durable ExecutionAuthorization bound to approved task state and a valid RoutingDecision.
+   * Creates an immutable, durable ExecutionAuthorization bound to Manager protocol authority,
+   * actual Git repository HEAD, and a valid RoutingDecision.
    */
-  public createAuthorization(params: CreateAuthorizationParams): ExecutionAuthorization {
+  public async createAuthorization(params: CreateAuthorizationParams): Promise<ExecutionAuthorization> {
     const authorizationId = crypto.randomUUID();
     const createdAt = new Date().toISOString();
     const normalizedAttemptId = params.attemptId ?? null;
@@ -191,12 +226,61 @@ export class ExecutionAuthorizationService {
       }
     }
 
-    // 2. Validate Task Approval / Executable State
-    if (!ALLOWED_TASK_STATES_FOR_AUTHORIZATION.has(task.state)) {
-      const reason = `Task "${params.taskId}" in state "${task.state}" does not have approved execution authority. Allowed states: [${Array.from(ALLOWED_TASK_STATES_FOR_AUTHORIZATION).join(', ')}].`;
+    // 2. Validate Manager Protocol Authority from SQLite ledger
+    const taskProtocolMessages = this.repo.getProtocolMessagesByTask(params.taskId);
+    const appliedManagerMsgs = taskProtocolMessages.filter(
+      (m) => m.protocol === 'manager.v1' && m.status === 'APPLIED' && m.project_id === params.projectId
+    );
+
+    if (appliedManagerMsgs.length === 0) {
+      const reason = `EXECUTION_AUTHORIZATION_MANAGER_AUTHORITY_MISSING: No applied manager.v1 protocol message found for task "${params.taskId}".`;
       this.recordRejectionEvent(params, reason);
       throw new Error(`EXECUTION_AUTHORIZATION_FAILED: ${reason}`);
     }
+
+    const latestManagerMsg = appliedManagerMsgs[appliedManagerMsgs.length - 1];
+    const parseResult = ProtocolParser.parse(String(latestManagerMsg.raw_payload));
+    if (!parseResult.success || !parseResult.data || parseResult.data.type !== 'manager.v1') {
+      const reason = `EXECUTION_AUTHORIZATION_MANAGER_AUTHORITY_INVALID: Could not parse applied manager protocol message (${parseResult.error || 'schema invalid'}).`;
+      this.recordRejectionEvent(params, reason);
+      throw new Error(`EXECUTION_AUTHORIZATION_FAILED: ${reason}`);
+    }
+
+    const managerData = parseResult.data.data;
+    if (managerData.decision !== 'EXECUTE' && managerData.decision !== 'FIX_REQUIRED') {
+      const reason = `EXECUTION_AUTHORIZATION_MANAGER_DECISION_NON_AUTHORIZING: Manager decision "${managerData.decision}" does not authorize execution.`;
+      this.recordRejectionEvent(params, reason);
+      throw new Error(`EXECUTION_AUTHORIZATION_FAILED: ${reason}`);
+    }
+
+    // Manager revision binding validation
+    if (managerData.decision === 'EXECUTE') {
+      if (
+        managerData.expected_revision !== null &&
+        managerData.expected_revision !== undefined &&
+        managerData.expected_revision !== task.revision_count
+      ) {
+        const reason = `EXECUTION_AUTHORIZATION_STALE_TASK_REVISION: Manager EXECUTE expected revision ${managerData.expected_revision}, but task revision is ${task.revision_count}.`;
+        this.recordRejectionEvent(params, reason);
+        throw new Error(`EXECUTION_AUTHORIZATION_FAILED: ${reason}`);
+      }
+    } else if (managerData.decision === 'FIX_REQUIRED') {
+      // For FIX_REQUIRED, the state machine increments revision upon entering fix coding cycle
+      const expectedPrev = task.revision_count > 0 ? task.revision_count - 1 : 0;
+      if (
+        managerData.expected_revision !== null &&
+        managerData.expected_revision !== undefined &&
+        managerData.expected_revision !== expectedPrev &&
+        managerData.expected_revision !== task.revision_count
+      ) {
+        const reason = `EXECUTION_AUTHORIZATION_STALE_TASK_REVISION: Manager FIX_REQUIRED expected revision ${managerData.expected_revision}, which does not match task coding revision ${task.revision_count}.`;
+        this.recordRejectionEvent(params, reason);
+        throw new Error(`EXECUTION_AUTHORIZATION_FAILED: ${reason}`);
+      }
+    }
+
+    const managerMessageId = String(latestManagerMsg.id);
+    const managerPayloadHash = String(latestManagerMsg.payload_hash);
 
     // 3. Validate Durable Routing Decision Binding
     const routingEvent = this.repo.getRoutingDecisionEvent(params.routingDecisionId);
@@ -241,7 +325,22 @@ export class ExecutionAuthorizationService {
       throw new Error(`EXECUTION_AUTHORIZATION_FAILED: ${reason}`);
     }
 
-    // 4. Validate Provider and Resource Enablement
+    // 4. Validate Task State Gate
+    if (routingOutcome === 'SELECTED') {
+      if (task.state !== 'CODING') {
+        const reason = `EXECUTION_AUTHORIZATION_TASK_STATE_INCOMPATIBLE: Task "${params.taskId}" in state "${task.state}" cannot authorize automated provider execution (must be in CODING).`;
+        this.recordRejectionEvent(params, reason);
+        throw new Error(`EXECUTION_AUTHORIZATION_FAILED: ${reason}`);
+      }
+    } else if (routingOutcome === 'MANUAL_HANDOFF_REQUIRED') {
+      if (task.state !== 'CODING' && task.state !== 'HANDOFF_REQUIRED') {
+        const reason = `EXECUTION_AUTHORIZATION_TASK_STATE_INCOMPATIBLE: Task "${params.taskId}" in state "${task.state}" cannot authorize manual bridge execution (must be in CODING or HANDOFF_REQUIRED).`;
+        this.recordRejectionEvent(params, reason);
+        throw new Error(`EXECUTION_AUTHORIZATION_FAILED: ${reason}`);
+      }
+    }
+
+    // 5. Validate Provider and Resource Enablement
     const resource = this.repo.getProviderResource(selectedResourceId);
     if (!resource || !resource.enabled) {
       const reason = `Selected ProviderResource "${selectedResourceId}" is missing or disabled.`;
@@ -262,7 +361,23 @@ export class ExecutionAuthorizationService {
       throw new Error(`EXECUTION_AUTHORIZATION_FAILED: ${reason}`);
     }
 
-    // 5. Context File Manifest Validation & Canonicalization
+    // 6. Base SHA and Real Git Repository HEAD Authority
+    if (!task.base_sha || task.base_sha.trim() === '') {
+      const reason = `EXECUTION_AUTHORIZATION_BASE_SHA_MISSING: Task "${params.taskId}" is missing durable base_sha.`;
+      this.recordRejectionEvent(params, reason);
+      throw new Error(`EXECUTION_AUTHORIZATION_FAILED: ${reason}`);
+    }
+    const baseSha = task.base_sha.trim();
+
+    const gitHeadResult = await GitService.getHeadSha(project.repository_path);
+    if (gitHeadResult.status !== 'SUCCESS' || !gitHeadResult.sha) {
+      const reason = `EXECUTION_AUTHORIZATION_GIT_HEAD_FAILED: Could not resolve current Git HEAD for repository "${project.repository_path}" (${gitHeadResult.errorMessage || 'git error'}).`;
+      this.recordRejectionEvent(params, reason);
+      throw new Error(`EXECUTION_AUTHORIZATION_FAILED: ${reason}`);
+    }
+    const repositoryHeadSha = gitHeadResult.sha;
+
+    // 7. Context File Manifest Validation & Canonicalization
     const sanitizeResult = sanitizeContextFiles(params.contextFiles, project.repository_path);
     if (sanitizeResult.error) {
       this.recordRejectionEvent(params, sanitizeResult.error);
@@ -271,11 +386,8 @@ export class ExecutionAuthorizationService {
     const canonicalContextFiles = sanitizeResult.validFiles;
     const contextManifestHash = computeContextManifestHash(canonicalContextFiles);
 
-    // 6. Canonical Execution Payload & Hash Computation
-    const effectiveInstructions =
-      params.instructions && params.instructions.length > 0
-        ? params.instructions
-        : [task.description ?? task.title];
+    // 8. Canonical Execution Instructions Derived from Manager & Task Truth
+    const canonicalInstructions = buildCanonicalInstructions(task, managerData);
 
     const canonicalPayload = computeCanonicalPayload({
       projectId: params.projectId,
@@ -285,15 +397,14 @@ export class ExecutionAuthorizationService {
       taskDescription: task.description,
       acceptanceCriteria: task.acceptance_criteria ?? [],
       constraints: task.constraints ?? [],
-      instructions: effectiveInstructions,
+      instructions: canonicalInstructions,
       contextFiles: canonicalContextFiles,
+      managerMessageId,
+      managerPayloadHash,
     });
     const instructionPayloadHash = computePayloadHash(canonicalPayload);
 
-    // 7. Base SHA Binding
-    const baseSha = task.base_sha || '0000000000000000000000000000000000000000';
-
-    // 8. Create ExecutionAuthorization Record
+    // 9. Create ExecutionAuthorization Record
     const authorization: ExecutionAuthorization = {
       id: authorizationId,
       project_id: params.projectId,
@@ -301,12 +412,15 @@ export class ExecutionAuthorizationService {
       attempt_id: normalizedAttemptId,
       task_revision: task.revision_count,
       base_sha: baseSha,
+      repository_head_sha: repositoryHeadSha,
+      manager_message_id: managerMessageId,
+      manager_payload_hash: managerPayloadHash,
       routing_decision_id: params.routingDecisionId,
       selected_resource_id: selectedResourceId,
       selected_provider_id: selectedProviderId,
       instruction_payload_hash: instructionPayloadHash,
       context_manifest_hash: contextManifestHash,
-      canonical_instructions_json: JSON.stringify(effectiveInstructions),
+      canonical_instructions_json: JSON.stringify(canonicalInstructions),
       context_files_json: JSON.stringify(canonicalContextFiles),
       status: 'AUTHORIZED',
       created_at: createdAt,
@@ -315,7 +429,7 @@ export class ExecutionAuthorizationService {
 
     this.repo.createExecutionAuthorization(authorization);
 
-    // 9. Persist Audit Event
+    // 10. Persist Audit Event
     if (this.eventService) {
       this.eventService.record(
         params.projectId,
@@ -328,6 +442,9 @@ export class ExecutionAuthorizationService {
           attemptId: normalizedAttemptId,
           taskRevision: task.revision_count,
           baseSha,
+          repositoryHeadSha,
+          managerMessageId,
+          managerPayloadHash,
           routingDecisionId: params.routingDecisionId,
           selectedResourceId,
           selectedProviderId,

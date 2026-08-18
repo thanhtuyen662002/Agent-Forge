@@ -4,6 +4,7 @@ import path from 'path';
 import fs from 'fs';
 import os from 'os';
 import crypto from 'crypto';
+import { execSync } from 'child_process';
 import { MigrationRunner } from '../src/core/database/migrations';
 import { Repository } from '../src/core/database/repositories';
 import { EventService } from '../src/core/services/EventService';
@@ -142,6 +143,14 @@ describe('PR #6 — Deterministic Quota-Aware Provider Routing & Pre-Dispatch Fa
     dispatcher = new ProviderDispatchService(registry, repo, eventService);
     authService = new ExecutionAuthorizationService(repo, eventService);
 
+    // Initialize real git repo for GitService HEAD validation
+    execSync('git init', { cwd: tmpDir });
+    execSync('git config user.email "test@test.com"', { cwd: tmpDir });
+    execSync('git config user.name "Tester"', { cwd: tmpDir });
+    fs.writeFileSync(path.join(tmpDir, 'README.md'), '# Test\n');
+    execSync('git add README.md && git commit -m "init"', { cwd: tmpDir });
+    const initSha = execSync('git rev-parse HEAD', { cwd: tmpDir }).toString().trim();
+
     // Create base project and task
     repo.createProject({
       id: 'PROJ-ROUTING',
@@ -170,7 +179,7 @@ describe('PR #6 — Deterministic Quota-Aware Provider Routing & Pre-Dispatch Fa
       assigned_agent_id: null,
       revision_count: 0,
       max_revisions: 3,
-      base_sha: '0000000000000000000000000000000000000000',
+      base_sha: initSha,
       current_sha: null,
       progress_cache_percent: 0,
       progress_computed_at: null,
@@ -179,6 +188,32 @@ describe('PR #6 — Deterministic Quota-Aware Provider Routing & Pre-Dispatch Fa
       created_at: new Date().toISOString(),
       updated_at: new Date().toISOString(),
     });
+
+    // Create applied manager EXECUTE protocol message
+    const mgrMsgId = 'msg-mgr-initial';
+    const mgrRaw = JSON.stringify({
+      protocol: 'manager.v1',
+      message_id: mgrMsgId,
+      project_id: 'PROJ-ROUTING',
+      task_id: 'TSK-ROUTING-001',
+      decision: 'EXECUTE',
+      expected_revision: 0,
+      instructions: ['Do work'],
+    });
+    const mgrHash = crypto.createHash('sha256').update(mgrRaw).digest('hex');
+    repo.recordProtocolMessage(
+      'rec-mgr-001',
+      mgrMsgId,
+      'manager.v1',
+      'PROJ-ROUTING',
+      'TSK-ROUTING-001',
+      'APPROVED',
+      0,
+      mgrHash,
+      mgrRaw,
+      'APPLIED',
+      undefined
+    );
   });
 
   afterEach(() => {
@@ -865,11 +900,10 @@ describe('PR #6 — Deterministic Quota-Aware Provider Routing & Pre-Dispatch Fa
     const decision = await router.route(req);
     expect(decision.outcome).toBe('SELECTED');
 
-    const auth = authService.createAuthorization({
+    const auth = await authService.createAuthorization({
       projectId: 'PROJ-ROUTING',
       taskId: 'TSK-ROUTING-001',
       routingDecisionId: decision.decisionId,
-      instructions: ['Do work'],
       contextFiles: [],
     });
 
@@ -917,11 +951,10 @@ describe('PR #6 — Deterministic Quota-Aware Provider Routing & Pre-Dispatch Fa
     const decision = await router.route(req);
     expect(decision.outcome).toBe('MANUAL_HANDOFF_REQUIRED');
 
-    const auth = authService.createAuthorization({
+    const auth = await authService.createAuthorization({
       projectId: 'PROJ-ROUTING',
       taskId: 'TSK-ROUTING-001',
       routingDecisionId: decision.decisionId,
-      instructions: ['Manual task'],
       contextFiles: [],
     });
 
@@ -949,11 +982,10 @@ describe('PR #6 — Deterministic Quota-Aware Provider Routing & Pre-Dispatch Fa
     const decision = await router.route(req);
     expect(decision.selectedResourceId).toBe('res-primary');
 
-    const auth = authService.createAuthorization({
+    const auth = await authService.createAuthorization({
       projectId: 'PROJ-ROUTING',
       taskId: 'TSK-ROUTING-001',
       routingDecisionId: decision.decisionId,
-      instructions: ['Run task'],
       contextFiles: [],
     });
 
@@ -983,11 +1015,10 @@ describe('PR #6 — Deterministic Quota-Aware Provider Routing & Pre-Dispatch Fa
       allowManualBridge: false,
     });
 
-    const auth = authService.createAuthorization({
+    const auth = await authService.createAuthorization({
       projectId: 'PROJ-ROUTING',
       taskId: 'TSK-ROUTING-001',
       routingDecisionId: decision.decisionId,
-      instructions: ['Task'],
       contextFiles: [],
     });
 
@@ -1014,11 +1045,10 @@ describe('PR #6 — Deterministic Quota-Aware Provider Routing & Pre-Dispatch Fa
       allowManualBridge: false,
     });
 
-    const auth = authService.createAuthorization({
+    const auth = await authService.createAuthorization({
       projectId: 'PROJ-ROUTING',
       taskId: 'TSK-ROUTING-001',
       routingDecisionId: decision.decisionId,
-      instructions: ['Task'],
       contextFiles: [],
     });
 
@@ -1048,11 +1078,10 @@ describe('PR #6 — Deterministic Quota-Aware Provider Routing & Pre-Dispatch Fa
       allowManualBridge: false,
     });
 
-    const auth = authService.createAuthorization({
+    const auth = await authService.createAuthorization({
       projectId: 'PROJ-ROUTING',
       taskId: 'TSK-ROUTING-001',
       routingDecisionId: decision.decisionId,
-      instructions: ['Task'],
       contextFiles: [],
     });
 
@@ -1079,11 +1108,10 @@ describe('PR #6 — Deterministic Quota-Aware Provider Routing & Pre-Dispatch Fa
       allowManualBridge: false,
     });
 
-    const auth = authService.createAuthorization({
+    const auth = await authService.createAuthorization({
       projectId: 'PROJ-ROUTING',
       taskId: 'TSK-ROUTING-001',
       routingDecisionId: decision.decisionId,
-      instructions: ['Task'],
       contextFiles: [],
     });
 
@@ -1369,13 +1397,13 @@ describe('PR #6 — Deterministic Quota-Aware Provider Routing & Pre-Dispatch Fa
       allowManualBridge: false,
     });
 
-    expect(() =>
+    await expect(
       authService.createAuthorization({
         projectId: 'PROJ-DIFFERENT',
         taskId: 'TSK-ROUTING-001',
         routingDecisionId: decision.decisionId,
       })
-    ).toThrow('EXECUTION_AUTHORIZATION_FAILED');
+    ).rejects.toThrow('EXECUTION_AUTHORIZATION_FAILED');
   });
 
   // 42. Valid persisted route Task A + authorization Task B → FAIL
@@ -1390,13 +1418,13 @@ describe('PR #6 — Deterministic Quota-Aware Provider Routing & Pre-Dispatch Fa
       allowManualBridge: false,
     });
 
-    expect(() =>
+    await expect(
       authService.createAuthorization({
         projectId: 'PROJ-ROUTING',
         taskId: 'TSK-DIFFERENT-002',
         routingDecisionId: decision.decisionId,
       })
-    ).toThrow('EXECUTION_AUTHORIZATION_FAILED');
+    ).rejects.toThrow('EXECUTION_AUTHORIZATION_FAILED');
   });
 
   // 43. Attempt mismatch → FAIL
@@ -1424,14 +1452,14 @@ describe('PR #6 — Deterministic Quota-Aware Provider Routing & Pre-Dispatch Fa
       allowManualBridge: false,
     });
 
-    expect(() =>
+    await expect(
       authService.createAuthorization({
         projectId: 'PROJ-ROUTING',
         taskId: 'TSK-ROUTING-001',
         attemptId: 'ATT-MISMATCH-999',
         routingDecisionId: decision.decisionId,
       })
-    ).toThrow('EXECUTION_AUTHORIZATION_FAILED');
+    ).rejects.toThrow('EXECUTION_AUTHORIZATION_FAILED');
   });
 
   // 44. Fabricated authorizationId → EXECUTION_AUTHORIZATION_NOT_FOUND
@@ -1470,13 +1498,13 @@ describe('PR #6 — Deterministic Quota-Aware Provider Routing & Pre-Dispatch Fa
       'TSK-ROUTING-001'
     );
 
-    expect(() =>
+    await expect(
       authService.createAuthorization({
         projectId: 'PROJ-ROUTING',
         taskId: 'TSK-ROUTING-001',
         routingDecisionId: corruptDecisionId,
       })
-    ).toThrow('EXECUTION_AUTHORIZATION_FAILED');
+    ).rejects.toThrow('EXECUTION_AUTHORIZATION_FAILED');
   });
 
   // 47. Resource.provider_id differs from selectedProviderId → FAIL
@@ -1500,13 +1528,13 @@ describe('PR #6 — Deterministic Quota-Aware Provider Routing & Pre-Dispatch Fa
       'TSK-ROUTING-001'
     );
 
-    expect(() =>
+    await expect(
       authService.createAuthorization({
         projectId: 'PROJ-ROUTING',
         taskId: 'TSK-ROUTING-001',
         routingDecisionId: forgedDecisionId,
       })
-    ).toThrow('EXECUTION_AUTHORIZATION_FAILED');
+    ).rejects.toThrow('EXECUTION_AUTHORIZATION_FAILED');
   });
 
   // 48. Selected resource disabled after authorization → FAIL
@@ -1523,7 +1551,7 @@ describe('PR #6 — Deterministic Quota-Aware Provider Routing & Pre-Dispatch Fa
     });
     expect(decision.selectedResourceId).toBe('res-dis-primary');
 
-    const auth = authService.createAuthorization({
+    const auth = await authService.createAuthorization({
       projectId: 'PROJ-ROUTING',
       taskId: 'TSK-ROUTING-001',
       routingDecisionId: decision.decisionId,
@@ -1552,7 +1580,7 @@ describe('PR #6 — Deterministic Quota-Aware Provider Routing & Pre-Dispatch Fa
       allowManualBridge: false,
     });
 
-    const auth = authService.createAuthorization({
+    const auth = await authService.createAuthorization({
       projectId: 'PROJ-ROUTING',
       taskId: 'TSK-ROUTING-001',
       routingDecisionId: decision.decisionId,
@@ -1580,7 +1608,7 @@ describe('PR #6 — Deterministic Quota-Aware Provider Routing & Pre-Dispatch Fa
       allowManualBridge: false,
     });
 
-    const auth = authService.createAuthorization({
+    const auth = await authService.createAuthorization({
       projectId: 'PROJ-ROUTING',
       taskId: 'TSK-ROUTING-001',
       routingDecisionId: decision.decisionId,
@@ -1627,7 +1655,7 @@ describe('PR #6 — Deterministic Quota-Aware Provider Routing & Pre-Dispatch Fa
       allowManualBridge: true,
     });
 
-    const auth = authService.createAuthorization({
+    const auth = await authService.createAuthorization({
       projectId: 'PROJ-ROUTING',
       taskId: 'TSK-ROUTING-001',
       routingDecisionId: decision.decisionId,
