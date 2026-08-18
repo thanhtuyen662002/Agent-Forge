@@ -149,7 +149,7 @@ export class BootstrapService {
 
     // 6. Initialize Provider Routing & Dispatch Services
     const providerRoutingService = new ProviderRoutingService(repo, providerRegistry, eventService);
-    const providerDispatchService = new ProviderDispatchService(providerRegistry);
+    const providerDispatchService = new ProviderDispatchService(providerRegistry, repo);
 
     return {
       db,

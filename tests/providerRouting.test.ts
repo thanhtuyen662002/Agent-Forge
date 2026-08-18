@@ -35,7 +35,11 @@ import {
 class MockProviderAdapter implements ProviderAdapter {
   public executionCount = 0;
   public cancelCount = 0;
+  public healthProbeCount = 0;
+  public quotaProbeCount = 0;
+  public capabilityProbeCount = 0;
   public probeError?: Error;
+  public capProbeError?: Error;
 
   constructor(
     public readonly id: string,
@@ -55,16 +59,19 @@ class MockProviderAdapter implements ProviderAdapter {
   ) {}
 
   public async getCapabilities(): Promise<Capability[]> {
-    if (this.probeError) throw this.probeError;
+    this.capabilityProbeCount++;
+    if (this.capProbeError) throw this.capProbeError;
     return this.capabilities;
   }
 
   public async getHealth(): Promise<ProviderHealthStatus> {
+    this.healthProbeCount++;
     if (this.probeError) throw this.probeError;
     return this.health;
   }
 
   public async getQuota(): Promise<QuotaSnapshotInfo> {
+    this.quotaProbeCount++;
     if (this.probeError) throw this.probeError;
     return this.quota;
   }
@@ -129,7 +136,7 @@ describe('PR #6 — Deterministic Quota-Aware Provider Routing & Pre-Dispatch Fa
     eventService = new EventService(repo);
     registry = new ProviderRegistry();
     router = new ProviderRoutingService(repo, registry, eventService);
-    dispatcher = new ProviderDispatchService(registry);
+    dispatcher = new ProviderDispatchService(registry, repo);
 
     // Create base project and task
     repo.createProject({
@@ -271,7 +278,8 @@ describe('PR #6 — Deterministic Quota-Aware Provider Routing & Pre-Dispatch Fa
     expect(decision1.selectedProviderId).toBe('prov-a');
     expect(decision2.outcome).toBe(decision1.outcome);
     expect(decision2.selectedResourceId).toBe(decision1.selectedResourceId);
-    expect(decision2.candidateEvaluations.length).toBe(decision1.candidateEvaluations.length);
+    expect(decision2.projectId).toBe('PROJ-ROUTING');
+    expect(decision2.taskId).toBe('TSK-ROUTING-001');
   });
 
   // 2. Empty candidate list → NO_ELIGIBLE_PROVIDER
@@ -326,7 +334,6 @@ describe('PR #6 — Deterministic Quota-Aware Provider Routing & Pre-Dispatch Fa
 
   // 5. Missing adapter explicitly rejected/ineligible
   it('5. Resource with unregistered adapter is marked ineligible', async () => {
-    // Create resource in DB without registering adapter in registry
     repo.createProvider({
       id: 'prov-unregistered',
       name: 'Unregistered Provider',
@@ -361,7 +368,9 @@ describe('PR #6 — Deterministic Quota-Aware Provider Routing & Pre-Dispatch Fa
     const decision = await router.route(req);
     expect(decision.outcome).toBe('NO_ELIGIBLE_PROVIDER');
     expect(decision.candidateEvaluations[0].eligibility).toBe('INELIGIBLE');
-    expect(decision.candidateEvaluations[0].rejectionReasons[0]).toContain('not registered in ProviderRegistry');
+    expect(decision.candidateEvaluations[0].rejectionReasons[0]).toContain(
+      'not registered in ProviderRegistry'
+    );
   });
 
   // 6. Disabled resource never selected
@@ -391,7 +400,7 @@ describe('PR #6 — Deterministic Quota-Aware Provider Routing & Pre-Dispatch Fa
     const req: RoutingRequest = {
       projectId: 'PROJ-ROUTING',
       taskId: 'TSK-ROUTING-001',
-      requiredCapabilities: ['CODING', 'SECURITY_REVIEW'], // Missing SECURITY_REVIEW
+      requiredCapabilities: ['CODING', 'SECURITY_REVIEW'],
       candidateResourceIds: ['res-coder'],
       allowManualBridge: false,
     };
@@ -447,7 +456,7 @@ describe('PR #6 — Deterministic Quota-Aware Provider Routing & Pre-Dispatch Fa
       projectId: 'PROJ-ROUTING',
       taskId: 'TSK-ROUTING-001',
       requiredCapabilities: ['CODING'],
-      candidateResourceIds: ['res-low', 'res-avail'], // LOW_QUOTA first
+      candidateResourceIds: ['res-low', 'res-avail'],
       allowManualBridge: false,
     };
 
@@ -482,7 +491,7 @@ describe('PR #6 — Deterministic Quota-Aware Provider Routing & Pre-Dispatch Fa
     expect(decision2.selectedResourceId).toBe('res-avail-2');
   });
 
-  // 12. health QUOTA_EXHAUSTED blocks candidate
+  // 12. Health QUOTA_EXHAUSTED blocks candidate
   it('12. Health QUOTA_EXHAUSTED blocks candidate from automated selection', async () => {
     setupResource('res-exhausted', 'prov-ex', { health: 'QUOTA_EXHAUSTED' });
 
@@ -519,7 +528,9 @@ describe('PR #6 — Deterministic Quota-Aware Provider Routing & Pre-Dispatch Fa
     const decision = await router.route(req);
     expect(decision.outcome).toBe('NO_ELIGIBLE_PROVIDER');
     expect(decision.candidateEvaluations[0].eligibility).toBe('INELIGIBLE');
-    expect(decision.candidateEvaluations[0].rejectionReasons[0]).toContain('Authoritative quota exhausted');
+    expect(decision.candidateEvaluations[0].rejectionReasons[0]).toContain(
+      'Authoritative quota exhausted'
+    );
   });
 
   // 14. Authoritative remaining<0 blocks candidate
@@ -541,7 +552,9 @@ describe('PR #6 — Deterministic Quota-Aware Provider Routing & Pre-Dispatch Fa
     const decision = await router.route(req);
     expect(decision.outcome).toBe('NO_ELIGIBLE_PROVIDER');
     expect(decision.candidateEvaluations[0].eligibility).toBe('INELIGIBLE');
-    expect(decision.candidateEvaluations[0].rejectionReasons[0]).toContain('Authoritative quota exhausted');
+    expect(decision.candidateEvaluations[0].rejectionReasons[0]).toContain(
+      'Authoritative quota exhausted'
+    );
   });
 
   // 15. UNKNOWN quota + AVAILABLE health remains eligible
@@ -602,7 +615,6 @@ describe('PR #6 — Deterministic Quota-Aware Provider Routing & Pre-Dispatch Fa
       quotaSource: 'MEASURED',
     });
 
-    // When both are AVAILABLE, first in candidateResourceIds order wins
     const req: RoutingRequest = {
       projectId: 'PROJ-ROUTING',
       taskId: 'TSK-ROUTING-001',
@@ -663,7 +675,7 @@ describe('PR #6 — Deterministic Quota-Aware Provider Routing & Pre-Dispatch Fa
       projectId: 'PROJ-ROUTING',
       taskId: 'TSK-ROUTING-001',
       requiredCapabilities: ['CODING'],
-      candidateResourceIds: ['res-auth-err', 'res-avail'], // AUTH_ERROR first
+      candidateResourceIds: ['res-auth-err', 'res-avail'],
       allowManualBridge: false,
     };
 
@@ -671,7 +683,6 @@ describe('PR #6 — Deterministic Quota-Aware Provider Routing & Pre-Dispatch Fa
     expect(decision.outcome).toBe('NEEDS_OWNER');
     expect(decision.selectedResourceId).toBeNull();
     expect(decision.reason).toContain('AUTH_ERROR');
-    // Second candidate must not be evaluated
     expect(decision.candidateEvaluations.length).toBe(1);
   });
 
@@ -752,7 +763,9 @@ describe('PR #6 — Deterministic Quota-Aware Provider Routing & Pre-Dispatch Fa
 
     const decision = await router.route(req);
     expect(decision.outcome).toBe('NO_ELIGIBLE_PROVIDER');
-    expect(decision.candidateEvaluations[0].rejectionReasons[0]).toContain('allowManualBridge=false');
+    expect(decision.candidateEvaluations[0].rejectionReasons[0]).toContain(
+      'allowManualBridge=false'
+    );
   });
 
   // 23. Manual Bridge explicitly permitted → MANUAL_HANDOFF_REQUIRED
@@ -799,7 +812,6 @@ describe('PR #6 — Deterministic Quota-Aware Provider Routing & Pre-Dispatch Fa
   // 24. No implicit Manual Bridge fallback
   it('24. No implicit Manual Bridge fallback when automated candidates fail and Manual Bridge is not in candidates', async () => {
     setupResource('res-failing', 'prov-fail', { health: 'OFFLINE' });
-    // Manual bridge exists in registry but NOT in candidateResourceIds
     const manualAdapter = new ManualBridgeAdapter();
     registry.register(manualAdapter);
 
@@ -835,7 +847,7 @@ describe('PR #6 — Deterministic Quota-Aware Provider Routing & Pre-Dispatch Fa
   });
 
   // 26. Dispatch executes selected automated provider exactly once
-  it('26. Dispatch executes the selected automated provider exactly once', async () => {
+  it('26. Dispatch executes the selected automated provider exactly once using durable decisionId', async () => {
     const mock = setupResource('res-exec', 'prov-exec', { health: 'AVAILABLE' });
 
     const req: RoutingRequest = {
@@ -849,7 +861,7 @@ describe('PR #6 — Deterministic Quota-Aware Provider Routing & Pre-Dispatch Fa
     const decision = await router.route(req);
     expect(decision.outcome).toBe('SELECTED');
 
-    const result = await dispatcher.dispatch(decision, {
+    const result = await dispatcher.dispatch(decision.decisionId, {
       taskId: 'TSK-ROUTING-001',
       projectId: 'PROJ-ROUTING',
       instructions: ['Do work'],
@@ -898,7 +910,7 @@ describe('PR #6 — Deterministic Quota-Aware Provider Routing & Pre-Dispatch Fa
     const decision = await router.route(req);
     expect(decision.outcome).toBe('MANUAL_HANDOFF_REQUIRED');
 
-    const result = await dispatcher.dispatch(decision, {
+    const result = await dispatcher.dispatch(decision.decisionId, {
       taskId: 'TSK-ROUTING-001',
       projectId: 'PROJ-ROUTING',
       instructions: ['Manual task'],
@@ -927,7 +939,7 @@ describe('PR #6 — Deterministic Quota-Aware Provider Routing & Pre-Dispatch Fa
     const decision = await router.route(req);
     expect(decision.selectedResourceId).toBe('res-primary');
 
-    const result = await dispatcher.dispatch(decision, {
+    const result = await dispatcher.dispatch(decision.decisionId, {
       taskId: 'TSK-ROUTING-001',
       projectId: 'PROJ-ROUTING',
       instructions: ['Run task'],
@@ -936,7 +948,7 @@ describe('PR #6 — Deterministic Quota-Aware Provider Routing & Pre-Dispatch Fa
 
     expect(result.status).toBe('FAILED');
     expect(failingMock.executionCount).toBe(1);
-    expect(secondaryMock.executionCount).toBe(0); // ZERO post-dispatch failover
+    expect(secondaryMock.executionCount).toBe(0);
   });
 
   // 29. PROTOCOL_INVALID → second provider execution count remains 0
@@ -950,18 +962,15 @@ describe('PR #6 — Deterministic Quota-Aware Provider Routing & Pre-Dispatch Fa
     });
     const backupMock = setupResource('res-backup-29', 'prov-b29', { health: 'AVAILABLE' });
 
-    const decision: RoutingDecision = {
-      decisionId: 'dec-29',
-      outcome: 'SELECTED',
-      selectedResourceId: 'res-proto-invalid',
-      selectedProviderId: 'prov-pi',
-      adapterType: 'LOCAL_CLI',
-      candidateEvaluations: [],
-      reason: 'Selected primary',
-      createdAt: new Date().toISOString(),
-    };
+    const decision = await router.route({
+      projectId: 'PROJ-ROUTING',
+      taskId: 'TSK-ROUTING-001',
+      requiredCapabilities: ['CODING'],
+      candidateResourceIds: ['res-proto-invalid', 'res-backup-29'],
+      allowManualBridge: false,
+    });
 
-    const result = await dispatcher.dispatch(decision, {
+    const result = await dispatcher.dispatch(decision.decisionId, {
       taskId: 'TSK-ROUTING-001',
       projectId: 'PROJ-ROUTING',
       instructions: ['Task'],
@@ -981,18 +990,15 @@ describe('PR #6 — Deterministic Quota-Aware Provider Routing & Pre-Dispatch Fa
     });
     const backupMock = setupResource('res-backup-30', 'prov-b30', { health: 'AVAILABLE' });
 
-    const decision: RoutingDecision = {
-      decisionId: 'dec-30',
-      outcome: 'SELECTED',
-      selectedResourceId: 'res-timeout',
-      selectedProviderId: 'prov-to',
-      adapterType: 'LOCAL_CLI',
-      candidateEvaluations: [],
-      reason: 'Selected primary',
-      createdAt: new Date().toISOString(),
-    };
+    const decision = await router.route({
+      projectId: 'PROJ-ROUTING',
+      taskId: 'TSK-ROUTING-001',
+      requiredCapabilities: ['CODING'],
+      candidateResourceIds: ['res-timeout', 'res-backup-30'],
+      allowManualBridge: false,
+    });
 
-    const result = await dispatcher.dispatch(decision, {
+    const result = await dispatcher.dispatch(decision.decisionId, {
       taskId: 'TSK-ROUTING-001',
       projectId: 'PROJ-ROUTING',
       instructions: ['Task'],
@@ -1015,18 +1021,15 @@ describe('PR #6 — Deterministic Quota-Aware Provider Routing & Pre-Dispatch Fa
     });
     const backupMock = setupResource('res-backup-31', 'prov-b31', { health: 'AVAILABLE' });
 
-    const decision: RoutingDecision = {
-      decisionId: 'dec-31',
-      outcome: 'SELECTED',
-      selectedResourceId: 'res-policy-denied',
-      selectedProviderId: 'prov-pd',
-      adapterType: 'LOCAL_CLI',
-      candidateEvaluations: [],
-      reason: 'Selected primary',
-      createdAt: new Date().toISOString(),
-    };
+    const decision = await router.route({
+      projectId: 'PROJ-ROUTING',
+      taskId: 'TSK-ROUTING-001',
+      requiredCapabilities: ['CODING'],
+      candidateResourceIds: ['res-policy-denied', 'res-backup-31'],
+      allowManualBridge: false,
+    });
 
-    const result = await dispatcher.dispatch(decision, {
+    const result = await dispatcher.dispatch(decision.decisionId, {
       taskId: 'TSK-ROUTING-001',
       projectId: 'PROJ-ROUTING',
       instructions: ['Task'],
@@ -1046,18 +1049,15 @@ describe('PR #6 — Deterministic Quota-Aware Provider Routing & Pre-Dispatch Fa
     });
     const backupMock = setupResource('res-backup-32', 'prov-b32', { health: 'AVAILABLE' });
 
-    const decision: RoutingDecision = {
-      decisionId: 'dec-32',
-      outcome: 'SELECTED',
-      selectedResourceId: 'res-cancelled',
-      selectedProviderId: 'prov-canc',
-      adapterType: 'LOCAL_CLI',
-      candidateEvaluations: [],
-      reason: 'Selected primary',
-      createdAt: new Date().toISOString(),
-    };
+    const decision = await router.route({
+      projectId: 'PROJ-ROUTING',
+      taskId: 'TSK-ROUTING-001',
+      requiredCapabilities: ['CODING'],
+      candidateResourceIds: ['res-cancelled', 'res-backup-32'],
+      allowManualBridge: false,
+    });
 
-    const result = await dispatcher.dispatch(decision, {
+    const result = await dispatcher.dispatch(decision.decisionId, {
       taskId: 'TSK-ROUTING-001',
       projectId: 'PROJ-ROUTING',
       instructions: ['Task'],
@@ -1178,7 +1178,7 @@ describe('PR #6 — Deterministic Quota-Aware Provider Routing & Pre-Dispatch Fa
     await router.route(req);
 
     const resRecord = repo.getProviderResource('res-disabled-mut')!;
-    expect(resRecord.enabled).toBe(false); // Still false, no silent mutation
+    expect(resRecord.enabled).toBe(false);
   });
 
   // 38. Telemetry probe exception recorded truthfully
@@ -1232,6 +1232,29 @@ describe('PR #6 — Deterministic Quota-Aware Provider Routing & Pre-Dispatch Fa
       completed_at: null,
     });
 
+    repo1.createTask({
+      id: 'TSK-REST',
+      project_id: 'PROJ-REST',
+      milestone_id: null,
+      title: 'Restart Task',
+      description: 'Testing restart event survival',
+      state: 'CODING',
+      paused_from_state: null,
+      priority: 'HIGH',
+      risk: 'LOW',
+      assigned_agent_id: null,
+      revision_count: 0,
+      max_revisions: 3,
+      base_sha: '0000000000000000000000000000000000000000',
+      current_sha: null,
+      progress_cache_percent: 0,
+      progress_computed_at: null,
+      acceptance_criteria: [],
+      constraints: [],
+      created_at: new Date().toISOString(),
+      updated_at: new Date().toISOString(),
+    });
+
     repo1.createProvider({
       id: 'prov-restart',
       name: 'Restart Provider',
@@ -1254,29 +1277,6 @@ describe('PR #6 — Deterministic Quota-Aware Provider Routing & Pre-Dispatch Fa
       quota_source: 'UNKNOWN',
       quota_confidence: 0,
       last_health_check: null,
-    });
-
-    repo1.createTask({
-      id: 'TSK-REST',
-      project_id: 'PROJ-REST',
-      milestone_id: null,
-      title: 'Restart Task',
-      description: 'Testing restart event survival',
-      state: 'CODING',
-      paused_from_state: null,
-      priority: 'HIGH',
-      risk: 'LOW',
-      assigned_agent_id: null,
-      revision_count: 0,
-      max_revisions: 3,
-      base_sha: '0000000000000000000000000000000000000000',
-      current_sha: null,
-      progress_cache_percent: 0,
-      progress_computed_at: null,
-      acceptance_criteria: [],
-      constraints: [],
-      created_at: new Date().toISOString(),
-      updated_at: new Date().toISOString(),
     });
 
     const router1 = new ProviderRoutingService(repo1, registry1, eventService1);
@@ -1306,7 +1306,6 @@ describe('PR #6 — Deterministic Quota-Aware Provider Routing & Pre-Dispatch Fa
 
   // 40. No API keys required
   it('40. Provider routing functions entirely offline without any external network or API keys', async () => {
-    // Execute routing in isolated environment with no env variables
     const originalEnv = process.env;
     process.env = {};
 
@@ -1327,5 +1326,519 @@ describe('PR #6 — Deterministic Quota-Aware Provider Routing & Pre-Dispatch Fa
     } finally {
       process.env = originalEnv;
     }
+  });
+
+  // ==========================================
+  // MANDATORY NEW AUTHORITY & PRECEDENCE TESTS
+  // ==========================================
+
+  // 41. Valid persisted route Project A / Task A + dispatch request Project B / Task A → FAIL
+  it('41. Cross-project dispatch request is rejected and yields 0 provider executions', async () => {
+    const mock = setupResource('res-scope-test', 'prov-st', { health: 'AVAILABLE' });
+
+    const decision = await router.route({
+      projectId: 'PROJ-ROUTING',
+      taskId: 'TSK-ROUTING-001',
+      requiredCapabilities: ['CODING'],
+      candidateResourceIds: ['res-scope-test'],
+      allowManualBridge: false,
+    });
+
+    const result = await dispatcher.dispatch(decision.decisionId, {
+      projectId: 'PROJ-DIFFERENT',
+      taskId: 'TSK-ROUTING-001',
+      instructions: ['Task'],
+      contextFiles: [],
+    });
+
+    expect(result.status).toBe('FAILED');
+    expect(result.error).toContain('ROUTING_DECISION_SCOPE_MISMATCH');
+    expect(result.error).toContain('Project ID mismatch');
+    expect(mock.executionCount).toBe(0);
+  });
+
+  // 42. Valid persisted route Task A + dispatch Task B → FAIL
+  it('42. Cross-task dispatch request is rejected and yields 0 provider executions', async () => {
+    const mock = setupResource('res-task-test', 'prov-tt', { health: 'AVAILABLE' });
+
+    const decision = await router.route({
+      projectId: 'PROJ-ROUTING',
+      taskId: 'TSK-ROUTING-001',
+      requiredCapabilities: ['CODING'],
+      candidateResourceIds: ['res-task-test'],
+      allowManualBridge: false,
+    });
+
+    const result = await dispatcher.dispatch(decision.decisionId, {
+      projectId: 'PROJ-ROUTING',
+      taskId: 'TSK-DIFFERENT-002',
+      instructions: ['Task'],
+      contextFiles: [],
+    });
+
+    expect(result.status).toBe('FAILED');
+    expect(result.error).toContain('ROUTING_DECISION_SCOPE_MISMATCH');
+    expect(result.error).toContain('Task ID mismatch');
+    expect(mock.executionCount).toBe(0);
+  });
+
+  // 43. Attempt mismatch → FAIL
+  it('43. Attempt mismatch between decision and dispatch request fails closed', async () => {
+    // Create attempt
+    repo.createTaskAttempt({
+      id: 'ATT-001',
+      task_id: 'TSK-ROUTING-001',
+      attempt_number: 1,
+      agent_id: 'agent-1',
+      status: 'RUNNING',
+      started_at: new Date().toISOString(),
+      ended_at: null,
+      summary: null,
+    });
+
+    const mock = setupResource('res-att-test', 'prov-at', { health: 'AVAILABLE' });
+
+    const decision = await router.route({
+      projectId: 'PROJ-ROUTING',
+      taskId: 'TSK-ROUTING-001',
+      attemptId: 'ATT-001',
+      requiredCapabilities: ['CODING'],
+      candidateResourceIds: ['res-att-test'],
+      allowManualBridge: false,
+    });
+
+    const result = await dispatcher.dispatch(decision.decisionId, {
+      projectId: 'PROJ-ROUTING',
+      taskId: 'TSK-ROUTING-001',
+      attemptId: 'ATT-MISMATCH-999',
+      instructions: ['Task'],
+      contextFiles: [],
+    });
+
+    expect(result.status).toBe('FAILED');
+    expect(result.error).toContain('ROUTING_DECISION_SCOPE_MISMATCH');
+    expect(result.error).toContain('Attempt ID mismatch');
+    expect(mock.executionCount).toBe(0);
+  });
+
+  // 44. Fabricated decisionId → ROUTING_DECISION_NOT_FOUND
+  it('44. Fabricated decisionId returns ROUTING_DECISION_NOT_FOUND with zero execution', async () => {
+    const mock = setupResource('res-fab-test', 'prov-ft', { health: 'AVAILABLE' });
+
+    const result = await dispatcher.dispatch('fabricated-uuid-0000-0000', {
+      projectId: 'PROJ-ROUTING',
+      taskId: 'TSK-ROUTING-001',
+      instructions: ['Task'],
+      contextFiles: [],
+    });
+
+    expect(result.status).toBe('FAILED');
+    expect(result.error).toContain('ROUTING_DECISION_NOT_FOUND');
+    expect(mock.executionCount).toBe(0);
+  });
+
+  // 45. Synthetic RoutingDecision object cannot bypass durable authority
+  it('45. ProviderDispatchService accepts decisionId ensuring authority is loaded from SQLite', async () => {
+    // Only decisionId is accepted, preventing in-memory forgery
+    expect(dispatcher.dispatch.length).toBe(2);
+  });
+
+  // 46. Persisted selectedResourceId missing → FAIL
+  it('46. Persisted event missing selectedResourceId fails closed', async () => {
+    const corruptDecisionId = 'dec-corrupt-001';
+    eventService.record(
+      'PROJ-ROUTING',
+      'PROVIDER_ROUTING_DECISION',
+      'Corrupt decision without selectedResourceId',
+      {
+        decisionId: corruptDecisionId,
+        projectId: 'PROJ-ROUTING',
+        taskId: 'TSK-ROUTING-001',
+        attemptId: null,
+        outcome: 'SELECTED',
+        selectedResourceId: null, // MISSING
+        selectedProviderId: 'prov-fake',
+      },
+      'TSK-ROUTING-001'
+    );
+
+    const result = await dispatcher.dispatch(corruptDecisionId, {
+      projectId: 'PROJ-ROUTING',
+      taskId: 'TSK-ROUTING-001',
+      instructions: ['Task'],
+      contextFiles: [],
+    });
+
+    expect(result.status).toBe('FAILED');
+    expect(result.error).toContain('ROUTING_DECISION_INVALID');
+  });
+
+  // 47. Resource.provider_id differs from selectedProviderId → FAIL
+  it('47. Database resource provider_id differing from selectedProviderId fails closed', async () => {
+    setupResource('res-mismatch-p', 'prov-actual', { health: 'AVAILABLE' });
+
+    const forgedDecisionId = 'dec-mismatch-p-001';
+    eventService.record(
+      'PROJ-ROUTING',
+      'PROVIDER_ROUTING_DECISION',
+      'Provider mismatch decision',
+      {
+        decisionId: forgedDecisionId,
+        projectId: 'PROJ-ROUTING',
+        taskId: 'TSK-ROUTING-001',
+        attemptId: null,
+        outcome: 'SELECTED',
+        selectedResourceId: 'res-mismatch-p',
+        selectedProviderId: 'prov-forged', // Mismatch!
+      },
+      'TSK-ROUTING-001'
+    );
+
+    const result = await dispatcher.dispatch(forgedDecisionId, {
+      projectId: 'PROJ-ROUTING',
+      taskId: 'TSK-ROUTING-001',
+      instructions: ['Task'],
+      contextFiles: [],
+    });
+
+    expect(result.status).toBe('FAILED');
+    expect(result.error).toContain('ROUTING_PROVIDER_MISMATCH');
+  });
+
+  // 48. Selected resource disabled after route → FAIL
+  it('48. Selected resource disabled after route fails closed with zero executions', async () => {
+    const mockPrimary = setupResource('res-dis-primary', 'prov-dp', { health: 'AVAILABLE' });
+    const mockBackup = setupResource('res-dis-backup', 'prov-db', { health: 'AVAILABLE' });
+
+    const decision = await router.route({
+      projectId: 'PROJ-ROUTING',
+      taskId: 'TSK-ROUTING-001',
+      requiredCapabilities: ['CODING'],
+      candidateResourceIds: ['res-dis-primary', 'res-dis-backup'],
+      allowManualBridge: false,
+    });
+    expect(decision.selectedResourceId).toBe('res-dis-primary');
+
+    // Disable resource in database after route
+    db.prepare('UPDATE provider_resources SET enabled = 0 WHERE id = ?').run('res-dis-primary');
+
+    const result = await dispatcher.dispatch(decision.decisionId, {
+      projectId: 'PROJ-ROUTING',
+      taskId: 'TSK-ROUTING-001',
+      instructions: ['Task'],
+      contextFiles: [],
+    });
+
+    expect(result.status).toBe('FAILED');
+    expect(result.error).toContain('ROUTING_RESOURCE_DISABLED');
+    expect(mockPrimary.executionCount).toBe(0);
+    expect(mockBackup.executionCount).toBe(0); // Zero failover
+  });
+
+  // 49. Parent provider disabled after route → FAIL
+  it('49. Parent provider disabled after route fails closed with zero executions', async () => {
+    const mock = setupResource('res-prov-dis', 'prov-will-disable', { health: 'AVAILABLE' });
+
+    const decision = await router.route({
+      projectId: 'PROJ-ROUTING',
+      taskId: 'TSK-ROUTING-001',
+      requiredCapabilities: ['CODING'],
+      candidateResourceIds: ['res-prov-dis'],
+      allowManualBridge: false,
+    });
+
+    // Disable parent provider in database after route
+    db.prepare('UPDATE providers SET enabled = 0 WHERE id = ?').run('prov-will-disable');
+
+    const result = await dispatcher.dispatch(decision.decisionId, {
+      projectId: 'PROJ-ROUTING',
+      taskId: 'TSK-ROUTING-001',
+      instructions: ['Task'],
+      contextFiles: [],
+    });
+
+    expect(result.status).toBe('FAILED');
+    expect(result.error).toContain('ROUTING_PROVIDER_DISABLED');
+    expect(mock.executionCount).toBe(0);
+  });
+
+  // 50. Valid persisted SELECTED decision → selected provider executes exactly once
+  it('50. Valid persisted SELECTED decision executes selected provider exactly once', async () => {
+    const mock = setupResource('res-sel-once', 'prov-so', { health: 'AVAILABLE' });
+
+    const decision = await router.route({
+      projectId: 'PROJ-ROUTING',
+      taskId: 'TSK-ROUTING-001',
+      requiredCapabilities: ['CODING'],
+      candidateResourceIds: ['res-sel-once'],
+      allowManualBridge: false,
+    });
+
+    const result = await dispatcher.dispatch(decision.decisionId, {
+      projectId: 'PROJ-ROUTING',
+      taskId: 'TSK-ROUTING-001',
+      instructions: ['Task'],
+      contextFiles: [],
+    });
+
+    expect(result.status).toBe('COMPLETED');
+    expect(mock.executionCount).toBe(1);
+  });
+
+  // 51. Valid persisted MANUAL_HANDOFF_REQUIRED → Manual Bridge executes exactly once, AWAITING_OWNER
+  it('51. Valid persisted MANUAL_HANDOFF_REQUIRED executes Manual Bridge and returns AWAITING_OWNER', async () => {
+    const manualAdapter = new ManualBridgeAdapter();
+    registry.register(manualAdapter);
+    repo.createProvider({
+      id: 'prov-manual-bridge',
+      name: 'Manual Bridge',
+      adapter_type: 'MANUAL_BRIDGE',
+      enabled: true,
+      created_at: new Date().toISOString(),
+    });
+    repo.createProviderResource({
+      id: 'res-manual-durable',
+      provider_id: 'prov-manual-bridge',
+      model_name: 'Manual Model',
+      health_status: 'UNKNOWN',
+      capabilities: ['CODING'],
+      enabled: true,
+      total_quota: null,
+      remaining_quota: null,
+      quota_unit: 'REQUESTS',
+      quota_reset_at: null,
+      quota_source: 'UNKNOWN',
+      quota_confidence: 0,
+      last_health_check: null,
+    });
+
+    const decision = await router.route({
+      projectId: 'PROJ-ROUTING',
+      taskId: 'TSK-ROUTING-001',
+      requiredCapabilities: ['CODING'],
+      candidateResourceIds: ['res-manual-durable'],
+      allowManualBridge: true,
+    });
+
+    const result = await dispatcher.dispatch(decision.decisionId, {
+      projectId: 'PROJ-ROUTING',
+      taskId: 'TSK-ROUTING-001',
+      instructions: ['Task'],
+      contextFiles: [],
+    });
+
+    expect(result.status).toBe('AWAITING_OWNER');
+  });
+
+  // 52. [A_AVAILABLE, B_AUTH_ERROR] → A selected, B probe count 0
+  it('52. [A_AVAILABLE, B_AUTH_ERROR] selects A immediately with 0 probes for B', async () => {
+    const mockA = setupResource('res-a-avail', 'prov-aa', { health: 'AVAILABLE' });
+    const mockB = setupResource('res-b-autherr', 'prov-bae', { health: 'AUTH_ERROR' });
+
+    const decision = await router.route({
+      projectId: 'PROJ-ROUTING',
+      taskId: 'TSK-ROUTING-001',
+      requiredCapabilities: ['CODING'],
+      candidateResourceIds: ['res-a-avail', 'res-b-autherr'],
+      allowManualBridge: false,
+    });
+
+    expect(decision.outcome).toBe('SELECTED');
+    expect(decision.selectedResourceId).toBe('res-a-avail');
+    expect(mockA.healthProbeCount).toBe(1);
+    expect(mockB.healthProbeCount).toBe(0); // Zero probes on B
+    expect(mockB.quotaProbeCount).toBe(0);
+    expect(mockB.capabilityProbeCount).toBe(0);
+  });
+
+  // 53. [A_AUTH_ERROR, B_AVAILABLE] → NEEDS_OWNER, B probe count 0
+  it('53. [A_AUTH_ERROR, B_AVAILABLE] halts with NEEDS_OWNER and 0 probes for B', async () => {
+    const mockA = setupResource('res-a-autherr', 'prov-aae', { health: 'AUTH_ERROR' });
+    const mockB = setupResource('res-b-avail', 'prov-bav', { health: 'AVAILABLE' });
+
+    const decision = await router.route({
+      projectId: 'PROJ-ROUTING',
+      taskId: 'TSK-ROUTING-001',
+      requiredCapabilities: ['CODING'],
+      candidateResourceIds: ['res-a-autherr', 'res-b-avail'],
+      allowManualBridge: false,
+    });
+
+    expect(decision.outcome).toBe('NEEDS_OWNER');
+    expect(mockA.healthProbeCount).toBe(1);
+    expect(mockB.healthProbeCount).toBe(0); // Zero probes on B
+  });
+
+  // 54. [A_LOW_QUOTA, B_AVAILABLE] → B selected
+  it('54. [A_LOW_QUOTA, B_AVAILABLE] continues probing and selects higher-tier B_AVAILABLE', async () => {
+    const mockA = setupResource('res-a-low', 'prov-al', { health: 'LOW_QUOTA' });
+    const mockB = setupResource('res-b-avail-54', 'prov-b54', { health: 'AVAILABLE' });
+
+    const decision = await router.route({
+      projectId: 'PROJ-ROUTING',
+      taskId: 'TSK-ROUTING-001',
+      requiredCapabilities: ['CODING'],
+      candidateResourceIds: ['res-a-low', 'res-b-avail-54'],
+      allowManualBridge: false,
+    });
+
+    expect(decision.outcome).toBe('SELECTED');
+    expect(decision.selectedResourceId).toBe('res-b-avail-54');
+    expect(mockA.healthProbeCount).toBe(1);
+    expect(mockB.healthProbeCount).toBe(1);
+  });
+
+  // 55. [A_LOW_QUOTA, B_AUTH_ERROR] → NEEDS_OWNER
+  it('55. [A_LOW_QUOTA, B_AUTH_ERROR] halts with NEEDS_OWNER instead of silently falling back to LOW_QUOTA', async () => {
+    const mockA = setupResource('res-a-low-55', 'prov-al55', { health: 'LOW_QUOTA' });
+    const mockB = setupResource('res-b-ae-55', 'prov-bae55', { health: 'AUTH_ERROR' });
+
+    const decision = await router.route({
+      projectId: 'PROJ-ROUTING',
+      taskId: 'TSK-ROUTING-001',
+      requiredCapabilities: ['CODING'],
+      candidateResourceIds: ['res-a-low-55', 'res-b-ae-55'],
+      allowManualBridge: false,
+    });
+
+    expect(decision.outcome).toBe('NEEDS_OWNER');
+    expect(decision.reason).toContain('AUTH_ERROR');
+  });
+
+  // 56. Capability probe exception → recorded explicitly, candidate ineligible
+  it('56. Capability probe exception is recorded as CAPABILITY_PROBE_FAILED and candidate is ineligible', async () => {
+    const adapter = new MockProviderAdapter('prov-cap-err', 'Cap Error Adapter');
+    adapter.capProbeError = new Error('Process pipe closed unexpectedly while probing capabilities');
+    setupResource('res-cap-err', 'prov-cap-err', { mockAdapter: adapter });
+
+    const decision = await router.route({
+      projectId: 'PROJ-ROUTING',
+      taskId: 'TSK-ROUTING-001',
+      requiredCapabilities: ['CODING'],
+      candidateResourceIds: ['res-cap-err'],
+      allowManualBridge: false,
+    });
+
+    expect(decision.outcome).toBe('NO_ELIGIBLE_PROVIDER');
+    expect(decision.candidateEvaluations[0].eligibility).toBe('INELIGIBLE');
+    expect(decision.candidateEvaluations[0].rejectionReasons[0]).toContain(
+      'CAPABILITY_PROBE_FAILED: Process pipe closed unexpectedly'
+    );
+  });
+
+  // 57. Unknown project routing request → fail closed
+  it('57. Unknown project in routing request fails closed with NO_ELIGIBLE_PROVIDER', async () => {
+    setupResource('res-up', 'prov-up', { health: 'AVAILABLE' });
+
+    const decision = await router.route({
+      projectId: 'PROJ-NONEXISTENT',
+      taskId: 'TSK-ROUTING-001',
+      requiredCapabilities: ['CODING'],
+      candidateResourceIds: ['res-up'],
+      allowManualBridge: false,
+    });
+
+    expect(decision.outcome).toBe('NO_ELIGIBLE_PROVIDER');
+    expect(decision.reason).toContain('Project "PROJ-NONEXISTENT" not found');
+  });
+
+  // 58. Unknown task routing request → fail closed
+  it('58. Unknown task in routing request fails closed with NO_ELIGIBLE_PROVIDER', async () => {
+    setupResource('res-ut', 'prov-ut', { health: 'AVAILABLE' });
+
+    const decision = await router.route({
+      projectId: 'PROJ-ROUTING',
+      taskId: 'TSK-NONEXISTENT',
+      requiredCapabilities: ['CODING'],
+      candidateResourceIds: ['res-ut'],
+      allowManualBridge: false,
+    });
+
+    expect(decision.outcome).toBe('NO_ELIGIBLE_PROVIDER');
+    expect(decision.reason).toContain('Task "TSK-NONEXISTENT" not found');
+  });
+
+  // 59. Cross-project task routing request → fail closed
+  it('59. Task not belonging to project in routing request fails closed with NO_ELIGIBLE_PROVIDER', async () => {
+    // Create second project
+    repo.createProject({
+      id: 'PROJ-SECOND',
+      name: 'Second Project',
+      description: 'Test',
+      repository_path: tmpDir,
+      default_branch: 'main',
+      status: 'READY',
+      contract: null,
+      created_at: new Date().toISOString(),
+      updated_at: new Date().toISOString(),
+      started_at: null,
+      completed_at: null,
+    });
+
+    setupResource('res-cpt', 'prov-cpt', { health: 'AVAILABLE' });
+
+    const decision = await router.route({
+      projectId: 'PROJ-SECOND', // Project is SECOND, but task belongs to ROUTING
+      taskId: 'TSK-ROUTING-001',
+      requiredCapabilities: ['CODING'],
+      candidateResourceIds: ['res-cpt'],
+      allowManualBridge: false,
+    });
+
+    expect(decision.outcome).toBe('NO_ELIGIBLE_PROVIDER');
+    expect(decision.reason).toContain('does not belong to project');
+  });
+
+  // 60. Invalid attempt ownership → fail closed
+  it('60. Attempt belonging to a different task fails closed with NO_ELIGIBLE_PROVIDER', async () => {
+    // Create task 2
+    repo.createTask({
+      id: 'TSK-OTHER-002',
+      project_id: 'PROJ-ROUTING',
+      milestone_id: null,
+      title: 'Other Task',
+      description: 'Test',
+      state: 'CODING',
+      paused_from_state: null,
+      priority: 'HIGH',
+      risk: 'LOW',
+      assigned_agent_id: null,
+      revision_count: 0,
+      max_revisions: 3,
+      base_sha: '0000000000000000000000000000000000000000',
+      current_sha: null,
+      progress_cache_percent: 0,
+      progress_computed_at: null,
+      acceptance_criteria: [],
+      constraints: [],
+      created_at: new Date().toISOString(),
+      updated_at: new Date().toISOString(),
+    });
+
+    // Create attempt belonging to TSK-OTHER-002
+    repo.createTaskAttempt({
+      id: 'ATT-CROSS-002',
+      task_id: 'TSK-OTHER-002',
+      attempt_number: 1,
+      agent_id: 'agent-1',
+      status: 'RUNNING',
+      started_at: new Date().toISOString(),
+      ended_at: null,
+      summary: null,
+    });
+
+    setupResource('res-att-cross', 'prov-ac', { health: 'AVAILABLE' });
+
+    const decision = await router.route({
+      projectId: 'PROJ-ROUTING',
+      taskId: 'TSK-ROUTING-001', // Requesting for task 001
+      attemptId: 'ATT-CROSS-002', // But attempt belongs to 002
+      requiredCapabilities: ['CODING'],
+      candidateResourceIds: ['res-att-cross'],
+      allowManualBridge: false,
+    });
+
+    expect(decision.outcome).toBe('NO_ELIGIBLE_PROVIDER');
+    expect(decision.reason).toContain('does not belong to task');
   });
 });

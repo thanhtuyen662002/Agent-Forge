@@ -750,6 +750,44 @@ export class Repository {
     return this.getEvents(projectId, limit);
   }
 
+  public getEvent(id: string): EventRecord | null {
+    const row = this.db.prepare('SELECT * FROM events WHERE id = ?').get(id) as Record<string, unknown> | undefined;
+    if (!row) return null;
+    return {
+      id: String(row.id),
+      project_id: String(row.project_id),
+      task_id: row.task_id ? String(row.task_id) : null,
+      agent_id: row.agent_id ? String(row.agent_id) : null,
+      type: String(row.type),
+      summary: String(row.summary),
+      structured_payload: row.structured_payload_json ? JSON.parse(String(row.structured_payload_json)) : {},
+      timestamp: String(row.timestamp),
+    };
+  }
+
+  public getRoutingDecisionEvent(decisionId: string): EventRecord | null {
+    const row = this.db
+      .prepare(`
+        SELECT * FROM events
+        WHERE type = 'PROVIDER_ROUTING_DECISION'
+          AND (id = ? OR json_extract(structured_payload_json, '$.decisionId') = ?)
+        ORDER BY timestamp DESC
+        LIMIT 1
+      `)
+      .get(decisionId, decisionId) as Record<string, unknown> | undefined;
+    if (!row) return null;
+    return {
+      id: String(row.id),
+      project_id: String(row.project_id),
+      task_id: row.task_id ? String(row.task_id) : null,
+      agent_id: row.agent_id ? String(row.agent_id) : null,
+      type: String(row.type),
+      summary: String(row.summary),
+      structured_payload: row.structured_payload_json ? JSON.parse(String(row.structured_payload_json)) : {},
+      timestamp: String(row.timestamp),
+    };
+  }
+
   // ==========================================
   // Checkpoints & Handoffs
   // ==========================================

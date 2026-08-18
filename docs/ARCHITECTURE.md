@@ -165,7 +165,11 @@ Agent-Forge does not treat raw model strings as architectural truth. Providers, 
 - **Pre-Dispatch-Only Failover & AUTH_ERROR Hard Stop**:
   - Ineligible candidates (e.g. `RATE_LIMITED`, `OFFLINE`, `UNHEALTHY`) are skipped **before** dispatch.
   - Encountering `AUTH_ERROR` halts routing immediately with `NEEDS_OWNER` and zero failover to prevent silent authority or credential bypass.
-  - **Critical Safety Gate**: Once execution begins via `ProviderDispatchService`, automatic provider failover is strictly blocked. Post-dispatch errors (crashes, timeouts, policy denials, protocol failures) are returned directly to orchestration without retrying or switching providers.
+- **Durable Routing Authority & Dispatch Binding (`ProviderDispatchService`)**:
+  - `ProviderDispatchService.dispatch(decisionId, request)` loads the authoritative `PROVIDER_ROUTING_DECISION` event from SQLite storage. In-memory synthetic decisions cannot bypass durable authority.
+  - At the dispatch boundary, scope (`projectId`, `taskId`, `attemptId`), resource enablement, parent provider enablement, and adapter mappings are strictly validated against database truth before execution.
+  - **Zero Telemetry Re-probing**: Dispatch does NOT call `getHealth()`, `getQuota()`, or `getCapabilities()`. The durable `RoutingDecision` is the sole routing authority.
+  - If a selected resource or provider becomes disabled after routing, dispatch fails closed immediately (`ROUTING_RESOURCE_DISABLED` / `ROUTING_PROVIDER_DISABLED`) with zero fallback or rerouting.
 - **Durable Routing Audit Trail**: Every routing decision persists a `PROVIDER_ROUTING_DECISION` audit event in SQLite capturing decision ID, outcome, reason, and telemetry snapshots, free from prompts, instructions, or secrets. Pure routing never mutates task state or resource configuration.
 
 - **Provider Resource / Model**: Represents specific model endpoints with discrete:

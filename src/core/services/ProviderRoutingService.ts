@@ -41,6 +41,9 @@ export interface CandidateEvaluation {
 
 export interface RoutingDecision {
   decisionId: string;
+  projectId: string;
+  taskId: string;
+  attemptId: string | null;
   outcome: RoutingOutcome;
   selectedResourceId: string | null;
   selectedProviderId: string | null;
@@ -64,11 +67,93 @@ export class ProviderRoutingService {
   public async route(request: RoutingRequest): Promise<RoutingDecision> {
     const decisionId = crypto.randomUUID();
     const createdAt = new Date().toISOString();
+    const normalizedAttemptId = request.attemptId ?? null;
 
-    // 1. Validate candidate list presence
+    // 1. Validate Scope: Project, Task, and Attempt ownership
+    const project = this.repo.getProject(request.projectId);
+    if (!project) {
+      const decision: RoutingDecision = {
+        decisionId,
+        projectId: request.projectId,
+        taskId: request.taskId,
+        attemptId: normalizedAttemptId,
+        outcome: 'NO_ELIGIBLE_PROVIDER',
+        selectedResourceId: null,
+        selectedProviderId: null,
+        adapterType: null,
+        candidateEvaluations: [],
+        reason: `Project "${request.projectId}" not found in database.`,
+        createdAt,
+      };
+      this.recordDecisionEvent(request, decision);
+      return decision;
+    }
+
+    const task = this.repo.getTask(request.taskId);
+    if (!task) {
+      const decision: RoutingDecision = {
+        decisionId,
+        projectId: request.projectId,
+        taskId: request.taskId,
+        attemptId: normalizedAttemptId,
+        outcome: 'NO_ELIGIBLE_PROVIDER',
+        selectedResourceId: null,
+        selectedProviderId: null,
+        adapterType: null,
+        candidateEvaluations: [],
+        reason: `Task "${request.taskId}" not found in database.`,
+        createdAt,
+      };
+      this.recordDecisionEvent(request, decision);
+      return decision;
+    }
+
+    if (task.project_id !== request.projectId) {
+      const decision: RoutingDecision = {
+        decisionId,
+        projectId: request.projectId,
+        taskId: request.taskId,
+        attemptId: normalizedAttemptId,
+        outcome: 'NO_ELIGIBLE_PROVIDER',
+        selectedResourceId: null,
+        selectedProviderId: null,
+        adapterType: null,
+        candidateEvaluations: [],
+        reason: `Task "${request.taskId}" does not belong to project "${request.projectId}".`,
+        createdAt,
+      };
+      this.recordDecisionEvent(request, decision);
+      return decision;
+    }
+
+    if (request.attemptId) {
+      const attempt = this.repo.getTaskAttempt(request.attemptId);
+      if (!attempt || attempt.task_id !== request.taskId) {
+        const decision: RoutingDecision = {
+          decisionId,
+          projectId: request.projectId,
+          taskId: request.taskId,
+          attemptId: normalizedAttemptId,
+          outcome: 'NO_ELIGIBLE_PROVIDER',
+          selectedResourceId: null,
+          selectedProviderId: null,
+          adapterType: null,
+          candidateEvaluations: [],
+          reason: `TaskAttempt "${request.attemptId}" not found or does not belong to task "${request.taskId}".`,
+          createdAt,
+        };
+        this.recordDecisionEvent(request, decision);
+        return decision;
+      }
+    }
+
+    // 2. Validate candidate list presence
     if (!request.candidateResourceIds || request.candidateResourceIds.length === 0) {
       const decision: RoutingDecision = {
         decisionId,
+        projectId: request.projectId,
+        taskId: request.taskId,
+        attemptId: normalizedAttemptId,
         outcome: 'NO_ELIGIBLE_PROVIDER',
         selectedResourceId: null,
         selectedProviderId: null,
@@ -81,7 +166,7 @@ export class ProviderRoutingService {
       return decision;
     }
 
-    // 2. Reject duplicate candidate IDs explicitly
+    // 3. Reject duplicate candidate IDs explicitly
     const seenCandidateIds = new Set<string>();
     for (const resId of request.candidateResourceIds) {
       if (seenCandidateIds.has(resId)) {
@@ -93,8 +178,10 @@ export class ProviderRoutingService {
     }
 
     const candidateEvaluations: CandidateEvaluation[] = [];
+    let firstLowQuotaCandidate: CandidateEvaluation | null = null;
+    let firstManualBridgeCandidate: CandidateEvaluation | null = null;
 
-    // 3. Evaluate each candidate in explicit request order
+    // 4. Evaluate each candidate in explicit request order
     for (const resourceId of request.candidateResourceIds) {
       const resource = this.repo.getProviderResource(resourceId);
 
@@ -162,10 +249,9 @@ export class ProviderRoutingService {
         continue;
       }
 
-      // Safe non-null assertion since checked above
       const resolvedAdapter = adapter!;
 
-      // 4. Handle Manual Bridge candidate
+      // 5. Handle Manual Bridge candidate
       if (resolvedAdapter.adapterType === 'MANUAL_BRIDGE') {
         if (!request.allowManualBridge) {
           rejectionReasons.push(
@@ -173,7 +259,6 @@ export class ProviderRoutingService {
           );
         }
 
-        // Validate required capabilities against resource capabilities
         const missingCaps = request.requiredCapabilities.filter(
           (c) => !resource.capabilities.includes(c)
         );
@@ -184,7 +269,7 @@ export class ProviderRoutingService {
         }
 
         const isEligible = rejectionReasons.length === 0;
-        candidateEvaluations.push({
+        const evaluation: CandidateEvaluation = {
           resourceId,
           providerId: resource.provider_id,
           modelName: resource.model_name,
@@ -202,11 +287,16 @@ export class ProviderRoutingService {
           eligibility: isEligible ? 'ELIGIBLE' : 'INELIGIBLE',
           rejectionReasons,
           tier: isEligible ? 3 : undefined,
-        });
+        };
+        candidateEvaluations.push(evaluation);
+
+        if (isEligible && !firstManualBridgeCandidate) {
+          firstManualBridgeCandidate = evaluation;
+        }
         continue;
       }
 
-      // 5. Handle Automated Adapter candidate
+      // 6. Handle Automated Adapter candidate
       let liveHealth: ProviderHealthStatus = 'OFFLINE';
       let healthProbeError: string | null = null;
       try {
@@ -239,6 +329,9 @@ export class ProviderRoutingService {
 
         const decision: RoutingDecision = {
           decisionId,
+          projectId: request.projectId,
+          taskId: request.taskId,
+          attemptId: normalizedAttemptId,
           outcome: 'NEEDS_OWNER',
           selectedResourceId: null,
           selectedProviderId: null,
@@ -275,12 +368,12 @@ export class ProviderRoutingService {
         rejectionReasons.push(healthProbeError);
       }
 
-      // Check Capabilities: Subset of BOTH resource.capabilities and adapter.getCapabilities()
+      // Probe Capabilities: Subset of BOTH resource.capabilities and adapter.getCapabilities()
       let adapterCaps: Capability[] = [];
       try {
         adapterCaps = await resolvedAdapter.getCapabilities();
-      } catch {
-        adapterCaps = [];
+      } catch (err: any) {
+        rejectionReasons.push(`CAPABILITY_PROBE_FAILED: ${err.message}`);
       }
 
       const missingResourceCaps = request.requiredCapabilities.filter(
@@ -323,7 +416,7 @@ export class ProviderRoutingService {
       }
 
       const isEligible = rejectionReasons.length === 0;
-      candidateEvaluations.push({
+      const evaluation: CandidateEvaluation = {
         resourceId,
         providerId: resource.provider_id,
         modelName: resource.model_name,
@@ -335,63 +428,68 @@ export class ProviderRoutingService {
         eligibility: isEligible ? 'ELIGIBLE' : 'INELIGIBLE',
         rejectionReasons,
         tier: isEligible ? candidateTier : undefined,
-      });
+      };
+      candidateEvaluations.push(evaluation);
+
+      // BLOCKER 2: If candidate is AVAILABLE and fully eligible (Tier 1), immediately select and terminate further probing!
+      if (isEligible && candidateTier === 1) {
+        const decision: RoutingDecision = {
+          decisionId,
+          projectId: request.projectId,
+          taskId: request.taskId,
+          attemptId: normalizedAttemptId,
+          outcome: 'SELECTED',
+          selectedResourceId: evaluation.resourceId,
+          selectedProviderId: evaluation.providerId,
+          adapterType: resolvedAdapter.adapterType,
+          candidateEvaluations,
+          reason: `Selected AVAILABLE provider resource "${evaluation.resourceId}" (model: "${evaluation.modelName}").`,
+          createdAt,
+        };
+        this.recordDecisionEvent(request, decision);
+        return decision;
+      }
+
+      // If candidate is LOW_QUOTA (Tier 2), record it as fallback and continue searching for an AVAILABLE candidate
+      if (isEligible && candidateTier === 2 && !firstLowQuotaCandidate) {
+        firstLowQuotaCandidate = evaluation;
+      }
     }
 
-    // 6. Deterministic Selection
-    // Tier 1: First AVAILABLE automated candidate
-    const tier1Candidate = candidateEvaluations.find(
-      (c) => c.eligibility === 'ELIGIBLE' && c.tier === 1
-    );
-    if (tier1Candidate) {
-      const adapter = this.providerRegistry.resolve(tier1Candidate.providerId);
+    // 7. Post-Loop Deterministic Selection (if no Tier 1 AVAILABLE candidate was selected during the loop)
+    // Select first eligible LOW_QUOTA candidate if found
+    if (firstLowQuotaCandidate) {
+      const adapter = this.providerRegistry.resolve(firstLowQuotaCandidate.providerId);
       const decision: RoutingDecision = {
         decisionId,
+        projectId: request.projectId,
+        taskId: request.taskId,
+        attemptId: normalizedAttemptId,
         outcome: 'SELECTED',
-        selectedResourceId: tier1Candidate.resourceId,
-        selectedProviderId: tier1Candidate.providerId,
+        selectedResourceId: firstLowQuotaCandidate.resourceId,
+        selectedProviderId: firstLowQuotaCandidate.providerId,
         adapterType: adapter.adapterType,
         candidateEvaluations,
-        reason: `Selected AVAILABLE provider resource "${tier1Candidate.resourceId}" (model: "${tier1Candidate.modelName}").`,
+        reason: `Selected LOW_QUOTA provider resource "${firstLowQuotaCandidate.resourceId}" (model: "${firstLowQuotaCandidate.modelName}").`,
         createdAt,
       };
       this.recordDecisionEvent(request, decision);
       return decision;
     }
 
-    // Tier 2: First LOW_QUOTA automated candidate
-    const tier2Candidate = candidateEvaluations.find(
-      (c) => c.eligibility === 'ELIGIBLE' && c.tier === 2
-    );
-    if (tier2Candidate) {
-      const adapter = this.providerRegistry.resolve(tier2Candidate.providerId);
+    // Select first eligible Manual Bridge candidate if found
+    if (firstManualBridgeCandidate) {
       const decision: RoutingDecision = {
         decisionId,
-        outcome: 'SELECTED',
-        selectedResourceId: tier2Candidate.resourceId,
-        selectedProviderId: tier2Candidate.providerId,
-        adapterType: adapter.adapterType,
-        candidateEvaluations,
-        reason: `Selected LOW_QUOTA provider resource "${tier2Candidate.resourceId}" (model: "${tier2Candidate.modelName}").`,
-        createdAt,
-      };
-      this.recordDecisionEvent(request, decision);
-      return decision;
-    }
-
-    // Tier 3: Manual Bridge candidate (explicitly permitted)
-    const tier3Candidate = candidateEvaluations.find(
-      (c) => c.eligibility === 'ELIGIBLE' && c.tier === 3
-    );
-    if (tier3Candidate) {
-      const decision: RoutingDecision = {
-        decisionId,
+        projectId: request.projectId,
+        taskId: request.taskId,
+        attemptId: normalizedAttemptId,
         outcome: 'MANUAL_HANDOFF_REQUIRED',
-        selectedResourceId: tier3Candidate.resourceId,
-        selectedProviderId: tier3Candidate.providerId,
+        selectedResourceId: firstManualBridgeCandidate.resourceId,
+        selectedProviderId: firstManualBridgeCandidate.providerId,
         adapterType: 'MANUAL_BRIDGE',
         candidateEvaluations,
-        reason: `Manual Bridge resource "${tier3Candidate.resourceId}" selected for manual clipboard relay.`,
+        reason: `Manual Bridge resource "${firstManualBridgeCandidate.resourceId}" selected for manual clipboard relay.`,
         createdAt,
       };
       this.recordDecisionEvent(request, decision);
@@ -401,6 +499,9 @@ export class ProviderRoutingService {
     // No eligible candidate found
     const decision: RoutingDecision = {
       decisionId,
+      projectId: request.projectId,
+      taskId: request.taskId,
+      attemptId: normalizedAttemptId,
       outcome: 'NO_ELIGIBLE_PROVIDER',
       selectedResourceId: null,
       selectedProviderId: null,
@@ -417,15 +518,22 @@ export class ProviderRoutingService {
   private recordDecisionEvent(request: RoutingRequest, decision: RoutingDecision): void {
     if (!this.eventService) return;
 
+    // Respect database foreign keys: only persist event if project exists
+    const project = this.repo.getProject(request.projectId);
+    if (!project) return;
+
+    const task = this.repo.getTask(request.taskId);
+    const validTaskId = task && task.project_id === request.projectId ? request.taskId : undefined;
+
     this.eventService.record(
       request.projectId,
       'PROVIDER_ROUTING_DECISION',
       `Routing decision: ${decision.outcome} for task ${request.taskId} (${decision.reason})`,
       {
         decisionId: decision.decisionId,
-        projectId: request.projectId,
-        taskId: request.taskId,
-        attemptId: request.attemptId ?? null,
+        projectId: decision.projectId,
+        taskId: decision.taskId,
+        attemptId: decision.attemptId,
         candidateResourceIds: request.candidateResourceIds,
         selectedResourceId: decision.selectedResourceId,
         selectedProviderId: decision.selectedProviderId,
@@ -433,7 +541,7 @@ export class ProviderRoutingService {
         reason: decision.reason,
         candidateEvaluations: decision.candidateEvaluations,
       },
-      request.taskId
+      validTaskId
     );
   }
 }
