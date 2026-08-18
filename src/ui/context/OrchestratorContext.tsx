@@ -37,6 +37,23 @@ interface OrchestratorContextType {
   updateResourceQuota: (id: string, remaining: number | null, total: number | null, source: string, confidence: number) => Promise<void>;
   triggerEmergencyStop: (reason?: string) => Promise<any>;
   resumeProject: () => Promise<void>;
+  routeTask: (data: {
+    projectId: string;
+    taskId: string;
+    attemptId?: string | null;
+    candidateResourceIds: string[];
+    allowManualBridge: boolean;
+  }) => Promise<any>;
+  authorizeRoutedTask: (data: {
+    projectId: string;
+    taskId: string;
+    attemptId?: string | null;
+    routingDecisionId: string;
+    contextFiles?: string[];
+  }) => Promise<any>;
+  dispatchAuthorization: (authorizationId: string) => Promise<any>;
+  getOwnerHandoffSnapshot: (taskId: string) => Promise<any>;
+  generateAuthorizedWorkOrder: (authorizationId: string) => Promise<any>;
 }
 
 const OrchestratorContext = createContext<OrchestratorContextType | null>(null);
@@ -287,6 +304,49 @@ export const OrchestratorProvider: React.FC<{ children: React.ReactNode }> = ({ 
     await refreshData();
   };
 
+  const routeTask = async (data: {
+    projectId: string;
+    taskId: string;
+    attemptId?: string | null;
+    candidateResourceIds: string[];
+    allowManualBridge: boolean;
+  }) => {
+    if (!orchestrator) return { success: false, error: 'Desktop required.' };
+    const res = await orchestrator.routeTask(data);
+    await refreshData();
+    return res;
+  };
+
+  const authorizeRoutedTask = async (data: {
+    projectId: string;
+    taskId: string;
+    attemptId?: string | null;
+    routingDecisionId: string;
+    contextFiles?: string[];
+  }) => {
+    if (!orchestrator) return { success: false, error: 'Desktop required.' };
+    const res = await orchestrator.authorizeRoutedTask(data);
+    await refreshData();
+    return res;
+  };
+
+  const dispatchAuthorization = async (authorizationId: string) => {
+    if (!orchestrator) return { success: false, error: 'Desktop required.' };
+    const res = await orchestrator.dispatchAuthorization(authorizationId);
+    await refreshData();
+    return res;
+  };
+
+  const getOwnerHandoffSnapshot = async (taskId: string) => {
+    if (!orchestrator) return { success: false, error: 'Desktop required.' };
+    return orchestrator.getOwnerHandoffSnapshot(taskId);
+  };
+
+  const generateAuthorizedWorkOrder = async (authorizationId: string) => {
+    if (!orchestrator) return { success: false, error: 'Desktop required.' };
+    return orchestrator.generateAuthorizedWorkOrder(authorizationId);
+  };
+
   return (
     <OrchestratorContext.Provider
       value={{
@@ -321,6 +381,11 @@ export const OrchestratorProvider: React.FC<{ children: React.ReactNode }> = ({ 
         updateResourceQuota,
         triggerEmergencyStop,
         resumeProject,
+        routeTask,
+        authorizeRoutedTask,
+        dispatchAuthorization,
+        getOwnerHandoffSnapshot,
+        generateAuthorizedWorkOrder,
       }}
     >
       {children}

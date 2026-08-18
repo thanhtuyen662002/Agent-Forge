@@ -406,21 +406,21 @@ export class Repository {
             AND project_id = ?
             AND protocol = 'manager.v1'
             AND status = 'APPLIED'
-          ORDER BY created_at DESC, id DESC
+          ORDER BY created_at DESC, rowid DESC
           LIMIT 1
         `)
         .get(taskId, projectId) as Record<string, unknown> | undefined;
       return row ?? null;
     }
     const row = this.db
-      .prepare(`
-        SELECT * FROM protocol_messages
-        WHERE task_id = ?
-          AND protocol = 'manager.v1'
-          AND status = 'APPLIED'
-        ORDER BY created_at DESC, id DESC
-        LIMIT 1
-      `)
+        .prepare(`
+          SELECT * FROM protocol_messages
+          WHERE task_id = ?
+            AND protocol = 'manager.v1'
+            AND status = 'APPLIED'
+          ORDER BY created_at DESC, rowid DESC
+          LIMIT 1
+        `)
       .get(taskId) as Record<string, unknown> | undefined;
     return row ?? null;
   }
@@ -824,6 +824,30 @@ export class Repository {
     };
   }
 
+  public getLatestRoutingDecisionEventByTask(projectId: string, taskId: string): EventRecord | null {
+    const row = this.db
+      .prepare(`
+        SELECT * FROM events
+        WHERE project_id = ?
+          AND task_id = ?
+          AND type = 'PROVIDER_ROUTING_DECISION'
+        ORDER BY timestamp DESC, rowid DESC
+        LIMIT 1
+      `)
+      .get(projectId, taskId) as Record<string, unknown> | undefined;
+    if (!row) return null;
+    return {
+      id: String(row.id),
+      project_id: String(row.project_id),
+      task_id: row.task_id ? String(row.task_id) : null,
+      agent_id: row.agent_id ? String(row.agent_id) : null,
+      type: String(row.type),
+      summary: String(row.summary),
+      structured_payload: row.structured_payload_json ? JSON.parse(String(row.structured_payload_json)) : {},
+      timestamp: String(row.timestamp),
+    };
+  }
+
   // ==========================================
   // Execution Authorizations (PR #7)
   // ==========================================
@@ -835,9 +859,9 @@ export class Repository {
           repository_head_sha, manager_message_id, manager_payload_hash,
           routing_decision_id, selected_resource_id, selected_provider_id,
           instruction_payload_hash, context_manifest_hash,
-          canonical_instructions_json, context_files_json, status,
+          canonical_instructions_json, context_files_json, canonical_payload_json, status,
           created_at, dispatched_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       `)
       .run(
         auth.id,
@@ -856,6 +880,7 @@ export class Repository {
         auth.context_manifest_hash,
         auth.canonical_instructions_json,
         auth.context_files_json,
+        auth.canonical_payload_json ?? null,
         auth.status,
         auth.created_at,
         auth.dispatched_at
@@ -882,6 +907,7 @@ export class Repository {
       context_manifest_hash: String(row.context_manifest_hash),
       canonical_instructions_json: String(row.canonical_instructions_json),
       context_files_json: String(row.context_files_json),
+      canonical_payload_json: row.canonical_payload_json != null ? String(row.canonical_payload_json) : null,
       status: row.status as ExecutionAuthorizationStatus,
       created_at: String(row.created_at),
       dispatched_at: row.dispatched_at ? String(row.dispatched_at) : null,
@@ -952,6 +978,7 @@ export class Repository {
       context_manifest_hash: String(row.context_manifest_hash),
       canonical_instructions_json: String(row.canonical_instructions_json),
       context_files_json: String(row.context_files_json),
+      canonical_payload_json: row.canonical_payload_json != null ? String(row.canonical_payload_json) : null,
       status: row.status as ExecutionAuthorizationStatus,
       created_at: String(row.created_at),
       dispatched_at: row.dispatched_at ? String(row.dispatched_at) : null,

@@ -131,7 +131,10 @@ app.whenReady().then(() => {
     bootstrapInstance.projectService,
     bootstrapInstance.taskService,
     bootstrapInstance.verificationService,
-    bootstrapInstance.emergencyStopService
+    bootstrapInstance.emergencyStopService,
+    bootstrapInstance.providerRoutingService,
+    bootstrapInstance.executionAuthorizationService,
+    bootstrapInstance.providerDispatchService
   );
 
   // Create Desktop Window

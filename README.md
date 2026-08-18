@@ -19,7 +19,7 @@ Agent-Forge guarantees that the durable source of truth resides entirely in:
 
 ---
 
-## Current Status: `DURABLE_EXECUTION_AUTHORIZATION_FOUNDATION`
+## Current Status: `OWNER_ROUTING_MANUAL_BRIDGE_LOOP`
 
 - **Core Foundation & Database Migrations (PR #1)**: **IMPLEMENTED & VERIFIED** (SQLite WAL mode, strict foreign keys, state machine, Git ground truth).
 - **Continuous Integration Pipeline (PR #2)**: **IMPLEMENTED & VERIFIED** (Multi-platform Windows & Ubuntu CI with diff hygiene).
@@ -27,6 +27,7 @@ Agent-Forge guarantees that the durable source of truth resides entirely in:
 - **Provider Integration Foundation (PR #5)**: **IMPLEMENTED & VERIFIED** (Manual Bridge truthful adapter, process runner isolation, Codex CLI contract fail-closed boundary, Antigravity manual-only).
 - **Deterministic Quota-Aware Routing (PR #6)**: **IMPLEMENTED & VERIFIED** (Pre-dispatch failover, tier-based eligibility, AUTH_ERROR hard stop, durable routing decision events).
 - **Durable Execution Authorization (PR #7)**: **IMPLEMENTED & VERIFIED** (Immutable `ExecutionAuthorization` binding exact approved work payloads, canonical payload hashes, context manifest containment, and atomic one-time dispatch claims).
+- **Owner Routing & Manual Bridge UI Loop (PR #8)**: **IMPLEMENTED & VERIFIED** (Human-in-the-Loop routing controller, explicit candidate reordering, truthful UNKNOWN quota rendering, typed single-argument dispatch IPC, 1-click WorkOrder copy, and durable restart reconstruction).
 - **Automated Production Providers**: Production Codex CLI remains `OFFLINE` (`capabilities=[]`, fails closed without spawning processes) on hosts without verified contracts. System operates reliably via the **Owner Manual Bridge**.
 - **Code Signing**: **UNSIGNED FOUNDATION** (`CODE_SIGNED=NO`; code-signing certificates and auto-update are intentionally deferred).
 
@@ -34,16 +35,17 @@ Agent-Forge guarantees that the durable source of truth resides entirely in:
 
 ## Operating Modes
 
-### MVP Operating Mode (Manual Bridge)
-In the initial release, the human owner serves as the manual transport bridge:
-1. Owner pastes **ChatGPT Manager** responses into the **Manager Inbox**.
-2. Agent-Forge validates the structured `manager.v1` protocol, records it in the idempotent message ledger, updates the task state machine, and produces a **Work Order**.
-3. Owner copies the **Work Order** into **Gemini Coder** (or another coding model).
-4. Owner pastes the resulting **Coder Report** into the **Coder Inbox**.
-5. Agent-Forge validates `coder.v1`, gathers real Git diffs, runs configured verification commands (test, lint, build), stores evidence in the `ArtifactStore`, and generates a **Review Package**.
-6. Owner copies the **Review Package** back to **ChatGPT Manager** for evaluation.
+### Human-in-the-Loop Operating Mode (Owner Manual Relay)
+In the current release, the human owner operates the manual routing and handoff loop from the desktop UI:
+1. Owner pastes **ChatGPT Manager** responses into the **Manager Inbox** to record and apply `EXECUTE` / `FIX_REQUIRED` protocol decisions.
+2. In the **Owner Routing / Handoff** view, the Owner reviews task authority, explicitly selects and orders candidate `ProviderResource` instances (starts empty; no implicit provider auto-selection), and explicitly opts into Manual Bridge fallback.
+3. The Owner triggers deterministic routing (`ProviderRoutingService.route`) and generates an immutable `ExecutionAuthorization` bound to durable Manager authority and Git repository HEAD.
+4. The Owner dispatches the execution, consuming the authorization (`DISPATCHED`) with atomic replay protection.
+5. If the outcome is `MANUAL_HANDOFF_REQUIRED`, the task enters `AWAITING_OWNER`. The Owner clicks **Generate Authorized WorkOrder** to construct the canonical prompt derived strictly from the immutable execution authorization instructions, then clicks **1-Click Copy WorkOrder** to copy the prompt to clipboard.
+6. The Owner manually pastes the prompt into **Gemini Coder**.
+7. The Owner pastes Gemini's `coder.v1` response into the **Coder Inbox** to execute verification tests and capture authoritative Git diff evidence.
 
-> **Zero Scraping Policy**: Agent-Forge does **NOT** automate ChatGPT Web, extract session cookies, or bypass provider rate limits. All automated adapters in future phases will use official, supported provider APIs and CLI tools.
+> **Zero Automation & Zero Scraping Policy**: Agent-Forge does **NOT** automate ChatGPT Web, Gemini Web, or Antigravity GUI, extract session cookies, or run background clipboard polling. All automated adapters in future phases will use official, supported provider APIs and CLI tools.
 
 ---
 

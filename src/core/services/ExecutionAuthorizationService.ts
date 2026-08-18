@@ -1,5 +1,6 @@
 import crypto from 'crypto';
 import path from 'path';
+import { z } from 'zod';
 import { Repository } from '../database/repositories';
 import { EventService } from './EventService';
 import { PolicyService } from './PolicyService';
@@ -19,19 +20,23 @@ export interface CreateAuthorizationParams {
   contextFiles?: string[];
 }
 
-export interface CanonicalExecutionPayload {
-  projectId: string;
-  taskId: string;
-  attemptId: string | null;
-  taskTitle: string;
-  taskDescription: string | null;
-  acceptanceCriteria: string[];
-  constraints: string[];
-  instructions: string[];
-  contextFiles: string[];
-  managerMessageId: string;
-  managerPayloadHash: string;
-}
+export const CanonicalExecutionPayloadSchema = z
+  .object({
+    projectId: z.string().min(1),
+    taskId: z.string().min(1),
+    attemptId: z.string().nullable(),
+    taskTitle: z.string().min(1),
+    taskDescription: z.string().nullable(),
+    acceptanceCriteria: z.array(z.string()),
+    constraints: z.array(z.string()),
+    instructions: z.array(z.string()),
+    contextFiles: z.array(z.string()),
+    managerMessageId: z.string().min(1),
+    managerPayloadHash: z.string().min(1),
+  })
+  .strict();
+
+export type CanonicalExecutionPayload = z.infer<typeof CanonicalExecutionPayloadSchema>;
 
 export function buildCanonicalInstructions(
   task: {
@@ -396,6 +401,7 @@ export class ExecutionAuthorizationService {
       managerMessageId,
       managerPayloadHash,
     });
+    const canonicalPayloadJson = JSON.stringify(canonicalPayload);
     const instructionPayloadHash = computePayloadHash(canonicalPayload);
 
     // 9. Create ExecutionAuthorization Record
@@ -416,6 +422,7 @@ export class ExecutionAuthorizationService {
       context_manifest_hash: contextManifestHash,
       canonical_instructions_json: JSON.stringify(canonicalInstructions),
       context_files_json: JSON.stringify(canonicalContextFiles),
+      canonical_payload_json: canonicalPayloadJson,
       status: 'AUTHORIZED',
       created_at: createdAt,
       dispatched_at: null,

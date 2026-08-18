@@ -486,6 +486,7 @@ export interface ExecutionAuthorization {
   context_manifest_hash: string;
   canonical_instructions_json: string;
   context_files_json: string;
+  canonical_payload_json: string | null;
   status: ExecutionAuthorizationStatus;
   created_at: string;
   dispatched_at: string | null;
