@@ -4,10 +4,17 @@
   "description": "Local AI Engineering Orchestrator / Owner Control Center",
   "main": "dist-electron/electron/main.js",
   "type": "module",
+  "engines": {
+    "node": ">=22.12.0"
+  },
   "scripts": {
     "dev": "vite",
-    "dev:electron": "tsc -p tsconfig.node.json && electron .",
-    "build": "tsc --noEmit && vite build && tsc -p tsconfig.node.json",
+    "dev:electron": "npm run build && electron .",
+    "build": "tsc --noEmit && vite build && tsc -p tsconfig.node.json && node -e \"fs.writeFileSync('dist-electron/package.json', JSON.stringify({type: 'commonjs'}, null, 2))\"",
+    "package:win:dir": "npm run build && npx @electron/rebuild -f -w better-sqlite3 && electron-builder --win --dir",
+    "package:win": "npm run build && npx @electron/rebuild -f -w better-sqlite3 && electron-builder --win nsis",
+    "smoke:packaged:win": "powershell -ExecutionPolicy Bypass -File scripts/smoke-packaged-win.ps1",
+    "smoke:dev:electron": "powershell -ExecutionPolicy Bypass -File scripts/smoke-dev-electron.ps1",
     "test": "vitest run",
     "test:watch": "vitest"
   },
@@ -21,6 +28,7 @@
     "zod": "^3.24.2"
   },
   "devDependencies": {
+    "@electron/rebuild": "^4.2.0",
     "@types/better-sqlite3": "^7.6.12",
     "@types/node": "^22.13.4",
     "@types/react": "^19.0.10",
@@ -28,6 +36,7 @@
     "@vitejs/plugin-react": "^4.3.4",
     "autoprefixer": "^10.4.20",
     "electron": "^34.2.0",
+    "electron-builder": "^26.15.3",
     "postcss": "^8.5.2",
     "tailwindcss": "^3.4.17",
     "typescript": "^5.7.3",

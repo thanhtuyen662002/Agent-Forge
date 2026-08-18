@@ -1,12 +1,14 @@
 import { app, BrowserWindow } from 'electron';
 import path from 'path';
+import fs from 'fs';
 import { BootstrapService, BootstrapResult } from '../core/services/BootstrapService';
 import { registerIpcHandlers } from './ipcHandlers';
+import { resolveRendererTarget } from './pathHelper';
 
 let mainWindow: BrowserWindow | null = null;
 let bootstrapInstance: BootstrapResult | null = null;
 
-function createWindow(): void {
+function createWindow(userDataDir: string): void {
   mainWindow = new BrowserWindow({
     width: 1400,
     height: 900,
@@ -21,6 +23,70 @@ function createWindow(): void {
       sandbox: true,
     },
   });
+
+  // Deterministic Smoke Mode: Record verified renderer readiness
+  if (process.env.AGENT_FORGE_SMOKE_MODE === '1') {
+    const reportPath = path.join(userDataDir, 'smoke-ready.json');
+
+    mainWindow.webContents.on('did-finish-load', async () => {
+      try {
+        const result = await mainWindow!.webContents.executeJavaScript(`
+          new Promise((resolve) => {
+            var start = Date.now();
+            function check() {
+              var root = document.querySelector('#root');
+              var count = root ? root.children.length : 0;
+              if (count > 0 || (Date.now() - start > 4000)) {
+                resolve({
+                  location: window.location.href,
+                  rootExists: !!root,
+                  rootChildCount: count
+                });
+              } else {
+                setTimeout(check, 50);
+              }
+            }
+            check();
+          })
+        `);
+
+        const report = {
+          status: result.rootExists && result.rootChildCount > 0 ? 'READY' : 'FAILED',
+          rendererUrl: result.location,
+          rootExists: result.rootExists,
+          rootChildCount: result.rootChildCount,
+          windowTitle: mainWindow ? mainWindow.getTitle() : '',
+          isPackaged: app.isPackaged,
+          sqliteInitialized: bootstrapInstance !== null,
+          timestamp: new Date().toISOString(),
+        };
+
+        fs.writeFileSync(reportPath, JSON.stringify(report, null, 2), 'utf-8');
+      } catch (err: any) {
+        const errorReport = {
+          status: 'FAILED',
+          error: String(err),
+          isPackaged: app.isPackaged,
+          sqliteInitialized: bootstrapInstance !== null,
+          timestamp: new Date().toISOString(),
+        };
+        fs.writeFileSync(reportPath, JSON.stringify(errorReport, null, 2), 'utf-8');
+      }
+    });
+
+    mainWindow.webContents.on('did-fail-load', (_event, errorCode, errorDescription, validatedURL) => {
+      const failReport = {
+        status: 'FAILED',
+        errorCode,
+        errorDescription,
+        validatedURL,
+        isPackaged: app.isPackaged,
+        sqliteInitialized: bootstrapInstance !== null,
+        timestamp: new Date().toISOString(),
+      };
+      fs.writeFileSync(reportPath, JSON.stringify(failReport, null, 2), 'utf-8');
+    });
+  }
 
   // Strict Navigation Guard: Block uncontrolled external navigation
   mainWindow.webContents.on('will-navigate', (event, url) => {
@@ -38,12 +104,16 @@ function createWindow(): void {
     return { action: 'deny' };
   });
 
-  if (process.env.VITE_DEV_SERVER_URL) {
-    mainWindow.loadURL(process.env.VITE_DEV_SERVER_URL);
-  } else if (!app.isPackaged) {
-    mainWindow.loadURL('http://localhost:5173');
+  const rendererTarget = resolveRendererTarget({
+    isPackaged: app.isPackaged,
+    appPath: app.getAppPath(),
+    devServerUrl: process.env.VITE_DEV_SERVER_URL,
+  });
+
+  if (rendererTarget.type === 'url') {
+    mainWindow.loadURL(rendererTarget.target);
   } else {
-    mainWindow.loadFile(path.join(__dirname, '../dist/index.html'));
+    mainWindow.loadFile(rendererTarget.target);
   }
 
   mainWindow.on('closed', () => {
@@ -52,7 +122,7 @@ function createWindow(): void {
 }
 
 app.whenReady().then(() => {
-  const userDataDir = app.getPath('userData');
+  const userDataDir = process.env.AGENT_FORGE_DATA_DIR || app.getPath('userData');
   bootstrapInstance = BootstrapService.initialize(userDataDir);
 
   // Register Typed & Validated IPC Handlers
@@ -65,11 +135,11 @@ app.whenReady().then(() => {
   );
 
   // Create Desktop Window
-  createWindow();
+  createWindow(userDataDir);
 
   app.on('activate', () => {
     if (BrowserWindow.getAllWindows().length === 0) {
-      createWindow();
+      createWindow(userDataDir);
     }
   });
 });
