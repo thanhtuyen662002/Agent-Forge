@@ -224,6 +224,56 @@ export class Repository {
   }
 
   // ==========================================
+  // Task Attempts
+  // ==========================================
+  public createTaskAttempt(attempt: TaskAttempt): void {
+    this.db
+      .prepare(`
+        INSERT INTO task_attempts (id, task_id, attempt_number, agent_id, status, started_at, ended_at, summary)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+      `)
+      .run(
+        attempt.id,
+        attempt.task_id,
+        attempt.attempt_number,
+        attempt.agent_id,
+        attempt.status,
+        attempt.started_at,
+        attempt.ended_at,
+        attempt.summary
+      );
+  }
+
+  public getTaskAttempt(id: string): TaskAttempt | null {
+    const row = this.db.prepare('SELECT * FROM task_attempts WHERE id = ?').get(id) as Record<string, unknown> | undefined;
+    if (!row) return null;
+    return {
+      id: String(row.id),
+      task_id: String(row.task_id),
+      attempt_number: Number(row.attempt_number),
+      agent_id: String(row.agent_id),
+      status: row.status as any,
+      started_at: String(row.started_at),
+      ended_at: row.ended_at ? String(row.ended_at) : null,
+      summary: row.summary ? String(row.summary) : null,
+    };
+  }
+
+  public getTaskAttemptsByTask(taskId: string): TaskAttempt[] {
+    const rows = this.db.prepare('SELECT * FROM task_attempts WHERE task_id = ? ORDER BY attempt_number ASC').all(taskId) as Record<string, unknown>[];
+    return rows.map((r) => ({
+      id: String(r.id),
+      task_id: String(r.task_id),
+      attempt_number: Number(r.attempt_number),
+      agent_id: String(r.agent_id),
+      status: r.status as any,
+      started_at: String(r.started_at),
+      ended_at: r.ended_at ? String(r.ended_at) : null,
+      summary: r.summary ? String(r.summary) : null,
+    }));
+  }
+
+  // ==========================================
   // Task Leases (Real Concurrency Locks)
   // ==========================================
   public acquireTaskLease(taskId: string, agentId: string, leaseToken: string, ttlMs: number = 300000): boolean {
@@ -348,6 +398,18 @@ export class Repository {
       .run(provider.id, provider.name, provider.adapter_type, provider.enabled ? 1 : 0, provider.created_at);
   }
 
+  public getProvider(id: string): Provider | null {
+    const row = this.db.prepare('SELECT * FROM providers WHERE id = ?').get(id) as Record<string, unknown> | undefined;
+    if (!row) return null;
+    return {
+      id: String(row.id),
+      name: String(row.name),
+      adapter_type: row.adapter_type as any,
+      enabled: Boolean(row.enabled),
+      created_at: String(row.created_at),
+    };
+  }
+
   public getAllProviders(): Provider[] {
     const rows = this.db.prepare('SELECT * FROM providers ORDER BY name ASC').all() as Record<string, unknown>[];
     return rows.map((r) => ({
@@ -383,6 +445,26 @@ export class Repository {
         resource.quota_confidence,
         resource.last_health_check
       );
+  }
+
+  public getProviderResource(id: string): ProviderResource | null {
+    const row = this.db.prepare('SELECT * FROM provider_resources WHERE id = ?').get(id) as Record<string, unknown> | undefined;
+    if (!row) return null;
+    return {
+      id: String(row.id),
+      provider_id: String(row.provider_id),
+      model_name: String(row.model_name),
+      health_status: row.health_status as any,
+      capabilities: row.capabilities_json ? JSON.parse(String(row.capabilities_json)) : [],
+      enabled: Boolean(row.enabled),
+      total_quota: row.total_quota !== null ? Number(row.total_quota) : null,
+      remaining_quota: row.remaining_quota !== null ? Number(row.remaining_quota) : null,
+      quota_unit: String(row.quota_unit),
+      quota_reset_at: row.quota_reset_at ? String(row.quota_reset_at) : null,
+      quota_source: row.quota_source as any,
+      quota_confidence: Number(row.quota_confidence),
+      last_health_check: row.last_health_check ? String(row.last_health_check) : null,
+    };
   }
 
   public getAllProviderResources(): ProviderResource[] {

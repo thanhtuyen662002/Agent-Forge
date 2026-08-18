@@ -1,9 +1,10 @@
 import { ProviderAdapter, QuotaSnapshotInfo, AgentExecutionRequest, AgentExecutionResult } from './ProviderAdapter';
-import { Capability, ProviderHealthStatus } from '../types/domain';
+import { Capability, ProviderHealthStatus, ProviderAdapterType } from '../types/domain';
 
 export class ManualBridgeAdapter implements ProviderAdapter {
   public id: string = 'prov-manual-bridge';
   public name: string = 'Owner Manual Bridge';
+  public adapterType: ProviderAdapterType = 'MANUAL_BRIDGE';
 
   public async getCapabilities(): Promise<Capability[]> {
     return [
@@ -37,8 +38,9 @@ export class ManualBridgeAdapter implements ProviderAdapter {
     // In manual bridge mode, execution is performed via Owner clipboard copy/paste
     return {
       executionId: `manual-exec-${Date.now()}`,
-      status: 'COMPLETED',
+      status: 'AWAITING_OWNER',
       outputProtocol: 'Awaiting Owner Manual Relay via Manual Bridge',
+      rawResponse: 'Awaiting Owner Manual Relay via Manual Bridge',
     };
   }
 
