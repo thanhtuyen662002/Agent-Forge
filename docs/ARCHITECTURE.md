@@ -148,10 +148,20 @@ interface ProcessExecutionRequest {
 
 ## 6. Provider Resource & Model Architecture
 
-Agent-Forge does not treat raw model strings as architectural truth. Providers and models are modeled explicitly:
+Agent-Forge does not treat raw model strings as architectural truth. Providers, adapters, and resources are modeled explicitly:
 
-- **Provider**: Represents the service endpoint (e.g. `MANUAL_BRIDGE`, `LOCAL_CLI`, `OPENAI_COMPLIANT`).
-- **Provider Resource / Model**: Represents specific model endpoints (e.g. `gpt-4o`, `gemini-1.5-pro`) with discrete:
+### ProviderRegistry & Adapters
+- **ProviderRegistry**: In-memory adapter lookup registry with unique ID enforcement. Rejects duplicate IDs and fails closed on unregistered provider requests without silent fallback or autonomous routing.
+- **Manual Bridge Adapter (`prov-manual-bridge`)**: Reference/fallback adapter that returns `AWAITING_OWNER` status (never `COMPLETED`) to preserve lifecycle truthfulness during manual relay.
+- **Local CLI Adapter Foundation (`LocalCliAdapterBase`)**:
+  - Executes local tools (e.g. `CodexCliAdapter`, `AntigravityCliAdapter`) safely through `ProcessRunner` with `shell: false`.
+  - Enforces project repository `cwd` and validates all context file paths via `PolicyService` (rejecting directory traversal `../` and sensitive files like `.env`).
+  - Passes prompt securely via `child.stdin` without leaking sensitive instructions into command-line arguments or `process_runs.command`.
+  - Binds process lifecycle to `projectId`, `taskId`, and `attemptId`, writing durable stdout/stderr `Evidence` records.
+  - Validates exit 0 outputs with `ProtocolParser` against Zod `CoderProtocolSchema` before marking execution as `COMPLETED`. Exit 0 without valid protocol yields `FAILED` (`PROTOCOL_INVALID`).
+  - Probes health truthfully (`AVAILABLE`, `OFFLINE`, `AUTH_ERROR`) and reports `UNKNOWN` quota with `0.0` confidence without estimation.
+
+- **Provider Resource / Model**: Represents specific model endpoints with discrete:
   - Health status (`AVAILABLE`, `LOW_QUOTA`, `RATE_LIMITED`, `QUOTA_EXHAUSTED`, `OFFLINE`, `UNKNOWN`)
   - Quota snapshot with confidence rating (`MEASURED`, `PROVIDER_REPORTED`, `MANUAL`, `ESTIMATED`, `UNKNOWN`)
   - Supported capabilities (`CODING`, `PLANNING`, `REVIEW`, `SECURITY_REVIEW`, `LARGE_CONTEXT`, etc.)

@@ -11,6 +11,10 @@ import { ProjectService } from './ProjectService';
 import { TaskService } from './TaskService';
 import { VerificationService } from './VerificationService';
 import { EmergencyStopService } from './EmergencyStopService';
+import { ProviderRegistry } from '../adapters/ProviderRegistry';
+import { ManualBridgeAdapter } from '../adapters/ManualBridgeAdapter';
+import { CodexCliAdapter } from '../adapters/CodexCliAdapter';
+import { AntigravityCliAdapter } from '../adapters/AntigravityCliAdapter';
 
 export interface BootstrapResult {
   db: Database.Database;
@@ -22,25 +26,26 @@ export interface BootstrapResult {
   taskService: TaskService;
   verificationService: VerificationService;
   emergencyStopService: EmergencyStopService;
+  providerRegistry: ProviderRegistry;
 }
 
 export class BootstrapService {
   public static seedDefaultResources(repo: Repository): void {
-    const providers = repo.getAllProviders();
-    if (providers.length === 0) {
-      const now = new Date().toISOString();
+    const now = new Date().toISOString();
 
-      // 1. Manual Bridge Provider
-      const manualProvider = {
+    // 1. Manual Bridge Provider (idempotent check by ID)
+    if (!repo.getProvider('prov-manual-bridge')) {
+      repo.createProvider({
         id: 'prov-manual-bridge',
         name: 'Owner Manual Bridge',
         adapter_type: 'MANUAL_BRIDGE' as const,
         enabled: true,
         created_at: now,
-      };
-      repo.createProvider(manualProvider);
+      });
+    }
 
-      // 2. Initial Provider Resources with UNKNOWN status & unmeasured quota (Truth in Observability)
+    // 2. Initial Provider Resources with UNKNOWN status & unmeasured quota (Truth in Observability)
+    if (!repo.getProviderResource('res-chatgpt-manager')) {
       repo.createProviderResource({
         id: 'res-chatgpt-manager',
         provider_id: 'prov-manual-bridge',
@@ -56,7 +61,9 @@ export class BootstrapService {
         quota_confidence: 0.0,
         last_health_check: null,
       });
+    }
 
+    if (!repo.getProviderResource('res-gemini-coder')) {
       repo.createProviderResource({
         id: 'res-gemini-coder',
         provider_id: 'prov-manual-bridge',
@@ -72,8 +79,10 @@ export class BootstrapService {
         quota_confidence: 0.0,
         last_health_check: null,
       });
+    }
 
-      // 3. Initial Agents
+    // 3. Initial Agents
+    if (!repo.getAgent('agent-primary-manager')) {
       repo.createAgent({
         id: 'agent-primary-manager',
         display_name: 'ChatGPT Manager (Manual Bridge)',
@@ -83,7 +92,9 @@ export class BootstrapService {
         current_task_id: null,
         last_seen_at: now,
       });
+    }
 
+    if (!repo.getAgent('agent-gemini-coder')) {
       repo.createAgent({
         id: 'agent-gemini-coder',
         display_name: 'Gemini Coder (Manual Bridge)',
@@ -127,6 +138,12 @@ export class BootstrapService {
     const taskService = new TaskService(repo, eventService, verificationService, artifactStore);
     const emergencyStopService = new EmergencyStopService(repo, eventService);
 
+    // 5. Initialize Provider Registry
+    const providerRegistry = new ProviderRegistry();
+    providerRegistry.register(new ManualBridgeAdapter());
+    providerRegistry.register(new CodexCliAdapter({ repo, artifactStore }));
+    providerRegistry.register(new AntigravityCliAdapter({ repo, artifactStore }));
+
     return {
       db,
       dbEngine,
@@ -137,6 +154,7 @@ export class BootstrapService {
       taskService,
       verificationService,
       emergencyStopService,
+      providerRegistry,
     };
   }
 }

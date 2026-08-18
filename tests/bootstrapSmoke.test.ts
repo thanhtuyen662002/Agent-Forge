@@ -63,6 +63,13 @@ describe('Bootstrap Smoke & Fresh Database Startup', () => {
     const agents = bootstrap.repo.getAllAgents();
     expect(agents.length).toBe(2);
 
+    // Assert provider registry initialized with registered adapters
+    expect(bootstrap.providerRegistry).toBeDefined();
+    expect(bootstrap.providerRegistry.size).toBe(3);
+    expect(bootstrap.providerRegistry.has('prov-manual-bridge')).toBe(true);
+    expect(bootstrap.providerRegistry.has('prov-codex-cli')).toBe(true);
+    expect(bootstrap.providerRegistry.has('prov-antigravity-cli')).toBe(true);
+
     // Create a project through trusted native selection token flow
     const token = RepositorySelectionService.issueToken(tmpGitDir);
     const consumeRes = RepositorySelectionService.consumeToken(token.selectionId);

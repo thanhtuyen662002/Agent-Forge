@@ -31,6 +31,7 @@ export interface StructuredProcessOptions {
   projectId?: string;
   taskId?: string;
   attemptId?: string | null;
+  stdin?: string;
 }
 
 export class ProcessRunner {
@@ -170,6 +171,24 @@ export class ProcessRunner {
         isTimedOut = true;
         this.killProcessTree(child);
       }, timeoutMs);
+
+      // Safe stdin writing when provided
+      if (options.stdin !== undefined && child.stdin) {
+        child.stdin.on('error', () => {
+          // Ignore EPIPE if child process exits early or closes stdin
+        });
+        try {
+          child.stdin.write(options.stdin, 'utf8', () => {
+            try {
+              child.stdin?.end();
+            } catch {
+              // Ignore
+            }
+          });
+        } catch {
+          // Ignore
+        }
+      }
 
       if (child.stdout) {
         child.stdout.on('data', (data) => {
