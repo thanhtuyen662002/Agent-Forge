@@ -19,10 +19,11 @@ Agent-Forge guarantees that the durable source of truth resides entirely in:
 
 ---
 
-## Current Status: `MVP_CORE_HARDENING`
+## Current Status: `DESKTOP_PACKAGING_FOUNDATION`
 
 - **Automated Provider Adapters**: **NOT YET IMPLEMENTED** (Intentionally deferred; system operates via the **Owner Manual Bridge**).
-- **Desktop Packaging**: **NOT YET IMPLEMENTED** (Windows `.exe` installer packaging is deferred; production bundle compilation via `npm run build` is fully verified).
+- **Desktop Runtime & Windows Packaging**: **IMPLEMENTED & VERIFIED** (Electron desktop launch, packaged ASAR runtime with unpacked `better-sqlite3` native ABI bindings, and Windows NSIS installer generation in `release/`).
+- **Code Signing**: **UNSIGNED FOUNDATION** (`CODE_SIGNED=NO`; code-signing certificates and auto-update are intentionally deferred).
 
 ---
 
@@ -79,20 +80,34 @@ In the initial release, the human owner serves as the manual transport bridge:
 ### Commands & Scripts
 ```powershell
 # Install dependencies
-npm install
+npm ci
 
 # Start Vite dev server (browser preview)
 npm run dev
 
-# Start Electron desktop application
-npm run dev:electron
+# Run development Electron window smoke test against Vite dev server
+npm run smoke:dev:electron
 
-# Run automated tests
+# Run full automated test suite (21 test suites, 83 tests)
 npm test
 
-# Build production bundle (frontend + electron main)
+# Build production bundle (frontend + electron main & preload)
 npm run build
+
+# Generate unpacked Windows application directory (release/win-unpacked)
+npm run package:win:dir
+
+# Run deterministic isolated packaged runtime smoke test
+npm run smoke:packaged:win
+
+# Generate Windows NSIS installer (release/AgentForge Setup 0.1.0.exe)
+npm run package:win
 ```
+
+### Native Modules & ABI Handling
+- In unit and integration tests (`npm test`), `better-sqlite3` runs on the local Node runtime (`NODE_MODULE_VERSION 131` / `127`).
+- During Windows packaging (`npm run package:win:dir` / `npm run package:win`), `electron-builder` automatically rebuilds `better-sqlite3` native binaries for the Electron runtime (`NODE_MODULE_VERSION 132` / Electron 34) and places them in `release/win-unpacked/resources/app.asar.unpacked/`.
+- If switching between dev Electron and local Node test runs, `npm rebuild better-sqlite3` restores Node runtime ABI.
 
 ---
 

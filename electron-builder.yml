@@ -1,0 +1,28 @@
+appId: com.agentforge.desktop
+productName: AgentForge
+copyright: Copyright © 2026 AgentForge Contributors
+
+directories:
+  output: release
+  buildResources: build
+
+files:
+  - dist/**
+  - dist-electron/**
+  - package.json
+
+asar: true
+asarUnpack:
+  - node_modules/better-sqlite3/**
+
+win:
+  target:
+    - target: nsis
+      arch:
+        - x64
+
+nsis:
+  oneClick: false
+  perMachine: false
+  allowToChangeInstallationDirectory: true
+  deleteAppDataOnUninstall: false

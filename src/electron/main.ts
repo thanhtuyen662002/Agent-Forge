@@ -2,6 +2,7 @@ import { app, BrowserWindow } from 'electron';
 import path from 'path';
 import { BootstrapService, BootstrapResult } from '../core/services/BootstrapService';
 import { registerIpcHandlers } from './ipcHandlers';
+import { resolveRendererTarget } from './pathHelper';
 
 let mainWindow: BrowserWindow | null = null;
 let bootstrapInstance: BootstrapResult | null = null;
@@ -38,12 +39,16 @@ function createWindow(): void {
     return { action: 'deny' };
   });
 
-  if (process.env.VITE_DEV_SERVER_URL) {
-    mainWindow.loadURL(process.env.VITE_DEV_SERVER_URL);
-  } else if (!app.isPackaged) {
-    mainWindow.loadURL('http://localhost:5173');
+  const rendererTarget = resolveRendererTarget({
+    isPackaged: app.isPackaged,
+    appPath: app.getAppPath(),
+    devServerUrl: process.env.VITE_DEV_SERVER_URL,
+  });
+
+  if (rendererTarget.type === 'url') {
+    mainWindow.loadURL(rendererTarget.target);
   } else {
-    mainWindow.loadFile(path.join(__dirname, '../dist/index.html'));
+    mainWindow.loadFile(rendererTarget.target);
   }
 
   mainWindow.on('closed', () => {
@@ -52,7 +57,7 @@ function createWindow(): void {
 }
 
 app.whenReady().then(() => {
-  const userDataDir = app.getPath('userData');
+  const userDataDir = process.env.AGENT_FORGE_DATA_DIR || app.getPath('userData');
   bootstrapInstance = BootstrapService.initialize(userDataDir);
 
   // Register Typed & Validated IPC Handlers
