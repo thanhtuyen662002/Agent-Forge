@@ -601,15 +601,10 @@ export function registerIpcHandlers(
     const authorizations = repo.getExecutionAuthorizationsByTask(task.id);
     const latestAuthorization = authorizations.length > 0 ? authorizations[0] : null;
 
-    // Retrieve latest routing decision event from SQLite (candidate for a NEW authorization)
+    // Retrieve latest routing decision event for this task directly from SQLite (candidate for a NEW authorization)
     let latestRoutingDecision: any = null;
     if (project) {
-      const events = repo.getEventsByProject(project.id, 50);
-      const routingEvent = events.find(
-        (e) =>
-          e.type === 'PROVIDER_ROUTING_DECISION' &&
-          (e.task_id === task.id || (e.structured_payload as any)?.taskId === task.id)
-      );
+      const routingEvent = repo.getLatestRoutingDecisionEventByTask(project.id, task.id);
       if (routingEvent && routingEvent.structured_payload) {
         latestRoutingDecision = routingEvent.structured_payload;
       }

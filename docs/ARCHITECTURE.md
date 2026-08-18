@@ -292,7 +292,20 @@ Owner pastes Gemini report into Coder Inbox → Protocol validation & Verificati
 - **Single-Identifier Dispatch & Authorized WorkOrder Generation**:
   - `routing:dispatchAuthorization` accepts **ONLY** `{ authorizationId: string }`.
   - `routing:generateAuthorizedWorkOrder` accepts **ONLY** `{ authorizationId: string }`.
-- **Authorization-Bound Immutable WorkOrder**: The Manual Bridge relay WorkOrder is generated strictly from the consumed `ExecutionAuthorization.canonical_instructions_json` and `context_files_json` with verified context and instruction hashes. Mutations to task fields after dispatch do not silently alter the authorized instructions.
+- **Authorization-Bound Frozen Canonical WorkOrder (Migration #007 & Cryptographic Re-verification)**:
+  - Additive Migration #007 (`007_execution_authorization_canonical_payload`) persists `canonical_payload_json TEXT NULL` on `execution_authorizations`.
+  - At authorization creation, `ExecutionAuthorizationService.createAuthorization` serializes the exact `canonicalPayload` into `canonical_payload_json` and computes `instruction_payload_hash = computePayloadHash(canonicalPayload)` from the identical object.
+  - When generating an Authorized Manual WorkOrder (`PackageGenerator.generateAuthorizedManualWorkOrder`), the runtime executes full cryptographic and structural verification before rendering:
+    1. Requires `auth.status === 'DISPATCHED'`.
+    2. Validates `canonical_payload_json != null` (failing closed with `AUTHORIZED_WORKORDER_CANONICAL_PAYLOAD_MISSING` on legacy pre-007 records).
+    3. Safely parses and strictly validates `canonical_payload_json` against `CanonicalExecutionPayloadSchema` (Zod).
+    4. Asserts exact match on frozen bindings (`projectId`, `taskId`, normalized `attemptId`, `managerMessageId`, `managerPayloadHash`).
+    5. Asserts deep element-by-element equality of `instructions` and `contextFiles` against `canonical_instructions_json` and `context_files_json`.
+    6. Recomputes `computeContextManifestHash(canonicalPayload.contextFiles)` and verifies exact equality with `auth.context_manifest_hash`.
+    7. Cryptographically recomputes `computePayloadHash(canonicalPayload)` and verifies exact 64-hex SHA-256 equality with `auth.instruction_payload_hash`.
+    8. Renders instructions and context paths strictly from the verified `canonicalPayload`.
+  - Task mutable field changes after authorization do not alter the frozen instructions or break verification.
+- **Direct Durable Latest Task Route Query**: `routing:getHandoffSnapshot` uses `Repository.getLatestRoutingDecisionEventByTask(projectId, taskId)` with direct SQLite indexing (`WHERE project_id = ? AND task_id = ? AND type = 'PROVIDER_ROUTING_DECISION' ORDER BY timestamp DESC, rowid DESC LIMIT 1`), ensuring durable lookup irrespective of intervening project event volume.
 - **Distinct Routing Concepts**: `routing:getHandoffSnapshot` distinctly exposes `latestRoutingDecision` (newest routing candidate for a new authorization) and `authorizationRoutingDecision` (the exact durable route bound to the existing authorization via `routing_decision_id`), preventing route cross-wiring.
 - **Awaiting Owner Semantics**: `AWAITING_OWNER` is derived strictly when `authorization.status === 'DISPATCHED' && authorizationRoutingDecision.outcome === 'MANUAL_HANDOFF_REQUIRED'`. Automated provider dispatches (`outcome === 'SELECTED'`) display `DISPATCHED TO AUTHORIZED PROVIDER` and do not show Manual Bridge relay.
 - **Explicit Candidate Selection & Manual Bridge Opt-In**: The candidate list is initially empty and never auto-populates enabled resources on page load or task switch. Manual Bridge permission defaults to `false` and requires explicit Owner opt-in.

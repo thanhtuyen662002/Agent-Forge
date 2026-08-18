@@ -514,6 +514,16 @@ export const MIGRATIONS: Migration[] = [
       `);
     },
   },
+  {
+    version: 7,
+    name: '007_execution_authorization_canonical_payload',
+    up: (db: Database.Database) => {
+      db.exec(`
+        ALTER TABLE execution_authorizations
+        ADD COLUMN canonical_payload_json TEXT NULL;
+      `);
+    },
+  },
 ];
 
 export class MigrationRunner {

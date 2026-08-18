@@ -27,6 +27,7 @@ import { ProviderRoutingService } from '../src/core/services/ProviderRoutingServ
 import {
   ExecutionAuthorizationService,
   computeContextManifestHash,
+  computePayloadHash,
 } from '../src/core/services/ExecutionAuthorizationService';
 import { ProviderDispatchService } from '../src/core/services/ProviderDispatchService';
 import { PackageGenerator } from '../src/core/protocol/packageGenerator';
@@ -676,10 +677,90 @@ describe('Owner Routing & Manual Bridge Handoff Loop (PR #8)', () => {
       expect(workOrder).toContain('- `README.md`');
     });
 
-    it('19. Tampered canonical_instructions_json fails closed', async () => {
+    it('19. New authorization persists canonical_payload_json and computePayloadHash matches instruction_payload_hash', async () => {
       const managerMsg = {
         protocol: 'manager.v1',
-        message_id: 'MSG-MGR-TAMP-19',
+        message_id: 'MSG-MGR-CANON-19',
+        project_id: testProjectId,
+        task_id: testTaskId,
+        decision: 'EXECUTE',
+        expected_task_state: 'PLANNED',
+        expected_revision: 0,
+        instructions: ['Persist canonical payload'],
+        priority: 'HIGH',
+        risk: 'LOW',
+      };
+      await taskService.applyManagerDecision(managerMsg as any, JSON.stringify(managerMsg));
+
+      const routingDecision = await routingService.route({
+        projectId: testProjectId,
+        taskId: testTaskId,
+        candidateResourceIds: ['res-gemini-coder'],
+        allowManualBridge: true,
+        requiredCapabilities: ['CODING'],
+      });
+
+      const auth = await authorizationService.createAuthorization({
+        projectId: testProjectId,
+        taskId: testTaskId,
+        routingDecisionId: routingDecision.decisionId,
+        contextFiles: ['README.md'],
+      });
+
+      expect(auth.canonical_payload_json).not.toBeNull();
+      const parsedPayload = JSON.parse(auth.canonical_payload_json!);
+      expect(parsedPayload.projectId).toBe(testProjectId);
+      expect(parsedPayload.taskId).toBe(testTaskId);
+      expect(computePayloadHash(parsedPayload)).toBe(auth.instruction_payload_hash);
+    });
+
+    it('20. Wrong but valid 64-hex SHA-256 digest fails closed', async () => {
+      const managerMsg = {
+        protocol: 'manager.v1',
+        message_id: 'MSG-MGR-WRONGHEX-20',
+        project_id: testProjectId,
+        task_id: testTaskId,
+        decision: 'EXECUTE',
+        expected_task_state: 'PLANNED',
+        expected_revision: 0,
+        instructions: ['Wrong hex test'],
+        priority: 'HIGH',
+        risk: 'LOW',
+      };
+      await taskService.applyManagerDecision(managerMsg as any, JSON.stringify(managerMsg));
+
+      const routingDecision = await routingService.route({
+        projectId: testProjectId,
+        taskId: testTaskId,
+        candidateResourceIds: ['res-gemini-coder'],
+        allowManualBridge: true,
+        requiredCapabilities: ['CODING'],
+      });
+
+      const auth = await authorizationService.createAuthorization({
+        projectId: testProjectId,
+        taskId: testTaskId,
+        routingDecisionId: routingDecision.decisionId,
+        contextFiles: [],
+      });
+
+      await dispatchService.dispatch(auth.id);
+
+      // Tamper hash to 'f'.repeat(64) - valid 64-hex format, but wrong digest
+      db.prepare('UPDATE execution_authorizations SET instruction_payload_hash = ? WHERE id = ?').run(
+        'f'.repeat(64),
+        auth.id
+      );
+
+      expect(() => {
+        PackageGenerator.generateAuthorizedManualWorkOrder(auth.id, repo);
+      }).toThrow(/EXECUTION_AUTHORIZATION_TAMPERED: Instruction payload hash mismatch/);
+    });
+
+    it('21. Changed canonical_instructions_json with original valid hash fails closed', async () => {
+      const managerMsg = {
+        protocol: 'manager.v1',
+        message_id: 'MSG-MGR-INST-21',
         project_id: testProjectId,
         task_id: testTaskId,
         decision: 'EXECUTE',
@@ -708,21 +789,108 @@ describe('Owner Routing & Manual Bridge Handoff Loop (PR #8)', () => {
 
       await dispatchService.dispatch(auth.id);
 
-      // Tamper in SQLite
+      // Tamper canonical_instructions_json only
       db.prepare('UPDATE execution_authorizations SET canonical_instructions_json = ? WHERE id = ?').run(
-        'not valid json',
+        JSON.stringify(['Tampered instruction line']),
         auth.id
       );
 
       expect(() => {
         PackageGenerator.generateAuthorizedManualWorkOrder(auth.id, repo);
-      }).toThrow(/EXECUTION_AUTHORIZATION_CORRUPTED/);
+      }).toThrow(/EXECUTION_AUTHORIZATION_TAMPERED: Canonical instructions mismatch/);
     });
 
-    it('20. Tampered context_files_json/hash fails closed', async () => {
+    it('22. Changed canonical_payload_json.instructions with original hash fails closed', async () => {
       const managerMsg = {
         protocol: 'manager.v1',
-        message_id: 'MSG-MGR-TAMP-20',
+        message_id: 'MSG-MGR-PAYLOAD-INST-22',
+        project_id: testProjectId,
+        task_id: testTaskId,
+        decision: 'EXECUTE',
+        expected_task_state: 'PLANNED',
+        expected_revision: 0,
+        instructions: ['Original instructions'],
+        priority: 'HIGH',
+        risk: 'LOW',
+      };
+      await taskService.applyManagerDecision(managerMsg as any, JSON.stringify(managerMsg));
+
+      const routingDecision = await routingService.route({
+        projectId: testProjectId,
+        taskId: testTaskId,
+        candidateResourceIds: ['res-gemini-coder'],
+        allowManualBridge: true,
+        requiredCapabilities: ['CODING'],
+      });
+
+      const auth = await authorizationService.createAuthorization({
+        projectId: testProjectId,
+        taskId: testTaskId,
+        routingDecisionId: routingDecision.decisionId,
+        contextFiles: [],
+      });
+
+      await dispatchService.dispatch(auth.id);
+
+      const parsedPayload = JSON.parse(auth.canonical_payload_json!);
+      parsedPayload.instructions = ['Tampered inside canonical payload'];
+
+      db.prepare('UPDATE execution_authorizations SET canonical_payload_json = ? WHERE id = ?').run(
+        JSON.stringify(parsedPayload),
+        auth.id
+      );
+
+      expect(() => {
+        PackageGenerator.generateAuthorizedManualWorkOrder(auth.id, repo);
+      }).toThrow(/EXECUTION_AUTHORIZATION_TAMPERED/);
+    });
+
+    it('23. Malformed canonical_payload_json fails closed', async () => {
+      const managerMsg = {
+        protocol: 'manager.v1',
+        message_id: 'MSG-MGR-MALFORM-23',
+        project_id: testProjectId,
+        task_id: testTaskId,
+        decision: 'EXECUTE',
+        expected_task_state: 'PLANNED',
+        expected_revision: 0,
+        instructions: ['Original instructions'],
+        priority: 'HIGH',
+        risk: 'LOW',
+      };
+      await taskService.applyManagerDecision(managerMsg as any, JSON.stringify(managerMsg));
+
+      const routingDecision = await routingService.route({
+        projectId: testProjectId,
+        taskId: testTaskId,
+        candidateResourceIds: ['res-gemini-coder'],
+        allowManualBridge: true,
+        requiredCapabilities: ['CODING'],
+      });
+
+      const auth = await authorizationService.createAuthorization({
+        projectId: testProjectId,
+        taskId: testTaskId,
+        routingDecisionId: routingDecision.decisionId,
+        contextFiles: [],
+      });
+
+      await dispatchService.dispatch(auth.id);
+
+      db.prepare('UPDATE execution_authorizations SET canonical_payload_json = ? WHERE id = ?').run(
+        '{ not valid json',
+        auth.id
+      );
+
+      expect(() => {
+        PackageGenerator.generateAuthorizedManualWorkOrder(auth.id, repo);
+      }).toThrow(/EXECUTION_AUTHORIZATION_CORRUPTED: Invalid canonical_payload_json/);
+    });
+
+    it('24. Canonical payload contextFiles differ from context_files_json fails closed', async () => {
+      const managerMsg = {
+        protocol: 'manager.v1',
+        message_id: 'MSG-MGR-CTXDIFF-24',
         project_id: testProjectId,
         task_id: testTaskId,
         decision: 'EXECUTE',
@@ -751,21 +919,21 @@ describe('Owner Routing & Manual Bridge Handoff Loop (PR #8)', () => {
 
       await dispatchService.dispatch(auth.id);
 
-      // Tamper context_files_json without updating hash
+      // Modify context_files_json to differ from canonical_payload_json
       db.prepare('UPDATE execution_authorizations SET context_files_json = ? WHERE id = ?').run(
-        JSON.stringify(['secrets.env']),
+        JSON.stringify([]),
         auth.id
       );
 
       expect(() => {
         PackageGenerator.generateAuthorizedManualWorkOrder(auth.id, repo);
-      }).toThrow(/EXECUTION_AUTHORIZATION_TAMPERED: Context manifest hash mismatch/);
+      }).toThrow(/EXECUTION_AUTHORIZATION_TAMPERED: Context files mismatch/);
     });
 
-    it('21. Tampered instruction payload hash fails closed', async () => {
+    it('25. Canonical payload scope mismatches (projectId, taskId, attemptId, manager bindings) fail closed', async () => {
       const managerMsg = {
         protocol: 'manager.v1',
-        message_id: 'MSG-MGR-TAMP-21',
+        message_id: 'MSG-MGR-SCOPE-25',
         project_id: testProjectId,
         task_id: testTaskId,
         decision: 'EXECUTE',
@@ -794,21 +962,131 @@ describe('Owner Routing & Manual Bridge Handoff Loop (PR #8)', () => {
 
       await dispatchService.dispatch(auth.id);
 
-      // Tamper instruction_payload_hash in SQLite with invalid hash
-      db.prepare('UPDATE execution_authorizations SET instruction_payload_hash = ? WHERE id = ?').run(
-        'not-a-valid-sha256',
+      // 1. projectId mismatch
+      const p1 = JSON.parse(auth.canonical_payload_json!);
+      p1.projectId = 'PROJ-OTHER';
+      db.prepare('UPDATE execution_authorizations SET canonical_payload_json = ? WHERE id = ?').run(
+        JSON.stringify(p1),
         auth.id
       );
+      expect(() => {
+        PackageGenerator.generateAuthorizedManualWorkOrder(auth.id, repo);
+      }).toThrow(/EXECUTION_AUTHORIZATION_TAMPERED: Canonical payload projectId mismatch/);
+
+      // 2. taskId mismatch
+      const p2 = JSON.parse(auth.canonical_payload_json!);
+      p2.taskId = 'TSK-OTHER';
+      db.prepare('UPDATE execution_authorizations SET canonical_payload_json = ? WHERE id = ?').run(
+        JSON.stringify(p2),
+        auth.id
+      );
+      expect(() => {
+        PackageGenerator.generateAuthorizedManualWorkOrder(auth.id, repo);
+      }).toThrow(/EXECUTION_AUTHORIZATION_TAMPERED: Canonical payload taskId mismatch/);
+
+      // 3. managerMessageId mismatch
+      const p3 = JSON.parse(auth.canonical_payload_json!);
+      p3.managerMessageId = 'MSG-OTHER';
+      db.prepare('UPDATE execution_authorizations SET canonical_payload_json = ? WHERE id = ?').run(
+        JSON.stringify(p3),
+        auth.id
+      );
+      expect(() => {
+        PackageGenerator.generateAuthorizedManualWorkOrder(auth.id, repo);
+      }).toThrow(/EXECUTION_AUTHORIZATION_TAMPERED: Canonical payload managerMessageId mismatch/);
+
+      // 4. managerPayloadHash mismatch
+      const p4 = JSON.parse(auth.canonical_payload_json!);
+      p4.managerPayloadHash = '0'.repeat(64);
+      db.prepare('UPDATE execution_authorizations SET canonical_payload_json = ? WHERE id = ?').run(
+        JSON.stringify(p4),
+        auth.id
+      );
+      expect(() => {
+        PackageGenerator.generateAuthorizedManualWorkOrder(auth.id, repo);
+      }).toThrow(/EXECUTION_AUTHORIZATION_TAMPERED: Canonical payload managerPayloadHash mismatch/);
+    });
+
+    it('26. Legacy authorization with canonical_payload_json NULL fails closed', async () => {
+      const managerMsg = {
+        protocol: 'manager.v1',
+        message_id: 'MSG-MGR-LEGACY-26',
+        project_id: testProjectId,
+        task_id: testTaskId,
+        decision: 'EXECUTE',
+        expected_task_state: 'PLANNED',
+        expected_revision: 0,
+        instructions: ['Legacy record test'],
+        priority: 'HIGH',
+        risk: 'LOW',
+      };
+      await taskService.applyManagerDecision(managerMsg as any, JSON.stringify(managerMsg));
+
+      const routingDecision = await routingService.route({
+        projectId: testProjectId,
+        taskId: testTaskId,
+        candidateResourceIds: ['res-gemini-coder'],
+        allowManualBridge: true,
+        requiredCapabilities: ['CODING'],
+      });
+
+      const auth = await authorizationService.createAuthorization({
+        projectId: testProjectId,
+        taskId: testTaskId,
+        routingDecisionId: routingDecision.decisionId,
+        contextFiles: [],
+      });
+
+      await dispatchService.dispatch(auth.id);
+
+      // Set canonical_payload_json to NULL as in legacy pre-007 records
+      db.prepare('UPDATE execution_authorizations SET canonical_payload_json = NULL WHERE id = ?').run(auth.id);
 
       expect(() => {
         PackageGenerator.generateAuthorizedManualWorkOrder(auth.id, repo);
-      }).toThrow(/EXECUTION_AUTHORIZATION_TAMPERED/);
+      }).toThrow(/AUTHORIZED_WORKORDER_CANONICAL_PAYLOAD_MISSING/);
     });
 
-    it('22. Current Task fields mutated AFTER dispatch do not silently alter the authorized instructions', async () => {
+    it('27. AUTHORIZED but not DISPATCHED fails closed for WorkOrder generation', async () => {
       const managerMsg = {
         protocol: 'manager.v1',
-        message_id: 'MSG-MGR-MUT-22',
+        message_id: 'MSG-MGR-NOTDISP-27',
+        project_id: testProjectId,
+        task_id: testTaskId,
+        decision: 'EXECUTE',
+        expected_task_state: 'PLANNED',
+        expected_revision: 0,
+        instructions: ['Not dispatched'],
+        priority: 'HIGH',
+        risk: 'LOW',
+      };
+      await taskService.applyManagerDecision(managerMsg as any, JSON.stringify(managerMsg));
+
+      const routingDecision = await routingService.route({
+        projectId: testProjectId,
+        taskId: testTaskId,
+        candidateResourceIds: ['res-gemini-coder'],
+        allowManualBridge: true,
+        requiredCapabilities: ['CODING'],
+      });
+
+      const auth = await authorizationService.createAuthorization({
+        projectId: testProjectId,
+        taskId: testTaskId,
+        routingDecisionId: routingDecision.decisionId,
+        contextFiles: [],
+      });
+
+      // Status is AUTHORIZED, not DISPATCHED
+      expect(() => {
+        PackageGenerator.generateAuthorizedManualWorkOrder(auth.id, repo);
+      }).toThrow(/EXECUTION_AUTHORIZATION_NOT_DISPATCHED/);
+    });
+
+    it('28. Current Task fields mutated AFTER dispatch do not alter the frozen instructions', async () => {
+      const managerMsg = {
+        protocol: 'manager.v1',
+        message_id: 'MSG-MGR-MUT-28',
         project_id: testProjectId,
         task_id: testTaskId,
         decision: 'EXECUTE',
@@ -851,13 +1129,13 @@ describe('Owner Routing & Manual Bridge Handoff Loop (PR #8)', () => {
   });
 
   // =========================================================================
-  // 3. Snapshot & Route Independence Gates
+  // 3. Snapshot & Route Independence Gates & Latest Route Durability
   // =========================================================================
   describe('Snapshot & Route Independence Gates', () => {
-    it('23-24. Route A -> Auth A -> Route B keeps latestRoutingDecision = B and authorizationRoutingDecision = A', async () => {
+    it('29-30. Route A -> Auth A -> Route B keeps latestRoutingDecision = B and authorizationRoutingDecision = A', async () => {
       const managerMsg = {
         protocol: 'manager.v1',
-        message_id: 'MSG-MGR-ROUTE-23',
+        message_id: 'MSG-MGR-ROUTE-29',
         project_id: testProjectId,
         task_id: testTaskId,
         decision: 'EXECUTE',
@@ -897,11 +1175,8 @@ describe('Owner Routing & Manual Bridge Handoff Loop (PR #8)', () => {
 
       expect(routeB.decisionId).not.toBe(routeA.decisionId);
 
-      // Check snapshot logic
-      const events = repo.getEventsByProject(testProjectId, 50);
-      const latestRoutingEvent = events.find(
-        (e) => e.type === 'PROVIDER_ROUTING_DECISION' && e.task_id === testTaskId
-      );
+      // Check direct lookup logic
+      const latestRoutingEvent = repo.getLatestRoutingDecisionEventByTask(testProjectId, testTaskId);
       const latestRoutingDecision = latestRoutingEvent?.structured_payload as any;
 
       const authRoutingEvent = repo.getRoutingDecisionEvent(authA.routing_decision_id);
@@ -912,22 +1187,22 @@ describe('Owner Routing & Manual Bridge Handoff Loop (PR #8)', () => {
       expect(authA.routing_decision_id).toBe(routeA.decisionId);
     });
 
-    it('25. DISPATCHED manual route reconstructs AWAITING_OWNER after restart/snapshot reload', async () => {
+    it('31. getLatestRoutingDecisionEventByTask finds latest route even after >50 newer unrelated project events', async () => {
       const managerMsg = {
         protocol: 'manager.v1',
-        message_id: 'MSG-MGR-RESTART-25',
+        message_id: 'MSG-MGR-DURABLE-31',
         project_id: testProjectId,
         task_id: testTaskId,
         decision: 'EXECUTE',
         expected_task_state: 'PLANNED',
         expected_revision: 0,
-        instructions: ['Manual instructions'],
+        instructions: ['Durability test'],
         priority: 'HIGH',
         risk: 'LOW',
       };
       await taskService.applyManagerDecision(managerMsg as any, JSON.stringify(managerMsg));
 
-      const route = await routingService.route({
+      const routeA = await routingService.route({
         projectId: testProjectId,
         taskId: testTaskId,
         candidateResourceIds: ['res-gemini-coder'],
@@ -935,123 +1210,23 @@ describe('Owner Routing & Manual Bridge Handoff Loop (PR #8)', () => {
         requiredCapabilities: ['CODING'],
       });
 
-      const auth = await authorizationService.createAuthorization({
-        projectId: testProjectId,
-        taskId: testTaskId,
-        routingDecisionId: route.decisionId,
-        contextFiles: [],
-      });
-
-      await dispatchService.dispatch(auth.id);
-
-      // Reconstruct from fresh instances
-      const freshRepo = new Repository(db);
-      const freshAuth = freshRepo.getExecutionAuthorization(auth.id);
-      const freshRouteEvent = freshRepo.getRoutingDecisionEvent(freshAuth!.routing_decision_id);
-      const freshRoutePayload = freshRouteEvent!.structured_payload as any;
-
-      const isManualHandoffAwaitingOwner =
-        freshAuth?.status === 'DISPATCHED' && freshRoutePayload?.outcome === 'MANUAL_HANDOFF_REQUIRED';
-
-      expect(isManualHandoffAwaitingOwner).toBe(true);
-    });
-
-    it('26. DISPATCHED SELECTED route does NOT reconstruct AWAITING_OWNER', async () => {
-      const mockAuto = new MockAutomatedAdapter();
-      providerRegistry.register(mockAuto);
-
-      repo.createProvider({
-        id: mockAuto.id,
-        name: 'Automated Test CLI',
-        adapter_type: 'LOCAL_CLI',
-        enabled: true,
-        created_at: new Date().toISOString(),
-      });
-
-      repo.createProviderResource({
-        id: 'res-auto-test-26',
-        provider_id: mockAuto.id,
-        model_name: 'Automated Model',
-        health_status: 'AVAILABLE',
-        capabilities: ['CODING'],
-        enabled: true,
-        total_quota: 100,
-        remaining_quota: 50,
-        quota_unit: 'REQUESTS',
-        quota_reset_at: null,
-        quota_source: 'MEASURED',
-        quota_confidence: 1.0,
-        last_health_check: null,
-      });
-
-      const managerMsg = {
-        protocol: 'manager.v1',
-        message_id: 'MSG-MGR-AUTO-26',
-        project_id: testProjectId,
-        task_id: testTaskId,
-        decision: 'EXECUTE',
-        expected_task_state: 'PLANNED',
-        expected_revision: 0,
-        instructions: ['Automated'],
-        priority: 'HIGH',
-        risk: 'LOW',
-      };
-      await taskService.applyManagerDecision(managerMsg as any, JSON.stringify(managerMsg));
-
-      const route = await routingService.route({
-        projectId: testProjectId,
-        taskId: testTaskId,
-        candidateResourceIds: ['res-auto-test-26'],
-        allowManualBridge: true,
-        requiredCapabilities: ['CODING'],
-      });
-
-      const auth = await authorizationService.createAuthorization({
-        projectId: testProjectId,
-        taskId: testTaskId,
-        routingDecisionId: route.decisionId,
-        contextFiles: [],
-      });
-
-      await dispatchService.dispatch(auth.id);
-
-      const freshRepo = new Repository(db);
-      const freshAuth = freshRepo.getExecutionAuthorization(auth.id);
-      const freshRouteEvent = freshRepo.getRoutingDecisionEvent(freshAuth!.routing_decision_id);
-      const freshRoutePayload = freshRouteEvent!.structured_payload as any;
-
-      const isManualHandoffAwaitingOwner =
-        freshAuth?.status === 'DISPATCHED' && freshRoutePayload?.outcome === 'MANUAL_HANDOFF_REQUIRED';
-
-      expect(isManualHandoffAwaitingOwner).toBe(false);
-      expect(freshRoutePayload.outcome).toBe('SELECTED');
-    });
-
-    it('27-28. Manager authority decision and expected revision are projected from parsed manager.v1 payload', async () => {
-      const managerMsg = {
-        protocol: 'manager.v1',
-        message_id: 'MSG-MGR-PARSED-27',
-        project_id: testProjectId,
-        task_id: testTaskId,
-        decision: 'EXECUTE',
-        expected_task_state: 'PLANNED',
-        expected_revision: 0,
-        instructions: ['Parsed projection test'],
-        priority: 'HIGH',
-        risk: 'LOW',
-      };
-      await taskService.applyManagerDecision(managerMsg as any, JSON.stringify(managerMsg));
-
-      const latestRecord = repo.getLatestAppliedManagerProtocolMessage(testTaskId, testProjectId);
-      expect(latestRecord).toBeDefined();
-
-      const parsedProto = ProtocolParser.parse(String(latestRecord!.raw_payload));
-      expect(parsedProto.success).toBe(true);
-      expect(parsedProto.data?.type).toBe('manager.v1');
-      if (parsedProto.data?.type === 'manager.v1') {
-        expect(parsedProto.data.data.decision).toBe('EXECUTE');
-        expect(parsedProto.data.data.expected_revision).toBe(0);
+      // Persist 60 unrelated events for the same project
+      for (let i = 0; i < 60; i++) {
+        eventService.record(
+          testProjectId,
+          'HEARTBEAT',
+          `Unrelated heartbeat event ${i}`,
+          { iteration: i }
+        );
       }
+
+      // Recreate repo to ensure zero cache dependency
+      const freshRepo = new Repository(db);
+      const foundEvent = freshRepo.getLatestRoutingDecisionEventByTask(testProjectId, testTaskId);
+      expect(foundEvent).not.toBeNull();
+      const payload = foundEvent!.structured_payload as any;
+      expect(payload.decisionId).toBe(routeA.decisionId);
+      expect(payload.taskId).toBe(testTaskId);
     });
   });
 

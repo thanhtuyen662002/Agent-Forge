@@ -7,7 +7,12 @@ import {
 } from '../types/domain';
 import { CoderProtocol } from '../types/protocols';
 import { Repository } from '../database/repositories';
-import { computeContextManifestHash } from '../services/ExecutionAuthorizationService';
+import {
+  computeContextManifestHash,
+  computePayloadHash,
+  CanonicalExecutionPayload,
+  CanonicalExecutionPayloadSchema,
+} from '../services/ExecutionAuthorizationService';
 
 export class PackageGenerator {
   public static generateAuthorizedManualWorkOrder(
@@ -65,7 +70,56 @@ export class PackageGenerator {
       );
     }
 
-    // 5. Parse and Validate Canonical Instructions
+    // 5. Require frozen canonical_payload_json (Fail closed for legacy NULL records)
+    if (!auth.canonical_payload_json) {
+      throw new Error(
+        'AUTHORIZED_WORKORDER_CANONICAL_PAYLOAD_MISSING: Execution authorization is missing frozen canonical_payload_json.'
+      );
+    }
+
+    // 6. Safely parse and strictly validate canonical_payload_json structure
+    let canonicalPayload: CanonicalExecutionPayload;
+    try {
+      const parsed = JSON.parse(auth.canonical_payload_json);
+      const parseResult = CanonicalExecutionPayloadSchema.safeParse(parsed);
+      if (!parseResult.success) {
+        throw new Error(parseResult.error.issues.map((i) => i.message).join(', '));
+      }
+      canonicalPayload = parseResult.data;
+    } catch (err: any) {
+      throw new Error(`EXECUTION_AUTHORIZATION_CORRUPTED: Invalid canonical_payload_json (${err.message})`);
+    }
+
+    // 7. Verify frozen scope and authority bindings
+    if (canonicalPayload.projectId !== auth.project_id) {
+      throw new Error(
+        `EXECUTION_AUTHORIZATION_TAMPERED: Canonical payload projectId mismatch (payload: "${canonicalPayload.projectId}", auth: "${auth.project_id}").`
+      );
+    }
+    if (canonicalPayload.taskId !== auth.task_id) {
+      throw new Error(
+        `EXECUTION_AUTHORIZATION_TAMPERED: Canonical payload taskId mismatch (payload: "${canonicalPayload.taskId}", auth: "${auth.task_id}").`
+      );
+    }
+    const normalizedPayloadAttempt = canonicalPayload.attemptId ?? null;
+    const normalizedAuthAttempt = auth.attempt_id ?? null;
+    if (normalizedPayloadAttempt !== normalizedAuthAttempt) {
+      throw new Error(
+        `EXECUTION_AUTHORIZATION_TAMPERED: Canonical payload attemptId mismatch (payload: "${normalizedPayloadAttempt}", auth: "${normalizedAuthAttempt}").`
+      );
+    }
+    if (canonicalPayload.managerMessageId !== auth.manager_message_id) {
+      throw new Error(
+        `EXECUTION_AUTHORIZATION_TAMPERED: Canonical payload managerMessageId mismatch (payload: "${canonicalPayload.managerMessageId}", auth: "${auth.manager_message_id}").`
+      );
+    }
+    if (canonicalPayload.managerPayloadHash !== auth.manager_payload_hash) {
+      throw new Error(
+        `EXECUTION_AUTHORIZATION_TAMPERED: Canonical payload managerPayloadHash mismatch (payload: "${canonicalPayload.managerPayloadHash}", auth: "${auth.manager_payload_hash}").`
+      );
+    }
+
+    // 8. Parse canonical_instructions_json and context_files_json as string arrays
     let canonicalInstructions: string[];
     try {
       canonicalInstructions = JSON.parse(auth.canonical_instructions_json);
@@ -76,7 +130,6 @@ export class PackageGenerator {
       throw new Error(`EXECUTION_AUTHORIZATION_CORRUPTED: Invalid canonical_instructions_json (${err.message})`);
     }
 
-    // 6. Parse and Validate Context Files
     let contextFiles: string[];
     try {
       contextFiles = JSON.parse(auth.context_files_json);
@@ -87,29 +140,52 @@ export class PackageGenerator {
       throw new Error(`EXECUTION_AUTHORIZATION_CORRUPTED: Invalid context_files_json (${err.message})`);
     }
 
-    // 7. Verify Integrity of Context Manifest Hash
-    const recomputedContextHash = computeContextManifestHash(contextFiles);
+    // 9. Require exact deep equality between payload and authorization record fields
+    if (
+      canonicalPayload.instructions.length !== canonicalInstructions.length ||
+      !canonicalPayload.instructions.every((val, idx) => val === canonicalInstructions[idx])
+    ) {
+      throw new Error('EXECUTION_AUTHORIZATION_TAMPERED: Canonical instructions mismatch between payload and authorization record.');
+    }
+
+    if (
+      canonicalPayload.contextFiles.length !== contextFiles.length ||
+      !canonicalPayload.contextFiles.every((val, idx) => val === contextFiles[idx])
+    ) {
+      throw new Error('EXECUTION_AUTHORIZATION_TAMPERED: Context files mismatch between payload and authorization record.');
+    }
+
+    // 10. Recompute Context Manifest Hash and verify exact equality
+    const recomputedContextHash = computeContextManifestHash(canonicalPayload.contextFiles);
     if (recomputedContextHash !== auth.context_manifest_hash) {
       throw new Error('EXECUTION_AUTHORIZATION_TAMPERED: Context manifest hash mismatch.');
     }
 
-    // 8. Verify Instruction Payload Hash Format
+    // 11. Early format guard and CRITICAL cryptographic instruction payload hash recomputation
     if (!auth.instruction_payload_hash || !/^[0-9a-f]{64}$/i.test(auth.instruction_payload_hash)) {
-      throw new Error('EXECUTION_AUTHORIZATION_TAMPERED: Invalid instruction payload hash.');
+      throw new Error('EXECUTION_AUTHORIZATION_TAMPERED: Invalid instruction payload hash format.');
+    }
+
+    const recomputedPayloadHash = computePayloadHash(canonicalPayload);
+    if (recomputedPayloadHash !== auth.instruction_payload_hash) {
+      throw new Error(
+        `EXECUTION_AUTHORIZATION_TAMPERED: Instruction payload hash mismatch (computed: "${recomputedPayloadHash}", stored: "${auth.instruction_payload_hash}").`
+      );
     }
 
     const testCmd = verificationCommands.test || 'npm test';
     const lintCmd = verificationCommands.lint || 'npm run lint';
     const buildCmd = verificationCommands.build || 'npm run build';
 
+    // 12. Render instructions and context ONLY from verified frozen canonicalPayload
     const renderedInstructions =
-      canonicalInstructions.length > 0
-        ? canonicalInstructions.map((inst, i) => `${i + 1}. ${inst}`).join('\n')
+      canonicalPayload.instructions.length > 0
+        ? canonicalPayload.instructions.map((inst, i) => `${i + 1}. ${inst}`).join('\n')
         : '1. No specific instructions provided.';
 
     const renderedContextFiles =
-      contextFiles.length > 0
-        ? contextFiles.map((f) => `- \`${f}\``).join('\n')
+      canonicalPayload.contextFiles.length > 0
+        ? canonicalPayload.contextFiles.map((f) => `- \`${f}\``).join('\n')
         : 'None specified.';
 
     return `# AgentForge Authorized Manual Handoff
