@@ -140,8 +140,8 @@ export class BootstrapService {
     // 5. Initialize Provider Registry with supported adapters
     const providerRegistry = new ProviderRegistry();
     providerRegistry.register(new ManualBridgeAdapter());
-    // Codex CLI registered as unverified on this host (contractVerified=false); fails closed on execute
-    providerRegistry.register(new CodexCliAdapter({ repo, artifactStore, contractVerified: false }));
+    // Codex CLI registered as unverified on this host; fails closed on execute
+    providerRegistry.register(new CodexCliAdapter({ repo, artifactStore }));
 
     return {
       db,

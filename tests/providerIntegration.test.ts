@@ -170,26 +170,28 @@ describe('PR #5 — Provider Integration Foundation', () => {
     );
   });
 
-  // 4. Missing Codex -> OFFLINE, no crash
-  it('4. Missing Codex CLI on this host yields OFFLINE health without crashing', async () => {
+  // 4. Missing Codex -> OFFLINE, no crash, empty capabilities
+  it('4. Codex CLI on this host yields OFFLINE health and empty capabilities without crashing', async () => {
     const adapter = new CodexCliAdapter({
       repo,
       artifactStore,
-      contractVerified: false,
     });
 
     const health = await adapter.getHealth();
     expect(health).toBe('OFFLINE');
+
+    const capabilities = await adapter.getCapabilities();
+    expect(capabilities).toEqual([]);
   });
 
-  // 5. Unverified Codex execute -> FAIL CLOSED / NO SPAWN
-  it('5. Unverified Codex CLI execute() fails closed immediately without spawning child processes', async () => {
+  // 5. Unverified Codex execute -> FAIL CLOSED / NO SPAWN / NO WORKSPACE MODIFICATION
+  it('5. Codex CLI execute() fails closed with CODEX_CLI_UNAVAILABLE, creates no ProcessRun, and modifies no workspace files', async () => {
     const initialRunCount = repo.getProcessRunsByProject('PROJ-TEST').length;
+    const initialFileContent = fs.readFileSync(path.join(repoDir, 'index.js'), 'utf8');
 
     const adapter = new CodexCliAdapter({
       repo,
       artifactStore,
-      contractVerified: false,
     });
 
     const result = await adapter.execute({
@@ -205,6 +207,30 @@ describe('PR #5 — Provider Integration Foundation', () => {
     // Verify zero processes spawned in SQLite
     const finalRunCount = repo.getProcessRunsByProject('PROJ-TEST').length;
     expect(finalRunCount).toBe(initialRunCount);
+
+    // Verify workspace remained unmodified
+    const finalFileContent = fs.readFileSync(path.join(repoDir, 'index.js'), 'utf8');
+    expect(finalFileContent).toBe(initialFileContent);
+  });
+
+  // 5b. No public escape hatch option on CodexCliAdapter
+  it('5b. CodexCliAdapter has no boolean escape hatch or public option enabling unverified execution', async () => {
+    // Attempt instantiation with ad-hoc options - execute must still fail closed
+    const adapter = new CodexCliAdapter({
+      repo,
+      artifactStore,
+      executable: 'node',
+    } as any);
+
+    const result = await adapter.execute({
+      taskId: 'TSK-TEST-001',
+      projectId: 'PROJ-TEST',
+      instructions: ['Attempt execution with fake executable option'],
+      contextFiles: ['index.js'],
+    });
+
+    expect(result.status).toBe('FAILED');
+    expect(result.error).toContain('CODEX_CLI_UNAVAILABLE');
   });
 
   // 6 & 7. Antigravity automated adapter absent & mode is MANUAL_BRIDGE_ONLY
