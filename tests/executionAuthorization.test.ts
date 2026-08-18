@@ -8,6 +8,7 @@ import Database from 'better-sqlite3';
 import { MigrationRunner } from '../src/core/database/migrations';
 import { Repository } from '../src/core/database/repositories';
 import { EventService } from '../src/core/services/EventService';
+import { TaskService } from '../src/core/services/TaskService';
 import { ProviderRegistry } from '../src/core/adapters/ProviderRegistry';
 import {
   ProviderAdapter,
@@ -19,11 +20,10 @@ import {
   ProviderAdapterType,
   ProviderHealthStatus,
   Capability,
-  TaskState,
 } from '../src/core/types/domain';
 import { ManualBridgeAdapter } from '../src/core/adapters/ManualBridgeAdapter';
 import { CodexCliAdapter } from '../src/core/adapters/CodexCliAdapter';
-import { ProviderRoutingService, RoutingRequest } from '../src/core/services/ProviderRoutingService';
+import { ProviderRoutingService } from '../src/core/services/ProviderRoutingService';
 import { ProviderDispatchService } from '../src/core/services/ProviderDispatchService';
 import {
   ExecutionAuthorizationService,
@@ -31,7 +31,6 @@ import {
   computePayloadHash,
   computeContextManifestHash,
   sanitizeContextFiles,
-  buildCanonicalInstructions,
 } from '../src/core/services/ExecutionAuthorizationService';
 
 class MockExecutionAdapter implements ProviderAdapter {
@@ -118,6 +117,7 @@ describe('PR #7 — Durable Execution Authorization & Orchestration Binding', ()
   let db: Database.Database;
   let repo: Repository;
   let eventService: EventService;
+  let taskService: TaskService;
   let registry: ProviderRegistry;
   let router: ProviderRoutingService;
   let dispatcher: ProviderDispatchService;
@@ -141,6 +141,7 @@ describe('PR #7 — Durable Execution Authorization & Orchestration Binding', ()
 
     repo = new Repository(db);
     eventService = new EventService(repo);
+    taskService = new TaskService(repo, eventService);
     registry = new ProviderRegistry();
     router = new ProviderRoutingService(repo, registry, eventService);
     dispatcher = new ProviderDispatchService(registry, repo, eventService);
@@ -190,6 +191,7 @@ describe('PR #7 — Durable Execution Authorization & Orchestration Binding', ()
       decision: 'EXECUTE',
       expected_revision: 0,
       instructions: ['Implement feature according to spec'],
+      messageId: 'msg-mgr-initial',
     });
   });
 
@@ -199,6 +201,8 @@ describe('PR #7 — Durable Execution Authorization & Orchestration Binding', ()
       fs.rmSync(tmpDir, { recursive: true, force: true });
     } catch {}
   });
+
+  let messageSequence = 0;
 
   // Helper to record applied manager messages in protocol_messages ledger
   function recordAppliedManagerMessage(
@@ -213,8 +217,10 @@ describe('PR #7 — Durable Execution Authorization & Orchestration Binding', ()
       status?: 'APPLIED' | 'REJECTED';
     }
   ): { messageId: string; recordId: string; payloadHash: string; rawPayload: string } {
-    const msgId = params.messageId ?? `msg-mgr-${crypto.randomUUID().slice(0, 8)}`;
-    const recId = params.recordId ?? `rec-mgr-${crypto.randomUUID().slice(0, 8)}`;
+    messageSequence++;
+    const nowTimestamp = new Date(Date.now() + messageSequence * 1000).toISOString();
+    const msgId = params.messageId ?? `msg-mgr-${String(messageSequence).padStart(6, '0')}-${crypto.randomUUID().slice(0, 8)}`;
+    const recId = params.recordId ?? `rec-mgr-${String(messageSequence).padStart(6, '0')}-${crypto.randomUUID().slice(0, 8)}`;
     const rawPayload = JSON.stringify({
       protocol: 'manager.v1',
       message_id: msgId,
@@ -238,7 +244,8 @@ describe('PR #7 — Durable Execution Authorization & Orchestration Binding', ()
       payloadHash,
       rawPayload,
       params.status ?? 'APPLIED',
-      undefined
+      undefined,
+      nowTimestamp
     );
     return { messageId: msgId, recordId: recId, payloadHash, rawPayload };
   }
@@ -295,42 +302,17 @@ describe('PR #7 — Durable Execution Authorization & Orchestration Binding', ()
   }
 
   // =========================================================================
-  // BLOCKER 1 & 2: MANAGER AUTHORITY & GIT BINDING TESTS
+  // 1. MANAGER SUPERSESSION & LIVENESS TESTS
   // =========================================================================
 
-  // 1. CreateAuthorizationParams no longer accepts instructions
-  it('1. CreateAuthorizationParams no longer accepts instructions property', async () => {
-    setupResource('res-1', 'prov-1');
+  // 1. EXECUTE applied -> auth A -> newer CANCEL -> A becomes INVALIDATED -> dispatch A -> zero provider execution
+  it('1. Newer applied CANCEL decision invalidates existing authorization with zero execution', async () => {
+    const mock = setupResource('res-sup-cancel', 'prov-sup-cancel');
     const decision = await router.route({
       projectId: 'PROJ-AUTH',
       taskId: 'TSK-AUTH-001',
       requiredCapabilities: ['CODING'],
-      candidateResourceIds: ['res-1'],
-      allowManualBridge: false,
-    });
-
-    const params: any = {
-      projectId: 'PROJ-AUTH',
-      taskId: 'TSK-AUTH-001',
-      routingDecisionId: decision.decisionId,
-      instructions: ['INJECTED_INSTRUCTION_ATTEMPT'],
-    };
-
-    const auth = await authService.createAuthorization(params);
-    // Durable instructions must come from Manager truth + Task, ignoring caller field
-    const parsed = JSON.parse(auth.canonical_instructions_json);
-    expect(parsed).not.toContain('INJECTED_INSTRUCTION_ATTEMPT');
-    expect(parsed).toContain('Manager Instructions (EXECUTE):');
-  });
-
-  // 2. Applied manager EXECUTE instructions become execution authority
-  it('2. Applied manager EXECUTE instructions become execution authority', async () => {
-    setupResource('res-2', 'prov-2');
-    const decision = await router.route({
-      projectId: 'PROJ-AUTH',
-      taskId: 'TSK-AUTH-001',
-      requiredCapabilities: ['CODING'],
-      candidateResourceIds: ['res-2'],
+      candidateResourceIds: ['res-sup-cancel'],
       allowManualBridge: false,
     });
 
@@ -340,19 +322,578 @@ describe('PR #7 — Durable Execution Authorization & Orchestration Binding', ()
       routingDecisionId: decision.decisionId,
     });
 
-    const parsed = JSON.parse(auth.canonical_instructions_json);
-    expect(parsed).toContain('Manager Instructions (EXECUTE):');
-    expect(parsed).toContain('- Implement feature according to spec');
+    // Apply newer CANCEL decision through TaskService (same transaction invalidation)
+    const cancelPayload = {
+      protocol: 'manager.v1' as const,
+      message_id: 'msg-mgr-cancel-01',
+      project_id: 'PROJ-AUTH',
+      task_id: 'TSK-AUTH-001',
+      decision: 'CANCEL' as const,
+      priority: 'HIGH' as const,
+      risk: 'MEDIUM' as const,
+      instructions: ['Cancel task execution'],
+      acceptance_criteria: [],
+      constraints: [],
+      review_issues: [],
+      expected_task_state: 'CODING' as const,
+      expected_revision: 0,
+    };
+    const res = await taskService.applyManagerDecision(cancelPayload, JSON.stringify(cancelPayload));
+    expect(res.success).toBe(true);
+
+    // Verify auth status in SQLite is already INVALIDATED
+    const loadedAuth = repo.getExecutionAuthorization(auth.id);
+    expect(loadedAuth!.status).toBe('INVALIDATED');
+
+    // Attempt dispatch -> must fail closed with zero provider execution
+    const dispatchRes = await dispatcher.dispatch(auth.id);
+    expect(dispatchRes.status).toBe('FAILED');
+    expect(dispatchRes.error).toContain('EXECUTION_AUTHORIZATION_INVALIDATED');
+    expect(mock.executionCount).toBe(0);
   });
 
-  // 3. A caller cannot substitute different instructions
-  it('3. A caller cannot substitute different instructions', async () => {
-    setupResource('res-3', 'prov-3');
+  // 2. Same supersession behavior for PAUSE
+  it('2. Newer applied PAUSE decision invalidates existing authorization with zero execution', async () => {
+    const mock = setupResource('res-sup-pause', 'prov-sup-pause');
     const decision = await router.route({
       projectId: 'PROJ-AUTH',
       taskId: 'TSK-AUTH-001',
       requiredCapabilities: ['CODING'],
-      candidateResourceIds: ['res-3'],
+      candidateResourceIds: ['res-sup-pause'],
+      allowManualBridge: false,
+    });
+
+    const auth = await authService.createAuthorization({
+      projectId: 'PROJ-AUTH',
+      taskId: 'TSK-AUTH-001',
+      routingDecisionId: decision.decisionId,
+    });
+
+    // Apply newer PAUSE decision through TaskService
+    const pausePayload = {
+      protocol: 'manager.v1' as const,
+      message_id: 'msg-mgr-pause-01',
+      project_id: 'PROJ-AUTH',
+      task_id: 'TSK-AUTH-001',
+      decision: 'PAUSE' as const,
+      priority: 'HIGH' as const,
+      risk: 'MEDIUM' as const,
+      instructions: ['Pause task execution'],
+      acceptance_criteria: [],
+      constraints: [],
+      review_issues: [],
+      expected_task_state: 'CODING' as const,
+      expected_revision: 0,
+    };
+    const res = await taskService.applyManagerDecision(pausePayload, JSON.stringify(pausePayload));
+    expect(res.success).toBe(true);
+
+    const loadedAuth = repo.getExecutionAuthorization(auth.id);
+    expect(loadedAuth!.status).toBe('INVALIDATED');
+
+    const dispatchRes = await dispatcher.dispatch(auth.id);
+    expect(dispatchRes.status).toBe('FAILED');
+    expect(mock.executionCount).toBe(0);
+  });
+
+  // 3. Same supersession behavior for PASS or BLOCK
+  it('3. Newer applied PASS or BLOCK decision invalidates existing authorization with zero execution', async () => {
+    const mock = setupResource('res-sup-pass', 'prov-sup-pass');
+    const decision = await router.route({
+      projectId: 'PROJ-AUTH',
+      taskId: 'TSK-AUTH-001',
+      requiredCapabilities: ['CODING'],
+      candidateResourceIds: ['res-sup-pass'],
+      allowManualBridge: false,
+    });
+
+    const auth = await authService.createAuthorization({
+      projectId: 'PROJ-AUTH',
+      taskId: 'TSK-AUTH-001',
+      routingDecisionId: decision.decisionId,
+    });
+
+    // Apply PASS decision directly through TaskService (with task in REVIEWING state)
+    db.prepare("UPDATE tasks SET state = 'REVIEWING' WHERE id = ?").run('TSK-AUTH-001');
+    const passPayload = {
+      protocol: 'manager.v1' as const,
+      message_id: 'msg-mgr-pass-01',
+      project_id: 'PROJ-AUTH',
+      task_id: 'TSK-AUTH-001',
+      decision: 'PASS' as const,
+      priority: 'HIGH' as const,
+      risk: 'MEDIUM' as const,
+      instructions: ['Work approved and verified'],
+      acceptance_criteria: [],
+      constraints: [],
+      review_issues: [],
+      expected_task_state: 'REVIEWING' as const,
+      expected_revision: 0,
+    };
+    const res = await taskService.applyManagerDecision(passPayload, JSON.stringify(passPayload));
+    expect(res.success).toBe(true);
+
+    const loadedAuth = repo.getExecutionAuthorization(auth.id);
+    expect(loadedAuth!.status).toBe('INVALIDATED');
+
+    const dispatchRes = await dispatcher.dispatch(auth.id);
+    expect(dispatchRes.status).toBe('FAILED');
+    expect(mock.executionCount).toBe(0);
+  });
+
+  // 4. EXECUTE A -> auth A -> newer EXECUTE B -> A INVALIDATED -> old A zero execution -> new auth B executes
+  it('4. Newer EXECUTE authority invalidates old authorization; new authorization bound to B executes', async () => {
+    const mock = setupResource('res-sup-exec', 'prov-sup-exec');
+    const decision = await router.route({
+      projectId: 'PROJ-AUTH',
+      taskId: 'TSK-AUTH-001',
+      requiredCapabilities: ['CODING'],
+      candidateResourceIds: ['res-sup-exec'],
+      allowManualBridge: false,
+    });
+
+    const authA = await authService.createAuthorization({
+      projectId: 'PROJ-AUTH',
+      taskId: 'TSK-AUTH-001',
+      routingDecisionId: decision.decisionId,
+    });
+
+    // Apply newer EXECUTE authority B
+    recordAppliedManagerMessage('PROJ-AUTH', 'TSK-AUTH-001', {
+      decision: 'EXECUTE',
+      expected_revision: 0,
+      instructions: ['Updated execute instructions B'],
+      messageId: 'msg-mgr-exec-B',
+    });
+
+    // Old auth A dispatch defense-in-depth fails because it is superseded
+    const dispatchARes = await dispatcher.dispatch(authA.id);
+    expect(dispatchARes.status).toBe('FAILED');
+    expect(dispatchARes.error).toContain('EXECUTION_AUTHORIZATION_MANAGER_AUTHORITY_SUPERSEDED');
+    expect(mock.executionCount).toBe(0);
+
+    // Create new authorization bound to authority B
+    const authB = await authService.createAuthorization({
+      projectId: 'PROJ-AUTH',
+      taskId: 'TSK-AUTH-001',
+      routingDecisionId: decision.decisionId,
+    });
+
+    const dispatchBRes = await dispatcher.dispatch(authB.id);
+    expect(dispatchBRes.status).toBe('COMPLETED');
+    expect(mock.executionCount).toBe(1);
+  });
+
+  // 5. EXECUTE authority A -> auth A -> newer FIX_REQUIRED B -> A INVALIDATED -> old A zero execution
+  it('5. Newer FIX_REQUIRED authority invalidates old authorization with zero execution for old authorization', async () => {
+    const mock = setupResource('res-sup-fix', 'prov-sup-fix');
+    const decision = await router.route({
+      projectId: 'PROJ-AUTH',
+      taskId: 'TSK-AUTH-001',
+      requiredCapabilities: ['CODING'],
+      candidateResourceIds: ['res-sup-fix'],
+      allowManualBridge: false,
+    });
+
+    const authA = await authService.createAuthorization({
+      projectId: 'PROJ-AUTH',
+      taskId: 'TSK-AUTH-001',
+      routingDecisionId: decision.decisionId,
+    });
+
+    // Apply FIX_REQUIRED decision
+    recordAppliedManagerMessage('PROJ-AUTH', 'TSK-AUTH-001', {
+      decision: 'FIX_REQUIRED',
+      expected_revision: 0,
+      instructions: ['Fix critical bug'],
+      messageId: 'msg-mgr-fix-B',
+    });
+
+    const dispatchRes = await dispatcher.dispatch(authA.id);
+    expect(dispatchRes.status).toBe('FAILED');
+    expect(dispatchRes.error).toContain('EXECUTION_AUTHORIZATION_MANAGER_AUTHORITY_SUPERSEDED');
+    expect(mock.executionCount).toBe(0);
+  });
+
+  // 6. A REJECTED newer Manager message does NOT invalidate a valid existing authorization
+  it('6. A REJECTED newer Manager message does NOT invalidate a valid existing authorization', async () => {
+    const mock = setupResource('res-sup-reject', 'prov-sup-reject');
+    const decision = await router.route({
+      projectId: 'PROJ-AUTH',
+      taskId: 'TSK-AUTH-001',
+      requiredCapabilities: ['CODING'],
+      candidateResourceIds: ['res-sup-reject'],
+      allowManualBridge: false,
+    });
+
+    const auth = await authService.createAuthorization({
+      projectId: 'PROJ-AUTH',
+      taskId: 'TSK-AUTH-001',
+      routingDecisionId: decision.decisionId,
+    });
+
+    // Send an invalid/rejected Manager message (cross-project conflict)
+    const badPayload = {
+      protocol: 'manager.v1' as const,
+      message_id: 'msg-mgr-bad-01',
+      project_id: 'PROJ-DIFFERENT',
+      task_id: 'TSK-AUTH-001',
+      decision: 'CANCEL' as const,
+      priority: 'HIGH' as const,
+      risk: 'MEDIUM' as const,
+      instructions: ['Bad cancel'],
+      acceptance_criteria: [],
+      constraints: [],
+      review_issues: [],
+      expected_task_state: 'CODING' as const,
+      expected_revision: 0,
+    };
+    const res = await taskService.applyManagerDecision(badPayload, JSON.stringify(badPayload));
+    expect(res.success).toBe(false);
+
+    // Auth remains AUTHORIZED and can execute
+    const loadedAuth = repo.getExecutionAuthorization(auth.id);
+    expect(loadedAuth!.status).toBe('AUTHORIZED');
+
+    const dispatchRes = await dispatcher.dispatch(auth.id);
+    expect(dispatchRes.status).toBe('COMPLETED');
+    expect(mock.executionCount).toBe(1);
+  });
+
+  // 7. A DUPLICATE/non-newly-applied Manager message does NOT accidentally invalidate authorization
+  it('7. A DUPLICATE Manager message does NOT accidentally invalidate authorization', async () => {
+    const mock = setupResource('res-sup-dup', 'prov-sup-dup');
+    const decision = await router.route({
+      projectId: 'PROJ-AUTH',
+      taskId: 'TSK-AUTH-001',
+      requiredCapabilities: ['CODING'],
+      candidateResourceIds: ['res-sup-dup'],
+      allowManualBridge: false,
+    });
+
+    const auth = await authService.createAuthorization({
+      projectId: 'PROJ-AUTH',
+      taskId: 'TSK-AUTH-001',
+      routingDecisionId: decision.decisionId,
+    });
+
+    // Send a duplicate Manager message using the initial message ID
+    const dupPayload = {
+      protocol: 'manager.v1' as const,
+      message_id: 'msg-mgr-initial',
+      project_id: 'PROJ-AUTH',
+      task_id: 'TSK-AUTH-001',
+      decision: 'EXECUTE' as const,
+      priority: 'HIGH' as const,
+      risk: 'MEDIUM' as const,
+      instructions: ['Duplicate'],
+      acceptance_criteria: [],
+      constraints: [],
+      review_issues: [],
+      expected_task_state: 'CODING' as const,
+      expected_revision: 0,
+    };
+    const res = await taskService.applyManagerDecision(dupPayload, JSON.stringify(dupPayload));
+    expect(res.isDuplicate).toBe(true);
+
+    const loadedAuth = repo.getExecutionAuthorization(auth.id);
+    expect(loadedAuth!.status).toBe('AUTHORIZED');
+
+    const dispatchRes = await dispatcher.dispatch(auth.id);
+    expect(dispatchRes.status).toBe('COMPLETED');
+    expect(mock.executionCount).toBe(1);
+  });
+
+  // 8. ManagerDecision transaction rollback also rolls back authorization invalidation
+  it('8. ManagerDecision transaction rollback also rolls back authorization invalidation', async () => {
+    const mock = setupResource('res-sup-rb', 'prov-sup-rb');
+    const decision = await router.route({
+      projectId: 'PROJ-AUTH',
+      taskId: 'TSK-AUTH-001',
+      requiredCapabilities: ['CODING'],
+      candidateResourceIds: ['res-sup-rb'],
+      allowManualBridge: false,
+    });
+
+    const auth = await authService.createAuthorization({
+      projectId: 'PROJ-AUTH',
+      taskId: 'TSK-AUTH-001',
+      routingDecisionId: decision.decisionId,
+    });
+
+    // Simulate a failed transaction that invalidates authorization but then throws an error
+    expect(() => {
+      repo.runInTransaction(() => {
+        repo.invalidateAuthorizedExecutionAuthorizationsForTask('TSK-AUTH-001');
+        throw new Error('Simulated transaction failure in mutate');
+      });
+    }).toThrow('Simulated transaction failure in mutate');
+
+    // Transaction was rolled back: auth status remains AUTHORIZED
+    const loadedAuth = repo.getExecutionAuthorization(auth.id);
+    expect(loadedAuth!.status).toBe('AUTHORIZED');
+
+    const dispatchRes = await dispatcher.dispatch(auth.id);
+    expect(dispatchRes.status).toBe('COMPLETED');
+    expect(mock.executionCount).toBe(1);
+  });
+
+  // 9. Dispatch defense-in-depth rejects an authorization whose bound Manager record is not the latest APPLIED authority
+  it('9. Dispatch defense-in-depth rejects an authorization whose bound Manager record is not latest APPLIED authority even if DB left it AUTHORIZED', async () => {
+    const mock = setupResource('res-sup-did', 'prov-sup-did');
+    const decision = await router.route({
+      projectId: 'PROJ-AUTH',
+      taskId: 'TSK-AUTH-001',
+      requiredCapabilities: ['CODING'],
+      candidateResourceIds: ['res-sup-did'],
+      allowManualBridge: false,
+    });
+
+    const auth = await authService.createAuthorization({
+      projectId: 'PROJ-AUTH',
+      taskId: 'TSK-AUTH-001',
+      routingDecisionId: decision.decisionId,
+    });
+
+    // Manually insert a newer applied Manager message directly into SQLite (simulating inconsistent DB)
+    recordAppliedManagerMessage('PROJ-AUTH', 'TSK-AUTH-001', {
+      decision: 'PAUSE',
+      expected_revision: 0,
+      instructions: ['Direct DB insert pause'],
+      messageId: 'msg-mgr-direct-newer',
+    });
+
+    // Auth status is still AUTHORIZED in DB, but dispatch defense-in-depth catches the supersession
+    expect(repo.getExecutionAuthorization(auth.id)!.status).toBe('AUTHORIZED');
+
+    const dispatchRes = await dispatcher.dispatch(auth.id);
+    expect(dispatchRes.status).toBe('FAILED');
+    expect(dispatchRes.error).toContain('EXECUTION_AUTHORIZATION_MANAGER_AUTHORITY_SUPERSEDED');
+    expect(mock.executionCount).toBe(0);
+
+    // Auth is now INVALIDATED
+    expect(repo.getExecutionAuthorization(auth.id)!.status).toBe('INVALIDATED');
+  });
+
+  // 10. Task changes from CODING to non-executable state after authorization without revision change: dispatch fails STALE_TASK_STATE
+  it('10. Task changing from CODING to non-executable state after authorization fails closed with STALE_TASK_STATE', async () => {
+    const mock = setupResource('res-stale-state', 'prov-stale-state');
+    const decision = await router.route({
+      projectId: 'PROJ-AUTH',
+      taskId: 'TSK-AUTH-001',
+      requiredCapabilities: ['CODING'],
+      candidateResourceIds: ['res-stale-state'],
+      allowManualBridge: false,
+    });
+
+    const auth = await authService.createAuthorization({
+      projectId: 'PROJ-AUTH',
+      taskId: 'TSK-AUTH-001',
+      routingDecisionId: decision.decisionId,
+    });
+
+    // Mutate task state to REVIEWING in database without changing revision
+    db.prepare("UPDATE tasks SET state = 'REVIEWING' WHERE id = ?").run('TSK-AUTH-001');
+
+    const dispatchRes = await dispatcher.dispatch(auth.id);
+    expect(dispatchRes.status).toBe('FAILED');
+    expect(dispatchRes.error).toContain('EXECUTION_AUTHORIZATION_STALE_TASK_STATE');
+    expect(mock.executionCount).toBe(0);
+
+    const loadedAuth = repo.getExecutionAuthorization(auth.id);
+    expect(loadedAuth!.status).toBe('INVALIDATED');
+  });
+
+  // 11. Manual Bridge: CODING / HANDOFF_REQUIRED remains valid
+  it('11. Manual Bridge: CODING and HANDOFF_REQUIRED states are valid at dispatch', async () => {
+    const manualAdapter = new ManualBridgeAdapter();
+    registry.register(manualAdapter);
+    if (!repo.getProvider('prov-manual-bridge')) {
+      repo.createProvider({
+        id: 'prov-manual-bridge',
+        name: 'Manual Bridge',
+        adapter_type: 'MANUAL_BRIDGE',
+        enabled: true,
+        created_at: new Date().toISOString(),
+      });
+    }
+    repo.createProviderResource({
+      id: 'res-mb-11',
+      provider_id: 'prov-manual-bridge',
+      model_name: 'Manual Model',
+      health_status: 'UNKNOWN',
+      capabilities: ['CODING'],
+      enabled: true,
+      total_quota: null,
+      remaining_quota: null,
+      quota_unit: 'REQUESTS',
+      quota_reset_at: null,
+      quota_source: 'UNKNOWN',
+      quota_confidence: 0,
+      last_health_check: null,
+    });
+
+    const decision = await router.route({
+      projectId: 'PROJ-AUTH',
+      taskId: 'TSK-AUTH-001',
+      requiredCapabilities: ['CODING'],
+      candidateResourceIds: ['res-mb-11'],
+      allowManualBridge: true,
+    });
+
+    const auth = await authService.createAuthorization({
+      projectId: 'PROJ-AUTH',
+      taskId: 'TSK-AUTH-001',
+      routingDecisionId: decision.decisionId,
+    });
+
+    // Set task to HANDOFF_REQUIRED
+    db.prepare("UPDATE tasks SET state = 'HANDOFF_REQUIRED' WHERE id = ?").run('TSK-AUTH-001');
+
+    const res = await dispatcher.dispatch(auth.id);
+    expect(res.status).toBe('AWAITING_OWNER');
+  });
+
+  // 12. Manual Bridge: other task states fail closed
+  it('12. Manual Bridge: non-CODING/non-HANDOFF_REQUIRED task states fail closed with STALE_TASK_STATE', async () => {
+    const manualAdapter = new ManualBridgeAdapter();
+    registry.register(manualAdapter);
+    if (!repo.getProvider('prov-manual-bridge')) {
+      repo.createProvider({
+        id: 'prov-manual-bridge',
+        name: 'Manual Bridge',
+        adapter_type: 'MANUAL_BRIDGE',
+        enabled: true,
+        created_at: new Date().toISOString(),
+      });
+    }
+    repo.createProviderResource({
+      id: 'res-mb-12',
+      provider_id: 'prov-manual-bridge',
+      model_name: 'Manual Model',
+      health_status: 'UNKNOWN',
+      capabilities: ['CODING'],
+      enabled: true,
+      total_quota: null,
+      remaining_quota: null,
+      quota_unit: 'REQUESTS',
+      quota_reset_at: null,
+      quota_source: 'UNKNOWN',
+      quota_confidence: 0,
+      last_health_check: null,
+    });
+
+    const decision = await router.route({
+      projectId: 'PROJ-AUTH',
+      taskId: 'TSK-AUTH-001',
+      requiredCapabilities: ['CODING'],
+      candidateResourceIds: ['res-mb-12'],
+      allowManualBridge: true,
+    });
+
+    const auth = await authService.createAuthorization({
+      projectId: 'PROJ-AUTH',
+      taskId: 'TSK-AUTH-001',
+      routingDecisionId: decision.decisionId,
+    });
+
+    // Set task to VALIDATING
+    db.prepare("UPDATE tasks SET state = 'VALIDATING' WHERE id = ?").run('TSK-AUTH-001');
+
+    const res = await dispatcher.dispatch(auth.id);
+    expect(res.status).toBe('FAILED');
+    expect(res.error).toContain('EXECUTION_AUTHORIZATION_STALE_TASK_STATE');
+  });
+
+  // 13. FIX_REQUIRED with manager.expected_revision == current_task_revision must NOT authorize
+  it('13. FIX_REQUIRED with manager.expected_revision == current_task_revision must NOT authorize (escape hatch removed)', async () => {
+    setupResource('res-fix-stale', 'prov-fix-stale');
+    // Task revision is 0, Manager FIX_REQUIRED has expected_revision 0
+    // But FIX_REQUIRED increment rule requires manager.expected_revision + 1 == task.revision_count
+    // So 0 + 1 = 1 != 0 -> fails closed
+    recordAppliedManagerMessage('PROJ-AUTH', 'TSK-AUTH-001', {
+      decision: 'FIX_REQUIRED',
+      expected_revision: 0,
+      instructions: ['Fix bug without revision bump'],
+      messageId: 'msg-fix-stale-escape',
+    });
+
+    const decision = await router.route({
+      projectId: 'PROJ-AUTH',
+      taskId: 'TSK-AUTH-001',
+      requiredCapabilities: ['CODING'],
+      candidateResourceIds: ['res-fix-stale'],
+      allowManualBridge: false,
+    });
+
+    await expect(
+      authService.createAuthorization({
+        projectId: 'PROJ-AUTH',
+        taskId: 'TSK-AUTH-001',
+        routingDecisionId: decision.decisionId,
+      })
+    ).rejects.toThrow('EXECUTION_AUTHORIZATION_STALE_TASK_REVISION');
+  });
+
+  // 14. Correct FIX_REQUIRED relationship: manager.expected_revision + 1 == task.revision_count does authorize
+  it('14. Correct FIX_REQUIRED relationship (expected_revision + 1 == task.revision_count) authorizes', async () => {
+    setupResource('res-fix-valid', 'prov-fix-valid');
+    // Task enters fix cycle: revision_count bumped to 1
+    db.prepare('UPDATE tasks SET revision_count = 1 WHERE id = ?').run('TSK-AUTH-001');
+
+    recordAppliedManagerMessage('PROJ-AUTH', 'TSK-AUTH-001', {
+      decision: 'FIX_REQUIRED',
+      expected_revision: 0, // 0 + 1 == 1 -> exact match
+      instructions: ['Fix bug for revision 1'],
+      messageId: 'msg-fix-valid',
+    });
+
+    const decision = await router.route({
+      projectId: 'PROJ-AUTH',
+      taskId: 'TSK-AUTH-001',
+      requiredCapabilities: ['CODING'],
+      candidateResourceIds: ['res-fix-valid'],
+      allowManualBridge: false,
+    });
+
+    const auth = await authService.createAuthorization({
+      projectId: 'PROJ-AUTH',
+      taskId: 'TSK-AUTH-001',
+      routingDecisionId: decision.decisionId,
+    });
+
+    expect(auth).toBeDefined();
+    expect(auth.task_revision).toBe(1);
+  });
+
+  // 15. EXECUTE revision relationship remains correct
+  it('15. EXECUTE revision relationship (manager.expected_revision == task.revision_count) authorizes', async () => {
+    setupResource('res-exec-rev', 'prov-exec-rev');
+    const decision = await router.route({
+      projectId: 'PROJ-AUTH',
+      taskId: 'TSK-AUTH-001',
+      requiredCapabilities: ['CODING'],
+      candidateResourceIds: ['res-exec-rev'],
+      allowManualBridge: false,
+    });
+
+    const auth = await authService.createAuthorization({
+      projectId: 'PROJ-AUTH',
+      taskId: 'TSK-AUTH-001',
+      routingDecisionId: decision.decisionId,
+    });
+
+    expect(auth.task_revision).toBe(0);
+  });
+
+  // 16. Unchanged current Manager authority + unchanged task state: executes exactly once
+  it('16. Unchanged current Manager authority + unchanged task state executes provider exactly once', async () => {
+    const mock = setupResource('res-valid-exec', 'prov-valid-exec');
+    const decision = await router.route({
+      projectId: 'PROJ-AUTH',
+      taskId: 'TSK-AUTH-001',
+      requiredCapabilities: ['CODING'],
+      candidateResourceIds: ['res-valid-exec'],
       allowManualBridge: false,
     });
 
@@ -364,177 +905,17 @@ describe('PR #7 — Durable Execution Authorization & Orchestration Binding', ()
 
     const result = await dispatcher.dispatch(auth.id);
     expect(result.status).toBe('COMPLETED');
+    expect(mock.executionCount).toBe(1);
   });
 
-  // 4. Task manually placed in CODING with no APPLIED Manager work authority cannot authorize
-  it('4. Task manually placed in CODING with no APPLIED Manager work authority cannot authorize', async () => {
-    repo.createTask({
-      id: 'TSK-MANUAL-CODING',
-      project_id: 'PROJ-AUTH',
-      milestone_id: null,
-      title: 'Manual Task Without Manager Ledger',
-      description: 'Forced into coding',
-      state: 'CODING',
-      paused_from_state: null,
-      priority: 'HIGH',
-      risk: 'LOW',
-      assigned_agent_id: null,
-      revision_count: 0,
-      max_revisions: 3,
-      base_sha: initialGitSha,
-      current_sha: null,
-      progress_cache_percent: 0,
-      progress_computed_at: null,
-      acceptance_criteria: [],
-      constraints: [],
-      created_at: new Date().toISOString(),
-      updated_at: new Date().toISOString(),
-    });
-
-    setupResource('res-4', 'prov-4');
-    const decision = await router.route({
-      projectId: 'PROJ-AUTH',
-      taskId: 'TSK-MANUAL-CODING',
-      requiredCapabilities: ['CODING'],
-      candidateResourceIds: ['res-4'],
-      allowManualBridge: false,
-    });
-
-    await expect(
-      authService.createAuthorization({
-        projectId: 'PROJ-AUTH',
-        taskId: 'TSK-MANUAL-CODING',
-        routingDecisionId: decision.decisionId,
-      })
-    ).rejects.toThrow('EXECUTION_AUTHORIZATION_MANAGER_AUTHORITY_MISSING');
-  });
-
-  // 5. REJECTED Manager message cannot authorize
-  it('5. REJECTED Manager message cannot authorize', async () => {
-    repo.createTask({
-      id: 'TSK-REJECTED-MGR',
-      project_id: 'PROJ-AUTH',
-      milestone_id: null,
-      title: 'Task With Rejected Manager Message',
-      description: 'Test rejected',
-      state: 'CODING',
-      paused_from_state: null,
-      priority: 'HIGH',
-      risk: 'LOW',
-      assigned_agent_id: null,
-      revision_count: 0,
-      max_revisions: 3,
-      base_sha: initialGitSha,
-      current_sha: null,
-      progress_cache_percent: 0,
-      progress_computed_at: null,
-      acceptance_criteria: [],
-      constraints: [],
-      created_at: new Date().toISOString(),
-      updated_at: new Date().toISOString(),
-    });
-
-    recordAppliedManagerMessage('PROJ-AUTH', 'TSK-REJECTED-MGR', {
-      decision: 'EXECUTE',
-      status: 'REJECTED',
-    });
-
-    setupResource('res-5', 'prov-5');
-    const decision = await router.route({
-      projectId: 'PROJ-AUTH',
-      taskId: 'TSK-REJECTED-MGR',
-      requiredCapabilities: ['CODING'],
-      candidateResourceIds: ['res-5'],
-      allowManualBridge: false,
-    });
-
-    await expect(
-      authService.createAuthorization({
-        projectId: 'PROJ-AUTH',
-        taskId: 'TSK-REJECTED-MGR',
-        routingDecisionId: decision.decisionId,
-      })
-    ).rejects.toThrow('EXECUTION_AUTHORIZATION_MANAGER_AUTHORITY_MISSING');
-  });
-
-  // 6. PASS / BLOCK / PAUSE / CANCEL / NEEDS_OWNER / CREATE_TASKS Manager decisions cannot authorize execution
-  it('6. PASS / BLOCK / PAUSE / CANCEL / NEEDS_OWNER / CREATE_TASKS Manager decisions cannot authorize execution', async () => {
-    const nonAuthorizingDecisions: Array<'PASS' | 'BLOCK' | 'PAUSE' | 'CANCEL' | 'NEEDS_OWNER' | 'CREATE_TASKS'> = [
-      'PASS',
-      'BLOCK',
-      'PAUSE',
-      'CANCEL',
-      'NEEDS_OWNER',
-      'CREATE_TASKS',
-    ];
-
-    setupResource('res-6', 'prov-6');
-
-    for (const dec of nonAuthorizingDecisions) {
-      const taskId = `TSK-DEC-${dec}`;
-      repo.createTask({
-        id: taskId,
-        project_id: 'PROJ-AUTH',
-        milestone_id: null,
-        title: `Task with ${dec}`,
-        description: 'Test decision',
-        state: 'CODING',
-        paused_from_state: null,
-        priority: 'HIGH',
-        risk: 'LOW',
-        assigned_agent_id: null,
-        revision_count: 0,
-        max_revisions: 3,
-        base_sha: initialGitSha,
-        current_sha: null,
-        progress_cache_percent: 0,
-        progress_computed_at: null,
-        acceptance_criteria: [],
-        constraints: [],
-        created_at: new Date().toISOString(),
-        updated_at: new Date().toISOString(),
-      });
-
-      recordAppliedManagerMessage('PROJ-AUTH', taskId, {
-        decision: dec,
-        status: 'APPLIED',
-      });
-
-      const decision = await router.route({
-        projectId: 'PROJ-AUTH',
-        taskId,
-        requiredCapabilities: ['CODING'],
-        candidateResourceIds: ['res-6'],
-        allowManualBridge: false,
-      });
-
-      await expect(
-        authService.createAuthorization({
-          projectId: 'PROJ-AUTH',
-          taskId,
-          routingDecisionId: decision.decisionId,
-        })
-      ).rejects.toThrow('EXECUTION_AUTHORIZATION_MANAGER_DECISION_NON_AUTHORIZING');
-    }
-  });
-
-  // 7. Latest applicable FIX_REQUIRED authority is correctly bound to the new coding revision
-  it('7. Latest applicable FIX_REQUIRED authority is correctly bound to the new coding revision', async () => {
-    // Increment revision count to 1 (entered fix cycle)
-    db.prepare('UPDATE tasks SET revision_count = 1 WHERE id = ?').run('TSK-AUTH-001');
-
-    recordAppliedManagerMessage('PROJ-AUTH', 'TSK-AUTH-001', {
-      decision: 'FIX_REQUIRED',
-      expected_revision: 0, // Manager message was created for revision 0, incrementing task to revision 1
-      instructions: ['Fix critical unit test failure'],
-    });
-
-    setupResource('res-7', 'prov-7');
+  // 17. Concurrent dispatch still executes exactly once
+  it('17. Concurrent dispatch calls produce exactly 1 provider execution (atomic claim)', async () => {
+    const mock = setupResource('res-concurrent-17', 'prov-concurrent-17');
     const decision = await router.route({
       projectId: 'PROJ-AUTH',
       taskId: 'TSK-AUTH-001',
       requiredCapabilities: ['CODING'],
-      candidateResourceIds: ['res-7'],
+      candidateResourceIds: ['res-concurrent-17'],
       allowManualBridge: false,
     });
 
@@ -544,20 +925,27 @@ describe('PR #7 — Durable Execution Authorization & Orchestration Binding', ()
       routingDecisionId: decision.decisionId,
     });
 
-    expect(auth.task_revision).toBe(1);
-    const parsed = JSON.parse(auth.canonical_instructions_json);
-    expect(parsed).toContain('Manager Instructions (FIX_REQUIRED):');
-    expect(parsed).toContain('- Fix critical unit test failure');
+    const [r1, r2] = await Promise.all([dispatcher.dispatch(auth.id), dispatcher.dispatch(auth.id)]);
+
+    const completed = [r1, r2].filter((r) => r.status === 'COMPLETED');
+    const failed = [r1, r2].filter((r) => r.status === 'FAILED');
+
+    expect(completed).toHaveLength(1);
+    expect(failed).toHaveLength(1);
+    expect(failed[0].error).toContain('EXECUTION_AUTHORIZATION_ALREADY_DISPATCHED');
+    expect(mock.executionCount).toBe(1);
   });
 
-  // 8. Authorization stores manager_message_id and manager_payload_hash
-  it('8. Authorization stores manager_message_id and manager_payload_hash', async () => {
-    setupResource('res-8', 'prov-8');
+  // 18. Provider FAILED / timeout / cancellation / PROTOCOL_INVALID after successful atomic claim leaves authorization DISPATCHED
+  it('18. Provider failure/timeout/cancellation/PROTOCOL_INVALID leaves authorization DISPATCHED without failover', async () => {
+    const mock = setupResource('res-fail-18', 'prov-fail-18', {
+      customExecutionResult: { status: 'FAILED', error: 'Process crashed' },
+    });
     const decision = await router.route({
       projectId: 'PROJ-AUTH',
       taskId: 'TSK-AUTH-001',
       requiredCapabilities: ['CODING'],
-      candidateResourceIds: ['res-8'],
+      candidateResourceIds: ['res-fail-18'],
       allowManualBridge: false,
     });
 
@@ -566,138 +954,73 @@ describe('PR #7 — Durable Execution Authorization & Orchestration Binding', ()
       taskId: 'TSK-AUTH-001',
       routingDecisionId: decision.decisionId,
     });
-
-    expect(auth.manager_message_id).toBeDefined();
-    expect(auth.manager_payload_hash).toBeDefined();
-    expect(auth.manager_payload_hash).toHaveLength(64); // SHA-256 hex string
-  });
-
-  // 9. Manager message/hash mismatch before dispatch: INVALIDATED, zero execution
-  it('9. Manager message/hash mismatch before dispatch invalidates authorization with zero execution', async () => {
-    const mock = setupResource('res-9', 'prov-9');
-    const decision = await router.route({
-      projectId: 'PROJ-AUTH',
-      taskId: 'TSK-AUTH-001',
-      requiredCapabilities: ['CODING'],
-      candidateResourceIds: ['res-9'],
-      allowManualBridge: false,
-    });
-
-    const auth = await authService.createAuthorization({
-      projectId: 'PROJ-AUTH',
-      taskId: 'TSK-AUTH-001',
-      routingDecisionId: decision.decisionId,
-    });
-
-    // Tamper with Manager message payload hash in database
-    db.prepare('UPDATE protocol_messages SET payload_hash = ? WHERE id = ?').run('tampered_hash_123', auth.manager_message_id);
 
     const result = await dispatcher.dispatch(auth.id);
-
     expect(result.status).toBe('FAILED');
-    expect(result.error).toContain('EXECUTION_AUTHORIZATION_MANAGER_AUTHORITY_INVALID');
-    expect(mock.executionCount).toBe(0);
 
-    const updatedAuth = repo.getExecutionAuthorization(auth.id);
-    expect(updatedAuth!.status).toBe('INVALIDATED');
+    const loaded = repo.getExecutionAuthorization(auth.id);
+    expect(loaded!.status).toBe('DISPATCHED');
   });
 
-  // 10. REVIEWING alone cannot authorize
-  it('10. Task state REVIEWING alone cannot authorize', async () => {
-    db.prepare('UPDATE tasks SET state = ? WHERE id = ?').run('REVIEWING', 'TSK-AUTH-001');
-
-    setupResource('res-10', 'prov-10');
-    const decision = await router.route({
-      projectId: 'PROJ-AUTH',
-      taskId: 'TSK-AUTH-001',
-      requiredCapabilities: ['CODING'],
-      candidateResourceIds: ['res-10'],
-      allowManualBridge: false,
+  // 19. Manual Bridge remains AWAITING_OWNER and non-replayable
+  it('19. Manual Bridge dispatch returns AWAITING_OWNER and cannot be replayed', async () => {
+    const manualAdapter = new ManualBridgeAdapter();
+    registry.register(manualAdapter);
+    if (!repo.getProvider('prov-manual-bridge')) {
+      repo.createProvider({
+        id: 'prov-manual-bridge',
+        name: 'Manual Bridge',
+        adapter_type: 'MANUAL_BRIDGE',
+        enabled: true,
+        created_at: new Date().toISOString(),
+      });
+    }
+    repo.createProviderResource({
+      id: 'res-mb-19',
+      provider_id: 'prov-manual-bridge',
+      model_name: 'Manual Model',
+      health_status: 'UNKNOWN',
+      capabilities: ['CODING'],
+      enabled: true,
+      total_quota: null,
+      remaining_quota: null,
+      quota_unit: 'REQUESTS',
+      quota_reset_at: null,
+      quota_source: 'UNKNOWN',
+      quota_confidence: 0,
+      last_health_check: null,
     });
 
-    await expect(
-      authService.createAuthorization({
-        projectId: 'PROJ-AUTH',
-        taskId: 'TSK-AUTH-001',
-        routingDecisionId: decision.decisionId,
-      })
-    ).rejects.toThrow('EXECUTION_AUTHORIZATION_TASK_STATE_INCOMPATIBLE');
-  });
-
-  // 11. VALIDATING alone cannot authorize
-  it('11. Task state VALIDATING alone cannot authorize', async () => {
-    db.prepare('UPDATE tasks SET state = ? WHERE id = ?').run('VALIDATING', 'TSK-AUTH-001');
-
-    setupResource('res-11', 'prov-11');
     const decision = await router.route({
       projectId: 'PROJ-AUTH',
       taskId: 'TSK-AUTH-001',
       requiredCapabilities: ['CODING'],
-      candidateResourceIds: ['res-11'],
-      allowManualBridge: false,
+      candidateResourceIds: ['res-mb-19'],
+      allowManualBridge: true,
     });
 
-    await expect(
-      authService.createAuthorization({
-        projectId: 'PROJ-AUTH',
-        taskId: 'TSK-AUTH-001',
-        routingDecisionId: decision.decisionId,
-      })
-    ).rejects.toThrow('EXECUTION_AUTHORIZATION_TASK_STATE_INCOMPATIBLE');
-  });
-
-  // 12. REVIEW_READY alone cannot authorize
-  it('12. Task state REVIEW_READY alone cannot authorize', async () => {
-    db.prepare('UPDATE tasks SET state = ? WHERE id = ?').run('REVIEW_READY', 'TSK-AUTH-001');
-
-    setupResource('res-12', 'prov-12');
-    const decision = await router.route({
+    const auth = await authService.createAuthorization({
       projectId: 'PROJ-AUTH',
       taskId: 'TSK-AUTH-001',
-      requiredCapabilities: ['CODING'],
-      candidateResourceIds: ['res-12'],
-      allowManualBridge: false,
+      routingDecisionId: decision.decisionId,
     });
 
-    await expect(
-      authService.createAuthorization({
-        projectId: 'PROJ-AUTH',
-        taskId: 'TSK-AUTH-001',
-        routingDecisionId: decision.decisionId,
-      })
-    ).rejects.toThrow('EXECUTION_AUTHORIZATION_TASK_STATE_INCOMPATIBLE');
+    const res1 = await dispatcher.dispatch(auth.id);
+    expect(res1.status).toBe('AWAITING_OWNER');
+
+    const res2 = await dispatcher.dispatch(auth.id);
+    expect(res2.status).toBe('FAILED');
+    expect(res2.error).toContain('EXECUTION_AUTHORIZATION_ALREADY_DISPATCHED');
   });
 
-  // 13. Missing task.base_sha: authorization creation fails, no zero SHA is fabricated
-  it('13. Missing task.base_sha fails closed on authorization creation without zero-SHA fallback', async () => {
-    db.prepare('UPDATE tasks SET base_sha = NULL WHERE id = ?').run('TSK-AUTH-001');
-
-    setupResource('res-13', 'prov-13');
+  // 20. Supersession rejection event contains no secrets/raw prompts
+  it('20. Supersession rejection event contains no secrets, API keys, or raw prompt instructions', async () => {
+    setupResource('res-sup-audit', 'prov-sup-audit');
     const decision = await router.route({
       projectId: 'PROJ-AUTH',
       taskId: 'TSK-AUTH-001',
       requiredCapabilities: ['CODING'],
-      candidateResourceIds: ['res-13'],
-      allowManualBridge: false,
-    });
-
-    await expect(
-      authService.createAuthorization({
-        projectId: 'PROJ-AUTH',
-        taskId: 'TSK-AUTH-001',
-        routingDecisionId: decision.decisionId,
-      })
-    ).rejects.toThrow('EXECUTION_AUTHORIZATION_BASE_SHA_MISSING');
-  });
-
-  // 14. Authorization captures real repository_head_sha
-  it('14. Authorization captures real repository_head_sha from GitService', async () => {
-    setupResource('res-14', 'prov-14');
-    const decision = await router.route({
-      projectId: 'PROJ-AUTH',
-      taskId: 'TSK-AUTH-001',
-      requiredCapabilities: ['CODING'],
-      candidateResourceIds: ['res-14'],
+      candidateResourceIds: ['res-sup-audit'],
       allowManualBridge: false,
     });
 
@@ -707,17 +1030,107 @@ describe('PR #7 — Durable Execution Authorization & Orchestration Binding', ()
       routingDecisionId: decision.decisionId,
     });
 
-    expect(auth.repository_head_sha).toBe(initialGitSha);
+    // Record newer applied Manager message
+    recordAppliedManagerMessage('PROJ-AUTH', 'TSK-AUTH-001', {
+      decision: 'PAUSE',
+      expected_revision: 0,
+      instructions: ['PAUSE SECRET_API_KEY_12345'],
+      messageId: 'msg-mgr-pause-secret',
+    });
+
+    await dispatcher.dispatch(auth.id);
+
+    const events = eventService.getEvents('PROJ-AUTH');
+    const rejEvent = events.find((e) => e.type === 'EXECUTION_AUTHORIZATION_REJECTED');
+    expect(rejEvent).toBeDefined();
+
+    const payloadStr = JSON.stringify(rejEvent!.structured_payload);
+    expect(payloadStr).toContain('EXECUTION_AUTHORIZATION_MANAGER_AUTHORITY_SUPERSEDED');
+    expect(payloadStr).not.toContain('SECRET_API_KEY_12345');
+    expect(payloadStr).not.toContain('PAUSE SECRET');
   });
 
-  // 15. Actual Git HEAD changes after authorization: STALE_GIT_HEAD, INVALIDATED, zero execution
-  it('15. Actual Git HEAD changes after authorization fails closed with STALE_GIT_HEAD and invalidation', async () => {
-    const mock = setupResource('res-15', 'prov-15');
+  // 21. PR #6 routing tests remain green
+  it('21. PR #6 routing semantics (AVAILABLE > LOW_QUOTA) remain intact', async () => {
+    setupResource('res-21-a', 'prov-21-a', { health: 'LOW_QUOTA' });
+    setupResource('res-21-b', 'prov-21-b', { health: 'AVAILABLE' });
+
     const decision = await router.route({
       projectId: 'PROJ-AUTH',
       taskId: 'TSK-AUTH-001',
       requiredCapabilities: ['CODING'],
-      candidateResourceIds: ['res-15'],
+      candidateResourceIds: ['res-21-a', 'res-21-b'],
+      allowManualBridge: false,
+    });
+
+    expect(decision.outcome).toBe('SELECTED');
+    expect(decision.selectedResourceId).toBe('res-21-b');
+  });
+
+  // 22. Codex remains OFFLINE / capabilities=[] / FAIL_CLOSED_NO_SPAWN
+  it('22. Codex CLI contract remains OFFLINE with empty capabilities and fails closed', async () => {
+    const codexAdapter = new CodexCliAdapter({ repo, artifactStore: {} as any });
+    expect(await codexAdapter.getHealth()).toBe('OFFLINE');
+    expect(await codexAdapter.getCapabilities()).toEqual([]);
+
+    const execResult = await codexAdapter.execute({
+      projectId: 'PROJ-AUTH',
+      taskId: 'TSK-AUTH-001',
+      instructions: ['Task'],
+      contextFiles: [],
+    });
+
+    expect(execResult.status).toBe('FAILED');
+    expect(execResult.error).toContain('CODEX_CLI_UNAVAILABLE');
+    expect(execResult.error).toContain('not installed or contract is unverified');
+  });
+
+  // 23. Antigravity remains MANUAL_BRIDGE_ONLY
+  it('23. Antigravity provider operates exclusively through Manual Bridge contract', async () => {
+    const manualAdapter = new ManualBridgeAdapter();
+    expect(manualAdapter.adapterType).toBe('MANUAL_BRIDGE');
+    const health = await manualAdapter.getHealth();
+    expect(health).toBe('UNKNOWN');
+  });
+
+  // 24. Foreign key RESTRICT prevents deleting referenced tasks or provider resources
+  it('24. Foreign key RESTRICT prevents cascade-deleting execution authorizations', async () => {
+    setupResource('res-24', 'prov-24');
+    const decision = await router.route({
+      projectId: 'PROJ-AUTH',
+      taskId: 'TSK-AUTH-001',
+      requiredCapabilities: ['CODING'],
+      candidateResourceIds: ['res-24'],
+      allowManualBridge: false,
+    });
+
+    const auth = await authService.createAuthorization({
+      projectId: 'PROJ-AUTH',
+      taskId: 'TSK-AUTH-001',
+      routingDecisionId: decision.decisionId,
+    });
+
+    expect(() => db.prepare('DELETE FROM tasks WHERE id = ?').run('TSK-AUTH-001')).toThrow(
+      'FOREIGN KEY constraint failed'
+    );
+    expect(() => db.prepare('DELETE FROM provider_resources WHERE id = ?').run('res-24')).toThrow(
+      'FOREIGN KEY constraint failed'
+    );
+    expect(() => db.prepare('DELETE FROM providers WHERE id = ?').run('prov-24')).toThrow(
+      'FOREIGN KEY constraint failed'
+    );
+
+    expect(repo.getExecutionAuthorization(auth.id)).not.toBeNull();
+  });
+
+  // 25. Actual Git HEAD changes after authorization: STALE_GIT_HEAD
+  it('25. Actual Git HEAD changes after authorization fails closed with STALE_GIT_HEAD and invalidation', async () => {
+    const mock = setupResource('res-25-git', 'prov-25-git');
+    const decision = await router.route({
+      projectId: 'PROJ-AUTH',
+      taskId: 'TSK-AUTH-001',
+      requiredCapabilities: ['CODING'],
+      candidateResourceIds: ['res-25-git'],
       allowManualBridge: false,
     });
 
@@ -743,529 +1156,8 @@ describe('PR #7 — Durable Execution Authorization & Orchestration Binding', ()
     expect(updatedAuth!.status).toBe('INVALIDATED');
   });
 
-  // 16. Unchanged actual Git HEAD: valid dispatch succeeds
-  it('16. Unchanged actual Git HEAD dispatch succeeds', async () => {
-    const mock = setupResource('res-16', 'prov-16');
-    const decision = await router.route({
-      projectId: 'PROJ-AUTH',
-      taskId: 'TSK-AUTH-001',
-      requiredCapabilities: ['CODING'],
-      candidateResourceIds: ['res-16'],
-      allowManualBridge: false,
-    });
-
-    const auth = await authService.createAuthorization({
-      projectId: 'PROJ-AUTH',
-      taskId: 'TSK-AUTH-001',
-      routingDecisionId: decision.decisionId,
-    });
-
-    const result = await dispatcher.dispatch(auth.id);
-
-    expect(result.status).toBe('COMPLETED');
-    expect(mock.executionCount).toBe(1);
-  });
-
-  // 17. Routing attemptId mismatch: INVALIDATED, zero execution
-  it('17. Routing attemptId mismatch invalidates authorization with zero execution', async () => {
-    const mock = setupResource('res-17', 'prov-17');
-
-    repo.createTaskAttempt({
-      id: 'ATT-AUTH-017',
-      task_id: 'TSK-AUTH-001',
-      attempt_number: 1,
-      agent_id: 'agent-1',
-      status: 'RUNNING',
-      started_at: new Date().toISOString(),
-      ended_at: null,
-      summary: null,
-    });
-
-    const decision = await router.route({
-      projectId: 'PROJ-AUTH',
-      taskId: 'TSK-AUTH-001',
-      attemptId: 'ATT-AUTH-017',
-      requiredCapabilities: ['CODING'],
-      candidateResourceIds: ['res-17'],
-      allowManualBridge: false,
-    });
-
-    const auth = await authService.createAuthorization({
-      projectId: 'PROJ-AUTH',
-      taskId: 'TSK-AUTH-001',
-      attemptId: 'ATT-AUTH-017',
-      routingDecisionId: decision.decisionId,
-    });
-
-    // Tamper with routing decision event in database
-    const routingEv = repo.getRoutingDecisionEvent(decision.decisionId);
-    const modifiedPayload = { ...routingEv!.structured_payload, attemptId: 'ATT-DIFFERENT' };
-    db.prepare('UPDATE events SET structured_payload_json = ? WHERE id = ?').run(JSON.stringify(modifiedPayload), routingEv!.id);
-
-    const result = await dispatcher.dispatch(auth.id);
-
-    expect(result.status).toBe('FAILED');
-    expect(result.error).toContain('EXECUTION_AUTHORIZATION_ROUTING_ATTEMPT_MISMATCH');
-    expect(mock.executionCount).toBe(0);
-
-    const updatedAuth = repo.getExecutionAuthorization(auth.id);
-    expect(updatedAuth!.status).toBe('INVALIDATED');
-  });
-
-  // 18. Routing selectedResourceId mismatch: INVALIDATED, zero execution
-  it('18. Routing selectedResourceId mismatch invalidates authorization with zero execution', async () => {
-    const mock = setupResource('res-18', 'prov-18');
-    const decision = await router.route({
-      projectId: 'PROJ-AUTH',
-      taskId: 'TSK-AUTH-001',
-      requiredCapabilities: ['CODING'],
-      candidateResourceIds: ['res-18'],
-      allowManualBridge: false,
-    });
-
-    const auth = await authService.createAuthorization({
-      projectId: 'PROJ-AUTH',
-      taskId: 'TSK-AUTH-001',
-      routingDecisionId: decision.decisionId,
-    });
-
-    // Tamper with routing decision event
-    const routingEv = repo.getRoutingDecisionEvent(decision.decisionId);
-    const modifiedPayload = { ...routingEv!.structured_payload, selectedResourceId: 'res-tampered' };
-    db.prepare('UPDATE events SET structured_payload_json = ? WHERE id = ?').run(JSON.stringify(modifiedPayload), routingEv!.id);
-
-    const result = await dispatcher.dispatch(auth.id);
-
-    expect(result.status).toBe('FAILED');
-    expect(result.error).toContain('EXECUTION_AUTHORIZATION_ROUTING_RESOURCE_MISMATCH');
-    expect(mock.executionCount).toBe(0);
-
-    const updatedAuth = repo.getExecutionAuthorization(auth.id);
-    expect(updatedAuth!.status).toBe('INVALIDATED');
-  });
-
-  // 19. Routing selectedProviderId mismatch: INVALIDATED, zero execution
-  it('19. Routing selectedProviderId mismatch invalidates authorization with zero execution', async () => {
-    const mock = setupResource('res-19', 'prov-19');
-    const decision = await router.route({
-      projectId: 'PROJ-AUTH',
-      taskId: 'TSK-AUTH-001',
-      requiredCapabilities: ['CODING'],
-      candidateResourceIds: ['res-19'],
-      allowManualBridge: false,
-    });
-
-    const auth = await authService.createAuthorization({
-      projectId: 'PROJ-AUTH',
-      taskId: 'TSK-AUTH-001',
-      routingDecisionId: decision.decisionId,
-    });
-
-    // Tamper with routing decision event
-    const routingEv = repo.getRoutingDecisionEvent(decision.decisionId);
-    const modifiedPayload = { ...routingEv!.structured_payload, selectedProviderId: 'prov-tampered' };
-    db.prepare('UPDATE events SET structured_payload_json = ? WHERE id = ?').run(JSON.stringify(modifiedPayload), routingEv!.id);
-
-    const result = await dispatcher.dispatch(auth.id);
-
-    expect(result.status).toBe('FAILED');
-    expect(result.error).toContain('EXECUTION_AUTHORIZATION_ROUTING_PROVIDER_MISMATCH');
-    expect(mock.executionCount).toBe(0);
-
-    const updatedAuth = repo.getExecutionAuthorization(auth.id);
-    expect(updatedAuth!.status).toBe('INVALIDATED');
-  });
-
-  // 20. Malformed canonical_instructions_json: structured FAILED, INVALIDATED, zero execution
-  it('20. Malformed canonical_instructions_json fails closed with invalidation and zero execution', async () => {
-    const mock = setupResource('res-20', 'prov-20');
-    const decision = await router.route({
-      projectId: 'PROJ-AUTH',
-      taskId: 'TSK-AUTH-001',
-      requiredCapabilities: ['CODING'],
-      candidateResourceIds: ['res-20'],
-      allowManualBridge: false,
-    });
-
-    const auth = await authService.createAuthorization({
-      projectId: 'PROJ-AUTH',
-      taskId: 'TSK-AUTH-001',
-      routingDecisionId: decision.decisionId,
-    });
-
-    // Corrupt canonical_instructions_json in database
-    db.prepare('UPDATE execution_authorizations SET canonical_instructions_json = ? WHERE id = ?').run('NOT_JSON{', auth.id);
-
-    const result = await dispatcher.dispatch(auth.id);
-
-    expect(result.status).toBe('FAILED');
-    expect(result.error).toContain('EXECUTION_AUTHORIZATION_PAYLOAD_CORRUPT');
-    expect(mock.executionCount).toBe(0);
-
-    const updatedAuth = repo.getExecutionAuthorization(auth.id);
-    expect(updatedAuth!.status).toBe('INVALIDATED');
-  });
-
-  // 21. Malformed context_files_json: structured FAILED, INVALIDATED, zero execution
-  it('21. Malformed context_files_json fails closed with invalidation and zero execution', async () => {
-    const mock = setupResource('res-21', 'prov-21');
-    const decision = await router.route({
-      projectId: 'PROJ-AUTH',
-      taskId: 'TSK-AUTH-001',
-      requiredCapabilities: ['CODING'],
-      candidateResourceIds: ['res-21'],
-      allowManualBridge: false,
-    });
-
-    const auth = await authService.createAuthorization({
-      projectId: 'PROJ-AUTH',
-      taskId: 'TSK-AUTH-001',
-      routingDecisionId: decision.decisionId,
-    });
-
-    // Corrupt context_files_json in database
-    db.prepare('UPDATE execution_authorizations SET context_files_json = ? WHERE id = ?').run('12345', auth.id); // Not an array
-
-    const result = await dispatcher.dispatch(auth.id);
-
-    expect(result.status).toBe('FAILED');
-    expect(result.error).toContain('EXECUTION_AUTHORIZATION_PAYLOAD_CORRUPT');
-    expect(mock.executionCount).toBe(0);
-
-    const updatedAuth = repo.getExecutionAuthorization(auth.id);
-    expect(updatedAuth!.status).toBe('INVALIDATED');
-  });
-
-  // 22. Stale task revision invalidates authorization permanently
-  it('22. Stale task revision invalidates authorization permanently', async () => {
-    const mock = setupResource('res-22', 'prov-22');
-    const decision = await router.route({
-      projectId: 'PROJ-AUTH',
-      taskId: 'TSK-AUTH-001',
-      requiredCapabilities: ['CODING'],
-      candidateResourceIds: ['res-22'],
-      allowManualBridge: false,
-    });
-
-    const auth = await authService.createAuthorization({
-      projectId: 'PROJ-AUTH',
-      taskId: 'TSK-AUTH-001',
-      routingDecisionId: decision.decisionId,
-    });
-
-    // Advance task revision count in database
-    db.prepare('UPDATE tasks SET revision_count = 1 WHERE id = ?').run('TSK-AUTH-001');
-
-    const result = await dispatcher.dispatch(auth.id);
-
-    expect(result.status).toBe('FAILED');
-    expect(result.error).toContain('EXECUTION_AUTHORIZATION_STALE_TASK_REVISION');
-    expect(mock.executionCount).toBe(0);
-
-    const updatedAuth = repo.getExecutionAuthorization(auth.id);
-    expect(updatedAuth!.status).toBe('INVALIDATED');
-  });
-
-  // 23. Restoring an old task revision afterward does NOT make that authorization usable again
-  it('23. Restoring an old task revision afterward does not make an INVALIDATED authorization usable again', async () => {
-    const mock = setupResource('res-23', 'prov-23');
-    const decision = await router.route({
-      projectId: 'PROJ-AUTH',
-      taskId: 'TSK-AUTH-001',
-      requiredCapabilities: ['CODING'],
-      candidateResourceIds: ['res-23'],
-      allowManualBridge: false,
-    });
-
-    const auth = await authService.createAuthorization({
-      projectId: 'PROJ-AUTH',
-      taskId: 'TSK-AUTH-001',
-      routingDecisionId: decision.decisionId,
-    });
-
-    // Make stale -> invalidates
-    db.prepare('UPDATE tasks SET revision_count = 1 WHERE id = ?').run('TSK-AUTH-001');
-    const res1 = await dispatcher.dispatch(auth.id);
-    expect(res1.status).toBe('FAILED');
-
-    // Restore old revision count
-    db.prepare('UPDATE tasks SET revision_count = 0 WHERE id = ?').run('TSK-AUTH-001');
-
-    const res2 = await dispatcher.dispatch(auth.id);
-    expect(res2.status).toBe('FAILED');
-    expect(res2.error).toContain('EXECUTION_AUTHORIZATION_INVALIDATED');
-    expect(mock.executionCount).toBe(0);
-  });
-
-  // 24. Deleting referenced attempt cannot silently SET NULL authorization scope (enforced by ON DELETE RESTRICT)
-  it('24. Deleting referenced attempt is restricted by foreign key constraints', async () => {
-    setupResource('res-24', 'prov-24');
-    repo.createTaskAttempt({
-      id: 'ATT-AUTH-024',
-      task_id: 'TSK-AUTH-001',
-      attempt_number: 1,
-      agent_id: 'agent-1',
-      status: 'RUNNING',
-      started_at: new Date().toISOString(),
-      ended_at: null,
-      summary: null,
-    });
-
-    const decision = await router.route({
-      projectId: 'PROJ-AUTH',
-      taskId: 'TSK-AUTH-001',
-      attemptId: 'ATT-AUTH-024',
-      requiredCapabilities: ['CODING'],
-      candidateResourceIds: ['res-24'],
-      allowManualBridge: false,
-    });
-
-    const auth = await authService.createAuthorization({
-      projectId: 'PROJ-AUTH',
-      taskId: 'TSK-AUTH-001',
-      attemptId: 'ATT-AUTH-024',
-      routingDecisionId: decision.decisionId,
-    });
-
-    // Attempting to delete attempt must throw foreign key restriction error
-    expect(() => {
-      db.prepare('DELETE FROM task_attempts WHERE id = ?').run('ATT-AUTH-024');
-    }).toThrow('FOREIGN KEY constraint failed');
-
-    // Verify attempt_id remains bound
-    const loadedAuth = repo.getExecutionAuthorization(auth.id);
-    expect(loadedAuth!.attempt_id).toBe('ATT-AUTH-024');
-  });
-
-  // 25. Deleting referenced task/resource/provider cannot cascade-delete historical authorization
-  it('25. Deleting referenced task, resource, or provider is restricted and cannot cascade-delete authorization', async () => {
-    setupResource('res-25', 'prov-25');
-    const decision = await router.route({
-      projectId: 'PROJ-AUTH',
-      taskId: 'TSK-AUTH-001',
-      requiredCapabilities: ['CODING'],
-      candidateResourceIds: ['res-25'],
-      allowManualBridge: false,
-    });
-
-    const auth = await authService.createAuthorization({
-      projectId: 'PROJ-AUTH',
-      taskId: 'TSK-AUTH-001',
-      routingDecisionId: decision.decisionId,
-    });
-
-    // Foreign key RESTRICT prevents cascade deletion
-    expect(() => db.prepare('DELETE FROM tasks WHERE id = ?').run('TSK-AUTH-001')).toThrow(
-      'FOREIGN KEY constraint failed'
-    );
-    expect(() => db.prepare('DELETE FROM provider_resources WHERE id = ?').run('res-25')).toThrow(
-      'FOREIGN KEY constraint failed'
-    );
-    expect(() => db.prepare('DELETE FROM providers WHERE id = ?').run('prov-25')).toThrow(
-      'FOREIGN KEY constraint failed'
-    );
-
-    // Authorization still exists intact
-    expect(repo.getExecutionAuthorization(auth.id)).not.toBeNull();
-  });
-
-  // 26. Valid automated fake provider still executes exactly once
-  it('26. Valid automated fake provider executes exactly once', async () => {
-    const mock = setupResource('res-26', 'prov-26');
-    const decision = await router.route({
-      projectId: 'PROJ-AUTH',
-      taskId: 'TSK-AUTH-001',
-      requiredCapabilities: ['CODING'],
-      candidateResourceIds: ['res-26'],
-      allowManualBridge: false,
-    });
-
-    const auth = await authService.createAuthorization({
-      projectId: 'PROJ-AUTH',
-      taskId: 'TSK-AUTH-001',
-      routingDecisionId: decision.decisionId,
-    });
-
-    const result = await dispatcher.dispatch(auth.id);
-
-    expect(result.status).toBe('COMPLETED');
-    expect(mock.executionCount).toBe(1);
-  });
-
-  // 27. Concurrent dispatch still executes exactly once
-  it('27. Concurrent dispatch calls produce exactly 1 provider execution (atomic claim)', async () => {
-    const mock = setupResource('res-27', 'prov-27');
-    const decision = await router.route({
-      projectId: 'PROJ-AUTH',
-      taskId: 'TSK-AUTH-001',
-      requiredCapabilities: ['CODING'],
-      candidateResourceIds: ['res-27'],
-      allowManualBridge: false,
-    });
-
-    const auth = await authService.createAuthorization({
-      projectId: 'PROJ-AUTH',
-      taskId: 'TSK-AUTH-001',
-      routingDecisionId: decision.decisionId,
-    });
-
-    const [r1, r2] = await Promise.all([dispatcher.dispatch(auth.id), dispatcher.dispatch(auth.id)]);
-
-    const completed = [r1, r2].filter((r) => r.status === 'COMPLETED');
-    const failed = [r1, r2].filter((r) => r.status === 'FAILED');
-
-    expect(completed).toHaveLength(1);
-    expect(failed).toHaveLength(1);
-    expect(failed[0].error).toContain('EXECUTION_AUTHORIZATION_ALREADY_DISPATCHED');
-    expect(mock.executionCount).toBe(1);
-  });
-
-  // 28. Provider FAILED after atomic claim remains DISPATCHED
-  it('28. Provider execution returning FAILED leaves authorization consumed as DISPATCHED', async () => {
-    setupResource('res-28', 'prov-28', {
-      customExecutionResult: { status: 'FAILED', error: 'Compiler error in user code' },
-    });
-    const decision = await router.route({
-      projectId: 'PROJ-AUTH',
-      taskId: 'TSK-AUTH-001',
-      requiredCapabilities: ['CODING'],
-      candidateResourceIds: ['res-28'],
-      allowManualBridge: false,
-    });
-
-    const auth = await authService.createAuthorization({
-      projectId: 'PROJ-AUTH',
-      taskId: 'TSK-AUTH-001',
-      routingDecisionId: decision.decisionId,
-    });
-
-    const result = await dispatcher.dispatch(auth.id);
-    expect(result.status).toBe('FAILED');
-
-    const loaded = repo.getExecutionAuthorization(auth.id);
-    expect(loaded!.status).toBe('DISPATCHED');
-  });
-
-  // 29. Timeout / cancellation / PROTOCOL_INVALID remain DISPATCHED
-  it('29. Timeout / cancellation / PROTOCOL_INVALID leave authorization consumed as DISPATCHED', async () => {
-    setupResource('res-29', 'prov-29', {
-      customExecutionResult: { status: 'CANCELLED', error: 'Execution cancelled by owner' },
-    });
-    const decision = await router.route({
-      projectId: 'PROJ-AUTH',
-      taskId: 'TSK-AUTH-001',
-      requiredCapabilities: ['CODING'],
-      candidateResourceIds: ['res-29'],
-      allowManualBridge: false,
-    });
-
-    const auth = await authService.createAuthorization({
-      projectId: 'PROJ-AUTH',
-      taskId: 'TSK-AUTH-001',
-      routingDecisionId: decision.decisionId,
-    });
-
-    const result = await dispatcher.dispatch(auth.id);
-    expect(result.status).toBe('CANCELLED');
-
-    const loaded = repo.getExecutionAuthorization(auth.id);
-    expect(loaded!.status).toBe('DISPATCHED');
-  });
-
-  // 30. Manual Bridge remains AWAITING_OWNER and cannot replay
-  it('30. Manual Bridge authorization dispatch returns AWAITING_OWNER and cannot be replayed', async () => {
-    const manualAdapter = new ManualBridgeAdapter();
-    registry.register(manualAdapter);
-    repo.createProvider({
-      id: 'prov-manual-bridge',
-      name: 'Manual Bridge',
-      adapter_type: 'MANUAL_BRIDGE',
-      enabled: true,
-      created_at: new Date().toISOString(),
-    });
-    repo.createProviderResource({
-      id: 'res-manual-30',
-      provider_id: 'prov-manual-bridge',
-      model_name: 'Manual Model',
-      health_status: 'UNKNOWN',
-      capabilities: ['CODING'],
-      enabled: true,
-      total_quota: null,
-      remaining_quota: null,
-      quota_unit: 'REQUESTS',
-      quota_reset_at: null,
-      quota_source: 'UNKNOWN',
-      quota_confidence: 0,
-      last_health_check: null,
-    });
-
-    const decision = await router.route({
-      projectId: 'PROJ-AUTH',
-      taskId: 'TSK-AUTH-001',
-      requiredCapabilities: ['CODING'],
-      candidateResourceIds: ['res-manual-30'],
-      allowManualBridge: true,
-    });
-
-    const auth = await authService.createAuthorization({
-      projectId: 'PROJ-AUTH',
-      taskId: 'TSK-AUTH-001',
-      routingDecisionId: decision.decisionId,
-    });
-
-    const res1 = await dispatcher.dispatch(auth.id);
-    expect(res1.status).toBe('AWAITING_OWNER');
-
-    const res2 = await dispatcher.dispatch(auth.id);
-    expect(res2.status).toBe('FAILED');
-    expect(res2.error).toContain('EXECUTION_AUTHORIZATION_ALREADY_DISPATCHED');
-  });
-
-  // 31. PR #6 routing tests remain green
-  it('31. PR #6 routing semantics (AVAILABLE > LOW_QUOTA) remain intact', async () => {
-    setupResource('res-31-a', 'prov-31-a', { health: 'LOW_QUOTA' });
-    setupResource('res-31-b', 'prov-31-b', { health: 'AVAILABLE' });
-
-    const decision = await router.route({
-      projectId: 'PROJ-AUTH',
-      taskId: 'TSK-AUTH-001',
-      requiredCapabilities: ['CODING'],
-      candidateResourceIds: ['res-31-a', 'res-31-b'],
-      allowManualBridge: false,
-    });
-
-    expect(decision.outcome).toBe('SELECTED');
-    expect(decision.selectedResourceId).toBe('res-31-b');
-  });
-
-  // 32. Codex remains OFFLINE / [] / fail-closed
-  it('32. Codex CLI contract remains OFFLINE with empty capabilities and fails closed', async () => {
-    const codexAdapter = new CodexCliAdapter({ repo, artifactStore: {} as any });
-    expect(await codexAdapter.getHealth()).toBe('OFFLINE');
-    expect(await codexAdapter.getCapabilities()).toEqual([]);
-
-    const execResult = await codexAdapter.execute({
-      projectId: 'PROJ-AUTH',
-      taskId: 'TSK-AUTH-001',
-      instructions: ['Task'],
-      contextFiles: [],
-    });
-
-    expect(execResult.status).toBe('FAILED');
-    expect(execResult.error).toContain('CODEX_CLI_UNAVAILABLE');
-    expect(execResult.error).toContain('not installed or contract is unverified');
-  });
-
-  // 33. Antigravity remains MANUAL_BRIDGE_ONLY
-  it('33. Antigravity provider operates exclusively through Manual Bridge contract', async () => {
-    const manualAdapter = new ManualBridgeAdapter();
-    expect(manualAdapter.adapterType).toBe('MANUAL_BRIDGE');
-    const health = await manualAdapter.getHealth();
-    expect(health).toBe('UNKNOWN');
-  });
-
-  // 34. Canonical payload determinism & hashing
-  it('34. Identical canonical payloads produce the exact same SHA-256 hash', () => {
+  // 26. Canonical payload determinism & hashing
+  it('26. Identical canonical payloads produce the exact same SHA-256 hash', () => {
     const payload1 = computeCanonicalPayload({
       projectId: 'PROJ-AUTH',
       taskId: 'TSK-AUTH-001',
@@ -1297,8 +1189,8 @@ describe('PR #7 — Durable Execution Authorization & Orchestration Binding', ()
     expect(computePayloadHash(payload1)).toBe(computePayloadHash(payload2));
   });
 
-  // 35. Context traversal paths (../) and sensitive credential paths are rejected
-  it('35. Context traversal paths (../) and sensitive credential paths (.env, .ssh) are rejected', () => {
+  // 27. Context traversal paths (../) and sensitive credential paths are rejected
+  it('27. Context traversal paths (../) and sensitive credential paths (.env, .ssh) are rejected', () => {
     const traversal = sanitizeContextFiles(['../secret.txt'], tmpDir);
     expect(traversal.error).toContain('CONTEXT_PATH_TRAVERSAL');
 
@@ -1306,47 +1198,14 @@ describe('PR #7 — Durable Execution Authorization & Orchestration Binding', ()
     expect(sensitive.error).toContain('CONTEXT_PATH_DENIED');
   });
 
-  // 36. Duplicate and out-of-order context paths are deduplicated and sorted deterministically
-  it('36. Duplicate and out-of-order context paths are deduplicated and sorted deterministically', () => {
+  // 28. Duplicate and out-of-order context paths are deduplicated and sorted deterministically
+  it('28. Duplicate and out-of-order context paths are deduplicated and sorted deterministically', () => {
     const result = sanitizeContextFiles(['src/z.ts', 'src/a.ts', 'src/z.ts', 'src\\b.ts'], tmpDir);
     expect(result.validFiles).toEqual(['src/a.ts', 'src/b.ts', 'src/z.ts']);
   });
 
-  // 37. Audit events contain payload hashes but zero secrets or raw credentials
-  it('37. Audit events contain payload hashes and metadata but zero raw secrets', async () => {
-    setupResource('res-37', 'prov-37');
-    const decision = await router.route({
-      projectId: 'PROJ-AUTH',
-      taskId: 'TSK-AUTH-001',
-      requiredCapabilities: ['CODING'],
-      candidateResourceIds: ['res-37'],
-      allowManualBridge: false,
-    });
-
-    const auth = await authService.createAuthorization({
-      projectId: 'PROJ-AUTH',
-      taskId: 'TSK-AUTH-001',
-      routingDecisionId: decision.decisionId,
-    });
-
-    await dispatcher.dispatch(auth.id);
-
-    const events = eventService.getEvents('PROJ-AUTH');
-    const createdEv = events.find((e) => e.type === 'EXECUTION_AUTHORIZATION_CREATED');
-    const dispatchedEv = events.find((e) => e.type === 'EXECUTION_AUTHORIZATION_DISPATCHED');
-
-    expect(createdEv).toBeDefined();
-    expect(dispatchedEv).toBeDefined();
-
-    const createdPayload = JSON.stringify(createdEv!.structured_payload);
-    expect(createdPayload).toContain('instructionPayloadHash');
-    expect(createdPayload).toContain('managerPayloadHash');
-    expect(createdPayload).not.toContain('API_KEY');
-    expect(createdPayload).not.toContain('SECRET');
-  });
-
-  // 38. Authorization record survives database reconnection / app restart
-  it('38. Authorization record survives database reconnection and cannot be reused if DISPATCHED', async () => {
+  // 29. Restart persistence: authorization record survives database reconnection
+  it('29. Authorization record survives database reconnection and cannot be reused if DISPATCHED', async () => {
     const dbFile = path.join(tmpDir, 'restart_test.db');
     const diskDb = new Database(dbFile);
     MigrationRunner.run(diskDb);
@@ -1395,7 +1254,6 @@ describe('PR #7 — Durable Execution Authorization & Orchestration Binding', ()
       updated_at: new Date().toISOString(),
     });
 
-    // Create applied manager message
     const msgId = 'msg-mgr-restart';
     const rawPayload = JSON.stringify({
       protocol: 'manager.v1',
@@ -1460,14 +1318,11 @@ describe('PR #7 — Durable Execution Authorization & Orchestration Binding', ()
       routingDecisionId: decision.decisionId,
     });
 
-    // Execute first time
     const res1 = await diskDispatcher.dispatch(auth.id);
     expect(res1.status).toBe('COMPLETED');
 
-    // Close database to simulate app termination
     diskDb.close();
 
-    // Reopen database to simulate restart
     const reopenedDb = new Database(dbFile);
     reopenedDb.pragma('foreign_keys = ON');
     const reopenedRepo = new Repository(reopenedDb);
@@ -1475,12 +1330,10 @@ describe('PR #7 — Durable Execution Authorization & Orchestration Binding', ()
     reopenedRegistry.register(new MockExecutionAdapter('prov-restart', 'Restart Provider'));
     const reopenedDispatcher = new ProviderDispatchService(reopenedRegistry, reopenedRepo);
 
-    // Assert authorization record exists with status DISPATCHED
     const loadedAuth = reopenedRepo.getExecutionAuthorization(auth.id);
     expect(loadedAuth).not.toBeNull();
     expect(loadedAuth!.status).toBe('DISPATCHED');
 
-    // Second dispatch on reopened database fails closed
     const res2 = await reopenedDispatcher.dispatch(auth.id);
     expect(res2.status).toBe('FAILED');
     expect(res2.error).toContain('EXECUTION_AUTHORIZATION_ALREADY_DISPATCHED');

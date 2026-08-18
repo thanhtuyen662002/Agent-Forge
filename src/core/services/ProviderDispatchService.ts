@@ -181,6 +181,24 @@ export class ProviderDispatchService {
       };
     }
 
+    // Defense-in-depth: Validate bound Manager message is still the CURRENT/LATEST applied Manager authority
+    const latestAppliedManager = this.repo.getLatestAppliedManagerProtocolMessage(auth.task_id, auth.project_id);
+    if (
+      !latestAppliedManager ||
+      String(latestAppliedManager.id) !== auth.manager_message_id ||
+      String(latestAppliedManager.payload_hash) !== auth.manager_payload_hash
+    ) {
+      this.repo.invalidateExecutionAuthorization(auth.id);
+      const reason =
+        'EXECUTION_AUTHORIZATION_MANAGER_AUTHORITY_SUPERSEDED: Bound Manager authority has been superseded by a newer applied Manager message.';
+      this.recordRejectionEvent(auth, reason);
+      return {
+        executionId,
+        status: 'FAILED',
+        error: reason,
+      };
+    }
+
     const parseResult = ProtocolParser.parse(String(managerRecord.raw_payload));
     if (!parseResult.success || !parseResult.data || parseResult.data.type !== 'manager.v1') {
       this.repo.invalidateExecutionAuthorization(auth.id);
@@ -275,6 +293,31 @@ export class ProviderDispatchService {
         status: 'FAILED',
         error: reason,
       };
+    }
+
+    // 7. Dispatch-Time Task State Liveness Check
+    if (routingOutcome === 'SELECTED') {
+      if (task.state !== 'CODING') {
+        this.repo.invalidateExecutionAuthorization(auth.id);
+        const reason = `EXECUTION_AUTHORIZATION_STALE_TASK_STATE: Current task state "${task.state}" is incompatible with automated routing outcome "SELECTED" (expected CODING).`;
+        this.recordRejectionEvent(auth, reason);
+        return {
+          executionId,
+          status: 'FAILED',
+          error: reason,
+        };
+      }
+    } else if (routingOutcome === 'MANUAL_HANDOFF_REQUIRED') {
+      if (task.state !== 'CODING' && task.state !== 'HANDOFF_REQUIRED') {
+        this.repo.invalidateExecutionAuthorization(auth.id);
+        const reason = `EXECUTION_AUTHORIZATION_STALE_TASK_STATE: Current task state "${task.state}" is incompatible with Manual Bridge outcome "MANUAL_HANDOFF_REQUIRED" (expected CODING or HANDOFF_REQUIRED).`;
+        this.recordRejectionEvent(auth, reason);
+        return {
+          executionId,
+          status: 'FAILED',
+          error: reason,
+        };
+      }
     }
 
     // 7. Reload and Validate Provider and Resource Enablement

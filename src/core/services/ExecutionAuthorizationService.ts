@@ -227,18 +227,13 @@ export class ExecutionAuthorizationService {
     }
 
     // 2. Validate Manager Protocol Authority from SQLite ledger
-    const taskProtocolMessages = this.repo.getProtocolMessagesByTask(params.taskId);
-    const appliedManagerMsgs = taskProtocolMessages.filter(
-      (m) => m.protocol === 'manager.v1' && m.status === 'APPLIED' && m.project_id === params.projectId
-    );
-
-    if (appliedManagerMsgs.length === 0) {
+    const latestManagerMsg = this.repo.getLatestAppliedManagerProtocolMessage(params.taskId, params.projectId);
+    if (!latestManagerMsg) {
       const reason = `EXECUTION_AUTHORIZATION_MANAGER_AUTHORITY_MISSING: No applied manager.v1 protocol message found for task "${params.taskId}".`;
       this.recordRejectionEvent(params, reason);
       throw new Error(`EXECUTION_AUTHORIZATION_FAILED: ${reason}`);
     }
 
-    const latestManagerMsg = appliedManagerMsgs[appliedManagerMsgs.length - 1];
     const parseResult = ProtocolParser.parse(String(latestManagerMsg.raw_payload));
     if (!parseResult.success || !parseResult.data || parseResult.data.type !== 'manager.v1') {
       const reason = `EXECUTION_AUTHORIZATION_MANAGER_AUTHORITY_INVALID: Could not parse applied manager protocol message (${parseResult.error || 'schema invalid'}).`;
@@ -265,15 +260,14 @@ export class ExecutionAuthorizationService {
         throw new Error(`EXECUTION_AUTHORIZATION_FAILED: ${reason}`);
       }
     } else if (managerData.decision === 'FIX_REQUIRED') {
-      // For FIX_REQUIRED, the state machine increments revision upon entering fix coding cycle
-      const expectedPrev = task.revision_count > 0 ? task.revision_count - 1 : 0;
+      // For FIX_REQUIRED, Manager decision was applied against the pre-fix revision and enters fix coding cycle, incrementing task revision.
+      // Therefore, manager.expected_revision + 1 must strictly equal task.revision_count.
       if (
         managerData.expected_revision !== null &&
         managerData.expected_revision !== undefined &&
-        managerData.expected_revision !== expectedPrev &&
-        managerData.expected_revision !== task.revision_count
+        managerData.expected_revision + 1 !== task.revision_count
       ) {
-        const reason = `EXECUTION_AUTHORIZATION_STALE_TASK_REVISION: Manager FIX_REQUIRED expected revision ${managerData.expected_revision}, which does not match task coding revision ${task.revision_count}.`;
+        const reason = `EXECUTION_AUTHORIZATION_STALE_TASK_REVISION: Manager FIX_REQUIRED expected revision ${managerData.expected_revision}, which does not match task coding revision ${task.revision_count} (expected manager.expected_revision + 1 == task.revision_count).`;
         this.recordRejectionEvent(params, reason);
         throw new Error(`EXECUTION_AUTHORIZATION_FAILED: ${reason}`);
       }

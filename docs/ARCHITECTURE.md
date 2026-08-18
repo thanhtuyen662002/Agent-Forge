@@ -202,22 +202,27 @@ EXACTLY ONE Provider Execution
 ### Execution Authorization Invariants (`ExecutionAuthorizationService`, `ProviderDispatchService`)
 - **Durable Immutable Record**: Persisted in SQLite `execution_authorizations` (Migration 6) with foreign keys enforcing `ON DELETE RESTRICT` to prevent historical scope tampering:
   `id`, `project_id`, `task_id`, `attempt_id`, `task_revision`, `base_sha`, `repository_head_sha`, `manager_message_id`, `manager_payload_hash`, `routing_decision_id`, `selected_resource_id`, `selected_provider_id`, `instruction_payload_hash`, `context_manifest_hash`, `canonical_instructions_json`, `context_files_json`, `status: AUTHORIZED | DISPATCHED | INVALIDATED`.
-- **Manager Ledger Authority Binding**:
-  - Requires an applied `manager.v1` protocol message with `EXECUTE` or `FIX_REQUIRED` matching the current coding revision.
-  - Re-verified at dispatch by checking message presence, `APPLIED` status, project/task scope, payload hash equality, and parsing decision validity.
+- **Manager Ledger Authority Binding & Liveness**:
+  - Requires an applied `manager.v1` protocol message with `EXECUTE` or `FIX_REQUIRED`.
+  - Strict revision binding: For `EXECUTE`, `manager.expected_revision === task.revision_count`. For `FIX_REQUIRED`, `manager.expected_revision + 1 === task.revision_count` (the pre-fix revision incremented on fix cycle entry).
+  - All queries resolving current Manager authority use a single total deterministic order: `ORDER BY created_at ASC, id ASC` (`Repository.getLatestAppliedManagerProtocolMessage`).
+  - **Transaction-Bound Supersession**: Whenever a new `manager.v1` decision (`EXECUTE`, `FIX_REQUIRED`, `PASS`, `BLOCK`, `PAUSE`, `CANCEL`, `NEEDS_OWNER`, `CREATE_TASKS`) is successfully applied in `TaskService.applyManagerDecision`, all previous still-`AUTHORIZED` execution authorizations for that task are invalidated (`status = 'INVALIDATED'`) within the SAME SQLite transaction (`Repository.invalidateAuthorizedExecutionAuthorizationsForTask`). If the transaction rolls back or the message is `REJECTED`/`DUPLICATE`, authorizations remain untouched.
+  - **Dispatch-Time Defense-in-Depth**: At dispatch, `ProviderDispatchService.dispatch` re-evaluates the latest applied Manager protocol record. If the bound record is no longer the latest applied record or if payload hash differs, dispatch fails closed with `EXECUTION_AUTHORIZATION_MANAGER_AUTHORITY_SUPERSEDED`, transitions `AUTHORIZED -> INVALIDATED`, and executes zero providers.
+- **Dispatch-Time Task State Liveness**:
+  - Re-evaluates current `task.state` after loading `RoutingDecision` but prior to atomic CAS claim.
+  - Automated `SELECTED` execution requires `task.state === 'CODING'`.
+  - `MANUAL_HANDOFF_REQUIRED` requires `task.state === 'CODING' || task.state === 'HANDOFF_REQUIRED'`.
+  - If task transitioned out of valid states between authorization and dispatch, dispatch fails closed with `EXECUTION_AUTHORIZATION_STALE_TASK_STATE`, transitions `AUTHORIZED -> INVALIDATED`, and executes zero providers.
 - **Real Git Repository Authority**:
   - Captures live `repository_head_sha` via `GitService.getHeadSha(project.repository_path)`.
   - Re-probes live Git repository HEAD at dispatch before claiming authorization. If repository HEAD has moved, dispatch fails closed with `EXECUTION_AUTHORIZATION_STALE_GIT_HEAD` and permanently invalidates the authorization.
-- **Task State Gate**:
-  - Automated `SELECTED` execution requires `task.state === 'CODING'`.
-  - `MANUAL_HANDOFF_REQUIRED` requires `task.state === 'CODING' || task.state === 'HANDOFF_REQUIRED'`.
-  - States `REVIEWING`, `VALIDATING`, `REVIEW_READY` alone cannot authorize execution.
 - **Canonical Payload & Manifest Hashing**:
   - `instructionPayloadHash = SHA-256(canonicalPayload)` derived deterministically from task title, description, acceptance criteria, constraints, Manager instructions, and context files.
   - `contextManifestHash = SHA-256(canonicalContextFiles)` with strict relative path containment, no traversal (`../`), no sensitive credential paths (`.env`, `.ssh`, `.aws`, `.gnupg`), and deterministic lexicographical sorting.
 - **Zero Caller-Supplied Instructions at Dispatch**: `ProviderDispatchService.dispatch(authorizationId)` accepts **ONLY** `authorizationId`. The execution payload is reconstructed internally from durable state.
 - **Atomic One-Time Claim**: Compare-and-set claim (`UPDATE ... SET status = 'DISPATCHED' WHERE id = ? AND status = 'AUTHORIZED'`) guarantees that concurrent calls or replayed authorizations execute zero additional times.
-- **Permanent Invalidation on Stale Checks**: Any validation failure (stale task revision, changed Git HEAD, Manager hash mismatch, routing scope mismatch, malformed payload JSON) permanently consumes the row as `INVALIDATED` (`UPDATE ... SET status = 'INVALIDATED' WHERE id = ? AND status = 'AUTHORIZED'`).
+- **Permanent Invalidation on Stale Checks**: Any validation failure (superseded Manager authority, stale task revision/state, changed Git HEAD, routing scope mismatch, malformed payload JSON) permanently consumes the row as `INVALIDATED` (`UPDATE ... SET status = 'INVALIDATED' WHERE id = ? AND status = 'AUTHORIZED'`).
+- **Safe Rejection Evidence**: Discarded or rejected authorizations record `EXECUTION_AUTHORIZATION_REJECTED` events with safe structured metadata (hashes, IDs, reason) and strictly zero prompt text, instructions, or secrets.
 - **Zero Post-Dispatch Failover**: If execution fails (process crash, protocol invalid, timeout, cancellation), the authorization remains consumed (`DISPATCHED`) and never automatically triggers a second provider execution.
 
 ---

@@ -352,9 +352,10 @@ export class Repository {
     payloadHash: string,
     rawPayload: string,
     status: 'APPLIED' | 'REJECTED' | 'DUPLICATE',
-    rejectionReason?: string
+    rejectionReason?: string,
+    createdAt?: string
   ): void {
-    const now = new Date().toISOString();
+    const now = createdAt ?? new Date().toISOString();
     this.db
       .prepare(`
         INSERT INTO protocol_messages (
@@ -392,8 +393,36 @@ export class Repository {
 
   public getProtocolMessagesByTask(taskId: string): Record<string, unknown>[] {
     return this.db
-      .prepare('SELECT * FROM protocol_messages WHERE task_id = ? ORDER BY created_at ASC')
+      .prepare('SELECT * FROM protocol_messages WHERE task_id = ? ORDER BY created_at ASC, id ASC')
       .all(taskId) as Record<string, unknown>[];
+  }
+
+  public getLatestAppliedManagerProtocolMessage(taskId: string, projectId?: string): Record<string, unknown> | null {
+    if (projectId) {
+      const row = this.db
+        .prepare(`
+          SELECT * FROM protocol_messages
+          WHERE task_id = ?
+            AND project_id = ?
+            AND protocol = 'manager.v1'
+            AND status = 'APPLIED'
+          ORDER BY created_at DESC, id DESC
+          LIMIT 1
+        `)
+        .get(taskId, projectId) as Record<string, unknown> | undefined;
+      return row ?? null;
+    }
+    const row = this.db
+      .prepare(`
+        SELECT * FROM protocol_messages
+        WHERE task_id = ?
+          AND protocol = 'manager.v1'
+          AND status = 'APPLIED'
+        ORDER BY created_at DESC, id DESC
+        LIMIT 1
+      `)
+      .get(taskId) as Record<string, unknown> | undefined;
+    return row ?? null;
   }
 
   // ==========================================
@@ -879,6 +908,17 @@ export class Repository {
       `)
       .run(id);
     return res.changes === 1;
+  }
+
+  public invalidateAuthorizedExecutionAuthorizationsForTask(taskId: string): number {
+    const res = this.db
+      .prepare(`
+        UPDATE execution_authorizations
+        SET status = 'INVALIDATED'
+        WHERE task_id = ? AND status = 'AUTHORIZED'
+      `)
+      .run(taskId);
+    return res.changes;
   }
 
   public updateExecutionAuthorizationStatus(id: string, status: ExecutionAuthorizationStatus): void {
