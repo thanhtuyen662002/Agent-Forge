@@ -14,7 +14,7 @@ describe('Database Migrations & Upgrade Integrity', () => {
     db.close();
   });
 
-  it('should run all migrations cleanly and create all tables (v1 through v5)', () => {
+  it('should run all migrations cleanly and create all tables (v1 through v6)', () => {
     MigrationRunner.run(db);
 
     const tables = db
@@ -33,10 +33,11 @@ describe('Database Migrations & Upgrade Integrity', () => {
     expect(tableNames).toContain('decisions');
     expect(tableNames).toContain('verification_commands');
     expect(tableNames).toContain('process_runs');
+    expect(tableNames).toContain('execution_authorizations');
     expect(tableNames).toContain('schema_migrations');
 
     const applied = db.prepare('SELECT COUNT(*) as count FROM schema_migrations').get() as { count: number };
-    expect(applied.count).toBe(5);
+    expect(applied.count).toBe(6);
 
     // Foreign key integrity check
     const fkViolations = db.prepare('PRAGMA foreign_key_check').all();
@@ -45,10 +46,10 @@ describe('Database Migrations & Upgrade Integrity', () => {
     // Idempotency check: running MigrationRunner again applies 0 new migrations
     MigrationRunner.run(db);
     const appliedAgain = db.prepare('SELECT COUNT(*) as count FROM schema_migrations').get() as { count: number };
-    expect(appliedAgain.count).toBe(5);
+    expect(appliedAgain.count).toBe(6);
   });
 
-  it('should cleanly upgrade an existing database through historical path (v1 -> v2 -> original v3 -> v4 -> v5) and repair default agent links', () => {
+  it('should cleanly upgrade an existing database through historical path (v1 -> v2 -> original v3 -> v4 -> v5 -> v6) and repair default agent links', () => {
     // 1. Manually apply v1 schema
     db.exec(`
       CREATE TABLE IF NOT EXISTS schema_migrations (
@@ -96,17 +97,18 @@ describe('Database Migrations & Upgrade Integrity', () => {
     const mgrBefore = db.prepare('SELECT * FROM agents WHERE id = ?').get('agent-primary-manager') as any;
     expect(mgrBefore.provider_resource_id).toBe('res-chatgpt-manager');
 
-    // 2. Run MigrationRunner to upgrade from v1 to latest (v5)
+    // 2. Run MigrationRunner to upgrade from v1 to latest (v6)
     MigrationRunner.run(db);
 
     // 3. Assert migrations applied
-    const v5Tables = (db.prepare("SELECT name FROM sqlite_master WHERE type='table'").all() as { name: string }[]).map((t) => t.name);
-    expect(v5Tables).toContain('verification_commands');
-    expect(v5Tables).toContain('provider_resources');
-    expect(v5Tables).toContain('process_runs');
+    const v6Tables = (db.prepare("SELECT name FROM sqlite_master WHERE type='table'").all() as { name: string }[]).map((t) => t.name);
+    expect(v6Tables).toContain('verification_commands');
+    expect(v6Tables).toContain('provider_resources');
+    expect(v6Tables).toContain('process_runs');
+    expect(v6Tables).toContain('execution_authorizations');
 
     const migrationCount = (db.prepare('SELECT COUNT(*) as count FROM schema_migrations').get() as { count: number }).count;
-    expect(migrationCount).toBe(5);
+    expect(migrationCount).toBe(6);
 
     // 4. Assert default agent links are repaired by migration 005
     const mgrAfter = db.prepare('SELECT * FROM agents WHERE id = ?').get('agent-primary-manager') as any;

@@ -165,11 +165,6 @@ Agent-Forge does not treat raw model strings as architectural truth. Providers, 
 - **Pre-Dispatch-Only Failover & AUTH_ERROR Hard Stop**:
   - Ineligible candidates (e.g. `RATE_LIMITED`, `OFFLINE`, `UNHEALTHY`) are skipped **before** dispatch.
   - Encountering `AUTH_ERROR` halts routing immediately with `NEEDS_OWNER` and zero failover to prevent silent authority or credential bypass.
-- **Durable Routing Authority & Dispatch Binding (`ProviderDispatchService`)**:
-  - `ProviderDispatchService.dispatch(decisionId, request)` loads the authoritative `PROVIDER_ROUTING_DECISION` event from SQLite storage. In-memory synthetic decisions cannot bypass durable authority.
-  - At the dispatch boundary, scope (`projectId`, `taskId`, `attemptId`), resource enablement, parent provider enablement, and adapter mappings are strictly validated against database truth before execution.
-  - **Zero Telemetry Re-probing**: Dispatch does NOT call `getHealth()`, `getQuota()`, or `getCapabilities()`. The durable `RoutingDecision` is the sole routing authority.
-  - If a selected resource or provider becomes disabled after routing, dispatch fails closed immediately (`ROUTING_RESOURCE_DISABLED` / `ROUTING_PROVIDER_DISABLED`) with zero fallback or rerouting.
 - **Durable Routing Audit Trail**: Every routing decision persists a `PROVIDER_ROUTING_DECISION` audit event in SQLite capturing decision ID, outcome, reason, and telemetry snapshots, free from prompts, instructions, or secrets. Pure routing never mutates task state or resource configuration.
 
 - **Provider Resource / Model**: Represents specific model endpoints with discrete:
@@ -180,7 +175,41 @@ Agent-Forge does not treat raw model strings as architectural truth. Providers, 
 
 ---
 
-## 7. Deterministic Derived Progress
+## 7. Durable Execution Authorization & Orchestration Binding
+
+**Routing Authority $\neq$ Execution Payload Authority.**
+
+- **RoutingDecision** decides *which ProviderResource may execute*.
+- **ExecutionAuthorization** decides *what exact approved work that provider is authorized to execute*.
+
+No provider execution may be authorized solely by a `decisionId` plus caller-supplied instructions. All execution payloads and context manifests originate strictly from approved durable AgentForge state.
+
+### Security & Authority Chain
+```text
+ManagerDecision / Approved Task State
+        ↓
+ExecutionAuthorization (Canonical Payload Hash & Context Manifest Hash)
+        ↓
+ProviderRoutingDecision (Selected Resource & Provider Mapping)
+        ↓
+ProviderDispatchService.dispatch(authorizationId)
+        ↓
+EXACTLY ONE Provider Execution
+```
+
+### Execution Authorization Invariants (`ExecutionAuthorizationService`, `ProviderDispatchService`)
+- **Durable Immutable Record**: Persisted in SQLite `execution_authorizations` with fields: `id`, `project_id`, `task_id`, `attempt_id`, `task_revision`, `base_sha`, `routing_decision_id`, `selected_resource_id`, `selected_provider_id`, `instruction_payload_hash`, `context_manifest_hash`, `canonical_instructions_json`, `context_files_json`, `status: AUTHORIZED | DISPATCHED | INVALIDATED`.
+- **Approved State Gate**: Only tasks with approved execution authority (`APPROVED`, `CODING`, `FIX_REQUIRED`, `REVIEWING`, `VALIDATING`, `DISPATCHED`, `HANDOFF_REQUIRED`, `REVIEW_READY`) may produce an `ExecutionAuthorization`.
+- **Canonical Payload & Manifest Hashing**:
+  - `instructionPayloadHash = SHA-256(canonicalPayload)` derived from task title, description, acceptance criteria, constraints, approved instructions, and context files.
+  - `contextManifestHash = SHA-256(canonicalContextFiles)` with strict path containment, no traversal (`../`), no sensitive credential paths (`.env`, `.ssh`, `.aws`), and deterministic lexicographical sorting.
+- **Zero Caller-Supplied Instructions at Dispatch**: `ProviderDispatchService.dispatch(authorizationId)` accepts ONLY `authorizationId`. The request is reconstructed internally from durable state.
+- **Atomic One-Time Claim**: Compare-and-set claim (`UPDATE ... SET status = 'DISPATCHED' WHERE id = ? AND status = 'AUTHORIZED'`) guarantees that concurrent calls or replayed authorizations execute zero additional times.
+- **Zero Post-Dispatch Failover**: If execution fails (process crash, protocol invalid, timeout, cancellation), the authorization remains consumed (`DISPATCHED`) and never automatically triggers a second provider execution.
+
+---
+
+## 8. Deterministic Derived Progress
 
 Task and project progress are never derived from AI self-estimation.
 

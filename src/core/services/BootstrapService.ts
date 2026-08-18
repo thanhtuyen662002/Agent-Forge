@@ -16,6 +16,7 @@ import { ManualBridgeAdapter } from '../adapters/ManualBridgeAdapter';
 import { CodexCliAdapter } from '../adapters/CodexCliAdapter';
 import { ProviderRoutingService } from './ProviderRoutingService';
 import { ProviderDispatchService } from './ProviderDispatchService';
+import { ExecutionAuthorizationService } from './ExecutionAuthorizationService';
 
 export interface BootstrapResult {
   db: Database.Database;
@@ -30,6 +31,7 @@ export interface BootstrapResult {
   providerRegistry: ProviderRegistry;
   providerRoutingService: ProviderRoutingService;
   providerDispatchService: ProviderDispatchService;
+  executionAuthorizationService: ExecutionAuthorizationService;
 }
 
 export class BootstrapService {
@@ -147,9 +149,10 @@ export class BootstrapService {
     // Codex CLI registered as unverified on this host; fails closed on execute
     providerRegistry.register(new CodexCliAdapter({ repo, artifactStore }));
 
-    // 6. Initialize Provider Routing & Dispatch Services
+    // 6. Initialize Provider Routing, Authorization & Dispatch Services
     const providerRoutingService = new ProviderRoutingService(repo, providerRegistry, eventService);
-    const providerDispatchService = new ProviderDispatchService(providerRegistry, repo);
+    const executionAuthorizationService = new ExecutionAuthorizationService(repo, eventService);
+    const providerDispatchService = new ProviderDispatchService(providerRegistry, repo, eventService);
 
     return {
       db,
@@ -164,6 +167,7 @@ export class BootstrapService {
       providerRegistry,
       providerRoutingService,
       providerDispatchService,
+      executionAuthorizationService,
     };
   }
 }

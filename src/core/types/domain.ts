@@ -466,3 +466,24 @@ export interface PolicyRule {
   default_decision: PolicyDecision;
   created_at: string;
 }
+
+export type ExecutionAuthorizationStatus = 'AUTHORIZED' | 'DISPATCHED' | 'INVALIDATED';
+
+export interface ExecutionAuthorization {
+  id: string;
+  project_id: string;
+  task_id: string;
+  attempt_id: string | null;
+  task_revision: number;
+  base_sha: string;
+  routing_decision_id: string;
+  selected_resource_id: string;
+  selected_provider_id: string;
+  instruction_payload_hash: string;
+  context_manifest_hash: string;
+  canonical_instructions_json: string;
+  context_files_json: string;
+  status: ExecutionAuthorizationStatus;
+  created_at: string;
+  dispatched_at: string | null;
+}
