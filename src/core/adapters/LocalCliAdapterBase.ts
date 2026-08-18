@@ -139,21 +139,27 @@ export abstract class LocalCliAdapterBase implements ProviderAdapter {
   public async execute(request: AgentExecutionRequest): Promise<AgentExecutionResult> {
     const executionId = crypto.randomUUID();
 
-    // 1. Resolve target project repository path
-    let repoPath = process.cwd();
-    if (this.repo) {
-      const project = this.repo.getProject(request.projectId);
-      if (!project) {
-        return {
-          executionId,
-          status: 'FAILED',
-          error: `Project "${request.projectId}" not found in database.`,
-        };
-      }
-      repoPath = path.normalize(path.resolve(project.repository_path));
+    // 1. Mandatory Repository Dependency Gate: Fail closed immediately if repo is absent (no spawn, no process.cwd fallback)
+    if (!this.repo) {
+      return {
+        executionId,
+        status: 'FAILED',
+        error: 'PROVIDER_REPOSITORY_NOT_CONFIGURED: Local CLI adapter requires a configured Repository to resolve durable project working directory.',
+      };
     }
 
-    // 2. Validate repository directory existence
+    // 2. Resolve target project repository path from durable database state
+    const project = this.repo.getProject(request.projectId);
+    if (!project) {
+      return {
+        executionId,
+        status: 'FAILED',
+        error: `Project "${request.projectId}" not found in database.`,
+      };
+    }
+    const repoPath = path.normalize(path.resolve(project.repository_path));
+
+    // 3. Validate repository directory existence
     if (!fs.existsSync(repoPath)) {
       return {
         executionId,

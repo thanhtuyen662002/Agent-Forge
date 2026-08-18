@@ -14,7 +14,6 @@ import { EmergencyStopService } from './EmergencyStopService';
 import { ProviderRegistry } from '../adapters/ProviderRegistry';
 import { ManualBridgeAdapter } from '../adapters/ManualBridgeAdapter';
 import { CodexCliAdapter } from '../adapters/CodexCliAdapter';
-import { AntigravityCliAdapter } from '../adapters/AntigravityCliAdapter';
 
 export interface BootstrapResult {
   db: Database.Database;
@@ -138,11 +137,11 @@ export class BootstrapService {
     const taskService = new TaskService(repo, eventService, verificationService, artifactStore);
     const emergencyStopService = new EmergencyStopService(repo, eventService);
 
-    // 5. Initialize Provider Registry
+    // 5. Initialize Provider Registry with supported adapters
     const providerRegistry = new ProviderRegistry();
     providerRegistry.register(new ManualBridgeAdapter());
-    providerRegistry.register(new CodexCliAdapter({ repo, artifactStore }));
-    providerRegistry.register(new AntigravityCliAdapter({ repo, artifactStore }));
+    // Codex CLI registered as unverified on this host (contractVerified=false); fails closed on execute
+    providerRegistry.register(new CodexCliAdapter({ repo, artifactStore, contractVerified: false }));
 
     return {
       db,

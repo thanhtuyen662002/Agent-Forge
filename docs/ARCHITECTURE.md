@@ -150,16 +150,20 @@ interface ProcessExecutionRequest {
 
 Agent-Forge does not treat raw model strings as architectural truth. Providers, adapters, and resources are modeled explicitly:
 
-### ProviderRegistry & Adapters
-- **ProviderRegistry**: In-memory adapter lookup registry with unique ID enforcement. Rejects duplicate IDs and fails closed on unregistered provider requests without silent fallback or autonomous routing.
-- **Manual Bridge Adapter (`prov-manual-bridge`)**: Reference/fallback adapter that returns `AWAITING_OWNER` status (never `COMPLETED`) to preserve lifecycle truthfulness during manual relay.
-- **Local CLI Adapter Foundation (`LocalCliAdapterBase`)**:
-  - Executes local tools (e.g. `CodexCliAdapter`, `AntigravityCliAdapter`) safely through `ProcessRunner` with `shell: false`.
-  - Enforces project repository `cwd` and validates all context file paths via `PolicyService` (rejecting directory traversal `../` and sensitive files like `.env`).
-  - Passes prompt securely via `child.stdin` without leaking sensitive instructions into command-line arguments or `process_runs.command`.
-  - Binds process lifecycle to `projectId`, `taskId`, and `attemptId`, writing durable stdout/stderr `Evidence` records.
-  - Validates exit 0 outputs with `ProtocolParser` against Zod `CoderProtocolSchema` before marking execution as `COMPLETED`. Exit 0 without valid protocol yields `FAILED` (`PROTOCOL_INVALID`).
-  - Probes health truthfully (`AVAILABLE`, `OFFLINE`, `AUTH_ERROR`) and reports `UNKNOWN` quota with `0.0` confidence without estimation.
+### Provider Registry & Discovery Truth
+- **ProviderRegistry**: In-memory adapter lookup registry with unique ID enforcement. Rejects duplicate IDs and fails closed on unregistered provider requests without silent fallback or autonomous routing (`AUTONOMOUS_ROUTING_IMPLEMENTED=NO`).
+- **Manual Bridge (`prov-manual-bridge`)**: SUPPORTED reference/fallback adapter. Returns `AWAITING_OWNER` status (never `COMPLETED`) to preserve lifecycle truthfulness during manual relay.
+- **Codex Automated CLI (`prov-codex-cli`)**: NOT AVAILABLE ON REVIEW HOST (`CODEX_CLI_DISCOVERED=NO`). The adapter requires an explicit verified CLI contract (`contractVerified=true`); on unverified hosts it fails closed on execution (`CODEX_CLI_UNAVAILABLE`) and reports `OFFLINE` health without spawning processes.
+- **Antigravity Integration**: NOT AVAILABLE as an automated CLI (`ANTIGRAVITY_CLI_DISCOVERED=NO`, `ANTIGRAVITY_AUTOMATION_MODE=MANUAL_BRIDGE_ONLY`). Manual Bridge remains the supported Antigravity transport. No GUI automation or process scraping is permitted.
+
+### Local CLI Adapter Foundation (`LocalCliAdapterBase`)
+- Executes local tools safely through `ProcessRunner` with `shell: false`.
+- **Durable Working Directory**: Requires a configured `Repository` to resolve the project root. Has zero fallback to `process.cwd()`. Unknown projects fail closed immediately without spawning.
+- **Context Security**: Evaluates all context file paths via `PolicyService`, rejecting directory traversal (`../`) and sensitive files (`.env`, `.ssh`, `.aws`, `.gnupg`).
+- **Privacy & Redaction**: Passes prompts securely via `child.stdin` without leaking instructions into CLI arguments or `process_runs.command`. Secrets are scrubbed before logging.
+- **Process & Evidence Ownership**: Binds process lifecycle to `projectId`, `taskId`, and `attemptId`, recording durable stdout and stderr `Evidence` records in `ArtifactStore`.
+- **Protocol Gate**: Validates exit 0 outputs with `ProtocolParser` against Zod `CoderProtocolSchema`. Exit 0 without valid protocol yields `FAILED` (`PROTOCOL_INVALID`).
+- **Truthful Telemetry**: Probes health truthfully and reports `UNKNOWN` quota with `0.0` confidence without estimation.
 
 - **Provider Resource / Model**: Represents specific model endpoints with discrete:
   - Health status (`AVAILABLE`, `LOW_QUOTA`, `RATE_LIMITED`, `QUOTA_EXHAUSTED`, `OFFLINE`, `UNKNOWN`)
