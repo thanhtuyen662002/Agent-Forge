@@ -69,6 +69,8 @@ describe('Bootstrap Smoke & Fresh Database Startup', () => {
     expect(bootstrap.providerRegistry.has('prov-manual-bridge')).toBe(true);
     expect(bootstrap.providerRegistry.has('prov-codex-cli')).toBe(true);
     expect(bootstrap.providerRegistry.has('prov-antigravity-cli')).toBe(false);
+    expect(bootstrap.providerRoutingService).toBeDefined();
+    expect(bootstrap.providerDispatchService).toBeDefined();
 
     // Create a project through trusted native selection token flow
     const token = RepositorySelectionService.issueToken(tmpGitDir);

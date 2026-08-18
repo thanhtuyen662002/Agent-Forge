@@ -150,20 +150,27 @@ interface ProcessExecutionRequest {
 
 Agent-Forge does not treat raw model strings as architectural truth. Providers, adapters, and resources are modeled explicitly:
 
-### Provider Registry & Discovery Truth
-- **ProviderRegistry**: In-memory adapter lookup registry with unique ID enforcement. Rejects duplicate IDs and fails closed on unregistered provider requests without silent fallback or autonomous routing (`AUTONOMOUS_ROUTING_IMPLEMENTED=NO`).
-- **Manual Bridge (`prov-manual-bridge`)**: SUPPORTED reference/fallback adapter. Returns `AWAITING_OWNER` status (never `COMPLETED`) to preserve lifecycle truthfulness during manual relay.
-- **Codex Automated CLI (`prov-codex-cli`)**: NOT AVAILABLE ON REVIEW HOST (`CODEX_CLI_DISCOVERED=NO`, `CODEX_CONTRACT_VERIFIED=NO`). Health is `OFFLINE`, and capabilities are `[]` while unavailable. `execute()` unconditionally fails closed with `CODEX_CLI_UNAVAILABLE` without spawning child processes. No production option, boolean, configuration flag, or constructor parameter can enable Codex execution in this foundation. Future Codex automation requires a separate evidence-backed milestone that discovers the actual CLI, proves its non-interactive invocation contract, implements that exact contract, and validates it before enabling execution.
-- **Antigravity Integration**: NOT AVAILABLE as an automated CLI (`ANTIGRAVITY_CLI_DISCOVERED=NO`, `ANTIGRAVITY_AUTOMATION_MODE=MANUAL_BRIDGE_ONLY`). Manual Bridge remains the supported Antigravity transport. No GUI automation or process scraping is permitted.
-
-### Local CLI Adapter Foundation (`LocalCliAdapterBase`)
-- Executes local tools safely through `ProcessRunner` with `shell: false`.
-- **Durable Working Directory**: Requires a configured `Repository` to resolve the project root. Has zero fallback to `process.cwd()`. Unknown projects fail closed immediately without spawning.
-- **Context Security**: Evaluates all context file paths via `PolicyService`, rejecting directory traversal (`../`) and sensitive files (`.env`, `.ssh`, `.aws`, `.gnupg`).
-- **Privacy & Redaction**: Passes prompts securely via `child.stdin` without leaking instructions into CLI arguments or `process_runs.command`. Secrets are scrubbed before logging.
-- **Process & Evidence Ownership**: Binds process lifecycle to `projectId`, `taskId`, and `attemptId`, recording durable stdout and stderr `Evidence` records in `ArtifactStore`.
-- **Protocol Gate**: Validates exit 0 outputs with `ProtocolParser` against Zod `CoderProtocolSchema`. Exit 0 without valid protocol yields `FAILED` (`PROTOCOL_INVALID`).
-- **Truthful Telemetry**: Probes health truthfully and reports `UNKNOWN` quota with `0.0` confidence without estimation.
+### Provider Resource & Routing Architecture (`ProviderRoutingService`)
+- **Routing Target**: Routes by `ProviderResource` ID (which owns discrete capabilities, model name, health status, and quota metadata), resolving through `ProviderRegistry` to concrete `ProviderAdapter` implementations.
+- **Explicit Candidate Policy**: Routing requests must provide an explicit, ordered list of candidate resource IDs. Duplicate candidates are rejected explicitly. Empty candidate lists yield `NO_ELIGIBLE_PROVIDER`.
+- **Deterministic Eligibility Tiers**:
+  - **Tier 1 (AVAILABLE Automated)**: Provider is enabled, satisfies required capabilities (subset of both resource and adapter), live health is `AVAILABLE`, and quota is not authoritatively exhausted.
+  - **Tier 2 (LOW_QUOTA Automated)**: Provider satisfies capabilities, health is `LOW_QUOTA`, and quota is not authoritatively exhausted.
+  - **Tier 3 (Manual Bridge)**: Permitted only when `allowManualBridge=true`, resource is enabled, and required capabilities match. Yields `MANUAL_HANDOFF_REQUIRED` (never automated `SELECTED`).
+  - **Tie-Breaking**: Within the same eligibility tier, candidate input ordering is preserved deterministically without random selection or fake quota percentages.
+- **Truthful Quota & Exhaustion Semantics**:
+  - Quota is never guessed or cross-compared across different units (e.g. tokens vs requests).
+  - Hard exhaustion occurs only when health is `QUOTA_EXHAUSTED` or authoritative remaining quota is $\le 0$ under `MEASURED`, `PROVIDER_REPORTED`, or `MANUAL` sources.
+  - `UNKNOWN` quota or `ESTIMATED` remaining $= 0$ does not hard-block dispatch if health is `AVAILABLE`.
+- **Pre-Dispatch-Only Failover & AUTH_ERROR Hard Stop**:
+  - Ineligible candidates (e.g. `RATE_LIMITED`, `OFFLINE`, `UNHEALTHY`) are skipped **before** dispatch.
+  - Encountering `AUTH_ERROR` halts routing immediately with `NEEDS_OWNER` and zero failover to prevent silent authority or credential bypass.
+- **Durable Routing Authority & Dispatch Binding (`ProviderDispatchService`)**:
+  - `ProviderDispatchService.dispatch(decisionId, request)` loads the authoritative `PROVIDER_ROUTING_DECISION` event from SQLite storage. In-memory synthetic decisions cannot bypass durable authority.
+  - At the dispatch boundary, scope (`projectId`, `taskId`, `attemptId`), resource enablement, parent provider enablement, and adapter mappings are strictly validated against database truth before execution.
+  - **Zero Telemetry Re-probing**: Dispatch does NOT call `getHealth()`, `getQuota()`, or `getCapabilities()`. The durable `RoutingDecision` is the sole routing authority.
+  - If a selected resource or provider becomes disabled after routing, dispatch fails closed immediately (`ROUTING_RESOURCE_DISABLED` / `ROUTING_PROVIDER_DISABLED`) with zero fallback or rerouting.
+- **Durable Routing Audit Trail**: Every routing decision persists a `PROVIDER_ROUTING_DECISION` audit event in SQLite capturing decision ID, outcome, reason, and telemetry snapshots, free from prompts, instructions, or secrets. Pure routing never mutates task state or resource configuration.
 
 - **Provider Resource / Model**: Represents specific model endpoints with discrete:
   - Health status (`AVAILABLE`, `LOW_QUOTA`, `RATE_LIMITED`, `QUOTA_EXHAUSTED`, `OFFLINE`, `UNKNOWN`)
