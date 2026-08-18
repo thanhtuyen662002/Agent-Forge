@@ -172,3 +172,22 @@ export const GenerateAuthorizedWorkOrderIpcSchema = z
   })
   .strict();
 export type GenerateAuthorizedWorkOrderIpc = z.infer<typeof GenerateAuthorizedWorkOrderIpcSchema>;
+
+// ==========================================
+// PR #9: Installed-App Update & Info Schemas
+// ==========================================
+
+export const UpdateGetStateIpcSchema = z.object({}).strict();
+export type UpdateGetStateIpc = z.infer<typeof UpdateGetStateIpcSchema>;
+
+export const UpdateCheckIpcSchema = z.object({}).strict();
+export type UpdateCheckIpc = z.infer<typeof UpdateCheckIpcSchema>;
+
+export const UpdateDownloadIpcSchema = z.object({}).strict();
+export type UpdateDownloadIpc = z.infer<typeof UpdateDownloadIpcSchema>;
+
+export const UpdateInstallAndRestartIpcSchema = z.object({}).strict();
+export type UpdateInstallAndRestartIpc = z.infer<typeof UpdateInstallAndRestartIpcSchema>;
+
+export const GetAppInfoIpcSchema = z.object({}).strict();
+export type GetAppInfoIpc = z.infer<typeof GetAppInfoIpcSchema>;

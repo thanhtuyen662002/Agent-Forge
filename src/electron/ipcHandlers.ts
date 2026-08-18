@@ -1,4 +1,4 @@
-import { ipcMain, dialog } from 'electron';
+import { ipcMain, dialog, app } from 'electron';
 import path from 'path';
 import { Repository } from '../core/database/repositories';
 import { ProjectService } from '../core/services/ProjectService';
@@ -14,6 +14,7 @@ import { RepositorySelectionService } from '../core/services/RepositorySelection
 import { ProviderRoutingService } from '../core/services/ProviderRoutingService';
 import { ExecutionAuthorizationService } from '../core/services/ExecutionAuthorizationService';
 import { ProviderDispatchService } from '../core/services/ProviderDispatchService';
+import { UpdateService } from '../core/services/UpdateService';
 import {
   CreateProjectIpcSchema,
   ImportContractIpcSchema,
@@ -34,6 +35,11 @@ import {
   DispatchAuthorizationIpcSchema,
   GetOwnerHandoffSnapshotIpcSchema,
   GenerateAuthorizedWorkOrderIpcSchema,
+  UpdateGetStateIpcSchema,
+  UpdateCheckIpcSchema,
+  UpdateDownloadIpcSchema,
+  UpdateInstallAndRestartIpcSchema,
+  GetAppInfoIpcSchema,
 } from '../core/types/ipc';
 
 export function registerIpcHandlers(
@@ -44,7 +50,8 @@ export function registerIpcHandlers(
   emergencyStopService: EmergencyStopService,
   providerRoutingService?: ProviderRoutingService,
   executionAuthorizationService?: ExecutionAuthorizationService,
-  providerDispatchService?: ProviderDispatchService
+  providerDispatchService?: ProviderDispatchService,
+  updateService?: UpdateService
 ): void {
   // ==========================================
   // Trusted Repository Selection Dialog
@@ -655,6 +662,98 @@ export function registerIpcHandlers(
       return { success: true, workOrder };
     } catch (err: any) {
       return { success: false, error: err.message || 'Failed to generate authorized manual WorkOrder.' };
+    }
+  });
+
+  // ==========================================
+  // PR #9: App Info & Update Lifecycle Handlers
+  // ==========================================
+
+  ipcMain.handle('app:getInfo', async (_, payload: unknown) => {
+    const parsed = GetAppInfoIpcSchema.safeParse(payload || {});
+    if (!parsed.success) {
+      return { success: false, error: parsed.error.issues.map((i) => i.message).join(', ') };
+    }
+    return {
+      success: true,
+      info: {
+        version: typeof app?.getVersion === 'function' ? app.getVersion() : '0.1.0',
+        isPackaged: typeof app?.isPackaged === 'boolean' ? app.isPackaged : false,
+        platform: process.platform,
+        arch: process.arch,
+      },
+    };
+  });
+
+  ipcMain.handle('update:getState', async (_, payload: unknown) => {
+    const parsed = UpdateGetStateIpcSchema.safeParse(payload || {});
+    if (!parsed.success) {
+      return { success: false, error: parsed.error.issues.map((i) => i.message).join(', ') };
+    }
+    if (!updateService) {
+      return {
+        success: true,
+        summary: {
+          state: 'DISABLED',
+          currentVersion: typeof app?.getVersion === 'function' ? app.getVersion() : '0.1.0',
+          updateInfo: null,
+          progress: null,
+          error: null,
+          isPackaged: typeof app?.isPackaged === 'boolean' ? app.isPackaged : false,
+          isCodeSigned: false,
+          canInstall: false,
+          lastCheckedAt: null,
+        },
+      };
+    }
+    return { success: true, summary: updateService.getState() };
+  });
+
+  ipcMain.handle('update:check', async (_, payload: unknown) => {
+    const parsed = UpdateCheckIpcSchema.safeParse(payload || {});
+    if (!parsed.success) {
+      return { success: false, error: parsed.error.issues.map((i) => i.message).join(', ') };
+    }
+    if (!updateService) {
+      return { success: false, error: 'Update service not available.' };
+    }
+    try {
+      const summary = await updateService.checkForUpdates();
+      return { success: true, summary };
+    } catch (err: any) {
+      return { success: false, error: err.message || 'Failed to check for updates.' };
+    }
+  });
+
+  ipcMain.handle('update:download', async (_, payload: unknown) => {
+    const parsed = UpdateDownloadIpcSchema.safeParse(payload || {});
+    if (!parsed.success) {
+      return { success: false, error: parsed.error.issues.map((i) => i.message).join(', ') };
+    }
+    if (!updateService) {
+      return { success: false, error: 'Update service not available.' };
+    }
+    try {
+      const summary = await updateService.downloadUpdate();
+      return { success: true, summary };
+    } catch (err: any) {
+      return { success: false, error: err.message || 'Failed to download update.' };
+    }
+  });
+
+  ipcMain.handle('update:installAndRestart', async (_, payload: unknown) => {
+    const parsed = UpdateInstallAndRestartIpcSchema.safeParse(payload || {});
+    if (!parsed.success) {
+      return { success: false, error: parsed.error.issues.map((i) => i.message).join(', ') };
+    }
+    if (!updateService) {
+      return { success: false, error: 'Update service not available.' };
+    }
+    try {
+      updateService.installAndRestart();
+      return { success: true };
+    } catch (err: any) {
+      return { success: false, error: err.message || 'Failed to install update.' };
     }
   });
 }

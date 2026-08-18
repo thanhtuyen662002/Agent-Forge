@@ -1,7 +1,8 @@
 import React from 'react';
 import { useOrchestrator } from '../context/OrchestratorContext';
+import { useI18n } from '../context/I18nContext';
 import { UIDensityMode } from '../../core/types/domain';
-import { ShieldAlert, Play, Pause, FolderGit2, Activity, Cpu } from 'lucide-react';
+import { ShieldAlert, Play, Pause, FolderGit2, Activity, Cpu, Languages } from 'lucide-react';
 
 export const Header: React.FC = () => {
   const {
@@ -16,6 +17,8 @@ export const Header: React.FC = () => {
     tasks,
     agents,
   } = useOrchestrator();
+
+  const { locale, setLocale, t } = useI18n();
 
   const doneTasks = tasks.filter((t) => t.state === 'DONE').length;
   const activeAgents = agents.filter((a) => a.status === 'ACTIVE' || a.status === 'BUSY').length;
@@ -44,8 +47,8 @@ export const Header: React.FC = () => {
             <span className="font-mono font-bold text-white text-sm">AF</span>
           </div>
           <div>
-            <h1 className="text-sm font-semibold text-white tracking-wide uppercase font-mono">Agent-Forge</h1>
-            <span className="text-xs text-slate-400 block -mt-0.5">Control Plane</span>
+            <h1 className="text-sm font-semibold text-white tracking-wide uppercase font-mono">{t('app.title')}</h1>
+            <span className="text-xs text-slate-400 block -mt-0.5">{t('app.modeDesktop')}</span>
           </div>
         </div>
 
@@ -88,8 +91,20 @@ export const Header: React.FC = () => {
         </div>
       </div>
 
-      {/* Right: UI Density Mode & Controls */}
-      <div className="flex items-center space-x-4">
+      {/* Right: UI Density Mode, Language Selector & Controls */}
+      <div className="flex items-center space-x-3">
+        {/* Language Selector */}
+        <div className="flex items-center bg-surface-card border border-surface-border rounded-lg p-1 text-xs font-mono">
+          <button
+            onClick={() => setLocale(locale === 'vi-VN' ? 'en-US' : 'vi-VN')}
+            title={t('language.selectorLabel')}
+            className="px-2 py-1 rounded flex items-center space-x-1.5 text-slate-300 hover:text-white transition"
+          >
+            <Languages className="w-3.5 h-3.5 text-forge-cyan" />
+            <span className="font-semibold">{locale === 'vi-VN' ? '🇻🇳 VI' : '🇺🇸 EN'}</span>
+          </button>
+        </div>
+
         {/* Density Mode Switch */}
         <div className="bg-surface-card p-1 rounded-lg border border-surface-border flex items-center text-xs font-mono">
           {(['OWNER', 'ENGINEER', 'DEBUG'] as UIDensityMode[]).map((mode) => (
@@ -144,7 +159,7 @@ export const Header: React.FC = () => {
           className="px-3.5 py-1.5 bg-rose-600 hover:bg-rose-700 text-white font-mono font-bold text-xs rounded-md flex items-center space-x-2 shadow-lg shadow-rose-950/60 glow-rose transition"
         >
           <ShieldAlert className="w-4 h-4" />
-          <span>EMERGENCY STOP</span>
+          <span>{t('emergencyStop.button').toUpperCase()}</span>
         </button>
       </div>
     </header>

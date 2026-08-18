@@ -313,3 +313,61 @@ Owner pastes Gemini report into Coder Inbox → Protocol validation & Verificati
 - **Truthful UI Quota Semantics**: Provider resources with `quota_source = 'UNKNOWN'` or `remaining_quota = null` render truthfully as `UNKNOWN (conf: 0.0)` in the UI and are never falsified as `0`, `unlimited`, or `healthy`.
 - **Atomic Replay Prevention**: Once dispatched, authorizations remain in `DISPATCHED` state across application restarts and reject subsequent dispatch attempts fail-closed.
 - **Zero Automation**: No browser automation, Gemini web scraping, Antigravity GUI automation, or background clipboard polling. WorkOrder clipboard writing is strictly human-triggered on explicit button click.
+
+---
+
+## 10. Internationalization (i18n) & Installed-App Update Foundation (PR #9)
+
+AgentForge PR #9 establishes the demo readiness baseline, bilingual Vietnamese/English user experience, and a secure installed-app software update foundation.
+
+### Bilingual Translation Subsystem
+- **Supported Locales**: Vietnamese (`vi-VN`) and English (`en-US`).
+- **Strict Key Parity**: The `TranslationDictionary` interface in `src/shared/i18n/types.ts` is the single authoritative structural schema. Automated tests (`tests/i18n.test.ts`) assert 100% key parity and absence of empty strings across catalogs.
+- **Durable Preference**: User locale preference is persisted in `localStorage` under `agentforge_locale` and retained across window reloads and application restarts.
+- **Initial Locale Resolution**: If no stored preference exists, the client resolves the system locale: any `vi*` system locale defaults to `vi-VN`, while all other locales default to `en-US`.
+- **Domain/Protocol Invariance**: Technical protocols (`manager.v1`, `coder.v1`), domain identifiers, database columns, SQLite tables, IPC channels, and state machine enums remain invariant in English and are never localized in storage or protocol messages.
+
+### Installed-App Update Architecture
+```
+Renderer Process                  Electron Main Process (Node.js)
+┌───────────────────────────┐    ┌───────────────────────────────────────────────┐
+│ SettingsView / Header     │    │ UpdateService                                 │
+│ ┌───────────────────────┐ │    │ ┌───────────────────────────────────────────┐ │
+│ │ Check for Updates     │ │    │ │ State Machine:                            │ │
+│ │ Download Update       │─┼────┼─► IDLE ──► CHECKING ──► UPDATE_AVAILABLE    │ │
+│ │ Restart & Install     │ │IPC │ │                  └──► NO_UPDATE_AVAILABLE │ │
+│ └───────────────────────┘ │    │ │                                           │ │
+│ ┌───────────────────────┐ │    │ │ UPDATE_AVAILABLE ──► DOWNLOADING          │ │
+│ │ Live Progress Bar     │◄┼────┼─┤ DOWNLOADING ──► DOWNLOADED                │ │
+│ │ Active Work Warning   │ │    │ │ DOWNLOADED ──► INSTALLING (Owner Gate)    │ │
+│ └───────────────────────┘ │    │ └───────────────────────────────────────────┘ │
+└───────────────────────────┘    │ ┌───────────────────────────────────────────┐ │
+                                 │ │ Safety & Policy Gates:                    │ │
+                                 │ │ - autoDownload = false                    │ │
+                                 │ │ - autoInstallOnAppQuit = false            │ │
+                                 │ │ - canSafelyRestart() SQLite guard         │ │
+                                 │ │ - Token/Secret sanitization in errors     │ │
+                                 │ │ - Zero ExecutionAuthorization coupling    │ │
+                                 │ └───────────────────────────────────────────┘ │
+                                 │                       │                       │
+                                 │                       ▼                       │
+                                 │               electron-updater                │
+                                 │             (Windows NSIS Target)             │
+                                 └───────────────────────────────────────────────┘
+```
+
+### Safety, Isolation & Verification Rules
+1. **Owner-Controlled Execution**: Automatic background downloading (`autoDownload = false`) and stealth quit-and-install (`autoInstallOnAppQuit = false`) are disabled. The Owner explicitly triggers both download and installation.
+2. **Safe Restart Guard (`canSafelyRestart`)**: `UpdateService.installAndRestart()` verifies SQLite state before invoking the installer. If tasks in the active project are currently in `CODING`, `VALIDATING`, or `DISPATCHED` execution states, restart is safely blocked.
+3. **Strict IPC Boundary & Schema**:
+   - `update:getState`: Parameterless query returning structured `UpdateStateSummary`.
+   - `update:check`: Parameterless query triggering update check.
+   - `update:download`: Parameterless command triggering download of detected release.
+   - `update:installAndRestart`: Parameterless command triggering installation.
+   - Renderer cannot supply update URLs, executable paths, authorization tokens, or shell commands.
+4. **Secret Sanitization**: Error messages from update operations sanitize GitHub Personal Access Tokens (`ghp_*`), Bearer tokens, and URL embedded credentials before recording or returning to renderer.
+5. **Separation from Authorization Core**: The updater subsystem has zero authority to create, dispatch, or modify `ExecutionAuthorization` records or bypass security policies.
+6. **Packaging & Release Pipeline**:
+   - Packaged with `electron-builder` targeting Windows NSIS directory and installer.
+   - Normal PR and main branch builds enforce `--publish never`.
+   - Production releases are published strictly via dedicated release workflows.

@@ -138,7 +138,18 @@ try {
   }
   Write-Host "[5/6] React Root rendered ($($report.rootChildCount) child elements): PASS"
 
-  # 6. Window Handle & Title Inspection (Local/Interactive Mode)
+  # 6. Update Service & App Info Initialization Guard
+  if (-not $report.updateServiceInitialized) {
+    Write-Error "UpdateService was not initialized in main process."
+    exit 1
+  }
+  if ([string]::IsNullOrWhiteSpace($report.appVersion)) {
+    Write-Error "App version was not reported."
+    exit 1
+  }
+  Write-Host "[6/7] UpdateService initialized & App Version verified ($($report.appVersion)): PASS"
+
+  # 7. Window Handle & Title Inspection (Local/Interactive Mode)
   if (-not $Headless) {
     $proc.Refresh()
     $handle = $proc.MainWindowHandle
@@ -152,12 +163,12 @@ try {
       Write-Error "Window title mismatch: '$($report.windowTitle)'"
       exit 1
     }
-    Write-Host "[6/6] Window title verified ('$($report.windowTitle)') with handle ($handle): PASS"
+    Write-Host "[7/7] Window title verified ('$($report.windowTitle)') with handle ($handle): PASS"
   } else {
-    Write-Host "[6/6] Headless mode: verified window title from Electron main report ('$($report.windowTitle)'): PASS"
+    Write-Host "[7/7] Headless mode: verified window title from Electron main report ('$($report.windowTitle)'): PASS"
   }
 
-  Write-Host "=== Packaged Runtime Smoke Test: SUCCESS (All 6 Gates Passed) ==="
+  Write-Host "=== Packaged Runtime Smoke Test: SUCCESS (All 7 Gates Passed) ==="
 
 } finally {
   # Clean termination of test process

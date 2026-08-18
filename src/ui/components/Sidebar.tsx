@@ -1,5 +1,6 @@
 import React from 'react';
 import { useOrchestrator } from '../context/OrchestratorContext';
+import { useI18n } from '../context/I18nContext';
 import {
   LayoutDashboard,
   ArrowLeftRight,
@@ -16,22 +17,23 @@ import {
 
 export const Sidebar: React.FC = () => {
   const { activeView, setActiveView, tasks, densityMode } = useOrchestrator();
+  const { t } = useI18n();
 
   const pendingBridgeTasks = tasks.filter(
     (t) => t.state === 'CODING' || t.state === 'REVIEW_READY' || t.state === 'PLANNED'
   ).length;
 
   const navItems = [
-    { id: 'dashboard', label: 'Dashboard', icon: LayoutDashboard },
-    { id: 'manual-bridge', label: 'Manual Bridge', icon: ArrowLeftRight, badge: pendingBridgeTasks },
+    { id: 'dashboard', label: t('nav.dashboard'), icon: LayoutDashboard },
+    { id: 'manual-bridge', label: t('nav.manualBridge'), icon: ArrowLeftRight, badge: pendingBridgeTasks },
     { id: 'task-board', label: 'Task Board', icon: Kanban, badge: tasks.length },
     { id: 'agent-center', label: 'Agent Center', icon: Bot },
     { id: 'capacity', label: 'Capacity & Quota', icon: Cpu },
-    { id: 'timeline', label: 'Timeline & Audit', icon: History },
+    { id: 'timeline', label: t('nav.timeline'), icon: History },
     { id: 'decisions', label: 'Decisions & Authority', icon: Scale },
-    { id: 'evidence', label: 'Evidence Locker', icon: ShieldCheck },
+    { id: 'evidence', label: t('nav.evidence'), icon: ShieldCheck },
     { id: 'projects', label: 'Projects & Contract', icon: FolderGit2 },
-    { id: 'settings', label: 'Settings & Policy', icon: Sliders },
+    { id: 'settings', label: t('nav.settings'), icon: Sliders },
   ];
 
   if (densityMode === 'DEBUG') {

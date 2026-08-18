@@ -19,7 +19,7 @@ Agent-Forge guarantees that the durable source of truth resides entirely in:
 
 ---
 
-## Current Status: `OWNER_ROUTING_MANUAL_BRIDGE_LOOP`
+## Current Status: `DEMO_READINESS_I18N_AUTO_UPDATE`
 
 - **Core Foundation & Database Migrations (PR #1)**: **IMPLEMENTED & VERIFIED** (SQLite WAL mode, strict foreign keys, state machine, Git ground truth).
 - **Continuous Integration Pipeline (PR #2)**: **IMPLEMENTED & VERIFIED** (Multi-platform Windows & Ubuntu CI with diff hygiene).
@@ -28,8 +28,29 @@ Agent-Forge guarantees that the durable source of truth resides entirely in:
 - **Deterministic Quota-Aware Routing (PR #6)**: **IMPLEMENTED & VERIFIED** (Pre-dispatch failover, tier-based eligibility, AUTH_ERROR hard stop, durable routing decision events).
 - **Durable Execution Authorization (PR #7)**: **IMPLEMENTED & VERIFIED** (Immutable `ExecutionAuthorization` binding exact approved work payloads, canonical payload hashes, context manifest containment, and atomic one-time dispatch claims).
 - **Owner Routing & Manual Bridge UI Loop (PR #8)**: **IMPLEMENTED & VERIFIED** (Human-in-the-Loop routing controller, explicit candidate reordering, truthful UNKNOWN quota rendering, typed single-argument dispatch IPC, 1-click WorkOrder copy, and durable restart reconstruction).
+- **Demo Readiness, Bilingual i18n & Installed-App Updates (PR #9)**: **IMPLEMENTED & VERIFIED** (Vietnamese `vi-VN` and English `en-US` typed translation dictionaries with 100% key parity, durable locale persistence, visible versioning, installed-app update foundation with `electron-updater`, live progress, Owner-controlled restart/install, and safe restart guards).
 - **Automated Production Providers**: Production Codex CLI remains `OFFLINE` (`capabilities=[]`, fails closed without spawning processes) on hosts without verified contracts. System operates reliably via the **Owner Manual Bridge**.
-- **Code Signing**: **UNSIGNED FOUNDATION** (`CODE_SIGNED=NO`; code-signing certificates and auto-update are intentionally deferred).
+- **Code Signing Status**: **UNSIGNED DESKTOP FOUNDATION** (`CODE_SIGNED=NO`; Windows executable is unsigned; explicitly noted in About and Update UI).
+
+---
+
+## Supported Languages (i18n)
+
+Agent-Forge features complete bilingual support:
+- 🇻🇳 **Tiếng Việt (`vi-VN`)**: Full Vietnamese user interface with accurate technical terminology.
+- 🇺🇸 **English (`en-US`)**: Default international English interface.
+
+Language selection is preserved across reloads and application restarts. Protocol messages (`manager.v1`, `coder.v1`), database storage, and state machine enums remain invariant in English.
+
+---
+
+## Installed-App Update Architecture
+
+Agent-Forge incorporates a secure, human-in-the-loop update foundation:
+- **Zero Stealth Installs**: `autoDownload` and `autoInstallOnAppQuit` are disabled. The Owner decides when to check, download, and install.
+- **Active Work Guard**: The update service verifies SQLite state and blocks restart if any task is actively running (`CODING`, `VALIDATING`, `DISPATCHED`).
+- **Strict IPC Security**: No renderer-supplied URLs, executable paths, authorization tokens, or shell commands.
+- **Secret Redaction**: Error logs sanitize GitHub tokens and credentials before presentation.
 
 ---
 

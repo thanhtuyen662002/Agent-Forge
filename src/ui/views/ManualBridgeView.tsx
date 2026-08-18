@@ -1,5 +1,6 @@
 import React, { useState, useEffect, useCallback } from 'react';
 import { useOrchestrator } from '../context/OrchestratorContext';
+import { useI18n } from '../context/I18nContext';
 import {
   ArrowLeftRight,
   Clipboard,
@@ -41,6 +42,8 @@ export const ManualBridgeView: React.FC = () => {
     getOwnerHandoffSnapshot,
     generateAuthorizedWorkOrder,
   } = useOrchestrator();
+
+  const { t } = useI18n();
 
   const [activeTab, setActiveTab] = useState<'routing-handoff' | 'manager-inbox' | 'coder-inbox' | 'outbox'>(
     'routing-handoff'
@@ -406,14 +409,14 @@ export const ManualBridgeView: React.FC = () => {
               <ArrowLeftRight className="w-5 h-5" />
             </div>
             <div>
-              <h2 className="text-xl font-bold text-white tracking-tight">Manual Bridge & Routing Controller</h2>
+              <h2 className="text-xl font-bold text-white tracking-tight">{t('manualBridge.title')}</h2>
               <span className="text-[11px] font-mono text-forge-amber uppercase font-semibold">
-                Human-in-the-Loop Relay Station
+                {t('manualBridge.subtitle')}
               </span>
             </div>
           </div>
           <p className="text-xs text-slate-400">
-            Deterministic Quota Routing &rarr; Durable Authorization &rarr; Authorized Manual WorkOrder Relay &rarr; Coder Verification.
+            {t('routing.subtitle')}
           </p>
         </div>
 
@@ -428,7 +431,7 @@ export const ManualBridgeView: React.FC = () => {
             }`}
           >
             <Layers className="w-3.5 h-3.5" />
-            <span>Owner Routing / Handoff</span>
+            <span>{t('nav.manualBridge')}</span>
           </button>
           <button
             onClick={() => setActiveTab('manager-inbox')}
@@ -439,7 +442,7 @@ export const ManualBridgeView: React.FC = () => {
             }`}
           >
             <Shield className="w-3.5 h-3.5" />
-            <span>Manager Inbox</span>
+            <span>{t('managerInbox.title')}</span>
           </button>
           <button
             onClick={() => setActiveTab('coder-inbox')}
@@ -450,7 +453,7 @@ export const ManualBridgeView: React.FC = () => {
             }`}
           >
             <Terminal className="w-3.5 h-3.5" />
-            <span>Coder Inbox</span>
+            <span>{t('coderInbox.title')}</span>
           </button>
           <button
             onClick={() => setActiveTab('outbox')}
