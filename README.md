@@ -19,10 +19,15 @@ Agent-Forge guarantees that the durable source of truth resides entirely in:
 
 ---
 
-## Current Status: `DESKTOP_PACKAGING_FOUNDATION`
+## Current Status: `DURABLE_EXECUTION_AUTHORIZATION_FOUNDATION`
 
-- **Automated Provider Adapters**: **NOT YET IMPLEMENTED** (Intentionally deferred; system operates via the **Owner Manual Bridge**).
-- **Desktop Runtime & Windows Packaging**: **IMPLEMENTED & VERIFIED** (Electron desktop launch, packaged ASAR runtime with unpacked `better-sqlite3` native ABI bindings, and Windows NSIS installer generation in `release/`).
+- **Core Foundation & Database Migrations (PR #1)**: **IMPLEMENTED & VERIFIED** (SQLite WAL mode, strict foreign keys, state machine, Git ground truth).
+- **Continuous Integration Pipeline (PR #2)**: **IMPLEMENTED & VERIFIED** (Multi-platform Windows & Ubuntu CI with diff hygiene).
+- **Desktop Runtime & Windows Packaging (PR #3 / PR #4)**: **IMPLEMENTED & VERIFIED** (Electron desktop runtime, unpacked `better-sqlite3` native ABI bindings, NSIS installer).
+- **Provider Integration Foundation (PR #5)**: **IMPLEMENTED & VERIFIED** (Manual Bridge truthful adapter, process runner isolation, Codex CLI contract fail-closed boundary, Antigravity manual-only).
+- **Deterministic Quota-Aware Routing (PR #6)**: **IMPLEMENTED & VERIFIED** (Pre-dispatch failover, tier-based eligibility, AUTH_ERROR hard stop, durable routing decision events).
+- **Durable Execution Authorization (PR #7)**: **IMPLEMENTED & VERIFIED** (Immutable `ExecutionAuthorization` binding exact approved work payloads, canonical payload hashes, context manifest containment, and atomic one-time dispatch claims).
+- **Automated Production Providers**: Production Codex CLI remains `OFFLINE` (`capabilities=[]`, fails closed without spawning processes) on hosts without verified contracts. System operates reliably via the **Owner Manual Bridge**.
 - **Code Signing**: **UNSIGNED FOUNDATION** (`CODE_SIGNED=NO`; code-signing certificates and auto-update are intentionally deferred).
 
 ---

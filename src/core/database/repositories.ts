@@ -18,7 +18,9 @@ import {
   EventRecord,
   ProjectContract,
   TaskState,
-  ProjectStatus
+  ProjectStatus,
+  ExecutionAuthorization,
+  ExecutionAuthorizationStatus
 } from '../types/domain';
 
 export class Repository {
@@ -350,9 +352,10 @@ export class Repository {
     payloadHash: string,
     rawPayload: string,
     status: 'APPLIED' | 'REJECTED' | 'DUPLICATE',
-    rejectionReason?: string
+    rejectionReason?: string,
+    createdAt?: string
   ): void {
-    const now = new Date().toISOString();
+    const now = createdAt ?? new Date().toISOString();
     this.db
       .prepare(`
         INSERT INTO protocol_messages (
@@ -383,10 +386,43 @@ export class Repository {
     return row ?? null;
   }
 
+  public getProtocolMessageByRecordId(id: string): Record<string, unknown> | null {
+    const row = this.db.prepare('SELECT * FROM protocol_messages WHERE id = ?').get(id) as Record<string, unknown> | undefined;
+    return row ?? null;
+  }
+
   public getProtocolMessagesByTask(taskId: string): Record<string, unknown>[] {
     return this.db
-      .prepare('SELECT * FROM protocol_messages WHERE task_id = ? ORDER BY created_at ASC')
+      .prepare('SELECT * FROM protocol_messages WHERE task_id = ? ORDER BY created_at ASC, id ASC')
       .all(taskId) as Record<string, unknown>[];
+  }
+
+  public getLatestAppliedManagerProtocolMessage(taskId: string, projectId?: string): Record<string, unknown> | null {
+    if (projectId) {
+      const row = this.db
+        .prepare(`
+          SELECT * FROM protocol_messages
+          WHERE task_id = ?
+            AND project_id = ?
+            AND protocol = 'manager.v1'
+            AND status = 'APPLIED'
+          ORDER BY created_at DESC, id DESC
+          LIMIT 1
+        `)
+        .get(taskId, projectId) as Record<string, unknown> | undefined;
+      return row ?? null;
+    }
+    const row = this.db
+      .prepare(`
+        SELECT * FROM protocol_messages
+        WHERE task_id = ?
+          AND protocol = 'manager.v1'
+          AND status = 'APPLIED'
+        ORDER BY created_at DESC, id DESC
+        LIMIT 1
+      `)
+      .get(taskId) as Record<string, unknown> | undefined;
+    return row ?? null;
   }
 
   // ==========================================
@@ -786,6 +822,140 @@ export class Repository {
       structured_payload: row.structured_payload_json ? JSON.parse(String(row.structured_payload_json)) : {},
       timestamp: String(row.timestamp),
     };
+  }
+
+  // ==========================================
+  // Execution Authorizations (PR #7)
+  // ==========================================
+  public createExecutionAuthorization(auth: ExecutionAuthorization): void {
+    this.db
+      .prepare(`
+        INSERT INTO execution_authorizations (
+          id, project_id, task_id, attempt_id, task_revision, base_sha,
+          repository_head_sha, manager_message_id, manager_payload_hash,
+          routing_decision_id, selected_resource_id, selected_provider_id,
+          instruction_payload_hash, context_manifest_hash,
+          canonical_instructions_json, context_files_json, status,
+          created_at, dispatched_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      `)
+      .run(
+        auth.id,
+        auth.project_id,
+        auth.task_id,
+        auth.attempt_id,
+        auth.task_revision,
+        auth.base_sha,
+        auth.repository_head_sha,
+        auth.manager_message_id,
+        auth.manager_payload_hash,
+        auth.routing_decision_id,
+        auth.selected_resource_id,
+        auth.selected_provider_id,
+        auth.instruction_payload_hash,
+        auth.context_manifest_hash,
+        auth.canonical_instructions_json,
+        auth.context_files_json,
+        auth.status,
+        auth.created_at,
+        auth.dispatched_at
+      );
+  }
+
+  public getExecutionAuthorization(id: string): ExecutionAuthorization | null {
+    const row = this.db.prepare('SELECT * FROM execution_authorizations WHERE id = ?').get(id) as Record<string, unknown> | undefined;
+    if (!row) return null;
+    return {
+      id: String(row.id),
+      project_id: String(row.project_id),
+      task_id: String(row.task_id),
+      attempt_id: row.attempt_id ? String(row.attempt_id) : null,
+      task_revision: Number(row.task_revision),
+      base_sha: String(row.base_sha),
+      repository_head_sha: String(row.repository_head_sha),
+      manager_message_id: String(row.manager_message_id),
+      manager_payload_hash: String(row.manager_payload_hash),
+      routing_decision_id: String(row.routing_decision_id),
+      selected_resource_id: String(row.selected_resource_id),
+      selected_provider_id: String(row.selected_provider_id),
+      instruction_payload_hash: String(row.instruction_payload_hash),
+      context_manifest_hash: String(row.context_manifest_hash),
+      canonical_instructions_json: String(row.canonical_instructions_json),
+      context_files_json: String(row.context_files_json),
+      status: row.status as ExecutionAuthorizationStatus,
+      created_at: String(row.created_at),
+      dispatched_at: row.dispatched_at ? String(row.dispatched_at) : null,
+    };
+  }
+
+  public claimExecutionAuthorization(id: string, dispatchedAt: string): boolean {
+    const res = this.db
+      .prepare(`
+        UPDATE execution_authorizations
+        SET status = 'DISPATCHED', dispatched_at = ?
+        WHERE id = ? AND status = 'AUTHORIZED'
+      `)
+      .run(dispatchedAt, id);
+    return res.changes === 1;
+  }
+
+  public invalidateExecutionAuthorization(id: string): boolean {
+    const res = this.db
+      .prepare(`
+        UPDATE execution_authorizations
+        SET status = 'INVALIDATED'
+        WHERE id = ? AND status = 'AUTHORIZED'
+      `)
+      .run(id);
+    return res.changes === 1;
+  }
+
+  public invalidateAuthorizedExecutionAuthorizationsForTask(taskId: string): number {
+    const res = this.db
+      .prepare(`
+        UPDATE execution_authorizations
+        SET status = 'INVALIDATED'
+        WHERE task_id = ? AND status = 'AUTHORIZED'
+      `)
+      .run(taskId);
+    return res.changes;
+  }
+
+  public updateExecutionAuthorizationStatus(id: string, status: ExecutionAuthorizationStatus): void {
+    this.db
+      .prepare(`
+        UPDATE execution_authorizations
+        SET status = ?
+        WHERE id = ?
+      `)
+      .run(status, id);
+  }
+
+  public getExecutionAuthorizationsByTask(taskId: string): ExecutionAuthorization[] {
+    const rows = this.db
+      .prepare('SELECT * FROM execution_authorizations WHERE task_id = ? ORDER BY created_at DESC')
+      .all(taskId) as Record<string, unknown>[];
+    return rows.map((row) => ({
+      id: String(row.id),
+      project_id: String(row.project_id),
+      task_id: String(row.task_id),
+      attempt_id: row.attempt_id ? String(row.attempt_id) : null,
+      task_revision: Number(row.task_revision),
+      base_sha: String(row.base_sha),
+      repository_head_sha: String(row.repository_head_sha),
+      manager_message_id: String(row.manager_message_id),
+      manager_payload_hash: String(row.manager_payload_hash),
+      routing_decision_id: String(row.routing_decision_id),
+      selected_resource_id: String(row.selected_resource_id),
+      selected_provider_id: String(row.selected_provider_id),
+      instruction_payload_hash: String(row.instruction_payload_hash),
+      context_manifest_hash: String(row.context_manifest_hash),
+      canonical_instructions_json: String(row.canonical_instructions_json),
+      context_files_json: String(row.context_files_json),
+      status: row.status as ExecutionAuthorizationStatus,
+      created_at: String(row.created_at),
+      dispatched_at: row.dispatched_at ? String(row.dispatched_at) : null,
+    }));
   }
 
   // ==========================================

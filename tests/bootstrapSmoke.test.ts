@@ -71,6 +71,7 @@ describe('Bootstrap Smoke & Fresh Database Startup', () => {
     expect(bootstrap.providerRegistry.has('prov-antigravity-cli')).toBe(false);
     expect(bootstrap.providerRoutingService).toBeDefined();
     expect(bootstrap.providerDispatchService).toBeDefined();
+    expect(bootstrap.executionAuthorizationService).toBeDefined();
 
     // Create a project through trusted native selection token flow
     const token = RepositorySelectionService.issueToken(tmpGitDir);

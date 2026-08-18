@@ -195,6 +195,9 @@ export class TaskService {
       case 'CANCEL':
         trigger = 'CANCEL';
         break;
+      case 'PAUSE':
+        trigger = 'PAUSE';
+        break;
       default:
         return { success: false, error: `Unsupported decision: ${(managerMsg as any).decision}` };
     }
@@ -309,6 +312,9 @@ export class TaskService {
         lintPassed: false,
       });
       this.repo.updateTaskProgressCache(task.id, progress.percent);
+
+      // Invalidate all previous still-AUTHORIZED execution authorizations for this task (same transaction)
+      this.repo.invalidateAuthorizedExecutionAuthorizationsForTask(task.id);
 
       // Record in protocol messages ledger
       this.repo.recordProtocolMessage(
