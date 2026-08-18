@@ -204,10 +204,16 @@ EXACTLY ONE Provider Execution
   `id`, `project_id`, `task_id`, `attempt_id`, `task_revision`, `base_sha`, `repository_head_sha`, `manager_message_id`, `manager_payload_hash`, `routing_decision_id`, `selected_resource_id`, `selected_provider_id`, `instruction_payload_hash`, `context_manifest_hash`, `canonical_instructions_json`, `context_files_json`, `status: AUTHORIZED | DISPATCHED | INVALIDATED`.
 - **Manager Ledger Authority Binding & Liveness**:
   - Requires an applied `manager.v1` protocol message with `EXECUTE` or `FIX_REQUIRED`.
-  - Strict revision binding: For `EXECUTE`, `manager.expected_revision === task.revision_count`. For `FIX_REQUIRED`, `manager.expected_revision + 1 === task.revision_count` (the pre-fix revision incremented on fix cycle entry).
-  - All queries resolving current Manager authority use a single total deterministic order: `ORDER BY created_at ASC, id ASC` (`Repository.getLatestAppliedManagerProtocolMessage`).
-  - **Transaction-Bound Supersession**: Whenever a new `manager.v1` decision (`EXECUTE`, `FIX_REQUIRED`, `PASS`, `BLOCK`, `PAUSE`, `CANCEL`, `NEEDS_OWNER`, `CREATE_TASKS`) is successfully applied in `TaskService.applyManagerDecision`, all previous still-`AUTHORIZED` execution authorizations for that task are invalidated (`status = 'INVALIDATED'`) within the SAME SQLite transaction (`Repository.invalidateAuthorizedExecutionAuthorizationsForTask`). If the transaction rolls back or the message is `REJECTED`/`DUPLICATE`, authorizations remain untouched.
-  - **Dispatch-Time Defense-in-Depth**: At dispatch, `ProviderDispatchService.dispatch` re-evaluates the latest applied Manager protocol record. If the bound record is no longer the latest applied record or if payload hash differs, dispatch fails closed with `EXECUTION_AUTHORIZATION_MANAGER_AUTHORITY_SUPERSEDED`, transitions `AUTHORIZED -> INVALIDATED`, and executes zero providers.
+  - Strict revision binding: For `EXECUTE`, `manager.expected_revision === task.revision_count`. For `FIX_REQUIRED`, strictly requires `manager.expected_revision + 1 === task.revision_count` (the pre-fix revision incremented on fix cycle entry).
+  - Deterministic Manager ledger ordering across all queries uses canonical total-order key `(created_at, id)`:
+    - Chronological traversal: `ORDER BY created_at ASC, id ASC` (`Repository.getProtocolMessagesByTask`).
+    - Latest APPLIED authority resolver: `ORDER BY created_at DESC, id DESC LIMIT 1` (`Repository.getLatestAppliedManagerProtocolMessage`).
+  - **Transaction-Bound Supersession**: In PR #7, `TaskService.applyManagerDecision` applies six Manager decisions: `EXECUTE`, `FIX_REQUIRED`, `PASS`, `BLOCK`, `PAUSE`, and `CANCEL`. When any of these six decisions is newly and successfully `APPLIED`, all previous still-`AUTHORIZED` execution authorizations for that task are invalidated (`status = 'INVALIDATED'`) within the SAME SQLite transaction (`Repository.invalidateAuthorizedExecutionAuthorizationsForTask`).
+  - `NEEDS_OWNER` and `CREATE_TASKS` exist in the `manager.v1` protocol schema vocabulary, but `TaskService` does NOT apply them in PR #7; therefore PR #7 defines no TaskService execution supersession path for `NEEDS_OWNER` or `CREATE_TASKS`.
+  - Decisions marked `REJECTED` do NOT invalidate existing authorizations.
+  - `DUPLICATE` (already processed) Manager messages do NOT invalidate existing authorizations.
+  - Transaction rollback automatically rolls back authorization invalidations.
+  - **Dispatch-Time Defense-in-Depth**: At dispatch, `ProviderDispatchService.dispatch` re-evaluates the latest applied Manager protocol record using `Repository.getLatestAppliedManagerProtocolMessage`. If the bound record is no longer the latest applied record or if payload hash differs, dispatch fails closed with `EXECUTION_AUTHORIZATION_MANAGER_AUTHORITY_SUPERSEDED`, transitions `AUTHORIZED -> INVALIDATED`, and executes zero providers.
 - **Dispatch-Time Task State Liveness**:
   - Re-evaluates current `task.state` after loading `RoutingDecision` but prior to atomic CAS claim.
   - Automated `SELECTED` execution requires `task.state === 'CODING'`.
