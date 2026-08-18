@@ -123,3 +123,45 @@ export const ResumeProjectIpcSchema = z.object({
   projectId: z.string().min(1),
 });
 export type ResumeProjectIpc = z.infer<typeof ResumeProjectIpcSchema>;
+
+// ==========================================
+// PR #8: Owner Routing & Manual Bridge Handoff Schemas
+// ==========================================
+
+export const RouteTaskIpcSchema = z
+  .object({
+    projectId: z.string().min(1, 'Project ID is required'),
+    taskId: z.string().min(1, 'Task ID is required'),
+    attemptId: z.string().nullable().optional(),
+    candidateResourceIds: z
+      .array(z.string().min(1, 'Candidate resource ID cannot be empty'))
+      .min(1, 'At least one candidate resource is required'),
+    allowManualBridge: z.boolean().default(false),
+  })
+  .strict();
+export type RouteTaskIpc = z.infer<typeof RouteTaskIpcSchema>;
+
+export const AuthorizeRoutedTaskIpcSchema = z
+  .object({
+    projectId: z.string().min(1, 'Project ID is required'),
+    taskId: z.string().min(1, 'Task ID is required'),
+    attemptId: z.string().nullable().optional(),
+    routingDecisionId: z.string().min(1, 'Routing decision ID is required'),
+    contextFiles: z.array(z.string()).optional().default([]),
+  })
+  .strict();
+export type AuthorizeRoutedTaskIpc = z.infer<typeof AuthorizeRoutedTaskIpcSchema>;
+
+export const DispatchAuthorizationIpcSchema = z
+  .object({
+    authorizationId: z.string().min(1, 'Authorization ID is required'),
+  })
+  .strict();
+export type DispatchAuthorizationIpc = z.infer<typeof DispatchAuthorizationIpcSchema>;
+
+export const GetOwnerHandoffSnapshotIpcSchema = z
+  .object({
+    taskId: z.string().min(1, 'Task ID is required'),
+  })
+  .strict();
+export type GetOwnerHandoffSnapshotIpc = z.infer<typeof GetOwnerHandoffSnapshotIpcSchema>;

@@ -7,6 +7,10 @@ import {
   ParseProtocolIpcSchema,
   EmergencyStopIpcSchema,
   ResumeProjectIpcSchema,
+  RouteTaskIpcSchema,
+  AuthorizeRoutedTaskIpcSchema,
+  DispatchAuthorizationIpcSchema,
+  GetOwnerHandoffSnapshotIpcSchema,
 } from '../src/core/types/ipc';
 import { PolicyService } from '../src/core/services/PolicyService';
 
@@ -135,5 +139,79 @@ describe('IPC Validation & Security Gates', () => {
     const sshRes = PolicyService.evaluatePathAccess('d:/Projects/Agent-Forge/.ssh/id_rsa', 'd:/Projects/Agent-Forge', true);
     expect(sshRes.allowed).toBe(false);
     expect(sshRes.decision).toBe('DENY');
+  });
+
+  it('should validate routing IPC schema and reject instructions or prompt overrides', () => {
+    const validRoute = RouteTaskIpcSchema.safeParse({
+      projectId: 'PROJ-1',
+      taskId: 'TASK-1',
+      candidateResourceIds: ['res-1', 'res-2'],
+      allowManualBridge: true,
+    });
+    expect(validRoute.success).toBe(true);
+
+    const invalidEmpty = RouteTaskIpcSchema.safeParse({
+      projectId: '',
+      taskId: '',
+      candidateResourceIds: [],
+    });
+    expect(invalidEmpty.success).toBe(false);
+
+    const invalidOverride = RouteTaskIpcSchema.safeParse({
+      projectId: 'PROJ-1',
+      taskId: 'TASK-1',
+      candidateResourceIds: ['res-1'],
+      instructions: ['caller prompt injection'], // forbidden
+    });
+    expect(invalidOverride.success).toBe(false);
+  });
+
+  it('should validate authorization IPC schema and reject caller-supplied instructions/prompts', () => {
+    const validAuth = AuthorizeRoutedTaskIpcSchema.safeParse({
+      projectId: 'PROJ-1',
+      taskId: 'TASK-1',
+      routingDecisionId: 'DEC-123',
+      contextFiles: ['src/core/router.ts'],
+    });
+    expect(validAuth.success).toBe(true);
+
+    const invalidInstructions = AuthorizeRoutedTaskIpcSchema.safeParse({
+      projectId: 'PROJ-1',
+      taskId: 'TASK-1',
+      routingDecisionId: 'DEC-123',
+      instructions: ['do something else'], // forbidden
+    });
+    expect(invalidInstructions.success).toBe(false);
+
+    const invalidPrompt = AuthorizeRoutedTaskIpcSchema.safeParse({
+      projectId: 'PROJ-1',
+      taskId: 'TASK-1',
+      routingDecisionId: 'DEC-123',
+      prompt: 'do something else', // forbidden
+    });
+    expect(invalidPrompt.success).toBe(false);
+  });
+
+  it('should validate dispatch IPC schema and strictly accept authorizationId only', () => {
+    const validDispatch = DispatchAuthorizationIpcSchema.safeParse({
+      authorizationId: 'AUTH-123',
+    });
+    expect(validDispatch.success).toBe(true);
+
+    const invalidEmpty = DispatchAuthorizationIpcSchema.safeParse({});
+    expect(invalidEmpty.success).toBe(false);
+
+    const invalidExtra = DispatchAuthorizationIpcSchema.safeParse({
+      authorizationId: 'AUTH-123',
+      requestOverride: { taskId: 'TASK-2' }, // forbidden
+      decisionOverride: { selectedProviderId: 'prov-evil' }, // forbidden
+    });
+    expect(invalidExtra.success).toBe(false);
+  });
+
+  it('should validate handoff snapshot IPC schema', () => {
+    expect(GetOwnerHandoffSnapshotIpcSchema.safeParse({ taskId: 'TASK-1' }).success).toBe(true);
+    expect(GetOwnerHandoffSnapshotIpcSchema.safeParse({}).success).toBe(false);
+    expect(GetOwnerHandoffSnapshotIpcSchema.safeParse({ taskId: '' }).success).toBe(false);
   });
 });

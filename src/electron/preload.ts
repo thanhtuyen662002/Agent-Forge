@@ -49,6 +49,24 @@ export interface OrchestratorApi {
   // Safety & Emergency Stop
   triggerEmergencyStop: (reason?: string) => Promise<any>;
   resumeProject: (projectId: string) => Promise<any>;
+
+  // PR #8: Owner Routing & Manual Bridge Handoff
+  routeTask: (data: {
+    projectId: string;
+    taskId: string;
+    attemptId?: string | null;
+    candidateResourceIds: string[];
+    allowManualBridge: boolean;
+  }) => Promise<any>;
+  authorizeRoutedTask: (data: {
+    projectId: string;
+    taskId: string;
+    attemptId?: string | null;
+    routingDecisionId: string;
+    contextFiles?: string[];
+  }) => Promise<any>;
+  dispatchAuthorization: (authorizationId: string) => Promise<any>;
+  getOwnerHandoffSnapshot: (taskId: string) => Promise<any>;
 }
 
 const api: OrchestratorApi = {
@@ -82,6 +100,13 @@ const api: OrchestratorApi = {
 
   triggerEmergencyStop: (reason?: string) => ipcRenderer.invoke('control:emergencyStop', { reason }),
   resumeProject: (projectId: string) => ipcRenderer.invoke('control:resume', { projectId }),
+
+  routeTask: (data) => ipcRenderer.invoke('routing:routeTask', data),
+  authorizeRoutedTask: (data) => ipcRenderer.invoke('routing:authorizeTask', data),
+  dispatchAuthorization: (authorizationId: string) =>
+    ipcRenderer.invoke('routing:dispatchAuthorization', { authorizationId }),
+  getOwnerHandoffSnapshot: (taskId: string) =>
+    ipcRenderer.invoke('routing:getHandoffSnapshot', { taskId }),
 };
 
 contextBridge.exposeInMainWorld('orchestrator', api);

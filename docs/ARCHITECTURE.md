@@ -249,3 +249,42 @@ Default Work Unit Weights:
 - Manager Review PASS: `10%`
 
 If work units cannot be verified, the UI displays `PROGRESS UNKNOWN`.
+
+---
+
+## 9. Owner Routing & Manual Bridge Relay Loop (`ManualBridgeView`, Typed IPC)
+
+AgentForge PR #8 introduces the complete Owner-facing Human-in-the-Loop routing and manual relay control station on top of the durable PR #6 routing and PR #7 authorization backbones.
+
+### Workflow Sequence
+```
+Manager Inbox (APPLY EXECUTE / FIX_REQUIRED)
+                   ↓
+Owner Selects Task & Verifies Manager Authority
+                   ↓
+Owner Selects & Orders Candidate ProviderResources (Move Up / Down)
+                   ↓
+Owner Toggles `Allow Manual Bridge Fallback`
+                   ↓
+`routing:routeTask` IPC → `ProviderRoutingService.route` → Durable RoutingDecision
+                   ↓
+`routing:authorizeTask` IPC → `ExecutionAuthorizationService.createAuthorization`
+                   ↓
+`routing:dispatchAuthorization` IPC → `ProviderDispatchService.dispatch(authorizationId)`
+                   ↓
+ManualBridgeAdapter returns `AWAITING_OWNER` & consumes authorization (`DISPATCHED`)
+                   ↓
+Owner clicks `GENERATE WORKORDER` & `1-CLICK COPY WORKORDER`
+                   ↓
+Owner manually relays prompt to Gemini Coder (zero browser or clipboard scraping)
+                   ↓
+Owner pastes Gemini report into Coder Inbox → Protocol validation & Verification tests
+```
+
+### IPC Security & Process Isolation Invariants
+- **Strict Schema Enforcement**: All routing IPC payloads (`RouteTaskIpcSchema`, `AuthorizeRoutedTaskIpcSchema`, `DispatchAuthorizationIpcSchema`, `GetOwnerHandoffSnapshotIpcSchema`) are validated with strict Zod schemas in the Electron main process.
+- **Zero Renderer Prompt/Instruction Overrides**: IPC schemas strictly prohibit `instructions`, `prompt`, `selectedProvider`, or `AgentExecutionRequest` payloads from being supplied by the untrusted renderer process. All execution payloads are constructed internally by core services from durable SQLite truth.
+- **Single-Identifier Dispatch**: `routing:dispatchAuthorization` accepts **ONLY** `{ authorizationId: string }`.
+- **Durable Snapshot Reconstruction**: The UI does not maintain ephemeral React state as ground truth. `routing:getHandoffSnapshot` reloads task status, Manager authority ledger records, Git repository HEAD SHA, provider resources, latest routing decisions, and execution authorizations directly from SQLite.
+- **Truthful UI Quota Semantics**: Provider resources with `quota_source = 'UNKNOWN'` or `remaining_quota = null` render truthfully as `UNKNOWN (conf: 0.0)` in the UI and are never falsified as `0`, `unlimited`, or `healthy`.
+- **Atomic Replay Prevention**: Once dispatched, authorizations remain in `DISPATCHED` state across application restarts and reject subsequent dispatch attempts fail-closed.

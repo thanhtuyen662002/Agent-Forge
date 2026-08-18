@@ -11,6 +11,9 @@ import { defaultArtifactStore } from '../core/services/ArtifactStore';
 import { EmergencyStopService } from '../core/services/EmergencyStopService';
 import { PolicyService } from '../core/services/PolicyService';
 import { RepositorySelectionService } from '../core/services/RepositorySelectionService';
+import { ProviderRoutingService } from '../core/services/ProviderRoutingService';
+import { ExecutionAuthorizationService } from '../core/services/ExecutionAuthorizationService';
+import { ProviderDispatchService } from '../core/services/ProviderDispatchService';
 import {
   CreateProjectIpcSchema,
   ImportContractIpcSchema,
@@ -26,6 +29,10 @@ import {
   RunVerificationIpcSchema,
   EmergencyStopIpcSchema,
   ResumeProjectIpcSchema,
+  RouteTaskIpcSchema,
+  AuthorizeRoutedTaskIpcSchema,
+  DispatchAuthorizationIpcSchema,
+  GetOwnerHandoffSnapshotIpcSchema,
 } from '../core/types/ipc';
 
 export function registerIpcHandlers(
@@ -33,7 +40,10 @@ export function registerIpcHandlers(
   projectService: ProjectService,
   taskService: TaskService,
   verificationService: VerificationService,
-  emergencyStopService: EmergencyStopService
+  emergencyStopService: EmergencyStopService,
+  providerRoutingService?: ProviderRoutingService,
+  executionAuthorizationService?: ExecutionAuthorizationService,
+  providerDispatchService?: ProviderDispatchService
 ): void {
   // ==========================================
   // Trusted Repository Selection Dialog
@@ -454,5 +464,171 @@ export function registerIpcHandlers(
       return false;
     }
     return emergencyStopService.resumeProject(parsed.data.projectId);
+  });
+
+  // ==========================================
+  // PR #8: Owner Routing & Manual Bridge Handoff
+  // ==========================================
+
+  ipcMain.handle('routing:routeTask', async (_, payload: unknown) => {
+    if (!providerRoutingService) {
+      return { success: false, error: 'ProviderRoutingService unavailable.' };
+    }
+    const parsed = RouteTaskIpcSchema.safeParse(payload);
+    if (!parsed.success) {
+      return { success: false, error: parsed.error.issues.map((i) => i.message).join(', ') };
+    }
+
+    const uniqueCandidates = new Set(parsed.data.candidateResourceIds);
+    if (uniqueCandidates.size !== parsed.data.candidateResourceIds.length) {
+      return {
+        success: false,
+        error: 'DUPLICATE_CANDIDATE_RESOURCES: Duplicate candidate resource IDs are not permitted.',
+      };
+    }
+
+    try {
+      const decision = await providerRoutingService.route({
+        projectId: parsed.data.projectId,
+        taskId: parsed.data.taskId,
+        attemptId: parsed.data.attemptId,
+        candidateResourceIds: parsed.data.candidateResourceIds,
+        allowManualBridge: parsed.data.allowManualBridge,
+        requiredCapabilities: ['CODING'],
+      });
+      return { success: true, decision };
+    } catch (err: any) {
+      return { success: false, error: err.message || 'Routing failed.' };
+    }
+  });
+
+  ipcMain.handle('routing:authorizeTask', async (_, payload: unknown) => {
+    if (!executionAuthorizationService) {
+      return { success: false, error: 'ExecutionAuthorizationService unavailable.' };
+    }
+    const parsed = AuthorizeRoutedTaskIpcSchema.safeParse(payload);
+    if (!parsed.success) {
+      return { success: false, error: parsed.error.issues.map((i) => i.message).join(', ') };
+    }
+
+    try {
+      const authorization = await executionAuthorizationService.createAuthorization(parsed.data);
+      return { success: true, authorization };
+    } catch (err: any) {
+      return { success: false, error: err.message || 'Authorization creation failed.' };
+    }
+  });
+
+  ipcMain.handle('routing:dispatchAuthorization', async (_, payload: unknown) => {
+    if (!providerDispatchService) {
+      return { success: false, error: 'ProviderDispatchService unavailable.' };
+    }
+    const parsed = DispatchAuthorizationIpcSchema.safeParse(payload);
+    if (!parsed.success) {
+      return { success: false, error: parsed.error.issues.map((i) => i.message).join(', ') };
+    }
+
+    try {
+      const result = await providerDispatchService.dispatch(parsed.data.authorizationId);
+      return { success: true, result };
+    } catch (err: any) {
+      return { success: false, error: err.message || 'Dispatch failed.' };
+    }
+  });
+
+  ipcMain.handle('routing:getHandoffSnapshot', async (_, payload: unknown) => {
+    const parsed = GetOwnerHandoffSnapshotIpcSchema.safeParse(payload);
+    if (!parsed.success) {
+      return { success: false, error: parsed.error.issues.map((i) => i.message).join(', ') };
+    }
+
+    const task = repo.getTask(parsed.data.taskId);
+    if (!task) {
+      return { success: false, error: `Task "${parsed.data.taskId}" not found.` };
+    }
+
+    const project = repo.getProject(task.project_id);
+    const latestManagerRecord = repo.getLatestAppliedManagerProtocolMessage(task.id, task.project_id);
+
+    let hasAuthority = false;
+    let decisionValidForCurrentRevision = false;
+    let authorityReason: string | undefined;
+    let instructionsCount = 0;
+
+    if (latestManagerRecord && latestManagerRecord.raw_payload) {
+      const parsedProto = ProtocolParser.parse(String(latestManagerRecord.raw_payload));
+      if (parsedProto.success && parsedProto.data?.type === 'manager.v1') {
+        const mData = parsedProto.data.data;
+        instructionsCount = Array.isArray(mData.instructions) ? mData.instructions.length : 0;
+        const expectedRev = typeof mData.expected_revision === 'number' ? mData.expected_revision : null;
+        if (mData.decision === 'EXECUTE') {
+          hasAuthority = true;
+          decisionValidForCurrentRevision = expectedRev === task.revision_count;
+          if (!decisionValidForCurrentRevision) {
+            authorityReason = `Manager EXECUTE expected revision (${expectedRev}) does not match task revision (${task.revision_count}).`;
+          }
+        } else if (mData.decision === 'FIX_REQUIRED') {
+          hasAuthority = true;
+          decisionValidForCurrentRevision = expectedRev !== null && expectedRev + 1 === task.revision_count;
+          if (!decisionValidForCurrentRevision) {
+            authorityReason = `Manager FIX_REQUIRED expected revision (${expectedRev !== null ? expectedRev + 1 : 'null'}) does not match task revision (${task.revision_count}).`;
+          }
+        } else {
+          authorityReason = `Latest Manager decision is non-authorizing: ${mData.decision}.`;
+        }
+      }
+    } else {
+      authorityReason = 'No applied manager.v1 protocol message found for this task.';
+    }
+
+    let gitHeadSha: string | null = null;
+    if (project) {
+      const headRes = await GitService.getHeadSha(project.repository_path);
+      if (headRes.status === 'SUCCESS' && headRes.sha) {
+        gitHeadSha = headRes.sha;
+      }
+    }
+
+    const providerResources = repo.getAllProviderResources();
+    const authorizations = repo.getExecutionAuthorizationsByTask(task.id);
+    const latestAuthorization = authorizations.length > 0 ? authorizations[0] : null;
+
+    // Retrieve latest routing decision event from SQLite
+    let latestRoutingDecision: any = null;
+    if (project) {
+      const events = repo.getEventsByProject(project.id, 50);
+      const routingEvent = events.find(
+        (e) =>
+          e.type === 'PROVIDER_ROUTING_DECISION' &&
+          (e.task_id === task.id || (e.structured_payload as any)?.taskId === task.id)
+      );
+      if (routingEvent && routingEvent.structured_payload) {
+        latestRoutingDecision = routingEvent.structured_payload;
+      }
+    }
+
+    return {
+      success: true,
+      snapshot: {
+        task,
+        project,
+        managerAuthority: {
+          hasAuthority,
+          messageId: latestManagerRecord?.id ? String(latestManagerRecord.id) : null,
+          decision: latestManagerRecord?.decision ? String(latestManagerRecord.decision) : null,
+          payloadHash: latestManagerRecord?.payload_hash ? String(latestManagerRecord.payload_hash) : null,
+          expectedRevision:
+            latestManagerRecord?.expected_revision !== undefined ? Number(latestManagerRecord.expected_revision) : null,
+          instructionsCount,
+          createdAt: latestManagerRecord?.created_at ? String(latestManagerRecord.created_at) : null,
+          decisionValidForCurrentRevision,
+          reason: authorityReason,
+        },
+        gitHeadSha,
+        providerResources,
+        latestRoutingDecision,
+        latestAuthorization,
+      },
+    };
   });
 }
