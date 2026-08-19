@@ -115,18 +115,14 @@ try {
   $diagData.stage = "SETUP_TEST_CONTEXT"
   Save-Diagnostics
 
-  # Create isolated scratch working directories on the same drive/volume as project root
+  # Create isolated scratch working directories
   $tempRoot = Join-Path $projectRoot ("release\installed-update-test\temp-" + [Guid]::NewGuid().ToString())
-  $tempAppDirA = Join-Path $tempRoot "app-vA"
   $tempOutDirA = Join-Path $tempRoot "out-vA"
-  $tempAppDirB = Join-Path $tempRoot "app-vB"
   $testFeedDir = Join-Path $tempRoot "feed"
   $testInstallDir = Join-Path $tempRoot "installed-vA"
   $testDataDir = Join-Path $tempRoot "data"
 
-  New-Item -ItemType Directory -Path $tempAppDirA -Force | Out-Null
   New-Item -ItemType Directory -Path $tempOutDirA -Force | Out-Null
-  New-Item -ItemType Directory -Path $tempAppDirB -Force | Out-Null
   New-Item -ItemType Directory -Path $testFeedDir -Force | Out-Null
   New-Item -ItemType Directory -Path $testInstallDir -Force | Out-Null
   New-Item -ItemType Directory -Path $testDataDir -Force | Out-Null
@@ -134,21 +130,17 @@ try {
   $diagData.requestedInstallPath = $testInstallDir
 
   # -------------------------------------------------------------------------
-  # Phase 2 & 3: Generate Dedicated Test Entrypoint in Isolated Context vA
+  # Phase 2: Generate Dedicated Test Entrypoint and Build TEST Artifact vA
   # -------------------------------------------------------------------------
-  Log-Diag "[1/6] Preparing isolated packaging context for TEST Artifact vA..."
+  Log-Diag "[1/6] Preparing dedicated test entrypoint and building TEST Artifact vA..."
   $diagData.stage = "BUILD_TEST_VA"
 
-  Copy-Item -Path "$projectRoot\package.json" -Destination "$tempAppDirA\package.json"
-  if (Test-Path "$projectRoot\package-lock.json") {
-    Copy-Item -Path "$projectRoot\package-lock.json" -Destination "$tempAppDirA\package-lock.json"
-  }
-  Copy-Item -Path "$projectRoot\dist" -Destination "$tempAppDirA\dist" -Recurse
-  Copy-Item -Path "$projectRoot\dist-electron" -Destination "$tempAppDirA\dist-electron" -Recurse
-  cmd /c mklink /J "$tempAppDirA\node_modules" "$projectRoot\node_modules" | Out-Null
+  # Ensure electron dist directory exists
+  $electronDistDir = Join-Path $projectRoot "dist-electron\electron"
+  New-Item -ItemType Directory -Path $electronDistDir -Force | Out-Null
 
-  # Write dedicated test-only Electron entrypoint
-  $dedicatedEntryPath = Join-Path $tempAppDirA "dist-electron\electron\updateIntegrationMain.cjs"
+  # Write dedicated test-only Electron entrypoint directly in project dist-electron
+  $dedicatedEntryPath = Join-Path $electronDistDir "updateIntegrationMain.cjs"
   $dedicatedEntryCode = @"
 const fs = require('fs');
 const path = require('path');
@@ -307,11 +299,6 @@ app.whenReady().then(async () => {
 "@
   [System.IO.File]::WriteAllText($dedicatedEntryPath, $dedicatedEntryCode, $utf8NoBom)
 
-  # Point ONLY the isolated temporary package.json to the dedicated entrypoint
-  $pkgA = Get-Content -Path "$tempAppDirA\package.json" -Raw | ConvertFrom-Json
-  $pkgA.main = "dist-electron/electron/updateIntegrationMain.cjs"
-  [System.IO.File]::WriteAllText("$tempAppDirA\package.json", ($pkgA | ConvertTo-Json -Depth 10), $utf8NoBom)
-
   # Ensure native bindings are prepared
   Log-Diag "Ensuring native bindings for Electron..."
   & cmd.exe /c "npx @electron/rebuild -f -w better-sqlite3 2>&1" | Out-Null
@@ -321,6 +308,9 @@ app.whenReady().then(async () => {
 appId: $testAppId
 productName: $testProductName
 npmRebuild: false
+extraMetadata:
+  main: dist-electron/electron/updateIntegrationMain.cjs
+  version: 0.1.0
 publish:
   provider: generic
   url: $feedUrl
@@ -347,7 +337,7 @@ nsis:
   [System.IO.File]::WriteAllText($configPathA, $builderConfigA, $utf8NoBom)
 
   Log-Diag "Building real NSIS installer for TEST Artifact vA..."
-  $buildOutA = & cmd.exe /c "npx electron-builder --win -c `"$configPathA`" --project `"$tempAppDirA`" --publish never 2>&1"
+  $buildOutA = & cmd.exe /c "npx electron-builder --win -c `"$configPathA`" --publish never 2>&1"
   if ($LASTEXITCODE -ne 0) {
     throw "electron-builder vA failed with exit code $($LASTEXITCODE): $buildOutA"
   }
@@ -362,18 +352,10 @@ nsis:
   Save-Diagnostics
 
   # -------------------------------------------------------------------------
-  # Phase 3: Build Real TEST Artifact vB (0.1.1) in Isolated Context
+  # Phase 3: Build Real TEST Artifact vB (0.1.1) in Feed Directory
   # -------------------------------------------------------------------------
   Log-Diag "[2/6] Generating real vB (0.1.1) electron-builder artifacts..."
   $diagData.stage = "BUILD_TEST_VB"
-
-  Copy-Item -Path "$projectRoot\package.json" -Destination "$tempAppDirB\package.json"
-  if (Test-Path "$projectRoot\package-lock.json") {
-    Copy-Item -Path "$projectRoot\package-lock.json" -Destination "$tempAppDirB\package-lock.json"
-  }
-  Copy-Item -Path "$projectRoot\dist" -Destination "$tempAppDirB\dist" -Recurse
-  Copy-Item -Path "$projectRoot\dist-electron" -Destination "$tempAppDirB\dist-electron" -Recurse
-  cmd /c mklink /J "$tempAppDirB\node_modules" "$projectRoot\node_modules" | Out-Null
 
   $configPathB = Join-Path $tempRoot "builder-vB.yml"
   $builderConfigB = @"
@@ -407,7 +389,7 @@ nsis:
 "@
   [System.IO.File]::WriteAllText($configPathB, $builderConfigB, $utf8NoBom)
 
-  $buildOutB = & cmd.exe /c "npx electron-builder --win -c `"$configPathB`" --project `"$tempAppDirB`" --publish never 2>&1"
+  $buildOutB = & cmd.exe /c "npx electron-builder --win -c `"$configPathB`" --publish never 2>&1"
   if ($LASTEXITCODE -ne 0) {
     throw "electron-builder vB failed with exit code $($LASTEXITCODE): $buildOutB"
   }
@@ -725,15 +707,14 @@ finally {
     Stop-Process -Id $feedServerProc.Id -Force -ErrorAction SilentlyContinue
   }
   Start-Sleep -Milliseconds 500
-  # Remove temporary build root safely
+  # Cleanup dedicated test entrypoint and temporary build root safely
+  if (Test-Path (Join-Path $projectRoot "dist-electron\electron\updateIntegrationMain.cjs")) {
+    Remove-Item -Path (Join-Path $projectRoot "dist-electron\electron\updateIntegrationMain.cjs") -Force -ErrorAction SilentlyContinue
+  }
   if ($null -ne $tempRoot -and (Test-Path $tempRoot)) {
     try {
       [System.GC]::Collect()
       [System.GC]::WaitForPendingFinalizers()
-      $juncA = Join-Path $tempRoot "app-vA\node_modules"
-      $juncB = Join-Path $tempRoot "app-vB\node_modules"
-      if (Test-Path $juncA) { cmd /c rmdir "$juncA" 2>$null | Out-Null }
-      if (Test-Path $juncB) { cmd /c rmdir "$juncB" 2>$null | Out-Null }
       Remove-Item -Path $tempRoot -Recurse -Force -ErrorAction SilentlyContinue
     } catch {}
   }
