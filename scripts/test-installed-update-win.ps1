@@ -140,6 +140,9 @@ try {
   $diagData.stage = "BUILD_TEST_VA"
 
   Copy-Item -Path "$projectRoot\package.json" -Destination "$tempAppDirA\package.json"
+  if (Test-Path "$projectRoot\package-lock.json") {
+    Copy-Item -Path "$projectRoot\package-lock.json" -Destination "$tempAppDirA\package-lock.json"
+  }
   Copy-Item -Path "$projectRoot\dist" -Destination "$tempAppDirA\dist" -Recurse
   Copy-Item -Path "$projectRoot\dist-electron" -Destination "$tempAppDirA\dist-electron" -Recurse
   cmd /c mklink /J "$tempAppDirA\node_modules" "$projectRoot\node_modules" | Out-Null
@@ -366,6 +369,9 @@ nsis:
   $diagData.stage = "BUILD_TEST_VB"
 
   Copy-Item -Path "$projectRoot\package.json" -Destination "$tempAppDirB\package.json"
+  if (Test-Path "$projectRoot\package-lock.json") {
+    Copy-Item -Path "$projectRoot\package-lock.json" -Destination "$tempAppDirB\package-lock.json"
+  }
   Copy-Item -Path "$projectRoot\dist" -Destination "$tempAppDirB\dist" -Recurse
   Copy-Item -Path "$projectRoot\dist-electron" -Destination "$tempAppDirB\dist-electron" -Recurse
   cmd /c mklink /J "$tempAppDirB\node_modules" "$projectRoot\node_modules" | Out-Null
