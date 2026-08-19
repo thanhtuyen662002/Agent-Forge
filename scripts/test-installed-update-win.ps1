@@ -76,6 +76,7 @@ try {
           const svc = updateServiceInstance;
           const ud = process.env.AGENT_FORGE_DATA_DIR || electron.app.getPath('userData');
           const rPath = path.join(ud, 'update-test-result.json');
+          try { fs.writeFileSync(rPath, JSON.stringify({ state: 'CHECKING' }, null, 2), 'utf-8'); } catch (e) {}
           svc.on('state-changed', (st) => {
             try {
               fs.writeFileSync(rPath, JSON.stringify(st, null, 2), 'utf-8');
@@ -103,10 +104,15 @@ try {
 "@
   Add-Content -Path "$tempAppDirA\dist-electron\electron\main.js" -Value $testObserverSnippet -Encoding utf8
 
+  # Ensure better-sqlite3 native addon is compiled for Electron runtime
+  Write-Host "Ensuring better-sqlite3 native bindings for Electron..."
+  cmd.exe /c "npx @electron/rebuild -f -w better-sqlite3" | Out-Null
+
   $configPathA = Join-Path $tempRoot "builder-vA.yml"
   $builderConfigA = @"
 appId: com.agentforge.desktop
 productName: AgentForge
+npmRebuild: false
 publish:
   provider: generic
   url: http://127.0.0.1:$testPort/
@@ -151,6 +157,7 @@ nsis:
   $builderConfigB = @"
 appId: com.agentforge.desktop
 productName: AgentForge
+npmRebuild: false
 extraMetadata:
   version: 0.1.1
 publish:
@@ -356,6 +363,9 @@ server.listen($testPort, '127.0.0.1', () => {
       Remove-Item -Recurse -Force $tempRoot -ErrorAction SilentlyContinue
     } catch {}
   }
+
+  # Restore node environment bindings for local CLI/Vitest execution
+  cmd.exe /c "npm rebuild better-sqlite3" 2>$null | Out-Null
 }
 
 exit 0
