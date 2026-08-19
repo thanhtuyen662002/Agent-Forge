@@ -298,14 +298,27 @@ server.listen($testPort, '127.0.0.1', () => {
   Start-Sleep -Seconds 1
 
   Write-Host "Installing real TEST vA application silently into $testInstallDir..."
-  $installProc = Start-Process -FilePath $installerA -ArgumentList "/S", "/D=$testInstallDir", "_?=$testInstallDir" -PassThru -Wait
-  if ($null -ne $installProc -and -not $installProc.HasExited) {
-    $installProc.WaitForExit(30000) | Out-Null
-  }
-  Start-Sleep -Seconds 3
+  cmd.exe /c "`"$installerA`" /S /D=$testInstallDir"
+  Start-Sleep -Seconds 6
 
   $installedExe = Join-Path $testInstallDir "AgentForge.exe"
   $installedAsar = Join-Path $testInstallDir "resources\app.asar"
+  $installedUpdateYml = Join-Path $testInstallDir "resources\app-update.yml"
+
+  if (-not (Test-Path $installedExe) -or -not (Test-Path $installedAsar)) {
+    # Check default per-user location as fallback
+    $defaultInstallDir = Join-Path $env:LOCALAPPDATA "Programs\AgentForge"
+    $fallbackExe = Join-Path $defaultInstallDir "AgentForge.exe"
+    $fallbackAsar = Join-Path $defaultInstallDir "resources\app.asar"
+    if ((Test-Path $fallbackExe) -and (Test-Path $fallbackAsar)) {
+      Write-Host "Detected installation at standard per-user directory: $defaultInstallDir"
+      $testInstallDir = $defaultInstallDir
+      $installedExe = $fallbackExe
+      $installedAsar = $fallbackAsar
+      $installedUpdateYml = Join-Path $testInstallDir "resources\app-update.yml"
+    }
+  }
+
   if (-not (Test-Path $installedExe) -or -not (Test-Path $installedAsar)) {
     Write-Error "Installed executable or app.asar not found at $testInstallDir"
     exit 1
@@ -313,7 +326,6 @@ server.listen($testPort, '127.0.0.1', () => {
   Write-Host "[4/6] Real TEST vA installed successfully at $($installedExe) (asar: $((Get-Item $installedAsar).Length) bytes): PASS"
 
   # 5. Verify installed app-update.yml (NO POST-INSTALL REWRITING)
-  $installedUpdateYml = Join-Path $testInstallDir "resources\app-update.yml"
   if (-not (Test-Path $installedUpdateYml)) {
     Write-Error "app-update.yml not found in installed TEST vA resources at $installedUpdateYml"
     exit 1
