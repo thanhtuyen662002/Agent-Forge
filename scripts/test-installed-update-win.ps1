@@ -298,15 +298,19 @@ server.listen($testPort, '127.0.0.1', () => {
   Start-Sleep -Seconds 1
 
   Write-Host "Installing real TEST vA application silently into $testInstallDir..."
-  $installProc = Start-Process -FilePath $installerA -ArgumentList "/S", "/D=$testInstallDir" -PassThru -Wait
-  Start-Sleep -Seconds 2
+  $installProc = Start-Process -FilePath $installerA -ArgumentList "/S", "/D=$testInstallDir", "_?=$testInstallDir" -PassThru -Wait
+  if ($null -ne $installProc -and -not $installProc.HasExited) {
+    $installProc.WaitForExit(30000) | Out-Null
+  }
+  Start-Sleep -Seconds 3
 
   $installedExe = Join-Path $testInstallDir "AgentForge.exe"
-  if (-not (Test-Path $installedExe)) {
-    Write-Error "Installed executable not found at $installedExe"
+  $installedAsar = Join-Path $testInstallDir "resources\app.asar"
+  if (-not (Test-Path $installedExe) -or -not (Test-Path $installedAsar)) {
+    Write-Error "Installed executable or app.asar not found at $testInstallDir"
     exit 1
   }
-  Write-Host "[4/6] Real TEST vA installed successfully at $($installedExe): PASS"
+  Write-Host "[4/6] Real TEST vA installed successfully at $($installedExe) (asar: $((Get-Item $installedAsar).Length) bytes): PASS"
 
   # 5. Verify installed app-update.yml (NO POST-INSTALL REWRITING)
   $installedUpdateYml = Join-Path $testInstallDir "resources\app-update.yml"
@@ -389,6 +393,8 @@ server.listen($testPort, '127.0.0.1', () => {
   if ($null -eq $finalResult) {
     Write-Host "Files in testDataDir ($testDataDir):"
     Get-ChildItem -Path $testDataDir -Recurse -ErrorAction SilentlyContinue | ForEach-Object { Write-Host "  $($_.FullName) ($($_.Length) bytes)" }
+    Write-Host "Files in testInstallDir ($testInstallDir):"
+    Get-ChildItem -Path $testInstallDir -Recurse -ErrorAction SilentlyContinue | ForEach-Object { Write-Host "  $($_.FullName) ($($_.Length) bytes)" }
     if (Test-Path $debugLogFile) {
       Write-Host "--- Process Debug Log ---"
       Get-Content -Path $debugLogFile | ForEach-Object { Write-Host "  $_" }
