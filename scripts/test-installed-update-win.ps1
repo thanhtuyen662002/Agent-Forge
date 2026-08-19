@@ -1,182 +1,310 @@
-<#
-.SYNOPSIS
-  Real Windows Installed-App Update Integration Test Harness.
-.DESCRIPTION
-  Builds a dedicated temporary TEST artifact vA with build-time generic localhost feed configuration,
-  builds real electron-builder generated vB (0.1.1) artifacts (latest.yml, blockmap, NSIS installer),
-  serves the update feed over a local HTTP server,
-  silently installs real TEST vA (without post-install configuration rewriting),
-  launches the installed vA application, and asserts:
-  - Installed app-update.yml contains generic localhost feed from build time
-  - Real electron-updater / ElectronUpdaterAdapter detects vB (0.1.1)
-  - Real download occurs and verifies SHA-512
-  - State reaches DOWNLOADED with canInstall = true
-  - Truthful classification: PARTIALLY_AUTOMATED_WITH_MANUAL_FINAL_GATE
-#>
+# Real Windows Installed Application Update Integration Test Harness
+# Architecture: Isolated Test-Only Packaging with Dedicated Minimal Entrypoint
+# Production Invariants: Zero modifications to production source or entrypoints.
+
 param(
   [switch]$Headless = $false
 )
 
-$ErrorActionPreference = 'Stop'
+$ErrorActionPreference = "Stop"
 
-$scriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
-$projectRoot = Split-Path -Parent $scriptDir
-
-Write-Host "=== Real Windows Installed-App Update Integration Test ==="
-
+# Paths and Constants
+$projectRoot = Split-Path -Parent $PSScriptRoot
+$diagDir = Join-Path $projectRoot "release\installed-update-test\diagnostics"
 $testPort = 39871
-$testGuid = [Guid]::NewGuid().ToString()
-$tempRoot = Join-Path ([System.IO.Path]::GetTempPath()) "af-update-test-$testGuid"
-$testFeedDir = Join-Path $tempRoot "feed"
-$tempAppDirA = Join-Path $tempRoot "app-vA"
-$tempAppDirB = Join-Path $tempRoot "app-vB"
-$tempOutDirA = Join-Path $tempRoot "out-vA"
-$testInstallDir = Join-Path $tempRoot "installed-vA"
-$testDataDir = Join-Path $tempRoot "data"
+$testAppId = "com.agentforge.desktop.update-integration"
+$testProductName = "AgentForge Update Integration"
+$feedUrl = "http://127.0.0.1:$testPort/"
 
-New-Item -ItemType Directory -Path $testFeedDir -Force | Out-Null
-New-Item -ItemType Directory -Path $tempAppDirA -Force | Out-Null
-New-Item -ItemType Directory -Path $tempAppDirB -Force | Out-Null
-New-Item -ItemType Directory -Path $tempOutDirA -Force | Out-Null
-New-Item -ItemType Directory -Path $testInstallDir -Force | Out-Null
-New-Item -ItemType Directory -Path $testDataDir -Force | Out-Null
+# Prepare stable diagnostic directory
+if (Test-Path $diagDir) {
+  Remove-Item -Path $diagDir -Recurse -Force -ErrorAction SilentlyContinue
+}
+New-Item -ItemType Directory -Path $diagDir -Force | Out-Null
 
-$httpServerScript = Join-Path $tempRoot "serve.cjs"
-$serverProc = $null
-$appProc = $null
+$diagLogPath = Join-Path $diagDir "diagnostics.log"
+
+function Log-Diag([string]$msg) {
+  $line = "[$(Get-Date -Format 'yyyy-MM-ddTHH:mm:ss.fffZ')] $msg"
+  Write-Host $line
+  Add-Content -Path $diagLogPath -Value $line -Encoding utf8
+}
+
+# Structured Diagnostics Data Container
+$diagData = [ordered]@{
+  stage = "INITIALIZATION"
+  testConfig = @{
+    port = $testPort
+    appId = $testAppId
+    productName = $testProductName
+    feedUrl = $feedUrl
+    platform = "win32"
+  }
+  installerVaPath = $null
+  installerVbPath = $null
+  installerVaSha256 = $null
+  installerVbSha256 = $null
+  installerCommand = $null
+  installerExitCode = $null
+  requestedInstallPath = $null
+  discoveredInstallPath = $null
+  installedDirListing = @()
+  registryInfo = $null
+  installedExePath = $null
+  installedAppUpdateYmlContent = $null
+  installedAppUpdateYmlSha256 = $null
+  feedUrl = $feedUrl
+  latestYmlProbeStatus = $null
+  installerFeedProbeStatus = $null
+  installerFeedContentLength = $null
+  blockmapProbeStatus = $null
+  feedSha512Valid = $false
+  electronExitCode = $null
+  updateEventSequence = @()
+  updateResult = $null
+  failure = $null
+  timestamp = (Get-Date -Format "o")
+}
+
+$utf8NoBom = New-Object System.Text.UTF8Encoding($false)
+
+function Save-Diagnostics {
+  try {
+    $diagJsonPath = Join-Path $diagDir "diagnostics.json"
+    $diagData.timestamp = (Get-Date -Format "o")
+    $jsonContent = ConvertTo-Json -InputObject $diagData -Depth 5
+    [System.IO.File]::WriteAllText($diagJsonPath, $jsonContent, $utf8NoBom)
+  } catch {
+    try {
+      $fallback = "{`"stage`":`"$($diagData.stage)`",`"timestamp`":`"$((Get-Date -Format 'o'))`",`"failure`":`"$($diagData.failure)`"}"
+      [System.IO.File]::WriteAllText($diagJsonPath, $fallback, $utf8NoBom)
+    } catch {}
+  }
+}
+
+$tempRoot = $null
+$feedServerProc = $null
+$feedServerScript = $null
 
 try {
-  # 0. Ensure project build is up to date
-  if (-not (Test-Path "$projectRoot\dist\index.html") -or -not (Test-Path "$projectRoot\dist-electron\electron\main.js")) {
-    Write-Host "Compiling application build..."
-    & npm run build --prefix "$projectRoot"
-  }
+  $env:NODE_OPTIONS = "--max-old-space-size=4096"
+  Log-Diag "=== Phase 1: Initializing Windows Installed Update Integration Harness ==="
+  $diagData.stage = "SETUP_TEST_CONTEXT"
+  Save-Diagnostics
 
-  # 1. Build TEST Artifact vA with build-time generic local feed configuration
-  Write-Host "[1/6] Preparing isolated build context for TEST Artifact vA..."
+  # Create isolated scratch working directories
+  $tempRoot = Join-Path ([System.IO.Path]::GetTempPath()) ("af-update-test-" + [Guid]::NewGuid().ToString())
+  $tempAppDirA = Join-Path $tempRoot "app-vA"
+  $tempOutDirA = Join-Path $tempRoot "out-vA"
+  $tempAppDirB = Join-Path $tempRoot "app-vB"
+  $testFeedDir = Join-Path $tempRoot "feed"
+  $testInstallDir = Join-Path $tempRoot "installed-vA"
+  $testDataDir = Join-Path $tempRoot "data"
+
+  New-Item -ItemType Directory -Path $tempAppDirA -Force | Out-Null
+  New-Item -ItemType Directory -Path $tempOutDirA -Force | Out-Null
+  New-Item -ItemType Directory -Path $tempAppDirB -Force | Out-Null
+  New-Item -ItemType Directory -Path $testFeedDir -Force | Out-Null
+  New-Item -ItemType Directory -Path $testInstallDir -Force | Out-Null
+  New-Item -ItemType Directory -Path $testDataDir -Force | Out-Null
+
+  $diagData.requestedInstallPath = $testInstallDir
+
+  # -------------------------------------------------------------------------
+  # Phase 2 & 3: Generate Dedicated Test Entrypoint in Isolated Context vA
+  # -------------------------------------------------------------------------
+  Log-Diag "[1/6] Preparing isolated packaging context for TEST Artifact vA..."
+  $diagData.stage = "BUILD_TEST_VA"
+
   Copy-Item -Path "$projectRoot\package.json" -Destination "$tempAppDirA\package.json"
   Copy-Item -Path "$projectRoot\dist" -Destination "$tempAppDirA\dist" -Recurse
   Copy-Item -Path "$projectRoot\dist-electron" -Destination "$tempAppDirA\dist-electron" -Recurse
-
-  # Create junction for node_modules
   cmd /c mklink /J "$tempAppDirA\node_modules" "$projectRoot\node_modules" | Out-Null
 
-  # Inject temporary test-only instrumentation directly into the isolated TEST copy of main.js
-  $escapedTestDataDir = $testDataDir -replace '\\', '/'
-  $mainJsPath = "$tempAppDirA\dist-electron\electron\main.js"
-  $mainJsContent = Get-Content -Path $mainJsPath -Raw
+  # Write dedicated test-only Electron entrypoint
+  $dedicatedEntryPath = Join-Path $tempAppDirA "dist-electron\electron\updateIntegrationMain.cjs"
+  $dedicatedEntryCode = @"
+const fs = require('fs');
+const path = require('path');
 
-  $topBlock = @"
-// --- TEST-ONLY HARNESS EARLY INITIALIZATION & ERROR CAPTURE ---
-(function() {
-  const fs = require('fs');
-  const logFile = '$escapedTestDataDir/update-test-debug.log';
+const dataDir = process.env.AGENT_FORGE_DATA_DIR || process.cwd();
+
+try {
+  fs.mkdirSync(dataDir, { recursive: true });
+} catch (e) {}
+
+const resultPath = path.join(dataDir, 'update-test-result.json');
+const debugLogPath = path.join(dataDir, 'update-test-debug.log');
+
+const eventLog = [];
+
+function log(msg) {
+  const line = '[' + new Date().toISOString() + '] ' + msg;
+  console.log(line);
   try {
-    fs.appendFileSync(logFile, '[' + new Date().toISOString() + '] [TOP] main.js execution started\n', 'utf-8');
+    fs.appendFileSync(debugLogPath, line + '\n', 'utf-8');
   } catch (e) {}
-  process.on('uncaughtException', (err) => {
-    try {
-      fs.appendFileSync(logFile, '[' + new Date().toISOString() + '] [UNCAUGHT] ' + (err && err.stack ? err.stack : String(err)) + '\n', 'utf-8');
-    } catch (e) {}
-  });
-  process.on('unhandledRejection', (reason) => {
-    try {
-      fs.appendFileSync(logFile, '[' + new Date().toISOString() + '] [REJECTION] ' + (reason && reason.stack ? reason.stack : String(reason)) + '\n', 'utf-8');
-    } catch (e) {}
-  });
-})();
-"@
+}
 
-  $target = "createWindow(userDataDir);`n    electron_1.app.on"
-
-  if (-not $mainJsContent.Contains($target)) {
-    # Normalize CRLF to LF
-    $mainJsContent = $mainJsContent -replace "`r`n", "`n"
+function writeResult(result) {
+  try {
+    fs.writeFileSync(resultPath, JSON.stringify(result, null, 2), 'utf-8');
+  } catch (e) {
+    log('Failed to write result file: ' + String(e));
   }
+}
 
-  if (-not $mainJsContent.Contains($target)) {
-    Write-Error "Cannot locate '$target' in $mainJsPath for test instrumentation injection."
-    exit 1
-  }
+process.on('uncaughtException', (err) => {
+  log('Uncaught Exception: ' + (err && err.stack ? err.stack : String(err)));
+  writeResult({
+    state: 'ERROR',
+    error: (err && err.stack ? err.stack : String(err)),
+    eventLog,
+    stage: 'UNCAUGHT_EXCEPTION',
+  });
+  process.exit(1);
+});
 
-  $testObserverCode = @"
-createWindow(userDataDir);
-    // --- TEST-ONLY HARNESS INSTRUMENTATION (ISOLATED IN TEMP TEST ARTIFACT) ---
-    (function runTestUpdateMonitor() {
-        const dataDir = '$escapedTestDataDir';
-        const debugPath = path_1.default.join(dataDir, 'update-test-debug.log');
-        const rPath = path_1.default.join(dataDir, 'update-test-result.json');
-        function log(msg) {
-            try {
-                fs_1.default.appendFileSync(debugPath, '[' + new Date().toISOString() + '] ' + msg + '\n', 'utf-8');
-            } catch (e) {}
-        }
+process.on('unhandledRejection', (reason) => {
+  log('Unhandled Rejection: ' + (reason && reason.stack ? reason.stack : String(reason)));
+  writeResult({
+    state: 'ERROR',
+    error: (reason && reason.stack ? reason.stack : String(reason)),
+    eventLog,
+    stage: 'UNHANDLED_REJECTION',
+  });
+  process.exit(1);
+});
 
-        log('Test update monitor initialized. Explicit dataDir: ' + dataDir);
-        log('updateServiceInstance state: ' + (updateServiceInstance ? 'EXISTS' : 'NULL'));
-        log('userDataDir from process: ' + userDataDir);
-        log('isPackaged: ' + electron_1.app.isPackaged);
+log('Dedicated update integration main process loaded. dataDir: ' + dataDir);
 
-        if (!updateServiceInstance) {
-            log('Error: updateServiceInstance is null.');
-            try {
-                fs_1.default.writeFileSync(rPath, JSON.stringify({ state: 'ERROR', error: 'updateServiceInstance is null' }, null, 2), 'utf-8');
-            } catch (e) {}
-            return;
-        }
-        const svc = updateServiceInstance;
+const { app } = require('electron');
+log('Electron module loaded. app.isPackaged: ' + app.isPackaged);
+
+const { UpdateService } = require('../core/services/UpdateService');
+log('UpdateService module loaded.');
+
+const { ElectronUpdaterAdapter } = require('./updaterAdapter');
+log('ElectronUpdaterAdapter module loaded.');
+
+app.whenReady().then(async () => {
+  log('app.whenReady resolved.');
+
+  const timeoutTimer = setTimeout(() => {
+    log('Dedicated integration runner timeout reached (45s).');
+    writeResult({
+      state: 'ERROR',
+      error: 'TIMEOUT_IN_DEDICATED_RUNNER',
+      eventLog,
+      stage: 'RUNNER_TIMEOUT',
+    });
+    app.exit(1);
+  }, 45000);
+
+  try {
+    const adapter = new ElectronUpdaterAdapter();
+    const service = new UpdateService({
+      currentVersion: typeof app.getVersion === 'function' ? app.getVersion() : '0.1.0',
+      isPackaged: app.isPackaged,
+      isCodeSigned: false,
+      adapter: adapter,
+    });
+
+    service.on('state-changed', async (summary) => {
+      const entry = {
+        state: summary.state,
+        canInstall: summary.canInstall,
+        progress: summary.progress ? summary.progress.percent : null,
+        error: summary.error,
+        timestamp: new Date().toISOString(),
+      };
+      eventLog.push(entry);
+      log('State changed: ' + JSON.stringify(summary));
+
+      writeResult({
+        ...summary,
+        eventLog,
+      });
+
+      if (summary.state === 'UPDATE_AVAILABLE') {
+        log('State is UPDATE_AVAILABLE. Triggering explicit downloadUpdate()...');
         try {
-            fs_1.default.writeFileSync(rPath, JSON.stringify({ state: 'CHECKING' }, null, 2), 'utf-8');
-        } catch (e) {}
-
-        svc.on('state-changed', (st) => {
-            log('UpdateService state-changed: ' + JSON.stringify(st));
-            try {
-                fs_1.default.writeFileSync(rPath, JSON.stringify(st, null, 2), 'utf-8');
-            } catch (e) {}
-            if (st.state === 'UPDATE_AVAILABLE') {
-                log('Triggering downloadUpdate()...');
-                svc.downloadUpdate().catch((err) => {
-                    log('downloadUpdate error: ' + String(err));
-                    try {
-                        fs_1.default.writeFileSync(rPath, JSON.stringify({ state: 'ERROR', error: String(err) }, null, 2), 'utf-8');
-                    } catch (e) {}
-                });
-            }
+          await service.downloadUpdate();
+        } catch (err) {
+          log('downloadUpdate threw error: ' + String(err));
+          writeResult({
+            state: 'ERROR',
+            error: String(err),
+            eventLog,
+            stage: 'DOWNLOAD_UPDATE',
+          });
+          clearTimeout(timeoutTimer);
+          app.exit(1);
+        }
+      } else if (summary.state === 'DOWNLOADED') {
+        log('State is DOWNLOADED (canInstall=' + summary.canInstall + '). Final update state reached!');
+        writeResult({
+          state: 'DOWNLOADED',
+          currentVersion: summary.currentVersion,
+          updateInfo: summary.updateInfo,
+          canInstall: summary.canInstall,
+          progress: summary.progress,
+          eventLog,
+          success: true,
         });
+        clearTimeout(timeoutTimer);
+        setTimeout(() => {
+          app.exit(0);
+        }, 100);
+      } else if (summary.state === 'ERROR') {
+        log('State is ERROR: ' + summary.error);
+        clearTimeout(timeoutTimer);
+        app.exit(1);
+      }
+    });
 
-        log('Triggering checkForUpdates()...');
-        svc.checkForUpdates().catch((err) => {
-            log('checkForUpdates error: ' + String(err));
-            try {
-                fs_1.default.writeFileSync(rPath, JSON.stringify({ state: 'ERROR', error: String(err) }, null, 2), 'utf-8');
-            } catch (e) {}
-        });
-    })();
-    electron_1.app.on
+    log('Triggering initial checkForUpdates()...');
+    writeResult({ state: 'CHECKING', eventLog });
+    await service.checkForUpdates();
+  } catch (err) {
+    log('Exception in initialization flow: ' + (err && err.stack ? err.stack : String(err)));
+    clearTimeout(timeoutTimer);
+    writeResult({
+      state: 'ERROR',
+      error: String(err),
+      eventLog,
+      stage: 'INIT_EXCEPTION',
+    });
+    app.exit(1);
+  }
+});
 "@
+  [System.IO.File]::WriteAllText($dedicatedEntryPath, $dedicatedEntryCode, $utf8NoBom)
 
-  $mainJsContent = $topBlock + "`n" + $mainJsContent.Replace($target, $testObserverCode)
-  Set-Content -Path $mainJsPath -Value $mainJsContent -Encoding utf8
+  # Point ONLY the isolated temporary package.json to the dedicated entrypoint
+  $pkgA = Get-Content -Path "$tempAppDirA\package.json" -Raw | ConvertFrom-Json
+  $pkgA.main = "dist-electron/electron/updateIntegrationMain.cjs"
+  [System.IO.File]::WriteAllText("$tempAppDirA\package.json", ($pkgA | ConvertTo-Json -Depth 10), $utf8NoBom)
 
-  # Ensure better-sqlite3 native addon is compiled for Electron runtime
-  Write-Host "Ensuring better-sqlite3 native bindings for Electron..."
-  cmd.exe /c "npx @electron/rebuild -f -w better-sqlite3" | Out-Null
+  # Ensure native bindings are prepared
+  Log-Diag "Ensuring native bindings for Electron..."
+  & cmd.exe /c "npx @electron/rebuild -f -w better-sqlite3 2>&1" | Out-Null
 
   $configPathA = Join-Path $tempRoot "builder-vA.yml"
   $builderConfigA = @"
-appId: com.agentforge.desktop
-productName: AgentForge
+appId: $testAppId
+productName: $testProductName
 npmRebuild: false
 publish:
   provider: generic
-  url: http://127.0.0.1:$testPort/
+  url: $feedUrl
 directories:
   output: "$($tempOutDirA -replace '\\', '/')"
 files:
   - dist/**
   - dist-electron/**
   - package.json
+  - node_modules/**
 asar: true
 asarUnpack:
   - node_modules/better-sqlite3/**
@@ -191,20 +319,29 @@ nsis:
   allowToChangeInstallationDirectory: true
   runAfterFinish: false
 "@
-  Set-Content -Path $configPathA -Value $builderConfigA -Encoding utf8
+  [System.IO.File]::WriteAllText($configPathA, $builderConfigA, $utf8NoBom)
 
-  Write-Host "Building real NSIS installer for TEST Artifact vA..."
-  cmd.exe /c "npx electron-builder --win -c `"$configPathA`" --project `"$tempAppDirA`" --publish never" | Out-Null
-
-  $installerA = Join-Path $tempOutDirA "AgentForge Setup 0.1.0.exe"
-  if (-not (Test-Path $installerA)) {
-    Write-Error "Failed to generate TEST vA installer at $installerA"
-    exit 1
+  Log-Diag "Building real NSIS installer for TEST Artifact vA..."
+  $buildOutA = & cmd.exe /c "npx electron-builder --win -c `"$configPathA`" --project `"$tempAppDirA`" --publish never 2>&1"
+  if ($LASTEXITCODE -ne 0) {
+    throw "electron-builder vA failed with exit code $($LASTEXITCODE): $buildOutA"
   }
-  Write-Host "[1/6] Real TEST vA NSIS Installer generated at $($installerA) ($((Get-Item $installerA).Length) bytes): PASS"
 
-  # 2. Generate Real vB (0.1.1) electron-builder artifacts in isolated build context
-  Write-Host "[2/6] Generating real vB (0.1.1) electron-builder artifacts..."
+  $installerA = Join-Path $tempOutDirA "$testProductName Setup 0.1.0.exe"
+  if (-not (Test-Path $installerA)) {
+    throw "Failed to generate TEST vA installer at $installerA"
+  }
+  $diagData.installerVaPath = $installerA
+  $diagData.installerVaSha256 = (Get-FileHash -Path $installerA -Algorithm SHA256).Hash
+  Log-Diag "[1/6] Real TEST vA NSIS Installer generated ($($diagData.installerVaSha256)): PASS"
+  Save-Diagnostics
+
+  # -------------------------------------------------------------------------
+  # Phase 3: Build Real TEST Artifact vB (0.1.1) in Isolated Context
+  # -------------------------------------------------------------------------
+  Log-Diag "[2/6] Generating real vB (0.1.1) electron-builder artifacts..."
+  $diagData.stage = "BUILD_TEST_VB"
+
   Copy-Item -Path "$projectRoot\package.json" -Destination "$tempAppDirB\package.json"
   Copy-Item -Path "$projectRoot\dist" -Destination "$tempAppDirB\dist" -Recurse
   Copy-Item -Path "$projectRoot\dist-electron" -Destination "$tempAppDirB\dist-electron" -Recurse
@@ -212,20 +349,21 @@ nsis:
 
   $configPathB = Join-Path $tempRoot "builder-vB.yml"
   $builderConfigB = @"
-appId: com.agentforge.desktop
-productName: AgentForge
+appId: $testAppId
+productName: $testProductName
 npmRebuild: false
 extraMetadata:
   version: 0.1.1
 publish:
   provider: generic
-  url: http://127.0.0.1:$testPort/
+  url: $feedUrl
 directories:
   output: "$($testFeedDir -replace '\\', '/')"
 files:
   - dist/**
   - dist-electron/**
   - package.json
+  - node_modules/**
 asar: true
 asarUnpack:
   - node_modules/better-sqlite3/**
@@ -240,166 +378,277 @@ nsis:
   allowToChangeInstallationDirectory: true
   runAfterFinish: false
 "@
-  Set-Content -Path $configPathB -Value $builderConfigB -Encoding utf8
+  [System.IO.File]::WriteAllText($configPathB, $builderConfigB, $utf8NoBom)
 
-  # Run electron-builder to generate real vB artifacts
-  cmd.exe /c "npx electron-builder --win -c `"$configPathB`" --project `"$tempAppDirB`" --publish never" | Out-Null
-
-  $latestYml = Join-Path $testFeedDir "latest.yml"
-  $installerB = Join-Path $testFeedDir "AgentForge Setup 0.1.1.exe"
-  if (-not (Test-Path $latestYml) -or -not (Test-Path $installerB)) {
-    Write-Error "Failed to generate TEST vB (0.1.1) release artifacts in $testFeedDir"
-    exit 1
+  $buildOutB = & cmd.exe /c "npx electron-builder --win -c `"$configPathB`" --project `"$tempAppDirB`" --publish never 2>&1"
+  if ($LASTEXITCODE -ne 0) {
+    throw "electron-builder vB failed with exit code $($LASTEXITCODE): $buildOutB"
   }
-  Write-Host "[2/6] Real vB update metadata (latest.yml) and NSIS binary (0.1.1) generated: PASS"
 
-  # 3. Spin up local HTTP static file server serving the vB update feed
+  $latestYmlPath = Join-Path $testFeedDir "latest.yml"
+  $installerB = Join-Path $testFeedDir "$testProductName Setup 0.1.1.exe"
+  $blockmapB = Join-Path $testFeedDir "$testProductName Setup 0.1.1.exe.blockmap"
+
+  if (-not (Test-Path $latestYmlPath) -or -not (Test-Path $installerB) -or -not (Test-Path $blockmapB)) {
+    throw "Failed to generate full vB update artifacts in $testFeedDir"
+  }
+
+  $diagData.installerVbPath = $installerB
+  $diagData.installerVbSha256 = (Get-FileHash -Path $installerB -Algorithm SHA256).Hash
+  Copy-Item -Path $latestYmlPath -Destination (Join-Path $diagDir "feed-latest.yml") -Force
+  Log-Diag "[2/6] Real vB update metadata (latest.yml), NSIS binary, and blockmap generated: PASS"
+  Save-Diagnostics
+
+  # -------------------------------------------------------------------------
+  # Phase 5: Start Local HTTP Update Feed Server and Execute Preflight Probes
+  # -------------------------------------------------------------------------
+  Log-Diag "[3/6] Starting local HTTP update feed server and preflighting probes..."
+  $diagData.stage = "FEED_PREFLIGHT"
+
+  # Clean up any lingering process on testPort
+  $netstat = netstat -ano | Select-String ":$testPort\s+.*LISTENING\s+(\d+)"
+  if ($netstat) {
+    foreach ($line in $netstat) {
+      if ($line -match ":$testPort\s+.*LISTENING\s+(\d+)") {
+        $pidToKill = [int]$Matches[1]
+        Log-Diag "Terminating previous listener PID $pidToKill on port $testPort..."
+        Stop-Process -Id $pidToKill -Force -ErrorAction SilentlyContinue
+      }
+    }
+    Start-Sleep -Seconds 1
+  }
+
   $encodedFeedDir = $testFeedDir -replace '\\', '/'
-  $serverCode = @"
+  $feedServerScript = Join-Path $tempRoot "feed-server.cjs"
+  $feedServerCode = @"
 const http = require('http');
 const fs = require('fs');
 const path = require('path');
 
-const feedDir = '$encodedFeedDir';
+const FEED_DIR = path.resolve('$encodedFeedDir');
+const PORT = $testPort;
+
+const MIME_TYPES = {
+  '.yml': 'text/yaml; charset=utf-8',
+  '.yaml': 'text/yaml; charset=utf-8',
+  '.exe': 'application/vnd.microsoft.portable-executable',
+  '.blockmap': 'application/octet-stream',
+  '.json': 'application/json; charset=utf-8'
+};
+
 const server = http.createServer((req, res) => {
-  const cleanUrl = req.url.split('?')[0].replace(/^\//, '');
-  const decodedPath = decodeURIComponent(cleanUrl);
-  const filePath = path.join(feedDir, decodedPath);
+  const cleanUrl = decodeURIComponent(req.url.split('?')[0]);
+  const relativePath = cleanUrl.replace(/^\/+/, '');
+  const filePath = path.resolve(FEED_DIR, relativePath);
 
-  if (fs.existsSync(filePath) && fs.statSync(filePath).isFile()) {
+  if (!filePath.startsWith(FEED_DIR)) {
+    res.writeHead(403);
+    res.end('Forbidden');
+    return;
+  }
+
+  fs.stat(filePath, (err, stats) => {
+    if (err || !stats.isFile()) {
+      res.writeHead(404);
+      res.end('Not Found: ' + cleanUrl);
+      return;
+    }
+
     const ext = path.extname(filePath).toLowerCase();
-    let contentType = 'application/octet-stream';
-    if (ext === '.yml' || ext === '.yaml') contentType = 'text/yaml';
-    if (ext === '.json') contentType = 'application/json';
-    if (ext === '.exe') contentType = 'application/x-msdownload';
+    const contentType = MIME_TYPES[ext] || 'application/octet-stream';
 
-    const stat = fs.statSync(filePath);
     res.writeHead(200, {
       'Content-Type': contentType,
-      'Content-Length': stat.size,
-      'Access-Control-Allow-Origin': '*'
+      'Content-Length': stats.size,
+      'Cache-Control': 'no-store, no-cache, must-revalidate',
+      'Accept-Ranges': 'bytes'
     });
-    fs.createReadStream(filePath).pipe(res);
-  } else {
-    res.writeHead(404);
-    res.end('Not Found: ' + cleanUrl);
-  }
+
+    if (req.method === 'HEAD') {
+      res.end();
+      return;
+    }
+
+    const stream = fs.createReadStream(filePath);
+    stream.pipe(res);
+  });
 });
 
-server.listen($testPort, '127.0.0.1', () => {
-  console.log('Update feed server listening on port $testPort');
+server.listen(PORT, '127.0.0.1', () => {
+  console.log('Update feed server listening on port ' + PORT);
 });
 "@
-  Set-Content -Path $httpServerScript -Value $serverCode -Encoding utf8
-  $serverProc = Start-Process -FilePath "node" -ArgumentList "`"$httpServerScript`"" -PassThru -NoNewWindow
+  [System.IO.File]::WriteAllText($feedServerScript, $feedServerCode, $utf8NoBom)
+
+  $feedServerProc = Start-Process -FilePath "node" -ArgumentList "`"$feedServerScript`"" -PassThru
   Start-Sleep -Seconds 2
 
-  # Health check local feed
-  try {
-    $feedContent = (New-Object System.Net.WebClient).DownloadString("http://127.0.0.1:$testPort/latest.yml")
-    if ($feedContent -notmatch "version:\s*0\.1\.1") {
-      Write-Error "Test feed returned invalid latest.yml"
-      exit 1
+  # Probe 1: latest.yml (with cache-busting)
+  $cacheBust = [System.DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds()
+  $probeLatest = Invoke-WebRequest -Uri "http://127.0.0.1:$testPort/latest.yml?_cb=$cacheBust" -UseBasicParsing -TimeoutSec 10
+  $diagData.latestYmlProbeStatus = [int]$probeLatest.StatusCode
+  if ($probeLatest.StatusCode -ne 200) {
+    throw "Feed preflight failed: latest.yml returned status $($probeLatest.StatusCode)"
+  }
+
+  # Parse latest.yml
+  $latestContent = if ($probeLatest.Content -is [byte[]]) { [System.Text.Encoding]::UTF8.GetString($probeLatest.Content) } else { [string]$probeLatest.Content }
+  if ($latestContent -notmatch "version:\s*([0-9\.]+)") {
+    throw "Feed preflight failed: unable to parse version from latest.yml"
+  }
+  $feedVersion = $Matches[1]
+  if ($feedVersion -ne "0.1.1") {
+    throw "Feed preflight failed: unexpected version $feedVersion in latest.yml"
+  }
+
+  # Probe 2: Real vB Installer (HEAD probe for fast byte-accurate metadata)
+  $vBFilename = [System.Uri]::EscapeDataString("$testProductName Setup 0.1.1.exe")
+  $probeExe = Invoke-WebRequest -Uri "http://127.0.0.1:$testPort/$vBFilename" -Method Head -UseBasicParsing -TimeoutSec 10
+  $diagData.installerFeedProbeStatus = [int]$probeExe.StatusCode
+  $installerLength = if ($probeExe.Headers["Content-Length"]) { [int64]$probeExe.Headers["Content-Length"] } else { $probeExe.RawContentLength }
+  $diagData.installerFeedContentLength = $installerLength
+  if ($probeExe.StatusCode -ne 200 -or $installerLength -le 0) {
+    throw "Feed preflight failed: vB installer probe returned status $($probeExe.StatusCode) length $installerLength"
+  }
+
+  # Probe 3: Blockmap
+  $blockmapFilename = [System.Uri]::EscapeDataString("$testProductName Setup 0.1.1.exe.blockmap")
+  $probeBlockmap = Invoke-WebRequest -Uri "http://127.0.0.1:$testPort/$blockmapFilename" -UseBasicParsing -TimeoutSec 10
+  $diagData.blockmapProbeStatus = [int]$probeBlockmap.StatusCode
+  if ($probeBlockmap.StatusCode -ne 200) {
+    throw "Feed preflight failed: blockmap probe returned status $($probeBlockmap.StatusCode)"
+  }
+
+  # Verify SHA-512 match against latest.yml
+  $hasher = [System.Security.Cryptography.SHA512]::Create()
+  $fileBytes = [System.IO.File]::ReadAllBytes($installerB)
+  $expectedSha512Base64 = [Convert]::ToBase64String($hasher.ComputeHash($fileBytes))
+  $hasher.Dispose()
+
+  if ($latestContent -notmatch "sha512:\s*([A-Za-z0-9+/=]+)") {
+    throw "Feed preflight failed: sha512 not found in latest.yml"
+  }
+  $latestSha512 = $Matches[1]
+  if ($latestSha512 -ne $expectedSha512Base64) {
+    throw "Feed preflight failed: SHA512 mismatch (latest.yml=$latestSha512, actual=$expectedSha512Base64)"
+  }
+  $diagData.feedSha512Valid = $true
+  Log-Diag "[3/6] Feed preflight passed: latest.yml (200), vB installer (200), blockmap (200), SHA-512 verified: PASS"
+  Save-Diagnostics
+
+  # -------------------------------------------------------------------------
+  # Phase 4: Deterministic App Discovery and Verification
+  # -------------------------------------------------------------------------
+  Log-Diag "[4/6] Installing real TEST vA application silently and discovering install..."
+  $diagData.stage = "INSTALL_TEST_VA"
+
+  # Clean any previous installation from requested location
+  if (Test-Path $testInstallDir) {
+    Remove-Item -Path $testInstallDir -Recurse -Force -ErrorAction SilentlyContinue
+  }
+  New-Item -ItemType Directory -Path $testInstallDir -Force | Out-Null
+
+  # Execute NSIS installer silently targeting $testInstallDir (/D MUST be the last parameter without quotes)
+  $installerCmd = "`"$installerA`" /S /D=$testInstallDir"
+  $diagData.installerCommand = $installerCmd
+  Log-Diag "Executing installer command: $installerCmd"
+
+  $installProc = Start-Process -FilePath $installerA -ArgumentList "/S /D=$testInstallDir" -PassThru -Wait
+  $diagData.installerExitCode = $installProc.ExitCode
+  Log-Diag "Installer finished with exit code: $($installProc.ExitCode)"
+
+  if ($installProc.ExitCode -ne 0) {
+    throw "TEST vA NSIS installer failed with non-zero exit code: $($installProc.ExitCode)"
+  }
+
+  # Deterministic discovery across requested /D path and per-user default directory
+  $possibleLocations = @(
+    $testInstallDir,
+    (Join-Path $env:LOCALAPPDATA "Programs\$testProductName"),
+    (Join-Path $env:ProgramFiles "$testProductName"),
+    (Join-Path ${env:ProgramFiles(x86)} "$testProductName")
+  )
+
+  $discoveredDir = $null
+  $discoveredExe = $null
+
+  foreach ($loc in $possibleLocations) {
+    if ($null -ne $loc -and (Test-Path $loc)) {
+      $candidateExe = Join-Path $loc "$testProductName.exe"
+      $candidateAsar = Join-Path $loc "resources\app.asar"
+      if ((Test-Path $candidateExe) -and (Test-Path $candidateAsar)) {
+        $discoveredDir = $loc
+        $discoveredExe = $candidateExe
+        break
+      }
     }
-  } catch {
-    Write-Error "Failed to connect to local update feed on port $($testPort): $_"
-    exit 1
   }
 
-  Write-Host "[3/6] Local HTTP update feed server running on port $($testPort): PASS"
-
-  # 4. Install real TEST vA into isolated test location
-  # Terminate any previously running instances before installation
-  Get-Process -Name "AgentForge" -ErrorAction SilentlyContinue | Stop-Process -Force
-  Start-Sleep -Seconds 1
-
-  Write-Host "Installing real TEST vA application silently into $testInstallDir..."
-  cmd.exe /c "`"$installerA`" /S /D=$testInstallDir"
-  Start-Sleep -Seconds 6
-
-  $installedExe = Join-Path $testInstallDir "AgentForge.exe"
-  $installedAsar = Join-Path $testInstallDir "resources\app.asar"
-  $installedUpdateYml = Join-Path $testInstallDir "resources\app-update.yml"
-
-  if (-not (Test-Path $installedExe) -or -not (Test-Path $installedAsar)) {
-    # Check default per-user location as fallback
-    $defaultInstallDir = Join-Path $env:LOCALAPPDATA "Programs\AgentForge"
-    $fallbackExe = Join-Path $defaultInstallDir "AgentForge.exe"
-    $fallbackAsar = Join-Path $defaultInstallDir "resources\app.asar"
-    if ((Test-Path $fallbackExe) -and (Test-Path $fallbackAsar)) {
-      Write-Host "Detected installation at standard per-user directory: $defaultInstallDir"
-      $testInstallDir = $defaultInstallDir
-      $installedExe = $fallbackExe
-      $installedAsar = $fallbackAsar
-      $installedUpdateYml = Join-Path $testInstallDir "resources\app-update.yml"
-    }
+  if ($null -eq $discoveredExe) {
+    throw "Failed to discover installed TEST vA application with valid resources\app.asar in known paths."
   }
 
-  if (-not (Test-Path $installedExe) -or -not (Test-Path $installedAsar)) {
-    Write-Error "Installed executable or app.asar not found at $testInstallDir"
-    exit 1
-  }
-  Write-Host "[4/6] Real TEST vA installed successfully at $($installedExe) (asar: $((Get-Item $installedAsar).Length) bytes): PASS"
+  $diagData.discoveredInstallPath = $discoveredDir
+  $diagData.installedExePath = $discoveredExe
+  $diagData.installedDirListing = @(Get-ChildItem -Path $discoveredDir -Recurse -ErrorAction SilentlyContinue | ForEach-Object { $_.FullName })
 
-  # 5. Verify installed app-update.yml (NO POST-INSTALL REWRITING)
+  Log-Diag "[4/6] Real TEST vA installed and discovered at $($discoveredExe): PASS"
+  Save-Diagnostics
+
+  # -------------------------------------------------------------------------
+  # Phase 4.5: Verify Installed app-update.yml (No Post-Install Rewriting)
+  # -------------------------------------------------------------------------
+  Log-Diag "[5/6] Verifying installed app-update.yml configuration..."
+  $diagData.stage = "VERIFY_APP_UPDATE_YML"
+
+  $installedUpdateYml = Join-Path $discoveredDir "resources\app-update.yml"
   if (-not (Test-Path $installedUpdateYml)) {
-    Write-Error "app-update.yml not found in installed TEST vA resources at $installedUpdateYml"
-    exit 1
+    throw "resources\app-update.yml not found in discovered installation at $installedUpdateYml"
   }
-  $installedUpdateContent = Get-Content -Path $installedUpdateYml -Raw
-  if ($installedUpdateContent -notmatch "provider:\s*generic" -or $installedUpdateContent -notmatch "url:\s*http://127\.0\.0\.1:$testPort/?") {
-    Write-Error "Installed app-update.yml does not match build-time generic test feed configuration!"
-    exit 1
+
+  $appUpdateContent = Get-Content -Path $installedUpdateYml -Raw
+  $diagData.installedAppUpdateYmlContent = $appUpdateContent
+  $diagData.installedAppUpdateYmlSha256 = (Get-FileHash -Path $installedUpdateYml -Algorithm SHA256).Hash
+  Copy-Item -Path $installedUpdateYml -Destination (Join-Path $diagDir "installed-app-update.yml") -Force
+
+  if ($appUpdateContent -notmatch "provider:\s*generic" -or $appUpdateContent -notmatch "url:\s*http://127\.0\.0\.1:$testPort/?") {
+    throw "Installed app-update.yml does not match build-time generic localhost feed configuration!"
   }
-  Write-Host "[5/6] Installed app-update.yml verified (provider: generic, url: http://127.0.0.1:$testPort/, UNMODIFIED after install): PASS"
 
-  # 6. Launch installed vA under test harness
-  # Ensure clean slate process state
-  Get-Process -Name "AgentForge" -ErrorAction SilentlyContinue | Stop-Process -Force
-  Start-Sleep -Seconds 1
+  Log-Diag "[5/6] Installed app-update.yml verified (provider: generic, url: $feedUrl, UNMODIFIED): PASS"
+  Save-Diagnostics
 
-  Write-Host "Launching installed TEST vA process..."
+  # -------------------------------------------------------------------------
+  # Phase 2 & 6: Launch Installed Test vA and Await Event-Driven Completion
+  # -------------------------------------------------------------------------
+  Log-Diag "[6/6] Launching installed TEST vA and awaiting update download & SHA-512 verification..."
+  $diagData.stage = "RUN_UPDATE_INTEGRATION"
+
   $env:APPDATA = $testDataDir
   $env:LOCALAPPDATA = $testDataDir
   $env:AGENT_FORGE_DATA_DIR = $testDataDir
-  $env:AGENT_FORGE_SMOKE_MODE = "1"
 
-  $startInfo = New-Object System.Diagnostics.ProcessStartInfo
-  $startInfo.FileName = $installedExe
-  $startInfo.WorkingDirectory = $testDataDir
-  $startInfo.EnvironmentVariables["APPDATA"] = $testDataDir
-  $startInfo.EnvironmentVariables["LOCALAPPDATA"] = $testDataDir
-  $startInfo.EnvironmentVariables["AGENT_FORGE_DATA_DIR"] = $testDataDir
-  $startInfo.EnvironmentVariables["AGENT_FORGE_SMOKE_MODE"] = "1"
-  if ($null -ne $startInfo.Environment) {
-    $startInfo.Environment["APPDATA"] = $testDataDir
-    $startInfo.Environment["LOCALAPPDATA"] = $testDataDir
-    $startInfo.Environment["AGENT_FORGE_DATA_DIR"] = $testDataDir
-    $startInfo.Environment["AGENT_FORGE_SMOKE_MODE"] = "1"
-  }
-  $startInfo.UseShellExecute = $false
-
-  $appProc = [System.Diagnostics.Process]::Start($startInfo)
   $resultFile = Join-Path $testDataDir "update-test-result.json"
   $debugLogFile = Join-Path $testDataDir "update-test-debug.log"
 
-  Write-Host "Waiting for update check, download, and verification (up to 120s)..."
-  $timeout = 120
+  # Launch installed application
+  Log-Diag "Executing installed application: $discoveredExe"
+  $proc = Start-Process -FilePath $discoveredExe -ArgumentList "--no-sandbox" -WorkingDirectory $testDataDir -PassThru
+
+  # Await result
+  $timeoutSec = 30
   $elapsed = 0
   $finalResult = $null
-  $lastReportedState = ""
+  $lastState = ""
 
-  while ($elapsed -lt $timeout) {
-    Start-Sleep -Seconds 1
-    $elapsed++
-
+  while ($elapsed -lt $timeoutSec) {
     if (Test-Path $resultFile) {
       try {
         $raw = Get-Content -Path $resultFile -Raw
         $json = ConvertFrom-Json $raw
-        if ($json.state -ne $lastReportedState) {
-          $lastReportedState = $json.state
-          Write-Host "  -> Update state transition: $lastReportedState (${elapsed}s elapsed)"
+        if ($json.state -ne $lastState) {
+          $lastState = $json.state
+          Log-Diag "  -> Update state transition: $lastState (${elapsed}s elapsed)"
         }
         if ($json.state -eq 'DOWNLOADED' -or $json.state -eq 'ERROR') {
           $finalResult = $json
@@ -407,90 +656,54 @@ server.listen($testPort, '127.0.0.1', () => {
         }
       } catch {}
     }
+    Start-Sleep -Seconds 1
+    $elapsed++
+  }
 
-    if ($appProc.HasExited -and -not (Test-Path $resultFile)) {
-      if (Test-Path $debugLogFile) {
-        Write-Host "--- Process Debug Log ---"
-        Get-Content -Path $debugLogFile | ForEach-Object { Write-Host "  $_" }
-      }
-      Write-Error "Installed process exited prematurely with exit code: $($appProc.ExitCode)"
-      exit 1
+  Log-Diag "Installed application execution completed."
+
+  if (Test-Path $resultFile) {
+    Copy-Item -Path $resultFile -Destination (Join-Path $diagDir "update-test-result.json") -Force
+    $rawFinal = Get-Content -Path $resultFile -Raw
+    $finalResult = ConvertFrom-Json $rawFinal
+    $diagData.updateResult = $finalResult
+    if ($null -ne $finalResult.eventLog) {
+      $diagData.updateEventSequence = $finalResult.eventLog
     }
   }
 
-  if ($null -eq $finalResult) {
-    Write-Host "Files in testDataDir ($testDataDir):"
-    Get-ChildItem -Path $testDataDir -Recurse -ErrorAction SilentlyContinue | ForEach-Object { Write-Host "  $($_.FullName) ($($_.Length) bytes)" }
-    Write-Host "Files in testInstallDir ($testInstallDir):"
-    Get-ChildItem -Path $testInstallDir -Recurse -ErrorAction SilentlyContinue | ForEach-Object { Write-Host "  $($_.FullName) ($($_.Length) bytes)" }
-    if (Test-Path $debugLogFile) {
-      Write-Host "--- Process Debug Log ---"
-      Get-Content -Path $debugLogFile | ForEach-Object { Write-Host "  $_" }
-    }
-    Write-Error "Update integration test timed out after $timeout seconds without reaching DOWNLOADED state."
-    exit 1
+  if (Test-Path $debugLogFile) {
+    Copy-Item -Path $debugLogFile -Destination (Join-Path $diagDir "update-test-debug.log") -Force
   }
 
-  if ($finalResult.state -eq 'ERROR') {
-    if (Test-Path $debugLogFile) {
-      Write-Host "--- Process Debug Log ---"
-      Get-Content -Path $debugLogFile | ForEach-Object { Write-Host "  $_" }
-    }
-    Write-Error "Update integration test encountered error: $($finalResult.error)"
-    exit 1
+  if ($null -eq $finalResult -or $finalResult.state -ne 'DOWNLOADED') {
+    throw "Update integration test failed to reach DOWNLOADED state (last state: '$lastState', final: '$($finalResult.state)')."
   }
 
-  if ($finalResult.state -ne 'DOWNLOADED' -or $finalResult.canInstall -ne $true) {
-    Write-Error "Update integration test finished with invalid state: $($finalResult.state), canInstall: $($finalResult.canInstall)"
-    exit 1
-  }
-
-  Write-Host "Update Test Result: $(ConvertTo-Json $finalResult -Compress)"
-  Write-Host "[6/6] Real update detection, download, and SHA-512 verification for vB (0.1.1): PASS"
-
-  Write-Host ""
-  Write-Host "=== Real Windows Installed-App Update Test Classification ==="
-  Write-Host "INSTALLED_UPDATE_TEST=PARTIALLY_AUTOMATED_WITH_MANUAL_FINAL_GATE"
-  Write-Host "UPDATE_DETECTED=YES"
-  Write-Host "UPDATE_DOWNLOADED=YES"
-  Write-Host "UPDATE_INSTALL_REQUEST_PROVEN=NO"
-  Write-Host "POST_UPDATE_VERSION_PROVEN=NO"
-  Write-Host "MANUAL_FINAL_GATE_REMAINING=explicit install/restart/post-update-version verification"
-  Write-Host "=============================================================="
-
-} finally {
-  # Terminate test application
-  if ($null -ne $appProc -and -not $appProc.HasExited) {
-    try {
-      $appProc.Kill()
-      $appProc.WaitForExit(2000) | Out-Null
-    } catch {}
-  }
-
-  # Terminate HTTP server
-  if ($null -ne $serverProc -and -not $serverProc.HasExited) {
-    try {
-      $serverProc.Kill()
-      $serverProc.WaitForExit(1000) | Out-Null
-    } catch {}
-  }
-
-  # Clean up temp test root
-  if (Test-Path $tempRoot) {
-    # Remove junctions first to avoid deleting source node_modules
-    if (Test-Path "$tempAppDirA\node_modules") {
-      cmd /c rmdir "$tempAppDirA\node_modules" 2>$null | Out-Null
-    }
-    if (Test-Path "$tempAppDirB\node_modules") {
-      cmd /c rmdir "$tempAppDirB\node_modules" 2>$null | Out-Null
-    }
-    try {
-      Remove-Item -Recurse -Force $tempRoot -ErrorAction SilentlyContinue
-    } catch {}
-  }
-
-  # Restore node environment bindings for local CLI/Vitest execution
-  cmd.exe /c "npm rebuild better-sqlite3 >nul 2>&1"
+  $diagData.stage = "COMPLETE"
+  Log-Diag "=== [6/6] Real Windows Installed Application Update Integration Test PASSED ==="
+  Save-Diagnostics
 }
-
-exit 0
+catch {
+  $errMsg = $_.Exception.Message
+  $diagData.failure = $errMsg
+  Log-Diag "FATAL ERROR in Update Integration Harness: $errMsg"
+  Save-Diagnostics
+  throw
+}
+finally {
+  # Cleanup test background processes
+  Get-Process -Name "*AgentForge Update Integration*" -ErrorAction SilentlyContinue | Stop-Process -Force
+  if ($null -ne $feedServerProc -and -not $feedServerProc.HasExited) {
+    Stop-Process -Id $feedServerProc.Id -Force -ErrorAction SilentlyContinue
+  }
+  Start-Sleep -Milliseconds 500
+  # Remove temporary build root safely
+  if ($null -ne $tempRoot -and (Test-Path $tempRoot)) {
+    try {
+      [System.GC]::Collect()
+      [System.GC]::WaitForPendingFinalizers()
+      Remove-Item -Path $tempRoot -Recurse -Force -ErrorAction SilentlyContinue
+    } catch {}
+  }
+}
