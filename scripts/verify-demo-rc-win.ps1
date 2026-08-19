@@ -1,6 +1,6 @@
 # =============================================================================
 # scripts/verify-demo-rc-win.ps1
-# AgentForge Windows Release Candidate Verification Script (PR #10)
+# AgentForge Windows Release Candidate Verification Gate (Fail-Closed)
 # =============================================================================
 
 [CmdletBinding()]
@@ -45,82 +45,180 @@ $receiptLines = [System.Collections.Generic.List[string]]::new()
 $receiptLines.Add("AGENTFORGE_DEMO_RC_RECEIPT")
 $receiptLines.Add("TIMESTAMP=$(Get-Date -Format 'o')")
 
-# 1. Package Metadata & Production Version
+$failures = [System.Collections.Generic.List[string]]::new()
+
+# Assertion A: package.json version is exactly 0.1.0
 $packageJsonPath = Join-Path $ProjectRoot "package.json"
-$packageJson = Get-Content $packageJsonPath -Raw | ConvertFrom-Json
-$expectedVersion = $packageJson.version
-Write-Host "[1/6] Production Version: $expectedVersion" -ForegroundColor Green
+if (-not (Test-Path $packageJsonPath)) {
+  $failures.Add("A_PACKAGE_JSON_MISSING: package.json not found at $packageJsonPath")
+  $expectedVersion = "UNKNOWN"
+} else {
+  try {
+    $packageJson = Get-Content $packageJsonPath -Raw | ConvertFrom-Json
+    $expectedVersion = $packageJson.version
+    if ($expectedVersion -ne "0.1.0") {
+      $failures.Add("A_VERSION_MISMATCH: Expected package version 0.1.0, got $expectedVersion")
+    }
+  } catch {
+    $failures.Add("A_PACKAGE_JSON_PARSE_ERROR: Failed to parse package.json: $_")
+    $expectedVersion = "PARSE_ERROR"
+  }
+}
 $receiptLines.Add("PRODUCTION_VERSION=$expectedVersion")
+Write-Host "[A] Production Version ($expectedVersion): $(if ($expectedVersion -eq '0.1.0') {'PASS'} else {'FAIL'})"
 
-# 2. Database Migration Count
+# Assertion B: Database migration count == 7
 $migrationsPath = Join-Path $ProjectRoot "src\core\database\migrations.ts"
-$migrationMatches = Select-String -Path $migrationsPath -Pattern "version:\s*(\d+)"
-$migrationCount = $migrationMatches.Count
-Write-Host "[2/6] Database Migration Count: $migrationCount" -ForegroundColor Green
+$migrationCount = 0
+if (-not (Test-Path $migrationsPath)) {
+  $failures.Add("B_MIGRATIONS_FILE_MISSING: migrations.ts not found at $migrationsPath")
+} else {
+  $migrationMatches = Select-String -Path $migrationsPath -Pattern "version:\s*(\d+)"
+  $migrationCount = $migrationMatches.Count
+  if ($migrationCount -ne 7) {
+    $failures.Add("B_MIGRATION_COUNT_INVALID: Expected exactly 7 migrations, found $migrationCount")
+  }
+}
 $receiptLines.Add("MIGRATION_COUNT=$migrationCount")
+Write-Host "[B] Database Migration Count ($migrationCount): $(if ($migrationCount -eq 7) {'PASS'} else {'FAIL'})"
 
-# 3. Production Update Configuration Check
+# Assertion C & D: electron-builder.yml provider & credentials check
 $builderConfigPath = Join-Path $ProjectRoot "electron-builder.yml"
-$builderConfig = Get-Content $builderConfigPath -Raw
-$hasGithubProvider = $builderConfig -match "provider:\s*github"
-$hasOwner = $builderConfig -match "owner:\s*thanhtuyen662002"
-$hasRepo = $builderConfig -match "repo:\s*Agent-Forge"
-$hasCredentials = ($builderConfig -match "token:") -or ($builderConfig -match "secret:")
+$hasGithubProvider = $false
+$hasOwner = $false
+$hasRepo = $false
+$hasBuilderCreds = $false
 
-Write-Host "[3/6] Production Updater Config:" -ForegroundColor Green
-Write-Host "      - Provider GitHub: $hasGithubProvider"
-Write-Host "      - Owner thanhtuyen662002: $hasOwner"
-Write-Host "      - Repo Agent-Forge: $hasRepo"
-Write-Host "      - Embedded Credentials: $(if ($hasCredentials) {'FOUND (FAIL)'} else {'NONE (PASS)'})"
+if (-not (Test-Path $builderConfigPath)) {
+  $failures.Add("C_BUILDER_CONFIG_MISSING: electron-builder.yml not found at $builderConfigPath")
+} else {
+  $builderConfig = Get-Content $builderConfigPath -Raw
+  $hasGithubProvider = $builderConfig -match "(?m)^\s*provider:\s*github"
+  $hasOwner = $builderConfig -match "(?m)^\s*owner:\s*thanhtuyen662002"
+  $hasRepo = $builderConfig -match "(?m)^\s*repo:\s*Agent-Forge"
+  if (-not ($hasGithubProvider -and $hasOwner -and $hasRepo)) {
+    $failures.Add("C_BUILDER_CONFIG_PROVIDER_INVALID: electron-builder.yml must specify github / thanhtuyen662002 / Agent-Forge")
+  }
 
+  $credRegex = "(?i)(token:|password:|Authorization:|Bearer\s|ghp_|github_pat_)"
+  if ($builderConfig -match $credRegex) {
+    $hasBuilderCreds = $true
+    $failures.Add("D_BUILDER_CONFIG_CREDENTIALS_FOUND: electron-builder.yml contains embedded credentials")
+  }
+}
 $receiptLines.Add("UPDATER_PROVIDER_GITHUB=$hasGithubProvider")
 $receiptLines.Add("UPDATER_OWNER=thanhtuyen662002")
 $receiptLines.Add("UPDATER_REPO=Agent-Forge")
-$receiptLines.Add("UPDATER_EMBEDDED_CREDENTIALS=$hasCredentials")
+$receiptLines.Add("BUILDER_CONFIG_CREDENTIALS_FOUND=$hasBuilderCreds")
+Write-Host "[C] Production Builder Provider (github/thanhtuyen662002/Agent-Forge): $(if ($hasGithubProvider -and $hasOwner -and $hasRepo) {'PASS'} else {'FAIL'})"
+Write-Host "[D] Builder Config Credentials Check: $(if (-not $hasBuilderCreds) {'PASS (No credentials)'} else {'FAIL (Found credentials)'})"
 
-# 4. Packaged Executable Check
+# Assertion E: release/win-unpacked/AgentForge.exe exists
 $unpackedExe = Join-Path $ProjectRoot "release\win-unpacked\AgentForge.exe"
 $unpackedExists = Test-Path $unpackedExe
-Write-Host "[4/6] Packaged Executable (win-unpacked): $(if ($unpackedExists) {'FOUND'} else {'NOT_BUILT'})" -ForegroundColor $(if ($unpackedExists) {'Green'} else {'Yellow'})
+if (-not $unpackedExists) {
+  $failures.Add("E_UNPACKED_EXE_MISSING: Packaged executable not found at $unpackedExe")
+}
 $receiptLines.Add("PACKAGED_UNPACKED_EXE_EXISTS=$unpackedExists")
+Write-Host "[E] Packaged Executable ($unpackedExe): $(if ($unpackedExists) {'PASS'} else {'FAIL'})"
 
-# 5. Production Installer Check
+# Assertion F, G, H: Production installer existence, size > 0, SHA256
 $installerName = "AgentForge Setup $expectedVersion.exe"
 $installerPath = Join-Path $ProjectRoot "release\$installerName"
 $installerExists = Test-Path $installerPath
 $installerSize = 0
 $installerSha256 = "N/A"
-$authenticodeStatus = "NotSigned"
+$authenticodeStatus = "Unknown"
 
-if ($installerExists) {
-  $installerItem = Get-Item $installerPath
-  $installerSize = $installerItem.Length
-  $installerSha256 = Get-Sha256Hex -FilePath $installerPath
-  $sig = Get-AuthenticodeSignature -FilePath $installerPath
-  $authenticodeStatus = $sig.Status.ToString()
-  Write-Host "[5/6] Production Installer:" -ForegroundColor Green
-  Write-Host "      - Path: $installerPath"
-  Write-Host "      - Size: $installerSize bytes"
-  Write-Host "      - SHA-256: $installerSha256"
-  Write-Host "      - Authenticode: $authenticodeStatus"
+if (-not $installerExists) {
+  $failures.Add("F_INSTALLER_MISSING: Production installer not found at $installerPath")
 } else {
-  Write-Host "[5/6] Production Installer: NOT_BUILT (Run npm run package:win)" -ForegroundColor Yellow
+  try {
+    $installerItem = Get-Item $installerPath
+    $installerSize = $installerItem.Length
+    if ($installerSize -le 0) {
+      $failures.Add("G_INSTALLER_EMPTY: Installer file size is 0 bytes")
+    }
+    $installerSha256 = Get-Sha256Hex -FilePath $installerPath
+    if ([string]::IsNullOrWhiteSpace($installerSha256) -or $installerSha256.Length -ne 64) {
+      $failures.Add("H_INSTALLER_SHA256_INVALID: Failed to compute valid 64-char SHA256 for installer")
+    }
+    $sig = Get-AuthenticodeSignature -FilePath $installerPath
+    $authenticodeStatus = $sig.Status.ToString()
+  } catch {
+    $failures.Add("H_INSTALLER_INSPECT_ERROR: Error inspecting installer: $_")
+  }
 }
-
 $receiptLines.Add("INSTALLER_NAME=$installerName")
 $receiptLines.Add("INSTALLER_EXISTS=$installerExists")
 $receiptLines.Add("INSTALLER_SIZE_BYTES=$installerSize")
 $receiptLines.Add("INSTALLER_SHA256=$installerSha256")
 $receiptLines.Add("AUTHENTICODE_STATUS=$authenticodeStatus")
+Write-Host "[F] Production Installer Exists: $(if ($installerExists) {'PASS'} else {'FAIL'})"
+Write-Host "[G] Production Installer Size ($installerSize bytes): $(if ($installerSize -gt 0) {'PASS'} else {'FAIL'})"
+Write-Host "[H] Production Installer SHA-256 ($installerSha256): $(if ($installerSha256.Length -eq 64) {'PASS'} else {'FAIL'})"
 
-# 6. Write Receipt
+# Assertion I, J, K: Packaged resources/app-update.yml exists, correct config, NO credentials
+$packagedAppUpdate = Join-Path $ProjectRoot "release\win-unpacked\resources\app-update.yml"
+$packagedAppUpdateExists = Test-Path $packagedAppUpdate
+$packagedUpdateProviderOk = $false
+$packagedUpdateCredsFound = $false
+
+if (-not $packagedAppUpdateExists) {
+  $failures.Add("I_PACKAGED_APP_UPDATE_YML_MISSING: resources\app-update.yml not found in win-unpacked")
+} else {
+  $appUpdateContent = Get-Content $packagedAppUpdate -Raw
+  $hasPkgProvider = $appUpdateContent -match "(?m)^\s*provider:\s*github"
+  $hasPkgOwner = $appUpdateContent -match "(?m)^\s*owner:\s*thanhtuyen662002"
+  $hasPkgRepo = $appUpdateContent -match "(?m)^\s*repo:\s*Agent-Forge"
+
+  if ($hasPkgProvider -and $hasPkgOwner -and $hasPkgRepo) {
+    $packagedUpdateProviderOk = $true
+  } else {
+    $failures.Add("J_PACKAGED_APP_UPDATE_YML_INVALID: app-update.yml must specify provider: github, owner: thanhtuyen662002, repo: Agent-Forge")
+  }
+
+  $credRegex = "(?i)(token:|password:|Authorization:|Bearer\s|ghp_|github_pat_)"
+  if ($appUpdateContent -match $credRegex) {
+    $packagedUpdateCredsFound = $true
+    $failures.Add("K_PACKAGED_APP_UPDATE_YML_CREDENTIALS_FOUND: resources\app-update.yml contains credentials")
+  }
+}
+$receiptLines.Add("PACKAGED_APP_UPDATE_YML_EXISTS=$packagedAppUpdateExists")
+$receiptLines.Add("PACKAGED_APP_UPDATE_CONFIG_VALID=$packagedUpdateProviderOk")
+$receiptLines.Add("PACKAGED_APP_UPDATE_CREDENTIALS_FOUND=$packagedUpdateCredsFound")
+
+Write-Host "[I] Packaged app-update.yml Exists: $(if ($packagedAppUpdateExists) {'PASS'} else {'FAIL'})"
+Write-Host "[J] Packaged app-update.yml Configuration: $(if ($packagedUpdateProviderOk) {'PASS'} else {'FAIL'})"
+Write-Host "[K] Packaged app-update.yml No Credentials: $(if (-not $packagedUpdateCredsFound) {'PASS'} else {'FAIL'})"
+
+# Final Gate Evaluation
 $receiptDir = [System.IO.Path]::GetDirectoryName($ReceiptOutput)
 if (-not (Test-Path $receiptDir)) {
   New-Item -ItemType Directory -Path $receiptDir -Force | Out-Null
 }
-$receiptLines.Add("RC_VERIFICATION_STATUS=PASS")
-[System.IO.File]::WriteAllLines($ReceiptOutput, $receiptLines)
-Write-Host "[6/6] Receipt written to $ReceiptOutput" -ForegroundColor Green
-Write-Host "=================================================================" -ForegroundColor Cyan
-Write-Host "   AgentForge Windows RC Verification: PASS                      " -ForegroundColor Green
-Write-Host "=================================================================" -ForegroundColor Cyan
+
+if ($failures.Count -eq 0) {
+  $receiptLines.Add("RC_VERIFICATION_STATUS=PASS")
+  [System.IO.File]::WriteAllLines($ReceiptOutput, $receiptLines)
+  Write-Host "=================================================================" -ForegroundColor Cyan
+  Write-Host "   AgentForge Windows RC Verification: PASS (All Gates Passed)  " -ForegroundColor Green
+  Write-Host "   Receipt written to $ReceiptOutput                             " -ForegroundColor Green
+  Write-Host "=================================================================" -ForegroundColor Cyan
+  exit 0
+} else {
+  $receiptLines.Add("RC_VERIFICATION_STATUS=FAIL")
+  $receiptLines.Add("FAILURE_COUNT=$($failures.Count)")
+  foreach ($fail in $failures) {
+    $receiptLines.Add("FAILURE_REASON=$fail")
+  }
+  [System.IO.File]::WriteAllLines($ReceiptOutput, $receiptLines)
+  Write-Host "=================================================================" -ForegroundColor Red
+  Write-Host "   AgentForge Windows RC Verification: FAILED ($($failures.Count) failures) " -ForegroundColor Red
+  foreach ($fail in $failures) {
+    Write-Host "   - $fail" -ForegroundColor Red
+  }
+  Write-Host "   Receipt written to $ReceiptOutput                             " -ForegroundColor Yellow
+  Write-Host "=================================================================" -ForegroundColor Red
+  exit 1
+}

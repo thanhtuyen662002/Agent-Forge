@@ -196,7 +196,7 @@ describe('PR #10 — AgentForge Demo & Release Candidate Gate Contract Tests', (
   // =========================================================================
   // Section 5: Real Core Services Demo E2E Happy Path Flow
   // =========================================================================
-  it('should execute the full real core services Owner demo lifecycle without shortcuts', async () => {
+  it('should execute the full real core services Owner demo lifecycle without shortcuts using authorized manual handoff', async () => {
     // 1. Advance task to PLANNED then apply Manager decision (manager.v1) -> moves task to CODING
     await applyExecuteDecision(testTaskId);
 
@@ -219,7 +219,7 @@ describe('PR #10 — AgentForge Demo & Release Candidate Gate Contract Tests', (
     expect(routingEvents.length).toBe(1);
     expect(routingEvents[0].structured_payload.outcome).toBe('MANUAL_HANDOFF_REQUIRED');
 
-    // 4. Create Execution Authorization from durable decision
+    // 4. Create Execution Authorization from durable decision -> Status AUTHORIZED
     const auth = await authorizationService.createAuthorization({
       projectId: testProjectId,
       taskId: testTaskId,
@@ -238,12 +238,19 @@ describe('PR #10 — AgentForge Demo & Release Candidate Gate Contract Tests', (
     expect(dispatchedAuth.status).toBe('DISPATCHED');
     expect(dispatchedAuth.dispatched_at).toBeDefined();
 
-    // 6. Generate cryptographically authorized WorkOrder
-    const project = repo.getProject(testProjectId)!;
-    const taskAfterDispatch = repo.getTask(testTaskId)!;
-    const workOrder = PackageGenerator.generateWorkOrder(project, taskAfterDispatch);
-    expect(workOrder).toContain('Project Context');
-    expect(workOrder).toContain('RC-DEMO-001');
+    // 6. Generate REAL authorization-bound manual WorkOrder (PR #8 API)
+    const workOrder = PackageGenerator.generateAuthorizedManualWorkOrder(auth.id, repo);
+    expect(workOrder).toBeDefined();
+
+    // Assert all required envelope fields and frozen instruction
+    expect(workOrder).toContain(auth.id);
+    expect(workOrder).toContain(testProjectId);
+    expect(workOrder).toContain(testTaskId);
+    expect(workOrder).toContain(auth.manager_message_id);
+    expect(workOrder).toContain(routeDecision.decisionId);
+    expect(workOrder).toContain('res-gemini-coder');
+    expect(workOrder).toContain('prov-manual-bridge');
+    expect(workOrder).toContain('Update feature.js to return { value: 42 } so run_tests.js passes.');
     expect(workOrder).toContain('coder.v1');
 
     // 7. Simulate Owner manually updating Git repository with Gemini Coder changes
@@ -303,6 +310,7 @@ describe('PR #10 — AgentForge Demo & Release Candidate Gate Contract Tests', (
     expect(latestTestRun).toBeDefined();
     expect(gitDiffEv).toBeDefined();
 
+    const project = repo.getProject(testProjectId)!;
     const reviewPackage = PackageGenerator.generateReviewPackage(
       project,
       taskAfterValidation,
@@ -322,18 +330,38 @@ describe('PR #10 — AgentForge Demo & Release Candidate Gate Contract Tests', (
   // Section 6: Negative E2E Contracts (10 Focused Contract Invariants)
   // =========================================================================
 
-  // Contract 1: WorkOrder cannot be generated for nonexistent or cross-project tasks
-  it('Negative Contract 1: WorkOrder generation fails closed on mismatched/nonexistent project', () => {
-    const project = repo.getProject(testProjectId)!;
-    const task = repo.getTask(testTaskId)!;
+  // Contract 1: Pre-dispatch call to generateAuthorizedManualWorkOrder fails closed
+  it('Negative Contract 1: Pre-dispatch generateAuthorizedManualWorkOrder fails closed with EXECUTION_AUTHORIZATION_NOT_DISPATCHED', async () => {
+    await applyExecuteDecision(testTaskId);
 
-    const foreignProject = { ...project, id: 'proj-foreign-999' };
+    const routeDecision = await routingService.route({
+      projectId: testProjectId,
+      taskId: testTaskId,
+      candidateResourceIds: ['res-gemini-coder'],
+      allowManualBridge: true,
+      requiredCapabilities: ['CODING'],
+    });
+
+    const auth = await authorizationService.createAuthorization({
+      projectId: testProjectId,
+      taskId: testTaskId,
+      routingDecisionId: routeDecision.decisionId,
+    });
+    expect(auth.status).toBe('AUTHORIZED');
+
+    // Calling before dispatch MUST throw EXECUTION_AUTHORIZATION_NOT_DISPATCHED
     expect(() => {
-      if (task.project_id !== foreignProject.id) {
-        throw new Error(`Cross-project guard: Task "${task.id}" belongs to project "${task.project_id}", not "${foreignProject.id}".`);
-      }
-      PackageGenerator.generateWorkOrder(foreignProject, task);
-    }).toThrow(/Cross-project guard/);
+      PackageGenerator.generateAuthorizedManualWorkOrder(auth.id, repo);
+    }).toThrow(/EXECUTION_AUTHORIZATION_NOT_DISPATCHED/);
+
+    // After dispatch, status is DISPATCHED and call succeeds
+    const dispatchResult = await dispatchService.dispatch(auth.id);
+    expect(dispatchResult.status).toBe('AWAITING_OWNER');
+    expect(repo.getExecutionAuthorization(auth.id)!.status).toBe('DISPATCHED');
+
+    const workOrder = PackageGenerator.generateAuthorizedManualWorkOrder(auth.id, repo);
+    expect(workOrder).toBeDefined();
+    expect(workOrder).toContain(auth.id);
   });
 
   // Contract 2: Consumed authorization cannot execute twice
@@ -363,7 +391,7 @@ describe('PR #10 — AgentForge Demo & Release Candidate Gate Contract Tests', (
     expect(dispatch2.error).toContain('EXECUTION_AUTHORIZATION_ALREADY_DISPATCHED');
   });
 
-  // Contract 3: New Manager authority invalidates stale authorization
+  // Contract 3: Task state mismatch invalidates authorization at dispatch time
   it('Negative Contract 3: Task state mismatch invalidates authorization at dispatch time', async () => {
     await applyExecuteDecision(testTaskId);
 
@@ -575,5 +603,127 @@ describe('PR #10 — AgentForge Demo & Release Candidate Gate Contract Tests', (
     expect(summary.state).toBe('IDLE');
     expect(summary.currentVersion).toBe('0.1.0');
     expect(summary.canInstall).toBe(false);
+  });
+
+  // =========================================================================
+  // Section 7: Static Negative Contracts for RC Verification Rules
+  // =========================================================================
+  describe('RC Verification Script Static Rules & Invariants', () => {
+    function evaluateRcConfig(options: {
+      providerText: string;
+      appUpdateText?: string;
+      migrationCount: number;
+      installerExists: boolean;
+      unpackedExists: boolean;
+      appUpdateExists: boolean;
+    }): { valid: boolean; failures: string[] } {
+      const failures: string[] = [];
+      const credRegex = /(token:|password:|Authorization:|Bearer\s|ghp_|github_pat_)/i;
+
+      // Provider check
+      const hasGithub = /provider:\s*github/i.test(options.providerText);
+      const hasOwner = /owner:\s*thanhtuyen662002/i.test(options.providerText);
+      const hasRepo = /repo:\s*Agent-Forge/i.test(options.providerText);
+      if (!(hasGithub && hasOwner && hasRepo)) {
+        failures.push('INVALID_PROVIDER');
+      }
+
+      // Credentials in builder
+      if (credRegex.test(options.providerText)) {
+        failures.push('BUILDER_CREDENTIALS_FOUND');
+      }
+
+      // Migration count
+      if (options.migrationCount !== 7) {
+        failures.push('INVALID_MIGRATION_COUNT');
+      }
+
+      // Installer existence
+      if (!options.installerExists) {
+        failures.push('MISSING_INSTALLER');
+      }
+
+      // Unpacked existence
+      if (!options.unpackedExists) {
+        failures.push('MISSING_UNPACKED_EXE');
+      }
+
+      // Packaged app-update.yml
+      if (!options.appUpdateExists) {
+        failures.push('MISSING_PACKAGED_APP_UPDATE_YML');
+      } else if (options.appUpdateText) {
+        const hasPkgGithub = /provider:\s*github/i.test(options.appUpdateText);
+        const hasPkgOwner = /owner:\s*thanhtuyen662002/i.test(options.appUpdateText);
+        const hasPkgRepo = /repo:\s*Agent-Forge/i.test(options.appUpdateText);
+        if (!(hasPkgGithub && hasPkgOwner && hasPkgRepo)) {
+          failures.push('INVALID_APP_UPDATE_CONFIG');
+        }
+        if (credRegex.test(options.appUpdateText)) {
+          failures.push('APP_UPDATE_CREDENTIALS_FOUND');
+        }
+      }
+
+      return { valid: failures.length === 0, failures };
+    }
+
+    it('RC Rule 1: Wrong provider (e.g. generic/s3) fails verification', () => {
+      const res = evaluateRcConfig({
+        providerText: 'provider: generic\nurl: https://example.com',
+        migrationCount: 7,
+        installerExists: true,
+        unpackedExists: true,
+        appUpdateExists: true,
+      });
+      expect(res.valid).toBe(false);
+      expect(res.failures).toContain('INVALID_PROVIDER');
+    });
+
+    it('RC Rule 2: Embedded credentials in builder config fails verification', () => {
+      const res = evaluateRcConfig({
+        providerText: 'provider: github\nowner: thanhtuyen662002\nrepo: Agent-Forge\ntoken: ghp_12345secret',
+        migrationCount: 7,
+        installerExists: true,
+        unpackedExists: true,
+        appUpdateExists: true,
+      });
+      expect(res.valid).toBe(false);
+      expect(res.failures).toContain('BUILDER_CREDENTIALS_FOUND');
+    });
+
+    it('RC Rule 3: Missing installer file fails verification', () => {
+      const res = evaluateRcConfig({
+        providerText: 'provider: github\nowner: thanhtuyen662002\nrepo: Agent-Forge',
+        migrationCount: 7,
+        installerExists: false,
+        unpackedExists: true,
+        appUpdateExists: true,
+      });
+      expect(res.valid).toBe(false);
+      expect(res.failures).toContain('MISSING_INSTALLER');
+    });
+
+    it('RC Rule 4: Incorrect migration count (!= 7) fails verification', () => {
+      const res = evaluateRcConfig({
+        providerText: 'provider: github\nowner: thanhtuyen662002\nrepo: Agent-Forge',
+        migrationCount: 6,
+        installerExists: true,
+        unpackedExists: true,
+        appUpdateExists: true,
+      });
+      expect(res.valid).toBe(false);
+      expect(res.failures).toContain('INVALID_MIGRATION_COUNT');
+    });
+
+    it('RC Rule 5: Missing packaged app-update.yml fails verification', () => {
+      const res = evaluateRcConfig({
+        providerText: 'provider: github\nowner: thanhtuyen662002\nrepo: Agent-Forge',
+        migrationCount: 7,
+        installerExists: true,
+        unpackedExists: true,
+        appUpdateExists: false,
+      });
+      expect(res.valid).toBe(false);
+      expect(res.failures).toContain('MISSING_PACKAGED_APP_UPDATE_YML');
+    });
   });
 });

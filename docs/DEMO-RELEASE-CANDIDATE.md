@@ -31,7 +31,7 @@ This document is the operator runbook for evaluating the AgentForge MVP Windows 
 3. **Installed App Location**:
    - Default install path: `%LOCALAPPDATA%\Programs\AgentForge\`
    - Executable: `%LOCALAPPDATA%\Programs\AgentForge\AgentForge.exe`
-   - User Data & SQLite DB: `%APPDATA%\AgentForge\` (`agent-forge.db`)
+   - User Data & SQLite DB: `%APPDATA%\AgentForge\database\agent-forge.db`
 
 4. **Uninstall / Reinstall Behavior**:
    - Run `%LOCALAPPDATA%\Programs\AgentForge\Uninstall AgentForge.exe /S` to remove binary files.
@@ -52,7 +52,7 @@ This document is the operator runbook for evaluating the AgentForge MVP Windows 
 
 ---
 
-## 4. Owner Demo Workflow & Manual Bridge Handoff
+## 4. Owner Demo Workflow & Authorized Manual Bridge Handoff
 
 The core Owner workflow exercises full cryptographic and durable authority without shortcuts:
 
@@ -63,27 +63,28 @@ Create / Open Project (Select local Git repository)
        ↓
 Create Task (Objective & Description)
        ↓
-Apply Manager Decision (EXECUTE)
+Apply Manager Decision (EXECUTE) -> Task moves to CODING
        ↓
 Owner Selects Candidate Resource (e.g. Gemini Coder / Manual Bridge)
        ↓
-Execution Authorization Created (Revision-bound, Manager-bound)
+Execution Authorization Created (Status: AUTHORIZED, Revision-bound, Manager-bound)
        ↓
-One-Time Dispatch -> Task moves to AWAITING_OWNER (Status: CONSUMED)
+One-Time Dispatch -> Executes Manual Bridge -> Task moves to AWAITING_OWNER
+                    -> Authorization durable status in SQLite becomes DISPATCHED
        ↓
-Generate Cryptographic WorkOrder -> Copy to Clipboard
+Generate Cryptographic Authorized WorkOrder (PackageGenerator.generateAuthorizedManualWorkOrder)
        ↓
-Owner sends WorkOrder to Gemini in Browser / External Window
+Owner copies WorkOrder to Clipboard and relays to Gemini in Browser / External Window
        ↓
 Gemini completes coding & returns coder.v1 protocol JSON
        ↓
 Owner pastes coder.v1 into Coder Inbox
        ↓
-Protocol Validation & State Transition (moves to VALIDATING)
+Protocol Validation & State Transition (Task moves to VALIDATING)
        ↓
 Automated Verification Tests executed via ProcessRunner against real Git diff
        ↓
-Review Ready -> Generate Review Package with authoritative diff evidence
+Review Ready (Task moves to REVIEW_READY) -> Generate Review Package with authoritative diff evidence
 ```
 
 ---
@@ -103,28 +104,32 @@ Review Ready -> Generate Review Package with authoritative diff evidence
 2. Relaunch `AgentForge.exe`.
 3. Verify:
    - SQLite state is preserved (Project, Task, Protocol Messages, Events, Authorizations).
-   - Consumed authorization remains `DISPATCHED` / `CONSUMED` and cannot be replayed.
-   - Language selection persists.
+   - Consumed authorization remains `DISPATCHED` in SQLite and cannot be dispatched twice.
+   - Language selection persists across restarts.
    - Task resumes in exact durable state.
 
 ---
 
-## 7. Updater Check & Download Truth
+## 7. Updater Check & Production Truth
 
-- **Updater Backend**: Configured to GitHub Releases repository `thanhtuyen662002/Agent-Forge`.
+- **Production Updater Backend**:
+  - Configured to official GitHub Releases repository: `thanhtuyen662002/Agent-Forge`.
+  - Production `app-update.yml` contains zero embedded credentials.
 - **Policy Invariants**:
   - `autoDownload=false` (Owner must explicitly click Download).
   - `autoInstallOnAppQuit=false` (Owner must explicitly choose when to restart).
-- **Current Truth**:
-  - Production `app-update.yml` contains zero embedded credentials.
-  - Updates are checked and downloaded into isolated temp feed storage with SHA-512 blockmap verification.
-  - Final Windows replacement and restart requires elevation approval (`MANUAL_FINAL_GATE_REQUIRED`).
+- **Test vs Production Separation**:
+  - Localhost/generic HTTP feed belongs **ONLY** to the isolated automated updater integration test harness (`scripts/test-installed-update-win.ps1`).
+  - The installed production application (`AgentForge.exe`) strictly connects to GitHub Releases (`thanhtuyen662002/Agent-Forge`).
+- **Update Final Gate Evaluation**:
+  - Download and SHA-512 blockmap verification are automated and verified.
+  - Final Windows binary replacement and elevation restart requires interactive elevation approval (`FULL_UPDATE_INSTALL_RESTART_TEST=MANUAL_FINAL_GATE_REQUIRED`).
 
 ---
 
 ## 8. Diagnostic Evidence Collection
 
 To collect diagnostics for support or verification:
-1. **Application Logs**: `%APPDATA%\AgentForge\logs\`
-2. **Database**: `%APPDATA%\AgentForge\agent-forge.db`
-3. **Automated RC Verification Receipt**: Run `scripts/verify-demo-rc-win.ps1` to produce `release/demo-rc-receipt.txt`.
+1. **User Database**: `%APPDATA%\AgentForge\database\agent-forge.db`
+2. **Packaged Verification Receipt**: Run `scripts/verify-demo-rc-win.ps1` to produce `release/demo-rc-receipt.txt`.
+3. **Production Installed Smoke**: Run `scripts/smoke-installed-production-win.ps1` to perform isolated NSIS installation and startup verification.
