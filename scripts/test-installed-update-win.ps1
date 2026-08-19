@@ -92,10 +92,11 @@ try {
     const pollInterval = setInterval(() => {
       attempts++;
       try {
-        if (typeof updateServiceInstance !== 'undefined' && updateServiceInstance) {
+        const svcCandidate = global.__agentForgeUpdateService;
+        if (svcCandidate) {
           clearInterval(pollInterval);
-          log('updateServiceInstance acquired successfully.');
-          const svc = updateServiceInstance;
+          log('updateServiceInstance acquired via global.__agentForgeUpdateService.');
+          const svc = svcCandidate;
 
           try {
             fs.writeFileSync(rPath, JSON.stringify({ state: 'CHECKING' }, null, 2), 'utf-8');
@@ -147,6 +148,26 @@ try {
 })();
 "@
   Add-Content -Path "$tempAppDirA\dist-electron\electron\main.js" -Value $testObserverSnippet -Encoding utf8
+
+  # Patch compiled main.js to expose updateServiceInstance on global so the injected observer can access it
+  $mainJsPath = "$tempAppDirA\dist-electron\electron\main.js"
+  $mainJsLines = Get-Content -Path $mainJsPath
+  $patchedLines = @()
+  $patched = $false
+  foreach ($line in $mainJsLines) {
+    $patchedLines += $line
+    # After registerIpcHandlers call (which receives updateServiceInstance), export it to global
+    if (-not $patched -and $line -match 'registerIpcHandlers' -and $line -match 'updateServiceInstance') {
+      $patchedLines += 'global.__agentForgeUpdateService = updateServiceInstance;'
+      $patched = $true
+    }
+  }
+  if (-not $patched) {
+    # Fallback: append at end of file before our observer snippet's IIFE
+    Write-Host "WARNING: registerIpcHandlers marker not found in main.js, using fallback global patch"
+    $patchedLines += 'if (typeof updateServiceInstance !== "undefined" && updateServiceInstance) { global.__agentForgeUpdateService = updateServiceInstance; }'
+  }
+  Set-Content -Path $mainJsPath -Value $patchedLines -Encoding utf8
 
   # Ensure better-sqlite3 native addon is compiled for Electron runtime
   Write-Host "Ensuring better-sqlite3 native bindings for Electron..."
