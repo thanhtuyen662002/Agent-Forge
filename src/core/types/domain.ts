@@ -491,3 +491,40 @@ export interface ExecutionAuthorization {
   created_at: string;
   dispatched_at: string | null;
 }
+
+export type UpdateState =
+  | 'IDLE'
+  | 'CHECKING'
+  | 'UPDATE_AVAILABLE'
+  | 'NO_UPDATE_AVAILABLE'
+  | 'DOWNLOADING'
+  | 'DOWNLOADED'
+  | 'INSTALLING'
+  | 'ERROR'
+  | 'DISABLED';
+
+export interface UpdateProgress {
+  percent: number;
+  bytesPerSecond?: number;
+  transferred?: number;
+  total?: number;
+}
+
+export interface UpdateInfo {
+  version: string;
+  releaseDate?: string;
+  releaseNotes?: string;
+  releaseName?: string;
+}
+
+export interface UpdateStateSummary {
+  state: UpdateState;
+  currentVersion: string;
+  updateInfo: UpdateInfo | null;
+  progress: UpdateProgress | null;
+  error: string | null;
+  isPackaged: boolean;
+  isCodeSigned: boolean;
+  canInstall: boolean;
+  lastCheckedAt: string | null;
+}

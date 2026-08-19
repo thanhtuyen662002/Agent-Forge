@@ -4,9 +4,12 @@ import fs from 'fs';
 import { BootstrapService, BootstrapResult } from '../core/services/BootstrapService';
 import { registerIpcHandlers } from './ipcHandlers';
 import { resolveRendererTarget } from './pathHelper';
+import { UpdateService } from '../core/services/UpdateService';
+import { ElectronUpdaterAdapter } from './updaterAdapter';
 
 let mainWindow: BrowserWindow | null = null;
 let bootstrapInstance: BootstrapResult | null = null;
+let updateServiceInstance: UpdateService | null = null;
 
 function createWindow(userDataDir: string): void {
   mainWindow = new BrowserWindow({
@@ -57,7 +60,9 @@ function createWindow(userDataDir: string): void {
           rootChildCount: result.rootChildCount,
           windowTitle: mainWindow ? mainWindow.getTitle() : '',
           isPackaged: app.isPackaged,
+          appVersion: app.getVersion(),
           sqliteInitialized: bootstrapInstance !== null,
+          updateServiceInitialized: updateServiceInstance !== null,
           timestamp: new Date().toISOString(),
         };
 
@@ -125,6 +130,16 @@ app.whenReady().then(() => {
   const userDataDir = process.env.AGENT_FORGE_DATA_DIR || app.getPath('userData');
   bootstrapInstance = BootstrapService.initialize(userDataDir);
 
+  // Initialize UpdateService with packaged/unsigned configuration
+  const updateAdapter = app.isPackaged ? new ElectronUpdaterAdapter() : undefined;
+  updateServiceInstance = new UpdateService({
+    currentVersion: typeof app.getVersion === 'function' ? app.getVersion() : '0.1.0',
+    isPackaged: app.isPackaged,
+    isCodeSigned: false, // Explicit unsigned desktop foundation
+    adapter: updateAdapter,
+    repository: bootstrapInstance.repo,
+  });
+
   // Register Typed & Validated IPC Handlers
   registerIpcHandlers(
     bootstrapInstance.repo,
@@ -134,7 +149,8 @@ app.whenReady().then(() => {
     bootstrapInstance.emergencyStopService,
     bootstrapInstance.providerRoutingService,
     bootstrapInstance.executionAuthorizationService,
-    bootstrapInstance.providerDispatchService
+    bootstrapInstance.providerDispatchService,
+    updateServiceInstance
   );
 
   // Create Desktop Window

@@ -141,16 +141,27 @@ jobs:
           }
           Write-Host "dist\index.html relative asset path check: PASS"
 
-      - name: Generate unpacked Windows directory
-        run: npm run package:win:dir
+      - name: Generate Windows NSIS installer and unpacked package
+        run: npm run package:win
 
       - name: Run packaged process runtime smoke
         shell: pwsh
         run: |
           npm run smoke:packaged:win -- -Headless
 
-      - name: Generate Windows NSIS installer
-        run: npm run package:win
+      - name: Run real Windows installed application update integration test
+        shell: pwsh
+        run: |
+          npm run test:installed:win -- -Headless
+
+      - name: Upload Windows Installed Update Test Diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: agentforge-installed-update-diagnostics-${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
+          path: release/installed-update-test/diagnostics/
+          if-no-files-found: ignore
+          retention-days: 7
 
       - name: Verify installer and generate metadata
         shell: pwsh

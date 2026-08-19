@@ -1,5 +1,6 @@
 import React from 'react';
 import { useOrchestrator, OrchestratorProvider } from './context/OrchestratorContext';
+import { I18nProvider } from './context/I18nContext';
 import { Header } from './components/Header';
 import { Sidebar } from './components/Sidebar';
 import { EmergencyStopModal } from './components/EmergencyStopModal';
@@ -66,9 +67,11 @@ const MainLayout: React.FC = () => {
 
 export const App: React.FC = () => {
   return (
-    <OrchestratorProvider>
-      <MainLayout />
-    </OrchestratorProvider>
+    <I18nProvider>
+      <OrchestratorProvider>
+        <MainLayout />
+      </OrchestratorProvider>
+    </I18nProvider>
   );
 };
 

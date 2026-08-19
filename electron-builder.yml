@@ -2,6 +2,11 @@ appId: com.agentforge.desktop
 productName: AgentForge
 copyright: Copyright © 2026 AgentForge Contributors
 
+publish:
+  provider: github
+  owner: thanhtuyen662002
+  repo: Agent-Forge
+
 directories:
   output: release
   buildResources: build

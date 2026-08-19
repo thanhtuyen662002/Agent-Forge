@@ -18,4 +18,8 @@ export default defineConfig({
     outDir: 'dist',
     emptyOutDir: true,
   },
+  test: {
+    testTimeout: 30000,
+    hookTimeout: 60000,
+  },
 });

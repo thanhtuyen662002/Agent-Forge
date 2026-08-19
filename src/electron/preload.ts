@@ -68,6 +68,13 @@ export interface OrchestratorApi {
   dispatchAuthorization: (authorizationId: string) => Promise<any>;
   getOwnerHandoffSnapshot: (taskId: string) => Promise<any>;
   generateAuthorizedWorkOrder: (authorizationId: string) => Promise<any>;
+
+  // PR #9: App Info & Updates
+  getAppInfo: () => Promise<any>;
+  getUpdateState: () => Promise<any>;
+  checkForUpdates: () => Promise<any>;
+  downloadUpdate: () => Promise<any>;
+  installAndRestartUpdate: () => Promise<any>;
 }
 
 const api: OrchestratorApi = {
@@ -110,6 +117,12 @@ const api: OrchestratorApi = {
     ipcRenderer.invoke('routing:getHandoffSnapshot', { taskId }),
   generateAuthorizedWorkOrder: (authorizationId: string) =>
     ipcRenderer.invoke('routing:generateAuthorizedWorkOrder', { authorizationId }),
+
+  getAppInfo: () => ipcRenderer.invoke('app:getInfo'),
+  getUpdateState: () => ipcRenderer.invoke('update:getState'),
+  checkForUpdates: () => ipcRenderer.invoke('update:check'),
+  downloadUpdate: () => ipcRenderer.invoke('update:download'),
+  installAndRestartUpdate: () => ipcRenderer.invoke('update:installAndRestart'),
 };
 
 contextBridge.exposeInMainWorld('orchestrator', api);
