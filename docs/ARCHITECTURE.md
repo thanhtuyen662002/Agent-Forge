@@ -357,17 +357,17 @@ Renderer Process                  Electron Main Process (Node.js)
 ```
 
 ### Safety, Isolation & Verification Rules
-1. **Owner-Controlled Execution**: Automatic background downloading (`autoDownload = false`) and stealth quit-and-install (`autoInstallOnAppQuit = false`) are disabled. The Owner explicitly triggers both download and installation.
-2. **Safe Restart Guard (`canSafelyRestart`)**: `UpdateService.installAndRestart()` verifies SQLite state before invoking the installer. If tasks in the active project are currently in `CODING`, `VALIDATING`, or `DISPATCHED` execution states, restart is safely blocked.
-3. **Strict IPC Boundary & Schema**:
+1. **Production Provider Configuration**: Production configuration (`electron-builder.yml`) specifies GitHub provider (`owner: thanhtuyen662002`, `repo: Agent-Forge`) with zero embedded tokens or secrets. Normal packaging commands (`package:win`, `package:win:dir`) and CI pipelines strictly enforce `--publish never`.
+2. **Dedicated Release Workflow**: `.github/workflows/release-windows.yml` is the sole publishing pipeline. It triggers strictly via manual `workflow_dispatch` (no `pull_request` triggers), verifies that the source commit matches `origin/main`, enforces fail-closed consistency between `package.json` version and input release tag, executes the full test and smoke suite, and publishes to GitHub Releases using `GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}` with `--publish always`.
+3. **Owner-Controlled Execution**: Automatic background downloading (`autoDownload = false`) and stealth quit-and-install (`autoInstallOnAppQuit = false`) are disabled. The Owner explicitly triggers both download and installation.
+4. **Safe Restart Guard (`canSafelyRestart`)**: `UpdateService.installAndRestart()` verifies SQLite state before invoking the installer. If tasks in the active project are currently in `CODING`, `VALIDATING`, or `DISPATCHED` execution states, restart is safely blocked.
+5. **Strict Error Semantics**: Network failures, adapter exceptions, and invalid feeds transition to and remain in `ERROR` state with sanitized error text. An error state is never masked or overwritten as `NO_UPDATE_AVAILABLE`.
+6. **Strict IPC Boundary & Schema**:
    - `update:getState`: Parameterless query returning structured `UpdateStateSummary`.
    - `update:check`: Parameterless query triggering update check.
    - `update:download`: Parameterless command triggering download of detected release.
    - `update:installAndRestart`: Parameterless command triggering installation.
    - Renderer cannot supply update URLs, executable paths, authorization tokens, or shell commands.
-4. **Secret Sanitization**: Error messages from update operations sanitize GitHub Personal Access Tokens (`ghp_*`), Bearer tokens, and URL embedded credentials before recording or returning to renderer.
-5. **Separation from Authorization Core**: The updater subsystem has zero authority to create, dispatch, or modify `ExecutionAuthorization` records or bypass security policies.
-6. **Packaging & Release Pipeline**:
-   - Packaged with `electron-builder` targeting Windows NSIS directory and installer.
-   - Normal PR and main branch builds enforce `--publish never`.
-   - Production releases are published strictly via dedicated release workflows.
+7. **Secret Sanitization**: Error messages from update operations sanitize GitHub Personal Access Tokens (`ghp_*`), Bearer tokens, passwords, and URL embedded credentials before recording or returning to renderer.
+8. **Separation from Authorization Core**: The updater subsystem has zero authority to create, dispatch, or modify `ExecutionAuthorization` records or bypass security policies.
+9. **Installed-App Integration Verification**: `scripts/test-installed-update-win.ps1` provides automated Windows integration proof by installing the real NSIS vA package, spinning up a local loopback update feed serving real `electron-builder` generated vB artifacts (`latest.yml`, `.exe`, `.blockmap`), launching the installed app, and verifying update discovery, download, and the `DOWNLOADED` (canInstall = true) gate.

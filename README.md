@@ -47,10 +47,14 @@ Language selection is preserved across reloads and application restarts. Protoco
 ## Installed-App Update Architecture
 
 Agent-Forge incorporates a secure, human-in-the-loop update foundation:
+- **Production Provider**: Configured with GitHub provider (`thanhtuyen662002/Agent-Forge`) in `electron-builder.yml` without embedded secrets.
+- **Publish Invariant**: Normal packaging (`package:win`, `package:win:dir`) and CI runs strictly enforce `--publish never`. Releases are published exclusively via manual `.github/workflows/release-windows.yml`.
 - **Zero Stealth Installs**: `autoDownload` and `autoInstallOnAppQuit` are disabled. The Owner decides when to check, download, and install.
+- **Strict Error Semantics**: Network failures and adapter errors transition to and remain in `ERROR` state with sanitized error text; they are never masked as `NO_UPDATE_AVAILABLE`.
 - **Active Work Guard**: The update service verifies SQLite state and blocks restart if any task is actively running (`CODING`, `VALIDATING`, `DISPATCHED`).
 - **Strict IPC Security**: No renderer-supplied URLs, executable paths, authorization tokens, or shell commands.
-- **Secret Redaction**: Error logs sanitize GitHub tokens and credentials before presentation.
+- **Secret Redaction**: Error logs sanitize GitHub tokens, passwords, Bearer tokens, and credentials before presentation.
+- **Installed Integration Proof**: Real Windows NSIS installed application update verified via `npm run test:installed:win` with local feed detection and download completion.
 
 ---
 

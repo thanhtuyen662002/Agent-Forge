@@ -15,6 +15,7 @@
     "package:win": "npm run build && npx @electron/rebuild -f -w better-sqlite3 && electron-builder --win nsis --publish never",
     "smoke:packaged:win": "powershell -ExecutionPolicy Bypass -File scripts/smoke-packaged-win.ps1",
     "smoke:dev:electron": "powershell -ExecutionPolicy Bypass -File scripts/smoke-dev-electron.ps1",
+    "test:installed:win": "powershell -ExecutionPolicy Bypass -File scripts/test-installed-update-win.ps1",
     "test": "vitest run",
     "test:watch": "vitest"
   },

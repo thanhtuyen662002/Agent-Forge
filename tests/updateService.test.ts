@@ -304,4 +304,154 @@ describe('UpdateService & Installed-App Update Domain (PR #9)', () => {
     expect((updateService as any).createAuthorization).toBeUndefined();
     expect((updateService as any).authorizeTask).toBeUndefined();
   });
+
+  describe('Mandatory Update Error Contract & Safety Tests (PR #9 Corrective 1)', () => {
+    it('26. network/check rejection results in final state ERROR', async () => {
+      mockAdapter.checkForUpdatesMock.mockRejectedValue(new Error('getaddrinfo ENOTFOUND github.com'));
+
+      const result = await updateService.checkForUpdates();
+      expect(result.state).toBe('ERROR');
+      expect(result.error).toContain('ENOTFOUND github.com');
+      expect(updateService.getState().state).toBe('ERROR');
+    });
+
+    it('27. adapter check throws synchronously/asynchronously results in final state ERROR', async () => {
+      mockAdapter.checkForUpdatesMock.mockImplementation(() => {
+        throw new Error('HttpError: 503 Service Unavailable');
+      });
+
+      const result = await updateService.checkForUpdates();
+      expect(result.state).toBe('ERROR');
+      expect(result.error).toContain('503 Service Unavailable');
+    });
+
+    it('28. check error is sanitized of tokens, basic credentials, and long query strings', async () => {
+      mockAdapter.checkForUpdatesMock.mockRejectedValue(
+        new Error('Failed request to https://ghp_mySuperSecretToken12345@api.github.com/repos/thanhtuyen662002/Agent-Forge/releases with Bearer secret.jwt.token')
+      );
+
+      const result = await updateService.checkForUpdates();
+      expect(result.state).toBe('ERROR');
+      expect(result.error).not.toContain('ghp_mySuperSecretToken12345');
+      expect(result.error).not.toContain('secret.jwt.token');
+      expect(result.error).toContain('[REDACTED_TOKEN]');
+      expect(result.error).toContain('Bearer [REDACTED]');
+    });
+
+    it('29. ERROR is NOT overwritten with NO_UPDATE_AVAILABLE when check fails', async () => {
+      // Simulate adapter emitting an error AND returning null/throwing
+      mockAdapter.checkForUpdatesMock.mockImplementation(async () => {
+        mockAdapter.emit('error', new Error('Feed parse error: invalid YAML'));
+        throw new Error('Feed parse error: invalid YAML');
+      });
+
+      const result = await updateService.checkForUpdates();
+      expect(result.state).toBe('ERROR');
+      expect(result.state).not.toBe('NO_UPDATE_AVAILABLE');
+      expect(updateService.getState().state).toBe('ERROR');
+    });
+
+    it('30. genuine successful no-update check sets final state NO_UPDATE_AVAILABLE', async () => {
+      mockAdapter.checkForUpdatesMock.mockImplementation(async () => {
+        mockAdapter.emit('update-not-available', { version: '0.1.0' });
+        return { updateInfo: null };
+      });
+
+      const result = await updateService.checkForUpdates();
+      expect(result.state).toBe('NO_UPDATE_AVAILABLE');
+      expect(result.error).toBeNull();
+      expect(result.updateInfo).toBeNull();
+    });
+
+    it('31. genuine newer version available sets final state UPDATE_AVAILABLE with metadata', async () => {
+      mockAdapter.checkForUpdatesMock.mockImplementation(async () => {
+        const info = {
+          version: '0.1.1',
+          releaseDate: '2026-08-20T00:00:00Z',
+          releaseNotes: 'Performance improvements and bug fixes',
+          releaseName: 'v0.1.1',
+        };
+        mockAdapter.emit('update-available', info);
+        return { updateInfo: info };
+      });
+
+      const result = await updateService.checkForUpdates();
+      expect(result.state).toBe('UPDATE_AVAILABLE');
+      expect(result.updateInfo?.version).toBe('0.1.1');
+      expect(result.updateInfo?.releaseName).toBe('v0.1.1');
+    });
+
+    it('32. retry after recoverable ERROR can successfully check again and reach UPDATE_AVAILABLE or NO_UPDATE_AVAILABLE', async () => {
+      // Step 1: Fail with ERROR
+      mockAdapter.checkForUpdatesMock.mockRejectedValueOnce(new Error('Transient ETIMEDOUT'));
+      const failResult = await updateService.checkForUpdates();
+      expect(failResult.state).toBe('ERROR');
+      expect(failResult.error).toContain('Transient ETIMEDOUT');
+
+      // Step 2: Retry succeeds with newer version
+      mockAdapter.checkForUpdatesMock.mockImplementationOnce(async () => {
+        const info = { version: '0.1.1' };
+        mockAdapter.emit('update-available', info);
+        return { updateInfo: info };
+      });
+
+      const retryResult = await updateService.checkForUpdates();
+      expect(retryResult.state).toBe('UPDATE_AVAILABLE');
+      expect(retryResult.error).toBeNull();
+      expect(retryResult.updateInfo?.version).toBe('0.1.1');
+    });
+
+    it('33. no crash during application bootstrap if updater initialization/check is unavailable', () => {
+      // Uninitialized / unconfigured service in packaged mode
+      const unconfiguredService = new UpdateService({
+        currentVersion: '0.1.0',
+        isPackaged: true,
+      });
+
+      expect(() => unconfiguredService.getState()).not.toThrow();
+      expect(unconfiguredService.getState().state).toBe('IDLE');
+    });
+  });
+
+  describe('Static Packaging & Release Configuration Invariants', () => {
+    it('34. electron-builder.yml configures GitHub production update provider without credentials', async () => {
+      const fs = await import('fs');
+      const path = await import('path');
+      const configPath = path.resolve(__dirname, '../electron-builder.yml');
+      const content = fs.readFileSync(configPath, 'utf8');
+
+      expect(content).toMatch(/provider:\s*github/);
+      expect(content).toMatch(/owner:\s*thanhtuyen662002/);
+      expect(content).toMatch(/repo:\s*Agent-Forge/);
+
+      // Verify no tokens or credentials
+      expect(content).not.toMatch(/ghp_/);
+      expect(content).not.toMatch(/token/i);
+      expect(content).not.toMatch(/password/i);
+      expect(content).not.toMatch(/Authorization/i);
+    });
+
+    it('35. package.json packaging scripts strictly enforce --publish never for normal builds', async () => {
+      const fs = await import('fs');
+      const path = await import('path');
+      const pkgPath = path.resolve(__dirname, '../package.json');
+      const pkg = JSON.parse(fs.readFileSync(pkgPath, 'utf8'));
+
+      expect(pkg.scripts['package:win']).toContain('--publish never');
+      expect(pkg.scripts['package:win:dir']).toContain('--publish never');
+    });
+
+    it('36. release-windows.yml has no pull_request trigger, requires workflow_dispatch, and enforces fail-closed version consistency', async () => {
+      const fs = await import('fs');
+      const path = await import('path');
+      const releaseYmlPath = path.resolve(__dirname, '../.github/workflows/release-windows.yml');
+      expect(fs.existsSync(releaseYmlPath)).toBe(true);
+
+      const content = fs.readFileSync(releaseYmlPath, 'utf8');
+      expect(content).toMatch(/workflow_dispatch:/);
+      expect(content).not.toMatch(/pull_request:/);
+      expect(content).toMatch(/VERSION MISMATCH FAIL-CLOSED/);
+      expect(content).toMatch(/--publish always/);
+    });
+  });
 });

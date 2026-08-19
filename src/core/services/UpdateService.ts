@@ -174,8 +174,10 @@ export class UpdateService extends EventEmitter {
     try {
       const result = await this.adapter.checkForUpdates();
       if (!result || !result.updateInfo) {
-        this.state = 'NO_UPDATE_AVAILABLE';
-        this.lastCheckedAt = new Date().toISOString();
+        if (this.state === 'CHECKING') {
+          this.state = 'NO_UPDATE_AVAILABLE';
+          this.lastCheckedAt = new Date().toISOString();
+        }
       }
     } catch (err: any) {
       this.state = 'ERROR';

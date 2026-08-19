@@ -152,6 +152,11 @@ jobs:
       - name: Generate Windows NSIS installer
         run: npm run package:win
 
+      - name: Run real Windows installed application update integration test
+        shell: pwsh
+        run: |
+          npm run test:installed:win -- -Headless
+
       - name: Verify installer and generate metadata
         shell: pwsh
         run: |

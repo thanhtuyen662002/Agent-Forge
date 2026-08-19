@@ -1,0 +1,171 @@
+name: Release Windows Desktop
+
+on:
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: 'Release tag to publish (e.g. v0.1.1)'
+        required: true
+        type: string
+
+concurrency:
+  group: agentforge-release-windows
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+jobs:
+  release-windows:
+    name: Build & Publish Windows Release (windows-latest, Node 22.x)
+    runs-on: windows-latest
+    steps:
+      - name: Verify release trigger authorization
+        shell: pwsh
+        run: |
+          if ('${{ github.event_name }}' -ne 'workflow_dispatch') {
+            Write-Error "Release workflow must ONLY be triggered via manual workflow_dispatch."
+            exit 1
+          }
+          $tag = '${{ inputs.release_tag }}'.Trim()
+          if (-not $tag -or $tag -notmatch '^v?[0-9]+\.[0-9]+\.[0-9]+') {
+            Write-Error "Invalid release tag format: '$tag'. Expected format: 'vX.Y.Z' or 'X.Y.Z'."
+            exit 1
+          }
+          Write-Host "Authorized workflow_dispatch release trigger for tag: $tag"
+
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Verify source commit is on main branch
+        shell: bash
+        run: |
+          echo "=== Release Source Verification ==="
+          git fetch origin main
+          MAIN_SHA="$(git rev-parse origin/main)"
+          CURRENT_SHA="$(git rev-parse HEAD)"
+          echo "Origin Main SHA: $MAIN_SHA"
+          echo "Current HEAD SHA: $CURRENT_SHA"
+          if [ "$CURRENT_SHA" != "$MAIN_SHA" ]; then
+            echo "ERROR: Release source commit ($CURRENT_SHA) does not match origin/main ($MAIN_SHA)."
+            echo "Releases must be built strictly from verified main branch."
+            exit 1
+          fi
+          echo "Main branch source verification: PASS"
+
+      - name: Verify version and tag consistency (Fail-Closed)
+        shell: pwsh
+        run: |
+          $pkgJson = Get-Content -Path "package.json" -Raw | ConvertFrom-Json
+          $pkgVersion = $pkgJson.version.Trim()
+          $rawTag = '${{ inputs.release_tag }}'.Trim()
+          $normalizedTag = $rawTag.TrimStart('v')
+
+          Write-Host "Package version: $pkgVersion"
+          Write-Host "Input release tag: $rawTag (normalized: $normalizedTag)"
+
+          if ($pkgVersion -ne $normalizedTag) {
+            Write-Error "VERSION MISMATCH FAIL-CLOSED: package.json version ($pkgVersion) does not match release tag ($rawTag)."
+            exit 1
+          }
+          Write-Host "Version/tag consistency check: PASS"
+
+      - name: Setup Node.js 22.x
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22.x'
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Run test suite
+        run: npm test
+
+      - name: Build application
+        run: npm run build
+
+      - name: Verify generated relative asset base
+        shell: pwsh
+        run: |
+          $html = Get-Content -Path "dist\index.html" -Raw
+          if ($html -match 'src="/assets/' -or $html -match 'href="/assets/') {
+            Write-Error "dist\index.html contains root-absolute asset paths (/assets/). Must use relative paths."
+            exit 1
+          }
+          Write-Host "dist\index.html relative asset path check: PASS"
+
+      - name: Generate unpacked Windows directory
+        run: npm run package:win:dir
+
+      - name: Run packaged process runtime smoke
+        shell: pwsh
+        run: |
+          npm run smoke:packaged:win -- -Headless
+
+      - name: Build and Publish Windows NSIS Release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          Write-Host "Publishing Windows release to GitHub Releases for repository thanhtuyen662002/Agent-Forge..."
+          npx electron-builder --win --publish always
+
+      - name: Verify published installer and metadata
+        shell: pwsh
+        run: |
+          $pkgJson = Get-Content -Path "package.json" -Raw | ConvertFrom-Json
+          $ver = $pkgJson.version
+          $installerPath = "release\AgentForge Setup $ver.exe"
+          if (-not (Test-Path $installerPath)) {
+            Write-Error "Published installer executable not found at $installerPath"
+            exit 1
+          }
+
+          $hash = (Get-FileHash -Path $installerPath -Algorithm SHA256).Hash
+          $size = (Get-Item $installerPath).Length
+          $sha = (git rev-parse HEAD).Trim()
+          $sig = Get-AuthenticodeSignature -FilePath $installerPath
+          $sigStatus = $sig.Status.ToString()
+          $codeSigned = if ($sig.Status -eq "Valid") { "YES" } else { "NO" }
+
+          Write-Host "=== Release Windows Installer Verification ==="
+          Write-Host "Installer: $installerPath"
+          Write-Host "Size: $size bytes"
+          Write-Host "SHA256: $hash"
+          Write-Host "Authenticode Status: $sigStatus"
+          Write-Host "Code Signed: $codeSigned"
+          Write-Host "Source SHA: $sha"
+
+          $metadataContent = @"
+          SOURCE_SHA=$sha
+          RELEASE_TAG=${{ inputs.release_tag }}
+          APP_VERSION=$ver
+          INSTALLER_FILENAME=AgentForge Setup $ver.exe
+          INSTALLER_SIZE_BYTES=$size
+          INSTALLER_SHA256=$hash
+          AUTHENTICODE_STATUS=$sigStatus
+          CODE_SIGNED=$codeSigned
+          BUILD_OS=windows-latest
+          PUBLISHED_PROVIDER=github
+          PUBLISHED_REPO=thanhtuyen662002/Agent-Forge
+          "@
+
+          Set-Content -Path "release\release-metadata.txt" -Value $metadataContent
+
+      - name: Upload Release Step Summary
+        if: always()
+        shell: bash
+        run: |
+          echo "### AgentForge Windows Release Summary" >> $GITHUB_STEP_SUMMARY
+          echo "- **Exact Published Commit**: \`$(git rev-parse HEAD)\`" >> $GITHUB_STEP_SUMMARY
+          echo "- **Release Tag**: \`${{ inputs.release_tag }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "- **Publish Status**: \`${{ job.status }}\`" >> $GITHUB_STEP_SUMMARY
+          if [ -f "release/release-metadata.txt" ]; then
+            echo '```text' >> $GITHUB_STEP_SUMMARY
+            cat release/release-metadata.txt >> $GITHUB_STEP_SUMMARY
+            echo '```' >> $GITHUB_STEP_SUMMARY
+          fi

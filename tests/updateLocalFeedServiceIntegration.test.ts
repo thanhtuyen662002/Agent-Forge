@@ -63,7 +63,12 @@ class ControlledHttpUpdaterAdapter extends EventEmitter implements IUpdateAdapte
   }
 }
 
-describe('Installed Application Update Integration Proof (PR #9)', () => {
+/**
+ * SERVICE_LEVEL_LOCAL_FEED_SIMULATION
+ * Exercises UpdateService state transitions against a simulated local HTTP update feed.
+ * Note: This test exercises the service and mock adapter layer, not the real NSIS packaged binary.
+ */
+describe('UpdateService Local Feed Simulation (PR #9)', () => {
   let server: http.Server;
   let serverPort: number;
   const mockReleaseMeta = {

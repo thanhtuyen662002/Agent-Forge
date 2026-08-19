@@ -57,7 +57,7 @@ export class ElectronUpdaterAdapter extends EventEmitter implements IUpdateAdapt
       };
     } catch (err) {
       this.emit('error', err);
-      return null;
+      throw err;
     }
   }
 

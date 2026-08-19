@@ -147,9 +147,26 @@ try {
     Write-Error "App version was not reported."
     exit 1
   }
-  Write-Host "[6/7] UpdateService initialized & App Version verified ($($report.appVersion)): PASS"
+  Write-Host "[6/8] UpdateService initialized & App Version verified ($($report.appVersion)): PASS"
 
-  # 7. Window Handle & Title Inspection (Local/Interactive Mode)
+  # 7. Packaged Update Configuration (app-update.yml) Guard
+  $appUpdateYmlPath = Join-Path $projectRoot "release\win-unpacked\resources\app-update.yml"
+  if (-not (Test-Path $appUpdateYmlPath)) {
+    Write-Error "Packaged update configuration was not found at '$appUpdateYmlPath'."
+    exit 1
+  }
+  $appUpdateContent = Get-Content -Path $appUpdateYmlPath -Raw
+  if ($appUpdateContent -notmatch "provider:\s*github" -or $appUpdateContent -notmatch "owner:\s*thanhtuyen662002" -or $appUpdateContent -notmatch "repo:\s*Agent-Forge") {
+    Write-Error "Packaged app-update.yml does not match expected production GitHub provider/repository identity."
+    exit 1
+  }
+  if ($appUpdateContent -match "ghp_" -or $appUpdateContent -match "token" -or $appUpdateContent -match "password" -or $appUpdateContent -match "Authorization" -or $appUpdateContent -match "Bearer") {
+    Write-Error "SECURITY VIOLATION: Packaged app-update.yml contains credentials/secrets!"
+    exit 1
+  }
+  Write-Host "[7/8] Packaged Update Configuration verified (provider: github, owner: thanhtuyen662002, repo: Agent-Forge, no secrets): PASS"
+
+  # 8. Window Handle & Title Inspection (Local/Interactive Mode)
   if (-not $Headless) {
     $proc.Refresh()
     $handle = $proc.MainWindowHandle
@@ -163,12 +180,12 @@ try {
       Write-Error "Window title mismatch: '$($report.windowTitle)'"
       exit 1
     }
-    Write-Host "[7/7] Window title verified ('$($report.windowTitle)') with handle ($handle): PASS"
+    Write-Host "[8/8] Window title verified ('$($report.windowTitle)') with handle ($handle): PASS"
   } else {
-    Write-Host "[7/7] Headless mode: verified window title from Electron main report ('$($report.windowTitle)'): PASS"
+    Write-Host "[8/8] Headless mode: verified window title from Electron main report ('$($report.windowTitle)'): PASS"
   }
 
-  Write-Host "=== Packaged Runtime Smoke Test: SUCCESS (All 7 Gates Passed) ==="
+  Write-Host "=== Packaged Runtime Smoke Test: SUCCESS (All 8 Gates Passed) ==="
 
 } finally {
   # Clean termination of test process
