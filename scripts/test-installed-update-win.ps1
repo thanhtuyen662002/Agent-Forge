@@ -330,7 +330,6 @@ files:
   - dist/**
   - dist-electron/**
   - package.json
-  - node_modules/**
 asar: true
 asarUnpack:
   - node_modules/better-sqlite3/**
@@ -392,7 +391,6 @@ files:
   - dist/**
   - dist-electron/**
   - package.json
-  - node_modules/**
 asar: true
 asarUnpack:
   - node_modules/better-sqlite3/**
