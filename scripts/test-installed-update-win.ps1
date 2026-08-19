@@ -69,36 +69,73 @@ try {
   const electron = require('electron');
   const path = require('path');
   const fs = require('fs');
-  electron.app.whenReady().then(() => {
-    setTimeout(() => {
+
+  function startMonitoring() {
+    const ud = process.env.AGENT_FORGE_DATA_DIR || electron.app.getPath('userData');
+    const rPath = path.join(ud, 'update-test-result.json');
+    const debugPath = path.join(ud, 'update-test-debug.log');
+
+    function log(msg) {
+      try {
+        fs.appendFileSync(debugPath, '[' + new Date().toISOString() + '] ' + msg + '\n', 'utf-8');
+      } catch (e) {}
+    }
+
+    log('Test instrumentation started. Polling for updateServiceInstance...');
+
+    let attempts = 0;
+    const maxAttempts = 60; // 30 seconds
+
+    const pollInterval = setInterval(() => {
+      attempts++;
       try {
         if (typeof updateServiceInstance !== 'undefined' && updateServiceInstance) {
+          clearInterval(pollInterval);
+          log('updateServiceInstance acquired successfully.');
           const svc = updateServiceInstance;
-          const ud = process.env.AGENT_FORGE_DATA_DIR || electron.app.getPath('userData');
-          const rPath = path.join(ud, 'update-test-result.json');
-          try { fs.writeFileSync(rPath, JSON.stringify({ state: 'CHECKING' }, null, 2), 'utf-8'); } catch (e) {}
+
+          try {
+            fs.writeFileSync(rPath, JSON.stringify({ state: 'CHECKING' }, null, 2), 'utf-8');
+          } catch (e) {}
+
           svc.on('state-changed', (st) => {
+            log('UpdateService state-changed: ' + JSON.stringify(st));
             try {
               fs.writeFileSync(rPath, JSON.stringify(st, null, 2), 'utf-8');
             } catch (e) {}
             if (st.state === 'UPDATE_AVAILABLE') {
+              log('Triggering downloadUpdate()...');
               svc.downloadUpdate().catch((err) => {
+                log('downloadUpdate error: ' + String(err));
                 try {
                   fs.writeFileSync(rPath, JSON.stringify({ state: 'ERROR', error: String(err) }, null, 2), 'utf-8');
                 } catch (e) {}
               });
             }
           });
+
+          log('Triggering checkForUpdates()...');
           svc.checkForUpdates().catch((err) => {
+            log('checkForUpdates error: ' + String(err));
             try {
               fs.writeFileSync(rPath, JSON.stringify({ state: 'ERROR', error: String(err) }, null, 2), 'utf-8');
             } catch (e) {}
           });
+        } else if (attempts >= maxAttempts) {
+          clearInterval(pollInterval);
+          log('Timed out waiting for updateServiceInstance initialization.');
+          try {
+            fs.writeFileSync(rPath, JSON.stringify({ state: 'ERROR', error: 'Timed out waiting for updateServiceInstance initialization' }, null, 2), 'utf-8');
+          } catch (e) {}
         }
       } catch (err) {
-        console.error('[TestInstrumentation] Error:', err);
+        log('Error in poll interval: ' + String(err));
       }
-    }, 1000);
+    }, 500);
+  }
+
+  electron.app.whenReady().then(() => {
+    startMonitoring();
   });
 })();
 "@
@@ -267,6 +304,11 @@ server.listen($testPort, '127.0.0.1', () => {
 
   # 6. Launch installed vA under test harness
   Write-Host "Launching installed TEST vA process..."
+  $env:APPDATA = $testDataDir
+  $env:LOCALAPPDATA = $testDataDir
+  $env:AGENT_FORGE_DATA_DIR = $testDataDir
+  $env:AGENT_FORGE_SMOKE_MODE = "1"
+
   $startInfo = New-Object System.Diagnostics.ProcessStartInfo
   $startInfo.FileName = $installedExe
   $startInfo.WorkingDirectory = $testDataDir
@@ -278,6 +320,7 @@ server.listen($testPort, '127.0.0.1', () => {
 
   $appProc = [System.Diagnostics.Process]::Start($startInfo)
   $resultFile = Join-Path $testDataDir "update-test-result.json"
+  $debugLogFile = Join-Path $testDataDir "update-test-debug.log"
 
   Write-Host "Waiting for update check, download, and verification (up to 120s)..."
   $timeout = 120
@@ -303,14 +346,31 @@ server.listen($testPort, '127.0.0.1', () => {
         }
       } catch {}
     }
+
+    if ($appProc.HasExited -and -not (Test-Path $resultFile)) {
+      if (Test-Path $debugLogFile) {
+        Write-Host "--- Process Debug Log ---"
+        Get-Content -Path $debugLogFile | ForEach-Object { Write-Host "  $_" }
+      }
+      Write-Error "Installed process exited prematurely with exit code: $($appProc.ExitCode)"
+      exit 1
+    }
   }
 
   if ($null -eq $finalResult) {
+    if (Test-Path $debugLogFile) {
+      Write-Host "--- Process Debug Log ---"
+      Get-Content -Path $debugLogFile | ForEach-Object { Write-Host "  $_" }
+    }
     Write-Error "Update integration test timed out after $timeout seconds without reaching DOWNLOADED state."
     exit 1
   }
 
   if ($finalResult.state -eq 'ERROR') {
+    if (Test-Path $debugLogFile) {
+      Write-Host "--- Process Debug Log ---"
+      Get-Content -Path $debugLogFile | ForEach-Object { Write-Host "  $_" }
+    }
     Write-Error "Update integration test encountered error: $($finalResult.error)"
     exit 1
   }
@@ -365,7 +425,7 @@ server.listen($testPort, '127.0.0.1', () => {
   }
 
   # Restore node environment bindings for local CLI/Vitest execution
-  cmd.exe /c "npm rebuild better-sqlite3" 2>$null | Out-Null
+  cmd.exe /c "npm rebuild better-sqlite3 >nul 2>&1"
 }
 
 exit 0
