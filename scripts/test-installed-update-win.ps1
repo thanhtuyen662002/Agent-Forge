@@ -62,9 +62,16 @@ try {
   cmd /c mklink /J "$tempAppDirA\node_modules" "$projectRoot\node_modules" | Out-Null
 
   # Inject temporary test-only instrumentation directly into the isolated TEST copy of main.js
+  $escapedTestDataDir = $testDataDir -replace '\\', '/'
   $mainJsPath = "$tempAppDirA\dist-electron\electron\main.js"
   $mainJsContent = Get-Content -Path $mainJsPath -Raw
-  $target = "createWindow(userDataDir);"
+  $target = "createWindow(userDataDir);`n    electron_1.app.on"
+
+  if (-not $mainJsContent.Contains($target)) {
+    # Normalize CRLF to LF
+    $mainJsContent = $mainJsContent -replace "`r`n", "`n"
+  }
+
   if (-not $mainJsContent.Contains($target)) {
     Write-Error "Cannot locate '$target' in $mainJsPath for test instrumentation injection."
     exit 1
@@ -74,8 +81,9 @@ try {
 createWindow(userDataDir);
     // --- TEST-ONLY HARNESS INSTRUMENTATION (ISOLATED IN TEMP TEST ARTIFACT) ---
     (function runTestUpdateMonitor() {
-        const debugPath = path_1.default.join(userDataDir, 'update-test-debug.log');
-        const rPath = path_1.default.join(userDataDir, 'update-test-result.json');
+        const dataDir = '$escapedTestDataDir';
+        const debugPath = path_1.default.join(dataDir, 'update-test-debug.log');
+        const rPath = path_1.default.join(dataDir, 'update-test-result.json');
         function log(msg) {
             try {
                 fs_1.default.appendFileSync(debugPath, '[' + new Date().toISOString() + '] ' + msg + '\n', 'utf-8');
@@ -88,7 +96,11 @@ createWindow(userDataDir);
             log('Unhandled Rejection: ' + (reason && reason.stack ? reason.stack : String(reason)));
         });
 
-        log('Test update monitor initialized in isolated test artifact.');
+        log('Test update monitor initialized. Explicit dataDir: ' + dataDir);
+        log('updateServiceInstance state: ' + (updateServiceInstance ? 'EXISTS' : 'NULL'));
+        log('userDataDir from process: ' + userDataDir);
+        log('isPackaged: ' + electron_1.app.isPackaged);
+
         if (!updateServiceInstance) {
             log('Error: updateServiceInstance is null.');
             try {
@@ -125,6 +137,7 @@ createWindow(userDataDir);
             } catch (e) {}
         });
     })();
+    electron_1.app.on
 "@
 
   $mainJsContent = $mainJsContent.Replace($target, $testObserverCode)
@@ -159,6 +172,7 @@ win:
 nsis:
   oneClick: false
   perMachine: false
+  allowToChangeInstallationDirectory: true
   runAfterFinish: false
 "@
   Set-Content -Path $configPathA -Value $builderConfigA -Encoding utf8
@@ -207,6 +221,7 @@ win:
 nsis:
   oneClick: false
   perMachine: false
+  allowToChangeInstallationDirectory: true
   runAfterFinish: false
 "@
   Set-Content -Path $configPathB -Value $builderConfigB -Encoding utf8
