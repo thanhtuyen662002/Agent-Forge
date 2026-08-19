@@ -115,8 +115,8 @@ try {
   $diagData.stage = "SETUP_TEST_CONTEXT"
   Save-Diagnostics
 
-  # Create isolated scratch working directories
-  $tempRoot = Join-Path ([System.IO.Path]::GetTempPath()) ("af-update-test-" + [Guid]::NewGuid().ToString())
+  # Create isolated scratch working directories on the same drive/volume as project root
+  $tempRoot = Join-Path $projectRoot ("release\installed-update-test\temp-" + [Guid]::NewGuid().ToString())
   $tempAppDirA = Join-Path $tempRoot "app-vA"
   $tempOutDirA = Join-Path $tempRoot "out-vA"
   $tempAppDirB = Join-Path $tempRoot "app-vB"
@@ -732,6 +732,10 @@ finally {
     try {
       [System.GC]::Collect()
       [System.GC]::WaitForPendingFinalizers()
+      $juncA = Join-Path $tempRoot "app-vA\node_modules"
+      $juncB = Join-Path $tempRoot "app-vB\node_modules"
+      if (Test-Path $juncA) { cmd /c rmdir "$juncA" 2>$null | Out-Null }
+      if (Test-Path $juncB) { cmd /c rmdir "$juncB" 2>$null | Out-Null }
       Remove-Item -Path $tempRoot -Recurse -Force -ErrorAction SilentlyContinue
     } catch {}
   }
