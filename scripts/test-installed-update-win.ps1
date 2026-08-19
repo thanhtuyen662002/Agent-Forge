@@ -138,11 +138,10 @@ try {
     }, 500);
   }
 
-  if (electron.app && typeof electron.app.isReady === 'function' && electron.app.isReady()) {
-    startMonitoring();
-  } else if (electron.app && typeof electron.app.whenReady === 'function') {
+  if (electron.app && typeof electron.app.whenReady === 'function') {
     electron.app.whenReady().then(() => {
-      startMonitoring();
+      // Defer past the current whenReady .then() chain so global.__agentForgeUpdateService is set first
+      setTimeout(() => { startMonitoring(); }, 500);
     });
   }
 })();
