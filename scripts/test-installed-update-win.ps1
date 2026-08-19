@@ -62,6 +62,7 @@ try {
   cmd /c mklink /J "$tempAppDirA\node_modules" "$projectRoot\node_modules" | Out-Null
 
   # Inject temporary test-only instrumentation into the isolated TEST copy of main.js
+  $escapedTestDataDir = $testDataDir -replace '\\', '/'
   $testObserverSnippet = @"
 
 // --- TEST-ONLY HARNESS INSTRUMENTATION (ISOLATED IN TEMP TEST ARTIFACT) ---
@@ -70,19 +71,21 @@ try {
   const path = require('path');
   const fs = require('fs');
 
+  const explicitDataDir = '$escapedTestDataDir';
+  const ud = process.env.AGENT_FORGE_DATA_DIR || explicitDataDir || electron.app.getPath('userData');
+  const rPath = path.join(explicitDataDir, 'update-test-result.json');
+  const debugPath = path.join(explicitDataDir, 'update-test-debug.log');
+
+  function log(msg) {
+    try {
+      fs.appendFileSync(debugPath, '[' + new Date().toISOString() + '] ' + msg + '\n', 'utf-8');
+    } catch (e) {}
+  }
+
+  log('Test instrumentation script loaded in TEST vA copy.');
+
   function startMonitoring() {
-    const ud = process.env.AGENT_FORGE_DATA_DIR || electron.app.getPath('userData');
-    const rPath = path.join(ud, 'update-test-result.json');
-    const debugPath = path.join(ud, 'update-test-debug.log');
-
-    function log(msg) {
-      try {
-        fs.appendFileSync(debugPath, '[' + new Date().toISOString() + '] ' + msg + '\n', 'utf-8');
-      } catch (e) {}
-    }
-
-    log('Test instrumentation started. Polling for updateServiceInstance...');
-
+    log('startMonitoring running. Polling for updateServiceInstance...');
     let attempts = 0;
     const maxAttempts = 60; // 30 seconds
 
@@ -134,9 +137,13 @@ try {
     }, 500);
   }
 
-  electron.app.whenReady().then(() => {
+  if (electron.app && typeof electron.app.isReady === 'function' && electron.app.isReady()) {
     startMonitoring();
-  });
+  } else if (electron.app && typeof electron.app.whenReady === 'function') {
+    electron.app.whenReady().then(() => {
+      startMonitoring();
+    });
+  }
 })();
 "@
   Add-Content -Path "$tempAppDirA\dist-electron\electron\main.js" -Value $testObserverSnippet -Encoding utf8
@@ -170,6 +177,7 @@ win:
 nsis:
   oneClick: false
   perMachine: false
+  runAfterFinish: false
 "@
   Set-Content -Path $configPathA -Value $builderConfigA -Encoding utf8
 
@@ -217,36 +225,45 @@ win:
 nsis:
   oneClick: false
   perMachine: false
+  runAfterFinish: false
 "@
   Set-Content -Path $configPathB -Value $builderConfigB -Encoding utf8
 
   # Run electron-builder to generate real vB artifacts
   cmd.exe /c "npx electron-builder --win -c `"$configPathB`" --project `"$tempAppDirB`" --publish never" | Out-Null
 
-  $latestYmlPath = Join-Path $testFeedDir "latest.yml"
+  $latestYml = Join-Path $testFeedDir "latest.yml"
   $installerB = Join-Path $testFeedDir "AgentForge Setup 0.1.1.exe"
-  if (-not (Test-Path $latestYmlPath) -or -not (Test-Path $installerB)) {
-    Write-Error "Failed to generate real vB update feed artifacts in $testFeedDir"
+  if (-not (Test-Path $latestYml) -or -not (Test-Path $installerB)) {
+    Write-Error "Failed to generate TEST vB (0.1.1) release artifacts in $testFeedDir"
     exit 1
   }
   Write-Host "[2/6] Real vB update metadata (latest.yml) and NSIS binary (0.1.1) generated: PASS"
 
-  # 3. Spin up local HTTP feed server
-  $encodedFeedDir = ($testFeedDir -replace '\\', '/').Trim()
+  # 3. Spin up local HTTP static file server serving the vB update feed
   $serverCode = @"
 const http = require('http');
 const fs = require('fs');
 const path = require('path');
 
-const feedDir = "$encodedFeedDir";
+const feedDir = '$($testFeedDir -replace '\\', '/\')';
 const server = http.createServer((req, res) => {
-  const cleanUrl = req.url.split('?')[0];
-  const relativePath = cleanUrl.startsWith('/') ? cleanUrl.substring(1) : cleanUrl;
-  const filePath = path.join(feedDir, decodeURIComponent(relativePath));
+  const cleanUrl = req.url.split('?')[0].replace(/^\//, '');
+  const decodedPath = decodeURIComponent(cleanUrl);
+  const filePath = path.join(feedDir, decodedPath);
+
   if (fs.existsSync(filePath) && fs.statSync(filePath).isFile()) {
+    const ext = path.extname(filePath).toLowerCase();
+    let contentType = 'application/octet-stream';
+    if (ext === '.yml' || ext === '.yaml') contentType = 'text/yaml';
+    if (ext === '.json') contentType = 'application/json';
+    if (ext === '.exe') contentType = 'application/x-msdownload';
+
+    const stat = fs.statSync(filePath);
     res.writeHead(200, {
-      'Content-Type': cleanUrl.endsWith('.yml') ? 'text/yaml' : 'application/octet-stream',
-      'Content-Length': fs.statSync(filePath).size,
+      'Content-Type': contentType,
+      'Content-Length': stat.size,
+      'Access-Control-Allow-Origin': '*'
     });
     fs.createReadStream(filePath).pipe(res);
   } else {
@@ -278,6 +295,10 @@ server.listen($testPort, '127.0.0.1', () => {
   Write-Host "[3/6] Local HTTP update feed server running on port $($testPort): PASS"
 
   # 4. Install real TEST vA into isolated test location
+  # Terminate any previously running instances before installation
+  Get-Process -Name "AgentForge" -ErrorAction SilentlyContinue | Stop-Process -Force
+  Start-Sleep -Seconds 1
+
   Write-Host "Installing real TEST vA application silently into $testInstallDir..."
   $installProc = Start-Process -FilePath $installerA -ArgumentList "/S", "/D=$testInstallDir" -PassThru -Wait
   Start-Sleep -Seconds 2
@@ -303,6 +324,10 @@ server.listen($testPort, '127.0.0.1', () => {
   Write-Host "[5/6] Installed app-update.yml verified (provider: generic, url: http://127.0.0.1:$testPort/, UNMODIFIED after install): PASS"
 
   # 6. Launch installed vA under test harness
+  # Ensure clean slate process state
+  Get-Process -Name "AgentForge" -ErrorAction SilentlyContinue | Stop-Process -Force
+  Start-Sleep -Seconds 1
+
   Write-Host "Launching installed TEST vA process..."
   $env:APPDATA = $testDataDir
   $env:LOCALAPPDATA = $testDataDir
@@ -316,6 +341,12 @@ server.listen($testPort, '127.0.0.1', () => {
   $startInfo.EnvironmentVariables["LOCALAPPDATA"] = $testDataDir
   $startInfo.EnvironmentVariables["AGENT_FORGE_DATA_DIR"] = $testDataDir
   $startInfo.EnvironmentVariables["AGENT_FORGE_SMOKE_MODE"] = "1"
+  if ($null -ne $startInfo.Environment) {
+    $startInfo.Environment["APPDATA"] = $testDataDir
+    $startInfo.Environment["LOCALAPPDATA"] = $testDataDir
+    $startInfo.Environment["AGENT_FORGE_DATA_DIR"] = $testDataDir
+    $startInfo.Environment["AGENT_FORGE_SMOKE_MODE"] = "1"
+  }
   $startInfo.UseShellExecute = $false
 
   $appProc = [System.Diagnostics.Process]::Start($startInfo)
