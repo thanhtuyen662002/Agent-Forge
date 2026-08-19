@@ -82,6 +82,29 @@ function Save-Diagnostics {
   }
 }
 
+function Get-Sha256Hex {
+  param(
+    [Parameter(Mandatory = $true)]
+    [string]$Path
+  )
+
+  $sha256 = [System.Security.Cryptography.SHA256]::Create()
+  try {
+    $stream = [System.IO.File]::OpenRead($Path)
+    try {
+      $bytes = $sha256.ComputeHash($stream)
+    }
+    finally {
+      $stream.Dispose()
+    }
+  }
+  finally {
+    $sha256.Dispose()
+  }
+
+  return ([System.BitConverter]::ToString($bytes)).Replace('-', '')
+}
+
 $tempRoot = $null
 $feedServerProc = $null
 $feedServerScript = $null
@@ -332,7 +355,7 @@ nsis:
     throw "Failed to generate TEST vA installer at $installerA"
   }
   $diagData.installerVaPath = $installerA
-  $diagData.installerVaSha256 = (Get-FileHash -Path $installerA -Algorithm SHA256).Hash
+  $diagData.installerVaSha256 = Get-Sha256Hex -Path $installerA
   Log-Diag "[1/6] Real TEST vA NSIS Installer generated ($($diagData.installerVaSha256)): PASS"
   Save-Diagnostics
 
@@ -394,7 +417,7 @@ nsis:
   }
 
   $diagData.installerVbPath = $installerB
-  $diagData.installerVbSha256 = (Get-FileHash -Path $installerB -Algorithm SHA256).Hash
+  $diagData.installerVbSha256 = Get-Sha256Hex -Path $installerB
   Copy-Item -Path $latestYmlPath -Destination (Join-Path $diagDir "feed-latest.yml") -Force
   Log-Diag "[2/6] Real vB update metadata (latest.yml), NSIS binary, and blockmap generated: PASS"
   Save-Diagnostics
@@ -608,7 +631,7 @@ server.listen(PORT, '127.0.0.1', () => {
 
   $appUpdateContent = Get-Content -Path $installedUpdateYml -Raw
   $diagData.installedAppUpdateYmlContent = $appUpdateContent
-  $diagData.installedAppUpdateYmlSha256 = (Get-FileHash -Path $installedUpdateYml -Algorithm SHA256).Hash
+  $diagData.installedAppUpdateYmlSha256 = Get-Sha256Hex -Path $installedUpdateYml
   Copy-Item -Path $installedUpdateYml -Destination (Join-Path $diagDir "installed-app-update.yml") -Force
 
   if ($appUpdateContent -notmatch "provider:\s*generic" -or $appUpdateContent -notmatch "url:\s*http://127\.0\.0\.1:$testPort/?") {
