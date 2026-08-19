@@ -18,4 +18,7 @@ export default defineConfig({
     outDir: 'dist',
     emptyOutDir: true,
   },
+  test: {
+    testTimeout: 15000,
+  },
 });
