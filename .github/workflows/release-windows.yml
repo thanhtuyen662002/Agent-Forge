@@ -98,8 +98,8 @@ jobs:
           }
           Write-Host "dist\index.html relative asset path check: PASS"
 
-      - name: Generate unpacked Windows directory
-        run: npm run package:win:dir
+      - name: Generate Windows NSIS installer and unpacked package
+        run: npm run package:win
 
       - name: Run packaged process runtime smoke
         shell: pwsh
@@ -112,7 +112,7 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           Write-Host "Publishing Windows release to GitHub Releases for repository thanhtuyen662002/Agent-Forge..."
-          npx electron-builder --win --publish always
+          npx electron-builder --win nsis --publish always
 
       - name: Verify published installer and metadata
         shell: pwsh

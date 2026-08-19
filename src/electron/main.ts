@@ -156,29 +156,6 @@ app.whenReady().then(() => {
   // Create Desktop Window
   createWindow(userDataDir);
 
-  // Test Update Integration Observer (Activated only under explicit test harness flag)
-  if (process.env.AGENT_FORGE_TEST_UPDATE === '1' && updateServiceInstance) {
-    const service = updateServiceInstance;
-    const updateResultPath = path.join(userDataDir, 'update-test-result.json');
-    service.on('state-changed', (state) => {
-      try {
-        fs.writeFileSync(updateResultPath, JSON.stringify(state, null, 2), 'utf-8');
-      } catch {}
-      if (state.state === 'UPDATE_AVAILABLE') {
-        service.downloadUpdate().catch(() => {});
-      } else if (state.state === 'DOWNLOADED' && process.env.AGENT_FORGE_TRIGGER_INSTALL === '1') {
-        setTimeout(() => {
-          try {
-            service.installAndRestart();
-          } catch {}
-        }, 500);
-      }
-    });
-    setTimeout(() => {
-      service.checkForUpdates().catch(() => {});
-    }, 1000);
-  }
-
   app.on('activate', () => {
     if (BrowserWindow.getAllWindows().length === 0) {
       createWindow(userDataDir);

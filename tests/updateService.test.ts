@@ -453,5 +453,73 @@ describe('UpdateService & Installed-App Update Domain (PR #9)', () => {
       expect(content).toMatch(/VERSION MISMATCH FAIL-CLOSED/);
       expect(content).toMatch(/--publish always/);
     });
+
+    it('37. release-windows.yml pre-smoke step builds full NSIS package with package:win and only final step uses --publish always', async () => {
+      const fs = await import('fs');
+      const path = await import('path');
+      const releaseYmlPath = path.resolve(__dirname, '../.github/workflows/release-windows.yml');
+      const content = fs.readFileSync(releaseYmlPath, 'utf8');
+
+      // Pre-smoke step must build complete NSIS package
+      expect(content).toMatch(/run:\s*npm run package:win\s*\n\s*- name:\s*Run packaged process runtime smoke/);
+      // Pre-smoke must not publish
+      expect(content).not.toMatch(/npm run package:win:dir/);
+      // Final step is the only one with --publish always
+      expect(content).toMatch(/npx electron-builder --win nsis --publish always/);
+    });
+
+    it('38. production committed main.ts has zero occurrences of AGENT_FORGE_TEST_UPDATE or AGENT_FORGE_TRIGGER_INSTALL', async () => {
+      const fs = await import('fs');
+      const path = await import('path');
+      const mainPath = path.resolve(__dirname, '../src/electron/main.ts');
+      const content = fs.readFileSync(mainPath, 'utf8');
+
+      expect(content).not.toContain('AGENT_FORGE_TEST_UPDATE');
+      expect(content).not.toContain('AGENT_FORGE_TRIGGER_INSTALL');
+    });
+
+    it('39. production main process and updater adapter cannot accept arbitrary feed URLs or expose setFeedURL', async () => {
+      const fs = await import('fs');
+      const path = await import('path');
+      const adapterPath = path.resolve(__dirname, '../src/electron/updaterAdapter.ts');
+      const ipcPath = path.resolve(__dirname, '../src/electron/ipcHandlers.ts');
+      const preloadPath = path.resolve(__dirname, '../src/electron/preload.ts');
+      const adapterContent = fs.readFileSync(adapterPath, 'utf8');
+      const ipcContent = fs.readFileSync(ipcPath, 'utf8');
+      const preloadContent = fs.readFileSync(preloadPath, 'utf8');
+
+      expect(adapterContent).not.toContain('setFeedURL');
+      expect(ipcContent).not.toContain('setFeedURL');
+      expect(ipcContent).not.toContain('updateUrl');
+      expect(preloadContent).not.toContain('setFeedURL');
+      expect(preloadContent).not.toContain('updateUrl');
+    });
+
+    it('40. test-installed-update-win.ps1 uses isolated temporary build context and does not modify installed app-update.yml', async () => {
+      const fs = await import('fs');
+      const path = await import('path');
+      const scriptPath = path.resolve(__dirname, '../scripts/test-installed-update-win.ps1');
+      const content = fs.readFileSync(scriptPath, 'utf8');
+
+      // Uses temporary isolated build context for TEST vA and vB
+      expect(content).toContain('builder-vA.yml');
+      expect(content).toContain('builder-vB.yml');
+      expect(content).toContain('http://127.0.0.1:$testPort/');
+
+      // Inspects installed config without rewriting it
+      expect(content).toMatch(/Get-Content -Path \$installedUpdateYml/);
+      expect(content).not.toMatch(/Set-Content\s+-Path\s+\$installedUpdateYml/);
+    });
+
+    it('41. production source and configuration files contain zero GitHub tokens or credentials', async () => {
+      const fs = await import('fs');
+      const path = await import('path');
+      const configPath = path.resolve(__dirname, '../electron-builder.yml');
+      const content = fs.readFileSync(configPath, 'utf8');
+
+      expect(content).not.toMatch(/ghp_[a-zA-Z0-9]{36}/);
+      expect(content).not.toMatch(/github_pat_[a-zA-Z0-9_]+/);
+      expect(content).not.toMatch(/Bearer\s+/i);
+    });
   });
 });
