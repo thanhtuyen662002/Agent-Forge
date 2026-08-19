@@ -241,12 +241,13 @@ nsis:
   Write-Host "[2/6] Real vB update metadata (latest.yml) and NSIS binary (0.1.1) generated: PASS"
 
   # 3. Spin up local HTTP static file server serving the vB update feed
+  $encodedFeedDir = $testFeedDir -replace '\\', '/'
   $serverCode = @"
 const http = require('http');
 const fs = require('fs');
 const path = require('path');
 
-const feedDir = '$($testFeedDir -replace '\\', '/\')';
+const feedDir = '$encodedFeedDir';
 const server = http.createServer((req, res) => {
   const cleanUrl = req.url.split('?')[0].replace(/^\//, '');
   const decodedPath = decodeURIComponent(cleanUrl);
