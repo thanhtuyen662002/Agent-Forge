@@ -65,6 +65,28 @@ try {
   $escapedTestDataDir = $testDataDir -replace '\\', '/'
   $mainJsPath = "$tempAppDirA\dist-electron\electron\main.js"
   $mainJsContent = Get-Content -Path $mainJsPath -Raw
+
+  $topBlock = @"
+// --- TEST-ONLY HARNESS EARLY INITIALIZATION & ERROR CAPTURE ---
+(function() {
+  const fs = require('fs');
+  const logFile = '$escapedTestDataDir/update-test-debug.log';
+  try {
+    fs.appendFileSync(logFile, '[' + new Date().toISOString() + '] [TOP] main.js execution started\n', 'utf-8');
+  } catch (e) {}
+  process.on('uncaughtException', (err) => {
+    try {
+      fs.appendFileSync(logFile, '[' + new Date().toISOString() + '] [UNCAUGHT] ' + (err && err.stack ? err.stack : String(err)) + '\n', 'utf-8');
+    } catch (e) {}
+  });
+  process.on('unhandledRejection', (reason) => {
+    try {
+      fs.appendFileSync(logFile, '[' + new Date().toISOString() + '] [REJECTION] ' + (reason && reason.stack ? reason.stack : String(reason)) + '\n', 'utf-8');
+    } catch (e) {}
+  });
+})();
+"@
+
   $target = "createWindow(userDataDir);`n    electron_1.app.on"
 
   if (-not $mainJsContent.Contains($target)) {
@@ -89,12 +111,6 @@ createWindow(userDataDir);
                 fs_1.default.appendFileSync(debugPath, '[' + new Date().toISOString() + '] ' + msg + '\n', 'utf-8');
             } catch (e) {}
         }
-        process.on('uncaughtException', (err) => {
-            log('Uncaught Exception: ' + (err && err.stack ? err.stack : String(err)));
-        });
-        process.on('unhandledRejection', (reason) => {
-            log('Unhandled Rejection: ' + (reason && reason.stack ? reason.stack : String(reason)));
-        });
 
         log('Test update monitor initialized. Explicit dataDir: ' + dataDir);
         log('updateServiceInstance state: ' + (updateServiceInstance ? 'EXISTS' : 'NULL'));
@@ -140,7 +156,7 @@ createWindow(userDataDir);
     electron_1.app.on
 "@
 
-  $mainJsContent = $mainJsContent.Replace($target, $testObserverCode)
+  $mainJsContent = $topBlock + "`n" + $mainJsContent.Replace($target, $testObserverCode)
   Set-Content -Path $mainJsPath -Value $mainJsContent -Encoding utf8
 
   # Ensure better-sqlite3 native addon is compiled for Electron runtime
