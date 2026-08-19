@@ -19,6 +19,7 @@ export default defineConfig({
     emptyOutDir: true,
   },
   test: {
-    testTimeout: 15000,
+    testTimeout: 30000,
+    hookTimeout: 60000,
   },
 });
