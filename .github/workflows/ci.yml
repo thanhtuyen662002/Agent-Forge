@@ -141,16 +141,13 @@ jobs:
           }
           Write-Host "dist\index.html relative asset path check: PASS"
 
-      - name: Generate unpacked Windows directory
-        run: npm run package:win:dir
+      - name: Generate Windows NSIS installer and unpacked package
+        run: npm run package:win
 
       - name: Run packaged process runtime smoke
         shell: pwsh
         run: |
           npm run smoke:packaged:win -- -Headless
-
-      - name: Generate Windows NSIS installer
-        run: npm run package:win
 
       - name: Run real Windows installed application update integration test
         shell: pwsh
