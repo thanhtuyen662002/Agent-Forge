@@ -154,6 +154,16 @@ jobs:
         run: |
           npm run test:installed:win -- -Headless
 
+      - name: Run real production installed application smoke
+        shell: pwsh
+        run: |
+          powershell -ExecutionPolicy Bypass -File scripts/smoke-installed-production-win.ps1 -Headless
+
+      - name: Run Windows Release Candidate verification gate
+        shell: pwsh
+        run: |
+          powershell -ExecutionPolicy Bypass -File scripts/verify-demo-rc-win.ps1
+
       - name: Upload Windows Installed Update Test Diagnostics
         if: always()
         uses: actions/upload-artifact@v4
@@ -207,6 +217,7 @@ jobs:
           path: |
             release/AgentForge Setup 0.1.0.exe
             release/installer-metadata.txt
+            release/demo-rc-receipt.txt
           if-no-files-found: error
           retention-days: 7
 
