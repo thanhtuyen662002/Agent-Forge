@@ -61,112 +61,74 @@ try {
   # Create junction for node_modules
   cmd /c mklink /J "$tempAppDirA\node_modules" "$projectRoot\node_modules" | Out-Null
 
-  # Inject temporary test-only instrumentation into the isolated TEST copy of main.js
-  $escapedTestDataDir = $testDataDir -replace '\\', '/'
-  $testObserverSnippet = @"
-
-// --- TEST-ONLY HARNESS INSTRUMENTATION (ISOLATED IN TEMP TEST ARTIFACT) ---
-(function() {
-  const electron = require('electron');
-  const path = require('path');
-  const fs = require('fs');
-
-  const explicitDataDir = '$escapedTestDataDir';
-  const ud = process.env.AGENT_FORGE_DATA_DIR || explicitDataDir || electron.app.getPath('userData');
-  const rPath = path.join(explicitDataDir, 'update-test-result.json');
-  const debugPath = path.join(explicitDataDir, 'update-test-debug.log');
-
-  function log(msg) {
-    try {
-      fs.appendFileSync(debugPath, '[' + new Date().toISOString() + '] ' + msg + '\n', 'utf-8');
-    } catch (e) {}
+  # Inject temporary test-only instrumentation directly into the isolated TEST copy of main.js
+  $mainJsPath = "$tempAppDirA\dist-electron\electron\main.js"
+  $mainJsContent = Get-Content -Path $mainJsPath -Raw
+  $target = "createWindow(userDataDir);"
+  if (-not $mainJsContent.Contains($target)) {
+    Write-Error "Cannot locate '$target' in $mainJsPath for test instrumentation injection."
+    exit 1
   }
 
-  log('Test instrumentation script loaded in TEST vA copy.');
+  $testObserverCode = @"
+createWindow(userDataDir);
+    // --- TEST-ONLY HARNESS INSTRUMENTATION (ISOLATED IN TEMP TEST ARTIFACT) ---
+    (function runTestUpdateMonitor() {
+        const debugPath = path_1.default.join(userDataDir, 'update-test-debug.log');
+        const rPath = path_1.default.join(userDataDir, 'update-test-result.json');
+        function log(msg) {
+            try {
+                fs_1.default.appendFileSync(debugPath, '[' + new Date().toISOString() + '] ' + msg + '\n', 'utf-8');
+            } catch (e) {}
+        }
+        process.on('uncaughtException', (err) => {
+            log('Uncaught Exception: ' + (err && err.stack ? err.stack : String(err)));
+        });
+        process.on('unhandledRejection', (reason) => {
+            log('Unhandled Rejection: ' + (reason && reason.stack ? reason.stack : String(reason)));
+        });
 
-  function startMonitoring() {
-    log('startMonitoring running. Polling for updateServiceInstance...');
-    let attempts = 0;
-    const maxAttempts = 60; // 30 seconds
+        log('Test update monitor initialized in isolated test artifact.');
+        if (!updateServiceInstance) {
+            log('Error: updateServiceInstance is null.');
+            try {
+                fs_1.default.writeFileSync(rPath, JSON.stringify({ state: 'ERROR', error: 'updateServiceInstance is null' }, null, 2), 'utf-8');
+            } catch (e) {}
+            return;
+        }
+        const svc = updateServiceInstance;
+        try {
+            fs_1.default.writeFileSync(rPath, JSON.stringify({ state: 'CHECKING' }, null, 2), 'utf-8');
+        } catch (e) {}
 
-    const pollInterval = setInterval(() => {
-      attempts++;
-      try {
-        const svcCandidate = global.__agentForgeUpdateService;
-        if (svcCandidate) {
-          clearInterval(pollInterval);
-          log('updateServiceInstance acquired via global.__agentForgeUpdateService.');
-          const svc = svcCandidate;
-
-          try {
-            fs.writeFileSync(rPath, JSON.stringify({ state: 'CHECKING' }, null, 2), 'utf-8');
-          } catch (e) {}
-
-          svc.on('state-changed', (st) => {
+        svc.on('state-changed', (st) => {
             log('UpdateService state-changed: ' + JSON.stringify(st));
             try {
-              fs.writeFileSync(rPath, JSON.stringify(st, null, 2), 'utf-8');
+                fs_1.default.writeFileSync(rPath, JSON.stringify(st, null, 2), 'utf-8');
             } catch (e) {}
             if (st.state === 'UPDATE_AVAILABLE') {
-              log('Triggering downloadUpdate()...');
-              svc.downloadUpdate().catch((err) => {
-                log('downloadUpdate error: ' + String(err));
-                try {
-                  fs.writeFileSync(rPath, JSON.stringify({ state: 'ERROR', error: String(err) }, null, 2), 'utf-8');
-                } catch (e) {}
-              });
+                log('Triggering downloadUpdate()...');
+                svc.downloadUpdate().catch((err) => {
+                    log('downloadUpdate error: ' + String(err));
+                    try {
+                        fs_1.default.writeFileSync(rPath, JSON.stringify({ state: 'ERROR', error: String(err) }, null, 2), 'utf-8');
+                    } catch (e) {}
+                });
             }
-          });
+        });
 
-          log('Triggering checkForUpdates()...');
-          svc.checkForUpdates().catch((err) => {
+        log('Triggering checkForUpdates()...');
+        svc.checkForUpdates().catch((err) => {
             log('checkForUpdates error: ' + String(err));
             try {
-              fs.writeFileSync(rPath, JSON.stringify({ state: 'ERROR', error: String(err) }, null, 2), 'utf-8');
+                fs_1.default.writeFileSync(rPath, JSON.stringify({ state: 'ERROR', error: String(err) }, null, 2), 'utf-8');
             } catch (e) {}
-          });
-        } else if (attempts >= maxAttempts) {
-          clearInterval(pollInterval);
-          log('Timed out waiting for updateServiceInstance initialization.');
-          try {
-            fs.writeFileSync(rPath, JSON.stringify({ state: 'ERROR', error: 'Timed out waiting for updateServiceInstance initialization' }, null, 2), 'utf-8');
-          } catch (e) {}
-        }
-      } catch (err) {
-        log('Error in poll interval: ' + String(err));
-      }
-    }, 500);
-  }
-
-  if (electron.app && typeof electron.app.whenReady === 'function') {
-    electron.app.whenReady().then(() => {
-      // Defer past the current whenReady .then() chain so global.__agentForgeUpdateService is set first
-      setTimeout(() => { startMonitoring(); }, 500);
-    });
-  }
-})();
+        });
+    })();
 "@
-  Add-Content -Path "$tempAppDirA\dist-electron\electron\main.js" -Value $testObserverSnippet -Encoding utf8
 
-  # Patch compiled main.js to expose updateServiceInstance on global so the injected observer can access it
-  $mainJsPath = "$tempAppDirA\dist-electron\electron\main.js"
-  $mainJsLines = Get-Content -Path $mainJsPath
-  $patchedLines = @()
-  $patched = $false
-  foreach ($line in $mainJsLines) {
-    $patchedLines += $line
-    # After registerIpcHandlers call (which receives updateServiceInstance), export it to global
-    if (-not $patched -and $line -match 'registerIpcHandlers' -and $line -match 'updateServiceInstance') {
-      $patchedLines += 'global.__agentForgeUpdateService = updateServiceInstance;'
-      $patched = $true
-    }
-  }
-  if (-not $patched) {
-    # Fallback: append at end of file before our observer snippet's IIFE
-    Write-Host "WARNING: registerIpcHandlers marker not found in main.js, using fallback global patch"
-    $patchedLines += 'if (typeof updateServiceInstance !== "undefined" && updateServiceInstance) { global.__agentForgeUpdateService = updateServiceInstance; }'
-  }
-  Set-Content -Path $mainJsPath -Value $patchedLines -Encoding utf8
+  $mainJsContent = $mainJsContent.Replace($target, $testObserverCode)
+  Set-Content -Path $mainJsPath -Value $mainJsContent -Encoding utf8
 
   # Ensure better-sqlite3 native addon is compiled for Electron runtime
   Write-Host "Ensuring better-sqlite3 native bindings for Electron..."
@@ -410,6 +372,8 @@ server.listen($testPort, '127.0.0.1', () => {
   }
 
   if ($null -eq $finalResult) {
+    Write-Host "Files in testDataDir ($testDataDir):"
+    Get-ChildItem -Path $testDataDir -Recurse -ErrorAction SilentlyContinue | ForEach-Object { Write-Host "  $($_.FullName) ($($_.Length) bytes)" }
     if (Test-Path $debugLogFile) {
       Write-Host "--- Process Debug Log ---"
       Get-Content -Path $debugLogFile | ForEach-Object { Write-Host "  $_" }
