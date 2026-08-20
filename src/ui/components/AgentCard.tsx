@@ -60,30 +60,30 @@ export const AgentCard: React.FC<AgentCardProps> = ({
   return (
     <div className="bg-surface-card border border-surface-border rounded-xl p-5 shadow-lg space-y-4 hover:border-surface-hover transition group">
       {/* Header */}
-      <div className="flex items-start justify-between">
-        <div className="flex items-center space-x-3">
-          <div className="p-2 rounded-lg bg-surface border border-surface-border">
+      <div className="flex items-start justify-between gap-3">
+        <div className="flex items-center space-x-3 min-w-0">
+          <div className="p-2 rounded-lg bg-surface border border-surface-border shrink-0">
             {getRoleIcon()}
           </div>
-          <div>
-            <div className="flex items-center space-x-2">
-              <h3 className="text-sm font-semibold text-white group-hover:text-forge-cyan transition">
-                {agent.display_name}
-              </h3>
-              <span className="text-[10px] font-mono uppercase px-1.5 py-0.5 rounded bg-surface border border-surface-border text-slate-400">
-                {agent.role.replace('_', ' ')}
-              </span>
-            </div>
-            <div className="text-xs text-slate-400 font-mono mt-0.5">
+          <div className="min-w-0">
+            <h3 className="text-sm font-semibold text-white group-hover:text-forge-cyan transition truncate" title={agent.display_name}>
+              {agent.display_name}
+            </h3>
+            <div className="text-xs text-slate-400 font-mono mt-0.5 truncate" title={resource?.model_name || t('agentCard.noAssignedModel')}>
               {resource?.model_name || t('agentCard.noAssignedModel')}
             </div>
           </div>
         </div>
 
-        {/* Status Badge */}
-        <div className={`px-2.5 py-1 rounded-full text-xs font-mono font-medium border flex items-center space-x-1.5 ${getStatusColor()}`}>
-          <span className="w-1.5 h-1.5 rounded-full bg-current animate-pulse"></span>
-          <span>{agent.status}</span>
+        {/* Unified Aligned Badge Group */}
+        <div className="flex items-center gap-2 shrink-0">
+          <span className="text-[10px] font-mono uppercase px-2 py-1 rounded-md bg-surface border border-surface-border text-slate-300 font-medium">
+            {agent.role.replace('_', ' ')}
+          </span>
+          <div className={`px-2.5 py-1 rounded-full text-xs font-mono font-medium border flex items-center space-x-1.5 ${getStatusColor()}`}>
+            <span className="w-1.5 h-1.5 rounded-full bg-current animate-pulse"></span>
+            <span>{agent.status}</span>
+          </div>
         </div>
       </div>
 
