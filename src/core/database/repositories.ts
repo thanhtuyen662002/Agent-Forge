@@ -1,3 +1,4 @@
+import crypto from 'crypto';
 import Database from 'better-sqlite3';
 import {
   Project,
@@ -1115,6 +1116,55 @@ export class Repository {
       timeout_ms: Number(row.timeout_ms),
       enabled: Boolean(row.enabled),
     };
+  }
+
+  public setProjectVerificationCommands(
+    projectId: string,
+    commands: {
+      TEST?: { executable: string; args: string[] } | null;
+      LINT?: { executable: string; args: string[] } | null;
+      BUILD?: { executable: string; args: string[] } | null;
+    }
+  ): any[] {
+    return this.runInTransaction(() => {
+      const managedTypes: Array<'TEST' | 'LINT' | 'BUILD'> = ['TEST', 'LINT', 'BUILD'];
+
+      for (const type of managedTypes) {
+        if (type in commands) {
+          const cmdData = commands[type];
+          if (cmdData) {
+            const existing = this.db
+              .prepare('SELECT id FROM verification_commands WHERE project_id = ? AND command_type = ?')
+              .get(projectId, type) as { id: string } | undefined;
+
+            if (existing) {
+              this.db
+                .prepare(`
+                  UPDATE verification_commands
+                  SET executable = ?, args_json = ?, timeout_ms = 120000, enabled = 1
+                  WHERE id = ?
+                `)
+                .run(cmdData.executable, JSON.stringify(cmdData.args), existing.id);
+            } else {
+              const id = `vc-${crypto.randomUUID().substring(0, 8)}`;
+              const typeName = `${type.charAt(0) + type.slice(1).toLowerCase()} Suite`;
+              this.db
+                .prepare(`
+                  INSERT INTO verification_commands (id, project_id, name, command_type, executable, args_json, timeout_ms, enabled)
+                  VALUES (?, ?, ?, ?, ?, ?, 120000, 1)
+                `)
+                .run(id, projectId, typeName, type, cmdData.executable, JSON.stringify(cmdData.args));
+            }
+          } else {
+            this.db
+              .prepare('DELETE FROM verification_commands WHERE project_id = ? AND command_type = ?')
+              .run(projectId, type);
+          }
+        }
+      }
+
+      return this.getVerificationCommandsByProject(projectId);
+    });
   }
 
   // ==========================================

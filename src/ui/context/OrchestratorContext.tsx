@@ -54,6 +54,15 @@ interface OrchestratorContextType {
   dispatchAuthorization: (authorizationId: string) => Promise<any>;
   getOwnerHandoffSnapshot: (taskId: string) => Promise<any>;
   generateAuthorizedWorkOrder: (authorizationId: string) => Promise<any>;
+  getVerificationCommands: (projectId: string) => Promise<any>;
+  saveVerificationCommands: (data: {
+    projectId: string;
+    commands: {
+      TEST?: string | null;
+      LINT?: string | null;
+      BUILD?: string | null;
+    };
+  }) => Promise<any>;
 }
 
 const OrchestratorContext = createContext<OrchestratorContextType | null>(null);
@@ -347,6 +356,23 @@ export const OrchestratorProvider: React.FC<{ children: React.ReactNode }> = ({ 
     return orchestrator.generateAuthorizedWorkOrder(authorizationId);
   };
 
+  const getVerificationCommands = async (projectId: string) => {
+    if (!orchestrator) return { success: false, error: 'Desktop required.' };
+    return orchestrator.getVerificationCommands(projectId);
+  };
+
+  const saveVerificationCommands = async (data: {
+    projectId: string;
+    commands: {
+      TEST?: string | null;
+      LINT?: string | null;
+      BUILD?: string | null;
+    };
+  }) => {
+    if (!orchestrator) return { success: false, error: 'Desktop required.' };
+    return orchestrator.saveVerificationCommands(data);
+  };
+
   return (
     <OrchestratorContext.Provider
       value={{
@@ -386,6 +412,8 @@ export const OrchestratorProvider: React.FC<{ children: React.ReactNode }> = ({ 
         dispatchAuthorization,
         getOwnerHandoffSnapshot,
         generateAuthorizedWorkOrder,
+        getVerificationCommands,
+        saveVerificationCommands,
       }}
     >
       {children}

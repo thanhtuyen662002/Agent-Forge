@@ -284,8 +284,11 @@ export const enUS: TranslationDictionary = {
     verificationCommands: {
       title: 'Verification Commands',
       testCmdLabel: 'Test Command',
+      testCmdPlaceholder: 'e.g. npm test',
       lintCmdLabel: 'Linter Command',
+      lintCmdPlaceholder: 'e.g. npm run lint',
       buildCmdLabel: 'Build Command',
+      buildCmdPlaceholder: 'e.g. npm run build',
     },
     loopProtection: {
       title: 'Loop Protection & Revision Limits',
@@ -294,6 +297,9 @@ export const enUS: TranslationDictionary = {
     },
     saveConfigButton: 'SAVE CONFIGURATION',
     settingsSavedButton: 'SETTINGS SAVED',
+    noActiveProject: 'No active project selected. Select or create a project to configure verification commands.',
+    saveSuccess: 'Verification commands saved successfully.',
+    saveFailed: 'Failed to save verification commands.',
   },
   task: {
     title: 'Task Title',

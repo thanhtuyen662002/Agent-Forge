@@ -287,8 +287,11 @@ export interface TranslationDictionary {
     verificationCommands: {
       title: string;
       testCmdLabel: string;
+      testCmdPlaceholder: string;
       lintCmdLabel: string;
+      lintCmdPlaceholder: string;
       buildCmdLabel: string;
+      buildCmdPlaceholder: string;
     };
     loopProtection: {
       title: string;
@@ -297,6 +300,9 @@ export interface TranslationDictionary {
     };
     saveConfigButton: string;
     settingsSavedButton: string;
+    noActiveProject: string;
+    saveSuccess: string;
+    saveFailed: string;
   };
   task: {
     title: string;
