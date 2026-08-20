@@ -15,6 +15,7 @@ import { ProviderRoutingService } from '../core/services/ProviderRoutingService'
 import { ExecutionAuthorizationService } from '../core/services/ExecutionAuthorizationService';
 import { ProviderDispatchService } from '../core/services/ProviderDispatchService';
 import { UpdateService } from '../core/services/UpdateService';
+import { CommandParser } from '../core/services/CommandParser';
 import {
   CreateProjectIpcSchema,
   ImportContractIpcSchema,
@@ -40,6 +41,8 @@ import {
   UpdateDownloadIpcSchema,
   UpdateInstallAndRestartIpcSchema,
   GetAppInfoIpcSchema,
+  GetVerificationCommandsIpcSchema,
+  SaveVerificationCommandsIpcSchema,
 } from '../core/types/ipc';
 
 export function registerIpcHandlers(
@@ -420,6 +423,74 @@ export function registerIpcHandlers(
     }
 
     return taskService.executeValidationFlow(parsed.data.taskId, parsed.data.commandConfigId);
+  });
+
+  ipcMain.handle('verification:getCommands', async (_, payload: unknown) => {
+    const parsed = GetVerificationCommandsIpcSchema.safeParse(payload);
+    if (!parsed.success) {
+      return { success: false, error: parsed.error.issues.map((i) => i.message).join(', ') };
+    }
+
+    const project = repo.getProject(parsed.data.projectId);
+    if (!project) {
+      return { success: false, error: `Project "${parsed.data.projectId}" not found.` };
+    }
+
+    const commands = repo.getVerificationCommandsByProject(project.id);
+    return { success: true, commands };
+  });
+
+  ipcMain.handle('verification:saveCommands', async (_, payload: unknown) => {
+    const parsed = SaveVerificationCommandsIpcSchema.safeParse(payload);
+    if (!parsed.success) {
+      return { success: false, error: parsed.error.issues.map((i) => i.message).join(', ') };
+    }
+
+    const project = repo.getProject(parsed.data.projectId);
+    if (!project) {
+      return { success: false, error: `Project "${parsed.data.projectId}" not found.` };
+    }
+
+    const parsedCommands: {
+      TEST?: { executable: string; args: string[] } | null;
+      LINT?: { executable: string; args: string[] } | null;
+      BUILD?: { executable: string; args: string[] } | null;
+    } = {};
+
+    const types: Array<'TEST' | 'LINT' | 'BUILD'> = ['TEST', 'LINT', 'BUILD'];
+    for (const type of types) {
+      const rawCmd = parsed.data.commands[type];
+      if (rawCmd != null && rawCmd.trim().length > 0) {
+        let parsedCmd;
+        try {
+          parsedCmd = CommandParser.parse(rawCmd);
+        } catch (err: any) {
+          return { success: false, error: `Invalid ${type} command: ${err.message}` };
+        }
+
+        if (parsedCmd) {
+          const policy = PolicyService.evaluateProcessExecution(parsedCmd.executable, parsedCmd.args, false);
+          if (!policy.allowed) {
+            return {
+              success: false,
+              error: `Security policy rejected ${type} command "${rawCmd}": ${policy.reason} (${policy.decision})`,
+            };
+          }
+          parsedCommands[type] = parsedCmd;
+        } else {
+          parsedCommands[type] = null;
+        }
+      } else {
+        parsedCommands[type] = null;
+      }
+    }
+
+    try {
+      const updatedCommands = repo.setProjectVerificationCommands(project.id, parsedCommands);
+      return { success: true, commands: updatedCommands };
+    } catch (err: any) {
+      return { success: false, error: err.message || 'Failed to save verification commands.' };
+    }
   });
 
   // ==========================================

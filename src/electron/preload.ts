@@ -83,6 +83,17 @@ export interface OrchestratorApi {
   checkForUpdates: () => Promise<any>;
   downloadUpdate: () => Promise<any>;
   installAndRestartUpdate: () => Promise<any>;
+
+  // PR #14: Verification Commands Configuration
+  getVerificationCommands: (projectId: string) => Promise<any>;
+  saveVerificationCommands: (data: {
+    projectId: string;
+    commands: {
+      TEST?: string | null;
+      LINT?: string | null;
+      BUILD?: string | null;
+    };
+  }) => Promise<any>;
 }
 
 const api: OrchestratorApi = {
@@ -131,6 +142,11 @@ const api: OrchestratorApi = {
   checkForUpdates: () => ipcRenderer.invoke('update:check'),
   downloadUpdate: () => ipcRenderer.invoke('update:download'),
   installAndRestartUpdate: () => ipcRenderer.invoke('update:installAndRestart'),
+
+  getVerificationCommands: (projectId: string) =>
+    ipcRenderer.invoke('verification:getCommands', { projectId }),
+  saveVerificationCommands: (data) =>
+    ipcRenderer.invoke('verification:saveCommands', data),
 };
 
 contextBridge.exposeInMainWorld('orchestrator', api);

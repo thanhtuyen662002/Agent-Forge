@@ -191,3 +191,28 @@ export type UpdateInstallAndRestartIpc = z.infer<typeof UpdateInstallAndRestartI
 
 export const GetAppInfoIpcSchema = z.object({}).strict();
 export type GetAppInfoIpc = z.infer<typeof GetAppInfoIpcSchema>;
+
+// ==========================================
+// PR #14: Verification Commands Configuration Schemas
+// ==========================================
+
+export const GetVerificationCommandsIpcSchema = z
+  .object({
+    projectId: z.string().min(1, 'Project ID is required'),
+  })
+  .strict();
+export type GetVerificationCommandsIpc = z.infer<typeof GetVerificationCommandsIpcSchema>;
+
+export const SaveVerificationCommandsIpcSchema = z
+  .object({
+    projectId: z.string().min(1, 'Project ID is required'),
+    commands: z
+      .object({
+        TEST: z.string().max(1000).optional().nullable(),
+        LINT: z.string().max(1000).optional().nullable(),
+        BUILD: z.string().max(1000).optional().nullable(),
+      })
+      .strict(),
+  })
+  .strict();
+export type SaveVerificationCommandsIpc = z.infer<typeof SaveVerificationCommandsIpcSchema>;

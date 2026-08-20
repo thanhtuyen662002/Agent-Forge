@@ -284,8 +284,11 @@ export const viVN: TranslationDictionary = {
     verificationCommands: {
       title: 'Lệnh Xác minh',
       testCmdLabel: 'Lệnh Kiểm thử (Test)',
+      testCmdPlaceholder: 'vd: npm test',
       lintCmdLabel: 'Lệnh Linter',
+      lintCmdPlaceholder: 'vd: npm run lint',
       buildCmdLabel: 'Lệnh Xây dựng (Build)',
+      buildCmdPlaceholder: 'vd: npm run build',
     },
     loopProtection: {
       title: 'Bảo vệ Vòng lặp & Giới hạn Bản sửa đổi',
@@ -294,6 +297,9 @@ export const viVN: TranslationDictionary = {
     },
     saveConfigButton: 'LƯU CẤU HÌNH',
     settingsSavedButton: 'ĐÃ LƯU CÀI ĐẶT',
+    noActiveProject: 'Chưa chọn dự án nào. Vui lòng chọn hoặc tạo dự án để cấu hình lệnh xác minh.',
+    saveSuccess: 'Đã lưu các lệnh xác minh thành công.',
+    saveFailed: 'Lưu lệnh xác minh thất bại.',
   },
   task: {
     title: 'Tiêu đề Nhiệm vụ',

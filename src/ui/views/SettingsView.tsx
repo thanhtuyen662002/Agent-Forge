@@ -1,5 +1,6 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useRef, useLayoutEffect } from 'react';
 import { useI18n } from '../context/I18nContext';
+import { useOrchestrator } from '../context/OrchestratorContext';
 import {
   Sliders,
   Shield,
@@ -17,18 +18,27 @@ import {
   Cpu,
   Layers,
   Database,
+  FolderGit2,
 } from 'lucide-react';
 import { UpdateStateSummary } from '../../core/types/domain';
+import { CommandParser } from '../../core/services/CommandParser';
 
 export const SettingsView: React.FC = () => {
   const { locale, setLocale, t } = useI18n();
+  const { activeProject } = useOrchestrator();
 
-  // Verification commands & policy state
-  const [testCmd, setTestCmd] = useState<string>('npm test');
-  const [lintCmd, setLintCmd] = useState<string>('npm run lint');
-  const [buildCmd, setBuildCmd] = useState<string>('npm run build');
+  const activeProjectIdRef = useRef<string | undefined>(activeProject?.id);
+  useLayoutEffect(() => {
+    activeProjectIdRef.current = activeProject?.id;
+  }, [activeProject?.id]);
+
+  // Verification commands & policy state (initialized to empty strings; placeholders show examples)
+  const [testCmd, setTestCmd] = useState<string>('');
+  const [lintCmd, setLintCmd] = useState<string>('');
+  const [buildCmd, setBuildCmd] = useState<string>('');
   const [maxRevisions, setMaxRevisions] = useState<number>(3);
   const [saved, setSaved] = useState<boolean>(false);
+  const [saveError, setSaveError] = useState<string | null>(null);
 
   // App & Update State
   const [appInfo, setAppInfo] = useState<{ version: string; isPackaged: boolean; platform: string; arch: string }>({
@@ -50,6 +60,54 @@ export const SettingsView: React.FC = () => {
   });
   const [isActionLoading, setIsActionLoading] = useState<boolean>(false);
   const [updateError, setUpdateError] = useState<string | null>(null);
+
+  const applyCanonicalCommands = (commands: any[]) => {
+    const testRow = commands.find((c: any) => c.command_type === 'TEST' && c.enabled);
+    const lintRow = commands.find((c: any) => c.command_type === 'LINT' && c.enabled);
+    const buildRow = commands.find((c: any) => c.command_type === 'BUILD' && c.enabled);
+
+    setTestCmd(CommandParser.format(testRow));
+    setLintCmd(CommandParser.format(lintRow));
+    setBuildCmd(CommandParser.format(buildRow));
+  };
+
+  // Load project-scoped verification commands from SQLite whenever activeProject changes
+  useEffect(() => {
+    const currentProjectId = activeProject?.id;
+    let isMounted = true;
+    setSaveError(null);
+    setSaved(false);
+
+    const loadVerificationCommands = async () => {
+      if (!currentProjectId || !(window as any).orchestrator?.getVerificationCommands) {
+        if (isMounted) {
+          setTestCmd('');
+          setLintCmd('');
+          setBuildCmd('');
+        }
+        return;
+      }
+
+      try {
+        const res = await (window as any).orchestrator.getVerificationCommands(currentProjectId);
+        if (
+          isMounted &&
+          activeProjectIdRef.current === currentProjectId &&
+          res?.success &&
+          Array.isArray(res.commands)
+        ) {
+          applyCanonicalCommands(res.commands);
+        }
+      } catch (err) {
+        console.warn('Failed to load verification commands for project:', err);
+      }
+    };
+
+    loadVerificationCommands();
+    return () => {
+      isMounted = false;
+    };
+  }, [activeProject?.id]);
 
   const fetchState = async () => {
     try {
@@ -129,9 +187,45 @@ export const SettingsView: React.FC = () => {
     }
   };
 
-  const handleSave = () => {
-    setSaved(true);
-    setTimeout(() => setSaved(false), 2000);
+  const handleSave = async () => {
+    if (!activeProject?.id) {
+      setSaveError(t('settings.noActiveProject'));
+      return;
+    }
+
+    const savedProjectId = activeProject.id;
+    setSaveError(null);
+    setSaved(false);
+
+    try {
+      if ((window as any).orchestrator?.saveVerificationCommands) {
+        const res = await (window as any).orchestrator.saveVerificationCommands({
+          projectId: savedProjectId,
+          commands: {
+            TEST: testCmd,
+            LINT: lintCmd,
+            BUILD: buildCmd,
+          },
+        });
+
+        // Ignore stale async response if active project switched while save was in flight
+        if (activeProjectIdRef.current !== savedProjectId) {
+          return;
+        }
+
+        if (res?.success && Array.isArray(res.commands)) {
+          applyCanonicalCommands(res.commands);
+          setSaved(true);
+          setTimeout(() => setSaved(false), 2000);
+        } else {
+          setSaveError(res?.error || t('settings.saveFailed'));
+        }
+      }
+    } catch (err: any) {
+      if (activeProjectIdRef.current === savedProjectId) {
+        setSaveError(err?.message || t('settings.saveFailed'));
+      }
+    }
   };
 
   const getUpdateStateBadge = () => {
@@ -398,10 +492,30 @@ export const SettingsView: React.FC = () => {
       {/* 4. Verification Commands & Policies */}
       <div className="bg-surface-card border border-surface-border rounded-xl p-6 shadow-lg space-y-6">
         <div className="space-y-4">
-          <h3 className="text-xs font-mono font-semibold text-slate-300 uppercase tracking-wider flex items-center space-x-2">
-            <Terminal className="w-4 h-4 text-forge-cyan" />
-            <span>{t('settings.verificationCommands.title')}</span>
-          </h3>
+          <div className="flex items-center justify-between">
+            <h3 className="text-xs font-mono font-semibold text-slate-300 uppercase tracking-wider flex items-center space-x-2">
+              <Terminal className="w-4 h-4 text-forge-cyan" />
+              <span>{t('settings.verificationCommands.title')}</span>
+            </h3>
+            {activeProject ? (
+              <span className="text-[11px] font-mono text-forge-cyan bg-forge-cyan/10 border border-forge-cyan/20 px-2.5 py-1 rounded-md flex items-center space-x-1.5">
+                <FolderGit2 className="w-3.5 h-3.5" />
+                <span>{activeProject.name}</span>
+              </span>
+            ) : (
+              <span className="text-[11px] font-mono text-amber-400 bg-amber-500/10 border border-amber-500/20 px-2.5 py-1 rounded-md flex items-center space-x-1.5">
+                <AlertCircle className="w-3.5 h-3.5" />
+                <span>{t('settings.noActiveProject')}</span>
+              </span>
+            )}
+          </div>
+
+          {saveError && (
+            <div className="p-3 bg-rose-500/10 border border-rose-500/30 rounded-lg text-xs font-mono text-rose-400 flex items-center space-x-2">
+              <AlertCircle className="w-4 h-4 text-rose-400 shrink-0" />
+              <span>{saveError}</span>
+            </div>
+          )}
 
           <div className="grid grid-cols-1 md:grid-cols-3 gap-4 text-xs font-mono">
             <div>
@@ -409,8 +523,9 @@ export const SettingsView: React.FC = () => {
               <input
                 type="text"
                 value={testCmd}
+                placeholder={t('settings.verificationCommands.testCmdPlaceholder')}
                 onChange={(e) => setTestCmd(e.target.value)}
-                className="w-full bg-surface border border-surface-border rounded-lg px-3 py-2 text-white focus:outline-none focus:border-forge-cyan"
+                className="w-full bg-surface border border-surface-border rounded-lg px-3 py-2 text-white focus:outline-none focus:border-forge-cyan placeholder:text-slate-600"
               />
             </div>
 
@@ -419,8 +534,9 @@ export const SettingsView: React.FC = () => {
               <input
                 type="text"
                 value={lintCmd}
+                placeholder={t('settings.verificationCommands.lintCmdPlaceholder')}
                 onChange={(e) => setLintCmd(e.target.value)}
-                className="w-full bg-surface border border-surface-border rounded-lg px-3 py-2 text-white focus:outline-none focus:border-forge-cyan"
+                className="w-full bg-surface border border-surface-border rounded-lg px-3 py-2 text-white focus:outline-none focus:border-forge-cyan placeholder:text-slate-600"
               />
             </div>
 
@@ -429,8 +545,9 @@ export const SettingsView: React.FC = () => {
               <input
                 type="text"
                 value={buildCmd}
+                placeholder={t('settings.verificationCommands.buildCmdPlaceholder')}
                 onChange={(e) => setBuildCmd(e.target.value)}
-                className="w-full bg-surface border border-surface-border rounded-lg px-3 py-2 text-white focus:outline-none focus:border-forge-cyan"
+                className="w-full bg-surface border border-surface-border rounded-lg px-3 py-2 text-white focus:outline-none focus:border-forge-cyan placeholder:text-slate-600"
               />
             </div>
           </div>
