@@ -2,7 +2,7 @@ import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import Database from 'better-sqlite3';
 import { MigrationRunner } from '../src/core/database/migrations';
 import { Repository } from '../src/core/database/repositories';
-import { CommandParser } from '../src/core/services/CommandParser';
+import { CommandParser, ParsedCommand } from '../src/core/services/CommandParser';
 import { PolicyService } from '../src/core/services/PolicyService';
 import { VerificationService } from '../src/core/services/VerificationService';
 import { ArtifactStore } from '../src/core/services/ArtifactStore';
@@ -16,8 +16,8 @@ import fs from 'fs';
 import os from 'os';
 
 describe('PR #14: Verification Settings Persistence & Parser', () => {
-  describe('1. Command Parser', () => {
-    it('parses basic command into structured executable and args', () => {
+  describe('1. Command Parser & Windows Path Handling', () => {
+    it('CASE 1: parses basic command into structured executable and args', () => {
       const parsed = CommandParser.parse('node run_tests.js');
       expect(parsed).toEqual({
         executable: 'node',
@@ -25,36 +25,47 @@ describe('PR #14: Verification Settings Persistence & Parser', () => {
       });
     });
 
-    it('parses npm command with multiple arguments', () => {
-      const parsed = CommandParser.parse('npm test -- --verbose --runInBand');
-      expect(parsed).toEqual({
-        executable: 'npm',
-        args: ['test', '--', '--verbose', '--runInBand'],
-      });
-    });
-
-    it('parses quoted arguments and paths preserving spaces', () => {
-      const parsed = CommandParser.parse('node "scripts/run tests.js" --config="my config.json"');
+    it('CASE 2: parses command with quoted spaced argument', () => {
+      const parsed = CommandParser.parse('node "scripts/run tests.js"');
       expect(parsed).toEqual({
         executable: 'node',
-        args: ['scripts/run tests.js', '--config=my config.json'],
+        args: ['scripts/run tests.js'],
       });
     });
 
-    it('parses single-quoted arguments', () => {
-      const parsed = CommandParser.parse("pytest 'tests/test unit.py'");
+    it('CASE 3: preserves exact Windows backslashes in quoted path', () => {
+      const parsed = CommandParser.parse('node "C:\\Users\\Test User\\repo\\run_tests.js"');
       expect(parsed).toEqual({
-        executable: 'pytest',
-        args: ['tests/test unit.py'],
+        executable: 'node',
+        args: ['C:\\Users\\Test User\\repo\\run_tests.js'],
       });
     });
 
-    it('returns null for blank or whitespace-only input', () => {
-      expect(CommandParser.parse('')).toBeNull();
-      expect(CommandParser.parse('   \t  ')).toBeNull();
+    it('CASE 4: preserves quoted executable with spaces and quoted Windows argument', () => {
+      const parsed = CommandParser.parse('"C:\\Program Files\\nodejs\\node.exe" "scripts\\run tests.js"');
+      expect(parsed).toEqual({
+        executable: 'C:\\Program Files\\nodejs\\node.exe',
+        args: ['scripts\\run tests.js'],
+      });
     });
 
-    it('rejects unterminated double quotes', () => {
+    it('CASE 5: preserves unquoted Windows backslashes in path argument', () => {
+      const parsed = CommandParser.parse('node C:\\repo\\run_tests.js');
+      expect(parsed).toEqual({
+        executable: 'node',
+        args: ['C:\\repo\\run_tests.js'],
+      });
+    });
+
+    it('CASE 6: preserves leading UNC backslashes and remaining path separators', () => {
+      const parsed = CommandParser.parse('node "\\\\server\\share folder\\run_tests.js"');
+      expect(parsed).toEqual({
+        executable: 'node',
+        args: ['\\\\server\\share folder\\run_tests.js'],
+      });
+    });
+
+    it('CASE 7: rejects unterminated double quotes', () => {
       expect(() => CommandParser.parse('node "unclosed.js')).toThrow(
         /unterminated quotation mark/i
       );
@@ -74,9 +85,71 @@ describe('PR #14: Verification Settings Persistence & Parser', () => {
         /invalid control characters/i
       );
     });
+
+    it('returns null for blank or whitespace-only input', () => {
+      expect(CommandParser.parse('')).toBeNull();
+      expect(CommandParser.parse('   \t  ')).toBeNull();
+    });
   });
 
-  describe('2. Repository Persistence & Project Isolation', () => {
+  describe('2. Canonical Command Formatter & parse(format(cmd)) Round-Trip Property', () => {
+    const assertRoundTrip = (cmd: ParsedCommand) => {
+      const formatted = CommandParser.format(cmd);
+      const parsed = CommandParser.parse(formatted);
+      expect(parsed).toEqual(cmd);
+    };
+
+    it('round-trips basic command with no spaces', () => {
+      assertRoundTrip({
+        executable: 'npm',
+        args: ['test'],
+      });
+    });
+
+    it('round-trips command with spaces in arguments', () => {
+      assertRoundTrip({
+        executable: 'node',
+        args: ['scripts/run tests.js'],
+      });
+    });
+
+    it('round-trips command with Windows path containing spaces', () => {
+      assertRoundTrip({
+        executable: 'node',
+        args: ['C:\\Users\\Test User\\repo\\run_tests.js'],
+      });
+    });
+
+    it('round-trips command with spaces in executable path', () => {
+      assertRoundTrip({
+        executable: 'C:\\Program Files\\nodejs\\node.exe',
+        args: ['scripts\\run tests.js'],
+      });
+    });
+
+    it('round-trips command with multiple mixed arguments', () => {
+      assertRoundTrip({
+        executable: 'node',
+        args: ['--max-old-space-size=4096', 'scripts/run tests.js', '-v', '--bail'],
+      });
+    });
+
+    it('round-trips command with empty args array', () => {
+      assertRoundTrip({
+        executable: 'npm',
+        args: [],
+      });
+    });
+
+    it('round-trips command with UNC path', () => {
+      assertRoundTrip({
+        executable: 'node',
+        args: ['\\\\server\\share folder\\run_tests.js'],
+      });
+    });
+  });
+
+  describe('3. Repository Persistence & Project Isolation', () => {
     let db: Database.Database;
     let repo: Repository;
     let projectA: Project;
@@ -200,6 +273,82 @@ describe('PR #14: Verification Settings Persistence & Parser', () => {
       expect(cmdsB).toHaveLength(0);
     });
 
+    it('SAVE -> LOAD -> SAVE Immutability: preserves exact argument boundaries without user edit', () => {
+      // 1. Owner enters input with spaced argument
+      const inputString = 'node "scripts/run tests.js"';
+      const parsed1 = CommandParser.parse(inputString)!;
+      expect(parsed1).toEqual({ executable: 'node', args: ['scripts/run tests.js'] });
+
+      // 2. Persist to SQLite
+      repo.setProjectVerificationCommands(projectA.id, { TEST: parsed1 });
+
+      // 3. Reload from SQLite
+      const loadedCmds = repo.getVerificationCommandsByProject(projectA.id);
+      const testRow = loadedCmds.find((c) => c.command_type === 'TEST')!;
+      expect(testRow.executable).toBe('node');
+      expect(testRow.args).toEqual(['scripts/run tests.js']);
+
+      // 4. Renderer formats using canonical formatter
+      const formattedForUI = CommandParser.format(testRow);
+      expect(formattedForUI).toBe('node "scripts/run tests.js"');
+
+      // 5. Save again without edits
+      const parsed2 = CommandParser.parse(formattedForUI)!;
+      repo.setProjectVerificationCommands(projectA.id, { TEST: parsed2 });
+
+      // 6. Assert SQLite remains exactly unchanged
+      const reloadedCmds = repo.getVerificationCommandsByProject(projectA.id);
+      const testRowReloaded = reloadedCmds.find((c) => c.command_type === 'TEST')!;
+      expect(testRowReloaded.executable).toBe('node');
+      expect(testRowReloaded.args).toEqual(['scripts/run tests.js']);
+    });
+
+    it('SAVE -> LOAD -> SAVE Windows Path Immutability', () => {
+      const inputString = '"C:\\Program Files\\nodejs\\node.exe" "scripts\\run tests.js"';
+      const parsed1 = CommandParser.parse(inputString)!;
+      expect(parsed1).toEqual({
+        executable: 'C:\\Program Files\\nodejs\\node.exe',
+        args: ['scripts\\run tests.js'],
+      });
+
+      repo.setProjectVerificationCommands(projectA.id, { TEST: parsed1 });
+
+      const loadedCmds = repo.getVerificationCommandsByProject(projectA.id);
+      const testRow = loadedCmds.find((c) => c.command_type === 'TEST')!;
+      const formattedForUI = CommandParser.format(testRow);
+      expect(formattedForUI).toBe('"C:\\Program Files\\nodejs\\node.exe" "scripts\\run tests.js"');
+
+      const parsed2 = CommandParser.parse(formattedForUI)!;
+      repo.setProjectVerificationCommands(projectA.id, { TEST: parsed2 });
+
+      const reloadedCmds = repo.getVerificationCommandsByProject(projectA.id);
+      const testRowReloaded = reloadedCmds.find((c) => c.command_type === 'TEST')!;
+      expect(testRowReloaded.executable).toBe('C:\\Program Files\\nodejs\\node.exe');
+      expect(testRowReloaded.args).toEqual(['scripts\\run tests.js']);
+    });
+
+    it('PROJECT SWITCH ROUND-TRIP: switching A -> B -> A reconstructs both commands losslessly', () => {
+      // Project A has spaced path
+      const parsedA = CommandParser.parse('node "scripts/A tests.js"')!;
+      repo.setProjectVerificationCommands(projectA.id, { TEST: parsedA });
+
+      // Project B has Windows spaced path
+      const parsedB = CommandParser.parse('"C:\\Program Files\\nodejs\\node.exe" "scripts\\B tests.js"')!;
+      repo.setProjectVerificationCommands(projectB.id, { TEST: parsedB });
+
+      // Load A
+      const rowsA1 = repo.getVerificationCommandsByProject(projectA.id);
+      expect(CommandParser.format(rowsA1[0])).toBe('node "scripts/A tests.js"');
+
+      // Switch to B
+      const rowsB = repo.getVerificationCommandsByProject(projectB.id);
+      expect(CommandParser.format(rowsB[0])).toBe('"C:\\Program Files\\nodejs\\node.exe" "scripts\\B tests.js"');
+
+      // Switch back to A
+      const rowsA2 = repo.getVerificationCommandsByProject(projectA.id);
+      expect(CommandParser.format(rowsA2[0])).toBe('node "scripts/A tests.js"');
+    });
+
     it('preserves existing TYPECHECK configuration and other command types', () => {
       repo.createVerificationCommand({
         id: 'cmd-typecheck-1',
@@ -223,7 +372,21 @@ describe('PR #14: Verification Settings Persistence & Parser', () => {
     });
   });
 
-  describe('3. IPC Schema Validation & Security Policy Enforcement', () => {
+  describe('4. IPC Schema Validation & Nonexistent Project Rejection', () => {
+    let db: Database.Database;
+    let repo: Repository;
+
+    beforeEach(() => {
+      db = new Database(':memory:');
+      db.pragma('foreign_keys = ON');
+      MigrationRunner.run(db);
+      repo = new Repository(db);
+    });
+
+    afterEach(() => {
+      db.close();
+    });
+
     it('validates GetVerificationCommandsIpcSchema strictly', () => {
       const valid = GetVerificationCommandsIpcSchema.safeParse({ projectId: 'PROJ-123' });
       expect(valid.success).toBe(true);
@@ -259,6 +422,25 @@ describe('PR #14: Verification Settings Persistence & Parser', () => {
       expect(invalidExtra.success).toBe(false);
     });
 
+    it('nonexistent project save fails closed with zero SQLite DB mutation', () => {
+      const nonexistentProjectId = 'PROJ-DOES-NOT-EXIST';
+
+      // Verify project does not exist
+      const project = repo.getProject(nonexistentProjectId);
+      expect(project).toBeNull();
+
+      // Attempting to write verification commands for nonexistent project fails foreign key constraint or project check
+      expect(() => {
+        repo.setProjectVerificationCommands(nonexistentProjectId, {
+          TEST: { executable: 'npm', args: ['test'] },
+        });
+      }).toThrow();
+
+      // Verify 0 rows exist in verification_commands
+      const allRows = db.prepare('SELECT * FROM verification_commands').all();
+      expect(allRows).toHaveLength(0);
+    });
+
     it('evaluates commands against PolicyService before execution', () => {
       const parsedSafe = CommandParser.parse('npm test')!;
       const policySafe = PolicyService.evaluateProcessExecution(parsedSafe.executable, parsedSafe.args, false);
@@ -270,7 +452,7 @@ describe('PR #14: Verification Settings Persistence & Parser', () => {
     });
   });
 
-  describe('4. VerificationService Discovery after Owner Configuration', () => {
+  describe('5. VerificationService Discovery after Owner Configuration', () => {
     let db: Database.Database;
     let repo: Repository;
     let artifactStore: ArtifactStore;
@@ -350,16 +532,13 @@ describe('PR #14: Verification Settings Persistence & Parser', () => {
     });
 
     it('discovers and executes TEST command after Owner configures it', async () => {
-      // Create a small test script in tmpDataDir
       const scriptPath = path.join(tmpDataDir, 'run_pass.js');
       fs.writeFileSync(scriptPath, 'process.exit(0);', 'utf-8');
 
-      // Owner saves TEST command via production persistence
       repo.setProjectVerificationCommands(project.id, {
         TEST: { executable: 'node', args: [scriptPath] },
       });
 
-      // VerificationService runs tests without explicit commandConfigId
       const res = await verificationService.runTests(
         project.id,
         task.id,

@@ -55,6 +55,30 @@ export const SettingsView: React.FC = () => {
   const [isActionLoading, setIsActionLoading] = useState<boolean>(false);
   const [updateError, setUpdateError] = useState<string | null>(null);
 
+  const formatCommand = (row?: { executable: string; args?: string[] | null }): string => {
+    if (!row || !row.executable || row.executable.trim().length === 0) {
+      return '';
+    }
+    const formatToken = (t: string): string => (t.length === 0 || /\s/.test(t) ? `"${t}"` : t);
+    const parts = [formatToken(row.executable)];
+    if (row.args && Array.isArray(row.args)) {
+      for (const arg of row.args) {
+        parts.push(formatToken(arg));
+      }
+    }
+    return parts.join(' ');
+  };
+
+  const applyCanonicalCommands = (commands: any[]) => {
+    const testRow = commands.find((c: any) => c.command_type === 'TEST' && c.enabled);
+    const lintRow = commands.find((c: any) => c.command_type === 'LINT' && c.enabled);
+    const buildRow = commands.find((c: any) => c.command_type === 'BUILD' && c.enabled);
+
+    setTestCmd(formatCommand(testRow));
+    setLintCmd(formatCommand(lintRow));
+    setBuildCmd(formatCommand(buildRow));
+  };
+
   // Load project-scoped verification commands from SQLite whenever activeProject changes
   useEffect(() => {
     let isMounted = true;
@@ -74,13 +98,7 @@ export const SettingsView: React.FC = () => {
       try {
         const res = await (window as any).orchestrator.getVerificationCommands(activeProject.id);
         if (isMounted && res?.success && Array.isArray(res.commands)) {
-          const testRow = res.commands.find((c: any) => c.command_type === 'TEST' && c.enabled);
-          const lintRow = res.commands.find((c: any) => c.command_type === 'LINT' && c.enabled);
-          const buildRow = res.commands.find((c: any) => c.command_type === 'BUILD' && c.enabled);
-
-          setTestCmd(testRow ? `${testRow.executable}${testRow.args?.length ? ' ' + testRow.args.join(' ') : ''}` : '');
-          setLintCmd(lintRow ? `${lintRow.executable}${lintRow.args?.length ? ' ' + lintRow.args.join(' ') : ''}` : '');
-          setBuildCmd(buildRow ? `${buildRow.executable}${buildRow.args?.length ? ' ' + buildRow.args.join(' ') : ''}` : '');
+          applyCanonicalCommands(res.commands);
         }
       } catch (err) {
         console.warn('Failed to load verification commands for project:', err);
@@ -191,7 +209,8 @@ export const SettingsView: React.FC = () => {
           },
         });
 
-        if (res?.success) {
+        if (res?.success && Array.isArray(res.commands)) {
+          applyCanonicalCommands(res.commands);
           setSaved(true);
           setTimeout(() => setSaved(false), 2000);
         } else {
