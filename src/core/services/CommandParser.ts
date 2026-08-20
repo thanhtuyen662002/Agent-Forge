@@ -6,10 +6,19 @@ export interface ParsedCommand {
 export class CommandParser {
   /**
    * Parses a single-line command string into structured executable and args without invoking a shell.
-   * Preserves quoted arguments (both single and double quotes).
-   * Native Windows backslash path separators ('\') and UNC paths ('\\server\share') are literal and preserved.
-   * Returns null for empty or whitespace-only input.
-   * Throws an Error on malformed/unclosed quotes or control characters.
+   *
+   * Grammar & Semantics:
+   * 1. Whitespace (' ' or '\t') separates tokens outside quotes.
+   * 2. Quoting:
+   *    - A token starting with '"' is double-quoted until a matching '"'.
+   *    - A token starting with "'" is single-quoted until a matching "'".
+   *    - Inside quotes, whitespace is preserved and all backslashes ('\') are literal.
+   * 3. Literal Apostrophes / Quotes in Unquoted Tokens:
+   *    - Unquoted tokens (e.g. O'Reilly's.js, param='val') preserve all characters literally.
+   *    - Quote characters mid-token are never silently stripped or deleted.
+   * 4. Native Windows backslash path separators ('\') and UNC paths ('\\server\share') are literal and preserved.
+   * 5. Returns null for empty or whitespace-only input.
+   * 6. Throws an Error on unterminated quotation marks or control characters.
    */
   public static parse(rawInput: string): ParsedCommand | null {
     const trimmed = rawInput.trim();
@@ -23,40 +32,63 @@ export class CommandParser {
     }
 
     const tokens: string[] = [];
-    let currentToken = '';
-    let inDoubleQuote = false;
-    let inSingleQuote = false;
+    let i = 0;
+    const len = trimmed.length;
 
-    for (let i = 0; i < trimmed.length; i++) {
-      const char = trimmed[i];
-
-      if (char === '"' && !inSingleQuote) {
-        inDoubleQuote = !inDoubleQuote;
-        continue;
+    while (i < len) {
+      // Skip whitespace outside quotes
+      while (i < len && (trimmed[i] === ' ' || trimmed[i] === '\t')) {
+        i++;
       }
+      if (i >= len) break;
 
-      if (char === "'" && !inDoubleQuote) {
-        inSingleQuote = !inSingleQuote;
-        continue;
-      }
+      const firstChar = trimmed[i];
 
-      if ((char === ' ' || char === '\t') && !inDoubleQuote && !inSingleQuote) {
-        if (currentToken.length > 0) {
-          tokens.push(currentToken);
-          currentToken = '';
+      if (firstChar === '"') {
+        // Double-quoted token
+        i++; // skip opening quote
+        let token = '';
+        let closed = false;
+        while (i < len) {
+          if (trimmed[i] === '"') {
+            closed = true;
+            i++; // skip closing quote
+            break;
+          }
+          token += trimmed[i];
+          i++;
         }
-        continue;
+        if (!closed) {
+          throw new Error('Command contains unterminated quotation mark.');
+        }
+        tokens.push(token);
+      } else if (firstChar === "'") {
+        // Single-quoted token
+        i++; // skip opening quote
+        let token = '';
+        let closed = false;
+        while (i < len) {
+          if (trimmed[i] === "'") {
+            closed = true;
+            i++; // skip closing quote
+            break;
+          }
+          token += trimmed[i];
+          i++;
+        }
+        if (!closed) {
+          throw new Error('Command contains unterminated quotation mark.');
+        }
+        tokens.push(token);
+      } else {
+        // Unquoted token: read until whitespace
+        let token = '';
+        while (i < len && trimmed[i] !== ' ' && trimmed[i] !== '\t') {
+          token += trimmed[i];
+          i++;
+        }
+        tokens.push(token);
       }
-
-      currentToken += char;
-    }
-
-    if (inDoubleQuote || inSingleQuote) {
-      throw new Error('Command contains unterminated quotation mark.');
-    }
-
-    if (currentToken.length > 0) {
-      tokens.push(currentToken);
     }
 
     if (tokens.length === 0) {
@@ -75,18 +107,47 @@ export class CommandParser {
 
   /**
    * Serializes a structured command into a canonical single-line Owner-editable command string.
-   * Quotes tokens containing whitespace or empty tokens with double quotes.
-   * Guarantees that parse(format(cmd)) deeply equals cmd for all valid structured commands.
+   * Quotes tokens containing whitespace or empty tokens.
+   * Preserves literal apostrophes and Windows path separators.
+   * Guarantees that parse(format(cmd)) deeply equals cmd for all supported commands.
    */
-  public static format(cmd: { executable: string; args?: string[] | null }): string {
-    if (!cmd.executable || cmd.executable.trim().length === 0) {
+  public static format(cmd?: { executable?: string | null; args?: string[] | null } | null): string {
+    if (!cmd || !cmd.executable || cmd.executable.trim().length === 0) {
       return '';
     }
 
     const formatToken = (token: string): string => {
-      if (token.length === 0 || /\s/.test(token)) {
+      if (token.length === 0) {
+        return '""';
+      }
+
+      const hasWhitespace = /\s/.test(token);
+      const hasDoubleQuote = token.includes('"');
+      const hasSingleQuote = token.includes("'");
+
+      if (hasWhitespace) {
+        if (hasDoubleQuote && hasSingleQuote) {
+          throw new Error(
+            `Token containing whitespace, single quotes, and double quotes cannot be safely serialized: "${token}"`
+          );
+        }
+        if (hasDoubleQuote) {
+          return `'${token}'`;
+        }
         return `"${token}"`;
       }
+
+      // If token starts with quote character, wrap to preserve exact token boundary
+      if (token.startsWith('"') || token.startsWith("'")) {
+        if (hasDoubleQuote && hasSingleQuote) {
+          throw new Error(`Ambiguous token starting with quote character: "${token}"`);
+        }
+        if (hasDoubleQuote) {
+          return `'${token}'`;
+        }
+        return `"${token}"`;
+      }
+
       return token;
     };
 

@@ -1,4 +1,4 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useRef } from 'react';
 import { useI18n } from '../context/I18nContext';
 import { useOrchestrator } from '../context/OrchestratorContext';
 import {
@@ -21,10 +21,16 @@ import {
   FolderGit2,
 } from 'lucide-react';
 import { UpdateStateSummary } from '../../core/types/domain';
+import { CommandParser } from '../../core/services/CommandParser';
 
 export const SettingsView: React.FC = () => {
   const { locale, setLocale, t } = useI18n();
   const { activeProject } = useOrchestrator();
+
+  const activeProjectIdRef = useRef<string | undefined>(activeProject?.id);
+  useEffect(() => {
+    activeProjectIdRef.current = activeProject?.id;
+  }, [activeProject?.id]);
 
   // Verification commands & policy state (initialized to empty strings; placeholders show examples)
   const [testCmd, setTestCmd] = useState<string>('');
@@ -55,38 +61,25 @@ export const SettingsView: React.FC = () => {
   const [isActionLoading, setIsActionLoading] = useState<boolean>(false);
   const [updateError, setUpdateError] = useState<string | null>(null);
 
-  const formatCommand = (row?: { executable: string; args?: string[] | null }): string => {
-    if (!row || !row.executable || row.executable.trim().length === 0) {
-      return '';
-    }
-    const formatToken = (t: string): string => (t.length === 0 || /\s/.test(t) ? `"${t}"` : t);
-    const parts = [formatToken(row.executable)];
-    if (row.args && Array.isArray(row.args)) {
-      for (const arg of row.args) {
-        parts.push(formatToken(arg));
-      }
-    }
-    return parts.join(' ');
-  };
-
   const applyCanonicalCommands = (commands: any[]) => {
     const testRow = commands.find((c: any) => c.command_type === 'TEST' && c.enabled);
     const lintRow = commands.find((c: any) => c.command_type === 'LINT' && c.enabled);
     const buildRow = commands.find((c: any) => c.command_type === 'BUILD' && c.enabled);
 
-    setTestCmd(formatCommand(testRow));
-    setLintCmd(formatCommand(lintRow));
-    setBuildCmd(formatCommand(buildRow));
+    setTestCmd(CommandParser.format(testRow));
+    setLintCmd(CommandParser.format(lintRow));
+    setBuildCmd(CommandParser.format(buildRow));
   };
 
   // Load project-scoped verification commands from SQLite whenever activeProject changes
   useEffect(() => {
+    const currentProjectId = activeProject?.id;
     let isMounted = true;
     setSaveError(null);
     setSaved(false);
 
     const loadVerificationCommands = async () => {
-      if (!activeProject?.id || !(window as any).orchestrator?.getVerificationCommands) {
+      if (!currentProjectId || !(window as any).orchestrator?.getVerificationCommands) {
         if (isMounted) {
           setTestCmd('');
           setLintCmd('');
@@ -96,8 +89,13 @@ export const SettingsView: React.FC = () => {
       }
 
       try {
-        const res = await (window as any).orchestrator.getVerificationCommands(activeProject.id);
-        if (isMounted && res?.success && Array.isArray(res.commands)) {
+        const res = await (window as any).orchestrator.getVerificationCommands(currentProjectId);
+        if (
+          isMounted &&
+          activeProjectIdRef.current === currentProjectId &&
+          res?.success &&
+          Array.isArray(res.commands)
+        ) {
           applyCanonicalCommands(res.commands);
         }
       } catch (err) {
@@ -195,19 +193,25 @@ export const SettingsView: React.FC = () => {
       return;
     }
 
+    const savedProjectId = activeProject.id;
     setSaveError(null);
     setSaved(false);
 
     try {
       if ((window as any).orchestrator?.saveVerificationCommands) {
         const res = await (window as any).orchestrator.saveVerificationCommands({
-          projectId: activeProject.id,
+          projectId: savedProjectId,
           commands: {
             TEST: testCmd,
             LINT: lintCmd,
             BUILD: buildCmd,
           },
         });
+
+        // Ignore stale async response if active project switched while save was in flight
+        if (activeProjectIdRef.current !== savedProjectId) {
+          return;
+        }
 
         if (res?.success && Array.isArray(res.commands)) {
           applyCanonicalCommands(res.commands);
@@ -218,7 +222,9 @@ export const SettingsView: React.FC = () => {
         }
       }
     } catch (err: any) {
-      setSaveError(err?.message || t('settings.saveFailed'));
+      if (activeProjectIdRef.current === savedProjectId) {
+        setSaveError(err?.message || t('settings.saveFailed'));
+      }
     }
   };
 

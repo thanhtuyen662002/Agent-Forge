@@ -15,7 +15,7 @@ import path from 'path';
 import fs from 'fs';
 import os from 'os';
 
-describe('PR #14: Verification Settings Persistence & Parser', () => {
+describe('PR #14: Verification Settings Persistence, Parser, & Formatter', () => {
   describe('1. Command Parser & Windows Path Handling', () => {
     it('CASE 1: parses basic command into structured executable and args', () => {
       const parsed = CommandParser.parse('node run_tests.js');
@@ -92,7 +92,55 @@ describe('PR #14: Verification Settings Persistence & Parser', () => {
     });
   });
 
-  describe('2. Canonical Command Formatter & parse(format(cmd)) Round-Trip Property', () => {
+  describe('2. Literal Apostrophe & Quote Semantics (No Silent Mutation)', () => {
+    it('preserves literal apostrophes in unquoted tokens without silent deletion', () => {
+      const parsed = CommandParser.parse("node O'Reilly's.js");
+      expect(parsed).toEqual({
+        executable: 'node',
+        args: ["O'Reilly's.js"],
+      });
+    });
+
+    it('preserves literal apostrophes inside quoted Windows paths', () => {
+      const parsed = CommandParser.parse('node "C:\\Users\\O\'Reilly\\run tests.js"');
+      expect(parsed).toEqual({
+        executable: 'node',
+        args: ["C:\\Users\\O'Reilly\\run tests.js"],
+      });
+    });
+
+    it('round-trips structured command with literal apostrophe', () => {
+      const cmd: ParsedCommand = {
+        executable: 'node',
+        args: ["O'Reilly's.js"],
+      };
+      const formatted = CommandParser.format(cmd);
+      expect(formatted).toBe("node O'Reilly's.js");
+      const parsed = CommandParser.parse(formatted);
+      expect(parsed).toEqual(cmd);
+    });
+
+    it('round-trips structured command with apostrophe in quoted path with spaces', () => {
+      const cmd: ParsedCommand = {
+        executable: 'node',
+        args: ["C:\\Users\\O'Reilly\\run tests.js"],
+      };
+      const formatted = CommandParser.format(cmd);
+      expect(formatted).toBe('node "C:\\Users\\O\'Reilly\\run tests.js"');
+      const parsed = CommandParser.parse(formatted);
+      expect(parsed).toEqual(cmd);
+    });
+
+    it('fails closed with explicit error for ambiguously mixed quotes with whitespace', () => {
+      const cmd: ParsedCommand = {
+        executable: 'node',
+        args: ['"quoted" and \'single\' with space'],
+      };
+      expect(() => CommandParser.format(cmd)).toThrow(/cannot be safely serialized/i);
+    });
+  });
+
+  describe('3. Canonical Command Formatter & parse(format(cmd)) Round-Trip Invariant', () => {
     const assertRoundTrip = (cmd: ParsedCommand) => {
       const formatted = CommandParser.format(cmd);
       const parsed = CommandParser.parse(formatted);
@@ -149,7 +197,7 @@ describe('PR #14: Verification Settings Persistence & Parser', () => {
     });
   });
 
-  describe('3. Repository Persistence & Project Isolation', () => {
+  describe('4. Repository Persistence & Project Isolation', () => {
     let db: Database.Database;
     let repo: Repository;
     let projectA: Project;
@@ -274,29 +322,23 @@ describe('PR #14: Verification Settings Persistence & Parser', () => {
     });
 
     it('SAVE -> LOAD -> SAVE Immutability: preserves exact argument boundaries without user edit', () => {
-      // 1. Owner enters input with spaced argument
       const inputString = 'node "scripts/run tests.js"';
       const parsed1 = CommandParser.parse(inputString)!;
       expect(parsed1).toEqual({ executable: 'node', args: ['scripts/run tests.js'] });
 
-      // 2. Persist to SQLite
       repo.setProjectVerificationCommands(projectA.id, { TEST: parsed1 });
 
-      // 3. Reload from SQLite
       const loadedCmds = repo.getVerificationCommandsByProject(projectA.id);
       const testRow = loadedCmds.find((c) => c.command_type === 'TEST')!;
       expect(testRow.executable).toBe('node');
       expect(testRow.args).toEqual(['scripts/run tests.js']);
 
-      // 4. Renderer formats using canonical formatter
       const formattedForUI = CommandParser.format(testRow);
       expect(formattedForUI).toBe('node "scripts/run tests.js"');
 
-      // 5. Save again without edits
       const parsed2 = CommandParser.parse(formattedForUI)!;
       repo.setProjectVerificationCommands(projectA.id, { TEST: parsed2 });
 
-      // 6. Assert SQLite remains exactly unchanged
       const reloadedCmds = repo.getVerificationCommandsByProject(projectA.id);
       const testRowReloaded = reloadedCmds.find((c) => c.command_type === 'TEST')!;
       expect(testRowReloaded.executable).toBe('node');
@@ -328,23 +370,18 @@ describe('PR #14: Verification Settings Persistence & Parser', () => {
     });
 
     it('PROJECT SWITCH ROUND-TRIP: switching A -> B -> A reconstructs both commands losslessly', () => {
-      // Project A has spaced path
       const parsedA = CommandParser.parse('node "scripts/A tests.js"')!;
       repo.setProjectVerificationCommands(projectA.id, { TEST: parsedA });
 
-      // Project B has Windows spaced path
       const parsedB = CommandParser.parse('"C:\\Program Files\\nodejs\\node.exe" "scripts\\B tests.js"')!;
       repo.setProjectVerificationCommands(projectB.id, { TEST: parsedB });
 
-      // Load A
       const rowsA1 = repo.getVerificationCommandsByProject(projectA.id);
       expect(CommandParser.format(rowsA1[0])).toBe('node "scripts/A tests.js"');
 
-      // Switch to B
       const rowsB = repo.getVerificationCommandsByProject(projectB.id);
       expect(CommandParser.format(rowsB[0])).toBe('"C:\\Program Files\\nodejs\\node.exe" "scripts\\B tests.js"');
 
-      // Switch back to A
       const rowsA2 = repo.getVerificationCommandsByProject(projectA.id);
       expect(CommandParser.format(rowsA2[0])).toBe('node "scripts/A tests.js"');
     });
@@ -372,7 +409,49 @@ describe('PR #14: Verification Settings Persistence & Parser', () => {
     });
   });
 
-  describe('4. IPC Schema Validation & Nonexistent Project Rejection', () => {
+  describe('5. Project-Switch In-Flight Save Race Protection', () => {
+    it('simulates race condition: stale save response from Project A does not overwrite Project B state', () => {
+      // Model the SettingsView activeProjectIdRef identity guard
+      let activeProjectId = 'PROJ-A';
+      let activeProjectIdRef = { current: activeProjectId };
+      let renderedCommandsState = {
+        TEST: 'node "scripts/A tests.js"',
+      };
+
+      // 1. Owner clicks Save while Project A is active
+      const savedProjectId = activeProjectId;
+
+      // 2. Before save response resolves, Owner switches to Project B
+      activeProjectId = 'PROJ-B';
+      activeProjectIdRef.current = activeProjectId;
+      renderedCommandsState = {
+        TEST: '"C:\\Program Files\\nodejs\\node.exe" "scripts\\B tests.js"',
+      };
+
+      // 3. Delayed save response for Project A returns
+      const saveResponseForA = {
+        success: true,
+        commands: [
+          {
+            command_type: 'TEST',
+            executable: 'node',
+            args: ['scripts/A tests.js'],
+            enabled: true,
+          },
+        ],
+      };
+
+      // 4. Response handler executes with identity check
+      if (activeProjectIdRef.current === savedProjectId) {
+        renderedCommandsState.TEST = CommandParser.format(saveResponseForA.commands[0]);
+      }
+
+      // 5. Verify renderedCommandsState for Project B was NOT polluted by Project A
+      expect(renderedCommandsState.TEST).toBe('"C:\\Program Files\\nodejs\\node.exe" "scripts\\B tests.js"');
+    });
+  });
+
+  describe('6. IPC Schema Validation & Nonexistent Project Rejection', () => {
     let db: Database.Database;
     let repo: Repository;
 
@@ -422,21 +501,18 @@ describe('PR #14: Verification Settings Persistence & Parser', () => {
       expect(invalidExtra.success).toBe(false);
     });
 
-    it('nonexistent project save fails closed with zero SQLite DB mutation', () => {
+    it('Repository: nonexistent project save fails closed with zero SQLite DB mutation', () => {
       const nonexistentProjectId = 'PROJ-DOES-NOT-EXIST';
 
-      // Verify project does not exist
       const project = repo.getProject(nonexistentProjectId);
       expect(project).toBeNull();
 
-      // Attempting to write verification commands for nonexistent project fails foreign key constraint or project check
       expect(() => {
         repo.setProjectVerificationCommands(nonexistentProjectId, {
           TEST: { executable: 'npm', args: ['test'] },
         });
       }).toThrow();
 
-      // Verify 0 rows exist in verification_commands
       const allRows = db.prepare('SELECT * FROM verification_commands').all();
       expect(allRows).toHaveLength(0);
     });
@@ -452,7 +528,7 @@ describe('PR #14: Verification Settings Persistence & Parser', () => {
     });
   });
 
-  describe('5. VerificationService Discovery after Owner Configuration', () => {
+  describe('7. VerificationService Discovery after Owner Configuration', () => {
     let db: Database.Database;
     let repo: Repository;
     let artifactStore: ArtifactStore;
