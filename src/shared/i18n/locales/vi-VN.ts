@@ -270,6 +270,12 @@ export const viVN: TranslationDictionary = {
       noRepoSelected: 'Chưa chọn kho mã nào (nhấn Chọn Kho mã)',
       cancelButton: 'Hủy',
       initButton: 'Khởi tạo Dự án',
+      repositoryErrors: {
+        notGitRepository: 'Thư mục đã chọn không phải là kho mã Git hợp lệ. Hãy chọn thư mục gốc của một kho Git.',
+        invalidLocation: 'Vị trí kho mã không hợp lệ. Đường dẫn thư mục không thể truy cập hoặc không được phép.',
+        unknown: 'Đã xảy ra lỗi không xác định khi chọn kho mã.',
+        technicalDetails: 'Chi tiết kỹ thuật: {error}',
+      },
     },
   },
   settings: {

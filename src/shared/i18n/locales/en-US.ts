@@ -270,6 +270,12 @@ export const enUS: TranslationDictionary = {
       noRepoSelected: 'No repository selected (click Choose Repository)',
       cancelButton: 'Cancel',
       initButton: 'Initialize Project',
+      repositoryErrors: {
+        notGitRepository: 'The selected directory is not a valid Git repository. Choose the root directory of a Git repository.',
+        invalidLocation: 'Invalid repository location. Directory path is not accessible or allowed.',
+        unknown: 'An unknown error occurred while selecting the repository.',
+        technicalDetails: 'Technical details: {error}',
+      },
     },
   },
   settings: {

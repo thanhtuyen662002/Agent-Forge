@@ -59,7 +59,6 @@ export function registerIpcHandlers(
   ipcMain.handle('dialog:selectRepository', async () => {
     const { canceled, filePaths } = await dialog.showOpenDialog({
       properties: ['openDirectory'],
-      title: 'Select Git Repository for Project',
     });
 
     if (canceled || filePaths.length === 0) {
@@ -71,15 +70,23 @@ export function registerIpcHandlers(
     // Validate path against security policy
     const policy = PolicyService.evaluatePathAccess(selectedPath, selectedPath, false);
     if (!policy.allowed) {
-      return { success: false, error: `Invalid repository location: ${policy.reason}` };
+      return {
+        success: false,
+        errorCode: 'INVALID_REPOSITORY_LOCATION',
+        errorDetail: policy.reason,
+        error: `Invalid repository location: ${policy.reason}`,
+      };
     }
 
     // Verify directory is a genuine Git working tree
     const gitStatus = await GitService.getStatus(selectedPath);
     if (gitStatus.status !== 'SUCCESS') {
+      const errorDetail = gitStatus.errorMessage || 'git status failed';
       return {
         success: false,
-        error: `Selected directory is not a valid Git repository (${gitStatus.errorMessage || 'git status failed'}).`,
+        errorCode: 'NOT_GIT_REPOSITORY',
+        errorDetail,
+        error: `Selected directory is not a valid Git repository (${errorDetail}).`,
       };
     }
 

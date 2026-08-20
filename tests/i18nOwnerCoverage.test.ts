@@ -360,4 +360,53 @@ describe('Owner Vietnamese I18n Coverage Contract (PR #11)', () => {
     // Assert unified right-side badge group container exists
     expect(content.includes('flex items-center gap-2 shrink-0')).toBe(true);
   });
+
+  it('13. Repository selection error classification and ProjectsView localization contract', () => {
+    const ipcHandlersPath = path.resolve(__dirname, '..', 'src/electron/ipcHandlers.ts');
+    const ipcContent = fs.readFileSync(ipcHandlersPath, 'utf-8');
+
+    // 1. Assert ipcHandlers returns structured error codes
+    expect(ipcContent.includes("errorCode: 'NOT_GIT_REPOSITORY'")).toBe(true);
+    expect(ipcContent.includes("errorCode: 'INVALID_REPOSITORY_LOCATION'")).toBe(true);
+
+    // 2. Assert hardcoded English dialog title is removed
+    expect(ipcContent.includes("title: 'Select Git Repository for Project'")).toBe(false);
+
+    // 3. Assert preload type includes errorCode
+    const preloadPath = path.resolve(__dirname, '..', 'src/electron/preload.ts');
+    const preloadContent = fs.readFileSync(preloadPath, 'utf-8');
+    expect(preloadContent.includes("errorCode?: 'NOT_GIT_REPOSITORY' | 'INVALID_REPOSITORY_LOCATION' | 'UNKNOWN_ERROR'")).toBe(true);
+
+    // 4. Assert ProjectsView does NOT directly render raw res.error
+    const projectsViewPath = path.resolve(__dirname, '..', 'src/ui/views/ProjectsView.tsx');
+    const projectsViewContent = fs.readFileSync(projectsViewPath, 'utf-8');
+    expect(projectsViewContent.includes('setErrorStatus(res.error)')).toBe(false);
+    expect(projectsViewContent.includes('setErrorStatus(res?.error)')).toBe(false);
+
+    // 5. Assert ProjectsView maps repository selection errors through i18n
+    expect(projectsViewContent.includes("t('projects.createModal.repositoryErrors.notGitRepository')")).toBe(true);
+    expect(projectsViewContent.includes("t('projects.createModal.repositoryErrors.invalidLocation')")).toBe(true);
+    expect(projectsViewContent.includes("t('projects.createModal.repositoryErrors.unknown')")).toBe(true);
+    expect(projectsViewContent.includes("t('projects.createModal.repositoryErrors.technicalDetails'")).toBe(true);
+  });
+
+  it('14. Repository selection error translations resolve accurately in both en-US and vi-VN', () => {
+    const enNotGit = getTranslation('en-US', 'projects.createModal.repositoryErrors.notGitRepository');
+    expect(enNotGit).toBe('The selected directory is not a valid Git repository. Choose the root directory of a Git repository.');
+
+    const viNotGit = getTranslation('vi-VN', 'projects.createModal.repositoryErrors.notGitRepository');
+    expect(viNotGit).toBe('Thư mục đã chọn không phải là kho mã Git hợp lệ. Hãy chọn thư mục gốc của một kho Git.');
+
+    const enInvalid = getTranslation('en-US', 'projects.createModal.repositoryErrors.invalidLocation');
+    expect(enInvalid).toBe('Invalid repository location. Directory path is not accessible or allowed.');
+
+    const viInvalid = getTranslation('vi-VN', 'projects.createModal.repositoryErrors.invalidLocation');
+    expect(viInvalid).toBe('Vị trí kho mã không hợp lệ. Đường dẫn thư mục không thể truy cập hoặc không được phép.');
+
+    const enTech = getTranslation('en-US', 'projects.createModal.repositoryErrors.technicalDetails', { error: 'fatal: not a git repository' });
+    expect(enTech).toBe('Technical details: fatal: not a git repository');
+
+    const viTech = getTranslation('vi-VN', 'projects.createModal.repositoryErrors.technicalDetails', { error: 'fatal: not a git repository' });
+    expect(viTech).toBe('Chi tiết kỹ thuật: fatal: not a git repository');
+  });
 });
