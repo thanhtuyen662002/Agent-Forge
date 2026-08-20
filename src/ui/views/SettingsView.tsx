@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useRef } from 'react';
+import React, { useState, useEffect, useRef, useLayoutEffect } from 'react';
 import { useI18n } from '../context/I18nContext';
 import { useOrchestrator } from '../context/OrchestratorContext';
 import {
@@ -28,7 +28,7 @@ export const SettingsView: React.FC = () => {
   const { activeProject } = useOrchestrator();
 
   const activeProjectIdRef = useRef<string | undefined>(activeProject?.id);
-  useEffect(() => {
+  useLayoutEffect(() => {
     activeProjectIdRef.current = activeProject?.id;
   }, [activeProject?.id]);
 
