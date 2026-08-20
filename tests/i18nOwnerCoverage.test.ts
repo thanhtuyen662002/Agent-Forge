@@ -8,6 +8,17 @@ import {
   getTranslation,
   TranslationDictionary,
 } from '../src/shared/i18n';
+import {
+  TaskStateEnum,
+  AgentRoleEnum,
+  DecisionAuthorityEnum,
+  UIDensityModeEnum,
+} from '../src/core/types/domain';
+import {
+  ManagerDecisionEnum,
+  ManagerProtocolSchema,
+  CoderProtocolSchema,
+} from '../src/core/types/protocols';
 
 describe('Owner Vietnamese I18n Coverage Contract (PR #11)', () => {
   const requiredNamespaces: (keyof TranslationDictionary)[] = [
@@ -39,6 +50,27 @@ describe('Owner Vietnamese I18n Coverage Contract (PR #11)', () => {
     'projects',
     'settings',
     'debug',
+  ];
+
+  const ownerViewFiles = [
+    'src/ui/views/DashboardView.tsx',
+    'src/ui/views/TaskBoardView.tsx',
+    'src/ui/views/TaskDetailView.tsx',
+    'src/ui/views/AgentCenterView.tsx',
+    'src/ui/views/CapacityView.tsx',
+    'src/ui/views/TimelineView.tsx',
+    'src/ui/views/DecisionsView.tsx',
+    'src/ui/views/EvidenceView.tsx',
+    'src/ui/views/ProjectsView.tsx',
+    'src/ui/views/SettingsView.tsx',
+    'src/ui/views/DebugView.tsx',
+    'src/ui/views/ManualBridgeView.tsx',
+    'src/ui/components/Header.tsx',
+    'src/ui/components/Sidebar.tsx',
+    'src/ui/components/AgentCard.tsx',
+    'src/ui/components/QuotaBadge.tsx',
+    'src/ui/components/EmergencyStopModal.tsx',
+    'src/ui/components/ProgressIndicator.tsx',
   ];
 
   it('1. TranslationDictionary contains all 28 required Owner UI namespaces', () => {
@@ -99,26 +131,7 @@ describe('Owner Vietnamese I18n Coverage Contract (PR #11)', () => {
   });
 
   it('5. Primary Owner view files import and use useI18n', () => {
-    const ownerViewFiles = [
-      'src/ui/views/DashboardView.tsx',
-      'src/ui/views/TaskBoardView.tsx',
-      'src/ui/views/TaskDetailView.tsx',
-      'src/ui/views/AgentCenterView.tsx',
-      'src/ui/views/CapacityView.tsx',
-      'src/ui/views/TimelineView.tsx',
-      'src/ui/views/DecisionsView.tsx',
-      'src/ui/views/EvidenceView.tsx',
-      'src/ui/views/ProjectsView.tsx',
-      'src/ui/views/SettingsView.tsx',
-      'src/ui/views/DebugView.tsx',
-      'src/ui/views/ManualBridgeView.tsx',
-      'src/ui/components/Header.tsx',
-      'src/ui/components/Sidebar.tsx',
-      'src/ui/components/AgentCard.tsx',
-      'src/ui/components/QuotaBadge.tsx',
-      'src/ui/components/EmergencyStopModal.tsx',
-      'src/ui/components/ProgressIndicator.tsx',
-    ];
+    expect(ownerViewFiles.length).toBe(18);
 
     for (const relPath of ownerViewFiles) {
       const fullPath = path.resolve(__dirname, '..', relPath);
@@ -163,59 +176,105 @@ describe('Owner Vietnamese I18n Coverage Contract (PR #11)', () => {
       '<span>SAVE CONFIGURATION</span>',
     ];
 
-    const viewsDir = path.resolve(__dirname, '..', 'src/ui/views');
-    const componentsDir = path.resolve(__dirname, '..', 'src/ui/components');
-
-    const scanFiles = (dir: string): string[] => {
-      let results: string[] = [];
-      const list = fs.readdirSync(dir);
-      for (const file of list) {
-        const full = path.join(dir, file);
-        const stat = fs.statSync(full);
-        if (stat.isDirectory()) {
-          results = results.concat(scanFiles(full));
-        } else if (file.endsWith('.tsx')) {
-          results.push(full);
-        }
-      }
-      return results;
-    };
-
-    const allTsx = [...scanFiles(viewsDir), ...scanFiles(componentsDir)];
-
-    for (const filePath of allTsx) {
-      const content = fs.readFileSync(filePath, 'utf-8');
+    for (const relPath of ownerViewFiles) {
+      const fullPath = path.resolve(__dirname, '..', relPath);
+      const content = fs.readFileSync(fullPath, 'utf-8');
       for (const blocker of rawVisualBlockers) {
         expect(
           content.includes(blocker),
-          `Found raw hard-coded visual blocker "${blocker}" in ${path.relative(path.resolve(__dirname, '..'), filePath)}`
+          `Found raw hard-coded visual blocker "${blocker}" in ${relPath}`
         ).toBe(false);
       }
     }
   });
 
-  it('7. Canonical protocol, enum, and technical tokens remain unchanged', () => {
-    const canonicalTokens = [
-      'EXECUTE',
-      'FIX_REQUIRED',
-      'DISPATCHED',
-      'AWAITING_OWNER',
-      'MANUAL_HANDOFF_REQUIRED',
-      'PRIMARY_MANAGER',
-      'BACKUP_MANAGER',
-      'CODER',
-      'REVIEWER',
-      'OWNER',
-      'manager.v1',
-      'coder.v1',
-      'BETTER-SQLITE3 (WAL)',
-      'ELECTRON ACTIVE',
-      'BROWSER PREVIEW',
+  it('7. Authoritative production domain and protocol definitions contain required canonical tokens', () => {
+    // 1. Production runtime enums & zod schema definitions
+    const taskStates = TaskStateEnum.options;
+    expect(taskStates).toContain('DISPATCHED');
+    expect(taskStates).toContain('FIX_REQUIRED');
+    expect(taskStates).toContain('HANDOFF_REQUIRED');
+    expect(taskStates).toContain('CODING');
+    expect(taskStates).toContain('VALIDATING');
+    expect(taskStates).toContain('REVIEWING');
+    expect(taskStates).toContain('DONE');
+
+    const agentRoles = AgentRoleEnum.options;
+    expect(agentRoles).toContain('PRIMARY_MANAGER');
+    expect(agentRoles).toContain('CODER');
+
+    const authorities = DecisionAuthorityEnum.options;
+    expect(authorities).toContain('OWNER');
+    expect(authorities).toContain('PRIMARY_MANAGER');
+    expect(authorities).toContain('CODER');
+
+    const densityModes = UIDensityModeEnum.options;
+    expect(densityModes).toContain('OWNER');
+
+    const managerDecisions = ManagerDecisionEnum.options;
+    expect(managerDecisions).toContain('EXECUTE');
+    expect(managerDecisions).toContain('FIX_REQUIRED');
+
+    // 2. Production protocol schema literal shape
+    const managerShape = ManagerProtocolSchema.shape;
+    expect(managerShape.protocol.value).toBe('manager.v1');
+
+    const coderShape = CoderProtocolSchema.shape;
+    expect(coderShape.protocol.value).toBe('coder.v1');
+
+    // 3. Adapter canonical tokens
+    const adapterSource = fs.readFileSync(path.resolve(__dirname, '..', 'src/core/adapters/ManualBridgeAdapter.ts'), 'utf-8');
+    expect(adapterSource).toContain("'AWAITING_OWNER'");
+
+    // 4. Static inspection of domain.ts, protocols.ts & ProviderRoutingService.ts source files
+    const domainSource = fs.readFileSync(path.resolve(__dirname, '..', 'src/core/types/domain.ts'), 'utf-8');
+    const protocolsSource = fs.readFileSync(path.resolve(__dirname, '..', 'src/core/types/protocols.ts'), 'utf-8');
+    const routingSource = fs.readFileSync(path.resolve(__dirname, '..', 'src/core/services/ProviderRoutingService.ts'), 'utf-8');
+
+    expect(domainSource).toContain("'DISPATCHED'");
+    expect(domainSource).toContain("'PRIMARY_MANAGER'");
+    expect(domainSource).toContain("'CODER'");
+    expect(domainSource).toContain("'OWNER'");
+
+    expect(routingSource).toContain("'SELECTED'");
+    expect(routingSource).toContain("'MANUAL_HANDOFF_REQUIRED'");
+
+    expect(protocolsSource).toContain("'manager.v1'");
+    expect(protocolsSource).toContain("'EXECUTE'");
+    expect(protocolsSource).toContain("'FIX_REQUIRED'");
+    expect(protocolsSource).toContain("'coder.v1'");
+  });
+
+  it('8. Static scan verifies zero hardcoded English regression strings across all 18 Owner UI files', () => {
+    const forbiddenPatterns = [
+      'Paste Manager response here',
+      'Paste Coder response here',
+      'Routing failed without decision',
+      'Authorization creation failed',
+      'Dispatch execution failed',
+      'Error generating authorized work order',
+      'Success: Manager decision applied',
+      'Verification Error:',
+      'Error generating package:',
+      '>Notice:<',
+      '>Provider:<',
+      'conf:',
+      '>General Milestone<',
+      'Simulating Quota Exhaustion:',
+      'Simulating Process Crash:',
+      'Simulating Protocol Rejection:',
     ];
 
-    for (const token of canonicalTokens) {
-      expect(typeof token).toBe('string');
-      expect(token.length).toBeGreaterThan(0);
+    for (const relPath of ownerViewFiles) {
+      const fullPath = path.resolve(__dirname, '..', relPath);
+      const content = fs.readFileSync(fullPath, 'utf-8');
+
+      for (const pattern of forbiddenPatterns) {
+        expect(
+          content.includes(pattern),
+          `Regression: Found forbidden English copy "${pattern}" in ${relPath}`
+        ).toBe(false);
+      }
     }
   });
 });

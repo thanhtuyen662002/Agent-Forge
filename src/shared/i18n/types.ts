@@ -471,6 +471,35 @@ export interface TranslationDictionary {
     oneClickCopyButton: string;
     copiedButton: string;
     outboxPlaceholder: string;
+    providerLabel: string;
+    revisionShortLabel: string;
+    maxLabel: string;
+    unknownLabel: string;
+    confidenceShortLabel: string;
+    generalMilestone: string;
+    noticeLabel: string;
+    routingFailedWithoutDecision: string;
+    errorExecutingRouting: string;
+    errorExecutingRoutingDefault: string;
+    authCreationFailed: string;
+    errorExecutingAuth: string;
+    errorExecutingAuthDefault: string;
+    dispatchExecutionFailed: string;
+    errorDispatchingAuth: string;
+    errorDispatchingAuthDefault: string;
+    errorGeneratingWorkOrder: string;
+    managerDecisionAppliedSuccess: string;
+    managerDecisionAppliedDefault: string;
+    managerDecisionApplyFailed: string;
+    managerDecisionApplyFailedDefault: string;
+    coderReportAppliedRunningTests: string;
+    coderReportAppliedDefault: string;
+    testsPassed: string;
+    testsFailed: string;
+    coderReportAppliedWithTests: string;
+    coderReportApplyError: string;
+    verificationError: string;
+    errorGeneratingPackage: string;
   };
   managerInbox: {
     title: string;
@@ -614,5 +643,10 @@ export interface TranslationDictionary {
     databaseLabel: string;
     totalTasksLabel: string;
     activeResourcesLabel: string;
+    simQuotaExhaustionStatus: string;
+    simCrashStatus: string;
+    simInvalidProtocolStatus: string;
+    ipcElectronActive: string;
+    ipcBrowserPreview: string;
   };
 }

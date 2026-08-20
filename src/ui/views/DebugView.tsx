@@ -9,15 +9,15 @@ export const DebugView: React.FC = () => {
   const [simStatus, setSimStatus] = useState<string | null>(null);
 
   const handleSimulateQuotaExhaustion = () => {
-    setSimStatus('Simulating Quota Exhaustion: Coder model quota depleted -> Triggered task HANDOFF_REQUIRED state.');
+    setSimStatus(t('debug.simQuotaExhaustionStatus'));
   };
 
   const handleSimulateCrash = () => {
-    setSimStatus('Simulating Process Crash: Tracked child process terminated abruptly -> CrashRecoveryService reconciled orphaned run.');
+    setSimStatus(t('debug.simCrashStatus'));
   };
 
   const handleSimulateInvalidProtocol = () => {
-    setSimStatus('Simulating Protocol Rejection: Corrupt payload rejected by Zod schema with descriptive validation feedback.');
+    setSimStatus(t('debug.simInvalidProtocolStatus'));
   };
 
   return (
@@ -97,7 +97,7 @@ export const DebugView: React.FC = () => {
           <div className="p-3 bg-surface rounded-lg border border-surface-border">
             <span className="text-slate-500 block text-[10px]">{t('debug.ipcBridgeLabel')}</span>
             <strong className={isElectron ? 'text-emerald-400' : 'text-amber-400'}>
-              {isElectron ? 'ELECTRON ACTIVE' : 'BROWSER PREVIEW'}
+              {isElectron ? t('debug.ipcElectronActive') : t('debug.ipcBrowserPreview')}
             </strong>
           </div>
           <div className="p-3 bg-surface rounded-lg border border-surface-border">

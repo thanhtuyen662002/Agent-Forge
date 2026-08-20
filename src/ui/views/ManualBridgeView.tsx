@@ -204,10 +204,10 @@ export const ManualBridgeView: React.FC = () => {
       if (res && res.success && res.decision) {
         setRoutingDecision(res.decision);
       } else {
-        setRoutingError(res?.error || 'Routing failed without decision.');
+        setRoutingError(res?.error || t('manualBridge.routingFailedWithoutDecision'));
       }
     } catch (err: any) {
-      setRoutingError(err.message || 'Error executing routing.');
+      setRoutingError(err.message ? t('manualBridge.errorExecutingRouting', { error: err.message }) : t('manualBridge.errorExecutingRoutingDefault'));
     } finally {
       setIsRouting(false);
       await loadSnapshot();
@@ -230,10 +230,10 @@ export const ManualBridgeView: React.FC = () => {
       if (res && res.success && res.authorization) {
         setAuthorization(res.authorization);
       } else {
-        setAuthError(res?.error || 'Authorization creation failed.');
+        setAuthError(res?.error || t('manualBridge.authCreationFailed'));
       }
     } catch (err: any) {
-      setAuthError(err.message || 'Error executing authorization.');
+      setAuthError(err.message ? t('manualBridge.errorExecutingAuth', { error: err.message }) : t('manualBridge.errorExecutingAuthDefault'));
     } finally {
       setIsAuthorizing(false);
       await loadSnapshot();
@@ -250,10 +250,10 @@ export const ManualBridgeView: React.FC = () => {
       if (res && res.success && res.result) {
         setDispatchResult(res.result);
       } else {
-        setDispatchError(res?.error || res?.result?.error || 'Dispatch execution failed.');
+        setDispatchError(res?.error || res?.result?.error || t('manualBridge.dispatchExecutionFailed'));
       }
     } catch (err: any) {
-      setDispatchError(err.message || 'Error dispatching authorization.');
+      setDispatchError(err.message ? t('manualBridge.errorDispatchingAuth', { error: err.message }) : t('manualBridge.errorDispatchingAuthDefault'));
     } finally {
       setIsDispatching(false);
       await loadSnapshot();
@@ -269,10 +269,10 @@ export const ManualBridgeView: React.FC = () => {
       if (res && res.success && res.workOrder) {
         setHandoffWorkOrder(res.workOrder);
       } else {
-        setHandoffWorkOrder(`Error generating authorized work order: ${res?.error || 'Unknown error'}`);
+        setHandoffWorkOrder(t('manualBridge.errorGeneratingWorkOrder', { error: res?.error || t('common.unknown') }));
       }
     } catch (err: any) {
-      setHandoffWorkOrder(`Error generating authorized work order: ${err.message}`);
+      setHandoffWorkOrder(t('manualBridge.errorGeneratingWorkOrder', { error: err.message }));
     } finally {
       setIsGeneratingHandoffWorkOrder(false);
     }
@@ -300,10 +300,10 @@ export const ManualBridgeView: React.FC = () => {
     if (!managerInput.trim()) return;
     const res = await applyProtocol(managerInput);
     if (res.success) {
-      setManagerApplyStatus(`Success: ${res.message || 'Manager decision applied.'}`);
+      setManagerApplyStatus(t('manualBridge.managerDecisionAppliedSuccess', { message: res.message || t('manualBridge.managerDecisionAppliedDefault') }));
       await loadSnapshot();
     } else {
-      setManagerApplyStatus(`Error: ${res.error || 'Failed to apply manager decision.'}`);
+      setManagerApplyStatus(t('manualBridge.managerDecisionApplyFailed', { error: res.error || t('manualBridge.managerDecisionApplyFailedDefault') }));
     }
   };
 
@@ -323,21 +323,24 @@ export const ManualBridgeView: React.FC = () => {
     try {
       const res = await applyProtocol(coderInput);
       if (res.success) {
-        setCoderApplyStatus(`Success: ${res.message || 'Coder report applied.'}. Running verification tests...`);
+        setCoderApplyStatus(t('manualBridge.coderReportAppliedRunningTests', { message: res.message || t('manualBridge.coderReportAppliedDefault') }));
         if (res.task?.id) {
           const verifRes = await runVerificationTests(res.task.id);
+          const outcome = verifRes.success ? t('manualBridge.testsPassed') : t('manualBridge.testsFailed');
           setCoderApplyStatus(
-            `Success: Coder report applied. Tests ${verifRes.success ? 'PASSED' : 'FAILED'} (Exit code: ${
-              verifRes.testRun?.exit_code
-            }). Task state: ${verifRes.finalTaskState}.`
+            t('manualBridge.coderReportAppliedWithTests', {
+              outcome,
+              code: (verifRes.testRun?.exit_code ?? 0).toString(),
+              state: verifRes.finalTaskState || '',
+            })
           );
         }
         await loadSnapshot();
       } else {
-        setCoderApplyStatus(`Error: ${res.error}`);
+        setCoderApplyStatus(t('manualBridge.coderReportApplyError', { error: res.error || t('common.unknown') }));
       }
     } catch (err: any) {
-      setCoderApplyStatus(`Verification Error: ${err.message}`);
+      setCoderApplyStatus(t('manualBridge.verificationError', { error: err.message || t('common.unknown') }));
     } finally {
       setIsVerifying(false);
     }
@@ -358,7 +361,7 @@ export const ManualBridgeView: React.FC = () => {
         setOutboxContent(text);
       }
     } catch (err: any) {
-      setOutboxContent(`Error generating package: ${err.message}`);
+      setOutboxContent(t('manualBridge.errorGeneratingPackage', { error: err.message }));
     } finally {
       setIsGenerating(false);
     }
@@ -508,9 +511,9 @@ export const ManualBridgeView: React.FC = () => {
                   onChange={(e) => handleTaskChange(e.target.value)}
                   className="w-full bg-surface border border-surface-border rounded-lg px-3 py-2 text-xs text-white focus:outline-none focus:border-forge-amber font-mono"
                 >
-                  {tasks.map((t) => (
-                    <option key={t.id} value={t.id}>
-                      {t.id}: {t.title} ({t.state} &mdash; Rev {t.revision_count})
+                  {tasks.map((taskItem) => (
+                    <option key={taskItem.id} value={taskItem.id}>
+                      {taskItem.id}: {taskItem.title} ({taskItem.state} &mdash; {t('manualBridge.revisionShortLabel')} {taskItem.revision_count})
                     </option>
                   ))}
                 </select>
@@ -524,7 +527,7 @@ export const ManualBridgeView: React.FC = () => {
                       <span className="px-2 py-0.5 rounded bg-slate-800 text-forge-cyan border border-slate-700 mr-1.5">
                         {currentTask.state}
                       </span>
-                      Rev {currentTask.revision_count} (Max {currentTask.max_revisions})
+                      {t('manualBridge.revisionShortLabel')} {currentTask.revision_count} ({t('manualBridge.maxLabel')} {currentTask.max_revisions})
                     </span>
                   </div>
                   <div className="flex items-center justify-between">
@@ -533,8 +536,8 @@ export const ManualBridgeView: React.FC = () => {
                   </div>
                   <div className="flex items-center justify-between">
                     <span className="text-slate-400">{t('manualBridge.baseShaRepoHeadLabel')}:</span>
-                    <span className="text-slate-300 truncate max-w-[200px]" title={snapshot?.gitHeadSha || 'Unknown'}>
-                      {currentTask.base_sha?.slice(0, 7) || 'HEAD'} / {snapshot?.gitHeadSha?.slice(0, 7) || 'Unknown'}
+                    <span className="text-slate-300 truncate max-w-[200px]" title={snapshot?.gitHeadSha || t('manualBridge.unknownLabel')}>
+                      {currentTask.base_sha?.slice(0, 7) || 'HEAD'} / {snapshot?.gitHeadSha?.slice(0, 7) || t('manualBridge.unknownLabel')}
                     </span>
                   </div>
                 </div>
@@ -664,7 +667,7 @@ export const ManualBridgeView: React.FC = () => {
                               <span className="text-[10px] text-slate-400">({res.id})</span>
                             </div>
                             <div className="text-[10px] text-slate-400">
-                              Provider: <strong className="text-slate-300">{res.provider_id}</strong>
+                              {t('manualBridge.providerLabel')}: <strong className="text-slate-300">{res.provider_id}</strong>
                             </div>
                           </div>
                         </div>
@@ -718,7 +721,7 @@ export const ManualBridgeView: React.FC = () => {
                             </span>
                           ) : (
                             <span className="px-1.5 py-0.2 rounded bg-emerald-950/30 text-emerald-300 border border-emerald-800/30">
-                              {t('capacity.quotaLabel')}: {res.remaining_quota} / {res.total_quota} {res.quota_unit} [{res.quota_source}, conf: {res.quota_confidence}]
+                              {t('capacity.quotaLabel')}: {res.remaining_quota} / {res.total_quota} {res.quota_unit} [{res.quota_source}, {t('manualBridge.confidenceShortLabel')}: {res.quota_confidence}]
                             </span>
                           )}
                         </div>
@@ -1051,7 +1054,7 @@ export const ManualBridgeView: React.FC = () => {
               <textarea
                 value={managerInput}
                 onChange={(e) => setManagerInput(e.target.value)}
-                placeholder='Paste Manager response here (e.g. { "protocol": "manager.v1", "decision": "EXECUTE", ... })'
+                placeholder={t('managerInbox.placeholder')}
                 className="w-full h-80 bg-surface border border-surface-border rounded-lg p-3.5 text-xs text-slate-100 font-mono focus:outline-none focus:border-forge-purple resize-none"
               />
             </div>
@@ -1097,7 +1100,7 @@ export const ManualBridgeView: React.FC = () => {
 
                 <div className="bg-surface p-4 rounded-lg border border-surface-border space-y-2">
                   <div>{t('routing.decisionId')}: <strong className="text-white">{managerParseResult.data?.data?.message_id}</strong></div>
-                  <div>{t('managerInbox.targetTaskLabel')}: <strong className="text-forge-cyan">{managerParseResult.data?.data?.task_id || 'General Milestone'}</strong></div>
+                  <div>{t('managerInbox.targetTaskLabel')}: <strong className="text-forge-cyan">{managerParseResult.data?.data?.task_id || t('manualBridge.generalMilestone')}</strong></div>
                   <div>{t('managerInbox.title')}: <span className="px-2 py-0.5 rounded bg-forge-purple/20 text-forge-purple font-bold border border-forge-purple/40">{managerParseResult.data?.data?.decision}</span></div>
                   <div>{t('manualBridge.riskPriorityLabel')}: <span className="text-slate-300">{managerParseResult.data?.data?.priority} / {managerParseResult.data?.data?.risk}</span></div>
                   <div>{t('managerInbox.criteriaDefinedLabel')}: <span className="text-white">{managerParseResult.data?.data?.acceptance_criteria?.length || 0}</span></div>
@@ -1149,7 +1152,7 @@ export const ManualBridgeView: React.FC = () => {
               <textarea
                 value={coderInput}
                 onChange={(e) => setCoderInput(e.target.value)}
-                placeholder='Paste Coder response here (e.g. { "protocol": "coder.v1", "status": "COMPLETED", ... })'
+                placeholder={t('coderInbox.placeholder')}
                 className="w-full h-80 bg-surface border border-surface-border rounded-lg p-3.5 text-xs text-slate-100 font-mono focus:outline-none focus:border-forge-cyan resize-none"
               />
             </div>
@@ -1236,7 +1239,7 @@ export const ManualBridgeView: React.FC = () => {
           {/* Left: Configuration Form (1 col) */}
           <div className="bg-surface-card border border-surface-border rounded-xl p-5 shadow space-y-4">
             <div className="p-3 bg-slate-900/50 border border-slate-700/50 rounded-lg text-[11px] font-mono text-slate-300">
-              <span className="font-bold text-slate-200">Notice:</span> {t('manualBridge.outboxNoticeText')}
+              <span className="font-bold text-slate-200">{t('manualBridge.noticeLabel')}:</span> {t('manualBridge.outboxNoticeText')}
             </div>
 
             <h3 className="text-xs font-mono font-semibold text-slate-300 uppercase tracking-wider">
