@@ -38,6 +38,36 @@ export const Header: React.FC = () => {
     }
   };
 
+  const getStatusLabel = (status?: string) => {
+    switch (status) {
+      case 'READY':
+        return t('header.statusReady');
+      case 'RUNNING':
+        return t('header.statusRunning');
+      case 'PAUSED':
+        return t('header.statusPaused');
+      case 'BLOCKED':
+        return t('header.statusBlocked');
+      case 'COMPLETED':
+        return t('header.statusCompleted');
+      default:
+        return status || '';
+    }
+  };
+
+  const getModeLabel = (mode: UIDensityMode) => {
+    switch (mode) {
+      case 'OWNER':
+        return t('header.modeOwner');
+      case 'ENGINEER':
+        return t('header.modeEngineer');
+      case 'DEBUG':
+        return t('header.modeDebug');
+      default:
+        return mode;
+    }
+  };
+
   return (
     <header className="h-16 bg-surface border-b border-surface-border px-6 flex items-center justify-between shrink-0 z-30">
       {/* Left: Brand & Project Selector */}
@@ -73,7 +103,7 @@ export const Header: React.FC = () => {
           {activeProject && (
             <div className={`px-2.5 py-1 rounded-full text-xs font-mono font-medium border flex items-center space-x-1.5 ${getStatusColor(activeProject.status)}`}>
               <span className="w-1.5 h-1.5 rounded-full bg-current animate-pulse"></span>
-              <span>{activeProject.status}</span>
+              <span>{getStatusLabel(activeProject.status)}</span>
             </div>
           )}
         </div>
@@ -83,11 +113,15 @@ export const Header: React.FC = () => {
       <div className="hidden lg:flex items-center space-x-8 text-xs font-mono text-slate-400">
         <div className="flex items-center space-x-2">
           <Activity className="w-4 h-4 text-forge-cyan" />
-          <span>Tasks: <strong className="text-slate-100">{doneTasks}/{tasks.length}</strong> Done</span>
+          <span>
+            {t('nav.taskBoard')}: <strong className="text-slate-100">{doneTasks}/{tasks.length}</strong> {t('header.tasksDone')}
+          </span>
         </div>
         <div className="flex items-center space-x-2">
           <Cpu className="w-4 h-4 text-forge-emerald" />
-          <span>Agents: <strong className="text-slate-100">{activeAgents}</strong> Active</span>
+          <span>
+            {t('nav.agentCenter')}: <strong className="text-slate-100">{activeAgents}</strong> {t('header.agentsActive')}
+          </span>
         </div>
       </div>
 
@@ -117,7 +151,7 @@ export const Header: React.FC = () => {
                   : 'text-slate-400 hover:text-slate-200'
               }`}
             >
-              {mode}
+              {getModeLabel(mode)}
             </button>
           ))}
         </div>
@@ -129,7 +163,7 @@ export const Header: React.FC = () => {
             className="px-3 py-1.5 bg-forge-emerald hover:bg-emerald-600 text-slate-950 font-semibold text-xs rounded-md flex items-center space-x-1.5 shadow-md shadow-emerald-950/40 transition"
           >
             <Play className="w-3.5 h-3.5 fill-current" />
-            <span>START PROJECT</span>
+            <span>{t('header.startProject')}</span>
           </button>
         )}
 
@@ -139,7 +173,7 @@ export const Header: React.FC = () => {
             className="px-3 py-1.5 bg-amber-500/20 border border-amber-500/40 hover:bg-amber-500/30 text-amber-300 font-semibold text-xs rounded-md flex items-center space-x-1.5 transition"
           >
             <Pause className="w-3.5 h-3.5" />
-            <span>PAUSE</span>
+            <span>{t('header.pause')}</span>
           </button>
         )}
 
@@ -149,7 +183,7 @@ export const Header: React.FC = () => {
             className="px-3 py-1.5 bg-emerald-500/20 border border-emerald-500/40 hover:bg-emerald-500/30 text-emerald-300 font-semibold text-xs rounded-md flex items-center space-x-1.5 transition"
           >
             <Play className="w-3.5 h-3.5 fill-current" />
-            <span>RESUME</span>
+            <span>{t('header.resume')}</span>
           </button>
         )}
 

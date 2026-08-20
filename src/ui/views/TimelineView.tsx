@@ -1,9 +1,11 @@
 import React, { useState } from 'react';
 import { useOrchestrator } from '../context/OrchestratorContext';
+import { useI18n } from '../context/I18nContext';
 import { History, Search, Filter, ChevronDown, ChevronRight, Terminal, Shield } from 'lucide-react';
 
 export const TimelineView: React.FC = () => {
   const { events } = useOrchestrator();
+  const { t } = useI18n();
   const [filterType, setFilterType] = useState<string>('ALL');
   const [searchQuery, setSearchQuery] = useState<string>('');
   const [expandedEventId, setExpandedEventId] = useState<string | null>(null);
@@ -27,10 +29,10 @@ export const TimelineView: React.FC = () => {
         <div>
           <h2 className="text-xl font-bold text-white tracking-tight flex items-center space-x-2.5">
             <History className="w-5 h-5 text-forge-cyan" />
-            <span>Immutable Timeline & Audit Log</span>
+            <span>{t('timeline.title')}</span>
           </h2>
           <p className="text-xs text-slate-400">
-            Append-only event stream recording all task dispatches, state transitions, protocol verifications, and safety actions.
+            {t('timeline.subtitle')}
           </p>
         </div>
 
@@ -42,7 +44,7 @@ export const TimelineView: React.FC = () => {
               type="text"
               value={searchQuery}
               onChange={(e) => setSearchQuery(e.target.value)}
-              placeholder="Search audit events..."
+              placeholder={t('timeline.searchPlaceholder')}
               className="bg-surface-card border border-surface-border rounded-lg pl-8 pr-3 py-1.5 text-white focus:outline-none focus:border-forge-cyan"
             />
           </div>
@@ -52,11 +54,11 @@ export const TimelineView: React.FC = () => {
             onChange={(e) => setFilterType(e.target.value)}
             className="bg-surface-card border border-surface-border rounded-lg px-3 py-1.5 text-white focus:outline-none focus:border-forge-cyan"
           >
-            <option value="ALL">All Events</option>
-            <option value="MANAGER">Manager Decisions</option>
-            <option value="CODER">Coder Reports</option>
-            <option value="TEST">Tests & Verification</option>
-            <option value="EMERGENCY">Emergency Stop</option>
+            <option value="ALL">{t('timeline.filterAll')}</option>
+            <option value="MANAGER">{t('timeline.filterManager')}</option>
+            <option value="CODER">{t('timeline.filterCoder')}</option>
+            <option value="TEST">{t('timeline.filterTest')}</option>
+            <option value="EMERGENCY">{t('timeline.filterEmergency')}</option>
           </select>
         </div>
       </div>
@@ -65,7 +67,7 @@ export const TimelineView: React.FC = () => {
       <div className="space-y-3">
         {filteredEvents.length === 0 ? (
           <div className="p-12 text-center text-slate-500 font-mono text-xs border border-dashed border-surface-border rounded-xl">
-            No events match the selected criteria.
+            {t('timeline.noEventsMatch')}
           </div>
         ) : (
           filteredEvents.map((ev) => {
@@ -102,7 +104,7 @@ export const TimelineView: React.FC = () => {
 
                 {isExpanded && (
                   <div className="pt-3 border-t border-surface-border font-mono text-xs">
-                    <div className="text-[10px] text-slate-400 mb-1">Structured Payload JSON:</div>
+                    <div className="text-[10px] text-slate-400 mb-1">{t('timeline.structuredPayloadLabel')}:</div>
                     <pre className="p-3 bg-surface rounded-lg border border-surface-border text-slate-200 overflow-x-auto text-[11px]">
                       {JSON.stringify(ev.structured_payload, null, 2)}
                     </pre>

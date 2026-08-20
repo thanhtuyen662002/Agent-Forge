@@ -69,9 +69,9 @@ export const EmergencyStopModal: React.FC = () => {
               </div>
 
               <div className="text-xs text-slate-400 space-y-1 font-mono">
-                <div>• All active subprocesses will receive SIGKILL immediately.</div>
-                <div>• Database state, repository changes, and checkpoints are fully preserved.</div>
-                <div>• Projects and tasks can be deterministically resumed by the owner.</div>
+                <div>• {t('emergencyStop.bulletSigkill')}</div>
+                <div>• {t('emergencyStop.bulletPreserveDb')}</div>
+                <div>• {t('emergencyStop.bulletResume')}</div>
               </div>
 
               {/* Action Buttons */}
@@ -89,7 +89,7 @@ export const EmergencyStopModal: React.FC = () => {
                   className="px-5 py-2 bg-rose-600 hover:bg-rose-700 text-white font-mono font-bold text-xs rounded-lg shadow-lg shadow-rose-950/80 flex items-center space-x-2 transition"
                 >
                   <ShieldAlert className="w-4 h-4" />
-                  <span>{isProcessing ? 'TERMINATING...' : t('emergencyStop.confirm').toUpperCase()}</span>
+                  <span>{isProcessing ? t('emergencyStop.terminating') : t('emergencyStop.confirm').toUpperCase()}</span>
                 </button>
               </div>
             </>
@@ -97,14 +97,14 @@ export const EmergencyStopModal: React.FC = () => {
             <div className="space-y-4">
               <div className="flex items-center space-x-3 text-emerald-400 p-3 bg-emerald-950/30 border border-emerald-800/40 rounded-lg">
                 <Check className="w-5 h-5 shrink-0" />
-                <span className="font-semibold text-xs">Emergency Stop executed successfully. System is safe.</span>
+                <span className="font-semibold text-xs">{t('emergencyStop.successNotice')}</span>
               </div>
 
               <div className="bg-surface-card p-4 rounded-lg border border-surface-border space-y-2 text-xs font-mono">
-                <div>Processes Terminated: <strong className="text-white">{stopResult.processesTerminated}</strong></div>
-                <div>Tasks Safely Paused: <strong className="text-white">{stopResult.tasksPaused?.length || 0}</strong></div>
-                <div>Projects Paused: <strong className="text-white">{stopResult.projectsPaused?.length || 0}</strong></div>
-                <div>Timestamp: <span className="text-slate-400">{stopResult.timestamp}</span></div>
+                <div>{t('emergencyStop.processesTerminated')}: <strong className="text-white">{stopResult.processesTerminated}</strong></div>
+                <div>{t('emergencyStop.tasksPaused')}: <strong className="text-white">{stopResult.tasksPaused?.length || 0}</strong></div>
+                <div>{t('emergencyStop.projectsPaused')}: <strong className="text-white">{stopResult.projectsPaused?.length || 0}</strong></div>
+                <div>{t('emergencyStop.timestamp')}: <span className="text-slate-400">{stopResult.timestamp}</span></div>
               </div>
 
               <div className="flex justify-end pt-2">

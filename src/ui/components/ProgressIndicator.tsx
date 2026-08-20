@@ -1,4 +1,5 @@
 import React from 'react';
+import { useI18n } from '../context/I18nContext';
 
 interface ProgressIndicatorProps {
   percent: number;
@@ -11,6 +12,7 @@ export const ProgressIndicator: React.FC<ProgressIndicatorProps> = ({
   showDetails = false,
   size = 'md',
 }) => {
+  const { t } = useI18n();
   const heightClass = size === 'sm' ? 'h-1.5' : size === 'lg' ? 'h-3' : 'h-2';
 
   const getBarColor = (val: number) => {
@@ -23,7 +25,7 @@ export const ProgressIndicator: React.FC<ProgressIndicatorProps> = ({
   return (
     <div className="w-full space-y-1.5">
       <div className="flex items-center justify-between text-xs font-mono">
-        <span className="text-slate-400">Derived Progress</span>
+        <span className="text-slate-400">{t('dashboard.projectProgress')}</span>
         <span className="text-slate-200 font-semibold">{percent}%</span>
       </div>
       <div className={`w-full bg-surface-card rounded-full overflow-hidden border border-surface-border ${heightClass}`}>
@@ -34,11 +36,11 @@ export const ProgressIndicator: React.FC<ProgressIndicatorProps> = ({
       </div>
       {showDetails && (
         <div className="text-[10px] font-mono text-slate-500 flex justify-between pt-0.5">
-          <span>Plan: 10%</span>
-          <span>Code: 40%</span>
-          <span>Tests: 20%</span>
-          <span>Lint: 15%</span>
-          <span>Review: 15%</span>
+          <span>{t('task.status.planned')}: 10%</span>
+          <span>{t('task.status.in_progress')}: 40%</span>
+          <span>{t('task.status.validating')}: 20%</span>
+          <span>{t('settings.verificationCommands.lintCmdLabel')}: 15%</span>
+          <span>{t('task.status.reviewing')}: 15%</span>
         </div>
       )}
     </div>

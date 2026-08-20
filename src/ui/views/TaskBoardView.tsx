@@ -1,5 +1,6 @@
 import React, { useState } from 'react';
 import { useOrchestrator } from '../context/OrchestratorContext';
+import { useI18n } from '../context/I18nContext';
 import { Task, TaskState } from '../../core/types/domain';
 import { ProgressIndicator } from '../components/ProgressIndicator';
 import {
@@ -16,6 +17,7 @@ import {
 
 export const TaskBoardView: React.FC = () => {
   const { tasks, createTask, setSelectedTaskId, setActiveView } = useOrchestrator();
+  const { t } = useI18n();
   const [isCreateModalOpen, setIsCreateModalOpen] = useState<boolean>(false);
   const [newTitle, setNewTitle] = useState<string>('');
   const [newDesc, setNewDesc] = useState<string>('');
@@ -24,11 +26,11 @@ export const TaskBoardView: React.FC = () => {
   const [newCriteria, setNewCriteria] = useState<string>('');
 
   const columns: { id: string; label: string; states: TaskState[]; color: string }[] = [
-    { id: 'planned', label: 'PLANNED', states: ['CREATED', 'PLANNED', 'APPROVED', 'QUEUED'], color: 'border-slate-600' },
-    { id: 'coding', label: 'CODING', states: ['DISPATCHED', 'CODING', 'PAUSED'], color: 'border-forge-cyan/40' },
-    { id: 'validating', label: 'VALIDATING & REVIEW', states: ['VALIDATING', 'REVIEW_READY', 'REVIEWING', 'FIX_REQUIRED'], color: 'border-forge-purple/40' },
-    { id: 'blocked', label: 'BLOCKED / ESCALATED', states: ['BLOCKED', 'NEEDS_HUMAN', 'WAITING_FOR_CAPACITY', 'WAITING_FOR_AUTHORITY'], color: 'border-forge-rose/40' },
-    { id: 'done', label: 'COMPLETED', states: ['DONE'], color: 'border-forge-emerald/40' },
+    { id: 'planned', label: t('taskBoard.lanes.planned'), states: ['CREATED', 'PLANNED', 'APPROVED', 'QUEUED'], color: 'border-slate-600' },
+    { id: 'coding', label: t('taskBoard.lanes.coding'), states: ['DISPATCHED', 'CODING', 'PAUSED'], color: 'border-forge-cyan/40' },
+    { id: 'validating', label: t('taskBoard.lanes.validating'), states: ['VALIDATING', 'REVIEW_READY', 'REVIEWING', 'FIX_REQUIRED'], color: 'border-forge-purple/40' },
+    { id: 'blocked', label: t('taskBoard.lanes.blocked'), states: ['BLOCKED', 'NEEDS_HUMAN', 'WAITING_FOR_CAPACITY', 'WAITING_FOR_AUTHORITY'], color: 'border-forge-rose/40' },
+    { id: 'done', label: t('taskBoard.lanes.completed'), states: ['DONE'], color: 'border-forge-emerald/40' },
   ];
 
   const handleCreateTask = async (e: React.FormEvent) => {
@@ -62,10 +64,10 @@ export const TaskBoardView: React.FC = () => {
         <div>
           <h2 className="text-xl font-bold text-white tracking-tight flex items-center space-x-2.5">
             <Layers className="w-5 h-5 text-forge-cyan" />
-            <span>Task Kanban Board</span>
+            <span>{t('taskBoard.title')}</span>
           </h2>
           <p className="text-xs text-slate-400">
-            Lifecycle state machine tracks tasks from creation through decomposition, coding, validation, and completion.
+            {t('taskBoard.subtitle')}
           </p>
         </div>
 
@@ -74,7 +76,7 @@ export const TaskBoardView: React.FC = () => {
           className="px-4 py-2 bg-forge-cyan hover:bg-cyan-600 text-slate-950 font-mono font-bold text-xs rounded-lg shadow-lg flex items-center space-x-2 transition"
         >
           <Plus className="w-4 h-4" />
-          <span>NEW TASK</span>
+          <span>{t('taskBoard.newTask')}</span>
         </button>
       </div>
 
@@ -98,7 +100,7 @@ export const TaskBoardView: React.FC = () => {
               <div className="space-y-3 flex-1 overflow-y-auto pr-1">
                 {colTasks.length === 0 ? (
                   <div className="text-[11px] font-mono text-slate-600 text-center py-8">
-                    No tasks in this lane
+                    {t('taskBoard.emptyLane')}
                   </div>
                 ) : (
                   colTasks.map((task) => (
@@ -132,7 +134,7 @@ export const TaskBoardView: React.FC = () => {
                       <ProgressIndicator percent={task.progress_cache_percent} size="sm" />
 
                       <div className="flex items-center justify-between text-[10px] font-mono text-slate-400 pt-1 border-t border-surface-border/50">
-                        <span>Rev: {task.revision_count}/{task.max_revisions}</span>
+                        <span>{t('taskBoard.revLabel')}: {task.revision_count}/{task.max_revisions}</span>
                         <span className="text-slate-300 font-medium">{task.state}</span>
                       </div>
                     </div>
@@ -148,33 +150,33 @@ export const TaskBoardView: React.FC = () => {
       {isCreateModalOpen && (
         <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/80 backdrop-blur-sm p-4">
           <div className="bg-surface border border-surface-border rounded-xl shadow-2xl max-w-lg w-full p-6 space-y-4">
-            <h3 className="text-base font-bold text-white font-mono uppercase tracking-wide">Create New Task</h3>
+            <h3 className="text-base font-bold text-white font-mono uppercase tracking-wide">{t('taskBoard.createModal.title')}</h3>
             <form onSubmit={handleCreateTask} className="space-y-4 text-xs font-mono">
               <div>
-                <label className="block text-slate-400 mb-1">Task Title:</label>
+                <label className="block text-slate-400 mb-1">{t('taskBoard.createModal.taskTitleLabel')}:</label>
                 <input
                   type="text"
                   required
                   value={newTitle}
                   onChange={(e) => setNewTitle(e.target.value)}
-                  placeholder="e.g. Implement API rate limiter middleware"
+                  placeholder={t('taskBoard.createModal.taskTitlePlaceholder')}
                   className="w-full bg-surface-card border border-surface-border rounded-lg px-3 py-2 text-white focus:outline-none focus:border-forge-cyan font-sans"
                 />
               </div>
 
               <div>
-                <label className="block text-slate-400 mb-1">Description:</label>
+                <label className="block text-slate-400 mb-1">{t('taskBoard.createModal.descLabel')}:</label>
                 <textarea
                   value={newDesc}
                   onChange={(e) => setNewDesc(e.target.value)}
-                  placeholder="Detailed task description and requirements..."
+                  placeholder={t('taskBoard.createModal.descPlaceholder')}
                   className="w-full h-24 bg-surface-card border border-surface-border rounded-lg p-3 text-white focus:outline-none focus:border-forge-cyan font-sans resize-none"
                 />
               </div>
 
               <div className="grid grid-cols-2 gap-4">
                 <div>
-                  <label className="block text-slate-400 mb-1">Priority:</label>
+                  <label className="block text-slate-400 mb-1">{t('taskBoard.createModal.priorityLabel')}:</label>
                   <select
                     value={newPriority}
                     onChange={(e) => setNewPriority(e.target.value as any)}
@@ -187,7 +189,7 @@ export const TaskBoardView: React.FC = () => {
                   </select>
                 </div>
                 <div>
-                  <label className="block text-slate-400 mb-1">Risk Level:</label>
+                  <label className="block text-slate-400 mb-1">{t('taskBoard.createModal.riskLabel')}:</label>
                   <select
                     value={newRisk}
                     onChange={(e) => setNewRisk(e.target.value as any)}
@@ -202,11 +204,11 @@ export const TaskBoardView: React.FC = () => {
               </div>
 
               <div>
-                <label className="block text-slate-400 mb-1">Acceptance Criteria (1 per line):</label>
+                <label className="block text-slate-400 mb-1">{t('taskBoard.createModal.criteriaLabel')}:</label>
                 <textarea
                   value={newCriteria}
                   onChange={(e) => setNewCriteria(e.target.value)}
-                  placeholder="All unit tests pass&#10;Returns 429 when quota exceeded"
+                  placeholder={t('taskBoard.createModal.criteriaPlaceholder')}
                   className="w-full h-20 bg-surface-card border border-surface-border rounded-lg p-3 text-white focus:outline-none focus:border-forge-cyan font-sans resize-none"
                 />
               </div>
@@ -217,13 +219,13 @@ export const TaskBoardView: React.FC = () => {
                   onClick={() => setIsCreateModalOpen(false)}
                   className="px-4 py-2 bg-surface-card hover:bg-surface-border text-slate-300 rounded-lg text-xs"
                 >
-                  Cancel
+                  {t('taskBoard.createModal.cancelButton')}
                 </button>
                 <button
                   type="submit"
                   className="px-5 py-2 bg-forge-cyan hover:bg-cyan-600 text-slate-950 font-bold rounded-lg text-xs shadow"
                 >
-                  Create Task
+                  {t('taskBoard.createModal.createButton')}
                 </button>
               </div>
             </form>

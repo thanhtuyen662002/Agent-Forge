@@ -464,7 +464,7 @@ export const ManualBridgeView: React.FC = () => {
             }`}
           >
             <Send className="w-3.5 h-3.5" />
-            <span>Outbox Generator</span>
+            <span>{t('manualBridge.outboxTabButton')}</span>
           </button>
         </div>
       </div>
@@ -478,9 +478,9 @@ export const ManualBridgeView: React.FC = () => {
           <div className="p-4 bg-surface-card border border-surface-border rounded-xl text-xs font-mono flex items-start space-x-3">
             <AlertTriangle className="w-4 h-4 text-forge-amber shrink-0 mt-0.5" />
             <div className="space-y-1 text-slate-300">
-              <span className="font-bold text-white uppercase tracking-wider">Manual Relay Protocol:</span>
+              <span className="font-bold text-white uppercase tracking-wider">{t('manualBridge.relayNoticeTitle')}:</span>
               <p>
-                Owner explicitly routes candidate resources, authorizes execution from durable Manager authority, and dispatches to Manual Bridge. WorkOrders are copied manually by the Owner to Gemini. No browser or clipboard scraping is performed.
+                {t('manualBridge.relayNoticeText')}
               </p>
             </div>
           </div>
@@ -494,7 +494,7 @@ export const ManualBridgeView: React.FC = () => {
               <div className="flex items-center justify-between">
                 <h3 className="text-xs font-mono font-semibold text-slate-300 uppercase tracking-wider flex items-center space-x-2">
                   <span className="w-5 h-5 rounded-full bg-forge-amber/20 text-forge-amber flex items-center justify-center text-[10px] font-bold">1</span>
-                  <span>Target Task & Authority</span>
+                  <span>{t('manualBridge.step1TargetTaskTitle')}</span>
                 </h3>
                 {loadingSnapshot && (
                   <RefreshCw className="w-3.5 h-3.5 text-slate-400 animate-spin" />
@@ -502,7 +502,7 @@ export const ManualBridgeView: React.FC = () => {
               </div>
 
               <div>
-                <label className="block text-xs font-mono text-slate-400 mb-1.5">Select Target Task:</label>
+                <label className="block text-xs font-mono text-slate-400 mb-1.5">{t('manualBridge.selectTargetTaskLabel')}:</label>
                 <select
                   value={selectedHandoffTaskId}
                   onChange={(e) => handleTaskChange(e.target.value)}
@@ -519,7 +519,7 @@ export const ManualBridgeView: React.FC = () => {
               {currentTask && (
                 <div className="bg-surface p-3.5 rounded-lg border border-surface-border space-y-2 text-xs font-mono">
                   <div className="flex items-center justify-between">
-                    <span className="text-slate-400">State / Revision:</span>
+                    <span className="text-slate-400">{t('manualBridge.stateRevisionLabel')}:</span>
                     <span className="font-bold text-white">
                       <span className="px-2 py-0.5 rounded bg-slate-800 text-forge-cyan border border-slate-700 mr-1.5">
                         {currentTask.state}
@@ -528,11 +528,11 @@ export const ManualBridgeView: React.FC = () => {
                     </span>
                   </div>
                   <div className="flex items-center justify-between">
-                    <span className="text-slate-400">Risk / Priority:</span>
+                    <span className="text-slate-400">{t('manualBridge.riskPriorityLabel')}:</span>
                     <span className="text-slate-300">{currentTask.risk} / {currentTask.priority}</span>
                   </div>
                   <div className="flex items-center justify-between">
-                    <span className="text-slate-400">Base SHA / Repo HEAD:</span>
+                    <span className="text-slate-400">{t('manualBridge.baseShaRepoHeadLabel')}:</span>
                     <span className="text-slate-300 truncate max-w-[200px]" title={snapshot?.gitHeadSha || 'Unknown'}>
                       {currentTask.base_sha?.slice(0, 7) || 'HEAD'} / {snapshot?.gitHeadSha?.slice(0, 7) || 'Unknown'}
                     </span>
@@ -543,7 +543,7 @@ export const ManualBridgeView: React.FC = () => {
               {/* Manager Authority Status Box */}
               <div className="space-y-2">
                 <label className="block text-[11px] font-mono font-semibold text-slate-400 uppercase">
-                  Manager Authority Status
+                  {t('manualBridge.managerAuthorityStatusLabel')}
                 </label>
                 {managerAuth?.hasAuthority ? (
                   <div
@@ -560,20 +560,20 @@ export const ManualBridgeView: React.FC = () => {
                         ) : (
                           <XCircle className="w-4 h-4 text-rose-400" />
                         )}
-                        <span>Decision: {managerAuth.decision}</span>
+                        <span>{t('managerInbox.title')}: {managerAuth.decision}</span>
                       </span>
                       <span className="text-[10px] px-2 py-0.5 rounded bg-surface border border-surface-border text-slate-300">
-                        Exp Rev {managerAuth.expectedRevision}
+                        {t('managerInbox.expectedRevision')} {managerAuth.expectedRevision}
                       </span>
                     </div>
                     <div className="text-[11px] space-y-1 text-slate-300">
-                      <div>Message ID: <strong className="text-white">{managerAuth.messageId}</strong></div>
-                      <div>Payload Hash: <span className="text-slate-400 truncate block">{managerAuth.payloadHash}</span></div>
-                      <div>Instructions Count: <strong className="text-white">{managerAuth.instructionsCount}</strong></div>
+                      <div>{t('routing.decisionId')}: <strong className="text-white">{managerAuth.messageId}</strong></div>
+                      <div>{t('manualBridge.instructionHashLabel')}: <span className="text-slate-400 truncate block">{managerAuth.payloadHash}</span></div>
+                      <div>{t('managerInbox.instructionsCount')}: <strong className="text-white">{managerAuth.instructionsCount}</strong></div>
                     </div>
                     {!managerAuth.decisionValidForCurrentRevision && (
                       <div className="p-2 rounded bg-rose-900/30 border border-rose-700/50 text-[11px] text-rose-200">
-                        {managerAuth.reason || 'Manager expected revision does not match current task revision.'}
+                        {managerAuth.reason || t('manualBridge.noManagerAuthDefaultReason')}
                       </div>
                     )}
                   </div>
@@ -581,17 +581,17 @@ export const ManualBridgeView: React.FC = () => {
                   <div className="p-3.5 bg-rose-950/20 border border-rose-800/40 rounded-lg text-xs font-mono text-rose-300 space-y-2">
                     <div className="flex items-center space-x-2 font-bold">
                       <XCircle className="w-4 h-4 text-rose-400 shrink-0" />
-                      <span>No Valid Manager Authority</span>
+                      <span>{t('manualBridge.noManagerAuthTitle')}</span>
                     </div>
                     <p className="text-[11px] text-slate-300">
-                      {managerAuth?.reason || 'No applied manager.v1 EXECUTE or FIX_REQUIRED message exists for this task.'}
+                      {managerAuth?.reason || t('manualBridge.noManagerAuthDefaultReason')}
                     </p>
                     <button
                       onClick={() => setActiveTab('manager-inbox')}
                       className="px-3 py-1.5 bg-forge-purple hover:bg-purple-600 text-white font-bold text-[11px] rounded transition flex items-center space-x-1.5"
                     >
                       <Shield className="w-3 h-3" />
-                      <span>Go to Manager Inbox</span>
+                      <span>{t('manualBridge.goToManagerInbox')}</span>
                     </button>
                   </div>
                 )}
@@ -605,7 +605,7 @@ export const ManualBridgeView: React.FC = () => {
               <div className="flex items-center justify-between">
                 <h3 className="text-xs font-mono font-semibold text-slate-300 uppercase tracking-wider flex items-center space-x-2">
                   <span className="w-5 h-5 rounded-full bg-forge-amber/20 text-forge-amber flex items-center justify-center text-[10px] font-bold">2</span>
-                  <span>Candidate Resources (Ordered)</span>
+                  <span>{t('manualBridge.step2CandidateTitle')}</span>
                 </h3>
                 <div className="flex items-center space-x-2">
                   <button
@@ -618,7 +618,7 @@ export const ManualBridgeView: React.FC = () => {
                     }}
                     className="text-[11px] text-forge-amber hover:underline font-mono"
                   >
-                    Select all enabled
+                    {t('manualBridge.selectAllEnabled')}
                   </button>
                   {candidateIds.length > 0 && (
                     <button
@@ -626,11 +626,11 @@ export const ManualBridgeView: React.FC = () => {
                       onClick={() => setCandidateIds([])}
                       className="text-[11px] text-slate-400 hover:text-white font-mono"
                     >
-                      Clear
+                      {t('manualBridge.clearCandidates')}
                     </button>
                   )}
                   <span className="text-[11px] text-slate-400 font-mono ml-1">
-                    ({candidateIds.length} selected)
+                    {t('manualBridge.selectedCount', { count: candidateIds.length.toString() })}
                   </span>
                 </div>
               </div>
@@ -679,7 +679,7 @@ export const ManualBridgeView: React.FC = () => {
                               onClick={() => moveCandidateUp(candidateOrder)}
                               disabled={candidateOrder <= 0}
                               className="p-1 rounded bg-surface-card hover:bg-slate-700 text-slate-300 disabled:opacity-30"
-                              title="Move Candidate Up"
+                              title={t('manualBridge.moveUpTitle')}
                             >
                               <ArrowUp className="w-3 h-3" />
                             </button>
@@ -687,7 +687,7 @@ export const ManualBridgeView: React.FC = () => {
                               onClick={() => moveCandidateDown(candidateOrder)}
                               disabled={candidateOrder >= candidateIds.length - 1}
                               className="p-1 rounded bg-surface-card hover:bg-slate-700 text-slate-300 disabled:opacity-30"
-                              title="Move Candidate Down"
+                              title={t('manualBridge.moveDownTitle')}
                             >
                               <ArrowDown className="w-3 h-3" />
                             </button>
@@ -703,10 +703,10 @@ export const ManualBridgeView: React.FC = () => {
                               res.enabled ? 'bg-emerald-950/40 text-emerald-300' : 'bg-rose-950/40 text-rose-300'
                             }`}
                           >
-                            {res.enabled ? 'ENABLED' : 'DISABLED'}
+                            {res.enabled ? t('manualBridge.enabledLabel') : t('manualBridge.disabledLabel')}
                           </span>
                           <span className="px-1.5 py-0.2 rounded bg-slate-800 text-slate-300">
-                            Health: {res.health_status}
+                            {t('manualBridge.healthLabel')}: {res.health_status}
                           </span>
                         </div>
 
@@ -714,11 +714,11 @@ export const ManualBridgeView: React.FC = () => {
                         <div className="text-slate-400">
                           {res.remaining_quota === null || res.quota_source === 'UNKNOWN' ? (
                             <span className="px-1.5 py-0.2 rounded bg-slate-800/80 text-slate-300 border border-slate-700">
-                              Quota: UNKNOWN (conf: 0.0)
+                              {t('manualBridge.quotaUnknownLabel')}
                             </span>
                           ) : (
                             <span className="px-1.5 py-0.2 rounded bg-emerald-950/30 text-emerald-300 border border-emerald-800/30">
-                              Quota: {res.remaining_quota} / {res.total_quota} {res.quota_unit} [{res.quota_source}, conf: {res.quota_confidence}]
+                              {t('capacity.quotaLabel')}: {res.remaining_quota} / {res.total_quota} {res.quota_unit} [{res.quota_source}, conf: {res.quota_confidence}]
                             </span>
                           )}
                         </div>
@@ -731,9 +731,9 @@ export const ManualBridgeView: React.FC = () => {
               {/* Manual Bridge Permission Toggle */}
               <div className="p-3 bg-surface rounded-lg border border-surface-border text-xs font-mono flex items-center justify-between">
                 <div>
-                  <div className="font-semibold text-white">Explicit Manual Bridge Permission</div>
+                  <div className="font-semibold text-white">{t('manualBridge.explicitManualBridgeTitle')}</div>
                   <div className="text-[11px] text-slate-400">
-                    If enabled, falls back to Manual Relay when automated providers are unavailable. Default: disabled.
+                    {t('manualBridge.explicitManualBridgeDesc')}
                   </div>
                 </div>
                 <input
@@ -757,7 +757,7 @@ export const ManualBridgeView: React.FC = () => {
                 className="w-full py-2.5 bg-forge-amber hover:bg-amber-600 text-slate-950 font-mono font-bold text-xs rounded-lg shadow-lg flex items-center justify-center space-x-2 transition disabled:opacity-40"
               >
                 <Sparkles className="w-4 h-4" />
-                <span>{isRouting ? 'ROUTING CANDIDATES...' : 'ROUTE PROVIDER CANDIDATES'}</span>
+                <span>{isRouting ? t('manualBridge.routingCandidatesButton') : t('manualBridge.routeCandidatesButton')}</span>
               </button>
             </div>
           </div>
@@ -770,18 +770,18 @@ export const ManualBridgeView: React.FC = () => {
             <div className="bg-surface-card border border-surface-border rounded-xl p-5 shadow space-y-4">
               <h3 className="text-xs font-mono font-semibold text-slate-300 uppercase tracking-wider flex items-center space-x-2">
                 <span className="w-5 h-5 rounded-full bg-forge-amber/20 text-forge-amber flex items-center justify-center text-[10px] font-bold">3</span>
-                <span>Durable Routing Decision</span>
+                <span>{t('manualBridge.step3RoutingDecisionTitle')}</span>
               </h3>
 
               {!routingDecision ? (
                 <div className="h-64 flex flex-col items-center justify-center text-slate-500 space-y-2 border border-dashed border-surface-border rounded-lg p-6 text-center">
                   <Cpu className="w-8 h-8 text-slate-600" />
-                  <span className="text-xs font-mono">Select candidates and execute Step 2 to generate a deterministic routing decision.</span>
+                  <span className="text-xs font-mono">{t('manualBridge.step3RoutingEmptyHint')}</span>
                 </div>
               ) : (
                 <div className="space-y-3.5 text-xs font-mono">
                   <div className="flex items-center justify-between">
-                    <span className="text-slate-400">Decision Outcome:</span>
+                    <span className="text-slate-400">{t('manualBridge.decisionOutcomeLabel')}:</span>
                     <span
                       className={`px-2.5 py-1 rounded font-bold border ${
                         routingDecision.outcome === 'SELECTED'
@@ -796,22 +796,22 @@ export const ManualBridgeView: React.FC = () => {
                   </div>
 
                   <div className="bg-surface p-3.5 rounded-lg border border-surface-border space-y-1.5">
-                    <div>Decision ID: <strong className="text-white">{routingDecision.decisionId}</strong></div>
-                    <div>Selected Resource: <strong className="text-forge-cyan">{routingDecision.selectedResourceId || 'None'}</strong></div>
-                    <div>Selected Provider: <strong className="text-forge-purple">{routingDecision.selectedProviderId || 'None'}</strong></div>
-                    <div>Reason: <span className="text-slate-300">{routingDecision.reason}</span></div>
+                    <div>{t('routing.decisionId')}: <strong className="text-white">{routingDecision.decisionId}</strong></div>
+                    <div>{t('routing.selectedResource')}: <strong className="text-forge-cyan">{routingDecision.selectedResourceId || t('common.none')}</strong></div>
+                    <div>{t('manualBridge.selectedProviderLabel')}: <strong className="text-forge-purple">{routingDecision.selectedProviderId || t('common.none')}</strong></div>
+                    <div>{t('manualBridge.reasonLabel')}: <span className="text-slate-300">{routingDecision.reason}</span></div>
                   </div>
 
                   {/* Candidate Evaluations Summary */}
                   {routingDecision.candidateEvaluations && routingDecision.candidateEvaluations.length > 0 && (
                     <div className="space-y-1.5">
-                      <span className="text-[11px] font-semibold text-slate-400 uppercase">Evaluations:</span>
+                      <span className="text-[11px] font-semibold text-slate-400 uppercase">{t('manualBridge.evaluationsLabel')}:</span>
                       <div className="space-y-1 max-h-36 overflow-y-auto pr-1">
                         {routingDecision.candidateEvaluations.map((ev: any, i: number) => (
                           <div key={i} className="p-2 rounded bg-surface border border-surface-border text-[11px] flex items-center justify-between">
                             <div>
                               <strong className="text-white">{ev.modelName || ev.resourceId}</strong>
-                              <span className="text-slate-400 ml-1.5">Tier {ev.tier || 'N/A'}</span>
+                              <span className="text-slate-400 ml-1.5">{t('manualBridge.tierLabel')} {ev.tier || 'N/A'}</span>
                             </div>
                             <span
                               className={`px-1.5 py-0.2 rounded font-semibold ${
@@ -840,7 +840,7 @@ export const ManualBridgeView: React.FC = () => {
                       className="w-full py-2 bg-forge-emerald hover:bg-emerald-600 text-slate-950 font-bold text-xs rounded-lg shadow transition flex items-center justify-center space-x-2 disabled:opacity-40"
                     >
                       <Lock className="w-3.5 h-3.5" />
-                      <span>{isAuthorizing ? 'CREATING AUTHORIZATION...' : 'CREATE EXECUTION AUTHORIZATION'}</span>
+                      <span>{isAuthorizing ? t('manualBridge.creatingAuthButton') : t('manualBridge.createAuthButton')}</span>
                     </button>
                   )}
                 </div>
@@ -851,18 +851,18 @@ export const ManualBridgeView: React.FC = () => {
             <div className="bg-surface-card border border-surface-border rounded-xl p-5 shadow space-y-4">
               <h3 className="text-xs font-mono font-semibold text-slate-300 uppercase tracking-wider flex items-center space-x-2">
                 <span className="w-5 h-5 rounded-full bg-forge-amber/20 text-forge-amber flex items-center justify-center text-[10px] font-bold">4</span>
-                <span>Durable Execution Authorization</span>
+                <span>{t('manualBridge.step4ExecutionAuthTitle')}</span>
               </h3>
 
               {!authorization ? (
                 <div className="h-64 flex flex-col items-center justify-center text-slate-500 space-y-2 border border-dashed border-surface-border rounded-lg p-6 text-center">
                   <Key className="w-8 h-8 text-slate-600" />
-                  <span className="text-xs font-mono">Create an execution authorization from an approved routing decision.</span>
+                  <span className="text-xs font-mono">{t('manualBridge.step4AuthEmptyHint')}</span>
                 </div>
               ) : (
                 <div className="space-y-3.5 text-xs font-mono">
                   <div className="flex items-center justify-between">
-                    <span className="text-slate-400">Authority Status:</span>
+                    <span className="text-slate-400">{t('manualBridge.authorityStatusLabel')}:</span>
                     <span
                       className={`px-2.5 py-1 rounded font-bold border ${
                         authorization.status === 'AUTHORIZED'
@@ -877,10 +877,10 @@ export const ManualBridgeView: React.FC = () => {
                   </div>
 
                   <div className="bg-surface p-3.5 rounded-lg border border-surface-border space-y-1.5 text-[11px]">
-                    <div>Authorization ID: <strong className="text-white">{authorization.id}</strong></div>
-                    <div>Task Revision: <strong className="text-forge-cyan">Rev {authorization.task_revision}</strong></div>
+                    <div>{t('manualBridge.authIdLabel')}: <strong className="text-white">{authorization.id}</strong></div>
+                    <div>{t('manualBridge.taskRevisionLabel')}: <strong className="text-forge-cyan">Rev {authorization.task_revision}</strong></div>
                     <div>
-                      Bound Route: <strong className="text-forge-amber">{authorization.routing_decision_id}</strong>
+                      {t('manualBridge.boundRouteLabel')}: <strong className="text-forge-amber">{authorization.routing_decision_id}</strong>
                       {authBoundRoutingDecision && (
                         <span className="ml-1 text-slate-400">({authBoundRoutingDecision.outcome})</span>
                       )}
@@ -888,14 +888,17 @@ export const ManualBridgeView: React.FC = () => {
                     {snapshot?.latestRoutingDecision &&
                       snapshot.latestRoutingDecision.decisionId !== authorization.routing_decision_id && (
                         <div className="p-2 rounded bg-amber-950/30 border border-amber-800/40 text-[10px] text-forge-amber">
-                          Latest Route ({snapshot.latestRoutingDecision.decisionId}) is newer than Authorized Route ({authorization.routing_decision_id}). Authorization remains bound to {authorization.routing_decision_id}.
+                          {t('manualBridge.latestRouteNewerNotice', {
+                            latest: snapshot.latestRoutingDecision.decisionId,
+                            authorized: authorization.routing_decision_id,
+                          })}
                         </div>
                       )}
-                    <div>Repository HEAD: <span className="text-slate-300 truncate block">{authorization.repository_head_sha}</span></div>
-                    <div>Instruction Payload Hash: <span className="text-slate-400 truncate block">{authorization.instruction_payload_hash}</span></div>
-                    <div>Context Manifest Hash: <span className="text-slate-400 truncate block">{authorization.context_manifest_hash}</span></div>
+                    <div>{t('manualBridge.repoHeadLabel')}: <span className="text-slate-300 truncate block">{authorization.repository_head_sha}</span></div>
+                    <div>{t('manualBridge.instructionHashLabel')}: <span className="text-slate-400 truncate block">{authorization.instruction_payload_hash}</span></div>
+                    <div>{t('manualBridge.contextHashLabel')}: <span className="text-slate-400 truncate block">{authorization.context_manifest_hash}</span></div>
                     {authorization.dispatched_at && (
-                      <div>Dispatched At: <span className="text-slate-300">{authorization.dispatched_at}</span></div>
+                      <div>{t('manualBridge.dispatchedAtLabel')}: <span className="text-slate-300">{authorization.dispatched_at}</span></div>
                     )}
                   </div>
 
@@ -915,35 +918,35 @@ export const ManualBridgeView: React.FC = () => {
                       <Play className="w-3.5 h-3.5 fill-current" />
                       <span>
                         {isDispatching
-                          ? 'DISPATCHING...'
+                          ? t('manualBridge.dispatchingButton')
                           : routingDecision?.outcome === 'MANUAL_HANDOFF_REQUIRED'
-                          ? 'DISPATCH MANUAL HANDOFF'
-                          : 'DISPATCH AUTHORIZED PROVIDER'}
+                          ? t('manualBridge.dispatchManualHandoffButton')
+                          : t('manualBridge.dispatchAuthorizedProviderButton')}
                       </span>
                     </button>
                   ) : isManualHandoffAwaitingOwner ? (
                     <div className="p-3 bg-emerald-950/20 border border-emerald-800/40 rounded-lg text-emerald-300 text-center space-y-1">
                       <div className="font-bold flex items-center justify-center space-x-1.5">
                         <CheckCircle2 className="w-4 h-4 text-emerald-400" />
-                        <span>AWAITING_OWNER / CONSUMED</span>
+                        <span>{t('manualBridge.awaitingOwnerConsumedTitle')}</span>
                       </div>
                       <p className="text-[11px] text-slate-300">
-                        Manual Bridge authorization claimed. Replay protection active. Generate Authorized WorkOrder below for Gemini relay.
+                        {t('manualBridge.awaitingOwnerConsumedDesc')}
                       </p>
                     </div>
                   ) : isSelectedDispatched ? (
                     <div className="p-3 bg-cyan-950/20 border border-cyan-800/40 rounded-lg text-cyan-300 text-center space-y-1">
                       <div className="font-bold flex items-center justify-center space-x-1.5">
                         <CheckCircle2 className="w-4 h-4 text-cyan-400" />
-                        <span>DISPATCHED TO AUTHORIZED PROVIDER / CONSUMED</span>
+                        <span>{t('manualBridge.dispatchedToProviderTitle')}</span>
                       </div>
                       <p className="text-[11px] text-slate-300">
-                        Automated provider execution started. Replay protection active.
+                        {t('manualBridge.dispatchedToProviderDesc')}
                       </p>
                     </div>
                   ) : (
                     <div className="p-3 bg-rose-950/20 border border-rose-800/40 rounded-lg text-rose-300 text-center">
-                      Authorization is INVALIDATED. Request a new Manager decision.
+                      {t('manualBridge.authInvalidatedNotice')}
                     </div>
                   )}
                 </div>
@@ -960,10 +963,10 @@ export const ManualBridgeView: React.FC = () => {
                 <div>
                   <h3 className="text-xs font-mono font-semibold text-slate-300 uppercase tracking-wider flex items-center space-x-2">
                     <span className="w-5 h-5 rounded-full bg-forge-emerald/20 text-forge-emerald flex items-center justify-center text-[10px] font-bold">5</span>
-                    <span>Authorized Manual WorkOrder Relay & Gemini Dispatch</span>
+                    <span>{t('manualBridge.step5WorkOrderRelayTitle')}</span>
                   </h3>
                   <p className="text-[11px] text-slate-400 font-mono mt-0.5">
-                    Generate the immutable authorized WorkOrder, 1-click copy it to clipboard, and paste into Gemini.
+                    {t('manualBridge.step5WorkOrderRelayDesc')}
                   </p>
                 </div>
 
@@ -974,7 +977,7 @@ export const ManualBridgeView: React.FC = () => {
                     className="px-3.5 py-1.5 bg-surface hover:bg-surface-hover border border-surface-border text-white text-xs font-mono font-bold rounded-lg shadow transition flex items-center space-x-1.5"
                   >
                     <Sparkles className="w-3.5 h-3.5 text-forge-emerald" />
-                    <span>{isGeneratingHandoffWorkOrder ? 'GENERATING...' : 'GENERATE AUTHORIZED WORKORDER'}</span>
+                    <span>{isGeneratingHandoffWorkOrder ? t('manualBridge.generatingWorkOrderButton') : t('manualBridge.generateAuthorizedWorkOrderButton')}</span>
                   </button>
 
                   {handoffWorkOrder && (
@@ -987,7 +990,7 @@ export const ManualBridgeView: React.FC = () => {
                       }`}
                     >
                       {handoffCopied ? <Check className="w-3.5 h-3.5" /> : <Clipboard className="w-3.5 h-3.5" />}
-                      <span>{handoffCopied ? 'COPIED TO CLIPBOARD!' : '1-CLICK COPY WORKORDER'}</span>
+                      <span>{handoffCopied ? t('manualBridge.workOrderCopiedButton') : t('manualBridge.oneClickCopyWorkOrderButton')}</span>
                     </button>
                   )}
                 </div>
@@ -1004,9 +1007,9 @@ export const ManualBridgeView: React.FC = () => {
                   {/* Step by step owner prompt */}
                   <div className="p-4 bg-surface rounded-lg border border-surface-border flex flex-col md:flex-row md:items-center justify-between gap-4 text-xs font-mono">
                     <div className="space-y-1">
-                      <div className="font-bold text-white">Next Step: Paste Coder Output</div>
+                      <div className="font-bold text-white">{t('manualBridge.nextStepCoderTitle')}</div>
                       <p className="text-[11px] text-slate-400">
-                        When Gemini Coder finishes and outputs its <code>coder.v1</code> report, copy it and switch to the Coder Inbox tab to validate and run verification tests.
+                        {t('manualBridge.nextStepCoderDesc')}
                       </p>
                     </div>
 
@@ -1015,14 +1018,14 @@ export const ManualBridgeView: React.FC = () => {
                       className="px-4 py-2 bg-forge-cyan hover:bg-cyan-500 text-slate-950 font-bold rounded-lg shadow transition flex items-center space-x-2 shrink-0"
                     >
                       <Terminal className="w-4 h-4" />
-                      <span>OPEN CODER INBOX</span>
+                      <span>{t('manualBridge.openCoderInboxButton')}</span>
                     </button>
                   </div>
                 </div>
               ) : (
                 <div className="p-6 bg-surface rounded-lg border border-surface-border text-center space-y-2 text-xs font-mono text-slate-400">
                   <FileCheck className="w-8 h-8 mx-auto text-slate-500" />
-                  <p>Click "Generate Authorized WorkOrder" above to construct the immutable Markdown prompt for Gemini Coder.</p>
+                  <p>{t('manualBridge.emptyWorkOrderRelayHint')}</p>
                 </div>
               )}
             </div>
@@ -1041,9 +1044,9 @@ export const ManualBridgeView: React.FC = () => {
               <div className="flex items-center justify-between">
                 <label className="text-xs font-mono font-semibold text-slate-300 flex items-center space-x-2">
                   <Shield className="w-4 h-4 text-forge-purple" />
-                  <span>Paste ChatGPT Manager Response</span>
+                  <span>{t('managerInbox.pasteLabel')}</span>
                 </label>
-                <span className="text-[11px] text-slate-500 font-mono">Accepts JSON, Markdown fences, or prose</span>
+                <span className="text-[11px] text-slate-500 font-mono">{t('managerInbox.formatHint')}</span>
               </div>
               <textarea
                 value={managerInput}
@@ -1058,14 +1061,14 @@ export const ManualBridgeView: React.FC = () => {
                 onClick={() => setManagerInput('')}
                 className="text-xs text-slate-400 hover:text-slate-200 font-mono"
               >
-                Clear
+                {t('common.clear')}
               </button>
               <button
                 onClick={handleParseManager}
                 className="px-4 py-2 bg-forge-purple hover:bg-purple-600 text-white font-mono font-bold text-xs rounded-lg shadow flex items-center space-x-2 transition"
               >
                 <Sparkles className="w-4 h-4" />
-                <span>PARSE PROTOCOL</span>
+                <span>{t('managerInbox.parseProtocolButton')}</span>
               </button>
             </div>
           </div>
@@ -1073,28 +1076,32 @@ export const ManualBridgeView: React.FC = () => {
           {/* Right: Validation & State Preview */}
           <div className="bg-surface-card border border-surface-border rounded-xl p-5 shadow space-y-4">
             <h3 className="text-xs font-mono font-semibold text-slate-300 uppercase tracking-wider">
-              Protocol Validation & State Preview
+              {t('managerInbox.validationPreviewTitle')}
             </h3>
 
             {!managerParseResult ? (
               <div className="h-80 flex flex-col items-center justify-center text-slate-500 space-y-2 border border-dashed border-surface-border rounded-lg p-6 text-center">
                 <FileCheck className="w-8 h-8 text-slate-600" />
-                <span className="text-xs font-mono">Paste Manager message and click Parse Protocol to inspect payload.</span>
+                <span className="text-xs font-mono">{t('managerInbox.emptyParseHint')}</span>
               </div>
             ) : managerParseResult.success ? (
               <div className="space-y-4 text-xs font-mono">
                 <div className="p-3 bg-emerald-950/20 border border-emerald-800/30 rounded-lg text-emerald-300 flex items-center space-x-2">
                   <Check className="w-4 h-4 text-emerald-400 shrink-0" />
-                  <span>Valid <strong>{managerParseResult.protocolType}</strong> protocol payload detected.</span>
+                  <span>
+                    {t('managerInbox.validPayloadDetected', {
+                      protocolType: managerParseResult.protocolType || 'manager.v1',
+                    })}
+                  </span>
                 </div>
 
                 <div className="bg-surface p-4 rounded-lg border border-surface-border space-y-2">
-                  <div>Message ID: <strong className="text-white">{managerParseResult.data?.data?.message_id}</strong></div>
-                  <div>Target Task: <strong className="text-forge-cyan">{managerParseResult.data?.data?.task_id || 'General Milestone'}</strong></div>
-                  <div>Decision: <span className="px-2 py-0.5 rounded bg-forge-purple/20 text-forge-purple font-bold border border-forge-purple/40">{managerParseResult.data?.data?.decision}</span></div>
-                  <div>Priority / Risk: <span className="text-slate-300">{managerParseResult.data?.data?.priority} / {managerParseResult.data?.data?.risk}</span></div>
-                  <div>Criteria Defined: <span className="text-white">{managerParseResult.data?.data?.acceptance_criteria?.length || 0}</span></div>
-                  <div>Issues Logged: <span className="text-white">{managerParseResult.data?.data?.review_issues?.length || 0}</span></div>
+                  <div>{t('routing.decisionId')}: <strong className="text-white">{managerParseResult.data?.data?.message_id}</strong></div>
+                  <div>{t('managerInbox.targetTaskLabel')}: <strong className="text-forge-cyan">{managerParseResult.data?.data?.task_id || 'General Milestone'}</strong></div>
+                  <div>{t('managerInbox.title')}: <span className="px-2 py-0.5 rounded bg-forge-purple/20 text-forge-purple font-bold border border-forge-purple/40">{managerParseResult.data?.data?.decision}</span></div>
+                  <div>{t('manualBridge.riskPriorityLabel')}: <span className="text-slate-300">{managerParseResult.data?.data?.priority} / {managerParseResult.data?.data?.risk}</span></div>
+                  <div>{t('managerInbox.criteriaDefinedLabel')}: <span className="text-white">{managerParseResult.data?.data?.acceptance_criteria?.length || 0}</span></div>
+                  <div>{t('managerInbox.issuesLoggedLabel')}: <span className="text-white">{managerParseResult.data?.data?.review_issues?.length || 0}</span></div>
                 </div>
 
                 {managerApplyStatus && (
@@ -1108,14 +1115,14 @@ export const ManualBridgeView: React.FC = () => {
                   className="w-full py-2.5 bg-forge-emerald hover:bg-emerald-600 text-slate-950 font-mono font-bold text-xs rounded-lg shadow-lg flex items-center justify-center space-x-2 transition"
                 >
                   <Play className="w-4 h-4 fill-current" />
-                  <span>APPLY STATE TRANSITION</span>
+                  <span>{t('managerInbox.applyStateTransitionButton')}</span>
                 </button>
               </div>
             ) : (
               <div className="p-4 bg-rose-950/20 border border-rose-800/30 rounded-lg text-xs font-mono text-rose-300 space-y-2">
                 <div className="flex items-center space-x-2 font-bold">
                   <AlertCircle className="w-4 h-4 text-rose-400" />
-                  <span>Protocol Error</span>
+                  <span>{t('managerInbox.protocolErrorTitle')}</span>
                 </div>
                 <p className="text-slate-300">{managerParseResult.error}</p>
               </div>
@@ -1135,9 +1142,9 @@ export const ManualBridgeView: React.FC = () => {
               <div className="flex items-center justify-between">
                 <label className="text-xs font-mono font-semibold text-slate-300 flex items-center space-x-2">
                   <Terminal className="w-4 h-4 text-forge-cyan" />
-                  <span>Paste Gemini Coder Report</span>
+                  <span>{t('coderInbox.pasteLabel')}</span>
                 </label>
-                <span className="text-[11px] text-slate-500 font-mono">Requires coder.v1 protocol</span>
+                <span className="text-[11px] text-slate-500 font-mono">{t('coderInbox.requiresProtocolHint')}</span>
               </div>
               <textarea
                 value={coderInput}
@@ -1152,14 +1159,14 @@ export const ManualBridgeView: React.FC = () => {
                 onClick={() => setCoderInput('')}
                 className="text-xs text-slate-400 hover:text-slate-200 font-mono"
               >
-                Clear
+                {t('common.clear')}
               </button>
               <button
                 onClick={handleParseCoder}
                 className="px-4 py-2 bg-forge-cyan hover:bg-cyan-600 text-slate-950 font-mono font-bold text-xs rounded-lg shadow flex items-center space-x-2 transition"
               >
                 <Sparkles className="w-4 h-4" />
-                <span>PARSE REPORT</span>
+                <span>{t('coderInbox.parseReportButton')}</span>
               </button>
             </div>
           </div>
@@ -1167,26 +1174,30 @@ export const ManualBridgeView: React.FC = () => {
           {/* Right: Validation & Verification Trigger */}
           <div className="bg-surface-card border border-surface-border rounded-xl p-5 shadow space-y-4">
             <h3 className="text-xs font-mono font-semibold text-slate-300 uppercase tracking-wider">
-              Coder Claims vs Authoritative Evidence
+              {t('coderInbox.claimsVsEvidenceTitle')}
             </h3>
 
             {!coderParseResult ? (
               <div className="h-80 flex flex-col items-center justify-center text-slate-500 space-y-2 border border-dashed border-surface-border rounded-lg p-6 text-center">
                 <FileCheck className="w-8 h-8 text-slate-600" />
-                <span className="text-xs font-mono">Paste Coder report and click Parse Report to inspect.</span>
+                <span className="text-xs font-mono">{t('coderInbox.emptyParseHint')}</span>
               </div>
             ) : coderParseResult.success ? (
               <div className="space-y-4 text-xs font-mono">
                 <div className="p-3 bg-emerald-950/20 border border-emerald-800/30 rounded-lg text-emerald-300 flex items-center space-x-2">
                   <Check className="w-4 h-4 text-emerald-400 shrink-0" />
-                  <span>Valid <strong>{coderParseResult.protocolType}</strong> report detected.</span>
+                  <span>
+                    {t('coderInbox.validReportDetected', {
+                      protocolType: coderParseResult.protocolType || 'coder.v1',
+                    })}
+                  </span>
                 </div>
 
                 <div className="bg-surface p-4 rounded-lg border border-surface-border space-y-2">
-                  <div>Task ID: <strong className="text-forge-cyan">{coderParseResult.data?.data?.task_id}</strong></div>
-                  <div>Claimed Status: <span className="text-white font-bold">{coderParseResult.data?.data?.status}</span></div>
-                  <div>Files Claimed Changed: <span className="text-slate-300">{coderParseResult.data?.data?.files_claimed_changed?.join(', ') || 'None'}</span></div>
-                  <div>Tests Claimed: <span className="text-slate-300">{coderParseResult.data?.data?.tests_claimed?.join(', ') || 'None'}</span></div>
+                  <div>{t('managerInbox.targetTaskLabel')}: <strong className="text-forge-cyan">{coderParseResult.data?.data?.task_id}</strong></div>
+                  <div>{t('coderInbox.claimedStatusLabel')}: <span className="text-white font-bold">{coderParseResult.data?.data?.status}</span></div>
+                  <div>{t('coderInbox.filesChanged')}: <span className="text-slate-300">{coderParseResult.data?.data?.files_claimed_changed?.join(', ') || t('common.none')}</span></div>
+                  <div>{t('coderInbox.testsClaimed')}: <span className="text-slate-300">{coderParseResult.data?.data?.tests_claimed?.join(', ') || t('common.none')}</span></div>
                 </div>
 
                 {coderApplyStatus && (
@@ -1201,14 +1212,14 @@ export const ManualBridgeView: React.FC = () => {
                   className="w-full py-2.5 bg-forge-cyan hover:bg-cyan-500 text-slate-950 font-mono font-bold text-xs rounded-lg shadow-lg flex items-center justify-center space-x-2 transition disabled:opacity-50"
                 >
                   <Play className="w-4 h-4 fill-current" />
-                  <span>{isVerifying ? 'RUNNING AUTOMATED TESTS...' : 'APPLY & RUN VERIFICATION TESTS'}</span>
+                  <span>{isVerifying ? t('coderInbox.runningAutomatedTestsButton') : t('coderInbox.applyRunVerificationButton')}</span>
                 </button>
               </div>
             ) : (
               <div className="p-4 bg-rose-950/20 border border-rose-800/30 rounded-lg text-xs font-mono text-rose-300 space-y-2">
                 <div className="flex items-center space-x-2 font-bold">
                   <AlertCircle className="w-4 h-4 text-rose-400" />
-                  <span>Report Validation Error</span>
+                  <span>{t('coderInbox.validationErrorTitle')}</span>
                 </div>
                 <p className="text-slate-300">{coderParseResult.error}</p>
               </div>
@@ -1225,15 +1236,15 @@ export const ManualBridgeView: React.FC = () => {
           {/* Left: Configuration Form (1 col) */}
           <div className="bg-surface-card border border-surface-border rounded-xl p-5 shadow space-y-4">
             <div className="p-3 bg-slate-900/50 border border-slate-700/50 rounded-lg text-[11px] font-mono text-slate-300">
-              <span className="font-bold text-slate-200">Notice:</span> General WorkOrder / Review Package generator for pre-routing inspection. For authorized execution handoffs, use the <strong className="text-forge-amber">Owner Routing / Handoff</strong> tab.
+              <span className="font-bold text-slate-200">Notice:</span> {t('manualBridge.outboxNoticeText')}
             </div>
 
             <h3 className="text-xs font-mono font-semibold text-slate-300 uppercase tracking-wider">
-              Package Configuration (Pre-Routing / General)
+              {t('manualBridge.packageConfigTitle')}
             </h3>
 
             <div>
-              <label className="block text-xs font-mono text-slate-400 mb-1.5">Select Target Task:</label>
+              <label className="block text-xs font-mono text-slate-400 mb-1.5">{t('manualBridge.selectTargetTaskLabel')}:</label>
               <select
                 value={selectedOutboxTaskId}
                 onChange={(e) => setSelectedOutboxTaskId(e.target.value)}
@@ -1248,7 +1259,7 @@ export const ManualBridgeView: React.FC = () => {
             </div>
 
             <div>
-              <label className="block text-xs font-mono text-slate-400 mb-1.5">Package Type:</label>
+              <label className="block text-xs font-mono text-slate-400 mb-1.5">{t('manualBridge.packageTypeLabel')}:</label>
               <div className="space-y-2">
                 <label className="flex items-center space-x-2.5 p-3 rounded-lg border border-surface-border bg-surface cursor-pointer">
                   <input
@@ -1259,8 +1270,8 @@ export const ManualBridgeView: React.FC = () => {
                     className="text-forge-emerald focus:ring-0"
                   />
                   <div>
-                    <div className="text-xs font-semibold text-white">Work Order</div>
-                    <div className="text-[11px] text-slate-400">For Gemini Coder (Task + Criteria + Commands)</div>
+                    <div className="text-xs font-semibold text-white">{t('manualBridge.workOrderOptionTitle')}</div>
+                    <div className="text-[11px] text-slate-400">{t('manualBridge.workOrderOptionDesc')}</div>
                   </div>
                 </label>
 
@@ -1273,8 +1284,8 @@ export const ManualBridgeView: React.FC = () => {
                     className="text-forge-emerald focus:ring-0"
                   />
                   <div>
-                    <div className="text-xs font-semibold text-white">Review Package</div>
-                    <div className="text-[11px] text-slate-400">For ChatGPT Manager (Git Evidence + Test Results)</div>
+                    <div className="text-xs font-semibold text-white">{t('manualBridge.reviewPackageOptionTitle')}</div>
+                    <div className="text-[11px] text-slate-400">{t('manualBridge.reviewPackageOptionDesc')}</div>
                   </div>
                 </label>
               </div>
@@ -1286,7 +1297,7 @@ export const ManualBridgeView: React.FC = () => {
               className="w-full py-2.5 bg-forge-emerald hover:bg-emerald-600 text-slate-950 font-mono font-bold text-xs rounded-lg shadow-lg flex items-center justify-center space-x-2 transition disabled:opacity-50"
             >
               <Sparkles className="w-4 h-4" />
-              <span>{isGenerating ? 'GENERATING...' : 'GENERATE PACKAGE'}</span>
+              <span>{isGenerating ? t('manualBridge.generatingPackageButton') : t('manualBridge.generatePackageButton')}</span>
             </button>
           </div>
 
@@ -1294,7 +1305,7 @@ export const ManualBridgeView: React.FC = () => {
           <div className="lg:col-span-2 bg-surface-card border border-surface-border rounded-xl p-5 shadow space-y-4 flex flex-col justify-between">
             <div className="flex items-center justify-between">
               <h3 className="text-xs font-mono font-semibold text-slate-300 uppercase tracking-wider">
-                Generated Markdown Package
+                {t('manualBridge.generatedMarkdownPackageTitle')}
               </h3>
               {outboxContent && (
                 <button
@@ -1306,7 +1317,7 @@ export const ManualBridgeView: React.FC = () => {
                   }`}
                 >
                   {copied ? <Check className="w-3.5 h-3.5" /> : <Clipboard className="w-3.5 h-3.5" />}
-                  <span>{copied ? 'COPIED TO CLIPBOARD!' : '1-CLICK COPY'}</span>
+                  <span>{copied ? t('manualBridge.copiedButton') : t('manualBridge.oneClickCopyButton')}</span>
                 </button>
               )}
             </div>
@@ -1314,7 +1325,7 @@ export const ManualBridgeView: React.FC = () => {
             <textarea
               readOnly
               value={outboxContent}
-              placeholder="Click 'Generate Package' to construct a formatted Markdown package ready for 1-click clipboard copy."
+              placeholder={t('manualBridge.outboxPlaceholder')}
               className="w-full h-96 bg-surface border border-surface-border rounded-lg p-4 text-xs text-slate-100 font-mono focus:outline-none resize-none"
             />
           </div>
