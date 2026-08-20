@@ -9,6 +9,7 @@ export const Header: React.FC = () => {
     activeProject,
     projects,
     setActiveProject,
+    setActiveView,
     densityMode,
     setDensityMode,
     setIsEmergencyStopOpen,
@@ -85,26 +86,38 @@ export const Header: React.FC = () => {
         {/* Project Selector */}
         <div className="flex items-center space-x-2 pl-4 border-l border-surface-border">
           <FolderGit2 className="w-4 h-4 text-slate-400" />
-          <select
-            value={activeProject?.id || ''}
-            onChange={(e) => {
-              const selected = projects.find((p) => p.id === e.target.value);
-              setActiveProject(selected || null);
-            }}
-            className="bg-surface-card border border-surface-border text-sm text-slate-200 rounded-md px-2.5 py-1.5 focus:outline-none focus:border-forge-cyan"
-          >
-            {projects.map((p) => (
-              <option key={p.id} value={p.id}>
-                {p.name} ({p.id})
-              </option>
-            ))}
-          </select>
+          {projects.length > 0 ? (
+            <>
+              <select
+                value={activeProject?.id || ''}
+                onChange={(e) => {
+                  const selected = projects.find((p) => p.id === e.target.value);
+                  setActiveProject(selected || null);
+                }}
+                className="bg-surface-card border border-surface-border text-sm text-slate-200 rounded-md px-2.5 py-1.5 focus:outline-none focus:border-forge-cyan"
+              >
+                {projects.map((p) => (
+                  <option key={p.id} value={p.id}>
+                    {p.name} ({p.id})
+                  </option>
+                ))}
+              </select>
 
-          {activeProject && (
-            <div className={`px-2.5 py-1 rounded-full text-xs font-mono font-medium border flex items-center space-x-1.5 ${getStatusColor(activeProject.status)}`}>
-              <span className="w-1.5 h-1.5 rounded-full bg-current animate-pulse"></span>
-              <span>{getStatusLabel(activeProject.status)}</span>
-            </div>
+              {activeProject && (
+                <div className={`px-2.5 py-1 rounded-full text-xs font-mono font-medium border flex items-center space-x-1.5 ${getStatusColor(activeProject.status)}`}>
+                  <span className="w-1.5 h-1.5 rounded-full bg-current animate-pulse"></span>
+                  <span>{getStatusLabel(activeProject.status)}</span>
+                </div>
+              )}
+            </>
+          ) : (
+            <button
+              onClick={() => setActiveView('projects')}
+              className="text-xs font-mono text-slate-400 hover:text-forge-cyan transition flex items-center space-x-1.5 bg-surface-card border border-surface-border rounded-md px-2.5 py-1.5"
+              title={t('header.noProject')}
+            >
+              <span>{t('header.noProject')}</span>
+            </button>
           )}
         </div>
       </div>

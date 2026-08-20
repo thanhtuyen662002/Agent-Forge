@@ -68,6 +68,8 @@ export const viVN: TranslationDictionary = {
     statusPaused: 'ĐÃ TẠM DỪNG',
     statusBlocked: 'BỊ CHẶN',
     statusCompleted: 'ĐÃ HOÀN THÀNH',
+    noProject: 'Chưa có dự án',
+    openProjects: 'Mở Dự án',
   },
   sidebar: {
     orchestration: 'Điều phối',

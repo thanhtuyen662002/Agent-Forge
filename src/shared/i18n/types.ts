@@ -71,6 +71,8 @@ export interface TranslationDictionary {
     statusPaused: string;
     statusBlocked: string;
     statusCompleted: string;
+    noProject: string;
+    openProjects: string;
   };
   sidebar: {
     orchestration: string;

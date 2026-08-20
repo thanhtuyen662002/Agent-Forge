@@ -333,4 +333,31 @@ describe('Owner Vietnamese I18n Coverage Contract (PR #11)', () => {
       ).toBe(false);
     }
   });
+
+  it('11. Header empty project selector contract: renders explicit localized empty state when zero projects exist without a blank select', () => {
+    const headerPath = path.resolve(__dirname, '..', 'src/ui/components/Header.tsx');
+    const content = fs.readFileSync(headerPath, 'utf-8');
+
+    // Assert projects.length check exists
+    expect(content.includes('projects.length > 0')).toBe(true);
+
+    // Assert localized noProject key is used
+    expect(content.includes("t('header.noProject')")).toBe(true);
+
+    // Assert translation keys exist and resolve in both locales
+    expect(getTranslation('en-US', 'header.noProject')).toBe('No project');
+    expect(getTranslation('vi-VN', 'header.noProject')).toBe('Chưa có dự án');
+  });
+
+  it('12. AgentCard badge layout contract: aligns role and status badges together in a right-side badge group', () => {
+    const agentCardPath = path.resolve(__dirname, '..', 'src/ui/components/AgentCard.tsx');
+    const content = fs.readFileSync(agentCardPath, 'utf-8');
+
+    // Assert role and status badges are rendered using canonical values
+    expect(content.includes("agent.role.replace('_', ' ')")).toBe(true);
+    expect(content.includes('{agent.status}')).toBe(true);
+
+    // Assert unified right-side badge group container exists
+    expect(content.includes('flex items-center gap-2 shrink-0')).toBe(true);
+  });
 });

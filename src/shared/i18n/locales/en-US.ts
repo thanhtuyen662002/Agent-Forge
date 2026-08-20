@@ -68,6 +68,8 @@ export const enUS: TranslationDictionary = {
     statusPaused: 'PAUSED',
     statusBlocked: 'BLOCKED',
     statusCompleted: 'COMPLETED',
+    noProject: 'No project',
+    openProjects: 'Open Projects',
   },
   sidebar: {
     orchestration: 'Orchestration',
