@@ -204,10 +204,24 @@ export const ManualBridgeView: React.FC = () => {
       if (res && res.success && res.decision) {
         setRoutingDecision(res.decision);
       } else {
-        setRoutingError(res?.error || t('manualBridge.routingFailedWithoutDecision'));
+        const errorDetail = res?.error;
+        setRoutingError(
+          errorDetail
+            ? t('manualBridge.errorExecutingRouting', {
+                error: errorDetail,
+              })
+            : t('manualBridge.routingFailedWithoutDecision')
+        );
       }
     } catch (err: any) {
-      setRoutingError(err.message ? t('manualBridge.errorExecutingRouting', { error: err.message }) : t('manualBridge.errorExecutingRoutingDefault'));
+      const errorDetail = err.message;
+      setRoutingError(
+        errorDetail
+          ? t('manualBridge.errorExecutingRouting', {
+              error: errorDetail,
+            })
+          : t('manualBridge.errorExecutingRoutingDefault')
+      );
     } finally {
       setIsRouting(false);
       await loadSnapshot();
@@ -230,10 +244,24 @@ export const ManualBridgeView: React.FC = () => {
       if (res && res.success && res.authorization) {
         setAuthorization(res.authorization);
       } else {
-        setAuthError(res?.error || t('manualBridge.authCreationFailed'));
+        const errorDetail = res?.error;
+        setAuthError(
+          errorDetail
+            ? t('manualBridge.errorExecutingAuth', {
+                error: errorDetail,
+              })
+            : t('manualBridge.authCreationFailed')
+        );
       }
     } catch (err: any) {
-      setAuthError(err.message ? t('manualBridge.errorExecutingAuth', { error: err.message }) : t('manualBridge.errorExecutingAuthDefault'));
+      const errorDetail = err.message;
+      setAuthError(
+        errorDetail
+          ? t('manualBridge.errorExecutingAuth', {
+              error: errorDetail,
+            })
+          : t('manualBridge.errorExecutingAuthDefault')
+      );
     } finally {
       setIsAuthorizing(false);
       await loadSnapshot();
@@ -250,10 +278,24 @@ export const ManualBridgeView: React.FC = () => {
       if (res && res.success && res.result) {
         setDispatchResult(res.result);
       } else {
-        setDispatchError(res?.error || res?.result?.error || t('manualBridge.dispatchExecutionFailed'));
+        const errorDetail = res?.error || res?.result?.error;
+        setDispatchError(
+          errorDetail
+            ? t('manualBridge.errorDispatchingAuth', {
+                error: errorDetail,
+              })
+            : t('manualBridge.dispatchExecutionFailed')
+        );
       }
     } catch (err: any) {
-      setDispatchError(err.message ? t('manualBridge.errorDispatchingAuth', { error: err.message }) : t('manualBridge.errorDispatchingAuthDefault'));
+      const errorDetail = err.message;
+      setDispatchError(
+        errorDetail
+          ? t('manualBridge.errorDispatchingAuth', {
+              error: errorDetail,
+            })
+          : t('manualBridge.errorDispatchingAuthDefault')
+      );
     } finally {
       setIsDispatching(false);
       await loadSnapshot();
@@ -269,10 +311,12 @@ export const ManualBridgeView: React.FC = () => {
       if (res && res.success && res.workOrder) {
         setHandoffWorkOrder(res.workOrder);
       } else {
-        setHandoffWorkOrder(t('manualBridge.errorGeneratingWorkOrder', { error: res?.error || t('common.unknown') }));
+        const errorDetail = res?.error || t('common.unknown');
+        setHandoffWorkOrder(t('manualBridge.errorGeneratingWorkOrder', { error: errorDetail }));
       }
     } catch (err: any) {
-      setHandoffWorkOrder(t('manualBridge.errorGeneratingWorkOrder', { error: err.message }));
+      const errorDetail = err.message || t('common.unknown');
+      setHandoffWorkOrder(t('manualBridge.errorGeneratingWorkOrder', { error: errorDetail }));
     } finally {
       setIsGeneratingHandoffWorkOrder(false);
     }
@@ -303,7 +347,8 @@ export const ManualBridgeView: React.FC = () => {
       setManagerApplyStatus(t('manualBridge.managerDecisionAppliedSuccess', { message: res.message || t('manualBridge.managerDecisionAppliedDefault') }));
       await loadSnapshot();
     } else {
-      setManagerApplyStatus(t('manualBridge.managerDecisionApplyFailed', { error: res.error || t('manualBridge.managerDecisionApplyFailedDefault') }));
+      const errorDetail = res.error || t('manualBridge.managerDecisionApplyFailedDefault');
+      setManagerApplyStatus(t('manualBridge.managerDecisionApplyFailed', { error: errorDetail }));
     }
   };
 
@@ -337,10 +382,12 @@ export const ManualBridgeView: React.FC = () => {
         }
         await loadSnapshot();
       } else {
-        setCoderApplyStatus(t('manualBridge.coderReportApplyError', { error: res.error || t('common.unknown') }));
+        const errorDetail = res.error || t('common.unknown');
+        setCoderApplyStatus(t('manualBridge.coderReportApplyError', { error: errorDetail }));
       }
     } catch (err: any) {
-      setCoderApplyStatus(t('manualBridge.verificationError', { error: err.message || t('common.unknown') }));
+      const errorDetail = err.message || t('common.unknown');
+      setCoderApplyStatus(t('manualBridge.verificationError', { error: errorDetail }));
     } finally {
       setIsVerifying(false);
     }
@@ -361,7 +408,8 @@ export const ManualBridgeView: React.FC = () => {
         setOutboxContent(text);
       }
     } catch (err: any) {
-      setOutboxContent(t('manualBridge.errorGeneratingPackage', { error: err.message }));
+      const errorDetail = err.message || t('common.unknown');
+      setOutboxContent(t('manualBridge.errorGeneratingPackage', { error: errorDetail }));
     } finally {
       setIsGenerating(false);
     }

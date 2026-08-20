@@ -277,4 +277,60 @@ describe('Owner Vietnamese I18n Coverage Contract (PR #11)', () => {
       }
     }
   });
+
+  it('9. Generic placeholder guard: Prevents hardcoded string literals inside placeholder attributes across all 18 Owner UI files', () => {
+    for (const relPath of ownerViewFiles) {
+      const fullPath = path.resolve(__dirname, '..', relPath);
+      const content = fs.readFileSync(fullPath, 'utf-8');
+      const lines = content.split('\n');
+
+      lines.forEach((line, idx) => {
+        // Match placeholder="English text" or placeholder='English text' or placeholder={`English text`}
+        const rawPlaceholderMatch = line.match(/placeholder=(["'`])([^"'`]+)\1/);
+        if (rawPlaceholderMatch) {
+          const val = rawPlaceholderMatch[2].trim();
+          // Allow empty string or purely non-word characters if any
+          expect(
+            val,
+            `Hardcoded placeholder string literal "${val}" at ${relPath}:${idx + 1}. Use placeholder={t('...')} instead.`
+          ).toBe('');
+        }
+      });
+    }
+  });
+
+  it('10. Generic Manual Bridge status/error setter guard: Enforces localized error wrappers and prevents unwrapped backend error display', () => {
+    const manualBridgePath = path.resolve(__dirname, '..', 'src/ui/views/ManualBridgeView.tsx');
+    const content = fs.readFileSync(manualBridgePath, 'utf-8');
+
+    // 1. Assert old unwrapped error display patterns are absent
+    expect(content.includes('setRoutingError(res?.error ||')).toBe(false);
+    expect(content.includes('setAuthError(res?.error ||')).toBe(false);
+    expect(content.includes('setDispatchError(res?.error || res?.result?.error ||')).toBe(false);
+    expect(content.includes('setDispatchError(res?.error ||')).toBe(false);
+
+    // 2. Assert no hardcoded English template literals passed to status/error setters
+    const forbiddenSetterPatterns = [
+      /setRoutingError\(\s*['"`]Routing failed/i,
+      /setRoutingError\(\s*['"`]Error executing/i,
+      /setAuthError\(\s*['"`]Authorization creation/i,
+      /setAuthError\(\s*['"`]Error executing/i,
+      /setDispatchError\(\s*['"`]Dispatch execution/i,
+      /setDispatchError\(\s*['"`]Error dispatching/i,
+      /setManagerApplyStatus\(\s*`Success:\s*\$\{res\.message/i,
+      /setManagerApplyStatus\(\s*`Error:\s*\$\{res\.error/i,
+      /setCoderApplyStatus\(\s*`Success:\s*\$\{res\.message/i,
+      /setCoderApplyStatus\(\s*`Error:\s*\$\{res\.error/i,
+      /setCoderApplyStatus\(\s*`Verification Error:/i,
+      /setHandoffWorkOrder\(\s*`Error generating/i,
+      /setOutboxContent\(\s*`Error generating/i,
+    ];
+
+    for (const pattern of forbiddenSetterPatterns) {
+      expect(
+        pattern.test(content),
+        `Found hardcoded setter pattern ${pattern.toString()} in ManualBridgeView.tsx`
+      ).toBe(false);
+    }
+  });
 });
