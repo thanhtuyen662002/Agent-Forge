@@ -1,9 +1,11 @@
 import React, { useState } from 'react';
 import { useOrchestrator } from '../context/OrchestratorContext';
+import { useI18n } from '../context/I18nContext';
 import { FolderGit2, Plus, FileCode, FolderOpen } from 'lucide-react';
 
 export const ProjectsView: React.FC = () => {
   const { projects, activeProject, createProject, importContract } = useOrchestrator();
+  const { t } = useI18n();
   const [isCreateOpen, setIsCreateOpen] = useState<boolean>(false);
   const [name, setName] = useState<string>('');
   const [desc, setDesc] = useState<string>('');
@@ -26,7 +28,7 @@ export const ProjectsView: React.FC = () => {
         }
       }
     } catch (err: any) {
-      setErrorStatus(`Dialog error: ${err.message}`);
+      setErrorStatus(`${t('common.error')}: ${err.message}`);
     }
   };
 
@@ -46,7 +48,7 @@ export const ProjectsView: React.FC = () => {
       setDisplayPath('');
       setIsCreateOpen(false);
     } catch (err: any) {
-      setErrorStatus(`Creation failed: ${err.message}`);
+      setErrorStatus(`${t('common.error')}: ${err.message}`);
     }
   };
 
@@ -55,9 +57,9 @@ export const ProjectsView: React.FC = () => {
     try {
       const parsed = JSON.parse(contractJson);
       await importContract(parsed);
-      setImportStatus('Contract successfully imported!');
+      setImportStatus(t('projects.importSuccess'));
     } catch (err: any) {
-      setImportStatus(`JSON Error: ${err.message}`);
+      setImportStatus(t('projects.importError', { error: err.message }));
     }
   };
 
@@ -67,10 +69,10 @@ export const ProjectsView: React.FC = () => {
         <div>
           <h2 className="text-xl font-bold text-white tracking-tight flex items-center space-x-2.5">
             <FolderGit2 className="w-5 h-5 text-forge-cyan" />
-            <span>Projects & Project Contract</span>
+            <span>{t('projects.title')}</span>
           </h2>
           <p className="text-xs text-slate-400">
-            Bind local Git repositories and import durable project contracts and architecture constraints.
+            {t('projects.subtitle')}
           </p>
         </div>
 
@@ -82,7 +84,7 @@ export const ProjectsView: React.FC = () => {
           className="px-4 py-2 bg-forge-cyan hover:bg-cyan-600 text-slate-950 font-mono font-bold text-xs rounded-lg shadow flex items-center space-x-2 transition"
         >
           <Plus className="w-4 h-4" />
-          <span>NEW PROJECT</span>
+          <span>{t('projects.newProject')}</span>
         </button>
       </div>
 
@@ -90,10 +92,10 @@ export const ProjectsView: React.FC = () => {
       <div className="bg-surface-card border border-surface-border rounded-xl p-6 shadow-lg space-y-4">
         <h3 className="text-sm font-semibold text-white font-mono uppercase tracking-wider flex items-center space-x-2">
           <FileCode className="w-4 h-4 text-forge-purple" />
-          <span>Project Contract Importer</span>
+          <span>{t('projects.importerTitle')}</span>
         </h3>
         <p className="text-xs text-slate-400">
-          Import durable project goals, security requirements, and definition of done (DoD) to guide Manager decomposition.
+          {t('projects.importerSubtitle')}
         </p>
 
         <textarea
@@ -119,7 +121,7 @@ export const ProjectsView: React.FC = () => {
             onClick={handleImportContract}
             className="px-5 py-2 bg-forge-purple hover:bg-purple-600 text-white font-mono font-bold text-xs rounded-lg shadow transition"
           >
-            IMPORT CONTRACT
+            {t('projects.importButton')}
           </button>
         </div>
       </div>
@@ -128,32 +130,32 @@ export const ProjectsView: React.FC = () => {
       {isCreateOpen && (
         <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/80 backdrop-blur-sm p-4">
           <div className="bg-surface border border-surface-border rounded-xl shadow-2xl max-w-md w-full p-6 space-y-4">
-            <h3 className="text-sm font-mono font-bold text-white uppercase tracking-wider">Create New Project</h3>
+            <h3 className="text-sm font-mono font-bold text-white uppercase tracking-wider">{t('projects.createModal.title')}</h3>
             <form onSubmit={handleCreate} className="space-y-4 text-xs font-mono">
               <div>
-                <label className="block text-slate-400 mb-1">Project Name:</label>
+                <label className="block text-slate-400 mb-1">{t('projects.createModal.nameLabel')}:</label>
                 <input
                   type="text"
                   required
                   value={name}
                   onChange={(e) => setName(e.target.value)}
-                  placeholder="e.g. Agent-Forge Control Plane"
+                  placeholder={t('projects.createModal.namePlaceholder')}
                   className="w-full bg-surface-card border border-surface-border rounded-lg px-3 py-2 text-white font-sans focus:outline-none focus:border-forge-cyan"
                 />
               </div>
 
               <div>
-                <label className="block text-slate-400 mb-1">Description:</label>
+                <label className="block text-slate-400 mb-1">{t('projects.createModal.descLabel')}:</label>
                 <textarea
                   value={desc}
                   onChange={(e) => setDesc(e.target.value)}
-                  placeholder="Project overview..."
+                  placeholder={t('projects.createModal.descPlaceholder')}
                   className="w-full h-20 bg-surface-card border border-surface-border rounded-lg p-3 text-white font-sans focus:outline-none focus:border-forge-cyan resize-none"
                 />
               </div>
 
               <div>
-                <label className="block text-slate-400 mb-1">Git Repository:</label>
+                <label className="block text-slate-400 mb-1">{t('projects.createModal.gitRepoLabel')}:</label>
                 <div className="space-y-2">
                   <div className="flex items-center space-x-2">
                     <button
@@ -162,10 +164,10 @@ export const ProjectsView: React.FC = () => {
                       className="px-3 py-2 bg-surface-border hover:bg-slate-700 text-slate-200 rounded-lg flex items-center space-x-1.5 transition font-semibold"
                     >
                       <FolderOpen className="w-3.5 h-3.5 text-forge-cyan" />
-                      <span>Choose Repository...</span>
+                      <span>{t('projects.createModal.chooseRepoButton')}</span>
                     </button>
                     <span className="text-[10px] text-slate-400 font-mono">
-                      {selectionId ? '✓ Token Verified' : 'Select Git Root'}
+                      {selectionId ? t('projects.createModal.tokenVerified') : t('projects.createModal.selectGitRoot')}
                     </span>
                   </div>
 
@@ -173,7 +175,7 @@ export const ProjectsView: React.FC = () => {
                     type="text"
                     readOnly
                     value={displayPath}
-                    placeholder="No repository selected (click Choose Repository)"
+                    placeholder={t('projects.createModal.noRepoSelected')}
                     className="w-full bg-surface-card/60 border border-surface-border text-slate-300 rounded-lg px-3 py-2 text-xs font-mono cursor-not-allowed focus:outline-none"
                   />
                 </div>
@@ -191,14 +193,14 @@ export const ProjectsView: React.FC = () => {
                   onClick={() => setIsCreateOpen(false)}
                   className="px-4 py-2 bg-surface-card hover:bg-surface-border text-slate-300 rounded-lg text-xs"
                 >
-                  Cancel
+                  {t('projects.createModal.cancelButton')}
                 </button>
                 <button
                   type="submit"
                   disabled={!selectionId}
                   className="px-5 py-2 bg-forge-cyan hover:bg-cyan-600 disabled:opacity-40 disabled:cursor-not-allowed text-slate-950 font-bold rounded-lg text-xs shadow"
                 >
-                  Initialize Project
+                  {t('projects.createModal.initButton')}
                 </button>
               </div>
             </form>

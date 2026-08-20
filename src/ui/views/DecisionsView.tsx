@@ -1,13 +1,32 @@
 import React from 'react';
 import { useOrchestrator } from '../context/OrchestratorContext';
+import { useI18n } from '../context/I18nContext';
 import { Scale, ShieldCheck, UserCheck, AlertCircle } from 'lucide-react';
 
 export const DecisionsView: React.FC = () => {
+  const { t } = useI18n();
+
   const authorityMatrix = [
-    { level: 'CODER', scope: 'Local file edits, unit test creation, lint fixes', threshold: 'Automated dispatch' },
-    { level: 'REVIEWER', scope: 'Test validation, issue classification (Blocker/Required/Nit)', threshold: 'Pass/Fix decision' },
-    { level: 'PRIMARY_MANAGER', scope: 'Task decomposition, milestone sign-off, architecture changes', threshold: 'Full project planning' },
-    { level: 'OWNER', scope: 'Production deploy, dependency install, credential access, emergency stop', threshold: 'Final Human Authority' },
+    {
+      level: 'CODER',
+      scope: t('decisions.tiers.coderScope'),
+      threshold: t('decisions.tiers.coderThreshold'),
+    },
+    {
+      level: 'REVIEWER',
+      scope: t('decisions.tiers.reviewerScope'),
+      threshold: t('decisions.tiers.reviewerThreshold'),
+    },
+    {
+      level: 'PRIMARY_MANAGER',
+      scope: t('decisions.tiers.managerScope'),
+      threshold: t('decisions.tiers.managerThreshold'),
+    },
+    {
+      level: 'OWNER',
+      scope: t('decisions.tiers.ownerScope'),
+      threshold: t('decisions.tiers.ownerThreshold'),
+    },
   ];
 
   return (
@@ -15,25 +34,25 @@ export const DecisionsView: React.FC = () => {
       <div>
         <h2 className="text-xl font-bold text-white tracking-tight flex items-center space-x-2.5">
           <Scale className="w-5 h-5 text-forge-purple" />
-          <span>Decision Authority & Governance</span>
+          <span>{t('decisions.title')}</span>
         </h2>
         <p className="text-xs text-slate-400">
-          Enforces explicit authority boundaries so lower-capability models cannot silently make high-risk decisions.
+          {t('decisions.subtitle')}
         </p>
       </div>
 
       {/* Authority Matrix Table */}
       <div className="bg-surface-card border border-surface-border rounded-xl p-6 shadow-lg space-y-4">
         <h3 className="text-sm font-semibold text-white font-mono uppercase tracking-wider">
-          Authority Tier Specification
+          {t('decisions.tierSpecTitle')}
         </h3>
         <div className="overflow-x-auto">
           <table className="w-full text-xs text-left">
             <thead className="font-mono text-slate-400 border-b border-surface-border uppercase bg-surface/50">
               <tr>
-                <th className="p-3">Authority Tier</th>
-                <th className="p-3">Permitted Scope</th>
-                <th className="p-3">Approval Gate</th>
+                <th className="p-3">{t('decisions.tierHeader')}</th>
+                <th className="p-3">{t('decisions.scopeHeader')}</th>
+                <th className="p-3">{t('decisions.gateHeader')}</th>
               </tr>
             </thead>
             <tbody className="divide-y divide-surface-border font-mono">

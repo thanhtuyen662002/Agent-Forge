@@ -1,5 +1,6 @@
 import React from 'react';
 import { Agent, ProviderResource, Task } from '../../core/types/domain';
+import { useI18n } from '../context/I18nContext';
 import { QuotaBadge } from './QuotaBadge';
 import { Bot, Terminal, Shield, ArrowUpRight, Cpu } from 'lucide-react';
 
@@ -16,6 +17,8 @@ export const AgentCard: React.FC<AgentCardProps> = ({
   assignedTask,
   onViewTask,
 }) => {
+  const { t } = useI18n();
+
   const getRoleIcon = () => {
     switch (agent.role) {
       case 'PRIMARY_MANAGER':
@@ -46,13 +49,13 @@ export const AgentCard: React.FC<AgentCardProps> = ({
 
   const observableAction = assignedTask
     ? assignedTask.state === 'CODING'
-      ? 'Implementing code & running tests'
+      ? t('agentCard.actions.implementingCode')
       : assignedTask.state === 'VALIDATING'
-      ? 'Running automated verification commands'
+      ? t('agentCard.actions.runningVerification')
       : assignedTask.state === 'REVIEWING'
-      ? 'Manager evaluating review package'
-      : `Active on ${assignedTask.id}`
-    : 'Awaiting task dispatch (IDLE)';
+      ? t('agentCard.actions.evaluatingReview')
+      : t('agentCard.actions.activeOnTask', { taskId: assignedTask.id })
+    : t('agentCard.actions.awaitingDispatch');
 
   return (
     <div className="bg-surface-card border border-surface-border rounded-xl p-5 shadow-lg space-y-4 hover:border-surface-hover transition group">
@@ -72,7 +75,7 @@ export const AgentCard: React.FC<AgentCardProps> = ({
               </span>
             </div>
             <div className="text-xs text-slate-400 font-mono mt-0.5">
-              {resource?.model_name || 'No assigned model'}
+              {resource?.model_name || t('agentCard.noAssignedModel')}
             </div>
           </div>
         </div>
@@ -87,10 +90,10 @@ export const AgentCard: React.FC<AgentCardProps> = ({
       {/* Task & Action Info */}
       <div className="p-3 bg-surface/70 rounded-lg border border-surface-border space-y-2 text-xs">
         <div className="text-slate-400 font-mono flex items-center justify-between">
-          <span>Observable Action:</span>
+          <span>{t('agentCard.observableAction')}:</span>
           {assignedTask && (
             <span className="text-forge-cyan font-semibold">
-              Attempt #{assignedTask.revision_count + 1}
+              {t('agentCard.attemptLabel', { attempt: (assignedTask.revision_count + 1).toString() })}
             </span>
           )}
         </div>
@@ -98,13 +101,13 @@ export const AgentCard: React.FC<AgentCardProps> = ({
 
         {assignedTask && (
           <div className="pt-2 border-t border-surface-border/50 flex items-center justify-between">
-            <span className="font-mono text-slate-400 text-[11px]">Task: <strong className="text-white">{assignedTask.id}</strong></span>
+            <span className="font-mono text-slate-400 text-[11px]">{t('agentCard.taskLabel')}: <strong className="text-white">{assignedTask.id}</strong></span>
             {onViewTask && (
               <button
                 onClick={() => onViewTask(assignedTask.id)}
                 className="text-[11px] text-forge-cyan hover:underline flex items-center space-x-0.5 font-medium"
               >
-                <span>View Task</span>
+                <span>{t('agentCard.viewTask')}</span>
                 <ArrowUpRight className="w-3 h-3" />
               </button>
             )}
@@ -115,7 +118,7 @@ export const AgentCard: React.FC<AgentCardProps> = ({
       {/* Quota & Footer */}
       {resource && (
         <div className="flex items-center justify-between pt-1">
-          <span className="text-xs text-slate-400 font-mono">Resource Quota:</span>
+          <span className="text-xs text-slate-400 font-mono">{t('agentCard.resourceQuota')}:</span>
           <QuotaBadge
             remaining={resource.remaining_quota}
             total={resource.total_quota}

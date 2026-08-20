@@ -1,10 +1,12 @@
 import React from 'react';
 import { useOrchestrator } from '../context/OrchestratorContext';
+import { useI18n } from '../context/I18nContext';
 import { AgentCard } from '../components/AgentCard';
 import { Bot, Shield, Terminal, Wrench } from 'lucide-react';
 
 export const AgentCenterView: React.FC = () => {
   const { agents, resources, tasks, setSelectedTaskId, setActiveView } = useOrchestrator();
+  const { t } = useI18n();
 
   const managers = agents.filter((a) => a.role === 'PRIMARY_MANAGER' || a.role === 'BACKUP_MANAGER');
   const coders = agents.filter((a) => a.role === 'CODER');
@@ -15,10 +17,10 @@ export const AgentCenterView: React.FC = () => {
       <div>
         <h2 className="text-xl font-bold text-white tracking-tight flex items-center space-x-2.5">
           <Bot className="w-5 h-5 text-forge-cyan" />
-          <span>Agent Center</span>
+          <span>{t('agentCenter.title')}</span>
         </h2>
         <p className="text-xs text-slate-400">
-          Supervise active AI Managers, Coders, Reviewers, and their assigned provider resources.
+          {t('agentCenter.subtitle')}
         </p>
       </div>
 
@@ -26,7 +28,7 @@ export const AgentCenterView: React.FC = () => {
       <div className="space-y-3">
         <h3 className="text-xs font-mono font-semibold text-slate-400 uppercase tracking-wider flex items-center space-x-2">
           <Shield className="w-4 h-4 text-forge-purple" />
-          <span>Manager Pool</span>
+          <span>{t('agentCenter.managerPool')}</span>
         </h3>
         <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-5">
           {managers.map((m) => (
@@ -48,7 +50,7 @@ export const AgentCenterView: React.FC = () => {
       <div className="space-y-3">
         <h3 className="text-xs font-mono font-semibold text-slate-400 uppercase tracking-wider flex items-center space-x-2">
           <Terminal className="w-4 h-4 text-forge-cyan" />
-          <span>Coder Pool</span>
+          <span>{t('agentCenter.coderPool')}</span>
         </h3>
         <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-5">
           {coders.map((c) => (

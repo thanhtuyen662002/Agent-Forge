@@ -1,11 +1,13 @@
 import React, { useState } from 'react';
 import { useOrchestrator } from '../context/OrchestratorContext';
+import { useI18n } from '../context/I18nContext';
 import { QuotaBadge } from '../components/QuotaBadge';
 import { ProviderResource } from '../../core/types/domain';
 import { Cpu, Edit2, ShieldAlert, Check, RefreshCw } from 'lucide-react';
 
 export const CapacityView: React.FC = () => {
   const { resources, updateResourceQuota } = useOrchestrator();
+  const { t } = useI18n();
   const [editingResource, setEditingResource] = useState<ProviderResource | null>(null);
   const [editRemaining, setEditRemaining] = useState<number>(0);
   const [editTotal, setEditTotal] = useState<number>(100);
@@ -27,10 +29,10 @@ export const CapacityView: React.FC = () => {
       <div>
         <h2 className="text-xl font-bold text-white tracking-tight flex items-center space-x-2.5">
           <Cpu className="w-5 h-5 text-forge-emerald" />
-          <span>Capacity & Quota Management</span>
+          <span>{t('capacity.title')}</span>
         </h2>
         <p className="text-xs text-slate-400">
-          Model-level provider quotas, health status, and capacity confidence ratings.
+          {t('capacity.subtitle')}
         </p>
       </div>
 
@@ -63,7 +65,7 @@ export const CapacityView: React.FC = () => {
 
             <div className="pt-3 border-t border-surface-border space-y-3">
               <div className="flex items-center justify-between">
-                <span className="text-xs font-mono text-slate-400">Quota:</span>
+                <span className="text-xs font-mono text-slate-400">{t('capacity.quotaLabel')}:</span>
                 <QuotaBadge
                   remaining={res.remaining_quota}
                   total={res.total_quota}
@@ -82,7 +84,7 @@ export const CapacityView: React.FC = () => {
                 className="w-full py-1.5 bg-surface hover:bg-surface-hover text-slate-300 rounded-lg border border-surface-border text-xs font-mono flex items-center justify-center space-x-1.5 transition"
               >
                 <Edit2 className="w-3 h-3 text-forge-cyan" />
-                <span>Adjust Quota Snapshot</span>
+                <span>{t('capacity.adjustSnapshot')}</span>
               </button>
             </div>
           </div>
@@ -94,12 +96,14 @@ export const CapacityView: React.FC = () => {
         <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/80 backdrop-blur-sm p-4">
           <div className="bg-surface border border-surface-border rounded-xl shadow-2xl max-w-md w-full p-6 space-y-4">
             <h3 className="text-sm font-mono font-bold text-white uppercase tracking-wider">
-              Adjust Quota: {editingResource.model_name}
+              {t('capacity.adjustTitle', { modelName: editingResource.model_name })}
             </h3>
 
             <div className="space-y-3 text-xs font-mono">
               <div>
-                <label className="block text-slate-400 mb-1">Remaining Units ({editingResource.quota_unit}):</label>
+                <label className="block text-slate-400 mb-1">
+                  {t('capacity.remainingUnits', { unit: editingResource.quota_unit })}:
+                </label>
                 <input
                   type="number"
                   value={editRemaining}
@@ -109,7 +113,7 @@ export const CapacityView: React.FC = () => {
               </div>
 
               <div>
-                <label className="block text-slate-400 mb-1">Total Allocated Units:</label>
+                <label className="block text-slate-400 mb-1">{t('capacity.totalUnits')}:</label>
                 <input
                   type="number"
                   value={editTotal}
@@ -124,13 +128,13 @@ export const CapacityView: React.FC = () => {
                 onClick={() => setEditingResource(null)}
                 className="px-4 py-2 bg-surface-card hover:bg-surface-border text-slate-300 rounded-lg text-xs"
               >
-                Cancel
+                {t('capacity.cancel')}
               </button>
               <button
                 onClick={handleSaveQuota}
                 className="px-5 py-2 bg-forge-emerald hover:bg-emerald-600 text-slate-950 font-mono font-bold rounded-lg text-xs shadow"
               >
-                Save Quota Snapshot
+                {t('capacity.saveSnapshot')}
               </button>
             </div>
           </div>

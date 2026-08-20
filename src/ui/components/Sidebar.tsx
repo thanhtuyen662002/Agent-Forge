@@ -26,25 +26,38 @@ export const Sidebar: React.FC = () => {
   const navItems = [
     { id: 'dashboard', label: t('nav.dashboard'), icon: LayoutDashboard },
     { id: 'manual-bridge', label: t('nav.manualBridge'), icon: ArrowLeftRight, badge: pendingBridgeTasks },
-    { id: 'task-board', label: 'Task Board', icon: Kanban, badge: tasks.length },
-    { id: 'agent-center', label: 'Agent Center', icon: Bot },
-    { id: 'capacity', label: 'Capacity & Quota', icon: Cpu },
+    { id: 'task-board', label: t('nav.taskBoard'), icon: Kanban, badge: tasks.length },
+    { id: 'agent-center', label: t('nav.agentCenter'), icon: Bot },
+    { id: 'capacity', label: t('nav.capacity'), icon: Cpu },
     { id: 'timeline', label: t('nav.timeline'), icon: History },
-    { id: 'decisions', label: 'Decisions & Authority', icon: Scale },
+    { id: 'decisions', label: t('nav.decisions'), icon: Scale },
     { id: 'evidence', label: t('nav.evidence'), icon: ShieldCheck },
-    { id: 'projects', label: 'Projects & Contract', icon: FolderGit2 },
+    { id: 'projects', label: t('nav.projects'), icon: FolderGit2 },
     { id: 'settings', label: t('nav.settings'), icon: Sliders },
   ];
 
   if (densityMode === 'DEBUG') {
-    navItems.push({ id: 'debug', label: 'Debug & Simulator', icon: Bug, badge: undefined });
+    navItems.push({ id: 'debug', label: t('nav.debug'), icon: Bug, badge: undefined });
   }
+
+  const getModeLabel = (mode: string) => {
+    switch (mode) {
+      case 'OWNER':
+        return t('header.modeOwner');
+      case 'ENGINEER':
+        return t('header.modeEngineer');
+      case 'DEBUG':
+        return t('header.modeDebug');
+      default:
+        return mode;
+    }
+  };
 
   return (
     <aside className="w-64 bg-surface border-r border-surface-border flex flex-col justify-between shrink-0 select-none">
       <div className="py-4 px-3 space-y-1">
         <div className="px-3 py-1.5 text-xs font-mono font-semibold text-slate-500 uppercase tracking-wider">
-          Orchestration
+          {t('sidebar.orchestration')}
         </div>
         {navItems.map((item) => {
           const Icon = item.icon;
@@ -82,14 +95,14 @@ export const Sidebar: React.FC = () => {
       {/* Footer Info */}
       <div className="p-4 border-t border-surface-border bg-surface-card/40">
         <div className="flex items-center justify-between text-[11px] font-mono text-slate-400">
-          <span>Mode: <strong className="text-slate-200">{densityMode}</strong></span>
+          <span>{t('sidebar.mode')}: <strong className="text-slate-200">{getModeLabel(densityMode)}</strong></span>
           <span className="text-emerald-400 flex items-center space-x-1">
             <span className="w-1.5 h-1.5 rounded-full bg-emerald-400"></span>
-            <span>ONLINE</span>
+            <span>{t('sidebar.online')}</span>
           </span>
         </div>
         <div className="text-[10px] text-slate-500 mt-1 truncate">
-          Offline SQLite • Local-First
+          {t('sidebar.offlineTag')}
         </div>
       </div>
     </aside>

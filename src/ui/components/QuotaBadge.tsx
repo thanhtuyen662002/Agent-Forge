@@ -1,5 +1,6 @@
 import React from 'react';
 import { QuotaSource } from '../../core/types/domain';
+import { useI18n } from '../context/I18nContext';
 
 interface QuotaBadgeProps {
   remaining: number | null;
@@ -16,11 +17,13 @@ export const QuotaBadge: React.FC<QuotaBadgeProps> = ({
   source,
   confidence = 1.0,
 }) => {
+  const { t } = useI18n();
+
   if (remaining === null || source === 'UNKNOWN') {
     return (
       <div className="inline-flex items-center space-x-1.5 px-2 py-0.5 rounded bg-slate-800 border border-slate-700 text-[11px] font-mono text-slate-400">
         <span className="w-1.5 h-1.5 rounded-full bg-slate-500"></span>
-        <span>QUOTA UNKNOWN</span>
+        <span>{t('quota.unknown')}</span>
       </div>
     );
   }
@@ -40,7 +43,12 @@ export const QuotaBadge: React.FC<QuotaBadgeProps> = ({
     }
   }
 
-  const sourceLabel = source === 'MANUAL' ? 'MANUAL' : source === 'MEASURED' ? 'MEASURED' : 'ESTIMATED';
+  const sourceLabel =
+    source === 'MANUAL'
+      ? t('quota.manual')
+      : source === 'MEASURED'
+      ? t('quota.measured')
+      : t('quota.estimated');
 
   return (
     <div className={`inline-flex items-center space-x-2 px-2.5 py-1 rounded-md border text-xs font-mono font-medium ${colorClass}`}>

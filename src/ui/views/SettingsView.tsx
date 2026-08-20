@@ -400,12 +400,12 @@ export const SettingsView: React.FC = () => {
         <div className="space-y-4">
           <h3 className="text-xs font-mono font-semibold text-slate-300 uppercase tracking-wider flex items-center space-x-2">
             <Terminal className="w-4 h-4 text-forge-cyan" />
-            <span>Verification Commands</span>
+            <span>{t('settings.verificationCommands.title')}</span>
           </h3>
 
           <div className="grid grid-cols-1 md:grid-cols-3 gap-4 text-xs font-mono">
             <div>
-              <label className="block text-slate-400 mb-1">Test Command:</label>
+              <label className="block text-slate-400 mb-1">{t('settings.verificationCommands.testCmdLabel')}:</label>
               <input
                 type="text"
                 value={testCmd}
@@ -415,7 +415,7 @@ export const SettingsView: React.FC = () => {
             </div>
 
             <div>
-              <label className="block text-slate-400 mb-1">Linter Command:</label>
+              <label className="block text-slate-400 mb-1">{t('settings.verificationCommands.lintCmdLabel')}:</label>
               <input
                 type="text"
                 value={lintCmd}
@@ -425,7 +425,7 @@ export const SettingsView: React.FC = () => {
             </div>
 
             <div>
-              <label className="block text-slate-400 mb-1">Build Command:</label>
+              <label className="block text-slate-400 mb-1">{t('settings.verificationCommands.buildCmdLabel')}:</label>
               <input
                 type="text"
                 value={buildCmd}
@@ -439,11 +439,11 @@ export const SettingsView: React.FC = () => {
         <div className="space-y-4 pt-4 border-t border-surface-border">
           <h3 className="text-xs font-mono font-semibold text-slate-300 uppercase tracking-wider flex items-center space-x-2">
             <Shield className="w-4 h-4 text-forge-emerald" />
-            <span>Loop Protection & Revision Limits</span>
+            <span>{t('settings.loopProtection.title')}</span>
           </h3>
 
           <div className="max-w-xs text-xs font-mono">
-            <label className="block text-slate-400 mb-1">Max Revisions Before Escalation:</label>
+            <label className="block text-slate-400 mb-1">{t('settings.loopProtection.maxRevisionsLabel')}:</label>
             <input
               type="number"
               min={1}
@@ -453,7 +453,7 @@ export const SettingsView: React.FC = () => {
               className="w-full bg-surface border border-surface-border rounded-lg px-3 py-2 text-white focus:outline-none focus:border-forge-cyan"
             />
             <p className="text-[10px] text-slate-500 mt-1">
-              Tasks exceeding this limit transition to <strong>NEEDS_HUMAN</strong> to halt AI ping-pong.
+              {t('settings.loopProtection.helpText')}
             </p>
           </div>
         </div>
@@ -464,7 +464,7 @@ export const SettingsView: React.FC = () => {
             className="px-5 py-2 bg-forge-cyan hover:bg-cyan-600 text-slate-950 font-mono font-bold text-xs rounded-lg shadow flex items-center space-x-2 transition"
           >
             {saved ? <Check className="w-4 h-4" /> : <Save className="w-4 h-4" />}
-            <span>{saved ? 'SETTINGS SAVED' : 'SAVE CONFIGURATION'}</span>
+            <span>{saved ? t('settings.settingsSavedButton') : t('settings.saveConfigButton')}</span>
           </button>
         </div>
       </div>
