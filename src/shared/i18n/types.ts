@@ -273,6 +273,12 @@ export interface TranslationDictionary {
       noRepoSelected: string;
       cancelButton: string;
       initButton: string;
+      repositoryErrors: {
+        notGitRepository: string;
+        invalidLocation: string;
+        unknown: string;
+        technicalDetails: string;
+      };
     };
   };
   settings: {

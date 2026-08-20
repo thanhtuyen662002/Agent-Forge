@@ -2,7 +2,15 @@ import { contextBridge, ipcRenderer } from 'electron';
 
 export interface OrchestratorApi {
   // Repository Dialog
-  selectRepositoryDirectory: () => Promise<{ success: boolean; selectionId?: string; displayPath?: string; error?: string; cancelled?: boolean }>;
+  selectRepositoryDirectory: () => Promise<{
+    success: boolean;
+    selectionId?: string;
+    displayPath?: string;
+    errorCode?: 'NOT_GIT_REPOSITORY' | 'INVALID_REPOSITORY_LOCATION' | 'UNKNOWN_ERROR';
+    errorDetail?: string;
+    error?: string;
+    cancelled?: boolean;
+  }>;
 
   // Projects
   getProjects: () => Promise<any[]>;

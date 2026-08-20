@@ -23,12 +23,24 @@ export const ProjectsView: React.FC = () => {
         if (res.success && res.selectionId) {
           setSelectionId(res.selectionId);
           setDisplayPath(res.displayPath || '');
-        } else if (res.error) {
-          setErrorStatus(res.error);
+        } else if (!res.cancelled && (res.errorCode || res.error)) {
+          let primaryMsg = t('projects.createModal.repositoryErrors.unknown');
+          if (res.errorCode === 'NOT_GIT_REPOSITORY') {
+            primaryMsg = t('projects.createModal.repositoryErrors.notGitRepository');
+          } else if (res.errorCode === 'INVALID_REPOSITORY_LOCATION') {
+            primaryMsg = t('projects.createModal.repositoryErrors.invalidLocation');
+          }
+
+          if (res.errorDetail) {
+            setErrorStatus(`${primaryMsg} (${t('projects.createModal.repositoryErrors.technicalDetails', { error: res.errorDetail })})`);
+          } else {
+            setErrorStatus(primaryMsg);
+          }
         }
       }
     } catch (err: any) {
-      setErrorStatus(`${t('common.error')}: ${err.message}`);
+      const errorMsg = err?.message || t('common.unknown');
+      setErrorStatus(`${t('projects.createModal.repositoryErrors.unknown')} (${t('projects.createModal.repositoryErrors.technicalDetails', { error: errorMsg })})`);
     }
   };
 
