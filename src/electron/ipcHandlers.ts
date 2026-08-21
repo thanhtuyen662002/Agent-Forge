@@ -257,7 +257,7 @@ export function registerIpcHandlers(
       };
     }
 
-    const workOrder = PackageGenerator.generateWorkOrder(project, task);
+    const workOrder = PackageGenerator.generateWorkOrder(project, task, repo);
     return { success: true, workOrder };
   });
 
