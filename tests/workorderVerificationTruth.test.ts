@@ -392,4 +392,21 @@ describe('WorkOrder Verification Guidance Truthfulness', () => {
     expect(legacyWorkOrder).toContain('- **Lint**: Not configured');
     expect(legacyWorkOrder).toContain('- **Build**: Not configured');
   });
+
+  // =========================================================================
+  // CASE G: Caller-supplied verification command objects are strictly rejected
+  // =========================================================================
+  it('CASE G: Caller cannot supply verification command overrides to bypass durable SQLite truth', () => {
+    // Attempting to pass an unauthorized command object instead of Repository fails closed
+    expect(() => {
+      (PackageGenerator.generateWorkOrder as any)(testProject, testTask, {
+        test: 'malicious-or-stale-command',
+      });
+    }).toThrow();
+
+    // Authoritative Repository produces truthful "Not configured"
+    const truthfulWorkOrder = PackageGenerator.generateWorkOrder(testProject, testTask, repo);
+    expect(truthfulWorkOrder).toContain('- **Test**: Not configured');
+    expect(truthfulWorkOrder).not.toContain('malicious-or-stale-command');
+  });
 });

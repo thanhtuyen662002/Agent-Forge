@@ -1340,7 +1340,7 @@ describe('Owner Routing & Manual Bridge Handoff Loop (PR #8)', () => {
       // Pure function generation test
       const project = repo.getProject(testProjectId)!;
       const task = repo.getTask(testTaskId)!;
-      const wo = PackageGenerator.generateWorkOrder(project, task);
+      const wo = PackageGenerator.generateWorkOrder(project, task, repo);
       expect(typeof wo).toBe('string');
       expect(wo.length).toBeGreaterThan(0);
     });

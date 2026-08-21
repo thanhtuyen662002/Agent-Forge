@@ -266,7 +266,7 @@ When work is complete, return your final report strictly in the following JSON f
   public static generateWorkOrder(
     project: Project,
     task: Task,
-    repoOrCommands?: Repository | { test?: string; lint?: string; build?: string }
+    repo: Repository
   ): string {
     const criteriaList = task.acceptance_criteria.length > 0
       ? task.acceptance_criteria.map((c, i) => `${i + 1}. [ ] ${c}`).join('\n')
@@ -276,27 +276,10 @@ When work is complete, return your final report strictly in the following JSON f
       ? task.constraints.map((c, i) => `${i + 1}. ${c}`).join('\n')
       : 'None specified.';
 
-    let testCmd = 'Not configured';
-    let lintCmd = 'Not configured';
-    let buildCmd = 'Not configured';
-
-    if (repoOrCommands && typeof (repoOrCommands as Repository).getVerificationCommandsByProject === 'function') {
-      const verifCommands = (repoOrCommands as Repository).getVerificationCommandsByProject(project.id);
-      testCmd = PackageGenerator.formatVerificationCommand(verifCommands, 'TEST');
-      lintCmd = PackageGenerator.formatVerificationCommand(verifCommands, 'LINT');
-      buildCmd = PackageGenerator.formatVerificationCommand(verifCommands, 'BUILD');
-    } else if (repoOrCommands && typeof repoOrCommands === 'object') {
-      const custom = repoOrCommands as { test?: string; lint?: string; build?: string };
-      if (custom.test && custom.test.trim().length > 0) {
-        testCmd = custom.test.startsWith('`') ? custom.test : `\`${custom.test}\``;
-      }
-      if (custom.lint && custom.lint.trim().length > 0) {
-        lintCmd = custom.lint.startsWith('`') ? custom.lint : `\`${custom.lint}\``;
-      }
-      if (custom.build && custom.build.trim().length > 0) {
-        buildCmd = custom.build.startsWith('`') ? custom.build : `\`${custom.build}\``;
-      }
-    }
+    const verifCommands = repo.getVerificationCommandsByProject(project.id);
+    const testCmd = PackageGenerator.formatVerificationCommand(verifCommands, 'TEST');
+    const lintCmd = PackageGenerator.formatVerificationCommand(verifCommands, 'LINT');
+    const buildCmd = PackageGenerator.formatVerificationCommand(verifCommands, 'BUILD');
 
     return `# WORK ORDER: ${task.id} — ${task.title}
 
