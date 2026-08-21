@@ -13,12 +13,24 @@ import {
   CanonicalExecutionPayload,
   CanonicalExecutionPayloadSchema,
 } from '../services/ExecutionAuthorizationService';
+import { CommandParser } from '../services/CommandParser';
 
 export class PackageGenerator {
+  private static formatVerificationCommand(
+    commands: Array<{ command_type: string; executable: string; args: string[]; enabled?: boolean }>,
+    type: 'TEST' | 'LINT' | 'BUILD'
+  ): string {
+    const cmd = commands.find((c) => c.command_type === type && (c.enabled === undefined || c.enabled));
+    if (!cmd || !cmd.executable || cmd.executable.trim().length === 0) {
+      return 'Not configured';
+    }
+    const formatted = CommandParser.format({ executable: cmd.executable, args: cmd.args });
+    return formatted ? `\`${formatted}\`` : 'Not configured';
+  }
+
   public static generateAuthorizedManualWorkOrder(
     authorizationId: string,
-    repo: Repository,
-    verificationCommands: { test?: string; lint?: string; build?: string } = {}
+    repo: Repository
   ): string {
     // 1. Load durable execution authorization
     const auth = repo.getExecutionAuthorization(authorizationId);
@@ -173,11 +185,13 @@ export class PackageGenerator {
       );
     }
 
-    const testCmd = verificationCommands.test || 'npm test';
-    const lintCmd = verificationCommands.lint || 'npm run lint';
-    const buildCmd = verificationCommands.build || 'npm run build';
+    // 12. Derive verification guidance directly from durable project verification commands
+    const verifCommands = repo.getVerificationCommandsByProject(auth.project_id);
+    const testCmd = PackageGenerator.formatVerificationCommand(verifCommands, 'TEST');
+    const lintCmd = PackageGenerator.formatVerificationCommand(verifCommands, 'LINT');
+    const buildCmd = PackageGenerator.formatVerificationCommand(verifCommands, 'BUILD');
 
-    // 12. Render instructions and context ONLY from verified frozen canonicalPayload
+    // 13. Render instructions and context ONLY from verified frozen canonicalPayload
     const renderedInstructions =
       canonicalPayload.instructions.length > 0
         ? canonicalPayload.instructions.map((inst, i) => `${i + 1}. ${inst}`).join('\n')
@@ -213,9 +227,9 @@ ${renderedContextFiles}
 
 ## AgentForge Verification Guidance
 Before completing work, ensure the following commands succeed locally:
-- **Test**: \`${testCmd}\`
-- **Lint**: \`${lintCmd}\`
-- **Build**: \`${buildCmd}\`
+- **Test**: ${testCmd}
+- **Lint**: ${lintCmd}
+- **Build**: ${buildCmd}
 
 ---
 
@@ -252,7 +266,7 @@ When work is complete, return your final report strictly in the following JSON f
   public static generateWorkOrder(
     project: Project,
     task: Task,
-    verificationCommands: { test?: string; lint?: string; build?: string } = {}
+    repo: Repository
   ): string {
     const criteriaList = task.acceptance_criteria.length > 0
       ? task.acceptance_criteria.map((c, i) => `${i + 1}. [ ] ${c}`).join('\n')
@@ -262,9 +276,10 @@ When work is complete, return your final report strictly in the following JSON f
       ? task.constraints.map((c, i) => `${i + 1}. ${c}`).join('\n')
       : 'None specified.';
 
-    const testCmd = verificationCommands.test || 'npm test';
-    const lintCmd = verificationCommands.lint || 'npm run lint';
-    const buildCmd = verificationCommands.build || 'npm run build';
+    const verifCommands = repo.getVerificationCommandsByProject(project.id);
+    const testCmd = PackageGenerator.formatVerificationCommand(verifCommands, 'TEST');
+    const lintCmd = PackageGenerator.formatVerificationCommand(verifCommands, 'LINT');
+    const buildCmd = PackageGenerator.formatVerificationCommand(verifCommands, 'BUILD');
 
     return `# WORK ORDER: ${task.id} — ${task.title}
 
@@ -290,9 +305,9 @@ ${constraintsList}
 
 ## Verification Commands
 Before completing work, ensure the following commands succeed locally:
-- **Test**: \`${testCmd}\`
-- **Lint**: \`${lintCmd}\`
-- **Build**: \`${buildCmd}\`
+- **Test**: ${testCmd}
+- **Lint**: ${lintCmd}
+- **Build**: ${buildCmd}
 
 ---
 

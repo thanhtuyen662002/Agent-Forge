@@ -156,7 +156,7 @@ describe('Real End-to-End Orchestration Integration Lifecycle', () => {
     expect(taskInCoding.base_sha).toBe(baseSha); // Immutably bound to exact git rev-parse HEAD commit!
 
     // 4. Generate Work Order containing exact bound commit SHA
-    const workOrder = PackageGenerator.generateWorkOrder(project, taskInCoding);
+    const workOrder = PackageGenerator.generateWorkOrder(project, taskInCoding, repo);
     expect(workOrder).toContain(`WORK ORDER: ${task.id}`);
     expect(workOrder).toContain(baseSha);
     expect(workOrder).toContain('Update feature to 42');
