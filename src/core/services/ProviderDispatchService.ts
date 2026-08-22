@@ -10,6 +10,8 @@ import {
   computeCanonicalPayload,
   computePayloadHash,
   computeContextManifestHash,
+  CanonicalExecutionPayloadSchema,
+  CanonicalExecutionPayload,
 } from './ExecutionAuthorizationService';
 
 export class ProviderDispatchService {
@@ -391,7 +393,41 @@ export class ProviderDispatchService {
       };
     }
 
-    // 9. Verify Integrity of Canonical Hashes
+    // 9. Strict Canonical Payload Schema Validation and Integrity of Canonical Hashes
+    if (!auth.canonical_payload_json || auth.canonical_payload_json.trim() === '') {
+      this.repo.invalidateExecutionAuthorization(auth.id);
+      this.recordRejectionEvent(auth, 'EXECUTION_AUTHORIZATION_PAYLOAD_CORRUPT: Canonical execution payload JSON is missing.');
+      return {
+        executionId,
+        status: 'FAILED',
+        error: 'EXECUTION_AUTHORIZATION_PAYLOAD_CORRUPT: Canonical execution payload JSON is missing.',
+      };
+    }
+
+    let parsedCanonicalPayload: CanonicalExecutionPayload;
+    try {
+      const rawParsed = JSON.parse(auth.canonical_payload_json);
+      const schemaValidation = CanonicalExecutionPayloadSchema.safeParse(rawParsed);
+      if (!schemaValidation.success) {
+        this.repo.invalidateExecutionAuthorization(auth.id);
+        this.recordRejectionEvent(auth, 'EXECUTION_AUTHORIZATION_PAYLOAD_CORRUPT: Canonical execution payload schema invalid.');
+        return {
+          executionId,
+          status: 'FAILED',
+          error: 'EXECUTION_AUTHORIZATION_PAYLOAD_CORRUPT: Canonical execution payload schema invalid.',
+        };
+      }
+      parsedCanonicalPayload = schemaValidation.data;
+    } catch {
+      this.repo.invalidateExecutionAuthorization(auth.id);
+      this.recordRejectionEvent(auth, 'EXECUTION_AUTHORIZATION_PAYLOAD_CORRUPT: Canonical execution payload malformed JSON.');
+      return {
+        executionId,
+        status: 'FAILED',
+        error: 'EXECUTION_AUTHORIZATION_PAYLOAD_CORRUPT: Canonical execution payload malformed JSON.',
+      };
+    }
+
     const recomputedContextHash = computeContextManifestHash(parsedContextFiles);
     if (recomputedContextHash !== auth.context_manifest_hash) {
       this.repo.invalidateExecutionAuthorization(auth.id);
@@ -401,18 +437,6 @@ export class ProviderDispatchService {
         status: 'FAILED',
         error: 'EXECUTION_AUTHORIZATION_HASH_MISMATCH: Context manifest hash recomputation failed.',
       };
-    }
-
-    let parsedVerificationCommands = null;
-    if (auth.canonical_payload_json) {
-      try {
-        const parsedCanonical = JSON.parse(auth.canonical_payload_json);
-        if (parsedCanonical && typeof parsedCanonical === 'object' && parsedCanonical.verificationCommands) {
-          parsedVerificationCommands = parsedCanonical.verificationCommands;
-        }
-      } catch {
-        // Will fail closed on hash comparison
-      }
     }
 
     const recomputedPayload = computeCanonicalPayload({
@@ -425,7 +449,7 @@ export class ProviderDispatchService {
       constraints: task.constraints ?? [],
       instructions: parsedInstructions,
       contextFiles: parsedContextFiles,
-      verificationCommands: parsedVerificationCommands,
+      verificationCommands: parsedCanonicalPayload.verificationCommands,
       managerMessageId: auth.manager_message_id,
       managerPayloadHash: auth.manager_payload_hash,
     });

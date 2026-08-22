@@ -20,18 +20,22 @@ export interface CreateAuthorizationParams {
   contextFiles?: string[];
 }
 
-export const VerificationCommandSnapshotSchema = z.object({
-  executable: z.string(),
-  args: z.array(z.string()),
-});
+export const VerificationCommandSnapshotSchema = z
+  .object({
+    executable: z.string().trim().min(1),
+    args: z.array(z.string()),
+  })
+  .strict();
 
 export type VerificationCommandSnapshot = z.infer<typeof VerificationCommandSnapshotSchema>;
 
-export const VerificationCommandsSnapshotSchema = z.object({
-  TEST: VerificationCommandSnapshotSchema.nullable(),
-  LINT: VerificationCommandSnapshotSchema.nullable(),
-  BUILD: VerificationCommandSnapshotSchema.nullable(),
-});
+export const VerificationCommandsSnapshotSchema = z
+  .object({
+    TEST: VerificationCommandSnapshotSchema.nullable(),
+    LINT: VerificationCommandSnapshotSchema.nullable(),
+    BUILD: VerificationCommandSnapshotSchema.nullable(),
+  })
+  .strict();
 
 export type VerificationCommandsSnapshot = z.infer<typeof VerificationCommandsSnapshotSchema>;
 
@@ -63,7 +67,7 @@ export function buildVerificationCommandsSnapshot(
       return null;
     }
     return {
-      executable: cmd.executable,
+      executable: cmd.executable.trim(),
       args: [...cmd.args],
     };
   };
@@ -120,11 +124,10 @@ export function computeCanonicalPayload(params: {
   constraints: string[];
   instructions: string[];
   contextFiles: string[];
-  verificationCommands?: VerificationCommandsSnapshot | null;
+  verificationCommands: VerificationCommandsSnapshot;
   managerMessageId: string;
   managerPayloadHash: string;
 }): CanonicalExecutionPayload {
-  const verif = params.verificationCommands || { TEST: null, LINT: null, BUILD: null };
   return {
     projectId: params.projectId,
     taskId: params.taskId,
@@ -136,9 +139,15 @@ export function computeCanonicalPayload(params: {
     instructions: [...params.instructions],
     contextFiles: [...params.contextFiles],
     verificationCommands: {
-      TEST: verif.TEST ? { executable: verif.TEST.executable, args: [...verif.TEST.args] } : null,
-      LINT: verif.LINT ? { executable: verif.LINT.executable, args: [...verif.LINT.args] } : null,
-      BUILD: verif.BUILD ? { executable: verif.BUILD.executable, args: [...verif.BUILD.args] } : null,
+      TEST: params.verificationCommands.TEST
+        ? { executable: params.verificationCommands.TEST.executable, args: [...params.verificationCommands.TEST.args] }
+        : null,
+      LINT: params.verificationCommands.LINT
+        ? { executable: params.verificationCommands.LINT.executable, args: [...params.verificationCommands.LINT.args] }
+        : null,
+      BUILD: params.verificationCommands.BUILD
+        ? { executable: params.verificationCommands.BUILD.executable, args: [...params.verificationCommands.BUILD.args] }
+        : null,
     },
     managerMessageId: params.managerMessageId,
     managerPayloadHash: params.managerPayloadHash,
