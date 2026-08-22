@@ -20,6 +20,39 @@ export interface CreateAuthorizationParams {
   contextFiles?: string[];
 }
 
+// =========================================================================
+// CREATION MAY CANONICALIZE, VALIDATION MUST NOT NORMALIZE
+// During authorization creation, durable project inputs may be canonicalized once.
+// Once persisted, frozen canonical payload validation schemas must perform
+// strictly non-transforming verification (no .trim(), .toLowerCase(), or .transform()).
+// =========================================================================
+
+export const CanonicalExecutableSchema = z
+  .string()
+  .min(1)
+  .refine((val) => val === val.trim(), {
+    message: 'Executable must already be canonical without surrounding whitespace.',
+  });
+
+export const VerificationCommandSnapshotSchema = z
+  .object({
+    executable: CanonicalExecutableSchema,
+    args: z.array(z.string()),
+  })
+  .strict();
+
+export type VerificationCommandSnapshot = z.infer<typeof VerificationCommandSnapshotSchema>;
+
+export const VerificationCommandsSnapshotSchema = z
+  .object({
+    TEST: VerificationCommandSnapshotSchema.nullable(),
+    LINT: VerificationCommandSnapshotSchema.nullable(),
+    BUILD: VerificationCommandSnapshotSchema.nullable(),
+  })
+  .strict();
+
+export type VerificationCommandsSnapshot = z.infer<typeof VerificationCommandsSnapshotSchema>;
+
 export const CanonicalExecutionPayloadSchema = z
   .object({
     projectId: z.string().min(1),
@@ -31,12 +64,35 @@ export const CanonicalExecutionPayloadSchema = z
     constraints: z.array(z.string()),
     instructions: z.array(z.string()),
     contextFiles: z.array(z.string()),
+    verificationCommands: VerificationCommandsSnapshotSchema,
     managerMessageId: z.string().min(1),
     managerPayloadHash: z.string().min(1),
   })
   .strict();
 
 export type CanonicalExecutionPayload = z.infer<typeof CanonicalExecutionPayloadSchema>;
+
+export function buildVerificationCommandsSnapshot(
+  commands: Array<{ command_type: string; executable: string; args: string[]; enabled?: boolean }>
+): VerificationCommandsSnapshot {
+  const getCmd = (type: 'TEST' | 'LINT' | 'BUILD'): VerificationCommandSnapshot | null => {
+    const cmd = commands.find((c) => c.command_type === type && (c.enabled === undefined || c.enabled));
+    if (!cmd || !cmd.executable || cmd.executable.trim().length === 0) {
+      return null;
+    }
+    return {
+      // Creation-time canonicalization: trim executable once before storing in payload
+      executable: cmd.executable.trim(),
+      args: [...cmd.args],
+    };
+  };
+
+  return {
+    TEST: getCmd('TEST'),
+    LINT: getCmd('LINT'),
+    BUILD: getCmd('BUILD'),
+  };
+}
 
 export function buildCanonicalInstructions(
   task: {
@@ -83,6 +139,7 @@ export function computeCanonicalPayload(params: {
   constraints: string[];
   instructions: string[];
   contextFiles: string[];
+  verificationCommands: VerificationCommandsSnapshot;
   managerMessageId: string;
   managerPayloadHash: string;
 }): CanonicalExecutionPayload {
@@ -96,6 +153,17 @@ export function computeCanonicalPayload(params: {
     constraints: [...params.constraints],
     instructions: [...params.instructions],
     contextFiles: [...params.contextFiles],
+    verificationCommands: {
+      TEST: params.verificationCommands.TEST
+        ? { executable: params.verificationCommands.TEST.executable, args: [...params.verificationCommands.TEST.args] }
+        : null,
+      LINT: params.verificationCommands.LINT
+        ? { executable: params.verificationCommands.LINT.executable, args: [...params.verificationCommands.LINT.args] }
+        : null,
+      BUILD: params.verificationCommands.BUILD
+        ? { executable: params.verificationCommands.BUILD.executable, args: [...params.verificationCommands.BUILD.args] }
+        : null,
+    },
     managerMessageId: params.managerMessageId,
     managerPayloadHash: params.managerPayloadHash,
   };
@@ -114,6 +182,7 @@ export function computePayloadHash(payload: CanonicalExecutionPayload): string {
     taskDescription: payload.taskDescription,
     taskId: payload.taskId,
     taskTitle: payload.taskTitle,
+    verificationCommands: payload.verificationCommands,
   });
   return crypto.createHash('sha256').update(serialized, 'utf8').digest('hex');
 }
@@ -385,8 +454,10 @@ export class ExecutionAuthorizationService {
     const canonicalContextFiles = sanitizeResult.validFiles;
     const contextManifestHash = computeContextManifestHash(canonicalContextFiles);
 
-    // 8. Canonical Execution Instructions Derived from Manager & Task Truth
+    // 8. Canonical Execution Instructions & Verification Snapshot Derived from Manager, Task, & Project Truth
     const canonicalInstructions = buildCanonicalInstructions(task, managerData);
+    const durableVerifCommands = this.repo.getVerificationCommandsByProject(params.projectId);
+    const verificationSnapshot = buildVerificationCommandsSnapshot(durableVerifCommands);
 
     const canonicalPayload = computeCanonicalPayload({
       projectId: params.projectId,
@@ -398,6 +469,7 @@ export class ExecutionAuthorizationService {
       constraints: task.constraints ?? [],
       instructions: canonicalInstructions,
       contextFiles: canonicalContextFiles,
+      verificationCommands: verificationSnapshot,
       managerMessageId,
       managerPayloadHash,
     });

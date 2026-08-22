@@ -1168,6 +1168,7 @@ describe('PR #7 — Durable Execution Authorization & Orchestration Binding', ()
       constraints: ['C1'],
       instructions: ['Inst1'],
       contextFiles: ['src/a.ts', 'src/b.ts'],
+      verificationCommands: { TEST: null, LINT: null, BUILD: null },
       managerMessageId: 'msg-1',
       managerPayloadHash: 'hash-1',
     });
@@ -1182,6 +1183,7 @@ describe('PR #7 — Durable Execution Authorization & Orchestration Binding', ()
       constraints: ['C1'],
       instructions: ['Inst1'],
       contextFiles: ['src/a.ts', 'src/b.ts'],
+      verificationCommands: { TEST: null, LINT: null, BUILD: null },
       managerMessageId: 'msg-1',
       managerPayloadHash: 'hash-1',
     });
