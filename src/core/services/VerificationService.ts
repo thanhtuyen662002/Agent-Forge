@@ -5,6 +5,8 @@ import { PolicyService } from './PolicyService';
 import { Repository } from '../database/repositories';
 import { TestRun } from '../types/domain';
 
+export { shouldRunCoderVerification } from '../state/taskStateMachine';
+
 export class VerificationService {
   constructor(
     private repo: Repository,

@@ -168,3 +168,11 @@ export class TaskStateMachine {
     );
   }
 }
+
+/**
+ * Determines whether automatic AgentForge verification should run after applying a coder.v1 report.
+ * Automatic verification is gated strictly to when the successfully applied coder report leaves the task in VALIDATING.
+ */
+export function shouldRunCoderVerification(postApplyTaskState?: string | null): boolean {
+  return postApplyTaskState === 'VALIDATING';
+}
