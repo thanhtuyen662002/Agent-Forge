@@ -206,11 +206,16 @@ export class PackageGenerator {
     const lintCmd = formatSnapshotCmd(canonicalPayload.verificationCommands.LINT);
     const buildCmd = formatSnapshotCmd(canonicalPayload.verificationCommands.BUILD);
 
-    // 13. Render instructions and context ONLY from verified frozen canonicalPayload
+    // 13. Render instructions, constraints, and context ONLY from verified frozen canonicalPayload
     const renderedInstructions =
       canonicalPayload.instructions.length > 0
         ? canonicalPayload.instructions.map((inst, i) => `${i + 1}. ${inst}`).join('\n')
         : '1. No specific instructions provided.';
+
+    const renderedConstraints =
+      canonicalPayload.constraints.length > 0
+        ? canonicalPayload.constraints.map((c) => `- ${c}`).join('\n')
+        : 'None specified.';
 
     const renderedContextFiles =
       canonicalPayload.contextFiles.length > 0
@@ -236,6 +241,9 @@ export class PackageGenerator {
 
 ## Authorized Execution Instructions
 ${renderedInstructions}
+
+## Authorized Constraints
+${renderedConstraints}
 
 ## Authorized Context Files
 ${renderedContextFiles}

@@ -439,6 +439,27 @@ export class ProviderDispatchService {
       };
     }
 
+    const effectiveConstraints: string[] = [
+      ...(task.constraints ?? []),
+      ...(managerData.constraints ?? []),
+    ];
+
+    if (
+      parsedCanonicalPayload.constraints.length !== effectiveConstraints.length ||
+      !parsedCanonicalPayload.constraints.every((val, idx) => val === effectiveConstraints[idx])
+    ) {
+      this.repo.invalidateExecutionAuthorization(auth.id);
+      this.recordRejectionEvent(
+        auth,
+        'EXECUTION_AUTHORIZATION_HASH_MISMATCH: Canonical execution payload constraints mismatch.'
+      );
+      return {
+        executionId,
+        status: 'FAILED',
+        error: 'EXECUTION_AUTHORIZATION_HASH_MISMATCH: Canonical execution payload constraints mismatch.',
+      };
+    }
+
     const recomputedPayload = computeCanonicalPayload({
       projectId: auth.project_id,
       taskId: auth.task_id,
@@ -446,7 +467,7 @@ export class ProviderDispatchService {
       taskTitle: task.title,
       taskDescription: task.description,
       acceptanceCriteria: task.acceptance_criteria ?? [],
-      constraints: task.constraints ?? [],
+      constraints: effectiveConstraints,
       instructions: parsedInstructions,
       contextFiles: parsedContextFiles,
       verificationCommands: parsedCanonicalPayload.verificationCommands,
