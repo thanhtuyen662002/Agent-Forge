@@ -20,9 +20,23 @@ export interface CreateAuthorizationParams {
   contextFiles?: string[];
 }
 
+// =========================================================================
+// CREATION MAY CANONICALIZE, VALIDATION MUST NOT NORMALIZE
+// During authorization creation, durable project inputs may be canonicalized once.
+// Once persisted, frozen canonical payload validation schemas must perform
+// strictly non-transforming verification (no .trim(), .toLowerCase(), or .transform()).
+// =========================================================================
+
+export const CanonicalExecutableSchema = z
+  .string()
+  .min(1)
+  .refine((val) => val === val.trim(), {
+    message: 'Executable must already be canonical without surrounding whitespace.',
+  });
+
 export const VerificationCommandSnapshotSchema = z
   .object({
-    executable: z.string().trim().min(1),
+    executable: CanonicalExecutableSchema,
     args: z.array(z.string()),
   })
   .strict();
@@ -67,6 +81,7 @@ export function buildVerificationCommandsSnapshot(
       return null;
     }
     return {
+      // Creation-time canonicalization: trim executable once before storing in payload
       executable: cmd.executable.trim(),
       args: [...cmd.args],
     };

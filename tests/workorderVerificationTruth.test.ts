@@ -674,4 +674,117 @@ describe('WorkOrder Verification Guidance Truthfulness & Immutability Hardening'
       });
     }
   });
+
+  it('CASE S: Tampered surrounding whitespace in verificationCommands.TEST.executable fails closed for Authorized WorkOrder generation', async () => {
+    repo.setProjectVerificationCommands(testProjectId, {
+      TEST: { executable: 'node', args: ['verify.js'] },
+    });
+
+    const authId = await createAndDispatchManualHandoff(testProjectId, testTaskId);
+    const auth = repo.getExecutionAuthorization(authId)!;
+
+    const payload = JSON.parse(auth.canonical_payload_json!);
+    payload.verificationCommands.TEST.executable = ' node ';
+
+    db.prepare('UPDATE execution_authorizations SET canonical_payload_json = ? WHERE id = ?').run(
+      JSON.stringify(payload),
+      auth.id
+    );
+
+    expect(() => {
+      PackageGenerator.generateAuthorizedManualWorkOrder(auth.id, repo);
+    }).toThrow(/EXECUTION_AUTHORIZATION_CORRUPTED: Invalid canonical_payload_json/);
+  });
+
+  it('CASE T: Tampered surrounding whitespace in verificationCommands.TEST.executable fails closed at dispatch, invalidating authorization without reaching provider', async () => {
+    repo.updateTaskState(testTaskId, 'PLANNED');
+    const managerMsg = {
+      protocol: 'manager.v1',
+      message_id: `MSG-MGR-STRICT-T`,
+      project_id: testProjectId,
+      task_id: testTaskId,
+      decision: 'EXECUTE',
+      expected_task_state: 'PLANNED',
+      expected_revision: 0,
+      instructions: ['Strict dispatch whitespace test.'],
+      priority: 'HIGH',
+      risk: 'LOW',
+    };
+    await taskService.applyManagerDecision(managerMsg as any, JSON.stringify(managerMsg));
+
+    const routingDecision = await routingService.route({
+      projectId: testProjectId,
+      taskId: testTaskId,
+      candidateResourceIds: ['res-gemini-coder'],
+      allowManualBridge: true,
+      requiredCapabilities: ['CODING'],
+    });
+
+    const auth = await authorizationService.createAuthorization({
+      projectId: testProjectId,
+      taskId: testTaskId,
+      routingDecisionId: routingDecision.decisionId,
+      contextFiles: ['README.md'],
+    });
+
+    // Tamper executable with surrounding whitespace
+    const payload = JSON.parse(auth.canonical_payload_json!);
+    payload.verificationCommands.TEST = { executable: ' node ', args: ['verify.js'] };
+
+    db.prepare('UPDATE execution_authorizations SET canonical_payload_json = ? WHERE id = ?').run(
+      JSON.stringify(payload),
+      auth.id
+    );
+
+    const dispatchResult = await dispatchService.dispatch(auth.id);
+
+    expect(dispatchResult.status).toBe('FAILED');
+    expect(dispatchResult.error).toContain('EXECUTION_AUTHORIZATION_PAYLOAD_CORRUPT');
+
+    const updatedAuth = repo.getExecutionAuthorization(auth.id);
+    expect(updatedAuth!.status).toBe('INVALIDATED');
+  });
+
+  it('CASE U: Canonical valid executable ("node") with args (["verify.js"]) passes authorization, dispatch, and deterministic WorkOrder generation', async () => {
+    repo.setProjectVerificationCommands(testProjectId, {
+      TEST: { executable: 'node', args: ['verify.js'] },
+    });
+
+    const authId = await createAndDispatchManualHandoff(testProjectId, testTaskId);
+    const workOrder = PackageGenerator.generateAuthorizedManualWorkOrder(authId, repo);
+
+    expect(workOrder).toContain('- **Test**: `node verify.js`');
+  });
+
+  it('CASE V: Whitespace-only or empty executable cannot pass VerificationCommandSnapshotSchema', () => {
+    expect(VerificationCommandSnapshotSchema.safeParse({ executable: '', args: [] }).success).toBe(false);
+    expect(VerificationCommandSnapshotSchema.safeParse({ executable: ' ', args: [] }).success).toBe(false);
+    expect(VerificationCommandSnapshotSchema.safeParse({ executable: '   ', args: [] }).success).toBe(false);
+    expect(VerificationCommandSnapshotSchema.safeParse({ executable: 'node', args: [] }).success).toBe(true);
+  });
+
+  it('CASE W: Top-level unknown field in canonical payload fails closed under CanonicalExecutionPayloadSchema', () => {
+    const payloadWithUnknown = {
+      projectId: testProjectId,
+      taskId: testTaskId,
+      attemptId: null,
+      taskTitle: 'Title',
+      taskDescription: 'Desc',
+      acceptanceCriteria: ['AC1'],
+      constraints: ['C1'],
+      instructions: ['Inst1'],
+      contextFiles: ['README.md'],
+      verificationCommands: {
+        TEST: { executable: 'node', args: ['verify.js'] },
+        LINT: null,
+        BUILD: null,
+      },
+      managerMessageId: 'msg-mgr-1',
+      managerPayloadHash: 'hash-mgr-1',
+      extraTopLevelField: 'injected',
+    };
+
+    const parseResult = CanonicalExecutionPayloadSchema.safeParse(payloadWithUnknown);
+    expect(parseResult.success).toBe(false);
+  });
 });
