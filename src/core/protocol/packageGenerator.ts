@@ -93,12 +93,20 @@ export class PackageGenerator {
     let canonicalPayload: CanonicalExecutionPayload;
     try {
       const parsed = JSON.parse(auth.canonical_payload_json);
+      if (!parsed || typeof parsed !== 'object' || parsed.verificationCommands === undefined) {
+        throw new Error(
+          'AUTHORIZED_WORKORDER_VERIFICATION_SNAPSHOT_MISSING: Execution authorization is missing required frozen verificationCommands snapshot.'
+        );
+      }
       const parseResult = CanonicalExecutionPayloadSchema.safeParse(parsed);
       if (!parseResult.success) {
         throw new Error(parseResult.error.issues.map((i) => i.message).join(', '));
       }
       canonicalPayload = parseResult.data;
     } catch (err: any) {
+      if (err.message && err.message.includes('AUTHORIZED_WORKORDER_VERIFICATION_SNAPSHOT_MISSING')) {
+        throw err;
+      }
       throw new Error(`EXECUTION_AUTHORIZATION_CORRUPTED: Invalid canonical_payload_json (${err.message})`);
     }
 
@@ -185,11 +193,18 @@ export class PackageGenerator {
       );
     }
 
-    // 12. Derive verification guidance directly from durable project verification commands
-    const verifCommands = repo.getVerificationCommandsByProject(auth.project_id);
-    const testCmd = PackageGenerator.formatVerificationCommand(verifCommands, 'TEST');
-    const lintCmd = PackageGenerator.formatVerificationCommand(verifCommands, 'LINT');
-    const buildCmd = PackageGenerator.formatVerificationCommand(verifCommands, 'BUILD');
+    // 12. Derive verification guidance ONLY from verified frozen verificationCommands snapshot
+    const formatSnapshotCmd = (cmd: { executable: string; args: string[] } | null): string => {
+      if (!cmd || !cmd.executable || cmd.executable.trim().length === 0) {
+        return 'Not configured';
+      }
+      const formatted = CommandParser.format(cmd);
+      return formatted ? `\`${formatted}\`` : 'Not configured';
+    };
+
+    const testCmd = formatSnapshotCmd(canonicalPayload.verificationCommands.TEST);
+    const lintCmd = formatSnapshotCmd(canonicalPayload.verificationCommands.LINT);
+    const buildCmd = formatSnapshotCmd(canonicalPayload.verificationCommands.BUILD);
 
     // 13. Render instructions and context ONLY from verified frozen canonicalPayload
     const renderedInstructions =
@@ -234,26 +249,25 @@ Before completing work, ensure the following commands succeed locally:
 ---
 
 ## Required Response Protocol (\`coder.v1\`)
-When work is complete, return your final report strictly in the following JSON format:
+When work is complete, return your final report strictly in the following JSON format.
+Guidelines:
+- Populate \`files_claimed_changed\` ONLY with repository files you actually modified.
+- Populate \`tests_claimed\` ONLY with verification commands you actually executed and their outcomes.
+- Leave arrays empty (\`[]\`) if no truthful claim exists.
+- Never copy hypothetical example evidence or claim unverified results.
 
 \`\`\`json
 {
   "protocol": "coder.v1",
-  "message_id": "msg-cdr-${auth.task_id}-${Date.now()}",
+  "message_id": "msg-cdr-${auth.task_id}-${auth.id}",
   "project_id": "${auth.project_id}",
   "task_id": "${auth.task_id}",
   "attempt": 1,
   "status": "COMPLETED",
-  "completed": [
-    "Summary of what was implemented"
-  ],
+  "completed": [],
   "remaining": [],
-  "files_claimed_changed": [
-    "src/example.ts"
-  ],
-  "tests_claimed": [
-    "npm test: all tests passing"
-  ],
+  "files_claimed_changed": [],
+  "tests_claimed": [],
   "blockers": [],
   "review_requested": true,
   "expected_task_state": "CODING",
@@ -312,26 +326,25 @@ Before completing work, ensure the following commands succeed locally:
 ---
 
 ## Required Response Protocol (\`coder.v1\`)
-When work is complete, return your final report strictly in the following JSON format:
+When work is complete, return your final report strictly in the following JSON format.
+Guidelines:
+- Populate \`files_claimed_changed\` ONLY with repository files you actually modified.
+- Populate \`tests_claimed\` ONLY with verification commands you actually executed and their outcomes.
+- Leave arrays empty (\`[]\`) if no truthful claim exists.
+- Never copy hypothetical example evidence or claim unverified results.
 
 \`\`\`json
 {
   "protocol": "coder.v1",
-  "message_id": "msg-cdr-${task.id}-${Date.now()}",
+  "message_id": "msg-cdr-${task.id}-rev${task.revision_count}",
   "project_id": "${project.id}",
   "task_id": "${task.id}",
   "attempt": 1,
   "status": "COMPLETED",
-  "completed": [
-    "Summary of what was implemented"
-  ],
+  "completed": [],
   "remaining": [],
-  "files_claimed_changed": [
-    "src/example.ts"
-  ],
-  "tests_claimed": [
-    "npm test: all tests passing"
-  ],
+  "files_claimed_changed": [],
+  "tests_claimed": [],
   "blockers": [],
   "review_requested": true,
   "expected_task_state": "CODING",

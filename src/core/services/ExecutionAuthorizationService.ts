@@ -20,6 +20,21 @@ export interface CreateAuthorizationParams {
   contextFiles?: string[];
 }
 
+export const VerificationCommandSnapshotSchema = z.object({
+  executable: z.string(),
+  args: z.array(z.string()),
+});
+
+export type VerificationCommandSnapshot = z.infer<typeof VerificationCommandSnapshotSchema>;
+
+export const VerificationCommandsSnapshotSchema = z.object({
+  TEST: VerificationCommandSnapshotSchema.nullable(),
+  LINT: VerificationCommandSnapshotSchema.nullable(),
+  BUILD: VerificationCommandSnapshotSchema.nullable(),
+});
+
+export type VerificationCommandsSnapshot = z.infer<typeof VerificationCommandsSnapshotSchema>;
+
 export const CanonicalExecutionPayloadSchema = z
   .object({
     projectId: z.string().min(1),
@@ -31,12 +46,34 @@ export const CanonicalExecutionPayloadSchema = z
     constraints: z.array(z.string()),
     instructions: z.array(z.string()),
     contextFiles: z.array(z.string()),
+    verificationCommands: VerificationCommandsSnapshotSchema,
     managerMessageId: z.string().min(1),
     managerPayloadHash: z.string().min(1),
   })
   .strict();
 
 export type CanonicalExecutionPayload = z.infer<typeof CanonicalExecutionPayloadSchema>;
+
+export function buildVerificationCommandsSnapshot(
+  commands: Array<{ command_type: string; executable: string; args: string[]; enabled?: boolean }>
+): VerificationCommandsSnapshot {
+  const getCmd = (type: 'TEST' | 'LINT' | 'BUILD'): VerificationCommandSnapshot | null => {
+    const cmd = commands.find((c) => c.command_type === type && (c.enabled === undefined || c.enabled));
+    if (!cmd || !cmd.executable || cmd.executable.trim().length === 0) {
+      return null;
+    }
+    return {
+      executable: cmd.executable,
+      args: [...cmd.args],
+    };
+  };
+
+  return {
+    TEST: getCmd('TEST'),
+    LINT: getCmd('LINT'),
+    BUILD: getCmd('BUILD'),
+  };
+}
 
 export function buildCanonicalInstructions(
   task: {
@@ -83,9 +120,11 @@ export function computeCanonicalPayload(params: {
   constraints: string[];
   instructions: string[];
   contextFiles: string[];
+  verificationCommands?: VerificationCommandsSnapshot | null;
   managerMessageId: string;
   managerPayloadHash: string;
 }): CanonicalExecutionPayload {
+  const verif = params.verificationCommands || { TEST: null, LINT: null, BUILD: null };
   return {
     projectId: params.projectId,
     taskId: params.taskId,
@@ -96,6 +135,11 @@ export function computeCanonicalPayload(params: {
     constraints: [...params.constraints],
     instructions: [...params.instructions],
     contextFiles: [...params.contextFiles],
+    verificationCommands: {
+      TEST: verif.TEST ? { executable: verif.TEST.executable, args: [...verif.TEST.args] } : null,
+      LINT: verif.LINT ? { executable: verif.LINT.executable, args: [...verif.LINT.args] } : null,
+      BUILD: verif.BUILD ? { executable: verif.BUILD.executable, args: [...verif.BUILD.args] } : null,
+    },
     managerMessageId: params.managerMessageId,
     managerPayloadHash: params.managerPayloadHash,
   };
@@ -114,6 +158,7 @@ export function computePayloadHash(payload: CanonicalExecutionPayload): string {
     taskDescription: payload.taskDescription,
     taskId: payload.taskId,
     taskTitle: payload.taskTitle,
+    verificationCommands: payload.verificationCommands,
   });
   return crypto.createHash('sha256').update(serialized, 'utf8').digest('hex');
 }
@@ -385,8 +430,10 @@ export class ExecutionAuthorizationService {
     const canonicalContextFiles = sanitizeResult.validFiles;
     const contextManifestHash = computeContextManifestHash(canonicalContextFiles);
 
-    // 8. Canonical Execution Instructions Derived from Manager & Task Truth
+    // 8. Canonical Execution Instructions & Verification Snapshot Derived from Manager, Task, & Project Truth
     const canonicalInstructions = buildCanonicalInstructions(task, managerData);
+    const durableVerifCommands = this.repo.getVerificationCommandsByProject(params.projectId);
+    const verificationSnapshot = buildVerificationCommandsSnapshot(durableVerifCommands);
 
     const canonicalPayload = computeCanonicalPayload({
       projectId: params.projectId,
@@ -398,6 +445,7 @@ export class ExecutionAuthorizationService {
       constraints: task.constraints ?? [],
       instructions: canonicalInstructions,
       contextFiles: canonicalContextFiles,
+      verificationCommands: verificationSnapshot,
       managerMessageId,
       managerPayloadHash,
     });

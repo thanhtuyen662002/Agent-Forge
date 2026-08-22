@@ -403,6 +403,18 @@ export class ProviderDispatchService {
       };
     }
 
+    let parsedVerificationCommands = null;
+    if (auth.canonical_payload_json) {
+      try {
+        const parsedCanonical = JSON.parse(auth.canonical_payload_json);
+        if (parsedCanonical && typeof parsedCanonical === 'object' && parsedCanonical.verificationCommands) {
+          parsedVerificationCommands = parsedCanonical.verificationCommands;
+        }
+      } catch {
+        // Will fail closed on hash comparison
+      }
+    }
+
     const recomputedPayload = computeCanonicalPayload({
       projectId: auth.project_id,
       taskId: auth.task_id,
@@ -413,6 +425,7 @@ export class ProviderDispatchService {
       constraints: task.constraints ?? [],
       instructions: parsedInstructions,
       contextFiles: parsedContextFiles,
+      verificationCommands: parsedVerificationCommands,
       managerMessageId: auth.manager_message_id,
       managerPayloadHash: auth.manager_payload_hash,
     });

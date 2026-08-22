@@ -19,7 +19,7 @@ import { VerificationService } from '../src/core/services/VerificationService';
 import { PackageGenerator } from '../src/core/protocol/packageGenerator';
 import { Project, Task } from '../src/core/types/domain';
 
-describe('WorkOrder Verification Guidance Truthfulness', () => {
+describe('WorkOrder Verification Guidance Truthfulness & Immutability Hardening', () => {
   let db: Database.Database;
   let repo: Repository;
   let eventService: EventService;
@@ -162,10 +162,37 @@ describe('WorkOrder Verification Guidance Truthfulness', () => {
   }
 
   // =========================================================================
-  // CASE A: Authorized WorkOrder with TEST=node verify.js and unconfigured LINT/BUILD
+  // CASE A: Frozen TEST truth (Authorized WorkOrder shows exact TEST and unconfigured LINT/BUILD)
   // =========================================================================
   it('CASE A: Authorized WorkOrder reflects durable TEST=node verify.js and unconfigured LINT/BUILD without invented npm defaults', async () => {
-    // Configure durable verification command: TEST only
+    repo.createVerificationCommand({
+      id: 'vc-test-01',
+      project_id: testProjectId,
+      name: 'Test Suite',
+      command_type: 'TEST',
+      executable: 'node',
+      args: ['verify.js'],
+      enabled: true,
+    });
+
+    const authId = await createAndDispatchManualHandoff(testProjectId, testTaskId);
+    const workOrder = PackageGenerator.generateAuthorizedManualWorkOrder(authId, repo);
+
+    expect(workOrder).toContain('- **Test**: `node verify.js`');
+    expect(workOrder).toContain('- **Lint**: Not configured');
+    expect(workOrder).toContain('- **Build**: Not configured');
+
+    expect(workOrder).not.toContain('`npm test`');
+    expect(workOrder).not.toContain('`npm run lint`');
+    expect(workOrder).not.toContain('`npm run build`');
+    expect(workOrder).not.toContain('npm run lint');
+    expect(workOrder).not.toContain('npm run build');
+  });
+
+  // =========================================================================
+  // CASE B: Settings mutation after authorization does NOT alter Authorized WorkOrder
+  // =========================================================================
+  it('CASE B: Settings mutation after authorization does not alter Authorized WorkOrder (frozen snapshot immutability)', async () => {
     repo.createVerificationCommand({
       id: 'vc-test-01',
       project_id: testProjectId,
@@ -178,29 +205,36 @@ describe('WorkOrder Verification Guidance Truthfulness', () => {
 
     const authId = await createAndDispatchManualHandoff(testProjectId, testTaskId);
 
+    // Now mutate project verification configuration in SQLite using official repo method
+    repo.setProjectVerificationCommands(testProjectId, {
+      TEST: {
+        executable: 'pytest',
+        args: ['-v', 'test_mutated.py'],
+      },
+      LINT: {
+        executable: 'eslint',
+        args: ['.'],
+      },
+    });
+
     const workOrder = PackageGenerator.generateAuthorizedManualWorkOrder(authId, repo);
 
-    // Must contain exact configured command
+    // Must STILL render frozen node verify.js
     expect(workOrder).toContain('- **Test**: `node verify.js`');
+    expect(workOrder).not.toContain('pytest');
+    expect(workOrder).not.toContain('test_mutated.py');
 
-    // Must explicitly indicate LINT and BUILD are unconfigured
+    // LINT was added after authorization was created, so frozen snapshot still says Not configured
     expect(workOrder).toContain('- **Lint**: Not configured');
-    expect(workOrder).toContain('- **Build**: Not configured');
-
-    // Must NOT contain blind npm defaults
-    expect(workOrder).not.toContain('`npm test`');
-    expect(workOrder).not.toContain('`npm run lint`');
-    expect(workOrder).not.toContain('`npm run build`');
-    expect(workOrder).not.toContain('npm run lint');
-    expect(workOrder).not.toContain('npm run build');
+    expect(workOrder).not.toContain('eslint');
   });
 
   // =========================================================================
-  // CASE B: Legacy WorkOrder uses the same durable SQLite truth
+  // CASE C: Deterministic regeneration (byte-identical)
   // =========================================================================
-  it('CASE B: Legacy WorkOrder uses durable SQLite truth from Repository without npm defaults', () => {
+  it('CASE C: Multiple generations of Authorized WorkOrder from the same authorization are byte-for-byte identical', async () => {
     repo.createVerificationCommand({
-      id: 'vc-test-02',
+      id: 'vc-test-01',
       project_id: testProjectId,
       name: 'Test Suite',
       command_type: 'TEST',
@@ -209,22 +243,86 @@ describe('WorkOrder Verification Guidance Truthfulness', () => {
       enabled: true,
     });
 
-    const workOrder = PackageGenerator.generateWorkOrder(testProject, testTask, repo);
+    const authId = await createAndDispatchManualHandoff(testProjectId, testTaskId);
 
-    expect(workOrder).toContain('- **Test**: `node verify.js`');
-    expect(workOrder).toContain('- **Lint**: Not configured');
-    expect(workOrder).toContain('- **Build**: Not configured');
+    const workOrder1 = PackageGenerator.generateAuthorizedManualWorkOrder(authId, repo);
+    // Introduce artificial delay
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    const workOrder2 = PackageGenerator.generateAuthorizedManualWorkOrder(authId, repo);
 
-    expect(workOrder).not.toContain('`npm test`');
-    expect(workOrder).not.toContain('`npm run lint`');
-    expect(workOrder).not.toContain('`npm run build`');
+    expect(workOrder1).toBe(workOrder2);
   });
 
   // =========================================================================
-  // CASE C: Cross-project isolation between Project A and Project B
+  // CASE D: No fabricated file claim
   // =========================================================================
-  it('CASE C: Cross-project isolation ensures Project A verification command is never leaked into Project B WorkOrder', async () => {
-    // Project A has TEST = node verify.js
+  it('CASE D: Authorized WorkOrder does not contain fabricated file claim src/example.ts', async () => {
+    const authId = await createAndDispatchManualHandoff(testProjectId, testTaskId);
+    const workOrder = PackageGenerator.generateAuthorizedManualWorkOrder(authId, repo);
+
+    expect(workOrder).not.toContain('src/example.ts');
+  });
+
+  // =========================================================================
+  // CASE E: No fabricated test claim in response template
+  // =========================================================================
+  it('CASE E: Authorized WorkOrder response template does not contain pre-populated success claims', async () => {
+    const authId = await createAndDispatchManualHandoff(testProjectId, testTaskId);
+    const workOrder = PackageGenerator.generateAuthorizedManualWorkOrder(authId, repo);
+
+    expect(workOrder).not.toContain('npm test: all tests passing');
+    expect(workOrder).not.toContain('Summary of what was implemented');
+  });
+
+  // =========================================================================
+  // CASE F: Safe empty claim arrays in JSON response template
+  // =========================================================================
+  it('CASE F: Response template contains truthful empty default arrays', async () => {
+    const authId = await createAndDispatchManualHandoff(testProjectId, testTaskId);
+    const workOrder = PackageGenerator.generateAuthorizedManualWorkOrder(authId, repo);
+
+    expect(workOrder).toContain('"completed": []');
+    expect(workOrder).toContain('"remaining": []');
+    expect(workOrder).toContain('"files_claimed_changed": []');
+    expect(workOrder).toContain('"tests_claimed": []');
+    expect(workOrder).toContain('"blockers": []');
+  });
+
+  // =========================================================================
+  // CASE G: Tampered verification snapshot fails closed
+  // =========================================================================
+  it('CASE G: Tampered verification snapshot inside canonical_payload_json fails closed', async () => {
+    repo.createVerificationCommand({
+      id: 'vc-test-01',
+      project_id: testProjectId,
+      name: 'Test Suite',
+      command_type: 'TEST',
+      executable: 'node',
+      args: ['verify.js'],
+      enabled: true,
+    });
+
+    const authId = await createAndDispatchManualHandoff(testProjectId, testTaskId);
+    const auth = repo.getExecutionAuthorization(authId)!;
+
+    const payload = JSON.parse(auth.canonical_payload_json!);
+    // Tamper verificationCommands inside canonical_payload_json
+    payload.verificationCommands.TEST = { executable: 'malicious_runner', args: ['--hack'] };
+
+    db.prepare('UPDATE execution_authorizations SET canonical_payload_json = ? WHERE id = ?').run(
+      JSON.stringify(payload),
+      auth.id
+    );
+
+    expect(() => {
+      PackageGenerator.generateAuthorizedManualWorkOrder(auth.id, repo);
+    }).toThrow(/EXECUTION_AUTHORIZATION_TAMPERED: Instruction payload hash mismatch/);
+  });
+
+  // =========================================================================
+  // CASE H: Cross-project isolation between Project A and Project B
+  // =========================================================================
+  it('CASE H: Cross-project isolation ensures Project A verification command is never leaked into Project B WorkOrder', async () => {
     repo.createVerificationCommand({
       id: 'vc-proj-a',
       project_id: testProjectId,
@@ -235,7 +333,6 @@ describe('WorkOrder Verification Guidance Truthfulness', () => {
       enabled: true,
     });
 
-    // Create Project B with TEST = python run_tests.py
     const projBId = 'PROJ-TEST-002';
     const projB: Project = {
       id: projBId,
@@ -272,37 +369,23 @@ describe('WorkOrder Verification Guidance Truthfulness', () => {
       enabled: true,
     });
 
-    // Generate Authorized WorkOrders for both
     const authAId = await createAndDispatchManualHandoff(testProjectId, testTaskId);
     const authBId = await createAndDispatchManualHandoff(projBId, taskB.id);
 
     const workOrderA = PackageGenerator.generateAuthorizedManualWorkOrder(authAId, repo);
     const workOrderB = PackageGenerator.generateAuthorizedManualWorkOrder(authBId, repo);
 
-    // Project A has node verify.js, NOT python run_tests.py
     expect(workOrderA).toContain('- **Test**: `node verify.js`');
     expect(workOrderA).not.toContain('run_tests.py');
 
-    // Project B has python run_tests.py, NOT node verify.js
     expect(workOrderB).toContain('- **Test**: `python run_tests.py`');
     expect(workOrderB).not.toContain('verify.js');
-
-    // Legacy WorkOrders also isolate strictly
-    const legacyWOA = PackageGenerator.generateWorkOrder(testProject, testTask, repo);
-    const legacyWOB = PackageGenerator.generateWorkOrder(projB, taskB, repo);
-
-    expect(legacyWOA).toContain('- **Test**: `node verify.js`');
-    expect(legacyWOA).not.toContain('run_tests.py');
-
-    expect(legacyWOB).toContain('- **Test**: `python run_tests.py`');
-    expect(legacyWOB).not.toContain('verify.js');
   });
 
   // =========================================================================
-  // CASE D: Disabled verification commands are not presented as configured
+  // CASE I: Disabled verification commands become null / Not configured
   // =========================================================================
-  it('CASE D: Disabled verification commands are not presented as configured', async () => {
-    // Disabled TEST command (enabled = false)
+  it('CASE I: Disabled verification commands are frozen as null and rendered as Not configured', async () => {
     repo.createVerificationCommand({
       id: 'vc-disabled-test',
       project_id: testProjectId,
@@ -314,24 +397,68 @@ describe('WorkOrder Verification Guidance Truthfulness', () => {
     });
 
     const authId = await createAndDispatchManualHandoff(testProjectId, testTaskId);
+    const auth = repo.getExecutionAuthorization(authId)!;
+    const parsedPayload = JSON.parse(auth.canonical_payload_json!);
+
+    expect(parsedPayload.verificationCommands.TEST).toBeNull();
+
     const authWorkOrder = PackageGenerator.generateAuthorizedManualWorkOrder(authId, repo);
-    const legacyWorkOrder = PackageGenerator.generateWorkOrder(testProject, testTask, repo);
-
     expect(authWorkOrder).toContain('- **Test**: Not configured');
-    expect(authWorkOrder).toContain('- **Lint**: Not configured');
-    expect(authWorkOrder).toContain('- **Build**: Not configured');
     expect(authWorkOrder).not.toContain('pytest');
-
-    expect(legacyWorkOrder).toContain('- **Test**: Not configured');
-    expect(legacyWorkOrder).toContain('- **Lint**: Not configured');
-    expect(legacyWorkOrder).toContain('- **Build**: Not configured');
-    expect(legacyWorkOrder).not.toContain('pytest');
   });
 
   // =========================================================================
-  // CASE E: Arguments needing quoting are rendered deterministically/unambiguously
+  // CASE J: Old authorization without verificationCommands snapshot fails closed
   // =========================================================================
-  it('CASE E: Arguments needing quoting (spaces, quotes, flags) are rendered deterministically and unambiguously', async () => {
+  it('CASE J: Old authorization missing verificationCommands snapshot fails closed with explicit error', async () => {
+    const authId = await createAndDispatchManualHandoff(testProjectId, testTaskId);
+    const auth = repo.getExecutionAuthorization(authId)!;
+
+    // Simulate old pre-snapshot payload
+    const legacyPayload = JSON.parse(auth.canonical_payload_json!);
+    delete legacyPayload.verificationCommands;
+
+    db.prepare('UPDATE execution_authorizations SET canonical_payload_json = ? WHERE id = ?').run(
+      JSON.stringify(legacyPayload),
+      auth.id
+    );
+
+    expect(() => {
+      PackageGenerator.generateAuthorizedManualWorkOrder(auth.id, repo);
+    }).toThrow(/AUTHORIZED_WORKORDER_VERIFICATION_SNAPSHOT_MISSING/);
+  });
+
+  // =========================================================================
+  // CASE K: Legacy WorkOrder template is truthful and deterministic
+  // =========================================================================
+  it('CASE K: Legacy WorkOrder response template has no fabricated claims and is deterministic', async () => {
+    repo.createVerificationCommand({
+      id: 'vc-test-01',
+      project_id: testProjectId,
+      name: 'Test Suite',
+      command_type: 'TEST',
+      executable: 'node',
+      args: ['verify.js'],
+      enabled: true,
+    });
+
+    const legacyWO1 = PackageGenerator.generateWorkOrder(testProject, testTask, repo);
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    const legacyWO2 = PackageGenerator.generateWorkOrder(testProject, testTask, repo);
+
+    expect(legacyWO1).toBe(legacyWO2);
+    expect(legacyWO1).not.toContain('src/example.ts');
+    expect(legacyWO1).not.toContain('npm test: all tests passing');
+    expect(legacyWO1).not.toContain('Summary of what was implemented');
+    expect(legacyWO1).toContain('"files_claimed_changed": []');
+    expect(legacyWO1).toContain('"tests_claimed": []');
+    expect(legacyWO1).toContain(`"message_id": "msg-cdr-${testTask.id}-rev${testTask.revision_count}"`);
+  });
+
+  // =========================================================================
+  // CASE L: Arguments needing quoting are rendered deterministically/unambiguously
+  // =========================================================================
+  it('CASE L: Arguments needing quoting (spaces, quotes, flags) are rendered deterministically and unambiguously', async () => {
     repo.createVerificationCommand({
       id: 'vc-quoted-test',
       project_id: testProjectId,
@@ -342,71 +469,9 @@ describe('WorkOrder Verification Guidance Truthfulness', () => {
       enabled: true,
     });
 
-    repo.createVerificationCommand({
-      id: 'vc-quoted-lint',
-      project_id: testProjectId,
-      name: 'Quoted Args Lint',
-      command_type: 'LINT',
-      executable: 'eslint',
-      args: ['src/**/*.{ts,tsx}', '--rule', 'semi: [2, "always"]'],
-      enabled: true,
-    });
-
-    repo.createVerificationCommand({
-      id: 'vc-quoted-build',
-      project_id: testProjectId,
-      name: 'Quoted Args Build',
-      command_type: 'BUILD',
-      executable: 'npm',
-      args: ['run', 'build:prod --release'],
-      enabled: true,
-    });
-
     const authId = await createAndDispatchManualHandoff(testProjectId, testTaskId);
     const authWorkOrder = PackageGenerator.generateAuthorizedManualWorkOrder(authId, repo);
-    const legacyWorkOrder = PackageGenerator.generateWorkOrder(testProject, testTask, repo);
 
-    // Spaces are safely quoted
     expect(authWorkOrder).toContain('- **Test**: `node --test "test suite/integration spec.js" \'--filter="all tests"\'`');
-    expect(authWorkOrder).toContain('- **Lint**: `eslint src/**/*.{ts,tsx} --rule \'semi: [2, "always"]\'`');
-    expect(authWorkOrder).toContain('- **Build**: `npm run "build:prod --release"`');
-
-    expect(legacyWorkOrder).toContain('- **Test**: `node --test "test suite/integration spec.js" \'--filter="all tests"\'`');
-    expect(legacyWorkOrder).toContain('- **Lint**: `eslint src/**/*.{ts,tsx} --rule \'semi: [2, "always"]\'`');
-    expect(legacyWorkOrder).toContain('- **Build**: `npm run "build:prod --release"`');
-  });
-
-  // =========================================================================
-  // CASE F: Complete absence of verification commands yields clean unconfigured output
-  // =========================================================================
-  it('CASE F: Completely unconfigured project renders all three types as Not configured', async () => {
-    const authId = await createAndDispatchManualHandoff(testProjectId, testTaskId);
-    const authWorkOrder = PackageGenerator.generateAuthorizedManualWorkOrder(authId, repo);
-    const legacyWorkOrder = PackageGenerator.generateWorkOrder(testProject, testTask, repo);
-
-    expect(authWorkOrder).toContain('- **Test**: Not configured');
-    expect(authWorkOrder).toContain('- **Lint**: Not configured');
-    expect(authWorkOrder).toContain('- **Build**: Not configured');
-
-    expect(legacyWorkOrder).toContain('- **Test**: Not configured');
-    expect(legacyWorkOrder).toContain('- **Lint**: Not configured');
-    expect(legacyWorkOrder).toContain('- **Build**: Not configured');
-  });
-
-  // =========================================================================
-  // CASE G: Caller-supplied verification command objects are strictly rejected
-  // =========================================================================
-  it('CASE G: Caller cannot supply verification command overrides to bypass durable SQLite truth', () => {
-    // Attempting to pass an unauthorized command object instead of Repository fails closed
-    expect(() => {
-      (PackageGenerator.generateWorkOrder as any)(testProject, testTask, {
-        test: 'malicious-or-stale-command',
-      });
-    }).toThrow();
-
-    // Authoritative Repository produces truthful "Not configured"
-    const truthfulWorkOrder = PackageGenerator.generateWorkOrder(testProject, testTask, repo);
-    expect(truthfulWorkOrder).toContain('- **Test**: Not configured');
-    expect(truthfulWorkOrder).not.toContain('malicious-or-stale-command');
   });
 });
