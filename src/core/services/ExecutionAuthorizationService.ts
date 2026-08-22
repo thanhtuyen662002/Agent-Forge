@@ -114,12 +114,6 @@ export function buildCanonicalInstructions(
       lines.push(`- ${ac}`);
     }
   }
-  if (task.constraints && task.constraints.length > 0) {
-    lines.push('Constraints:');
-    for (const c of task.constraints) {
-      lines.push(`- ${c}`);
-    }
-  }
   if (managerData.instructions && managerData.instructions.length > 0) {
     lines.push(`Manager Instructions (${managerData.decision}):`);
     for (const inst of managerData.instructions) {
@@ -459,6 +453,11 @@ export class ExecutionAuthorizationService {
     const durableVerifCommands = this.repo.getVerificationCommandsByProject(params.projectId);
     const verificationSnapshot = buildVerificationCommandsSnapshot(durableVerifCommands);
 
+    const effectiveConstraints: string[] = [
+      ...(task.constraints ?? []),
+      ...(managerData.constraints ?? []),
+    ];
+
     const canonicalPayload = computeCanonicalPayload({
       projectId: params.projectId,
       taskId: params.taskId,
@@ -466,7 +465,7 @@ export class ExecutionAuthorizationService {
       taskTitle: task.title,
       taskDescription: task.description,
       acceptanceCriteria: task.acceptance_criteria ?? [],
-      constraints: task.constraints ?? [],
+      constraints: effectiveConstraints,
       instructions: canonicalInstructions,
       contextFiles: canonicalContextFiles,
       verificationCommands: verificationSnapshot,
