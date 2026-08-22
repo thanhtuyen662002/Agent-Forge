@@ -25,6 +25,7 @@ import {
   AlertTriangle,
 } from 'lucide-react';
 import { ProviderResource } from '../../core/types/domain';
+import { shouldRunCoderVerification } from '../../core/state/taskStateMachine';
 
 export const ManualBridgeView: React.FC = () => {
   const {
@@ -368,8 +369,12 @@ export const ManualBridgeView: React.FC = () => {
     try {
       const res = await applyProtocol(coderInput);
       if (res.success) {
-        setCoderApplyStatus(t('manualBridge.coderReportAppliedRunningTests', { message: res.message || t('manualBridge.coderReportAppliedDefault') }));
-        if (res.task?.id) {
+        if (res.task?.id && shouldRunCoderVerification(res.task.state)) {
+          setCoderApplyStatus(
+            t('manualBridge.coderReportAppliedRunningTests', {
+              message: res.message || t('manualBridge.coderReportAppliedDefault'),
+            })
+          );
           const verifRes = await runVerificationTests(res.task.id);
           const outcome = verifRes.success ? t('manualBridge.testsPassed') : t('manualBridge.testsFailed');
           setCoderApplyStatus(
@@ -379,6 +384,8 @@ export const ManualBridgeView: React.FC = () => {
               state: verifRes.finalTaskState || '',
             })
           );
+        } else {
+          setCoderApplyStatus(res.message || t('manualBridge.coderReportAppliedDefault'));
         }
         await loadSnapshot();
       } else {
