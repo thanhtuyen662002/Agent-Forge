@@ -98,10 +98,45 @@ export class ProcessRunner {
   }
 
   /**
+   * Resolves a trusted, absolute path to cmd.exe on Windows.
+   * Ignores caller-supplied custom options.env.COMSPEC to prevent execution hijacking.
+   * Validates that the candidate path is absolute, has basename 'cmd.exe', exists as a regular file,
+   * and contains no control characters, quotes, or metacharacters.
+   */
+  private static resolveTrustedCmdExe(): string | null {
+    const candidates: (string | undefined)[] = [
+      process.env.ComSpec,
+      process.env.COMSPEC,
+      path.join(process.env.SystemRoot || process.env.SYSTEMROOT || 'C:\\Windows', 'System32', 'cmd.exe'),
+    ];
+
+    for (const candidate of candidates) {
+      if (!candidate || typeof candidate !== 'string') continue;
+      const trimmed = candidate.trim();
+      if (!path.isAbsolute(trimmed)) continue;
+      if (path.basename(trimmed).toLowerCase() !== 'cmd.exe') continue;
+      if (/[\x00\r\n"&|<>^%!()]/.test(trimmed)) continue;
+
+      try {
+        if (fs.existsSync(trimmed)) {
+          const stat = fs.statSync(trimmed);
+          if (stat.isFile()) {
+            return path.resolve(trimmed);
+          }
+        }
+      } catch {
+        // Continue to next candidate on filesystem error
+      }
+    }
+
+    return null;
+  }
+
+  /**
    * Resolves platform-specific executable invocations while preserving logical command identity.
    * On Windows, resolves bare commands against PATH and PATHEXT.
-   * If a .cmd or .bat shim (such as npm.cmd) is resolved, it is safely invoked through cmd.exe /d /s /c
-   * with strict argument validation to prevent shell injection.
+   * If a .cmd or .bat shim (such as npm.cmd) is resolved, it is safely invoked through trusted cmd.exe
+   * with explicit /d /v:off /s /c flags and strict path and argument validation to prevent shell injection.
    */
   private static resolvePlatformInvocation(
     executable: string,
@@ -141,14 +176,14 @@ export class ProcessRunner {
         if (hasExt) {
           const candidate = path.join(dir, executable);
           if (fs.existsSync(candidate)) {
-            resolvedPath = candidate;
+            resolvedPath = path.resolve(candidate);
             break;
           }
         } else {
           for (const ext of extensions) {
             const candidate = path.join(dir, executable + ext);
             if (fs.existsSync(candidate)) {
-              resolvedPath = candidate;
+              resolvedPath = path.resolve(candidate);
               break;
             }
           }
@@ -168,7 +203,51 @@ export class ProcessRunner {
     }
 
     if (ext === '.cmd' || ext === '.bat') {
-      // Strict fail-closed validation for command shim arguments
+      // 1. Validate resolved shim path
+      if (!path.isAbsolute(resolvedPath)) {
+        return {
+          executable,
+          args,
+          error: `Resolved command shim path is not absolute: "${resolvedPath}".`,
+        };
+      }
+
+      try {
+        if (!fs.existsSync(resolvedPath) || !fs.statSync(resolvedPath).isFile()) {
+          return {
+            executable,
+            args,
+            error: `Resolved command shim does not exist or is not a file: "${resolvedPath}".`,
+          };
+        }
+      } catch (err: any) {
+        return {
+          executable,
+          args,
+          error: `Cannot access resolved command shim: ${err.message}`,
+        };
+      }
+
+      // Reject paths containing expansion characters (%), quotes, newlines, or control chars
+      if (/[\x00\r\n"%!]/.test(resolvedPath)) {
+        return {
+          executable,
+          args,
+          error: `Unsafe characters or expansion sequence in resolved command shim path: "${resolvedPath}".`,
+        };
+      }
+
+      // 2. Resolve trusted cmd.exe (ignoring custom options.env.COMSPEC)
+      const trustedCmd = this.resolveTrustedCmdExe();
+      if (!trustedCmd) {
+        return {
+          executable,
+          args,
+          error: 'Cannot securely resolve trusted cmd.exe command processor on Windows.',
+        };
+      }
+
+      // 3. Strict fail-closed validation for command shim arguments
       for (const arg of args) {
         if (/[\x00\r\n]/.test(arg)) {
           return {
@@ -177,7 +256,7 @@ export class ProcessRunner {
             error: 'Unsafe characters in command shim argument: newline or control character detected.',
           };
         }
-        if (/[&|<>^%"]/.test(arg)) {
+        if (/[&|<>^%"()!]/.test(arg)) {
           return {
             executable,
             args,
@@ -186,13 +265,12 @@ export class ProcessRunner {
         }
       }
 
-      const comSpec = env.COMSPEC || process.env.COMSPEC || 'C:\\Windows\\system32\\cmd.exe';
       const formattedArgs = args.map((arg) => (/\s/.test(arg) ? `"${arg}"` : arg));
       const fullCommandLine = `"${resolvedPath}" ${formattedArgs.join(' ')}`.trim();
 
       return {
-        executable: comSpec,
-        args: ['/d', '/s', '/c', `"${fullCommandLine}"`],
+        executable: trustedCmd,
+        args: ['/d', '/v:off', '/s', '/c', `"${fullCommandLine}"`],
         windowsVerbatimArguments: true,
       };
     }
@@ -203,7 +281,7 @@ export class ProcessRunner {
   public static async execute(options: StructuredProcessOptions): Promise<ProcessRunResult> {
     const executionId = crypto.randomUUID();
     const timeoutMs = options.timeoutMs ?? 60000;
-    const commandStr = `${options.executable} ${options.args.join(' ')}`;
+    const commandStr = [options.executable, ...options.args].join(' ');
     const startTime = Date.now();
     const startIso = new Date(startTime).toISOString();
 
@@ -246,6 +324,13 @@ export class ProcessRunner {
 
     // 2. Resolve safe platform invocation (Windows shim vs direct binary)
     const minimalEnv = this.buildMinimalEnv(options.env);
+    if (process.platform === 'win32') {
+      const trustedCmd = this.resolveTrustedCmdExe();
+      if (trustedCmd) {
+        minimalEnv.COMSPEC = trustedCmd;
+        minimalEnv.ComSpec = trustedCmd;
+      }
+    }
     const invocation = this.resolvePlatformInvocation(options.executable, options.args, minimalEnv);
 
     if (invocation.error) {

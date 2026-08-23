@@ -86,6 +86,84 @@ describe('ProcessRunner Windows Command-Shim Resolution & Security Invariants', 
   );
 
   it.runIf(process.platform === 'win32')(
+    'should ignore caller-supplied custom options.env.COMSPEC and execute real logical "npm test" through trusted cmd.exe',
+    async () => {
+      const pkgJson = {
+        name: 'windows-comspec-fixture',
+        version: '1.0.0',
+        scripts: {
+          test: 'node fixture.test.js',
+        },
+      };
+      fs.writeFileSync(path.join(tmpDir, 'package.json'), JSON.stringify(pkgJson, null, 2), 'utf8');
+      fs.writeFileSync(
+        path.join(tmpDir, 'fixture.test.js'),
+        'console.log("COMSPEC_HIJACK_IGNORED_PASSED"); process.exit(0);',
+        'utf8'
+      );
+
+      const res = await ProcessRunner.execute({
+        executable: 'npm',
+        args: ['test'],
+        cwd: tmpDir,
+        env: {
+          COMSPEC: 'C:\\fake_hijack\\nonexistent_cmd.exe',
+          ComSpec: 'C:\\fake_hijack\\nonexistent_cmd.exe',
+        },
+        repo,
+        artifactStore,
+        projectId: 'PROJ-SHIM',
+      });
+
+      expect(res.exitCode).toBe(0);
+      expect(res.pid).toBeTypeOf('number');
+      expect(res.stdout).toContain('COMSPEC_HIJACK_IGNORED_PASSED');
+      expect(res.command).toBe('npm test');
+
+      const runRecord = repo.getProcessRun(res.executionId);
+      expect(runRecord).not.toBeNull();
+      expect(runRecord.status).toBe('COMPLETED');
+      expect(runRecord.command).toBe('npm test');
+      expect(runRecord.exit_code).toBe(0);
+      expect(runRecord.pid).toBe(res.pid);
+    }
+  );
+
+  it.runIf(process.platform === 'win32')(
+    'should fail closed when resolved command shim path contains unsafe percent expansion characters',
+    async () => {
+      const percentDir = path.join(tmpDir, 'unsafe%dir%path');
+      fs.mkdirSync(percentDir, { recursive: true });
+      fs.writeFileSync(
+        path.join(percentDir, 'unsafe_tool.cmd'),
+        '@echo off\r\necho UNSAFE_EXECUTED\r\n',
+        'utf8'
+      );
+
+      const res = await ProcessRunner.execute({
+        executable: 'unsafe_tool',
+        args: [],
+        cwd: tmpDir,
+        env: {
+          PATH: `${percentDir}${path.delimiter}${process.env.PATH || ''}`,
+        },
+        repo,
+        projectId: 'PROJ-SHIM',
+      });
+
+      expect(res.exitCode).toBe(-1);
+      expect(res.pid).toBeNull();
+      expect(res.stderr).toContain('Unsafe characters or expansion sequence in resolved command shim path');
+
+      const runRecord = repo.getProcessRun(res.executionId);
+      expect(runRecord).not.toBeNull();
+      expect(runRecord.status).toBe('FAILED');
+      expect(runRecord.pid).toBeNull();
+      expect(runRecord.command).toBe('unsafe_tool');
+    }
+  );
+
+  it.runIf(process.platform === 'win32')(
     'should reject CRLF and NUL injection attempts before spawning child process',
     async () => {
       const crlfArg = 'test\ncalc.exe';
@@ -120,6 +198,9 @@ describe('ProcessRunner Windows Command-Shim Resolution & Security Invariants', 
         ['test', '>', 'out.txt'],
         ['test', '^something'],
         ['test', 'double"quote'],
+        ['test', '(', 'nested'],
+        ['test', ')', 'nested'],
+        ['test', '!', 'delayed_var'],
       ];
 
       for (const dangerousArgs of dangerousArgSets) {
