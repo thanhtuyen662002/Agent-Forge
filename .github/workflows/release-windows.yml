@@ -109,24 +109,102 @@ jobs:
 
           # 2. Exhaustive Paginated GitHub Releases & Drafts Query
           Write-Host "Querying all GitHub releases and drafts via paginated REST API..."
-          $releasesJson = gh api --paginate "/repos/${{ github.repository }}/releases" 2>&1
+          $releasesJson = (gh api --paginate --slurp "/repos/${{ github.repository }}/releases" 2>&1) -join "`n"
           if ($LASTEXITCODE -ne 0) {
             Write-Error "COLLISION GUARD LOOKUP FAILURE FAIL-CLOSED: gh api --paginate failed with exit code $($LASTEXITCODE): $releasesJson"
             exit 1
           }
 
-          $releases = $null
+          if ([string]::IsNullOrWhiteSpace($releasesJson)) {
+            Write-Error "COLLISION GUARD LOOKUP FAILURE FAIL-CLOSED: Releases API returned empty output."
+            exit 1
+          }
+
+          $pages = $null
           try {
-            $releases = $releasesJson | ConvertFrom-Json
+            $cmd = Get-Command ConvertFrom-Json
+            if ($cmd.Parameters.ContainsKey('NoEnumerate')) {
+              $pages = ConvertFrom-Json -InputObject $releasesJson -NoEnumerate
+            } else {
+              $pages = ConvertFrom-Json -InputObject $releasesJson
+            }
           } catch {
             Write-Error "COLLISION GUARD PARSE FAILURE FAIL-CLOSED: Failed to parse releases JSON: $_"
             exit 1
           }
 
-          if ($null -eq $releases) {
-            Write-Error "COLLISION GUARD LOOKUP FAILURE FAIL-CLOSED: Releases API returned null response."
+          if ($null -eq $pages -or (-not ($pages -is [System.Array] -or $pages -is [System.Collections.IList]))) {
+            Write-Error "COLLISION GUARD SHAPE FAILURE FAIL-CLOSED: Top-level releases JSON is not an array of pages."
             exit 1
           }
+
+          $releases = [System.Collections.Generic.List[object]]::new()
+          $pageIndex = 0
+          foreach ($page in $pages) {
+            $pageIndex++
+            if ($null -eq $page) {
+              Write-Error "COLLISION GUARD SHAPE FAILURE FAIL-CLOSED: Page $pageIndex is null."
+              exit 1
+            }
+            if (-not ($page -is [System.Array] -or $page -is [System.Collections.IList])) {
+              Write-Error "COLLISION GUARD SHAPE FAILURE FAIL-CLOSED: Page $pageIndex is not a valid array."
+              exit 1
+            }
+            $itemIndex = 0
+            foreach ($item in $page) {
+              $itemIndex++
+              if ($null -eq $item) {
+                Write-Error "COLLISION GUARD SHAPE FAILURE FAIL-CLOSED: Page $pageIndex record $itemIndex is null."
+                exit 1
+              }
+              if (-not ($item -is [System.Management.Automation.PSCustomObject] -or $item -is [System.Collections.IDictionary])) {
+                Write-Error "COLLISION GUARD SHAPE FAILURE FAIL-CLOSED: Page $pageIndex record $itemIndex is not a valid object."
+                exit 1
+              }
+
+              $tagName = $null
+              if ($item -is [System.Management.Automation.PSCustomObject]) {
+                if (-not ($item.PSObject.Properties.Match('tag_name').Count -gt 0)) {
+                  Write-Error "COLLISION GUARD SHAPE FAILURE FAIL-CLOSED: Page $pageIndex record $itemIndex is missing required property 'tag_name'."
+                  exit 1
+                }
+                $tagName = $item.tag_name
+              } else {
+                if (-not $item.Contains('tag_name')) {
+                  Write-Error "COLLISION GUARD SHAPE FAILURE FAIL-CLOSED: Page $pageIndex record $itemIndex is missing required property 'tag_name'."
+                  exit 1
+                }
+                $tagName = $item['tag_name']
+              }
+
+              if ($null -eq $tagName -or (-not ($tagName -is [string])) -or [string]::IsNullOrWhiteSpace($tagName)) {
+                Write-Error "COLLISION GUARD SHAPE FAILURE FAIL-CLOSED: Page $pageIndex record $itemIndex 'tag_name' must be a non-empty string."
+                exit 1
+              }
+
+              $nameVal = $null
+              if ($item -is [System.Management.Automation.PSCustomObject]) {
+                if ($item.PSObject.Properties.Match('name').Count -gt 0) {
+                  $nameVal = $item.name
+                }
+              } else {
+                if ($item.Contains('name')) {
+                  $nameVal = $item['name']
+                }
+              }
+              if ($null -ne $nameVal -and (-not ($nameVal -is [string]))) {
+                Write-Error "COLLISION GUARD SHAPE FAILURE FAIL-CLOSED: Page $pageIndex record $itemIndex 'name' property must be null or string."
+                exit 1
+              }
+
+              $releases.Add($item)
+            }
+          }
+
+          $pageCount = $pages.Count
+          $recordCount = $releases.Count
+          Write-Host "RELEASE_PAGE_COUNT=$pageCount"
+          Write-Host "RELEASE_RECORD_COUNT=$recordCount"
 
           $matchingReleases = @($releases | Where-Object {
             $_.tag_name -eq $canonicalTag -or

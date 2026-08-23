@@ -1,6 +1,7 @@
 import { describe, it, expect } from 'vitest';
 import * as fs from 'fs';
 import * as path from 'path';
+import { execSync } from 'child_process';
 
 describe('PR #19 — Production Release Pipeline Hardening Contract Tests', () => {
   const projectRoot = path.resolve(__dirname, '..');
@@ -49,18 +50,25 @@ describe('PR #19 — Production Release Pipeline Hardening Contract Tests', () =
     expect(normalize('v0.1.1')).toBe('v0.1.1');
   });
 
-  it('5. release-windows.yml enforces exhaustive draft-aware release collision guard with pagination and fail-closed semantics', () => {
+  it('5. release-windows.yml enforces exhaustive draft-aware release collision guard with pagination, slurp, and fail-closed semantics', () => {
     const workflow = fs.readFileSync(releaseWorkflowPath, 'utf8');
     // Checks both canonical and unprefixed remote git tags
     expect(workflow).toMatch(/git ls-remote --tags origin/);
     expect(workflow).toMatch(/refs\/tags\/\$canonicalTag/);
     expect(workflow).toMatch(/refs\/tags\/\$normalizedVersion/);
-    // Queries paginated releases list capable of inspecting drafts
-    expect(workflow).toMatch(/gh api --paginate ["']\/repos\/\$\{\{\s*github\.repository\s*\}\}\/releases["']/);
+    // Queries paginated releases list with --slurp capable of inspecting drafts
+    expect(workflow).toMatch(/gh api --paginate --slurp ["']\/repos\/\$\{\{\s*github\.repository\s*\}\}\/releases["']/);
+    expect(workflow).toMatch(/ConvertFrom-Json.*-NoEnumerate/);
+    expect(workflow).toMatch(/RELEASE_PAGE_COUNT/);
+    expect(workflow).toMatch(/RELEASE_RECORD_COUNT/);
     expect(workflow).toMatch(/\$matchingReleases\.Count -gt 0/);
     expect(workflow).toMatch(/COLLISION GUARD FAIL-CLOSED/);
     expect(workflow).toMatch(/COLLISION GUARD LOOKUP FAILURE FAIL-CLOSED/);
     expect(workflow).toMatch(/COLLISION GUARD PARSE FAILURE FAIL-CLOSED/);
+    expect(workflow).toMatch(/COLLISION GUARD SHAPE FAILURE FAIL-CLOSED/);
+
+    // Forbids regression to naive if ($null -eq $releases) that fails on valid empty collections
+    expect(workflow).not.toMatch(/if\s*\(\$null\s*-eq\s*\$releases\)\s*\{\s*Write-Error\s*["'].*Releases API returned null response/);
   });
 
   it('6. release-windows.yml executes ALL release gates and asserts strict execution ordering', () => {
@@ -168,8 +176,52 @@ describe('PR #19 — Production Release Pipeline Hardening Contract Tests', () =
     expect(workflow).not.toMatch(/\$LASTEXITCODE:/);
 
     // Safely delimited exit-code check in collision guard
-    expect(workflow).toMatch(/gh api --paginate ["']\/repos\/\$\{\{\s*github\.repository\s*\}\}\/releases["']/);
+    expect(workflow).toMatch(/gh api --paginate --slurp ["']\/repos\/\$\{\{\s*github\.repository\s*\}\}\/releases["']/);
     expect(workflow).toMatch(/if\s*\(\$LASTEXITCODE\s*-ne\s*0\)/);
     expect(workflow).toMatch(/Write-Error ["'].*COLLISION GUARD LOOKUP FAILURE FAIL-CLOSED.*\$(\(\$LASTEXITCODE\)|\{LASTEXITCODE\}).*\$releasesJson["']/);
+  });
+
+  it('12. release collision guard handles empty and multi-page JSON collections with page flattening and strict record shape validation', () => {
+    const workflow = fs.readFileSync(releaseWorkflowPath, 'utf8');
+
+    // Asserts page flattening loop and validation
+    expect(workflow).toMatch(/foreach\s*\(\$page in \$pages\)/);
+    expect(workflow).toMatch(/foreach\s*\(\$item in \$page\)/);
+    expect(workflow).toMatch(/\$releases\.Add\(\$item\)/);
+
+    // Fail-closed on null page (no continue)
+    expect(workflow).not.toMatch(/if\s*\(\$null\s*-eq\s*\$page\)\s*\{\s*continue\s*\}/);
+    expect(workflow).toMatch(/COLLISION GUARD SHAPE FAILURE FAIL-CLOSED: Page \$pageIndex is null\./);
+
+    // Fail-closed on null record and non-object record
+    expect(workflow).toMatch(/COLLISION GUARD SHAPE FAILURE FAIL-CLOSED: Page \$pageIndex record \$itemIndex is null\./);
+    expect(workflow).toMatch(/COLLISION GUARD SHAPE FAILURE FAIL-CLOSED: Page \$pageIndex record \$itemIndex is not a valid object\./);
+
+    // Fail-closed on missing or empty tag_name
+    expect(workflow).toMatch(/COLLISION GUARD SHAPE FAILURE FAIL-CLOSED: Page \$pageIndex record \$itemIndex is missing required property 'tag_name'\./);
+    expect(workflow).toMatch(/COLLISION GUARD SHAPE FAILURE FAIL-CLOSED: Page \$pageIndex record \$itemIndex 'tag_name' must be a non-empty string\./);
+
+    // Ordering requirement: tag_name validation must occur strictly before $releases.Add($item)
+    const posTagNameCheck = workflow.indexOf("tag_name' must be a non-empty string");
+    const posAddRelease = workflow.indexOf("$releases.Add($item)");
+    expect(posTagNameCheck).toBeGreaterThan(0);
+    expect(posAddRelease).toBeGreaterThan(posTagNameCheck);
+  });
+
+  it('13. semantic release collision fixture test suite executes and passes all 15 cases', () => {
+    const fixtureScriptPath = path.join(projectRoot, 'tests/fixtures/test-release-collision-fixtures.ps1');
+    expect(fs.existsSync(fixtureScriptPath)).toBe(true);
+
+    const psExe = process.platform === 'win32' ? 'powershell' : 'pwsh';
+    const output = execSync(`${psExe} -File "${fixtureScriptPath}"`, { encoding: 'utf8' });
+    expect(output).toMatch(/COLLISION_FIXTURE_TEST_COUNT:\s*15/);
+    expect(output).toMatch(/COLLISION_FIXTURE_TEST_PASS_COUNT:\s*15/);
+    expect(output).toMatch(/PASS:\s*CASE A - ZERO RELEASES/);
+    expect(output).toMatch(/PASS:\s*CASE J - NULL PAGE/);
+    expect(output).toMatch(/PASS:\s*CASE K - NULL RELEASE RECORD/);
+    expect(output).toMatch(/PASS:\s*CASE L - SCALAR RELEASE RECORD/);
+    expect(output).toMatch(/PASS:\s*CASE M - RECORD MISSING TAG_NAME/);
+    expect(output).toMatch(/PASS:\s*CASE N - EMPTY TAG_NAME/);
+    expect(output).toMatch(/PASS:\s*CASE O - NULL NAME IS VALID/);
   });
 });
