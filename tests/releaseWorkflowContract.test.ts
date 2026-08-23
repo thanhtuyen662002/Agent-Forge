@@ -49,18 +49,25 @@ describe('PR #19 — Production Release Pipeline Hardening Contract Tests', () =
     expect(normalize('v0.1.1')).toBe('v0.1.1');
   });
 
-  it('5. release-windows.yml enforces exhaustive draft-aware release collision guard with pagination and fail-closed semantics', () => {
+  it('5. release-windows.yml enforces exhaustive draft-aware release collision guard with pagination, slurp, and fail-closed semantics', () => {
     const workflow = fs.readFileSync(releaseWorkflowPath, 'utf8');
     // Checks both canonical and unprefixed remote git tags
     expect(workflow).toMatch(/git ls-remote --tags origin/);
     expect(workflow).toMatch(/refs\/tags\/\$canonicalTag/);
     expect(workflow).toMatch(/refs\/tags\/\$normalizedVersion/);
-    // Queries paginated releases list capable of inspecting drafts
-    expect(workflow).toMatch(/gh api --paginate ["']\/repos\/\$\{\{\s*github\.repository\s*\}\}\/releases["']/);
+    // Queries paginated releases list with --slurp capable of inspecting drafts
+    expect(workflow).toMatch(/gh api --paginate --slurp ["']\/repos\/\$\{\{\s*github\.repository\s*\}\}\/releases["']/);
+    expect(workflow).toMatch(/ConvertFrom-Json.*-NoEnumerate/);
+    expect(workflow).toMatch(/RELEASE_PAGE_COUNT/);
+    expect(workflow).toMatch(/RELEASE_RECORD_COUNT/);
     expect(workflow).toMatch(/\$matchingReleases\.Count -gt 0/);
     expect(workflow).toMatch(/COLLISION GUARD FAIL-CLOSED/);
     expect(workflow).toMatch(/COLLISION GUARD LOOKUP FAILURE FAIL-CLOSED/);
     expect(workflow).toMatch(/COLLISION GUARD PARSE FAILURE FAIL-CLOSED/);
+    expect(workflow).toMatch(/COLLISION GUARD SHAPE FAILURE FAIL-CLOSED/);
+
+    // Forbids regression to naive if ($null -eq $releases) that fails on valid empty collections
+    expect(workflow).not.toMatch(/if\s*\(\$null\s*-eq\s*\$releases\)\s*\{\s*Write-Error\s*["'].*Releases API returned null response/);
   });
 
   it('6. release-windows.yml executes ALL release gates and asserts strict execution ordering', () => {
@@ -168,8 +175,17 @@ describe('PR #19 — Production Release Pipeline Hardening Contract Tests', () =
     expect(workflow).not.toMatch(/\$LASTEXITCODE:/);
 
     // Safely delimited exit-code check in collision guard
-    expect(workflow).toMatch(/gh api --paginate ["']\/repos\/\$\{\{\s*github\.repository\s*\}\}\/releases["']/);
+    expect(workflow).toMatch(/gh api --paginate --slurp ["']\/repos\/\$\{\{\s*github\.repository\s*\}\}\/releases["']/);
     expect(workflow).toMatch(/if\s*\(\$LASTEXITCODE\s*-ne\s*0\)/);
     expect(workflow).toMatch(/Write-Error ["'].*COLLISION GUARD LOOKUP FAILURE FAIL-CLOSED.*\$(\(\$LASTEXITCODE\)|\{LASTEXITCODE\}).*\$releasesJson["']/);
+  });
+
+  it('12. release collision guard handles empty and multi-page JSON collections with page flattening', () => {
+    const workflow = fs.readFileSync(releaseWorkflowPath, 'utf8');
+
+    // Asserts page flattening loop and validation
+    expect(workflow).toMatch(/foreach\s*\(\$page in \$pages\)/);
+    expect(workflow).toMatch(/foreach\s*\(\$item in \$page\)/);
+    expect(workflow).toMatch(/\$releases\.Add\(\$item\)/);
   });
 });
