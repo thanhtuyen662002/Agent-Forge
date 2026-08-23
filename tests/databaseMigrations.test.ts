@@ -14,7 +14,7 @@ describe('Database Migrations & Upgrade Integrity', () => {
     db.close();
   });
 
-  it('should run all migrations cleanly and create all tables (v1 through v7)', () => {
+  it('should run all migrations cleanly and create all tables (v1 through v8)', () => {
     MigrationRunner.run(db);
 
     const tables = db
@@ -34,10 +34,18 @@ describe('Database Migrations & Upgrade Integrity', () => {
     expect(tableNames).toContain('verification_commands');
     expect(tableNames).toContain('process_runs');
     expect(tableNames).toContain('execution_authorizations');
+    expect(tableNames).toContain('role_profiles');
+    expect(tableNames).toContain('agent_profiles');
+    expect(tableNames).toContain('provider_accounts');
+    expect(tableNames).toContain('worker_slots');
+    expect(tableNames).toContain('agent_assignments');
+    expect(tableNames).toContain('account_leases');
+    expect(tableNames).toContain('route_policies');
+    expect(tableNames).toContain('separation_policies');
     expect(tableNames).toContain('schema_migrations');
 
     const applied = db.prepare('SELECT COUNT(*) as count FROM schema_migrations').get() as { count: number };
-    expect(applied.count).toBe(7);
+    expect(applied.count).toBe(8);
 
     // Foreign key integrity check
     const fkViolations = db.prepare('PRAGMA foreign_key_check').all();
@@ -46,10 +54,10 @@ describe('Database Migrations & Upgrade Integrity', () => {
     // Idempotency check: running MigrationRunner again applies 0 new migrations
     MigrationRunner.run(db);
     const appliedAgain = db.prepare('SELECT COUNT(*) as count FROM schema_migrations').get() as { count: number };
-    expect(appliedAgain.count).toBe(7);
+    expect(appliedAgain.count).toBe(8);
   });
 
-  it('should cleanly upgrade an existing database through historical path (v1 -> v2 -> original v3 -> v4 -> v5 -> v6 -> v7) and repair default agent links', () => {
+  it('should cleanly upgrade an existing database through historical path (v1 -> v2 -> original v3 -> v4 -> v5 -> v6 -> v7 -> v8) and repair default agent links', () => {
     // 1. Manually apply v1 schema
     db.exec(`
       CREATE TABLE IF NOT EXISTS schema_migrations (
@@ -97,18 +105,26 @@ describe('Database Migrations & Upgrade Integrity', () => {
     const mgrBefore = db.prepare('SELECT * FROM agents WHERE id = ?').get('agent-primary-manager') as any;
     expect(mgrBefore.provider_resource_id).toBe('res-chatgpt-manager');
 
-    // 2. Run MigrationRunner to upgrade from v1 to latest (v7)
+    // 2. Run MigrationRunner to upgrade from v1 to latest (v8)
     MigrationRunner.run(db);
 
     // 3. Assert migrations applied
-    const v7Tables = (db.prepare("SELECT name FROM sqlite_master WHERE type='table'").all() as { name: string }[]).map((t) => t.name);
-    expect(v7Tables).toContain('verification_commands');
-    expect(v7Tables).toContain('provider_resources');
-    expect(v7Tables).toContain('process_runs');
-    expect(v7Tables).toContain('execution_authorizations');
+    const v8Tables = (db.prepare("SELECT name FROM sqlite_master WHERE type='table'").all() as { name: string }[]).map((t) => t.name);
+    expect(v8Tables).toContain('verification_commands');
+    expect(v8Tables).toContain('provider_resources');
+    expect(v8Tables).toContain('process_runs');
+    expect(v8Tables).toContain('execution_authorizations');
+    expect(v8Tables).toContain('role_profiles');
+    expect(v8Tables).toContain('agent_profiles');
+    expect(v8Tables).toContain('provider_accounts');
+    expect(v8Tables).toContain('worker_slots');
+    expect(v8Tables).toContain('agent_assignments');
+    expect(v8Tables).toContain('account_leases');
+    expect(v8Tables).toContain('route_policies');
+    expect(v8Tables).toContain('separation_policies');
 
     const migrationCount = (db.prepare('SELECT COUNT(*) as count FROM schema_migrations').get() as { count: number }).count;
-    expect(migrationCount).toBe(7);
+    expect(migrationCount).toBe(8);
 
     // 4. Assert default agent links are repaired by migration 005
     const mgrAfter = db.prepare('SELECT * FROM agents WHERE id = ?').get('agent-primary-manager') as any;

@@ -7,6 +7,7 @@ import {
   TaskAttempt,
   Provider,
   ProviderResource,
+  ProviderHealthStatus,
   Agent,
   Decision,
   Review,
@@ -21,7 +22,22 @@ import {
   TaskState,
   ProjectStatus,
   ExecutionAuthorization,
-  ExecutionAuthorizationStatus
+  ExecutionAuthorizationStatus,
+  RoleProfile,
+  AgentProfile,
+  ProviderAccount,
+  WorkerSlot,
+  AgentAssignment,
+  AccountLease,
+  RoutePolicy,
+  SeparationPolicy,
+  FabricRole,
+  AccountAuthMode,
+  WorkerSlotStatus,
+  AgentAssignmentStatus,
+  SeparationAffinity,
+  Capability,
+  RiskLevel
 } from '../types/domain';
 
 export class Repository {
@@ -462,14 +478,15 @@ export class Repository {
     this.db
       .prepare(`
         INSERT INTO provider_resources (
-          id, provider_id, model_name, health_status, capabilities_json, enabled,
+          id, provider_id, provider_account_id, model_name, health_status, capabilities_json, enabled,
           total_quota, remaining_quota, quota_unit, quota_reset_at, quota_source,
           quota_confidence, last_health_check
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       `)
       .run(
         resource.id,
         resource.provider_id,
+        resource.provider_account_id ?? null,
         resource.model_name,
         resource.health_status,
         JSON.stringify(resource.capabilities),
@@ -490,6 +507,7 @@ export class Repository {
     return {
       id: String(row.id),
       provider_id: String(row.provider_id),
+      provider_account_id: row.provider_account_id ? String(row.provider_account_id) : null,
       model_name: String(row.model_name),
       health_status: row.health_status as any,
       capabilities: row.capabilities_json ? JSON.parse(String(row.capabilities_json)) : [],
@@ -504,11 +522,12 @@ export class Repository {
     };
   }
 
-  public getAllProviderResources(): ProviderResource[] {
-    const rows = this.db.prepare('SELECT * FROM provider_resources ORDER BY model_name ASC').all() as Record<string, unknown>[];
+  public getProviderResourcesByAccount(accountId: string): ProviderResource[] {
+    const rows = this.db.prepare('SELECT * FROM provider_resources WHERE provider_account_id = ? ORDER BY model_name ASC').all(accountId) as Record<string, unknown>[];
     return rows.map((r) => ({
       id: String(r.id),
       provider_id: String(r.provider_id),
+      provider_account_id: r.provider_account_id ? String(r.provider_account_id) : null,
       model_name: String(r.model_name),
       health_status: r.health_status as any,
       capabilities: r.capabilities_json ? JSON.parse(String(r.capabilities_json)) : [],
@@ -521,6 +540,32 @@ export class Repository {
       quota_confidence: Number(r.quota_confidence),
       last_health_check: r.last_health_check ? String(r.last_health_check) : null,
     }));
+  }
+
+  public getAllProviderResources(): ProviderResource[] {
+    const rows = this.db.prepare('SELECT * FROM provider_resources ORDER BY model_name ASC').all() as Record<string, unknown>[];
+    return rows.map((r) => ({
+      id: String(r.id),
+      provider_id: String(r.provider_id),
+      provider_account_id: r.provider_account_id ? String(r.provider_account_id) : null,
+      model_name: String(r.model_name),
+      health_status: r.health_status as any,
+      capabilities: r.capabilities_json ? JSON.parse(String(r.capabilities_json)) : [],
+      enabled: Boolean(r.enabled),
+      total_quota: r.total_quota !== null ? Number(r.total_quota) : null,
+      remaining_quota: r.remaining_quota !== null ? Number(r.remaining_quota) : null,
+      quota_unit: String(r.quota_unit),
+      quota_reset_at: r.quota_reset_at ? String(r.quota_reset_at) : null,
+      quota_source: r.quota_source as any,
+      quota_confidence: Number(r.quota_confidence),
+      last_health_check: r.last_health_check ? String(r.last_health_check) : null,
+    }));
+  }
+
+  public updateProviderResourceAccount(id: string, accountId: string | null): void {
+    this.db
+      .prepare('UPDATE provider_resources SET provider_account_id = ? WHERE id = ?')
+      .run(accountId, id);
   }
 
   public updateProviderResourceQuota(
@@ -1304,5 +1349,712 @@ export class Repository {
     return this.db
       .prepare('SELECT * FROM process_runs WHERE project_id = ? ORDER BY start_time DESC')
       .all(projectId);
+  }
+
+  // ==========================================
+  // Role Profiles (R5A)
+  // ==========================================
+  public createRoleProfile(profile: RoleProfile): void {
+    this.db
+      .prepare(`
+        INSERT INTO role_profiles (
+          id, role, display_name, required_capabilities_json, preferred_capabilities_json,
+          authority_scope_json, permissions_json, output_protocol, enabled, created_at, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      `)
+      .run(
+        profile.id,
+        profile.role,
+        profile.display_name,
+        JSON.stringify(profile.required_capabilities || []),
+        JSON.stringify(profile.preferred_capabilities || []),
+        profile.authority_scope ? JSON.stringify(profile.authority_scope) : null,
+        JSON.stringify(profile.permissions || []),
+        profile.output_protocol ?? null,
+        profile.enabled ? 1 : 0,
+        profile.created_at,
+        profile.updated_at
+      );
+  }
+
+  public getRoleProfile(id: string): RoleProfile | null {
+    const row = this.db.prepare('SELECT * FROM role_profiles WHERE id = ?').get(id) as Record<string, unknown> | undefined;
+    return row ? this.mapRoleProfile(row) : null;
+  }
+
+  public getRoleProfilesByRole(role: FabricRole): RoleProfile[] {
+    const rows = this.db.prepare('SELECT * FROM role_profiles WHERE role = ? ORDER BY created_at ASC').all(role) as Record<string, unknown>[];
+    return rows.map((r) => this.mapRoleProfile(r));
+  }
+
+  public getAllRoleProfiles(): RoleProfile[] {
+    const rows = this.db.prepare('SELECT * FROM role_profiles ORDER BY role ASC, display_name ASC').all() as Record<string, unknown>[];
+    return rows.map((r) => this.mapRoleProfile(r));
+  }
+
+  public updateRoleProfile(
+    id: string,
+    updates: Partial<Pick<RoleProfile, 'display_name' | 'required_capabilities' | 'preferred_capabilities' | 'authority_scope' | 'permissions' | 'output_protocol' | 'enabled'>>
+  ): void {
+    const existing = this.getRoleProfile(id);
+    if (!existing) return;
+
+    this.db
+      .prepare(`
+        UPDATE role_profiles
+        SET display_name = ?,
+            required_capabilities_json = ?,
+            preferred_capabilities_json = ?,
+            authority_scope_json = ?,
+            permissions_json = ?,
+            output_protocol = ?,
+            enabled = ?,
+            updated_at = ?
+        WHERE id = ?
+      `)
+      .run(
+        updates.display_name ?? existing.display_name,
+        updates.required_capabilities !== undefined ? JSON.stringify(updates.required_capabilities) : JSON.stringify(existing.required_capabilities),
+        updates.preferred_capabilities !== undefined ? JSON.stringify(updates.preferred_capabilities) : JSON.stringify(existing.preferred_capabilities),
+        updates.authority_scope !== undefined ? (updates.authority_scope ? JSON.stringify(updates.authority_scope) : null) : (existing.authority_scope ? JSON.stringify(existing.authority_scope) : null),
+        updates.permissions !== undefined ? JSON.stringify(updates.permissions) : JSON.stringify(existing.permissions),
+        updates.output_protocol !== undefined ? updates.output_protocol : existing.output_protocol,
+        updates.enabled !== undefined ? (updates.enabled ? 1 : 0) : (existing.enabled ? 1 : 0),
+        new Date().toISOString(),
+        id
+      );
+  }
+
+  private mapRoleProfile(row: Record<string, unknown>): RoleProfile {
+    return {
+      id: String(row.id),
+      role: row.role as FabricRole,
+      display_name: String(row.display_name),
+      required_capabilities: JSON.parse(String(row.required_capabilities_json)) as Capability[],
+      preferred_capabilities: JSON.parse(String(row.preferred_capabilities_json)) as Capability[],
+      authority_scope: row.authority_scope_json ? (JSON.parse(String(row.authority_scope_json)) as Record<string, unknown>) : null,
+      permissions: JSON.parse(String(row.permissions_json)) as string[],
+      output_protocol: row.output_protocol ? String(row.output_protocol) : null,
+      enabled: Boolean(row.enabled),
+      created_at: String(row.created_at),
+      updated_at: String(row.updated_at),
+    };
+  }
+
+  // ==========================================
+  // Agent Profiles (R5A)
+  // ==========================================
+  public createAgentProfile(profile: AgentProfile): void {
+    this.db
+      .prepare(`
+        INSERT INTO agent_profiles (
+          id, role_profile_id, name, prompt_template, config_json, enabled, created_at, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+      `)
+      .run(
+        profile.id,
+        profile.role_profile_id,
+        profile.name,
+        profile.prompt_template ?? null,
+        profile.config ? JSON.stringify(profile.config) : null,
+        profile.enabled ? 1 : 0,
+        profile.created_at,
+        profile.updated_at
+      );
+  }
+
+  public getAgentProfile(id: string): AgentProfile | null {
+    const row = this.db.prepare('SELECT * FROM agent_profiles WHERE id = ?').get(id) as Record<string, unknown> | undefined;
+    return row ? this.mapAgentProfile(row) : null;
+  }
+
+  public getAgentProfilesByRoleProfile(roleProfileId: string): AgentProfile[] {
+    const rows = this.db.prepare('SELECT * FROM agent_profiles WHERE role_profile_id = ? ORDER BY name ASC').all(roleProfileId) as Record<string, unknown>[];
+    return rows.map((r) => this.mapAgentProfile(r));
+  }
+
+  public getAllAgentProfiles(): AgentProfile[] {
+    const rows = this.db.prepare('SELECT * FROM agent_profiles ORDER BY name ASC').all() as Record<string, unknown>[];
+    return rows.map((r) => this.mapAgentProfile(r));
+  }
+
+  public updateAgentProfile(
+    id: string,
+    updates: Partial<Pick<AgentProfile, 'name' | 'prompt_template' | 'config' | 'enabled'>>
+  ): void {
+    const existing = this.getAgentProfile(id);
+    if (!existing) return;
+
+    this.db
+      .prepare(`
+        UPDATE agent_profiles
+        SET name = ?,
+            prompt_template = ?,
+            config_json = ?,
+            enabled = ?,
+            updated_at = ?
+        WHERE id = ?
+      `)
+      .run(
+        updates.name ?? existing.name,
+        updates.prompt_template !== undefined ? updates.prompt_template : existing.prompt_template,
+        updates.config !== undefined ? (updates.config ? JSON.stringify(updates.config) : null) : (existing.config ? JSON.stringify(existing.config) : null),
+        updates.enabled !== undefined ? (updates.enabled ? 1 : 0) : (existing.enabled ? 1 : 0),
+        new Date().toISOString(),
+        id
+      );
+  }
+
+  private mapAgentProfile(row: Record<string, unknown>): AgentProfile {
+    return {
+      id: String(row.id),
+      role_profile_id: String(row.role_profile_id),
+      name: String(row.name),
+      prompt_template: row.prompt_template ? String(row.prompt_template) : null,
+      config: row.config_json ? (JSON.parse(String(row.config_json)) as Record<string, unknown>) : null,
+      enabled: Boolean(row.enabled),
+      created_at: String(row.created_at),
+      updated_at: String(row.updated_at),
+    };
+  }
+
+  // ==========================================
+  // Provider Accounts (R5A)
+  // ==========================================
+  public createProviderAccount(account: ProviderAccount): void {
+    this.db
+      .prepare(`
+        INSERT INTO provider_accounts (
+          id, provider_id, label, auth_mode, credential_ref, profile_ref,
+          enabled, priority, health_status, cooldown_until, concurrency_limit,
+          last_success_at, last_failure_at, last_failure_code, created_at, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      `)
+      .run(
+        account.id,
+        account.provider_id,
+        account.label,
+        account.auth_mode,
+        account.credential_ref ?? null,
+        account.profile_ref ?? null,
+        account.enabled ? 1 : 0,
+        account.priority ?? 0,
+        account.health_status,
+        account.cooldown_until ?? null,
+        account.concurrency_limit ?? 1,
+        account.last_success_at ?? null,
+        account.last_failure_at ?? null,
+        account.last_failure_code ?? null,
+        account.created_at,
+        account.updated_at
+      );
+  }
+
+  public getProviderAccount(id: string): ProviderAccount | null {
+    const row = this.db.prepare('SELECT * FROM provider_accounts WHERE id = ?').get(id) as Record<string, unknown> | undefined;
+    return row ? this.mapProviderAccount(row) : null;
+  }
+
+  public getProviderAccountsByProvider(providerId: string): ProviderAccount[] {
+    const rows = this.db.prepare('SELECT * FROM provider_accounts WHERE provider_id = ? ORDER BY priority DESC, created_at ASC').all(providerId) as Record<string, unknown>[];
+    return rows.map((r) => this.mapProviderAccount(r));
+  }
+
+  public getAllProviderAccounts(): ProviderAccount[] {
+    const rows = this.db.prepare('SELECT * FROM provider_accounts ORDER BY priority DESC, created_at ASC').all() as Record<string, unknown>[];
+    return rows.map((r) => this.mapProviderAccount(r));
+  }
+
+  public updateProviderAccountHealth(
+    id: string,
+    healthStatus: ProviderHealthStatus,
+    cooldownUntil?: string | null,
+    failureCode?: string | null
+  ): void {
+    const now = new Date().toISOString();
+    if (healthStatus === 'AVAILABLE') {
+      this.db
+        .prepare(`
+          UPDATE provider_accounts
+          SET health_status = ?, cooldown_until = NULL, last_success_at = ?, updated_at = ?
+          WHERE id = ?
+        `)
+        .run(healthStatus, now, now, id);
+    } else {
+      this.db
+        .prepare(`
+          UPDATE provider_accounts
+          SET health_status = ?, cooldown_until = ?, last_failure_at = ?, last_failure_code = ?, updated_at = ?
+          WHERE id = ?
+        `)
+        .run(healthStatus, cooldownUntil ?? null, now, failureCode ?? null, now, id);
+    }
+  }
+
+  public updateProviderAccount(
+    id: string,
+    updates: Partial<Pick<ProviderAccount, 'label' | 'auth_mode' | 'credential_ref' | 'profile_ref' | 'enabled' | 'priority' | 'health_status' | 'cooldown_until' | 'concurrency_limit' | 'last_success_at' | 'last_failure_at' | 'last_failure_code'>>
+  ): void {
+    const existing = this.getProviderAccount(id);
+    if (!existing) return;
+
+    this.db
+      .prepare(`
+        UPDATE provider_accounts
+        SET label = ?,
+            auth_mode = ?,
+            credential_ref = ?,
+            profile_ref = ?,
+            enabled = ?,
+            priority = ?,
+            health_status = ?,
+            cooldown_until = ?,
+            concurrency_limit = ?,
+            last_success_at = ?,
+            last_failure_at = ?,
+            last_failure_code = ?,
+            updated_at = ?
+        WHERE id = ?
+      `)
+      .run(
+        updates.label ?? existing.label,
+        updates.auth_mode ?? existing.auth_mode,
+        updates.credential_ref !== undefined ? updates.credential_ref : existing.credential_ref,
+        updates.profile_ref !== undefined ? updates.profile_ref : existing.profile_ref,
+        updates.enabled !== undefined ? (updates.enabled ? 1 : 0) : (existing.enabled ? 1 : 0),
+        updates.priority !== undefined ? updates.priority : existing.priority,
+        updates.health_status ?? existing.health_status,
+        updates.cooldown_until !== undefined ? updates.cooldown_until : existing.cooldown_until,
+        updates.concurrency_limit !== undefined ? updates.concurrency_limit : existing.concurrency_limit,
+        updates.last_success_at !== undefined ? updates.last_success_at : existing.last_success_at,
+        updates.last_failure_at !== undefined ? updates.last_failure_at : existing.last_failure_at,
+        updates.last_failure_code !== undefined ? updates.last_failure_code : existing.last_failure_code,
+        new Date().toISOString(),
+        id
+      );
+  }
+
+  private mapProviderAccount(row: Record<string, unknown>): ProviderAccount {
+    return {
+      id: String(row.id),
+      provider_id: String(row.provider_id),
+      label: String(row.label),
+      auth_mode: row.auth_mode as AccountAuthMode,
+      credential_ref: row.credential_ref ? String(row.credential_ref) : null,
+      profile_ref: row.profile_ref ? String(row.profile_ref) : null,
+      enabled: Boolean(row.enabled),
+      priority: Number(row.priority),
+      health_status: row.health_status as ProviderHealthStatus,
+      cooldown_until: row.cooldown_until ? String(row.cooldown_until) : null,
+      concurrency_limit: Number(row.concurrency_limit),
+      last_success_at: row.last_success_at ? String(row.last_success_at) : null,
+      last_failure_at: row.last_failure_at ? String(row.last_failure_at) : null,
+      last_failure_code: row.last_failure_code ? String(row.last_failure_code) : null,
+      created_at: String(row.created_at),
+      updated_at: String(row.updated_at),
+    };
+  }
+
+  // ==========================================
+  // Worker Slots (R5A)
+  // ==========================================
+  public createWorkerSlot(slot: WorkerSlot): void {
+    this.db
+      .prepare(`
+        INSERT INTO worker_slots (
+          id, provider_account_id, provider_resource_id, slot_index, status,
+          current_assignment_id, current_execution_id, heartbeat_at, created_at, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      `)
+      .run(
+        slot.id,
+        slot.provider_account_id,
+        slot.provider_resource_id ?? null,
+        slot.slot_index,
+        slot.status,
+        slot.current_assignment_id ?? null,
+        slot.current_execution_id ?? null,
+        slot.heartbeat_at ?? null,
+        slot.created_at,
+        slot.updated_at
+      );
+  }
+
+  public getWorkerSlot(id: string): WorkerSlot | null {
+    const row = this.db.prepare('SELECT * FROM worker_slots WHERE id = ?').get(id) as Record<string, unknown> | undefined;
+    return row ? this.mapWorkerSlot(row) : null;
+  }
+
+  public getWorkerSlotsByAccount(accountId: string): WorkerSlot[] {
+    const rows = this.db.prepare('SELECT * FROM worker_slots WHERE provider_account_id = ? ORDER BY slot_index ASC').all(accountId) as Record<string, unknown>[];
+    return rows.map((r) => this.mapWorkerSlot(r));
+  }
+
+  public getAllWorkerSlots(): WorkerSlot[] {
+    const rows = this.db.prepare('SELECT * FROM worker_slots ORDER BY provider_account_id ASC, slot_index ASC').all() as Record<string, unknown>[];
+    return rows.map((r) => this.mapWorkerSlot(r));
+  }
+
+  public updateWorkerSlotStatus(
+    id: string,
+    status: WorkerSlotStatus,
+    currentAssignmentId?: string | null,
+    currentExecutionId?: string | null,
+    heartbeatAt?: string | null
+  ): void {
+    this.db
+      .prepare(`
+        UPDATE worker_slots
+        SET status = ?,
+            current_assignment_id = ?,
+            current_execution_id = ?,
+            heartbeat_at = ?,
+            updated_at = ?
+        WHERE id = ?
+      `)
+      .run(
+        status,
+        currentAssignmentId !== undefined ? currentAssignmentId : null,
+        currentExecutionId !== undefined ? currentExecutionId : null,
+        heartbeatAt !== undefined ? heartbeatAt : new Date().toISOString(),
+        new Date().toISOString(),
+        id
+      );
+  }
+
+  private mapWorkerSlot(row: Record<string, unknown>): WorkerSlot {
+    return {
+      id: String(row.id),
+      provider_account_id: String(row.provider_account_id),
+      provider_resource_id: row.provider_resource_id ? String(row.provider_resource_id) : null,
+      slot_index: Number(row.slot_index),
+      status: row.status as WorkerSlotStatus,
+      current_assignment_id: row.current_assignment_id ? String(row.current_assignment_id) : null,
+      current_execution_id: row.current_execution_id ? String(row.current_execution_id) : null,
+      heartbeat_at: row.heartbeat_at ? String(row.heartbeat_at) : null,
+      created_at: String(row.created_at),
+      updated_at: String(row.updated_at),
+    };
+  }
+
+  // ==========================================
+  // Agent Assignments (R5A)
+  // ==========================================
+  public createAgentAssignment(assignment: AgentAssignment): void {
+    this.db
+      .prepare(`
+        INSERT INTO agent_assignments (
+          id, project_id, task_id, attempt_id, role_profile_id, agent_profile_id,
+          selected_provider_id, selected_account_id, selected_resource_id,
+          selected_worker_slot_id, routing_decision_id, preferred_metadata_json,
+          status, created_at, ended_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      `)
+      .run(
+        assignment.id,
+        assignment.project_id,
+        assignment.task_id,
+        assignment.attempt_id ?? null,
+        assignment.role_profile_id,
+        assignment.agent_profile_id ?? null,
+        assignment.selected_provider_id,
+        assignment.selected_account_id,
+        assignment.selected_resource_id,
+        assignment.selected_worker_slot_id ?? null,
+        assignment.routing_decision_id ?? null,
+        assignment.preferred_metadata ? JSON.stringify(assignment.preferred_metadata) : null,
+        assignment.status,
+        assignment.created_at,
+        assignment.ended_at ?? null
+      );
+  }
+
+  public getAgentAssignment(id: string): AgentAssignment | null {
+    const row = this.db.prepare('SELECT * FROM agent_assignments WHERE id = ?').get(id) as Record<string, unknown> | undefined;
+    return row ? this.mapAgentAssignment(row) : null;
+  }
+
+  public getAgentAssignmentsByTask(taskId: string): AgentAssignment[] {
+    const rows = this.db.prepare('SELECT * FROM agent_assignments WHERE task_id = ? ORDER BY created_at DESC').all(taskId) as Record<string, unknown>[];
+    return rows.map((r) => this.mapAgentAssignment(r));
+  }
+
+  public getAgentAssignmentsByProject(projectId: string): AgentAssignment[] {
+    const rows = this.db.prepare('SELECT * FROM agent_assignments WHERE project_id = ? ORDER BY created_at DESC').all(projectId) as Record<string, unknown>[];
+    return rows.map((r) => this.mapAgentAssignment(r));
+  }
+
+  public getAllAgentAssignments(): AgentAssignment[] {
+    const rows = this.db.prepare('SELECT * FROM agent_assignments ORDER BY created_at DESC').all() as Record<string, unknown>[];
+    return rows.map((r) => this.mapAgentAssignment(r));
+  }
+
+  public updateAgentAssignmentStatus(id: string, status: AgentAssignmentStatus, endedAt?: string | null): void {
+    this.db
+      .prepare(`
+        UPDATE agent_assignments
+        SET status = ?, ended_at = ?
+        WHERE id = ?
+      `)
+      .run(status, endedAt !== undefined ? endedAt : (status === 'COMPLETED' || status === 'FAILED' || status === 'CANCELLED' ? new Date().toISOString() : null), id);
+  }
+
+  private mapAgentAssignment(row: Record<string, unknown>): AgentAssignment {
+    return {
+      id: String(row.id),
+      project_id: String(row.project_id),
+      task_id: String(row.task_id),
+      attempt_id: row.attempt_id ? String(row.attempt_id) : null,
+      role_profile_id: String(row.role_profile_id),
+      agent_profile_id: row.agent_profile_id ? String(row.agent_profile_id) : null,
+      selected_provider_id: String(row.selected_provider_id),
+      selected_account_id: String(row.selected_account_id),
+      selected_resource_id: String(row.selected_resource_id),
+      selected_worker_slot_id: row.selected_worker_slot_id ? String(row.selected_worker_slot_id) : null,
+      routing_decision_id: row.routing_decision_id ? String(row.routing_decision_id) : null,
+      preferred_metadata: row.preferred_metadata_json ? (JSON.parse(String(row.preferred_metadata_json)) as Record<string, unknown>) : null,
+      status: row.status as AgentAssignmentStatus,
+      created_at: String(row.created_at),
+      ended_at: row.ended_at ? String(row.ended_at) : null,
+    };
+  }
+
+  // ==========================================
+  // Account Leases (R5A)
+  // ==========================================
+  public createAccountLease(lease: AccountLease): void {
+    this.db
+      .prepare(`
+        INSERT INTO account_leases (
+          id, assignment_id, provider_account_id, worker_slot_id,
+          lease_token, acquired_at, expires_at, heartbeat_at, released_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+      `)
+      .run(
+        lease.id,
+        lease.assignment_id,
+        lease.provider_account_id,
+        lease.worker_slot_id,
+        lease.lease_token,
+        lease.acquired_at,
+        lease.expires_at,
+        lease.heartbeat_at,
+        lease.released_at ?? null
+      );
+  }
+
+  public getAccountLease(id: string): AccountLease | null {
+    const row = this.db.prepare('SELECT * FROM account_leases WHERE id = ?').get(id) as Record<string, unknown> | undefined;
+    return row ? this.mapAccountLease(row) : null;
+  }
+
+  public getActiveLeaseForSlot(slotId: string): AccountLease | null {
+    const row = this.db.prepare('SELECT * FROM account_leases WHERE worker_slot_id = ? AND released_at IS NULL').get(slotId) as Record<string, unknown> | undefined;
+    return row ? this.mapAccountLease(row) : null;
+  }
+
+  public getAccountLeasesByAssignment(assignmentId: string): AccountLease[] {
+    const rows = this.db.prepare('SELECT * FROM account_leases WHERE assignment_id = ? ORDER BY acquired_at DESC').all(assignmentId) as Record<string, unknown>[];
+    return rows.map((r) => this.mapAccountLease(r));
+  }
+
+  public releaseAccountLease(id: string, releasedAt?: string): void {
+    this.db
+      .prepare('UPDATE account_leases SET released_at = ? WHERE id = ?')
+      .run(releasedAt ?? new Date().toISOString(), id);
+  }
+
+  private mapAccountLease(row: Record<string, unknown>): AccountLease {
+    return {
+      id: String(row.id),
+      assignment_id: String(row.assignment_id),
+      provider_account_id: String(row.provider_account_id),
+      worker_slot_id: String(row.worker_slot_id),
+      lease_token: String(row.lease_token),
+      acquired_at: String(row.acquired_at),
+      expires_at: String(row.expires_at),
+      heartbeat_at: String(row.heartbeat_at),
+      released_at: row.released_at ? String(row.released_at) : null,
+    };
+  }
+
+  // ==========================================
+  // Route Policies (R5A)
+  // ==========================================
+  public createRoutePolicy(policy: RoutePolicy): void {
+    this.db
+      .prepare(`
+        INSERT INTO route_policies (
+          id, name, required_capabilities_json, preferred_capabilities_json,
+          provider_account_policy_json, allow_manual_bridge, failover_policy_json,
+          risk_policy_json, enabled, created_at, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      `)
+      .run(
+        policy.id,
+        policy.name,
+        JSON.stringify(policy.required_capabilities || []),
+        JSON.stringify(policy.preferred_capabilities || []),
+        policy.provider_account_policy ? JSON.stringify(policy.provider_account_policy) : null,
+        policy.allow_manual_bridge ? 1 : 0,
+        policy.failover_policy ? JSON.stringify(policy.failover_policy) : null,
+        policy.risk_policy ? JSON.stringify(policy.risk_policy) : null,
+        policy.enabled ? 1 : 0,
+        policy.created_at,
+        policy.updated_at
+      );
+  }
+
+  public getRoutePolicy(id: string): RoutePolicy | null {
+    const row = this.db.prepare('SELECT * FROM route_policies WHERE id = ?').get(id) as Record<string, unknown> | undefined;
+    return row ? this.mapRoutePolicy(row) : null;
+  }
+
+  public getAllRoutePolicies(): RoutePolicy[] {
+    const rows = this.db.prepare('SELECT * FROM route_policies ORDER BY name ASC').all() as Record<string, unknown>[];
+    return rows.map((r) => this.mapRoutePolicy(r));
+  }
+
+  public updateRoutePolicy(
+    id: string,
+    updates: Partial<Pick<RoutePolicy, 'name' | 'required_capabilities' | 'preferred_capabilities' | 'provider_account_policy' | 'allow_manual_bridge' | 'failover_policy' | 'risk_policy' | 'enabled'>>
+  ): void {
+    const existing = this.getRoutePolicy(id);
+    if (!existing) return;
+
+    this.db
+      .prepare(`
+        UPDATE route_policies
+        SET name = ?,
+            required_capabilities_json = ?,
+            preferred_capabilities_json = ?,
+            provider_account_policy_json = ?,
+            allow_manual_bridge = ?,
+            failover_policy_json = ?,
+            risk_policy_json = ?,
+            enabled = ?,
+            updated_at = ?
+        WHERE id = ?
+      `)
+      .run(
+        updates.name ?? existing.name,
+        updates.required_capabilities !== undefined ? JSON.stringify(updates.required_capabilities) : JSON.stringify(existing.required_capabilities),
+        updates.preferred_capabilities !== undefined ? JSON.stringify(updates.preferred_capabilities) : JSON.stringify(existing.preferred_capabilities),
+        updates.provider_account_policy !== undefined ? (updates.provider_account_policy ? JSON.stringify(updates.provider_account_policy) : null) : (existing.provider_account_policy ? JSON.stringify(existing.provider_account_policy) : null),
+        updates.allow_manual_bridge !== undefined ? (updates.allow_manual_bridge ? 1 : 0) : (existing.allow_manual_bridge ? 1 : 0),
+        updates.failover_policy !== undefined ? (updates.failover_policy ? JSON.stringify(updates.failover_policy) : null) : (existing.failover_policy ? JSON.stringify(existing.failover_policy) : null),
+        updates.risk_policy !== undefined ? (updates.risk_policy ? JSON.stringify(updates.risk_policy) : null) : (existing.risk_policy ? JSON.stringify(existing.risk_policy) : null),
+        updates.enabled !== undefined ? (updates.enabled ? 1 : 0) : (existing.enabled ? 1 : 0),
+        new Date().toISOString(),
+        id
+      );
+  }
+
+  private mapRoutePolicy(row: Record<string, unknown>): RoutePolicy {
+    return {
+      id: String(row.id),
+      name: String(row.name),
+      required_capabilities: JSON.parse(String(row.required_capabilities_json)) as Capability[],
+      preferred_capabilities: JSON.parse(String(row.preferred_capabilities_json)) as Capability[],
+      provider_account_policy: row.provider_account_policy_json ? (JSON.parse(String(row.provider_account_policy_json)) as Record<string, unknown>) : null,
+      allow_manual_bridge: Boolean(row.allow_manual_bridge),
+      failover_policy: row.failover_policy_json ? (JSON.parse(String(row.failover_policy_json)) as Record<string, unknown>) : null,
+      risk_policy: row.risk_policy_json ? (JSON.parse(String(row.risk_policy_json)) as Record<string, unknown>) : null,
+      enabled: Boolean(row.enabled),
+      created_at: String(row.created_at),
+      updated_at: String(row.updated_at),
+    };
+  }
+
+  // ==========================================
+  // Separation Policies (R5A)
+  // ==========================================
+  public createSeparationPolicy(policy: SeparationPolicy): void {
+    this.db
+      .prepare(`
+        INSERT INTO separation_policies (
+          id, name, same_execution_forbidden, same_session_forbidden,
+          same_account_policy, same_provider_policy, same_model_policy,
+          risk_threshold, applicability_json, enabled, created_at, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      `)
+      .run(
+        policy.id,
+        policy.name,
+        policy.same_execution_forbidden ? 1 : 0,
+        policy.same_session_forbidden ? 1 : 0,
+        policy.same_account_policy,
+        policy.same_provider_policy,
+        policy.same_model_policy,
+        policy.risk_threshold,
+        policy.applicability ? JSON.stringify(policy.applicability) : null,
+        policy.enabled ? 1 : 0,
+        policy.created_at,
+        policy.updated_at
+      );
+  }
+
+  public getSeparationPolicy(id: string): SeparationPolicy | null {
+    const row = this.db.prepare('SELECT * FROM separation_policies WHERE id = ?').get(id) as Record<string, unknown> | undefined;
+    return row ? this.mapSeparationPolicy(row) : null;
+  }
+
+  public getAllSeparationPolicies(): SeparationPolicy[] {
+    const rows = this.db.prepare('SELECT * FROM separation_policies ORDER BY name ASC').all() as Record<string, unknown>[];
+    return rows.map((r) => this.mapSeparationPolicy(r));
+  }
+
+  public updateSeparationPolicy(
+    id: string,
+    updates: Partial<Pick<SeparationPolicy, 'name' | 'same_execution_forbidden' | 'same_session_forbidden' | 'same_account_policy' | 'same_provider_policy' | 'same_model_policy' | 'risk_threshold' | 'applicability' | 'enabled'>>
+  ): void {
+    const existing = this.getSeparationPolicy(id);
+    if (!existing) return;
+
+    this.db
+      .prepare(`
+        UPDATE separation_policies
+        SET name = ?,
+            same_execution_forbidden = ?,
+            same_session_forbidden = ?,
+            same_account_policy = ?,
+            same_provider_policy = ?,
+            same_model_policy = ?,
+            risk_threshold = ?,
+            applicability_json = ?,
+            enabled = ?,
+            updated_at = ?
+        WHERE id = ?
+      `)
+      .run(
+        updates.name ?? existing.name,
+        updates.same_execution_forbidden !== undefined ? (updates.same_execution_forbidden ? 1 : 0) : (existing.same_execution_forbidden ? 1 : 0),
+        updates.same_session_forbidden !== undefined ? (updates.same_session_forbidden ? 1 : 0) : (existing.same_session_forbidden ? 1 : 0),
+        updates.same_account_policy ?? existing.same_account_policy,
+        updates.same_provider_policy ?? existing.same_provider_policy,
+        updates.same_model_policy ?? existing.same_model_policy,
+        updates.risk_threshold ?? existing.risk_threshold,
+        updates.applicability !== undefined ? (updates.applicability ? JSON.stringify(updates.applicability) : null) : (existing.applicability ? JSON.stringify(existing.applicability) : null),
+        updates.enabled !== undefined ? (updates.enabled ? 1 : 0) : (existing.enabled ? 1 : 0),
+        new Date().toISOString(),
+        id
+      );
+  }
+
+  private mapSeparationPolicy(row: Record<string, unknown>): SeparationPolicy {
+    return {
+      id: String(row.id),
+      name: String(row.name),
+      same_execution_forbidden: Boolean(row.same_execution_forbidden),
+      same_session_forbidden: Boolean(row.same_session_forbidden),
+      same_account_policy: row.same_account_policy as SeparationAffinity,
+      same_provider_policy: row.same_provider_policy as SeparationAffinity,
+      same_model_policy: row.same_model_policy as SeparationAffinity,
+      risk_threshold: row.risk_threshold as RiskLevel,
+      applicability: row.applicability_json ? (JSON.parse(String(row.applicability_json)) as Record<string, unknown>) : null,
+      enabled: Boolean(row.enabled),
+      created_at: String(row.created_at),
+      updated_at: String(row.updated_at),
+    };
   }
 }
