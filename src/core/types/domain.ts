@@ -287,6 +287,7 @@ export interface Provider {
 export interface ProviderResource {
   id: string;
   provider_id: string;
+  provider_account_id?: string | null;
   model_name: string;
   health_status: ProviderHealthStatus;
   capabilities: Capability[];
@@ -527,4 +528,170 @@ export interface UpdateStateSummary {
   isCodeSigned: boolean;
   canInstall: boolean;
   lastCheckedAt: string | null;
+}
+
+// ==========================================
+// 3. R5A Role-Agnostic Agent Fabric Entities
+// ==========================================
+
+export const FabricRoleEnum = z.enum([
+  'MANAGER',
+  'PLANNER',
+  'CODER',
+  'REVIEWER',
+  'SECURITY_REVIEWER',
+  'RESEARCHER',
+  'RELEASE_MANAGER',
+  'MONITOR',
+  'TOOL',
+]);
+export type FabricRole = z.infer<typeof FabricRoleEnum>;
+
+export const AccountAuthModeEnum = z.enum([
+  'NATIVE_PROFILE',
+  'API_CREDENTIAL',
+]);
+export type AccountAuthMode = z.infer<typeof AccountAuthModeEnum>;
+
+export const WorkerSlotStatusEnum = z.enum([
+  'IDLE',
+  'LEASED',
+  'RUNNING',
+  'COOLDOWN',
+  'OFFLINE',
+  'DISABLED',
+]);
+export type WorkerSlotStatus = z.infer<typeof WorkerSlotStatusEnum>;
+
+export const AgentAssignmentStatusEnum = z.enum([
+  'ASSIGNED',
+  'RUNNING',
+  'COMPLETED',
+  'FAILED',
+  'CANCELLED',
+  'HANDED_OFF',
+]);
+export type AgentAssignmentStatus = z.infer<typeof AgentAssignmentStatusEnum>;
+
+export const SeparationAffinityEnum = z.enum([
+  'ALLOW',
+  'PREFER_DIFFERENT',
+  'REQUIRE_DIFFERENT',
+]);
+export type SeparationAffinity = z.infer<typeof SeparationAffinityEnum>;
+
+export interface RoleProfile {
+  id: string;
+  role: FabricRole;
+  display_name: string;
+  required_capabilities: Capability[];
+  preferred_capabilities: Capability[];
+  authority_scope: Record<string, unknown> | null;
+  permissions: string[];
+  output_protocol: string | null;
+  enabled: boolean;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface AgentProfile {
+  id: string;
+  role_profile_id: string;
+  name: string;
+  prompt_template: string | null;
+  config: Record<string, unknown> | null;
+  enabled: boolean;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface ProviderAccount {
+  id: string;
+  provider_id: string;
+  label: string;
+  auth_mode: AccountAuthMode;
+  credential_ref: string | null;
+  profile_ref: string | null;
+  enabled: boolean;
+  priority: number;
+  health_status: ProviderHealthStatus;
+  cooldown_until: string | null;
+  concurrency_limit: number;
+  last_success_at: string | null;
+  last_failure_at: string | null;
+  last_failure_code: string | null;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface WorkerSlot {
+  id: string;
+  provider_account_id: string;
+  provider_resource_id: string | null;
+  slot_index: number;
+  status: WorkerSlotStatus;
+  current_assignment_id: string | null;
+  current_execution_id: string | null;
+  heartbeat_at: string | null;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface AgentAssignment {
+  id: string;
+  project_id: string;
+  task_id: string;
+  attempt_id: string | null;
+  role_profile_id: string;
+  agent_profile_id: string | null;
+  selected_provider_id: string;
+  selected_account_id: string;
+  selected_resource_id: string;
+  selected_worker_slot_id: string | null;
+  routing_decision_id: string | null;
+  preferred_metadata: Record<string, unknown> | null;
+  status: AgentAssignmentStatus;
+  created_at: string;
+  ended_at: string | null;
+}
+
+export interface AccountLease {
+  id: string;
+  assignment_id: string;
+  provider_account_id: string;
+  worker_slot_id: string;
+  lease_token: string;
+  acquired_at: string;
+  expires_at: string;
+  heartbeat_at: string;
+  released_at: string | null;
+}
+
+export interface RoutePolicy {
+  id: string;
+  name: string;
+  required_capabilities: Capability[];
+  preferred_capabilities: Capability[];
+  provider_account_policy: Record<string, unknown> | null;
+  allow_manual_bridge: boolean;
+  failover_policy: Record<string, unknown> | null;
+  risk_policy: Record<string, unknown> | null;
+  enabled: boolean;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface SeparationPolicy {
+  id: string;
+  name: string;
+  same_execution_forbidden: boolean;
+  same_session_forbidden: boolean;
+  same_account_policy: SeparationAffinity;
+  same_provider_policy: SeparationAffinity;
+  same_model_policy: SeparationAffinity;
+  risk_threshold: RiskLevel;
+  applicability: Record<string, unknown> | null;
+  enabled: boolean;
+  created_at: string;
+  updated_at: string;
 }

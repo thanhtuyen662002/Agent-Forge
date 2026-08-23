@@ -634,7 +634,7 @@ describe('PR #10 — AgentForge Demo & Release Candidate Gate Contract Tests', (
       }
 
       // Migration count
-      if (options.migrationCount !== 7) {
+      if (options.migrationCount !== 8) {
         failures.push('INVALID_MIGRATION_COUNT');
       }
 
@@ -669,7 +669,7 @@ describe('PR #10 — AgentForge Demo & Release Candidate Gate Contract Tests', (
     it('RC Rule 1: Wrong provider (e.g. generic/s3) fails verification', () => {
       const res = evaluateRcConfig({
         providerText: 'provider: generic\nurl: https://example.com',
-        migrationCount: 7,
+        migrationCount: 8,
         installerExists: true,
         unpackedExists: true,
         appUpdateExists: true,
@@ -681,7 +681,7 @@ describe('PR #10 — AgentForge Demo & Release Candidate Gate Contract Tests', (
     it('RC Rule 2: Embedded credentials in builder config fails verification', () => {
       const res = evaluateRcConfig({
         providerText: 'provider: github\nowner: thanhtuyen662002\nrepo: Agent-Forge\ntoken: ghp_12345secret',
-        migrationCount: 7,
+        migrationCount: 8,
         installerExists: true,
         unpackedExists: true,
         appUpdateExists: true,
@@ -693,7 +693,7 @@ describe('PR #10 — AgentForge Demo & Release Candidate Gate Contract Tests', (
     it('RC Rule 3: Missing installer file fails verification', () => {
       const res = evaluateRcConfig({
         providerText: 'provider: github\nowner: thanhtuyen662002\nrepo: Agent-Forge',
-        migrationCount: 7,
+        migrationCount: 8,
         installerExists: false,
         unpackedExists: true,
         appUpdateExists: true,
@@ -702,10 +702,10 @@ describe('PR #10 — AgentForge Demo & Release Candidate Gate Contract Tests', (
       expect(res.failures).toContain('MISSING_INSTALLER');
     });
 
-    it('RC Rule 4: Incorrect migration count (!= 7) fails verification', () => {
+    it('RC Rule 4: Incorrect migration count (!= 8) fails verification', () => {
       const res = evaluateRcConfig({
         providerText: 'provider: github\nowner: thanhtuyen662002\nrepo: Agent-Forge',
-        migrationCount: 6,
+        migrationCount: 7,
         installerExists: true,
         unpackedExists: true,
         appUpdateExists: true,
@@ -717,7 +717,7 @@ describe('PR #10 — AgentForge Demo & Release Candidate Gate Contract Tests', (
     it('RC Rule 5: Missing packaged app-update.yml fails verification', () => {
       const res = evaluateRcConfig({
         providerText: 'provider: github\nowner: thanhtuyen662002\nrepo: Agent-Forge',
-        migrationCount: 7,
+        migrationCount: 8,
         installerExists: true,
         unpackedExists: true,
         appUpdateExists: false,
