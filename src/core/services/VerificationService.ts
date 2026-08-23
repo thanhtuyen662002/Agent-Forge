@@ -7,6 +7,71 @@ import { TestRun } from '../types/domain';
 
 export { shouldRunCoderVerification } from '../state/taskStateMachine';
 
+export interface ParsedTestMetrics {
+  passedCount: number;
+  failedCount: number;
+  skippedCount: number;
+}
+
+export function parseTestMetrics(stdout: string, exitCode: number): ParsedTestMetrics {
+  if (!stdout || typeof stdout !== 'string') {
+    return exitCode === 0
+      ? { passedCount: 1, failedCount: 0, skippedCount: 0 }
+      : { passedCount: 0, failedCount: 1, skippedCount: 0 };
+  }
+
+  // Priority 1: Node.js node:test TAP / spec summary forms:
+  // e.g. "# pass 9", "ℹ pass 9", "# fail 0", "ℹ fail 0", "# skipped 2", "ℹ skipped 2"
+  // Must be bounded to start of line to avoid random test prose.
+  const tapPassMatch = stdout.match(/(?:^|\r?\n)\s*(?:#|ℹ)?\s*pass\s+(\d+)\b/i);
+  const tapFailMatch = stdout.match(/(?:^|\r?\n)\s*(?:#|ℹ)?\s*fail\s+(\d+)\b/i);
+  const tapSkipMatch = stdout.match(/(?:^|\r?\n)\s*(?:#|ℹ)?\s*(?:skipped|skip)\s+(\d+)\b/i);
+
+  // Priority 2: Count-first formats:
+  // e.g. "9 passed", "9 pass", "Tests  440 passed (440)", "2 failed", "1 skipped"
+  const countFirstPassMatch = stdout.match(/(?:^|\r?\n|\s)(\d+)\s+pass(?:ed|es)?\b/i);
+  const countFirstFailMatch = stdout.match(/(?:^|\r?\n|\s)(\d+)\s+fail(?:ed|ing|s)?\b/i);
+  const countFirstSkipMatch = stdout.match(/(?:^|\r?\n|\s)(\d+)\s+skip(?:ped|s)?\b/i);
+
+  const hasTapMetric = tapPassMatch !== null || tapFailMatch !== null || tapSkipMatch !== null;
+  const hasCountFirstMetric =
+    countFirstPassMatch !== null || countFirstFailMatch !== null || countFirstSkipMatch !== null;
+
+  if (!hasTapMetric && !hasCountFirstMetric) {
+    return exitCode === 0
+      ? { passedCount: 1, failedCount: 0, skippedCount: 0 }
+      : { passedCount: 0, failedCount: 1, skippedCount: 0 };
+  }
+
+  let passedCount = 0;
+  let failedCount = 0;
+  let skippedCount = 0;
+
+  if (tapPassMatch) {
+    passedCount = parseInt(tapPassMatch[1], 10);
+  } else if (countFirstPassMatch) {
+    passedCount = parseInt(countFirstPassMatch[1], 10);
+  }
+
+  if (tapFailMatch) {
+    failedCount = parseInt(tapFailMatch[1], 10);
+  } else if (countFirstFailMatch) {
+    failedCount = parseInt(countFirstFailMatch[1], 10);
+  }
+
+  if (tapSkipMatch) {
+    skippedCount = parseInt(tapSkipMatch[1], 10);
+  } else if (countFirstSkipMatch) {
+    skippedCount = parseInt(countFirstSkipMatch[1], 10);
+  }
+
+  return {
+    passedCount,
+    failedCount,
+    skippedCount,
+  };
+}
+
 export class VerificationService {
   constructor(
     private repo: Repository,
@@ -133,26 +198,15 @@ export class VerificationService {
     );
     this.repo.createEvidence(evidence);
 
-    let passedCount = 0;
-    let failedCount = 0;
-    let skippedCount = 0;
-
-    if (result.exitCode === 0) {
-      const passMatch = stdout.match(/(\d+)\s+pass/i);
-      passedCount = passMatch ? parseInt(passMatch[1], 10) : 1;
-    } else {
-      failedCount = 1;
-      const failMatch = stdout.match(/(\d+)\s+fail/i);
-      if (failMatch) failedCount = parseInt(failMatch[1], 10);
-    }
+    const metrics = parseTestMetrics(stdout, result.exitCode);
 
     const testRun: TestRun = {
       id: crypto.randomUUID(),
       task_id: taskId,
       command: fullCommandStr,
-      passed_count: passedCount,
-      failed_count: failedCount,
-      skipped_count: skippedCount,
+      passed_count: metrics.passedCount,
+      failed_count: metrics.failedCount,
+      skipped_count: metrics.skippedCount,
       duration_ms: result.durationMs,
       exit_code: result.exitCode,
       evidence_id: evidenceId,
