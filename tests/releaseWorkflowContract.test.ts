@@ -1,6 +1,7 @@
 import { describe, it, expect } from 'vitest';
 import * as fs from 'fs';
 import * as path from 'path';
+import { execSync } from 'child_process';
 
 describe('PR #19 — Production Release Pipeline Hardening Contract Tests', () => {
   const projectRoot = path.resolve(__dirname, '..');
@@ -180,12 +181,47 @@ describe('PR #19 — Production Release Pipeline Hardening Contract Tests', () =
     expect(workflow).toMatch(/Write-Error ["'].*COLLISION GUARD LOOKUP FAILURE FAIL-CLOSED.*\$(\(\$LASTEXITCODE\)|\{LASTEXITCODE\}).*\$releasesJson["']/);
   });
 
-  it('12. release collision guard handles empty and multi-page JSON collections with page flattening', () => {
+  it('12. release collision guard handles empty and multi-page JSON collections with page flattening and strict record shape validation', () => {
     const workflow = fs.readFileSync(releaseWorkflowPath, 'utf8');
 
     // Asserts page flattening loop and validation
     expect(workflow).toMatch(/foreach\s*\(\$page in \$pages\)/);
     expect(workflow).toMatch(/foreach\s*\(\$item in \$page\)/);
     expect(workflow).toMatch(/\$releases\.Add\(\$item\)/);
+
+    // Fail-closed on null page (no continue)
+    expect(workflow).not.toMatch(/if\s*\(\$null\s*-eq\s*\$page\)\s*\{\s*continue\s*\}/);
+    expect(workflow).toMatch(/COLLISION GUARD SHAPE FAILURE FAIL-CLOSED: Page \$pageIndex is null\./);
+
+    // Fail-closed on null record and non-object record
+    expect(workflow).toMatch(/COLLISION GUARD SHAPE FAILURE FAIL-CLOSED: Page \$pageIndex record \$itemIndex is null\./);
+    expect(workflow).toMatch(/COLLISION GUARD SHAPE FAILURE FAIL-CLOSED: Page \$pageIndex record \$itemIndex is not a valid object\./);
+
+    // Fail-closed on missing or empty tag_name
+    expect(workflow).toMatch(/COLLISION GUARD SHAPE FAILURE FAIL-CLOSED: Page \$pageIndex record \$itemIndex is missing required property 'tag_name'\./);
+    expect(workflow).toMatch(/COLLISION GUARD SHAPE FAILURE FAIL-CLOSED: Page \$pageIndex record \$itemIndex 'tag_name' must be a non-empty string\./);
+
+    // Ordering requirement: tag_name validation must occur strictly before $releases.Add($item)
+    const posTagNameCheck = workflow.indexOf("tag_name' must be a non-empty string");
+    const posAddRelease = workflow.indexOf("$releases.Add($item)");
+    expect(posTagNameCheck).toBeGreaterThan(0);
+    expect(posAddRelease).toBeGreaterThan(posTagNameCheck);
+  });
+
+  it('13. semantic release collision fixture test suite executes and passes all 15 cases', () => {
+    const fixtureScriptPath = path.join(projectRoot, 'tests/fixtures/test-release-collision-fixtures.ps1');
+    expect(fs.existsSync(fixtureScriptPath)).toBe(true);
+
+    const psExe = process.platform === 'win32' ? 'powershell' : 'pwsh';
+    const output = execSync(`${psExe} -File "${fixtureScriptPath}"`, { encoding: 'utf8' });
+    expect(output).toMatch(/COLLISION_FIXTURE_TEST_COUNT:\s*15/);
+    expect(output).toMatch(/COLLISION_FIXTURE_TEST_PASS_COUNT:\s*15/);
+    expect(output).toMatch(/PASS:\s*CASE A - ZERO RELEASES/);
+    expect(output).toMatch(/PASS:\s*CASE J - NULL PAGE/);
+    expect(output).toMatch(/PASS:\s*CASE K - NULL RELEASE RECORD/);
+    expect(output).toMatch(/PASS:\s*CASE L - SCALAR RELEASE RECORD/);
+    expect(output).toMatch(/PASS:\s*CASE M - RECORD MISSING TAG_NAME/);
+    expect(output).toMatch(/PASS:\s*CASE N - EMPTY TAG_NAME/);
+    expect(output).toMatch(/PASS:\s*CASE O - NULL NAME IS VALID/);
   });
 });

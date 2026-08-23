@@ -143,16 +143,61 @@ jobs:
           foreach ($page in $pages) {
             $pageIndex++
             if ($null -eq $page) {
-              continue
+              Write-Error "COLLISION GUARD SHAPE FAILURE FAIL-CLOSED: Page $pageIndex is null."
+              exit 1
             }
             if (-not ($page -is [System.Array] -or $page -is [System.Collections.IList])) {
               Write-Error "COLLISION GUARD SHAPE FAILURE FAIL-CLOSED: Page $pageIndex is not a valid array."
               exit 1
             }
+            $itemIndex = 0
             foreach ($item in $page) {
-              if ($null -ne $item) {
-                $releases.Add($item)
+              $itemIndex++
+              if ($null -eq $item) {
+                Write-Error "COLLISION GUARD SHAPE FAILURE FAIL-CLOSED: Page $pageIndex record $itemIndex is null."
+                exit 1
               }
+              if (-not ($item -is [System.Management.Automation.PSCustomObject] -or $item -is [System.Collections.IDictionary])) {
+                Write-Error "COLLISION GUARD SHAPE FAILURE FAIL-CLOSED: Page $pageIndex record $itemIndex is not a valid object."
+                exit 1
+              }
+
+              $tagName = $null
+              if ($item -is [System.Management.Automation.PSCustomObject]) {
+                if (-not ($item.PSObject.Properties.Match('tag_name').Count -gt 0)) {
+                  Write-Error "COLLISION GUARD SHAPE FAILURE FAIL-CLOSED: Page $pageIndex record $itemIndex is missing required property 'tag_name'."
+                  exit 1
+                }
+                $tagName = $item.tag_name
+              } else {
+                if (-not $item.Contains('tag_name')) {
+                  Write-Error "COLLISION GUARD SHAPE FAILURE FAIL-CLOSED: Page $pageIndex record $itemIndex is missing required property 'tag_name'."
+                  exit 1
+                }
+                $tagName = $item['tag_name']
+              }
+
+              if ($null -eq $tagName -or (-not ($tagName -is [string])) -or [string]::IsNullOrWhiteSpace($tagName)) {
+                Write-Error "COLLISION GUARD SHAPE FAILURE FAIL-CLOSED: Page $pageIndex record $itemIndex 'tag_name' must be a non-empty string."
+                exit 1
+              }
+
+              $nameVal = $null
+              if ($item -is [System.Management.Automation.PSCustomObject]) {
+                if ($item.PSObject.Properties.Match('name').Count -gt 0) {
+                  $nameVal = $item.name
+                }
+              } else {
+                if ($item.Contains('name')) {
+                  $nameVal = $item['name']
+                }
+              }
+              if ($null -ne $nameVal -and (-not ($nameVal -is [string]))) {
+                Write-Error "COLLISION GUARD SHAPE FAILURE FAIL-CLOSED: Page $pageIndex record $itemIndex 'name' property must be null or string."
+                exit 1
+              }
+
+              $releases.Add($item)
             }
           }
 
