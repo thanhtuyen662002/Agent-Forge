@@ -1168,12 +1168,12 @@ describe('R5A — Role-Agnostic Agent Fabric Domain Foundation', () => {
   });
 
   // 18. Legacy migration tests pass
-  it('18. Full migration chain from v1 through v8 executes idempotently and PRAGMA foreign_key_check is zero', () => {
+  it('18. Full migration chain executes idempotently and PRAGMA foreign_key_check is zero', () => {
     // MigrationRunner was already run in beforeEach, run again to test idempotency
     MigrationRunner.run(db);
 
     const applied = db.prepare('SELECT COUNT(*) as count FROM schema_migrations').get() as { count: number };
-    expect(applied.count).toBe(8);
+    expect(applied.count).toBe(MIGRATIONS.length);
 
     const fkViolations = db.prepare('PRAGMA foreign_key_check').all();
     expect(fkViolations).toHaveLength(0);

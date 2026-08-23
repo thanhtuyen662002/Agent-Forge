@@ -18,6 +18,7 @@ export interface CreateAuthorizationParams {
   attemptId?: string | null;
   routingDecisionId: string;
   contextFiles?: string[];
+  contextManifestId?: string | null;
 }
 
 // =========================================================================
@@ -439,14 +440,45 @@ export class ExecutionAuthorizationService {
     }
     const repositoryHeadSha = gitHeadResult.sha;
 
-    // 7. Context File Manifest Validation & Canonicalization
+    // 7. Context File Manifest Validation & Canonicalization (with R5B Durable ContextManifest support)
     const sanitizeResult = sanitizeContextFiles(params.contextFiles, project.repository_path);
     if (sanitizeResult.error) {
       this.recordRejectionEvent(params, sanitizeResult.error);
       throw new Error(`EXECUTION_AUTHORIZATION_FAILED: ${sanitizeResult.error}`);
     }
     const canonicalContextFiles = sanitizeResult.validFiles;
-    const contextManifestHash = computeContextManifestHash(canonicalContextFiles);
+
+    let contextManifestHash = computeContextManifestHash(canonicalContextFiles);
+
+    if (params.contextManifestId) {
+      const durableManifest = this.repo.getContextManifest(params.contextManifestId);
+      if (!durableManifest) {
+        const reason = `EXECUTION_AUTHORIZATION_MANIFEST_MISSING: Durable ContextManifest "${params.contextManifestId}" not found.`;
+        this.recordRejectionEvent(params, reason);
+        throw new Error(`EXECUTION_AUTHORIZATION_FAILED: ${reason}`);
+      }
+
+      const snapshot = this.repo.getContextSnapshot(durableManifest.snapshot_id);
+      if (!snapshot) {
+        const reason = `EXECUTION_AUTHORIZATION_SNAPSHOT_MISSING: ContextSnapshot "${durableManifest.snapshot_id}" for manifest "${params.contextManifestId}" not found.`;
+        this.recordRejectionEvent(params, reason);
+        throw new Error(`EXECUTION_AUTHORIZATION_FAILED: ${reason}`);
+      }
+
+      if (snapshot.project_id !== params.projectId || snapshot.task_id !== params.taskId) {
+        const reason = `EXECUTION_AUTHORIZATION_MANIFEST_MISMATCH: ContextManifest "${params.contextManifestId}" belongs to project "${snapshot.project_id}" / task "${snapshot.task_id}", expected project "${params.projectId}" / task "${params.taskId}".`;
+        this.recordRejectionEvent(params, reason);
+        throw new Error(`EXECUTION_AUTHORIZATION_FAILED: ${reason}`);
+      }
+
+      if (normalizedAttemptId && snapshot.attempt_id && snapshot.attempt_id !== normalizedAttemptId) {
+        const reason = `EXECUTION_AUTHORIZATION_MANIFEST_MISMATCH: ContextManifest "${params.contextManifestId}" belongs to attempt "${snapshot.attempt_id}", expected attempt "${normalizedAttemptId}".`;
+        this.recordRejectionEvent(params, reason);
+        throw new Error(`EXECUTION_AUTHORIZATION_FAILED: ${reason}`);
+      }
+
+      contextManifestHash = durableManifest.manifest_hash;
+    }
 
     // 8. Canonical Execution Instructions & Verification Snapshot Derived from Manager, Task, & Project Truth
     const canonicalInstructions = buildCanonicalInstructions(task, managerData);
