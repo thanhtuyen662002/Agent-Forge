@@ -1269,7 +1269,7 @@ export class Repository {
 
   public getLatestTestRun(taskId: string): TestRun | null {
     const row = this.db
-      .prepare('SELECT * FROM test_runs WHERE task_id = ? ORDER BY created_at DESC LIMIT 1')
+      .prepare('SELECT * FROM test_runs WHERE task_id = ? ORDER BY created_at DESC, rowid DESC LIMIT 1')
       .get(taskId) as Record<string, unknown> | undefined;
     if (!row) return null;
     return {
@@ -1288,7 +1288,7 @@ export class Repository {
 
   public getLatestEvidence(taskId: string, evidenceType: string): Evidence | null {
     const row = this.db
-      .prepare('SELECT * FROM evidence WHERE task_id = ? AND evidence_type = ? ORDER BY created_at DESC LIMIT 1')
+      .prepare('SELECT * FROM evidence WHERE task_id = ? AND evidence_type = ? ORDER BY created_at DESC, rowid DESC LIMIT 1')
       .get(taskId, evidenceType) as Record<string, unknown> | undefined;
     if (!row) return null;
     return {
