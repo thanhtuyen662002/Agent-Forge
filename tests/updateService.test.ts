@@ -451,21 +451,23 @@ describe('UpdateService & Installed-App Update Domain (PR #9)', () => {
       expect(content).toMatch(/workflow_dispatch:/);
       expect(content).not.toMatch(/pull_request:/);
       expect(content).toMatch(/VERSION MISMATCH FAIL-CLOSED/);
-      expect(content).toMatch(/--publish always/);
+      expect(content).toMatch(/--draft/);
     });
 
-    it('37. release-windows.yml pre-smoke step builds full NSIS package with package:win and only final step uses --publish always', async () => {
+    it('37. release-windows.yml builds full NSIS package ONCE with package:win and stages frozen assets without --publish always', async () => {
       const fs = await import('fs');
       const path = await import('path');
       const releaseYmlPath = path.resolve(__dirname, '../.github/workflows/release-windows.yml');
       const content = fs.readFileSync(releaseYmlPath, 'utf8');
 
-      // Pre-smoke step must build complete NSIS package
-      expect(content).toMatch(/run:\s*npm run package:win\s*\n\s*- name:\s*Run packaged process runtime smoke/);
-      // Pre-smoke must not publish
-      expect(content).not.toMatch(/npm run package:win:dir/);
-      // Final step is the only one with --publish always
-      expect(content).toMatch(/npx electron-builder --win nsis --publish always/);
+      // Package step must build complete NSIS package
+      expect(content).toMatch(/run:\s*npm run package:win/);
+      // Stages exact assets
+      expect(content).toMatch(/prepare-release-assets-win\.ps1/);
+      // Publishes frozen assets via gh release create
+      expect(content).toMatch(/gh release create/);
+      // Never uses electron-builder --publish always rebuild
+      expect(content).not.toMatch(/--publish always/);
     });
 
     it('38. production committed main.ts has zero occurrences of AGENT_FORGE_TEST_UPDATE or AGENT_FORGE_TRIGGER_INSTALL', async () => {

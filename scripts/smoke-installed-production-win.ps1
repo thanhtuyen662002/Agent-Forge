@@ -16,7 +16,23 @@ if ([string]::IsNullOrWhiteSpace($ProjectRoot)) {
   $ProjectRoot = (Resolve-Path (Join-Path $PSScriptRoot "..")).Path
 }
 if ([string]::IsNullOrWhiteSpace($InstallerPath)) {
-  $InstallerPath = Join-Path $ProjectRoot "release\AgentForge Setup 0.1.0.exe"
+  $pkgPath = Join-Path $ProjectRoot "package.json"
+  $ver = if (Test-Path $pkgPath) { (Get-Content $pkgPath -Raw | ConvertFrom-Json).version.Trim() } else { "0.1.0" }
+  $candidates = @(
+    (Join-Path $ProjectRoot "release\AgentForge Setup $ver.exe"),
+    (Join-Path $ProjectRoot "release\AgentForge-Setup-$ver.exe"),
+    (Join-Path $ProjectRoot "release\publish-assets\AgentForge-Setup-$ver.exe"),
+    (Join-Path $ProjectRoot "release\publish-assets\AgentForge Setup $ver.exe")
+  )
+  foreach ($cand in $candidates) {
+    if (Test-Path $cand) {
+      $InstallerPath = $cand
+      break
+    }
+  }
+  if ([string]::IsNullOrWhiteSpace($InstallerPath)) {
+    $InstallerPath = Join-Path $ProjectRoot "release\AgentForge Setup $ver.exe"
+  }
 }
 
 Write-Host "=================================================================" -ForegroundColor Cyan

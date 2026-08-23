@@ -176,12 +176,18 @@ jobs:
       - name: Verify installer and generate metadata
         shell: pwsh
         run: |
-          $installerPath = "release\AgentForge Setup 0.1.0.exe"
+          $pkg = Get-Content "package.json" -Raw | ConvertFrom-Json
+          $ver = $pkg.version.Trim()
+          $installerPath = "release\AgentForge Setup $ver.exe"
+          if (-not (Test-Path $installerPath)) {
+            $installerPath = "release\AgentForge-Setup-$ver.exe"
+          }
           if (-not (Test-Path $installerPath)) {
             Write-Error "Installer executable not found at $installerPath"
             exit 1
           }
 
+          $installerFilename = Split-Path -Leaf $installerPath
           $hash = (Get-FileHash -Path $installerPath -Algorithm SHA256).Hash
           $size = (Get-Item $installerPath).Length
           $sha = (git rev-parse HEAD).Trim()
@@ -199,13 +205,13 @@ jobs:
 
           $metadataContent = @"
           SOURCE_SHA=$sha
-          INSTALLER_FILENAME=AgentForge Setup 0.1.0.exe
+          INSTALLER_FILENAME=$installerFilename
           INSTALLER_SIZE_BYTES=$size
           INSTALLER_SHA256=$hash
           AUTHENTICODE_STATUS=$sigStatus
           CODE_SIGNED=$codeSigned
           BUILD_OS=windows-latest
-          APP_VERSION=0.1.0
+          APP_VERSION=$ver
           "@
 
           Set-Content -Path "release\installer-metadata.txt" -Value $metadataContent
@@ -215,7 +221,7 @@ jobs:
         with:
           name: agentforge-windows-installer-${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
           path: |
-            release/AgentForge Setup 0.1.0.exe
+            release/AgentForge*.exe
             release/installer-metadata.txt
             release/demo-rc-receipt.txt
           if-no-files-found: error

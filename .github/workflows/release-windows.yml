@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       release_tag:
-        description: 'Release tag to publish (e.g. v0.1.1)'
+        description: 'Release tag to publish as DRAFT (e.g. v0.1.0 or 0.1.0)'
         required: true
         type: string
 
@@ -17,22 +17,24 @@ permissions:
 
 jobs:
   release-windows:
-    name: Build & Publish Windows Release (windows-latest, Node 22.x)
+    name: Build & Stage Windows DRAFT Release (windows-latest, Node 22.x)
     runs-on: windows-latest
     steps:
-      - name: Verify release trigger authorization
+      - name: Verify release trigger authorization and canonical tag normalization
         shell: pwsh
         run: |
           if ('${{ github.event_name }}' -ne 'workflow_dispatch') {
             Write-Error "Release workflow must ONLY be triggered via manual workflow_dispatch."
             exit 1
           }
-          $tag = '${{ inputs.release_tag }}'.Trim()
-          if (-not $tag -or $tag -notmatch '^v?[0-9]+\.[0-9]+\.[0-9]+') {
-            Write-Error "Invalid release tag format: '$tag'. Expected format: 'vX.Y.Z' or 'X.Y.Z'."
+          $rawTag = '${{ inputs.release_tag }}'.Trim()
+          if (-not $rawTag -or $rawTag -notmatch '^v?[0-9]+\.[0-9]+\.[0-9]+') {
+            Write-Error "Invalid release tag format: '$rawTag'. Expected format: 'vX.Y.Z' or 'X.Y.Z'."
             exit 1
           }
-          Write-Host "Authorized workflow_dispatch release trigger for tag: $tag"
+          $normalizedVersion = $rawTag.TrimStart('v')
+          $canonicalTag = "v$normalizedVersion"
+          Write-Host "Authorized workflow_dispatch release trigger for input '$rawTag' -> Canonical Tag: '$canonicalTag'"
 
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -63,15 +65,87 @@ jobs:
           $pkgVersion = $pkgJson.version.Trim()
           $rawTag = '${{ inputs.release_tag }}'.Trim()
           $normalizedTag = $rawTag.TrimStart('v')
+          $canonicalTag = "v$normalizedTag"
 
           Write-Host "Package version: $pkgVersion"
-          Write-Host "Input release tag: $rawTag (normalized: $normalizedTag)"
+          Write-Host "Input release tag: $rawTag"
+          Write-Host "Canonical release tag: $canonicalTag"
 
           if ($pkgVersion -ne $normalizedTag) {
-            Write-Error "VERSION MISMATCH FAIL-CLOSED: package.json version ($pkgVersion) does not match release tag ($rawTag)."
+            Write-Error "VERSION MISMATCH FAIL-CLOSED: package.json version ($pkgVersion) does not match normalized release tag ($normalizedTag)."
             exit 1
           }
           Write-Host "Version/tag consistency check: PASS"
+
+      - name: Exhaustive draft-aware release collision guard (Fail-Closed)
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          $rawTag = '${{ inputs.release_tag }}'.Trim()
+          $normalizedVersion = $rawTag.TrimStart('v')
+          $canonicalTag = "v$normalizedVersion"
+
+          Write-Host "=== Exhaustive Release Collision Guard ==="
+          Write-Host "Target Canonical Tag: $canonicalTag"
+          Write-Host "Target Unprefixed Version: $normalizedVersion"
+
+          # 1. Check Git remote tags for exact refs
+          $remoteTags = git ls-remote --tags origin
+          if ($LASTEXITCODE -ne 0) {
+            Write-Error "COLLISION GUARD FAIL-CLOSED: git ls-remote failed with exit code $LASTEXITCODE"
+            exit 1
+          }
+          if ($remoteTags -match "refs/tags/$canonicalTag`$") {
+            Write-Error "COLLISION GUARD FAIL-CLOSED: Canonical tag $canonicalTag already exists on remote origin!"
+            exit 1
+          }
+          if ($remoteTags -match "refs/tags/$normalizedVersion`$") {
+            Write-Error "COLLISION GUARD FAIL-CLOSED: Unprefixed tag $normalizedVersion already exists on remote origin!"
+            exit 1
+          }
+          Write-Host "REMOTE_CANONICAL_TAG_EXISTS=NO"
+          Write-Host "REMOTE_UNPREFIXED_TAG_EXISTS=NO"
+
+          # 2. Exhaustive Paginated GitHub Releases & Drafts Query
+          Write-Host "Querying all GitHub releases and drafts via paginated REST API..."
+          $releasesJson = gh api --paginate "/repos/${{ github.repository }}/releases" 2>&1
+          if ($LASTEXITCODE -ne 0) {
+            Write-Error "COLLISION GUARD LOOKUP FAILURE FAIL-CLOSED: gh api --paginate failed with exit code $LASTEXITCODE: $releasesJson"
+            exit 1
+          }
+
+          $releases = $null
+          try {
+            $releases = $releasesJson | ConvertFrom-Json
+          } catch {
+            Write-Error "COLLISION GUARD PARSE FAILURE FAIL-CLOSED: Failed to parse releases JSON: $_"
+            exit 1
+          }
+
+          if ($null -eq $releases) {
+            Write-Error "COLLISION GUARD LOOKUP FAILURE FAIL-CLOSED: Releases API returned null response."
+            exit 1
+          }
+
+          $matchingReleases = @($releases | Where-Object {
+            $_.tag_name -eq $canonicalTag -or
+            $_.tag_name -eq $normalizedVersion -or
+            $_.name -eq $canonicalTag -or
+            $_.name -eq $normalizedVersion
+          })
+
+          if ($matchingReleases.Count -gt 0) {
+            Write-Error "COLLISION GUARD FAIL-CLOSED: Found $($matchingReleases.Count) existing release(s)/draft(s) matching '$canonicalTag' or '$normalizedVersion'!"
+            exit 1
+          }
+
+          Write-Host "DRAFT_AWARE_RELEASE_ENUMERATION=YES"
+          Write-Host "RELEASE_ENUMERATION_PAGINATED=YES"
+          Write-Host "CANONICAL_RELEASE_COLLISION_CHECK=PASS"
+          Write-Host "UNPREFIXED_RELEASE_COLLISION_CHECK=PASS"
+          Write-Host "GITHUB_RELEASE_COLLISION=NO"
+          Write-Host "Release collision guard: PASS (Exhaustive paginated search confirmed zero colliding releases or drafts)"
 
       - name: Setup Node.js 22.x
         uses: actions/setup-node@v4
@@ -98,74 +172,257 @@ jobs:
           }
           Write-Host "dist\index.html relative asset path check: PASS"
 
-      - name: Generate Windows NSIS installer and unpacked package
+      - name: Package production Windows installer ONCE (No Publish)
         run: npm run package:win
+
+      - name: Stage and freeze exact release assets
+        shell: pwsh
+        run: |
+          $pkgJson = Get-Content -Path "package.json" -Raw | ConvertFrom-Json
+          $ver = $pkgJson.version.Trim()
+          $rawTag = '${{ inputs.release_tag }}'.Trim()
+          $canonicalTag = "v$($rawTag.TrimStart('v'))"
+          $sha = (git rev-parse HEAD).Trim()
+          powershell -ExecutionPolicy Bypass -File scripts/prepare-release-assets-win.ps1 `
+            -ExpectedVersion $ver `
+            -ReleaseTag $canonicalTag `
+            -SourceSha $sha `
+            -ReleaseDir "release" `
+            -StagingDir "release\publish-assets"
 
       - name: Run packaged process runtime smoke
         shell: pwsh
         run: |
           npm run smoke:packaged:win -- -Headless
 
-      - name: Build and Publish Windows NSIS Release
+      - name: Run installed update integration test
+        shell: pwsh
+        run: |
+          npm run test:installed:win -- -Headless
+
+      - name: Run real production installed smoke using exact staged installer
+        shell: pwsh
+        run: |
+          $stagedMeta = Get-Content -Path "release\publish-assets\release-metadata.txt" -Raw
+          if ($stagedMeta -notmatch "PUBLISHED_INSTALLER_FILENAME=([^\r\n]+)") {
+            Write-Error "Failed to parse PUBLISHED_INSTALLER_FILENAME from release-metadata.txt"
+            exit 1
+          }
+          $stagedInstallerName = $Matches[1].Trim()
+          $stagedInstallerPath = "release\publish-assets\$stagedInstallerName"
+
+          Write-Host "Executing production installed smoke on exact staged installer: $stagedInstallerPath"
+          powershell -ExecutionPolicy Bypass -File scripts/smoke-installed-production-win.ps1 `
+            -InstallerPath $stagedInstallerPath `
+            -Headless
+
+      - name: Run demo RC verification on exact staged installer
+        shell: pwsh
+        run: |
+          $stagedMeta = Get-Content -Path "release\publish-assets\release-metadata.txt" -Raw
+          if ($stagedMeta -notmatch "PUBLISHED_INSTALLER_FILENAME=([^\r\n]+)") {
+            Write-Error "Failed to parse PUBLISHED_INSTALLER_FILENAME from release-metadata.txt"
+            exit 1
+          }
+          $stagedInstallerName = $Matches[1].Trim()
+          $stagedInstallerPath = "release\publish-assets\$stagedInstallerName"
+
+          Write-Host "Executing RC verification on exact staged installer: $stagedInstallerPath"
+          powershell -ExecutionPolicy Bypass -File scripts/verify-demo-rc-win.ps1 `
+            -InstallerPath $stagedInstallerPath `
+            -ReceiptOutput "release\publish-assets\demo-rc-receipt.txt"
+
+      - name: Finalize release metadata with RC verification receipt
+        shell: pwsh
+        run: |
+          powershell -ExecutionPolicy Bypass -File scripts/prepare-release-assets-win.ps1 `
+            -FinalizeRcStatus `
+            -StagingDir "release\publish-assets"
+
+      - name: Final frozen release asset byte verification immediately before release creation (Fail-Closed)
+        shell: pwsh
+        run: |
+          $pkgJson = Get-Content -Path "package.json" -Raw | ConvertFrom-Json
+          $ver = $pkgJson.version.Trim()
+          $rawTag = '${{ inputs.release_tag }}'.Trim()
+          $canonicalTag = "v$($rawTag.TrimStart('v'))"
+          $sha = (git rev-parse HEAD).Trim()
+
+          Write-Host "=== Final Pre-Release Frozen Asset Verification ==="
+          powershell -ExecutionPolicy Bypass -File scripts/prepare-release-assets-win.ps1 `
+            -VerifyOnly `
+            -ExpectedVersion $ver `
+            -ReleaseTag $canonicalTag `
+            -SourceSha $sha `
+            -StagingDir "release\publish-assets"
+
+      - name: Create GitHub DRAFT Release From Frozen Assets Only
         shell: pwsh
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          Write-Host "Publishing Windows release to GitHub Releases for repository thanhtuyen662002/Agent-Forge..."
-          npx electron-builder --win nsis --publish always
+          $rawTag = '${{ inputs.release_tag }}'.Trim()
+          $canonicalTag = "v$($rawTag.TrimStart('v'))"
+          $sha = (git rev-parse HEAD).Trim()
+          $stagedDir = "release\publish-assets"
+          $metadataPath = Join-Path $stagedDir "release-metadata.txt"
 
-      - name: Verify published installer and metadata
+          Write-Host "=== Creating GitHub DRAFT Release ==="
+          Write-Host "Canonical Tag: $canonicalTag"
+          Write-Host "Target SHA:    $sha"
+          Write-Host "Draft:         true (Explicit draft release policy)"
+
+          $assets = @(Get-ChildItem -Path $stagedDir -File | ForEach-Object { $_.FullName })
+          Write-Host "Assets to upload:"
+          foreach ($a in $assets) {
+            Write-Host "  - $(Split-Path -Leaf $a)"
+          }
+
+          gh release create $canonicalTag $assets `
+            --target $sha `
+            --draft `
+            --title "AgentForge $canonicalTag" `
+            --notes-file $metadataPath
+
+          Write-Host "GitHub DRAFT release created successfully for tag: $canonicalTag."
+
+      - name: Verify Published DRAFT Release, Asset Sizes, and Remote Digests (Post-Creation Verification)
         shell: pwsh
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          $pkgJson = Get-Content -Path "package.json" -Raw | ConvertFrom-Json
-          $ver = $pkgJson.version
-          $installerPath = "release\AgentForge Setup $ver.exe"
-          if (-not (Test-Path $installerPath)) {
-            Write-Error "Published installer executable not found at $installerPath"
+          $rawTag = '${{ inputs.release_tag }}'.Trim()
+          $canonicalTag = "v$($rawTag.TrimStart('v'))"
+          $sha = (git rev-parse HEAD).Trim()
+
+          Write-Host "=== Verifying Created DRAFT Release via GitHub API ==="
+          $releaseInfoJson = gh release view $canonicalTag --json id,databaseId,isDraft,isPrerelease,tagName,targetCommitish,assets 2>&1
+          if ($LASTEXITCODE -ne 0) {
+            Write-Error "POST-DRAFT VERIFICATION FAIL-CLOSED: gh release view failed: $releaseInfoJson"
+            exit 1
+          }
+          $releaseInfo = $releaseInfoJson | ConvertFrom-Json
+
+          if ($releaseInfo.isDraft -ne $true) {
+            Write-Error "CRITICAL SECURITY BREACH: Release is NOT marked as draft!"
             exit 1
           }
 
-          $hash = (Get-FileHash -Path $installerPath -Algorithm SHA256).Hash
-          $size = (Get-Item $installerPath).Length
-          $sha = (git rev-parse HEAD).Trim()
-          $sig = Get-AuthenticodeSignature -FilePath $installerPath
-          $sigStatus = $sig.Status.ToString()
-          $codeSigned = if ($sig.Status -eq "Valid") { "YES" } else { "NO" }
+          if ($releaseInfo.tagName -ne $canonicalTag) {
+            Write-Error "Release tag mismatch: expected $canonicalTag, got $($releaseInfo.tagName)"
+            exit 1
+          }
 
-          Write-Host "=== Release Windows Installer Verification ==="
-          Write-Host "Installer: $installerPath"
-          Write-Host "Size: $size bytes"
-          Write-Host "SHA256: $hash"
-          Write-Host "Authenticode Status: $sigStatus"
-          Write-Host "Code Signed: $codeSigned"
-          Write-Host "Source SHA: $sha"
+          if ($releaseInfo.targetCommitish -ne $sha) {
+            Write-Error "Release target SHA mismatch: expected $sha, got $($releaseInfo.targetCommitish)"
+            exit 1
+          }
 
-          $metadataContent = @"
-          SOURCE_SHA=$sha
-          RELEASE_TAG=${{ inputs.release_tag }}
-          APP_VERSION=$ver
-          INSTALLER_FILENAME=AgentForge Setup $ver.exe
-          INSTALLER_SIZE_BYTES=$size
-          INSTALLER_SHA256=$hash
-          AUTHENTICODE_STATUS=$sigStatus
-          CODE_SIGNED=$codeSigned
-          BUILD_OS=windows-latest
-          PUBLISHED_PROVIDER=github
-          PUBLISHED_REPO=thanhtuyen662002/Agent-Forge
-          "@
+          $releaseId = if ($null -ne $releaseInfo.databaseId) { $releaseInfo.databaseId } else { $releaseInfo.id }
+          Write-Host "Release ID: $releaseId (Draft: $($releaseInfo.isDraft), Target: $($releaseInfo.targetCommitish))"
 
-          Set-Content -Path "release\release-metadata.txt" -Value $metadataContent
+          # Query remote assets with pagination via REST API
+          $remoteAssetsJson = gh api --paginate "/repos/${{ github.repository }}/releases/$releaseId/assets" 2>&1
+          if ($LASTEXITCODE -ne 0) {
+            Write-Error "POST-DRAFT VERIFICATION FAIL-CLOSED: Failed to fetch release assets: $remoteAssetsJson"
+            exit 1
+          }
+          $remoteAssets = $remoteAssetsJson | ConvertFrom-Json
+
+          $stagedDir = "release\publish-assets"
+          $stagedMetaContent = Get-Content -Path (Join-Path $stagedDir "release-metadata.txt") -Raw
+          $meta = @{}
+          foreach ($line in ($stagedMetaContent -split "\r?\n")) {
+            if ($line -match '^([^=]+)=(.*)$') {
+              $meta[$Matches[1].Trim()] = $Matches[2].Trim()
+            }
+          }
+
+          $expectedAssets = @(
+            $meta["PUBLISHED_INSTALLER_FILENAME"],
+            $meta["BLOCKMAP_FILENAME"],
+            "latest.yml",
+            "release-metadata.txt",
+            "demo-rc-receipt.txt"
+          )
+
+          Write-Host "Verifying $($expectedAssets.Count) expected frozen release assets against GitHub uploaded assets..."
+
+          foreach ($assetName in $expectedAssets) {
+            $localFilePath = Join-Path $stagedDir $assetName
+            if (-not (Test-Path $localFilePath)) {
+              Write-Error "LOCAL ASSET MISSING: $localFilePath does not exist in staging!"
+              exit 1
+            }
+
+            $localSize = (Get-Item $localFilePath).Length
+            $localSha256 = (Get-FileHash -Path $localFilePath -Algorithm SHA256).Hash.ToLower()
+            $expectedDigest = "sha256:$localSha256"
+
+            $matchingRemote = @($remoteAssets | Where-Object { $_.name -eq $assetName })
+            if ($matchingRemote.Count -eq 0) {
+              Write-Error "REMOTE ASSET MISSING: Asset '$assetName' was not found in GitHub draft release!"
+              exit 1
+            }
+            if ($matchingRemote.Count -gt 1) {
+              Write-Error "DUPLICATE REMOTE ASSET: Found $($matchingRemote.Count) assets named '$assetName' in release!"
+              exit 1
+            }
+
+            $remoteAsset = $matchingRemote[0]
+            Write-Host "Checking Asset: $assetName"
+            Write-Host "  -> Local Size:      $localSize bytes"
+            Write-Host "  -> Remote Size:     $($remoteAsset.size) bytes"
+            Write-Host "  -> Expected Digest: $expectedDigest"
+            Write-Host "  -> Remote Digest:   $($remoteAsset.digest)"
+
+            # Size verification
+            if ($remoteAsset.size -ne $localSize) {
+              Write-Error "ASSET SIZE MISMATCH for '$assetName': Remote ($($remoteAsset.size)) != Local ($localSize)!"
+              exit 1
+            }
+
+            # Strict Fail-Closed Remote Digest verification (sha256:<hex>)
+            $remoteDigest = [string]$remoteAsset.digest
+            if ([string]::IsNullOrWhiteSpace($remoteDigest)) {
+              Write-Error "REMOTE ASSET DIGEST MISSING FAIL-CLOSED: Remote asset '$assetName' does not contain a digest property!"
+              exit 1
+            }
+
+            if (-not $remoteDigest.StartsWith("sha256:")) {
+              Write-Error "UNSUPPORTED REMOTE ASSET DIGEST FAIL-CLOSED: Remote asset '$assetName' digest algorithm is not sha256 ($remoteDigest)!"
+              exit 1
+            }
+
+            if ($remoteDigest.ToLowerInvariant() -ne $expectedDigest.ToLowerInvariant()) {
+              Write-Error "ASSET DIGEST MISMATCH FAIL-CLOSED: Remote asset '$assetName' digest ($remoteDigest) != Expected ($expectedDigest)!"
+              exit 1
+            }
+            Write-Host "  -> Digest verified: $remoteDigest"
+          }
+
+          Write-Host "POST_DRAFT_EXPECTED_ASSET_COUNT=5"
+          Write-Host "POST_DRAFT_ALL_ASSET_SIZE_MATCH=YES"
+          Write-Host "POST_DRAFT_ALL_ASSET_DIGEST_MATCH=YES"
+          Write-Host "Post-creation draft verification: PASS (Draft=true, Tag=$canonicalTag, Target=$sha, All 5 assets verified)"
 
       - name: Upload Release Step Summary
         if: always()
         shell: bash
         run: |
-          echo "### AgentForge Windows Release Summary" >> $GITHUB_STEP_SUMMARY
+          echo "### AgentForge Windows Release Summary (DRAFT ONLY)" >> $GITHUB_STEP_SUMMARY
           echo "- **Exact Published Commit**: \`$(git rev-parse HEAD)\`" >> $GITHUB_STEP_SUMMARY
-          echo "- **Release Tag**: \`${{ inputs.release_tag }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "- **Input Tag**: \`${{ inputs.release_tag }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "- **Canonical Release Tag**: \`v$(echo '${{ inputs.release_tag }}' | sed 's/^v//')\`" >> $GITHUB_STEP_SUMMARY
+          echo "- **Release State**: \`DRAFT (Awaiting Owner Review & Publication Approval)\`" >> $GITHUB_STEP_SUMMARY
           echo "- **Publish Status**: \`${{ job.status }}\`" >> $GITHUB_STEP_SUMMARY
-          if [ -f "release/release-metadata.txt" ]; then
+          if [ -f "release/publish-assets/release-metadata.txt" ]; then
             echo '```text' >> $GITHUB_STEP_SUMMARY
-            cat release/release-metadata.txt >> $GITHUB_STEP_SUMMARY
+            cat release/publish-assets/release-metadata.txt >> $GITHUB_STEP_SUMMARY
+            echo '```' >> $GITHUB_STEP_SUMMARY
+          fi
+          if [ -f "release/publish-assets/demo-rc-receipt.txt" ]; then
+            echo '```text' >> $GITHUB_STEP_SUMMARY
+            cat release/publish-assets/demo-rc-receipt.txt >> $GITHUB_STEP_SUMMARY
             echo '```' >> $GITHUB_STEP_SUMMARY
           fi
