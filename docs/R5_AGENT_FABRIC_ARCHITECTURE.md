@@ -4,6 +4,10 @@
 
 The AgentForge R5 release family introduces a **Role-Agnostic Agent Fabric**, establishing a durable domain foundation that separates logical roles from specific AI providers, models, and accounts.
 
+> [!NOTE]
+> **R5-v1.1 Specification Alignment**:
+> The R5-v1.1 specification supersedes the initial R5-v1.0 planning sequence, formally establishing durable local memory boundaries (R5B) and the complete 12-gate roadmap (R5A–R5L).
+
 ### The Fundamental Separation Invariant
 
 $$\text{ROLE} \neq \text{AGENT PROFILE} \neq \text{PROVIDER} \neq \text{MODEL RESOURCE} \neq \text{PROVIDER ACCOUNT} \neq \text{SESSION / WORKER SLOT}$$
@@ -111,15 +115,32 @@ Durable representation of review / coder separation and isolation rules.
 
 ---
 
-## 6. Next Gates (R5B – R5K Roadmap)
+## 6. Durable Memory & Context Boundary (R5-v1.1 Invariant)
 
-- **R5B**: Provider Account Manager & Secure Credential Reference Resolvers
-- **R5C**: Worker Slot Allocator & Concurrency Limiter
-- **R5D**: Decoupled Agent Fabric Router & Separation Policy Engine
-- **R5E**: Multi-Account Health Monitoring & Cooldown State Machine
-- **R5F**: MCP Tooling & Fabric Execution Bridges
-- **R5G**: Role-Agnostic Context & System Prompt Compilers
-- **R5H**: Multi-Agent Parallel Scheduling & Handoff Protocols
-- **R5I**: Dynamic Quota Tracking & Account Failover Handlers
-- **R5J**: Fabric Observability, Audit Logs & Metrics Dashboard
-- **R5K**: End-to-End Multi-Account Fabric Verification & Stress Testing
+In AgentForge R5-v1.1, the relationship between operational execution and persistent memory is strictly codified:
+
+1. **Ephemeral Execution Context**: Provider and model conversations are transient execution context and are **NOT** the authoritative memory of projects or tasks (`CONVERSATION_IS_SOURCE_OF_TRUTH = NO`).
+2. **Local Durable Memory Requirement**: Authoritative state, structured task progress, decisions, and constraints are maintained locally in durable SQLite storage (`LOCAL_DURABLE_MEMORY_REQUIRED = YES`, `STRUCTURED_TASK_MEMORY = REQUIRED`).
+3. **Stable Identity Binding**: Future memory fabric entities introduced in R5B (`AgentSession`, `ProjectMemory`, `TaskMemory`, `ContextSnapshot`, `ContextItem`, `ContextManifest`, `HandoffContext`) bind directly to the stable project, task, attempt, and assignment identities established here in R5A.
+4. **Context Window Independence**: Model context window limits must never compromise project knowledge or task execution continuity (`MODEL_CONTEXT_WINDOW_DEPENDENCY = FORBIDDEN`).
+5. **Audit vs Operational Memory**: Raw conversation transcripts may be retained for auditing and replay purposes, but cannot serve as the sole operational memory (`SUMMARY_OF_SUMMARY_AS_ONLY_MEMORY = FORBIDDEN`).
+6. **R5A Non-Implementation**: R5A defines and preserves the relational boundaries only; operational memory compilation and `ContextBuilderService` are strictly deferred to R5B.
+
+---
+
+## 7. Next Gates (Authoritative R5-v1.1 Roadmap)
+
+The R5 planning sequence is governed by the authoritative R5-v1.1 roadmap:
+
+- **R5A — Role-Agnostic Domain Foundation**: Durable entity separation (`ROLE != PROFILE != PROVIDER != RESOURCE != ACCOUNT != SLOT`), schema migrations, relational provenance validation.
+- **R5B — Durable Memory & Context Fabric**: Local structured task/project memory, versioned context snapshots, manifest hashing, context builders.
+- **R5C — Local Account & Credential Fabric**: Secure credential references, Windows Credential Manager integration, profile resolvers.
+- **R5D — Native Multi-Profile Execution Proof**: Multi-profile isolation and authentication validation across distinct provider accounts.
+- **R5E — Role-Aware Router & Separation Policy**: Capability matching, conflict-of-interest enforcement (reviewer != coder), affinity policies.
+- **R5F — Production CLI Runtime Adapters**: Live runtime execution bridges for Codex, Gemini, Claude, and Manual Bridge.
+- **R5G — Concurrent Scheduler & Worktree Isolation**: Multi-agent slot allocation, isolated git worktrees, task concurrency control.
+- **R5H — Quota / Account / Provider Failover**: Dynamic quota tracking, rate-limit backoff, multi-account failover handlers.
+- **R5I — Cross-Agent / Cross-Provider Mid-Task Handoff**: Context preservation across agent handoffs and model transitions.
+- **R5J — AgentForge MCP + IDE/Client Bridge**: MCP protocol servers and IDE integration endpoints.
+- **R5K — Optional Local LLM Gateway**: Local inference adapter and model gateway integration.
+- **R5L — Dynamic Multi-Role / Multi-Account / Context-Continuity Production Trial**: End-to-end multi-agent production verification.

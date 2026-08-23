@@ -475,6 +475,22 @@ export class Repository {
   }
 
   public createProviderResource(resource: ProviderResource): void {
+    if (resource.provider_account_id) {
+      const provider = this.getProvider(resource.provider_id);
+      if (!provider) {
+        throw new Error(`Provider '${resource.provider_id}' not found for resource '${resource.id}'`);
+      }
+      const account = this.getProviderAccount(resource.provider_account_id);
+      if (!account) {
+        throw new Error(`Provider account '${resource.provider_account_id}' not found for resource '${resource.id}'`);
+      }
+      if (account.provider_id !== resource.provider_id) {
+        throw new Error(
+          `Provider mismatch: Resource provider '${resource.provider_id}' does not match Account provider '${account.provider_id}'`
+        );
+      }
+    }
+
     this.db
       .prepare(`
         INSERT INTO provider_resources (
@@ -563,6 +579,22 @@ export class Repository {
   }
 
   public updateProviderResourceAccount(id: string, accountId: string | null): void {
+    const resource = this.getProviderResource(id);
+    if (!resource) {
+      throw new Error(`Provider resource '${id}' not found`);
+    }
+    if (accountId !== null) {
+      const account = this.getProviderAccount(accountId);
+      if (!account) {
+        throw new Error(`Provider account '${accountId}' not found`);
+      }
+      if (account.provider_id !== resource.provider_id) {
+        throw new Error(
+          `Provider mismatch: Resource provider '${resource.provider_id}' does not match Account provider '${account.provider_id}'`
+        );
+      }
+    }
+
     this.db
       .prepare('UPDATE provider_resources SET provider_account_id = ? WHERE id = ?')
       .run(accountId, id);
@@ -1659,6 +1691,27 @@ export class Repository {
   // Worker Slots (R5A)
   // ==========================================
   public createWorkerSlot(slot: WorkerSlot): void {
+    const account = this.getProviderAccount(slot.provider_account_id);
+    if (!account) {
+      throw new Error(`Provider account '${slot.provider_account_id}' not found for worker slot '${slot.id}'`);
+    }
+    if (slot.provider_resource_id) {
+      const resource = this.getProviderResource(slot.provider_resource_id);
+      if (!resource) {
+        throw new Error(`Provider resource '${slot.provider_resource_id}' not found for worker slot '${slot.id}'`);
+      }
+      if (resource.provider_account_id !== slot.provider_account_id) {
+        throw new Error(
+          `Slot resource account mismatch: Resource account '${resource.provider_account_id}' does not match slot account '${slot.provider_account_id}'`
+        );
+      }
+      if (resource.provider_id !== account.provider_id) {
+        throw new Error(
+          `Slot resource provider mismatch: Resource provider '${resource.provider_id}' does not match account provider '${account.provider_id}'`
+        );
+      }
+    }
+
     this.db
       .prepare(`
         INSERT INTO worker_slots (
@@ -1702,6 +1755,13 @@ export class Repository {
     currentExecutionId?: string | null,
     heartbeatAt?: string | null
   ): void {
+    const existing = this.getWorkerSlot(id);
+    if (!existing) return;
+
+    const newAssignmentId = currentAssignmentId !== undefined ? currentAssignmentId : existing.current_assignment_id;
+    const newExecutionId = currentExecutionId !== undefined ? currentExecutionId : existing.current_execution_id;
+    const newHeartbeatAt = heartbeatAt !== undefined ? heartbeatAt : existing.heartbeat_at;
+
     this.db
       .prepare(`
         UPDATE worker_slots
@@ -1714,12 +1774,23 @@ export class Repository {
       `)
       .run(
         status,
-        currentAssignmentId !== undefined ? currentAssignmentId : null,
-        currentExecutionId !== undefined ? currentExecutionId : null,
-        heartbeatAt !== undefined ? heartbeatAt : new Date().toISOString(),
+        newAssignmentId,
+        newExecutionId,
+        newHeartbeatAt,
         new Date().toISOString(),
         id
       );
+  }
+
+  public updateWorkerSlotHeartbeat(id: string, heartbeatAt?: string): void {
+    const now = heartbeatAt ?? new Date().toISOString();
+    this.db
+      .prepare(`
+        UPDATE worker_slots
+        SET heartbeat_at = ?, updated_at = ?
+        WHERE id = ?
+      `)
+      .run(now, new Date().toISOString(), id);
   }
 
   private mapWorkerSlot(row: Record<string, unknown>): WorkerSlot {
@@ -1741,6 +1812,96 @@ export class Repository {
   // Agent Assignments (R5A)
   // ==========================================
   public createAgentAssignment(assignment: AgentAssignment): void {
+    // B3: Project / Task / Attempt chain
+    const project = this.getProject(assignment.project_id);
+    if (!project) {
+      throw new Error(`Project '${assignment.project_id}' not found for assignment '${assignment.id}'`);
+    }
+    const task = this.getTask(assignment.task_id);
+    if (!task) {
+      throw new Error(`Task '${assignment.task_id}' not found for assignment '${assignment.id}'`);
+    }
+    if (task.project_id !== assignment.project_id) {
+      throw new Error(
+        `Project task mismatch: Task project '${task.project_id}' does not match assignment project '${assignment.project_id}'`
+      );
+    }
+    if (assignment.attempt_id) {
+      const attempt = this.getTaskAttempt(assignment.attempt_id);
+      if (!attempt) {
+        throw new Error(`Task attempt '${assignment.attempt_id}' not found for assignment '${assignment.id}'`);
+      }
+      if (attempt.task_id !== assignment.task_id) {
+        throw new Error(
+          `Task attempt mismatch: Attempt task '${attempt.task_id}' does not match assignment task '${assignment.task_id}'`
+        );
+      }
+    }
+
+    // B4: Role / Profile chain
+    const roleProfile = this.getRoleProfile(assignment.role_profile_id);
+    if (!roleProfile) {
+      throw new Error(`Role profile '${assignment.role_profile_id}' not found for assignment '${assignment.id}'`);
+    }
+    if (assignment.agent_profile_id) {
+      const agentProfile = this.getAgentProfile(assignment.agent_profile_id);
+      if (!agentProfile) {
+        throw new Error(`Agent profile '${assignment.agent_profile_id}' not found for assignment '${assignment.id}'`);
+      }
+      if (agentProfile.role_profile_id !== assignment.role_profile_id) {
+        throw new Error(
+          `Role profile mismatch: Agent profile role '${agentProfile.role_profile_id}' does not match assignment role profile '${assignment.role_profile_id}'`
+        );
+      }
+    }
+
+    // B5: Provider / Account / Resource chain
+    const provider = this.getProvider(assignment.selected_provider_id);
+    if (!provider) {
+      throw new Error(`Provider '${assignment.selected_provider_id}' not found for assignment '${assignment.id}'`);
+    }
+    const account = this.getProviderAccount(assignment.selected_account_id);
+    if (!account) {
+      throw new Error(`Provider account '${assignment.selected_account_id}' not found for assignment '${assignment.id}'`);
+    }
+    if (account.provider_id !== assignment.selected_provider_id) {
+      throw new Error(
+        `Provider account mismatch: Account provider '${account.provider_id}' does not match selected provider '${assignment.selected_provider_id}'`
+      );
+    }
+    const resource = this.getProviderResource(assignment.selected_resource_id);
+    if (!resource) {
+      throw new Error(`Provider resource '${assignment.selected_resource_id}' not found for assignment '${assignment.id}'`);
+    }
+    if (resource.provider_id !== assignment.selected_provider_id) {
+      throw new Error(
+        `Provider resource mismatch: Resource provider '${resource.provider_id}' does not match selected provider '${assignment.selected_provider_id}'`
+      );
+    }
+    if (!resource.provider_account_id || resource.provider_account_id !== assignment.selected_account_id) {
+      throw new Error(
+        `Account resource mismatch: Resource account '${resource.provider_account_id}' must be non-null and match selected account '${assignment.selected_account_id}'`
+      );
+    }
+
+    // B6: Worker slot chain
+    if (assignment.selected_worker_slot_id) {
+      const slot = this.getWorkerSlot(assignment.selected_worker_slot_id);
+      if (!slot) {
+        throw new Error(`Worker slot '${assignment.selected_worker_slot_id}' not found for assignment '${assignment.id}'`);
+      }
+      if (slot.provider_account_id !== assignment.selected_account_id) {
+        throw new Error(
+          `Assignment slot account mismatch: Slot account '${slot.provider_account_id}' does not match selected account '${assignment.selected_account_id}'`
+        );
+      }
+      if (slot.provider_resource_id && slot.provider_resource_id !== assignment.selected_resource_id) {
+        throw new Error(
+          `Assignment slot resource mismatch: Slot resource '${slot.provider_resource_id}' does not match selected resource '${assignment.selected_resource_id}'`
+        );
+      }
+    }
+
     this.db
       .prepare(`
         INSERT INTO agent_assignments (
@@ -1823,6 +1984,34 @@ export class Repository {
   // Account Leases (R5A)
   // ==========================================
   public createAccountLease(lease: AccountLease): void {
+    const assignment = this.getAgentAssignment(lease.assignment_id);
+    if (!assignment) {
+      throw new Error(`Agent assignment '${lease.assignment_id}' not found for lease '${lease.id}'`);
+    }
+    const account = this.getProviderAccount(lease.provider_account_id);
+    if (!account) {
+      throw new Error(`Provider account '${lease.provider_account_id}' not found for lease '${lease.id}'`);
+    }
+    const slot = this.getWorkerSlot(lease.worker_slot_id);
+    if (!slot) {
+      throw new Error(`Worker slot '${lease.worker_slot_id}' not found for lease '${lease.id}'`);
+    }
+    if (lease.provider_account_id !== assignment.selected_account_id) {
+      throw new Error(
+        `Lease account mismatch: Lease account '${lease.provider_account_id}' does not match assignment account '${assignment.selected_account_id}'`
+      );
+    }
+    if (lease.worker_slot_id !== assignment.selected_worker_slot_id) {
+      throw new Error(
+        `Lease slot mismatch: Lease slot '${lease.worker_slot_id}' does not match assignment slot '${assignment.selected_worker_slot_id}'`
+      );
+    }
+    if (slot.provider_account_id !== lease.provider_account_id) {
+      throw new Error(
+        `Slot account mismatch: Slot account '${slot.provider_account_id}' does not match lease account '${lease.provider_account_id}'`
+      );
+    }
+
     this.db
       .prepare(`
         INSERT INTO account_leases (

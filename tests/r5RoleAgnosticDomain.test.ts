@@ -1178,4 +1178,1501 @@ describe('R5A — Role-Agnostic Agent Fabric Domain Foundation', () => {
     const fkViolations = db.prepare('PRAGMA foreign_key_check').all();
     expect(fkViolations).toHaveLength(0);
   });
+
+  // =========================================================================
+  // Manager Corrective 1: Relational Chain Validation & Safe Update Semantics
+  // =========================================================================
+
+  // 19. resource provider A + account from provider B rejected
+  it('19. createProviderResource rejects resource provider A with account from provider B', () => {
+    const provA: Provider = {
+      id: 'prov-a-19',
+      name: 'Provider A',
+      adapter_type: 'API',
+      enabled: true,
+      created_at: new Date().toISOString(),
+    };
+    const provB: Provider = {
+      id: 'prov-b-19',
+      name: 'Provider B',
+      adapter_type: 'API',
+      enabled: true,
+      created_at: new Date().toISOString(),
+    };
+    repo.createProvider(provA);
+    repo.createProvider(provB);
+
+    const acctB: ProviderAccount = {
+      id: 'acct-b-19',
+      provider_id: 'prov-b-19',
+      label: 'Account B',
+      auth_mode: 'API_CREDENTIAL',
+      credential_ref: null,
+      profile_ref: null,
+      enabled: true,
+      priority: 1,
+      health_status: 'AVAILABLE',
+      cooldown_until: null,
+      concurrency_limit: 1,
+      last_success_at: null,
+      last_failure_at: null,
+      last_failure_code: null,
+      created_at: new Date().toISOString(),
+      updated_at: new Date().toISOString(),
+    };
+    repo.createProviderAccount(acctB);
+
+    const mismatchedRes: ProviderResource = {
+      id: 'res-mismatch-19',
+      provider_id: 'prov-a-19', // mismatch with acct-b-19 (prov-b-19)
+      provider_account_id: 'acct-b-19',
+      model_name: 'model-x',
+      health_status: 'AVAILABLE',
+      capabilities: ['CODING' as Capability],
+      enabled: true,
+      total_quota: null,
+      remaining_quota: null,
+      quota_unit: 'REQUESTS',
+      quota_reset_at: null,
+      quota_source: 'MANUAL',
+      quota_confidence: 1.0,
+      last_health_check: new Date().toISOString(),
+    };
+
+    expect(() => repo.createProviderResource(mismatchedRes)).toThrow(/Provider mismatch/);
+  });
+
+  // 20. update resource to account from wrong provider rejected
+  it('20. updateProviderResourceAccount rejects updating resource to account of a different provider', () => {
+    const provA: Provider = {
+      id: 'prov-a-20',
+      name: 'Provider A',
+      adapter_type: 'API',
+      enabled: true,
+      created_at: new Date().toISOString(),
+    };
+    const provB: Provider = {
+      id: 'prov-b-20',
+      name: 'Provider B',
+      adapter_type: 'API',
+      enabled: true,
+      created_at: new Date().toISOString(),
+    };
+    repo.createProvider(provA);
+    repo.createProvider(provB);
+
+    const acctA: ProviderAccount = {
+      id: 'acct-a-20',
+      provider_id: 'prov-a-20',
+      label: 'Account A',
+      auth_mode: 'API_CREDENTIAL',
+      credential_ref: null,
+      profile_ref: null,
+      enabled: true,
+      priority: 1,
+      health_status: 'AVAILABLE',
+      cooldown_until: null,
+      concurrency_limit: 1,
+      last_success_at: null,
+      last_failure_at: null,
+      last_failure_code: null,
+      created_at: new Date().toISOString(),
+      updated_at: new Date().toISOString(),
+    };
+    const acctB: ProviderAccount = {
+      id: 'acct-b-20',
+      provider_id: 'prov-b-20',
+      label: 'Account B',
+      auth_mode: 'API_CREDENTIAL',
+      credential_ref: null,
+      profile_ref: null,
+      enabled: true,
+      priority: 1,
+      health_status: 'AVAILABLE',
+      cooldown_until: null,
+      concurrency_limit: 1,
+      last_success_at: null,
+      last_failure_at: null,
+      last_failure_code: null,
+      created_at: new Date().toISOString(),
+      updated_at: new Date().toISOString(),
+    };
+    repo.createProviderAccount(acctA);
+    repo.createProviderAccount(acctB);
+
+    const resA: ProviderResource = {
+      id: 'res-a-20',
+      provider_id: 'prov-a-20',
+      provider_account_id: 'acct-a-20',
+      model_name: 'model-a',
+      health_status: 'AVAILABLE',
+      capabilities: ['CODING' as Capability],
+      enabled: true,
+      total_quota: null,
+      remaining_quota: null,
+      quota_unit: 'REQUESTS',
+      quota_reset_at: null,
+      quota_source: 'MANUAL',
+      quota_confidence: 1.0,
+      last_health_check: new Date().toISOString(),
+    };
+    repo.createProviderResource(resA);
+
+    // Attempting to re-point resA (prov-a) to acctB (prov-b) must fail closed
+    expect(() => repo.updateProviderResourceAccount('res-a-20', 'acct-b-20')).toThrow(/Provider mismatch/);
+  });
+
+  // 21. worker slot account A + resource from account B rejected
+  it('21. createWorkerSlot rejects slot on account A bound to resource of account B', () => {
+    const prov: Provider = {
+      id: 'prov-21',
+      name: 'Provider 21',
+      adapter_type: 'API',
+      enabled: true,
+      created_at: new Date().toISOString(),
+    };
+    repo.createProvider(prov);
+
+    const acctA: ProviderAccount = {
+      id: 'acct-a-21',
+      provider_id: 'prov-21',
+      label: 'Account A',
+      auth_mode: 'API_CREDENTIAL',
+      credential_ref: null,
+      profile_ref: null,
+      enabled: true,
+      priority: 1,
+      health_status: 'AVAILABLE',
+      cooldown_until: null,
+      concurrency_limit: 1,
+      last_success_at: null,
+      last_failure_at: null,
+      last_failure_code: null,
+      created_at: new Date().toISOString(),
+      updated_at: new Date().toISOString(),
+    };
+    const acctB: ProviderAccount = {
+      id: 'acct-b-21',
+      provider_id: 'prov-21',
+      label: 'Account B',
+      auth_mode: 'API_CREDENTIAL',
+      credential_ref: null,
+      profile_ref: null,
+      enabled: true,
+      priority: 1,
+      health_status: 'AVAILABLE',
+      cooldown_until: null,
+      concurrency_limit: 1,
+      last_success_at: null,
+      last_failure_at: null,
+      last_failure_code: null,
+      created_at: new Date().toISOString(),
+      updated_at: new Date().toISOString(),
+    };
+    repo.createProviderAccount(acctA);
+    repo.createProviderAccount(acctB);
+
+    const resB: ProviderResource = {
+      id: 'res-b-21',
+      provider_id: 'prov-21',
+      provider_account_id: 'acct-b-21',
+      model_name: 'model-b',
+      health_status: 'AVAILABLE',
+      capabilities: ['CODING' as Capability],
+      enabled: true,
+      total_quota: null,
+      remaining_quota: null,
+      quota_unit: 'REQUESTS',
+      quota_reset_at: null,
+      quota_source: 'MANUAL',
+      quota_confidence: 1.0,
+      last_health_check: new Date().toISOString(),
+    };
+    repo.createProviderResource(resB);
+
+    const slotMismatched: WorkerSlot = {
+      id: 'slot-mismatched-21',
+      provider_account_id: 'acct-a-21', // Account A
+      provider_resource_id: 'res-b-21', // Belongs to Account B
+      slot_index: 0,
+      status: 'IDLE',
+      current_assignment_id: null,
+      current_execution_id: null,
+      heartbeat_at: null,
+      created_at: new Date().toISOString(),
+      updated_at: new Date().toISOString(),
+    };
+
+    expect(() => repo.createWorkerSlot(slotMismatched)).toThrow(/Slot resource account mismatch/);
+  });
+
+  // 22. assignment.project A + task belonging to project B rejected
+  it('22. createAgentAssignment rejects project A with task belonging to project B', () => {
+    const projA: Project = {
+      id: 'proj-a-22',
+      name: 'Project A',
+      description: null,
+      repository_path: 'd:/a',
+      default_branch: 'main',
+      status: 'RUNNING',
+      contract: null,
+      created_at: new Date().toISOString(),
+      updated_at: new Date().toISOString(),
+      started_at: null,
+      completed_at: null,
+    };
+    const projB: Project = {
+      id: 'proj-b-22',
+      name: 'Project B',
+      description: null,
+      repository_path: 'd:/b',
+      default_branch: 'main',
+      status: 'RUNNING',
+      contract: null,
+      created_at: new Date().toISOString(),
+      updated_at: new Date().toISOString(),
+      started_at: null,
+      completed_at: null,
+    };
+    repo.createProject(projA);
+    repo.createProject(projB);
+
+    const taskB: Task = {
+      id: 'task-b-22',
+      project_id: 'proj-b-22',
+      milestone_id: null,
+      title: 'Task B',
+      description: null,
+      state: 'DISPATCHED',
+      paused_from_state: null,
+      priority: 'HIGH',
+      risk: 'MEDIUM',
+      assigned_agent_id: null,
+      revision_count: 1,
+      max_revisions: 3,
+      base_sha: null,
+      current_sha: null,
+      progress_cache_percent: 0,
+      progress_computed_at: null,
+      acceptance_criteria: [],
+      constraints: [],
+      created_at: new Date().toISOString(),
+      updated_at: new Date().toISOString(),
+    };
+    repo.createTask(taskB);
+
+    const roleProf: RoleProfile = {
+      id: 'rp-22',
+      role: 'CODER',
+      display_name: 'Coder 22',
+      required_capabilities: ['CODING' as Capability],
+      preferred_capabilities: [],
+      authority_scope: null,
+      permissions: [],
+      output_protocol: null,
+      enabled: true,
+      created_at: new Date().toISOString(),
+      updated_at: new Date().toISOString(),
+    };
+    repo.createRoleProfile(roleProf);
+
+    const prov: Provider = {
+      id: 'prov-22',
+      name: 'Provider 22',
+      adapter_type: 'API',
+      enabled: true,
+      created_at: new Date().toISOString(),
+    };
+    repo.createProvider(prov);
+
+    const acct: ProviderAccount = {
+      id: 'acct-22',
+      provider_id: 'prov-22',
+      label: 'Account 22',
+      auth_mode: 'API_CREDENTIAL',
+      credential_ref: null,
+      profile_ref: null,
+      enabled: true,
+      priority: 1,
+      health_status: 'AVAILABLE',
+      cooldown_until: null,
+      concurrency_limit: 1,
+      last_success_at: null,
+      last_failure_at: null,
+      last_failure_code: null,
+      created_at: new Date().toISOString(),
+      updated_at: new Date().toISOString(),
+    };
+    repo.createProviderAccount(acct);
+
+    const res: ProviderResource = {
+      id: 'res-22',
+      provider_id: 'prov-22',
+      provider_account_id: 'acct-22',
+      model_name: 'model-22',
+      health_status: 'AVAILABLE',
+      capabilities: ['CODING' as Capability],
+      enabled: true,
+      total_quota: null,
+      remaining_quota: null,
+      quota_unit: 'REQUESTS',
+      quota_reset_at: null,
+      quota_source: 'MANUAL',
+      quota_confidence: 1.0,
+      last_health_check: new Date().toISOString(),
+    };
+    repo.createProviderResource(res);
+
+    const mismatchedAssignment: AgentAssignment = {
+      id: 'asgn-mismatch-22',
+      project_id: 'proj-a-22', // Project A
+      task_id: 'task-b-22', // Belongs to Project B
+      attempt_id: null,
+      role_profile_id: 'rp-22',
+      agent_profile_id: null,
+      selected_provider_id: 'prov-22',
+      selected_account_id: 'acct-22',
+      selected_resource_id: 'res-22',
+      selected_worker_slot_id: null,
+      routing_decision_id: null,
+      preferred_metadata: null,
+      status: 'ASSIGNED',
+      created_at: new Date().toISOString(),
+      ended_at: null,
+    };
+
+    expect(() => repo.createAgentAssignment(mismatchedAssignment)).toThrow(/Project task mismatch/);
+  });
+
+  // 23. assignment task A + attempt belonging to task B rejected
+  it('23. createAgentAssignment rejects task A with attempt belonging to task B', () => {
+    const proj: Project = {
+      id: 'proj-23',
+      name: 'Project 23',
+      description: null,
+      repository_path: 'd:/p',
+      default_branch: 'main',
+      status: 'RUNNING',
+      contract: null,
+      created_at: new Date().toISOString(),
+      updated_at: new Date().toISOString(),
+      started_at: null,
+      completed_at: null,
+    };
+    repo.createProject(proj);
+
+    const taskA: Task = {
+      id: 'task-a-23',
+      project_id: 'proj-23',
+      milestone_id: null,
+      title: 'Task A',
+      description: null,
+      state: 'DISPATCHED',
+      paused_from_state: null,
+      priority: 'HIGH',
+      risk: 'MEDIUM',
+      assigned_agent_id: null,
+      revision_count: 1,
+      max_revisions: 3,
+      base_sha: null,
+      current_sha: null,
+      progress_cache_percent: 0,
+      progress_computed_at: null,
+      acceptance_criteria: [],
+      constraints: [],
+      created_at: new Date().toISOString(),
+      updated_at: new Date().toISOString(),
+    };
+    const taskB: Task = {
+      id: 'task-b-23',
+      project_id: 'proj-23',
+      milestone_id: null,
+      title: 'Task B',
+      description: null,
+      state: 'DISPATCHED',
+      paused_from_state: null,
+      priority: 'HIGH',
+      risk: 'MEDIUM',
+      assigned_agent_id: null,
+      revision_count: 1,
+      max_revisions: 3,
+      base_sha: null,
+      current_sha: null,
+      progress_cache_percent: 0,
+      progress_computed_at: null,
+      acceptance_criteria: [],
+      constraints: [],
+      created_at: new Date().toISOString(),
+      updated_at: new Date().toISOString(),
+    };
+    repo.createTask(taskA);
+    repo.createTask(taskB);
+
+    const prov: Provider = {
+      id: 'prov-23',
+      name: 'Provider 23',
+      adapter_type: 'API',
+      enabled: true,
+      created_at: new Date().toISOString(),
+    };
+    repo.createProvider(prov);
+
+    const res: ProviderResource = {
+      id: 'res-23',
+      provider_id: 'prov-23',
+      provider_account_id: null,
+      model_name: 'model-23',
+      health_status: 'AVAILABLE',
+      capabilities: ['CODING' as Capability],
+      enabled: true,
+      total_quota: null,
+      remaining_quota: null,
+      quota_unit: 'REQUESTS',
+      quota_reset_at: null,
+      quota_source: 'MANUAL',
+      quota_confidence: 1.0,
+      last_health_check: new Date().toISOString(),
+    };
+    repo.createProviderResource(res);
+
+    const legacyAgent: Agent = {
+      id: 'agent-23',
+      display_name: 'Agent 23',
+      role: 'CODER',
+      provider_resource_id: 'res-23',
+      status: 'IDLE',
+      current_task_id: null,
+      last_seen_at: new Date().toISOString(),
+    };
+    repo.createAgent(legacyAgent);
+
+    const attemptB = {
+      id: 'attempt-b-23',
+      task_id: 'task-b-23',
+      attempt_number: 1,
+      agent_id: 'agent-23',
+      status: 'IN_PROGRESS' as const,
+      started_at: new Date().toISOString(),
+      ended_at: null,
+      summary: null,
+    };
+    repo.createTaskAttempt(attemptB);
+
+    const roleProf: RoleProfile = {
+      id: 'rp-23',
+      role: 'CODER',
+      display_name: 'Coder 23',
+      required_capabilities: ['CODING' as Capability],
+      preferred_capabilities: [],
+      authority_scope: null,
+      permissions: [],
+      output_protocol: null,
+      enabled: true,
+      created_at: new Date().toISOString(),
+      updated_at: new Date().toISOString(),
+    };
+    repo.createRoleProfile(roleProf);
+
+    const acct: ProviderAccount = {
+      id: 'acct-23',
+      provider_id: 'prov-23',
+      label: 'Account 23',
+      auth_mode: 'API_CREDENTIAL',
+      credential_ref: null,
+      profile_ref: null,
+      enabled: true,
+      priority: 1,
+      health_status: 'AVAILABLE',
+      cooldown_until: null,
+      concurrency_limit: 1,
+      last_success_at: null,
+      last_failure_at: null,
+      last_failure_code: null,
+      created_at: new Date().toISOString(),
+      updated_at: new Date().toISOString(),
+    };
+    repo.createProviderAccount(acct);
+
+    const resLinked: ProviderResource = {
+      id: 'res-linked-23',
+      provider_id: 'prov-23',
+      provider_account_id: 'acct-23',
+      model_name: 'model-linked-23',
+      health_status: 'AVAILABLE',
+      capabilities: ['CODING' as Capability],
+      enabled: true,
+      total_quota: null,
+      remaining_quota: null,
+      quota_unit: 'REQUESTS',
+      quota_reset_at: null,
+      quota_source: 'MANUAL',
+      quota_confidence: 1.0,
+      last_health_check: new Date().toISOString(),
+    };
+    repo.createProviderResource(resLinked);
+
+    const mismatchedAssignment: AgentAssignment = {
+      id: 'asgn-mismatch-23',
+      project_id: 'proj-23',
+      task_id: 'task-a-23', // Task A
+      attempt_id: 'attempt-b-23', // Belongs to Task B
+      role_profile_id: 'rp-23',
+      agent_profile_id: null,
+      selected_provider_id: 'prov-23',
+      selected_account_id: 'acct-23',
+      selected_resource_id: 'res-linked-23',
+      selected_worker_slot_id: null,
+      routing_decision_id: null,
+      preferred_metadata: null,
+      status: 'ASSIGNED',
+      created_at: new Date().toISOString(),
+      ended_at: null,
+    };
+
+    expect(() => repo.createAgentAssignment(mismatchedAssignment)).toThrow(/Task attempt mismatch/);
+  });
+
+  // 24. role profile A + agent profile belonging to role profile B rejected
+  it('24. createAgentAssignment rejects role profile A with agent profile of role profile B', () => {
+    const proj: Project = {
+      id: 'proj-24',
+      name: 'Project 24',
+      description: null,
+      repository_path: 'd:/p',
+      default_branch: 'main',
+      status: 'RUNNING',
+      contract: null,
+      created_at: new Date().toISOString(),
+      updated_at: new Date().toISOString(),
+      started_at: null,
+      completed_at: null,
+    };
+    repo.createProject(proj);
+
+    const task: Task = {
+      id: 'task-24',
+      project_id: 'proj-24',
+      milestone_id: null,
+      title: 'Task 24',
+      description: null,
+      state: 'DISPATCHED',
+      paused_from_state: null,
+      priority: 'HIGH',
+      risk: 'MEDIUM',
+      assigned_agent_id: null,
+      revision_count: 1,
+      max_revisions: 3,
+      base_sha: null,
+      current_sha: null,
+      progress_cache_percent: 0,
+      progress_computed_at: null,
+      acceptance_criteria: [],
+      constraints: [],
+      created_at: new Date().toISOString(),
+      updated_at: new Date().toISOString(),
+    };
+    repo.createTask(task);
+
+    const roleA: RoleProfile = {
+      id: 'rp-a-24',
+      role: 'CODER',
+      display_name: 'Coder 24',
+      required_capabilities: ['CODING' as Capability],
+      preferred_capabilities: [],
+      authority_scope: null,
+      permissions: [],
+      output_protocol: null,
+      enabled: true,
+      created_at: new Date().toISOString(),
+      updated_at: new Date().toISOString(),
+    };
+    const roleB: RoleProfile = {
+      id: 'rp-b-24',
+      role: 'REVIEWER',
+      display_name: 'Reviewer 24',
+      required_capabilities: ['REVIEW' as Capability],
+      preferred_capabilities: [],
+      authority_scope: null,
+      permissions: [],
+      output_protocol: null,
+      enabled: true,
+      created_at: new Date().toISOString(),
+      updated_at: new Date().toISOString(),
+    };
+    repo.createRoleProfile(roleA);
+    repo.createRoleProfile(roleB);
+
+    const agentProfB: AgentProfile = {
+      id: 'ap-b-24',
+      role_profile_id: 'rp-b-24', // Under Role B
+      name: 'Reviewer Profile',
+      prompt_template: null,
+      config: null,
+      enabled: true,
+      created_at: new Date().toISOString(),
+      updated_at: new Date().toISOString(),
+    };
+    repo.createAgentProfile(agentProfB);
+
+    const prov: Provider = {
+      id: 'prov-24',
+      name: 'Provider 24',
+      adapter_type: 'API',
+      enabled: true,
+      created_at: new Date().toISOString(),
+    };
+    repo.createProvider(prov);
+
+    const acct: ProviderAccount = {
+      id: 'acct-24',
+      provider_id: 'prov-24',
+      label: 'Account 24',
+      auth_mode: 'API_CREDENTIAL',
+      credential_ref: null,
+      profile_ref: null,
+      enabled: true,
+      priority: 1,
+      health_status: 'AVAILABLE',
+      cooldown_until: null,
+      concurrency_limit: 1,
+      last_success_at: null,
+      last_failure_at: null,
+      last_failure_code: null,
+      created_at: new Date().toISOString(),
+      updated_at: new Date().toISOString(),
+    };
+    repo.createProviderAccount(acct);
+
+    const res: ProviderResource = {
+      id: 'res-24',
+      provider_id: 'prov-24',
+      provider_account_id: 'acct-24',
+      model_name: 'model-24',
+      health_status: 'AVAILABLE',
+      capabilities: ['CODING' as Capability],
+      enabled: true,
+      total_quota: null,
+      remaining_quota: null,
+      quota_unit: 'REQUESTS',
+      quota_reset_at: null,
+      quota_source: 'MANUAL',
+      quota_confidence: 1.0,
+      last_health_check: new Date().toISOString(),
+    };
+    repo.createProviderResource(res);
+
+    const mismatchedAssignment: AgentAssignment = {
+      id: 'asgn-mismatch-24',
+      project_id: 'proj-24',
+      task_id: 'task-24',
+      attempt_id: null,
+      role_profile_id: 'rp-a-24', // Role A
+      agent_profile_id: 'ap-b-24', // Profile belongs to Role B
+      selected_provider_id: 'prov-24',
+      selected_account_id: 'acct-24',
+      selected_resource_id: 'res-24',
+      selected_worker_slot_id: null,
+      routing_decision_id: null,
+      preferred_metadata: null,
+      status: 'ASSIGNED',
+      created_at: new Date().toISOString(),
+      ended_at: null,
+    };
+
+    expect(() => repo.createAgentAssignment(mismatchedAssignment)).toThrow(/Role profile mismatch/);
+  });
+
+  // 25. selected provider A + selected account provider B rejected
+  it('25. createAgentAssignment rejects selected provider A with account belonging to provider B', () => {
+    const proj: Project = {
+      id: 'proj-25',
+      name: 'Project 25',
+      description: null,
+      repository_path: 'd:/p',
+      default_branch: 'main',
+      status: 'RUNNING',
+      contract: null,
+      created_at: new Date().toISOString(),
+      updated_at: new Date().toISOString(),
+      started_at: null,
+      completed_at: null,
+    };
+    repo.createProject(proj);
+
+    const task: Task = {
+      id: 'task-25',
+      project_id: 'proj-25',
+      milestone_id: null,
+      title: 'Task 25',
+      description: null,
+      state: 'DISPATCHED',
+      paused_from_state: null,
+      priority: 'HIGH',
+      risk: 'MEDIUM',
+      assigned_agent_id: null,
+      revision_count: 1,
+      max_revisions: 3,
+      base_sha: null,
+      current_sha: null,
+      progress_cache_percent: 0,
+      progress_computed_at: null,
+      acceptance_criteria: [],
+      constraints: [],
+      created_at: new Date().toISOString(),
+      updated_at: new Date().toISOString(),
+    };
+    repo.createTask(task);
+
+    const role: RoleProfile = {
+      id: 'rp-25',
+      role: 'CODER',
+      display_name: 'Coder 25',
+      required_capabilities: ['CODING' as Capability],
+      preferred_capabilities: [],
+      authority_scope: null,
+      permissions: [],
+      output_protocol: null,
+      enabled: true,
+      created_at: new Date().toISOString(),
+      updated_at: new Date().toISOString(),
+    };
+    repo.createRoleProfile(role);
+
+    const provA: Provider = {
+      id: 'prov-a-25',
+      name: 'Provider A',
+      adapter_type: 'API',
+      enabled: true,
+      created_at: new Date().toISOString(),
+    };
+    const provB: Provider = {
+      id: 'prov-b-25',
+      name: 'Provider B',
+      adapter_type: 'API',
+      enabled: true,
+      created_at: new Date().toISOString(),
+    };
+    repo.createProvider(provA);
+    repo.createProvider(provB);
+
+    const acctB: ProviderAccount = {
+      id: 'acct-b-25',
+      provider_id: 'prov-b-25', // Belongs to Prov B
+      label: 'Account B',
+      auth_mode: 'API_CREDENTIAL',
+      credential_ref: null,
+      profile_ref: null,
+      enabled: true,
+      priority: 1,
+      health_status: 'AVAILABLE',
+      cooldown_until: null,
+      concurrency_limit: 1,
+      last_success_at: null,
+      last_failure_at: null,
+      last_failure_code: null,
+      created_at: new Date().toISOString(),
+      updated_at: new Date().toISOString(),
+    };
+    repo.createProviderAccount(acctB);
+
+    const resB: ProviderResource = {
+      id: 'res-b-25',
+      provider_id: 'prov-b-25',
+      provider_account_id: 'acct-b-25',
+      model_name: 'model-b',
+      health_status: 'AVAILABLE',
+      capabilities: ['CODING' as Capability],
+      enabled: true,
+      total_quota: null,
+      remaining_quota: null,
+      quota_unit: 'REQUESTS',
+      quota_reset_at: null,
+      quota_source: 'MANUAL',
+      quota_confidence: 1.0,
+      last_health_check: new Date().toISOString(),
+    };
+    repo.createProviderResource(resB);
+
+    const mismatchedAssignment: AgentAssignment = {
+      id: 'asgn-mismatch-25',
+      project_id: 'proj-25',
+      task_id: 'task-25',
+      attempt_id: null,
+      role_profile_id: 'rp-25',
+      agent_profile_id: null,
+      selected_provider_id: 'prov-a-25', // Selected Provider A (mismatch with Account B from Prov B)
+      selected_account_id: 'acct-b-25',
+      selected_resource_id: 'res-b-25',
+      selected_worker_slot_id: null,
+      routing_decision_id: null,
+      preferred_metadata: null,
+      status: 'ASSIGNED',
+      created_at: new Date().toISOString(),
+      ended_at: null,
+    };
+
+    expect(() => repo.createAgentAssignment(mismatchedAssignment)).toThrow(/Provider account mismatch/);
+  });
+
+  // 26. selected account A + selected resource account B rejected
+  it('26. createAgentAssignment rejects selected account A with resource belonging to account B', () => {
+    const proj: Project = {
+      id: 'proj-26',
+      name: 'Project 26',
+      description: null,
+      repository_path: 'd:/p',
+      default_branch: 'main',
+      status: 'RUNNING',
+      contract: null,
+      created_at: new Date().toISOString(),
+      updated_at: new Date().toISOString(),
+      started_at: null,
+      completed_at: null,
+    };
+    repo.createProject(proj);
+
+    const task: Task = {
+      id: 'task-26',
+      project_id: 'proj-26',
+      milestone_id: null,
+      title: 'Task 26',
+      description: null,
+      state: 'DISPATCHED',
+      paused_from_state: null,
+      priority: 'HIGH',
+      risk: 'MEDIUM',
+      assigned_agent_id: null,
+      revision_count: 1,
+      max_revisions: 3,
+      base_sha: null,
+      current_sha: null,
+      progress_cache_percent: 0,
+      progress_computed_at: null,
+      acceptance_criteria: [],
+      constraints: [],
+      created_at: new Date().toISOString(),
+      updated_at: new Date().toISOString(),
+    };
+    repo.createTask(task);
+
+    const role: RoleProfile = {
+      id: 'rp-26',
+      role: 'CODER',
+      display_name: 'Coder 26',
+      required_capabilities: ['CODING' as Capability],
+      preferred_capabilities: [],
+      authority_scope: null,
+      permissions: [],
+      output_protocol: null,
+      enabled: true,
+      created_at: new Date().toISOString(),
+      updated_at: new Date().toISOString(),
+    };
+    repo.createRoleProfile(role);
+
+    const prov: Provider = {
+      id: 'prov-26',
+      name: 'Provider 26',
+      adapter_type: 'API',
+      enabled: true,
+      created_at: new Date().toISOString(),
+    };
+    repo.createProvider(prov);
+
+    const acct1: ProviderAccount = {
+      id: 'acct-1-26',
+      provider_id: 'prov-26',
+      label: 'Account 1',
+      auth_mode: 'API_CREDENTIAL',
+      credential_ref: null,
+      profile_ref: null,
+      enabled: true,
+      priority: 1,
+      health_status: 'AVAILABLE',
+      cooldown_until: null,
+      concurrency_limit: 1,
+      last_success_at: null,
+      last_failure_at: null,
+      last_failure_code: null,
+      created_at: new Date().toISOString(),
+      updated_at: new Date().toISOString(),
+    };
+    const acct2: ProviderAccount = {
+      id: 'acct-2-26',
+      provider_id: 'prov-26',
+      label: 'Account 2',
+      auth_mode: 'API_CREDENTIAL',
+      credential_ref: null,
+      profile_ref: null,
+      enabled: true,
+      priority: 1,
+      health_status: 'AVAILABLE',
+      cooldown_until: null,
+      concurrency_limit: 1,
+      last_success_at: null,
+      last_failure_at: null,
+      last_failure_code: null,
+      created_at: new Date().toISOString(),
+      updated_at: new Date().toISOString(),
+    };
+    repo.createProviderAccount(acct1);
+    repo.createProviderAccount(acct2);
+
+    const res2: ProviderResource = {
+      id: 'res-2-26',
+      provider_id: 'prov-26',
+      provider_account_id: 'acct-2-26', // Resource belongs to Account 2
+      model_name: 'model-2',
+      health_status: 'AVAILABLE',
+      capabilities: ['CODING' as Capability],
+      enabled: true,
+      total_quota: null,
+      remaining_quota: null,
+      quota_unit: 'REQUESTS',
+      quota_reset_at: null,
+      quota_source: 'MANUAL',
+      quota_confidence: 1.0,
+      last_health_check: new Date().toISOString(),
+    };
+    repo.createProviderResource(res2);
+
+    const mismatchedAssignment: AgentAssignment = {
+      id: 'asgn-mismatch-26',
+      project_id: 'proj-26',
+      task_id: 'task-26',
+      attempt_id: null,
+      role_profile_id: 'rp-26',
+      agent_profile_id: null,
+      selected_provider_id: 'prov-26',
+      selected_account_id: 'acct-1-26', // Selected Account 1 (mismatch with res-2-26 on Account 2)
+      selected_resource_id: 'res-2-26',
+      selected_worker_slot_id: null,
+      routing_decision_id: null,
+      preferred_metadata: null,
+      status: 'ASSIGNED',
+      created_at: new Date().toISOString(),
+      ended_at: null,
+    };
+
+    expect(() => repo.createAgentAssignment(mismatchedAssignment)).toThrow(/Account resource mismatch/);
+  });
+
+  // 27. selected worker slot account B for assignment account A rejected
+  it('27. createAgentAssignment rejects selected worker slot on account B for assignment account A', () => {
+    const proj: Project = {
+      id: 'proj-27',
+      name: 'Project 27',
+      description: null,
+      repository_path: 'd:/p',
+      default_branch: 'main',
+      status: 'RUNNING',
+      contract: null,
+      created_at: new Date().toISOString(),
+      updated_at: new Date().toISOString(),
+      started_at: null,
+      completed_at: null,
+    };
+    repo.createProject(proj);
+
+    const task: Task = {
+      id: 'task-27',
+      project_id: 'proj-27',
+      milestone_id: null,
+      title: 'Task 27',
+      description: null,
+      state: 'DISPATCHED',
+      paused_from_state: null,
+      priority: 'HIGH',
+      risk: 'MEDIUM',
+      assigned_agent_id: null,
+      revision_count: 1,
+      max_revisions: 3,
+      base_sha: null,
+      current_sha: null,
+      progress_cache_percent: 0,
+      progress_computed_at: null,
+      acceptance_criteria: [],
+      constraints: [],
+      created_at: new Date().toISOString(),
+      updated_at: new Date().toISOString(),
+    };
+    repo.createTask(task);
+
+    const role: RoleProfile = {
+      id: 'rp-27',
+      role: 'CODER',
+      display_name: 'Coder 27',
+      required_capabilities: ['CODING' as Capability],
+      preferred_capabilities: [],
+      authority_scope: null,
+      permissions: [],
+      output_protocol: null,
+      enabled: true,
+      created_at: new Date().toISOString(),
+      updated_at: new Date().toISOString(),
+    };
+    repo.createRoleProfile(role);
+
+    const prov: Provider = {
+      id: 'prov-27',
+      name: 'Provider 27',
+      adapter_type: 'API',
+      enabled: true,
+      created_at: new Date().toISOString(),
+    };
+    repo.createProvider(prov);
+
+    const acct1: ProviderAccount = {
+      id: 'acct-1-27',
+      provider_id: 'prov-27',
+      label: 'Account 1',
+      auth_mode: 'API_CREDENTIAL',
+      credential_ref: null,
+      profile_ref: null,
+      enabled: true,
+      priority: 1,
+      health_status: 'AVAILABLE',
+      cooldown_until: null,
+      concurrency_limit: 1,
+      last_success_at: null,
+      last_failure_at: null,
+      last_failure_code: null,
+      created_at: new Date().toISOString(),
+      updated_at: new Date().toISOString(),
+    };
+    const acct2: ProviderAccount = {
+      id: 'acct-2-27',
+      provider_id: 'prov-27',
+      label: 'Account 2',
+      auth_mode: 'API_CREDENTIAL',
+      credential_ref: null,
+      profile_ref: null,
+      enabled: true,
+      priority: 1,
+      health_status: 'AVAILABLE',
+      cooldown_until: null,
+      concurrency_limit: 1,
+      last_success_at: null,
+      last_failure_at: null,
+      last_failure_code: null,
+      created_at: new Date().toISOString(),
+      updated_at: new Date().toISOString(),
+    };
+    repo.createProviderAccount(acct1);
+    repo.createProviderAccount(acct2);
+
+    const res1: ProviderResource = {
+      id: 'res-1-27',
+      provider_id: 'prov-27',
+      provider_account_id: 'acct-1-27',
+      model_name: 'model-1',
+      health_status: 'AVAILABLE',
+      capabilities: ['CODING' as Capability],
+      enabled: true,
+      total_quota: null,
+      remaining_quota: null,
+      quota_unit: 'REQUESTS',
+      quota_reset_at: null,
+      quota_source: 'MANUAL',
+      quota_confidence: 1.0,
+      last_health_check: new Date().toISOString(),
+    };
+    const res2: ProviderResource = {
+      id: 'res-2-27',
+      provider_id: 'prov-27',
+      provider_account_id: 'acct-2-27',
+      model_name: 'model-2',
+      health_status: 'AVAILABLE',
+      capabilities: ['CODING' as Capability],
+      enabled: true,
+      total_quota: null,
+      remaining_quota: null,
+      quota_unit: 'REQUESTS',
+      quota_reset_at: null,
+      quota_source: 'MANUAL',
+      quota_confidence: 1.0,
+      last_health_check: new Date().toISOString(),
+    };
+    repo.createProviderResource(res1);
+    repo.createProviderResource(res2);
+
+    const slot2: WorkerSlot = {
+      id: 'slot-2-27',
+      provider_account_id: 'acct-2-27', // Slot on Account 2
+      provider_resource_id: 'res-2-27',
+      slot_index: 0,
+      status: 'IDLE',
+      current_assignment_id: null,
+      current_execution_id: null,
+      heartbeat_at: null,
+      created_at: new Date().toISOString(),
+      updated_at: new Date().toISOString(),
+    };
+    repo.createWorkerSlot(slot2);
+
+    const mismatchedAssignment: AgentAssignment = {
+      id: 'asgn-mismatch-27',
+      project_id: 'proj-27',
+      task_id: 'task-27',
+      attempt_id: null,
+      role_profile_id: 'rp-27',
+      agent_profile_id: null,
+      selected_provider_id: 'prov-27',
+      selected_account_id: 'acct-1-27', // Assignment on Account 1
+      selected_resource_id: 'res-1-27',
+      selected_worker_slot_id: 'slot-2-27', // Slot on Account 2
+      routing_decision_id: null,
+      preferred_metadata: null,
+      status: 'ASSIGNED',
+      created_at: new Date().toISOString(),
+      ended_at: null,
+    };
+
+    expect(() => repo.createAgentAssignment(mismatchedAssignment)).toThrow(/Assignment slot account mismatch/);
+  });
+
+  // 28. account lease account/slot inconsistent with assignment rejected
+  it('28. createAccountLease rejects lease account or slot inconsistent with assignment bindings', () => {
+    const proj: Project = {
+      id: 'proj-28',
+      name: 'Project 28',
+      description: null,
+      repository_path: 'd:/p',
+      default_branch: 'main',
+      status: 'RUNNING',
+      contract: null,
+      created_at: new Date().toISOString(),
+      updated_at: new Date().toISOString(),
+      started_at: null,
+      completed_at: null,
+    };
+    repo.createProject(proj);
+
+    const task: Task = {
+      id: 'task-28',
+      project_id: 'proj-28',
+      milestone_id: null,
+      title: 'Task 28',
+      description: null,
+      state: 'DISPATCHED',
+      paused_from_state: null,
+      priority: 'HIGH',
+      risk: 'MEDIUM',
+      assigned_agent_id: null,
+      revision_count: 1,
+      max_revisions: 3,
+      base_sha: null,
+      current_sha: null,
+      progress_cache_percent: 0,
+      progress_computed_at: null,
+      acceptance_criteria: [],
+      constraints: [],
+      created_at: new Date().toISOString(),
+      updated_at: new Date().toISOString(),
+    };
+    repo.createTask(task);
+
+    const role: RoleProfile = {
+      id: 'rp-28',
+      role: 'CODER',
+      display_name: 'Coder 28',
+      required_capabilities: ['CODING' as Capability],
+      preferred_capabilities: [],
+      authority_scope: null,
+      permissions: [],
+      output_protocol: null,
+      enabled: true,
+      created_at: new Date().toISOString(),
+      updated_at: new Date().toISOString(),
+    };
+    repo.createRoleProfile(role);
+
+    const prov: Provider = {
+      id: 'prov-28',
+      name: 'Provider 28',
+      adapter_type: 'API',
+      enabled: true,
+      created_at: new Date().toISOString(),
+    };
+    repo.createProvider(prov);
+
+    const acct1: ProviderAccount = {
+      id: 'acct-1-28',
+      provider_id: 'prov-28',
+      label: 'Account 1',
+      auth_mode: 'API_CREDENTIAL',
+      credential_ref: null,
+      profile_ref: null,
+      enabled: true,
+      priority: 1,
+      health_status: 'AVAILABLE',
+      cooldown_until: null,
+      concurrency_limit: 1,
+      last_success_at: null,
+      last_failure_at: null,
+      last_failure_code: null,
+      created_at: new Date().toISOString(),
+      updated_at: new Date().toISOString(),
+    };
+    const acct2: ProviderAccount = {
+      id: 'acct-2-28',
+      provider_id: 'prov-28',
+      label: 'Account 2',
+      auth_mode: 'API_CREDENTIAL',
+      credential_ref: null,
+      profile_ref: null,
+      enabled: true,
+      priority: 1,
+      health_status: 'AVAILABLE',
+      cooldown_until: null,
+      concurrency_limit: 1,
+      last_success_at: null,
+      last_failure_at: null,
+      last_failure_code: null,
+      created_at: new Date().toISOString(),
+      updated_at: new Date().toISOString(),
+    };
+    repo.createProviderAccount(acct1);
+    repo.createProviderAccount(acct2);
+
+    const res1: ProviderResource = {
+      id: 'res-1-28',
+      provider_id: 'prov-28',
+      provider_account_id: 'acct-1-28',
+      model_name: 'model-1',
+      health_status: 'AVAILABLE',
+      capabilities: ['CODING' as Capability],
+      enabled: true,
+      total_quota: null,
+      remaining_quota: null,
+      quota_unit: 'REQUESTS',
+      quota_reset_at: null,
+      quota_source: 'MANUAL',
+      quota_confidence: 1.0,
+      last_health_check: new Date().toISOString(),
+    };
+    const res2: ProviderResource = {
+      id: 'res-2-28',
+      provider_id: 'prov-28',
+      provider_account_id: 'acct-2-28',
+      model_name: 'model-2',
+      health_status: 'AVAILABLE',
+      capabilities: ['CODING' as Capability],
+      enabled: true,
+      total_quota: null,
+      remaining_quota: null,
+      quota_unit: 'REQUESTS',
+      quota_reset_at: null,
+      quota_source: 'MANUAL',
+      quota_confidence: 1.0,
+      last_health_check: new Date().toISOString(),
+    };
+    repo.createProviderResource(res1);
+    repo.createProviderResource(res2);
+
+    const slot1: WorkerSlot = {
+      id: 'slot-1-28',
+      provider_account_id: 'acct-1-28',
+      provider_resource_id: 'res-1-28',
+      slot_index: 0,
+      status: 'IDLE',
+      current_assignment_id: null,
+      current_execution_id: null,
+      heartbeat_at: null,
+      created_at: new Date().toISOString(),
+      updated_at: new Date().toISOString(),
+    };
+    const slot2: WorkerSlot = {
+      id: 'slot-2-28',
+      provider_account_id: 'acct-2-28',
+      provider_resource_id: 'res-2-28',
+      slot_index: 0,
+      status: 'IDLE',
+      current_assignment_id: null,
+      current_execution_id: null,
+      heartbeat_at: null,
+      created_at: new Date().toISOString(),
+      updated_at: new Date().toISOString(),
+    };
+    repo.createWorkerSlot(slot1);
+    repo.createWorkerSlot(slot2);
+
+    const validAsgn: AgentAssignment = {
+      id: 'asgn-valid-28',
+      project_id: 'proj-28',
+      task_id: 'task-28',
+      attempt_id: null,
+      role_profile_id: 'rp-28',
+      agent_profile_id: null,
+      selected_provider_id: 'prov-28',
+      selected_account_id: 'acct-1-28',
+      selected_resource_id: 'res-1-28',
+      selected_worker_slot_id: 'slot-1-28',
+      routing_decision_id: null,
+      preferred_metadata: null,
+      status: 'ASSIGNED',
+      created_at: new Date().toISOString(),
+      ended_at: null,
+    };
+    repo.createAgentAssignment(validAsgn);
+
+    // Mismatched account
+    const leaseWrongAccount: AccountLease = {
+      id: 'lease-bad-acct-28',
+      assignment_id: 'asgn-valid-28',
+      provider_account_id: 'acct-2-28', // Mismatch with assignment acct-1-28
+      worker_slot_id: 'slot-1-28',
+      lease_token: 'tok-bad-acct',
+      acquired_at: new Date().toISOString(),
+      expires_at: new Date(Date.now() + 60000).toISOString(),
+      heartbeat_at: new Date().toISOString(),
+      released_at: null,
+    };
+    expect(() => repo.createAccountLease(leaseWrongAccount)).toThrow(/Lease account mismatch/);
+
+    // Mismatched slot
+    const leaseWrongSlot: AccountLease = {
+      id: 'lease-bad-slot-28',
+      assignment_id: 'asgn-valid-28',
+      provider_account_id: 'acct-1-28',
+      worker_slot_id: 'slot-2-28', // Mismatch with assignment slot-1-28
+      lease_token: 'tok-bad-slot',
+      acquired_at: new Date().toISOString(),
+      expires_at: new Date(Date.now() + 60000).toISOString(),
+      heartbeat_at: new Date().toISOString(),
+      released_at: null,
+    };
+    expect(() => repo.createAccountLease(leaseWrongSlot)).toThrow(/Lease slot mismatch/);
+  });
+
+  // 29. status-only worker-slot update preserves assignment/execution IDs
+  it('29. updateWorkerSlotStatus preserves assignment, execution, and heartbeat when omitted (undefined)', () => {
+    const prov: Provider = {
+      id: 'prov-29',
+      name: 'Provider 29',
+      adapter_type: 'API',
+      enabled: true,
+      created_at: new Date().toISOString(),
+    };
+    repo.createProvider(prov);
+
+    const acct: ProviderAccount = {
+      id: 'acct-29',
+      provider_id: 'prov-29',
+      label: 'Account 29',
+      auth_mode: 'API_CREDENTIAL',
+      credential_ref: null,
+      profile_ref: null,
+      enabled: true,
+      priority: 1,
+      health_status: 'AVAILABLE',
+      cooldown_until: null,
+      concurrency_limit: 1,
+      last_success_at: null,
+      last_failure_at: null,
+      last_failure_code: null,
+      created_at: new Date().toISOString(),
+      updated_at: new Date().toISOString(),
+    };
+    repo.createProviderAccount(acct);
+
+    const initialHeartbeat = '2026-08-20T00:00:00.000Z';
+    const slot: WorkerSlot = {
+      id: 'slot-29',
+      provider_account_id: 'acct-29',
+      provider_resource_id: null,
+      slot_index: 0,
+      status: 'IDLE',
+      current_assignment_id: 'asgn-existing-29',
+      current_execution_id: 'exec-existing-29',
+      heartbeat_at: initialHeartbeat,
+      created_at: new Date().toISOString(),
+      updated_at: new Date().toISOString(),
+    };
+    repo.createWorkerSlot(slot);
+
+    // Status-only update (all other args undefined)
+    repo.updateWorkerSlotStatus('slot-29', 'RUNNING');
+
+    const updated = repo.getWorkerSlot('slot-29');
+    expect(updated).toBeDefined();
+    expect(updated?.status).toBe('RUNNING');
+    expect(updated?.current_assignment_id).toBe('asgn-existing-29'); // PRESERVED
+    expect(updated?.current_execution_id).toBe('exec-existing-29'); // PRESERVED
+    expect(updated?.heartbeat_at).toBe(initialHeartbeat); // PRESERVED
+  });
+
+  // 30. explicit null worker-slot update clears intended IDs and explicit string sets new IDs
+  it('30. updateWorkerSlotStatus clears fields with explicit null and sets fields with explicit strings', () => {
+    const prov: Provider = {
+      id: 'prov-30',
+      name: 'Provider 30',
+      adapter_type: 'API',
+      enabled: true,
+      created_at: new Date().toISOString(),
+    };
+    repo.createProvider(prov);
+
+    const acct: ProviderAccount = {
+      id: 'acct-30',
+      provider_id: 'prov-30',
+      label: 'Account 30',
+      auth_mode: 'API_CREDENTIAL',
+      credential_ref: null,
+      profile_ref: null,
+      enabled: true,
+      priority: 1,
+      health_status: 'AVAILABLE',
+      cooldown_until: null,
+      concurrency_limit: 1,
+      last_success_at: null,
+      last_failure_at: null,
+      last_failure_code: null,
+      created_at: new Date().toISOString(),
+      updated_at: new Date().toISOString(),
+    };
+    repo.createProviderAccount(acct);
+
+    const slot: WorkerSlot = {
+      id: 'slot-30',
+      provider_account_id: 'acct-30',
+      provider_resource_id: null,
+      slot_index: 0,
+      status: 'RUNNING',
+      current_assignment_id: 'asgn-to-clear-30',
+      current_execution_id: 'exec-to-clear-30',
+      heartbeat_at: '2026-08-20T00:00:00.000Z',
+      created_at: new Date().toISOString(),
+      updated_at: new Date().toISOString(),
+    };
+    repo.createWorkerSlot(slot);
+
+    // 1. Explicit null to clear assignment and execution bindings
+    const customHeartbeat = '2026-08-23T12:00:00.000Z';
+    repo.updateWorkerSlotStatus('slot-30', 'IDLE', null, null, customHeartbeat);
+
+    let current = repo.getWorkerSlot('slot-30');
+    expect(current?.status).toBe('IDLE');
+    expect(current?.current_assignment_id).toBeNull(); // CLEARED
+    expect(current?.current_execution_id).toBeNull(); // CLEARED
+    expect(current?.heartbeat_at).toBe(customHeartbeat); // UPDATED
+
+    // 2. Explicit string to set new assignment and execution bindings
+    repo.updateWorkerSlotStatus('slot-30', 'LEASED', 'asgn-new-30', 'exec-new-30');
+
+    current = repo.getWorkerSlot('slot-30');
+    expect(current?.status).toBe('LEASED');
+    expect(current?.current_assignment_id).toBe('asgn-new-30'); // SET
+    expect(current?.current_execution_id).toBe('exec-new-30'); // SET
+    expect(current?.heartbeat_at).toBe(customHeartbeat); // PRESERVED (since heartbeat was undefined)
+
+    // 3. Explicit heartbeat update method
+    const finalHeartbeat = '2026-08-23T15:30:00.000Z';
+    repo.updateWorkerSlotHeartbeat('slot-30', finalHeartbeat);
+
+    current = repo.getWorkerSlot('slot-30');
+    expect(current?.heartbeat_at).toBe(finalHeartbeat); // UPDATED
+    expect(current?.current_assignment_id).toBe('asgn-new-30'); // PRESERVED
+    expect(current?.current_execution_id).toBe('exec-new-30'); // PRESERVED
+  });
 });
