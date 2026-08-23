@@ -49,16 +49,18 @@ describe('PR #19 — Production Release Pipeline Hardening Contract Tests', () =
     expect(normalize('v0.1.1')).toBe('v0.1.1');
   });
 
-  it('5. release-windows.yml enforces exhaustive collision guards with exact-tag fail-closed lookup', () => {
+  it('5. release-windows.yml enforces exhaustive draft-aware release collision guard with pagination and fail-closed semantics', () => {
     const workflow = fs.readFileSync(releaseWorkflowPath, 'utf8');
     // Checks both canonical and unprefixed remote git tags
     expect(workflow).toMatch(/git ls-remote --tags origin/);
     expect(workflow).toMatch(/refs\/tags\/\$canonicalTag/);
     expect(workflow).toMatch(/refs\/tags\/\$normalizedVersion/);
-    // Queries exact release endpoint
-    expect(workflow).toMatch(/\/repos\/\$\{\{\s*github\.repository\s*\}\}\/releases\/tags\/\$tagToCheck/);
-    // Confirms only 404 / Not Found is acceptable absent condition
+    // Queries paginated releases list capable of inspecting drafts
+    expect(workflow).toMatch(/gh api --paginate ["']\/repos\/\$\{\{\s*github\.repository\s*\}\}\/releases["']/);
+    expect(workflow).toMatch(/\$matchingReleases\.Count -gt 0/);
+    expect(workflow).toMatch(/COLLISION GUARD FAIL-CLOSED/);
     expect(workflow).toMatch(/COLLISION GUARD LOOKUP FAILURE FAIL-CLOSED/);
+    expect(workflow).toMatch(/COLLISION GUARD PARSE FAILURE FAIL-CLOSED/);
   });
 
   it('6. release-windows.yml executes ALL release gates and asserts strict execution ordering', () => {
@@ -99,16 +101,23 @@ describe('PR #19 — Production Release Pipeline Hardening Contract Tests', () =
     expect(workflow).not.toMatch(/--publish always/);
   });
 
-  it('8. release-windows.yml creates GitHub release explicitly as DRAFT with post-creation size verification', () => {
+  it('8. release-windows.yml creates GitHub release explicitly as DRAFT and verifies all 5 uploaded asset sizes and digests', () => {
     const workflow = fs.readFileSync(releaseWorkflowPath, 'utf8');
     expect(workflow).toMatch(/gh release create \$canonicalTag/);
     expect(workflow).toMatch(/--draft/);
     expect(workflow).toMatch(/--target \$sha/);
     expect(workflow).toMatch(/--notes-file \$metadataPath/);
     expect(workflow).toMatch(/release\\publish-assets/);
-    expect(workflow).toMatch(/gh release view \$canonicalTag --json isDraft,isPrerelease,tagName,targetCommitish,assets/);
-    expect(workflow).toMatch(/assetDict\[\$expectedInstaller\]\.size/);
-    expect(workflow).toMatch(/assetDict\[\$expectedBlockmap\]\.size/);
+    expect(workflow).toMatch(/gh release view \$canonicalTag --json id,databaseId,isDraft,isPrerelease,tagName,targetCommitish,assets/);
+    expect(workflow).toMatch(/gh api --paginate ["']\/repos\/\$\{\{\s*github\.repository\s*\}\}\/releases\/\$releaseId\/assets["']/);
+
+    // Verifies all 5 assets for both size and sha256 digest
+    expect(workflow).toMatch(/POST_DRAFT_EXPECTED_ASSET_COUNT=5/);
+    expect(workflow).toMatch(/ASSET SIZE MISMATCH/);
+    expect(workflow).toMatch(/ASSET DIGEST MISMATCH/);
+    expect(workflow).toMatch(/\$expectedDigest\s*=\s*["']sha256:\$localSha256["']/);
+    expect(workflow).toMatch(/POST_DRAFT_ALL_ASSET_SIZE_MATCH=YES/);
+    expect(workflow).toMatch(/POST_DRAFT_ALL_ASSET_DIGEST_MATCH=YES/);
   });
 
   it('9. scripts/prepare-release-assets-win.ps1 supports -VerifyOnly, -FinalizeRcStatus, and verifies all hash/byte invariants', () => {

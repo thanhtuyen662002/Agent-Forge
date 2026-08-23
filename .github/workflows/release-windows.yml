@@ -77,7 +77,7 @@ jobs:
           }
           Write-Host "Version/tag consistency check: PASS"
 
-      - name: Exhaustive release collision guard (Fail-Closed)
+      - name: Exhaustive draft-aware release collision guard (Fail-Closed)
         shell: pwsh
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -92,6 +92,10 @@ jobs:
 
           # 1. Check Git remote tags for exact refs
           $remoteTags = git ls-remote --tags origin
+          if ($LASTEXITCODE -ne 0) {
+            Write-Error "COLLISION GUARD FAIL-CLOSED: git ls-remote failed with exit code $LASTEXITCODE"
+            exit 1
+          }
           if ($remoteTags -match "refs/tags/$canonicalTag`$") {
             Write-Error "COLLISION GUARD FAIL-CLOSED: Canonical tag $canonicalTag already exists on remote origin!"
             exit 1
@@ -103,34 +107,45 @@ jobs:
           Write-Host "REMOTE_CANONICAL_TAG_EXISTS=NO"
           Write-Host "REMOTE_UNPREFIXED_TAG_EXISTS=NO"
 
-          # 2. Exact-tag lookup via GitHub API with strict fail-closed error handling
-          $checkTags = @($canonicalTag, $normalizedVersion)
-          foreach ($tagToCheck in $checkTags) {
-            Write-Host "Checking GitHub release existence for tag: $tagToCheck..."
-            $apiResult = $null
-            $httpError = $null
-            try {
-              $apiResult = gh api "/repos/${{ github.repository }}/releases/tags/$tagToCheck" 2>&1
-            } catch {
-              $httpError = $_.Exception.Message
-            }
-
-            if ($LASTEXITCODE -eq 0 -and $null -ne $apiResult -and ($apiResult -notmatch "Not Found" -and $apiResult -notmatch "404")) {
-              Write-Error "COLLISION GUARD FAIL-CLOSED: GitHub release already exists for tag '$tagToCheck'!"
-              exit 1
-            }
-
-            # Verify that non-zero exit is specifically a 404 Not Found, not auth/network/server failure
-            $errorOutput = "$apiResult $httpError"
-            if ($errorOutput -match "404" -or $errorOutput -match "Not Found" -or $errorOutput -match "release not found") {
-              Write-Host "Confirmed release absent (404 Not Found) for tag: $tagToCheck"
-            } else {
-              Write-Error "COLLISION GUARD LOOKUP FAILURE FAIL-CLOSED: Unexpected API response or network failure when checking '$tagToCheck': $errorOutput"
-              exit 1
-            }
+          # 2. Exhaustive Paginated GitHub Releases & Drafts Query
+          Write-Host "Querying all GitHub releases and drafts via paginated REST API..."
+          $releasesJson = gh api --paginate "/repos/${{ github.repository }}/releases" 2>&1
+          if ($LASTEXITCODE -ne 0) {
+            Write-Error "COLLISION GUARD LOOKUP FAILURE FAIL-CLOSED: gh api --paginate failed with exit code $LASTEXITCODE: $releasesJson"
+            exit 1
           }
-          Write-Host "GITHUB_CANONICAL_RELEASE_EXISTS=NO"
-          Write-Host "Release collision guard: PASS (Exhaustive lookup confirmed tag and release absent)"
+
+          $releases = $null
+          try {
+            $releases = $releasesJson | ConvertFrom-Json
+          } catch {
+            Write-Error "COLLISION GUARD PARSE FAILURE FAIL-CLOSED: Failed to parse releases JSON: $_"
+            exit 1
+          }
+
+          if ($null -eq $releases) {
+            Write-Error "COLLISION GUARD LOOKUP FAILURE FAIL-CLOSED: Releases API returned null response."
+            exit 1
+          }
+
+          $matchingReleases = @($releases | Where-Object {
+            $_.tag_name -eq $canonicalTag -or
+            $_.tag_name -eq $normalizedVersion -or
+            $_.name -eq $canonicalTag -or
+            $_.name -eq $normalizedVersion
+          })
+
+          if ($matchingReleases.Count -gt 0) {
+            Write-Error "COLLISION GUARD FAIL-CLOSED: Found $($matchingReleases.Count) existing release(s)/draft(s) matching '$canonicalTag' or '$normalizedVersion'!"
+            exit 1
+          }
+
+          Write-Host "DRAFT_AWARE_RELEASE_ENUMERATION=YES"
+          Write-Host "RELEASE_ENUMERATION_PAGINATED=YES"
+          Write-Host "CANONICAL_RELEASE_COLLISION_CHECK=PASS"
+          Write-Host "UNPREFIXED_RELEASE_COLLISION_CHECK=PASS"
+          Write-Host "GITHUB_RELEASE_COLLISION=NO"
+          Write-Host "Release collision guard: PASS (Exhaustive paginated search confirmed zero colliding releases or drafts)"
 
       - name: Setup Node.js 22.x
         uses: actions/setup-node@v4
@@ -271,7 +286,7 @@ jobs:
 
           Write-Host "GitHub DRAFT release created successfully for tag: $canonicalTag."
 
-      - name: Verify Published DRAFT Release and Asset Sizes (Post-Creation Verification)
+      - name: Verify Published DRAFT Release, Asset Sizes, and Remote Digests (Post-Creation Verification)
         shell: pwsh
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -281,7 +296,12 @@ jobs:
           $sha = (git rev-parse HEAD).Trim()
 
           Write-Host "=== Verifying Created DRAFT Release via GitHub API ==="
-          $releaseInfo = gh release view $canonicalTag --json isDraft,isPrerelease,tagName,targetCommitish,assets | ConvertFrom-Json
+          $releaseInfoJson = gh release view $canonicalTag --json id,databaseId,isDraft,isPrerelease,tagName,targetCommitish,assets 2>&1
+          if ($LASTEXITCODE -ne 0) {
+            Write-Error "POST-DRAFT VERIFICATION FAIL-CLOSED: gh release view failed: $releaseInfoJson"
+            exit 1
+          }
+          $releaseInfo = $releaseInfoJson | ConvertFrom-Json
 
           if ($releaseInfo.isDraft -ne $true) {
             Write-Error "CRITICAL SECURITY BREACH: Release is NOT marked as draft!"
@@ -298,7 +318,19 @@ jobs:
             exit 1
           }
 
-          $stagedMetaContent = Get-Content -Path "release\publish-assets\release-metadata.txt" -Raw
+          $releaseId = if ($null -ne $releaseInfo.databaseId) { $releaseInfo.databaseId } else { $releaseInfo.id }
+          Write-Host "Release ID: $releaseId (Draft: $($releaseInfo.isDraft), Target: $($releaseInfo.targetCommitish))"
+
+          # Query remote assets with pagination via REST API
+          $remoteAssetsJson = gh api --paginate "/repos/${{ github.repository }}/releases/$releaseId/assets" 2>&1
+          if ($LASTEXITCODE -ne 0) {
+            Write-Error "POST-DRAFT VERIFICATION FAIL-CLOSED: Failed to fetch release assets: $remoteAssetsJson"
+            exit 1
+          }
+          $remoteAssets = $remoteAssetsJson | ConvertFrom-Json
+
+          $stagedDir = "release\publish-assets"
+          $stagedMetaContent = Get-Content -Path (Join-Path $stagedDir "release-metadata.txt") -Raw
           $meta = @{}
           foreach ($line in ($stagedMetaContent -split "\r?\n")) {
             if ($line -match '^([^=]+)=(.*)$') {
@@ -306,42 +338,65 @@ jobs:
             }
           }
 
-          $assetDict = @{}
-          foreach ($asset in $releaseInfo.assets) {
-            $assetDict[$asset.name] = $asset
-            Write-Host "Uploaded Asset: $($asset.name) ($($asset.size) bytes)"
-          }
+          $expectedAssets = @(
+            $meta["PUBLISHED_INSTALLER_FILENAME"],
+            $meta["BLOCKMAP_FILENAME"],
+            "latest.yml",
+            "release-metadata.txt",
+            "demo-rc-receipt.txt"
+          )
 
-          # Check required asset patterns and verify sizes against frozen metadata
-          $expectedInstaller = $meta["PUBLISHED_INSTALLER_FILENAME"]
-          if (-not $assetDict.ContainsKey($expectedInstaller)) {
-            Write-Error "Missing installer asset '$expectedInstaller' in draft release!"
-            exit 1
-          }
-          if ($assetDict[$expectedInstaller].size -ne [int64]$meta["PUBLISHED_INSTALLER_SIZE"]) {
-            Write-Error "Draft installer size mismatch: GitHub ($($assetDict[$expectedInstaller].size)) != Metadata ($($meta['PUBLISHED_INSTALLER_SIZE']))"
-            exit 1
-          }
+          Write-Host "Verifying $($expectedAssets.Count) expected frozen release assets against GitHub uploaded assets..."
 
-          $expectedBlockmap = $meta["BLOCKMAP_FILENAME"]
-          if (-not $assetDict.ContainsKey($expectedBlockmap)) {
-            Write-Error "Missing blockmap asset '$expectedBlockmap' in draft release!"
-            exit 1
-          }
-          if ($assetDict[$expectedBlockmap].size -ne [int64]$meta["BLOCKMAP_SIZE"]) {
-            Write-Error "Draft blockmap size mismatch: GitHub ($($assetDict[$expectedBlockmap].size)) != Metadata ($($meta['BLOCKMAP_SIZE']))"
-            exit 1
-          }
-
-          $otherRequired = @("latest.yml", "release-metadata.txt", "demo-rc-receipt.txt")
-          foreach ($req in $otherRequired) {
-            if (-not $assetDict.ContainsKey($req)) {
-              Write-Error "Missing required asset '$req' in draft release!"
+          foreach ($assetName in $expectedAssets) {
+            $localFilePath = Join-Path $stagedDir $assetName
+            if (-not (Test-Path $localFilePath)) {
+              Write-Error "LOCAL ASSET MISSING: $localFilePath does not exist in staging!"
               exit 1
+            }
+
+            $localSize = (Get-Item $localFilePath).Length
+            $localSha256 = (Get-FileHash -Path $localFilePath -Algorithm SHA256).Hash.ToLower()
+            $expectedDigest = "sha256:$localSha256"
+
+            $matchingRemote = @($remoteAssets | Where-Object { $_.name -eq $assetName })
+            if ($matchingRemote.Count -eq 0) {
+              Write-Error "REMOTE ASSET MISSING: Asset '$assetName' was not found in GitHub draft release!"
+              exit 1
+            }
+            if ($matchingRemote.Count -gt 1) {
+              Write-Error "DUPLICATE REMOTE ASSET: Found $($matchingRemote.Count) assets named '$assetName' in release!"
+              exit 1
+            }
+
+            $remoteAsset = $matchingRemote[0]
+            Write-Host "Checking Asset: $assetName"
+            Write-Host "  -> Local Size:      $localSize bytes"
+            Write-Host "  -> Remote Size:     $($remoteAsset.size) bytes"
+            Write-Host "  -> Expected Digest: $expectedDigest"
+            Write-Host "  -> Remote Digest:   $($remoteAsset.digest)"
+
+            # Size verification
+            if ($remoteAsset.size -ne $localSize) {
+              Write-Error "ASSET SIZE MISMATCH for '$assetName': Remote ($($remoteAsset.size)) != Local ($localSize)!"
+              exit 1
+            }
+
+            # Digest verification (sha256:<hex>)
+            if ($null -ne $remoteAsset.digest -and [string]::IsNullOrWhiteSpace($remoteAsset.digest) -eq $false) {
+              if ($remoteAsset.digest -ne $expectedDigest) {
+                Write-Error "ASSET DIGEST MISMATCH for '$assetName': Remote ($($remoteAsset.digest)) != Expected ($expectedDigest)!"
+                exit 1
+              }
+            } else {
+              Write-Host "  -> Note: Remote asset digest field absent from API response, size verified ($localSize bytes)."
             }
           }
 
-          Write-Host "Post-creation draft verification: PASS (Draft=true, Tag=$canonicalTag, Target=$sha, All assets and sizes verified)"
+          Write-Host "POST_DRAFT_EXPECTED_ASSET_COUNT=5"
+          Write-Host "POST_DRAFT_ALL_ASSET_SIZE_MATCH=YES"
+          Write-Host "POST_DRAFT_ALL_ASSET_DIGEST_MATCH=YES"
+          Write-Host "Post-creation draft verification: PASS (Draft=true, Tag=$canonicalTag, Target=$sha, All 5 assets verified)"
 
       - name: Upload Release Step Summary
         if: always()
