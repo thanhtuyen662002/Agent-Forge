@@ -286,11 +286,99 @@ export function registerIpcHandlers(
     const gitDiffEv = repo.getLatestEvidence(task.id, 'GIT_DIFF');
     const reviews = repo.getReviewsByTask(task.id);
 
-    if (!gitDiffEv) {
-      return {
-        success: false,
-        error: 'AUTHORITATIVE_DIFF_EVIDENCE_MISSING: No durable Git diff validation evidence found for this task. Run validation flow before requesting review.',
-      };
+    let diffContent = '';
+    let diffStat = '';
+
+    if (gitDiffEv) {
+      diffStat = gitDiffEv.summary || 'Git Diff recorded.';
+      try {
+        diffContent = defaultArtifactStore.read(gitDiffEv);
+      } catch {
+        diffContent = gitDiffEv.raw_payload || '';
+      }
+    } else {
+      // Strict fail-closed CLEAN-NOOP fallback
+      // Condition 1: Task state is REVIEW_READY or REVIEWING
+      if (task.state !== 'REVIEW_READY' && task.state !== 'REVIEWING') {
+        return {
+          success: false,
+          error: 'AUTHORITATIVE_DIFF_EVIDENCE_MISSING: Task is not in REVIEW_READY or REVIEWING state for clean no-op validation.',
+        };
+      }
+
+      // Condition 2 & 3: A latest authoritative TestRun exists with exit_code === 0
+      if (!latestTestRun) {
+        return {
+          success: false,
+          error: 'AUTHORITATIVE_DIFF_EVIDENCE_MISSING: No authoritative TestRun found for clean no-op validation.',
+        };
+      }
+      if (latestTestRun.exit_code !== 0) {
+        return {
+          success: false,
+          error: `AUTHORITATIVE_DIFF_EVIDENCE_MISSING: Latest TestRun has non-zero exit code (${latestTestRun.exit_code}) for clean no-op validation.`,
+        };
+      }
+
+      // Condition 4, 5, 6: task.base_sha and task.current_sha are non-null, non-empty, and equal
+      if (!task.base_sha || !task.base_sha.trim() || !task.current_sha || !task.current_sha.trim()) {
+        return {
+          success: false,
+          error: 'AUTHORITATIVE_DIFF_EVIDENCE_MISSING: Missing base_sha or current_sha on task for clean no-op validation.',
+        };
+      }
+      if (task.base_sha !== task.current_sha) {
+        return {
+          success: false,
+          error: `AUTHORITATIVE_DIFF_EVIDENCE_MISSING: Base SHA (${task.base_sha}) differs from current SHA (${task.current_sha}) for clean no-op validation.`,
+        };
+      }
+
+      // Condition 7: Durable latest GIT_STATUS evidence exists for this task
+      const gitStatusEv = repo.getLatestEvidence(task.id, 'GIT_STATUS');
+      if (!gitStatusEv) {
+        return {
+          success: false,
+          error: 'AUTHORITATIVE_DIFF_EVIDENCE_MISSING: No durable GIT_STATUS evidence found for clean no-op validation.',
+        };
+      }
+
+      // Condition 8: Read the actual durable GIT_STATUS evidence using ArtifactStore with raw_payload fallback
+      let rawStatusPayload = '';
+      try {
+        rawStatusPayload = defaultArtifactStore.read(gitStatusEv);
+      } catch {
+        rawStatusPayload = gitStatusEv.raw_payload || '';
+      }
+
+      // Condition 9: The GIT_STATUS payload parses as JSON successfully
+      let parsedGitStatus: any = null;
+      try {
+        parsedGitStatus = JSON.parse(rawStatusPayload);
+      } catch {
+        return {
+          success: false,
+          error: 'AUTHORITATIVE_DIFF_EVIDENCE_MISSING: Durable GIT_STATUS evidence is not valid JSON for clean no-op validation.',
+        };
+      }
+
+      // Condition 10 & 11: Parsed Git status reports status === "SUCCESS" and isClean === true
+      if (!parsedGitStatus || parsedGitStatus.status !== 'SUCCESS') {
+        return {
+          success: false,
+          error: 'AUTHORITATIVE_DIFF_EVIDENCE_MISSING: Durable GIT_STATUS evidence status is not SUCCESS for clean no-op validation.',
+        };
+      }
+      if (parsedGitStatus.isClean !== true) {
+        return {
+          success: false,
+          error: 'AUTHORITATIVE_DIFF_EVIDENCE_MISSING: Durable GIT_STATUS evidence reports working tree is not clean for clean no-op validation.',
+        };
+      }
+
+      // All 11 conditions hold: set clean no-op inputs
+      diffContent = '';
+      diffStat = 'Git Diff: 0 files changed (validated clean no-op working tree)';
     }
 
     // Atomically advance task to REVIEWING if in REVIEW_READY
@@ -299,15 +387,6 @@ export function registerIpcHandlers(
       if (reviewStartRes.success && reviewStartRes.task) {
         task = reviewStartRes.task;
       }
-    }
-
-    let diffContent = '';
-    const diffStat = gitDiffEv.summary || 'Git Diff recorded.';
-
-    try {
-      diffContent = defaultArtifactStore.read(gitDiffEv);
-    } catch {
-      diffContent = gitDiffEv.raw_payload || '';
     }
 
     // Restore latest applied coder report from protocol ledger
@@ -332,7 +411,7 @@ export function registerIpcHandlers(
       diffContent,
       latestTestRun,
       reviews,
-      gitDiffEv
+      gitDiffEv || undefined
     );
 
     return { success: true, reviewPackage };
