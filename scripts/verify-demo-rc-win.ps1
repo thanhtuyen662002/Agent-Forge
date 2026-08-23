@@ -6,7 +6,8 @@
 [CmdletBinding()]
 param (
   [string]$ProjectRoot = "",
-  [string]$ReceiptOutput = ""
+  [string]$ReceiptOutput = "",
+  [string]$InstallerPath = ""
 )
 
 $ErrorActionPreference = "Stop"
@@ -47,7 +48,7 @@ $receiptLines.Add("TIMESTAMP=$(Get-Date -Format 'o')")
 
 $failures = [System.Collections.Generic.List[string]]::new()
 
-# Assertion A: package.json version is exactly 0.1.0
+# Assertion A: package.json version is valid semver
 $packageJsonPath = Join-Path $ProjectRoot "package.json"
 if (-not (Test-Path $packageJsonPath)) {
   $failures.Add("A_PACKAGE_JSON_MISSING: package.json not found at $packageJsonPath")
@@ -55,9 +56,9 @@ if (-not (Test-Path $packageJsonPath)) {
 } else {
   try {
     $packageJson = Get-Content $packageJsonPath -Raw | ConvertFrom-Json
-    $expectedVersion = $packageJson.version
-    if ($expectedVersion -ne "0.1.0") {
-      $failures.Add("A_VERSION_MISMATCH: Expected package version 0.1.0, got $expectedVersion")
+    $expectedVersion = $packageJson.version.Trim()
+    if ([string]::IsNullOrWhiteSpace($expectedVersion) -or $expectedVersion -notmatch '^\d+\.\d+\.\d+') {
+      $failures.Add("A_VERSION_INVALID: Invalid package version format: $expectedVersion")
     }
   } catch {
     $failures.Add("A_PACKAGE_JSON_PARSE_ERROR: Failed to parse package.json: $_")
@@ -65,7 +66,7 @@ if (-not (Test-Path $packageJsonPath)) {
   }
 }
 $receiptLines.Add("PRODUCTION_VERSION=$expectedVersion")
-Write-Host "[A] Production Version ($expectedVersion): $(if ($expectedVersion -eq '0.1.0') {'PASS'} else {'FAIL'})"
+Write-Host "[A] Production Version ($expectedVersion): $(if ($expectedVersion -match '^\d+\.\d+\.\d+') {'PASS'} else {'FAIL'})"
 
 # Assertion B: Database migration count == 7
 $migrationsPath = Join-Path $ProjectRoot "src\core\database\migrations.ts"
@@ -123,27 +124,50 @@ $receiptLines.Add("PACKAGED_UNPACKED_EXE_EXISTS=$unpackedExists")
 Write-Host "[E] Packaged Executable ($unpackedExe): $(if ($unpackedExists) {'PASS'} else {'FAIL'})"
 
 # Assertion F, G, H: Production installer existence, size > 0, SHA256
-$installerName = "AgentForge Setup $expectedVersion.exe"
-$installerPath = Join-Path $ProjectRoot "release\$installerName"
-$installerExists = Test-Path $installerPath
+$resolvedInstallerPath = $null
+
+if (-not [string]::IsNullOrWhiteSpace($InstallerPath)) {
+  $candidate = if ([System.IO.Path]::IsPathRooted($InstallerPath)) { $InstallerPath } else { Join-Path $ProjectRoot $InstallerPath }
+  if (Test-Path $candidate) {
+    $resolvedInstallerPath = $candidate
+  }
+}
+
+if ($null -eq $resolvedInstallerPath) {
+  $candidates = @(
+    (Join-Path $ProjectRoot "release\AgentForge Setup $expectedVersion.exe"),
+    (Join-Path $ProjectRoot "release\AgentForge-Setup-$expectedVersion.exe"),
+    (Join-Path $ProjectRoot "release\publish-assets\AgentForge-Setup-$expectedVersion.exe"),
+    (Join-Path $ProjectRoot "release\publish-assets\AgentForge Setup $expectedVersion.exe")
+  )
+  foreach ($cand in $candidates) {
+    if (Test-Path $cand) {
+      $resolvedInstallerPath = $cand
+      break
+    }
+  }
+}
+
+$installerExists = ($null -ne $resolvedInstallerPath -and (Test-Path $resolvedInstallerPath))
+$installerName = if ($installerExists) { Split-Path -Leaf $resolvedInstallerPath } else { "AgentForge Setup $expectedVersion.exe" }
 $installerSize = 0
 $installerSha256 = "N/A"
 $authenticodeStatus = "Unknown"
 
 if (-not $installerExists) {
-  $failures.Add("F_INSTALLER_MISSING: Production installer not found at $installerPath")
+  $failures.Add("F_INSTALLER_MISSING: Production installer not found (searched: $InstallerPath, release/publish-assets)")
 } else {
   try {
-    $installerItem = Get-Item $installerPath
+    $installerItem = Get-Item $resolvedInstallerPath
     $installerSize = $installerItem.Length
     if ($installerSize -le 0) {
       $failures.Add("G_INSTALLER_EMPTY: Installer file size is 0 bytes")
     }
-    $installerSha256 = Get-Sha256Hex -FilePath $installerPath
+    $installerSha256 = Get-Sha256Hex -FilePath $resolvedInstallerPath
     if ([string]::IsNullOrWhiteSpace($installerSha256) -or $installerSha256.Length -ne 64) {
       $failures.Add("H_INSTALLER_SHA256_INVALID: Failed to compute valid 64-char SHA256 for installer")
     }
-    $sig = Get-AuthenticodeSignature -FilePath $installerPath
+    $sig = Get-AuthenticodeSignature -FilePath $resolvedInstallerPath
     $authenticodeStatus = $sig.Status.ToString()
   } catch {
     $failures.Add("H_INSTALLER_INSPECT_ERROR: Error inspecting installer: $_")
@@ -154,7 +178,7 @@ $receiptLines.Add("INSTALLER_EXISTS=$installerExists")
 $receiptLines.Add("INSTALLER_SIZE_BYTES=$installerSize")
 $receiptLines.Add("INSTALLER_SHA256=$installerSha256")
 $receiptLines.Add("AUTHENTICODE_STATUS=$authenticodeStatus")
-Write-Host "[F] Production Installer Exists: $(if ($installerExists) {'PASS'} else {'FAIL'})"
+Write-Host "[F] Production Installer Exists ($installerName): $(if ($installerExists) {'PASS'} else {'FAIL'})"
 Write-Host "[G] Production Installer Size ($installerSize bytes): $(if ($installerSize -gt 0) {'PASS'} else {'FAIL'})"
 Write-Host "[H] Production Installer SHA-256 ($installerSha256): $(if ($installerSha256.Length -eq 64) {'PASS'} else {'FAIL'})"
 

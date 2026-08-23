@@ -6,6 +6,7 @@ publish:
   provider: github
   owner: thanhtuyen662002
   repo: Agent-Forge
+  releaseType: draft
 
 directories:
   output: release
