@@ -160,4 +160,16 @@ describe('PR #19 — Production Release Pipeline Hardening Contract Tests', () =
     expect(verifyScript).toMatch(/\[string\]\$InstallerPath/);
     expect(smokeScript).toMatch(/\[string\]\$InstallerPath/);
   });
+
+  it('11. release collision guard uses PowerShell-safe exit-code interpolation', () => {
+    const workflow = fs.readFileSync(releaseWorkflowPath, 'utf8');
+
+    // Regression guard: invalid unparenthesized $LASTEXITCODE: followed by colon is strictly forbidden
+    expect(workflow).not.toMatch(/\$LASTEXITCODE:/);
+
+    // Safely delimited exit-code check in collision guard
+    expect(workflow).toMatch(/gh api --paginate ["']\/repos\/\$\{\{\s*github\.repository\s*\}\}\/releases["']/);
+    expect(workflow).toMatch(/if\s*\(\$LASTEXITCODE\s*-ne\s*0\)/);
+    expect(workflow).toMatch(/Write-Error ["'].*COLLISION GUARD LOOKUP FAILURE FAIL-CLOSED.*\$(\(\$LASTEXITCODE\)|\{LASTEXITCODE\}).*\$releasesJson["']/);
+  });
 });
