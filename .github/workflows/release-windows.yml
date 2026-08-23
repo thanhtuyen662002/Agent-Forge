@@ -111,7 +111,7 @@ jobs:
           Write-Host "Querying all GitHub releases and drafts via paginated REST API..."
           $releasesJson = gh api --paginate "/repos/${{ github.repository }}/releases" 2>&1
           if ($LASTEXITCODE -ne 0) {
-            Write-Error "COLLISION GUARD LOOKUP FAILURE FAIL-CLOSED: gh api --paginate failed with exit code $LASTEXITCODE: $releasesJson"
+            Write-Error "COLLISION GUARD LOOKUP FAILURE FAIL-CLOSED: gh api --paginate failed with exit code $($LASTEXITCODE): $releasesJson"
             exit 1
           }
 
