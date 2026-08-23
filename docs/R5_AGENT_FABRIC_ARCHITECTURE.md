@@ -22,16 +22,16 @@ erDiagram
     PROVIDERS ||--o{ PROVIDER_RESOURCES : "defines"
     PROVIDER_ACCOUNTS ||--o{ PROVIDER_RESOURCES : "authenticates (nullable FK)"
     PROVIDER_ACCOUNTS ||--o{ WORKER_SLOTS : "manages capacity"
-    
+
     ROLE_PROFILES ||--o{ AGENT_PROFILES : "configures"
-    
+
     ROLE_PROFILES ||--o{ AGENT_ASSIGNMENTS : "specifies role"
     AGENT_PROFILES ||--o{ AGENT_ASSIGNMENTS : "specifies profile"
     PROVIDERS ||--o{ AGENT_ASSIGNMENTS : "specifies provider"
     PROVIDER_ACCOUNTS ||--o{ AGENT_ASSIGNMENTS : "specifies account"
     PROVIDER_RESOURCES ||--o{ AGENT_ASSIGNMENTS : "specifies resource"
     WORKER_SLOTS ||--o{ AGENT_ASSIGNMENTS : "allocates slot"
-    
+
     AGENT_ASSIGNMENTS ||--o{ ACCOUNT_LEASES : "locks"
     WORKER_SLOTS ||--o{ ACCOUNT_LEASES : "leases"
 ```
