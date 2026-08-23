@@ -396,7 +396,7 @@ describe('No-Op Review Package Evidence Hardening (Fail-Closed & Clean Fallback)
     expect(repo.getReviewsByTask(taskId).length).toBe(0);
   });
 
-  it('CASE G: Malformed or non-SUCCESS GIT_STATUS causes rejection and preserves REVIEW_READY', async () => {
+  it('CASE G1: Malformed JSON GIT_STATUS payload causes rejection and preserves REVIEW_READY', async () => {
     // 1. Passing TestRun
     repo.createTestRun({
       id: 'tr-' + crypto.randomUUID(),
@@ -411,7 +411,7 @@ describe('No-Op Review Package Evidence Hardening (Fail-Closed & Clean Fallback)
       created_at: new Date().toISOString(),
     });
 
-    // Subcase G1: Malformed JSON payload
+    // Malformed JSON payload
     const malformedEv = artifactStore.store(
       crypto.randomUUID(),
       projectId,
@@ -424,13 +424,29 @@ describe('No-Op Review Package Evidence Hardening (Fail-Closed & Clean Fallback)
     );
     repo.createEvidence(malformedEv);
 
-    let res = await invokeGenerateReviewPackage();
+    const res = await invokeGenerateReviewPackage();
     expect(res.success).toBe(false);
     expect(res.error).toContain('AUTHORITATIVE_DIFF_EVIDENCE_MISSING');
     expect(res.error).toContain('not valid JSON');
     expect(repo.getTask(taskId)?.state).toBe('REVIEW_READY');
+  });
 
-    // Subcase G2: Non-SUCCESS status field in JSON
+  it('CASE G2: Non-SUCCESS GIT_STATUS status field causes rejection and preserves REVIEW_READY', async () => {
+    // 1. Passing TestRun
+    repo.createTestRun({
+      id: 'tr-' + crypto.randomUUID(),
+      task_id: taskId,
+      command: 'npm test',
+      passed_count: 5,
+      failed_count: 0,
+      skipped_count: 0,
+      duration_ms: 200,
+      exit_code: 0,
+      evidence_id: null,
+      created_at: new Date().toISOString(),
+    });
+
+    // Non-SUCCESS status field in JSON
     const failedStatusEv = artifactStore.store(
       crypto.randomUUID(),
       projectId,
@@ -443,7 +459,7 @@ describe('No-Op Review Package Evidence Hardening (Fail-Closed & Clean Fallback)
     );
     repo.createEvidence(failedStatusEv);
 
-    res = await invokeGenerateReviewPackage();
+    const res = await invokeGenerateReviewPackage();
     expect(res.success).toBe(false);
     expect(res.error).toContain('AUTHORITATIVE_DIFF_EVIDENCE_MISSING');
     expect(res.error).toContain('status is not SUCCESS');
