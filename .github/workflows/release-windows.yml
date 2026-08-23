@@ -382,15 +382,23 @@ jobs:
               exit 1
             }
 
-            # Digest verification (sha256:<hex>)
-            if ($null -ne $remoteAsset.digest -and [string]::IsNullOrWhiteSpace($remoteAsset.digest) -eq $false) {
-              if ($remoteAsset.digest -ne $expectedDigest) {
-                Write-Error "ASSET DIGEST MISMATCH for '$assetName': Remote ($($remoteAsset.digest)) != Expected ($expectedDigest)!"
-                exit 1
-              }
-            } else {
-              Write-Host "  -> Note: Remote asset digest field absent from API response, size verified ($localSize bytes)."
+            # Strict Fail-Closed Remote Digest verification (sha256:<hex>)
+            $remoteDigest = [string]$remoteAsset.digest
+            if ([string]::IsNullOrWhiteSpace($remoteDigest)) {
+              Write-Error "REMOTE ASSET DIGEST MISSING FAIL-CLOSED: Remote asset '$assetName' does not contain a digest property!"
+              exit 1
             }
+
+            if (-not $remoteDigest.StartsWith("sha256:")) {
+              Write-Error "UNSUPPORTED REMOTE ASSET DIGEST FAIL-CLOSED: Remote asset '$assetName' digest algorithm is not sha256 ($remoteDigest)!"
+              exit 1
+            }
+
+            if ($remoteDigest.ToLowerInvariant() -ne $expectedDigest.ToLowerInvariant()) {
+              Write-Error "ASSET DIGEST MISMATCH FAIL-CLOSED: Remote asset '$assetName' digest ($remoteDigest) != Expected ($expectedDigest)!"
+              exit 1
+            }
+            Write-Host "  -> Digest verified: $remoteDigest"
           }
 
           Write-Host "POST_DRAFT_EXPECTED_ASSET_COUNT=5"

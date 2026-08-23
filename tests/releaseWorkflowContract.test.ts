@@ -101,7 +101,7 @@ describe('PR #19 — Production Release Pipeline Hardening Contract Tests', () =
     expect(workflow).not.toMatch(/--publish always/);
   });
 
-  it('8. release-windows.yml creates GitHub release explicitly as DRAFT and verifies all 5 uploaded asset sizes and digests', () => {
+  it('8. release-windows.yml creates GitHub release explicitly as DRAFT and verifies all 5 uploaded asset sizes and digests strictly fail-closed', () => {
     const workflow = fs.readFileSync(releaseWorkflowPath, 'utf8');
     expect(workflow).toMatch(/gh release create \$canonicalTag/);
     expect(workflow).toMatch(/--draft/);
@@ -111,13 +111,33 @@ describe('PR #19 — Production Release Pipeline Hardening Contract Tests', () =
     expect(workflow).toMatch(/gh release view \$canonicalTag --json id,databaseId,isDraft,isPrerelease,tagName,targetCommitish,assets/);
     expect(workflow).toMatch(/gh api --paginate ["']\/repos\/\$\{\{\s*github\.repository\s*\}\}\/releases\/\$releaseId\/assets["']/);
 
-    // Verifies all 5 assets for both size and sha256 digest
+    // Verifies all 5 assets are explicitly listed
+    expect(workflow).toMatch(/PUBLISHED_INSTALLER_FILENAME/);
+    expect(workflow).toMatch(/BLOCKMAP_FILENAME/);
+    expect(workflow).toMatch(/"latest\.yml"/);
+    expect(workflow).toMatch(/"release-metadata\.txt"/);
+    expect(workflow).toMatch(/"demo-rc-receipt\.txt"/);
     expect(workflow).toMatch(/POST_DRAFT_EXPECTED_ASSET_COUNT=5/);
+
+    // Fail-closed checks for size and digest
     expect(workflow).toMatch(/ASSET SIZE MISMATCH/);
-    expect(workflow).toMatch(/ASSET DIGEST MISMATCH/);
+    expect(workflow).toMatch(/REMOTE ASSET DIGEST MISSING FAIL-CLOSED/);
+    expect(workflow).toMatch(/UNSUPPORTED REMOTE ASSET DIGEST FAIL-CLOSED/);
+    expect(workflow).toMatch(/ASSET DIGEST MISMATCH FAIL-CLOSED/);
     expect(workflow).toMatch(/\$expectedDigest\s*=\s*["']sha256:\$localSha256["']/);
+    expect(workflow).toMatch(/\$remoteDigest\.StartsWith\(["']sha256:["']\)/);
+    expect(workflow).toMatch(/\$remoteDigest\.ToLowerInvariant\(\)\s*-ne\s*\$expectedDigest\.ToLowerInvariant\(\)/);
+
+    // Proves size-only fallback is completely absent
+    expect(workflow).not.toMatch(/digest.*absent.*size verified/i);
+    expect(workflow).not.toMatch(/Note: Remote asset digest field absent/i);
+
+    // Position check: POST_DRAFT_ALL_ASSET_DIGEST_MATCH=YES occurs strictly after the foreach loop and digest check
+    const posDigestCheck = workflow.indexOf('ASSET DIGEST MISMATCH FAIL-CLOSED');
+    const posDigestMatchOutput = workflow.indexOf('POST_DRAFT_ALL_ASSET_DIGEST_MATCH=YES');
+    expect(posDigestCheck).toBeGreaterThan(0);
+    expect(posDigestMatchOutput).toBeGreaterThan(posDigestCheck);
     expect(workflow).toMatch(/POST_DRAFT_ALL_ASSET_SIZE_MATCH=YES/);
-    expect(workflow).toMatch(/POST_DRAFT_ALL_ASSET_DIGEST_MATCH=YES/);
   });
 
   it('9. scripts/prepare-release-assets-win.ps1 supports -VerifyOnly, -FinalizeRcStatus, and verifies all hash/byte invariants', () => {
