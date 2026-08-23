@@ -1,5 +1,4 @@
 import crypto from 'crypto';
-import path from 'path';
 import { Repository } from '../database/repositories';
 import {
   ContextSnapshot,
@@ -8,6 +7,20 @@ import {
   ContextItemType,
   ContextManifest,
 } from '../types/domain';
+import {
+  codeUnitCompare,
+  canonicalJsonStringify,
+  computeSha256,
+  sanitizeContextFiles,
+  computeSnapshotContentHash,
+  computeManifestPayloadAndHash,
+} from '../context/ContextIntegrity';
+
+export {
+  canonicalJsonStringify,
+  computeSha256,
+  sanitizeContextFiles,
+};
 
 export interface BuildContextOptions {
   projectId: string;
@@ -39,82 +52,6 @@ export interface BuildContextResult {
   snapshot: ContextSnapshot;
   items: ContextItem[];
   manifest: ContextManifest;
-}
-
-/**
- * Deterministically stringifies an object by sorting its keys alphabetically.
- */
-export function canonicalJsonStringify(obj: unknown): string {
-  if (obj === null || typeof obj !== 'object') {
-    return JSON.stringify(obj);
-  }
-
-  if (Array.isArray(obj)) {
-    return '[' + obj.map((item) => canonicalJsonStringify(item)).join(',') + ']';
-  }
-
-  const keys = Object.keys(obj as Record<string, unknown>).sort();
-  const pairs = keys.map((key) => {
-    const val = (obj as Record<string, unknown>)[key];
-    return JSON.stringify(key) + ':' + canonicalJsonStringify(val);
-  });
-  return '{' + pairs.join(',') + '}';
-}
-
-/**
- * Computes SHA-256 hash of a string.
- */
-export function computeSha256(content: string): string {
-  return crypto.createHash('sha256').update(content, 'utf8').digest('hex');
-}
-
-/**
- * Sanitizes and validates context file paths to prevent traversal outside repository.
- */
-export function sanitizeContextFiles(
-  contextFiles: string[] | undefined,
-  repositoryPath: string
-): { validFiles: string[]; error?: string } {
-  if (!contextFiles || contextFiles.length === 0) {
-    return { validFiles: [] };
-  }
-
-  const normalizedRepo = path.resolve(repositoryPath);
-  const validSet = new Set<string>();
-
-  for (const rawFile of contextFiles) {
-    if (!rawFile || typeof rawFile !== 'string' || rawFile.trim() === '') {
-      continue;
-    }
-    const trimmed = rawFile.trim();
-
-    // Check for explicit path traversal
-    if (trimmed.includes('..') || trimmed.startsWith('/') || trimmed.startsWith('\\') || /^[a-zA-Z]:/.test(trimmed)) {
-      const resolved = path.resolve(normalizedRepo, trimmed);
-      if (!resolved.startsWith(normalizedRepo + path.sep) && resolved !== normalizedRepo) {
-        return {
-          validFiles: [],
-          error: `[ContextBuilderService] Invalid context file path "${trimmed}": path escapes repository root "${repositoryPath}".`,
-        };
-      }
-      const relative = path.relative(normalizedRepo, resolved).replace(/\\/g, '/');
-      if (relative && !relative.startsWith('..')) {
-        validSet.add(relative);
-      }
-    } else {
-      const normalized = path.normalize(trimmed).replace(/\\/g, '/');
-      if (normalized.startsWith('..')) {
-        return {
-          validFiles: [],
-          error: `[ContextBuilderService] Invalid context file path "${trimmed}": path escapes repository root.`,
-        };
-      }
-      validSet.add(normalized);
-    }
-  }
-
-  const sortedFiles = Array.from(validSet).sort();
-  return { validFiles: sortedFiles };
 }
 
 export class ContextBuilderService {
@@ -178,6 +115,9 @@ export class ContextBuilderService {
       if (assignment.task_id !== taskId || assignment.project_id !== projectId) {
         throw new Error(`[ContextBuilderService] AgentAssignment "${assignmentId}" does not match project "${projectId}" or task "${taskId}".`);
       }
+      if (attemptId && assignment.attempt_id && attemptId !== assignment.attempt_id) {
+        throw new Error(`[ContextBuilderService] AgentAssignment attempt "${assignment.attempt_id}" does not match context attempt "${attemptId}".`);
+      }
     }
 
     if (sessionId) {
@@ -187,6 +127,12 @@ export class ContextBuilderService {
       }
       if (session.task_id !== taskId || session.project_id !== projectId) {
         throw new Error(`[ContextBuilderService] AgentSession "${sessionId}" does not match project "${projectId}" or task "${taskId}".`);
+      }
+      if (attemptId && session.attempt_id && attemptId !== session.attempt_id) {
+        throw new Error(`[ContextBuilderService] AgentSession attempt "${session.attempt_id}" does not match context attempt "${attemptId}".`);
+      }
+      if (assignmentId && session.assignment_id && assignmentId !== session.assignment_id) {
+        throw new Error(`[ContextBuilderService] AgentSession assignment "${session.assignment_id}" does not match context assignment "${assignmentId}".`);
       }
     }
 
@@ -219,14 +165,13 @@ export class ContextBuilderService {
       });
     }
 
-    // Category 2: PROJECT_MEMORY (Sorted deterministically by memory_type ASC, key ASC)
+    // Category 2: PROJECT_MEMORY (Sorted deterministically by memory_type ASC, key ASC using codeUnitCompare)
     if (includeProjectMemory) {
       const activeProjectMemories = this.repo.getActiveProjectMemories(projectId);
       const sortedMemories = [...activeProjectMemories].sort((a, b) => {
-        if (a.memory_type !== b.memory_type) {
-          return a.memory_type.localeCompare(b.memory_type);
-        }
-        return a.key.localeCompare(b.key);
+        const typeCmp = codeUnitCompare(a.memory_type, b.memory_type);
+        if (typeCmp !== 0) return typeCmp;
+        return codeUnitCompare(a.key, b.key);
       });
 
       for (const mem of sortedMemories) {
@@ -277,14 +222,13 @@ export class ContextBuilderService {
       });
     }
 
-    // Category 4: TASK_MEMORY (Sorted deterministically by memory_type ASC, key ASC)
+    // Category 4: TASK_MEMORY (Sorted deterministically by memory_type ASC, key ASC using codeUnitCompare)
     if (includeTaskMemory) {
       const activeTaskMemories = this.repo.getActiveTaskMemories(taskId);
       const sortedMemories = [...activeTaskMemories].sort((a, b) => {
-        if (a.memory_type !== b.memory_type) {
-          return a.memory_type.localeCompare(b.memory_type);
-        }
-        return a.key.localeCompare(b.key);
+        const typeCmp = codeUnitCompare(a.memory_type, b.memory_type);
+        if (typeCmp !== 0) return typeCmp;
+        return codeUnitCompare(a.key, b.key);
       });
 
       for (const mem of sortedMemories) {
@@ -411,13 +355,18 @@ export class ContextBuilderService {
       }
     }
 
-    // Category 8: CUSTOM (Sorted deterministically by sourceType ASC, sourceRef ASC)
+    // Category 8: CUSTOM (Total deterministic ordering across all metadata, content hash, and tokens)
     if (customItems && customItems.length > 0) {
       const sortedCustom = [...customItems].sort((a, b) => {
-        if (a.sourceType !== b.sourceType) {
-          return a.sourceType.localeCompare(b.sourceType);
-        }
-        return (a.sourceRef || '').localeCompare(b.sourceRef || '');
+        const aType = a.itemType || 'CUSTOM';
+        const bType = b.itemType || 'CUSTOM';
+        const aContentHash = computeSha256(canonicalJsonStringify(a.content));
+        const bContentHash = computeSha256(canonicalJsonStringify(b.content));
+        const aTok = a.tokenEstimate !== null && a.tokenEstimate !== undefined ? String(a.tokenEstimate) : '';
+        const bTok = b.tokenEstimate !== null && b.tokenEstimate !== undefined ? String(b.tokenEstimate) : '';
+        const aKey = `${aType}\0${a.sourceType}\0${a.sourceRef || ''}\0${aContentHash}\0${aTok}`;
+        const bKey = `${bType}\0${b.sourceType}\0${b.sourceRef || ''}\0${bContentHash}\0${bTok}`;
+        return codeUnitCompare(aKey, bKey);
       });
 
       for (const custom of sortedCustom) {
@@ -451,7 +400,7 @@ export class ContextBuilderService {
       };
     });
 
-    // Compute ContextSnapshot content_hash
+    // Compute ContextSnapshot content_hash using shared canonical helper
     const snapshotSummary = {
       projectId,
       taskId,
@@ -467,7 +416,7 @@ export class ContextBuilderService {
         contentHash: i.content_hash,
       })),
     };
-    const snapshotContentHash = computeSha256(canonicalJsonStringify(snapshotSummary));
+    const snapshotContentHash = computeSnapshotContentHash(snapshotSummary);
 
     const snapshot: ContextSnapshot = {
       id: snapshotId,
@@ -483,8 +432,8 @@ export class ContextBuilderService {
       created_at: now,
     };
 
-    // Compute ContextManifest
-    const manifestData = {
+    // Compute ContextManifest using shared canonical helper
+    const manifestDescriptor = {
       manifest_version: '1.0.0',
       project_id: projectId,
       task_id: taskId,
@@ -502,8 +451,7 @@ export class ContextBuilderService {
         token_estimate: i.token_estimate,
       })),
     };
-    const manifestJson = canonicalJsonStringify(manifestData);
-    const manifestHash = computeSha256(manifestJson);
+    const { manifestJson, manifestHash } = computeManifestPayloadAndHash(manifestDescriptor);
 
     const manifest: ContextManifest = {
       id: manifestId,

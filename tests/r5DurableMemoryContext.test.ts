@@ -13,6 +13,7 @@ import {
   ExecutionAuthorizationService,
   computeContextManifestHash,
 } from '../src/core/services/ExecutionAuthorizationService';
+import { computeSnapshotContentHash } from '../src/core/context/ContextIntegrity';
 import {
   Project,
   Task,
@@ -184,6 +185,17 @@ describe('R5B — Durable Memory & Context Fabric Contract Tests', () => {
       constraints: [],
       created_at: new Date().toISOString(),
       updated_at: new Date().toISOString(),
+    });
+
+    // Create default agent fixture for attempts
+    repo.createAgent({
+      id: 'agent-r5b-default',
+      display_name: 'Default Test Agent',
+      provider_resource_id: null,
+      role: 'CODER',
+      status: 'IDLE',
+      current_task_id: null,
+      last_seen_at: new Date().toISOString(),
     });
   });
 
@@ -714,30 +726,55 @@ describe('R5B — Durable Memory & Context Fabric Contract Tests', () => {
     expect(items.length).toBe(res.items.length);
   });
 
-  it('14. ContextItem ordinal uniqueness is enforced by database constraint', () => {
-    const res = contextBuilder.buildContextSnapshot({
-      projectId: projectIdA,
-      taskId: taskIdA,
+  it('14. ContextItem ordinal uniqueness is enforced by database constraint on unsealed snapshots', () => {
+    const snapId = 'snap-unsealed-' + crypto.randomUUID();
+    repo.createContextSnapshot({
+      id: snapId,
+      project_id: projectIdA,
+      task_id: taskIdA,
+      attempt_id: null,
+      assignment_id: null,
+      session_id: null,
+      purpose: 'CUSTOM',
+      snapshot_version: 1,
+      builder_version: 'r5b-v1.1',
+      content_hash: 'initial-hash',
+      created_at: new Date().toISOString(),
     });
 
-    // Try inserting duplicate ordinal for same snapshot
+    const item1Content = JSON.stringify({ item: 1 });
+    repo.createContextItem({
+      id: 'item-1-' + crypto.randomUUID(),
+      snapshot_id: snapId,
+      ordinal: 0,
+      item_type: 'CUSTOM',
+      source_type: 'TEST',
+      source_ref: null,
+      content_json: item1Content,
+      content_hash: crypto.createHash('sha256').update(item1Content, 'utf8').digest('hex'),
+      token_estimate: null,
+      created_at: new Date().toISOString(),
+    });
+
+    // Try inserting duplicate ordinal for same unsealed snapshot
+    const item2Content = JSON.stringify({ item: 2 });
     expect(() => {
       repo.createContextItem({
         id: 'dup-item-' + crypto.randomUUID(),
-        snapshot_id: res.snapshot.id,
+        snapshot_id: snapId,
         ordinal: 0, // Duplicate ordinal!
         item_type: 'CUSTOM',
         source_type: 'TEST',
         source_ref: null,
-        content_json: JSON.stringify({ test: 'dup' }),
-        content_hash: 'hash123',
+        content_json: item2Content,
+        content_hash: crypto.createHash('sha256').update(item2Content, 'utf8').digest('hex'),
         token_estimate: null,
         created_at: new Date().toISOString(),
       });
     }).toThrowError(/UNIQUE constraint failed: context_items.snapshot_id, context_items.ordinal/);
   });
 
-  it('15. ContextManifest is bound to exactly one snapshot with snapshot_id UNIQUE constraint', () => {
+  it('15. ContextManifest is bound to exactly one snapshot and rejects duplicate manifests', () => {
     const res = contextBuilder.buildContextSnapshot({
       projectId: projectIdA,
       taskId: taskIdA,
@@ -753,7 +790,7 @@ describe('R5B — Durable Memory & Context Fabric Contract Tests', () => {
         manifest_hash: 'hash456',
         created_at: new Date().toISOString(),
       });
-    }).toThrowError(/UNIQUE constraint failed: context_manifests.snapshot_id/);
+    }).toThrowError(/already sealed by manifest/);
   });
 
   it('16. context from Project A can never appear in Project B (cross-project isolation)', () => {
@@ -1275,5 +1312,921 @@ describe('R5B — Durable Memory & Context Fabric Contract Tests', () => {
 
     expect(snap.snapshot.purpose).toBe('REVIEW');
     expect(snap.manifest.item_count).toBeGreaterThan(0);
+  });
+
+  // =========================================================================
+  // Manager Corrective 1: Durable Memory Integrity & Provenance Hardening
+  // =========================================================================
+
+  it('26. adding ContextItem after manifest exists is rejected (snapshot sealed)', () => {
+    const res = contextBuilder.buildContextSnapshot({
+      projectId: projectIdA,
+      taskId: taskIdA,
+    });
+
+    const itemContent = JSON.stringify({ late: 'item' });
+    const contentHash = crypto.createHash('sha256').update(itemContent, 'utf8').digest('hex');
+
+    expect(() => {
+      repo.createContextItem({
+        id: 'item-late-' + crypto.randomUUID(),
+        snapshot_id: res.snapshot.id,
+        ordinal: res.items.length,
+        item_type: 'CUSTOM',
+        source_type: 'TEST',
+        source_ref: null,
+        content_json: itemContent,
+        content_hash: contentHash,
+        token_estimate: null,
+        created_at: new Date().toISOString(),
+      });
+    }).toThrowError(/is sealed by manifest/);
+  });
+
+  it('27. ContextItem content_hash mismatch is rejected', () => {
+    const snapId = 'snap-hash-test-' + crypto.randomUUID();
+    repo.createContextSnapshot({
+      id: snapId,
+      project_id: projectIdA,
+      task_id: taskIdA,
+      attempt_id: null,
+      assignment_id: null,
+      session_id: null,
+      purpose: 'CUSTOM',
+      snapshot_version: 1,
+      builder_version: 'r5b-v1.1',
+      content_hash: 'initial-hash',
+      created_at: new Date().toISOString(),
+    });
+
+    expect(() => {
+      repo.createContextItem({
+        id: 'item-bad-hash-' + crypto.randomUUID(),
+        snapshot_id: snapId,
+        ordinal: 0,
+        item_type: 'CUSTOM',
+        source_type: 'TEST',
+        source_ref: null,
+        content_json: JSON.stringify({ item: 'data' }),
+        content_hash: 'tampered-or-wrong-sha256-hash',
+        token_estimate: null,
+        created_at: new Date().toISOString(),
+      });
+    }).toThrowError(/content_hash.*does not match SHA-256/);
+  });
+
+  it('28. manifest item_count mismatch is rejected', () => {
+    const snapId = 'snap-cnt-test-' + crypto.randomUUID();
+    repo.createContextSnapshot({
+      id: snapId,
+      project_id: projectIdA,
+      task_id: taskIdA,
+      attempt_id: null,
+      assignment_id: null,
+      session_id: null,
+      purpose: 'CUSTOM',
+      snapshot_version: 1,
+      builder_version: 'r5b-v1.1',
+      content_hash: 'initial-hash',
+      created_at: new Date().toISOString(),
+    });
+
+    const itemContent = JSON.stringify({ item: 'single' });
+    const contentHash = crypto.createHash('sha256').update(itemContent, 'utf8').digest('hex');
+    repo.createContextItem({
+      id: 'item-single-' + crypto.randomUUID(),
+      snapshot_id: snapId,
+      ordinal: 0,
+      item_type: 'CUSTOM',
+      source_type: 'TEST',
+      source_ref: null,
+      content_json: itemContent,
+      content_hash: contentHash,
+      token_estimate: null,
+      created_at: new Date().toISOString(),
+    });
+
+    expect(() => {
+      repo.createContextManifest({
+        id: 'man-bad-cnt-' + crypto.randomUUID(),
+        snapshot_id: snapId,
+        manifest_version: '1.0.0',
+        item_count: 5, // Actually 1 item!
+        manifest_json: JSON.stringify({ items: [] }),
+        manifest_hash: 'fake-hash',
+        created_at: new Date().toISOString(),
+      });
+    }).toThrowError(/manifest item_count \(5\) does not match actual item count \(1\)/);
+  });
+
+  it('29. manifest_hash mismatch is rejected', () => {
+    const snapId = 'snap-mhash-test-' + crypto.randomUUID();
+    const itemContent = JSON.stringify({ data: 'val' });
+    const itemHash = crypto.createHash('sha256').update(itemContent, 'utf8').digest('hex');
+
+    const snapContentHash = computeSnapshotContentHash({
+      projectId: projectIdA,
+      taskId: taskIdA,
+      attemptId: null,
+      assignmentId: null,
+      purpose: 'CUSTOM',
+      builderVersion: 'r5b-v1.1',
+      items: [{
+        ordinal: 0,
+        itemType: 'CUSTOM',
+        sourceType: 'TEST',
+        sourceRef: null,
+        contentHash: itemHash,
+      }],
+    });
+
+    repo.createContextSnapshot({
+      id: snapId,
+      project_id: projectIdA,
+      task_id: taskIdA,
+      attempt_id: null,
+      assignment_id: null,
+      session_id: null,
+      purpose: 'CUSTOM',
+      snapshot_version: 1,
+      builder_version: 'r5b-v1.1',
+      content_hash: snapContentHash,
+      created_at: new Date().toISOString(),
+    });
+
+    repo.createContextItem({
+      id: 'item-0-' + crypto.randomUUID(),
+      snapshot_id: snapId,
+      ordinal: 0,
+      item_type: 'CUSTOM',
+      source_type: 'TEST',
+      source_ref: null,
+      content_json: itemContent,
+      content_hash: itemHash,
+      token_estimate: null,
+      created_at: new Date().toISOString(),
+    });
+
+    expect(() => {
+      repo.createContextManifest({
+        id: 'man-bad-hash-' + crypto.randomUUID(),
+        snapshot_id: snapId,
+        manifest_version: '1.0.0',
+        item_count: 1,
+        manifest_json: JSON.stringify({ items: [] }),
+        manifest_hash: 'tampered-manifest-sha256-hash',
+        created_at: new Date().toISOString(),
+      });
+    }).toThrowError(/manifest_hash.*does not match recomputed/);
+  });
+
+  it('30. manifest JSON whose item descriptors do not match actual persisted items is rejected', () => {
+    const snapId = 'snap-mjson-test-' + crypto.randomUUID();
+    const itemContent = JSON.stringify({ data: 'val' });
+    const itemHash = crypto.createHash('sha256').update(itemContent, 'utf8').digest('hex');
+
+    const snapContentHash = computeSnapshotContentHash({
+      projectId: projectIdA,
+      taskId: taskIdA,
+      attemptId: null,
+      assignmentId: null,
+      purpose: 'CUSTOM',
+      builderVersion: 'r5b-v1.1',
+      items: [{
+        ordinal: 0,
+        itemType: 'CUSTOM',
+        sourceType: 'TEST',
+        sourceRef: null,
+        contentHash: itemHash,
+      }],
+    });
+
+    repo.createContextSnapshot({
+      id: snapId,
+      project_id: projectIdA,
+      task_id: taskIdA,
+      attempt_id: null,
+      assignment_id: null,
+      session_id: null,
+      purpose: 'CUSTOM',
+      snapshot_version: 1,
+      builder_version: 'r5b-v1.1',
+      content_hash: snapContentHash,
+      created_at: new Date().toISOString(),
+    });
+
+    repo.createContextItem({
+      id: 'item-0-' + crypto.randomUUID(),
+      snapshot_id: snapId,
+      ordinal: 0,
+      item_type: 'CUSTOM',
+      source_type: 'TEST',
+      source_ref: null,
+      content_json: itemContent,
+      content_hash: itemHash,
+      token_estimate: null,
+      created_at: new Date().toISOString(),
+    });
+
+    // Compute legitimate manifest hash for the legitimate descriptor, but supply bogus manifest_json
+    expect(() => {
+      repo.createContextManifest({
+        id: 'man-bad-json-' + crypto.randomUUID(),
+        snapshot_id: snapId,
+        manifest_version: '1.0.0',
+        item_count: 1,
+        manifest_json: JSON.stringify({ mismatched: 'items descriptor' }),
+        manifest_hash: 'any-hash',
+        created_at: new Date().toISOString(),
+      });
+    }).toThrowError(/manifest_hash.*does not match recomputed/);
+  });
+
+  it('31. snapshot content_hash tampering causes durable authorization rejection', async () => {
+    const contextRes = contextBuilder.buildContextSnapshot({
+      projectId: projectIdA,
+      taskId: taskIdA,
+      contextFiles: ['src/core/types.ts'],
+    });
+
+    // Tamper with the snapshot content_hash directly in SQLite
+    db.prepare('UPDATE context_snapshots SET content_hash = ? WHERE id = ?').run('tampered-content-hash', contextRes.snapshot.id);
+
+    recordAppliedManagerMessage(projectIdA, taskIdA, {
+      decision: 'EXECUTE',
+      expected_revision: 1,
+      instructions: ['Execute authorization'],
+    });
+
+    const provId = 'prov-tamper';
+    repo.createProvider({
+      id: provId,
+      name: 'Tamper Provider',
+      adapter_type: 'MANUAL_BRIDGE',
+      enabled: true,
+      created_at: new Date().toISOString(),
+    });
+
+    const resId = 'res-tamper';
+    repo.createProviderResource({
+      id: resId,
+      provider_id: provId,
+      model_name: 'Manual Operator',
+      health_status: 'AVAILABLE',
+      capabilities: ['CODING'],
+      enabled: true,
+      total_quota: null,
+      remaining_quota: null,
+      quota_unit: 'REQUESTS',
+      quota_reset_at: null,
+      quota_source: 'MANUAL',
+      quota_confidence: 1.0,
+      last_health_check: null,
+    });
+
+    const routingDecisionId = 'rd-' + crypto.randomUUID();
+    db.prepare(`
+      INSERT INTO events (id, project_id, task_id, type, summary, structured_payload_json, timestamp)
+      VALUES (?, ?, ?, 'PROVIDER_ROUTING_DECISION', 'Routing decision', ?, ?)
+    `).run(
+      routingDecisionId,
+      projectIdA,
+      taskIdA,
+      JSON.stringify({
+        decisionId: routingDecisionId,
+        selectedResourceId: resId,
+        selectedProviderId: provId,
+        projectId: projectIdA,
+        taskId: taskIdA,
+        outcome: 'MANUAL_HANDOFF_REQUIRED',
+      }),
+      new Date().toISOString()
+    );
+
+    await expect(authService.createAuthorization({
+      projectId: projectIdA,
+      taskId: taskIdA,
+      routingDecisionId,
+      contextFiles: ['src/core/types.ts'],
+      contextManifestId: contextRes.manifest.id,
+    })).rejects.toThrowError(/EXECUTION_AUTHORIZATION_FAILED: EXECUTION_AUTHORIZATION_MANIFEST_INTEGRITY_FAILED/);
+  });
+
+  it('32. authorization attempt A + snapshot attempt NULL is rejected', async () => {
+    // 1. Create durable snapshot without attempt (attempt = null)
+    const contextRes = contextBuilder.buildContextSnapshot({
+      projectId: projectIdA,
+      taskId: taskIdA,
+      attemptId: null,
+    });
+
+    // 2. Create task attempt
+    const attemptId = 'att-32-' + crypto.randomUUID();
+    repo.createTaskAttempt({
+      id: attemptId,
+      task_id: taskIdA,
+      agent_id: 'agent-r5b-default',
+      attempt_number: 1,
+      status: 'RUNNING',
+      started_at: new Date().toISOString(),
+      ended_at: null,
+      summary: null,
+    });
+
+    recordAppliedManagerMessage(projectIdA, taskIdA, {
+      decision: 'EXECUTE',
+      expected_revision: 1,
+      instructions: ['Attempt check'],
+    });
+
+    const provId = 'prov-att-32';
+    repo.createProvider({
+      id: provId,
+      name: 'Attempt Provider',
+      adapter_type: 'MANUAL_BRIDGE',
+      enabled: true,
+      created_at: new Date().toISOString(),
+    });
+
+    const resId = 'res-att-32';
+    repo.createProviderResource({
+      id: resId,
+      provider_id: provId,
+      model_name: 'Manual Operator',
+      health_status: 'AVAILABLE',
+      capabilities: ['CODING'],
+      enabled: true,
+      total_quota: null,
+      remaining_quota: null,
+      quota_unit: 'REQUESTS',
+      quota_reset_at: null,
+      quota_source: 'MANUAL',
+      quota_confidence: 1.0,
+      last_health_check: null,
+    });
+
+    const routingDecisionId = 'rd-' + crypto.randomUUID();
+    db.prepare(`
+      INSERT INTO events (id, project_id, task_id, type, summary, structured_payload_json, timestamp)
+      VALUES (?, ?, ?, 'PROVIDER_ROUTING_DECISION', 'Routing decision', ?, ?)
+    `).run(
+      routingDecisionId,
+      projectIdA,
+      taskIdA,
+      JSON.stringify({
+        decisionId: routingDecisionId,
+        selectedResourceId: resId,
+        selectedProviderId: provId,
+        projectId: projectIdA,
+        taskId: taskIdA,
+        attemptId: attemptId,
+        outcome: 'MANUAL_HANDOFF_REQUIRED',
+      }),
+      new Date().toISOString()
+    );
+
+    // Request authorization WITH attemptId, but snapshot has attemptId = null
+    await expect(authService.createAuthorization({
+      projectId: projectIdA,
+      taskId: taskIdA,
+      attemptId: attemptId,
+      routingDecisionId,
+      contextManifestId: contextRes.manifest.id,
+    })).rejects.toThrowError(/attempt binding "null" does not match authorization attempt/);
+  });
+
+  it('33. authorization attempt NULL + snapshot attempt A is rejected', async () => {
+    const attemptId = 'att-33-' + crypto.randomUUID();
+    repo.createTaskAttempt({
+      id: attemptId,
+      task_id: taskIdA,
+      agent_id: 'agent-r5b-default',
+      attempt_number: 1,
+      status: 'RUNNING',
+      started_at: new Date().toISOString(),
+      ended_at: null,
+      summary: null,
+    });
+
+    // 1. Create durable snapshot WITH attemptId
+    const contextRes = contextBuilder.buildContextSnapshot({
+      projectId: projectIdA,
+      taskId: taskIdA,
+      attemptId: attemptId,
+    });
+
+    recordAppliedManagerMessage(projectIdA, taskIdA, {
+      decision: 'EXECUTE',
+      expected_revision: 1,
+      instructions: ['Attempt check 2'],
+    });
+
+    const provId = 'prov-att-33';
+    repo.createProvider({
+      id: provId,
+      name: 'Attempt Provider 33',
+      adapter_type: 'MANUAL_BRIDGE',
+      enabled: true,
+      created_at: new Date().toISOString(),
+    });
+
+    const resId = 'res-att-33';
+    repo.createProviderResource({
+      id: resId,
+      provider_id: provId,
+      model_name: 'Manual Operator',
+      health_status: 'AVAILABLE',
+      capabilities: ['CODING'],
+      enabled: true,
+      total_quota: null,
+      remaining_quota: null,
+      quota_unit: 'REQUESTS',
+      quota_reset_at: null,
+      quota_source: 'MANUAL',
+      quota_confidence: 1.0,
+      last_health_check: null,
+    });
+
+    const routingDecisionId = 'rd-' + crypto.randomUUID();
+    db.prepare(`
+      INSERT INTO events (id, project_id, task_id, type, summary, structured_payload_json, timestamp)
+      VALUES (?, ?, ?, 'PROVIDER_ROUTING_DECISION', 'Routing decision', ?, ?)
+    `).run(
+      routingDecisionId,
+      projectIdA,
+      taskIdA,
+      JSON.stringify({
+        decisionId: routingDecisionId,
+        selectedResourceId: resId,
+        selectedProviderId: provId,
+        projectId: projectIdA,
+        taskId: taskIdA,
+        outcome: 'MANUAL_HANDOFF_REQUIRED',
+      }),
+      new Date().toISOString()
+    );
+
+    // Request authorization WITHOUT attemptId (attemptId = null), but snapshot has attemptId = attemptId
+    await expect(authService.createAuthorization({
+      projectId: projectIdA,
+      taskId: taskIdA,
+      attemptId: null,
+      routingDecisionId,
+      contextManifestId: contextRes.manifest.id,
+    })).rejects.toThrowError(new RegExp(`attempt binding "${attemptId}" does not match authorization attempt "null"`));
+  });
+
+  it('34. AgentSession provider A + account provider B is rejected', () => {
+    const provA = 'prov-a-' + crypto.randomUUID();
+    const provB = 'prov-b-' + crypto.randomUUID();
+    repo.createProvider({ id: provA, name: 'Provider A', adapter_type: 'MANUAL_BRIDGE', enabled: true, created_at: new Date().toISOString() });
+    repo.createProvider({ id: provB, name: 'Provider B', adapter_type: 'MANUAL_BRIDGE', enabled: true, created_at: new Date().toISOString() });
+
+    const accB = 'acc-b-' + crypto.randomUUID();
+    repo.createProviderAccount({
+      id: accB,
+      provider_id: provB, // Belongs to Provider B
+      label: 'Account B',
+      auth_mode: 'NATIVE_PROFILE',
+      credential_ref: null,
+      profile_ref: 'b',
+      enabled: true,
+      priority: 10,
+      health_status: 'AVAILABLE',
+      cooldown_until: null,
+      concurrency_limit: 1,
+      last_success_at: null,
+      last_failure_at: null,
+      last_failure_code: null,
+      created_at: new Date().toISOString(),
+      updated_at: new Date().toISOString(),
+    });
+
+    expect(() => {
+      repo.createAgentSession({
+        id: 'sess-bad-prov-' + crypto.randomUUID(),
+        project_id: projectIdA,
+        task_id: taskIdA,
+        attempt_id: null,
+        assignment_id: null,
+        provider_id: provA, // Provider A
+        provider_account_id: accB, // Account belonging to Provider B!
+        provider_resource_id: null,
+        external_session_ref: null,
+        status: 'ACTIVE',
+        started_at: new Date().toISOString(),
+        ended_at: null,
+        created_at: new Date().toISOString(),
+        updated_at: new Date().toISOString(),
+      });
+    }).toThrowError(/belongs to provider/);
+  });
+
+  it('35. AgentSession assignment A + resource/account from another assignment is rejected', () => {
+    const provId = 'prov-asgn-check';
+    repo.createProvider({ id: provId, name: 'Asgn Provider', adapter_type: 'MANUAL_BRIDGE', enabled: true, created_at: new Date().toISOString() });
+
+    const acc1 = 'acc-asgn-1-' + crypto.randomUUID();
+    const acc2 = 'acc-asgn-2-' + crypto.randomUUID();
+    repo.createProviderAccount({ id: acc1, provider_id: provId, label: 'Acc 1', auth_mode: 'NATIVE_PROFILE', credential_ref: null, profile_ref: '1', enabled: true, priority: 1, health_status: 'AVAILABLE', cooldown_until: null, concurrency_limit: 1, last_success_at: null, last_failure_at: null, last_failure_code: null, created_at: new Date().toISOString(), updated_at: new Date().toISOString() });
+    repo.createProviderAccount({ id: acc2, provider_id: provId, label: 'Acc 2', auth_mode: 'NATIVE_PROFILE', credential_ref: null, profile_ref: '2', enabled: true, priority: 1, health_status: 'AVAILABLE', cooldown_until: null, concurrency_limit: 1, last_success_at: null, last_failure_at: null, last_failure_code: null, created_at: new Date().toISOString(), updated_at: new Date().toISOString() });
+
+    const res1 = 'res-asgn-1-' + crypto.randomUUID();
+    const res2 = 'res-asgn-2-' + crypto.randomUUID();
+    repo.createProviderResource({ id: res1, provider_id: provId, provider_account_id: acc1, model_name: 'model-1', health_status: 'AVAILABLE', capabilities: ['CODING'], enabled: true, total_quota: null, remaining_quota: null, quota_unit: 'REQUESTS', quota_reset_at: null, quota_source: 'MANUAL', quota_confidence: 1.0, last_health_check: null });
+    repo.createProviderResource({ id: res2, provider_id: provId, provider_account_id: acc2, model_name: 'model-2', health_status: 'AVAILABLE', capabilities: ['CODING'], enabled: true, total_quota: null, remaining_quota: null, quota_unit: 'REQUESTS', quota_reset_at: null, quota_source: 'MANUAL', quota_confidence: 1.0, last_health_check: null });
+
+    const roleId = 'rp-asgn-' + crypto.randomUUID();
+    repo.createRoleProfile({ id: roleId, role: 'CODER', display_name: 'Coder', required_capabilities: ['CODING'], preferred_capabilities: [], authority_scope: null, permissions: ['FILE_WRITE'], output_protocol: 'CODER_DIFF', enabled: true, created_at: new Date().toISOString(), updated_at: new Date().toISOString() });
+
+    const slot1 = 'slot-asgn-1-' + crypto.randomUUID();
+    repo.createWorkerSlot({ id: slot1, provider_account_id: acc1, provider_resource_id: res1, slot_index: 0, status: 'IDLE', current_assignment_id: null, current_execution_id: null, heartbeat_at: null, created_at: new Date().toISOString(), updated_at: new Date().toISOString() });
+
+    const asgn1 = 'asgn-target-' + crypto.randomUUID();
+    repo.createAgentAssignment({
+      id: asgn1,
+      project_id: projectIdA,
+      task_id: taskIdA,
+      attempt_id: null,
+      role_profile_id: roleId,
+      agent_profile_id: null,
+      selected_provider_id: provId,
+      selected_account_id: acc1,
+      selected_resource_id: res1,
+      selected_worker_slot_id: slot1,
+      routing_decision_id: null,
+      preferred_metadata: null,
+      status: 'ASSIGNED',
+      created_at: new Date().toISOString(),
+      ended_at: null,
+    });
+
+    // Session claims assignment 1, but specifies account 2 and resource 2
+    expect(() => {
+      repo.createAgentSession({
+        id: 'sess-asgn-mismatch-' + crypto.randomUUID(),
+        project_id: projectIdA,
+        task_id: taskIdA,
+        attempt_id: null,
+        assignment_id: asgn1,
+        provider_id: provId,
+        provider_account_id: acc2, // Mismatch with asgn1.selected_account_id (acc1)
+        provider_resource_id: res2, // Mismatch with asgn1.selected_resource_id (res1)
+        external_session_ref: null,
+        status: 'ACTIVE',
+        started_at: new Date().toISOString(),
+        ended_at: null,
+        created_at: new Date().toISOString(),
+        updated_at: new Date().toISOString(),
+      });
+    }).toThrowError(/Session account.*does not match assignment account/);
+  });
+
+  it('36. ContextSnapshot task A + assignment task B is rejected', () => {
+    const provId = 'prov-cs-check';
+    repo.createProvider({ id: provId, name: 'CS Prov', adapter_type: 'MANUAL_BRIDGE', enabled: true, created_at: new Date().toISOString() });
+    const accId = 'acc-cs-' + crypto.randomUUID();
+    repo.createProviderAccount({ id: accId, provider_id: provId, label: 'Acc CS', auth_mode: 'NATIVE_PROFILE', credential_ref: null, profile_ref: 'p', enabled: true, priority: 1, health_status: 'AVAILABLE', cooldown_until: null, concurrency_limit: 1, last_success_at: null, last_failure_at: null, last_failure_code: null, created_at: new Date().toISOString(), updated_at: new Date().toISOString() });
+    const resId = 'res-cs-' + crypto.randomUUID();
+    repo.createProviderResource({ id: resId, provider_id: provId, provider_account_id: accId, model_name: 'model', health_status: 'AVAILABLE', capabilities: ['CODING'], enabled: true, total_quota: null, remaining_quota: null, quota_unit: 'REQUESTS', quota_reset_at: null, quota_source: 'MANUAL', quota_confidence: 1.0, last_health_check: null });
+    const roleId = 'rp-cs-' + crypto.randomUUID();
+    repo.createRoleProfile({ id: roleId, role: 'CODER', display_name: 'Coder', required_capabilities: ['CODING'], preferred_capabilities: [], authority_scope: null, permissions: ['FILE_WRITE'], output_protocol: 'CODER_DIFF', enabled: true, created_at: new Date().toISOString(), updated_at: new Date().toISOString() });
+    const slotId = 'slot-cs-' + crypto.randomUUID();
+    repo.createWorkerSlot({ id: slotId, provider_account_id: accId, provider_resource_id: resId, slot_index: 0, status: 'IDLE', current_assignment_id: null, current_execution_id: null, heartbeat_at: null, created_at: new Date().toISOString(), updated_at: new Date().toISOString() });
+
+    // Assignment belonging to Task B (taskIdB in projectIdB)
+    const asgnTaskB = 'asgn-task-b-' + crypto.randomUUID();
+    repo.createAgentAssignment({
+      id: asgnTaskB,
+      project_id: projectIdB,
+      task_id: taskIdB,
+      attempt_id: null,
+      role_profile_id: roleId,
+      agent_profile_id: null,
+      selected_provider_id: provId,
+      selected_account_id: accId,
+      selected_resource_id: resId,
+      selected_worker_slot_id: slotId,
+      routing_decision_id: null,
+      preferred_metadata: null,
+      status: 'ASSIGNED',
+      created_at: new Date().toISOString(),
+      ended_at: null,
+    });
+
+    // Create snapshot for Task A1, but referencing assignment for Task B
+    expect(() => {
+      repo.createContextSnapshot({
+        id: 'snap-cross-asgn-' + crypto.randomUUID(),
+        project_id: projectIdA,
+        task_id: taskIdA,
+        attempt_id: null,
+        assignment_id: asgnTaskB, // Assignment from Task B!
+        session_id: null,
+        purpose: 'CUSTOM',
+        snapshot_version: 1,
+        builder_version: 'r5b-v1.1',
+        content_hash: 'hash',
+        created_at: new Date().toISOString(),
+      });
+    }).toThrowError(/does not match project\/task/);
+  });
+
+  it('37. ContextSnapshot attempt A + session from contradictory attempt is rejected', () => {
+    const attempt1 = 'att-snap-1-' + crypto.randomUUID();
+    const attempt2 = 'att-snap-2-' + crypto.randomUUID();
+    repo.createTaskAttempt({ id: attempt1, task_id: taskIdA, agent_id: 'agent-r5b-default', attempt_number: 1, status: 'RUNNING', started_at: new Date().toISOString(), ended_at: null, summary: null });
+    repo.createTaskAttempt({ id: attempt2, task_id: taskIdA, agent_id: 'agent-r5b-default', attempt_number: 2, status: 'RUNNING', started_at: new Date().toISOString(), ended_at: null, summary: null });
+
+    const sessionAtt1 = 'sess-att1-' + crypto.randomUUID();
+    repo.createAgentSession({
+      id: sessionAtt1,
+      project_id: projectIdA,
+      task_id: taskIdA,
+      attempt_id: attempt1, // Session bound to attempt 1
+      assignment_id: null,
+      provider_id: null,
+      provider_account_id: null,
+      provider_resource_id: null,
+      external_session_ref: null,
+      status: 'ACTIVE',
+      started_at: new Date().toISOString(),
+      ended_at: null,
+      created_at: new Date().toISOString(),
+      updated_at: new Date().toISOString(),
+    });
+
+    // Create snapshot with attempt 2, but referencing session from attempt 1
+    expect(() => {
+      repo.createContextSnapshot({
+        id: 'snap-contradict-att-' + crypto.randomUUID(),
+        project_id: projectIdA,
+        task_id: taskIdA,
+        attempt_id: attempt2, // Attempt 2
+        assignment_id: null,
+        session_id: sessionAtt1, // Session for attempt 1
+        purpose: 'CUSTOM',
+        snapshot_version: 1,
+        builder_version: 'r5b-v1.1',
+        content_hash: 'hash',
+        created_at: new Date().toISOString(),
+      });
+    }).toThrowError(/Session attempt.*does not match snapshot attempt/);
+  });
+
+  it('38. HandoffContext from/to assignment from wrong task/project is rejected', () => {
+    const snap = contextBuilder.buildContextSnapshot({ projectId: projectIdA, taskId: taskIdA });
+
+    expect(() => {
+      repo.createHandoffContext({
+        id: 'hc-invalid-asgn-' + crypto.randomUUID(),
+        project_id: projectIdA,
+        task_id: taskIdA,
+        attempt_id: null,
+        from_assignment_id: 'non-existent-or-foreign-asgn',
+        to_assignment_id: null,
+        source_snapshot_id: snap.snapshot.id,
+        handoff_snapshot_id: null,
+        reason: 'HANDOFF',
+        status: 'READY',
+        created_at: new Date().toISOString(),
+        consumed_at: null,
+      });
+    }).toThrowError(/From AgentAssignment.*not found/);
+  });
+
+  it('39. first ProjectMemory with caller revision 99 cannot persist as 99 (persists as 1)', () => {
+    const memId = 'pm-rev99-' + crypto.randomUUID();
+    repo.createProjectMemory({
+      id: memId,
+      project_id: projectIdA,
+      memory_type: 'CUSTOM',
+      key: 'CALLER_REV_TEST',
+      value_json: JSON.stringify({ note: 'first' }),
+      source_type: 'USER',
+      source_ref: null,
+      revision: 99, // Caller sends 99!
+      is_active: true,
+      created_at: new Date().toISOString(),
+      updated_at: new Date().toISOString(),
+    });
+
+    const stored = repo.getProjectMemory(memId);
+    expect(stored).toBeDefined();
+    expect(stored?.revision).toBe(1); // Repository overrides to 1!
+  });
+
+  it('40. first TaskMemory with caller revision 99 cannot persist as 99 (persists as 1)', () => {
+    const memId = 'tm-rev99-' + crypto.randomUUID();
+    repo.createTaskMemory({
+      id: memId,
+      project_id: projectIdA,
+      task_id: taskIdA,
+      attempt_id: null,
+      assignment_id: null,
+      memory_type: 'CUSTOM',
+      key: 'CALLER_TASK_REV_TEST',
+      value_json: JSON.stringify({ note: 'first task' }),
+      source_type: 'USER',
+      source_ref: null,
+      revision: 99, // Caller sends 99!
+      is_active: true,
+      created_at: new Date().toISOString(),
+      updated_at: new Date().toISOString(),
+    });
+
+    const stored = repo.getTaskMemory(memId);
+    expect(stored).toBeDefined();
+    expect(stored?.revision).toBe(1); // Repository overrides to 1!
+  });
+
+  it('41. subsequent memory revisions are repository-controlled active.revision + 1', () => {
+    const key = 'AUTO_INCREMENT_KEY';
+    // Revision 1
+    repo.createProjectMemory({
+      id: 'pm-auto-1',
+      project_id: projectIdA,
+      memory_type: 'CUSTOM',
+      key,
+      value_json: JSON.stringify({ ver: 1 }),
+      source_type: 'USER',
+      source_ref: null,
+      revision: 10,
+      is_active: true,
+      created_at: new Date().toISOString(),
+      updated_at: new Date().toISOString(),
+    });
+
+    // Revision 2 (caller sends 500)
+    repo.createProjectMemory({
+      id: 'pm-auto-2',
+      project_id: projectIdA,
+      memory_type: 'CUSTOM',
+      key,
+      value_json: JSON.stringify({ ver: 2 }),
+      source_type: 'USER',
+      source_ref: null,
+      revision: 500,
+      is_active: true,
+      created_at: new Date().toISOString(),
+      updated_at: new Date().toISOString(),
+    });
+
+    // Revision 3 (caller sends 1)
+    repo.createProjectMemory({
+      id: 'pm-auto-3',
+      project_id: projectIdA,
+      memory_type: 'CUSTOM',
+      key,
+      value_json: JSON.stringify({ ver: 3 }),
+      source_type: 'USER',
+      source_ref: null,
+      revision: 1,
+      is_active: true,
+      created_at: new Date().toISOString(),
+      updated_at: new Date().toISOString(),
+    });
+
+    const m1 = repo.getProjectMemory('pm-auto-1');
+    const m2 = repo.getProjectMemory('pm-auto-2');
+    const m3 = repo.getProjectMemory('pm-auto-3');
+
+    expect(m1?.revision).toBe(1);
+    expect(m2?.revision).toBe(2);
+    expect(m3?.revision).toBe(3);
+    expect(m3?.is_active).toBe(true);
+    expect(m1?.is_active).toBe(false);
+    expect(m2?.is_active).toBe(false);
+  });
+
+  it('42. absolute context path inside repository is still rejected', () => {
+    const absPath = path.join(repoPath, 'README.md');
+    expect(() => {
+      contextBuilder.buildContextSnapshot({
+        projectId: projectIdA,
+        taskId: taskIdA,
+        contextFiles: [absPath],
+      });
+    }).toThrowError(/must be relative to repository root/);
+  });
+
+  it('43. traversal context path is rejected', () => {
+    expect(() => {
+      contextBuilder.buildContextSnapshot({
+        projectId: projectIdA,
+        taskId: taskIdA,
+        contextFiles: ['../outside.ts'],
+      });
+    }).toThrowError(/violates path containment/);
+  });
+
+  it('44. PolicyService-denied context path is rejected', () => {
+    expect(() => {
+      contextBuilder.buildContextSnapshot({
+        projectId: projectIdA,
+        taskId: taskIdA,
+        contextFiles: ['.env'],
+      });
+    }).toThrowError(/CONTEXT_PATH_DENIED/);
+  });
+
+  it('45. identical CUSTOM semantic items in reversed caller order produce identical manifest hash', () => {
+    const customItems1 = [
+      { sourceType: 'MANUAL', sourceRef: 'ref-B', content: { val: 2 } },
+      { sourceType: 'MANUAL', sourceRef: 'ref-A', content: { val: 1 } },
+    ];
+
+    const customItems2 = [
+      { sourceType: 'MANUAL', sourceRef: 'ref-A', content: { val: 1 } },
+      { sourceType: 'MANUAL', sourceRef: 'ref-B', content: { val: 2 } },
+    ];
+
+    const res1 = contextBuilder.buildContextSnapshot({
+      projectId: projectIdA,
+      taskId: taskIdA,
+      customItems: customItems1,
+    });
+
+    const res2 = contextBuilder.buildContextSnapshot({
+      projectId: projectIdA,
+      taskId: taskIdA,
+      customItems: customItems2,
+    });
+
+    expect(res1.manifest.manifest_hash).toBe(res2.manifest.manifest_hash);
+    expect(res1.snapshot.content_hash).toBe(res2.snapshot.content_hash);
+  });
+
+  it('46. sealed snapshot still reads successfully', () => {
+    const res = contextBuilder.buildContextSnapshot({
+      projectId: projectIdA,
+      taskId: taskIdA,
+    });
+
+    const fetchedSnap = repo.getContextSnapshot(res.snapshot.id);
+    const fetchedManifest = repo.getContextManifest(res.manifest.id);
+    const fetchedItems = repo.getContextItemsBySnapshot(res.snapshot.id);
+
+    expect(fetchedSnap).toBeDefined();
+    expect(fetchedManifest).toBeDefined();
+    expect(fetchedItems.length).toBe(res.items.length);
+  });
+
+  it('47. legacy ExecutionAuthorization without durable manifest remains PASS', async () => {
+    recordAppliedManagerMessage(projectIdA, taskIdA, {
+      decision: 'EXECUTE',
+      expected_revision: 1,
+      instructions: ['Legacy path test'],
+    });
+
+    const provId = 'prov-legacy-47';
+    repo.createProvider({ id: provId, name: 'Legacy Provider', adapter_type: 'MANUAL_BRIDGE', enabled: true, created_at: new Date().toISOString() });
+
+    const resId = 'res-legacy-47';
+    repo.createProviderResource({
+      id: resId,
+      provider_id: provId,
+      model_name: 'Manual',
+      health_status: 'AVAILABLE',
+      capabilities: ['CODING'],
+      enabled: true,
+      total_quota: null,
+      remaining_quota: null,
+      quota_unit: 'REQUESTS',
+      quota_reset_at: null,
+      quota_source: 'MANUAL',
+      quota_confidence: 1.0,
+      last_health_check: null,
+    });
+
+    const routingDecisionId = 'rd-' + crypto.randomUUID();
+    db.prepare(`
+      INSERT INTO events (id, project_id, task_id, type, summary, structured_payload_json, timestamp)
+      VALUES (?, ?, ?, 'PROVIDER_ROUTING_DECISION', 'Routing decision', ?, ?)
+    `).run(
+      routingDecisionId,
+      projectIdA,
+      taskIdA,
+      JSON.stringify({
+        decisionId: routingDecisionId,
+        selectedResourceId: resId,
+        selectedProviderId: provId,
+        projectId: projectIdA,
+        taskId: taskIdA,
+        outcome: 'MANUAL_HANDOFF_REQUIRED',
+      }),
+      new Date().toISOString()
+    );
+
+    const auth = await authService.createAuthorization({
+      projectId: projectIdA,
+      taskId: taskIdA,
+      routingDecisionId,
+      contextFiles: ['README.md'],
+    });
+
+    expect(auth).toBeDefined();
+    expect(auth.status).toBe('AUTHORIZED');
+    expect(auth.context_manifest_hash).toBe(computeContextManifestHash(['README.md']));
   });
 });

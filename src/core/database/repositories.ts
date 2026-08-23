@@ -52,6 +52,12 @@ import {
   HandoffContext,
   HandoffContextStatus
 } from '../types/domain';
+import {
+  computeSha256,
+  canonicalJsonStringify,
+  computeSnapshotContentHash,
+  computeManifestPayloadAndHash,
+} from '../context/ContextIntegrity';
 
 export class Repository {
   constructor(private db: Database.Database) {}
@@ -2289,13 +2295,53 @@ export class Repository {
       }
     }
 
+    let assignment: AgentAssignment | null = null;
     if (session.assignment_id) {
-      const assignment = this.getAgentAssignment(session.assignment_id);
+      assignment = this.getAgentAssignment(session.assignment_id);
       if (!assignment) {
         throw new Error(`[Repository] createAgentSession failed: AgentAssignment "${session.assignment_id}" not found.`);
       }
       if (assignment.task_id !== session.task_id || assignment.project_id !== session.project_id) {
         throw new Error(`[Repository] createAgentSession failed: AgentAssignment "${session.assignment_id}" does not match project/task.`);
+      }
+      if (session.attempt_id && assignment.attempt_id && session.attempt_id !== assignment.attempt_id) {
+        throw new Error(`[Repository] createAgentSession failed: AgentAssignment attempt "${assignment.attempt_id}" does not match session attempt "${session.attempt_id}".`);
+      }
+    }
+
+    // Provider tuple provenance validation
+    if (session.provider_account_id) {
+      const account = this.getProviderAccount(session.provider_account_id);
+      if (!account) {
+        throw new Error(`[Repository] createAgentSession failed: ProviderAccount "${session.provider_account_id}" not found.`);
+      }
+      if (session.provider_id && account.provider_id !== session.provider_id) {
+        throw new Error(`[Repository] createAgentSession failed: ProviderAccount "${session.provider_account_id}" belongs to provider "${account.provider_id}", expected "${session.provider_id}".`);
+      }
+    }
+
+    if (session.provider_resource_id) {
+      const resource = this.getProviderResource(session.provider_resource_id);
+      if (!resource) {
+        throw new Error(`[Repository] createAgentSession failed: ProviderResource "${session.provider_resource_id}" not found.`);
+      }
+      if (session.provider_id && resource.provider_id !== session.provider_id) {
+        throw new Error(`[Repository] createAgentSession failed: ProviderResource "${session.provider_resource_id}" belongs to provider "${resource.provider_id}", expected "${session.provider_id}".`);
+      }
+      if (session.provider_account_id && resource.provider_account_id && resource.provider_account_id !== session.provider_account_id) {
+        throw new Error(`[Repository] createAgentSession failed: ProviderResource account "${resource.provider_account_id}" does not match session account "${session.provider_account_id}".`);
+      }
+    }
+
+    if (assignment) {
+      if (session.provider_id && session.provider_id !== assignment.selected_provider_id) {
+        throw new Error(`[Repository] createAgentSession failed: Session provider "${session.provider_id}" does not match assignment provider "${assignment.selected_provider_id}".`);
+      }
+      if (session.provider_account_id && session.provider_account_id !== assignment.selected_account_id) {
+        throw new Error(`[Repository] createAgentSession failed: Session account "${session.provider_account_id}" does not match assignment account "${assignment.selected_account_id}".`);
+      }
+      if (session.provider_resource_id && session.provider_resource_id !== assignment.selected_resource_id) {
+        throw new Error(`[Repository] createAgentSession failed: Session resource "${session.provider_resource_id}" does not match assignment resource "${assignment.selected_resource_id}".`);
       }
     }
 
@@ -2395,14 +2441,12 @@ export class Repository {
         `)
         .get(memory.project_id, memory.memory_type, memory.key) as Record<string, unknown> | undefined;
 
-      let revision = memory.revision;
+      let revision = 1;
       if (active) {
         revision = Number(active.revision) + 1;
         this.db
           .prepare('UPDATE project_memories SET is_active = 0, updated_at = ? WHERE id = ?')
           .run(memory.created_at || new Date().toISOString(), String(active.id));
-      } else if (!revision || revision < 1) {
-        revision = 1;
       }
 
       this.db
@@ -2515,8 +2559,11 @@ export class Repository {
       if (!assignment) {
         throw new Error(`[Repository] createTaskMemory failed: AgentAssignment "${memory.assignment_id}" not found.`);
       }
-      if (assignment.task_id !== memory.task_id) {
-        throw new Error(`[Repository] createTaskMemory failed: AgentAssignment "${memory.assignment_id}" belongs to task "${assignment.task_id}", expected "${memory.task_id}".`);
+      if (assignment.task_id !== memory.task_id || assignment.project_id !== memory.project_id) {
+        throw new Error(`[Repository] createTaskMemory failed: AgentAssignment "${memory.assignment_id}" does not match project/task.`);
+      }
+      if (memory.attempt_id && assignment.attempt_id && memory.attempt_id !== assignment.attempt_id) {
+        throw new Error(`[Repository] createTaskMemory failed: AgentAssignment attempt "${assignment.attempt_id}" does not match memory attempt "${memory.attempt_id}".`);
       }
     }
 
@@ -2529,14 +2576,12 @@ export class Repository {
         `)
         .get(memory.task_id, memory.memory_type, memory.key) as Record<string, unknown> | undefined;
 
-      let revision = memory.revision;
+      let revision = 1;
       if (active) {
         revision = Number(active.revision) + 1;
         this.db
           .prepare('UPDATE task_memories SET is_active = 0, updated_at = ? WHERE id = ?')
           .run(memory.created_at || new Date().toISOString(), String(active.id));
-      } else if (!revision || revision < 1) {
-        revision = 1;
       }
 
       this.db
@@ -2627,6 +2672,11 @@ export class Repository {
 
   // 4. Context Snapshots
   public createContextSnapshot(snapshot: ContextSnapshot): void {
+    const project = this.getProject(snapshot.project_id);
+    if (!project) {
+      throw new Error(`[Repository] createContextSnapshot failed: Project "${snapshot.project_id}" not found.`);
+    }
+
     const task = this.getTask(snapshot.task_id);
     if (!task) {
       throw new Error(`[Repository] createContextSnapshot failed: Task "${snapshot.task_id}" not found.`);
@@ -2635,13 +2685,42 @@ export class Repository {
       throw new Error(`[Repository] createContextSnapshot failed: Task "${snapshot.task_id}" belongs to project "${task.project_id}", expected "${snapshot.project_id}".`);
     }
 
+    if (snapshot.attempt_id) {
+      const attempt = this.getTaskAttempt(snapshot.attempt_id);
+      if (!attempt) {
+        throw new Error(`[Repository] createContextSnapshot failed: TaskAttempt "${snapshot.attempt_id}" not found.`);
+      }
+      if (attempt.task_id !== snapshot.task_id) {
+        throw new Error(`[Repository] createContextSnapshot failed: TaskAttempt "${snapshot.attempt_id}" belongs to task "${attempt.task_id}", expected "${snapshot.task_id}".`);
+      }
+    }
+
+    if (snapshot.assignment_id) {
+      const assignment = this.getAgentAssignment(snapshot.assignment_id);
+      if (!assignment) {
+        throw new Error(`[Repository] createContextSnapshot failed: AgentAssignment "${snapshot.assignment_id}" not found.`);
+      }
+      if (assignment.project_id !== snapshot.project_id || assignment.task_id !== snapshot.task_id) {
+        throw new Error(`[Repository] createContextSnapshot failed: AgentAssignment "${snapshot.assignment_id}" does not match project/task.`);
+      }
+      if (snapshot.attempt_id && assignment.attempt_id && snapshot.attempt_id !== assignment.attempt_id) {
+        throw new Error(`[Repository] createContextSnapshot failed: AgentAssignment attempt "${assignment.attempt_id}" does not match snapshot attempt "${snapshot.attempt_id}".`);
+      }
+    }
+
     if (snapshot.session_id) {
       const session = this.getAgentSession(snapshot.session_id);
       if (!session) {
         throw new Error(`[Repository] createContextSnapshot failed: AgentSession "${snapshot.session_id}" not found.`);
       }
-      if (session.task_id !== snapshot.task_id) {
-        throw new Error(`[Repository] createContextSnapshot failed: AgentSession "${snapshot.session_id}" does not match task.`);
+      if (session.project_id !== snapshot.project_id || session.task_id !== snapshot.task_id) {
+        throw new Error(`[Repository] createContextSnapshot failed: AgentSession "${snapshot.session_id}" does not match project/task.`);
+      }
+      if (snapshot.attempt_id && session.attempt_id && snapshot.attempt_id !== session.attempt_id) {
+        throw new Error(`[Repository] createContextSnapshot failed: AgentSession attempt "${session.attempt_id}" does not match snapshot attempt "${snapshot.attempt_id}".`);
+      }
+      if (snapshot.assignment_id && session.assignment_id && snapshot.assignment_id !== session.assignment_id) {
+        throw new Error(`[Repository] createContextSnapshot failed: AgentSession assignment "${session.assignment_id}" does not match snapshot assignment "${snapshot.assignment_id}".`);
       }
     }
 
@@ -2710,10 +2789,20 @@ export class Repository {
       throw new Error(`[Repository] createContextItem failed: ContextSnapshot "${item.snapshot_id}" not found.`);
     }
 
+    const existingManifest = this.getContextManifestBySnapshotId(item.snapshot_id);
+    if (existingManifest) {
+      throw new Error(`[Repository] createContextItem failed: ContextSnapshot "${item.snapshot_id}" is sealed by manifest "${existingManifest.id}" and cannot accept new items.`);
+    }
+
     try {
       JSON.parse(item.content_json);
     } catch (e) {
       throw new Error(`[Repository] createContextItem failed: content_json is not valid JSON.`);
+    }
+
+    const expectedHash = computeSha256(item.content_json);
+    if (item.content_hash !== expectedHash) {
+      throw new Error(`[Repository] createContextItem failed: content_hash "${item.content_hash}" does not match SHA-256 of content_json ("${expectedHash}").`);
     }
 
     this.db
@@ -2766,10 +2855,82 @@ export class Repository {
       throw new Error(`[Repository] createContextManifest failed: ContextSnapshot "${manifest.snapshot_id}" not found.`);
     }
 
+    const existingManifest = this.getContextManifestBySnapshotId(manifest.snapshot_id);
+    if (existingManifest) {
+      throw new Error(`[Repository] createContextManifest failed: ContextSnapshot "${manifest.snapshot_id}" is already sealed by manifest "${existingManifest.id}".`);
+    }
+
     try {
       JSON.parse(manifest.manifest_json);
     } catch (e) {
       throw new Error(`[Repository] createContextManifest failed: manifest_json is not valid JSON.`);
+    }
+
+    const items = this.getContextItemsBySnapshot(manifest.snapshot_id);
+    if (manifest.item_count !== items.length) {
+      throw new Error(`[Repository] createContextManifest failed: manifest item_count (${manifest.item_count}) does not match actual item count (${items.length}).`);
+    }
+
+    for (let i = 0; i < items.length; i++) {
+      if (items[i].ordinal !== i) {
+        throw new Error(`[Repository] createContextManifest failed: context items ordinals are not contiguous (expected ${i}, found ${items[i].ordinal}).`);
+      }
+    }
+
+    for (const item of items) {
+      const itemHash = computeSha256(item.content_json);
+      if (item.content_hash !== itemHash) {
+        throw new Error(`[Repository] createContextManifest failed: item "${item.id}" content_hash mismatch.`);
+      }
+    }
+
+    const expectedSnapshotHash = computeSnapshotContentHash({
+      projectId: snapshot.project_id,
+      taskId: snapshot.task_id,
+      attemptId: snapshot.attempt_id,
+      assignmentId: snapshot.assignment_id,
+      purpose: snapshot.purpose,
+      builderVersion: snapshot.builder_version,
+      items: items.map((i) => ({
+        ordinal: i.ordinal,
+        itemType: i.item_type,
+        sourceType: i.source_type,
+        sourceRef: i.source_ref,
+        contentHash: i.content_hash,
+      })),
+    });
+
+    if (snapshot.content_hash !== expectedSnapshotHash) {
+      throw new Error(`[Repository] createContextManifest failed: snapshot content_hash "${snapshot.content_hash}" does not match recomputed hash "${expectedSnapshotHash}".`);
+    }
+
+    const { manifestJson: expectedManifestJson, manifestHash: expectedManifestHash } =
+      computeManifestPayloadAndHash({
+        manifest_version: manifest.manifest_version,
+        project_id: snapshot.project_id,
+        task_id: snapshot.task_id,
+        attempt_id: snapshot.attempt_id,
+        assignment_id: snapshot.assignment_id,
+        purpose: snapshot.purpose,
+        builder_version: snapshot.builder_version,
+        item_count: items.length,
+        items: items.map((i) => ({
+          ordinal: i.ordinal,
+          item_type: i.item_type,
+          source_type: i.source_type,
+          source_ref: i.source_ref,
+          content_hash: i.content_hash,
+          token_estimate: i.token_estimate,
+        })),
+      });
+
+    if (manifest.manifest_hash !== expectedManifestHash) {
+      throw new Error(`[Repository] createContextManifest failed: manifest_hash "${manifest.manifest_hash}" does not match recomputed canonical hash "${expectedManifestHash}".`);
+    }
+
+    const parsedManifest = JSON.parse(manifest.manifest_json);
+    if (canonicalJsonStringify(parsedManifest) !== expectedManifestJson) {
+      throw new Error(`[Repository] createContextManifest failed: manifest_json does not match canonical descriptor.`);
     }
 
     this.db
@@ -2823,6 +2984,11 @@ export class Repository {
 
   // 7. Handoff Context
   public createHandoffContext(handoff: HandoffContext): void {
+    const project = this.getProject(handoff.project_id);
+    if (!project) {
+      throw new Error(`[Repository] createHandoffContext failed: Project "${handoff.project_id}" not found.`);
+    }
+
     const task = this.getTask(handoff.task_id);
     if (!task) {
       throw new Error(`[Repository] createHandoffContext failed: Task "${handoff.task_id}" not found.`);
@@ -2831,12 +2997,51 @@ export class Repository {
       throw new Error(`[Repository] createHandoffContext failed: Task "${handoff.task_id}" belongs to project "${task.project_id}", expected "${handoff.project_id}".`);
     }
 
+    if (handoff.attempt_id) {
+      const attempt = this.getTaskAttempt(handoff.attempt_id);
+      if (!attempt) {
+        throw new Error(`[Repository] createHandoffContext failed: TaskAttempt "${handoff.attempt_id}" not found.`);
+      }
+      if (attempt.task_id !== handoff.task_id) {
+        throw new Error(`[Repository] createHandoffContext failed: TaskAttempt "${handoff.attempt_id}" belongs to task "${attempt.task_id}", expected "${handoff.task_id}".`);
+      }
+    }
+
+    if (handoff.from_assignment_id) {
+      const fromAsgn = this.getAgentAssignment(handoff.from_assignment_id);
+      if (!fromAsgn) {
+        throw new Error(`[Repository] createHandoffContext failed: From AgentAssignment "${handoff.from_assignment_id}" not found.`);
+      }
+      if (fromAsgn.project_id !== handoff.project_id || fromAsgn.task_id !== handoff.task_id) {
+        throw new Error(`[Repository] createHandoffContext failed: From AgentAssignment "${handoff.from_assignment_id}" does not match project/task.`);
+      }
+      if (handoff.attempt_id && fromAsgn.attempt_id && handoff.attempt_id !== fromAsgn.attempt_id) {
+        throw new Error(`[Repository] createHandoffContext failed: From AgentAssignment attempt "${fromAsgn.attempt_id}" does not match handoff attempt "${handoff.attempt_id}".`);
+      }
+    }
+
+    if (handoff.to_assignment_id) {
+      const toAsgn = this.getAgentAssignment(handoff.to_assignment_id);
+      if (!toAsgn) {
+        throw new Error(`[Repository] createHandoffContext failed: To AgentAssignment "${handoff.to_assignment_id}" not found.`);
+      }
+      if (toAsgn.project_id !== handoff.project_id || toAsgn.task_id !== handoff.task_id) {
+        throw new Error(`[Repository] createHandoffContext failed: To AgentAssignment "${handoff.to_assignment_id}" does not match project/task.`);
+      }
+      if (handoff.attempt_id && toAsgn.attempt_id && handoff.attempt_id !== toAsgn.attempt_id) {
+        throw new Error(`[Repository] createHandoffContext failed: To AgentAssignment attempt "${toAsgn.attempt_id}" does not match handoff attempt "${handoff.attempt_id}".`);
+      }
+    }
+
     const sourceSnapshot = this.getContextSnapshot(handoff.source_snapshot_id);
     if (!sourceSnapshot) {
       throw new Error(`[Repository] createHandoffContext failed: Source ContextSnapshot "${handoff.source_snapshot_id}" not found.`);
     }
-    if (sourceSnapshot.task_id !== handoff.task_id) {
-      throw new Error(`[Repository] createHandoffContext failed: Source ContextSnapshot "${handoff.source_snapshot_id}" belongs to task "${sourceSnapshot.task_id}", expected "${handoff.task_id}".`);
+    if (sourceSnapshot.project_id !== handoff.project_id || sourceSnapshot.task_id !== handoff.task_id) {
+      throw new Error(`[Repository] createHandoffContext failed: Source ContextSnapshot "${handoff.source_snapshot_id}" does not match project/task.`);
+    }
+    if (handoff.attempt_id && sourceSnapshot.attempt_id && handoff.attempt_id !== sourceSnapshot.attempt_id) {
+      throw new Error(`[Repository] createHandoffContext failed: Source ContextSnapshot attempt "${sourceSnapshot.attempt_id}" does not match handoff attempt "${handoff.attempt_id}".`);
     }
 
     if (handoff.handoff_snapshot_id) {
@@ -2844,8 +3049,11 @@ export class Repository {
       if (!handoffSnapshot) {
         throw new Error(`[Repository] createHandoffContext failed: Handoff ContextSnapshot "${handoff.handoff_snapshot_id}" not found.`);
       }
-      if (handoffSnapshot.task_id !== handoff.task_id) {
-        throw new Error(`[Repository] createHandoffContext failed: Handoff ContextSnapshot "${handoff.handoff_snapshot_id}" belongs to task "${handoffSnapshot.task_id}", expected "${handoff.task_id}".`);
+      if (handoffSnapshot.project_id !== handoff.project_id || handoffSnapshot.task_id !== handoff.task_id) {
+        throw new Error(`[Repository] createHandoffContext failed: Handoff ContextSnapshot "${handoff.handoff_snapshot_id}" does not match project/task.`);
+      }
+      if (handoff.attempt_id && handoffSnapshot.attempt_id && handoff.attempt_id !== handoffSnapshot.attempt_id) {
+        throw new Error(`[Repository] createHandoffContext failed: Handoff ContextSnapshot attempt "${handoffSnapshot.attempt_id}" does not match handoff attempt "${handoff.attempt_id}".`);
       }
     }
 
