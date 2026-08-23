@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       release_tag:
-        description: 'Release tag to publish as DRAFT (e.g. v0.1.0)'
+        description: 'Release tag to publish as DRAFT (e.g. v0.1.0 or 0.1.0)'
         required: true
         type: string
 
@@ -20,19 +20,21 @@ jobs:
     name: Build & Stage Windows DRAFT Release (windows-latest, Node 22.x)
     runs-on: windows-latest
     steps:
-      - name: Verify release trigger authorization
+      - name: Verify release trigger authorization and canonical tag normalization
         shell: pwsh
         run: |
           if ('${{ github.event_name }}' -ne 'workflow_dispatch') {
             Write-Error "Release workflow must ONLY be triggered via manual workflow_dispatch."
             exit 1
           }
-          $tag = '${{ inputs.release_tag }}'.Trim()
-          if (-not $tag -or $tag -notmatch '^v?[0-9]+\.[0-9]+\.[0-9]+') {
-            Write-Error "Invalid release tag format: '$tag'. Expected format: 'vX.Y.Z' or 'X.Y.Z'."
+          $rawTag = '${{ inputs.release_tag }}'.Trim()
+          if (-not $rawTag -or $rawTag -notmatch '^v?[0-9]+\.[0-9]+\.[0-9]+') {
+            Write-Error "Invalid release tag format: '$rawTag'. Expected format: 'vX.Y.Z' or 'X.Y.Z'."
             exit 1
           }
-          Write-Host "Authorized workflow_dispatch release trigger for tag: $tag"
+          $normalizedVersion = $rawTag.TrimStart('v')
+          $canonicalTag = "v$normalizedVersion"
+          Write-Host "Authorized workflow_dispatch release trigger for input '$rawTag' -> Canonical Tag: '$canonicalTag'"
 
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -63,40 +65,72 @@ jobs:
           $pkgVersion = $pkgJson.version.Trim()
           $rawTag = '${{ inputs.release_tag }}'.Trim()
           $normalizedTag = $rawTag.TrimStart('v')
+          $canonicalTag = "v$normalizedTag"
 
           Write-Host "Package version: $pkgVersion"
-          Write-Host "Input release tag: $rawTag (normalized: $normalizedTag)"
+          Write-Host "Input release tag: $rawTag"
+          Write-Host "Canonical release tag: $canonicalTag"
 
           if ($pkgVersion -ne $normalizedTag) {
-            Write-Error "VERSION MISMATCH FAIL-CLOSED: package.json version ($pkgVersion) does not match release tag ($rawTag)."
+            Write-Error "VERSION MISMATCH FAIL-CLOSED: package.json version ($pkgVersion) does not match normalized release tag ($normalizedTag)."
             exit 1
           }
           Write-Host "Version/tag consistency check: PASS"
 
-      - name: Verify release collision guards (Fail-Closed)
+      - name: Exhaustive release collision guard (Fail-Closed)
         shell: pwsh
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           $rawTag = '${{ inputs.release_tag }}'.Trim()
-          $normalizedTag = $rawTag.TrimStart('v')
-          $vPrefixedTag = "v$normalizedTag"
+          $normalizedVersion = $rawTag.TrimStart('v')
+          $canonicalTag = "v$normalizedVersion"
 
-          Write-Host "Checking for existing remote tags ($rawTag, $vPrefixedTag, $normalizedTag)..."
+          Write-Host "=== Exhaustive Release Collision Guard ==="
+          Write-Host "Target Canonical Tag: $canonicalTag"
+          Write-Host "Target Unprefixed Version: $normalizedVersion"
+
+          # 1. Check Git remote tags for exact refs
           $remoteTags = git ls-remote --tags origin
-          if ($remoteTags -match "refs/tags/$rawTag`$" -or $remoteTags -match "refs/tags/$vPrefixedTag`$" -or $remoteTags -match "refs/tags/$normalizedTag`$") {
-            Write-Error "RELEASE COLLISION GUARD FAIL-CLOSED: Tag already exists on remote origin!"
+          if ($remoteTags -match "refs/tags/$canonicalTag`$") {
+            Write-Error "COLLISION GUARD FAIL-CLOSED: Canonical tag $canonicalTag already exists on remote origin!"
             exit 1
           }
+          if ($remoteTags -match "refs/tags/$normalizedVersion`$") {
+            Write-Error "COLLISION GUARD FAIL-CLOSED: Unprefixed tag $normalizedVersion already exists on remote origin!"
+            exit 1
+          }
+          Write-Host "REMOTE_CANONICAL_TAG_EXISTS=NO"
+          Write-Host "REMOTE_UNPREFIXED_TAG_EXISTS=NO"
 
-          Write-Host "Checking for existing GitHub releases..."
-          $releasesJson = gh api /repos/${{ github.repository }}/releases | ConvertFrom-Json
-          $matching = $releasesJson | Where-Object { $_.tag_name -eq $rawTag -or $_.tag_name -eq $vPrefixedTag -or $_.tag_name -eq $normalizedTag }
-          if ($matching) {
-            Write-Error "RELEASE COLLISION GUARD FAIL-CLOSED: GitHub release already exists for tag ($rawTag)!"
-            exit 1
+          # 2. Exact-tag lookup via GitHub API with strict fail-closed error handling
+          $checkTags = @($canonicalTag, $normalizedVersion)
+          foreach ($tagToCheck in $checkTags) {
+            Write-Host "Checking GitHub release existence for tag: $tagToCheck..."
+            $apiResult = $null
+            $httpError = $null
+            try {
+              $apiResult = gh api "/repos/${{ github.repository }}/releases/tags/$tagToCheck" 2>&1
+            } catch {
+              $httpError = $_.Exception.Message
+            }
+
+            if ($LASTEXITCODE -eq 0 -and $null -ne $apiResult -and ($apiResult -notmatch "Not Found" -and $apiResult -notmatch "404")) {
+              Write-Error "COLLISION GUARD FAIL-CLOSED: GitHub release already exists for tag '$tagToCheck'!"
+              exit 1
+            }
+
+            # Verify that non-zero exit is specifically a 404 Not Found, not auth/network/server failure
+            $errorOutput = "$apiResult $httpError"
+            if ($errorOutput -match "404" -or $errorOutput -match "Not Found" -or $errorOutput -match "release not found") {
+              Write-Host "Confirmed release absent (404 Not Found) for tag: $tagToCheck"
+            } else {
+              Write-Error "COLLISION GUARD LOOKUP FAILURE FAIL-CLOSED: Unexpected API response or network failure when checking '$tagToCheck': $errorOutput"
+              exit 1
+            }
           }
-          Write-Host "Release collision check: PASS (No pre-existing tag or release)"
+          Write-Host "GITHUB_CANONICAL_RELEASE_EXISTS=NO"
+          Write-Host "Release collision guard: PASS (Exhaustive lookup confirmed tag and release absent)"
 
       - name: Setup Node.js 22.x
         uses: actions/setup-node@v4
@@ -131,10 +165,12 @@ jobs:
         run: |
           $pkgJson = Get-Content -Path "package.json" -Raw | ConvertFrom-Json
           $ver = $pkgJson.version.Trim()
+          $rawTag = '${{ inputs.release_tag }}'.Trim()
+          $canonicalTag = "v$($rawTag.TrimStart('v'))"
           $sha = (git rev-parse HEAD).Trim()
           powershell -ExecutionPolicy Bypass -File scripts/prepare-release-assets-win.ps1 `
             -ExpectedVersion $ver `
-            -ReleaseTag "${{ inputs.release_tag }}" `
+            -ReleaseTag $canonicalTag `
             -SourceSha $sha `
             -ReleaseDir "release" `
             -StagingDir "release\publish-assets"
@@ -181,40 +217,45 @@ jobs:
             -InstallerPath $stagedInstallerPath `
             -ReceiptOutput "release\publish-assets\demo-rc-receipt.txt"
 
-      - name: Verify Staged Assets Integrity Before GitHub Mutation
+      - name: Finalize release metadata with RC verification receipt
         shell: pwsh
         run: |
-          $stagedDir = "release\publish-assets"
-          $metadataPath = Join-Path $stagedDir "release-metadata.txt"
-          $receiptPath = Join-Path $stagedDir "demo-rc-receipt.txt"
-          $latestYmlPath = Join-Path $stagedDir "latest.yml"
+          powershell -ExecutionPolicy Bypass -File scripts/prepare-release-assets-win.ps1 `
+            -FinalizeRcStatus `
+            -StagingDir "release\publish-assets"
 
-          if (-not (Test-Path $metadataPath)) { Write-Error "Missing $metadataPath"; exit 1 }
-          if (-not (Test-Path $receiptPath)) { Write-Error "Missing $receiptPath"; exit 1 }
-          if (-not (Test-Path $latestYmlPath)) { Write-Error "Missing $latestYmlPath"; exit 1 }
+      - name: Final frozen release asset byte verification immediately before release creation (Fail-Closed)
+        shell: pwsh
+        run: |
+          $pkgJson = Get-Content -Path "package.json" -Raw | ConvertFrom-Json
+          $ver = $pkgJson.version.Trim()
+          $rawTag = '${{ inputs.release_tag }}'.Trim()
+          $canonicalTag = "v$($rawTag.TrimStart('v'))"
+          $sha = (git rev-parse HEAD).Trim()
 
-          $receiptContent = Get-Content -Path $receiptPath -Raw
-          if ($receiptContent -notmatch "RC_VERIFICATION_STATUS=PASS") {
-            Write-Error "RC verification failed or receipt does not indicate PASS!"
-            exit 1
-          }
-
-          Write-Host "All release gates passed. Ready to create DRAFT release from frozen staged assets."
+          Write-Host "=== Final Pre-Release Frozen Asset Verification ==="
+          powershell -ExecutionPolicy Bypass -File scripts/prepare-release-assets-win.ps1 `
+            -VerifyOnly `
+            -ExpectedVersion $ver `
+            -ReleaseTag $canonicalTag `
+            -SourceSha $sha `
+            -StagingDir "release\publish-assets"
 
       - name: Create GitHub DRAFT Release From Frozen Assets Only
         shell: pwsh
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          $tag = '${{ inputs.release_tag }}'.Trim()
+          $rawTag = '${{ inputs.release_tag }}'.Trim()
+          $canonicalTag = "v$($rawTag.TrimStart('v'))"
           $sha = (git rev-parse HEAD).Trim()
           $stagedDir = "release\publish-assets"
           $metadataPath = Join-Path $stagedDir "release-metadata.txt"
 
           Write-Host "=== Creating GitHub DRAFT Release ==="
-          Write-Host "Tag:    $tag"
-          Write-Host "Target: $sha"
-          Write-Host "Draft:  true (Explicit draft release policy)"
+          Write-Host "Canonical Tag: $canonicalTag"
+          Write-Host "Target SHA:    $sha"
+          Write-Host "Draft:         true (Explicit draft release policy)"
 
           $assets = @(Get-ChildItem -Path $stagedDir -File | ForEach-Object { $_.FullName })
           Write-Host "Assets to upload:"
@@ -222,32 +263,33 @@ jobs:
             Write-Host "  - $(Split-Path -Leaf $a)"
           }
 
-          gh release create $tag $assets `
+          gh release create $canonicalTag $assets `
             --target $sha `
             --draft `
-            --title "AgentForge $tag" `
+            --title "AgentForge $canonicalTag" `
             --notes-file $metadataPath
 
-          Write-Host "GitHub DRAFT release created successfully."
+          Write-Host "GitHub DRAFT release created successfully for tag: $canonicalTag."
 
-      - name: Verify Published DRAFT Release (Post-Creation Verification)
+      - name: Verify Published DRAFT Release and Asset Sizes (Post-Creation Verification)
         shell: pwsh
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          $tag = '${{ inputs.release_tag }}'.Trim()
+          $rawTag = '${{ inputs.release_tag }}'.Trim()
+          $canonicalTag = "v$($rawTag.TrimStart('v'))"
           $sha = (git rev-parse HEAD).Trim()
 
           Write-Host "=== Verifying Created DRAFT Release via GitHub API ==="
-          $releaseInfo = gh release view $tag --json isDraft,isPrerelease,tagName,targetCommitish,assets | ConvertFrom-Json
+          $releaseInfo = gh release view $canonicalTag --json isDraft,isPrerelease,tagName,targetCommitish,assets | ConvertFrom-Json
 
           if ($releaseInfo.isDraft -ne $true) {
             Write-Error "CRITICAL SECURITY BREACH: Release is NOT marked as draft!"
             exit 1
           }
 
-          if ($releaseInfo.tagName -ne $tag) {
-            Write-Error "Release tag mismatch: expected $tag, got $($releaseInfo.tagName)"
+          if ($releaseInfo.tagName -ne $canonicalTag) {
+            Write-Error "Release tag mismatch: expected $canonicalTag, got $($releaseInfo.tagName)"
             exit 1
           }
 
@@ -256,19 +298,50 @@ jobs:
             exit 1
           }
 
-          $assetNames = @($releaseInfo.assets | ForEach-Object { $_.name })
-          Write-Host "Uploaded Release Assets in Draft: $($assetNames -join ', ')"
+          $stagedMetaContent = Get-Content -Path "release\publish-assets\release-metadata.txt" -Raw
+          $meta = @{}
+          foreach ($line in ($stagedMetaContent -split "\r?\n")) {
+            if ($line -match '^([^=]+)=(.*)$') {
+              $meta[$Matches[1].Trim()] = $Matches[2].Trim()
+            }
+          }
 
-          $requiredPatterns = @('\.exe$', '\.blockmap$', '^latest\.yml$', '^release-metadata\.txt$', '^demo-rc-receipt\.txt$')
-          foreach ($pat in $requiredPatterns) {
-            $found = $assetNames | Where-Object { $_ -match $pat }
-            if (-not $found) {
-              Write-Error "Missing required asset matching pattern '$pat' in draft release!"
+          $assetDict = @{}
+          foreach ($asset in $releaseInfo.assets) {
+            $assetDict[$asset.name] = $asset
+            Write-Host "Uploaded Asset: $($asset.name) ($($asset.size) bytes)"
+          }
+
+          # Check required asset patterns and verify sizes against frozen metadata
+          $expectedInstaller = $meta["PUBLISHED_INSTALLER_FILENAME"]
+          if (-not $assetDict.ContainsKey($expectedInstaller)) {
+            Write-Error "Missing installer asset '$expectedInstaller' in draft release!"
+            exit 1
+          }
+          if ($assetDict[$expectedInstaller].size -ne [int64]$meta["PUBLISHED_INSTALLER_SIZE"]) {
+            Write-Error "Draft installer size mismatch: GitHub ($($assetDict[$expectedInstaller].size)) != Metadata ($($meta['PUBLISHED_INSTALLER_SIZE']))"
+            exit 1
+          }
+
+          $expectedBlockmap = $meta["BLOCKMAP_FILENAME"]
+          if (-not $assetDict.ContainsKey($expectedBlockmap)) {
+            Write-Error "Missing blockmap asset '$expectedBlockmap' in draft release!"
+            exit 1
+          }
+          if ($assetDict[$expectedBlockmap].size -ne [int64]$meta["BLOCKMAP_SIZE"]) {
+            Write-Error "Draft blockmap size mismatch: GitHub ($($assetDict[$expectedBlockmap].size)) != Metadata ($($meta['BLOCKMAP_SIZE']))"
+            exit 1
+          }
+
+          $otherRequired = @("latest.yml", "release-metadata.txt", "demo-rc-receipt.txt")
+          foreach ($req in $otherRequired) {
+            if (-not $assetDict.ContainsKey($req)) {
+              Write-Error "Missing required asset '$req' in draft release!"
               exit 1
             }
           }
 
-          Write-Host "Post-creation draft verification: PASS (Draft=true, Target=$sha, All assets present)"
+          Write-Host "Post-creation draft verification: PASS (Draft=true, Tag=$canonicalTag, Target=$sha, All assets and sizes verified)"
 
       - name: Upload Release Step Summary
         if: always()
@@ -276,7 +349,8 @@ jobs:
         run: |
           echo "### AgentForge Windows Release Summary (DRAFT ONLY)" >> $GITHUB_STEP_SUMMARY
           echo "- **Exact Published Commit**: \`$(git rev-parse HEAD)\`" >> $GITHUB_STEP_SUMMARY
-          echo "- **Release Tag**: \`${{ inputs.release_tag }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "- **Input Tag**: \`${{ inputs.release_tag }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "- **Canonical Release Tag**: \`v$(echo '${{ inputs.release_tag }}' | sed 's/^v//')\`" >> $GITHUB_STEP_SUMMARY
           echo "- **Release State**: \`DRAFT (Awaiting Owner Review & Publication Approval)\`" >> $GITHUB_STEP_SUMMARY
           echo "- **Publish Status**: \`${{ job.status }}\`" >> $GITHUB_STEP_SUMMARY
           if [ -f "release/publish-assets/release-metadata.txt" ]; then
