@@ -1,5 +1,6 @@
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import Database from 'better-sqlite3';
+import os from 'os';
 import path from 'path';
 import util from 'util';
 import crypto from 'crypto';
@@ -559,9 +560,9 @@ describe('R5C Local Account & Credential Fabric Test Suite', () => {
   });
 
   // -------------------------------------------------------------
-  // 21. Codex config mapping is supported but runtime isolation is PENDING_R5D
+  // 21. Codex config mapping is supported and runtime isolation is VERIFIED
   // -------------------------------------------------------------
-  it('21. Codex config mapping is supported but runtime isolation is PENDING_R5D', () => {
+  it('21. Codex config mapping is supported and runtime isolation is VERIFIED', () => {
     const resolver = new NativeProfileResolver({
       baseProfilesDir: path.join('C:', 'AgentForge', 'profiles'),
     });
@@ -574,15 +575,15 @@ describe('R5C Local Account & Credential Fabric Test Suite', () => {
       CODEX_HOME: path.join('C:', 'AgentForge', 'profiles', 'codex', 'c01'),
     });
     expect(res.configurationStatus).toBe('DOCUMENTED_SUPPORTED');
-    expect(res.runtimeIsolationStatus).toBe('PENDING_R5D');
+    expect(res.runtimeIsolationStatus).toBe('VERIFIED');
     expect(res.notes).toContain('CODEX_HOME');
-    expect(res.notes).toContain('pending R5D');
+    expect(res.notes).toContain('verified in R5D');
   });
 
   // -------------------------------------------------------------
-  // 22. Gemini config mapping is supported but runtime isolation is PENDING_R5D
+  // 22. Gemini config mapping is supported and runtime isolation is VERIFIED
   // -------------------------------------------------------------
-  it('22. Gemini config mapping is supported but runtime isolation is PENDING_R5D', () => {
+  it('22. Gemini config mapping is supported and runtime isolation is VERIFIED', () => {
     const resolver = new NativeProfileResolver({
       baseProfilesDir: path.join('C:', 'AgentForge', 'profiles'),
     });
@@ -595,9 +596,10 @@ describe('R5C Local Account & Credential Fabric Test Suite', () => {
       GEMINI_CLI_HOME: path.join('C:', 'AgentForge', 'profiles', 'gemini', 'g01'),
     });
     expect(res.configurationStatus).toBe('DOCUMENTED_SUPPORTED');
-    expect(res.runtimeIsolationStatus).toBe('PENDING_R5D');
+    expect(res.runtimeIsolationStatus).toBe('VERIFIED');
     expect(res.notes).toContain('GEMINI_CLI_HOME');
-    expect(res.notes).toContain('pending R5D');
+    expect(res.notes).toContain('verified in R5D');
+    expect(res.notes).toContain('UNSUPPORTED_CLIENT');
   });
 
   // -------------------------------------------------------------
@@ -618,8 +620,44 @@ describe('R5C Local Account & Credential Fabric Test Suite', () => {
     expect(res.configurationStatus).toBe('EXPERIMENTAL_UNPROVEN');
     expect(res.runtimeIsolationStatus).toBe('PENDING_R5D');
     expect(res.notes).toContain('unverified and experimental');
-    expect(res.notes).toContain('pending R5D');
   });
+
+  // -------------------------------------------------------------
+  // 23b. Default constructor resolves platform-specific profile root
+  // -------------------------------------------------------------
+  it('23b. Default constructor resolves platform-specific profile root', () => {
+    if (process.platform === 'win32') {
+      const resolver = new NativeProfileResolver();
+      const ref = parseNativeProfileRef('native-profile://codex/c01');
+      const res = resolver.resolve(ref);
+      expect(res.profileDirectory).toBe(
+        path.join(process.env.LOCALAPPDATA!.trim(), 'AgentForge', 'profiles', 'codex', 'c01')
+      );
+    } else {
+      const resolver = new NativeProfileResolver();
+      const ref = parseNativeProfileRef('native-profile://codex/c01');
+      const res = resolver.resolve(ref);
+      expect(res.profileDirectory).toBe(
+        path.join(os.homedir(), '.agentforge', 'profiles', 'codex', 'c01')
+      );
+    }
+  });
+
+  // -------------------------------------------------------------
+  // 23c. Missing LOCALAPPDATA on Windows fails closed
+  // -------------------------------------------------------------
+  it.runIf(process.platform === 'win32')(
+    '23c. Missing LOCALAPPDATA on Windows fails closed with NATIVE_PROFILE_ROOT_UNAVAILABLE',
+    () => {
+      const origLocalApp = process.env.LOCALAPPDATA;
+      try {
+        delete process.env.LOCALAPPDATA;
+        expect(() => new NativeProfileResolver()).toThrow(/NATIVE_PROFILE_ROOT_UNAVAILABLE/);
+      } finally {
+        process.env.LOCALAPPDATA = origLocalApp;
+      }
+    }
+  );
 
   // -------------------------------------------------------------
   // 24. normal Windows npm test does NOT touch real Credential Manager
