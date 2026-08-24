@@ -1442,10 +1442,9 @@ describe('Owner Routing & Manual Bridge Handoff Loop (PR #8)', () => {
   // 5. Provider Safety & Adapter Contracts
   // =========================================================================
   describe('Provider Safety & Adapter Contracts', () => {
-    it('36. Codex remains OFFLINE / [] / fail-closed', async () => {
+    it('36. Codex requires RuntimeExecutionBinding and advertises capabilities', async () => {
       const codex = new CodexCliAdapter({ repo, artifactStore });
-      expect(await codex.getHealth()).toBe('OFFLINE');
-      expect(await codex.getCapabilities()).toEqual([]);
+      expect(await codex.getCapabilities()).toEqual(['CODING', 'TERMINAL', 'FILESYSTEM_EDIT', 'TEST_EXECUTION']);
       const exec = await codex.execute({
         taskId: testTaskId,
         projectId: testProjectId,
@@ -1453,7 +1452,8 @@ describe('Owner Routing & Manual Bridge Handoff Loop (PR #8)', () => {
         contextFiles: [],
       });
       expect(exec.status).toBe('FAILED');
-      expect(exec.error).toContain('CODEX_CLI_UNAVAILABLE');
+      expect(exec.errorCode).toBe('RESOURCE_UNAVAILABLE');
+      expect(exec.error).toContain('RUNTIME_BINDING_MISSING');
     });
 
     it('37-38. ManualBridge remains MANUAL_BRIDGE and returns AWAITING_OWNER', async () => {

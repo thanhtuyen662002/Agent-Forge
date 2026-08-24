@@ -6,11 +6,12 @@ import {
   QuotaSnapshotInfo,
   AgentExecutionRequest,
   AgentExecutionResult,
+  RuntimeErrorCode,
 } from './ProviderAdapter';
 import { Capability, ProviderHealthStatus, ProviderAdapterType } from '../types/domain';
 import { Repository } from '../database/repositories';
 import { ArtifactStore } from '../services/ArtifactStore';
-import { ProcessRunner } from '../services/ProcessRunner';
+import { ProcessRunner, ProcessRunResult } from '../services/ProcessRunner';
 import { PolicyService } from '../services/PolicyService';
 import { ProtocolParser } from '../protocol/parser';
 
@@ -47,8 +48,23 @@ export abstract class LocalCliAdapterBase implements ProviderAdapter {
   protected abstract getDefaultExecutable(): string;
   public abstract getCapabilities(): Promise<Capability[]>;
 
-  protected getAllowedEnvironmentOverrideKeys(): string[] {
+  protected resolveExecutionEnvironment(_request?: AgentExecutionRequest): Record<string, string> | undefined {
+    return this.env;
+  }
+
+  protected getAllowedEnvironmentOverrideKeys(_request?: AgentExecutionRequest): string[] {
     return [];
+  }
+
+  protected extractProtocolText(_request: AgentExecutionRequest, rawStdout: string): string | null {
+    return rawStdout;
+  }
+
+  protected classifyProviderProcessFailure(
+    _request: AgentExecutionRequest,
+    _result: ProcessRunResult
+  ): { errorCode: RuntimeErrorCode; error: string } | null {
+    return null;
   }
 
   public setRepository(repo: Repository): void {
@@ -217,6 +233,8 @@ export abstract class LocalCliAdapterBase implements ProviderAdapter {
     // 5. Build prompt and CLI arguments
     const prompt = this.buildPrompt(request);
     const args = this.buildExecutionArgs(request, prompt);
+    const executionEnv = this.resolveExecutionEnvironment(request);
+    const allowedEnvKeys = this.getAllowedEnvironmentOverrideKeys(request);
 
     // 6. Execute through ProcessRunner with durable ownership and safe minimal environment
     const processResult = await ProcessRunner.execute({
@@ -224,8 +242,8 @@ export abstract class LocalCliAdapterBase implements ProviderAdapter {
       args,
       cwd: repoPath,
       timeoutMs: this.timeoutMs,
-      env: this.env,
-      allowedEnvKeys: this.getAllowedEnvironmentOverrideKeys(),
+      env: executionEnv,
+      allowedEnvKeys,
       allowShell: false,
       repo: this.repo,
       artifactStore: this.artifactStore,
@@ -286,6 +304,19 @@ export abstract class LocalCliAdapterBase implements ProviderAdapter {
     }
 
     if (processResult.exitCode !== 0) {
+      const refinedFailure = this.classifyProviderProcessFailure(request, processResult);
+      if (refinedFailure) {
+        return {
+          executionId: processResult.executionId,
+          status: 'FAILED',
+          errorCode: refinedFailure.errorCode,
+          rawResponse: processResult.stdout,
+          error: refinedFailure.error,
+          stdoutEvidenceId: processResult.stdoutEvidenceId,
+          stderrEvidenceId: processResult.stderrEvidenceId,
+        };
+      }
+
       return {
         executionId: processResult.executionId,
         status: 'FAILED',
@@ -298,7 +329,21 @@ export abstract class LocalCliAdapterBase implements ProviderAdapter {
     }
 
     // 9. Protocol validation: Process exit 0 alone is NOT task completion
-    const parseResult = ProtocolParser.parse(processResult.stdout);
+    const protocolText = this.extractProtocolText(request, processResult.stdout);
+
+    if (protocolText === null) {
+      return {
+        executionId: processResult.executionId,
+        status: 'FAILED',
+        errorCode: 'PROTOCOL_INVALID',
+        rawResponse: processResult.stdout,
+        error: 'PROTOCOL_INVALID: Process completed with exit code 0, but output extractor did not produce a valid protocol payload.',
+        stdoutEvidenceId: processResult.stdoutEvidenceId,
+        stderrEvidenceId: processResult.stderrEvidenceId,
+      };
+    }
+
+    const parseResult = ProtocolParser.parse(protocolText);
 
     if (parseResult.success && parseResult.data?.type === 'coder.v1') {
       return {
@@ -317,7 +362,7 @@ export abstract class LocalCliAdapterBase implements ProviderAdapter {
       status: 'FAILED',
       errorCode: 'PROTOCOL_INVALID',
       rawResponse: processResult.stdout,
-      error: `PROTOCOL_INVALID: Process completed with exit code 0, but stdout did not contain a valid CoderReport protocol payload (${parseResult.error || 'protocol missing'}).`,
+      error: `PROTOCOL_INVALID: Process completed with exit code 0, but payload did not contain a valid CoderReport protocol (${parseResult.error || 'protocol missing or invalid type'}).`,
       stdoutEvidenceId: processResult.stdoutEvidenceId,
       stderrEvidenceId: processResult.stderrEvidenceId,
     };
