@@ -216,7 +216,7 @@ describe('PR #19 — Production Release Pipeline Hardening Contract Tests', () =
     const result = spawnSync(
       psExe,
       ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File', fixtureScriptPath],
-      { encoding: 'utf8', windowsHide: true }
+      { encoding: 'utf8', timeout: 20000, windowsHide: true }
     );
 
     if (result.error) {
