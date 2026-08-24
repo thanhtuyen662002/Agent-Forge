@@ -1583,6 +1583,9 @@ export class Repository {
       throw new Error(`[Repository] createProviderAccount failed: Provider "${account.provider_id}" not found.`);
     }
 
+    let finalCredentialRef: string | null = null;
+    let finalProfileRef: string | null = null;
+
     if (account.auth_mode === 'API_CREDENTIAL') {
       if (account.profile_ref !== null && account.profile_ref !== undefined) {
         throw new Error(
@@ -1597,7 +1600,7 @@ export class Repository {
         }
       }
       if (account.credential_ref) {
-        parseCredentialRef(account.credential_ref);
+        finalCredentialRef = parseCredentialRef(account.credential_ref).toUriString();
       }
     } else if (account.auth_mode === 'NATIVE_PROFILE') {
       if (account.credential_ref !== null && account.credential_ref !== undefined) {
@@ -1613,7 +1616,7 @@ export class Repository {
         }
       }
       if (account.profile_ref) {
-        parseNativeProfileRef(account.profile_ref);
+        finalProfileRef = parseNativeProfileRef(account.profile_ref).toUriString();
       }
     } else {
       throw new Error(
@@ -1634,8 +1637,8 @@ export class Repository {
         account.provider_id,
         account.label,
         account.auth_mode,
-        account.credential_ref ?? null,
-        account.profile_ref ?? null,
+        finalCredentialRef,
+        finalProfileRef,
         account.enabled ? 1 : 0,
         account.priority ?? 0,
         account.health_status,
@@ -1703,6 +1706,9 @@ export class Repository {
       updates.profile_ref !== undefined;
     const isEnabling = updates.enabled === true && !existing.enabled;
 
+    let finalCredentialRef = updates.credential_ref !== undefined ? updates.credential_ref : existing.credential_ref;
+    let finalProfileRef = updates.profile_ref !== undefined ? updates.profile_ref : existing.profile_ref;
+
     if (isSecurityUpdate || isEnabling) {
       const mergedAuthMode = updates.auth_mode ?? existing.auth_mode;
       const mergedCredRef = updates.credential_ref !== undefined ? updates.credential_ref : existing.credential_ref;
@@ -1723,8 +1729,11 @@ export class Repository {
           }
         }
         if (mergedCredRef) {
-          parseCredentialRef(mergedCredRef);
+          finalCredentialRef = parseCredentialRef(mergedCredRef).toUriString();
+        } else {
+          finalCredentialRef = null;
         }
+        finalProfileRef = null;
       } else if (mergedAuthMode === 'NATIVE_PROFILE') {
         if (mergedCredRef !== null && mergedCredRef !== undefined) {
           throw new Error(
@@ -1739,8 +1748,11 @@ export class Repository {
           }
         }
         if (mergedProfRef) {
-          parseNativeProfileRef(mergedProfRef);
+          finalProfileRef = parseNativeProfileRef(mergedProfRef).toUriString();
+        } else {
+          finalProfileRef = null;
         }
+        finalCredentialRef = null;
       } else {
         throw new Error(
           `[Repository] updateProviderAccount failed: unsupported auth_mode "${mergedAuthMode}".`
@@ -1769,8 +1781,8 @@ export class Repository {
       .run(
         updates.label ?? existing.label,
         updates.auth_mode ?? existing.auth_mode,
-        updates.credential_ref !== undefined ? updates.credential_ref : existing.credential_ref,
-        updates.profile_ref !== undefined ? updates.profile_ref : existing.profile_ref,
+        finalCredentialRef,
+        finalProfileRef,
         updates.enabled !== undefined ? (updates.enabled ? 1 : 0) : (existing.enabled ? 1 : 0),
         updates.priority !== undefined ? updates.priority : existing.priority,
         updates.health_status ?? existing.health_status,

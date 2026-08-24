@@ -663,18 +663,18 @@ describe('R5C Local Account & Credential Fabric Test Suite', () => {
     // Test exists
     const existsResult = await store.exists(ref);
     expect(existsResult).toBe(true);
-    expect(executedInputs[1]).toBe('AgentForge:mock:test-target');
+    expect(executedInputs[1]).toBe('AgentForge:mock:test-target\n');
     expect(executedScripts[1]).toContain('WinCredProber');
 
     // Test get
     const retrieved = await store.get(ref);
     expect(retrieved?.exposeSecret()).toBe('mock-retrieved-secret');
-    expect(executedInputs[2]).toBe('AgentForge:mock:test-target');
+    expect(executedInputs[2]).toBe('AgentForge:mock:test-target\n');
 
     // Test delete
     const deleted = await store.delete(ref);
     expect(deleted).toBe(true);
-    expect(executedInputs[3]).toBe('AgentForge:mock:test-target');
+    expect(executedInputs[3]).toBe('AgentForge:mock:test-target\n');
   });
 
   // -------------------------------------------------------------
@@ -893,5 +893,287 @@ describe('R5C Local Account & Credential Fabric Test Suite', () => {
     const roundTrip = parseNativeProfileRef(mixed.toUriString());
     expect(roundTrip.toUriString()).toBe(mixed.toUriString());
     expect(roundTrip.getProfileId()).toBe(mixed.getProfileId());
+  });
+
+  // =============================================================
+  // CORRECTIVE 3: CANONICAL PERSISTENCE IN SQLITE (Section D)
+  // =============================================================
+
+  // 37. create ProviderAccount with mixed-case valid wincred input persists lowercase canonical credential_ref in raw SQLite
+  it('37. create ProviderAccount with mixed-case valid wincred input persists lowercase canonical credential_ref in raw SQLite', () => {
+    seedProvider('prov-37');
+    repo.createProviderAccount({
+      id: 'acct-37-mixed-wincred',
+      provider_id: 'prov-37',
+      label: 'Mixed Wincred Account',
+      auth_mode: 'API_CREDENTIAL',
+      credential_ref: 'WINCRED://AGENTFORGE/OpenAI/Team-Key',
+      profile_ref: null,
+      enabled: true,
+      priority: 1,
+      health_status: 'AVAILABLE',
+      cooldown_until: null,
+      concurrency_limit: 1,
+      last_success_at: null,
+      last_failure_at: null,
+      last_failure_code: null,
+      created_at: new Date().toISOString(),
+      updated_at: new Date().toISOString(),
+    });
+
+    const rawRow = db.prepare('SELECT credential_ref FROM provider_accounts WHERE id = ?').get('acct-37-mixed-wincred') as { credential_ref: string };
+    expect(rawRow.credential_ref).toBe('wincred://agentforge/openai/team-key');
+  });
+
+  // 38. create ProviderAccount with mixed-case native profile persists lowercase canonical profile_ref in raw SQLite
+  it('38. create ProviderAccount with mixed-case native profile persists lowercase canonical profile_ref in raw SQLite', () => {
+    seedProvider('prov-38');
+    repo.createProviderAccount({
+      id: 'acct-38-mixed-profile',
+      provider_id: 'prov-38',
+      label: 'Mixed Profile Account',
+      auth_mode: 'NATIVE_PROFILE',
+      credential_ref: null,
+      profile_ref: 'NATIVE-PROFILE://CODEX/C01',
+      enabled: true,
+      priority: 1,
+      health_status: 'AVAILABLE',
+      cooldown_until: null,
+      concurrency_limit: 1,
+      last_success_at: null,
+      last_failure_at: null,
+      last_failure_code: null,
+      created_at: new Date().toISOString(),
+      updated_at: new Date().toISOString(),
+    });
+
+    const rawRow = db.prepare('SELECT profile_ref FROM provider_accounts WHERE id = ?').get('acct-38-mixed-profile') as { profile_ref: string };
+    expect(rawRow.profile_ref).toBe('native-profile://codex/c01');
+  });
+
+  // 39. getProviderAccount returns canonical persisted ref
+  it('39. getProviderAccount returns canonical persisted ref', () => {
+    seedProvider('prov-39');
+    repo.createProviderAccount({
+      id: 'acct-39-canonical-get',
+      provider_id: 'prov-39',
+      label: 'Canonical Get Account',
+      auth_mode: 'API_CREDENTIAL',
+      credential_ref: 'wincred://AgentForge/Anthropic/Production-Key',
+      profile_ref: null,
+      enabled: true,
+      priority: 1,
+      health_status: 'AVAILABLE',
+      cooldown_until: null,
+      concurrency_limit: 1,
+      last_success_at: null,
+      last_failure_at: null,
+      last_failure_code: null,
+      created_at: new Date().toISOString(),
+      updated_at: new Date().toISOString(),
+    });
+
+    const acct = repo.getProviderAccount('acct-39-canonical-get');
+    expect(acct).not.toBeNull();
+    expect(acct?.credential_ref).toBe('wincred://agentforge/anthropic/production-key');
+  });
+
+  // 40. security update with mixed-case credential persists canonical form
+  it('40. security update with mixed-case credential persists canonical form', () => {
+    seedProvider('prov-40');
+    repo.createProviderAccount({
+      id: 'acct-40-security-update',
+      provider_id: 'prov-40',
+      label: 'Security Update Account',
+      auth_mode: 'API_CREDENTIAL',
+      credential_ref: 'wincred://agentforge/old/key',
+      profile_ref: null,
+      enabled: true,
+      priority: 1,
+      health_status: 'AVAILABLE',
+      cooldown_until: null,
+      concurrency_limit: 1,
+      last_success_at: null,
+      last_failure_at: null,
+      last_failure_code: null,
+      created_at: new Date().toISOString(),
+      updated_at: new Date().toISOString(),
+    });
+
+    repo.updateProviderAccount('acct-40-security-update', {
+      credential_ref: 'WINCRED://AGENTFORGE/New-Org/New-Secret-Key',
+    });
+
+    const rawRow = db.prepare('SELECT credential_ref FROM provider_accounts WHERE id = ?').get('acct-40-security-update') as { credential_ref: string };
+    expect(rawRow.credential_ref).toBe('wincred://agentforge/new-org/new-secret-key');
+  });
+
+  // 41. security update with mixed-case profile persists canonical form
+  it('41. security update with mixed-case profile persists canonical form', () => {
+    seedProvider('prov-41');
+    repo.createProviderAccount({
+      id: 'acct-41-profile-update',
+      provider_id: 'prov-41',
+      label: 'Profile Update Account',
+      auth_mode: 'NATIVE_PROFILE',
+      credential_ref: null,
+      profile_ref: 'native-profile://gemini/old-profile',
+      enabled: true,
+      priority: 1,
+      health_status: 'AVAILABLE',
+      cooldown_until: null,
+      concurrency_limit: 1,
+      last_success_at: null,
+      last_failure_at: null,
+      last_failure_code: null,
+      created_at: new Date().toISOString(),
+      updated_at: new Date().toISOString(),
+    });
+
+    repo.updateProviderAccount('acct-41-profile-update', {
+      profile_ref: 'NATIVE-PROFILE://GEMINI/Profile-Alpha-01',
+    });
+
+    const rawRow = db.prepare('SELECT profile_ref FROM provider_accounts WHERE id = ?').get('acct-41-profile-update') as { profile_ref: string };
+    expect(rawRow.profile_ref).toBe('native-profile://gemini/profile-alpha-01');
+  });
+
+  // 42. unrelated update of historical legacy row preserves exact legacy ref
+  it('42. unrelated update of historical legacy row preserves exact legacy ref', () => {
+    seedProvider('prov-42');
+    const historicalLegacyRef = 'OPAQUE_LEGACY_HANDLE_12345';
+    db.prepare(`
+      INSERT INTO provider_accounts (
+        id, provider_id, label, auth_mode, credential_ref, profile_ref,
+        enabled, priority, health_status, cooldown_until, concurrency_limit,
+        last_success_at, last_failure_at, last_failure_code, created_at, updated_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `).run(
+      'acct-42-legacy-exact',
+      'prov-42',
+      'Original Label',
+      'API_CREDENTIAL',
+      historicalLegacyRef,
+      null,
+      1,
+      5,
+      'AVAILABLE',
+      null,
+      1,
+      null,
+      null,
+      null,
+      new Date().toISOString(),
+      new Date().toISOString()
+    );
+
+    // Unrelated update (label and priority only)
+    repo.updateProviderAccount('acct-42-legacy-exact', {
+      label: 'Updated Label Only',
+      priority: 99,
+    });
+
+    const rawRow = db.prepare('SELECT credential_ref, label, priority FROM provider_accounts WHERE id = ?').get('acct-42-legacy-exact') as { credential_ref: string; label: string; priority: number };
+    expect(rawRow.credential_ref).toBe(historicalLegacyRef);
+    expect(rawRow.label).toBe('Updated Label Only');
+    expect(rawRow.priority).toBe(99);
+  });
+
+  // 43. two case-variant CredentialRefs cannot remain as two distinct durable string identities solely due to case
+  it('43. two case-variant CredentialRefs cannot remain as two distinct durable string identities solely due to case', () => {
+    seedProvider('prov-43');
+    repo.createProviderAccount({
+      id: 'acct-43-a',
+      provider_id: 'prov-43',
+      label: 'Account A',
+      auth_mode: 'API_CREDENTIAL',
+      credential_ref: 'wincred://agentforge/openai/key-01',
+      profile_ref: null,
+      enabled: true,
+      priority: 1,
+      health_status: 'AVAILABLE',
+      cooldown_until: null,
+      concurrency_limit: 1,
+      last_success_at: null,
+      last_failure_at: null,
+      last_failure_code: null,
+      created_at: new Date().toISOString(),
+      updated_at: new Date().toISOString(),
+    });
+
+    repo.createProviderAccount({
+      id: 'acct-43-b',
+      provider_id: 'prov-43',
+      label: 'Account B',
+      auth_mode: 'API_CREDENTIAL',
+      credential_ref: 'WINCRED://AGENTFORGE/OpenAI/KEY-01',
+      profile_ref: null,
+      enabled: true,
+      priority: 1,
+      health_status: 'AVAILABLE',
+      cooldown_until: null,
+      concurrency_limit: 1,
+      last_success_at: null,
+      last_failure_at: null,
+      last_failure_code: null,
+      created_at: new Date().toISOString(),
+      updated_at: new Date().toISOString(),
+    });
+
+    const rowA = db.prepare('SELECT credential_ref FROM provider_accounts WHERE id = ?').get('acct-43-a') as { credential_ref: string };
+    const rowB = db.prepare('SELECT credential_ref FROM provider_accounts WHERE id = ?').get('acct-43-b') as { credential_ref: string };
+
+    expect(rowA.credential_ref).toBe('wincred://agentforge/openai/key-01');
+    expect(rowB.credential_ref).toBe('wincred://agentforge/openai/key-01');
+    expect(rowA.credential_ref).toBe(rowB.credential_ref);
+  });
+
+  // 44. two case-variant NativeProfileRefs cannot remain as two distinct durable string identities solely due to case
+  it('44. two case-variant NativeProfileRefs cannot remain as two distinct durable string identities solely due to case', () => {
+    seedProvider('prov-44');
+    repo.createProviderAccount({
+      id: 'acct-44-a',
+      provider_id: 'prov-44',
+      label: 'Profile A',
+      auth_mode: 'NATIVE_PROFILE',
+      credential_ref: null,
+      profile_ref: 'native-profile://codex/c01',
+      enabled: true,
+      priority: 1,
+      health_status: 'AVAILABLE',
+      cooldown_until: null,
+      concurrency_limit: 1,
+      last_success_at: null,
+      last_failure_at: null,
+      last_failure_code: null,
+      created_at: new Date().toISOString(),
+      updated_at: new Date().toISOString(),
+    });
+
+    repo.createProviderAccount({
+      id: 'acct-44-b',
+      provider_id: 'prov-44',
+      label: 'Profile B',
+      auth_mode: 'NATIVE_PROFILE',
+      credential_ref: null,
+      profile_ref: 'NATIVE-PROFILE://CODEX/C01',
+      enabled: true,
+      priority: 1,
+      health_status: 'AVAILABLE',
+      cooldown_until: null,
+      concurrency_limit: 1,
+      last_success_at: null,
+      last_failure_at: null,
+      last_failure_code: null,
+      created_at: new Date().toISOString(),
+      updated_at: new Date().toISOString(),
+    });
+
+    const rowA = db.prepare('SELECT profile_ref FROM provider_accounts WHERE id = ?').get('acct-44-a') as { profile_ref: string };
+    const rowB = db.prepare('SELECT profile_ref FROM provider_accounts WHERE id = ?').get('acct-44-b') as { profile_ref: string };
+
+    expect(rowA.profile_ref).toBe('native-profile://codex/c01');
+    expect(rowB.profile_ref).toBe('native-profile://codex/c01');
+    expect(rowA.profile_ref).toBe(rowB.profile_ref);
   });
 });

@@ -1,6 +1,6 @@
 import { spawn } from 'child_process';
 import { CredentialRef, parseCredentialRef } from './CredentialRef';
-import { SecretValue } from './SecretValue';
+import { SecretValue, safeFormatDiagnostic } from './SecretValue';
 
 /**
  * Microsoft documented maximum credential blob size for generic credentials (5 * 512 bytes).
@@ -73,8 +73,10 @@ export class InMemoryCredentialStore implements CredentialStore {
  * Stores secrets in the Windows Credential Store under the current-user scope
  * with an `AgentForge:` namespace prefix.
  *
- * Revalidates reference inputs fail-closed before invoking OS commands.
- * Fails closed on non-Windows platforms.
+ * Strict channel separation:
+ * - PowerShell script logic is passed as command argument.
+ * - Credential target and secret payloads are passed strictly via standard input.
+ * - Fails closed on non-Windows platforms.
  */
 export class WindowsCredentialStore implements CredentialStore {
   readonly #platform: string;
@@ -239,7 +241,7 @@ try {
 }
 `;
 
-    const output = await this.#executor(psScript, targetName);
+    const output = await this.#executor(psScript, `${targetName}\n`);
     if (!output || output.length === 0) {
       return null;
     }
@@ -276,7 +278,7 @@ if ($success) {
 }
 `;
 
-    const output = await this.#executor(psScript, targetName);
+    const output = await this.#executor(psScript, `${targetName}\n`);
     return output.trim() === 'DELETED';
   }
 
@@ -322,18 +324,20 @@ if ($success) {
 }
 `;
 
-    const output = await this.#executor(psScript, targetName);
+    const output = await this.#executor(psScript, `${targetName}\n`);
     return output.trim() === 'EXISTS';
   }
 
   /**
    * Spawns PowerShell asynchronously with piped stdin and buffered stdout.
+   * PowerShell command source is supplied as a command argument (-Command <script>).
+   * Credential targets and secret payloads are supplied strictly via stdin.
    */
   #defaultPowerShellExecutor(script: string, stdinInput: string): Promise<string> {
     return new Promise((resolve, reject) => {
       const child = spawn(
         'powershell.exe',
-        ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-Command', '-'],
+        ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-Command', script],
         {
           stdio: ['pipe', 'pipe', 'pipe'],
           windowsHide: true,
@@ -357,9 +361,11 @@ if ($success) {
 
       child.on('close', (code) => {
         if (code !== 0) {
+          // Never output stdout in error message which might contain secret payloads
+          const sanitizedStderr = safeFormatDiagnostic(stderr.trim());
           reject(
             new Error(
-              `[WindowsCredentialStore] PowerShell execution failed (exit code ${code}): ${stderr.trim() || stdout.trim()}`
+              `[WindowsCredentialStore] PowerShell execution failed (exit code ${code}): ${sanitizedStderr || 'Unknown error'}`
             )
           );
         } else {
@@ -367,8 +373,7 @@ if ($success) {
         }
       });
 
-      // Write script and stdin input to powershell stdin
-      child.stdin.write(script + '\n');
+      // Write ONLY credential data to stdin
       if (stdinInput) {
         child.stdin.write(stdinInput);
       }
