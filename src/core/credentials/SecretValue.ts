@@ -2,33 +2,34 @@ import crypto from 'crypto';
 
 /**
  * Explicit secret-bearing container.
- * Encapsulates sensitive credentials in memory and guarantees that
- * standard stringification, JSON serialization, and Node.js inspection
+ * Encapsulates sensitive credentials in memory using true runtime-private
+ * `#secret` storage to guarantee that standard property reflection,
+ * object spreading, JSON serialization, and Node.js inspection hooks
  * always redact the secret payload to `[REDACTED_SECRET]`.
  */
 export class SecretValue {
-  private readonly secret: string;
+  #secret: string;
 
   constructor(secret: string) {
     if (typeof secret !== 'string' || secret.length === 0) {
       throw new Error('[SecretValue] Secret must be a non-empty string.');
     }
-    this.secret = secret;
+    this.#secret = secret;
   }
 
   /**
-   * Explicit method to access the raw secret string.
-   * This should only be called at the direct point of provider authorization/dispatch.
+   * Explicit intentional accessor for the raw secret payload.
+   * Must only be called at the direct point of provider authorization/dispatch.
    */
   public exposeSecret(): string {
-    return this.secret;
+    return this.#secret;
   }
 
   /**
    * Returns length of secret without revealing contents.
    */
   public get length(): number {
-    return this.secret.length;
+    return this.#secret.length;
   }
 
   /**
@@ -59,7 +60,7 @@ export class SecretValue {
     if (!other || !(other instanceof SecretValue)) {
       return false;
     }
-    const bufA = Buffer.from(this.secret, 'utf8');
+    const bufA = Buffer.from(this.#secret, 'utf8');
     const bufB = Buffer.from(other.exposeSecret(), 'utf8');
     if (bufA.length !== bufB.length) {
       return false;

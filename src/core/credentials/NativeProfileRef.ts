@@ -2,34 +2,57 @@
  * Parsed and validated opaque Native Profile Reference.
  * Represents a pointer to a provider CLI's isolated profile configuration
  * without reading, copying, or containing OAuth token payloads.
+ *
+ * Canonical URI form: `native-profile://<provider>/<profileId>`
  */
 export class NativeProfileRef {
-  private readonly scheme: string;
-  private readonly provider: string;
-  private readonly profileId: string;
-  private readonly rawUri: string;
+  readonly #scheme: string;
+  readonly #provider: string;
+  readonly #profileId: string;
+  readonly #rawUri: string;
 
-  constructor(scheme: string, provider: string, profileId: string, rawUri: string) {
-    this.scheme = scheme;
-    this.provider = provider;
-    this.profileId = profileId;
-    this.rawUri = rawUri;
+  private constructor(scheme: string, provider: string, profileId: string, rawUri: string) {
+    this.#scheme = scheme;
+    this.#provider = provider;
+    this.#profileId = profileId;
+    this.#rawUri = rawUri;
+  }
+
+  public static parse(raw: string): NativeProfileRef {
+    return parseNativeProfileRef(raw);
+  }
+
+  public static isValid(raw: string): boolean {
+    return isValidNativeProfileRef(raw);
+  }
+
+  /**
+   * Internal constructor helper for validated factory/parser.
+   * @internal
+   */
+  public static _createInternal(
+    scheme: string,
+    provider: string,
+    profileId: string,
+    rawUri: string
+  ): NativeProfileRef {
+    return new NativeProfileRef(scheme, provider, profileId, rawUri);
   }
 
   public getScheme(): string {
-    return this.scheme;
+    return this.#scheme;
   }
 
   public getProvider(): string {
-    return this.provider;
+    return this.#provider;
   }
 
   public getProfileId(): string {
-    return this.profileId;
+    return this.#profileId;
   }
 
   public toUriString(): string {
-    return `${this.scheme}://${this.provider}/${this.profileId}`;
+    return this.#rawUri;
   }
 
   public toString(): string {
@@ -117,7 +140,8 @@ export function parseNativeProfileRef(raw: string): NativeProfileRef {
     );
   }
 
-  return new NativeProfileRef(scheme, provider, profileId, `${scheme}://${provider}/${profileId}`);
+  const canonicalUri = `native-profile://${provider}/${profileId}`;
+  return NativeProfileRef._createInternal(scheme, provider, profileId, canonicalUri);
 }
 
 /**

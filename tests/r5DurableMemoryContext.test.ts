@@ -482,7 +482,7 @@ describe('R5B — Durable Memory & Context Fabric Contract Tests', () => {
       label: 'Native Profile 1',
       auth_mode: 'NATIVE_PROFILE',
       credential_ref: null,
-      profile_ref: 'profile-alpha',
+      profile_ref: 'native-profile://gemini/profile-alpha',
       enabled: true,
       priority: 10,
       health_status: 'AVAILABLE',
@@ -1789,7 +1789,7 @@ describe('R5B — Durable Memory & Context Fabric Contract Tests', () => {
       label: 'Account B',
       auth_mode: 'NATIVE_PROFILE',
       credential_ref: null,
-      profile_ref: 'b',
+      profile_ref: 'native-profile://gemini/b',
       enabled: true,
       priority: 10,
       health_status: 'AVAILABLE',
@@ -1828,8 +1828,8 @@ describe('R5B — Durable Memory & Context Fabric Contract Tests', () => {
 
     const acc1 = 'acc-asgn-1-' + crypto.randomUUID();
     const acc2 = 'acc-asgn-2-' + crypto.randomUUID();
-    repo.createProviderAccount({ id: acc1, provider_id: provId, label: 'Acc 1', auth_mode: 'NATIVE_PROFILE', credential_ref: null, profile_ref: '1', enabled: true, priority: 1, health_status: 'AVAILABLE', cooldown_until: null, concurrency_limit: 1, last_success_at: null, last_failure_at: null, last_failure_code: null, created_at: new Date().toISOString(), updated_at: new Date().toISOString() });
-    repo.createProviderAccount({ id: acc2, provider_id: provId, label: 'Acc 2', auth_mode: 'NATIVE_PROFILE', credential_ref: null, profile_ref: '2', enabled: true, priority: 1, health_status: 'AVAILABLE', cooldown_until: null, concurrency_limit: 1, last_success_at: null, last_failure_at: null, last_failure_code: null, created_at: new Date().toISOString(), updated_at: new Date().toISOString() });
+    repo.createProviderAccount({ id: acc1, provider_id: provId, label: 'Acc 1', auth_mode: 'NATIVE_PROFILE', credential_ref: null, profile_ref: 'native-profile://gemini/p1', enabled: true, priority: 1, health_status: 'AVAILABLE', cooldown_until: null, concurrency_limit: 1, last_success_at: null, last_failure_at: null, last_failure_code: null, created_at: new Date().toISOString(), updated_at: new Date().toISOString() });
+    repo.createProviderAccount({ id: acc2, provider_id: provId, label: 'Acc 2', auth_mode: 'NATIVE_PROFILE', credential_ref: null, profile_ref: 'native-profile://gemini/p2', enabled: true, priority: 1, health_status: 'AVAILABLE', cooldown_until: null, concurrency_limit: 1, last_success_at: null, last_failure_at: null, last_failure_code: null, created_at: new Date().toISOString(), updated_at: new Date().toISOString() });
 
     const res1 = 'res-asgn-1-' + crypto.randomUUID();
     const res2 = 'res-asgn-2-' + crypto.randomUUID();
@@ -1886,7 +1886,7 @@ describe('R5B — Durable Memory & Context Fabric Contract Tests', () => {
     const provId = 'prov-cs-check';
     repo.createProvider({ id: provId, name: 'CS Prov', adapter_type: 'MANUAL_BRIDGE', enabled: true, created_at: new Date().toISOString() });
     const accId = 'acc-cs-' + crypto.randomUUID();
-    repo.createProviderAccount({ id: accId, provider_id: provId, label: 'Acc CS', auth_mode: 'NATIVE_PROFILE', credential_ref: null, profile_ref: 'p', enabled: true, priority: 1, health_status: 'AVAILABLE', cooldown_until: null, concurrency_limit: 1, last_success_at: null, last_failure_at: null, last_failure_code: null, created_at: new Date().toISOString(), updated_at: new Date().toISOString() });
+    repo.createProviderAccount({ id: accId, provider_id: provId, label: 'Acc CS', auth_mode: 'NATIVE_PROFILE', credential_ref: null, profile_ref: 'native-profile://gemini/p', enabled: true, priority: 1, health_status: 'AVAILABLE', cooldown_until: null, concurrency_limit: 1, last_success_at: null, last_failure_at: null, last_failure_code: null, created_at: new Date().toISOString(), updated_at: new Date().toISOString() });
     const resId = 'res-cs-' + crypto.randomUUID();
     repo.createProviderResource({ id: resId, provider_id: provId, provider_account_id: accId, model_name: 'model', health_status: 'AVAILABLE', capabilities: ['CODING'], enabled: true, total_quota: null, remaining_quota: null, quota_unit: 'REQUESTS', quota_reset_at: null, quota_source: 'MANUAL', quota_confidence: 1.0, last_health_check: null });
     const roleId = 'rp-cs-' + crypto.randomUUID();
@@ -2239,7 +2239,7 @@ describe('R5B — Durable Memory & Context Fabric Contract Tests', () => {
     const provId = 'prov-cs-48';
     repo.createProvider({ id: provId, name: 'Provider 48', adapter_type: 'MANUAL_BRIDGE', enabled: true, created_at: new Date().toISOString() });
     const accId = 'acc-cs-48-' + crypto.randomUUID();
-    repo.createProviderAccount({ id: accId, provider_id: provId, label: 'Acc 48', auth_mode: 'NATIVE_PROFILE', credential_ref: null, profile_ref: 'p', enabled: true, priority: 1, health_status: 'AVAILABLE', cooldown_until: null, concurrency_limit: 1, last_success_at: null, last_failure_at: null, last_failure_code: null, created_at: new Date().toISOString(), updated_at: new Date().toISOString() });
+    repo.createProviderAccount({ id: accId, provider_id: provId, label: 'Acc 48', auth_mode: 'NATIVE_PROFILE', credential_ref: null, profile_ref: 'native-profile://gemini/p', enabled: true, priority: 1, health_status: 'AVAILABLE', cooldown_until: null, concurrency_limit: 1, last_success_at: null, last_failure_at: null, last_failure_code: null, created_at: new Date().toISOString(), updated_at: new Date().toISOString() });
     const resId = 'res-cs-48-' + crypto.randomUUID();
     repo.createProviderResource({ id: resId, provider_id: provId, provider_account_id: accId, model_name: 'model', health_status: 'AVAILABLE', capabilities: ['CODING'], enabled: true, total_quota: null, remaining_quota: null, quota_unit: 'REQUESTS', quota_reset_at: null, quota_source: 'MANUAL', quota_confidence: 1.0, last_health_check: null });
     const roleId = 'rp-cs-48-' + crypto.randomUUID();
@@ -2308,7 +2308,7 @@ describe('R5B — Durable Memory & Context Fabric Contract Tests', () => {
     const provId = 'prov-cs-49';
     repo.createProvider({ id: provId, name: 'Provider 49', adapter_type: 'MANUAL_BRIDGE', enabled: true, created_at: new Date().toISOString() });
     const accId = 'acc-cs-49-' + crypto.randomUUID();
-    repo.createProviderAccount({ id: accId, provider_id: provId, label: 'Acc 49', auth_mode: 'NATIVE_PROFILE', credential_ref: null, profile_ref: 'p', enabled: true, priority: 1, health_status: 'AVAILABLE', cooldown_until: null, concurrency_limit: 1, last_success_at: null, last_failure_at: null, last_failure_code: null, created_at: new Date().toISOString(), updated_at: new Date().toISOString() });
+    repo.createProviderAccount({ id: accId, provider_id: provId, label: 'Acc 49', auth_mode: 'NATIVE_PROFILE', credential_ref: null, profile_ref: 'native-profile://gemini/p', enabled: true, priority: 1, health_status: 'AVAILABLE', cooldown_until: null, concurrency_limit: 1, last_success_at: null, last_failure_at: null, last_failure_code: null, created_at: new Date().toISOString(), updated_at: new Date().toISOString() });
     const resId = 'res-cs-49-' + crypto.randomUUID();
     repo.createProviderResource({ id: resId, provider_id: provId, provider_account_id: accId, model_name: 'model', health_status: 'AVAILABLE', capabilities: ['CODING'], enabled: true, total_quota: null, remaining_quota: null, quota_unit: 'REQUESTS', quota_reset_at: null, quota_source: 'MANUAL', quota_confidence: 1.0, last_health_check: null });
     const roleId = 'rp-cs-49-' + crypto.randomUUID();
@@ -2384,7 +2384,7 @@ describe('R5B — Durable Memory & Context Fabric Contract Tests', () => {
     const provId = 'prov-hc-50';
     repo.createProvider({ id: provId, name: 'Provider 50', adapter_type: 'MANUAL_BRIDGE', enabled: true, created_at: new Date().toISOString() });
     const accId = 'acc-hc-50-' + crypto.randomUUID();
-    repo.createProviderAccount({ id: accId, provider_id: provId, label: 'Acc 50', auth_mode: 'NATIVE_PROFILE', credential_ref: null, profile_ref: 'p', enabled: true, priority: 1, health_status: 'AVAILABLE', cooldown_until: null, concurrency_limit: 1, last_success_at: null, last_failure_at: null, last_failure_code: null, created_at: new Date().toISOString(), updated_at: new Date().toISOString() });
+    repo.createProviderAccount({ id: accId, provider_id: provId, label: 'Acc 50', auth_mode: 'NATIVE_PROFILE', credential_ref: null, profile_ref: 'native-profile://gemini/p', enabled: true, priority: 1, health_status: 'AVAILABLE', cooldown_until: null, concurrency_limit: 1, last_success_at: null, last_failure_at: null, last_failure_code: null, created_at: new Date().toISOString(), updated_at: new Date().toISOString() });
     const resId = 'res-hc-50-' + crypto.randomUUID();
     repo.createProviderResource({ id: resId, provider_id: provId, provider_account_id: accId, model_name: 'model', health_status: 'AVAILABLE', capabilities: ['CODING'], enabled: true, total_quota: null, remaining_quota: null, quota_unit: 'REQUESTS', quota_reset_at: null, quota_source: 'MANUAL', quota_confidence: 1.0, last_health_check: null });
     const roleId = 'rp-hc-50-' + crypto.randomUUID();
@@ -2484,7 +2484,7 @@ describe('R5B — Durable Memory & Context Fabric Contract Tests', () => {
     const provId = 'prov-hc-52';
     repo.createProvider({ id: provId, name: 'Provider 52', adapter_type: 'MANUAL_BRIDGE', enabled: true, created_at: new Date().toISOString() });
     const accId = 'acc-hc-52-' + crypto.randomUUID();
-    repo.createProviderAccount({ id: accId, provider_id: provId, label: 'Acc 52', auth_mode: 'NATIVE_PROFILE', credential_ref: null, profile_ref: 'p', enabled: true, priority: 1, health_status: 'AVAILABLE', cooldown_until: null, concurrency_limit: 1, last_success_at: null, last_failure_at: null, last_failure_code: null, created_at: new Date().toISOString(), updated_at: new Date().toISOString() });
+    repo.createProviderAccount({ id: accId, provider_id: provId, label: 'Acc 52', auth_mode: 'NATIVE_PROFILE', credential_ref: null, profile_ref: 'native-profile://gemini/p', enabled: true, priority: 1, health_status: 'AVAILABLE', cooldown_until: null, concurrency_limit: 1, last_success_at: null, last_failure_at: null, last_failure_code: null, created_at: new Date().toISOString(), updated_at: new Date().toISOString() });
     const resId = 'res-hc-52-' + crypto.randomUUID();
     repo.createProviderResource({ id: resId, provider_id: provId, provider_account_id: accId, model_name: 'model', health_status: 'AVAILABLE', capabilities: ['CODING'], enabled: true, total_quota: null, remaining_quota: null, quota_unit: 'REQUESTS', quota_reset_at: null, quota_source: 'MANUAL', quota_confidence: 1.0, last_health_check: null });
     const roleId = 'rp-hc-52-' + crypto.randomUUID();

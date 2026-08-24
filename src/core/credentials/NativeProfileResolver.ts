@@ -2,7 +2,8 @@ import os from 'os';
 import path from 'path';
 import { NativeProfileRef, parseNativeProfileRef } from './NativeProfileRef';
 
-export type ProfileIsolationStatus = 'VERIFIED' | 'EXPERIMENTAL_UNPROVEN';
+export type ConfigurationStatus = 'DOCUMENTED_SUPPORTED' | 'EXPERIMENTAL_UNPROVEN';
+export type RuntimeIsolationStatus = 'PENDING_R5D' | 'VERIFIED';
 
 export interface NativeProfileResolution {
   provider: string;
@@ -10,8 +11,9 @@ export interface NativeProfileResolution {
   profileRef: string;
   envOverrides: Record<string, string>;
   profileDirectory: string;
-  isolationStatus: ProfileIsolationStatus;
-  notes?: string;
+  configurationStatus: ConfigurationStatus;
+  runtimeIsolationStatus: RuntimeIsolationStatus;
+  notes: string;
 }
 
 export interface NativeProfileResolverOptions {
@@ -24,17 +26,18 @@ export interface NativeProfileResolverOptions {
  * and directory layouts without reading, inspecting, or copying provider OAuth token files.
  */
 export class NativeProfileResolver {
-  private readonly baseProfilesDir: string;
-  private readonly homeDir: string;
+  readonly #baseProfilesDir: string;
+  readonly #homeDir: string;
 
   constructor(options: NativeProfileResolverOptions = {}) {
-    this.homeDir = options.homeDir ?? os.homedir();
-    this.baseProfilesDir =
-      options.baseProfilesDir ?? path.join(this.homeDir, '.agentforge', 'profiles');
+    this.#homeDir = options.homeDir ?? os.homedir();
+    this.#baseProfilesDir =
+      options.baseProfilesDir ?? path.join(this.#homeDir, '.agentforge', 'profiles');
   }
 
   /**
    * Resolves a native profile reference into safe execution configuration metadata.
+   * Fails closed for unknown providers that do not have a declared provider contract.
    */
   public resolve(refOrUri: NativeProfileRef | string): NativeProfileResolution {
     const profileRef =
@@ -46,7 +49,7 @@ export class NativeProfileResolver {
 
     switch (provider) {
       case 'codex': {
-        const profileDir = path.join(this.baseProfilesDir, 'codex', profileId);
+        const profileDir = path.join(this.#baseProfilesDir, 'codex', profileId);
         return {
           provider: 'codex',
           profileId,
@@ -55,13 +58,15 @@ export class NativeProfileResolver {
             CODEX_HOME: profileDir,
           },
           profileDirectory: profileDir,
-          isolationStatus: 'VERIFIED',
-          notes: 'Codex CLI profile isolated via CODEX_HOME.',
+          configurationStatus: 'DOCUMENTED_SUPPORTED',
+          runtimeIsolationStatus: 'PENDING_R5D',
+          notes:
+            'Codex CLI configuration mapping via CODEX_HOME. Multi-profile runtime isolation pending R5D proof.',
         };
       }
 
       case 'gemini': {
-        const profileDir = path.join(this.baseProfilesDir, 'gemini', profileId);
+        const profileDir = path.join(this.#baseProfilesDir, 'gemini', profileId);
         return {
           provider: 'gemini',
           profileId,
@@ -70,13 +75,15 @@ export class NativeProfileResolver {
             GEMINI_CLI_HOME: profileDir,
           },
           profileDirectory: profileDir,
-          isolationStatus: 'VERIFIED',
-          notes: 'Gemini CLI profile isolated via GEMINI_CLI_HOME.',
+          configurationStatus: 'DOCUMENTED_SUPPORTED',
+          runtimeIsolationStatus: 'PENDING_R5D',
+          notes:
+            'Gemini CLI configuration mapping via GEMINI_CLI_HOME. Multi-profile runtime isolation pending R5D proof.',
         };
       }
 
       case 'claude': {
-        const profileDir = path.join(this.baseProfilesDir, 'claude', profileId);
+        const profileDir = path.join(this.#baseProfilesDir, 'claude', profileId);
         return {
           provider: 'claude',
           profileId,
@@ -85,25 +92,17 @@ export class NativeProfileResolver {
             CLAUDE_CONFIG_DIR: profileDir,
           },
           profileDirectory: profileDir,
-          isolationStatus: 'EXPERIMENTAL_UNPROVEN',
+          configurationStatus: 'EXPERIMENTAL_UNPROVEN',
+          runtimeIsolationStatus: 'PENDING_R5D',
           notes:
-            'Claude Code profile isolation is unverified and experimental until R5D native execution proof.',
+            'Claude Code profile isolation is unverified and experimental. Multi-profile runtime isolation pending R5D proof.',
         };
       }
 
       default: {
-        const profileDir = path.join(this.baseProfilesDir, provider, profileId);
-        return {
-          provider,
-          profileId,
-          profileRef: rawRef,
-          envOverrides: {
-            [`${provider.toUpperCase().replace(/-/g, '_')}_HOME`]: profileDir,
-          },
-          profileDirectory: profileDir,
-          isolationStatus: 'EXPERIMENTAL_UNPROVEN',
-          notes: `Generic profile isolation for provider "${provider}". Unverified until proven.`,
-        };
+        throw new Error(
+          `[NativeProfileResolver] Unsupported native profile provider "${provider}". Supported providers: codex, gemini, claude.`
+        );
       }
     }
   }

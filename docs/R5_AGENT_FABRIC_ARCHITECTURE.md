@@ -226,11 +226,21 @@ $$\text{ROLE} \neq \text{AGENT PROFILE} \neq \text{PROVIDER} \neq \text{MODEL RE
 ```
 
 1. **Format**: `native-profile://<provider>/<profileId>` (e.g. `native-profile://gemini/g01`).
-2. **Resolution Contracts**:
-   - **Codex**: Sets `CODEX_HOME` (`isolationStatus: VERIFIED`).
-   - **Gemini**: Sets `GEMINI_CLI_HOME` (`isolationStatus: VERIFIED`).
-   - **Claude**: Sets `CLAUDE_CONFIG_DIR` (`isolationStatus: EXPERIMENTAL_UNPROVEN`).
-3. **R5D Verification Boundary**: Claude Code profile isolation remains categorized as `EXPERIMENTAL_UNPROVEN` until R5D native execution proof proves runtime isolation behavior.
+2. **Two-Tier Status Model**:
+   - **Codex**:
+     - `configurationStatus: DOCUMENTED_SUPPORTED`
+     - `runtimeIsolationStatus: PENDING_R5D`
+     - Sets `CODEX_HOME` to isolated profile directory.
+   - **Gemini**:
+     - `configurationStatus: DOCUMENTED_SUPPORTED`
+     - `runtimeIsolationStatus: PENDING_R5D`
+     - Sets `GEMINI_CLI_HOME` to isolated profile directory.
+   - **Claude**:
+     - `configurationStatus: EXPERIMENTAL_UNPROVEN`
+     - `runtimeIsolationStatus: PENDING_R5D`
+     - Sets `CLAUDE_CONFIG_DIR` to isolated profile directory.
+   - **Unknown Providers**: Fail-closed with `UNSUPPORTED_NATIVE_PROFILE_PROVIDER` error; never invents ad-hoc environment variables.
+3. **R5D Verification Boundary**: R5C establishes configuration mapping. All multi-profile runtime account isolation remains classified as `PENDING_R5D` until verified during live R5D execution proofs.
 
 ---
 

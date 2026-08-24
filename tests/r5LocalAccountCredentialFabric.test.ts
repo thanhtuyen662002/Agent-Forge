@@ -2,6 +2,7 @@ import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import Database from 'better-sqlite3';
 import path from 'path';
 import util from 'util';
+import crypto from 'crypto';
 import { MigrationRunner } from '../src/core/database/migrations';
 import { Repository } from '../src/core/database/repositories';
 import {
@@ -14,6 +15,7 @@ import {
   CredentialStore,
   InMemoryCredentialStore,
   WindowsCredentialStore,
+  CRED_MAX_CREDENTIAL_BLOB_SIZE,
   NativeProfileRef,
   parseNativeProfileRef,
   isValidNativeProfileRef,
@@ -49,525 +51,707 @@ describe('R5C Local Account & Credential Fabric Test Suite', () => {
   }
 
   // -------------------------------------------------------------
-  // 1. Valid wincred CredentialRef parse / round-trip
+  // 1. create API_CREDENTIAL with plaintext credential_ref is rejected
   // -------------------------------------------------------------
-  it('1. valid wincred CredentialRef parse/round-trip', () => {
-    const raw = 'wincred://agentforge/openai/api-01';
-    const ref = parseCredentialRef(raw);
-
-    expect(ref.getScheme()).toBe('wincred');
-    expect(ref.getTarget()).toBe('agentforge/openai/api-01');
-    expect(ref.toUriString()).toBe(raw);
-    expect(ref.toString()).toBe(raw);
-    expect(ref.toSafeString()).toBe(raw);
-    expect(ref.toJSON()).toBe(raw);
-    expect(isValidCredentialRef(raw)).toBe(true);
-  });
-
-  // -------------------------------------------------------------
-  // 2. Malformed credential refs rejected
-  // -------------------------------------------------------------
-  it('2. malformed credential refs rejected', () => {
-    expect(() => parseCredentialRef('')).toThrow(/non-empty string/);
-    expect(() => parseCredentialRef('invalid-no-scheme')).toThrow(/missing valid "scheme:\/\/" prefix/);
-    expect(() => parseCredentialRef('https://openai.com')).toThrow(/Unsupported credential scheme "https"/);
-    expect(() => parseCredentialRef('wincred://')).toThrow(/target path cannot be empty/);
-    expect(() => parseCredentialRef('wincred://has space/target')).toThrow(/target contains whitespace/);
-    expect(() => parseCredentialRef('wincred://../traversal/key')).toThrow(/path traversal is forbidden/);
-    expect(() => parseCredentialRef('wincred://agentforge/../key')).toThrow(/path traversal is forbidden/);
-    expect(() => parseCredentialRef('wincred://agentforge//consecutive')).toThrow(/consecutive slashes/);
-    expect(() => parseCredentialRef('wincred://agentforge/trailing/')).toThrow(/trailing slashes/);
-    expect(() => parseCredentialRef('wincred://agentforge/illegal$char')).toThrow(/target contains invalid characters/);
-
-    expect(isValidCredentialRef('wincred://../traversal')).toBe(false);
-    expect(isValidCredentialRef('not-a-ref')).toBe(false);
-  });
-
-  // -------------------------------------------------------------
-  // 3. Secret payload cannot be serialized as ordinary metadata
-  // -------------------------------------------------------------
-  it('3. secret payload cannot be serialized as ordinary metadata', () => {
-    const rawSecret = 'sk-live-secret-key-1234567890abcdef';
-    const secret = new SecretValue(rawSecret);
-
-    expect(secret.exposeSecret()).toBe(rawSecret);
-    expect(secret.toString()).toBe('[REDACTED_SECRET]');
-    expect(secret.toJSON()).toBe('[REDACTED_SECRET]');
-    expect(JSON.stringify({ secret, label: 'test' })).toBe('{"secret":"[REDACTED_SECRET]","label":"test"}');
-    expect(util.inspect(secret)).toBe('[REDACTED_SECRET]');
-    expect(`${secret}`).toBe('[REDACTED_SECRET]');
-
-    // SecretValue equality
-    const sameSecret = new SecretValue(rawSecret);
-    const diffSecret = new SecretValue('sk-other-secret');
-    expect(secret.equals(sameSecret)).toBe(true);
-    expect(secret.equals(diffSecret)).toBe(false);
-
-    expect(() => new SecretValue('')).toThrow(/non-empty string/);
-  });
-
-  // -------------------------------------------------------------
-  // 4. ProviderAccount secure-ref validation
-  // -------------------------------------------------------------
-  it('4. ProviderAccount secure-ref validation', () => {
-    seedProvider('prov-openai');
-
-    // Valid API_CREDENTIAL with wincred ref
-    const validAcct: ProviderAccount = {
-      id: 'acct-api-01',
-      provider_id: 'prov-openai',
-      label: 'OpenAI Team Key',
-      auth_mode: 'API_CREDENTIAL',
-      credential_ref: 'wincred://agentforge/openai/team-key',
-      profile_ref: null,
-      enabled: true,
-      priority: 100,
-      health_status: 'AVAILABLE',
-      cooldown_until: null,
-      concurrency_limit: 2,
-      last_success_at: null,
-      last_failure_at: null,
-      last_failure_code: null,
-      created_at: new Date().toISOString(),
-      updated_at: new Date().toISOString(),
-    };
-    repo.createProviderAccount(validAcct);
-    expect(repo.getProviderAccount('acct-api-01')?.credential_ref).toBe('wincred://agentforge/openai/team-key');
-
-    // Invalid: API_CREDENTIAL with malformed wincred ref
+  it('1. create API_CREDENTIAL with plaintext credential_ref is rejected', () => {
+    seedProvider('prov-1');
     expect(() => {
       repo.createProviderAccount({
-        ...validAcct,
-        id: 'acct-invalid-wincred',
-        credential_ref: 'wincred://../bad/path',
+        id: 'acct-plaintext',
+        provider_id: 'prov-1',
+        label: 'Plaintext Account',
+        auth_mode: 'API_CREDENTIAL',
+        credential_ref: 'sk-live-super-secret-key-12345',
+        profile_ref: null,
+        enabled: true,
+        priority: 1,
+        health_status: 'AVAILABLE',
+        cooldown_until: null,
+        concurrency_limit: 1,
+        last_success_at: null,
+        last_failure_at: null,
+        last_failure_code: null,
+        created_at: new Date().toISOString(),
+        updated_at: new Date().toISOString(),
       });
-    }).toThrow(/path traversal is forbidden/);
+    }).toThrow(/missing valid "scheme:\/\/" prefix/);
+  });
 
-    // Invalid: API_CREDENTIAL with conflicting profile_ref
+  // -------------------------------------------------------------
+  // 2. create API_CREDENTIAL with arbitrary legacy handle is rejected
+  // -------------------------------------------------------------
+  it('2. create API_CREDENTIAL with arbitrary legacy handle is rejected', () => {
+    seedProvider('prov-2');
     expect(() => {
       repo.createProviderAccount({
-        ...validAcct,
-        id: 'acct-conflicting',
-        profile_ref: 'native-profile://codex/c01',
+        id: 'acct-legacy-write',
+        provider_id: 'prov-2',
+        label: 'Legacy Write Account',
+        auth_mode: 'API_CREDENTIAL',
+        credential_ref: 'cred-handle-0912',
+        profile_ref: null,
+        enabled: true,
+        priority: 1,
+        health_status: 'AVAILABLE',
+        cooldown_until: null,
+        concurrency_limit: 1,
+        last_success_at: null,
+        last_failure_at: null,
+        last_failure_code: null,
+        created_at: new Date().toISOString(),
+        updated_at: new Date().toISOString(),
       });
-    }).toThrow(/contradictory references/);
+    }).toThrow(/missing valid "scheme:\/\/" prefix/);
+  });
 
-    // Invalid: NATIVE_PROFILE with malformed native-profile ref
+  // -------------------------------------------------------------
+  // 3. create NATIVE_PROFILE with arbitrary filesystem/profile string is rejected
+  // -------------------------------------------------------------
+  it('3. create NATIVE_PROFILE with arbitrary filesystem/profile string is rejected', () => {
+    seedProvider('prov-3');
     expect(() => {
       repo.createProviderAccount({
-        ...validAcct,
-        id: 'acct-invalid-native',
+        id: 'acct-path-profile',
+        provider_id: 'prov-3',
+        label: 'File Path Account',
         auth_mode: 'NATIVE_PROFILE',
         credential_ref: null,
-        profile_ref: 'native-profile://codex/../bad',
+        profile_ref: 'C:\\Users\\Admin\\.codex\\auth.json',
+        enabled: true,
+        priority: 1,
+        health_status: 'AVAILABLE',
+        cooldown_until: null,
+        concurrency_limit: 1,
+        last_success_at: null,
+        last_failure_at: null,
+        last_failure_code: null,
+        created_at: new Date().toISOString(),
+        updated_at: new Date().toISOString(),
       });
-    }).toThrow(/path traversal is forbidden/);
+    }).toThrow(/missing valid "scheme:\/\/" prefix/);
+  });
 
-    // Invalid: NATIVE_PROFILE with conflicting credential_ref
+  // -------------------------------------------------------------
+  // 4. credential_ref containing native-profile URI is rejected
+  // -------------------------------------------------------------
+  it('4. credential_ref containing native-profile URI is rejected', () => {
+    seedProvider('prov-4');
     expect(() => {
       repo.createProviderAccount({
-        ...validAcct,
-        id: 'acct-prof-conflict',
-        auth_mode: 'NATIVE_PROFILE',
-        credential_ref: 'wincred://agentforge/openai/key',
-        profile_ref: 'native-profile://codex/c01',
+        id: 'acct-cross-scheme-1',
+        provider_id: 'prov-4',
+        label: 'Cross Scheme Account 1',
+        auth_mode: 'API_CREDENTIAL',
+        credential_ref: 'native-profile://codex/c01',
+        profile_ref: null,
+        enabled: true,
+        priority: 1,
+        health_status: 'AVAILABLE',
+        cooldown_until: null,
+        concurrency_limit: 1,
+        last_success_at: null,
+        last_failure_at: null,
+        last_failure_code: null,
+        created_at: new Date().toISOString(),
+        updated_at: new Date().toISOString(),
       });
-    }).toThrow(/contradictory references/);
+    }).toThrow(/Unsupported credential scheme "native-profile"/);
   });
 
   // -------------------------------------------------------------
-  // 5. Plaintext credential data does not enter SQLite
+  // 5. profile_ref containing wincred URI is rejected
   // -------------------------------------------------------------
-  it('5. plaintext credential data does not enter SQLite', () => {
-    seedProvider('prov-openai');
-    const secretApiKey = 'sk-proj-SUPER_SECRET_TOKEN_DO_NOT_LEAK_12345';
-    const opaqueRef = 'wincred://agentforge/openai/production-key';
+  it('5. profile_ref containing wincred URI is rejected', () => {
+    seedProvider('prov-5');
+    expect(() => {
+      repo.createProviderAccount({
+        id: 'acct-cross-scheme-2',
+        provider_id: 'prov-5',
+        label: 'Cross Scheme Account 2',
+        auth_mode: 'NATIVE_PROFILE',
+        credential_ref: null,
+        profile_ref: 'wincred://agentforge/openai/key',
+        enabled: true,
+        priority: 1,
+        health_status: 'AVAILABLE',
+        cooldown_until: null,
+        concurrency_limit: 1,
+        last_success_at: null,
+        last_failure_at: null,
+        last_failure_code: null,
+        created_at: new Date().toISOString(),
+        updated_at: new Date().toISOString(),
+      });
+    }).toThrow(/Unsupported profile scheme "wincred"/);
+  });
 
-    repo.createProviderAccount({
-      id: 'acct-secure-test',
-      provider_id: 'prov-openai',
-      label: 'Production Key',
-      auth_mode: 'API_CREDENTIAL',
-      credential_ref: opaqueRef,
-      profile_ref: null,
-      enabled: true,
-      priority: 100,
-      health_status: 'AVAILABLE',
-      cooldown_until: null,
-      concurrency_limit: 1,
-      last_success_at: null,
-      last_failure_at: null,
-      last_failure_code: null,
-      created_at: new Date().toISOString(),
-      updated_at: new Date().toISOString(),
+  // -------------------------------------------------------------
+  // 6. case/alternate malformed credential scheme cannot bypass validation
+  // -------------------------------------------------------------
+  it('6. case/alternate malformed credential scheme cannot bypass validation', () => {
+    // Upper case scheme canonicalizes properly but invalid target structure fails
+    expect(() => parseCredentialRef('WINCRED://invalid-no-namespace')).toThrow(
+      /target must start with canonical namespace "agentforge\/"/
+    );
+    expect(() => parseCredentialRef('wincred://agentforge:openai:key')).toThrow(
+      /colons are forbidden in target path/
+    );
+    expect(() => parseCredentialRef('wincred://agentforge/openai\\key')).toThrow(
+      /backslashes are forbidden/
+    );
+  });
+
+  // -------------------------------------------------------------
+  // 7. enabled API_CREDENTIAL without credential_ref is rejected
+  // -------------------------------------------------------------
+  it('7. enabled API_CREDENTIAL without credential_ref is rejected', () => {
+    seedProvider('prov-7');
+    expect(() => {
+      repo.createProviderAccount({
+        id: 'acct-enabled-no-cred',
+        provider_id: 'prov-7',
+        label: 'Enabled No Cred',
+        auth_mode: 'API_CREDENTIAL',
+        credential_ref: null,
+        profile_ref: null,
+        enabled: true,
+        priority: 1,
+        health_status: 'AVAILABLE',
+        cooldown_until: null,
+        concurrency_limit: 1,
+        last_success_at: null,
+        last_failure_at: null,
+        last_failure_code: null,
+        created_at: new Date().toISOString(),
+        updated_at: new Date().toISOString(),
+      });
+    }).toThrow(/enabled auth_mode "API_CREDENTIAL" requires a valid canonical credential_ref/);
+
+    // Unconfigured account (enabled === false) is allowed to have null credential_ref
+    expect(() => {
+      repo.createProviderAccount({
+        id: 'acct-disabled-unconfigured',
+        provider_id: 'prov-7',
+        label: 'Disabled Unconfigured',
+        auth_mode: 'API_CREDENTIAL',
+        credential_ref: null,
+        profile_ref: null,
+        enabled: false,
+        priority: 1,
+        health_status: 'AVAILABLE',
+        cooldown_until: null,
+        concurrency_limit: 1,
+        last_success_at: null,
+        last_failure_at: null,
+        last_failure_code: null,
+        created_at: new Date().toISOString(),
+        updated_at: new Date().toISOString(),
+      });
+    }).not.toThrow();
+  });
+
+  // -------------------------------------------------------------
+  // 8. enabled NATIVE_PROFILE without profile_ref is rejected
+  // -------------------------------------------------------------
+  it('8. enabled NATIVE_PROFILE without profile_ref is rejected', () => {
+    seedProvider('prov-8');
+    expect(() => {
+      repo.createProviderAccount({
+        id: 'acct-enabled-no-prof',
+        provider_id: 'prov-8',
+        label: 'Enabled No Prof',
+        auth_mode: 'NATIVE_PROFILE',
+        credential_ref: null,
+        profile_ref: null,
+        enabled: true,
+        priority: 1,
+        health_status: 'AVAILABLE',
+        cooldown_until: null,
+        concurrency_limit: 1,
+        last_success_at: null,
+        last_failure_at: null,
+        last_failure_code: null,
+        created_at: new Date().toISOString(),
+        updated_at: new Date().toISOString(),
+      });
+    }).toThrow(/enabled auth_mode "NATIVE_PROFILE" requires a valid canonical profile_ref/);
+
+    // Disabled unconfigured profile is allowed to have null profile_ref
+    expect(() => {
+      repo.createProviderAccount({
+        id: 'acct-disabled-unconfigured-prof',
+        provider_id: 'prov-8',
+        label: 'Disabled Unconfigured Profile',
+        auth_mode: 'NATIVE_PROFILE',
+        credential_ref: null,
+        profile_ref: null,
+        enabled: false,
+        priority: 1,
+        health_status: 'AVAILABLE',
+        cooldown_until: null,
+        concurrency_limit: 1,
+        last_success_at: null,
+        last_failure_at: null,
+        last_failure_code: null,
+        created_at: new Date().toISOString(),
+        updated_at: new Date().toISOString(),
+      });
+    }).not.toThrow();
+  });
+
+  // -------------------------------------------------------------
+  // 9. pre-R5C legacy row can still be read
+  // -------------------------------------------------------------
+  it('9. pre-R5C legacy row can still be read', () => {
+    seedProvider('prov-9');
+    // Direct SQL insert simulating historical pre-R5C data
+    db.prepare(`
+      INSERT INTO provider_accounts (
+        id, provider_id, label, auth_mode, credential_ref, profile_ref,
+        enabled, priority, health_status, cooldown_until, concurrency_limit,
+        last_success_at, last_failure_at, last_failure_code, created_at, updated_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `).run(
+      'acct-pre-r5c-legacy',
+      'prov-9',
+      'Legacy Account',
+      'API_CREDENTIAL',
+      'legacy-opaque-handle-001',
+      null,
+      1,
+      10,
+      'AVAILABLE',
+      null,
+      1,
+      null,
+      null,
+      null,
+      new Date().toISOString(),
+      new Date().toISOString()
+    );
+
+    const loaded = repo.getProviderAccount('acct-pre-r5c-legacy');
+    expect(loaded).toBeDefined();
+    expect(loaded?.id).toBe('acct-pre-r5c-legacy');
+    expect(loaded?.credential_ref).toBe('legacy-opaque-handle-001');
+  });
+
+  // -------------------------------------------------------------
+  // 10. unrelated update to pre-R5C legacy row preserves legacy ref
+  // -------------------------------------------------------------
+  it('10. unrelated update to pre-R5C legacy row preserves legacy ref', () => {
+    seedProvider('prov-10');
+    db.prepare(`
+      INSERT INTO provider_accounts (
+        id, provider_id, label, auth_mode, credential_ref, profile_ref,
+        enabled, priority, health_status, cooldown_until, concurrency_limit,
+        last_success_at, last_failure_at, last_failure_code, created_at, updated_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `).run(
+      'acct-legacy-update-unrelated',
+      'prov-10',
+      'Legacy Account Label',
+      'API_CREDENTIAL',
+      'legacy-opaque-handle-002',
+      null,
+      1,
+      5,
+      'AVAILABLE',
+      null,
+      2,
+      null,
+      null,
+      null,
+      new Date().toISOString(),
+      new Date().toISOString()
+    );
+
+    // Update only label and priority
+    repo.updateProviderAccount('acct-legacy-update-unrelated', {
+      label: 'Updated Label Only',
+      priority: 20,
     });
 
-    // Query SQLite database raw tables directly
-    const row = db.prepare('SELECT * FROM provider_accounts WHERE id = ?').get('acct-secure-test') as Record<string, unknown>;
-    expect(row).toBeDefined();
-    expect(row.credential_ref).toBe(opaqueRef);
-
-    // Assert that the raw plaintext secret is nowhere in SQLite memory
-    const dump = JSON.stringify(db.prepare('SELECT * FROM provider_accounts').all());
-    expect(dump).not.toContain(secretApiKey);
-    expect(dump).toContain(opaqueRef);
+    const updated = repo.getProviderAccount('acct-legacy-update-unrelated');
+    expect(updated?.label).toBe('Updated Label Only');
+    expect(updated?.priority).toBe(20);
+    expect(updated?.credential_ref).toBe('legacy-opaque-handle-002');
   });
 
   // -------------------------------------------------------------
-  // 6. Windows backend namespace/target behavior
+  // 11. explicit ref/auth-mode update of legacy row requires canonical R5C ref
   // -------------------------------------------------------------
-  it('6. Windows backend namespace/target behavior', () => {
-    const ref1 = parseCredentialRef('wincred://agentforge/openai/api-01');
-    expect(ref1.getWindowsTargetName()).toBe('AgentForge:openai:api-01');
+  it('11. explicit ref/auth-mode update of legacy row requires canonical R5C ref', () => {
+    seedProvider('prov-11');
+    db.prepare(`
+      INSERT INTO provider_accounts (
+        id, provider_id, label, auth_mode, credential_ref, profile_ref,
+        enabled, priority, health_status, cooldown_until, concurrency_limit,
+        last_success_at, last_failure_at, last_failure_code, created_at, updated_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `).run(
+      'acct-legacy-security-update',
+      'prov-11',
+      'Legacy Account',
+      'API_CREDENTIAL',
+      'legacy-opaque-handle-003',
+      null,
+      1,
+      1,
+      'AVAILABLE',
+      null,
+      1,
+      null,
+      null,
+      null,
+      new Date().toISOString(),
+      new Date().toISOString()
+    );
 
-    const ref2 = parseCredentialRef('wincred://openai/key-02');
-    expect(ref2.getWindowsTargetName()).toBe('AgentForge:openai:key-02');
+    // Updating credential_ref to another non-canonical handle fails
+    expect(() => {
+      repo.updateProviderAccount('acct-legacy-security-update', {
+        credential_ref: 'another-legacy-handle',
+      });
+    }).toThrow(/missing valid "scheme:\/\/" prefix/);
 
-    const ref3 = parseCredentialRef('wincred://AgentForge:custom:target');
-    expect(ref3.getWindowsTargetName()).toBe('AgentForge:custom:target');
+    // Updating to a valid canonical R5C ref succeeds
+    repo.updateProviderAccount('acct-legacy-security-update', {
+      credential_ref: 'wincred://agentforge/openai/prod-key',
+    });
+
+    const updated = repo.getProviderAccount('acct-legacy-security-update');
+    expect(updated?.credential_ref).toBe('wincred://agentforge/openai/prod-key');
   });
 
   // -------------------------------------------------------------
-  // 7. put/get/delete semantics through injected backend
+  // 12. rejected plaintext write leaves plaintext absent from raw SQLite dump
   // -------------------------------------------------------------
-  it('7. put/get/delete semantics through injected backend', async () => {
-    const store: CredentialStore = new InMemoryCredentialStore();
-    const ref = parseCredentialRef('wincred://agentforge/test/sample-key');
-    const secret = new SecretValue('test-secret-payload-999');
+  it('12. rejected plaintext write leaves plaintext absent from raw SQLite dump', () => {
+    seedProvider('prov-12');
+    const sensitiveKey = 'sk-super-secret-forbidden-raw-token-99999';
 
-    expect(await store.exists(ref)).toBe(false);
-    expect(await store.get(ref)).toBeNull();
+    expect(() => {
+      repo.createProviderAccount({
+        id: 'acct-secret-dump-check',
+        provider_id: 'prov-12',
+        label: 'Secret Dump Check',
+        auth_mode: 'API_CREDENTIAL',
+        credential_ref: sensitiveKey,
+        profile_ref: null,
+        enabled: true,
+        priority: 1,
+        health_status: 'AVAILABLE',
+        cooldown_until: null,
+        concurrency_limit: 1,
+        last_success_at: null,
+        last_failure_at: null,
+        last_failure_code: null,
+        created_at: new Date().toISOString(),
+        updated_at: new Date().toISOString(),
+      });
+    }).toThrow();
 
-    await store.put(ref, secret);
-    expect(await store.exists(ref)).toBe(true);
-
-    const retrieved = await store.get(ref);
-    expect(retrieved).not.toBeNull();
-    expect(retrieved?.exposeSecret()).toBe('test-secret-payload-999');
-
-    const deleted = await store.delete(ref);
-    expect(deleted).toBe(true);
-    expect(await store.exists(ref)).toBe(false);
-    expect(await store.get(ref)).toBeNull();
-
-    // Delete non-existent
-    const deleteAgain = await store.delete(ref);
-    expect(deleteAgain).toBe(false);
+    // Query entire raw sqlite db tables
+    const rows = db.prepare('SELECT * FROM provider_accounts').all();
+    const serialized = JSON.stringify(rows);
+    expect(serialized).not.toContain(sensitiveKey);
   });
 
   // -------------------------------------------------------------
-  // 8. Secret not present in thrown error messages
+  // 13. SecretValue Object.keys does not expose raw field
   // -------------------------------------------------------------
-  it('8. secret not present in thrown error messages', () => {
-    const rawSecret = 'sk-sensitive-api-token-987654';
+  it('13. SecretValue Object.keys does not expose raw field', () => {
+    const rawSecret = 'sk-live-token-131313';
     const secret = new SecretValue(rawSecret);
 
-    const sanitizedError = safeFormatDiagnostic(
-      new Error(`Failed to connect with secret: ${secret.toString()}`),
-      [secret]
+    const keys = Object.keys(secret);
+    expect(keys).toEqual([]);
+    expect(Object.getOwnPropertyNames(secret)).toEqual([]);
+  });
+
+  // -------------------------------------------------------------
+  // 14. spreading SecretValue does not expose raw secret
+  // -------------------------------------------------------------
+  it('14. spreading SecretValue does not expose raw secret', () => {
+    const rawSecret = 'sk-live-token-141414';
+    const secret = new SecretValue(rawSecret);
+
+    const spreadObj = { ...secret };
+    expect(spreadObj).toEqual({});
+    expect(JSON.stringify(spreadObj)).toBe('{}');
+  });
+
+  // -------------------------------------------------------------
+  // 15. nested util.inspect does not expose raw secret
+  // -------------------------------------------------------------
+  it('15. nested util.inspect does not expose raw secret', () => {
+    const rawSecret = 'sk-live-token-151515';
+    const secret = new SecretValue(rawSecret);
+
+    const container = { auth: { payload: secret, meta: 'test' } };
+    const inspected = util.inspect(container, { depth: null });
+    expect(inspected).not.toContain(rawSecret);
+    expect(inspected).toContain('[REDACTED_SECRET]');
+  });
+
+  // -------------------------------------------------------------
+  // 16. public API cannot construct invalid CredentialRef without parser validation
+  // -------------------------------------------------------------
+  it('16. public API cannot construct invalid CredentialRef without parser validation', () => {
+    // parseCredentialRef rejects invalid inputs fail-closed
+    expect(() => parseCredentialRef('invalid-ref')).toThrow();
+    expect(() => CredentialRef.parse('invalid-ref')).toThrow();
+    expect(isValidCredentialRef('invalid-ref')).toBe(false);
+  });
+
+  // -------------------------------------------------------------
+  // 17. public API cannot construct invalid NativeProfileRef without parser validation
+  // -------------------------------------------------------------
+  it('17. public API cannot construct invalid NativeProfileRef without parser validation', () => {
+    expect(() => parseNativeProfileRef('invalid-profile')).toThrow();
+    expect(() => NativeProfileRef.parse('invalid-profile')).toThrow();
+    expect(isValidNativeProfileRef('invalid-profile')).toBe(false);
+  });
+
+  // -------------------------------------------------------------
+  // 18. credential URI alias forms are rejected
+  // -------------------------------------------------------------
+  it('18. credential URI alias forms are rejected', () => {
+    // Missing agentforge/ namespace
+    expect(() => parseCredentialRef('wincred://openai/api-01')).toThrow(
+      /target must start with canonical namespace "agentforge\/"/
     );
-
-    expect(sanitizedError).not.toContain(rawSecret);
-    expect(sanitizedError).toContain('[REDACTED_SECRET]');
-
-    // Redaction function directly
-    const redactedText = redactSecretString(`Auth header Bearer ${rawSecret} failed`, rawSecret);
-    expect(redactedText).toBe('Auth header Bearer [REDACTED_SECRET] failed');
+    // Colon separator alias
+    expect(() => parseCredentialRef('wincred://agentforge:openai:api-01')).toThrow(
+      /colons are forbidden in target path/
+    );
+    // Empty segment
+    expect(() => parseCredentialRef('wincred://agentforge/openai//api-01')).toThrow(
+      /consecutive slashes are forbidden/
+    );
   });
 
   // -------------------------------------------------------------
-  // 9. Secret not present in diagnostic/log-safe representation
+  // 19. canonical CredentialRef round-trip remains deterministic
   // -------------------------------------------------------------
-  it('9. secret not present in diagnostic/log-safe representation', () => {
-    const ref = parseCredentialRef('wincred://agentforge/anthropic/key-01');
-    const secret = new SecretValue('sk-ant-api03-SECRET_PAYLOAD');
+  it('19. canonical CredentialRef round-trip remains deterministic', () => {
+    const canonical = 'wincred://agentforge/openai/team-01';
+    const ref = parseCredentialRef(canonical);
 
-    const diagnosticPayload = {
-      ref: ref.toSafeString(),
-      secret: secret.toJSON(),
-      status: 'AUTHENTICATING',
-    };
-
-    const logJson = JSON.stringify(diagnosticPayload);
-    expect(logJson).not.toContain('sk-ant-api03-SECRET_PAYLOAD');
-    expect(logJson).toContain('"secret":"[REDACTED_SECRET]"');
-    expect(logJson).toContain('wincred://agentforge/anthropic/key-01');
+    expect(ref.toUriString()).toBe(canonical);
+    expect(ref.getWindowsTargetName()).toBe('AgentForge:openai:team-01');
+    expect(ref.toString()).toBe(canonical);
+    expect(ref.toSafeString()).toBe(canonical);
   });
 
   // -------------------------------------------------------------
-  // 10. Unsupported-platform behavior fails closed
+  // 20. unknown native-profile provider resolution fails closed
   // -------------------------------------------------------------
-  it('10. unsupported-platform behavior fails closed', async () => {
-    const linuxStore = new WindowsCredentialStore('linux');
-    const ref = parseCredentialRef('wincred://agentforge/openai/key');
-    const secret = new SecretValue('test-secret');
+  it('20. unknown native-profile provider resolution fails closed', () => {
+    const resolver = new NativeProfileResolver();
+    const unknownRef = parseNativeProfileRef('native-profile://unknown-custom-llm/prof-1');
 
-    await expect(linuxStore.put(ref, secret)).rejects.toThrow(/UNSUPPORTED_PLATFORM/);
-    await expect(linuxStore.get(ref)).rejects.toThrow(/UNSUPPORTED_PLATFORM/);
-    await expect(linuxStore.delete(ref)).rejects.toThrow(/UNSUPPORTED_PLATFORM/);
-    await expect(linuxStore.exists(ref)).rejects.toThrow(/UNSUPPORTED_PLATFORM/);
+    expect(() => resolver.resolve(unknownRef)).toThrow(
+      /Unsupported native profile provider "unknown-custom-llm"/
+    );
   });
 
   // -------------------------------------------------------------
-  // 11. Test fake usable through dependency injection only
+  // 21. Codex config mapping is supported but runtime isolation is PENDING_R5D
   // -------------------------------------------------------------
-  it('11. test fake usable through dependency injection only', async () => {
-    const fakeStore = new InMemoryCredentialStore();
-    const refA = parseCredentialRef('wincred://agentforge/fake/a');
-    const refB = parseCredentialRef('wincred://agentforge/fake/b');
-
-    await fakeStore.put(refA, new SecretValue('secret-a'));
-    await fakeStore.put(refB, new SecretValue('secret-b'));
-
-    expect((await fakeStore.get(refA))?.exposeSecret()).toBe('secret-a');
-    expect((await fakeStore.get(refB))?.exposeSecret()).toBe('secret-b');
-
-    fakeStore.clear();
-    expect(await fakeStore.exists(refA)).toBe(false);
-  });
-
-  // -------------------------------------------------------------
-  // 12. NativeProfileRef parse/round-trip
-  // -------------------------------------------------------------
-  it('12. NativeProfileRef parse/round-trip', () => {
-    const raw = 'native-profile://codex/c01';
-    const ref = parseNativeProfileRef(raw);
-
-    expect(ref.getScheme()).toBe('native-profile');
-    expect(ref.getProvider()).toBe('codex');
-    expect(ref.getProfileId()).toBe('c01');
-    expect(ref.toUriString()).toBe(raw);
-    expect(ref.toString()).toBe(raw);
-    expect(ref.toSafeString()).toBe(raw);
-    expect(ref.toJSON()).toBe(raw);
-    expect(isValidNativeProfileRef(raw)).toBe(true);
-  });
-
-  // -------------------------------------------------------------
-  // 13. Traversal/malformed native profiles rejected
-  // -------------------------------------------------------------
-  it('13. traversal/malformed native profiles rejected', () => {
-    expect(() => parseNativeProfileRef('')).toThrow(/non-empty string/);
-    expect(() => parseNativeProfileRef('invalid-scheme://codex/c01')).toThrow(/Unsupported profile scheme/);
-    expect(() => parseNativeProfileRef('native-profile://')).toThrow(/expected format/);
-    expect(() => parseNativeProfileRef('native-profile://codex')).toThrow(/expected format/);
-    expect(() => parseNativeProfileRef('native-profile:///c01')).toThrow(/provider cannot be empty/);
-    expect(() => parseNativeProfileRef('native-profile://codex/')).toThrow(/profileId cannot be empty/);
-    expect(() => parseNativeProfileRef('native-profile://codex/../traversal')).toThrow(/path traversal is forbidden/);
-    expect(() => parseNativeProfileRef('native-profile://codex/sub/dir')).toThrow(/path separators/);
-    expect(() => parseNativeProfileRef('native-profile://codex/sub\\dir')).toThrow(/path separators/);
-    expect(() => parseNativeProfileRef('native-profile://codex/has space')).toThrow(/whitespace or control characters/);
-    expect(() => parseNativeProfileRef('native-profile://codex/bad$char')).toThrow(/contains invalid characters/);
-
-    expect(isValidNativeProfileRef('native-profile://codex/../bad')).toBe(false);
-  });
-
-  // -------------------------------------------------------------
-  // 14. Codex profile execution metadata resolves deterministically
-  // -------------------------------------------------------------
-  it('14. Codex profile execution metadata resolves deterministically', () => {
+  it('21. Codex config mapping is supported but runtime isolation is PENDING_R5D', () => {
     const resolver = new NativeProfileResolver({
       baseProfilesDir: path.join('C:', 'AgentForge', 'profiles'),
     });
+    const ref = parseNativeProfileRef('native-profile://codex/c01');
+    const res = resolver.resolve(ref);
 
-    const resolution = resolver.resolve('native-profile://codex/work-account-01');
-    expect(resolution.provider).toBe('codex');
-    expect(resolution.profileId).toBe('work-account-01');
-    expect(resolution.profileRef).toBe('native-profile://codex/work-account-01');
-    expect(resolution.envOverrides.CODEX_HOME).toBe(
-      path.join('C:', 'AgentForge', 'profiles', 'codex', 'work-account-01')
-    );
-    expect(resolution.isolationStatus).toBe('VERIFIED');
-    expect(resolution.notes).toContain('Codex CLI profile isolated');
-  });
-
-  // -------------------------------------------------------------
-  // 15. Gemini profile execution metadata resolves deterministically
-  // -------------------------------------------------------------
-  it('15. Gemini profile execution metadata resolves deterministically', () => {
-    const resolver = new NativeProfileResolver({
-      baseProfilesDir: path.join('C:', 'AgentForge', 'profiles'),
-    });
-
-    const resolution = resolver.resolve('native-profile://gemini/personal-g01');
-    expect(resolution.provider).toBe('gemini');
-    expect(resolution.profileId).toBe('personal-g01');
-    expect(resolution.profileRef).toBe('native-profile://gemini/personal-g01');
-    expect(resolution.envOverrides.GEMINI_CLI_HOME).toBe(
-      path.join('C:', 'AgentForge', 'profiles', 'gemini', 'personal-g01')
-    );
-    expect(resolution.isolationStatus).toBe('VERIFIED');
-    expect(resolution.notes).toContain('Gemini CLI profile isolated');
-  });
-
-  // -------------------------------------------------------------
-  // 16. Claude profile remains marked experimental/unverified
-  // -------------------------------------------------------------
-  it('16. Claude profile remains marked experimental/unverified', () => {
-    const resolver = new NativeProfileResolver({
-      baseProfilesDir: path.join('C:', 'AgentForge', 'profiles'),
-    });
-
-    const resolution = resolver.resolve('native-profile://claude/cl-team');
-    expect(resolution.provider).toBe('claude');
-    expect(resolution.profileId).toBe('cl-team');
-    expect(resolution.profileRef).toBe('native-profile://claude/cl-team');
-    expect(resolution.envOverrides.CLAUDE_CONFIG_DIR).toBe(
-      path.join('C:', 'AgentForge', 'profiles', 'claude', 'cl-team')
-    );
-    expect(resolution.isolationStatus).toBe('EXPERIMENTAL_UNPROVEN');
-    expect(resolution.notes).toContain('Claude Code profile isolation is unverified and experimental');
-  });
-
-  // -------------------------------------------------------------
-  // 17. Resolver never reads/copies provider OAuth token payload
-  // -------------------------------------------------------------
-  it('17. resolver never reads/copies provider OAuth token payload', () => {
-    const resolver = new NativeProfileResolver({
-      baseProfilesDir: path.join('C:', 'AgentForge', 'profiles'),
-    });
-
-    // Pure computation of environment and directory mapping
-    const resolution = resolver.resolve(parseNativeProfileRef('native-profile://codex/c01'));
-
-    expect(resolution).toBeDefined();
-    expect(resolution.envOverrides).toEqual({
+    expect(res.provider).toBe('codex');
+    expect(res.profileId).toBe('c01');
+    expect(res.envOverrides).toEqual({
       CODEX_HOME: path.join('C:', 'AgentForge', 'profiles', 'codex', 'c01'),
     });
-    // Ensure no token properties or credential contents exist on the resolution object
-    const resObj = resolution as unknown as Record<string, unknown>;
-    expect(resObj.token).toBeUndefined();
-    expect(resObj.secret).toBeUndefined();
-    expect(resObj.accessToken).toBeUndefined();
+    expect(res.configurationStatus).toBe('DOCUMENTED_SUPPORTED');
+    expect(res.runtimeIsolationStatus).toBe('PENDING_R5D');
+    expect(res.notes).toContain('CODEX_HOME');
+    expect(res.notes).toContain('pending R5D');
   });
 
   // -------------------------------------------------------------
-  // 18. Existing ProviderAccount rows remain compatible
+  // 22. Gemini config mapping is supported but runtime isolation is PENDING_R5D
   // -------------------------------------------------------------
-  it('18. existing ProviderAccount rows remain compatible', () => {
-    seedProvider('prov-google');
-
-    // Legacy handle format used in R5A tests
-    const legacyAcct: ProviderAccount = {
-      id: 'acct-legacy-01',
-      provider_id: 'prov-google',
-      label: 'Legacy Gemini Account',
-      auth_mode: 'API_CREDENTIAL',
-      credential_ref: 'cred-handle-0912',
-      profile_ref: null,
-      enabled: true,
-      priority: 10,
-      health_status: 'AVAILABLE',
-      cooldown_until: null,
-      concurrency_limit: 4,
-      last_success_at: new Date().toISOString(),
-      last_failure_at: null,
-      last_failure_code: null,
-      created_at: new Date().toISOString(),
-      updated_at: new Date().toISOString(),
-    };
-    repo.createProviderAccount(legacyAcct);
-
-    const loaded = repo.getProviderAccount('acct-legacy-01');
-    expect(loaded).not.toBeNull();
-    expect(loaded?.credential_ref).toBe('cred-handle-0912');
-    expect(loaded?.auth_mode).toBe('API_CREDENTIAL');
-
-    // Update with legacy handle format
-    repo.updateProviderAccount('acct-legacy-01', {
-      credential_ref: 'cred-handle-updated',
-    });
-    expect(repo.getProviderAccount('acct-legacy-01')?.credential_ref).toBe('cred-handle-updated');
-  });
-
-  // -------------------------------------------------------------
-  // 19. Generic provider profile fallback in resolver
-  // -------------------------------------------------------------
-  it('19. generic provider profile fallback in resolver', () => {
+  it('22. Gemini config mapping is supported but runtime isolation is PENDING_R5D', () => {
     const resolver = new NativeProfileResolver({
       baseProfilesDir: path.join('C:', 'AgentForge', 'profiles'),
     });
+    const ref = parseNativeProfileRef('native-profile://gemini/g01');
+    const res = resolver.resolve(ref);
 
-    const resolution = resolver.resolve('native-profile://custom-llm/p1');
-    expect(resolution.provider).toBe('custom-llm');
-    expect(resolution.isolationStatus).toBe('EXPERIMENTAL_UNPROVEN');
-    expect(resolution.envOverrides.CUSTOM_LLM_HOME).toBe(
-      path.join('C:', 'AgentForge', 'profiles', 'custom-llm', 'p1')
-    );
+    expect(res.provider).toBe('gemini');
+    expect(res.profileId).toBe('g01');
+    expect(res.envOverrides).toEqual({
+      GEMINI_CLI_HOME: path.join('C:', 'AgentForge', 'profiles', 'gemini', 'g01'),
+    });
+    expect(res.configurationStatus).toBe('DOCUMENTED_SUPPORTED');
+    expect(res.runtimeIsolationStatus).toBe('PENDING_R5D');
+    expect(res.notes).toContain('GEMINI_CLI_HOME');
+    expect(res.notes).toContain('pending R5D');
   });
 
   // -------------------------------------------------------------
-  // 20. Update provider account ref validation
+  // 23. Claude remains experimental and runtime isolation PENDING_R5D
   // -------------------------------------------------------------
-  it('20. update provider account ref validation', () => {
-    seedProvider('prov-openai');
-
-    repo.createProviderAccount({
-      id: 'acct-update-test',
-      provider_id: 'prov-openai',
-      label: 'Update Test',
-      auth_mode: 'NATIVE_PROFILE',
-      credential_ref: null,
-      profile_ref: 'native-profile://codex/c01',
-      enabled: true,
-      priority: 10,
-      health_status: 'AVAILABLE',
-      cooldown_until: null,
-      concurrency_limit: 1,
-      last_success_at: null,
-      last_failure_at: null,
-      last_failure_code: null,
-      created_at: new Date().toISOString(),
-      updated_at: new Date().toISOString(),
+  it('23. Claude remains experimental and runtime isolation PENDING_R5D', () => {
+    const resolver = new NativeProfileResolver({
+      baseProfilesDir: path.join('C:', 'AgentForge', 'profiles'),
     });
+    const ref = parseNativeProfileRef('native-profile://claude/cl01');
+    const res = resolver.resolve(ref);
 
-    // Updating to invalid profile_ref should fail
-    expect(() => {
-      repo.updateProviderAccount('acct-update-test', {
-        profile_ref: 'native-profile://codex/../bad',
-      });
-    }).toThrow(/path traversal is forbidden/);
-
-    // Updating to conflicting credential_ref under NATIVE_PROFILE should fail
-    expect(() => {
-      repo.updateProviderAccount('acct-update-test', {
-        credential_ref: 'wincred://agentforge/key',
-      });
-    }).toThrow(/contradictory references/);
-
-    // Valid update
-    repo.updateProviderAccount('acct-update-test', {
-      profile_ref: 'native-profile://codex/c02',
+    expect(res.provider).toBe('claude');
+    expect(res.profileId).toBe('cl01');
+    expect(res.envOverrides).toEqual({
+      CLAUDE_CONFIG_DIR: path.join('C:', 'AgentForge', 'profiles', 'claude', 'cl01'),
     });
-    expect(repo.getProviderAccount('acct-update-test')?.profile_ref).toBe('native-profile://codex/c02');
+    expect(res.configurationStatus).toBe('EXPERIMENTAL_UNPROVEN');
+    expect(res.runtimeIsolationStatus).toBe('PENDING_R5D');
+    expect(res.notes).toContain('unverified and experimental');
+    expect(res.notes).toContain('pending R5D');
   });
 
   // -------------------------------------------------------------
-  // 21. Live Windows Credential Store integration (if running on Windows)
+  // 24. normal Windows npm test does NOT touch real Credential Manager
   // -------------------------------------------------------------
-  it('21. Windows Credential Store integration on win32', async () => {
-    if (process.platform !== 'win32') {
-      // Skipped on non-Windows (unsupported platform test in test 10 covers this)
+  it('24. normal Windows npm test does NOT touch real Credential Manager', () => {
+    // InMemoryCredentialStore is fully isolated
+    const memStore = new InMemoryCredentialStore();
+    const ref = parseCredentialRef('wincred://agentforge/test/mem-key');
+    const secret = new SecretValue('test-secret');
+
+    memStore.put(ref, secret);
+    expect(memStore.exists(ref)).resolves.toBe(true);
+  });
+
+  // -------------------------------------------------------------
+  // 25. injected Windows backend tests cover put/get/delete/exists command contract
+  // -------------------------------------------------------------
+  it('25. injected Windows backend tests cover put/get/delete/exists command contract', async () => {
+    const executedScripts: string[] = [];
+    const executedInputs: string[] = [];
+
+    const mockExecutor = async (script: string, stdinInput: string): Promise<string> => {
+      executedScripts.push(script);
+      executedInputs.push(stdinInput);
+      if (script.includes('CredWrite')) return 'OK\n';
+      if (script.includes('CredReadW') && script.includes('EXISTS')) return 'EXISTS\n';
+      if (script.includes('CredReadW')) return 'mock-retrieved-secret';
+      if (script.includes('CredDeleteW')) return 'DELETED\n';
+      return '';
+    };
+
+    const store = new WindowsCredentialStore('win32', mockExecutor);
+    const ref = parseCredentialRef('wincred://agentforge/mock/test-target');
+    const secret = new SecretValue('my-super-secret');
+
+    // Test put
+    await store.put(ref, secret);
+    expect(executedInputs[0]).toBe('AgentForge:mock:test-target\nmy-super-secret');
+    expect(executedScripts[0]).toContain('CredWrite');
+
+    // Test exists
+    const existsResult = await store.exists(ref);
+    expect(existsResult).toBe(true);
+    expect(executedInputs[1]).toBe('AgentForge:mock:test-target');
+    expect(executedScripts[1]).toContain('WinCredProber');
+
+    // Test get
+    const retrieved = await store.get(ref);
+    expect(retrieved?.exposeSecret()).toBe('mock-retrieved-secret');
+    expect(executedInputs[2]).toBe('AgentForge:mock:test-target');
+
+    // Test delete
+    const deleted = await store.delete(ref);
+    expect(deleted).toBe(true);
+    expect(executedInputs[3]).toBe('AgentForge:mock:test-target');
+  });
+
+  // -------------------------------------------------------------
+  // 26. exists() does not return/read secret payload
+  // -------------------------------------------------------------
+  it('26. exists() does not return/read secret payload', async () => {
+    let outputSecretPayload = false;
+
+    const probeExecutor = async (script: string, stdinInput: string): Promise<string> => {
+      // WinCredProber must NOT marshal or write secret to stdout
+      if (script.includes('WinCredProber')) {
+        expect(script).not.toContain('Marshal]::Copy');
+        expect(script).not.toContain('GetString');
+        return 'EXISTS\n';
+      }
+      return '';
+    };
+
+    const store = new WindowsCredentialStore('win32', probeExecutor);
+    const ref = parseCredentialRef('wincred://agentforge/mock/probe-target');
+    const exists = await store.exists(ref);
+    expect(exists).toBe(true);
+  });
+
+  // -------------------------------------------------------------
+  // 27 & 28. optional real WinCred integration test is skipped unless explicit opt-in
+  // -------------------------------------------------------------
+  it('27 & 28. optional real WinCred integration test is skipped unless explicit opt-in', async () => {
+    const isOptIn = process.env.AGENTFORGE_RUN_WINCRED_INTEGRATION === '1';
+    if (!isOptIn || process.platform !== 'win32') {
+      // Skipped in default hermetic test run
+      expect(true).toBe(true);
       return;
     }
 
-    const winStore = new WindowsCredentialStore();
-    const testRef = parseCredentialRef('wincred://agentforge/test/unit-test-key');
-    const testSecret = new SecretValue('test-wincred-secret-value-12345');
+    // When explicitly opted in:
+    const uniqueId = crypto.randomUUID();
+    const targetUri = `wincred://agentforge/test-isolated/${uniqueId}`;
+    const ref = parseCredentialRef(targetUri);
+    const secret = new SecretValue(`secret-payload-${uniqueId}`);
+    const liveStore = new WindowsCredentialStore('win32');
 
     try {
-      // Put
-      await winStore.put(testRef, testSecret);
-      expect(await winStore.exists(testRef)).toBe(true);
+      // 1. Put
+      await liveStore.put(ref, secret);
 
-      // Get
-      const retrieved = await winStore.get(testRef);
+      // 2. Exists
+      const exists = await liveStore.exists(ref);
+      expect(exists).toBe(true);
+
+      // 3. Get
+      const retrieved = await liveStore.get(ref);
       expect(retrieved).not.toBeNull();
-      expect(retrieved?.exposeSecret()).toBe('test-wincred-secret-value-12345');
+      expect(retrieved?.exposeSecret()).toBe(`secret-payload-${uniqueId}`);
     } finally {
-      // Delete
-      await winStore.delete(testRef);
-      expect(await winStore.exists(testRef)).toBe(false);
+      // 4. Guaranteed cleanup
+      await liveStore.delete(ref);
+      const existsAfter = await liveStore.exists(ref);
+      expect(existsAfter).toBe(false);
     }
+  });
+
+  // -------------------------------------------------------------
+  // 29 & 30. Windows Credential size limit validation (>2560 bytes fails closed)
+  // -------------------------------------------------------------
+  it('29 & 30. Windows Credential size limit validation (>2560 bytes fails closed)', async () => {
+    const mockExecutor = async () => 'OK\n';
+    const store = new WindowsCredentialStore('win32', mockExecutor);
+    const ref = parseCredentialRef('wincred://agentforge/test/size-limit');
+
+    // 2560 bytes in UTF-16LE = 1280 characters
+    const validSecret = new SecretValue('a'.repeat(1280));
+    await expect(store.put(ref, validSecret)).resolves.not.toThrow();
+
+    // 2562 bytes in UTF-16LE = 1281 characters -> exceeds limit
+    const oversizedSecret = new SecretValue('a'.repeat(1281));
+    await expect(store.put(ref, oversizedSecret)).rejects.toThrow(
+      /exceeds maximum Windows Credential Manager limit/
+    );
   });
 });

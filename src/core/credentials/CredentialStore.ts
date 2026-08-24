@@ -3,6 +3,11 @@ import { CredentialRef } from './CredentialRef';
 import { SecretValue } from './SecretValue';
 
 /**
+ * Microsoft documented maximum credential blob size for generic credentials (5 * 512 bytes).
+ */
+export const CRED_MAX_CREDENTIAL_BLOB_SIZE = 2560;
+
+/**
  * Provider-neutral interface for secure local credential storage.
  * Implementations manage persistent or in-memory storage of secret payloads
  * indexed by opaque CredentialRef references.
@@ -13,6 +18,8 @@ export interface CredentialStore {
   delete(ref: CredentialRef): Promise<boolean>;
   exists(ref: CredentialRef): Promise<boolean>;
 }
+
+export type PowerShellExecutor = (script: string, stdinInput: string) => Promise<string>;
 
 /**
  * In-memory CredentialStore fake for test environments and non-Windows CI.
@@ -50,16 +57,18 @@ export class InMemoryCredentialStore implements CredentialStore {
  * Fails closed on non-Windows platforms.
  */
 export class WindowsCredentialStore implements CredentialStore {
-  private readonly platform: string;
+  readonly #platform: string;
+  readonly #executor: PowerShellExecutor;
 
-  constructor(platformOverride?: string) {
-    this.platform = platformOverride ?? process.platform;
+  constructor(platformOverride?: string, customExecutor?: PowerShellExecutor) {
+    this.#platform = platformOverride ?? process.platform;
+    this.#executor = customExecutor ?? this.#defaultPowerShellExecutor.bind(this);
   }
 
   private assertWindowsPlatform(): void {
-    if (this.platform !== 'win32') {
+    if (this.#platform !== 'win32') {
       throw new Error(
-        `UNSUPPORTED_PLATFORM: WindowsCredentialStore is only supported on Windows (win32). Current platform: "${this.platform}".`
+        `UNSUPPORTED_PLATFORM: WindowsCredentialStore is only supported on Windows (win32). Current platform: "${this.#platform}".`
       );
     }
   }
@@ -68,6 +77,14 @@ export class WindowsCredentialStore implements CredentialStore {
     this.assertWindowsPlatform();
     const targetName = ref.getWindowsTargetName();
     const secretContent = secret.exposeSecret();
+
+    // Validate byte length against Microsoft Windows Credential Manager generic blob limits
+    const byteLength = Buffer.byteLength(secretContent, 'utf16le');
+    if (byteLength > CRED_MAX_CREDENTIAL_BLOB_SIZE) {
+      throw new Error(
+        `[WindowsCredentialStore] Credential secret size (${byteLength} bytes) exceeds maximum Windows Credential Manager limit (${CRED_MAX_CREDENTIAL_BLOB_SIZE} bytes).`
+      );
+    }
 
     // PowerShell script to write generic credential via advapi32.dll with secret passed via stdin
     const psScript = `
@@ -126,7 +143,7 @@ if (-not $success) {
 Write-Output "OK"
 `;
 
-    await this.executePowerShell(psScript, `${targetName}\n${secretContent}`);
+    await this.#executor(psScript, `${targetName}\n${secretContent}`);
   }
 
   public async get(ref: CredentialRef): Promise<SecretValue | null> {
@@ -188,7 +205,7 @@ try {
 }
 `;
 
-    const output = await this.executePowerShell(psScript, targetName);
+    const output = await this.#executor(psScript, targetName);
     if (!output || output.length === 0) {
       return null;
     }
@@ -225,16 +242,55 @@ if ($success) {
 }
 `;
 
-    const output = await this.executePowerShell(psScript, targetName);
+    const output = await this.#executor(psScript, targetName);
     return output.trim() === 'DELETED';
   }
 
+  /**
+   * Least-privilege existence check. Verifies credential presence without
+   * reading, marshalling, or exposing secret contents.
+   */
   public async exists(ref: CredentialRef): Promise<boolean> {
-    const cred = await this.get(ref);
-    return cred !== null;
+    this.assertWindowsPlatform();
+    const targetName = ref.getWindowsTargetName();
+
+    const psScript = `
+$target = [Console]::In.ReadLine()
+
+$def = @"
+using System;
+using System.Runtime.InteropServices;
+public class WinCredProber {
+    [DllImport("advapi32.dll", SetLastError = true, EntryPoint = "CredReadW", CharSet = CharSet.Unicode)]
+    public static extern bool CredRead(string target, int type, int reservedFlag, out IntPtr credentialPtr);
+
+    [DllImport("advapi32.dll", SetLastError = true, EntryPoint = "CredFree")]
+    public static extern void CredFree([In] IntPtr pBuffer);
+}
+"@
+Add-Type -TypeDefinition $def
+
+$ptr = [IntPtr]::Zero
+$success = [WinCredProber]::CredRead($target, 1, 0, [ref]$ptr)
+
+if ($success) {
+    [WinCredProber]::CredFree($ptr)
+    Write-Output "EXISTS"
+} else {
+    $err = [System.Runtime.InteropServices.Marshal]::GetLastWin32Error()
+    if ($err -eq 1168) { # ERROR_NOT_FOUND
+        Write-Output "NOT_FOUND"
+    } else {
+        throw "CredRead probe failed with error code $err."
+    }
+}
+`;
+
+    const output = await this.#executor(psScript, targetName);
+    return output.trim() === 'EXISTS';
   }
 
-  private executePowerShell(script: string, stdinInput: string): Promise<string> {
+  #defaultPowerShellExecutor(script: string, stdinInput: string): Promise<string> {
     return new Promise((resolve, reject) => {
       const child = spawn(
         'powershell.exe',
