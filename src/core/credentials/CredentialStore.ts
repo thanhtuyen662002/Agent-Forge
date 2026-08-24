@@ -1,5 +1,5 @@
 import { spawn } from 'child_process';
-import { CredentialRef } from './CredentialRef';
+import { CredentialRef, parseCredentialRef } from './CredentialRef';
 import { SecretValue } from './SecretValue';
 
 /**
@@ -23,25 +23,44 @@ export type PowerShellExecutor = (script: string, stdinInput: string) => Promise
 
 /**
  * In-memory CredentialStore fake for test environments and non-Windows CI.
+ * Revalidates reference canonical identity before indexing.
  * @internal
  */
 export class InMemoryCredentialStore implements CredentialStore {
   private readonly store = new Map<string, SecretValue>();
 
+  private getCanonicalUri(ref: CredentialRef): string {
+    if (!ref) {
+      throw new Error('[InMemoryCredentialStore] Credential reference cannot be null or undefined.');
+    }
+    const rawUri =
+      typeof ref === 'string'
+        ? ref
+        : typeof (ref as any).toUriString === 'function'
+          ? (ref as any).toUriString()
+          : String(ref);
+    const canonicalRef = parseCredentialRef(rawUri);
+    return canonicalRef.toUriString();
+  }
+
   public async put(ref: CredentialRef, secret: SecretValue): Promise<void> {
-    this.store.set(ref.toUriString(), secret);
+    const key = this.getCanonicalUri(ref);
+    this.store.set(key, secret);
   }
 
   public async get(ref: CredentialRef): Promise<SecretValue | null> {
-    return this.store.get(ref.toUriString()) ?? null;
+    const key = this.getCanonicalUri(ref);
+    return this.store.get(key) ?? null;
   }
 
   public async delete(ref: CredentialRef): Promise<boolean> {
-    return this.store.delete(ref.toUriString());
+    const key = this.getCanonicalUri(ref);
+    return this.store.delete(key);
   }
 
   public async exists(ref: CredentialRef): Promise<boolean> {
-    return this.store.has(ref.toUriString());
+    const key = this.getCanonicalUri(ref);
+    return this.store.has(key);
   }
 
   public clear(): void {
@@ -54,6 +73,7 @@ export class InMemoryCredentialStore implements CredentialStore {
  * Stores secrets in the Windows Credential Store under the current-user scope
  * with an `AgentForge:` namespace prefix.
  *
+ * Revalidates reference inputs fail-closed before invoking OS commands.
  * Fails closed on non-Windows platforms.
  */
 export class WindowsCredentialStore implements CredentialStore {
@@ -73,9 +93,23 @@ export class WindowsCredentialStore implements CredentialStore {
     }
   }
 
+  private getCanonicalTargetName(ref: CredentialRef): string {
+    if (!ref) {
+      throw new Error('[WindowsCredentialStore] Credential reference cannot be null or undefined.');
+    }
+    const rawUri =
+      typeof ref === 'string'
+        ? ref
+        : typeof (ref as any).toUriString === 'function'
+          ? (ref as any).toUriString()
+          : String(ref);
+    const canonicalRef = parseCredentialRef(rawUri);
+    return canonicalRef.getWindowsTargetName();
+  }
+
   public async put(ref: CredentialRef, secret: SecretValue): Promise<void> {
     this.assertWindowsPlatform();
-    const targetName = ref.getWindowsTargetName();
+    const targetName = this.getCanonicalTargetName(ref);
     const secretContent = secret.exposeSecret();
 
     // Validate byte length against Microsoft Windows Credential Manager generic blob limits
@@ -148,7 +182,7 @@ Write-Output "OK"
 
   public async get(ref: CredentialRef): Promise<SecretValue | null> {
     this.assertWindowsPlatform();
-    const targetName = ref.getWindowsTargetName();
+    const targetName = this.getCanonicalTargetName(ref);
 
     const psScript = `
 $target = [Console]::In.ReadLine()
@@ -214,7 +248,7 @@ try {
 
   public async delete(ref: CredentialRef): Promise<boolean> {
     this.assertWindowsPlatform();
-    const targetName = ref.getWindowsTargetName();
+    const targetName = this.getCanonicalTargetName(ref);
 
     const psScript = `
 $target = [Console]::In.ReadLine()
@@ -248,11 +282,11 @@ if ($success) {
 
   /**
    * Least-privilege existence check. Verifies credential presence without
-   * reading, marshalling, or exposing secret contents.
+   * reading, copying, or outputting the secret payload.
    */
   public async exists(ref: CredentialRef): Promise<boolean> {
     this.assertWindowsPlatform();
-    const targetName = ref.getWindowsTargetName();
+    const targetName = this.getCanonicalTargetName(ref);
 
     const psScript = `
 $target = [Console]::In.ReadLine()
@@ -274,14 +308,16 @@ $ptr = [IntPtr]::Zero
 $success = [WinCredProber]::CredRead($target, 1, 0, [ref]$ptr)
 
 if ($success) {
-    [WinCredProber]::CredFree($ptr)
+    if ($ptr -ne [IntPtr]::Zero) {
+        [WinCredProber]::CredFree($ptr)
+    }
     Write-Output "EXISTS"
 } else {
     $err = [System.Runtime.InteropServices.Marshal]::GetLastWin32Error()
     if ($err -eq 1168) { # ERROR_NOT_FOUND
         Write-Output "NOT_FOUND"
     } else {
-        throw "CredRead probe failed with error code $err."
+        throw "CredRead failed with error code $err."
     }
 }
 `;
@@ -290,39 +326,52 @@ if ($success) {
     return output.trim() === 'EXISTS';
   }
 
+  /**
+   * Spawns PowerShell asynchronously with piped stdin and buffered stdout.
+   */
   #defaultPowerShellExecutor(script: string, stdinInput: string): Promise<string> {
     return new Promise((resolve, reject) => {
       const child = spawn(
         'powershell.exe',
-        ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-Command', script],
-        { stdio: ['pipe', 'pipe', 'pipe'] }
+        ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-Command', '-'],
+        {
+          stdio: ['pipe', 'pipe', 'pipe'],
+          windowsHide: true,
+        }
       );
 
       let stdout = '';
       let stderr = '';
 
-      child.stdout.on('data', (chunk) => {
-        stdout += chunk.toString();
+      child.stdout.on('data', (data) => {
+        stdout += data.toString('utf8');
       });
 
-      child.stderr.on('data', (chunk) => {
-        stderr += chunk.toString();
+      child.stderr.on('data', (data) => {
+        stderr += data.toString('utf8');
       });
 
       child.on('error', (err) => {
-        reject(new Error(`[WindowsCredentialStore] PowerShell process error: ${err.message}`));
+        reject(new Error(`[WindowsCredentialStore] Failed to spawn PowerShell: ${err.message}`));
       });
 
       child.on('close', (code) => {
         if (code !== 0) {
-          const sanitizedError = stderr.replace(/[\r\n]+/g, ' ').trim();
-          reject(new Error(`[WindowsCredentialStore] Operation failed (exit code ${code}): ${sanitizedError}`));
+          reject(
+            new Error(
+              `[WindowsCredentialStore] PowerShell execution failed (exit code ${code}): ${stderr.trim() || stdout.trim()}`
+            )
+          );
         } else {
           resolve(stdout);
         }
       });
 
-      child.stdin.write(stdinInput);
+      // Write script and stdin input to powershell stdin
+      child.stdin.write(script + '\n');
+      if (stdinInput) {
+        child.stdin.write(stdinInput);
+      }
       child.stdin.end();
     });
   }

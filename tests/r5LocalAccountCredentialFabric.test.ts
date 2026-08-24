@@ -499,9 +499,9 @@ describe('R5C Local Account & Credential Fabric Test Suite', () => {
   // 16. public API cannot construct invalid CredentialRef without parser validation
   // -------------------------------------------------------------
   it('16. public API cannot construct invalid CredentialRef without parser validation', () => {
-    // parseCredentialRef rejects invalid inputs fail-closed
     expect(() => parseCredentialRef('invalid-ref')).toThrow();
     expect(() => CredentialRef.parse('invalid-ref')).toThrow();
+    expect(() => new CredentialRef('invalid-ref')).toThrow();
     expect(isValidCredentialRef('invalid-ref')).toBe(false);
   });
 
@@ -511,6 +511,7 @@ describe('R5C Local Account & Credential Fabric Test Suite', () => {
   it('17. public API cannot construct invalid NativeProfileRef without parser validation', () => {
     expect(() => parseNativeProfileRef('invalid-profile')).toThrow();
     expect(() => NativeProfileRef.parse('invalid-profile')).toThrow();
+    expect(() => new NativeProfileRef('invalid-profile')).toThrow();
     expect(isValidNativeProfileRef('invalid-profile')).toBe(false);
   });
 
@@ -680,9 +681,7 @@ describe('R5C Local Account & Credential Fabric Test Suite', () => {
   // 26. exists() does not return/read secret payload
   // -------------------------------------------------------------
   it('26. exists() does not return/read secret payload', async () => {
-    let outputSecretPayload = false;
-
-    const probeExecutor = async (script: string, stdinInput: string): Promise<string> => {
+    const probeExecutor = async (script: string): Promise<string> => {
       // WinCredProber must NOT marshal or write secret to stdout
       if (script.includes('WinCredProber')) {
         expect(script).not.toContain('Marshal]::Copy');
@@ -753,5 +752,146 @@ describe('R5C Local Account & Credential Fabric Test Suite', () => {
     await expect(store.put(ref, oversizedSecret)).rejects.toThrow(
       /exceeds maximum Windows Credential Manager limit/
     );
+  });
+
+  // =============================================================
+  // CORRECTIVE 2: RUNTIME BYPASS & ATTACK TESTS (Section G)
+  // =============================================================
+
+  // 31. CredentialRef and NativeProfileRef have no public _createInternal
+  it('31. CredentialRef and NativeProfileRef have no public _createInternal', () => {
+    expect((CredentialRef as any)._createInternal).toBeUndefined();
+    expect((NativeProfileRef as any)._createInternal).toBeUndefined();
+  });
+
+  // 32. Attempting to forge a CredentialRef-like object cannot bypass Windows target canonicalization
+  it('32. Attempting to forge a CredentialRef-like object cannot bypass Windows target canonicalization', async () => {
+    let capturedTarget = '';
+    const mockExecutor = async (_script: string, stdinInput: string): Promise<string> => {
+      capturedTarget = stdinInput.split('\n')[0];
+      return 'OK\n';
+    };
+
+    const store = new WindowsCredentialStore('win32', mockExecutor);
+
+    // Attack: pass a forged object claiming a safe URI but returning a malicious target in getWindowsTargetName()
+    const forgedRef = {
+      toUriString: () => 'wincred://agentforge/openai/team-key',
+      getWindowsTargetName: () => 'OtherApp:SensitiveTarget',
+    } as any;
+
+    await store.put(forgedRef, new SecretValue('test-payload'));
+
+    // WindowsCredentialStore must revalidate and use canonical target, NOT forged getWindowsTargetName
+    expect(capturedTarget).toBe('AgentForge:openai:team-key');
+    expect(capturedTarget).not.toBe('OtherApp:SensitiveTarget');
+  });
+
+  // 33. Forged object with invalid or traversing URI fails closed in consumer stores
+  it('33. Forged object with invalid or traversing URI fails closed in consumer stores', async () => {
+    const store = new WindowsCredentialStore('win32', async () => 'OK\n');
+
+    const maliciousTraversal = {
+      toUriString: () => 'wincred://agentforge/../../etc/shadow',
+      getWindowsTargetName: () => 'AgentForge:traversal',
+    } as any;
+
+    await expect(store.put(maliciousTraversal, new SecretValue('foo'))).rejects.toThrow(/path traversal is forbidden/);
+    await expect(store.get(maliciousTraversal)).rejects.toThrow(/path traversal is forbidden/);
+    await expect(store.delete(maliciousTraversal)).rejects.toThrow(/path traversal is forbidden/);
+    await expect(store.exists(maliciousTraversal)).rejects.toThrow(/path traversal is forbidden/);
+  });
+
+  // 34. Forged NativeProfileRef with path traversal fails closed in NativeProfileResolver
+  it('34. Forged NativeProfileRef with path traversal fails closed in NativeProfileResolver', () => {
+    const resolver = new NativeProfileResolver({
+      baseProfilesDir: path.join('C:', 'AgentForge', 'profiles'),
+    });
+
+    const maliciousProfile = {
+      provider: 'codex',
+      profileId: '../../escape',
+      toUriString: () => 'native-profile://codex/../../escape',
+    } as any;
+
+    expect(() => resolver.resolve(maliciousProfile)).toThrow(/path traversal is forbidden/);
+
+    // If forged object claims a safe URI but has forged traversal property, safe URI is canonicalized
+    const deceptiveProfile = {
+      provider: 'codex',
+      profileId: '../../escape',
+      toUriString: () => 'native-profile://codex/c01',
+    } as any;
+
+    const res = resolver.resolve(deceptiveProfile);
+    expect(res.profileDirectory).toBe(path.join('C:', 'AgentForge', 'profiles', 'codex', 'c01'));
+    expect(res.profileDirectory).not.toContain('escape');
+  });
+
+  // =============================================================
+  // CORRECTIVE 2: CASE IDENTITY & CANONICALIZATION TESTS (Section H)
+  // =============================================================
+
+  // 35. Credential refs differing only by case canonicalize to identical logical identity and Windows target
+  it('35. Credential refs differing only by case canonicalize to identical logical identity and Windows target', () => {
+    const lower = parseCredentialRef('wincred://agentforge/openai/team-key');
+    const mixed = parseCredentialRef('wincred://AgentForge/OpenAI/Team-Key');
+    const upper = parseCredentialRef('WINCRED://AGENTFORGE/OPENAI/TEAM-KEY');
+
+    // All must produce identical canonical URI
+    expect(lower.toUriString()).toBe('wincred://agentforge/openai/team-key');
+    expect(mixed.toUriString()).toBe('wincred://agentforge/openai/team-key');
+    expect(upper.toUriString()).toBe('wincred://agentforge/openai/team-key');
+
+    // All must produce identical target
+    expect(lower.getTarget()).toBe('agentforge/openai/team-key');
+    expect(mixed.getTarget()).toBe('agentforge/openai/team-key');
+    expect(upper.getTarget()).toBe('agentforge/openai/team-key');
+
+    // All must produce identical Windows target
+    expect(lower.getWindowsTargetName()).toBe('AgentForge:openai:team-key');
+    expect(mixed.getWindowsTargetName()).toBe('AgentForge:openai:team-key');
+    expect(upper.getWindowsTargetName()).toBe('AgentForge:openai:team-key');
+
+    // Canonical round-trip stability
+    const roundTrip = parseCredentialRef(mixed.toUriString());
+    expect(roundTrip.toUriString()).toBe(mixed.toUriString());
+    expect(roundTrip.getWindowsTargetName()).toBe(mixed.getWindowsTargetName());
+  });
+
+  // 36. Native profile refs differing only by case canonicalize to identical logical identity and directory
+  it('36. Native profile refs differing only by case canonicalize to identical logical identity and directory', () => {
+    const resolver = new NativeProfileResolver({
+      baseProfilesDir: path.join('C:', 'AgentForge', 'profiles'),
+    });
+
+    const lower = parseNativeProfileRef('native-profile://codex/c01');
+    const mixed = parseNativeProfileRef('native-profile://Codex/C01');
+    const upper = parseNativeProfileRef('NATIVE-PROFILE://CODEX/C01');
+
+    expect(lower.toUriString()).toBe('native-profile://codex/c01');
+    expect(mixed.toUriString()).toBe('native-profile://codex/c01');
+    expect(upper.toUriString()).toBe('native-profile://codex/c01');
+
+    expect(lower.getProvider()).toBe('codex');
+    expect(mixed.getProvider()).toBe('codex');
+    expect(upper.getProvider()).toBe('codex');
+
+    expect(lower.getProfileId()).toBe('c01');
+    expect(mixed.getProfileId()).toBe('c01');
+    expect(upper.getProfileId()).toBe('c01');
+
+    const resLower = resolver.resolve(lower);
+    const resMixed = resolver.resolve(mixed);
+    const resUpper = resolver.resolve(upper);
+
+    expect(resLower.profileDirectory).toBe(resMixed.profileDirectory);
+    expect(resLower.profileDirectory).toBe(resUpper.profileDirectory);
+    expect(resLower.envOverrides).toEqual(resMixed.envOverrides);
+
+    // Canonical round-trip stability
+    const roundTrip = parseNativeProfileRef(mixed.toUriString());
+    expect(roundTrip.toUriString()).toBe(mixed.toUriString());
+    expect(roundTrip.getProfileId()).toBe(mixed.getProfileId());
   });
 });

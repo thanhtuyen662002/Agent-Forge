@@ -24,6 +24,8 @@ export interface NativeProfileResolverOptions {
 /**
  * Resolves NativeProfileRef pointers to deterministic execution environment overrides
  * and directory layouts without reading, inspecting, or copying provider OAuth token files.
+ *
+ * Revalidates reference inputs fail-closed to prevent traversal or forged profile identities.
  */
 export class NativeProfileResolver {
   readonly #baseProfilesDir: string;
@@ -40,12 +42,22 @@ export class NativeProfileResolver {
    * Fails closed for unknown providers that do not have a declared provider contract.
    */
   public resolve(refOrUri: NativeProfileRef | string): NativeProfileResolution {
-    const profileRef =
-      typeof refOrUri === 'string' ? parseNativeProfileRef(refOrUri) : refOrUri;
+    if (!refOrUri) {
+      throw new Error('[NativeProfileResolver] Native profile reference cannot be null or undefined.');
+    }
 
-    const provider = profileRef.getProvider();
-    const profileId = profileRef.getProfileId();
-    const rawRef = profileRef.toUriString();
+    const rawUri =
+      typeof refOrUri === 'string'
+        ? refOrUri
+        : typeof (refOrUri as any).toUriString === 'function'
+          ? (refOrUri as any).toUriString()
+          : String(refOrUri);
+
+    const canonicalRef = parseNativeProfileRef(rawUri);
+
+    const provider = canonicalRef.getProvider();
+    const profileId = canonicalRef.getProfileId();
+    const canonicalUri = canonicalRef.toUriString();
 
     switch (provider) {
       case 'codex': {
@@ -53,7 +65,7 @@ export class NativeProfileResolver {
         return {
           provider: 'codex',
           profileId,
-          profileRef: rawRef,
+          profileRef: canonicalUri,
           envOverrides: {
             CODEX_HOME: profileDir,
           },
@@ -70,7 +82,7 @@ export class NativeProfileResolver {
         return {
           provider: 'gemini',
           profileId,
-          profileRef: rawRef,
+          profileRef: canonicalUri,
           envOverrides: {
             GEMINI_CLI_HOME: profileDir,
           },
@@ -87,7 +99,7 @@ export class NativeProfileResolver {
         return {
           provider: 'claude',
           profileId,
-          profileRef: rawRef,
+          profileRef: canonicalUri,
           envOverrides: {
             CLAUDE_CONFIG_DIR: profileDir,
           },

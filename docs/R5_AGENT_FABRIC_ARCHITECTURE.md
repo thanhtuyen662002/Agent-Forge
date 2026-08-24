@@ -199,34 +199,40 @@ $$\text{ROLE} \neq \text{AGENT PROFILE} \neq \text{PROVIDER} \neq \text{MODEL RE
 - **Windows Credential Manager (Production)**: Stores secret payloads under current-user scope via Win32 `advapi32.dll` generic credentials in the `AgentForge:` namespace. Secrets are piped via standard input to ensure no secret payload appears in process command-line arguments, environment logs, or task telemetry.
 - **In-Memory Credential Store (Testing & CI)**: Pure in-memory dependency injection fake for hermetic automated tests and non-Windows CI runners.
 
-### 3. CredentialRef Lifecycle
+### 3. CredentialRef Lifecycle & Canonical Identity
 
 ```
-[User / Config] -> [CredentialStore.put(ref, secret)] -> [Windows Credential Manager]
-                               |
-                        [credential_ref URI]
-                               |
-                               v
-                     [provider_accounts table] (SQLite: stores opaque URI only)
+[User / Config] -> [parseCredentialRef(uri)] -> [CredentialRef (Canonical Lowercase)]
+                                                    |
+                                    +---------------+---------------+
+                                    |                               |
+                                    v                               v
+                    [WindowsCredentialStore]              [provider_accounts table]
+                    (Re-validates canonical ref           (SQLite: stores canonical
+                     -> AgentForge:<ns>:<id>)              opaque URI only)
 ```
 
-1. **Parse & Validate**: Scheme-aware parser (`wincred://<target>`) enforces format hygiene and path-traversal prevention.
-2. **Safe Serialization**: `CredentialRef.toString()` and `toSafeString()` contain only pointer metadata.
-3. **Fail-Closed Resolution**: Plaintext retrieval requires explicit `CredentialStore.get(ref)` returning a `SecretValue` wrapper whose `toString()`, `toJSON()`, and inspection hooks return `[REDACTED_SECRET]`.
+1. **Parse & Validate**: Scheme-aware parser (`wincred://agentforge/<namespace>/<credential-id...>`) enforces format hygiene, traversal rejection, colon/backslash rejection, and lowercase canonicalization.
+2. **Canonical Lowercase Policy**: Microsoft Windows Credential Manager `TargetName` is case-insensitive. To prevent case-aliasing attacks, all credential target path segments are transformed to lowercase canonical form (`wincred://agentforge/OpenAI/Key` -> `wincred://agentforge/openai/key` -> `AgentForge:openai:key`).
+3. **Validated Construction Boundary**: `CredentialRef` constructor accepts only raw URI strings and validates them directly. Public unchecked factory methods (`_createInternal`) are removed.
+4. **Consumer Boundary Revalidation**: `WindowsCredentialStore` re-validates all references fail-closed before invoking OS commands, ignoring forged object properties.
+5. **Safe Serialization**: `CredentialRef.toString()` and `toSafeString()` contain only pointer metadata.
+6. **Fail-Closed Resolution**: Plaintext retrieval requires explicit `CredentialStore.get(ref)` returning a `SecretValue` wrapper using private `#secret` encapsulation whose `toString()`, `toJSON()`, spreading, and inspection hooks return `[REDACTED_SECRET]`.
 
 ### 4. NativeProfileRef & Resolver Lifecycle
 
 ```
-[NativeProfileRef (native-profile://codex/c01)]
+[NativeProfileRef (native-profile://<provider>/<profileId>)]
            |
-           v
+           v (Re-validated fail-closed)
 [NativeProfileResolver] -> [Environment Overrides & Profile Dirs]
                            (e.g., CODEX_HOME, GEMINI_CLI_HOME, CLAUDE_CONFIG_DIR)
                            * Never reads, inspects, or copies OAuth tokens *
 ```
 
-1. **Format**: `native-profile://<provider>/<profileId>` (e.g. `native-profile://gemini/g01`).
-2. **Two-Tier Status Model**:
+1. **Format & Case Canonicalization**: `native-profile://<provider>/<profileId>` (e.g. `native-profile://gemini/g01`). Because Windows filesystems are case-insensitive, provider and profile identifiers are canonicalized to lowercase to prevent directory aliasing.
+2. **Construction Boundary & Revalidation**: `NativeProfileRef` validates and canonicalizes directly in its constructor. `NativeProfileResolver.resolve()` re-validates references fail-closed.
+3. **Two-Tier Status Model**:
    - **Codex**:
      - `configurationStatus: DOCUMENTED_SUPPORTED`
      - `runtimeIsolationStatus: PENDING_R5D`
@@ -240,7 +246,7 @@ $$\text{ROLE} \neq \text{AGENT PROFILE} \neq \text{PROVIDER} \neq \text{MODEL RE
      - `runtimeIsolationStatus: PENDING_R5D`
      - Sets `CLAUDE_CONFIG_DIR` to isolated profile directory.
    - **Unknown Providers**: Fail-closed with `UNSUPPORTED_NATIVE_PROFILE_PROVIDER` error; never invents ad-hoc environment variables.
-3. **R5D Verification Boundary**: R5C establishes configuration mapping. All multi-profile runtime account isolation remains classified as `PENDING_R5D` until verified during live R5D execution proofs.
+4. **R5D Verification Boundary**: R5C establishes configuration mapping. All multi-profile runtime account isolation remains classified as `PENDING_R5D` until verified during live R5D execution proofs.
 
 ---
 
