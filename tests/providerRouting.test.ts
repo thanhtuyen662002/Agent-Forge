@@ -727,7 +727,7 @@ describe('PR #6 — Deterministic Quota-Aware Provider Routing & Pre-Dispatch Fa
 
   // 21. Codex current OFFLINE resource cannot route
   it('21. Real CodexCliAdapter resource cannot route and is marked OFFLINE', async () => {
-    const codexAdapter = new CodexCliAdapter();
+    const codexAdapter = new CodexCliAdapter({ executable: 'non_existent_codex' });
     registry.register(codexAdapter);
     repo.createProvider({
       id: 'prov-codex-cli',

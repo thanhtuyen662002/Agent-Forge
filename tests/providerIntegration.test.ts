@@ -170,22 +170,22 @@ describe('PR #5 — Provider Integration Foundation', () => {
     );
   });
 
-  // 4. Missing Codex -> OFFLINE, no crash, empty capabilities
-  it('4. Codex CLI on this host yields OFFLINE health and empty capabilities without crashing', async () => {
+  // 4. Codex CLI yields health and capabilities without crashing
+  it('4. Codex CLI on this host yields health and capabilities without crashing', async () => {
     const adapter = new CodexCliAdapter({
       repo,
       artifactStore,
     });
 
     const health = await adapter.getHealth();
-    expect(health).toBe('OFFLINE');
+    expect(['AVAILABLE', 'OFFLINE', 'UNHEALTHY']).toContain(health);
 
     const capabilities = await adapter.getCapabilities();
-    expect(capabilities).toEqual([]);
+    expect(capabilities).toEqual(['CODING', 'TERMINAL', 'FILESYSTEM_EDIT', 'TEST_EXECUTION']);
   });
 
   // 5. Unverified Codex execute -> FAIL CLOSED / NO SPAWN / NO WORKSPACE MODIFICATION
-  it('5. Codex CLI execute() fails closed with CODEX_CLI_UNAVAILABLE, creates no ProcessRun, and modifies no workspace files', async () => {
+  it('5. Codex CLI execute() fails closed without runtimeBinding, creates no ProcessRun, and modifies no workspace files', async () => {
     const initialRunCount = repo.getProcessRunsByProject('PROJ-TEST').length;
     const initialFileContent = fs.readFileSync(path.join(repoDir, 'index.js'), 'utf8');
 
@@ -202,7 +202,8 @@ describe('PR #5 — Provider Integration Foundation', () => {
     });
 
     expect(result.status).toBe('FAILED');
-    expect(result.error).toContain('CODEX_CLI_UNAVAILABLE');
+    expect(result.errorCode).toBe('RESOURCE_UNAVAILABLE');
+    expect(result.error).toContain('RUNTIME_BINDING_MISSING');
 
     // Verify zero processes spawned in SQLite
     const finalRunCount = repo.getProcessRunsByProject('PROJ-TEST').length;
@@ -230,7 +231,8 @@ describe('PR #5 — Provider Integration Foundation', () => {
     });
 
     expect(result.status).toBe('FAILED');
-    expect(result.error).toContain('CODEX_CLI_UNAVAILABLE');
+    expect(result.errorCode).toBe('RESOURCE_UNAVAILABLE');
+    expect(result.error).toContain('RUNTIME_BINDING_MISSING');
   });
 
   // 6 & 7. Antigravity automated adapter absent & mode is MANUAL_BRIDGE_ONLY

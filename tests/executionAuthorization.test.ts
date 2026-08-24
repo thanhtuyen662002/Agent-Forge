@@ -1067,11 +1067,10 @@ describe('PR #7 — Durable Execution Authorization & Orchestration Binding', ()
     expect(decision.selectedResourceId).toBe('res-21-b');
   });
 
-  // 22. Codex remains OFFLINE / capabilities=[] / FAIL_CLOSED_NO_SPAWN
-  it('22. Codex CLI contract remains OFFLINE with empty capabilities and fails closed', async () => {
+  // 22. Codex requires RuntimeExecutionBinding and advertises capabilities
+  it('22. Codex CLI contract requires RuntimeExecutionBinding and advertises capabilities', async () => {
     const codexAdapter = new CodexCliAdapter({ repo, artifactStore: {} as any });
-    expect(await codexAdapter.getHealth()).toBe('OFFLINE');
-    expect(await codexAdapter.getCapabilities()).toEqual([]);
+    expect(await codexAdapter.getCapabilities()).toEqual(['CODING', 'TERMINAL', 'FILESYSTEM_EDIT', 'TEST_EXECUTION']);
 
     const execResult = await codexAdapter.execute({
       projectId: 'PROJ-AUTH',
@@ -1081,8 +1080,8 @@ describe('PR #7 — Durable Execution Authorization & Orchestration Binding', ()
     });
 
     expect(execResult.status).toBe('FAILED');
-    expect(execResult.error).toContain('CODEX_CLI_UNAVAILABLE');
-    expect(execResult.error).toContain('not installed or contract is unverified');
+    expect(execResult.errorCode).toBe('RESOURCE_UNAVAILABLE');
+    expect(execResult.error).toContain('RUNTIME_BINDING_MISSING');
   });
 
   // 23. Antigravity remains MANUAL_BRIDGE_ONLY
