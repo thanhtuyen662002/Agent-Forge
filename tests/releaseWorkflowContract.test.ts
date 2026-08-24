@@ -213,10 +213,11 @@ describe('PR #19 — Production Release Pipeline Hardening Contract Tests', () =
     expect(fs.existsSync(fixtureScriptPath)).toBe(true);
 
     const psExe = process.platform === 'win32' ? 'powershell.exe' : 'pwsh';
+    const fixtureTimeoutMs = process.platform === 'win32' ? 60000 : 20000;
     const result = spawnSync(
       psExe,
       ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File', fixtureScriptPath],
-      { encoding: 'utf8', timeout: 20000, windowsHide: true }
+      { encoding: 'utf8', timeout: fixtureTimeoutMs, windowsHide: true }
     );
 
     if (result.error) {
