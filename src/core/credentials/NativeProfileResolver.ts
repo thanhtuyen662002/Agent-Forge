@@ -33,8 +33,19 @@ export class NativeProfileResolver {
 
   constructor(options: NativeProfileResolverOptions = {}) {
     this.#homeDir = options.homeDir ?? os.homedir();
-    this.#baseProfilesDir =
-      options.baseProfilesDir ?? path.join(this.#homeDir, '.agentforge', 'profiles');
+    if (options.baseProfilesDir) {
+      this.#baseProfilesDir = options.baseProfilesDir;
+    } else if (process.platform === 'win32') {
+      const localAppData = process.env.LOCALAPPDATA;
+      if (!localAppData || localAppData.trim() === '') {
+        throw new Error(
+          '[NativeProfileResolver] NATIVE_PROFILE_ROOT_UNAVAILABLE: LOCALAPPDATA environment variable is missing or blank on Windows.'
+        );
+      }
+      this.#baseProfilesDir = path.join(localAppData.trim(), 'AgentForge', 'profiles');
+    } else {
+      this.#baseProfilesDir = path.join(this.#homeDir, '.agentforge', 'profiles');
+    }
   }
 
   /**
@@ -71,9 +82,9 @@ export class NativeProfileResolver {
           },
           profileDirectory: profileDir,
           configurationStatus: 'DOCUMENTED_SUPPORTED',
-          runtimeIsolationStatus: 'PENDING_R5D',
+          runtimeIsolationStatus: 'VERIFIED',
           notes:
-            'Codex CLI configuration mapping via CODEX_HOME. Multi-profile runtime isolation pending R5D proof.',
+            'Codex CLI configuration mapping via CODEX_HOME. Multi-profile runtime isolation verified in R5D.',
         };
       }
 
@@ -88,9 +99,9 @@ export class NativeProfileResolver {
           },
           profileDirectory: profileDir,
           configurationStatus: 'DOCUMENTED_SUPPORTED',
-          runtimeIsolationStatus: 'PENDING_R5D',
+          runtimeIsolationStatus: 'VERIFIED',
           notes:
-            'Gemini CLI configuration mapping via GEMINI_CLI_HOME. Multi-profile runtime isolation pending R5D proof.',
+            'Gemini CLI configuration mapping via GEMINI_CLI_HOME. Multi-profile runtime isolation verified in R5D. Live runtime execution blocked by UNSUPPORTED_CLIENT.',
         };
       }
 
