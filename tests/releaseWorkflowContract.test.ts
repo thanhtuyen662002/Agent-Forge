@@ -208,31 +208,35 @@ describe('PR #19 — Production Release Pipeline Hardening Contract Tests', () =
     expect(posAddRelease).toBeGreaterThan(posTagNameCheck);
   });
 
-  it('13. semantic release collision fixture test suite executes and passes all 15 cases', () => {
-    const fixtureScriptPath = path.join(projectRoot, 'tests/fixtures/test-release-collision-fixtures.ps1');
-    expect(fs.existsSync(fixtureScriptPath)).toBe(true);
+  it(
+    '13. semantic release collision fixture test suite executes and passes all 15 cases',
+    () => {
+      const fixtureScriptPath = path.join(projectRoot, 'tests/fixtures/test-release-collision-fixtures.ps1');
+      expect(fs.existsSync(fixtureScriptPath)).toBe(true);
 
-    const psExe = process.platform === 'win32' ? 'powershell.exe' : 'pwsh';
-    const fixtureTimeoutMs = process.platform === 'win32' ? 60000 : 20000;
-    const result = spawnSync(
-      psExe,
-      ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File', fixtureScriptPath],
-      { encoding: 'utf8', timeout: fixtureTimeoutMs, windowsHide: true }
-    );
+      const psExe = process.platform === 'win32' ? 'powershell.exe' : 'pwsh';
+      const fixtureTimeoutMs = process.platform === 'win32' ? 60000 : 20000;
+      const result = spawnSync(
+        psExe,
+        ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File', fixtureScriptPath],
+        { encoding: 'utf8', timeout: fixtureTimeoutMs, windowsHide: true }
+      );
 
-    if (result.error) {
-      throw result.error;
-    }
-    expect(result.status).toBe(0);
-    const output = result.stdout || '';
-    expect(output).toMatch(/COLLISION_FIXTURE_TEST_COUNT:\s*15/);
-    expect(output).toMatch(/COLLISION_FIXTURE_TEST_PASS_COUNT:\s*15/);
-    expect(output).toMatch(/PASS:\s*CASE A - ZERO RELEASES/);
-    expect(output).toMatch(/PASS:\s*CASE J - NULL PAGE/);
-    expect(output).toMatch(/PASS:\s*CASE K - NULL RELEASE RECORD/);
-    expect(output).toMatch(/PASS:\s*CASE L - SCALAR RELEASE RECORD/);
-    expect(output).toMatch(/PASS:\s*CASE M - RECORD MISSING TAG_NAME/);
-    expect(output).toMatch(/PASS:\s*CASE N - EMPTY TAG_NAME/);
-    expect(output).toMatch(/PASS:\s*CASE O - NULL NAME IS VALID/);
-  });
+      if (result.error) {
+        throw result.error;
+      }
+      expect(result.status).toBe(0);
+      const output = result.stdout || '';
+      expect(output).toMatch(/COLLISION_FIXTURE_TEST_COUNT:\s*15/);
+      expect(output).toMatch(/COLLISION_FIXTURE_TEST_PASS_COUNT:\s*15/);
+      expect(output).toMatch(/PASS:\s*CASE A - ZERO RELEASES/);
+      expect(output).toMatch(/PASS:\s*CASE J - NULL PAGE/);
+      expect(output).toMatch(/PASS:\s*CASE K - NULL RELEASE RECORD/);
+      expect(output).toMatch(/PASS:\s*CASE L - SCALAR RELEASE RECORD/);
+      expect(output).toMatch(/PASS:\s*CASE M - RECORD MISSING TAG_NAME/);
+      expect(output).toMatch(/PASS:\s*CASE N - EMPTY TAG_NAME/);
+      expect(output).toMatch(/PASS:\s*CASE O - NULL NAME IS VALID/);
+    },
+    process.platform === 'win32' ? 75000 : 30000
+  );
 });
