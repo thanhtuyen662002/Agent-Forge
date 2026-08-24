@@ -59,6 +59,10 @@ import {
   computeManifestPayloadAndHash,
   assertConsistentAttemptBindings,
 } from '../context/ContextIntegrity';
+import {
+  parseCredentialRef,
+  parseNativeProfileRef,
+} from '../credentials';
 
 export class Repository {
   constructor(private db: Database.Database) {}
@@ -1574,6 +1578,38 @@ export class Repository {
   // Provider Accounts (R5A)
   // ==========================================
   public createProviderAccount(account: ProviderAccount): void {
+    const provider = this.getProvider(account.provider_id);
+    if (!provider) {
+      throw new Error(`[Repository] createProviderAccount failed: Provider "${account.provider_id}" not found.`);
+    }
+
+    const hasWincred = account.credential_ref?.startsWith('wincred://');
+    const hasNativeProf = account.profile_ref?.startsWith('native-profile://');
+
+    if (hasWincred && hasNativeProf) {
+      throw new Error(
+        `[Repository] createProviderAccount failed: contradictory references (cannot have both wincred credential_ref and native-profile profile_ref).`
+      );
+    }
+
+    if (hasWincred) {
+      parseCredentialRef(account.credential_ref!);
+      if (account.auth_mode === 'NATIVE_PROFILE') {
+        throw new Error(
+          `[Repository] createProviderAccount failed: auth_mode "NATIVE_PROFILE" cannot have a wincred credential_ref.`
+        );
+      }
+    }
+
+    if (hasNativeProf) {
+      parseNativeProfileRef(account.profile_ref!);
+      if (account.auth_mode === 'API_CREDENTIAL') {
+        throw new Error(
+          `[Repository] createProviderAccount failed: auth_mode "API_CREDENTIAL" cannot have a native-profile profile_ref.`
+        );
+      }
+    }
+
     this.db
       .prepare(`
         INSERT INTO provider_accounts (
@@ -1649,6 +1685,37 @@ export class Repository {
   ): void {
     const existing = this.getProviderAccount(id);
     if (!existing) return;
+
+    const mergedAuthMode = updates.auth_mode ?? existing.auth_mode;
+    const mergedCredRef = updates.credential_ref !== undefined ? updates.credential_ref : existing.credential_ref;
+    const mergedProfRef = updates.profile_ref !== undefined ? updates.profile_ref : existing.profile_ref;
+
+    const hasWincred = mergedCredRef?.startsWith('wincred://');
+    const hasNativeProf = mergedProfRef?.startsWith('native-profile://');
+
+    if (hasWincred && hasNativeProf) {
+      throw new Error(
+        `[Repository] updateProviderAccount failed: contradictory references (cannot have both wincred credential_ref and native-profile profile_ref).`
+      );
+    }
+
+    if (hasWincred) {
+      parseCredentialRef(mergedCredRef!);
+      if (mergedAuthMode === 'NATIVE_PROFILE') {
+        throw new Error(
+          `[Repository] updateProviderAccount failed: auth_mode "NATIVE_PROFILE" cannot have a wincred credential_ref.`
+        );
+      }
+    }
+
+    if (hasNativeProf) {
+      parseNativeProfileRef(mergedProfRef!);
+      if (mergedAuthMode === 'API_CREDENTIAL') {
+        throw new Error(
+          `[Repository] updateProviderAccount failed: auth_mode "API_CREDENTIAL" cannot have a native-profile profile_ref.`
+        );
+      }
+    }
 
     this.db
       .prepare(`

@@ -182,13 +182,65 @@ Deterministic, provider-neutral context aggregation compiler:
 
 ---
 
-## 7. Next Gates (Authoritative R5-v1.1 Roadmap)
+## 7. R5C Local Account & Credential Fabric Architecture
+
+### 1. Executive Principle & Token Ownership
+
+> [!IMPORTANT]
+> **AGENTFORGE SHOULD PREFER SPAWNING A PROVIDER'S NATIVE CLI UNDER ITS SELECTED PROFILE RATHER THAN COPYING OR EXTRACTING THE PROVIDER'S OAUTH TOKENS.**
+
+The R5C Local Account & Credential Fabric implements a strict security boundary ensuring that zero plaintext secrets enter SQLite persistence:
+
+$$\text{ROLE} \neq \text{AGENT PROFILE} \neq \text{PROVIDER} \neq \text{MODEL RESOURCE} \neq \text{PROVIDER ACCOUNT} \neq \text{CREDENTIAL} \neq \text{NATIVE PROFILE} \neq \text{SESSION / WORKER SLOT}$$
+
+### 2. SQLite vs Secure Store Ownership
+
+- **SQLite Persistence**: Stores only opaque, non-sensitive reference pointers (`credential_ref` such as `wincred://agentforge/openai/api-01` or `profile_ref` such as `native-profile://codex/c01`). Zero API keys, passwords, bearer tokens, session cookies, or OAuth secrets are stored in SQLite database rows.
+- **Windows Credential Manager (Production)**: Stores secret payloads under current-user scope via Win32 `advapi32.dll` generic credentials in the `AgentForge:` namespace. Secrets are piped via standard input to ensure no secret payload appears in process command-line arguments, environment logs, or task telemetry.
+- **In-Memory Credential Store (Testing & CI)**: Pure in-memory dependency injection fake for hermetic automated tests and non-Windows CI runners.
+
+### 3. CredentialRef Lifecycle
+
+```
+[User / Config] -> [CredentialStore.put(ref, secret)] -> [Windows Credential Manager]
+                               |
+                        [credential_ref URI]
+                               |
+                               v
+                     [provider_accounts table] (SQLite: stores opaque URI only)
+```
+
+1. **Parse & Validate**: Scheme-aware parser (`wincred://<target>`) enforces format hygiene and path-traversal prevention.
+2. **Safe Serialization**: `CredentialRef.toString()` and `toSafeString()` contain only pointer metadata.
+3. **Fail-Closed Resolution**: Plaintext retrieval requires explicit `CredentialStore.get(ref)` returning a `SecretValue` wrapper whose `toString()`, `toJSON()`, and inspection hooks return `[REDACTED_SECRET]`.
+
+### 4. NativeProfileRef & Resolver Lifecycle
+
+```
+[NativeProfileRef (native-profile://codex/c01)]
+           |
+           v
+[NativeProfileResolver] -> [Environment Overrides & Profile Dirs]
+                           (e.g., CODEX_HOME, GEMINI_CLI_HOME, CLAUDE_CONFIG_DIR)
+                           * Never reads, inspects, or copies OAuth tokens *
+```
+
+1. **Format**: `native-profile://<provider>/<profileId>` (e.g. `native-profile://gemini/g01`).
+2. **Resolution Contracts**:
+   - **Codex**: Sets `CODEX_HOME` (`isolationStatus: VERIFIED`).
+   - **Gemini**: Sets `GEMINI_CLI_HOME` (`isolationStatus: VERIFIED`).
+   - **Claude**: Sets `CLAUDE_CONFIG_DIR` (`isolationStatus: EXPERIMENTAL_UNPROVEN`).
+3. **R5D Verification Boundary**: Claude Code profile isolation remains categorized as `EXPERIMENTAL_UNPROVEN` until R5D native execution proof proves runtime isolation behavior.
+
+---
+
+## 8. Next Gates (Authoritative R5-v1.1 Roadmap)
 
 The R5 planning sequence is governed by the authoritative R5-v1.1 roadmap:
 
 - **R5A — Role-Agnostic Domain Foundation** `[CLOSED_SUCCESSFULLY]`: Durable entity separation (`ROLE != PROFILE != PROVIDER != RESOURCE != ACCOUNT != SLOT`), schema migrations, relational provenance validation.
-- **R5B — Durable Memory & Context Fabric** `[CURRENT GATE]`: Local structured task/project memory, versioned context snapshots, manifest hashing, deterministic context builders.
-- **R5C — Local Account & Credential Fabric**: Secure credential references, Windows Credential Manager integration, profile resolvers.
+- **R5B — Durable Memory & Context Fabric** `[CLOSED_SUCCESSFULLY]`: Local structured task/project memory, versioned context snapshots, manifest hashing, deterministic context builders.
+- **R5C — Local Account & Credential Fabric** `[CURRENT GATE]`: Secure credential references, Windows Credential Manager integration, profile resolvers, zero plaintext in SQLite.
 - **R5D — Native Multi-Profile Execution Proof**: Multi-profile isolation and authentication validation across distinct provider accounts.
 - **R5E — Role-Aware Router & Separation Policy**: Capability matching, conflict-of-interest enforcement (reviewer != coder), affinity policies.
 - **R5F — Production CLI Runtime Adapters**: Live runtime execution bridges for Codex, Gemini, Claude, and Manual Bridge.
