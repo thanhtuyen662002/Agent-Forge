@@ -1,3 +1,11 @@
+$hasNoEnumerate = $false
+try {
+  $cmd = Get-Command ConvertFrom-Json -ErrorAction SilentlyContinue
+  if ($null -ne $cmd -and $cmd.Parameters.ContainsKey('NoEnumerate')) {
+    $hasNoEnumerate = $true
+  }
+} catch {}
+
 function Test-ReleaseCollisionJson([string]$rawJson, [string]$canonicalTag = "v0.1.0", [string]$normalizedVersion = "0.1.0") {
   if ([string]::IsNullOrWhiteSpace($rawJson)) {
     return @{ Success = $false; Error = "EMPTY_OUTPUT" }
@@ -5,11 +13,10 @@ function Test-ReleaseCollisionJson([string]$rawJson, [string]$canonicalTag = "v0
 
   $pages = $null
   try {
-    $cmd = Get-Command ConvertFrom-Json
-    if ($cmd.Parameters.ContainsKey('NoEnumerate')) {
-      $pages = ConvertFrom-Json -InputObject $rawJson -NoEnumerate
+    if ($hasNoEnumerate) {
+      $pages = ConvertFrom-Json -InputObject $rawJson -NoEnumerate -ErrorAction Stop
     } else {
-      $pages = ConvertFrom-Json -InputObject $rawJson
+      $pages = ConvertFrom-Json -InputObject $rawJson -ErrorAction Stop
     }
   } catch {
     return @{ Success = $false; Error = "PARSE_FAILURE: $_" }

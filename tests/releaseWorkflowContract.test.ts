@@ -1,7 +1,7 @@
 import { describe, it, expect } from 'vitest';
 import * as fs from 'fs';
 import * as path from 'path';
-import { execSync } from 'child_process';
+import { spawnSync } from 'child_process';
 
 describe('PR #19 — Production Release Pipeline Hardening Contract Tests', () => {
   const projectRoot = path.resolve(__dirname, '..');
@@ -213,10 +213,17 @@ describe('PR #19 — Production Release Pipeline Hardening Contract Tests', () =
     expect(fs.existsSync(fixtureScriptPath)).toBe(true);
 
     const psExe = process.platform === 'win32' ? 'powershell.exe' : 'pwsh';
-    const output = execSync(
-      `"${psExe}" -NoProfile -NonInteractive -ExecutionPolicy Bypass -File "${fixtureScriptPath}"`,
-      { encoding: 'utf8', timeout: 20000, windowsHide: true }
+    const result = spawnSync(
+      psExe,
+      ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File', fixtureScriptPath],
+      { encoding: 'utf8', windowsHide: true }
     );
+
+    if (result.error) {
+      throw result.error;
+    }
+    expect(result.status).toBe(0);
+    const output = result.stdout || '';
     expect(output).toMatch(/COLLISION_FIXTURE_TEST_COUNT:\s*15/);
     expect(output).toMatch(/COLLISION_FIXTURE_TEST_PASS_COUNT:\s*15/);
     expect(output).toMatch(/PASS:\s*CASE A - ZERO RELEASES/);
