@@ -212,8 +212,11 @@ describe('PR #19 — Production Release Pipeline Hardening Contract Tests', () =
     const fixtureScriptPath = path.join(projectRoot, 'tests/fixtures/test-release-collision-fixtures.ps1');
     expect(fs.existsSync(fixtureScriptPath)).toBe(true);
 
-    const psExe = process.platform === 'win32' ? 'powershell' : 'pwsh';
-    const output = execSync(`${psExe} -File "${fixtureScriptPath}"`, { encoding: 'utf8' });
+    const psExe = process.platform === 'win32' ? 'powershell.exe' : 'pwsh';
+    const output = execSync(
+      `"${psExe}" -NoProfile -NonInteractive -ExecutionPolicy Bypass -File "${fixtureScriptPath}"`,
+      { encoding: 'utf8', timeout: 20000, windowsHide: true }
+    );
     expect(output).toMatch(/COLLISION_FIXTURE_TEST_COUNT:\s*15/);
     expect(output).toMatch(/COLLISION_FIXTURE_TEST_PASS_COUNT:\s*15/);
     expect(output).toMatch(/PASS:\s*CASE A - ZERO RELEASES/);
