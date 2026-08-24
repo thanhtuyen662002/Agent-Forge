@@ -229,10 +229,11 @@ export abstract class LocalCliAdapterBase implements ProviderAdapter {
     });
 
     // 7. Map cancellation truthfully
-    if (processResult.cancelled) {
+    if (processResult.cancelled || processResult.errorCode === 'CANCELLED') {
       return {
         executionId: processResult.executionId,
         status: 'CANCELLED',
+        errorCode: 'CANCELLED',
         rawResponse: processResult.stdout,
         error: 'Execution was cancelled.',
         stdoutEvidenceId: processResult.stdoutEvidenceId,
@@ -240,13 +241,38 @@ export abstract class LocalCliAdapterBase implements ProviderAdapter {
       };
     }
 
-    // 8. Map timeout / nonzero process exit truthfully
-    if (processResult.timedOut) {
+    // 8. Map timeout / output limit / nonzero process exit truthfully
+    if (processResult.timedOut || processResult.errorCode === 'TIMEOUT') {
       return {
         executionId: processResult.executionId,
         status: 'FAILED',
+        errorCode: 'TIMEOUT',
         rawResponse: processResult.stdout,
         error: `Process timed out after ${this.timeoutMs}ms.`,
+        stdoutEvidenceId: processResult.stdoutEvidenceId,
+        stderrEvidenceId: processResult.stderrEvidenceId,
+      };
+    }
+
+    if (processResult.outputLimitExceeded || processResult.errorCode === 'OUTPUT_LIMIT_EXCEEDED') {
+      return {
+        executionId: processResult.executionId,
+        status: 'FAILED',
+        errorCode: 'OUTPUT_LIMIT_EXCEEDED',
+        rawResponse: processResult.stdout,
+        error: 'Process output limit exceeded.',
+        stdoutEvidenceId: processResult.stdoutEvidenceId,
+        stderrEvidenceId: processResult.stderrEvidenceId,
+      };
+    }
+
+    if (processResult.errorCode === 'PROCESS_LAUNCH_FAILED') {
+      return {
+        executionId: processResult.executionId,
+        status: 'FAILED',
+        errorCode: 'PROCESS_LAUNCH_FAILED',
+        rawResponse: processResult.stdout,
+        error: processResult.stderr || 'Failed to launch process.',
         stdoutEvidenceId: processResult.stdoutEvidenceId,
         stderrEvidenceId: processResult.stderrEvidenceId,
       };
@@ -256,6 +282,7 @@ export abstract class LocalCliAdapterBase implements ProviderAdapter {
       return {
         executionId: processResult.executionId,
         status: 'FAILED',
+        errorCode: 'NONZERO_EXIT',
         rawResponse: processResult.stdout,
         error: processResult.stderr || `Process exited with code ${processResult.exitCode}`,
         stdoutEvidenceId: processResult.stdoutEvidenceId,
@@ -281,6 +308,7 @@ export abstract class LocalCliAdapterBase implements ProviderAdapter {
     return {
       executionId: processResult.executionId,
       status: 'FAILED',
+      errorCode: 'PROTOCOL_INVALID',
       rawResponse: processResult.stdout,
       error: `PROTOCOL_INVALID: Process completed with exit code 0, but stdout did not contain a valid CoderReport protocol payload (${parseResult.error || 'protocol missing'}).`,
       stdoutEvidenceId: processResult.stdoutEvidenceId,
