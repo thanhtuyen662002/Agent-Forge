@@ -14,7 +14,7 @@ describe('Database Migrations & Upgrade Integrity', () => {
     db.close();
   });
 
-  it('should run all migrations cleanly and create all tables (v1 through v8)', () => {
+  it('should run all migrations cleanly and create all tables (v1 through v9)', () => {
     MigrationRunner.run(db);
 
     const tables = db
@@ -42,10 +42,17 @@ describe('Database Migrations & Upgrade Integrity', () => {
     expect(tableNames).toContain('account_leases');
     expect(tableNames).toContain('route_policies');
     expect(tableNames).toContain('separation_policies');
+    expect(tableNames).toContain('agent_sessions');
+    expect(tableNames).toContain('project_memories');
+    expect(tableNames).toContain('task_memories');
+    expect(tableNames).toContain('context_snapshots');
+    expect(tableNames).toContain('context_items');
+    expect(tableNames).toContain('context_manifests');
+    expect(tableNames).toContain('handoff_contexts');
     expect(tableNames).toContain('schema_migrations');
 
     const applied = db.prepare('SELECT COUNT(*) as count FROM schema_migrations').get() as { count: number };
-    expect(applied.count).toBe(8);
+    expect(applied.count).toBe(9);
 
     // Foreign key integrity check
     const fkViolations = db.prepare('PRAGMA foreign_key_check').all();
@@ -54,10 +61,10 @@ describe('Database Migrations & Upgrade Integrity', () => {
     // Idempotency check: running MigrationRunner again applies 0 new migrations
     MigrationRunner.run(db);
     const appliedAgain = db.prepare('SELECT COUNT(*) as count FROM schema_migrations').get() as { count: number };
-    expect(appliedAgain.count).toBe(8);
+    expect(appliedAgain.count).toBe(9);
   });
 
-  it('should cleanly upgrade an existing database through historical path (v1 -> v2 -> original v3 -> v4 -> v5 -> v6 -> v7 -> v8) and repair default agent links', () => {
+  it('should cleanly upgrade an existing database through historical path (v1 -> v2 -> original v3 -> v4 -> v5 -> v6 -> v7 -> v8 -> v9) and repair default agent links', () => {
     // 1. Manually apply v1 schema
     db.exec(`
       CREATE TABLE IF NOT EXISTS schema_migrations (
@@ -105,26 +112,33 @@ describe('Database Migrations & Upgrade Integrity', () => {
     const mgrBefore = db.prepare('SELECT * FROM agents WHERE id = ?').get('agent-primary-manager') as any;
     expect(mgrBefore.provider_resource_id).toBe('res-chatgpt-manager');
 
-    // 2. Run MigrationRunner to upgrade from v1 to latest (v8)
+    // 2. Run MigrationRunner to upgrade from v1 to latest (v9)
     MigrationRunner.run(db);
 
     // 3. Assert migrations applied
-    const v8Tables = (db.prepare("SELECT name FROM sqlite_master WHERE type='table'").all() as { name: string }[]).map((t) => t.name);
-    expect(v8Tables).toContain('verification_commands');
-    expect(v8Tables).toContain('provider_resources');
-    expect(v8Tables).toContain('process_runs');
-    expect(v8Tables).toContain('execution_authorizations');
-    expect(v8Tables).toContain('role_profiles');
-    expect(v8Tables).toContain('agent_profiles');
-    expect(v8Tables).toContain('provider_accounts');
-    expect(v8Tables).toContain('worker_slots');
-    expect(v8Tables).toContain('agent_assignments');
-    expect(v8Tables).toContain('account_leases');
-    expect(v8Tables).toContain('route_policies');
-    expect(v8Tables).toContain('separation_policies');
+    const v9Tables = (db.prepare("SELECT name FROM sqlite_master WHERE type='table'").all() as { name: string }[]).map((t) => t.name);
+    expect(v9Tables).toContain('verification_commands');
+    expect(v9Tables).toContain('provider_resources');
+    expect(v9Tables).toContain('process_runs');
+    expect(v9Tables).toContain('execution_authorizations');
+    expect(v9Tables).toContain('role_profiles');
+    expect(v9Tables).toContain('agent_profiles');
+    expect(v9Tables).toContain('provider_accounts');
+    expect(v9Tables).toContain('worker_slots');
+    expect(v9Tables).toContain('agent_assignments');
+    expect(v9Tables).toContain('account_leases');
+    expect(v9Tables).toContain('route_policies');
+    expect(v9Tables).toContain('separation_policies');
+    expect(v9Tables).toContain('agent_sessions');
+    expect(v9Tables).toContain('project_memories');
+    expect(v9Tables).toContain('task_memories');
+    expect(v9Tables).toContain('context_snapshots');
+    expect(v9Tables).toContain('context_items');
+    expect(v9Tables).toContain('context_manifests');
+    expect(v9Tables).toContain('handoff_contexts');
 
     const migrationCount = (db.prepare('SELECT COUNT(*) as count FROM schema_migrations').get() as { count: number }).count;
-    expect(migrationCount).toBe(8);
+    expect(migrationCount).toBe(9);
 
     // 4. Assert default agent links are repaired by migration 005
     const mgrAfter = db.prepare('SELECT * FROM agents WHERE id = ?').get('agent-primary-manager') as any;

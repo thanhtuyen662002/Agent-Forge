@@ -11,6 +11,7 @@ import {
   TaskState,
 } from '../types/domain';
 import { ManagerProtocol } from '../types/protocols';
+import { sanitizeContextFiles, verifyContextManifestIntegrity } from '../context/ContextIntegrity';
 
 export interface CreateAuthorizationParams {
   projectId: string;
@@ -18,6 +19,7 @@ export interface CreateAuthorizationParams {
   attemptId?: string | null;
   routingDecisionId: string;
   contextFiles?: string[];
+  contextManifestId?: string | null;
 }
 
 // =========================================================================
@@ -186,62 +188,7 @@ export function computeContextManifestHash(contextFiles: string[]): string {
   return crypto.createHash('sha256').update(serialized, 'utf8').digest('hex');
 }
 
-export function sanitizeContextFiles(
-  contextFiles: string[] = [],
-  repositoryRoot: string
-): { validFiles: string[]; error?: string } {
-  const seen = new Set<string>();
-  const validFiles: string[] = [];
-
-  for (const rawPath of contextFiles) {
-    if (typeof rawPath !== 'string' || rawPath.trim() === '') {
-      continue;
-    }
-    const trimmed = rawPath.trim();
-
-    // Reject absolute paths
-    if (path.isAbsolute(trimmed)) {
-      return {
-        validFiles: [],
-        error: `CONTEXT_PATH_INVALID: Context path "${trimmed}" must be relative to repository root.`,
-      };
-    }
-
-    // Reject directory traversal
-    if (
-      trimmed.startsWith('..') ||
-      trimmed.includes('../') ||
-      trimmed.includes('..\\') ||
-      trimmed.split(/[\\/]/).includes('..')
-    ) {
-      return {
-        validFiles: [],
-        error: `CONTEXT_PATH_TRAVERSAL: Context path "${trimmed}" violates path containment.`,
-      };
-    }
-
-    // Check against PolicyService path access
-    const resolvedPath = path.join(repositoryRoot, trimmed);
-    const policyResult = PolicyService.evaluatePathAccess(resolvedPath, repositoryRoot, false);
-    if (!policyResult.allowed) {
-      return {
-        validFiles: [],
-        error: `CONTEXT_PATH_DENIED: Context path "${trimmed}" rejected: ${policyResult.reason}`,
-      };
-    }
-
-    // Canonicalize separators to '/'
-    const canonicalRel = trimmed.split(/[\\/]/).join('/');
-    if (!seen.has(canonicalRel)) {
-      seen.add(canonicalRel);
-      validFiles.push(canonicalRel);
-    }
-  }
-
-  // Sort deterministically
-  validFiles.sort();
-  return { validFiles };
-}
+export { sanitizeContextFiles } from '../context/ContextIntegrity';
 
 export class ExecutionAuthorizationService {
   constructor(
@@ -439,14 +386,43 @@ export class ExecutionAuthorizationService {
     }
     const repositoryHeadSha = gitHeadResult.sha;
 
-    // 7. Context File Manifest Validation & Canonicalization
+    // 7. Context File Manifest Validation & Canonicalization (with R5B Durable ContextManifest support)
     const sanitizeResult = sanitizeContextFiles(params.contextFiles, project.repository_path);
     if (sanitizeResult.error) {
       this.recordRejectionEvent(params, sanitizeResult.error);
       throw new Error(`EXECUTION_AUTHORIZATION_FAILED: ${sanitizeResult.error}`);
     }
     const canonicalContextFiles = sanitizeResult.validFiles;
-    const contextManifestHash = computeContextManifestHash(canonicalContextFiles);
+
+    let contextManifestHash = computeContextManifestHash(canonicalContextFiles);
+
+    if (params.contextManifestId) {
+      const integrityResult = verifyContextManifestIntegrity(this.repo, params.contextManifestId);
+      if (!integrityResult.valid) {
+        const reason = `EXECUTION_AUTHORIZATION_MANIFEST_INTEGRITY_FAILED: ${integrityResult.error}`;
+        this.recordRejectionEvent(params, reason);
+        throw new Error(`EXECUTION_AUTHORIZATION_FAILED: ${reason}`);
+      }
+
+      const durableManifest = integrityResult.manifest!;
+      const snapshot = integrityResult.snapshot!;
+
+      if (snapshot.project_id !== params.projectId || snapshot.task_id !== params.taskId) {
+        const reason = `EXECUTION_AUTHORIZATION_MANIFEST_MISMATCH: ContextManifest "${params.contextManifestId}" belongs to project "${snapshot.project_id}" / task "${snapshot.task_id}", expected project "${params.projectId}" / task "${params.taskId}".`;
+        this.recordRejectionEvent(params, reason);
+        throw new Error(`EXECUTION_AUTHORIZATION_FAILED: ${reason}`);
+      }
+
+      const snapshotAttempt = snapshot.attempt_id ?? null;
+      const authAttempt = normalizedAttemptId ?? null;
+      if (snapshotAttempt !== authAttempt) {
+        const reason = `EXECUTION_AUTHORIZATION_MANIFEST_MISMATCH: ContextManifest "${params.contextManifestId}" attempt binding "${snapshotAttempt}" does not match authorization attempt "${authAttempt}".`;
+        this.recordRejectionEvent(params, reason);
+        throw new Error(`EXECUTION_AUTHORIZATION_FAILED: ${reason}`);
+      }
+
+      contextManifestHash = durableManifest.manifest_hash;
+    }
 
     // 8. Canonical Execution Instructions & Verification Snapshot Derived from Manager, Task, & Project Truth
     const canonicalInstructions = buildCanonicalInstructions(task, managerData);

@@ -695,3 +695,171 @@ export interface SeparationPolicy {
   created_at: string;
   updated_at: string;
 }
+
+// ==========================================
+// 4. R5B Durable Memory & Context Fabric Entities
+// ==========================================
+
+export const AgentSessionStatusEnum = z.enum([
+  'ACTIVE',
+  'ENDED',
+  'FAILED',
+  'SUSPENDED',
+]);
+export type AgentSessionStatus = z.infer<typeof AgentSessionStatusEnum>;
+
+export interface AgentSession {
+  id: string;
+  project_id: string;
+  task_id: string;
+  attempt_id: string | null;
+  assignment_id: string | null;
+  provider_id: string | null;
+  provider_account_id: string | null;
+  provider_resource_id: string | null;
+  external_session_ref: string | null;
+  status: AgentSessionStatus;
+  started_at: string;
+  ended_at: string | null;
+  created_at: string;
+  updated_at: string;
+}
+
+export const ProjectMemoryTypeEnum = z.enum([
+  'ARCHITECTURE',
+  'OWNER_POLICY',
+  'CONSTRAINT',
+  'DECISION',
+  'CONVENTION',
+  'REPOSITORY_FACT',
+  'CUSTOM',
+]);
+export type ProjectMemoryType = z.infer<typeof ProjectMemoryTypeEnum>;
+
+export interface ProjectMemory {
+  id: string;
+  project_id: string;
+  memory_type: ProjectMemoryType;
+  key: string;
+  value_json: string;
+  source_type: string;
+  source_ref: string | null;
+  revision: number;
+  is_active: boolean;
+  created_at: string;
+  updated_at: string;
+}
+
+export const TaskMemoryTypeEnum = z.enum([
+  'GOAL',
+  'ACCEPTANCE_CRITERION',
+  'CONSTRAINT',
+  'COMPLETED_STEP',
+  'REMAINING_STEP',
+  'KNOWN_ISSUE',
+  'DECISION',
+  'VERIFICATION_FACT',
+  'RECOMMENDED_NEXT_ACTION',
+  'CUSTOM',
+]);
+export type TaskMemoryType = z.infer<typeof TaskMemoryTypeEnum>;
+
+export interface TaskMemory {
+  id: string;
+  project_id: string;
+  task_id: string;
+  attempt_id: string | null;
+  assignment_id: string | null;
+  memory_type: TaskMemoryType;
+  key: string;
+  value_json: string;
+  source_type: string;
+  source_ref: string | null;
+  revision: number;
+  is_active: boolean;
+  created_at: string;
+  updated_at: string;
+}
+
+export const ContextSnapshotPurposeEnum = z.enum([
+  'EXECUTION',
+  'REVIEW',
+  'HANDOFF',
+  'MANAGER',
+  'RESEARCH',
+  'CUSTOM',
+]);
+export type ContextSnapshotPurpose = z.infer<typeof ContextSnapshotPurposeEnum>;
+
+export interface ContextSnapshot {
+  id: string;
+  project_id: string;
+  task_id: string;
+  attempt_id: string | null;
+  assignment_id: string | null;
+  session_id: string | null;
+  purpose: ContextSnapshotPurpose;
+  snapshot_version: number;
+  builder_version: string;
+  content_hash: string;
+  created_at: string;
+}
+
+export const ContextItemTypeEnum = z.enum([
+  'PROJECT_CONTRACT',
+  'PROJECT_MEMORY',
+  'TASK_CORE',
+  'TASK_MEMORY',
+  'CHECKPOINT',
+  'HANDOFF',
+  'CONTEXT_FILE_REFERENCE',
+  'CUSTOM',
+]);
+export type ContextItemType = z.infer<typeof ContextItemTypeEnum>;
+
+export interface ContextItem {
+  id: string;
+  snapshot_id: string;
+  ordinal: number;
+  item_type: ContextItemType;
+  source_type: string;
+  source_ref: string | null;
+  content_json: string;
+  content_hash: string;
+  token_estimate: number | null;
+  created_at: string;
+}
+
+export interface ContextManifest {
+  id: string;
+  snapshot_id: string;
+  manifest_version: string;
+  item_count: number;
+  manifest_json: string;
+  manifest_hash: string;
+  created_at: string;
+}
+
+export const HandoffContextStatusEnum = z.enum([
+  'PENDING',
+  'READY',
+  'CONSUMED',
+  'FAILED',
+  'CANCELLED',
+]);
+export type HandoffContextStatus = z.infer<typeof HandoffContextStatusEnum>;
+
+export interface HandoffContext {
+  id: string;
+  project_id: string;
+  task_id: string;
+  attempt_id: string | null;
+  from_assignment_id: string | null;
+  to_assignment_id: string | null;
+  source_snapshot_id: string;
+  handoff_snapshot_id: string | null;
+  reason: string;
+  status: HandoffContextStatus;
+  created_at: string;
+  consumed_at: string | null;
+}

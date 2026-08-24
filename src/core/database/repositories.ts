@@ -37,8 +37,28 @@ import {
   AgentAssignmentStatus,
   SeparationAffinity,
   Capability,
-  RiskLevel
+  RiskLevel,
+  AgentSession,
+  AgentSessionStatus,
+  ProjectMemory,
+  ProjectMemoryType,
+  TaskMemory,
+  TaskMemoryType,
+  ContextSnapshot,
+  ContextSnapshotPurpose,
+  ContextItem,
+  ContextItemType,
+  ContextManifest,
+  HandoffContext,
+  HandoffContextStatus
 } from '../types/domain';
+import {
+  computeSha256,
+  canonicalJsonStringify,
+  computeSnapshotContentHash,
+  computeManifestPayloadAndHash,
+  assertConsistentAttemptBindings,
+} from '../context/ContextIntegrity';
 
 export class Repository {
   constructor(private db: Database.Database) {}
@@ -2244,6 +2264,860 @@ export class Repository {
       enabled: Boolean(row.enabled),
       created_at: String(row.created_at),
       updated_at: String(row.updated_at),
+    };
+  }
+
+  // ==========================================
+  // R5B Durable Memory & Context Fabric
+  // ==========================================
+
+  // 1. Agent Sessions
+  public createAgentSession(session: AgentSession): void {
+    const project = this.getProject(session.project_id);
+    if (!project) {
+      throw new Error(`[Repository] createAgentSession failed: Project "${session.project_id}" not found.`);
+    }
+
+    const task = this.getTask(session.task_id);
+    if (!task) {
+      throw new Error(`[Repository] createAgentSession failed: Task "${session.task_id}" not found.`);
+    }
+    if (task.project_id !== session.project_id) {
+      throw new Error(`[Repository] createAgentSession failed: Task "${session.task_id}" belongs to project "${task.project_id}", expected "${session.project_id}".`);
+    }
+
+    if (session.attempt_id) {
+      const attempt = this.getTaskAttempt(session.attempt_id);
+      if (!attempt) {
+        throw new Error(`[Repository] createAgentSession failed: TaskAttempt "${session.attempt_id}" not found.`);
+      }
+      if (attempt.task_id !== session.task_id) {
+        throw new Error(`[Repository] createAgentSession failed: TaskAttempt "${session.attempt_id}" belongs to task "${attempt.task_id}", expected "${session.task_id}".`);
+      }
+    }
+
+    let assignment: AgentAssignment | null = null;
+    if (session.assignment_id) {
+      assignment = this.getAgentAssignment(session.assignment_id);
+      if (!assignment) {
+        throw new Error(`[Repository] createAgentSession failed: AgentAssignment "${session.assignment_id}" not found.`);
+      }
+      if (assignment.task_id !== session.task_id || assignment.project_id !== session.project_id) {
+        throw new Error(`[Repository] createAgentSession failed: AgentAssignment "${session.assignment_id}" does not match project/task.`);
+      }
+      if (session.attempt_id && assignment.attempt_id && session.attempt_id !== assignment.attempt_id) {
+        throw new Error(`[Repository] createAgentSession failed: AgentAssignment attempt "${assignment.attempt_id}" does not match session attempt "${session.attempt_id}".`);
+      }
+    }
+
+    // Provider tuple provenance validation
+    if (session.provider_account_id) {
+      const account = this.getProviderAccount(session.provider_account_id);
+      if (!account) {
+        throw new Error(`[Repository] createAgentSession failed: ProviderAccount "${session.provider_account_id}" not found.`);
+      }
+      if (session.provider_id && account.provider_id !== session.provider_id) {
+        throw new Error(`[Repository] createAgentSession failed: ProviderAccount "${session.provider_account_id}" belongs to provider "${account.provider_id}", expected "${session.provider_id}".`);
+      }
+    }
+
+    if (session.provider_resource_id) {
+      const resource = this.getProviderResource(session.provider_resource_id);
+      if (!resource) {
+        throw new Error(`[Repository] createAgentSession failed: ProviderResource "${session.provider_resource_id}" not found.`);
+      }
+      if (session.provider_id && resource.provider_id !== session.provider_id) {
+        throw new Error(`[Repository] createAgentSession failed: ProviderResource "${session.provider_resource_id}" belongs to provider "${resource.provider_id}", expected "${session.provider_id}".`);
+      }
+      if (session.provider_account_id && resource.provider_account_id && resource.provider_account_id !== session.provider_account_id) {
+        throw new Error(`[Repository] createAgentSession failed: ProviderResource account "${resource.provider_account_id}" does not match session account "${session.provider_account_id}".`);
+      }
+    }
+
+    if (assignment) {
+      if (session.provider_id && session.provider_id !== assignment.selected_provider_id) {
+        throw new Error(`[Repository] createAgentSession failed: Session provider "${session.provider_id}" does not match assignment provider "${assignment.selected_provider_id}".`);
+      }
+      if (session.provider_account_id && session.provider_account_id !== assignment.selected_account_id) {
+        throw new Error(`[Repository] createAgentSession failed: Session account "${session.provider_account_id}" does not match assignment account "${assignment.selected_account_id}".`);
+      }
+      if (session.provider_resource_id && session.provider_resource_id !== assignment.selected_resource_id) {
+        throw new Error(`[Repository] createAgentSession failed: Session resource "${session.provider_resource_id}" does not match assignment resource "${assignment.selected_resource_id}".`);
+      }
+    }
+
+    this.db
+      .prepare(`
+        INSERT INTO agent_sessions (
+          id, project_id, task_id, attempt_id, assignment_id, provider_id,
+          provider_account_id, provider_resource_id, external_session_ref,
+          status, started_at, ended_at, created_at, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      `)
+      .run(
+        session.id,
+        session.project_id,
+        session.task_id,
+        session.attempt_id,
+        session.assignment_id,
+        session.provider_id,
+        session.provider_account_id,
+        session.provider_resource_id,
+        session.external_session_ref,
+        session.status,
+        session.started_at,
+        session.ended_at,
+        session.created_at,
+        session.updated_at
+      );
+  }
+
+  public getAgentSession(id: string): AgentSession | null {
+    const row = this.db.prepare('SELECT * FROM agent_sessions WHERE id = ?').get(id) as Record<string, unknown> | undefined;
+    if (!row) return null;
+    return this.mapAgentSession(row);
+  }
+
+  public getAgentSessionsByTask(taskId: string): AgentSession[] {
+    const rows = this.db
+      .prepare('SELECT * FROM agent_sessions WHERE task_id = ? ORDER BY created_at DESC, rowid DESC')
+      .all(taskId) as Record<string, unknown>[];
+    return rows.map((r) => this.mapAgentSession(r));
+  }
+
+  public getAgentSessionsByProject(projectId: string): AgentSession[] {
+    const rows = this.db
+      .prepare('SELECT * FROM agent_sessions WHERE project_id = ? ORDER BY created_at DESC, rowid DESC')
+      .all(projectId) as Record<string, unknown>[];
+    return rows.map((r) => this.mapAgentSession(r));
+  }
+
+  public updateAgentSessionStatus(id: string, status: AgentSessionStatus, endedAt?: string | null): void {
+    const existing = this.getAgentSession(id);
+    if (!existing) return;
+
+    this.db
+      .prepare('UPDATE agent_sessions SET status = ?, ended_at = ?, updated_at = ? WHERE id = ?')
+      .run(status, endedAt !== undefined ? endedAt : existing.ended_at, new Date().toISOString(), id);
+  }
+
+  private mapAgentSession(row: Record<string, unknown>): AgentSession {
+    return {
+      id: String(row.id),
+      project_id: String(row.project_id),
+      task_id: String(row.task_id),
+      attempt_id: row.attempt_id ? String(row.attempt_id) : null,
+      assignment_id: row.assignment_id ? String(row.assignment_id) : null,
+      provider_id: row.provider_id ? String(row.provider_id) : null,
+      provider_account_id: row.provider_account_id ? String(row.provider_account_id) : null,
+      provider_resource_id: row.provider_resource_id ? String(row.provider_resource_id) : null,
+      external_session_ref: row.external_session_ref ? String(row.external_session_ref) : null,
+      status: row.status as AgentSessionStatus,
+      started_at: String(row.started_at),
+      ended_at: row.ended_at ? String(row.ended_at) : null,
+      created_at: String(row.created_at),
+      updated_at: String(row.updated_at),
+    };
+  }
+
+  // 2. Project Memory
+  public createProjectMemory(memory: ProjectMemory): void {
+    try {
+      JSON.parse(memory.value_json);
+    } catch (e) {
+      throw new Error(`[Repository] createProjectMemory failed: value_json is not valid JSON.`);
+    }
+
+    const project = this.getProject(memory.project_id);
+    if (!project) {
+      throw new Error(`[Repository] createProjectMemory failed: Project "${memory.project_id}" not found.`);
+    }
+
+    this.runInTransaction(() => {
+      const active = this.db
+        .prepare(`
+          SELECT * FROM project_memories
+          WHERE project_id = ? AND memory_type = ? AND key = ? AND is_active = 1
+          ORDER BY revision DESC, rowid DESC LIMIT 1
+        `)
+        .get(memory.project_id, memory.memory_type, memory.key) as Record<string, unknown> | undefined;
+
+      let revision = 1;
+      if (active) {
+        revision = Number(active.revision) + 1;
+        this.db
+          .prepare('UPDATE project_memories SET is_active = 0, updated_at = ? WHERE id = ?')
+          .run(memory.created_at || new Date().toISOString(), String(active.id));
+      }
+
+      this.db
+        .prepare(`
+          INSERT INTO project_memories (
+            id, project_id, memory_type, key, value_json, source_type,
+            source_ref, revision, is_active, created_at, updated_at
+          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        `)
+        .run(
+          memory.id,
+          memory.project_id,
+          memory.memory_type,
+          memory.key,
+          memory.value_json,
+          memory.source_type,
+          memory.source_ref,
+          revision,
+          1,
+          memory.created_at,
+          memory.updated_at
+        );
+    });
+  }
+
+  public getProjectMemory(id: string): ProjectMemory | null {
+    const row = this.db.prepare('SELECT * FROM project_memories WHERE id = ?').get(id) as Record<string, unknown> | undefined;
+    if (!row) return null;
+    return this.mapProjectMemory(row);
+  }
+
+  public getActiveProjectMemories(projectId: string): ProjectMemory[] {
+    const rows = this.db
+      .prepare(`
+        SELECT * FROM project_memories
+        WHERE project_id = ? AND is_active = 1
+        ORDER BY memory_type ASC, key ASC, revision DESC, rowid DESC
+      `)
+      .all(projectId) as Record<string, unknown>[];
+    return rows.map((r) => this.mapProjectMemory(r));
+  }
+
+  public getActiveProjectMemoryByKey(projectId: string, memoryType: ProjectMemoryType, key: string): ProjectMemory | null {
+    const row = this.db
+      .prepare(`
+        SELECT * FROM project_memories
+        WHERE project_id = ? AND memory_type = ? AND key = ? AND is_active = 1
+        ORDER BY revision DESC, rowid DESC LIMIT 1
+      `)
+      .get(projectId, memoryType, key) as Record<string, unknown> | undefined;
+    if (!row) return null;
+    return this.mapProjectMemory(row);
+  }
+
+  public getProjectMemoryHistory(projectId: string, memoryType: ProjectMemoryType, key: string): ProjectMemory[] {
+    const rows = this.db
+      .prepare(`
+        SELECT * FROM project_memories
+        WHERE project_id = ? AND memory_type = ? AND key = ?
+        ORDER BY revision DESC, rowid DESC
+      `)
+      .all(projectId, memoryType, key) as Record<string, unknown>[];
+    return rows.map((r) => this.mapProjectMemory(r));
+  }
+
+  private mapProjectMemory(row: Record<string, unknown>): ProjectMemory {
+    return {
+      id: String(row.id),
+      project_id: String(row.project_id),
+      memory_type: row.memory_type as ProjectMemoryType,
+      key: String(row.key),
+      value_json: String(row.value_json),
+      source_type: String(row.source_type),
+      source_ref: row.source_ref ? String(row.source_ref) : null,
+      revision: Number(row.revision),
+      is_active: Boolean(row.is_active),
+      created_at: String(row.created_at),
+      updated_at: String(row.updated_at),
+    };
+  }
+
+  // 3. Task Memory
+  public createTaskMemory(memory: TaskMemory): void {
+    try {
+      JSON.parse(memory.value_json);
+    } catch (e) {
+      throw new Error(`[Repository] createTaskMemory failed: value_json is not valid JSON.`);
+    }
+
+    const task = this.getTask(memory.task_id);
+    if (!task) {
+      throw new Error(`[Repository] createTaskMemory failed: Task "${memory.task_id}" not found.`);
+    }
+    if (task.project_id !== memory.project_id) {
+      throw new Error(`[Repository] createTaskMemory failed: Task "${memory.task_id}" belongs to project "${task.project_id}", expected "${memory.project_id}".`);
+    }
+
+    if (memory.attempt_id) {
+      const attempt = this.getTaskAttempt(memory.attempt_id);
+      if (!attempt) {
+        throw new Error(`[Repository] createTaskMemory failed: TaskAttempt "${memory.attempt_id}" not found.`);
+      }
+      if (attempt.task_id !== memory.task_id) {
+        throw new Error(`[Repository] createTaskMemory failed: TaskAttempt "${memory.attempt_id}" belongs to task "${attempt.task_id}", expected "${memory.task_id}".`);
+      }
+    }
+
+    if (memory.assignment_id) {
+      const assignment = this.getAgentAssignment(memory.assignment_id);
+      if (!assignment) {
+        throw new Error(`[Repository] createTaskMemory failed: AgentAssignment "${memory.assignment_id}" not found.`);
+      }
+      if (assignment.task_id !== memory.task_id || assignment.project_id !== memory.project_id) {
+        throw new Error(`[Repository] createTaskMemory failed: AgentAssignment "${memory.assignment_id}" does not match project/task.`);
+      }
+      if (memory.attempt_id && assignment.attempt_id && memory.attempt_id !== assignment.attempt_id) {
+        throw new Error(`[Repository] createTaskMemory failed: AgentAssignment attempt "${assignment.attempt_id}" does not match memory attempt "${memory.attempt_id}".`);
+      }
+    }
+
+    this.runInTransaction(() => {
+      const active = this.db
+        .prepare(`
+          SELECT * FROM task_memories
+          WHERE task_id = ? AND memory_type = ? AND key = ? AND is_active = 1
+          ORDER BY revision DESC, rowid DESC LIMIT 1
+        `)
+        .get(memory.task_id, memory.memory_type, memory.key) as Record<string, unknown> | undefined;
+
+      let revision = 1;
+      if (active) {
+        revision = Number(active.revision) + 1;
+        this.db
+          .prepare('UPDATE task_memories SET is_active = 0, updated_at = ? WHERE id = ?')
+          .run(memory.created_at || new Date().toISOString(), String(active.id));
+      }
+
+      this.db
+        .prepare(`
+          INSERT INTO task_memories (
+            id, project_id, task_id, attempt_id, assignment_id, memory_type,
+            key, value_json, source_type, source_ref, revision, is_active,
+            created_at, updated_at
+          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        `)
+        .run(
+          memory.id,
+          memory.project_id,
+          memory.task_id,
+          memory.attempt_id,
+          memory.assignment_id,
+          memory.memory_type,
+          memory.key,
+          memory.value_json,
+          memory.source_type,
+          memory.source_ref,
+          revision,
+          1,
+          memory.created_at,
+          memory.updated_at
+        );
+    });
+  }
+
+  public getTaskMemory(id: string): TaskMemory | null {
+    const row = this.db.prepare('SELECT * FROM task_memories WHERE id = ?').get(id) as Record<string, unknown> | undefined;
+    if (!row) return null;
+    return this.mapTaskMemory(row);
+  }
+
+  public getActiveTaskMemories(taskId: string): TaskMemory[] {
+    const rows = this.db
+      .prepare(`
+        SELECT * FROM task_memories
+        WHERE task_id = ? AND is_active = 1
+        ORDER BY memory_type ASC, key ASC, revision DESC, rowid DESC
+      `)
+      .all(taskId) as Record<string, unknown>[];
+    return rows.map((r) => this.mapTaskMemory(r));
+  }
+
+  public getActiveTaskMemoryByKey(taskId: string, memoryType: TaskMemoryType, key: string): TaskMemory | null {
+    const row = this.db
+      .prepare(`
+        SELECT * FROM task_memories
+        WHERE task_id = ? AND memory_type = ? AND key = ? AND is_active = 1
+        ORDER BY revision DESC, rowid DESC LIMIT 1
+      `)
+      .get(taskId, memoryType, key) as Record<string, unknown> | undefined;
+    if (!row) return null;
+    return this.mapTaskMemory(row);
+  }
+
+  public getTaskMemoryHistory(taskId: string, memoryType: TaskMemoryType, key: string): TaskMemory[] {
+    const rows = this.db
+      .prepare(`
+        SELECT * FROM task_memories
+        WHERE task_id = ? AND memory_type = ? AND key = ?
+        ORDER BY revision DESC, rowid DESC
+      `)
+      .all(taskId, memoryType, key) as Record<string, unknown>[];
+    return rows.map((r) => this.mapTaskMemory(r));
+  }
+
+  private mapTaskMemory(row: Record<string, unknown>): TaskMemory {
+    return {
+      id: String(row.id),
+      project_id: String(row.project_id),
+      task_id: String(row.task_id),
+      attempt_id: row.attempt_id ? String(row.attempt_id) : null,
+      assignment_id: row.assignment_id ? String(row.assignment_id) : null,
+      memory_type: row.memory_type as TaskMemoryType,
+      key: String(row.key),
+      value_json: String(row.value_json),
+      source_type: String(row.source_type),
+      source_ref: row.source_ref ? String(row.source_ref) : null,
+      revision: Number(row.revision),
+      is_active: Boolean(row.is_active),
+      created_at: String(row.created_at),
+      updated_at: String(row.updated_at),
+    };
+  }
+
+  // 4. Context Snapshots
+  public createContextSnapshot(snapshot: ContextSnapshot): void {
+    const project = this.getProject(snapshot.project_id);
+    if (!project) {
+      throw new Error(`[Repository] createContextSnapshot failed: Project "${snapshot.project_id}" not found.`);
+    }
+
+    const task = this.getTask(snapshot.task_id);
+    if (!task) {
+      throw new Error(`[Repository] createContextSnapshot failed: Task "${snapshot.task_id}" not found.`);
+    }
+    if (task.project_id !== snapshot.project_id) {
+      throw new Error(`[Repository] createContextSnapshot failed: Task "${snapshot.task_id}" belongs to project "${task.project_id}", expected "${snapshot.project_id}".`);
+    }
+
+    if (snapshot.attempt_id) {
+      const attempt = this.getTaskAttempt(snapshot.attempt_id);
+      if (!attempt) {
+        throw new Error(`[Repository] createContextSnapshot failed: TaskAttempt "${snapshot.attempt_id}" not found.`);
+      }
+      if (attempt.task_id !== snapshot.task_id) {
+        throw new Error(`[Repository] createContextSnapshot failed: TaskAttempt "${snapshot.attempt_id}" belongs to task "${attempt.task_id}", expected "${snapshot.task_id}".`);
+      }
+    }
+
+    let assignment: AgentAssignment | null = null;
+    if (snapshot.assignment_id) {
+      assignment = this.getAgentAssignment(snapshot.assignment_id);
+      if (!assignment) {
+        throw new Error(`[Repository] createContextSnapshot failed: AgentAssignment "${snapshot.assignment_id}" not found.`);
+      }
+      if (assignment.project_id !== snapshot.project_id || assignment.task_id !== snapshot.task_id) {
+        throw new Error(`[Repository] createContextSnapshot failed: AgentAssignment "${snapshot.assignment_id}" does not match project/task.`);
+      }
+    }
+
+    let session: AgentSession | null = null;
+    if (snapshot.session_id) {
+      session = this.getAgentSession(snapshot.session_id);
+      if (!session) {
+        throw new Error(`[Repository] createContextSnapshot failed: AgentSession "${snapshot.session_id}" not found.`);
+      }
+      if (session.project_id !== snapshot.project_id || session.task_id !== snapshot.task_id) {
+        throw new Error(`[Repository] createContextSnapshot failed: AgentSession "${snapshot.session_id}" does not match project/task.`);
+      }
+      if (snapshot.assignment_id && session.assignment_id && snapshot.assignment_id !== session.assignment_id) {
+        throw new Error(`[Repository] createContextSnapshot failed: AgentSession assignment "${session.assignment_id}" does not match snapshot assignment "${snapshot.assignment_id}".`);
+      }
+    }
+
+    assertConsistentAttemptBindings('createContextSnapshot', [
+      { label: 'Snapshot attempt', attemptId: snapshot.attempt_id },
+      { label: 'AgentAssignment attempt', attemptId: assignment?.attempt_id },
+      { label: 'AgentSession attempt', attemptId: session?.attempt_id },
+    ]);
+
+    this.db
+      .prepare(`
+        INSERT INTO context_snapshots (
+          id, project_id, task_id, attempt_id, assignment_id, session_id,
+          purpose, snapshot_version, builder_version, content_hash, created_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      `)
+      .run(
+        snapshot.id,
+        snapshot.project_id,
+        snapshot.task_id,
+        snapshot.attempt_id,
+        snapshot.assignment_id,
+        snapshot.session_id,
+        snapshot.purpose,
+        snapshot.snapshot_version,
+        snapshot.builder_version,
+        snapshot.content_hash,
+        snapshot.created_at
+      );
+  }
+
+  public getContextSnapshot(id: string): ContextSnapshot | null {
+    const row = this.db.prepare('SELECT * FROM context_snapshots WHERE id = ?').get(id) as Record<string, unknown> | undefined;
+    if (!row) return null;
+    return this.mapContextSnapshot(row);
+  }
+
+  public getContextSnapshotsByTask(taskId: string): ContextSnapshot[] {
+    const rows = this.db
+      .prepare('SELECT * FROM context_snapshots WHERE task_id = ? ORDER BY created_at DESC, rowid DESC')
+      .all(taskId) as Record<string, unknown>[];
+    return rows.map((r) => this.mapContextSnapshot(r));
+  }
+
+  public getContextSnapshotsByProject(projectId: string): ContextSnapshot[] {
+    const rows = this.db
+      .prepare('SELECT * FROM context_snapshots WHERE project_id = ? ORDER BY created_at DESC, rowid DESC')
+      .all(projectId) as Record<string, unknown>[];
+    return rows.map((r) => this.mapContextSnapshot(r));
+  }
+
+  private mapContextSnapshot(row: Record<string, unknown>): ContextSnapshot {
+    return {
+      id: String(row.id),
+      project_id: String(row.project_id),
+      task_id: String(row.task_id),
+      attempt_id: row.attempt_id ? String(row.attempt_id) : null,
+      assignment_id: row.assignment_id ? String(row.assignment_id) : null,
+      session_id: row.session_id ? String(row.session_id) : null,
+      purpose: row.purpose as ContextSnapshotPurpose,
+      snapshot_version: Number(row.snapshot_version),
+      builder_version: String(row.builder_version),
+      content_hash: String(row.content_hash),
+      created_at: String(row.created_at),
+    };
+  }
+
+  // 5. Context Items
+  public createContextItem(item: ContextItem): void {
+    const snapshot = this.getContextSnapshot(item.snapshot_id);
+    if (!snapshot) {
+      throw new Error(`[Repository] createContextItem failed: ContextSnapshot "${item.snapshot_id}" not found.`);
+    }
+
+    const existingManifest = this.getContextManifestBySnapshotId(item.snapshot_id);
+    if (existingManifest) {
+      throw new Error(`[Repository] createContextItem failed: ContextSnapshot "${item.snapshot_id}" is sealed by manifest "${existingManifest.id}" and cannot accept new items.`);
+    }
+
+    try {
+      JSON.parse(item.content_json);
+    } catch (e) {
+      throw new Error(`[Repository] createContextItem failed: content_json is not valid JSON.`);
+    }
+
+    const expectedHash = computeSha256(item.content_json);
+    if (item.content_hash !== expectedHash) {
+      throw new Error(`[Repository] createContextItem failed: content_hash "${item.content_hash}" does not match SHA-256 of content_json ("${expectedHash}").`);
+    }
+
+    this.db
+      .prepare(`
+        INSERT INTO context_items (
+          id, snapshot_id, ordinal, item_type, source_type, source_ref,
+          content_json, content_hash, token_estimate, created_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      `)
+      .run(
+        item.id,
+        item.snapshot_id,
+        item.ordinal,
+        item.item_type,
+        item.source_type,
+        item.source_ref,
+        item.content_json,
+        item.content_hash,
+        item.token_estimate,
+        item.created_at
+      );
+  }
+
+  public getContextItemsBySnapshot(snapshotId: string): ContextItem[] {
+    const rows = this.db
+      .prepare('SELECT * FROM context_items WHERE snapshot_id = ? ORDER BY ordinal ASC')
+      .all(snapshotId) as Record<string, unknown>[];
+    return rows.map((r) => this.mapContextItem(r));
+  }
+
+  private mapContextItem(row: Record<string, unknown>): ContextItem {
+    return {
+      id: String(row.id),
+      snapshot_id: String(row.snapshot_id),
+      ordinal: Number(row.ordinal),
+      item_type: row.item_type as ContextItemType,
+      source_type: String(row.source_type),
+      source_ref: row.source_ref ? String(row.source_ref) : null,
+      content_json: String(row.content_json),
+      content_hash: String(row.content_hash),
+      token_estimate: row.token_estimate !== null && row.token_estimate !== undefined ? Number(row.token_estimate) : null,
+      created_at: String(row.created_at),
+    };
+  }
+
+  // 6. Context Manifests
+  public createContextManifest(manifest: ContextManifest): void {
+    const snapshot = this.getContextSnapshot(manifest.snapshot_id);
+    if (!snapshot) {
+      throw new Error(`[Repository] createContextManifest failed: ContextSnapshot "${manifest.snapshot_id}" not found.`);
+    }
+
+    const existingManifest = this.getContextManifestBySnapshotId(manifest.snapshot_id);
+    if (existingManifest) {
+      throw new Error(`[Repository] createContextManifest failed: ContextSnapshot "${manifest.snapshot_id}" is already sealed by manifest "${existingManifest.id}".`);
+    }
+
+    try {
+      JSON.parse(manifest.manifest_json);
+    } catch (e) {
+      throw new Error(`[Repository] createContextManifest failed: manifest_json is not valid JSON.`);
+    }
+
+    const items = this.getContextItemsBySnapshot(manifest.snapshot_id);
+    if (manifest.item_count !== items.length) {
+      throw new Error(`[Repository] createContextManifest failed: manifest item_count (${manifest.item_count}) does not match actual item count (${items.length}).`);
+    }
+
+    for (let i = 0; i < items.length; i++) {
+      if (items[i].ordinal !== i) {
+        throw new Error(`[Repository] createContextManifest failed: context items ordinals are not contiguous (expected ${i}, found ${items[i].ordinal}).`);
+      }
+    }
+
+    for (const item of items) {
+      const itemHash = computeSha256(item.content_json);
+      if (item.content_hash !== itemHash) {
+        throw new Error(`[Repository] createContextManifest failed: item "${item.id}" content_hash mismatch.`);
+      }
+    }
+
+    const expectedSnapshotHash = computeSnapshotContentHash({
+      projectId: snapshot.project_id,
+      taskId: snapshot.task_id,
+      attemptId: snapshot.attempt_id,
+      assignmentId: snapshot.assignment_id,
+      purpose: snapshot.purpose,
+      builderVersion: snapshot.builder_version,
+      items: items.map((i) => ({
+        ordinal: i.ordinal,
+        itemType: i.item_type,
+        sourceType: i.source_type,
+        sourceRef: i.source_ref,
+        contentHash: i.content_hash,
+      })),
+    });
+
+    if (snapshot.content_hash !== expectedSnapshotHash) {
+      throw new Error(`[Repository] createContextManifest failed: snapshot content_hash "${snapshot.content_hash}" does not match recomputed hash "${expectedSnapshotHash}".`);
+    }
+
+    const { manifestJson: expectedManifestJson, manifestHash: expectedManifestHash } =
+      computeManifestPayloadAndHash({
+        manifest_version: manifest.manifest_version,
+        project_id: snapshot.project_id,
+        task_id: snapshot.task_id,
+        attempt_id: snapshot.attempt_id,
+        assignment_id: snapshot.assignment_id,
+        purpose: snapshot.purpose,
+        builder_version: snapshot.builder_version,
+        item_count: items.length,
+        items: items.map((i) => ({
+          ordinal: i.ordinal,
+          item_type: i.item_type,
+          source_type: i.source_type,
+          source_ref: i.source_ref,
+          content_hash: i.content_hash,
+          token_estimate: i.token_estimate,
+        })),
+      });
+
+    if (manifest.manifest_hash !== expectedManifestHash) {
+      throw new Error(`[Repository] createContextManifest failed: manifest_hash "${manifest.manifest_hash}" does not match recomputed canonical hash "${expectedManifestHash}".`);
+    }
+
+    const parsedManifest = JSON.parse(manifest.manifest_json);
+    if (canonicalJsonStringify(parsedManifest) !== expectedManifestJson) {
+      throw new Error(`[Repository] createContextManifest failed: manifest_json does not match canonical descriptor.`);
+    }
+
+    this.db
+      .prepare(`
+        INSERT INTO context_manifests (
+          id, snapshot_id, manifest_version, item_count, manifest_json, manifest_hash, created_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?)
+      `)
+      .run(
+        manifest.id,
+        manifest.snapshot_id,
+        manifest.manifest_version,
+        manifest.item_count,
+        manifest.manifest_json,
+        manifest.manifest_hash,
+        manifest.created_at
+      );
+  }
+
+  public getContextManifest(id: string): ContextManifest | null {
+    const row = this.db.prepare('SELECT * FROM context_manifests WHERE id = ?').get(id) as Record<string, unknown> | undefined;
+    if (!row) return null;
+    return this.mapContextManifest(row);
+  }
+
+  public getContextManifestBySnapshotId(snapshotId: string): ContextManifest | null {
+    const row = this.db.prepare('SELECT * FROM context_manifests WHERE snapshot_id = ?').get(snapshotId) as Record<string, unknown> | undefined;
+    if (!row) return null;
+    return this.mapContextManifest(row);
+  }
+
+  public getContextManifestByHash(hash: string): ContextManifest | null {
+    const row = this.db
+      .prepare('SELECT * FROM context_manifests WHERE manifest_hash = ? ORDER BY created_at DESC, rowid DESC LIMIT 1')
+      .get(hash) as Record<string, unknown> | undefined;
+    if (!row) return null;
+    return this.mapContextManifest(row);
+  }
+
+  private mapContextManifest(row: Record<string, unknown>): ContextManifest {
+    return {
+      id: String(row.id),
+      snapshot_id: String(row.snapshot_id),
+      manifest_version: String(row.manifest_version),
+      item_count: Number(row.item_count),
+      manifest_json: String(row.manifest_json),
+      manifest_hash: String(row.manifest_hash),
+      created_at: String(row.created_at),
+    };
+  }
+
+  // 7. Handoff Context
+  public createHandoffContext(handoff: HandoffContext): void {
+    const project = this.getProject(handoff.project_id);
+    if (!project) {
+      throw new Error(`[Repository] createHandoffContext failed: Project "${handoff.project_id}" not found.`);
+    }
+
+    const task = this.getTask(handoff.task_id);
+    if (!task) {
+      throw new Error(`[Repository] createHandoffContext failed: Task "${handoff.task_id}" not found.`);
+    }
+    if (task.project_id !== handoff.project_id) {
+      throw new Error(`[Repository] createHandoffContext failed: Task "${handoff.task_id}" belongs to project "${task.project_id}", expected "${handoff.project_id}".`);
+    }
+
+    if (handoff.attempt_id) {
+      const attempt = this.getTaskAttempt(handoff.attempt_id);
+      if (!attempt) {
+        throw new Error(`[Repository] createHandoffContext failed: TaskAttempt "${handoff.attempt_id}" not found.`);
+      }
+      if (attempt.task_id !== handoff.task_id) {
+        throw new Error(`[Repository] createHandoffContext failed: TaskAttempt "${handoff.attempt_id}" belongs to task "${attempt.task_id}", expected "${handoff.task_id}".`);
+      }
+    }
+
+    let fromAsgn: AgentAssignment | null = null;
+    if (handoff.from_assignment_id) {
+      fromAsgn = this.getAgentAssignment(handoff.from_assignment_id);
+      if (!fromAsgn) {
+        throw new Error(`[Repository] createHandoffContext failed: From AgentAssignment "${handoff.from_assignment_id}" not found.`);
+      }
+      if (fromAsgn.project_id !== handoff.project_id || fromAsgn.task_id !== handoff.task_id) {
+        throw new Error(`[Repository] createHandoffContext failed: From AgentAssignment "${handoff.from_assignment_id}" does not match project/task.`);
+      }
+    }
+
+    let toAsgn: AgentAssignment | null = null;
+    if (handoff.to_assignment_id) {
+      toAsgn = this.getAgentAssignment(handoff.to_assignment_id);
+      if (!toAsgn) {
+        throw new Error(`[Repository] createHandoffContext failed: To AgentAssignment "${handoff.to_assignment_id}" not found.`);
+      }
+      if (toAsgn.project_id !== handoff.project_id || toAsgn.task_id !== handoff.task_id) {
+        throw new Error(`[Repository] createHandoffContext failed: To AgentAssignment "${handoff.to_assignment_id}" does not match project/task.`);
+      }
+    }
+
+    const sourceSnapshot = this.getContextSnapshot(handoff.source_snapshot_id);
+    if (!sourceSnapshot) {
+      throw new Error(`[Repository] createHandoffContext failed: Source ContextSnapshot "${handoff.source_snapshot_id}" not found.`);
+    }
+    if (sourceSnapshot.project_id !== handoff.project_id || sourceSnapshot.task_id !== handoff.task_id) {
+      throw new Error(`[Repository] createHandoffContext failed: Source ContextSnapshot "${handoff.source_snapshot_id}" does not match project/task.`);
+    }
+
+    let handoffSnapshot: ContextSnapshot | null = null;
+    if (handoff.handoff_snapshot_id) {
+      handoffSnapshot = this.getContextSnapshot(handoff.handoff_snapshot_id);
+      if (!handoffSnapshot) {
+        throw new Error(`[Repository] createHandoffContext failed: Handoff ContextSnapshot "${handoff.handoff_snapshot_id}" not found.`);
+      }
+      if (handoffSnapshot.project_id !== handoff.project_id || handoffSnapshot.task_id !== handoff.task_id) {
+        throw new Error(`[Repository] createHandoffContext failed: Handoff ContextSnapshot "${handoff.handoff_snapshot_id}" does not match project/task.`);
+      }
+    }
+
+    assertConsistentAttemptBindings('createHandoffContext', [
+      { label: 'Handoff attempt', attemptId: handoff.attempt_id },
+      { label: 'From AgentAssignment attempt', attemptId: fromAsgn?.attempt_id },
+      { label: 'To AgentAssignment attempt', attemptId: toAsgn?.attempt_id },
+      { label: 'Source ContextSnapshot attempt', attemptId: sourceSnapshot?.attempt_id },
+      { label: 'Handoff ContextSnapshot attempt', attemptId: handoffSnapshot?.attempt_id },
+    ]);
+
+    this.db
+      .prepare(`
+        INSERT INTO handoff_contexts (
+          id, project_id, task_id, attempt_id, from_assignment_id, to_assignment_id,
+          source_snapshot_id, handoff_snapshot_id, reason, status, created_at, consumed_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      `)
+      .run(
+        handoff.id,
+        handoff.project_id,
+        handoff.task_id,
+        handoff.attempt_id,
+        handoff.from_assignment_id,
+        handoff.to_assignment_id,
+        handoff.source_snapshot_id,
+        handoff.handoff_snapshot_id,
+        handoff.reason,
+        handoff.status,
+        handoff.created_at,
+        handoff.consumed_at
+      );
+  }
+
+  public getHandoffContext(id: string): HandoffContext | null {
+    const row = this.db.prepare('SELECT * FROM handoff_contexts WHERE id = ?').get(id) as Record<string, unknown> | undefined;
+    if (!row) return null;
+    return this.mapHandoffContext(row);
+  }
+
+  public getHandoffContextsByTask(taskId: string): HandoffContext[] {
+    const rows = this.db
+      .prepare('SELECT * FROM handoff_contexts WHERE task_id = ? ORDER BY created_at DESC, rowid DESC')
+      .all(taskId) as Record<string, unknown>[];
+    return rows.map((r) => this.mapHandoffContext(r));
+  }
+
+  public updateHandoffContextStatus(id: string, status: HandoffContextStatus, consumedAt?: string | null): void {
+    const existing = this.getHandoffContext(id);
+    if (!existing) return;
+
+    this.db
+      .prepare('UPDATE handoff_contexts SET status = ?, consumed_at = ? WHERE id = ?')
+      .run(status, consumedAt !== undefined ? consumedAt : existing.consumed_at, id);
+  }
+
+  private mapHandoffContext(row: Record<string, unknown>): HandoffContext {
+    return {
+      id: String(row.id),
+      project_id: String(row.project_id),
+      task_id: String(row.task_id),
+      attempt_id: row.attempt_id ? String(row.attempt_id) : null,
+      from_assignment_id: row.from_assignment_id ? String(row.from_assignment_id) : null,
+      to_assignment_id: row.to_assignment_id ? String(row.to_assignment_id) : null,
+      source_snapshot_id: String(row.source_snapshot_id),
+      handoff_snapshot_id: row.handoff_snapshot_id ? String(row.handoff_snapshot_id) : null,
+      reason: String(row.reason),
+      status: row.status as HandoffContextStatus,
+      created_at: String(row.created_at),
+      consumed_at: row.consumed_at ? String(row.consumed_at) : null,
     };
   }
 }

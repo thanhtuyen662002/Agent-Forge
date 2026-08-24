@@ -115,16 +115,70 @@ Durable representation of review / coder separation and isolation rules.
 
 ---
 
-## 6. Durable Memory & Context Boundary (R5-v1.1 Invariant)
+## 6. Durable Memory & Context Fabric (R5B Implementation)
 
-In AgentForge R5-v1.1, the relationship between operational execution and persistent memory is strictly codified:
+In AgentForge R5-v1.1 / R5B, the relationship between operational execution and persistent memory is codified into 7 durable SQLite entities and a provider-neutral `ContextBuilderService`:
 
-1. **Ephemeral Execution Context**: Provider and model conversations are transient execution context and are **NOT** the authoritative memory of projects or tasks (`CONVERSATION_IS_SOURCE_OF_TRUTH = NO`).
-2. **Local Durable Memory Requirement**: Authoritative state, structured task progress, decisions, and constraints are maintained locally in durable SQLite storage (`LOCAL_DURABLE_MEMORY_REQUIRED = YES`, `STRUCTURED_TASK_MEMORY = REQUIRED`).
-3. **Stable Identity Binding**: Future memory fabric entities introduced in R5B (`AgentSession`, `ProjectMemory`, `TaskMemory`, `ContextSnapshot`, `ContextItem`, `ContextManifest`, `HandoffContext`) bind directly to the stable project, task, attempt, and assignment identities established here in R5A.
-4. **Context Window Independence**: Model context window limits must never compromise project knowledge or task execution continuity (`MODEL_CONTEXT_WINDOW_DEPENDENCY = FORBIDDEN`).
-5. **Audit vs Operational Memory**: Raw conversation transcripts may be retained for auditing and replay purposes, but cannot serve as the sole operational memory (`SUMMARY_OF_SUMMARY_AS_ONLY_MEMORY = FORBIDDEN`).
-6. **R5A Non-Implementation**: R5A defines and preserves the relational boundaries only; operational memory compilation and `ContextBuilderService` are strictly deferred to R5B.
+```mermaid
+erDiagram
+    PROJECTS ||--o{ AGENT_SESSIONS : "owns"
+    TASKS ||--o{ AGENT_SESSIONS : "scopes"
+    AGENT_ASSIGNMENTS ||--o{ AGENT_SESSIONS : "executes"
+
+    PROJECTS ||--o{ PROJECT_MEMORIES : "maintains"
+    TASKS ||--o{ TASK_MEMORIES : "records"
+
+    TASKS ||--o{ CONTEXT_SNAPSHOTS : "snapshots"
+    AGENT_SESSIONS ||--o{ CONTEXT_SNAPSHOTS : "generates"
+    CONTEXT_SNAPSHOTS ||--o{ CONTEXT_ITEMS : "contains ordered"
+    CONTEXT_SNAPSHOTS ||--|| CONTEXT_MANIFESTS : "bound 1-to-1"
+
+    TASKS ||--o{ HANDOFF_CONTEXTS : "transfers"
+    CONTEXT_SNAPSHOTS ||--o{ HANDOFF_CONTEXTS : "source snapshot"
+```
+
+### 1. `AgentSession` (`agent_sessions`)
+Represents a distinct logical execution session bound to a project, task, attempt, and assignment. Decoupled from external vendor conversation threads.
+- **Fields**: `id`, `project_id`, `task_id`, `attempt_id`, `assignment_id`, `provider_id`, `provider_account_id`, `provider_resource_id`, `external_session_ref`, `status` (`ACTIVE`, `ENDED`, `FAILED`, `SUSPENDED`), `started_at`, `ended_at`, `created_at`, `updated_at`.
+
+### 2. `ProjectMemory` (`project_memories`)
+Represents durable, versioned project-level knowledge, architectural constraints, and repository facts.
+- **Fields**: `id`, `project_id`, `memory_type` (`ARCHITECTURE`, `OWNER_POLICY`, `CONSTRAINT`, `DECISION`, `CONVENTION`, `REPOSITORY_FACT`, `CUSTOM`), `key`, `value_json`, `source_type`, `source_ref`, `revision`, `is_active`, `created_at`, `updated_at`.
+- **Versioning Invariant**: Partial unique index `UNIQUE(project_id, memory_type, key) WHERE is_active = 1`. Updating memory deactivates previous revisions and increments `revision`.
+
+### 3. `TaskMemory` (`task_memories`)
+Represents durable, versioned task-specific operational memory (completed steps, remaining steps, acceptance criteria, known issues, verification facts).
+- **Fields**: `id`, `project_id`, `task_id`, `attempt_id`, `assignment_id`, `memory_type` (`GOAL`, `ACCEPTANCE_CRITERION`, `CONSTRAINT`, `COMPLETED_STEP`, `REMAINING_STEP`, `KNOWN_ISSUE`, `DECISION`, `VERIFICATION_FACT`, `RECOMMENDED_NEXT_ACTION`, `CUSTOM`), `key`, `value_json`, `source_type`, `source_ref`, `revision`, `is_active`, `created_at`, `updated_at`.
+- **Versioning Invariant**: Partial unique index `UNIQUE(task_id, memory_type, key) WHERE is_active = 1`.
+
+### 4. `ContextSnapshot` (`context_snapshots`)
+Represents an immutable, frozen compilation of context prepared for execution, review, research, or handoff.
+- **Fields**: `id`, `project_id`, `task_id`, `attempt_id`, `assignment_id`, `session_id`, `purpose` (`EXECUTION`, `REVIEW`, `HANDOFF`, `MANAGER`, `RESEARCH`, `CUSTOM`), `snapshot_version`, `builder_version`, `content_hash`, `created_at`.
+
+### 5. `ContextItem` (`context_items`)
+Ordered elements belonging to a frozen ContextSnapshot.
+- **Fields**: `id`, `snapshot_id`, `ordinal`, `item_type` (`PROJECT_CONTRACT`, `PROJECT_MEMORY`, `TASK_CORE`, `TASK_MEMORY`, `CHECKPOINT`, `HANDOFF`, `CONTEXT_FILE_REFERENCE`, `CUSTOM`), `source_type`, `source_ref`, `content_json`, `content_hash`, `token_estimate`, `created_at`.
+- **Ordering Invariant**: `UNIQUE(snapshot_id, ordinal)`.
+
+### 6. `ContextManifest` (`context_manifests`)
+Canonical, reproducible manifest describing the immutable snapshot and its constituent items.
+- **Fields**: `id`, `snapshot_id UNIQUE`, `manifest_version`, `item_count`, `manifest_json`, `manifest_hash`, `created_at`.
+- **Hash Invariant**: SHA-256 over canonical deterministic JSON representation of manifest metadata + array of item hashes.
+
+### 7. `HandoffContext` (`handoff_contexts`)
+Durable bridge facilitating cross-agent, cross-model, or cross-provider task movement without data loss.
+- **Fields**: `id`, `project_id`, `task_id`, `attempt_id`, `from_assignment_id`, `to_assignment_id`, `source_snapshot_id`, `handoff_snapshot_id`, `reason`, `status` (`PENDING`, `READY`, `CONSUMED`, `FAILED`, `CANCELLED`), `created_at`, `consumed_at`.
+
+### 8. `ContextBuilderService` & Compilation Hierarchy
+Deterministic, provider-neutral context aggregation compiler:
+1. `PROJECT_CONTRACT`: Project contract truths and owner policies.
+2. `PROJECT_MEMORY`: Active project memories sorted deterministically (`memory_type ASC, key ASC`).
+3. `TASK_CORE`: Core task definition, state, revision, acceptance criteria, constraints.
+4. `TASK_MEMORY`: Active task memories sorted deterministically (`memory_type ASC, key ASC`).
+5. `CHECKPOINT`: Latest or explicit task checkpoints.
+6. `HANDOFF`: Latest or explicit handoff contexts.
+7. `CONTEXT_FILE_REFERENCE`: Sanitized repository-relative file paths sorted alphabetically.
+8. `CUSTOM`: Custom domain items sorted by `sourceType ASC, sourceRef ASC`.
 
 ---
 
@@ -132,8 +186,8 @@ In AgentForge R5-v1.1, the relationship between operational execution and persis
 
 The R5 planning sequence is governed by the authoritative R5-v1.1 roadmap:
 
-- **R5A — Role-Agnostic Domain Foundation**: Durable entity separation (`ROLE != PROFILE != PROVIDER != RESOURCE != ACCOUNT != SLOT`), schema migrations, relational provenance validation.
-- **R5B — Durable Memory & Context Fabric**: Local structured task/project memory, versioned context snapshots, manifest hashing, context builders.
+- **R5A — Role-Agnostic Domain Foundation** `[CLOSED_SUCCESSFULLY]`: Durable entity separation (`ROLE != PROFILE != PROVIDER != RESOURCE != ACCOUNT != SLOT`), schema migrations, relational provenance validation.
+- **R5B — Durable Memory & Context Fabric** `[CURRENT GATE]`: Local structured task/project memory, versioned context snapshots, manifest hashing, deterministic context builders.
 - **R5C — Local Account & Credential Fabric**: Secure credential references, Windows Credential Manager integration, profile resolvers.
 - **R5D — Native Multi-Profile Execution Proof**: Multi-profile isolation and authentication validation across distinct provider accounts.
 - **R5E — Role-Aware Router & Separation Policy**: Capability matching, conflict-of-interest enforcement (reviewer != coder), affinity policies.
