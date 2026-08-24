@@ -47,6 +47,10 @@ export abstract class LocalCliAdapterBase implements ProviderAdapter {
   protected abstract getDefaultExecutable(): string;
   public abstract getCapabilities(): Promise<Capability[]>;
 
+  protected getAllowedEnvironmentOverrideKeys(): string[] {
+    return [];
+  }
+
   public setRepository(repo: Repository): void {
     this.repo = repo;
   }
@@ -80,6 +84,8 @@ export abstract class LocalCliAdapterBase implements ProviderAdapter {
         cwd: process.cwd(),
         timeoutMs: 5000,
         allowShell: false,
+        env: this.env,
+        allowedEnvKeys: this.getAllowedEnvironmentOverrideKeys(),
       });
 
       if (res.cancelled) {
@@ -219,6 +225,7 @@ export abstract class LocalCliAdapterBase implements ProviderAdapter {
       cwd: repoPath,
       timeoutMs: this.timeoutMs,
       env: this.env,
+      allowedEnvKeys: this.getAllowedEnvironmentOverrideKeys(),
       allowShell: false,
       repo: this.repo,
       artifactStore: this.artifactStore,
