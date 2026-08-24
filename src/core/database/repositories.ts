@@ -59,6 +59,10 @@ import {
   computeManifestPayloadAndHash,
   assertConsistentAttemptBindings,
 } from '../context/ContextIntegrity';
+import {
+  parseCredentialRef,
+  parseNativeProfileRef,
+} from '../credentials';
 
 export class Repository {
   constructor(private db: Database.Database) {}
@@ -1574,6 +1578,52 @@ export class Repository {
   // Provider Accounts (R5A)
   // ==========================================
   public createProviderAccount(account: ProviderAccount): void {
+    const provider = this.getProvider(account.provider_id);
+    if (!provider) {
+      throw new Error(`[Repository] createProviderAccount failed: Provider "${account.provider_id}" not found.`);
+    }
+
+    let finalCredentialRef: string | null = null;
+    let finalProfileRef: string | null = null;
+
+    if (account.auth_mode === 'API_CREDENTIAL') {
+      if (account.profile_ref !== null && account.profile_ref !== undefined) {
+        throw new Error(
+          `[Repository] createProviderAccount failed: auth_mode "API_CREDENTIAL" requires null profile_ref.`
+        );
+      }
+      if (account.enabled) {
+        if (!account.credential_ref || account.credential_ref.trim().length === 0) {
+          throw new Error(
+            `[Repository] createProviderAccount failed: enabled auth_mode "API_CREDENTIAL" requires a valid canonical credential_ref.`
+          );
+        }
+      }
+      if (account.credential_ref) {
+        finalCredentialRef = parseCredentialRef(account.credential_ref).toUriString();
+      }
+    } else if (account.auth_mode === 'NATIVE_PROFILE') {
+      if (account.credential_ref !== null && account.credential_ref !== undefined) {
+        throw new Error(
+          `[Repository] createProviderAccount failed: auth_mode "NATIVE_PROFILE" requires null credential_ref.`
+        );
+      }
+      if (account.enabled) {
+        if (!account.profile_ref || account.profile_ref.trim().length === 0) {
+          throw new Error(
+            `[Repository] createProviderAccount failed: enabled auth_mode "NATIVE_PROFILE" requires a valid canonical profile_ref.`
+          );
+        }
+      }
+      if (account.profile_ref) {
+        finalProfileRef = parseNativeProfileRef(account.profile_ref).toUriString();
+      }
+    } else {
+      throw new Error(
+        `[Repository] createProviderAccount failed: unsupported auth_mode "${account.auth_mode}".`
+      );
+    }
+
     this.db
       .prepare(`
         INSERT INTO provider_accounts (
@@ -1587,8 +1637,8 @@ export class Repository {
         account.provider_id,
         account.label,
         account.auth_mode,
-        account.credential_ref ?? null,
-        account.profile_ref ?? null,
+        finalCredentialRef,
+        finalProfileRef,
         account.enabled ? 1 : 0,
         account.priority ?? 0,
         account.health_status,
@@ -1650,6 +1700,66 @@ export class Repository {
     const existing = this.getProviderAccount(id);
     if (!existing) return;
 
+    const isSecurityUpdate =
+      updates.auth_mode !== undefined ||
+      updates.credential_ref !== undefined ||
+      updates.profile_ref !== undefined;
+    const isEnabling = updates.enabled === true && !existing.enabled;
+
+    let finalCredentialRef = updates.credential_ref !== undefined ? updates.credential_ref : existing.credential_ref;
+    let finalProfileRef = updates.profile_ref !== undefined ? updates.profile_ref : existing.profile_ref;
+
+    if (isSecurityUpdate || isEnabling) {
+      const mergedAuthMode = updates.auth_mode ?? existing.auth_mode;
+      const mergedCredRef = updates.credential_ref !== undefined ? updates.credential_ref : existing.credential_ref;
+      const mergedProfRef = updates.profile_ref !== undefined ? updates.profile_ref : existing.profile_ref;
+      const mergedEnabled = updates.enabled !== undefined ? updates.enabled : existing.enabled;
+
+      if (mergedAuthMode === 'API_CREDENTIAL') {
+        if (mergedProfRef !== null && mergedProfRef !== undefined) {
+          throw new Error(
+            `[Repository] updateProviderAccount failed: auth_mode "API_CREDENTIAL" requires null profile_ref.`
+          );
+        }
+        if (mergedEnabled) {
+          if (!mergedCredRef || mergedCredRef.trim().length === 0) {
+            throw new Error(
+              `[Repository] updateProviderAccount failed: enabled auth_mode "API_CREDENTIAL" requires a valid canonical credential_ref.`
+            );
+          }
+        }
+        if (mergedCredRef) {
+          finalCredentialRef = parseCredentialRef(mergedCredRef).toUriString();
+        } else {
+          finalCredentialRef = null;
+        }
+        finalProfileRef = null;
+      } else if (mergedAuthMode === 'NATIVE_PROFILE') {
+        if (mergedCredRef !== null && mergedCredRef !== undefined) {
+          throw new Error(
+            `[Repository] updateProviderAccount failed: auth_mode "NATIVE_PROFILE" requires null credential_ref.`
+          );
+        }
+        if (mergedEnabled) {
+          if (!mergedProfRef || mergedProfRef.trim().length === 0) {
+            throw new Error(
+              `[Repository] updateProviderAccount failed: enabled auth_mode "NATIVE_PROFILE" requires a valid canonical profile_ref.`
+            );
+          }
+        }
+        if (mergedProfRef) {
+          finalProfileRef = parseNativeProfileRef(mergedProfRef).toUriString();
+        } else {
+          finalProfileRef = null;
+        }
+        finalCredentialRef = null;
+      } else {
+        throw new Error(
+          `[Repository] updateProviderAccount failed: unsupported auth_mode "${mergedAuthMode}".`
+        );
+      }
+    }
+
     this.db
       .prepare(`
         UPDATE provider_accounts
@@ -1671,8 +1781,8 @@ export class Repository {
       .run(
         updates.label ?? existing.label,
         updates.auth_mode ?? existing.auth_mode,
-        updates.credential_ref !== undefined ? updates.credential_ref : existing.credential_ref,
-        updates.profile_ref !== undefined ? updates.profile_ref : existing.profile_ref,
+        finalCredentialRef,
+        finalProfileRef,
         updates.enabled !== undefined ? (updates.enabled ? 1 : 0) : (existing.enabled ? 1 : 0),
         updates.priority !== undefined ? updates.priority : existing.priority,
         updates.health_status ?? existing.health_status,
