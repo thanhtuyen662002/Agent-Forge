@@ -34,6 +34,7 @@ class FakeExecutableAdapter implements ProviderAdapter {
   public executionCount = 0;
   public lastRequest?: AgentExecutionRequest;
   public customResult?: Partial<AgentExecutionResult>;
+  public throwError?: Error;
 
   constructor(id: string, name: string) {
     this.id = id;
@@ -62,6 +63,9 @@ class FakeExecutableAdapter implements ProviderAdapter {
   public async execute(request: AgentExecutionRequest): Promise<AgentExecutionResult> {
     this.executionCount++;
     this.lastRequest = request;
+    if (this.throwError) {
+      throw this.throwError;
+    }
     if (this.customResult) {
       return {
         executionId: crypto.randomUUID(),
@@ -378,10 +382,10 @@ describe('R5F0B — Runtime Execution Binding & Process Runner Hardening Tests',
   }
 
   // ============================================================
-  // A. DISPATCH BINDING TESTS
+  // A. DISPATCH BINDING & FAIL-CLOSED MATRIX
   // ============================================================
-  describe('A. Dispatch Binding & Revalidation', () => {
-    it('1. SELECTED route populates exact provider, account, resource, assignment, and profileRef', async () => {
+  describe('A. Dispatch Binding & Fail-Closed Matrix', () => {
+    it('1. SELECTED route populates exact provider, account, resource, assignment, modelName, and profileRef', async () => {
       const decisionId = 'dec-r5f-001';
       const { fakeAdapter, assignmentId } = createRoutingFixture({
         decisionId,
@@ -443,7 +447,7 @@ describe('R5F0B — Runtime Execution Binding & Process Runner Hardening Tests',
       expect(fakeAdapter.executionCount).toBe(0);
     });
 
-    it('3. Assignment mismatch fails closed with zero adapter execution', async () => {
+    it('3. Terminal assignment fails closed with zero adapter execution', async () => {
       const decisionId = 'dec-r5f-003';
       const { fakeAdapter, assignmentId } = createRoutingFixture({
         decisionId,
@@ -515,12 +519,63 @@ describe('R5F0B — Runtime Execution Binding & Process Runner Hardening Tests',
       expect(result.error).toContain('ROUTING_RESOURCE_ACCOUNT_MISMATCH');
       expect(fakeAdapter.executionCount).toBe(0);
     });
+
+    it('3c. Disabled ProviderAccount in database fails closed', async () => {
+      const decisionId = 'dec-r5f-003c';
+      const { fakeAdapter } = createRoutingFixture({
+        decisionId,
+        providerId: 'prov-fake',
+        accountId: 'acc-c03c',
+        resourceId: 'res-model-3c',
+        accountEnabled: true,
+      });
+
+      const auth = await authService.createAuthorization({
+        projectId: 'proj-r5f',
+        taskId: 'task-r5f-001',
+        routingDecisionId: decisionId,
+      });
+
+      // Disable account after authorization
+      db.prepare('UPDATE provider_accounts SET enabled = 0 WHERE id = ?').run('acc-c03c');
+
+      const result = await dispatcher.dispatch(auth.id);
+
+      expect(result.status).toBe('FAILED');
+      expect(result.errorCode).toBe('RESOURCE_UNAVAILABLE');
+      expect(result.error).toContain('ROUTING_ACCOUNT_DISABLED');
+      expect(fakeAdapter.executionCount).toBe(0);
+    });
+
+    it('3d. Adapter throws during execution -> fails with EXECUTION_FAILED and zero retry', async () => {
+      const decisionId = 'dec-r5f-003d';
+      const { fakeAdapter } = createRoutingFixture({
+        decisionId,
+        providerId: 'prov-fake',
+        accountId: 'acc-c03d',
+        resourceId: 'res-model-3d',
+      });
+      fakeAdapter.throwError = new Error('Simulated unexpected adapter crash');
+
+      const auth = await authService.createAuthorization({
+        projectId: 'proj-r5f',
+        taskId: 'task-r5f-001',
+        routingDecisionId: decisionId,
+      });
+
+      const result = await dispatcher.dispatch(auth.id);
+
+      expect(result.status).toBe('FAILED');
+      expect(result.errorCode).toBe('EXECUTION_FAILED');
+      expect(result.error).toContain('ADAPTER_EXECUTION_THREW');
+      expect(fakeAdapter.executionCount).toBe(1); // Executed exactly once, NO retry
+    });
   });
 
   // ============================================================
-  // B. EVENT PROVENANCE TESTS
+  // B. EVENT PROVENANCE & SECURITY TESTS
   // ============================================================
-  describe('B. Durable Event Provenance', () => {
+  describe('B. Durable Event Provenance & Security', () => {
     it('4. Emits PROVIDER_RUNTIME_EXECUTION_BOUND and PROVIDER_RUNTIME_EXECUTION_RESULT events with safe metadata', async () => {
       const decisionId = 'dec-r5f-004';
       const { assignmentId } = createRoutingFixture({
@@ -549,13 +604,23 @@ describe('R5F0B — Runtime Execution Binding & Process Runner Hardening Tests',
       expect(boundEvent!.structured_payload.authorizationId).toBe(auth.id);
       expect(boundEvent!.structured_payload.assignmentId).toBe(assignmentId);
       expect(boundEvent!.structured_payload.accountId).toBe('acc-c04');
+      expect(boundEvent!.structured_payload.resourceId).toBe('res-model-4');
+      expect(boundEvent!.structured_payload.modelName).toBe('o3-mini');
       expect(boundEvent!.structured_payload.profileRef).toBe('native-profile://codex/c04');
+      // Assert absence of instructions, prompt, stdin, secrets
       expect(boundEvent!.structured_payload.instructions).toBeUndefined();
+      expect(boundEvent!.structured_payload.prompt).toBeUndefined();
+      expect(boundEvent!.structured_payload.stdin).toBeUndefined();
+      expect(boundEvent!.structured_payload.env).toBeUndefined();
 
       expect(resultEvent).toBeDefined();
       expect(resultEvent!.structured_payload.executionId).toBe(result.executionId);
+      expect(resultEvent!.structured_payload.assignmentId).toBe(assignmentId);
+      expect(resultEvent!.structured_payload.accountId).toBe('acc-c04');
+      expect(resultEvent!.structured_payload.resourceId).toBe('res-model-4');
       expect(resultEvent!.structured_payload.status).toBe('COMPLETED');
       expect(resultEvent!.structured_payload.rawResponse).toBeUndefined();
+      expect(resultEvent!.structured_payload.prompt).toBeUndefined();
     });
   });
 
@@ -608,16 +673,6 @@ describe('R5F0B — Runtime Execution Binding & Process Runner Hardening Tests',
         'for (let i = 0; i < 2000; i++) { process.stdout.write("X".repeat(1024)); }'
       );
 
-      const adapter = new TestLocalCliAdapter({
-        repo,
-        artifactStore,
-        timeoutMs: 5000,
-      });
-
-      (adapter as any).buildExecutionArgs = () => [scriptPath];
-      (adapter as any).useStdin = false;
-
-      // Wrap ProcessRunner execution in adapter with options or test through ProcessRunner error mapping
       const runnerRes = await ProcessRunner.execute({
         executable: process.execPath,
         args: [scriptPath],
@@ -666,9 +721,9 @@ describe('R5F0B — Runtime Execution Binding & Process Runner Hardening Tests',
       expect(res.stderr).toContain('Fatal error');
     });
 
-    it('10. Allowed custom environment key is accepted', async () => {
+    it('10. Invocation with explicitly authorized custom env key succeeds', async () => {
       const scriptPath = path.join(tempDir, 'env_script.js');
-      fs.writeFileSync(scriptPath, 'process.stdout.write(process.env.CODEX_HOME || "missing");');
+      fs.writeFileSync(scriptPath, 'process.stdout.write(process.env.AGENTFORGE_TEST_ENV || "missing");');
 
       const res = await ProcessRunner.execute({
         executable: process.execPath,
@@ -676,15 +731,16 @@ describe('R5F0B — Runtime Execution Binding & Process Runner Hardening Tests',
         cwd: projectRepoDir,
         timeoutMs: 5000,
         env: {
-          CODEX_HOME: 'C:\\fake\\codex\\profile',
+          AGENTFORGE_TEST_ENV: 'authorized_test_val',
         },
+        allowedEnvKeys: ['AGENTFORGE_TEST_ENV'],
       });
 
       expect(res.exitCode).toBe(0);
-      expect(res.stdout).toBe('C:\\fake\\codex\\profile');
+      expect(res.stdout).toBe('authorized_test_val');
     });
 
-    it('11. Unauthorized custom environment key is rejected before launch', async () => {
+    it('11. Custom env without allowedEnvKeys is rejected before launch', async () => {
       const scriptPath = path.join(tempDir, 'unauthorized_env.js');
       fs.writeFileSync(scriptPath, 'process.exit(0);');
 
@@ -696,11 +752,32 @@ describe('R5F0B — Runtime Execution Binding & Process Runner Hardening Tests',
         env: {
           UNAUTHORIZED_SECRET_KEY: 'secret_value',
         },
+        // allowedEnvKeys is omitted
       });
 
       expect(res.exitCode).toBe(-1);
       expect(res.errorCode).toBe('PROCESS_LAUNCH_FAILED');
-      expect(res.stderr).toContain('Unauthorized custom environment variable key');
+      expect(res.stderr).toContain('Unauthorized custom environment variable key: "UNAUTHORIZED_SECRET_KEY"');
+    });
+
+    it('11b. Custom env key not matching allowedEnvKeys is rejected before launch', async () => {
+      const scriptPath = path.join(tempDir, 'unauthorized_env2.js');
+      fs.writeFileSync(scriptPath, 'process.exit(0);');
+
+      const res = await ProcessRunner.execute({
+        executable: process.execPath,
+        args: [scriptPath],
+        cwd: projectRepoDir,
+        timeoutMs: 5000,
+        env: {
+          UNKNOWN_ENV: 'val',
+        },
+        allowedEnvKeys: ['ALLOWED_KEY_A', 'ALLOWED_KEY_B'],
+      });
+
+      expect(res.exitCode).toBe(-1);
+      expect(res.errorCode).toBe('PROCESS_LAUNCH_FAILED');
+      expect(res.stderr).toContain('Unauthorized custom environment variable key: "UNKNOWN_ENV"');
     });
   });
 

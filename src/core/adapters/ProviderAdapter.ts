@@ -11,7 +11,9 @@ export type RuntimeErrorCode =
   | 'UNSUPPORTED_CLIENT'
   | 'RESOURCE_UNAVAILABLE'
   | 'OUTPUT_LIMIT_EXCEEDED'
-  | 'EXECUTION_FAILED';
+  | 'POLICY_DENIAL'
+  | 'EXECUTION_FAILED'
+  | 'UNKNOWN';
 
 export interface QuotaSnapshotInfo {
   remaining: number | null;

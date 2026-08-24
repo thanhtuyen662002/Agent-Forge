@@ -31,6 +31,7 @@ export interface StructuredProcessOptions {
   maxStdoutBytes?: number;
   maxStderrBytes?: number;
   env?: Record<string, string>;
+  allowedEnvKeys?: string[];
   allowShell?: boolean;
   repo?: Repository;
   artifactStore?: ArtifactStore;
@@ -56,29 +57,18 @@ export class ProcessRunner {
   public static readonly DEFAULT_MAX_OUTPUT_BYTES = 8 * 1024 * 1024; // 8 MiB default
   public static readonly MAX_ALLOWED_OUTPUT_BYTES = 32 * 1024 * 1024; // 32 MiB hard cap
 
-  // Permitted custom environment variable keys
-  private static ALLOWED_CUSTOM_ENV_KEYS = new Set([
-    'PATH',
-    'Path',
-    'COMSPEC',
-    'ComSpec',
-    'SYSTEMROOT',
-    'SystemRoot',
-    'TEMP',
-    'TMP',
-    'NODE_ENV',
-    'CODEX_HOME',
-    'GEMINI_CLI_HOME',
-    'CLAUDE_CONFIG_DIR',
-    'AGENTFORGE_TEST_ENV',
-    'TEST_VAR',
-    'TEST_FLAG',
-  ]);
-
-  private static validateCustomEnv(customEnv?: Record<string, string>): string | null {
-    if (!customEnv) return null;
+  private static validateCustomEnv(
+    customEnv?: Record<string, string>,
+    allowedEnvKeys?: string[]
+  ): string | null {
+    if (!customEnv || Object.keys(customEnv).length === 0) return null;
+    if (!allowedEnvKeys || allowedEnvKeys.length === 0) {
+      const firstKey = Object.keys(customEnv)[0];
+      return `Unauthorized custom environment variable key: "${firstKey}". No allowedEnvKeys were authorized.`;
+    }
+    const allowedSet = new Set(allowedEnvKeys);
     for (const key of Object.keys(customEnv)) {
-      if (!this.ALLOWED_CUSTOM_ENV_KEYS.has(key)) {
+      if (!allowedSet.has(key)) {
         return `Unauthorized custom environment variable key: "${key}".`;
       }
     }
@@ -112,16 +102,20 @@ export class ProcessRunner {
     'NODE_ENV',
   ];
 
-  private static buildMinimalEnv(customEnv?: Record<string, string>): NodeJS.ProcessEnv {
+  private static buildMinimalEnv(
+    customEnv?: Record<string, string>,
+    allowedEnvKeys?: string[]
+  ): NodeJS.ProcessEnv {
     const minimal: NodeJS.ProcessEnv = {};
     for (const key of this.SAFE_ENV_VARS) {
       if (process.env[key]) {
         minimal[key] = process.env[key];
       }
     }
-    if (customEnv) {
+    if (customEnv && allowedEnvKeys && allowedEnvKeys.length > 0) {
+      const allowedSet = new Set(allowedEnvKeys);
       for (const [k, v] of Object.entries(customEnv)) {
-        if (this.ALLOWED_CUSTOM_ENV_KEYS.has(k)) {
+        if (allowedSet.has(k)) {
           minimal[k] = v;
         }
       }
@@ -374,7 +368,7 @@ export class ProcessRunner {
     }
 
     // 2. Custom Environment Allowlist Validation Gate
-    const envValidationError = this.validateCustomEnv(options.env);
+    const envValidationError = this.validateCustomEnv(options.env, options.allowedEnvKeys);
     if (envValidationError) {
       if (options.repo) {
         options.repo.createProcessRun({
@@ -408,7 +402,7 @@ export class ProcessRunner {
     }
 
     // 3. Resolve safe platform invocation (Windows shim vs direct binary)
-    const minimalEnv = this.buildMinimalEnv(options.env);
+    const minimalEnv = this.buildMinimalEnv(options.env, options.allowedEnvKeys);
     if (process.platform === 'win32') {
       const trustedCmd = this.resolveTrustedCmdExe();
       if (trustedCmd) {
