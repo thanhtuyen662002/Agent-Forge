@@ -57,6 +57,7 @@ import {
   canonicalJsonStringify,
   computeSnapshotContentHash,
   computeManifestPayloadAndHash,
+  assertConsistentAttemptBindings,
 } from '../context/ContextIntegrity';
 
 export class Repository {
@@ -2695,34 +2696,36 @@ export class Repository {
       }
     }
 
+    let assignment: AgentAssignment | null = null;
     if (snapshot.assignment_id) {
-      const assignment = this.getAgentAssignment(snapshot.assignment_id);
+      assignment = this.getAgentAssignment(snapshot.assignment_id);
       if (!assignment) {
         throw new Error(`[Repository] createContextSnapshot failed: AgentAssignment "${snapshot.assignment_id}" not found.`);
       }
       if (assignment.project_id !== snapshot.project_id || assignment.task_id !== snapshot.task_id) {
         throw new Error(`[Repository] createContextSnapshot failed: AgentAssignment "${snapshot.assignment_id}" does not match project/task.`);
       }
-      if (snapshot.attempt_id && assignment.attempt_id && snapshot.attempt_id !== assignment.attempt_id) {
-        throw new Error(`[Repository] createContextSnapshot failed: AgentAssignment attempt "${assignment.attempt_id}" does not match snapshot attempt "${snapshot.attempt_id}".`);
-      }
     }
 
+    let session: AgentSession | null = null;
     if (snapshot.session_id) {
-      const session = this.getAgentSession(snapshot.session_id);
+      session = this.getAgentSession(snapshot.session_id);
       if (!session) {
         throw new Error(`[Repository] createContextSnapshot failed: AgentSession "${snapshot.session_id}" not found.`);
       }
       if (session.project_id !== snapshot.project_id || session.task_id !== snapshot.task_id) {
         throw new Error(`[Repository] createContextSnapshot failed: AgentSession "${snapshot.session_id}" does not match project/task.`);
       }
-      if (snapshot.attempt_id && session.attempt_id && snapshot.attempt_id !== session.attempt_id) {
-        throw new Error(`[Repository] createContextSnapshot failed: AgentSession attempt "${session.attempt_id}" does not match snapshot attempt "${snapshot.attempt_id}".`);
-      }
       if (snapshot.assignment_id && session.assignment_id && snapshot.assignment_id !== session.assignment_id) {
         throw new Error(`[Repository] createContextSnapshot failed: AgentSession assignment "${session.assignment_id}" does not match snapshot assignment "${snapshot.assignment_id}".`);
       }
     }
+
+    assertConsistentAttemptBindings('createContextSnapshot', [
+      { label: 'Snapshot attempt', attemptId: snapshot.attempt_id },
+      { label: 'AgentAssignment attempt', attemptId: assignment?.attempt_id },
+      { label: 'AgentSession attempt', attemptId: session?.attempt_id },
+    ]);
 
     this.db
       .prepare(`
@@ -3007,29 +3010,25 @@ export class Repository {
       }
     }
 
+    let fromAsgn: AgentAssignment | null = null;
     if (handoff.from_assignment_id) {
-      const fromAsgn = this.getAgentAssignment(handoff.from_assignment_id);
+      fromAsgn = this.getAgentAssignment(handoff.from_assignment_id);
       if (!fromAsgn) {
         throw new Error(`[Repository] createHandoffContext failed: From AgentAssignment "${handoff.from_assignment_id}" not found.`);
       }
       if (fromAsgn.project_id !== handoff.project_id || fromAsgn.task_id !== handoff.task_id) {
         throw new Error(`[Repository] createHandoffContext failed: From AgentAssignment "${handoff.from_assignment_id}" does not match project/task.`);
       }
-      if (handoff.attempt_id && fromAsgn.attempt_id && handoff.attempt_id !== fromAsgn.attempt_id) {
-        throw new Error(`[Repository] createHandoffContext failed: From AgentAssignment attempt "${fromAsgn.attempt_id}" does not match handoff attempt "${handoff.attempt_id}".`);
-      }
     }
 
+    let toAsgn: AgentAssignment | null = null;
     if (handoff.to_assignment_id) {
-      const toAsgn = this.getAgentAssignment(handoff.to_assignment_id);
+      toAsgn = this.getAgentAssignment(handoff.to_assignment_id);
       if (!toAsgn) {
         throw new Error(`[Repository] createHandoffContext failed: To AgentAssignment "${handoff.to_assignment_id}" not found.`);
       }
       if (toAsgn.project_id !== handoff.project_id || toAsgn.task_id !== handoff.task_id) {
         throw new Error(`[Repository] createHandoffContext failed: To AgentAssignment "${handoff.to_assignment_id}" does not match project/task.`);
-      }
-      if (handoff.attempt_id && toAsgn.attempt_id && handoff.attempt_id !== toAsgn.attempt_id) {
-        throw new Error(`[Repository] createHandoffContext failed: To AgentAssignment attempt "${toAsgn.attempt_id}" does not match handoff attempt "${handoff.attempt_id}".`);
       }
     }
 
@@ -3040,22 +3039,25 @@ export class Repository {
     if (sourceSnapshot.project_id !== handoff.project_id || sourceSnapshot.task_id !== handoff.task_id) {
       throw new Error(`[Repository] createHandoffContext failed: Source ContextSnapshot "${handoff.source_snapshot_id}" does not match project/task.`);
     }
-    if (handoff.attempt_id && sourceSnapshot.attempt_id && handoff.attempt_id !== sourceSnapshot.attempt_id) {
-      throw new Error(`[Repository] createHandoffContext failed: Source ContextSnapshot attempt "${sourceSnapshot.attempt_id}" does not match handoff attempt "${handoff.attempt_id}".`);
-    }
 
+    let handoffSnapshot: ContextSnapshot | null = null;
     if (handoff.handoff_snapshot_id) {
-      const handoffSnapshot = this.getContextSnapshot(handoff.handoff_snapshot_id);
+      handoffSnapshot = this.getContextSnapshot(handoff.handoff_snapshot_id);
       if (!handoffSnapshot) {
         throw new Error(`[Repository] createHandoffContext failed: Handoff ContextSnapshot "${handoff.handoff_snapshot_id}" not found.`);
       }
       if (handoffSnapshot.project_id !== handoff.project_id || handoffSnapshot.task_id !== handoff.task_id) {
         throw new Error(`[Repository] createHandoffContext failed: Handoff ContextSnapshot "${handoff.handoff_snapshot_id}" does not match project/task.`);
       }
-      if (handoff.attempt_id && handoffSnapshot.attempt_id && handoff.attempt_id !== handoffSnapshot.attempt_id) {
-        throw new Error(`[Repository] createHandoffContext failed: Handoff ContextSnapshot attempt "${handoffSnapshot.attempt_id}" does not match handoff attempt "${handoff.attempt_id}".`);
-      }
     }
+
+    assertConsistentAttemptBindings('createHandoffContext', [
+      { label: 'Handoff attempt', attemptId: handoff.attempt_id },
+      { label: 'From AgentAssignment attempt', attemptId: fromAsgn?.attempt_id },
+      { label: 'To AgentAssignment attempt', attemptId: toAsgn?.attempt_id },
+      { label: 'Source ContextSnapshot attempt', attemptId: sourceSnapshot?.attempt_id },
+      { label: 'Handoff ContextSnapshot attempt', attemptId: handoffSnapshot?.attempt_id },
+    ]);
 
     this.db
       .prepare(`

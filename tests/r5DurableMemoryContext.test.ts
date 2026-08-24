@@ -1971,7 +1971,7 @@ describe('R5B — Durable Memory & Context Fabric Contract Tests', () => {
         content_hash: 'hash',
         created_at: new Date().toISOString(),
       });
-    }).toThrowError(/Session attempt.*does not match snapshot attempt/);
+    }).toThrowError(/conflicting attempt bindings/);
   });
 
   it('38. HandoffContext from/to assignment from wrong task/project is rejected', () => {
@@ -2228,5 +2228,311 @@ describe('R5B — Durable Memory & Context Fabric Contract Tests', () => {
     expect(auth).toBeDefined();
     expect(auth.status).toBe('AUTHORIZED');
     expect(auth.context_manifest_hash).toBe(computeContextManifestHash(['README.md']));
+  });
+
+  it('48. ContextSnapshot: snapshot attempt NULL + assignment ATT-A + session ATT-B => rejected', () => {
+    const attemptA = 'att-cs-48-a-' + crypto.randomUUID();
+    const attemptB = 'att-cs-48-b-' + crypto.randomUUID();
+    repo.createTaskAttempt({ id: attemptA, task_id: taskIdA, agent_id: 'agent-r5b-default', attempt_number: 1, status: 'RUNNING', started_at: new Date().toISOString(), ended_at: null, summary: null });
+    repo.createTaskAttempt({ id: attemptB, task_id: taskIdA, agent_id: 'agent-r5b-default', attempt_number: 2, status: 'RUNNING', started_at: new Date().toISOString(), ended_at: null, summary: null });
+
+    const provId = 'prov-cs-48';
+    repo.createProvider({ id: provId, name: 'Provider 48', adapter_type: 'MANUAL_BRIDGE', enabled: true, created_at: new Date().toISOString() });
+    const accId = 'acc-cs-48-' + crypto.randomUUID();
+    repo.createProviderAccount({ id: accId, provider_id: provId, label: 'Acc 48', auth_mode: 'NATIVE_PROFILE', credential_ref: null, profile_ref: 'p', enabled: true, priority: 1, health_status: 'AVAILABLE', cooldown_until: null, concurrency_limit: 1, last_success_at: null, last_failure_at: null, last_failure_code: null, created_at: new Date().toISOString(), updated_at: new Date().toISOString() });
+    const resId = 'res-cs-48-' + crypto.randomUUID();
+    repo.createProviderResource({ id: resId, provider_id: provId, provider_account_id: accId, model_name: 'model', health_status: 'AVAILABLE', capabilities: ['CODING'], enabled: true, total_quota: null, remaining_quota: null, quota_unit: 'REQUESTS', quota_reset_at: null, quota_source: 'MANUAL', quota_confidence: 1.0, last_health_check: null });
+    const roleId = 'rp-cs-48-' + crypto.randomUUID();
+    repo.createRoleProfile({ id: roleId, role: 'CODER', display_name: 'Coder', required_capabilities: ['CODING'], preferred_capabilities: [], authority_scope: null, permissions: ['FILE_WRITE'], output_protocol: 'CODER_DIFF', enabled: true, created_at: new Date().toISOString(), updated_at: new Date().toISOString() });
+    const slotId = 'slot-cs-48-' + crypto.randomUUID();
+    repo.createWorkerSlot({ id: slotId, provider_account_id: accId, provider_resource_id: resId, slot_index: 0, status: 'IDLE', current_assignment_id: null, current_execution_id: null, heartbeat_at: null, created_at: new Date().toISOString(), updated_at: new Date().toISOString() });
+
+    const asgnA = 'asgn-cs-48-a-' + crypto.randomUUID();
+    repo.createAgentAssignment({
+      id: asgnA,
+      project_id: projectIdA,
+      task_id: taskIdA,
+      attempt_id: attemptA,
+      role_profile_id: roleId,
+      agent_profile_id: null,
+      selected_provider_id: provId,
+      selected_account_id: accId,
+      selected_resource_id: resId,
+      selected_worker_slot_id: slotId,
+      routing_decision_id: null,
+      preferred_metadata: null,
+      status: 'ASSIGNED',
+      created_at: new Date().toISOString(),
+      ended_at: null,
+    });
+
+    const sessB = 'sess-cs-48-b-' + crypto.randomUUID();
+    repo.createAgentSession({
+      id: sessB,
+      project_id: projectIdA,
+      task_id: taskIdA,
+      attempt_id: attemptB,
+      assignment_id: null,
+      provider_id: provId,
+      provider_account_id: accId,
+      provider_resource_id: resId,
+      external_session_ref: null,
+      status: 'ACTIVE',
+      started_at: new Date().toISOString(),
+      ended_at: null,
+      created_at: new Date().toISOString(),
+      updated_at: new Date().toISOString(),
+    });
+
+    expect(() => {
+      repo.createContextSnapshot({
+        id: 'snap-cs-48-' + crypto.randomUUID(),
+        project_id: projectIdA,
+        task_id: taskIdA,
+        attempt_id: null, // snapshot attempt NULL
+        assignment_id: asgnA, // assignment ATT-A
+        session_id: sessB, // session ATT-B
+        purpose: 'CUSTOM',
+        snapshot_version: 1,
+        builder_version: 'r5b-v1.1',
+        content_hash: 'hash48',
+        created_at: new Date().toISOString(),
+      });
+    }).toThrowError(/conflicting attempt bindings/);
+  });
+
+  it('49. ContextSnapshot: snapshot attempt NULL + assignment ATT-A + session ATT-A => accepted', () => {
+    const attemptA = 'att-cs-49-a-' + crypto.randomUUID();
+    repo.createTaskAttempt({ id: attemptA, task_id: taskIdA, agent_id: 'agent-r5b-default', attempt_number: 1, status: 'RUNNING', started_at: new Date().toISOString(), ended_at: null, summary: null });
+
+    const provId = 'prov-cs-49';
+    repo.createProvider({ id: provId, name: 'Provider 49', adapter_type: 'MANUAL_BRIDGE', enabled: true, created_at: new Date().toISOString() });
+    const accId = 'acc-cs-49-' + crypto.randomUUID();
+    repo.createProviderAccount({ id: accId, provider_id: provId, label: 'Acc 49', auth_mode: 'NATIVE_PROFILE', credential_ref: null, profile_ref: 'p', enabled: true, priority: 1, health_status: 'AVAILABLE', cooldown_until: null, concurrency_limit: 1, last_success_at: null, last_failure_at: null, last_failure_code: null, created_at: new Date().toISOString(), updated_at: new Date().toISOString() });
+    const resId = 'res-cs-49-' + crypto.randomUUID();
+    repo.createProviderResource({ id: resId, provider_id: provId, provider_account_id: accId, model_name: 'model', health_status: 'AVAILABLE', capabilities: ['CODING'], enabled: true, total_quota: null, remaining_quota: null, quota_unit: 'REQUESTS', quota_reset_at: null, quota_source: 'MANUAL', quota_confidence: 1.0, last_health_check: null });
+    const roleId = 'rp-cs-49-' + crypto.randomUUID();
+    repo.createRoleProfile({ id: roleId, role: 'CODER', display_name: 'Coder', required_capabilities: ['CODING'], preferred_capabilities: [], authority_scope: null, permissions: ['FILE_WRITE'], output_protocol: 'CODER_DIFF', enabled: true, created_at: new Date().toISOString(), updated_at: new Date().toISOString() });
+    const slotId = 'slot-cs-49-' + crypto.randomUUID();
+    repo.createWorkerSlot({ id: slotId, provider_account_id: accId, provider_resource_id: resId, slot_index: 0, status: 'IDLE', current_assignment_id: null, current_execution_id: null, heartbeat_at: null, created_at: new Date().toISOString(), updated_at: new Date().toISOString() });
+
+    const asgnA = 'asgn-cs-49-a-' + crypto.randomUUID();
+    repo.createAgentAssignment({
+      id: asgnA,
+      project_id: projectIdA,
+      task_id: taskIdA,
+      attempt_id: attemptA,
+      role_profile_id: roleId,
+      agent_profile_id: null,
+      selected_provider_id: provId,
+      selected_account_id: accId,
+      selected_resource_id: resId,
+      selected_worker_slot_id: slotId,
+      routing_decision_id: null,
+      preferred_metadata: null,
+      status: 'ASSIGNED',
+      created_at: new Date().toISOString(),
+      ended_at: null,
+    });
+
+    const sessA = 'sess-cs-49-a-' + crypto.randomUUID();
+    repo.createAgentSession({
+      id: sessA,
+      project_id: projectIdA,
+      task_id: taskIdA,
+      attempt_id: attemptA,
+      assignment_id: asgnA,
+      provider_id: provId,
+      provider_account_id: accId,
+      provider_resource_id: resId,
+      external_session_ref: null,
+      status: 'ACTIVE',
+      started_at: new Date().toISOString(),
+      ended_at: null,
+      created_at: new Date().toISOString(),
+      updated_at: new Date().toISOString(),
+    });
+
+    const snapId = 'snap-cs-49-' + crypto.randomUUID();
+    repo.createContextSnapshot({
+      id: snapId,
+      project_id: projectIdA,
+      task_id: taskIdA,
+      attempt_id: null, // snapshot attempt NULL
+      assignment_id: asgnA, // assignment ATT-A
+      session_id: sessA, // session ATT-A
+      purpose: 'CUSTOM',
+      snapshot_version: 1,
+      builder_version: 'r5b-v1.1',
+      content_hash: 'hash49',
+      created_at: new Date().toISOString(),
+    });
+
+    const persisted = repo.getContextSnapshot(snapId);
+    expect(persisted).not.toBeNull();
+    expect(persisted?.assignment_id).toBe(asgnA);
+    expect(persisted?.session_id).toBe(sessA);
+    expect(persisted?.attempt_id).toBeNull();
+  });
+
+  it('50. HandoffContext: handoff attempt NULL + from assignment ATT-A + to assignment ATT-B => rejected', () => {
+    const attemptA = 'att-hc-50-a-' + crypto.randomUUID();
+    const attemptB = 'att-hc-50-b-' + crypto.randomUUID();
+    repo.createTaskAttempt({ id: attemptA, task_id: taskIdA, agent_id: 'agent-r5b-default', attempt_number: 1, status: 'RUNNING', started_at: new Date().toISOString(), ended_at: null, summary: null });
+    repo.createTaskAttempt({ id: attemptB, task_id: taskIdA, agent_id: 'agent-r5b-default', attempt_number: 2, status: 'RUNNING', started_at: new Date().toISOString(), ended_at: null, summary: null });
+
+    const provId = 'prov-hc-50';
+    repo.createProvider({ id: provId, name: 'Provider 50', adapter_type: 'MANUAL_BRIDGE', enabled: true, created_at: new Date().toISOString() });
+    const accId = 'acc-hc-50-' + crypto.randomUUID();
+    repo.createProviderAccount({ id: accId, provider_id: provId, label: 'Acc 50', auth_mode: 'NATIVE_PROFILE', credential_ref: null, profile_ref: 'p', enabled: true, priority: 1, health_status: 'AVAILABLE', cooldown_until: null, concurrency_limit: 1, last_success_at: null, last_failure_at: null, last_failure_code: null, created_at: new Date().toISOString(), updated_at: new Date().toISOString() });
+    const resId = 'res-hc-50-' + crypto.randomUUID();
+    repo.createProviderResource({ id: resId, provider_id: provId, provider_account_id: accId, model_name: 'model', health_status: 'AVAILABLE', capabilities: ['CODING'], enabled: true, total_quota: null, remaining_quota: null, quota_unit: 'REQUESTS', quota_reset_at: null, quota_source: 'MANUAL', quota_confidence: 1.0, last_health_check: null });
+    const roleId = 'rp-hc-50-' + crypto.randomUUID();
+    repo.createRoleProfile({ id: roleId, role: 'CODER', display_name: 'Coder', required_capabilities: ['CODING'], preferred_capabilities: [], authority_scope: null, permissions: ['FILE_WRITE'], output_protocol: 'CODER_DIFF', enabled: true, created_at: new Date().toISOString(), updated_at: new Date().toISOString() });
+    const slotId = 'slot-hc-50-' + crypto.randomUUID();
+    repo.createWorkerSlot({ id: slotId, provider_account_id: accId, provider_resource_id: resId, slot_index: 0, status: 'IDLE', current_assignment_id: null, current_execution_id: null, heartbeat_at: null, created_at: new Date().toISOString(), updated_at: new Date().toISOString() });
+
+    const asgnA = 'asgn-hc-50-a-' + crypto.randomUUID();
+    repo.createAgentAssignment({
+      id: asgnA,
+      project_id: projectIdA,
+      task_id: taskIdA,
+      attempt_id: attemptA,
+      role_profile_id: roleId,
+      agent_profile_id: null,
+      selected_provider_id: provId,
+      selected_account_id: accId,
+      selected_resource_id: resId,
+      selected_worker_slot_id: slotId,
+      routing_decision_id: null,
+      preferred_metadata: null,
+      status: 'ASSIGNED',
+      created_at: new Date().toISOString(),
+      ended_at: null,
+    });
+
+    const asgnB = 'asgn-hc-50-b-' + crypto.randomUUID();
+    repo.createAgentAssignment({
+      id: asgnB,
+      project_id: projectIdA,
+      task_id: taskIdA,
+      attempt_id: attemptB,
+      role_profile_id: roleId,
+      agent_profile_id: null,
+      selected_provider_id: provId,
+      selected_account_id: accId,
+      selected_resource_id: resId,
+      selected_worker_slot_id: slotId,
+      routing_decision_id: null,
+      preferred_metadata: null,
+      status: 'ASSIGNED',
+      created_at: new Date().toISOString(),
+      ended_at: null,
+    });
+
+    const snap = contextBuilder.buildContextSnapshot({ projectId: projectIdA, taskId: taskIdA, attemptId: null });
+
+    expect(() => {
+      repo.createHandoffContext({
+        id: 'hc-50-' + crypto.randomUUID(),
+        project_id: projectIdA,
+        task_id: taskIdA,
+        attempt_id: null, // handoff attempt NULL
+        from_assignment_id: asgnA, // from assignment ATT-A
+        to_assignment_id: asgnB, // to assignment ATT-B
+        source_snapshot_id: snap.snapshot.id,
+        handoff_snapshot_id: null,
+        reason: 'HANDOFF_TEST',
+        status: 'READY',
+        created_at: new Date().toISOString(),
+        consumed_at: null,
+      });
+    }).toThrowError(/conflicting attempt bindings/);
+  });
+
+  it('51. HandoffContext: handoff attempt NULL + source snapshot ATT-A + handoff snapshot ATT-B => rejected', () => {
+    const attemptA = 'att-hc-51-a-' + crypto.randomUUID();
+    const attemptB = 'att-hc-51-b-' + crypto.randomUUID();
+    repo.createTaskAttempt({ id: attemptA, task_id: taskIdA, agent_id: 'agent-r5b-default', attempt_number: 1, status: 'RUNNING', started_at: new Date().toISOString(), ended_at: null, summary: null });
+    repo.createTaskAttempt({ id: attemptB, task_id: taskIdA, agent_id: 'agent-r5b-default', attempt_number: 2, status: 'RUNNING', started_at: new Date().toISOString(), ended_at: null, summary: null });
+
+    const snapA = contextBuilder.buildContextSnapshot({ projectId: projectIdA, taskId: taskIdA, attemptId: attemptA });
+    const snapB = contextBuilder.buildContextSnapshot({ projectId: projectIdA, taskId: taskIdA, attemptId: attemptB });
+
+    expect(() => {
+      repo.createHandoffContext({
+        id: 'hc-51-' + crypto.randomUUID(),
+        project_id: projectIdA,
+        task_id: taskIdA,
+        attempt_id: null, // handoff attempt NULL
+        from_assignment_id: null,
+        to_assignment_id: null,
+        source_snapshot_id: snapA.snapshot.id, // source snap ATT-A
+        handoff_snapshot_id: snapB.snapshot.id, // handoff snap ATT-B
+        reason: 'HANDOFF_TEST',
+        status: 'READY',
+        created_at: new Date().toISOString(),
+        consumed_at: null,
+      });
+    }).toThrowError(/conflicting attempt bindings/);
+  });
+
+  it('52. HandoffContext: handoff attempt NULL + all supplied non-null child attempts ATT-A => accepted', () => {
+    const attemptA = 'att-hc-52-a-' + crypto.randomUUID();
+    repo.createTaskAttempt({ id: attemptA, task_id: taskIdA, agent_id: 'agent-r5b-default', attempt_number: 1, status: 'RUNNING', started_at: new Date().toISOString(), ended_at: null, summary: null });
+
+    const provId = 'prov-hc-52';
+    repo.createProvider({ id: provId, name: 'Provider 52', adapter_type: 'MANUAL_BRIDGE', enabled: true, created_at: new Date().toISOString() });
+    const accId = 'acc-hc-52-' + crypto.randomUUID();
+    repo.createProviderAccount({ id: accId, provider_id: provId, label: 'Acc 52', auth_mode: 'NATIVE_PROFILE', credential_ref: null, profile_ref: 'p', enabled: true, priority: 1, health_status: 'AVAILABLE', cooldown_until: null, concurrency_limit: 1, last_success_at: null, last_failure_at: null, last_failure_code: null, created_at: new Date().toISOString(), updated_at: new Date().toISOString() });
+    const resId = 'res-hc-52-' + crypto.randomUUID();
+    repo.createProviderResource({ id: resId, provider_id: provId, provider_account_id: accId, model_name: 'model', health_status: 'AVAILABLE', capabilities: ['CODING'], enabled: true, total_quota: null, remaining_quota: null, quota_unit: 'REQUESTS', quota_reset_at: null, quota_source: 'MANUAL', quota_confidence: 1.0, last_health_check: null });
+    const roleId = 'rp-hc-52-' + crypto.randomUUID();
+    repo.createRoleProfile({ id: roleId, role: 'CODER', display_name: 'Coder', required_capabilities: ['CODING'], preferred_capabilities: [], authority_scope: null, permissions: ['FILE_WRITE'], output_protocol: 'CODER_DIFF', enabled: true, created_at: new Date().toISOString(), updated_at: new Date().toISOString() });
+    const slotId = 'slot-hc-52-' + crypto.randomUUID();
+    repo.createWorkerSlot({ id: slotId, provider_account_id: accId, provider_resource_id: resId, slot_index: 0, status: 'IDLE', current_assignment_id: null, current_execution_id: null, heartbeat_at: null, created_at: new Date().toISOString(), updated_at: new Date().toISOString() });
+
+    const asgnA = 'asgn-hc-52-a-' + crypto.randomUUID();
+    repo.createAgentAssignment({
+      id: asgnA,
+      project_id: projectIdA,
+      task_id: taskIdA,
+      attempt_id: attemptA,
+      role_profile_id: roleId,
+      agent_profile_id: null,
+      selected_provider_id: provId,
+      selected_account_id: accId,
+      selected_resource_id: resId,
+      selected_worker_slot_id: slotId,
+      routing_decision_id: null,
+      preferred_metadata: null,
+      status: 'ASSIGNED',
+      created_at: new Date().toISOString(),
+      ended_at: null,
+    });
+
+    const snapA = contextBuilder.buildContextSnapshot({ projectId: projectIdA, taskId: taskIdA, attemptId: attemptA });
+
+    const hcId = 'hc-52-' + crypto.randomUUID();
+    repo.createHandoffContext({
+      id: hcId,
+      project_id: projectIdA,
+      task_id: taskIdA,
+      attempt_id: null, // handoff attempt NULL
+      from_assignment_id: asgnA, // from assignment ATT-A
+      to_assignment_id: null, // to assignment NULL
+      source_snapshot_id: snapA.snapshot.id, // source snapshot ATT-A
+      handoff_snapshot_id: null, // handoff snapshot NULL
+      reason: 'HANDOFF_SUCCESS',
+      status: 'READY',
+      created_at: new Date().toISOString(),
+      consumed_at: null,
+    });
+
+    const persisted = repo.getHandoffContext(hcId);
+    expect(persisted).not.toBeNull();
+    expect(persisted?.attempt_id).toBeNull();
+    expect(persisted?.from_assignment_id).toBe(asgnA);
+    expect(persisted?.source_snapshot_id).toBe(snapA.snapshot.id);
   });
 });

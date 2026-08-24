@@ -320,3 +320,23 @@ export function verifyContextManifestIntegrity(
     items,
   };
 }
+
+/**
+ * Cross-object attempt binding consistency validator.
+ * Validates that all non-null/non-undefined attempt IDs participating in a durable provenance object agree.
+ * Permissive of null/undefined values (which are ignored).
+ * Fails closed with deterministic error if more than 1 distinct non-null attempt ID is present.
+ */
+export function assertConsistentAttemptBindings(
+  contextDescription: string,
+  bindings: Array<{ label: string; attemptId: string | null | undefined }>
+): void {
+  const nonNullBindings = bindings.filter(
+    (b) => b.attemptId !== null && b.attemptId !== undefined && typeof b.attemptId === 'string' && b.attemptId.trim() !== ''
+  );
+  const distinctAttempts = Array.from(new Set(nonNullBindings.map((b) => b.attemptId)));
+  if (distinctAttempts.length > 1) {
+    const details = nonNullBindings.map((b) => `${b.label}: "${b.attemptId}"`).join(', ');
+    throw new Error(`[Repository] ${contextDescription} failed: conflicting attempt bindings (${details}).`);
+  }
+}
