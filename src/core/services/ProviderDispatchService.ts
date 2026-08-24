@@ -4,8 +4,16 @@ import { Repository } from '../database/repositories';
 import { EventService } from './EventService';
 import { GitService } from './GitService';
 import { ProtocolParser } from '../protocol/parser';
-import { AgentExecutionRequest, AgentExecutionResult } from '../adapters/ProviderAdapter';
-import { ExecutionAuthorization } from '../types/domain';
+import {
+  AgentExecutionRequest,
+  AgentExecutionResult,
+  RuntimeExecutionBinding,
+} from '../adapters/ProviderAdapter';
+import {
+  ExecutionAuthorization,
+  ProviderAccount,
+  AgentAssignment,
+} from '../types/domain';
 import {
   computeCanonicalPayload,
   computePayloadHash,
@@ -322,13 +330,117 @@ export class ProviderDispatchService {
       }
     }
 
-    // 7. Reload and Validate Provider and Resource Enablement
+    // 8. R5F Account and Assignment Rebinding (for SELECTED routing outcome)
+    let account: ProviderAccount | null = null;
+    let assignment: AgentAssignment | null = null;
+
+    const hasFabricContext =
+      routingPayload.selectedAccountId !== undefined ||
+      routingPayload.selectedAssignmentId !== undefined ||
+      routingPayload.roleProfileId !== undefined;
+
+    if (routingOutcome === 'SELECTED' && hasFabricContext) {
+      const selectedAccountId = routingPayload.selectedAccountId;
+      if (typeof selectedAccountId !== 'string' || selectedAccountId.trim().length === 0) {
+        this.repo.invalidateExecutionAuthorization(auth.id);
+        const reason = 'ROUTING_ACCOUNT_ID_MISSING: Selected routing decision missing valid selectedAccountId.';
+        this.recordRejectionEvent(auth, reason);
+        return { executionId, status: 'FAILED', error: reason, errorCode: 'RESOURCE_UNAVAILABLE' };
+      }
+
+      const selectedAssignmentId = routingPayload.selectedAssignmentId;
+      if (typeof selectedAssignmentId !== 'string' || selectedAssignmentId.trim().length === 0) {
+        this.repo.invalidateExecutionAuthorization(auth.id);
+        const reason = 'ROUTING_ASSIGNMENT_ID_MISSING: Selected routing decision missing valid selectedAssignmentId.';
+        this.recordRejectionEvent(auth, reason);
+        return { executionId, status: 'FAILED', error: reason, errorCode: 'RESOURCE_UNAVAILABLE' };
+      }
+
+      account = this.repo.getProviderAccount(selectedAccountId);
+      if (!account) {
+        this.repo.invalidateExecutionAuthorization(auth.id);
+        const reason = `ROUTING_ACCOUNT_NOT_FOUND: Selected provider account "${selectedAccountId}" was not found in database.`;
+        this.recordRejectionEvent(auth, reason);
+        return { executionId, status: 'FAILED', error: reason, errorCode: 'RESOURCE_UNAVAILABLE' };
+      }
+
+      if (!account.enabled) {
+        this.repo.invalidateExecutionAuthorization(auth.id);
+        const reason = `ROUTING_ACCOUNT_DISABLED: Selected provider account "${account.id}" is disabled.`;
+        this.recordRejectionEvent(auth, reason);
+        return { executionId, status: 'FAILED', error: reason, errorCode: 'RESOURCE_UNAVAILABLE' };
+      }
+
+      if (account.provider_id !== auth.selected_provider_id) {
+        this.repo.invalidateExecutionAuthorization(auth.id);
+        const reason = `ROUTING_ACCOUNT_PROVIDER_MISMATCH: Account provider_id "${account.provider_id}" differs from authorized provider "${auth.selected_provider_id}".`;
+        this.recordRejectionEvent(auth, reason);
+        return { executionId, status: 'FAILED', error: reason, errorCode: 'RESOURCE_UNAVAILABLE' };
+      }
+
+      if (account.health_status === 'AUTH_ERROR') {
+        this.repo.invalidateExecutionAuthorization(auth.id);
+        const reason = `PROVIDER_ACCOUNT_AUTH_ERROR: Selected provider account "${account.id}" is in AUTH_ERROR state.`;
+        this.recordRejectionEvent(auth, reason);
+        return { executionId, status: 'FAILED', error: reason, errorCode: 'AUTH_ERROR' };
+      }
+
+      if (
+        account.health_status === 'OFFLINE' ||
+        account.health_status === 'UNHEALTHY' ||
+        account.health_status === 'DISABLED'
+      ) {
+        this.repo.invalidateExecutionAuthorization(auth.id);
+        const reason = `ROUTING_ACCOUNT_UNAVAILABLE: Selected provider account "${account.id}" has health status "${account.health_status}".`;
+        this.recordRejectionEvent(auth, reason);
+        return { executionId, status: 'FAILED', error: reason, errorCode: 'RESOURCE_UNAVAILABLE' };
+      }
+
+      assignment = this.repo.getAgentAssignment(selectedAssignmentId);
+      if (!assignment) {
+        this.repo.invalidateExecutionAuthorization(auth.id);
+        const reason = `ROUTING_ASSIGNMENT_NOT_FOUND: Selected assignment "${selectedAssignmentId}" was not found in database.`;
+        this.recordRejectionEvent(auth, reason);
+        return { executionId, status: 'FAILED', error: reason, errorCode: 'RESOURCE_UNAVAILABLE' };
+      }
+
+      if (
+        assignment.id !== selectedAssignmentId ||
+        assignment.project_id !== auth.project_id ||
+        assignment.task_id !== auth.task_id ||
+        assignment.attempt_id !== auth.attempt_id ||
+        assignment.selected_provider_id !== auth.selected_provider_id ||
+        assignment.selected_account_id !== account.id ||
+        assignment.selected_resource_id !== auth.selected_resource_id ||
+        assignment.routing_decision_id !== auth.routing_decision_id
+      ) {
+        this.repo.invalidateExecutionAuthorization(auth.id);
+        const reason = `ROUTING_ASSIGNMENT_SCOPE_MISMATCH: AgentAssignment "${assignment.id}" scope does not match authorization and routing decision.`;
+        this.recordRejectionEvent(auth, reason);
+        return { executionId, status: 'FAILED', error: reason, errorCode: 'RESOURCE_UNAVAILABLE' };
+      }
+
+      if (
+        assignment.status === 'COMPLETED' ||
+        assignment.status === 'FAILED' ||
+        assignment.status === 'CANCELLED' ||
+        assignment.status === 'HANDED_OFF'
+      ) {
+        this.repo.invalidateExecutionAuthorization(auth.id);
+        const reason = `ROUTING_ASSIGNMENT_STATUS_INVALID: AgentAssignment "${assignment.id}" is in terminal state "${assignment.status}".`;
+        this.recordRejectionEvent(auth, reason);
+        return { executionId, status: 'FAILED', error: reason, errorCode: 'RESOURCE_UNAVAILABLE' };
+      }
+    }
+
+    // 9. Reload and Validate Provider and Resource Enablement
     const resource = this.repo.getProviderResource(auth.selected_resource_id);
     if (!resource) {
       return {
         executionId,
         status: 'FAILED',
         error: `ROUTING_RESOURCE_NOT_FOUND: Selected resource "${auth.selected_resource_id}" not found in database.`,
+        errorCode: 'RESOURCE_UNAVAILABLE',
       };
     }
 
@@ -337,6 +449,19 @@ export class ProviderDispatchService {
         executionId,
         status: 'FAILED',
         error: `ROUTING_RESOURCE_DISABLED: Selected resource "${auth.selected_resource_id}" is disabled.`,
+        errorCode: 'RESOURCE_UNAVAILABLE',
+      };
+    }
+
+    if (account && resource.provider_account_id != null && resource.provider_account_id !== account.id) {
+      this.repo.invalidateExecutionAuthorization(auth.id);
+      const reason = `ROUTING_RESOURCE_ACCOUNT_MISMATCH: Selected resource "${resource.id}" requires account "${resource.provider_account_id}" but routing selected account "${account.id}".`;
+      this.recordRejectionEvent(auth, reason);
+      return {
+        executionId,
+        status: 'FAILED',
+        error: reason,
+        errorCode: 'RESOURCE_UNAVAILABLE',
       };
     }
 
@@ -346,6 +471,7 @@ export class ProviderDispatchService {
         executionId,
         status: 'FAILED',
         error: `ROUTING_PROVIDER_NOT_FOUND: Parent provider "${resource.provider_id}" not found in database.`,
+        errorCode: 'RESOURCE_UNAVAILABLE',
       };
     }
 
@@ -354,6 +480,7 @@ export class ProviderDispatchService {
         executionId,
         status: 'FAILED',
         error: `ROUTING_PROVIDER_DISABLED: Parent provider "${resource.provider_id}" is disabled.`,
+        errorCode: 'RESOURCE_UNAVAILABLE',
       };
     }
 
@@ -362,25 +489,40 @@ export class ProviderDispatchService {
         executionId,
         status: 'FAILED',
         error: `ROUTING_PROVIDER_MISMATCH: Resource provider_id "${resource.provider_id}" differs from authorized provider "${auth.selected_provider_id}".`,
+        errorCode: 'RESOURCE_UNAVAILABLE',
       };
     }
 
-    // 8. Validate Registered Provider Adapter & Outcome Compatibility
+    // 10. Validate Registered Provider Adapter & Outcome Compatibility
     if (!this.providerRegistry.has(auth.selected_provider_id)) {
       return {
         executionId,
         status: 'FAILED',
         error: `ROUTING_ADAPTER_UNREGISTERED: Provider adapter "${auth.selected_provider_id}" is not registered in ProviderRegistry.`,
+        errorCode: 'RESOURCE_UNAVAILABLE',
       };
     }
 
     const adapter = this.providerRegistry.resolve(auth.selected_provider_id);
+    if (provider.adapter_type !== adapter.adapterType) {
+      this.repo.invalidateExecutionAuthorization(auth.id);
+      const reason = `ROUTING_ADAPTER_TYPE_MISMATCH: Provider adapter_type "${provider.adapter_type}" does not match resolved adapter type "${adapter.adapterType}".`;
+      this.recordRejectionEvent(auth, reason);
+      return {
+        executionId,
+        status: 'FAILED',
+        error: reason,
+        errorCode: 'RESOURCE_UNAVAILABLE',
+      };
+    }
+
     if (routingOutcome === 'SELECTED' && adapter.adapterType === 'MANUAL_BRIDGE') {
       return {
         executionId,
         status: 'FAILED',
         error:
           'ROUTING_OUTCOME_ADAPTER_MISMATCH: Decision outcome is SELECTED but resolved adapter is MANUAL_BRIDGE.',
+        errorCode: 'RESOURCE_UNAVAILABLE',
       };
     }
 
@@ -390,10 +532,11 @@ export class ProviderDispatchService {
         status: 'FAILED',
         error:
           'ROUTING_OUTCOME_ADAPTER_MISMATCH: Decision outcome is MANUAL_HANDOFF_REQUIRED but resolved adapter is not MANUAL_BRIDGE.',
+        errorCode: 'RESOURCE_UNAVAILABLE',
       };
     }
 
-    // 9. Strict Canonical Payload Schema Validation and Integrity of Canonical Hashes
+    // 11. Strict Canonical Payload Schema Validation and Integrity of Canonical Hashes
     if (!auth.canonical_payload_json || auth.canonical_payload_json.trim() === '') {
       this.repo.invalidateExecutionAuthorization(auth.id);
       this.recordRejectionEvent(auth, 'EXECUTION_AUTHORIZATION_PAYLOAD_CORRUPT: Canonical execution payload JSON is missing.');
@@ -401,6 +544,7 @@ export class ProviderDispatchService {
         executionId,
         status: 'FAILED',
         error: 'EXECUTION_AUTHORIZATION_PAYLOAD_CORRUPT: Canonical execution payload JSON is missing.',
+        errorCode: 'PROTOCOL_INVALID',
       };
     }
 
@@ -415,6 +559,7 @@ export class ProviderDispatchService {
           executionId,
           status: 'FAILED',
           error: 'EXECUTION_AUTHORIZATION_PAYLOAD_CORRUPT: Canonical execution payload schema invalid.',
+          errorCode: 'PROTOCOL_INVALID',
         };
       }
       parsedCanonicalPayload = schemaValidation.data;
@@ -425,6 +570,7 @@ export class ProviderDispatchService {
         executionId,
         status: 'FAILED',
         error: 'EXECUTION_AUTHORIZATION_PAYLOAD_CORRUPT: Canonical execution payload malformed JSON.',
+        errorCode: 'PROTOCOL_INVALID',
       };
     }
 
@@ -436,6 +582,7 @@ export class ProviderDispatchService {
         executionId,
         status: 'FAILED',
         error: 'EXECUTION_AUTHORIZATION_HASH_MISMATCH: Context manifest hash recomputation failed.',
+        errorCode: 'PROTOCOL_INVALID',
       };
     }
 
@@ -457,6 +604,7 @@ export class ProviderDispatchService {
         executionId,
         status: 'FAILED',
         error: 'EXECUTION_AUTHORIZATION_HASH_MISMATCH: Canonical execution payload constraints mismatch.',
+        errorCode: 'PROTOCOL_INVALID',
       };
     }
 
@@ -482,10 +630,11 @@ export class ProviderDispatchService {
         executionId,
         status: 'FAILED',
         error: 'EXECUTION_AUTHORIZATION_HASH_MISMATCH: Canonical execution payload hash recomputation failed.',
+        errorCode: 'PROTOCOL_INVALID',
       };
     }
 
-    // 10. ATOMIC CLAIM: Consume authorization before execution
+    // 12. ATOMIC CLAIM: Consume authorization before execution
     const claimed = this.repo.claimExecutionAuthorization(authorizationId, nowIso);
     if (!claimed) {
       // Re-read current status to explain why claim failed
@@ -504,16 +653,33 @@ export class ProviderDispatchService {
       };
     }
 
-    // 11. Reconstruct AgentExecutionRequest from approved durable state (caller supplies NO instructions)
+    // 13. Construct RuntimeExecutionBinding & Reconstruct AgentExecutionRequest
+    let runtimeBinding: RuntimeExecutionBinding | undefined;
+    if (routingOutcome === 'SELECTED' && account && assignment) {
+      runtimeBinding = {
+        authorizationId: auth.id,
+        routingDecisionId: auth.routing_decision_id,
+        assignmentId: assignment.id,
+        providerId: auth.selected_provider_id,
+        accountId: account.id,
+        resourceId: auth.selected_resource_id,
+        adapterType: adapter.adapterType,
+        modelName: resource.model_name,
+        accountAuthMode: account.auth_mode,
+        profileRef: account.profile_ref ?? null,
+      };
+    }
+
     const request: AgentExecutionRequest = {
       projectId: auth.project_id,
       taskId: auth.task_id,
       attemptId: auth.attempt_id ?? undefined,
       instructions: parsedInstructions,
       contextFiles: parsedContextFiles,
+      runtimeBinding,
     };
 
-    // 12. Persist Dispatched Audit Event
+    // 14. Persist Dispatched Audit Event
     if (this.eventService) {
       this.eventService.record(
         auth.project_id,
@@ -540,8 +706,66 @@ export class ProviderDispatchService {
       );
     }
 
-    // 13. Execute the selected provider exactly once (NO retry, NO failover on failure)
-    return adapter.execute(request);
+    // 15. Emit PROVIDER_RUNTIME_EXECUTION_BOUND event
+    if (this.eventService && runtimeBinding) {
+      this.eventService.record(
+        auth.project_id,
+        'PROVIDER_RUNTIME_EXECUTION_BOUND',
+        `Runtime execution bound for task ${auth.task_id} to provider ${auth.selected_provider_id}, account ${runtimeBinding.accountId}, model ${runtimeBinding.modelName}`,
+        {
+          authorizationId: runtimeBinding.authorizationId,
+          routingDecisionId: runtimeBinding.routingDecisionId,
+          assignmentId: runtimeBinding.assignmentId,
+          projectId: auth.project_id,
+          taskId: auth.task_id,
+          attemptId: auth.attempt_id,
+          providerId: runtimeBinding.providerId,
+          accountId: runtimeBinding.accountId,
+          resourceId: runtimeBinding.resourceId,
+          adapterType: runtimeBinding.adapterType,
+          modelName: runtimeBinding.modelName,
+          profileRef: runtimeBinding.profileRef,
+        },
+        auth.task_id
+      );
+    }
+
+    // 16. Execute the selected provider exactly once (NO retry, NO failover on failure)
+    let result: AgentExecutionResult;
+    try {
+      result = await adapter.execute(request);
+    } catch (err: any) {
+      result = {
+        executionId,
+        status: 'FAILED',
+        errorCode: 'EXECUTION_FAILED',
+        error: `ADAPTER_EXECUTION_THREW: ${err.message}`,
+      };
+    }
+
+    // 17. Emit PROVIDER_RUNTIME_EXECUTION_RESULT event
+    if (this.eventService && runtimeBinding) {
+      this.eventService.record(
+        auth.project_id,
+        'PROVIDER_RUNTIME_EXECUTION_RESULT',
+        `Runtime execution ${result.executionId} finished with status ${result.status} for task ${auth.task_id}`,
+        {
+          executionId: result.executionId,
+          authorizationId: auth.id,
+          assignmentId: runtimeBinding.assignmentId,
+          providerId: runtimeBinding.providerId,
+          accountId: runtimeBinding.accountId,
+          resourceId: runtimeBinding.resourceId,
+          status: result.status,
+          errorCode: result.errorCode ?? null,
+          stdoutEvidenceId: result.stdoutEvidenceId ?? null,
+          stderrEvidenceId: result.stderrEvidenceId ?? null,
+        },
+        auth.task_id
+      );
+    }
+
+    return result;
   }
 
   private recordRejectionEvent(auth: ExecutionAuthorization, reason: string): void {

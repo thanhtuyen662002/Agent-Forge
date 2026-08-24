@@ -1,4 +1,17 @@
-import { Capability, ProviderHealthStatus, ProviderAdapterType, QuotaSource } from '../types/domain';
+import { Capability, ProviderHealthStatus, ProviderAdapterType, QuotaSource, AccountAuthMode } from '../types/domain';
+
+export type RuntimeErrorCode =
+  | 'AUTH_ERROR'
+  | 'QUOTA_EXHAUSTED'
+  | 'TIMEOUT'
+  | 'CANCELLED'
+  | 'PROCESS_LAUNCH_FAILED'
+  | 'NONZERO_EXIT'
+  | 'PROTOCOL_INVALID'
+  | 'UNSUPPORTED_CLIENT'
+  | 'RESOURCE_UNAVAILABLE'
+  | 'OUTPUT_LIMIT_EXCEEDED'
+  | 'EXECUTION_FAILED';
 
 export interface QuotaSnapshotInfo {
   remaining: number | null;
@@ -9,12 +22,26 @@ export interface QuotaSnapshotInfo {
   resetAt: string | null;
 }
 
+export interface RuntimeExecutionBinding {
+  authorizationId: string;
+  routingDecisionId: string;
+  assignmentId: string;
+  providerId: string;
+  accountId: string;
+  resourceId: string;
+  adapterType: ProviderAdapterType;
+  modelName: string;
+  accountAuthMode: AccountAuthMode;
+  profileRef: string | null;
+}
+
 export interface AgentExecutionRequest {
   taskId: string;
   projectId: string;
   instructions: string[];
   contextFiles: string[];
   attemptId?: string | null;
+  runtimeBinding?: RuntimeExecutionBinding;
 }
 
 export interface AgentExecutionResult {
@@ -23,6 +50,7 @@ export interface AgentExecutionResult {
   outputProtocol?: string;
   rawResponse?: string;
   error?: string;
+  errorCode?: RuntimeErrorCode | null;
   stdoutEvidenceId?: string | null;
   stderrEvidenceId?: string | null;
 }

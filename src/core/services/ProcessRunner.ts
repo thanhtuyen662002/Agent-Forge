@@ -17,6 +17,8 @@ export interface ProcessRunResult {
   durationMs: number;
   timedOut: boolean;
   cancelled: boolean;
+  outputLimitExceeded?: boolean;
+  errorCode?: 'TIMEOUT' | 'CANCELLED' | 'PROCESS_LAUNCH_FAILED' | 'NONZERO_EXIT' | 'OUTPUT_LIMIT_EXCEEDED' | null;
   stdoutEvidenceId?: string | null;
   stderrEvidenceId?: string | null;
 }
@@ -26,6 +28,8 @@ export interface StructuredProcessOptions {
   args: string[];
   cwd: string;
   timeoutMs?: number;
+  maxStdoutBytes?: number;
+  maxStderrBytes?: number;
   env?: Record<string, string>;
   allowShell?: boolean;
   repo?: Repository;
@@ -48,6 +52,38 @@ export class ProcessRunner {
     string,
     { process: ChildProcess; command: string; isCancelled: boolean; repo?: Repository }
   >();
+
+  public static readonly DEFAULT_MAX_OUTPUT_BYTES = 8 * 1024 * 1024; // 8 MiB default
+  public static readonly MAX_ALLOWED_OUTPUT_BYTES = 32 * 1024 * 1024; // 32 MiB hard cap
+
+  // Permitted custom environment variable keys
+  private static ALLOWED_CUSTOM_ENV_KEYS = new Set([
+    'PATH',
+    'Path',
+    'COMSPEC',
+    'ComSpec',
+    'SYSTEMROOT',
+    'SystemRoot',
+    'TEMP',
+    'TMP',
+    'NODE_ENV',
+    'CODEX_HOME',
+    'GEMINI_CLI_HOME',
+    'CLAUDE_CONFIG_DIR',
+    'AGENTFORGE_TEST_ENV',
+    'TEST_VAR',
+    'TEST_FLAG',
+  ]);
+
+  private static validateCustomEnv(customEnv?: Record<string, string>): string | null {
+    if (!customEnv) return null;
+    for (const key of Object.keys(customEnv)) {
+      if (!this.ALLOWED_CUSTOM_ENV_KEYS.has(key)) {
+        return `Unauthorized custom environment variable key: "${key}".`;
+      }
+    }
+    return null;
+  }
 
   private static SECRET_PATTERNS = [
     /AKIA[0-9A-Z]{16}/g, // AWS Access Key
@@ -84,7 +120,11 @@ export class ProcessRunner {
       }
     }
     if (customEnv) {
-      Object.assign(minimal, customEnv);
+      for (const [k, v] of Object.entries(customEnv)) {
+        if (this.ALLOWED_CUSTOM_ENV_KEYS.has(k)) {
+          minimal[k] = v;
+        }
+      }
     }
     return minimal;
   }
@@ -285,6 +325,15 @@ export class ProcessRunner {
     const startTime = Date.now();
     const startIso = new Date(startTime).toISOString();
 
+    const maxStdout =
+      options.maxStdoutBytes !== undefined && options.maxStdoutBytes > 0
+        ? Math.min(options.maxStdoutBytes, this.MAX_ALLOWED_OUTPUT_BYTES)
+        : this.DEFAULT_MAX_OUTPUT_BYTES;
+    const maxStderr =
+      options.maxStderrBytes !== undefined && options.maxStderrBytes > 0
+        ? Math.min(options.maxStderrBytes, this.MAX_ALLOWED_OUTPUT_BYTES)
+        : this.DEFAULT_MAX_OUTPUT_BYTES;
+
     // 1. Mandatory PolicyService Evaluation Gate (evaluated on raw logical command)
     const policy = PolicyService.evaluateProcessExecution(
       options.executable,
@@ -300,7 +349,7 @@ export class ProcessRunner {
           project_id: options.projectId ?? null,
           task_id: options.taskId ?? null,
           attempt_id: options.attemptId ?? null,
-          command: commandStr,
+          command: this.scrubSecrets(commandStr),
           working_directory: options.cwd,
           status: 'FAILED',
           start_time: startIso,
@@ -311,7 +360,7 @@ export class ProcessRunner {
       return {
         executionId,
         pid: null,
-        command: commandStr,
+        command: this.scrubSecrets(commandStr),
         cwd: options.cwd,
         exitCode: -1,
         stdout: '',
@@ -319,10 +368,46 @@ export class ProcessRunner {
         durationMs: 0,
         timedOut: false,
         cancelled: false,
+        outputLimitExceeded: false,
+        errorCode: 'PROCESS_LAUNCH_FAILED',
       };
     }
 
-    // 2. Resolve safe platform invocation (Windows shim vs direct binary)
+    // 2. Custom Environment Allowlist Validation Gate
+    const envValidationError = this.validateCustomEnv(options.env);
+    if (envValidationError) {
+      if (options.repo) {
+        options.repo.createProcessRun({
+          id: executionId,
+          pid: null,
+          project_id: options.projectId ?? null,
+          task_id: options.taskId ?? null,
+          attempt_id: options.attemptId ?? null,
+          command: this.scrubSecrets(commandStr),
+          working_directory: options.cwd,
+          status: 'FAILED',
+          start_time: startIso,
+        });
+        options.repo.updateProcessRun(executionId, 'FAILED', -1, new Date().toISOString(), null, null);
+      }
+
+      return {
+        executionId,
+        pid: null,
+        command: this.scrubSecrets(commandStr),
+        cwd: options.cwd,
+        exitCode: -1,
+        stdout: '',
+        stderr: `Process execution rejected: ${envValidationError}`,
+        durationMs: 0,
+        timedOut: false,
+        cancelled: false,
+        outputLimitExceeded: false,
+        errorCode: 'PROCESS_LAUNCH_FAILED',
+      };
+    }
+
+    // 3. Resolve safe platform invocation (Windows shim vs direct binary)
     const minimalEnv = this.buildMinimalEnv(options.env);
     if (process.platform === 'win32') {
       const trustedCmd = this.resolveTrustedCmdExe();
@@ -341,7 +426,7 @@ export class ProcessRunner {
           project_id: options.projectId ?? null,
           task_id: options.taskId ?? null,
           attempt_id: options.attemptId ?? null,
-          command: commandStr,
+          command: this.scrubSecrets(commandStr),
           working_directory: options.cwd,
           status: 'FAILED',
           start_time: startIso,
@@ -352,7 +437,7 @@ export class ProcessRunner {
       return {
         executionId,
         pid: null,
-        command: commandStr,
+        command: this.scrubSecrets(commandStr),
         cwd: options.cwd,
         exitCode: -1,
         stdout: '',
@@ -360,6 +445,8 @@ export class ProcessRunner {
         durationMs: 0,
         timedOut: false,
         cancelled: false,
+        outputLimitExceeded: false,
+        errorCode: 'PROCESS_LAUNCH_FAILED',
       };
     }
 
@@ -371,7 +458,7 @@ export class ProcessRunner {
         project_id: options.projectId ?? null,
         task_id: options.taskId ?? null,
         attempt_id: options.attemptId ?? null,
-        command: commandStr,
+        command: this.scrubSecrets(commandStr),
         working_directory: options.cwd,
         status: 'RUNNING',
         start_time: startIso,
@@ -381,7 +468,10 @@ export class ProcessRunner {
     return new Promise((resolve) => {
       let stdoutAcc = '';
       let stderrAcc = '';
+      let stdoutByteCount = 0;
+      let stderrByteCount = 0;
       let isTimedOut = false;
+      let isOutputLimitExceeded = false;
 
       // Spawn child process directly with minimal sanitized environment
       const child = spawn(invocation.executable, invocation.args, {
@@ -423,14 +513,46 @@ export class ProcessRunner {
       }
 
       if (child.stdout) {
-        child.stdout.on('data', (data) => {
-          stdoutAcc += data.toString('utf8');
+        child.stdout.on('data', (data: Buffer | string) => {
+          if (isOutputLimitExceeded) return;
+          const chunkBuf = Buffer.isBuffer(data) ? data : Buffer.from(data, 'utf8');
+          const chunkLen = chunkBuf.length;
+
+          if (stdoutByteCount + chunkLen > maxStdout) {
+            isOutputLimitExceeded = true;
+            const remaining = maxStdout - stdoutByteCount;
+            if (remaining > 0) {
+              stdoutAcc += chunkBuf.subarray(0, remaining).toString('utf8');
+              stdoutByteCount += remaining;
+            }
+            this.killProcessTree(child);
+            return;
+          }
+
+          stdoutAcc += chunkBuf.toString('utf8');
+          stdoutByteCount += chunkLen;
         });
       }
 
       if (child.stderr) {
-        child.stderr.on('data', (data) => {
-          stderrAcc += data.toString('utf8');
+        child.stderr.on('data', (data: Buffer | string) => {
+          if (isOutputLimitExceeded) return;
+          const chunkBuf = Buffer.isBuffer(data) ? data : Buffer.from(data, 'utf8');
+          const chunkLen = chunkBuf.length;
+
+          if (stderrByteCount + chunkLen > maxStderr) {
+            isOutputLimitExceeded = true;
+            const remaining = maxStderr - stderrByteCount;
+            if (remaining > 0) {
+              stderrAcc += chunkBuf.subarray(0, remaining).toString('utf8');
+              stderrByteCount += remaining;
+            }
+            this.killProcessTree(child);
+            return;
+          }
+
+          stderrAcc += chunkBuf.toString('utf8');
+          stderrByteCount += chunkLen;
         });
       }
 
@@ -440,6 +562,16 @@ export class ProcessRunner {
         this.activeProcesses.delete(executionId);
         const durationMs = Date.now() - startTime;
         const endIso = new Date().toISOString();
+
+        let finalErrorCode: 'TIMEOUT' | 'CANCELLED' | 'PROCESS_LAUNCH_FAILED' | 'NONZERO_EXIT' | 'OUTPUT_LIMIT_EXCEEDED' =
+          'PROCESS_LAUNCH_FAILED';
+        if (wasCancelled) {
+          finalErrorCode = 'CANCELLED';
+        } else if (isTimedOut) {
+          finalErrorCode = 'TIMEOUT';
+        } else if (isOutputLimitExceeded) {
+          finalErrorCode = 'OUTPUT_LIMIT_EXCEEDED';
+        }
 
         if (options.repo) {
           options.repo.updateProcessRun(
@@ -453,7 +585,7 @@ export class ProcessRunner {
         resolve({
           executionId,
           pid: child.pid ?? null,
-          command: commandStr,
+          command: this.scrubSecrets(commandStr),
           cwd: options.cwd,
           exitCode: -1,
           stdout: this.scrubSecrets(stdoutAcc),
@@ -461,6 +593,8 @@ export class ProcessRunner {
           durationMs,
           timedOut: isTimedOut,
           cancelled: wasCancelled,
+          outputLimitExceeded: isOutputLimitExceeded,
+          errorCode: finalErrorCode,
         });
       });
 
@@ -472,12 +606,21 @@ export class ProcessRunner {
         const endIso = new Date().toISOString();
 
         let terminalStatus: 'COMPLETED' | 'FAILED' | 'CANCELLED' | 'TIMED_OUT' = 'COMPLETED';
+        let finalErrorCode: 'TIMEOUT' | 'CANCELLED' | 'PROCESS_LAUNCH_FAILED' | 'NONZERO_EXIT' | 'OUTPUT_LIMIT_EXCEEDED' | null =
+          null;
+
         if (wasCancelled) {
           terminalStatus = 'CANCELLED';
+          finalErrorCode = 'CANCELLED';
         } else if (isTimedOut) {
           terminalStatus = 'TIMED_OUT';
+          finalErrorCode = 'TIMEOUT';
+        } else if (isOutputLimitExceeded) {
+          terminalStatus = 'FAILED';
+          finalErrorCode = 'OUTPUT_LIMIT_EXCEEDED';
         } else if (code !== 0) {
           terminalStatus = 'FAILED';
+          finalErrorCode = 'NONZERO_EXIT';
         }
 
         let stdoutEvidenceId: string | null = null;
@@ -492,7 +635,7 @@ export class ProcessRunner {
               options.taskId ?? null,
               null,
               'PROCESS_LOG',
-              `Stdout for ${commandStr}`,
+              `Stdout for ${this.scrubSecrets(commandStr)}`,
               this.scrubSecrets(stdoutAcc),
               'text/plain'
             );
@@ -506,7 +649,7 @@ export class ProcessRunner {
               options.taskId ?? null,
               null,
               'PROCESS_LOG',
-              `Stderr for ${commandStr}`,
+              `Stderr for ${this.scrubSecrets(commandStr)}`,
               this.scrubSecrets(stderrAcc),
               'text/plain'
             );
@@ -520,7 +663,7 @@ export class ProcessRunner {
             options.repo.updateProcessRun(
               executionId,
               terminalStatus,
-              code ?? (isTimedOut ? -2 : wasCancelled ? -1 : 0),
+              code ?? (isTimedOut ? -2 : wasCancelled ? -1 : isOutputLimitExceeded ? -3 : 0),
               endIso,
               stdoutEvidenceId,
               stderrEvidenceId
@@ -533,14 +676,20 @@ export class ProcessRunner {
         resolve({
           executionId,
           pid: child.pid ?? null,
-          command: commandStr,
+          command: this.scrubSecrets(commandStr),
           cwd: options.cwd,
-          exitCode: code ?? (isTimedOut ? -2 : wasCancelled ? -1 : 0),
+          exitCode: code ?? (isTimedOut ? -2 : wasCancelled ? -1 : isOutputLimitExceeded ? -3 : 0),
           stdout: this.scrubSecrets(stdoutAcc),
-          stderr: this.scrubSecrets(stderrAcc),
+          stderr: this.scrubSecrets(
+            isOutputLimitExceeded
+              ? `${stderrAcc}\n[Process output limit exceeded]`.trim()
+              : stderrAcc
+          ),
           durationMs,
           timedOut: isTimedOut,
           cancelled: wasCancelled,
+          outputLimitExceeded: isOutputLimitExceeded,
+          errorCode: finalErrorCode,
           stdoutEvidenceId,
           stderrEvidenceId,
         });
