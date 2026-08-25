@@ -1,25 +1,26 @@
 import { Repository } from '../database/repositories';
 import { ProviderHealthStatus } from '../types/domain';
+import { ProviderFailureCategory } from './ExecutionFailureClassifier';
 
 export interface RateLimitedHealthUpdateOptions {
   cooldownDurationMs?: number;
   cooldownUntil?: string | Date;
-  failureCode?: string;
+  failureCode?: ProviderFailureCategory;
 }
 
 export interface QuotaExhaustedHealthUpdateOptions {
   cooldownUntil?: string | Date | null;
-  failureCode?: string;
+  failureCode?: ProviderFailureCategory;
 }
 
 export interface AuthErrorHealthUpdateOptions {
-  failureCode?: string;
+  failureCode?: ProviderFailureCategory;
 }
 
 export interface CooldownHealthUpdateOptions {
   cooldownDurationMs?: number;
   cooldownUntil?: string | Date;
-  failureCode?: string;
+  failureCode?: ProviderFailureCategory;
 }
 
 export class AccountHealthService {
@@ -37,6 +38,7 @@ export class AccountHealthService {
    * its health status to AVAILABLE and clearing any active cooldown.
    */
   public recordSuccess(accountId: string): void {
+    this.ensureAccountExists(accountId);
     this.repo.updateProviderAccountHealth(accountId, 'AVAILABLE');
   }
 
@@ -45,8 +47,9 @@ export class AccountHealthService {
    * Fails closed if no explicit cooldown duration or timestamp is provided (no invented defaults).
    */
   public recordRateLimited(accountId: string, options: RateLimitedHealthUpdateOptions): void {
+    this.ensureAccountExists(accountId);
     const cooldownUntil = this.resolveExplicitCooldownUntil(options);
-    const failureCode = options.failureCode ?? 'RATE_LIMITED';
+    const failureCode: ProviderFailureCategory = options.failureCode ?? 'RATE_LIMITED';
 
     this.repo.updateProviderAccountHealth(
       accountId,
@@ -64,18 +67,13 @@ export class AccountHealthService {
     accountId: string,
     options?: QuotaExhaustedHealthUpdateOptions
   ): void {
+    this.ensureAccountExists(accountId);
     let cooldownUntil: string | null = null;
     if (options?.cooldownUntil) {
-      const parsed = new Date(options.cooldownUntil);
-      if (isNaN(parsed.getTime())) {
-        throw new Error(
-          `INVALID_COOLDOWN_TIMESTAMP: Provided cooldownUntil "${options.cooldownUntil}" is not a valid date.`
-        );
-      }
-      cooldownUntil = parsed.toISOString();
+      cooldownUntil = this.parseAndValidateFutureCooldown(options.cooldownUntil);
     }
 
-    const failureCode = options?.failureCode ?? 'QUOTA_EXHAUSTED';
+    const failureCode: ProviderFailureCategory = options?.failureCode ?? 'QUOTA_EXHAUSTED';
 
     this.repo.updateProviderAccountHealth(
       accountId,
@@ -90,7 +88,8 @@ export class AccountHealthService {
    * and clears cooldown (authentication errors require owner intervention).
    */
   public recordAuthError(accountId: string, options?: AuthErrorHealthUpdateOptions): void {
-    const failureCode = options?.failureCode ?? 'AUTH_ERROR';
+    this.ensureAccountExists(accountId);
+    const failureCode: ProviderFailureCategory = options?.failureCode ?? 'AUTHENTICATION_FAILURE';
 
     this.repo.updateProviderAccountHealth(
       accountId,
@@ -104,8 +103,9 @@ export class AccountHealthService {
    * Records an explicit COOLDOWN status with a required future cooldown duration or timestamp.
    */
   public recordCooldown(accountId: string, options: CooldownHealthUpdateOptions): void {
+    this.ensureAccountExists(accountId);
     const cooldownUntil = this.resolveExplicitCooldownUntil(options);
-    const failureCode = options.failureCode ?? 'COOLDOWN';
+    const failureCode: ProviderFailureCategory = options.failureCode ?? 'RATE_LIMITED';
 
     this.repo.updateProviderAccountHealth(
       accountId,
@@ -121,17 +121,12 @@ export class AccountHealthService {
   public recordGeneralFailure(
     accountId: string,
     healthStatus: ProviderHealthStatus,
-    options?: { failureCode?: string; cooldownUntil?: string | Date | null }
+    options?: { failureCode?: ProviderFailureCategory; cooldownUntil?: string | Date | null }
   ): void {
+    this.ensureAccountExists(accountId);
     let cooldownUntil: string | null = null;
     if (options?.cooldownUntil) {
-      const parsed = new Date(options.cooldownUntil);
-      if (isNaN(parsed.getTime())) {
-        throw new Error(
-          `INVALID_COOLDOWN_TIMESTAMP: Provided cooldownUntil "${options.cooldownUntil}" is not a valid date.`
-        );
-      }
-      cooldownUntil = parsed.toISOString();
+      cooldownUntil = this.parseAndValidateFutureCooldown(options.cooldownUntil);
     }
 
     this.repo.updateProviderAccountHealth(
@@ -142,17 +137,35 @@ export class AccountHealthService {
     );
   }
 
+  private ensureAccountExists(accountId: string): void {
+    const account = this.repo.getProviderAccount(accountId);
+    if (!account) {
+      throw new Error(`PROVIDER_ACCOUNT_NOT_FOUND: ProviderAccount "${accountId}" not found.`);
+    }
+  }
+
+  private parseAndValidateFutureCooldown(cooldownUntil: string | Date): string {
+    const parsed = new Date(cooldownUntil);
+    if (isNaN(parsed.getTime())) {
+      throw new Error(
+        `INVALID_COOLDOWN_TIMESTAMP: Provided cooldownUntil "${cooldownUntil}" is not a valid date.`
+      );
+    }
+    const targetMs = parsed.getTime();
+    const currentMs = this.now().getTime();
+    if (targetMs <= currentMs) {
+      throw new Error(
+        `INVALID_COOLDOWN_TIMESTAMP: Cooldown timestamp must be strictly in the future relative to current time (${this.now().toISOString()}).`
+      );
+    }
+    return parsed.toISOString();
+  }
+
   private resolveExplicitCooldownUntil(
     options: RateLimitedHealthUpdateOptions | CooldownHealthUpdateOptions
   ): string {
     if (options.cooldownUntil !== undefined && options.cooldownUntil !== null) {
-      const parsed = new Date(options.cooldownUntil);
-      if (isNaN(parsed.getTime())) {
-        throw new Error(
-          `INVALID_COOLDOWN_TIMESTAMP: Provided cooldownUntil "${options.cooldownUntil}" is not a valid date.`
-        );
-      }
-      return parsed.toISOString();
+      return this.parseAndValidateFutureCooldown(options.cooldownUntil);
     }
 
     if (
