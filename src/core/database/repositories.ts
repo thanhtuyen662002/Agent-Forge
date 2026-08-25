@@ -72,6 +72,11 @@ export class Repository {
     return tx();
   }
 
+  public runInImmediateTransaction<T>(fn: () => T): T {
+    const tx = this.db.transaction(fn);
+    return tx.immediate();
+  }
+
   // ==========================================
   // Projects
   // ==========================================
@@ -2090,6 +2095,19 @@ export class Repository {
       .run(status, endedAt !== undefined ? endedAt : (status === 'COMPLETED' || status === 'FAILED' || status === 'CANCELLED' ? new Date().toISOString() : null), id);
   }
 
+  public bindAgentAssignmentWorkerSlotIfUnbound(assignmentId: string, workerSlotId: string): boolean {
+    const result = this.db
+      .prepare(`
+        UPDATE agent_assignments
+        SET selected_worker_slot_id = ?
+        WHERE id = ?
+          AND selected_worker_slot_id IS NULL
+          AND status = 'ASSIGNED'
+      `)
+      .run(workerSlotId, assignmentId);
+    return result.changes === 1;
+  }
+
   private mapAgentAssignment(row: Record<string, unknown>): AgentAssignment {
     return {
       id: String(row.id),
@@ -2172,6 +2190,20 @@ export class Repository {
     return row ? this.mapAccountLease(row) : null;
   }
 
+  public getActiveLeaseForAssignment(assignmentId: string): AccountLease | null {
+    const row = this.db
+      .prepare('SELECT * FROM account_leases WHERE assignment_id = ? AND released_at IS NULL')
+      .get(assignmentId) as Record<string, unknown> | undefined;
+    return row ? this.mapAccountLease(row) : null;
+  }
+
+  public getUnreleasedAccountLeasesByAccount(accountId: string): AccountLease[] {
+    const rows = this.db
+      .prepare('SELECT * FROM account_leases WHERE provider_account_id = ? AND released_at IS NULL ORDER BY acquired_at DESC')
+      .all(accountId) as Record<string, unknown>[];
+    return rows.map((r) => this.mapAccountLease(r));
+  }
+
   public getAccountLeasesByAssignment(assignmentId: string): AccountLease[] {
     const rows = this.db.prepare('SELECT * FROM account_leases WHERE assignment_id = ? ORDER BY acquired_at DESC').all(assignmentId) as Record<string, unknown>[];
     return rows.map((r) => this.mapAccountLease(r));
@@ -2181,6 +2213,33 @@ export class Repository {
     this.db
       .prepare('UPDATE account_leases SET released_at = ? WHERE id = ?')
       .run(releasedAt ?? new Date().toISOString(), id);
+  }
+
+  public updateAccountLeaseHeartbeat(
+    leaseId: string,
+    leaseToken: string,
+    heartbeatAt: string,
+    expiresAt: string
+  ): boolean {
+    const result = this.db
+      .prepare(`
+        UPDATE account_leases
+        SET heartbeat_at = ?, expires_at = ?
+        WHERE id = ? AND lease_token = ? AND released_at IS NULL
+      `)
+      .run(heartbeatAt, expiresAt, leaseId, leaseToken);
+    return result.changes === 1;
+  }
+
+  public releaseAccountLeaseWithToken(leaseId: string, leaseToken: string, releasedAt?: string): boolean {
+    const result = this.db
+      .prepare(`
+        UPDATE account_leases
+        SET released_at = ?
+        WHERE id = ? AND lease_token = ? AND released_at IS NULL
+      `)
+      .run(releasedAt ?? new Date().toISOString(), leaseId, leaseToken);
+    return result.changes === 1;
   }
 
   private mapAccountLease(row: Record<string, unknown>): AccountLease {
