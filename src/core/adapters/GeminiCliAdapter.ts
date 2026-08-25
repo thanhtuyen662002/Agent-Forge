@@ -121,8 +121,6 @@ export class GeminiCliAdapter extends LocalCliAdapterBase {
   ): string[] {
     const modelName = request.runtimeBinding?.modelName;
     return [
-      '--prompt',
-      '',
       '--output-format',
       'json',
       '--model',

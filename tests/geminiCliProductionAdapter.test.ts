@@ -751,30 +751,60 @@ describe('R5F0D1 — Production Gemini CLI Adapter Contract Suite', () => {
       expect(logs.length).toBe(1);
       const log = logs[0];
 
-      // Prompt is in stdin
+      // Prompt is in stdin exactly once and non-empty
+      expect(log.stdin).toBeTruthy();
       expect(log.stdin).toContain('Instruction line 1');
       expect(log.stdin).toContain('Instruction line 2');
 
-      // Prompt is NOT in argv
+      // Prompt body is NOT in argv
       for (const arg of log.argv) {
         expect(arg).not.toContain('Instruction line 1');
         expect(arg).not.toContain('Instruction line 2');
       }
 
-      // Argv structure: --prompt, "", --output-format, json, --model, <model>, --sandbox, --approval-mode, default
-      expect(log.argv).toContain('--prompt');
-      expect(log.argv).toContain('--output-format');
-      expect(log.argv).toContain('json');
-      expect(log.argv).toContain('--model');
-      expect(log.argv).toContain('gemini-1.5-pro');
-      expect(log.argv).toContain('--sandbox');
-      expect(log.argv).toContain('--approval-mode');
-      expect(log.argv).toContain('default');
+      // Prompt flags (--prompt / -p) are strictly absent from argv
+      expect(log.argv).not.toContain('--prompt');
+      expect(log.argv).not.toContain('-p');
+
+      // Exact argv structure
+      expect(log.argv).toEqual([
+        '--output-format',
+        'json',
+        '--model',
+        'gemini-1.5-pro',
+        '--sandbox',
+        '--approval-mode',
+        'default',
+      ]);
 
       // No YOLO flag
       expect(log.argv).not.toContain('--yolo');
       expect(log.argv).not.toContain('-y');
       expect(log.argv).not.toContain('yolo');
+    });
+
+    it('11b. Regression: Adapter never emits empty-value prompt flags', async () => {
+      const adapter = new GeminiCliAdapter({
+        executable: fakeGeminiExecutable,
+        repo,
+        artifactStore,
+        profileResolver: resolver,
+      });
+
+      await adapter.execute(createValidRequest());
+
+      const logs = getLogs();
+      expect(logs.length).toBe(1);
+      const argv = logs[0].argv;
+
+      // Ensure no sequence of ['--prompt', ''] or ['-p', '']
+      for (let i = 0; i < argv.length; i++) {
+        if (argv[i] === '--prompt' || argv[i] === '-p') {
+          expect(argv[i + 1]).not.toBe('');
+        }
+        expect(argv[i]).not.toBe('--prompt');
+        expect(argv[i]).not.toBe('-p');
+      }
     });
 
     it('12. Working directory matches target project repository directory', async () => {
