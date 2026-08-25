@@ -767,20 +767,34 @@ describe('ConcurrentExecutionScheduler (R5G3D1)', () => {
 
   // 27. scheduler waits for original dispatch promise after cancellation.
   it('27. scheduler waits for original dispatch promise after cancellation', async () => {
-    let dispatchSettled = false;
-    adapter.executionBarrier = new Promise((resolve) => {
-      setTimeout(() => {
-        dispatchSettled = true;
-        resolve({ executionId: 'exec-1', status: 'CANCELLED' });
-      }, 50);
+    const cancelSpy = vi.spyOn(dispatchService, 'cancelScheduled');
+    let resolveDispatch!: (res: AgentExecutionResult) => void;
+    const executeStartedPromise = new Promise<void>((resolve) => {
+      adapter.onExecuteStarted = resolve;
+      adapter.executionBarrier = new Promise((res) => {
+        resolveDispatch = res;
+      });
     });
 
-    const execPromise = scheduler.execute(authId);
+    let schedulerSettled = false;
+    const execPromise = scheduler.execute(authId).then((result) => {
+      schedulerSettled = true;
+      return result;
+    });
+
+    await executeStartedPromise;
+
     db.prepare("UPDATE account_leases SET expires_at = '2020-01-01T00:00:00.000Z'").run();
     await timer.fireNext();
 
+    expect(cancelSpy).toHaveBeenCalledWith(authId);
+    expect(cancelSpy).toHaveBeenCalledTimes(1);
+    expect(schedulerSettled).toBe(false);
+
+    resolveDispatch({ executionId: 'exec-1', status: 'CANCELLED' });
+
     const res = await execPromise;
-    expect(dispatchSettled).toBe(true);
+    expect(schedulerSettled).toBe(true);
     expect(res.status).toBe('LEASE_OWNERSHIP_LOST');
   });
 
