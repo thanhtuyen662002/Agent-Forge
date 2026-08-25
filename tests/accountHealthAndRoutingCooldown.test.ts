@@ -387,7 +387,6 @@ describe('R5H1 — Failure Taxonomy, Account Health & Routing Cooldown', () => {
       const explicitUntil = '2026-08-25T12:15:30.000Z';
       healthService.recordRateLimited(accountId, {
         cooldownUntil: explicitUntil,
-        failureCode: 'RATE_LIMITED',
       });
 
       const updated = repo.getProviderAccount(accountId)!;
@@ -461,7 +460,10 @@ describe('R5H1 — Failure Taxonomy, Account Health & Routing Cooldown', () => {
       );
 
       expect(() =>
-        healthService.recordCooldown('missing-account', { cooldownDurationMs: 60000 })
+        healthService.recordCooldown('missing-account', {
+          cooldownDurationMs: 60000,
+          failureCode: 'RATE_LIMITED',
+        })
       ).toThrow(/PROVIDER_ACCOUNT_NOT_FOUND/);
 
       expect(() =>
@@ -482,7 +484,6 @@ describe('R5H1 — Failure Taxonomy, Account Health & Routing Cooldown', () => {
       const resetTime = '2026-08-26T00:00:00.000Z';
       healthService.recordQuotaExhausted(accountId, {
         cooldownUntil: resetTime,
-        failureCode: 'QUOTA_EXHAUSTED',
       });
 
       const updated = repo.getProviderAccount(accountId)!;
@@ -516,6 +517,50 @@ describe('R5H1 — Failure Taxonomy, Account Health & Routing Cooldown', () => {
       expect(updated.health_status).toBe('AVAILABLE');
       expect(updated.cooldown_until).toBeNull();
       expect(updated.last_success_at).toBeDefined();
+    });
+
+    it('records generic COOLDOWN with explicit failureCode and rejects missing failureCode', () => {
+      healthService.recordCooldown(accountId, {
+        cooldownDurationMs: 30000,
+        failureCode: 'RESOURCE_UNAVAILABLE',
+      });
+
+      const updated = repo.getProviderAccount(accountId)!;
+      expect(updated.health_status).toBe('COOLDOWN');
+      expect(updated.last_failure_code).toBe('RESOURCE_UNAVAILABLE');
+      expect(updated.cooldown_until).toBe('2026-08-25T12:00:30.000Z');
+
+      expect(() =>
+        healthService.recordCooldown(accountId, {
+          cooldownDurationMs: 30000,
+        } as any)
+      ).toThrow(/MISSING_COOLDOWN_FAILURE_CODE/);
+    });
+
+    it('records general failure for non-dedicated statuses and rejects dedicated statuses', () => {
+      healthService.recordGeneralFailure(accountId, 'UNHEALTHY', {
+        failureCode: 'LOCAL_PROCESS_FAILURE',
+      });
+
+      const updated = repo.getProviderAccount(accountId)!;
+      expect(updated.health_status).toBe('UNHEALTHY');
+      expect(updated.last_failure_code).toBe('LOCAL_PROCESS_FAILURE');
+
+      expect(() => healthService.recordGeneralFailure(accountId, 'AVAILABLE')).toThrow(
+        /INVALID_GENERAL_HEALTH_STATUS/
+      );
+      expect(() => healthService.recordGeneralFailure(accountId, 'RATE_LIMITED')).toThrow(
+        /INVALID_GENERAL_HEALTH_STATUS/
+      );
+      expect(() => healthService.recordGeneralFailure(accountId, 'QUOTA_EXHAUSTED')).toThrow(
+        /INVALID_GENERAL_HEALTH_STATUS/
+      );
+      expect(() => healthService.recordGeneralFailure(accountId, 'AUTH_ERROR')).toThrow(
+        /INVALID_GENERAL_HEALTH_STATUS/
+      );
+      expect(() => healthService.recordGeneralFailure(accountId, 'COOLDOWN')).toThrow(
+        /INVALID_GENERAL_HEALTH_STATUS/
+      );
     });
   });
 

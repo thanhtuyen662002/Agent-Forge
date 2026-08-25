@@ -5,22 +5,26 @@ import { ProviderFailureCategory } from './ExecutionFailureClassifier';
 export interface RateLimitedHealthUpdateOptions {
   cooldownDurationMs?: number;
   cooldownUntil?: string | Date;
-  failureCode?: ProviderFailureCategory;
 }
 
 export interface QuotaExhaustedHealthUpdateOptions {
   cooldownUntil?: string | Date | null;
-  failureCode?: ProviderFailureCategory;
 }
 
-export interface AuthErrorHealthUpdateOptions {
-  failureCode?: ProviderFailureCategory;
-}
+export type CooldownFailureCategory =
+  | 'RATE_LIMITED'
+  | 'QUOTA_EXHAUSTED'
+  | 'RESOURCE_UNAVAILABLE';
 
 export interface CooldownHealthUpdateOptions {
   cooldownDurationMs?: number;
   cooldownUntil?: string | Date;
+  failureCode: CooldownFailureCategory;
+}
+
+export interface GeneralFailureHealthUpdateOptions {
   failureCode?: ProviderFailureCategory;
+  cooldownUntil?: string | Date | null;
 }
 
 export class AccountHealthService {
@@ -45,23 +49,24 @@ export class AccountHealthService {
   /**
    * Records rate limiting for the provider account with an explicit future cooldown.
    * Fails closed if no explicit cooldown duration or timestamp is provided (no invented defaults).
+   * Always binds last_failure_code to RATE_LIMITED.
    */
   public recordRateLimited(accountId: string, options: RateLimitedHealthUpdateOptions): void {
     this.ensureAccountExists(accountId);
     const cooldownUntil = this.resolveExplicitCooldownUntil(options);
-    const failureCode: ProviderFailureCategory = options.failureCode ?? 'RATE_LIMITED';
 
     this.repo.updateProviderAccountHealth(
       accountId,
       'RATE_LIMITED',
       cooldownUntil,
-      failureCode
+      'RATE_LIMITED'
     );
   }
 
   /**
    * Records quota exhaustion for the provider account. Does not invent a cooldown
    * unless explicitly supplied by caller policy.
+   * Always binds last_failure_code to QUOTA_EXHAUSTED.
    */
   public recordQuotaExhausted(
     accountId: string,
@@ -73,57 +78,73 @@ export class AccountHealthService {
       cooldownUntil = this.parseAndValidateFutureCooldown(options.cooldownUntil);
     }
 
-    const failureCode: ProviderFailureCategory = options?.failureCode ?? 'QUOTA_EXHAUSTED';
-
     this.repo.updateProviderAccountHealth(
       accountId,
       'QUOTA_EXHAUSTED',
       cooldownUntil,
-      failureCode
+      'QUOTA_EXHAUSTED'
     );
   }
 
   /**
    * Records authentication failure for the provider account. Sets status to AUTH_ERROR
    * and clears cooldown (authentication errors require owner intervention).
+   * Always binds last_failure_code to AUTHENTICATION_FAILURE.
    */
-  public recordAuthError(accountId: string, options?: AuthErrorHealthUpdateOptions): void {
+  public recordAuthError(accountId: string): void {
     this.ensureAccountExists(accountId);
-    const failureCode: ProviderFailureCategory = options?.failureCode ?? 'AUTHENTICATION_FAILURE';
 
     this.repo.updateProviderAccountHealth(
       accountId,
       'AUTH_ERROR',
       null,
-      failureCode
+      'AUTHENTICATION_FAILURE'
     );
   }
 
   /**
-   * Records an explicit COOLDOWN status with a required future cooldown duration or timestamp.
+   * Records an explicit COOLDOWN status with a required future cooldown duration or timestamp,
+   * and an explicit temporary CooldownFailureCategory (no invented default reason).
    */
   public recordCooldown(accountId: string, options: CooldownHealthUpdateOptions): void {
     this.ensureAccountExists(accountId);
+    if (!options || !options.failureCode) {
+      throw new Error(
+        'MISSING_COOLDOWN_FAILURE_CODE: Generic recordCooldown requires an explicit failureCode.'
+      );
+    }
     const cooldownUntil = this.resolveExplicitCooldownUntil(options);
-    const failureCode: ProviderFailureCategory = options.failureCode ?? 'RATE_LIMITED';
 
     this.repo.updateProviderAccountHealth(
       accountId,
       'COOLDOWN',
       cooldownUntil,
-      failureCode
+      options.failureCode
     );
   }
 
   /**
    * Records a general health degradation (e.g. UNHEALTHY, OFFLINE) with optional failure code.
+   * Rejects dedicated semantic health statuses (AVAILABLE, RATE_LIMITED, QUOTA_EXHAUSTED, AUTH_ERROR, COOLDOWN).
    */
   public recordGeneralFailure(
     accountId: string,
     healthStatus: ProviderHealthStatus,
-    options?: { failureCode?: ProviderFailureCategory; cooldownUntil?: string | Date | null }
+    options?: GeneralFailureHealthUpdateOptions
   ): void {
     this.ensureAccountExists(accountId);
+    if (
+      healthStatus === 'AVAILABLE' ||
+      healthStatus === 'RATE_LIMITED' ||
+      healthStatus === 'QUOTA_EXHAUSTED' ||
+      healthStatus === 'AUTH_ERROR' ||
+      healthStatus === 'COOLDOWN'
+    ) {
+      throw new Error(
+        `INVALID_GENERAL_HEALTH_STATUS: Dedicated health status "${healthStatus}" must be recorded using its dedicated mutation method.`
+      );
+    }
+
     let cooldownUntil: string | null = null;
     if (options?.cooldownUntil) {
       cooldownUntil = this.parseAndValidateFutureCooldown(options.cooldownUntil);
