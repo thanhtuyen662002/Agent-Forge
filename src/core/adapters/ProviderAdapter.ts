@@ -24,6 +24,13 @@ export interface QuotaSnapshotInfo {
   resetAt: string | null;
 }
 
+export interface RuntimeWorkspaceBinding {
+  workerSlotId: string;
+  ownershipDigest: string;
+  sourceSha: string;
+  workingDirectory: string;
+}
+
 export interface RuntimeExecutionBinding {
   authorizationId: string;
   routingDecisionId: string;
@@ -35,6 +42,7 @@ export interface RuntimeExecutionBinding {
   modelName: string;
   accountAuthMode: AccountAuthMode;
   profileRef: string | null;
+  workspace?: RuntimeWorkspaceBinding;
 }
 
 export interface AgentExecutionRequest {

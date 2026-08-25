@@ -14,6 +14,7 @@ import {
   ProviderAccount,
   AgentAssignment,
 } from '../types/domain';
+import { GitWorktreeService, WorktreeOwnershipTuple, WorktreeInspection } from './GitWorktreeService';
 import {
   computeCanonicalPayload,
   computePayloadHash,
@@ -26,15 +27,36 @@ export class ProviderDispatchService {
   constructor(
     private providerRegistry: ProviderRegistry,
     private repo: Repository,
-    private eventService?: EventService
+    private eventService?: EventService,
+    private gitWorktreeService?: GitWorktreeService
   ) {}
 
+  public setGitWorktreeService(service: GitWorktreeService): void {
+    this.gitWorktreeService = service;
+  }
+
   /**
-   * Dispatches task execution bound to an immutable, durably persisted ExecutionAuthorization.
+   * Dispatches task execution bound to an immutable, durably persisted ExecutionAuthorization in legacy mode.
    * Atomically claims the authorization to prevent duplicate/concurrent executions.
    * Derives all execution instructions internally from approved durable state.
    */
   public async dispatch(authorizationId: string): Promise<AgentExecutionResult> {
+    return this.dispatchInternal(authorizationId, 'LEGACY');
+  }
+
+  /**
+   * Dispatches task execution bound to an immutable, durably persisted ExecutionAuthorization in scheduled mode.
+   * Verifies that the required worker slot and isolated Git worktree are already prepared, locked, and clean.
+   * Populates RuntimeExecutionBinding with verified workspace metadata for adapter execution.
+   */
+  public async dispatchScheduled(authorizationId: string): Promise<AgentExecutionResult> {
+    return this.dispatchInternal(authorizationId, 'SCHEDULED');
+  }
+
+  private async dispatchInternal(
+    authorizationId: string,
+    mode: 'LEGACY' | 'SCHEDULED'
+  ): Promise<AgentExecutionResult> {
     const executionId = crypto.randomUUID();
     const nowIso = new Date().toISOString();
 
@@ -305,6 +327,15 @@ export class ProviderDispatchService {
       };
     }
 
+    if (mode === 'SCHEDULED' && routingOutcome === 'MANUAL_HANDOFF_REQUIRED') {
+      return {
+        executionId,
+        status: 'FAILED',
+        errorCode: 'RESOURCE_UNAVAILABLE',
+        error: 'SCHEDULED_DISPATCH_NOT_APPLICABLE: Scheduled dispatch is not applicable to MANUAL_HANDOFF_REQUIRED decisions.',
+      };
+    }
+
     // 7. Dispatch-Time Task State Liveness Check
     if (routingOutcome === 'SELECTED') {
       if (task.state !== 'CODING') {
@@ -431,6 +462,99 @@ export class ProviderDispatchService {
         this.recordRejectionEvent(auth, reason);
         return { executionId, status: 'FAILED', error: reason, errorCode: 'RESOURCE_UNAVAILABLE' };
       }
+    }
+
+    // 8b. Scheduled Mode Workspace Inspection & Verification (BEFORE claim)
+    let inspectedWorkspace: WorktreeInspection | undefined;
+    if (mode === 'SCHEDULED') {
+      if (!this.gitWorktreeService) {
+        return {
+          executionId,
+          status: 'FAILED',
+          errorCode: 'RESOURCE_UNAVAILABLE',
+          error: 'SCHEDULED_GIT_WORKTREE_SERVICE_NOT_CONFIGURED: Scheduled dispatch requires a configured GitWorktreeService.',
+        };
+      }
+
+      if (!assignment || !assignment.selected_worker_slot_id || assignment.selected_worker_slot_id.trim().length === 0) {
+        return {
+          executionId,
+          status: 'FAILED',
+          errorCode: 'RESOURCE_UNAVAILABLE',
+          error: 'ROUTING_ASSIGNMENT_SLOT_MISSING: Scheduled dispatch requires assignment to have a valid selected_worker_slot_id.',
+        };
+      }
+
+      const ownershipTuple: WorktreeOwnershipTuple = {
+        projectId: auth.project_id,
+        taskId: auth.task_id,
+        attemptId: auth.attempt_id ?? null,
+        assignmentId: assignment.id,
+        workerSlotId: assignment.selected_worker_slot_id,
+        baseSha: auth.repository_head_sha,
+      };
+
+      const inspectResult = await this.gitWorktreeService.inspectWorktree(ownershipTuple);
+      if (inspectResult.status !== 'INSPECTED') {
+        return {
+          executionId,
+          status: 'FAILED',
+          errorCode: 'RESOURCE_UNAVAILABLE',
+          error: `SCHEDULED_WORKSPACE_INSPECTION_FAILED: Worktree inspection failed: ${inspectResult.error}`,
+        };
+      }
+
+      const insp = inspectResult.inspection;
+      if (!insp.exists) {
+        return {
+          executionId,
+          status: 'FAILED',
+          errorCode: 'RESOURCE_UNAVAILABLE',
+          error: `SCHEDULED_WORKSPACE_MISSING: Worktree directory does not exist: ${insp.managedPath}`,
+        };
+      }
+      if (!insp.registered) {
+        return {
+          executionId,
+          status: 'FAILED',
+          errorCode: 'RESOURCE_UNAVAILABLE',
+          error: `SCHEDULED_WORKSPACE_NOT_REGISTERED: Worktree "${insp.managedPath}" is not registered in Git porcelain list.`,
+        };
+      }
+      if (!insp.sourceMatch || !insp.headSha || insp.headSha.toLowerCase() !== auth.repository_head_sha.toLowerCase()) {
+        return {
+          executionId,
+          status: 'FAILED',
+          errorCode: 'RESOURCE_UNAVAILABLE',
+          error: `SCHEDULED_WORKSPACE_HEAD_MISMATCH: Worktree HEAD ("${insp.headSha}") does not match authorized repository HEAD ("${auth.repository_head_sha}").`,
+        };
+      }
+      if (!insp.detached) {
+        return {
+          executionId,
+          status: 'FAILED',
+          errorCode: 'RESOURCE_UNAVAILABLE',
+          error: `SCHEDULED_WORKSPACE_NOT_DETACHED: Worktree "${insp.managedPath}" is not in detached HEAD state.`,
+        };
+      }
+      if (!insp.locked) {
+        return {
+          executionId,
+          status: 'FAILED',
+          errorCode: 'RESOURCE_UNAVAILABLE',
+          error: `SCHEDULED_WORKSPACE_NOT_LOCKED: Worktree "${insp.managedPath}" is not locked.`,
+        };
+      }
+      if (!insp.clean) {
+        return {
+          executionId,
+          status: 'FAILED',
+          errorCode: 'RESOURCE_UNAVAILABLE',
+          error: `SCHEDULED_WORKSPACE_DIRTY: Worktree "${insp.managedPath}" has uncommitted or untracked changes before dispatch.`,
+        };
+      }
+
+      inspectedWorkspace = insp;
     }
 
     // 9. Reload and Validate Provider and Resource Enablement
@@ -668,6 +792,15 @@ export class ProviderDispatchService {
         accountAuthMode: account.auth_mode,
         profileRef: account.profile_ref ?? null,
       };
+
+      if (mode === 'SCHEDULED' && inspectedWorkspace && assignment.selected_worker_slot_id) {
+        runtimeBinding.workspace = {
+          workerSlotId: assignment.selected_worker_slot_id,
+          ownershipDigest: inspectedWorkspace.ownershipDigest,
+          sourceSha: auth.repository_head_sha,
+          workingDirectory: inspectedWorkspace.managedPath,
+        };
+      }
     }
 
     const request: AgentExecutionRequest = {
@@ -708,24 +841,32 @@ export class ProviderDispatchService {
 
     // 15. Emit PROVIDER_RUNTIME_EXECUTION_BOUND event
     if (this.eventService && runtimeBinding) {
+      const boundPayload: Record<string, unknown> = {
+        authorizationId: runtimeBinding.authorizationId,
+        routingDecisionId: runtimeBinding.routingDecisionId,
+        assignmentId: runtimeBinding.assignmentId,
+        projectId: auth.project_id,
+        taskId: auth.task_id,
+        attemptId: auth.attempt_id,
+        providerId: runtimeBinding.providerId,
+        accountId: runtimeBinding.accountId,
+        resourceId: runtimeBinding.resourceId,
+        adapterType: runtimeBinding.adapterType,
+        modelName: runtimeBinding.modelName,
+        profileRef: runtimeBinding.profileRef,
+      };
+
+      if (runtimeBinding.workspace) {
+        boundPayload.workerSlotId = runtimeBinding.workspace.workerSlotId;
+        boundPayload.workspaceOwnershipDigest = runtimeBinding.workspace.ownershipDigest;
+        boundPayload.workspaceSourceSha = runtimeBinding.workspace.sourceSha;
+      }
+
       this.eventService.record(
         auth.project_id,
         'PROVIDER_RUNTIME_EXECUTION_BOUND',
         `Runtime execution bound for task ${auth.task_id} to provider ${auth.selected_provider_id}, account ${runtimeBinding.accountId}, model ${runtimeBinding.modelName}`,
-        {
-          authorizationId: runtimeBinding.authorizationId,
-          routingDecisionId: runtimeBinding.routingDecisionId,
-          assignmentId: runtimeBinding.assignmentId,
-          projectId: auth.project_id,
-          taskId: auth.task_id,
-          attemptId: auth.attempt_id,
-          providerId: runtimeBinding.providerId,
-          accountId: runtimeBinding.accountId,
-          resourceId: runtimeBinding.resourceId,
-          adapterType: runtimeBinding.adapterType,
-          modelName: runtimeBinding.modelName,
-          profileRef: runtimeBinding.profileRef,
-        },
+        boundPayload,
         auth.task_id
       );
     }

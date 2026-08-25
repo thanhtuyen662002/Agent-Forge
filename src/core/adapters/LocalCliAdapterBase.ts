@@ -170,57 +170,124 @@ export abstract class LocalCliAdapterBase implements ProviderAdapter {
       };
     }
 
-    // 2. Resolve target project repository path from durable database state
-    const project = this.repo.getProject(request.projectId);
-    if (!project) {
-      return {
-        executionId,
-        status: 'FAILED',
-        error: `Project "${request.projectId}" not found in database.`,
-      };
-    }
-    const repoPath = path.normalize(path.resolve(project.repository_path));
+    // 2. Resolve execution root directory (Scheduled Workspace or Legacy Project Repository Path)
+    let executionRoot: string;
+    const workspace = request.runtimeBinding?.workspace;
 
-    // 3. Validate repository directory existence
-    if (!fs.existsSync(repoPath)) {
-      return {
-        executionId,
-        status: 'FAILED',
-        error: `Project repository path does not exist on disk: ${repoPath}`,
-      };
-    }
-
-    try {
-      const stat = fs.statSync(repoPath);
-      if (!stat.isDirectory()) {
+    if (workspace) {
+      // Defense-in-depth structural validation of ProviderDispatch-produced workspace binding
+      if (
+        !workspace.workingDirectory ||
+        typeof workspace.workingDirectory !== 'string' ||
+        !path.isAbsolute(workspace.workingDirectory)
+      ) {
         return {
           executionId,
           status: 'FAILED',
-          error: `Project repository path is not a directory: ${repoPath}`,
+          error: `INVALID_WORKSPACE_BINDING: workingDirectory must be an absolute path (received "${workspace?.workingDirectory}").`,
         };
       }
-    } catch (err: any) {
-      return {
-        executionId,
-        status: 'FAILED',
-        error: `Cannot access project repository directory: ${err.message}`,
-      };
+      if (!workspace.sourceSha || typeof workspace.sourceSha !== 'string' || !/^[0-9a-fA-F]{40}$/.test(workspace.sourceSha)) {
+        return {
+          executionId,
+          status: 'FAILED',
+          error: `INVALID_WORKSPACE_BINDING: sourceSha must be a 40-character hexadecimal string (received "${workspace?.sourceSha}").`,
+        };
+      }
+      if (!workspace.workerSlotId || typeof workspace.workerSlotId !== 'string' || workspace.workerSlotId.trim() === '') {
+        return {
+          executionId,
+          status: 'FAILED',
+          error: 'INVALID_WORKSPACE_BINDING: workerSlotId must be a non-empty string.',
+        };
+      }
+      if (!workspace.ownershipDigest || typeof workspace.ownershipDigest !== 'string' || workspace.ownershipDigest.trim() === '') {
+        return {
+          executionId,
+          status: 'FAILED',
+          error: 'INVALID_WORKSPACE_BINDING: ownershipDigest must be a non-empty string.',
+        };
+      }
+
+      const wsPath = path.normalize(path.resolve(workspace.workingDirectory));
+      if (!fs.existsSync(wsPath)) {
+        return {
+          executionId,
+          status: 'FAILED',
+          error: `INVALID_WORKSPACE_BINDING: Workspace working directory does not exist: ${wsPath}`,
+        };
+      }
+      try {
+        const wsStat = fs.statSync(wsPath);
+        if (!wsStat.isDirectory()) {
+          return {
+            executionId,
+            status: 'FAILED',
+            error: `INVALID_WORKSPACE_BINDING: Workspace working directory is not a directory: ${wsPath}`,
+          };
+        }
+      } catch (err: any) {
+        return {
+          executionId,
+          status: 'FAILED',
+          error: `INVALID_WORKSPACE_BINDING: Cannot access workspace working directory: ${err.message}`,
+        };
+      }
+      executionRoot = wsPath;
+    } else {
+      // Legacy path resolution from durable Project database entity
+      const project = this.repo.getProject(request.projectId);
+      if (!project) {
+        return {
+          executionId,
+          status: 'FAILED',
+          error: `Project "${request.projectId}" not found in database.`,
+        };
+      }
+      const repoPath = path.normalize(path.resolve(project.repository_path));
+
+      // Validate repository directory existence
+      if (!fs.existsSync(repoPath)) {
+        return {
+          executionId,
+          status: 'FAILED',
+          error: `Project repository path does not exist on disk: ${repoPath}`,
+        };
+      }
+
+      try {
+        const stat = fs.statSync(repoPath);
+        if (!stat.isDirectory()) {
+          return {
+            executionId,
+            status: 'FAILED',
+            error: `Project repository path is not a directory: ${repoPath}`,
+          };
+        }
+      } catch (err: any) {
+        return {
+          executionId,
+          status: 'FAILED',
+          error: `Cannot access project repository directory: ${err.message}`,
+        };
+      }
+      executionRoot = repoPath;
     }
 
-    // 3. Security Policy: Validate project root path
-    const rootPolicy = PolicyService.evaluatePathAccess(repoPath, repoPath, false);
+    // 3. Security Policy: Validate execution root path
+    const rootPolicy = PolicyService.evaluatePathAccess(executionRoot, executionRoot, false);
     if (!rootPolicy.allowed) {
       return {
         executionId,
         status: 'FAILED',
-        error: `Project repository path violates security policy: ${rootPolicy.reason}`,
+        error: `Execution working directory violates security policy: ${rootPolicy.reason}`,
       };
     }
 
-    // 4. Security Policy: Validate and canonicalize all context file paths
+    // 4. Security Policy: Validate and canonicalize all context file paths relative to executionRoot
     for (const contextFile of request.contextFiles) {
-      const canonicalTarget = path.normalize(path.resolve(repoPath, contextFile));
-      const filePolicy = PolicyService.evaluatePathAccess(canonicalTarget, repoPath, false);
+      const canonicalTarget = path.normalize(path.resolve(executionRoot, contextFile));
+      const filePolicy = PolicyService.evaluatePathAccess(canonicalTarget, executionRoot, false);
       if (!filePolicy.allowed) {
         return {
           executionId,
@@ -240,7 +307,7 @@ export abstract class LocalCliAdapterBase implements ProviderAdapter {
     const processResult = await ProcessRunner.execute({
       executable: this.executable,
       args,
-      cwd: repoPath,
+      cwd: executionRoot,
       timeoutMs: this.timeoutMs,
       env: executionEnv,
       allowedEnvKeys,
