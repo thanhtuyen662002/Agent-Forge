@@ -49,7 +49,7 @@ export class ExecutionFailureClassifier {
     }
 
     const code = result.errorCode;
-    const errorText = `${result.error ?? ''} ${result.rawResponse ?? ''}`.trim();
+    const errorText = (result.error ?? '').trim();
 
     // 1. Quota / Rate-limit checks
     if (code === 'QUOTA_EXHAUSTED') {

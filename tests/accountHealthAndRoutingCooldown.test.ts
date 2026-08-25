@@ -108,7 +108,7 @@ describe('R5H1 — Failure Taxonomy, Account Health & Routing Cooldown', () => {
           executionId: 'exec-3',
           status: 'FAILED',
           errorCode: 'QUOTA_EXHAUSTED',
-          rawResponse: 'HTTP 429: Too many requests. Please wait.',
+          error: 'Rate limit: HTTP 429: Too many requests. Please wait.',
         },
       ];
 
@@ -118,6 +118,47 @@ describe('R5H1 — Failure Taxonomy, Account Health & Routing Cooldown', () => {
         expect(classified.disposition).toBe('FAILOVER_ELIGIBLE');
         expect(classified.sourceErrorCode).toBe('QUOTA_EXHAUSTED');
       }
+    });
+
+    it('does NOT classify QUOTA_EXHAUSTED as RATE_LIMITED when rate limit text is only in rawResponse', () => {
+      const result: AgentExecutionResult = {
+        executionId: 'exec-raw-429',
+        status: 'FAILED',
+        errorCode: 'QUOTA_EXHAUSTED',
+        error: 'Quota exhausted.',
+        rawResponse: 'Some unrelated model output mentioning HTTP 429.',
+      };
+
+      const classified = ExecutionFailureClassifier.classify(result);
+      expect(classified.category).toBe('QUOTA_EXHAUSTED');
+      expect(classified.disposition).toBe('FAILOVER_ELIGIBLE');
+      expect(classified.sourceErrorCode).toBe('QUOTA_EXHAUSTED');
+    });
+
+    it('does NOT classify unrelated error codes as RATE_LIMITED even if error text contains 429 or rate limit text', () => {
+      const authResult: AgentExecutionResult = {
+        executionId: 'exec-auth-429',
+        status: 'FAILED',
+        errorCode: 'AUTH_ERROR',
+        error: 'Authentication failed: error code 429 in auth header.',
+      };
+      expect(ExecutionFailureClassifier.classify(authResult).category).toBe('AUTHENTICATION_FAILURE');
+
+      const resResult: AgentExecutionResult = {
+        executionId: 'exec-res-rate',
+        status: 'FAILED',
+        errorCode: 'RESOURCE_UNAVAILABLE',
+        error: 'Resource unavailable due to rate limit.',
+      };
+      expect(ExecutionFailureClassifier.classify(resResult).category).toBe('RESOURCE_UNAVAILABLE');
+
+      const exitResult: AgentExecutionResult = {
+        executionId: 'exec-exit-429',
+        status: 'FAILED',
+        errorCode: 'NONZERO_EXIT',
+        error: 'Exit code 429.',
+      };
+      expect(ExecutionFailureClassifier.classify(exitResult).category).toBe('NONZERO_EXIT');
     });
 
     it('classifies QUOTA_EXHAUSTED without rate limit text as QUOTA_EXHAUSTED / FAILOVER_ELIGIBLE', () => {
@@ -346,19 +387,86 @@ describe('R5H1 — Failure Taxonomy, Account Health & Routing Cooldown', () => {
       const explicitUntil = '2026-08-25T12:15:30.000Z';
       healthService.recordRateLimited(accountId, {
         cooldownUntil: explicitUntil,
-        failureCode: 'CUSTOM_429',
+        failureCode: 'RATE_LIMITED',
       });
 
       const updated = repo.getProviderAccount(accountId)!;
       expect(updated.health_status).toBe('RATE_LIMITED');
       expect(updated.cooldown_until).toBe(explicitUntil);
-      expect(updated.last_failure_code).toBe('CUSTOM_429');
+      expect(updated.last_failure_code).toBe('RATE_LIMITED');
     });
 
     it('throws error when recordRateLimited is called without explicit cooldown duration or timestamp', () => {
       expect(() => healthService.recordRateLimited(accountId, {})).toThrow(
         /MISSING_EXPLICIT_COOLDOWN/
       );
+    });
+
+    it('rejects explicit cooldownUntil timestamp that is in the past or equal to current time', () => {
+      // fakeNow is 2026-08-25T12:00:00.000Z
+      const pastTime = '2026-08-25T11:59:59.999Z'; // T - 1ms
+      const currentTime = '2026-08-25T12:00:00.000Z'; // T
+      const futureTime = '2026-08-25T12:00:00.001Z'; // T + 1ms
+
+      expect(() =>
+        healthService.recordRateLimited(accountId, { cooldownUntil: pastTime })
+      ).toThrow(/INVALID_COOLDOWN_TIMESTAMP/);
+
+      expect(() =>
+        healthService.recordRateLimited(accountId, { cooldownUntil: currentTime })
+      ).toThrow(/INVALID_COOLDOWN_TIMESTAMP/);
+
+      expect(() =>
+        healthService.recordRateLimited(accountId, { cooldownUntil: 'not-a-valid-date' })
+      ).toThrow(/INVALID_COOLDOWN_TIMESTAMP/);
+
+      // T + 1ms is accepted
+      healthService.recordRateLimited(accountId, { cooldownUntil: futureTime });
+      expect(repo.getProviderAccount(accountId)!.cooldown_until).toBe(futureTime);
+    });
+
+    it('rejects zero, negative, NaN, or non-finite cooldownDurationMs', () => {
+      expect(() =>
+        healthService.recordRateLimited(accountId, { cooldownDurationMs: 0 })
+      ).toThrow(/MISSING_EXPLICIT_COOLDOWN/);
+
+      expect(() =>
+        healthService.recordRateLimited(accountId, { cooldownDurationMs: -5000 })
+      ).toThrow(/MISSING_EXPLICIT_COOLDOWN/);
+
+      expect(() =>
+        healthService.recordRateLimited(accountId, { cooldownDurationMs: NaN })
+      ).toThrow(/MISSING_EXPLICIT_COOLDOWN/);
+
+      expect(() =>
+        healthService.recordRateLimited(accountId, { cooldownDurationMs: Infinity })
+      ).toThrow(/MISSING_EXPLICIT_COOLDOWN/);
+    });
+
+    it('throws error when mutation methods are called for a non-existent account', () => {
+      expect(() => healthService.recordSuccess('missing-account')).toThrow(
+        /PROVIDER_ACCOUNT_NOT_FOUND/
+      );
+
+      expect(() =>
+        healthService.recordRateLimited('missing-account', { cooldownDurationMs: 60000 })
+      ).toThrow(/PROVIDER_ACCOUNT_NOT_FOUND/);
+
+      expect(() => healthService.recordAuthError('missing-account')).toThrow(
+        /PROVIDER_ACCOUNT_NOT_FOUND/
+      );
+
+      expect(() => healthService.recordQuotaExhausted('missing-account')).toThrow(
+        /PROVIDER_ACCOUNT_NOT_FOUND/
+      );
+
+      expect(() =>
+        healthService.recordCooldown('missing-account', { cooldownDurationMs: 60000 })
+      ).toThrow(/PROVIDER_ACCOUNT_NOT_FOUND/);
+
+      expect(() =>
+        healthService.recordGeneralFailure('missing-account', 'UNHEALTHY')
+      ).toThrow(/PROVIDER_ACCOUNT_NOT_FOUND/);
     });
 
     it('records QUOTA_EXHAUSTED without inventing a cooldown', () => {
@@ -374,16 +482,16 @@ describe('R5H1 — Failure Taxonomy, Account Health & Routing Cooldown', () => {
       const resetTime = '2026-08-26T00:00:00.000Z';
       healthService.recordQuotaExhausted(accountId, {
         cooldownUntil: resetTime,
-        failureCode: 'MONTHLY_QUOTA',
+        failureCode: 'QUOTA_EXHAUSTED',
       });
 
       const updated = repo.getProviderAccount(accountId)!;
       expect(updated.health_status).toBe('QUOTA_EXHAUSTED');
       expect(updated.cooldown_until).toBe(resetTime);
-      expect(updated.last_failure_code).toBe('MONTHLY_QUOTA');
+      expect(updated.last_failure_code).toBe('QUOTA_EXHAUSTED');
     });
 
-    it('records AUTH_ERROR clearing cooldown and setting status', () => {
+    it('records AUTH_ERROR clearing cooldown and setting status and failureCode to AUTHENTICATION_FAILURE', () => {
       // First set in cooldown
       healthService.recordRateLimited(accountId, { cooldownDurationMs: 60000 });
       expect(repo.getProviderAccount(accountId)!.cooldown_until).not.toBeNull();
@@ -394,7 +502,7 @@ describe('R5H1 — Failure Taxonomy, Account Health & Routing Cooldown', () => {
       const updated = repo.getProviderAccount(accountId)!;
       expect(updated.health_status).toBe('AUTH_ERROR');
       expect(updated.cooldown_until).toBeNull();
-      expect(updated.last_failure_code).toBe('AUTH_ERROR');
+      expect(updated.last_failure_code).toBe('AUTHENTICATION_FAILURE');
     });
 
     it('records SUCCESS restoring AVAILABLE and clearing cooldown', () => {
