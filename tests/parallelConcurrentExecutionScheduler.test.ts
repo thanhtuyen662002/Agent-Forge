@@ -167,6 +167,7 @@ describe('Parallel ConcurrentExecutionScheduler Proof (R5G3E1)', () => {
   let repoDir: string;
   let managedDir: string;
   let gitExe: string;
+  let initialRealWorktreeOutput: string;
 
   let projectId: string;
   let accountId: string;
@@ -340,6 +341,8 @@ describe('Parallel ConcurrentExecutionScheduler Proof (R5G3E1)', () => {
   }
 
   beforeEach(() => {
+    initialRealWorktreeOutput = execSync('git worktree list --porcelain', { encoding: 'utf-8' }).trim();
+
     testDir = fs.mkdtempSync(path.join(os.tmpdir(), 'af-par-sched-test-'));
     repoDir = path.join(testDir, 'repo');
     managedDir = path.join(testDir, 'managed');
@@ -994,7 +997,6 @@ describe('Parallel ConcurrentExecutionScheduler Proof (R5G3E1)', () => {
 
     // 50. Real AgentForge worktree inventory unchanged
     const realWorktreeOutput = execSync('git worktree list --porcelain', { encoding: 'utf-8' }).trim();
-    const realWorktrees = realWorktreeOutput.split(/\r?\n\r?\n/).filter(Boolean);
-    expect(realWorktrees.length).toBe(5);
+    expect(realWorktreeOutput).toBe(initialRealWorktreeOutput);
   });
 });

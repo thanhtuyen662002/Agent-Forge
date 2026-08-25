@@ -178,7 +178,9 @@ describe('R5G3B — Verified Workspace Runtime Binding & Local CLI Authority', (
 }));`
     );
 
-    gitExe = execSync('where git', { encoding: 'utf-8' }).trim().split(/\r?\n/)[0];
+    gitExe = execSync(process.platform === 'win32' ? 'where git' : 'which git', { encoding: 'utf-8' })
+      .trim()
+      .split(/\r?\n/)[0];
 
     // Initialize git repo
     execSync(`"${gitExe}" init`, { cwd: repoDir, stdio: 'pipe' });
