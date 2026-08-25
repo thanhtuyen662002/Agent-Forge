@@ -13,6 +13,7 @@ import { VerificationService } from '../src/core/services/VerificationService';
 import { BootstrapService } from '../src/core/services/BootstrapService';
 import { ManualBridgeAdapter } from '../src/core/adapters/ManualBridgeAdapter';
 import { CodexCliAdapter } from '../src/core/adapters/CodexCliAdapter';
+import { GeminiCliAdapter } from '../src/core/adapters/GeminiCliAdapter';
 import { LocalCliAdapterBase, LocalCliAdapterOptions } from '../src/core/adapters/LocalCliAdapterBase';
 import { ProviderRegistry } from '../src/core/adapters/ProviderRegistry';
 import { ProtocolParser } from '../src/core/protocol/parser';
@@ -664,6 +665,7 @@ describe('PR #5 — Provider Integration Foundation', () => {
     expect(bootstrap.providerRegistry).toBeDefined();
     expect(bootstrap.providerRegistry.has('prov-manual-bridge')).toBe(true);
     expect(bootstrap.providerRegistry.has('prov-codex-cli')).toBe(true);
+    expect(bootstrap.providerRegistry.has('prov-gemini-cli')).toBe(true);
     expect(bootstrap.providerRegistry.has('prov-antigravity-cli')).toBe(false);
 
     bootstrap.dbEngine.close();
@@ -774,5 +776,64 @@ describe('PR #5 — Provider Integration Foundation', () => {
     expect(runs[0].status).toBe('COMPLETED');
 
     bootstrap2.dbEngine.close();
+  });
+
+  // 26. Live application composition registers ManualBridge, Codex, and Gemini with strict provider exclusion
+  it('26. BootstrapService registers ManualBridge, CodexCliAdapter, and GeminiCliAdapter with distinct IDs and excludes unproven providers', () => {
+    const bootstrapDir = path.join(tmpDir, 'bootstrap-composition-test');
+    const bootstrap = BootstrapService.initialize(bootstrapDir);
+
+    const registry = bootstrap.providerRegistry;
+    expect(registry).toBeDefined();
+
+    // Both production CLI adapters registered alongside ManualBridge
+    expect(registry.has('prov-codex-cli')).toBe(true);
+    expect(registry.has('prov-gemini-cli')).toBe(true);
+    expect(registry.has('prov-manual-bridge')).toBe(true);
+
+    // Resolving exact adapters
+    const codex = registry.resolve('prov-codex-cli');
+    expect(codex).toBeInstanceOf(CodexCliAdapter);
+    expect(codex.id).toBe('prov-codex-cli');
+
+    const gemini = registry.resolve('prov-gemini-cli');
+    expect(gemini).toBeInstanceOf(GeminiCliAdapter);
+    expect(gemini.id).toBe('prov-gemini-cli');
+
+    const manual = registry.resolve('prov-manual-bridge');
+    expect(manual).toBeInstanceOf(ManualBridgeAdapter);
+    expect(manual.id).toBe('prov-manual-bridge');
+
+    // Distinct IDs
+    expect(codex.id).not.toBe(gemini.id);
+    expect(codex.id).not.toBe(manual.id);
+    expect(gemini.id).not.toBe(manual.id);
+
+    // Registered adapter count equals exactly 3
+    expect(registry.size).toBe(3);
+
+    // Excluded providers are absent
+    expect(registry.has('prov-antigravity-cli')).toBe(false);
+    expect(registry.has('prov-antigravity')).toBe(false);
+    expect(registry.has('prov-claude-code')).toBe(false);
+    expect(registry.has('prov-claude-cli')).toBe(false);
+    expect(registry.has('prov-claude')).toBe(false);
+
+    bootstrap.dbEngine.close();
+  });
+
+  // 27. Composition enables ProviderDispatchService resolution for both Codex and Gemini
+  it('27. ProviderDispatchService resolves registered Codex and Gemini adapters from application composition', () => {
+    const bootstrapDir = path.join(tmpDir, 'bootstrap-dispatch-reachability');
+    const bootstrap = BootstrapService.initialize(bootstrapDir);
+
+    const dispatchService = bootstrap.providerDispatchService;
+    expect(dispatchService).toBeDefined();
+
+    // Dispatch service can resolve both registered adapters via registry
+    expect(bootstrap.providerRegistry.resolve('prov-codex-cli')).toBeInstanceOf(CodexCliAdapter);
+    expect(bootstrap.providerRegistry.resolve('prov-gemini-cli')).toBeInstanceOf(GeminiCliAdapter);
+
+    bootstrap.dbEngine.close();
   });
 });
