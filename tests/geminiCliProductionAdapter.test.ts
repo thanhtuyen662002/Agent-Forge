@@ -22,7 +22,7 @@ describe('R5F0D1 — Production Gemini CLI Adapter Contract Suite', () => {
   let fakeGeminiExecutable: string;
   let fakeGeminiScript: string;
   let scenarioFile: string;
-  let logFile: string;
+  let logsDir: string;
   let projectRepoDir: string;
 
   const validCoderPayload = JSON.stringify({
@@ -101,7 +101,8 @@ describe('R5F0D1 — Production Gemini CLI Adapter Contract Suite', () => {
     });
 
     scenarioFile = path.join(tmpDir, 'scenario.json');
-    logFile = path.join(tmpDir, 'invocation_log.json');
+    logsDir = path.join(tmpDir, 'invocation_logs');
+    fs.mkdirSync(logsDir, { recursive: true });
 
     // Create fake gemini runner script
     fakeGeminiScript = path.join(tmpDir, 'fake_gemini_runner.js');
@@ -110,7 +111,7 @@ describe('R5F0D1 — Production Gemini CLI Adapter Contract Suite', () => {
       const path = require('path');
 
       const scenarioFile = ${JSON.stringify(scenarioFile)};
-      const logFile = ${JSON.stringify(logFile)};
+      const logsDir = ${JSON.stringify(logsDir)};
       const args = process.argv.slice(2);
 
       let scenario = { mode: 'SUCCESS' };
@@ -118,6 +119,13 @@ describe('R5F0D1 — Production Gemini CLI Adapter Contract Suite', () => {
         try {
           scenario = JSON.parse(fs.readFileSync(scenarioFile, 'utf8'));
         } catch {}
+      }
+
+      function writeTelemetry(entry) {
+        const id = Date.now() + '_' + process.pid + '_' + Math.random().toString(36).slice(2);
+        entry.seq = id;
+        const entryFile = path.join(logsDir, 'log_' + id + '.json');
+        fs.writeFileSync(entryFile, JSON.stringify(entry, null, 2), 'utf8');
       }
 
       // Handle --version probe immediately without waiting on stdin
@@ -129,14 +137,7 @@ describe('R5F0D1 — Production Gemini CLI Adapter Contract Suite', () => {
           stdin: '',
           timestamp: new Date().toISOString(),
         };
-        try {
-          let currentLogs = [];
-          if (fs.existsSync(logFile)) {
-            currentLogs = JSON.parse(fs.readFileSync(logFile, 'utf8'));
-          }
-          currentLogs.push(logEntry);
-          fs.writeFileSync(logFile, JSON.stringify(currentLogs, null, 2), 'utf8');
-        } catch {}
+        writeTelemetry(logEntry);
 
         if (scenario.versionError) {
           console.error("Version check failed");
@@ -159,15 +160,7 @@ describe('R5F0D1 — Production Gemini CLI Adapter Contract Suite', () => {
         stdin: stdinData,
         timestamp: new Date().toISOString(),
       };
-
-      try {
-        let currentLogs = [];
-        if (fs.existsSync(logFile)) {
-          currentLogs = JSON.parse(fs.readFileSync(logFile, 'utf8'));
-        }
-        currentLogs.push(logEntry);
-        fs.writeFileSync(logFile, JSON.stringify(currentLogs, null, 2), 'utf8');
-      } catch {}
+      writeTelemetry(logEntry);
 
       // Handle execution scenarios
       if (scenario.mode === 'SUCCESS') {
@@ -375,12 +368,19 @@ describe('R5F0D1 — Production Gemini CLI Adapter Contract Suite', () => {
   }
 
   function getLogs(): any[] {
-    if (!fs.existsSync(logFile)) return [];
-    try {
-      return JSON.parse(fs.readFileSync(logFile, 'utf8'));
-    } catch {
-      return [];
+    if (!fs.existsSync(logsDir)) return [];
+    const files = fs.readdirSync(logsDir).filter((f) => f.endsWith('.json'));
+    const entries: any[] = [];
+    for (const file of files) {
+      const content = fs.readFileSync(path.join(logsDir, file), 'utf8');
+      entries.push(JSON.parse(content));
     }
+    entries.sort((a, b) => {
+      const timeDiff = new Date(a.timestamp).getTime() - new Date(b.timestamp).getTime();
+      if (timeDiff !== 0) return timeDiff;
+      return String(a.seq || '').localeCompare(String(b.seq || ''));
+    });
+    return entries;
   }
 
   function createValidRequest(overrides?: Partial<AgentExecutionRequest>): AgentExecutionRequest {
