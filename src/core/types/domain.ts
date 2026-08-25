@@ -667,6 +667,53 @@ export interface AccountLease {
   released_at: string | null;
 }
 
+export type PolicyDependentFailureCategory =
+  | 'TIMEOUT'
+  | 'NONZERO_EXIT'
+  | 'OUTPUT_LIMIT_EXCEEDED';
+
+export type FailoverPolicyAction = 'FAILOVER' | 'STOP';
+
+export interface DisabledFailoverPolicyV1 {
+  version: 1;
+  enabled: false;
+}
+
+export interface EnabledFailoverPolicyV1 {
+  version: 1;
+  enabled: true;
+  max_failover_attempts: number;
+  same_account_retries: number;
+  allow_cross_account: boolean;
+  allow_cross_provider: boolean;
+  cooldown_duration_ms?: number;
+  failure_actions?: Partial<Record<PolicyDependentFailureCategory, FailoverPolicyAction>>;
+}
+
+export type FailoverPolicyV1 = DisabledFailoverPolicyV1 | EnabledFailoverPolicyV1;
+
+export type FailoverPolicyParseStatus = 'VALID' | 'ABSENT' | 'INVALID';
+
+export type FailoverPolicyParseResult =
+  | { status: 'VALID'; policy: FailoverPolicyV1 }
+  | { status: 'ABSENT' }
+  | { status: 'INVALID'; error: string };
+
+export type FailoverDecisionOutcome =
+  | 'FAILOVER_ALLOWED'
+  | 'AUTOMATED_FAILOVER_DISABLED'
+  | 'FAILOVER_ATTEMPTS_EXHAUSTED'
+  | 'NON_FAILOVERABLE'
+  | 'POLICY_DECISION_REQUIRED'
+  | 'INVALID_POLICY';
+
+export interface FailoverDecision {
+  outcome: FailoverDecisionOutcome;
+  category: string;
+  reason: string;
+  cooldownDurationMs?: number;
+}
+
 export interface RoutePolicy {
   id: string;
   name: string;
