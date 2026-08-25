@@ -65,9 +65,10 @@ describe('Bootstrap Smoke & Fresh Database Startup', () => {
 
     // Assert provider registry initialized with registered adapters (Antigravity is MANUAL_BRIDGE_ONLY)
     expect(bootstrap.providerRegistry).toBeDefined();
-    expect(bootstrap.providerRegistry.size).toBe(2);
+    expect(bootstrap.providerRegistry.size).toBe(3);
     expect(bootstrap.providerRegistry.has('prov-manual-bridge')).toBe(true);
     expect(bootstrap.providerRegistry.has('prov-codex-cli')).toBe(true);
+    expect(bootstrap.providerRegistry.has('prov-gemini-cli')).toBe(true);
     expect(bootstrap.providerRegistry.has('prov-antigravity-cli')).toBe(false);
     expect(bootstrap.providerRoutingService).toBeDefined();
     expect(bootstrap.providerDispatchService).toBeDefined();

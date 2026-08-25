@@ -14,6 +14,7 @@ import { EmergencyStopService } from './EmergencyStopService';
 import { ProviderRegistry } from '../adapters/ProviderRegistry';
 import { ManualBridgeAdapter } from '../adapters/ManualBridgeAdapter';
 import { CodexCliAdapter } from '../adapters/CodexCliAdapter';
+import { GeminiCliAdapter } from '../adapters/GeminiCliAdapter';
 import { ProviderRoutingService } from './ProviderRoutingService';
 import { ProviderDispatchService } from './ProviderDispatchService';
 import { ExecutionAuthorizationService } from './ExecutionAuthorizationService';
@@ -146,8 +147,8 @@ export class BootstrapService {
     // 5. Initialize Provider Registry with supported adapters
     const providerRegistry = new ProviderRegistry();
     providerRegistry.register(new ManualBridgeAdapter());
-    // Codex CLI registered as unverified on this host; fails closed on execute
     providerRegistry.register(new CodexCliAdapter({ repo, artifactStore }));
+    providerRegistry.register(new GeminiCliAdapter({ repo, artifactStore }));
 
     // 6. Initialize Provider Routing, Authorization & Dispatch Services
     const providerRoutingService = new ProviderRoutingService(repo, providerRegistry, eventService);
