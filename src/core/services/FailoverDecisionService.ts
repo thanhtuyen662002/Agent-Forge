@@ -1,5 +1,4 @@
 import {
-  FailoverPolicyV1,
   FailoverPolicyParseResult,
   EnabledFailoverPolicyV1,
   PolicyDependentFailureCategory,
@@ -8,26 +7,26 @@ import {
 import {
   ClassifiedExecutionFailure,
 } from './ExecutionFailureClassifier';
-import { FailoverPolicyParser } from './FailoverPolicyParser';
 
 export interface FailoverDecisionParams {
   failure: ClassifiedExecutionFailure;
-  policy: FailoverPolicyV1 | FailoverPolicyParseResult | Record<string, unknown> | null | undefined;
+  policyResult: FailoverPolicyParseResult;
   failoverAttemptsUsed: number;
 }
 
 export class FailoverDecisionService {
   /**
    * Pure, deterministic decision authority that evaluates a classified execution failure
-   * against an explicit failover policy and attempt counter.
+   * against a typed FailoverPolicyParseResult and attempt counter.
    *
    * NEVER launches execution, mutates database state, or overrides non-failoverable hard stops.
+   * Consumes strictly trusted FailoverPolicyParseResult produced by FailoverPolicyParser.
    *
-   * @param params Input containing classified failure, policy (or parsed policy), and failover attempts count.
+   * @param params Input containing classified failure, policyResult, and failover attempts count.
    * @returns FailoverDecision with bounded outcome, category, and reason.
    */
   public static evaluate(params: FailoverDecisionParams): FailoverDecision {
-    const { failure, policy, failoverAttemptsUsed } = params;
+    const { failure, policyResult, failoverAttemptsUsed } = params;
 
     // 1. Validate attempts count input fail-closed
     if (
@@ -43,46 +42,45 @@ export class FailoverDecisionService {
       };
     }
 
-    // 2. Resolve policy to parsed form
-    let parsedPolicy: FailoverPolicyV1;
-    if (policy && typeof policy === 'object' && 'status' in policy) {
-      const parseResult = policy as FailoverPolicyParseResult;
-      if (parseResult.status === 'INVALID') {
-        return {
-          outcome: 'INVALID_POLICY',
-          category: failure.category,
-          reason: `Failover policy is invalid: ${parseResult.error}`,
-        };
-      }
-      if (parseResult.status === 'ABSENT') {
-        return {
-          outcome: 'AUTOMATED_FAILOVER_DISABLED',
-          category: failure.category,
-          reason: 'Automated failover is not configured (policy absent).',
-        };
-      }
-      parsedPolicy = parseResult.policy;
-    } else {
-      const parseResult = FailoverPolicyParser.parse(policy);
-      if (parseResult.status === 'INVALID') {
-        return {
-          outcome: 'INVALID_POLICY',
-          category: failure.category,
-          reason: `Failover policy is invalid: ${parseResult.error}`,
-        };
-      }
-      if (parseResult.status === 'ABSENT') {
-        return {
-          outcome: 'AUTOMATED_FAILOVER_DISABLED',
-          category: failure.category,
-          reason: 'Automated failover is not configured (policy absent).',
-        };
-      }
-      parsedPolicy = parseResult.policy;
+    // 2. Validate policyResult shape & status
+    if (
+      !policyResult ||
+      typeof policyResult !== 'object' ||
+      !('status' in policyResult)
+    ) {
+      return {
+        outcome: 'INVALID_POLICY',
+        category: failure.category,
+        reason: 'Failover policy result is invalid or unrecognized.',
+      };
+    }
+
+    if (policyResult.status === 'INVALID') {
+      return {
+        outcome: 'INVALID_POLICY',
+        category: failure.category,
+        reason: `Failover policy is invalid: ${policyResult.error}`,
+      };
+    }
+
+    if (policyResult.status === 'ABSENT') {
+      return {
+        outcome: 'AUTOMATED_FAILOVER_DISABLED',
+        category: failure.category,
+        reason: 'Automated failover is not configured (policy absent).',
+      };
+    }
+
+    if (policyResult.status !== 'VALID') {
+      return {
+        outcome: 'INVALID_POLICY',
+        category: failure.category,
+        reason: 'Unrecognized failover policy parse status.',
+      };
     }
 
     // 3. Disabled policy evaluation
-    if (parsedPolicy.enabled === false) {
+    if (policyResult.policy.enabled === false) {
       return {
         outcome: 'AUTOMATED_FAILOVER_DISABLED',
         category: failure.category,
@@ -90,9 +88,9 @@ export class FailoverDecisionService {
       };
     }
 
-    const enabledPolicy = parsedPolicy as EnabledFailoverPolicyV1;
+    const enabledPolicy = policyResult.policy as EnabledFailoverPolicyV1;
 
-    // 4. NON-FAILOVERABLE Precedence: hard-stop categories can NEVER be overridden
+    // 4. Precedence A: NON-FAILOVERABLE Precedence (hard-stop categories can NEVER be overridden)
     if (failure.disposition === 'NON_FAILOVERABLE') {
       return {
         outcome: 'NON_FAILOVERABLE',
@@ -101,33 +99,39 @@ export class FailoverDecisionService {
       };
     }
 
-    // 5. Attempt Budget Enforcement
-    if (failoverAttemptsUsed >= enabledPolicy.max_failover_attempts) {
-      return {
-        outcome: 'FAILOVER_ATTEMPTS_EXHAUSTED',
-        category: failure.category,
-        reason: `Maximum failover attempts reached (${failoverAttemptsUsed}/${enabledPolicy.max_failover_attempts}).`,
-      };
-    }
-
-    // 6. Policy Evaluation based on Failure Category & Disposition
-    if (failure.disposition === 'FAILOVER_ELIGIBLE') {
-      const decision: FailoverDecision = {
-        outcome: 'FAILOVER_ALLOWED',
-        category: failure.category,
-        reason: `Failover permitted by policy for ${failure.category}.`,
-      };
-      if (enabledPolicy.cooldown_duration_ms !== undefined) {
-        decision.cooldownDurationMs = enabledPolicy.cooldown_duration_ms;
-      }
-      return decision;
-    }
-
+    // 5. Precedence B: POLICY_DECISION_REQUIRED Categories (TIMEOUT, NONZERO_EXIT, OUTPUT_LIMIT_EXCEEDED)
     if (failure.disposition === 'POLICY_DECISION_REQUIRED') {
       const categoryKey = failure.category as PolicyDependentFailureCategory;
       const explicitAction = enabledPolicy.failure_actions?.[categoryKey];
 
+      // Missing explicit action: retain POLICY_DECISION_REQUIRED regardless of attempt budget
+      if (!explicitAction) {
+        return {
+          outcome: 'POLICY_DECISION_REQUIRED',
+          category: failure.category,
+          reason: `Policy decision required for ${failure.category}; no explicit failure_action configured.`,
+        };
+      }
+
+      // Explicit STOP action: non-failoverable stop regardless of attempt budget
+      if (explicitAction === 'STOP') {
+        return {
+          outcome: 'NON_FAILOVERABLE',
+          category: failure.category,
+          reason: `Explicit policy action for ${failure.category} is STOP.`,
+        };
+      }
+
+      // Explicit FAILOVER action: evaluate attempt budget
       if (explicitAction === 'FAILOVER') {
+        if (failoverAttemptsUsed >= enabledPolicy.max_failover_attempts) {
+          return {
+            outcome: 'FAILOVER_ATTEMPTS_EXHAUSTED',
+            category: failure.category,
+            reason: `Maximum failover attempts reached (${failoverAttemptsUsed}/${enabledPolicy.max_failover_attempts}).`,
+          };
+        }
+
         const decision: FailoverDecision = {
           outcome: 'FAILOVER_ALLOWED',
           category: failure.category,
@@ -138,21 +142,27 @@ export class FailoverDecisionService {
         }
         return decision;
       }
+    }
 
-      if (explicitAction === 'STOP') {
+    // 6. Precedence C: FAILOVER_ELIGIBLE Categories (RATE_LIMITED, QUOTA_EXHAUSTED, RESOURCE_UNAVAILABLE)
+    if (failure.disposition === 'FAILOVER_ELIGIBLE') {
+      if (failoverAttemptsUsed >= enabledPolicy.max_failover_attempts) {
         return {
-          outcome: 'NON_FAILOVERABLE',
+          outcome: 'FAILOVER_ATTEMPTS_EXHAUSTED',
           category: failure.category,
-          reason: `Explicit policy action for ${failure.category} is STOP.`,
+          reason: `Maximum failover attempts reached (${failoverAttemptsUsed}/${enabledPolicy.max_failover_attempts}).`,
         };
       }
 
-      // No explicit action configured -> retain truthful POLICY_DECISION_REQUIRED
-      return {
-        outcome: 'POLICY_DECISION_REQUIRED',
+      const decision: FailoverDecision = {
+        outcome: 'FAILOVER_ALLOWED',
         category: failure.category,
-        reason: `Policy decision required for ${failure.category}; no explicit failure_action configured.`,
+        reason: `Failover permitted by policy for ${failure.category}.`,
       };
+      if (enabledPolicy.cooldown_duration_ms !== undefined) {
+        decision.cooldownDurationMs = enabledPolicy.cooldown_duration_ms;
+      }
+      return decision;
     }
 
     // Default fail-closed
