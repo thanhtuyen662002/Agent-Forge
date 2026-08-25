@@ -115,11 +115,16 @@ export interface RoleAwareRoutingDecision {
 }
 
 export class RoleAwareRoutingService {
+  private readonly now: () => Date;
+
   constructor(
     private repo: Repository,
     private providerRegistry: ProviderRegistry,
-    private eventService?: EventService
-  ) {}
+    private eventService?: EventService,
+    clock?: () => Date
+  ) {
+    this.now = clock ?? (() => new Date());
+  }
 
   /**
    * Deterministically evaluates candidate (ProviderAccount, ProviderResource) pairs
@@ -136,7 +141,7 @@ export class RoleAwareRoutingService {
    */
   public async routeRole(request: RoleAwareRoutingRequest): Promise<RoleAwareRoutingDecision> {
     const decisionId = crypto.randomUUID();
-    const createdAt = new Date().toISOString();
+    const createdAt = this.now().toISOString();
     const normalizedAttemptId = request.attemptId ?? null;
 
     const requestedConstraints: RequestedRoutingConstraintsAudit = {
@@ -437,6 +442,25 @@ export class RoleAwareRoutingService {
         rejectionReasons.push(
           `ProviderAccount "${account.id}" health status is "${account.health_status}".`
         );
+      }
+      if (account.health_status === 'RATE_LIMITED' || account.health_status === 'COOLDOWN') {
+        if (!account.cooldown_until) {
+          rejectionReasons.push(
+            `ProviderAccount "${account.id}" health status is "${account.health_status}" with missing cooldown_until timestamp.`
+          );
+        } else {
+          const cooldownMs = Date.parse(account.cooldown_until);
+          if (isNaN(cooldownMs)) {
+            rejectionReasons.push(
+              `ProviderAccount "${account.id}" health status is "${account.health_status}" with malformed cooldown_until timestamp "${account.cooldown_until}".`
+            );
+          } else if (cooldownMs > this.now().getTime()) {
+            rejectionReasons.push(
+              `ProviderAccount "${account.id}" is under active cooldown until ${account.cooldown_until}.`
+            );
+          }
+          // If cooldownMs <= this.now().getTime(), cooldown has expired: candidate can proceed
+        }
       }
 
       // Check provider & resource enabled
