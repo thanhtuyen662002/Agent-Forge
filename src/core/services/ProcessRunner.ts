@@ -39,6 +39,7 @@ export interface StructuredProcessOptions {
   taskId?: string;
   attemptId?: string | null;
   stdin?: string;
+  executionId?: string;
 }
 
 interface ResolvedInvocation {
@@ -313,9 +314,51 @@ export class ProcessRunner {
   }
 
   public static async execute(options: StructuredProcessOptions): Promise<ProcessRunResult> {
-    const executionId = crypto.randomUUID();
-    const timeoutMs = options.timeoutMs ?? 60000;
+    let executionId: string;
     const commandStr = [options.executable, ...options.args].join(' ');
+
+    if (options.executionId !== undefined) {
+      if (
+        typeof options.executionId !== 'string' ||
+        !/^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$/.test(options.executionId)
+      ) {
+        return {
+          executionId: typeof options.executionId === 'string' ? options.executionId : 'INVALID_ID',
+          pid: null,
+          command: this.scrubSecrets(commandStr),
+          cwd: options.cwd,
+          exitCode: -1,
+          stdout: '',
+          stderr: `INVALID_EXECUTION_ID: Supplied executionId "${options.executionId}" is not a valid canonical UUID.`,
+          durationMs: 0,
+          timedOut: false,
+          cancelled: false,
+          outputLimitExceeded: false,
+          errorCode: 'PROCESS_LAUNCH_FAILED',
+        };
+      }
+      if (this.activeProcesses.has(options.executionId)) {
+        return {
+          executionId: options.executionId,
+          pid: null,
+          command: this.scrubSecrets(commandStr),
+          cwd: options.cwd,
+          exitCode: -1,
+          stdout: '',
+          stderr: `DUPLICATE_ACTIVE_PROCESS_ID: Execution ID "${options.executionId}" is already active in ProcessRunner.`,
+          durationMs: 0,
+          timedOut: false,
+          cancelled: false,
+          outputLimitExceeded: false,
+          errorCode: 'PROCESS_LAUNCH_FAILED',
+        };
+      }
+      executionId = options.executionId;
+    } else {
+      executionId = crypto.randomUUID();
+    }
+
+    const timeoutMs = options.timeoutMs ?? 60000;
     const startTime = Date.now();
     const startIso = new Date(startTime).toISOString();
 
@@ -337,18 +380,22 @@ export class ProcessRunner {
 
     if (!policy.allowed) {
       if (options.repo) {
-        options.repo.createProcessRun({
-          id: executionId,
-          pid: null,
-          project_id: options.projectId ?? null,
-          task_id: options.taskId ?? null,
-          attempt_id: options.attemptId ?? null,
-          command: this.scrubSecrets(commandStr),
-          working_directory: options.cwd,
-          status: 'FAILED',
-          start_time: startIso,
-        });
-        options.repo.updateProcessRun(executionId, 'FAILED', -1, new Date().toISOString(), null, null);
+        try {
+          options.repo.createProcessRun({
+            id: executionId,
+            pid: null,
+            project_id: options.projectId ?? null,
+            task_id: options.taskId ?? null,
+            attempt_id: options.attemptId ?? null,
+            command: this.scrubSecrets(commandStr),
+            working_directory: options.cwd,
+            status: 'FAILED',
+            start_time: startIso,
+          });
+          options.repo.updateProcessRun(executionId, 'FAILED', -1, new Date().toISOString(), null, null);
+        } catch {
+          // Ignore collision or persistence error on rejection path
+        }
       }
 
       return {
@@ -371,18 +418,22 @@ export class ProcessRunner {
     const envValidationError = this.validateCustomEnv(options.env, options.allowedEnvKeys);
     if (envValidationError) {
       if (options.repo) {
-        options.repo.createProcessRun({
-          id: executionId,
-          pid: null,
-          project_id: options.projectId ?? null,
-          task_id: options.taskId ?? null,
-          attempt_id: options.attemptId ?? null,
-          command: this.scrubSecrets(commandStr),
-          working_directory: options.cwd,
-          status: 'FAILED',
-          start_time: startIso,
-        });
-        options.repo.updateProcessRun(executionId, 'FAILED', -1, new Date().toISOString(), null, null);
+        try {
+          options.repo.createProcessRun({
+            id: executionId,
+            pid: null,
+            project_id: options.projectId ?? null,
+            task_id: options.taskId ?? null,
+            attempt_id: options.attemptId ?? null,
+            command: this.scrubSecrets(commandStr),
+            working_directory: options.cwd,
+            status: 'FAILED',
+            start_time: startIso,
+          });
+          options.repo.updateProcessRun(executionId, 'FAILED', -1, new Date().toISOString(), null, null);
+        } catch {
+          // Ignore collision or persistence error on rejection path
+        }
       }
 
       return {
@@ -446,17 +497,34 @@ export class ProcessRunner {
 
     // Persist RUNNING process run in database if repository provided
     if (options.repo) {
-      options.repo.createProcessRun({
-        id: executionId,
-        pid: null,
-        project_id: options.projectId ?? null,
-        task_id: options.taskId ?? null,
-        attempt_id: options.attemptId ?? null,
-        command: this.scrubSecrets(commandStr),
-        working_directory: options.cwd,
-        status: 'RUNNING',
-        start_time: startIso,
-      });
+      try {
+        options.repo.createProcessRun({
+          id: executionId,
+          pid: null,
+          project_id: options.projectId ?? null,
+          task_id: options.taskId ?? null,
+          attempt_id: options.attemptId ?? null,
+          command: this.scrubSecrets(commandStr),
+          working_directory: options.cwd,
+          status: 'RUNNING',
+          start_time: startIso,
+        });
+      } catch (err: any) {
+        return {
+          executionId,
+          pid: null,
+          command: this.scrubSecrets(commandStr),
+          cwd: options.cwd,
+          exitCode: -1,
+          stdout: '',
+          stderr: `PERSISTED_PROCESS_RUN_COLLISION: Failed to create process run record for ID "${executionId}": ${err.message}`,
+          durationMs: 0,
+          timedOut: false,
+          cancelled: false,
+          outputLimitExceeded: false,
+          errorCode: 'PROCESS_LAUNCH_FAILED',
+        };
+      }
     }
 
     return new Promise((resolve) => {

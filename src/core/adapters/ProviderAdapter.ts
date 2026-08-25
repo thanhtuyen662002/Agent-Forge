@@ -42,6 +42,7 @@ export interface RuntimeExecutionBinding {
   modelName: string;
   accountAuthMode: AccountAuthMode;
   profileRef: string | null;
+  executionId?: string;
   workspace?: RuntimeWorkspaceBinding;
 }
 

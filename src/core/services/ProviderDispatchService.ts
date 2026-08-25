@@ -8,6 +8,7 @@ import {
   AgentExecutionRequest,
   AgentExecutionResult,
   RuntimeExecutionBinding,
+  ProviderAdapter,
 } from '../adapters/ProviderAdapter';
 import {
   ExecutionAuthorization,
@@ -23,7 +24,30 @@ import {
   CanonicalExecutionPayload,
 } from './ExecutionAuthorizationService';
 
+export type ScheduledCancellationStatus =
+  | 'CANCEL_REQUESTED'
+  | 'ALREADY_REQUESTED'
+  | 'NOT_ACTIVE'
+  | 'ADAPTER_CANCEL_FAILED';
+
+export interface ScheduledCancellationResult {
+  status: ScheduledCancellationStatus;
+  authorizationId: string;
+  executionId?: string;
+  error?: string;
+}
+
+interface ScheduledDispatchControl {
+  executionId: string;
+  phase: 'PREPARING' | 'EXECUTING';
+  adapter: ProviderAdapter | null;
+  cancelRequested: boolean;
+  startedAt: string;
+}
+
 export class ProviderDispatchService {
+  private activeDispatches = new Map<string, ScheduledDispatchControl>();
+
   constructor(
     private providerRegistry: ProviderRegistry,
     private repo: Repository,
@@ -33,6 +57,49 @@ export class ProviderDispatchService {
 
   public setGitWorktreeService(service: GitWorktreeService): void {
     this.gitWorktreeService = service;
+  }
+
+  /**
+   * Cancels an active scheduled execution if it is currently in PREPARING or EXECUTING phase.
+   * Caller supplies only authorizationId.
+   */
+  public async cancelScheduled(authorizationId: string): Promise<ScheduledCancellationResult> {
+    const control = this.activeDispatches.get(authorizationId);
+    if (!control) {
+      return {
+        status: 'NOT_ACTIVE',
+        authorizationId,
+      };
+    }
+
+    if (control.cancelRequested) {
+      return {
+        status: 'ALREADY_REQUESTED',
+        authorizationId,
+        executionId: control.executionId,
+      };
+    }
+
+    control.cancelRequested = true;
+
+    if (control.phase === 'EXECUTING' && control.adapter) {
+      try {
+        await control.adapter.cancel(control.executionId);
+      } catch (err: any) {
+        return {
+          status: 'ADAPTER_CANCEL_FAILED',
+          authorizationId,
+          executionId: control.executionId,
+          error: `Adapter cancellation threw: ${err.message}`,
+        };
+      }
+    }
+
+    return {
+      status: 'CANCEL_REQUESTED',
+      authorizationId,
+      executionId: control.executionId,
+    };
   }
 
   /**
@@ -59,6 +126,28 @@ export class ProviderDispatchService {
   ): Promise<AgentExecutionResult> {
     const executionId = crypto.randomUUID();
     const nowIso = new Date().toISOString();
+
+    let control: ScheduledDispatchControl | undefined;
+    if (mode === 'SCHEDULED') {
+      if (this.activeDispatches.has(authorizationId)) {
+        return {
+          executionId,
+          status: 'FAILED',
+          errorCode: 'RESOURCE_UNAVAILABLE',
+          error: `SCHEDULED_DISPATCH_ALREADY_ACTIVE: A scheduled execution for authorization "${authorizationId}" is already in progress.`,
+        };
+      }
+      control = {
+        executionId,
+        phase: 'PREPARING',
+        adapter: null,
+        cancelRequested: false,
+        startedAt: nowIso,
+      };
+      this.activeDispatches.set(authorizationId, control);
+    }
+
+    try {
 
     // 1. Fetch authorization metadata for initial existence check
     const auth = this.repo.getExecutionAuthorization(authorizationId);
@@ -758,6 +847,16 @@ export class ProviderDispatchService {
       };
     }
 
+    // 11b. Pre-claim cancellation check for scheduled execution
+    if (mode === 'SCHEDULED' && control?.cancelRequested) {
+      return {
+        executionId,
+        status: 'CANCELLED',
+        errorCode: 'CANCELLED',
+        error: 'Execution was cancelled during scheduled preparation.',
+      };
+    }
+
     // 12. ATOMIC CLAIM: Consume authorization before execution
     const claimed = this.repo.claimExecutionAuthorization(authorizationId, nowIso);
     if (!claimed) {
@@ -793,13 +892,16 @@ export class ProviderDispatchService {
         profileRef: account.profile_ref ?? null,
       };
 
-      if (mode === 'SCHEDULED' && inspectedWorkspace && assignment.selected_worker_slot_id) {
-        runtimeBinding.workspace = {
-          workerSlotId: assignment.selected_worker_slot_id,
-          ownershipDigest: inspectedWorkspace.ownershipDigest,
-          sourceSha: auth.repository_head_sha,
-          workingDirectory: inspectedWorkspace.managedPath,
-        };
+      if (mode === 'SCHEDULED') {
+        runtimeBinding.executionId = executionId;
+        if (inspectedWorkspace && assignment.selected_worker_slot_id) {
+          runtimeBinding.workspace = {
+            workerSlotId: assignment.selected_worker_slot_id,
+            ownershipDigest: inspectedWorkspace.ownershipDigest,
+            sourceSha: auth.repository_head_sha,
+            workingDirectory: inspectedWorkspace.managedPath,
+          };
+        }
       }
     }
 
@@ -871,10 +973,31 @@ export class ProviderDispatchService {
       );
     }
 
+    // 15b. Post-claim / pre-adapter cancellation check for scheduled execution
+    if (mode === 'SCHEDULED' && control?.cancelRequested) {
+      return {
+        executionId,
+        status: 'CANCELLED',
+        errorCode: 'CANCELLED',
+        error: 'Execution was cancelled before adapter execution.',
+      };
+    }
+
+    if (mode === 'SCHEDULED' && control) {
+      control.phase = 'EXECUTING';
+      control.adapter = adapter;
+    }
+
     // 16. Execute the selected provider exactly once (NO retry, NO failover on failure)
     let result: AgentExecutionResult;
     try {
       result = await adapter.execute(request);
+      if (mode === 'SCHEDULED') {
+        result = {
+          ...result,
+          executionId,
+        };
+      }
     } catch (err: any) {
       result = {
         executionId,
@@ -907,6 +1030,11 @@ export class ProviderDispatchService {
     }
 
     return result;
+    } finally {
+      if (mode === 'SCHEDULED') {
+        this.activeDispatches.delete(authorizationId);
+      }
+    }
   }
 
   private recordRejectionEvent(auth: ExecutionAuthorization, reason: string): void {
