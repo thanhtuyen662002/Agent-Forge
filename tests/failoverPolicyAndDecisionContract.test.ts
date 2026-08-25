@@ -5,11 +5,6 @@ import {
   ExecutionFailureClassifier,
   ClassifiedExecutionFailure,
 } from '../src/core/services/ExecutionFailureClassifier';
-import {
-  FailoverPolicyV1,
-  EnabledFailoverPolicyV1,
-  DisabledFailoverPolicyV1,
-} from '../src/core/types/domain';
 
 describe('R5H2: FailoverPolicyParser and FailoverDecisionService Contract', () => {
   // =========================================================================
@@ -312,7 +307,7 @@ describe('R5H2: FailoverPolicyParser and FailoverDecisionService Contract', () =
   // 2. FailoverDecisionService Tests
   // =========================================================================
   describe('FailoverDecisionService', () => {
-    const defaultEnabledPolicy: EnabledFailoverPolicyV1 = {
+    const rawDefaultEnabledPolicy = {
       version: 1,
       enabled: true,
       max_failover_attempts: 2,
@@ -322,10 +317,13 @@ describe('R5H2: FailoverPolicyParser and FailoverDecisionService Contract', () =
       cooldown_duration_ms: 45000,
     };
 
-    const disabledPolicy: DisabledFailoverPolicyV1 = {
+    const parsedDefaultEnabledResult = FailoverPolicyParser.parse(rawDefaultEnabledPolicy);
+
+    const rawDisabledPolicy = {
       version: 1,
       enabled: false,
     };
+    const parsedDisabledResult = FailoverPolicyParser.parse(rawDisabledPolicy);
 
     it('1. permits failover for FAILOVER_ELIGIBLE failure categories within attempt budget', () => {
       const rateLimitFailure: ClassifiedExecutionFailure = {
@@ -337,7 +335,7 @@ describe('R5H2: FailoverPolicyParser and FailoverDecisionService Contract', () =
 
       const decision0 = FailoverDecisionService.evaluate({
         failure: rateLimitFailure,
-        policy: defaultEnabledPolicy,
+        policyResult: parsedDefaultEnabledResult,
         failoverAttemptsUsed: 0,
       });
 
@@ -350,7 +348,7 @@ describe('R5H2: FailoverPolicyParser and FailoverDecisionService Contract', () =
 
       const decision1 = FailoverDecisionService.evaluate({
         failure: rateLimitFailure,
-        policy: defaultEnabledPolicy,
+        policyResult: parsedDefaultEnabledResult,
         failoverAttemptsUsed: 1,
       });
 
@@ -366,7 +364,7 @@ describe('R5H2: FailoverPolicyParser and FailoverDecisionService Contract', () =
       expect(
         FailoverDecisionService.evaluate({
           failure: quotaFailure,
-          policy: defaultEnabledPolicy,
+          policyResult: parsedDefaultEnabledResult,
           failoverAttemptsUsed: 0,
         }).outcome
       ).toBe('FAILOVER_ALLOWED');
@@ -381,7 +379,7 @@ describe('R5H2: FailoverPolicyParser and FailoverDecisionService Contract', () =
       expect(
         FailoverDecisionService.evaluate({
           failure: resourceFailure,
-          policy: defaultEnabledPolicy,
+          policyResult: parsedDefaultEnabledResult,
           failoverAttemptsUsed: 0,
         }).outcome
       ).toBe('FAILOVER_ALLOWED');
@@ -398,7 +396,7 @@ describe('R5H2: FailoverPolicyParser and FailoverDecisionService Contract', () =
       // When attemptsUsed == max (2)
       const exhausted = FailoverDecisionService.evaluate({
         failure: rateLimitFailure,
-        policy: defaultEnabledPolicy,
+        policyResult: parsedDefaultEnabledResult,
         failoverAttemptsUsed: 2,
       });
 
@@ -411,19 +409,19 @@ describe('R5H2: FailoverPolicyParser and FailoverDecisionService Contract', () =
       // When attemptsUsed > max (3)
       const overExhausted = FailoverDecisionService.evaluate({
         failure: rateLimitFailure,
-        policy: defaultEnabledPolicy,
+        policyResult: parsedDefaultEnabledResult,
         failoverAttemptsUsed: 3,
       });
       expect(overExhausted.outcome).toBe('FAILOVER_ATTEMPTS_EXHAUSTED');
 
       // When max_failover_attempts == 0 and attemptsUsed == 0
-      const zeroBudgetPolicy: EnabledFailoverPolicyV1 = {
-        ...defaultEnabledPolicy,
+      const zeroBudgetPolicyResult = FailoverPolicyParser.parse({
+        ...rawDefaultEnabledPolicy,
         max_failover_attempts: 0,
-      };
+      });
       const zeroExhausted = FailoverDecisionService.evaluate({
         failure: rateLimitFailure,
-        policy: zeroBudgetPolicy,
+        policyResult: zeroBudgetPolicyResult,
         failoverAttemptsUsed: 0,
       });
       expect(zeroExhausted.outcome).toBe('FAILOVER_ATTEMPTS_EXHAUSTED');
@@ -452,7 +450,7 @@ describe('R5H2: FailoverPolicyParser and FailoverDecisionService Contract', () =
 
         const decision = FailoverDecisionService.evaluate({
           failure,
-          policy: defaultEnabledPolicy,
+          policyResult: parsedDefaultEnabledResult,
           failoverAttemptsUsed: 0,
         });
 
@@ -461,7 +459,7 @@ describe('R5H2: FailoverPolicyParser and FailoverDecisionService Contract', () =
       }
     });
 
-    it('4. preserves POLICY_DECISION_REQUIRED when no explicit failure_action is defined', () => {
+    it('4. preserves POLICY_DECISION_REQUIRED when no explicit failure_action is defined regardless of attempt budget', () => {
       const policyDepCategories: Array<ClassifiedExecutionFailure['category']> = [
         'TIMEOUT',
         'NONZERO_EXIT',
@@ -476,25 +474,43 @@ describe('R5H2: FailoverPolicyParser and FailoverDecisionService Contract', () =
           reason: `Policy decision required for ${cat}`,
         };
 
-        const decision = FailoverDecisionService.evaluate({
+        // Budget remaining (attempts = 0)
+        const decisionWithBudget = FailoverDecisionService.evaluate({
           failure,
-          policy: defaultEnabledPolicy, // No failure_actions configured
+          policyResult: parsedDefaultEnabledResult, // No failure_actions configured
           failoverAttemptsUsed: 0,
         });
+        expect(decisionWithBudget.outcome).toBe('POLICY_DECISION_REQUIRED');
+        expect(decisionWithBudget.category).toBe(cat);
 
-        expect(decision.outcome).toBe('POLICY_DECISION_REQUIRED');
-        expect(decision.category).toBe(cat);
+        // Budget exhausted (attempts = 2 == max)
+        const decisionExhausted = FailoverDecisionService.evaluate({
+          failure,
+          policyResult: parsedDefaultEnabledResult,
+          failoverAttemptsUsed: 2,
+        });
+        expect(decisionExhausted.outcome).toBe('POLICY_DECISION_REQUIRED');
+        expect(decisionExhausted.category).toBe(cat);
+
+        // Budget over-exhausted (attempts = 3 > max)
+        const decisionOverExhausted = FailoverDecisionService.evaluate({
+          failure,
+          policyResult: parsedDefaultEnabledResult,
+          failoverAttemptsUsed: 3,
+        });
+        expect(decisionOverExhausted.outcome).toBe('POLICY_DECISION_REQUIRED');
+        expect(decisionOverExhausted.category).toBe(cat);
       }
     });
 
-    it('5. evaluates explicit failure_actions (FAILOVER vs STOP)', () => {
-      const policyWithActions: EnabledFailoverPolicyV1 = {
-        ...defaultEnabledPolicy,
+    it('5. evaluates explicit failure_actions: STOP preserves NON_FAILOVERABLE regardless of budget; FAILOVER respects budget', () => {
+      const parsedPolicyWithActions = FailoverPolicyParser.parse({
+        ...rawDefaultEnabledPolicy,
         failure_actions: {
           TIMEOUT: 'FAILOVER',
           NONZERO_EXIT: 'STOP',
         },
-      };
+      });
 
       const timeoutFailure: ClassifiedExecutionFailure = {
         category: 'TIMEOUT',
@@ -503,10 +519,10 @@ describe('R5H2: FailoverPolicyParser and FailoverDecisionService Contract', () =
         reason: 'Process timed out',
       };
 
-      // TIMEOUT with explicit FAILOVER action -> FAILOVER_ALLOWED (with cooldown)
+      // TIMEOUT with explicit FAILOVER action and budget remaining -> FAILOVER_ALLOWED
       const timeoutDecision = FailoverDecisionService.evaluate({
         failure: timeoutFailure,
-        policy: policyWithActions,
+        policyResult: parsedPolicyWithActions,
         failoverAttemptsUsed: 0,
       });
       expect(timeoutDecision).toEqual({
@@ -516,45 +532,57 @@ describe('R5H2: FailoverPolicyParser and FailoverDecisionService Contract', () =
         cooldownDurationMs: 45000,
       });
 
-      // TIMEOUT with explicit FAILOVER action but exhausted budget -> FAILOVER_ATTEMPTS_EXHAUSTED
+      // TIMEOUT with explicit FAILOVER action and budget exhausted -> FAILOVER_ATTEMPTS_EXHAUSTED
       const timeoutExhausted = FailoverDecisionService.evaluate({
         failure: timeoutFailure,
-        policy: policyWithActions,
+        policyResult: parsedPolicyWithActions,
         failoverAttemptsUsed: 2,
       });
       expect(timeoutExhausted.outcome).toBe('FAILOVER_ATTEMPTS_EXHAUSTED');
 
-      // NONZERO_EXIT with explicit STOP action -> NON_FAILOVERABLE
+      // NONZERO_EXIT with explicit STOP action and budget remaining -> NON_FAILOVERABLE
       const nonzeroFailure: ClassifiedExecutionFailure = {
         category: 'NONZERO_EXIT',
         disposition: 'POLICY_DECISION_REQUIRED',
         sourceErrorCode: 'NONZERO_EXIT',
         reason: 'Process exited with code 1',
       };
-      const nonzeroDecision = FailoverDecisionService.evaluate({
+      const nonzeroDecisionWithBudget = FailoverDecisionService.evaluate({
         failure: nonzeroFailure,
-        policy: policyWithActions,
+        policyResult: parsedPolicyWithActions,
         failoverAttemptsUsed: 0,
       });
-      expect(nonzeroDecision).toEqual({
+      expect(nonzeroDecisionWithBudget).toEqual({
         outcome: 'NON_FAILOVERABLE',
         category: 'NONZERO_EXIT',
         reason: 'Explicit policy action for NONZERO_EXIT is STOP.',
       });
 
-      // OUTPUT_LIMIT_EXCEEDED without action -> POLICY_DECISION_REQUIRED
+      // NONZERO_EXIT with explicit STOP action and budget exhausted -> STILL NON_FAILOVERABLE (STOP is not masked)
+      const nonzeroDecisionExhausted = FailoverDecisionService.evaluate({
+        failure: nonzeroFailure,
+        policyResult: parsedPolicyWithActions,
+        failoverAttemptsUsed: 2,
+      });
+      expect(nonzeroDecisionExhausted).toEqual({
+        outcome: 'NON_FAILOVERABLE',
+        category: 'NONZERO_EXIT',
+        reason: 'Explicit policy action for NONZERO_EXIT is STOP.',
+      });
+
+      // OUTPUT_LIMIT_EXCEEDED without action and budget exhausted -> STILL POLICY_DECISION_REQUIRED
       const outputLimitFailure: ClassifiedExecutionFailure = {
         category: 'OUTPUT_LIMIT_EXCEEDED',
         disposition: 'POLICY_DECISION_REQUIRED',
         sourceErrorCode: 'OUTPUT_LIMIT_EXCEEDED',
         reason: 'Output limit exceeded',
       };
-      const outputLimitDecision = FailoverDecisionService.evaluate({
+      const outputLimitDecisionExhausted = FailoverDecisionService.evaluate({
         failure: outputLimitFailure,
-        policy: policyWithActions,
-        failoverAttemptsUsed: 0,
+        policyResult: parsedPolicyWithActions,
+        failoverAttemptsUsed: 3,
       });
-      expect(outputLimitDecision.outcome).toBe('POLICY_DECISION_REQUIRED');
+      expect(outputLimitDecisionExhausted.outcome).toBe('POLICY_DECISION_REQUIRED');
     });
 
     it('6. returns AUTOMATED_FAILOVER_DISABLED when policy is explicitly disabled', () => {
@@ -567,13 +595,13 @@ describe('R5H2: FailoverPolicyParser and FailoverDecisionService Contract', () =
 
       const decision = FailoverDecisionService.evaluate({
         failure: rateLimitFailure,
-        policy: disabledPolicy,
+        policyResult: parsedDisabledResult,
         failoverAttemptsUsed: 0,
       });
       expect(decision.outcome).toBe('AUTOMATED_FAILOVER_DISABLED');
     });
 
-    it('7. returns AUTOMATED_FAILOVER_DISABLED when policy is null, undefined, or ABSENT', () => {
+    it('7. returns AUTOMATED_FAILOVER_DISABLED when policyResult is ABSENT', () => {
       const rateLimitFailure: ClassifiedExecutionFailure = {
         category: 'RATE_LIMITED',
         disposition: 'FAILOVER_ELIGIBLE',
@@ -581,26 +609,13 @@ describe('R5H2: FailoverPolicyParser and FailoverDecisionService Contract', () =
         reason: 'Rate limit hit',
       };
 
-      expect(
-        FailoverDecisionService.evaluate({
-          failure: rateLimitFailure,
-          policy: null,
-          failoverAttemptsUsed: 0,
-        }).outcome
-      ).toBe('AUTOMATED_FAILOVER_DISABLED');
+      const absentResult = FailoverPolicyParser.parse(null);
+      expect(absentResult).toEqual({ status: 'ABSENT' });
 
       expect(
         FailoverDecisionService.evaluate({
           failure: rateLimitFailure,
-          policy: undefined,
-          failoverAttemptsUsed: 0,
-        }).outcome
-      ).toBe('AUTOMATED_FAILOVER_DISABLED');
-
-      expect(
-        FailoverDecisionService.evaluate({
-          failure: rateLimitFailure,
-          policy: { status: 'ABSENT' },
+          policyResult: absentResult,
           failoverAttemptsUsed: 0,
         }).outcome
       ).toBe('AUTOMATED_FAILOVER_DISABLED');
@@ -614,26 +629,22 @@ describe('R5H2: FailoverPolicyParser and FailoverDecisionService Contract', () =
         reason: 'Rate limit hit',
       };
 
-      // Invalid policy object
-      const invalidPolicyDecision = FailoverDecisionService.evaluate({
-        failure: rateLimitFailure,
-        policy: { version: 1, enabled: true, max_failover_attempts: -1 } as any,
-        failoverAttemptsUsed: 0,
-      });
-      expect(invalidPolicyDecision.outcome).toBe('INVALID_POLICY');
+      // Malformed policy parsed by parser -> INVALID -> passed to decision service -> INVALID_POLICY
+      const rawInvalidPolicy = { version: 1, enabled: true, max_failover_attempts: -1 };
+      const parsedInvalid = FailoverPolicyParser.parse(rawInvalidPolicy);
+      expect(parsedInvalid.status).toBe('INVALID');
 
-      // Parsed INVALID policy
-      const parsedInvalidDecision = FailoverDecisionService.evaluate({
+      const decisionOnInvalid = FailoverDecisionService.evaluate({
         failure: rateLimitFailure,
-        policy: { status: 'INVALID', error: 'Malformed policy' },
+        policyResult: parsedInvalid,
         failoverAttemptsUsed: 0,
       });
-      expect(parsedInvalidDecision.outcome).toBe('INVALID_POLICY');
+      expect(decisionOnInvalid.outcome).toBe('INVALID_POLICY');
 
       // Negative attempts count
       const negativeAttemptsDecision = FailoverDecisionService.evaluate({
         failure: rateLimitFailure,
-        policy: defaultEnabledPolicy,
+        policyResult: parsedDefaultEnabledResult,
         failoverAttemptsUsed: -1,
       });
       expect(negativeAttemptsDecision.outcome).toBe('INVALID_POLICY');
@@ -641,7 +652,7 @@ describe('R5H2: FailoverPolicyParser and FailoverDecisionService Contract', () =
       // Fractional attempts count
       const fractionalAttemptsDecision = FailoverDecisionService.evaluate({
         failure: rateLimitFailure,
-        policy: defaultEnabledPolicy,
+        policyResult: parsedDefaultEnabledResult,
         failoverAttemptsUsed: 1.5,
       });
       expect(fractionalAttemptsDecision.outcome).toBe('INVALID_POLICY');
@@ -649,13 +660,13 @@ describe('R5H2: FailoverPolicyParser and FailoverDecisionService Contract', () =
       // NaN attempts count
       const nanAttemptsDecision = FailoverDecisionService.evaluate({
         failure: rateLimitFailure,
-        policy: defaultEnabledPolicy,
+        policyResult: parsedDefaultEnabledResult,
         failoverAttemptsUsed: NaN,
       });
       expect(nanAttemptsDecision.outcome).toBe('INVALID_POLICY');
     });
 
-    it('9. end-to-end integration: integrates with ExecutionFailureClassifier without mutation', () => {
+    it('9. proves complete pipeline: ExecutionFailureClassifier -> FailoverPolicyParser -> FailoverDecisionService', () => {
       const simulatedResult = {
         executionId: 'exec-101',
         status: 'FAILED' as const,
@@ -667,9 +678,12 @@ describe('R5H2: FailoverPolicyParser and FailoverDecisionService Contract', () =
       expect(classified.category).toBe('RATE_LIMITED');
       expect(classified.disposition).toBe('FAILOVER_ELIGIBLE');
 
+      const parsedPolicy = FailoverPolicyParser.parse(rawDefaultEnabledPolicy);
+      expect(parsedPolicy.status).toBe('VALID');
+
       const decision = FailoverDecisionService.evaluate({
         failure: classified,
-        policy: defaultEnabledPolicy,
+        policyResult: parsedPolicy,
         failoverAttemptsUsed: 0,
       });
 
