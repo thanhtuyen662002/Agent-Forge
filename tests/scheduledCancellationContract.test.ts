@@ -198,7 +198,9 @@ setInterval(() => {
 }, 1000);`
     );
 
-    gitExe = execSync('where git', { encoding: 'utf-8' }).trim().split(/\r?\n/)[0];
+    gitExe = execSync(process.platform === 'win32' ? 'where git' : 'which git', { encoding: 'utf-8' })
+      .trim()
+      .split(/\r?\n/)[0];
 
     execSync(`"${gitExe}" init`, { cwd: repoDir, stdio: 'pipe' });
     execSync(`"${gitExe}" config user.name "Test User"`, { cwd: repoDir, stdio: 'pipe' });
