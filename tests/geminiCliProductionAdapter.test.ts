@@ -253,10 +253,25 @@ describe('R5F0D1 — Production Gemini CLI Adapter Contract Suite', () => {
 
       if (scenario.mode === 'HUGE_OUTPUT') {
         const chunk = "X".repeat(1024 * 1024);
-        for (let i = 0; i < 40; i++) {
-          process.stdout.write(chunk);
+        let remaining = 40;
+        function writeMore() {
+          let ok = true;
+          while (remaining > 0 && ok) {
+            remaining--;
+            if (remaining === 0) {
+              process.stdout.write(chunk, () => {
+                process.exit(0);
+              });
+            } else {
+              ok = process.stdout.write(chunk);
+            }
+          }
+          if (remaining > 0) {
+            process.stdout.once('drain', writeMore);
+          }
         }
-        process.exit(0);
+        writeMore();
+        return;
       }
 
       if (scenario.mode === 'SLEEP_TIMEOUT') {
