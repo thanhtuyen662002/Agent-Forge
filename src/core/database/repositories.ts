@@ -3804,7 +3804,7 @@ export class Repository {
           `RESOURCE_PROVIDER_MISMATCH: ProviderResource provider_id "${resource.provider_id}" does not match observation provider_id "${observation.provider_id}".`
         );
       }
-      if (resource.provider_account_id != null && resource.provider_account_id !== observation.account_id) {
+      if (resource.provider_account_id !== observation.account_id) {
         throw new Error(
           `RESOURCE_ACCOUNT_MISMATCH: ProviderResource provider_account_id "${resource.provider_account_id}" does not match observation account_id "${observation.account_id}".`
         );
