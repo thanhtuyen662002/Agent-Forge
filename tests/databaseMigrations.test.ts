@@ -64,19 +64,25 @@ describe('Database Migrations & Upgrade Integrity', () => {
     expect(uniqueAccountOrderIdx?.unique).toBe(1);
 
     const applied = db.prepare('SELECT COUNT(*) as count FROM schema_migrations').get() as { count: number };
-    expect(applied.count).toBe(12);
+    expect(applied.count).toBe(13);
 
     // Foreign key integrity check
     const fkViolations = db.prepare('PRAGMA foreign_key_check').all();
     expect(fkViolations).toHaveLength(0);
 
+    // Verify Migration 13 columns on provider_health_observations
+    const obsColumns = (db.prepare("PRAGMA table_info(provider_health_observations)").all() as { name: string }[]).map((c) => c.name);
+    expect(obsColumns).toContain('health_action_plan_version');
+    expect(obsColumns).toContain('health_action');
+    expect(obsColumns).toContain('health_action_cooldown_duration_ms');
+
     // Idempotency check: running MigrationRunner again applies 0 new migrations
     MigrationRunner.run(db);
     const appliedAgain = db.prepare('SELECT COUNT(*) as count FROM schema_migrations').get() as { count: number };
-    expect(appliedAgain.count).toBe(12);
+    expect(appliedAgain.count).toBe(13);
   });
 
-  it('should cleanly upgrade an existing database through historical path (v1 -> v2 -> original v3 -> v4 -> v5 -> v6 -> v7 -> v8 -> v9 -> v10 -> v11 -> v12) and repair default agent links', () => {
+  it('should cleanly upgrade an existing database through historical path (v1 -> v2 -> original v3 -> v4 -> v5 -> v6 -> v7 -> v8 -> v9 -> v10 -> v11 -> v12 -> v13) and repair default agent links', () => {
     // 1. Manually apply v1 schema
     db.exec(`
       CREATE TABLE IF NOT EXISTS schema_migrations (
@@ -124,7 +130,7 @@ describe('Database Migrations & Upgrade Integrity', () => {
     const mgrBefore = db.prepare('SELECT * FROM agents WHERE id = ?').get('agent-primary-manager') as any;
     expect(mgrBefore.provider_resource_id).toBe('res-chatgpt-manager');
 
-    // 2. Run MigrationRunner to upgrade from v1 to latest (v12)
+    // 2. Run MigrationRunner to upgrade from v1 to latest (v13)
     MigrationRunner.run(db);
 
     // 3. Assert migrations applied
@@ -152,7 +158,7 @@ describe('Database Migrations & Upgrade Integrity', () => {
     expect(v12Tables).toContain('provider_health_observations');
 
     const migrationCount = (db.prepare('SELECT COUNT(*) as count FROM schema_migrations').get() as { count: number }).count;
-    expect(migrationCount).toBe(12);
+    expect(migrationCount).toBe(13);
 
     // 4. Assert default agent links are repaired by migration 005
     const mgrAfter = db.prepare('SELECT * FROM agents WHERE id = ?').get('agent-primary-manager') as any;

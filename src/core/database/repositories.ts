@@ -56,10 +56,15 @@ import {
   ClaimSuccessorParams,
   ProviderHealthObservation,
   ProviderHealthObservationRecord,
-  ProviderHealthObservationCategory
+  ProviderHealthObservationCategory,
+  FailoverPolicyAuthoritySnapshotV1,
+  ProviderAccountHealthAction,
+  FailoverPolicyParseResult,
 } from '../types/domain';
 import type { ProviderDispatchExecutionResult } from '../services/ProviderDispatchService';
 import { ExecutionFailureClassifier } from '../services/ExecutionFailureClassifier';
+import { FailureHealthMutationPolicyService } from '../services/FailureHealthMutationPolicyService';
+import { FailoverPolicyParser } from '../services/FailoverPolicyParser';
 import {
   computeSha256,
   canonicalJsonStringify,
@@ -3944,13 +3949,77 @@ export class Repository {
         );
       }
 
-      // 12. Calculate next account_order for this account
+      // 12. Policy snapshot resolution and Action-Plan derivation from durable routing event
+      let healthActionPlanVersion: 1 | null = null;
+      let healthAction: ProviderAccountHealthAction | null = null;
+      let healthActionCooldownDurationMs: number | null = null;
+
+      const routingEventRow = this.db
+        .prepare(`
+          SELECT * FROM events
+          WHERE (id = ? OR json_extract(structured_payload_json, '$.decisionId') = ?)
+            AND type IN ('ROLE_AWARE_ROUTING_DECISION', 'PROVIDER_ROUTING_DECISION')
+          ORDER BY timestamp DESC
+          LIMIT 1
+        `)
+        .get(observation.routing_decision_id, observation.routing_decision_id) as Record<string, unknown> | undefined;
+
+      if (routingEventRow) {
+        const eventProjectId = routingEventRow.project_id ? String(routingEventRow.project_id) : null;
+        const eventTaskId = routingEventRow.task_id ? String(routingEventRow.task_id) : null;
+        if (eventProjectId === auth.project_id && (!eventTaskId || eventTaskId === auth.task_id)) {
+          const payload = routingEventRow.structured_payload_json
+            ? JSON.parse(String(routingEventRow.structured_payload_json))
+            : {};
+
+          const snapshot = payload.failoverPolicyAuthoritySnapshot;
+          if (snapshot && typeof snapshot === 'object' && !Array.isArray(snapshot) && snapshot.version === 1) {
+            let policyResult: FailoverPolicyParseResult | null = null;
+            if (snapshot.status === 'VALID' && snapshot.policy && typeof snapshot.policy === 'object') {
+              const revalidated = FailoverPolicyParser.parse(snapshot.policy);
+              if (revalidated.status === 'VALID') {
+                policyResult = { status: 'VALID', policy: revalidated.policy };
+              } else {
+                policyResult = { status: 'INVALID', error: 'SNAPSHOT_REVALIDATION_FAILED' };
+              }
+            } else if (snapshot.status === 'ABSENT') {
+              policyResult = { status: 'ABSENT' };
+            } else if (snapshot.status === 'INVALID') {
+              policyResult = { status: 'INVALID', error: 'SNAPSHOT_STATUS_INVALID' };
+            }
+
+            if (policyResult) {
+              const plan = FailureHealthMutationPolicyService.evaluate({
+                providerResult,
+                policyResult,
+              });
+
+              const planCategory = (plan.category === 'UNKNOWN' && observation.classified_category === 'ADAPTER_THROW')
+                ? 'ADAPTER_THROW'
+                : plan.category;
+
+              if (
+                plan.accountId === observation.account_id &&
+                plan.executionId === observation.execution_id &&
+                plan.authorizationId === observation.authorization_id &&
+                planCategory === observation.classified_category
+              ) {
+                healthActionPlanVersion = 1;
+                healthAction = plan.action;
+                healthActionCooldownDurationMs = plan.cooldownDurationMs ?? null;
+              }
+            }
+          }
+        }
+      }
+
+      // 13. Calculate next account_order for this account
       const orderRow = this.db
         .prepare('SELECT COALESCE(MAX(account_order), 0) + 1 AS next_order FROM provider_health_observations WHERE account_id = ?')
         .get(observation.account_id) as { next_order: number };
       const nextOrder = Number(orderRow.next_order);
 
-      // 13. Insert row
+      // 14. Insert row
       this.db
         .prepare(`
           INSERT INTO provider_health_observations (
@@ -3969,8 +4038,11 @@ export class Repository {
             result_status,
             classified_category,
             observed_at,
-            account_order
-          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            account_order,
+            health_action_plan_version,
+            health_action,
+            health_action_cooldown_duration_ms
+          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         `)
         .run(
           observation.authorization_id,
@@ -3988,7 +4060,10 @@ export class Repository {
           observation.result_status,
           observation.classified_category,
           observation.observed_at,
-          nextOrder
+          nextOrder,
+          healthActionPlanVersion,
+          healthAction,
+          healthActionCooldownDurationMs
         );
 
       return 'RECORDED';
@@ -4013,6 +4088,9 @@ export class Repository {
       classified_category: String(row.classified_category) as ProviderHealthObservationCategory,
       observed_at: String(row.observed_at),
       account_order: row.account_order !== null && row.account_order !== undefined ? Number(row.account_order) : null,
+      health_action_plan_version: row.health_action_plan_version !== null && row.health_action_plan_version !== undefined ? Number(row.health_action_plan_version) as 1 : null,
+      health_action: row.health_action ? String(row.health_action) as ProviderAccountHealthAction : null,
+      health_action_cooldown_duration_ms: row.health_action_cooldown_duration_ms !== null && row.health_action_cooldown_duration_ms !== undefined ? Number(row.health_action_cooldown_duration_ms) : null,
     };
   }
 }
