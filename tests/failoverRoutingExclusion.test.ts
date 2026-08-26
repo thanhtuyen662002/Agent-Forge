@@ -812,24 +812,88 @@ describe('R5H3 — Routing Exclusion & Audit Contract', () => {
     expect(decision.requestedConstraints.excludedAccountIds).toEqual(['acc-a', 'acc-m', 'acc-z']);
   });
 
-  it('23. DURABLE REQUEST PERMUTATION INVARIANCE: durable event contains identical canonical requested constraints regardless of input order', async () => {
-    await roleRouter.routeRole({
+  it('23. DURABLE REQUEST PERMUTATION INVARIANCE: durable event contains identical canonical requested constraints across two separate runs with permuted inputs', async () => {
+    // Run A with permuted inputs
+    const decisionA = await roleRouter.routeRole({
       projectId,
       taskId,
       roleProfileId,
-      excludedAccountIds: ['acc-openai-2', 'acc-openai-1'],
+      excludedCandidateIds: [
+        'acc-openai-2:res-openai-gpt4-2',
+        'acc-openai-1:res-openai-gpt4-1',
+        'acc-anthropic-1:res-claude-sonnet',
+      ],
+      excludedAccountIds: ['acc-openai-2', 'acc-gemini-1', 'acc-openai-1'],
+      excludedProviderIds: ['prov-openai', 'prov-gemini', 'prov-anthropic'],
     });
 
-    const events = eventService.getEvents(projectId);
-    const routingEvent = events[events.length - 1];
-    const payload = routingEvent?.structured_payload as any;
+    const eventsAfterA = eventService.getEvents(projectId);
+    const eventA = eventsAfterA.find(
+      (e) =>
+        e.type === 'ROLE_AWARE_ROUTING_DECISION' &&
+        (e.structured_payload as any)?.decisionId === decisionA.decisionId
+    );
+    const payloadA = eventA?.structured_payload as any;
 
-    expect(payload.requestedConstraints.excludedAccountIds).toEqual(['acc-openai-1', 'acc-openai-2']);
+    // Run B with differently permuted inputs
+    const decisionB = await roleRouter.routeRole({
+      projectId,
+      taskId,
+      roleProfileId,
+      excludedCandidateIds: [
+        'acc-anthropic-1:res-claude-sonnet',
+        'acc-openai-1:res-openai-gpt4-1',
+        'acc-openai-2:res-openai-gpt4-2',
+      ],
+      excludedAccountIds: ['acc-gemini-1', 'acc-openai-1', 'acc-openai-2'],
+      excludedProviderIds: ['prov-anthropic', 'prov-openai', 'prov-gemini'],
+    });
+
+    const eventsAfterB = eventService.getEvents(projectId);
+    const eventB = eventsAfterB.find(
+      (e) =>
+        e.type === 'ROLE_AWARE_ROUTING_DECISION' &&
+        (e.structured_payload as any)?.decisionId === decisionB.decisionId
+    );
+    const payloadB = eventB?.structured_payload as any;
+
+    // Ensure distinct events were captured
+    expect(eventA).toBeDefined();
+    expect(eventB).toBeDefined();
+    expect(eventA?.id).not.toEqual(eventB?.id);
+
+    // Assert explicit canonical sorted arrays
+    const expectedCanonicalCandidates = [
+      'acc-anthropic-1:res-claude-sonnet',
+      'acc-openai-1:res-openai-gpt4-1',
+      'acc-openai-2:res-openai-gpt4-2',
+    ];
+    const expectedCanonicalAccounts = ['acc-gemini-1', 'acc-openai-1', 'acc-openai-2'];
+    const expectedCanonicalProviders = ['prov-anthropic', 'prov-gemini', 'prov-openai'];
+
+    expect(payloadA.requestedConstraints.excludedCandidateIds).toEqual(expectedCanonicalCandidates);
+    expect(payloadA.requestedConstraints.excludedAccountIds).toEqual(expectedCanonicalAccounts);
+    expect(payloadA.requestedConstraints.excludedProviderIds).toEqual(expectedCanonicalProviders);
+
+    expect(payloadB.requestedConstraints.excludedCandidateIds).toEqual(expectedCanonicalCandidates);
+    expect(payloadB.requestedConstraints.excludedAccountIds).toEqual(expectedCanonicalAccounts);
+    expect(payloadB.requestedConstraints.excludedProviderIds).toEqual(expectedCanonicalProviders);
+
+    // Assert exact deep equality between runs
+    expect(payloadA.requestedConstraints.excludedCandidateIds).toEqual(
+      payloadB.requestedConstraints.excludedCandidateIds
+    );
+    expect(payloadA.requestedConstraints.excludedAccountIds).toEqual(
+      payloadB.requestedConstraints.excludedAccountIds
+    );
+    expect(payloadA.requestedConstraints.excludedProviderIds).toEqual(
+      payloadB.requestedConstraints.excludedProviderIds
+    );
   });
 
   it('24. APPLIED EXCLUSION ORDER INVARIANCE: durable appliedExclusions is deterministically sorted by candidateId ascending regardless of candidate discovery order', async () => {
     // Run with candidateRefs in order A
-    await roleRouter.routeRole({
+    const decision1 = await roleRouter.routeRole({
       projectId,
       taskId,
       roleProfileId,
@@ -841,10 +905,15 @@ describe('R5H3 — Routing Exclusion & Audit Contract', () => {
     });
 
     const events1 = eventService.getEvents(projectId);
-    const payload1 = events1[events1.length - 1]?.structured_payload as any;
+    const event1 = events1.find(
+      (e) =>
+        e.type === 'ROLE_AWARE_ROUTING_DECISION' &&
+        (e.structured_payload as any)?.decisionId === decision1.decisionId
+    );
+    const payload1 = event1?.structured_payload as any;
 
     // Run with candidateRefs in reversed order B
-    await roleRouter.routeRole({
+    const decision2 = await roleRouter.routeRole({
       projectId,
       taskId,
       roleProfileId,
@@ -856,7 +925,12 @@ describe('R5H3 — Routing Exclusion & Audit Contract', () => {
     });
 
     const events2 = eventService.getEvents(projectId);
-    const payload2 = events2[events2.length - 1]?.structured_payload as any;
+    const event2 = events2.find(
+      (e) =>
+        e.type === 'ROLE_AWARE_ROUTING_DECISION' &&
+        (e.structured_payload as any)?.decisionId === decision2.decisionId
+    );
+    const payload2 = event2?.structured_payload as any;
 
     expect(payload1.appliedExclusions).toBeDefined();
     expect(payload2.appliedExclusions).toBeDefined();
@@ -887,7 +961,12 @@ describe('R5H3 — Routing Exclusion & Audit Contract', () => {
     ]);
 
     const events = eventService.getEvents(projectId);
-    const payload = events[events.length - 1]?.structured_payload as any;
+    const event = events.find(
+      (e) =>
+        e.type === 'ROLE_AWARE_ROUTING_DECISION' &&
+        (e.structured_payload as any)?.decisionId === decision.decisionId
+    );
+    const payload = event?.structured_payload as any;
     const appliedEntry = payload.appliedExclusions.find(
       (a: any) => a.candidateId === 'acc-openai-1:res-openai-gpt4-1'
     );
