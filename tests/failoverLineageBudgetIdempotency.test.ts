@@ -21,27 +21,38 @@ function safeRmDir(dir: string): void {
   } catch {}
 }
 
-function seedBaseProjectAndTask(repo: Repository, db: Database.Database, taskId = 'task-1'): { project: Project; task: Task } {
-  const project: Project = {
-    id: 'project-1',
-    name: 'Test Project',
-    description: 'Test Description',
-    repository_path: '/repo/test',
-    default_branch: 'main',
-    status: 'READY',
-    contract: null,
-    created_at: new Date().toISOString(),
-    updated_at: new Date().toISOString(),
-    started_at: null,
-    completed_at: null,
-  };
-  repo.createProject(project);
+function seedBaseProjectAndTask(
+  repo: Repository,
+  db: Database.Database,
+  taskId = 'task-1',
+  projectId = 'project-1'
+): { project: Project; task: Task } {
+  const existingProject = repo.getProject(projectId);
+  let project: Project;
+  if (existingProject) {
+    project = existingProject;
+  } else {
+    project = {
+      id: projectId,
+      name: 'Test Project ' + projectId,
+      description: 'Test Description',
+      repository_path: '/repo/test',
+      default_branch: 'main',
+      status: 'READY',
+      contract: null,
+      created_at: new Date().toISOString(),
+      updated_at: new Date().toISOString(),
+      started_at: null,
+      completed_at: null,
+    };
+    repo.createProject(project);
+  }
 
   const task: Task = {
     id: taskId,
     project_id: project.id,
     milestone_id: null,
-    title: 'Test Task',
+    title: 'Test Task ' + taskId,
     description: 'Task Description',
     state: 'APPROVED',
     paused_from_state: null,
@@ -62,6 +73,35 @@ function seedBaseProjectAndTask(repo: Repository, db: Database.Database, taskId 
   repo.createTask(task);
 
   return { project, task };
+}
+
+function rawInsertTransition(
+  database: Database.Database,
+  t: {
+    id: string;
+    task_id: string;
+    root_attempt_id: string;
+    source_attempt_id: string;
+    successor_attempt_id: string;
+    failover_ordinal: number;
+    created_at?: string;
+  }
+): void {
+  database
+    .prepare(`
+      INSERT INTO failover_transitions (
+        id, task_id, root_attempt_id, source_attempt_id, successor_attempt_id, failover_ordinal, created_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?)
+    `)
+    .run(
+      t.id,
+      t.task_id,
+      t.root_attempt_id,
+      t.source_attempt_id,
+      t.successor_attempt_id,
+      t.failover_ordinal,
+      t.created_at ?? new Date().toISOString()
+    );
 }
 
 describe('Failover Lineage, Budget, and Idempotency Contract (R5H4)', () => {
@@ -252,7 +292,7 @@ describe('Failover Lineage, Budget, and Idempotency Contract (R5H4)', () => {
         summary: null,
       });
 
-      repo.createFailoverTransition({
+      rawInsertTransition(db, {
         id: 'ft-1',
         task_id: 'task-1',
         root_attempt_id: 'att-1',
@@ -264,7 +304,7 @@ describe('Failover Lineage, Budget, and Idempotency Contract (R5H4)', () => {
 
       // Attempt duplicate source_attempt_id
       expect(() => {
-        repo.createFailoverTransition({
+        rawInsertTransition(db, {
           id: 'ft-2',
           task_id: 'task-1',
           root_attempt_id: 'att-1',
@@ -273,11 +313,11 @@ describe('Failover Lineage, Budget, and Idempotency Contract (R5H4)', () => {
           failover_ordinal: 2,
           created_at: new Date().toISOString(),
         });
-      }).toThrow();
+      }).toThrow(/UNIQUE constraint failed: failover_transitions\.source_attempt_id/);
 
       // Attempt duplicate successor_attempt_id
       expect(() => {
-        repo.createFailoverTransition({
+        rawInsertTransition(db, {
           id: 'ft-3',
           task_id: 'task-1',
           root_attempt_id: 'att-2',
@@ -286,7 +326,7 @@ describe('Failover Lineage, Budget, and Idempotency Contract (R5H4)', () => {
           failover_ordinal: 1,
           created_at: new Date().toISOString(),
         });
-      }).toThrow();
+      }).toThrow(/UNIQUE constraint failed: failover_transitions\.successor_attempt_id/);
     });
 
     it('5. enforces DB-level uniqueness on (root_attempt_id, failover_ordinal)', () => {
@@ -295,7 +335,7 @@ describe('Failover Lineage, Budget, and Idempotency Contract (R5H4)', () => {
       repo.createTaskAttempt({ id: 'att-2', task_id: 'task-1', attempt_number: 2, agent_id: 'agent-1', status: 'FAILED', started_at: '2026-08-26T00:01:00Z', ended_at: null, summary: null });
       repo.createTaskAttempt({ id: 'att-3', task_id: 'task-1', attempt_number: 3, agent_id: 'agent-1', status: 'RUNNING', started_at: '2026-08-26T00:02:00Z', ended_at: null, summary: null });
 
-      repo.createFailoverTransition({
+      rawInsertTransition(db, {
         id: 'ft-1',
         task_id: 'task-1',
         root_attempt_id: 'att-1',
@@ -307,7 +347,7 @@ describe('Failover Lineage, Budget, and Idempotency Contract (R5H4)', () => {
 
       // Attempt to insert duplicate ordinal 1 for root att-1
       expect(() => {
-        repo.createFailoverTransition({
+        rawInsertTransition(db, {
           id: 'ft-2',
           task_id: 'task-1',
           root_attempt_id: 'att-1',
@@ -316,7 +356,64 @@ describe('Failover Lineage, Budget, and Idempotency Contract (R5H4)', () => {
           failover_ordinal: 1, // duplicate ordinal for root att-1!
           created_at: '2026-08-26T00:02:00Z',
         });
-      }).toThrow();
+      }).toThrow(/UNIQUE constraint failed: failover_transitions\.root_attempt_id, failover_transitions\.failover_ordinal/);
+    });
+
+    it('5b. rejects cross-task root_attempt_id via composite foreign key constraint', () => {
+      seedBaseProjectAndTask(repo, db, 'task-A');
+      seedBaseProjectAndTask(repo, db, 'task-B');
+      repo.createTaskAttempt({ id: 'att-A1', task_id: 'task-A', attempt_number: 1, agent_id: 'agent-1', status: 'FAILED', started_at: '2026-08-26T00:00:00Z', ended_at: null, summary: null });
+      repo.createTaskAttempt({ id: 'att-A2', task_id: 'task-A', attempt_number: 2, agent_id: 'agent-1', status: 'RUNNING', started_at: '2026-08-26T00:01:00Z', ended_at: null, summary: null });
+      repo.createTaskAttempt({ id: 'att-B1', task_id: 'task-B', attempt_number: 1, agent_id: 'agent-1', status: 'FAILED', started_at: '2026-08-26T00:00:00Z', ended_at: null, summary: null });
+
+      expect(() => {
+        rawInsertTransition(db, {
+          id: 'trans-cross-root',
+          task_id: 'task-A',
+          root_attempt_id: 'att-B1', // Cross-task root!
+          source_attempt_id: 'att-A1',
+          successor_attempt_id: 'att-A2',
+          failover_ordinal: 1,
+        });
+      }).toThrow(/FOREIGN KEY constraint failed/i);
+    });
+
+    it('5c. rejects cross-task source_attempt_id via composite foreign key constraint', () => {
+      seedBaseProjectAndTask(repo, db, 'task-A');
+      seedBaseProjectAndTask(repo, db, 'task-B');
+      repo.createTaskAttempt({ id: 'att-A1', task_id: 'task-A', attempt_number: 1, agent_id: 'agent-1', status: 'FAILED', started_at: '2026-08-26T00:00:00Z', ended_at: null, summary: null });
+      repo.createTaskAttempt({ id: 'att-A2', task_id: 'task-A', attempt_number: 2, agent_id: 'agent-1', status: 'RUNNING', started_at: '2026-08-26T00:01:00Z', ended_at: null, summary: null });
+      repo.createTaskAttempt({ id: 'att-B1', task_id: 'task-B', attempt_number: 1, agent_id: 'agent-1', status: 'FAILED', started_at: '2026-08-26T00:00:00Z', ended_at: null, summary: null });
+
+      expect(() => {
+        rawInsertTransition(db, {
+          id: 'trans-cross-source',
+          task_id: 'task-A',
+          root_attempt_id: 'att-A1',
+          source_attempt_id: 'att-B1', // Cross-task source!
+          successor_attempt_id: 'att-A2',
+          failover_ordinal: 1,
+        });
+      }).toThrow(/FOREIGN KEY constraint failed/i);
+    });
+
+    it('5d. rejects cross-task successor_attempt_id via composite foreign key constraint', () => {
+      seedBaseProjectAndTask(repo, db, 'task-A');
+      seedBaseProjectAndTask(repo, db, 'task-B');
+      repo.createTaskAttempt({ id: 'att-A1', task_id: 'task-A', attempt_number: 1, agent_id: 'agent-1', status: 'FAILED', started_at: '2026-08-26T00:00:00Z', ended_at: null, summary: null });
+      repo.createTaskAttempt({ id: 'att-A2', task_id: 'task-A', attempt_number: 2, agent_id: 'agent-1', status: 'RUNNING', started_at: '2026-08-26T00:01:00Z', ended_at: null, summary: null });
+      repo.createTaskAttempt({ id: 'att-B1', task_id: 'task-B', attempt_number: 1, agent_id: 'agent-1', status: 'FAILED', started_at: '2026-08-26T00:00:00Z', ended_at: null, summary: null });
+
+      expect(() => {
+        rawInsertTransition(db, {
+          id: 'trans-cross-succ',
+          task_id: 'task-A',
+          root_attempt_id: 'att-A1',
+          source_attempt_id: 'att-A1',
+          successor_attempt_id: 'att-B1', // Cross-task successor!
+          failover_ordinal: 1,
+        });
+      }).toThrow(/FOREIGN KEY constraint failed/i);
     });
   });
 
@@ -771,7 +868,7 @@ describe('Failover Lineage, Budget, and Idempotency Contract (R5H4)', () => {
       // Step A: Seed initial attempts A, B, and transition A -> B (root=A, ordinal=1)
       repo.createTaskAttempt({ id: 'att-A', task_id: 'task-1', attempt_number: 1, agent_id: 'agent-1', status: 'FAILED', started_at: '2026-08-26T00:00:00Z', ended_at: null, summary: null });
       repo.createTaskAttempt({ id: 'att-B', task_id: 'task-1', attempt_number: 2, agent_id: 'agent-1', status: 'FAILED', started_at: '2026-08-26T00:01:00Z', ended_at: null, summary: null });
-      repo.createFailoverTransition({
+      rawInsertTransition(db, {
         id: 'trans-A-B',
         task_id: 'task-1',
         root_attempt_id: 'att-A',
@@ -784,7 +881,7 @@ describe('Failover Lineage, Budget, and Idempotency Contract (R5H4)', () => {
       // Step B: Seed additional valid attempts X, Y and pre-seed a transition that occupies (root_attempt_id=A, failover_ordinal=2)
       repo.createTaskAttempt({ id: 'att-X', task_id: 'task-1', attempt_number: 3, agent_id: 'agent-1', status: 'FAILED', started_at: '2026-08-26T00:02:00Z', ended_at: null, summary: null });
       repo.createTaskAttempt({ id: 'att-Y', task_id: 'task-1', attempt_number: 4, agent_id: 'agent-1', status: 'RUNNING', started_at: '2026-08-26T00:02:30Z', ended_at: null, summary: null });
-      repo.createFailoverTransition({
+      rawInsertTransition(db, {
         id: 'trans-X-Y-conflict',
         task_id: 'task-1',
         root_attempt_id: 'att-A',
@@ -798,17 +895,6 @@ describe('Failover Lineage, Budget, and Idempotency Contract (R5H4)', () => {
       expect(attemptCountBefore).toBe(4);
 
       // Step C: Call claimSuccessor for source att-B with fresh transitionId and fresh successorAttemptId att-Z
-      // All pre-checks pass:
-      // - att-B exists
-      // - att-B has no outgoing transition yet
-      // - trans-B-Z does not exist
-      // - att-Z does not exist
-      // - att-Z is NOT a successor of any transition
-      // Predecessor is trans-A-B (successor=att-B) => computed root = att-A, computed ordinal = 1 + 1 = 2
-      // Inside runInImmediateTransaction:
-      // 1. successor att-Z is INSERTED into task_attempts
-      // 2. transition trans-B-Z is INSERTED with root=att-A, ordinal=2 -> FAILS on UNIQUE(root_attempt_id, failover_ordinal)
-      // 3. Exception causes immediate transaction rollback
       expect(() => {
         service.claimSuccessor({
           transitionId: 'trans-B-Z',
@@ -827,6 +913,66 @@ describe('Failover Lineage, Budget, and Idempotency Contract (R5H4)', () => {
       // Verify attempt count in task is unchanged
       const attemptCountAfter = repo.getTaskAttemptsByTask('task-1').length;
       expect(attemptCountAfter).toBe(attemptCountBefore);
+    });
+
+    it('16b. fails closed with bounded integrity error when existing predecessor transition state is malformed', () => {
+      seedBaseProjectAndTask(repo, db, 'task-1');
+      repo.createTaskAttempt({ id: 'att-1', task_id: 'task-1', attempt_number: 1, agent_id: 'agent-1', status: 'FAILED', started_at: '2026-08-26T00:00:00Z', ended_at: null, summary: null });
+      repo.createTaskAttempt({ id: 'att-2', task_id: 'task-1', attempt_number: 2, agent_id: 'agent-1', status: 'FAILED', started_at: '2026-08-26T00:01:00Z', ended_at: null, summary: null });
+
+      // Temporarily disable FK enforcement to insert corrupt predecessor row
+      db.pragma('foreign_keys = OFF');
+      rawInsertTransition(db, {
+        id: 'trans-corrupt-pred',
+        task_id: 'task-corrupt',
+        root_attempt_id: 'att-1',
+        source_attempt_id: 'att-1',
+        successor_attempt_id: 'att-2',
+        failover_ordinal: 1,
+      });
+      db.pragma('foreign_keys = ON');
+
+      const attemptCountBefore = repo.getTaskAttemptsByTask('task-1').length;
+
+      expect(() => {
+        service.claimSuccessor({
+          transitionId: 'trans-from-2',
+          sourceAttemptId: 'att-2',
+          successorAttemptId: 'att-3',
+        });
+      }).toThrow(/\[FailoverLineageIntegrity\]/i);
+
+      // Verify 0 writes occurred
+      expect(repo.getTaskAttempt('att-3')).toBeNull();
+      expect(repo.getTaskAttemptsByTask('task-1')).toHaveLength(attemptCountBefore);
+    });
+
+    it('16c. fails closed with bounded integrity error when existing outgoing idempotent transition is corrupt', () => {
+      seedBaseProjectAndTask(repo, db, 'task-1');
+      repo.createTaskAttempt({ id: 'att-1', task_id: 'task-1', attempt_number: 1, agent_id: 'agent-1', status: 'FAILED', started_at: '2026-08-26T00:00:00Z', ended_at: null, summary: null });
+
+      // Temporarily disable FK enforcement to insert corrupt outgoing transition with missing successor
+      db.pragma('foreign_keys = OFF');
+      rawInsertTransition(db, {
+        id: 'trans-corrupt-outgoing',
+        task_id: 'task-1',
+        root_attempt_id: 'att-1',
+        source_attempt_id: 'att-1',
+        successor_attempt_id: 'att-nonexistent-succ',
+        failover_ordinal: 1,
+      });
+      db.pragma('foreign_keys = ON');
+
+      expect(() => {
+        service.claimSuccessor({
+          transitionId: 'trans-new',
+          sourceAttemptId: 'att-1',
+          successorAttemptId: 'att-fresh',
+        });
+      }).toThrow(/\[FailoverLineageIntegrity\]/i);
+
+      // Verify 0 writes
+      expect(repo.getTaskAttempt('att-fresh')).toBeNull();
     });
   });
 
@@ -875,6 +1021,92 @@ describe('Failover Lineage, Budget, and Idempotency Contract (R5H4)', () => {
       expect(() => {
         service.getLineageContext('nonexistent-attempt');
       }).toThrow(/TaskAttempt "nonexistent-attempt" not found/);
+    });
+
+    it('20b. detects cycle in lineage graph and throws bounded integrity error immediately', () => {
+      seedBaseProjectAndTask(repo, db, 'task-1');
+      repo.createTaskAttempt({ id: 'att-A', task_id: 'task-1', attempt_number: 1, agent_id: 'agent-1', status: 'FAILED', started_at: '2026-08-26T00:00:00Z', ended_at: null, summary: null });
+      repo.createTaskAttempt({ id: 'att-B', task_id: 'task-1', attempt_number: 2, agent_id: 'agent-1', status: 'FAILED', started_at: '2026-08-26T00:01:00Z', ended_at: null, summary: null });
+
+      rawInsertTransition(db, {
+        id: 'trans-A-B',
+        task_id: 'task-1',
+        root_attempt_id: 'att-A',
+        source_attempt_id: 'att-A',
+        successor_attempt_id: 'att-B',
+        failover_ordinal: 1,
+      });
+
+      rawInsertTransition(db, {
+        id: 'trans-B-A',
+        task_id: 'task-1',
+        root_attempt_id: 'att-A',
+        source_attempt_id: 'att-B',
+        successor_attempt_id: 'att-A',
+        failover_ordinal: 2,
+      });
+
+      expect(() => {
+        service.getLineageContext('att-A');
+      }).toThrow(/\[FailoverLineageIntegrity\].*cycle/i);
+    });
+
+    it('20c. fails closed with bounded integrity error when an ordinal gap exists in the lineage chain', () => {
+      seedBaseProjectAndTask(repo, db, 'task-1');
+      repo.createTaskAttempt({ id: 'att-A', task_id: 'task-1', attempt_number: 1, agent_id: 'agent-1', status: 'FAILED', started_at: '2026-08-26T00:00:00Z', ended_at: null, summary: null });
+      repo.createTaskAttempt({ id: 'att-B', task_id: 'task-1', attempt_number: 2, agent_id: 'agent-1', status: 'FAILED', started_at: '2026-08-26T00:01:00Z', ended_at: null, summary: null });
+      repo.createTaskAttempt({ id: 'att-C', task_id: 'task-1', attempt_number: 3, agent_id: 'agent-1', status: 'FAILED', started_at: '2026-08-26T00:02:00Z', ended_at: null, summary: null });
+
+      rawInsertTransition(db, {
+        id: 'trans-A-B',
+        task_id: 'task-1',
+        root_attempt_id: 'att-A',
+        source_attempt_id: 'att-A',
+        successor_attempt_id: 'att-B',
+        failover_ordinal: 1,
+      });
+
+      rawInsertTransition(db, {
+        id: 'trans-B-C',
+        task_id: 'task-1',
+        root_attempt_id: 'att-A',
+        source_attempt_id: 'att-B',
+        successor_attempt_id: 'att-C',
+        failover_ordinal: 3, // Ordinal gap: 3 instead of 2!
+      });
+
+      expect(() => {
+        service.getLineageContext('att-C');
+      }).toThrow(/\[FailoverLineageIntegrity\].*ordinal gap/i);
+    });
+
+    it('20d. fails closed with bounded integrity error when a root attempt mismatch exists across the lineage chain', () => {
+      seedBaseProjectAndTask(repo, db, 'task-1');
+      repo.createTaskAttempt({ id: 'att-A', task_id: 'task-1', attempt_number: 1, agent_id: 'agent-1', status: 'FAILED', started_at: '2026-08-26T00:00:00Z', ended_at: null, summary: null });
+      repo.createTaskAttempt({ id: 'att-B', task_id: 'task-1', attempt_number: 2, agent_id: 'agent-1', status: 'FAILED', started_at: '2026-08-26T00:01:00Z', ended_at: null, summary: null });
+      repo.createTaskAttempt({ id: 'att-C', task_id: 'task-1', attempt_number: 3, agent_id: 'agent-1', status: 'FAILED', started_at: '2026-08-26T00:02:00Z', ended_at: null, summary: null });
+
+      rawInsertTransition(db, {
+        id: 'trans-A-B',
+        task_id: 'task-1',
+        root_attempt_id: 'att-A',
+        source_attempt_id: 'att-A',
+        successor_attempt_id: 'att-B',
+        failover_ordinal: 1,
+      });
+
+      rawInsertTransition(db, {
+        id: 'trans-B-C',
+        task_id: 'task-1',
+        root_attempt_id: 'att-B', // Root mismatch: att-B instead of att-A!
+        source_attempt_id: 'att-B',
+        successor_attempt_id: 'att-C',
+        failover_ordinal: 2,
+      });
+
+      expect(() => {
+        service.getLineageContext('att-C');
+      }).toThrow(/\[FailoverLineageIntegrity\].*root mismatch/i);
     });
   });
 
