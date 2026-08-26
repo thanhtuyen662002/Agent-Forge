@@ -1135,4 +1135,101 @@ describe('R5H4 Provider Health Observation Ordering Authority Contract Tests', (
     expect(dispatchSrc).not.toContain('completionOrder');
     expect(dispatchSrc).not.toContain('completionSequence');
   });
+
+  // -------------------------------------------------------------
+  // Section 8: Post-Allocation Rollback Invariants (Test 31)
+  // -------------------------------------------------------------
+
+  it('31. post-allocation insert failure rolls back account_order and next successful observation reuses the ordinal', () => {
+    // 1. Create three coherent observations for accountIdA
+    const { auth: authA, assignment: asgnA } = createValidAssignmentAndAuth(repo, {
+      taskId: taskId1,
+      accountId: accountIdA,
+      resourceId: resourceIdA,
+    });
+    const { auth: authB, assignment: asgnB } = createValidAssignmentAndAuth(repo, {
+      taskId: taskId1,
+      accountId: accountIdA,
+      resourceId: resourceIdA,
+    });
+    const { auth: authC, assignment: asgnC } = createValidAssignmentAndAuth(repo, {
+      taskId: taskId1,
+      accountId: accountIdA,
+      resourceId: resourceIdA,
+    });
+
+    const obsA = buildValidObservation({ auth: authA, assignment: asgnA });
+    const resA = buildTrustedResult(authA, asgnA, obsA);
+
+    const obsB = buildValidObservation({ auth: authB, assignment: asgnB });
+    const resB = buildTrustedResult(authB, asgnB, obsB);
+
+    const obsC = buildValidObservation({ auth: authC, assignment: asgnC });
+    const resC = buildTrustedResult(authC, asgnC, obsC);
+
+    // 2. Claim A successfully -> account_order = 1
+    const statusA = repo.claimProviderHealthObservation(obsA, resA);
+    expect(statusA).toBe('RECORDED');
+    const recA = repo.getProviderHealthObservation(obsA.authorization_id);
+    expect(recA).not.toBeNull();
+    expect(recA?.account_order).toBe(1);
+
+    // 3. Setup test-only SQLite capture function & trigger for B
+    let capturedOrder: number | null = null;
+    db.function('__capture_provider_health_order', (value) => {
+      capturedOrder = Number(value);
+      return null;
+    });
+
+    db.exec(`
+      CREATE TEMP TRIGGER test_force_provider_health_order_insert_failure
+      BEFORE INSERT ON provider_health_observations
+      WHEN NEW.authorization_id = '${obsB.authorization_id}'
+      BEGIN
+        SELECT __capture_provider_health_order(NEW.account_order);
+        SELECT RAISE(
+          ABORT,
+          'TEST_FORCED_POST_ALLOCATION_INSERT_FAILURE'
+        );
+      END;
+    `);
+
+    // 4. Claim B -> throws TEST_FORCED_POST_ALLOCATION_INSERT_FAILURE
+    expect(() => repo.claimProviderHealthObservation(obsB, resB)).toThrow(
+      /TEST_FORCED_POST_ALLOCATION_INSERT_FAILURE/
+    );
+
+    // Verify after failure:
+    // - capturedOrder is 2 (proves account_order 2 was computed and supplied to INSERT)
+    expect(capturedOrder).toBe(2);
+
+    // - B durable row is ABSENT
+    const recB = repo.getProviderHealthObservation(obsB.authorization_id);
+    expect(recB).toBeNull();
+
+    // - MAX(account_order) for account remains 1
+    const maxRowAfterFail = db
+      .prepare('SELECT COALESCE(MAX(account_order), 0) AS max_order FROM provider_health_observations WHERE account_id = ?')
+      .get(accountIdA) as { max_order: number };
+    expect(Number(maxRowAfterFail.max_order)).toBe(1);
+
+    // 5. Remove test trigger (DROP TEMP TRIGGER)
+    db.exec('DROP TRIGGER IF EXISTS test_force_provider_health_order_insert_failure;');
+
+    // 6. Claim C -> must receive account_order = 2, NOT 3
+    const statusC = repo.claimProviderHealthObservation(obsC, resC);
+    expect(statusC).toBe('RECORDED');
+
+    const recC = repo.getProviderHealthObservation(obsC.authorization_id);
+    expect(recC).not.toBeNull();
+    expect(recC?.account_order).toBe(2);
+
+    // 7. Verify final ordered durable rows for account A: [A(1), C(2)], B absent
+    const accountRows = repo.getProviderHealthObservationsForAccount(accountIdA);
+    expect(accountRows).toHaveLength(2);
+    expect(accountRows[0].authorization_id).toBe(obsA.authorization_id);
+    expect(accountRows[0].account_order).toBe(1);
+    expect(accountRows[1].authorization_id).toBe(obsC.authorization_id);
+    expect(accountRows[1].account_order).toBe(2);
+  });
 });
