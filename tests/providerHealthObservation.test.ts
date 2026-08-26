@@ -421,6 +421,30 @@ function buildTrustedResult(
   };
 }
 
+function buildValidObservation(
+  hierarchy: ReturnType<typeof createHierarchy>,
+  overrides?: Partial<ProviderHealthObservation>
+): ProviderHealthObservation {
+  return {
+    authorization_id: hierarchy.authId,
+    execution_id: crypto.randomUUID(),
+    account_id: hierarchy.accountId,
+    provider_id: hierarchy.providerId,
+    resource_id: hierarchy.resourceId,
+    assignment_id: hierarchy.assignmentId,
+    attempt_id: hierarchy.attemptId,
+    routing_decision_id: hierarchy.routingDecisionId,
+    provenance_version: 1,
+    provenance_source: 'PROVIDER_DISPATCH_SERVICE',
+    mode: 'SCHEDULED',
+    adapter_invocation: 'RETURNED',
+    result_status: 'COMPLETED',
+    classified_category: 'SUCCESS',
+    observed_at: new Date().toISOString(),
+    ...(overrides ?? {}),
+  };
+}
+
 describe('R5H4 Durable Provider Health Observation Contract', () => {
   let tempBaseDir: string;
   let repoDir: string;
@@ -1033,8 +1057,8 @@ describe('R5H4 Durable Provider Health Observation Contract', () => {
     expect(content).not.toContain('updateProviderAccountHealth');
   });
 
-  // 37. Concurrent / duplicate claim proof using two SQLite handles against same DB
-  it('37. concurrent / duplicate claim proof using two SQLite handles against same DB', () => {
+  // 37. Genuine SQLite two-connection write contention proof
+  it('37. genuine SQLite two-connection write contention proof', () => {
     const tempDbDir = fs.mkdtempSync(path.join(os.tmpdir(), 'af-concurrent-obs-'));
     const dbPath = path.join(tempDbDir, 'concurrent.db');
 
@@ -1047,6 +1071,7 @@ describe('R5H4 Durable Provider Health Observation Contract', () => {
 
       const db2 = new Database(dbPath);
       db2.pragma('foreign_keys = ON');
+      db2.pragma('busy_timeout = 0'); // Fail immediately on write lock contention
       const repo2 = new Repository(db2);
 
       const obs: ProviderHealthObservation = {
@@ -1067,12 +1092,30 @@ describe('R5H4 Durable Provider Health Observation Contract', () => {
         observed_at: new Date().toISOString(),
       };
 
+      // Step 1: db1 acquires write reservation via BEGIN IMMEDIATE
+      db1.exec('BEGIN IMMEDIATE');
+
+      // Step 2: while db1 holds write lock, db2 attempts claimProviderHealthObservation (which uses runInImmediateTransaction)
+      // With busy_timeout = 0, db2 cannot acquire write lock and must throw SQLITE_BUSY / database locked
+      expect(() => {
+        repo2.claimProviderHealthObservation(obs);
+      }).toThrow(/database is locked|busy/i);
+
+      // Verify no observation was inserted on db2 or db1
+      expect(repo1.getProviderHealthObservation(hierarchy.authId)).toBeNull();
+
+      // Step 3: db1 rolls back / releases the held write reservation
+      db1.exec('ROLLBACK');
+
+      // Step 4: After lock release, perform one claim on db1 -> RECORDED
       const res1 = repo1.claimProviderHealthObservation(obs);
       expect(res1).toBe('RECORDED');
 
+      // Step 5: Perform second identical claim on db2 -> ALREADY_RECORDED
       const res2 = repo2.claimProviderHealthObservation(obs);
       expect(res2).toBe('ALREADY_RECORDED');
 
+      // Final row count: exactly 1
       const count = (db1.prepare('SELECT COUNT(*) as count FROM provider_health_observations WHERE authorization_id = ?').get(hierarchy.authId) as any).count;
       expect(count).toBe(1);
 
@@ -1110,5 +1153,928 @@ describe('R5H4 Durable Provider Health Observation Contract', () => {
     expect(serialized).not.toContain('auth_token_secret_12345');
     expect(serialized).not.toContain('sk-xyz');
     expect(serialized).not.toContain('hunter2');
+  });
+
+  // 39. Atomic validation race / TOCTOU closed proof
+  it('39. atomic validation race / TOCTOU closed proof: concurrent writer cannot leave stale pre-read', () => {
+    const tempDbDir = fs.mkdtempSync(path.join(os.tmpdir(), 'af-toctou-obs-'));
+    const dbPath = path.join(tempDbDir, 'toctou.db');
+
+    try {
+      const db1 = new Database(dbPath);
+      db1.pragma('foreign_keys = ON');
+      MigrationRunner.run(db1);
+      const repo1 = new Repository(db1);
+      const hierarchy = createHierarchy(repo1, repoDir, baseSha);
+
+      const db2 = new Database(dbPath);
+      db2.pragma('foreign_keys = ON');
+      db2.pragma('busy_timeout = 0');
+      const repo2 = new Repository(db2);
+
+      const obs: ProviderHealthObservation = {
+        authorization_id: hierarchy.authId,
+        execution_id: crypto.randomUUID(),
+        account_id: hierarchy.accountId,
+        provider_id: hierarchy.providerId,
+        resource_id: hierarchy.resourceId,
+        assignment_id: hierarchy.assignmentId,
+        attempt_id: hierarchy.attemptId,
+        routing_decision_id: hierarchy.routingDecisionId,
+        provenance_version: 1,
+        provenance_source: 'PROVIDER_DISPATCH_SERVICE',
+        mode: 'SCHEDULED',
+        adapter_invocation: 'RETURNED',
+        result_status: 'COMPLETED',
+        classified_category: 'SUCCESS',
+        observed_at: new Date().toISOString(),
+      };
+
+      // Handle 1 holds BEGIN IMMEDIATE and changes authorization status away from DISPATCHED uncommitted
+      db1.exec('BEGIN IMMEDIATE');
+      db1.prepare("UPDATE execution_authorizations SET status = 'AUTHORIZED' WHERE id = ?").run(hierarchy.authId);
+
+      // Handle 2 atomic claim cannot proceed while handle 1 holds immediate lock
+      expect(() => {
+        repo2.claimProviderHealthObservation(obs);
+      }).toThrow(/database is locked|busy/i);
+
+      // Handle 1 commits the change
+      db1.exec('COMMIT');
+
+      // Now Handle 2 tries, and fails validation because authorization is no longer DISPATCHED
+      expect(() => {
+        repo2.claimProviderHealthObservation(obs);
+      }).toThrow(/AUTHORIZATION_NOT_DISPATCHED/);
+
+      expect(repo2.getProviderHealthObservation(hierarchy.authId)).toBeNull();
+
+      db1.close();
+      db2.close();
+    } finally {
+      try {
+        fs.rmSync(tempDbDir, { recursive: true, force: true });
+      } catch {}
+    }
+  });
+
+  // 40. Raw claim fails closed when authorization status != DISPATCHED
+  it('40. raw claim fails closed when authorization status != DISPATCHED', () => {
+    const hierarchy = createHierarchy(repo, repoDir, baseSha);
+    db.prepare("UPDATE execution_authorizations SET status = 'AUTHORIZED' WHERE id = ?").run(hierarchy.authId);
+
+    const obs: ProviderHealthObservation = {
+      authorization_id: hierarchy.authId,
+      execution_id: crypto.randomUUID(),
+      account_id: hierarchy.accountId,
+      provider_id: hierarchy.providerId,
+      resource_id: hierarchy.resourceId,
+      assignment_id: hierarchy.assignmentId,
+      attempt_id: hierarchy.attemptId,
+      routing_decision_id: hierarchy.routingDecisionId,
+      provenance_version: 1,
+      provenance_source: 'PROVIDER_DISPATCH_SERVICE',
+      mode: 'SCHEDULED',
+      adapter_invocation: 'RETURNED',
+      result_status: 'COMPLETED',
+      classified_category: 'SUCCESS',
+      observed_at: new Date().toISOString(),
+    };
+
+    expect(() => repo.claimProviderHealthObservation(obs)).toThrow(/AUTHORIZATION_NOT_DISPATCHED/);
+    expect(repo.getProviderHealthObservation(hierarchy.authId)).toBeNull();
+  });
+
+  // 41. Raw claim fails closed when authorization does not exist
+  it('41. raw claim fails closed when authorization does not exist', () => {
+    const hierarchy = createHierarchy(repo, repoDir, baseSha);
+
+    const obs: ProviderHealthObservation = {
+      authorization_id: 'non-existent-auth',
+      execution_id: crypto.randomUUID(),
+      account_id: hierarchy.accountId,
+      provider_id: hierarchy.providerId,
+      resource_id: hierarchy.resourceId,
+      assignment_id: hierarchy.assignmentId,
+      attempt_id: hierarchy.attemptId,
+      routing_decision_id: hierarchy.routingDecisionId,
+      provenance_version: 1,
+      provenance_source: 'PROVIDER_DISPATCH_SERVICE',
+      mode: 'SCHEDULED',
+      adapter_invocation: 'RETURNED',
+      result_status: 'COMPLETED',
+      classified_category: 'SUCCESS',
+      observed_at: new Date().toISOString(),
+    };
+
+    expect(() => repo.claimProviderHealthObservation(obs)).toThrow(/AUTHORIZATION_NOT_FOUND/);
+    expect(repo.getProviderHealthObservation('non-existent-auth')).toBeNull();
+  });
+
+  // 42. Raw claim fails closed when authorization routing_decision_id mismatches observation
+  it('42. raw claim fails closed when authorization routing_decision_id mismatches observation', () => {
+    const hierarchy = createHierarchy(repo, repoDir, baseSha);
+
+    const obs: ProviderHealthObservation = {
+      authorization_id: hierarchy.authId,
+      execution_id: crypto.randomUUID(),
+      account_id: hierarchy.accountId,
+      provider_id: hierarchy.providerId,
+      resource_id: hierarchy.resourceId,
+      assignment_id: hierarchy.assignmentId,
+      attempt_id: hierarchy.attemptId,
+      routing_decision_id: 'other-rd-id',
+      provenance_version: 1,
+      provenance_source: 'PROVIDER_DISPATCH_SERVICE',
+      mode: 'SCHEDULED',
+      adapter_invocation: 'RETURNED',
+      result_status: 'COMPLETED',
+      classified_category: 'SUCCESS',
+      observed_at: new Date().toISOString(),
+    };
+
+    expect(() => repo.claimProviderHealthObservation(obs)).toThrow(/ROUTING_DECISION_ID_MISMATCH/);
+    expect(repo.getProviderHealthObservation(hierarchy.authId)).toBeNull();
+  });
+
+  // 43. Raw claim fails closed when authorization selected_provider_id mismatches observation
+  it('43. raw claim fails closed when authorization selected_provider_id mismatches observation', () => {
+    const hierarchy = createHierarchy(repo, repoDir, baseSha);
+
+    const obs: ProviderHealthObservation = {
+      authorization_id: hierarchy.authId,
+      execution_id: crypto.randomUUID(),
+      account_id: hierarchy.accountId,
+      provider_id: 'other-provider',
+      resource_id: hierarchy.resourceId,
+      assignment_id: hierarchy.assignmentId,
+      attempt_id: hierarchy.attemptId,
+      routing_decision_id: hierarchy.routingDecisionId,
+      provenance_version: 1,
+      provenance_source: 'PROVIDER_DISPATCH_SERVICE',
+      mode: 'SCHEDULED',
+      adapter_invocation: 'RETURNED',
+      result_status: 'COMPLETED',
+      classified_category: 'SUCCESS',
+      observed_at: new Date().toISOString(),
+    };
+
+    expect(() => repo.claimProviderHealthObservation(obs)).toThrow(/PROVIDER_ID_MISMATCH/);
+    expect(repo.getProviderHealthObservation(hierarchy.authId)).toBeNull();
+  });
+
+  // 44. Raw claim fails closed when authorization selected_resource_id mismatches observation
+  it('44. raw claim fails closed when authorization selected_resource_id mismatches observation', () => {
+    const hierarchy = createHierarchy(repo, repoDir, baseSha);
+
+    const obs: ProviderHealthObservation = {
+      authorization_id: hierarchy.authId,
+      execution_id: crypto.randomUUID(),
+      account_id: hierarchy.accountId,
+      provider_id: hierarchy.providerId,
+      resource_id: 'other-resource',
+      assignment_id: hierarchy.assignmentId,
+      attempt_id: hierarchy.attemptId,
+      routing_decision_id: hierarchy.routingDecisionId,
+      provenance_version: 1,
+      provenance_source: 'PROVIDER_DISPATCH_SERVICE',
+      mode: 'SCHEDULED',
+      adapter_invocation: 'RETURNED',
+      result_status: 'COMPLETED',
+      classified_category: 'SUCCESS',
+      observed_at: new Date().toISOString(),
+    };
+
+    expect(() => repo.claimProviderHealthObservation(obs)).toThrow(/RESOURCE_ID_MISMATCH/);
+    expect(repo.getProviderHealthObservation(hierarchy.authId)).toBeNull();
+  });
+
+  // 45. Raw claim fails closed when authorization attempt_id mismatches observation
+  it('45. raw claim fails closed when authorization attempt_id mismatches observation', () => {
+    const hierarchy = createHierarchy(repo, repoDir, baseSha);
+
+    const obs: ProviderHealthObservation = {
+      authorization_id: hierarchy.authId,
+      execution_id: crypto.randomUUID(),
+      account_id: hierarchy.accountId,
+      provider_id: hierarchy.providerId,
+      resource_id: hierarchy.resourceId,
+      assignment_id: hierarchy.assignmentId,
+      attempt_id: 'other-attempt',
+      routing_decision_id: hierarchy.routingDecisionId,
+      provenance_version: 1,
+      provenance_source: 'PROVIDER_DISPATCH_SERVICE',
+      mode: 'SCHEDULED',
+      adapter_invocation: 'RETURNED',
+      result_status: 'COMPLETED',
+      classified_category: 'SUCCESS',
+      observed_at: new Date().toISOString(),
+    };
+
+    expect(() => repo.claimProviderHealthObservation(obs)).toThrow(/ATTEMPT_ID_MISMATCH/);
+    expect(repo.getProviderHealthObservation(hierarchy.authId)).toBeNull();
+  });
+
+  // 46. Raw claim fails closed when assignment does not exist
+  it('46. raw claim fails closed when assignment does not exist', () => {
+    const hierarchy = createHierarchy(repo, repoDir, baseSha);
+
+    const obs: ProviderHealthObservation = {
+      authorization_id: hierarchy.authId,
+      execution_id: crypto.randomUUID(),
+      account_id: hierarchy.accountId,
+      provider_id: hierarchy.providerId,
+      resource_id: hierarchy.resourceId,
+      assignment_id: 'non-existent-assignment',
+      attempt_id: hierarchy.attemptId,
+      routing_decision_id: hierarchy.routingDecisionId,
+      provenance_version: 1,
+      provenance_source: 'PROVIDER_DISPATCH_SERVICE',
+      mode: 'SCHEDULED',
+      adapter_invocation: 'RETURNED',
+      result_status: 'COMPLETED',
+      classified_category: 'SUCCESS',
+      observed_at: new Date().toISOString(),
+    };
+
+    expect(() => repo.claimProviderHealthObservation(obs)).toThrow(/ASSIGNMENT_NOT_FOUND/);
+    expect(repo.getProviderHealthObservation(hierarchy.authId)).toBeNull();
+  });
+
+  // 47. Raw claim fails closed when assignment project_id mismatches authorization project_id
+  it('47. raw claim fails closed when assignment project_id mismatches authorization project_id', () => {
+    const hierarchy = createHierarchy(repo, repoDir, baseSha);
+    const now = new Date().toISOString();
+    repo.createProject({
+      id: 'proj-foreign',
+      name: 'Foreign Project',
+      description: null,
+      contract: null,
+      repository_path: repoDir,
+      default_branch: 'main',
+      status: 'RUNNING',
+      started_at: now,
+      completed_at: null,
+      created_at: now,
+      updated_at: now,
+    });
+    repo.createTask({
+      id: 'task-proj-foreign',
+      project_id: 'proj-foreign',
+      milestone_id: null,
+      title: 'Foreign Task',
+      description: 'Foreign Task Desc',
+      state: 'CODING',
+      paused_from_state: null,
+      priority: 'HIGH',
+      risk: 'LOW',
+      assigned_agent_id: null,
+      revision_count: 1,
+      max_revisions: 3,
+      base_sha: baseSha,
+      current_sha: baseSha,
+      progress_cache_percent: 0,
+      progress_computed_at: null,
+      constraints: [],
+      acceptance_criteria: ['pass tests'],
+      created_at: now,
+      updated_at: now,
+    });
+    const asgnId = 'assign-foreign-proj';
+    repo.createAgentAssignment({
+      id: asgnId,
+      project_id: 'proj-foreign',
+      task_id: 'task-proj-foreign',
+      attempt_id: null,
+      role_profile_id: 'role-obs-1',
+      agent_profile_id: 'prof-obs-1',
+      selected_provider_id: hierarchy.providerId,
+      selected_account_id: hierarchy.accountId,
+      selected_resource_id: hierarchy.resourceId,
+      selected_worker_slot_id: hierarchy.slotId,
+      routing_decision_id: hierarchy.routingDecisionId,
+      preferred_metadata: null,
+      status: 'ASSIGNED',
+      created_at: now,
+      ended_at: null,
+    });
+
+    const obs = buildValidObservation(hierarchy, { assignment_id: asgnId });
+    expect(() => repo.claimProviderHealthObservation(obs)).toThrow(/PROJECT_ID_MISMATCH/);
+    expect(repo.getProviderHealthObservation(hierarchy.authId)).toBeNull();
+  });
+
+  // 48. Raw claim fails closed when assignment task_id mismatches authorization task_id
+  it('48. raw claim fails closed when assignment task_id mismatches authorization task_id', () => {
+    const hierarchy = createHierarchy(repo, repoDir, baseSha);
+    const now = new Date().toISOString();
+    repo.createTask({
+      id: 'task-foreign',
+      project_id: hierarchy.projectId,
+      milestone_id: null,
+      title: 'Foreign Task',
+      description: 'Foreign Task Desc',
+      state: 'CODING',
+      paused_from_state: null,
+      priority: 'HIGH',
+      risk: 'LOW',
+      assigned_agent_id: null,
+      revision_count: 1,
+      max_revisions: 3,
+      base_sha: baseSha,
+      current_sha: baseSha,
+      progress_cache_percent: 0,
+      progress_computed_at: null,
+      constraints: [],
+      acceptance_criteria: ['pass tests'],
+      created_at: now,
+      updated_at: now,
+    });
+    const asgnId = 'assign-foreign-task';
+    repo.createAgentAssignment({
+      id: asgnId,
+      project_id: hierarchy.projectId,
+      task_id: 'task-foreign',
+      attempt_id: null,
+      role_profile_id: 'role-obs-1',
+      agent_profile_id: 'prof-obs-1',
+      selected_provider_id: hierarchy.providerId,
+      selected_account_id: hierarchy.accountId,
+      selected_resource_id: hierarchy.resourceId,
+      selected_worker_slot_id: hierarchy.slotId,
+      routing_decision_id: hierarchy.routingDecisionId,
+      preferred_metadata: null,
+      status: 'ASSIGNED',
+      created_at: now,
+      ended_at: null,
+    });
+
+    const obs = buildValidObservation(hierarchy, { assignment_id: asgnId });
+    expect(() => repo.claimProviderHealthObservation(obs)).toThrow(/TASK_ID_MISMATCH/);
+    expect(repo.getProviderHealthObservation(hierarchy.authId)).toBeNull();
+  });
+
+  // 49. Raw claim fails closed when assignment attempt_id mismatches authorization attempt_id
+  it('49. raw claim fails closed when assignment attempt_id mismatches authorization attempt_id', () => {
+    const hierarchy = createHierarchy(repo, repoDir, baseSha);
+    const now = new Date().toISOString();
+    repo.createTaskAttempt({
+      id: 'att-foreign',
+      task_id: hierarchy.taskId,
+      agent_id: 'agent-obs-1',
+      attempt_number: 2,
+      status: 'RUNNING',
+      started_at: now,
+      ended_at: null,
+      summary: null,
+    });
+    const asgnId = 'assign-foreign-attempt';
+    repo.createAgentAssignment({
+      id: asgnId,
+      project_id: hierarchy.projectId,
+      task_id: hierarchy.taskId,
+      attempt_id: 'att-foreign',
+      role_profile_id: 'role-obs-1',
+      agent_profile_id: 'prof-obs-1',
+      selected_provider_id: hierarchy.providerId,
+      selected_account_id: hierarchy.accountId,
+      selected_resource_id: hierarchy.resourceId,
+      selected_worker_slot_id: hierarchy.slotId,
+      routing_decision_id: hierarchy.routingDecisionId,
+      preferred_metadata: null,
+      status: 'ASSIGNED',
+      created_at: now,
+      ended_at: null,
+    });
+
+    const obs = buildValidObservation(hierarchy, { assignment_id: asgnId });
+    expect(() => repo.claimProviderHealthObservation(obs)).toThrow(/ATTEMPT_ID_MISMATCH/);
+    expect(repo.getProviderHealthObservation(hierarchy.authId)).toBeNull();
+  });
+
+  // 50. Raw claim fails closed when assignment routing_decision_id mismatches authorization routing_decision_id
+  it('50. raw claim fails closed when assignment routing_decision_id mismatches authorization routing_decision_id', () => {
+    const hierarchy = createHierarchy(repo, repoDir, baseSha);
+    const now = new Date().toISOString();
+    const asgnId = 'assign-foreign-rd';
+    repo.createAgentAssignment({
+      id: asgnId,
+      project_id: hierarchy.projectId,
+      task_id: hierarchy.taskId,
+      attempt_id: hierarchy.attemptId,
+      role_profile_id: 'role-obs-1',
+      agent_profile_id: 'prof-obs-1',
+      selected_provider_id: hierarchy.providerId,
+      selected_account_id: hierarchy.accountId,
+      selected_resource_id: hierarchy.resourceId,
+      selected_worker_slot_id: hierarchy.slotId,
+      routing_decision_id: 'rd-foreign',
+      preferred_metadata: null,
+      status: 'ASSIGNED',
+      created_at: now,
+      ended_at: null,
+    });
+
+    const obs = buildValidObservation(hierarchy, { assignment_id: asgnId });
+    expect(() => repo.claimProviderHealthObservation(obs)).toThrow(/ROUTING_DECISION_ID_MISMATCH/);
+    expect(repo.getProviderHealthObservation(hierarchy.authId)).toBeNull();
+  });
+
+  // 51. Raw claim fails closed when assignment selected_account_id mismatches observation account_id
+  it('51. raw claim fails closed when assignment selected_account_id mismatches observation account_id', () => {
+    const hierarchy = createHierarchy(repo, repoDir, baseSha);
+    const now = new Date().toISOString();
+    repo.createProviderAccount({
+      id: 'acc-foreign',
+      provider_id: hierarchy.providerId,
+      label: 'Foreign Account',
+      auth_mode: 'NATIVE_PROFILE',
+      credential_ref: null,
+      profile_ref: 'native-profile://gemini/g02',
+      enabled: true,
+      priority: 2,
+      health_status: 'AVAILABLE',
+      cooldown_until: null,
+      concurrency_limit: 2,
+      last_success_at: null,
+      last_failure_at: null,
+      last_failure_code: null,
+      created_at: now,
+      updated_at: now,
+    });
+    repo.createProviderResource({
+      id: 'res-foreign-acc',
+      provider_id: hierarchy.providerId,
+      provider_account_id: 'acc-foreign',
+      model_name: 'gemini-1.5-flash',
+      capabilities: ['CODING'],
+      enabled: true,
+      health_status: 'AVAILABLE',
+      total_quota: 100,
+      remaining_quota: 100,
+      quota_unit: 'requests',
+      quota_reset_at: null,
+      quota_source: 'ESTIMATED',
+      quota_confidence: 1.0,
+      last_health_check: now,
+    });
+    repo.createWorkerSlot({
+      id: 'slot-foreign-acc',
+      provider_account_id: 'acc-foreign',
+      provider_resource_id: 'res-foreign-acc',
+      slot_index: 0,
+      status: 'IDLE',
+      current_assignment_id: null,
+      current_execution_id: null,
+      heartbeat_at: null,
+      created_at: now,
+      updated_at: now,
+    });
+    const asgnId = 'assign-foreign-acc';
+    repo.createAgentAssignment({
+      id: asgnId,
+      project_id: hierarchy.projectId,
+      task_id: hierarchy.taskId,
+      attempt_id: hierarchy.attemptId,
+      role_profile_id: 'role-obs-1',
+      agent_profile_id: 'prof-obs-1',
+      selected_provider_id: hierarchy.providerId,
+      selected_account_id: 'acc-foreign',
+      selected_resource_id: 'res-foreign-acc',
+      selected_worker_slot_id: 'slot-foreign-acc',
+      routing_decision_id: hierarchy.routingDecisionId,
+      preferred_metadata: null,
+      status: 'ASSIGNED',
+      created_at: now,
+      ended_at: null,
+    });
+
+    const obs = buildValidObservation(hierarchy, { assignment_id: asgnId });
+    expect(() => repo.claimProviderHealthObservation(obs)).toThrow(/ASSIGNMENT_ACCOUNT_ID_MISMATCH/);
+    expect(repo.getProviderHealthObservation(hierarchy.authId)).toBeNull();
+  });
+
+  // 52. Raw claim fails closed when assignment selected_provider_id mismatches observation provider_id
+  it('52. raw claim fails closed when assignment selected_provider_id mismatches observation provider_id', () => {
+    const hierarchy = createHierarchy(repo, repoDir, baseSha);
+    const now = new Date().toISOString();
+    repo.createProvider({
+      id: 'prov-foreign',
+      name: 'Foreign Provider',
+      adapter_type: 'LOCAL_CLI',
+      enabled: true,
+      created_at: now,
+    });
+    repo.createProviderAccount({
+      id: 'acc-foreign-prov',
+      provider_id: 'prov-foreign',
+      label: 'Foreign Prov Account',
+      auth_mode: 'NATIVE_PROFILE',
+      credential_ref: null,
+      profile_ref: 'native-profile://gemini/g02',
+      enabled: true,
+      priority: 2,
+      health_status: 'AVAILABLE',
+      cooldown_until: null,
+      concurrency_limit: 2,
+      last_success_at: null,
+      last_failure_at: null,
+      last_failure_code: null,
+      created_at: now,
+      updated_at: now,
+    });
+    repo.createProviderResource({
+      id: 'res-foreign-prov',
+      provider_id: 'prov-foreign',
+      provider_account_id: 'acc-foreign-prov',
+      model_name: 'gemini-1.5-flash',
+      capabilities: ['CODING'],
+      enabled: true,
+      health_status: 'AVAILABLE',
+      total_quota: 100,
+      remaining_quota: 100,
+      quota_unit: 'requests',
+      quota_reset_at: null,
+      quota_source: 'ESTIMATED',
+      quota_confidence: 1.0,
+      last_health_check: now,
+    });
+    repo.createWorkerSlot({
+      id: 'slot-foreign-prov',
+      provider_account_id: 'acc-foreign-prov',
+      provider_resource_id: 'res-foreign-prov',
+      slot_index: 0,
+      status: 'IDLE',
+      current_assignment_id: null,
+      current_execution_id: null,
+      heartbeat_at: null,
+      created_at: now,
+      updated_at: now,
+    });
+    const asgnId = 'assign-foreign-prov';
+    repo.createAgentAssignment({
+      id: asgnId,
+      project_id: hierarchy.projectId,
+      task_id: hierarchy.taskId,
+      attempt_id: hierarchy.attemptId,
+      role_profile_id: 'role-obs-1',
+      agent_profile_id: 'prof-obs-1',
+      selected_provider_id: 'prov-foreign',
+      selected_account_id: 'acc-foreign-prov',
+      selected_resource_id: 'res-foreign-prov',
+      selected_worker_slot_id: 'slot-foreign-prov',
+      routing_decision_id: hierarchy.routingDecisionId,
+      preferred_metadata: null,
+      status: 'ASSIGNED',
+      created_at: now,
+      ended_at: null,
+    });
+
+    const obs = buildValidObservation(hierarchy, { assignment_id: asgnId });
+    expect(() => repo.claimProviderHealthObservation(obs)).toThrow(/ASSIGNMENT_PROVIDER_ID_MISMATCH/);
+    expect(repo.getProviderHealthObservation(hierarchy.authId)).toBeNull();
+  });
+
+  // 53. Raw claim fails closed when assignment selected_resource_id mismatches observation resource_id
+  it('53. raw claim fails closed when assignment selected_resource_id mismatches observation resource_id', () => {
+    const hierarchy = createHierarchy(repo, repoDir, baseSha);
+    const now = new Date().toISOString();
+    repo.createProviderResource({
+      id: 'res-foreign',
+      provider_id: hierarchy.providerId,
+      provider_account_id: hierarchy.accountId,
+      model_name: 'gemini-1.5-flash',
+      capabilities: ['CODING'],
+      enabled: true,
+      health_status: 'AVAILABLE',
+      total_quota: 100,
+      remaining_quota: 100,
+      quota_unit: 'requests',
+      quota_reset_at: null,
+      quota_source: 'ESTIMATED',
+      quota_confidence: 1.0,
+      last_health_check: now,
+    });
+    repo.createWorkerSlot({
+      id: 'slot-foreign-res',
+      provider_account_id: hierarchy.accountId,
+      provider_resource_id: 'res-foreign',
+      slot_index: 1,
+      status: 'IDLE',
+      current_assignment_id: null,
+      current_execution_id: null,
+      heartbeat_at: null,
+      created_at: now,
+      updated_at: now,
+    });
+    const asgnId = 'assign-foreign-res';
+    repo.createAgentAssignment({
+      id: asgnId,
+      project_id: hierarchy.projectId,
+      task_id: hierarchy.taskId,
+      attempt_id: hierarchy.attemptId,
+      role_profile_id: 'role-obs-1',
+      agent_profile_id: 'prof-obs-1',
+      selected_provider_id: hierarchy.providerId,
+      selected_account_id: hierarchy.accountId,
+      selected_resource_id: 'res-foreign',
+      selected_worker_slot_id: 'slot-foreign-res',
+      routing_decision_id: hierarchy.routingDecisionId,
+      preferred_metadata: null,
+      status: 'ASSIGNED',
+      created_at: now,
+      ended_at: null,
+    });
+
+    const obs = buildValidObservation(hierarchy, { assignment_id: asgnId });
+    expect(() => repo.claimProviderHealthObservation(obs)).toThrow(/ASSIGNMENT_RESOURCE_ID_MISMATCH/);
+    expect(repo.getProviderHealthObservation(hierarchy.authId)).toBeNull();
+  });
+
+  // 54. Raw claim fails closed when task_attempt does not exist for non-null attempt_id
+  it('54. raw claim fails closed when task_attempt does not exist for non-null attempt_id', () => {
+    const hierarchy = createHierarchy(repo, repoDir, baseSha);
+    db.prepare('PRAGMA foreign_keys = OFF').run();
+    db.prepare('DELETE FROM task_attempts WHERE id = ?').run(hierarchy.attemptId);
+    db.prepare('PRAGMA foreign_keys = ON').run();
+
+    const obs = buildValidObservation(hierarchy);
+    expect(() => repo.claimProviderHealthObservation(obs)).toThrow(/TASK_ATTEMPT_NOT_FOUND/);
+    expect(repo.getProviderHealthObservation(hierarchy.authId)).toBeNull();
+  });
+
+  // 55. Raw claim fails closed when task_attempt task_id mismatches authorization task_id
+  it('55. raw claim fails closed when task_attempt task_id mismatches authorization task_id', () => {
+    const hierarchy = createHierarchy(repo, repoDir, baseSha);
+    const now = new Date().toISOString();
+    repo.createTask({
+      id: 'task-foreign',
+      project_id: hierarchy.projectId,
+      milestone_id: null,
+      title: 'Foreign Task',
+      description: 'Foreign Task Desc',
+      state: 'CODING',
+      paused_from_state: null,
+      priority: 'HIGH',
+      risk: 'LOW',
+      assigned_agent_id: null,
+      revision_count: 1,
+      max_revisions: 3,
+      base_sha: baseSha,
+      current_sha: baseSha,
+      progress_cache_percent: 0,
+      progress_computed_at: null,
+      constraints: [],
+      acceptance_criteria: ['pass tests'],
+      created_at: now,
+      updated_at: now,
+    });
+    repo.createTaskAttempt({
+      id: 'att-foreign',
+      task_id: 'task-foreign',
+      agent_id: 'agent-obs-1',
+      attempt_number: 1,
+      status: 'RUNNING',
+      started_at: now,
+      ended_at: null,
+      summary: null,
+    });
+    db.prepare('UPDATE execution_authorizations SET attempt_id = ? WHERE id = ?').run('att-foreign', hierarchy.authId);
+    db.prepare('UPDATE agent_assignments SET attempt_id = ? WHERE id = ?').run('att-foreign', hierarchy.assignmentId);
+
+    const obs = buildValidObservation(hierarchy, { attempt_id: 'att-foreign' });
+    expect(() => repo.claimProviderHealthObservation(obs)).toThrow(/TASK_ATTEMPT_TASK_MISMATCH/);
+    expect(repo.getProviderHealthObservation(hierarchy.authId)).toBeNull();
+  });
+
+  // 56. Raw claim fails closed when provider_account does not exist
+  it('56. raw claim fails closed when provider_account does not exist', () => {
+    const hierarchy = createHierarchy(repo, repoDir, baseSha);
+    db.prepare('PRAGMA foreign_keys = OFF').run();
+    db.prepare('DELETE FROM provider_accounts WHERE id = ?').run(hierarchy.accountId);
+    db.prepare('PRAGMA foreign_keys = ON').run();
+
+    const obs = buildValidObservation(hierarchy);
+    expect(() => repo.claimProviderHealthObservation(obs)).toThrow(/PROVIDER_ACCOUNT_NOT_FOUND/);
+    expect(repo.getProviderHealthObservation(hierarchy.authId)).toBeNull();
+  });
+
+  // 57. Raw claim fails closed when provider_account provider_id mismatches observation provider_id
+  it('57. raw claim fails closed when provider_account provider_id mismatches observation provider_id', () => {
+    const hierarchy = createHierarchy(repo, repoDir, baseSha);
+    const now = new Date().toISOString();
+    repo.createProvider({
+      id: 'prov-foreign',
+      name: 'Foreign Provider',
+      adapter_type: 'LOCAL_CLI',
+      enabled: true,
+      created_at: now,
+    });
+    db.prepare('UPDATE provider_accounts SET provider_id = ? WHERE id = ?').run('prov-foreign', hierarchy.accountId);
+
+    const obs = buildValidObservation(hierarchy);
+    expect(() => repo.claimProviderHealthObservation(obs)).toThrow(/ACCOUNT_PROVIDER_MISMATCH/);
+    expect(repo.getProviderHealthObservation(hierarchy.authId)).toBeNull();
+  });
+
+  // 58. Raw claim fails closed when provider does not exist
+  it('58. raw claim fails closed when provider does not exist', () => {
+    const hierarchy = createHierarchy(repo, repoDir, baseSha);
+    db.prepare('PRAGMA foreign_keys = OFF').run();
+    db.prepare('DELETE FROM providers WHERE id = ?').run(hierarchy.providerId);
+    db.prepare('PRAGMA foreign_keys = ON').run();
+
+    const obs = buildValidObservation(hierarchy);
+    expect(() => repo.claimProviderHealthObservation(obs)).toThrow(/PROVIDER_NOT_FOUND/);
+    expect(repo.getProviderHealthObservation(hierarchy.authId)).toBeNull();
+  });
+
+  // 59. Raw claim fails closed when provider_resource does not exist
+  it('59. raw claim fails closed when provider_resource does not exist', () => {
+    const hierarchy = createHierarchy(repo, repoDir, baseSha);
+    db.prepare('PRAGMA foreign_keys = OFF').run();
+    db.prepare('DELETE FROM provider_resources WHERE id = ?').run(hierarchy.resourceId);
+    db.prepare('PRAGMA foreign_keys = ON').run();
+
+    const obs = buildValidObservation(hierarchy);
+    expect(() => repo.claimProviderHealthObservation(obs)).toThrow(/PROVIDER_RESOURCE_NOT_FOUND/);
+    expect(repo.getProviderHealthObservation(hierarchy.authId)).toBeNull();
+  });
+
+  // 60. Raw claim fails closed when provider_resource provider_id mismatches observation provider_id
+  it('60. raw claim fails closed when provider_resource provider_id mismatches observation provider_id', () => {
+    const hierarchy = createHierarchy(repo, repoDir, baseSha);
+    const now = new Date().toISOString();
+    repo.createProvider({
+      id: 'prov-foreign',
+      name: 'Foreign Provider',
+      adapter_type: 'LOCAL_CLI',
+      enabled: true,
+      created_at: now,
+    });
+    db.prepare('UPDATE provider_resources SET provider_id = ? WHERE id = ?').run('prov-foreign', hierarchy.resourceId);
+
+    const obs = buildValidObservation(hierarchy);
+    expect(() => repo.claimProviderHealthObservation(obs)).toThrow(/RESOURCE_PROVIDER_MISMATCH/);
+    expect(repo.getProviderHealthObservation(hierarchy.authId)).toBeNull();
+  });
+
+  // 61. Raw claim fails closed when provider_resource provider_account_id mismatches observation account_id
+  it('61. raw claim fails closed when provider_resource provider_account_id mismatches observation account_id', () => {
+    const hierarchy = createHierarchy(repo, repoDir, baseSha);
+    const now = new Date().toISOString();
+    repo.createProviderAccount({
+      id: 'acc-foreign',
+      provider_id: hierarchy.providerId,
+      label: 'Foreign Account',
+      auth_mode: 'NATIVE_PROFILE',
+      credential_ref: null,
+      profile_ref: 'native-profile://gemini/g02',
+      enabled: true,
+      priority: 2,
+      health_status: 'AVAILABLE',
+      cooldown_until: null,
+      concurrency_limit: 2,
+      last_success_at: null,
+      last_failure_at: null,
+      last_failure_code: null,
+      created_at: now,
+      updated_at: now,
+    });
+    db.prepare('UPDATE provider_resources SET provider_account_id = ? WHERE id = ?').run('acc-foreign', hierarchy.resourceId);
+
+    const obs = buildValidObservation(hierarchy);
+    expect(() => repo.claimProviderHealthObservation(obs)).toThrow(/RESOURCE_ACCOUNT_MISMATCH/);
+    expect(repo.getProviderHealthObservation(hierarchy.authId)).toBeNull();
+  });
+
+  // 62. Raw claim fails closed on invalid result_status
+  it('62. raw claim fails closed on invalid result_status', () => {
+    const hierarchy = createHierarchy(repo, repoDir, baseSha);
+
+    const obs: ProviderHealthObservation = {
+      authorization_id: hierarchy.authId,
+      execution_id: crypto.randomUUID(),
+      account_id: hierarchy.accountId,
+      provider_id: hierarchy.providerId,
+      resource_id: hierarchy.resourceId,
+      assignment_id: hierarchy.assignmentId,
+      attempt_id: hierarchy.attemptId,
+      routing_decision_id: hierarchy.routingDecisionId,
+      provenance_version: 1,
+      provenance_source: 'PROVIDER_DISPATCH_SERVICE',
+      mode: 'SCHEDULED',
+      adapter_invocation: 'RETURNED',
+      result_status: 'FORGED_STATUS' as any,
+      classified_category: 'SUCCESS',
+      observed_at: new Date().toISOString(),
+    };
+
+    expect(() => repo.claimProviderHealthObservation(obs)).toThrow(/INVALID_RESULT_STATUS/);
+    expect(repo.getProviderHealthObservation(hierarchy.authId)).toBeNull();
+  });
+
+  // 63. Raw claim fails closed on invalid classified_category
+  it('63. raw claim fails closed on invalid classified_category', () => {
+    const hierarchy = createHierarchy(repo, repoDir, baseSha);
+
+    const obs: ProviderHealthObservation = {
+      authorization_id: hierarchy.authId,
+      execution_id: crypto.randomUUID(),
+      account_id: hierarchy.accountId,
+      provider_id: hierarchy.providerId,
+      resource_id: hierarchy.resourceId,
+      assignment_id: hierarchy.assignmentId,
+      attempt_id: hierarchy.attemptId,
+      routing_decision_id: hierarchy.routingDecisionId,
+      provenance_version: 1,
+      provenance_source: 'PROVIDER_DISPATCH_SERVICE',
+      mode: 'SCHEDULED',
+      adapter_invocation: 'RETURNED',
+      result_status: 'COMPLETED',
+      classified_category: 'RAW_UNBOUNDED_CATEGORY' as any,
+      observed_at: new Date().toISOString(),
+    };
+
+    expect(() => repo.claimProviderHealthObservation(obs)).toThrow(/INVALID_CLASSIFIED_CATEGORY/);
+    expect(repo.getProviderHealthObservation(hierarchy.authId)).toBeNull();
+  });
+
+  // 64. Raw claim fails closed on invalid runtime shape (e.g. provenance_version != 1)
+  it('64. raw claim fails closed on invalid runtime shape (e.g. provenance_version != 1)', () => {
+    const hierarchy = createHierarchy(repo, repoDir, baseSha);
+
+    const obs: ProviderHealthObservation = {
+      authorization_id: hierarchy.authId,
+      execution_id: crypto.randomUUID(),
+      account_id: hierarchy.accountId,
+      provider_id: hierarchy.providerId,
+      resource_id: hierarchy.resourceId,
+      assignment_id: hierarchy.assignmentId,
+      attempt_id: hierarchy.attemptId,
+      routing_decision_id: hierarchy.routingDecisionId,
+      provenance_version: 2 as any,
+      provenance_source: 'PROVIDER_DISPATCH_SERVICE',
+      mode: 'SCHEDULED',
+      adapter_invocation: 'RETURNED',
+      result_status: 'COMPLETED',
+      classified_category: 'SUCCESS',
+      observed_at: new Date().toISOString(),
+    };
+
+    expect(() => repo.claimProviderHealthObservation(obs)).toThrow(/INVALID_OBSERVATION_SHAPE/);
+    expect(repo.getProviderHealthObservation(hierarchy.authId)).toBeNull();
+  });
+
+  // 65. Raw claim fails closed on invalid runtime shape (empty string fields)
+  it('65. raw claim fails closed on invalid runtime shape (empty string fields)', () => {
+    const hierarchy = createHierarchy(repo, repoDir, baseSha);
+
+    const obs: ProviderHealthObservation = {
+      authorization_id: hierarchy.authId,
+      execution_id: '   ',
+      account_id: hierarchy.accountId,
+      provider_id: hierarchy.providerId,
+      resource_id: hierarchy.resourceId,
+      assignment_id: hierarchy.assignmentId,
+      attempt_id: hierarchy.attemptId,
+      routing_decision_id: hierarchy.routingDecisionId,
+      provenance_version: 1,
+      provenance_source: 'PROVIDER_DISPATCH_SERVICE',
+      mode: 'SCHEDULED',
+      adapter_invocation: 'RETURNED',
+      result_status: 'COMPLETED',
+      classified_category: 'SUCCESS',
+      observed_at: new Date().toISOString(),
+    };
+
+    expect(() => repo.claimProviderHealthObservation(obs)).toThrow(/INVALID_OBSERVATION_SHAPE/);
+    expect(repo.getProviderHealthObservation(hierarchy.authId)).toBeNull();
+  });
+
+  // 66. Raw claim fails closed on invalid observed_at timestamp
+  it('66. raw claim fails closed on invalid observed_at timestamp', () => {
+    const hierarchy = createHierarchy(repo, repoDir, baseSha);
+
+    const obs: ProviderHealthObservation = {
+      authorization_id: hierarchy.authId,
+      execution_id: crypto.randomUUID(),
+      account_id: hierarchy.accountId,
+      provider_id: hierarchy.providerId,
+      resource_id: hierarchy.resourceId,
+      assignment_id: hierarchy.assignmentId,
+      attempt_id: hierarchy.attemptId,
+      routing_decision_id: hierarchy.routingDecisionId,
+      provenance_version: 1,
+      provenance_source: 'PROVIDER_DISPATCH_SERVICE',
+      mode: 'SCHEDULED',
+      adapter_invocation: 'RETURNED',
+      result_status: 'COMPLETED',
+      classified_category: 'SUCCESS',
+      observed_at: 'NOT_A_DATE',
+    };
+
+    expect(() => repo.claimProviderHealthObservation(obs)).toThrow(/INVALID_OBSERVATION_SHAPE/);
+    expect(repo.getProviderHealthObservation(hierarchy.authId)).toBeNull();
   });
 });
