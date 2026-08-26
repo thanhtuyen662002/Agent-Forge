@@ -351,7 +351,9 @@ export class RoleAwareRoutingService {
           `SeparationPolicy "${request.separationPolicyId}" not found in database.`,
           requestedConstraints,
           null,
-          createdAt
+          createdAt,
+          [],
+          failoverPolicyAuthoritySnapshot
         );
       }
     }
@@ -368,7 +370,9 @@ export class RoleAwareRoutingService {
           `Reviewed AgentAssignment "${request.reviewedAssignmentId}" not found in database.`,
           requestedConstraints,
           null,
-          createdAt
+          createdAt,
+          [],
+          failoverPolicyAuthoritySnapshot
         );
       }
     }
@@ -428,7 +432,9 @@ export class RoleAwareRoutingService {
         'No candidate provider accounts/resources available for routing.',
         requestedConstraints,
         appliedSeparation,
-        createdAt
+        createdAt,
+        [],
+        failoverPolicyAuthoritySnapshot
       );
     }
 
@@ -1057,22 +1063,8 @@ export class RoleAwareRoutingService {
     failoverPolicyAuthoritySnapshot?: FailoverPolicyAuthoritySnapshotV1
   ): RoleAwareRoutingDecision {
     const roleProfile = this.repo.getRoleProfile(request.roleProfileId);
-    let resolvedSnapshot = failoverPolicyAuthoritySnapshot;
-    if (!resolvedSnapshot) {
-      if (request.routePolicyId) {
-        const pol = this.repo.getRoutePolicy(request.routePolicyId);
-        const parsed = FailoverPolicyParser.parse(pol?.failover_policy ?? null);
-        if (parsed.status === 'VALID') {
-          resolvedSnapshot = { version: 1, status: 'VALID', policy: parsed.policy };
-        } else if (parsed.status === 'ABSENT') {
-          resolvedSnapshot = { version: 1, status: 'ABSENT' };
-        } else {
-          resolvedSnapshot = { version: 1, status: 'INVALID' };
-        }
-      } else {
-        resolvedSnapshot = { version: 1, status: 'ABSENT' };
-      }
-    }
+    const resolvedSnapshot: FailoverPolicyAuthoritySnapshotV1 =
+      failoverPolicyAuthoritySnapshot ?? { version: 1, status: 'ABSENT' };
 
     const decision: RoleAwareRoutingDecision = {
       decisionId,
