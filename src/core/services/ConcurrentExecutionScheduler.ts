@@ -11,6 +11,7 @@ import {
 } from './GitWorktreeService';
 import {
   ProviderDispatchService,
+  ProviderDispatchExecutionResult,
   ScheduledCancellationResult,
 } from './ProviderDispatchService';
 import {
@@ -39,7 +40,7 @@ export interface SchedulerExecutionResult {
   workerSlotId?: string;
   leaseId?: string;
   workspaceOwnershipDigest?: string;
-  providerResult?: AgentExecutionResult;
+  providerResult?: ProviderDispatchExecutionResult;
   error?: string;
   errorCode?: string | RuntimeErrorCode | null;
 }
@@ -301,7 +302,7 @@ export class ConcurrentExecutionScheduler {
     supervisor.setDispatchPending(true, authorizationId);
     const dispatchPromise = this.dispatchService.dispatchScheduled(authorizationId);
 
-    let providerResult: AgentExecutionResult;
+    let providerResult: ProviderDispatchExecutionResult;
     try {
       providerResult = await dispatchPromise;
     } catch (err: any) {

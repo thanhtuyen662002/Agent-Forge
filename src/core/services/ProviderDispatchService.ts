@@ -37,6 +37,29 @@ export interface ScheduledCancellationResult {
   error?: string;
 }
 
+export type ProviderAdapterInvocationOutcome = 'RETURNED' | 'THREW';
+
+export interface ProviderExecutionProvenanceV1 {
+  version: 1;
+  source: 'PROVIDER_DISPATCH_SERVICE';
+  mode: 'LEGACY' | 'SCHEDULED';
+  adapterInvocation: ProviderAdapterInvocationOutcome;
+  authorizationId: string;
+  executionId: string;
+  projectId: string;
+  taskId: string;
+  attemptId: string | null;
+  routingDecisionId: string;
+  providerId: string;
+  resourceId: string;
+  assignmentId: string | null;
+  accountId: string | null;
+}
+
+export interface ProviderDispatchExecutionResult extends AgentExecutionResult {
+  providerExecutionProvenance?: ProviderExecutionProvenanceV1;
+}
+
 interface ScheduledDispatchControl {
   executionId: string;
   phase: 'PREPARING' | 'EXECUTING';
@@ -107,7 +130,7 @@ export class ProviderDispatchService {
    * Atomically claims the authorization to prevent duplicate/concurrent executions.
    * Derives all execution instructions internally from approved durable state.
    */
-  public async dispatch(authorizationId: string): Promise<AgentExecutionResult> {
+  public async dispatch(authorizationId: string): Promise<ProviderDispatchExecutionResult> {
     return this.dispatchInternal(authorizationId, 'LEGACY');
   }
 
@@ -116,14 +139,14 @@ export class ProviderDispatchService {
    * Verifies that the required worker slot and isolated Git worktree are already prepared, locked, and clean.
    * Populates RuntimeExecutionBinding with verified workspace metadata for adapter execution.
    */
-  public async dispatchScheduled(authorizationId: string): Promise<AgentExecutionResult> {
+  public async dispatchScheduled(authorizationId: string): Promise<ProviderDispatchExecutionResult> {
     return this.dispatchInternal(authorizationId, 'SCHEDULED');
   }
 
   private async dispatchInternal(
     authorizationId: string,
     mode: 'LEGACY' | 'SCHEDULED'
-  ): Promise<AgentExecutionResult> {
+  ): Promise<ProviderDispatchExecutionResult> {
     const executionId = crypto.randomUUID();
     const nowIso = new Date().toISOString();
 
@@ -989,23 +1012,49 @@ export class ProviderDispatchService {
     }
 
     // 16. Execute the selected provider exactly once (NO retry, NO failover on failure)
-    let result: AgentExecutionResult;
+    let rawResult: AgentExecutionResult;
+    let adapterInvocation: ProviderAdapterInvocationOutcome;
     try {
-      result = await adapter.execute(request);
-      if (mode === 'SCHEDULED') {
-        result = {
-          ...result,
-          executionId,
-        };
-      }
+      rawResult = await adapter.execute(request);
+      adapterInvocation = 'RETURNED';
     } catch (err: any) {
-      result = {
+      rawResult = {
         executionId,
         status: 'FAILED',
         errorCode: 'EXECUTION_FAILED',
         error: `ADAPTER_EXECUTION_THREW: ${err.message}`,
       };
+      adapterInvocation = 'THREW';
     }
+
+    const finalExecutionId = mode === 'SCHEDULED' ? executionId : (rawResult.executionId || executionId);
+
+    // Build trusted provenance stamped strictly by ProviderDispatchService
+    const provenance: ProviderExecutionProvenanceV1 = {
+      version: 1,
+      source: 'PROVIDER_DISPATCH_SERVICE',
+      mode,
+      adapterInvocation,
+      authorizationId: auth.id,
+      executionId: finalExecutionId,
+      projectId: auth.project_id,
+      taskId: auth.task_id,
+      attemptId: auth.attempt_id ?? null,
+      routingDecisionId: auth.routing_decision_id,
+      providerId: auth.selected_provider_id,
+      resourceId: auth.selected_resource_id,
+      assignmentId: runtimeBinding?.assignmentId ?? null,
+      accountId: runtimeBinding?.accountId ?? null,
+    };
+
+    // Strip any spoofed or adapter-supplied providerExecutionProvenance from rawResult
+    const { providerExecutionProvenance: _discardedSpoof, ...sanitizedResult } = rawResult as any;
+
+    const result: ProviderDispatchExecutionResult = {
+      ...sanitizedResult,
+      executionId: finalExecutionId,
+      providerExecutionProvenance: provenance,
+    };
 
     // 17. Emit PROVIDER_RUNTIME_EXECUTION_RESULT event
     if (this.eventService && runtimeBinding) {
