@@ -480,21 +480,80 @@ describe('R5H4 Provider Execution Provenance Contract', () => {
     expect(mockAdapter.executeCallCount).toBe(0);
   });
 
-  // 8. pre-claim cancellation has no provenance
-  it('8. pre-claim cancellation has no provenance', async () => {
-    const cancelRes = await dispatchService.cancelScheduled(authId);
-    expect(cancelRes.status).toBe('NOT_ACTIVE');
+  // 8. scheduled cancellation during preparation (pre-claim) returns CANCELLED without provenance and leaves authorization unclaimed
+  it('8. scheduled cancellation during preparation (pre-claim) returns CANCELLED without provenance and leaves authorization unclaimed', async () => {
+    const worktreeTuple = {
+      projectId,
+      taskId,
+      attemptId,
+      assignmentId,
+      workerSlotId: slotId,
+      baseSha,
+    };
+    const createRes = await worktreeService.createWorktree(worktreeTuple);
+    expect(createRes.status).toBe('CREATED');
+
+    const origInspect = worktreeService.inspectWorktree.bind(worktreeService);
+    worktreeService.inspectWorktree = async (tuple) => {
+      const inspectRes = await origInspect(tuple);
+      await dispatchService.cancelScheduled(authId);
+      return inspectRes;
+    };
+
+    try {
+      const result = await dispatchService.dispatchScheduled(authId);
+      expect(result.status).toBe('CANCELLED');
+      expect(result.errorCode).toBe('CANCELLED');
+      expect(result.error).toContain('Execution was cancelled during scheduled preparation');
+      expect(result.providerExecutionProvenance).toBeUndefined();
+      expect(mockAdapter.executeCallCount).toBe(0);
+
+      // Verify authorization was not consumed
+      const authRecord = repo.getExecutionAuthorization(authId);
+      expect(authRecord?.status).toBe('AUTHORIZED');
+    } finally {
+      worktreeService.inspectWorktree = origInspect;
+      await worktreeService.removeWorktree(worktreeTuple);
+    }
   });
 
-  // 9. post-claim/pre-adapter cancellation has no provenance
-  it('9. post-claim/pre-adapter cancellation has no provenance', async () => {
-    const result: AgentExecutionResult = {
-      executionId: 'exec-1',
-      status: 'CANCELLED',
-      errorCode: 'CANCELLED',
-      error: 'Cancelled before adapter',
+  // 9. scheduled cancellation post-claim but pre-adapter returns CANCELLED without provenance after claiming authorization
+  it('9. scheduled cancellation post-claim but pre-adapter returns CANCELLED without provenance after claiming authorization', async () => {
+    const worktreeTuple = {
+      projectId,
+      taskId,
+      attemptId,
+      assignmentId,
+      workerSlotId: slotId,
+      baseSha,
     };
-    expect((result as any).providerExecutionProvenance).toBeUndefined();
+    const createRes = await worktreeService.createWorktree(worktreeTuple);
+    expect(createRes.status).toBe('CREATED');
+
+    const origClaim = repo.claimExecutionAuthorization.bind(repo);
+    repo.claimExecutionAuthorization = (id: string, now: string) => {
+      const res = origClaim(id, now);
+      if (res) {
+        void dispatchService.cancelScheduled(authId);
+      }
+      return res;
+    };
+
+    try {
+      const result = await dispatchService.dispatchScheduled(authId);
+      expect(result.status).toBe('CANCELLED');
+      expect(result.errorCode).toBe('CANCELLED');
+      expect(result.error).toContain('Execution was cancelled before adapter execution');
+      expect(result.providerExecutionProvenance).toBeUndefined();
+      expect(mockAdapter.executeCallCount).toBe(0);
+
+      // Verify authorization was claimed / dispatched
+      const authRecord = repo.getExecutionAuthorization(authId);
+      expect(authRecord?.status).toBe('DISPATCHED');
+    } finally {
+      repo.claimExecutionAuthorization = origClaim;
+      await worktreeService.removeWorktree(worktreeTuple);
+    }
   });
 
   // 10. adapter COMPLETED return has provenance
@@ -517,8 +576,8 @@ describe('R5H4 Provider Execution Provenance Contract', () => {
     expect(mockAdapter.executeCallCount).toBe(1);
   });
 
-  // 11. adapter FAILED RATE_LIMITED return has provenance
-  it('11. adapter FAILED RATE_LIMITED return has provenance', async () => {
+  // 11. adapter returned QUOTA_EXHAUSTED with rate-limit evidence has provenance
+  it('11. adapter returned QUOTA_EXHAUSTED with rate-limit evidence has provenance', async () => {
     mockAdapter.executeResult = {
       status: 'FAILED',
       errorCode: 'QUOTA_EXHAUSTED',
@@ -689,18 +748,46 @@ describe('R5H4 Provider Execution Provenance Contract', () => {
     expect(result.providerExecutionProvenance).not.toEqual(fakeProvenance);
   });
 
-  // 22. scheduler pre-adapter dispatch failure exposes no provider provenance
-  it('22. scheduler pre-adapter dispatch failure exposes no provider provenance', async () => {
+  // 22. scheduler pre-dispatch lease acquire failure exposes no provider provenance
+  it('22. scheduler pre-dispatch lease acquire failure exposes no provider provenance', async () => {
     // Disable account so scheduler pre-dispatch or dispatch fails
     db.prepare('UPDATE provider_accounts SET enabled = 0 WHERE id = ?').run(accountId);
     const scheduler = new ConcurrentExecutionScheduler(repo, leaseService, worktreeService, dispatchService);
     const schedResult = await scheduler.execute(authId);
     expect(['LEASE_ACQUIRE_FAILED', 'PREPARATION_FAILED']).toContain(schedResult.status);
     expect(schedResult.providerResult).toBeUndefined();
+    expect(mockAdapter.executeCallCount).toBe(0);
   });
 
-  // 23. scheduler genuine provider failure exposes provenance
-  it('23. scheduler genuine provider failure exposes provenance', async () => {
+  // 23. scheduler entered execution path with real dispatch pre-adapter rejection exposes no provider provenance
+  it('23. scheduler entered execution path with real dispatch pre-adapter rejection exposes no provider provenance', async () => {
+    const scheduler = new ConcurrentExecutionScheduler(repo, leaseService, worktreeService, dispatchService);
+
+    // Mutate provider account after worktree created, right before dispatchScheduled runs
+    const origCreate = worktreeService.createWorktree.bind(worktreeService);
+    worktreeService.createWorktree = async (tuple) => {
+      const res = await origCreate(tuple);
+      if (res.status === 'CREATED') {
+        db.prepare('UPDATE provider_accounts SET enabled = 0 WHERE id = ?').run(accountId);
+      }
+      return res;
+    };
+
+    try {
+      const schedResult = await scheduler.execute(authId);
+      expect(schedResult.status).toBe('PROVIDER_FAILED');
+      expect(schedResult.providerResult).toBeDefined();
+      expect(schedResult.providerResult?.status).toBe('FAILED');
+      expect(schedResult.providerResult?.errorCode).toBe('RESOURCE_UNAVAILABLE');
+      expect(schedResult.providerResult?.providerExecutionProvenance).toBeUndefined();
+      expect(mockAdapter.executeCallCount).toBe(0);
+    } finally {
+      worktreeService.createWorktree = origCreate;
+    }
+  });
+
+  // 24. scheduler genuine provider failure exposes provenance
+  it('24. scheduler genuine provider failure exposes provenance', async () => {
     mockAdapter.executeResult = {
       status: 'FAILED',
       errorCode: 'QUOTA_EXHAUSTED',
@@ -714,8 +801,8 @@ describe('R5H4 Provider Execution Provenance Contract', () => {
     expect(schedResult.providerResult?.providerExecutionProvenance?.adapterInvocation).toBe('RETURNED');
   });
 
-  // 24. scheduler post-adapter worktree/lease cleanup failure preserves exact provider provenance
-  it('24. scheduler post-adapter worktree/lease cleanup failure preserves exact provider provenance', async () => {
+  // 25. scheduler post-adapter worktree/lease cleanup failure preserves exact provider provenance
+  it('25. scheduler post-adapter worktree/lease cleanup failure preserves exact provider provenance', async () => {
     mockAdapter.executeResult = {
       status: 'FAILED',
       errorCode: 'QUOTA_EXHAUSTED',
@@ -743,8 +830,8 @@ describe('R5H4 Provider Execution Provenance Contract', () => {
     }
   });
 
-  // 25. scheduler dispatch exception synthetic result has no provenance
-  it('25. scheduler dispatch exception synthetic result has no provenance', async () => {
+  // 26. scheduler dispatch exception synthetic result has no provenance
+  it('26. scheduler dispatch exception synthetic result has no provenance', async () => {
     const scheduler = new ConcurrentExecutionScheduler(repo, leaseService, worktreeService, dispatchService);
     const origDispatchScheduled = dispatchService.dispatchScheduled.bind(dispatchService);
     dispatchService.dispatchScheduled = async () => {
@@ -761,8 +848,8 @@ describe('R5H4 Provider Execution Provenance Contract', () => {
     }
   });
 
-  // 26. EventService undefined does not prevent provenance
-  it('26. EventService undefined does not prevent provenance', async () => {
+  // 27. EventService undefined does not prevent provenance
+  it('27. EventService undefined does not prevent provenance', async () => {
     const noEventDispatch = new ProviderDispatchService(registry, repo, undefined, worktreeService);
     const result = await noEventDispatch.dispatch(authId);
     expect(result.status).toBe('COMPLETED');
@@ -771,8 +858,8 @@ describe('R5H4 Provider Execution Provenance Contract', () => {
     expect(result.providerExecutionProvenance?.adapterInvocation).toBe('RETURNED');
   });
 
-  // 27. assignment/account are null only when legitimate non-fabric execution has no runtime binding
-  it('27. assignment/account are null only when legitimate non-fabric execution has no runtime binding', async () => {
+  // 28. assignment/account are null only when legitimate non-fabric execution has no runtime binding
+  it('28. assignment/account are null only when legitimate non-fabric execution has no runtime binding', async () => {
     // Create legacy routing decision without account/assignment
     const legacyRoutingId = `rout-legacy-${crypto.randomUUID()}`;
     const legacyAuthId = `auth-legacy-${crypto.randomUUID()}`;
@@ -841,8 +928,8 @@ describe('R5H4 Provider Execution Provenance Contract', () => {
     expect(result.providerExecutionProvenance?.resourceId).toBe(resourceId);
   });
 
-  // 28. provenance contains no credential_ref/profile_ref/secrets
-  it('28. provenance contains no credential_ref/profile_ref/secrets', async () => {
+  // 29. provenance contains no credential_ref/profile_ref/secrets
+  it('29. provenance contains no credential_ref/profile_ref/secrets', async () => {
     const result = await dispatchService.dispatch(authId);
     const prov = result.providerExecutionProvenance! as any;
     expect(prov.credential_ref).toBeUndefined();
@@ -855,8 +942,8 @@ describe('R5H4 Provider Execution Provenance Contract', () => {
     expect(prov.stderr).toBeUndefined();
   });
 
-  // 29. Source boundary test: proves production files do NOT newly import classifier, health, failover decision, etc.
-  it('29. Source boundary test: proves production files do not newly import classifier, health, failover decision, etc.', () => {
+  // 30. Source boundary test: proves production files do NOT newly import classifier, health, failover decision, etc.
+  it('30. Source boundary test: proves production files do not newly import classifier, health, failover decision, etc.', () => {
     const dispatchSource = fs.readFileSync(
       path.join(__dirname, '../src/core/services/ProviderDispatchService.ts'),
       'utf-8'
