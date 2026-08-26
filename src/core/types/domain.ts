@@ -1029,6 +1029,11 @@ export interface ProviderHealthObservation {
   result_status: string;
   classified_category: ProviderHealthObservationCategory;
   observed_at: string;
+  account_order?: number | null;
+}
+
+export interface ProviderHealthObservationRecord extends ProviderHealthObservation {
+  account_order: number | null;
 }
 
 export type ProviderHealthObservationIngestStatus =
@@ -1039,6 +1044,6 @@ export type ProviderHealthObservationIngestStatus =
 
 export interface ProviderHealthObservationIngestResult {
   status: ProviderHealthObservationIngestStatus;
-  observation: ProviderHealthObservation | null;
+  observation: ProviderHealthObservationRecord | ProviderHealthObservation | null;
   reason?: string;
 }
