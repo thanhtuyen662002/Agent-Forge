@@ -757,6 +757,48 @@ export interface ClaimSuccessorParams {
   createdAt?: string;
 }
 
+export type FailoverRouteStageKind =
+  | 'SAME_ACCOUNT_RETRY'
+  | 'CROSS_ACCOUNT_SAME_PROVIDER'
+  | 'CROSS_PROVIDER';
+
+export type FailoverNextRoutePlanOutcome =
+  | 'ROUTE_STAGES_READY'
+  | 'NO_ROUTE_SCOPE_ALLOWED'
+  | 'FAILOVER_NOT_AUTHORIZED'
+  | 'INVALID_INPUT';
+
+export interface FailoverRouteStage {
+  kind: FailoverRouteStageKind;
+  requiredProviderId: string | null;
+  requiredAccountId: string | null;
+  requiredResourceId: string | null;
+  excludedCandidateIds: string[];
+  excludedAccountIds: string[];
+  excludedProviderIds: string[];
+  reason: string;
+}
+
+export interface FailoverNextRoutePlan {
+  outcome: FailoverNextRoutePlanOutcome;
+  currentAttemptId: string;
+  currentAssignmentId: string | null;
+  currentProviderId: string | null;
+  currentAccountId: string | null;
+  currentResourceId: string | null;
+  consecutiveSameAccountRetriesUsed: number;
+  sameAccountRetriesAllowed: number;
+  stages: FailoverRouteStage[];
+  reason: string;
+}
+
+export interface EvaluateFailoverNextRouteParams {
+  policyResult: FailoverPolicyParseResult;
+  decision: FailoverDecision;
+  lineage: FailoverLineageContext;
+  assignments: AgentAssignment[];
+}
+
 export interface RoutePolicy {
   id: string;
   name: string;
