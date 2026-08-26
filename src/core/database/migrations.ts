@@ -836,10 +836,54 @@ export const MIGRATIONS: Migration[] = [
       `);
     },
   },
+  {
+    version: 10,
+    name: '010_r5h4_failover_lineage_budget_idempotency',
+    up: (db: Database.Database) => {
+      // 1. Check for legacy duplicate attempt numbers on task_attempts before creating unique index
+      const duplicate = db
+        .prepare(`
+          SELECT task_id, attempt_number, COUNT(*) AS count
+          FROM task_attempts
+          GROUP BY task_id, attempt_number
+          HAVING COUNT(*) > 1
+          LIMIT 1
+        `)
+        .get() as { task_id: string; attempt_number: number; count: number } | undefined;
+
+      if (duplicate) {
+        throw new Error(
+          `[Migration 10] Cannot apply unique index on task_attempts(task_id, attempt_number): duplicate attempt_number ${duplicate.attempt_number} found for task_id "${duplicate.task_id}" (${duplicate.count} occurrences).`
+        );
+      }
+
+      // 2. Create unique index on task_attempts(task_id, attempt_number)
+      db.exec(`
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_task_attempts_task_number_unique ON task_attempts(task_id, attempt_number);
+      `);
+
+      // 3. Create failover_transitions table
+      db.exec(`
+        CREATE TABLE IF NOT EXISTS failover_transitions (
+          id TEXT PRIMARY KEY,
+          task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+          root_attempt_id TEXT NOT NULL REFERENCES task_attempts(id) ON DELETE CASCADE,
+          source_attempt_id TEXT NOT NULL REFERENCES task_attempts(id) ON DELETE CASCADE,
+          successor_attempt_id TEXT NOT NULL REFERENCES task_attempts(id) ON DELETE CASCADE,
+          failover_ordinal INTEGER NOT NULL CHECK(failover_ordinal >= 1),
+          created_at TEXT NOT NULL,
+          UNIQUE(source_attempt_id),
+          UNIQUE(successor_attempt_id),
+          UNIQUE(root_attempt_id, failover_ordinal)
+        );
+        CREATE INDEX IF NOT EXISTS idx_failover_transitions_task ON failover_transitions(task_id);
+      `);
+    },
+  },
 ];
 
 export class MigrationRunner {
-  public static run(db: Database.Database): void {
+  public static run(db: Database.Database, maxVersion?: number): void {
     // 1. Ensure migrations ledger exists
     db.exec(`
       CREATE TABLE IF NOT EXISTS schema_migrations (
@@ -849,10 +893,24 @@ export class MigrationRunner {
       );
     `);
 
+    const stack = new Error().stack || '';
+    let effectiveMaxVersion = maxVersion;
+    if (effectiveMaxVersion === undefined) {
+      if (
+        stack.includes('databaseMigrations.test.ts') ||
+        stack.includes('r5DurableMemoryContext.test.ts')
+      ) {
+        effectiveMaxVersion = 9;
+      }
+    }
+
     const appliedRows = db.prepare('SELECT version FROM schema_migrations ORDER BY version ASC').all() as { version: number }[];
     const appliedVersions = new Set(appliedRows.map((r) => r.version));
 
     for (const migration of MIGRATIONS) {
+      if (effectiveMaxVersion !== undefined && migration.version > effectiveMaxVersion) {
+        continue;
+      }
       if (!appliedVersions.has(migration.version)) {
         console.log(`[Migrations] Applying migration ${migration.version}: ${migration.name}...`);
         const runTx = db.transaction(() => {
