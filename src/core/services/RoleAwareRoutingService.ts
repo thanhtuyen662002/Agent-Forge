@@ -42,6 +42,9 @@ export interface RoleAwareRoutingRequest {
   preferredResourceId?: string | null;
   preferredMetadata?: Record<string, unknown> | null;
   persistAssignment?: boolean;
+  excludedCandidateIds?: string[];
+  excludedAccountIds?: string[];
+  excludedProviderIds?: string[];
 }
 
 export type RoleAwareRoutingOutcome =
@@ -90,6 +93,17 @@ export interface RequestedRoutingConstraintsAudit {
   preferredProviderId: string | null;
   preferredAccountId: string | null;
   preferredResourceId: string | null;
+  excludedCandidateIds: string[];
+  excludedAccountIds: string[];
+  excludedProviderIds: string[];
+}
+
+export interface AppliedExclusionAuditEntry {
+  candidateId: string;
+  accountId: string;
+  providerId: string;
+  resourceId: string;
+  reasonCodes: string[];
 }
 
 export interface RoleAwareRoutingDecision {
@@ -126,6 +140,23 @@ export class RoleAwareRoutingService {
     this.now = clock ?? (() => new Date());
   }
 
+  private validateExclusionIds(ids: unknown, fieldName: string): string[] {
+    if (ids === undefined || ids === null) return [];
+    if (!Array.isArray(ids)) {
+      throw new Error(`INVALID_ROUTING_REQUEST: ${fieldName} must be an array of strings if provided.`);
+    }
+    const unique = new Set<string>();
+    for (const item of ids) {
+      if (typeof item !== 'string' || item.trim() === '' || item !== item.trim()) {
+        throw new Error(
+          `INVALID_ROUTING_REQUEST: ${fieldName} elements must be non-empty canonical strings without surrounding whitespace.`
+        );
+      }
+      unique.add(item);
+    }
+    return Array.from(unique);
+  }
+
   /**
    * Deterministically evaluates candidate (ProviderAccount, ProviderResource) pairs
    * against RoleProfile requirements, explicit RoutePolicy, and SeparationPolicy.
@@ -144,6 +175,19 @@ export class RoleAwareRoutingService {
     const createdAt = this.now().toISOString();
     const normalizedAttemptId = request.attemptId ?? null;
 
+    const excludedCandidateIds = this.validateExclusionIds(
+      request.excludedCandidateIds,
+      'excludedCandidateIds'
+    );
+    const excludedAccountIds = this.validateExclusionIds(
+      request.excludedAccountIds,
+      'excludedAccountIds'
+    );
+    const excludedProviderIds = this.validateExclusionIds(
+      request.excludedProviderIds,
+      'excludedProviderIds'
+    );
+
     const requestedConstraints: RequestedRoutingConstraintsAudit = {
       requiredProviderId: request.requiredProviderId ?? null,
       requiredAccountId: request.requiredAccountId ?? null,
@@ -151,7 +195,14 @@ export class RoleAwareRoutingService {
       preferredProviderId: request.preferredProviderId ?? null,
       preferredAccountId: request.preferredAccountId ?? null,
       preferredResourceId: request.preferredResourceId ?? null,
+      excludedCandidateIds,
+      excludedAccountIds,
+      excludedProviderIds,
     };
+
+    const excludedCandidateSet = new Set(excludedCandidateIds);
+    const excludedAccountSet = new Set(excludedAccountIds);
+    const excludedProviderSet = new Set(excludedProviderIds);
 
     // 1. Validate Scope: Project & Task
     const project = this.repo.getProject(request.projectId);
@@ -420,6 +471,17 @@ export class RoleAwareRoutingService {
           preferenceDetails: {},
         });
         continue;
+      }
+
+      // Check failover exclusions
+      if (excludedCandidateSet.has(candidateId)) {
+        rejectionReasons.push('FAILOVER_EXCLUDED_CANDIDATE');
+      }
+      if (excludedAccountSet.has(account.id)) {
+        rejectionReasons.push('FAILOVER_EXCLUDED_ACCOUNT');
+      }
+      if (excludedProviderSet.has(resource.provider_id)) {
+        rejectionReasons.push('FAILOVER_EXCLUDED_PROVIDER');
       }
 
       // Check resource-to-provider alignment
@@ -1021,6 +1083,25 @@ export class RoleAwareRoutingService {
       const task = this.repo.getTask(request.taskId);
       const validTaskId = task && task.project_id === request.projectId ? request.taskId : null;
 
+      const appliedExclusions: AppliedExclusionAuditEntry[] = [];
+      for (const evalItem of decision.candidateEvaluations) {
+        const matchedCodes = evalItem.rejectionReasons.filter(
+          (r) =>
+            r === 'FAILOVER_EXCLUDED_CANDIDATE' ||
+            r === 'FAILOVER_EXCLUDED_ACCOUNT' ||
+            r === 'FAILOVER_EXCLUDED_PROVIDER'
+        );
+        if (matchedCodes.length > 0) {
+          appliedExclusions.push({
+            candidateId: evalItem.candidateId,
+            accountId: evalItem.accountId,
+            providerId: evalItem.providerId,
+            resourceId: evalItem.resourceId,
+            reasonCodes: matchedCodes,
+          });
+        }
+      }
+
       this.eventService.record(
         request.projectId,
         'ROLE_AWARE_ROUTING_DECISION',
@@ -1035,6 +1116,7 @@ export class RoleAwareRoutingService {
           selectedResourceId: decision.selectedResourceId,
           selectedAssignmentId: decision.selectedAssignmentId,
           requestedConstraints: decision.requestedConstraints,
+          appliedExclusions,
           appliedSeparation: decision.appliedSeparation,
           reason: decision.reason,
         },
