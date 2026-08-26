@@ -50,7 +50,10 @@ import {
   ContextItemType,
   ContextManifest,
   HandoffContext,
-  HandoffContextStatus
+  HandoffContextStatus,
+  FailoverTransition,
+  FailoverSuccessorClaimResult,
+  ClaimSuccessorParams
 } from '../types/domain';
 import {
   computeSha256,
@@ -319,6 +322,264 @@ export class Repository {
       ended_at: r.ended_at ? String(r.ended_at) : null,
       summary: r.summary ? String(r.summary) : null,
     }));
+  }
+
+  // ==========================================
+  // Failover Transitions (Durable Whole-Attempt Lineage)
+  // ==========================================
+  public createFailoverTransition(transition: FailoverTransition): void {
+    this.db
+      .prepare(`
+        INSERT INTO failover_transitions (
+          id, task_id, root_attempt_id, source_attempt_id, successor_attempt_id, failover_ordinal, created_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?)
+      `)
+      .run(
+        transition.id,
+        transition.task_id,
+        transition.root_attempt_id,
+        transition.source_attempt_id,
+        transition.successor_attempt_id,
+        transition.failover_ordinal,
+        transition.created_at
+      );
+  }
+
+  public getFailoverTransition(id: string): FailoverTransition | null {
+    const row = this.db
+      .prepare('SELECT * FROM failover_transitions WHERE id = ?')
+      .get(id) as Record<string, unknown> | undefined;
+    if (!row) return null;
+    return {
+      id: String(row.id),
+      task_id: String(row.task_id),
+      root_attempt_id: String(row.root_attempt_id),
+      source_attempt_id: String(row.source_attempt_id),
+      successor_attempt_id: String(row.successor_attempt_id),
+      failover_ordinal: Number(row.failover_ordinal),
+      created_at: String(row.created_at),
+    };
+  }
+
+  public getFailoverTransitionBySource(sourceAttemptId: string): FailoverTransition | null {
+    const row = this.db
+      .prepare('SELECT * FROM failover_transitions WHERE source_attempt_id = ?')
+      .get(sourceAttemptId) as Record<string, unknown> | undefined;
+    if (!row) return null;
+    return {
+      id: String(row.id),
+      task_id: String(row.task_id),
+      root_attempt_id: String(row.root_attempt_id),
+      source_attempt_id: String(row.source_attempt_id),
+      successor_attempt_id: String(row.successor_attempt_id),
+      failover_ordinal: Number(row.failover_ordinal),
+      created_at: String(row.created_at),
+    };
+  }
+
+  public getFailoverTransitionBySuccessor(successorAttemptId: string): FailoverTransition | null {
+    const row = this.db
+      .prepare('SELECT * FROM failover_transitions WHERE successor_attempt_id = ?')
+      .get(successorAttemptId) as Record<string, unknown> | undefined;
+    if (!row) return null;
+    return {
+      id: String(row.id),
+      task_id: String(row.task_id),
+      root_attempt_id: String(row.root_attempt_id),
+      source_attempt_id: String(row.source_attempt_id),
+      successor_attempt_id: String(row.successor_attempt_id),
+      failover_ordinal: Number(row.failover_ordinal),
+      created_at: String(row.created_at),
+    };
+  }
+
+  public getFailoverTransitionsByTask(taskId: string): FailoverTransition[] {
+    const rows = this.db
+      .prepare('SELECT * FROM failover_transitions WHERE task_id = ? ORDER BY failover_ordinal ASC')
+      .all(taskId) as Record<string, unknown>[];
+    return rows.map((row) => ({
+      id: String(row.id),
+      task_id: String(row.task_id),
+      root_attempt_id: String(row.root_attempt_id),
+      source_attempt_id: String(row.source_attempt_id),
+      successor_attempt_id: String(row.successor_attempt_id),
+      failover_ordinal: Number(row.failover_ordinal),
+      created_at: String(row.created_at),
+    }));
+  }
+
+  public getFailoverTransitionsByRoot(rootAttemptId: string): FailoverTransition[] {
+    const rows = this.db
+      .prepare('SELECT * FROM failover_transitions WHERE root_attempt_id = ? ORDER BY failover_ordinal ASC')
+      .all(rootAttemptId) as Record<string, unknown>[];
+    return rows.map((row) => ({
+      id: String(row.id),
+      task_id: String(row.task_id),
+      root_attempt_id: String(row.root_attempt_id),
+      source_attempt_id: String(row.source_attempt_id),
+      successor_attempt_id: String(row.successor_attempt_id),
+      failover_ordinal: Number(row.failover_ordinal),
+      created_at: String(row.created_at),
+    }));
+  }
+
+  public claimSuccessorTaskAttempt(params: ClaimSuccessorParams): FailoverSuccessorClaimResult {
+    // A. Validate input fields
+    if (
+      !params ||
+      typeof params !== 'object' ||
+      typeof params.transitionId !== 'string' ||
+      params.transitionId.trim().length === 0 ||
+      params.transitionId !== params.transitionId.trim() ||
+      typeof params.sourceAttemptId !== 'string' ||
+      params.sourceAttemptId.trim().length === 0 ||
+      params.sourceAttemptId !== params.sourceAttemptId.trim() ||
+      typeof params.successorAttemptId !== 'string' ||
+      params.successorAttemptId.trim().length === 0 ||
+      params.successorAttemptId !== params.successorAttemptId.trim()
+    ) {
+      return {
+        status: 'INVALID_INPUT',
+        error: 'INVALID_INPUT: transitionId, sourceAttemptId, and successorAttemptId must be non-empty strings without surrounding whitespace.',
+      };
+    }
+
+    if (params.sourceAttemptId === params.successorAttemptId) {
+      return {
+        status: 'INVALID_INPUT',
+        error: 'INVALID_INPUT: sourceAttemptId and successorAttemptId cannot be identical.',
+      };
+    }
+
+    return this.runInImmediateTransaction<FailoverSuccessorClaimResult>(() => {
+      // B. Load source TaskAttempt
+      const sourceAttempt = this.getTaskAttempt(params.sourceAttemptId);
+      if (!sourceAttempt) {
+        return {
+          status: 'SOURCE_NOT_FOUND',
+          error: `Source TaskAttempt "${params.sourceAttemptId}" not found.`,
+        };
+      }
+
+      // C. Check existing transition by source_attempt_id (Idempotency authority)
+      const existingTransition = this.getFailoverTransitionBySource(params.sourceAttemptId);
+      if (existingTransition) {
+        const existingSuccessor = this.getTaskAttempt(existingTransition.successor_attempt_id);
+        return {
+          status: 'ALREADY_CLAIMED',
+          transition: existingTransition,
+          successorAttempt: existingSuccessor ?? undefined,
+        };
+      }
+
+      // D. Check ID conflicts
+      const existingTransitionById = this.getFailoverTransition(params.transitionId);
+      if (existingTransitionById) {
+        return {
+          status: 'TRANSITION_ID_CONFLICT',
+          error: `Transition with ID "${params.transitionId}" already exists.`,
+        };
+      }
+
+      const existingTaskAttemptById = this.getTaskAttempt(params.successorAttemptId);
+      if (existingTaskAttemptById) {
+        return {
+          status: 'SUCCESSOR_ID_CONFLICT',
+          error: `TaskAttempt with ID "${params.successorAttemptId}" already exists.`,
+        };
+      }
+
+      const existingTransitionBySuccessor = this.getFailoverTransitionBySuccessor(params.successorAttemptId);
+      if (existingTransitionBySuccessor) {
+        return {
+          status: 'SUCCESSOR_ID_CONFLICT',
+          error: `Transition with successor_attempt_id "${params.successorAttemptId}" already exists.`,
+        };
+      }
+
+      // E. Determine predecessor transition where successor_attempt_id = sourceAttemptId
+      const predecessorTransition = this.getFailoverTransitionBySuccessor(params.sourceAttemptId);
+      let rootAttemptId: string;
+      let failoverOrdinal: number;
+
+      if (!predecessorTransition) {
+        rootAttemptId = params.sourceAttemptId;
+        failoverOrdinal = 1;
+      } else {
+        rootAttemptId = predecessorTransition.root_attempt_id;
+        failoverOrdinal = predecessorTransition.failover_ordinal + 1;
+      }
+
+      // F. Compute next TaskAttempt attempt_number INSIDE the immediate transaction
+      const maxRow = this.db
+        .prepare(`SELECT COALESCE(MAX(attempt_number), 0) + 1 AS next_attempt_number FROM task_attempts WHERE task_id = ?`)
+        .get(sourceAttempt.task_id) as { next_attempt_number: number };
+      const nextAttemptNumber = Number(maxRow.next_attempt_number);
+
+      const nowIso = params.createdAt ?? new Date().toISOString();
+      const startedAt = params.startedAt ?? nowIso;
+      const status = params.status ?? 'PENDING';
+
+      // G. Create successor TaskAttempt
+      const successorAttempt: TaskAttempt = {
+        id: params.successorAttemptId,
+        task_id: sourceAttempt.task_id,
+        attempt_number: nextAttemptNumber,
+        agent_id: sourceAttempt.agent_id,
+        status,
+        started_at: startedAt,
+        ended_at: params.endedAt ?? null,
+        summary: params.summary ?? null,
+      };
+
+      this.db
+        .prepare(`
+          INSERT INTO task_attempts (id, task_id, attempt_number, agent_id, status, started_at, ended_at, summary)
+          VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        `)
+        .run(
+          successorAttempt.id,
+          successorAttempt.task_id,
+          successorAttempt.attempt_number,
+          successorAttempt.agent_id,
+          successorAttempt.status,
+          successorAttempt.started_at,
+          successorAttempt.ended_at,
+          successorAttempt.summary
+        );
+
+      // H. Create failover transition
+      const transition: FailoverTransition = {
+        id: params.transitionId,
+        task_id: sourceAttempt.task_id,
+        root_attempt_id: rootAttemptId,
+        source_attempt_id: params.sourceAttemptId,
+        successor_attempt_id: params.successorAttemptId,
+        failover_ordinal: failoverOrdinal,
+        created_at: nowIso,
+      };
+
+      this.db
+        .prepare(`
+          INSERT INTO failover_transitions (id, task_id, root_attempt_id, source_attempt_id, successor_attempt_id, failover_ordinal, created_at)
+          VALUES (?, ?, ?, ?, ?, ?, ?)
+        `)
+        .run(
+          transition.id,
+          transition.task_id,
+          transition.root_attempt_id,
+          transition.source_attempt_id,
+          transition.successor_attempt_id,
+          transition.failover_ordinal,
+          transition.created_at
+        );
+
+      return {
+        status: 'CREATED',
+        transition,
+        successorAttempt,
+      };
+    });
   }
 
   // ==========================================

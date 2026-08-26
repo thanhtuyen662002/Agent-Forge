@@ -714,6 +714,49 @@ export interface FailoverDecision {
   cooldownDurationMs?: number;
 }
 
+export interface FailoverTransition {
+  id: string;
+  task_id: string;
+  root_attempt_id: string;
+  source_attempt_id: string;
+  successor_attempt_id: string;
+  failover_ordinal: number;
+  created_at: string;
+}
+
+export interface FailoverLineageContext {
+  currentAttemptId: string;
+  rootAttemptId: string;
+  failoverAttemptsUsed: number;
+  transitions: FailoverTransition[];
+}
+
+export type FailoverSuccessorClaimStatus =
+  | 'CREATED'
+  | 'ALREADY_CLAIMED'
+  | 'SOURCE_NOT_FOUND'
+  | 'SUCCESSOR_ID_CONFLICT'
+  | 'TRANSITION_ID_CONFLICT'
+  | 'INVALID_INPUT';
+
+export interface FailoverSuccessorClaimResult {
+  status: FailoverSuccessorClaimStatus;
+  transition?: FailoverTransition;
+  successorAttempt?: TaskAttempt;
+  error?: string;
+}
+
+export interface ClaimSuccessorParams {
+  transitionId: string;
+  sourceAttemptId: string;
+  successorAttemptId: string;
+  status?: string;
+  startedAt?: string;
+  endedAt?: string | null;
+  summary?: string | null;
+  createdAt?: string;
+}
+
 export interface RoutePolicy {
   id: string;
   name: string;
