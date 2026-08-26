@@ -584,28 +584,168 @@ describe('R5H4 Provider Health Cooldown Replay Authority Contract Tests', () => 
   // 6. Atomicity, Restart Durability & Deterministic Replay
   // =========================================================================
 
-  it('19. Transaction rollback proof: aborted insert leaves no partial anchor or action plan', () => {
+  it('19. Transaction rollback proof: post-allocation insert failure rolls back cooldown anchor and next claim obtains valid anchor without order gap', () => {
     seedDurableGraph({ cooldownDurationMs: 60000 });
 
-    // Install an abort trigger on provider_health_observations
+    const obs1 = createObservation('RATE_LIMITED');
+    const res1 = createResult('FAILED', 'rate limit 429');
+
+    // 1. Setup test-only SQLite capture function & trigger for target authorization
+    let capturedAnchor: string | null = null;
+    let capturedAction: string | null = null;
+    let capturedDuration: number | null = null;
+    let capturedOrder: number | null = null;
+
+    db.function('__capture_cooldown_anchor', (anchor, action, duration, order) => {
+      capturedAnchor = anchor ? String(anchor) : null;
+      capturedAction = action ? String(action) : null;
+      capturedDuration = duration !== null && duration !== undefined ? Number(duration) : null;
+      capturedOrder = order !== null && order !== undefined ? Number(order) : null;
+      return null;
+    });
+
     db.exec(`
-      CREATE TRIGGER test_abort_observation
+      CREATE TEMP TRIGGER test_force_post_anchor_insert_failure
       BEFORE INSERT ON provider_health_observations
+      WHEN NEW.authorization_id = '${obs1.authorization_id}'
       BEGIN
-        SELECT RAISE(ABORT, 'INTENTIONAL_TEST_ABORT');
+        SELECT __capture_cooldown_anchor(
+          NEW.health_action_cooldown_anchor_at,
+          NEW.health_action,
+          NEW.health_action_cooldown_duration_ms,
+          NEW.account_order
+        );
+        SELECT RAISE(
+          ABORT,
+          'TEST_FORCED_POST_ANCHOR_INSERT_FAILURE'
+        );
       END;
     `);
 
-    const obs = createObservation('RATE_LIMITED');
-    const res = createResult('FAILED', 'rate limit 429');
+    // 2. Claim obs1 -> throws TEST_FORCED_POST_ANCHOR_INSERT_FAILURE
+    expect(() => repo.claimProviderHealthObservation(obs1, res1)).toThrow(
+      /TEST_FORCED_POST_ANCHOR_INSERT_FAILURE/
+    );
 
-    expect(() => repo.claimProviderHealthObservation(obs, res)).toThrow(/INTENTIONAL_TEST_ABORT/);
+    // 3. Verify attempted insert captured values:
+    expect(capturedAction).toBe('RECORD_RATE_LIMITED');
+    expect(capturedDuration).toBe(60000);
+    expect(capturedAnchor).not.toBeNull();
+    expect(typeof capturedAnchor).toBe('string');
+    expect(Number.isNaN(Date.parse(capturedAnchor!))).toBe(false);
+    expect(capturedOrder).toBe(1);
 
-    const stored = repo.getProviderHealthObservation(AUTH_ID);
-    expect(stored).toBeNull();
+    // 4. Verify durable rollback:
+    // - Target observation row is ABSENT
+    expect(repo.getProviderHealthObservation(obs1.authorization_id)).toBeNull();
+    // - Table has 0 rows
+    const countAfterAbort = (db.prepare('SELECT COUNT(*) as cnt FROM provider_health_observations').get() as { cnt: number }).cnt;
+    expect(countAfterAbort).toBe(0);
+    // - MAX(account_order) is 0 (no order allocated durably)
+    const maxOrderAfterAbort = (db.prepare('SELECT COALESCE(MAX(account_order), 0) as max_order FROM provider_health_observations WHERE account_id = ?').get(ACCOUNT_ID) as { max_order: number }).max_order;
+    expect(Number(maxOrderAfterAbort)).toBe(0);
 
-    const count = (db.prepare('SELECT COUNT(*) as cnt FROM provider_health_observations').get() as { cnt: number }).cnt;
-    expect(count).toBe(0);
+    // 5. Remove test trigger (DROP TEMP TRIGGER)
+    db.exec('DROP TRIGGER IF EXISTS test_force_post_anchor_insert_failure;');
+
+    // 6. Create NEW coherent authorization & observation on the same account
+    const AUTH_ID_2 = 'auth-cooldown-retry-2';
+    const EXECUTION_ID_2 = 'exec-cooldown-retry-2';
+
+    repo.recordProtocolMessage(
+      'msg-2',
+      'msg-2',
+      'manager.v1',
+      PROJECT_ID,
+      TASK_ID,
+      'APPROVED',
+      0,
+      'sha-msg-2',
+      JSON.stringify({ instruction: 'retry' }),
+      'APPLIED',
+      undefined,
+      '2026-08-26T12:00:00.000Z'
+    );
+
+    repo.createExecutionAuthorization({
+      id: AUTH_ID_2,
+      project_id: PROJECT_ID,
+      task_id: TASK_ID,
+      attempt_id: ATTEMPT_ID,
+      task_revision: 0,
+      base_sha: '8cec7fcbe9edb51a7e3e03d7205eb5da425fb697',
+      repository_head_sha: '8cec7fcbe9edb51a7e3e03d7205eb5da425fb697',
+      manager_message_id: 'msg-2',
+      manager_payload_hash: 'hash-2',
+      routing_decision_id: ROUTING_DECISION_ID,
+      selected_provider_id: PROVIDER_ID,
+      selected_resource_id: RESOURCE_ID,
+      canonical_instructions_json: JSON.stringify(['retry']),
+      context_files_json: JSON.stringify([]),
+      canonical_payload_json: JSON.stringify({}),
+      instruction_payload_hash: 'hash-payload-2',
+      context_manifest_hash: 'hash-manifest-2',
+      status: 'DISPATCHED',
+      dispatched_at: '2026-08-26T12:00:00.000Z',
+      created_at: '2026-08-26T12:00:00.000Z',
+    });
+
+    const obs2: ProviderHealthObservation = {
+      authorization_id: AUTH_ID_2,
+      execution_id: EXECUTION_ID_2,
+      account_id: ACCOUNT_ID,
+      provider_id: PROVIDER_ID,
+      resource_id: RESOURCE_ID,
+      assignment_id: ASSIGNMENT_ID,
+      attempt_id: ATTEMPT_ID,
+      routing_decision_id: ROUTING_DECISION_ID,
+      provenance_version: 1,
+      provenance_source: 'PROVIDER_DISPATCH_SERVICE',
+      mode: 'LEGACY',
+      adapter_invocation: 'RETURNED',
+      result_status: 'FAILED',
+      classified_category: 'RATE_LIMITED',
+      observed_at: '2026-08-26T12:00:00.000Z',
+    };
+
+    const res2: ProviderDispatchExecutionResult = {
+      executionId: EXECUTION_ID_2,
+      status: 'FAILED',
+      rawResponse: 'rate limit 429',
+      error: 'rate limit 429 too many requests',
+      errorCode: 'QUOTA_EXHAUSTED',
+      providerExecutionProvenance: {
+        version: 1,
+        source: 'PROVIDER_DISPATCH_SERVICE',
+        mode: 'LEGACY',
+        adapterInvocation: 'RETURNED',
+        authorizationId: AUTH_ID_2,
+        executionId: EXECUTION_ID_2,
+        projectId: PROJECT_ID,
+        taskId: TASK_ID,
+        attemptId: ATTEMPT_ID,
+        routingDecisionId: ROUTING_DECISION_ID,
+        providerId: PROVIDER_ID,
+        resourceId: RESOURCE_ID,
+        assignmentId: ASSIGNMENT_ID,
+        accountId: ACCOUNT_ID,
+      },
+    };
+
+    // 7. Claim obs2 -> must succeed with status RECORDED
+    const claimStatus2 = repo.claimProviderHealthObservation(obs2, res2);
+    expect(claimStatus2).toBe('RECORDED');
+
+    const rec2 = repo.getProviderHealthObservation(AUTH_ID_2)!;
+    expect(rec2).not.toBeNull();
+    expect(rec2.health_action).toBe('RECORD_RATE_LIMITED');
+    expect(rec2.health_action_cooldown_duration_ms).toBe(60000);
+    expect(rec2.health_action_cooldown_anchor_at).not.toBeNull();
+    expect(Number.isNaN(Date.parse(rec2.health_action_cooldown_anchor_at!))).toBe(false);
+    expect(rec2.account_order).toBe(1);
+
+    // Old aborted observation remains absent
+    expect(repo.getProviderHealthObservation(obs1.authorization_id)).toBeNull();
   });
 
   it('20. Restart durability: database close and reopen preserves identical anchor and duration', () => {
