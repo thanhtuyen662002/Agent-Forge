@@ -135,11 +135,27 @@ export class FailureHealthMutationPolicyService {
       };
     }
 
+    // 4. Validate adapterInvocation runtime discriminator (must be RETURNED or THREW)
+    if (
+      provenance.adapterInvocation !== 'RETURNED' &&
+      provenance.adapterInvocation !== 'THREW'
+    ) {
+      return {
+        action: 'NO_MUTATION',
+        accountId: null,
+        executionId: providerResult.executionId ?? null,
+        authorizationId: provenance.authorizationId ?? null,
+        category: null,
+        cooldownDurationMs: null,
+        reason: 'MALFORMED_PROVENANCE: adapterInvocation must be RETURNED or THREW.',
+      };
+    }
+
     const accountId = provenance.accountId;
     const executionId = provenance.executionId;
     const authorizationId = provenance.authorizationId;
 
-    // 4. Handle adapter invocation THREW (internal adapter crash, not remote provider fault)
+    // 5. Handle adapter invocation THREW (internal adapter crash, not remote provider fault)
     if (provenance.adapterInvocation === 'THREW') {
       if (providerResult.status === 'COMPLETED') {
         return {
