@@ -23,6 +23,7 @@ import {
   CanonicalExecutionPayloadSchema,
   CanonicalExecutionPayload,
 } from './ExecutionAuthorizationService';
+import { ProviderHealthObservationService } from './ProviderHealthObservationService';
 
 export type ScheduledCancellationStatus =
   | 'CANCEL_REQUESTED'
@@ -70,13 +71,16 @@ interface ScheduledDispatchControl {
 
 export class ProviderDispatchService {
   private activeDispatches = new Map<string, ScheduledDispatchControl>();
+  private readonly observationService: ProviderHealthObservationService;
 
   constructor(
     private providerRegistry: ProviderRegistry,
     private repo: Repository,
     private eventService?: EventService,
     private gitWorktreeService?: GitWorktreeService
-  ) {}
+  ) {
+    this.observationService = new ProviderHealthObservationService(this.repo);
+  }
 
   public setGitWorktreeService(service: GitWorktreeService): void {
     this.gitWorktreeService = service;
@@ -1055,6 +1059,13 @@ export class ProviderDispatchService {
       executionId: finalExecutionId,
       providerExecutionProvenance: provenance,
     };
+
+    // 16b. Record durable provider health observation for trusted execution results
+    try {
+      this.observationService.recordObservation(result);
+    } catch (_err) {
+      // Non-fatal to provider result: observation recording failure must not mutate or invalidate the actual provider execution result
+    }
 
     // 17. Emit PROVIDER_RUNTIME_EXECUTION_RESULT event
     if (this.eventService && runtimeBinding) {

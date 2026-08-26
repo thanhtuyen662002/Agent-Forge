@@ -53,7 +53,8 @@ import {
   HandoffContextStatus,
   FailoverTransition,
   FailoverSuccessorClaimResult,
-  ClaimSuccessorParams
+  ClaimSuccessorParams,
+  ProviderHealthObservation
 } from '../types/domain';
 import {
   computeSha256,
@@ -3572,6 +3573,115 @@ export class Repository {
       status: row.status as HandoffContextStatus,
       created_at: String(row.created_at),
       consumed_at: row.consumed_at ? String(row.consumed_at) : null,
+    };
+  }
+
+  public getProviderHealthObservation(authorizationId: string): ProviderHealthObservation | null {
+    const row = this.db
+      .prepare('SELECT * FROM provider_health_observations WHERE authorization_id = ?')
+      .get(authorizationId) as Record<string, unknown> | undefined;
+    if (!row) return null;
+    return this.mapProviderHealthObservation(row);
+  }
+
+  public getProviderHealthObservationsForAccount(accountId: string, limit: number = 100): ProviderHealthObservation[] {
+    const rows = this.db
+      .prepare('SELECT * FROM provider_health_observations WHERE account_id = ? ORDER BY observed_at DESC, rowid DESC LIMIT ?')
+      .all(accountId, limit) as Record<string, unknown>[];
+    return rows.map((r) => this.mapProviderHealthObservation(r));
+  }
+
+  public claimProviderHealthObservation(observation: ProviderHealthObservation): 'RECORDED' | 'ALREADY_RECORDED' {
+    return this.runInImmediateTransaction(() => {
+      const existingRow = this.db
+        .prepare('SELECT * FROM provider_health_observations WHERE authorization_id = ?')
+        .get(observation.authorization_id) as Record<string, unknown> | undefined;
+
+      if (existingRow) {
+        const existing = this.mapProviderHealthObservation(existingRow);
+        const isIdentical =
+          existing.execution_id === observation.execution_id &&
+          existing.account_id === observation.account_id &&
+          existing.provider_id === observation.provider_id &&
+          existing.resource_id === observation.resource_id &&
+          existing.assignment_id === observation.assignment_id &&
+          existing.attempt_id === observation.attempt_id &&
+          existing.routing_decision_id === observation.routing_decision_id &&
+          existing.provenance_version === observation.provenance_version &&
+          existing.provenance_source === observation.provenance_source &&
+          existing.mode === observation.mode &&
+          existing.adapter_invocation === observation.adapter_invocation &&
+          existing.result_status === observation.result_status &&
+          existing.classified_category === observation.classified_category;
+
+        if (isIdentical) {
+          return 'ALREADY_RECORDED';
+        }
+
+        throw new Error(
+          `OBSERVATION_INTEGRITY_MISMATCH: Duplicate observation for authorization "${observation.authorization_id}" with conflicting content.`
+        );
+      }
+
+      this.db
+        .prepare(`
+          INSERT INTO provider_health_observations (
+            authorization_id,
+            execution_id,
+            account_id,
+            provider_id,
+            resource_id,
+            assignment_id,
+            attempt_id,
+            routing_decision_id,
+            provenance_version,
+            provenance_source,
+            mode,
+            adapter_invocation,
+            result_status,
+            classified_category,
+            observed_at
+          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        `)
+        .run(
+          observation.authorization_id,
+          observation.execution_id,
+          observation.account_id,
+          observation.provider_id,
+          observation.resource_id,
+          observation.assignment_id,
+          observation.attempt_id ?? null,
+          observation.routing_decision_id,
+          observation.provenance_version,
+          observation.provenance_source,
+          observation.mode,
+          observation.adapter_invocation,
+          observation.result_status,
+          observation.classified_category,
+          observation.observed_at
+        );
+
+      return 'RECORDED';
+    });
+  }
+
+  private mapProviderHealthObservation(row: Record<string, unknown>): ProviderHealthObservation {
+    return {
+      authorization_id: String(row.authorization_id),
+      execution_id: String(row.execution_id),
+      account_id: String(row.account_id),
+      provider_id: String(row.provider_id),
+      resource_id: String(row.resource_id),
+      assignment_id: String(row.assignment_id),
+      attempt_id: row.attempt_id ? String(row.attempt_id) : null,
+      routing_decision_id: String(row.routing_decision_id),
+      provenance_version: Number(row.provenance_version) as 1,
+      provenance_source: String(row.provenance_source) as 'PROVIDER_DISPATCH_SERVICE',
+      mode: String(row.mode) as 'LEGACY' | 'SCHEDULED',
+      adapter_invocation: String(row.adapter_invocation) as 'RETURNED' | 'THREW',
+      result_status: String(row.result_status),
+      classified_category: String(row.classified_category) as ProviderHealthObservation['classified_category'],
+      observed_at: String(row.observed_at),
     };
   }
 }
