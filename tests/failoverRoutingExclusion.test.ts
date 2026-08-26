@@ -22,6 +22,10 @@ import {
 } from '../src/core/types/domain';
 
 class MockProviderAdapter implements ProviderAdapter {
+  public healthProbeCount = 0;
+  public capabilitiesProbeCount = 0;
+  public quotaProbeCount = 0;
+
   constructor(
     public readonly id: string,
     public readonly name: string,
@@ -39,6 +43,7 @@ class MockProviderAdapter implements ProviderAdapter {
   ) {}
 
   public async getHealth(): Promise<ProviderHealthStatus> {
+    this.healthProbeCount++;
     return this.health;
   }
 
@@ -47,6 +52,7 @@ class MockProviderAdapter implements ProviderAdapter {
   }
 
   public async getCapabilities(): Promise<Capability[]> {
+    this.capabilitiesProbeCount++;
     return this.capabilities;
   }
 
@@ -55,6 +61,7 @@ class MockProviderAdapter implements ProviderAdapter {
   }
 
   public async getQuota(): Promise<QuotaSnapshotInfo> {
+    this.quotaProbeCount++;
     return this.quota;
   }
 
@@ -766,5 +773,154 @@ describe('R5H3 — Routing Exclusion & Audit Contract', () => {
 
     const decision = await roleRouter.routeRole(request);
     expect(decision.requestedConstraints.excludedCandidateIds).toEqual(['acc-openai-1:res-openai-gpt4-1']);
+  });
+
+  it('21. REQUEST PERMUTATION INVARIANCE: equivalent exclusion sets in different orders produce identical canonical constraints', async () => {
+    const decision1 = await roleRouter.routeRole({
+      projectId,
+      taskId,
+      roleProfileId,
+      excludedCandidateIds: ['acc-z:res-z', 'acc-a:res-a', 'acc-m:res-m'],
+      excludedAccountIds: ['acc-z', 'acc-a', 'acc-m'],
+      excludedProviderIds: ['prov-z', 'prov-a', 'prov-m'],
+    });
+
+    const decision2 = await roleRouter.routeRole({
+      projectId,
+      taskId,
+      roleProfileId,
+      excludedCandidateIds: ['acc-a:res-a', 'acc-m:res-m', 'acc-z:res-z'],
+      excludedAccountIds: ['acc-m', 'acc-z', 'acc-a'],
+      excludedProviderIds: ['prov-a', 'prov-m', 'prov-z'],
+    });
+
+    expect(decision1.requestedConstraints.excludedCandidateIds).toEqual(['acc-a:res-a', 'acc-m:res-m', 'acc-z:res-z']);
+    expect(decision1.requestedConstraints.excludedAccountIds).toEqual(['acc-a', 'acc-m', 'acc-z']);
+    expect(decision1.requestedConstraints.excludedProviderIds).toEqual(['prov-a', 'prov-m', 'prov-z']);
+
+    expect(decision1.requestedConstraints).toEqual(decision2.requestedConstraints);
+  });
+
+  it('22. DUPLICATE + ORDER CANONICALIZATION: duplicates collapse and sort canonically', async () => {
+    const decision = await roleRouter.routeRole({
+      projectId,
+      taskId,
+      roleProfileId,
+      excludedAccountIds: ['acc-z', 'acc-a', 'acc-z', 'acc-m', 'acc-a'],
+    });
+
+    expect(decision.requestedConstraints.excludedAccountIds).toEqual(['acc-a', 'acc-m', 'acc-z']);
+  });
+
+  it('23. DURABLE REQUEST PERMUTATION INVARIANCE: durable event contains identical canonical requested constraints regardless of input order', async () => {
+    await roleRouter.routeRole({
+      projectId,
+      taskId,
+      roleProfileId,
+      excludedAccountIds: ['acc-openai-2', 'acc-openai-1'],
+    });
+
+    const events = eventService.getEvents(projectId);
+    const routingEvent = events[events.length - 1];
+    const payload = routingEvent?.structured_payload as any;
+
+    expect(payload.requestedConstraints.excludedAccountIds).toEqual(['acc-openai-1', 'acc-openai-2']);
+  });
+
+  it('24. APPLIED EXCLUSION ORDER INVARIANCE: durable appliedExclusions is deterministically sorted by candidateId ascending regardless of candidate discovery order', async () => {
+    // Run with candidateRefs in order A
+    await roleRouter.routeRole({
+      projectId,
+      taskId,
+      roleProfileId,
+      candidateRefs: [
+        { accountId: 'acc-openai-2', resourceId: 'res-openai-gpt4-2' },
+        { accountId: 'acc-openai-1', resourceId: 'res-openai-gpt4-1' },
+      ],
+      excludedAccountIds: ['acc-openai-1', 'acc-openai-2'],
+    });
+
+    const events1 = eventService.getEvents(projectId);
+    const payload1 = events1[events1.length - 1]?.structured_payload as any;
+
+    // Run with candidateRefs in reversed order B
+    await roleRouter.routeRole({
+      projectId,
+      taskId,
+      roleProfileId,
+      candidateRefs: [
+        { accountId: 'acc-openai-1', resourceId: 'res-openai-gpt4-1' },
+        { accountId: 'acc-openai-2', resourceId: 'res-openai-gpt4-2' },
+      ],
+      excludedAccountIds: ['acc-openai-2', 'acc-openai-1'],
+    });
+
+    const events2 = eventService.getEvents(projectId);
+    const payload2 = events2[events2.length - 1]?.structured_payload as any;
+
+    expect(payload1.appliedExclusions).toBeDefined();
+    expect(payload2.appliedExclusions).toBeDefined();
+    expect(payload1.appliedExclusions).toEqual(payload2.appliedExclusions);
+
+    // Assert candidateId ascending ordering
+    expect(payload1.appliedExclusions[0].candidateId).toBe('acc-openai-1:res-openai-gpt4-1');
+    expect(payload1.appliedExclusions[1].candidateId).toBe('acc-openai-2:res-openai-gpt4-2');
+  });
+
+  it('25. REASON SEMANTIC ORDER: candidate matching candidate/account/provider exclusions preserves exact semantic ordering in both evaluations and applied audit', async () => {
+    const decision = await roleRouter.routeRole({
+      projectId,
+      taskId,
+      roleProfileId,
+      excludedCandidateIds: ['acc-openai-1:res-openai-gpt4-1'],
+      excludedAccountIds: ['acc-openai-1'],
+      excludedProviderIds: ['prov-openai'],
+    });
+
+    const candidateEval = decision.candidateEvaluations.find(
+      (c) => c.candidateId === 'acc-openai-1:res-openai-gpt4-1'
+    );
+    expect(candidateEval?.rejectionReasons).toEqual([
+      'FAILOVER_EXCLUDED_CANDIDATE',
+      'FAILOVER_EXCLUDED_ACCOUNT',
+      'FAILOVER_EXCLUDED_PROVIDER',
+    ]);
+
+    const events = eventService.getEvents(projectId);
+    const payload = events[events.length - 1]?.structured_payload as any;
+    const appliedEntry = payload.appliedExclusions.find(
+      (a: any) => a.candidateId === 'acc-openai-1:res-openai-gpt4-1'
+    );
+    expect(appliedEntry.reasonCodes).toEqual([
+      'FAILOVER_EXCLUDED_CANDIDATE',
+      'FAILOVER_EXCLUDED_ACCOUNT',
+      'FAILOVER_EXCLUDED_PROVIDER',
+    ]);
+  });
+
+  it('26. EXCLUSION PROBE SHORT-CIRCUIT: explicitly excluded candidates bypass live health, quota, and capability probes', async () => {
+    const openAIAdapter = registry.resolve('prov-openai') as MockProviderAdapter;
+    const anthropicAdapter = registry.resolve('prov-anthropic') as MockProviderAdapter;
+    const geminiAdapter = registry.resolve('prov-gemini') as MockProviderAdapter;
+
+    openAIAdapter.healthProbeCount = 0;
+    openAIAdapter.capabilitiesProbeCount = 0;
+    openAIAdapter.quotaProbeCount = 0;
+
+    // Exclude OpenAI provider completely
+    await roleRouter.routeRole({
+      projectId,
+      taskId,
+      roleProfileId,
+      excludedProviderIds: ['prov-openai'],
+    });
+
+    // OpenAI adapter must have zero probe calls because its candidates were short-circuited before live probing
+    expect(openAIAdapter.healthProbeCount).toBe(0);
+    expect(openAIAdapter.capabilitiesProbeCount).toBe(0);
+    expect(openAIAdapter.quotaProbeCount).toBe(0);
+
+    // Eligible winner (Anthropic) should have been probed
+    expect(anthropicAdapter.healthProbeCount).toBeGreaterThan(0);
   });
 });

@@ -154,7 +154,12 @@ export class RoleAwareRoutingService {
       }
       unique.add(item);
     }
-    return Array.from(unique);
+    const compareCanonicalId = (a: string, b: string): number => {
+      if (a < b) return -1;
+      if (a > b) return 1;
+      return 0;
+    };
+    return Array.from(unique).sort(compareCanonicalId);
   }
 
   /**
@@ -1101,6 +1106,22 @@ export class RoleAwareRoutingService {
           });
         }
       }
+
+      const compareCanonicalEntry = (
+        a: AppliedExclusionAuditEntry,
+        b: AppliedExclusionAuditEntry
+      ): number => {
+        if (a.candidateId < b.candidateId) return -1;
+        if (a.candidateId > b.candidateId) return 1;
+        if (a.accountId < b.accountId) return -1;
+        if (a.accountId > b.accountId) return 1;
+        if (a.providerId < b.providerId) return -1;
+        if (a.providerId > b.providerId) return 1;
+        if (a.resourceId < b.resourceId) return -1;
+        if (a.resourceId > b.resourceId) return 1;
+        return 0;
+      };
+      appliedExclusions.sort(compareCanonicalEntry);
 
       this.eventService.record(
         request.projectId,
