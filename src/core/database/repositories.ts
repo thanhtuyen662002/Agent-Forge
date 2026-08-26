@@ -1990,7 +1990,7 @@ export class Repository {
 
   public updateProviderAccount(
     id: string,
-    updates: Partial<Pick<ProviderAccount, 'label' | 'auth_mode' | 'credential_ref' | 'profile_ref' | 'enabled' | 'priority' | 'health_status' | 'cooldown_until' | 'concurrency_limit' | 'last_success_at' | 'last_failure_at' | 'last_failure_code'>>
+    updates: Partial<Pick<ProviderAccount, 'label' | 'auth_mode' | 'credential_ref' | 'profile_ref' | 'enabled' | 'priority' | 'concurrency_limit'>>
   ): void {
     const existing = this.getProviderAccount(id);
     if (!existing) return;
@@ -2064,12 +2064,7 @@ export class Repository {
             profile_ref = ?,
             enabled = ?,
             priority = ?,
-            health_status = ?,
-            cooldown_until = ?,
             concurrency_limit = ?,
-            last_success_at = ?,
-            last_failure_at = ?,
-            last_failure_code = ?,
             updated_at = ?
         WHERE id = ?
       `)
@@ -2080,12 +2075,7 @@ export class Repository {
         finalProfileRef,
         updates.enabled !== undefined ? (updates.enabled ? 1 : 0) : (existing.enabled ? 1 : 0),
         updates.priority !== undefined ? updates.priority : existing.priority,
-        updates.health_status ?? existing.health_status,
-        updates.cooldown_until !== undefined ? updates.cooldown_until : existing.cooldown_until,
         updates.concurrency_limit !== undefined ? updates.concurrency_limit : existing.concurrency_limit,
-        updates.last_success_at !== undefined ? updates.last_success_at : existing.last_success_at,
-        updates.last_failure_at !== undefined ? updates.last_failure_at : existing.last_failure_at,
-        updates.last_failure_code !== undefined ? updates.last_failure_code : existing.last_failure_code,
         new Date().toISOString(),
         id
       );
