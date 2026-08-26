@@ -54,8 +54,11 @@ import {
   FailoverTransition,
   FailoverSuccessorClaimResult,
   ClaimSuccessorParams,
-  ProviderHealthObservation
+  ProviderHealthObservation,
+  ProviderHealthObservationCategory
 } from '../types/domain';
+import type { ProviderDispatchExecutionResult } from '../services/ProviderDispatchService';
+import { ExecutionFailureClassifier } from '../services/ExecutionFailureClassifier';
 import {
   computeSha256,
   canonicalJsonStringify,
@@ -3591,7 +3594,10 @@ export class Repository {
     return rows.map((r) => this.mapProviderHealthObservation(r));
   }
 
-  public claimProviderHealthObservation(observation: ProviderHealthObservation): 'RECORDED' | 'ALREADY_RECORDED' {
+  public claimProviderHealthObservation(
+    observation: ProviderHealthObservation,
+    providerResult?: ProviderDispatchExecutionResult
+  ): 'RECORDED' | 'ALREADY_RECORDED' {
     return this.runInImmediateTransaction(() => {
       // 1. Runtime shape validation
       if (
@@ -3680,7 +3686,120 @@ export class Repository {
         );
       }
 
-      // 5. ExecutionAuthorization lookup + validation
+      // 5. Provider result evidence verification & Category Authenticity
+      if (!providerResult || typeof providerResult !== 'object') {
+        throw new Error('PROVIDER_RESULT_REQUIRED: ProviderDispatchExecutionResult evidence is required for new observation claim.');
+      }
+
+      const prov = providerResult.providerExecutionProvenance;
+      if (!prov || typeof prov !== 'object') {
+        throw new Error('PROVENANCE_MISSING: Result has no provider execution provenance.');
+      }
+
+      if (prov.version !== 1) {
+        throw new Error(`MALFORMED_PROVENANCE_VERSION: Unsupported provenance version ${prov.version}.`);
+      }
+
+      if (prov.source !== 'PROVIDER_DISPATCH_SERVICE') {
+        throw new Error(`MALFORMED_PROVENANCE_SOURCE: Invalid provenance source "${prov.source}".`);
+      }
+
+      if (prov.executionId !== observation.execution_id || providerResult.executionId !== observation.execution_id) {
+        throw new Error(
+          `EXECUTION_ID_MISMATCH: Result/Provenance executionId ("${providerResult.executionId}" / "${prov.executionId}") does not match observation execution_id "${observation.execution_id}".`
+        );
+      }
+
+      if (prov.authorizationId !== observation.authorization_id) {
+        throw new Error(
+          `AUTHORIZATION_ID_MISMATCH: Provenance authorizationId "${prov.authorizationId}" does not match observation authorization_id "${observation.authorization_id}".`
+        );
+      }
+
+      if (prov.accountId !== observation.account_id) {
+        throw new Error(
+          `ACCOUNT_ID_MISMATCH: Provenance accountId "${prov.accountId}" does not match observation account_id "${observation.account_id}".`
+        );
+      }
+
+      if (prov.providerId !== observation.provider_id) {
+        throw new Error(
+          `PROVIDER_ID_MISMATCH: Provenance providerId "${prov.providerId}" does not match observation provider_id "${observation.provider_id}".`
+        );
+      }
+
+      if (prov.resourceId !== observation.resource_id) {
+        throw new Error(
+          `RESOURCE_ID_MISMATCH: Provenance resourceId "${prov.resourceId}" does not match observation resource_id "${observation.resource_id}".`
+        );
+      }
+
+      if (prov.assignmentId !== observation.assignment_id) {
+        throw new Error(
+          `ASSIGNMENT_ID_MISMATCH: Provenance assignmentId "${prov.assignmentId}" does not match observation assignment_id "${observation.assignment_id}".`
+        );
+      }
+
+      if ((prov.attemptId ?? null) !== (observation.attempt_id ?? null)) {
+        throw new Error(
+          `ATTEMPT_ID_MISMATCH: Provenance attemptId "${prov.attemptId}" does not match observation attempt_id "${observation.attempt_id}".`
+        );
+      }
+
+      if (prov.routingDecisionId !== observation.routing_decision_id) {
+        throw new Error(
+          `ROUTING_DECISION_ID_MISMATCH: Provenance routingDecisionId "${prov.routingDecisionId}" does not match observation routing_decision_id "${observation.routing_decision_id}".`
+        );
+      }
+
+      if (prov.mode !== observation.mode) {
+        throw new Error(
+          `MODE_MISMATCH: Provenance mode "${prov.mode}" does not match observation mode "${observation.mode}".`
+        );
+      }
+
+      if (prov.adapterInvocation !== observation.adapter_invocation) {
+        throw new Error(
+          `ADAPTER_INVOCATION_MISMATCH: Provenance adapterInvocation "${prov.adapterInvocation}" does not match observation adapter_invocation "${observation.adapter_invocation}".`
+        );
+      }
+
+      // Independent category & result status derivation
+      let expectedCategory: ProviderHealthObservationCategory;
+      let expectedResultStatus: string;
+
+      if (prov.adapterInvocation === 'THREW') {
+        expectedCategory = 'ADAPTER_THROW';
+        expectedResultStatus = 'FAILED';
+      } else if (providerResult.status === 'COMPLETED') {
+        expectedCategory = 'SUCCESS';
+        expectedResultStatus = 'COMPLETED';
+      } else if (providerResult.status === 'AWAITING_OWNER') {
+        expectedCategory = 'AWAITING_OWNER';
+        expectedResultStatus = 'AWAITING_OWNER';
+      } else if (providerResult.status === 'CANCELLED') {
+        const classification = ExecutionFailureClassifier.classify(providerResult);
+        expectedCategory = classification.category;
+        expectedResultStatus = 'CANCELLED';
+      } else {
+        const classification = ExecutionFailureClassifier.classify(providerResult);
+        expectedCategory = classification.category;
+        expectedResultStatus = 'FAILED';
+      }
+
+      if (observation.result_status !== expectedResultStatus) {
+        throw new Error(
+          `OBSERVATION_RESULT_STATUS_MISMATCH: Observation result_status "${observation.result_status}" does not match expected result_status "${expectedResultStatus}".`
+        );
+      }
+
+      if (observation.classified_category !== expectedCategory) {
+        throw new Error(
+          `OBSERVATION_CATEGORY_MISMATCH: Observation classified_category "${observation.classified_category}" does not match canonical derived category "${expectedCategory}".`
+        );
+      }
+
+      // 6. ExecutionAuthorization lookup + validation
       const auth = this.getExecutionAuthorization(observation.authorization_id);
       if (!auth) {
         throw new Error(`AUTHORIZATION_NOT_FOUND: ExecutionAuthorization "${observation.authorization_id}" not found.`);
@@ -3716,7 +3835,7 @@ export class Repository {
         );
       }
 
-      // 6. AgentAssignment lookup + validation
+      // 7. AgentAssignment lookup + validation
       const assignment = this.getAgentAssignment(observation.assignment_id);
       if (!assignment) {
         throw new Error(`ASSIGNMENT_NOT_FOUND: AgentAssignment "${observation.assignment_id}" not found.`);
@@ -3764,7 +3883,7 @@ export class Repository {
         );
       }
 
-      // 7. TaskAttempt coherence when attempt_id non-null
+      // 8. TaskAttempt coherence when attempt_id non-null
       if (observation.attempt_id != null) {
         const attempt = this.getTaskAttempt(observation.attempt_id);
         if (!attempt) {
@@ -3777,7 +3896,7 @@ export class Repository {
         }
       }
 
-      // 8. ProviderAccount coherence
+      // 9. ProviderAccount coherence
       const account = this.getProviderAccount(observation.account_id);
       if (!account) {
         throw new Error(`PROVIDER_ACCOUNT_NOT_FOUND: ProviderAccount "${observation.account_id}" not found.`);
@@ -3788,13 +3907,13 @@ export class Repository {
         );
       }
 
-      // 9. Provider coherence
+      // 10. Provider coherence
       const provider = this.getProvider(observation.provider_id);
       if (!provider) {
         throw new Error(`PROVIDER_NOT_FOUND: Provider "${observation.provider_id}" not found.`);
       }
 
-      // 10. ProviderResource coherence
+      // 11. ProviderResource coherence
       const resource = this.getProviderResource(observation.resource_id);
       if (!resource) {
         throw new Error(`PROVIDER_RESOURCE_NOT_FOUND: ProviderResource "${observation.resource_id}" not found.`);
@@ -3810,7 +3929,7 @@ export class Repository {
         );
       }
 
-      // 11. Insert row
+      // 12. Insert row
       this.db
         .prepare(`
           INSERT INTO provider_health_observations (
