@@ -2184,7 +2184,7 @@ describe('R5H4 Durable Provider Health Observation Contract', () => {
       adapterInvocation: 'RETURNED',
     });
 
-    expect(() => repo.claimProviderHealthObservation(obs, result)).toThrow(/OBSERVATION_RESULT_STATUS_MISMATCH/);
+    expect(() => repo.claimProviderHealthObservation(obs, result)).toThrow(/RESULT_STATUS_MISMATCH/);
     expect(repo.getProviderHealthObservation(hierarchy.authId)).toBeNull();
   });
 
@@ -2564,7 +2564,7 @@ describe('R5H4 Durable Provider Health Observation Contract', () => {
       adapterInvocation: 'RETURNED',
     });
 
-    expect(() => repo.claimProviderHealthObservation(obs, result)).toThrow(/OBSERVATION_RESULT_STATUS_MISMATCH/);
+    expect(() => repo.claimProviderHealthObservation(obs, result)).toThrow(/RESULT_STATUS_MISMATCH/);
     expect(repo.getProviderHealthObservation(hierarchy.authId)).toBeNull();
   });
 
@@ -2605,5 +2605,123 @@ describe('R5H4 Durable Provider Health Observation Contract', () => {
 
     expect(() => repo.claimProviderHealthObservation(obs)).toThrow(/PROVIDER_RESULT_REQUIRED/);
     expect(repo.getProviderHealthObservation(hierarchy.authId)).toBeNull();
+  });
+
+  // 95. Required Test — THREW + COMPLETED rejection
+  it('95. THREW + COMPLETED rejection fails closed with zero rows persisted', () => {
+    const hierarchy = createHierarchy(repo, repoDir, baseSha);
+    const obs = buildValidObservation(hierarchy, {
+      adapter_invocation: 'THREW',
+      result_status: 'FAILED',
+      classified_category: 'ADAPTER_THROW',
+    });
+    const result = buildTrustedResult(hierarchy, {
+      executionId: obs.execution_id,
+      status: 'COMPLETED',
+      adapterInvocation: 'THREW',
+    });
+
+    expect(() => repo.claimProviderHealthObservation(obs, result)).toThrow(/PROVIDER_RESULT_STATUS_MISMATCH/);
+    expect(repo.getProviderHealthObservation(hierarchy.authId)).toBeNull();
+    const count = (db.prepare('SELECT COUNT(*) as count FROM provider_health_observations WHERE authorization_id = ?').get(hierarchy.authId) as any).count;
+    expect(count).toBe(0);
+  });
+
+  // 96. Required Test — THREW + CANCELLED rejection
+  it('96. THREW + CANCELLED rejection fails closed with zero rows persisted', () => {
+    const hierarchy = createHierarchy(repo, repoDir, baseSha);
+    const obs = buildValidObservation(hierarchy, {
+      adapter_invocation: 'THREW',
+      result_status: 'FAILED',
+      classified_category: 'ADAPTER_THROW',
+    });
+    const result = buildTrustedResult(hierarchy, {
+      executionId: obs.execution_id,
+      status: 'CANCELLED',
+      errorCode: 'CANCELLED',
+      adapterInvocation: 'THREW',
+    });
+
+    expect(() => repo.claimProviderHealthObservation(obs, result)).toThrow(/PROVIDER_RESULT_STATUS_MISMATCH/);
+    expect(repo.getProviderHealthObservation(hierarchy.authId)).toBeNull();
+    const count = (db.prepare('SELECT COUNT(*) as count FROM provider_health_observations WHERE authorization_id = ?').get(hierarchy.authId) as any).count;
+    expect(count).toBe(0);
+  });
+
+  // 97. Required Test — THREW + AWAITING_OWNER rejection
+  it('97. THREW + AWAITING_OWNER rejection fails closed with zero rows persisted', () => {
+    const hierarchy = createHierarchy(repo, repoDir, baseSha);
+    const obs = buildValidObservation(hierarchy, {
+      adapter_invocation: 'THREW',
+      result_status: 'FAILED',
+      classified_category: 'ADAPTER_THROW',
+    });
+    const result = buildTrustedResult(hierarchy, {
+      executionId: obs.execution_id,
+      status: 'AWAITING_OWNER',
+      adapterInvocation: 'THREW',
+    });
+
+    expect(() => repo.claimProviderHealthObservation(obs, result)).toThrow(/PROVIDER_RESULT_STATUS_MISMATCH/);
+    expect(repo.getProviderHealthObservation(hierarchy.authId)).toBeNull();
+    const count = (db.prepare('SELECT COUNT(*) as count FROM provider_health_observations WHERE authorization_id = ?').get(hierarchy.authId) as any).count;
+    expect(count).toBe(0);
+  });
+
+  // 98. Required Test — FORGED RUNTIME STATUS rejection
+  it('98. FORGED RUNTIME STATUS rejection fails closed with zero rows persisted', () => {
+    const hierarchy = createHierarchy(repo, repoDir, baseSha);
+    const obs = buildValidObservation(hierarchy, {
+      result_status: 'FAILED',
+      classified_category: 'UNKNOWN',
+    });
+    const result = buildTrustedResult(hierarchy, {
+      executionId: obs.execution_id,
+      status: 'FORGED_STATUS' as any,
+      adapterInvocation: 'RETURNED',
+    });
+
+    expect(() => repo.claimProviderHealthObservation(obs, result)).toThrow(/INVALID_PROVIDER_RESULT_STATUS/);
+    expect(repo.getProviderHealthObservation(hierarchy.authId)).toBeNull();
+    const count = (db.prepare('SELECT COUNT(*) as count FROM provider_health_observations WHERE authorization_id = ?').get(hierarchy.authId) as any).count;
+    expect(count).toBe(0);
+  });
+
+  // 99. Required Test — UNDEFINED STATUS rejection
+  it('99. UNDEFINED STATUS rejection fails closed with zero rows persisted', () => {
+    const hierarchy = createHierarchy(repo, repoDir, baseSha);
+    const obs = buildValidObservation(hierarchy, {
+      result_status: 'FAILED',
+      classified_category: 'UNKNOWN',
+    });
+    const result = buildTrustedResult(hierarchy, {
+      executionId: obs.execution_id,
+      adapterInvocation: 'RETURNED',
+    });
+    (result as any).status = undefined;
+
+    expect(() => repo.claimProviderHealthObservation(obs, result)).toThrow(/INVALID_PROVIDER_RESULT_STATUS/);
+    expect(repo.getProviderHealthObservation(hierarchy.authId)).toBeNull();
+    const count = (db.prepare('SELECT COUNT(*) as count FROM provider_health_observations WHERE authorization_id = ?').get(hierarchy.authId) as any).count;
+    expect(count).toBe(0);
+  });
+
+  // 100. Required Test — NULL STATUS rejection
+  it('100. NULL STATUS rejection fails closed with zero rows persisted', () => {
+    const hierarchy = createHierarchy(repo, repoDir, baseSha);
+    const obs = buildValidObservation(hierarchy, {
+      result_status: 'FAILED',
+      classified_category: 'UNKNOWN',
+    });
+    const result = buildTrustedResult(hierarchy, {
+      executionId: obs.execution_id,
+      adapterInvocation: 'RETURNED',
+    });
+    (result as any).status = null;
+
+    expect(() => repo.claimProviderHealthObservation(obs, result)).toThrow(/INVALID_PROVIDER_RESULT_STATUS/);
+    expect(repo.getProviderHealthObservation(hierarchy.authId)).toBeNull();
+    const count = (db.prepare('SELECT COUNT(*) as count FROM provider_health_observations WHERE authorization_id = ?').get(hierarchy.authId) as any).count;
+    expect(count).toBe(0);
   });
 });
