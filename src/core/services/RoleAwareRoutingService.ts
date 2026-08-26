@@ -12,11 +12,13 @@ import {
   RoutePolicy,
   SeparationAffinity,
   QuotaSource,
+  FailoverPolicyAuthoritySnapshotV1,
 } from '../types/domain';
 import { Repository } from '../database/repositories';
 import { ProviderRegistry } from '../adapters/ProviderRegistry';
 import { EventService } from './EventService';
 import { QuotaSnapshotInfo } from '../adapters/ProviderAdapter';
+import { FailoverPolicyParser } from './FailoverPolicyParser';
 
 export interface CandidateAccountResourceRef {
   accountId: string;
@@ -115,6 +117,7 @@ export interface RoleAwareRoutingDecision {
   role: FabricRole;
   agentProfileId: string | null;
   routePolicyId: string | null;
+  failoverPolicyAuthoritySnapshot: FailoverPolicyAuthoritySnapshotV1;
   outcome: RoleAwareRoutingOutcome;
   selectedResourceId: string | null;
   selectedAccountId: string | null;
@@ -315,6 +318,26 @@ export class RoleAwareRoutingService {
           createdAt
         );
       }
+    }
+
+    const parsedPolicy = FailoverPolicyParser.parse(routePolicy?.failover_policy ?? null);
+    let failoverPolicyAuthoritySnapshot: FailoverPolicyAuthoritySnapshotV1;
+    if (parsedPolicy.status === 'VALID') {
+      failoverPolicyAuthoritySnapshot = {
+        version: 1,
+        status: 'VALID',
+        policy: parsedPolicy.policy,
+      };
+    } else if (parsedPolicy.status === 'ABSENT') {
+      failoverPolicyAuthoritySnapshot = {
+        version: 1,
+        status: 'ABSENT',
+      };
+    } else {
+      failoverPolicyAuthoritySnapshot = {
+        version: 1,
+        status: 'INVALID',
+      };
     }
 
     let separationPolicy: SeparationPolicy | null = null;
@@ -673,6 +696,7 @@ export class RoleAwareRoutingService {
           role: roleProfile.role,
           agentProfileId: request.agentProfileId ?? null,
           routePolicyId: routePolicy ? routePolicy.id : null,
+          failoverPolicyAuthoritySnapshot,
           outcome: 'NEEDS_OWNER',
           selectedResourceId: null,
           selectedAccountId: null,
@@ -874,7 +898,8 @@ export class RoleAwareRoutingService {
         requestedConstraints,
         appliedSeparation,
         createdAt,
-        candidateEvaluations
+        candidateEvaluations,
+        failoverPolicyAuthoritySnapshot
       );
     }
 
@@ -923,6 +948,7 @@ export class RoleAwareRoutingService {
       role: roleProfile.role,
       agentProfileId: request.agentProfileId ?? null,
       routePolicyId: routePolicy ? routePolicy.id : null,
+      failoverPolicyAuthoritySnapshot,
       outcome: winner.tier === 3 ? 'MANUAL_HANDOFF_REQUIRED' : 'SELECTED',
       selectedResourceId: winner.resourceId,
       selectedAccountId: winner.accountId,
@@ -1027,9 +1053,27 @@ export class RoleAwareRoutingService {
     requestedConstraints: RequestedRoutingConstraintsAudit,
     appliedSeparation: AppliedSeparationAudit | null,
     createdAt: string,
-    candidateEvaluations: RoleAwareCandidateEvaluation[] = []
+    candidateEvaluations: RoleAwareCandidateEvaluation[] = [],
+    failoverPolicyAuthoritySnapshot?: FailoverPolicyAuthoritySnapshotV1
   ): RoleAwareRoutingDecision {
     const roleProfile = this.repo.getRoleProfile(request.roleProfileId);
+    let resolvedSnapshot = failoverPolicyAuthoritySnapshot;
+    if (!resolvedSnapshot) {
+      if (request.routePolicyId) {
+        const pol = this.repo.getRoutePolicy(request.routePolicyId);
+        const parsed = FailoverPolicyParser.parse(pol?.failover_policy ?? null);
+        if (parsed.status === 'VALID') {
+          resolvedSnapshot = { version: 1, status: 'VALID', policy: parsed.policy };
+        } else if (parsed.status === 'ABSENT') {
+          resolvedSnapshot = { version: 1, status: 'ABSENT' };
+        } else {
+          resolvedSnapshot = { version: 1, status: 'INVALID' };
+        }
+      } else {
+        resolvedSnapshot = { version: 1, status: 'ABSENT' };
+      }
+    }
+
     const decision: RoleAwareRoutingDecision = {
       decisionId,
       projectId: request.projectId,
@@ -1039,6 +1083,7 @@ export class RoleAwareRoutingService {
       role: roleProfile ? roleProfile.role : ('CODER' as FabricRole),
       agentProfileId: request.agentProfileId ?? null,
       routePolicyId: request.routePolicyId ?? null,
+      failoverPolicyAuthoritySnapshot: resolvedSnapshot,
       outcome,
       selectedResourceId: null,
       selectedAccountId: null,
@@ -1132,6 +1177,8 @@ export class RoleAwareRoutingService {
           roleProfileId: decision.roleProfileId,
           role: decision.role,
           outcome: decision.outcome,
+          routePolicyId: decision.routePolicyId,
+          failoverPolicyAuthoritySnapshot: decision.failoverPolicyAuthoritySnapshot,
           selectedProviderId: decision.selectedProviderId,
           selectedAccountId: decision.selectedAccountId,
           selectedResourceId: decision.selectedResourceId,

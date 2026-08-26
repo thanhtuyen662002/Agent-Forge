@@ -1013,6 +1013,28 @@ export type ProviderHealthObservationCategory =
   | 'OUTPUT_LIMIT_EXCEEDED'
   | 'UNKNOWN';
 
+export type FailoverPolicyAuthoritySnapshotV1 =
+  | {
+      version: 1;
+      status: 'VALID';
+      policy: FailoverPolicyV1;
+    }
+  | {
+      version: 1;
+      status: 'ABSENT';
+    }
+  | {
+      version: 1;
+      status: 'INVALID';
+    };
+
+export type ProviderAccountHealthAction =
+  | 'NO_MUTATION'
+  | 'RECORD_SUCCESS'
+  | 'RECORD_RATE_LIMITED'
+  | 'RECORD_QUOTA_EXHAUSTED'
+  | 'RECORD_AUTH_ERROR';
+
 export interface ProviderHealthObservation {
   authorization_id: string;
   execution_id: string;
@@ -1030,10 +1052,16 @@ export interface ProviderHealthObservation {
   classified_category: ProviderHealthObservationCategory;
   observed_at: string;
   account_order?: number | null;
+  health_action_plan_version?: 1 | null;
+  health_action?: ProviderAccountHealthAction | null;
+  health_action_cooldown_duration_ms?: number | null;
 }
 
 export interface ProviderHealthObservationRecord extends ProviderHealthObservation {
   account_order: number | null;
+  health_action_plan_version: 1 | null;
+  health_action: ProviderAccountHealthAction | null;
+  health_action_cooldown_duration_ms: number | null;
 }
 
 export type ProviderHealthObservationIngestStatus =

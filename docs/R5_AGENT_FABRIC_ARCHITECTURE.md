@@ -296,3 +296,27 @@ The R5 planning sequence is governed by the authoritative R5-v1.1 roadmap:
   - No live manual health override exists in the shipped runtime.
   - Future manual/admin health features require a separate durable precedence contract.
   - Future automatic observation application must extend this single write authority model with durable `account_order` CAS / idempotency.
+
+---
+
+## 11. R5H Durable Provider Health Action Plan Authority & Frozen Routing Policy Snapshot
+
+### 1. Authoritative Lifecycle Points & Durability
+- **Policy Freeze Point**: `ROUTING_DECISION`. When `RoleAwareRoutingService` evaluates candidates, it parses and canonicalizes the `RoutePolicy`'s failover policy via `FailoverPolicyParser.parse()` into an immutable `FailoverPolicyAuthoritySnapshotV1` (`VALID`, `ABSENT`, or `INVALID`).
+- **Policy Snapshot Authority**: `DURABLE_ROUTING_DECISION_EVENT`. The canonical snapshot is persisted directly in the `ROLE_AWARE_ROUTING_DECISION` structured event payload alongside `routePolicyId`.
+- **Execution Binding Authority**: `ExecutionAuthorization.routing_decision_id`. Execution authorizations link immutably to the routing decision without replicating redundant mutable policy blobs.
+- **Final Action Derivation Authority**: `Repository.claimProviderHealthObservation`. When an observation is claimed, the repository reconstructs the policy result from the durable routing event snapshot, passes it with the authentic `ProviderDispatchExecutionResult` to `FailureHealthMutationPolicyService.evaluate()`, and persists the resulting bounded `ProviderAccountHealthActionPlan` atomically into `provider_health_observations`.
+- **Final Action Policy Engine**: `FailureHealthMutationPolicyService`. Pure, deterministic mapping of execution outcome and frozen policy snapshot to bounded health action plans.
+
+### 2. Immutability & Replay Independence
+- **Post-Routing Policy Mutation**: Any subsequent mutation to `RoutePolicy` (e.g. changing or removing `cooldown_duration_ms`) has zero effect on the historical snapshot captured at routing time.
+- **Replay Independence**: Once persisted in `provider_health_observations` (`health_action_plan_version`, `health_action`, `health_action_cooldown_duration_ms`), future health state application requires neither the original raw `ProviderDispatchExecutionResult` nor current/historical policy evaluation.
+- **Rate-Limit Distinguishability**: Durable action plans clearly distinguish `RECORD_RATE_LIMITED` (with explicit snapshotted `cooldown_duration_ms`) from `NO_MUTATION` (when cooldown is missing/disabled), resolving all rate-limit ambiguity.
+
+### 3. Legacy and Fail-Closed Semantics
+- **Legacy Routing Events**: Old routing events without a policy snapshot record observations normally with `account_order`, but persist `health_action_plan_version = NULL`, `health_action = NULL`, and `health_action_cooldown_duration_ms = NULL`.
+- **NULL Plan vs NO_MUTATION**: A `NULL` action plan signifies missing historical authority (legacy observation) and is never equivalent to `NO_MUTATION`. Newly derived action plans always persist `health_action_plan_version = 1`.
+- **NO_MUTATION Precedence & Watermarks**: `NO_MUTATION` is a valid durable action plan, but it does NOT supersede older unapplied actionable health evidence and must NOT advance the actionable health stale watermark.
+- **Boundaries**:
+  - Temporal cooldown expiration (`cooldown_until`) and temporal anchor selection remain unpersisted and are deferred to a dedicated cooldown replay gate.
+  - No health application CAS or `AccountHealthService` mutation is performed during observation ingestion.

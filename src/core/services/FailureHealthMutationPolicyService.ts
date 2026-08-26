@@ -1,4 +1,4 @@
-import {
+import type {
   ProviderDispatchExecutionResult,
 } from './ProviderDispatchService';
 import {
