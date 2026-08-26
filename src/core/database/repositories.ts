@@ -3764,11 +3764,31 @@ export class Repository {
         );
       }
 
+      // 5b. Provider result status runtime bounding
+      const VALID_PROVIDER_RESULT_STATUSES = new Set(['COMPLETED', 'FAILED', 'CANCELLED', 'AWAITING_OWNER']);
+      if (typeof (providerResult as any).status !== 'string' || !VALID_PROVIDER_RESULT_STATUSES.has(providerResult.status)) {
+        throw new Error(
+          `INVALID_PROVIDER_RESULT_STATUS: Unsupported providerResult.status "${(providerResult as any).status}".`
+        );
+      }
+
+      // 5c. Exact result status equality
+      if (providerResult.status !== observation.result_status) {
+        throw new Error(
+          `PROVIDER_RESULT_STATUS_MISMATCH: providerResult.status "${providerResult.status}" does not match observation.result_status "${observation.result_status}".`
+        );
+      }
+
       // Independent category & result status derivation
       let expectedCategory: ProviderHealthObservationCategory;
       let expectedResultStatus: string;
 
       if (prov.adapterInvocation === 'THREW') {
+        if (providerResult.status !== 'FAILED') {
+          throw new Error(
+            `PROVIDER_RESULT_STATUS_MISMATCH: THREW invocation requires providerResult.status "FAILED", got "${providerResult.status}".`
+          );
+        }
         expectedCategory = 'ADAPTER_THROW';
         expectedResultStatus = 'FAILED';
       } else if (providerResult.status === 'COMPLETED') {
@@ -3781,10 +3801,14 @@ export class Repository {
         const classification = ExecutionFailureClassifier.classify(providerResult);
         expectedCategory = classification.category;
         expectedResultStatus = 'CANCELLED';
-      } else {
+      } else if (providerResult.status === 'FAILED') {
         const classification = ExecutionFailureClassifier.classify(providerResult);
         expectedCategory = classification.category;
         expectedResultStatus = 'FAILED';
+      } else {
+        throw new Error(
+          `INVALID_PROVIDER_RESULT_STATUS: Unsupported providerResult.status "${providerResult.status}".`
+        );
       }
 
       if (observation.result_status !== expectedResultStatus) {
