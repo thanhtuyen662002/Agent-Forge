@@ -1,4 +1,4 @@
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, vi } from 'vitest';
 import * as fs from 'fs';
 import * as path from 'path';
 import {
@@ -9,6 +9,9 @@ import {
   ProviderDispatchExecutionResult,
   ProviderExecutionProvenanceV1,
 } from '../src/core/services/ProviderDispatchService';
+import {
+  ExecutionFailureClassifier,
+} from '../src/core/services/ExecutionFailureClassifier';
 import {
   FailoverPolicyParseResult,
 } from '../src/core/types/domain';
@@ -865,6 +868,110 @@ describe('FailureHealthMutationPolicyService (R5H4)', () => {
 
     for (const term of forbiddenTerms) {
       expect(content).not.toContain(term);
+    }
+  });
+
+  // 38. REQUIRED NEW TEST — INVALID STRING + COMPLETED
+  it('38. returns NO_MUTATION when adapterInvocation is an invalid string and status is COMPLETED', () => {
+    const result: ProviderDispatchExecutionResult = {
+      executionId: 'exec-38',
+      status: 'COMPLETED',
+      providerExecutionProvenance: makeProvenance({
+        executionId: 'exec-38',
+        adapterInvocation: 'INVALID' as any,
+      }),
+    };
+
+    const plan = FailureHealthMutationPolicyService.evaluate({ providerResult: result });
+    expect(plan.action).toBe('NO_MUTATION');
+    expect(plan.accountId).toBeNull();
+    expect(plan.category).toBeNull();
+    expect(plan.cooldownDurationMs).toBeNull();
+    expect(plan.reason).toContain('MALFORMED_PROVENANCE');
+  });
+
+  // 39. REQUIRED NEW TEST — INVALID STRING + AUTH_ERROR
+  it('39. returns NO_MUTATION when adapterInvocation is an invalid string and error is AUTH_ERROR', () => {
+    const result: ProviderDispatchExecutionResult = {
+      executionId: 'exec-39',
+      status: 'FAILED',
+      errorCode: 'AUTH_ERROR',
+      error: 'Invalid API key',
+      providerExecutionProvenance: makeProvenance({
+        executionId: 'exec-39',
+        adapterInvocation: 'INVALID' as any,
+      }),
+    };
+
+    const plan = FailureHealthMutationPolicyService.evaluate({ providerResult: result });
+    expect(plan.action).toBe('NO_MUTATION');
+    expect(plan.accountId).toBeNull();
+    expect(plan.category).toBeNull();
+    expect(plan.cooldownDurationMs).toBeNull();
+    expect(plan.reason).toContain('MALFORMED_PROVENANCE');
+  });
+
+  // 40. REQUIRED NEW TEST — MISSING INVOCATION
+  it('40. returns NO_MUTATION when adapterInvocation is undefined and status is COMPLETED', () => {
+    const result: ProviderDispatchExecutionResult = {
+      executionId: 'exec-40',
+      status: 'COMPLETED',
+      providerExecutionProvenance: makeProvenance({
+        executionId: 'exec-40',
+        adapterInvocation: undefined as any,
+      }),
+    };
+
+    const plan = FailureHealthMutationPolicyService.evaluate({ providerResult: result });
+    expect(plan.action).toBe('NO_MUTATION');
+    expect(plan.accountId).toBeNull();
+    expect(plan.category).toBeNull();
+    expect(plan.cooldownDurationMs).toBeNull();
+    expect(plan.reason).toContain('MALFORMED_PROVENANCE');
+  });
+
+  // 41. REQUIRED NEW TEST — NULL INVOCATION
+  it('41. returns NO_MUTATION when adapterInvocation is null and error is QUOTA_EXHAUSTED', () => {
+    const result: ProviderDispatchExecutionResult = {
+      executionId: 'exec-41',
+      status: 'FAILED',
+      errorCode: 'QUOTA_EXHAUSTED',
+      error: 'Usage limit reached',
+      providerExecutionProvenance: makeProvenance({
+        executionId: 'exec-41',
+        adapterInvocation: null as any,
+      }),
+    };
+
+    const plan = FailureHealthMutationPolicyService.evaluate({ providerResult: result });
+    expect(plan.action).toBe('NO_MUTATION');
+    expect(plan.accountId).toBeNull();
+    expect(plan.category).toBeNull();
+    expect(plan.cooldownDurationMs).toBeNull();
+    expect(plan.reason).toContain('MALFORMED_PROVENANCE');
+  });
+
+  // 42. OPTIONAL CLASSIFIER SPY PROOF
+  it('42. proves ExecutionFailureClassifier.classify is never called for malformed adapterInvocation', () => {
+    const classifySpy = vi.spyOn(ExecutionFailureClassifier, 'classify');
+
+    try {
+      const result: ProviderDispatchExecutionResult = {
+        executionId: 'exec-42',
+        status: 'FAILED',
+        errorCode: 'QUOTA_EXHAUSTED',
+        error: 'Usage limit reached',
+        providerExecutionProvenance: makeProvenance({
+          executionId: 'exec-42',
+          adapterInvocation: 'BOGUS_OUTCOME' as any,
+        }),
+      };
+
+      const plan = FailureHealthMutationPolicyService.evaluate({ providerResult: result });
+      expect(plan.action).toBe('NO_MUTATION');
+      expect(classifySpy).not.toHaveBeenCalled();
+    } finally {
+      classifySpy.mockRestore();
     }
   });
 });
