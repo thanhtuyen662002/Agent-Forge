@@ -1091,6 +1091,7 @@ describe('R5H4 Durable Provider Health Observation Contract', () => {
         classified_category: 'SUCCESS',
         observed_at: new Date().toISOString(),
       };
+      const providerResult = buildTrustedResult(hierarchy, { executionId: obs.execution_id });
 
       // Step 1: db1 acquires write reservation via BEGIN IMMEDIATE
       db1.exec('BEGIN IMMEDIATE');
@@ -1098,7 +1099,7 @@ describe('R5H4 Durable Provider Health Observation Contract', () => {
       // Step 2: while db1 holds write lock, db2 attempts claimProviderHealthObservation (which uses runInImmediateTransaction)
       // With busy_timeout = 0, db2 cannot acquire write lock and must throw SQLITE_BUSY / database locked
       expect(() => {
-        repo2.claimProviderHealthObservation(obs);
+        repo2.claimProviderHealthObservation(obs, providerResult);
       }).toThrow(/database is locked|busy/i);
 
       // Verify no observation was inserted on db2 or db1
@@ -1108,11 +1109,11 @@ describe('R5H4 Durable Provider Health Observation Contract', () => {
       db1.exec('ROLLBACK');
 
       // Step 4: After lock release, perform one claim on db1 -> RECORDED
-      const res1 = repo1.claimProviderHealthObservation(obs);
+      const res1 = repo1.claimProviderHealthObservation(obs, providerResult);
       expect(res1).toBe('RECORDED');
 
       // Step 5: Perform second identical claim on db2 -> ALREADY_RECORDED
-      const res2 = repo2.claimProviderHealthObservation(obs);
+      const res2 = repo2.claimProviderHealthObservation(obs, providerResult);
       expect(res2).toBe('ALREADY_RECORDED');
 
       // Final row count: exactly 1
@@ -1189,6 +1190,7 @@ describe('R5H4 Durable Provider Health Observation Contract', () => {
         classified_category: 'SUCCESS',
         observed_at: new Date().toISOString(),
       };
+      const providerResult = buildTrustedResult(hierarchy, { executionId: obs.execution_id });
 
       // Handle 1 holds BEGIN IMMEDIATE and changes authorization status away from DISPATCHED uncommitted
       db1.exec('BEGIN IMMEDIATE');
@@ -1196,7 +1198,7 @@ describe('R5H4 Durable Provider Health Observation Contract', () => {
 
       // Handle 2 atomic claim cannot proceed while handle 1 holds immediate lock
       expect(() => {
-        repo2.claimProviderHealthObservation(obs);
+        repo2.claimProviderHealthObservation(obs, providerResult);
       }).toThrow(/database is locked|busy/i);
 
       // Handle 1 commits the change
@@ -1204,7 +1206,7 @@ describe('R5H4 Durable Provider Health Observation Contract', () => {
 
       // Now Handle 2 tries, and fails validation because authorization is no longer DISPATCHED
       expect(() => {
-        repo2.claimProviderHealthObservation(obs);
+        repo2.claimProviderHealthObservation(obs, providerResult);
       }).toThrow(/AUTHORIZATION_NOT_DISPATCHED/);
 
       expect(repo2.getProviderHealthObservation(hierarchy.authId)).toBeNull();
@@ -1223,25 +1225,10 @@ describe('R5H4 Durable Provider Health Observation Contract', () => {
     const hierarchy = createHierarchy(repo, repoDir, baseSha);
     db.prepare("UPDATE execution_authorizations SET status = 'AUTHORIZED' WHERE id = ?").run(hierarchy.authId);
 
-    const obs: ProviderHealthObservation = {
-      authorization_id: hierarchy.authId,
-      execution_id: crypto.randomUUID(),
-      account_id: hierarchy.accountId,
-      provider_id: hierarchy.providerId,
-      resource_id: hierarchy.resourceId,
-      assignment_id: hierarchy.assignmentId,
-      attempt_id: hierarchy.attemptId,
-      routing_decision_id: hierarchy.routingDecisionId,
-      provenance_version: 1,
-      provenance_source: 'PROVIDER_DISPATCH_SERVICE',
-      mode: 'SCHEDULED',
-      adapter_invocation: 'RETURNED',
-      result_status: 'COMPLETED',
-      classified_category: 'SUCCESS',
-      observed_at: new Date().toISOString(),
-    };
+    const obs = buildValidObservation(hierarchy);
+    const result = buildTrustedResult(hierarchy, { executionId: obs.execution_id });
 
-    expect(() => repo.claimProviderHealthObservation(obs)).toThrow(/AUTHORIZATION_NOT_DISPATCHED/);
+    expect(() => repo.claimProviderHealthObservation(obs, result)).toThrow(/AUTHORIZATION_NOT_DISPATCHED/);
     expect(repo.getProviderHealthObservation(hierarchy.authId)).toBeNull();
   });
 
@@ -1266,8 +1253,12 @@ describe('R5H4 Durable Provider Health Observation Contract', () => {
       classified_category: 'SUCCESS',
       observed_at: new Date().toISOString(),
     };
+    const result = buildTrustedResult(hierarchy, {
+      executionId: obs.execution_id,
+      provenanceOverrides: { authorizationId: 'non-existent-auth' },
+    });
 
-    expect(() => repo.claimProviderHealthObservation(obs)).toThrow(/AUTHORIZATION_NOT_FOUND/);
+    expect(() => repo.claimProviderHealthObservation(obs, result)).toThrow(/AUTHORIZATION_NOT_FOUND/);
     expect(repo.getProviderHealthObservation('non-existent-auth')).toBeNull();
   });
 
@@ -1292,8 +1283,12 @@ describe('R5H4 Durable Provider Health Observation Contract', () => {
       classified_category: 'SUCCESS',
       observed_at: new Date().toISOString(),
     };
+    const result = buildTrustedResult(hierarchy, {
+      executionId: obs.execution_id,
+      provenanceOverrides: { routingDecisionId: 'other-rd-id' },
+    });
 
-    expect(() => repo.claimProviderHealthObservation(obs)).toThrow(/ROUTING_DECISION_ID_MISMATCH/);
+    expect(() => repo.claimProviderHealthObservation(obs, result)).toThrow(/ROUTING_DECISION_ID_MISMATCH/);
     expect(repo.getProviderHealthObservation(hierarchy.authId)).toBeNull();
   });
 
@@ -1318,8 +1313,12 @@ describe('R5H4 Durable Provider Health Observation Contract', () => {
       classified_category: 'SUCCESS',
       observed_at: new Date().toISOString(),
     };
+    const result = buildTrustedResult(hierarchy, {
+      executionId: obs.execution_id,
+      provenanceOverrides: { providerId: 'other-provider' },
+    });
 
-    expect(() => repo.claimProviderHealthObservation(obs)).toThrow(/PROVIDER_ID_MISMATCH/);
+    expect(() => repo.claimProviderHealthObservation(obs, result)).toThrow(/PROVIDER_ID_MISMATCH/);
     expect(repo.getProviderHealthObservation(hierarchy.authId)).toBeNull();
   });
 
@@ -1344,8 +1343,12 @@ describe('R5H4 Durable Provider Health Observation Contract', () => {
       classified_category: 'SUCCESS',
       observed_at: new Date().toISOString(),
     };
+    const result = buildTrustedResult(hierarchy, {
+      executionId: obs.execution_id,
+      provenanceOverrides: { resourceId: 'other-resource' },
+    });
 
-    expect(() => repo.claimProviderHealthObservation(obs)).toThrow(/RESOURCE_ID_MISMATCH/);
+    expect(() => repo.claimProviderHealthObservation(obs, result)).toThrow(/RESOURCE_ID_MISMATCH/);
     expect(repo.getProviderHealthObservation(hierarchy.authId)).toBeNull();
   });
 
@@ -1370,8 +1373,12 @@ describe('R5H4 Durable Provider Health Observation Contract', () => {
       classified_category: 'SUCCESS',
       observed_at: new Date().toISOString(),
     };
+    const result = buildTrustedResult(hierarchy, {
+      executionId: obs.execution_id,
+      provenanceOverrides: { attemptId: 'other-attempt' },
+    });
 
-    expect(() => repo.claimProviderHealthObservation(obs)).toThrow(/ATTEMPT_ID_MISMATCH/);
+    expect(() => repo.claimProviderHealthObservation(obs, result)).toThrow(/ATTEMPT_ID_MISMATCH/);
     expect(repo.getProviderHealthObservation(hierarchy.authId)).toBeNull();
   });
 
@@ -1396,8 +1403,12 @@ describe('R5H4 Durable Provider Health Observation Contract', () => {
       classified_category: 'SUCCESS',
       observed_at: new Date().toISOString(),
     };
+    const result = buildTrustedResult(hierarchy, {
+      executionId: obs.execution_id,
+      provenanceOverrides: { assignmentId: 'non-existent-assignment' },
+    });
 
-    expect(() => repo.claimProviderHealthObservation(obs)).toThrow(/ASSIGNMENT_NOT_FOUND/);
+    expect(() => repo.claimProviderHealthObservation(obs, result)).toThrow(/ASSIGNMENT_NOT_FOUND/);
     expect(repo.getProviderHealthObservation(hierarchy.authId)).toBeNull();
   });
 
@@ -1460,7 +1471,11 @@ describe('R5H4 Durable Provider Health Observation Contract', () => {
     });
 
     const obs = buildValidObservation(hierarchy, { assignment_id: asgnId });
-    expect(() => repo.claimProviderHealthObservation(obs)).toThrow(/PROJECT_ID_MISMATCH/);
+    const result = buildTrustedResult(hierarchy, {
+      executionId: obs.execution_id,
+      provenanceOverrides: { assignmentId: asgnId },
+    });
+    expect(() => repo.claimProviderHealthObservation(obs, result)).toThrow(/PROJECT_ID_MISMATCH/);
     expect(repo.getProviderHealthObservation(hierarchy.authId)).toBeNull();
   });
 
@@ -1510,7 +1525,11 @@ describe('R5H4 Durable Provider Health Observation Contract', () => {
     });
 
     const obs = buildValidObservation(hierarchy, { assignment_id: asgnId });
-    expect(() => repo.claimProviderHealthObservation(obs)).toThrow(/TASK_ID_MISMATCH/);
+    const result = buildTrustedResult(hierarchy, {
+      executionId: obs.execution_id,
+      provenanceOverrides: { assignmentId: asgnId },
+    });
+    expect(() => repo.claimProviderHealthObservation(obs, result)).toThrow(/TASK_ID_MISMATCH/);
     expect(repo.getProviderHealthObservation(hierarchy.authId)).toBeNull();
   });
 
@@ -1548,7 +1567,11 @@ describe('R5H4 Durable Provider Health Observation Contract', () => {
     });
 
     const obs = buildValidObservation(hierarchy, { assignment_id: asgnId });
-    expect(() => repo.claimProviderHealthObservation(obs)).toThrow(/ATTEMPT_ID_MISMATCH/);
+    const result = buildTrustedResult(hierarchy, {
+      executionId: obs.execution_id,
+      provenanceOverrides: { assignmentId: asgnId },
+    });
+    expect(() => repo.claimProviderHealthObservation(obs, result)).toThrow(/ATTEMPT_ID_MISMATCH/);
     expect(repo.getProviderHealthObservation(hierarchy.authId)).toBeNull();
   });
 
@@ -1576,7 +1599,11 @@ describe('R5H4 Durable Provider Health Observation Contract', () => {
     });
 
     const obs = buildValidObservation(hierarchy, { assignment_id: asgnId });
-    expect(() => repo.claimProviderHealthObservation(obs)).toThrow(/ROUTING_DECISION_ID_MISMATCH/);
+    const result = buildTrustedResult(hierarchy, {
+      executionId: obs.execution_id,
+      provenanceOverrides: { assignmentId: asgnId },
+    });
+    expect(() => repo.claimProviderHealthObservation(obs, result)).toThrow(/ROUTING_DECISION_ID_MISMATCH/);
     expect(repo.getProviderHealthObservation(hierarchy.authId)).toBeNull();
   });
 
@@ -1650,7 +1677,11 @@ describe('R5H4 Durable Provider Health Observation Contract', () => {
     });
 
     const obs = buildValidObservation(hierarchy, { assignment_id: asgnId });
-    expect(() => repo.claimProviderHealthObservation(obs)).toThrow(/ASSIGNMENT_ACCOUNT_ID_MISMATCH/);
+    const result = buildTrustedResult(hierarchy, {
+      executionId: obs.execution_id,
+      provenanceOverrides: { assignmentId: asgnId },
+    });
+    expect(() => repo.claimProviderHealthObservation(obs, result)).toThrow(/ASSIGNMENT_ACCOUNT_ID_MISMATCH/);
     expect(repo.getProviderHealthObservation(hierarchy.authId)).toBeNull();
   });
 
@@ -1731,7 +1762,11 @@ describe('R5H4 Durable Provider Health Observation Contract', () => {
     });
 
     const obs = buildValidObservation(hierarchy, { assignment_id: asgnId });
-    expect(() => repo.claimProviderHealthObservation(obs)).toThrow(/ASSIGNMENT_PROVIDER_ID_MISMATCH/);
+    const result = buildTrustedResult(hierarchy, {
+      executionId: obs.execution_id,
+      provenanceOverrides: { assignmentId: asgnId },
+    });
+    expect(() => repo.claimProviderHealthObservation(obs, result)).toThrow(/ASSIGNMENT_PROVIDER_ID_MISMATCH/);
     expect(repo.getProviderHealthObservation(hierarchy.authId)).toBeNull();
   });
 
@@ -1787,7 +1822,11 @@ describe('R5H4 Durable Provider Health Observation Contract', () => {
     });
 
     const obs = buildValidObservation(hierarchy, { assignment_id: asgnId });
-    expect(() => repo.claimProviderHealthObservation(obs)).toThrow(/ASSIGNMENT_RESOURCE_ID_MISMATCH/);
+    const result = buildTrustedResult(hierarchy, {
+      executionId: obs.execution_id,
+      provenanceOverrides: { assignmentId: asgnId },
+    });
+    expect(() => repo.claimProviderHealthObservation(obs, result)).toThrow(/ASSIGNMENT_RESOURCE_ID_MISMATCH/);
     expect(repo.getProviderHealthObservation(hierarchy.authId)).toBeNull();
   });
 
@@ -1799,7 +1838,8 @@ describe('R5H4 Durable Provider Health Observation Contract', () => {
     db.prepare('PRAGMA foreign_keys = ON').run();
 
     const obs = buildValidObservation(hierarchy);
-    expect(() => repo.claimProviderHealthObservation(obs)).toThrow(/TASK_ATTEMPT_NOT_FOUND/);
+    const result = buildTrustedResult(hierarchy, { executionId: obs.execution_id });
+    expect(() => repo.claimProviderHealthObservation(obs, result)).toThrow(/TASK_ATTEMPT_NOT_FOUND/);
     expect(repo.getProviderHealthObservation(hierarchy.authId)).toBeNull();
   });
 
@@ -1843,7 +1883,11 @@ describe('R5H4 Durable Provider Health Observation Contract', () => {
     db.prepare('UPDATE agent_assignments SET attempt_id = ? WHERE id = ?').run('att-foreign', hierarchy.assignmentId);
 
     const obs = buildValidObservation(hierarchy, { attempt_id: 'att-foreign' });
-    expect(() => repo.claimProviderHealthObservation(obs)).toThrow(/TASK_ATTEMPT_TASK_MISMATCH/);
+    const result = buildTrustedResult(hierarchy, {
+      executionId: obs.execution_id,
+      provenanceOverrides: { attemptId: 'att-foreign' },
+    });
+    expect(() => repo.claimProviderHealthObservation(obs, result)).toThrow(/TASK_ATTEMPT_TASK_MISMATCH/);
     expect(repo.getProviderHealthObservation(hierarchy.authId)).toBeNull();
   });
 
@@ -1855,7 +1899,8 @@ describe('R5H4 Durable Provider Health Observation Contract', () => {
     db.prepare('PRAGMA foreign_keys = ON').run();
 
     const obs = buildValidObservation(hierarchy);
-    expect(() => repo.claimProviderHealthObservation(obs)).toThrow(/PROVIDER_ACCOUNT_NOT_FOUND/);
+    const result = buildTrustedResult(hierarchy, { executionId: obs.execution_id });
+    expect(() => repo.claimProviderHealthObservation(obs, result)).toThrow(/PROVIDER_ACCOUNT_NOT_FOUND/);
     expect(repo.getProviderHealthObservation(hierarchy.authId)).toBeNull();
   });
 
@@ -1873,7 +1918,8 @@ describe('R5H4 Durable Provider Health Observation Contract', () => {
     db.prepare('UPDATE provider_accounts SET provider_id = ? WHERE id = ?').run('prov-foreign', hierarchy.accountId);
 
     const obs = buildValidObservation(hierarchy);
-    expect(() => repo.claimProviderHealthObservation(obs)).toThrow(/ACCOUNT_PROVIDER_MISMATCH/);
+    const result = buildTrustedResult(hierarchy, { executionId: obs.execution_id });
+    expect(() => repo.claimProviderHealthObservation(obs, result)).toThrow(/ACCOUNT_PROVIDER_MISMATCH/);
     expect(repo.getProviderHealthObservation(hierarchy.authId)).toBeNull();
   });
 
@@ -1885,7 +1931,8 @@ describe('R5H4 Durable Provider Health Observation Contract', () => {
     db.prepare('PRAGMA foreign_keys = ON').run();
 
     const obs = buildValidObservation(hierarchy);
-    expect(() => repo.claimProviderHealthObservation(obs)).toThrow(/PROVIDER_NOT_FOUND/);
+    const result = buildTrustedResult(hierarchy, { executionId: obs.execution_id });
+    expect(() => repo.claimProviderHealthObservation(obs, result)).toThrow(/PROVIDER_NOT_FOUND/);
     expect(repo.getProviderHealthObservation(hierarchy.authId)).toBeNull();
   });
 
@@ -1897,7 +1944,8 @@ describe('R5H4 Durable Provider Health Observation Contract', () => {
     db.prepare('PRAGMA foreign_keys = ON').run();
 
     const obs = buildValidObservation(hierarchy);
-    expect(() => repo.claimProviderHealthObservation(obs)).toThrow(/PROVIDER_RESOURCE_NOT_FOUND/);
+    const result = buildTrustedResult(hierarchy, { executionId: obs.execution_id });
+    expect(() => repo.claimProviderHealthObservation(obs, result)).toThrow(/PROVIDER_RESOURCE_NOT_FOUND/);
     expect(repo.getProviderHealthObservation(hierarchy.authId)).toBeNull();
   });
 
@@ -1915,7 +1963,8 @@ describe('R5H4 Durable Provider Health Observation Contract', () => {
     db.prepare('UPDATE provider_resources SET provider_id = ? WHERE id = ?').run('prov-foreign', hierarchy.resourceId);
 
     const obs = buildValidObservation(hierarchy);
-    expect(() => repo.claimProviderHealthObservation(obs)).toThrow(/RESOURCE_PROVIDER_MISMATCH/);
+    const result = buildTrustedResult(hierarchy, { executionId: obs.execution_id });
+    expect(() => repo.claimProviderHealthObservation(obs, result)).toThrow(/RESOURCE_PROVIDER_MISMATCH/);
     expect(repo.getProviderHealthObservation(hierarchy.authId)).toBeNull();
   });
 
@@ -1944,7 +1993,8 @@ describe('R5H4 Durable Provider Health Observation Contract', () => {
     db.prepare('UPDATE provider_resources SET provider_account_id = ? WHERE id = ?').run('acc-foreign', hierarchy.resourceId);
 
     const obs = buildValidObservation(hierarchy);
-    expect(() => repo.claimProviderHealthObservation(obs)).toThrow(/RESOURCE_ACCOUNT_MISMATCH/);
+    const result = buildTrustedResult(hierarchy, { executionId: obs.execution_id });
+    expect(() => repo.claimProviderHealthObservation(obs, result)).toThrow(/RESOURCE_ACCOUNT_MISMATCH/);
     expect(repo.getProviderHealthObservation(hierarchy.authId)).toBeNull();
   });
 
@@ -2084,7 +2134,8 @@ describe('R5H4 Durable Provider Health Observation Contract', () => {
     db.prepare('UPDATE provider_resources SET provider_account_id = NULL WHERE id = ?').run(hierarchy.resourceId);
 
     const obs = buildValidObservation(hierarchy);
-    expect(() => repo.claimProviderHealthObservation(obs)).toThrow(/RESOURCE_ACCOUNT_MISMATCH/);
+    const result = buildTrustedResult(hierarchy, { executionId: obs.execution_id });
+    expect(() => repo.claimProviderHealthObservation(obs, result)).toThrow(/RESOURCE_ACCOUNT_MISMATCH/);
     expect(repo.getProviderHealthObservation(hierarchy.authId)).toBeNull();
   });
 
@@ -2098,6 +2149,461 @@ describe('R5H4 Durable Provider Health Observation Contract', () => {
       service.recordObservation(result);
     }).toThrow(/RESOURCE_ACCOUNT_MISMATCH/);
 
+    expect(repo.getProviderHealthObservation(hierarchy.authId)).toBeNull();
+  });
+
+  // 69. Forgery reject: RETURNED + COMPLETED evidence with AUTHENTICATION_FAILURE category
+  it('69. forgery reject: RETURNED + COMPLETED evidence with AUTHENTICATION_FAILURE category', () => {
+    const hierarchy = createHierarchy(repo, repoDir, baseSha);
+    const obs = buildValidObservation(hierarchy, {
+      result_status: 'COMPLETED',
+      classified_category: 'AUTHENTICATION_FAILURE',
+    });
+    const result = buildTrustedResult(hierarchy, {
+      executionId: obs.execution_id,
+      status: 'COMPLETED',
+      adapterInvocation: 'RETURNED',
+    });
+
+    expect(() => repo.claimProviderHealthObservation(obs, result)).toThrow(/OBSERVATION_CATEGORY_MISMATCH/);
+    expect(repo.getProviderHealthObservation(hierarchy.authId)).toBeNull();
+  });
+
+  // 70. Forgery reject: RETURNED + FAILED AUTH_ERROR evidence with SUCCESS category
+  it('70. forgery reject: RETURNED + FAILED AUTH_ERROR evidence with SUCCESS category', () => {
+    const hierarchy = createHierarchy(repo, repoDir, baseSha);
+    const obs = buildValidObservation(hierarchy, {
+      result_status: 'COMPLETED',
+      classified_category: 'SUCCESS',
+    });
+    const result = buildTrustedResult(hierarchy, {
+      executionId: obs.execution_id,
+      status: 'FAILED',
+      errorCode: 'AUTH_ERROR',
+      error: 'Unauthorized',
+      adapterInvocation: 'RETURNED',
+    });
+
+    expect(() => repo.claimProviderHealthObservation(obs, result)).toThrow(/OBSERVATION_RESULT_STATUS_MISMATCH/);
+    expect(repo.getProviderHealthObservation(hierarchy.authId)).toBeNull();
+  });
+
+  // 71. Forgery reject: RETURNED + COMPLETED evidence with ADAPTER_THROW category
+  it('71. forgery reject: RETURNED + COMPLETED evidence with ADAPTER_THROW category', () => {
+    const hierarchy = createHierarchy(repo, repoDir, baseSha);
+    const obs = buildValidObservation(hierarchy, {
+      result_status: 'COMPLETED',
+      classified_category: 'ADAPTER_THROW',
+    });
+    const result = buildTrustedResult(hierarchy, {
+      executionId: obs.execution_id,
+      status: 'COMPLETED',
+      adapterInvocation: 'RETURNED',
+    });
+
+    expect(() => repo.claimProviderHealthObservation(obs, result)).toThrow(/OBSERVATION_CATEGORY_MISMATCH/);
+    expect(repo.getProviderHealthObservation(hierarchy.authId)).toBeNull();
+  });
+
+  // 72. Forgery reject: THREW + FAILED evidence with RATE_LIMITED category
+  it('72. forgery reject: THREW + FAILED evidence with RATE_LIMITED category', () => {
+    const hierarchy = createHierarchy(repo, repoDir, baseSha);
+    const obs = buildValidObservation(hierarchy, {
+      adapter_invocation: 'THREW',
+      result_status: 'FAILED',
+      classified_category: 'RATE_LIMITED',
+    });
+    const result = buildTrustedResult(hierarchy, {
+      executionId: obs.execution_id,
+      status: 'FAILED',
+      adapterInvocation: 'THREW',
+    });
+
+    expect(() => repo.claimProviderHealthObservation(obs, result)).toThrow(/OBSERVATION_CATEGORY_MISMATCH/);
+    expect(repo.getProviderHealthObservation(hierarchy.authId)).toBeNull();
+  });
+
+  // 73. Forgery reject: RETURNED + AWAITING_OWNER evidence with SUCCESS category
+  it('73. forgery reject: RETURNED + AWAITING_OWNER evidence with SUCCESS category', () => {
+    const hierarchy = createHierarchy(repo, repoDir, baseSha);
+    const obs = buildValidObservation(hierarchy, {
+      result_status: 'AWAITING_OWNER',
+      classified_category: 'SUCCESS',
+    });
+    const result = buildTrustedResult(hierarchy, {
+      executionId: obs.execution_id,
+      status: 'AWAITING_OWNER',
+      adapterInvocation: 'RETURNED',
+    });
+
+    expect(() => repo.claimProviderHealthObservation(obs, result)).toThrow(/OBSERVATION_CATEGORY_MISMATCH/);
+    expect(repo.getProviderHealthObservation(hierarchy.authId)).toBeNull();
+  });
+
+  // 74. Forgery reject: RETURNED + CANCELLED evidence with UNKNOWN category
+  it('74. forgery reject: RETURNED + CANCELLED evidence with UNKNOWN category', () => {
+    const hierarchy = createHierarchy(repo, repoDir, baseSha);
+    const obs = buildValidObservation(hierarchy, {
+      result_status: 'CANCELLED',
+      classified_category: 'UNKNOWN',
+    });
+    const result = buildTrustedResult(hierarchy, {
+      executionId: obs.execution_id,
+      status: 'CANCELLED',
+      errorCode: 'CANCELLED',
+      adapterInvocation: 'RETURNED',
+    });
+
+    expect(() => repo.claimProviderHealthObservation(obs, result)).toThrow(/OBSERVATION_CATEGORY_MISMATCH/);
+    expect(repo.getProviderHealthObservation(hierarchy.authId)).toBeNull();
+  });
+
+  // 75. Forgery reject: RETURNED + FAILED AUTH_ERROR evidence with RATE_LIMITED category
+  it('75. forgery reject: RETURNED + FAILED AUTH_ERROR evidence with RATE_LIMITED category', () => {
+    const hierarchy = createHierarchy(repo, repoDir, baseSha);
+    const obs = buildValidObservation(hierarchy, {
+      result_status: 'FAILED',
+      classified_category: 'RATE_LIMITED',
+    });
+    const result = buildTrustedResult(hierarchy, {
+      executionId: obs.execution_id,
+      status: 'FAILED',
+      errorCode: 'AUTH_ERROR',
+      error: 'Invalid token',
+      adapterInvocation: 'RETURNED',
+    });
+
+    expect(() => repo.claimProviderHealthObservation(obs, result)).toThrow(/OBSERVATION_CATEGORY_MISMATCH/);
+    expect(repo.getProviderHealthObservation(hierarchy.authId)).toBeNull();
+  });
+
+  // 76. Forgery reject: RETURNED + FAILED plain QUOTA_EXHAUSTED evidence with RATE_LIMITED category
+  it('76. forgery reject: RETURNED + FAILED plain QUOTA_EXHAUSTED evidence with RATE_LIMITED category', () => {
+    const hierarchy = createHierarchy(repo, repoDir, baseSha);
+    const obs = buildValidObservation(hierarchy, {
+      result_status: 'FAILED',
+      classified_category: 'RATE_LIMITED',
+    });
+    const result = buildTrustedResult(hierarchy, {
+      executionId: obs.execution_id,
+      status: 'FAILED',
+      errorCode: 'QUOTA_EXHAUSTED',
+      error: 'Monthly quota exhausted',
+      adapterInvocation: 'RETURNED',
+    });
+
+    expect(() => repo.claimProviderHealthObservation(obs, result)).toThrow(/OBSERVATION_CATEGORY_MISMATCH/);
+    expect(repo.getProviderHealthObservation(hierarchy.authId)).toBeNull();
+  });
+
+  // 77. Forgery reject: RETURNED + FAILED rate-limited QUOTA_EXHAUSTED evidence with plain QUOTA_EXHAUSTED category
+  it('77. forgery reject: RETURNED + FAILED rate-limited QUOTA_EXHAUSTED evidence with plain QUOTA_EXHAUSTED category', () => {
+    const hierarchy = createHierarchy(repo, repoDir, baseSha);
+    const obs = buildValidObservation(hierarchy, {
+      result_status: 'FAILED',
+      classified_category: 'QUOTA_EXHAUSTED',
+    });
+    const result = buildTrustedResult(hierarchy, {
+      executionId: obs.execution_id,
+      status: 'FAILED',
+      errorCode: 'QUOTA_EXHAUSTED',
+      error: '429 rate limit exceeded',
+      adapterInvocation: 'RETURNED',
+    });
+
+    expect(() => repo.claimProviderHealthObservation(obs, result)).toThrow(/OBSERVATION_CATEGORY_MISMATCH/);
+    expect(repo.getProviderHealthObservation(hierarchy.authId)).toBeNull();
+  });
+
+  // 78. Canonical accept: RETURNED + COMPLETED + SUCCESS
+  it('78. canonical accept: RETURNED + COMPLETED + SUCCESS', () => {
+    const hierarchy = createHierarchy(repo, repoDir, baseSha);
+    const obs = buildValidObservation(hierarchy, {
+      result_status: 'COMPLETED',
+      classified_category: 'SUCCESS',
+    });
+    const result = buildTrustedResult(hierarchy, {
+      executionId: obs.execution_id,
+      status: 'COMPLETED',
+      adapterInvocation: 'RETURNED',
+    });
+
+    const res = repo.claimProviderHealthObservation(obs, result);
+    expect(res).toBe('RECORDED');
+    const stored = repo.getProviderHealthObservation(hierarchy.authId);
+    expect(stored?.classified_category).toBe('SUCCESS');
+  });
+
+  // 79. Canonical accept: RETURNED + FAILED AUTH_ERROR + AUTHENTICATION_FAILURE
+  it('79. canonical accept: RETURNED + FAILED AUTH_ERROR + AUTHENTICATION_FAILURE', () => {
+    const hierarchy = createHierarchy(repo, repoDir, baseSha);
+    const obs = buildValidObservation(hierarchy, {
+      result_status: 'FAILED',
+      classified_category: 'AUTHENTICATION_FAILURE',
+    });
+    const result = buildTrustedResult(hierarchy, {
+      executionId: obs.execution_id,
+      status: 'FAILED',
+      errorCode: 'AUTH_ERROR',
+      error: 'Token expired',
+      adapterInvocation: 'RETURNED',
+    });
+
+    const res = repo.claimProviderHealthObservation(obs, result);
+    expect(res).toBe('RECORDED');
+    const stored = repo.getProviderHealthObservation(hierarchy.authId);
+    expect(stored?.classified_category).toBe('AUTHENTICATION_FAILURE');
+  });
+
+  // 80. Canonical accept: RETURNED + FAILED plain quota + QUOTA_EXHAUSTED
+  it('80. canonical accept: RETURNED + FAILED plain quota + QUOTA_EXHAUSTED', () => {
+    const hierarchy = createHierarchy(repo, repoDir, baseSha);
+    const obs = buildValidObservation(hierarchy, {
+      result_status: 'FAILED',
+      classified_category: 'QUOTA_EXHAUSTED',
+    });
+    const result = buildTrustedResult(hierarchy, {
+      executionId: obs.execution_id,
+      status: 'FAILED',
+      errorCode: 'QUOTA_EXHAUSTED',
+      error: 'Account credit balance depleted',
+      adapterInvocation: 'RETURNED',
+    });
+
+    const res = repo.claimProviderHealthObservation(obs, result);
+    expect(res).toBe('RECORDED');
+    const stored = repo.getProviderHealthObservation(hierarchy.authId);
+    expect(stored?.classified_category).toBe('QUOTA_EXHAUSTED');
+  });
+
+  // 81. Canonical accept: RETURNED + FAILED rate-limit quota + RATE_LIMITED
+  it('81. canonical accept: RETURNED + FAILED rate-limit quota + RATE_LIMITED', () => {
+    const hierarchy = createHierarchy(repo, repoDir, baseSha);
+    const obs = buildValidObservation(hierarchy, {
+      result_status: 'FAILED',
+      classified_category: 'RATE_LIMITED',
+    });
+    const result = buildTrustedResult(hierarchy, {
+      executionId: obs.execution_id,
+      status: 'FAILED',
+      errorCode: 'QUOTA_EXHAUSTED',
+      error: '429 Too Many Requests - rate limit exceeded',
+      adapterInvocation: 'RETURNED',
+    });
+
+    const res = repo.claimProviderHealthObservation(obs, result);
+    expect(res).toBe('RECORDED');
+    const stored = repo.getProviderHealthObservation(hierarchy.authId);
+    expect(stored?.classified_category).toBe('RATE_LIMITED');
+  });
+
+  // 82. Canonical accept: RETURNED + CANCELLED + CANCELLED
+  it('82. canonical accept: RETURNED + CANCELLED + CANCELLED', () => {
+    const hierarchy = createHierarchy(repo, repoDir, baseSha);
+    const obs = buildValidObservation(hierarchy, {
+      result_status: 'CANCELLED',
+      classified_category: 'CANCELLED',
+    });
+    const result = buildTrustedResult(hierarchy, {
+      executionId: obs.execution_id,
+      status: 'CANCELLED',
+      errorCode: 'CANCELLED',
+      adapterInvocation: 'RETURNED',
+    });
+
+    const res = repo.claimProviderHealthObservation(obs, result);
+    expect(res).toBe('RECORDED');
+    const stored = repo.getProviderHealthObservation(hierarchy.authId);
+    expect(stored?.classified_category).toBe('CANCELLED');
+  });
+
+  // 83. Canonical accept: RETURNED + AWAITING_OWNER + AWAITING_OWNER
+  it('83. canonical accept: RETURNED + AWAITING_OWNER + AWAITING_OWNER', () => {
+    const hierarchy = createHierarchy(repo, repoDir, baseSha);
+    const obs = buildValidObservation(hierarchy, {
+      result_status: 'AWAITING_OWNER',
+      classified_category: 'AWAITING_OWNER',
+    });
+    const result = buildTrustedResult(hierarchy, {
+      executionId: obs.execution_id,
+      status: 'AWAITING_OWNER',
+      adapterInvocation: 'RETURNED',
+    });
+
+    const res = repo.claimProviderHealthObservation(obs, result);
+    expect(res).toBe('RECORDED');
+    const stored = repo.getProviderHealthObservation(hierarchy.authId);
+    expect(stored?.classified_category).toBe('AWAITING_OWNER');
+  });
+
+  // 84. Canonical accept: THREW + FAILED + ADAPTER_THROW
+  it('84. canonical accept: THREW + FAILED + ADAPTER_THROW', () => {
+    const hierarchy = createHierarchy(repo, repoDir, baseSha);
+    const obs = buildValidObservation(hierarchy, {
+      adapter_invocation: 'THREW',
+      result_status: 'FAILED',
+      classified_category: 'ADAPTER_THROW',
+    });
+    const result = buildTrustedResult(hierarchy, {
+      executionId: obs.execution_id,
+      status: 'FAILED',
+      adapterInvocation: 'THREW',
+    });
+
+    const res = repo.claimProviderHealthObservation(obs, result);
+    expect(res).toBe('RECORDED');
+    const stored = repo.getProviderHealthObservation(hierarchy.authId);
+    expect(stored?.classified_category).toBe('ADAPTER_THROW');
+  });
+
+  // 85. Result evidence mismatch: executionId mismatch
+  it('85. result evidence mismatch: executionId mismatch fails closed', () => {
+    const hierarchy = createHierarchy(repo, repoDir, baseSha);
+    const obs = buildValidObservation(hierarchy);
+    const result = buildTrustedResult(hierarchy, {
+      executionId: 'other-exec-id',
+    });
+
+    expect(() => repo.claimProviderHealthObservation(obs, result)).toThrow(/EXECUTION_ID_MISMATCH/);
+    expect(repo.getProviderHealthObservation(hierarchy.authId)).toBeNull();
+  });
+
+  // 86. Result evidence mismatch: authorizationId mismatch
+  it('86. result evidence mismatch: authorizationId mismatch fails closed', () => {
+    const hierarchy = createHierarchy(repo, repoDir, baseSha);
+    const obs = buildValidObservation(hierarchy);
+    const result = buildTrustedResult(hierarchy, {
+      executionId: obs.execution_id,
+      provenanceOverrides: { authorizationId: 'other-auth-id' },
+    });
+
+    expect(() => repo.claimProviderHealthObservation(obs, result)).toThrow(/AUTHORIZATION_ID_MISMATCH/);
+    expect(repo.getProviderHealthObservation(hierarchy.authId)).toBeNull();
+  });
+
+  // 87. Result evidence mismatch: accountId mismatch
+  it('87. result evidence mismatch: accountId mismatch fails closed', () => {
+    const hierarchy = createHierarchy(repo, repoDir, baseSha);
+    const obs = buildValidObservation(hierarchy);
+    const result = buildTrustedResult(hierarchy, {
+      executionId: obs.execution_id,
+      provenanceOverrides: { accountId: 'other-account-id' },
+    });
+
+    expect(() => repo.claimProviderHealthObservation(obs, result)).toThrow(/ACCOUNT_ID_MISMATCH/);
+    expect(repo.getProviderHealthObservation(hierarchy.authId)).toBeNull();
+  });
+
+  // 88. Result evidence mismatch: providerId mismatch
+  it('88. result evidence mismatch: providerId mismatch fails closed', () => {
+    const hierarchy = createHierarchy(repo, repoDir, baseSha);
+    const obs = buildValidObservation(hierarchy);
+    const result = buildTrustedResult(hierarchy, {
+      executionId: obs.execution_id,
+      provenanceOverrides: { providerId: 'other-prov-id' },
+    });
+
+    expect(() => repo.claimProviderHealthObservation(obs, result)).toThrow(/PROVIDER_ID_MISMATCH/);
+    expect(repo.getProviderHealthObservation(hierarchy.authId)).toBeNull();
+  });
+
+  // 89. Result evidence mismatch: resourceId mismatch
+  it('89. result evidence mismatch: resourceId mismatch fails closed', () => {
+    const hierarchy = createHierarchy(repo, repoDir, baseSha);
+    const obs = buildValidObservation(hierarchy);
+    const result = buildTrustedResult(hierarchy, {
+      executionId: obs.execution_id,
+      provenanceOverrides: { resourceId: 'other-res-id' },
+    });
+
+    expect(() => repo.claimProviderHealthObservation(obs, result)).toThrow(/RESOURCE_ID_MISMATCH/);
+    expect(repo.getProviderHealthObservation(hierarchy.authId)).toBeNull();
+  });
+
+  // 90. Result evidence mismatch: assignmentId mismatch
+  it('90. result evidence mismatch: assignmentId mismatch fails closed', () => {
+    const hierarchy = createHierarchy(repo, repoDir, baseSha);
+    const obs = buildValidObservation(hierarchy);
+    const result = buildTrustedResult(hierarchy, {
+      executionId: obs.execution_id,
+      provenanceOverrides: { assignmentId: 'other-asgn-id' },
+    });
+
+    expect(() => repo.claimProviderHealthObservation(obs, result)).toThrow(/ASSIGNMENT_ID_MISMATCH/);
+    expect(repo.getProviderHealthObservation(hierarchy.authId)).toBeNull();
+  });
+
+  // 91. Result evidence mismatch: adapterInvocation mismatch
+  it('91. result evidence mismatch: adapterInvocation mismatch fails closed', () => {
+    const hierarchy = createHierarchy(repo, repoDir, baseSha);
+    const obs = buildValidObservation(hierarchy, {
+      adapter_invocation: 'THREW',
+      result_status: 'FAILED',
+      classified_category: 'ADAPTER_THROW',
+    });
+    const result = buildTrustedResult(hierarchy, {
+      executionId: obs.execution_id,
+      status: 'FAILED',
+      adapterInvocation: 'RETURNED',
+    });
+
+    expect(() => repo.claimProviderHealthObservation(obs, result)).toThrow(/ADAPTER_INVOCATION_MISMATCH/);
+    expect(repo.getProviderHealthObservation(hierarchy.authId)).toBeNull();
+  });
+
+  // 92. Result evidence mismatch: result status mismatch
+  it('92. result evidence mismatch: result status mismatch fails closed', () => {
+    const hierarchy = createHierarchy(repo, repoDir, baseSha);
+    const obs = buildValidObservation(hierarchy, {
+      result_status: 'FAILED',
+      classified_category: 'SUCCESS',
+    });
+    const result = buildTrustedResult(hierarchy, {
+      executionId: obs.execution_id,
+      status: 'COMPLETED',
+      adapterInvocation: 'RETURNED',
+    });
+
+    expect(() => repo.claimProviderHealthObservation(obs, result)).toThrow(/OBSERVATION_RESULT_STATUS_MISMATCH/);
+    expect(repo.getProviderHealthObservation(hierarchy.authId)).toBeNull();
+  });
+
+  // 93. Raw response is not authority: 429 in rawResponse without rate limit error text does NOT authenticate RATE_LIMITED
+  it('93. raw response is not authority: 429 in rawResponse without rate limit error text does NOT authenticate RATE_LIMITED', () => {
+    const hierarchy = createHierarchy(repo, repoDir, baseSha);
+    const result = buildTrustedResult(hierarchy, {
+      status: 'FAILED',
+      errorCode: 'QUOTA_EXHAUSTED',
+      error: 'Daily quota balance depleted without any rate text',
+      rawResponse: 'HTTP/1.1 429 Too Many Requests - rate limit exceeded',
+    });
+
+    // An observation attempting to claim RATE_LIMITED must fail
+    const forgedObs = buildValidObservation(hierarchy, {
+      execution_id: result.executionId,
+      result_status: 'FAILED',
+      classified_category: 'RATE_LIMITED',
+    });
+    expect(() => repo.claimProviderHealthObservation(forgedObs, result)).toThrow(/OBSERVATION_CATEGORY_MISMATCH/);
+    expect(repo.getProviderHealthObservation(hierarchy.authId)).toBeNull();
+
+    // Canonical QUOTA_EXHAUSTED observation succeeds
+    const canonicalObs = buildValidObservation(hierarchy, {
+      execution_id: result.executionId,
+      result_status: 'FAILED',
+      classified_category: 'QUOTA_EXHAUSTED',
+    });
+    const claimRes = repo.claimProviderHealthObservation(canonicalObs, result);
+    expect(claimRes).toBe('RECORDED');
+    expect(repo.getProviderHealthObservation(hierarchy.authId)?.classified_category).toBe('QUOTA_EXHAUSTED');
+  });
+
+  // 94. Missing providerResult on new claim fails closed
+  it('94. missing providerResult on new claim fails closed', () => {
+    const hierarchy = createHierarchy(repo, repoDir, baseSha);
+    const obs = buildValidObservation(hierarchy);
+
+    expect(() => repo.claimProviderHealthObservation(obs)).toThrow(/PROVIDER_RESULT_REQUIRED/);
     expect(repo.getProviderHealthObservation(hierarchy.authId)).toBeNull();
   });
 });

@@ -261,7 +261,7 @@ export class ProviderHealthObservationService {
     };
 
     // 8. Atomic ingestion via repository
-    const claimResult = this.repo.claimProviderHealthObservation(observation);
+    const claimResult = this.repo.claimProviderHealthObservation(observation, providerResult);
     if (claimResult === 'ALREADY_RECORDED') {
       const existing = this.repo.getProviderHealthObservation(observation.authorization_id);
       return {
