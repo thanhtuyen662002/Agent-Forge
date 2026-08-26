@@ -2077,4 +2077,27 @@ describe('R5H4 Durable Provider Health Observation Contract', () => {
     expect(() => repo.claimProviderHealthObservation(obs)).toThrow(/INVALID_OBSERVATION_SHAPE/);
     expect(repo.getProviderHealthObservation(hierarchy.authId)).toBeNull();
   });
+
+  // 67. Raw claim fails closed when provider_resource provider_account_id is NULL
+  it('67. raw claim fails closed when provider_resource provider_account_id is NULL', () => {
+    const hierarchy = createHierarchy(repo, repoDir, baseSha);
+    db.prepare('UPDATE provider_resources SET provider_account_id = NULL WHERE id = ?').run(hierarchy.resourceId);
+
+    const obs = buildValidObservation(hierarchy);
+    expect(() => repo.claimProviderHealthObservation(obs)).toThrow(/RESOURCE_ACCOUNT_MISMATCH/);
+    expect(repo.getProviderHealthObservation(hierarchy.authId)).toBeNull();
+  });
+
+  // 68. Service observation recording fails closed when provider_resource provider_account_id is NULL
+  it('68. service observation recording fails closed when provider_resource provider_account_id is NULL', () => {
+    const hierarchy = createHierarchy(repo, repoDir, baseSha);
+    db.prepare('UPDATE provider_resources SET provider_account_id = NULL WHERE id = ?').run(hierarchy.resourceId);
+
+    const result = buildTrustedResult(hierarchy);
+    expect(() => {
+      service.recordObservation(result);
+    }).toThrow(/RESOURCE_ACCOUNT_MISMATCH/);
+
+    expect(repo.getProviderHealthObservation(hierarchy.authId)).toBeNull();
+  });
 });
