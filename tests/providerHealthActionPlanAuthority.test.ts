@@ -1792,4 +1792,199 @@ describe('R5H4 Durable Provider Health Action Plan Authority & Routing Snapshot 
       `).run();
     }).toThrow();
   });
+
+  // 41. Separation failure after freeze preserves original snapshot
+  it('41. Separation failure after freeze preserves original snapshot when RoutePolicy is mutated mid-routing', async () => {
+    repo.createRoutePolicy({
+      id: 'pol-sep-race',
+      name: 'Sep Race Policy',
+      required_capabilities: [],
+      preferred_capabilities: [],
+      provider_account_policy: null,
+      allow_manual_bridge: false,
+      failover_policy: { version: 1, enabled: true, max_failover_attempts: 2, same_account_retries: 0, allow_cross_account: true, allow_cross_provider: false, cooldown_duration_ms: 60000 },
+      risk_policy: null,
+      enabled: true,
+      created_at: '2026-08-26T12:00:00.000Z',
+      updated_at: '2026-08-26T12:00:00.000Z',
+    });
+
+    const originalGetSep = repo.getSeparationPolicy.bind(repo);
+    repo.getSeparationPolicy = (id: string) => {
+      repo.updateRoutePolicy('pol-sep-race', {
+        failover_policy: { version: 1, enabled: true, max_failover_attempts: 10, same_account_retries: 5, allow_cross_account: false, allow_cross_provider: false, cooldown_duration_ms: 900000 },
+      });
+      return null;
+    };
+
+    const decision = await routingService.routeRole({
+      projectId: 'proj-1',
+      taskId: 'task-1',
+      roleProfileId: 'rp-coder',
+      routePolicyId: 'pol-sep-race',
+      separationPolicyId: 'sep-missing',
+    });
+
+    repo.getSeparationPolicy = originalGetSep;
+
+    expect(decision.outcome).toBe('NO_ELIGIBLE_PROVIDER');
+    expect(decision.failoverPolicyAuthoritySnapshot.status).toBe('VALID');
+    if (decision.failoverPolicyAuthoritySnapshot.status === 'VALID') {
+      expect((decision.failoverPolicyAuthoritySnapshot.policy as any).cooldown_duration_ms).toBe(60000);
+    }
+
+    const events = repo.getEvents('proj-1');
+    const event = events.find((e) => e.structured_payload.decisionId === decision.decisionId);
+    expect(event).toBeDefined();
+    expect((event?.structured_payload as any).failoverPolicyAuthoritySnapshot.policy.cooldown_duration_ms).toBe(60000);
+  });
+
+  // 42. Reviewed assignment failure after freeze preserves original snapshot
+  it('42. Reviewed assignment failure after freeze preserves original snapshot when RoutePolicy is mutated mid-routing', async () => {
+    repo.createRoutePolicy({
+      id: 'pol-rev-race',
+      name: 'Rev Race Policy',
+      required_capabilities: [],
+      preferred_capabilities: [],
+      provider_account_policy: null,
+      allow_manual_bridge: false,
+      failover_policy: { version: 1, enabled: true, max_failover_attempts: 2, same_account_retries: 0, allow_cross_account: true, allow_cross_provider: false, cooldown_duration_ms: 60000 },
+      risk_policy: null,
+      enabled: true,
+      created_at: '2026-08-26T12:00:00.000Z',
+      updated_at: '2026-08-26T12:00:00.000Z',
+    });
+
+    const originalGetAssign = repo.getAgentAssignment.bind(repo);
+    repo.getAgentAssignment = (id: string) => {
+      repo.updateRoutePolicy('pol-rev-race', {
+        failover_policy: { version: 1, enabled: true, max_failover_attempts: 10, same_account_retries: 5, allow_cross_account: false, allow_cross_provider: false, cooldown_duration_ms: 900000 },
+      });
+      return null;
+    };
+
+    const decision = await routingService.routeRole({
+      projectId: 'proj-1',
+      taskId: 'task-1',
+      roleProfileId: 'rp-coder',
+      routePolicyId: 'pol-rev-race',
+      reviewedAssignmentId: 'assign-nonexistent',
+    });
+
+    repo.getAgentAssignment = originalGetAssign;
+
+    expect(decision.outcome).toBe('NO_ELIGIBLE_PROVIDER');
+    expect(decision.failoverPolicyAuthoritySnapshot.status).toBe('VALID');
+    if (decision.failoverPolicyAuthoritySnapshot.status === 'VALID') {
+      expect((decision.failoverPolicyAuthoritySnapshot.policy as any).cooldown_duration_ms).toBe(60000);
+    }
+
+    const events = repo.getEvents('proj-1');
+    const event = events.find((e) => e.structured_payload.decisionId === decision.decisionId);
+    expect(event).toBeDefined();
+    expect((event?.structured_payload as any).failoverPolicyAuthoritySnapshot.policy.cooldown_duration_ms).toBe(60000);
+  });
+
+  // 43. Empty candidate failure after freeze preserves original snapshot
+  it('43. Empty candidate failure after freeze preserves original snapshot when RoutePolicy is mutated mid-routing', async () => {
+    repo.createRoutePolicy({
+      id: 'pol-empty-race',
+      name: 'Empty Race Policy',
+      required_capabilities: [],
+      preferred_capabilities: [],
+      provider_account_policy: null,
+      allow_manual_bridge: false,
+      failover_policy: { version: 1, enabled: true, max_failover_attempts: 2, same_account_retries: 0, allow_cross_account: true, allow_cross_provider: false, cooldown_duration_ms: 60000 },
+      risk_policy: null,
+      enabled: true,
+      created_at: '2026-08-26T12:00:00.000Z',
+      updated_at: '2026-08-26T12:00:00.000Z',
+    });
+
+    const originalGetAccounts = repo.getAllProviderAccounts.bind(repo);
+    repo.getAllProviderAccounts = () => {
+      repo.updateRoutePolicy('pol-empty-race', {
+        failover_policy: { version: 1, enabled: true, max_failover_attempts: 10, same_account_retries: 5, allow_cross_account: false, allow_cross_provider: false, cooldown_duration_ms: 900000 },
+      });
+      return [];
+    };
+
+    const decision = await routingService.routeRole({
+      projectId: 'proj-1',
+      taskId: 'task-1',
+      roleProfileId: 'rp-coder',
+      routePolicyId: 'pol-empty-race',
+    });
+
+    repo.getAllProviderAccounts = originalGetAccounts;
+
+    expect(decision.outcome).toBe('NO_ELIGIBLE_PROVIDER');
+    expect(decision.failoverPolicyAuthoritySnapshot.status).toBe('VALID');
+    if (decision.failoverPolicyAuthoritySnapshot.status === 'VALID') {
+      expect((decision.failoverPolicyAuthoritySnapshot.policy as any).cooldown_duration_ms).toBe(60000);
+    }
+
+    const events = repo.getEvents('proj-1');
+    const event = events.find((e) => e.structured_payload.decisionId === decision.decisionId);
+    expect(event).toBeDefined();
+    expect((event?.structured_payload as any).failoverPolicyAuthoritySnapshot.policy.cooldown_duration_ms).toBe(60000);
+  });
+
+  // 44. No eligible candidate failure after freeze preserves original snapshot
+  it('44. No eligible candidate failure after freeze preserves original snapshot when RoutePolicy is mutated mid-routing', async () => {
+    repo.createRoutePolicy({
+      id: 'pol-noelig-race',
+      name: 'No Elig Race Policy',
+      required_capabilities: ['UNSATISFIABLE_CAPABILITY' as any],
+      preferred_capabilities: [],
+      provider_account_policy: null,
+      allow_manual_bridge: false,
+      failover_policy: { version: 1, enabled: true, max_failover_attempts: 2, same_account_retries: 0, allow_cross_account: true, allow_cross_provider: false, cooldown_duration_ms: 60000 },
+      risk_policy: null,
+      enabled: true,
+      created_at: '2026-08-26T12:00:00.000Z',
+      updated_at: '2026-08-26T12:00:00.000Z',
+    });
+
+    const decision = await routingService.routeRole({
+      projectId: 'proj-1',
+      taskId: 'task-1',
+      roleProfileId: 'rp-coder',
+      routePolicyId: 'pol-noelig-race',
+    });
+
+    expect(decision.outcome).toBe('NO_ELIGIBLE_PROVIDER');
+    expect(decision.failoverPolicyAuthoritySnapshot.status).toBe('VALID');
+    if (decision.failoverPolicyAuthoritySnapshot.status === 'VALID') {
+      expect((decision.failoverPolicyAuthoritySnapshot.policy as any).cooldown_duration_ms).toBe(60000);
+    }
+
+    const events = repo.getEvents('proj-1');
+    const event = events.find((e) => e.structured_payload.decisionId === decision.decisionId);
+    expect(event).toBeDefined();
+    expect((event?.structured_payload as any).failoverPolicyAuthoritySnapshot.policy.cooldown_duration_ms).toBe(60000);
+  });
+
+  // 45. Pre-freeze fail-closed does 0 getRoutePolicy lookups
+  it('45. Pre-freeze fail-closed does 0 getRoutePolicy lookups and yields ABSENT snapshot on missing project', async () => {
+    let getRoutePolicyCalls = 0;
+    const originalGetRoutePolicy = repo.getRoutePolicy.bind(repo);
+    repo.getRoutePolicy = (id: string) => {
+      getRoutePolicyCalls++;
+      return originalGetRoutePolicy(id);
+    };
+
+    const decision = await routingService.routeRole({
+      projectId: 'proj-nonexistent',
+      taskId: 'task-1',
+      roleProfileId: 'rp-coder',
+      routePolicyId: 'pol-60s',
+    });
+
+    repo.getRoutePolicy = originalGetRoutePolicy;
+
+    expect(decision.outcome).toBe('NO_ELIGIBLE_PROVIDER');
+    expect(getRoutePolicyCalls).toBe(0);
+    expect(decision.failoverPolicyAuthoritySnapshot).toEqual({ version: 1, status: 'ABSENT' });
+  });
 });
