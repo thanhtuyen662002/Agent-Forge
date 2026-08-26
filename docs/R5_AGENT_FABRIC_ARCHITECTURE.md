@@ -281,3 +281,18 @@ The R5 planning sequence is governed by the authoritative R5-v1.1 roadmap:
   - This ordering authority contract establishes durable observation ordering only and does NOT authorize automatic health status mutation.
   - Manual / administrative / non-execution health precedence remains unresolved.
   - Cooldown replay and absolute `cooldownUntil` timestamp authority remain unresolved.
+
+---
+
+## 10. R5H Provider Account Health Single-Writer Authority & Write-Surface Containment
+
+### 1. Authoritative Architecture Model: Single Semantic Health Writer
+- **Semantic Writer**: `AccountHealthService` is the single semantic production authority for existing `ProviderAccount` health mutations.
+- **Storage Primitive**: `Repository.updateProviderAccountHealth` is a low-level storage primitive and not an independent semantic authority. Production code outside `AccountHealthService` must not call it.
+- **Configuration Containment**: Generic configuration updates via `Repository.updateProviderAccount` are restricted strictly to configuration fields (`label`, `auth_mode`, `credential_ref`, `profile_ref`, `enabled`, `priority`, `concurrency_limit`) and can never write or clobber health fields (`health_status`, `cooldown_until`, `last_success_at`, `last_failure_at`, `last_failure_code`).
+- **Control Plane Separation**: The administrative `enabled` field remains independent from health telemetry and status signals. Health mutations cannot modify `enabled`, and configuration updates cannot modify health signals.
+- **Initialization Boundary**: Account creation via `Repository.createProviderAccount` may set initial health state upon creation, but all subsequent existing-account health updates must flow exclusively through the single health authority.
+- **Manual Precedence & Future Application**:
+  - No live manual health override exists in the shipped runtime.
+  - Future manual/admin health features require a separate durable precedence contract.
+  - Future automatic observation application must extend this single write authority model with durable `account_order` CAS / idempotency.
