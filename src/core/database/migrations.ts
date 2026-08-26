@@ -883,7 +883,7 @@ export const MIGRATIONS: Migration[] = [
 ];
 
 export class MigrationRunner {
-  public static run(db: Database.Database, maxVersion?: number): void {
+  public static run(db: Database.Database): void {
     // 1. Ensure migrations ledger exists
     db.exec(`
       CREATE TABLE IF NOT EXISTS schema_migrations (
@@ -893,24 +893,10 @@ export class MigrationRunner {
       );
     `);
 
-    const stack = new Error().stack || '';
-    let effectiveMaxVersion = maxVersion;
-    if (effectiveMaxVersion === undefined) {
-      if (
-        stack.includes('databaseMigrations.test.ts') ||
-        stack.includes('r5DurableMemoryContext.test.ts')
-      ) {
-        effectiveMaxVersion = 9;
-      }
-    }
-
     const appliedRows = db.prepare('SELECT version FROM schema_migrations ORDER BY version ASC').all() as { version: number }[];
     const appliedVersions = new Set(appliedRows.map((r) => r.version));
 
     for (const migration of MIGRATIONS) {
-      if (effectiveMaxVersion !== undefined && migration.version > effectiveMaxVersion) {
-        continue;
-      }
       if (!appliedVersions.has(migration.version)) {
         console.log(`[Migrations] Applying migration ${migration.version}: ${migration.name}...`);
         const runTx = db.transaction(() => {

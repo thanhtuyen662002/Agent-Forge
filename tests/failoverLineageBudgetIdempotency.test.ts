@@ -152,6 +152,73 @@ describe('Failover Lineage, Budget, and Idempotency Contract (R5H4)', () => {
       rawDb.close();
     });
 
+    it('3b. preserves valid historical TaskAttempt attempt_number values without renumbering or row replacement', () => {
+      const rawDb = new Database(':memory:');
+      rawDb.pragma('foreign_keys = ON');
+
+      // Run migrations 1 through 9 manually
+      for (const migration of MIGRATIONS.slice(0, 9)) {
+        rawDb.transaction(() => {
+          migration.up(rawDb);
+        })();
+      }
+
+      // Seed project and task
+      rawDb.prepare(`
+        INSERT INTO projects (id, name, description, repository_path, default_branch, status, created_at, updated_at)
+        VALUES ('p-hist', 'Historical Project', 'Desc', '/repo', 'main', 'READY', '2026-08-26T00:00:00Z', '2026-08-26T00:00:00Z')
+      `).run();
+
+      rawDb.prepare(`
+        INSERT INTO tasks (id, project_id, title, description, state, priority, risk, created_at, updated_at)
+        VALUES ('t-hist', 'p-hist', 'Historical Task', 'Desc', 'APPROVED', 'HIGH', 'HIGH', '2026-08-26T00:00:00Z', '2026-08-26T00:00:00Z')
+      `).run();
+
+      // Seed valid historical attempts with distinct non-sequential attempt_numbers: 1, 4, 9
+      const historicalAttempts = [
+        { id: 'att-hist-1', task_id: 't-hist', attempt_number: 1, agent_id: 'agent-1', status: 'FAILED', started_at: '2026-08-26T00:01:00Z' },
+        { id: 'att-hist-4', task_id: 't-hist', attempt_number: 4, agent_id: 'agent-2', status: 'FAILED', started_at: '2026-08-26T00:04:00Z' },
+        { id: 'att-hist-9', task_id: 't-hist', attempt_number: 9, agent_id: 'agent-3', status: 'COMPLETED', started_at: '2026-08-26T00:09:00Z' },
+      ];
+
+      for (const a of historicalAttempts) {
+        rawDb.prepare(`
+          INSERT INTO task_attempts (id, task_id, attempt_number, agent_id, status, started_at)
+          VALUES (?, ?, ?, ?, ?, ?)
+        `).run(a.id, a.task_id, a.attempt_number, a.agent_id, a.status, a.started_at);
+      }
+
+      // Run migration 10
+      const migration10 = MIGRATIONS.find((m) => m.version === 10)!;
+      rawDb.transaction(() => {
+        migration10.up(rawDb);
+      })();
+
+      // Verify all rows are intact, untampered, and identical
+      const rowsAfter = rawDb.prepare(`SELECT * FROM task_attempts WHERE task_id = 't-hist' ORDER BY attempt_number ASC`).all() as Array<{
+        id: string;
+        task_id: string;
+        attempt_number: number;
+        agent_id: string;
+        status: string;
+        started_at: string;
+      }>;
+
+      expect(rowsAfter).toHaveLength(3);
+      expect(rowsAfter.map((r) => r.attempt_number)).toEqual([1, 4, 9]);
+      expect(rowsAfter[0].id).toBe('att-hist-1');
+      expect(rowsAfter[0].agent_id).toBe('agent-1');
+      expect(rowsAfter[0].status).toBe('FAILED');
+      expect(rowsAfter[1].id).toBe('att-hist-4');
+      expect(rowsAfter[1].agent_id).toBe('agent-2');
+      expect(rowsAfter[1].status).toBe('FAILED');
+      expect(rowsAfter[2].id).toBe('att-hist-9');
+      expect(rowsAfter[2].agent_id).toBe('agent-3');
+      expect(rowsAfter[2].status).toBe('COMPLETED');
+
+      rawDb.close();
+    });
+
     it('4. enforces DB-level uniqueness on source_attempt_id and successor_attempt_id in failover_transitions', () => {
       seedBaseProjectAndTask(repo, db, 'task-1');
       repo.createTaskAttempt({
@@ -631,7 +698,7 @@ describe('Failover Lineage, Budget, and Idempotency Contract (R5H4)', () => {
   // 6. Concurrency and Atomic Rollback
   // =========================================================================
   describe('Concurrency and Atomic Rollback', () => {
-    it('15. prevents concurrent attempt number collisions on dual database handles', () => {
+    it('15. exercises genuine SQLite contention with dual database handles rejecting concurrent IMMEDIATE writer and ensuring serialized attempt numbers', () => {
       const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'agentforge-r5h4-concurrency-'));
       const dbPath = path.join(tempDir, 'concurrency_test.db');
 
@@ -644,6 +711,7 @@ describe('Failover Lineage, Budget, and Idempotency Contract (R5H4)', () => {
 
         const db2 = new Database(dbPath);
         db2.pragma('foreign_keys = ON');
+        db2.pragma('busy_timeout = 0'); // Fail immediately on write lock contention
         const repo2 = new Repository(db2);
         const service2 = new FailoverLineageService(repo2);
 
@@ -651,7 +719,26 @@ describe('Failover Lineage, Budget, and Idempotency Contract (R5H4)', () => {
         repo1.createTaskAttempt({ id: 'att-1', task_id: 'task-concurrency', attempt_number: 1, agent_id: 'agent-1', status: 'FAILED', started_at: '2026-08-26T00:00:00Z', ended_at: null, summary: null });
         repo1.createTaskAttempt({ id: 'att-2', task_id: 'task-concurrency', attempt_number: 2, agent_id: 'agent-1', status: 'FAILED', started_at: '2026-08-26T00:01:00Z', ended_at: null, summary: null });
 
-        // Claim from source att-1 on handle 1
+        // Step 1: db1 acquires write reservation via BEGIN IMMEDIATE
+        db1.exec('BEGIN IMMEDIATE');
+
+        // Step 2: while db1 holds write lock, db2 attempts claimSuccessor (which uses BEGIN IMMEDIATE)
+        // With busy_timeout = 0, db2 cannot acquire write lock and must throw SQLITE_BUSY / database locked
+        expect(() => {
+          service2.claimSuccessor({
+            transitionId: 'trans-blocked',
+            sourceAttemptId: 'att-2',
+            successorAttemptId: 'att-blocked',
+          });
+        }).toThrow(/database is locked|busy/i);
+
+        // Verify att-blocked was not created on db2 or db1
+        expect(repo1.getTaskAttempt('att-blocked')).toBeNull();
+
+        // Step 3: db1 rolls back / releases the held write reservation
+        db1.exec('ROLLBACK');
+
+        // Step 4: After lock release, perform two valid claims on the two handles
         const claim1 = service1.claimSuccessor({
           transitionId: 'trans-from-1',
           sourceAttemptId: 'att-1',
@@ -660,7 +747,6 @@ describe('Failover Lineage, Budget, and Idempotency Contract (R5H4)', () => {
         expect(claim1.status).toBe('CREATED');
         expect(claim1.successorAttempt?.attempt_number).toBe(3);
 
-        // Claim from source att-2 on handle 2
         const claim2 = service2.claimSuccessor({
           transitionId: 'trans-from-2',
           sourceAttemptId: 'att-2',
@@ -680,34 +766,67 @@ describe('Failover Lineage, Budget, and Idempotency Contract (R5H4)', () => {
       }
     });
 
-    it('16. rolls back atomically and leaves no orphan successor attempt on transition conflict', () => {
+    it('16. executes true atomic rollback when successor TaskAttempt insertion succeeds but transition insertion fails on UNIQUE(root_attempt_id, failover_ordinal)', () => {
       seedBaseProjectAndTask(repo, db, 'task-1');
-      repo.createTaskAttempt({ id: 'att-1', task_id: 'task-1', attempt_number: 1, agent_id: 'agent-1', status: 'FAILED', started_at: '2026-08-26T00:00:00Z', ended_at: null, summary: null });
-      repo.createTaskAttempt({ id: 'att-2', task_id: 'task-1', attempt_number: 2, agent_id: 'agent-1', status: 'FAILED', started_at: '2026-08-26T00:01:00Z', ended_at: null, summary: null });
-
-      // Pre-seed a conflicting transition with id 'trans-conflict'
-      repo.createTaskAttempt({ id: 'att-2-succ', task_id: 'task-1', attempt_number: 3, agent_id: 'agent-1', status: 'RUNNING', started_at: '2026-08-26T00:01:30Z', ended_at: null, summary: null });
+      // Step A: Seed initial attempts A, B, and transition A -> B (root=A, ordinal=1)
+      repo.createTaskAttempt({ id: 'att-A', task_id: 'task-1', attempt_number: 1, agent_id: 'agent-1', status: 'FAILED', started_at: '2026-08-26T00:00:00Z', ended_at: null, summary: null });
+      repo.createTaskAttempt({ id: 'att-B', task_id: 'task-1', attempt_number: 2, agent_id: 'agent-1', status: 'FAILED', started_at: '2026-08-26T00:01:00Z', ended_at: null, summary: null });
       repo.createFailoverTransition({
-        id: 'trans-conflict',
+        id: 'trans-A-B',
         task_id: 'task-1',
-        root_attempt_id: 'att-2',
-        source_attempt_id: 'att-2',
-        successor_attempt_id: 'att-2-succ',
+        root_attempt_id: 'att-A',
+        source_attempt_id: 'att-A',
+        successor_attempt_id: 'att-B',
         failover_ordinal: 1,
-        created_at: '2026-08-26T00:01:30Z',
+        created_at: '2026-08-26T00:01:00Z',
       });
 
-      // Now attempt to claim successor for att-1 using the conflicting transitionId 'trans-conflict'
-      const res = service.claimSuccessor({
-        transitionId: 'trans-conflict',
-        sourceAttemptId: 'att-1',
-        successorAttemptId: 'att-orphan-test',
+      // Step B: Seed additional valid attempts X, Y and pre-seed a transition that occupies (root_attempt_id=A, failover_ordinal=2)
+      repo.createTaskAttempt({ id: 'att-X', task_id: 'task-1', attempt_number: 3, agent_id: 'agent-1', status: 'FAILED', started_at: '2026-08-26T00:02:00Z', ended_at: null, summary: null });
+      repo.createTaskAttempt({ id: 'att-Y', task_id: 'task-1', attempt_number: 4, agent_id: 'agent-1', status: 'RUNNING', started_at: '2026-08-26T00:02:30Z', ended_at: null, summary: null });
+      repo.createFailoverTransition({
+        id: 'trans-X-Y-conflict',
+        task_id: 'task-1',
+        root_attempt_id: 'att-A',
+        source_attempt_id: 'att-X',
+        successor_attempt_id: 'att-Y',
+        failover_ordinal: 2, // Pre-occupies ordinal 2 for root att-A!
+        created_at: '2026-08-26T00:02:30Z',
       });
 
-      expect(res.status).toBe('TRANSITION_ID_CONFLICT');
+      const attemptCountBefore = repo.getTaskAttemptsByTask('task-1').length;
+      expect(attemptCountBefore).toBe(4);
 
-      // The requested successor attempt MUST NOT exist in DB
-      expect(repo.getTaskAttempt('att-orphan-test')).toBeNull();
+      // Step C: Call claimSuccessor for source att-B with fresh transitionId and fresh successorAttemptId att-Z
+      // All pre-checks pass:
+      // - att-B exists
+      // - att-B has no outgoing transition yet
+      // - trans-B-Z does not exist
+      // - att-Z does not exist
+      // - att-Z is NOT a successor of any transition
+      // Predecessor is trans-A-B (successor=att-B) => computed root = att-A, computed ordinal = 1 + 1 = 2
+      // Inside runInImmediateTransaction:
+      // 1. successor att-Z is INSERTED into task_attempts
+      // 2. transition trans-B-Z is INSERTED with root=att-A, ordinal=2 -> FAILS on UNIQUE(root_attempt_id, failover_ordinal)
+      // 3. Exception causes immediate transaction rollback
+      expect(() => {
+        service.claimSuccessor({
+          transitionId: 'trans-B-Z',
+          sourceAttemptId: 'att-B',
+          successorAttemptId: 'att-Z',
+        });
+      }).toThrow(/UNIQUE constraint failed: failover_transitions\.root_attempt_id, failover_transitions\.failover_ordinal/);
+
+      // Step D: Verify atomic rollback - NO orphan successor att-Z exists
+      expect(repo.getTaskAttempt('att-Z')).toBeNull();
+
+      // Verify no transition was recorded for source att-B
+      expect(repo.getFailoverTransitionBySource('att-B')).toBeNull();
+      expect(repo.getFailoverTransition('trans-B-Z')).toBeNull();
+
+      // Verify attempt count in task is unchanged
+      const attemptCountAfter = repo.getTaskAttemptsByTask('task-1').length;
+      expect(attemptCountAfter).toBe(attemptCountBefore);
     });
   });
 
