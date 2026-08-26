@@ -247,7 +247,6 @@ $$\text{ROLE} \neq \text{AGENT PROFILE} \neq \text{PROVIDER} \neq \text{MODEL RE
      - Sets `CLAUDE_CONFIG_DIR` to isolated profile directory.
    - **Unknown Providers**: Fail-closed with `UNSUPPORTED_NATIVE_PROFILE_PROVIDER` error; never invents ad-hoc environment variables.
 4. **R5D Verification Boundary**: R5C establishes configuration mapping. All multi-profile runtime account isolation remains classified as `PENDING_R5D` until verified during live R5D execution proofs.
-
 ---
 
 ## 8. Next Gates (Authoritative R5-v1.1 Roadmap)
@@ -266,3 +265,19 @@ The R5 planning sequence is governed by the authoritative R5-v1.1 roadmap:
 - **R5J — AgentForge MCP + IDE/Client Bridge**: MCP protocol servers and IDE integration endpoints.
 - **R5K — Optional Local LLM Gateway**: Local inference adapter and model gateway integration.
 - **R5L — Dynamic Multi-Role / Multi-Account / Context-Continuity Production Trial**: End-to-end multi-agent production verification.
+
+---
+
+## 9. R5H Provider Health Observation Ordering Authority
+
+### 1. Authoritative Precedence Semantic: Durable Ingestion Order
+- **Semantic Definition**: For two authenticated durable provider-health observations belonging to the same `ProviderAccount`, the observation assigned the greater account-local durable ingestion ordinal (`account_order`) is authoritative and newer.
+- **Repository Authority**: Monotonic `account_order` is allocated exclusively by `Repository.claimProviderHealthObservation` inside an immediate transaction (`COALESCE(MAX(account_order), 0) + 1` per `account_id`). Callers, adapters, and services cannot supply or forge order values.
+- **Ordering Scope**: Strictly scoped to `ProviderAccount` across all tasks and projects. Different provider accounts maintain independent integer sequences starting from 1.
+- **Audit Chronology vs Precedence**: `observed_at` (ISO timestamp) is preserved for audit chronology only; it does not determine health precedence or act as an order tie-breaker.
+- **Non-Precedence Signals**: External provider completion time, adapter completion/start time, execution authorization creation/claim time, dispatch entry, lease acquisition, and agent assignment creation are not health precedence authorities.
+- **Legacy Observations**: Pre-migration observations remain with `account_order = NULL` and are not retroactively backfilled or automatically applied.
+- **Boundaries & Open Areas**:
+  - This ordering authority contract establishes durable observation ordering only and does NOT authorize automatic health status mutation.
+  - Manual / administrative / non-execution health precedence remains unresolved.
+  - Cooldown replay and absolute `cooldownUntil` timestamp authority remain unresolved.

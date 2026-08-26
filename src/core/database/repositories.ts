@@ -55,6 +55,7 @@ import {
   FailoverSuccessorClaimResult,
   ClaimSuccessorParams,
   ProviderHealthObservation,
+  ProviderHealthObservationRecord,
   ProviderHealthObservationCategory
 } from '../types/domain';
 import type { ProviderDispatchExecutionResult } from '../services/ProviderDispatchService';
@@ -3579,7 +3580,7 @@ export class Repository {
     };
   }
 
-  public getProviderHealthObservation(authorizationId: string): ProviderHealthObservation | null {
+  public getProviderHealthObservation(authorizationId: string): ProviderHealthObservationRecord | null {
     const row = this.db
       .prepare('SELECT * FROM provider_health_observations WHERE authorization_id = ?')
       .get(authorizationId) as Record<string, unknown> | undefined;
@@ -3587,9 +3588,9 @@ export class Repository {
     return this.mapProviderHealthObservation(row);
   }
 
-  public getProviderHealthObservationsForAccount(accountId: string, limit: number = 100): ProviderHealthObservation[] {
+  public getProviderHealthObservationsForAccount(accountId: string, limit: number = 100): ProviderHealthObservationRecord[] {
     const rows = this.db
-      .prepare('SELECT * FROM provider_health_observations WHERE account_id = ? ORDER BY observed_at DESC, rowid DESC LIMIT ?')
+      .prepare('SELECT * FROM provider_health_observations WHERE account_id = ? ORDER BY account_order ASC NULLS FIRST, observed_at ASC LIMIT ?')
       .all(accountId, limit) as Record<string, unknown>[];
     return rows.map((r) => this.mapProviderHealthObservation(r));
   }
@@ -3953,7 +3954,13 @@ export class Repository {
         );
       }
 
-      // 12. Insert row
+      // 12. Calculate next account_order for this account
+      const orderRow = this.db
+        .prepare('SELECT COALESCE(MAX(account_order), 0) + 1 AS next_order FROM provider_health_observations WHERE account_id = ?')
+        .get(observation.account_id) as { next_order: number };
+      const nextOrder = Number(orderRow.next_order);
+
+      // 13. Insert row
       this.db
         .prepare(`
           INSERT INTO provider_health_observations (
@@ -3971,8 +3978,9 @@ export class Repository {
             adapter_invocation,
             result_status,
             classified_category,
-            observed_at
-          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            observed_at,
+            account_order
+          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         `)
         .run(
           observation.authorization_id,
@@ -3989,14 +3997,15 @@ export class Repository {
           observation.adapter_invocation,
           observation.result_status,
           observation.classified_category,
-          observation.observed_at
+          observation.observed_at,
+          nextOrder
         );
 
       return 'RECORDED';
     });
   }
 
-  private mapProviderHealthObservation(row: Record<string, unknown>): ProviderHealthObservation {
+  private mapProviderHealthObservation(row: Record<string, unknown>): ProviderHealthObservationRecord {
     return {
       authorization_id: String(row.authorization_id),
       execution_id: String(row.execution_id),
@@ -4011,8 +4020,9 @@ export class Repository {
       mode: String(row.mode) as 'LEGACY' | 'SCHEDULED',
       adapter_invocation: String(row.adapter_invocation) as 'RETURNED' | 'THREW',
       result_status: String(row.result_status),
-      classified_category: String(row.classified_category) as ProviderHealthObservation['classified_category'],
+      classified_category: String(row.classified_category) as ProviderHealthObservationCategory,
       observed_at: String(row.observed_at),
+      account_order: row.account_order !== null && row.account_order !== undefined ? Number(row.account_order) : null,
     };
   }
 }
