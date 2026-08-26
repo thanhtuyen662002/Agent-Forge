@@ -196,11 +196,35 @@ export class ProviderHealthObservationService {
       };
     }
 
+    if (assignment.project_id !== provenance.projectId) {
+      return {
+        status: 'REJECTED',
+        observation: null,
+        reason: `ASSIGNMENT_PROJECT_ID_MISMATCH: Assignment project_id "${assignment.project_id}" does not match provenance projectId "${provenance.projectId}".`,
+      };
+    }
+
     if (assignment.task_id !== provenance.taskId) {
       return {
         status: 'REJECTED',
         observation: null,
         reason: `ASSIGNMENT_TASK_ID_MISMATCH: Assignment task_id "${assignment.task_id}" does not match provenance taskId "${provenance.taskId}".`,
+      };
+    }
+
+    if (assignment.attempt_id !== provenance.attemptId) {
+      return {
+        status: 'REJECTED',
+        observation: null,
+        reason: `ASSIGNMENT_ATTEMPT_ID_MISMATCH: Assignment attempt_id "${assignment.attempt_id}" does not match provenance attemptId "${provenance.attemptId}".`,
+      };
+    }
+
+    if (assignment.routing_decision_id !== provenance.routingDecisionId) {
+      return {
+        status: 'REJECTED',
+        observation: null,
+        reason: `ASSIGNMENT_ROUTING_DECISION_ID_MISMATCH: Assignment routing_decision_id "${assignment.routing_decision_id}" does not match provenance routingDecisionId "${provenance.routingDecisionId}".`,
       };
     }
 

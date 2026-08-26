@@ -3593,6 +3593,63 @@ export class Repository {
 
   public claimProviderHealthObservation(observation: ProviderHealthObservation): 'RECORDED' | 'ALREADY_RECORDED' {
     return this.runInImmediateTransaction(() => {
+      // 1. Runtime shape validation
+      if (
+        !observation ||
+        typeof observation.authorization_id !== 'string' ||
+        observation.authorization_id.trim() === '' ||
+        typeof observation.execution_id !== 'string' ||
+        observation.execution_id.trim() === '' ||
+        typeof observation.account_id !== 'string' ||
+        observation.account_id.trim() === '' ||
+        typeof observation.provider_id !== 'string' ||
+        observation.provider_id.trim() === '' ||
+        typeof observation.resource_id !== 'string' ||
+        observation.resource_id.trim() === '' ||
+        typeof observation.assignment_id !== 'string' ||
+        observation.assignment_id.trim() === '' ||
+        typeof observation.routing_decision_id !== 'string' ||
+        observation.routing_decision_id.trim() === '' ||
+        observation.provenance_version !== 1 ||
+        observation.provenance_source !== 'PROVIDER_DISPATCH_SERVICE' ||
+        (observation.mode !== 'LEGACY' && observation.mode !== 'SCHEDULED') ||
+        (observation.adapter_invocation !== 'RETURNED' && observation.adapter_invocation !== 'THREW') ||
+        typeof observation.observed_at !== 'string' ||
+        observation.observed_at.trim() === '' ||
+        isNaN(Date.parse(observation.observed_at))
+      ) {
+        throw new Error('INVALID_OBSERVATION_SHAPE: Observation fails runtime shape validation.');
+      }
+
+      // 2. Bounded result_status validation
+      const VALID_RESULT_STATUSES = new Set(['COMPLETED', 'FAILED', 'CANCELLED', 'AWAITING_OWNER']);
+      if (!VALID_RESULT_STATUSES.has(observation.result_status)) {
+        throw new Error(`INVALID_RESULT_STATUS: Unsupported result_status "${observation.result_status}".`);
+      }
+
+      // 3. Bounded classified_category validation
+      const VALID_OBSERVATION_CATEGORIES = new Set<string>([
+        'SUCCESS',
+        'AWAITING_OWNER',
+        'ADAPTER_THROW',
+        'RATE_LIMITED',
+        'QUOTA_EXHAUSTED',
+        'AUTHENTICATION_FAILURE',
+        'RESOURCE_UNAVAILABLE',
+        'CANCELLED',
+        'POLICY_DENIAL',
+        'PROTOCOL_INVALID',
+        'LOCAL_PROCESS_FAILURE',
+        'TIMEOUT',
+        'NONZERO_EXIT',
+        'OUTPUT_LIMIT_EXCEEDED',
+        'UNKNOWN',
+      ]);
+      if (!VALID_OBSERVATION_CATEGORIES.has(observation.classified_category)) {
+        throw new Error(`INVALID_CLASSIFIED_CATEGORY: Unsupported classified_category "${observation.classified_category}".`);
+      }
+
+      // 4. Duplicate-first check
       const existingRow = this.db
         .prepare('SELECT * FROM provider_health_observations WHERE authorization_id = ?')
         .get(observation.authorization_id) as Record<string, unknown> | undefined;
@@ -3623,6 +3680,137 @@ export class Repository {
         );
       }
 
+      // 5. ExecutionAuthorization lookup + validation
+      const auth = this.getExecutionAuthorization(observation.authorization_id);
+      if (!auth) {
+        throw new Error(`AUTHORIZATION_NOT_FOUND: ExecutionAuthorization "${observation.authorization_id}" not found.`);
+      }
+
+      if (auth.status !== 'DISPATCHED') {
+        throw new Error(
+          `AUTHORIZATION_NOT_DISPATCHED: ExecutionAuthorization "${auth.id}" status is "${auth.status}", expected "DISPATCHED".`
+        );
+      }
+
+      if (auth.routing_decision_id !== observation.routing_decision_id) {
+        throw new Error(
+          `ROUTING_DECISION_ID_MISMATCH: Authorization routing_decision_id "${auth.routing_decision_id}" does not match observation routing_decision_id "${observation.routing_decision_id}".`
+        );
+      }
+
+      if (auth.selected_provider_id !== observation.provider_id) {
+        throw new Error(
+          `PROVIDER_ID_MISMATCH: Authorization selected_provider_id "${auth.selected_provider_id}" does not match observation provider_id "${observation.provider_id}".`
+        );
+      }
+
+      if (auth.selected_resource_id !== observation.resource_id) {
+        throw new Error(
+          `RESOURCE_ID_MISMATCH: Authorization selected_resource_id "${auth.selected_resource_id}" does not match observation resource_id "${observation.resource_id}".`
+        );
+      }
+
+      if (auth.attempt_id !== observation.attempt_id) {
+        throw new Error(
+          `ATTEMPT_ID_MISMATCH: Authorization attempt_id "${auth.attempt_id}" does not match observation attempt_id "${observation.attempt_id}".`
+        );
+      }
+
+      // 6. AgentAssignment lookup + validation
+      const assignment = this.getAgentAssignment(observation.assignment_id);
+      if (!assignment) {
+        throw new Error(`ASSIGNMENT_NOT_FOUND: AgentAssignment "${observation.assignment_id}" not found.`);
+      }
+
+      if (assignment.project_id !== auth.project_id) {
+        throw new Error(
+          `PROJECT_ID_MISMATCH: Assignment project_id "${assignment.project_id}" does not match authorization project_id "${auth.project_id}".`
+        );
+      }
+
+      if (assignment.task_id !== auth.task_id) {
+        throw new Error(
+          `TASK_ID_MISMATCH: Assignment task_id "${assignment.task_id}" does not match authorization task_id "${auth.task_id}".`
+        );
+      }
+
+      if (assignment.attempt_id !== auth.attempt_id) {
+        throw new Error(
+          `ATTEMPT_ID_MISMATCH: Assignment attempt_id "${assignment.attempt_id}" does not match authorization attempt_id "${auth.attempt_id}".`
+        );
+      }
+
+      if (assignment.routing_decision_id !== auth.routing_decision_id) {
+        throw new Error(
+          `ROUTING_DECISION_ID_MISMATCH: Assignment routing_decision_id "${assignment.routing_decision_id}" does not match authorization routing_decision_id "${auth.routing_decision_id}".`
+        );
+      }
+
+      if (assignment.selected_provider_id !== observation.provider_id) {
+        throw new Error(
+          `ASSIGNMENT_PROVIDER_ID_MISMATCH: Assignment selected_provider_id "${assignment.selected_provider_id}" does not match observation provider_id "${observation.provider_id}".`
+        );
+      }
+
+      if (assignment.selected_account_id !== observation.account_id) {
+        throw new Error(
+          `ASSIGNMENT_ACCOUNT_ID_MISMATCH: Assignment selected_account_id "${assignment.selected_account_id}" does not match observation account_id "${observation.account_id}".`
+        );
+      }
+
+      if (assignment.selected_resource_id !== observation.resource_id) {
+        throw new Error(
+          `ASSIGNMENT_RESOURCE_ID_MISMATCH: Assignment selected_resource_id "${assignment.selected_resource_id}" does not match observation resource_id "${observation.resource_id}".`
+        );
+      }
+
+      // 7. TaskAttempt coherence when attempt_id non-null
+      if (observation.attempt_id != null) {
+        const attempt = this.getTaskAttempt(observation.attempt_id);
+        if (!attempt) {
+          throw new Error(`TASK_ATTEMPT_NOT_FOUND: TaskAttempt "${observation.attempt_id}" not found.`);
+        }
+        if (attempt.task_id !== auth.task_id) {
+          throw new Error(
+            `TASK_ATTEMPT_TASK_MISMATCH: TaskAttempt task_id "${attempt.task_id}" does not match authorization task_id "${auth.task_id}".`
+          );
+        }
+      }
+
+      // 8. ProviderAccount coherence
+      const account = this.getProviderAccount(observation.account_id);
+      if (!account) {
+        throw new Error(`PROVIDER_ACCOUNT_NOT_FOUND: ProviderAccount "${observation.account_id}" not found.`);
+      }
+      if (account.provider_id !== observation.provider_id) {
+        throw new Error(
+          `ACCOUNT_PROVIDER_MISMATCH: ProviderAccount provider_id "${account.provider_id}" does not match observation provider_id "${observation.provider_id}".`
+        );
+      }
+
+      // 9. Provider coherence
+      const provider = this.getProvider(observation.provider_id);
+      if (!provider) {
+        throw new Error(`PROVIDER_NOT_FOUND: Provider "${observation.provider_id}" not found.`);
+      }
+
+      // 10. ProviderResource coherence
+      const resource = this.getProviderResource(observation.resource_id);
+      if (!resource) {
+        throw new Error(`PROVIDER_RESOURCE_NOT_FOUND: ProviderResource "${observation.resource_id}" not found.`);
+      }
+      if (resource.provider_id !== observation.provider_id) {
+        throw new Error(
+          `RESOURCE_PROVIDER_MISMATCH: ProviderResource provider_id "${resource.provider_id}" does not match observation provider_id "${observation.provider_id}".`
+        );
+      }
+      if (resource.provider_account_id != null && resource.provider_account_id !== observation.account_id) {
+        throw new Error(
+          `RESOURCE_ACCOUNT_MISMATCH: ProviderResource provider_account_id "${resource.provider_account_id}" does not match observation account_id "${observation.account_id}".`
+        );
+      }
+
+      // 11. Insert row
       this.db
         .prepare(`
           INSERT INTO provider_health_observations (
