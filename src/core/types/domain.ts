@@ -995,3 +995,50 @@ export interface HandoffContext {
   created_at: string;
   consumed_at: string | null;
 }
+
+export type ProviderHealthObservationCategory =
+  | 'SUCCESS'
+  | 'AWAITING_OWNER'
+  | 'ADAPTER_THROW'
+  | 'RATE_LIMITED'
+  | 'QUOTA_EXHAUSTED'
+  | 'AUTHENTICATION_FAILURE'
+  | 'RESOURCE_UNAVAILABLE'
+  | 'CANCELLED'
+  | 'POLICY_DENIAL'
+  | 'PROTOCOL_INVALID'
+  | 'LOCAL_PROCESS_FAILURE'
+  | 'TIMEOUT'
+  | 'NONZERO_EXIT'
+  | 'OUTPUT_LIMIT_EXCEEDED'
+  | 'UNKNOWN';
+
+export interface ProviderHealthObservation {
+  authorization_id: string;
+  execution_id: string;
+  account_id: string;
+  provider_id: string;
+  resource_id: string;
+  assignment_id: string;
+  attempt_id: string | null;
+  routing_decision_id: string;
+  provenance_version: 1;
+  provenance_source: 'PROVIDER_DISPATCH_SERVICE';
+  mode: 'LEGACY' | 'SCHEDULED';
+  adapter_invocation: 'RETURNED' | 'THREW';
+  result_status: string;
+  classified_category: ProviderHealthObservationCategory;
+  observed_at: string;
+}
+
+export type ProviderHealthObservationIngestStatus =
+  | 'RECORDED'
+  | 'ALREADY_RECORDED'
+  | 'NOT_APPLICABLE'
+  | 'REJECTED';
+
+export interface ProviderHealthObservationIngestResult {
+  status: ProviderHealthObservationIngestStatus;
+  observation: ProviderHealthObservation | null;
+  reason?: string;
+}
