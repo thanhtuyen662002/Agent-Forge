@@ -3953,6 +3953,7 @@ export class Repository {
       let healthActionPlanVersion: 1 | null = null;
       let healthAction: ProviderAccountHealthAction | null = null;
       let healthActionCooldownDurationMs: number | null = null;
+      let healthActionCooldownAnchorAt: string | null = null;
 
       const routingEventRow = this.db
         .prepare(`
@@ -4007,6 +4008,14 @@ export class Repository {
                 healthActionPlanVersion = 1;
                 healthAction = plan.action;
                 healthActionCooldownDurationMs = plan.cooldownDurationMs ?? null;
+                if (
+                  plan.action === 'RECORD_RATE_LIMITED' &&
+                  plan.cooldownDurationMs !== null &&
+                  plan.cooldownDurationMs !== undefined &&
+                  plan.cooldownDurationMs > 0
+                ) {
+                  healthActionCooldownAnchorAt = new Date().toISOString();
+                }
               }
             }
           }
@@ -4041,8 +4050,9 @@ export class Repository {
             account_order,
             health_action_plan_version,
             health_action,
-            health_action_cooldown_duration_ms
-          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            health_action_cooldown_duration_ms,
+            health_action_cooldown_anchor_at
+          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         `)
         .run(
           observation.authorization_id,
@@ -4063,7 +4073,8 @@ export class Repository {
           nextOrder,
           healthActionPlanVersion,
           healthAction,
-          healthActionCooldownDurationMs
+          healthActionCooldownDurationMs,
+          healthActionCooldownAnchorAt
         );
 
       return 'RECORDED';
@@ -4091,6 +4102,7 @@ export class Repository {
       health_action_plan_version: row.health_action_plan_version !== null && row.health_action_plan_version !== undefined ? Number(row.health_action_plan_version) as 1 : null,
       health_action: row.health_action ? String(row.health_action) as ProviderAccountHealthAction : null,
       health_action_cooldown_duration_ms: row.health_action_cooldown_duration_ms !== null && row.health_action_cooldown_duration_ms !== undefined ? Number(row.health_action_cooldown_duration_ms) : null,
+      health_action_cooldown_anchor_at: row.health_action_cooldown_anchor_at ? String(row.health_action_cooldown_anchor_at) : null,
     };
   }
 }

@@ -1055,6 +1055,7 @@ export interface ProviderHealthObservation {
   health_action_plan_version?: 1 | null;
   health_action?: ProviderAccountHealthAction | null;
   health_action_cooldown_duration_ms?: number | null;
+  health_action_cooldown_anchor_at?: string | null;
 }
 
 export interface ProviderHealthObservationRecord extends ProviderHealthObservation {
@@ -1062,6 +1063,7 @@ export interface ProviderHealthObservationRecord extends ProviderHealthObservati
   health_action_plan_version: 1 | null;
   health_action: ProviderAccountHealthAction | null;
   health_action_cooldown_duration_ms: number | null;
+  health_action_cooldown_anchor_at: string | null;
 }
 
 export type ProviderHealthObservationIngestStatus =

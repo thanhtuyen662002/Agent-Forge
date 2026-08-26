@@ -318,5 +318,40 @@ The R5 planning sequence is governed by the authoritative R5-v1.1 roadmap:
 - **NULL Plan vs NO_MUTATION**: A `NULL` action plan signifies missing historical authority (legacy observation) and is never equivalent to `NO_MUTATION`. Newly derived action plans always persist `health_action_plan_version = 1`.
 - **NO_MUTATION Precedence & Watermarks**: `NO_MUTATION` is a valid durable action plan, but it does NOT supersede older unapplied actionable health evidence and must NOT advance the actionable health stale watermark.
 - **Boundaries**:
-  - Temporal cooldown expiration (`cooldown_until`) and temporal anchor selection remain unpersisted and are deferred to a dedicated cooldown replay gate.
   - No health application CAS or `AccountHealthService` mutation is performed during observation ingestion.
+
+---
+
+## 12. R5H Durable Provider Health Cooldown Replay Authority & Temporal Anchor
+
+### 1. Authoritative Temporal Ingestion Model
+- **Authoritative Cooldown Start**: `DURABLE_ACTION_PLAN_INGESTION_TIME`. Cooldown duration starts when the actionable health plan becomes durable (DURABLE EVIDENCE COMMIT TIME).
+- **Single Trusted Allocator**: Inside `Repository.claimProviderHealthObservation()`, within the same `IMMEDIATE` transaction that allocates `account_order` and derives the action plan, the Repository generates an authoritative wall-clock timestamp (`health_action_cooldown_anchor_at = new Date().toISOString()`) for new `RECORD_RATE_LIMITED` actions with positive duration.
+- **Non-Authorities**: The temporal anchor is explicitly NOT:
+  - `observed_at`: caller-provided audit chronology only.
+  - Provider completion time: not currently captured/bound.
+  - Routing decision time: occurs before execution/failure.
+  - Authorization time: occurs before execution/failure.
+  - Application time: closes the application delay / restart extension hazard.
+- **Observation Write Delay**: Cooldown duration starts at durable evidence commit time; observation persistence delay can shift the initial anchor.
+
+### 2. Schema and Derived Absolute Until
+- **Storage Model**: `health_action_cooldown_anchor_at` is persisted in `provider_health_observations` alongside `health_action_cooldown_duration_ms`.
+- **No Duplicate Storage**: `cooldown_until` is not stored as a redundant column. The canonical absolute until is derived deterministically:
+  $$\text{derivedCooldownUntilMs} = \text{Date.parse}(\text{health\_action\_cooldown\_anchor\_at}) + \text{health\_action\_cooldown\_duration\_ms}$$
+- **Non-Rate-Limited Actions**: For `NO_MUTATION`, `RECORD_SUCCESS`, `RECORD_QUOTA_EXHAUSTED`, `RECORD_AUTH_ERROR`, and legacy action plans, `health_action_cooldown_anchor_at` is strictly `NULL`.
+
+### 3. Legacy v13 & Upgrade Rules
+- **No Backfill**: Migration 14 performs no backfill on existing v13 rows (`health_action_cooldown_anchor_at` remains `NULL`).
+- **Temporal Authority Unknown**: Legacy v13 `RECORD_RATE_LIMITED` rows have known action authority but unknown temporal replay authority and are not automatically replay-applicable without explicit policy resolution.
+- **Action Plan Version**: `health_action_plan_version` remains `1` because action derivation logic is unchanged.
+
+### 4. Expired Rate-Limit Semantics & Precedence
+- **Expiry Semantics**: When `derivedCooldownUntilMs <= now`, the temporary routing block has passed. Expiry does NOT convert the event into `NO_MUTATION`, `AVAILABLE`, or `SUCCESS`.
+- **Precedence**: A newer `RECORD_RATE_LIMITED` observation (even if its derived cooldown has expired) represents valid newer actionable evidence that supersedes older actionable states (e.g., `RECORD_AUTH_ERROR`) and advances the actionable stale authority.
+- **Router Behavior**: `RoleAwareRoutingService` evaluates active vs expired cooldowns dynamically during routing; expired cooldowns do not block routing, and the router does not mutate database health status.
+
+### 5. Single-Writer & Application Boundaries
+- **Single Semantic Writer**: `AccountHealthService` remains the sole semantic authority for health state mutations.
+- **Historical Replay API Gap**: The current `AccountHealthService.recordRateLimited()` requires strictly future cooldowns; historical replay and atomic CAS application remain separate future gates.
+- **No Ingestion Mutations**: Ingestion of observations and cooldown anchors performs zero health state mutations.
