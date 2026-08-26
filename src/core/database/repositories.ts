@@ -327,24 +327,6 @@ export class Repository {
   // ==========================================
   // Failover Transitions (Durable Whole-Attempt Lineage)
   // ==========================================
-  public createFailoverTransition(transition: FailoverTransition): void {
-    this.db
-      .prepare(`
-        INSERT INTO failover_transitions (
-          id, task_id, root_attempt_id, source_attempt_id, successor_attempt_id, failover_ordinal, created_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?)
-      `)
-      .run(
-        transition.id,
-        transition.task_id,
-        transition.root_attempt_id,
-        transition.source_attempt_id,
-        transition.successor_attempt_id,
-        transition.failover_ordinal,
-        transition.created_at
-      );
-  }
-
   public getFailoverTransition(id: string): FailoverTransition | null {
     const row = this.db
       .prepare('SELECT * FROM failover_transitions WHERE id = ?')
@@ -464,11 +446,31 @@ export class Repository {
       // C. Check existing transition by source_attempt_id (Idempotency authority)
       const existingTransition = this.getFailoverTransitionBySource(params.sourceAttemptId);
       if (existingTransition) {
+        if (
+          existingTransition.source_attempt_id !== sourceAttempt.id ||
+          existingTransition.task_id !== sourceAttempt.task_id ||
+          existingTransition.failover_ordinal < 1
+        ) {
+          throw new Error(
+            `[FailoverLineageIntegrity] Corrupt existing transition "${existingTransition.id}" for source "${params.sourceAttemptId}": task or ordinal mismatch.`
+          );
+        }
         const existingSuccessor = this.getTaskAttempt(existingTransition.successor_attempt_id);
+        if (!existingSuccessor || existingSuccessor.task_id !== sourceAttempt.task_id) {
+          throw new Error(
+            `[FailoverLineageIntegrity] Corrupt existing transition "${existingTransition.id}": successor "${existingTransition.successor_attempt_id}" missing or task mismatch.`
+          );
+        }
+        const existingRoot = this.getTaskAttempt(existingTransition.root_attempt_id);
+        if (!existingRoot || existingRoot.task_id !== sourceAttempt.task_id) {
+          throw new Error(
+            `[FailoverLineageIntegrity] Corrupt existing transition "${existingTransition.id}": root "${existingTransition.root_attempt_id}" missing or task mismatch.`
+          );
+        }
         return {
           status: 'ALREADY_CLAIMED',
           transition: existingTransition,
-          successorAttempt: existingSuccessor ?? undefined,
+          successorAttempt: existingSuccessor,
         };
       }
 
@@ -506,6 +508,28 @@ export class Repository {
         rootAttemptId = params.sourceAttemptId;
         failoverOrdinal = 1;
       } else {
+        if (
+          predecessorTransition.successor_attempt_id !== sourceAttempt.id ||
+          predecessorTransition.task_id !== sourceAttempt.task_id ||
+          predecessorTransition.failover_ordinal < 1
+        ) {
+          throw new Error(
+            `[FailoverLineageIntegrity] Malformed predecessor transition "${predecessorTransition.id}": task, successor, or ordinal mismatch.`
+          );
+        }
+        const predecessorSource = this.getTaskAttempt(predecessorTransition.source_attempt_id);
+        if (!predecessorSource || predecessorSource.task_id !== sourceAttempt.task_id) {
+          throw new Error(
+            `[FailoverLineageIntegrity] Malformed predecessor transition "${predecessorTransition.id}": source attempt "${predecessorTransition.source_attempt_id}" missing or task mismatch.`
+          );
+        }
+        const predecessorRoot = this.getTaskAttempt(predecessorTransition.root_attempt_id);
+        if (!predecessorRoot || predecessorRoot.task_id !== sourceAttempt.task_id) {
+          throw new Error(
+            `[FailoverLineageIntegrity] Malformed predecessor transition "${predecessorTransition.id}": root attempt "${predecessorTransition.root_attempt_id}" missing or task mismatch.`
+          );
+        }
+
         rootAttemptId = predecessorTransition.root_attempt_id;
         failoverOrdinal = predecessorTransition.failover_ordinal + 1;
       }

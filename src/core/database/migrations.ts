@@ -857,21 +857,25 @@ export const MIGRATIONS: Migration[] = [
         );
       }
 
-      // 2. Create unique index on task_attempts(task_id, attempt_number)
+      // 2. Create unique indexes on task_attempts
       db.exec(`
         CREATE UNIQUE INDEX IF NOT EXISTS idx_task_attempts_task_number_unique ON task_attempts(task_id, attempt_number);
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_task_attempts_task_id_id_unique ON task_attempts(task_id, id);
       `);
 
-      // 3. Create failover_transitions table
+      // 3. Create failover_transitions table with composite foreign keys to guarantee same-task integrity
       db.exec(`
         CREATE TABLE IF NOT EXISTS failover_transitions (
           id TEXT PRIMARY KEY,
           task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
-          root_attempt_id TEXT NOT NULL REFERENCES task_attempts(id) ON DELETE CASCADE,
-          source_attempt_id TEXT NOT NULL REFERENCES task_attempts(id) ON DELETE CASCADE,
-          successor_attempt_id TEXT NOT NULL REFERENCES task_attempts(id) ON DELETE CASCADE,
+          root_attempt_id TEXT NOT NULL,
+          source_attempt_id TEXT NOT NULL,
+          successor_attempt_id TEXT NOT NULL,
           failover_ordinal INTEGER NOT NULL CHECK(failover_ordinal >= 1),
           created_at TEXT NOT NULL,
+          FOREIGN KEY (task_id, root_attempt_id) REFERENCES task_attempts(task_id, id) ON DELETE CASCADE,
+          FOREIGN KEY (task_id, source_attempt_id) REFERENCES task_attempts(task_id, id) ON DELETE CASCADE,
+          FOREIGN KEY (task_id, successor_attempt_id) REFERENCES task_attempts(task_id, id) ON DELETE CASCADE,
           UNIQUE(source_attempt_id),
           UNIQUE(successor_attempt_id),
           UNIQUE(root_attempt_id, failover_ordinal)
