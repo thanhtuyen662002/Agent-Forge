@@ -251,6 +251,7 @@ export interface Task {
   progress_computed_at: string | null;
   acceptance_criteria: string[];
   constraints: string[];
+  ownership_epoch?: number;
   created_at: string;
   updated_at: string;
 }
@@ -269,7 +270,8 @@ export interface TaskAttempt {
   id: string;
   task_id: string;
   attempt_number: number;
-  agent_id: string;
+  agent_id: string | null;
+  agent_profile_id?: string | null;
   status: string;
   started_at: string;
   ended_at: string | null;
@@ -469,6 +471,8 @@ export interface PolicyRule {
 }
 
 export type ExecutionAuthorizationStatus = 'AUTHORIZED' | 'DISPATCHED' | 'INVALIDATED';
+export type AdapterOutcome = 'RETURNED' | 'THREW' | 'CANCELLED' | 'TIMED_OUT' | 'UNKNOWN';
+export type ProviderTerminationStatus = 'CONFIRMED_TERMINATED' | 'UNRESOLVED';
 
 export interface ExecutionAuthorization {
   id: string;
@@ -491,6 +495,15 @@ export interface ExecutionAuthorization {
   status: ExecutionAuthorizationStatus;
   created_at: string;
   dispatched_at: string | null;
+  task_ownership_epoch?: number;
+  execution_id?: string | null;
+  adapter_started_at?: string | null;
+  adapter_finished_at?: string | null;
+  adapter_outcome?: AdapterOutcome | null;
+  cancellation_requested_at?: string | null;
+  termination_confirmed_at?: string | null;
+  termination_status?: ProviderTerminationStatus | null;
+  termination_source?: string | null;
 }
 
 export type UpdateState =
@@ -1120,4 +1133,53 @@ export interface ProviderHealthRoutingSafetyEvaluation {
   effectiveHeadAuthorizationId: string | null;
   effectiveHeadHealthAction: string | null;
   reason?: string;
+}
+
+// ==========================================
+// 6. R5I Durable Handoff Transfer Entities
+// ==========================================
+
+export const HandoffTransferStatusEnum = z.enum([
+  'REQUESTED',
+  'FROZEN',
+  'QUIESCING',
+  'RELINQUISHED',
+  'SUCCESSOR_PREPARED',
+  'ROUTED',
+  'AUTHORIZED',
+  'ACCEPTED',
+  'COMPLETED',
+  'FAILED',
+  'CANCELLED',
+  'EXPIRED',
+]);
+export type HandoffTransferStatus = z.infer<typeof HandoffTransferStatusEnum>;
+
+export interface HandoffTransfer {
+  id: string;
+  request_id: string;
+  task_id: string;
+  source_attempt_id: string;
+  successor_attempt_id: string | null;
+  source_assignment_id: string;
+  successor_assignment_id: string | null;
+  successor_role_profile_id: string | null;
+  successor_agent_profile_id: string | null;
+  successor_agent_id: string | null;
+  handoff_context_id: string;
+  checkpoint_id: string | null;
+  source_authorization_id: string | null;
+  successor_authorization_id: string | null;
+  reason: string;
+  status: HandoffTransferStatus;
+  source_ownership_epoch: number;
+  successor_ownership_epoch: number | null;
+  version: number;
+  frozen_at: string | null;
+  quiescing_at: string | null;
+  relinquished_at: string | null;
+  accepted_at: string | null;
+  completed_at: string | null;
+  created_at: string;
+  updated_at: string;
 }
