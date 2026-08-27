@@ -1411,6 +1411,15 @@ export class Repository {
         return { success: false, alreadyClaimed: false, error: 'AUTHORIZATION_NOT_FOUND' };
       }
 
+      // Status Fencing: start claim may succeed ONLY when status === 'DISPATCHED'
+      if (auth.status !== 'DISPATCHED') {
+        return {
+          success: false,
+          alreadyClaimed: false,
+          error: `AUTHORIZATION_NOT_DISPATCHED: expected status DISPATCHED, found ${auth.status}`,
+        };
+      }
+
       // Check current task ownership epoch
       const currentTaskEpoch = this.getTaskOwnershipEpoch(auth.task_id);
       if (currentTaskEpoch !== params.expectedEpoch || auth.task_ownership_epoch !== params.expectedEpoch) {
@@ -1438,7 +1447,7 @@ export class Repository {
         .prepare(`
           UPDATE execution_authorizations
           SET execution_id = ?, adapter_started_at = ?
-          WHERE id = ? AND adapter_started_at IS NULL AND task_ownership_epoch = ?
+          WHERE id = ? AND adapter_started_at IS NULL AND task_ownership_epoch = ? AND status = 'DISPATCHED'
         `)
         .run(params.executionId, startedAt, params.authorizationId, params.expectedEpoch);
 
@@ -1513,7 +1522,15 @@ export class Repository {
         return { success: false, alreadyRequested: false, error: 'AUTHORIZATION_NOT_FOUND' };
       }
 
-      if (auth.execution_id && auth.execution_id !== params.executionId) {
+      if (!auth.adapter_started_at) {
+        return {
+          success: false,
+          alreadyRequested: false,
+          error: 'EXECUTION_NOT_STARTED',
+        };
+      }
+
+      if (auth.execution_id !== params.executionId) {
         return {
           success: false,
           alreadyRequested: false,
@@ -1530,9 +1547,9 @@ export class Repository {
         .prepare(`
           UPDATE execution_authorizations
           SET cancellation_requested_at = ?
-          WHERE id = ? AND cancellation_requested_at IS NULL
+          WHERE id = ? AND execution_id = ? AND cancellation_requested_at IS NULL
         `)
-        .run(requestedAt, params.authorizationId);
+        .run(requestedAt, params.authorizationId, params.executionId);
 
       return { success: res.changes === 1, alreadyRequested: false };
     });
@@ -1544,7 +1561,6 @@ export class Repository {
     terminationStatus: ProviderTerminationStatus;
     terminationSource: string;
     confirmedAt?: string;
-    outcome?: AdapterOutcome;
   }): { success: boolean; alreadyConfirmed: boolean; error?: string } {
     return this.runInImmediateTransaction(() => {
       const auth = this.getExecutionAuthorization(params.authorizationId);
@@ -1552,7 +1568,15 @@ export class Repository {
         return { success: false, alreadyConfirmed: false, error: 'AUTHORIZATION_NOT_FOUND' };
       }
 
-      if (auth.execution_id && auth.execution_id !== params.executionId) {
+      if (!auth.adapter_started_at) {
+        return {
+          success: false,
+          alreadyConfirmed: false,
+          error: 'EXECUTION_NOT_STARTED',
+        };
+      }
+
+      if (auth.execution_id !== params.executionId) {
         return {
           success: false,
           alreadyConfirmed: false,
@@ -1560,42 +1584,67 @@ export class Repository {
         };
       }
 
-      if (auth.termination_confirmed_at && auth.termination_status === params.terminationStatus) {
-        return { success: true, alreadyConfirmed: true };
-      }
-
-      if (auth.termination_status && auth.termination_status !== params.terminationStatus) {
+      if (auth.termination_status === 'CONFIRMED_TERMINATED') {
+        if (params.terminationStatus === 'CONFIRMED_TERMINATED') {
+          if (auth.termination_source === params.terminationSource) {
+            return { success: true, alreadyConfirmed: true };
+          }
+          return {
+            success: false,
+            alreadyConfirmed: false,
+            error: `TERMINATION_SOURCE_CONFLICT: already confirmed by ${auth.termination_source}, contradictory source ${params.terminationSource}`,
+          };
+        }
         return {
           success: false,
           alreadyConfirmed: false,
-          error: `TERMINATION_STATUS_CONFLICT: already ${auth.termination_status}, attempted ${params.terminationStatus}`,
+          error: 'TERMINATION_STATUS_CONFLICT: cannot transition CONFIRMED_TERMINATED to UNRESOLVED',
         };
       }
 
-      const confirmedAt = params.confirmedAt ?? new Date().toISOString();
-      const outcome = params.outcome ?? auth.adapter_outcome ?? null;
-      const finishedAt = auth.adapter_finished_at ?? confirmedAt;
+      if (auth.termination_status === 'UNRESOLVED') {
+        if (params.terminationStatus === 'UNRESOLVED') {
+          if (auth.termination_source === params.terminationSource) {
+            return { success: true, alreadyConfirmed: true };
+          }
+          return {
+            success: false,
+            alreadyConfirmed: false,
+            error: `TERMINATION_SOURCE_CONFLICT: already UNRESOLVED with source ${auth.termination_source}, contradictory source ${params.terminationSource}`,
+          };
+        }
+      }
 
-      const res = this.db
-        .prepare(`
-          UPDATE execution_authorizations
-          SET termination_status = ?,
-              termination_source = ?,
-              termination_confirmed_at = ?,
-              adapter_finished_at = COALESCE(adapter_finished_at, ?),
-              adapter_outcome = COALESCE(adapter_outcome, ?)
-          WHERE id = ?
-        `)
-        .run(
-          params.terminationStatus,
-          params.terminationSource,
-          confirmedAt,
-          finishedAt,
-          outcome,
-          params.authorizationId
-        );
+      if (params.terminationStatus === 'UNRESOLVED') {
+        const res = this.db
+          .prepare(`
+            UPDATE execution_authorizations
+            SET termination_status = 'UNRESOLVED',
+                termination_source = ?,
+                termination_confirmed_at = NULL
+            WHERE id = ? AND execution_id = ?
+          `)
+          .run(params.terminationSource, params.authorizationId, params.executionId);
 
-      return { success: res.changes === 1, alreadyConfirmed: false };
+        return { success: res.changes === 1, alreadyConfirmed: false };
+      }
+
+      if (params.terminationStatus === 'CONFIRMED_TERMINATED') {
+        const confirmedAt = params.confirmedAt ?? new Date().toISOString();
+        const res = this.db
+          .prepare(`
+            UPDATE execution_authorizations
+            SET termination_status = 'CONFIRMED_TERMINATED',
+                termination_source = ?,
+                termination_confirmed_at = ?
+            WHERE id = ? AND execution_id = ?
+          `)
+          .run(params.terminationSource, confirmedAt, params.authorizationId, params.executionId);
+
+        return { success: res.changes === 1, alreadyConfirmed: false };
+      }
+
+      return { success: false, alreadyConfirmed: false, error: 'INVALID_TERMINATION_STATUS' };
     });
   }
 
@@ -1732,11 +1781,27 @@ export class Repository {
   // ==========================================
   // Handoff Transfers (R5I Durable Authority)
   // ==========================================
-  public createHandoffTransfer(transfer: HandoffTransfer): { success: boolean; transfer: HandoffTransfer; duplicate: boolean } {
+  public createHandoffTransfer(transfer: HandoffTransfer): { success: boolean; transfer: HandoffTransfer; duplicate: boolean; error?: string } {
     return this.runInImmediateTransaction(() => {
       const existing = this.getHandoffTransferByRequestId(transfer.request_id);
       if (existing) {
-        return { success: true, transfer: existing, duplicate: true };
+        const matches =
+          existing.task_id === transfer.task_id &&
+          existing.source_attempt_id === transfer.source_attempt_id &&
+          existing.source_assignment_id === transfer.source_assignment_id &&
+          existing.reason === transfer.reason &&
+          existing.source_ownership_epoch === transfer.source_ownership_epoch;
+
+        if (matches) {
+          return { success: true, transfer: existing, duplicate: true };
+        }
+
+        return {
+          success: false,
+          transfer: existing,
+          duplicate: false,
+          error: `REQUEST_ID_CONFLICT: immutable request attributes do not match existing transfer for request_id ${transfer.request_id}`,
+        };
       }
 
       this.db
@@ -1744,12 +1809,12 @@ export class Repository {
           INSERT INTO handoff_transfers (
             id, request_id, task_id, source_attempt_id, successor_attempt_id,
             source_assignment_id, successor_assignment_id, successor_role_profile_id,
-            successor_agent_profile_id, successor_agent_id, handoff_context_id,
+            successor_agent_profile_id, handoff_context_id,
             checkpoint_id, source_authorization_id, successor_authorization_id,
             reason, status, source_ownership_epoch, successor_ownership_epoch,
             version, frozen_at, quiescing_at, relinquished_at, accepted_at,
             completed_at, created_at, updated_at
-          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         `)
         .run(
           transfer.id,
@@ -1761,8 +1826,7 @@ export class Repository {
           transfer.successor_assignment_id ?? null,
           transfer.successor_role_profile_id ?? null,
           transfer.successor_agent_profile_id ?? null,
-          transfer.successor_agent_id ?? null,
-          transfer.handoff_context_id,
+          transfer.handoff_context_id ?? null,
           transfer.checkpoint_id ?? null,
           transfer.source_authorization_id ?? null,
           transfer.successor_authorization_id ?? null,
@@ -1801,7 +1865,10 @@ export class Repository {
       .prepare(`
         SELECT * FROM handoff_transfers
         WHERE source_attempt_id = ?
-          AND status IN ('REQUESTED', 'FROZEN', 'QUIESCING', 'RELINQUISHED', 'SUCCESSOR_PREPARED', 'ROUTED', 'AUTHORIZED', 'ACCEPTED')
+          AND (
+            status IN ('REQUESTED', 'FROZEN', 'QUIESCING', 'RELINQUISHED', 'SUCCESSOR_PREPARED', 'ROUTED', 'AUTHORIZED', 'ACCEPTED')
+            OR relinquished_at IS NOT NULL
+          )
         LIMIT 1
       `)
       .get(sourceAttemptId) as Record<string, unknown> | undefined;
@@ -1852,7 +1919,7 @@ export class Repository {
       const successorAssignmentId = fields.successor_assignment_id !== undefined ? fields.successor_assignment_id : existing.successor_assignment_id;
       const successorRoleProfileId = fields.successor_role_profile_id !== undefined ? fields.successor_role_profile_id : existing.successor_role_profile_id;
       const successorAgentProfileId = fields.successor_agent_profile_id !== undefined ? fields.successor_agent_profile_id : existing.successor_agent_profile_id;
-      const successorAgentId = fields.successor_agent_id !== undefined ? fields.successor_agent_id : existing.successor_agent_id;
+      const handoffContextId = fields.handoff_context_id !== undefined ? fields.handoff_context_id : existing.handoff_context_id;
       const successorAuthorizationId = fields.successor_authorization_id !== undefined ? fields.successor_authorization_id : existing.successor_authorization_id;
       const successorOwnershipEpoch = fields.successor_ownership_epoch !== undefined ? fields.successor_ownership_epoch : existing.successor_ownership_epoch;
       const frozenAt = fields.frozen_at !== undefined ? fields.frozen_at : existing.frozen_at;
@@ -1869,7 +1936,7 @@ export class Repository {
               successor_assignment_id = ?,
               successor_role_profile_id = ?,
               successor_agent_profile_id = ?,
-              successor_agent_id = ?,
+              handoff_context_id = ?,
               successor_authorization_id = ?,
               successor_ownership_epoch = ?,
               version = ?,
@@ -1887,7 +1954,7 @@ export class Repository {
           successorAssignmentId,
           successorRoleProfileId,
           successorAgentProfileId,
-          successorAgentId,
+          handoffContextId,
           successorAuthorizationId,
           successorOwnershipEpoch,
           newVersion,
@@ -1920,8 +1987,7 @@ export class Repository {
       successor_assignment_id: row.successor_assignment_id ? String(row.successor_assignment_id) : null,
       successor_role_profile_id: row.successor_role_profile_id ? String(row.successor_role_profile_id) : null,
       successor_agent_profile_id: row.successor_agent_profile_id ? String(row.successor_agent_profile_id) : null,
-      successor_agent_id: row.successor_agent_id ? String(row.successor_agent_id) : null,
-      handoff_context_id: String(row.handoff_context_id),
+      handoff_context_id: row.handoff_context_id ? String(row.handoff_context_id) : null,
       checkpoint_id: row.checkpoint_id ? String(row.checkpoint_id) : null,
       source_authorization_id: row.source_authorization_id ? String(row.source_authorization_id) : null,
       successor_authorization_id: row.successor_authorization_id ? String(row.successor_authorization_id) : null,
