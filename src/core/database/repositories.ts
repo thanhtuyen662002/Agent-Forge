@@ -64,6 +64,10 @@ import {
   ProviderHealthObservationApplicationResult,
   ProviderHealthRoutingSafetyStatus,
   ProviderHealthRoutingSafetyEvaluation,
+  HandoffTransfer,
+  HandoffTransferStatus,
+  AdapterOutcome,
+  ProviderTerminationStatus,
 } from '../types/domain';
 import type { ProviderDispatchExecutionResult } from '../services/ProviderDispatchService';
 import { ExecutionFailureClassifier } from '../services/ExecutionFailureClassifier';
@@ -263,6 +267,32 @@ export class Repository {
       .run(progressPercent, now, now, id);
   }
 
+  public getTaskOwnershipEpoch(taskId: string): number {
+    const row = this.db.prepare('SELECT ownership_epoch FROM tasks WHERE id = ?').get(taskId) as { ownership_epoch: number } | undefined;
+    if (!row) {
+      throw new Error(`[TaskOwnershipEpoch] Task "${taskId}" not found.`);
+    }
+    return Number(row.ownership_epoch);
+  }
+
+  public bumpTaskOwnershipEpoch(taskId: string, expectedEpoch: number): { success: boolean; newEpoch: number } {
+    return this.runInImmediateTransaction(() => {
+      const current = this.getTaskOwnershipEpoch(taskId);
+      if (current !== expectedEpoch) {
+        return { success: false, newEpoch: current };
+      }
+      const newEpoch = current + 1;
+      const now = new Date().toISOString();
+      const info = this.db
+        .prepare('UPDATE tasks SET ownership_epoch = ?, updated_at = ? WHERE id = ? AND ownership_epoch = ?')
+        .run(newEpoch, now, taskId, expectedEpoch);
+      if (info.changes === 0) {
+        return { success: false, newEpoch: this.getTaskOwnershipEpoch(taskId) };
+      }
+      return { success: true, newEpoch };
+    });
+  }
+
   private mapTask(row: Record<string, unknown>): Task {
     return {
       id: String(row.id),
@@ -283,6 +313,7 @@ export class Repository {
       progress_computed_at: row.progress_computed_at ? String(row.progress_computed_at) : null,
       acceptance_criteria: row.acceptance_criteria_json ? JSON.parse(String(row.acceptance_criteria_json)) : [],
       constraints: row.constraints_json ? JSON.parse(String(row.constraints_json)) : [],
+      ownership_epoch: row.ownership_epoch !== undefined && row.ownership_epoch !== null ? Number(row.ownership_epoch) : 1,
       created_at: String(row.created_at),
       updated_at: String(row.updated_at),
     };
@@ -294,18 +325,19 @@ export class Repository {
   public createTaskAttempt(attempt: TaskAttempt): void {
     this.db
       .prepare(`
-        INSERT INTO task_attempts (id, task_id, attempt_number, agent_id, status, started_at, ended_at, summary)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        INSERT INTO task_attempts (id, task_id, attempt_number, agent_id, agent_profile_id, status, started_at, ended_at, summary)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
       `)
       .run(
         attempt.id,
         attempt.task_id,
         attempt.attempt_number,
-        attempt.agent_id,
+        attempt.agent_id ?? null,
+        attempt.agent_profile_id ?? null,
         attempt.status,
         attempt.started_at,
-        attempt.ended_at,
-        attempt.summary
+        attempt.ended_at ?? null,
+        attempt.summary ?? null
       );
   }
 
@@ -316,7 +348,8 @@ export class Repository {
       id: String(row.id),
       task_id: String(row.task_id),
       attempt_number: Number(row.attempt_number),
-      agent_id: String(row.agent_id),
+      agent_id: row.agent_id !== null && row.agent_id !== undefined ? String(row.agent_id) : null,
+      agent_profile_id: row.agent_profile_id !== null && row.agent_profile_id !== undefined ? String(row.agent_profile_id) : null,
       status: row.status as any,
       started_at: String(row.started_at),
       ended_at: row.ended_at ? String(row.ended_at) : null,
@@ -330,7 +363,8 @@ export class Repository {
       id: String(r.id),
       task_id: String(r.task_id),
       attempt_number: Number(r.attempt_number),
-      agent_id: String(r.agent_id),
+      agent_id: r.agent_id !== null && r.agent_id !== undefined ? String(r.agent_id) : null,
+      agent_profile_id: r.agent_profile_id !== null && r.agent_profile_id !== undefined ? String(r.agent_profile_id) : null,
       status: r.status as any,
       started_at: String(r.started_at),
       ended_at: r.ended_at ? String(r.ended_at) : null,
@@ -564,6 +598,7 @@ export class Repository {
         task_id: sourceAttempt.task_id,
         attempt_number: nextAttemptNumber,
         agent_id: sourceAttempt.agent_id,
+        agent_profile_id: sourceAttempt.agent_profile_id ?? null,
         status,
         started_at: startedAt,
         ended_at: params.endedAt ?? null,
@@ -572,14 +607,15 @@ export class Repository {
 
       this.db
         .prepare(`
-          INSERT INTO task_attempts (id, task_id, attempt_number, agent_id, status, started_at, ended_at, summary)
-          VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+          INSERT INTO task_attempts (id, task_id, attempt_number, agent_id, agent_profile_id, status, started_at, ended_at, summary)
+          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
         `)
         .run(
           successorAttempt.id,
           successorAttempt.task_id,
           successorAttempt.attempt_number,
           successorAttempt.agent_id,
+          successorAttempt.agent_profile_id,
           successorAttempt.status,
           successorAttempt.started_at,
           successorAttempt.ended_at,
@@ -624,41 +660,43 @@ export class Repository {
   // Task Leases (Real Concurrency Locks)
   // ==========================================
   public acquireTaskLease(taskId: string, agentId: string, leaseToken: string, ttlMs: number = 300000): boolean {
-    const now = new Date();
-    const expiresAt = new Date(now.getTime() + ttlMs).toISOString();
-    const nowIso = now.toISOString();
+    return this.runInImmediateTransaction(() => {
+      const now = new Date();
+      const expiresAt = new Date(now.getTime() + ttlMs).toISOString();
+      const nowIso = now.toISOString();
 
-    const existing = this.db.prepare('SELECT * FROM task_leases WHERE task_id = ?').get(taskId) as Record<string, unknown> | undefined;
+      const existing = this.db.prepare('SELECT * FROM task_leases WHERE task_id = ?').get(taskId) as Record<string, unknown> | undefined;
 
-    if (!existing || existing.released_at !== null || new Date(String(existing.expires_at)) < now) {
-      // Lease is available or expired
-      this.db
-        .prepare(`
-          INSERT INTO task_leases (task_id, agent_id, lease_token, acquired_at, expires_at, heartbeat_at, released_at)
-          VALUES (?, ?, ?, ?, ?, ?, NULL)
-          ON CONFLICT(task_id) DO UPDATE SET
-            agent_id = excluded.agent_id,
-            lease_token = excluded.lease_token,
-            acquired_at = excluded.acquired_at,
-            expires_at = excluded.expires_at,
-            heartbeat_at = excluded.heartbeat_at,
-            released_at = NULL
-        `)
-        .run(taskId, agentId, leaseToken, nowIso, expiresAt, nowIso);
+      if (!existing || existing.released_at !== null || new Date(String(existing.expires_at)) < now) {
+        // Lease is available or expired
+        this.db
+          .prepare(`
+            INSERT INTO task_leases (task_id, agent_id, lease_token, acquired_at, expires_at, heartbeat_at, released_at)
+            VALUES (?, ?, ?, ?, ?, ?, NULL)
+            ON CONFLICT(task_id) DO UPDATE SET
+              agent_id = excluded.agent_id,
+              lease_token = excluded.lease_token,
+              acquired_at = excluded.acquired_at,
+              expires_at = excluded.expires_at,
+              heartbeat_at = excluded.heartbeat_at,
+              released_at = NULL
+          `)
+          .run(taskId, agentId, leaseToken, nowIso, expiresAt, nowIso);
 
-      this.db.prepare('UPDATE tasks SET assigned_agent_id = ? WHERE id = ?').run(agentId, taskId);
-      return true;
-    }
+        this.db.prepare('UPDATE tasks SET assigned_agent_id = ? WHERE id = ?').run(agentId, taskId);
+        return true;
+      }
 
-    if (existing.agent_id === agentId && existing.lease_token === leaseToken) {
-      // Re-acquired / refreshed by same agent
-      this.db
-        .prepare('UPDATE task_leases SET expires_at = ?, heartbeat_at = ? WHERE task_id = ?')
-        .run(expiresAt, nowIso, taskId);
-      return true;
-    }
+      if (existing.agent_id === agentId && existing.lease_token === leaseToken) {
+        // Re-acquired / refreshed by same agent
+        this.db
+          .prepare('UPDATE task_leases SET expires_at = ?, heartbeat_at = ? WHERE task_id = ?')
+          .run(expiresAt, nowIso, taskId);
+        return true;
+      }
 
-    return false; // Active lease held by another agent
+      return false; // Active lease held by another agent
+    });
   }
 
   public releaseTaskLease(taskId: string, leaseToken: string): boolean {
@@ -1258,66 +1296,96 @@ export class Repository {
   // Execution Authorizations (PR #7)
   // ==========================================
   public createExecutionAuthorization(auth: ExecutionAuthorization): void {
-    this.db
-      .prepare(`
-        INSERT INTO execution_authorizations (
-          id, project_id, task_id, attempt_id, task_revision, base_sha,
-          repository_head_sha, manager_message_id, manager_payload_hash,
-          routing_decision_id, selected_resource_id, selected_provider_id,
-          instruction_payload_hash, context_manifest_hash,
-          canonical_instructions_json, context_files_json, canonical_payload_json, status,
-          created_at, dispatched_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-      `)
-      .run(
-        auth.id,
-        auth.project_id,
-        auth.task_id,
-        auth.attempt_id,
-        auth.task_revision,
-        auth.base_sha,
-        auth.repository_head_sha,
-        auth.manager_message_id,
-        auth.manager_payload_hash,
-        auth.routing_decision_id,
-        auth.selected_resource_id,
-        auth.selected_provider_id,
-        auth.instruction_payload_hash,
-        auth.context_manifest_hash,
-        auth.canonical_instructions_json,
-        auth.context_files_json,
-        auth.canonical_payload_json ?? null,
-        auth.status,
-        auth.created_at,
-        auth.dispatched_at
-      );
+    const tableInfo = this.db.pragma('table_info(execution_authorizations)') as { name: string }[];
+    const columnNames = new Set(tableInfo.map((c) => c.name));
+
+    if (columnNames.has('task_ownership_epoch')) {
+      this.db
+        .prepare(`
+          INSERT INTO execution_authorizations (
+            id, project_id, task_id, attempt_id, task_revision, base_sha,
+            repository_head_sha, manager_message_id, manager_payload_hash,
+            routing_decision_id, selected_resource_id, selected_provider_id,
+            instruction_payload_hash, context_manifest_hash,
+            canonical_instructions_json, context_files_json, canonical_payload_json, status,
+            created_at, dispatched_at, task_ownership_epoch, execution_id,
+            adapter_started_at, adapter_finished_at, adapter_outcome,
+            cancellation_requested_at, termination_confirmed_at,
+            termination_status, termination_source
+          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        `)
+        .run(
+          auth.id,
+          auth.project_id,
+          auth.task_id,
+          auth.attempt_id,
+          auth.task_revision,
+          auth.base_sha,
+          auth.repository_head_sha,
+          auth.manager_message_id,
+          auth.manager_payload_hash,
+          auth.routing_decision_id,
+          auth.selected_resource_id,
+          auth.selected_provider_id,
+          auth.instruction_payload_hash,
+          auth.context_manifest_hash,
+          auth.canonical_instructions_json,
+          auth.context_files_json,
+          auth.canonical_payload_json ?? null,
+          auth.status,
+          auth.created_at,
+          auth.dispatched_at,
+          auth.task_ownership_epoch ?? 1,
+          auth.execution_id ?? null,
+          auth.adapter_started_at ?? null,
+          auth.adapter_finished_at ?? null,
+          auth.adapter_outcome ?? null,
+          auth.cancellation_requested_at ?? null,
+          auth.termination_confirmed_at ?? null,
+          auth.termination_status ?? null,
+          auth.termination_source ?? null
+        );
+    } else {
+      this.db
+        .prepare(`
+          INSERT INTO execution_authorizations (
+            id, project_id, task_id, attempt_id, task_revision, base_sha,
+            repository_head_sha, manager_message_id, manager_payload_hash,
+            routing_decision_id, selected_resource_id, selected_provider_id,
+            instruction_payload_hash, context_manifest_hash,
+            canonical_instructions_json, context_files_json, canonical_payload_json, status,
+            created_at, dispatched_at
+          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        `)
+        .run(
+          auth.id,
+          auth.project_id,
+          auth.task_id,
+          auth.attempt_id,
+          auth.task_revision,
+          auth.base_sha,
+          auth.repository_head_sha,
+          auth.manager_message_id,
+          auth.manager_payload_hash,
+          auth.routing_decision_id,
+          auth.selected_resource_id,
+          auth.selected_provider_id,
+          auth.instruction_payload_hash,
+          auth.context_manifest_hash,
+          auth.canonical_instructions_json,
+          auth.context_files_json,
+          auth.canonical_payload_json ?? null,
+          auth.status,
+          auth.created_at,
+          auth.dispatched_at
+        );
+    }
   }
 
   public getExecutionAuthorization(id: string): ExecutionAuthorization | null {
     const row = this.db.prepare('SELECT * FROM execution_authorizations WHERE id = ?').get(id) as Record<string, unknown> | undefined;
     if (!row) return null;
-    return {
-      id: String(row.id),
-      project_id: String(row.project_id),
-      task_id: String(row.task_id),
-      attempt_id: row.attempt_id ? String(row.attempt_id) : null,
-      task_revision: Number(row.task_revision),
-      base_sha: String(row.base_sha),
-      repository_head_sha: String(row.repository_head_sha),
-      manager_message_id: String(row.manager_message_id),
-      manager_payload_hash: String(row.manager_payload_hash),
-      routing_decision_id: String(row.routing_decision_id),
-      selected_resource_id: String(row.selected_resource_id),
-      selected_provider_id: String(row.selected_provider_id),
-      instruction_payload_hash: String(row.instruction_payload_hash),
-      context_manifest_hash: String(row.context_manifest_hash),
-      canonical_instructions_json: String(row.canonical_instructions_json),
-      context_files_json: String(row.context_files_json),
-      canonical_payload_json: row.canonical_payload_json != null ? String(row.canonical_payload_json) : null,
-      status: row.status as ExecutionAuthorizationStatus,
-      created_at: String(row.created_at),
-      dispatched_at: row.dispatched_at ? String(row.dispatched_at) : null,
-    };
+    return this.mapExecutionAuthorization(row);
   }
 
   public claimExecutionAuthorization(id: string, dispatchedAt: string): boolean {
@@ -1329,6 +1397,206 @@ export class Repository {
       `)
       .run(dispatchedAt, id);
     return res.changes === 1;
+  }
+
+  public claimAdapterExecutionStart(params: {
+    authorizationId: string;
+    executionId: string;
+    expectedEpoch: number;
+    startedAt?: string;
+  }): { success: boolean; alreadyClaimed: boolean; error?: string } {
+    return this.runInImmediateTransaction(() => {
+      const auth = this.getExecutionAuthorization(params.authorizationId);
+      if (!auth) {
+        return { success: false, alreadyClaimed: false, error: 'AUTHORIZATION_NOT_FOUND' };
+      }
+
+      // Check current task ownership epoch
+      const currentTaskEpoch = this.getTaskOwnershipEpoch(auth.task_id);
+      if (currentTaskEpoch !== params.expectedEpoch || auth.task_ownership_epoch !== params.expectedEpoch) {
+        return {
+          success: false,
+          alreadyClaimed: false,
+          error: `OWNERSHIP_EPOCH_MISMATCH: expected ${params.expectedEpoch}, current task epoch is ${currentTaskEpoch}, auth epoch is ${auth.task_ownership_epoch}`,
+        };
+      }
+
+      // Check if already started
+      if (auth.adapter_started_at) {
+        if (auth.execution_id === params.executionId) {
+          return { success: true, alreadyClaimed: true };
+        }
+        return {
+          success: false,
+          alreadyClaimed: false,
+          error: `EXECUTION_ID_CONFLICT: already claimed with execution_id ${auth.execution_id}`,
+        };
+      }
+
+      const startedAt = params.startedAt ?? new Date().toISOString();
+      const res = this.db
+        .prepare(`
+          UPDATE execution_authorizations
+          SET execution_id = ?, adapter_started_at = ?
+          WHERE id = ? AND adapter_started_at IS NULL AND task_ownership_epoch = ?
+        `)
+        .run(params.executionId, startedAt, params.authorizationId, params.expectedEpoch);
+
+      if (res.changes === 0) {
+        return { success: false, alreadyClaimed: false, error: 'START_CLAIM_CAS_FAILED' };
+      }
+
+      return { success: true, alreadyClaimed: false };
+    });
+  }
+
+  public completeAdapterExecution(params: {
+    authorizationId: string;
+    executionId: string;
+    outcome: AdapterOutcome;
+    finishedAt?: string;
+  }): { success: boolean; alreadyCompleted: boolean; error?: string } {
+    return this.runInImmediateTransaction(() => {
+      const auth = this.getExecutionAuthorization(params.authorizationId);
+      if (!auth) {
+        return { success: false, alreadyCompleted: false, error: 'AUTHORIZATION_NOT_FOUND' };
+      }
+
+      if (!auth.adapter_started_at) {
+        return { success: false, alreadyCompleted: false, error: 'EXECUTION_NEVER_STARTED' };
+      }
+
+      if (auth.execution_id !== params.executionId) {
+        return {
+          success: false,
+          alreadyCompleted: false,
+          error: `EXECUTION_ID_MISMATCH: expected ${auth.execution_id}, got ${params.executionId}`,
+        };
+      }
+
+      if (auth.adapter_finished_at) {
+        if (auth.adapter_outcome === params.outcome) {
+          return { success: true, alreadyCompleted: true };
+        }
+        return {
+          success: false,
+          alreadyCompleted: false,
+          error: `OUTCOME_CONFLICT: already completed with outcome ${auth.adapter_outcome}, attempted ${params.outcome}`,
+        };
+      }
+
+      const finishedAt = params.finishedAt ?? new Date().toISOString();
+      const res = this.db
+        .prepare(`
+          UPDATE execution_authorizations
+          SET adapter_finished_at = ?, adapter_outcome = ?
+          WHERE id = ? AND execution_id = ? AND adapter_finished_at IS NULL
+        `)
+        .run(finishedAt, params.outcome, params.authorizationId, params.executionId);
+
+      if (res.changes === 0) {
+        return { success: false, alreadyCompleted: false, error: 'COMPLETION_CAS_FAILED' };
+      }
+
+      return { success: true, alreadyCompleted: false };
+    });
+  }
+
+  public markCancellationRequested(params: {
+    authorizationId: string;
+    executionId: string;
+    requestedAt?: string;
+  }): { success: boolean; alreadyRequested: boolean; error?: string } {
+    return this.runInImmediateTransaction(() => {
+      const auth = this.getExecutionAuthorization(params.authorizationId);
+      if (!auth) {
+        return { success: false, alreadyRequested: false, error: 'AUTHORIZATION_NOT_FOUND' };
+      }
+
+      if (auth.execution_id && auth.execution_id !== params.executionId) {
+        return {
+          success: false,
+          alreadyRequested: false,
+          error: `EXECUTION_ID_MISMATCH: expected ${auth.execution_id}, got ${params.executionId}`,
+        };
+      }
+
+      if (auth.cancellation_requested_at) {
+        return { success: true, alreadyRequested: true };
+      }
+
+      const requestedAt = params.requestedAt ?? new Date().toISOString();
+      const res = this.db
+        .prepare(`
+          UPDATE execution_authorizations
+          SET cancellation_requested_at = ?
+          WHERE id = ? AND cancellation_requested_at IS NULL
+        `)
+        .run(requestedAt, params.authorizationId);
+
+      return { success: res.changes === 1, alreadyRequested: false };
+    });
+  }
+
+  public confirmExecutionTermination(params: {
+    authorizationId: string;
+    executionId: string;
+    terminationStatus: ProviderTerminationStatus;
+    terminationSource: string;
+    confirmedAt?: string;
+    outcome?: AdapterOutcome;
+  }): { success: boolean; alreadyConfirmed: boolean; error?: string } {
+    return this.runInImmediateTransaction(() => {
+      const auth = this.getExecutionAuthorization(params.authorizationId);
+      if (!auth) {
+        return { success: false, alreadyConfirmed: false, error: 'AUTHORIZATION_NOT_FOUND' };
+      }
+
+      if (auth.execution_id && auth.execution_id !== params.executionId) {
+        return {
+          success: false,
+          alreadyConfirmed: false,
+          error: `EXECUTION_ID_MISMATCH: expected ${auth.execution_id}, got ${params.executionId}`,
+        };
+      }
+
+      if (auth.termination_confirmed_at && auth.termination_status === params.terminationStatus) {
+        return { success: true, alreadyConfirmed: true };
+      }
+
+      if (auth.termination_status && auth.termination_status !== params.terminationStatus) {
+        return {
+          success: false,
+          alreadyConfirmed: false,
+          error: `TERMINATION_STATUS_CONFLICT: already ${auth.termination_status}, attempted ${params.terminationStatus}`,
+        };
+      }
+
+      const confirmedAt = params.confirmedAt ?? new Date().toISOString();
+      const outcome = params.outcome ?? auth.adapter_outcome ?? null;
+      const finishedAt = auth.adapter_finished_at ?? confirmedAt;
+
+      const res = this.db
+        .prepare(`
+          UPDATE execution_authorizations
+          SET termination_status = ?,
+              termination_source = ?,
+              termination_confirmed_at = ?,
+              adapter_finished_at = COALESCE(adapter_finished_at, ?),
+              adapter_outcome = COALESCE(adapter_outcome, ?)
+          WHERE id = ?
+        `)
+        .run(
+          params.terminationStatus,
+          params.terminationSource,
+          confirmedAt,
+          finishedAt,
+          outcome,
+          params.authorizationId
+        );
+
+      return { success: res.changes === 1, alreadyConfirmed: false };
+    });
   }
 
   public invalidateExecutionAuthorization(id: string): boolean {
@@ -1367,7 +1635,11 @@ export class Repository {
     const rows = this.db
       .prepare('SELECT * FROM execution_authorizations WHERE task_id = ? ORDER BY created_at DESC')
       .all(taskId) as Record<string, unknown>[];
-    return rows.map((row) => ({
+    return rows.map((row) => this.mapExecutionAuthorization(row));
+  }
+
+  private mapExecutionAuthorization(row: Record<string, unknown>): ExecutionAuthorization {
+    return {
       id: String(row.id),
       project_id: String(row.project_id),
       task_id: String(row.task_id),
@@ -1388,7 +1660,16 @@ export class Repository {
       status: row.status as ExecutionAuthorizationStatus,
       created_at: String(row.created_at),
       dispatched_at: row.dispatched_at ? String(row.dispatched_at) : null,
-    }));
+      task_ownership_epoch: row.task_ownership_epoch !== undefined && row.task_ownership_epoch !== null ? Number(row.task_ownership_epoch) : 1,
+      execution_id: row.execution_id ? String(row.execution_id) : null,
+      adapter_started_at: row.adapter_started_at ? String(row.adapter_started_at) : null,
+      adapter_finished_at: row.adapter_finished_at ? String(row.adapter_finished_at) : null,
+      adapter_outcome: row.adapter_outcome ? (row.adapter_outcome as AdapterOutcome) : null,
+      cancellation_requested_at: row.cancellation_requested_at ? String(row.cancellation_requested_at) : null,
+      termination_confirmed_at: row.termination_confirmed_at ? String(row.termination_confirmed_at) : null,
+      termination_status: row.termination_status ? (row.termination_status as ProviderTerminationStatus) : null,
+      termination_source: row.termination_source ? String(row.termination_source) : null,
+    };
   }
 
   // ==========================================
@@ -1446,6 +1727,217 @@ export class Repository {
         VALUES (?, ?, ?, ?, ?, ?, ?)
       `)
       .run(h.id, h.task_id, h.attempt_id, h.previous_agent_id, h.reason, JSON.stringify(h.payload), h.created_at);
+  }
+
+  // ==========================================
+  // Handoff Transfers (R5I Durable Authority)
+  // ==========================================
+  public createHandoffTransfer(transfer: HandoffTransfer): { success: boolean; transfer: HandoffTransfer; duplicate: boolean } {
+    return this.runInImmediateTransaction(() => {
+      const existing = this.getHandoffTransferByRequestId(transfer.request_id);
+      if (existing) {
+        return { success: true, transfer: existing, duplicate: true };
+      }
+
+      this.db
+        .prepare(`
+          INSERT INTO handoff_transfers (
+            id, request_id, task_id, source_attempt_id, successor_attempt_id,
+            source_assignment_id, successor_assignment_id, successor_role_profile_id,
+            successor_agent_profile_id, successor_agent_id, handoff_context_id,
+            checkpoint_id, source_authorization_id, successor_authorization_id,
+            reason, status, source_ownership_epoch, successor_ownership_epoch,
+            version, frozen_at, quiescing_at, relinquished_at, accepted_at,
+            completed_at, created_at, updated_at
+          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        `)
+        .run(
+          transfer.id,
+          transfer.request_id,
+          transfer.task_id,
+          transfer.source_attempt_id,
+          transfer.successor_attempt_id ?? null,
+          transfer.source_assignment_id,
+          transfer.successor_assignment_id ?? null,
+          transfer.successor_role_profile_id ?? null,
+          transfer.successor_agent_profile_id ?? null,
+          transfer.successor_agent_id ?? null,
+          transfer.handoff_context_id,
+          transfer.checkpoint_id ?? null,
+          transfer.source_authorization_id ?? null,
+          transfer.successor_authorization_id ?? null,
+          transfer.reason,
+          transfer.status,
+          transfer.source_ownership_epoch,
+          transfer.successor_ownership_epoch ?? null,
+          transfer.version ?? 1,
+          transfer.frozen_at ?? null,
+          transfer.quiescing_at ?? null,
+          transfer.relinquished_at ?? null,
+          transfer.accepted_at ?? null,
+          transfer.completed_at ?? null,
+          transfer.created_at,
+          transfer.updated_at
+        );
+
+      return { success: true, transfer, duplicate: false };
+    });
+  }
+
+  public getHandoffTransfer(id: string): HandoffTransfer | null {
+    const row = this.db.prepare('SELECT * FROM handoff_transfers WHERE id = ?').get(id) as Record<string, unknown> | undefined;
+    if (!row) return null;
+    return this.mapHandoffTransfer(row);
+  }
+
+  public getHandoffTransferByRequestId(requestId: string): HandoffTransfer | null {
+    const row = this.db.prepare('SELECT * FROM handoff_transfers WHERE request_id = ?').get(requestId) as Record<string, unknown> | undefined;
+    if (!row) return null;
+    return this.mapHandoffTransfer(row);
+  }
+
+  public getActiveHandoffTransferForSourceAttempt(sourceAttemptId: string): HandoffTransfer | null {
+    const row = this.db
+      .prepare(`
+        SELECT * FROM handoff_transfers
+        WHERE source_attempt_id = ?
+          AND status IN ('REQUESTED', 'FROZEN', 'QUIESCING', 'RELINQUISHED', 'SUCCESSOR_PREPARED', 'ROUTED', 'AUTHORIZED', 'ACCEPTED')
+        LIMIT 1
+      `)
+      .get(sourceAttemptId) as Record<string, unknown> | undefined;
+    if (!row) return null;
+    return this.mapHandoffTransfer(row);
+  }
+
+  public getHandoffTransfersByTask(taskId: string): HandoffTransfer[] {
+    const rows = this.db
+      .prepare('SELECT * FROM handoff_transfers WHERE task_id = ? ORDER BY created_at ASC')
+      .all(taskId) as Record<string, unknown>[];
+    return rows.map((r) => this.mapHandoffTransfer(r));
+  }
+
+  public updateHandoffTransferStatus(params: {
+    id: string;
+    fromStatus: HandoffTransferStatus | HandoffTransferStatus[];
+    toStatus: HandoffTransferStatus;
+    expectedVersion: number;
+    additionalFields?: Partial<HandoffTransfer>;
+  }): { success: boolean; transfer?: HandoffTransfer; error?: string } {
+    return this.runInImmediateTransaction(() => {
+      const existing = this.getHandoffTransfer(params.id);
+      if (!existing) {
+        return { success: false, error: 'HANDOFF_TRANSFER_NOT_FOUND' };
+      }
+
+      const allowedStatuses = Array.isArray(params.fromStatus) ? params.fromStatus : [params.fromStatus];
+      if (!allowedStatuses.includes(existing.status)) {
+        return {
+          success: false,
+          error: `STATUS_PRECONDITION_FAILED: expected one of [${allowedStatuses.join(', ')}], found ${existing.status}`,
+        };
+      }
+
+      if (existing.version !== params.expectedVersion) {
+        return {
+          success: false,
+          error: `VERSION_CONFLICT: expected version ${params.expectedVersion}, found ${existing.version}`,
+        };
+      }
+
+      const newVersion = existing.version + 1;
+      const nowIso = new Date().toISOString();
+      const fields = params.additionalFields ?? {};
+
+      const successorAttemptId = fields.successor_attempt_id !== undefined ? fields.successor_attempt_id : existing.successor_attempt_id;
+      const successorAssignmentId = fields.successor_assignment_id !== undefined ? fields.successor_assignment_id : existing.successor_assignment_id;
+      const successorRoleProfileId = fields.successor_role_profile_id !== undefined ? fields.successor_role_profile_id : existing.successor_role_profile_id;
+      const successorAgentProfileId = fields.successor_agent_profile_id !== undefined ? fields.successor_agent_profile_id : existing.successor_agent_profile_id;
+      const successorAgentId = fields.successor_agent_id !== undefined ? fields.successor_agent_id : existing.successor_agent_id;
+      const successorAuthorizationId = fields.successor_authorization_id !== undefined ? fields.successor_authorization_id : existing.successor_authorization_id;
+      const successorOwnershipEpoch = fields.successor_ownership_epoch !== undefined ? fields.successor_ownership_epoch : existing.successor_ownership_epoch;
+      const frozenAt = fields.frozen_at !== undefined ? fields.frozen_at : existing.frozen_at;
+      const quiescingAt = fields.quiescing_at !== undefined ? fields.quiescing_at : existing.quiescing_at;
+      const relinquishedAt = fields.relinquished_at !== undefined ? fields.relinquished_at : existing.relinquished_at;
+      const acceptedAt = fields.accepted_at !== undefined ? fields.accepted_at : existing.accepted_at;
+      const completedAt = fields.completed_at !== undefined ? fields.completed_at : existing.completed_at;
+
+      const res = this.db
+        .prepare(`
+          UPDATE handoff_transfers
+          SET status = ?,
+              successor_attempt_id = ?,
+              successor_assignment_id = ?,
+              successor_role_profile_id = ?,
+              successor_agent_profile_id = ?,
+              successor_agent_id = ?,
+              successor_authorization_id = ?,
+              successor_ownership_epoch = ?,
+              version = ?,
+              frozen_at = ?,
+              quiescing_at = ?,
+              relinquished_at = ?,
+              accepted_at = ?,
+              completed_at = ?,
+              updated_at = ?
+          WHERE id = ? AND version = ?
+        `)
+        .run(
+          params.toStatus,
+          successorAttemptId,
+          successorAssignmentId,
+          successorRoleProfileId,
+          successorAgentProfileId,
+          successorAgentId,
+          successorAuthorizationId,
+          successorOwnershipEpoch,
+          newVersion,
+          frozenAt,
+          quiescingAt,
+          relinquishedAt,
+          acceptedAt,
+          completedAt,
+          nowIso,
+          params.id,
+          params.expectedVersion
+        );
+
+      if (res.changes === 0) {
+        return { success: false, error: 'CONCURRENT_UPDATE_CONFLICT' };
+      }
+
+      return { success: true, transfer: this.getHandoffTransfer(params.id)! };
+    });
+  }
+
+  private mapHandoffTransfer(row: Record<string, unknown>): HandoffTransfer {
+    return {
+      id: String(row.id),
+      request_id: String(row.request_id),
+      task_id: String(row.task_id),
+      source_attempt_id: String(row.source_attempt_id),
+      successor_attempt_id: row.successor_attempt_id ? String(row.successor_attempt_id) : null,
+      source_assignment_id: String(row.source_assignment_id),
+      successor_assignment_id: row.successor_assignment_id ? String(row.successor_assignment_id) : null,
+      successor_role_profile_id: row.successor_role_profile_id ? String(row.successor_role_profile_id) : null,
+      successor_agent_profile_id: row.successor_agent_profile_id ? String(row.successor_agent_profile_id) : null,
+      successor_agent_id: row.successor_agent_id ? String(row.successor_agent_id) : null,
+      handoff_context_id: String(row.handoff_context_id),
+      checkpoint_id: row.checkpoint_id ? String(row.checkpoint_id) : null,
+      source_authorization_id: row.source_authorization_id ? String(row.source_authorization_id) : null,
+      successor_authorization_id: row.successor_authorization_id ? String(row.successor_authorization_id) : null,
+      reason: String(row.reason),
+      status: row.status as HandoffTransferStatus,
+      source_ownership_epoch: Number(row.source_ownership_epoch),
+      successor_ownership_epoch: row.successor_ownership_epoch !== null && row.successor_ownership_epoch !== undefined ? Number(row.successor_ownership_epoch) : null,
+      version: Number(row.version),
+      frozen_at: row.frozen_at ? String(row.frozen_at) : null,
+      quiescing_at: row.quiescing_at ? String(row.quiescing_at) : null,
+      relinquished_at: row.relinquished_at ? String(row.relinquished_at) : null,
+      accepted_at: row.accepted_at ? String(row.accepted_at) : null,
+      completed_at: row.completed_at ? String(row.completed_at) : null,
+      created_at: String(row.created_at),
+      updated_at: String(row.updated_at),
+    };
   }
 
   public getAgent(id: string): Agent | null {
