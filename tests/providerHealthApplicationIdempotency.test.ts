@@ -1092,7 +1092,7 @@ describe('R5H4 Ordered Provider Health Application & Idempotency Contract Tests'
   // 8. Concurrency, Permutations & Account Isolation
   // =========================================================================
 
-  it('44. Same-account interleaved application resolves to latest actionable state regardless of call order', () => {
+  it('44. Same-account application call-order permutation resolves to latest actionable state', () => {
     seedDurableGraph();
     const item1 = createCoherentObservation({ authId: 'auth-1', execId: 'exec-1', msgId: 'msg-1', category: 'SUCCESS' });
     repo.claimProviderHealthObservation(item1.obs, item1.result);
@@ -1314,5 +1314,26 @@ describe('R5H4 Ordered Provider Health Application & Idempotency Contract Tests'
     const res = service.applyDurableObservation('auth-1');
     expect(res.status).toBe('REJECTED');
     expect(res.reason).toContain('WATERMARK_INTEGRITY_MISMATCH');
+  });
+
+  it('56. Tracked architecture explicitly contains corrected SQLite serialization contract and no account-lock overclaim', () => {
+    const archPath = path.join(__dirname, '../docs/R5_AGENT_FABRIC_ARCHITECTURE.md');
+    const archContent = fs.readFileSync(archPath, 'utf-8');
+
+    // Prove corrected SQLite serialization contract is tracked
+    expect(archContent).toContain('SQLite `BEGIN IMMEDIATE` serializes write transactions');
+    expect(archContent).toContain('This contract does NOT claim physically parallel SQLite writes across accounts');
+    expect(archContent).toContain('no dedicated account-level application lock exists');
+
+    // Prove old overclaim is completely absent
+    expect(archContent).not.toContain('Account locks serialize concurrent writes');
+
+    // Prove Repository application uses runInImmediateTransaction without account locks
+    const repoPath = path.join(__dirname, '../src/core/database/repositories.ts');
+    const repoContent = fs.readFileSync(repoPath, 'utf-8');
+    expect(repoContent).toContain('public applyDurableProviderHealthObservation');
+    expect(repoContent).toContain('return this.runInImmediateTransaction(');
+    expect(repoContent).not.toContain('acquireAccountLock');
+    expect(repoContent).not.toContain('AccountLock');
   });
 });

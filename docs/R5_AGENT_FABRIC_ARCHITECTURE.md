@@ -385,7 +385,8 @@ When evaluating a candidate observation against the account ledger:
 - **Single Immediate Transaction**: The entire resolution, stale check, duplicate check, health mutation, and watermark advancement occur in one atomic `BEGIN IMMEDIATE` transaction in `Repository.applyDurableProviderHealthObservation`.
 - **Zero Crash Window**: Health-first or watermark-first partial commits are impossible.
 - **Duplicate Idempotency**: If `target.account_order === watermark.order` and `target.authorization_id === watermark.auth`, returns `ALREADY_APPLIED` with zero database writes.
-- **Isolation**: Account locks serialize concurrent writes to the same account while different accounts progress independently.
+- **SQLite Serialization**: SQLite `BEGIN IMMEDIATE` serializes write transactions at the database writer boundary. This contract does NOT claim physically parallel SQLite writes across accounts, and no dedicated account-level application lock exists.
+- **State Isolation**: Same-account health application remains logically isolated because target resolution, health mutation, and watermark CAS occur in one `IMMEDIATE` transaction using account-local `account_order`. Different ProviderAccounts retain independent health state, account-order spaces, and watermarks.
 
 ### 6. Semantic Boundary & Production Wiring Scope
 - **Single Semantic Entrypoint**: `AccountHealthService.applyDurableObservation(authorizationId)` is the sole public facade.
