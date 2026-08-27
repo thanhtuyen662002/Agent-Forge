@@ -64,7 +64,7 @@ describe('Database Migrations & Upgrade Integrity', () => {
     expect(uniqueAccountOrderIdx?.unique).toBe(1);
 
     const applied = db.prepare('SELECT COUNT(*) as count FROM schema_migrations').get() as { count: number };
-    expect(applied.count).toBe(14);
+    expect(applied.count).toBe(15);
 
     // Foreign key integrity check
     const fkViolations = db.prepare('PRAGMA foreign_key_check').all();
@@ -77,10 +77,15 @@ describe('Database Migrations & Upgrade Integrity', () => {
     expect(obsColumns).toContain('health_action_cooldown_duration_ms');
     expect(obsColumns).toContain('health_action_cooldown_anchor_at');
 
+    // Verify Migration 15 columns on provider_accounts
+    const accountColumns = (db.prepare("PRAGMA table_info(provider_accounts)").all() as { name: string }[]).map((c) => c.name);
+    expect(accountColumns).toContain('last_applied_action_account_order');
+    expect(accountColumns).toContain('last_applied_action_authorization_id');
+
     // Idempotency check: running MigrationRunner again applies 0 new migrations
     MigrationRunner.run(db);
     const appliedAgain = db.prepare('SELECT COUNT(*) as count FROM schema_migrations').get() as { count: number };
-    expect(appliedAgain.count).toBe(14);
+    expect(appliedAgain.count).toBe(15);
   });
 
   it('should cleanly upgrade an existing database through historical path (v1 -> v2 -> original v3 -> v4 -> v5 -> v6 -> v7 -> v8 -> v9 -> v10 -> v11 -> v12 -> v13) and repair default agent links', () => {
@@ -159,7 +164,7 @@ describe('Database Migrations & Upgrade Integrity', () => {
     expect(v12Tables).toContain('provider_health_observations');
 
     const migrationCount = (db.prepare('SELECT COUNT(*) as count FROM schema_migrations').get() as { count: number }).count;
-    expect(migrationCount).toBe(14);
+    expect(migrationCount).toBe(15);
 
     // 4. Assert default agent links are repaired by migration 005
     const mgrAfter = db.prepare('SELECT * FROM agents WHERE id = ?').get('agent-primary-manager') as any;

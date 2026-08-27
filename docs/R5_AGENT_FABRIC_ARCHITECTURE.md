@@ -355,3 +355,38 @@ The R5 planning sequence is governed by the authoritative R5-v1.1 roadmap:
 - **Single Semantic Writer**: `AccountHealthService` remains the sole semantic authority for health state mutations.
 - **Historical Replay API Gap**: The current `AccountHealthService.recordRateLimited()` requires strictly future cooldowns; historical replay and atomic CAS application remain separate future gates.
 - **No Ingestion Mutations**: Ingestion of observations and cooldown anchors performs zero health state mutations.
+
+## 13. Ordered Provider Health Application & Idempotency Architecture (R5H4)
+
+### 1. Authoritative Application Model & Precedence
+- **Durable Input Authority**: Health application consumes strictly the persisted `ProviderHealthObservationRecord` (via `authorization_id`). It ignores raw provider responses, caller-supplied parameters, and current routing policies.
+- **Precedence Model**: Governed by monotonic, account-local `account_order`.
+- **Application Order Model**: `LATEST_EFFECTIVE_ACTIONABLE_WINS`. The newest effective actionable observation for an account determines its current operational health state.
+- **Application State Model**: `PROVIDER_ACCOUNT_WATERMARK_ONLY`. Watermark state is maintained directly on `provider_accounts` via `last_applied_action_account_order` and `last_applied_action_authorization_id` (Migration 15).
+
+### 2. Correctness Domain & Timestamp Semantics
+- **Correctness Scope**: `CURRENT_OPERATIONAL_HEALTH_STATE_PLUS_ACTION_WATERMARK`. Correctness requires `health_status`, `cooldown_until`, and the applied actionable watermark to reflect the newest effective action.
+- **Application-Time Metadata**: `last_success_at`, `last_failure_at`, `last_failure_code`, and `updated_at` represent applied mutation metadata generated at application time (`now()`). The durable `provider_health_observations` ledger remains the authoritative audit trail of all historical execution evidence.
+- **Stale Actions**: Stale skipped actions perform zero writes and do not alter `last_*` metadata.
+
+### 3. Resolution & Barrier Direction Rules
+When evaluating a candidate observation against the account ledger:
+- **NO_MUTATION Transparency**: `NO_MUTATION` rows have no health state impact and are transparent when scanning for newer actionable candidates.
+- **Newer Known Action**: If a newer valid actionable observation exists (`RECORD_SUCCESS`, `RECORD_QUOTA_EXHAUSTED`, `RECORD_AUTH_ERROR`, or valid `RECORD_RATE_LIMITED`), the older candidate returns `STALE` with zero writes.
+- **Newer Unresolved Barrier**: If a newer observation has unknown action authority (missing/invalid plan) or unknown temporal authority (rate limit with null anchor), an older action cannot safely leapfrog it and is `DEFERRED_BY_NEWER_UNKNOWN_AUTHORITY`.
+- **Older Unresolved Non-Barrier**: An older unresolved observation does NOT block a newer valid actionable candidate from applying immediately.
+
+### 4. Historical Expired Rate-Limit Application
+- **Historical Replay**: Modern `RECORD_RATE_LIMITED` observations with positive duration and authoritative anchor derive `cooldown_until = anchor + duration`.
+- **Expired Application**: If derived `cooldown_until <= now()`, the observation is successfully applied with `health_status = 'RATE_LIMITED'`, the derived past timestamp in `cooldown_until`, and `last_failure_code = 'RATE_LIMITED'`. Expired rate limits are never converted to `AVAILABLE`, `SUCCESS`, or `NO_MUTATION`.
+- **Router Compatibility**: `RoleAwareRoutingService` evaluates `cooldown_until > now()` dynamically; expired cooldowns do not block routing.
+
+### 5. Atomic Storage CAS & Idempotency
+- **Single Immediate Transaction**: The entire resolution, stale check, duplicate check, health mutation, and watermark advancement occur in one atomic `BEGIN IMMEDIATE` transaction in `Repository.applyDurableProviderHealthObservation`.
+- **Zero Crash Window**: Health-first or watermark-first partial commits are impossible.
+- **Duplicate Idempotency**: If `target.account_order === watermark.order` and `target.authorization_id === watermark.auth`, returns `ALREADY_APPLIED` with zero database writes.
+- **Isolation**: Account locks serialize concurrent writes to the same account while different accounts progress independently.
+
+### 6. Semantic Boundary & Production Wiring Scope
+- **Single Semantic Entrypoint**: `AccountHealthService.applyDurableObservation(authorizationId)` is the sole public facade.
+- **No Production Mutation Wiring**: Ingestion does not trigger synchronous application, and startup recovery does not execute health reconciliation in this contract phase. All production orchestration remains deferred to subsequent gates.

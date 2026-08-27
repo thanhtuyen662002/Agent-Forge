@@ -620,6 +620,8 @@ export interface ProviderAccount {
   last_success_at: string | null;
   last_failure_at: string | null;
   last_failure_code: string | null;
+  last_applied_action_account_order?: number | null;
+  last_applied_action_authorization_id?: string | null;
   created_at: string;
   updated_at: string;
 }
@@ -1075,5 +1077,29 @@ export type ProviderHealthObservationIngestStatus =
 export interface ProviderHealthObservationIngestResult {
   status: ProviderHealthObservationIngestStatus;
   observation: ProviderHealthObservationRecord | ProviderHealthObservation | null;
+  reason?: string;
+}
+
+export type ProviderHealthObservationApplicationStatus =
+  | 'APPLIED'
+  | 'ALREADY_APPLIED'
+  | 'STALE'
+  | 'NO_MUTATION'
+  | 'LEGACY_UNORDERED'
+  | 'ACTION_AUTHORITY_UNKNOWN'
+  | 'TEMPORAL_AUTHORITY_UNKNOWN'
+  | 'DEFERRED_BY_NEWER_UNKNOWN_AUTHORITY'
+  | 'REJECTED';
+
+export interface ProviderHealthObservationApplicationResult {
+  status: ProviderHealthObservationApplicationStatus;
+  accountId: string;
+  authorizationId: string;
+  accountOrder: number | null;
+  healthAction: ProviderAccountHealthAction | null;
+  appliedHealthStatus?: ProviderHealthStatus;
+  appliedCooldownUntil?: string | null;
+  watermarkAccountOrder?: number | null;
+  watermarkAuthorizationId?: string | null;
   reason?: string;
 }
