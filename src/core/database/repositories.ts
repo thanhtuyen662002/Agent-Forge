@@ -60,6 +60,8 @@ import {
   FailoverPolicyAuthoritySnapshotV1,
   ProviderAccountHealthAction,
   FailoverPolicyParseResult,
+  ProviderHealthObservationApplicationStatus,
+  ProviderHealthObservationApplicationResult,
 } from '../types/domain';
 import type { ProviderDispatchExecutionResult } from '../services/ProviderDispatchService';
 import { ExecutionFailureClassifier } from '../services/ExecutionFailureClassifier';
@@ -2102,6 +2104,13 @@ export class Repository {
       last_success_at: row.last_success_at ? String(row.last_success_at) : null,
       last_failure_at: row.last_failure_at ? String(row.last_failure_at) : null,
       last_failure_code: row.last_failure_code ? String(row.last_failure_code) : null,
+      last_applied_action_account_order:
+        row.last_applied_action_account_order !== null && row.last_applied_action_account_order !== undefined
+          ? Number(row.last_applied_action_account_order)
+          : null,
+      last_applied_action_authorization_id: row.last_applied_action_authorization_id
+        ? String(row.last_applied_action_authorization_id)
+        : null,
       created_at: String(row.created_at),
       updated_at: String(row.updated_at),
     };
@@ -4104,5 +4113,339 @@ export class Repository {
       health_action_cooldown_duration_ms: row.health_action_cooldown_duration_ms !== null && row.health_action_cooldown_duration_ms !== undefined ? Number(row.health_action_cooldown_duration_ms) : null,
       health_action_cooldown_anchor_at: row.health_action_cooldown_anchor_at ? String(row.health_action_cooldown_anchor_at) : null,
     };
+  }
+
+  public applyDurableProviderHealthObservation(
+    authorizationId: string
+  ): ProviderHealthObservationApplicationResult {
+    return this.runInImmediateTransaction(() => {
+      // 1. Re-read durable observation
+      const obs = this.getProviderHealthObservation(authorizationId);
+      if (!obs) {
+        return {
+          status: 'REJECTED',
+          accountId: 'UNKNOWN',
+          authorizationId,
+          accountOrder: null,
+          healthAction: null,
+          reason: `OBSERVATION_NOT_FOUND: Observation for authorization "${authorizationId}" does not exist.`,
+        };
+      }
+
+      const accountId = obs.account_id;
+      const account = this.getProviderAccount(accountId);
+      if (!account) {
+        return {
+          status: 'REJECTED',
+          accountId,
+          authorizationId,
+          accountOrder: obs.account_order,
+          healthAction: obs.health_action,
+          reason: `PROVIDER_ACCOUNT_NOT_FOUND: Account "${accountId}" does not exist.`,
+        };
+      }
+
+      // 2. Check legacy unordered
+      if (obs.account_order === null || obs.account_order === undefined) {
+        return {
+          status: 'LEGACY_UNORDERED',
+          accountId,
+          authorizationId,
+          accountOrder: null,
+          healthAction: obs.health_action,
+          watermarkAccountOrder: account.last_applied_action_account_order ?? null,
+          watermarkAuthorizationId: account.last_applied_action_authorization_id ?? null,
+          reason: 'LEGACY_UNORDERED: Observation does not have a durable account_order.',
+        };
+      }
+
+      // 3. Check action authority
+      if (
+        obs.health_action_plan_version !== 1 ||
+        !obs.health_action ||
+        !['RECORD_SUCCESS', 'RECORD_RATE_LIMITED', 'RECORD_QUOTA_EXHAUSTED', 'RECORD_AUTH_ERROR', 'NO_MUTATION'].includes(obs.health_action)
+      ) {
+        return {
+          status: 'ACTION_AUTHORITY_UNKNOWN',
+          accountId,
+          authorizationId,
+          accountOrder: obs.account_order,
+          healthAction: obs.health_action ?? null,
+          watermarkAccountOrder: account.last_applied_action_account_order ?? null,
+          watermarkAuthorizationId: account.last_applied_action_authorization_id ?? null,
+          reason: 'ACTION_AUTHORITY_UNKNOWN: Observation does not have valid plan_version 1 or known health_action.',
+        };
+      }
+
+      // 4. Check temporal authority for RATE_LIMITED
+      if (obs.health_action === 'RECORD_RATE_LIMITED') {
+        if (
+          !obs.health_action_cooldown_anchor_at ||
+          obs.health_action_cooldown_duration_ms === null ||
+          obs.health_action_cooldown_duration_ms === undefined ||
+          obs.health_action_cooldown_duration_ms <= 0 ||
+          Number.isNaN(Date.parse(obs.health_action_cooldown_anchor_at))
+        ) {
+          return {
+            status: 'TEMPORAL_AUTHORITY_UNKNOWN',
+            accountId,
+            authorizationId,
+            accountOrder: obs.account_order,
+            healthAction: obs.health_action,
+            watermarkAccountOrder: account.last_applied_action_account_order ?? null,
+            watermarkAuthorizationId: account.last_applied_action_authorization_id ?? null,
+            reason: 'TEMPORAL_AUTHORITY_UNKNOWN: RECORD_RATE_LIMITED requires non-null positive cooldown duration and valid anchor.',
+          };
+        }
+      }
+
+      // 5. Check NO_MUTATION
+      if (obs.health_action === 'NO_MUTATION') {
+        return {
+          status: 'NO_MUTATION',
+          accountId,
+          authorizationId,
+          accountOrder: obs.account_order,
+          healthAction: 'NO_MUTATION',
+          watermarkAccountOrder: account.last_applied_action_account_order ?? null,
+          watermarkAuthorizationId: account.last_applied_action_authorization_id ?? null,
+          reason: 'NO_MUTATION: Plan dictates no health state change.',
+        };
+      }
+
+      // 6. Check existing watermark idempotency
+      const currentWatermarkOrder = account.last_applied_action_account_order ?? null;
+      const currentWatermarkAuth = account.last_applied_action_authorization_id ?? null;
+
+      if (currentWatermarkOrder !== null && currentWatermarkOrder !== undefined) {
+        if (obs.account_order === currentWatermarkOrder) {
+          if (obs.authorization_id === currentWatermarkAuth) {
+            return {
+              status: 'ALREADY_APPLIED',
+              accountId,
+              authorizationId,
+              accountOrder: obs.account_order,
+              healthAction: obs.health_action,
+              appliedHealthStatus: account.health_status,
+              appliedCooldownUntil: account.cooldown_until,
+              watermarkAccountOrder: currentWatermarkOrder,
+              watermarkAuthorizationId: currentWatermarkAuth,
+            };
+          } else {
+            return {
+              status: 'REJECTED',
+              accountId,
+              authorizationId,
+              accountOrder: obs.account_order,
+              healthAction: obs.health_action,
+              watermarkAccountOrder: currentWatermarkOrder,
+              watermarkAuthorizationId: currentWatermarkAuth,
+              reason: `WATERMARK_INTEGRITY_MISMATCH: Same account_order ${obs.account_order} already applied for different authorization "${currentWatermarkAuth}".`,
+            };
+          }
+        }
+
+        if (obs.account_order < currentWatermarkOrder) {
+          return {
+            status: 'STALE',
+            accountId,
+            authorizationId,
+            accountOrder: obs.account_order,
+            healthAction: obs.health_action,
+            appliedHealthStatus: account.health_status,
+            appliedCooldownUntil: account.cooldown_until,
+            watermarkAccountOrder: currentWatermarkOrder,
+            watermarkAuthorizationId: currentWatermarkAuth,
+            reason: `STALE: Target account_order ${obs.account_order} is older than current applied watermark ${currentWatermarkOrder}.`,
+          };
+        }
+      }
+
+      // 7. Inspect newer ordered observations on the account (in account_order DESC)
+      const newerRows = this.db
+        .prepare(`
+          SELECT * FROM provider_health_observations
+          WHERE account_id = ? AND account_order IS NOT NULL AND account_order > ?
+          ORDER BY account_order DESC
+        `)
+        .all(accountId, obs.account_order) as Record<string, unknown>[];
+
+      for (const nRow of newerRows) {
+        const nObs = this.mapProviderHealthObservation(nRow);
+        if (nObs.health_action_plan_version === 1 && nObs.health_action === 'NO_MUTATION') {
+          continue; // transparent
+        }
+        const isActionable =
+          nObs.health_action_plan_version === 1 &&
+          nObs.health_action &&
+          ['RECORD_SUCCESS', 'RECORD_QUOTA_EXHAUSTED', 'RECORD_AUTH_ERROR', 'RECORD_RATE_LIMITED'].includes(nObs.health_action);
+
+        if (isActionable) {
+          if (nObs.health_action === 'RECORD_RATE_LIMITED') {
+            const validTemporal =
+              nObs.health_action_cooldown_anchor_at &&
+              nObs.health_action_cooldown_duration_ms &&
+              nObs.health_action_cooldown_duration_ms > 0 &&
+              !Number.isNaN(Date.parse(nObs.health_action_cooldown_anchor_at));
+            if (!validTemporal) {
+              return {
+                status: 'DEFERRED_BY_NEWER_UNKNOWN_AUTHORITY',
+                accountId,
+                authorizationId,
+                accountOrder: obs.account_order,
+                healthAction: obs.health_action,
+                watermarkAccountOrder: currentWatermarkOrder,
+                watermarkAuthorizationId: currentWatermarkAuth,
+                reason: `DEFERRED_BY_NEWER_UNKNOWN_AUTHORITY: Newer observation ${nObs.authorization_id} (order ${nObs.account_order}) has unknown temporal authority.`,
+              };
+            }
+          }
+          return {
+            status: 'STALE',
+            accountId,
+            authorizationId,
+            accountOrder: obs.account_order,
+            healthAction: obs.health_action,
+            appliedHealthStatus: account.health_status,
+            appliedCooldownUntil: account.cooldown_until,
+            watermarkAccountOrder: currentWatermarkOrder,
+            watermarkAuthorizationId: currentWatermarkAuth,
+            reason: `STALE: Newer actionable observation ${nObs.authorization_id} (order ${nObs.account_order}) supersedes target order ${obs.account_order}.`,
+          };
+        } else {
+          return {
+            status: 'DEFERRED_BY_NEWER_UNKNOWN_AUTHORITY',
+            accountId,
+            authorizationId,
+            accountOrder: obs.account_order,
+            healthAction: obs.health_action,
+            watermarkAccountOrder: currentWatermarkOrder,
+            watermarkAuthorizationId: currentWatermarkAuth,
+            reason: `DEFERRED_BY_NEWER_UNKNOWN_AUTHORITY: Newer observation ${nObs.authorization_id} (order ${nObs.account_order}) has unknown action authority.`,
+          };
+        }
+      }
+
+      // 8. Target is the newest effective candidate! Apply mutation and advance watermark atomically
+      const now = new Date().toISOString();
+      let targetHealthStatus: ProviderHealthStatus;
+      let targetCooldownUntil: string | null = null;
+      let targetFailureCode: string | null = null;
+
+      if (obs.health_action === 'RECORD_SUCCESS') {
+        targetHealthStatus = 'AVAILABLE';
+        targetCooldownUntil = null;
+        this.db
+          .prepare(`
+            UPDATE provider_accounts
+            SET health_status = ?,
+                cooldown_until = NULL,
+                last_success_at = ?,
+                updated_at = ?,
+                last_applied_action_account_order = ?,
+                last_applied_action_authorization_id = ?
+            WHERE id = ?
+          `)
+          .run(
+            targetHealthStatus,
+            now,
+            now,
+            obs.account_order,
+            obs.authorization_id,
+            accountId
+          );
+      } else if (obs.health_action === 'RECORD_RATE_LIMITED') {
+        targetHealthStatus = 'RATE_LIMITED';
+        targetFailureCode = 'RATE_LIMITED';
+        const anchorMs = Date.parse(obs.health_action_cooldown_anchor_at!);
+        targetCooldownUntil = new Date(anchorMs + obs.health_action_cooldown_duration_ms!).toISOString();
+        this.db
+          .prepare(`
+            UPDATE provider_accounts
+            SET health_status = ?,
+                cooldown_until = ?,
+                last_failure_at = ?,
+                last_failure_code = ?,
+                updated_at = ?,
+                last_applied_action_account_order = ?,
+                last_applied_action_authorization_id = ?
+            WHERE id = ?
+          `)
+          .run(
+            targetHealthStatus,
+            targetCooldownUntil,
+            now,
+            targetFailureCode,
+            now,
+            obs.account_order,
+            obs.authorization_id,
+            accountId
+          );
+      } else if (obs.health_action === 'RECORD_QUOTA_EXHAUSTED') {
+        targetHealthStatus = 'QUOTA_EXHAUSTED';
+        targetFailureCode = 'QUOTA_EXHAUSTED';
+        targetCooldownUntil = null;
+        this.db
+          .prepare(`
+            UPDATE provider_accounts
+            SET health_status = ?,
+                cooldown_until = NULL,
+                last_failure_at = ?,
+                last_failure_code = ?,
+                updated_at = ?,
+                last_applied_action_account_order = ?,
+                last_applied_action_authorization_id = ?
+            WHERE id = ?
+          `)
+          .run(
+            targetHealthStatus,
+            now,
+            targetFailureCode,
+            now,
+            obs.account_order,
+            obs.authorization_id,
+            accountId
+          );
+      } else if (obs.health_action === 'RECORD_AUTH_ERROR') {
+        targetHealthStatus = 'AUTH_ERROR';
+        targetFailureCode = 'AUTHENTICATION_FAILURE';
+        targetCooldownUntil = null;
+        this.db
+          .prepare(`
+            UPDATE provider_accounts
+            SET health_status = ?,
+                cooldown_until = NULL,
+                last_failure_at = ?,
+                last_failure_code = ?,
+                updated_at = ?,
+                last_applied_action_account_order = ?,
+                last_applied_action_authorization_id = ?
+            WHERE id = ?
+          `)
+          .run(
+            targetHealthStatus,
+            now,
+            targetFailureCode,
+            now,
+            obs.account_order,
+            obs.authorization_id,
+            accountId
+          );
+      } else {
+        throw new Error(`UNEXPECTED_ACTION: Action "${obs.health_action}" cannot be applied.`);
+      }
+
+      return {
+        status: 'APPLIED',
+        accountId,
+        authorizationId,
+        accountOrder: obs.account_order,
+        healthAction: obs.health_action,
+        appliedHealthStatus: targetHealthStatus,
+        appliedCooldownUntil: targetCooldownUntil,
+        watermarkAccountOrder: obs.account_order,
+        watermarkAuthorizationId: obs.authorization_id,
+      };
+    });
   }
 }

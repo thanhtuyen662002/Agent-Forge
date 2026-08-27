@@ -1,5 +1,5 @@
 import { Repository } from '../database/repositories';
-import { ProviderHealthStatus } from '../types/domain';
+import { ProviderHealthStatus, ProviderHealthObservationApplicationResult } from '../types/domain';
 import { ProviderFailureCategory } from './ExecutionFailureClassifier';
 
 export interface RateLimitedHealthUpdateOptions {
@@ -202,5 +202,21 @@ export class AccountHealthService {
     throw new Error(
       'MISSING_EXPLICIT_COOLDOWN: Cooldown mutation requires an explicit positive cooldownDurationMs or valid cooldownUntil timestamp. No default cooldown is assumed.'
     );
+  }
+
+  /**
+   * Applies a modern durable provider health observation to the associated ProviderAccount
+   * using latest-effective actionable ordering and atomic watermark management.
+   * Single semantic writer entrypoint for observation-driven health application.
+   */
+  public applyDurableObservation(
+    authorizationId: string
+  ): ProviderHealthObservationApplicationResult {
+    if (!authorizationId || typeof authorizationId !== 'string' || authorizationId.trim().length === 0) {
+      throw new Error(
+        'INVALID_AUTHORIZATION_ID: applyDurableObservation requires a non-empty authorizationId string.'
+      );
+    }
+    return this.repo.applyDurableProviderHealthObservation(authorizationId.trim());
   }
 }
