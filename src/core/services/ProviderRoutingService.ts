@@ -226,6 +226,16 @@ export class ProviderRoutingService {
         );
       }
 
+      // Check durable health-authority routing safety for account-bound resources
+      if (resource.provider_account_id) {
+        const safety = this.repo.evaluateProviderHealthRoutingSafety(resource.provider_account_id);
+        if (safety.status !== 'SAFE') {
+          rejectionReasons.push(
+            `PROVIDER_HEALTH_UNRESOLVED_AUTHORITY: Account "${resource.provider_account_id}" routing safety status is "${safety.status}". ${safety.reason ?? ''}`.trim()
+          );
+        }
+      }
+
       // If configuration gates fail, reject without probing
       if (rejectionReasons.length > 0) {
         candidateEvaluations.push({

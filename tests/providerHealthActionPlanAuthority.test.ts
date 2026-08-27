@@ -995,6 +995,10 @@ describe('R5H4 Durable Provider Health Action Plan Authority & Routing Snapshot 
       created_at: '2026-08-26T12:00:00.000Z',
       updated_at: '2026-08-26T12:00:00.000Z',
     });
+    // Apply prior observation and reset account health so acc-1 is safe for subsequent routing under R5H4 routing safety
+    repo.applyDurableProviderHealthObservation('auth-diff-a');
+    repo.updateProviderAccountHealth('acc-1', 'AVAILABLE');
+
     const decB = await routingService.routeRole({
       projectId: 'proj-1',
       taskId: 'task-1',

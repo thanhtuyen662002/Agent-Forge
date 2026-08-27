@@ -529,6 +529,15 @@ export class RoleAwareRoutingService {
       if (!account.enabled) {
         rejectionReasons.push(`ProviderAccount "${account.id}" is disabled.`);
       }
+
+      // Check durable health-authority routing safety before probes/selection
+      const routingSafety = this.repo.evaluateProviderHealthRoutingSafety(account.id);
+      if (routingSafety.status !== 'SAFE') {
+        rejectionReasons.push(
+          `PROVIDER_HEALTH_UNRESOLVED_AUTHORITY: Account "${account.id}" routing safety check failed with status "${routingSafety.status}". ${routingSafety.reason ?? ''}`.trim()
+        );
+      }
+
       if (
         account.health_status === 'DISABLED' ||
         account.health_status === 'OFFLINE' ||

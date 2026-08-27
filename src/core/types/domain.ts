@@ -1103,3 +1103,21 @@ export interface ProviderHealthObservationApplicationResult {
   watermarkAuthorizationId?: string | null;
   reason?: string;
 }
+
+export type ProviderHealthRoutingSafetyStatus =
+  | 'SAFE'
+  | 'PENDING_APPLICATION'
+  | 'ACTION_AUTHORITY_UNKNOWN'
+  | 'TEMPORAL_AUTHORITY_UNKNOWN'
+  | 'WATERMARK_INTEGRITY_MISMATCH';
+
+export interface ProviderHealthRoutingSafetyEvaluation {
+  status: ProviderHealthRoutingSafetyStatus;
+  accountId: string;
+  watermarkAccountOrder: number | null;
+  watermarkAuthorizationId: string | null;
+  effectiveHeadAccountOrder: number | null;
+  effectiveHeadAuthorizationId: string | null;
+  effectiveHeadHealthAction: string | null;
+  reason?: string;
+}
