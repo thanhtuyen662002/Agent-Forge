@@ -2108,9 +2108,10 @@ export class Repository {
         row.last_applied_action_account_order !== null && row.last_applied_action_account_order !== undefined
           ? Number(row.last_applied_action_account_order)
           : null,
-      last_applied_action_authorization_id: row.last_applied_action_authorization_id
-        ? String(row.last_applied_action_authorization_id)
-        : null,
+      last_applied_action_authorization_id:
+        row.last_applied_action_authorization_id !== null && row.last_applied_action_authorization_id !== undefined
+          ? String(row.last_applied_action_authorization_id)
+          : null,
       created_at: String(row.created_at),
       updated_at: String(row.updated_at),
     };
@@ -4145,13 +4146,18 @@ export class Repository {
         };
       }
 
-      // 2. Validate Watermark Pair Coherence invariant: both must be null OR both must be non-null
+      // 2. Validate Watermark Pair Coherence invariant: both absent OR both valid non-empty
       const currentWatermarkOrder = account.last_applied_action_account_order ?? null;
       const currentWatermarkAuth = account.last_applied_action_authorization_id ?? null;
-      const hasWatermarkOrder = currentWatermarkOrder !== null && currentWatermarkOrder !== undefined;
-      const hasWatermarkAuth = currentWatermarkAuth !== null && currentWatermarkAuth !== undefined && currentWatermarkAuth !== '';
 
-      if ((hasWatermarkOrder && !hasWatermarkAuth) || (!hasWatermarkOrder && hasWatermarkAuth)) {
+      const hasWatermarkOrder = currentWatermarkOrder !== null && currentWatermarkOrder !== undefined;
+      const authPresent = currentWatermarkAuth !== null && currentWatermarkAuth !== undefined;
+      const authValid = authPresent && typeof currentWatermarkAuth === 'string' && currentWatermarkAuth.trim().length > 0;
+
+      const isBothAbsent = !hasWatermarkOrder && !authPresent;
+      const isBothValid = hasWatermarkOrder && authValid;
+
+      if (!isBothAbsent && !isBothValid) {
         return {
           status: 'REJECTED',
           accountId,
@@ -4160,7 +4166,7 @@ export class Repository {
           healthAction: obs.health_action ?? null,
           watermarkAccountOrder: currentWatermarkOrder,
           watermarkAuthorizationId: currentWatermarkAuth,
-          reason: `WATERMARK_PAIR_INTEGRITY_MISMATCH: ProviderAccount "${accountId}" has malformed partial watermark pair (order=${currentWatermarkOrder}, auth=${currentWatermarkAuth}).`,
+          reason: `WATERMARK_PAIR_INTEGRITY_MISMATCH: ProviderAccount "${accountId}" has malformed or invalid watermark pair (order=${currentWatermarkOrder}, auth=${currentWatermarkAuth}).`,
         };
       }
 
