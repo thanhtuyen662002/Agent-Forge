@@ -1410,4 +1410,86 @@ describe('R5H4 Ordered Provider Health Application & Idempotency Contract Tests'
     expect(res.status).toBe('REJECTED');
     expect(res.reason).toContain('WATERMARK_PAIR_INTEGRITY_MISMATCH');
   });
+
+  it('61. NULL order + empty auth fails closed with REJECTED and zero writes', () => {
+    seedDurableGraph();
+    const item1 = createCoherentObservation({ authId: 'auth-1', execId: 'exec-1', msgId: 'msg-1', category: 'SUCCESS' });
+    repo.claimProviderHealthObservation(item1.obs, item1.result);
+
+    // Corrupt watermark: order = NULL, auth = ''
+    db.prepare('UPDATE provider_accounts SET last_applied_action_account_order = NULL, last_applied_action_authorization_id = ? WHERE id = ?')
+      .run('', ACCOUNT_ID);
+
+    const beforeAcc = repo.getProviderAccount(ACCOUNT_ID)!;
+
+    const res = service.applyDurableObservation('auth-1');
+    expect(res.status).toBe('REJECTED');
+    expect(res.reason).toContain('WATERMARK_PAIR_INTEGRITY_MISMATCH');
+
+    const afterAcc = repo.getProviderAccount(ACCOUNT_ID)!;
+    expect(afterAcc).toEqual(beforeAcc);
+  });
+
+  it('62. non-NULL order + empty auth fails closed with REJECTED and zero writes', () => {
+    seedDurableGraph();
+    const item1 = createCoherentObservation({ authId: 'auth-1', execId: 'exec-1', msgId: 'msg-1', category: 'SUCCESS' });
+    repo.claimProviderHealthObservation(item1.obs, item1.result);
+
+    const item2 = createCoherentObservation({ authId: 'auth-2', execId: 'exec-2', msgId: 'msg-2', category: 'AUTHENTICATION_FAILURE' });
+    repo.claimProviderHealthObservation(item2.obs, item2.result);
+
+    // Corrupt watermark: order = 1, auth = ''
+    db.prepare('UPDATE provider_accounts SET last_applied_action_account_order = 1, last_applied_action_authorization_id = ? WHERE id = ?')
+      .run('', ACCOUNT_ID);
+
+    const beforeAcc = repo.getProviderAccount(ACCOUNT_ID)!;
+
+    const res = service.applyDurableObservation('auth-2');
+    expect(res.status).toBe('REJECTED');
+    expect(res.reason).toContain('WATERMARK_PAIR_INTEGRITY_MISMATCH');
+
+    const afterAcc = repo.getProviderAccount(ACCOUNT_ID)!;
+    expect(afterAcc).toEqual(beforeAcc);
+  });
+
+  it('63. NULL order + whitespace auth fails closed with REJECTED and zero writes', () => {
+    seedDurableGraph();
+    const item1 = createCoherentObservation({ authId: 'auth-1', execId: 'exec-1', msgId: 'msg-1', category: 'SUCCESS' });
+    repo.claimProviderHealthObservation(item1.obs, item1.result);
+
+    // Corrupt watermark: order = NULL, auth = '   '
+    db.prepare('UPDATE provider_accounts SET last_applied_action_account_order = NULL, last_applied_action_authorization_id = ? WHERE id = ?')
+      .run('   ', ACCOUNT_ID);
+
+    const beforeAcc = repo.getProviderAccount(ACCOUNT_ID)!;
+
+    const res = service.applyDurableObservation('auth-1');
+    expect(res.status).toBe('REJECTED');
+    expect(res.reason).toContain('WATERMARK_PAIR_INTEGRITY_MISMATCH');
+
+    const afterAcc = repo.getProviderAccount(ACCOUNT_ID)!;
+    expect(afterAcc).toEqual(beforeAcc);
+  });
+
+  it('64. non-NULL order + whitespace auth fails closed with REJECTED and zero writes', () => {
+    seedDurableGraph();
+    const item1 = createCoherentObservation({ authId: 'auth-1', execId: 'exec-1', msgId: 'msg-1', category: 'SUCCESS' });
+    repo.claimProviderHealthObservation(item1.obs, item1.result);
+
+    const item2 = createCoherentObservation({ authId: 'auth-2', execId: 'exec-2', msgId: 'msg-2', category: 'AUTHENTICATION_FAILURE' });
+    repo.claimProviderHealthObservation(item2.obs, item2.result);
+
+    // Corrupt watermark: order = 1, auth = '   '
+    db.prepare('UPDATE provider_accounts SET last_applied_action_account_order = 1, last_applied_action_authorization_id = ? WHERE id = ?')
+      .run('   ', ACCOUNT_ID);
+
+    const beforeAcc = repo.getProviderAccount(ACCOUNT_ID)!;
+
+    const res = service.applyDurableObservation('auth-2');
+    expect(res.status).toBe('REJECTED');
+    expect(res.reason).toContain('WATERMARK_PAIR_INTEGRITY_MISMATCH');
+
+    const afterAcc = repo.getProviderAccount(ACCOUNT_ID)!;
+    expect(afterAcc).toEqual(beforeAcc);
+  });
 });
