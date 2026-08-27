@@ -1336,4 +1336,78 @@ describe('R5H4 Ordered Provider Health Application & Idempotency Contract Tests'
     expect(repoContent).not.toContain('acquireAccountLock');
     expect(repoContent).not.toContain('AccountLock');
   });
+
+  it('57. Malformed partial watermark (NULL order + non-NULL auth) fails closed with REJECTED and zero writes', () => {
+    seedDurableGraph();
+    const item1 = createCoherentObservation({ authId: 'auth-1', execId: 'exec-1', msgId: 'msg-1', category: 'SUCCESS' });
+    repo.claimProviderHealthObservation(item1.obs, item1.result);
+
+    // Corrupt watermark: order = NULL, auth = 'auth-corrupt'
+    db.prepare('UPDATE provider_accounts SET last_applied_action_account_order = NULL, last_applied_action_authorization_id = ? WHERE id = ?')
+      .run('auth-corrupt', ACCOUNT_ID);
+
+    const beforeAcc = repo.getProviderAccount(ACCOUNT_ID)!;
+
+    const res = service.applyDurableObservation('auth-1');
+    expect(res.status).toBe('REJECTED');
+    expect(res.reason).toContain('WATERMARK_PAIR_INTEGRITY_MISMATCH');
+
+    const afterAcc = repo.getProviderAccount(ACCOUNT_ID)!;
+    expect(afterAcc).toEqual(beforeAcc);
+  });
+
+  it('58. Malformed partial watermark (non-NULL order + NULL auth) fails closed with REJECTED even when target order is newer', () => {
+    seedDurableGraph();
+    const item1 = createCoherentObservation({ authId: 'auth-1', execId: 'exec-1', msgId: 'msg-1', category: 'SUCCESS' });
+    repo.claimProviderHealthObservation(item1.obs, item1.result);
+
+    const item2 = createCoherentObservation({ authId: 'auth-2', execId: 'exec-2', msgId: 'msg-2', category: 'AUTHENTICATION_FAILURE' });
+    repo.claimProviderHealthObservation(item2.obs, item2.result);
+
+    // Corrupt watermark: order = 1, auth = NULL
+    db.prepare('UPDATE provider_accounts SET last_applied_action_account_order = 1, last_applied_action_authorization_id = NULL WHERE id = ?')
+      .run(ACCOUNT_ID);
+
+    const beforeAcc = repo.getProviderAccount(ACCOUNT_ID)!;
+
+    // Apply target auth-2 (order 2 > 1)
+    const res = service.applyDurableObservation('auth-2');
+    expect(res.status).toBe('REJECTED');
+    expect(res.reason).toContain('WATERMARK_PAIR_INTEGRITY_MISMATCH');
+
+    const afterAcc = repo.getProviderAccount(ACCOUNT_ID)!;
+    expect(afterAcc).toEqual(beforeAcc);
+  });
+
+  it('59. Malformed partial watermark outranks NO_MUTATION (returns REJECTED rather than NO_MUTATION)', () => {
+    seedDurableGraph();
+    // Ingestion result with NO_MUTATION
+    const item1 = createCoherentObservation({ authId: 'auth-1', execId: 'exec-1', msgId: 'msg-1', category: 'UNKNOWN' });
+    repo.claimProviderHealthObservation(item1.obs, item1.result);
+
+    // Corrupt watermark
+    db.prepare('UPDATE provider_accounts SET last_applied_action_account_order = 1, last_applied_action_authorization_id = NULL WHERE id = ?')
+      .run(ACCOUNT_ID);
+
+    const res = service.applyDurableObservation('auth-1');
+    expect(res.status).toBe('REJECTED');
+    expect(res.reason).toContain('WATERMARK_PAIR_INTEGRITY_MISMATCH');
+  });
+
+  it('60. Malformed partial watermark outranks legacy unordered target (returns REJECTED rather than LEGACY_UNORDERED)', () => {
+    seedDurableGraph();
+    const item1 = createCoherentObservation({ authId: 'auth-1', execId: 'exec-1', msgId: 'msg-1', category: 'SUCCESS' });
+    repo.claimProviderHealthObservation(item1.obs, item1.result);
+
+    // Make target observation legacy unordered (order = NULL)
+    db.prepare('UPDATE provider_health_observations SET account_order = NULL WHERE authorization_id = ?').run('auth-1');
+
+    // Corrupt watermark
+    db.prepare('UPDATE provider_accounts SET last_applied_action_account_order = NULL, last_applied_action_authorization_id = ? WHERE id = ?')
+      .run('auth-corrupt', ACCOUNT_ID);
+
+    const res = service.applyDurableObservation('auth-1');
+    expect(res.status).toBe('REJECTED');
+    expect(res.reason).toContain('WATERMARK_PAIR_INTEGRITY_MISMATCH');
+  });
 });
