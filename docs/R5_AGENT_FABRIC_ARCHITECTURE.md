@@ -392,3 +392,44 @@ When evaluating a candidate observation against the account ledger:
 ### 6. Semantic Boundary & Production Wiring Scope
 - **Single Semantic Entrypoint**: `AccountHealthService.applyDurableObservation(authorizationId)` is the sole public facade.
 - **No Production Mutation Wiring**: Ingestion does not trigger synchronous application, and startup recovery does not execute health reconciliation in this contract phase. All production orchestration remains deferred to subsequent gates.
+
+---
+
+## 14. Durable Health-Authority Routing Safety & Liveness Guard (R5H4)
+
+### 1. Core Safety Principle: Ledger vs Watermark Authority
+- **Beyond Account Health Status**: Routing safety authority is not merely `ProviderAccount.health_status`. It is the comparison between the durable effective health observation head in the observation ledger and the account's persisted application watermark (`last_applied_action_account_order`, `last_applied_action_authorization_id`).
+- **Dynamic Ledger Guard**: Prevents routing to accounts with unapplied actionable evidence (`PENDING_APPLICATION`), unresolved action authority (`ACTION_AUTHORITY_UNKNOWN`), unresolved temporal rate-limit authority (`TEMPORAL_AUTHORITY_UNKNOWN`), or corrupt watermarks (`WATERMARK_INTEGRITY_MISMATCH`).
+- **No Schema Column**: No new unresolved-state column or Migration 16 is added; the durable `provider_health_observations` ledger itself serves as the dynamic source of authority.
+
+### 2. Read-Only Invariant
+- Safety evaluation (`Repository.evaluateProviderHealthRoutingSafety`) is strictly read-only. It never modifies `health_status`, `cooldown_until`, `last_success_at`, `last_failure_at`, `last_failure_code`, `updated_at`, `enabled`, or watermark columns on `ProviderAccount`.
+
+### 3. Effective Head Resolution & Transparency
+- **Account-Ordered Only**: Only observations with non-null `account_order` participate in effective head resolution. Legacy rows (`account_order IS NULL`) are ignored.
+- **NO_MUTATION Transparency**: Valid `plan_version = 1` observations with `health_action = 'NO_MUTATION'` are transparent. Scanning proceeds from newest to oldest until the first non-`NO_MUTATION` ordered row is encountered.
+- **No Fixed Limit**: Effective head discovery scans ordered observations without an arbitrary LIMIT (e.g. 100), ensuring that large batches of transparent `NO_MUTATION` rows cannot hide older actionable evidence.
+
+### 4. Safety Evaluation Taxonomy
+1. **SAFE**:
+   - No effective ordered head exists AND watermark is absent (NULL/NULL).
+   - Effective ordered head is valid actionable (`RECORD_SUCCESS`, `RECORD_QUOTA_EXHAUSTED`, `RECORD_AUTH_ERROR`, or valid `RECORD_RATE_LIMITED`) AND matches watermark exactly `(order, authorization_id)`.
+2. **PENDING_APPLICATION**:
+   - Effective ordered head is valid actionable AND watermark is either NULL or older than head (`watermark.order < head.order`).
+   - Fails closed: prevents stale `AVAILABLE` state from being routed when newer actionable evidence is committed.
+3. **ACTION_AUTHORITY_UNKNOWN**:
+   - Effective ordered head lacks valid modern action authority (`health_action_plan_version != 1` or unrecognized action).
+   - Fails closed without inventing health status or disabling the account.
+4. **TEMPORAL_AUTHORITY_UNKNOWN**:
+   - Effective ordered head is `RECORD_RATE_LIMITED` but lacks a valid positive duration or valid temporal anchor (`health_action_cooldown_anchor_at`).
+   - Fails closed without inventing health status.
+5. **WATERMARK_INTEGRITY_MISMATCH**:
+   - Malformed watermark pair (partial, empty string, or whitespace-only auth).
+   - Watermark references non-existent observation, observation for different account, mismatched order, or `NO_MUTATION` action.
+   - Watermark order ahead of effective head, or same order with different authorization ID.
+
+### 5. Multi-Point Defense Pipeline
+- **RoleAwareRoutingService**: Evaluates routing safety for every candidate account before live adapter health probes, quota probes, capability probes, and selection. Unsafe candidates are marked `INELIGIBLE` with bounded rejection reasons; alternate safe accounts can still be selected.
+- **ProviderRoutingService**: Evaluates routing safety for account-bound resources (`resource.provider_account_id IS NOT NULL`) before live adapter health probes and Manual Bridge evaluation. Unbound legacy resources remain unchanged.
+- **ProviderDispatchService Pre-Claim Check**: Evaluates account routing safety during dispatch for `SELECTED` routing decisions after account lookup and before claiming the authorization.
+- **ProviderDispatchService Post-Claim / Pre-Adapter Check**: Final safety check performed after authorization claim and immediately before `adapter.execute()`. This serves as the `PROVIDER_HEALTH_AUTHORITY_EXECUTION_LINEARIZATION_POINT`. If the account became unsafe after claim, execution fails closed with `RESOURCE_UNAVAILABLE` and adapter invocation is strictly zero.

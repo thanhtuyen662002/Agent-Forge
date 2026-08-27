@@ -543,6 +543,15 @@ export class ProviderDispatchService {
         return { executionId, status: 'FAILED', error: reason, errorCode: 'RESOURCE_UNAVAILABLE' };
       }
 
+      // Check durable health-authority routing safety before claim
+      const preClaimSafety = this.repo.evaluateProviderHealthRoutingSafety(account.id);
+      if (preClaimSafety.status !== 'SAFE') {
+        this.repo.invalidateExecutionAuthorization(auth.id);
+        const reason = `EXECUTION_AUTHORIZATION_ROUTING_UNSAFE: Provider account "${account.id}" routing safety check failed with status "${preClaimSafety.status}". ${preClaimSafety.reason ?? ''}`.trim();
+        this.recordRejectionEvent(auth, reason);
+        return { executionId, status: 'FAILED', error: reason, errorCode: 'RESOURCE_UNAVAILABLE' };
+      }
+
       assignment = this.repo.getAgentAssignment(selectedAssignmentId);
       if (!assignment) {
         this.repo.invalidateExecutionAuthorization(auth.id);
@@ -1013,6 +1022,21 @@ export class ProviderDispatchService {
     if (mode === 'SCHEDULED' && control) {
       control.phase = 'EXECUTING';
       control.adapter = adapter;
+    }
+
+    // 15c. Post-claim / Final pre-adapter routing safety check (linearization point)
+    if (runtimeBinding?.accountId) {
+      const postClaimSafety = this.repo.evaluateProviderHealthRoutingSafety(runtimeBinding.accountId);
+      if (postClaimSafety.status !== 'SAFE') {
+        const reason = `EXECUTION_DISPATCH_ROUTING_UNSAFE: Provider account "${runtimeBinding.accountId}" became unsafe after authorization claim (status: "${postClaimSafety.status}"). ${postClaimSafety.reason ?? ''}`.trim();
+        this.recordRejectionEvent(auth, reason);
+        return {
+          executionId,
+          status: 'FAILED',
+          errorCode: 'RESOURCE_UNAVAILABLE',
+          error: reason,
+        };
+      }
     }
 
     // 16. Execute the selected provider exactly once (NO retry, NO failover on failure)

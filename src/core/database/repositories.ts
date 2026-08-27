@@ -62,6 +62,8 @@ import {
   FailoverPolicyParseResult,
   ProviderHealthObservationApplicationStatus,
   ProviderHealthObservationApplicationResult,
+  ProviderHealthRoutingSafetyStatus,
+  ProviderHealthRoutingSafetyEvaluation,
 } from '../types/domain';
 import type { ProviderDispatchExecutionResult } from '../services/ProviderDispatchService';
 import { ExecutionFailureClassifier } from '../services/ExecutionFailureClassifier';
@@ -4469,5 +4471,263 @@ export class Repository {
         watermarkAuthorizationId: obs.authorization_id,
       };
     });
+  }
+
+  /**
+   * Evaluates routing safety for a ProviderAccount by comparing the durable effective
+   * health observation head against the account's persisted application watermark.
+   *
+   * Pure read-only operation: never mutates ProviderAccount state.
+   */
+  public evaluateProviderHealthRoutingSafety(accountId: string): ProviderHealthRoutingSafetyEvaluation {
+    const account = this.getProviderAccount(accountId);
+    if (!account) {
+      return {
+        status: 'SAFE',
+        accountId,
+        watermarkAccountOrder: null,
+        watermarkAuthorizationId: null,
+        effectiveHeadAccountOrder: null,
+        effectiveHeadAuthorizationId: null,
+        effectiveHeadHealthAction: null,
+        reason: `ACCOUNT_NOT_FOUND: ProviderAccount "${accountId}" not found.`,
+      };
+    }
+
+    const watermarkOrder = account.last_applied_action_account_order ?? null;
+    const watermarkAuth = account.last_applied_action_authorization_id ?? null;
+
+    const hasWatermarkOrder = watermarkOrder !== null && watermarkOrder !== undefined;
+    const authPresent = watermarkAuth !== null && watermarkAuth !== undefined;
+    const authValid = authPresent && typeof watermarkAuth === 'string' && watermarkAuth.trim().length > 0;
+
+    const isBothAbsent = !hasWatermarkOrder && !authPresent;
+    const isBothValid = hasWatermarkOrder && authValid;
+
+    // 1. Watermark structural validation
+    if (!isBothAbsent && !isBothValid) {
+      return {
+        status: 'WATERMARK_INTEGRITY_MISMATCH',
+        accountId,
+        watermarkAccountOrder: watermarkOrder,
+        watermarkAuthorizationId: watermarkAuth,
+        effectiveHeadAccountOrder: null,
+        effectiveHeadAuthorizationId: null,
+        effectiveHeadHealthAction: null,
+        reason: `WATERMARK_INTEGRITY_MISMATCH: Malformed watermark pair (order=${watermarkOrder}, auth=${JSON.stringify(watermarkAuth)}).`,
+      };
+    }
+
+    // 2. Watermark reference integrity (if non-null)
+    if (isBothValid) {
+      const watermarkedObs = this.getProviderHealthObservation(watermarkAuth!);
+      if (!watermarkedObs) {
+        return {
+          status: 'WATERMARK_INTEGRITY_MISMATCH',
+          accountId,
+          watermarkAccountOrder: watermarkOrder,
+          watermarkAuthorizationId: watermarkAuth,
+          effectiveHeadAccountOrder: null,
+          effectiveHeadAuthorizationId: null,
+          effectiveHeadHealthAction: null,
+          reason: `WATERMARK_INTEGRITY_MISMATCH: Watermark references non-existent observation "${watermarkAuth}".`,
+        };
+      }
+
+      if (watermarkedObs.account_id !== accountId) {
+        return {
+          status: 'WATERMARK_INTEGRITY_MISMATCH',
+          accountId,
+          watermarkAccountOrder: watermarkOrder,
+          watermarkAuthorizationId: watermarkAuth,
+          effectiveHeadAccountOrder: null,
+          effectiveHeadAuthorizationId: null,
+          effectiveHeadHealthAction: null,
+          reason: `WATERMARK_INTEGRITY_MISMATCH: Watermark references observation for different account "${watermarkedObs.account_id}".`,
+        };
+      }
+
+      if (watermarkedObs.account_order !== watermarkOrder) {
+        return {
+          status: 'WATERMARK_INTEGRITY_MISMATCH',
+          accountId,
+          watermarkAccountOrder: watermarkOrder,
+          watermarkAuthorizationId: watermarkAuth,
+          effectiveHeadAccountOrder: null,
+          effectiveHeadAuthorizationId: null,
+          effectiveHeadHealthAction: null,
+          reason: `WATERMARK_INTEGRITY_MISMATCH: Watermark order ${watermarkOrder} does not match referenced observation order ${watermarkedObs.account_order}.`,
+        };
+      }
+
+      if (
+        watermarkedObs.health_action_plan_version === 1 &&
+        watermarkedObs.health_action === 'NO_MUTATION'
+      ) {
+        return {
+          status: 'WATERMARK_INTEGRITY_MISMATCH',
+          accountId,
+          watermarkAccountOrder: watermarkOrder,
+          watermarkAuthorizationId: watermarkAuth,
+          effectiveHeadAccountOrder: null,
+          effectiveHeadAuthorizationId: null,
+          effectiveHeadHealthAction: null,
+          reason: 'WATERMARK_INTEGRITY_MISMATCH: Watermark cannot point to a NO_MUTATION observation.',
+        };
+      }
+    }
+
+    // 3. Scan ordered observations for this account (newest -> oldest, NO LIMIT) to find effective head
+    const rows = this.db
+      .prepare(`
+        SELECT authorization_id, account_id, account_order, health_action_plan_version, health_action,
+               health_action_cooldown_duration_ms, health_action_cooldown_anchor_at
+        FROM provider_health_observations
+        WHERE account_id = ?
+          AND account_order IS NOT NULL
+        ORDER BY account_order DESC
+      `)
+      .all(accountId) as Record<string, unknown>[];
+
+    let effectiveHead: Record<string, unknown> | null = null;
+    for (const row of rows) {
+      const planVer = row.health_action_plan_version !== null && row.health_action_plan_version !== undefined
+        ? Number(row.health_action_plan_version)
+        : null;
+      const action = row.health_action ? String(row.health_action) : null;
+
+      // Explicit valid NO_MUTATION is transparent
+      if (planVer === 1 && action === 'NO_MUTATION') {
+        continue;
+      }
+
+      // First non-NO_MUTATION ordered row is the effective head
+      effectiveHead = row;
+      break;
+    }
+
+    // 4. Case: No effective ordered head
+    if (!effectiveHead) {
+      if (isBothAbsent) {
+        return {
+          status: 'SAFE',
+          accountId,
+          watermarkAccountOrder: null,
+          watermarkAuthorizationId: null,
+          effectiveHeadAccountOrder: null,
+          effectiveHeadAuthorizationId: null,
+          effectiveHeadHealthAction: null,
+        };
+      } else {
+        // Watermark exists but no non-NO_MUTATION head exists
+        return {
+          status: 'WATERMARK_INTEGRITY_MISMATCH',
+          accountId,
+          watermarkAccountOrder: watermarkOrder,
+          watermarkAuthorizationId: watermarkAuth,
+          effectiveHeadAccountOrder: null,
+          effectiveHeadAuthorizationId: null,
+          effectiveHeadHealthAction: null,
+          reason: 'WATERMARK_INTEGRITY_MISMATCH: Watermark exists but no effective ordered observations found.',
+        };
+      }
+    }
+
+    const headOrder = Number(effectiveHead.account_order);
+    const headAuth = String(effectiveHead.authorization_id);
+    const headPlanVer = effectiveHead.health_action_plan_version !== null && effectiveHead.health_action_plan_version !== undefined
+      ? Number(effectiveHead.health_action_plan_version)
+      : null;
+    const headAction = effectiveHead.health_action ? String(effectiveHead.health_action) : null;
+    const headDuration = effectiveHead.health_action_cooldown_duration_ms !== null && effectiveHead.health_action_cooldown_duration_ms !== undefined
+      ? Number(effectiveHead.health_action_cooldown_duration_ms)
+      : null;
+    const headAnchor = effectiveHead.health_action_cooldown_anchor_at ? String(effectiveHead.health_action_cooldown_anchor_at) : null;
+
+    // 5. Watermark ahead of effective head check
+    if (hasWatermarkOrder && watermarkOrder! > headOrder) {
+      return {
+        status: 'WATERMARK_INTEGRITY_MISMATCH',
+        accountId,
+        watermarkAccountOrder: watermarkOrder,
+        watermarkAuthorizationId: watermarkAuth,
+        effectiveHeadAccountOrder: headOrder,
+        effectiveHeadAuthorizationId: headAuth,
+        effectiveHeadHealthAction: headAction,
+        reason: `WATERMARK_INTEGRITY_MISMATCH: Watermark order ${watermarkOrder} is ahead of effective head order ${headOrder}.`,
+      };
+    }
+
+    // 6. Same order different authorization check
+    if (hasWatermarkOrder && watermarkOrder === headOrder && watermarkAuth !== headAuth) {
+      return {
+        status: 'WATERMARK_INTEGRITY_MISMATCH',
+        accountId,
+        watermarkAccountOrder: watermarkOrder,
+        watermarkAuthorizationId: watermarkAuth,
+        effectiveHeadAccountOrder: headOrder,
+        effectiveHeadAuthorizationId: headAuth,
+        effectiveHeadHealthAction: headAction,
+        reason: `WATERMARK_INTEGRITY_MISMATCH: Watermark auth "${watermarkAuth}" does not match effective head auth "${headAuth}" at order ${headOrder}.`,
+      };
+    }
+
+    // 7. Check if effective head has unknown action authority
+    const validActions = ['RECORD_SUCCESS', 'RECORD_QUOTA_EXHAUSTED', 'RECORD_AUTH_ERROR', 'RECORD_RATE_LIMITED'];
+    if (headPlanVer !== 1 || !headAction || !validActions.includes(headAction)) {
+      return {
+        status: 'ACTION_AUTHORITY_UNKNOWN',
+        accountId,
+        watermarkAccountOrder: watermarkOrder,
+        watermarkAuthorizationId: watermarkAuth,
+        effectiveHeadAccountOrder: headOrder,
+        effectiveHeadAuthorizationId: headAuth,
+        effectiveHeadHealthAction: headAction,
+        reason: `ACTION_AUTHORITY_UNKNOWN: Effective head observation "${headAuth}" has unknown action authority (planVer=${headPlanVer}, action=${headAction}).`,
+      };
+    }
+
+    // 8. Check temporal authority for RECORD_RATE_LIMITED
+    if (headAction === 'RECORD_RATE_LIMITED') {
+      const isAnchorValid = headAnchor !== null && !isNaN(Date.parse(headAnchor));
+      const isDurationValid = headDuration !== null && headDuration > 0;
+      if (!isAnchorValid || !isDurationValid) {
+        return {
+          status: 'TEMPORAL_AUTHORITY_UNKNOWN',
+          accountId,
+          watermarkAccountOrder: watermarkOrder,
+          watermarkAuthorizationId: watermarkAuth,
+          effectiveHeadAccountOrder: headOrder,
+          effectiveHeadAuthorizationId: headAuth,
+          effectiveHeadHealthAction: headAction,
+          reason: `TEMPORAL_AUTHORITY_UNKNOWN: Effective head observation "${headAuth}" has invalid cooldown anchor/duration.`,
+        };
+      }
+    }
+
+    // 9. Check if watermark is current with effective head
+    if (hasWatermarkOrder && watermarkOrder === headOrder && watermarkAuth === headAuth) {
+      return {
+        status: 'SAFE',
+        accountId,
+        watermarkAccountOrder: watermarkOrder,
+        watermarkAuthorizationId: watermarkAuth,
+        effectiveHeadAccountOrder: headOrder,
+        effectiveHeadAuthorizationId: headAuth,
+        effectiveHeadHealthAction: headAction,
+      };
+    }
+
+    // 10. Watermark is null or older than effective head
+    return {
+      status: 'PENDING_APPLICATION',
+      accountId,
+      watermarkAccountOrder: watermarkOrder,
+      watermarkAuthorizationId: watermarkAuth,
+      effectiveHeadAccountOrder: headOrder,
+      effectiveHeadAuthorizationId: headAuth,
+      effectiveHeadHealthAction: headAction,
+      reason: `PENDING_APPLICATION: Effective head observation "${headAuth}" (order ${headOrder}) has not yet been applied to account watermark (order ${watermarkOrder}).`,
+    };
   }
 }
