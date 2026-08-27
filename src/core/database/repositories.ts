@@ -4145,7 +4145,26 @@ export class Repository {
         };
       }
 
-      // 2. Check legacy unordered
+      // 2. Validate Watermark Pair Coherence invariant: both must be null OR both must be non-null
+      const currentWatermarkOrder = account.last_applied_action_account_order ?? null;
+      const currentWatermarkAuth = account.last_applied_action_authorization_id ?? null;
+      const hasWatermarkOrder = currentWatermarkOrder !== null && currentWatermarkOrder !== undefined;
+      const hasWatermarkAuth = currentWatermarkAuth !== null && currentWatermarkAuth !== undefined && currentWatermarkAuth !== '';
+
+      if ((hasWatermarkOrder && !hasWatermarkAuth) || (!hasWatermarkOrder && hasWatermarkAuth)) {
+        return {
+          status: 'REJECTED',
+          accountId,
+          authorizationId,
+          accountOrder: obs.account_order ?? null,
+          healthAction: obs.health_action ?? null,
+          watermarkAccountOrder: currentWatermarkOrder,
+          watermarkAuthorizationId: currentWatermarkAuth,
+          reason: `WATERMARK_PAIR_INTEGRITY_MISMATCH: ProviderAccount "${accountId}" has malformed partial watermark pair (order=${currentWatermarkOrder}, auth=${currentWatermarkAuth}).`,
+        };
+      }
+
+      // 3. Check legacy unordered
       if (obs.account_order === null || obs.account_order === undefined) {
         return {
           status: 'LEGACY_UNORDERED',
@@ -4153,13 +4172,13 @@ export class Repository {
           authorizationId,
           accountOrder: null,
           healthAction: obs.health_action,
-          watermarkAccountOrder: account.last_applied_action_account_order ?? null,
-          watermarkAuthorizationId: account.last_applied_action_authorization_id ?? null,
+          watermarkAccountOrder: currentWatermarkOrder,
+          watermarkAuthorizationId: currentWatermarkAuth,
           reason: 'LEGACY_UNORDERED: Observation does not have a durable account_order.',
         };
       }
 
-      // 3. Check action authority
+      // 4. Check action authority
       if (
         obs.health_action_plan_version !== 1 ||
         !obs.health_action ||
@@ -4171,13 +4190,13 @@ export class Repository {
           authorizationId,
           accountOrder: obs.account_order,
           healthAction: obs.health_action ?? null,
-          watermarkAccountOrder: account.last_applied_action_account_order ?? null,
-          watermarkAuthorizationId: account.last_applied_action_authorization_id ?? null,
+          watermarkAccountOrder: currentWatermarkOrder,
+          watermarkAuthorizationId: currentWatermarkAuth,
           reason: 'ACTION_AUTHORITY_UNKNOWN: Observation does not have valid plan_version 1 or known health_action.',
         };
       }
 
-      // 4. Check temporal authority for RATE_LIMITED
+      // 5. Check temporal authority for RATE_LIMITED
       if (obs.health_action === 'RECORD_RATE_LIMITED') {
         if (
           !obs.health_action_cooldown_anchor_at ||
@@ -4192,14 +4211,14 @@ export class Repository {
             authorizationId,
             accountOrder: obs.account_order,
             healthAction: obs.health_action,
-            watermarkAccountOrder: account.last_applied_action_account_order ?? null,
-            watermarkAuthorizationId: account.last_applied_action_authorization_id ?? null,
+            watermarkAccountOrder: currentWatermarkOrder,
+            watermarkAuthorizationId: currentWatermarkAuth,
             reason: 'TEMPORAL_AUTHORITY_UNKNOWN: RECORD_RATE_LIMITED requires non-null positive cooldown duration and valid anchor.',
           };
         }
       }
 
-      // 5. Check NO_MUTATION
+      // 6. Check NO_MUTATION
       if (obs.health_action === 'NO_MUTATION') {
         return {
           status: 'NO_MUTATION',
@@ -4207,16 +4226,13 @@ export class Repository {
           authorizationId,
           accountOrder: obs.account_order,
           healthAction: 'NO_MUTATION',
-          watermarkAccountOrder: account.last_applied_action_account_order ?? null,
-          watermarkAuthorizationId: account.last_applied_action_authorization_id ?? null,
+          watermarkAccountOrder: currentWatermarkOrder,
+          watermarkAuthorizationId: currentWatermarkAuth,
           reason: 'NO_MUTATION: Plan dictates no health state change.',
         };
       }
 
-      // 6. Check existing watermark idempotency
-      const currentWatermarkOrder = account.last_applied_action_account_order ?? null;
-      const currentWatermarkAuth = account.last_applied_action_authorization_id ?? null;
-
+      // 7. Check existing watermark idempotency
       if (currentWatermarkOrder !== null && currentWatermarkOrder !== undefined) {
         if (obs.account_order === currentWatermarkOrder) {
           if (obs.authorization_id === currentWatermarkAuth) {
