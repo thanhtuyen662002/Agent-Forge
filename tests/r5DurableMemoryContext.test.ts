@@ -217,7 +217,7 @@ describe('R5B — Durable Memory & Context Fabric Contract Tests', () => {
     expect(tables).toContain('handoff_contexts');
 
     const migrationCount = (db.prepare('SELECT COUNT(*) as count FROM schema_migrations').get() as { count: number }).count;
-    expect(migrationCount).toBe(15);
+    expect(migrationCount).toBe(MIGRATIONS.length);
   });
 
   it('2. historical migration upgrade v1 -> v15 succeeds', () => {
@@ -245,9 +245,9 @@ describe('R5B — Durable Memory & Context Fabric Contract Tests', () => {
 
     expect((upgradeDb.prepare('SELECT COUNT(*) as count FROM schema_migrations').get() as { count: number }).count).toBe(8);
 
-    // Apply remaining migrations through latest (v15)
+    // Apply remaining migrations through latest
     MigrationRunner.run(upgradeDb);
-    expect((upgradeDb.prepare('SELECT COUNT(*) as count FROM schema_migrations').get() as { count: number }).count).toBe(15);
+    expect((upgradeDb.prepare('SELECT COUNT(*) as count FROM schema_migrations').get() as { count: number }).count).toBe(MIGRATIONS.length);
 
     const fkViolations = upgradeDb.prepare('PRAGMA foreign_key_check').all();
     expect(fkViolations).toHaveLength(0);

@@ -51,6 +51,7 @@ describe('Database Migrations & Upgrade Integrity', () => {
     expect(tableNames).toContain('handoff_contexts');
     expect(tableNames).toContain('failover_transitions');
     expect(tableNames).toContain('provider_health_observations');
+    expect(tableNames).toContain('handoff_transfers');
     expect(tableNames).toContain('schema_migrations');
 
     const indexList = db.prepare('PRAGMA index_list(task_attempts)').all() as { name: string; unique: number }[];
@@ -64,7 +65,7 @@ describe('Database Migrations & Upgrade Integrity', () => {
     expect(uniqueAccountOrderIdx?.unique).toBe(1);
 
     const applied = db.prepare('SELECT COUNT(*) as count FROM schema_migrations').get() as { count: number };
-    expect(applied.count).toBe(15);
+    expect(applied.count).toBe(MIGRATIONS.length);
 
     // Foreign key integrity check
     const fkViolations = db.prepare('PRAGMA foreign_key_check').all();
@@ -85,7 +86,7 @@ describe('Database Migrations & Upgrade Integrity', () => {
     // Idempotency check: running MigrationRunner again applies 0 new migrations
     MigrationRunner.run(db);
     const appliedAgain = db.prepare('SELECT COUNT(*) as count FROM schema_migrations').get() as { count: number };
-    expect(appliedAgain.count).toBe(15);
+    expect(appliedAgain.count).toBe(MIGRATIONS.length);
   });
 
   it('should cleanly upgrade an existing database through historical path (v1 -> v2 -> original v3 -> v4 -> v5 -> v6 -> v7 -> v8 -> v9 -> v10 -> v11 -> v12 -> v13) and repair default agent links', () => {
@@ -164,7 +165,7 @@ describe('Database Migrations & Upgrade Integrity', () => {
     expect(v12Tables).toContain('provider_health_observations');
 
     const migrationCount = (db.prepare('SELECT COUNT(*) as count FROM schema_migrations').get() as { count: number }).count;
-    expect(migrationCount).toBe(15);
+    expect(migrationCount).toBe(MIGRATIONS.length);
 
     // 4. Assert default agent links are repaired by migration 005
     const mgrAfter = db.prepare('SELECT * FROM agents WHERE id = ?').get('agent-primary-manager') as any;
