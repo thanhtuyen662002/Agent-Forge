@@ -6,6 +6,7 @@ import {
   AdapterOutcome,
   ProviderTerminationStatus,
   TaskAttempt,
+  AgentAssignment,
   ContextSnapshot,
   ContextManifest,
   ContextItem,
@@ -17,6 +18,12 @@ import {
   canonicalJsonStringify,
   computeSha256,
 } from './ContextBuilderService';
+import {
+  RoleAwareRoutingService,
+  CandidateAccountResourceRef,
+  RoleAwareRoutingDecision,
+  RoleAwareRoutingOutcome,
+} from './RoleAwareRoutingService';
 
 export function isRecoverableDeterministicSnapshotCollision(
   err: unknown,
@@ -330,11 +337,262 @@ export interface HandoffCancelResult {
     | 'INTERNAL_ERROR';
 }
 
+export interface HandoffRouteSpecV1 {
+  version: 1;
+  transfer_id: string;
+  task_id: string;
+  successor_attempt_id: string;
+  successor_role_profile_id: string;
+  successor_agent_profile_id: string;
+  successor_context_snapshot_id: string;
+  successor_context_spec_hash: string;
+  source_assignment_id: string;
+  source_provider_id: string;
+  cross_provider_required: true;
+  route_policy_id: string | null;
+  separation_policy_id: string | null;
+  caller_candidate_refs_constraint: Array<{ account_id: string; resource_id: string }> | null;
+  required_provider_id: string | null;
+  required_account_id: string | null;
+  required_resource_id: string | null;
+  preferred_provider_id: string | null;
+  preferred_account_id: string | null;
+  preferred_resource_id: string | null;
+  effective_excluded_candidate_ids: string[];
+  effective_excluded_account_ids: string[];
+  effective_excluded_provider_ids: string[];
+}
+
+export function validateAndSortStringList(list: unknown, fieldName: string): string[] {
+  if (list === undefined || list === null) return [];
+  if (!Array.isArray(list)) {
+    throw new Error(`INVALID_ROUTING_REQUEST: ${fieldName} must be an array of strings if provided.`);
+  }
+  const unique = new Set<string>();
+  for (const item of list) {
+    if (typeof item !== 'string' || item.trim() === '' || item !== item.trim()) {
+      throw new Error(
+        `INVALID_ROUTING_REQUEST: ${fieldName} elements must be non-empty canonical strings without surrounding whitespace.`
+      );
+    }
+    unique.add(item);
+  }
+  return Array.from(unique).sort(codeUnitCompare);
+}
+
+export function validateAndCanonicalizeCandidateRefs(
+  candidateRefs?: CandidateAccountResourceRef[] | null
+): Array<{ account_id: string; resource_id: string }> | null {
+  if (!candidateRefs || candidateRefs.length === 0) {
+    return null;
+  }
+  if (!Array.isArray(candidateRefs)) {
+    throw new Error('INVALID_ROUTING_REQUEST: candidateRefs must be an array if provided.');
+  }
+  const seen = new Set<string>();
+  const canonicalList: Array<{ account_id: string; resource_id: string }> = [];
+  for (const pair of candidateRefs) {
+    if (!pair || typeof pair !== 'object') {
+      throw new Error('INVALID_ROUTING_REQUEST: Each candidateRef must be an object with accountId and resourceId.');
+    }
+    const { accountId, resourceId } = pair;
+    if (
+      typeof accountId !== 'string' ||
+      accountId.trim() === '' ||
+      accountId !== accountId.trim() ||
+      typeof resourceId !== 'string' ||
+      resourceId.trim() === '' ||
+      resourceId !== resourceId.trim()
+    ) {
+      throw new Error(
+        'INVALID_ROUTING_REQUEST: CandidateRef accountId and resourceId must be non-empty canonical strings without surrounding whitespace.'
+      );
+    }
+    const key = `${accountId}:${resourceId}`;
+    if (seen.has(key)) {
+      throw new Error(`INVALID_ROUTING_REQUEST: Duplicate candidate reference in request: "${key}".`);
+    }
+    seen.add(key);
+    canonicalList.push({ account_id: accountId, resource_id: resourceId });
+  }
+
+  return canonicalList.sort((a, b) => {
+    const accCmp = codeUnitCompare(a.account_id, b.account_id);
+    if (accCmp !== 0) return accCmp;
+    return codeUnitCompare(a.resource_id, b.resource_id);
+  });
+}
+
+export function validateCanonicalOptionalString(val: unknown, fieldName: string): string | null {
+  if (val === undefined || val === null) return null;
+  if (typeof val !== 'string') {
+    throw new Error(`INVALID_ROUTING_REQUEST: ${fieldName} must be a string if provided.`);
+  }
+  if (val.trim() === '' || val !== val.trim()) {
+    throw new Error(
+      `INVALID_ROUTING_REQUEST: ${fieldName} must be a non-empty canonical string without surrounding whitespace.`
+    );
+  }
+  return val;
+}
+
+export function buildCanonicalHandoffRouteSpecV1(input: {
+  transferId: string;
+  taskId: string;
+  successorAttemptId: string;
+  successorRoleProfileId: string;
+  successorAgentProfileId: string;
+  successorContextSnapshotId: string;
+  successorContextSpecHash: string;
+  sourceAssignmentId: string;
+  sourceProviderId: string;
+  routePolicyId?: string | null;
+  separationPolicyId?: string | null;
+  candidateRefs?: CandidateAccountResourceRef[] | null;
+  requiredProviderId?: string | null;
+  requiredAccountId?: string | null;
+  requiredResourceId?: string | null;
+  preferredProviderId?: string | null;
+  preferredAccountId?: string | null;
+  preferredResourceId?: string | null;
+  excludedCandidateIds?: string[];
+  excludedAccountIds?: string[];
+  excludedProviderIds?: string[];
+}): HandoffRouteSpecV1 {
+  const routePolicyId = validateCanonicalOptionalString(input.routePolicyId, 'routePolicyId');
+  const separationPolicyId = validateCanonicalOptionalString(input.separationPolicyId, 'separationPolicyId');
+  const requiredProviderId = validateCanonicalOptionalString(input.requiredProviderId, 'requiredProviderId');
+  const requiredAccountId = validateCanonicalOptionalString(input.requiredAccountId, 'requiredAccountId');
+  const requiredResourceId = validateCanonicalOptionalString(input.requiredResourceId, 'requiredResourceId');
+  const preferredProviderId = validateCanonicalOptionalString(input.preferredProviderId, 'preferredProviderId');
+  const preferredAccountId = validateCanonicalOptionalString(input.preferredAccountId, 'preferredAccountId');
+  const preferredResourceId = validateCanonicalOptionalString(input.preferredResourceId, 'preferredResourceId');
+
+  const callerCandidateRefs = validateAndCanonicalizeCandidateRefs(input.candidateRefs);
+  const effectiveExcludedCandidates = validateAndSortStringList(input.excludedCandidateIds, 'excludedCandidateIds');
+  const effectiveExcludedAccounts = validateAndSortStringList(input.excludedAccountIds, 'excludedAccountIds');
+
+  const callerExcludedProviders = validateAndSortStringList(input.excludedProviderIds, 'excludedProviderIds');
+  const effectiveExcludedProvidersSet = new Set(callerExcludedProviders);
+  effectiveExcludedProvidersSet.add(input.sourceProviderId);
+  const effectiveExcludedProviders = Array.from(effectiveExcludedProvidersSet).sort(codeUnitCompare);
+
+  return {
+    version: 1,
+    transfer_id: input.transferId,
+    task_id: input.taskId,
+    successor_attempt_id: input.successorAttemptId,
+    successor_role_profile_id: input.successorRoleProfileId,
+    successor_agent_profile_id: input.successorAgentProfileId,
+    successor_context_snapshot_id: input.successorContextSnapshotId,
+    successor_context_spec_hash: input.successorContextSpecHash,
+    source_assignment_id: input.sourceAssignmentId,
+    source_provider_id: input.sourceProviderId,
+    cross_provider_required: true,
+    route_policy_id: routePolicyId,
+    separation_policy_id: separationPolicyId,
+    caller_candidate_refs_constraint: callerCandidateRefs,
+    required_provider_id: requiredProviderId,
+    required_account_id: requiredAccountId,
+    required_resource_id: requiredResourceId,
+    preferred_provider_id: preferredProviderId,
+    preferred_account_id: preferredAccountId,
+    preferred_resource_id: preferredResourceId,
+    effective_excluded_candidate_ids: effectiveExcludedCandidates,
+    effective_excluded_account_ids: effectiveExcludedAccounts,
+    effective_excluded_provider_ids: effectiveExcludedProviders,
+  };
+}
+
+export interface HandoffRouteSuccessorParams {
+  transferId: string;
+  expectedVersion: number;
+  expectedSuccessorEpoch: number;
+  routePolicyId?: string | null;
+  separationPolicyId?: string | null;
+  candidateRefs?: CandidateAccountResourceRef[];
+  requiredProviderId?: string | null;
+  requiredAccountId?: string | null;
+  requiredResourceId?: string | null;
+  preferredProviderId?: string | null;
+  preferredAccountId?: string | null;
+  preferredResourceId?: string | null;
+  excludedCandidateIds?: string[];
+  excludedAccountIds?: string[];
+  excludedProviderIds?: string[];
+}
+
+export interface HandoffRouteSuccessorResult {
+  success: boolean;
+  transfer?: HandoffTransfer;
+  assignment?: AgentAssignment;
+  decision?: RoleAwareRoutingDecision;
+  outcome?: RoleAwareRoutingOutcome;
+  alreadyRouted?: boolean;
+  errorCode?:
+    | 'ROUTING_SERVICE_REQUIRED'
+    | 'TRANSFER_NOT_FOUND'
+    | 'TASK_NOT_FOUND'
+    | 'STALE_OWNERSHIP_EPOCH'
+    | 'STATUS_CONFLICT'
+    | 'VERSION_CONFLICT'
+    | 'SUCCESSOR_ROUTE_CONFLICT'
+    | 'SOURCE_ASSIGNMENT_NOT_FOUND'
+    | 'SOURCE_ASSIGNMENT_STATUS_MISMATCH'
+    | 'SOURCE_PROVIDER_MISMATCH'
+    | 'CROSS_PROVIDER_VIOLATION'
+    | 'SUCCESSOR_NOT_PREPARED'
+    | 'SUCCESSOR_ATTEMPT_NOT_FOUND'
+    | 'SUCCESSOR_ATTEMPT_STATUS_MISMATCH'
+    | 'ROLE_PROFILE_NOT_FOUND'
+    | 'ROLE_PROFILE_DISABLED'
+    | 'AGENT_PROFILE_NOT_FOUND'
+    | 'AGENT_PROFILE_DISABLED'
+    | 'AGENT_PROFILE_ROLE_MISMATCH'
+    | 'CONTEXT_SNAPSHOT_NOT_FOUND'
+    | 'CONTEXT_SNAPSHOT_INTEGRITY_MISMATCH'
+    | 'CONTEXT_MANIFEST_NOT_FOUND'
+    | 'SUCCESSOR_CONTEXT_SPEC_CONFLICT'
+    | 'NO_ELIGIBLE_CANDIDATES'
+    | 'NO_ELIGIBLE_PROVIDER'
+    | 'MANUAL_HANDOFF_REQUIRED'
+    | 'NEEDS_OWNER'
+    | 'PROVIDER_NOT_FOUND'
+    | 'PROVIDER_DISABLED'
+    | 'PROVIDER_ACCOUNT_NOT_FOUND'
+    | 'PROVIDER_ACCOUNT_MISMATCH'
+    | 'PROVIDER_ACCOUNT_DISABLED'
+    | 'PROVIDER_ACCOUNT_UNSAFE_HEALTH'
+    | 'PROVIDER_RESOURCE_NOT_FOUND'
+    | 'PROVIDER_RESOURCE_MISMATCH'
+    | 'PROVIDER_RESOURCE_DISABLED'
+    | 'PROVIDER_RESOURCE_UNSAFE_HEALTH'
+    | 'PROVIDER_RESOURCE_QUOTA_EXHAUSTED'
+    | 'PROVIDER_HEALTH_UNRESOLVED_AUTHORITY'
+    | 'ROUTE_METADATA_CORRUPTION'
+    | 'INTERNAL_ERROR';
+  error?: string;
+}
+
 export class HandoffTransferService {
   private contextBuilder: ContextBuilderService;
+  private roleAwareRoutingService?: RoleAwareRoutingService;
 
-  constructor(private repo: Repository, contextBuilder?: ContextBuilderService) {
-    this.contextBuilder = contextBuilder ?? new ContextBuilderService(this.repo);
+  constructor(
+    private repo: Repository,
+    contextBuilderOrRouter?: ContextBuilderService | RoleAwareRoutingService,
+    roleAwareRouter?: RoleAwareRoutingService
+  ) {
+    if (contextBuilderOrRouter instanceof ContextBuilderService) {
+      this.contextBuilder = contextBuilderOrRouter;
+      this.roleAwareRoutingService = roleAwareRouter;
+    } else if (contextBuilderOrRouter && 'routeRole' in contextBuilderOrRouter) {
+      this.contextBuilder = new ContextBuilderService(this.repo);
+      this.roleAwareRoutingService = contextBuilderOrRouter as RoleAwareRoutingService;
+    } else {
+      this.contextBuilder = new ContextBuilderService(this.repo);
+      this.roleAwareRoutingService = roleAwareRouter;
+    }
   }
 
   public requestHandoff(params: HandoffRequestParams): HandoffRequestResult {
@@ -1151,6 +1409,439 @@ export class HandoffTransferService {
     return {
       success: true,
       transfer: res.transfer,
+    };
+  }
+
+  public async routeHandoffSuccessor(
+    params: HandoffRouteSuccessorParams
+  ): Promise<HandoffRouteSuccessorResult> {
+    if (!this.roleAwareRoutingService) {
+      return {
+        success: false,
+        errorCode: 'ROUTING_SERVICE_REQUIRED',
+        error: 'ROUTING_SERVICE_REQUIRED: RoleAwareRoutingService dependency is required to route handoff successor.',
+      };
+    }
+
+    // 1. Initial read & validation of HandoffTransfer
+    const transfer = this.repo.getHandoffTransfer(params.transferId);
+    if (!transfer) {
+      return {
+        success: false,
+        errorCode: 'TRANSFER_NOT_FOUND',
+        error: `Handoff transfer "${params.transferId}" not found.`,
+      };
+    }
+
+    // 2. Validate source assignment & derive source provider
+    const sourceAsgn = this.repo.getAgentAssignment(transfer.source_assignment_id);
+    if (
+      !sourceAsgn ||
+      sourceAsgn.task_id !== transfer.task_id ||
+      sourceAsgn.attempt_id !== transfer.source_attempt_id
+    ) {
+      return {
+        success: false,
+        transfer,
+        errorCode: 'SOURCE_ASSIGNMENT_NOT_FOUND',
+        error: `SOURCE_ASSIGNMENT_NOT_FOUND: Source assignment "${transfer.source_assignment_id}" not found or does not match task/attempt.`,
+      };
+    }
+
+    if (sourceAsgn.status !== 'HANDED_OFF') {
+      return {
+        success: false,
+        transfer,
+        errorCode: 'SOURCE_ASSIGNMENT_STATUS_MISMATCH',
+        error: `SOURCE_ASSIGNMENT_STATUS_MISMATCH: Source assignment "${sourceAsgn.id}" status is "${sourceAsgn.status}", expected "HANDED_OFF".`,
+      };
+    }
+
+    const sourceProviderId = sourceAsgn.selected_provider_id;
+
+    // 3. Ensure successor attributes are prepared
+    if (
+      !transfer.successor_attempt_id ||
+      !transfer.successor_role_profile_id ||
+      !transfer.successor_agent_profile_id ||
+      !transfer.successor_context_snapshot_id ||
+      !transfer.successor_context_spec_hash
+    ) {
+      return {
+        success: false,
+        transfer,
+        errorCode: 'SUCCESSOR_NOT_PREPARED',
+        error: `SUCCESSOR_NOT_PREPARED: Transfer "${params.transferId}" has incomplete successor preparation fields.`,
+      };
+    }
+
+    // 4. Construct canonical route spec & hash
+    let canonicalSpec: HandoffRouteSpecV1;
+    try {
+      canonicalSpec = buildCanonicalHandoffRouteSpecV1({
+        transferId: transfer.id,
+        taskId: transfer.task_id,
+        successorAttemptId: transfer.successor_attempt_id,
+        successorRoleProfileId: transfer.successor_role_profile_id,
+        successorAgentProfileId: transfer.successor_agent_profile_id,
+        successorContextSnapshotId: transfer.successor_context_snapshot_id,
+        successorContextSpecHash: transfer.successor_context_spec_hash,
+        sourceAssignmentId: transfer.source_assignment_id,
+        sourceProviderId,
+        routePolicyId: params.routePolicyId,
+        separationPolicyId: params.separationPolicyId,
+        candidateRefs: params.candidateRefs,
+        requiredProviderId: params.requiredProviderId,
+        requiredAccountId: params.requiredAccountId,
+        requiredResourceId: params.requiredResourceId,
+        preferredProviderId: params.preferredProviderId,
+        preferredAccountId: params.preferredAccountId,
+        preferredResourceId: params.preferredResourceId,
+        excludedCandidateIds: params.excludedCandidateIds,
+        excludedAccountIds: params.excludedAccountIds,
+        excludedProviderIds: params.excludedProviderIds,
+      });
+    } catch (err: any) {
+      return {
+        success: false,
+        transfer,
+        errorCode: 'NO_ELIGIBLE_CANDIDATES',
+        error: err.message,
+      };
+    }
+
+    const routeSpecHash = computeSha256(canonicalJsonStringify(canonicalSpec));
+
+    // 5. ALREADY-ROUTED Replay Check (DO NOT call routeRole if already ROUTED)
+    if (transfer.status === 'ROUTED') {
+      const replayRes = this.repo.bindHandoffSuccessorRoute({
+        transferId: transfer.id,
+        expectedVersion: params.expectedVersion,
+        expectedSuccessorEpoch: params.expectedSuccessorEpoch,
+        sourceAssignmentId: transfer.source_assignment_id,
+        sourceProviderId,
+        successorAttemptId: transfer.successor_attempt_id,
+        successorRoleProfileId: transfer.successor_role_profile_id,
+        successorAgentProfileId: transfer.successor_agent_profile_id,
+        successorContextSnapshotId: transfer.successor_context_snapshot_id,
+        successorContextSpecHash: transfer.successor_context_spec_hash,
+        selectedProviderId: '',
+        selectedAccountId: '',
+        selectedResourceId: '',
+        routingDecisionId: '',
+        routeSpecHash,
+        canonicalRouteSpec: canonicalSpec as unknown as Record<string, unknown>,
+      });
+
+      if (!replayRes.success) {
+        return {
+          success: false,
+          transfer: replayRes.transfer ?? transfer,
+          errorCode: replayRes.errorCode as any,
+          error: replayRes.error,
+        };
+      }
+
+      return {
+        success: true,
+        transfer: replayRes.transfer!,
+        assignment: replayRes.assignment!,
+        alreadyRouted: true,
+      };
+    }
+
+    // 6. Pre-Phase-A Status and Version CAS check
+    if (transfer.status !== 'SUCCESSOR_PREPARED') {
+      return {
+        success: false,
+        transfer,
+        errorCode: 'STATUS_CONFLICT',
+        error: `STATUS_CONFLICT: Expected transfer status SUCCESSOR_PREPARED, found "${transfer.status}".`,
+      };
+    }
+
+    if (transfer.version !== params.expectedVersion) {
+      return {
+        success: false,
+        transfer,
+        errorCode: 'VERSION_CONFLICT',
+        error: `VERSION_CONFLICT: Expected transfer version ${params.expectedVersion}, found ${transfer.version}.`,
+      };
+    }
+
+    // Successor ownership epoch lineage check (Defect A)
+    if (
+      params.expectedSuccessorEpoch !== transfer.source_ownership_epoch + 1 ||
+      transfer.successor_ownership_epoch !== params.expectedSuccessorEpoch
+    ) {
+      return {
+        success: false,
+        transfer,
+        errorCode: 'STALE_OWNERSHIP_EPOCH',
+        error: `STALE_OWNERSHIP_EPOCH: Expected successor epoch ${params.expectedSuccessorEpoch} must equal source_ownership_epoch + 1 (${transfer.source_ownership_epoch + 1}) and transfer.successor_ownership_epoch (${transfer.successor_ownership_epoch}).`,
+      };
+    }
+
+    const task = this.repo.getTask(transfer.task_id);
+    if (!task) {
+      return {
+        success: false,
+        transfer,
+        errorCode: 'TASK_NOT_FOUND',
+        error: `Task "${transfer.task_id}" not found.`,
+      };
+    }
+
+    if (task.ownership_epoch !== params.expectedSuccessorEpoch) {
+      return {
+        success: false,
+        transfer,
+        errorCode: 'STALE_OWNERSHIP_EPOCH',
+        error: `STALE_OWNERSHIP_EPOCH: Task current epoch is ${task.ownership_epoch}, expected ${params.expectedSuccessorEpoch}.`,
+      };
+    }
+
+    // Successor TaskAttempt check
+    const succAttempt = this.repo.getTaskAttempt(transfer.successor_attempt_id);
+    if (!succAttempt || succAttempt.task_id !== transfer.task_id) {
+      return {
+        success: false,
+        transfer,
+        errorCode: 'SUCCESSOR_ATTEMPT_NOT_FOUND',
+        error: `SUCCESSOR_ATTEMPT_NOT_FOUND: Successor attempt "${transfer.successor_attempt_id}" not found.`,
+      };
+    }
+
+    if (succAttempt.status !== 'PENDING' || succAttempt.agent_id !== null) {
+      return {
+        success: false,
+        transfer,
+        errorCode: 'SUCCESSOR_ATTEMPT_STATUS_MISMATCH',
+        error: `SUCCESSOR_ATTEMPT_STATUS_MISMATCH: Successor attempt status is "${succAttempt.status}", agent_id is "${succAttempt.agent_id}", expected "PENDING" and NULL agent_id.`,
+      };
+    }
+
+    // Role and Agent profile checks
+    const roleProfile = this.repo.getRoleProfile(transfer.successor_role_profile_id);
+    if (!roleProfile) {
+      return {
+        success: false,
+        transfer,
+        errorCode: 'ROLE_PROFILE_NOT_FOUND',
+        error: `ROLE_PROFILE_NOT_FOUND: Successor role profile "${transfer.successor_role_profile_id}" not found.`,
+      };
+    }
+    if (!roleProfile.enabled) {
+      return {
+        success: false,
+        transfer,
+        errorCode: 'ROLE_PROFILE_DISABLED',
+        error: `ROLE_PROFILE_DISABLED: Successor role profile "${transfer.successor_role_profile_id}" is disabled.`,
+      };
+    }
+
+    const agentProfile = this.repo.getAgentProfile(transfer.successor_agent_profile_id);
+    if (!agentProfile) {
+      return {
+        success: false,
+        transfer,
+        errorCode: 'AGENT_PROFILE_NOT_FOUND',
+        error: `AGENT_PROFILE_NOT_FOUND: Successor agent profile "${transfer.successor_agent_profile_id}" not found.`,
+      };
+    }
+    if (!agentProfile.enabled) {
+      return {
+        success: false,
+        transfer,
+        errorCode: 'AGENT_PROFILE_DISABLED',
+        error: `AGENT_PROFILE_DISABLED: Successor agent profile "${transfer.successor_agent_profile_id}" is disabled.`,
+      };
+    }
+    if (agentProfile.role_profile_id !== transfer.successor_role_profile_id) {
+      return {
+        success: false,
+        transfer,
+        errorCode: 'AGENT_PROFILE_ROLE_MISMATCH',
+        error: `AGENT_PROFILE_ROLE_MISMATCH: Agent profile role_profile_id "${agentProfile.role_profile_id}" does not match "${transfer.successor_role_profile_id}".`,
+      };
+    }
+
+    // Successor context exact deterministic authority check (Defect B)
+    const expectedSnapshotId = `ctx-snap-ho-${computeSha256(
+      `r5i-successor-context:${transfer.id}:${transfer.successor_context_spec_hash}`
+    ).substring(0, 32)}`;
+
+    const expectedManifestId = `ctx-man-ho-${computeSha256(
+      `r5i-successor-manifest:${transfer.id}:${transfer.successor_context_spec_hash}`
+    ).substring(0, 32)}`;
+
+    if (transfer.successor_context_snapshot_id !== expectedSnapshotId) {
+      return {
+        success: false,
+        transfer,
+        errorCode: 'CONTEXT_SNAPSHOT_INTEGRITY_MISMATCH',
+        error: `CONTEXT_SNAPSHOT_INTEGRITY_MISMATCH: Transfer successor_context_snapshot_id "${transfer.successor_context_snapshot_id}" does not match deterministic ID "${expectedSnapshotId}".`,
+      };
+    }
+
+    const snapshot = this.repo.getContextSnapshot(expectedSnapshotId);
+    if (!snapshot) {
+      return {
+        success: false,
+        transfer,
+        errorCode: 'CONTEXT_SNAPSHOT_NOT_FOUND',
+        error: `CONTEXT_SNAPSHOT_NOT_FOUND: Bound ContextSnapshot "${expectedSnapshotId}" not found.`,
+      };
+    }
+    if (
+      snapshot.task_id !== transfer.task_id ||
+      snapshot.attempt_id !== transfer.successor_attempt_id ||
+      snapshot.purpose !== 'HANDOFF'
+    ) {
+      return {
+        success: false,
+        transfer,
+        errorCode: 'CONTEXT_SNAPSHOT_INTEGRITY_MISMATCH',
+        error: `CONTEXT_SNAPSHOT_INTEGRITY_MISMATCH: ContextSnapshot "${snapshot.id}" does not match transfer task/attempt/purpose.`,
+      };
+    }
+    const manifest = this.repo.getContextManifestBySnapshotId(snapshot.id);
+    if (!manifest || manifest.id !== expectedManifestId || manifest.snapshot_id !== snapshot.id) {
+      return {
+        success: false,
+        transfer,
+        errorCode: 'CONTEXT_MANIFEST_NOT_FOUND',
+        error: `CONTEXT_MANIFEST_NOT_FOUND: ContextManifest for snapshot "${snapshot.id}" not found or ID mismatch (expected "${expectedManifestId}", found "${manifest?.id}").`,
+      };
+    }
+
+    // 7. Construct Structurally Assignable Candidate Pool (Defect C: do not prefilter enabled/health/quota)
+    const allAccounts = this.repo.getAllProviderAccounts();
+    const allResources = this.repo.getAllProviderResources();
+    const structuralPairs: CandidateAccountResourceRef[] = [];
+    for (const acc of allAccounts) {
+      const matching = allResources.filter(
+        (r) => r.provider_id === acc.provider_id && r.provider_account_id === acc.id
+      );
+      for (const res of matching) {
+        structuralPairs.push({
+          accountId: acc.id,
+          resourceId: res.id,
+        });
+      }
+    }
+
+    let candidateRefsForRouting: CandidateAccountResourceRef[];
+    if (params.candidateRefs && params.candidateRefs.length > 0) {
+      const filtered = params.candidateRefs.filter((pair) =>
+        structuralPairs.some((sp) => sp.accountId === pair.accountId && sp.resourceId === pair.resourceId)
+      );
+      if (filtered.length === 0) {
+        return {
+          success: false,
+          transfer,
+          outcome: 'NO_ELIGIBLE_PROVIDER',
+          errorCode: 'NO_ELIGIBLE_CANDIDATES',
+          error: 'No structurally assignable candidate pairs match the requested candidate constraints.',
+        };
+      }
+      candidateRefsForRouting = filtered;
+    } else {
+      if (structuralPairs.length === 0) {
+        return {
+          success: false,
+          transfer,
+          outcome: 'NO_ELIGIBLE_PROVIDER',
+          errorCode: 'NO_ELIGIBLE_CANDIDATES',
+          error: 'No structurally assignable provider account/resource pairs exist in the database.',
+        };
+      }
+      candidateRefsForRouting = structuralPairs;
+    }
+
+    // 8. Phase A: Role-Aware Routing (persistAssignment: false, allowManualBridge derived from RoutePolicy)
+    const decision = await this.roleAwareRoutingService.routeRole({
+      projectId: task.project_id,
+      taskId: transfer.task_id,
+      attemptId: transfer.successor_attempt_id,
+      roleProfileId: transfer.successor_role_profile_id,
+      agentProfileId: transfer.successor_agent_profile_id,
+      routePolicyId: params.routePolicyId ?? null,
+      separationPolicyId: params.separationPolicyId ?? null,
+      reviewedAssignmentId: params.separationPolicyId ? transfer.source_assignment_id : null,
+      candidateRefs: candidateRefsForRouting,
+      requiredProviderId: params.requiredProviderId ?? null,
+      requiredAccountId: params.requiredAccountId ?? null,
+      requiredResourceId: params.requiredResourceId ?? null,
+      preferredProviderId: params.preferredProviderId ?? null,
+      preferredAccountId: params.preferredAccountId ?? null,
+      preferredResourceId: params.preferredResourceId ?? null,
+      persistAssignment: false,
+      excludedCandidateIds: canonicalSpec.effective_excluded_candidate_ids,
+      excludedAccountIds: canonicalSpec.effective_excluded_account_ids,
+      excludedProviderIds: canonicalSpec.effective_excluded_provider_ids, // includes sourceProviderId
+    });
+
+    if (decision.outcome !== 'SELECTED') {
+      return {
+        success: false,
+        transfer,
+        decision,
+        outcome: decision.outcome,
+        errorCode: decision.outcome as any,
+        error: decision.reason,
+      };
+    }
+
+    if (!decision.selectedProviderId || !decision.selectedAccountId || !decision.selectedResourceId) {
+      return {
+        success: false,
+        transfer,
+        decision,
+        outcome: decision.outcome,
+        errorCode: 'NO_ELIGIBLE_PROVIDER',
+        error: 'Routing decision SELECTED but missing provider/account/resource selections.',
+      };
+    }
+
+    // 9. Phase B: Atomic Linearization in Repository (Defect E: no caller-controlled temporal authority)
+    const bindRes = this.repo.bindHandoffSuccessorRoute({
+      transferId: transfer.id,
+      expectedVersion: params.expectedVersion,
+      expectedSuccessorEpoch: params.expectedSuccessorEpoch,
+      sourceAssignmentId: transfer.source_assignment_id,
+      sourceProviderId,
+      successorAttemptId: transfer.successor_attempt_id,
+      successorRoleProfileId: transfer.successor_role_profile_id,
+      successorAgentProfileId: transfer.successor_agent_profile_id,
+      successorContextSnapshotId: transfer.successor_context_snapshot_id,
+      successorContextSpecHash: transfer.successor_context_spec_hash,
+      selectedProviderId: decision.selectedProviderId,
+      selectedAccountId: decision.selectedAccountId,
+      selectedResourceId: decision.selectedResourceId,
+      routingDecisionId: decision.decisionId,
+      routeSpecHash,
+      canonicalRouteSpec: canonicalSpec as unknown as Record<string, unknown>,
+    });
+
+    if (!bindRes.success) {
+      return {
+        success: false,
+        transfer: bindRes.transfer ?? transfer,
+        decision,
+        outcome: decision.outcome,
+        errorCode: bindRes.errorCode as any,
+        error: bindRes.error,
+      };
+    }
+
+    return {
+      success: true,
+      transfer: bindRes.transfer!,
+      assignment: bindRes.assignment!,
+      decision,
+      outcome: decision.outcome,
+      alreadyRouted: bindRes.alreadyRouted ?? false,
     };
   }
 }
