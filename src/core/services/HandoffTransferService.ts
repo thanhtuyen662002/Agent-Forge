@@ -5,7 +5,13 @@ import {
   HandoffTransferStatus,
   AdapterOutcome,
   ProviderTerminationStatus,
+  TaskAttempt,
+  ContextSnapshot,
+  ContextManifest,
+  ContextItem,
+  ContextItemType,
 } from '../types/domain';
+import { ContextBuilderService } from './ContextBuilderService';
 
 export type PredecessorQuiescenceState =
   | 'NOT_STARTED'
@@ -137,6 +143,59 @@ export interface HandoffRelinquishResult {
   unresolvedAuthorizations?: string[];
 }
 
+export interface HandoffPrepareSuccessorParams {
+  transferId: string;
+  expectedVersion: number;
+  expectedSuccessorEpoch: number;
+  successorRoleProfileId: string;
+  successorAgentProfileId: string;
+  successorAttemptId?: string;
+  status?: string;
+  preparedAt?: string;
+  // Context snapshot options
+  buildContext?: boolean;
+  handoffContextId?: string | null;
+  checkpointId?: string | null;
+  contextFiles?: string[];
+  customItems?: Array<{
+    itemType?: ContextItemType;
+    sourceType: string;
+    sourceRef?: string | null;
+    content: Record<string, unknown> | unknown[];
+    tokenEstimate?: number | null;
+  }>;
+}
+
+export interface HandoffPrepareSuccessorResult {
+  success: boolean;
+  transfer?: HandoffTransfer;
+  successorAttempt?: TaskAttempt;
+  contextSnapshot?: ContextSnapshot;
+  contextManifest?: ContextManifest;
+  contextItems?: ContextItem[];
+  alreadyPrepared?: boolean;
+  error?: string;
+  errorCode?:
+    | 'TRANSFER_NOT_FOUND'
+    | 'STATUS_CONFLICT'
+    | 'VERSION_CONFLICT'
+    | 'STALE_OWNERSHIP_EPOCH'
+    | 'TASK_NOT_FOUND'
+    | 'ROLE_PROFILE_NOT_FOUND'
+    | 'ROLE_PROFILE_DISABLED'
+    | 'AGENT_PROFILE_NOT_FOUND'
+    | 'AGENT_PROFILE_DISABLED'
+    | 'AGENT_PROFILE_ROLE_MISMATCH'
+    | 'ATTEMPT_ID_ALREADY_EXISTS'
+    | 'CONFLICTING_SUCCESSOR_PROFILE'
+    | 'CONFLICTING_SUCCESSOR_ROLE'
+    | 'HANDOFF_CONTEXT_NOT_FOUND'
+    | 'CROSS_TASK_HANDOFF_CONTEXT_FORBIDDEN'
+    | 'HANDOFF_CONTEXT_SOURCE_MISMATCH'
+    | 'CONTEXT_BUILD_FAILED'
+    | 'INTERNAL_ERROR';
+}
+
 export interface HandoffCancelParams {
   transferId: string;
   expectedVersion: number;
@@ -157,7 +216,11 @@ export interface HandoffCancelResult {
 }
 
 export class HandoffTransferService {
-  constructor(private repo: Repository) {}
+  private contextBuilder: ContextBuilderService;
+
+  constructor(private repo: Repository, contextBuilder?: ContextBuilderService) {
+    this.contextBuilder = contextBuilder ?? new ContextBuilderService(this.repo);
+  }
 
   public requestHandoff(params: HandoffRequestParams): HandoffRequestResult {
     // 1. Task validation
@@ -566,6 +629,123 @@ export class HandoffTransferService {
 
   public relinquishPredecessorOwnership(params: HandoffRelinquishParams): HandoffRelinquishResult {
     return this.repo.relinquishPredecessorOwnership(params);
+  }
+
+  public prepareHandoffSuccessor(params: HandoffPrepareSuccessorParams): HandoffPrepareSuccessorResult {
+    // 1. Invoke atomic repository primitive
+    const prepRes = this.repo.prepareHandoffSuccessor({
+      transferId: params.transferId,
+      expectedVersion: params.expectedVersion,
+      expectedSuccessorEpoch: params.expectedSuccessorEpoch,
+      successorRoleProfileId: params.successorRoleProfileId,
+      successorAgentProfileId: params.successorAgentProfileId,
+      successorAttemptId: params.successorAttemptId,
+      status: params.status,
+      preparedAt: params.preparedAt,
+    });
+
+    if (!prepRes.success) {
+      return {
+        success: false,
+        errorCode: prepRes.errorCode,
+        error: prepRes.error,
+      };
+    }
+
+    const transfer = prepRes.transfer!;
+    const successorAttempt = prepRes.successorAttempt!;
+
+    // If context construction is not requested, return prepared result
+    if (params.buildContext === false) {
+      return {
+        success: true,
+        transfer,
+        successorAttempt,
+        alreadyPrepared: prepRes.alreadyPrepared,
+      };
+    }
+
+    // 2. Successor Context Rebinding
+    const effectiveHandoffContextId =
+      params.handoffContextId !== undefined ? params.handoffContextId : transfer.handoff_context_id;
+
+    if (effectiveHandoffContextId) {
+      const ho = this.repo.getHandoffContext(effectiveHandoffContextId);
+      if (!ho) {
+        return {
+          success: false,
+          transfer,
+          successorAttempt,
+          alreadyPrepared: prepRes.alreadyPrepared,
+          errorCode: 'HANDOFF_CONTEXT_NOT_FOUND',
+          error: `HandoffContext "${effectiveHandoffContextId}" not found.`,
+        };
+      }
+      if (ho.task_id !== transfer.task_id) {
+        return {
+          success: false,
+          transfer,
+          successorAttempt,
+          alreadyPrepared: prepRes.alreadyPrepared,
+          errorCode: 'CROSS_TASK_HANDOFF_CONTEXT_FORBIDDEN',
+          error: `CROSS_TASK_HANDOFF_CONTEXT_FORBIDDEN: HandoffContext "${effectiveHandoffContextId}" belongs to task "${ho.task_id}", expected "${transfer.task_id}".`,
+        };
+      }
+      if (ho.attempt_id && ho.attempt_id !== transfer.source_attempt_id) {
+        return {
+          success: false,
+          transfer,
+          successorAttempt,
+          alreadyPrepared: prepRes.alreadyPrepared,
+          errorCode: 'HANDOFF_CONTEXT_SOURCE_MISMATCH',
+          error: `HANDOFF_CONTEXT_SOURCE_MISMATCH: HandoffContext "${effectiveHandoffContextId}" source attempt "${ho.attempt_id}" does not match transfer source attempt "${transfer.source_attempt_id}".`,
+        };
+      }
+    }
+
+    const task = this.repo.getTask(transfer.task_id);
+    if (!task) {
+      return {
+        success: false,
+        transfer,
+        successorAttempt,
+        alreadyPrepared: prepRes.alreadyPrepared,
+        errorCode: 'TASK_NOT_FOUND',
+        error: `Task "${transfer.task_id}" not found.`,
+      };
+    }
+
+    try {
+      const ctxResult = this.contextBuilder.buildContextSnapshot({
+        projectId: task.project_id,
+        taskId: transfer.task_id,
+        attemptId: successorAttempt.id,
+        purpose: 'HANDOFF',
+        handoffId: effectiveHandoffContextId,
+        checkpointId: params.checkpointId !== undefined ? params.checkpointId : (transfer.checkpoint_id ?? null),
+        contextFiles: params.contextFiles,
+        customItems: params.customItems,
+      });
+
+      return {
+        success: true,
+        transfer,
+        successorAttempt,
+        contextSnapshot: ctxResult.snapshot,
+        contextManifest: ctxResult.manifest,
+        contextItems: ctxResult.items,
+        alreadyPrepared: prepRes.alreadyPrepared,
+      };
+    } catch (err) {
+      return {
+        success: false,
+        transfer,
+        successorAttempt,
+        alreadyPrepared: prepRes.alreadyPrepared,
+        errorCode: 'CONTEXT_BUILD_FAILED',
+        error: `[ContextBuildFailed] ${err instanceof Error ? err.message : String(err)}`,
+      };
+    }
   }
 
   public cancelHandoff(params: HandoffCancelParams): HandoffCancelResult {
