@@ -310,7 +310,7 @@ describe('R5I3 Corrective Durable Successor Context Authority and Attempt State 
   // Section 26: Migration 18 & Schema Authority Tests (1..10)
   // =========================================================================
   describe('Migration 18 & Schema Authority', () => {
-    it('1-8. fresh DB and upgrade DB migrations 1..18 apply cleanly, new columns exist, legacy rows receive nulls, FKs enforced, and count == 18', () => {
+    it('1-8. fresh DB and upgrade DB migrations apply cleanly, new columns exist, legacy rows receive nulls, FKs enforced, and Migration 18 is present', () => {
       // 1. Fresh DB test
       const freshDb = new Database(':memory:');
       freshDb.pragma('foreign_keys = ON');
@@ -320,9 +320,13 @@ describe('R5I3 Corrective Durable Successor Context Authority and Attempt State 
       expect(columns).toContain('successor_context_snapshot_id');
       expect(columns).toContain('successor_context_spec_hash');
 
-      // 8. Migration ledger count == 18
+      // 8. Migration ledger count == MIGRATIONS.length and Migration 18 is present
       const applied = freshDb.prepare('SELECT COUNT(*) as count FROM schema_migrations').get() as { count: number };
-      expect(applied.count).toBe(18);
+      expect(applied.count).toBe(MIGRATIONS.length);
+
+      const m18 = MIGRATIONS.find((m) => m.version === 18);
+      expect(m18).toBeDefined();
+      expect(m18?.name).toBe('018_r5i_successor_context_authority');
 
       // 7. foreign_key_check is zero
       const fkViolations = freshDb.prepare('PRAGMA foreign_key_check').all();
@@ -405,12 +409,17 @@ describe('R5I3 Corrective Durable Successor Context Authority and Attempt State 
       upgradeDb.close();
     });
 
-    it('9-10. Migration 16 and Migration 17 remain unchanged', () => {
+    it('9-10. Migration 16, Migration 17, and Migration 18 identities remain unchanged in migration ledger', () => {
       const m16 = MIGRATIONS.find((m) => m.version === 16);
       const m17 = MIGRATIONS.find((m) => m.version === 17);
+      const m18 = MIGRATIONS.find((m) => m.version === 18);
+      const m19 = MIGRATIONS.find((m) => m.version === 19);
+
       expect(m16?.name).toBe('016_r5i_durable_handoff_ownership_and_execution_authority');
       expect(m17?.name).toBe('017_r5i_handoff_authority_corrective_hardening');
-      expect(MIGRATIONS.length).toBe(18);
+      expect(m18?.name).toBe('018_r5i_successor_context_authority');
+      expect(m19?.name).toBe('019_r5i_execution_authorization_assignment_and_unique_successor_auth');
+      expect(MIGRATIONS.length).toBeGreaterThanOrEqual(18);
     });
   });
 
