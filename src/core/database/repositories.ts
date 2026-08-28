@@ -175,37 +175,75 @@ export class Repository {
   // Tasks
   // ==========================================
   public createTask(task: Task): void {
-    this.db
-      .prepare(`
-        INSERT INTO tasks (
-          id, project_id, milestone_id, title, description, state, paused_from_state,
-          priority, risk, assigned_agent_id, revision_count, max_revisions,
-          base_sha, current_sha, progress_cache_percent, progress_computed_at,
-          acceptance_criteria_json, constraints_json, created_at, updated_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-      `)
-      .run(
-        task.id,
-        task.project_id,
-        task.milestone_id,
-        task.title,
-        task.description,
-        task.state,
-        task.paused_from_state,
-        task.priority,
-        task.risk,
-        task.assigned_agent_id,
-        task.revision_count,
-        task.max_revisions,
-        task.base_sha,
-        task.current_sha,
-        task.progress_cache_percent,
-        task.progress_computed_at,
-        JSON.stringify(task.acceptance_criteria),
-        JSON.stringify(task.constraints),
-        task.created_at,
-        task.updated_at
-      );
+    const tableInfo = this.db.pragma('table_info(tasks)') as { name: string }[];
+    const columnNames = new Set(tableInfo.map((c) => c.name));
+
+    if (columnNames.has('ownership_epoch')) {
+      this.db
+        .prepare(`
+          INSERT INTO tasks (
+            id, project_id, milestone_id, title, description, state, paused_from_state,
+            priority, risk, assigned_agent_id, revision_count, max_revisions,
+            base_sha, current_sha, progress_cache_percent, progress_computed_at,
+            acceptance_criteria_json, constraints_json, ownership_epoch, created_at, updated_at
+          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        `)
+        .run(
+          task.id,
+          task.project_id,
+          task.milestone_id,
+          task.title,
+          task.description,
+          task.state,
+          task.paused_from_state,
+          task.priority,
+          task.risk,
+          task.assigned_agent_id,
+          task.revision_count,
+          task.max_revisions,
+          task.base_sha,
+          task.current_sha,
+          task.progress_cache_percent,
+          task.progress_computed_at,
+          JSON.stringify(task.acceptance_criteria),
+          JSON.stringify(task.constraints),
+          task.ownership_epoch ?? 1,
+          task.created_at,
+          task.updated_at
+        );
+    } else {
+      this.db
+        .prepare(`
+          INSERT INTO tasks (
+            id, project_id, milestone_id, title, description, state, paused_from_state,
+            priority, risk, assigned_agent_id, revision_count, max_revisions,
+            base_sha, current_sha, progress_cache_percent, progress_computed_at,
+            acceptance_criteria_json, constraints_json, created_at, updated_at
+          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        `)
+        .run(
+          task.id,
+          task.project_id,
+          task.milestone_id,
+          task.title,
+          task.description,
+          task.state,
+          task.paused_from_state,
+          task.priority,
+          task.risk,
+          task.assigned_agent_id,
+          task.revision_count,
+          task.max_revisions,
+          task.base_sha,
+          task.current_sha,
+          task.progress_cache_percent,
+          task.progress_computed_at,
+          JSON.stringify(task.acceptance_criteria),
+          JSON.stringify(task.constraints),
+          task.created_at,
+          task.updated_at
+        );
+    }
   }
 
   public getTask(id: string): Task | null {
@@ -1687,6 +1725,13 @@ export class Repository {
     return rows.map((row) => this.mapExecutionAuthorization(row));
   }
 
+  public getExecutionAuthorizationsByAttempt(attemptId: string): ExecutionAuthorization[] {
+    const rows = this.db
+      .prepare('SELECT * FROM execution_authorizations WHERE attempt_id = ? ORDER BY created_at DESC')
+      .all(attemptId) as Record<string, unknown>[];
+    return rows.map((row) => this.mapExecutionAuthorization(row));
+  }
+
   private mapExecutionAuthorization(row: Record<string, unknown>): ExecutionAuthorization {
     return {
       id: String(row.id),
@@ -1767,6 +1812,25 @@ export class Repository {
       recommended_next_action: r.recommended_next_action ? String(r.recommended_next_action) : null,
       created_at: String(r.created_at),
     }));
+  }
+
+  public getCheckpoint(id: string): Checkpoint | null {
+    const row = this.db.prepare('SELECT * FROM checkpoints WHERE id = ?').get(id) as Record<string, unknown> | undefined;
+    if (!row) return null;
+    return {
+      id: String(row.id),
+      task_id: String(row.task_id),
+      attempt_id: row.attempt_id ? String(row.attempt_id) : null,
+      sha: String(row.sha),
+      tree_metadata: row.tree_metadata_json ? JSON.parse(String(row.tree_metadata_json)) : {},
+      completed_steps: row.completed_steps_json ? JSON.parse(String(row.completed_steps_json)) : [],
+      remaining_steps: row.remaining_steps_json ? JSON.parse(String(row.remaining_steps_json)) : [],
+      tests_passing: Number(row.tests_passing),
+      tests_failing: Number(row.tests_failing),
+      known_issues: row.known_issues_json ? JSON.parse(String(row.known_issues_json)) : [],
+      recommended_next_action: row.recommended_next_action ? String(row.recommended_next_action) : null,
+      created_at: String(row.created_at),
+    };
   }
 
   public createHandoff(h: Handoff): void {
@@ -1915,11 +1979,14 @@ export class Repository {
       const nowIso = new Date().toISOString();
       const fields = params.additionalFields ?? {};
 
+      const sourceAssignmentId = fields.source_assignment_id !== undefined ? fields.source_assignment_id : existing.source_assignment_id;
       const successorAttemptId = fields.successor_attempt_id !== undefined ? fields.successor_attempt_id : existing.successor_attempt_id;
       const successorAssignmentId = fields.successor_assignment_id !== undefined ? fields.successor_assignment_id : existing.successor_assignment_id;
       const successorRoleProfileId = fields.successor_role_profile_id !== undefined ? fields.successor_role_profile_id : existing.successor_role_profile_id;
       const successorAgentProfileId = fields.successor_agent_profile_id !== undefined ? fields.successor_agent_profile_id : existing.successor_agent_profile_id;
       const handoffContextId = fields.handoff_context_id !== undefined ? fields.handoff_context_id : existing.handoff_context_id;
+      const checkpointId = fields.checkpoint_id !== undefined ? fields.checkpoint_id : existing.checkpoint_id;
+      const sourceAuthorizationId = fields.source_authorization_id !== undefined ? fields.source_authorization_id : existing.source_authorization_id;
       const successorAuthorizationId = fields.successor_authorization_id !== undefined ? fields.successor_authorization_id : existing.successor_authorization_id;
       const successorOwnershipEpoch = fields.successor_ownership_epoch !== undefined ? fields.successor_ownership_epoch : existing.successor_ownership_epoch;
       const frozenAt = fields.frozen_at !== undefined ? fields.frozen_at : existing.frozen_at;
@@ -1932,11 +1999,14 @@ export class Repository {
         .prepare(`
           UPDATE handoff_transfers
           SET status = ?,
+              source_assignment_id = ?,
               successor_attempt_id = ?,
               successor_assignment_id = ?,
               successor_role_profile_id = ?,
               successor_agent_profile_id = ?,
               handoff_context_id = ?,
+              checkpoint_id = ?,
+              source_authorization_id = ?,
               successor_authorization_id = ?,
               successor_ownership_epoch = ?,
               version = ?,
@@ -1950,11 +2020,14 @@ export class Repository {
         `)
         .run(
           params.toStatus,
+          sourceAssignmentId,
           successorAttemptId,
           successorAssignmentId,
           successorRoleProfileId,
           successorAgentProfileId,
           handoffContextId,
+          checkpointId,
+          sourceAuthorizationId,
           successorAuthorizationId,
           successorOwnershipEpoch,
           newVersion,
@@ -1973,6 +2046,188 @@ export class Repository {
       }
 
       return { success: true, transfer: this.getHandoffTransfer(params.id)! };
+    });
+  }
+
+  public relinquishPredecessorOwnership(params: {
+    transferId: string;
+    expectedVersion: number;
+    expectedSourceEpoch: number;
+    relinquishedAt?: string;
+  }): {
+    success: boolean;
+    transfer?: HandoffTransfer;
+    newEpoch?: number;
+    alreadyRelinquished?: boolean;
+    error?: string;
+    errorCode?:
+      | 'TRANSFER_NOT_FOUND'
+      | 'STATUS_CONFLICT'
+      | 'VERSION_CONFLICT'
+      | 'STALE_OWNERSHIP_EPOCH'
+      | 'TASK_NOT_FOUND'
+      | 'PREDECESSOR_EXECUTION_UNRESOLVED'
+      | 'INTERNAL_ERROR';
+    unresolvedAuthorizations?: string[];
+  } {
+    return this.runInImmediateTransaction(() => {
+      // 1. Re-read handoff transfer
+      const transfer = this.getHandoffTransfer(params.transferId);
+      if (!transfer) {
+        return {
+          success: false,
+          errorCode: 'TRANSFER_NOT_FOUND',
+          error: `Handoff transfer "${params.transferId}" not found.`,
+        };
+      }
+
+      // Idempotent replay check: if already RELINQUISHED with same expected source epoch
+      if (transfer.status === 'RELINQUISHED' && transfer.relinquished_at !== null) {
+        if (transfer.source_ownership_epoch === params.expectedSourceEpoch) {
+          const currentEpoch = this.getTaskOwnershipEpoch(transfer.task_id);
+          return {
+            success: true,
+            transfer,
+            newEpoch: currentEpoch,
+            alreadyRelinquished: true,
+          };
+        }
+        return {
+          success: false,
+          errorCode: 'STALE_OWNERSHIP_EPOCH',
+          error: `Transfer is already relinquished with historical source epoch ${transfer.source_ownership_epoch}, expected ${params.expectedSourceEpoch}.`,
+        };
+      }
+
+      // State check: must be QUIESCING
+      if (transfer.status !== 'QUIESCING') {
+        return {
+          success: false,
+          errorCode: 'STATUS_CONFLICT',
+          error: `STATUS_CONFLICT: Expected transfer status QUIESCING, found ${transfer.status}.`,
+        };
+      }
+
+      // Version CAS check
+      if (transfer.version !== params.expectedVersion) {
+        return {
+          success: false,
+          errorCode: 'VERSION_CONFLICT',
+          error: `VERSION_CONFLICT: Expected transfer version ${params.expectedVersion}, found ${transfer.version}.`,
+        };
+      }
+
+      // 2. Re-read Task
+      const task = this.getTask(transfer.task_id);
+      if (!task) {
+        return {
+          success: false,
+          errorCode: 'TASK_NOT_FOUND',
+          error: `Task "${transfer.task_id}" not found.`,
+        };
+      }
+
+      const currentTaskEpoch = task.ownership_epoch ?? 1;
+      if (
+        currentTaskEpoch !== params.expectedSourceEpoch ||
+        transfer.source_ownership_epoch !== params.expectedSourceEpoch
+      ) {
+        return {
+          success: false,
+          errorCode: 'STALE_OWNERSHIP_EPOCH',
+          error: `STALE_OWNERSHIP_EPOCH: Expected epoch ${params.expectedSourceEpoch}, task current epoch is ${currentTaskEpoch}, transfer source epoch is ${transfer.source_ownership_epoch}.`,
+        };
+      }
+
+      // 3. Recheck quiescence condition INSIDE this immediate transaction
+      const authRows = this.db
+        .prepare('SELECT * FROM execution_authorizations WHERE attempt_id = ?')
+        .all(transfer.source_attempt_id) as Record<string, unknown>[];
+
+      const unresolvedAuthIds: string[] = [];
+      for (const aRow of authRows) {
+        const auth = this.mapExecutionAuthorization(aRow);
+        if (auth.adapter_started_at) {
+          // Started execution must have CONFIRMED_TERMINATED and non-null termination_confirmed_at
+          const isTerminated =
+            auth.termination_status === 'CONFIRMED_TERMINATED' &&
+            auth.termination_confirmed_at !== null &&
+            auth.termination_confirmed_at !== undefined;
+
+          if (!isTerminated) {
+            unresolvedAuthIds.push(auth.id);
+          }
+        }
+      }
+
+      if (unresolvedAuthIds.length > 0) {
+        return {
+          success: false,
+          errorCode: 'PREDECESSOR_EXECUTION_UNRESOLVED',
+          unresolvedAuthorizations: unresolvedAuthIds,
+          error: `PREDECESSOR_EXECUTION_UNRESOLVED: Source attempt "${transfer.source_attempt_id}" has ${unresolvedAuthIds.length} unresolved active execution(s): [${unresolvedAuthIds.join(', ')}].`,
+        };
+      }
+
+      // 4. Atomic Linearization
+      const nowIso = params.relinquishedAt ?? new Date().toISOString();
+      const newEpoch = currentTaskEpoch + 1;
+
+      // 4a. Bump task ownership epoch
+      const epochRes = this.db
+        .prepare('UPDATE tasks SET ownership_epoch = ?, updated_at = ? WHERE id = ? AND ownership_epoch = ?')
+        .run(newEpoch, nowIso, transfer.task_id, currentTaskEpoch);
+
+      if (epochRes.changes === 0) {
+        return {
+          success: false,
+          errorCode: 'STALE_OWNERSHIP_EPOCH',
+          error: 'CONCURRENT_EPOCH_MUTATION',
+        };
+      }
+
+      // 4b. Source assignment transition to HANDED_OFF (if bound)
+      if (transfer.source_assignment_id) {
+        this.db
+          .prepare(`
+            UPDATE agent_assignments
+            SET status = 'HANDED_OFF', ended_at = ?
+            WHERE id = ? AND status IN ('ASSIGNED', 'RUNNING')
+          `)
+          .run(nowIso, transfer.source_assignment_id);
+      }
+
+      // 4c. Release active task lease if one exists
+      this.db
+        .prepare('UPDATE task_leases SET released_at = ? WHERE task_id = ? AND released_at IS NULL')
+        .run(nowIso, transfer.task_id);
+
+      // 4d. Update transfer to RELINQUISHED
+      const newVersion = transfer.version + 1;
+      const transferRes = this.db
+        .prepare(`
+          UPDATE handoff_transfers
+          SET status = 'RELINQUISHED',
+              relinquished_at = ?,
+              version = ?,
+              updated_at = ?
+          WHERE id = ? AND version = ?
+        `)
+        .run(nowIso, newVersion, nowIso, transfer.id, transfer.version);
+
+      if (transferRes.changes === 0) {
+        throw new Error(
+          `[HandoffRelinquish] Failed to update transfer "${transfer.id}" status to RELINQUISHED.`
+        );
+      }
+
+      const updatedTransfer = this.getHandoffTransfer(transfer.id)!;
+      return {
+        success: true,
+        transfer: updatedTransfer,
+        newEpoch,
+        alreadyRelinquished: false,
+      };
     });
   }
 
