@@ -1709,38 +1709,8 @@ describe('R5I3 Corrective Durable Successor Context Authority and Attempt State 
       expect(transfer.successor_context_spec_hash).toBeNull();
     });
 
-    it('Proofs 13..15 & Section 8. collision classifier strictly discriminates recoverable vs non-recoverable SQLite constraints', () => {
-      // 1. Arbitrary Error
-      expect(isRecoverableDeterministicSnapshotCollision(new Error('Arbitrary failure'))).toBe(false);
-
-      // 2. CHECK constraint error
-      expect(
-        isRecoverableDeterministicSnapshotCollision({
-          code: 'SQLITE_CONSTRAINT_CHECK',
-          message: 'CHECK constraint failed: task_attempts_status_check',
-        })
-      ).toBe(false);
-
-      // 3. FOREIGN KEY constraint error
-      expect(
-        isRecoverableDeterministicSnapshotCollision({
-          code: 'SQLITE_CONSTRAINT_FOREIGNKEY',
-          message: 'FOREIGN KEY constraint failed',
-        })
-      ).toBe(false);
-
-      // 4. UNIQUE constraint on wrong table
-      expect(
-        isRecoverableDeterministicSnapshotCollision(
-          {
-            code: 'SQLITE_CONSTRAINT_UNIQUE',
-            message: 'UNIQUE constraint failed: other_table.id',
-          },
-          'ctx-snap-expected'
-        )
-      ).toBe(false);
-
-      // 5. Valid SQLite PRIMARY KEY constraint error on context_snapshots.id
+    it('Proofs 13..15 & Section 5. collision classifier strictly discriminates recoverable vs non-recoverable SQLite constraints', () => {
+      // 1. SQLITE_CONSTRAINT_PRIMARYKEY + UNIQUE constraint failed: context_snapshots.id => true
       expect(
         isRecoverableDeterministicSnapshotCollision({
           code: 'SQLITE_CONSTRAINT_PRIMARYKEY',
@@ -1748,16 +1718,83 @@ describe('R5I3 Corrective Durable Successor Context Authority and Attempt State 
         })
       ).toBe(true);
 
-      // 6. Valid SQLite UNIQUE constraint error identifying snapshot ID
+      // 2. SQLITE_CONSTRAINT_UNIQUE + UNIQUE constraint failed: context_snapshots.id => true
+      expect(
+        isRecoverableDeterministicSnapshotCollision({
+          code: 'SQLITE_CONSTRAINT_UNIQUE',
+          message: 'UNIQUE constraint failed: context_snapshots.id',
+        })
+      ).toBe(true);
+
+      // 3. SQLITE_CONSTRAINT + UNIQUE constraint failed: context_snapshots.id => true
+      expect(
+        isRecoverableDeterministicSnapshotCollision({
+          code: 'SQLITE_CONSTRAINT',
+          message: 'UNIQUE constraint failed: context_snapshots.id',
+        })
+      ).toBe(true);
+
+      // 4. SQLITE_CONSTRAINT_UNIQUE + UNIQUE constraint failed: context_snapshots.content_hash => false
+      expect(
+        isRecoverableDeterministicSnapshotCollision({
+          code: 'SQLITE_CONSTRAINT_UNIQUE',
+          message: 'UNIQUE constraint failed: context_snapshots.content_hash',
+        })
+      ).toBe(false);
+
+      // 5. SQLITE_CONSTRAINT_PRIMARYKEY + PRIMARY KEY constraint failed: context_snapshots.other_column => false
+      expect(
+        isRecoverableDeterministicSnapshotCollision({
+          code: 'SQLITE_CONSTRAINT_PRIMARYKEY',
+          message: 'PRIMARY KEY constraint failed: context_snapshots.other_column',
+        })
+      ).toBe(false);
+
+      // 6. SQLITE_CONSTRAINT_UNIQUE + message only mentioning context_snapshots => false
+      expect(
+        isRecoverableDeterministicSnapshotCollision({
+          code: 'SQLITE_CONSTRAINT_UNIQUE',
+          message: 'UNIQUE constraint failed: context_snapshots',
+        })
+      ).toBe(false);
+
+      // 7. correct expectedSnapshotId string present in an unrelated UNIQUE error but no context_snapshots.id => false
       expect(
         isRecoverableDeterministicSnapshotCollision(
           {
             code: 'SQLITE_CONSTRAINT_UNIQUE',
-            message: 'UNIQUE constraint failed: context_snapshots.id',
+            message: 'UNIQUE constraint failed: other_table.snapshot_id (ctx-snap-ho-123)',
           },
           'ctx-snap-ho-123'
         )
-      ).toBe(true);
+      ).toBe(false);
+
+      // 8. wrong table => false
+      expect(
+        isRecoverableDeterministicSnapshotCollision({
+          code: 'SQLITE_CONSTRAINT_UNIQUE',
+          message: 'UNIQUE constraint failed: other_table.id',
+        })
+      ).toBe(false);
+
+      // 9. CHECK => false
+      expect(
+        isRecoverableDeterministicSnapshotCollision({
+          code: 'SQLITE_CONSTRAINT_CHECK',
+          message: 'CHECK constraint failed: task_attempts_status_check',
+        })
+      ).toBe(false);
+
+      // 10. FOREIGN KEY => false
+      expect(
+        isRecoverableDeterministicSnapshotCollision({
+          code: 'SQLITE_CONSTRAINT_FOREIGNKEY',
+          message: 'FOREIGN KEY constraint failed: context_snapshots.task_id',
+        })
+      ).toBe(false);
+
+      // 11. generic Error => false
+      expect(isRecoverableDeterministicSnapshotCollision(new Error('Arbitrary runtime failure'))).toBe(false);
     });
 
     it('38. conflicting context specs cannot both bind', () => {

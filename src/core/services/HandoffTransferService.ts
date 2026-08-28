@@ -20,7 +20,7 @@ import {
 
 export function isRecoverableDeterministicSnapshotCollision(
   err: unknown,
-  expectedSnapshotId?: string
+  _expectedSnapshotId?: string
 ): boolean {
   if (!err || typeof err !== 'object') {
     return false;
@@ -34,19 +34,18 @@ export function isRecoverableDeterministicSnapshotCollision(
   const isUniqueOrPrimaryKey =
     code === 'SQLITE_CONSTRAINT_PRIMARYKEY' ||
     code === 'SQLITE_CONSTRAINT_UNIQUE' ||
-    (code === 'SQLITE_CONSTRAINT' && (message.includes('UNIQUE constraint failed') || message.includes('PRIMARY KEY constraint failed')));
+    (code === 'SQLITE_CONSTRAINT' &&
+      (message.includes('UNIQUE constraint failed') ||
+       message.includes('PRIMARY KEY constraint failed')));
 
   if (!isUniqueOrPrimaryKey) {
     return false;
   }
 
-  // Must specifically identify the context_snapshots.id collision
-  const targetsSnapshot =
-    message.includes('context_snapshots.id') ||
-    message.includes('context_snapshots') ||
-    (expectedSnapshotId ? message.includes(expectedSnapshotId) : false);
+  // Must specifically and strictly identify the context_snapshots.id collision
+  const targetsSnapshotId = message.includes('context_snapshots.id');
 
-  return Boolean(targetsSnapshot);
+  return targetsSnapshotId;
 }
 
 export function sortSuccessorCustomItems<T extends {
