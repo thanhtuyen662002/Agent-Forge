@@ -1,5 +1,8 @@
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import Database from 'better-sqlite3';
+import * as fs from 'fs';
+import * as path from 'path';
+import * as os from 'os';
 import { MigrationRunner, MIGRATIONS } from '../src/core/database/migrations';
 import { Repository } from '../src/core/database/repositories';
 import {
@@ -41,6 +44,7 @@ describe('R5I3 Corrective Durable Successor Context Authority and Attempt State 
   });
 
   function seedBaseEntities(params?: {
+    customRepo?: Repository;
     taskId?: string;
     attemptId?: string;
     assignmentId?: string;
@@ -50,6 +54,7 @@ describe('R5I3 Corrective Durable Successor Context Authority and Attempt State 
     successorRoleProfileId?: string;
     successorAgentProfileId?: string;
   }) {
+    const targetRepo = params?.customRepo ?? repo;
     const taskId = params?.taskId ?? 'task-1';
     const attemptId = params?.attemptId ?? 'att-1';
     const assignmentId = params?.assignmentId ?? 'asgn-1';
@@ -60,7 +65,7 @@ describe('R5I3 Corrective Durable Successor Context Authority and Attempt State 
     const successorAgentProfileId = params?.successorAgentProfileId ?? 'prof-reviewer-1';
     const nowIso = '2026-08-28T00:00:00Z';
 
-    repo.createProject({
+    targetRepo.createProject({
       id: 'proj-1',
       name: 'Project 1',
       description: null,
@@ -75,7 +80,7 @@ describe('R5I3 Corrective Durable Successor Context Authority and Attempt State 
     });
 
     // Source Role Profile & Agent Profile
-    repo.createRoleProfile({
+    targetRepo.createRoleProfile({
       id: sourceRoleProfileId,
       role: 'CODER',
       display_name: 'Coder Role',
@@ -89,7 +94,7 @@ describe('R5I3 Corrective Durable Successor Context Authority and Attempt State 
       updated_at: nowIso,
     });
 
-    repo.createAgentProfile({
+    targetRepo.createAgentProfile({
       id: sourceAgentProfileId,
       role_profile_id: sourceRoleProfileId,
       name: 'Primary Coder Agent',
@@ -101,7 +106,7 @@ describe('R5I3 Corrective Durable Successor Context Authority and Attempt State 
     });
 
     // Successor Role Profile & Agent Profile
-    repo.createRoleProfile({
+    targetRepo.createRoleProfile({
       id: successorRoleProfileId,
       role: 'REVIEWER',
       display_name: 'Reviewer Role',
@@ -115,7 +120,7 @@ describe('R5I3 Corrective Durable Successor Context Authority and Attempt State 
       updated_at: nowIso,
     });
 
-    repo.createAgentProfile({
+    targetRepo.createAgentProfile({
       id: successorAgentProfileId,
       role_profile_id: successorRoleProfileId,
       name: 'Primary Reviewer Agent',
@@ -127,7 +132,7 @@ describe('R5I3 Corrective Durable Successor Context Authority and Attempt State 
     });
 
     // Provider, Provider Account, Provider Resource
-    repo.createProvider({
+    targetRepo.createProvider({
       id: 'prov-1',
       name: 'Provider 1',
       adapter_type: 'API',
@@ -135,7 +140,7 @@ describe('R5I3 Corrective Durable Successor Context Authority and Attempt State 
       created_at: nowIso,
     });
 
-    repo.createProviderAccount({
+    targetRepo.createProviderAccount({
       id: 'acc-1',
       provider_id: 'prov-1',
       label: 'Account 1',
@@ -154,7 +159,7 @@ describe('R5I3 Corrective Durable Successor Context Authority and Attempt State 
       updated_at: nowIso,
     });
 
-    repo.createProviderResource({
+    targetRepo.createProviderResource({
       id: 'res-1',
       provider_id: 'prov-1',
       provider_account_id: 'acc-1',
@@ -172,7 +177,7 @@ describe('R5I3 Corrective Durable Successor Context Authority and Attempt State 
     });
 
     // Task
-    repo.createTask({
+    targetRepo.createTask({
       id: taskId,
       project_id: 'proj-1',
       milestone_id: null,
@@ -197,7 +202,7 @@ describe('R5I3 Corrective Durable Successor Context Authority and Attempt State 
     });
 
     // Source Task Attempt (Attempt 1)
-    repo.createTaskAttempt({
+    targetRepo.createTaskAttempt({
       id: attemptId,
       task_id: taskId,
       attempt_number: 1,
@@ -210,7 +215,7 @@ describe('R5I3 Corrective Durable Successor Context Authority and Attempt State 
     });
 
     // Source Agent Assignment
-    repo.createAgentAssignment({
+    targetRepo.createAgentAssignment({
       id: assignmentId,
       project_id: 'proj-1',
       task_id: taskId,
@@ -233,6 +238,8 @@ describe('R5I3 Corrective Durable Successor Context Authority and Attempt State 
    * Helper to execute full predecessor lifecycle to reach RELINQUISHED state (version 4, epoch bumped to 2)
    */
   function seedRelinquishedHandoff(params?: {
+    customService?: HandoffTransferService;
+    customRepo?: Repository;
     requestId?: string;
     taskId?: string;
     attemptId?: string;
@@ -241,6 +248,8 @@ describe('R5I3 Corrective Durable Successor Context Authority and Attempt State 
     handoffContextId?: string | null;
     checkpointId?: string | null;
   }): { transferId: string; version: number; newEpoch: number } {
+    const targetService = params?.customService ?? service;
+    const targetRepo = params?.customRepo ?? repo;
     const taskId = params?.taskId ?? 'task-1';
     const attemptId = params?.attemptId ?? 'att-1';
     const assignmentId = params?.assignmentId ?? 'asgn-1';
@@ -248,7 +257,7 @@ describe('R5I3 Corrective Durable Successor Context Authority and Attempt State 
     const reqId = params?.requestId ?? 'req-relinquished-1';
 
     // 1. Request
-    const reqRes = service.requestHandoff({
+    const reqRes = targetService.requestHandoff({
       requestId: reqId,
       taskId,
       sourceAttemptId: attemptId,
@@ -259,23 +268,23 @@ describe('R5I3 Corrective Durable Successor Context Authority and Attempt State 
     const transferId = reqRes.transfer!.id;
 
     // Acquire task lease
-    repo.acquireTaskLease(taskId, 'prof-coder-1', leaseToken);
+    targetRepo.acquireTaskLease(taskId, 'prof-coder-1', leaseToken);
 
     // 2. Freeze
-    service.freezeHandoff({
+    targetService.freezeHandoff({
       transferId,
       expectedVersion: 1,
       checkpointId: params?.checkpointId ?? null,
     });
 
     // 3. Begin Quiescence
-    service.beginQuiescence({
+    targetService.beginQuiescence({
       transferId,
       expectedVersion: 2,
     });
 
     // 4. Relinquish
-    const relRes = service.relinquishPredecessorOwnership({
+    const relRes = targetService.relinquishPredecessorOwnership({
       transferId,
       expectedVersion: 3,
       expectedSourceEpoch: 1,
@@ -406,7 +415,7 @@ describe('R5I3 Corrective Durable Successor Context Authority and Attempt State 
   // Section 27: Required Context Authority & Fencing Tests (11..29)
   // =========================================================================
   describe('Context Authority & Fencing', () => {
-    it('11-15. first context build binds durable snapshot pointer, verifies task/attempt/purpose, and resolves manifest', () => {
+    it('11-15 & Proof 1-2. first context build binds durable snapshot pointer, verifies task/attempt/purpose, and resolves deterministic manifest', () => {
       seedBaseEntities();
       const { transferId, version, newEpoch } = seedRelinquishedHandoff();
 
@@ -438,10 +447,18 @@ describe('R5I3 Corrective Durable Successor Context Authority and Attempt State 
       // 14. Pointer snapshot purpose == HANDOFF
       expect(prepRes.contextSnapshot?.purpose).toBe('HANDOFF');
 
+      // Proof 1 & 2: Normal deterministic snapshot and manifest ID checks
+      const specHash = transfer.successor_context_spec_hash!;
+      const expectedSnapId = `ctx-snap-ho-${computeSha256(`r5i-successor-context:${transferId}:${specHash}`).slice(0, 32)}`;
+      const expectedManId = `ctx-man-ho-${computeSha256(`r5i-successor-manifest:${transferId}:${specHash}`).slice(0, 32)}`;
+      expect(prepRes.contextSnapshot?.id).toBe(expectedSnapId);
+      expect(prepRes.contextManifest?.id).toBe(expectedManId);
+
       // 15. Manifest resolves from pointer snapshot
       const manifest = repo.getContextManifestBySnapshotId(transfer.successor_context_snapshot_id!);
       expect(manifest).not.toBeNull();
       expect(manifest?.snapshot_id).toBe(transfer.successor_context_snapshot_id);
+      expect(manifest?.id).toBe(expectedManId);
     });
 
     it('16-19. exact context replay returns same snapshot ID, same manifest, creates zero new snapshots and no N+2', () => {
@@ -1157,7 +1174,7 @@ describe('R5I3 Corrective Durable Successor Context Authority and Attempt State 
   });
 
   // =========================================================================
-  // Section 28: Crash / Recovery & Replay Authority Tests (30..36 + Defect B)
+  // Section 28: Crash / Recovery & Replay Authority Tests (30..36 + Proofs 3..11)
   // =========================================================================
   describe('Crash / Recovery & Replay Authority Tests', () => {
     it('30-34. deterministic candidate snapshot persists, recovers after simulated interruption before pointer bind, and binds without duplicating', () => {
@@ -1315,7 +1332,64 @@ describe('R5I3 Corrective Durable Successor Context Authority and Attempt State 
       expect(retryRes.errorCode).toBe('SUCCESSOR_CONTEXT_AUTHORITY_INTEGRITY_MISMATCH');
     });
 
-    it('Defect B. already-bound repository replay validates snapshot exists, manifest exists, and task/attempt/purpose integrity before returning alreadyBound', () => {
+    it('Proofs 3..5 (Blocker B). wrong deterministic-candidate manifest ID fails closed and leaves pointer/spec NULL', () => {
+      seedBaseEntities();
+      const { transferId, version, newEpoch } = seedRelinquishedHandoff();
+
+      const prepRes = service.prepareHandoffSuccessor({
+        transferId,
+        expectedVersion: version,
+        expectedSuccessorEpoch: newEpoch,
+        successorRoleProfileId: 'rp-reviewer',
+        successorAgentProfileId: 'prof-reviewer-1',
+        buildContext: false,
+      });
+      const successorAttemptId = prepRes.successorAttempt!.id;
+
+      const specHash = computeSuccessorContextSpecHash({
+        transferId,
+        successorAttemptId,
+        purpose: 'HANDOFF',
+        handoffContextId: null,
+        checkpointId: null,
+        contextFiles: [],
+        customItems: [],
+      });
+      const deterministicSnapId = `ctx-snap-ho-${computeSha256(`r5i-successor-context:${transferId}:${specHash}`).slice(0, 32)}`;
+
+      // Insert valid candidate snapshot
+      db.prepare(`
+        INSERT INTO context_snapshots (id, project_id, task_id, attempt_id, purpose, snapshot_version, builder_version, content_hash, created_at)
+        VALUES (?, 'proj-1', 'task-1', ?, 'HANDOFF', 1, 'r5b-v1.1', 'valid_hash', '2026-08-28T00:00:00Z')
+      `).run(deterministicSnapId, successorAttemptId);
+
+      // Insert manifest with WRONG ID (not deterministicManifestId)
+      db.prepare(`
+        INSERT INTO context_manifests (id, snapshot_id, manifest_version, item_count, manifest_hash, manifest_json, created_at)
+        VALUES ('ctx-man-wrong-id-adversarial', ?, 1, 0, 'man_hash', '{}', '2026-08-28T00:00:00Z')
+      `).run(deterministicSnapId);
+
+      // Preparation must fail closed
+      const retryRes = service.prepareHandoffSuccessor({
+        transferId,
+        expectedVersion: version,
+        expectedSuccessorEpoch: newEpoch,
+        successorRoleProfileId: 'rp-reviewer',
+        successorAgentProfileId: 'prof-reviewer-1',
+        buildContext: true,
+      });
+
+      // Proof 3: Fails closed
+      expect(retryRes.success).toBe(false);
+      expect(retryRes.errorCode).toBe('SUCCESSOR_CONTEXT_AUTHORITY_INTEGRITY_MISMATCH');
+
+      // Proof 4 & 5: Transfer pointer and spec hash remain NULL
+      const transfer = repo.getHandoffTransfer(transferId)!;
+      expect(transfer.successor_context_snapshot_id).toBeNull();
+      expect(transfer.successor_context_spec_hash).toBeNull();
+    });
+
+    it('Proofs 6..11 (Blocker C). already-bound repository replay validates snapshot metadata (task, attempt, purpose) and artifacts', () => {
       seedBaseEntities();
       const { transferId, version, newEpoch } = seedRelinquishedHandoff();
 
@@ -1333,7 +1407,7 @@ describe('R5I3 Corrective Durable Successor Context Authority and Attempt State 
       const boundSnapshotId = prepRes.contextSnapshot!.id;
       const boundSpecHash = prepRes.transfer!.successor_context_spec_hash!;
 
-      // 1. Valid exact replay at repository level returns alreadyBound: true
+      // Proof 11: Valid exact replay at repository level returns alreadyBound: true
       const repoReplay = repo.bindHandoffSuccessorContext({
         transferId,
         expectedVersion: prepRes.transfer!.version,
@@ -1343,7 +1417,48 @@ describe('R5I3 Corrective Durable Successor Context Authority and Attempt State 
       expect(repoReplay.success).toBe(true);
       expect(repoReplay.alreadyBound).toBe(true);
 
-      // 2. If manifest is missing for already-bound snapshot, repository fails closed with CONTEXT_MANIFEST_NOT_FOUND
+      // Proof 6: Corrupt already-bound snapshot task_id -> fails closed with CONTEXT_SNAPSHOT_INTEGRITY_MISMATCH
+      db.pragma('foreign_keys = OFF');
+      db.prepare('UPDATE context_snapshots SET task_id = ? WHERE id = ?').run('task-corrupted-other', boundSnapshotId);
+      const replayWrongTask = repo.bindHandoffSuccessorContext({
+        transferId,
+        expectedVersion: prepRes.transfer!.version,
+        successorContextSnapshotId: boundSnapshotId,
+        successorContextSpecHash: boundSpecHash,
+      });
+      expect(replayWrongTask.success).toBe(false);
+      expect(replayWrongTask.errorCode).toBe('CONTEXT_SNAPSHOT_INTEGRITY_MISMATCH');
+      // Restore task_id
+      db.prepare('UPDATE context_snapshots SET task_id = ? WHERE id = ?').run('task-1', boundSnapshotId);
+
+      // Proof 7: Corrupt already-bound snapshot attempt_id -> fails closed with CONTEXT_SNAPSHOT_INTEGRITY_MISMATCH
+      db.prepare('UPDATE context_snapshots SET attempt_id = ? WHERE id = ?').run('att-corrupted-other', boundSnapshotId);
+      const replayWrongAttempt = repo.bindHandoffSuccessorContext({
+        transferId,
+        expectedVersion: prepRes.transfer!.version,
+        successorContextSnapshotId: boundSnapshotId,
+        successorContextSpecHash: boundSpecHash,
+      });
+      expect(replayWrongAttempt.success).toBe(false);
+      expect(replayWrongAttempt.errorCode).toBe('CONTEXT_SNAPSHOT_INTEGRITY_MISMATCH');
+      // Restore attempt_id
+      db.prepare('UPDATE context_snapshots SET attempt_id = ? WHERE id = ?').run(prepRes.successorAttempt!.id, boundSnapshotId);
+
+      // Proof 8: Corrupt already-bound snapshot purpose -> fails closed with CONTEXT_SNAPSHOT_INTEGRITY_MISMATCH
+      db.prepare('UPDATE context_snapshots SET purpose = ? WHERE id = ?').run('EXECUTION', boundSnapshotId);
+      const replayWrongPurpose = repo.bindHandoffSuccessorContext({
+        transferId,
+        expectedVersion: prepRes.transfer!.version,
+        successorContextSnapshotId: boundSnapshotId,
+        successorContextSpecHash: boundSpecHash,
+      });
+      expect(replayWrongPurpose.success).toBe(false);
+      expect(replayWrongPurpose.errorCode).toBe('CONTEXT_SNAPSHOT_INTEGRITY_MISMATCH');
+      // Restore purpose
+      db.prepare('UPDATE context_snapshots SET purpose = ? WHERE id = ?').run('HANDOFF', boundSnapshotId);
+      db.pragma('foreign_keys = ON');
+
+      // Proof 10: Missing manifest for already-bound snapshot -> fails closed with CONTEXT_MANIFEST_NOT_FOUND
       db.prepare('DELETE FROM context_manifests WHERE snapshot_id = ?').run(boundSnapshotId);
       const replayNoManifest = repo.bindHandoffSuccessorContext({
         transferId,
@@ -1354,11 +1469,10 @@ describe('R5I3 Corrective Durable Successor Context Authority and Attempt State 
       expect(replayNoManifest.success).toBe(false);
       expect(replayNoManifest.errorCode).toBe('CONTEXT_MANIFEST_NOT_FOUND');
 
-      // 3. If snapshot itself is missing, repository fails closed with CONTEXT_SNAPSHOT_NOT_FOUND
+      // Proof 9: Missing snapshot for already-bound snapshot -> fails closed with CONTEXT_SNAPSHOT_NOT_FOUND
       db.pragma('foreign_keys = OFF');
       db.prepare('DELETE FROM context_items WHERE snapshot_id = ?').run(boundSnapshotId);
       db.prepare('DELETE FROM context_snapshots WHERE id = ?').run(boundSnapshotId);
-
       const replayNoSnapshot = repo.bindHandoffSuccessorContext({
         transferId,
         expectedVersion: prepRes.transfer!.version,
@@ -1373,59 +1487,155 @@ describe('R5I3 Corrective Durable Successor Context Authority and Attempt State 
   });
 
   // =========================================================================
-  // Section 29: Concurrency, Stale CAS & Version Fencing (37..41 + Defect E & F)
+  // Section 29: True Deterministic Interleaving Race & CAS Fencing (Proofs 12..24)
   // =========================================================================
-  describe('Concurrency & CAS Binding', () => {
-    it('37 & Defect E. race-shaped concurrent preparation from two independent service instances converges to one authority without duplicating snapshots, manifests, or attempts', () => {
-      seedBaseEntities();
-      const { transferId, version, newEpoch } = seedRelinquishedHandoff();
+  describe('True Deterministic Interleaving Race & CAS Fencing', () => {
+    it('Proofs 12..24 (Blockers A & 4). true deterministic interleaving across two physical SQLite connections exercises production race recovery and converges', () => {
+      // 12. Create a temporary on-disk SQLite database file for two distinct physical connections
+      const tempDbPath = path.join(os.tmpdir(), `agentforge-race-${Date.now()}-${Math.random().toString(36).slice(2)}.db`);
+      const dbA = new Database(tempDbPath);
+      const dbB = new Database(tempDbPath);
 
-      // Instantiate two independent service and repository instances against the same database
-      const repo1 = new Repository(db);
-      const builder1 = new ContextBuilderService(repo1);
-      const service1 = new HandoffTransferService(repo1, builder1);
+      dbA.pragma('journal_mode = WAL');
+      dbA.pragma('foreign_keys = ON');
+      dbB.pragma('journal_mode = WAL');
+      dbB.pragma('foreign_keys = ON');
 
-      const repo2 = new Repository(db);
-      const builder2 = new ContextBuilderService(repo2);
-      const service2 = new HandoffTransferService(repo2, builder2);
+      try {
+        // Run migrations via connection A
+        MigrationRunner.run(dbA);
 
-      // Both contenders execute preparation based on the exact same pre-bind relinquished transfer state
-      const res1 = service1.prepareHandoffSuccessor({
-        transferId,
-        expectedVersion: version,
-        expectedSuccessorEpoch: newEpoch,
-        successorRoleProfileId: 'rp-reviewer',
-        successorAgentProfileId: 'prof-reviewer-1',
-        buildContext: true,
-      });
-      expect(res1.success).toBe(true);
+        const repoA = new Repository(dbA);
+        const repoB = new Repository(dbB);
 
-      const res2 = service2.prepareHandoffSuccessor({
-        transferId,
-        expectedVersion: version,
-        expectedSuccessorEpoch: newEpoch,
-        successorRoleProfileId: 'rp-reviewer',
-        successorAgentProfileId: 'prof-reviewer-1',
-        buildContext: true,
-      });
-      expect(res2.success).toBe(true);
+        // Seed base entities & relinquished transfer via connection A
+        seedBaseEntities({ customRepo: repoA });
+        const { transferId, version, newEpoch } = seedRelinquishedHandoff({
+          customRepo: repoA,
+          customService: new HandoffTransferService(repoA, new ContextBuilderService(repoA)),
+        });
 
-      // Both converge to the exact same authoritative pointer
-      expect(res2.contextSnapshot?.id).toBe(res1.contextSnapshot?.id);
-      expect(res2.contextManifest?.id).toBe(res1.contextManifest?.id);
+        const sharedSuccessorAttemptId = 'att-succ-race-1';
 
-      // Exactly 1 ContextSnapshot exists
-      const snapshots = db.prepare('SELECT * FROM context_snapshots WHERE task_id = ?').all('task-1');
-      expect(snapshots.length).toBe(1);
+        // 13. Pre-bind context authority derived
+        const specHash = computeSuccessorContextSpecHash({
+          transferId,
+          successorAttemptId: sharedSuccessorAttemptId,
+          purpose: 'HANDOFF',
+          handoffContextId: null,
+          checkpointId: null,
+          contextFiles: [],
+          customItems: [],
+        });
+        const deterministicSnapId = `ctx-snap-ho-${computeSha256(`r5i-successor-context:${transferId}:${specHash}`).slice(0, 32)}`;
+        const deterministicManId = `ctx-man-ho-${computeSha256(`r5i-successor-manifest:${transferId}:${specHash}`).slice(0, 32)}`;
 
-      // Exactly 1 ContextManifest exists
-      const manifests = db.prepare('SELECT * FROM context_manifests WHERE snapshot_id = ?').all(res1.contextSnapshot!.id);
-      expect(manifests.length).toBe(1);
+        // Instantiate Contender B service with standard ContextBuilder on dbB
+        const builderB = new ContextBuilderService(repoB);
+        const serviceB = new HandoffTransferService(repoB, builderB);
 
-      // Exactly 2 total attempts exist on task (Attempt 1 predecessor + Attempt 2 successor, no N+2)
-      const attempts = repo.getTaskAttemptsByTask('task-1');
-      expect(attempts.length).toBe(2);
-      expect(res2.successorAttempt?.id).toBe(res1.successorAttempt?.id);
+        // Hook ContextBuilder for Contender A on dbA to interleave Contender B immediately before A persists
+        let contenderBExecuted = false;
+        let contenderARaceEncountered = false;
+
+        class InterleavingContextBuilderService extends ContextBuilderService {
+          public onBeforeBuild?: () => void;
+
+          override buildContextSnapshot(options: any) {
+            if (this.onBeforeBuild) {
+              const hook = this.onBeforeBuild;
+              this.onBeforeBuild = undefined;
+              hook();
+            }
+            try {
+              return super.buildContextSnapshot(options);
+            } catch (err) {
+              // Contender A encountered the duplicate key conflict on dbA
+              contenderARaceEncountered = true;
+              throw err;
+            }
+          }
+        }
+
+        const builderA = new InterleavingContextBuilderService(repoA);
+        const serviceA = new HandoffTransferService(repoA, builderA);
+
+        let resB: any = null;
+        builderA.onBeforeBuild = () => {
+          // 14. Contender B executes on physical connection dbB, creates candidate snapshot & manifest, and binds pointer
+          resB = serviceB.prepareHandoffSuccessor({
+            transferId,
+            expectedVersion: version,
+            expectedSuccessorEpoch: newEpoch,
+            successorRoleProfileId: 'rp-reviewer',
+            successorAgentProfileId: 'prof-reviewer-1',
+            successorAttemptId: sharedSuccessorAttemptId,
+            buildContext: true,
+          });
+          expect(resB.success).toBe(true);
+          expect(resB.alreadyBound).toBe(false);
+          expect(resB.contextSnapshot?.id).toBe(deterministicSnapId);
+          expect(resB.contextManifest?.id).toBe(deterministicManId);
+          contenderBExecuted = true;
+        };
+
+        // Contender A executes prepareHandoffSuccessor on dbA
+        const resA = serviceA.prepareHandoffSuccessor({
+          transferId,
+          expectedVersion: version,
+          expectedSuccessorEpoch: newEpoch,
+          successorRoleProfileId: 'rp-reviewer',
+          successorAgentProfileId: 'prof-reviewer-1',
+          successorAttemptId: sharedSuccessorAttemptId,
+          buildContext: true,
+        });
+
+        // 14. Contender B executed before Contender A insertion
+        expect(contenderBExecuted).toBe(true);
+
+        // 15. Contender A actually encountered the duplicate deterministic artifact insertion race
+        expect(contenderARaceEncountered).toBe(true);
+
+        // 16. Contender A successfully recovered via production race recovery path
+        expect(resA.success).toBe(true);
+        expect(resA.alreadyBound).toBe(true);
+
+        // 17. Both converged to the exact same snapshot ID
+        expect(resA.contextSnapshot?.id).toBe(resB.contextSnapshot?.id);
+        expect(resA.contextSnapshot?.id).toBe(deterministicSnapId);
+
+        // 18. Both converged to the exact same manifest ID
+        expect(resA.contextManifest?.id).toBe(resB.contextManifest?.id);
+        expect(resA.contextManifest?.id).toBe(deterministicManId);
+
+        // 19. Exactly one ContextSnapshot persisted
+        const snapshotRows = dbA.prepare('SELECT * FROM context_snapshots WHERE task_id = ?').all('task-1');
+        expect(snapshotRows.length).toBe(1);
+
+        // 20. Exactly one ContextManifest persisted
+        const manifestRows = dbA.prepare('SELECT * FROM context_manifests WHERE snapshot_id = ?').all(deterministicSnapId);
+        expect(manifestRows.length).toBe(1);
+
+        // 21-22. Exactly one successor attempt (Attempt 2), no N+2
+        const attemptRows = repoA.getTaskAttemptsByTask('task-1');
+        expect(attemptRows.length).toBe(2);
+        expect(resA.successorAttempt?.id).toBe(resB.successorAttempt?.id);
+
+        // 23-24. Single pointer and spec hash authority in transfer
+        const finalTransfer = repoA.getHandoffTransfer(transferId)!;
+        expect(finalTransfer.successor_context_snapshot_id).toBe(deterministicSnapId);
+        expect(finalTransfer.successor_context_spec_hash).toBe(resA.transfer?.successor_context_spec_hash);
+      } finally {
+        dbA.close();
+        dbB.close();
+        try {
+          if (fs.existsSync(tempDbPath)) fs.unlinkSync(tempDbPath);
+          if (fs.existsSync(`${tempDbPath}-wal`)) fs.unlinkSync(`${tempDbPath}-wal`);
+          if (fs.existsSync(`${tempDbPath}-shm`)) fs.unlinkSync(`${tempDbPath}-shm`);
+        } catch {
+          // Ignore cleanup errors
+        }
+      }
     });
 
     it('38. conflicting context specs cannot both bind', () => {

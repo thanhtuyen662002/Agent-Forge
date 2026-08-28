@@ -897,6 +897,18 @@ export class HandoffTransferService {
         };
       }
 
+      const deterministicManifestId = `ctx-man-ho-${computeSha256(`r5i-successor-manifest:${transfer.id}:${specHash}`).slice(0, 32)}`;
+      if (existingMan.id !== deterministicManifestId) {
+        return {
+          success: false,
+          transfer,
+          successorAttempt,
+          alreadyPrepared: prepRes.alreadyPrepared,
+          errorCode: 'SUCCESSOR_CONTEXT_AUTHORITY_INTEGRITY_MISMATCH',
+          error: `SUCCESSOR_CONTEXT_AUTHORITY_INTEGRITY_MISMATCH: Bound manifest "${existingMan.id}" does not match deterministic manifest ID "${deterministicManifestId}".`,
+        };
+      }
+
       return {
         success: true,
         transfer,
@@ -942,6 +954,16 @@ export class HandoffTransferService {
           error: `SUCCESSOR_CONTEXT_AUTHORITY_INTEGRITY_MISMATCH: Pre-existing candidate snapshot "${candidateSnapshot.id}" missing manifest.`,
         };
       }
+      if (candidateManifest.id !== deterministicManifestId) {
+        return {
+          success: false,
+          transfer,
+          successorAttempt,
+          alreadyPrepared: prepRes.alreadyPrepared,
+          errorCode: 'SUCCESSOR_CONTEXT_AUTHORITY_INTEGRITY_MISMATCH',
+          error: `SUCCESSOR_CONTEXT_AUTHORITY_INTEGRITY_MISMATCH: Pre-existing candidate manifest "${candidateManifest.id}" does not match deterministic manifest ID "${deterministicManifestId}".`,
+        };
+      }
     } else {
       const task = this.repo.getTask(transfer.task_id);
       if (!task) {
@@ -983,7 +1005,8 @@ export class HandoffTransferService {
           recoveredMan &&
           recoveredSnap.task_id === transfer.task_id &&
           recoveredSnap.attempt_id === successorAttempt.id &&
-          recoveredSnap.purpose === 'HANDOFF'
+          recoveredSnap.purpose === 'HANDOFF' &&
+          recoveredMan.id === deterministicManifestId
         ) {
           candidateSnapshot = recoveredSnap;
           candidateManifest = recoveredMan;
