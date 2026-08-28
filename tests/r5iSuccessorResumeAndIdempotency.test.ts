@@ -23,6 +23,7 @@ import {
 } from '../src/core/services/ExecutionAuthorizationService';
 import {
   HandoffTransferService,
+  computeSuccessorContextSpecHash,
 } from '../src/core/services/HandoffTransferService';
 import {
   ContextBuilderService,
@@ -433,9 +434,37 @@ describe('R5I5 Successor Resume, Linearization, and Idempotency Authority', () =
     defaultRoutingDecisionId = 'dec-route-succ-1';
     const successorAssignmentId = 'asgn-r5i5-succ';
 
-    // R5I3 Context snapshot & manifest
-    defaultSnapshotId = `ctx-snap-${transferId}-${successorAttemptId}-HANDOFF`;
-    defaultManifestId = `ctx-man-${defaultSnapshotId}`;
+    // R5I3 Context snapshot & manifest via real computeSuccessorContextSpecHash
+    const rawContextFiles = ['src_file.ts'];
+    const rawCustomItems = [
+      {
+        itemType: 'PROJECT_MEMORY' as const,
+        sourceType: 'MEMORY_STORE',
+        sourceRef: 'project-notes',
+        content: { note: 'Important project architectural invariant' },
+        tokenEstimate: 25,
+      },
+      {
+        itemType: 'TASK_MEMORY' as const,
+        sourceType: 'TASK_STORE',
+        sourceRef: 'task-progress',
+        content: { step: 'Step 1 complete' },
+        tokenEstimate: 15,
+      },
+    ];
+
+    const contextSpecHash = computeSuccessorContextSpecHash({
+      transferId,
+      successorAttemptId,
+      purpose: 'HANDOFF',
+      handoffContextId: null,
+      checkpointId: null,
+      contextFiles: rawContextFiles,
+      customItems: rawCustomItems,
+    });
+
+    defaultSnapshotId = `ctx-snap-ho-${computeSha256(`r5i-successor-context:${transferId}:${contextSpecHash}`).slice(0, 32)}`;
+    defaultManifestId = `ctx-man-ho-${computeSha256(`r5i-successor-manifest:${transferId}:${contextSpecHash}`).slice(0, 32)}`;
 
     const buildRes = contextBuilder.buildContextSnapshot({
       projectId,
@@ -444,30 +473,9 @@ describe('R5I5 Successor Resume, Linearization, and Idempotency Authority', () =
       purpose: 'HANDOFF',
       snapshotId: defaultSnapshotId,
       manifestId: defaultManifestId,
-      contextFiles: ['src_file.ts'],
-      customItems: [
-        {
-          itemType: 'PROJECT_MEMORY',
-          sourceType: 'MEMORY_STORE',
-          sourceRef: 'project-notes',
-          content: { note: 'Important project architectural invariant' },
-          tokenEstimate: 25,
-        },
-        {
-          itemType: 'TASK_MEMORY',
-          sourceType: 'TASK_STORE',
-          sourceRef: 'task-progress',
-          content: { step: 'Step 1 complete' },
-          tokenEstimate: 15,
-        },
-      ],
+      contextFiles: rawContextFiles,
+      customItems: rawCustomItems,
     });
-
-    const contextSpecHash = computeSha256(canonicalJsonStringify({
-      snapshotId: defaultSnapshotId,
-      manifestId: defaultManifestId,
-      manifestHash: buildRes.manifest.manifest_hash,
-    }));
 
     // Record R5I4 Historical Routing Event with selectedAssignmentId = null
     const routeSpec: Record<string, unknown> = {
@@ -2280,5 +2288,337 @@ describe('R5I5 Successor Resume, Linearization, and Idempotency Authority', () =
     const asgn = repo.getAgentAssignment(defaultAssignment.id)!;
     const meta = asgn.preferred_metadata as any;
     expect(meta.handoff_route_spec_hash).toBeDefined();
+  });
+
+  // =========================================================================
+  // I. R5I5 SECOND CORRECTIVE: PREDECESSOR CONTEXT & POST-AUTH FENCING (A-O)
+  // =========================================================================
+
+  it('75 (A-B). fixture transfer.successor_context_spec_hash equals output of computeSuccessorContextSpecHash for exact R5I3 inputs', async () => {
+    const expectedSpecHash = computeSuccessorContextSpecHash({
+      transferId: defaultTransfer.id,
+      successorAttemptId,
+      purpose: 'HANDOFF',
+      handoffContextId: null,
+      checkpointId: null,
+      contextFiles: ['src_file.ts'],
+      customItems: [
+        {
+          itemType: 'PROJECT_MEMORY',
+          sourceType: 'MEMORY_STORE',
+          sourceRef: 'project-notes',
+          content: { note: 'Important project architectural invariant' },
+          tokenEstimate: 25,
+        },
+        {
+          itemType: 'TASK_MEMORY',
+          sourceType: 'TASK_STORE',
+          sourceRef: 'task-progress',
+          content: { step: 'Step 1 complete' },
+          tokenEstimate: 15,
+        },
+      ],
+    });
+    expect(defaultTransfer.successor_context_spec_hash).toBe(expectedSpecHash);
+  });
+
+  it('76 (C-D). snapshot and manifest IDs follow exact deterministic R5I3 formulas', async () => {
+    const specHash = defaultTransfer.successor_context_spec_hash!;
+    const expectedSnapshotId = `ctx-snap-ho-${computeSha256(`r5i-successor-context:${defaultTransfer.id}:${specHash}`).slice(0, 32)}`;
+    const expectedManifestId = `ctx-man-ho-${computeSha256(`r5i-successor-manifest:${defaultTransfer.id}:${specHash}`).slice(0, 32)}`;
+
+    expect(defaultSnapshotId).toBe(expectedSnapshotId);
+    expect(defaultManifestId).toBe(expectedManifestId);
+    expect(defaultTransfer.successor_context_snapshot_id).toBe(expectedSnapshotId);
+  });
+
+  it('77 (E). legacy/fake R5I5 tuple-hash is NOT treated as valid R5I3 context-spec authority', async () => {
+    // Attempt to seed transfer with fake tuple hash
+    const fakeTupleHash = computeSha256(canonicalJsonStringify({
+      snapshotId: defaultSnapshotId,
+      manifestId: defaultManifestId,
+      manifestHash: 'fake-manifest-hash',
+    }));
+    db.prepare('UPDATE handoff_transfers SET successor_context_spec_hash = ? WHERE id = ?').run(fakeTupleHash, defaultTransfer.id);
+
+    const resumeRes = await handoffService.resumeHandoffSuccessor({ transferId: defaultTransfer.id });
+    expect(resumeRes.success).toBe(false);
+    expect(resumeRes.errorCode).toMatch(/CONTEXT_MANIFEST_INTEGRITY_FAILED|CONTEXT_SPEC_HASH_MISMATCH|CONTEXT_SNAPSHOT_MISMATCH/);
+  });
+
+  it('78 (F). non-R5I3 snapshot ID is rejected in Phase EB and central validator', async () => {
+    const nonR5i3SnapshotId = `ctx-snap-${defaultTransfer.id}-${successorAttemptId}-HANDOFF`;
+    const nonR5i3ManifestId = `ctx-man-${nonR5i3SnapshotId}`;
+    contextBuilder.buildContextSnapshot({
+      projectId,
+      taskId,
+      attemptId: successorAttemptId,
+      purpose: 'HANDOFF',
+      snapshotId: nonR5i3SnapshotId,
+      manifestId: nonR5i3ManifestId,
+      contextFiles: ['src_file.ts'],
+      customItems: [],
+    });
+
+    db.prepare('UPDATE handoff_transfers SET successor_context_snapshot_id = ? WHERE id = ?').run(nonR5i3SnapshotId, defaultTransfer.id);
+
+    const resumeRes = await handoffService.resumeHandoffSuccessor({ transferId: defaultTransfer.id });
+    expect(resumeRes.success).toBe(false);
+    expect(resumeRes.errorCode).toMatch(/CONTEXT_MANIFEST_INTEGRITY_FAILED|CONTEXT_SNAPSHOT_MISMATCH/);
+  });
+
+  it('79 (G). non-R5I3 manifest ID is rejected', async () => {
+    // Create manifest with non-deterministic ID
+    const wrongManifestId = 'ctx-man-wrong-id';
+    db.prepare('UPDATE context_manifests SET id = ? WHERE id = ?').run(wrongManifestId, defaultManifestId);
+
+    const resumeRes = await handoffService.resumeHandoffSuccessor({ transferId: defaultTransfer.id });
+    expect(resumeRes.success).toBe(false);
+    expect(resumeRes.errorCode).toMatch(/CONTEXT_MANIFEST_NOT_FOUND|CONTEXT_MANIFEST_INTEGRITY_FAILED/);
+  });
+
+  it('80 (H). real R5I3-prepared context reaches Phase EA and Phase EB without false mismatch', async () => {
+    const prepareRes = await authService.prepareHandoffSuccessorAuthorization({ transferId: defaultTransfer.id });
+    expect(prepareRes.success).toBe(true);
+
+    const resumeRes = repo.resumeHandoffSuccessorAuthorization({
+      transferId: defaultTransfer.id,
+      expectedVersion: defaultTransfer.version,
+      candidate: prepareRes.candidate!,
+    });
+    expect(resumeRes.success).toBe(true);
+    expect(resumeRes.authorization).toBeDefined();
+  });
+
+  it('81 (I). post-authorization coordinated route mutation fails central validator with AUTHORIZATION_CONTENT_MISMATCH', async () => {
+    const resumeRes = await handoffService.resumeHandoffSuccessor({ transferId: defaultTransfer.id });
+    expect(resumeRes.success).toBe(true);
+    const authId = resumeRes.authorization!.id;
+
+    // Mutate route spec and compute matching hash
+    const mutatedRouteSpec: Record<string, unknown> = {
+      transferId: defaultTransfer.id,
+      successorAttemptId,
+      roleProfileId,
+      sourceProviderId: providerAId,
+      tampered: true,
+    };
+    const mutatedRouteSpecHash = computeSha256(canonicalJsonStringify(mutatedRouteSpec));
+    const mutatedMetadata = {
+      handoff_route_spec_version: 1,
+      handoff_route_spec_hash: mutatedRouteSpecHash,
+      handoff_route_spec: mutatedRouteSpec,
+    };
+    db.prepare('UPDATE agent_assignments SET preferred_metadata_json = ? WHERE id = ?').run(
+      JSON.stringify(mutatedMetadata),
+      defaultAssignment.id
+    );
+
+    const validation = repo.validateHandoffSuccessorExecutionAuthority(authId);
+    expect(validation.valid).toBe(false);
+    expect(validation.errorCode).toBe('AUTHORIZATION_CONTENT_MISMATCH');
+  });
+
+  it('82 (J). post-authorization coordinated route mutation fails before first lease through ConcurrentExecutionScheduler', async () => {
+    const resumeRes = await handoffService.resumeHandoffSuccessor({ transferId: defaultTransfer.id });
+    expect(resumeRes.success).toBe(true);
+    const authId = resumeRes.authorization!.id;
+
+    // Mutate route spec and matching hash
+    const mutatedRouteSpec: Record<string, unknown> = {
+      transferId: defaultTransfer.id,
+      successorAttemptId,
+      roleProfileId,
+      sourceProviderId: providerAId,
+      tampered: true,
+    };
+    const mutatedRouteSpecHash = computeSha256(canonicalJsonStringify(mutatedRouteSpec));
+    const mutatedMetadata = {
+      handoff_route_spec_version: 1,
+      handoff_route_spec_hash: mutatedRouteSpecHash,
+      handoff_route_spec: mutatedRouteSpec,
+    };
+    db.prepare('UPDATE agent_assignments SET preferred_metadata_json = ? WHERE id = ?').run(
+      JSON.stringify(mutatedMetadata),
+      defaultAssignment.id
+    );
+
+    const leasesBefore = (db.prepare('SELECT COUNT(*) as count FROM account_leases').get() as { count: number }).count;
+    const schedRes = await scheduler.execute(authId);
+    expect(schedRes.status).toBe('PREPARATION_FAILED');
+    expect(schedRes.errorCode).toMatch(/AUTHORIZATION_CONTENT_MISMATCH|AUTHORIZATION_INVALID/);
+
+    const leasesAfter = (db.prepare('SELECT COUNT(*) as count FROM account_leases').get() as { count: number }).count;
+    expect(leasesAfter).toBe(leasesBefore);
+  });
+
+  it('83 (K). post-authorization coordinated route mutation fails first ACCEPT without mutating state', async () => {
+    const resumeRes = await handoffService.resumeHandoffSuccessor({ transferId: defaultTransfer.id });
+    const authId = resumeRes.authorization!.id;
+
+    // Mutate route spec and matching hash
+    const mutatedRouteSpec: Record<string, unknown> = {
+      transferId: defaultTransfer.id,
+      successorAttemptId,
+      roleProfileId,
+      sourceProviderId: providerAId,
+      tampered: true,
+    };
+    const mutatedRouteSpecHash = computeSha256(canonicalJsonStringify(mutatedRouteSpec));
+    const mutatedMetadata = {
+      handoff_route_spec_version: 1,
+      handoff_route_spec_hash: mutatedRouteSpecHash,
+      handoff_route_spec: mutatedRouteSpec,
+    };
+    db.prepare('UPDATE agent_assignments SET preferred_metadata_json = ? WHERE id = ?').run(
+      JSON.stringify(mutatedMetadata),
+      defaultAssignment.id
+    );
+
+    const leaseRes = leaseService.acquireForAssignment(defaultAssignment.id, 60000);
+    const acceptRes = repo.acceptHandoffSuccessorExecution({
+      authorizationId: authId,
+      leaseId: (leaseRes as any).lease.id,
+      leaseToken: (leaseRes as any).lease.lease_token,
+      expectedSuccessorEpoch: 2,
+    });
+
+    expect(acceptRes.success).toBe(false);
+    expect(acceptRes.errorCode).toBe('AUTHORIZATION_CONTENT_MISMATCH');
+
+    // Verify zero state transitions
+    const attempt = repo.getTaskAttempt(successorAttemptId)!;
+    expect(attempt.status).toBe('PENDING');
+    const asgn = repo.getAgentAssignment(defaultAssignment.id)!;
+    expect(asgn.status).toBe('ASSIGNED');
+    const transfer = repo.getHandoffTransfer(defaultTransfer.id)!;
+    expect(transfer.status).toBe('AUTHORIZED');
+  });
+
+  it('84 (L). post-authorization coordinated route mutation after ACCEPTED fails replay', async () => {
+    const resumeRes = await handoffService.resumeHandoffSuccessor({ transferId: defaultTransfer.id });
+    const authId = resumeRes.authorization!.id;
+
+    const leaseRes = leaseService.acquireForAssignment(defaultAssignment.id, 60000);
+    const acceptRes = repo.acceptHandoffSuccessorExecution({
+      authorizationId: authId,
+      leaseId: (leaseRes as any).lease.id,
+      leaseToken: (leaseRes as any).lease.lease_token,
+      expectedSuccessorEpoch: 2,
+    });
+    expect(acceptRes.success).toBe(true);
+
+    // Mutate route spec and matching hash after ACCEPTED
+    const mutatedRouteSpec: Record<string, unknown> = {
+      transferId: defaultTransfer.id,
+      successorAttemptId,
+      roleProfileId,
+      sourceProviderId: providerAId,
+      tampered: true,
+    };
+    const mutatedRouteSpecHash = computeSha256(canonicalJsonStringify(mutatedRouteSpec));
+    const mutatedMetadata = {
+      handoff_route_spec_version: 1,
+      handoff_route_spec_hash: mutatedRouteSpecHash,
+      handoff_route_spec: mutatedRouteSpec,
+    };
+    db.prepare('UPDATE agent_assignments SET preferred_metadata_json = ? WHERE id = ?').run(
+      JSON.stringify(mutatedMetadata),
+      defaultAssignment.id
+    );
+
+    const replayRes = repo.acceptHandoffSuccessorExecution({
+      authorizationId: authId,
+      leaseId: (leaseRes as any).lease.id,
+      leaseToken: (leaseRes as any).lease.lease_token,
+      expectedSuccessorEpoch: 2,
+    });
+
+    expect(replayRes.success).toBe(false);
+    expect(replayRes.errorCode).toBe('AUTHORIZATION_CONTENT_MISMATCH');
+  });
+
+  it('85 (M). post-authorization coordinated route mutation before ProviderDispatch claim fails without DISPATCHED status', async () => {
+    const resumeRes = await handoffService.resumeHandoffSuccessor({ transferId: defaultTransfer.id });
+    const authId = resumeRes.authorization!.id;
+
+    const leaseRes = leaseService.acquireForAssignment(defaultAssignment.id, 60000);
+    const acceptRes = repo.acceptHandoffSuccessorExecution({
+      authorizationId: authId,
+      leaseId: (leaseRes as any).lease.id,
+      leaseToken: (leaseRes as any).lease.lease_token,
+      expectedSuccessorEpoch: 2,
+    });
+    expect(acceptRes.success).toBe(true);
+
+    // Mutate route spec and matching hash
+    const mutatedRouteSpec: Record<string, unknown> = {
+      transferId: defaultTransfer.id,
+      successorAttemptId,
+      roleProfileId,
+      sourceProviderId: providerAId,
+      tampered: true,
+    };
+    const mutatedRouteSpecHash = computeSha256(canonicalJsonStringify(mutatedRouteSpec));
+    const mutatedMetadata = {
+      handoff_route_spec_version: 1,
+      handoff_route_spec_hash: mutatedRouteSpecHash,
+      handoff_route_spec: mutatedRouteSpec,
+    };
+    db.prepare('UPDATE agent_assignments SET preferred_metadata_json = ? WHERE id = ?').run(
+      JSON.stringify(mutatedMetadata),
+      defaultAssignment.id
+    );
+
+    const dispatchRes = await dispatchService.dispatchScheduled(authId);
+    expect(dispatchRes.status).toBe('FAILED');
+
+    const auth = repo.getExecutionAuthorization(authId)!;
+    expect(auth.status).not.toBe('DISPATCHED');
+  });
+
+  it('86 (N). mutating successor_context_spec_hash after authorization fails central validator', async () => {
+    const resumeRes = await handoffService.resumeHandoffSuccessor({ transferId: defaultTransfer.id });
+    const authId = resumeRes.authorization!.id;
+
+    db.prepare("UPDATE handoff_transfers SET successor_context_spec_hash = 'tampered-spec-hash' WHERE id = ?").run(
+      defaultTransfer.id
+    );
+
+    const validation = repo.validateHandoffSuccessorExecutionAuthority(authId);
+    expect(validation.valid).toBe(false);
+    expect(validation.errorCode).toMatch(/CONTEXT_SNAPSHOT_MISMATCH|AUTHORIZATION_CONTENT_MISMATCH/);
+  });
+
+  it('87 (O). paired mutated context spec hash + replacement deterministic context pointers fails because auth.id is bound to original context spec hash', async () => {
+    const resumeRes = await handoffService.resumeHandoffSuccessor({ transferId: defaultTransfer.id });
+    const authId = resumeRes.authorization!.id;
+
+    // Create a new valid context snapshot for a replacement spec hash
+    const replacementSpecHash = computeSha256('replacement-context-spec');
+    const replacementSnapId = `ctx-snap-ho-${computeSha256(`r5i-successor-context:${defaultTransfer.id}:${replacementSpecHash}`).slice(0, 32)}`;
+    const replacementManId = `ctx-man-ho-${computeSha256(`r5i-successor-manifest:${defaultTransfer.id}:${replacementSpecHash}`).slice(0, 32)}`;
+
+    contextBuilder.buildContextSnapshot({
+      projectId,
+      taskId,
+      attemptId: successorAttemptId,
+      purpose: 'HANDOFF',
+      snapshotId: replacementSnapId,
+      manifestId: replacementManId,
+      contextFiles: ['src_file.ts'],
+      customItems: [],
+    });
+
+    // Update transfer with paired replacement spec hash and replacement snapshot ID
+    db.prepare('UPDATE handoff_transfers SET successor_context_spec_hash = ?, successor_context_snapshot_id = ? WHERE id = ?').run(
+      replacementSpecHash,
+      replacementSnapId,
+      defaultTransfer.id
+    );
+
+    const validation = repo.validateHandoffSuccessorExecutionAuthority(authId);
+    expect(validation.valid).toBe(false);
+    expect(validation.errorCode).toBe('AUTHORIZATION_CONTENT_MISMATCH');
   });
 });

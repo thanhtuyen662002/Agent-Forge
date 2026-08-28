@@ -3859,8 +3859,47 @@ export class Repository {
       };
     }
 
-    const manifest = this.getContextManifestBySnapshotId(transfer.successor_context_snapshot_id!);
-    if (!manifest || manifest.snapshot_id !== transfer.successor_context_snapshot_id) {
+    // R5I3 Deterministic Context Authority Validation
+    const specHash = transfer.successor_context_spec_hash;
+    if (!specHash || typeof specHash !== 'string' || specHash.trim().length === 0) {
+      return {
+        valid: false,
+        auth,
+        transfer,
+        task,
+        attempt,
+        assignment,
+        roleProfile,
+        agentProfile,
+        routingEvent,
+        routingPayload,
+        errorCode: 'CONTEXT_SPEC_HASH_MISMATCH',
+        error: `Successor transfer "${transfer.id}" has missing or invalid successor_context_spec_hash.`,
+      };
+    }
+
+    const expectedSnapshotId = `ctx-snap-ho-${computeSha256(`r5i-successor-context:${transfer.id}:${specHash}`).slice(0, 32)}`;
+    const expectedManifestId = `ctx-man-ho-${computeSha256(`r5i-successor-manifest:${transfer.id}:${specHash}`).slice(0, 32)}`;
+
+    if (transfer.successor_context_snapshot_id !== expectedSnapshotId) {
+      return {
+        valid: false,
+        auth,
+        transfer,
+        task,
+        attempt,
+        assignment,
+        roleProfile,
+        agentProfile,
+        routingEvent,
+        routingPayload,
+        errorCode: 'CONTEXT_SNAPSHOT_MISMATCH',
+        error: `Successor context snapshot ID "${transfer.successor_context_snapshot_id}" does not match R5I3 deterministic derivation "${expectedSnapshotId}".`,
+      };
+    }
+
+    const manifest = this.getContextManifestBySnapshotId(transfer.successor_context_snapshot_id);
+    if (!manifest || manifest.id !== expectedManifestId || manifest.snapshot_id !== expectedSnapshotId) {
       return {
         valid: false,
         auth,
@@ -3873,7 +3912,7 @@ export class Repository {
         routingEvent,
         routingPayload,
         errorCode: 'CONTEXT_MANIFEST_NOT_FOUND',
-        error: `ContextManifest for snapshot "${transfer.successor_context_snapshot_id}" not found.`,
+        error: `ContextManifest for snapshot "${transfer.successor_context_snapshot_id}" not found or ID mismatch (expected "${expectedManifestId}").`,
       };
     }
 
@@ -3897,6 +3936,7 @@ export class Repository {
     }
 
     if (
+      integrityResult.snapshot.id !== expectedSnapshotId ||
       integrityResult.snapshot.task_id !== task.id ||
       integrityResult.snapshot.attempt_id !== attempt.id ||
       integrityResult.snapshot.purpose !== 'HANDOFF'
@@ -3919,14 +3959,22 @@ export class Repository {
       };
     }
 
-    const recomputedContextSpecHash = computeSha256(
-      canonicalJsonStringify({
-        snapshotId: manifest.snapshot_id,
-        manifestId: manifest.id,
-        manifestHash: manifest.manifest_hash,
-      })
-    );
-    if (recomputedContextSpecHash !== transfer.successor_context_spec_hash) {
+    // Central Validator Deterministic Authorization ID Fence (Defect B)
+    const currentAuthority: HandoffSuccessorExecutionAuthorityV1 = {
+      version: 1,
+      transfer_id: transfer.id,
+      successor_attempt_id: transfer.successor_attempt_id!,
+      successor_assignment_id: transfer.successor_assignment_id,
+      successor_ownership_epoch: transfer.successor_ownership_epoch,
+      routing_decision_id: assignment.routing_decision_id,
+      handoff_route_spec_hash: meta.handoff_route_spec_hash as string,
+      successor_context_spec_hash: specHash,
+      manager_message_id: auth.manager_message_id,
+      manager_payload_hash: auth.manager_payload_hash,
+    };
+
+    const recomputedAuthId = computeHandoffAuthorizationId(currentAuthority);
+    if (recomputedAuthId !== auth.id) {
       return {
         valid: false,
         auth,
@@ -3940,8 +3988,8 @@ export class Repository {
         routingPayload,
         manifest,
         integrityResult,
-        errorCode: 'CONTEXT_SPEC_HASH_MISMATCH',
-        error: `Context spec hash mismatch between transfer authority and recomputed hash.`,
+        errorCode: 'AUTHORIZATION_CONTENT_MISMATCH',
+        error: `Deterministic authorization ID mismatch between stored authorization ("${auth.id}") and current verified authority ("${recomputedAuthId}").`,
       };
     }
 
@@ -4379,13 +4427,35 @@ export class Repository {
       }
 
       // R5I3 Context Manifest and Snapshot Integrity
+      const specHash = transfer.successor_context_spec_hash;
+      if (!specHash || typeof specHash !== 'string' || specHash.trim().length === 0) {
+        return {
+          success: false,
+          transfer,
+          errorCode: 'CONTEXT_MANIFEST_INTEGRITY_FAILED',
+          error: `Successor transfer "${transfer.id}" has missing or invalid successor_context_spec_hash in Phase EB.`,
+        };
+      }
+
+      const expectedSnapshotId = `ctx-snap-ho-${computeSha256(`r5i-successor-context:${transfer.id}:${specHash}`).slice(0, 32)}`;
+      const expectedManifestId = `ctx-man-ho-${computeSha256(`r5i-successor-manifest:${transfer.id}:${specHash}`).slice(0, 32)}`;
+
+      if (transfer.successor_context_snapshot_id !== expectedSnapshotId) {
+        return {
+          success: false,
+          transfer,
+          errorCode: 'CONTEXT_MANIFEST_INTEGRITY_FAILED',
+          error: `Successor context snapshot ID "${transfer.successor_context_snapshot_id}" does not match R5I3 deterministic derivation "${expectedSnapshotId}" in Phase EB.`,
+        };
+      }
+
       const manifest = this.getContextManifestBySnapshotId(transfer.successor_context_snapshot_id);
-      if (!manifest || manifest.snapshot_id !== transfer.successor_context_snapshot_id) {
+      if (!manifest || manifest.id !== expectedManifestId || manifest.snapshot_id !== expectedSnapshotId) {
         return {
           success: false,
           transfer,
           errorCode: 'CONTEXT_MANIFEST_NOT_FOUND',
-          error: `ContextManifest for snapshot "${transfer.successor_context_snapshot_id}" not found.`,
+          error: `ContextManifest for snapshot "${transfer.successor_context_snapshot_id}" not found or ID mismatch in Phase EB (expected "${expectedManifestId}").`,
         };
       }
 
@@ -4400,6 +4470,7 @@ export class Repository {
       }
 
       if (
+        integrityResult.snapshot.id !== expectedSnapshotId ||
         integrityResult.snapshot.task_id !== task.id ||
         integrityResult.snapshot.attempt_id !== attempt.id ||
         integrityResult.snapshot.purpose !== 'HANDOFF'
@@ -4409,22 +4480,6 @@ export class Repository {
           transfer,
           errorCode: 'CONTEXT_MANIFEST_INTEGRITY_FAILED',
           error: `Context snapshot bindings mismatch in Phase EB.`,
-        };
-      }
-
-      const recomputedContextSpecHash = computeSha256(
-        canonicalJsonStringify({
-          snapshotId: manifest.snapshot_id,
-          manifestId: manifest.id,
-          manifestHash: manifest.manifest_hash,
-        })
-      );
-      if (recomputedContextSpecHash !== transfer.successor_context_spec_hash) {
-        return {
-          success: false,
-          transfer,
-          errorCode: 'CONTEXT_MANIFEST_INTEGRITY_FAILED',
-          error: `Context spec hash mismatch in Phase EB.`,
         };
       }
 
