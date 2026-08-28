@@ -32,7 +32,7 @@ describe('R5I1 Durable Handoff Ownership and Execution Authority Primitives', ()
       MigrationRunner.run(db);
 
       const rows = db.prepare('SELECT version FROM schema_migrations ORDER BY version ASC').all() as { version: number }[];
-      expect(rows.map((r) => r.version)).toEqual([1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17]);
+      expect(rows.map((r) => r.version)).toEqual(MIGRATIONS.map((m) => m.version));
 
       // 27. foreign_key_check is zero
       const fkCheck = db.pragma('foreign_key_check') as unknown[];
@@ -757,6 +757,8 @@ describe('R5I1 Durable Handoff Ownership and Execution Authority Primitives', ()
         successor_assignment_id: null,
         successor_role_profile_id: null,
         successor_agent_profile_id: null,
+        successor_context_snapshot_id: null,
+        successor_context_spec_hash: null,
         handoff_context_id: null, // Nullable context!
         checkpoint_id: null,
         source_authorization_id: null,
@@ -794,6 +796,8 @@ describe('R5I1 Durable Handoff Ownership and Execution Authority Primitives', ()
         successor_assignment_id: null,
         successor_role_profile_id: null,
         successor_agent_profile_id: null,
+        successor_context_snapshot_id: null,
+        successor_context_spec_hash: null,
         handoff_context_id: null,
         checkpoint_id: null,
         source_authorization_id: null,
@@ -836,6 +840,8 @@ describe('R5I1 Durable Handoff Ownership and Execution Authority Primitives', ()
         successor_assignment_id: null,
         successor_role_profile_id: null,
         successor_agent_profile_id: null,
+        successor_context_snapshot_id: null,
+        successor_context_spec_hash: null,
         handoff_context_id: null,
         checkpoint_id: null,
         source_authorization_id: null,
@@ -898,6 +904,8 @@ describe('R5I1 Durable Handoff Ownership and Execution Authority Primitives', ()
         successor_assignment_id: null,
         successor_role_profile_id: null,
         successor_agent_profile_id: null,
+        successor_context_snapshot_id: null,
+        successor_context_spec_hash: null,
         handoff_context_id: null,
         checkpoint_id: null,
         source_authorization_id: null,
@@ -965,6 +973,8 @@ describe('R5I1 Durable Handoff Ownership and Execution Authority Primitives', ()
         successor_assignment_id: null,
         successor_role_profile_id: null,
         successor_agent_profile_id: null,
+        successor_context_snapshot_id: null,
+        successor_context_spec_hash: null,
         handoff_context_id: null,
         checkpoint_id: null,
         source_authorization_id: null,

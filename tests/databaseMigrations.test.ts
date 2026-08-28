@@ -83,6 +83,11 @@ describe('Database Migrations & Upgrade Integrity', () => {
     expect(accountColumns).toContain('last_applied_action_account_order');
     expect(accountColumns).toContain('last_applied_action_authorization_id');
 
+    // Verify Migration 18 columns on handoff_transfers
+    const transferColumns = (db.prepare("PRAGMA table_info(handoff_transfers)").all() as { name: string }[]).map((c) => c.name);
+    expect(transferColumns).toContain('successor_context_snapshot_id');
+    expect(transferColumns).toContain('successor_context_spec_hash');
+
     // Idempotency check: running MigrationRunner again applies 0 new migrations
     MigrationRunner.run(db);
     const appliedAgain = db.prepare('SELECT COUNT(*) as count FROM schema_migrations').get() as { count: number };

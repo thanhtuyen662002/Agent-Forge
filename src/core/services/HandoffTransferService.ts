@@ -11,7 +11,59 @@ import {
   ContextItem,
   ContextItemType,
 } from '../types/domain';
-import { ContextBuilderService } from './ContextBuilderService';
+import {
+  ContextBuilderService,
+  codeUnitCompare,
+  canonicalJsonStringify,
+  computeSha256,
+} from './ContextBuilderService';
+
+export function computeSuccessorContextSpecHash(spec: {
+  transferId: string;
+  successorAttemptId: string;
+  purpose: string;
+  handoffContextId: string | null;
+  checkpointId: string | null;
+  contextFiles: string[];
+  customItems: Array<{
+    itemType?: ContextItemType;
+    sourceType: string;
+    sourceRef?: string | null;
+    content: Record<string, unknown> | unknown[];
+    tokenEstimate?: number | null;
+  }>;
+}): string {
+  const sortedFiles = [...spec.contextFiles].sort(codeUnitCompare);
+  const sortedCustom = [...spec.customItems].sort((a, b) => {
+    const aType = a.itemType || 'CUSTOM';
+    const bType = b.itemType || 'CUSTOM';
+    const aHash = computeSha256(canonicalJsonStringify(a.content));
+    const bHash = computeSha256(canonicalJsonStringify(b.content));
+    const aTok = a.tokenEstimate !== null && a.tokenEstimate !== undefined ? String(a.tokenEstimate) : '';
+    const bTok = b.tokenEstimate !== null && b.tokenEstimate !== undefined ? String(b.tokenEstimate) : '';
+    const aKey = `${aType}\0${a.sourceType}\0${a.sourceRef || ''}\0${aHash}\0${aTok}`;
+    const bKey = `${bType}\0${b.sourceType}\0${b.sourceRef || ''}\0${bHash}\0${bTok}`;
+    return codeUnitCompare(aKey, bKey);
+  });
+
+  const canonicalDescriptor = {
+    transfer_id: spec.transferId,
+    successor_attempt_id: spec.successorAttemptId,
+    purpose: spec.purpose,
+    handoff_context_id: spec.handoffContextId,
+    checkpoint_id: spec.checkpointId,
+    context_files: sortedFiles,
+    custom_items: sortedCustom.map((c) => ({
+      item_type: c.itemType || 'CUSTOM',
+      source_type: c.sourceType,
+      source_ref: c.sourceRef ?? null,
+      content: c.content,
+      token_estimate: c.tokenEstimate ?? null,
+    })),
+  };
+
+  return computeSha256(canonicalJsonStringify(canonicalDescriptor));
+}
 
 export type PredecessorQuiescenceState =
   | 'NOT_STARTED'
@@ -150,7 +202,6 @@ export interface HandoffPrepareSuccessorParams {
   successorRoleProfileId: string;
   successorAgentProfileId: string;
   successorAttemptId?: string;
-  status?: string;
   preparedAt?: string;
   // Context snapshot options
   buildContext?: boolean;
@@ -174,6 +225,7 @@ export interface HandoffPrepareSuccessorResult {
   contextManifest?: ContextManifest;
   contextItems?: ContextItem[];
   alreadyPrepared?: boolean;
+  alreadyBound?: boolean;
   error?: string;
   errorCode?:
     | 'TRANSFER_NOT_FOUND'
@@ -192,6 +244,16 @@ export interface HandoffPrepareSuccessorResult {
     | 'HANDOFF_CONTEXT_NOT_FOUND'
     | 'CROSS_TASK_HANDOFF_CONTEXT_FORBIDDEN'
     | 'HANDOFF_CONTEXT_SOURCE_MISMATCH'
+    | 'BOUND_HANDOFF_CONTEXT_OVERRIDE_FORBIDDEN'
+    | 'UNBOUND_HANDOFF_CONTEXT_OVERRIDE'
+    | 'BOUND_CHECKPOINT_OVERRIDE_FORBIDDEN'
+    | 'UNBOUND_CHECKPOINT_OVERRIDE'
+    | 'SUCCESSOR_CONTEXT_SPEC_CONFLICT'
+    | 'SUCCESSOR_CONTEXT_AUTHORITY_INTEGRITY_MISMATCH'
+    | 'CONTEXT_SNAPSHOT_NOT_FOUND'
+    | 'CONTEXT_SNAPSHOT_INTEGRITY_MISMATCH'
+    | 'CONTEXT_MANIFEST_NOT_FOUND'
+    | 'SUCCESSOR_NOT_PREPARED'
     | 'CONTEXT_BUILD_FAILED'
     | 'INTERNAL_ERROR';
 }
@@ -329,6 +391,8 @@ export class HandoffTransferService {
       successor_assignment_id: null,
       successor_role_profile_id: null,
       successor_agent_profile_id: null,
+      successor_context_snapshot_id: null,
+      successor_context_spec_hash: null,
       handoff_context_id: null,
       checkpoint_id: null,
       source_authorization_id: null,
@@ -632,7 +696,7 @@ export class HandoffTransferService {
   }
 
   public prepareHandoffSuccessor(params: HandoffPrepareSuccessorParams): HandoffPrepareSuccessorResult {
-    // 1. Invoke atomic repository primitive
+    // 1. Invoke atomic repository primitive (creates Attempt N+1 and sets status to SUCCESSOR_PREPARED)
     const prepRes = this.repo.prepareHandoffSuccessor({
       transferId: params.transferId,
       expectedVersion: params.expectedVersion,
@@ -640,7 +704,6 @@ export class HandoffTransferService {
       successorRoleProfileId: params.successorRoleProfileId,
       successorAgentProfileId: params.successorAgentProfileId,
       successorAttemptId: params.successorAttemptId,
-      status: params.status,
       preparedAt: params.preparedAt,
     });
 
@@ -665,12 +728,54 @@ export class HandoffTransferService {
       };
     }
 
-    // 2. Successor Context Rebinding
-    const effectiveHandoffContextId =
-      params.handoffContextId !== undefined ? params.handoffContextId : transfer.handoff_context_id;
+    // 2. Caller override fencing (Section 13)
+    if (transfer.handoff_context_id !== null) {
+      if (params.handoffContextId !== undefined && params.handoffContextId !== transfer.handoff_context_id) {
+        return {
+          success: false,
+          transfer,
+          successorAttempt,
+          alreadyPrepared: prepRes.alreadyPrepared,
+          errorCode: 'BOUND_HANDOFF_CONTEXT_OVERRIDE_FORBIDDEN',
+          error: `BOUND_HANDOFF_CONTEXT_OVERRIDE_FORBIDDEN: Cannot override bound handoff_context_id "${transfer.handoff_context_id}" with "${params.handoffContextId}".`,
+        };
+      }
+    } else if (params.handoffContextId) {
+      return {
+        success: false,
+        transfer,
+        successorAttempt,
+        alreadyPrepared: prepRes.alreadyPrepared,
+        errorCode: 'UNBOUND_HANDOFF_CONTEXT_OVERRIDE',
+        error: `UNBOUND_HANDOFF_CONTEXT_OVERRIDE: Cannot inject unbound handoffContextId "${params.handoffContextId}" when transfer has no bound handoff_context_id.`,
+      };
+    }
 
-    if (effectiveHandoffContextId) {
-      const ho = this.repo.getHandoffContext(effectiveHandoffContextId);
+    if (transfer.checkpoint_id !== null) {
+      if (params.checkpointId !== undefined && params.checkpointId !== transfer.checkpoint_id) {
+        return {
+          success: false,
+          transfer,
+          successorAttempt,
+          alreadyPrepared: prepRes.alreadyPrepared,
+          errorCode: 'BOUND_CHECKPOINT_OVERRIDE_FORBIDDEN',
+          error: `BOUND_CHECKPOINT_OVERRIDE_FORBIDDEN: Cannot override bound checkpoint_id "${transfer.checkpoint_id}" with "${params.checkpointId}".`,
+        };
+      }
+    } else if (params.checkpointId) {
+      return {
+        success: false,
+        transfer,
+        successorAttempt,
+        alreadyPrepared: prepRes.alreadyPrepared,
+        errorCode: 'UNBOUND_CHECKPOINT_OVERRIDE',
+        error: `UNBOUND_CHECKPOINT_OVERRIDE: Cannot inject unbound checkpointId "${params.checkpointId}" when transfer has no bound checkpoint_id.`,
+      };
+    }
+
+    // 3. Bound HandoffContext validation
+    if (transfer.handoff_context_id) {
+      const ho = this.repo.getHandoffContext(transfer.handoff_context_id);
       if (!ho) {
         return {
           success: false,
@@ -678,7 +783,7 @@ export class HandoffTransferService {
           successorAttempt,
           alreadyPrepared: prepRes.alreadyPrepared,
           errorCode: 'HANDOFF_CONTEXT_NOT_FOUND',
-          error: `HandoffContext "${effectiveHandoffContextId}" not found.`,
+          error: `HandoffContext "${transfer.handoff_context_id}" not found.`,
         };
       }
       if (ho.task_id !== transfer.task_id) {
@@ -688,7 +793,7 @@ export class HandoffTransferService {
           successorAttempt,
           alreadyPrepared: prepRes.alreadyPrepared,
           errorCode: 'CROSS_TASK_HANDOFF_CONTEXT_FORBIDDEN',
-          error: `CROSS_TASK_HANDOFF_CONTEXT_FORBIDDEN: HandoffContext "${effectiveHandoffContextId}" belongs to task "${ho.task_id}", expected "${transfer.task_id}".`,
+          error: `CROSS_TASK_HANDOFF_CONTEXT_FORBIDDEN: HandoffContext "${transfer.handoff_context_id}" belongs to task "${ho.task_id}", expected "${transfer.task_id}".`,
         };
       }
       if (ho.attempt_id && ho.attempt_id !== transfer.source_attempt_id) {
@@ -698,54 +803,193 @@ export class HandoffTransferService {
           successorAttempt,
           alreadyPrepared: prepRes.alreadyPrepared,
           errorCode: 'HANDOFF_CONTEXT_SOURCE_MISMATCH',
-          error: `HANDOFF_CONTEXT_SOURCE_MISMATCH: HandoffContext "${effectiveHandoffContextId}" source attempt "${ho.attempt_id}" does not match transfer source attempt "${transfer.source_attempt_id}".`,
+          error: `HANDOFF_CONTEXT_SOURCE_MISMATCH: HandoffContext "${transfer.handoff_context_id}" source attempt "${ho.attempt_id}" does not match transfer source attempt "${transfer.source_attempt_id}".`,
         };
       }
     }
 
-    const task = this.repo.getTask(transfer.task_id);
-    if (!task) {
-      return {
-        success: false,
-        transfer,
-        successorAttempt,
-        alreadyPrepared: prepRes.alreadyPrepared,
-        errorCode: 'TASK_NOT_FOUND',
-        error: `Task "${transfer.task_id}" not found.`,
-      };
-    }
+    // 4. Compute canonical spec hash
+    const specHash = computeSuccessorContextSpecHash({
+      transferId: transfer.id,
+      successorAttemptId: successorAttempt.id,
+      purpose: 'HANDOFF',
+      handoffContextId: transfer.handoff_context_id,
+      checkpointId: transfer.checkpoint_id,
+      contextFiles: params.contextFiles ?? [],
+      customItems: params.customItems ?? [],
+    });
 
-    try {
-      const ctxResult = this.contextBuilder.buildContextSnapshot({
-        projectId: task.project_id,
-        taskId: transfer.task_id,
-        attemptId: successorAttempt.id,
-        purpose: 'HANDOFF',
-        handoffId: effectiveHandoffContextId,
-        checkpointId: params.checkpointId !== undefined ? params.checkpointId : (transfer.checkpoint_id ?? null),
-        contextFiles: params.contextFiles,
-        customItems: params.customItems,
-      });
+    // 5. Exact Context Replay Check (Section 10 & 11)
+    if (transfer.successor_context_snapshot_id !== null) {
+      const existingSnap = this.repo.getContextSnapshot(transfer.successor_context_snapshot_id);
+      if (!existingSnap) {
+        return {
+          success: false,
+          transfer,
+          successorAttempt,
+          alreadyPrepared: prepRes.alreadyPrepared,
+          errorCode: 'SUCCESSOR_CONTEXT_AUTHORITY_INTEGRITY_MISMATCH',
+          error: `SUCCESSOR_CONTEXT_AUTHORITY_INTEGRITY_MISMATCH: Bound snapshot "${transfer.successor_context_snapshot_id}" not found in database.`,
+        };
+      }
+
+      if (
+        existingSnap.task_id !== transfer.task_id ||
+        existingSnap.attempt_id !== successorAttempt.id ||
+        existingSnap.purpose !== 'HANDOFF'
+      ) {
+        return {
+          success: false,
+          transfer,
+          successorAttempt,
+          alreadyPrepared: prepRes.alreadyPrepared,
+          errorCode: 'SUCCESSOR_CONTEXT_AUTHORITY_INTEGRITY_MISMATCH',
+          error: `SUCCESSOR_CONTEXT_AUTHORITY_INTEGRITY_MISMATCH: Bound snapshot "${existingSnap.id}" integrity mismatch.`,
+        };
+      }
+
+      const existingMan = this.repo.getContextManifestBySnapshotId(existingSnap.id);
+      if (!existingMan) {
+        return {
+          success: false,
+          transfer,
+          successorAttempt,
+          alreadyPrepared: prepRes.alreadyPrepared,
+          errorCode: 'SUCCESSOR_CONTEXT_AUTHORITY_INTEGRITY_MISMATCH',
+          error: `SUCCESSOR_CONTEXT_AUTHORITY_INTEGRITY_MISMATCH: Manifest for snapshot "${existingSnap.id}" not found.`,
+        };
+      }
+
+      if (transfer.successor_context_spec_hash !== specHash) {
+        return {
+          success: false,
+          transfer,
+          successorAttempt,
+          alreadyPrepared: prepRes.alreadyPrepared,
+          errorCode: 'SUCCESSOR_CONTEXT_SPEC_CONFLICT',
+          error: `SUCCESSOR_CONTEXT_SPEC_CONFLICT: Persisted spec hash "${transfer.successor_context_spec_hash}" does not match requested spec hash "${specHash}".`,
+        };
+      }
 
       return {
         success: true,
         transfer,
         successorAttempt,
-        contextSnapshot: ctxResult.snapshot,
-        contextManifest: ctxResult.manifest,
-        contextItems: ctxResult.items,
-        alreadyPrepared: prepRes.alreadyPrepared,
+        contextSnapshot: existingSnap,
+        contextManifest: existingMan,
+        contextItems: this.repo.getContextItemsBySnapshot(existingSnap.id),
+        alreadyPrepared: true,
+        alreadyBound: true,
       };
-    } catch (err) {
+    }
+
+    // 6. Derive deterministic artifact IDs & recover if snapshot already persisted
+    const deterministicSnapshotId = `ctx-snap-ho-${computeSha256(`r5i-successor-context:${transfer.id}:${specHash}`).slice(0, 32)}`;
+    const deterministicManifestId = `ctx-man-ho-${computeSha256(`r5i-successor-manifest:${transfer.id}:${specHash}`).slice(0, 32)}`;
+
+    let candidateSnapshot = this.repo.getContextSnapshot(deterministicSnapshotId);
+    let candidateManifest = candidateSnapshot ? this.repo.getContextManifestBySnapshotId(candidateSnapshot.id) : null;
+    let candidateItems = candidateSnapshot ? this.repo.getContextItemsBySnapshot(candidateSnapshot.id) : [];
+
+    if (candidateSnapshot) {
+      if (
+        candidateSnapshot.task_id !== transfer.task_id ||
+        candidateSnapshot.attempt_id !== successorAttempt.id ||
+        candidateSnapshot.purpose !== 'HANDOFF'
+      ) {
+        return {
+          success: false,
+          transfer,
+          successorAttempt,
+          alreadyPrepared: prepRes.alreadyPrepared,
+          errorCode: 'SUCCESSOR_CONTEXT_AUTHORITY_INTEGRITY_MISMATCH',
+          error: `SUCCESSOR_CONTEXT_AUTHORITY_INTEGRITY_MISMATCH: Pre-existing candidate snapshot "${candidateSnapshot.id}" integrity mismatch.`,
+        };
+      }
+      if (!candidateManifest) {
+        return {
+          success: false,
+          transfer,
+          successorAttempt,
+          alreadyPrepared: prepRes.alreadyPrepared,
+          errorCode: 'SUCCESSOR_CONTEXT_AUTHORITY_INTEGRITY_MISMATCH',
+          error: `SUCCESSOR_CONTEXT_AUTHORITY_INTEGRITY_MISMATCH: Pre-existing candidate snapshot "${candidateSnapshot.id}" missing manifest.`,
+        };
+      }
+    } else {
+      const task = this.repo.getTask(transfer.task_id);
+      if (!task) {
+        return {
+          success: false,
+          transfer,
+          successorAttempt,
+          alreadyPrepared: prepRes.alreadyPrepared,
+          errorCode: 'TASK_NOT_FOUND',
+          error: `Task "${transfer.task_id}" not found.`,
+        };
+      }
+
+      try {
+        const ctxResult = this.contextBuilder.buildContextSnapshot({
+          projectId: task.project_id,
+          taskId: transfer.task_id,
+          attemptId: successorAttempt.id,
+          purpose: 'HANDOFF',
+          includeLatestHandoff: false,
+          includeLatestCheckpoint: false,
+          handoffId: transfer.handoff_context_id,
+          checkpointId: transfer.checkpoint_id,
+          contextFiles: params.contextFiles,
+          customItems: params.customItems,
+          snapshotId: deterministicSnapshotId,
+          manifestId: deterministicManifestId,
+        });
+
+        candidateSnapshot = ctxResult.snapshot;
+        candidateManifest = ctxResult.manifest;
+        candidateItems = ctxResult.items;
+      } catch (err) {
+        return {
+          success: false,
+          transfer,
+          successorAttempt,
+          alreadyPrepared: prepRes.alreadyPrepared,
+          errorCode: 'CONTEXT_BUILD_FAILED',
+          error: `[ContextBuildFailed] ${err instanceof Error ? err.message : String(err)}`,
+        };
+      }
+    }
+
+    // 7. Atomic CAS Pointer Bind
+    const bindRes = this.repo.bindHandoffSuccessorContext({
+      transferId: transfer.id,
+      expectedVersion: transfer.version,
+      successorContextSnapshotId: candidateSnapshot.id,
+      successorContextSpecHash: specHash,
+      boundAt: params.preparedAt,
+    });
+
+    if (!bindRes.success) {
       return {
         success: false,
         transfer,
         successorAttempt,
         alreadyPrepared: prepRes.alreadyPrepared,
-        errorCode: 'CONTEXT_BUILD_FAILED',
-        error: `[ContextBuildFailed] ${err instanceof Error ? err.message : String(err)}`,
+        errorCode: bindRes.errorCode as any,
+        error: bindRes.error,
       };
     }
+
+    return {
+      success: true,
+      transfer: bindRes.transfer!,
+      successorAttempt,
+      contextSnapshot: candidateSnapshot,
+      contextManifest: candidateManifest!,
+      contextItems: candidateItems,
+      alreadyPrepared: prepRes.alreadyPrepared,
+      alreadyBound: bindRes.alreadyBound,
+    };
   }
 
   public cancelHandoff(params: HandoffCancelParams): HandoffCancelResult {
