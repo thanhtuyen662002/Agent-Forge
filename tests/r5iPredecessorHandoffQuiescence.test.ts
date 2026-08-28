@@ -863,11 +863,12 @@ describe('R5I2 Predecessor Handoff Freeze, Quiescence, and Relinquishment', () =
       service.freezeHandoff({ transferId, expectedVersion: 1 });
       service.beginQuiescence({ transferId, expectedVersion: 2 });
 
-      // Attempt relinquishment
+      // Attempt relinquishment with expected lease token
       const relRes = service.relinquishPredecessorOwnership({
         transferId,
         expectedVersion: 3,
         expectedSourceEpoch: 1,
+        expectedTaskLeaseToken: 'lease-token-1',
       });
 
       // 17. Must fail with PREDECESSOR_EXECUTION_UNRESOLVED
@@ -925,11 +926,12 @@ describe('R5I2 Predecessor Handoff Freeze, Quiescence, and Relinquishment', () =
       service.freezeHandoff({ transferId, expectedVersion: 1 });
       service.beginQuiescence({ transferId, expectedVersion: 2 });
 
-      // Relinquish
+      // Relinquish with valid lease token
       const relRes = service.relinquishPredecessorOwnership({
         transferId,
         expectedVersion: 3,
         expectedSourceEpoch: 1,
+        expectedTaskLeaseToken: 'lease-token-1',
       });
 
       expect(relRes.success).toBe(true);
@@ -984,7 +986,7 @@ describe('R5I2 Predecessor Handoff Freeze, Quiescence, and Relinquishment', () =
       expect(relRes1.success).toBe(true);
       expect(relRes1.newEpoch).toBe(2);
 
-      // 27. Replay exact same relinquishment
+      // 27. Replay exact same relinquishment (expectedVersion 3 matches pre-relinquishment version 3)
       const relRes2 = service.relinquishPredecessorOwnership({
         transferId,
         expectedVersion: 3,
@@ -997,6 +999,534 @@ describe('R5I2 Predecessor Handoff Freeze, Quiescence, and Relinquishment', () =
       // 28. Does NOT bump epoch a second time
       expect(relRes2.newEpoch).toBe(2);
       expect(repo.getTaskOwnershipEpoch('task-1')).toBe(2);
+    });
+
+    // -----------------------------------------------------------------------
+    // Section 10: Adversarial Assignment Drift & Authority Validation Tests
+    // -----------------------------------------------------------------------
+    it('28a. source assignment becomes COMPLETED before relinquishment -> fails closed with SOURCE_ASSIGNMENT_STATE_CONFLICT', () => {
+      seedBaseEntities({ taskId: 'task-1', attemptId: 'att-1', assignmentId: 'asgn-1', ownershipEpoch: 1 });
+      repo.acquireTaskLease('task-1', 'prof-1', 'lease-token-1');
+
+      const reqRes = service.requestHandoff({
+        requestId: 'req-1',
+        taskId: 'task-1',
+        sourceAttemptId: 'att-1',
+        sourceAssignmentId: 'asgn-1',
+        reason: 'Assignment drift test',
+        expectedSourceEpoch: 1,
+      });
+      const transferId = reqRes.transfer!.id;
+
+      service.freezeHandoff({ transferId, expectedVersion: 1 });
+      service.beginQuiescence({ transferId, expectedVersion: 2 });
+
+      // Mutate assignment to COMPLETED before relinquishment occurs
+      db.prepare("UPDATE agent_assignments SET status = 'COMPLETED' WHERE id = 'asgn-1'").run();
+
+      const relRes = service.relinquishPredecessorOwnership({
+        transferId,
+        expectedVersion: 3,
+        expectedSourceEpoch: 1,
+        expectedTaskLeaseToken: 'lease-token-1',
+      });
+
+      expect(relRes.success).toBe(false);
+      expect(relRes.errorCode).toBe('SOURCE_ASSIGNMENT_STATE_CONFLICT');
+
+      // Assert fail-closed state
+      expect(repo.getTaskOwnershipEpoch('task-1')).toBe(1);
+      const asgn = repo.getAgentAssignment('asgn-1');
+      expect(asgn?.status).toBe('COMPLETED');
+      const lease = repo.getTaskLease('task-1');
+      expect(lease?.released_at).toBeNull();
+      const transfer = repo.getHandoffTransfer(transferId);
+      expect(transfer?.status).toBe('QUIESCING');
+      expect(transfer?.relinquished_at).toBeNull();
+      expect(transfer?.version).toBe(3);
+    });
+
+    it('28b. source assignment becomes FAILED, CANCELLED, or HANDED_OFF before relinquishment -> fails closed', () => {
+      seedBaseEntities({ taskId: 'task-1', attemptId: 'att-1', assignmentId: 'asgn-1', ownershipEpoch: 1 });
+
+      for (const terminalStatus of ['FAILED', 'CANCELLED', 'HANDED_OFF']) {
+        const taskId = `task-${terminalStatus.toLowerCase()}`;
+        const attId = `att-${terminalStatus.toLowerCase()}`;
+        const asgnId = `asgn-${terminalStatus.toLowerCase()}`;
+        const reqId = `req-${terminalStatus.toLowerCase()}`;
+
+        repo.createTask({
+          id: taskId,
+          project_id: 'proj-1',
+          milestone_id: null,
+          title: `Task ${terminalStatus}`,
+          description: null,
+          state: 'CODING',
+          paused_from_state: null,
+          priority: 'MEDIUM',
+          risk: 'LOW',
+          assigned_agent_id: null,
+          revision_count: 0,
+          max_revisions: 5,
+          base_sha: null,
+          current_sha: null,
+          progress_cache_percent: 0.0,
+          progress_computed_at: null,
+          acceptance_criteria: [],
+          constraints: [],
+          ownership_epoch: 1,
+          created_at: '2026-08-28T00:00:00Z',
+          updated_at: '2026-08-28T00:00:00Z',
+        });
+
+        repo.createTaskAttempt({
+          id: attId,
+          task_id: taskId,
+          attempt_number: 1,
+          agent_id: null,
+          agent_profile_id: 'prof-1',
+          status: 'RUNNING',
+          started_at: '2026-08-28T00:00:00Z',
+          ended_at: null,
+          summary: 'Summary',
+        });
+
+        repo.createAgentAssignment({
+          id: asgnId,
+          project_id: 'proj-1',
+          task_id: taskId,
+          attempt_id: attId,
+          role_profile_id: 'rp-coder',
+          agent_profile_id: 'prof-1',
+          selected_provider_id: 'prov-1',
+          selected_account_id: 'acc-1',
+          selected_resource_id: 'res-1',
+          selected_worker_slot_id: null,
+          routing_decision_id: null,
+          preferred_metadata: {},
+          status: 'ASSIGNED',
+          created_at: '2026-08-28T00:00:00Z',
+          ended_at: null,
+        });
+
+        const reqRes = service.requestHandoff({
+          requestId: reqId,
+          taskId,
+          sourceAttemptId: attId,
+          sourceAssignmentId: asgnId,
+          reason: `Terminal status ${terminalStatus} test`,
+          expectedSourceEpoch: 1,
+        });
+        const transferId = reqRes.transfer!.id;
+
+        service.freezeHandoff({ transferId, expectedVersion: 1 });
+        service.beginQuiescence({ transferId, expectedVersion: 2 });
+
+        // Mutate status to terminal
+        db.prepare(`UPDATE agent_assignments SET status = '${terminalStatus}' WHERE id = ?`).run(asgnId);
+
+        const relRes = service.relinquishPredecessorOwnership({
+          transferId,
+          expectedVersion: 3,
+          expectedSourceEpoch: 1,
+        });
+
+        expect(relRes.success).toBe(false);
+        expect(relRes.errorCode).toBe('SOURCE_ASSIGNMENT_STATE_CONFLICT');
+      }
+    });
+
+    it('28c. source assignment task_id binding mismatch fails closed with SOURCE_ASSIGNMENT_BINDING_MISMATCH', () => {
+      seedBaseEntities({ taskId: 'task-1', attemptId: 'att-1', assignmentId: 'asgn-1', ownershipEpoch: 1 });
+
+      // Create a second task
+      repo.createTask({
+        id: 'task-mismatch',
+        project_id: 'proj-1',
+        milestone_id: null,
+        title: 'Task Mismatch',
+        description: null,
+        state: 'CODING',
+        paused_from_state: null,
+        priority: 'MEDIUM',
+        risk: 'LOW',
+        assigned_agent_id: null,
+        revision_count: 0,
+        max_revisions: 5,
+        base_sha: null,
+        current_sha: null,
+        progress_cache_percent: 0.0,
+        progress_computed_at: null,
+        acceptance_criteria: [],
+        constraints: [],
+        ownership_epoch: 1,
+        created_at: '2026-08-28T00:00:00Z',
+        updated_at: '2026-08-28T00:00:00Z',
+      });
+
+      const reqRes = service.requestHandoff({
+        requestId: 'req-1',
+        taskId: 'task-1',
+        sourceAttemptId: 'att-1',
+        sourceAssignmentId: 'asgn-1',
+        reason: 'Mismatch test',
+        expectedSourceEpoch: 1,
+      });
+      const transferId = reqRes.transfer!.id;
+
+      service.freezeHandoff({ transferId, expectedVersion: 1 });
+      service.beginQuiescence({ transferId, expectedVersion: 2 });
+
+      // Adversarially point assignment to task-mismatch
+      db.prepare("UPDATE agent_assignments SET task_id = 'task-mismatch' WHERE id = 'asgn-1'").run();
+
+      const relRes = service.relinquishPredecessorOwnership({
+        transferId,
+        expectedVersion: 3,
+        expectedSourceEpoch: 1,
+      });
+
+      expect(relRes.success).toBe(false);
+      expect(relRes.errorCode).toBe('SOURCE_ASSIGNMENT_BINDING_MISMATCH');
+      expect(repo.getTaskOwnershipEpoch('task-1')).toBe(1);
+    });
+
+    it('28d. source assignment attempt_id binding mismatch fails closed with SOURCE_ASSIGNMENT_BINDING_MISMATCH', () => {
+      seedBaseEntities({ taskId: 'task-1', attemptId: 'att-1', assignmentId: 'asgn-1', ownershipEpoch: 1 });
+
+      repo.createTaskAttempt({
+        id: 'att-other',
+        task_id: 'task-1',
+        attempt_number: 2,
+        agent_id: null,
+        agent_profile_id: 'prof-1',
+        status: 'RUNNING',
+        started_at: '2026-08-28T00:00:00Z',
+        ended_at: null,
+        summary: 'Other attempt',
+      });
+
+      const reqRes = service.requestHandoff({
+        requestId: 'req-1',
+        taskId: 'task-1',
+        sourceAttemptId: 'att-1',
+        sourceAssignmentId: 'asgn-1',
+        reason: 'Attempt mismatch test',
+        expectedSourceEpoch: 1,
+      });
+      const transferId = reqRes.transfer!.id;
+
+      service.freezeHandoff({ transferId, expectedVersion: 1 });
+      service.beginQuiescence({ transferId, expectedVersion: 2 });
+
+      // Point assignment to att-other
+      db.prepare("UPDATE agent_assignments SET attempt_id = 'att-other' WHERE id = 'asgn-1'").run();
+
+      const relRes = service.relinquishPredecessorOwnership({
+        transferId,
+        expectedVersion: 3,
+        expectedSourceEpoch: 1,
+      });
+
+      expect(relRes.success).toBe(false);
+      expect(relRes.errorCode).toBe('SOURCE_ASSIGNMENT_BINDING_MISMATCH');
+    });
+
+    it('28e. source attempt task_id binding mismatch fails closed with SOURCE_ATTEMPT_BINDING_MISMATCH', () => {
+      seedBaseEntities({ taskId: 'task-1', attemptId: 'att-1', assignmentId: 'asgn-1', ownershipEpoch: 1 });
+
+      repo.createTask({
+        id: 'task-other-2',
+        project_id: 'proj-1',
+        milestone_id: null,
+        title: 'Task Other 2',
+        description: null,
+        state: 'CODING',
+        paused_from_state: null,
+        priority: 'MEDIUM',
+        risk: 'LOW',
+        assigned_agent_id: null,
+        revision_count: 0,
+        max_revisions: 5,
+        base_sha: null,
+        current_sha: null,
+        progress_cache_percent: 0.0,
+        progress_computed_at: null,
+        acceptance_criteria: [],
+        constraints: [],
+        ownership_epoch: 1,
+        created_at: '2026-08-28T00:00:00Z',
+        updated_at: '2026-08-28T00:00:00Z',
+      });
+
+      const reqRes = service.requestHandoff({
+        requestId: 'req-1',
+        taskId: 'task-1',
+        sourceAttemptId: 'att-1',
+        sourceAssignmentId: 'asgn-1',
+        reason: 'Attempt task mismatch',
+        expectedSourceEpoch: 1,
+      });
+      const transferId = reqRes.transfer!.id;
+
+      service.freezeHandoff({ transferId, expectedVersion: 1 });
+      service.beginQuiescence({ transferId, expectedVersion: 2 });
+
+      // Point attempt to task-other-2
+      db.prepare("UPDATE task_attempts SET task_id = 'task-other-2' WHERE id = 'att-1'").run();
+
+      const relRes = service.relinquishPredecessorOwnership({
+        transferId,
+        expectedVersion: 3,
+        expectedSourceEpoch: 1,
+      });
+
+      expect(relRes.success).toBe(false);
+      expect(relRes.errorCode).toBe('SOURCE_ATTEMPT_BINDING_MISMATCH');
+    });
+
+    // -----------------------------------------------------------------------
+    // Section 11: Task Lease Authority Tests
+    // -----------------------------------------------------------------------
+    it('28f. no task lease exists: safe relinquishment succeeds without lease mutation', () => {
+      seedBaseEntities({ taskId: 'task-1', attemptId: 'att-1', assignmentId: 'asgn-1', ownershipEpoch: 1 });
+
+      const reqRes = service.requestHandoff({
+        requestId: 'req-no-lease',
+        taskId: 'task-1',
+        sourceAttemptId: 'att-1',
+        sourceAssignmentId: 'asgn-1',
+        reason: 'No lease relinquishment',
+        expectedSourceEpoch: 1,
+      });
+      const transferId = reqRes.transfer!.id;
+
+      service.freezeHandoff({ transferId, expectedVersion: 1 });
+      service.beginQuiescence({ transferId, expectedVersion: 2 });
+
+      // Relinquish without expectedTaskLeaseToken (no lease exists)
+      const relRes = service.relinquishPredecessorOwnership({
+        transferId,
+        expectedVersion: 3,
+        expectedSourceEpoch: 1,
+      });
+
+      expect(relRes.success).toBe(true);
+      expect(relRes.newEpoch).toBe(2);
+      expect(repo.getTaskLease('task-1')).toBeNull();
+    });
+
+    it('28g. active task lease exists with matching expected lease token: safe relinquishment succeeds and releases lease', () => {
+      seedBaseEntities({ taskId: 'task-1', attemptId: 'att-1', assignmentId: 'asgn-1', ownershipEpoch: 1 });
+      repo.acquireTaskLease('task-1', 'prof-1', 'lease-token-valid');
+
+      const reqRes = service.requestHandoff({
+        requestId: 'req-with-lease',
+        taskId: 'task-1',
+        sourceAttemptId: 'att-1',
+        sourceAssignmentId: 'asgn-1',
+        reason: 'Lease token valid',
+        expectedSourceEpoch: 1,
+      });
+      const transferId = reqRes.transfer!.id;
+
+      service.freezeHandoff({ transferId, expectedVersion: 1 });
+      service.beginQuiescence({ transferId, expectedVersion: 2 });
+
+      const relRes = service.relinquishPredecessorOwnership({
+        transferId,
+        expectedVersion: 3,
+        expectedSourceEpoch: 1,
+        expectedTaskLeaseToken: 'lease-token-valid',
+      });
+
+      expect(relRes.success).toBe(true);
+      expect(relRes.newEpoch).toBe(2);
+      const lease = repo.getTaskLease('task-1');
+      expect(lease?.released_at).not.toBeNull();
+    });
+
+    it('28h. active task lease exists but expected token omitted: fails closed with TASK_LEASE_AUTHORITY_UNVERIFIED', () => {
+      seedBaseEntities({ taskId: 'task-1', attemptId: 'att-1', assignmentId: 'asgn-1', ownershipEpoch: 1 });
+      repo.acquireTaskLease('task-1', 'prof-1', 'lease-token-secret-1');
+
+      const reqRes = service.requestHandoff({
+        requestId: 'req-lease-omitted',
+        taskId: 'task-1',
+        sourceAttemptId: 'att-1',
+        sourceAssignmentId: 'asgn-1',
+        reason: 'Omitted lease token test',
+        expectedSourceEpoch: 1,
+      });
+      const transferId = reqRes.transfer!.id;
+
+      service.freezeHandoff({ transferId, expectedVersion: 1 });
+      service.beginQuiescence({ transferId, expectedVersion: 2 });
+
+      // Omit expectedTaskLeaseToken
+      const relRes = service.relinquishPredecessorOwnership({
+        transferId,
+        expectedVersion: 3,
+        expectedSourceEpoch: 1,
+      });
+
+      expect(relRes.success).toBe(false);
+      expect(relRes.errorCode).toBe('TASK_LEASE_AUTHORITY_UNVERIFIED');
+
+      // Assert fail-closed state
+      expect(repo.getTaskOwnershipEpoch('task-1')).toBe(1);
+      const asgn = repo.getAgentAssignment('asgn-1');
+      expect(asgn?.status).toBe('ASSIGNED');
+      const lease = repo.getTaskLease('task-1');
+      expect(lease?.released_at).toBeNull();
+      const transfer = repo.getHandoffTransfer(transferId);
+      expect(transfer?.status).toBe('QUIESCING');
+      expect(transfer?.version).toBe(3);
+    });
+
+    it('28i. active task lease exists with mismatching expected token: fails closed with TASK_LEASE_TOKEN_MISMATCH', () => {
+      seedBaseEntities({ taskId: 'task-1', attemptId: 'att-1', assignmentId: 'asgn-1', ownershipEpoch: 1 });
+      repo.acquireTaskLease('task-1', 'prof-1', 'lease-token-correct');
+
+      const reqRes = service.requestHandoff({
+        requestId: 'req-lease-mismatch',
+        taskId: 'task-1',
+        sourceAttemptId: 'att-1',
+        sourceAssignmentId: 'asgn-1',
+        reason: 'Mismatching lease token test',
+        expectedSourceEpoch: 1,
+      });
+      const transferId = reqRes.transfer!.id;
+
+      service.freezeHandoff({ transferId, expectedVersion: 1 });
+      service.beginQuiescence({ transferId, expectedVersion: 2 });
+
+      // Pass wrong token
+      const relRes = service.relinquishPredecessorOwnership({
+        transferId,
+        expectedVersion: 3,
+        expectedSourceEpoch: 1,
+        expectedTaskLeaseToken: 'lease-token-wrong',
+      });
+
+      expect(relRes.success).toBe(false);
+      expect(relRes.errorCode).toBe('TASK_LEASE_TOKEN_MISMATCH');
+
+      // Assert fail-closed state
+      expect(repo.getTaskOwnershipEpoch('task-1')).toBe(1);
+      const asgn = repo.getAgentAssignment('asgn-1');
+      expect(asgn?.status).toBe('ASSIGNED');
+      const lease = repo.getTaskLease('task-1');
+      expect(lease?.released_at).toBeNull();
+      const transfer = repo.getHandoffTransfer(transferId);
+      expect(transfer?.status).toBe('QUIESCING');
+      expect(transfer?.version).toBe(3);
+    });
+
+    it('28j. lease token confidentiality: error message does not expose lease token', () => {
+      seedBaseEntities({ taskId: 'task-1', attemptId: 'att-1', assignmentId: 'asgn-1', ownershipEpoch: 1 });
+      const secretToken = 'super-secret-task-lease-token-12345';
+      repo.acquireTaskLease('task-1', 'prof-1', secretToken);
+
+      const reqRes = service.requestHandoff({
+        requestId: 'req-confidential',
+        taskId: 'task-1',
+        sourceAttemptId: 'att-1',
+        sourceAssignmentId: 'asgn-1',
+        reason: 'Confidentiality test',
+        expectedSourceEpoch: 1,
+      });
+      const transferId = reqRes.transfer!.id;
+
+      service.freezeHandoff({ transferId, expectedVersion: 1 });
+      service.beginQuiescence({ transferId, expectedVersion: 2 });
+
+      const relRes = service.relinquishPredecessorOwnership({
+        transferId,
+        expectedVersion: 3,
+        expectedSourceEpoch: 1,
+        expectedTaskLeaseToken: 'wrong-token',
+      });
+
+      expect(relRes.success).toBe(false);
+      expect(relRes.error).not.toContain(secretToken);
+      expect(relRes.error).not.toContain('wrong-token');
+    });
+
+    // -----------------------------------------------------------------------
+    // Section 12: Replay Version & Epoch Validation Tests
+    // -----------------------------------------------------------------------
+    it('28k. replay with mismatching expectedVersion fails closed with VERSION_CONFLICT and does not mutate state', () => {
+      seedBaseEntities({ taskId: 'task-1', attemptId: 'att-1', assignmentId: 'asgn-1', ownershipEpoch: 1 });
+
+      const reqRes = service.requestHandoff({
+        requestId: 'req-replay-ver',
+        taskId: 'task-1',
+        sourceAttemptId: 'att-1',
+        sourceAssignmentId: 'asgn-1',
+        reason: 'Replay version test',
+        expectedSourceEpoch: 1,
+      });
+      const transferId = reqRes.transfer!.id;
+
+      service.freezeHandoff({ transferId, expectedVersion: 1 });
+      service.beginQuiescence({ transferId, expectedVersion: 2 });
+
+      // Successful relinquishment at expectedVersion 3 (transfer becomes version 4)
+      const relRes1 = service.relinquishPredecessorOwnership({
+        transferId,
+        expectedVersion: 3,
+        expectedSourceEpoch: 1,
+      });
+      expect(relRes1.success).toBe(true);
+      expect(relRes1.newEpoch).toBe(2);
+
+      // Replay with mismatching expectedVersion (e.g. 4 or 99 instead of original 3)
+      const relRes2 = service.relinquishPredecessorOwnership({
+        transferId,
+        expectedVersion: 4,
+        expectedSourceEpoch: 1,
+      });
+
+      expect(relRes2.success).toBe(false);
+      expect(relRes2.errorCode).toBe('VERSION_CONFLICT');
+      expect(repo.getTaskOwnershipEpoch('task-1')).toBe(2); // Epoch remains 2 (no second bump)
+      const transfer = repo.getHandoffTransfer(transferId);
+      expect(transfer?.version).toBe(4); // Transfer version remains 4
+    });
+
+    it('28l. replay with mismatching expectedSourceEpoch fails closed with STALE_OWNERSHIP_EPOCH', () => {
+      seedBaseEntities({ taskId: 'task-1', attemptId: 'att-1', assignmentId: 'asgn-1', ownershipEpoch: 1 });
+
+      const reqRes = service.requestHandoff({
+        requestId: 'req-replay-epoch',
+        taskId: 'task-1',
+        sourceAttemptId: 'att-1',
+        sourceAssignmentId: 'asgn-1',
+        reason: 'Replay epoch test',
+        expectedSourceEpoch: 1,
+      });
+      const transferId = reqRes.transfer!.id;
+
+      service.freezeHandoff({ transferId, expectedVersion: 1 });
+      service.beginQuiescence({ transferId, expectedVersion: 2 });
+
+      const relRes1 = service.relinquishPredecessorOwnership({
+        transferId,
+        expectedVersion: 3,
+        expectedSourceEpoch: 1,
+      });
+      expect(relRes1.success).toBe(true);
+
+      // Replay with mismatching expectedSourceEpoch (e.g. 2 instead of original source epoch 1)
+      const relRes2 = service.relinquishPredecessorOwnership({
+        transferId,
+        expectedVersion: 3,
+        expectedSourceEpoch: 2,
+      });
+
+      expect(relRes2.success).toBe(false);
+      expect(relRes2.errorCode).toBe('STALE_OWNERSHIP_EPOCH');
     });
   });
 

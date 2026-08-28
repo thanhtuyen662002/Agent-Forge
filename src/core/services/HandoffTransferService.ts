@@ -109,6 +109,7 @@ export interface HandoffRelinquishParams {
   transferId: string;
   expectedVersion: number;
   expectedSourceEpoch: number;
+  expectedTaskLeaseToken?: string;
   relinquishedAt?: string;
 }
 
@@ -124,7 +125,14 @@ export interface HandoffRelinquishResult {
     | 'VERSION_CONFLICT'
     | 'STALE_OWNERSHIP_EPOCH'
     | 'TASK_NOT_FOUND'
+    | 'SOURCE_ATTEMPT_NOT_FOUND'
+    | 'SOURCE_ATTEMPT_BINDING_MISMATCH'
+    | 'SOURCE_ASSIGNMENT_NOT_FOUND'
+    | 'SOURCE_ASSIGNMENT_BINDING_MISMATCH'
+    | 'SOURCE_ASSIGNMENT_STATE_CONFLICT'
     | 'PREDECESSOR_EXECUTION_UNRESOLVED'
+    | 'TASK_LEASE_AUTHORITY_UNVERIFIED'
+    | 'TASK_LEASE_TOKEN_MISMATCH'
     | 'INTERNAL_ERROR';
   unresolvedAuthorizations?: string[];
 }

@@ -2053,6 +2053,7 @@ export class Repository {
     transferId: string;
     expectedVersion: number;
     expectedSourceEpoch: number;
+    expectedTaskLeaseToken?: string;
     relinquishedAt?: string;
   }): {
     success: boolean;
@@ -2066,7 +2067,14 @@ export class Repository {
       | 'VERSION_CONFLICT'
       | 'STALE_OWNERSHIP_EPOCH'
       | 'TASK_NOT_FOUND'
+      | 'SOURCE_ATTEMPT_NOT_FOUND'
+      | 'SOURCE_ATTEMPT_BINDING_MISMATCH'
+      | 'SOURCE_ASSIGNMENT_NOT_FOUND'
+      | 'SOURCE_ASSIGNMENT_BINDING_MISMATCH'
+      | 'SOURCE_ASSIGNMENT_STATE_CONFLICT'
       | 'PREDECESSOR_EXECUTION_UNRESOLVED'
+      | 'TASK_LEASE_AUTHORITY_UNVERIFIED'
+      | 'TASK_LEASE_TOKEN_MISMATCH'
       | 'INTERNAL_ERROR';
     unresolvedAuthorizations?: string[];
   } {
@@ -2081,21 +2089,28 @@ export class Repository {
         };
       }
 
-      // Idempotent replay check: if already RELINQUISHED with same expected source epoch
+      // Idempotent replay check: if already RELINQUISHED with same expected source epoch and exact version
       if (transfer.status === 'RELINQUISHED' && transfer.relinquished_at !== null) {
-        if (transfer.source_ownership_epoch === params.expectedSourceEpoch) {
-          const currentEpoch = this.getTaskOwnershipEpoch(transfer.task_id);
+        if (transfer.source_ownership_epoch !== params.expectedSourceEpoch) {
           return {
-            success: true,
-            transfer,
-            newEpoch: currentEpoch,
-            alreadyRelinquished: true,
+            success: false,
+            errorCode: 'STALE_OWNERSHIP_EPOCH',
+            error: `Transfer is already relinquished with historical source epoch ${transfer.source_ownership_epoch}, expected ${params.expectedSourceEpoch}.`,
           };
         }
+        if (params.expectedVersion !== transfer.version - 1) {
+          return {
+            success: false,
+            errorCode: 'VERSION_CONFLICT',
+            error: `VERSION_CONFLICT: Replay expectedVersion ${params.expectedVersion} does not match pre-relinquishment version ${transfer.version - 1}.`,
+          };
+        }
+        const currentEpoch = this.getTaskOwnershipEpoch(transfer.task_id);
         return {
-          success: false,
-          errorCode: 'STALE_OWNERSHIP_EPOCH',
-          error: `Transfer is already relinquished with historical source epoch ${transfer.source_ownership_epoch}, expected ${params.expectedSourceEpoch}.`,
+          success: true,
+          transfer,
+          newEpoch: currentEpoch,
+          alreadyRelinquished: true,
         };
       }
 
@@ -2139,7 +2154,66 @@ export class Repository {
         };
       }
 
-      // 3. Recheck quiescence condition INSIDE this immediate transaction
+      // 3. Re-read Source TaskAttempt inside transaction
+      const attemptRow = this.db
+        .prepare('SELECT * FROM task_attempts WHERE id = ?')
+        .get(transfer.source_attempt_id) as Record<string, unknown> | undefined;
+      if (!attemptRow) {
+        return {
+          success: false,
+          errorCode: 'SOURCE_ATTEMPT_NOT_FOUND',
+          error: `SOURCE_ATTEMPT_NOT_FOUND: Source attempt "${transfer.source_attempt_id}" not found.`,
+        };
+      }
+      if (String(attemptRow.task_id) !== transfer.task_id) {
+        return {
+          success: false,
+          errorCode: 'SOURCE_ATTEMPT_BINDING_MISMATCH',
+          error: `SOURCE_ATTEMPT_BINDING_MISMATCH: Source attempt task_id "${attemptRow.task_id}" does not match transfer task_id "${transfer.task_id}".`,
+        };
+      }
+
+      // 4. Re-read Source AgentAssignment inside transaction (if bound)
+      if (transfer.source_assignment_id) {
+        const assignmentRow = this.db
+          .prepare('SELECT * FROM agent_assignments WHERE id = ?')
+          .get(transfer.source_assignment_id) as Record<string, unknown> | undefined;
+        if (!assignmentRow) {
+          return {
+            success: false,
+            errorCode: 'SOURCE_ASSIGNMENT_NOT_FOUND',
+            error: `SOURCE_ASSIGNMENT_NOT_FOUND: Source assignment "${transfer.source_assignment_id}" not found.`,
+          };
+        }
+        if (String(assignmentRow.task_id) !== transfer.task_id) {
+          return {
+            success: false,
+            errorCode: 'SOURCE_ASSIGNMENT_BINDING_MISMATCH',
+            error: `SOURCE_ASSIGNMENT_BINDING_MISMATCH: Source assignment task_id "${assignmentRow.task_id}" does not match transfer task_id "${transfer.task_id}".`,
+          };
+        }
+        if (
+          assignmentRow.attempt_id !== null &&
+          assignmentRow.attempt_id !== undefined &&
+          String(assignmentRow.attempt_id) !== transfer.source_attempt_id
+        ) {
+          return {
+            success: false,
+            errorCode: 'SOURCE_ASSIGNMENT_BINDING_MISMATCH',
+            error: `SOURCE_ASSIGNMENT_BINDING_MISMATCH: Source assignment attempt_id "${assignmentRow.attempt_id}" does not match transfer source_attempt_id "${transfer.source_attempt_id}".`,
+          };
+        }
+        const asgnStatus = String(assignmentRow.status);
+        if (asgnStatus !== 'ASSIGNED' && asgnStatus !== 'RUNNING') {
+          return {
+            success: false,
+            errorCode: 'SOURCE_ASSIGNMENT_STATE_CONFLICT',
+            error: `SOURCE_ASSIGNMENT_STATE_CONFLICT: Source assignment status is "${asgnStatus}", expected "ASSIGNED" or "RUNNING".`,
+          };
+        }
+      }
+
+      // 5. Recheck quiescence condition INSIDE this immediate transaction
       const authRows = this.db
         .prepare('SELECT * FROM execution_authorizations WHERE attempt_id = ?')
         .all(transfer.source_attempt_id) as Record<string, unknown>[];
@@ -2169,16 +2243,38 @@ export class Repository {
         };
       }
 
-      // 4. Atomic Linearization
+      // 6. Check Task Lease authority (if unreleased lease exists)
+      const activeLeaseRow = this.db
+        .prepare('SELECT * FROM task_leases WHERE task_id = ? AND released_at IS NULL')
+        .get(transfer.task_id) as { task_id: string; lease_token: string } | undefined;
+
+      if (activeLeaseRow) {
+        if (!params.expectedTaskLeaseToken) {
+          return {
+            success: false,
+            errorCode: 'TASK_LEASE_AUTHORITY_UNVERIFIED',
+            error: 'TASK_LEASE_AUTHORITY_UNVERIFIED: Active task lease exists but expectedTaskLeaseToken was omitted.',
+          };
+        }
+        if (params.expectedTaskLeaseToken !== activeLeaseRow.lease_token) {
+          return {
+            success: false,
+            errorCode: 'TASK_LEASE_TOKEN_MISMATCH',
+            error: 'TASK_LEASE_TOKEN_MISMATCH: Provided lease token does not match active task lease.',
+          };
+        }
+      }
+
+      // 7. Atomic Linearization
       const nowIso = params.relinquishedAt ?? new Date().toISOString();
       const newEpoch = currentTaskEpoch + 1;
 
-      // 4a. Bump task ownership epoch
+      // 7a. Bump task ownership epoch
       const epochRes = this.db
         .prepare('UPDATE tasks SET ownership_epoch = ?, updated_at = ? WHERE id = ? AND ownership_epoch = ?')
         .run(newEpoch, nowIso, transfer.task_id, currentTaskEpoch);
 
-      if (epochRes.changes === 0) {
+      if (epochRes.changes !== 1) {
         return {
           success: false,
           errorCode: 'STALE_OWNERSHIP_EPOCH',
@@ -2186,23 +2282,37 @@ export class Repository {
         };
       }
 
-      // 4b. Source assignment transition to HANDED_OFF (if bound)
+      // 7b. Source assignment transition to HANDED_OFF (if bound)
       if (transfer.source_assignment_id) {
-        this.db
+        const asgnRes = this.db
           .prepare(`
             UPDATE agent_assignments
             SET status = 'HANDED_OFF', ended_at = ?
-            WHERE id = ? AND status IN ('ASSIGNED', 'RUNNING')
+            WHERE id = ? AND task_id = ? AND status IN ('ASSIGNED', 'RUNNING')
           `)
-          .run(nowIso, transfer.source_assignment_id);
+          .run(nowIso, transfer.source_assignment_id, transfer.task_id);
+
+        if (asgnRes.changes !== 1) {
+          throw new Error(
+            `[HandoffRelinquish] Failed to update source assignment "${transfer.source_assignment_id}" to HANDED_OFF.`
+          );
+        }
       }
 
-      // 4c. Release active task lease if one exists
-      this.db
-        .prepare('UPDATE task_leases SET released_at = ? WHERE task_id = ? AND released_at IS NULL')
-        .run(nowIso, transfer.task_id);
+      // 7c. Release active task lease if one exists
+      if (activeLeaseRow) {
+        const leaseRes = this.db
+          .prepare('UPDATE task_leases SET released_at = ? WHERE task_id = ? AND lease_token = ? AND released_at IS NULL')
+          .run(nowIso, transfer.task_id, params.expectedTaskLeaseToken);
 
-      // 4d. Update transfer to RELINQUISHED
+        if (leaseRes.changes !== 1) {
+          throw new Error(
+            `[HandoffRelinquish] Failed to release active task lease for task "${transfer.task_id}".`
+          );
+        }
+      }
+
+      // 7d. Update transfer to RELINQUISHED
       const newVersion = transfer.version + 1;
       const transferRes = this.db
         .prepare(`
@@ -2215,7 +2325,7 @@ export class Repository {
         `)
         .run(nowIso, newVersion, nowIso, transfer.id, transfer.version);
 
-      if (transferRes.changes === 0) {
+      if (transferRes.changes !== 1) {
         throw new Error(
           `[HandoffRelinquish] Failed to update transfer "${transfer.id}" status to RELINQUISHED.`
         );
