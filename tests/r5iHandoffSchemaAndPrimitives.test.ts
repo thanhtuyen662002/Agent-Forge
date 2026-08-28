@@ -29,10 +29,32 @@ describe('R5I1 Durable Handoff Ownership and Execution Authority Primitives', ()
   // =========================================================================
   describe('Migration 16 & 17 Schema Rebuild & FK Safety', () => {
     it('25. fresh database migrates 1 -> 17 cleanly with zero errors', () => {
-      MigrationRunner.run(db);
+      db.exec(`
+        CREATE TABLE IF NOT EXISTS schema_migrations (
+          version INTEGER PRIMARY KEY,
+          name TEXT NOT NULL,
+          applied_at TEXT NOT NULL
+        );
+      `);
+
+      const migrations1To17 = MIGRATIONS.filter((m) => m.version <= 17);
+      for (const m of migrations1To17) {
+        if (m.foreignKeyMode === 'DISABLED_FOR_REBUILD') {
+          db.pragma('foreign_keys = OFF');
+          m.up(db);
+          db.pragma('foreign_keys = ON');
+        } else {
+          m.up(db);
+        }
+        db.prepare('INSERT INTO schema_migrations (version, name, applied_at) VALUES (?, ?, ?)').run(
+          m.version,
+          m.name,
+          new Date().toISOString()
+        );
+      }
 
       const rows = db.prepare('SELECT version FROM schema_migrations ORDER BY version ASC').all() as { version: number }[];
-      expect(rows.map((r) => r.version)).toEqual(MIGRATIONS.map((m) => m.version));
+      expect(rows.map((r) => r.version)).toEqual([1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17]);
 
       // 27. foreign_key_check is zero
       const fkCheck = db.pragma('foreign_key_check') as unknown[];

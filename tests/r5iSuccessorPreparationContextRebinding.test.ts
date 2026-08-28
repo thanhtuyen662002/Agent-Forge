@@ -5,6 +5,7 @@ import { Repository } from '../src/core/database/repositories';
 import {
   HandoffTransferService,
   computeSuccessorContextSpecHash,
+  sortSuccessorCustomItems,
 } from '../src/core/services/HandoffTransferService';
 import {
   ContextBuilderService,
@@ -583,11 +584,11 @@ describe('R5I3 Corrective Durable Successor Context Authority and Attempt State 
       expect(handoffItems[0].source_ref).not.toBe('ho-ctx-unrelated-newer');
     });
 
-    it('23-24. caller cannot override bound HandoffContext or inject unbound HandoffContext when transfer field is NULL', () => {
+    it('23-24. caller cannot override bound HandoffContext or inject unbound HandoffContext (including empty string)', () => {
       seedBaseEntities();
       const { transferId, version, newEpoch } = seedRelinquishedHandoff();
 
-      // Case 24: Transfer has handoff_context_id = NULL. Caller supplies handoffContextId -> FAIL CLOSED
+      // Case 24a: Transfer has handoff_context_id = NULL. Caller supplies string -> FAIL CLOSED
       const prepRes1 = service.prepareHandoffSuccessor({
         transferId,
         expectedVersion: version,
@@ -599,6 +600,19 @@ describe('R5I3 Corrective Durable Successor Context Authority and Attempt State 
       });
       expect(prepRes1.success).toBe(false);
       expect(prepRes1.errorCode).toBe('UNBOUND_HANDOFF_CONTEXT_OVERRIDE');
+
+      // Case 24b: Transfer has handoff_context_id = NULL. Caller supplies empty string -> FAIL CLOSED (Defect C)
+      const prepResEmpty = service.prepareHandoffSuccessor({
+        transferId,
+        expectedVersion: version,
+        expectedSuccessorEpoch: newEpoch,
+        successorRoleProfileId: 'rp-reviewer',
+        successorAgentProfileId: 'prof-reviewer-1',
+        handoffContextId: '',
+        buildContext: true,
+      });
+      expect(prepResEmpty.success).toBe(false);
+      expect(prepResEmpty.errorCode).toBe('UNBOUND_HANDOFF_CONTEXT_OVERRIDE');
 
       // Case 23: Transfer has handoff_context_id = 'ho-ctx-1'. Caller supplies 'ho-ctx-override' -> FAIL CLOSED
       const snapInit = contextBuilder.buildContextSnapshot({
@@ -636,7 +650,7 @@ describe('R5I3 Corrective Durable Successor Context Authority and Attempt State 
       expect(prepRes2.errorCode).toBe('BOUND_HANDOFF_CONTEXT_OVERRIDE_FORBIDDEN');
     });
 
-    it('25-27. bound checkpoint is used explicitly, latest checkpoint fallback is disabled, and caller cannot override bound checkpoint', () => {
+    it('25-27. bound checkpoint is used explicitly, latest checkpoint fallback is disabled, and caller cannot override bound checkpoint (including empty string)', () => {
       seedBaseEntities();
 
       // Create Checkpoint 1
@@ -690,7 +704,7 @@ describe('R5I3 Corrective Durable Successor Context Authority and Attempt State 
       expect(cpItems.length).toBe(1);
       expect(cpItems[0].source_ref).toBe('cp-bound-1');
 
-      // 27. Caller cannot override bound checkpoint on a separate task/transfer
+      // 27a. Caller cannot override bound checkpoint on a separate task/transfer
       repo.createTask({
         id: 'task-cp-ovr',
         project_id: 'proj-1',
@@ -778,9 +792,81 @@ describe('R5I3 Corrective Durable Successor Context Authority and Attempt State 
       });
       expect(overrideRes.success).toBe(false);
       expect(overrideRes.errorCode).toBe('BOUND_CHECKPOINT_OVERRIDE_FORBIDDEN');
+
+      // 27b. Caller cannot inject unbound checkpoint with empty string (Defect C)
+      repo.createTask({
+        id: 'task-cp-null',
+        project_id: 'proj-1',
+        milestone_id: null,
+        title: 'Task CP Null',
+        description: null,
+        state: 'CODING',
+        paused_from_state: null,
+        priority: 'MEDIUM',
+        risk: 'LOW',
+        assigned_agent_id: null,
+        revision_count: 0,
+        max_revisions: 5,
+        base_sha: null,
+        current_sha: null,
+        progress_cache_percent: 0.0,
+        progress_computed_at: null,
+        acceptance_criteria: [],
+        constraints: [],
+        ownership_epoch: 1,
+        created_at: '2026-08-28T00:00:00Z',
+        updated_at: '2026-08-28T00:00:00Z',
+      });
+      repo.createTaskAttempt({
+        id: 'att-cp-null',
+        task_id: 'task-cp-null',
+        attempt_number: 1,
+        agent_id: null,
+        agent_profile_id: 'prof-coder-1',
+        status: 'RUNNING',
+        started_at: '2026-08-28T00:00:00Z',
+        ended_at: null,
+        summary: null,
+      });
+      repo.createAgentAssignment({
+        id: 'asgn-cp-null',
+        project_id: 'proj-1',
+        task_id: 'task-cp-null',
+        attempt_id: 'att-cp-null',
+        role_profile_id: 'rp-coder',
+        agent_profile_id: 'prof-coder-1',
+        selected_provider_id: 'prov-1',
+        selected_account_id: 'acc-1',
+        selected_resource_id: 'res-1',
+        selected_worker_slot_id: null,
+        routing_decision_id: null,
+        preferred_metadata: {},
+        status: 'ASSIGNED',
+        created_at: '2026-08-28T00:00:00Z',
+        ended_at: null,
+      });
+
+      const { transferId: t3, version: v3, newEpoch: e3 } = seedRelinquishedHandoff({
+        requestId: 'req-cp-null-test',
+        taskId: 'task-cp-null',
+        attemptId: 'att-cp-null',
+        assignmentId: 'asgn-cp-null',
+        leaseToken: 'lease-cp-null',
+      });
+      const emptyCpRes = service.prepareHandoffSuccessor({
+        transferId: t3,
+        expectedVersion: v3,
+        expectedSuccessorEpoch: e3,
+        successorRoleProfileId: 'rp-reviewer',
+        successorAgentProfileId: 'prof-reviewer-1',
+        checkpointId: '',
+        buildContext: true,
+      });
+      expect(emptyCpRes.success).toBe(false);
+      expect(emptyCpRes.errorCode).toBe('UNBOUND_CHECKPOINT_OVERRIDE');
     });
 
-    it('28-29. cross-task and cross-source-attempt handoff contexts are rejected', () => {
+    it('28-29. HandoffContext NULL attempt_id, wrong source attempt, and cross-task are rejected fail closed', () => {
       seedBaseEntities();
 
       // Create second task
@@ -851,7 +937,7 @@ describe('R5I3 Corrective Durable Successor Context Authority and Attempt State 
       expect(prepRes1.success).toBe(false);
       expect(prepRes1.errorCode).toBe('CROSS_TASK_HANDOFF_CONTEXT_FORBIDDEN');
 
-      // 29. Cross-source-attempt handoff context (attempt_id on same task is att-prior-0, not att-1)
+      // 29a. Cross-source-attempt handoff context (attempt_id on same task is att-prior-0, not att-1)
       repo.createTaskAttempt({
         id: 'att-prior-0',
         task_id: 'task-1',
@@ -896,13 +982,184 @@ describe('R5I3 Corrective Durable Successor Context Authority and Attempt State 
       });
       expect(prepRes2.success).toBe(false);
       expect(prepRes2.errorCode).toBe('HANDOFF_CONTEXT_SOURCE_MISMATCH');
+
+      // 29b. NULL attempt_id on HandoffContext is rejected fail closed (Defect A)
+      const snapNullAttempt = contextBuilder.buildContextSnapshot({
+        projectId: 'proj-1',
+        taskId: 'task-1',
+        attemptId: null,
+        purpose: 'EXECUTION',
+      });
+      repo.createHandoffContext({
+        id: 'ho-ctx-null-attempt',
+        project_id: 'proj-1',
+        task_id: 'task-1',
+        attempt_id: null,
+        from_assignment_id: null,
+        to_assignment_id: null,
+        source_snapshot_id: snapNullAttempt.snapshot.id,
+        handoff_snapshot_id: null,
+        reason: 'Null attempt',
+        status: 'READY',
+        created_at: '2026-08-28T00:00:00Z',
+        consumed_at: null,
+      });
+
+      db.prepare('UPDATE handoff_transfers SET handoff_context_id = ? WHERE id = ?').run('ho-ctx-null-attempt', transferId);
+      const prepResNullAttempt = service.prepareHandoffSuccessor({
+        transferId,
+        expectedVersion: version,
+        expectedSuccessorEpoch: newEpoch,
+        successorRoleProfileId: 'rp-reviewer',
+        successorAgentProfileId: 'prof-reviewer-1',
+        buildContext: true,
+      });
+      expect(prepResNullAttempt.success).toBe(false);
+      expect(prepResNullAttempt.errorCode).toBe('HANDOFF_CONTEXT_SOURCE_MISMATCH');
+    });
+
+    it('Defect D. customItems permutation differing only by null vs empty sourceRef produces identical spec hash and identical context item ordering', () => {
+      seedBaseEntities();
+
+      const itemNull = {
+        sourceType: 'CUSTOM_TEST',
+        sourceRef: null,
+        content: { key: 'same_content' },
+        tokenEstimate: 10,
+      };
+      const itemEmpty = {
+        sourceType: 'CUSTOM_TEST',
+        sourceRef: '',
+        content: { key: 'same_content' },
+        tokenEstimate: 10,
+      };
+
+      // Permutation 1: [itemNull, itemEmpty]
+      const hash1 = computeSuccessorContextSpecHash({
+        transferId: 'ht-test-1',
+        successorAttemptId: 'att-succ-1',
+        purpose: 'HANDOFF',
+        handoffContextId: null,
+        checkpointId: null,
+        contextFiles: [],
+        customItems: [itemNull, itemEmpty],
+      });
+
+      // Permutation 2: [itemEmpty, itemNull]
+      const hash2 = computeSuccessorContextSpecHash({
+        transferId: 'ht-test-1',
+        successorAttemptId: 'att-succ-1',
+        purpose: 'HANDOFF',
+        handoffContextId: null,
+        checkpointId: null,
+        contextFiles: [],
+        customItems: [itemEmpty, itemNull],
+      });
+
+      // Both permutations must produce exact same spec hash
+      expect(hash1).toBe(hash2);
+
+      // Verify sortSuccessorCustomItems produces identical canonical order
+      const sorted1 = sortSuccessorCustomItems([itemNull, itemEmpty]);
+      const sorted2 = sortSuccessorCustomItems([itemEmpty, itemNull]);
+      expect(sorted1).toEqual(sorted2);
+
+      // Verify that building successor context with both permutations yields the same context item ordering
+      const { transferId: t1, version: v1, newEpoch: e1 } = seedRelinquishedHandoff({
+        requestId: 'req-perm-1',
+      });
+      const res1 = service.prepareHandoffSuccessor({
+        transferId: t1,
+        expectedVersion: v1,
+        expectedSuccessorEpoch: e1,
+        successorRoleProfileId: 'rp-reviewer',
+        successorAgentProfileId: 'prof-reviewer-1',
+        customItems: [itemNull, itemEmpty],
+        buildContext: true,
+      });
+
+      repo.createTask({
+        id: 'task-perm-2',
+        project_id: 'proj-1',
+        milestone_id: null,
+        title: 'Task Perm 2',
+        description: null,
+        state: 'CODING',
+        paused_from_state: null,
+        priority: 'MEDIUM',
+        risk: 'LOW',
+        assigned_agent_id: null,
+        revision_count: 0,
+        max_revisions: 5,
+        base_sha: null,
+        current_sha: null,
+        progress_cache_percent: 0.0,
+        progress_computed_at: null,
+        acceptance_criteria: [],
+        constraints: [],
+        ownership_epoch: 1,
+        created_at: '2026-08-28T00:00:00Z',
+        updated_at: '2026-08-28T00:00:00Z',
+      });
+      repo.createTaskAttempt({
+        id: 'att-perm-2',
+        task_id: 'task-perm-2',
+        attempt_number: 1,
+        agent_id: null,
+        agent_profile_id: 'prof-coder-1',
+        status: 'RUNNING',
+        started_at: '2026-08-28T00:00:00Z',
+        ended_at: null,
+        summary: null,
+      });
+      repo.createAgentAssignment({
+        id: 'asgn-perm-2',
+        project_id: 'proj-1',
+        task_id: 'task-perm-2',
+        attempt_id: 'att-perm-2',
+        role_profile_id: 'rp-coder',
+        agent_profile_id: 'prof-coder-1',
+        selected_provider_id: 'prov-1',
+        selected_account_id: 'acc-1',
+        selected_resource_id: 'res-1',
+        selected_worker_slot_id: null,
+        routing_decision_id: null,
+        preferred_metadata: {},
+        status: 'ASSIGNED',
+        created_at: '2026-08-28T00:00:00Z',
+        ended_at: null,
+      });
+
+      const { transferId: t2, version: v2, newEpoch: e2 } = seedRelinquishedHandoff({
+        requestId: 'req-perm-2',
+        taskId: 'task-perm-2',
+        attemptId: 'att-perm-2',
+        assignmentId: 'asgn-perm-2',
+        leaseToken: 'lease-perm-2',
+      });
+      const res2 = service.prepareHandoffSuccessor({
+        transferId: t2,
+        expectedVersion: v2,
+        expectedSuccessorEpoch: e2,
+        successorRoleProfileId: 'rp-reviewer',
+        successorAgentProfileId: 'prof-reviewer-1',
+        customItems: [itemEmpty, itemNull],
+        buildContext: true,
+      });
+
+      expect(res1.success).toBe(true);
+      expect(res2.success).toBe(true);
+
+      const items1 = res1.contextItems!.filter((i) => i.source_type === 'CUSTOM_TEST');
+      const items2 = res2.contextItems!.filter((i) => i.source_type === 'CUSTOM_TEST');
+      expect(items1.map((i) => i.source_ref)).toEqual(items2.map((i) => i.source_ref));
     });
   });
 
   // =========================================================================
-  // Section 28: Crash / Recovery Tests (30..36)
+  // Section 28: Crash / Recovery & Replay Authority Tests (30..36 + Defect B)
   // =========================================================================
-  describe('Crash / Recovery Tests', () => {
+  describe('Crash / Recovery & Replay Authority Tests', () => {
     it('30-34. deterministic candidate snapshot persists, recovers after simulated interruption before pointer bind, and binds without duplicating', () => {
       seedBaseEntities();
       const { transferId, version, newEpoch } = seedRelinquishedHandoff();
@@ -918,7 +1175,6 @@ describe('R5I3 Corrective Durable Successor Context Authority and Attempt State 
       });
       expect(prepRes.success).toBe(true);
       const successorAttemptId = prepRes.successorAttempt!.id;
-      const prepVersion = prepRes.transfer!.version; // 5
 
       // Step B: Derive deterministic IDs
       const specHash = computeSuccessorContextSpecHash({
@@ -953,7 +1209,7 @@ describe('R5I3 Corrective Durable Successor Context Authority and Attempt State 
       // Step D: Retry prepareHandoffSuccessor with buildContext: true
       const retryRes = service.prepareHandoffSuccessor({
         transferId,
-        expectedVersion: version, // Can pass initial version or 5
+        expectedVersion: version,
         expectedSuccessorEpoch: newEpoch,
         successorRoleProfileId: 'rp-reviewer',
         successorAgentProfileId: 'prof-reviewer-1',
@@ -1058,17 +1314,83 @@ describe('R5I3 Corrective Durable Successor Context Authority and Attempt State 
       expect(retryRes.success).toBe(false);
       expect(retryRes.errorCode).toBe('SUCCESSOR_CONTEXT_AUTHORITY_INTEGRITY_MISMATCH');
     });
-  });
 
-  // =========================================================================
-  // Section 29: Concurrency / CAS Tests (37..41)
-  // =========================================================================
-  describe('Concurrency & CAS Binding', () => {
-    it('37. identical concurrent context preparation converges to one authority', () => {
+    it('Defect B. already-bound repository replay validates snapshot exists, manifest exists, and task/attempt/purpose integrity before returning alreadyBound', () => {
       seedBaseEntities();
       const { transferId, version, newEpoch } = seedRelinquishedHandoff();
 
-      const res1 = service.prepareHandoffSuccessor({
+      // Successfully bind initial context
+      const prepRes = service.prepareHandoffSuccessor({
+        transferId,
+        expectedVersion: version,
+        expectedSuccessorEpoch: newEpoch,
+        successorRoleProfileId: 'rp-reviewer',
+        successorAgentProfileId: 'prof-reviewer-1',
+        buildContext: true,
+      });
+      expect(prepRes.success).toBe(true);
+
+      const boundSnapshotId = prepRes.contextSnapshot!.id;
+      const boundSpecHash = prepRes.transfer!.successor_context_spec_hash!;
+
+      // 1. Valid exact replay at repository level returns alreadyBound: true
+      const repoReplay = repo.bindHandoffSuccessorContext({
+        transferId,
+        expectedVersion: prepRes.transfer!.version,
+        successorContextSnapshotId: boundSnapshotId,
+        successorContextSpecHash: boundSpecHash,
+      });
+      expect(repoReplay.success).toBe(true);
+      expect(repoReplay.alreadyBound).toBe(true);
+
+      // 2. If manifest is missing for already-bound snapshot, repository fails closed with CONTEXT_MANIFEST_NOT_FOUND
+      db.prepare('DELETE FROM context_manifests WHERE snapshot_id = ?').run(boundSnapshotId);
+      const replayNoManifest = repo.bindHandoffSuccessorContext({
+        transferId,
+        expectedVersion: prepRes.transfer!.version,
+        successorContextSnapshotId: boundSnapshotId,
+        successorContextSpecHash: boundSpecHash,
+      });
+      expect(replayNoManifest.success).toBe(false);
+      expect(replayNoManifest.errorCode).toBe('CONTEXT_MANIFEST_NOT_FOUND');
+
+      // 3. If snapshot itself is missing, repository fails closed with CONTEXT_SNAPSHOT_NOT_FOUND
+      db.pragma('foreign_keys = OFF');
+      db.prepare('DELETE FROM context_items WHERE snapshot_id = ?').run(boundSnapshotId);
+      db.prepare('DELETE FROM context_snapshots WHERE id = ?').run(boundSnapshotId);
+
+      const replayNoSnapshot = repo.bindHandoffSuccessorContext({
+        transferId,
+        expectedVersion: prepRes.transfer!.version,
+        successorContextSnapshotId: boundSnapshotId,
+        successorContextSpecHash: boundSpecHash,
+      });
+      db.pragma('foreign_keys = ON');
+
+      expect(replayNoSnapshot.success).toBe(false);
+      expect(replayNoSnapshot.errorCode).toBe('CONTEXT_SNAPSHOT_NOT_FOUND');
+    });
+  });
+
+  // =========================================================================
+  // Section 29: Concurrency, Stale CAS & Version Fencing (37..41 + Defect E & F)
+  // =========================================================================
+  describe('Concurrency & CAS Binding', () => {
+    it('37 & Defect E. race-shaped concurrent preparation from two independent service instances converges to one authority without duplicating snapshots, manifests, or attempts', () => {
+      seedBaseEntities();
+      const { transferId, version, newEpoch } = seedRelinquishedHandoff();
+
+      // Instantiate two independent service and repository instances against the same database
+      const repo1 = new Repository(db);
+      const builder1 = new ContextBuilderService(repo1);
+      const service1 = new HandoffTransferService(repo1, builder1);
+
+      const repo2 = new Repository(db);
+      const builder2 = new ContextBuilderService(repo2);
+      const service2 = new HandoffTransferService(repo2, builder2);
+
+      // Both contenders execute preparation based on the exact same pre-bind relinquished transfer state
+      const res1 = service1.prepareHandoffSuccessor({
         transferId,
         expectedVersion: version,
         expectedSuccessorEpoch: newEpoch,
@@ -1078,7 +1400,7 @@ describe('R5I3 Corrective Durable Successor Context Authority and Attempt State 
       });
       expect(res1.success).toBe(true);
 
-      const res2 = service.prepareHandoffSuccessor({
+      const res2 = service2.prepareHandoffSuccessor({
         transferId,
         expectedVersion: version,
         expectedSuccessorEpoch: newEpoch,
@@ -1087,8 +1409,23 @@ describe('R5I3 Corrective Durable Successor Context Authority and Attempt State 
         buildContext: true,
       });
       expect(res2.success).toBe(true);
-      expect(res2.alreadyPrepared).toBe(true);
+
+      // Both converge to the exact same authoritative pointer
       expect(res2.contextSnapshot?.id).toBe(res1.contextSnapshot?.id);
+      expect(res2.contextManifest?.id).toBe(res1.contextManifest?.id);
+
+      // Exactly 1 ContextSnapshot exists
+      const snapshots = db.prepare('SELECT * FROM context_snapshots WHERE task_id = ?').all('task-1');
+      expect(snapshots.length).toBe(1);
+
+      // Exactly 1 ContextManifest exists
+      const manifests = db.prepare('SELECT * FROM context_manifests WHERE snapshot_id = ?').all(res1.contextSnapshot!.id);
+      expect(manifests.length).toBe(1);
+
+      // Exactly 2 total attempts exist on task (Attempt 1 predecessor + Attempt 2 successor, no N+2)
+      const attempts = repo.getTaskAttemptsByTask('task-1');
+      expect(attempts.length).toBe(2);
+      expect(res2.successorAttempt?.id).toBe(res1.successorAttempt?.id);
     });
 
     it('38. conflicting context specs cannot both bind', () => {
@@ -1119,7 +1456,7 @@ describe('R5I3 Corrective Durable Successor Context Authority and Attempt State 
       expect(res2.errorCode).toBe('SUCCESSOR_CONTEXT_SPEC_CONFLICT');
     });
 
-    it('39-41. pointer cannot be overwritten after successful binding, stale version fails, and failed bind leaves authority unchanged', () => {
+    it('39-41. pointer cannot be overwritten after successful binding, and failed bind leaves authority unchanged', () => {
       seedBaseEntities();
       const { transferId, version, newEpoch } = seedRelinquishedHandoff();
 
@@ -1134,24 +1471,70 @@ describe('R5I3 Corrective Durable Successor Context Authority and Attempt State 
       expect(res1.success).toBe(true);
       const boundSnapshotId = res1.contextSnapshot!.id;
 
-      // 40. Direct call to bindHandoffSuccessorContext with stale version fails
-      const bindStale = repo.bindHandoffSuccessorContext({
+      // Overwrite attempt with different snapshot ID fails
+      const bindOverwrite = repo.bindHandoffSuccessorContext({
         transferId,
-        expectedVersion: 1, // Stale version
-        successorContextSnapshotId: 'ctx-snap-new',
-        successorContextSpecHash: 'new_hash',
+        expectedVersion: res1.transfer!.version,
+        successorContextSnapshotId: 'ctx-snap-different',
+        successorContextSpecHash: 'different_hash',
       });
-      expect(bindStale.success).toBe(false);
-      expect(bindStale.errorCode).toBe('SUCCESSOR_CONTEXT_SPEC_CONFLICT');
+      expect(bindOverwrite.success).toBe(false);
+      expect(bindOverwrite.errorCode).toBe('SUCCESSOR_CONTEXT_SPEC_CONFLICT');
 
-      // 39 & 41. Pointer is unchanged in database
+      // Pointer is unchanged in database
       const transfer = repo.getHandoffTransfer(transferId)!;
       expect(transfer.successor_context_snapshot_id).toBe(boundSnapshotId);
+    });
+
+    it('Defect F. stale expectedVersion on prepared transfer with pointer NULL returns VERSION_CONFLICT and leaves pointer NULL', () => {
+      seedBaseEntities();
+      const { transferId, version, newEpoch } = seedRelinquishedHandoff();
+
+      // Step A: Prepare successor attempt (status -> SUCCESSOR_PREPARED, version -> 5, pointer -> NULL)
+      const prepRes = service.prepareHandoffSuccessor({
+        transferId,
+        expectedVersion: version, // 4
+        expectedSuccessorEpoch: newEpoch,
+        successorRoleProfileId: 'rp-reviewer',
+        successorAgentProfileId: 'prof-reviewer-1',
+        buildContext: false,
+      });
+      expect(prepRes.success).toBe(true);
+      expect(prepRes.transfer?.version).toBe(5);
+      expect(prepRes.transfer?.successor_context_snapshot_id).toBeNull();
+      const successorAttemptId = prepRes.successorAttempt!.id;
+
+      // Step B: Create a valid candidate snapshot and manifest
+      const candidate = contextBuilder.buildContextSnapshot({
+        projectId: 'proj-1',
+        taskId: 'task-1',
+        attemptId: successorAttemptId,
+        purpose: 'HANDOFF',
+        includeLatestHandoff: false,
+        includeLatestCheckpoint: false,
+      });
+
+      // Step C: Call bindHandoffSuccessorContext with stale version = 4 (current is 5)
+      const bindStale = repo.bindHandoffSuccessorContext({
+        transferId,
+        expectedVersion: 4, // Stale version!
+        successorContextSnapshotId: candidate.snapshot.id,
+        successorContextSpecHash: 'spec_hash_123',
+      });
+
+      expect(bindStale.success).toBe(false);
+      expect(bindStale.errorCode).toBe('VERSION_CONFLICT');
+
+      // Verify transfer pointer and spec hash remain NULL in database
+      const transfer = repo.getHandoffTransfer(transferId)!;
+      expect(transfer.successor_context_snapshot_id).toBeNull();
+      expect(transfer.successor_context_spec_hash).toBeNull();
+      expect(transfer.version).toBe(5);
     });
   });
 
   // =========================================================================
-  // Section 30: Successor Attempt State Tests (42..47)
+  // Section 30: Successor Attempt State Tests (42..47 + Defect G)
   // =========================================================================
   describe('Successor Attempt State Fencing', () => {
     it('42-47. successor Attempt N+1 is always created in PENDING status with agent_id = NULL and agent_profile_id bound', () => {
@@ -1176,6 +1559,44 @@ describe('R5I3 Corrective Durable Successor Context Authority and Attempt State 
       // 46. agent_profile_id bound
       expect(attempt.agent_profile_id).toBe('prof-reviewer-1');
       // 47. Total attempts == 2 (no N+2)
+      expect(repo.getTaskAttemptsByTask('task-1').length).toBe(2);
+    });
+
+    it('Defect G. adversarial runtime caller injecting RUNNING or terminal status cannot override PENDING status', () => {
+      seedBaseEntities();
+      const { transferId, version, newEpoch } = seedRelinquishedHandoff();
+
+      // Adversarial attempt 1: Inject status: 'RUNNING'
+      const prepResRunning = service.prepareHandoffSuccessor({
+        transferId,
+        expectedVersion: version,
+        expectedSuccessorEpoch: newEpoch,
+        successorRoleProfileId: 'rp-reviewer',
+        successorAgentProfileId: 'prof-reviewer-1',
+        status: 'RUNNING', // Injected
+        buildContext: false,
+      } as any);
+
+      expect(prepResRunning.success).toBe(true);
+      expect(prepResRunning.successorAttempt?.status).toBe('PENDING');
+      expect(prepResRunning.successorAttempt?.agent_id).toBeNull();
+      expect(prepResRunning.successorAttempt?.agent_profile_id).toBe('prof-reviewer-1');
+
+      // Adversarial attempt 2: Inject status: 'COMPLETED'
+      const prepResCompleted = service.prepareHandoffSuccessor({
+        transferId,
+        expectedVersion: prepResRunning.transfer!.version,
+        expectedSuccessorEpoch: newEpoch,
+        successorRoleProfileId: 'rp-reviewer',
+        successorAgentProfileId: 'prof-reviewer-1',
+        status: 'COMPLETED', // Injected
+        buildContext: false,
+      } as any);
+
+      expect(prepResCompleted.success).toBe(true);
+      expect(prepResCompleted.successorAttempt?.status).toBe('PENDING');
+      expect(prepResCompleted.successorAttempt?.agent_id).toBeNull();
+      expect(prepResCompleted.successorAttempt?.agent_profile_id).toBe('prof-reviewer-1');
       expect(repo.getTaskAttemptsByTask('task-1').length).toBe(2);
     });
   });

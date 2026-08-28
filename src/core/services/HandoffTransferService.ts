@@ -18,6 +18,39 @@ import {
   computeSha256,
 } from './ContextBuilderService';
 
+export function sortSuccessorCustomItems<T extends {
+  itemType?: ContextItemType;
+  sourceType: string;
+  sourceRef?: string | null;
+  content: Record<string, unknown> | unknown[];
+  tokenEstimate?: number | null;
+}>(items: T[]): T[] {
+  return [...items].sort((a, b) => {
+    const aType = a.itemType || 'CUSTOM';
+    const bType = b.itemType || 'CUSTOM';
+    const typeCmp = codeUnitCompare(aType, bType);
+    if (typeCmp !== 0) return typeCmp;
+
+    const srcTypeCmp = codeUnitCompare(a.sourceType, b.sourceType);
+    if (srcTypeCmp !== 0) return srcTypeCmp;
+
+    // Distinguish NULL/undefined from string (including empty string "")
+    const aRefTag = a.sourceRef === null || a.sourceRef === undefined ? '0' : `1${a.sourceRef}`;
+    const bRefTag = b.sourceRef === null || b.sourceRef === undefined ? '0' : `1${b.sourceRef}`;
+    const refCmp = codeUnitCompare(aRefTag, bRefTag);
+    if (refCmp !== 0) return refCmp;
+
+    const aHash = computeSha256(canonicalJsonStringify(a.content));
+    const bHash = computeSha256(canonicalJsonStringify(b.content));
+    const contentCmp = codeUnitCompare(aHash, bHash);
+    if (contentCmp !== 0) return contentCmp;
+
+    const aTok = a.tokenEstimate !== null && a.tokenEstimate !== undefined ? `1${a.tokenEstimate}` : '0';
+    const bTok = b.tokenEstimate !== null && b.tokenEstimate !== undefined ? `1${b.tokenEstimate}` : '0';
+    return codeUnitCompare(aTok, bTok);
+  });
+}
+
 export function computeSuccessorContextSpecHash(spec: {
   transferId: string;
   successorAttemptId: string;
@@ -34,17 +67,7 @@ export function computeSuccessorContextSpecHash(spec: {
   }>;
 }): string {
   const sortedFiles = [...spec.contextFiles].sort(codeUnitCompare);
-  const sortedCustom = [...spec.customItems].sort((a, b) => {
-    const aType = a.itemType || 'CUSTOM';
-    const bType = b.itemType || 'CUSTOM';
-    const aHash = computeSha256(canonicalJsonStringify(a.content));
-    const bHash = computeSha256(canonicalJsonStringify(b.content));
-    const aTok = a.tokenEstimate !== null && a.tokenEstimate !== undefined ? String(a.tokenEstimate) : '';
-    const bTok = b.tokenEstimate !== null && b.tokenEstimate !== undefined ? String(b.tokenEstimate) : '';
-    const aKey = `${aType}\0${a.sourceType}\0${a.sourceRef || ''}\0${aHash}\0${aTok}`;
-    const bKey = `${bType}\0${b.sourceType}\0${b.sourceRef || ''}\0${bHash}\0${bTok}`;
-    return codeUnitCompare(aKey, bKey);
-  });
+  const sortedCustom = sortSuccessorCustomItems(spec.customItems);
 
   const canonicalDescriptor = {
     transfer_id: spec.transferId,
@@ -728,7 +751,7 @@ export class HandoffTransferService {
       };
     }
 
-    // 2. Caller override fencing (Section 13)
+    // 2. Caller override fencing (Section 13 & Defect C)
     if (transfer.handoff_context_id !== null) {
       if (params.handoffContextId !== undefined && params.handoffContextId !== transfer.handoff_context_id) {
         return {
@@ -740,7 +763,7 @@ export class HandoffTransferService {
           error: `BOUND_HANDOFF_CONTEXT_OVERRIDE_FORBIDDEN: Cannot override bound handoff_context_id "${transfer.handoff_context_id}" with "${params.handoffContextId}".`,
         };
       }
-    } else if (params.handoffContextId) {
+    } else if (params.handoffContextId !== undefined && params.handoffContextId !== null) {
       return {
         success: false,
         transfer,
@@ -762,7 +785,7 @@ export class HandoffTransferService {
           error: `BOUND_CHECKPOINT_OVERRIDE_FORBIDDEN: Cannot override bound checkpoint_id "${transfer.checkpoint_id}" with "${params.checkpointId}".`,
         };
       }
-    } else if (params.checkpointId) {
+    } else if (params.checkpointId !== undefined && params.checkpointId !== null) {
       return {
         success: false,
         transfer,
@@ -773,7 +796,7 @@ export class HandoffTransferService {
       };
     }
 
-    // 3. Bound HandoffContext validation
+    // 3. Bound HandoffContext validation (Defect A: exact source attempt match required)
     if (transfer.handoff_context_id) {
       const ho = this.repo.getHandoffContext(transfer.handoff_context_id);
       if (!ho) {
@@ -796,27 +819,30 @@ export class HandoffTransferService {
           error: `CROSS_TASK_HANDOFF_CONTEXT_FORBIDDEN: HandoffContext "${transfer.handoff_context_id}" belongs to task "${ho.task_id}", expected "${transfer.task_id}".`,
         };
       }
-      if (ho.attempt_id && ho.attempt_id !== transfer.source_attempt_id) {
+      if (!ho.attempt_id || ho.attempt_id !== transfer.source_attempt_id) {
         return {
           success: false,
           transfer,
           successorAttempt,
           alreadyPrepared: prepRes.alreadyPrepared,
           errorCode: 'HANDOFF_CONTEXT_SOURCE_MISMATCH',
-          error: `HANDOFF_CONTEXT_SOURCE_MISMATCH: HandoffContext "${transfer.handoff_context_id}" source attempt "${ho.attempt_id}" does not match transfer source attempt "${transfer.source_attempt_id}".`,
+          error: `HANDOFF_CONTEXT_SOURCE_MISMATCH: HandoffContext "${transfer.handoff_context_id}" source attempt "${ho.attempt_id ?? 'NULL'}" does not match transfer source attempt "${transfer.source_attempt_id}".`,
         };
       }
     }
 
-    // 4. Compute canonical spec hash
+    // 4. Compute canonical spec hash with total deterministic ordering
+    const sortedFiles = [...(params.contextFiles ?? [])].sort(codeUnitCompare);
+    const sortedCustomItems = sortSuccessorCustomItems(params.customItems ?? []);
+
     const specHash = computeSuccessorContextSpecHash({
       transferId: transfer.id,
       successorAttemptId: successorAttempt.id,
       purpose: 'HANDOFF',
       handoffContextId: transfer.handoff_context_id,
       checkpointId: transfer.checkpoint_id,
-      contextFiles: params.contextFiles ?? [],
-      customItems: params.customItems ?? [],
+      contextFiles: sortedFiles,
+      customItems: sortedCustomItems,
     });
 
     // 5. Exact Context Replay Check (Section 10 & 11)
@@ -939,8 +965,8 @@ export class HandoffTransferService {
           includeLatestCheckpoint: false,
           handoffId: transfer.handoff_context_id,
           checkpointId: transfer.checkpoint_id,
-          contextFiles: params.contextFiles,
-          customItems: params.customItems,
+          contextFiles: sortedFiles,
+          customItems: sortedCustomItems,
           snapshotId: deterministicSnapshotId,
           manifestId: deterministicManifestId,
         });
@@ -949,14 +975,29 @@ export class HandoffTransferService {
         candidateManifest = ctxResult.manifest;
         candidateItems = ctxResult.items;
       } catch (err) {
-        return {
-          success: false,
-          transfer,
-          successorAttempt,
-          alreadyPrepared: prepRes.alreadyPrepared,
-          errorCode: 'CONTEXT_BUILD_FAILED',
-          error: `[ContextBuildFailed] ${err instanceof Error ? err.message : String(err)}`,
-        };
+        // Race recovery: if a concurrent contender already persisted the deterministic candidate
+        const recoveredSnap = this.repo.getContextSnapshot(deterministicSnapshotId);
+        const recoveredMan = recoveredSnap ? this.repo.getContextManifestBySnapshotId(recoveredSnap.id) : null;
+        if (
+          recoveredSnap &&
+          recoveredMan &&
+          recoveredSnap.task_id === transfer.task_id &&
+          recoveredSnap.attempt_id === successorAttempt.id &&
+          recoveredSnap.purpose === 'HANDOFF'
+        ) {
+          candidateSnapshot = recoveredSnap;
+          candidateManifest = recoveredMan;
+          candidateItems = this.repo.getContextItemsBySnapshot(recoveredSnap.id);
+        } else {
+          return {
+            success: false,
+            transfer,
+            successorAttempt,
+            alreadyPrepared: prepRes.alreadyPrepared,
+            errorCode: 'CONTEXT_BUILD_FAILED',
+            error: `[ContextBuildFailed] ${err instanceof Error ? err.message : String(err)}`,
+          };
+        }
       }
     }
 

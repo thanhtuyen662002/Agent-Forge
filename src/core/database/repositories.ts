@@ -2679,29 +2679,62 @@ export class Repository {
 
       // Check if already bound
       if (transfer.successor_context_snapshot_id !== null) {
-        if (transfer.successor_context_snapshot_id === params.successorContextSnapshotId) {
-          if (transfer.successor_context_spec_hash !== params.successorContextSpecHash) {
-            return {
-              success: false,
-              errorCode: 'SUCCESSOR_CONTEXT_SPEC_CONFLICT',
-              error: `SUCCESSOR_CONTEXT_SPEC_CONFLICT: Persisted spec hash "${transfer.successor_context_spec_hash}" does not match requested spec hash "${params.successorContextSpecHash}".`,
-            };
-          }
-          return {
-            success: true,
-            transfer,
-            alreadyBound: true,
-          };
-        } else {
+        if (transfer.successor_context_snapshot_id !== params.successorContextSnapshotId) {
           return {
             success: false,
             errorCode: 'SUCCESSOR_CONTEXT_SPEC_CONFLICT',
-            error: `Transfer is already bound to snapshot "${transfer.successor_context_snapshot_id}", cannot bind "${params.successorContextSnapshotId}".`,
+            error: `SUCCESSOR_CONTEXT_SPEC_CONFLICT: Transfer is already bound to snapshot "${transfer.successor_context_snapshot_id}", cannot bind "${params.successorContextSnapshotId}".`,
           };
         }
+
+        if (transfer.successor_context_spec_hash !== params.successorContextSpecHash) {
+          return {
+            success: false,
+            errorCode: 'SUCCESSOR_CONTEXT_SPEC_CONFLICT',
+            error: `SUCCESSOR_CONTEXT_SPEC_CONFLICT: Persisted spec hash "${transfer.successor_context_spec_hash}" does not match requested spec hash "${params.successorContextSpecHash}".`,
+          };
+        }
+
+        // Validate persisted authoritative ContextSnapshot
+        const snapshot = this.getContextSnapshot(params.successorContextSnapshotId);
+        if (!snapshot) {
+          return {
+            success: false,
+            errorCode: 'CONTEXT_SNAPSHOT_NOT_FOUND',
+            error: `ContextSnapshot "${params.successorContextSnapshotId}" not found.`,
+          };
+        }
+
+        if (
+          snapshot.task_id !== transfer.task_id ||
+          snapshot.attempt_id !== transfer.successor_attempt_id ||
+          snapshot.purpose !== 'HANDOFF'
+        ) {
+          return {
+            success: false,
+            errorCode: 'CONTEXT_SNAPSHOT_INTEGRITY_MISMATCH',
+            error: `ContextSnapshot integrity mismatch: task=${snapshot.task_id} (expected ${transfer.task_id}), attempt=${snapshot.attempt_id} (expected ${transfer.successor_attempt_id}), purpose=${snapshot.purpose} (expected HANDOFF).`,
+          };
+        }
+
+        // Validate persisted authoritative ContextManifest
+        const manifest = this.getContextManifestBySnapshotId(snapshot.id);
+        if (!manifest) {
+          return {
+            success: false,
+            errorCode: 'CONTEXT_MANIFEST_NOT_FOUND',
+            error: `ContextManifest for snapshot "${snapshot.id}" not found.`,
+          };
+        }
+
+        return {
+          success: true,
+          transfer,
+          alreadyBound: true,
+        };
       }
 
-      // Version CAS check
+      // Unbound path: Version CAS check
       if (transfer.version !== params.expectedVersion) {
         return {
           success: false,
@@ -4671,7 +4704,7 @@ export class Repository {
       ordinal: Number(row.ordinal),
       item_type: row.item_type as ContextItemType,
       source_type: String(row.source_type),
-      source_ref: row.source_ref ? String(row.source_ref) : null,
+      source_ref: row.source_ref !== null && row.source_ref !== undefined ? String(row.source_ref) : null,
       content_json: String(row.content_json),
       content_hash: String(row.content_hash),
       token_estimate: row.token_estimate !== null && row.token_estimate !== undefined ? Number(row.token_estimate) : null,
