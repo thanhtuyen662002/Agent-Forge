@@ -2811,6 +2811,647 @@ export class Repository {
     });
   }
 
+  public bindHandoffSuccessorRoute(params: {
+    transferId: string;
+    expectedVersion: number;
+    expectedSuccessorEpoch: number;
+    sourceAssignmentId: string;
+    sourceProviderId: string;
+    successorAttemptId: string;
+    successorRoleProfileId: string;
+    successorAgentProfileId: string;
+    successorContextSnapshotId: string;
+    successorContextSpecHash: string;
+    selectedProviderId: string;
+    selectedAccountId: string;
+    selectedResourceId: string;
+    routingDecisionId: string;
+    routeSpecHash: string;
+    canonicalRouteSpec: Record<string, unknown>;
+    nowIso?: string;
+  }): {
+    success: boolean;
+    transfer?: HandoffTransfer;
+    assignment?: AgentAssignment;
+    alreadyRouted?: boolean;
+    errorCode?:
+      | 'TRANSFER_NOT_FOUND'
+      | 'TASK_NOT_FOUND'
+      | 'STALE_OWNERSHIP_EPOCH'
+      | 'STATUS_CONFLICT'
+      | 'VERSION_CONFLICT'
+      | 'SUCCESSOR_ROUTE_CONFLICT'
+      | 'SOURCE_ASSIGNMENT_NOT_FOUND'
+      | 'SOURCE_ASSIGNMENT_STATUS_MISMATCH'
+      | 'SOURCE_PROVIDER_MISMATCH'
+      | 'CROSS_PROVIDER_VIOLATION'
+      | 'SUCCESSOR_ATTEMPT_NOT_FOUND'
+      | 'SUCCESSOR_ATTEMPT_STATUS_MISMATCH'
+      | 'ROLE_PROFILE_NOT_FOUND'
+      | 'ROLE_PROFILE_DISABLED'
+      | 'AGENT_PROFILE_NOT_FOUND'
+      | 'AGENT_PROFILE_DISABLED'
+      | 'AGENT_PROFILE_ROLE_MISMATCH'
+      | 'CONTEXT_SNAPSHOT_NOT_FOUND'
+      | 'CONTEXT_SNAPSHOT_INTEGRITY_MISMATCH'
+      | 'CONTEXT_MANIFEST_NOT_FOUND'
+      | 'SUCCESSOR_CONTEXT_SPEC_CONFLICT'
+      | 'PROVIDER_NOT_FOUND'
+      | 'PROVIDER_DISABLED'
+      | 'PROVIDER_ACCOUNT_NOT_FOUND'
+      | 'PROVIDER_ACCOUNT_MISMATCH'
+      | 'PROVIDER_ACCOUNT_DISABLED'
+      | 'PROVIDER_ACCOUNT_UNSAFE_HEALTH'
+      | 'PROVIDER_RESOURCE_NOT_FOUND'
+      | 'PROVIDER_RESOURCE_MISMATCH'
+      | 'PROVIDER_RESOURCE_DISABLED'
+      | 'PROVIDER_RESOURCE_UNSAFE_HEALTH'
+      | 'PROVIDER_RESOURCE_QUOTA_EXHAUSTED'
+      | 'PROVIDER_HEALTH_UNRESOLVED_AUTHORITY'
+      | 'ROUTE_METADATA_CORRUPTION'
+      | 'INTERNAL_ERROR';
+    error?: string;
+  } {
+    return this.runInImmediateTransaction(() => {
+      const transfer = this.getHandoffTransfer(params.transferId);
+      if (!transfer) {
+        return {
+          success: false,
+          errorCode: 'TRANSFER_NOT_FOUND',
+          error: `Handoff transfer "${params.transferId}" not found.`,
+        };
+      }
+
+      // 1. Idempotent replay on already ROUTED transfer
+      if (transfer.status === 'ROUTED') {
+        if (params.expectedVersion !== transfer.version - 1) {
+          return {
+            success: false,
+            transfer,
+            errorCode: 'VERSION_CONFLICT',
+            error: `VERSION_CONFLICT: Expected pre-routing version ${transfer.version - 1}, received ${params.expectedVersion}.`,
+          };
+        }
+
+        if (!transfer.successor_assignment_id) {
+          return {
+            success: false,
+            transfer,
+            errorCode: 'ROUTE_METADATA_CORRUPTION',
+            error: `ROUTE_METADATA_CORRUPTION: Transfer "${params.transferId}" is ROUTED but successor_assignment_id is NULL.`,
+          };
+        }
+
+        const existingAssignment = this.getAgentAssignment(transfer.successor_assignment_id);
+        if (!existingAssignment) {
+          return {
+            success: false,
+            transfer,
+            errorCode: 'ROUTE_METADATA_CORRUPTION',
+            error: `ROUTE_METADATA_CORRUPTION: Bound assignment "${transfer.successor_assignment_id}" not found in database.`,
+          };
+        }
+
+        if (
+          existingAssignment.task_id !== transfer.task_id ||
+          existingAssignment.attempt_id !== params.successorAttemptId ||
+          existingAssignment.role_profile_id !== params.successorRoleProfileId ||
+          existingAssignment.agent_profile_id !== params.successorAgentProfileId
+        ) {
+          return {
+            success: false,
+            transfer,
+            errorCode: 'ROUTE_METADATA_CORRUPTION',
+            error: 'ROUTE_METADATA_CORRUPTION: Bound assignment attributes do not match transfer successor bindings.',
+          };
+        }
+
+        const meta = existingAssignment.preferred_metadata;
+        if (
+          !meta ||
+          typeof meta !== 'object' ||
+          meta.handoff_route_spec_version !== 1 ||
+          typeof meta.handoff_route_spec_hash !== 'string' ||
+          !meta.handoff_route_spec ||
+          typeof meta.handoff_route_spec !== 'object'
+        ) {
+          return {
+            success: false,
+            transfer,
+            errorCode: 'ROUTE_METADATA_CORRUPTION',
+            error: 'ROUTE_METADATA_CORRUPTION: Bound assignment preferred_metadata is missing or has invalid route spec structure.',
+          };
+        }
+
+        const recomputedHash = computeSha256(canonicalJsonStringify(meta.handoff_route_spec));
+        if (recomputedHash !== meta.handoff_route_spec_hash) {
+          return {
+            success: false,
+            transfer,
+            errorCode: 'ROUTE_METADATA_CORRUPTION',
+            error: `ROUTE_METADATA_CORRUPTION: Stored route spec hash "${meta.handoff_route_spec_hash}" does not match recomputed hash "${recomputedHash}".`,
+          };
+        }
+
+        if (meta.handoff_route_spec_hash !== params.routeSpecHash) {
+          return {
+            success: false,
+            transfer,
+            errorCode: 'SUCCESSOR_ROUTE_CONFLICT',
+            error: `SUCCESSOR_ROUTE_CONFLICT: Transfer "${params.transferId}" already routed with spec hash "${meta.handoff_route_spec_hash}", cannot route with "${params.routeSpecHash}".`,
+          };
+        }
+
+        if (existingAssignment.selected_provider_id === params.sourceProviderId) {
+          return {
+            success: false,
+            transfer,
+            errorCode: 'CROSS_PROVIDER_VIOLATION',
+            error: `CROSS_PROVIDER_VIOLATION: Existing assignment selected provider "${existingAssignment.selected_provider_id}" matches source provider "${params.sourceProviderId}".`,
+          };
+        }
+
+        return {
+          success: true,
+          transfer,
+          assignment: existingAssignment,
+          alreadyRouted: true,
+        };
+      }
+
+      // 2. Transfer status check: must be SUCCESSOR_PREPARED
+      if (transfer.status !== 'SUCCESSOR_PREPARED') {
+        return {
+          success: false,
+          transfer,
+          errorCode: 'STATUS_CONFLICT',
+          error: `STATUS_CONFLICT: Expected transfer status SUCCESSOR_PREPARED, found "${transfer.status}".`,
+        };
+      }
+
+      // 3. Version CAS check
+      if (transfer.version !== params.expectedVersion) {
+        return {
+          success: false,
+          transfer,
+          errorCode: 'VERSION_CONFLICT',
+          error: `VERSION_CONFLICT: Expected transfer version ${params.expectedVersion}, found ${transfer.version}.`,
+        };
+      }
+
+      // 4. Successor ownership epoch check
+      if (transfer.successor_ownership_epoch !== params.expectedSuccessorEpoch) {
+        return {
+          success: false,
+          transfer,
+          errorCode: 'STALE_OWNERSHIP_EPOCH',
+          error: `STALE_OWNERSHIP_EPOCH: Expected successor epoch ${params.expectedSuccessorEpoch}, found ${transfer.successor_ownership_epoch}.`,
+        };
+      }
+
+      // 5. Transfer pointer integrity checks
+      if (transfer.source_assignment_id !== params.sourceAssignmentId) {
+        return {
+          success: false,
+          transfer,
+          errorCode: 'SOURCE_ASSIGNMENT_NOT_FOUND',
+          error: `SOURCE_ASSIGNMENT_NOT_FOUND: Transfer source_assignment_id "${transfer.source_assignment_id}" does not match requested "${params.sourceAssignmentId}".`,
+        };
+      }
+
+      if (transfer.successor_attempt_id !== params.successorAttemptId) {
+        return {
+          success: false,
+          transfer,
+          errorCode: 'SUCCESSOR_ATTEMPT_NOT_FOUND',
+          error: `SUCCESSOR_ATTEMPT_NOT_FOUND: Transfer successor_attempt_id "${transfer.successor_attempt_id}" does not match requested "${params.successorAttemptId}".`,
+        };
+      }
+
+      if (transfer.successor_role_profile_id !== params.successorRoleProfileId) {
+        return {
+          success: false,
+          transfer,
+          errorCode: 'ROLE_PROFILE_NOT_FOUND',
+          error: `ROLE_PROFILE_NOT_FOUND: Transfer successor_role_profile_id "${transfer.successor_role_profile_id}" does not match requested "${params.successorRoleProfileId}".`,
+        };
+      }
+
+      if (transfer.successor_agent_profile_id !== params.successorAgentProfileId) {
+        return {
+          success: false,
+          transfer,
+          errorCode: 'AGENT_PROFILE_NOT_FOUND',
+          error: `AGENT_PROFILE_NOT_FOUND: Transfer successor_agent_profile_id "${transfer.successor_agent_profile_id}" does not match requested "${params.successorAgentProfileId}".`,
+        };
+      }
+
+      if (transfer.successor_context_snapshot_id !== params.successorContextSnapshotId) {
+        return {
+          success: false,
+          transfer,
+          errorCode: 'CONTEXT_SNAPSHOT_NOT_FOUND',
+          error: `CONTEXT_SNAPSHOT_NOT_FOUND: Transfer successor_context_snapshot_id "${transfer.successor_context_snapshot_id}" does not match requested "${params.successorContextSnapshotId}".`,
+        };
+      }
+
+      if (transfer.successor_context_spec_hash !== params.successorContextSpecHash) {
+        return {
+          success: false,
+          transfer,
+          errorCode: 'SUCCESSOR_CONTEXT_SPEC_CONFLICT',
+          error: `SUCCESSOR_CONTEXT_SPEC_CONFLICT: Transfer successor_context_spec_hash "${transfer.successor_context_spec_hash}" does not match requested "${params.successorContextSpecHash}".`,
+        };
+      }
+
+      if (transfer.successor_assignment_id !== null) {
+        return {
+          success: false,
+          transfer,
+          errorCode: 'STATUS_CONFLICT',
+          error: 'STATUS_CONFLICT: Transfer already has a non-null successor_assignment_id.',
+        };
+      }
+
+      if (transfer.successor_authorization_id !== null) {
+        return {
+          success: false,
+          transfer,
+          errorCode: 'STATUS_CONFLICT',
+          error: 'STATUS_CONFLICT: Transfer already has a non-null successor_authorization_id.',
+        };
+      }
+
+      // 6. Task authority check
+      const task = this.getTask(transfer.task_id);
+      if (!task) {
+        return {
+          success: false,
+          transfer,
+          errorCode: 'TASK_NOT_FOUND',
+          error: `Task "${transfer.task_id}" not found.`,
+        };
+      }
+
+      if (task.ownership_epoch !== params.expectedSuccessorEpoch) {
+        return {
+          success: false,
+          transfer,
+          errorCode: 'STALE_OWNERSHIP_EPOCH',
+          error: `STALE_OWNERSHIP_EPOCH: Current task epoch ${task.ownership_epoch} does not match expected successor epoch ${params.expectedSuccessorEpoch}.`,
+        };
+      }
+
+      // 7. Source AgentAssignment validation
+      const sourceAsgn = this.getAgentAssignment(params.sourceAssignmentId);
+      if (
+        !sourceAsgn ||
+        sourceAsgn.task_id !== transfer.task_id ||
+        sourceAsgn.attempt_id !== transfer.source_attempt_id
+      ) {
+        return {
+          success: false,
+          transfer,
+          errorCode: 'SOURCE_ASSIGNMENT_NOT_FOUND',
+          error: `SOURCE_ASSIGNMENT_NOT_FOUND: Source assignment "${params.sourceAssignmentId}" not found or does not match task/attempt.`,
+        };
+      }
+
+      if (sourceAsgn.status !== 'HANDED_OFF') {
+        return {
+          success: false,
+          transfer,
+          errorCode: 'SOURCE_ASSIGNMENT_STATUS_MISMATCH',
+          error: `SOURCE_ASSIGNMENT_STATUS_MISMATCH: Source assignment "${sourceAsgn.id}" status is "${sourceAsgn.status}", expected "HANDED_OFF".`,
+        };
+      }
+
+      if (sourceAsgn.selected_provider_id !== params.sourceProviderId) {
+        return {
+          success: false,
+          transfer,
+          errorCode: 'SOURCE_PROVIDER_MISMATCH',
+          error: `SOURCE_PROVIDER_MISMATCH: Source assignment provider "${sourceAsgn.selected_provider_id}" does not match requested "${params.sourceProviderId}".`,
+        };
+      }
+
+      // 8. Successor TaskAttempt validation
+      const succAttempt = this.getTaskAttempt(params.successorAttemptId);
+      if (!succAttempt || succAttempt.task_id !== transfer.task_id) {
+        return {
+          success: false,
+          transfer,
+          errorCode: 'SUCCESSOR_ATTEMPT_NOT_FOUND',
+          error: `SUCCESSOR_ATTEMPT_NOT_FOUND: Successor attempt "${params.successorAttemptId}" not found for task "${transfer.task_id}".`,
+        };
+      }
+
+      if (succAttempt.status !== 'PENDING' || succAttempt.agent_id !== null) {
+        return {
+          success: false,
+          transfer,
+          errorCode: 'SUCCESSOR_ATTEMPT_STATUS_MISMATCH',
+          error: `SUCCESSOR_ATTEMPT_STATUS_MISMATCH: Successor attempt status is "${succAttempt.status}", agent_id is "${succAttempt.agent_id}", expected status "PENDING" and NULL agent_id.`,
+        };
+      }
+
+      // 9. RoleProfile & AgentProfile validation
+      const roleProfile = this.getRoleProfile(params.successorRoleProfileId);
+      if (!roleProfile) {
+        return {
+          success: false,
+          transfer,
+          errorCode: 'ROLE_PROFILE_NOT_FOUND',
+          error: `ROLE_PROFILE_NOT_FOUND: Successor RoleProfile "${params.successorRoleProfileId}" not found.`,
+        };
+      }
+      if (!roleProfile.enabled) {
+        return {
+          success: false,
+          transfer,
+          errorCode: 'ROLE_PROFILE_DISABLED',
+          error: `ROLE_PROFILE_DISABLED: Successor RoleProfile "${params.successorRoleProfileId}" is disabled.`,
+        };
+      }
+
+      const agentProfile = this.getAgentProfile(params.successorAgentProfileId);
+      if (!agentProfile) {
+        return {
+          success: false,
+          transfer,
+          errorCode: 'AGENT_PROFILE_NOT_FOUND',
+          error: `AGENT_PROFILE_NOT_FOUND: Successor AgentProfile "${params.successorAgentProfileId}" not found.`,
+        };
+      }
+      if (!agentProfile.enabled) {
+        return {
+          success: false,
+          transfer,
+          errorCode: 'AGENT_PROFILE_DISABLED',
+          error: `AGENT_PROFILE_DISABLED: Successor AgentProfile "${params.successorAgentProfileId}" is disabled.`,
+        };
+      }
+      if (agentProfile.role_profile_id !== params.successorRoleProfileId) {
+        return {
+          success: false,
+          transfer,
+          errorCode: 'AGENT_PROFILE_ROLE_MISMATCH',
+          error: `AGENT_PROFILE_ROLE_MISMATCH: AgentProfile role_profile_id "${agentProfile.role_profile_id}" does not match "${params.successorRoleProfileId}".`,
+        };
+      }
+
+      // 10. Successor Context authority validation
+      const snapshot = this.getContextSnapshot(params.successorContextSnapshotId);
+      if (!snapshot) {
+        return {
+          success: false,
+          transfer,
+          errorCode: 'CONTEXT_SNAPSHOT_NOT_FOUND',
+          error: `CONTEXT_SNAPSHOT_NOT_FOUND: ContextSnapshot "${params.successorContextSnapshotId}" not found.`,
+        };
+      }
+      if (
+        snapshot.task_id !== transfer.task_id ||
+        snapshot.attempt_id !== params.successorAttemptId ||
+        snapshot.purpose !== 'HANDOFF'
+      ) {
+        return {
+          success: false,
+          transfer,
+          errorCode: 'CONTEXT_SNAPSHOT_INTEGRITY_MISMATCH',
+          error: `CONTEXT_SNAPSHOT_INTEGRITY_MISMATCH: ContextSnapshot integrity mismatch for "${snapshot.id}".`,
+        };
+      }
+
+      const manifest = this.getContextManifestBySnapshotId(snapshot.id);
+      if (!manifest) {
+        return {
+          success: false,
+          transfer,
+          errorCode: 'CONTEXT_MANIFEST_NOT_FOUND',
+          error: `CONTEXT_MANIFEST_NOT_FOUND: ContextManifest for snapshot "${snapshot.id}" not found.`,
+        };
+      }
+
+      // 11. Selected Provider validation
+      const provider = this.getProvider(params.selectedProviderId);
+      if (!provider) {
+        return {
+          success: false,
+          transfer,
+          errorCode: 'PROVIDER_NOT_FOUND',
+          error: `PROVIDER_NOT_FOUND: Provider "${params.selectedProviderId}" not found.`,
+        };
+      }
+      if (!provider.enabled) {
+        return {
+          success: false,
+          transfer,
+          errorCode: 'PROVIDER_DISABLED',
+          error: `PROVIDER_DISABLED: Provider "${params.selectedProviderId}" is disabled.`,
+        };
+      }
+      if (params.selectedProviderId === params.sourceProviderId) {
+        return {
+          success: false,
+          transfer,
+          errorCode: 'CROSS_PROVIDER_VIOLATION',
+          error: `CROSS_PROVIDER_VIOLATION: Selected provider "${params.selectedProviderId}" matches source provider "${params.sourceProviderId}".`,
+        };
+      }
+
+      // 12. Selected ProviderAccount validation
+      const account = this.getProviderAccount(params.selectedAccountId);
+      if (!account) {
+        return {
+          success: false,
+          transfer,
+          errorCode: 'PROVIDER_ACCOUNT_NOT_FOUND',
+          error: `PROVIDER_ACCOUNT_NOT_FOUND: ProviderAccount "${params.selectedAccountId}" not found.`,
+        };
+      }
+      if (account.provider_id !== params.selectedProviderId) {
+        return {
+          success: false,
+          transfer,
+          errorCode: 'PROVIDER_ACCOUNT_MISMATCH',
+          error: `PROVIDER_ACCOUNT_MISMATCH: Account provider_id "${account.provider_id}" does not match selected provider "${params.selectedProviderId}".`,
+        };
+      }
+      if (!account.enabled) {
+        return {
+          success: false,
+          transfer,
+          errorCode: 'PROVIDER_ACCOUNT_DISABLED',
+          error: `PROVIDER_ACCOUNT_DISABLED: ProviderAccount "${account.id}" is disabled.`,
+        };
+      }
+      if (
+        account.health_status === 'DISABLED' ||
+        account.health_status === 'OFFLINE' ||
+        account.health_status === 'UNHEALTHY' ||
+        account.health_status === 'QUOTA_EXHAUSTED' ||
+        account.health_status === 'AUTH_ERROR'
+      ) {
+        return {
+          success: false,
+          transfer,
+          errorCode: 'PROVIDER_ACCOUNT_UNSAFE_HEALTH',
+          error: `PROVIDER_ACCOUNT_UNSAFE_HEALTH: ProviderAccount "${account.id}" health status is "${account.health_status}".`,
+        };
+      }
+      if (account.health_status === 'RATE_LIMITED' || account.health_status === 'COOLDOWN') {
+        if (!account.cooldown_until) {
+          return {
+            success: false,
+            transfer,
+            errorCode: 'PROVIDER_ACCOUNT_UNSAFE_HEALTH',
+            error: `PROVIDER_ACCOUNT_UNSAFE_HEALTH: ProviderAccount "${account.id}" is in "${account.health_status}" without cooldown_until.`,
+          };
+        }
+        const cdMs = Date.parse(account.cooldown_until);
+        const nowTime = params.nowIso ? Date.parse(params.nowIso) : Date.now();
+        if (isNaN(cdMs) || cdMs > nowTime) {
+          return {
+            success: false,
+            transfer,
+            errorCode: 'PROVIDER_ACCOUNT_UNSAFE_HEALTH',
+            error: `PROVIDER_ACCOUNT_UNSAFE_HEALTH: ProviderAccount "${account.id}" cooldown is active until ${account.cooldown_until}.`,
+          };
+        }
+      }
+
+      // 13. Selected ProviderResource validation
+      const resource = this.getProviderResource(params.selectedResourceId);
+      if (!resource) {
+        return {
+          success: false,
+          transfer,
+          errorCode: 'PROVIDER_RESOURCE_NOT_FOUND',
+          error: `PROVIDER_RESOURCE_NOT_FOUND: ProviderResource "${params.selectedResourceId}" not found.`,
+        };
+      }
+      if (resource.provider_id !== params.selectedProviderId) {
+        return {
+          success: false,
+          transfer,
+          errorCode: 'PROVIDER_RESOURCE_MISMATCH',
+          error: `PROVIDER_RESOURCE_MISMATCH: Resource provider_id "${resource.provider_id}" does not match selected provider "${params.selectedProviderId}".`,
+        };
+      }
+      if (!resource.provider_account_id || resource.provider_account_id !== params.selectedAccountId) {
+        return {
+          success: false,
+          transfer,
+          errorCode: 'PROVIDER_RESOURCE_MISMATCH',
+          error: `PROVIDER_RESOURCE_MISMATCH: Resource provider_account_id "${resource.provider_account_id}" does not match selected account "${params.selectedAccountId}".`,
+        };
+      }
+      if (!resource.enabled) {
+        return {
+          success: false,
+          transfer,
+          errorCode: 'PROVIDER_RESOURCE_DISABLED',
+          error: `PROVIDER_RESOURCE_DISABLED: ProviderResource "${resource.id}" is disabled.`,
+        };
+      }
+      if (
+        resource.health_status === 'DISABLED' ||
+        resource.health_status === 'OFFLINE' ||
+        resource.health_status === 'UNHEALTHY' ||
+        resource.health_status === 'QUOTA_EXHAUSTED' ||
+        resource.health_status === 'AUTH_ERROR'
+      ) {
+        return {
+          success: false,
+          transfer,
+          errorCode: 'PROVIDER_RESOURCE_UNSAFE_HEALTH',
+          error: `PROVIDER_RESOURCE_UNSAFE_HEALTH: ProviderResource "${resource.id}" health status is "${resource.health_status}".`,
+        };
+      }
+      if (['MEASURED', 'PROVIDER_REPORTED', 'MANUAL'].includes(resource.quota_source)) {
+        if (resource.remaining_quota !== null && resource.remaining_quota !== undefined && resource.remaining_quota <= 0) {
+          return {
+            success: false,
+            transfer,
+            errorCode: 'PROVIDER_RESOURCE_QUOTA_EXHAUSTED',
+            error: `PROVIDER_RESOURCE_QUOTA_EXHAUSTED: ProviderResource "${resource.id}" quota is exhausted (remaining_quota: ${resource.remaining_quota}, source: ${resource.quota_source}).`,
+          };
+        }
+      }
+
+      // 14. Provider health routing safety check
+      const safety = this.evaluateProviderHealthRoutingSafety(params.selectedAccountId);
+      if (safety.status !== 'SAFE') {
+        return {
+          success: false,
+          transfer,
+          errorCode: 'PROVIDER_HEALTH_UNRESOLVED_AUTHORITY',
+          error: `PROVIDER_HEALTH_UNRESOLVED_AUTHORITY: Account "${params.selectedAccountId}" routing safety check returned "${safety.status}": ${safety.reason ?? ''}`.trim(),
+        };
+      }
+
+      // 15. Create AgentAssignment
+      const assignmentId = 'asgn-' + crypto.randomUUID();
+      const nowIso = params.nowIso ?? new Date().toISOString();
+      const assignment: AgentAssignment = {
+        id: assignmentId,
+        project_id: task.project_id,
+        task_id: transfer.task_id,
+        attempt_id: params.successorAttemptId,
+        role_profile_id: params.successorRoleProfileId,
+        agent_profile_id: params.successorAgentProfileId,
+        selected_provider_id: params.selectedProviderId,
+        selected_account_id: params.selectedAccountId,
+        selected_resource_id: params.selectedResourceId,
+        selected_worker_slot_id: null,
+        routing_decision_id: params.routingDecisionId,
+        preferred_metadata: {
+          handoff_route_spec_version: 1,
+          handoff_route_spec_hash: params.routeSpecHash,
+          handoff_route_spec: params.canonicalRouteSpec,
+        },
+        status: 'ASSIGNED',
+        created_at: nowIso,
+        ended_at: null,
+      };
+      this.createAgentAssignment(assignment);
+
+      // 16. Update transfer status CAS to ROUTED
+      const newVersion = transfer.version + 1;
+      const res = this.db
+        .prepare(`
+          UPDATE handoff_transfers
+          SET status = 'ROUTED',
+              successor_assignment_id = ?,
+              version = ?,
+              updated_at = ?
+          WHERE id = ? AND version = ? AND status = 'SUCCESSOR_PREPARED'
+        `)
+        .run(
+          assignmentId,
+          newVersion,
+          nowIso,
+          transfer.id,
+          transfer.version
+        );
+
+      if (res.changes !== 1) {
+        throw new Error(
+          `[HandoffBindRoute] Failed to update transfer "${transfer.id}" status to ROUTED.`
+        );
+      }
+
+      const updatedTransfer = this.getHandoffTransfer(transfer.id)!;
+      return {
+        success: true,
+        transfer: updatedTransfer,
+        assignment,
+        alreadyRouted: false,
+      };
+    });
+  }
+
   private mapHandoffTransfer(row: Record<string, unknown>): HandoffTransfer {
     return {
       id: String(row.id),
