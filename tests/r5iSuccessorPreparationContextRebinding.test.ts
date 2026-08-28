@@ -9,9 +9,12 @@ import {
   HandoffTransferService,
   computeSuccessorContextSpecHash,
   sortSuccessorCustomItems,
+  isRecoverableDeterministicSnapshotCollision,
 } from '../src/core/services/HandoffTransferService';
 import {
   ContextBuilderService,
+  BuildContextOptions,
+  BuildContextResult,
   canonicalJsonStringify,
   computeSha256,
 } from '../src/core/services/ContextBuilderService';
@@ -1537,11 +1540,12 @@ describe('R5I3 Corrective Durable Successor Context Authority and Attempt State 
         // Hook ContextBuilder for Contender A on dbA to interleave Contender B immediately before A persists
         let contenderBExecuted = false;
         let contenderARaceEncountered = false;
+        let capturedCollisionError: any = null;
 
         class InterleavingContextBuilderService extends ContextBuilderService {
           public onBeforeBuild?: () => void;
 
-          override buildContextSnapshot(options: any) {
+          override buildContextSnapshot(options: BuildContextOptions): BuildContextResult {
             if (this.onBeforeBuild) {
               const hook = this.onBeforeBuild;
               this.onBeforeBuild = undefined;
@@ -1551,6 +1555,7 @@ describe('R5I3 Corrective Durable Successor Context Authority and Attempt State 
               return super.buildContextSnapshot(options);
             } catch (err) {
               // Contender A encountered the duplicate key conflict on dbA
+              capturedCollisionError = err;
               contenderARaceEncountered = true;
               throw err;
             }
@@ -1595,6 +1600,18 @@ describe('R5I3 Corrective Durable Successor Context Authority and Attempt State 
 
         // 15. Contender A actually encountered the duplicate deterministic artifact insertion race
         expect(contenderARaceEncountered).toBe(true);
+        expect(capturedCollisionError).toBeDefined();
+
+        // Prove actual SQLite error code and collision identity
+        const isConstraintCode =
+          capturedCollisionError.code === 'SQLITE_CONSTRAINT_PRIMARYKEY' ||
+          capturedCollisionError.code === 'SQLITE_CONSTRAINT_UNIQUE' ||
+          capturedCollisionError.code === 'SQLITE_CONSTRAINT';
+        expect(isConstraintCode).toBe(true);
+        expect(capturedCollisionError.message).toMatch(/UNIQUE constraint failed.*context_snapshots\.id/);
+
+        // Prove collision classifier returns recoverable for the real race error
+        expect(isRecoverableDeterministicSnapshotCollision(capturedCollisionError, deterministicSnapId)).toBe(true);
 
         // 16. Contender A successfully recovered via production race recovery path
         expect(resA.success).toBe(true);
@@ -1636,6 +1653,111 @@ describe('R5I3 Corrective Durable Successor Context Authority and Attempt State 
           // Ignore cleanup errors
         }
       }
+    });
+
+    it('Proofs 10..12 (Defect 4th Corrective). non-collision error with valid deterministic candidate present returns CONTEXT_BUILD_FAILED and fails closed', () => {
+      seedBaseEntities();
+      const { transferId, version, newEpoch } = seedRelinquishedHandoff();
+
+      const sharedSuccessorAttemptId = 'att-succ-noncollision-1';
+      const specHash = computeSuccessorContextSpecHash({
+        transferId,
+        successorAttemptId: sharedSuccessorAttemptId,
+        purpose: 'HANDOFF',
+        handoffContextId: null,
+        checkpointId: null,
+        contextFiles: [],
+        customItems: [],
+      });
+      const deterministicSnapId = `ctx-snap-ho-${computeSha256(`r5i-successor-context:${transferId}:${specHash}`).slice(0, 32)}`;
+      const deterministicManId = `ctx-man-ho-${computeSha256(`r5i-successor-manifest:${transferId}:${specHash}`).slice(0, 32)}`;
+
+      // Custom ContextBuilder that inserts valid deterministic snapshot/manifest into DB, but then throws a non-collision error
+      class SyntheticFailureContextBuilder extends ContextBuilderService {
+        override buildContextSnapshot(options: BuildContextOptions): BuildContextResult {
+          // Pre-persist the exact valid candidate into DB
+          super.buildContextSnapshot(options);
+          // But deliberately throw a NON-collision error instead of returning normally
+          throw new Error('SYNTHETIC_NON_COLLISION_CONTEXT_BUILD_FAILURE');
+        }
+      }
+
+      const failingBuilder = new SyntheticFailureContextBuilder(repo);
+      const failingService = new HandoffTransferService(repo, failingBuilder);
+
+      const res = failingService.prepareHandoffSuccessor({
+        transferId,
+        expectedVersion: version,
+        expectedSuccessorEpoch: newEpoch,
+        successorRoleProfileId: 'rp-reviewer',
+        successorAgentProfileId: 'prof-reviewer-1',
+        successorAttemptId: sharedSuccessorAttemptId,
+        buildContext: true,
+      });
+
+      // Proof 10: Returns fail-closed CONTEXT_BUILD_FAILED
+      expect(res.success).toBe(false);
+      expect(res.errorCode).toBe('CONTEXT_BUILD_FAILED');
+      expect(res.error).toContain('SYNTHETIC_NON_COLLISION_CONTEXT_BUILD_FAILURE');
+
+      // Proof 11: Non-collision error does not become race success
+      expect(res.alreadyBound).toBeUndefined();
+
+      // Proof 12: Unbound candidate authority is NOT promoted and pointer remains NULL
+      const transfer = repo.getHandoffTransfer(transferId)!;
+      expect(transfer.successor_context_snapshot_id).toBeNull();
+      expect(transfer.successor_context_spec_hash).toBeNull();
+    });
+
+    it('Proofs 13..15 & Section 8. collision classifier strictly discriminates recoverable vs non-recoverable SQLite constraints', () => {
+      // 1. Arbitrary Error
+      expect(isRecoverableDeterministicSnapshotCollision(new Error('Arbitrary failure'))).toBe(false);
+
+      // 2. CHECK constraint error
+      expect(
+        isRecoverableDeterministicSnapshotCollision({
+          code: 'SQLITE_CONSTRAINT_CHECK',
+          message: 'CHECK constraint failed: task_attempts_status_check',
+        })
+      ).toBe(false);
+
+      // 3. FOREIGN KEY constraint error
+      expect(
+        isRecoverableDeterministicSnapshotCollision({
+          code: 'SQLITE_CONSTRAINT_FOREIGNKEY',
+          message: 'FOREIGN KEY constraint failed',
+        })
+      ).toBe(false);
+
+      // 4. UNIQUE constraint on wrong table
+      expect(
+        isRecoverableDeterministicSnapshotCollision(
+          {
+            code: 'SQLITE_CONSTRAINT_UNIQUE',
+            message: 'UNIQUE constraint failed: other_table.id',
+          },
+          'ctx-snap-expected'
+        )
+      ).toBe(false);
+
+      // 5. Valid SQLite PRIMARY KEY constraint error on context_snapshots.id
+      expect(
+        isRecoverableDeterministicSnapshotCollision({
+          code: 'SQLITE_CONSTRAINT_PRIMARYKEY',
+          message: 'UNIQUE constraint failed: context_snapshots.id',
+        })
+      ).toBe(true);
+
+      // 6. Valid SQLite UNIQUE constraint error identifying snapshot ID
+      expect(
+        isRecoverableDeterministicSnapshotCollision(
+          {
+            code: 'SQLITE_CONSTRAINT_UNIQUE',
+            message: 'UNIQUE constraint failed: context_snapshots.id',
+          },
+          'ctx-snap-ho-123'
+        )
+      ).toBe(true);
     });
 
     it('38. conflicting context specs cannot both bind', () => {

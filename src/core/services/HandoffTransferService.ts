@@ -18,6 +18,37 @@ import {
   computeSha256,
 } from './ContextBuilderService';
 
+export function isRecoverableDeterministicSnapshotCollision(
+  err: unknown,
+  expectedSnapshotId?: string
+): boolean {
+  if (!err || typeof err !== 'object') {
+    return false;
+  }
+
+  const error = err as { code?: string; message?: string; name?: string };
+  const code = error.code ? String(error.code) : '';
+  const message = error.message ? String(error.message) : '';
+
+  // Must be an SQLite unique / primary-key constraint error
+  const isUniqueOrPrimaryKey =
+    code === 'SQLITE_CONSTRAINT_PRIMARYKEY' ||
+    code === 'SQLITE_CONSTRAINT_UNIQUE' ||
+    (code === 'SQLITE_CONSTRAINT' && (message.includes('UNIQUE constraint failed') || message.includes('PRIMARY KEY constraint failed')));
+
+  if (!isUniqueOrPrimaryKey) {
+    return false;
+  }
+
+  // Must specifically identify the context_snapshots.id collision
+  const targetsSnapshot =
+    message.includes('context_snapshots.id') ||
+    message.includes('context_snapshots') ||
+    (expectedSnapshotId ? message.includes(expectedSnapshotId) : false);
+
+  return Boolean(targetsSnapshot);
+}
+
 export function sortSuccessorCustomItems<T extends {
   itemType?: ContextItemType;
   sourceType: string;
@@ -997,7 +1028,19 @@ export class HandoffTransferService {
         candidateManifest = ctxResult.manifest;
         candidateItems = ctxResult.items;
       } catch (err) {
-        // Race recovery: if a concurrent contender already persisted the deterministic candidate
+        // Enforce exact collision classification before attempting race recovery
+        if (!isRecoverableDeterministicSnapshotCollision(err, deterministicSnapshotId)) {
+          return {
+            success: false,
+            transfer,
+            successorAttempt,
+            alreadyPrepared: prepRes.alreadyPrepared,
+            errorCode: 'CONTEXT_BUILD_FAILED',
+            error: `[ContextBuildFailed] ${err instanceof Error ? err.message : String(err)}`,
+          };
+        }
+
+        // Race recovery: a concurrent contender already persisted the deterministic candidate
         const recoveredSnap = this.repo.getContextSnapshot(deterministicSnapshotId);
         const recoveredMan = recoveredSnap ? this.repo.getContextManifestBySnapshotId(recoveredSnap.id) : null;
         if (
@@ -1018,7 +1061,7 @@ export class HandoffTransferService {
             successorAttempt,
             alreadyPrepared: prepRes.alreadyPrepared,
             errorCode: 'CONTEXT_BUILD_FAILED',
-            error: `[ContextBuildFailed] ${err instanceof Error ? err.message : String(err)}`,
+            error: `[ContextBuildFailed] Recovered candidate failed integrity validation after collision: ${err instanceof Error ? err.message : String(err)}`,
           };
         }
       }
