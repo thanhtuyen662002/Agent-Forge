@@ -1781,6 +1781,34 @@ describe('R5I4 Cross-Provider Successor Routing and Replay Identity Authority', 
       expect(t?.status).toBe('SUCCESSOR_PREPARED');
     });
 
+    it('E1b. legacy caller routedAt injection cannot influence Phase-B cooldown authority', async () => {
+      const { transfer } = createPreparedTransfer({ version: 2 });
+      const originalBind = repo.bindHandoffSuccessorRoute.bind(repo);
+      repo.bindHandoffSuccessorRoute = (params) => {
+        const futureCooldown = new Date(Date.now() + 3600000).toISOString();
+        db.prepare("UPDATE provider_accounts SET health_status = 'COOLDOWN', cooldown_until = ? WHERE id = ?").run(
+          futureCooldown,
+          params.selectedAccountId
+        );
+        return originalBind(params);
+      };
+
+      const res = await handoffService.routeHandoffSuccessor({
+        transferId: transfer.id,
+        expectedVersion: 2,
+        expectedSuccessorEpoch: 2,
+        candidateRefs: [{ accountId: 'acc-succ-openai-1', resourceId: 'res-succ-openai-1' }],
+        routedAt: '9999-12-31T23:59:59.999Z',
+      } as any);
+
+      expect(res.success).toBe(false);
+      expect(res.errorCode).toBe('PROVIDER_ACCOUNT_UNSAFE_HEALTH');
+      expect(repo.getAllAgentAssignments().length).toBe(1);
+      const t = repo.getHandoffTransfer(transfer.id);
+      expect(t?.status).toBe('SUCCESSOR_PREPARED');
+      expect(t?.successor_assignment_id).toBeNull();
+    });
+
     it('E2. expired persisted cooldown remains eligible', async () => {
       const pastCooldown = new Date(Date.now() - 3600000).toISOString();
       db.prepare("UPDATE provider_accounts SET health_status = 'COOLDOWN', cooldown_until = ? WHERE id = 'acc-succ-openai-1'").run(pastCooldown);
