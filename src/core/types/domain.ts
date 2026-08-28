@@ -1165,6 +1165,8 @@ export interface HandoffTransfer {
   successor_assignment_id: string | null;
   successor_role_profile_id: string | null;
   successor_agent_profile_id: string | null;
+  successor_context_snapshot_id: string | null;
+  successor_context_spec_hash: string | null;
   handoff_context_id: string | null;
   checkpoint_id: string | null;
   source_authorization_id: string | null;

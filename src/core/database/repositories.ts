@@ -1873,12 +1873,12 @@ export class Repository {
           INSERT INTO handoff_transfers (
             id, request_id, task_id, source_attempt_id, successor_attempt_id,
             source_assignment_id, successor_assignment_id, successor_role_profile_id,
-            successor_agent_profile_id, handoff_context_id,
-            checkpoint_id, source_authorization_id, successor_authorization_id,
+            successor_agent_profile_id, successor_context_snapshot_id, successor_context_spec_hash,
+            handoff_context_id, checkpoint_id, source_authorization_id, successor_authorization_id,
             reason, status, source_ownership_epoch, successor_ownership_epoch,
             version, frozen_at, quiescing_at, relinquished_at, accepted_at,
             completed_at, created_at, updated_at
-          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         `)
         .run(
           transfer.id,
@@ -1890,6 +1890,8 @@ export class Repository {
           transfer.successor_assignment_id ?? null,
           transfer.successor_role_profile_id ?? null,
           transfer.successor_agent_profile_id ?? null,
+          transfer.successor_context_snapshot_id ?? null,
+          transfer.successor_context_spec_hash ?? null,
           transfer.handoff_context_id ?? null,
           transfer.checkpoint_id ?? null,
           transfer.source_authorization_id ?? null,
@@ -1984,6 +1986,8 @@ export class Repository {
       const successorAssignmentId = fields.successor_assignment_id !== undefined ? fields.successor_assignment_id : existing.successor_assignment_id;
       const successorRoleProfileId = fields.successor_role_profile_id !== undefined ? fields.successor_role_profile_id : existing.successor_role_profile_id;
       const successorAgentProfileId = fields.successor_agent_profile_id !== undefined ? fields.successor_agent_profile_id : existing.successor_agent_profile_id;
+      const successorContextSnapshotId = fields.successor_context_snapshot_id !== undefined ? fields.successor_context_snapshot_id : existing.successor_context_snapshot_id;
+      const successorContextSpecHash = fields.successor_context_spec_hash !== undefined ? fields.successor_context_spec_hash : existing.successor_context_spec_hash;
       const handoffContextId = fields.handoff_context_id !== undefined ? fields.handoff_context_id : existing.handoff_context_id;
       const checkpointId = fields.checkpoint_id !== undefined ? fields.checkpoint_id : existing.checkpoint_id;
       const sourceAuthorizationId = fields.source_authorization_id !== undefined ? fields.source_authorization_id : existing.source_authorization_id;
@@ -2004,6 +2008,8 @@ export class Repository {
               successor_assignment_id = ?,
               successor_role_profile_id = ?,
               successor_agent_profile_id = ?,
+              successor_context_snapshot_id = ?,
+              successor_context_spec_hash = ?,
               handoff_context_id = ?,
               checkpoint_id = ?,
               source_authorization_id = ?,
@@ -2025,6 +2031,8 @@ export class Repository {
           successorAssignmentId,
           successorRoleProfileId,
           successorAgentProfileId,
+          successorContextSnapshotId,
+          successorContextSpecHash,
           handoffContextId,
           checkpointId,
           sourceAuthorizationId,
@@ -2341,6 +2349,468 @@ export class Repository {
     });
   }
 
+  public prepareHandoffSuccessor(params: {
+    transferId: string;
+    expectedVersion: number;
+    expectedSuccessorEpoch: number;
+    successorRoleProfileId: string;
+    successorAgentProfileId: string;
+    successorAttemptId?: string;
+    preparedAt?: string;
+  }): {
+    success: boolean;
+    transfer?: HandoffTransfer;
+    successorAttempt?: TaskAttempt;
+    alreadyPrepared?: boolean;
+    error?: string;
+    errorCode?:
+      | 'TRANSFER_NOT_FOUND'
+      | 'STATUS_CONFLICT'
+      | 'VERSION_CONFLICT'
+      | 'STALE_OWNERSHIP_EPOCH'
+      | 'TASK_NOT_FOUND'
+      | 'ROLE_PROFILE_NOT_FOUND'
+      | 'ROLE_PROFILE_DISABLED'
+      | 'AGENT_PROFILE_NOT_FOUND'
+      | 'AGENT_PROFILE_DISABLED'
+      | 'AGENT_PROFILE_ROLE_MISMATCH'
+      | 'ATTEMPT_ID_ALREADY_EXISTS'
+      | 'CONFLICTING_SUCCESSOR_PROFILE'
+      | 'CONFLICTING_SUCCESSOR_ROLE'
+      | 'INTERNAL_ERROR';
+  } {
+    return this.runInImmediateTransaction(() => {
+      // 1. Re-read handoff transfer
+      const transfer = this.getHandoffTransfer(params.transferId);
+      if (!transfer) {
+        return {
+          success: false,
+          errorCode: 'TRANSFER_NOT_FOUND',
+          error: `Handoff transfer "${params.transferId}" not found.`,
+        };
+      }
+
+      // Idempotent replay check: if already SUCCESSOR_PREPARED
+      if (transfer.status === 'SUCCESSOR_PREPARED' && transfer.successor_attempt_id !== null) {
+        if (transfer.successor_role_profile_id !== params.successorRoleProfileId) {
+          return {
+            success: false,
+            errorCode: 'CONFLICTING_SUCCESSOR_ROLE',
+            error: `Transfer is already prepared with successor role profile "${transfer.successor_role_profile_id}", expected "${params.successorRoleProfileId}".`,
+          };
+        }
+        if (transfer.successor_agent_profile_id !== params.successorAgentProfileId) {
+          return {
+            success: false,
+            errorCode: 'CONFLICTING_SUCCESSOR_PROFILE',
+            error: `Transfer is already prepared with successor agent profile "${transfer.successor_agent_profile_id}", expected "${params.successorAgentProfileId}".`,
+          };
+        }
+        if (transfer.successor_ownership_epoch !== params.expectedSuccessorEpoch) {
+          return {
+            success: false,
+            errorCode: 'STALE_OWNERSHIP_EPOCH',
+            error: `Transfer is already prepared with successor ownership epoch ${transfer.successor_ownership_epoch}, expected ${params.expectedSuccessorEpoch}.`,
+          };
+        }
+        // If transfer already reached version + 1 (or + 2 if context bound), verify replay version
+        if (params.expectedVersion < 1 || params.expectedVersion > transfer.version) {
+          return {
+            success: false,
+            errorCode: 'VERSION_CONFLICT',
+            error: `VERSION_CONFLICT: Replay expectedVersion ${params.expectedVersion} is invalid for current version ${transfer.version}.`,
+          };
+        }
+
+        const existingAttempt = this.getTaskAttempt(transfer.successor_attempt_id);
+        if (!existingAttempt) {
+          return {
+            success: false,
+            errorCode: 'INTERNAL_ERROR',
+            error: `Successor attempt "${transfer.successor_attempt_id}" not found in database.`,
+          };
+        }
+
+        return {
+          success: true,
+          transfer,
+          successorAttempt: existingAttempt,
+          alreadyPrepared: true,
+        };
+      }
+
+      // Precondition: status must be RELINQUISHED and relinquished_at must not be null
+      if (transfer.status !== 'RELINQUISHED' || transfer.relinquished_at === null) {
+        return {
+          success: false,
+          errorCode: 'STATUS_CONFLICT',
+          error: `STATUS_CONFLICT: Expected transfer status RELINQUISHED with non-null relinquished_at, found status "${transfer.status}" (relinquished_at: ${transfer.relinquished_at}).`,
+        };
+      }
+
+      // Version CAS check
+      if (transfer.version !== params.expectedVersion) {
+        return {
+          success: false,
+          errorCode: 'VERSION_CONFLICT',
+          error: `VERSION_CONFLICT: Expected transfer version ${params.expectedVersion}, found ${transfer.version}.`,
+        };
+      }
+
+      // 2. Re-read Task
+      const task = this.getTask(transfer.task_id);
+      if (!task) {
+        return {
+          success: false,
+          errorCode: 'TASK_NOT_FOUND',
+          error: `Task "${transfer.task_id}" not found.`,
+        };
+      }
+
+      const currentTaskEpoch = task.ownership_epoch ?? 1;
+      if (
+        currentTaskEpoch !== params.expectedSuccessorEpoch ||
+        currentTaskEpoch !== transfer.source_ownership_epoch + 1
+      ) {
+        return {
+          success: false,
+          errorCode: 'STALE_OWNERSHIP_EPOCH',
+          error: `STALE_OWNERSHIP_EPOCH: Expected successor epoch ${params.expectedSuccessorEpoch}, current task epoch is ${currentTaskEpoch}, transfer source epoch was ${transfer.source_ownership_epoch}.`,
+        };
+      }
+
+      // 3. Successor RoleProfile & AgentProfile validation inside transaction
+      const roleProfile = this.getRoleProfile(params.successorRoleProfileId);
+      if (!roleProfile) {
+        return {
+          success: false,
+          errorCode: 'ROLE_PROFILE_NOT_FOUND',
+          error: `ROLE_PROFILE_NOT_FOUND: Successor RoleProfile "${params.successorRoleProfileId}" not found.`,
+        };
+      }
+      if (!roleProfile.enabled) {
+        return {
+          success: false,
+          errorCode: 'ROLE_PROFILE_DISABLED',
+          error: `ROLE_PROFILE_DISABLED: Successor RoleProfile "${params.successorRoleProfileId}" is disabled.`,
+        };
+      }
+
+      const agentProfile = this.getAgentProfile(params.successorAgentProfileId);
+      if (!agentProfile) {
+        return {
+          success: false,
+          errorCode: 'AGENT_PROFILE_NOT_FOUND',
+          error: `AGENT_PROFILE_NOT_FOUND: Successor AgentProfile "${params.successorAgentProfileId}" not found.`,
+        };
+      }
+      if (!agentProfile.enabled) {
+        return {
+          success: false,
+          errorCode: 'AGENT_PROFILE_DISABLED',
+          error: `AGENT_PROFILE_DISABLED: Successor AgentProfile "${params.successorAgentProfileId}" is disabled.`,
+        };
+      }
+      if (agentProfile.role_profile_id !== params.successorRoleProfileId) {
+        return {
+          success: false,
+          errorCode: 'AGENT_PROFILE_ROLE_MISMATCH',
+          error: `AGENT_PROFILE_ROLE_MISMATCH: Successor AgentProfile "${params.successorAgentProfileId}" role_profile_id is "${agentProfile.role_profile_id}", expected "${params.successorRoleProfileId}".`,
+        };
+      }
+
+      // 4. Compute next attempt_number atomically
+      const maxRow = this.db
+        .prepare('SELECT COALESCE(MAX(attempt_number), 0) + 1 AS next_attempt_number FROM task_attempts WHERE task_id = ?')
+        .get(transfer.task_id) as { next_attempt_number: number };
+      const nextAttemptNumber = Number(maxRow.next_attempt_number);
+
+      const successorAttemptId = params.successorAttemptId ?? ('att-' + crypto.randomUUID());
+
+      // Check if attempt id already exists
+      const existingAttempt = this.getTaskAttempt(successorAttemptId);
+      if (existingAttempt) {
+        return {
+          success: false,
+          errorCode: 'ATTEMPT_ID_ALREADY_EXISTS',
+          error: `TaskAttempt with ID "${successorAttemptId}" already exists.`,
+        };
+      }
+
+      const nowIso = params.preparedAt ?? new Date().toISOString();
+
+      // 5. Create TaskAttempt N+1 ALWAYS in PENDING initial state
+      const successorAttempt: TaskAttempt = {
+        id: successorAttemptId,
+        task_id: transfer.task_id,
+        attempt_number: nextAttemptNumber,
+        agent_id: null,
+        agent_profile_id: params.successorAgentProfileId,
+        status: 'PENDING',
+        started_at: nowIso,
+        ended_at: null,
+        summary: null,
+      };
+
+      this.db
+        .prepare(`
+          INSERT INTO task_attempts (id, task_id, attempt_number, agent_id, agent_profile_id, status, started_at, ended_at, summary)
+          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        `)
+        .run(
+          successorAttempt.id,
+          successorAttempt.task_id,
+          successorAttempt.attempt_number,
+          successorAttempt.agent_id,
+          successorAttempt.agent_profile_id,
+          successorAttempt.status,
+          successorAttempt.started_at,
+          successorAttempt.ended_at,
+          successorAttempt.summary
+        );
+
+      // 6. Update handoff_transfers CAS
+      const newVersion = transfer.version + 1;
+      const transferRes = this.db
+        .prepare(`
+          UPDATE handoff_transfers
+          SET status = 'SUCCESSOR_PREPARED',
+              successor_attempt_id = ?,
+              successor_role_profile_id = ?,
+              successor_agent_profile_id = ?,
+              successor_ownership_epoch = ?,
+              version = ?,
+              updated_at = ?
+          WHERE id = ? AND version = ? AND status = 'RELINQUISHED'
+        `)
+        .run(
+          successorAttemptId,
+          params.successorRoleProfileId,
+          params.successorAgentProfileId,
+          currentTaskEpoch,
+          newVersion,
+          nowIso,
+          transfer.id,
+          transfer.version
+        );
+
+      if (transferRes.changes !== 1) {
+        throw new Error(
+          `[HandoffPrepareSuccessor] Failed to update transfer "${transfer.id}" status to SUCCESSOR_PREPARED.`
+        );
+      }
+
+      const updatedTransfer = this.getHandoffTransfer(transfer.id)!;
+      return {
+        success: true,
+        transfer: updatedTransfer,
+        successorAttempt,
+        alreadyPrepared: false,
+      };
+    });
+  }
+
+  public bindHandoffSuccessorContext(params: {
+    transferId: string;
+    expectedVersion: number;
+    successorContextSnapshotId: string;
+    successorContextSpecHash: string;
+    boundAt?: string;
+  }): {
+    success: boolean;
+    transfer?: HandoffTransfer;
+    alreadyBound?: boolean;
+    error?: string;
+    errorCode?:
+      | 'TRANSFER_NOT_FOUND'
+      | 'STATUS_CONFLICT'
+      | 'VERSION_CONFLICT'
+      | 'STALE_OWNERSHIP_EPOCH'
+      | 'TASK_NOT_FOUND'
+      | 'SUCCESSOR_NOT_PREPARED'
+      | 'CONTEXT_SNAPSHOT_NOT_FOUND'
+      | 'CONTEXT_SNAPSHOT_INTEGRITY_MISMATCH'
+      | 'CONTEXT_MANIFEST_NOT_FOUND'
+      | 'SUCCESSOR_CONTEXT_SPEC_CONFLICT'
+      | 'INTERNAL_ERROR';
+  } {
+    return this.runInImmediateTransaction(() => {
+      const transfer = this.getHandoffTransfer(params.transferId);
+      if (!transfer) {
+        return {
+          success: false,
+          errorCode: 'TRANSFER_NOT_FOUND',
+          error: `Handoff transfer "${params.transferId}" not found.`,
+        };
+      }
+
+      if (transfer.status !== 'SUCCESSOR_PREPARED') {
+        return {
+          success: false,
+          errorCode: 'STATUS_CONFLICT',
+          error: `STATUS_CONFLICT: Expected transfer status SUCCESSOR_PREPARED, found "${transfer.status}".`,
+        };
+      }
+
+      if (!transfer.successor_attempt_id) {
+        return {
+          success: false,
+          errorCode: 'SUCCESSOR_NOT_PREPARED',
+          error: `SUCCESSOR_NOT_PREPARED: Transfer "${params.transferId}" has no successor_attempt_id.`,
+        };
+      }
+
+      const task = this.getTask(transfer.task_id);
+      if (!task) {
+        return {
+          success: false,
+          errorCode: 'TASK_NOT_FOUND',
+          error: `Task "${transfer.task_id}" not found.`,
+        };
+      }
+
+      if (task.ownership_epoch !== transfer.successor_ownership_epoch) {
+        return {
+          success: false,
+          errorCode: 'STALE_OWNERSHIP_EPOCH',
+          error: `STALE_OWNERSHIP_EPOCH: Current task epoch ${task.ownership_epoch} does not match transfer successor epoch ${transfer.successor_ownership_epoch}.`,
+        };
+      }
+
+      // Check if already bound
+      if (transfer.successor_context_snapshot_id !== null) {
+        if (transfer.successor_context_snapshot_id !== params.successorContextSnapshotId) {
+          return {
+            success: false,
+            errorCode: 'SUCCESSOR_CONTEXT_SPEC_CONFLICT',
+            error: `SUCCESSOR_CONTEXT_SPEC_CONFLICT: Transfer is already bound to snapshot "${transfer.successor_context_snapshot_id}", cannot bind "${params.successorContextSnapshotId}".`,
+          };
+        }
+
+        if (transfer.successor_context_spec_hash !== params.successorContextSpecHash) {
+          return {
+            success: false,
+            errorCode: 'SUCCESSOR_CONTEXT_SPEC_CONFLICT',
+            error: `SUCCESSOR_CONTEXT_SPEC_CONFLICT: Persisted spec hash "${transfer.successor_context_spec_hash}" does not match requested spec hash "${params.successorContextSpecHash}".`,
+          };
+        }
+
+        // Validate persisted authoritative ContextSnapshot
+        const snapshot = this.getContextSnapshot(params.successorContextSnapshotId);
+        if (!snapshot) {
+          return {
+            success: false,
+            errorCode: 'CONTEXT_SNAPSHOT_NOT_FOUND',
+            error: `ContextSnapshot "${params.successorContextSnapshotId}" not found.`,
+          };
+        }
+
+        if (
+          snapshot.task_id !== transfer.task_id ||
+          snapshot.attempt_id !== transfer.successor_attempt_id ||
+          snapshot.purpose !== 'HANDOFF'
+        ) {
+          return {
+            success: false,
+            errorCode: 'CONTEXT_SNAPSHOT_INTEGRITY_MISMATCH',
+            error: `ContextSnapshot integrity mismatch: task=${snapshot.task_id} (expected ${transfer.task_id}), attempt=${snapshot.attempt_id} (expected ${transfer.successor_attempt_id}), purpose=${snapshot.purpose} (expected HANDOFF).`,
+          };
+        }
+
+        // Validate persisted authoritative ContextManifest
+        const manifest = this.getContextManifestBySnapshotId(snapshot.id);
+        if (!manifest) {
+          return {
+            success: false,
+            errorCode: 'CONTEXT_MANIFEST_NOT_FOUND',
+            error: `ContextManifest for snapshot "${snapshot.id}" not found.`,
+          };
+        }
+
+        return {
+          success: true,
+          transfer,
+          alreadyBound: true,
+        };
+      }
+
+      // Unbound path: Version CAS check
+      if (transfer.version !== params.expectedVersion) {
+        return {
+          success: false,
+          errorCode: 'VERSION_CONFLICT',
+          error: `VERSION_CONFLICT: Expected transfer version ${params.expectedVersion}, found ${transfer.version}.`,
+        };
+      }
+
+      // Validate candidate ContextSnapshot
+      const snapshot = this.getContextSnapshot(params.successorContextSnapshotId);
+      if (!snapshot) {
+        return {
+          success: false,
+          errorCode: 'CONTEXT_SNAPSHOT_NOT_FOUND',
+          error: `ContextSnapshot "${params.successorContextSnapshotId}" not found.`,
+        };
+      }
+
+      if (
+        snapshot.task_id !== transfer.task_id ||
+        snapshot.attempt_id !== transfer.successor_attempt_id ||
+        snapshot.purpose !== 'HANDOFF'
+      ) {
+        return {
+          success: false,
+          errorCode: 'CONTEXT_SNAPSHOT_INTEGRITY_MISMATCH',
+          error: `ContextSnapshot integrity mismatch: task=${snapshot.task_id} (expected ${transfer.task_id}), attempt=${snapshot.attempt_id} (expected ${transfer.successor_attempt_id}), purpose=${snapshot.purpose} (expected HANDOFF).`,
+        };
+      }
+
+      // Validate candidate ContextManifest
+      const manifest = this.getContextManifestBySnapshotId(snapshot.id);
+      if (!manifest) {
+        return {
+          success: false,
+          errorCode: 'CONTEXT_MANIFEST_NOT_FOUND',
+          error: `ContextManifest for snapshot "${snapshot.id}" not found.`,
+        };
+      }
+
+      const nowIso = params.boundAt ?? new Date().toISOString();
+      const newVersion = transfer.version + 1;
+
+      const res = this.db
+        .prepare(`
+          UPDATE handoff_transfers
+          SET successor_context_snapshot_id = ?,
+              successor_context_spec_hash = ?,
+              version = ?,
+              updated_at = ?
+          WHERE id = ? AND version = ? AND status = 'SUCCESSOR_PREPARED' AND successor_context_snapshot_id IS NULL
+        `)
+        .run(
+          params.successorContextSnapshotId,
+          params.successorContextSpecHash,
+          newVersion,
+          nowIso,
+          transfer.id,
+          transfer.version
+        );
+
+      if (res.changes !== 1) {
+        throw new Error(
+          `[HandoffBindContext] Failed to update transfer "${transfer.id}" successor context pointer.`
+        );
+      }
+
+      const updated = this.getHandoffTransfer(transfer.id)!;
+      return {
+        success: true,
+        transfer: updated,
+        alreadyBound: false,
+      };
+    });
+  }
+
   private mapHandoffTransfer(row: Record<string, unknown>): HandoffTransfer {
     return {
       id: String(row.id),
@@ -2352,6 +2822,8 @@ export class Repository {
       successor_assignment_id: row.successor_assignment_id ? String(row.successor_assignment_id) : null,
       successor_role_profile_id: row.successor_role_profile_id ? String(row.successor_role_profile_id) : null,
       successor_agent_profile_id: row.successor_agent_profile_id ? String(row.successor_agent_profile_id) : null,
+      successor_context_snapshot_id: row.successor_context_snapshot_id ? String(row.successor_context_snapshot_id) : null,
+      successor_context_spec_hash: row.successor_context_spec_hash ? String(row.successor_context_spec_hash) : null,
       handoff_context_id: row.handoff_context_id ? String(row.handoff_context_id) : null,
       checkpoint_id: row.checkpoint_id ? String(row.checkpoint_id) : null,
       source_authorization_id: row.source_authorization_id ? String(row.source_authorization_id) : null,
@@ -4232,7 +4704,7 @@ export class Repository {
       ordinal: Number(row.ordinal),
       item_type: row.item_type as ContextItemType,
       source_type: String(row.source_type),
-      source_ref: row.source_ref ? String(row.source_ref) : null,
+      source_ref: row.source_ref !== null && row.source_ref !== undefined ? String(row.source_ref) : null,
       content_json: String(row.content_json),
       content_hash: String(row.content_hash),
       token_estimate: row.token_estimate !== null && row.token_estimate !== undefined ? Number(row.token_estimate) : null,

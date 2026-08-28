@@ -17,6 +17,7 @@ import {
 } from '../context/ContextIntegrity';
 
 export {
+  codeUnitCompare,
   canonicalJsonStringify,
   computeSha256,
   sanitizeContextFiles,
@@ -38,6 +39,8 @@ export interface BuildContextOptions {
   includeLatestHandoff?: boolean;
   checkpointId?: string | null;
   handoffId?: string | null;
+  snapshotId?: string | null;
+  manifestId?: string | null;
   contextFiles?: string[];
   customItems?: Array<{
     itemType?: ContextItemType;
@@ -136,8 +139,8 @@ export class ContextBuilderService {
       }
     }
 
-    const snapshotId = `ctx-snap-${crypto.randomUUID()}`;
-    const manifestId = `ctx-man-${crypto.randomUUID()}`;
+    const snapshotId = options.snapshotId ?? `ctx-snap-${crypto.randomUUID()}`;
+    const manifestId = options.manifestId ?? `ctx-man-${crypto.randomUUID()}`;
     const now = new Date().toISOString();
 
     const rawItems: Array<{
@@ -384,7 +387,9 @@ export class ContextBuilderService {
     const contextItems: ContextItem[] = rawItems.map((raw, idx) => {
       const contentJson = canonicalJsonStringify(raw.content);
       const contentHash = computeSha256(contentJson);
-      const itemId = `ctx-item-${crypto.randomUUID()}`;
+      const itemId = options.snapshotId
+        ? `ctx-item-${computeSha256(`${snapshotId}:${idx}`).slice(0, 32)}`
+        : `ctx-item-${crypto.randomUUID()}`;
 
       return {
         id: itemId,
