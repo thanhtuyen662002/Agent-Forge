@@ -496,6 +496,7 @@ export interface ExecutionAuthorization {
   created_at: string;
   dispatched_at: string | null;
   task_ownership_epoch?: number;
+  assignment_id?: string | null;
   execution_id?: string | null;
   adapter_started_at?: string | null;
   adapter_finished_at?: string | null;

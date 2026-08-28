@@ -477,43 +477,116 @@ export class ProviderDispatchService {
       }
     }
 
-    // 8. R5F Account and Assignment Rebinding (for SELECTED routing outcome)
+    // 8. R5F Account and Assignment Rebinding (for SELECTED routing outcome or R5I Handoff Authorization)
     let account: ProviderAccount | null = null;
     let assignment: AgentAssignment | null = null;
 
-    const hasFabricContext =
-      routingPayload.selectedAccountId !== undefined ||
-      routingPayload.selectedAssignmentId !== undefined ||
-      routingPayload.roleProfileId !== undefined;
-
-    if (routingOutcome === 'SELECTED' && hasFabricContext) {
-      const selectedAccountId = routingPayload.selectedAccountId;
-      if (typeof selectedAccountId !== 'string' || selectedAccountId.trim().length === 0) {
+    if (auth.assignment_id) {
+      // R5I Handoff Execution Authority Fence
+      const transfer = this.repo.getHandoffTransferBySuccessorAuthId(auth.id);
+      if (!transfer) {
         this.repo.invalidateExecutionAuthorization(auth.id);
-        const reason = 'ROUTING_ACCOUNT_ID_MISSING: Selected routing decision missing valid selectedAccountId.';
+        const reason = `ROUTING_ASSIGNMENT_NOT_FOUND: No HandoffTransfer bound to successor_authorization_id "${auth.id}".`;
         this.recordRejectionEvent(auth, reason);
         return { executionId, status: 'FAILED', error: reason, errorCode: 'RESOURCE_UNAVAILABLE' };
       }
 
-      const selectedAssignmentId = routingPayload.selectedAssignmentId;
-      if (typeof selectedAssignmentId !== 'string' || selectedAssignmentId.trim().length === 0) {
+      if (
+        transfer.successor_assignment_id !== auth.assignment_id ||
+        transfer.successor_attempt_id !== auth.attempt_id ||
+        transfer.task_id !== auth.task_id ||
+        transfer.successor_ownership_epoch !== auth.task_ownership_epoch
+      ) {
         this.repo.invalidateExecutionAuthorization(auth.id);
-        const reason = 'ROUTING_ASSIGNMENT_ID_MISSING: Selected routing decision missing valid selectedAssignmentId.';
+        const reason = `ROUTING_ASSIGNMENT_NOT_FOUND: HandoffTransfer binding mismatch for authorization "${auth.id}".`;
         this.recordRejectionEvent(auth, reason);
         return { executionId, status: 'FAILED', error: reason, errorCode: 'RESOURCE_UNAVAILABLE' };
       }
 
+      if (transfer.status !== 'ACCEPTED') {
+        this.repo.invalidateExecutionAuthorization(auth.id);
+        const reason = `EXECUTION_AUTHORIZATION_NOT_ACCEPTED: HandoffTransfer "${transfer.id}" status is "${transfer.status}", expected "ACCEPTED".`;
+        this.recordRejectionEvent(auth, reason);
+        return { executionId, status: 'FAILED', error: reason, errorCode: 'RESOURCE_UNAVAILABLE' };
+      }
+
+      // Check task ownership epoch fence
+      const task = this.repo.getTask(auth.task_id);
+      if (!task || task.ownership_epoch !== auth.task_ownership_epoch) {
+        this.repo.invalidateExecutionAuthorization(auth.id);
+        const reason = `EXECUTION_AUTHORIZATION_STALE_TASK_EPOCH: Task ownership epoch is ${task?.ownership_epoch}, expected auth epoch ${auth.task_ownership_epoch}.`;
+        this.recordRejectionEvent(auth, reason);
+        return { executionId, status: 'FAILED', error: reason, errorCode: 'RESOURCE_UNAVAILABLE' };
+      }
+
+      // Check successor attempt status
+      if (auth.attempt_id) {
+        const attempt = this.repo.getTaskAttempt(auth.attempt_id);
+        if (!attempt || attempt.status !== 'RUNNING') {
+          this.repo.invalidateExecutionAuthorization(auth.id);
+          const reason = `EXECUTION_AUTHORIZATION_ATTEMPT_NOT_RUNNING: Successor attempt status is "${attempt?.status}", expected "RUNNING".`;
+          this.recordRejectionEvent(auth, reason);
+          return { executionId, status: 'FAILED', error: reason, errorCode: 'RESOURCE_UNAVAILABLE' };
+        }
+      }
+
+      assignment = this.repo.getAgentAssignment(auth.assignment_id);
+      if (!assignment) {
+        this.repo.invalidateExecutionAuthorization(auth.id);
+        const reason = `ROUTING_ASSIGNMENT_NOT_FOUND: Successor assignment "${auth.assignment_id}" not found in database.`;
+        this.recordRejectionEvent(auth, reason);
+        return { executionId, status: 'FAILED', error: reason, errorCode: 'RESOURCE_UNAVAILABLE' };
+      }
+
+      if (assignment.status !== 'RUNNING') {
+        this.repo.invalidateExecutionAuthorization(auth.id);
+        const reason = `ROUTING_ASSIGNMENT_STATUS_INVALID: Successor assignment "${assignment.id}" status is "${assignment.status}", expected "RUNNING".`;
+        this.recordRejectionEvent(auth, reason);
+        return { executionId, status: 'FAILED', error: reason, errorCode: 'RESOURCE_UNAVAILABLE' };
+      }
+
+      // Scheduled active lease fence
+      if (mode === 'SCHEDULED') {
+        const activeLease = this.repo.getActiveLeaseForAssignment(assignment.id);
+        if (!activeLease) {
+          this.repo.invalidateExecutionAuthorization(auth.id);
+          const reason = `SCHEDULED_LEASE_REQUIRED: No active unreleased AccountLease found for assignment "${assignment.id}".`;
+          this.recordRejectionEvent(auth, reason);
+          return { executionId, status: 'FAILED', error: reason, errorCode: 'RESOURCE_UNAVAILABLE' };
+        }
+
+        if (
+          activeLease.assignment_id !== assignment.id ||
+          activeLease.worker_slot_id !== assignment.selected_worker_slot_id ||
+          new Date(activeLease.expires_at).getTime() <= Date.now()
+        ) {
+          this.repo.invalidateExecutionAuthorization(auth.id);
+          const reason = `SCHEDULED_LEASE_EXPIRED_OR_MISMATCHED: Active lease "${activeLease.id}" expired or mismatched.`;
+          this.recordRejectionEvent(auth, reason);
+          return { executionId, status: 'FAILED', error: reason, errorCode: 'RESOURCE_UNAVAILABLE' };
+        }
+
+        const slot = this.repo.getWorkerSlot(activeLease.worker_slot_id);
+        if (!slot || slot.status !== 'LEASED' || slot.current_assignment_id !== assignment.id) {
+          this.repo.invalidateExecutionAuthorization(auth.id);
+          const reason = `SCHEDULED_WORKER_SLOT_NOT_LEASED: WorkerSlot "${activeLease.worker_slot_id}" is not in LEASED state for assignment "${assignment.id}".`;
+          this.recordRejectionEvent(auth, reason);
+          return { executionId, status: 'FAILED', error: reason, errorCode: 'RESOURCE_UNAVAILABLE' };
+        }
+      }
+
+      const selectedAccountId = (routingPayload.selectedAccountId as string | undefined) || assignment.selected_account_id;
       account = this.repo.getProviderAccount(selectedAccountId);
       if (!account) {
         this.repo.invalidateExecutionAuthorization(auth.id);
-        const reason = `ROUTING_ACCOUNT_NOT_FOUND: Selected provider account "${selectedAccountId}" was not found in database.`;
+        const reason = `ROUTING_ACCOUNT_NOT_FOUND: Provider account "${selectedAccountId}" not found in database.`;
         this.recordRejectionEvent(auth, reason);
         return { executionId, status: 'FAILED', error: reason, errorCode: 'RESOURCE_UNAVAILABLE' };
       }
 
       if (!account.enabled) {
         this.repo.invalidateExecutionAuthorization(auth.id);
-        const reason = `ROUTING_ACCOUNT_DISABLED: Selected provider account "${account.id}" is disabled.`;
+        const reason = `ROUTING_ACCOUNT_DISABLED: Provider account "${account.id}" is disabled.`;
         this.recordRejectionEvent(auth, reason);
         return { executionId, status: 'FAILED', error: reason, errorCode: 'RESOURCE_UNAVAILABLE' };
       }
@@ -543,7 +616,6 @@ export class ProviderDispatchService {
         return { executionId, status: 'FAILED', error: reason, errorCode: 'RESOURCE_UNAVAILABLE' };
       }
 
-      // Check durable health-authority routing safety before claim
       const preClaimSafety = this.repo.evaluateProviderHealthRoutingSafety(account.id);
       if (preClaimSafety.status !== 'SAFE') {
         this.repo.invalidateExecutionAuthorization(auth.id);
@@ -551,41 +623,113 @@ export class ProviderDispatchService {
         this.recordRejectionEvent(auth, reason);
         return { executionId, status: 'FAILED', error: reason, errorCode: 'RESOURCE_UNAVAILABLE' };
       }
+    } else {
+      const hasFabricContext =
+        routingPayload.selectedAccountId !== undefined ||
+        routingPayload.selectedAssignmentId !== undefined ||
+        routingPayload.roleProfileId !== undefined;
 
-      assignment = this.repo.getAgentAssignment(selectedAssignmentId);
-      if (!assignment) {
-        this.repo.invalidateExecutionAuthorization(auth.id);
-        const reason = `ROUTING_ASSIGNMENT_NOT_FOUND: Selected assignment "${selectedAssignmentId}" was not found in database.`;
-        this.recordRejectionEvent(auth, reason);
-        return { executionId, status: 'FAILED', error: reason, errorCode: 'RESOURCE_UNAVAILABLE' };
-      }
+      if (routingOutcome === 'SELECTED' && hasFabricContext) {
+        const selectedAccountId = routingPayload.selectedAccountId;
+        if (typeof selectedAccountId !== 'string' || selectedAccountId.trim().length === 0) {
+          this.repo.invalidateExecutionAuthorization(auth.id);
+          const reason = 'ROUTING_ACCOUNT_ID_MISSING: Selected routing decision missing valid selectedAccountId.';
+          this.recordRejectionEvent(auth, reason);
+          return { executionId, status: 'FAILED', error: reason, errorCode: 'RESOURCE_UNAVAILABLE' };
+        }
 
-      if (
-        assignment.id !== selectedAssignmentId ||
-        assignment.project_id !== auth.project_id ||
-        assignment.task_id !== auth.task_id ||
-        assignment.attempt_id !== auth.attempt_id ||
-        assignment.selected_provider_id !== auth.selected_provider_id ||
-        assignment.selected_account_id !== account.id ||
-        assignment.selected_resource_id !== auth.selected_resource_id ||
-        assignment.routing_decision_id !== auth.routing_decision_id
-      ) {
-        this.repo.invalidateExecutionAuthorization(auth.id);
-        const reason = `ROUTING_ASSIGNMENT_SCOPE_MISMATCH: AgentAssignment "${assignment.id}" scope does not match authorization and routing decision.`;
-        this.recordRejectionEvent(auth, reason);
-        return { executionId, status: 'FAILED', error: reason, errorCode: 'RESOURCE_UNAVAILABLE' };
-      }
+        const selectedAssignmentId = routingPayload.selectedAssignmentId;
+        if (typeof selectedAssignmentId !== 'string' || selectedAssignmentId.trim().length === 0) {
+          this.repo.invalidateExecutionAuthorization(auth.id);
+          const reason = 'ROUTING_ASSIGNMENT_ID_MISSING: Selected routing decision missing valid selectedAssignmentId.';
+          this.recordRejectionEvent(auth, reason);
+          return { executionId, status: 'FAILED', error: reason, errorCode: 'RESOURCE_UNAVAILABLE' };
+        }
 
-      if (
-        assignment.status === 'COMPLETED' ||
-        assignment.status === 'FAILED' ||
-        assignment.status === 'CANCELLED' ||
-        assignment.status === 'HANDED_OFF'
-      ) {
-        this.repo.invalidateExecutionAuthorization(auth.id);
-        const reason = `ROUTING_ASSIGNMENT_STATUS_INVALID: AgentAssignment "${assignment.id}" is in terminal state "${assignment.status}".`;
-        this.recordRejectionEvent(auth, reason);
-        return { executionId, status: 'FAILED', error: reason, errorCode: 'RESOURCE_UNAVAILABLE' };
+        account = this.repo.getProviderAccount(selectedAccountId);
+        if (!account) {
+          this.repo.invalidateExecutionAuthorization(auth.id);
+          const reason = `ROUTING_ACCOUNT_NOT_FOUND: Selected provider account "${selectedAccountId}" was not found in database.`;
+          this.recordRejectionEvent(auth, reason);
+          return { executionId, status: 'FAILED', error: reason, errorCode: 'RESOURCE_UNAVAILABLE' };
+        }
+
+        if (!account.enabled) {
+          this.repo.invalidateExecutionAuthorization(auth.id);
+          const reason = `ROUTING_ACCOUNT_DISABLED: Selected provider account "${account.id}" is disabled.`;
+          this.recordRejectionEvent(auth, reason);
+          return { executionId, status: 'FAILED', error: reason, errorCode: 'RESOURCE_UNAVAILABLE' };
+        }
+
+        if (account.provider_id !== auth.selected_provider_id) {
+          this.repo.invalidateExecutionAuthorization(auth.id);
+          const reason = `ROUTING_ACCOUNT_PROVIDER_MISMATCH: Account provider_id "${account.provider_id}" differs from authorized provider "${auth.selected_provider_id}".`;
+          this.recordRejectionEvent(auth, reason);
+          return { executionId, status: 'FAILED', error: reason, errorCode: 'RESOURCE_UNAVAILABLE' };
+        }
+
+        if (account.health_status === 'AUTH_ERROR') {
+          this.repo.invalidateExecutionAuthorization(auth.id);
+          const reason = `PROVIDER_ACCOUNT_AUTH_ERROR: Selected provider account "${account.id}" is in AUTH_ERROR state.`;
+          this.recordRejectionEvent(auth, reason);
+          return { executionId, status: 'FAILED', error: reason, errorCode: 'AUTH_ERROR' };
+        }
+
+        if (
+          account.health_status === 'OFFLINE' ||
+          account.health_status === 'UNHEALTHY' ||
+          account.health_status === 'DISABLED'
+        ) {
+          this.repo.invalidateExecutionAuthorization(auth.id);
+          const reason = `ROUTING_ACCOUNT_UNAVAILABLE: Selected provider account "${account.id}" has health status "${account.health_status}".`;
+          this.recordRejectionEvent(auth, reason);
+          return { executionId, status: 'FAILED', error: reason, errorCode: 'RESOURCE_UNAVAILABLE' };
+        }
+
+        // Check durable health-authority routing safety before claim
+        const preClaimSafety = this.repo.evaluateProviderHealthRoutingSafety(account.id);
+        if (preClaimSafety.status !== 'SAFE') {
+          this.repo.invalidateExecutionAuthorization(auth.id);
+          const reason = `EXECUTION_AUTHORIZATION_ROUTING_UNSAFE: Provider account "${account.id}" routing safety check failed with status "${preClaimSafety.status}". ${preClaimSafety.reason ?? ''}`.trim();
+          this.recordRejectionEvent(auth, reason);
+          return { executionId, status: 'FAILED', error: reason, errorCode: 'RESOURCE_UNAVAILABLE' };
+        }
+
+        assignment = this.repo.getAgentAssignment(selectedAssignmentId);
+        if (!assignment) {
+          this.repo.invalidateExecutionAuthorization(auth.id);
+          const reason = `ROUTING_ASSIGNMENT_NOT_FOUND: Selected assignment "${selectedAssignmentId}" was not found in database.`;
+          this.recordRejectionEvent(auth, reason);
+          return { executionId, status: 'FAILED', error: reason, errorCode: 'RESOURCE_UNAVAILABLE' };
+        }
+
+        if (
+          assignment.id !== selectedAssignmentId ||
+          assignment.project_id !== auth.project_id ||
+          assignment.task_id !== auth.task_id ||
+          assignment.attempt_id !== auth.attempt_id ||
+          assignment.selected_provider_id !== auth.selected_provider_id ||
+          assignment.selected_account_id !== account.id ||
+          assignment.selected_resource_id !== auth.selected_resource_id ||
+          assignment.routing_decision_id !== auth.routing_decision_id
+        ) {
+          this.repo.invalidateExecutionAuthorization(auth.id);
+          const reason = `ROUTING_ASSIGNMENT_SCOPE_MISMATCH: AgentAssignment "${assignment.id}" scope does not match authorization and routing decision.`;
+          this.recordRejectionEvent(auth, reason);
+          return { executionId, status: 'FAILED', error: reason, errorCode: 'RESOURCE_UNAVAILABLE' };
+        }
+
+        if (
+          assignment.status === 'COMPLETED' ||
+          assignment.status === 'FAILED' ||
+          assignment.status === 'CANCELLED' ||
+          assignment.status === 'HANDED_OFF'
+        ) {
+          this.repo.invalidateExecutionAuthorization(auth.id);
+          const reason = `ROUTING_ASSIGNMENT_STATUS_INVALID: AgentAssignment "${assignment.id}" is in terminal state "${assignment.status}".`;
+          this.recordRejectionEvent(auth, reason);
+          return { executionId, status: 'FAILED', error: reason, errorCode: 'RESOURCE_UNAVAILABLE' };
+        }
       }
     }
 

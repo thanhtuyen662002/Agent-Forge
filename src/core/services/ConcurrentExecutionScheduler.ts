@@ -1,4 +1,5 @@
 import { Repository } from '../database/repositories';
+import { AgentAssignment } from '../types/domain';
 import {
   WorkerSlotLeaseService,
   DEFAULT_LEASE_TTL_MS,
@@ -178,21 +179,49 @@ export class ConcurrentExecutionScheduler {
       };
     }
 
-    const selectedAssignmentId = routingPayload.selectedAssignmentId as string;
-    if (typeof selectedAssignmentId !== 'string' || selectedAssignmentId.trim().length === 0) {
-      return {
-        status: 'PREPARATION_FAILED',
-        authorizationId,
-        error: 'ROUTING_ASSIGNMENT_ID_MISSING: Selected routing decision is missing selectedAssignmentId.',
-      };
+    let assignment: AgentAssignment | null = null;
+    if (auth.assignment_id) {
+      // R5I Handoff execution bridge
+      const transfer = this.repo.getHandoffTransferBySuccessorAuthId(auth.id);
+      if (!transfer) {
+        return {
+          status: 'PREPARATION_FAILED',
+          authorizationId,
+          error: `ROUTING_ASSIGNMENT_NOT_FOUND: Execution authorization "${auth.id}" has assignment_id "${auth.assignment_id}" but no matching HandoffTransfer was found.`,
+        };
+      }
+      if (
+        transfer.successor_assignment_id !== auth.assignment_id ||
+        transfer.successor_attempt_id !== auth.attempt_id ||
+        transfer.task_id !== auth.task_id ||
+        transfer.successor_ownership_epoch !== auth.task_ownership_epoch ||
+        (transfer.status !== 'AUTHORIZED' && transfer.status !== 'ACCEPTED')
+      ) {
+        return {
+          status: 'PREPARATION_FAILED',
+          authorizationId,
+          error: `ROUTING_ASSIGNMENT_NOT_FOUND: HandoffTransfer binding mismatch for authorization "${auth.id}".`,
+        };
+      }
+      assignment = this.repo.getAgentAssignment(auth.assignment_id);
+    } else {
+      // Legacy non-handoff execution path
+      const selectedAssignmentId = routingPayload.selectedAssignmentId as string;
+      if (typeof selectedAssignmentId !== 'string' || selectedAssignmentId.trim().length === 0) {
+        return {
+          status: 'PREPARATION_FAILED',
+          authorizationId,
+          error: 'ROUTING_ASSIGNMENT_ID_MISSING: Selected routing decision is missing selectedAssignmentId.',
+        };
+      }
+      assignment = this.repo.getAgentAssignment(selectedAssignmentId);
     }
 
-    const assignment = this.repo.getAgentAssignment(selectedAssignmentId);
     if (!assignment) {
       return {
         status: 'PREPARATION_FAILED',
         authorizationId,
-        error: `ROUTING_ASSIGNMENT_NOT_FOUND: Selected assignment "${selectedAssignmentId}" was not found in database.`,
+        error: `ROUTING_ASSIGNMENT_NOT_FOUND: Selected assignment was not found in database.`,
       };
     }
 
@@ -296,6 +325,41 @@ export class ConcurrentExecutionScheduler {
         workspaceOwnershipDigest,
         error: supervisor.getLeaseLossReason() || 'Lease ownership lost before provider dispatch.',
       };
+    }
+
+    // 6.5. R5I Handoff Successor Execution Acceptance
+    if (auth.assignment_id) {
+      const acceptRes = this.repo.acceptHandoffSuccessorExecution({
+        authorizationId: auth.id,
+        leaseId,
+        leaseToken,
+        expectedSuccessorEpoch: auth.task_ownership_epoch ?? 1,
+      });
+
+      if (!acceptRes.success) {
+        await supervisor.stop();
+        if (!supervisor.isLeaseLost()) {
+          try {
+            this.leaseService.release(leaseId, leaseToken);
+          } catch {
+            // Ignore release error
+          }
+          try {
+            await this.worktreeService.removeWorktree(worktreeTuple);
+          } catch {
+            // Ignore cleanup error
+          }
+        }
+        return {
+          status: 'PREPARATION_FAILED',
+          authorizationId,
+          assignmentId: assignment.id,
+          workerSlotId,
+          leaseId,
+          errorCode: acceptRes.errorCode as any,
+          error: `ACCEPTANCE_FAILED: ${acceptRes.error}`,
+        };
+      }
     }
 
     // 7. Supervised Provider Dispatch

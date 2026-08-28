@@ -24,6 +24,26 @@ import {
   RoleAwareRoutingDecision,
   RoleAwareRoutingOutcome,
 } from './RoleAwareRoutingService';
+import {
+  ExecutionAuthorizationService,
+} from './ExecutionAuthorizationService';
+import {
+  ExecutionAuthorization,
+} from '../types/domain';
+
+export interface HandoffResumeSuccessorParams {
+  transferId: string;
+  expectedVersion?: number;
+}
+
+export interface HandoffResumeSuccessorResult {
+  success: boolean;
+  transfer?: HandoffTransfer;
+  authorization?: ExecutionAuthorization;
+  alreadyAuthorized?: boolean;
+  errorCode?: string;
+  error?: string;
+}
 
 export function isRecoverableDeterministicSnapshotCollision(
   err: unknown,
@@ -1842,6 +1862,58 @@ export class HandoffTransferService {
       decision,
       outcome: decision.outcome,
       alreadyRouted: bindRes.alreadyRouted ?? false,
+    };
+  }
+
+  public async resumeHandoffSuccessor(
+    params: HandoffResumeSuccessorParams
+  ): Promise<HandoffResumeSuccessorResult> {
+    const transfer = this.repo.getHandoffTransfer(params.transferId);
+    if (!transfer) {
+      return {
+        success: false,
+        errorCode: 'TRANSFER_NOT_FOUND',
+        error: `HandoffTransfer "${params.transferId}" not found.`,
+      };
+    }
+
+    // Phase EA: Prepare candidate authorization (pure validation, no DB mutation)
+    const authService = new ExecutionAuthorizationService(this.repo);
+    const prepareRes = await authService.prepareHandoffSuccessorAuthorization({
+      transferId: transfer.id,
+    });
+
+    if (!prepareRes.success || !prepareRes.candidate) {
+      return {
+        success: false,
+        transfer,
+        errorCode: prepareRes.errorCode || 'INTERNAL_ERROR',
+        error: prepareRes.error || 'Failed to prepare successor execution authorization candidate.',
+      };
+    }
+
+    // Phase EB: Atomic Linearization in Repository Transaction
+    const expectedVersion = params.expectedVersion !== undefined ? params.expectedVersion : transfer.version;
+    const resumeRes = this.repo.resumeHandoffSuccessorAuthorization({
+      transferId: transfer.id,
+      expectedVersion,
+      candidate: prepareRes.candidate,
+    });
+
+    if (!resumeRes.success) {
+      return {
+        success: false,
+        transfer: resumeRes.transfer ?? transfer,
+        errorCode: resumeRes.errorCode || 'INTERNAL_ERROR',
+        error: resumeRes.error,
+      };
+    }
+
+    return {
+      success: true,
+      transfer: resumeRes.transfer!,
+      authorization: resumeRes.authorization!,
+      alreadyAuthorized: resumeRes.alreadyAuthorized ?? false,
     };
   }
 }
