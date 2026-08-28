@@ -520,7 +520,6 @@ export interface HandoffRouteSuccessorParams {
   excludedCandidateIds?: string[];
   excludedAccountIds?: string[];
   excludedProviderIds?: string[];
-  routedAt?: string;
 }
 
 export interface HandoffRouteSuccessorResult {
@@ -1532,7 +1531,6 @@ export class HandoffTransferService {
         routingDecisionId: '',
         routeSpecHash,
         canonicalRouteSpec: canonicalSpec as unknown as Record<string, unknown>,
-        nowIso: params.routedAt,
       });
 
       if (!replayRes.success) {
@@ -1571,12 +1569,16 @@ export class HandoffTransferService {
       };
     }
 
-    if (transfer.successor_ownership_epoch !== params.expectedSuccessorEpoch) {
+    // Successor ownership epoch lineage check (Defect A)
+    if (
+      params.expectedSuccessorEpoch !== transfer.source_ownership_epoch + 1 ||
+      transfer.successor_ownership_epoch !== params.expectedSuccessorEpoch
+    ) {
       return {
         success: false,
         transfer,
         errorCode: 'STALE_OWNERSHIP_EPOCH',
-        error: `STALE_OWNERSHIP_EPOCH: Expected successor epoch ${params.expectedSuccessorEpoch}, found ${transfer.successor_ownership_epoch}.`,
+        error: `STALE_OWNERSHIP_EPOCH: Expected successor epoch ${params.expectedSuccessorEpoch} must equal source_ownership_epoch + 1 (${transfer.source_ownership_epoch + 1}) and transfer.successor_ownership_epoch (${transfer.successor_ownership_epoch}).`,
       };
     }
 
@@ -1664,14 +1666,31 @@ export class HandoffTransferService {
       };
     }
 
-    // Successor context integrity check
-    const snapshot = this.repo.getContextSnapshot(transfer.successor_context_snapshot_id);
+    // Successor context exact deterministic authority check (Defect B)
+    const expectedSnapshotId = `ctx-snap-ho-${computeSha256(
+      `r5i-successor-context:${transfer.id}:${transfer.successor_context_spec_hash}`
+    ).substring(0, 32)}`;
+
+    const expectedManifestId = `ctx-man-ho-${computeSha256(
+      `r5i-successor-manifest:${transfer.id}:${transfer.successor_context_spec_hash}`
+    ).substring(0, 32)}`;
+
+    if (transfer.successor_context_snapshot_id !== expectedSnapshotId) {
+      return {
+        success: false,
+        transfer,
+        errorCode: 'CONTEXT_SNAPSHOT_INTEGRITY_MISMATCH',
+        error: `CONTEXT_SNAPSHOT_INTEGRITY_MISMATCH: Transfer successor_context_snapshot_id "${transfer.successor_context_snapshot_id}" does not match deterministic ID "${expectedSnapshotId}".`,
+      };
+    }
+
+    const snapshot = this.repo.getContextSnapshot(expectedSnapshotId);
     if (!snapshot) {
       return {
         success: false,
         transfer,
         errorCode: 'CONTEXT_SNAPSHOT_NOT_FOUND',
-        error: `CONTEXT_SNAPSHOT_NOT_FOUND: Bound ContextSnapshot "${transfer.successor_context_snapshot_id}" not found.`,
+        error: `CONTEXT_SNAPSHOT_NOT_FOUND: Bound ContextSnapshot "${expectedSnapshotId}" not found.`,
       };
     }
     if (
@@ -1687,18 +1706,18 @@ export class HandoffTransferService {
       };
     }
     const manifest = this.repo.getContextManifestBySnapshotId(snapshot.id);
-    if (!manifest) {
+    if (!manifest || manifest.id !== expectedManifestId || manifest.snapshot_id !== snapshot.id) {
       return {
         success: false,
         transfer,
         errorCode: 'CONTEXT_MANIFEST_NOT_FOUND',
-        error: `CONTEXT_MANIFEST_NOT_FOUND: ContextManifest for snapshot "${snapshot.id}" not found.`,
+        error: `CONTEXT_MANIFEST_NOT_FOUND: ContextManifest for snapshot "${snapshot.id}" not found or ID mismatch (expected "${expectedManifestId}", found "${manifest?.id}").`,
       };
     }
 
-    // 7. Construct Structurally Assignable Candidate Pool
-    const allAccounts = this.repo.getAllProviderAccounts().filter((a) => a.enabled);
-    const allResources = this.repo.getAllProviderResources().filter((r) => r.enabled);
+    // 7. Construct Structurally Assignable Candidate Pool (Defect C: do not prefilter enabled/health/quota)
+    const allAccounts = this.repo.getAllProviderAccounts();
+    const allResources = this.repo.getAllProviderResources();
     const structuralPairs: CandidateAccountResourceRef[] = [];
     for (const acc of allAccounts) {
       const matching = allResources.filter(
@@ -1740,7 +1759,7 @@ export class HandoffTransferService {
       candidateRefsForRouting = structuralPairs;
     }
 
-    // 8. Phase A: Role-Aware Routing (persistAssignment: false)
+    // 8. Phase A: Role-Aware Routing (persistAssignment: false, allowManualBridge derived from RoutePolicy)
     const decision = await this.roleAwareRoutingService.routeRole({
       projectId: task.project_id,
       taskId: transfer.task_id,
@@ -1751,7 +1770,6 @@ export class HandoffTransferService {
       separationPolicyId: params.separationPolicyId ?? null,
       reviewedAssignmentId: params.separationPolicyId ? transfer.source_assignment_id : null,
       candidateRefs: candidateRefsForRouting,
-      allowManualBridge: false,
       requiredProviderId: params.requiredProviderId ?? null,
       requiredAccountId: params.requiredAccountId ?? null,
       requiredResourceId: params.requiredResourceId ?? null,
@@ -1786,7 +1804,7 @@ export class HandoffTransferService {
       };
     }
 
-    // 9. Phase B: Atomic Linearization in Repository
+    // 9. Phase B: Atomic Linearization in Repository (Defect E: no caller-controlled temporal authority)
     const bindRes = this.repo.bindHandoffSuccessorRoute({
       transferId: transfer.id,
       expectedVersion: params.expectedVersion,
@@ -1804,7 +1822,6 @@ export class HandoffTransferService {
       routingDecisionId: decision.decisionId,
       routeSpecHash,
       canonicalRouteSpec: canonicalSpec as unknown as Record<string, unknown>,
-      nowIso: params.routedAt,
     });
 
     if (!bindRes.success) {

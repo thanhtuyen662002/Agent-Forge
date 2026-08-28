@@ -2828,7 +2828,6 @@ export class Repository {
     routingDecisionId: string;
     routeSpecHash: string;
     canonicalRouteSpec: Record<string, unknown>;
-    nowIso?: string;
   }): {
     success: boolean;
     transfer?: HandoffTransfer;
@@ -2873,6 +2872,9 @@ export class Repository {
     error?: string;
   } {
     return this.runInImmediateTransaction(() => {
+      const nowIso = new Date().toISOString();
+      const nowTime = Date.parse(nowIso);
+
       const transfer = this.getHandoffTransfer(params.transferId);
       if (!transfer) {
         return {
@@ -2890,6 +2892,18 @@ export class Repository {
             transfer,
             errorCode: 'VERSION_CONFLICT',
             error: `VERSION_CONFLICT: Expected pre-routing version ${transfer.version - 1}, received ${params.expectedVersion}.`,
+          };
+        }
+
+        if (
+          params.expectedSuccessorEpoch !== transfer.source_ownership_epoch + 1 ||
+          transfer.successor_ownership_epoch !== params.expectedSuccessorEpoch
+        ) {
+          return {
+            success: false,
+            transfer,
+            errorCode: 'STALE_OWNERSHIP_EPOCH',
+            error: `STALE_OWNERSHIP_EPOCH: Expected successor epoch ${params.expectedSuccessorEpoch} does not match transfer successor epoch ${transfer.successor_ownership_epoch}.`,
           };
         }
 
@@ -2912,7 +2926,19 @@ export class Repository {
           };
         }
 
+        // Defect F: Durable assignment structural integrity checks
+        const task = this.getTask(transfer.task_id);
+        if (!task) {
+          return {
+            success: false,
+            transfer,
+            errorCode: 'ROUTE_METADATA_CORRUPTION',
+            error: `ROUTE_METADATA_CORRUPTION: Task "${transfer.task_id}" not found in database.`,
+          };
+        }
+
         if (
+          existingAssignment.project_id !== task.project_id ||
           existingAssignment.task_id !== transfer.task_id ||
           existingAssignment.attempt_id !== params.successorAttemptId ||
           existingAssignment.role_profile_id !== params.successorRoleProfileId ||
@@ -2922,7 +2948,52 @@ export class Repository {
             success: false,
             transfer,
             errorCode: 'ROUTE_METADATA_CORRUPTION',
-            error: 'ROUTE_METADATA_CORRUPTION: Bound assignment attributes do not match transfer successor bindings.',
+            error: 'ROUTE_METADATA_CORRUPTION: Bound assignment attributes do not match transfer successor bindings or task project_id.',
+          };
+        }
+
+        const existingProvider = this.getProvider(existingAssignment.selected_provider_id);
+        const existingAccount = this.getProviderAccount(existingAssignment.selected_account_id);
+        const existingResource = this.getProviderResource(existingAssignment.selected_resource_id);
+
+        if (!existingProvider || !existingAccount || !existingResource) {
+          return {
+            success: false,
+            transfer,
+            errorCode: 'ROUTE_METADATA_CORRUPTION',
+            error: 'ROUTE_METADATA_CORRUPTION: Bound assignment references non-existent provider, account, or resource.',
+          };
+        }
+
+        if (
+          existingAccount.provider_id !== existingAssignment.selected_provider_id ||
+          existingResource.provider_id !== existingAssignment.selected_provider_id ||
+          existingResource.provider_account_id !== existingAssignment.selected_account_id
+        ) {
+          return {
+            success: false,
+            transfer,
+            errorCode: 'ROUTE_METADATA_CORRUPTION',
+            error: 'ROUTE_METADATA_CORRUPTION: Bound assignment account/resource provider binding mismatch.',
+          };
+        }
+
+        const sourceAsgn = this.getAgentAssignment(transfer.source_assignment_id);
+        if (!sourceAsgn) {
+          return {
+            success: false,
+            transfer,
+            errorCode: 'ROUTE_METADATA_CORRUPTION',
+            error: `ROUTE_METADATA_CORRUPTION: Source assignment "${transfer.source_assignment_id}" not found in database.`,
+          };
+        }
+
+        if (existingAssignment.selected_provider_id === sourceAsgn.selected_provider_id) {
+          return {
+            success: false,
+            transfer,
+            errorCode: 'CROSS_PROVIDER_VIOLATION',
+            error: `CROSS_PROVIDER_VIOLATION: Existing assignment selected provider "${existingAssignment.selected_provider_id}" matches source provider "${sourceAsgn.selected_provider_id}".`,
           };
         }
 
@@ -2962,15 +3033,6 @@ export class Repository {
           };
         }
 
-        if (existingAssignment.selected_provider_id === params.sourceProviderId) {
-          return {
-            success: false,
-            transfer,
-            errorCode: 'CROSS_PROVIDER_VIOLATION',
-            error: `CROSS_PROVIDER_VIOLATION: Existing assignment selected provider "${existingAssignment.selected_provider_id}" matches source provider "${params.sourceProviderId}".`,
-          };
-        }
-
         return {
           success: true,
           transfer,
@@ -2999,13 +3061,16 @@ export class Repository {
         };
       }
 
-      // 4. Successor ownership epoch check
-      if (transfer.successor_ownership_epoch !== params.expectedSuccessorEpoch) {
+      // 4. Successor ownership epoch lineage check (Defect A)
+      if (
+        params.expectedSuccessorEpoch !== transfer.source_ownership_epoch + 1 ||
+        transfer.successor_ownership_epoch !== params.expectedSuccessorEpoch
+      ) {
         return {
           success: false,
           transfer,
           errorCode: 'STALE_OWNERSHIP_EPOCH',
-          error: `STALE_OWNERSHIP_EPOCH: Expected successor epoch ${params.expectedSuccessorEpoch}, found ${transfer.successor_ownership_epoch}.`,
+          error: `STALE_OWNERSHIP_EPOCH: Expected successor epoch ${params.expectedSuccessorEpoch} must equal source_ownership_epoch + 1 (${transfer.source_ownership_epoch + 1}) and transfer.successor_ownership_epoch (${transfer.successor_ownership_epoch}).`,
         };
       }
 
@@ -3200,14 +3265,34 @@ export class Repository {
         };
       }
 
-      // 10. Successor Context authority validation
-      const snapshot = this.getContextSnapshot(params.successorContextSnapshotId);
+      // 10. Successor Context exact deterministic authority validation (Defect B)
+      const expectedSnapshotId = `ctx-snap-ho-${computeSha256(
+        `r5i-successor-context:${transfer.id}:${transfer.successor_context_spec_hash}`
+      ).substring(0, 32)}`;
+
+      const expectedManifestId = `ctx-man-ho-${computeSha256(
+        `r5i-successor-manifest:${transfer.id}:${transfer.successor_context_spec_hash}`
+      ).substring(0, 32)}`;
+
+      if (
+        transfer.successor_context_snapshot_id !== expectedSnapshotId ||
+        params.successorContextSnapshotId !== expectedSnapshotId
+      ) {
+        return {
+          success: false,
+          transfer,
+          errorCode: 'CONTEXT_SNAPSHOT_INTEGRITY_MISMATCH',
+          error: `CONTEXT_SNAPSHOT_INTEGRITY_MISMATCH: Successor context snapshot ID does not match deterministic ID "${expectedSnapshotId}".`,
+        };
+      }
+
+      const snapshot = this.getContextSnapshot(expectedSnapshotId);
       if (!snapshot) {
         return {
           success: false,
           transfer,
           errorCode: 'CONTEXT_SNAPSHOT_NOT_FOUND',
-          error: `CONTEXT_SNAPSHOT_NOT_FOUND: ContextSnapshot "${params.successorContextSnapshotId}" not found.`,
+          error: `CONTEXT_SNAPSHOT_NOT_FOUND: ContextSnapshot "${expectedSnapshotId}" not found.`,
         };
       }
       if (
@@ -3224,12 +3309,12 @@ export class Repository {
       }
 
       const manifest = this.getContextManifestBySnapshotId(snapshot.id);
-      if (!manifest) {
+      if (!manifest || manifest.id !== expectedManifestId || manifest.snapshot_id !== snapshot.id) {
         return {
           success: false,
           transfer,
           errorCode: 'CONTEXT_MANIFEST_NOT_FOUND',
-          error: `CONTEXT_MANIFEST_NOT_FOUND: ContextManifest for snapshot "${snapshot.id}" not found.`,
+          error: `CONTEXT_MANIFEST_NOT_FOUND: ContextManifest for snapshot "${snapshot.id}" not found or ID mismatch (expected "${expectedManifestId}", found "${manifest?.id}").`,
         };
       }
 
@@ -3310,7 +3395,6 @@ export class Repository {
           };
         }
         const cdMs = Date.parse(account.cooldown_until);
-        const nowTime = params.nowIso ? Date.parse(params.nowIso) : Date.now();
         if (isNaN(cdMs) || cdMs > nowTime) {
           return {
             success: false,
@@ -3393,7 +3477,6 @@ export class Repository {
 
       // 15. Create AgentAssignment
       const assignmentId = 'asgn-' + crypto.randomUUID();
-      const nowIso = params.nowIso ?? new Date().toISOString();
       const assignment: AgentAssignment = {
         id: assignmentId,
         project_id: task.project_id,

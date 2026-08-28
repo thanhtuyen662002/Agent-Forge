@@ -418,14 +418,19 @@ describe('R5I4 Cross-Provider Successor Routing and Replay Identity Authority', 
     let specHash: string | null = null;
 
     if (!params?.noSnapshot) {
+      specHash = 'spechash_r5i4_test_1';
+      const detSnapId = `ctx-snap-ho-${computeSha256(`r5i-successor-context:${transferId}:${specHash}`).substring(0, 32)}`;
+      const detManId = `ctx-man-ho-${computeSha256(`r5i-successor-manifest:${transferId}:${specHash}`).substring(0, 32)}`;
+
       const buildRes = contextBuilder.buildContextSnapshot({
         projectId,
         taskId,
         attemptId: successorAttemptId,
         purpose: 'HANDOFF',
+        snapshotId: detSnapId,
+        manifestId: detManId,
       });
       snapId = buildRes.snapshot.id;
-      specHash = 'spechash_r5i4_test_1';
     }
 
     const transfer: HandoffTransfer = {
@@ -675,6 +680,39 @@ describe('R5I4 Cross-Provider Successor Routing and Replay Identity Authority', 
 
       expect(repo.getAllProcessRuns().length).toBe(0);
     });
+
+    it('A1. source epoch 1, successor epoch 3, task epoch 3, expected epoch 3 fails STALE_OWNERSHIP_EPOCH', async () => {
+      db.prepare('UPDATE tasks SET ownership_epoch = 3 WHERE id = ?').run(taskId);
+      const { transfer } = createPreparedTransfer({
+        sourceOwnershipEpoch: 1,
+        successorOwnershipEpoch: 3,
+      });
+      const res = await handoffService.routeHandoffSuccessor({
+        transferId: transfer.id,
+        expectedVersion: 2,
+        expectedSuccessorEpoch: 3,
+      });
+      expect(res.success).toBe(false);
+      expect(res.errorCode).toBe('STALE_OWNERSHIP_EPOCH');
+      expect(repo.getAllAgentAssignments().length).toBe(1);
+    });
+
+    it('A3. epoch mismatch introduced between Phase A and Phase B fails closed with zero assignment', async () => {
+      const { transfer } = createPreparedTransfer({ version: 2, sourceOwnershipEpoch: 1, successorOwnershipEpoch: 2 });
+      const originalBind = repo.bindHandoffSuccessorRoute.bind(repo);
+      repo.bindHandoffSuccessorRoute = (params) => {
+        db.prepare('UPDATE tasks SET ownership_epoch = 99 WHERE id = ?').run(taskId);
+        return originalBind(params);
+      };
+      const res = await handoffService.routeHandoffSuccessor({
+        transferId: transfer.id,
+        expectedVersion: 2,
+        expectedSuccessorEpoch: 2,
+      });
+      expect(res.success).toBe(false);
+      expect(res.errorCode).toBe('STALE_OWNERSHIP_EPOCH');
+      expect(repo.getAllAgentAssignments().length).toBe(1);
+    });
   });
 
   // ============================================================
@@ -917,6 +955,36 @@ describe('R5I4 Cross-Provider Successor Routing and Replay Identity Authority', 
       expect(res.errorCode).toBe('NO_ELIGIBLE_CANDIDATES');
       expect(repo.getAllAgentAssignments().length).toBe(1); // zero new assignments
     });
+
+    it('C1. caller supplies structurally valid but disabled account candidate -> evaluated by RoleAware', async () => {
+      repo.updateProviderAccount('acc-succ-openai-1', { enabled: false });
+      const { transfer } = createPreparedTransfer();
+      const res = await handoffService.routeHandoffSuccessor({
+        transferId: transfer.id,
+        expectedVersion: 2,
+        expectedSuccessorEpoch: 2,
+        candidateRefs: [{ accountId: 'acc-succ-openai-1', resourceId: 'res-succ-openai-1' }],
+      });
+      expect(res.success).toBe(false);
+      expect(res.outcome).toBe('NO_ELIGIBLE_PROVIDER');
+      expect(res.decision).toBeDefined();
+      expect(repo.getAllAgentAssignments().length).toBe(1);
+    });
+
+    it('C2. caller supplies structurally valid but disabled resource candidate -> evaluated by RoleAware', async () => {
+      db.prepare('UPDATE provider_resources SET enabled = 0 WHERE id = ?').run('res-succ-openai-1');
+      const { transfer } = createPreparedTransfer();
+      const res = await handoffService.routeHandoffSuccessor({
+        transferId: transfer.id,
+        expectedVersion: 2,
+        expectedSuccessorEpoch: 2,
+        candidateRefs: [{ accountId: 'acc-succ-openai-1', resourceId: 'res-succ-openai-1' }],
+      });
+      expect(res.success).toBe(false);
+      expect(res.outcome).toBe('NO_ELIGIBLE_PROVIDER');
+      expect(res.decision).toBeDefined();
+      expect(repo.getAllAgentAssignments().length).toBe(1);
+    });
   });
 
   // ============================================================
@@ -1121,6 +1189,111 @@ describe('R5I4 Cross-Provider Successor Routing and Replay Identity Authority', 
       expect(replayRes.success).toBe(false);
       expect(replayRes.errorCode).toBe('ROUTE_METADATA_CORRUPTION');
     });
+
+    it('F1. ROUTED assignment selected_account_id corrupted to account from another provider fails closed', async () => {
+      const { transfer } = createPreparedTransfer({ version: 2 });
+      const res = await handoffService.routeHandoffSuccessor({
+        transferId: transfer.id,
+        expectedVersion: 2,
+        expectedSuccessorEpoch: 2,
+      });
+      expect(res.success).toBe(true);
+
+      // Corrupt account_id to source account (prov-source-1)
+      db.prepare("UPDATE agent_assignments SET selected_account_id = 'acc-source-1' WHERE id = ?").run(res.assignment!.id);
+
+      const replayRes = await handoffService.routeHandoffSuccessor({
+        transferId: transfer.id,
+        expectedVersion: 2,
+        expectedSuccessorEpoch: 2,
+      });
+      expect(replayRes.success).toBe(false);
+      expect(replayRes.errorCode).toBe('ROUTE_METADATA_CORRUPTION');
+    });
+
+    it('F2. ROUTED assignment selected_resource_id corrupted to resource bound to different account fails closed', async () => {
+      const { transfer } = createPreparedTransfer({ version: 2 });
+      const res = await handoffService.routeHandoffSuccessor({
+        transferId: transfer.id,
+        expectedVersion: 2,
+        expectedSuccessorEpoch: 2,
+      });
+      expect(res.success).toBe(true);
+
+      // Corrupt resource_id to google resource while account is openai
+      db.prepare("UPDATE agent_assignments SET selected_resource_id = 'res-succ-google-1' WHERE id = ?").run(res.assignment!.id);
+
+      const replayRes = await handoffService.routeHandoffSuccessor({
+        transferId: transfer.id,
+        expectedVersion: 2,
+        expectedSuccessorEpoch: 2,
+      });
+      expect(replayRes.success).toBe(false);
+      expect(replayRes.errorCode).toBe('ROUTE_METADATA_CORRUPTION');
+    });
+
+    it('F3. ROUTED assignment task binding corruption fails closed', async () => {
+      repo.createTask({
+        id: 'task-other',
+        project_id: projectId,
+        milestone_id: null,
+        title: 'Other task',
+        description: null,
+        state: 'CREATED',
+        paused_from_state: null,
+        priority: 'MEDIUM',
+        risk: 'LOW',
+        assigned_agent_id: null,
+        revision_count: 0,
+        max_revisions: 5,
+        base_sha: null,
+        current_sha: null,
+        progress_cache_percent: 0,
+        progress_computed_at: nowIso,
+        acceptance_criteria: [],
+        constraints: [],
+        ownership_epoch: 1,
+        created_at: nowIso,
+        updated_at: nowIso,
+      });
+
+      const { transfer } = createPreparedTransfer({ version: 2 });
+      const res = await handoffService.routeHandoffSuccessor({
+        transferId: transfer.id,
+        expectedVersion: 2,
+        expectedSuccessorEpoch: 2,
+      });
+      expect(res.success).toBe(true);
+
+      // Corrupt task_id to another valid task
+      db.prepare("UPDATE agent_assignments SET task_id = 'task-other' WHERE id = ?").run(res.assignment!.id);
+
+      const replayRes = await handoffService.routeHandoffSuccessor({
+        transferId: transfer.id,
+        expectedVersion: 2,
+        expectedSuccessorEpoch: 2,
+      });
+      expect(replayRes.success).toBe(false);
+      expect(replayRes.errorCode).toBe('ROUTE_METADATA_CORRUPTION');
+    });
+
+    it('F4. valid routed assignment converges without routeRole', async () => {
+      const { transfer } = createPreparedTransfer({ version: 2 });
+      const res1 = await handoffService.routeHandoffSuccessor({
+        transferId: transfer.id,
+        expectedVersion: 2,
+        expectedSuccessorEpoch: 2,
+      });
+      expect(res1.success).toBe(true);
+
+      const res2 = await handoffService.routeHandoffSuccessor({
+        transferId: transfer.id,
+        expectedVersion: 2,
+        expectedSuccessorEpoch: 2,
+      });
+      expect(res2.success).toBe(true);
+      expect(res2.alreadyRouted).toBe(true);
+    });
   });
 
   // ============================================================
@@ -1200,7 +1373,7 @@ describe('R5I4 Cross-Provider Successor Routing and Replay Identity Authority', 
       });
 
       expect(res.success).toBe(false);
-      expect(res.errorCode).toBe('NO_ELIGIBLE_CANDIDATES');
+      expect(res.outcome).toBe('NO_ELIGIBLE_PROVIDER');
       expect(repo.getAllAgentAssignments().length).toBe(1);
     });
 
@@ -1461,6 +1634,167 @@ describe('R5I4 Cross-Provider Successor Routing and Replay Identity Authority', 
 
       expect(res.success).toBe(false);
       expect(res.errorCode).toBe('AGENT_PROFILE_DISABLED');
+    });
+
+    it('B1. structurally valid HANDOFF snapshot with wrong nondeterministic ID fails closed', async () => {
+      const { transfer } = createPreparedTransfer();
+      const bogusSnapId = 'ctx-snap-ho-nondeterministic-bogus';
+      const bogusManId = 'ctx-man-ho-nondeterministic-bogus';
+      contextBuilder.buildContextSnapshot({
+        projectId,
+        taskId,
+        attemptId: successorAttemptId,
+        purpose: 'HANDOFF',
+        snapshotId: bogusSnapId,
+        manifestId: bogusManId,
+      });
+
+      db.prepare('UPDATE handoff_transfers SET successor_context_snapshot_id = ? WHERE id = ?').run(bogusSnapId, transfer.id);
+      const res = await handoffService.routeHandoffSuccessor({
+        transferId: transfer.id,
+        expectedVersion: 2,
+        expectedSuccessorEpoch: 2,
+      });
+      expect(res.success).toBe(false);
+      expect(res.errorCode).toBe('CONTEXT_SNAPSHOT_INTEGRITY_MISMATCH');
+      expect(repo.getAllAgentAssignments().length).toBe(1);
+    });
+
+    it('B2. correct snapshot but manifest replaced with wrong manifest ID fails closed', async () => {
+      const { transfer, snapshotId } = createPreparedTransfer();
+      db.prepare('DELETE FROM context_manifests WHERE snapshot_id = ?').run(snapshotId);
+      db.prepare(`
+        INSERT INTO context_manifests (id, snapshot_id, manifest_version, item_count, manifest_json, manifest_hash, created_at)
+        VALUES (?, ?, '1.0', 0, '[]', 'hash', ?)
+      `).run('ctx-man-ho-wrong-id', snapshotId, nowIso);
+
+      const res = await handoffService.routeHandoffSuccessor({
+        transferId: transfer.id,
+        expectedVersion: 2,
+        expectedSuccessorEpoch: 2,
+      });
+      expect(res.success).toBe(false);
+      expect(res.errorCode).toBe('CONTEXT_MANIFEST_NOT_FOUND');
+      expect(repo.getAllAgentAssignments().length).toBe(1);
+    });
+
+    it('D1-D3. RoutePolicy with allow_manual_bridge=true produces MANUAL_HANDOFF_REQUIRED and creates zero assignment', async () => {
+      const manualAdapter = new MockTestAdapter('prov-manual-d', 'Manual Adapter D', 'MANUAL_BRIDGE');
+      registry.register(manualAdapter);
+      repo.createProvider({
+        id: 'prov-manual-d',
+        name: 'Manual Provider D',
+        adapter_type: 'MANUAL_BRIDGE',
+        enabled: true,
+        created_at: nowIso,
+      });
+      repo.createProviderAccount({
+        id: 'acc-manual-d-1',
+        provider_id: 'prov-manual-d',
+        label: 'Manual Account D',
+        auth_mode: 'API_CREDENTIAL',
+        credential_ref: 'wincred://agentforge/manual-d/key',
+        profile_ref: null,
+        enabled: true,
+        priority: 100,
+        health_status: 'AVAILABLE',
+        cooldown_until: null,
+        concurrency_limit: 1,
+        last_success_at: nowIso,
+        last_failure_at: null,
+        last_failure_code: null,
+        created_at: nowIso,
+        updated_at: nowIso,
+      });
+      repo.createProviderResource({
+        id: 'res-manual-d-1',
+        provider_id: 'prov-manual-d',
+        provider_account_id: 'acc-manual-d-1',
+        model_name: 'human-review',
+        health_status: 'AVAILABLE',
+        capabilities: ['REVIEW'],
+        enabled: true,
+        total_quota: null,
+        remaining_quota: null,
+        quota_unit: 'REQUESTS',
+        quota_reset_at: null,
+        quota_source: 'UNKNOWN',
+        quota_confidence: 1.0,
+        last_health_check: nowIso,
+      });
+
+      repo.createRoutePolicy({
+        id: 'policy-manual-bridge',
+        name: 'Manual Bridge Policy',
+        required_capabilities: [],
+        preferred_capabilities: [],
+        provider_account_policy: null,
+        allow_manual_bridge: true,
+        failover_policy: null,
+        risk_policy: null,
+        enabled: true,
+        created_at: nowIso,
+        updated_at: nowIso,
+      });
+
+      // Disable automated providers so only manual candidate exists
+      db.prepare('UPDATE provider_accounts SET enabled = 0 WHERE provider_id != ?').run('prov-manual-d');
+
+      const { transfer } = createPreparedTransfer();
+      const res = await handoffService.routeHandoffSuccessor({
+        transferId: transfer.id,
+        expectedVersion: 2,
+        expectedSuccessorEpoch: 2,
+        routePolicyId: 'policy-manual-bridge',
+      });
+
+      expect(res.decision?.outcome).toBe('MANUAL_HANDOFF_REQUIRED');
+      expect(res.success).toBe(false);
+      expect(res.outcome).toBe('MANUAL_HANDOFF_REQUIRED');
+      expect(repo.getAllAgentAssignments().length).toBe(1);
+      const updatedTransfer = repo.getHandoffTransfer(transfer.id);
+      expect(updatedTransfer?.status).toBe('SUCCESSOR_PREPARED');
+    });
+
+    it('E1. Phase B revalidates cooldown with transaction-local time and fails closed', async () => {
+      const { transfer } = createPreparedTransfer({ version: 2 });
+      const originalBind = repo.bindHandoffSuccessorRoute.bind(repo);
+      repo.bindHandoffSuccessorRoute = (params) => {
+        const futureCooldown = new Date(Date.now() + 3600000).toISOString();
+        db.prepare("UPDATE provider_accounts SET health_status = 'COOLDOWN', cooldown_until = ? WHERE id = ?").run(
+          futureCooldown,
+          params.selectedAccountId
+        );
+        return originalBind(params);
+      };
+
+      const res = await handoffService.routeHandoffSuccessor({
+        transferId: transfer.id,
+        expectedVersion: 2,
+        expectedSuccessorEpoch: 2,
+      });
+
+      expect(res.success).toBe(false);
+      expect(res.errorCode).toBe('PROVIDER_ACCOUNT_UNSAFE_HEALTH');
+      expect(repo.getAllAgentAssignments().length).toBe(1);
+      const t = repo.getHandoffTransfer(transfer.id);
+      expect(t?.status).toBe('SUCCESSOR_PREPARED');
+    });
+
+    it('E2. expired persisted cooldown remains eligible', async () => {
+      const pastCooldown = new Date(Date.now() - 3600000).toISOString();
+      db.prepare("UPDATE provider_accounts SET health_status = 'COOLDOWN', cooldown_until = ? WHERE id = 'acc-succ-openai-1'").run(pastCooldown);
+      repo.updateProviderAccount('acc-succ-google-1', { enabled: false });
+
+      const { transfer } = createPreparedTransfer();
+      const res = await handoffService.routeHandoffSuccessor({
+        transferId: transfer.id,
+        expectedVersion: 2,
+        expectedSuccessorEpoch: 2,
+      });
+
+      expect(res.success).toBe(true);
+      expect(res.transfer?.status).toBe('ROUTED');
     });
   });
 
