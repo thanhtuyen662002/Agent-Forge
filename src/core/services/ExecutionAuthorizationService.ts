@@ -38,6 +38,10 @@ export interface HandoffSuccessorExecutionAuthorityV1 {
   manager_payload_hash: string;
 }
 
+export function computeSha256(content: string): string {
+  return crypto.createHash('sha256').update(content, 'utf8').digest('hex');
+}
+
 export function computeHandoffAuthorizationId(authority: HandoffSuccessorExecutionAuthorityV1): string {
   const canonicalSpec: Record<string, unknown> = {
     version: 1,
@@ -1040,13 +1044,7 @@ export class ExecutionAuthorizationService {
       token_estimate: i.token_estimate,
     }));
 
-    let snapshotContentHash = '';
-    try {
-      const manifestJsonParsed = JSON.parse(manifest.manifest_json);
-      snapshotContentHash = manifestJsonParsed.snapshot_content_hash || manifest.manifest_hash;
-    } catch {
-      snapshotContentHash = manifest.manifest_hash;
-    }
+    const snapshotContentHash = integrityResult.snapshot!.content_hash;
 
     const contextDescriptor = buildHandoffContextExecutionDescriptorV1({
       snapshotId: transfer.successor_context_snapshot_id,
@@ -1085,14 +1083,32 @@ export class ExecutionAuthorizationService {
 
     // 14. Compute Deterministic Authorization ID
     const routeMetadata = assignment.preferred_metadata as Record<string, unknown> | null;
-    const routeSpecHash = (routeMetadata?.handoff_route_spec_hash || routeMetadata?.route_spec_hash || routeMetadata?.routeSpecHash || '') as string;
-    if (!routeSpecHash || routeSpecHash.trim().length === 0) {
+    if (
+      !routeMetadata ||
+      typeof routeMetadata !== 'object' ||
+      routeMetadata.handoff_route_spec_version !== 1 ||
+      !routeMetadata.handoff_route_spec ||
+      typeof routeMetadata.handoff_route_spec !== 'object' ||
+      typeof routeMetadata.handoff_route_spec_hash !== 'string' ||
+      routeMetadata.handoff_route_spec_hash.trim().length === 0
+    ) {
       return {
         success: false,
         errorCode: 'ROUTE_METADATA_CORRUPT',
-        error: `Successor assignment "${assignment.id}" is missing handoff_route_spec_hash in preferred_metadata.`,
+        error: `Successor assignment "${assignment.id}" is missing valid R5I4 route specification metadata in preferred_metadata.`,
       };
     }
+
+    const recomputedRouteHash = computeSha256(canonicalJsonStringify(routeMetadata.handoff_route_spec as Record<string, unknown>));
+    if (recomputedRouteHash !== routeMetadata.handoff_route_spec_hash) {
+      return {
+        success: false,
+        errorCode: 'ROUTE_METADATA_CORRUPT',
+        error: `Successor assignment "${assignment.id}" handoff_route_spec_hash does not match recomputed hash of handoff_route_spec.`,
+      };
+    }
+
+    const routeSpecHash = routeMetadata.handoff_route_spec_hash as string;
 
     const authority: HandoffSuccessorExecutionAuthorityV1 = {
       version: 1,

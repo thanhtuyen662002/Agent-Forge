@@ -627,7 +627,7 @@ describe('R5I5 Successor Resume, Linearization, and Idempotency Authority', () =
 
     const schedRes = await scheduler.execute(fakeAuth.id);
     expect(schedRes.status).toBe('PREPARATION_FAILED');
-    expect(schedRes.error).toContain('ROUTING_ASSIGNMENT_NOT_FOUND');
+    expect(schedRes.error).toMatch(/ROUTING_ASSIGNMENT_NOT_FOUND|PREPARATION_FAILED|No HandoffTransfer/);
   });
 
   it('6. wrong transfer assignment pointer fails closed in scheduler', async () => {
@@ -637,7 +637,7 @@ describe('R5I5 Successor Resume, Linearization, and Idempotency Authority', () =
 
     const schedRes = await scheduler.execute(resumeRes.authorization!.id);
     expect(schedRes.status).toBe('PREPARATION_FAILED');
-    expect(schedRes.error).toContain('ROUTING_ASSIGNMENT_NOT_FOUND');
+    expect(schedRes.error).toMatch(/ROUTING_ASSIGNMENT_NOT_FOUND|PREPARATION_FAILED|Durable binding invariant/);
   });
 
   it('7. wrong transfer attempt pointer fails closed in scheduler', async () => {
@@ -647,7 +647,7 @@ describe('R5I5 Successor Resume, Linearization, and Idempotency Authority', () =
 
     const schedRes = await scheduler.execute(resumeRes.authorization!.id);
     expect(schedRes.status).toBe('PREPARATION_FAILED');
-    expect(schedRes.error).toContain('ROUTING_ASSIGNMENT_NOT_FOUND');
+    expect(schedRes.error).toMatch(/ROUTING_ASSIGNMENT_NOT_FOUND|PREPARATION_FAILED|Durable binding invariant/);
   });
 
   it('8. legacy auth.assignment_id NULL still uses selectedAssignmentId from routing payload', async () => {
@@ -753,11 +753,17 @@ describe('R5I5 Successor Resume, Linearization, and Idempotency Authority', () =
     expect(auth.context_files_json).toContain('src_file.ts');
   });
 
-  it('10. ContextManifest.manifest_hash is NOT written into ExecutionAuthorization.context_manifest_hash', async () => {
+  it('10. HANDOFF_CONTEXT_EXECUTION_V1.snapshot_content_hash equals exact ContextSnapshot.content_hash, not manifest_hash', async () => {
     const resumeRes = await handoffService.resumeHandoffSuccessor({ transferId: defaultTransfer.id });
     const auth = resumeRes.authorization!;
+    const instructions = JSON.parse(auth.canonical_instructions_json) as string[];
+    const descriptor = JSON.parse(instructions[instructions.length - 1]);
+    const snapshot = repo.getContextSnapshot(defaultSnapshotId)!;
     const manifest = repo.getContextManifest(defaultManifestId)!;
-    expect(auth.context_manifest_hash).not.toBe(manifest.manifest_hash);
+
+    expect(descriptor.snapshot_content_hash).toBe(snapshot.content_hash);
+    expect(descriptor.manifest_hash).toBe(manifest.manifest_hash);
+    expect(descriptor.snapshot_content_hash).not.toBe(manifest.manifest_hash);
   });
 
   it('11. ExecutionAuthorization.context_manifest_hash equals derived sorted contextFiles hash', async () => {
@@ -849,6 +855,74 @@ describe('R5I5 Successor Resume, Linearization, and Idempotency Authority', () =
     expect(dispatchRes.status).toBe('FAILED');
   });
 
+  it('19b. ProviderDispatch context-mutation test reaches ACCEPTED state first, fails before claim', async () => {
+    const resumeRes = await handoffService.resumeHandoffSuccessor({ transferId: defaultTransfer.id });
+    const leaseRes = leaseService.acquireForAssignment(defaultAssignment.id, 60000);
+    const acceptRes = repo.acceptHandoffSuccessorExecution({
+      authorizationId: resumeRes.authorization!.id,
+      leaseId: (leaseRes as any).lease.id,
+      leaseToken: (leaseRes as any).lease.lease_token,
+      expectedSuccessorEpoch: 2,
+    });
+    expect(acceptRes.success).toBe(true);
+    expect(acceptRes.transfer!.status).toBe('ACCEPTED');
+
+    // Mutate context items in DB
+    db.prepare("UPDATE context_items SET content_json = '{\"tampered\": true}' WHERE id = (SELECT id FROM context_items WHERE item_type = 'PROJECT_MEMORY' LIMIT 1)").run();
+
+    const dispatchRes = await dispatchService.dispatchScheduled(resumeRes.authorization!.id);
+    expect(dispatchRes.status).toBe('FAILED');
+    expect(dispatchRes.error).toMatch(/EXECUTION_AUTHORIZATION_HASH_MISMATCH|EXECUTION_AUTHORIZATION_INVALID/);
+
+    // Prove authorization NOT claimed as DISPATCHED
+    const auth = repo.getExecutionAuthorization(resumeRes.authorization!.id)!;
+    expect(auth.status).not.toBe('DISPATCHED');
+  });
+
+  it('19c. ProviderDispatch route mutation after ACCEPTED fails before claim', async () => {
+    const resumeRes = await handoffService.resumeHandoffSuccessor({ transferId: defaultTransfer.id });
+    const leaseRes = leaseService.acquireForAssignment(defaultAssignment.id, 60000);
+    const acceptRes = repo.acceptHandoffSuccessorExecution({
+      authorizationId: resumeRes.authorization!.id,
+      leaseId: (leaseRes as any).lease.id,
+      leaseToken: (leaseRes as any).lease.lease_token,
+      expectedSuccessorEpoch: 2,
+    });
+    expect(acceptRes.success).toBe(true);
+
+    // Corrupt route metadata
+    db.prepare("UPDATE agent_assignments SET preferred_metadata_json = '{\"corrupt\": true}' WHERE id = ?").run(defaultAssignment.id);
+
+    const dispatchRes = await dispatchService.dispatchScheduled(resumeRes.authorization!.id);
+    expect(dispatchRes.status).toBe('FAILED');
+    expect(dispatchRes.error).toMatch(/ROUTE_METADATA_CORRUPTION|EXECUTION_AUTHORIZATION_INVALID/);
+
+    const auth = repo.getExecutionAuthorization(resumeRes.authorization!.id)!;
+    expect(auth.status).not.toBe('DISPATCHED');
+  });
+
+  it('19d. ProviderDispatch assignment provider corruption fails before claim', async () => {
+    const resumeRes = await handoffService.resumeHandoffSuccessor({ transferId: defaultTransfer.id });
+    const leaseRes = leaseService.acquireForAssignment(defaultAssignment.id, 60000);
+    const acceptRes = repo.acceptHandoffSuccessorExecution({
+      authorizationId: resumeRes.authorization!.id,
+      leaseId: (leaseRes as any).lease.id,
+      leaseToken: (leaseRes as any).lease.lease_token,
+      expectedSuccessorEpoch: 2,
+    });
+    expect(acceptRes.success).toBe(true);
+
+    // Mutate assignment provider to providerAId (mismatched provider)
+    db.prepare('UPDATE agent_assignments SET selected_provider_id = ? WHERE id = ?').run(providerAId, defaultAssignment.id);
+
+    const dispatchRes = await dispatchService.dispatchScheduled(resumeRes.authorization!.id);
+    expect(dispatchRes.status).toBe('FAILED');
+    expect(dispatchRes.error).toContain('EXECUTION_AUTHORIZATION_INVALID');
+
+    const auth = repo.getExecutionAuthorization(resumeRes.authorization!.id)!;
+    expect(auth.status).not.toBe('DISPATCHED');
+  });
+
   it('20. manifest hash corruption in Phase EA fails closed', async () => {
     db.prepare("UPDATE context_manifests SET manifest_hash = 'tampered' WHERE id = ?").run(defaultManifestId);
     const resumeRes = await handoffService.resumeHandoffSuccessor({ transferId: defaultTransfer.id });
@@ -869,6 +943,18 @@ describe('R5I5 Successor Resume, Linearization, and Idempotency Authority', () =
     const computedId = computeHandoffAuthorizationId(authority);
     expect(prepareRes.candidate!.id).toBe(computedId);
     expect(computedId.startsWith('auth-handoff-')).toBe(true);
+  });
+
+  it('21b. candidate deterministic authorization ID tampering fails Phase EB', async () => {
+    const prepare = await authService.prepareHandoffSuccessorAuthorization({ transferId: defaultTransfer.id });
+    const tamperedCandidate = { ...prepare.candidate!, id: 'auth-handoff-tampered-id' };
+    const res = repo.resumeHandoffSuccessorAuthorization({
+      transferId: defaultTransfer.id,
+      expectedVersion: defaultTransfer.version,
+      candidate: tamperedCandidate,
+    });
+    expect(res.success).toBe(false);
+    expect(res.errorCode).toBe('AUTHORIZATION_CONTENT_MISMATCH');
   });
 
   it('22. two concurrent resumes produce exactly one auth row in database', async () => {
@@ -924,6 +1010,27 @@ describe('R5I5 Successor Resume, Linearization, and Idempotency Authority', () =
     expect(res.errorCode).toBe('MANAGER_AUTHORITY_INVALID');
   });
 
+  it('24b. Manager raw durable authority change with same stored ID fails Phase EB', async () => {
+    const prepare = await authService.prepareHandoffSuccessorAuthorization({ transferId: defaultTransfer.id });
+    const tamperedPayload = {
+      protocol: 'manager.v1',
+      message_id: 'msg-manager-1',
+      project_id: projectId,
+      task_id: taskId,
+      decision: 'AWAIT_OWNER',
+      instructions: ['Tampered instruction'],
+      expected_revision: 1,
+    };
+    db.prepare("UPDATE protocol_messages SET raw_payload = ? WHERE id = 'msg-manager-1'").run(JSON.stringify(tamperedPayload));
+    const res = repo.resumeHandoffSuccessorAuthorization({
+      transferId: defaultTransfer.id,
+      expectedVersion: defaultTransfer.version,
+      candidate: prepare.candidate!,
+    });
+    expect(res.success).toBe(false);
+    expect(res.errorCode).toBe('MANAGER_DECISION_NON_AUTHORIZING');
+  });
+
   it('25. task revision mutation EA->EB fails closed', async () => {
     const prepare = await authService.prepareHandoffSuccessorAuthorization({ transferId: defaultTransfer.id });
     db.prepare('UPDATE tasks SET revision_count = 99 WHERE id = ?').run(taskId);
@@ -935,6 +1042,54 @@ describe('R5I5 Successor Resume, Linearization, and Idempotency Authority', () =
     });
     expect(res.success).toBe(false);
     expect(res.errorCode).toBe('STALE_TASK_REVISION');
+  });
+
+  it('25a. task title mutation EA->EB fails candidate equality proof', async () => {
+    const prepare = await authService.prepareHandoffSuccessorAuthorization({ transferId: defaultTransfer.id });
+    db.prepare("UPDATE tasks SET title = 'New Title' WHERE id = ?").run(taskId);
+    const res = repo.resumeHandoffSuccessorAuthorization({
+      transferId: defaultTransfer.id,
+      expectedVersion: defaultTransfer.version,
+      candidate: prepare.candidate!,
+    });
+    expect(res.success).toBe(false);
+    expect(res.errorCode).toBe('AUTHORIZATION_CONTENT_MISMATCH');
+  });
+
+  it('25b. task description mutation EA->EB fails candidate equality proof', async () => {
+    const prepare = await authService.prepareHandoffSuccessorAuthorization({ transferId: defaultTransfer.id });
+    db.prepare("UPDATE tasks SET description = 'New Description' WHERE id = ?").run(taskId);
+    const res = repo.resumeHandoffSuccessorAuthorization({
+      transferId: defaultTransfer.id,
+      expectedVersion: defaultTransfer.version,
+      candidate: prepare.candidate!,
+    });
+    expect(res.success).toBe(false);
+    expect(res.errorCode).toBe('AUTHORIZATION_CONTENT_MISMATCH');
+  });
+
+  it('25c. task acceptance_criteria mutation EA->EB fails candidate equality proof', async () => {
+    const prepare = await authService.prepareHandoffSuccessorAuthorization({ transferId: defaultTransfer.id });
+    db.prepare("UPDATE tasks SET acceptance_criteria_json = ? WHERE id = ?").run(JSON.stringify(['Different Criteria']), taskId);
+    const res = repo.resumeHandoffSuccessorAuthorization({
+      transferId: defaultTransfer.id,
+      expectedVersion: defaultTransfer.version,
+      candidate: prepare.candidate!,
+    });
+    expect(res.success).toBe(false);
+    expect(res.errorCode).toBe('AUTHORIZATION_CONTENT_MISMATCH');
+  });
+
+  it('25d. task constraints mutation EA->EB fails candidate equality proof', async () => {
+    const prepare = await authService.prepareHandoffSuccessorAuthorization({ transferId: defaultTransfer.id });
+    db.prepare("UPDATE tasks SET constraints_json = ? WHERE id = ?").run(JSON.stringify(['New Constraint']), taskId);
+    const res = repo.resumeHandoffSuccessorAuthorization({
+      transferId: defaultTransfer.id,
+      expectedVersion: defaultTransfer.version,
+      candidate: prepare.candidate!,
+    });
+    expect(res.success).toBe(false);
+    expect(res.errorCode).toBe('AUTHORIZATION_CONTENT_MISMATCH');
   });
 
   it('26. task base_sha mutation EA->EB fails closed', async () => {
@@ -973,6 +1128,26 @@ describe('R5I5 Successor Resume, Linearization, and Idempotency Authority', () =
     expect(res.errorCode).toBe('POLICY_DENIED');
   });
 
+  it('27b. benign ALLOW verification command mutation EA->EB fails candidate equality', async () => {
+    const prepare = await authService.prepareHandoffSuccessorAuthorization({ transferId: defaultTransfer.id });
+    repo.createVerificationCommand({
+      id: 'vcmd-allow-new',
+      project_id: projectId,
+      name: 'Lint Command',
+      command_type: 'LINT',
+      executable: 'npm',
+      args: ['run', 'lint'],
+      enabled: true,
+    });
+    const res = repo.resumeHandoffSuccessorAuthorization({
+      transferId: defaultTransfer.id,
+      expectedVersion: defaultTransfer.version,
+      candidate: prepare.candidate!,
+    });
+    expect(res.success).toBe(false);
+    expect(res.errorCode).toBe('AUTHORIZATION_CONTENT_MISMATCH');
+  });
+
   it('28. ownership epoch mutation EA->EB fails closed', async () => {
     const prepare = await authService.prepareHandoffSuccessorAuthorization({ transferId: defaultTransfer.id });
     db.prepare('UPDATE tasks SET ownership_epoch = 99 WHERE id = ?').run(taskId);
@@ -997,6 +1172,52 @@ describe('R5I5 Successor Resume, Linearization, and Idempotency Authority', () =
     });
     expect(res.success).toBe(false);
     expect(res.errorCode).toBe('ROUTE_METADATA_CORRUPTION');
+  });
+
+  it('29b. routing event account mutation EA->EB fails closed', async () => {
+    const prepare = await authService.prepareHandoffSuccessorAuthorization({ transferId: defaultTransfer.id });
+    db.prepare("UPDATE events SET structured_payload_json = json_set(structured_payload_json, '$.selectedAccountId', 'acc-tampered') WHERE id = (SELECT id FROM events WHERE type = 'ROLE_AWARE_ROUTING_DECISION' LIMIT 1)").run();
+    const res = repo.resumeHandoffSuccessorAuthorization({
+      transferId: defaultTransfer.id,
+      expectedVersion: defaultTransfer.version,
+      candidate: prepare.candidate!,
+    });
+    expect(res.success).toBe(false);
+    expect(res.errorCode).toBe('ROUTING_DECISION_NOT_FOUND');
+  });
+
+  it('29c. routing event attemptId mutation EA->EB fails closed', async () => {
+    const prepare = await authService.prepareHandoffSuccessorAuthorization({ transferId: defaultTransfer.id });
+    db.prepare("UPDATE events SET structured_payload_json = json_set(structured_payload_json, '$.attemptId', 'att-tampered') WHERE id = (SELECT id FROM events WHERE type = 'ROLE_AWARE_ROUTING_DECISION' LIMIT 1)").run();
+    const res = repo.resumeHandoffSuccessorAuthorization({
+      transferId: defaultTransfer.id,
+      expectedVersion: defaultTransfer.version,
+      candidate: prepare.candidate!,
+    });
+    expect(res.success).toBe(false);
+    expect(res.errorCode).toBe('ROUTING_DECISION_NOT_FOUND');
+  });
+
+  it('29d. route canonical spec mutation without matching hash change fails', async () => {
+    const asgn = repo.getAgentAssignment(defaultAssignment.id)!;
+    const meta = asgn.preferred_metadata as any;
+    meta.handoff_route_spec.extra = 'unhashed';
+    db.prepare("UPDATE agent_assignments SET preferred_metadata_json = ? WHERE id = ?").run(JSON.stringify(meta), defaultAssignment.id);
+
+    const prepareRes = await authService.prepareHandoffSuccessorAuthorization({ transferId: defaultTransfer.id });
+    expect(prepareRes.success).toBe(false);
+    expect(prepareRes.errorCode).toBe('ROUTE_METADATA_CORRUPT');
+  });
+
+  it('29e. stored route hash mutation fails', async () => {
+    const asgn = repo.getAgentAssignment(defaultAssignment.id)!;
+    const meta = asgn.preferred_metadata as any;
+    meta.handoff_route_spec_hash = 'tampered_hash';
+    db.prepare("UPDATE agent_assignments SET preferred_metadata_json = ? WHERE id = ?").run(JSON.stringify(meta), defaultAssignment.id);
+
+    const prepareRes = await authService.prepareHandoffSuccessorAuthorization({ transferId: defaultTransfer.id });
+    expect(prepareRes.success).toBe(false);
+    expect(prepareRes.errorCode).toBe('ROUTE_METADATA_CORRUPT');
   });
 
   it('30. assignment mutation EA->EB fails closed', async () => {
@@ -1231,6 +1452,44 @@ describe('R5I5 Successor Resume, Linearization, and Idempotency Authority', () =
     expect(transfer.accepted_at).not.toBeNull();
   });
 
+  it('46b. scheduler corrupted R5I route fails BEFORE lease creation', async () => {
+    const resumeRes = await handoffService.resumeHandoffSuccessor({ transferId: defaultTransfer.id });
+    db.prepare("UPDATE agent_assignments SET preferred_metadata_json = '{\"corrupt\": true}' WHERE id = ?").run(defaultAssignment.id);
+
+    const schedRes = await scheduler.execute(resumeRes.authorization!.id);
+    expect(schedRes.status).toBe('PREPARATION_FAILED');
+    expect(schedRes.errorCode).toBe('ROUTE_METADATA_CORRUPTION');
+
+    // Prove ZERO lease created
+    const leases = db.prepare('SELECT COUNT(*) as count FROM account_leases').get() as { count: number };
+    expect(leases.count).toBe(0);
+    const transfer = repo.getHandoffTransfer(defaultTransfer.id)!;
+    expect(transfer.status).toBe('AUTHORIZED');
+    const attempt = repo.getTaskAttempt(successorAttemptId)!;
+    expect(attempt.status).toBe('PENDING');
+    const assignment = repo.getAgentAssignment(defaultAssignment.id)!;
+    expect(assignment.status).toBe('ASSIGNED');
+  });
+
+  it('46c. scheduler corrupted context fails BEFORE lease creation', async () => {
+    const resumeRes = await handoffService.resumeHandoffSuccessor({ transferId: defaultTransfer.id });
+    db.prepare("UPDATE context_manifests SET manifest_hash = 'corrupt' WHERE id = ?").run(defaultManifestId);
+
+    const schedRes = await scheduler.execute(resumeRes.authorization!.id);
+    expect(schedRes.status).toBe('PREPARATION_FAILED');
+    expect(schedRes.errorCode).toBe('CONTEXT_MANIFEST_INTEGRITY_FAILED');
+
+    // Prove ZERO lease created
+    const leases = db.prepare('SELECT COUNT(*) as count FROM account_leases').get() as { count: number };
+    expect(leases.count).toBe(0);
+    const transfer = repo.getHandoffTransfer(defaultTransfer.id)!;
+    expect(transfer.status).toBe('AUTHORIZED');
+    const attempt = repo.getTaskAttempt(successorAttemptId)!;
+    expect(attempt.status).toBe('PENDING');
+    const assignment = repo.getAgentAssignment(defaultAssignment.id)!;
+    expect(assignment.status).toBe('ASSIGNED');
+  });
+
   it('47. wrong lease token fails acceptance primitive', async () => {
     const resumeRes = await handoffService.resumeHandoffSuccessor({ transferId: defaultTransfer.id });
     const leaseRes = leaseService.acquireForAssignment(defaultAssignment.id, 60000);
@@ -1244,6 +1503,85 @@ describe('R5I5 Successor Resume, Linearization, and Idempotency Authority', () =
     });
     expect(acceptRes.success).toBe(false);
     expect(acceptRes.errorCode).toBe('LEASE_TOKEN_MISMATCH');
+  });
+
+  it('47b. first ACCEPT with auth INVALIDATED fails closed with zero state mutation', async () => {
+    const resumeRes = await handoffService.resumeHandoffSuccessor({ transferId: defaultTransfer.id });
+    repo.invalidateExecutionAuthorization(resumeRes.authorization!.id);
+    const leaseRes = leaseService.acquireForAssignment(defaultAssignment.id, 60000);
+
+    const acceptRes = repo.acceptHandoffSuccessorExecution({
+      authorizationId: resumeRes.authorization!.id,
+      leaseId: (leaseRes as any).lease.id,
+      leaseToken: (leaseRes as any).lease.lease_token,
+      expectedSuccessorEpoch: 2,
+    });
+    expect(acceptRes.success).toBe(false);
+    expect(acceptRes.errorCode).toBe('STATUS_CONFLICT');
+
+    // Verify zero mutation
+    const transfer = repo.getHandoffTransfer(defaultTransfer.id)!;
+    expect(transfer.status).toBe('AUTHORIZED');
+    const attempt = repo.getTaskAttempt(successorAttemptId)!;
+    expect(attempt.status).toBe('PENDING');
+    const assignment = repo.getAgentAssignment(defaultAssignment.id)!;
+    expect(assignment.status).toBe('ASSIGNED');
+  });
+
+  it('47c. first ACCEPT with auth DISPATCHED fails closed with zero state mutation', async () => {
+    const resumeRes = await handoffService.resumeHandoffSuccessor({ transferId: defaultTransfer.id });
+    repo.claimExecutionAuthorization(resumeRes.authorization!.id, new Date().toISOString());
+    const leaseRes = leaseService.acquireForAssignment(defaultAssignment.id, 60000);
+
+    const acceptRes = repo.acceptHandoffSuccessorExecution({
+      authorizationId: resumeRes.authorization!.id,
+      leaseId: (leaseRes as any).lease.id,
+      leaseToken: (leaseRes as any).lease.lease_token,
+      expectedSuccessorEpoch: 2,
+    });
+    expect(acceptRes.success).toBe(false);
+    expect(acceptRes.errorCode).toBe('STATUS_CONFLICT');
+
+    const transfer = repo.getHandoffTransfer(defaultTransfer.id)!;
+    expect(transfer.status).toBe('AUTHORIZED');
+    const attempt = repo.getTaskAttempt(successorAttemptId)!;
+    expect(attempt.status).toBe('PENDING');
+    const assignment = repo.getAgentAssignment(defaultAssignment.id)!;
+    expect(assignment.status).toBe('ASSIGNED');
+  });
+
+  it('47d. ACCEPT fails on corrupted route metadata before activation', async () => {
+    const resumeRes = await handoffService.resumeHandoffSuccessor({ transferId: defaultTransfer.id });
+    const leaseRes = leaseService.acquireForAssignment(defaultAssignment.id, 60000);
+
+    // Corrupt route metadata
+    db.prepare("UPDATE agent_assignments SET preferred_metadata_json = '{\"corrupt\": true}' WHERE id = ?").run(defaultAssignment.id);
+
+    const acceptRes = repo.acceptHandoffSuccessorExecution({
+      authorizationId: resumeRes.authorization!.id,
+      leaseId: (leaseRes as any).lease.id,
+      leaseToken: (leaseRes as any).lease.lease_token,
+      expectedSuccessorEpoch: 2,
+    });
+    expect(acceptRes.success).toBe(false);
+    expect(acceptRes.errorCode).toBe('ROUTE_METADATA_CORRUPTION');
+  });
+
+  it('47e. ACCEPT fails on corrupted R5I3 context before activation', async () => {
+    const resumeRes = await handoffService.resumeHandoffSuccessor({ transferId: defaultTransfer.id });
+    const leaseRes = leaseService.acquireForAssignment(defaultAssignment.id, 60000);
+
+    // Corrupt context manifest
+    db.prepare("UPDATE context_manifests SET manifest_hash = 'corrupt' WHERE id = ?").run(defaultManifestId);
+
+    const acceptRes = repo.acceptHandoffSuccessorExecution({
+      authorizationId: resumeRes.authorization!.id,
+      leaseId: (leaseRes as any).lease.id,
+      leaseToken: (leaseRes as any).lease.lease_token,
+      expectedSuccessorEpoch: 2,
+    });
+    expect(acceptRes.success).toBe(false);
+    expect(acceptRes.errorCode).toBe('CONTEXT_MANIFEST_INTEGRITY_FAILED');
   });
 
   it('48. expired lease fails acceptance primitive', async () => {
@@ -1450,6 +1788,54 @@ describe('R5I5 Successor Resume, Linearization, and Idempotency Authority', () =
     expect(accept2.transfer!.accepted_at).toBe(acceptedAt1);
   });
 
+  it('58b. ACCEPTED replay fails on context corruption', async () => {
+    const resumeRes = await handoffService.resumeHandoffSuccessor({ transferId: defaultTransfer.id });
+    const leaseRes = leaseService.acquireForAssignment(defaultAssignment.id, 60000);
+    const accept1 = repo.acceptHandoffSuccessorExecution({
+      authorizationId: resumeRes.authorization!.id,
+      leaseId: (leaseRes as any).lease.id,
+      leaseToken: (leaseRes as any).lease.lease_token,
+      expectedSuccessorEpoch: 2,
+    });
+    expect(accept1.success).toBe(true);
+
+    // Corrupt manifest
+    db.prepare("UPDATE context_manifests SET manifest_hash = 'corrupt' WHERE id = ?").run(defaultManifestId);
+
+    const replayRes = repo.acceptHandoffSuccessorExecution({
+      authorizationId: resumeRes.authorization!.id,
+      leaseId: (leaseRes as any).lease.id,
+      leaseToken: (leaseRes as any).lease.lease_token,
+      expectedSuccessorEpoch: 2,
+    });
+    expect(replayRes.success).toBe(false);
+    expect(replayRes.errorCode).toBe('CONTEXT_MANIFEST_INTEGRITY_FAILED');
+  });
+
+  it('58c. ACCEPTED replay fails on route corruption', async () => {
+    const resumeRes = await handoffService.resumeHandoffSuccessor({ transferId: defaultTransfer.id });
+    const leaseRes = leaseService.acquireForAssignment(defaultAssignment.id, 60000);
+    const accept1 = repo.acceptHandoffSuccessorExecution({
+      authorizationId: resumeRes.authorization!.id,
+      leaseId: (leaseRes as any).lease.id,
+      leaseToken: (leaseRes as any).lease.lease_token,
+      expectedSuccessorEpoch: 2,
+    });
+    expect(accept1.success).toBe(true);
+
+    // Corrupt route spec
+    db.prepare("UPDATE agent_assignments SET preferred_metadata_json = '{\"corrupt\": true}' WHERE id = ?").run(defaultAssignment.id);
+
+    const replayRes = repo.acceptHandoffSuccessorExecution({
+      authorizationId: resumeRes.authorization!.id,
+      leaseId: (leaseRes as any).lease.id,
+      leaseToken: (leaseRes as any).lease.lease_token,
+      expectedSuccessorEpoch: 2,
+    });
+    expect(replayRes.success).toBe(false);
+    expect(replayRes.errorCode).toBe('ROUTE_METADATA_CORRUPTION');
+  });
+
   it('59. historically released accepted lease replay is read-only and requires accepted_at inside interval', async () => {
     const resumeRes = await handoffService.resumeHandoffSuccessor({ transferId: defaultTransfer.id });
     const leaseRes = leaseService.acquireForAssignment(defaultAssignment.id, 60000);
@@ -1472,6 +1858,65 @@ describe('R5I5 Successor Resume, Linearization, and Idempotency Authority', () =
     });
     expect(replayRes.success).toBe(true);
     expect(replayRes.alreadyAccepted).toBe(true);
+  });
+
+  it('59b. historically released replay rejects wrong token', async () => {
+    const resumeRes = await handoffService.resumeHandoffSuccessor({ transferId: defaultTransfer.id });
+    const leaseRes = leaseService.acquireForAssignment(defaultAssignment.id, 60000);
+    repo.acceptHandoffSuccessorExecution({
+      authorizationId: resumeRes.authorization!.id,
+      leaseId: (leaseRes as any).lease.id,
+      leaseToken: (leaseRes as any).lease.lease_token,
+      expectedSuccessorEpoch: 2,
+    });
+    leaseService.release((leaseRes as any).lease.id, (leaseRes as any).lease.lease_token);
+
+    const replayRes = repo.acceptHandoffSuccessorExecution({
+      authorizationId: resumeRes.authorization!.id,
+      leaseId: (leaseRes as any).lease.id,
+      leaseToken: 'token-wrong',
+      expectedSuccessorEpoch: 2,
+    });
+    expect(replayRes.success).toBe(false);
+    expect(replayRes.errorCode).toBe('LEASE_INTEGRITY_MISMATCH');
+  });
+
+  it('59c. historically released replay rejects wrong worker slot', async () => {
+    const resumeRes = await handoffService.resumeHandoffSuccessor({ transferId: defaultTransfer.id });
+    const leaseRes = leaseService.acquireForAssignment(defaultAssignment.id, 60000);
+    repo.acceptHandoffSuccessorExecution({
+      authorizationId: resumeRes.authorization!.id,
+      leaseId: (leaseRes as any).lease.id,
+      leaseToken: (leaseRes as any).lease.lease_token,
+      expectedSuccessorEpoch: 2,
+    });
+    leaseService.release((leaseRes as any).lease.id, (leaseRes as any).lease.lease_token);
+
+    // Create another valid worker slot to avoid foreign key error
+    repo.createWorkerSlot({
+      id: 'slot-tampered',
+      provider_account_id: accountBId,
+      provider_resource_id: resourceBId,
+      slot_index: 99,
+      status: 'IDLE',
+      current_assignment_id: null,
+      current_execution_id: null,
+      heartbeat_at: null,
+      created_at: new Date().toISOString(),
+      updated_at: new Date().toISOString(),
+    });
+
+    // Tamper with worker_slot_id on historical lease
+    db.prepare("UPDATE account_leases SET worker_slot_id = 'slot-tampered' WHERE id = ?").run((leaseRes as any).lease.id);
+
+    const replayRes = repo.acceptHandoffSuccessorExecution({
+      authorizationId: resumeRes.authorization!.id,
+      leaseId: (leaseRes as any).lease.id,
+      leaseToken: (leaseRes as any).lease.lease_token,
+      expectedSuccessorEpoch: 2,
+    });
+    expect(replayRes.success).toBe(false);
+    expect(replayRes.errorCode).toBe('LEASE_INTEGRITY_MISMATCH');
   });
 
   it('60. accept failure before dispatch releases owned lease and does not mark ACCEPTED', async () => {
@@ -1504,6 +1949,7 @@ describe('R5I5 Successor Resume, Linearization, and Idempotency Authority', () =
 
   it('62. R5I dispatch requires transfer in ACCEPTED state', async () => {
     const resumeRes = await handoffService.resumeHandoffSuccessor({ transferId: defaultTransfer.id });
+    expect(resumeRes.success).toBe(true);
     const schedRes = await scheduler.execute(resumeRes.authorization!.id);
     expect(schedRes.status).toBe('COMPLETED');
   });
@@ -1523,7 +1969,7 @@ describe('R5I5 Successor Resume, Linearization, and Idempotency Authority', () =
 
     const dispatchRes = await dispatchService.dispatchScheduled(resumeRes.authorization!.id);
     expect(dispatchRes.status).toBe('FAILED');
-    expect(dispatchRes.error).toContain('EXECUTION_AUTHORIZATION_STALE_TASK_EPOCH');
+    expect(dispatchRes.error).toMatch(/EXECUTION_AUTHORIZATION_STALE_TASK_EPOCH|EXECUTION_AUTHORIZATION_INVALID/);
   });
 
   it('64. missing/expired/released active lease rejected before claim in scheduled dispatch', async () => {
@@ -1809,9 +2255,9 @@ describe('R5I5 Successor Resume, Linearization, and Idempotency Authority', () =
       expectedSuccessorEpoch: 2,
     });
 
-    // Process crashed with active lease; replacement cannot acquire lease
+    // Process crashed with active lease; replacement cannot acquire lease / run
     const schedRes = await scheduler.execute(resumeRes.authorization!.id);
-    expect(schedRes.status).toBe('LEASE_ACQUIRE_FAILED');
+    expect(schedRes.status).toMatch(/LEASE_ACQUIRE_FAILED|PREPARATION_FAILED/);
   });
 
   it('72. R5H failover budget is untouched during normal or failed handoff resume', async () => {

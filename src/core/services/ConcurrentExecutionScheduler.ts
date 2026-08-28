@@ -181,29 +181,27 @@ export class ConcurrentExecutionScheduler {
 
     let assignment: AgentAssignment | null = null;
     if (auth.assignment_id) {
-      // R5I Handoff execution bridge
-      const transfer = this.repo.getHandoffTransferBySuccessorAuthId(auth.id);
-      if (!transfer) {
+      // R5I Handoff execution bridge: validate full durable authority before acquiring lease
+      const valRes = this.repo.validateHandoffSuccessorExecutionAuthority(auth.id);
+      if (!valRes.valid) {
         return {
           status: 'PREPARATION_FAILED',
           authorizationId,
-          error: `ROUTING_ASSIGNMENT_NOT_FOUND: Execution authorization "${auth.id}" has assignment_id "${auth.assignment_id}" but no matching HandoffTransfer was found.`,
+          assignmentId: auth.assignment_id,
+          errorCode: (valRes.errorCode as any) || 'INTERNAL_ERROR',
+          error: `PREPARATION_FAILED: ${valRes.error}`,
         };
       }
-      if (
-        transfer.successor_assignment_id !== auth.assignment_id ||
-        transfer.successor_attempt_id !== auth.attempt_id ||
-        transfer.task_id !== auth.task_id ||
-        transfer.successor_ownership_epoch !== auth.task_ownership_epoch ||
-        (transfer.status !== 'AUTHORIZED' && transfer.status !== 'ACCEPTED')
-      ) {
+      if (valRes.transfer!.status !== 'AUTHORIZED') {
         return {
           status: 'PREPARATION_FAILED',
           authorizationId,
-          error: `ROUTING_ASSIGNMENT_NOT_FOUND: HandoffTransfer binding mismatch for authorization "${auth.id}".`,
+          assignmentId: auth.assignment_id,
+          errorCode: 'STATUS_CONFLICT' as any,
+          error: `PREPARATION_FAILED: HandoffTransfer "${valRes.transfer!.id}" status is "${valRes.transfer!.status}", expected "AUTHORIZED".`,
         };
       }
-      assignment = this.repo.getAgentAssignment(auth.assignment_id);
+      assignment = valRes.assignment!;
     } else {
       // Legacy non-handoff execution path
       const selectedAssignmentId = routingPayload.selectedAssignmentId as string;
