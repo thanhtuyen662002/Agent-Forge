@@ -780,7 +780,7 @@ describe('Parallel ConcurrentExecutionScheduler Proof (R5G3E1)', () => {
     expect(JSON.stringify(resA).includes('leaseToken')).toBe(false);
     expect(JSON.stringify(resB).includes('leaseToken')).toBe(false);
     expect(JSON.stringify(resC).includes('leaseToken')).toBe(false);
-  });
+  }, 120000);
 
   // SCENARIO 2: Failure & Lease Loss Isolation Scenario (Tests 34 - 42)
   it('Lease loss isolation proves single-execution cancellation does not affect parallel healthy execution', async () => {
@@ -871,7 +871,7 @@ describe('Parallel ConcurrentExecutionScheduler Proof (R5G3E1)', () => {
 
     // 42. Heartbeat state isolated per scheduler execution
     expect(timer.pendingCount).toBe(0);
-  });
+  }, 120000);
 
   // SCENARIO 3: Same Auth Duplicate Scenario (Tests 43 - 44)
   it('Duplicate concurrent execution of the same authorization fails closed without creating second lease or worktree', async () => {

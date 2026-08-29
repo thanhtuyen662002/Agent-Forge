@@ -71,4 +71,3 @@ export class CrashRecoveryService {
     return report;
   }
 }
-
