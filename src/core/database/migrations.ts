@@ -1188,6 +1188,68 @@ export const MIGRATIONS: Migration[] = [
       `);
     },
   },
+  {
+    version: 20,
+    name: '020_r5i_crash_recovery_and_execution_lifecycle_authority',
+    up: (db: Database.Database) => {
+      db.exec(`
+        -- 1. Extend execution_authorizations with lifecycle protocol & durable settlement fields
+        ALTER TABLE execution_authorizations
+        ADD COLUMN lifecycle_version INTEGER NULL;
+
+        ALTER TABLE execution_authorizations
+        ADD COLUMN adapter_error_json TEXT NULL;
+
+        ALTER TABLE execution_authorizations
+        ADD COLUMN terminated_at TEXT NULL;
+
+        ALTER TABLE execution_authorizations
+        ADD COLUMN settled_at TEXT NULL;
+
+        ALTER TABLE execution_authorizations
+        ADD COLUMN settlement_evidence_json TEXT NULL;
+
+        ALTER TABLE execution_authorizations
+        ADD COLUMN settlement_evidence_hash TEXT NULL;
+
+        CREATE INDEX IF NOT EXISTS idx_exec_auth_lifecycle
+        ON execution_authorizations(lifecycle_version);
+
+        -- 2. Durable per-authorization recovery state ledger
+        CREATE TABLE IF NOT EXISTS execution_recovery_states (
+          id TEXT PRIMARY KEY,
+          authorization_id TEXT NOT NULL UNIQUE REFERENCES execution_authorizations(id) ON DELETE CASCADE,
+          transfer_id TEXT NOT NULL REFERENCES handoff_transfers(id) ON DELETE RESTRICT,
+          execution_id TEXT NULL,
+          lifecycle_version INTEGER NULL,
+          recovery_classification TEXT NOT NULL,
+          disposition TEXT NOT NULL,
+          canonical_evidence_json TEXT NOT NULL,
+          evidence_hash TEXT NOT NULL,
+          recovery_version INTEGER NOT NULL DEFAULT 1,
+          mutated_terminal_state INTEGER NOT NULL DEFAULT 0,
+          mutated_resources INTEGER NOT NULL DEFAULT 0,
+          first_detected_at TEXT NOT NULL,
+          last_scanned_at TEXT NOT NULL,
+          resolved_at TEXT NULL,
+          created_at TEXT NOT NULL,
+          updated_at TEXT NOT NULL
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_exec_recovery_transfer
+        ON execution_recovery_states(transfer_id);
+
+        CREATE INDEX IF NOT EXISTS idx_exec_recovery_classification
+        ON execution_recovery_states(recovery_classification);
+
+        CREATE INDEX IF NOT EXISTS idx_exec_recovery_disposition
+        ON execution_recovery_states(disposition);
+
+        CREATE INDEX IF NOT EXISTS idx_exec_recovery_evidence_hash
+        ON execution_recovery_states(evidence_hash);
+      `);
+    },
+  },
 ];
 
 export class MigrationRunner {

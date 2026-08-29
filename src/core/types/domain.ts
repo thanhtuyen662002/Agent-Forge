@@ -497,14 +497,92 @@ export interface ExecutionAuthorization {
   dispatched_at: string | null;
   task_ownership_epoch?: number;
   assignment_id?: string | null;
+  lifecycle_version?: number | null;
   execution_id?: string | null;
   adapter_started_at?: string | null;
   adapter_finished_at?: string | null;
   adapter_outcome?: AdapterOutcome | null;
+  adapter_error_json?: string | null;
   cancellation_requested_at?: string | null;
   termination_confirmed_at?: string | null;
   termination_status?: ProviderTerminationStatus | null;
   termination_source?: string | null;
+  terminated_at?: string | null;
+  settled_at?: string | null;
+  settlement_evidence_json?: string | null;
+  settlement_evidence_hash?: string | null;
+}
+
+export type ExecutionRecoveryClassification =
+  | 'PRE_ADAPTER_NOT_STARTED'
+  | 'ADAPTER_IN_FLIGHT_UNRESOLVED'
+  | 'ADAPTER_TERMINATED_AFTER_TIMEOUT'
+  | 'ADAPTER_FINISHED_RESULT_MISSING'
+  | 'RESULT_PERSISTED_STATE_INCOMPLETE'
+  | 'ALREADY_RECONCILED'
+  | 'LEGACY_UNCLASSIFIABLE'
+  | 'AUTHORITY_CONFLICT';
+
+export type ExecutionRecoveryDisposition =
+  | 'TERMINALIZED_SAFE_EXPIRED'
+  | 'UNRESOLVED_FENCED'
+  | 'TERMINALIZED_CONFIRMED_TIMEOUT'
+  | 'TERMINALIZED_CONFIRMED_CANCELLED'
+  | 'RESULT_MISSING_FENCED'
+  | 'TERMINAL_STATE_RECONCILED'
+  | 'NO_OP_ALREADY_RECONCILED'
+  | 'LEGACY_UNRESOLVED_FENCED'
+  | 'REJECTED_INTEGRITY_CONFLICT';
+
+export interface ExecutionRecoveryState {
+  id: string;
+  authorization_id: string;
+  transfer_id: string;
+  execution_id: string | null;
+  lifecycle_version: number | null;
+  recovery_classification: ExecutionRecoveryClassification;
+  disposition: ExecutionRecoveryDisposition;
+  canonical_evidence_json: string;
+  evidence_hash: string;
+  recovery_version: number;
+  mutated_terminal_state: boolean;
+  mutated_resources: boolean;
+  first_detected_at: string;
+  last_scanned_at: string;
+  resolved_at: string | null;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface ExecutionRecoveryScanItemResult {
+  authorizationId: string;
+  transferId: string;
+  executionId: string | null;
+  lifecycleVersion: number | null;
+  classification: ExecutionRecoveryClassification;
+  disposition: ExecutionRecoveryDisposition;
+  mutatedTerminalState: boolean;
+  mutatedResources: boolean;
+  evidenceHash: string;
+  error?: string;
+}
+
+export interface ExecutionRecoveryScanReport {
+  scannedCount: number;
+  reconciledCount: number;
+  unresolvedCount: number;
+  rejectedCount: number;
+  noOpCount: number;
+  preAdapterNotStartedCount: number;
+  adapterInFlightUnresolvedCount: number;
+  adapterTerminatedTimeoutCount: number;
+  adapterFinishedResultMissingCount: number;
+  resultPersistedStateIncompleteCount: number;
+  alreadyReconciledCount: number;
+  legacyUnclassifiableCount: number;
+  authorityConflictCount: number;
+  items: ExecutionRecoveryScanItemResult[];
+  scannedAt: string;
 }
 
 export type UpdateState =

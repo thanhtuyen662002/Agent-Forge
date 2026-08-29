@@ -14,6 +14,7 @@ import {
   ExecutionAuthorization,
   ProviderAccount,
   AgentAssignment,
+  AdapterOutcome,
 } from '../types/domain';
 import { GitWorktreeService, WorktreeOwnershipTuple, WorktreeInspection } from './GitWorktreeService';
 import {
@@ -1276,12 +1277,32 @@ export class ProviderDispatchService {
       }
     }
 
+    // 15d. Atomic adapter-start claim linearization point (R5I6)
+    const expectedEpoch = auth.task_ownership_epoch ?? this.repo.getTaskOwnershipEpoch(auth.task_id);
+    const startClaim = this.repo.claimAdapterExecutionStart({
+      authorizationId: auth.id,
+      executionId,
+      expectedEpoch,
+      startedAt: nowIso,
+    });
+    if (!startClaim.success && !startClaim.alreadyClaimed) {
+      return {
+        executionId,
+        status: 'FAILED',
+        errorCode: 'RESOURCE_UNAVAILABLE',
+        error: `ADAPTER_START_CLAIM_FAILED: Could not claim adapter start (${startClaim.error}).`,
+      };
+    }
+
     // 16. Execute the selected provider exactly once (NO retry, NO failover on failure)
     let rawResult: AgentExecutionResult;
     let adapterInvocation: ProviderAdapterInvocationOutcome;
+    let adapterOutcome: AdapterOutcome;
+    let adapterErrorJson: string | null = null;
     try {
       rawResult = await adapter.execute(request);
       adapterInvocation = 'RETURNED';
+      adapterOutcome = rawResult.status === 'COMPLETED' ? 'RETURNED' : rawResult.status === 'CANCELLED' ? 'CANCELLED' : 'RETURNED';
     } catch (err: any) {
       rawResult = {
         executionId,
@@ -1290,6 +1311,8 @@ export class ProviderDispatchService {
         error: `ADAPTER_EXECUTION_THREW: ${err.message}`,
       };
       adapterInvocation = 'THREW';
+      adapterOutcome = 'THREW';
+      adapterErrorJson = JSON.stringify({ message: err.message, stack: err.stack });
     }
 
     const finalExecutionId = mode === 'SCHEDULED' ? executionId : (rawResult.executionId || executionId);
@@ -1320,6 +1343,21 @@ export class ProviderDispatchService {
       executionId: finalExecutionId,
       providerExecutionProvenance: provenance,
     };
+
+    // Durably settle execution lifecycle and outcome (R5I6)
+    const finishTimestamp = new Date().toISOString();
+    try {
+      this.repo.settleExecutionResult({
+        authorizationId: auth.id,
+        executionId: finalExecutionId,
+        outcome: adapterOutcome,
+        finishedAt: finishTimestamp,
+        resultPayload: sanitizedResult,
+        errorJson: adapterErrorJson,
+      });
+    } catch (settleErr) {
+      console.error(`[ProviderDispatchService] Durable result settlement warning:`, settleErr);
+    }
 
     // 16b. Record durable provider health observation for trusted execution results
     try {

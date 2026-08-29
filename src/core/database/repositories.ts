@@ -68,6 +68,9 @@ import {
   HandoffTransferStatus,
   AdapterOutcome,
   ProviderTerminationStatus,
+  ExecutionRecoveryClassification,
+  ExecutionRecoveryDisposition,
+  ExecutionRecoveryState,
 } from '../types/domain';
 import type { ProviderDispatchExecutionResult } from '../services/ProviderDispatchService';
 import { ExecutionFailureClassifier } from '../services/ExecutionFailureClassifier';
@@ -1351,7 +1354,61 @@ export class Repository {
     const tableInfo = this.db.pragma('table_info(execution_authorizations)') as { name: string }[];
     const columnNames = new Set(tableInfo.map((c) => c.name));
 
-    if (columnNames.has('assignment_id')) {
+    if (columnNames.has('lifecycle_version')) {
+      this.db
+        .prepare(`
+          INSERT INTO execution_authorizations (
+            id, project_id, task_id, attempt_id, task_revision, base_sha,
+            repository_head_sha, manager_message_id, manager_payload_hash,
+            routing_decision_id, selected_resource_id, selected_provider_id,
+            instruction_payload_hash, context_manifest_hash,
+            canonical_instructions_json, context_files_json, canonical_payload_json, status,
+            created_at, dispatched_at, task_ownership_epoch, assignment_id, lifecycle_version, execution_id,
+            adapter_started_at, adapter_finished_at, adapter_outcome, adapter_error_json,
+            cancellation_requested_at, termination_confirmed_at,
+            termination_status, termination_source, terminated_at, settled_at,
+            settlement_evidence_json, settlement_evidence_hash
+          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        `)
+        .run(
+          auth.id,
+          auth.project_id,
+          auth.task_id,
+          auth.attempt_id,
+          auth.task_revision,
+          auth.base_sha,
+          auth.repository_head_sha,
+          auth.manager_message_id,
+          auth.manager_payload_hash,
+          auth.routing_decision_id,
+          auth.selected_resource_id,
+          auth.selected_provider_id,
+          auth.instruction_payload_hash,
+          auth.context_manifest_hash,
+          auth.canonical_instructions_json,
+          auth.context_files_json,
+          auth.canonical_payload_json ?? null,
+          auth.status,
+          auth.created_at,
+          auth.dispatched_at,
+          auth.task_ownership_epoch ?? 1,
+          auth.assignment_id ?? null,
+          auth.lifecycle_version ?? null,
+          auth.execution_id ?? null,
+          auth.adapter_started_at ?? null,
+          auth.adapter_finished_at ?? null,
+          auth.adapter_outcome ?? null,
+          auth.adapter_error_json ?? null,
+          auth.cancellation_requested_at ?? null,
+          auth.termination_confirmed_at ?? null,
+          auth.termination_status ?? null,
+          auth.termination_source ?? null,
+          auth.terminated_at ?? null,
+          auth.settled_at ?? null,
+          auth.settlement_evidence_json ?? null,
+          auth.settlement_evidence_hash ?? null
+        );
+    } else if (columnNames.has('assignment_id')) {
       this.db
         .prepare(`
           INSERT INTO execution_authorizations (
@@ -1521,7 +1578,14 @@ export class Repository {
 
       // Check current task ownership epoch
       const currentTaskEpoch = this.getTaskOwnershipEpoch(auth.task_id);
-      if (currentTaskEpoch !== params.expectedEpoch || auth.task_ownership_epoch !== params.expectedEpoch) {
+      if (currentTaskEpoch !== params.expectedEpoch) {
+        return {
+          success: false,
+          alreadyClaimed: false,
+          error: `OWNERSHIP_EPOCH_MISMATCH: expected ${params.expectedEpoch}, current task epoch is ${currentTaskEpoch}`,
+        };
+      }
+      if (auth.task_ownership_epoch !== null && auth.task_ownership_epoch !== undefined && auth.task_ownership_epoch !== params.expectedEpoch) {
         return {
           success: false,
           alreadyClaimed: false,
@@ -1546,7 +1610,9 @@ export class Repository {
         .prepare(`
           UPDATE execution_authorizations
           SET execution_id = ?, adapter_started_at = ?
-          WHERE id = ? AND adapter_started_at IS NULL AND task_ownership_epoch = ? AND status = 'DISPATCHED'
+          WHERE id = ? AND adapter_started_at IS NULL
+            AND (task_ownership_epoch = ? OR task_ownership_epoch IS NULL)
+            AND status = 'DISPATCHED'
         `)
         .run(params.executionId, startedAt, params.authorizationId, params.expectedEpoch);
 
@@ -1607,6 +1673,136 @@ export class Repository {
       }
 
       return { success: true, alreadyCompleted: false };
+    });
+  }
+
+  public settleExecutionResult(params: {
+    authorizationId: string;
+    executionId: string;
+    outcome: AdapterOutcome | string;
+    finishedAt?: string;
+    resultPayload: Record<string, unknown>;
+    errorJson?: string | null;
+  }): {
+    success: boolean;
+    alreadySettled: boolean;
+    settledAt: string;
+    evidenceHash: string;
+    error?: string;
+  } {
+    return this.runInImmediateTransaction(() => {
+      const auth = this.getExecutionAuthorization(params.authorizationId);
+      if (!auth) {
+        return { success: false, alreadySettled: false, settledAt: '', evidenceHash: '', error: 'AUTHORIZATION_NOT_FOUND' };
+      }
+
+      const finishedAt = params.finishedAt ?? new Date().toISOString();
+      const canonicalEvidence = {
+        authorization_id: auth.id,
+        execution_id: params.executionId,
+        outcome: params.outcome,
+        finished_at: finishedAt,
+        result_payload: params.resultPayload,
+        error_json: params.errorJson ?? null,
+      };
+      const canonicalEvidenceJson = canonicalJsonStringify(canonicalEvidence);
+      const evidenceHash = computeSha256(canonicalEvidenceJson);
+
+      if (auth.settled_at) {
+        if (auth.settlement_evidence_hash === evidenceHash && auth.adapter_outcome === params.outcome) {
+          return {
+            success: true,
+            alreadySettled: true,
+            settledAt: auth.settled_at,
+            evidenceHash: auth.settlement_evidence_hash,
+          };
+        }
+        return {
+          success: false,
+          alreadySettled: false,
+          settledAt: auth.settled_at,
+          evidenceHash: auth.settlement_evidence_hash || '',
+          error: `SETTLEMENT_CONFLICT: Authorization "${auth.id}" is already settled with different outcome/evidence.`,
+        };
+      }
+
+      // Update execution_authorizations
+      const authRes = this.db
+        .prepare(`
+          UPDATE execution_authorizations
+          SET adapter_finished_at = ?,
+              adapter_outcome = ?,
+              adapter_error_json = ?,
+              settled_at = ?,
+              settlement_evidence_json = ?,
+              settlement_evidence_hash = ?,
+              execution_id = COALESCE(execution_id, ?)
+          WHERE id = ? AND settled_at IS NULL
+        `)
+        .run(
+          finishedAt,
+          params.outcome,
+          params.errorJson ?? null,
+          finishedAt,
+          canonicalEvidenceJson,
+          evidenceHash,
+          params.executionId,
+          auth.id
+        );
+
+      if (authRes.changes === 0) {
+        return { success: false, alreadySettled: false, settledAt: '', evidenceHash: '', error: 'SETTLEMENT_CAS_FAILED' };
+      }
+
+      // If bound to handoff transfer, terminalize transfer, attempt, and assignment
+      const transfer = this.getHandoffTransferBySuccessorAuthId(auth.id);
+      if (transfer) {
+        const terminalStatus: HandoffTransferStatus =
+          params.outcome === 'RETURNED' || params.outcome === 'COMPLETED'
+            ? 'COMPLETED'
+            : params.outcome === 'CANCELLED'
+            ? 'CANCELLED'
+            : 'FAILED';
+
+        // 1. TaskAttempt -> terminalStatus
+        if (transfer.successor_attempt_id) {
+          this.db
+            .prepare(`
+              UPDATE task_attempts
+              SET status = ?, ended_at = ?
+              WHERE id = ? AND status = 'RUNNING'
+            `)
+            .run(terminalStatus, finishedAt, transfer.successor_attempt_id);
+        }
+
+        // 2. AgentAssignment -> terminalStatus
+        if (transfer.successor_assignment_id) {
+          this.db
+            .prepare(`
+              UPDATE agent_assignments
+              SET status = ?, ended_at = ?
+              WHERE id = ? AND status = 'RUNNING'
+            `)
+            .run(terminalStatus, finishedAt, transfer.successor_assignment_id);
+        }
+
+        // 3. HandoffTransfer -> terminalStatus
+        const newVersion = transfer.version + 1;
+        this.db
+          .prepare(`
+            UPDATE handoff_transfers
+            SET status = ?, completed_at = ?, version = ?, updated_at = ?
+            WHERE id = ? AND status IN ('ACCEPTED', 'AUTHORIZED', 'ROUTED')
+          `)
+          .run(terminalStatus, finishedAt, newVersion, finishedAt, transfer.id);
+      }
+
+      return {
+        success: true,
+        alreadySettled: false,
+        settledAt: finishedAt,
+        evidenceHash,
+      };
     });
   }
 
@@ -1735,10 +1931,11 @@ export class Repository {
             UPDATE execution_authorizations
             SET termination_status = 'CONFIRMED_TERMINATED',
                 termination_source = ?,
-                termination_confirmed_at = ?
+                termination_confirmed_at = ?,
+                terminated_at = ?
             WHERE id = ? AND execution_id = ?
           `)
-          .run(params.terminationSource, confirmedAt, params.authorizationId, params.executionId);
+          .run(params.terminationSource, confirmedAt, confirmedAt, params.authorizationId, params.executionId);
 
         return { success: res.changes === 1, alreadyConfirmed: false };
       }
@@ -1817,15 +2014,183 @@ export class Repository {
       dispatched_at: row.dispatched_at ? String(row.dispatched_at) : null,
       task_ownership_epoch: row.task_ownership_epoch !== undefined && row.task_ownership_epoch !== null ? Number(row.task_ownership_epoch) : 1,
       assignment_id: row.assignment_id ? String(row.assignment_id) : null,
+      lifecycle_version: row.lifecycle_version !== undefined && row.lifecycle_version !== null ? Number(row.lifecycle_version) : null,
       execution_id: row.execution_id ? String(row.execution_id) : null,
       adapter_started_at: row.adapter_started_at ? String(row.adapter_started_at) : null,
       adapter_finished_at: row.adapter_finished_at ? String(row.adapter_finished_at) : null,
       adapter_outcome: row.adapter_outcome ? (row.adapter_outcome as AdapterOutcome) : null,
+      adapter_error_json: row.adapter_error_json ? String(row.adapter_error_json) : null,
       cancellation_requested_at: row.cancellation_requested_at ? String(row.cancellation_requested_at) : null,
       termination_confirmed_at: row.termination_confirmed_at ? String(row.termination_confirmed_at) : null,
       termination_status: row.termination_status ? (row.termination_status as ProviderTerminationStatus) : null,
       termination_source: row.termination_source ? String(row.termination_source) : null,
+      terminated_at: row.terminated_at ? String(row.terminated_at) : null,
+      settled_at: row.settled_at ? String(row.settled_at) : null,
+      settlement_evidence_json: row.settlement_evidence_json ? String(row.settlement_evidence_json) : null,
+      settlement_evidence_hash: row.settlement_evidence_hash ? String(row.settlement_evidence_hash) : null,
     };
+  }
+
+  // ==========================================
+  // Durable Execution Recovery States (R5I6)
+  // ==========================================
+  public getExecutionRecoveryState(authorizationId: string): ExecutionRecoveryState | null {
+    const row = this.db
+      .prepare('SELECT * FROM execution_recovery_states WHERE authorization_id = ?')
+      .get(authorizationId) as Record<string, unknown> | undefined;
+    if (!row) return null;
+    return this.mapExecutionRecoveryState(row);
+  }
+
+  public getAllExecutionRecoveryStates(): ExecutionRecoveryState[] {
+    const rows = this.db
+      .prepare('SELECT * FROM execution_recovery_states ORDER BY created_at ASC, id ASC')
+      .all() as Record<string, unknown>[];
+    return rows.map((r) => this.mapExecutionRecoveryState(r));
+  }
+
+  private mapExecutionRecoveryState(row: Record<string, unknown>): ExecutionRecoveryState {
+    return {
+      id: String(row.id),
+      authorization_id: String(row.authorization_id),
+      transfer_id: String(row.transfer_id),
+      execution_id: row.execution_id ? String(row.execution_id) : null,
+      lifecycle_version: row.lifecycle_version !== undefined && row.lifecycle_version !== null ? Number(row.lifecycle_version) : null,
+      recovery_classification: row.recovery_classification as ExecutionRecoveryClassification,
+      disposition: row.disposition as ExecutionRecoveryDisposition,
+      canonical_evidence_json: String(row.canonical_evidence_json),
+      evidence_hash: String(row.evidence_hash),
+      recovery_version: Number(row.recovery_version || 1),
+      mutated_terminal_state: Boolean(row.mutated_terminal_state),
+      mutated_resources: Boolean(row.mutated_resources),
+      first_detected_at: String(row.first_detected_at),
+      last_scanned_at: String(row.last_scanned_at),
+      resolved_at: row.resolved_at ? String(row.resolved_at) : null,
+      created_at: String(row.created_at),
+      updated_at: String(row.updated_at),
+    };
+  }
+
+  public upsertExecutionRecoveryState(state: {
+    id?: string;
+    authorization_id: string;
+    transfer_id: string;
+    execution_id?: string | null;
+    lifecycle_version?: number | null;
+    recovery_classification: ExecutionRecoveryClassification;
+    disposition: ExecutionRecoveryDisposition;
+    canonical_evidence_json: string;
+    evidence_hash: string;
+    recovery_version?: number;
+    mutated_terminal_state?: boolean;
+    mutated_resources?: boolean;
+    first_detected_at?: string;
+    last_scanned_at?: string;
+    resolved_at?: string | null;
+  }): ExecutionRecoveryState {
+    return this.runInImmediateTransaction(() => {
+      const nowIso = new Date().toISOString();
+      const existing = this.getExecutionRecoveryState(state.authorization_id);
+      if (existing) {
+        const nextVersion = (existing.recovery_version || 1) + 1;
+        const mutatedTerminal = state.mutated_terminal_state !== undefined ? (state.mutated_terminal_state ? 1 : 0) : (existing.mutated_terminal_state ? 1 : 0);
+        const mutatedRes = state.mutated_resources !== undefined ? (state.mutated_resources ? 1 : 0) : (existing.mutated_resources ? 1 : 0);
+        const resolvedAt = state.resolved_at !== undefined ? state.resolved_at : existing.resolved_at;
+
+        this.db
+          .prepare(`
+            UPDATE execution_recovery_states
+            SET execution_id = ?,
+                lifecycle_version = ?,
+                recovery_classification = ?,
+                disposition = ?,
+                canonical_evidence_json = ?,
+                evidence_hash = ?,
+                recovery_version = ?,
+                mutated_terminal_state = ?,
+                mutated_resources = ?,
+                last_scanned_at = ?,
+                resolved_at = ?,
+                updated_at = ?
+            WHERE id = ?
+          `)
+          .run(
+            state.execution_id ?? existing.execution_id,
+            state.lifecycle_version !== undefined ? state.lifecycle_version : existing.lifecycle_version,
+            state.recovery_classification,
+            state.disposition,
+            state.canonical_evidence_json,
+            state.evidence_hash,
+            nextVersion,
+            mutatedTerminal,
+            mutatedRes,
+            state.last_scanned_at || nowIso,
+            resolvedAt,
+            nowIso,
+            existing.id
+          );
+        return this.getExecutionRecoveryState(state.authorization_id)!;
+      }
+
+      const id = state.id || crypto.randomUUID();
+      const firstDetected = state.first_detected_at || nowIso;
+      const lastScanned = state.last_scanned_at || nowIso;
+      const recVersion = state.recovery_version || 1;
+
+      this.db
+        .prepare(`
+          INSERT INTO execution_recovery_states (
+            id, authorization_id, transfer_id, execution_id, lifecycle_version,
+            recovery_classification, disposition, canonical_evidence_json, evidence_hash,
+            recovery_version, mutated_terminal_state, mutated_resources,
+            first_detected_at, last_scanned_at, resolved_at, created_at, updated_at
+          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        `)
+        .run(
+          id,
+          state.authorization_id,
+          state.transfer_id,
+          state.execution_id ?? null,
+          state.lifecycle_version ?? null,
+          state.recovery_classification,
+          state.disposition,
+          state.canonical_evidence_json,
+          state.evidence_hash,
+          recVersion,
+          state.mutated_terminal_state ? 1 : 0,
+          state.mutated_resources ? 1 : 0,
+          firstDetected,
+          lastScanned,
+          state.resolved_at ?? null,
+          nowIso,
+          nowIso
+        );
+
+      return this.getExecutionRecoveryState(state.authorization_id)!;
+    });
+  }
+
+  public releaseAccountLeaseAndIdleSlot(leaseId: string, slotId?: string | null, releasedAt?: string): void {
+    this.runInImmediateTransaction(() => {
+      const nowIso = releasedAt ?? new Date().toISOString();
+      this.db
+        .prepare(`
+          UPDATE account_leases
+          SET released_at = ?
+          WHERE id = ? AND released_at IS NULL
+        `)
+        .run(nowIso, leaseId);
+
+      if (slotId) {
+        this.db
+          .prepare(`
+            UPDATE worker_slots
+            SET status = 'IDLE', current_assignment_id = NULL, current_execution_id = NULL, updated_at = ?
+            WHERE id = ?
+          `)
+          .run(nowIso, slotId);
+      }
+    });
   }
 
   // ==========================================
@@ -5146,6 +5511,20 @@ export class Repository {
 
       if (transferRes.changes !== 1) {
         throw new Error(`[HandoffAccept] Failed to update HandoffTransfer "${transfer.id}" to ACCEPTED.`);
+      }
+
+      // 4. Atomically arm lifecycle_version = 1 on successor authorization
+      if (transfer.successor_authorization_id) {
+        const tableInfo = this.db.pragma('table_info(execution_authorizations)') as { name: string }[];
+        if (tableInfo.some((c) => c.name === 'lifecycle_version')) {
+          this.db
+            .prepare(`
+              UPDATE execution_authorizations
+              SET lifecycle_version = 1
+              WHERE id = ? AND (lifecycle_version IS NULL OR lifecycle_version = 1)
+            `)
+            .run(transfer.successor_authorization_id);
+        }
       }
 
       return {
