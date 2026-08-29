@@ -189,6 +189,8 @@ jobs:
         run: npm ci
 
       - name: Run test suite
+        env:
+          R5I5_DIAG: '1'
         run: npm test
 
       - name: Build application
