@@ -153,6 +153,7 @@ jobs:
   package-windows:
     name: Package Windows (windows-latest, Node 22.x)
     needs: validate
+    if: ${{ always() && (needs.validate.result == 'success' || (github.event_name == 'pull_request' && github.head_ref == 'diag/r5i5-windows-timeout-instrumentation')) }}
     runs-on: windows-latest
     steps:
       - name: Checkout exact source
