@@ -80,6 +80,8 @@ class MockAutomatedAdapter implements ProviderAdapter {
 
 describe('Owner Routing & Manual Bridge Handoff Loop (PR #8)', () => {
   const isR5i5DiagEnabled = (): boolean => process.platform === 'win32' && process.env.R5I5_DIAG === '1';
+  const getR5i5DiagRunContext = (): 'github_actions' | 'local' =>
+    process.env.GITHUB_ACTIONS === 'true' ? 'github_actions' : 'local';
   let suiteHookCount = 0;
   let suiteHookTotalMs = 0;
   let suiteHookMinMs = Infinity;
@@ -167,35 +169,6 @@ describe('Owner Routing & Manual Bridge Handoff Loop (PR #8)', () => {
       created_at: new Date().toISOString(),
     });
 
-    if (diagEnabled) {
-      const hookElapsed = performance.now() - hookStart;
-      suiteHookCount++;
-      suiteHookTotalMs += hookElapsed;
-      suiteHookMinMs = Math.min(suiteHookMinMs, hookElapsed);
-      suiteHookMaxMs = Math.max(suiteHookMaxMs, hookElapsed);
-      suiteMigrationTotalMs += migMs;
-      suiteGitTotalMs += gitMs;
-
-      if (suiteHookCount <= 2 || hookElapsed >= 5000) {
-        const record = {
-          marker: 'R5I5_DIAG',
-          schema_version: '1.0',
-          run_context: 'github_actions',
-          scope: 'ownerRoutingManualBridge',
-          phase: 'beforeEach',
-          event: 'HOOK_SUMMARY',
-          wall_clock_utc: new Date().toISOString(),
-          hook_index: suiteHookCount,
-          elapsed_ms: hookElapsed,
-          git_setup_ms: gitMs,
-          migration_ms: migMs,
-          system_free_memory_bytes: os.freemem(),
-          rss_bytes: process.memoryUsage().rss,
-        };
-        console.log('R5I5_DIAG ' + JSON.stringify(record));
-      }
-    }
-
     repo.createProviderResource({
       id: 'res-gemini-coder',
       provider_id: 'prov-manual-bridge',
@@ -239,6 +212,35 @@ describe('Owner Routing & Manual Bridge Handoff Loop (PR #8)', () => {
       constraints: ['No browser automation'],
     });
     testTaskId = t.id;
+
+    if (diagEnabled) {
+      const hookElapsed = performance.now() - hookStart;
+      suiteHookCount++;
+      suiteHookTotalMs += hookElapsed;
+      suiteHookMinMs = Math.min(suiteHookMinMs, hookElapsed);
+      suiteHookMaxMs = Math.max(suiteHookMaxMs, hookElapsed);
+      suiteMigrationTotalMs += migMs;
+      suiteGitTotalMs += gitMs;
+
+      if (suiteHookCount <= 2 || hookElapsed >= 5000) {
+        const record = {
+          marker: 'R5I5_DIAG',
+          schema_version: '1.0',
+          run_context: getR5i5DiagRunContext(),
+          scope: 'ownerRoutingManualBridge',
+          phase: 'beforeEach',
+          event: 'HOOK_SUMMARY',
+          wall_clock_utc: new Date().toISOString(),
+          hook_index: suiteHookCount,
+          elapsed_ms: hookElapsed,
+          git_setup_ms: gitMs,
+          migration_ms: migMs,
+          system_free_memory_bytes: os.freemem(),
+          rss_bytes: process.memoryUsage().rss,
+        };
+        console.log('R5I5_DIAG ' + JSON.stringify(record));
+      }
+    }
   }, 30000);
 
   afterEach(() => {
@@ -255,7 +257,7 @@ describe('Owner Routing & Manual Bridge Handoff Loop (PR #8)', () => {
       const record = {
         marker: 'R5I5_DIAG',
         schema_version: '1.0',
-        run_context: 'github_actions',
+        run_context: getR5i5DiagRunContext(),
         scope: 'ownerRoutingManualBridge',
         phase: 'suite_summary',
         event: 'SUITE_HOOK_AGGREGATE',

@@ -511,6 +511,8 @@ describe('R5H4 Provider Health Observation Ordering Authority Contract Tests', (
 
   it('5. Legacy v11 observations remain account_order = NULL after migration 12 upgrade without backfill', () => {
     const isR5i5DiagEnabled = (): boolean => process.platform === 'win32' && process.env.R5I5_DIAG === '1';
+    const getR5i5DiagRunContext = (): 'github_actions' | 'local' =>
+      process.env.GITHUB_ACTIONS === 'true' ? 'github_actions' : 'local';
     const diagEnabled = isR5i5DiagEnabled();
     const test5Start = diagEnabled ? performance.now() : 0;
     let mig11Ms = 0;
@@ -587,7 +589,7 @@ describe('R5H4 Provider Health Observation Ordering Authority Contract Tests', (
       const record = {
         marker: 'R5I5_DIAG',
         schema_version: '1.0',
-        run_context: 'github_actions',
+        run_context: getR5i5DiagRunContext(),
         scope: 'providerHealthOrderingAuthority',
         phase: 'test5',
         event: 'TEST_SUMMARY',

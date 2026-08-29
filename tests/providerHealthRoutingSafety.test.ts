@@ -80,6 +80,8 @@ class MockTestAdapter implements ProviderAdapter {
 
 describe('R5H4 Provider Health Routing Safety & Liveness Guard Contract Tests', () => {
   const isR5i5DiagEnabled = (): boolean => process.platform === 'win32' && process.env.R5I5_DIAG === '1';
+  const getR5i5DiagRunContext = (): 'github_actions' | 'local' =>
+    process.env.GITHUB_ACTIONS === 'true' ? 'github_actions' : 'local';
   let safetySuiteHookCount = 0;
   let safetySuiteHookTotalMs = 0;
   let safetySuiteHookMinMs = Infinity;
@@ -155,7 +157,7 @@ describe('R5H4 Provider Health Routing Safety & Liveness Guard Contract Tests', 
         const record = {
           marker: 'R5I5_DIAG',
           schema_version: '1.0',
-          run_context: 'github_actions',
+          run_context: getR5i5DiagRunContext(),
           scope: 'providerHealthRoutingSafety',
           phase: 'beforeEach',
           event: 'HOOK_SUMMARY',
@@ -182,7 +184,7 @@ describe('R5H4 Provider Health Routing Safety & Liveness Guard Contract Tests', 
       const record = {
         marker: 'R5I5_DIAG',
         schema_version: '1.0',
-        run_context: 'github_actions',
+        run_context: getR5i5DiagRunContext(),
         scope: 'providerHealthRoutingSafety',
         phase: 'suite_summary',
         event: 'SUITE_HOOK_AGGREGATE',
@@ -972,7 +974,7 @@ describe('R5H4 Provider Health Routing Safety & Liveness Guard Contract Tests', 
         const record = {
           marker: 'R5I5_DIAG',
           schema_version: '1.0',
-          run_context: 'github_actions',
+          run_context: getR5i5DiagRunContext(),
           scope: 'providerHealthRoutingSafety',
           phase: 'test24',
           event: 'TEST24_SUMMARY',

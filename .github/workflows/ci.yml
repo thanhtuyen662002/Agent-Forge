@@ -69,6 +69,8 @@ jobs:
         run: |
           node -e "
             const os = require('os');
+            const { execFileSync } = require('child_process');
+            const testedSha = execFileSync('git', ['rev-parse', 'HEAD'], { encoding: 'utf8' }).trim();
             const record = {
               marker: 'R5I5_DIAG',
               schema_version: '1.0',
@@ -80,7 +82,8 @@ jobs:
               github_job: '${{ github.job }}',
               github_run_id: '${{ github.run_id }}',
               github_run_attempt: '${{ github.run_attempt }}',
-              github_sha: '${{ github.sha }}',
+              tested_sha: testedSha,
+              event_sha: '${{ github.sha }}',
               github_event_name: '${{ github.event_name }}',
               platform: process.platform,
               arch: process.arch,
@@ -101,6 +104,8 @@ jobs:
         run: |
           node -e "
             const os = require('os');
+            const { execFileSync } = require('child_process');
+            const testedSha = execFileSync('git', ['rev-parse', 'HEAD'], { encoding: 'utf8' }).trim();
             const record = {
               marker: 'R5I5_DIAG',
               schema_version: '1.0',
@@ -112,7 +117,8 @@ jobs:
               github_job: '${{ github.job }}',
               github_run_id: '${{ github.run_id }}',
               github_run_attempt: '${{ github.run_attempt }}',
-              github_sha: '${{ github.sha }}',
+              tested_sha: testedSha,
+              event_sha: '${{ github.sha }}',
               github_event_name: '${{ github.event_name }}',
               platform: process.platform,
               node_version: process.version,

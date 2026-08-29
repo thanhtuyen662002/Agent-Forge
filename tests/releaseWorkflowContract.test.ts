@@ -220,6 +220,8 @@ describe('PR #19 — Production Release Pipeline Hardening Contract Tests', () =
       const fixtureTimeoutMs = process.platform === 'win32' ? 60000 : 20000;
 
       const diagEnabled = process.platform === 'win32' && process.env.R5I5_DIAG === '1';
+      const getR5i5DiagRunContext = (): 'github_actions' | 'local' =>
+        process.env.GITHUB_ACTIONS === 'true' ? 'github_actions' : 'local';
       let spawnStart = 0;
       let cpuBefore: NodeJS.CpuUsage | null = null;
       let rssBefore = 0;
@@ -236,7 +238,7 @@ describe('PR #19 — Production Release Pipeline Hardening Contract Tests', () =
         const record = {
           marker: 'R5I5_DIAG',
           schema_version: '1.0',
-          run_context: 'github_actions',
+          run_context: getR5i5DiagRunContext(),
           scope: 'releaseWorkflowContract',
           phase: 'spawnSync',
           event: 'SPAWN_BEGIN',
@@ -262,7 +264,7 @@ describe('PR #19 — Production Release Pipeline Hardening Contract Tests', () =
         const record = {
           marker: 'R5I5_DIAG',
           schema_version: '1.0',
-          run_context: 'github_actions',
+          run_context: getR5i5DiagRunContext(),
           scope: 'releaseWorkflowContract',
           phase: 'spawnSync',
           event: 'SPAWN_END',
