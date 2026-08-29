@@ -1456,7 +1456,7 @@ describe('R5I5 Successor Resume, Linearization, and Idempotency Authority', () =
     expect(schedRes.status).toBe('COMPLETED');
 
     const transfer = repo.getHandoffTransfer(defaultTransfer.id)!;
-    expect(['ACCEPTED', 'COMPLETED']).toContain(transfer.status);
+    expect(transfer.status).toBe('COMPLETED');
     expect(transfer.accepted_at).not.toBeNull();
   });
 

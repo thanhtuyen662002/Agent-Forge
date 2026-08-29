@@ -1278,20 +1278,37 @@ export class ProviderDispatchService {
     }
 
     // 15d. Atomic adapter-start claim linearization point (R5I6)
-    const expectedEpoch = auth.task_ownership_epoch ?? this.repo.getTaskOwnershipEpoch(auth.task_id);
-    const startClaim = this.repo.claimAdapterExecutionStart({
-      authorizationId: auth.id,
-      executionId,
-      expectedEpoch,
-      startedAt: nowIso,
-    });
-    if (!startClaim.success && !startClaim.alreadyClaimed) {
-      return {
+    const isR5ILifecycle = auth.lifecycle_version === 1;
+    if (isR5ILifecycle) {
+      const expectedEpoch = auth.task_ownership_epoch ?? this.repo.getTaskOwnershipEpoch(auth.task_id);
+      const startClaim = this.repo.claimAdapterExecutionStart({
+        authorizationId: auth.id,
         executionId,
-        status: 'FAILED',
-        errorCode: 'RESOURCE_UNAVAILABLE',
-        error: `ADAPTER_START_CLAIM_FAILED: Could not claim adapter start (${startClaim.error}).`,
-      };
+        expectedEpoch,
+        expectedLifecycleVersion: 1,
+        startedAt: nowIso,
+      });
+      // ONLY a newly successful claim (!alreadyClaimed && success) may proceed to adapter invocation
+      if (!startClaim.success || startClaim.alreadyClaimed) {
+        return {
+          executionId,
+          status: 'FAILED',
+          errorCode: 'RESOURCE_UNAVAILABLE',
+          error: `ADAPTER_START_CLAIM_FAILED: Could not claim adapter start (${startClaim.error || (startClaim.alreadyClaimed ? 'ALREADY_CLAIMED' : 'CLAIM_REJECTED')}).`,
+        };
+      }
+    } else {
+      // Legacy execution path (lifecycle_version IS NULL): retain epoch verification
+      const expectedEpoch = auth.task_ownership_epoch ?? this.repo.getTaskOwnershipEpoch(auth.task_id);
+      const currentTaskEpoch = this.repo.getTaskOwnershipEpoch(auth.task_id);
+      if (currentTaskEpoch !== expectedEpoch) {
+        return {
+          executionId,
+          status: 'FAILED',
+          errorCode: 'RESOURCE_UNAVAILABLE',
+          error: `OWNERSHIP_EPOCH_MISMATCH: expected ${expectedEpoch}, current ${currentTaskEpoch}`,
+        };
+      }
     }
 
     // 16. Execute the selected provider exactly once (NO retry, NO failover on failure)
@@ -1345,18 +1362,38 @@ export class ProviderDispatchService {
     };
 
     // Durably settle execution lifecycle and outcome (R5I6)
-    const finishTimestamp = new Date().toISOString();
-    try {
-      this.repo.settleExecutionResult({
-        authorizationId: auth.id,
-        executionId: finalExecutionId,
-        outcome: adapterOutcome,
-        finishedAt: finishTimestamp,
-        resultPayload: sanitizedResult,
-        errorJson: adapterErrorJson,
-      });
-    } catch (settleErr) {
-      console.error(`[ProviderDispatchService] Durable result settlement warning:`, settleErr);
+    if (isR5ILifecycle) {
+      const finishTimestamp = new Date().toISOString();
+      try {
+        const settleRes = this.repo.settleExecutionResult({
+          authorizationId: auth.id,
+          executionId: finalExecutionId,
+          outcome: adapterOutcome,
+          status: sanitizedResult.status,
+          finishedAt: finishTimestamp,
+          resultPayload: sanitizedResult,
+          errorJson: adapterErrorJson,
+        });
+
+        if (!settleRes.success) {
+          return {
+            executionId: finalExecutionId,
+            status: 'FAILED',
+            errorCode: 'SETTLEMENT_FAILED',
+            error: `SETTLEMENT_FAILED: ${settleRes.error}`,
+            providerExecutionProvenance: provenance,
+          };
+        }
+      } catch (settleErr: any) {
+        console.error(`[ProviderDispatchService] Durable result settlement failure:`, settleErr);
+        return {
+          executionId: finalExecutionId,
+          status: 'FAILED',
+          errorCode: 'SETTLEMENT_FAILED',
+          error: `SETTLEMENT_FAILED: ${settleErr.message}`,
+          providerExecutionProvenance: provenance,
+        };
+      }
     }
 
     // 16b. Record durable provider health observation for trusted execution results

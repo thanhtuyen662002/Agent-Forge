@@ -736,13 +736,20 @@ describe('R5I6 Crash Recovery, Execution Lifecycle Linearization, and Durable Au
     expect(res.providerExecutionProvenance?.authorizationId).toBe(auth.id);
   });
 
-  // 12. Identical settlement replay is idempotent
+  // 12. Settlement replay is idempotent
   it('12. should handle identical settlement replay idempotently', async () => {
     const { auth } = await seedStandardTopology();
+    repo.claimExecutionAuthorization(auth.id, new Date().toISOString());
+    repo.claimAdapterExecutionStart({
+      authorizationId: auth.id,
+      executionId: 'exec-1',
+      expectedEpoch: 2,
+    });
     const settle1 = repo.settleExecutionResult({
       authorizationId: auth.id,
       executionId: 'exec-1',
       outcome: 'RETURNED',
+      status: 'COMPLETED',
       resultPayload: { status: 'COMPLETED' },
     });
     expect(settle1.success).toBe(true);
@@ -752,6 +759,7 @@ describe('R5I6 Crash Recovery, Execution Lifecycle Linearization, and Durable Au
       authorizationId: auth.id,
       executionId: 'exec-1',
       outcome: 'RETURNED',
+      status: 'COMPLETED',
       finishedAt: settle1.settledAt,
       resultPayload: { status: 'COMPLETED' },
     });
@@ -762,10 +770,17 @@ describe('R5I6 Crash Recovery, Execution Lifecycle Linearization, and Durable Au
   // 13. Conflicting settlement is rejected
   it('13. should reject contradictory settlement attempt fail-closed', async () => {
     const { auth } = await seedStandardTopology();
+    repo.claimExecutionAuthorization(auth.id, new Date().toISOString());
+    repo.claimAdapterExecutionStart({
+      authorizationId: auth.id,
+      executionId: 'exec-1',
+      expectedEpoch: 2,
+    });
     const settle1 = repo.settleExecutionResult({
       authorizationId: auth.id,
       executionId: 'exec-1',
       outcome: 'RETURNED',
+      status: 'COMPLETED',
       resultPayload: { status: 'COMPLETED' },
     });
     expect(settle1.success).toBe(true);
@@ -774,6 +789,7 @@ describe('R5I6 Crash Recovery, Execution Lifecycle Linearization, and Durable Au
       authorizationId: auth.id,
       executionId: 'exec-1',
       outcome: 'THREW',
+      status: 'FAILED',
       resultPayload: { status: 'FAILED' },
     });
     expect(settle2.success).toBe(false);
@@ -1087,16 +1103,35 @@ describe('R5I6 Crash Recovery, Execution Lifecycle Linearization, and Durable Au
       expectedEpoch: 2,
     });
 
+    const nowIso = new Date().toISOString();
+    const evidencePayload = {
+      authorization_id: auth.id,
+      execution_id: 'exec-1',
+      lifecycle_version: 1,
+      task_id: auth.task_id,
+      project_id: auth.project_id,
+      attempt_id: auth.attempt_id,
+      assignment_id: auth.assignment_id,
+      status: 'COMPLETED',
+      outcome: 'RETURNED',
+      finished_at: nowIso,
+      result_payload: { status: 'COMPLETED' },
+      error_json: null,
+    };
+    const evidenceJson = canonicalJsonStringify(evidencePayload);
+    const evidenceHash = computeSha256(evidenceJson);
+
     // Durably settle authorization but simulate crash before transfer/attempt/assignment or lease cleanup
     db.prepare(`
       UPDATE execution_authorizations
-      SET adapter_finished_at = datetime('now'),
+      SET adapter_started_at = datetime('now'),
+          adapter_finished_at = datetime('now'),
           adapter_outcome = 'RETURNED',
           settled_at = datetime('now'),
-          settlement_evidence_json = '{"status":"COMPLETED"}',
-          settlement_evidence_hash = 'hash-complete'
+          settlement_evidence_json = ?,
+          settlement_evidence_hash = ?
       WHERE id = ?
-    `).run(auth.id);
+    `).run(evidenceJson, evidenceHash, auth.id);
 
     const report = scanner.scanAndReconcile();
     expect(report.resultPersistedStateIncompleteCount).toBe(1);
@@ -1119,6 +1154,25 @@ describe('R5I6 Crash Recovery, Execution Lifecycle Linearization, and Durable Au
       leaseToken: leaseRes.lease.lease_token,
       expectedSuccessorEpoch: 2,
     });
+
+    const nowIso = new Date().toISOString();
+    const evidencePayload = {
+      authorization_id: auth.id,
+      execution_id: 'exec-1',
+      lifecycle_version: 1,
+      task_id: auth.task_id,
+      project_id: auth.project_id,
+      attempt_id: auth.attempt_id,
+      assignment_id: auth.assignment_id,
+      status: 'COMPLETED',
+      outcome: 'RETURNED',
+      finished_at: nowIso,
+      result_payload: { status: 'COMPLETED' },
+      error_json: null,
+    };
+    const evidenceJson = canonicalJsonStringify(evidencePayload);
+    const evidenceHash = computeSha256(evidenceJson);
+
     // Settle authorization durably but simulate crash before release
     db.prepare(`
       UPDATE execution_authorizations
@@ -1126,10 +1180,10 @@ describe('R5I6 Crash Recovery, Execution Lifecycle Linearization, and Durable Au
           adapter_finished_at = datetime('now'),
           settled_at = datetime('now'),
           adapter_outcome = 'RETURNED',
-          settlement_evidence_json = '{"status":"COMPLETED"}',
-          settlement_evidence_hash = 'hash-complete'
+          settlement_evidence_json = ?,
+          settlement_evidence_hash = ?
       WHERE id = ?
-    `).run(auth.id);
+    `).run(evidenceJson, evidenceHash, auth.id);
 
     const report = scanner.scanAndReconcile();
     expect(report.resultPersistedStateIncompleteCount).toBe(1);
@@ -1207,18 +1261,23 @@ describe('R5I6 Crash Recovery, Execution Lifecycle Linearization, and Durable Au
   // 31. Evidence-hash corruption is rejected
   it('31. should reject settlement conflict if evidence hash does not match', async () => {
     const { auth } = await seedStandardTopology();
+    const dummyHash = computeSha256('dummy-settlement-payload');
     db.prepare(`
       UPDATE execution_authorizations
       SET settled_at = datetime('now'),
+          adapter_started_at = datetime('now'),
           adapter_outcome = 'RETURNED',
-          settlement_evidence_hash = 'correct-hash'
+          status = 'DISPATCHED',
+          execution_id = 'exec-1',
+          settlement_evidence_hash = ?
       WHERE id = ?
-    `).run(auth.id);
+    `).run(dummyHash, auth.id);
 
     const res = repo.settleExecutionResult({
       authorizationId: auth.id,
       executionId: 'exec-1',
       outcome: 'RETURNED',
+      status: 'COMPLETED',
       resultPayload: { different: 'payload' },
     });
     expect(res.success).toBe(false);
@@ -1337,5 +1396,280 @@ describe('R5I6 Crash Recovery, Execution Lifecycle Linearization, and Durable Au
 
     expect(schedRes.status).toBe('COMPLETED');
     expect(schedRes.providerResult?.status).toBe('COMPLETED');
+  });
+
+  // 39. Adapter claim gating: alreadyClaimed prevents adapter invocation
+  it('39. should prevent adapter invocation when authorization is already claimed', async () => {
+    const { auth } = await seedStandardTopology();
+    const leaseRes = leaseService.acquireForAssignment('asgn-succ', 60000) as SlotLeaseSuccess;
+    repo.acceptHandoffSuccessorExecution({
+      authorizationId: auth.id,
+      leaseId: leaseRes.lease.id,
+      leaseToken: leaseRes.lease.lease_token,
+      expectedSuccessorEpoch: 2,
+    });
+    repo.claimExecutionAuthorization(auth.id, new Date().toISOString());
+
+    // First claim succeeds
+    const claim1 = repo.claimAdapterExecutionStart({
+      authorizationId: auth.id,
+      executionId: 'exec-1',
+      expectedEpoch: 2,
+    });
+    expect(claim1.success).toBe(true);
+    expect(claim1.alreadyClaimed).toBe(false);
+
+    // Second claim reports alreadyClaimed: true (idempotent replay)
+    const claim2 = repo.claimAdapterExecutionStart({
+      authorizationId: auth.id,
+      executionId: 'exec-1',
+      expectedEpoch: 2,
+    });
+    expect(claim2.success).toBe(true);
+    expect(claim2.alreadyClaimed).toBe(true);
+  });
+
+  // 40. Adapter claim gating: epoch mismatch rejects claim
+  it('40. should reject adapter claim when ownership epoch mismatches', async () => {
+    const { auth } = await seedStandardTopology();
+    repo.claimExecutionAuthorization(auth.id, new Date().toISOString());
+
+    const claimRes = repo.claimAdapterExecutionStart({
+      authorizationId: auth.id,
+      executionId: 'exec-1',
+      expectedEpoch: 999, // Mismatched epoch
+    });
+    expect(claimRes.success).toBe(false);
+    expect(claimRes.alreadyClaimed).toBe(false);
+    expect(claimRes.error).toContain('OWNERSHIP_EPOCH_MISMATCH');
+  });
+
+  // 41. Atomic settlement: rejects unknown result status
+  it('41. should reject settlement with unknown result status fail-closed', async () => {
+    const { auth } = await seedStandardTopology();
+    repo.claimExecutionAuthorization(auth.id, new Date().toISOString());
+    repo.claimAdapterExecutionStart({
+      authorizationId: auth.id,
+      executionId: 'exec-1',
+      expectedEpoch: 2,
+    });
+
+    const settleRes = repo.settleExecutionResult({
+      authorizationId: auth.id,
+      executionId: 'exec-1',
+      outcome: 'RETURNED',
+      status: 'INVALID_STATUS' as any,
+      resultPayload: { test: true },
+    });
+    expect(settleRes.success).toBe(false);
+    expect(settleRes.error).toContain('UNKNOWN_RESULT_STATUS');
+  });
+
+  // 42. Atomic settlement: rolls back when expected row count mismatches
+  it('42. should roll back settlement transaction if transfer is not in modifiable state', async () => {
+    const { auth } = await seedStandardTopology();
+    repo.claimExecutionAuthorization(auth.id, new Date().toISOString());
+    repo.claimAdapterExecutionStart({
+      authorizationId: auth.id,
+      executionId: 'exec-1',
+      expectedEpoch: 2,
+    });
+
+    // Prematurely set transfer to COMPLETED so the settlement update changes === 0
+    db.prepare(`UPDATE handoff_transfers SET status = 'COMPLETED' WHERE id = 'xfer-1'`).run();
+
+    expect(() => {
+      repo.settleExecutionResult({
+        authorizationId: auth.id,
+        executionId: 'exec-1',
+        outcome: 'RETURNED',
+        status: 'COMPLETED',
+        resultPayload: { test: true },
+      });
+    }).toThrow(/SETTLEMENT_TRANSFER_UPDATE_FAILED/);
+
+    // Verify auth was NOT settled due to rollback
+    const reloadedAuth = repo.getExecutionAuthorization(auth.id)!;
+    expect(reloadedAuth.settled_at).toBeNull();
+  });
+
+  // 43. Atomic settlement: deterministic event ID
+  it('43. should create deterministic canonical event ID during settlement', async () => {
+    const { auth } = await seedStandardTopology();
+    const leaseRes = leaseService.acquireForAssignment('asgn-succ', 60000) as SlotLeaseSuccess;
+    repo.acceptHandoffSuccessorExecution({
+      authorizationId: auth.id,
+      leaseId: leaseRes.lease.id,
+      leaseToken: leaseRes.lease.lease_token,
+      expectedSuccessorEpoch: 2,
+    });
+    repo.claimExecutionAuthorization(auth.id, new Date().toISOString());
+    repo.claimAdapterExecutionStart({
+      authorizationId: auth.id,
+      executionId: 'exec-1',
+      expectedEpoch: 2,
+    });
+
+    const fixedTimestamp = '2026-08-29T12:00:00.000Z';
+    const settleRes = repo.settleExecutionResult({
+      authorizationId: auth.id,
+      executionId: 'exec-1',
+      outcome: 'RETURNED',
+      status: 'COMPLETED',
+      finishedAt: fixedTimestamp,
+      resultPayload: { step: 'done' },
+    });
+    expect(settleRes.success).toBe(true);
+
+    const event = db.prepare("SELECT * FROM events WHERE type = 'HANDOFF_SUCCESSOR_EXECUTION_COMPLETED'").get() as any;
+    expect(event).toBeDefined();
+    expect(event.id).toMatch(/^evt-res-[a-f0-9]{32}$/);
+  });
+
+  // 44. Recovery scanner: recomputed evidence hash mismatch -> AUTHORITY_CONFLICT
+  it('44. should classify as AUTHORITY_CONFLICT when stored settlement evidence hash does not match canonical recomputed hash', async () => {
+    const { auth } = await seedStandardTopology();
+    db.prepare(`
+      UPDATE execution_authorizations
+      SET settled_at = datetime('now'),
+          adapter_outcome = 'RETURNED',
+          settlement_evidence_json = '{"authorization_id":"${auth.id}","execution_id":"exec-1","tampered":true}',
+          settlement_evidence_hash = 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'
+      WHERE id = ?
+    `).run(auth.id);
+
+    const report = scanner.scanAndReconcile();
+    expect(report.authorityConflictCount).toBe(1);
+    expect(report.items[0].classification).toBe('AUTHORITY_CONFLICT');
+    expect(report.items[0].disposition).toBe('REJECTED_INTEGRITY_CONFLICT');
+  });
+
+  // 45. Recovery scanner: malformed settlement evidence JSON -> AUTHORITY_CONFLICT
+  it('45. should classify as AUTHORITY_CONFLICT when settlement evidence JSON is malformed', async () => {
+    const { auth } = await seedStandardTopology();
+    db.prepare(`
+      UPDATE execution_authorizations
+      SET settled_at = datetime('now'),
+          adapter_outcome = 'RETURNED',
+          settlement_evidence_json = '{malformed json',
+          settlement_evidence_hash = 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'
+      WHERE id = ?
+    `).run(auth.id);
+
+    const report = scanner.scanAndReconcile();
+    expect(report.authorityConflictCount).toBe(1);
+    expect(report.items[0].classification).toBe('AUTHORITY_CONFLICT');
+    expect(report.items[0].disposition).toBe('REJECTED_INTEGRITY_CONFLICT');
+  });
+
+  // 46. Guarded lease release: slot reassigned to another assignment is not idled
+  it('46. should abort guarded slot release without idling slot if slot has been reassigned', async () => {
+    await seedStandardTopology();
+    const leaseRes = leaseService.acquireForAssignment('asgn-succ', 60000) as SlotLeaseSuccess;
+
+    // Simulate slot reassigned to another assignment
+    db.prepare(`UPDATE worker_slots SET current_assignment_id = 'asgn-other' WHERE id = 'slot-1'`).run();
+
+    expect(() => {
+      repo.releaseGuardedAccountLeaseAndIdleSlot({
+        leaseId: leaseRes.lease.id,
+        expectedAssignmentId: 'asgn-succ',
+        expectedAccountId: 'acc-1',
+        expectedSlotId: 'slot-1',
+      });
+    }).toThrow(/SLOT_REASSIGNED/);
+
+    // Slot remains assigned to asgn-other and lease was not released due to transaction rollback
+    const slot = repo.getWorkerSlot('slot-1')!;
+    expect(slot.current_assignment_id).toBe('asgn-other');
+    const lease = repo.getActiveLeaseForAssignment('asgn-succ');
+    expect(lease).not.toBeNull();
+  });
+
+  // 47. Idempotent recovery scan: repeated scan does not bump recovery_version or mutate rows
+  it('47. should not increment recovery_version or mutate rows on repeated scan with identical evidence', async () => {
+    const { auth } = await seedStandardTopology();
+    db.prepare(`UPDATE execution_authorizations SET status = 'INVALIDATED' WHERE id = ?`).run(auth.id);
+    db.prepare(`UPDATE handoff_transfers SET status = 'FAILED' WHERE id = 'xfer-1'`).run();
+    db.prepare(`UPDATE task_attempts SET status = 'FAILED' WHERE id = 'att-succ'`).run();
+    db.prepare(`UPDATE agent_assignments SET status = 'FAILED' WHERE id = 'asgn-succ'`).run();
+
+    // First scan creates recovery state version 1
+    const report1 = scanner.scanAndReconcile();
+    expect(report1.alreadyReconciledCount).toBe(1);
+    const state1 = repo.getExecutionRecoveryState(auth.id)!;
+    expect(state1.recovery_version).toBe(1);
+
+    // Second scan with identical evidence
+    const report2 = scanner.scanAndReconcile();
+    expect(report2.alreadyReconciledCount).toBe(1);
+    const state2 = repo.getExecutionRecoveryState(auth.id)!;
+    expect(state2.recovery_version).toBe(1);
+  });
+
+  // 48. Termination source: unconfirmed or non-standard termination kind does not infer cancellation
+  it('48. should keep execution in ADAPTER_IN_FLIGHT_UNRESOLVED when termination source is unknown', async () => {
+    const { auth } = await seedStandardTopology();
+    repo.claimExecutionAuthorization(auth.id, new Date().toISOString());
+    repo.claimAdapterExecutionStart({
+      authorizationId: auth.id,
+      executionId: 'exec-1',
+      expectedEpoch: 2,
+    });
+    // Set unknown termination source
+    db.prepare(`
+      UPDATE execution_authorizations
+      SET termination_status = 'CONFIRMED_TERMINATED',
+          termination_source = 'UNKNOWN_EXTERNAL_SIGNAL'
+      WHERE id = ?
+    `).run(auth.id);
+
+    const report = scanner.scanAndReconcile();
+    expect(report.adapterInFlightUnresolvedCount).toBe(1);
+    expect(report.items[0].disposition).toBe('UNRESOLVED_FENCED');
+  });
+
+  // 49. Unresolved in-flight state: unconfirmed termination remains ADAPTER_IN_FLIGHT_UNRESOLVED
+  it('49. should keep execution in ADAPTER_IN_FLIGHT_UNRESOLVED when termination is UNRESOLVED', async () => {
+    const { auth } = await seedStandardTopology();
+    repo.claimExecutionAuthorization(auth.id, new Date().toISOString());
+    repo.claimAdapterExecutionStart({
+      authorizationId: auth.id,
+      executionId: 'exec-1',
+      expectedEpoch: 2,
+    });
+    db.prepare(`
+      UPDATE execution_authorizations
+      SET termination_status = 'UNRESOLVED',
+          cancellation_requested_at = datetime('now')
+      WHERE id = ?
+    `).run(auth.id);
+
+    const report = scanner.scanAndReconcile();
+    expect(report.adapterInFlightUnresolvedCount).toBe(1);
+    expect(report.items[0].disposition).toBe('UNRESOLVED_FENCED');
+  });
+
+  // 50. Dispatch settlement failure leaves execution recoverable and unresolved
+  it('50. should fail dispatch when settlement fails, leaving execution recoverable', async () => {
+    const { auth } = await seedStandardTopology();
+
+    // Spy on settleExecutionResult to simulate database / transaction failure during settlement
+    vi.spyOn(repo, 'settleExecutionResult').mockReturnValueOnce({
+      success: false,
+      alreadySettled: false,
+      settledAt: '',
+      evidenceHash: '',
+      error: 'SIMULATED_SETTLEMENT_TRANSACTION_FAILURE: Simulated DB constraint failure',
+    });
+
+    const schedRes = await scheduler.execute(auth.id);
+    expect(schedRes.status).toBe('PROVIDER_FAILED');
+    expect(schedRes.providerResult?.errorCode).toBe('SETTLEMENT_FAILED');
+
+    // Execution authorization remains DISPATCHED and started, recoverable by scanner
+    const reloadedAuth = repo.getExecutionAuthorization(auth.id)!;
+    expect(reloadedAuth.adapter_started_at).not.toBeNull();
+    expect(reloadedAuth.settled_at).toBeNull();
   });
 });

@@ -13,6 +13,7 @@ export type RuntimeErrorCode =
   | 'OUTPUT_LIMIT_EXCEEDED'
   | 'POLICY_DENIAL'
   | 'EXECUTION_FAILED'
+  | 'SETTLEMENT_FAILED'
   | 'UNKNOWN';
 
 export interface QuotaSnapshotInfo {

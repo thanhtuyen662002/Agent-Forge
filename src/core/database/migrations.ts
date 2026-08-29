@@ -1195,7 +1195,7 @@ export const MIGRATIONS: Migration[] = [
       db.exec(`
         -- 1. Extend execution_authorizations with lifecycle protocol & durable settlement fields
         ALTER TABLE execution_authorizations
-        ADD COLUMN lifecycle_version INTEGER NULL;
+        ADD COLUMN lifecycle_version INTEGER NULL CHECK (lifecycle_version IS NULL OR lifecycle_version >= 1);
 
         ALTER TABLE execution_authorizations
         ADD COLUMN adapter_error_json TEXT NULL;
@@ -1210,7 +1210,7 @@ export const MIGRATIONS: Migration[] = [
         ADD COLUMN settlement_evidence_json TEXT NULL;
 
         ALTER TABLE execution_authorizations
-        ADD COLUMN settlement_evidence_hash TEXT NULL;
+        ADD COLUMN settlement_evidence_hash TEXT NULL CHECK (settlement_evidence_hash IS NULL OR length(settlement_evidence_hash) = 64);
 
         CREATE INDEX IF NOT EXISTS idx_exec_auth_lifecycle
         ON execution_authorizations(lifecycle_version);
@@ -1221,14 +1221,33 @@ export const MIGRATIONS: Migration[] = [
           authorization_id TEXT NOT NULL UNIQUE REFERENCES execution_authorizations(id) ON DELETE CASCADE,
           transfer_id TEXT NOT NULL REFERENCES handoff_transfers(id) ON DELETE RESTRICT,
           execution_id TEXT NULL,
-          lifecycle_version INTEGER NULL,
-          recovery_classification TEXT NOT NULL,
-          disposition TEXT NOT NULL,
+          lifecycle_version INTEGER NULL CHECK (lifecycle_version IS NULL OR lifecycle_version >= 1),
+          recovery_classification TEXT NOT NULL CHECK (recovery_classification IN (
+            'PRE_ADAPTER_NOT_STARTED',
+            'ADAPTER_IN_FLIGHT_UNRESOLVED',
+            'ADAPTER_TERMINATED_AFTER_TIMEOUT',
+            'ADAPTER_FINISHED_RESULT_MISSING',
+            'RESULT_PERSISTED_STATE_INCOMPLETE',
+            'ALREADY_RECONCILED',
+            'LEGACY_UNCLASSIFIABLE',
+            'AUTHORITY_CONFLICT'
+          )),
+          disposition TEXT NOT NULL CHECK (disposition IN (
+            'TERMINALIZED_SAFE_EXPIRED',
+            'UNRESOLVED_FENCED',
+            'TERMINALIZED_CONFIRMED_TIMEOUT',
+            'TERMINALIZED_CONFIRMED_CANCELLED',
+            'RESULT_MISSING_FENCED',
+            'TERMINAL_STATE_RECONCILED',
+            'NO_OP_ALREADY_RECONCILED',
+            'LEGACY_UNRESOLVED_FENCED',
+            'REJECTED_INTEGRITY_CONFLICT'
+          )),
           canonical_evidence_json TEXT NOT NULL,
-          evidence_hash TEXT NOT NULL,
-          recovery_version INTEGER NOT NULL DEFAULT 1,
-          mutated_terminal_state INTEGER NOT NULL DEFAULT 0,
-          mutated_resources INTEGER NOT NULL DEFAULT 0,
+          evidence_hash TEXT NOT NULL CHECK (length(evidence_hash) = 64),
+          recovery_version INTEGER NOT NULL DEFAULT 1 CHECK (recovery_version >= 1),
+          mutated_terminal_state INTEGER NOT NULL DEFAULT 0 CHECK (mutated_terminal_state IN (0, 1)),
+          mutated_resources INTEGER NOT NULL DEFAULT 0 CHECK (mutated_resources IN (0, 1)),
           first_detected_at TEXT NOT NULL,
           last_scanned_at TEXT NOT NULL,
           resolved_at TEXT NULL,
