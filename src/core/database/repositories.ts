@@ -2154,7 +2154,7 @@ export class Repository {
           deterministicEventId,
           auth.project_id,
           auth.task_id,
-          assignment.agent_profile_id ?? null,
+          null,
           eventType,
           `Execution ${params.executionId} settled as ${params.status} (outcome: ${params.outcome}) for task ${auth.task_id}`,
           canonicalEvidenceJson,
