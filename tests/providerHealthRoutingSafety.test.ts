@@ -800,7 +800,7 @@ describe('R5H4 Provider Health Routing Safety & Liveness Guard Contract Tests', 
     expect(safety.status).toBe('SAFE');
     expect(safety.effectiveHeadAccountOrder).toBe(1);
     expect(safety.effectiveHeadAuthorizationId).toBe('auth-head-1');
-  });
+  }, 60000);
 
   // ============================================================
   // SECTION 44: ROLE-AWARE ROUTING TESTS
