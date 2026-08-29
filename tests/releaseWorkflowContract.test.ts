@@ -1,6 +1,8 @@
 import { describe, it, expect } from 'vitest';
 import * as fs from 'fs';
 import * as path from 'path';
+import * as os from 'os';
+import { performance } from 'perf_hooks';
 import { spawnSync } from 'child_process';
 
 describe('PR #19 — Production Release Pipeline Hardening Contract Tests', () => {
@@ -216,11 +218,67 @@ describe('PR #19 — Production Release Pipeline Hardening Contract Tests', () =
 
       const psExe = process.platform === 'win32' ? 'powershell.exe' : 'pwsh';
       const fixtureTimeoutMs = process.platform === 'win32' ? 60000 : 20000;
+
+      const diagEnabled = process.platform === 'win32' && process.env.R5I5_DIAG === '1';
+      let spawnStart = 0;
+      let cpuBefore: NodeJS.CpuUsage | null = null;
+      let rssBefore = 0;
+      let heapBefore = 0;
+      let freeMemBefore = 0;
+
+      if (diagEnabled) {
+        spawnStart = performance.now();
+        cpuBefore = process.cpuUsage();
+        rssBefore = process.memoryUsage().rss;
+        heapBefore = process.memoryUsage().heapUsed;
+        freeMemBefore = os.freemem();
+
+        const record = {
+          marker: 'R5I5_DIAG',
+          schema_version: '1.0',
+          run_context: 'github_actions',
+          scope: 'releaseWorkflowContract',
+          phase: 'spawnSync',
+          event: 'SPAWN_BEGIN',
+          wall_clock_utc: new Date().toISOString(),
+          platform: process.platform,
+          fixture_timeout_ms: fixtureTimeoutMs,
+          worker_rss_bytes: rssBefore,
+          worker_heap_used_bytes: heapBefore,
+          system_free_memory_bytes: freeMemBefore,
+        };
+        console.log('R5I5_DIAG ' + JSON.stringify(record));
+      }
+
       const result = spawnSync(
         psExe,
         ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File', fixtureScriptPath],
         { encoding: 'utf8', timeout: fixtureTimeoutMs, windowsHide: true }
       );
+
+      if (diagEnabled) {
+        const elapsed = performance.now() - spawnStart;
+        const cpuDelta = cpuBefore ? process.cpuUsage(cpuBefore) : null;
+        const record = {
+          marker: 'R5I5_DIAG',
+          schema_version: '1.0',
+          run_context: 'github_actions',
+          scope: 'releaseWorkflowContract',
+          phase: 'spawnSync',
+          event: 'SPAWN_END',
+          wall_clock_utc: new Date().toISOString(),
+          elapsed_ms: elapsed,
+          exit_status: result.status,
+          error_code: (result.error as any)?.code ?? null,
+          signal: result.signal ?? null,
+          worker_rss_bytes: process.memoryUsage().rss,
+          worker_heap_used_bytes: process.memoryUsage().heapUsed,
+          system_free_memory_bytes: os.freemem(),
+          cpu_user_us_delta: cpuDelta ? cpuDelta.user : null,
+          cpu_system_us_delta: cpuDelta ? cpuDelta.system : null,
+        };
+        console.log('R5I5_DIAG ' + JSON.stringify(record));
+      }
 
       if (result.error) {
         throw result.error;

@@ -3,6 +3,7 @@ import fs from 'fs';
 import path from 'path';
 import os from 'os';
 import crypto from 'crypto';
+import { performance } from 'perf_hooks';
 import Database from 'better-sqlite3';
 import { MigrationRunner, MIGRATIONS } from '../src/core/database/migrations';
 import { Repository } from '../src/core/database/repositories';
@@ -509,11 +510,18 @@ describe('R5H4 Provider Health Observation Ordering Authority Contract Tests', (
   // -------------------------------------------------------------
 
   it('5. Legacy v11 observations remain account_order = NULL after migration 12 upgrade without backfill', () => {
+    const isR5i5DiagEnabled = (): boolean => process.platform === 'win32' && process.env.R5I5_DIAG === '1';
+    const diagEnabled = isR5i5DiagEnabled();
+    const test5Start = diagEnabled ? performance.now() : 0;
+    let mig11Ms = 0;
+    let mig12Ms = 0;
+
     const legacyDbPath = path.join(tempDir, 'legacy_v11.db');
     const legacyDb = new Database(legacyDbPath);
     legacyDb.pragma('foreign_keys = ON');
 
     // Apply migrations 1 through 11 only
+    const mig11Start = diagEnabled ? performance.now() : 0;
     legacyDb.exec(`
       CREATE TABLE schema_migrations (
         version INTEGER PRIMARY KEY,
@@ -525,6 +533,7 @@ describe('R5H4 Provider Health Observation Ordering Authority Contract Tests', (
       m.up(legacyDb);
       legacyDb.prepare('INSERT INTO schema_migrations VALUES (?, ?, ?)').run(m.version, m.name, new Date().toISOString());
     }
+    if (diagEnabled) mig11Ms = performance.now() - mig11Start;
 
     const legacyRepo = new Repository(legacyDb);
     createTestEntities(legacyRepo);
@@ -561,15 +570,36 @@ describe('R5H4 Provider Health Observation Ordering Authority Contract Tests', (
     expect(legacyRow.account_order).toBeUndefined();
 
     // Now apply migration 12
+    const mig12Start = diagEnabled ? performance.now() : 0;
     const m12 = MIGRATIONS.find((m) => m.version === 12)!;
     m12.up(legacyDb);
     legacyDb.prepare('INSERT INTO schema_migrations VALUES (?, ?, ?)').run(12, m12.name, new Date().toISOString());
+    if (diagEnabled) mig12Ms = performance.now() - mig12Start;
 
     // Verify existing v11 row has account_order = NULL (no historical backfill)
     const upgradedRow = legacyDb.prepare('SELECT * FROM provider_health_observations WHERE authorization_id = ?').get(obs.authorization_id) as any;
     expect(upgradedRow.account_order).toBeNull();
 
     legacyDb.close();
+
+    if (diagEnabled) {
+      const test5TotalMs = performance.now() - test5Start;
+      const record = {
+        marker: 'R5I5_DIAG',
+        schema_version: '1.0',
+        run_context: 'github_actions',
+        scope: 'providerHealthOrderingAuthority',
+        phase: 'test5',
+        event: 'TEST_SUMMARY',
+        wall_clock_utc: new Date().toISOString(),
+        elapsed_ms: test5TotalMs,
+        migrations_1_to_11_ms: mig11Ms,
+        migration_12_ms: mig12Ms,
+        system_free_memory_bytes: os.freemem(),
+        rss_bytes: process.memoryUsage().rss,
+      };
+      console.log('R5I5_DIAG ' + JSON.stringify(record));
+    }
   });
 
   it('6. First post-v12 observation for an account is assigned account_order = 1', () => {

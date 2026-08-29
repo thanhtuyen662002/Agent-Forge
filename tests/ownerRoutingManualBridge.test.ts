@@ -1,10 +1,11 @@
-import { describe, it, expect, beforeEach, afterEach } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach, afterAll } from 'vitest';
 import Database from 'better-sqlite3';
 import fs from 'fs';
 import path from 'path';
 import os from 'os';
 import crypto from 'crypto';
 import { execSync } from 'child_process';
+import { performance } from 'perf_hooks';
 import { MigrationRunner } from '../src/core/database/migrations';
 import { Repository } from '../src/core/database/repositories';
 import { EventService } from '../src/core/services/EventService';
@@ -78,6 +79,14 @@ class MockAutomatedAdapter implements ProviderAdapter {
 }
 
 describe('Owner Routing & Manual Bridge Handoff Loop (PR #8)', () => {
+  const isR5i5DiagEnabled = (): boolean => process.platform === 'win32' && process.env.R5I5_DIAG === '1';
+  let suiteHookCount = 0;
+  let suiteHookTotalMs = 0;
+  let suiteHookMinMs = Infinity;
+  let suiteHookMaxMs = 0;
+  let suiteMigrationTotalMs = 0;
+  let suiteGitTotalMs = 0;
+
   let tempDir: string;
   let dbDir: string;
   let artifactsDir: string;
@@ -100,6 +109,11 @@ describe('Owner Routing & Manual Bridge Handoff Loop (PR #8)', () => {
   let initialGitSha: string;
 
   beforeEach(() => {
+    const diagEnabled = isR5i5DiagEnabled();
+    const hookStart = diagEnabled ? performance.now() : 0;
+    let gitMs = 0;
+    let migMs = 0;
+
     tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'agent-forge-pr8-test-'));
     dbDir = path.join(tempDir, 'db');
     artifactsDir = path.join(tempDir, 'artifacts');
@@ -110,15 +124,19 @@ describe('Owner Routing & Manual Bridge Handoff Loop (PR #8)', () => {
     fs.mkdirSync(gitRepoDir, { recursive: true });
 
     // Initialize real git repo for GitService tests
+    const gitStart = diagEnabled ? performance.now() : 0;
     execSync('git init', { cwd: gitRepoDir });
     execSync('git config user.email "test@test.com"', { cwd: gitRepoDir });
     execSync('git config user.name "Tester"', { cwd: gitRepoDir });
     fs.writeFileSync(path.join(gitRepoDir, 'README.md'), '# Initial README\n');
     execSync('git add README.md && git commit -m "initial commit"', { cwd: gitRepoDir });
     initialGitSha = execSync('git rev-parse HEAD', { cwd: gitRepoDir }).toString().trim();
+    if (diagEnabled) gitMs = performance.now() - gitStart;
 
     db = new Database(path.join(dbDir, 'test.db'));
+    const migStart = diagEnabled ? performance.now() : 0;
     MigrationRunner.run(db);
+    if (diagEnabled) migMs = performance.now() - migStart;
 
     repo = new Repository(db);
     eventService = new EventService(repo);
@@ -148,6 +166,35 @@ describe('Owner Routing & Manual Bridge Handoff Loop (PR #8)', () => {
       enabled: true,
       created_at: new Date().toISOString(),
     });
+
+    if (diagEnabled) {
+      const hookElapsed = performance.now() - hookStart;
+      suiteHookCount++;
+      suiteHookTotalMs += hookElapsed;
+      suiteHookMinMs = Math.min(suiteHookMinMs, hookElapsed);
+      suiteHookMaxMs = Math.max(suiteHookMaxMs, hookElapsed);
+      suiteMigrationTotalMs += migMs;
+      suiteGitTotalMs += gitMs;
+
+      if (suiteHookCount <= 2 || hookElapsed >= 5000) {
+        const record = {
+          marker: 'R5I5_DIAG',
+          schema_version: '1.0',
+          run_context: 'github_actions',
+          scope: 'ownerRoutingManualBridge',
+          phase: 'beforeEach',
+          event: 'HOOK_SUMMARY',
+          wall_clock_utc: new Date().toISOString(),
+          hook_index: suiteHookCount,
+          elapsed_ms: hookElapsed,
+          git_setup_ms: gitMs,
+          migration_ms: migMs,
+          system_free_memory_bytes: os.freemem(),
+          rss_bytes: process.memoryUsage().rss,
+        };
+        console.log('R5I5_DIAG ' + JSON.stringify(record));
+      }
+    }
 
     repo.createProviderResource({
       id: 'res-gemini-coder',
@@ -202,6 +249,29 @@ describe('Owner Routing & Manual Bridge Handoff Loop (PR #8)', () => {
       // Clean teardown
     }
   }, 30000);
+
+  afterAll(() => {
+    if (isR5i5DiagEnabled() && suiteHookCount > 0) {
+      const record = {
+        marker: 'R5I5_DIAG',
+        schema_version: '1.0',
+        run_context: 'github_actions',
+        scope: 'ownerRoutingManualBridge',
+        phase: 'suite_summary',
+        event: 'SUITE_HOOK_AGGREGATE',
+        wall_clock_utc: new Date().toISOString(),
+        hook_count: suiteHookCount,
+        hook_total_elapsed_ms: suiteHookTotalMs,
+        hook_min_elapsed_ms: suiteHookMinMs,
+        hook_max_elapsed_ms: suiteHookMaxMs,
+        migration_total_elapsed_ms: suiteMigrationTotalMs,
+        git_setup_total_elapsed_ms: suiteGitTotalMs,
+        system_free_memory_bytes: os.freemem(),
+        rss_bytes: process.memoryUsage().rss,
+      };
+      console.log('R5I5_DIAG ' + JSON.stringify(record));
+    }
+  });
 
   // =========================================================================
   // 1. Explicit Candidate Selection & Opt-in Invariants

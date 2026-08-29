@@ -1,8 +1,9 @@
-import { describe, it, expect, beforeEach, afterEach } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach, afterAll } from 'vitest';
 import fs from 'fs';
 import path from 'path';
 import os from 'os';
 import crypto from 'crypto';
+import { performance } from 'perf_hooks';
 import Database from 'better-sqlite3';
 import { MigrationRunner } from '../src/core/database/migrations';
 import { Repository } from '../src/core/database/repositories';
@@ -78,6 +79,14 @@ class MockTestAdapter implements ProviderAdapter {
 }
 
 describe('R5H4 Provider Health Routing Safety & Liveness Guard Contract Tests', () => {
+  const isR5i5DiagEnabled = (): boolean => process.platform === 'win32' && process.env.R5I5_DIAG === '1';
+  let safetySuiteHookCount = 0;
+  let safetySuiteHookTotalMs = 0;
+  let safetySuiteHookMinMs = Infinity;
+  let safetySuiteHookMaxMs = 0;
+  let safetySuiteMigrationTotalMs = 0;
+  let safetySuiteGitTotalMs = 0;
+
   let tempDir: string;
   let dbPath: string;
   let repoDir: string;
@@ -99,10 +108,17 @@ describe('R5H4 Provider Health Routing Safety & Liveness Guard Contract Tests', 
   const agentProfileId = 'agent-prof-test-safety';
 
   beforeEach(() => {
+    const diagEnabled = isR5i5DiagEnabled();
+    const hookStart = diagEnabled ? performance.now() : 0;
+    let gitMs = 0;
+    let migMs = 0;
+
     tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'agentforge-safety-test-'));
     dbPath = path.join(tempDir, 'safety-test.db');
     repoDir = path.join(tempDir, 'repo');
     fs.mkdirSync(repoDir, { recursive: true });
+
+    const gitStart = diagEnabled ? performance.now() : 0;
     require('child_process').execSync('git init', { cwd: repoDir, stdio: 'pipe' });
     require('child_process').execSync('git config user.name "Tester"', { cwd: repoDir, stdio: 'pipe' });
     require('child_process').execSync('git config user.email "test@example.com"', { cwd: repoDir, stdio: 'pipe' });
@@ -110,9 +126,13 @@ describe('R5H4 Provider Health Routing Safety & Liveness Guard Contract Tests', 
     require('child_process').execSync('git add README.md', { cwd: repoDir, stdio: 'pipe' });
     require('child_process').execSync('git commit -m "init"', { cwd: repoDir, stdio: 'pipe' });
     baseSha = require('child_process').execSync('git rev-parse HEAD', { cwd: repoDir, encoding: 'utf-8' }).trim();
+    if (diagEnabled) gitMs = performance.now() - gitStart;
 
     db = new Database(dbPath);
+    const migStart = diagEnabled ? performance.now() : 0;
     MigrationRunner.run(db);
+    if (diagEnabled) migMs = performance.now() - migStart;
+
     repo = new Repository(db);
     eventService = new EventService(repo);
 
@@ -121,11 +141,63 @@ describe('R5H4 Provider Health Routing Safety & Liveness Guard Contract Tests', 
     registry.register(mockAdapter);
 
     createBaselineEntities();
+
+    if (diagEnabled) {
+      const hookElapsed = performance.now() - hookStart;
+      safetySuiteHookCount++;
+      safetySuiteHookTotalMs += hookElapsed;
+      safetySuiteHookMinMs = Math.min(safetySuiteHookMinMs, hookElapsed);
+      safetySuiteHookMaxMs = Math.max(safetySuiteHookMaxMs, hookElapsed);
+      safetySuiteMigrationTotalMs += migMs;
+      safetySuiteGitTotalMs += gitMs;
+
+      if (safetySuiteHookCount <= 2 || hookElapsed >= 5000) {
+        const record = {
+          marker: 'R5I5_DIAG',
+          schema_version: '1.0',
+          run_context: 'github_actions',
+          scope: 'providerHealthRoutingSafety',
+          phase: 'beforeEach',
+          event: 'HOOK_SUMMARY',
+          wall_clock_utc: new Date().toISOString(),
+          hook_index: safetySuiteHookCount,
+          elapsed_ms: hookElapsed,
+          git_setup_ms: gitMs,
+          migration_ms: migMs,
+          system_free_memory_bytes: os.freemem(),
+          rss_bytes: process.memoryUsage().rss,
+        };
+        console.log('R5I5_DIAG ' + JSON.stringify(record));
+      }
+    }
   });
 
   afterEach(() => {
     db.close();
     fs.rmSync(tempDir, { recursive: true, force: true });
+  });
+
+  afterAll(() => {
+    if (isR5i5DiagEnabled() && safetySuiteHookCount > 0) {
+      const record = {
+        marker: 'R5I5_DIAG',
+        schema_version: '1.0',
+        run_context: 'github_actions',
+        scope: 'providerHealthRoutingSafety',
+        phase: 'suite_summary',
+        event: 'SUITE_HOOK_AGGREGATE',
+        wall_clock_utc: new Date().toISOString(),
+        hook_count: safetySuiteHookCount,
+        hook_total_elapsed_ms: safetySuiteHookTotalMs,
+        hook_min_elapsed_ms: safetySuiteHookMinMs,
+        hook_max_elapsed_ms: safetySuiteHookMaxMs,
+        migration_total_elapsed_ms: safetySuiteMigrationTotalMs,
+        git_setup_total_elapsed_ms: safetySuiteGitTotalMs,
+        system_free_memory_bytes: os.freemem(),
+        rss_bytes: process.memoryUsage().rss,
+      };
+      console.log('R5I5_DIAG ' + JSON.stringify(record));
+    }
   });
 
   function createBaselineEntities() {
@@ -300,6 +372,21 @@ describe('R5H4 Provider Health Routing Safety & Liveness Guard Contract Tests', 
     );
   }
 
+  interface Test24DiagAccumulator {
+    authLookupCount: number;
+    authLookupTotalMs: number;
+    authCreateCount: number;
+    authCreateTotalMs: number;
+    assignmentLookupCount: number;
+    assignmentLookupTotalMs: number;
+    assignmentCreateCount: number;
+    assignmentCreateTotalMs: number;
+    observationInsertCount: number;
+    observationInsertTotalMs: number;
+    iterationDurationsMs: number[];
+  }
+  let currentTest24Diag: Test24DiagAccumulator | null = null;
+
   function insertObservationDirectly(obs: {
     authorization_id: string;
     execution_id?: string;
@@ -324,9 +411,19 @@ describe('R5H4 Provider Health Routing Safety & Liveness Guard Contract Tests', 
   }) {
     const now = new Date().toISOString();
     const effectiveResourceId = obs.resource_id ?? (obs.account_id === accountIdB ? resourceIdB : resourceIdA);
+    const diag = currentTest24Diag;
+    const iterStart = diag ? performance.now() : 0;
 
     // Ensure execution_authorizations row exists
-    if (!repo.getExecutionAuthorization(obs.authorization_id)) {
+    const alStart = diag ? performance.now() : 0;
+    const existingAuth = repo.getExecutionAuthorization(obs.authorization_id);
+    if (diag) {
+      diag.authLookupTotalMs += performance.now() - alStart;
+      diag.authLookupCount++;
+    }
+
+    if (!existingAuth) {
+      const acStart = diag ? performance.now() : 0;
       repo.createExecutionAuthorization({
         id: obs.authorization_id,
         project_id: projectId,
@@ -349,11 +446,23 @@ describe('R5H4 Provider Health Routing Safety & Liveness Guard Contract Tests', 
         created_at: now,
         dispatched_at: now,
       });
+      if (diag) {
+        diag.authCreateTotalMs += performance.now() - acStart;
+        diag.authCreateCount++;
+      }
     }
 
     // Ensure agent_assignments row exists
     const assignmentId = obs.assignment_id ?? `asgn-${obs.authorization_id}`;
-    if (!repo.getAgentAssignment(assignmentId)) {
+    const aslStart = diag ? performance.now() : 0;
+    const existingAsgn = repo.getAgentAssignment(assignmentId);
+    if (diag) {
+      diag.assignmentLookupTotalMs += performance.now() - aslStart;
+      diag.assignmentLookupCount++;
+    }
+
+    if (!existingAsgn) {
+      const ascStart = diag ? performance.now() : 0;
       repo.createAgentAssignment({
         id: assignmentId,
         project_id: projectId,
@@ -371,8 +480,13 @@ describe('R5H4 Provider Health Routing Safety & Liveness Guard Contract Tests', 
         created_at: now,
         ended_at: null,
       });
+      if (diag) {
+        diag.assignmentCreateTotalMs += performance.now() - ascStart;
+        diag.assignmentCreateCount++;
+      }
     }
 
+    const oiStart = diag ? performance.now() : 0;
     db.prepare(`
       INSERT INTO provider_health_observations (
         authorization_id, execution_id, account_id, provider_id, resource_id,
@@ -411,6 +525,11 @@ describe('R5H4 Provider Health Routing Safety & Liveness Guard Contract Tests', 
       obs.health_action_cooldown_duration_ms ?? null,
       obs.health_action_cooldown_anchor_at ?? null
     );
+    if (diag) {
+      diag.observationInsertTotalMs += performance.now() - oiStart;
+      diag.observationInsertCount++;
+      diag.iterationDurationsMs.push(performance.now() - iterStart);
+    }
   }
 
   function setAccountWatermark(
@@ -775,31 +894,124 @@ describe('R5H4 Provider Health Routing Safety & Liveness Guard Contract Tests', 
   });
 
   it('24. >100 newer NO_MUTATION rows do not hide older effective head (ROUTING_SAFETY_MORE_THAN_100_ROWS_PROVEN)', () => {
-    insertObservationDirectly({
-      authorization_id: 'auth-head-1',
-      account_id: accountIdA,
-      account_order: 1,
-      health_action_plan_version: 1,
-      health_action: 'RECORD_SUCCESS',
-    });
+    const diagEnabled = isR5i5DiagEnabled();
+    let diagAccumulator: Test24DiagAccumulator | null = null;
+    let testStart = 0;
+    let watermarkMs = 0;
+    let routingEvalMs = 0;
 
-    // Insert 120 transparent NO_MUTATION rows
-    for (let i = 2; i <= 121; i++) {
-      insertObservationDirectly({
-        authorization_id: `auth-nomut-${i}`,
-        account_id: accountIdA,
-        account_order: i,
-        health_action_plan_version: 1,
-        health_action: 'NO_MUTATION',
-      });
+    if (diagEnabled) {
+      testStart = performance.now();
+      diagAccumulator = {
+        authLookupCount: 0,
+        authLookupTotalMs: 0,
+        authCreateCount: 0,
+        authCreateTotalMs: 0,
+        assignmentLookupCount: 0,
+        assignmentLookupTotalMs: 0,
+        assignmentCreateCount: 0,
+        assignmentCreateTotalMs: 0,
+        observationInsertCount: 0,
+        observationInsertTotalMs: 0,
+        iterationDurationsMs: [],
+      };
+      currentTest24Diag = diagAccumulator;
     }
 
-    setAccountWatermark(accountIdA, 1, 'auth-head-1');
+    try {
+      insertObservationDirectly({
+        authorization_id: 'auth-head-1',
+        account_id: accountIdA,
+        account_order: 1,
+        health_action_plan_version: 1,
+        health_action: 'RECORD_SUCCESS',
+      });
 
-    const safety = repo.evaluateProviderHealthRoutingSafety(accountIdA);
-    expect(safety.status).toBe('SAFE');
-    expect(safety.effectiveHeadAccountOrder).toBe(1);
-    expect(safety.effectiveHeadAuthorizationId).toBe('auth-head-1');
+      // Insert 120 transparent NO_MUTATION rows
+      for (let i = 2; i <= 121; i++) {
+        insertObservationDirectly({
+          authorization_id: `auth-nomut-${i}`,
+          account_id: accountIdA,
+          account_order: i,
+          health_action_plan_version: 1,
+          health_action: 'NO_MUTATION',
+        });
+      }
+
+      const wmStart = diagEnabled ? performance.now() : 0;
+      setAccountWatermark(accountIdA, 1, 'auth-head-1');
+      if (diagEnabled) watermarkMs = performance.now() - wmStart;
+
+      const evalStart = diagEnabled ? performance.now() : 0;
+      const safety = repo.evaluateProviderHealthRoutingSafety(accountIdA);
+      if (diagEnabled) routingEvalMs = performance.now() - evalStart;
+
+      expect(safety.status).toBe('SAFE');
+      expect(safety.effectiveHeadAccountOrder).toBe(1);
+      expect(safety.effectiveHeadAuthorizationId).toBe('auth-head-1');
+    } finally {
+      if (diagEnabled && diagAccumulator) {
+        currentTest24Diag = null;
+        const totalElapsed = performance.now() - testStart;
+        const durations = diagAccumulator.iterationDurationsMs;
+        const iterCount = durations.length;
+        const iterTotal = durations.reduce((a, b) => a + b, 0);
+        const iterMin = iterCount > 0 ? Math.min(...durations) : 0;
+        const iterMax = iterCount > 0 ? Math.max(...durations) : 0;
+        const iterMean = iterCount > 0 ? iterTotal / iterCount : 0;
+
+        const sorted = [...durations].sort((a, b) => a - b);
+        const p50 = iterCount > 0 ? sorted[Math.floor(iterCount * 0.5)] : 0;
+        const p95 = iterCount > 0 ? sorted[Math.floor(iterCount * 0.95)] : 0;
+
+        const first10 = durations.slice(0, 10);
+        const last10 = durations.slice(-10);
+        const first10Mean = first10.length > 0 ? first10.reduce((a, b) => a + b, 0) / first10.length : 0;
+        const last10Mean = last10.length > 0 ? last10.reduce((a, b) => a + b, 0) / last10.length : 0;
+
+        const record = {
+          marker: 'R5I5_DIAG',
+          schema_version: '1.0',
+          run_context: 'github_actions',
+          scope: 'providerHealthRoutingSafety',
+          phase: 'test24',
+          event: 'TEST24_SUMMARY',
+          wall_clock_utc: new Date().toISOString(),
+          elapsed_ms: totalElapsed,
+          counts: {
+            iteration_count: iterCount,
+            auth_lookup_count: diagAccumulator.authLookupCount,
+            auth_create_count: diagAccumulator.authCreateCount,
+            assignment_lookup_count: diagAccumulator.assignmentLookupCount,
+            assignment_create_count: diagAccumulator.assignmentCreateCount,
+            observation_insert_count: diagAccumulator.observationInsertCount,
+          },
+          timing_ms: {
+            iteration_total_ms: iterTotal,
+            iteration_min_ms: iterMin,
+            iteration_max_ms: iterMax,
+            iteration_mean_ms: iterMean,
+            iteration_p50_ms: p50,
+            iteration_p95_ms: p95,
+            first_10_mean_ms: first10Mean,
+            last_10_mean_ms: last10Mean,
+            auth_lookup_total_ms: diagAccumulator.authLookupTotalMs,
+            auth_create_total_ms: diagAccumulator.authCreateTotalMs,
+            assignment_lookup_total_ms: diagAccumulator.assignmentLookupTotalMs,
+            assignment_create_total_ms: diagAccumulator.assignmentCreateTotalMs,
+            observation_insert_total_ms: diagAccumulator.observationInsertTotalMs,
+            watermark_ms: watermarkMs,
+            routing_evaluation_ms: routingEvalMs,
+          },
+          telemetry: {
+            rss_bytes: process.memoryUsage().rss,
+            heap_used_bytes: process.memoryUsage().heapUsed,
+            system_free_memory_bytes: os.freemem(),
+          },
+        };
+        console.log('R5I5_DIAG ' + JSON.stringify(record));
+      }
+    }
   });
 
   // ============================================================

@@ -63,8 +63,65 @@ jobs:
       - name: Install dependencies
         run: npm ci
 
+      - name: Windows Diagnostic Pre-Test Envelope
+        if: runner.os == 'Windows'
+        shell: bash
+        run: |
+          node -e "
+            const os = require('os');
+            const record = {
+              marker: 'R5I5_DIAG',
+              schema_version: '1.0',
+              run_context: 'github_actions',
+              scope: 'workflow_envelope',
+              phase: 'pre_test',
+              event: 'PRE_TEST_ENVELOPE',
+              wall_clock_utc: new Date().toISOString(),
+              github_job: '${{ github.job }}',
+              github_run_id: '${{ github.run_id }}',
+              github_run_attempt: '${{ github.run_attempt }}',
+              github_sha: '${{ github.sha }}',
+              github_event_name: '${{ github.event_name }}',
+              platform: process.platform,
+              arch: process.arch,
+              node_version: process.version,
+              system_total_memory_bytes: os.totalmem(),
+              system_free_memory_bytes: os.freemem()
+            };
+            console.log('R5I5_DIAG ' + JSON.stringify(record));
+          "
+          echo "R5I5_DIAG=1" >> $GITHUB_ENV
+
       - name: Run test suite
         run: npm test
+
+      - name: Windows Diagnostic Post-Test Envelope
+        if: always() && runner.os == 'Windows'
+        shell: bash
+        run: |
+          node -e "
+            const os = require('os');
+            const record = {
+              marker: 'R5I5_DIAG',
+              schema_version: '1.0',
+              run_context: 'github_actions',
+              scope: 'workflow_envelope',
+              phase: 'post_test',
+              event: 'POST_TEST_ENVELOPE',
+              wall_clock_utc: new Date().toISOString(),
+              github_job: '${{ github.job }}',
+              github_run_id: '${{ github.run_id }}',
+              github_run_attempt: '${{ github.run_attempt }}',
+              github_sha: '${{ github.sha }}',
+              github_event_name: '${{ github.event_name }}',
+              platform: process.platform,
+              node_version: process.version,
+              system_total_memory_bytes: os.totalmem(),
+              system_free_memory_bytes: os.freemem()
+            };
+            console.log('R5I5_DIAG ' + JSON.stringify(record));
+          "
+          echo "R5I5_DIAG=0" >> $GITHUB_ENV
 
       - name: Build application
         run: npm run build
