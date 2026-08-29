@@ -14,6 +14,7 @@ export type RuntimeErrorCode =
   | 'POLICY_DENIAL'
   | 'EXECUTION_FAILED'
   | 'SETTLEMENT_FAILED'
+  | 'RECOVERY_FENCED'
   | 'UNKNOWN';
 
 export interface QuotaSnapshotInfo {

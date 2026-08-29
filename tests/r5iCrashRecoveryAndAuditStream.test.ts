@@ -986,11 +986,15 @@ describe('R5I6 Crash Recovery, Execution Lifecycle Linearization, and Durable Au
       executionId: 'exec-1',
       expectedEpoch: 2,
     });
+    const termEvidenceJson = canonicalJsonStringify({ timeoutMs: 30000 });
     repo.confirmExecutionTermination({
       authorizationId: auth.id,
       executionId: 'exec-1',
       terminationStatus: 'CONFIRMED_TERMINATED',
       terminationSource: 'PROVIDER_ADAPTER_TIMEOUT',
+      terminationReason: 'EXECUTION_TIMEOUT',
+      terminationProofSource: 'PROVIDER_FINAL_ACK',
+      terminationEvidenceJson: termEvidenceJson,
     });
 
     const report = scanner.scanAndReconcile();
@@ -1020,11 +1024,15 @@ describe('R5I6 Crash Recovery, Execution Lifecycle Linearization, and Durable Au
       executionId: 'exec-1',
       expectedEpoch: 2,
     });
+    const termEvidenceJson = canonicalJsonStringify({ cancelledBy: 'OPERATOR' });
     repo.confirmExecutionTermination({
       authorizationId: auth.id,
       executionId: 'exec-1',
       terminationStatus: 'CONFIRMED_TERMINATED',
       terminationSource: 'OPERATOR_CANCELLED',
+      terminationReason: 'EXECUTION_CANCELLED',
+      terminationProofSource: 'LOCAL_PROCESS_EXIT',
+      terminationEvidenceJson: termEvidenceJson,
     });
 
     const report = scanner.scanAndReconcile();
@@ -1049,6 +1057,9 @@ describe('R5I6 Crash Recovery, Execution Lifecycle Linearization, and Durable Au
       executionId: 'exec-wrong',
       terminationStatus: 'CONFIRMED_TERMINATED',
       terminationSource: 'PROVIDER_TIMEOUT',
+      terminationReason: 'EXECUTION_TIMEOUT',
+      terminationProofSource: 'PROVIDER_FINAL_ACK',
+      terminationEvidenceJson: '{"test":true}',
     });
     expect(confirmRes.success).toBe(false);
     expect(confirmRes.error).toContain('EXECUTION_ID_MISMATCH');
@@ -1063,17 +1074,25 @@ describe('R5I6 Crash Recovery, Execution Lifecycle Linearization, and Durable Au
       executionId: 'exec-1',
       expectedEpoch: 2,
     });
+    const termEvidenceJsonA = canonicalJsonStringify({ source: 'A' });
+    const termEvidenceJsonB = canonicalJsonStringify({ source: 'B' });
     repo.confirmExecutionTermination({
       authorizationId: auth.id,
       executionId: 'exec-1',
       terminationStatus: 'CONFIRMED_TERMINATED',
       terminationSource: 'TIMEOUT_A',
+      terminationReason: 'EXECUTION_TIMEOUT',
+      terminationProofSource: 'LOCAL_PROCESS_EXIT',
+      terminationEvidenceJson: termEvidenceJsonA,
     });
     const res2 = repo.confirmExecutionTermination({
       authorizationId: auth.id,
       executionId: 'exec-1',
       terminationStatus: 'CONFIRMED_TERMINATED',
       terminationSource: 'TIMEOUT_B',
+      terminationReason: 'EXECUTION_TIMEOUT',
+      terminationProofSource: 'LOCAL_PROCESS_EXIT',
+      terminationEvidenceJson: termEvidenceJsonB,
     });
     expect(res2.success).toBe(false);
     expect(res2.error).toContain('TERMINATION_SOURCE_CONFLICT');
@@ -1130,7 +1149,7 @@ describe('R5I6 Crash Recovery, Execution Lifecycle Linearization, and Durable Au
       project_id: auth.project_id,
       attempt_id: auth.attempt_id,
       assignment_id: auth.assignment_id,
-      status: 'COMPLETED',
+      settlement_status: 'COMPLETED',
       outcome: 'RETURNED',
       finished_at: nowIso,
       result_payload: { status: 'COMPLETED' },
@@ -1173,6 +1192,12 @@ describe('R5I6 Crash Recovery, Execution Lifecycle Linearization, and Durable Au
       leaseToken: leaseRes.lease.lease_token,
       expectedSuccessorEpoch: 2,
     });
+    repo.claimExecutionAuthorization(auth.id, new Date().toISOString());
+    repo.claimAdapterExecutionStart({
+      authorizationId: auth.id,
+      executionId: 'exec-1',
+      expectedEpoch: 2,
+    });
 
     const nowIso = new Date().toISOString();
     const evidencePayload = {
@@ -1183,7 +1208,7 @@ describe('R5I6 Crash Recovery, Execution Lifecycle Linearization, and Durable Au
       project_id: auth.project_id,
       attempt_id: auth.attempt_id,
       assignment_id: auth.assignment_id,
-      status: 'COMPLETED',
+      settlement_status: 'COMPLETED',
       outcome: 'RETURNED',
       finished_at: nowIso,
       result_payload: { status: 'COMPLETED' },
@@ -1197,6 +1222,7 @@ describe('R5I6 Crash Recovery, Execution Lifecycle Linearization, and Durable Au
       UPDATE execution_authorizations
       SET adapter_started_at = datetime('now'),
           adapter_finished_at = datetime('now'),
+          settlement_status = 'COMPLETED',
           settled_at = datetime('now'),
           adapter_outcome = 'RETURNED',
           settlement_evidence_json = ?,
@@ -1277,24 +1303,26 @@ describe('R5I6 Crash Recovery, Execution Lifecycle Linearization, and Durable Au
     expect(report.items[0].disposition).toBe('REJECTED_INTEGRITY_CONFLICT');
   });
 
-  // 31. Evidence-hash corruption is rejected
+  // 31. Settle execution result detects hash mismatch
   it('31. should reject settlement conflict if evidence hash does not match', async () => {
     const { auth } = await seedStandardTopology();
-    const leaseRes = leaseService.acquireForAssignment('asgn-succ', 60000) as SlotLeaseSuccess;
-    repo.acceptHandoffSuccessorExecution({
+    repo.claimExecutionAuthorization(auth.id, new Date().toISOString());
+    repo.claimAdapterExecutionStart({
       authorizationId: auth.id,
-      leaseId: leaseRes.lease.id,
-      leaseToken: leaseRes.lease.lease_token,
-      expectedSuccessorEpoch: 2,
+      executionId: 'exec-1',
+      expectedEpoch: 2,
     });
+
     const dummyHash = computeSha256('dummy-settlement-payload');
     db.prepare(`
       UPDATE execution_authorizations
-      SET settled_at = datetime('now'),
+      SET settlement_status = 'COMPLETED',
+          settled_at = datetime('now'),
           adapter_started_at = datetime('now'),
           adapter_outcome = 'RETURNED',
           status = 'DISPATCHED',
           execution_id = 'exec-1',
+          settlement_evidence_json = '{"dummy":true}',
           settlement_evidence_hash = ?
       WHERE id = ?
     `).run(dummyHash, auth.id);
@@ -1344,7 +1372,9 @@ describe('R5I6 Crash Recovery, Execution Lifecycle Linearization, and Durable Au
     const res1 = await seedStandardTopology({ transferId: 'xfer-1', taskId: 'tsk-1', attemptPredId: 'att-pred-1', attemptSuccId: 'att-succ-1', asgnPredId: 'asgn-pred-1', asgnSuccId: 'asgn-succ-1' });
     const res2 = await seedStandardTopology({ transferId: 'xfer-2', taskId: 'tsk-2', attemptPredId: 'att-pred-2', attemptSuccId: 'att-succ-2', asgnPredId: 'asgn-pred-2', asgnSuccId: 'asgn-succ-2' });
 
-    // Arm candidate 1 as DISPATCHED
+    // Arm candidate 1 as DISPATCHED with expired lease
+    const leaseRes1 = leaseService.acquireForAssignment('asgn-succ-1', 60000) as SlotLeaseSuccess;
+    db.prepare(`UPDATE account_leases SET expires_at = datetime('now', '-10 seconds') WHERE id = ?`).run(leaseRes1.lease.id);
     db.prepare(`UPDATE execution_authorizations SET lifecycle_version = 1, status = 'DISPATCHED' WHERE id = ?`).run(res1.auth.id);
 
     // Corrupt binding on transfer 2 to a valid mismatched task
@@ -1370,6 +1400,8 @@ describe('R5I6 Crash Recovery, Execution Lifecycle Linearization, and Durable Au
       leaseToken: leaseRes.lease.lease_token,
       expectedSuccessorEpoch: 2,
     });
+    repo.claimExecutionAuthorization(auth.id, new Date().toISOString());
+    db.prepare(`UPDATE account_leases SET expires_at = datetime('now', '-10 seconds') WHERE id = ?`).run(leaseRes.lease.id);
 
     // First scan reconciles and emits event
     scanner.scanAndReconcile();
@@ -1557,7 +1589,8 @@ describe('R5I6 Crash Recovery, Execution Lifecycle Linearization, and Durable Au
     const { auth } = await seedStandardTopology();
     db.prepare(`
       UPDATE execution_authorizations
-      SET settled_at = datetime('now'),
+      SET settlement_status = 'COMPLETED',
+          settled_at = datetime('now'),
           adapter_outcome = 'RETURNED',
           settlement_evidence_json = '{"authorization_id":"${auth.id}","execution_id":"exec-1","tampered":true}',
           settlement_evidence_hash = 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'
@@ -1575,7 +1608,8 @@ describe('R5I6 Crash Recovery, Execution Lifecycle Linearization, and Durable Au
     const { auth } = await seedStandardTopology();
     db.prepare(`
       UPDATE execution_authorizations
-      SET settled_at = datetime('now'),
+      SET settlement_status = 'COMPLETED',
+          settled_at = datetime('now'),
           adapter_outcome = 'RETURNED',
           settlement_evidence_json = '{malformed json',
           settlement_evidence_hash = 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'
@@ -1645,7 +1679,7 @@ describe('R5I6 Crash Recovery, Execution Lifecycle Linearization, and Durable Au
     // Set unknown termination source
     db.prepare(`
       UPDATE execution_authorizations
-      SET termination_status = 'CONFIRMED_TERMINATED',
+      SET termination_status = 'UNRESOLVED',
           termination_source = 'UNKNOWN_EXTERNAL_SIGNAL'
       WHERE id = ?
     `).run(auth.id);

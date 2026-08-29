@@ -196,6 +196,7 @@ export class ProviderDispatchService {
       return {
         executionId,
         status: 'FAILED',
+        errorCode: 'RECOVERY_FENCED',
         error: `EXECUTION_AUTHORIZATION_ALREADY_DISPATCHED: Execution authorization "${authorizationId}" has already been consumed.`,
       };
     }
@@ -1286,14 +1287,13 @@ export class ProviderDispatchService {
         executionId,
         expectedEpoch,
         expectedLifecycleVersion: 1,
-        startedAt: nowIso,
       });
       // ONLY a newly successful claim (!alreadyClaimed && success) may proceed to adapter invocation
       if (!startClaim.success || startClaim.alreadyClaimed) {
         return {
           executionId,
           status: 'FAILED',
-          errorCode: 'RESOURCE_UNAVAILABLE',
+          errorCode: 'RECOVERY_FENCED',
           error: `ADAPTER_START_CLAIM_FAILED: Could not claim adapter start (${startClaim.error || (startClaim.alreadyClaimed ? 'ALREADY_CLAIMED' : 'CLAIM_REJECTED')}).`,
         };
       }

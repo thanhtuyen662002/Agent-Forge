@@ -1224,15 +1224,40 @@ export const MIGRATIONS: Migration[] = [
         ADD COLUMN termination_evidence_json TEXT NULL;
 
         ALTER TABLE execution_authorizations
+        ADD COLUMN terminated_at TEXT NULL;
+
+        ALTER TABLE execution_authorizations
         ADD COLUMN termination_evidence_hash TEXT NULL CHECK (
-          termination_evidence_hash IS NULL OR (
+          (
+            termination_status IS NULL AND
+            termination_source IS NULL AND
+            termination_reason IS NULL AND
+            termination_proof_source IS NULL AND
+            termination_confirmed_at IS NULL AND
+            terminated_at IS NULL AND
+            termination_evidence_json IS NULL AND
+            termination_evidence_hash IS NULL
+          ) OR (
+            termination_status = 'UNRESOLVED' AND
+            termination_confirmed_at IS NULL AND
+            terminated_at IS NULL AND
+            (
+              (termination_evidence_json IS NULL AND termination_evidence_hash IS NULL) OR
+              (termination_evidence_json IS NOT NULL AND termination_evidence_hash IS NOT NULL AND length(termination_evidence_hash) = 64 AND termination_evidence_hash GLOB '[0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]')
+            )
+          ) OR (
+            termination_status = 'CONFIRMED_TERMINATED' AND
+            termination_source IS NOT NULL AND
+            termination_reason IS NOT NULL AND
+            termination_proof_source IS NOT NULL AND
+            termination_confirmed_at IS NOT NULL AND
+            terminated_at IS NOT NULL AND
+            termination_evidence_json IS NOT NULL AND
+            termination_evidence_hash IS NOT NULL AND
             length(termination_evidence_hash) = 64 AND
             termination_evidence_hash GLOB '[0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]'
           )
         );
-
-        ALTER TABLE execution_authorizations
-        ADD COLUMN terminated_at TEXT NULL;
 
         ALTER TABLE execution_authorizations
         ADD COLUMN settled_at TEXT NULL;
@@ -1242,7 +1267,11 @@ export const MIGRATIONS: Migration[] = [
 
         ALTER TABLE execution_authorizations
         ADD COLUMN settlement_evidence_hash TEXT NULL CHECK (
-          settlement_evidence_hash IS NULL OR (
+          (settlement_status IS NULL AND settled_at IS NULL AND settlement_evidence_json IS NULL AND settlement_evidence_hash IS NULL) OR (
+            settlement_status IS NOT NULL AND
+            settled_at IS NOT NULL AND
+            settlement_evidence_json IS NOT NULL AND
+            settlement_evidence_hash IS NOT NULL AND
             length(settlement_evidence_hash) = 64 AND
             settlement_evidence_hash GLOB '[0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]'
           )

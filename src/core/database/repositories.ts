@@ -1368,10 +1368,11 @@ export class Repository {
             canonical_instructions_json, context_files_json, canonical_payload_json, status,
             created_at, dispatched_at, task_ownership_epoch, assignment_id, lifecycle_version, execution_id,
             adapter_started_at, adapter_finished_at, adapter_outcome, adapter_error_json,
-            cancellation_requested_at, termination_confirmed_at,
-            termination_status, termination_source, terminated_at, settled_at,
+            settlement_status, cancellation_requested_at, termination_confirmed_at,
+            termination_status, termination_source, termination_reason, termination_proof_source,
+            termination_evidence_json, termination_evidence_hash, terminated_at, settled_at,
             settlement_evidence_json, settlement_evidence_hash
-          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         `)
         .run(
           auth.id,
@@ -1402,10 +1403,15 @@ export class Repository {
           auth.adapter_finished_at ?? null,
           auth.adapter_outcome ?? null,
           auth.adapter_error_json ?? null,
+          auth.settlement_status ?? null,
           auth.cancellation_requested_at ?? null,
           auth.termination_confirmed_at ?? null,
           auth.termination_status ?? null,
           auth.termination_source ?? null,
+          auth.termination_reason ?? null,
+          auth.termination_proof_source ?? null,
+          auth.termination_evidence_json ?? null,
+          auth.termination_evidence_hash ?? null,
           auth.terminated_at ?? null,
           auth.settled_at ?? null,
           auth.settlement_evidence_json ?? null,
@@ -1581,8 +1587,8 @@ export class Repository {
       }
 
       // Lifecycle version fencing: if auth has lifecycle_version, must match expected
+      const expectedLifecycle = params.expectedLifecycleVersion !== undefined ? params.expectedLifecycleVersion : 1;
       if (auth.lifecycle_version !== null && auth.lifecycle_version !== undefined) {
-        const expectedLifecycle = params.expectedLifecycleVersion !== undefined ? params.expectedLifecycleVersion : 1;
         if (auth.lifecycle_version !== expectedLifecycle) {
           return {
             success: false,
@@ -1612,7 +1618,7 @@ export class Repository {
       // Check if already started
       if (auth.adapter_started_at) {
         if (auth.execution_id === params.executionId) {
-          return { success: true, alreadyClaimed: true };
+          return { success: true, alreadyClaimed: true, startedAt: auth.adapter_started_at };
         }
         return {
           success: false,
@@ -1621,21 +1627,40 @@ export class Repository {
         };
       }
 
+      // Generate adapter_started_at immediately inside the transaction before the CAS
       const startedAt = params.startedAt ?? new Date().toISOString();
       const res = this.db
         .prepare(`
           UPDATE execution_authorizations
           SET execution_id = ?, adapter_started_at = ?
-          WHERE id = ? AND adapter_started_at IS NULL
+          WHERE id = ?
             AND status = 'DISPATCHED'
+            AND adapter_started_at IS NULL
+            AND execution_id IS NULL
+            AND (lifecycle_version IS NULL OR lifecycle_version = ?)
+            AND (task_ownership_epoch IS NULL OR task_ownership_epoch = ?)
         `)
-        .run(params.executionId, startedAt, params.authorizationId);
+        .run(params.executionId, startedAt, params.authorizationId, expectedLifecycle, params.expectedEpoch);
 
       if (res.changes !== 1) {
         return { success: false, alreadyClaimed: false, error: 'START_CLAIM_CAS_FAILED' };
       }
 
-      return { success: true, alreadyClaimed: false };
+      // Stamp current_execution_id on worker_slot if slot is bound to assignment
+      if (auth.assignment_id) {
+        const assignment = this.getAgentAssignment(auth.assignment_id);
+        if (assignment && assignment.selected_worker_slot_id) {
+          this.db
+            .prepare(`
+              UPDATE worker_slots
+              SET current_execution_id = ?, updated_at = ?
+              WHERE id = ? AND status = 'LEASED' AND current_assignment_id = ? AND (current_execution_id IS NULL OR current_execution_id = ?)
+            `)
+            .run(params.executionId, startedAt, assignment.selected_worker_slot_id, assignment.id, params.executionId);
+        }
+      }
+
+      return { success: true, alreadyClaimed: false, startedAt };
     });
   }
 
@@ -1838,29 +1863,72 @@ export class Repository {
       }
 
       // 8. Canonical evidence payload & idempotency check
-      const canonicalEvidence = {
-        authorization_id: auth.id,
-        execution_id: params.executionId,
-        lifecycle_version: auth.lifecycle_version,
-        task_id: auth.task_id,
-        project_id: auth.project_id,
-        attempt_id: auth.attempt_id ?? null,
-        assignment_id: auth.assignment_id ?? null,
-        settlement_status: params.status,
-        outcome: params.outcome,
-        finished_at: finishedAt,
-        result_payload: params.resultPayload,
-        error_json: params.errorJson ?? null,
-      };
-      const canonicalEvidenceJson = canonicalJsonStringify(canonicalEvidence);
-      const evidenceHash = computeSha256(canonicalEvidenceJson);
-
-      // Idempotency check: if already settled
+      // If already settled, verify stored evidence integrity and evaluate semantic idempotency
       if (auth.settled_at) {
+        if (!auth.settlement_status) {
+          return {
+            success: false,
+            alreadySettled: false,
+            settledAt: auth.settled_at,
+            evidenceHash: auth.settlement_evidence_hash || '',
+            error: `SETTLEMENT_CORRUPTION: Authorization "${auth.id}" is marked settled but has null settlement_status.`,
+          };
+        }
+        if (!auth.settlement_evidence_json || !auth.settlement_evidence_hash) {
+          return {
+            success: false,
+            alreadySettled: false,
+            settledAt: auth.settled_at,
+            evidenceHash: auth.settlement_evidence_hash || '',
+            error: `SETTLEMENT_CONFLICT: Authorization "${auth.id}" is marked settled but missing settlement evidence JSON/hash.`,
+          };
+        }
+        let storedEvidence: any;
+        try {
+          storedEvidence = JSON.parse(auth.settlement_evidence_json);
+          const computedStoredHash = computeSha256(canonicalJsonStringify(storedEvidence));
+          if (computedStoredHash !== auth.settlement_evidence_hash) {
+            return {
+              success: false,
+              alreadySettled: false,
+              settledAt: auth.settled_at,
+              evidenceHash: auth.settlement_evidence_hash,
+              error: `SETTLEMENT_CONFLICT: Stored settlement evidence hash mismatch: stored "${auth.settlement_evidence_hash}", recomputed "${computedStoredHash}".`,
+            };
+          }
+        } catch (e: any) {
+          return {
+            success: false,
+            alreadySettled: false,
+            settledAt: auth.settled_at,
+            evidenceHash: auth.settlement_evidence_hash,
+            error: `SETTLEMENT_CONFLICT: Stored settlement evidence JSON is malformed: ${e.message}`,
+          };
+        }
+
+        // Support semantic replay with omitted finishedAt: use the stored finished timestamp
+        const effectiveFinishedAt = params.finishedAt ?? storedEvidence.finished_at ?? auth.settled_at;
+        const replayEvidence = {
+          authorization_id: auth.id,
+          execution_id: params.executionId,
+          lifecycle_version: auth.lifecycle_version,
+          task_id: auth.task_id,
+          project_id: auth.project_id,
+          attempt_id: auth.attempt_id ?? null,
+          assignment_id: auth.assignment_id ?? null,
+          settlement_status: params.status,
+          outcome: params.outcome,
+          finished_at: effectiveFinishedAt,
+          result_payload: params.resultPayload,
+          error_json: params.errorJson ?? null,
+        };
+        const replayEvidenceHash = computeSha256(canonicalJsonStringify(replayEvidence));
+
         if (
-          auth.settlement_evidence_hash === evidenceHash &&
+          auth.settlement_evidence_hash === replayEvidenceHash &&
           auth.adapter_outcome === params.outcome &&
-          (auth.settlement_status === params.status || auth.settlement_status === null)
+          auth.settlement_status === params.status &&
+          auth.execution_id === params.executionId
         ) {
           return {
             success: true,
@@ -1878,7 +1946,44 @@ export class Repository {
         };
       }
 
+      const canonicalEvidence = {
+        authorization_id: auth.id,
+        execution_id: params.executionId,
+        lifecycle_version: auth.lifecycle_version,
+        task_id: auth.task_id,
+        project_id: auth.project_id,
+        attempt_id: auth.attempt_id ?? null,
+        assignment_id: auth.assignment_id ?? null,
+        settlement_status: params.status,
+        outcome: params.outcome,
+        finished_at: finishedAt,
+        result_payload: params.resultPayload,
+        error_json: params.errorJson ?? null,
+      };
+      const canonicalEvidenceJson = canonicalJsonStringify(canonicalEvidence);
+      const evidenceHash = computeSha256(canonicalEvidenceJson);
+
       // 9. Validate complete binding graph
+      if (
+        !auth.task_id ||
+        !auth.project_id ||
+        !auth.attempt_id ||
+        !auth.assignment_id ||
+        !auth.selected_provider_id ||
+        !auth.selected_resource_id ||
+        !auth.routing_decision_id ||
+        auth.task_ownership_epoch === null ||
+        auth.task_ownership_epoch === undefined
+      ) {
+        return {
+          success: false,
+          alreadySettled: false,
+          settledAt: '',
+          evidenceHash: '',
+          error: `BINDING_MISMATCH: Authorization "${auth.id}" has missing or null required lifecycle bindings.`,
+        };
+      }
+
       const transfer = this.getHandoffTransferBySuccessorAuthId(auth.id);
       if (!transfer) {
         return {
@@ -1910,22 +2015,13 @@ export class Repository {
         };
       }
 
-      if (!transfer.successor_attempt_id) {
+      if (!transfer.successor_attempt_id || transfer.successor_attempt_id !== auth.attempt_id) {
         return {
           success: false,
           alreadySettled: false,
           settledAt: '',
           evidenceHash: '',
-          error: `BINDING_MISMATCH: Transfer "${transfer.id}" has no successor_attempt_id.`,
-        };
-      }
-      if (auth.attempt_id && transfer.successor_attempt_id !== auth.attempt_id) {
-        return {
-          success: false,
-          alreadySettled: false,
-          settledAt: '',
-          evidenceHash: '',
-          error: `BINDING_MISMATCH: Transfer attempt "${transfer.successor_attempt_id}" !== auth attempt "${auth.attempt_id}".`,
+          error: `BINDING_MISMATCH: Transfer successor_attempt_id "${transfer.successor_attempt_id}" !== auth attempt "${auth.attempt_id}".`,
         };
       }
 
@@ -1958,22 +2054,13 @@ export class Repository {
         };
       }
 
-      if (!transfer.successor_assignment_id) {
+      if (!transfer.successor_assignment_id || transfer.successor_assignment_id !== auth.assignment_id) {
         return {
           success: false,
           alreadySettled: false,
           settledAt: '',
           evidenceHash: '',
-          error: `BINDING_MISMATCH: Transfer "${transfer.id}" has no successor_assignment_id.`,
-        };
-      }
-      if (auth.assignment_id && transfer.successor_assignment_id !== auth.assignment_id) {
-        return {
-          success: false,
-          alreadySettled: false,
-          settledAt: '',
-          evidenceHash: '',
-          error: `BINDING_MISMATCH: Transfer assignment "${transfer.successor_assignment_id}" !== auth assignment "${auth.assignment_id}".`,
+          error: `BINDING_MISMATCH: Transfer successor_assignment_id "${transfer.successor_assignment_id}" !== auth assignment "${auth.assignment_id}".`,
         };
       }
 
@@ -2041,10 +2128,19 @@ export class Repository {
           error: `BINDING_MISMATCH: Assignment account "${assignment.selected_account_id}" !== auth account "${auth.selected_account_id}".`,
         };
       }
+      if (assignment.routing_decision_id !== auth.routing_decision_id) {
+        return {
+          success: false,
+          alreadySettled: false,
+          settledAt: '',
+          evidenceHash: '',
+          error: `BINDING_MISMATCH: Assignment routing "${assignment.routing_decision_id}" !== auth routing "${auth.routing_decision_id}".`,
+        };
+      }
 
       // Check task ownership epoch agreement
       const currentTaskEpoch = this.getTaskOwnershipEpoch(auth.task_id);
-      if (auth.task_ownership_epoch !== undefined && auth.task_ownership_epoch !== null && auth.task_ownership_epoch !== currentTaskEpoch) {
+      if (auth.task_ownership_epoch !== currentTaskEpoch) {
         return {
           success: false,
           alreadySettled: false,
@@ -2053,7 +2149,7 @@ export class Repository {
           error: `OWNERSHIP_EPOCH_MISMATCH: Auth task epoch "${auth.task_ownership_epoch}" !== current task epoch "${currentTaskEpoch}".`,
         };
       }
-      if (transfer.successor_ownership_epoch !== undefined && transfer.successor_ownership_epoch !== null && transfer.successor_ownership_epoch !== currentTaskEpoch) {
+      if (transfer.successor_ownership_epoch !== currentTaskEpoch) {
         return {
           success: false,
           alreadySettled: false,
@@ -2064,7 +2160,7 @@ export class Repository {
       }
 
       // Atomic persistence across all entities in this transaction
-      // 1. Update execution_authorizations
+      // 1. Update execution_authorizations with strict status, executionId, and lifecycle CAS predicate
       const authRes = this.db
         .prepare(`
           UPDATE execution_authorizations
@@ -2075,7 +2171,11 @@ export class Repository {
               settled_at = ?,
               settlement_evidence_json = ?,
               settlement_evidence_hash = ?
-          WHERE id = ? AND settled_at IS NULL AND status = 'DISPATCHED'
+          WHERE id = ?
+            AND settled_at IS NULL
+            AND status = 'DISPATCHED'
+            AND execution_id = ?
+            AND (lifecycle_version IS NULL OR lifecycle_version = 1)
         `)
         .run(
           params.status,
@@ -2085,7 +2185,8 @@ export class Repository {
           finishedAt,
           canonicalEvidenceJson,
           evidenceHash,
-          auth.id
+          auth.id,
+          params.executionId
         );
 
       if (authRes.changes !== 1) {
@@ -2322,12 +2423,41 @@ export class Repository {
       }
 
       if (params.terminationStatus === 'CONFIRMED_TERMINATED') {
+        if (
+          !params.terminationSource ||
+          !params.terminationReason ||
+          !params.terminationProofSource ||
+          !params.terminationEvidenceJson ||
+          !evidenceHash
+        ) {
+          return {
+            success: false,
+            alreadyConfirmed: false,
+            error: 'INSUFFICIENT_TERMINATION_PROOF: Confirmed termination requires explicit terminationSource, terminationReason, terminationProofSource, and terminationEvidenceJson.',
+          };
+        }
+
+        if (
+          params.terminationProofSource !== 'LOCAL_PROCESS_EXIT' &&
+          params.terminationProofSource !== 'PROVIDER_FINAL_ACK'
+        ) {
+          return {
+            success: false,
+            alreadyConfirmed: false,
+            error: `INVALID_PROOF_SOURCE: "${params.terminationProofSource}" cannot confirm termination (requires LOCAL_PROCESS_EXIT or PROVIDER_FINAL_ACK).`,
+          };
+        }
+
         const confirmedAt = params.confirmedAt ?? new Date().toISOString();
         const terminatedAt = params.terminatedAt ?? confirmedAt;
-        const defaultReason = params.terminationSource?.includes('CANCEL') ? 'EXECUTION_CANCELLED' : 'EXECUTION_TIMEOUT';
-        const defaultProof = params.terminationSource?.includes('PROVIDER') ? 'PROVIDER_FINAL_ACK' : 'LOCAL_PROCESS_EXIT';
-        const reason = params.terminationReason ?? defaultReason;
-        const proofSource = params.terminationProofSource ?? defaultProof;
+        if (new Date(terminatedAt).getTime() > new Date(confirmedAt).getTime()) {
+          return {
+            success: false,
+            alreadyConfirmed: false,
+            error: `NON_MONOTONIC_TIMESTAMPS: terminated_at "${terminatedAt}" cannot succeed confirmed_at "${confirmedAt}".`,
+          };
+        }
+
         const res = this.db
           .prepare(`
             UPDATE execution_authorizations
@@ -2342,10 +2472,10 @@ export class Repository {
             WHERE id = ? AND execution_id = ?
           `)
           .run(
-            params.terminationSource ?? null,
-            reason,
-            proofSource,
-            params.terminationEvidenceJson ?? null,
+            params.terminationSource,
+            params.terminationReason,
+            params.terminationProofSource,
+            params.terminationEvidenceJson,
             evidenceHash,
             confirmedAt,
             terminatedAt,

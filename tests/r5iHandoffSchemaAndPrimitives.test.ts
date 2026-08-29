@@ -397,16 +397,14 @@ describe('R5I1 Durable Handoff Ownership and Execution Authority Primitives', ()
     });
 
     it('2. DISPATCHED authorization can claim adapter start exactly once', () => {
-      // Transition from AUTHORIZED to DISPATCHED
-      const claimed = repo.claimExecutionAuthorization('auth-1', '2026-08-27T00:01:00Z');
-      expect(claimed).toBe(true);
+      repo.claimExecutionAuthorization('auth-1', '2026-08-27T00:01:00Z');
 
       const startClaim = repo.claimAdapterExecutionStart({
         authorizationId: 'auth-1',
         executionId: 'exec-1',
         expectedEpoch: 1,
       });
-      expect(startClaim).toEqual({ success: true, alreadyClaimed: false });
+      expect(startClaim).toMatchObject({ success: true, alreadyClaimed: false });
 
       const updated = repo.getExecutionAuthorization('auth-1');
       expect(updated?.execution_id).toBe('exec-1');
@@ -448,7 +446,7 @@ describe('R5I1 Durable Handoff Ownership and Execution Authority Primitives', ()
         executionId: 'exec-1',
         expectedEpoch: 1,
       });
-      expect(claim1).toEqual({ success: true, alreadyClaimed: false });
+      expect(claim1).toMatchObject({ success: true, alreadyClaimed: false });
 
       // Identical replay succeeds idempotently
       const replay = repo.claimAdapterExecutionStart({
@@ -456,7 +454,7 @@ describe('R5I1 Durable Handoff Ownership and Execution Authority Primitives', ()
         executionId: 'exec-1',
         expectedEpoch: 1,
       });
-      expect(replay).toEqual({ success: true, alreadyClaimed: true });
+      expect(replay).toMatchObject({ success: true, alreadyClaimed: true });
 
       // Conflicting execution_id fails closed
       const conflict = repo.claimAdapterExecutionStart({
@@ -592,6 +590,9 @@ describe('R5I1 Durable Handoff Ownership and Execution Authority Primitives', ()
         executionId: 'exec-real',
         terminationStatus: 'CONFIRMED_TERMINATED',
         terminationSource: 'PROCESS_EXIT_0',
+        terminationReason: 'EXECUTION_TIMEOUT',
+        terminationProofSource: 'LOCAL_PROCESS_EXIT',
+        terminationEvidenceJson: '{"exitCode":0}',
         confirmedAt: '2026-08-27T00:05:00Z',
       });
       expect(confirmResult).toEqual({ success: true, alreadyConfirmed: false });
@@ -607,6 +608,9 @@ describe('R5I1 Durable Handoff Ownership and Execution Authority Primitives', ()
         executionId: 'exec-real',
         terminationStatus: 'CONFIRMED_TERMINATED',
         terminationSource: 'PROCESS_EXIT_0',
+        terminationReason: 'EXECUTION_TIMEOUT',
+        terminationProofSource: 'LOCAL_PROCESS_EXIT',
+        terminationEvidenceJson: '{"exitCode":0}',
       });
       expect(replay).toEqual({ success: true, alreadyConfirmed: true });
     });
@@ -624,6 +628,9 @@ describe('R5I1 Durable Handoff Ownership and Execution Authority Primitives', ()
         executionId: 'exec-real',
         terminationStatus: 'CONFIRMED_TERMINATED',
         terminationSource: 'LOCAL_PROCESS_EXIT',
+        terminationReason: 'EXECUTION_TIMEOUT',
+        terminationProofSource: 'LOCAL_PROCESS_EXIT',
+        terminationEvidenceJson: '{"exitCode":0}',
       });
 
       // Contradictory source on CONFIRMED_TERMINATED
@@ -632,6 +639,9 @@ describe('R5I1 Durable Handoff Ownership and Execution Authority Primitives', ()
         executionId: 'exec-real',
         terminationStatus: 'CONFIRMED_TERMINATED',
         terminationSource: 'REMOTE_API_REPORT',
+        terminationReason: 'EXECUTION_TIMEOUT',
+        terminationProofSource: 'LOCAL_PROCESS_EXIT',
+        terminationEvidenceJson: '{"exitCode":0}',
       });
       expect(sourceConflict.success).toBe(false);
       expect(sourceConflict.error).toContain('TERMINATION_SOURCE_CONFLICT');

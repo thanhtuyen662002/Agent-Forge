@@ -214,7 +214,12 @@ export class ExecutionRecoveryScanner {
         }
       }
 
-      // 1b. Check Ownership Epoch Integrity
+      // 1b. Check WorkerSlot IDLE State Cleanliness
+      if (!bindingConflictReason && workerSlot && workerSlot.status === 'IDLE' && (workerSlot.current_assignment_id !== null || workerSlot.current_execution_id !== null)) {
+        bindingConflictReason = `WorkerSlot "${workerSlot.id}" is IDLE but has residual assignment "${workerSlot.current_assignment_id}" or execution "${workerSlot.current_execution_id}".`;
+      }
+
+      // 1c. Check Ownership Epoch Integrity
       const currentTaskEpoch = this.repo.getTaskOwnershipEpoch(auth.task_id);
       if (!bindingConflictReason) {
         if (transfer.successor_ownership_epoch !== undefined && transfer.successor_ownership_epoch !== null && transfer.successor_ownership_epoch !== currentTaskEpoch) {
@@ -224,10 +229,10 @@ export class ExecutionRecoveryScanner {
         }
       }
 
-      // 1c. Recompute and verify Settlement Evidence Integrity if settled
+      // 1d. Recompute and verify Settlement Evidence Integrity if settled
       let parsedSettlementEvidence: any = null;
       if (!bindingConflictReason && (auth.settled_at || auth.settlement_evidence_json || auth.settlement_evidence_hash || auth.settlement_status)) {
-        if (!auth.settled_at || !auth.settlement_evidence_json || !auth.settlement_evidence_hash) {
+        if (!auth.settled_at || !auth.settlement_evidence_json || !auth.settlement_evidence_hash || !auth.settlement_status) {
           bindingConflictReason = `Incomplete settlement evidence metadata for settled auth "${auth.id}".`;
         } else {
           try {
@@ -237,15 +242,20 @@ export class ExecutionRecoveryScanner {
               bindingConflictReason = `Settlement evidence hash mismatch: stored "${auth.settlement_evidence_hash}" !== recomputed "${recomputedHash}".`;
             } else if (parsedSettlementEvidence.authorization_id !== auth.id) {
               bindingConflictReason = `Settlement evidence authorization_id "${parsedSettlementEvidence.authorization_id}" !== auth id "${auth.id}".`;
-            } else if (parsedSettlementEvidence.execution_id && auth.execution_id && parsedSettlementEvidence.execution_id !== auth.execution_id) {
+            } else if (parsedSettlementEvidence.execution_id !== auth.execution_id) {
               bindingConflictReason = `Settlement evidence execution_id "${parsedSettlementEvidence.execution_id}" !== auth execution_id "${auth.execution_id}".`;
-            } else {
-              const evidenceStatus = parsedSettlementEvidence.settlement_status || parsedSettlementEvidence.status;
-              if (!evidenceStatus && !auth.settlement_status) {
-                bindingConflictReason = `Missing settlement status in both auth and evidence.`;
-              } else if (auth.settlement_status && evidenceStatus && evidenceStatus !== auth.settlement_status) {
-                bindingConflictReason = `Settlement status mismatch: auth "${auth.settlement_status}" !== evidence "${evidenceStatus}".`;
-              }
+            } else if (parsedSettlementEvidence.task_id !== auth.task_id) {
+              bindingConflictReason = `Settlement evidence task_id "${parsedSettlementEvidence.task_id}" !== auth task_id "${auth.task_id}".`;
+            } else if (parsedSettlementEvidence.project_id !== auth.project_id) {
+              bindingConflictReason = `Settlement evidence project_id "${parsedSettlementEvidence.project_id}" !== auth project_id "${auth.project_id}".`;
+            } else if (parsedSettlementEvidence.attempt_id !== auth.attempt_id) {
+              bindingConflictReason = `Settlement evidence attempt_id "${parsedSettlementEvidence.attempt_id}" !== auth attempt_id "${auth.attempt_id}".`;
+            } else if (parsedSettlementEvidence.assignment_id !== auth.assignment_id) {
+              bindingConflictReason = `Settlement evidence assignment_id "${parsedSettlementEvidence.assignment_id}" !== auth assignment_id "${auth.assignment_id}".`;
+            } else if (auth.settlement_status && parsedSettlementEvidence.settlement_status !== auth.settlement_status) {
+              bindingConflictReason = `Settlement status mismatch: auth "${auth.settlement_status}" !== evidence "${parsedSettlementEvidence.settlement_status}".`;
+            } else if (auth.adapter_outcome && parsedSettlementEvidence.outcome !== auth.adapter_outcome) {
+              bindingConflictReason = `Adapter outcome mismatch: auth "${auth.adapter_outcome}" !== evidence "${parsedSettlementEvidence.outcome}".`;
             }
           } catch (e: any) {
             bindingConflictReason = `Malformed settlement evidence JSON: ${e.message}`;
@@ -253,13 +263,15 @@ export class ExecutionRecoveryScanner {
         }
       }
 
-      // 1d. Validate structured termination proof if confirmed with evidence
+      // 1e. Validate structured termination proof if confirmed with evidence
       if (!bindingConflictReason && auth.termination_status === 'CONFIRMED_TERMINATED') {
-        if (auth.termination_evidence_json) {
+        if (!auth.termination_evidence_json || !auth.termination_evidence_hash || !auth.termination_confirmed_at || !auth.terminated_at || !auth.termination_reason || !auth.termination_proof_source) {
+          bindingConflictReason = `Incomplete termination evidence for confirmed terminated auth "${auth.id}".`;
+        } else {
           try {
             const parsedTerm = JSON.parse(auth.termination_evidence_json);
             const computedTermHash = computeSha256(canonicalJsonStringify(parsedTerm));
-            if (auth.termination_evidence_hash && computedTermHash !== auth.termination_evidence_hash) {
+            if (computedTermHash !== auth.termination_evidence_hash) {
               bindingConflictReason = `Termination evidence hash mismatch: stored "${auth.termination_evidence_hash}" !== computed "${computedTermHash}".`;
             }
           } catch (e: any) {
@@ -456,11 +468,39 @@ export class ExecutionRecoveryScanner {
       // Check Classification A: PRE_ADAPTER_NOT_STARTED
       // Version-1 execution, adapter start was not claimed
       if (auth.lifecycle_version === 1 && !auth.adapter_started_at) {
-        const isLeaseActiveAndUnexpired = activeLease && new Date(activeLease.expires_at).getTime() > new Date(nowIso).getTime();
+        // Fresh AUTHORIZED records and unexpired active leases must cause NO database or event mutation
+        if (auth.status === 'AUTHORIZED') {
+          return {
+            authorizationId: auth.id,
+            transferId: transfer.id,
+            executionId: null,
+            lifecycleVersion: auth.lifecycle_version,
+            classification: 'PRE_ADAPTER_NOT_STARTED',
+            disposition: 'UNRESOLVED_FENCED',
+            mutatedTerminalState: false,
+            mutatedResources: false,
+            evidenceHash: '',
+          };
+        }
 
-        // Fresh AUTHORIZED records and unexpired active leases must not be terminalized
-        if (auth.status !== 'DISPATCHED' || isLeaseActiveAndUnexpired) {
-          const classification: ExecutionRecoveryClassification = 'PRE_ADAPTER_NOT_STARTED';
+        const isLeaseActiveAndUnexpired = activeLease && new Date(activeLease.expires_at).getTime() > new Date(nowIso).getTime();
+        if (isLeaseActiveAndUnexpired) {
+          return {
+            authorizationId: auth.id,
+            transferId: transfer.id,
+            executionId: auth.execution_id ?? null,
+            lifecycleVersion: auth.lifecycle_version,
+            classification: 'PRE_ADAPTER_NOT_STARTED',
+            disposition: 'UNRESOLVED_FENCED',
+            mutatedTerminalState: false,
+            mutatedResources: false,
+            evidenceHash: '',
+          };
+        }
+
+        // A bare DISPATCHED row with no lease is not sufficient proof of safe expiry; keep it fenced and unresolved
+        if (!activeLease) {
+          const classification: ExecutionRecoveryClassification = 'ADAPTER_IN_FLIGHT_UNRESOLVED';
           const disposition: ExecutionRecoveryDisposition = 'UNRESOLVED_FENCED';
 
           this.persistRecoveryAndEmit({
@@ -591,16 +631,28 @@ export class ExecutionRecoveryScanner {
         const isProvenTermination =
           (auth.termination_proof_source === 'LOCAL_PROCESS_EXIT' || auth.termination_proof_source === 'PROVIDER_FINAL_ACK') &&
           auth.termination_confirmed_at !== null &&
-          auth.terminated_at !== null;
+          auth.termination_confirmed_at !== undefined &&
+          auth.terminated_at !== null &&
+          auth.terminated_at !== undefined &&
+          auth.termination_evidence_json !== null &&
+          auth.termination_evidence_hash !== null &&
+          new Date(auth.terminated_at).getTime() <= new Date(auth.termination_confirmed_at).getTime();
 
-        if (isProvenTermination) {
+        let validEvidenceHash = false;
+        if (isProvenTermination && auth.termination_evidence_json && auth.termination_evidence_hash) {
+          try {
+            const parsed = JSON.parse(auth.termination_evidence_json);
+            const computed = computeSha256(canonicalJsonStringify(parsed));
+            validEvidenceHash = computed === auth.termination_evidence_hash;
+          } catch {
+            validEvidenceHash = false;
+          }
+        }
+
+        if (isProvenTermination && validEvidenceHash) {
           const isExplicitCancel =
             auth.termination_reason === 'EXECUTION_CANCELLED' ||
-            auth.termination_source === 'USER_CANCELLED' ||
-            auth.termination_source === 'OWNER_CANCELLED' ||
-            auth.termination_source === 'DISPATCH_CANCELLED' ||
-            auth.termination_source === 'OPERATOR_CANCELLED' ||
-            auth.termination_source === 'CANCELLED_CONFIRMED';
+            auth.termination_source === 'OPERATOR_CANCELLED';
 
           const classification: ExecutionRecoveryClassification = 'ADAPTER_TERMINATED_AFTER_TIMEOUT';
           const disposition: ExecutionRecoveryDisposition = isExplicitCancel

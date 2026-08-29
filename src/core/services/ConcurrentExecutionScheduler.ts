@@ -379,16 +379,12 @@ export class ConcurrentExecutionScheduler {
       supervisor.setDispatchPending(false);
     }
 
-    // 7.5. Recovery Fencing Check (R5I6)
-    // When settlement fails or execution may have started without durable settlement,
-    // retain worktree and unreleased lease for recovery scanner; do NOT release lease or idle slot.
+    // 7.5. Typed Recovery Fencing Check (R5I6)
+    // When settlement fails, start claim was rejected/ambiguous, or execution threw unhandled exception,
+    // retain worktree, active lease, slot ownership, and assignment for recovery scanner.
     const isRecoveryFenced =
-      providerResult.errorCode === 'SETTLEMENT_FAILED' ||
-      (typeof providerResult.error === 'string' &&
-        (providerResult.error.includes('SETTLEMENT_FAILED') ||
-          providerResult.error.includes('ALREADY_CLAIMED') ||
-          providerResult.error.includes('START_CLAIM_CAS_FAILED') ||
-          providerResult.error.includes('EXECUTION_ALREADY_STARTED')));
+      providerResult.errorCode === 'RECOVERY_FENCED' ||
+      providerResult.errorCode === 'SETTLEMENT_FAILED';
 
     if (isRecoveryFenced) {
       await supervisor.stop();
