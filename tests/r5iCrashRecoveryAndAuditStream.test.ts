@@ -2199,4 +2199,3 @@ describe('R5I6 Crash Recovery, Execution Lifecycle Linearization, and Durable Au
     expect(settleRes.error).toMatch(/INCOMPATIBLE_OUTCOME_STATUS/);
   });
 });
-
