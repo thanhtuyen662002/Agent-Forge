@@ -68,6 +68,9 @@ import {
   HandoffTransferStatus,
   AdapterOutcome,
   ProviderTerminationStatus,
+  SettlementStatus,
+  TerminationReason,
+  TerminationProofSource,
   ExecutionRecoveryClassification,
   ExecutionRecoveryDisposition,
   ExecutionRecoveryState,
@@ -1624,10 +1627,9 @@ export class Repository {
           UPDATE execution_authorizations
           SET execution_id = ?, adapter_started_at = ?
           WHERE id = ? AND adapter_started_at IS NULL
-            AND (task_ownership_epoch = ? OR task_ownership_epoch IS NULL)
             AND status = 'DISPATCHED'
         `)
-        .run(params.executionId, startedAt, params.authorizationId, params.expectedEpoch);
+        .run(params.executionId, startedAt, params.authorizationId);
 
       if (res.changes !== 1) {
         return { success: false, alreadyClaimed: false, error: 'START_CLAIM_CAS_FAILED' };
@@ -1688,14 +1690,13 @@ export class Repository {
       return { success: true, alreadyCompleted: false };
     });
   }
-
   public settleExecutionResult(params: {
     authorizationId: string;
     executionId: string;
     outcome: AdapterOutcome;
-    status: 'COMPLETED' | 'FAILED' | 'CANCELLED' | string;
+    status: SettlementStatus;
     finishedAt?: string;
-    resultPayload: Record<string, unknown>;
+    resultPayload?: any;
     errorJson?: string | null;
   }): {
     success: boolean;
@@ -1770,8 +1771,7 @@ export class Repository {
         params.outcome !== 'RETURNED' &&
         params.outcome !== 'THREW' &&
         params.outcome !== 'CANCELLED' &&
-        params.outcome !== 'TIMED_OUT' &&
-        params.outcome !== 'UNKNOWN'
+        params.outcome !== 'TIMED_OUT'
       ) {
         return {
           success: false,
@@ -1782,66 +1782,62 @@ export class Repository {
         };
       }
 
-      // 7. Validate transfer & bindings if bound to handoff transfer
-      const transfer = this.getHandoffTransferBySuccessorAuthId(auth.id);
-      let attempt: any = null;
-      let assignment: any = null;
-
-      if (transfer) {
-        if (transfer.task_id !== auth.task_id) {
+      // Validate outcome-status compatibility
+      if (params.outcome === 'RETURNED') {
+        if (params.status !== 'COMPLETED' && params.status !== 'FAILED' && params.status !== 'CANCELLED') {
           return {
             success: false,
             alreadySettled: false,
             settledAt: '',
             evidenceHash: '',
-            error: `BINDING_MISMATCH: transfer task_id "${transfer.task_id}" !== auth task_id "${auth.task_id}"`,
+            error: `INCOMPATIBLE_OUTCOME_STATUS: outcome "RETURNED" cannot result in status "${params.status}"`,
           };
         }
-        if (transfer.successor_attempt_id) {
-          if (auth.attempt_id && transfer.successor_attempt_id !== auth.attempt_id) {
-            return {
-              success: false,
-              alreadySettled: false,
-              settledAt: '',
-              evidenceHash: '',
-              error: `BINDING_MISMATCH: transfer attempt "${transfer.successor_attempt_id}" !== auth attempt "${auth.attempt_id}"`,
-            };
-          }
-          attempt = this.getTaskAttempt(transfer.successor_attempt_id);
-          if (!attempt) {
-            return {
-              success: false,
-              alreadySettled: false,
-              settledAt: '',
-              evidenceHash: '',
-              error: `ATTEMPT_NOT_FOUND: Successor attempt "${transfer.successor_attempt_id}" not found.`,
-            };
-          }
+      } else if (params.outcome === 'THREW') {
+        if (params.status !== 'FAILED') {
+          return {
+            success: false,
+            alreadySettled: false,
+            settledAt: '',
+            evidenceHash: '',
+            error: `INCOMPATIBLE_OUTCOME_STATUS: outcome "THREW" requires status "FAILED", got "${params.status}"`,
+          };
         }
-        if (transfer.successor_assignment_id) {
-          if (auth.assignment_id && transfer.successor_assignment_id !== auth.assignment_id) {
-            return {
-              success: false,
-              alreadySettled: false,
-              settledAt: '',
-              evidenceHash: '',
-              error: `BINDING_MISMATCH: transfer assignment "${transfer.successor_assignment_id}" !== auth assignment "${auth.assignment_id}"`,
-            };
-          }
-          assignment = this.getAgentAssignment(transfer.successor_assignment_id);
-          if (!assignment) {
-            return {
-              success: false,
-              alreadySettled: false,
-              settledAt: '',
-              evidenceHash: '',
-              error: `ASSIGNMENT_NOT_FOUND: Successor assignment "${transfer.successor_assignment_id}" not found.`,
-            };
-          }
+      } else if (params.outcome === 'CANCELLED') {
+        if (params.status !== 'CANCELLED') {
+          return {
+            success: false,
+            alreadySettled: false,
+            settledAt: '',
+            evidenceHash: '',
+            error: `INCOMPATIBLE_OUTCOME_STATUS: outcome "CANCELLED" requires status "CANCELLED", got "${params.status}"`,
+          };
+        }
+      } else if (params.outcome === 'TIMED_OUT') {
+        if (params.status !== 'FAILED' && params.status !== 'CANCELLED') {
+          return {
+            success: false,
+            alreadySettled: false,
+            settledAt: '',
+            evidenceHash: '',
+            error: `INCOMPATIBLE_OUTCOME_STATUS: outcome "TIMED_OUT" requires status "FAILED" or "CANCELLED", got "${params.status}"`,
+          };
         }
       }
 
+      // 7. Validate monotonic timestamps: finish cannot precede start
       const finishedAt = params.finishedAt ?? new Date().toISOString();
+      if (new Date(finishedAt).getTime() < new Date(auth.adapter_started_at).getTime()) {
+        return {
+          success: false,
+          alreadySettled: false,
+          settledAt: '',
+          evidenceHash: '',
+          error: `NON_MONOTONIC_TIMESTAMPS: finished_at "${finishedAt}" cannot precede adapter_started_at "${auth.adapter_started_at}"`,
+        };
+      }
+
+      // 8. Canonical evidence payload & idempotency check
       const canonicalEvidence = {
         authorization_id: auth.id,
         execution_id: params.executionId,
@@ -1850,7 +1846,7 @@ export class Repository {
         project_id: auth.project_id,
         attempt_id: auth.attempt_id ?? null,
         assignment_id: auth.assignment_id ?? null,
-        status: params.status,
+        settlement_status: params.status,
         outcome: params.outcome,
         finished_at: finishedAt,
         result_payload: params.resultPayload,
@@ -1861,7 +1857,11 @@ export class Repository {
 
       // Idempotency check: if already settled
       if (auth.settled_at) {
-        if (auth.settlement_evidence_hash === evidenceHash && auth.adapter_outcome === params.outcome) {
+        if (
+          auth.settlement_evidence_hash === evidenceHash &&
+          auth.adapter_outcome === params.outcome &&
+          (auth.settlement_status === params.status || auth.settlement_status === null)
+        ) {
           return {
             success: true,
             alreadySettled: true,
@@ -1878,12 +1878,198 @@ export class Repository {
         };
       }
 
+      // 9. Validate complete binding graph
+      const transfer = this.getHandoffTransferBySuccessorAuthId(auth.id);
+      if (!transfer) {
+        return {
+          success: false,
+          alreadySettled: false,
+          settledAt: '',
+          evidenceHash: '',
+          error: `TRANSFER_NOT_FOUND: No handoff transfer bound to successor authorization "${auth.id}".`,
+        };
+      }
+
+      if (transfer.status !== 'ACCEPTED') {
+        return {
+          success: false,
+          alreadySettled: false,
+          settledAt: '',
+          evidenceHash: '',
+          error: `TRANSFER_NOT_ACCEPTED: Handoff transfer "${transfer.id}" status is "${transfer.status}", expected "ACCEPTED".`,
+        };
+      }
+
+      if (transfer.task_id !== auth.task_id) {
+        return {
+          success: false,
+          alreadySettled: false,
+          settledAt: '',
+          evidenceHash: '',
+          error: `BINDING_MISMATCH: Transfer task_id "${transfer.task_id}" !== auth task_id "${auth.task_id}".`,
+        };
+      }
+
+      if (!transfer.successor_attempt_id) {
+        return {
+          success: false,
+          alreadySettled: false,
+          settledAt: '',
+          evidenceHash: '',
+          error: `BINDING_MISMATCH: Transfer "${transfer.id}" has no successor_attempt_id.`,
+        };
+      }
+      if (auth.attempt_id && transfer.successor_attempt_id !== auth.attempt_id) {
+        return {
+          success: false,
+          alreadySettled: false,
+          settledAt: '',
+          evidenceHash: '',
+          error: `BINDING_MISMATCH: Transfer attempt "${transfer.successor_attempt_id}" !== auth attempt "${auth.attempt_id}".`,
+        };
+      }
+
+      const attempt = this.getTaskAttempt(transfer.successor_attempt_id);
+      if (!attempt) {
+        return {
+          success: false,
+          alreadySettled: false,
+          settledAt: '',
+          evidenceHash: '',
+          error: `ATTEMPT_NOT_FOUND: Successor attempt "${transfer.successor_attempt_id}" not found.`,
+        };
+      }
+      if (attempt.status !== 'RUNNING') {
+        return {
+          success: false,
+          alreadySettled: false,
+          settledAt: '',
+          evidenceHash: '',
+          error: `ATTEMPT_NOT_RUNNING: Task attempt "${attempt.id}" status is "${attempt.status}", expected "RUNNING".`,
+        };
+      }
+      if (attempt.task_id !== auth.task_id) {
+        return {
+          success: false,
+          alreadySettled: false,
+          settledAt: '',
+          evidenceHash: '',
+          error: `BINDING_MISMATCH: Attempt task_id "${attempt.task_id}" !== auth task_id "${auth.task_id}".`,
+        };
+      }
+
+      if (!transfer.successor_assignment_id) {
+        return {
+          success: false,
+          alreadySettled: false,
+          settledAt: '',
+          evidenceHash: '',
+          error: `BINDING_MISMATCH: Transfer "${transfer.id}" has no successor_assignment_id.`,
+        };
+      }
+      if (auth.assignment_id && transfer.successor_assignment_id !== auth.assignment_id) {
+        return {
+          success: false,
+          alreadySettled: false,
+          settledAt: '',
+          evidenceHash: '',
+          error: `BINDING_MISMATCH: Transfer assignment "${transfer.successor_assignment_id}" !== auth assignment "${auth.assignment_id}".`,
+        };
+      }
+
+      const assignment = this.getAgentAssignment(transfer.successor_assignment_id);
+      if (!assignment) {
+        return {
+          success: false,
+          alreadySettled: false,
+          settledAt: '',
+          evidenceHash: '',
+          error: `ASSIGNMENT_NOT_FOUND: Successor assignment "${transfer.successor_assignment_id}" not found.`,
+        };
+      }
+      if (assignment.status !== 'RUNNING') {
+        return {
+          success: false,
+          alreadySettled: false,
+          settledAt: '',
+          evidenceHash: '',
+          error: `ASSIGNMENT_NOT_RUNNING: Agent assignment "${assignment.id}" status is "${assignment.status}", expected "RUNNING".`,
+        };
+      }
+      if (assignment.task_id !== auth.task_id) {
+        return {
+          success: false,
+          alreadySettled: false,
+          settledAt: '',
+          evidenceHash: '',
+          error: `BINDING_MISMATCH: Assignment task_id "${assignment.task_id}" !== auth task_id "${auth.task_id}".`,
+        };
+      }
+      if (assignment.project_id !== auth.project_id) {
+        return {
+          success: false,
+          alreadySettled: false,
+          settledAt: '',
+          evidenceHash: '',
+          error: `BINDING_MISMATCH: Assignment project_id "${assignment.project_id}" !== auth project_id "${auth.project_id}".`,
+        };
+      }
+      if (assignment.selected_provider_id !== auth.selected_provider_id) {
+        return {
+          success: false,
+          alreadySettled: false,
+          settledAt: '',
+          evidenceHash: '',
+          error: `BINDING_MISMATCH: Assignment provider "${assignment.selected_provider_id}" !== auth provider "${auth.selected_provider_id}".`,
+        };
+      }
+      if (assignment.selected_resource_id !== auth.selected_resource_id) {
+        return {
+          success: false,
+          alreadySettled: false,
+          settledAt: '',
+          evidenceHash: '',
+          error: `BINDING_MISMATCH: Assignment resource "${assignment.selected_resource_id}" !== auth resource "${auth.selected_resource_id}".`,
+        };
+      }
+      if (auth.selected_account_id && assignment.selected_account_id !== auth.selected_account_id) {
+        return {
+          success: false,
+          alreadySettled: false,
+          settledAt: '',
+          evidenceHash: '',
+          error: `BINDING_MISMATCH: Assignment account "${assignment.selected_account_id}" !== auth account "${auth.selected_account_id}".`,
+        };
+      }
+
+      // Check task ownership epoch agreement
+      const currentTaskEpoch = this.getTaskOwnershipEpoch(auth.task_id);
+      if (auth.task_ownership_epoch !== undefined && auth.task_ownership_epoch !== null && auth.task_ownership_epoch !== currentTaskEpoch) {
+        return {
+          success: false,
+          alreadySettled: false,
+          settledAt: '',
+          evidenceHash: '',
+          error: `OWNERSHIP_EPOCH_MISMATCH: Auth task epoch "${auth.task_ownership_epoch}" !== current task epoch "${currentTaskEpoch}".`,
+        };
+      }
+      if (transfer.successor_ownership_epoch !== undefined && transfer.successor_ownership_epoch !== null && transfer.successor_ownership_epoch !== currentTaskEpoch) {
+        return {
+          success: false,
+          alreadySettled: false,
+          settledAt: '',
+          evidenceHash: '',
+          error: `OWNERSHIP_EPOCH_MISMATCH: Transfer successor epoch "${transfer.successor_ownership_epoch}" !== current task epoch "${currentTaskEpoch}".`,
+        };
+      }
+
       // Atomic persistence across all entities in this transaction
       // 1. Update execution_authorizations
       const authRes = this.db
         .prepare(`
           UPDATE execution_authorizations
-          SET adapter_finished_at = ?,
+          SET settlement_status = ?,
+              adapter_finished_at = ?,
               adapter_outcome = ?,
               adapter_error_json = ?,
               settled_at = ?,
@@ -1892,6 +2078,7 @@ export class Repository {
           WHERE id = ? AND settled_at IS NULL AND status = 'DISPATCHED'
         `)
         .run(
+          params.status,
           finishedAt,
           params.outcome,
           params.errorJson ?? null,
@@ -1905,53 +2092,47 @@ export class Repository {
         throw new Error(`SETTLEMENT_AUTH_UPDATE_FAILED: Expected 1 auth row updated, got ${authRes.changes}`);
       }
 
-      // 2. Terminalize transfer, attempt, and assignment if bound
+      // 2. Terminalize transfer, attempt, and assignment
       const terminalStatus: HandoffTransferStatus = params.status as HandoffTransferStatus;
 
-      if (transfer) {
-        // Update TaskAttempt
-        if (transfer.successor_attempt_id) {
-          const attemptRes = this.db
-            .prepare(`
-              UPDATE task_attempts
-              SET status = ?, ended_at = ?
-              WHERE id = ? AND status IN ('RUNNING', 'PENDING')
-            `)
-            .run(terminalStatus, finishedAt, transfer.successor_attempt_id);
+      // Update TaskAttempt
+      const attemptRes = this.db
+        .prepare(`
+          UPDATE task_attempts
+          SET status = ?, ended_at = ?
+          WHERE id = ? AND status = 'RUNNING'
+        `)
+        .run(terminalStatus, finishedAt, transfer.successor_attempt_id);
 
-          if (attemptRes.changes !== 1) {
-            throw new Error(`SETTLEMENT_ATTEMPT_UPDATE_FAILED: Expected 1 attempt row updated, got ${attemptRes.changes}`);
-          }
-        }
+      if (attemptRes.changes !== 1) {
+        throw new Error(`SETTLEMENT_ATTEMPT_UPDATE_FAILED: Expected 1 attempt row updated, got ${attemptRes.changes}`);
+      }
 
-        // Update AgentAssignment
-        if (transfer.successor_assignment_id) {
-          const asgnRes = this.db
-            .prepare(`
-              UPDATE agent_assignments
-              SET status = ?, ended_at = ?
-              WHERE id = ? AND status IN ('RUNNING', 'ASSIGNED')
-            `)
-            .run(terminalStatus, finishedAt, transfer.successor_assignment_id);
+      // Update AgentAssignment
+      const asgnRes = this.db
+        .prepare(`
+          UPDATE agent_assignments
+          SET status = ?, ended_at = ?
+          WHERE id = ? AND status = 'RUNNING'
+        `)
+        .run(terminalStatus, finishedAt, transfer.successor_assignment_id);
 
-          if (asgnRes.changes !== 1) {
-            throw new Error(`SETTLEMENT_ASSIGNMENT_UPDATE_FAILED: Expected 1 assignment row updated, got ${asgnRes.changes}`);
-          }
-        }
+      if (asgnRes.changes !== 1) {
+        throw new Error(`SETTLEMENT_ASSIGNMENT_UPDATE_FAILED: Expected 1 assignment row updated, got ${asgnRes.changes}`);
+      }
 
-        // Update HandoffTransfer
-        const newVersion = transfer.version + 1;
-        const transferRes = this.db
-          .prepare(`
-            UPDATE handoff_transfers
-            SET status = ?, completed_at = ?, version = ?, updated_at = ?
-            WHERE id = ? AND status IN ('ACCEPTED', 'AUTHORIZED', 'ROUTED')
-          `)
-          .run(terminalStatus, finishedAt, newVersion, finishedAt, transfer.id);
+      // Update HandoffTransfer
+      const newVersion = transfer.version + 1;
+      const transferRes = this.db
+        .prepare(`
+          UPDATE handoff_transfers
+          SET status = ?, completed_at = ?, version = ?, updated_at = ?
+          WHERE id = ? AND status = 'ACCEPTED' AND version = ?
+        `)
+        .run(terminalStatus, finishedAt, newVersion, finishedAt, transfer.id, transfer.version);
 
-        if (transferRes.changes !== 1) {
-          throw new Error(`SETTLEMENT_TRANSFER_UPDATE_FAILED: Expected 1 transfer row updated, got ${transferRes.changes}`);
-        }
+      if (transferRes.changes !== 1) {
+        throw new Error(`SETTLEMENT_TRANSFER_UPDATE_FAILED: Expected 1 transfer row updated, got ${transferRes.changes}`);
       }
 
       // 3. Insert Deterministic Canonical Result Event
@@ -1973,7 +2154,7 @@ export class Repository {
           deterministicEventId,
           auth.project_id,
           auth.task_id,
-          assignment?.agent_id ?? null,
+          assignment.agent_profile_id ?? null,
           eventType,
           `Execution ${params.executionId} settled as ${params.status} (outcome: ${params.outcome}) for task ${auth.task_id}`,
           canonicalEvidenceJson,
@@ -2041,8 +2222,12 @@ export class Repository {
     authorizationId: string;
     executionId: string;
     terminationStatus: ProviderTerminationStatus;
-    terminationSource: string;
+    terminationSource?: string;
+    terminationReason?: TerminationReason;
+    terminationProofSource?: TerminationProofSource;
+    terminationEvidenceJson?: string;
     confirmedAt?: string;
+    terminatedAt?: string;
   }): { success: boolean; alreadyConfirmed: boolean; error?: string } {
     return this.runInImmediateTransaction(() => {
       const auth = this.getExecutionAuthorization(params.authorizationId);
@@ -2066,15 +2251,28 @@ export class Repository {
         };
       }
 
+      let evidenceHash: string | null = null;
+      if (params.terminationEvidenceJson) {
+        try {
+          const parsed = JSON.parse(params.terminationEvidenceJson);
+          evidenceHash = computeSha256(canonicalJsonStringify(parsed));
+        } catch (e: any) {
+          return { success: false, alreadyConfirmed: false, error: `MALFORMED_TERMINATION_EVIDENCE: ${e.message}` };
+        }
+      }
+
       if (auth.termination_status === 'CONFIRMED_TERMINATED') {
         if (params.terminationStatus === 'CONFIRMED_TERMINATED') {
-          if (auth.termination_source === params.terminationSource) {
+          const sourceMatch = !params.terminationSource || auth.termination_source === params.terminationSource;
+          const reasonMatch = !params.terminationReason || auth.termination_reason === params.terminationReason;
+          const proofMatch = !params.terminationProofSource || auth.termination_proof_source === params.terminationProofSource;
+          if (sourceMatch && reasonMatch && proofMatch) {
             return { success: true, alreadyConfirmed: true };
           }
           return {
             success: false,
             alreadyConfirmed: false,
-            error: `TERMINATION_SOURCE_CONFLICT: already confirmed by ${auth.termination_source}, contradictory source ${params.terminationSource}`,
+            error: `TERMINATION_SOURCE_CONFLICT: already confirmed, contradictory termination source/reason/proof`,
           };
         }
         return {
@@ -2086,7 +2284,7 @@ export class Repository {
 
       if (auth.termination_status === 'UNRESOLVED') {
         if (params.terminationStatus === 'UNRESOLVED') {
-          if (auth.termination_source === params.terminationSource) {
+          if (!params.terminationSource || auth.termination_source === params.terminationSource) {
             return { success: true, alreadyConfirmed: true };
           }
           return {
@@ -2103,32 +2301,192 @@ export class Repository {
             UPDATE execution_authorizations
             SET termination_status = 'UNRESOLVED',
                 termination_source = ?,
+                termination_reason = ?,
+                termination_proof_source = ?,
+                termination_evidence_json = ?,
+                termination_evidence_hash = ?,
                 termination_confirmed_at = NULL
             WHERE id = ? AND execution_id = ?
           `)
-          .run(params.terminationSource, params.authorizationId, params.executionId);
+          .run(
+            params.terminationSource ?? null,
+            params.terminationReason ?? null,
+            params.terminationProofSource ?? null,
+            params.terminationEvidenceJson ?? null,
+            evidenceHash,
+            params.authorizationId,
+            params.executionId
+          );
 
         return { success: res.changes === 1, alreadyConfirmed: false };
       }
 
       if (params.terminationStatus === 'CONFIRMED_TERMINATED') {
         const confirmedAt = params.confirmedAt ?? new Date().toISOString();
+        const terminatedAt = params.terminatedAt ?? confirmedAt;
+        const defaultReason = params.terminationSource?.includes('CANCEL') ? 'EXECUTION_CANCELLED' : 'EXECUTION_TIMEOUT';
+        const defaultProof = params.terminationSource?.includes('PROVIDER') ? 'PROVIDER_FINAL_ACK' : 'LOCAL_PROCESS_EXIT';
+        const reason = params.terminationReason ?? defaultReason;
+        const proofSource = params.terminationProofSource ?? defaultProof;
         const res = this.db
           .prepare(`
             UPDATE execution_authorizations
             SET termination_status = 'CONFIRMED_TERMINATED',
                 termination_source = ?,
+                termination_reason = ?,
+                termination_proof_source = ?,
+                termination_evidence_json = ?,
+                termination_evidence_hash = ?,
                 termination_confirmed_at = ?,
                 terminated_at = ?
             WHERE id = ? AND execution_id = ?
           `)
-          .run(params.terminationSource, confirmedAt, confirmedAt, params.authorizationId, params.executionId);
+          .run(
+            params.terminationSource ?? null,
+            reason,
+            proofSource,
+            params.terminationEvidenceJson ?? null,
+            evidenceHash,
+            confirmedAt,
+            terminatedAt,
+            params.authorizationId,
+            params.executionId
+          );
 
         return { success: res.changes === 1, alreadyConfirmed: false };
       }
 
       return { success: false, alreadyConfirmed: false, error: 'INVALID_TERMINATION_STATUS' };
     });
+  }
+
+  public releaseGuardedAccountLeaseAndIdleSlot(params: {
+    leaseId: string;
+    expectedAssignmentId: string;
+    expectedAccountId: string;
+    expectedSlotId: string;
+    expectedExecutionId?: string | null;
+    releasedAt?: string;
+  }): { success: boolean; error?: string } {
+    return this.runInImmediateTransaction(() => {
+      const nowIso = params.releasedAt ?? new Date().toISOString();
+
+      // 1. Verify lease
+      const lease = this.getAccountLease(params.leaseId);
+      if (!lease) {
+        return { success: false, error: `LEASE_NOT_FOUND: Lease "${params.leaseId}" not found.` };
+      }
+      if (lease.released_at !== null) {
+        return { success: false, error: `LEASE_ALREADY_RELEASED: Lease "${params.leaseId}" was already released at ${lease.released_at}.` };
+      }
+      if (lease.assignment_id !== params.expectedAssignmentId) {
+        return { success: false, error: `LEASE_ASSIGNMENT_MISMATCH: Lease assignment "${lease.assignment_id}" !== expected "${params.expectedAssignmentId}".` };
+      }
+      if (lease.provider_account_id !== params.expectedAccountId) {
+        return { success: false, error: `LEASE_ACCOUNT_MISMATCH: Lease account "${lease.provider_account_id}" !== expected "${params.expectedAccountId}".` };
+      }
+      if (lease.worker_slot_id !== params.expectedSlotId) {
+        return { success: false, error: `LEASE_SLOT_MISMATCH: Lease slot "${lease.worker_slot_id}" !== expected "${params.expectedSlotId}".` };
+      }
+
+      // 2. Verify slot
+      const slot = this.getWorkerSlot(params.expectedSlotId);
+      if (!slot) {
+        return { success: false, error: `SLOT_NOT_FOUND: Slot "${params.expectedSlotId}" not found.` };
+      }
+      if (slot.status !== 'LEASED') {
+        return { success: false, error: `SLOT_STATE_MISMATCH: Slot "${slot.id}" status is "${slot.status}", expected "LEASED".` };
+      }
+      if (slot.provider_account_id !== params.expectedAccountId) {
+        return { success: false, error: `SLOT_ACCOUNT_MISMATCH: Slot account "${slot.provider_account_id}" !== expected "${params.expectedAccountId}".` };
+      }
+      if (slot.current_assignment_id !== params.expectedAssignmentId) {
+        return { success: false, error: `SLOT_ASSIGNMENT_MISMATCH: Slot assignment "${slot.current_assignment_id}" !== expected "${params.expectedAssignmentId}".` };
+      }
+
+      if (params.expectedExecutionId !== undefined) {
+        if (params.expectedExecutionId === null) {
+          if (slot.current_execution_id !== null) {
+            return { success: false, error: `SLOT_EXECUTION_MISMATCH: Slot current_execution_id is "${slot.current_execution_id}", expected null.` };
+          }
+        } else {
+          if (slot.current_execution_id !== null && slot.current_execution_id !== params.expectedExecutionId) {
+            return { success: false, error: `SLOT_EXECUTION_MISMATCH: Slot current_execution_id is "${slot.current_execution_id}", expected "${params.expectedExecutionId}".` };
+          }
+        }
+      }
+
+      // 3. Update lease
+      const leaseRes = this.db
+        .prepare(`
+          UPDATE account_leases
+          SET released_at = ?
+          WHERE id = ? AND released_at IS NULL AND assignment_id = ? AND provider_account_id = ? AND worker_slot_id = ?
+        `)
+        .run(nowIso, params.leaseId, params.expectedAssignmentId, params.expectedAccountId, params.expectedSlotId);
+
+      if (leaseRes.changes !== 1) {
+        throw new Error(`GUARDED_LEASE_RELEASE_FAILED: Expected 1 lease updated, got ${leaseRes.changes}`);
+      }
+
+      // 4. Update slot
+      let slotRes;
+      if (params.expectedExecutionId && slot.current_execution_id === params.expectedExecutionId) {
+        slotRes = this.db
+          .prepare(`
+            UPDATE worker_slots
+            SET status = 'IDLE', current_assignment_id = NULL, current_execution_id = NULL, updated_at = ?
+            WHERE id = ? AND status = 'LEASED' AND provider_account_id = ? AND current_assignment_id = ? AND current_execution_id = ?
+          `)
+          .run(nowIso, params.expectedSlotId, params.expectedAccountId, params.expectedAssignmentId, params.expectedExecutionId);
+      } else {
+        slotRes = this.db
+          .prepare(`
+            UPDATE worker_slots
+            SET status = 'IDLE', current_assignment_id = NULL, current_execution_id = NULL, updated_at = ?
+            WHERE id = ? AND status = 'LEASED' AND provider_account_id = ? AND current_assignment_id = ?
+          `)
+          .run(nowIso, params.expectedSlotId, params.expectedAccountId, params.expectedAssignmentId);
+      }
+
+      if (slotRes.changes !== 1) {
+        throw new Error(`GUARDED_SLOT_RELEASE_FAILED: Expected 1 slot updated, got ${slotRes.changes}`);
+      }
+
+      return { success: true };
+    });
+  }
+
+  public insertDeterministicEvent(event: {
+    id: string;
+    project_id: string;
+    task_id?: string | null;
+    agent_id?: string | null;
+    type: string;
+    summary: string;
+    structured_payload_json?: string | null;
+    timestamp: string;
+  }): boolean {
+    const existing = this.db.prepare('SELECT id FROM events WHERE id = ?').get(event.id);
+    if (existing) {
+      return false;
+    }
+    const res = this.db
+      .prepare(`
+        INSERT INTO events (id, project_id, task_id, agent_id, type, summary, structured_payload_json, timestamp)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+      `)
+      .run(
+        event.id,
+        event.project_id,
+        event.task_id ?? null,
+        event.agent_id ?? null,
+        event.type,
+        event.summary,
+        event.structured_payload_json ?? null,
+        event.timestamp
+      );
+    return res.changes === 1;
   }
 
   public invalidateExecutionAuthorization(id: string): boolean {
@@ -2189,6 +2547,7 @@ export class Repository {
       manager_message_id: String(row.manager_message_id),
       manager_payload_hash: String(row.manager_payload_hash),
       routing_decision_id: String(row.routing_decision_id),
+      selected_account_id: row.selected_account_id ? String(row.selected_account_id) : undefined,
       selected_resource_id: String(row.selected_resource_id),
       selected_provider_id: String(row.selected_provider_id),
       instruction_payload_hash: String(row.instruction_payload_hash),
@@ -2199,7 +2558,7 @@ export class Repository {
       status: row.status as ExecutionAuthorizationStatus,
       created_at: String(row.created_at),
       dispatched_at: row.dispatched_at ? String(row.dispatched_at) : null,
-      task_ownership_epoch: row.task_ownership_epoch !== undefined && row.task_ownership_epoch !== null ? Number(row.task_ownership_epoch) : 1,
+      task_ownership_epoch: row.task_ownership_epoch !== undefined && row.task_ownership_epoch !== null ? Number(row.task_ownership_epoch) : undefined,
       assignment_id: row.assignment_id ? String(row.assignment_id) : null,
       lifecycle_version: row.lifecycle_version !== undefined && row.lifecycle_version !== null ? Number(row.lifecycle_version) : null,
       execution_id: row.execution_id ? String(row.execution_id) : null,
@@ -2207,10 +2566,15 @@ export class Repository {
       adapter_finished_at: row.adapter_finished_at ? String(row.adapter_finished_at) : null,
       adapter_outcome: row.adapter_outcome ? (row.adapter_outcome as AdapterOutcome) : null,
       adapter_error_json: row.adapter_error_json ? String(row.adapter_error_json) : null,
+      settlement_status: row.settlement_status ? (row.settlement_status as SettlementStatus) : null,
       cancellation_requested_at: row.cancellation_requested_at ? String(row.cancellation_requested_at) : null,
       termination_confirmed_at: row.termination_confirmed_at ? String(row.termination_confirmed_at) : null,
       termination_status: row.termination_status ? (row.termination_status as ProviderTerminationStatus) : null,
       termination_source: row.termination_source ? String(row.termination_source) : null,
+      termination_reason: row.termination_reason ? (row.termination_reason as TerminationReason) : null,
+      termination_proof_source: row.termination_proof_source ? (row.termination_proof_source as TerminationProofSource) : null,
+      termination_evidence_json: row.termination_evidence_json ? String(row.termination_evidence_json) : null,
+      termination_evidence_hash: row.termination_evidence_hash ? String(row.termination_evidence_hash) : null,
       terminated_at: row.terminated_at ? String(row.terminated_at) : null,
       settled_at: row.settled_at ? String(row.settled_at) : null,
       settlement_evidence_json: row.settlement_evidence_json ? String(row.settlement_evidence_json) : null,
@@ -2396,98 +2760,6 @@ export class Repository {
           `)
           .run(nowIso, slotId);
       }
-    });
-  }
-
-  public releaseGuardedAccountLeaseAndIdleSlot(params: {
-    leaseId: string;
-    expectedAssignmentId: string;
-    expectedAccountId: string;
-    expectedSlotId?: string | null;
-    expectedExecutionId?: string | null;
-    releasedAt?: string;
-  }): { success: boolean; error?: string } {
-    return this.runInImmediateTransaction(() => {
-      const nowIso = params.releasedAt ?? new Date().toISOString();
-
-      // 1. Verify and update active lease
-      const lease = this.db
-        .prepare('SELECT * FROM account_leases WHERE id = ?')
-        .get(params.leaseId) as Record<string, unknown> | undefined;
-
-      if (!lease) {
-        throw new Error(`LEASE_NOT_FOUND: Lease "${params.leaseId}" does not exist.`);
-      }
-      if (lease.released_at !== null && lease.released_at !== undefined) {
-        throw new Error(`LEASE_ALREADY_RELEASED: Lease "${params.leaseId}" is already released.`);
-      }
-      if (String(lease.assignment_id) !== params.expectedAssignmentId) {
-        throw new Error(
-          `LEASE_ASSIGNMENT_MISMATCH: Lease assignment "${lease.assignment_id}" !== expected "${params.expectedAssignmentId}".`
-        );
-      }
-      if (String(lease.provider_account_id) !== params.expectedAccountId) {
-        throw new Error(
-          `LEASE_ACCOUNT_MISMATCH: Lease account "${lease.provider_account_id}" !== expected "${params.expectedAccountId}".`
-        );
-      }
-
-      const leaseUpdate = this.db
-        .prepare(`
-          UPDATE account_leases
-          SET released_at = ?
-          WHERE id = ? AND released_at IS NULL AND assignment_id = ? AND provider_account_id = ?
-        `)
-        .run(nowIso, params.leaseId, params.expectedAssignmentId, params.expectedAccountId);
-
-      if (leaseUpdate.changes !== 1) {
-        throw new Error(`GUARDED_LEASE_RELEASE_FAILED: Expected 1 lease row updated, got ${leaseUpdate.changes}`);
-      }
-
-      // 2. Verify and update worker slot if specified
-      if (params.expectedSlotId) {
-        const slot = this.db
-          .prepare('SELECT * FROM worker_slots WHERE id = ?')
-          .get(params.expectedSlotId) as Record<string, unknown> | undefined;
-
-        if (!slot) {
-          throw new Error(`SLOT_NOT_FOUND: Slot "${params.expectedSlotId}" does not exist.`);
-        }
-        if (String(slot.provider_account_id) !== params.expectedAccountId) {
-          throw new Error(
-            `SLOT_ACCOUNT_MISMATCH: Slot account "${slot.provider_account_id}" !== expected "${params.expectedAccountId}".`
-          );
-        }
-        if (slot.current_assignment_id !== params.expectedAssignmentId) {
-          throw new Error(
-            `SLOT_REASSIGNED: Slot current_assignment_id "${slot.current_assignment_id}" !== expected "${params.expectedAssignmentId}".`
-          );
-        }
-        if (
-          params.expectedExecutionId &&
-          slot.current_execution_id !== null &&
-          slot.current_execution_id !== undefined &&
-          slot.current_execution_id !== params.expectedExecutionId
-        ) {
-          throw new Error(
-            `SLOT_EXECUTION_MISMATCH: Slot current_execution_id "${slot.current_execution_id}" !== expected "${params.expectedExecutionId}".`
-          );
-        }
-
-        const slotUpdate = this.db
-          .prepare(`
-            UPDATE worker_slots
-            SET status = 'IDLE', current_assignment_id = NULL, current_execution_id = NULL, updated_at = ?
-            WHERE id = ? AND current_assignment_id = ?
-          `)
-          .run(nowIso, params.expectedSlotId, params.expectedAssignmentId);
-
-        if (slotUpdate.changes !== 1) {
-          throw new Error(`GUARDED_SLOT_IDLE_FAILED: Expected 1 slot row updated, got ${slotUpdate.changes}`);
-        }
-      }
-
-      return { success: true };
     });
   }
 

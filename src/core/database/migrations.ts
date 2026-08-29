@@ -1195,10 +1195,41 @@ export const MIGRATIONS: Migration[] = [
       db.exec(`
         -- 1. Extend execution_authorizations with lifecycle protocol & durable settlement fields
         ALTER TABLE execution_authorizations
-        ADD COLUMN lifecycle_version INTEGER NULL CHECK (lifecycle_version IS NULL OR lifecycle_version >= 1);
+        ADD COLUMN lifecycle_version INTEGER NULL CHECK (lifecycle_version IS NULL OR lifecycle_version = 1);
 
         ALTER TABLE execution_authorizations
         ADD COLUMN adapter_error_json TEXT NULL;
+
+        ALTER TABLE execution_authorizations
+        ADD COLUMN settlement_status TEXT NULL CHECK (settlement_status IS NULL OR settlement_status IN ('COMPLETED', 'FAILED', 'CANCELLED'));
+
+        ALTER TABLE execution_authorizations
+        ADD COLUMN termination_reason TEXT NULL CHECK (termination_reason IS NULL OR termination_reason IN (
+          'EXECUTION_TIMEOUT',
+          'EXECUTION_CANCELLED',
+          'HEARTBEAT_TIMEOUT',
+          'MANUAL_INTERVENTION'
+        ));
+
+        ALTER TABLE execution_authorizations
+        ADD COLUMN termination_proof_source TEXT NULL CHECK (termination_proof_source IS NULL OR termination_proof_source IN (
+          'LOCAL_PROCESS_EXIT',
+          'PROVIDER_FINAL_ACK',
+          'TIMEOUT_UNACKNOWLEDGED',
+          'CANCEL_UNACKNOWLEDGED',
+          'DISCONNECT_UNKNOWN'
+        ));
+
+        ALTER TABLE execution_authorizations
+        ADD COLUMN termination_evidence_json TEXT NULL;
+
+        ALTER TABLE execution_authorizations
+        ADD COLUMN termination_evidence_hash TEXT NULL CHECK (
+          termination_evidence_hash IS NULL OR (
+            length(termination_evidence_hash) = 64 AND
+            termination_evidence_hash GLOB '[0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]'
+          )
+        );
 
         ALTER TABLE execution_authorizations
         ADD COLUMN terminated_at TEXT NULL;
@@ -1210,18 +1241,26 @@ export const MIGRATIONS: Migration[] = [
         ADD COLUMN settlement_evidence_json TEXT NULL;
 
         ALTER TABLE execution_authorizations
-        ADD COLUMN settlement_evidence_hash TEXT NULL CHECK (settlement_evidence_hash IS NULL OR length(settlement_evidence_hash) = 64);
+        ADD COLUMN settlement_evidence_hash TEXT NULL CHECK (
+          settlement_evidence_hash IS NULL OR (
+            length(settlement_evidence_hash) = 64 AND
+            settlement_evidence_hash GLOB '[0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]'
+          )
+        );
 
         CREATE INDEX IF NOT EXISTS idx_exec_auth_lifecycle
         ON execution_authorizations(lifecycle_version);
 
+        CREATE INDEX IF NOT EXISTS idx_exec_auth_settlement_status
+        ON execution_authorizations(settlement_status);
+
         -- 2. Durable per-authorization recovery state ledger
         CREATE TABLE IF NOT EXISTS execution_recovery_states (
           id TEXT PRIMARY KEY,
-          authorization_id TEXT NOT NULL UNIQUE REFERENCES execution_authorizations(id) ON DELETE CASCADE,
+          authorization_id TEXT NOT NULL UNIQUE REFERENCES execution_authorizations(id) ON DELETE RESTRICT,
           transfer_id TEXT NOT NULL REFERENCES handoff_transfers(id) ON DELETE RESTRICT,
           execution_id TEXT NULL,
-          lifecycle_version INTEGER NULL CHECK (lifecycle_version IS NULL OR lifecycle_version >= 1),
+          lifecycle_version INTEGER NULL CHECK (lifecycle_version IS NULL OR lifecycle_version = 1),
           recovery_classification TEXT NOT NULL CHECK (recovery_classification IN (
             'PRE_ADAPTER_NOT_STARTED',
             'ADAPTER_IN_FLIGHT_UNRESOLVED',
@@ -1244,7 +1283,10 @@ export const MIGRATIONS: Migration[] = [
             'REJECTED_INTEGRITY_CONFLICT'
           )),
           canonical_evidence_json TEXT NOT NULL,
-          evidence_hash TEXT NOT NULL CHECK (length(evidence_hash) = 64),
+          evidence_hash TEXT NOT NULL CHECK (
+            length(evidence_hash) = 64 AND
+            evidence_hash GLOB '[0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]'
+          ),
           recovery_version INTEGER NOT NULL DEFAULT 1 CHECK (recovery_version >= 1),
           mutated_terminal_state INTEGER NOT NULL DEFAULT 0 CHECK (mutated_terminal_state IN (0, 1)),
           mutated_resources INTEGER NOT NULL DEFAULT 0 CHECK (mutated_resources IN (0, 1)),

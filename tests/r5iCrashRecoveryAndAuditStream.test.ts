@@ -736,14 +736,22 @@ describe('R5I6 Crash Recovery, Execution Lifecycle Linearization, and Durable Au
     expect(res.providerExecutionProvenance?.authorizationId).toBe(auth.id);
   });
 
-  // 12. Settlement replay is idempotent
+  // 12. Atomic settlement: idempotent replay
   it('12. should handle identical settlement replay idempotently', async () => {
     const { auth } = await seedStandardTopology();
+    const leaseRes = leaseService.acquireForAssignment('asgn-succ', 60000) as SlotLeaseSuccess;
+    repo.acceptHandoffSuccessorExecution({
+      authorizationId: auth.id,
+      leaseId: leaseRes.lease.id,
+      leaseToken: leaseRes.lease.lease_token,
+      expectedSuccessorEpoch: 2,
+    });
     repo.claimExecutionAuthorization(auth.id, new Date().toISOString());
     repo.claimAdapterExecutionStart({
       authorizationId: auth.id,
       executionId: 'exec-1',
       expectedEpoch: 2,
+      startedAt: new Date().toISOString(),
     });
     const settle1 = repo.settleExecutionResult({
       authorizationId: auth.id,
@@ -770,6 +778,13 @@ describe('R5I6 Crash Recovery, Execution Lifecycle Linearization, and Durable Au
   // 13. Conflicting settlement is rejected
   it('13. should reject contradictory settlement attempt fail-closed', async () => {
     const { auth } = await seedStandardTopology();
+    const leaseRes = leaseService.acquireForAssignment('asgn-succ', 60000) as SlotLeaseSuccess;
+    repo.acceptHandoffSuccessorExecution({
+      authorizationId: auth.id,
+      leaseId: leaseRes.lease.id,
+      leaseToken: leaseRes.lease.lease_token,
+      expectedSuccessorEpoch: 2,
+    });
     repo.claimExecutionAuthorization(auth.id, new Date().toISOString());
     repo.claimAdapterExecutionStart({
       authorizationId: auth.id,
@@ -806,6 +821,8 @@ describe('R5I6 Crash Recovery, Execution Lifecycle Linearization, and Durable Au
       leaseToken: leaseRes.lease.lease_token,
       expectedSuccessorEpoch: 2,
     });
+    repo.claimExecutionAuthorization(auth.id, new Date().toISOString());
+    db.prepare(`UPDATE account_leases SET expires_at = datetime('now', '-10 minutes') WHERE id = ?`).run(leaseRes.lease.id);
 
     // Simulate crash right after acceptance
     const report = scanner.scanAndReconcile();
@@ -837,8 +854,9 @@ describe('R5I6 Crash Recovery, Execution Lifecycle Linearization, and Durable Au
       expectedSuccessorEpoch: 2,
     });
 
-    // Claim dispatch but crash before adapter_started_at
+    // Claim dispatch but crash before adapter_started_at with expired lease
     repo.claimExecutionAuthorization(auth.id, new Date().toISOString());
+    db.prepare(`UPDATE account_leases SET expires_at = datetime('now', '-10 minutes') WHERE id = ?`).run(leaseRes.lease.id);
 
     const report = scanner.scanAndReconcile();
     expect(report.preAdapterNotStartedCount).toBe(1);
@@ -1127,6 +1145,7 @@ describe('R5I6 Crash Recovery, Execution Lifecycle Linearization, and Durable Au
       SET adapter_started_at = datetime('now'),
           adapter_finished_at = datetime('now'),
           adapter_outcome = 'RETURNED',
+          settlement_status = 'COMPLETED',
           settled_at = datetime('now'),
           settlement_evidence_json = ?,
           settlement_evidence_hash = ?
@@ -1261,6 +1280,13 @@ describe('R5I6 Crash Recovery, Execution Lifecycle Linearization, and Durable Au
   // 31. Evidence-hash corruption is rejected
   it('31. should reject settlement conflict if evidence hash does not match', async () => {
     const { auth } = await seedStandardTopology();
+    const leaseRes = leaseService.acquireForAssignment('asgn-succ', 60000) as SlotLeaseSuccess;
+    repo.acceptHandoffSuccessorExecution({
+      authorizationId: auth.id,
+      leaseId: leaseRes.lease.id,
+      leaseToken: leaseRes.lease.lease_token,
+      expectedSuccessorEpoch: 2,
+    });
     const dummyHash = computeSha256('dummy-settlement-payload');
     db.prepare(`
       UPDATE execution_authorizations
@@ -1318,8 +1344,8 @@ describe('R5I6 Crash Recovery, Execution Lifecycle Linearization, and Durable Au
     const res1 = await seedStandardTopology({ transferId: 'xfer-1', taskId: 'tsk-1', attemptPredId: 'att-pred-1', attemptSuccId: 'att-succ-1', asgnPredId: 'asgn-pred-1', asgnSuccId: 'asgn-succ-1' });
     const res2 = await seedStandardTopology({ transferId: 'xfer-2', taskId: 'tsk-2', attemptPredId: 'att-pred-2', attemptSuccId: 'att-succ-2', asgnPredId: 'asgn-pred-2', asgnSuccId: 'asgn-succ-2' });
 
-    // Arm candidate 1
-    db.prepare(`UPDATE execution_authorizations SET lifecycle_version = 1 WHERE id = ?`).run(res1.auth.id);
+    // Arm candidate 1 as DISPATCHED
+    db.prepare(`UPDATE execution_authorizations SET lifecycle_version = 1, status = 'DISPATCHED' WHERE id = ?`).run(res1.auth.id);
 
     // Corrupt binding on transfer 2 to a valid mismatched task
     db.prepare(`UPDATE handoff_transfers SET task_id = 'tsk-1' WHERE id = 'xfer-2'`).run();
@@ -1478,15 +1504,15 @@ describe('R5I6 Crash Recovery, Execution Lifecycle Linearization, and Durable Au
     // Prematurely set transfer to COMPLETED so the settlement update changes === 0
     db.prepare(`UPDATE handoff_transfers SET status = 'COMPLETED' WHERE id = 'xfer-1'`).run();
 
-    expect(() => {
-      repo.settleExecutionResult({
-        authorizationId: auth.id,
-        executionId: 'exec-1',
-        outcome: 'RETURNED',
-        status: 'COMPLETED',
-        resultPayload: { test: true },
-      });
-    }).toThrow(/SETTLEMENT_TRANSFER_UPDATE_FAILED/);
+    const res = repo.settleExecutionResult({
+      authorizationId: auth.id,
+      executionId: 'exec-1',
+      outcome: 'RETURNED',
+      status: 'COMPLETED',
+      resultPayload: { test: true },
+    });
+    expect(res.success).toBe(false);
+    expect(res.error).toMatch(/TRANSFER_NOT_ACCEPTED/);
 
     // Verify auth was NOT settled due to rollback
     const reloadedAuth = repo.getExecutionAuthorization(auth.id)!;
@@ -1510,7 +1536,7 @@ describe('R5I6 Crash Recovery, Execution Lifecycle Linearization, and Durable Au
       expectedEpoch: 2,
     });
 
-    const fixedTimestamp = '2026-08-29T12:00:00.000Z';
+    const fixedTimestamp = new Date(Date.now() + 1000).toISOString();
     const settleRes = repo.settleExecutionResult({
       authorizationId: auth.id,
       executionId: 'exec-1',
@@ -1570,16 +1596,16 @@ describe('R5I6 Crash Recovery, Execution Lifecycle Linearization, and Durable Au
     // Simulate slot reassigned to another assignment
     db.prepare(`UPDATE worker_slots SET current_assignment_id = 'asgn-other' WHERE id = 'slot-1'`).run();
 
-    expect(() => {
-      repo.releaseGuardedAccountLeaseAndIdleSlot({
-        leaseId: leaseRes.lease.id,
-        expectedAssignmentId: 'asgn-succ',
-        expectedAccountId: 'acc-1',
-        expectedSlotId: 'slot-1',
-      });
-    }).toThrow(/SLOT_REASSIGNED/);
+    const releaseRes = repo.releaseGuardedAccountLeaseAndIdleSlot({
+      leaseId: leaseRes.lease.id,
+      expectedAssignmentId: 'asgn-succ',
+      expectedAccountId: 'acc-1',
+      expectedSlotId: 'slot-1',
+    });
+    expect(releaseRes.success).toBe(false);
+    expect(releaseRes.error).toMatch(/SLOT_ASSIGNMENT_MISMATCH/);
 
-    // Slot remains assigned to asgn-other and lease was not released due to transaction rollback
+    // Slot remains assigned to asgn-other and lease was not released
     const slot = repo.getWorkerSlot('slot-1')!;
     expect(slot.current_assignment_id).toBe('asgn-other');
     const lease = repo.getActiveLeaseForAssignment('asgn-succ');
@@ -1650,8 +1676,8 @@ describe('R5I6 Crash Recovery, Execution Lifecycle Linearization, and Durable Au
     expect(report.items[0].disposition).toBe('UNRESOLVED_FENCED');
   });
 
-  // 50. Dispatch settlement failure leaves execution recoverable and unresolved
-  it('50. should fail dispatch when settlement fails, leaving execution recoverable', async () => {
+  // 50. Dispatch settlement failure returns RECOVERY_FENCED, retaining lease, slot, and worktree
+  it('50. should return RECOVERY_FENCED on settlement failure and retain lease, slot, and worktree', async () => {
     const { auth } = await seedStandardTopology();
 
     // Spy on settleExecutionResult to simulate database / transaction failure during settlement
@@ -1664,12 +1690,513 @@ describe('R5I6 Crash Recovery, Execution Lifecycle Linearization, and Durable Au
     });
 
     const schedRes = await scheduler.execute(auth.id);
-    expect(schedRes.status).toBe('PROVIDER_FAILED');
+    expect(schedRes.status).toBe('RECOVERY_FENCED');
     expect(schedRes.providerResult?.errorCode).toBe('SETTLEMENT_FAILED');
 
     // Execution authorization remains DISPATCHED and started, recoverable by scanner
     const reloadedAuth = repo.getExecutionAuthorization(auth.id)!;
     expect(reloadedAuth.adapter_started_at).not.toBeNull();
     expect(reloadedAuth.settled_at).toBeNull();
+
+    // Lease remains active and unreleased for recovery fencing
+    const activeLease = repo.getActiveLeaseForAssignment('asgn-succ');
+    expect(activeLease).not.toBeNull();
+
+    // Slot remains in LEASED state
+    const slot = repo.getWorkerSlot('slot-1')!;
+    expect(slot.status).toBe('LEASED');
+  });
+
+  // 51. Recovery-fenced execution cannot start another successor or adapter
+  it('51. should reject subsequent execution starts on a recovery-fenced authorization', async () => {
+    const { auth } = await seedStandardTopology();
+    repo.claimExecutionAuthorization(auth.id, new Date().toISOString());
+    repo.claimAdapterExecutionStart({
+      authorizationId: auth.id,
+      executionId: 'exec-1',
+      expectedEpoch: 2,
+    });
+
+    // Attempting to claim adapter execution start again for same authorization fails
+    const secondClaim = repo.claimAdapterExecutionStart({
+      authorizationId: auth.id,
+      executionId: 'exec-2',
+      expectedEpoch: 2,
+    });
+    expect(secondClaim.success).toBe(false);
+    expect(secondClaim.error).toMatch(/EXECUTION_ID_CONFLICT|EXECUTION_ALREADY_STARTED/);
+  });
+
+  // 52. RETURNED + FAILED remains FAILED through incomplete-state recovery
+  it('52. should recover incomplete state as FAILED when outcome is RETURNED and settlement_status is FAILED', async () => {
+    const { auth } = await seedStandardTopology();
+    repo.claimExecutionAuthorization(auth.id, new Date().toISOString());
+    repo.claimAdapterExecutionStart({
+      authorizationId: auth.id,
+      executionId: 'exec-1',
+      expectedEpoch: 2,
+    });
+
+    const finishIso = '2026-08-29T12:00:00.000Z';
+    const evidence = {
+      authorization_id: auth.id,
+      execution_id: 'exec-1',
+      lifecycle_version: 1,
+      task_id: auth.task_id,
+      project_id: auth.project_id,
+      attempt_id: auth.attempt_id,
+      assignment_id: auth.assignment_id,
+      settlement_status: 'FAILED',
+      outcome: 'RETURNED',
+      finished_at: finishIso,
+      result_payload: { status: 'FAILED' },
+      error_json: null,
+    };
+    const evidenceJson = canonicalJsonStringify(evidence);
+    const evidenceHash = computeSha256(evidenceJson);
+
+    // Simulate crash after auth settlement update but before transfer update
+    db.prepare(`
+      UPDATE execution_authorizations
+      SET settlement_status = 'FAILED',
+          adapter_finished_at = ?,
+          adapter_outcome = 'RETURNED',
+          settled_at = ?,
+          settlement_evidence_json = ?,
+          settlement_evidence_hash = ?
+      WHERE id = ?
+    `).run(finishIso, finishIso, evidenceJson, evidenceHash, auth.id);
+
+    const report = scanner.scanAndReconcile();
+    expect(report.resultPersistedStateIncompleteCount).toBe(1);
+    expect(report.items[0].disposition).toBe('TERMINAL_STATE_RECONCILED');
+
+    const transfer = repo.getHandoffTransfer('xfer-1')!;
+    expect(transfer.status).toBe('FAILED');
+    const attempt = repo.getTaskAttempt('att-succ')!;
+    expect(attempt.status).toBe('FAILED');
+    const assignment = repo.getAgentAssignment('asgn-succ')!;
+    expect(assignment.status).toBe('FAILED');
+  });
+
+  // 53. RETURNED + CANCELLED remains CANCELLED through incomplete-state recovery
+  it('53. should recover incomplete state as CANCELLED when outcome is RETURNED and settlement_status is CANCELLED', async () => {
+    const { auth } = await seedStandardTopology();
+    repo.claimExecutionAuthorization(auth.id, new Date().toISOString());
+    repo.claimAdapterExecutionStart({
+      authorizationId: auth.id,
+      executionId: 'exec-1',
+      expectedEpoch: 2,
+    });
+
+    const finishIso = '2026-08-29T12:00:00.000Z';
+    const evidence = {
+      authorization_id: auth.id,
+      execution_id: 'exec-1',
+      lifecycle_version: 1,
+      task_id: auth.task_id,
+      project_id: auth.project_id,
+      attempt_id: auth.attempt_id,
+      assignment_id: auth.assignment_id,
+      settlement_status: 'CANCELLED',
+      outcome: 'RETURNED',
+      finished_at: finishIso,
+      result_payload: { status: 'CANCELLED' },
+      error_json: null,
+    };
+    const evidenceJson = canonicalJsonStringify(evidence);
+    const evidenceHash = computeSha256(evidenceJson);
+
+    db.prepare(`
+      UPDATE execution_authorizations
+      SET settlement_status = 'CANCELLED',
+          adapter_finished_at = ?,
+          adapter_outcome = 'RETURNED',
+          settled_at = ?,
+          settlement_evidence_json = ?,
+          settlement_evidence_hash = ?
+      WHERE id = ?
+    `).run(finishIso, finishIso, evidenceJson, evidenceHash, auth.id);
+
+    const report = scanner.scanAndReconcile();
+    expect(report.resultPersistedStateIncompleteCount).toBe(1);
+    expect(report.items[0].disposition).toBe('TERMINAL_STATE_RECONCILED');
+
+    const transfer = repo.getHandoffTransfer('xfer-1')!;
+    expect(transfer.status).toBe('CANCELLED');
+  });
+
+  // 54. Conflicting terminal states are never overwritten
+  it('54. should classify as AUTHORITY_CONFLICT when transfer has conflicting terminal state against settlement_status', async () => {
+    const { auth } = await seedStandardTopology();
+    repo.claimExecutionAuthorization(auth.id, new Date().toISOString());
+    repo.claimAdapterExecutionStart({
+      authorizationId: auth.id,
+      executionId: 'exec-1',
+      expectedEpoch: 2,
+    });
+
+    const finishIso = '2026-08-29T12:00:00.000Z';
+    const evidence = {
+      authorization_id: auth.id,
+      execution_id: 'exec-1',
+      lifecycle_version: 1,
+      task_id: auth.task_id,
+      project_id: auth.project_id,
+      attempt_id: auth.attempt_id,
+      assignment_id: auth.assignment_id,
+      settlement_status: 'COMPLETED',
+      outcome: 'RETURNED',
+      finished_at: finishIso,
+      result_payload: { status: 'COMPLETED' },
+      error_json: null,
+    };
+    const evidenceJson = canonicalJsonStringify(evidence);
+    const evidenceHash = computeSha256(evidenceJson);
+
+    // Set auth to settled as COMPLETED, but transfer already terminal as FAILED
+    db.prepare(`
+      UPDATE execution_authorizations
+      SET settlement_status = 'COMPLETED',
+          adapter_finished_at = ?,
+          adapter_outcome = 'RETURNED',
+          settled_at = ?,
+          settlement_evidence_json = ?,
+          settlement_evidence_hash = ?
+      WHERE id = ?
+    `).run(finishIso, finishIso, evidenceJson, evidenceHash, auth.id);
+    db.prepare(`UPDATE handoff_transfers SET status = 'FAILED' WHERE id = 'xfer-1'`).run();
+
+    const report = scanner.scanAndReconcile();
+    expect(report.authorityConflictCount).toBe(1);
+    expect(report.items[0].classification).toBe('AUTHORITY_CONFLICT');
+    expect(report.items[0].disposition).toBe('REJECTED_INTEGRITY_CONFLICT');
+
+    // Transfer status was NOT overwritten
+    const transfer = repo.getHandoffTransfer('xfer-1')!;
+    expect(transfer.status).toBe('FAILED');
+  });
+
+  // 55. Fresh AUTHORIZED and unexpired pre-adapter records are not terminalized
+  it('55. should not terminalize fresh AUTHORIZED authorizations or unexpired active leases', async () => {
+    const { auth } = await seedStandardTopology();
+    // Auth is AUTHORIZED, not DISPATCHED
+    expect(auth.status).toBe('AUTHORIZED');
+
+    const report = scanner.scanAndReconcile();
+    expect(report.unresolvedCount).toBe(1);
+    expect(report.items[0].classification).toBe('PRE_ADAPTER_NOT_STARTED');
+    expect(report.items[0].disposition).toBe('UNRESOLVED_FENCED');
+    expect(report.items[0].mutatedTerminalState).toBe(false);
+
+    // Auth remains AUTHORIZED
+    const reloadedAuth = repo.getExecutionAuthorization(auth.id)!;
+    expect(reloadedAuth.status).toBe('AUTHORIZED');
+  });
+
+  // 56. Missing attempt/assignment/transfer bindings fail settlement
+  it('56. should fail settlement when attempt, assignment, or transfer bindings are missing', async () => {
+    const { auth } = await seedStandardTopology();
+    const leaseRes = leaseService.acquireForAssignment('asgn-succ', 60000) as SlotLeaseSuccess;
+    repo.acceptHandoffSuccessorExecution({
+      authorizationId: auth.id,
+      leaseId: leaseRes.lease.id,
+      leaseToken: leaseRes.lease.lease_token,
+      expectedSuccessorEpoch: 2,
+    });
+    repo.claimExecutionAuthorization(auth.id, new Date().toISOString());
+    repo.claimAdapterExecutionStart({
+      authorizationId: auth.id,
+      executionId: 'exec-1',
+      expectedEpoch: 2,
+    });
+
+    // Delete task attempt with FK check temporarily disabled to test binding check
+    db.pragma('foreign_keys = OFF');
+    db.prepare(`DELETE FROM task_attempts WHERE id = 'att-succ'`).run();
+    db.pragma('foreign_keys = ON');
+
+    const settleRes = repo.settleExecutionResult({
+      authorizationId: auth.id,
+      executionId: 'exec-1',
+      outcome: 'RETURNED',
+      status: 'COMPLETED',
+      resultPayload: {},
+    });
+    expect(settleRes.success).toBe(false);
+    expect(settleRes.error).toMatch(/ATTEMPT_NOT_FOUND/);
+
+    // Authorization remains unsettled
+    const reloadedAuth = repo.getExecutionAuthorization(auth.id)!;
+    expect(reloadedAuth.settled_at).toBeNull();
+  });
+
+  // 57. Settlement from ROUTED, AUTHORIZED, PENDING, or ASSIGNED fails
+  it('57. should reject settlement when authorization is not in DISPATCHED state', async () => {
+    const { auth } = await seedStandardTopology();
+    // Auth is in AUTHORIZED status
+    const settleRes = repo.settleExecutionResult({
+      authorizationId: auth.id,
+      executionId: 'exec-1',
+      outcome: 'RETURNED',
+      status: 'COMPLETED',
+      resultPayload: {},
+    });
+    expect(settleRes.success).toBe(false);
+    expect(settleRes.error).toMatch(/INVALID_AUTH_STATUS/);
+  });
+
+  // 58. Wrong account, routing decision, provider, resource, or epoch fails settlement
+  it('58. should reject settlement on mismatch of provider, resource, account, or epoch', async () => {
+    const { auth } = await seedStandardTopology();
+    const leaseRes = leaseService.acquireForAssignment('asgn-succ', 60000) as SlotLeaseSuccess;
+    repo.acceptHandoffSuccessorExecution({
+      authorizationId: auth.id,
+      leaseId: leaseRes.lease.id,
+      leaseToken: leaseRes.lease.lease_token,
+      expectedSuccessorEpoch: 2,
+    });
+    repo.claimExecutionAuthorization(auth.id, new Date().toISOString());
+    repo.claimAdapterExecutionStart({
+      authorizationId: auth.id,
+      executionId: 'exec-1',
+      expectedEpoch: 2,
+    });
+
+    // Mutate task ownership epoch
+    db.prepare(`UPDATE tasks SET ownership_epoch = 99 WHERE id = ?`).run(auth.task_id);
+
+    const settleRes = repo.settleExecutionResult({
+      authorizationId: auth.id,
+      executionId: 'exec-1',
+      outcome: 'RETURNED',
+      status: 'COMPLETED',
+      resultPayload: {},
+    });
+    expect(settleRes.success).toBe(false);
+    expect(settleRes.error).toMatch(/OWNERSHIP_EPOCH_MISMATCH/);
+  });
+
+  // 59. Guarded release rejects wrong lease-slot binding
+  it('59. should reject guarded lease release if expected slot does not match lease slot', async () => {
+    await seedStandardTopology();
+    const leaseRes = leaseService.acquireForAssignment('asgn-succ', 60000) as SlotLeaseSuccess;
+
+    const res = repo.releaseGuardedAccountLeaseAndIdleSlot({
+      leaseId: leaseRes.lease.id,
+      expectedAssignmentId: 'asgn-succ',
+      expectedAccountId: 'acc-1',
+      expectedSlotId: 'slot-wrong',
+    });
+    expect(res.success).toBe(false);
+    expect(res.error).toMatch(/SLOT_NOT_FOUND|LEASE_SLOT_MISMATCH/);
+  });
+
+  // 60. Guarded release rejects current_execution_id mismatch
+  it('60. should reject guarded lease release if current_execution_id on slot mismatches', async () => {
+    await seedStandardTopology();
+    const leaseRes = leaseService.acquireForAssignment('asgn-succ', 60000) as SlotLeaseSuccess;
+    db.prepare(`UPDATE worker_slots SET current_execution_id = 'exec-active' WHERE id = 'slot-1'`).run();
+
+    const res = repo.releaseGuardedAccountLeaseAndIdleSlot({
+      leaseId: leaseRes.lease.id,
+      expectedAssignmentId: 'asgn-succ',
+      expectedAccountId: 'acc-1',
+      expectedSlotId: 'slot-1',
+      expectedExecutionId: 'exec-different',
+    });
+    expect(res.success).toBe(false);
+    expect(res.error).toMatch(/SLOT_EXECUTION_MISMATCH/);
+  });
+
+  // 61. Guarded release failure rolls back terminal mutations
+  it('61. should roll back terminal mutations when guarded lease release fails during recovery scan', async () => {
+    const { auth } = await seedStandardTopology();
+    repo.claimExecutionAuthorization(auth.id, new Date().toISOString());
+    const leaseRes = leaseService.acquireForAssignment('asgn-succ', 60000) as SlotLeaseSuccess;
+
+    // Mutate slot status to BREAK guarded release
+    db.prepare(`UPDATE worker_slots SET status = 'OFFLINE' WHERE id = 'slot-1'`).run();
+
+    // Set auth to expired pre-adapter state
+    db.prepare(`UPDATE account_leases SET expires_at = datetime('now', '-10 minutes') WHERE id = ?`).run(leaseRes.lease.id);
+
+    const report = scanner.scanAndReconcile();
+    expect(report.authorityConflictCount).toBe(1);
+    expect(report.items[0].classification).toBe('AUTHORITY_CONFLICT');
+
+    // Transfer status was NOT modified due to rollback
+    const transfer = repo.getHandoffTransfer('xfer-1')!;
+    expect(transfer.status).toBe('AUTHORIZED');
+  });
+
+  // 62. Unacknowledged cancellation remains unresolved even with cancellation_requested_at
+  it('62. should keep execution as ADAPTER_IN_FLIGHT_UNRESOLVED when cancellation is unacknowledged', async () => {
+    const { auth } = await seedStandardTopology();
+    repo.claimExecutionAuthorization(auth.id, new Date().toISOString());
+    repo.claimAdapterExecutionStart({
+      authorizationId: auth.id,
+      executionId: 'exec-1',
+      expectedEpoch: 2,
+    });
+    repo.markCancellationRequested({
+      authorizationId: auth.id,
+      executionId: 'exec-1',
+    });
+
+    // Termination status is UNRESOLVED / proof source is CANCEL_UNACKNOWLEDGED
+    db.prepare(`
+      UPDATE execution_authorizations
+      SET termination_status = 'UNRESOLVED',
+          termination_proof_source = 'CANCEL_UNACKNOWLEDGED'
+      WHERE id = ?
+    `).run(auth.id);
+
+    const report = scanner.scanAndReconcile();
+    expect(report.adapterInFlightUnresolvedCount).toBe(1);
+    expect(report.items[0].disposition).toBe('UNRESOLVED_FENCED');
+    expect(report.items[0].mutatedTerminalState).toBe(false);
+  });
+
+  // 63. Missing or corrupt structured termination proof cannot terminalize
+  it('63. should reject terminalization when structured termination evidence hash is corrupted', async () => {
+    const { auth } = await seedStandardTopology();
+    repo.claimExecutionAuthorization(auth.id, new Date().toISOString());
+    repo.claimAdapterExecutionStart({
+      authorizationId: auth.id,
+      executionId: 'exec-1',
+      expectedEpoch: 2,
+    });
+
+    db.prepare(`
+      UPDATE execution_authorizations
+      SET termination_status = 'CONFIRMED_TERMINATED',
+          termination_source = 'PROVIDER_FINAL_ACK',
+          termination_proof_source = 'PROVIDER_FINAL_ACK',
+          termination_reason = 'EXECUTION_TIMEOUT',
+          termination_confirmed_at = datetime('now'),
+          terminated_at = datetime('now'),
+          termination_evidence_json = '{"proof":"corrupted"}',
+          termination_evidence_hash = 'ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff'
+      WHERE id = ?
+    `).run(auth.id);
+
+    const report = scanner.scanAndReconcile();
+    expect(report.authorityConflictCount).toBe(1);
+    expect(report.items[0].classification).toBe('AUTHORITY_CONFLICT');
+  });
+
+  // 64. Recovery event ID is deterministic and deduplicated
+  it('64. should generate deterministic recovery event ID and deduplicate across repeated scans', async () => {
+    const { auth } = await seedStandardTopology();
+    db.prepare(`UPDATE execution_authorizations SET status = 'INVALIDATED' WHERE id = ?`).run(auth.id);
+    db.prepare(`UPDATE handoff_transfers SET status = 'FAILED' WHERE id = 'xfer-1'`).run();
+    db.prepare(`UPDATE task_attempts SET status = 'FAILED' WHERE id = 'att-succ'`).run();
+    db.prepare(`UPDATE agent_assignments SET status = 'FAILED' WHERE id = 'asgn-succ'`).run();
+
+    scanner.scanAndReconcile();
+    const eventCount1 = (db.prepare('SELECT COUNT(*) as c FROM events').get() as any).c;
+
+    scanner.scanAndReconcile();
+    const eventCount2 = (db.prepare('SELECT COUNT(*) as c FROM events').get() as any).c;
+
+    expect(eventCount1).toBe(eventCount2);
+  });
+
+  // 65. Actual ProviderDispatchService replay test uses adapter spy and proves zero duplicate calls
+  it('65. should prove zero duplicate adapter calls on dispatch replay', async () => {
+    const { auth } = await seedStandardTopology();
+    const leaseRes = leaseService.acquireForAssignment('asgn-succ', 60000) as SlotLeaseSuccess;
+    repo.acceptHandoffSuccessorExecution({
+      authorizationId: auth.id,
+      leaseId: leaseRes.lease.id,
+      leaseToken: leaseRes.lease.lease_token,
+      expectedSuccessorEpoch: 2,
+    });
+
+    const executeSpy = vi.spyOn(adapterA, 'execute');
+
+    // First dispatch execution
+    const res1 = await dispatchService.dispatch(auth.id);
+    expect(res1.status).toBe('COMPLETED');
+    expect(executeSpy).toHaveBeenCalledTimes(1);
+
+    // Second dispatch execution replay fails closed without calling adapter
+    const res2 = await dispatchService.dispatch(auth.id);
+    expect(res2.status).toBe('FAILED');
+    // Adapter execute was NOT called a second time
+    expect(executeSpy).toHaveBeenCalledTimes(1);
+  });
+
+  // 66. Adapter start timestamp is generated at the start-claim transaction, not dispatch entry
+  it('66. should generate adapter start timestamp atomically during claimAdapterExecutionStart', async () => {
+    const { auth } = await seedStandardTopology();
+    repo.claimExecutionAuthorization(auth.id, new Date().toISOString());
+
+    const beforeClaim = new Date().toISOString();
+    const claimRes = repo.claimAdapterExecutionStart({
+      authorizationId: auth.id,
+      executionId: 'exec-atomic-start',
+      expectedEpoch: 2,
+    });
+    expect(claimRes.success).toBe(true);
+
+    const reloadedAuth = repo.getExecutionAuthorization(auth.id)!;
+    expect(reloadedAuth.adapter_started_at).not.toBeNull();
+    expect(new Date(reloadedAuth.adapter_started_at!).getTime()).toBeGreaterThanOrEqual(new Date(beforeClaim).getTime());
+  });
+
+  // 67. Invalid lifecycle versions and non-hex hashes fail at the database boundary
+  it('67. should reject invalid lifecycle versions and non-hex hashes at database CHECK constraint', () => {
+    expect(() => {
+      db.prepare(`
+        INSERT INTO execution_authorizations (
+          id, project_id, task_id, attempt_id, task_revision, base_sha, repository_head_sha,
+          manager_message_id, manager_payload_hash, routing_decision_id, selected_resource_id,
+          selected_provider_id, instruction_payload_hash, context_manifest_hash,
+          canonical_instructions_json, context_files_json, status, created_at, lifecycle_version
+        ) VALUES (
+          'auth-invalid-lc', 'proj-1', 'task-1', 'att-1', 1, 'sha', 'sha',
+          'msg-1', 'hash', 'rd-1', 'res-1',
+          'prov-1', 'hash', 'hash',
+          '{}', '[]', 'AUTHORIZED', datetime('now'), 99
+        )
+      `).run();
+    }).toThrow(/CHECK constraint failed/);
+
+    expect(() => {
+      db.prepare(`
+        INSERT INTO execution_recovery_states (
+          id, authorization_id, transfer_id, recovery_classification, disposition,
+          canonical_evidence_json, evidence_hash, first_detected_at, last_scanned_at, created_at, updated_at
+        ) VALUES (
+          'rec-invalid-hash', 'auth-1', 'xfer-1', 'ALREADY_RECONCILED', 'NO_OP_ALREADY_RECONCILED',
+          '{}', 'INVALID-NON-HEX-HASH', datetime('now'), datetime('now'), datetime('now'), datetime('now')
+        )
+      `).run();
+    }).toThrow(/CHECK constraint failed/);
+  });
+
+  // 68. Settle execution rejects incompatible outcome and status combinations
+  it('68. should reject incompatible adapter outcome and settlement status combinations', async () => {
+    const { auth } = await seedStandardTopology();
+    repo.claimExecutionAuthorization(auth.id, new Date().toISOString());
+    repo.claimAdapterExecutionStart({
+      authorizationId: auth.id,
+      executionId: 'exec-1',
+      expectedEpoch: 2,
+    });
+
+    // THREW with COMPLETED is incompatible
+    const settleRes = repo.settleExecutionResult({
+      authorizationId: auth.id,
+      executionId: 'exec-1',
+      outcome: 'THREW',
+      status: 'COMPLETED',
+      resultPayload: {},
+    });
+    expect(settleRes.success).toBe(false);
+    expect(settleRes.error).toMatch(/INCOMPATIBLE_OUTCOME_STATUS/);
   });
 });
+

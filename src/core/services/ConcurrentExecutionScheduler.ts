@@ -32,7 +32,8 @@ export type SchedulerExecutionStatus =
   | 'WORKTREE_CLEANUP_FAILED'
   | 'LEASE_RELEASE_FAILED'
   | 'LEASE_OWNERSHIP_LOST'
-  | 'SCHEDULED_DISPATCH_FAILED';
+  | 'SCHEDULED_DISPATCH_FAILED'
+  | 'RECOVERY_FENCED';
 
 export interface SchedulerExecutionResult {
   status: SchedulerExecutionStatus;
@@ -376,6 +377,32 @@ export class ConcurrentExecutionScheduler {
       };
     } finally {
       supervisor.setDispatchPending(false);
+    }
+
+    // 7.5. Recovery Fencing Check (R5I6)
+    // When settlement fails or execution may have started without durable settlement,
+    // retain worktree and unreleased lease for recovery scanner; do NOT release lease or idle slot.
+    const isRecoveryFenced =
+      providerResult.errorCode === 'SETTLEMENT_FAILED' ||
+      (typeof providerResult.error === 'string' &&
+        (providerResult.error.includes('SETTLEMENT_FAILED') ||
+          providerResult.error.includes('ALREADY_CLAIMED') ||
+          providerResult.error.includes('START_CLAIM_CAS_FAILED') ||
+          providerResult.error.includes('EXECUTION_ALREADY_STARTED')));
+
+    if (isRecoveryFenced) {
+      await supervisor.stop();
+      return {
+        status: 'RECOVERY_FENCED',
+        authorizationId,
+        assignmentId: assignment.id,
+        workerSlotId,
+        leaseId,
+        workspaceOwnershipDigest,
+        providerResult,
+        errorCode: providerResult.errorCode,
+        error: `RECOVERY_FENCED: ${providerResult.error || 'Execution settlement failed or unconfirmed adapter execution. Worktree and lease retained for crash recovery scanner.'}`,
+      };
     }
 
     // 8. Post-Dispatch Lease Loss Dominance Check

@@ -473,6 +473,20 @@ export interface PolicyRule {
 export type ExecutionAuthorizationStatus = 'AUTHORIZED' | 'DISPATCHED' | 'INVALIDATED';
 export type AdapterOutcome = 'RETURNED' | 'THREW' | 'CANCELLED' | 'TIMED_OUT' | 'UNKNOWN';
 export type ProviderTerminationStatus = 'CONFIRMED_TERMINATED' | 'UNRESOLVED';
+export type SettlementStatus = 'COMPLETED' | 'FAILED' | 'CANCELLED';
+
+export type TerminationReason =
+  | 'EXECUTION_TIMEOUT'
+  | 'EXECUTION_CANCELLED'
+  | 'HEARTBEAT_TIMEOUT'
+  | 'MANUAL_INTERVENTION';
+
+export type TerminationProofSource =
+  | 'LOCAL_PROCESS_EXIT'
+  | 'PROVIDER_FINAL_ACK'
+  | 'TIMEOUT_UNACKNOWLEDGED'
+  | 'CANCEL_UNACKNOWLEDGED'
+  | 'DISCONNECT_UNKNOWN';
 
 export interface ExecutionAuthorization {
   id: string;
@@ -485,13 +499,23 @@ export interface ExecutionAuthorization {
   manager_message_id: string;
   manager_payload_hash: string;
   routing_decision_id: string;
+  selected_account_id?: string;
   selected_resource_id: string;
   selected_provider_id: string;
+  authorized_roles?: string[];
   instruction_payload_hash: string;
   context_manifest_hash: string;
   canonical_instructions_json: string;
   context_files_json: string;
+  context_items_json?: string | null;
   canonical_payload_json: string | null;
+  expected_task_revision?: number;
+  expected_task_title?: string;
+  expected_task_description?: string;
+  expected_task_acceptance_criteria?: string;
+  expected_task_constraints?: string;
+  expected_task_base_sha?: string;
+  expected_task_allow_commands?: string[];
   status: ExecutionAuthorizationStatus;
   created_at: string;
   dispatched_at: string | null;
@@ -503,10 +527,15 @@ export interface ExecutionAuthorization {
   adapter_finished_at?: string | null;
   adapter_outcome?: AdapterOutcome | null;
   adapter_error_json?: string | null;
+  settlement_status?: SettlementStatus | null;
   cancellation_requested_at?: string | null;
   termination_confirmed_at?: string | null;
   termination_status?: ProviderTerminationStatus | null;
   termination_source?: string | null;
+  termination_reason?: TerminationReason | null;
+  termination_proof_source?: TerminationProofSource | null;
+  termination_evidence_json?: string | null;
+  termination_evidence_hash?: string | null;
   terminated_at?: string | null;
   settled_at?: string | null;
   settlement_evidence_json?: string | null;

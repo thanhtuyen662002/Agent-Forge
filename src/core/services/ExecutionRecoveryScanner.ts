@@ -10,6 +10,7 @@ import {
   ExecutionRecoveryScanItemResult,
   ExecutionRecoveryScanReport,
   HandoffTransferStatus,
+  SettlementStatus,
 } from '../types/domain';
 import { canonicalJsonStringify, computeSha256 } from '../context/ContextIntegrity';
 
@@ -56,7 +57,11 @@ export class ExecutionRecoveryScanner {
         switch (itemResult.classification) {
           case 'PRE_ADAPTER_NOT_STARTED':
             preAdapterNotStartedCount++;
-            reconciledCount++;
+            if (itemResult.mutatedTerminalState || itemResult.disposition === 'TERMINALIZED_SAFE_EXPIRED') {
+              reconciledCount++;
+            } else {
+              unresolvedCount++;
+            }
             break;
           case 'ADAPTER_IN_FLIGHT_UNRESOLVED':
             adapterInFlightUnresolvedCount++;
@@ -88,6 +93,35 @@ export class ExecutionRecoveryScanner {
             break;
         }
       } catch (err: any) {
+        // Record fail-closed conflict disposition in separate transaction
+        const failureEvidenceJson = canonicalJsonStringify({
+          authorization_id: row.authorization_id,
+          scanner_exception: err.message,
+        });
+        const failureEvidenceHash = computeSha256(failureEvidenceJson);
+        const existingRecovery = this.repo.getExecutionRecoveryState(row.authorization_id);
+
+        try {
+          this.repo.runInImmediateTransaction(() => {
+            const transfer = this.repo.getHandoffTransferBySuccessorAuthId(row.authorization_id);
+            this.repo.upsertExecutionRecoveryState({
+              authorization_id: row.authorization_id,
+              transfer_id: transfer?.id ?? '',
+              execution_id: null,
+              lifecycle_version: null,
+              recovery_classification: 'AUTHORITY_CONFLICT',
+              disposition: 'REJECTED_INTEGRITY_CONFLICT',
+              canonical_evidence_json: failureEvidenceJson,
+              evidence_hash: failureEvidenceHash,
+              mutated_terminal_state: false,
+              mutated_resources: false,
+              resolved_at: null,
+            });
+          });
+        } catch {
+          // Ignore secondary logging failure
+        }
+
         items.push({
           authorizationId: row.authorization_id,
           transferId: '',
@@ -97,7 +131,7 @@ export class ExecutionRecoveryScanner {
           disposition: 'REJECTED_INTEGRITY_CONFLICT',
           mutatedTerminalState: false,
           mutatedResources: false,
-          evidenceHash: '',
+          evidenceHash: failureEvidenceHash,
           error: `SCANNER_ITEM_ERROR: ${err.message}`,
         });
         authorityConflictCount++;
@@ -175,6 +209,8 @@ export class ExecutionRecoveryScanner {
           bindingConflictReason = `Assignment selected_provider_id "${assignment.selected_provider_id}" !== auth selected_provider_id "${auth.selected_provider_id}".`;
         } else if (assignment.selected_resource_id !== auth.selected_resource_id) {
           bindingConflictReason = `Assignment selected_resource_id "${assignment.selected_resource_id}" !== auth selected_resource_id "${auth.selected_resource_id}".`;
+        } else if (auth.selected_account_id && assignment.selected_account_id !== auth.selected_account_id) {
+          bindingConflictReason = `Assignment selected_account_id "${assignment.selected_account_id}" !== auth selected_account_id "${auth.selected_account_id}".`;
         }
       }
 
@@ -189,19 +225,27 @@ export class ExecutionRecoveryScanner {
       }
 
       // 1c. Recompute and verify Settlement Evidence Integrity if settled
-      if (!bindingConflictReason && (auth.settled_at || auth.settlement_evidence_json || auth.settlement_evidence_hash)) {
+      let parsedSettlementEvidence: any = null;
+      if (!bindingConflictReason && (auth.settled_at || auth.settlement_evidence_json || auth.settlement_evidence_hash || auth.settlement_status)) {
         if (!auth.settled_at || !auth.settlement_evidence_json || !auth.settlement_evidence_hash) {
           bindingConflictReason = `Incomplete settlement evidence metadata for settled auth "${auth.id}".`;
         } else {
           try {
-            const parsedEvidence = JSON.parse(auth.settlement_evidence_json);
-            const recomputedHash = computeSha256(canonicalJsonStringify(parsedEvidence));
+            parsedSettlementEvidence = JSON.parse(auth.settlement_evidence_json);
+            const recomputedHash = computeSha256(canonicalJsonStringify(parsedSettlementEvidence));
             if (recomputedHash !== auth.settlement_evidence_hash) {
               bindingConflictReason = `Settlement evidence hash mismatch: stored "${auth.settlement_evidence_hash}" !== recomputed "${recomputedHash}".`;
-            } else if (parsedEvidence.authorization_id !== auth.id) {
-              bindingConflictReason = `Settlement evidence authorization_id "${parsedEvidence.authorization_id}" !== auth id "${auth.id}".`;
-            } else if (parsedEvidence.execution_id && auth.execution_id && parsedEvidence.execution_id !== auth.execution_id) {
-              bindingConflictReason = `Settlement evidence execution_id "${parsedEvidence.execution_id}" !== auth execution_id "${auth.execution_id}".`;
+            } else if (parsedSettlementEvidence.authorization_id !== auth.id) {
+              bindingConflictReason = `Settlement evidence authorization_id "${parsedSettlementEvidence.authorization_id}" !== auth id "${auth.id}".`;
+            } else if (parsedSettlementEvidence.execution_id && auth.execution_id && parsedSettlementEvidence.execution_id !== auth.execution_id) {
+              bindingConflictReason = `Settlement evidence execution_id "${parsedSettlementEvidence.execution_id}" !== auth execution_id "${auth.execution_id}".`;
+            } else {
+              const evidenceStatus = parsedSettlementEvidence.settlement_status || parsedSettlementEvidence.status;
+              if (!evidenceStatus && !auth.settlement_status) {
+                bindingConflictReason = `Missing settlement status in both auth and evidence.`;
+              } else if (auth.settlement_status && evidenceStatus && evidenceStatus !== auth.settlement_status) {
+                bindingConflictReason = `Settlement status mismatch: auth "${auth.settlement_status}" !== evidence "${evidenceStatus}".`;
+              }
             }
           } catch (e: any) {
             bindingConflictReason = `Malformed settlement evidence JSON: ${e.message}`;
@@ -209,8 +253,19 @@ export class ExecutionRecoveryScanner {
         }
       }
 
-      if (!bindingConflictReason && auth.termination_status === 'CONFIRMED_TERMINATED' && (!auth.termination_source || auth.termination_source.trim() === '')) {
-        bindingConflictReason = `Termination status is CONFIRMED_TERMINATED but termination_source is empty.`;
+      // 1d. Validate structured termination proof if confirmed with evidence
+      if (!bindingConflictReason && auth.termination_status === 'CONFIRMED_TERMINATED') {
+        if (auth.termination_evidence_json) {
+          try {
+            const parsedTerm = JSON.parse(auth.termination_evidence_json);
+            const computedTermHash = computeSha256(canonicalJsonStringify(parsedTerm));
+            if (auth.termination_evidence_hash && computedTermHash !== auth.termination_evidence_hash) {
+              bindingConflictReason = `Termination evidence hash mismatch: stored "${auth.termination_evidence_hash}" !== computed "${computedTermHash}".`;
+            }
+          } catch (e: any) {
+            bindingConflictReason = `Malformed termination evidence JSON: ${e.message}`;
+          }
+        }
       }
 
       const canonicalEvidence = {
@@ -227,8 +282,11 @@ export class ExecutionRecoveryScanner {
         adapter_started_at: auth.adapter_started_at ?? null,
         adapter_finished_at: auth.adapter_finished_at ?? null,
         adapter_outcome: auth.adapter_outcome ?? null,
+        settlement_status: auth.settlement_status ?? null,
         termination_status: auth.termination_status ?? null,
         termination_source: auth.termination_source ?? null,
+        termination_reason: auth.termination_reason ?? null,
+        termination_proof_source: auth.termination_proof_source ?? null,
         terminated_at: auth.terminated_at ?? null,
         settled_at: auth.settled_at ?? null,
         settlement_evidence_hash: auth.settlement_evidence_hash ?? null,
@@ -278,47 +336,87 @@ export class ExecutionRecoveryScanner {
       }
 
       // Check Classification G: ALREADY_RECONCILED
-      const isTransferTerminal =
-        transfer.status === 'COMPLETED' ||
-        transfer.status === 'FAILED' ||
-        transfer.status === 'CANCELLED' ||
-        transfer.status === 'EXPIRED';
-      const isAttemptTerminal = !attempt || attempt.status === 'COMPLETED' || attempt.status === 'FAILED' || attempt.status === 'CANCELLED';
-      const isAssignmentTerminal = !assignment || assignment.status === 'COMPLETED' || assignment.status === 'FAILED' || assignment.status === 'CANCELLED';
-      const isLeaseCleared = !activeLease;
-      const isAuthTerminal = auth.status === 'INVALIDATED' || (auth.settled_at !== null && auth.settlement_evidence_hash !== null);
+      // Requires exact agreement among settlement status, transfer, attempt, assignment, and cleared leases
+      if (auth.settled_at) {
+        const expectedStatus = auth.settlement_status || parsedSettlementEvidence?.settlement_status || parsedSettlementEvidence?.status;
+        if (expectedStatus) {
+          const transferAgrees = transfer.status === expectedStatus;
+          const attemptAgrees = !attempt || attempt.status === expectedStatus;
+          const asgnAgrees = !assignment || assignment.status === expectedStatus;
+          const leaseCleared = !activeLease;
+          const slotClean = !workerSlot || workerSlot.status === 'IDLE';
 
-      if (isTransferTerminal && isAttemptTerminal && isAssignmentTerminal && isLeaseCleared && isAuthTerminal) {
-        const classification: ExecutionRecoveryClassification = 'ALREADY_RECONCILED';
-        const disposition: ExecutionRecoveryDisposition = 'NO_OP_ALREADY_RECONCILED';
+          if (transferAgrees && attemptAgrees && asgnAgrees && leaseCleared && slotClean) {
+            const classification: ExecutionRecoveryClassification = 'ALREADY_RECONCILED';
+            const disposition: ExecutionRecoveryDisposition = 'NO_OP_ALREADY_RECONCILED';
 
-        this.persistRecoveryAndEmit({
-          auth,
-          transfer,
-          assignment,
-          activeLease,
-          workerSlot,
-          classification,
-          disposition,
-          canonicalEvidenceJson,
-          evidenceHash,
-          mutatedTerminalState: false,
-          mutatedResources: false,
-          resolvedAt: existingRecovery?.resolved_at || nowIso,
-          existingRecovery,
-        });
+            this.persistRecoveryAndEmit({
+              auth,
+              transfer,
+              assignment,
+              activeLease,
+              workerSlot,
+              classification,
+              disposition,
+              canonicalEvidenceJson,
+              evidenceHash,
+              mutatedTerminalState: false,
+              mutatedResources: false,
+              resolvedAt: existingRecovery?.resolved_at || nowIso,
+              existingRecovery,
+            });
 
-        return {
-          authorizationId: auth.id,
-          transferId: transfer.id,
-          executionId: auth.execution_id ?? null,
-          lifecycleVersion: auth.lifecycle_version ?? null,
-          classification,
-          disposition,
-          mutatedTerminalState: false,
-          mutatedResources: false,
-          evidenceHash,
-        };
+            return {
+              authorizationId: auth.id,
+              transferId: transfer.id,
+              executionId: auth.execution_id ?? null,
+              lifecycleVersion: auth.lifecycle_version ?? null,
+              classification,
+              disposition,
+              mutatedTerminalState: false,
+              mutatedResources: false,
+              evidenceHash,
+            };
+          }
+        }
+      } else if (auth.status === 'INVALIDATED') {
+        const transferAgrees = transfer.status === 'FAILED' || transfer.status === 'EXPIRED';
+        const attemptAgrees = !attempt || attempt.status === 'FAILED';
+        const asgnAgrees = !assignment || assignment.status === 'FAILED';
+        const leaseCleared = !activeLease;
+
+        if (transferAgrees && attemptAgrees && asgnAgrees && leaseCleared) {
+          const classification: ExecutionRecoveryClassification = 'ALREADY_RECONCILED';
+          const disposition: ExecutionRecoveryDisposition = 'NO_OP_ALREADY_RECONCILED';
+
+          this.persistRecoveryAndEmit({
+            auth,
+            transfer,
+            assignment,
+            activeLease,
+            workerSlot,
+            classification,
+            disposition,
+            canonicalEvidenceJson,
+            evidenceHash,
+            mutatedTerminalState: false,
+            mutatedResources: false,
+            resolvedAt: existingRecovery?.resolved_at || nowIso,
+            existingRecovery,
+          });
+
+          return {
+            authorizationId: auth.id,
+            transferId: transfer.id,
+            executionId: auth.execution_id ?? null,
+            lifecycleVersion: auth.lifecycle_version ?? null,
+            classification,
+            disposition,
+            mutatedTerminalState: false,
+            mutatedResources: false,
+            evidenceHash,
+          };
+        }
       }
 
       // Check Classification B: LEGACY_UNCLASSIFIABLE (historical rows with lifecycle_version null)
@@ -358,56 +456,104 @@ export class ExecutionRecoveryScanner {
       // Check Classification A: PRE_ADAPTER_NOT_STARTED
       // Version-1 execution, adapter start was not claimed
       if (auth.lifecycle_version === 1 && !auth.adapter_started_at) {
+        const isLeaseActiveAndUnexpired = activeLease && new Date(activeLease.expires_at).getTime() > new Date(nowIso).getTime();
+
+        // Fresh AUTHORIZED records and unexpired active leases must not be terminalized
+        if (auth.status !== 'DISPATCHED' || isLeaseActiveAndUnexpired) {
+          const classification: ExecutionRecoveryClassification = 'PRE_ADAPTER_NOT_STARTED';
+          const disposition: ExecutionRecoveryDisposition = 'UNRESOLVED_FENCED';
+
+          this.persistRecoveryAndEmit({
+            auth,
+            transfer,
+            assignment,
+            activeLease,
+            workerSlot,
+            classification,
+            disposition,
+            canonicalEvidenceJson,
+            evidenceHash,
+            mutatedTerminalState: false,
+            mutatedResources: false,
+            resolvedAt: null,
+            existingRecovery,
+          });
+
+          return {
+            authorizationId: auth.id,
+            transferId: transfer.id,
+            executionId: auth.execution_id ?? null,
+            lifecycleVersion: auth.lifecycle_version,
+            classification,
+            disposition,
+            mutatedTerminalState: false,
+            mutatedResources: false,
+            evidenceHash,
+          };
+        }
+
+        // Safe expired / dispatched pre-adapter execution: terminalize atomically
         const classification: ExecutionRecoveryClassification = 'PRE_ADAPTER_NOT_STARTED';
         const disposition: ExecutionRecoveryDisposition = 'TERMINALIZED_SAFE_EXPIRED';
 
         // 1. Invalidate authorization
-        this.db
-          .prepare(`UPDATE execution_authorizations SET status = 'INVALIDATED' WHERE id = ?`)
+        const authRes = this.db
+          .prepare(`UPDATE execution_authorizations SET status = 'INVALIDATED' WHERE id = ? AND status = 'DISPATCHED'`)
           .run(auth.id);
+        if (authRes.changes !== 1) {
+          throw new Error(`PRE_ADAPTER_AUTH_INVALIDATION_FAILED: Expected 1 row changed, got ${authRes.changes}`);
+        }
 
         // 2. Terminalize transfer, attempt, assignment
         if (transfer.status === 'ACCEPTED' || transfer.status === 'AUTHORIZED' || transfer.status === 'ROUTED') {
           const newVersion = transfer.version + 1;
-          this.db
+          const trRes = this.db
             .prepare(`
               UPDATE handoff_transfers
               SET status = 'FAILED', completed_at = ?, version = ?, updated_at = ?
-              WHERE id = ?
+              WHERE id = ? AND status = ? AND version = ?
             `)
-            .run(nowIso, newVersion, nowIso, transfer.id);
+            .run(nowIso, newVersion, nowIso, transfer.id, transfer.status, transfer.version);
+          if (trRes.changes !== 1) {
+            throw new Error(`PRE_ADAPTER_TRANSFER_UPDATE_FAILED: Expected 1 row changed, got ${trRes.changes}`);
+          }
         }
 
-        if (attempt && attempt.status === 'RUNNING') {
-          this.db
-            .prepare(`UPDATE task_attempts SET status = 'FAILED', ended_at = ? WHERE id = ?`)
+        if (attempt && attempt.status !== 'FAILED') {
+          const attRes = this.db
+            .prepare(`UPDATE task_attempts SET status = 'FAILED', ended_at = ? WHERE id = ? AND status IN ('PENDING', 'RUNNING')`)
             .run(nowIso, attempt.id);
+          if (attRes.changes !== 1) {
+            throw new Error(`PRE_ADAPTER_ATTEMPT_UPDATE_FAILED: Expected 1 row changed, got ${attRes.changes}`);
+          }
         }
 
-        if (assignment && assignment.status === 'RUNNING') {
-          this.db
-            .prepare(`UPDATE agent_assignments SET status = 'FAILED', ended_at = ? WHERE id = ?`)
+        if (assignment && assignment.status !== 'FAILED') {
+          const asgnRes = this.db
+            .prepare(`UPDATE agent_assignments SET status = 'FAILED', ended_at = ? WHERE id = ? AND status IN ('ASSIGNED', 'RUNNING')`)
             .run(nowIso, assignment.id);
+          if (asgnRes.changes !== 1) {
+            throw new Error(`PRE_ADAPTER_ASSIGNMENT_UPDATE_FAILED: Expected 1 row changed, got ${asgnRes.changes}`);
+          }
         }
 
         // 3. Release matching lease and slot via guarded check
         let mutatedResources = false;
         if (activeLease && assignment) {
-          try {
-            const slotId = assignment.selected_worker_slot_id || activeLease.worker_slot_id;
-            const accountId = assignment.selected_account_id || activeLease.provider_account_id;
-            this.repo.releaseGuardedAccountLeaseAndIdleSlot({
-              leaseId: activeLease.id,
-              expectedAssignmentId: assignment.id,
-              expectedAccountId: accountId,
-              expectedSlotId: slotId,
-              expectedExecutionId: auth.execution_id,
-              releasedAt: nowIso,
-            });
-            mutatedResources = true;
-          } catch {
-            mutatedResources = false;
+          const slotId = assignment.selected_worker_slot_id || activeLease.worker_slot_id;
+          const accountId = assignment.selected_account_id || activeLease.provider_account_id;
+          const releaseRes = this.repo.releaseGuardedAccountLeaseAndIdleSlot({
+            leaseId: activeLease.id,
+            expectedAssignmentId: assignment.id,
+            expectedAccountId: accountId,
+            expectedSlotId: slotId,
+            expectedExecutionId: auth.execution_id,
+            releasedAt: nowIso,
+          });
+          if (!releaseRes.success) {
+            throw new Error(`PRE_ADAPTER_GUARDED_RELEASE_FAILED: ${releaseRes.error}`);
           }
+          mutatedResources = true;
         }
 
         this.persistRecoveryAndEmit({
@@ -439,21 +585,23 @@ export class ExecutionRecoveryScanner {
         };
       }
 
-      // Check Classification D: ADAPTER_TERMINATED_AFTER_TIMEOUT (requires explicit confirmed termination)
+      // Check Classification D: ADAPTER_TERMINATED_AFTER_TIMEOUT
+      // Only proven local process exit (LOCAL_PROCESS_EXIT) or provider-final acknowledgement (PROVIDER_FINAL_ACK) may terminalize
       if (auth.adapter_started_at && !auth.adapter_finished_at && auth.termination_status === 'CONFIRMED_TERMINATED') {
-        const isExplicitCancel =
-          auth.termination_source === 'USER_CANCELLED' ||
-          auth.termination_source === 'OWNER_CANCELLED' ||
-          auth.termination_source === 'DISPATCH_CANCELLED' ||
-          auth.termination_source === 'OPERATOR_CANCELLED' ||
-          auth.termination_source === 'CANCELLED_CONFIRMED' ||
-          auth.cancellation_requested_at !== null;
-        const isExplicitTimeout =
-          auth.termination_source === 'EXECUTION_TIMEOUT_SUPERVISOR' ||
-          auth.termination_source === 'PROVIDER_ADAPTER_TIMEOUT' ||
-          auth.termination_source === 'TIMEOUT_CONFIRMED';
+        const isProvenTermination =
+          (auth.termination_proof_source === 'LOCAL_PROCESS_EXIT' || auth.termination_proof_source === 'PROVIDER_FINAL_ACK') &&
+          auth.termination_confirmed_at !== null &&
+          auth.terminated_at !== null;
 
-        if (isExplicitCancel || isExplicitTimeout) {
+        if (isProvenTermination) {
+          const isExplicitCancel =
+            auth.termination_reason === 'EXECUTION_CANCELLED' ||
+            auth.termination_source === 'USER_CANCELLED' ||
+            auth.termination_source === 'OWNER_CANCELLED' ||
+            auth.termination_source === 'DISPATCH_CANCELLED' ||
+            auth.termination_source === 'OPERATOR_CANCELLED' ||
+            auth.termination_source === 'CANCELLED_CONFIRMED';
+
           const classification: ExecutionRecoveryClassification = 'ADAPTER_TERMINATED_AFTER_TIMEOUT';
           const disposition: ExecutionRecoveryDisposition = isExplicitCancel
             ? 'TERMINALIZED_CONFIRMED_CANCELLED'
@@ -463,45 +611,53 @@ export class ExecutionRecoveryScanner {
           // Terminalize transfer, attempt, assignment
           if (transfer.status === 'ACCEPTED' || transfer.status === 'AUTHORIZED' || transfer.status === 'ROUTED') {
             const newVersion = transfer.version + 1;
-            this.db
+            const trRes = this.db
               .prepare(`
                 UPDATE handoff_transfers
                 SET status = ?, completed_at = ?, version = ?, updated_at = ?
-                WHERE id = ?
+                WHERE id = ? AND status = ? AND version = ?
               `)
-              .run(terminalStatus, nowIso, newVersion, nowIso, transfer.id);
+              .run(terminalStatus, nowIso, newVersion, nowIso, transfer.id, transfer.status, transfer.version);
+            if (trRes.changes !== 1) {
+              throw new Error(`TIMEOUT_TRANSFER_UPDATE_FAILED: Expected 1 row changed, got ${trRes.changes}`);
+            }
           }
 
-          if (attempt && attempt.status === 'RUNNING') {
-            this.db
-              .prepare(`UPDATE task_attempts SET status = ?, ended_at = ? WHERE id = ?`)
+          if (attempt && attempt.status !== terminalStatus) {
+            const attRes = this.db
+              .prepare(`UPDATE task_attempts SET status = ?, ended_at = ? WHERE id = ? AND status IN ('PENDING', 'RUNNING')`)
               .run(terminalStatus, nowIso, attempt.id);
+            if (attRes.changes !== 1) {
+              throw new Error(`TIMEOUT_ATTEMPT_UPDATE_FAILED: Expected 1 row changed, got ${attRes.changes}`);
+            }
           }
 
-          if (assignment && assignment.status === 'RUNNING') {
-            this.db
-              .prepare(`UPDATE agent_assignments SET status = ?, ended_at = ? WHERE id = ?`)
+          if (assignment && assignment.status !== terminalStatus) {
+            const asgnRes = this.db
+              .prepare(`UPDATE agent_assignments SET status = ?, ended_at = ? WHERE id = ? AND status IN ('ASSIGNED', 'RUNNING')`)
               .run(terminalStatus, nowIso, assignment.id);
+            if (asgnRes.changes !== 1) {
+              throw new Error(`TIMEOUT_ASSIGNMENT_UPDATE_FAILED: Expected 1 row changed, got ${asgnRes.changes}`);
+            }
           }
 
           // Release matching lease and slot via guarded check
           let mutatedResources = false;
           if (activeLease && assignment) {
-            try {
-              const slotId = assignment.selected_worker_slot_id || activeLease.worker_slot_id;
-              const accountId = assignment.selected_account_id || activeLease.provider_account_id;
-              this.repo.releaseGuardedAccountLeaseAndIdleSlot({
-                leaseId: activeLease.id,
-                expectedAssignmentId: assignment.id,
-                expectedAccountId: accountId,
-                expectedSlotId: slotId,
-                expectedExecutionId: auth.execution_id,
-                releasedAt: nowIso,
-              });
-              mutatedResources = true;
-            } catch {
-              mutatedResources = false;
+            const slotId = assignment.selected_worker_slot_id || activeLease.worker_slot_id;
+            const accountId = assignment.selected_account_id || activeLease.provider_account_id;
+            const releaseRes = this.repo.releaseGuardedAccountLeaseAndIdleSlot({
+              leaseId: activeLease.id,
+              expectedAssignmentId: assignment.id,
+              expectedAccountId: accountId,
+              expectedSlotId: slotId,
+              expectedExecutionId: auth.execution_id,
+              releasedAt: nowIso,
+            });
+            if (!releaseRes.success) {
+              throw new Error(`TIMEOUT_GUARDED_RELEASE_FAILED: ${releaseRes.error}`);
             }
+            mutatedResources = true;
           }
 
           this.persistRecoveryAndEmit({
@@ -535,7 +691,7 @@ export class ExecutionRecoveryScanner {
       }
 
       // Check Classification C: ADAPTER_IN_FLIGHT_UNRESOLVED
-      // In-flight execution, unconfirmed termination, remote timeout or unknown process state
+      // In-flight execution, unconfirmed termination, remote timeout, unacknowledged cancel or unknown process state
       if (auth.adapter_started_at && !auth.adapter_finished_at) {
         const classification: ExecutionRecoveryClassification = 'ADAPTER_IN_FLIGHT_UNRESOLVED';
         const disposition: ExecutionRecoveryDisposition = 'UNRESOLVED_FENCED';
@@ -605,60 +761,113 @@ export class ExecutionRecoveryScanner {
 
       // Check Classification F: RESULT_PERSISTED_STATE_INCOMPLETE
       if (auth.settled_at && auth.settlement_evidence_hash) {
+        const parsedEvidence = JSON.parse(auth.settlement_evidence_json || '{}');
+        const terminalStatus: SettlementStatus =
+          auth.settlement_status || parsedEvidence.settlement_status || parsedEvidence.status || 'FAILED';
+
+        // Check for conflicting terminal states (must never overwrite a terminal conflict)
+        const isTransferConflict =
+          (transfer.status === 'COMPLETED' || transfer.status === 'FAILED' || transfer.status === 'CANCELLED' || transfer.status === 'EXPIRED') &&
+          transfer.status !== terminalStatus;
+        const isAttemptConflict =
+          attempt &&
+          (attempt.status === 'COMPLETED' || attempt.status === 'FAILED' || attempt.status === 'CANCELLED') &&
+          attempt.status !== terminalStatus;
+        const isAsgnConflict =
+          assignment &&
+          (assignment.status === 'COMPLETED' || assignment.status === 'FAILED' || assignment.status === 'CANCELLED') &&
+          assignment.status !== terminalStatus;
+
+        if (isTransferConflict || isAttemptConflict || isAsgnConflict) {
+          const classification: ExecutionRecoveryClassification = 'AUTHORITY_CONFLICT';
+          const disposition: ExecutionRecoveryDisposition = 'REJECTED_INTEGRITY_CONFLICT';
+          const conflictError = `TERMINAL_STATE_CONFLICT: Entity has conflicting terminal state against settlement_status "${terminalStatus}"`;
+
+          this.persistRecoveryAndEmit({
+            auth,
+            transfer,
+            assignment,
+            activeLease,
+            workerSlot,
+            classification,
+            disposition,
+            canonicalEvidenceJson,
+            evidenceHash,
+            mutatedTerminalState: false,
+            mutatedResources: false,
+            resolvedAt: null,
+            existingRecovery,
+          });
+
+          return {
+            authorizationId: auth.id,
+            transferId: transfer.id,
+            executionId: auth.execution_id ?? null,
+            lifecycleVersion: auth.lifecycle_version ?? null,
+            classification,
+            disposition,
+            mutatedTerminalState: false,
+            mutatedResources: false,
+            evidenceHash,
+            error: conflictError,
+          };
+        }
+
         const classification: ExecutionRecoveryClassification = 'RESULT_PERSISTED_STATE_INCOMPLETE';
         const disposition: ExecutionRecoveryDisposition = 'TERMINAL_STATE_RECONCILED';
-
-        const terminalStatus: HandoffTransferStatus =
-          auth.adapter_outcome === 'RETURNED'
-            ? 'COMPLETED'
-            : auth.adapter_outcome === 'CANCELLED'
-            ? 'CANCELLED'
-            : 'FAILED';
 
         let mutatedTerminalState = false;
         if (transfer.status !== terminalStatus) {
           const newVersion = transfer.version + 1;
-          this.db
+          const trRes = this.db
             .prepare(`
               UPDATE handoff_transfers
               SET status = ?, completed_at = ?, version = ?, updated_at = ?
-              WHERE id = ?
+              WHERE id = ? AND status = ? AND version = ?
             `)
-            .run(terminalStatus, nowIso, newVersion, nowIso, transfer.id);
+            .run(terminalStatus, nowIso, newVersion, nowIso, transfer.id, transfer.status, transfer.version);
+          if (trRes.changes !== 1) {
+            throw new Error(`RESULT_RECOVERY_TRANSFER_UPDATE_FAILED: Expected 1 row changed, got ${trRes.changes}`);
+          }
           mutatedTerminalState = true;
         }
 
         if (attempt && attempt.status !== terminalStatus) {
-          this.db
-            .prepare(`UPDATE task_attempts SET status = ?, ended_at = ? WHERE id = ?`)
+          const attRes = this.db
+            .prepare(`UPDATE task_attempts SET status = ?, ended_at = ? WHERE id = ? AND status IN ('PENDING', 'RUNNING')`)
             .run(terminalStatus, nowIso, attempt.id);
+          if (attRes.changes !== 1) {
+            throw new Error(`RESULT_RECOVERY_ATTEMPT_UPDATE_FAILED: Expected 1 row changed, got ${attRes.changes}`);
+          }
           mutatedTerminalState = true;
         }
 
         if (assignment && assignment.status !== terminalStatus) {
-          this.db
-            .prepare(`UPDATE agent_assignments SET status = ?, ended_at = ? WHERE id = ?`)
+          const asgnRes = this.db
+            .prepare(`UPDATE agent_assignments SET status = ?, ended_at = ? WHERE id = ? AND status IN ('ASSIGNED', 'RUNNING')`)
             .run(terminalStatus, nowIso, assignment.id);
+          if (asgnRes.changes !== 1) {
+            throw new Error(`RESULT_RECOVERY_ASSIGNMENT_UPDATE_FAILED: Expected 1 row changed, got ${asgnRes.changes}`);
+          }
           mutatedTerminalState = true;
         }
 
         let mutatedResources = false;
         if (activeLease && assignment) {
-          try {
-            const slotId = assignment.selected_worker_slot_id || activeLease.worker_slot_id;
-            const accountId = assignment.selected_account_id || activeLease.provider_account_id;
-            this.repo.releaseGuardedAccountLeaseAndIdleSlot({
-              leaseId: activeLease.id,
-              expectedAssignmentId: assignment.id,
-              expectedAccountId: accountId,
-              expectedSlotId: slotId,
-              expectedExecutionId: auth.execution_id,
-              releasedAt: nowIso,
-            });
-            mutatedResources = true;
-          } catch {
-            mutatedResources = false;
+          const slotId = assignment.selected_worker_slot_id || activeLease.worker_slot_id;
+          const accountId = assignment.selected_account_id || activeLease.provider_account_id;
+          const releaseRes = this.repo.releaseGuardedAccountLeaseAndIdleSlot({
+            leaseId: activeLease.id,
+            expectedAssignmentId: assignment.id,
+            expectedAccountId: accountId,
+            expectedSlotId: slotId,
+            expectedExecutionId: auth.execution_id,
+            releasedAt: nowIso,
+          });
+          if (!releaseRes.success) {
+            throw new Error(`RESULT_RECOVERY_GUARDED_RELEASE_FAILED: ${releaseRes.error}`);
           }
+          mutatedResources = true;
         }
 
         this.persistRecoveryAndEmit({
@@ -769,59 +978,69 @@ export class ExecutionRecoveryScanner {
       return;
     }
 
-    if (this.eventService) {
-      let eventType: string;
-      if (params.disposition === 'REJECTED_INTEGRITY_CONFLICT') {
-        eventType = 'EXECUTION_RECOVERY_REJECTED';
-      } else if (
-        params.disposition === 'TERMINALIZED_SAFE_EXPIRED' ||
-        params.disposition === 'TERMINALIZED_CONFIRMED_TIMEOUT' ||
-        params.disposition === 'TERMINALIZED_CONFIRMED_CANCELLED' ||
-        params.disposition === 'TERMINAL_STATE_RECONCILED'
-      ) {
-        eventType = 'EXECUTION_RECOVERY_RECONCILED';
-      } else if (params.disposition === 'NO_OP_ALREADY_RECONCILED') {
-        eventType = 'EXECUTION_RECOVERY_NOOP';
-      } else {
-        eventType = 'EXECUTION_RECOVERY_UNRESOLVED';
-      }
-
-      const eventPayload = {
-        lifecycle_version: params.auth.lifecycle_version ?? null,
-        recovery_version: recoveryState.recovery_version,
-        project_id: params.auth.project_id,
-        task_id: params.auth.task_id,
-        attempt_id: params.auth.attempt_id,
-        assignment_id: params.assignment?.id ?? null,
-        transfer_id: params.transfer.id,
-        authorization_id: params.auth.id,
-        execution_id: params.auth.execution_id ?? null,
-        provider_id: params.auth.selected_provider_id,
-        account_id: params.assignment?.selected_account_id ?? null,
-        resource_id: params.auth.selected_resource_id,
-        worker_slot_id: params.assignment?.selected_worker_slot_id ?? null,
-        lease_id: params.activeLease?.id ?? null,
-        adapter_started_at: params.auth.adapter_started_at ?? null,
-        adapter_finished_at: params.auth.adapter_finished_at ?? null,
-        adapter_outcome: params.auth.adapter_outcome ?? null,
-        cancellation_requested_at: params.auth.cancellation_requested_at ?? null,
-        termination_status: params.auth.termination_status ?? null,
-        termination_source: params.auth.termination_source ?? null,
-        terminated_at: params.auth.terminated_at ?? null,
-        recovery_classification: params.classification,
-        disposition: params.disposition,
-        canonical_evidence_hash: params.evidenceHash,
-        mutated_terminal_state: params.mutatedTerminalState,
-        mutated_resources: params.mutatedResources,
-      };
-
-      this.eventService.record(
-        params.auth.project_id,
-        eventType,
-        `Execution recovery ${eventType}: authorization ${params.auth.id}, classification ${params.classification}, disposition ${params.disposition}`,
-        eventPayload,
-        params.auth.task_id
-      );
+    let eventType: string;
+    if (params.disposition === 'REJECTED_INTEGRITY_CONFLICT') {
+      eventType = 'EXECUTION_RECOVERY_REJECTED';
+    } else if (
+      params.disposition === 'TERMINALIZED_SAFE_EXPIRED' ||
+      params.disposition === 'TERMINALIZED_CONFIRMED_TIMEOUT' ||
+      params.disposition === 'TERMINALIZED_CONFIRMED_CANCELLED' ||
+      params.disposition === 'TERMINAL_STATE_RECONCILED'
+    ) {
+      eventType = 'EXECUTION_RECOVERY_RECONCILED';
+    } else if (params.disposition === 'NO_OP_ALREADY_RECONCILED') {
+      eventType = 'EXECUTION_RECOVERY_NOOP';
+    } else {
+      eventType = 'EXECUTION_RECOVERY_UNRESOLVED';
     }
+
+    const eventPayload = {
+      lifecycle_version: params.auth.lifecycle_version ?? null,
+      recovery_version: recoveryState.recovery_version,
+      project_id: params.auth.project_id,
+      task_id: params.auth.task_id,
+      attempt_id: params.auth.attempt_id,
+      assignment_id: params.assignment?.id ?? null,
+      transfer_id: params.transfer.id,
+      authorization_id: params.auth.id,
+      execution_id: params.auth.execution_id ?? null,
+      provider_id: params.auth.selected_provider_id,
+      account_id: params.assignment?.selected_account_id ?? null,
+      resource_id: params.auth.selected_resource_id,
+      worker_slot_id: params.assignment?.selected_worker_slot_id ?? null,
+      lease_id: params.activeLease?.id ?? null,
+      adapter_started_at: params.auth.adapter_started_at ?? null,
+      adapter_finished_at: params.auth.adapter_finished_at ?? null,
+      adapter_outcome: params.auth.adapter_outcome ?? null,
+      settlement_status: params.auth.settlement_status ?? null,
+      cancellation_requested_at: params.auth.cancellation_requested_at ?? null,
+      termination_status: params.auth.termination_status ?? null,
+      termination_source: params.auth.termination_source ?? null,
+      termination_reason: params.auth.termination_reason ?? null,
+      termination_proof_source: params.auth.termination_proof_source ?? null,
+      terminated_at: params.auth.terminated_at ?? null,
+      recovery_classification: params.classification,
+      disposition: params.disposition,
+      canonical_evidence_hash: params.evidenceHash,
+      mutated_terminal_state: params.mutatedTerminalState,
+      mutated_resources: params.mutatedResources,
+    };
+
+    const deterministicEventId =
+      'evt-rec-' +
+      computeSha256(
+        `${params.auth.id}:${recoveryState.recovery_version}:${params.classification}:${params.disposition}:${params.evidenceHash}`
+      ).slice(0, 32);
+
+    this.repo.insertDeterministicEvent({
+      id: deterministicEventId,
+      project_id: params.auth.project_id,
+      task_id: params.auth.task_id,
+      agent_id: params.assignment?.agent_id ?? null,
+      type: eventType,
+      summary: `Execution recovery ${eventType}: authorization ${params.auth.id}, classification ${params.classification}, disposition ${params.disposition}`,
+      structured_payload_json: canonicalJsonStringify(eventPayload),
+      timestamp: params.auth.terminated_at || params.auth.settled_at || new Date().toISOString(),
+    });
   }
 }
