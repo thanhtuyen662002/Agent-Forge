@@ -192,7 +192,7 @@ describe('Owner Routing & Manual Bridge Handoff Loop (PR #8)', () => {
       constraints: ['No browser automation'],
     });
     testTaskId = t.id;
-  }, 30000);
+  });
 
   afterEach(() => {
     try {
@@ -201,7 +201,7 @@ describe('Owner Routing & Manual Bridge Handoff Loop (PR #8)', () => {
     } catch {
       // Clean teardown
     }
-  }, 30000);
+  });
 
   // =========================================================================
   // 1. Explicit Candidate Selection & Opt-in Invariants
