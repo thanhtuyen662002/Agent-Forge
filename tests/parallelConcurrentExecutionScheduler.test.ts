@@ -68,6 +68,20 @@ class MockDeterministicTimer implements SchedulerTimer {
     return true;
   }
 
+  public async fireAll(): Promise<number> {
+    let count = 0;
+    const keys = Array.from(this.timers.keys());
+    for (const key of keys) {
+      if (this.timers.has(key)) {
+        const entry = this.timers.get(key)!;
+        this.timers.delete(key);
+        await entry.fn();
+        count++;
+      }
+    }
+    return count;
+  }
+
   public get pendingCount(): number {
     return this.timers.size;
   }
@@ -822,7 +836,7 @@ describe('Parallel ConcurrentExecutionScheduler Proof (R5G3E1)', () => {
     db.prepare("UPDATE account_leases SET expires_at = '2020-01-01T00:00:00.000Z' WHERE id = ?").run(lossLease.id);
 
     // Fire timer ticks for heartbeat
-    await timer.fireNext();
+    await timer.fireAll();
 
     // 34. One execution lease-loss cancels only itself
     expect(cancelScheduledSpy).toHaveBeenCalledWith(chainLoss.authId);
