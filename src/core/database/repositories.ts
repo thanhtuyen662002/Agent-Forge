@@ -73,13 +73,27 @@ import type { ProviderDispatchExecutionResult } from '../services/ProviderDispat
 import { ExecutionFailureClassifier } from '../services/ExecutionFailureClassifier';
 import { FailureHealthMutationPolicyService } from '../services/FailureHealthMutationPolicyService';
 import { FailoverPolicyParser } from '../services/FailoverPolicyParser';
+import { PolicyService } from '../services/PolicyService';
 import {
   computeSha256,
   canonicalJsonStringify,
   computeSnapshotContentHash,
   computeManifestPayloadAndHash,
   assertConsistentAttemptBindings,
+  verifyContextManifestIntegrity,
+  sanitizeContextFiles,
 } from '../context/ContextIntegrity';
+import {
+  computeHandoffAuthorizationId,
+  computeCanonicalPayload,
+  computePayloadHash,
+  computeContextManifestHash,
+  buildCanonicalInstructions,
+  buildVerificationCommandsSnapshot,
+  buildHandoffContextExecutionDescriptorV1,
+  HandoffSuccessorExecutionAuthorityV1,
+  HandoffContextExecutionItemV1,
+} from '../services/ExecutionAuthorizationService';
 import {
   parseCredentialRef,
   parseNativeProfileRef,
@@ -1287,7 +1301,7 @@ export class Repository {
     const row = this.db
       .prepare(`
         SELECT * FROM events
-        WHERE type = 'PROVIDER_ROUTING_DECISION'
+        WHERE type IN ('PROVIDER_ROUTING_DECISION', 'ROLE_AWARE_ROUTING_DECISION')
           AND (id = ? OR json_extract(structured_payload_json, '$.decisionId') = ?)
         ORDER BY timestamp DESC
         LIMIT 1
@@ -1312,7 +1326,7 @@ export class Repository {
         SELECT * FROM events
         WHERE project_id = ?
           AND task_id = ?
-          AND type = 'PROVIDER_ROUTING_DECISION'
+          AND type IN ('PROVIDER_ROUTING_DECISION', 'ROLE_AWARE_ROUTING_DECISION')
         ORDER BY timestamp DESC, rowid DESC
         LIMIT 1
       `)
@@ -1337,7 +1351,54 @@ export class Repository {
     const tableInfo = this.db.pragma('table_info(execution_authorizations)') as { name: string }[];
     const columnNames = new Set(tableInfo.map((c) => c.name));
 
-    if (columnNames.has('task_ownership_epoch')) {
+    if (columnNames.has('assignment_id')) {
+      this.db
+        .prepare(`
+          INSERT INTO execution_authorizations (
+            id, project_id, task_id, attempt_id, task_revision, base_sha,
+            repository_head_sha, manager_message_id, manager_payload_hash,
+            routing_decision_id, selected_resource_id, selected_provider_id,
+            instruction_payload_hash, context_manifest_hash,
+            canonical_instructions_json, context_files_json, canonical_payload_json, status,
+            created_at, dispatched_at, task_ownership_epoch, assignment_id, execution_id,
+            adapter_started_at, adapter_finished_at, adapter_outcome,
+            cancellation_requested_at, termination_confirmed_at,
+            termination_status, termination_source
+          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        `)
+        .run(
+          auth.id,
+          auth.project_id,
+          auth.task_id,
+          auth.attempt_id,
+          auth.task_revision,
+          auth.base_sha,
+          auth.repository_head_sha,
+          auth.manager_message_id,
+          auth.manager_payload_hash,
+          auth.routing_decision_id,
+          auth.selected_resource_id,
+          auth.selected_provider_id,
+          auth.instruction_payload_hash,
+          auth.context_manifest_hash,
+          auth.canonical_instructions_json,
+          auth.context_files_json,
+          auth.canonical_payload_json ?? null,
+          auth.status,
+          auth.created_at,
+          auth.dispatched_at,
+          auth.task_ownership_epoch ?? 1,
+          auth.assignment_id ?? null,
+          auth.execution_id ?? null,
+          auth.adapter_started_at ?? null,
+          auth.adapter_finished_at ?? null,
+          auth.adapter_outcome ?? null,
+          auth.cancellation_requested_at ?? null,
+          auth.termination_confirmed_at ?? null,
+          auth.termination_status ?? null,
+          auth.termination_source ?? null
+        );
+    } else if (columnNames.has('task_ownership_epoch')) {
       this.db
         .prepare(`
           INSERT INTO execution_authorizations (
@@ -1755,6 +1816,7 @@ export class Repository {
       created_at: String(row.created_at),
       dispatched_at: row.dispatched_at ? String(row.dispatched_at) : null,
       task_ownership_epoch: row.task_ownership_epoch !== undefined && row.task_ownership_epoch !== null ? Number(row.task_ownership_epoch) : 1,
+      assignment_id: row.assignment_id ? String(row.assignment_id) : null,
       execution_id: row.execution_id ? String(row.execution_id) : null,
       adapter_started_at: row.adapter_started_at ? String(row.adapter_started_at) : null,
       adapter_finished_at: row.adapter_finished_at ? String(row.adapter_finished_at) : null,
@@ -3531,6 +3593,1567 @@ export class Repository {
         transfer: updatedTransfer,
         assignment,
         alreadyRouted: false,
+      };
+    });
+  }
+
+  public getHandoffTransferBySuccessorAuthId(authId: string): HandoffTransfer | null {
+    const row = this.db
+      .prepare('SELECT * FROM handoff_transfers WHERE successor_authorization_id = ?')
+      .get(authId) as Record<string, unknown> | undefined;
+    if (!row) return null;
+    return this.mapHandoffTransfer(row);
+  }
+
+  public validateHandoffSuccessorExecutionAuthority(authorizationId: string): {
+    valid: boolean;
+    auth?: ExecutionAuthorization;
+    transfer?: HandoffTransfer;
+    task?: Task;
+    project?: Project;
+    attempt?: TaskAttempt;
+    assignment?: AgentAssignment;
+    roleProfile?: RoleProfile;
+    agentProfile?: AgentProfile;
+    routingEvent?: EventRecord;
+    routingPayload?: Record<string, unknown>;
+    manifest?: ContextManifest;
+    integrityResult?: { valid: boolean; error?: string; snapshot?: ContextSnapshot };
+    errorCode?: string;
+    error?: string;
+  } {
+    const auth = this.getExecutionAuthorization(authorizationId);
+    if (!auth) {
+      return {
+        valid: false,
+        errorCode: 'AUTHORIZATION_NOT_FOUND',
+        error: `Execution authorization "${authorizationId}" not found.`,
+      };
+    }
+
+    if (!auth.assignment_id) {
+      return {
+        valid: false,
+        errorCode: 'NON_HANDOFF_AUTHORIZATION',
+        error: `Execution authorization "${authorizationId}" is not bound to a handoff assignment_id.`,
+      };
+    }
+
+    const transfer = this.getHandoffTransferBySuccessorAuthId(auth.id);
+    if (!transfer) {
+      return {
+        valid: false,
+        auth,
+        errorCode: 'TRANSFER_NOT_FOUND',
+        error: `No HandoffTransfer found for successor_authorization_id "${auth.id}".`,
+      };
+    }
+
+    if (
+      transfer.successor_authorization_id !== auth.id ||
+      transfer.successor_assignment_id !== auth.assignment_id ||
+      transfer.successor_attempt_id !== auth.attempt_id ||
+      transfer.task_id !== auth.task_id ||
+      transfer.successor_ownership_epoch !== auth.task_ownership_epoch ||
+      transfer.successor_ownership_epoch !== transfer.source_ownership_epoch + 1
+    ) {
+      return {
+        valid: false,
+        auth,
+        transfer,
+        errorCode: 'STALE_OWNERSHIP_EPOCH',
+        error: `Durable binding invariant mismatch between authorization "${auth.id}" and HandoffTransfer "${transfer.id}".`,
+      };
+    }
+
+    const task = this.getTask(auth.task_id);
+    if (!task) {
+      return {
+        valid: false,
+        auth,
+        transfer,
+        errorCode: 'TASK_NOT_FOUND',
+        error: `Task "${auth.task_id}" not found in database.`,
+      };
+    }
+
+    if (
+      task.ownership_epoch !== auth.task_ownership_epoch ||
+      task.project_id !== auth.project_id ||
+      task.revision_count !== auth.task_revision ||
+      !task.base_sha ||
+      task.base_sha.trim() !== auth.base_sha.trim()
+    ) {
+      return {
+        valid: false,
+        auth,
+        transfer,
+        task,
+        errorCode: 'STALE_OWNERSHIP_EPOCH',
+        error: `Task "${task.id}" state or epoch (${task.ownership_epoch}) does not match authorization authority (${auth.task_ownership_epoch}).`,
+      };
+    }
+
+    const project = this.getProject(task.project_id);
+    if (!project) {
+      return {
+        valid: false,
+        auth,
+        transfer,
+        task,
+        errorCode: 'PROJECT_NOT_FOUND',
+        error: `Project "${task.project_id}" not found in database.`,
+      };
+    }
+
+    const attempt = this.getTaskAttempt(transfer.successor_attempt_id!);
+    if (!attempt || attempt.task_id !== task.id || attempt.agent_profile_id !== transfer.successor_agent_profile_id) {
+      return {
+        valid: false,
+        auth,
+        transfer,
+        task,
+        errorCode: 'ATTEMPT_NOT_FOUND',
+        error: `Successor attempt "${transfer.successor_attempt_id}" mismatch or not found for task "${task.id}".`,
+      };
+    }
+
+    const assignment = this.getAgentAssignment(transfer.successor_assignment_id!);
+    if (
+      !assignment ||
+      assignment.id !== auth.assignment_id ||
+      assignment.project_id !== task.project_id ||
+      assignment.task_id !== task.id ||
+      assignment.attempt_id !== transfer.successor_attempt_id ||
+      assignment.role_profile_id !== transfer.successor_role_profile_id ||
+      assignment.agent_profile_id !== transfer.successor_agent_profile_id ||
+      assignment.routing_decision_id !== auth.routing_decision_id ||
+      assignment.selected_provider_id !== auth.selected_provider_id ||
+      assignment.selected_resource_id !== auth.selected_resource_id ||
+      !assignment.agent_profile_id
+    ) {
+      return {
+        valid: false,
+        auth,
+        transfer,
+        task,
+        attempt,
+        errorCode: 'ASSIGNMENT_NOT_FOUND',
+        error: `Successor assignment "${transfer.successor_assignment_id}" mismatch or not found for task "${task.id}".`,
+      };
+    }
+
+    const roleProfile = this.getRoleProfile(assignment.role_profile_id);
+    if (!roleProfile || !roleProfile.enabled) {
+      return {
+        valid: false,
+        auth,
+        transfer,
+        task,
+        attempt,
+        assignment,
+        errorCode: 'ROLE_PROFILE_INVALID',
+        error: `RoleProfile "${assignment.role_profile_id}" is missing or disabled.`,
+      };
+    }
+
+    const agentProfile = this.getAgentProfile(assignment.agent_profile_id);
+    if (!agentProfile || !agentProfile.enabled || agentProfile.role_profile_id !== roleProfile.id) {
+      return {
+        valid: false,
+        auth,
+        transfer,
+        task,
+        attempt,
+        assignment,
+        roleProfile,
+        errorCode: 'AGENT_PROFILE_INVALID',
+        error: `AgentProfile "${assignment.agent_profile_id}" is missing, disabled, or unlinked from role "${roleProfile.id}".`,
+      };
+    }
+
+    const routingEvent = this.getRoutingDecisionEvent(assignment.routing_decision_id);
+    if (!routingEvent || routingEvent.type !== 'ROLE_AWARE_ROUTING_DECISION') {
+      return {
+        valid: false,
+        auth,
+        transfer,
+        task,
+        attempt,
+        assignment,
+        roleProfile,
+        agentProfile,
+        errorCode: 'ROUTING_DECISION_NOT_FOUND',
+        error: `Routing decision event "${assignment.routing_decision_id}" not found or not ROLE_AWARE_ROUTING_DECISION.`,
+      };
+    }
+
+    const routingPayload = routingEvent.structured_payload as Record<string, unknown>;
+    if (
+      routingPayload.outcome !== 'SELECTED' ||
+      routingPayload.projectId !== task.project_id ||
+      routingPayload.taskId !== task.id ||
+      routingPayload.attemptId !== transfer.successor_attempt_id ||
+      routingPayload.selectedProviderId !== assignment.selected_provider_id ||
+      routingPayload.selectedAccountId !== assignment.selected_account_id ||
+      routingPayload.selectedResourceId !== assignment.selected_resource_id ||
+      routingPayload.selectedAssignmentId !== null
+    ) {
+      return {
+        valid: false,
+        auth,
+        transfer,
+        task,
+        attempt,
+        assignment,
+        roleProfile,
+        agentProfile,
+        routingEvent,
+        routingPayload,
+        errorCode: 'ROUTING_DECISION_MISMATCH',
+        error: `Routing decision event "${assignment.routing_decision_id}" payload does not match successor binding authority.`,
+      };
+    }
+
+    const meta = assignment.preferred_metadata as Record<string, unknown> | null;
+    if (
+      !meta ||
+      typeof meta !== 'object' ||
+      meta.handoff_route_spec_version !== 1 ||
+      !meta.handoff_route_spec ||
+      typeof meta.handoff_route_spec !== 'object' ||
+      typeof meta.handoff_route_spec_hash !== 'string' ||
+      meta.handoff_route_spec_hash.trim().length === 0
+    ) {
+      return {
+        valid: false,
+        auth,
+        transfer,
+        task,
+        attempt,
+        assignment,
+        roleProfile,
+        agentProfile,
+        routingEvent,
+        routingPayload,
+        errorCode: 'ROUTE_METADATA_CORRUPTION',
+        error: `Successor assignment "${assignment.id}" is missing valid R5I4 route specification metadata.`,
+      };
+    }
+
+    const recomputedRouteHash = computeSha256(canonicalJsonStringify(meta.handoff_route_spec as Record<string, unknown>));
+    if (recomputedRouteHash !== meta.handoff_route_spec_hash) {
+      return {
+        valid: false,
+        auth,
+        transfer,
+        task,
+        attempt,
+        assignment,
+        roleProfile,
+        agentProfile,
+        routingEvent,
+        routingPayload,
+        errorCode: 'ROUTE_METADATA_CORRUPTION',
+        error: `Successor assignment "${assignment.id}" handoff_route_spec_hash does not match recomputed hash.`,
+      };
+    }
+
+    // R5I3 Deterministic Context Authority Validation
+    const specHash = transfer.successor_context_spec_hash;
+    if (!specHash || typeof specHash !== 'string' || specHash.trim().length === 0) {
+      return {
+        valid: false,
+        auth,
+        transfer,
+        task,
+        attempt,
+        assignment,
+        roleProfile,
+        agentProfile,
+        routingEvent,
+        routingPayload,
+        errorCode: 'CONTEXT_SPEC_HASH_MISMATCH',
+        error: `Successor transfer "${transfer.id}" has missing or invalid successor_context_spec_hash.`,
+      };
+    }
+
+    const expectedSnapshotId = `ctx-snap-ho-${computeSha256(`r5i-successor-context:${transfer.id}:${specHash}`).slice(0, 32)}`;
+    const expectedManifestId = `ctx-man-ho-${computeSha256(`r5i-successor-manifest:${transfer.id}:${specHash}`).slice(0, 32)}`;
+
+    if (transfer.successor_context_snapshot_id !== expectedSnapshotId) {
+      return {
+        valid: false,
+        auth,
+        transfer,
+        task,
+        attempt,
+        assignment,
+        roleProfile,
+        agentProfile,
+        routingEvent,
+        routingPayload,
+        errorCode: 'CONTEXT_SNAPSHOT_MISMATCH',
+        error: `Successor context snapshot ID "${transfer.successor_context_snapshot_id}" does not match R5I3 deterministic derivation "${expectedSnapshotId}".`,
+      };
+    }
+
+    const manifest = this.getContextManifestBySnapshotId(transfer.successor_context_snapshot_id);
+    if (!manifest || manifest.id !== expectedManifestId || manifest.snapshot_id !== expectedSnapshotId) {
+      return {
+        valid: false,
+        auth,
+        transfer,
+        task,
+        attempt,
+        assignment,
+        roleProfile,
+        agentProfile,
+        routingEvent,
+        routingPayload,
+        errorCode: 'CONTEXT_MANIFEST_NOT_FOUND',
+        error: `ContextManifest for snapshot "${transfer.successor_context_snapshot_id}" not found or ID mismatch (expected "${expectedManifestId}").`,
+      };
+    }
+
+    const integrityResult = verifyContextManifestIntegrity(this, manifest.id);
+    if (!integrityResult.valid || !integrityResult.snapshot) {
+      return {
+        valid: false,
+        auth,
+        transfer,
+        task,
+        attempt,
+        assignment,
+        roleProfile,
+        agentProfile,
+        routingEvent,
+        routingPayload,
+        manifest,
+        errorCode: 'CONTEXT_MANIFEST_INTEGRITY_FAILED',
+        error: `ContextManifest integrity failed: ${integrityResult.error}`,
+      };
+    }
+
+    if (
+      integrityResult.snapshot.id !== expectedSnapshotId ||
+      integrityResult.snapshot.task_id !== task.id ||
+      integrityResult.snapshot.attempt_id !== attempt.id ||
+      integrityResult.snapshot.purpose !== 'HANDOFF'
+    ) {
+      return {
+        valid: false,
+        auth,
+        transfer,
+        task,
+        attempt,
+        assignment,
+        roleProfile,
+        agentProfile,
+        routingEvent,
+        routingPayload,
+        manifest,
+        integrityResult,
+        errorCode: 'CONTEXT_SNAPSHOT_MISMATCH',
+        error: `Context snapshot bindings do not match handoff successor task, attempt, or HANDOFF purpose.`,
+      };
+    }
+
+    // Central Validator Deterministic Authorization ID Fence (Defect B)
+    const currentAuthority: HandoffSuccessorExecutionAuthorityV1 = {
+      version: 1,
+      transfer_id: transfer.id,
+      successor_attempt_id: transfer.successor_attempt_id!,
+      successor_assignment_id: transfer.successor_assignment_id,
+      successor_ownership_epoch: transfer.successor_ownership_epoch,
+      routing_decision_id: assignment.routing_decision_id,
+      handoff_route_spec_hash: meta.handoff_route_spec_hash as string,
+      successor_context_spec_hash: specHash,
+      manager_message_id: auth.manager_message_id,
+      manager_payload_hash: auth.manager_payload_hash,
+    };
+
+    const recomputedAuthId = computeHandoffAuthorizationId(currentAuthority);
+    if (recomputedAuthId !== auth.id) {
+      return {
+        valid: false,
+        auth,
+        transfer,
+        task,
+        attempt,
+        assignment,
+        roleProfile,
+        agentProfile,
+        routingEvent,
+        routingPayload,
+        manifest,
+        integrityResult,
+        errorCode: 'AUTHORIZATION_CONTENT_MISMATCH',
+        error: `Deterministic authorization ID mismatch between stored authorization ("${auth.id}") and current verified authority ("${recomputedAuthId}").`,
+      };
+    }
+
+    return {
+      valid: true,
+      auth,
+      transfer,
+      task,
+      project,
+      attempt,
+      assignment,
+      roleProfile,
+      agentProfile,
+      routingEvent,
+      routingPayload,
+      manifest,
+      integrityResult,
+    };
+  }
+
+  public resumeHandoffSuccessorAuthorization(params: {
+    transferId: string;
+    expectedVersion: number;
+    candidate: ExecutionAuthorization;
+  }): {
+    success: boolean;
+    transfer?: HandoffTransfer;
+    authorization?: ExecutionAuthorization;
+    alreadyAuthorized?: boolean;
+    errorCode?:
+      | 'TRANSFER_NOT_FOUND'
+      | 'TASK_NOT_FOUND'
+      | 'PROJECT_NOT_FOUND'
+      | 'ASSIGNMENT_NOT_FOUND'
+      | 'ATTEMPT_NOT_FOUND'
+      | 'STALE_OWNERSHIP_EPOCH'
+      | 'STATUS_CONFLICT'
+      | 'VERSION_CONFLICT'
+      | 'AUTHORIZATION_CONTENT_MISMATCH'
+      | 'DURABLE_AUTHORITY_CHANGED'
+      | 'MANAGER_AUTHORITY_INVALID'
+      | 'MANAGER_DECISION_NON_AUTHORIZING'
+      | 'STALE_TASK_REVISION'
+      | 'BASE_SHA_MISSING'
+      | 'ROUTING_DECISION_NOT_FOUND'
+      | 'PROVIDER_NOT_FOUND'
+      | 'PROVIDER_DISABLED'
+      | 'PROVIDER_ACCOUNT_NOT_FOUND'
+      | 'PROVIDER_ACCOUNT_DISABLED'
+      | 'PROVIDER_ACCOUNT_UNSAFE_HEALTH'
+      | 'PROVIDER_RESOURCE_NOT_FOUND'
+      | 'PROVIDER_RESOURCE_DISABLED'
+      | 'PROVIDER_RESOURCE_UNSAFE_HEALTH'
+      | 'PROVIDER_RESOURCE_QUOTA_EXHAUSTED'
+      | 'CONTEXT_SNAPSHOT_NOT_FOUND'
+      | 'CONTEXT_MANIFEST_NOT_FOUND'
+      | 'CONTEXT_MANIFEST_INTEGRITY_FAILED'
+      | 'CONTEXT_FILES_INVALID'
+      | 'POLICY_DENIED'
+      | 'NEEDS_OWNER'
+      | 'PROVIDER_HEALTH_UNSAFE'
+      | 'ROUTE_METADATA_CORRUPTION'
+      | 'INTERNAL_ERROR';
+    error?: string;
+  } {
+    return this.runInImmediateTransaction(() => {
+      const nowIso = new Date().toISOString();
+      const transfer = this.getHandoffTransfer(params.transferId);
+      if (!transfer) {
+        return {
+          success: false,
+          errorCode: 'TRANSFER_NOT_FOUND',
+          error: `Handoff transfer "${params.transferId}" not found.`,
+        };
+      }
+
+      // Replay path: transfer is already AUTHORIZED or ACCEPTED
+      if (transfer.status === 'AUTHORIZED' || transfer.status === 'ACCEPTED') {
+        if (!transfer.successor_authorization_id) {
+          return {
+            success: false,
+            transfer,
+            errorCode: 'ROUTE_METADATA_CORRUPTION',
+            error: `Transfer "${transfer.id}" status is "${transfer.status}" but successor_authorization_id is NULL.`,
+          };
+        }
+
+        const existingAuth = this.getExecutionAuthorization(transfer.successor_authorization_id);
+        if (!existingAuth) {
+          return {
+            success: false,
+            transfer,
+            errorCode: 'ROUTE_METADATA_CORRUPTION',
+            error: `Successor authorization "${transfer.successor_authorization_id}" not found in database.`,
+          };
+        }
+
+        if (existingAuth.status === 'INVALIDATED') {
+          return {
+            success: false,
+            transfer,
+            authorization: existingAuth,
+            errorCode: 'STATUS_CONFLICT',
+            error: `Successor authorization "${existingAuth.id}" is INVALIDATED and cannot be resumed or replaced.`,
+          };
+        }
+
+        // Compare all immutable fields
+        const c = params.candidate;
+        const mismatch =
+          existingAuth.id !== c.id ||
+          existingAuth.project_id !== c.project_id ||
+          existingAuth.task_id !== c.task_id ||
+          existingAuth.attempt_id !== c.attempt_id ||
+          existingAuth.task_revision !== c.task_revision ||
+          existingAuth.base_sha !== c.base_sha ||
+          existingAuth.repository_head_sha !== c.repository_head_sha ||
+          existingAuth.manager_message_id !== c.manager_message_id ||
+          existingAuth.manager_payload_hash !== c.manager_payload_hash ||
+          existingAuth.routing_decision_id !== c.routing_decision_id ||
+          existingAuth.selected_provider_id !== c.selected_provider_id ||
+          existingAuth.selected_resource_id !== c.selected_resource_id ||
+          existingAuth.assignment_id !== c.assignment_id ||
+          existingAuth.instruction_payload_hash !== c.instruction_payload_hash ||
+          existingAuth.context_manifest_hash !== c.context_manifest_hash ||
+          existingAuth.canonical_instructions_json !== c.canonical_instructions_json ||
+          existingAuth.context_files_json !== c.context_files_json ||
+          existingAuth.canonical_payload_json !== c.canonical_payload_json ||
+          existingAuth.task_ownership_epoch !== c.task_ownership_epoch;
+
+        if (mismatch) {
+          return {
+            success: false,
+            transfer,
+            authorization: existingAuth,
+            errorCode: 'AUTHORIZATION_CONTENT_MISMATCH',
+            error: `AUTHORIZATION_CONTENT_MISMATCH: Existing authorization "${existingAuth.id}" fields do not match candidate.`,
+          };
+        }
+
+        return {
+          success: true,
+          transfer,
+          authorization: existingAuth,
+          alreadyAuthorized: true,
+        };
+      }
+
+      // First authorization path requires status === 'ROUTED'
+      if (transfer.status !== 'ROUTED') {
+        return {
+          success: false,
+          transfer,
+          errorCode: 'STATUS_CONFLICT',
+          error: `STATUS_CONFLICT: Expected transfer status ROUTED, found "${transfer.status}".`,
+        };
+      }
+
+      if (params.expectedVersion !== transfer.version) {
+        return {
+          success: false,
+          transfer,
+          errorCode: 'VERSION_CONFLICT',
+          error: `VERSION_CONFLICT: Expected transfer version ${transfer.version}, received ${params.expectedVersion}.`,
+        };
+      }
+
+      if (transfer.successor_authorization_id) {
+        return {
+          success: false,
+          transfer,
+          errorCode: 'STATUS_CONFLICT',
+          error: `Transfer "${transfer.id}" already has successor_authorization_id "${transfer.successor_authorization_id}".`,
+        };
+      }
+
+      if (
+        !transfer.successor_assignment_id ||
+        !transfer.successor_attempt_id ||
+        !transfer.successor_context_snapshot_id ||
+        !transfer.successor_context_spec_hash ||
+        transfer.successor_ownership_epoch !== transfer.source_ownership_epoch + 1
+      ) {
+        return {
+          success: false,
+          transfer,
+          errorCode: 'ROUTE_METADATA_CORRUPTION',
+          error: `HandoffTransfer "${transfer.id}" missing successor assignment, attempt, context snapshot, or invalid epoch.`,
+        };
+      }
+
+      // Rederive complete database-derived authority in Phase EB
+      const task = this.getTask(transfer.task_id);
+      if (!task) {
+        return { success: false, transfer, errorCode: 'TASK_NOT_FOUND', error: `Task "${transfer.task_id}" not found.` };
+      }
+      const project = this.getProject(task.project_id);
+      if (!project) {
+        return { success: false, transfer, errorCode: 'PROJECT_NOT_FOUND', error: `Project "${task.project_id}" not found.` };
+      }
+
+      if (task.ownership_epoch !== transfer.successor_ownership_epoch) {
+        return {
+          success: false,
+          transfer,
+          errorCode: 'STALE_OWNERSHIP_EPOCH',
+          error: `Task "${task.id}" ownership epoch is ${task.ownership_epoch}, expected successor epoch ${transfer.successor_ownership_epoch}.`,
+        };
+      }
+
+      if (task.revision_count !== params.candidate.task_revision) {
+        return {
+          success: false,
+          transfer,
+          errorCode: 'STALE_TASK_REVISION',
+          error: `Task revision count (${task.revision_count}) differs from candidate revision (${params.candidate.task_revision}).`,
+        };
+      }
+
+      if (!task.base_sha || task.base_sha.trim() !== params.candidate.base_sha.trim()) {
+        return {
+          success: false,
+          transfer,
+          errorCode: 'BASE_SHA_MISSING',
+          error: `Task base_sha differs from candidate authorization base_sha.`,
+        };
+      }
+
+      // Revalidate latest applied Manager protocol message
+      const latestManagerMsg = this.getLatestAppliedManagerProtocolMessage(task.id, task.project_id);
+      if (!latestManagerMsg) {
+        return {
+          success: false,
+          transfer,
+          errorCode: 'MANAGER_AUTHORITY_INVALID',
+          error: `No APPLIED manager.v1 protocol message found for task "${task.id}".`,
+        };
+      }
+
+      let managerData: { decision: string; instructions?: string[]; constraints?: string[]; expected_revision?: number };
+      try {
+        const rawPayloadStr = String(latestManagerMsg.raw_payload || latestManagerMsg.structured_payload_json || '{}');
+        const raw = JSON.parse(rawPayloadStr);
+        managerData = raw.data || raw;
+      } catch {
+        return {
+          success: false,
+          transfer,
+          errorCode: 'MANAGER_AUTHORITY_INVALID',
+          error: `Malformed JSON in manager message "${latestManagerMsg.id}".`,
+        };
+      }
+
+      if (managerData.decision !== 'EXECUTE' && managerData.decision !== 'FIX_REQUIRED') {
+        return {
+          success: false,
+          transfer,
+          errorCode: 'MANAGER_DECISION_NON_AUTHORIZING',
+          error: `Manager decision "${managerData.decision}" does not authorize execution.`,
+        };
+      }
+
+      if (managerData.decision === 'EXECUTE') {
+        if (
+          managerData.expected_revision !== null &&
+          managerData.expected_revision !== undefined &&
+          managerData.expected_revision !== task.revision_count
+        ) {
+          return {
+            success: false,
+            transfer,
+            errorCode: 'STALE_TASK_REVISION',
+            error: `Manager EXECUTE expected revision ${managerData.expected_revision}, but task revision is ${task.revision_count}.`,
+          };
+        }
+      } else if (managerData.decision === 'FIX_REQUIRED') {
+        if (
+          managerData.expected_revision !== null &&
+          managerData.expected_revision !== undefined &&
+          managerData.expected_revision + 1 !== task.revision_count
+        ) {
+          return {
+            success: false,
+            transfer,
+            errorCode: 'STALE_TASK_REVISION',
+            error: `Manager FIX_REQUIRED expected revision ${managerData.expected_revision}, but task revision is ${task.revision_count} (expected +1).`,
+          };
+        }
+      }
+
+      if (
+        String(latestManagerMsg.id) !== params.candidate.manager_message_id ||
+        String(latestManagerMsg.payload_hash) !== params.candidate.manager_payload_hash
+      ) {
+        return {
+          success: false,
+          transfer,
+          errorCode: 'MANAGER_AUTHORITY_INVALID',
+          error: `Manager authority changed between Phase EA and Phase EB.`,
+        };
+      }
+
+      // Successor TaskAttempt
+      const attempt = this.getTaskAttempt(transfer.successor_attempt_id);
+      if (!attempt || attempt.task_id !== task.id || attempt.agent_profile_id !== transfer.successor_agent_profile_id) {
+        return {
+          success: false,
+          transfer,
+          errorCode: 'ATTEMPT_NOT_FOUND',
+          error: `Successor attempt "${transfer.successor_attempt_id}" mismatch or not found for task "${task.id}".`,
+        };
+      }
+
+      if (attempt.status !== 'PENDING' || attempt.agent_id !== null) {
+        return {
+          success: false,
+          transfer,
+          errorCode: 'STATUS_CONFLICT',
+          error: `Successor attempt "${attempt.id}" status is "${attempt.status}" (expected "PENDING" and NULL agent_id).`,
+        };
+      }
+
+      // Successor AgentAssignment
+      const assignment = this.getAgentAssignment(transfer.successor_assignment_id);
+      if (!assignment) {
+        return { success: false, transfer, errorCode: 'ASSIGNMENT_NOT_FOUND', error: `Successor assignment not found.` };
+      }
+
+      if (
+        assignment.id !== params.candidate.assignment_id ||
+        assignment.task_id !== task.id ||
+        assignment.project_id !== task.project_id ||
+        assignment.attempt_id !== transfer.successor_attempt_id ||
+        assignment.role_profile_id !== transfer.successor_role_profile_id ||
+        assignment.agent_profile_id !== transfer.successor_agent_profile_id ||
+        assignment.routing_decision_id !== params.candidate.routing_decision_id ||
+        assignment.selected_provider_id !== params.candidate.selected_provider_id ||
+        assignment.selected_resource_id !== params.candidate.selected_resource_id ||
+        assignment.status !== 'ASSIGNED'
+      ) {
+        return {
+          success: false,
+          transfer,
+          errorCode: 'ROUTE_METADATA_CORRUPTION',
+          error: `Successor assignment binding mismatch with candidate authorization.`,
+        };
+      }
+
+      const roleProfile = this.getRoleProfile(assignment.role_profile_id);
+      if (!roleProfile || !roleProfile.enabled) {
+        return {
+          success: false,
+          transfer,
+          errorCode: 'ROUTE_METADATA_CORRUPTION',
+          error: `RoleProfile "${assignment.role_profile_id}" is missing or disabled.`,
+        };
+      }
+
+      if (!assignment.agent_profile_id) {
+        return {
+          success: false,
+          transfer,
+          errorCode: 'ROUTE_METADATA_CORRUPTION',
+          error: `Successor assignment is missing agent_profile_id.`,
+        };
+      }
+
+      const agentProfile = this.getAgentProfile(assignment.agent_profile_id);
+      if (!agentProfile || !agentProfile.enabled || agentProfile.role_profile_id !== roleProfile.id) {
+        return {
+          success: false,
+          transfer,
+          errorCode: 'ROUTE_METADATA_CORRUPTION',
+          error: `AgentProfile "${assignment.agent_profile_id}" is missing, disabled, or unlinked.`,
+        };
+      }
+
+      // Routing Decision Event
+      const routingEvent = this.getRoutingDecisionEvent(assignment.routing_decision_id);
+      if (!routingEvent || routingEvent.type !== 'ROLE_AWARE_ROUTING_DECISION') {
+        return {
+          success: false,
+          transfer,
+          errorCode: 'ROUTING_DECISION_NOT_FOUND',
+          error: `Routing decision event "${assignment.routing_decision_id}" not found or invalid type.`,
+        };
+      }
+
+      const routingPayload = routingEvent.structured_payload as Record<string, unknown>;
+      if (
+        routingPayload.outcome !== 'SELECTED' ||
+        routingPayload.projectId !== task.project_id ||
+        routingPayload.taskId !== task.id ||
+        routingPayload.attemptId !== transfer.successor_attempt_id ||
+        routingPayload.selectedProviderId !== assignment.selected_provider_id ||
+        routingPayload.selectedAccountId !== assignment.selected_account_id ||
+        routingPayload.selectedResourceId !== assignment.selected_resource_id ||
+        routingPayload.selectedAssignmentId !== null
+      ) {
+        return {
+          success: false,
+          transfer,
+          errorCode: 'ROUTING_DECISION_NOT_FOUND',
+          error: `Routing decision event "${assignment.routing_decision_id}" payload scope mismatch.`,
+        };
+      }
+
+      // R5I4 Route spec validation
+      const meta = assignment.preferred_metadata as Record<string, unknown> | null;
+      if (
+        !meta ||
+        typeof meta !== 'object' ||
+        meta.handoff_route_spec_version !== 1 ||
+        !meta.handoff_route_spec ||
+        typeof meta.handoff_route_spec !== 'object' ||
+        typeof meta.handoff_route_spec_hash !== 'string' ||
+        meta.handoff_route_spec_hash.trim().length === 0
+      ) {
+        return {
+          success: false,
+          transfer,
+          errorCode: 'ROUTE_METADATA_CORRUPTION',
+          error: `Successor assignment is missing valid R5I4 route specification metadata.`,
+        };
+      }
+
+      const recomputedRouteHash = computeSha256(canonicalJsonStringify(meta.handoff_route_spec as Record<string, unknown>));
+      if (recomputedRouteHash !== meta.handoff_route_spec_hash) {
+        return {
+          success: false,
+          transfer,
+          errorCode: 'ROUTE_METADATA_CORRUPTION',
+          error: `Successor assignment handoff_route_spec_hash does not match recomputed hash.`,
+        };
+      }
+
+      // R5I3 Context Manifest and Snapshot Integrity
+      const specHash = transfer.successor_context_spec_hash;
+      if (!specHash || typeof specHash !== 'string' || specHash.trim().length === 0) {
+        return {
+          success: false,
+          transfer,
+          errorCode: 'CONTEXT_MANIFEST_INTEGRITY_FAILED',
+          error: `Successor transfer "${transfer.id}" has missing or invalid successor_context_spec_hash in Phase EB.`,
+        };
+      }
+
+      const expectedSnapshotId = `ctx-snap-ho-${computeSha256(`r5i-successor-context:${transfer.id}:${specHash}`).slice(0, 32)}`;
+      const expectedManifestId = `ctx-man-ho-${computeSha256(`r5i-successor-manifest:${transfer.id}:${specHash}`).slice(0, 32)}`;
+
+      if (transfer.successor_context_snapshot_id !== expectedSnapshotId) {
+        return {
+          success: false,
+          transfer,
+          errorCode: 'CONTEXT_MANIFEST_INTEGRITY_FAILED',
+          error: `Successor context snapshot ID "${transfer.successor_context_snapshot_id}" does not match R5I3 deterministic derivation "${expectedSnapshotId}" in Phase EB.`,
+        };
+      }
+
+      const manifest = this.getContextManifestBySnapshotId(transfer.successor_context_snapshot_id);
+      if (!manifest || manifest.id !== expectedManifestId || manifest.snapshot_id !== expectedSnapshotId) {
+        return {
+          success: false,
+          transfer,
+          errorCode: 'CONTEXT_MANIFEST_NOT_FOUND',
+          error: `ContextManifest for snapshot "${transfer.successor_context_snapshot_id}" not found or ID mismatch in Phase EB (expected "${expectedManifestId}").`,
+        };
+      }
+
+      const integrityResult = verifyContextManifestIntegrity(this, manifest.id);
+      if (!integrityResult.valid || !integrityResult.snapshot) {
+        return {
+          success: false,
+          transfer,
+          errorCode: 'CONTEXT_MANIFEST_INTEGRITY_FAILED',
+          error: `ContextManifest integrity failed in Phase EB: ${integrityResult.error}`,
+        };
+      }
+
+      if (
+        integrityResult.snapshot.id !== expectedSnapshotId ||
+        integrityResult.snapshot.task_id !== task.id ||
+        integrityResult.snapshot.attempt_id !== attempt.id ||
+        integrityResult.snapshot.purpose !== 'HANDOFF'
+      ) {
+        return {
+          success: false,
+          transfer,
+          errorCode: 'CONTEXT_MANIFEST_INTEGRITY_FAILED',
+          error: `Context snapshot bindings mismatch in Phase EB.`,
+        };
+      }
+
+      // Rederive Execution Context Artifacts
+      const contextItems = this.getContextItemsBySnapshot(transfer.successor_context_snapshot_id);
+      const fileRefItems = contextItems.filter((i) => i.item_type === 'CONTEXT_FILE_REFERENCE');
+      const nonFileItems = contextItems.filter((i) => i.item_type !== 'CONTEXT_FILE_REFERENCE');
+
+      const rawFilePaths: string[] = [];
+      for (const item of fileRefItems) {
+        let content: any;
+        try {
+          content = JSON.parse(item.content_json);
+        } catch {
+          return {
+            success: false,
+            transfer,
+            errorCode: 'CONTEXT_FILES_INVALID',
+            error: 'Malformed JSON in CONTEXT_FILE_REFERENCE item content in Phase EB.',
+          };
+        }
+        if (!content || typeof content.filePath !== 'string' || content.filePath.trim().length === 0) {
+          return {
+            success: false,
+            transfer,
+            errorCode: 'CONTEXT_FILES_INVALID',
+            error: 'Missing or empty filePath in CONTEXT_FILE_REFERENCE item in Phase EB.',
+          };
+        }
+        if (item.source_type !== 'REPOSITORY_FILE' || item.source_ref !== content.filePath) {
+          return {
+            success: false,
+            transfer,
+            errorCode: 'CONTEXT_FILES_INVALID',
+            error: `Mismatched source_type or source_ref in CONTEXT_FILE_REFERENCE item in Phase EB.`,
+          };
+        }
+        rawFilePaths.push(content.filePath);
+      }
+
+      const sanitizeResult = sanitizeContextFiles(rawFilePaths, project.repository_path);
+      if (sanitizeResult.error) {
+        return {
+          success: false,
+          transfer,
+          errorCode: 'CONTEXT_FILES_INVALID',
+          error: sanitizeResult.error,
+        };
+      }
+
+      const canonicalContextFiles = sanitizeResult.validFiles;
+      const contextManifestHash = computeContextManifestHash(canonicalContextFiles);
+
+      nonFileItems.sort((a, b) => a.ordinal - b.ordinal);
+      const structuredItems: HandoffContextExecutionItemV1[] = nonFileItems.map((i) => ({
+        ordinal: i.ordinal,
+        item_type: i.item_type,
+        source_type: i.source_type,
+        source_ref: i.source_ref,
+        content_json: i.content_json,
+        content_hash: i.content_hash,
+        token_estimate: i.token_estimate,
+      }));
+
+      const snapshotContentHash = integrityResult.snapshot.content_hash;
+      const contextDescriptor = buildHandoffContextExecutionDescriptorV1({
+        snapshotId: transfer.successor_context_snapshot_id,
+        snapshotContentHash,
+        manifestId: manifest.id,
+        manifestHash: manifest.manifest_hash,
+        items: structuredItems,
+      });
+      const serializedDescriptor = canonicalJsonStringify(contextDescriptor as unknown as Record<string, unknown>);
+
+      const canonicalInstructions = buildCanonicalInstructions(task, managerData as any);
+      canonicalInstructions.push('Handoff Successor Context (HANDOFF_CONTEXT_EXECUTION_V1):');
+      canonicalInstructions.push(serializedDescriptor);
+
+      const effectiveConstraints = [...(task.constraints ?? []), ...(managerData.constraints ?? [])];
+      const durableVerifCommands = this.getVerificationCommandsByProject(project.id);
+      const verificationSnapshot = buildVerificationCommandsSnapshot(durableVerifCommands);
+
+      const canonicalPayload = computeCanonicalPayload({
+        projectId: task.project_id,
+        taskId: task.id,
+        attemptId: transfer.successor_attempt_id,
+        taskTitle: task.title,
+        taskDescription: task.description,
+        acceptanceCriteria: task.acceptance_criteria ?? [],
+        constraints: effectiveConstraints,
+        instructions: canonicalInstructions,
+        contextFiles: canonicalContextFiles,
+        verificationCommands: verificationSnapshot,
+        managerMessageId: String(latestManagerMsg.id),
+        managerPayloadHash: String(latestManagerMsg.payload_hash),
+      });
+      const canonicalPayloadJson = JSON.stringify(canonicalPayload);
+      const instructionPayloadHash = computePayloadHash(canonicalPayload);
+
+      // Revalidate Provider / Account / Resource
+      const provider = this.getProvider(assignment.selected_provider_id);
+      if (!provider || !provider.enabled) {
+        return {
+          success: false,
+          transfer,
+          errorCode: !provider ? 'PROVIDER_NOT_FOUND' : 'PROVIDER_DISABLED',
+          error: `Provider "${assignment.selected_provider_id}" is missing or disabled.`,
+        };
+      }
+
+      const account = this.getProviderAccount(assignment.selected_account_id);
+      if (!account || !account.enabled) {
+        return {
+          success: false,
+          transfer,
+          errorCode: !account ? 'PROVIDER_ACCOUNT_NOT_FOUND' : 'PROVIDER_ACCOUNT_DISABLED',
+          error: `ProviderAccount "${assignment.selected_account_id}" is missing or disabled.`,
+        };
+      }
+      if (account.health_status === 'AUTH_ERROR') {
+        return {
+          success: false,
+          transfer,
+          errorCode: 'PROVIDER_ACCOUNT_UNSAFE_HEALTH',
+          error: `ProviderAccount "${account.id}" is in AUTH_ERROR state.`,
+        };
+      }
+      if (account.health_status !== 'AVAILABLE' && account.health_status !== 'LOW_QUOTA') {
+        return {
+          success: false,
+          transfer,
+          errorCode: 'PROVIDER_ACCOUNT_UNSAFE_HEALTH',
+          error: `ProviderAccount "${account.id}" health status "${account.health_status}" not eligible.`,
+        };
+      }
+      if (account.cooldown_until && new Date(account.cooldown_until).getTime() > Date.now()) {
+        return {
+          success: false,
+          transfer,
+          errorCode: 'PROVIDER_ACCOUNT_UNSAFE_HEALTH',
+          error: `ProviderAccount "${account.id}" is in cooldown until "${account.cooldown_until}".`,
+        };
+      }
+
+      const resource = this.getProviderResource(assignment.selected_resource_id);
+      if (!resource || !resource.enabled) {
+        return {
+          success: false,
+          transfer,
+          errorCode: !resource ? 'PROVIDER_RESOURCE_NOT_FOUND' : 'PROVIDER_RESOURCE_DISABLED',
+          error: `ProviderResource "${assignment.selected_resource_id}" is missing or disabled.`,
+        };
+      }
+      if (
+        resource.health_status === 'DISABLED' ||
+        resource.health_status === 'OFFLINE' ||
+        resource.health_status === 'UNHEALTHY' ||
+        resource.health_status === 'QUOTA_EXHAUSTED' ||
+        resource.health_status === 'AUTH_ERROR' ||
+        resource.health_status === 'RATE_LIMITED' ||
+        resource.health_status === 'COOLDOWN'
+      ) {
+        return {
+          success: false,
+          transfer,
+          errorCode: 'PROVIDER_RESOURCE_UNSAFE_HEALTH',
+          error: `ProviderResource "${resource.id}" health status "${resource.health_status}" not eligible.`,
+        };
+      }
+      if (
+        (resource.quota_source === 'MEASURED' || resource.quota_source === 'PROVIDER_REPORTED' || resource.quota_source === 'MANUAL') &&
+        resource.remaining_quota !== null &&
+        resource.remaining_quota <= 0
+      ) {
+        return {
+          success: false,
+          transfer,
+          errorCode: 'PROVIDER_RESOURCE_QUOTA_EXHAUSTED',
+          error: `ProviderResource "${resource.id}" quota exhausted (remaining: ${resource.remaining_quota}).`,
+        };
+      }
+
+      const safety = this.evaluateProviderHealthRoutingSafety(account.id);
+      if (safety.status !== 'SAFE') {
+        return {
+          success: false,
+          transfer,
+          errorCode: 'PROVIDER_HEALTH_UNSAFE',
+          error: `Provider health safety watermark check failed: ${safety.status}.`,
+        };
+      }
+
+      // Revalidate Verification Command policy
+      for (const cmd of durableVerifCommands) {
+        if (cmd.enabled === undefined || cmd.enabled) {
+          if (cmd.executable && cmd.executable.trim().length > 0) {
+            const policyRes = PolicyService.evaluateProcessExecution(cmd.executable.trim(), cmd.args, false);
+            if (policyRes.decision === 'DENY') {
+              return {
+                success: false,
+                transfer,
+                errorCode: 'POLICY_DENIED',
+                error: `Verification command "${cmd.name}" denied by policy: ${policyRes.reason}`,
+              };
+            }
+            if (policyRes.decision === 'REQUIRES_OWNER_APPROVAL') {
+              return {
+                success: false,
+                transfer,
+                errorCode: 'NEEDS_OWNER',
+                error: `Verification command "${cmd.name}" requires owner approval: ${policyRes.reason}`,
+              };
+            }
+          }
+        }
+      }
+
+      // Recompute deterministic authorization ID
+      const authority: HandoffSuccessorExecutionAuthorityV1 = {
+        version: 1,
+        transfer_id: transfer.id,
+        successor_attempt_id: transfer.successor_attempt_id,
+        successor_assignment_id: transfer.successor_assignment_id,
+        successor_ownership_epoch: transfer.successor_ownership_epoch,
+        routing_decision_id: assignment.routing_decision_id,
+        handoff_route_spec_hash: meta.handoff_route_spec_hash as string,
+        successor_context_spec_hash: transfer.successor_context_spec_hash,
+        manager_message_id: String(latestManagerMsg.id),
+        manager_payload_hash: String(latestManagerMsg.payload_hash),
+      };
+
+      const recomputedAuthId = computeHandoffAuthorizationId(authority);
+      if (recomputedAuthId !== params.candidate.id) {
+        return {
+          success: false,
+          transfer,
+          errorCode: 'AUTHORIZATION_CONTENT_MISMATCH',
+          error: `Deterministic authorization ID mismatch between Phase EA ("${params.candidate.id}") and Phase EB ("${recomputedAuthId}").`,
+        };
+      }
+
+      // Compare all derived fields against candidate
+      const mismatch =
+        params.candidate.project_id !== task.project_id ||
+        params.candidate.task_id !== task.id ||
+        params.candidate.attempt_id !== transfer.successor_attempt_id ||
+        params.candidate.assignment_id !== transfer.successor_assignment_id ||
+        params.candidate.task_revision !== task.revision_count ||
+        params.candidate.base_sha !== task.base_sha ||
+        params.candidate.task_ownership_epoch !== transfer.successor_ownership_epoch ||
+        params.candidate.canonical_instructions_json !== JSON.stringify(canonicalInstructions) ||
+        params.candidate.context_files_json !== JSON.stringify(canonicalContextFiles) ||
+        params.candidate.context_manifest_hash !== contextManifestHash ||
+        params.candidate.canonical_payload_json !== canonicalPayloadJson ||
+        params.candidate.instruction_payload_hash !== instructionPayloadHash;
+
+      if (mismatch) {
+        return {
+          success: false,
+          transfer,
+          errorCode: 'AUTHORIZATION_CONTENT_MISMATCH',
+          error: `Candidate authorization content does not match rederived Phase EB durable authority.`,
+        };
+      }
+
+      // 1. Insert candidate authorization
+      this.createExecutionAuthorization(params.candidate);
+
+      // 2. CAS update handoff_transfers ROUTED -> AUTHORIZED
+      const newVersion = transfer.version + 1;
+      const updateRes = this.db
+        .prepare(`
+          UPDATE handoff_transfers
+          SET status = 'AUTHORIZED',
+              successor_authorization_id = ?,
+              version = ?,
+              updated_at = ?
+          WHERE id = ? AND version = ? AND status = 'ROUTED'
+        `)
+        .run(params.candidate.id, newVersion, nowIso, transfer.id, transfer.version);
+
+      if (updateRes.changes !== 1) {
+        throw new Error(
+          `[HandoffAuthorize] Failed to update transfer "${transfer.id}" status to AUTHORIZED (CAS failure).`
+        );
+      }
+
+      const updatedTransfer = this.getHandoffTransfer(transfer.id)!;
+      return {
+        success: true,
+        transfer: updatedTransfer,
+        authorization: params.candidate,
+        alreadyAuthorized: false,
+      };
+    });
+  }
+
+  public acceptHandoffSuccessorExecution(params: {
+    authorizationId: string;
+    leaseId: string;
+    leaseToken: string;
+    expectedSuccessorEpoch: number;
+  }): {
+    success: boolean;
+    transfer?: HandoffTransfer;
+    attempt?: TaskAttempt;
+    assignment?: AgentAssignment;
+    alreadyAccepted?: boolean;
+    errorCode?:
+      | 'AUTHORIZATION_NOT_FOUND'
+      | 'NON_HANDOFF_AUTHORIZATION'
+      | 'TRANSFER_NOT_FOUND'
+      | 'TASK_NOT_FOUND'
+      | 'ATTEMPT_NOT_FOUND'
+      | 'ASSIGNMENT_NOT_FOUND'
+      | 'STALE_OWNERSHIP_EPOCH'
+      | 'STATUS_CONFLICT'
+      | 'LEASE_NOT_FOUND'
+      | 'LEASE_TOKEN_MISMATCH'
+      | 'LEASE_EXPIRED'
+      | 'LEASE_RELEASED'
+      | 'LEASE_INTEGRITY_MISMATCH'
+      | 'WORKER_SLOT_NOT_FOUND'
+      | 'WORKER_SLOT_NOT_LEASED'
+      | 'ATTEMPT_STATUS_MISMATCH'
+      | 'ASSIGNMENT_STATUS_MISMATCH'
+      | 'INTERNAL_ERROR';
+    error?: string;
+  } {
+    return this.runInImmediateTransaction(() => {
+      const nowIso = new Date().toISOString();
+      const nowTime = Date.parse(nowIso);
+
+      const valRes = this.validateHandoffSuccessorExecutionAuthority(params.authorizationId);
+      if (!valRes.valid) {
+        return {
+          success: false,
+          transfer: valRes.transfer,
+          errorCode: (valRes.errorCode as any) || 'INTERNAL_ERROR',
+          error: valRes.error,
+        };
+      }
+
+      const auth = valRes.auth!;
+      const transfer = valRes.transfer!;
+      const task = valRes.task!;
+      const attempt = valRes.attempt!;
+      const assignment = valRes.assignment!;
+
+      if (
+        transfer.successor_ownership_epoch !== params.expectedSuccessorEpoch ||
+        auth.task_ownership_epoch !== params.expectedSuccessorEpoch
+      ) {
+        return {
+          success: false,
+          transfer,
+          errorCode: 'STALE_OWNERSHIP_EPOCH',
+          error: `Durable binding invariant failure: expected epoch ${params.expectedSuccessorEpoch}, found ${transfer.successor_ownership_epoch}.`,
+        };
+      }
+
+      // Replay path: transfer is already ACCEPTED
+      if (transfer.status === 'ACCEPTED') {
+        if (auth.status === 'INVALIDATED') {
+          return {
+            success: false,
+            transfer,
+            errorCode: 'STATUS_CONFLICT',
+            error: `Execution authorization "${auth.id}" is INVALIDATED and cannot be replayed.`,
+          };
+        }
+        if (auth.status !== 'AUTHORIZED' && auth.status !== 'DISPATCHED') {
+          return {
+            success: false,
+            transfer,
+            errorCode: 'STATUS_CONFLICT',
+            error: `Execution authorization "${auth.id}" status is "${auth.status}" (expected "AUTHORIZED" or "DISPATCHED" for replay).`,
+          };
+        }
+
+        if (attempt.status !== 'RUNNING') {
+          return {
+            success: false,
+            transfer,
+            attempt,
+            errorCode: 'ATTEMPT_STATUS_MISMATCH',
+            error: `Transfer is ACCEPTED but attempt status is "${attempt.status}" (expected "RUNNING").`,
+          };
+        }
+        if (assignment.status !== 'RUNNING') {
+          return {
+            success: false,
+            transfer,
+            assignment,
+            errorCode: 'ASSIGNMENT_STATUS_MISMATCH',
+            error: `Transfer is ACCEPTED but assignment status is "${assignment.status}" (expected "RUNNING").`,
+          };
+        }
+
+        // Replay lease check
+        const lease = this.getAccountLease(params.leaseId);
+        if (!lease) {
+          return {
+            success: false,
+            transfer,
+            errorCode: 'LEASE_NOT_FOUND',
+            error: `AccountLease "${params.leaseId}" not found.`,
+          };
+        }
+
+        if (
+          lease.lease_token !== params.leaseToken ||
+          lease.assignment_id !== assignment.id ||
+          lease.worker_slot_id !== assignment.selected_worker_slot_id ||
+          lease.provider_account_id !== assignment.selected_account_id
+        ) {
+          return {
+            success: false,
+            transfer,
+            errorCode: 'LEASE_INTEGRITY_MISMATCH',
+            error: `Lease token, assignment, slot, or account mismatch during replay.`,
+          };
+        }
+
+        if (lease.released_at === null) {
+          // Lease is currently active
+          if (Date.parse(lease.expires_at) <= nowTime) {
+            return {
+              success: false,
+              transfer,
+              errorCode: 'LEASE_EXPIRED',
+              error: `Active lease "${lease.id}" is expired.`,
+            };
+          }
+          const slot = this.getWorkerSlot(lease.worker_slot_id);
+          if (!slot || slot.status !== 'LEASED' || slot.current_assignment_id !== assignment.id) {
+            return {
+              success: false,
+              transfer,
+              errorCode: 'WORKER_SLOT_NOT_LEASED',
+              error: `WorkerSlot "${lease.worker_slot_id}" is not in LEASED state for assignment "${assignment.id}".`,
+            };
+          }
+        } else {
+          // Lease was historically released
+          const acceptedTime = Date.parse(transfer.accepted_at!);
+          const acquiredTime = Date.parse(lease.acquired_at);
+          const expiresTime = Date.parse(lease.expires_at);
+          const releasedTime = Date.parse(lease.released_at);
+          if (
+            acquiredTime > acceptedTime ||
+            releasedTime < acceptedTime ||
+            acceptedTime >= expiresTime
+          ) {
+            return {
+              success: false,
+              transfer,
+              errorCode: 'LEASE_INTEGRITY_MISMATCH',
+              error: `Historical lease authority interval does not encompass transfer accepted_at timestamp.`,
+            };
+          }
+          const slot = this.getWorkerSlot(lease.worker_slot_id);
+          if (!slot) {
+            return {
+              success: false,
+              transfer,
+              errorCode: 'WORKER_SLOT_NOT_FOUND',
+              error: `WorkerSlot "${lease.worker_slot_id}" for historical lease not found.`,
+            };
+          }
+        }
+
+        return {
+          success: true,
+          transfer,
+          attempt,
+          assignment,
+          alreadyAccepted: true,
+        };
+      }
+
+      // First acceptance path: transfer must be AUTHORIZED and auth must be AUTHORIZED
+      if (transfer.status !== 'AUTHORIZED') {
+        return {
+          success: false,
+          transfer,
+          errorCode: 'STATUS_CONFLICT',
+          error: `STATUS_CONFLICT: Expected transfer status AUTHORIZED, found "${transfer.status}".`,
+        };
+      }
+
+      if (auth.status !== 'AUTHORIZED') {
+        return {
+          success: false,
+          transfer,
+          errorCode: 'STATUS_CONFLICT',
+          error: `STATUS_CONFLICT: First acceptance requires authorization status AUTHORIZED, found "${auth.status}".`,
+        };
+      }
+
+      if (attempt.status !== 'PENDING' || attempt.agent_id !== null) {
+        return {
+          success: false,
+          transfer,
+          attempt,
+          errorCode: 'ATTEMPT_STATUS_MISMATCH',
+          error: `ATTEMPT_STATUS_MISMATCH: Successor attempt status is "${attempt.status}", agent_id is "${attempt.agent_id}" (expected "PENDING" and NULL agent_id).`,
+        };
+      }
+
+      if (assignment.status !== 'ASSIGNED') {
+        return {
+          success: false,
+          transfer,
+          assignment,
+          errorCode: 'ASSIGNMENT_STATUS_MISMATCH',
+          error: `ASSIGNMENT_STATUS_MISMATCH: Successor assignment status is "${assignment.status}" (expected "ASSIGNED").`,
+        };
+      }
+
+      // Validate Lease
+      const lease = this.getAccountLease(params.leaseId);
+      if (!lease) {
+        return {
+          success: false,
+          transfer,
+          errorCode: 'LEASE_NOT_FOUND',
+          error: `AccountLease "${params.leaseId}" not found.`,
+        };
+      }
+
+      if (lease.lease_token !== params.leaseToken) {
+        return {
+          success: false,
+          transfer,
+          errorCode: 'LEASE_TOKEN_MISMATCH',
+          error: `LEASE_TOKEN_MISMATCH: Lease token does not match active lease authority.`,
+        };
+      }
+
+      if (lease.released_at !== null) {
+        return {
+          success: false,
+          transfer,
+          errorCode: 'LEASE_RELEASED',
+          error: `LEASE_RELEASED: AccountLease "${params.leaseId}" has already been released.`,
+        };
+      }
+
+      if (Date.parse(lease.expires_at) <= nowTime) {
+        return {
+          success: false,
+          transfer,
+          errorCode: 'LEASE_EXPIRED',
+          error: `LEASE_EXPIRED: AccountLease "${params.leaseId}" expired at "${lease.expires_at}".`,
+        };
+      }
+
+      if (lease.assignment_id !== assignment.id) {
+        return {
+          success: false,
+          transfer,
+          errorCode: 'LEASE_INTEGRITY_MISMATCH',
+          error: `LEASE_INTEGRITY_MISMATCH: Lease assignment_id "${lease.assignment_id}" does not match successor assignment "${assignment.id}".`,
+        };
+      }
+
+      if (lease.worker_slot_id !== assignment.selected_worker_slot_id) {
+        return {
+          success: false,
+          transfer,
+          errorCode: 'LEASE_INTEGRITY_MISMATCH',
+          error: `LEASE_INTEGRITY_MISMATCH: Lease worker_slot_id "${lease.worker_slot_id}" does not match assignment slot "${assignment.selected_worker_slot_id}".`,
+        };
+      }
+
+      if (lease.provider_account_id !== assignment.selected_account_id) {
+        return {
+          success: false,
+          transfer,
+          errorCode: 'LEASE_INTEGRITY_MISMATCH',
+          error: `LEASE_INTEGRITY_MISMATCH: Lease provider_account_id "${lease.provider_account_id}" does not match assignment account "${assignment.selected_account_id}".`,
+        };
+      }
+
+      // Validate WorkerSlot
+      const slot = this.getWorkerSlot(lease.worker_slot_id);
+      if (!slot) {
+        return {
+          success: false,
+          transfer,
+          errorCode: 'WORKER_SLOT_NOT_FOUND',
+          error: `WorkerSlot "${lease.worker_slot_id}" not found.`,
+        };
+      }
+
+      if (slot.status !== 'LEASED') {
+        return {
+          success: false,
+          transfer,
+          errorCode: 'WORKER_SLOT_NOT_LEASED',
+          error: `WORKER_SLOT_NOT_LEASED: WorkerSlot status is "${slot.status}" (expected "LEASED").`,
+        };
+      }
+
+      if (slot.current_assignment_id !== assignment.id) {
+        return {
+          success: false,
+          transfer,
+          errorCode: 'WORKER_SLOT_NOT_LEASED',
+          error: `WorkerSlot current_assignment_id "${slot.current_assignment_id}" does not match successor assignment "${assignment.id}".`,
+        };
+      }
+
+      if (slot.provider_account_id !== assignment.selected_account_id) {
+        return {
+          success: false,
+          transfer,
+          errorCode: 'WORKER_SLOT_NOT_LEASED',
+          error: `WorkerSlot provider_account_id "${slot.provider_account_id}" does not match assignment account "${assignment.selected_account_id}".`,
+        };
+      }
+
+      // Perform atomic CAS transitions:
+      // 1. TaskAttempt PENDING -> RUNNING
+      const attemptRes = this.db
+        .prepare(`
+          UPDATE task_attempts
+          SET status = 'RUNNING',
+              started_at = ?
+          WHERE id = ? AND task_id = ? AND status = 'PENDING'
+        `)
+        .run(nowIso, attempt.id, task.id);
+
+      if (attemptRes.changes !== 1) {
+        throw new Error(`[HandoffAccept] Failed to update TaskAttempt "${attempt.id}" to RUNNING.`);
+      }
+
+      // 2. AgentAssignment ASSIGNED -> RUNNING
+      const assignmentRes = this.db
+        .prepare(`
+          UPDATE agent_assignments
+          SET status = 'RUNNING'
+          WHERE id = ? AND task_id = ? AND project_id = ? AND status = 'ASSIGNED'
+        `)
+        .run(assignment.id, task.id, task.project_id);
+
+      if (assignmentRes.changes !== 1) {
+        throw new Error(`[HandoffAccept] Failed to update AgentAssignment "${assignment.id}" to RUNNING.`);
+      }
+
+      // 3. HandoffTransfer AUTHORIZED -> ACCEPTED
+      const newVersion = transfer.version + 1;
+      const transferRes = this.db
+        .prepare(`
+          UPDATE handoff_transfers
+          SET status = 'ACCEPTED',
+              accepted_at = ?,
+              version = ?,
+              updated_at = ?
+          WHERE id = ? AND status = 'AUTHORIZED'
+        `)
+        .run(nowIso, newVersion, nowIso, transfer.id);
+
+      if (transferRes.changes !== 1) {
+        throw new Error(`[HandoffAccept] Failed to update HandoffTransfer "${transfer.id}" to ACCEPTED.`);
+      }
+
+      return {
+        success: true,
+        transfer: this.getHandoffTransfer(transfer.id)!,
+        attempt: this.getTaskAttempt(attempt.id)!,
+        assignment: this.getAgentAssignment(assignment.id)!,
+        alreadyAccepted: false,
       };
     });
   }

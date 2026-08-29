@@ -20,9 +20,14 @@ import {
   computeCanonicalPayload,
   computePayloadHash,
   computeContextManifestHash,
+  buildCanonicalInstructions,
+  buildHandoffContextExecutionDescriptorV1,
+  buildVerificationCommandsSnapshot,
   CanonicalExecutionPayloadSchema,
   CanonicalExecutionPayload,
+  HandoffContextExecutionItemV1,
 } from './ExecutionAuthorizationService';
+import { sanitizeContextFiles, canonicalJsonStringify, verifyContextManifestIntegrity } from '../context/ContextIntegrity';
 import { ProviderHealthObservationService } from './ProviderHealthObservationService';
 
 export type ScheduledCancellationStatus =
@@ -477,43 +482,102 @@ export class ProviderDispatchService {
       }
     }
 
-    // 8. R5F Account and Assignment Rebinding (for SELECTED routing outcome)
+    // 8. R5F Account and Assignment Rebinding (for SELECTED routing outcome or R5I Handoff Authorization)
     let account: ProviderAccount | null = null;
     let assignment: AgentAssignment | null = null;
 
-    const hasFabricContext =
-      routingPayload.selectedAccountId !== undefined ||
-      routingPayload.selectedAssignmentId !== undefined ||
-      routingPayload.roleProfileId !== undefined;
-
-    if (routingOutcome === 'SELECTED' && hasFabricContext) {
-      const selectedAccountId = routingPayload.selectedAccountId;
-      if (typeof selectedAccountId !== 'string' || selectedAccountId.trim().length === 0) {
+    if (auth.assignment_id) {
+      // R5I Handoff Execution Authority Fence
+      const valRes = this.repo.validateHandoffSuccessorExecutionAuthority(auth.id);
+      if (!valRes.valid) {
         this.repo.invalidateExecutionAuthorization(auth.id);
-        const reason = 'ROUTING_ACCOUNT_ID_MISSING: Selected routing decision missing valid selectedAccountId.';
+        const reason = `EXECUTION_AUTHORIZATION_INVALID: ${valRes.error}`;
         this.recordRejectionEvent(auth, reason);
         return { executionId, status: 'FAILED', error: reason, errorCode: 'RESOURCE_UNAVAILABLE' };
       }
 
-      const selectedAssignmentId = routingPayload.selectedAssignmentId;
-      if (typeof selectedAssignmentId !== 'string' || selectedAssignmentId.trim().length === 0) {
+      const transfer = valRes.transfer!;
+      const task = valRes.task!;
+      const attempt = valRes.attempt!;
+      assignment = valRes.assignment!;
+
+      if (transfer.status !== 'ACCEPTED') {
         this.repo.invalidateExecutionAuthorization(auth.id);
-        const reason = 'ROUTING_ASSIGNMENT_ID_MISSING: Selected routing decision missing valid selectedAssignmentId.';
+        const reason = `EXECUTION_AUTHORIZATION_NOT_ACCEPTED: HandoffTransfer "${transfer.id}" status is "${transfer.status}", expected "ACCEPTED".`;
         this.recordRejectionEvent(auth, reason);
         return { executionId, status: 'FAILED', error: reason, errorCode: 'RESOURCE_UNAVAILABLE' };
       }
 
-      account = this.repo.getProviderAccount(selectedAccountId);
+      if (attempt.status !== 'RUNNING') {
+        this.repo.invalidateExecutionAuthorization(auth.id);
+        const reason = `EXECUTION_AUTHORIZATION_ATTEMPT_NOT_RUNNING: Successor attempt status is "${attempt.status}", expected "RUNNING".`;
+        this.recordRejectionEvent(auth, reason);
+        return { executionId, status: 'FAILED', error: reason, errorCode: 'RESOURCE_UNAVAILABLE' };
+      }
+
+      if (assignment.status !== 'RUNNING') {
+        this.repo.invalidateExecutionAuthorization(auth.id);
+        const reason = `ROUTING_ASSIGNMENT_STATUS_INVALID: Successor assignment "${assignment.id}" status is "${assignment.status}", expected "RUNNING".`;
+        this.recordRejectionEvent(auth, reason);
+        return { executionId, status: 'FAILED', error: reason, errorCode: 'RESOURCE_UNAVAILABLE' };
+      }
+
+      const routingPayload = (valRes.routingPayload || {}) as Record<string, unknown>;
+      if (routingPayload.selectedAccountId !== assignment.selected_account_id) {
+        this.repo.invalidateExecutionAuthorization(auth.id);
+        const reason = `ROUTING_ACCOUNT_MISMATCH: Routing payload account "${routingPayload.selectedAccountId}" differs from assignment account "${assignment.selected_account_id}".`;
+        this.recordRejectionEvent(auth, reason);
+        return { executionId, status: 'FAILED', error: reason, errorCode: 'RESOURCE_UNAVAILABLE' };
+      }
+
+      // Scheduled active lease fence
+      if (mode === 'SCHEDULED') {
+        const activeLease = this.repo.getActiveLeaseForAssignment(assignment.id);
+        if (!activeLease) {
+          this.repo.invalidateExecutionAuthorization(auth.id);
+          const reason = `SCHEDULED_LEASE_REQUIRED: No active unreleased AccountLease found for assignment "${assignment.id}".`;
+          this.recordRejectionEvent(auth, reason);
+          return { executionId, status: 'FAILED', error: reason, errorCode: 'RESOURCE_UNAVAILABLE' };
+        }
+
+        if (
+          activeLease.assignment_id !== assignment.id ||
+          activeLease.worker_slot_id !== assignment.selected_worker_slot_id ||
+          activeLease.provider_account_id !== assignment.selected_account_id ||
+          new Date(activeLease.expires_at).getTime() <= Date.now()
+        ) {
+          this.repo.invalidateExecutionAuthorization(auth.id);
+          const reason = `SCHEDULED_LEASE_EXPIRED_OR_MISMATCHED: Active lease "${activeLease.id}" expired or mismatched.`;
+          this.recordRejectionEvent(auth, reason);
+          return { executionId, status: 'FAILED', error: reason, errorCode: 'RESOURCE_UNAVAILABLE' };
+        }
+
+        const slot = this.repo.getWorkerSlot(activeLease.worker_slot_id);
+        if (
+          !slot ||
+          slot.status !== 'LEASED' ||
+          slot.current_assignment_id !== assignment.id ||
+          slot.provider_account_id !== assignment.selected_account_id ||
+          (slot.provider_resource_id !== null && slot.provider_resource_id !== assignment.selected_resource_id)
+        ) {
+          this.repo.invalidateExecutionAuthorization(auth.id);
+          const reason = `SCHEDULED_WORKER_SLOT_NOT_LEASED: WorkerSlot "${activeLease.worker_slot_id}" is not in valid LEASED state for assignment "${assignment.id}".`;
+          this.recordRejectionEvent(auth, reason);
+          return { executionId, status: 'FAILED', error: reason, errorCode: 'RESOURCE_UNAVAILABLE' };
+        }
+      }
+
+      account = this.repo.getProviderAccount(assignment.selected_account_id);
       if (!account) {
         this.repo.invalidateExecutionAuthorization(auth.id);
-        const reason = `ROUTING_ACCOUNT_NOT_FOUND: Selected provider account "${selectedAccountId}" was not found in database.`;
+        const reason = `ROUTING_ACCOUNT_NOT_FOUND: Provider account "${assignment.selected_account_id}" not found in database.`;
         this.recordRejectionEvent(auth, reason);
         return { executionId, status: 'FAILED', error: reason, errorCode: 'RESOURCE_UNAVAILABLE' };
       }
 
       if (!account.enabled) {
         this.repo.invalidateExecutionAuthorization(auth.id);
-        const reason = `ROUTING_ACCOUNT_DISABLED: Selected provider account "${account.id}" is disabled.`;
+        const reason = `ROUTING_ACCOUNT_DISABLED: Provider account "${account.id}" is disabled.`;
         this.recordRejectionEvent(auth, reason);
         return { executionId, status: 'FAILED', error: reason, errorCode: 'RESOURCE_UNAVAILABLE' };
       }
@@ -543,7 +607,6 @@ export class ProviderDispatchService {
         return { executionId, status: 'FAILED', error: reason, errorCode: 'RESOURCE_UNAVAILABLE' };
       }
 
-      // Check durable health-authority routing safety before claim
       const preClaimSafety = this.repo.evaluateProviderHealthRoutingSafety(account.id);
       if (preClaimSafety.status !== 'SAFE') {
         this.repo.invalidateExecutionAuthorization(auth.id);
@@ -551,41 +614,113 @@ export class ProviderDispatchService {
         this.recordRejectionEvent(auth, reason);
         return { executionId, status: 'FAILED', error: reason, errorCode: 'RESOURCE_UNAVAILABLE' };
       }
+    } else {
+      const hasFabricContext =
+        routingPayload.selectedAccountId !== undefined ||
+        routingPayload.selectedAssignmentId !== undefined ||
+        routingPayload.roleProfileId !== undefined;
 
-      assignment = this.repo.getAgentAssignment(selectedAssignmentId);
-      if (!assignment) {
-        this.repo.invalidateExecutionAuthorization(auth.id);
-        const reason = `ROUTING_ASSIGNMENT_NOT_FOUND: Selected assignment "${selectedAssignmentId}" was not found in database.`;
-        this.recordRejectionEvent(auth, reason);
-        return { executionId, status: 'FAILED', error: reason, errorCode: 'RESOURCE_UNAVAILABLE' };
-      }
+      if (routingOutcome === 'SELECTED' && hasFabricContext) {
+        const selectedAccountId = routingPayload.selectedAccountId;
+        if (typeof selectedAccountId !== 'string' || selectedAccountId.trim().length === 0) {
+          this.repo.invalidateExecutionAuthorization(auth.id);
+          const reason = 'ROUTING_ACCOUNT_ID_MISSING: Selected routing decision missing valid selectedAccountId.';
+          this.recordRejectionEvent(auth, reason);
+          return { executionId, status: 'FAILED', error: reason, errorCode: 'RESOURCE_UNAVAILABLE' };
+        }
 
-      if (
-        assignment.id !== selectedAssignmentId ||
-        assignment.project_id !== auth.project_id ||
-        assignment.task_id !== auth.task_id ||
-        assignment.attempt_id !== auth.attempt_id ||
-        assignment.selected_provider_id !== auth.selected_provider_id ||
-        assignment.selected_account_id !== account.id ||
-        assignment.selected_resource_id !== auth.selected_resource_id ||
-        assignment.routing_decision_id !== auth.routing_decision_id
-      ) {
-        this.repo.invalidateExecutionAuthorization(auth.id);
-        const reason = `ROUTING_ASSIGNMENT_SCOPE_MISMATCH: AgentAssignment "${assignment.id}" scope does not match authorization and routing decision.`;
-        this.recordRejectionEvent(auth, reason);
-        return { executionId, status: 'FAILED', error: reason, errorCode: 'RESOURCE_UNAVAILABLE' };
-      }
+        const selectedAssignmentId = routingPayload.selectedAssignmentId;
+        if (typeof selectedAssignmentId !== 'string' || selectedAssignmentId.trim().length === 0) {
+          this.repo.invalidateExecutionAuthorization(auth.id);
+          const reason = 'ROUTING_ASSIGNMENT_ID_MISSING: Selected routing decision missing valid selectedAssignmentId.';
+          this.recordRejectionEvent(auth, reason);
+          return { executionId, status: 'FAILED', error: reason, errorCode: 'RESOURCE_UNAVAILABLE' };
+        }
 
-      if (
-        assignment.status === 'COMPLETED' ||
-        assignment.status === 'FAILED' ||
-        assignment.status === 'CANCELLED' ||
-        assignment.status === 'HANDED_OFF'
-      ) {
-        this.repo.invalidateExecutionAuthorization(auth.id);
-        const reason = `ROUTING_ASSIGNMENT_STATUS_INVALID: AgentAssignment "${assignment.id}" is in terminal state "${assignment.status}".`;
-        this.recordRejectionEvent(auth, reason);
-        return { executionId, status: 'FAILED', error: reason, errorCode: 'RESOURCE_UNAVAILABLE' };
+        account = this.repo.getProviderAccount(selectedAccountId);
+        if (!account) {
+          this.repo.invalidateExecutionAuthorization(auth.id);
+          const reason = `ROUTING_ACCOUNT_NOT_FOUND: Selected provider account "${selectedAccountId}" was not found in database.`;
+          this.recordRejectionEvent(auth, reason);
+          return { executionId, status: 'FAILED', error: reason, errorCode: 'RESOURCE_UNAVAILABLE' };
+        }
+
+        if (!account.enabled) {
+          this.repo.invalidateExecutionAuthorization(auth.id);
+          const reason = `ROUTING_ACCOUNT_DISABLED: Selected provider account "${account.id}" is disabled.`;
+          this.recordRejectionEvent(auth, reason);
+          return { executionId, status: 'FAILED', error: reason, errorCode: 'RESOURCE_UNAVAILABLE' };
+        }
+
+        if (account.provider_id !== auth.selected_provider_id) {
+          this.repo.invalidateExecutionAuthorization(auth.id);
+          const reason = `ROUTING_ACCOUNT_PROVIDER_MISMATCH: Account provider_id "${account.provider_id}" differs from authorized provider "${auth.selected_provider_id}".`;
+          this.recordRejectionEvent(auth, reason);
+          return { executionId, status: 'FAILED', error: reason, errorCode: 'RESOURCE_UNAVAILABLE' };
+        }
+
+        if (account.health_status === 'AUTH_ERROR') {
+          this.repo.invalidateExecutionAuthorization(auth.id);
+          const reason = `PROVIDER_ACCOUNT_AUTH_ERROR: Selected provider account "${account.id}" is in AUTH_ERROR state.`;
+          this.recordRejectionEvent(auth, reason);
+          return { executionId, status: 'FAILED', error: reason, errorCode: 'AUTH_ERROR' };
+        }
+
+        if (
+          account.health_status === 'OFFLINE' ||
+          account.health_status === 'UNHEALTHY' ||
+          account.health_status === 'DISABLED'
+        ) {
+          this.repo.invalidateExecutionAuthorization(auth.id);
+          const reason = `ROUTING_ACCOUNT_UNAVAILABLE: Selected provider account "${account.id}" has health status "${account.health_status}".`;
+          this.recordRejectionEvent(auth, reason);
+          return { executionId, status: 'FAILED', error: reason, errorCode: 'RESOURCE_UNAVAILABLE' };
+        }
+
+        // Check durable health-authority routing safety before claim
+        const preClaimSafety = this.repo.evaluateProviderHealthRoutingSafety(account.id);
+        if (preClaimSafety.status !== 'SAFE') {
+          this.repo.invalidateExecutionAuthorization(auth.id);
+          const reason = `EXECUTION_AUTHORIZATION_ROUTING_UNSAFE: Provider account "${account.id}" routing safety check failed with status "${preClaimSafety.status}". ${preClaimSafety.reason ?? ''}`.trim();
+          this.recordRejectionEvent(auth, reason);
+          return { executionId, status: 'FAILED', error: reason, errorCode: 'RESOURCE_UNAVAILABLE' };
+        }
+
+        assignment = this.repo.getAgentAssignment(selectedAssignmentId);
+        if (!assignment) {
+          this.repo.invalidateExecutionAuthorization(auth.id);
+          const reason = `ROUTING_ASSIGNMENT_NOT_FOUND: Selected assignment "${selectedAssignmentId}" was not found in database.`;
+          this.recordRejectionEvent(auth, reason);
+          return { executionId, status: 'FAILED', error: reason, errorCode: 'RESOURCE_UNAVAILABLE' };
+        }
+
+        if (
+          assignment.id !== selectedAssignmentId ||
+          assignment.project_id !== auth.project_id ||
+          assignment.task_id !== auth.task_id ||
+          assignment.attempt_id !== auth.attempt_id ||
+          assignment.selected_provider_id !== auth.selected_provider_id ||
+          assignment.selected_account_id !== account.id ||
+          assignment.selected_resource_id !== auth.selected_resource_id ||
+          assignment.routing_decision_id !== auth.routing_decision_id
+        ) {
+          this.repo.invalidateExecutionAuthorization(auth.id);
+          const reason = `ROUTING_ASSIGNMENT_SCOPE_MISMATCH: AgentAssignment "${assignment.id}" scope does not match authorization and routing decision.`;
+          this.recordRejectionEvent(auth, reason);
+          return { executionId, status: 'FAILED', error: reason, errorCode: 'RESOURCE_UNAVAILABLE' };
+        }
+
+        if (
+          assignment.status === 'COMPLETED' ||
+          assignment.status === 'FAILED' ||
+          assignment.status === 'CANCELLED' ||
+          assignment.status === 'HANDED_OFF'
+        ) {
+          this.repo.invalidateExecutionAuthorization(auth.id);
+          const reason = `ROUTING_ASSIGNMENT_STATUS_INVALID: AgentAssignment "${assignment.id}" is in terminal state "${assignment.status}".`;
+          this.recordRejectionEvent(auth, reason);
+          return { executionId, status: 'FAILED', error: reason, errorCode: 'RESOURCE_UNAVAILABLE' };
+        }
       }
     }
 
@@ -881,6 +1016,108 @@ export class ProviderDispatchService {
         error: 'EXECUTION_AUTHORIZATION_HASH_MISMATCH: Canonical execution payload hash recomputation failed.',
         errorCode: 'PROTOCOL_INVALID',
       };
+    }
+
+    if (auth.assignment_id) {
+      const transfer = this.repo.getHandoffTransferBySuccessorAuthId(auth.id);
+      if (transfer?.successor_context_snapshot_id) {
+        const manifest = this.repo.getContextManifestBySnapshotId(transfer.successor_context_snapshot_id);
+        const integrityResult = manifest ? this.repo.runInTransaction(() => verifyContextManifestIntegrity(this.repo, manifest.id)) : null;
+        if (!manifest || !integrityResult || !integrityResult.valid || !integrityResult.snapshot) {
+          this.repo.invalidateExecutionAuthorization(auth.id);
+          const reason = 'EXECUTION_AUTHORIZATION_HASH_MISMATCH: Live context manifest integrity failed before dispatch.';
+          this.recordRejectionEvent(auth, reason);
+          return {
+            executionId,
+            status: 'FAILED',
+            error: reason,
+            errorCode: 'PROTOCOL_INVALID',
+          };
+        }
+
+        const contextItems = this.repo.getContextItemsBySnapshot(transfer.successor_context_snapshot_id);
+        const fileRefItems = contextItems.filter((i) => i.item_type === 'CONTEXT_FILE_REFERENCE');
+        const nonFileItems = contextItems.filter((i) => i.item_type !== 'CONTEXT_FILE_REFERENCE');
+
+        const rawFilePaths: string[] = [];
+        for (const item of fileRefItems) {
+          try {
+            const parsed = JSON.parse(item.content_json);
+            if (parsed?.filePath && item.source_type === 'REPOSITORY_FILE' && item.source_ref === parsed.filePath) {
+              rawFilePaths.push(parsed.filePath);
+            }
+          } catch {
+            // ignore
+          }
+        }
+
+        const project = this.repo.getProject(task.project_id);
+        const sanitizeResult = sanitizeContextFiles(rawFilePaths, project ? project.repository_path : '');
+        const currentCanonicalContextFiles = sanitizeResult.validFiles;
+        const currentContextManifestHash = computeContextManifestHash(currentCanonicalContextFiles);
+
+        nonFileItems.sort((a, b) => a.ordinal - b.ordinal);
+        const currentStructuredItems: HandoffContextExecutionItemV1[] = nonFileItems.map((i) => ({
+          ordinal: i.ordinal,
+          item_type: i.item_type,
+          source_type: i.source_type,
+          source_ref: i.source_ref,
+          content_json: i.content_json,
+          content_hash: i.content_hash,
+          token_estimate: i.token_estimate,
+        }));
+
+        const currentDescriptor = buildHandoffContextExecutionDescriptorV1({
+          snapshotId: transfer.successor_context_snapshot_id,
+          snapshotContentHash: integrityResult.snapshot.content_hash,
+          manifestId: manifest.id,
+          manifestHash: manifest.manifest_hash,
+          items: currentStructuredItems,
+        });
+        const serializedCurrentDescriptor = canonicalJsonStringify(currentDescriptor as unknown as Record<string, unknown>);
+
+        const currentCanonicalInstructions = buildCanonicalInstructions(task, managerData);
+        currentCanonicalInstructions.push('Handoff Successor Context (HANDOFF_CONTEXT_EXECUTION_V1):');
+        currentCanonicalInstructions.push(serializedCurrentDescriptor);
+
+        const currentDurableVerifCommands = project ? this.repo.getVerificationCommandsByProject(project.id) : [];
+        const currentVerificationSnapshot = buildVerificationCommandsSnapshot(currentDurableVerifCommands);
+
+        const currentCanonicalPayload = computeCanonicalPayload({
+          projectId: auth.project_id,
+          taskId: auth.task_id,
+          attemptId: auth.attempt_id,
+          taskTitle: task.title,
+          taskDescription: task.description,
+          acceptanceCriteria: task.acceptance_criteria ?? [],
+          constraints: effectiveConstraints,
+          instructions: currentCanonicalInstructions,
+          contextFiles: currentCanonicalContextFiles,
+          verificationCommands: currentVerificationSnapshot,
+          managerMessageId: auth.manager_message_id,
+          managerPayloadHash: auth.manager_payload_hash,
+        });
+        const currentPayloadHash = computePayloadHash(currentCanonicalPayload);
+
+        const isMatch =
+          auth.canonical_instructions_json === JSON.stringify(currentCanonicalInstructions) &&
+          auth.context_files_json === JSON.stringify(currentCanonicalContextFiles) &&
+          auth.context_manifest_hash === currentContextManifestHash &&
+          auth.canonical_payload_json === JSON.stringify(currentCanonicalPayload) &&
+          auth.instruction_payload_hash === currentPayloadHash;
+
+        if (!isMatch) {
+          this.repo.invalidateExecutionAuthorization(auth.id);
+          const reason = 'EXECUTION_AUTHORIZATION_HASH_MISMATCH: Current context authority or canonical payload does not match persisted authorization.';
+          this.recordRejectionEvent(auth, reason);
+          return {
+            executionId,
+            status: 'FAILED',
+            error: reason,
+            errorCode: 'PROTOCOL_INVALID',
+          };
+        }
+      }
     }
 
     // 11b. Pre-claim cancellation check for scheduled execution
