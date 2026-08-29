@@ -68,7 +68,7 @@ if (-not (Test-Path $packageJsonPath)) {
 $receiptLines.Add("PRODUCTION_VERSION=$expectedVersion")
 Write-Host "[A] Production Version ($expectedVersion): $(if ($expectedVersion -match '^\d+\.\d+\.\d+') {'PASS'} else {'FAIL'})"
 
-# Assertion B: Database migration count == 18
+# Assertion B: Database migration count == 19
 $migrationsPath = Join-Path $ProjectRoot "src\core\database\migrations.ts"
 $migrationCount = 0
 if (-not (Test-Path $migrationsPath)) {
@@ -76,12 +76,12 @@ if (-not (Test-Path $migrationsPath)) {
 } else {
   $migrationMatches = Select-String -Path $migrationsPath -Pattern "version:\s*(\d+)"
   $migrationCount = $migrationMatches.Count
-  if ($migrationCount -ne 18) {
-    $failures.Add("B_MIGRATION_COUNT_INVALID: Expected exactly 18 migrations, found $migrationCount")
+  if ($migrationCount -ne 19) {
+    $failures.Add("B_MIGRATION_COUNT_INVALID: Expected exactly 19 migrations, found $migrationCount")
   }
 }
 $receiptLines.Add("MIGRATION_COUNT=$migrationCount")
-Write-Host "[B] Database Migration Count ($migrationCount): $(if ($migrationCount -eq 18) {'PASS'} else {'FAIL'})"
+Write-Host "[B] Database Migration Count ($migrationCount): $(if ($migrationCount -eq 19) {'PASS'} else {'FAIL'})"
 
 # Assertion C & D: electron-builder.yml provider & credentials check
 $builderConfigPath = Join-Path $ProjectRoot "electron-builder.yml"
