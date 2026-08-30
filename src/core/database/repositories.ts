@@ -1571,97 +1571,130 @@ export class Repository {
     expectedLifecycleVersion?: number | null;
     startedAt?: string;
   }): { success: boolean; alreadyClaimed: boolean; startedAt?: string; error?: string } {
-    return this.runInImmediateTransaction(() => {
-      const auth = this.getExecutionAuthorization(params.authorizationId);
-      if (!auth) {
-        return { success: false, alreadyClaimed: false, error: 'AUTHORIZATION_NOT_FOUND' };
-      }
+    try {
+      return this.runInImmediateTransaction(() => {
+        const auth = this.getExecutionAuthorization(params.authorizationId);
+        if (!auth) {
+          return { success: false, alreadyClaimed: false, error: 'AUTHORIZATION_NOT_FOUND' };
+        }
 
-      // Status Fencing: start claim may succeed ONLY when status === 'DISPATCHED'
-      if (auth.status !== 'DISPATCHED') {
-        return {
-          success: false,
-          alreadyClaimed: false,
-          error: `AUTHORIZATION_NOT_DISPATCHED: expected status DISPATCHED, found ${auth.status}`,
-        };
-      }
-
-      // Lifecycle version fencing: if auth has lifecycle_version, must match expected
-      const expectedLifecycle = params.expectedLifecycleVersion !== undefined ? params.expectedLifecycleVersion : 1;
-      if (auth.lifecycle_version !== null && auth.lifecycle_version !== undefined) {
-        if (auth.lifecycle_version !== expectedLifecycle) {
+        // Status Fencing: start claim may succeed ONLY when status === 'DISPATCHED'
+        if (auth.status !== 'DISPATCHED') {
           return {
             success: false,
             alreadyClaimed: false,
-            error: `LIFECYCLE_VERSION_MISMATCH: expected ${expectedLifecycle}, found ${auth.lifecycle_version}`,
+            error: `AUTHORIZATION_NOT_DISPATCHED: expected status DISPATCHED, found ${auth.status}`,
           };
         }
-      }
 
-      // Check current task ownership epoch
-      const currentTaskEpoch = this.getTaskOwnershipEpoch(auth.task_id);
-      if (currentTaskEpoch !== params.expectedEpoch) {
-        return {
-          success: false,
-          alreadyClaimed: false,
-          error: `OWNERSHIP_EPOCH_MISMATCH: expected ${params.expectedEpoch}, current task epoch is ${currentTaskEpoch}`,
-        };
-      }
-      if (auth.task_ownership_epoch !== null && auth.task_ownership_epoch !== undefined && auth.task_ownership_epoch !== params.expectedEpoch) {
-        return {
-          success: false,
-          alreadyClaimed: false,
-          error: `OWNERSHIP_EPOCH_MISMATCH: expected ${params.expectedEpoch}, current task epoch is ${currentTaskEpoch}, auth epoch is ${auth.task_ownership_epoch}`,
-        };
-      }
-
-      // Check if already started
-      if (auth.adapter_started_at) {
-        if (auth.execution_id === params.executionId) {
-          return { success: true, alreadyClaimed: true, startedAt: auth.adapter_started_at };
+        // Check epoch validity
+        if (typeof params.expectedEpoch !== 'number' || !Number.isInteger(params.expectedEpoch) || params.expectedEpoch <= 0) {
+          return {
+            success: false,
+            alreadyClaimed: false,
+            error: `INVALID_EXPECTED_EPOCH: expectedEpoch must be a positive integer, got ${params.expectedEpoch}`,
+          };
         }
-        return {
-          success: false,
-          alreadyClaimed: false,
-          error: `EXECUTION_ID_CONFLICT: already claimed with execution_id ${auth.execution_id}`,
-        };
-      }
 
-      // Generate adapter_started_at immediately inside the transaction before the CAS
-      const startedAt = params.startedAt ?? new Date().toISOString();
-      const res = this.db
-        .prepare(`
-          UPDATE execution_authorizations
-          SET execution_id = ?, adapter_started_at = ?
-          WHERE id = ?
-            AND status = 'DISPATCHED'
-            AND adapter_started_at IS NULL
-            AND execution_id IS NULL
-            AND (lifecycle_version IS NULL OR lifecycle_version = ?)
-            AND (task_ownership_epoch IS NULL OR task_ownership_epoch = ?)
-        `)
-        .run(params.executionId, startedAt, params.authorizationId, expectedLifecycle, params.expectedEpoch);
-
-      if (res.changes !== 1) {
-        return { success: false, alreadyClaimed: false, error: 'START_CLAIM_CAS_FAILED' };
-      }
-
-      // Stamp current_execution_id on worker_slot if slot is bound to assignment
-      if (auth.assignment_id) {
-        const assignment = this.getAgentAssignment(auth.assignment_id);
-        if (assignment && assignment.selected_worker_slot_id) {
-          this.db
-            .prepare(`
-              UPDATE worker_slots
-              SET current_execution_id = ?, updated_at = ?
-              WHERE id = ? AND status = 'LEASED' AND current_assignment_id = ? AND (current_execution_id IS NULL OR current_execution_id = ?)
-            `)
-            .run(params.executionId, startedAt, assignment.selected_worker_slot_id, assignment.id, params.executionId);
+        // Lifecycle version fencing: if explicit lifecycle version requested, validate it
+        if (params.expectedLifecycleVersion !== undefined) {
+          if (auth.lifecycle_version !== params.expectedLifecycleVersion) {
+            return {
+              success: false,
+              alreadyClaimed: false,
+              error: `LIFECYCLE_VERSION_MISMATCH: expected ${params.expectedLifecycleVersion}, found ${auth.lifecycle_version}`,
+            };
+          }
         }
-      }
 
-      return { success: true, alreadyClaimed: false, startedAt };
-    });
+        // Check current task ownership epoch
+        const currentTaskEpoch = this.getTaskOwnershipEpoch(auth.task_id);
+        if (currentTaskEpoch !== params.expectedEpoch) {
+          return {
+            success: false,
+            alreadyClaimed: false,
+            error: `OWNERSHIP_EPOCH_MISMATCH: expected ${params.expectedEpoch}, current task epoch is ${currentTaskEpoch}`,
+          };
+        }
+        if (auth.task_ownership_epoch !== undefined && auth.task_ownership_epoch !== null && auth.task_ownership_epoch !== params.expectedEpoch) {
+          return {
+            success: false,
+            alreadyClaimed: false,
+            error: `OWNERSHIP_EPOCH_MISMATCH: expected ${params.expectedEpoch}, current task epoch is ${currentTaskEpoch}, auth epoch is ${auth.task_ownership_epoch}`,
+          };
+        }
+
+        // Check if already started
+        if (auth.adapter_started_at) {
+          if (auth.execution_id === params.executionId) {
+            return { success: true, alreadyClaimed: true, startedAt: auth.adapter_started_at };
+          }
+          return {
+            success: false,
+            alreadyClaimed: false,
+            error: `EXECUTION_ID_CONFLICT: authorization already claimed with execution ${auth.execution_id}`,
+          };
+        }
+
+        // Linearization point: generate canonical timestamp inside transaction
+        const startedAt = new Date().toISOString();
+
+        const res = this.db
+          .prepare(`
+            UPDATE execution_authorizations
+            SET adapter_started_at = ?,
+                execution_id = ?,
+                lifecycle_version = COALESCE(lifecycle_version, 1)
+            WHERE id = ?
+              AND status = 'DISPATCHED'
+              AND adapter_started_at IS NULL
+              AND (task_ownership_epoch IS NULL OR task_ownership_epoch = ?)
+              AND (lifecycle_version IS NULL OR lifecycle_version = ?)
+          `)
+          .run(startedAt, params.executionId, params.authorizationId, params.expectedEpoch, auth.lifecycle_version ?? 1);
+
+        if (res.changes !== 1) {
+          return { success: false, alreadyClaimed: false, error: 'START_CLAIM_CAS_FAILED' };
+        }
+
+        // Stamp current_execution_id on worker_slot if slot is bound to assignment
+        if (auth.assignment_id) {
+          const assignment = this.getAgentAssignment(auth.assignment_id);
+          if (assignment && assignment.selected_worker_slot_id) {
+            const slotRes = this.db
+              .prepare(`
+                UPDATE worker_slots
+                SET current_execution_id = ?, updated_at = ?
+                WHERE id = ?
+                  AND status = 'LEASED'
+                  AND current_assignment_id = ?
+                  AND provider_account_id = ?
+                  AND (current_execution_id IS NULL OR current_execution_id = ?)
+              `)
+              .run(
+                params.executionId,
+                startedAt,
+                assignment.selected_worker_slot_id,
+                assignment.id,
+                assignment.selected_account_id,
+                params.executionId
+              );
+
+            if (slotRes.changes !== 1) {
+              throw new Error(`WORKER_SLOT_EXECUTION_STAMP_FAILED: Failed to stamp execution_id on slot "${assignment.selected_worker_slot_id}" for assignment "${assignment.id}".`);
+            }
+          }
+        }
+
+        return { success: true, alreadyClaimed: false, startedAt };
+      });
+    } catch (err: any) {
+      return {
+        success: false,
+        alreadyClaimed: false,
+        error: `ADAPTER_START_CLAIM_FAILED: ${err.message}`,
+      };
+    }
   }
 
   public completeAdapterExecution(params: {
@@ -1862,8 +1895,7 @@ export class Repository {
         };
       }
 
-      // 8. Canonical evidence payload & idempotency check
-      // If already settled, verify stored evidence integrity and evaluate semantic idempotency
+      // 8. Replay check if already settled
       if (auth.settled_at) {
         if (!auth.settlement_status) {
           return {
@@ -1906,18 +1938,27 @@ export class Repository {
           };
         }
 
-        // Support semantic replay with omitted finishedAt: use the stored finished timestamp
+        const transfer = this.getHandoffTransferBySuccessorAuthId(auth.id);
+        const currentTaskEpoch = this.getTaskOwnershipEpoch(auth.task_id);
         const effectiveFinishedAt = params.finishedAt ?? storedEvidence.finished_at ?? auth.settled_at;
+
         const replayEvidence = {
           authorization_id: auth.id,
           execution_id: params.executionId,
-          lifecycle_version: auth.lifecycle_version,
-          task_id: auth.task_id,
+          transfer_id: transfer ? transfer.id : (storedEvidence.transfer_id ?? ''),
           project_id: auth.project_id,
-          attempt_id: auth.attempt_id ?? null,
-          assignment_id: auth.assignment_id ?? null,
+          task_id: auth.task_id,
+          attempt_id: auth.attempt_id,
+          assignment_id: auth.assignment_id,
+          provider_id: auth.selected_provider_id,
+          resource_id: auth.selected_resource_id,
+          account_id: storedEvidence.account_id ?? null,
+          routing_decision_id: auth.routing_decision_id,
+          ownership_epoch: currentTaskEpoch,
+          lifecycle_version: 1,
           settlement_status: params.status,
           outcome: params.outcome,
+          started_at: auth.adapter_started_at,
           finished_at: effectiveFinishedAt,
           result_payload: params.resultPayload,
           error_json: params.errorJson ?? null,
@@ -1946,24 +1987,7 @@ export class Repository {
         };
       }
 
-      const canonicalEvidence = {
-        authorization_id: auth.id,
-        execution_id: params.executionId,
-        lifecycle_version: auth.lifecycle_version,
-        task_id: auth.task_id,
-        project_id: auth.project_id,
-        attempt_id: auth.attempt_id ?? null,
-        assignment_id: auth.assignment_id ?? null,
-        settlement_status: params.status,
-        outcome: params.outcome,
-        finished_at: finishedAt,
-        result_payload: params.resultPayload,
-        error_json: params.errorJson ?? null,
-      };
-      const canonicalEvidenceJson = canonicalJsonStringify(canonicalEvidence);
-      const evidenceHash = computeSha256(canonicalEvidenceJson);
-
-      // 9. Validate complete binding graph
+      // 9. Validate complete binding graph for initial settlement
       if (
         !auth.task_id ||
         !auth.project_id ||
@@ -2119,6 +2143,15 @@ export class Repository {
           error: `BINDING_MISMATCH: Assignment resource "${assignment.selected_resource_id}" !== auth resource "${auth.selected_resource_id}".`,
         };
       }
+      if (!assignment.selected_account_id) {
+        return {
+          success: false,
+          alreadySettled: false,
+          settledAt: '',
+          evidenceHash: '',
+          error: `BINDING_MISMATCH: Assignment "${assignment.id}" missing selected_account_id.`,
+        };
+      }
       if (auth.selected_account_id && assignment.selected_account_id !== auth.selected_account_id) {
         return {
           success: false,
@@ -2159,6 +2192,30 @@ export class Repository {
         };
       }
 
+      const canonicalEvidence = {
+        authorization_id: auth.id,
+        execution_id: params.executionId,
+        transfer_id: transfer.id,
+        project_id: auth.project_id,
+        task_id: auth.task_id,
+        attempt_id: auth.attempt_id,
+        assignment_id: auth.assignment_id,
+        provider_id: auth.selected_provider_id,
+        resource_id: auth.selected_resource_id,
+        account_id: assignment.selected_account_id,
+        routing_decision_id: auth.routing_decision_id,
+        ownership_epoch: currentTaskEpoch,
+        lifecycle_version: 1,
+        settlement_status: params.status,
+        outcome: params.outcome,
+        started_at: auth.adapter_started_at,
+        finished_at: finishedAt,
+        result_payload: params.resultPayload,
+        error_json: params.errorJson ?? null,
+      };
+      const canonicalEvidenceJson = canonicalJsonStringify(canonicalEvidence);
+      const evidenceHash = computeSha256(canonicalEvidenceJson);
+
       // Atomic persistence across all entities in this transaction
       // 1. Update execution_authorizations with strict status, executionId, and lifecycle CAS predicate
       const authRes = this.db
@@ -2175,7 +2232,7 @@ export class Repository {
             AND settled_at IS NULL
             AND status = 'DISPATCHED'
             AND execution_id = ?
-            AND (lifecycle_version IS NULL OR lifecycle_version = 1)
+            AND lifecycle_version = 1
         `)
         .run(
           params.status,
@@ -2315,7 +2372,118 @@ export class Repository {
         `)
         .run(requestedAt, params.authorizationId, params.executionId);
 
-      return { success: res.changes === 1, alreadyRequested: false };
+      if (res.changes === 0) {
+        return { success: false, alreadyRequested: false, error: 'CANCELLATION_REQUEST_FAILED' };
+      }
+
+      return { success: true, alreadyRequested: false };
+    });
+  }
+
+  public releaseGuardedAccountLeaseAndIdleSlot(params: {
+    leaseId: string;
+    expectedAssignmentId: string;
+    expectedAccountId: string;
+    expectedSlotId: string;
+    expectedExecutionId?: string | null;
+    releasedAt?: string;
+  }): { success: boolean; error?: string } {
+    return this.runInImmediateTransaction(() => {
+      const nowIso = params.releasedAt ?? new Date().toISOString();
+
+      // 1. Verify lease
+      const lease = this.getAccountLease(params.leaseId);
+      if (!lease) {
+        return { success: false, error: `LEASE_NOT_FOUND: Lease "${params.leaseId}" not found.` };
+      }
+      if (lease.released_at !== null) {
+        return { success: false, error: `LEASE_ALREADY_RELEASED: Lease "${params.leaseId}" was already released at ${lease.released_at}.` };
+      }
+      if (lease.assignment_id !== params.expectedAssignmentId) {
+        return { success: false, error: `LEASE_ASSIGNMENT_MISMATCH: Lease assignment "${lease.assignment_id}" !== expected "${params.expectedAssignmentId}".` };
+      }
+      if (lease.provider_account_id !== params.expectedAccountId) {
+        return { success: false, error: `LEASE_ACCOUNT_MISMATCH: Lease account "${lease.provider_account_id}" !== expected "${params.expectedAccountId}".` };
+      }
+      if (lease.worker_slot_id !== params.expectedSlotId) {
+        return { success: false, error: `LEASE_SLOT_MISMATCH: Lease slot "${lease.worker_slot_id}" !== expected "${params.expectedSlotId}".` };
+      }
+
+      // 2. Verify slot
+      const slot = this.getWorkerSlot(params.expectedSlotId);
+      if (!slot) {
+        return { success: false, error: `SLOT_NOT_FOUND: Slot "${params.expectedSlotId}" not found.` };
+      }
+      if (slot.status !== 'LEASED') {
+        return { success: false, error: `SLOT_STATE_MISMATCH: Slot "${slot.id}" status is "${slot.status}", expected "LEASED".` };
+      }
+      if (slot.provider_account_id !== params.expectedAccountId) {
+        return { success: false, error: `SLOT_ACCOUNT_MISMATCH: Slot account "${slot.provider_account_id}" !== expected "${params.expectedAccountId}".` };
+      }
+      if (slot.current_assignment_id !== params.expectedAssignmentId) {
+        return { success: false, error: `SLOT_ASSIGNMENT_MISMATCH: Slot assignment "${slot.current_assignment_id}" !== expected "${params.expectedAssignmentId}".` };
+      }
+
+      if (params.expectedExecutionId !== undefined) {
+        if (params.expectedExecutionId === null) {
+          if (slot.current_execution_id !== null) {
+            return { success: false, error: `SLOT_EXECUTION_MISMATCH: Slot current_execution_id is "${slot.current_execution_id}", expected null.` };
+          }
+        } else {
+          if (slot.current_execution_id !== params.expectedExecutionId) {
+            return { success: false, error: `SLOT_EXECUTION_MISMATCH: Slot current_execution_id is "${slot.current_execution_id}", expected "${params.expectedExecutionId}".` };
+          }
+        }
+      }
+
+      // 3. Update lease
+      const leaseRes = this.db
+        .prepare(`
+          UPDATE account_leases
+          SET released_at = ?
+          WHERE id = ? AND released_at IS NULL AND assignment_id = ? AND provider_account_id = ? AND worker_slot_id = ?
+        `)
+        .run(nowIso, params.leaseId, params.expectedAssignmentId, params.expectedAccountId, params.expectedSlotId);
+
+      if (leaseRes.changes !== 1) {
+        throw new Error(`GUARDED_LEASE_RELEASE_FAILED: Expected 1 lease updated, got ${leaseRes.changes}`);
+      }
+
+      // 4. Update slot
+      let slotRes;
+      if (params.expectedExecutionId !== undefined) {
+        if (params.expectedExecutionId === null) {
+          slotRes = this.db
+            .prepare(`
+              UPDATE worker_slots
+              SET status = 'IDLE', current_assignment_id = NULL, current_execution_id = NULL, updated_at = ?
+              WHERE id = ? AND status = 'LEASED' AND provider_account_id = ? AND current_assignment_id = ? AND current_execution_id IS NULL
+            `)
+            .run(nowIso, params.expectedSlotId, params.expectedAccountId, params.expectedAssignmentId);
+        } else {
+          slotRes = this.db
+            .prepare(`
+              UPDATE worker_slots
+              SET status = 'IDLE', current_assignment_id = NULL, current_execution_id = NULL, updated_at = ?
+              WHERE id = ? AND status = 'LEASED' AND provider_account_id = ? AND current_assignment_id = ? AND current_execution_id = ?
+            `)
+            .run(nowIso, params.expectedSlotId, params.expectedAccountId, params.expectedAssignmentId, params.expectedExecutionId);
+        }
+      } else {
+        slotRes = this.db
+          .prepare(`
+            UPDATE worker_slots
+            SET status = 'IDLE', current_assignment_id = NULL, current_execution_id = NULL, updated_at = ?
+            WHERE id = ? AND status = 'LEASED' AND provider_account_id = ? AND current_assignment_id = ?
+          `)
+          .run(nowIso, params.expectedSlotId, params.expectedAccountId, params.expectedAssignmentId);
+      }
+
+      if (slotRes.changes !== 1) {
+        throw new Error(`GUARDED_SLOT_RELEASE_FAILED: Expected 1 slot updated, got ${slotRes.changes}`);
+      }
+
+      return { success: true };
     });
   }
 
@@ -2487,103 +2655,6 @@ export class Repository {
       }
 
       return { success: false, alreadyConfirmed: false, error: 'INVALID_TERMINATION_STATUS' };
-    });
-  }
-
-  public releaseGuardedAccountLeaseAndIdleSlot(params: {
-    leaseId: string;
-    expectedAssignmentId: string;
-    expectedAccountId: string;
-    expectedSlotId: string;
-    expectedExecutionId?: string | null;
-    releasedAt?: string;
-  }): { success: boolean; error?: string } {
-    return this.runInImmediateTransaction(() => {
-      const nowIso = params.releasedAt ?? new Date().toISOString();
-
-      // 1. Verify lease
-      const lease = this.getAccountLease(params.leaseId);
-      if (!lease) {
-        return { success: false, error: `LEASE_NOT_FOUND: Lease "${params.leaseId}" not found.` };
-      }
-      if (lease.released_at !== null) {
-        return { success: false, error: `LEASE_ALREADY_RELEASED: Lease "${params.leaseId}" was already released at ${lease.released_at}.` };
-      }
-      if (lease.assignment_id !== params.expectedAssignmentId) {
-        return { success: false, error: `LEASE_ASSIGNMENT_MISMATCH: Lease assignment "${lease.assignment_id}" !== expected "${params.expectedAssignmentId}".` };
-      }
-      if (lease.provider_account_id !== params.expectedAccountId) {
-        return { success: false, error: `LEASE_ACCOUNT_MISMATCH: Lease account "${lease.provider_account_id}" !== expected "${params.expectedAccountId}".` };
-      }
-      if (lease.worker_slot_id !== params.expectedSlotId) {
-        return { success: false, error: `LEASE_SLOT_MISMATCH: Lease slot "${lease.worker_slot_id}" !== expected "${params.expectedSlotId}".` };
-      }
-
-      // 2. Verify slot
-      const slot = this.getWorkerSlot(params.expectedSlotId);
-      if (!slot) {
-        return { success: false, error: `SLOT_NOT_FOUND: Slot "${params.expectedSlotId}" not found.` };
-      }
-      if (slot.status !== 'LEASED') {
-        return { success: false, error: `SLOT_STATE_MISMATCH: Slot "${slot.id}" status is "${slot.status}", expected "LEASED".` };
-      }
-      if (slot.provider_account_id !== params.expectedAccountId) {
-        return { success: false, error: `SLOT_ACCOUNT_MISMATCH: Slot account "${slot.provider_account_id}" !== expected "${params.expectedAccountId}".` };
-      }
-      if (slot.current_assignment_id !== params.expectedAssignmentId) {
-        return { success: false, error: `SLOT_ASSIGNMENT_MISMATCH: Slot assignment "${slot.current_assignment_id}" !== expected "${params.expectedAssignmentId}".` };
-      }
-
-      if (params.expectedExecutionId !== undefined) {
-        if (params.expectedExecutionId === null) {
-          if (slot.current_execution_id !== null) {
-            return { success: false, error: `SLOT_EXECUTION_MISMATCH: Slot current_execution_id is "${slot.current_execution_id}", expected null.` };
-          }
-        } else {
-          if (slot.current_execution_id !== null && slot.current_execution_id !== params.expectedExecutionId) {
-            return { success: false, error: `SLOT_EXECUTION_MISMATCH: Slot current_execution_id is "${slot.current_execution_id}", expected "${params.expectedExecutionId}".` };
-          }
-        }
-      }
-
-      // 3. Update lease
-      const leaseRes = this.db
-        .prepare(`
-          UPDATE account_leases
-          SET released_at = ?
-          WHERE id = ? AND released_at IS NULL AND assignment_id = ? AND provider_account_id = ? AND worker_slot_id = ?
-        `)
-        .run(nowIso, params.leaseId, params.expectedAssignmentId, params.expectedAccountId, params.expectedSlotId);
-
-      if (leaseRes.changes !== 1) {
-        throw new Error(`GUARDED_LEASE_RELEASE_FAILED: Expected 1 lease updated, got ${leaseRes.changes}`);
-      }
-
-      // 4. Update slot
-      let slotRes;
-      if (params.expectedExecutionId && slot.current_execution_id === params.expectedExecutionId) {
-        slotRes = this.db
-          .prepare(`
-            UPDATE worker_slots
-            SET status = 'IDLE', current_assignment_id = NULL, current_execution_id = NULL, updated_at = ?
-            WHERE id = ? AND status = 'LEASED' AND provider_account_id = ? AND current_assignment_id = ? AND current_execution_id = ?
-          `)
-          .run(nowIso, params.expectedSlotId, params.expectedAccountId, params.expectedAssignmentId, params.expectedExecutionId);
-      } else {
-        slotRes = this.db
-          .prepare(`
-            UPDATE worker_slots
-            SET status = 'IDLE', current_assignment_id = NULL, current_execution_id = NULL, updated_at = ?
-            WHERE id = ? AND status = 'LEASED' AND provider_account_id = ? AND current_assignment_id = ?
-          `)
-          .run(nowIso, params.expectedSlotId, params.expectedAccountId, params.expectedAssignmentId);
-      }
-
-      if (slotRes.changes !== 1) {
-        throw new Error(`GUARDED_SLOT_RELEASE_FAILED: Expected 1 slot updated, got ${slotRes.changes}`);
-      }
-
-      return { success: true };
     });
   }
 

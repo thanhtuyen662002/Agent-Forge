@@ -1141,12 +1141,14 @@ export class ProviderDispatchService {
         return {
           executionId,
           status: 'FAILED',
+          errorCode: 'RECOVERY_FENCED',
           error: `EXECUTION_AUTHORIZATION_ALREADY_DISPATCHED: Authorization "${authorizationId}" was already claimed by another execution.`,
         };
       }
       return {
         executionId,
         status: 'FAILED',
+        errorCode: 'RECOVERY_FENCED',
         error: `EXECUTION_AUTHORIZATION_CLAIM_FAILED: Could not claim authorization "${authorizationId}" (status: ${currentAuth.status}).`,
       };
     }

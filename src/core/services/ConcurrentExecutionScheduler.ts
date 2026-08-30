@@ -372,7 +372,6 @@ export class ConcurrentExecutionScheduler {
       providerResult = {
         executionId: '',
         status: 'FAILED',
-        errorCode: 'EXECUTION_FAILED',
         error: `PROVIDER_DISPATCH_THREW: ${err.message}`,
       };
     } finally {

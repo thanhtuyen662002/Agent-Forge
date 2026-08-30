@@ -1226,6 +1226,24 @@ export const MIGRATIONS: Migration[] = [
         ALTER TABLE execution_authorizations
         ADD COLUMN terminated_at TEXT NULL;
 
+        -- Convert unprovable legacy migration-19 termination rows to clean unresolved state
+        UPDATE execution_authorizations
+        SET termination_status = 'UNRESOLVED',
+            termination_confirmed_at = NULL,
+            terminated_at = NULL,
+            termination_proof_source = 'DISCONNECT_UNKNOWN'
+        WHERE termination_status = 'CONFIRMED_TERMINATED'
+          AND (
+            termination_proof_source IS NULL OR
+            termination_proof_source NOT IN ('LOCAL_PROCESS_EXIT', 'PROVIDER_FINAL_ACK')
+          );
+
+        UPDATE execution_authorizations
+        SET termination_confirmed_at = NULL,
+            terminated_at = NULL
+        WHERE termination_status = 'UNRESOLVED'
+          AND (termination_confirmed_at IS NOT NULL OR terminated_at IS NOT NULL);
+
         ALTER TABLE execution_authorizations
         ADD COLUMN termination_evidence_hash TEXT NULL CHECK (
           (
@@ -1241,6 +1259,7 @@ export const MIGRATIONS: Migration[] = [
             termination_status = 'UNRESOLVED' AND
             termination_confirmed_at IS NULL AND
             terminated_at IS NULL AND
+            (termination_proof_source IS NULL OR termination_proof_source IN ('TIMEOUT_UNACKNOWLEDGED', 'CANCEL_UNACKNOWLEDGED', 'DISCONNECT_UNKNOWN')) AND
             (
               (termination_evidence_json IS NULL AND termination_evidence_hash IS NULL) OR
               (termination_evidence_json IS NOT NULL AND termination_evidence_hash IS NOT NULL AND length(termination_evidence_hash) = 64 AND termination_evidence_hash GLOB '[0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]')
@@ -1249,7 +1268,7 @@ export const MIGRATIONS: Migration[] = [
             termination_status = 'CONFIRMED_TERMINATED' AND
             termination_source IS NOT NULL AND
             termination_reason IS NOT NULL AND
-            termination_proof_source IS NOT NULL AND
+            termination_proof_source IN ('LOCAL_PROCESS_EXIT', 'PROVIDER_FINAL_ACK') AND
             termination_confirmed_at IS NOT NULL AND
             terminated_at IS NOT NULL AND
             termination_evidence_json IS NOT NULL AND

@@ -1334,4 +1334,84 @@ describe('ConcurrentExecutionScheduler (R5G3D1)', () => {
     await scheduler.execute(authId);
     expect(timer.pendingCount).toBe(0);
   });
+
+  // 61. scheduler returns RECOVERY_FENCED without releasing lease or removing worktree on typed RECOVERY_FENCED dispatch failure
+  it('61. scheduler returns RECOVERY_FENCED without releasing lease or removing worktree on typed RECOVERY_FENCED dispatch failure', async () => {
+    vi.spyOn(dispatchService, 'dispatchScheduled').mockResolvedValue({
+      executionId: 'exec-fenced',
+      status: 'FAILED',
+      errorCode: 'RECOVERY_FENCED',
+      error: 'ADAPTER_START_CLAIM_FAILED: START_CLAIM_CAS_FAILED',
+    });
+
+    const res = await scheduler.execute(authId);
+    expect(res.status).toBe('RECOVERY_FENCED');
+    expect(res.errorCode).toBe('RECOVERY_FENCED');
+    expect(timer.pendingCount).toBe(0);
+
+    // Active lease and slot must remain intact for crash recovery scanner
+    const lease = repo.getActiveLeaseForAssignment(assignmentId);
+    expect(lease).not.toBeNull();
+    const slot = repo.getWorkerSlot(slotId);
+    expect(slot?.status).toBe('LEASED');
+    expect(slot?.current_assignment_id).toBe(assignmentId);
+  });
+
+  // 62. scheduler returns RECOVERY_FENCED when dispatch encounters RECOVERY_FENCED from start claim failure
+  it('62. scheduler returns RECOVERY_FENCED when dispatch encounters RECOVERY_FENCED from start claim failure', async () => {
+    vi.spyOn(dispatchService, 'dispatchScheduled').mockResolvedValue({
+      executionId: 'exec-concurrent',
+      status: 'FAILED',
+      errorCode: 'RECOVERY_FENCED',
+      error: 'ADAPTER_START_CLAIM_FAILED: authorization not in dispatched state',
+    });
+
+    const res = await scheduler.execute(authId);
+    expect(res.status).toBe('RECOVERY_FENCED');
+    expect(res.errorCode).toBe('RECOVERY_FENCED');
+    expect(timer.pendingCount).toBe(0);
+
+    const lease = repo.getActiveLeaseForAssignment(assignmentId);
+    expect(lease).not.toBeNull();
+  });
+
+  // 63. scheduler returns RECOVERY_FENCED on settlement failure and retains lease and worktree
+  it('63. scheduler returns RECOVERY_FENCED on settlement failure and retains lease and worktree', async () => {
+    vi.spyOn(dispatchService, 'dispatchScheduled').mockResolvedValue({
+      executionId: 'exec-settle-fail',
+      status: 'FAILED',
+      errorCode: 'SETTLEMENT_FAILED',
+      error: 'DURABLE_SETTLEMENT_FAILED: Simulated DB write failure',
+    });
+
+    const res = await scheduler.execute(authId);
+    expect(res.status).toBe('RECOVERY_FENCED');
+    expect(res.errorCode).toBe('SETTLEMENT_FAILED');
+    expect(timer.pendingCount).toBe(0);
+
+    const lease = repo.getActiveLeaseForAssignment(assignmentId);
+    expect(lease).not.toBeNull();
+    const slot = repo.getWorkerSlot(slotId);
+    expect(slot?.status).toBe('LEASED');
+  });
+
+  // 64. scheduler returns RECOVERY_FENCED on rejected adapter start claim CAS and stops supervisor without idling slot
+  it('64. scheduler returns RECOVERY_FENCED on rejected adapter start claim CAS and stops supervisor without idling slot', async () => {
+    vi.spyOn(dispatchService, 'dispatchScheduled').mockResolvedValue({
+      executionId: 'exec-start-claim-fail',
+      status: 'FAILED',
+      errorCode: 'RECOVERY_FENCED',
+      error: 'ADAPTER_START_CLAIM_FAILED: START_CLAIM_CAS_FAILED',
+    });
+
+    const res = await scheduler.execute(authId);
+    expect(res.status).toBe('RECOVERY_FENCED');
+    expect(res.errorCode).toBe('RECOVERY_FENCED');
+    expect(timer.pendingCount).toBe(0);
+
+    const lease = repo.getActiveLeaseForAssignment(assignmentId);
+    expect(lease).not.toBeNull();
+    const slot = repo.getWorkerSlot(slotId);
+    expect(slot?.status).toBe('LEASED');
+  });
 });
