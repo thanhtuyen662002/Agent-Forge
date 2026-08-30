@@ -1197,6 +1197,16 @@ export const MIGRATIONS: Migration[] = [
         ALTER TABLE execution_authorizations
         ADD COLUMN lifecycle_version INTEGER NULL CHECK (lifecycle_version IS NULL OR lifecycle_version = 1);
 
+        CREATE TRIGGER IF NOT EXISTS trg_exec_auth_lifecycle_default
+        AFTER INSERT ON execution_authorizations
+        FOR EACH ROW
+        WHEN NEW.lifecycle_version IS NULL AND (NEW.status = 'DISPATCHED' OR NEW.assignment_id IS NOT NULL) AND NEW.task_ownership_epoch IS NOT NULL
+        BEGIN
+          UPDATE execution_authorizations
+          SET lifecycle_version = 1
+          WHERE id = NEW.id;
+        END;
+
         ALTER TABLE execution_authorizations
         ADD COLUMN adapter_error_json TEXT NULL;
 

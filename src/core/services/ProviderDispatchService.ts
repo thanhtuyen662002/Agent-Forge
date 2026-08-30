@@ -92,6 +92,10 @@ export class ProviderDispatchService {
     this.gitWorktreeService = service;
   }
 
+  public hasActiveDispatch(authorizationId: string): boolean {
+    return this.activeDispatches.has(authorizationId);
+  }
+
   /**
    * Cancels an active scheduled execution if it is currently in PREPARING or EXECUTING phase.
    * Caller supplies only authorizationId.
@@ -163,10 +167,11 @@ export class ProviderDispatchService {
     let control: ScheduledDispatchControl | undefined;
     if (mode === 'SCHEDULED') {
       if (this.activeDispatches.has(authorizationId)) {
+        const currentAuth = this.repo.getExecutionAuthorization(authorizationId);
         return {
           executionId,
           status: 'FAILED',
-          errorCode: 'RESOURCE_UNAVAILABLE',
+          errorCode: currentAuth?.lifecycle_version === 1 ? 'RECOVERY_FENCED' : 'RESOURCE_UNAVAILABLE',
           error: `SCHEDULED_DISPATCH_ALREADY_ACTIVE: A scheduled execution for authorization "${authorizationId}" is already in progress.`,
         };
       }
@@ -1281,7 +1286,7 @@ export class ProviderDispatchService {
     }
 
     // 15d. Atomic adapter-start claim linearization point (R5I6)
-    const isR5ILifecycle = auth.lifecycle_version === 1;
+    const isR5ILifecycle = auth.lifecycle_version === 1 && Boolean(auth.assignment_id);
     if (isR5ILifecycle) {
       const expectedEpoch = auth.task_ownership_epoch ?? this.repo.getTaskOwnershipEpoch(auth.task_id);
       const startClaim = this.repo.claimAdapterExecutionStart({

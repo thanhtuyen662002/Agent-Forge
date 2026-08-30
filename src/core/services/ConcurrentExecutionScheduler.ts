@@ -143,7 +143,33 @@ export class ConcurrentExecutionScheduler {
       };
     }
 
+    if (this.dispatchService.hasActiveDispatch(authorizationId)) {
+      if (auth.lifecycle_version === 1) {
+        return {
+          status: 'RECOVERY_FENCED',
+          authorizationId,
+          assignmentId: auth.assignment_id ?? undefined,
+          errorCode: 'RECOVERY_FENCED',
+          error: `RECOVERY_FENCED: Scheduled dispatch is already active for authorization "${authorizationId}".`,
+        };
+      }
+      return {
+        status: 'PREPARATION_FAILED',
+        authorizationId,
+        error: `EXECUTION_AUTHORIZATION_INVALID_STATUS: Scheduled dispatch is already active for authorization "${authorizationId}".`,
+      };
+    }
+
     if (auth.status !== 'AUTHORIZED') {
+      if (auth.status === 'DISPATCHED' && auth.lifecycle_version === 1) {
+        return {
+          status: 'RECOVERY_FENCED',
+          authorizationId,
+          assignmentId: auth.assignment_id ?? undefined,
+          errorCode: 'RECOVERY_FENCED',
+          error: `RECOVERY_FENCED: Execution authorization "${authorizationId}" is already DISPATCHED.`,
+        };
+      }
       return {
         status: 'PREPARATION_FAILED',
         authorizationId,
@@ -372,6 +398,7 @@ export class ConcurrentExecutionScheduler {
       providerResult = {
         executionId: '',
         status: 'FAILED',
+        errorCode: auth.lifecycle_version === 1 ? 'RECOVERY_FENCED' : 'EXECUTION_FAILED',
         error: `PROVIDER_DISPATCH_THREW: ${err.message}`,
       };
     } finally {

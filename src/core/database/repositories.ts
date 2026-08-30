@@ -105,6 +105,13 @@ import {
   parseNativeProfileRef,
 } from '../credentials';
 
+function isValidIsoTimestamp(ts: any): boolean {
+  if (typeof ts !== 'string' || ts.trim().length < 10) return false;
+  const parsed = Date.parse(ts);
+  if (isNaN(parsed)) return false;
+  return /^\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}:\d{2}(\.\d+)?(Z|[+-]\d{2}:?\d{2})?$/.test(ts.trim());
+}
+
 export class Repository {
   constructor(private db: Database.Database) {}
 
@@ -1397,7 +1404,7 @@ export class Repository {
           auth.dispatched_at,
           auth.task_ownership_epoch ?? 1,
           auth.assignment_id ?? null,
-          auth.lifecycle_version ?? null,
+          auth.lifecycle_version !== undefined ? auth.lifecycle_version : (auth.task_ownership_epoch !== undefined ? 1 : null),
           auth.execution_id ?? null,
           auth.adapter_started_at ?? null,
           auth.adapter_finished_at ?? null,
@@ -1569,7 +1576,6 @@ export class Repository {
     executionId: string;
     expectedEpoch: number;
     expectedLifecycleVersion?: number | null;
-    startedAt?: string;
   }): { success: boolean; alreadyClaimed: boolean; startedAt?: string; error?: string } {
     try {
       return this.runInImmediateTransaction(() => {
@@ -1587,6 +1593,15 @@ export class Repository {
           };
         }
 
+        // Lifecycle version fencing: require lifecycle_version = 1 (NULL must fail without mutation)
+        if (auth.lifecycle_version !== 1) {
+          return {
+            success: false,
+            alreadyClaimed: false,
+            error: `LIFECYCLE_VERSION_MISMATCH: expected 1, found ${auth.lifecycle_version}`,
+          };
+        }
+
         // Check epoch validity
         if (typeof params.expectedEpoch !== 'number' || !Number.isInteger(params.expectedEpoch) || params.expectedEpoch <= 0) {
           return {
@@ -1596,27 +1611,17 @@ export class Repository {
           };
         }
 
-        // Lifecycle version fencing: if explicit lifecycle version requested, validate it
-        if (params.expectedLifecycleVersion !== undefined) {
-          if (auth.lifecycle_version !== params.expectedLifecycleVersion) {
-            return {
-              success: false,
-              alreadyClaimed: false,
-              error: `LIFECYCLE_VERSION_MISMATCH: expected ${params.expectedLifecycleVersion}, found ${auth.lifecycle_version}`,
-            };
-          }
+        if (auth.task_ownership_epoch === null || auth.task_ownership_epoch === undefined || auth.task_ownership_epoch <= 0) {
+          return {
+            success: false,
+            alreadyClaimed: false,
+            error: `NULL_OR_INVALID_AUTH_OWNERSHIP_EPOCH: auth task_ownership_epoch is ${auth.task_ownership_epoch}`,
+          };
         }
 
         // Check current task ownership epoch
         const currentTaskEpoch = this.getTaskOwnershipEpoch(auth.task_id);
-        if (currentTaskEpoch !== params.expectedEpoch) {
-          return {
-            success: false,
-            alreadyClaimed: false,
-            error: `OWNERSHIP_EPOCH_MISMATCH: expected ${params.expectedEpoch}, current task epoch is ${currentTaskEpoch}`,
-          };
-        }
-        if (auth.task_ownership_epoch !== undefined && auth.task_ownership_epoch !== null && auth.task_ownership_epoch !== params.expectedEpoch) {
+        if (currentTaskEpoch !== params.expectedEpoch || auth.task_ownership_epoch !== params.expectedEpoch) {
           return {
             success: false,
             alreadyClaimed: false,
@@ -1636,53 +1641,72 @@ export class Repository {
           };
         }
 
+        let assignment: any = null;
+        if (auth.assignment_id) {
+          assignment = this.getAgentAssignment(auth.assignment_id);
+          if (!assignment) {
+            return { success: false, alreadyClaimed: false, error: `ASSIGNMENT_NOT_FOUND: Assignment "${auth.assignment_id}" not found.` };
+          }
+          if (!assignment.selected_account_id) {
+            return { success: false, alreadyClaimed: false, error: `ASSIGNMENT_ACCOUNT_MISSING: Assignment "${assignment.id}" missing selected_account_id.` };
+          }
+          if (!assignment.selected_worker_slot_id) {
+            return { success: false, alreadyClaimed: false, error: `ASSIGNMENT_SLOT_MISSING: Assignment "${assignment.id}" missing selected_worker_slot_id.` };
+          }
+          const slot = this.getWorkerSlot(assignment.selected_worker_slot_id);
+          if (!slot || slot.status !== 'LEASED' || slot.current_assignment_id !== assignment.id || slot.current_execution_id !== null) {
+            return { success: false, alreadyClaimed: false, error: `WORKER_SLOT_NOT_READY: Slot "${assignment.selected_worker_slot_id}" is not LEASED, bound, or unexecuted.` };
+          }
+          const lease = this.getActiveLeaseForAssignment(assignment.id);
+          if (!lease || lease.worker_slot_id !== slot.id || lease.released_at !== null) {
+            return { success: false, alreadyClaimed: false, error: `ACTIVE_LEASE_NOT_FOUND: No active unreleased lease for assignment "${assignment.id}".` };
+          }
+        }
+
         // Linearization point: generate canonical timestamp inside transaction
         const startedAt = new Date().toISOString();
 
+        // Perform exact CAS claim update
         const res = this.db
           .prepare(`
             UPDATE execution_authorizations
             SET adapter_started_at = ?,
-                execution_id = ?,
-                lifecycle_version = COALESCE(lifecycle_version, 1)
+                execution_id = ?
             WHERE id = ?
               AND status = 'DISPATCHED'
+              AND execution_id IS NULL
               AND adapter_started_at IS NULL
-              AND (task_ownership_epoch IS NULL OR task_ownership_epoch = ?)
-              AND (lifecycle_version IS NULL OR lifecycle_version = ?)
+              AND lifecycle_version = 1
+              AND task_ownership_epoch = ?
           `)
-          .run(startedAt, params.executionId, params.authorizationId, params.expectedEpoch, auth.lifecycle_version ?? 1);
+          .run(startedAt, params.executionId, params.authorizationId, params.expectedEpoch);
 
         if (res.changes !== 1) {
           return { success: false, alreadyClaimed: false, error: 'START_CLAIM_CAS_FAILED' };
         }
 
-        // Stamp current_execution_id on worker_slot if slot is bound to assignment
-        if (auth.assignment_id) {
-          const assignment = this.getAgentAssignment(auth.assignment_id);
-          if (assignment && assignment.selected_worker_slot_id) {
-            const slotRes = this.db
-              .prepare(`
-                UPDATE worker_slots
-                SET current_execution_id = ?, updated_at = ?
-                WHERE id = ?
-                  AND status = 'LEASED'
-                  AND current_assignment_id = ?
-                  AND provider_account_id = ?
-                  AND (current_execution_id IS NULL OR current_execution_id = ?)
-              `)
-              .run(
-                params.executionId,
-                startedAt,
-                assignment.selected_worker_slot_id,
-                assignment.id,
-                assignment.selected_account_id,
-                params.executionId
-              );
+        // Stamp current_execution_id on worker_slot
+        if (assignment && assignment.selected_worker_slot_id) {
+          const slotRes = this.db
+            .prepare(`
+              UPDATE worker_slots
+              SET current_execution_id = ?, updated_at = ?
+              WHERE id = ?
+                AND status = 'LEASED'
+                AND current_assignment_id = ?
+                AND provider_account_id = ?
+                AND current_execution_id IS NULL
+            `)
+            .run(
+              params.executionId,
+              startedAt,
+              assignment.selected_worker_slot_id,
+              assignment.id,
+              assignment.selected_account_id
+            );
 
-            if (slotRes.changes !== 1) {
-              throw new Error(`WORKER_SLOT_EXECUTION_STAMP_FAILED: Failed to stamp execution_id on slot "${assignment.selected_worker_slot_id}" for assignment "${assignment.id}".`);
-            }
+          if (slotRes.changes !== 1) {
+            throw new Error(`WORKER_SLOT_EXECUTION_STAMP_FAILED: Failed to stamp execution_id on slot "${assignment.selected_worker_slot_id}" for assignment "${assignment.id}".`);
           }
         }
 
@@ -1884,6 +1908,27 @@ export class Repository {
       }
 
       // 7. Validate monotonic timestamps: finish cannot precede start
+      if (params.finishedAt !== undefined) {
+        if (!isValidIsoTimestamp(params.finishedAt)) {
+          return {
+            success: false,
+            alreadySettled: false,
+            settledAt: '',
+            evidenceHash: '',
+            error: `INVALID_ISO_TIMESTAMP: finishedAt "${params.finishedAt}" is not a valid ISO 8601 timestamp string.`,
+          };
+        }
+      }
+      if (!isValidIsoTimestamp(auth.adapter_started_at)) {
+        return {
+          success: false,
+          alreadySettled: false,
+          settledAt: '',
+          evidenceHash: '',
+          error: `INVALID_ISO_TIMESTAMP: adapter_started_at "${auth.adapter_started_at}" is not a valid ISO 8601 timestamp string.`,
+        };
+      }
+
       const finishedAt = params.finishedAt ?? new Date().toISOString();
       if (new Date(finishedAt).getTime() < new Date(auth.adapter_started_at).getTime()) {
         return {
@@ -1918,6 +1963,37 @@ export class Repository {
         let storedEvidence: any;
         try {
           storedEvidence = JSON.parse(auth.settlement_evidence_json);
+          const requiredKeys = [
+            'authorization_id',
+            'execution_id',
+            'transfer_id',
+            'project_id',
+            'task_id',
+            'attempt_id',
+            'assignment_id',
+            'provider_id',
+            'resource_id',
+            'account_id',
+            'routing_decision_id',
+            'ownership_epoch',
+            'lifecycle_version',
+            'settlement_status',
+            'outcome',
+            'started_at',
+            'finished_at',
+            'result_payload',
+          ];
+          for (const key of requiredKeys) {
+            if (storedEvidence[key] === undefined) {
+              return {
+                success: false,
+                alreadySettled: false,
+                settledAt: auth.settled_at,
+                evidenceHash: auth.settlement_evidence_hash,
+                error: `SETTLEMENT_CONFLICT: Stored settlement evidence missing required key "${key}".`,
+              };
+            }
+          }
           const computedStoredHash = computeSha256(canonicalJsonStringify(storedEvidence));
           if (computedStoredHash !== auth.settlement_evidence_hash) {
             return {
@@ -1939,20 +2015,78 @@ export class Repository {
         }
 
         const transfer = this.getHandoffTransferBySuccessorAuthId(auth.id);
+        if (!transfer || transfer.id !== storedEvidence.transfer_id) {
+          return {
+            success: false,
+            alreadySettled: false,
+            settledAt: auth.settled_at,
+            evidenceHash: auth.settlement_evidence_hash,
+            error: `SETTLEMENT_CONFLICT: Transfer binding graph missing or mismatch: transfer "${transfer?.id}" !== stored "${storedEvidence.transfer_id}".`,
+          };
+        }
+        const attempt = auth.attempt_id ? this.getTaskAttempt(auth.attempt_id) : null;
+        if (!attempt || attempt.id !== storedEvidence.attempt_id) {
+          return {
+            success: false,
+            alreadySettled: false,
+            settledAt: auth.settled_at,
+            evidenceHash: auth.settlement_evidence_hash,
+            error: `SETTLEMENT_CONFLICT: Attempt binding graph missing or mismatch: attempt "${attempt?.id}" !== stored "${storedEvidence.attempt_id}".`,
+          };
+        }
+        const assignment = auth.assignment_id ? this.getAgentAssignment(auth.assignment_id) : null;
+        if (!assignment || assignment.id !== storedEvidence.assignment_id || assignment.selected_account_id !== storedEvidence.account_id) {
+          return {
+            success: false,
+            alreadySettled: false,
+            settledAt: auth.settled_at,
+            evidenceHash: auth.settlement_evidence_hash,
+            error: `SETTLEMENT_CONFLICT: Assignment/account binding graph missing or mismatch: assignment "${assignment?.id}" / account "${assignment?.selected_account_id}" !== stored "${storedEvidence.assignment_id}" / "${storedEvidence.account_id}".`,
+          };
+        }
+
         const currentTaskEpoch = this.getTaskOwnershipEpoch(auth.task_id);
-        const effectiveFinishedAt = params.finishedAt ?? storedEvidence.finished_at ?? auth.settled_at;
+        if (currentTaskEpoch !== storedEvidence.ownership_epoch || auth.task_ownership_epoch !== storedEvidence.ownership_epoch) {
+          return {
+            success: false,
+            alreadySettled: false,
+            settledAt: auth.settled_at,
+            evidenceHash: auth.settlement_evidence_hash,
+            error: `SETTLEMENT_CONFLICT: Ownership epoch mismatch: current "${currentTaskEpoch}", auth "${auth.task_ownership_epoch}", stored "${storedEvidence.ownership_epoch}".`,
+          };
+        }
+        if (storedEvidence.lifecycle_version !== 1 || auth.lifecycle_version !== 1) {
+          return {
+            success: false,
+            alreadySettled: false,
+            settledAt: auth.settled_at,
+            evidenceHash: auth.settlement_evidence_hash,
+            error: `SETTLEMENT_CONFLICT: Lifecycle version mismatch: auth "${auth.lifecycle_version}", stored "${storedEvidence.lifecycle_version}".`,
+          };
+        }
+        if (params.finishedAt !== undefined && params.finishedAt !== storedEvidence.finished_at) {
+          return {
+            success: false,
+            alreadySettled: false,
+            settledAt: auth.settled_at,
+            evidenceHash: auth.settlement_evidence_hash,
+            error: `SETTLEMENT_CONFLICT: Supplied finishedAt "${params.finishedAt}" !== stored finished_at "${storedEvidence.finished_at}".`,
+          };
+        }
+
+        const effectiveFinishedAt = storedEvidence.finished_at;
 
         const replayEvidence = {
           authorization_id: auth.id,
           execution_id: params.executionId,
-          transfer_id: transfer ? transfer.id : (storedEvidence.transfer_id ?? ''),
+          transfer_id: transfer.id,
           project_id: auth.project_id,
           task_id: auth.task_id,
           attempt_id: auth.attempt_id,
           assignment_id: auth.assignment_id,
           provider_id: auth.selected_provider_id,
           resource_id: auth.selected_resource_id,
-          account_id: storedEvidence.account_id ?? null,
+          account_id: assignment.selected_account_id,
           routing_decision_id: auth.routing_decision_id,
           ownership_epoch: currentTaskEpoch,
           lifecycle_version: 1,
@@ -2152,13 +2286,14 @@ export class Repository {
           error: `BINDING_MISMATCH: Assignment "${assignment.id}" missing selected_account_id.`,
         };
       }
-      if (auth.selected_account_id && assignment.selected_account_id !== auth.selected_account_id) {
+      const resource = this.getProviderResource(auth.selected_resource_id);
+      if (resource?.provider_account_id && assignment.selected_account_id !== resource.provider_account_id) {
         return {
           success: false,
           alreadySettled: false,
           settledAt: '',
           evidenceHash: '',
-          error: `BINDING_MISMATCH: Assignment account "${assignment.selected_account_id}" !== auth account "${auth.selected_account_id}".`,
+          error: `BINDING_MISMATCH: Assignment account "${assignment.selected_account_id}" !== resource account "${resource.provider_account_id}".`,
         };
       }
       if (assignment.routing_decision_id !== auth.routing_decision_id) {
@@ -2385,9 +2520,12 @@ export class Repository {
     expectedAssignmentId: string;
     expectedAccountId: string;
     expectedSlotId: string;
-    expectedExecutionId?: string | null;
+    expectedExecutionId: string | null;
     releasedAt?: string;
   }): { success: boolean; error?: string } {
+    if (params.expectedExecutionId === undefined) {
+      return { success: false, error: 'GUARDED_RELEASE_EXECUTION_ID_REQUIRED: expectedExecutionId must be a string or null.' };
+    }
     return this.runInImmediateTransaction(() => {
       const nowIso = params.releasedAt ?? new Date().toISOString();
 
@@ -2424,15 +2562,13 @@ export class Repository {
         return { success: false, error: `SLOT_ASSIGNMENT_MISMATCH: Slot assignment "${slot.current_assignment_id}" !== expected "${params.expectedAssignmentId}".` };
       }
 
-      if (params.expectedExecutionId !== undefined) {
-        if (params.expectedExecutionId === null) {
-          if (slot.current_execution_id !== null) {
-            return { success: false, error: `SLOT_EXECUTION_MISMATCH: Slot current_execution_id is "${slot.current_execution_id}", expected null.` };
-          }
-        } else {
-          if (slot.current_execution_id !== params.expectedExecutionId) {
-            return { success: false, error: `SLOT_EXECUTION_MISMATCH: Slot current_execution_id is "${slot.current_execution_id}", expected "${params.expectedExecutionId}".` };
-          }
+      if (params.expectedExecutionId === null) {
+        if (slot.current_execution_id !== null) {
+          return { success: false, error: `SLOT_EXECUTION_MISMATCH: Slot current_execution_id is "${slot.current_execution_id}", expected null.` };
+        }
+      } else {
+        if (slot.current_execution_id !== params.expectedExecutionId) {
+          return { success: false, error: `SLOT_EXECUTION_MISMATCH: Slot current_execution_id is "${slot.current_execution_id}", expected "${params.expectedExecutionId}".` };
         }
       }
 
@@ -2451,36 +2587,26 @@ export class Repository {
 
       // 4. Update slot
       let slotRes;
-      if (params.expectedExecutionId !== undefined) {
-        if (params.expectedExecutionId === null) {
-          slotRes = this.db
-            .prepare(`
-              UPDATE worker_slots
-              SET status = 'IDLE', current_assignment_id = NULL, current_execution_id = NULL, updated_at = ?
-              WHERE id = ? AND status = 'LEASED' AND provider_account_id = ? AND current_assignment_id = ? AND current_execution_id IS NULL
-            `)
-            .run(nowIso, params.expectedSlotId, params.expectedAccountId, params.expectedAssignmentId);
-        } else {
-          slotRes = this.db
-            .prepare(`
-              UPDATE worker_slots
-              SET status = 'IDLE', current_assignment_id = NULL, current_execution_id = NULL, updated_at = ?
-              WHERE id = ? AND status = 'LEASED' AND provider_account_id = ? AND current_assignment_id = ? AND current_execution_id = ?
-            `)
-            .run(nowIso, params.expectedSlotId, params.expectedAccountId, params.expectedAssignmentId, params.expectedExecutionId);
-        }
+      if (params.expectedExecutionId === null) {
+        slotRes = this.db
+          .prepare(`
+            UPDATE worker_slots
+            SET status = 'IDLE', current_assignment_id = NULL, current_execution_id = NULL, updated_at = ?
+            WHERE id = ? AND status = 'LEASED' AND provider_account_id = ? AND current_assignment_id = ? AND current_execution_id IS NULL
+          `)
+          .run(nowIso, params.expectedSlotId, params.expectedAccountId, params.expectedAssignmentId);
       } else {
         slotRes = this.db
           .prepare(`
             UPDATE worker_slots
             SET status = 'IDLE', current_assignment_id = NULL, current_execution_id = NULL, updated_at = ?
-            WHERE id = ? AND status = 'LEASED' AND provider_account_id = ? AND current_assignment_id = ?
+            WHERE id = ? AND status = 'LEASED' AND provider_account_id = ? AND current_assignment_id = ? AND current_execution_id = ?
           `)
-          .run(nowIso, params.expectedSlotId, params.expectedAccountId, params.expectedAssignmentId);
+          .run(nowIso, params.expectedSlotId, params.expectedAccountId, params.expectedAssignmentId, params.expectedExecutionId);
       }
 
       if (slotRes.changes !== 1) {
-        throw new Error(`GUARDED_SLOT_RELEASE_FAILED: Expected 1 slot updated, got ${slotRes.changes}`);
+        throw new Error(`GUARDED_SLOT_IDLE_FAILED: Expected 1 slot updated, got ${slotRes.changes}`);
       }
 
       return { success: true };
@@ -2535,13 +2661,17 @@ export class Repository {
           const sourceMatch = !params.terminationSource || auth.termination_source === params.terminationSource;
           const reasonMatch = !params.terminationReason || auth.termination_reason === params.terminationReason;
           const proofMatch = !params.terminationProofSource || auth.termination_proof_source === params.terminationProofSource;
-          if (sourceMatch && reasonMatch && proofMatch) {
+          const confirmedAtMatch = !params.confirmedAt || auth.termination_confirmed_at === params.confirmedAt;
+          const terminatedAtMatch = !params.terminatedAt || auth.terminated_at === params.terminatedAt;
+          const evidenceMatch = !evidenceHash || auth.termination_evidence_hash === evidenceHash;
+
+          if (sourceMatch && reasonMatch && proofMatch && confirmedAtMatch && terminatedAtMatch && evidenceMatch) {
             return { success: true, alreadyConfirmed: true };
           }
           return {
             success: false,
             alreadyConfirmed: false,
-            error: `TERMINATION_SOURCE_CONFLICT: already confirmed, contradictory termination source/reason/proof`,
+            error: `TERMINATION_SOURCE_CONFLICT: already confirmed, contradictory termination source/reason/proof/timestamps/evidence`,
           };
         }
         return {
@@ -2618,6 +2748,15 @@ export class Repository {
 
         const confirmedAt = params.confirmedAt ?? new Date().toISOString();
         const terminatedAt = params.terminatedAt ?? confirmedAt;
+
+        if (!isValidIsoTimestamp(confirmedAt) || !isValidIsoTimestamp(terminatedAt)) {
+          return {
+            success: false,
+            alreadyConfirmed: false,
+            error: 'INVALID_ISO_TIMESTAMP: confirmedAt and terminatedAt must be valid ISO timestamps.',
+          };
+        }
+
         if (new Date(terminatedAt).getTime() > new Date(confirmedAt).getTime()) {
           return {
             success: false,

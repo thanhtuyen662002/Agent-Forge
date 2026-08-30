@@ -1414,4 +1414,80 @@ describe('ConcurrentExecutionScheduler (R5G3D1)', () => {
     const slot = repo.getWorkerSlot(slotId);
     expect(slot?.status).toBe('LEASED');
   });
+
+  // 65. Real concurrent-active dispatch returns typed fence and invokes no adapter
+  it('65. Real concurrent-active dispatch returns typed fence and invokes no adapter', async () => {
+    db.prepare("UPDATE execution_authorizations SET lifecycle_version = 1, task_ownership_epoch = 1 WHERE id = ?").run(authId);
+    db.prepare("UPDATE tasks SET ownership_epoch = 1 WHERE id = ?").run(taskId);
+    leaseService.acquireForAssignment(assignmentId, 60000);
+
+    let releaseBarrier: () => void;
+    adapter.executionBarrier = new Promise((resolve) => {
+      releaseBarrier = () =>
+        resolve({
+          executionId: 'exec-real-1',
+          status: 'COMPLETED',
+          rawResponse: '{}',
+        });
+    });
+
+    const dispatchPromise = dispatchService.dispatchScheduled(authId);
+
+    try {
+      // Concurrent dispatch attempt through scheduler
+      const dupRes = await scheduler.execute(authId);
+      expect(dupRes.status).toBe('RECOVERY_FENCED');
+      expect(dupRes.errorCode).toBe('RECOVERY_FENCED');
+      expect(adapter.executeCallCount).toBe(0); // Concurrent scheduler execution invoked no adapter
+
+      const lease = repo.getActiveLeaseForAssignment(assignmentId);
+      expect(lease).not.toBeNull();
+      const slot = repo.getWorkerSlot(slotId);
+      expect(slot?.status).toBe('LEASED');
+    } finally {
+      releaseBarrier!();
+      await dispatchPromise;
+    }
+  });
+
+  // 66. Scheduler dispatch exception retains all recovery resources
+  it('66. Scheduler dispatch exception retains all recovery resources', async () => {
+    db.prepare("UPDATE execution_authorizations SET lifecycle_version = 1, task_ownership_epoch = 1 WHERE id = ?").run(authId);
+    db.prepare("UPDATE tasks SET ownership_epoch = 1 WHERE id = ?").run(taskId);
+
+    vi.spyOn(dispatchService, 'dispatchScheduled').mockImplementation(async () => {
+      throw new Error('UNEXPECTED_FATAL_SCHEDULER_CRASH');
+    });
+
+    const res = await scheduler.execute(authId);
+    expect(res.status).toBe('RECOVERY_FENCED');
+    expect(res.errorCode).toBe('RECOVERY_FENCED');
+    expect(timer.pendingCount).toBe(0);
+
+    const lease = repo.getActiveLeaseForAssignment(assignmentId);
+    expect(lease).not.toBeNull();
+    const slot = repo.getWorkerSlot(slotId);
+    expect(slot?.status).toBe('LEASED');
+    expect(slot?.current_assignment_id).toBe(assignmentId);
+  });
+
+  // 67. Real already-dispatched replay invokes no adapter and retains resources
+  it('67. Real already-dispatched replay invokes no adapter and retains resources', async () => {
+    db.prepare("UPDATE execution_authorizations SET lifecycle_version = 1, task_ownership_epoch = 1, status = 'DISPATCHED', dispatched_at = ? WHERE id = ?").run(
+      new Date().toISOString(),
+      authId
+    );
+    db.prepare("UPDATE tasks SET ownership_epoch = 1 WHERE id = ?").run(taskId);
+    leaseService.acquireForAssignment(assignmentId, 60000);
+
+    const res = await scheduler.execute(authId);
+    expect(res.status).toBe('RECOVERY_FENCED');
+    expect(res.errorCode).toBe('RECOVERY_FENCED');
+    expect(adapter.executeCallCount).toBe(0); // Adapter was never invoked
+
+    const lease = repo.getActiveLeaseForAssignment(assignmentId);
+    expect(lease).not.toBeNull();
+    const slot = repo.getWorkerSlot(slotId);
+    expect(slot?.status).toBe('LEASED');
+  });
 });

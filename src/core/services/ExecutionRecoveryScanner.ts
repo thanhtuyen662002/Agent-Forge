@@ -181,35 +181,55 @@ export class ExecutionRecoveryScanner {
 
       // 1. Check Authority & Complete Binding Graph Integrity
       let bindingConflictReason: string | null = null;
-      if (!project) {
-        bindingConflictReason = `Project "${auth.project_id}" not found.`;
-      } else if (!task) {
-        bindingConflictReason = `Task "${auth.task_id}" not found.`;
-      } else if (task.project_id !== auth.project_id) {
-        bindingConflictReason = `Task project_id "${task.project_id}" !== auth project_id "${auth.project_id}".`;
-      } else if (transfer.task_id !== auth.task_id) {
-        bindingConflictReason = `Transfer task_id "${transfer.task_id}" !== auth task_id "${auth.task_id}".`;
-      } else if (transfer.successor_attempt_id && auth.attempt_id && transfer.successor_attempt_id !== auth.attempt_id) {
-        bindingConflictReason = `Transfer successor_attempt_id "${transfer.successor_attempt_id}" !== auth attempt_id "${auth.attempt_id}".`;
-      } else if (transfer.successor_assignment_id && auth.assignment_id && transfer.successor_assignment_id !== auth.assignment_id) {
-        bindingConflictReason = `Transfer successor_assignment_id "${transfer.successor_assignment_id}" !== auth assignment_id "${auth.assignment_id}".`;
-      } else if (attempt && attempt.task_id !== auth.task_id) {
-        bindingConflictReason = `Attempt task_id "${attempt.task_id}" !== auth task_id "${auth.task_id}".`;
-      } else if (assignment) {
-        if (assignment.task_id !== auth.task_id) {
-          bindingConflictReason = `Assignment task_id "${assignment.task_id}" !== auth task_id "${auth.task_id}".`;
-        } else if (assignment.project_id !== auth.project_id) {
-          bindingConflictReason = `Assignment project_id "${assignment.project_id}" !== auth project_id "${auth.project_id}".`;
-        } else if (assignment.selected_provider_id !== auth.selected_provider_id) {
-          bindingConflictReason = `Assignment selected_provider_id "${assignment.selected_provider_id}" !== auth selected_provider_id "${auth.selected_provider_id}".`;
-        } else if (assignment.selected_resource_id !== auth.selected_resource_id) {
-          bindingConflictReason = `Assignment selected_resource_id "${assignment.selected_resource_id}" !== auth selected_resource_id "${auth.selected_resource_id}".`;
-        } else if (!assignment.selected_account_id) {
-          bindingConflictReason = `Assignment "${assignment.id}" missing selected_account_id.`;
-        } else if (auth.selected_account_id && assignment.selected_account_id !== auth.selected_account_id) {
-          bindingConflictReason = `Assignment selected_account_id "${assignment.selected_account_id}" !== auth selected_account_id "${auth.selected_account_id}".`;
-        } else if (assignment.routing_decision_id !== auth.routing_decision_id) {
-          bindingConflictReason = `Assignment routing_decision_id "${assignment.routing_decision_id}" !== auth routing_decision_id "${auth.routing_decision_id}".`;
+      if (auth.lifecycle_version === 1) {
+        if (
+          !auth.task_id ||
+          !auth.project_id ||
+          !auth.attempt_id ||
+          !auth.assignment_id ||
+          !auth.selected_provider_id ||
+          !auth.selected_resource_id ||
+          !auth.routing_decision_id ||
+          auth.task_ownership_epoch === null ||
+          auth.task_ownership_epoch === undefined
+        ) {
+          bindingConflictReason = `Lifecycle v1 authorization "${auth.id}" missing required lifecycle bindings.`;
+        } else if (!transfer || !attempt || !assignment || !assignment.selected_account_id) {
+          bindingConflictReason = `Lifecycle v1 binding graph incomplete for auth "${auth.id}": missing transfer, attempt, assignment, or account.`;
+        }
+      }
+
+      if (!bindingConflictReason) {
+        if (!project) {
+          bindingConflictReason = `Project "${auth.project_id}" not found.`;
+        } else if (!task) {
+          bindingConflictReason = `Task "${auth.task_id}" not found.`;
+        } else if (task.project_id !== auth.project_id) {
+          bindingConflictReason = `Task project_id "${task.project_id}" !== auth project_id "${auth.project_id}".`;
+        } else if (transfer.task_id !== auth.task_id) {
+          bindingConflictReason = `Transfer task_id "${transfer.task_id}" !== auth task_id "${auth.task_id}".`;
+        } else if (transfer.successor_attempt_id && auth.attempt_id && transfer.successor_attempt_id !== auth.attempt_id) {
+          bindingConflictReason = `Transfer successor_attempt_id "${transfer.successor_attempt_id}" !== auth attempt_id "${auth.attempt_id}".`;
+        } else if (transfer.successor_assignment_id && auth.assignment_id && transfer.successor_assignment_id !== auth.assignment_id) {
+          bindingConflictReason = `Transfer successor_assignment_id "${transfer.successor_assignment_id}" !== auth assignment_id "${auth.assignment_id}".`;
+        } else if (attempt && attempt.task_id !== auth.task_id) {
+          bindingConflictReason = `Attempt task_id "${attempt.task_id}" !== auth task_id "${auth.task_id}".`;
+        } else if (assignment) {
+          if (assignment.task_id !== auth.task_id) {
+            bindingConflictReason = `Assignment task_id "${assignment.task_id}" !== auth task_id "${auth.task_id}".`;
+          } else if (assignment.project_id !== auth.project_id) {
+            bindingConflictReason = `Assignment project_id "${assignment.project_id}" !== auth project_id "${auth.project_id}".`;
+          } else if (assignment.selected_provider_id !== auth.selected_provider_id) {
+            bindingConflictReason = `Assignment selected_provider_id "${assignment.selected_provider_id}" !== auth selected_provider_id "${auth.selected_provider_id}".`;
+          } else if (assignment.selected_resource_id !== auth.selected_resource_id) {
+            bindingConflictReason = `Assignment selected_resource_id "${assignment.selected_resource_id}" !== auth selected_resource_id "${auth.selected_resource_id}".`;
+          } else if (!assignment.selected_account_id) {
+            bindingConflictReason = `Assignment "${assignment.id}" missing selected_account_id.`;
+          } else if (auth.selected_account_id && assignment.selected_account_id !== auth.selected_account_id) {
+            bindingConflictReason = `Assignment selected_account_id "${assignment.selected_account_id}" !== auth selected_account_id "${auth.selected_account_id}".`;
+          } else if (assignment.routing_decision_id !== auth.routing_decision_id) {
+            bindingConflictReason = `Assignment routing_decision_id "${assignment.routing_decision_id}" !== auth routing_decision_id "${auth.routing_decision_id}".`;
+          }
         }
       }
 
@@ -583,7 +603,7 @@ export class ExecutionRecoveryScanner {
             expectedAssignmentId: assignment.id,
             expectedAccountId: accountId,
             expectedSlotId: slotId,
-            expectedExecutionId: auth.execution_id,
+            expectedExecutionId: auth.execution_id ?? null,
             releasedAt: nowIso,
           });
           if (!releaseRes.success) {
@@ -736,7 +756,7 @@ export class ExecutionRecoveryScanner {
               expectedAssignmentId: assignment.id,
               expectedAccountId: accountId,
               expectedSlotId: slotId,
-              expectedExecutionId: auth.execution_id,
+              expectedExecutionId: auth.execution_id ?? null,
               releasedAt: nowIso,
             });
             if (!releaseRes.success) {
@@ -981,7 +1001,7 @@ export class ExecutionRecoveryScanner {
             expectedAssignmentId: assignment.id,
             expectedAccountId: accountId,
             expectedSlotId: slotId,
-            expectedExecutionId: auth.execution_id,
+            expectedExecutionId: auth.execution_id ?? null,
             releasedAt: nowIso,
           });
           if (!releaseRes.success) {
