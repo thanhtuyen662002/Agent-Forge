@@ -93,33 +93,35 @@ export class ExecutionRecoveryScanner {
             break;
         }
       } catch (err: any) {
-        // Record fail-closed conflict disposition in separate transaction
+        // Record fail-closed conflict disposition in separate transaction if transfer exists
         const failureEvidenceJson = canonicalJsonStringify({
           authorization_id: row.authorization_id,
           scanner_exception: err.message,
         });
         const failureEvidenceHash = computeSha256(failureEvidenceJson);
 
-        this.repo.runInImmediateTransaction(() => {
-          const transfer = this.repo.getHandoffTransferBySuccessorAuthId(row.authorization_id);
-          this.repo.upsertExecutionRecoveryState({
-            authorization_id: row.authorization_id,
-            transfer_id: transfer?.id ?? '',
-            execution_id: null,
-            lifecycle_version: null,
-            recovery_classification: 'AUTHORITY_CONFLICT',
-            disposition: 'REJECTED_INTEGRITY_CONFLICT',
-            canonical_evidence_json: failureEvidenceJson,
-            evidence_hash: failureEvidenceHash,
-            mutated_terminal_state: false,
-            mutated_resources: false,
-            resolved_at: null,
+        const transfer = this.repo.getHandoffTransferBySuccessorAuthId(row.authorization_id);
+        if (transfer) {
+          this.repo.runInImmediateTransaction(() => {
+            this.repo.upsertExecutionRecoveryState({
+              authorization_id: row.authorization_id,
+              transfer_id: transfer.id,
+              execution_id: null,
+              lifecycle_version: null,
+              recovery_classification: 'AUTHORITY_CONFLICT',
+              disposition: 'REJECTED_INTEGRITY_CONFLICT',
+              canonical_evidence_json: failureEvidenceJson,
+              evidence_hash: failureEvidenceHash,
+              mutated_terminal_state: false,
+              mutated_resources: false,
+              resolved_at: null,
+            });
           });
-        });
+        }
 
         items.push({
           authorizationId: row.authorization_id,
-          transferId: '',
+          transferId: transfer?.id ?? '',
           executionId: null,
           lifecycleVersion: null,
           classification: 'AUTHORITY_CONFLICT',
@@ -187,15 +189,25 @@ export class ExecutionRecoveryScanner {
           !auth.project_id ||
           !auth.attempt_id ||
           !auth.assignment_id ||
+          !auth.selected_account_id ||
           !auth.selected_provider_id ||
           !auth.selected_resource_id ||
           !auth.routing_decision_id ||
           auth.task_ownership_epoch === null ||
-          auth.task_ownership_epoch === undefined
+          auth.task_ownership_epoch === undefined ||
+          auth.task_ownership_epoch <= 0
         ) {
           bindingConflictReason = `Lifecycle v1 authorization "${auth.id}" missing required lifecycle bindings.`;
-        } else if (!transfer || !attempt || !assignment || !assignment.selected_account_id) {
-          bindingConflictReason = `Lifecycle v1 binding graph incomplete for auth "${auth.id}": missing transfer, attempt, assignment, or account.`;
+        } else if (
+          !transfer ||
+          !attempt ||
+          !assignment ||
+          !assignment.selected_account_id ||
+          transfer.successor_ownership_epoch === null ||
+          transfer.successor_ownership_epoch === undefined ||
+          transfer.successor_ownership_epoch <= 0
+        ) {
+          bindingConflictReason = `Lifecycle v1 binding graph incomplete for auth "${auth.id}": missing transfer, attempt, assignment, account, or epoch.`;
         }
       }
 
@@ -275,17 +287,19 @@ export class ExecutionRecoveryScanner {
               bindingConflictReason = `Settlement evidence provider_id "${parsedSettlementEvidence.provider_id}" !== auth provider "${auth.selected_provider_id}".`;
             } else if (parsedSettlementEvidence.resource_id && parsedSettlementEvidence.resource_id !== auth.selected_resource_id) {
               bindingConflictReason = `Settlement evidence resource_id "${parsedSettlementEvidence.resource_id}" !== auth resource "${auth.selected_resource_id}".`;
-            } else if (parsedSettlementEvidence.account_id && assignment && parsedSettlementEvidence.account_id !== assignment.selected_account_id) {
+            } else if (assignment && parsedSettlementEvidence.account_id && parsedSettlementEvidence.account_id !== assignment.selected_account_id) {
               bindingConflictReason = `Settlement evidence account_id "${parsedSettlementEvidence.account_id}" !== assignment account "${assignment.selected_account_id}".`;
+            } else if (auth.selected_account_id && parsedSettlementEvidence.account_id && parsedSettlementEvidence.account_id !== auth.selected_account_id) {
+              bindingConflictReason = `Settlement evidence account_id "${parsedSettlementEvidence.account_id}" !== auth account "${auth.selected_account_id}".`;
             } else if (parsedSettlementEvidence.routing_decision_id && parsedSettlementEvidence.routing_decision_id !== auth.routing_decision_id) {
               bindingConflictReason = `Settlement evidence routing_decision_id "${parsedSettlementEvidence.routing_decision_id}" !== auth routing "${auth.routing_decision_id}".`;
             } else if (parsedSettlementEvidence.ownership_epoch !== undefined && parsedSettlementEvidence.ownership_epoch !== null && parsedSettlementEvidence.ownership_epoch !== auth.task_ownership_epoch) {
               bindingConflictReason = `Settlement evidence ownership_epoch "${parsedSettlementEvidence.ownership_epoch}" !== auth epoch "${auth.task_ownership_epoch}".`;
             } else if (parsedSettlementEvidence.lifecycle_version !== undefined && parsedSettlementEvidence.lifecycle_version !== null && parsedSettlementEvidence.lifecycle_version !== auth.lifecycle_version) {
               bindingConflictReason = `Settlement evidence lifecycle_version "${parsedSettlementEvidence.lifecycle_version}" !== auth lifecycle_version "${auth.lifecycle_version}".`;
-            } else if (auth.settlement_status && parsedSettlementEvidence.settlement_status !== auth.settlement_status) {
+            } else if (parsedSettlementEvidence.settlement_status && parsedSettlementEvidence.settlement_status !== auth.settlement_status) {
               bindingConflictReason = `Settlement status mismatch: auth "${auth.settlement_status}" !== evidence "${parsedSettlementEvidence.settlement_status}".`;
-            } else if (auth.adapter_outcome && parsedSettlementEvidence.outcome !== auth.adapter_outcome) {
+            } else if (parsedSettlementEvidence.outcome && parsedSettlementEvidence.outcome !== auth.adapter_outcome) {
               bindingConflictReason = `Adapter outcome mismatch: auth "${auth.adapter_outcome}" !== evidence "${parsedSettlementEvidence.outcome}".`;
             }
           } catch (e: any) {
@@ -305,7 +319,22 @@ export class ExecutionRecoveryScanner {
         } else {
           try {
             const parsedTerm = JSON.parse(auth.termination_evidence_json);
-            const computedTermHash = computeSha256(canonicalJsonStringify(parsedTerm));
+            const storedProofPayload =
+              parsedTerm && typeof parsedTerm === 'object' && 'proof_payload' in parsedTerm
+                ? parsedTerm.proof_payload
+                : parsedTerm;
+            const expectedReconstructedEnvelope = {
+              authorization_id: auth.id,
+              execution_id: auth.execution_id,
+              termination_status: auth.termination_status,
+              termination_source: auth.termination_source,
+              termination_reason: auth.termination_reason,
+              proof_source: auth.termination_proof_source,
+              confirmed_at: auth.termination_confirmed_at,
+              terminated_at: auth.terminated_at,
+              proof_payload: storedProofPayload,
+            };
+            const computedTermHash = computeSha256(canonicalJsonStringify(expectedReconstructedEnvelope));
             if (computedTermHash !== auth.termination_evidence_hash) {
               bindingConflictReason = `Termination evidence hash mismatch: stored "${auth.termination_evidence_hash}" !== computed "${computedTermHash}".`;
             }
@@ -1040,6 +1069,41 @@ export class ExecutionRecoveryScanner {
       }
 
       // Default fallback if unhandled
+      if (auth.lifecycle_version === 1) {
+        const classification: ExecutionRecoveryClassification = 'AUTHORITY_CONFLICT';
+        const disposition: ExecutionRecoveryDisposition = 'REJECTED_INTEGRITY_CONFLICT';
+        const conflictError = `UNHANDLED_LIFECYCLE_V1_STATE: Authorization "${auth.id}" in unhandled state (status: "${auth.status}").`;
+
+        this.persistRecoveryAndEmit({
+          auth,
+          transfer,
+          assignment,
+          activeLease,
+          workerSlot,
+          classification,
+          disposition,
+          canonicalEvidenceJson,
+          evidenceHash,
+          mutatedTerminalState: false,
+          mutatedResources: false,
+          resolvedAt: null,
+          existingRecovery,
+        });
+
+        return {
+          authorizationId: auth.id,
+          transferId: transfer.id,
+          executionId: auth.execution_id ?? null,
+          lifecycleVersion: auth.lifecycle_version,
+          classification,
+          disposition,
+          mutatedTerminalState: false,
+          mutatedResources: false,
+          evidenceHash,
+          error: conflictError,
+        };
+      }
+
       const classification: ExecutionRecoveryClassification = 'LEGACY_UNCLASSIFIABLE';
       const disposition: ExecutionRecoveryDisposition = 'LEGACY_UNRESOLVED_FENCED';
 
@@ -1092,6 +1156,17 @@ export class ExecutionRecoveryScanner {
       return;
     }
 
+    const isUnchangedReplay =
+      params.existingRecovery &&
+      params.existingRecovery.evidence_hash === params.evidenceHash &&
+      params.existingRecovery.disposition === params.disposition &&
+      !params.mutatedTerminalState &&
+      !params.mutatedResources;
+
+    if (isUnchangedReplay) {
+      return;
+    }
+
     const recoveryState = this.repo.upsertExecutionRecoveryState({
       authorization_id: params.auth.id,
       transfer_id: params.transfer.id,
@@ -1105,17 +1180,6 @@ export class ExecutionRecoveryScanner {
       mutated_resources: params.mutatedResources,
       resolved_at: params.resolvedAt,
     });
-
-    const isUnchangedReplay =
-      params.existingRecovery &&
-      params.existingRecovery.evidence_hash === params.evidenceHash &&
-      params.existingRecovery.disposition === params.disposition &&
-      !params.mutatedTerminalState &&
-      !params.mutatedResources;
-
-    if (isUnchangedReplay) {
-      return;
-    }
 
     let eventType: string;
     if (params.disposition === 'REJECTED_INTEGRITY_CONFLICT') {
@@ -1171,7 +1235,7 @@ export class ExecutionRecoveryScanner {
         `${params.auth.id}:${recoveryState.recovery_version}:${params.classification}:${params.disposition}:${params.evidenceHash}`
       ).slice(0, 32);
 
-    this.repo.insertDeterministicEvent({
+    const eventInserted = this.repo.insertDeterministicEvent({
       id: deterministicEventId,
       project_id: params.auth.project_id,
       task_id: params.auth.task_id,
@@ -1181,5 +1245,9 @@ export class ExecutionRecoveryScanner {
       structured_payload_json: canonicalJsonStringify(eventPayload),
       timestamp: params.auth.terminated_at || params.auth.settled_at || new Date().toISOString(),
     });
+
+    if (eventInserted === false) {
+      throw new Error(`RECOVERY_EVENT_INSERT_FAILED: Failed to insert deterministic recovery event "${deterministicEventId}".`);
+    }
   }
 }

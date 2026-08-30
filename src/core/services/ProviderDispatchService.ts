@@ -214,6 +214,17 @@ export class ProviderDispatchService {
       };
     }
 
+    if (auth.lifecycle_version === 1) {
+      if (!auth.assignment_id || !auth.selected_account_id) {
+        return {
+          executionId,
+          status: 'FAILED',
+          errorCode: 'RECOVERY_FENCED',
+          error: 'LIFECYCLE_V1_BINDING_INCOMPLETE: Lifecycle-v1 authorization missing required assignment or account binding.',
+        };
+      }
+    }
+
     // 2. Structured Durable Payload Validation (Safe JSON parse & shape validation)
     let parsedInstructions: string[];
     let parsedContextFiles: string[];
@@ -1286,8 +1297,16 @@ export class ProviderDispatchService {
     }
 
     // 15d. Atomic adapter-start claim linearization point (R5I6)
-    const isR5ILifecycle = auth.lifecycle_version === 1 && Boolean(auth.assignment_id);
-    if (isR5ILifecycle) {
+    if (auth.lifecycle_version === 1) {
+      if (!auth.assignment_id || !auth.selected_account_id) {
+        return {
+          executionId,
+          status: 'FAILED',
+          errorCode: 'RECOVERY_FENCED',
+          error: 'LIFECYCLE_V1_BINDING_INCOMPLETE: Lifecycle-v1 authorization missing required assignment or account binding.',
+        };
+      }
+
       const expectedEpoch = auth.task_ownership_epoch ?? this.repo.getTaskOwnershipEpoch(auth.task_id);
       const startClaim = this.repo.claimAdapterExecutionStart({
         authorizationId: auth.id,
@@ -1317,6 +1336,8 @@ export class ProviderDispatchService {
         };
       }
     }
+
+    const isR5ILifecycle = auth.lifecycle_version === 1;
 
     // 16. Execute the selected provider exactly once (NO retry, NO failover on failure)
     let rawResult: AgentExecutionResult;

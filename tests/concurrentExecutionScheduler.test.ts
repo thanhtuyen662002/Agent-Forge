@@ -1417,7 +1417,7 @@ describe('ConcurrentExecutionScheduler (R5G3D1)', () => {
 
   // 65. Real concurrent-active dispatch returns typed fence and invokes no adapter
   it('65. Real concurrent-active dispatch returns typed fence and invokes no adapter', async () => {
-    db.prepare("UPDATE execution_authorizations SET lifecycle_version = 1, task_ownership_epoch = 1 WHERE id = ?").run(authId);
+    db.prepare("UPDATE execution_authorizations SET lifecycle_version = 1, assignment_id = ?, selected_account_id = ?, task_ownership_epoch = 1 WHERE id = ?").run(assignmentId, accountId, authId);
     db.prepare("UPDATE tasks SET ownership_epoch = 1 WHERE id = ?").run(taskId);
     leaseService.acquireForAssignment(assignmentId, 60000);
 
@@ -1452,7 +1452,7 @@ describe('ConcurrentExecutionScheduler (R5G3D1)', () => {
 
   // 66. Scheduler dispatch exception retains all recovery resources
   it('66. Scheduler dispatch exception retains all recovery resources', async () => {
-    db.prepare("UPDATE execution_authorizations SET lifecycle_version = 1, task_ownership_epoch = 1 WHERE id = ?").run(authId);
+    db.prepare("UPDATE execution_authorizations SET lifecycle_version = 1, assignment_id = ?, selected_account_id = ?, task_ownership_epoch = 1 WHERE id = ?").run(assignmentId, accountId, authId);
     db.prepare("UPDATE tasks SET ownership_epoch = 1 WHERE id = ?").run(taskId);
 
     vi.spyOn(dispatchService, 'dispatchScheduled').mockImplementation(async () => {
@@ -1473,7 +1473,9 @@ describe('ConcurrentExecutionScheduler (R5G3D1)', () => {
 
   // 67. Real already-dispatched replay invokes no adapter and retains resources
   it('67. Real already-dispatched replay invokes no adapter and retains resources', async () => {
-    db.prepare("UPDATE execution_authorizations SET lifecycle_version = 1, task_ownership_epoch = 1, status = 'DISPATCHED', dispatched_at = ? WHERE id = ?").run(
+    db.prepare("UPDATE execution_authorizations SET lifecycle_version = 1, assignment_id = ?, selected_account_id = ?, task_ownership_epoch = 1, status = 'DISPATCHED', dispatched_at = ? WHERE id = ?").run(
+      assignmentId,
+      accountId,
       new Date().toISOString(),
       authId
     );

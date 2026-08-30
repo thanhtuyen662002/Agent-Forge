@@ -1193,14 +1193,29 @@ export const MIGRATIONS: Migration[] = [
     name: '020_r5i_crash_recovery_and_execution_lifecycle_authority',
     up: (db: Database.Database) => {
       db.exec(`
-        -- 1. Extend execution_authorizations with lifecycle protocol & durable settlement fields
+        -- 1. Extend execution_authorizations with selected_account_id and lifecycle protocol fields
         ALTER TABLE execution_authorizations
-        ADD COLUMN lifecycle_version INTEGER NULL CHECK (lifecycle_version IS NULL OR lifecycle_version = 1);
+        ADD COLUMN selected_account_id TEXT NULL REFERENCES provider_accounts(id) ON DELETE RESTRICT;
+
+        ALTER TABLE execution_authorizations
+        ADD COLUMN lifecycle_version INTEGER NULL CHECK (
+          lifecycle_version IS NULL OR (
+            lifecycle_version = 1 AND
+            assignment_id IS NOT NULL AND
+            selected_account_id IS NOT NULL AND
+            task_ownership_epoch IS NOT NULL AND
+            task_ownership_epoch > 0
+          )
+        );
 
         CREATE TRIGGER IF NOT EXISTS trg_exec_auth_lifecycle_default
         AFTER INSERT ON execution_authorizations
         FOR EACH ROW
-        WHEN NEW.lifecycle_version IS NULL AND (NEW.status = 'DISPATCHED' OR NEW.assignment_id IS NOT NULL) AND NEW.task_ownership_epoch IS NOT NULL
+        WHEN NEW.lifecycle_version IS NULL
+          AND NEW.assignment_id IS NOT NULL
+          AND NEW.selected_account_id IS NOT NULL
+          AND NEW.task_ownership_epoch IS NOT NULL
+          AND NEW.task_ownership_epoch > 0
         BEGIN
           UPDATE execution_authorizations
           SET lifecycle_version = 1

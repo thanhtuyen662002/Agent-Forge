@@ -208,27 +208,32 @@ export class ConcurrentExecutionScheduler {
 
     let assignment: AgentAssignment | null = null;
     if (auth.assignment_id) {
-      // R5I Handoff execution bridge: validate full durable authority before acquiring lease
-      const valRes = this.repo.validateHandoffSuccessorExecutionAuthority(auth.id);
-      if (!valRes.valid) {
-        return {
-          status: 'PREPARATION_FAILED',
-          authorizationId,
-          assignmentId: auth.assignment_id,
-          errorCode: (valRes.errorCode as any) || 'INTERNAL_ERROR',
-          error: `PREPARATION_FAILED: ${valRes.error}`,
-        };
+      const transfer = this.repo.getHandoffTransferBySuccessorAuthId(auth.id);
+      if (transfer) {
+        // R5I Handoff execution bridge: validate full durable authority before acquiring lease
+        const valRes = this.repo.validateHandoffSuccessorExecutionAuthority(auth.id);
+        if (!valRes.valid) {
+          return {
+            status: 'PREPARATION_FAILED',
+            authorizationId,
+            assignmentId: auth.assignment_id,
+            errorCode: (valRes.errorCode as any) || 'INTERNAL_ERROR',
+            error: `PREPARATION_FAILED: ${valRes.error}`,
+          };
+        }
+        if (valRes.transfer!.status !== 'AUTHORIZED') {
+          return {
+            status: 'PREPARATION_FAILED',
+            authorizationId,
+            assignmentId: auth.assignment_id,
+            errorCode: 'STATUS_CONFLICT' as any,
+            error: `PREPARATION_FAILED: HandoffTransfer "${valRes.transfer!.id}" status is "${valRes.transfer!.status}", expected "AUTHORIZED".`,
+          };
+        }
+        assignment = valRes.assignment!;
+      } else {
+        assignment = this.repo.getAgentAssignment(auth.assignment_id);
       }
-      if (valRes.transfer!.status !== 'AUTHORIZED') {
-        return {
-          status: 'PREPARATION_FAILED',
-          authorizationId,
-          assignmentId: auth.assignment_id,
-          errorCode: 'STATUS_CONFLICT' as any,
-          error: `PREPARATION_FAILED: HandoffTransfer "${valRes.transfer!.id}" status is "${valRes.transfer!.status}", expected "AUTHORIZED".`,
-        };
-      }
-      assignment = valRes.assignment!;
     } else {
       // Legacy non-handoff execution path
       const selectedAssignmentId = routingPayload.selectedAssignmentId as string;
@@ -236,7 +241,7 @@ export class ConcurrentExecutionScheduler {
         return {
           status: 'PREPARATION_FAILED',
           authorizationId,
-          error: 'ROUTING_ASSIGNMENT_ID_MISSING: Selected routing decision is missing selectedAssignmentId.',
+          error: 'PREPARATION_FAILED: ROUTING_ASSIGNMENT_ID_MISSING: Selected routing decision is missing selectedAssignmentId.',
         };
       }
       assignment = this.repo.getAgentAssignment(selectedAssignmentId);
@@ -246,7 +251,7 @@ export class ConcurrentExecutionScheduler {
       return {
         status: 'PREPARATION_FAILED',
         authorizationId,
-        error: `ROUTING_ASSIGNMENT_NOT_FOUND: Selected assignment was not found in database.`,
+        error: `PREPARATION_FAILED: ROUTING_ASSIGNMENT_NOT_FOUND: Selected assignment was not found in database.`,
       };
     }
 
@@ -260,7 +265,7 @@ export class ConcurrentExecutionScheduler {
         status: 'PREPARATION_FAILED',
         authorizationId,
         assignmentId: assignment.id,
-        error: `ROUTING_ASSIGNMENT_TERMINAL: AgentAssignment "${assignment.id}" is already in terminal state "${assignment.status}".`,
+        error: `PREPARATION_FAILED: ROUTING_ASSIGNMENT_TERMINAL: AgentAssignment "${assignment.id}" is already in terminal state "${assignment.status}".`,
       };
     }
 
@@ -354,36 +359,39 @@ export class ConcurrentExecutionScheduler {
 
     // 6.5. R5I Handoff Successor Execution Acceptance
     if (auth.assignment_id) {
-      const acceptRes = this.repo.acceptHandoffSuccessorExecution({
-        authorizationId: auth.id,
-        leaseId,
-        leaseToken,
-        expectedSuccessorEpoch: auth.task_ownership_epoch ?? 1,
-      });
-
-      if (!acceptRes.success) {
-        await supervisor.stop();
-        if (!supervisor.isLeaseLost()) {
-          try {
-            this.leaseService.release(leaseId, leaseToken);
-          } catch {
-            // Ignore release error
-          }
-          try {
-            await this.worktreeService.removeWorktree(worktreeTuple);
-          } catch {
-            // Ignore cleanup error
-          }
-        }
-        return {
-          status: 'PREPARATION_FAILED',
-          authorizationId,
-          assignmentId: assignment.id,
-          workerSlotId,
+      const transfer = this.repo.getHandoffTransferBySuccessorAuthId(auth.id);
+      if (transfer) {
+        const acceptRes = this.repo.acceptHandoffSuccessorExecution({
+          authorizationId: auth.id,
           leaseId,
-          errorCode: acceptRes.errorCode as any,
-          error: `ACCEPTANCE_FAILED: ${acceptRes.error}`,
-        };
+          leaseToken,
+          expectedSuccessorEpoch: auth.task_ownership_epoch ?? 1,
+        });
+
+        if (!acceptRes.success) {
+          await supervisor.stop();
+          if (!supervisor.isLeaseLost()) {
+            try {
+              this.leaseService.release(leaseId, leaseToken);
+            } catch {
+              // Ignore release error
+            }
+            try {
+              await this.worktreeService.removeWorktree(worktreeTuple);
+            } catch {
+              // Ignore cleanup error
+            }
+          }
+          return {
+            status: 'PREPARATION_FAILED',
+            authorizationId,
+            assignmentId: assignment.id,
+            workerSlotId,
+            leaseId,
+            errorCode: acceptRes.errorCode as any,
+            error: `ACCEPTANCE_FAILED: ${acceptRes.error}`,
+          };
+        }
       }
     }
 

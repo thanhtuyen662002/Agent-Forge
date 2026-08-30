@@ -1365,12 +1365,27 @@ export class Repository {
     const columnNames = new Set(tableInfo.map((c) => c.name));
 
     if (columnNames.has('lifecycle_version')) {
+      let selectedAccountId = auth.selected_account_id ?? null;
+      if (!selectedAccountId && auth.assignment_id) {
+        const asgn = this.getAgentAssignment(auth.assignment_id);
+        if (asgn?.selected_account_id) {
+          selectedAccountId = asgn.selected_account_id;
+        }
+      }
+
+      const lifecycleVersion =
+        auth.lifecycle_version !== undefined
+          ? auth.lifecycle_version
+          : auth.assignment_id && selectedAccountId && (auth.task_ownership_epoch ?? 0) > 0
+          ? 1
+          : null;
+
       this.db
         .prepare(`
           INSERT INTO execution_authorizations (
             id, project_id, task_id, attempt_id, task_revision, base_sha,
             repository_head_sha, manager_message_id, manager_payload_hash,
-            routing_decision_id, selected_resource_id, selected_provider_id,
+            routing_decision_id, selected_account_id, selected_resource_id, selected_provider_id,
             instruction_payload_hash, context_manifest_hash,
             canonical_instructions_json, context_files_json, canonical_payload_json, status,
             created_at, dispatched_at, task_ownership_epoch, assignment_id, lifecycle_version, execution_id,
@@ -1379,7 +1394,7 @@ export class Repository {
             termination_status, termination_source, termination_reason, termination_proof_source,
             termination_evidence_json, termination_evidence_hash, terminated_at, settled_at,
             settlement_evidence_json, settlement_evidence_hash
-          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         `)
         .run(
           auth.id,
@@ -1392,6 +1407,7 @@ export class Repository {
           auth.manager_message_id,
           auth.manager_payload_hash,
           auth.routing_decision_id,
+          selectedAccountId,
           auth.selected_resource_id,
           auth.selected_provider_id,
           auth.instruction_payload_hash,
@@ -1404,7 +1420,7 @@ export class Repository {
           auth.dispatched_at,
           auth.task_ownership_epoch ?? 1,
           auth.assignment_id ?? null,
-          auth.lifecycle_version !== undefined ? auth.lifecycle_version : (auth.task_ownership_epoch !== undefined ? 1 : null),
+          lifecycleVersion,
           auth.execution_id ?? null,
           auth.adapter_started_at ?? null,
           auth.adapter_finished_at ?? null,
@@ -1433,11 +1449,8 @@ export class Repository {
             routing_decision_id, selected_resource_id, selected_provider_id,
             instruction_payload_hash, context_manifest_hash,
             canonical_instructions_json, context_files_json, canonical_payload_json, status,
-            created_at, dispatched_at, task_ownership_epoch, assignment_id, execution_id,
-            adapter_started_at, adapter_finished_at, adapter_outcome,
-            cancellation_requested_at, termination_confirmed_at,
-            termination_status, termination_source
-          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            created_at, dispatched_at, task_ownership_epoch, assignment_id
+          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         `)
         .run(
           auth.id,
@@ -1461,15 +1474,7 @@ export class Repository {
           auth.created_at,
           auth.dispatched_at,
           auth.task_ownership_epoch ?? 1,
-          auth.assignment_id ?? null,
-          auth.execution_id ?? null,
-          auth.adapter_started_at ?? null,
-          auth.adapter_finished_at ?? null,
-          auth.adapter_outcome ?? null,
-          auth.cancellation_requested_at ?? null,
-          auth.termination_confirmed_at ?? null,
-          auth.termination_status ?? null,
-          auth.termination_source ?? null
+          auth.assignment_id ?? null
         );
     } else if (columnNames.has('task_ownership_epoch')) {
       this.db
@@ -1480,11 +1485,8 @@ export class Repository {
             routing_decision_id, selected_resource_id, selected_provider_id,
             instruction_payload_hash, context_manifest_hash,
             canonical_instructions_json, context_files_json, canonical_payload_json, status,
-            created_at, dispatched_at, task_ownership_epoch, execution_id,
-            adapter_started_at, adapter_finished_at, adapter_outcome,
-            cancellation_requested_at, termination_confirmed_at,
-            termination_status, termination_source
-          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            created_at, dispatched_at, task_ownership_epoch
+          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         `)
         .run(
           auth.id,
@@ -1507,15 +1509,41 @@ export class Repository {
           auth.status,
           auth.created_at,
           auth.dispatched_at,
-          auth.task_ownership_epoch ?? 1,
-          auth.execution_id ?? null,
-          auth.adapter_started_at ?? null,
-          auth.adapter_finished_at ?? null,
-          auth.adapter_outcome ?? null,
-          auth.cancellation_requested_at ?? null,
-          auth.termination_confirmed_at ?? null,
-          auth.termination_status ?? null,
-          auth.termination_source ?? null
+          auth.task_ownership_epoch ?? 1
+        );
+    } else if (columnNames.has('canonical_payload_json')) {
+      this.db
+        .prepare(`
+          INSERT INTO execution_authorizations (
+            id, project_id, task_id, attempt_id, task_revision, base_sha,
+            repository_head_sha, manager_message_id, manager_payload_hash,
+            routing_decision_id, selected_resource_id, selected_provider_id,
+            instruction_payload_hash, context_manifest_hash,
+            canonical_instructions_json, context_files_json, canonical_payload_json, status,
+            created_at, dispatched_at
+          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        `)
+        .run(
+          auth.id,
+          auth.project_id,
+          auth.task_id,
+          auth.attempt_id,
+          auth.task_revision,
+          auth.base_sha,
+          auth.repository_head_sha,
+          auth.manager_message_id,
+          auth.manager_payload_hash,
+          auth.routing_decision_id,
+          auth.selected_resource_id,
+          auth.selected_provider_id,
+          auth.instruction_payload_hash,
+          auth.context_manifest_hash,
+          auth.canonical_instructions_json,
+          auth.context_files_json,
+          auth.canonical_payload_json ?? null,
+          auth.status,
+          auth.created_at,
+          auth.dispatched_at
         );
     } else {
       this.db
@@ -1593,29 +1621,12 @@ export class Repository {
           };
         }
 
-        // Lifecycle version fencing: require lifecycle_version = 1 (NULL must fail without mutation)
-        if (auth.lifecycle_version !== 1) {
-          return {
-            success: false,
-            alreadyClaimed: false,
-            error: `LIFECYCLE_VERSION_MISMATCH: expected 1, found ${auth.lifecycle_version}`,
-          };
-        }
-
-        // Check epoch validity
+        // Check epoch validity first
         if (typeof params.expectedEpoch !== 'number' || !Number.isInteger(params.expectedEpoch) || params.expectedEpoch <= 0) {
           return {
             success: false,
             alreadyClaimed: false,
             error: `INVALID_EXPECTED_EPOCH: expectedEpoch must be a positive integer, got ${params.expectedEpoch}`,
-          };
-        }
-
-        if (auth.task_ownership_epoch === null || auth.task_ownership_epoch === undefined || auth.task_ownership_epoch <= 0) {
-          return {
-            success: false,
-            alreadyClaimed: false,
-            error: `NULL_OR_INVALID_AUTH_OWNERSHIP_EPOCH: auth task_ownership_epoch is ${auth.task_ownership_epoch}`,
           };
         }
 
@@ -1626,6 +1637,98 @@ export class Repository {
             success: false,
             alreadyClaimed: false,
             error: `OWNERSHIP_EPOCH_MISMATCH: expected ${params.expectedEpoch}, current task epoch is ${currentTaskEpoch}, auth epoch is ${auth.task_ownership_epoch}`,
+          };
+        }
+
+        // Lifecycle version fencing: require lifecycle_version = 1 for handoff / assignment-bound auths
+        if (auth.lifecycle_version !== 1) {
+          if (auth.assignment_id || params.expectedLifecycleVersion === 1) {
+            return {
+              success: false,
+              alreadyClaimed: false,
+              error: `LIFECYCLE_VERSION_MISMATCH: expected 1, found ${auth.lifecycle_version}`,
+            };
+          }
+
+          // Legacy unversioned non-handoff execution path (R5I1/R5I2 backward compatibility)
+          if (auth.adapter_started_at) {
+            if (auth.execution_id === params.executionId) {
+              return { success: true, alreadyClaimed: true, startedAt: auth.adapter_started_at };
+            }
+            return {
+              success: false,
+              alreadyClaimed: false,
+              error: `EXECUTION_ID_CONFLICT: authorization already claimed with execution ${auth.execution_id}`,
+            };
+          }
+
+          const startedAt = new Date().toISOString();
+          const res = this.db
+            .prepare(`
+              UPDATE execution_authorizations
+              SET adapter_started_at = ?,
+                  execution_id = ?
+              WHERE id = ?
+                AND status = 'DISPATCHED'
+                AND execution_id IS NULL
+                AND adapter_started_at IS NULL
+            `)
+            .run(startedAt, params.executionId, params.authorizationId);
+
+          if (res.changes !== 1) {
+            return { success: false, alreadyClaimed: false, error: 'START_CLAIM_CAS_FAILED' };
+          }
+
+          return { success: true, alreadyClaimed: false, startedAt };
+        }
+
+        // Check required lifecycle-v1 assignment and account bindings
+        if (!auth.assignment_id) {
+          return {
+            success: false,
+            alreadyClaimed: false,
+            error: 'AUTH_ASSIGNMENT_MISSING: Lifecycle-v1 requires non-null assignment_id.',
+          };
+        }
+
+        if (!auth.selected_account_id) {
+          return {
+            success: false,
+            alreadyClaimed: false,
+            error: 'AUTH_ACCOUNT_MISSING: Lifecycle-v1 requires non-null selected_account_id.',
+          };
+        }
+
+        const assignment = this.getAgentAssignment(auth.assignment_id);
+        if (!assignment) {
+          return {
+            success: false,
+            alreadyClaimed: false,
+            error: `ASSIGNMENT_NOT_FOUND: Assignment "${auth.assignment_id}" not found.`,
+          };
+        }
+
+        // Validate assignment bindings match authorization exactly
+        if (
+          assignment.task_id !== auth.task_id ||
+          assignment.project_id !== auth.project_id ||
+          assignment.selected_provider_id !== auth.selected_provider_id ||
+          assignment.selected_resource_id !== auth.selected_resource_id ||
+          assignment.selected_account_id !== auth.selected_account_id ||
+          (auth.routing_decision_id && assignment.routing_decision_id !== auth.routing_decision_id)
+        ) {
+          return {
+            success: false,
+            alreadyClaimed: false,
+            error: 'ASSIGNMENT_BINDING_MISMATCH: Assignment bindings do not match execution authorization.',
+          };
+        }
+
+        if (!assignment.selected_worker_slot_id) {
+          return {
+            success: false,
+            alreadyClaimed: false,
+            error: `ASSIGNMENT_SLOT_MISSING: Assignment "${assignment.id}" missing selected_worker_slot_id.`,
           };
         }
 
@@ -1641,26 +1744,44 @@ export class Repository {
           };
         }
 
-        let assignment: any = null;
-        if (auth.assignment_id) {
-          assignment = this.getAgentAssignment(auth.assignment_id);
-          if (!assignment) {
-            return { success: false, alreadyClaimed: false, error: `ASSIGNMENT_NOT_FOUND: Assignment "${auth.assignment_id}" not found.` };
-          }
-          if (!assignment.selected_account_id) {
-            return { success: false, alreadyClaimed: false, error: `ASSIGNMENT_ACCOUNT_MISSING: Assignment "${assignment.id}" missing selected_account_id.` };
-          }
-          if (!assignment.selected_worker_slot_id) {
-            return { success: false, alreadyClaimed: false, error: `ASSIGNMENT_SLOT_MISSING: Assignment "${assignment.id}" missing selected_worker_slot_id.` };
-          }
-          const slot = this.getWorkerSlot(assignment.selected_worker_slot_id);
-          if (!slot || slot.status !== 'LEASED' || slot.current_assignment_id !== assignment.id || slot.current_execution_id !== null) {
-            return { success: false, alreadyClaimed: false, error: `WORKER_SLOT_NOT_READY: Slot "${assignment.selected_worker_slot_id}" is not LEASED, bound, or unexecuted.` };
-          }
-          const lease = this.getActiveLeaseForAssignment(assignment.id);
-          if (!lease || lease.worker_slot_id !== slot.id || lease.released_at !== null) {
-            return { success: false, alreadyClaimed: false, error: `ACTIVE_LEASE_NOT_FOUND: No active unreleased lease for assignment "${assignment.id}".` };
-          }
+        const slot = this.getWorkerSlot(assignment.selected_worker_slot_id);
+        if (
+          !slot ||
+          slot.status !== 'LEASED' ||
+          slot.current_assignment_id !== assignment.id ||
+          slot.provider_account_id !== auth.selected_account_id ||
+          slot.current_execution_id !== null ||
+          (slot.provider_resource_id !== null && slot.provider_resource_id !== auth.selected_resource_id)
+        ) {
+          return {
+            success: false,
+            alreadyClaimed: false,
+            error: `WORKER_SLOT_NOT_READY: Slot "${assignment.selected_worker_slot_id}" is not LEASED, bound to assignment/account, or unexecuted.`,
+          };
+        }
+
+        const lease = this.getActiveLeaseForAssignment(assignment.id);
+        if (
+          !lease ||
+          lease.worker_slot_id !== slot.id ||
+          lease.provider_account_id !== auth.selected_account_id ||
+          lease.assignment_id !== assignment.id ||
+          lease.released_at !== null ||
+          new Date(lease.expires_at).getTime() <= Date.now()
+        ) {
+          return {
+            success: false,
+            alreadyClaimed: false,
+            error: `ACTIVE_LEASE_NOT_FOUND: No active unreleased unexpired lease for assignment "${assignment.id}".`,
+          };
+        }
+
+        if (auth.task_ownership_epoch === null || auth.task_ownership_epoch === undefined || auth.task_ownership_epoch <= 0) {
+          return {
+            success: false,
+            alreadyClaimed: false,
+            error: `NULL_OR_INVALID_AUTH_OWNERSHIP_EPOCH: auth task_ownership_epoch is ${auth.task_ownership_epoch}`,
+          };
         }
 
         // Linearization point: generate canonical timestamp inside transaction
@@ -1686,28 +1807,26 @@ export class Repository {
         }
 
         // Stamp current_execution_id on worker_slot
-        if (assignment && assignment.selected_worker_slot_id) {
-          const slotRes = this.db
-            .prepare(`
-              UPDATE worker_slots
-              SET current_execution_id = ?, updated_at = ?
-              WHERE id = ?
-                AND status = 'LEASED'
-                AND current_assignment_id = ?
-                AND provider_account_id = ?
-                AND current_execution_id IS NULL
-            `)
-            .run(
-              params.executionId,
-              startedAt,
-              assignment.selected_worker_slot_id,
-              assignment.id,
-              assignment.selected_account_id
-            );
+        const slotRes = this.db
+          .prepare(`
+            UPDATE worker_slots
+            SET current_execution_id = ?, updated_at = ?
+            WHERE id = ?
+              AND status = 'LEASED'
+              AND current_assignment_id = ?
+              AND provider_account_id = ?
+              AND current_execution_id IS NULL
+          `)
+          .run(
+            params.executionId,
+            startedAt,
+            assignment.selected_worker_slot_id,
+            assignment.id,
+            auth.selected_account_id
+          );
 
-          if (slotRes.changes !== 1) {
-            throw new Error(`WORKER_SLOT_EXECUTION_STAMP_FAILED: Failed to stamp execution_id on slot "${assignment.selected_worker_slot_id}" for assignment "${assignment.id}".`);
-          }
+        if (slotRes.changes !== 1) {
+          throw new Error(`WORKER_SLOT_EXECUTION_STAMP_FAILED: Failed to stamp execution_id on slot "${assignment.selected_worker_slot_id}" for assignment "${assignment.id}".`);
         }
 
         return { success: true, alreadyClaimed: false, startedAt };
@@ -2015,38 +2134,83 @@ export class Repository {
         }
 
         const transfer = this.getHandoffTransferBySuccessorAuthId(auth.id);
-        if (!transfer || transfer.id !== storedEvidence.transfer_id) {
+        if (
+          !transfer ||
+          transfer.id !== storedEvidence.transfer_id ||
+          transfer.successor_attempt_id !== storedEvidence.attempt_id ||
+          transfer.successor_assignment_id !== storedEvidence.assignment_id ||
+          transfer.task_id !== storedEvidence.task_id ||
+          transfer.successor_ownership_epoch !== storedEvidence.ownership_epoch
+        ) {
           return {
             success: false,
             alreadySettled: false,
             settledAt: auth.settled_at,
             evidenceHash: auth.settlement_evidence_hash,
-            error: `SETTLEMENT_CONFLICT: Transfer binding graph missing or mismatch: transfer "${transfer?.id}" !== stored "${storedEvidence.transfer_id}".`,
+            error: `SETTLEMENT_CONFLICT: Transfer binding graph missing or mismatch against stored evidence.`,
           };
         }
         const attempt = auth.attempt_id ? this.getTaskAttempt(auth.attempt_id) : null;
-        if (!attempt || attempt.id !== storedEvidence.attempt_id) {
+        if (!attempt || attempt.id !== storedEvidence.attempt_id || attempt.task_id !== storedEvidence.task_id) {
           return {
             success: false,
             alreadySettled: false,
             settledAt: auth.settled_at,
             evidenceHash: auth.settlement_evidence_hash,
-            error: `SETTLEMENT_CONFLICT: Attempt binding graph missing or mismatch: attempt "${attempt?.id}" !== stored "${storedEvidence.attempt_id}".`,
+            error: `SETTLEMENT_CONFLICT: Attempt binding graph missing or mismatch against stored evidence.`,
           };
         }
         const assignment = auth.assignment_id ? this.getAgentAssignment(auth.assignment_id) : null;
-        if (!assignment || assignment.id !== storedEvidence.assignment_id || assignment.selected_account_id !== storedEvidence.account_id) {
+        if (
+          !assignment ||
+          assignment.id !== storedEvidence.assignment_id ||
+          assignment.task_id !== storedEvidence.task_id ||
+          assignment.project_id !== storedEvidence.project_id ||
+          assignment.selected_provider_id !== storedEvidence.provider_id ||
+          assignment.selected_resource_id !== storedEvidence.resource_id ||
+          assignment.selected_account_id !== storedEvidence.account_id ||
+          assignment.routing_decision_id !== storedEvidence.routing_decision_id
+        ) {
           return {
             success: false,
             alreadySettled: false,
             settledAt: auth.settled_at,
             evidenceHash: auth.settlement_evidence_hash,
-            error: `SETTLEMENT_CONFLICT: Assignment/account binding graph missing or mismatch: assignment "${assignment?.id}" / account "${assignment?.selected_account_id}" !== stored "${storedEvidence.assignment_id}" / "${storedEvidence.account_id}".`,
+            error: `SETTLEMENT_CONFLICT: Assignment binding graph missing or mismatch against stored evidence.`,
+          };
+        }
+
+        if (!auth.selected_account_id || auth.selected_account_id !== storedEvidence.account_id) {
+          return {
+            success: false,
+            alreadySettled: false,
+            settledAt: auth.settled_at,
+            evidenceHash: auth.settlement_evidence_hash,
+            error: `SETTLEMENT_CONFLICT: Authorization selected_account_id missing or mismatch against stored evidence.`,
+          };
+        }
+
+        const resource = this.getProviderResource(auth.selected_resource_id);
+        if (
+          !resource ||
+          resource.provider_id !== storedEvidence.provider_id ||
+          (resource.provider_account_id && resource.provider_account_id !== storedEvidence.account_id)
+        ) {
+          return {
+            success: false,
+            alreadySettled: false,
+            settledAt: auth.settled_at,
+            evidenceHash: auth.settlement_evidence_hash,
+            error: `SETTLEMENT_CONFLICT: Resource provider/account mismatch against stored evidence.`,
           };
         }
 
         const currentTaskEpoch = this.getTaskOwnershipEpoch(auth.task_id);
-        if (currentTaskEpoch !== storedEvidence.ownership_epoch || auth.task_ownership_epoch !== storedEvidence.ownership_epoch) {
+        if (
+          currentTaskEpoch !== storedEvidence.ownership_epoch ||
+          auth.task_ownership_epoch !== storedEvidence.ownership_epoch ||
+          transfer.successor_ownership_epoch !== storedEvidence.ownership_epoch
+        ) {
           return {
             success: false,
             alreadySettled: false,
@@ -2127,6 +2291,7 @@ export class Repository {
         !auth.project_id ||
         !auth.attempt_id ||
         !auth.assignment_id ||
+        !auth.selected_account_id ||
         !auth.selected_provider_id ||
         !auth.selected_resource_id ||
         !auth.routing_decision_id ||
@@ -2277,23 +2442,23 @@ export class Repository {
           error: `BINDING_MISMATCH: Assignment resource "${assignment.selected_resource_id}" !== auth resource "${auth.selected_resource_id}".`,
         };
       }
-      if (!assignment.selected_account_id) {
+      if (!assignment.selected_account_id || assignment.selected_account_id !== auth.selected_account_id) {
         return {
           success: false,
           alreadySettled: false,
           settledAt: '',
           evidenceHash: '',
-          error: `BINDING_MISMATCH: Assignment "${assignment.id}" missing selected_account_id.`,
+          error: `BINDING_MISMATCH: Assignment selected_account_id "${assignment.selected_account_id}" !== auth selected_account_id "${auth.selected_account_id}".`,
         };
       }
       const resource = this.getProviderResource(auth.selected_resource_id);
-      if (resource?.provider_account_id && assignment.selected_account_id !== resource.provider_account_id) {
+      if (!resource || resource.provider_id !== auth.selected_provider_id || (resource.provider_account_id && resource.provider_account_id !== auth.selected_account_id)) {
         return {
           success: false,
           alreadySettled: false,
           settledAt: '',
           evidenceHash: '',
-          error: `BINDING_MISMATCH: Assignment account "${assignment.selected_account_id}" !== resource account "${resource.provider_account_id}".`,
+          error: `BINDING_MISMATCH: Resource account "${resource?.provider_account_id}" or provider "${resource?.provider_id}" !== auth.`,
         };
       }
       if (assignment.routing_decision_id !== auth.routing_decision_id) {
@@ -2646,11 +2811,13 @@ export class Repository {
         };
       }
 
-      let evidenceHash: string | null = null;
+      let parsedProofPayload: unknown = null;
+      let rawEvidenceHash: string | null = null;
       if (params.terminationEvidenceJson) {
         try {
           const parsed = JSON.parse(params.terminationEvidenceJson);
-          evidenceHash = computeSha256(canonicalJsonStringify(parsed));
+          parsedProofPayload = parsed && typeof parsed === 'object' && 'proof_payload' in parsed ? (parsed as any).proof_payload : parsed;
+          rawEvidenceHash = computeSha256(canonicalJsonStringify(parsed));
         } catch (e: any) {
           return { success: false, alreadyConfirmed: false, error: `MALFORMED_TERMINATION_EVIDENCE: ${e.message}` };
         }
@@ -2658,14 +2825,54 @@ export class Repository {
 
       if (auth.termination_status === 'CONFIRMED_TERMINATED') {
         if (params.terminationStatus === 'CONFIRMED_TERMINATED') {
+          let storedEnvelope: any = null;
+          try {
+            storedEnvelope = JSON.parse(auth.termination_evidence_json || '{}');
+          } catch {
+            return {
+              success: false,
+              alreadyConfirmed: false,
+              error: 'TERMINATION_SOURCE_CONFLICT: Stored termination evidence is malformed JSON.',
+            };
+          }
+
+          const storedProofPayload =
+            storedEnvelope && typeof storedEnvelope === 'object' && 'proof_payload' in storedEnvelope
+              ? storedEnvelope.proof_payload
+              : storedEnvelope;
+
+          const expectedReconstructedEnvelope = {
+            authorization_id: auth.id,
+            execution_id: auth.execution_id,
+            termination_status: auth.termination_status,
+            termination_source: auth.termination_source,
+            termination_reason: auth.termination_reason,
+            proof_source: auth.termination_proof_source,
+            confirmed_at: auth.termination_confirmed_at,
+            terminated_at: auth.terminated_at,
+            proof_payload: storedProofPayload,
+          };
+
+          const expectedEnvelopeHash = computeSha256(canonicalJsonStringify(expectedReconstructedEnvelope));
+          if (auth.termination_evidence_hash !== expectedEnvelopeHash) {
+            return {
+              success: false,
+              alreadyConfirmed: false,
+              error: 'TERMINATION_SOURCE_CONFLICT: Stored termination evidence hash mismatch.',
+            };
+          }
+
           const sourceMatch = !params.terminationSource || auth.termination_source === params.terminationSource;
           const reasonMatch = !params.terminationReason || auth.termination_reason === params.terminationReason;
           const proofMatch = !params.terminationProofSource || auth.termination_proof_source === params.terminationProofSource;
           const confirmedAtMatch = !params.confirmedAt || auth.termination_confirmed_at === params.confirmedAt;
           const terminatedAtMatch = !params.terminatedAt || auth.terminated_at === params.terminatedAt;
-          const evidenceMatch = !evidenceHash || auth.termination_evidence_hash === evidenceHash;
+          const payloadMatch =
+            !parsedProofPayload ||
+            canonicalJsonStringify(parsedProofPayload) === canonicalJsonStringify(storedProofPayload) ||
+            auth.termination_evidence_hash === rawEvidenceHash;
 
-          if (sourceMatch && reasonMatch && proofMatch && confirmedAtMatch && terminatedAtMatch && evidenceMatch) {
+          if (sourceMatch && reasonMatch && proofMatch && confirmedAtMatch && terminatedAtMatch && payloadMatch) {
             return { success: true, alreadyConfirmed: true };
           }
           return {
@@ -2712,7 +2919,7 @@ export class Repository {
             params.terminationReason ?? null,
             params.terminationProofSource ?? null,
             params.terminationEvidenceJson ?? null,
-            evidenceHash,
+            rawEvidenceHash,
             params.authorizationId,
             params.executionId
           );
@@ -2726,7 +2933,7 @@ export class Repository {
           !params.terminationReason ||
           !params.terminationProofSource ||
           !params.terminationEvidenceJson ||
-          !evidenceHash
+          parsedProofPayload === null
         ) {
           return {
             success: false,
@@ -2765,6 +2972,20 @@ export class Repository {
           };
         }
 
+        const canonicalEnvelope = {
+          authorization_id: auth.id,
+          execution_id: params.executionId,
+          termination_status: 'CONFIRMED_TERMINATED',
+          termination_source: params.terminationSource,
+          termination_reason: params.terminationReason,
+          proof_source: params.terminationProofSource,
+          confirmed_at: confirmedAt,
+          terminated_at: terminatedAt,
+          proof_payload: parsedProofPayload,
+        };
+        const canonicalEnvelopeJson = canonicalJsonStringify(canonicalEnvelope);
+        const evidenceHash = computeSha256(canonicalEnvelopeJson);
+
         const res = this.db
           .prepare(`
             UPDATE execution_authorizations
@@ -2782,7 +3003,7 @@ export class Repository {
             params.terminationSource,
             params.terminationReason,
             params.terminationProofSource,
-            params.terminationEvidenceJson,
+            canonicalEnvelopeJson,
             evidenceHash,
             confirmedAt,
             terminatedAt,
@@ -6021,6 +6242,9 @@ export class Repository {
       }
 
       // 1. Insert candidate authorization
+      if (!params.candidate.selected_account_id && assignment.selected_account_id) {
+        params.candidate.selected_account_id = assignment.selected_account_id;
+      }
       this.createExecutionAuthorization(params.candidate);
 
       // 2. CAS update handoff_transfers ROUTED -> AUTHORIZED
