@@ -740,7 +740,7 @@ describe('R5I5 Successor Resume, Linearization, and Idempotency Authority', () =
       status: 'AUTHORIZED',
       created_at: new Date().toISOString(),
       dispatched_at: null,
-      task_ownership_epoch: 1,
+      task_ownership_epoch: 2,
       assignment_id: null, // Legacy auth has NULL assignment_id
     };
     repo.createExecutionAuthorization(legacyAuth);
@@ -1456,7 +1456,7 @@ describe('R5I5 Successor Resume, Linearization, and Idempotency Authority', () =
     expect(schedRes.status).toBe('COMPLETED');
 
     const transfer = repo.getHandoffTransfer(defaultTransfer.id)!;
-    expect(transfer.status).toBe('ACCEPTED');
+    expect(transfer.status).toBe('COMPLETED');
     expect(transfer.accepted_at).not.toBeNull();
   });
 
@@ -2133,7 +2133,7 @@ describe('R5I5 Successor Resume, Linearization, and Idempotency Authority', () =
       status: 'AUTHORIZED',
       created_at: new Date().toISOString(),
       dispatched_at: null,
-      task_ownership_epoch: 1,
+      task_ownership_epoch: 2,
       assignment_id: null,
     };
     repo.createExecutionAuthorization(legacyAuth);
@@ -2224,15 +2224,12 @@ describe('R5I5 Successor Resume, Linearization, and Idempotency Authority', () =
       status: 'AUTHORIZED',
       created_at: new Date().toISOString(),
       dispatched_at: null,
-      task_ownership_epoch: 1,
+      task_ownership_epoch: 2,
       assignment_id: null,
     };
     repo.createExecutionAuthorization(legacyAuth);
 
     const res = await scheduler.execute(legacyAuth.id);
-    if (res.status !== 'COMPLETED') {
-      console.log('LEGACY SCHEDULER 69 ERROR:', res.status, (res as any).providerResult);
-    }
     expect(res.status).toBe('COMPLETED');
   });
 

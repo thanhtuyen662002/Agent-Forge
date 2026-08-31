@@ -783,16 +783,18 @@ describe('R5H4 Provider Health Routing Safety & Liveness Guard Contract Tests', 
       health_action: 'RECORD_SUCCESS',
     });
 
-    // Insert 120 transparent NO_MUTATION rows
-    for (let i = 2; i <= 121; i++) {
-      insertObservationDirectly({
-        authorization_id: `auth-nomut-${i}`,
-        account_id: accountIdA,
-        account_order: i,
-        health_action_plan_version: 1,
-        health_action: 'NO_MUTATION',
-      });
-    }
+    // Insert 120 transparent NO_MUTATION rows in a single transaction for speed
+    repo.runInImmediateTransaction(() => {
+      for (let i = 2; i <= 121; i++) {
+        insertObservationDirectly({
+          authorization_id: `auth-nomut-${i}`,
+          account_id: accountIdA,
+          account_order: i,
+          health_action_plan_version: 1,
+          health_action: 'NO_MUTATION',
+        });
+      }
+    });
 
     setAccountWatermark(accountIdA, 1, 'auth-head-1');
 

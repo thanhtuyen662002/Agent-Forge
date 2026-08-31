@@ -32,7 +32,8 @@ export type SchedulerExecutionStatus =
   | 'WORKTREE_CLEANUP_FAILED'
   | 'LEASE_RELEASE_FAILED'
   | 'LEASE_OWNERSHIP_LOST'
-  | 'SCHEDULED_DISPATCH_FAILED';
+  | 'SCHEDULED_DISPATCH_FAILED'
+  | 'RECOVERY_FENCED';
 
 export interface SchedulerExecutionResult {
   status: SchedulerExecutionStatus;
@@ -142,7 +143,33 @@ export class ConcurrentExecutionScheduler {
       };
     }
 
+    if (this.dispatchService.hasActiveDispatch(authorizationId)) {
+      if (auth.lifecycle_version === 1) {
+        return {
+          status: 'RECOVERY_FENCED',
+          authorizationId,
+          assignmentId: auth.assignment_id ?? undefined,
+          errorCode: 'RECOVERY_FENCED',
+          error: `RECOVERY_FENCED: Scheduled dispatch is already active for authorization "${authorizationId}".`,
+        };
+      }
+      return {
+        status: 'PREPARATION_FAILED',
+        authorizationId,
+        error: `EXECUTION_AUTHORIZATION_INVALID_STATUS: Scheduled dispatch is already active for authorization "${authorizationId}".`,
+      };
+    }
+
     if (auth.status !== 'AUTHORIZED') {
+      if (auth.status === 'DISPATCHED' && auth.lifecycle_version === 1) {
+        return {
+          status: 'RECOVERY_FENCED',
+          authorizationId,
+          assignmentId: auth.assignment_id ?? undefined,
+          errorCode: 'RECOVERY_FENCED',
+          error: `RECOVERY_FENCED: Execution authorization "${authorizationId}" is already DISPATCHED.`,
+        };
+      }
       return {
         status: 'PREPARATION_FAILED',
         authorizationId,
@@ -181,27 +208,32 @@ export class ConcurrentExecutionScheduler {
 
     let assignment: AgentAssignment | null = null;
     if (auth.assignment_id) {
-      // R5I Handoff execution bridge: validate full durable authority before acquiring lease
-      const valRes = this.repo.validateHandoffSuccessorExecutionAuthority(auth.id);
-      if (!valRes.valid) {
-        return {
-          status: 'PREPARATION_FAILED',
-          authorizationId,
-          assignmentId: auth.assignment_id,
-          errorCode: (valRes.errorCode as any) || 'INTERNAL_ERROR',
-          error: `PREPARATION_FAILED: ${valRes.error}`,
-        };
+      const transfer = this.repo.getHandoffTransferBySuccessorAuthId(auth.id);
+      if (transfer) {
+        // R5I Handoff execution bridge: validate full durable authority before acquiring lease
+        const valRes = this.repo.validateHandoffSuccessorExecutionAuthority(auth.id);
+        if (!valRes.valid) {
+          return {
+            status: 'PREPARATION_FAILED',
+            authorizationId,
+            assignmentId: auth.assignment_id,
+            errorCode: (valRes.errorCode as any) || 'INTERNAL_ERROR',
+            error: `PREPARATION_FAILED: ${valRes.error}`,
+          };
+        }
+        if (valRes.transfer!.status !== 'AUTHORIZED') {
+          return {
+            status: 'PREPARATION_FAILED',
+            authorizationId,
+            assignmentId: auth.assignment_id,
+            errorCode: 'STATUS_CONFLICT' as any,
+            error: `PREPARATION_FAILED: HandoffTransfer "${valRes.transfer!.id}" status is "${valRes.transfer!.status}", expected "AUTHORIZED".`,
+          };
+        }
+        assignment = valRes.assignment!;
+      } else {
+        assignment = this.repo.getAgentAssignment(auth.assignment_id);
       }
-      if (valRes.transfer!.status !== 'AUTHORIZED') {
-        return {
-          status: 'PREPARATION_FAILED',
-          authorizationId,
-          assignmentId: auth.assignment_id,
-          errorCode: 'STATUS_CONFLICT' as any,
-          error: `PREPARATION_FAILED: HandoffTransfer "${valRes.transfer!.id}" status is "${valRes.transfer!.status}", expected "AUTHORIZED".`,
-        };
-      }
-      assignment = valRes.assignment!;
     } else {
       // Legacy non-handoff execution path
       const selectedAssignmentId = routingPayload.selectedAssignmentId as string;
@@ -209,7 +241,7 @@ export class ConcurrentExecutionScheduler {
         return {
           status: 'PREPARATION_FAILED',
           authorizationId,
-          error: 'ROUTING_ASSIGNMENT_ID_MISSING: Selected routing decision is missing selectedAssignmentId.',
+          error: 'PREPARATION_FAILED: ROUTING_ASSIGNMENT_ID_MISSING: Selected routing decision is missing selectedAssignmentId.',
         };
       }
       assignment = this.repo.getAgentAssignment(selectedAssignmentId);
@@ -219,7 +251,7 @@ export class ConcurrentExecutionScheduler {
       return {
         status: 'PREPARATION_FAILED',
         authorizationId,
-        error: `ROUTING_ASSIGNMENT_NOT_FOUND: Selected assignment was not found in database.`,
+        error: `PREPARATION_FAILED: ROUTING_ASSIGNMENT_NOT_FOUND: Selected assignment was not found in database.`,
       };
     }
 
@@ -233,7 +265,7 @@ export class ConcurrentExecutionScheduler {
         status: 'PREPARATION_FAILED',
         authorizationId,
         assignmentId: assignment.id,
-        error: `ROUTING_ASSIGNMENT_TERMINAL: AgentAssignment "${assignment.id}" is already in terminal state "${assignment.status}".`,
+        error: `PREPARATION_FAILED: ROUTING_ASSIGNMENT_TERMINAL: AgentAssignment "${assignment.id}" is already in terminal state "${assignment.status}".`,
       };
     }
 
@@ -327,36 +359,39 @@ export class ConcurrentExecutionScheduler {
 
     // 6.5. R5I Handoff Successor Execution Acceptance
     if (auth.assignment_id) {
-      const acceptRes = this.repo.acceptHandoffSuccessorExecution({
-        authorizationId: auth.id,
-        leaseId,
-        leaseToken,
-        expectedSuccessorEpoch: auth.task_ownership_epoch ?? 1,
-      });
-
-      if (!acceptRes.success) {
-        await supervisor.stop();
-        if (!supervisor.isLeaseLost()) {
-          try {
-            this.leaseService.release(leaseId, leaseToken);
-          } catch {
-            // Ignore release error
-          }
-          try {
-            await this.worktreeService.removeWorktree(worktreeTuple);
-          } catch {
-            // Ignore cleanup error
-          }
-        }
-        return {
-          status: 'PREPARATION_FAILED',
-          authorizationId,
-          assignmentId: assignment.id,
-          workerSlotId,
+      const transfer = this.repo.getHandoffTransferBySuccessorAuthId(auth.id);
+      if (transfer) {
+        const acceptRes = this.repo.acceptHandoffSuccessorExecution({
+          authorizationId: auth.id,
           leaseId,
-          errorCode: acceptRes.errorCode as any,
-          error: `ACCEPTANCE_FAILED: ${acceptRes.error}`,
-        };
+          leaseToken,
+          expectedSuccessorEpoch: auth.task_ownership_epoch ?? 1,
+        });
+
+        if (!acceptRes.success) {
+          await supervisor.stop();
+          if (!supervisor.isLeaseLost()) {
+            try {
+              this.leaseService.release(leaseId, leaseToken);
+            } catch {
+              // Ignore release error
+            }
+            try {
+              await this.worktreeService.removeWorktree(worktreeTuple);
+            } catch {
+              // Ignore cleanup error
+            }
+          }
+          return {
+            status: 'PREPARATION_FAILED',
+            authorizationId,
+            assignmentId: assignment.id,
+            workerSlotId,
+            leaseId,
+            errorCode: acceptRes.errorCode as any,
+            error: `ACCEPTANCE_FAILED: ${acceptRes.error}`,
+          };
+        }
       }
     }
 
@@ -371,11 +406,33 @@ export class ConcurrentExecutionScheduler {
       providerResult = {
         executionId: '',
         status: 'FAILED',
-        errorCode: 'EXECUTION_FAILED',
+        errorCode: auth.lifecycle_version === 1 ? 'RECOVERY_FENCED' : 'EXECUTION_FAILED',
         error: `PROVIDER_DISPATCH_THREW: ${err.message}`,
       };
     } finally {
       supervisor.setDispatchPending(false);
+    }
+
+    // 7.5. Typed Recovery Fencing Check (R5I6)
+    // When settlement fails, start claim was rejected/ambiguous, or execution threw unhandled exception,
+    // retain worktree, active lease, slot ownership, and assignment for recovery scanner.
+    const isRecoveryFenced =
+      providerResult.errorCode === 'RECOVERY_FENCED' ||
+      providerResult.errorCode === 'SETTLEMENT_FAILED';
+
+    if (isRecoveryFenced) {
+      await supervisor.stop();
+      return {
+        status: 'RECOVERY_FENCED',
+        authorizationId,
+        assignmentId: assignment.id,
+        workerSlotId,
+        leaseId,
+        workspaceOwnershipDigest,
+        providerResult,
+        errorCode: providerResult.errorCode,
+        error: `RECOVERY_FENCED: ${providerResult.error || 'Execution settlement failed or unconfirmed adapter execution. Worktree and lease retained for crash recovery scanner.'}`,
+      };
     }
 
     // 8. Post-Dispatch Lease Loss Dominance Check

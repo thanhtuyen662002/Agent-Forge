@@ -1149,6 +1149,7 @@ export class ExecutionAuthorizationService {
       dispatched_at: null,
       task_ownership_epoch: transfer.successor_ownership_epoch,
       assignment_id: transfer.successor_assignment_id,
+      lifecycle_version: 1,
     };
 
     return {

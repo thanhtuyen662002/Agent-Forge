@@ -14,6 +14,7 @@ import {
   ExecutionAuthorization,
   ProviderAccount,
   AgentAssignment,
+  AdapterOutcome,
 } from '../types/domain';
 import { GitWorktreeService, WorktreeOwnershipTuple, WorktreeInspection } from './GitWorktreeService';
 import {
@@ -91,6 +92,10 @@ export class ProviderDispatchService {
     this.gitWorktreeService = service;
   }
 
+  public hasActiveDispatch(authorizationId: string): boolean {
+    return this.activeDispatches.has(authorizationId);
+  }
+
   /**
    * Cancels an active scheduled execution if it is currently in PREPARING or EXECUTING phase.
    * Caller supplies only authorizationId.
@@ -162,10 +167,11 @@ export class ProviderDispatchService {
     let control: ScheduledDispatchControl | undefined;
     if (mode === 'SCHEDULED') {
       if (this.activeDispatches.has(authorizationId)) {
+        const currentAuth = this.repo.getExecutionAuthorization(authorizationId);
         return {
           executionId,
           status: 'FAILED',
-          errorCode: 'RESOURCE_UNAVAILABLE',
+          errorCode: currentAuth?.lifecycle_version === 1 ? 'RECOVERY_FENCED' : 'RESOURCE_UNAVAILABLE',
           error: `SCHEDULED_DISPATCH_ALREADY_ACTIVE: A scheduled execution for authorization "${authorizationId}" is already in progress.`,
         };
       }
@@ -195,6 +201,7 @@ export class ProviderDispatchService {
       return {
         executionId,
         status: 'FAILED',
+        errorCode: 'RECOVERY_FENCED',
         error: `EXECUTION_AUTHORIZATION_ALREADY_DISPATCHED: Execution authorization "${authorizationId}" has already been consumed.`,
       };
     }
@@ -205,6 +212,17 @@ export class ProviderDispatchService {
         status: 'FAILED',
         error: `EXECUTION_AUTHORIZATION_INVALIDATED: Execution authorization "${authorizationId}" has been invalidated.`,
       };
+    }
+
+    if (auth.lifecycle_version === 1) {
+      if (!auth.assignment_id || !auth.selected_account_id) {
+        return {
+          executionId,
+          status: 'FAILED',
+          errorCode: 'RECOVERY_FENCED',
+          error: 'LIFECYCLE_V1_BINDING_INCOMPLETE: Lifecycle-v1 authorization missing required assignment or account binding.',
+        };
+      }
     }
 
     // 2. Structured Durable Payload Validation (Safe JSON parse & shape validation)
@@ -1139,12 +1157,14 @@ export class ProviderDispatchService {
         return {
           executionId,
           status: 'FAILED',
+          errorCode: 'RECOVERY_FENCED',
           error: `EXECUTION_AUTHORIZATION_ALREADY_DISPATCHED: Authorization "${authorizationId}" was already claimed by another execution.`,
         };
       }
       return {
         executionId,
         status: 'FAILED',
+        errorCode: 'RECOVERY_FENCED',
         error: `EXECUTION_AUTHORIZATION_CLAIM_FAILED: Could not claim authorization "${authorizationId}" (status: ${currentAuth.status}).`,
       };
     }
@@ -1276,12 +1296,58 @@ export class ProviderDispatchService {
       }
     }
 
+    // 15d. Atomic adapter-start claim linearization point (R5I6)
+    if (auth.lifecycle_version === 1) {
+      if (!auth.assignment_id || !auth.selected_account_id) {
+        return {
+          executionId,
+          status: 'FAILED',
+          errorCode: 'RECOVERY_FENCED',
+          error: 'LIFECYCLE_V1_BINDING_INCOMPLETE: Lifecycle-v1 authorization missing required assignment or account binding.',
+        };
+      }
+
+      const expectedEpoch = auth.task_ownership_epoch ?? this.repo.getTaskOwnershipEpoch(auth.task_id);
+      const startClaim = this.repo.claimAdapterExecutionStart({
+        authorizationId: auth.id,
+        executionId,
+        expectedEpoch,
+        expectedLifecycleVersion: 1,
+      });
+      // ONLY a newly successful claim (!alreadyClaimed && success) may proceed to adapter invocation
+      if (!startClaim.success || startClaim.alreadyClaimed) {
+        return {
+          executionId,
+          status: 'FAILED',
+          errorCode: 'RECOVERY_FENCED',
+          error: `ADAPTER_START_CLAIM_FAILED: Could not claim adapter start (${startClaim.error || (startClaim.alreadyClaimed ? 'ALREADY_CLAIMED' : 'CLAIM_REJECTED')}).`,
+        };
+      }
+    } else {
+      // Legacy execution path (lifecycle_version IS NULL): retain epoch verification
+      const expectedEpoch = auth.task_ownership_epoch ?? this.repo.getTaskOwnershipEpoch(auth.task_id);
+      const currentTaskEpoch = this.repo.getTaskOwnershipEpoch(auth.task_id);
+      if (currentTaskEpoch !== expectedEpoch) {
+        return {
+          executionId,
+          status: 'FAILED',
+          errorCode: 'RESOURCE_UNAVAILABLE',
+          error: `OWNERSHIP_EPOCH_MISMATCH: expected ${expectedEpoch}, current ${currentTaskEpoch}`,
+        };
+      }
+    }
+
+    const isR5ILifecycle = auth.lifecycle_version === 1;
+
     // 16. Execute the selected provider exactly once (NO retry, NO failover on failure)
     let rawResult: AgentExecutionResult;
     let adapterInvocation: ProviderAdapterInvocationOutcome;
+    let adapterOutcome: AdapterOutcome;
+    let adapterErrorJson: string | null = null;
     try {
       rawResult = await adapter.execute(request);
       adapterInvocation = 'RETURNED';
+      adapterOutcome = rawResult.status === 'COMPLETED' ? 'RETURNED' : rawResult.status === 'CANCELLED' ? 'CANCELLED' : 'RETURNED';
     } catch (err: any) {
       rawResult = {
         executionId,
@@ -1290,6 +1356,8 @@ export class ProviderDispatchService {
         error: `ADAPTER_EXECUTION_THREW: ${err.message}`,
       };
       adapterInvocation = 'THREW';
+      adapterOutcome = 'THREW';
+      adapterErrorJson = JSON.stringify({ message: err.message, stack: err.stack });
     }
 
     const finalExecutionId = mode === 'SCHEDULED' ? executionId : (rawResult.executionId || executionId);
@@ -1320,6 +1388,41 @@ export class ProviderDispatchService {
       executionId: finalExecutionId,
       providerExecutionProvenance: provenance,
     };
+
+    // Durably settle execution lifecycle and outcome (R5I6)
+    if (isR5ILifecycle) {
+      const finishTimestamp = new Date().toISOString();
+      try {
+        const settleRes = this.repo.settleExecutionResult({
+          authorizationId: auth.id,
+          executionId: finalExecutionId,
+          outcome: adapterOutcome,
+          status: sanitizedResult.status,
+          finishedAt: finishTimestamp,
+          resultPayload: sanitizedResult,
+          errorJson: adapterErrorJson,
+        });
+
+        if (!settleRes.success) {
+          return {
+            executionId: finalExecutionId,
+            status: 'FAILED',
+            errorCode: 'SETTLEMENT_FAILED',
+            error: `SETTLEMENT_FAILED: ${settleRes.error}`,
+            providerExecutionProvenance: provenance,
+          };
+        }
+      } catch (settleErr: any) {
+        console.error(`[ProviderDispatchService] Durable result settlement failure:`, settleErr);
+        return {
+          executionId: finalExecutionId,
+          status: 'FAILED',
+          errorCode: 'SETTLEMENT_FAILED',
+          error: `SETTLEMENT_FAILED: ${settleErr.message}`,
+          providerExecutionProvenance: provenance,
+        };
+      }
+    }
 
     // 16b. Record durable provider health observation for trusted execution results
     try {

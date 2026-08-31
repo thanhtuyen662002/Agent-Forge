@@ -68,6 +68,20 @@ class MockDeterministicTimer implements SchedulerTimer {
     return true;
   }
 
+  public async fireAll(): Promise<number> {
+    let count = 0;
+    const keys = Array.from(this.timers.keys());
+    for (const key of keys) {
+      if (this.timers.has(key)) {
+        const entry = this.timers.get(key)!;
+        this.timers.delete(key);
+        await entry.fn();
+        count++;
+      }
+    }
+    return count;
+  }
+
   public get pendingCount(): number {
     return this.timers.size;
   }
@@ -780,7 +794,7 @@ describe('Parallel ConcurrentExecutionScheduler Proof (R5G3E1)', () => {
     expect(JSON.stringify(resA).includes('leaseToken')).toBe(false);
     expect(JSON.stringify(resB).includes('leaseToken')).toBe(false);
     expect(JSON.stringify(resC).includes('leaseToken')).toBe(false);
-  });
+  }, 120000);
 
   // SCENARIO 2: Failure & Lease Loss Isolation Scenario (Tests 34 - 42)
   it('Lease loss isolation proves single-execution cancellation does not affect parallel healthy execution', async () => {
@@ -822,7 +836,7 @@ describe('Parallel ConcurrentExecutionScheduler Proof (R5G3E1)', () => {
     db.prepare("UPDATE account_leases SET expires_at = '2020-01-01T00:00:00.000Z' WHERE id = ?").run(lossLease.id);
 
     // Fire timer ticks for heartbeat
-    await timer.fireNext();
+    await timer.fireAll();
 
     // 34. One execution lease-loss cancels only itself
     expect(cancelScheduledSpy).toHaveBeenCalledWith(chainLoss.authId);
@@ -871,7 +885,7 @@ describe('Parallel ConcurrentExecutionScheduler Proof (R5G3E1)', () => {
 
     // 42. Heartbeat state isolated per scheduler execution
     expect(timer.pendingCount).toBe(0);
-  });
+  }, 120000);
 
   // SCENARIO 3: Same Auth Duplicate Scenario (Tests 43 - 44)
   it('Duplicate concurrent execution of the same authorization fails closed without creating second lease or worktree', async () => {

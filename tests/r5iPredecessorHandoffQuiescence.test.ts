@@ -19,6 +19,7 @@ import {
   AdapterOutcome,
   ProviderTerminationStatus,
 } from '../src/core/types/domain';
+import { computeSha256 } from '../src/core/context/ContextIntegrity';
 
 describe('R5I2 Predecessor Handoff Freeze, Quiescence, and Relinquishment', () => {
   let db: Database.Database;
@@ -223,6 +224,13 @@ describe('R5I2 Predecessor Handoff Freeze, Quiescence, and Relinquishment', () =
   }) {
     const epoch = params.epoch ?? 1;
     const status = params.status ?? 'AUTHORIZED';
+    const isTerminated = params.terminationStatus === 'CONFIRMED_TERMINATED';
+    const termReason = isTerminated ? 'EXECUTION_TIMEOUT' : null;
+    const termProof = isTerminated ? 'LOCAL_PROCESS_EXIT' : null;
+    const termConfirmedAt = isTerminated ? (params.terminationConfirmedAt ?? '2026-08-28T00:05:00Z') : null;
+    const termAt = isTerminated ? termConfirmedAt : null;
+    const termEvidenceJson = isTerminated ? '{"exitCode":137}' : null;
+    const termEvidenceHash = isTerminated ? computeSha256('{"exitCode":137}') : null;
 
     db.prepare(`
       INSERT INTO execution_authorizations (
@@ -233,7 +241,8 @@ describe('R5I2 Predecessor Handoff Freeze, Quiescence, and Relinquishment', () =
         canonical_instructions_json, context_files_json, canonical_payload_json, status,
         task_ownership_epoch, execution_id, adapter_started_at, adapter_finished_at,
         adapter_outcome, cancellation_requested_at, termination_confirmed_at,
-        termination_status, termination_source, created_at, dispatched_at
+        termination_status, termination_source, termination_reason, termination_proof_source,
+        termination_evidence_json, termination_evidence_hash, terminated_at, created_at, dispatched_at
       ) VALUES (
         ?, 'proj-1', ?, ?, 0, 'sha-base',
         'sha-head', 'msg-1', 'hash-1',
@@ -242,7 +251,8 @@ describe('R5I2 Predecessor Handoff Freeze, Quiescence, and Relinquishment', () =
         '{}', '[]', '{}', ?,
         ?, ?, ?, ?,
         ?, ?, ?,
-        ?, ?, '2026-08-28T00:00:00Z', ?
+        ?, ?, ?, ?,
+        ?, ?, ?, '2026-08-28T00:00:00Z', ?
       )
     `).run(
       params.authId,
@@ -255,9 +265,14 @@ describe('R5I2 Predecessor Handoff Freeze, Quiescence, and Relinquishment', () =
       params.adapterFinishedAt ?? null,
       params.adapterOutcome ?? null,
       params.cancellationRequestedAt ?? null,
-      params.terminationConfirmedAt ?? null,
+      termConfirmedAt,
       params.terminationStatus ?? null,
       params.terminationSource ?? null,
+      termReason,
+      termProof,
+      termEvidenceJson,
+      termEvidenceHash,
+      termAt,
       status === 'DISPATCHED' ? '2026-08-28T00:01:00Z' : null
     );
   }
