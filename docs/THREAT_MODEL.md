@@ -66,3 +66,15 @@ This document defines the threat landscape, trust boundaries, and defensive coun
   - Transactional `task_leases` ensure only one agent slot holds the active execution lease.
   - `protocol_messages` ensures message idempotency and rejects stale states.
   - SQLite runs in WAL mode with transactions and foreign key integrity.
+
+### 2.6 Cross-Provider Handoff, Provenance Spoofing & Crash Recovery (R5I)
+- **Threat (T-R5I1: Stale Epoch / Split-Brain Ownership)**: A relinquished predecessor agent attempts to continue writing or claiming start after handoff to a successor provider.
+  - **Mitigation**: Monotonic `tasks.ownership_epoch` increments upon relinquishment. Predecessor execution claims fail closed on epoch check.
+- **Threat (T-R5I2: Provenance Spoofing & Provider Impersonation)**: An untrusted adapter attempts to falsify its returned execution metadata to impersonate an authorized provider or account.
+  - **Mitigation**: `ProviderDispatchService` sanitizes and strips all returned provenance fields, binding results exclusively to durable authorized provider, account, and resource IDs.
+- **Threat (T-R5I3: Mid-Transfer Concurrency & Replay Races)**: Two concurrent dispatch triggers attempt to invoke the adapter concurrently across multiple processes or threads.
+  - **Mitigation**: `Repository.claimAdapterExecutionStart` performs an atomic CAS check on `worker_slots` (`current_execution_id` stamping) and `execution_authorizations` (`DISPATCHED` status and `execution_id` check), guaranteeing exactly one adapter call.
+- **Threat (T-R5I4: Context Tampering & Manifest Mutation)**: Successor context files or memory items are modified in SQLite prior to dispatch.
+  - **Mitigation**: Canonical payload hashing and live manifest verification assert that the active context exactly matches the frozen authorization digest before dispatch proceeds.
+- **Threat (T-R5I5: Crash Inconsistency & Zombie Replays)**: The orchestrator process crashes after adapter dispatch or mid-settlement.
+  - **Mitigation**: `ExecutionRecoveryScanner` detects in-flight or incomplete authorizations, enforces `UNRESOLVED_FENCED` status to block replay without re-authorization, and deterministically reconciles terminal state.

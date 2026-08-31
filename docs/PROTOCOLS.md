@@ -192,3 +192,72 @@ Contains:
 - Coder Self-Report Claims
 - Previous Review History & Unresolved Issues
 - Required Output Protocol (`manager.v1`)
+
+---
+
+## 4. Cross-Provider Handoff & Settlement Protocols (R5I)
+
+### 4.1 Handoff Successor Authorization Formula (`auth-handoff.v1`)
+The successor execution authorization ID is deterministically computed via:
+```text
+computeHandoffAuthorizationId({
+  version: 1,
+  transfer_id,
+  successor_attempt_id,
+  successor_assignment_id,
+  successor_ownership_epoch,
+  routing_decision_id,
+  handoff_route_spec_hash,
+  successor_context_spec_hash,
+  manager_message_id,
+  manager_payload_hash
+})
+```
+Where `handoff_route_spec_hash` and `successor_context_spec_hash` are SHA-256 digests over canonically stringified JSON descriptors.
+
+### 4.2 Trusted Provider Execution Provenance (`ProviderExecutionProvenanceV1`)
+Stamped exclusively by `ProviderDispatchService` upon adapter return; all adapter-supplied provenance overrides are stripped:
+```json
+{
+  "version": 1,
+  "source": "PROVIDER_DISPATCH_SERVICE",
+  "mode": "SCHEDULED",
+  "adapterInvocation": "RETURNED",
+  "authorizationId": "auth-handoff-...",
+  "executionId": "948045e6-8a73-4a3b-ac0c-00cb8a2c5255",
+  "projectId": "proj-1",
+  "taskId": "task-1",
+  "attemptId": "att-2",
+  "routingDecisionId": "rd-1",
+  "providerId": "prov-gemini",
+  "resourceId": "res-gemini-flash",
+  "assignmentId": "asgn-succ-1",
+  "accountId": "acc-gemini-prod"
+}
+```
+
+### 4.3 Authentic Durable Settlement Evidence (`SettlementEvidenceV1`)
+19-field envelope sealed in `execution_authorizations.settlement_evidence_json`:
+```json
+{
+  "authorization_id": "auth-handoff-...",
+  "execution_id": "948045e6-8a73-4a3b-ac0c-00cb8a2c5255",
+  "transfer_id": "xfer-1",
+  "project_id": "proj-1",
+  "task_id": "task-1",
+  "attempt_id": "att-2",
+  "assignment_id": "asgn-succ-1",
+  "provider_id": "prov-gemini",
+  "resource_id": "res-gemini-flash",
+  "account_id": "acc-gemini-prod",
+  "routing_decision_id": "rd-1",
+  "ownership_epoch": 2,
+  "lifecycle_version": 1,
+  "settlement_status": "COMPLETED",
+  "outcome": "RETURNED",
+  "started_at": "2026-08-31T20:00:00.000Z",
+  "finished_at": "2026-08-31T20:01:00.000Z",
+  "result_payload": { "status": "COMPLETED" },
+  "error_json": null
+}
+```

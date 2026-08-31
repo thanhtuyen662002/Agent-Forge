@@ -152,3 +152,66 @@ To prevent runaway AI loops and infinite retry ping-pong:
    - `OPTIONAL` and `NIT` issues are recorded as advisory notes and do not increment revisions.
 4. **Escalation**:
    - If `revision_count >= max_revisions`, the task automatically transitions to `NEEDS_HUMAN`, freezing automated retry until the owner intervenes.
+
+---
+
+## 5. Handoff Transfer & Crash Recovery State Machines (R5I)
+
+### 5.1 Handoff Transfer State Machine
+```mermaid
+stateDiagram-v2
+    [*] --> REQUESTED: requestHandoff
+    REQUESTED --> FROZEN: freezeHandoff
+    FROZEN --> QUIESCING: beginQuiescence
+    QUIESCING --> RELINQUISHED: relinquishPredecessorOwnership (CAS)
+    RELINQUISHED --> ROUTED: routeRole / assignSuccessor
+    ROUTED --> AUTHORIZED: resumeHandoffSuccessor
+    AUTHORIZED --> ACCEPTED: acceptHandoffSuccessorExecution (Lease Bound)
+    ACCEPTED --> COMPLETED: settleExecutionResult (COMPLETED)
+
+    REQUESTED --> CANCELLED: cancelHandoff
+    FROZEN --> CANCELLED: cancelHandoff
+    QUIESCING --> CANCELLED: cancelHandoff
+    RELINQUISHED --> CANCELLED: cancelHandoff
+    ROUTED --> CANCELLED: cancelHandoff
+```
+
+| Transfer State | Invariants & Authority |
+| :--- | :--- |
+| `REQUESTED` | Transfer intent recorded; source attempt/assignment still active. |
+| `FROZEN` | Predecessor execution paused; no new child commands permitted. |
+| `QUIESCING` | In-flight I/O flushes; Git worktree dirty state checkpointed. |
+| `RELINQUISHED` | Predecessor releases task ownership; `tasks.ownership_epoch` increments. Predecessor can never resume. |
+| `ROUTED` | Successor role profile, provider, account, and resource selected. |
+| `AUTHORIZED` | Successor `ExecutionAuthorization` (lifecycle-v1) created with deterministic authority hash. |
+| `ACCEPTED` | Worker slot lease acquired; successor attempt/assignment transition to `RUNNING`. Ready for dispatch. |
+| `COMPLETED` | Successor execution finished, durable settlement evidence sealed, worker slot returned to `IDLE`. |
+| `CANCELLED` | Handoff cancelled fail-closed. |
+
+### 5.2 Execution Authorization Lifecycle (Lifecycle-v1)
+```mermaid
+stateDiagram-v2
+    [*] --> AUTHORIZED: createExecutionAuthorization
+    AUTHORIZED --> DISPATCHED: claimExecutionAuthorization (CAS)
+    DISPATCHED --> EXECUTING: claimAdapterExecutionStart (CAS on slot/epoch)
+    EXECUTING --> SETTLED_COMPLETED: settleExecutionResult (status: COMPLETED)
+    EXECUTING --> SETTLED_FAILED: settleExecutionResult (status: FAILED)
+    EXECUTING --> SETTLED_CANCELLED: settleExecutionResult (status: CANCELLED)
+
+    AUTHORIZED --> REVOKED: revokeExecutionAuthorization
+```
+
+### 5.3 Crash Recovery Classification & Disposition Matrix
+```mermaid
+stateDiagram-v2
+    [*] --> SCANNING: Startup / Periodic Scan
+    SCANNING --> ORPHAN_AUTHORIZED: Auth not linked to valid active assignment
+    SCANNING --> ADAPTER_IN_FLIGHT_UNRESOLVED: Started but no durable settlement
+    SCANNING --> RESULT_PERSISTED_STATE_INCOMPLETE: Settled but graph not completed
+    SCANNING --> RESULT_PERSISTED_STATE_COMPLETE: Settled and graph complete
+
+    ORPHAN_AUTHORIZED --> REVOKED_UNSTARTED: Set auth REVOKED, release slot
+    ADAPTER_IN_FLIGHT_UNRESOLVED --> UNRESOLVED_FENCED: Fence auth, retain slot/worktree
+    RESULT_PERSISTED_STATE_INCOMPLETE --> TERMINAL_STATE_RECONCILED: CAS update transfer/attempt/assignment
+    RESULT_PERSISTED_STATE_COMPLETE --> NO_OP: No changes, zero duplicate events
+```

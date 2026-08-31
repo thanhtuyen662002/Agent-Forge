@@ -371,3 +371,53 @@ Renderer Process                  Electron Main Process (Node.js)
 7. **Secret Sanitization**: Error messages from update operations sanitize GitHub Personal Access Tokens (`ghp_*`), Bearer tokens, passwords, and URL embedded credentials before recording or returning to renderer.
 8. **Separation from Authorization Core**: The updater subsystem has zero authority to create, dispatch, or modify `ExecutionAuthorization` records or bypass security policies.
 9. **Installed-App Integration Verification**: `scripts/test-installed-update-win.ps1` provides automated Windows integration proof by installing the real NSIS vA package, spinning up a local loopback update feed serving real `electron-builder` generated vB artifacts (`latest.yml`, `.exe`, `.blockmap`), launching the installed app, and verifying update discovery, download, and the `DOWNLOADED` (canInstall = true) gate.
+
+---
+
+## 11. Cross-Provider Handoff, Lease Scheduling & Crash Recovery (R5I1–R5I7)
+
+Agent-Forge R5I establishes durable multi-agent, cross-provider handoff coordination, worker slot concurrency control, and crash recovery reconciliation.
+
+### Cross-Provider Handoff Subsystems
+```text
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                           Handoff Orchestration                             │
+│                                                                             │
+│  1. Predecessor Freeze & Quiescence                                         │
+│     HandoffTransferService.requestHandoff() ──► freezeHandoff()             │
+│                                             ──► beginQuiescence()           │
+│                                                                             │
+│  2. Single-Ownership Relinquishment                                         │
+│     relinquishPredecessorOwnership() (CAS: source_epoch, version)           │
+│                                                                             │
+│  3. Successor Context Capture & Manifest Hashing                            │
+│     ContextBuilderService.buildContextSnapshot() (purpose='HANDOFF')        │
+│     computeSuccessorContextSpecHash()                                       │
+│                                                                             │
+│  4. Distinct Role-Aware Route Selection                                     │
+│     RoleAwareRoutingService.routeRole(excludedProviderIds: [sourceProvider])│
+│                                                                             │
+│  5. Immutable Successor Execution Authorization                             │
+│     ExecutionAuthorizationService (lifecycle_version = 1)                   │
+│     computeHandoffAuthorizationId()                                         │
+│                                                                             │
+│  6. Worker Slot Lease Acquisition & Heartbeat Watchdog                      │
+│     WorkerSlotLeaseService.acquireForAssignment()                           │
+│     ConcurrentExecutionScheduler (Heartbeat supervision interval <= TTL/3)  │
+│                                                                             │
+│  7. Durable Handoff Acceptance & Atomic Dispatch                            │
+│     Repository.acceptHandoffSuccessorExecution()                            │
+│     ProviderDispatchService.dispatch()                                      │
+│                                                                             │
+│  8. Authentic Settlement & Recovery Fencing                                 │
+│     Repository.settleExecutionResult() (19-field evidence envelope)         │
+│     ExecutionRecoveryScanner.scanAndReconcile()                             │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+### Core Invariants & Fencing
+- **Monotonic Ownership Epochs**: Each handoff transition strictly increments `tasks.ownership_epoch`. Stale predecessor execution attempts or start claims with mismatched epochs fail closed.
+- **Durable Authorization Binding**: Handoff authorizations bind exact `transfer_id`, `successor_attempt_id`, `successor_assignment_id`, `successor_ownership_epoch`, `routing_decision_id`, `handoff_route_spec_hash`, `successor_context_spec_hash`, and manager payload hashes.
+- **Worker Slot Leases**: In lifecycle-v1 dispatches, worker slots must be in `status = 'LEASED'` and bound to the active assignment before adapter execution starts.
+- **One-Time Adapter Claim**: `Repository.claimAdapterExecutionStart` performs an atomic CAS check ensuring that concurrent or replayed dispatches invoke the underlying adapter exactly once.
+- **Crash Recovery Scanning**: On application startup or restart, `ExecutionRecoveryScanner` deterministically scans all active authorizations and reconciles incomplete transitions without duplicate audit emission.
