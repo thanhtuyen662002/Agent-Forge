@@ -1172,13 +1172,20 @@ describe('R5I6 Crash Recovery, Execution Lifecycle Linearization, and Durable Au
     const evidencePayload = {
       authorization_id: auth.id,
       execution_id: 'exec-1',
-      lifecycle_version: 1,
-      task_id: auth.task_id,
+      transfer_id: 'xfer-1',
       project_id: auth.project_id,
+      task_id: auth.task_id,
       attempt_id: auth.attempt_id,
       assignment_id: auth.assignment_id,
+      provider_id: auth.selected_provider_id,
+      resource_id: auth.selected_resource_id,
+      account_id: 'acc-1',
+      routing_decision_id: auth.routing_decision_id,
+      ownership_epoch: 2,
+      lifecycle_version: 1,
       settlement_status: 'COMPLETED',
       outcome: 'RETURNED',
+      started_at: nowIso,
       finished_at: nowIso,
       result_payload: { status: 'COMPLETED' },
       error_json: null,
@@ -1189,15 +1196,15 @@ describe('R5I6 Crash Recovery, Execution Lifecycle Linearization, and Durable Au
     // Durably settle authorization but simulate crash before transfer/attempt/assignment or lease cleanup
     db.prepare(`
       UPDATE execution_authorizations
-      SET adapter_started_at = datetime('now'),
-          adapter_finished_at = datetime('now'),
+      SET adapter_started_at = ?,
+          adapter_finished_at = ?,
           adapter_outcome = 'RETURNED',
           settlement_status = 'COMPLETED',
-          settled_at = datetime('now'),
+          settled_at = ?,
           settlement_evidence_json = ?,
           settlement_evidence_hash = ?
       WHERE id = ?
-    `).run(evidenceJson, evidenceHash, auth.id);
+    `).run(nowIso, nowIso, nowIso, evidenceJson, evidenceHash, auth.id);
 
     const report = scanner.scanAndReconcile();
     expect(report.resultPersistedStateIncompleteCount).toBe(1);
@@ -1231,13 +1238,20 @@ describe('R5I6 Crash Recovery, Execution Lifecycle Linearization, and Durable Au
     const evidencePayload = {
       authorization_id: auth.id,
       execution_id: 'exec-1',
-      lifecycle_version: 1,
-      task_id: auth.task_id,
+      transfer_id: 'xfer-1',
       project_id: auth.project_id,
+      task_id: auth.task_id,
       attempt_id: auth.attempt_id,
       assignment_id: auth.assignment_id,
+      provider_id: auth.selected_provider_id,
+      resource_id: auth.selected_resource_id,
+      account_id: 'acc-1',
+      routing_decision_id: auth.routing_decision_id,
+      ownership_epoch: 2,
+      lifecycle_version: 1,
       settlement_status: 'COMPLETED',
       outcome: 'RETURNED',
+      started_at: nowIso,
       finished_at: nowIso,
       result_payload: { status: 'COMPLETED' },
       error_json: null,
@@ -1248,15 +1262,15 @@ describe('R5I6 Crash Recovery, Execution Lifecycle Linearization, and Durable Au
     // Settle authorization durably but simulate crash before release
     db.prepare(`
       UPDATE execution_authorizations
-      SET adapter_started_at = datetime('now'),
-          adapter_finished_at = datetime('now'),
+      SET adapter_started_at = ?,
+          adapter_finished_at = ?,
           settlement_status = 'COMPLETED',
-          settled_at = datetime('now'),
+          settled_at = ?,
           adapter_outcome = 'RETURNED',
           settlement_evidence_json = ?,
           settlement_evidence_hash = ?
       WHERE id = ?
-    `).run(evidenceJson, evidenceHash, auth.id);
+    `).run(nowIso, nowIso, nowIso, evidenceJson, evidenceHash, auth.id);
 
     const report = scanner.scanAndReconcile();
     expect(report.resultPersistedStateIncompleteCount).toBe(1);
@@ -1795,13 +1809,20 @@ describe('R5I6 Crash Recovery, Execution Lifecycle Linearization, and Durable Au
     const evidence = {
       authorization_id: auth.id,
       execution_id: 'exec-1',
-      lifecycle_version: 1,
-      task_id: auth.task_id,
+      transfer_id: 'xfer-1',
       project_id: auth.project_id,
+      task_id: auth.task_id,
       attempt_id: auth.attempt_id,
       assignment_id: auth.assignment_id,
+      provider_id: auth.selected_provider_id,
+      resource_id: auth.selected_resource_id,
+      account_id: 'acc-1',
+      routing_decision_id: auth.routing_decision_id,
+      ownership_epoch: 2,
+      lifecycle_version: 1,
       settlement_status: 'FAILED',
       outcome: 'RETURNED',
+      started_at: '2026-08-29T11:00:00.000Z',
       finished_at: finishIso,
       result_payload: { status: 'FAILED' },
       error_json: null,
@@ -1812,7 +1833,8 @@ describe('R5I6 Crash Recovery, Execution Lifecycle Linearization, and Durable Au
     // Simulate crash after auth settlement update but before transfer update
     db.prepare(`
       UPDATE execution_authorizations
-      SET settlement_status = 'FAILED',
+      SET adapter_started_at = '2026-08-29T11:00:00.000Z',
+          settlement_status = 'FAILED',
           adapter_finished_at = ?,
           adapter_outcome = 'RETURNED',
           settled_at = ?,
@@ -1847,13 +1869,20 @@ describe('R5I6 Crash Recovery, Execution Lifecycle Linearization, and Durable Au
     const evidence = {
       authorization_id: auth.id,
       execution_id: 'exec-1',
-      lifecycle_version: 1,
-      task_id: auth.task_id,
+      transfer_id: 'xfer-1',
       project_id: auth.project_id,
+      task_id: auth.task_id,
       attempt_id: auth.attempt_id,
       assignment_id: auth.assignment_id,
+      provider_id: auth.selected_provider_id,
+      resource_id: auth.selected_resource_id,
+      account_id: 'acc-1',
+      routing_decision_id: auth.routing_decision_id,
+      ownership_epoch: 2,
+      lifecycle_version: 1,
       settlement_status: 'CANCELLED',
       outcome: 'RETURNED',
+      started_at: '2026-08-29T11:00:00.000Z',
       finished_at: finishIso,
       result_payload: { status: 'CANCELLED' },
       error_json: null,
@@ -1863,7 +1892,8 @@ describe('R5I6 Crash Recovery, Execution Lifecycle Linearization, and Durable Au
 
     db.prepare(`
       UPDATE execution_authorizations
-      SET settlement_status = 'CANCELLED',
+      SET adapter_started_at = '2026-08-29T11:00:00.000Z',
+          settlement_status = 'CANCELLED',
           adapter_finished_at = ?,
           adapter_outcome = 'RETURNED',
           settled_at = ?,
@@ -3019,7 +3049,7 @@ describe('R5I6 Crash Recovery, Execution Lifecycle Linearization, and Durable Au
     });
 
     const nowIso = new Date().toISOString();
-    const partialEvidence = {
+    const completeEvidence = {
       authorization_id: auth.id,
       execution_id: 'exec-1',
       transfer_id: transfer.id,
@@ -3029,7 +3059,7 @@ describe('R5I6 Crash Recovery, Execution Lifecycle Linearization, and Durable Au
       assignment_id: auth.assignment_id,
       provider_id: auth.selected_provider_id,
       resource_id: auth.selected_resource_id,
-      account_id: 'acc-tampered-95',
+      account_id: 'acc-1',
       routing_decision_id: auth.routing_decision_id,
       ownership_epoch: 2,
       lifecycle_version: 1,
@@ -3038,24 +3068,33 @@ describe('R5I6 Crash Recovery, Execution Lifecycle Linearization, and Durable Au
       started_at: nowIso,
       finished_at: nowIso,
       result_payload: { status: 'COMPLETED' },
+      error_json: null,
     };
-    const partialJson = canonicalJsonStringify(partialEvidence);
-    const partialHash = computeSha256(partialJson);
 
-    db.prepare(`
-      UPDATE execution_authorizations
-      SET settled_at = ?,
-          settlement_status = 'COMPLETED',
-          adapter_outcome = 'RETURNED',
-          adapter_finished_at = ?,
-          settlement_evidence_json = ?,
-          settlement_evidence_hash = ?
-      WHERE id = ?
-    `).run(nowIso, nowIso, partialJson, partialHash, auth.id);
+    // Test removing each required field one-by-one with properly recomputed hash
+    const fieldsToTest = ['transfer_id', 'resource_id', 'account_id', 'routing_decision_id', 'error_json', 'result_payload'];
+    for (const field of fieldsToTest) {
+      const partialEvidence: any = { ...completeEvidence };
+      delete partialEvidence[field];
+      const partialJson = canonicalJsonStringify(partialEvidence);
+      const partialHash = computeSha256(partialJson);
 
-    const res = scanner.reconcileAuthorization(auth.id);
-    expect(res.classification).toBe('AUTHORITY_CONFLICT');
-    expect(res.disposition).toBe('REJECTED_INTEGRITY_CONFLICT');
+      db.prepare(`
+        UPDATE execution_authorizations
+        SET settled_at = ?,
+            settlement_status = 'COMPLETED',
+            adapter_outcome = 'RETURNED',
+            adapter_finished_at = ?,
+            settlement_evidence_json = ?,
+            settlement_evidence_hash = ?
+        WHERE id = ?
+      `).run(nowIso, nowIso, partialJson, partialHash, auth.id);
+
+      const res = scanner.reconcileAuthorization(auth.id);
+      expect(res.classification).toBe('AUTHORITY_CONFLICT');
+      expect(res.disposition).toBe('REJECTED_INTEGRITY_CONFLICT');
+      expect(res.error).toContain(`missing required field "${field}"`);
+    }
   });
 
   // 96. Recovery mutation rolls back when ledger or event persistence fails
@@ -3432,10 +3471,24 @@ describe('R5I6 Crash Recovery, Execution Lifecycle Linearization, and Durable Au
     });
     expect(confirmRes.success).toBe(true);
 
-    // Tamper termination reason in authorization record without recomputing envelope
-    db.prepare("UPDATE execution_authorizations SET termination_reason = 'EXECUTION_CANCELLED' WHERE id = ?").run(auth.id);
+    // Case 1: Tamper stored envelope JSON without recomputing hash
+    const tamperedEnvelopeUnchangedHash = {
+      authorization_id: auth.id,
+      execution_id: 'exec-term-tamper',
+      termination_status: 'CONFIRMED_TERMINATED',
+      termination_source: 'PROCESS_EXIT_0',
+      termination_reason: 'EXECUTION_CANCELLED', // Tampered!
+      proof_source: 'LOCAL_PROCESS_EXIT',
+      confirmed_at: '2026-08-27T00:05:00.000Z',
+      terminated_at: '2026-08-27T00:05:00.000Z',
+      proof_payload: { code: 0 },
+    };
+    db.prepare("UPDATE execution_authorizations SET termination_evidence_json = ? WHERE id = ?").run(
+      JSON.stringify(tamperedEnvelopeUnchangedHash),
+      auth.id
+    );
 
-    const replayRes = repo.confirmExecutionTermination({
+    const replayRes1 = repo.confirmExecutionTermination({
       authorizationId: auth.id,
       executionId: 'exec-term-tamper',
       terminationStatus: 'CONFIRMED_TERMINATED',
@@ -3444,9 +3497,28 @@ describe('R5I6 Crash Recovery, Execution Lifecycle Linearization, and Durable Au
       terminationProofSource: 'LOCAL_PROCESS_EXIT',
       terminationEvidenceJson: JSON.stringify({ code: 0 }),
     });
+    expect(replayRes1.success).toBe(false);
+    expect(replayRes1.error).toContain('TERMINATION_SOURCE_CONFLICT');
 
-    expect(replayRes.success).toBe(false);
-    expect(replayRes.error).toContain('TERMINATION_SOURCE_CONFLICT');
+    // Case 2: Tamper stored envelope JSON AND recompute hash (mismatch against DB column termination_reason)
+    const recomputedHash = computeSha256(canonicalJsonStringify(tamperedEnvelopeUnchangedHash));
+    db.prepare("UPDATE execution_authorizations SET termination_evidence_json = ?, termination_evidence_hash = ? WHERE id = ?").run(
+      JSON.stringify(tamperedEnvelopeUnchangedHash),
+      recomputedHash,
+      auth.id
+    );
+
+    const replayRes2 = repo.confirmExecutionTermination({
+      authorizationId: auth.id,
+      executionId: 'exec-term-tamper',
+      terminationStatus: 'CONFIRMED_TERMINATED',
+      terminationSource: 'PROCESS_EXIT_0',
+      terminationReason: 'EXECUTION_TIMEOUT',
+      terminationProofSource: 'LOCAL_PROCESS_EXIT',
+      terminationEvidenceJson: JSON.stringify({ code: 0 }),
+    });
+    expect(replayRes2.success).toBe(false);
+    expect(replayRes2.error).toContain('TERMINATION_SOURCE_CONFLICT');
   });
 
   // 105. Lifecycle-v1 unhandled scanner state becomes authority conflict
@@ -3475,25 +3547,18 @@ describe('R5I6 Crash Recovery, Execution Lifecycle Linearization, and Durable Au
 
   // 106. Missing transfer never creates an empty-ID recovery ledger; false event insertion rolls back
   it('106. Missing transfer never creates an empty-ID recovery ledger; false event insertion rolls back', async () => {
-    // Case A: Missing transfer in scanner catch block does not persist empty transfer_id
+    // Case A: Genuinely missing transfer fails visibly and writes zero recovery rows
     const { auth } = await seedStandardTopology();
+    db.prepare("DELETE FROM handoff_transfers WHERE successor_authorization_id = ?").run(auth.id);
 
-    const origReconcile = scanner.reconcileAuthorization.bind(scanner);
-    const spyReconcile = vi.spyOn(scanner, 'reconcileAuthorization').mockImplementation((authId) => {
-      if (authId === auth.id) {
-        throw new Error('SIMULATED_SCANNER_FAIL');
-      }
-      return origReconcile(authId);
-    });
+    expect(() => {
+      scanner.reconcileAuthorization(auth.id);
+    }).toThrow(/HandoffTransfer for successor authorization/);
 
-    const scanResult = scanner.scanAndReconcile();
-    expect(scanResult.rejectedCount).toBeGreaterThan(0);
-
-    const emptyTransferLedgers = db.prepare("SELECT * FROM execution_recovery_states WHERE transfer_id = ''").all();
+    const emptyTransferLedgers = db.prepare("SELECT * FROM execution_recovery_states WHERE transfer_id = '' OR authorization_id = ?").all(auth.id);
     expect(emptyTransferLedgers.length).toBe(0);
-    spyReconcile.mockRestore();
 
-    // Case B: False event insertion throws and rolls back recovery
+    // Case B: False event insertion through scanAndReconcile throws and rolls back recovery
     const { auth: auth2, leaseRes } = await seedStandardTopology({
       taskId: 'tsk-106b',
       transferId: 'xfer-106b',
@@ -3510,11 +3575,439 @@ describe('R5I6 Crash Recovery, Execution Lifecycle Linearization, and Durable Au
     const spy = vi.spyOn(repo, 'insertDeterministicEvent').mockReturnValue(false);
 
     expect(() => {
-      scanner.reconcileAuthorization(auth2.id);
+      scanner.scanAndReconcile();
     }).toThrow(/RECOVERY_EVENT_INSERT_FAILED/);
 
     const checkAuth = repo.getExecutionAuthorization(auth2.id)!;
     expect(checkAuth.status).toBe('DISPATCHED');
     spy.mockRestore();
+  });
+
+  // 107. Empty required settlement field plus recomputed hash is rejected
+  it('107. Empty required settlement field plus recomputed hash is rejected', async () => {
+    const { auth, transfer } = await seedStandardTopology({ acquireLease: true, acceptSuccessor: true });
+    repo.claimExecutionAuthorization(auth.id, new Date().toISOString());
+    repo.claimAdapterExecutionStart({
+      authorizationId: auth.id,
+      executionId: 'exec-107',
+      expectedEpoch: 2,
+    });
+
+    const nowIso = new Date().toISOString();
+    const emptyStringEvidence = {
+      authorization_id: auth.id,
+      execution_id: 'exec-107',
+      transfer_id: transfer.id,
+      project_id: auth.project_id,
+      task_id: auth.task_id,
+      attempt_id: auth.attempt_id,
+      assignment_id: auth.assignment_id,
+      provider_id: auth.selected_provider_id,
+      resource_id: auth.selected_resource_id,
+      account_id: 'acc-1',
+      routing_decision_id: '   ', // Empty whitespace string!
+      ownership_epoch: 2,
+      lifecycle_version: 1,
+      settlement_status: 'COMPLETED',
+      outcome: 'RETURNED',
+      started_at: nowIso,
+      finished_at: nowIso,
+      result_payload: { ok: true },
+      error_json: null,
+    };
+    const emptyJson = canonicalJsonStringify(emptyStringEvidence);
+    const emptyHash = computeSha256(emptyJson);
+
+    db.prepare(`
+      UPDATE execution_authorizations
+      SET settled_at = ?,
+          settlement_status = 'COMPLETED',
+          adapter_outcome = 'RETURNED',
+          adapter_finished_at = ?,
+          settlement_evidence_json = ?,
+          settlement_evidence_hash = ?
+      WHERE id = ?
+    `).run(nowIso, nowIso, emptyJson, emptyHash, auth.id);
+
+    const res = scanner.reconcileAuthorization(auth.id);
+    expect(res.classification).toBe('AUTHORITY_CONFLICT');
+    expect(res.disposition).toBe('REJECTED_INTEGRITY_CONFLICT');
+    expect(res.error).toContain('is empty or not a string');
+  });
+
+  // 108. Stored termination envelope field deletion is rejected
+  it('108. Stored termination envelope field deletion is rejected', async () => {
+    const { auth } = await seedStandardTopology({ acquireLease: true, acceptSuccessor: true });
+    repo.claimExecutionAuthorization(auth.id, new Date().toISOString());
+    repo.claimAdapterExecutionStart({
+      authorizationId: auth.id,
+      executionId: 'exec-term-108',
+      expectedEpoch: 2,
+    });
+
+    repo.confirmExecutionTermination({
+      authorizationId: auth.id,
+      executionId: 'exec-term-108',
+      terminationStatus: 'CONFIRMED_TERMINATED',
+      terminationSource: 'PROCESS_EXIT_0',
+      terminationReason: 'EXECUTION_TIMEOUT',
+      terminationProofSource: 'LOCAL_PROCESS_EXIT',
+      terminationEvidenceJson: JSON.stringify({ code: 0 }),
+      confirmedAt: '2026-08-27T00:05:00.000Z',
+      terminatedAt: '2026-08-27T00:05:00.000Z',
+    });
+
+    // Delete proof_payload from stored envelope and recompute hash
+    const envelopeWithoutPayload: any = {
+      authorization_id: auth.id,
+      execution_id: 'exec-term-108',
+      termination_status: 'CONFIRMED_TERMINATED',
+      termination_source: 'PROCESS_EXIT_0',
+      termination_reason: 'EXECUTION_TIMEOUT',
+      proof_source: 'LOCAL_PROCESS_EXIT',
+      confirmed_at: '2026-08-27T00:05:00.000Z',
+      terminated_at: '2026-08-27T00:05:00.000Z',
+    };
+    const jsonWithoutPayload = canonicalJsonStringify(envelopeWithoutPayload);
+    const hashWithoutPayload = computeSha256(jsonWithoutPayload);
+
+    db.prepare("UPDATE execution_authorizations SET termination_evidence_json = ?, termination_evidence_hash = ? WHERE id = ?").run(
+      jsonWithoutPayload,
+      hashWithoutPayload,
+      auth.id
+    );
+
+    const replayRes = repo.confirmExecutionTermination({
+      authorizationId: auth.id,
+      executionId: 'exec-term-108',
+      terminationStatus: 'CONFIRMED_TERMINATED',
+      terminationSource: 'PROCESS_EXIT_0',
+      terminationReason: 'EXECUTION_TIMEOUT',
+      terminationProofSource: 'LOCAL_PROCESS_EXIT',
+      terminationEvidenceJson: JSON.stringify({ code: 0 }),
+    });
+
+    expect(replayRes.success).toBe(false);
+    expect(replayRes.error).toContain('missing required envelope field "proof_payload"');
+  });
+
+  // 109. Stored termination envelope metadata tampering is rejected even when its hash is recomputed
+  it('109. Stored termination envelope metadata tampering is rejected even when its hash is recomputed', async () => {
+    const { auth } = await seedStandardTopology({ acquireLease: true, acceptSuccessor: true });
+    repo.claimExecutionAuthorization(auth.id, new Date().toISOString());
+    repo.claimAdapterExecutionStart({
+      authorizationId: auth.id,
+      executionId: 'exec-term-109',
+      expectedEpoch: 2,
+    });
+
+    repo.confirmExecutionTermination({
+      authorizationId: auth.id,
+      executionId: 'exec-term-109',
+      terminationStatus: 'CONFIRMED_TERMINATED',
+      terminationSource: 'PROCESS_EXIT_0',
+      terminationReason: 'EXECUTION_TIMEOUT',
+      terminationProofSource: 'LOCAL_PROCESS_EXIT',
+      terminationEvidenceJson: JSON.stringify({ code: 0 }),
+      confirmedAt: '2026-08-27T00:05:00.000Z',
+      terminatedAt: '2026-08-27T00:05:00.000Z',
+    });
+
+    // Tamper termination source in envelope and recompute hash
+    const tamperedEnvelope = {
+      authorization_id: auth.id,
+      execution_id: 'exec-term-109',
+      termination_status: 'CONFIRMED_TERMINATED',
+      termination_source: 'TAMPERED_PROCESS_SOURCE', // Tampered!
+      termination_reason: 'EXECUTION_TIMEOUT',
+      proof_source: 'LOCAL_PROCESS_EXIT',
+      confirmed_at: '2026-08-27T00:05:00.000Z',
+      terminated_at: '2026-08-27T00:05:00.000Z',
+      proof_payload: { code: 0 },
+    };
+    const tamperedJson = canonicalJsonStringify(tamperedEnvelope);
+    const tamperedHash = computeSha256(tamperedJson);
+
+    db.prepare("UPDATE execution_authorizations SET termination_evidence_json = ?, termination_evidence_hash = ? WHERE id = ?").run(
+      tamperedJson,
+      tamperedHash,
+      auth.id
+    );
+
+    const replayRes = repo.confirmExecutionTermination({
+      authorizationId: auth.id,
+      executionId: 'exec-term-109',
+      terminationStatus: 'CONFIRMED_TERMINATED',
+      terminationSource: 'PROCESS_EXIT_0',
+      terminationReason: 'EXECUTION_TIMEOUT',
+      terminationProofSource: 'LOCAL_PROCESS_EXIT',
+      terminationEvidenceJson: JSON.stringify({ code: 0 }),
+    });
+
+    expect(replayRes.success).toBe(false);
+    expect(replayRes.error).toContain('Stored termination envelope fields mismatch database record columns');
+  });
+
+  // 110. Scanner rejects termination-envelope tampering
+  it('110. Scanner rejects termination-envelope tampering', async () => {
+    const { auth } = await seedStandardTopology({ acquireLease: true, acceptSuccessor: true });
+    repo.claimExecutionAuthorization(auth.id, new Date().toISOString());
+    repo.claimAdapterExecutionStart({
+      authorizationId: auth.id,
+      executionId: 'exec-term-110',
+      expectedEpoch: 2,
+    });
+
+    repo.confirmExecutionTermination({
+      authorizationId: auth.id,
+      executionId: 'exec-term-110',
+      terminationStatus: 'CONFIRMED_TERMINATED',
+      terminationSource: 'PROCESS_EXIT_0',
+      terminationReason: 'EXECUTION_TIMEOUT',
+      terminationProofSource: 'LOCAL_PROCESS_EXIT',
+      terminationEvidenceJson: JSON.stringify({ code: 0 }),
+      confirmedAt: '2026-08-27T00:05:00.000Z',
+      terminatedAt: '2026-08-27T00:05:00.000Z',
+    });
+
+    // Case A: Tamper envelope JSON without recomputing hash
+    db.prepare("UPDATE execution_authorizations SET termination_evidence_json = '{\"tampered\": true}' WHERE id = ?").run(auth.id);
+    const resA = scanner.reconcileAuthorization(auth.id);
+    expect(resA.classification).toBe('AUTHORITY_CONFLICT');
+    expect(resA.disposition).toBe('REJECTED_INTEGRITY_CONFLICT');
+
+    // Case B: Tamper envelope JSON AND recompute hash (mismatch against DB column termination_reason)
+    const tamperedEnvelope = {
+      authorization_id: auth.id,
+      execution_id: 'exec-term-110',
+      termination_status: 'CONFIRMED_TERMINATED',
+      termination_source: 'PROCESS_EXIT_0',
+      termination_reason: 'EXECUTION_CANCELLED', // Tampered!
+      proof_source: 'LOCAL_PROCESS_EXIT',
+      confirmed_at: '2026-08-27T00:05:00.000Z',
+      terminated_at: '2026-08-27T00:05:00.000Z',
+      proof_payload: { code: 0 },
+    };
+    const tamperedJson = canonicalJsonStringify(tamperedEnvelope);
+    const tamperedHash = computeSha256(tamperedJson);
+
+    db.prepare("UPDATE execution_authorizations SET termination_evidence_json = ?, termination_evidence_hash = ? WHERE id = ?").run(
+      tamperedJson,
+      tamperedHash,
+      auth.id
+    );
+
+    const resB = scanner.reconcileAuthorization(auth.id);
+    expect(resB.classification).toBe('AUTHORITY_CONFLICT');
+    expect(resB.disposition).toBe('REJECTED_INTEGRITY_CONFLICT');
+    expect(resB.error).toContain('mismatch');
+  });
+
+  // 111. Account-to-provider mismatch blocks adapter-start claim with zero mutation
+  it('111. Account-to-provider mismatch blocks adapter-start claim with zero mutation', async () => {
+    const { auth } = await seedStandardTopology({ acquireLease: true, acceptSuccessor: true });
+    repo.claimExecutionAuthorization(auth.id, new Date().toISOString());
+
+    // Insert prov-b and account belonging to prov-b
+    db.prepare(`
+      INSERT INTO providers (id, name, adapter_type, enabled, created_at)
+      VALUES ('prov-b-111', 'Provider B 111', 'LOCAL_CLI', 1, ?)
+    `).run(new Date().toISOString());
+
+    db.prepare(`
+      INSERT INTO provider_accounts (id, provider_id, label, auth_mode, enabled, priority, health_status, concurrency_limit, created_at, updated_at)
+      VALUES ('acc-prov-b-111', 'prov-b-111', 'Account B 111', 'NATIVE_PROFILE', 1, 10, 'AVAILABLE', 2, ?, ?)
+    `).run(new Date().toISOString(), new Date().toISOString());
+
+    // Set auth and assignment account to acc-prov-b-111 while provider remains prov-a
+    db.prepare("UPDATE agent_assignments SET selected_account_id = 'acc-prov-b-111' WHERE id = 'asgn-succ'").run();
+    db.prepare("UPDATE execution_authorizations SET selected_account_id = 'acc-prov-b-111' WHERE id = ?").run(auth.id);
+
+    const claimRes = repo.claimAdapterExecutionStart({
+      authorizationId: auth.id,
+      executionId: 'exec-mismatch-111',
+      expectedEpoch: 2,
+    });
+
+    expect(claimRes.success).toBe(false);
+    expect(claimRes.error).toContain('PROVIDER_ACCOUNT_MISMATCH');
+
+    const checkAuth = repo.getExecutionAuthorization(auth.id)!;
+    expect(checkAuth.adapter_started_at).toBeNull();
+    const slot = repo.getWorkerSlot('slot-1')!;
+    expect(slot.current_execution_id).toBeNull();
+  });
+
+  // 112. Resource-to-provider mismatch blocks claim
+  it('112. Resource-to-provider mismatch blocks claim', async () => {
+    const { auth } = await seedStandardTopology({ acquireLease: true, acceptSuccessor: true });
+    repo.claimExecutionAuthorization(auth.id, new Date().toISOString());
+
+    // Insert prov-b and resource on prov-b
+    db.prepare(`
+      INSERT INTO providers (id, name, adapter_type, enabled, created_at)
+      VALUES ('prov-b-112', 'Provider B 112', 'LOCAL_CLI', 1, ?)
+    `).run(new Date().toISOString());
+
+    db.prepare(`
+      INSERT INTO provider_resources (id, provider_id, provider_account_id, model_name, health_status, capabilities_json, enabled, total_quota, remaining_quota, quota_unit, quota_source, quota_confidence, last_health_check)
+      VALUES ('res-prov-b-112', 'prov-b-112', 'acc-1', 'model-b', 'AVAILABLE', '["CODING"]', 1, 1000, 1000, 'REQUESTS', 'PROVIDER_REPORTED', 1.0, ?)
+    `).run(new Date().toISOString());
+
+    db.prepare("UPDATE agent_assignments SET selected_resource_id = 'res-prov-b-112' WHERE id = 'asgn-succ'").run();
+    db.prepare("UPDATE execution_authorizations SET selected_resource_id = 'res-prov-b-112' WHERE id = ?").run(auth.id);
+
+    const claimRes = repo.claimAdapterExecutionStart({
+      authorizationId: auth.id,
+      executionId: 'exec-mismatch-112',
+      expectedEpoch: 2,
+    });
+
+    expect(claimRes.success).toBe(false);
+    expect(claimRes.error).toContain('PROVIDER_RESOURCE_MISMATCH');
+
+    const checkAuth = repo.getExecutionAuthorization(auth.id)!;
+    expect(checkAuth.adapter_started_at).toBeNull();
+  });
+
+  // 113. Resource-to-account mismatch blocks claim
+  it('113. Resource-to-account mismatch blocks claim', async () => {
+    const { auth } = await seedStandardTopology({ acquireLease: true, acceptSuccessor: true });
+    repo.claimExecutionAuthorization(auth.id, new Date().toISOString());
+
+    // Insert acc-other-113 on prov-a
+    db.prepare(`
+      INSERT INTO provider_accounts (id, provider_id, label, auth_mode, enabled, priority, health_status, concurrency_limit, created_at, updated_at)
+      VALUES ('acc-other-113', 'prov-a', 'Other 113', 'NATIVE_PROFILE', 1, 10, 'AVAILABLE', 2, ?, ?)
+    `).run(new Date().toISOString(), new Date().toISOString());
+
+    // Update resource provider_account_id to acc-other-113 while auth is acc-1
+    db.prepare("UPDATE provider_resources SET provider_account_id = 'acc-other-113' WHERE id = 'res-1'").run();
+
+    const claimRes = repo.claimAdapterExecutionStart({
+      authorizationId: auth.id,
+      executionId: 'exec-mismatch-113',
+      expectedEpoch: 2,
+    });
+
+    expect(claimRes.success).toBe(false);
+    expect(claimRes.error).toContain('PROVIDER_RESOURCE_MISMATCH');
+
+    const checkAuth = repo.getExecutionAuthorization(auth.id)!;
+    expect(checkAuth.adapter_started_at).toBeNull();
+  });
+
+  // 114. Assignment-attempt mismatch blocks claim
+  it('114. Assignment-attempt mismatch blocks claim', async () => {
+    const { auth } = await seedStandardTopology({ acquireLease: true, acceptSuccessor: true });
+    repo.claimExecutionAuthorization(auth.id, new Date().toISOString());
+
+    // Insert separate attempt
+    repo.createTaskAttempt({
+      id: 'att-other-114',
+      task_id: auth.task_id,
+      attempt_number: 99,
+      status: 'PENDING',
+      agent_profile_id: 'agent-prof-1',
+      agent_id: null,
+      started_at: new Date().toISOString(),
+      ended_at: null,
+      summary: null,
+    });
+
+    // Update assignment to point to att-other-114 while auth points to att-succ
+    db.prepare("UPDATE agent_assignments SET attempt_id = 'att-other-114' WHERE id = 'asgn-succ'").run();
+
+    const claimRes = repo.claimAdapterExecutionStart({
+      authorizationId: auth.id,
+      executionId: 'exec-mismatch-114',
+      expectedEpoch: 2,
+    });
+
+    expect(claimRes.success).toBe(false);
+    expect(claimRes.error).toContain('ASSIGNMENT_BINDING_MISMATCH');
+
+    const checkAuth = repo.getExecutionAuthorization(auth.id)!;
+    expect(checkAuth.adapter_started_at).toBeNull();
+  });
+
+  // 115. Event insertion returning false bubbles from scanAndReconcile and rolls back
+  it('115. Event insertion returning false bubbles from scanAndReconcile and rolls back', async () => {
+    const { auth, leaseRes } = await seedStandardTopology({
+      taskId: 'tsk-115',
+      transferId: 'xfer-115',
+      asgnSuccId: 'asgn-115',
+      attemptSuccId: 'att-115',
+      asgnPredId: 'asgn-pred-115',
+      attemptPredId: 'att-pred-115',
+      acquireLease: true,
+      acceptSuccessor: true,
+    });
+    repo.claimExecutionAuthorization(auth.id, new Date().toISOString());
+    db.prepare("UPDATE account_leases SET expires_at = '2020-01-01T00:00:00.000Z' WHERE id = ?").run(leaseRes.lease.id);
+
+    const spy = vi.spyOn(repo, 'insertDeterministicEvent').mockReturnValue(false);
+
+    expect(() => {
+      scanner.scanAndReconcile();
+    }).toThrow(/RECOVERY_EVENT_INSERT_FAILED/);
+
+    const checkAuth = repo.getExecutionAuthorization(auth.id)!;
+    expect(checkAuth.status).toBe('DISPATCHED');
+    const transfer = repo.getHandoffTransferBySuccessorAuthId(auth.id)!;
+    expect(transfer.status).toBe('ACCEPTED');
+    spy.mockRestore();
+  });
+
+  // 116. Event insertion throwing bubbles from scanAndReconcile and rolls back
+  it('116. Event insertion throwing bubbles from scanAndReconcile and rolls back', async () => {
+    const { auth, leaseRes } = await seedStandardTopology({
+      taskId: 'tsk-116',
+      transferId: 'xfer-116',
+      asgnSuccId: 'asgn-116',
+      attemptSuccId: 'att-116',
+      asgnPredId: 'asgn-pred-116',
+      attemptPredId: 'att-pred-116',
+      acquireLease: true,
+      acceptSuccessor: true,
+    });
+    repo.claimExecutionAuthorization(auth.id, new Date().toISOString());
+    db.prepare("UPDATE account_leases SET expires_at = '2020-01-01T00:00:00.000Z' WHERE id = ?").run(leaseRes.lease.id);
+
+    const spy = vi.spyOn(repo, 'insertDeterministicEvent').mockImplementation(() => {
+      throw new Error('FATAL_EVENT_DISK_FULL');
+    });
+
+    expect(() => {
+      scanner.scanAndReconcile();
+    }).toThrow(/FATAL_EVENT_DISK_FULL/);
+
+    const checkAuth = repo.getExecutionAuthorization(auth.id)!;
+    expect(checkAuth.status).toBe('DISPATCHED');
+    const transfer = repo.getHandoffTransferBySuccessorAuthId(auth.id)!;
+    expect(transfer.status).toBe('ACCEPTED');
+    spy.mockRestore();
+  });
+
+  // 117. Missing transfer creates neither a recovery row nor an empty transfer ID
+  it('117. Missing transfer creates neither a recovery row nor an empty transfer ID', async () => {
+    const { auth } = await seedStandardTopology({
+      taskId: 'tsk-117',
+      transferId: 'xfer-117',
+      asgnSuccId: 'asgn-117',
+      attemptSuccId: 'att-117',
+      asgnPredId: 'asgn-pred-117',
+      attemptPredId: 'att-pred-117',
+    });
+
+    // Delete transfer to create orphan
+    db.prepare("DELETE FROM handoff_transfers WHERE id = 'xfer-117'").run();
+
+    expect(() => {
+      scanner.reconcileAuthorization(auth.id);
+    }).toThrow(new RegExp(`HandoffTransfer for successor authorization "${auth.id}" not found`));
+
+    const recoveryRows = db.prepare("SELECT * FROM execution_recovery_states WHERE authorization_id = ? OR transfer_id = ''").all(auth.id);
+    expect(recoveryRows.length).toBe(0);
   });
 });

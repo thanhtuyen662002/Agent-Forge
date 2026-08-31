@@ -1712,6 +1712,7 @@ export class Repository {
         if (
           assignment.task_id !== auth.task_id ||
           assignment.project_id !== auth.project_id ||
+          assignment.attempt_id !== auth.attempt_id ||
           assignment.selected_provider_id !== auth.selected_provider_id ||
           assignment.selected_resource_id !== auth.selected_resource_id ||
           assignment.selected_account_id !== auth.selected_account_id ||
@@ -1721,6 +1722,55 @@ export class Repository {
             success: false,
             alreadyClaimed: false,
             error: 'ASSIGNMENT_BINDING_MISMATCH: Assignment bindings do not match execution authorization.',
+          };
+        }
+
+        // Validate provider account exists and matches provider and authorization
+        const account = this.db
+          .prepare('SELECT id, provider_id FROM provider_accounts WHERE id = ?')
+          .get(auth.selected_account_id) as { id: string; provider_id: string } | undefined;
+        if (!account) {
+          return {
+            success: false,
+            alreadyClaimed: false,
+            error: `PROVIDER_ACCOUNT_NOT_FOUND: Account "${auth.selected_account_id}" not found.`,
+          };
+        }
+        if (
+          account.id !== auth.selected_account_id ||
+          account.id !== assignment.selected_account_id ||
+          account.provider_id !== auth.selected_provider_id ||
+          account.provider_id !== assignment.selected_provider_id
+        ) {
+          return {
+            success: false,
+            alreadyClaimed: false,
+            error: `PROVIDER_ACCOUNT_MISMATCH: Account "${account.id}" provider "${account.provider_id}" does not match authorization provider "${auth.selected_provider_id}".`,
+          };
+        }
+
+        // Validate provider resource exists and matches provider, authorization, and account (not null)
+        const resource = this.db
+          .prepare('SELECT id, provider_id, provider_account_id FROM provider_resources WHERE id = ?')
+          .get(auth.selected_resource_id) as { id: string; provider_id: string; provider_account_id: string | null } | undefined;
+        if (!resource) {
+          return {
+            success: false,
+            alreadyClaimed: false,
+            error: `PROVIDER_RESOURCE_NOT_FOUND: Resource "${auth.selected_resource_id}" not found.`,
+          };
+        }
+        if (
+          resource.id !== auth.selected_resource_id ||
+          resource.id !== assignment.selected_resource_id ||
+          resource.provider_id !== auth.selected_provider_id ||
+          resource.provider_account_id !== auth.selected_account_id ||
+          resource.provider_account_id === null
+        ) {
+          return {
+            success: false,
+            alreadyClaimed: false,
+            error: `PROVIDER_RESOURCE_MISMATCH: Resource "${resource.id}" bindings (provider: ${resource.provider_id}, account: ${resource.provider_account_id}) do not match authorization (provider: ${auth.selected_provider_id}, account: ${auth.selected_account_id}).`,
           };
         }
 
@@ -2836,25 +2886,38 @@ export class Repository {
             };
           }
 
-          const storedProofPayload =
-            storedEnvelope && typeof storedEnvelope === 'object' && 'proof_payload' in storedEnvelope
-              ? storedEnvelope.proof_payload
-              : storedEnvelope;
+          if (!storedEnvelope || typeof storedEnvelope !== 'object' || Array.isArray(storedEnvelope)) {
+            return {
+              success: false,
+              alreadyConfirmed: false,
+              error: 'TERMINATION_SOURCE_CONFLICT: Stored termination evidence is not an object.',
+            };
+          }
 
-          const expectedReconstructedEnvelope = {
-            authorization_id: auth.id,
-            execution_id: auth.execution_id,
-            termination_status: auth.termination_status,
-            termination_source: auth.termination_source,
-            termination_reason: auth.termination_reason,
-            proof_source: auth.termination_proof_source,
-            confirmed_at: auth.termination_confirmed_at,
-            terminated_at: auth.terminated_at,
-            proof_payload: storedProofPayload,
-          };
+          const requiredTermFields = [
+            'authorization_id',
+            'execution_id',
+            'termination_status',
+            'termination_source',
+            'termination_reason',
+            'proof_source',
+            'confirmed_at',
+            'terminated_at',
+            'proof_payload',
+          ];
+          for (const f of requiredTermFields) {
+            if (!Object.prototype.hasOwnProperty.call(storedEnvelope, f)) {
+              return {
+                success: false,
+                alreadyConfirmed: false,
+                error: `TERMINATION_SOURCE_CONFLICT: Stored termination evidence missing required envelope field "${f}".`,
+              };
+            }
+          }
 
-          const expectedEnvelopeHash = computeSha256(canonicalJsonStringify(expectedReconstructedEnvelope));
-          if (auth.termination_evidence_hash !== expectedEnvelopeHash) {
+          // Step 3: Recompute stored hash directly from the complete stored envelope BEFORE reconstructing or comparing anything
+          const storedEnvelopeHash = computeSha256(canonicalJsonStringify(storedEnvelope));
+          if (auth.termination_evidence_hash !== storedEnvelopeHash) {
             return {
               success: false,
               alreadyConfirmed: false,
@@ -2862,24 +2925,103 @@ export class Repository {
             };
           }
 
-          const sourceMatch = !params.terminationSource || auth.termination_source === params.terminationSource;
-          const reasonMatch = !params.terminationReason || auth.termination_reason === params.terminationReason;
-          const proofMatch = !params.terminationProofSource || auth.termination_proof_source === params.terminationProofSource;
-          const confirmedAtMatch = !params.confirmedAt || auth.termination_confirmed_at === params.confirmedAt;
-          const terminatedAtMatch = !params.terminatedAt || auth.terminated_at === params.terminatedAt;
-          const payloadMatch =
-            !parsedProofPayload ||
-            canonicalJsonStringify(parsedProofPayload) === canonicalJsonStringify(storedProofPayload) ||
-            auth.termination_evidence_hash === rawEvidenceHash;
-
-          if (sourceMatch && reasonMatch && proofMatch && confirmedAtMatch && terminatedAtMatch && payloadMatch) {
-            return { success: true, alreadyConfirmed: true };
+          // Step 4: Compare every stored envelope field unconditionally with the corresponding durable authorization columns
+          if (
+            storedEnvelope.authorization_id !== auth.id ||
+            storedEnvelope.execution_id !== auth.execution_id ||
+            storedEnvelope.termination_status !== auth.termination_status ||
+            storedEnvelope.termination_source !== auth.termination_source ||
+            storedEnvelope.termination_reason !== auth.termination_reason ||
+            storedEnvelope.proof_source !== auth.termination_proof_source ||
+            storedEnvelope.confirmed_at !== auth.termination_confirmed_at ||
+            storedEnvelope.terminated_at !== auth.terminated_at
+          ) {
+            return {
+              success: false,
+              alreadyConfirmed: false,
+              error: 'TERMINATION_SOURCE_CONFLICT: Stored termination envelope fields mismatch database record columns.',
+            };
           }
-          return {
-            success: false,
-            alreadyConfirmed: false,
-            error: `TERMINATION_SOURCE_CONFLICT: already confirmed, contradictory termination source/reason/proof/timestamps/evidence`,
-          };
+
+          // Step 5: Validate proof-source authority and timestamp monotonicity
+          if (
+            storedEnvelope.proof_source !== 'LOCAL_PROCESS_EXIT' &&
+            storedEnvelope.proof_source !== 'PROVIDER_FINAL_ACK'
+          ) {
+            return {
+              success: false,
+              alreadyConfirmed: false,
+              error: `TERMINATION_SOURCE_CONFLICT: Invalid proof source "${storedEnvelope.proof_source}".`,
+            };
+          }
+
+          if (!isValidIsoTimestamp(storedEnvelope.confirmed_at) || !isValidIsoTimestamp(storedEnvelope.terminated_at)) {
+            return {
+              success: false,
+              alreadyConfirmed: false,
+              error: 'TERMINATION_SOURCE_CONFLICT: Invalid ISO timestamps in stored envelope.',
+            };
+          }
+
+          if (new Date(storedEnvelope.terminated_at).getTime() > new Date(storedEnvelope.confirmed_at).getTime()) {
+            return {
+              success: false,
+              alreadyConfirmed: false,
+              error: 'TERMINATION_SOURCE_CONFLICT: Non-monotonic termination timestamps (terminated_at > confirmed_at).',
+            };
+          }
+
+          // Step 7: An idempotent replay may omit optional caller arguments only after the complete stored envelope and hash have been proven valid. Any supplied replay value must match exactly.
+          if (params.terminationSource !== undefined && params.terminationSource !== auth.termination_source) {
+            return {
+              success: false,
+              alreadyConfirmed: false,
+              error: `TERMINATION_SOURCE_CONFLICT: Supplied terminationSource "${params.terminationSource}" !== stored "${auth.termination_source}".`,
+            };
+          }
+          if (params.terminationReason !== undefined && params.terminationReason !== auth.termination_reason) {
+            return {
+              success: false,
+              alreadyConfirmed: false,
+              error: `TERMINATION_SOURCE_CONFLICT: Supplied terminationReason "${params.terminationReason}" !== stored "${auth.termination_reason}".`,
+            };
+          }
+          if (params.terminationProofSource !== undefined && params.terminationProofSource !== auth.termination_proof_source) {
+            return {
+              success: false,
+              alreadyConfirmed: false,
+              error: `TERMINATION_SOURCE_CONFLICT: Supplied terminationProofSource "${params.terminationProofSource}" !== stored "${auth.termination_proof_source}".`,
+            };
+          }
+          if (params.confirmedAt !== undefined && params.confirmedAt !== auth.termination_confirmed_at) {
+            return {
+              success: false,
+              alreadyConfirmed: false,
+              error: `TERMINATION_SOURCE_CONFLICT: Supplied confirmedAt "${params.confirmedAt}" !== stored "${auth.termination_confirmed_at}".`,
+            };
+          }
+          if (params.terminatedAt !== undefined && params.terminatedAt !== auth.terminated_at) {
+            return {
+              success: false,
+              alreadyConfirmed: false,
+              error: `TERMINATION_SOURCE_CONFLICT: Supplied terminatedAt "${params.terminatedAt}" !== stored "${auth.terminated_at}".`,
+            };
+          }
+          if (params.terminationEvidenceJson !== undefined) {
+            const suppliedPayload = parsedProofPayload;
+            if (
+              canonicalJsonStringify(suppliedPayload) !== canonicalJsonStringify(storedEnvelope.proof_payload) &&
+              rawEvidenceHash !== auth.termination_evidence_hash
+            ) {
+              return {
+                success: false,
+                alreadyConfirmed: false,
+                error: 'TERMINATION_SOURCE_CONFLICT: Supplied termination evidence payload mismatch.',
+              };
+            }
+          }
+
+          return { success: true, alreadyConfirmed: true };
         }
         return {
           success: false,
