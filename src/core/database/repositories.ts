@@ -2132,7 +2132,16 @@ export class Repository {
         let storedEvidence: any;
         try {
           storedEvidence = JSON.parse(auth.settlement_evidence_json);
-          const requiredKeys = [
+          if (!storedEvidence || typeof storedEvidence !== 'object' || Array.isArray(storedEvidence)) {
+            return {
+              success: false,
+              alreadySettled: false,
+              settledAt: auth.settled_at,
+              evidenceHash: auth.settlement_evidence_hash,
+              error: `SETTLEMENT_CONFLICT: Stored settlement evidence is not an object.`,
+            };
+          }
+          const requiredSettlementKeys = [
             'authorization_id',
             'execution_id',
             'transfer_id',
@@ -2151,9 +2160,20 @@ export class Repository {
             'started_at',
             'finished_at',
             'result_payload',
+            'error_json',
           ];
-          for (const key of requiredKeys) {
-            if (storedEvidence[key] === undefined) {
+          const storedKeys = Object.keys(storedEvidence);
+          if (storedKeys.length !== requiredSettlementKeys.length) {
+            return {
+              success: false,
+              alreadySettled: false,
+              settledAt: auth.settled_at,
+              evidenceHash: auth.settlement_evidence_hash,
+              error: `SETTLEMENT_CONFLICT: Stored settlement evidence contains invalid number of fields (${storedKeys.length} !== ${requiredSettlementKeys.length}).`,
+            };
+          }
+          for (const key of requiredSettlementKeys) {
+            if (!Object.prototype.hasOwnProperty.call(storedEvidence, key)) {
               return {
                 success: false,
                 alreadySettled: false,
@@ -2162,6 +2182,24 @@ export class Repository {
                 error: `SETTLEMENT_CONFLICT: Stored settlement evidence missing required key "${key}".`,
               };
             }
+          }
+          if (storedEvidence.error_json !== null && typeof storedEvidence.error_json !== 'string') {
+            return {
+              success: false,
+              alreadySettled: false,
+              settledAt: auth.settled_at,
+              evidenceHash: auth.settlement_evidence_hash,
+              error: `SETTLEMENT_CONFLICT: Stored settlement evidence error_json must be null or a string.`,
+            };
+          }
+          if ((storedEvidence.error_json ?? null) !== (auth.adapter_error_json ?? null)) {
+            return {
+              success: false,
+              alreadySettled: false,
+              settledAt: auth.settled_at,
+              evidenceHash: auth.settlement_evidence_hash,
+              error: `SETTLEMENT_CONFLICT: Stored settlement evidence error_json "${storedEvidence.error_json}" !== auth adapter_error_json "${auth.adapter_error_json}".`,
+            };
           }
           const computedStoredHash = computeSha256(canonicalJsonStringify(storedEvidence));
           if (computedStoredHash !== auth.settlement_evidence_hash) {
@@ -2240,18 +2278,42 @@ export class Repository {
           };
         }
 
-        const resource = this.getProviderResource(auth.selected_resource_id);
+        const account = this.db
+          .prepare('SELECT id, provider_id FROM provider_accounts WHERE id = ?')
+          .get(storedEvidence.account_id) as { id: string; provider_id: string } | undefined;
         if (
-          !resource ||
-          resource.provider_id !== storedEvidence.provider_id ||
-          (resource.provider_account_id && resource.provider_account_id !== storedEvidence.account_id)
+          !account ||
+          account.id !== auth.selected_account_id ||
+          account.provider_id !== storedEvidence.provider_id ||
+          account.provider_id !== auth.selected_provider_id
         ) {
           return {
             success: false,
             alreadySettled: false,
             settledAt: auth.settled_at,
             evidenceHash: auth.settlement_evidence_hash,
-            error: `SETTLEMENT_CONFLICT: Resource provider/account mismatch against stored evidence.`,
+            error: `SETTLEMENT_CONFLICT: Account missing or provider mismatch against stored evidence.`,
+          };
+        }
+
+        const resource = this.db
+          .prepare('SELECT id, provider_id, provider_account_id FROM provider_resources WHERE id = ?')
+          .get(storedEvidence.resource_id) as { id: string; provider_id: string; provider_account_id: string | null } | undefined;
+        if (
+          !resource ||
+          resource.id !== auth.selected_resource_id ||
+          resource.provider_id !== storedEvidence.provider_id ||
+          resource.provider_id !== auth.selected_provider_id ||
+          resource.provider_account_id === null ||
+          resource.provider_account_id !== storedEvidence.account_id ||
+          resource.provider_account_id !== auth.selected_account_id
+        ) {
+          return {
+            success: false,
+            alreadySettled: false,
+            settledAt: auth.settled_at,
+            evidenceHash: auth.settlement_evidence_hash,
+            error: `SETTLEMENT_CONFLICT: Resource missing or provider/account mismatch against stored evidence.`,
           };
         }
 
@@ -2285,6 +2347,15 @@ export class Repository {
             settledAt: auth.settled_at,
             evidenceHash: auth.settlement_evidence_hash,
             error: `SETTLEMENT_CONFLICT: Supplied finishedAt "${params.finishedAt}" !== stored finished_at "${storedEvidence.finished_at}".`,
+          };
+        }
+        if (params.errorJson !== undefined && (params.errorJson ?? null) !== (storedEvidence.error_json ?? null)) {
+          return {
+            success: false,
+            alreadySettled: false,
+            settledAt: auth.settled_at,
+            evidenceHash: auth.settlement_evidence_hash,
+            error: `SETTLEMENT_CONFLICT: Supplied errorJson mismatch against stored evidence.`,
           };
         }
 
@@ -2501,16 +2572,64 @@ export class Repository {
           error: `BINDING_MISMATCH: Assignment selected_account_id "${assignment.selected_account_id}" !== auth selected_account_id "${auth.selected_account_id}".`,
         };
       }
-      const resource = this.getProviderResource(auth.selected_resource_id);
-      if (!resource || resource.provider_id !== auth.selected_provider_id || (resource.provider_account_id && resource.provider_account_id !== auth.selected_account_id)) {
+
+      // Validate provider account exists and matches provider
+      const account = this.db
+        .prepare('SELECT id, provider_id FROM provider_accounts WHERE id = ?')
+        .get(auth.selected_account_id) as { id: string; provider_id: string } | undefined;
+      if (!account) {
         return {
           success: false,
           alreadySettled: false,
           settledAt: '',
           evidenceHash: '',
-          error: `BINDING_MISMATCH: Resource account "${resource?.provider_account_id}" or provider "${resource?.provider_id}" !== auth.`,
+          error: `PROVIDER_ACCOUNT_NOT_FOUND: Account "${auth.selected_account_id}" not found.`,
         };
       }
+      if (
+        account.id !== auth.selected_account_id ||
+        account.id !== assignment.selected_account_id ||
+        account.provider_id !== auth.selected_provider_id ||
+        account.provider_id !== assignment.selected_provider_id
+      ) {
+        return {
+          success: false,
+          alreadySettled: false,
+          settledAt: '',
+          evidenceHash: '',
+          error: `BINDING_MISMATCH: PROVIDER_ACCOUNT_MISMATCH: Account "${account.id}" provider "${account.provider_id}" does not match authorization provider "${auth.selected_provider_id}".`,
+        };
+      }
+
+      // Validate provider resource exists and matches provider and non-null account
+      const resource = this.db
+        .prepare('SELECT id, provider_id, provider_account_id FROM provider_resources WHERE id = ?')
+        .get(auth.selected_resource_id) as { id: string; provider_id: string; provider_account_id: string | null } | undefined;
+      if (!resource) {
+        return {
+          success: false,
+          alreadySettled: false,
+          settledAt: '',
+          evidenceHash: '',
+          error: `BINDING_MISMATCH: PROVIDER_RESOURCE_NOT_FOUND: Resource "${auth.selected_resource_id}" not found.`,
+        };
+      }
+      if (
+        resource.id !== auth.selected_resource_id ||
+        resource.id !== assignment.selected_resource_id ||
+        resource.provider_id !== auth.selected_provider_id ||
+        resource.provider_account_id === null ||
+        resource.provider_account_id !== auth.selected_account_id
+      ) {
+        return {
+          success: false,
+          alreadySettled: false,
+          settledAt: '',
+          evidenceHash: '',
+          error: `BINDING_MISMATCH: PROVIDER_RESOURCE_MISMATCH: Resource "${resource.id}" bindings (provider: ${resource.provider_id}, account: ${resource.provider_account_id}) do not match authorization (provider: ${auth.selected_provider_id}, account: ${auth.selected_account_id}).`,
+        };
+      }
+
       if (assignment.routing_decision_id !== auth.routing_decision_id) {
         return {
           success: false,
@@ -2905,6 +3024,14 @@ export class Repository {
             'terminated_at',
             'proof_payload',
           ];
+          const storedKeys = Object.keys(storedEnvelope);
+          if (storedKeys.length !== requiredTermFields.length) {
+            return {
+              success: false,
+              alreadyConfirmed: false,
+              error: `TERMINATION_SOURCE_CONFLICT: Stored termination envelope contains invalid number of fields (${storedKeys.length} !== ${requiredTermFields.length}).`,
+            };
+          }
           for (const f of requiredTermFields) {
             if (!Object.prototype.hasOwnProperty.call(storedEnvelope, f)) {
               return {

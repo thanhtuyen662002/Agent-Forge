@@ -36,7 +36,8 @@ export class ExecutionRecoveryScanner {
       .prepare(`
         SELECT ea.id as authorization_id
         FROM execution_authorizations ea
-        JOIN handoff_transfers ht ON ht.successor_authorization_id = ea.id
+        LEFT JOIN handoff_transfers ht ON ht.successor_authorization_id = ea.id
+        WHERE ea.lifecycle_version = 1 OR ht.id IS NOT NULL
         ORDER BY ea.created_at ASC, ea.id ASC
       `)
       .all() as Array<{ authorization_id: string }>;
@@ -257,10 +258,15 @@ export class ExecutionRecoveryScanner {
                 'error_json',
               ];
 
-              for (const f of requiredSettlementFields) {
-                if (!Object.prototype.hasOwnProperty.call(parsedSettlementEvidence, f)) {
-                  bindingConflictReason = `Settlement evidence missing required field "${f}".`;
-                  break;
+              const storedSettlementKeys = Object.keys(parsedSettlementEvidence);
+              if (storedSettlementKeys.length !== requiredSettlementFields.length) {
+                bindingConflictReason = `Settlement evidence contains invalid number of fields (${storedSettlementKeys.length} !== ${requiredSettlementFields.length}).`;
+              } else {
+                for (const f of requiredSettlementFields) {
+                  if (!Object.prototype.hasOwnProperty.call(parsedSettlementEvidence, f)) {
+                    bindingConflictReason = `Settlement evidence missing required field "${f}".`;
+                    break;
+                  }
                 }
               }
 
@@ -287,6 +293,14 @@ export class ExecutionRecoveryScanner {
                     bindingConflictReason = `Settlement evidence field "${f}" is empty or not a string.`;
                     break;
                   }
+                }
+              }
+
+              if (!bindingConflictReason) {
+                if (parsedSettlementEvidence.error_json !== null && typeof parsedSettlementEvidence.error_json !== 'string') {
+                  bindingConflictReason = `Settlement evidence error_json must be null or a string.`;
+                } else if ((parsedSettlementEvidence.error_json ?? null) !== (auth.adapter_error_json ?? null)) {
+                  bindingConflictReason = `Settlement evidence error_json mismatch: auth "${auth.adapter_error_json}" !== evidence "${parsedSettlementEvidence.error_json}".`;
                 }
               }
 
@@ -396,10 +410,15 @@ export class ExecutionRecoveryScanner {
                 'terminated_at',
                 'proof_payload',
               ];
-              for (const f of requiredTermFields) {
-                if (!Object.prototype.hasOwnProperty.call(parsedTerm, f)) {
-                  bindingConflictReason = `Termination envelope missing required field "${f}".`;
-                  break;
+              const storedTermKeys = Object.keys(parsedTerm);
+              if (storedTermKeys.length !== requiredTermFields.length) {
+                bindingConflictReason = `Termination envelope contains invalid number of fields (${storedTermKeys.length} !== ${requiredTermFields.length}).`;
+              } else {
+                for (const f of requiredTermFields) {
+                  if (!Object.prototype.hasOwnProperty.call(parsedTerm, f)) {
+                    bindingConflictReason = `Termination envelope missing required field "${f}".`;
+                    break;
+                  }
                 }
               }
 
