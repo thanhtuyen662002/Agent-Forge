@@ -1175,6 +1175,9 @@ export class RoleAwareRoutingService {
         `Role-aware routing decision: ${decision.outcome} for role ${decision.role} on task ${request.taskId} (${decision.reason})`,
         {
           decisionId: decision.decisionId,
+          projectId: request.projectId,
+          taskId: request.taskId,
+          attemptId: request.attemptId ?? null,
           roleProfileId: decision.roleProfileId,
           role: decision.role,
           outcome: decision.outcome,
