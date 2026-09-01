@@ -882,6 +882,74 @@ describe('R5I7 Cross-Provider Handoff Evidence and Closure Integration Suite', (
     };
   }
 
+  // Reusable complete authority graph capture helper for fail-closed tests
+  function captureAuthorityGraphSnapshot(database: Database.Database, flow: ProductionHandoffContext) {
+    const snapshotId = flow.transfer.successor_context_snapshot_id ?? '';
+    return {
+      task: database.prepare('SELECT * FROM tasks WHERE id = ?').get(flow.taskId),
+      transfer: database.prepare('SELECT * FROM handoff_transfers WHERE id = ?').get(flow.transferId),
+      attempt: database.prepare('SELECT * FROM task_attempts WHERE id = ?').get(flow.succAttId!),
+      assignment: database.prepare('SELECT * FROM agent_assignments WHERE id = ?').get(flow.succAsgnId!),
+      auth: database.prepare('SELECT * FROM execution_authorizations WHERE id = ?').get(flow.authorizationId!),
+      lease: database.prepare('SELECT * FROM account_leases WHERE id = ?').get(flow.leaseId!),
+      slot: database.prepare('SELECT * FROM worker_slots WHERE id = ?').get(flow.slotBId),
+      contextSnapshot: database.prepare('SELECT * FROM context_snapshots WHERE id = ?').get(snapshotId),
+      contextItems: database.prepare('SELECT * FROM context_items WHERE snapshot_id = ? ORDER BY id').all(snapshotId),
+      contextManifest: database.prepare('SELECT * FROM context_manifests WHERE snapshot_id = ?').get(snapshotId),
+      events: database.prepare('SELECT * FROM events WHERE project_id = ? ORDER BY id').all(flow.projectId),
+    };
+  }
+
+  // Reusable complete domain capture helper for replay tests
+  function captureFullDomainSnapshot(database: Database.Database) {
+    return {
+      projects: database.prepare('SELECT * FROM projects ORDER BY id').all(),
+      tasks: database.prepare('SELECT * FROM tasks ORDER BY id').all(),
+      protocol_messages: database.prepare('SELECT * FROM protocol_messages ORDER BY id').all(),
+      handoff_transfers: database.prepare('SELECT * FROM handoff_transfers ORDER BY id').all(),
+      task_attempts: database.prepare('SELECT * FROM task_attempts ORDER BY id').all(),
+      agent_assignments: database.prepare('SELECT * FROM agent_assignments ORDER BY id').all(),
+      execution_authorizations: database.prepare('SELECT * FROM execution_authorizations ORDER BY id').all(),
+      account_leases: database.prepare('SELECT * FROM account_leases ORDER BY id').all(),
+      worker_slots: database.prepare('SELECT * FROM worker_slots ORDER BY id').all(),
+      events: database.prepare('SELECT * FROM events ORDER BY id').all(),
+      context_snapshots: database.prepare('SELECT * FROM context_snapshots ORDER BY id').all(),
+      context_items: database.prepare('SELECT * FROM context_items ORDER BY id').all(),
+      context_manifests: database.prepare('SELECT * FROM context_manifests ORDER BY id').all(),
+      execution_recovery_states: database.prepare('SELECT * FROM execution_recovery_states ORDER BY id').all(),
+    };
+  }
+
+  // Reusable complete Project-2 isolation snapshot helper
+  function captureProject2IsolationSnapshot(database: Database.Database, p2Flow: ProductionHandoffContext) {
+    const p2Snapshots = database.prepare('SELECT * FROM context_snapshots WHERE task_id = ? ORDER BY id').all(p2Flow.taskId);
+    const p2SnapshotIds = p2Snapshots.map((s: any) => s.id);
+    const snapInClause = p2SnapshotIds.length > 0 ? `(${p2SnapshotIds.map(() => '?').join(',')})` : "('')";
+
+    return {
+      project: database.prepare('SELECT * FROM projects WHERE id = ?').get(p2Flow.projectId),
+      tasks: database.prepare('SELECT * FROM tasks WHERE project_id = ? ORDER BY id').all(p2Flow.projectId),
+      attempts: database.prepare('SELECT * FROM task_attempts WHERE task_id = ? ORDER BY id').all(p2Flow.taskId),
+      assignments: database.prepare('SELECT * FROM agent_assignments WHERE project_id = ? ORDER BY id').all(p2Flow.projectId),
+      transfers: database.prepare('SELECT * FROM handoff_transfers WHERE task_id = ? ORDER BY id').all(p2Flow.taskId),
+      authorizations: database.prepare('SELECT * FROM execution_authorizations WHERE project_id = ? ORDER BY id').all(p2Flow.projectId),
+      protocol_messages: database.prepare('SELECT * FROM protocol_messages WHERE project_id = ? ORDER BY id').all(p2Flow.projectId),
+      events: database.prepare('SELECT * FROM events WHERE project_id = ? ORDER BY id').all(p2Flow.projectId),
+      accounts: database.prepare('SELECT * FROM provider_accounts WHERE id IN (?, ?) ORDER BY id').all(p2Flow.accountAId, p2Flow.accountBId),
+      resources: database.prepare('SELECT * FROM provider_resources WHERE id IN (?, ?) ORDER BY id').all(p2Flow.resourceAId, p2Flow.resourceBId),
+      slots: database.prepare('SELECT * FROM worker_slots WHERE provider_account_id IN (?, ?) ORDER BY id').all(p2Flow.accountAId, p2Flow.accountBId),
+      leases: database.prepare('SELECT * FROM account_leases WHERE provider_account_id IN (?, ?) ORDER BY id').all(p2Flow.accountAId, p2Flow.accountBId),
+      contextSnapshots: p2Snapshots,
+      contextItems: p2SnapshotIds.length > 0
+        ? database.prepare(`SELECT * FROM context_items WHERE snapshot_id IN ${snapInClause} ORDER BY id`).all(...p2SnapshotIds)
+        : [],
+      contextManifests: p2SnapshotIds.length > 0
+        ? database.prepare(`SELECT * FROM context_manifests WHERE snapshot_id IN ${snapInClause} ORDER BY id`).all(...p2SnapshotIds)
+        : [],
+      recoveryStates: database.prepare('SELECT * FROM execution_recovery_states WHERE authorization_id = ? ORDER BY id').all(p2Flow.authorizationId!),
+    };
+  }
+
   // 1. Provider A owns and executes predecessor attempt N
   it('1. Provider A owns and executes predecessor attempt N', async () => {
     const topo = await seedClosureTopology({ seedPredecessorAuth: true });
@@ -1064,11 +1132,13 @@ describe('R5I7 Cross-Provider Handoff Evidence and Closure Integration Suite', (
       stopAt: 'RELINQUISHED',
     });
 
-    const predAuthBefore = repo.getExecutionAuthorization(flow.predAuthId!)!;
-    expect(predAuthBefore.status).toBe('DISPATCHED');
-    expect(predAuthBefore.adapter_started_at).toBeNull();
-    const predAsgnBefore = repo.getAgentAssignment(flow.predAsgnId)!;
-    expect(predAsgnBefore.status).toBe('HANDED_OFF');
+    // Snapshot predecessor authorization and assignment after relinquishment and before stale claim
+    const predAuthSnapshot = repo.getExecutionAuthorization(flow.predAuthId!)!;
+    const predAsgnSnapshot = repo.getAgentAssignment(flow.predAsgnId)!;
+
+    expect(predAuthSnapshot.status).toBe('DISPATCHED');
+    expect(predAuthSnapshot.adapter_started_at).toBeNull();
+    expect(predAsgnSnapshot.status).toBe('HANDED_OFF');
 
     // Attempt adapter-start claim with stale epoch 1 fails specifically identifying epoch authority
     const startClaimRes = repo.claimAdapterExecutionStart({
@@ -1084,13 +1154,22 @@ describe('R5I7 Cross-Provider Handoff Evidence and Closure Integration Suite', (
     expect(dispatchRes.status).toBe('FAILED');
     expect(adapterA.invocationCount).toBe(0);
 
-    // Assert exact preservation of authorization, assignment, and adapter-start state
+    // Deep-compare authorization and assignment after both rejected operations against pre-operation snapshots
     const predAuthAfter = repo.getExecutionAuthorization(flow.predAuthId!)!;
-    expect(predAuthAfter.status).toBe('DISPATCHED');
-    expect(predAuthAfter.adapter_started_at).toBeNull();
-    expect(predAuthAfter.settled_at).toBeNull();
     const predAsgnAfter = repo.getAgentAssignment(flow.predAsgnId)!;
-    expect(predAsgnAfter.status).toBe('HANDED_OFF');
+    expect(predAuthAfter).toEqual(predAuthSnapshot);
+    expect(predAsgnAfter).toEqual(predAsgnSnapshot);
+
+    // Assert no execution ID, adapter-start timestamp, finish timestamp, settlement evidence or settlement event is created
+    expect(predAuthAfter.execution_id).toBeNull();
+    expect(predAuthAfter.adapter_started_at).toBeNull();
+    expect(predAuthAfter.adapter_finished_at).toBeNull();
+    expect(predAuthAfter.settlement_evidence_json).toBeNull();
+    expect(predAuthAfter.settlement_evidence_hash).toBeNull();
+    expect(predAuthAfter.settled_at).toBeNull();
+
+    const settlementEvents = db.prepare("SELECT * FROM events WHERE project_id = ? AND type LIKE 'HANDOFF_SUCCESSOR_EXECUTION_%'").all(flow.projectId);
+    expect(settlementEvents.length).toBe(0);
   });
 
   // 10. Adapter-start claim invokes Provider B exactly once
@@ -1163,8 +1242,36 @@ describe('R5I7 Cross-Provider Handoff Evidence and Closure Integration Suite', (
     expect(adapterB.invocationCount).toBe(1);
     expect(adapterA.invocationCount).toBe(0);
 
-    // Assert durable settlement evidence is stamped authentically and canonical evidence hash verifies
     const auth = repo.getExecutionAuthorization(flow.authorizationId!)!;
+    const providerResult = flow.schedulerResult!.providerResult!;
+    const prov = providerResult.providerExecutionProvenance!;
+
+    // Assert authentic Provider B provenance stamped on providerResult
+    expect(prov).toBeDefined();
+    expect(prov.version).toBe(1);
+    expect(prov.source).toBe('PROVIDER_DISPATCH_SERVICE');
+    expect(prov.mode).toBe('SCHEDULED');
+    expect(prov.adapterInvocation).toBe('RETURNED');
+    expect(prov.authorizationId).toBe(flow.authorizationId);
+    expect(prov.executionId).toBe(auth.execution_id);
+    expect(prov.projectId).toBe(flow.projectId);
+    expect(prov.taskId).toBe(flow.taskId);
+    expect(prov.attemptId).toBe(flow.succAttId);
+    expect(prov.routingDecisionId).toBe(flow.routingDecisionId);
+    expect(prov.providerId).toBe(providerBId);
+    expect(prov.accountId).toBe(flow.accountBId);
+    expect(prov.resourceId).toBe(flow.resourceBId);
+    expect(prov.assignmentId).toBe(flow.succAsgnId);
+
+    // Assert none of the spoofed Provider-A values survive in the trusted provenance
+    expect(prov.providerId).not.toBe(providerAId);
+    expect(prov.accountId).not.toBe('spoofed-acc');
+    expect(prov.resourceId).not.toBe('spoofed-res');
+    expect(prov.authorizationId).not.toBe('spoofed-auth-id');
+    expect(prov.executionId).not.toBe('spoofed-exec-id');
+    expect(prov.assignmentId).not.toBe('spoofed-asgn-id');
+
+    // Assert durable settlement evidence JSON
     const evidence = JSON.parse(auth.settlement_evidence_json!);
     expect(evidence.provider_id).toBe(providerBId);
     expect(evidence.account_id).toBe(flow.accountBId);
@@ -1172,6 +1279,9 @@ describe('R5I7 Cross-Provider Handoff Evidence and Closure Integration Suite', (
     expect(evidence.assignment_id).toBe(flow.succAsgnId);
     expect(evidence.authorization_id).toBe(flow.authorizationId);
     expect(evidence.provider_id).not.toBe(providerAId);
+
+    // Assert settlement_evidence_json.result_payload does not contain adapter-supplied providerExecutionProvenance
+    expect((evidence.result_payload as any).providerExecutionProvenance).toBeUndefined();
 
     const recomputedHash = computeSha256(canonicalJsonStringify(evidence));
     expect(auth.settlement_evidence_hash).toBe(recomputedHash);
@@ -1222,32 +1332,76 @@ describe('R5I7 Cross-Provider Handoff Evidence and Closure Integration Suite', (
       expect(auth.settlement_evidence_json).toBeDefined();
       expect(auth.settlement_evidence_hash).toBeDefined();
 
-      // 2. Canonical settlement evidence hash integrity
+      // 2. Validate canonical settlement evidence against durable graph bindings
       const evidence = JSON.parse(auth.settlement_evidence_json!);
-      expect(computeSha256(canonicalJsonStringify(evidence))).toBe(auth.settlement_evidence_hash);
+      expect(evidence.authorization_id).toBe(auth.id);
+      expect(evidence.execution_id).toBe(auth.execution_id);
+      expect(evidence.transfer_id).toBe(flow.transferId);
+      expect(evidence.project_id).toBe(flow.projectId);
+      expect(evidence.task_id).toBe(flow.taskId);
+      expect(evidence.attempt_id).toBe(flow.succAttId);
+      expect(evidence.assignment_id).toBe(flow.succAsgnId);
+      expect(evidence.provider_id).toBe(providerBId);
+      expect(evidence.account_id).toBe(flow.accountBId);
+      expect(evidence.resource_id).toBe(flow.resourceBId);
+      expect(evidence.routing_decision_id).toBe(flow.routingDecisionId);
+      expect(evidence.ownership_epoch).toBe(2);
+      expect(evidence.lifecycle_version).toBe(1);
+      expect(evidence.settlement_status).toBe(status);
+      expect(evidence.outcome).toBe(outcome);
 
-      // 3. handoff_transfers terminal state
-      expect(transfer.status).toBe(status);
-      expect(transfer.completed_at).toBeDefined();
+      // Validate finished_at >= started_at
+      expect(new Date(evidence.finished_at).getTime()).toBeGreaterThanOrEqual(new Date(evidence.started_at).getTime());
 
-      // 4. task_attempts terminal state
-      expect(attempt.status).toBe(status);
-      expect(attempt.ended_at).toBeDefined();
+      // Validate error_json domain
+      if (status === 'COMPLETED') {
+        expect(evidence.error_json).toBeNull();
+      } else {
+        expect(evidence.error_json).toBeDefined();
+      }
 
-      // 5. agent_assignments terminal state
-      expect(assignment.status).toBe(status);
-      expect(assignment.ended_at).toBeDefined();
+      // Recomputed SHA-256 canonical hash verification
+      const canonicalHash = computeSha256(canonicalJsonStringify(evidence));
+      expect(auth.settlement_evidence_hash).toBe(canonicalHash);
 
-      // 6. Runtime execution result event recorded
+      // 3. Deterministic settlement event verification
+      const derivedEventId = 'evt-res-' + computeSha256(`${auth.id}:${auth.execution_id}:${auth.settlement_evidence_hash}`).slice(0, 32);
+      const eventType = status === 'COMPLETED'
+        ? 'HANDOFF_SUCCESSOR_EXECUTION_COMPLETED'
+        : status === 'CANCELLED'
+        ? 'HANDOFF_SUCCESSOR_EXECUTION_CANCELLED'
+        : 'HANDOFF_SUCCESSOR_EXECUTION_FAILED';
+
+      const detEvent = db.prepare('SELECT * FROM events WHERE id = ?').get(derivedEventId) as any;
+      expect(detEvent).toBeDefined();
+      expect(detEvent.type).toBe(eventType);
+      expect(detEvent.project_id).toBe(flow.projectId);
+      expect(detEvent.task_id).toBe(flow.taskId);
+      expect(detEvent.structured_payload_json).toBe(auth.settlement_evidence_json);
+
+      const allDetEvents = db.prepare("SELECT * FROM events WHERE project_id = ? AND type LIKE 'HANDOFF_SUCCESSOR_EXECUTION_%'").all(flow.projectId);
+      expect(allDetEvents.length).toBe(1);
+
+      // 4. Runtime execution result event
       const executionEvents = db.prepare('SELECT * FROM events WHERE project_id = ? AND type = ?').all(
         flow.projectId,
         'PROVIDER_RUNTIME_EXECUTION_RESULT'
       );
       expect(executionEvents.length).toBe(1);
-      const evPayload = JSON.parse((executionEvents[0] as any).structured_payload_json);
-      expect(evPayload.status).toBe(status);
 
-      // 7. Active lease released and matching slot returned to IDLE
+      // 5. handoff_transfers terminal state
+      expect(transfer.status).toBe(status);
+      expect(transfer.completed_at).toBeDefined();
+
+      // 6. task_attempts terminal state
+      expect(attempt.status).toBe(status);
+      expect(attempt.ended_at).toBeDefined();
+
+      // 7. agent_assignments terminal state
+      expect(assignment.status).toBe(status);
+      expect(assignment.ended_at).toBeDefined();
+
+      // 8. Active lease released and matching slot returned to IDLE
       const activeLease = repo.getActiveLeaseForAssignment(flow.succAsgnId!);
       expect(activeLease).toBeNull();
       const slotB = repo.getWorkerSlot(flow.slotBId)!;
@@ -1255,7 +1409,7 @@ describe('R5I7 Cross-Provider Handoff Evidence and Closure Integration Suite', (
       expect(slotB.current_assignment_id).toBeNull();
       expect(slotB.current_execution_id).toBeNull();
 
-      // 8. Unrelated slot remains IDLE
+      // 9. Unrelated slot remains IDLE
       const slotA = repo.getWorkerSlot(flow.slotAId)!;
       expect(slotA.status).toBe('IDLE');
     }
@@ -1288,14 +1442,8 @@ describe('R5I7 Cross-Provider Handoff Evidence and Closure Integration Suite', (
     expect(flow.schedulerResult!.status).toBe('COMPLETED');
     expect(adapterB.invocationCount).toBe(1);
 
-    // Snapshot counts and durable records after initial full execution
-    const initialTransfers = db.prepare('SELECT * FROM handoff_transfers ORDER BY id').all();
-    const initialAttempts = db.prepare('SELECT * FROM task_attempts ORDER BY id').all();
-    const initialAssignments = db.prepare('SELECT * FROM agent_assignments ORDER BY id').all();
-    const initialAuths = db.prepare('SELECT * FROM execution_authorizations ORDER BY id').all();
-    const initialEvents = db.prepare('SELECT * FROM events ORDER BY id').all();
-    const initialContextSnapshots = db.prepare('SELECT * FROM context_snapshots ORDER BY id').all();
-    const initialManifests = db.prepare('SELECT * FROM context_manifests ORDER BY id').all();
+    // Snapshot complete domain before replay
+    const initialSnapshot = captureFullDomainSnapshot(db);
     const initialAdapterCount = adapterB.invocationCount;
 
     // Replay through public workflow methods with identical request ID and inputs
@@ -1322,6 +1470,9 @@ describe('R5I7 Cross-Provider Handoff Evidence and Closure Integration Suite', (
       quiescingAt: new Date().toISOString(),
     });
     expect(replayQuiesce.success).toBe(false);
+
+    const readOnlyQuiesceEval = handoffService.evaluatePredecessorQuiescence(flow.transferId);
+    expect(readOnlyQuiesceEval).toBeDefined();
 
     const replayRelinquish = handoffService.relinquishPredecessorOwnership({
       transferId: flow.transferId,
@@ -1363,24 +1514,10 @@ describe('R5I7 Cross-Provider Handoff Evidence and Closure Integration Suite', (
     expect(replayDispatch.status).toBe('FAILED');
     expect(replayDispatch.errorCode).toBe('RECOVERY_FENCED');
 
-    // Assert zero mutations to any tables, identical records, and zero additional adapter calls
-    const finalTransfers = db.prepare('SELECT * FROM handoff_transfers ORDER BY id').all();
-    const finalAttempts = db.prepare('SELECT * FROM task_attempts ORDER BY id').all();
-    const finalAssignments = db.prepare('SELECT * FROM agent_assignments ORDER BY id').all();
-    const finalAuths = db.prepare('SELECT * FROM execution_authorizations ORDER BY id').all();
-    const finalEvents = db.prepare('SELECT * FROM events ORDER BY id').all();
-    const finalContextSnapshots = db.prepare('SELECT * FROM context_snapshots ORDER BY id').all();
-    const finalManifests = db.prepare('SELECT * FROM context_manifests ORDER BY id').all();
-    const finalAdapterCount = adapterB.invocationCount;
-
-    expect(finalTransfers).toEqual(initialTransfers);
-    expect(finalAttempts).toEqual(initialAttempts);
-    expect(finalAssignments).toEqual(initialAssignments);
-    expect(finalAuths).toEqual(initialAuths);
-    expect(finalEvents).toEqual(initialEvents);
-    expect(finalContextSnapshots).toEqual(initialContextSnapshots);
-    expect(finalManifests).toEqual(initialManifests);
-    expect(finalAdapterCount).toBe(initialAdapterCount);
+    // Deep-compare every domain table before and after replay
+    const finalSnapshot = captureFullDomainSnapshot(db);
+    expect(finalSnapshot).toEqual(initialSnapshot);
+    expect(adapterB.invocationCount).toBe(initialAdapterCount);
   });
 
   // 16. Stale ownership epoch and corrupted provider/account/resource bindings fail before adapter invocation with zero authority mutation
@@ -1395,14 +1532,7 @@ describe('R5I7 Cross-Provider Handoff Evidence and Closure Integration Suite', (
       // Adversarial corruption: Mutate task ownership epoch to stale value
       db.prepare('UPDATE tasks SET ownership_epoch = 99 WHERE id = ?').run(flow.taskId);
 
-      const preDispatchSnapshot = {
-        transfer: repo.getHandoffTransfer(flow.transferId)!,
-        attempt: repo.getTaskAttempt(flow.succAttId!)!,
-        assignment: repo.getAgentAssignment(flow.succAsgnId!)!,
-        auth: repo.getExecutionAuthorization(flow.authorizationId!)!,
-        lease: repo.getActiveLeaseForAssignment(flow.succAsgnId!)!,
-        slot: repo.getWorkerSlot(flow.slotBId)!,
-      };
+      const preSnapshot = captureAuthorityGraphSnapshot(db, flow);
 
       const res = await dispatchService.dispatch(flow.authorizationId!);
       expect(res.status).toBe('FAILED');
@@ -1410,17 +1540,38 @@ describe('R5I7 Cross-Provider Handoff Evidence and Closure Integration Suite', (
       expect(res.error).toContain('does not match authorization authority');
       expect(adapterB.invocationCount).toBe(0);
 
-      const postAuth = repo.getExecutionAuthorization(flow.authorizationId!)!;
-      expect(postAuth.adapter_started_at).toBeNull();
-      expect(postAuth.settlement_status).toBeNull();
-      expect(postAuth.settled_at).toBeNull();
+      const postSnapshot = captureAuthorityGraphSnapshot(db, flow);
 
-      expect(repo.getHandoffTransfer(flow.transferId)!).toEqual(preDispatchSnapshot.transfer);
-      expect(repo.getTaskAttempt(flow.succAttId!)!).toEqual(preDispatchSnapshot.attempt);
-      expect(repo.getAgentAssignment(flow.succAsgnId!)!).toEqual(preDispatchSnapshot.assignment);
+      // Assert no execution ID, adapter-start, or settlement timestamps gained
+      const postAuth = postSnapshot.auth as any;
+      expect(postAuth.execution_id).toBeNull();
+      expect(postAuth.adapter_started_at).toBeNull();
+      expect(postAuth.adapter_finished_at).toBeNull();
+      expect(postAuth.settled_at).toBeNull();
+      expect(postAuth.settlement_status).toBeNull();
+
+      // Deep compare graph authorities
+      expect(postSnapshot.task).toEqual(preSnapshot.task);
+      expect(postSnapshot.transfer).toEqual(preSnapshot.transfer);
+      expect(postSnapshot.attempt).toEqual(preSnapshot.attempt);
+      expect(postSnapshot.assignment).toEqual(preSnapshot.assignment);
+      expect(postSnapshot.lease).toEqual(preSnapshot.lease);
+      expect(postSnapshot.slot).toEqual(preSnapshot.slot);
+      expect(postSnapshot.contextSnapshot).toEqual(preSnapshot.contextSnapshot);
+      expect(postSnapshot.contextItems).toEqual(preSnapshot.contextItems);
+      expect(postSnapshot.contextManifest).toEqual(preSnapshot.contextManifest);
+
+      // Event delta: exactly 1 rejection event added
+      const preEventIds = new Set((preSnapshot.events as any[]).map(e => e.id));
+      const postEvents = postSnapshot.events as any[];
+      const newEvents = postEvents.filter(e => !preEventIds.has(e.id));
+      expect(newEvents.length).toBe(1);
+      expect(newEvents[0].type).toBe('EXECUTION_AUTHORIZATION_REJECTED');
+      expect(newEvents[0].project_id).toBe(flow.projectId);
+      expect(newEvents[0].task_id).toBe(flow.taskId);
     }
 
-    // Subcase 2: Provider mismatch
+    // Subcase 2: Routing provider mismatch
     {
       const flow = await runProductionHandoffFlow({
         projectId: 'proj-16-2',
@@ -1436,17 +1587,35 @@ describe('R5I7 Cross-Provider Handoff Evidence and Closure Integration Suite', (
         routingEvent.id
       );
 
+      const preSnapshot = captureAuthorityGraphSnapshot(db, flow);
+
       const res = await dispatchService.dispatch(flow.authorizationId!);
       expect(res.status).toBe('FAILED');
       expect(res.error).toContain('EXECUTION_AUTHORIZATION_ROUTING_PROVIDER_MISMATCH');
       expect(adapterB.invocationCount).toBe(0);
 
-      const auth = repo.getExecutionAuthorization(flow.authorizationId!)!;
-      expect(auth.adapter_started_at).toBeNull();
-      expect(auth.settlement_status).toBeNull();
+      const postSnapshot = captureAuthorityGraphSnapshot(db, flow);
+
+      const postAuth = postSnapshot.auth as any;
+      expect(postAuth.execution_id).toBeNull();
+      expect(postAuth.adapter_started_at).toBeNull();
+      expect(postAuth.settlement_status).toBeNull();
+
+      expect(postSnapshot.task).toEqual(preSnapshot.task);
+      expect(postSnapshot.transfer).toEqual(preSnapshot.transfer);
+      expect(postSnapshot.attempt).toEqual(preSnapshot.attempt);
+      expect(postSnapshot.assignment).toEqual(preSnapshot.assignment);
+      expect(postSnapshot.lease).toEqual(preSnapshot.lease);
+      expect(postSnapshot.slot).toEqual(preSnapshot.slot);
+
+      const preEventIds = new Set((preSnapshot.events as any[]).map(e => e.id));
+      const postEvents = postSnapshot.events as any[];
+      const newEvents = postEvents.filter(e => !preEventIds.has(e.id));
+      expect(newEvents.length).toBe(1);
+      expect(newEvents[0].type).toBe('EXECUTION_AUTHORIZATION_REJECTED');
     }
 
-    // Subcase 3: Account mismatch
+    // Subcase 3: Routing account mismatch
     {
       const flow = await runProductionHandoffFlow({
         projectId: 'proj-16-3',
@@ -1462,18 +1631,36 @@ describe('R5I7 Cross-Provider Handoff Evidence and Closure Integration Suite', (
         routingEvent.id
       );
 
+      const preSnapshot = captureAuthorityGraphSnapshot(db, flow);
+
       const res = await dispatchService.dispatch(flow.authorizationId!);
       expect(res.status).toBe('FAILED');
       expect(res.error).toContain('Routing decision event');
       expect(res.error).toContain('payload does not match successor binding authority');
       expect(adapterB.invocationCount).toBe(0);
 
-      const auth = repo.getExecutionAuthorization(flow.authorizationId!)!;
-      expect(auth.adapter_started_at).toBeNull();
-      expect(auth.settlement_status).toBeNull();
+      const postSnapshot = captureAuthorityGraphSnapshot(db, flow);
+
+      const postAuth = postSnapshot.auth as any;
+      expect(postAuth.execution_id).toBeNull();
+      expect(postAuth.adapter_started_at).toBeNull();
+      expect(postAuth.settlement_status).toBeNull();
+
+      expect(postSnapshot.task).toEqual(preSnapshot.task);
+      expect(postSnapshot.transfer).toEqual(preSnapshot.transfer);
+      expect(postSnapshot.attempt).toEqual(preSnapshot.attempt);
+      expect(postSnapshot.assignment).toEqual(preSnapshot.assignment);
+      expect(postSnapshot.lease).toEqual(preSnapshot.lease);
+      expect(postSnapshot.slot).toEqual(preSnapshot.slot);
+
+      const preEventIds = new Set((preSnapshot.events as any[]).map(e => e.id));
+      const postEvents = postSnapshot.events as any[];
+      const newEvents = postEvents.filter(e => !preEventIds.has(e.id));
+      expect(newEvents.length).toBe(1);
+      expect(newEvents[0].type).toBe('EXECUTION_AUTHORIZATION_REJECTED');
     }
 
-    // Subcase 4: Resource mismatch
+    // Subcase 4: Routing resource mismatch
     {
       const flow = await runProductionHandoffFlow({
         projectId: 'proj-16-4',
@@ -1489,14 +1676,32 @@ describe('R5I7 Cross-Provider Handoff Evidence and Closure Integration Suite', (
         routingEvent.id
       );
 
+      const preSnapshot = captureAuthorityGraphSnapshot(db, flow);
+
       const res = await dispatchService.dispatch(flow.authorizationId!);
       expect(res.status).toBe('FAILED');
       expect(res.error).toContain('EXECUTION_AUTHORIZATION_ROUTING_RESOURCE_MISMATCH');
       expect(adapterB.invocationCount).toBe(0);
 
-      const auth = repo.getExecutionAuthorization(flow.authorizationId!)!;
-      expect(auth.adapter_started_at).toBeNull();
-      expect(auth.settlement_status).toBeNull();
+      const postSnapshot = captureAuthorityGraphSnapshot(db, flow);
+
+      const postAuth = postSnapshot.auth as any;
+      expect(postAuth.execution_id).toBeNull();
+      expect(postAuth.adapter_started_at).toBeNull();
+      expect(postAuth.settlement_status).toBeNull();
+
+      expect(postSnapshot.task).toEqual(preSnapshot.task);
+      expect(postSnapshot.transfer).toEqual(preSnapshot.transfer);
+      expect(postSnapshot.attempt).toEqual(preSnapshot.attempt);
+      expect(postSnapshot.assignment).toEqual(preSnapshot.assignment);
+      expect(postSnapshot.lease).toEqual(preSnapshot.lease);
+      expect(postSnapshot.slot).toEqual(preSnapshot.slot);
+
+      const preEventIds = new Set((preSnapshot.events as any[]).map(e => e.id));
+      const postEvents = postSnapshot.events as any[];
+      const newEvents = postEvents.filter(e => !preEventIds.has(e.id));
+      expect(newEvents.length).toBe(1);
+      expect(newEvents[0].type).toBe('EXECUTION_AUTHORIZATION_REJECTED');
     }
 
     // Subcase 5: Resource-account mismatch
@@ -1512,14 +1717,32 @@ describe('R5I7 Cross-Provider Handoff Evidence and Closure Integration Suite', (
         flow.authorization!.selected_resource_id
       );
 
+      const preSnapshot = captureAuthorityGraphSnapshot(db, flow);
+
       const res = await dispatchService.dispatch(flow.authorizationId!);
       expect(res.status).toBe('FAILED');
       expect(res.error).toContain('ROUTING_RESOURCE_ACCOUNT_MISMATCH');
       expect(adapterB.invocationCount).toBe(0);
 
-      const auth = repo.getExecutionAuthorization(flow.authorizationId!)!;
-      expect(auth.adapter_started_at).toBeNull();
-      expect(auth.settlement_status).toBeNull();
+      const postSnapshot = captureAuthorityGraphSnapshot(db, flow);
+
+      const postAuth = postSnapshot.auth as any;
+      expect(postAuth.execution_id).toBeNull();
+      expect(postAuth.adapter_started_at).toBeNull();
+      expect(postAuth.settlement_status).toBeNull();
+
+      expect(postSnapshot.task).toEqual(preSnapshot.task);
+      expect(postSnapshot.transfer).toEqual(preSnapshot.transfer);
+      expect(postSnapshot.attempt).toEqual(preSnapshot.attempt);
+      expect(postSnapshot.assignment).toEqual(preSnapshot.assignment);
+      expect(postSnapshot.lease).toEqual(preSnapshot.lease);
+      expect(postSnapshot.slot).toEqual(preSnapshot.slot);
+
+      const preEventIds = new Set((preSnapshot.events as any[]).map(e => e.id));
+      const postEvents = postSnapshot.events as any[];
+      const newEvents = postEvents.filter(e => !preEventIds.has(e.id));
+      expect(newEvents.length).toBe(1);
+      expect(newEvents[0].type).toBe('EXECUTION_AUTHORIZATION_REJECTED');
     }
   });
 
@@ -1773,33 +1996,22 @@ describe('R5I7 Cross-Provider Handoff Evidence and Closure Integration Suite', (
     });
     expect(p2Flow.schedulerResult!.status).toBe('COMPLETED');
 
-    // 2. Snapshot every Project-2-related row before Project 1 execution
-    const p2TasksBefore = db.prepare('SELECT * FROM tasks WHERE project_id = ?').all(p2Flow.projectId);
-    const p2AttemptsBefore = db.prepare('SELECT * FROM task_attempts WHERE task_id = ?').all(p2Flow.taskId);
-    const p2AssignmentsBefore = db.prepare('SELECT * FROM agent_assignments WHERE project_id = ?').all(p2Flow.projectId);
-    const p2TransfersBefore = db.prepare('SELECT * FROM handoff_transfers WHERE task_id = ?').all(p2Flow.taskId);
-    const p2AuthsBefore = db.prepare('SELECT * FROM execution_authorizations WHERE project_id = ?').all(p2Flow.projectId);
-    const p2MessagesBefore = db.prepare('SELECT * FROM protocol_messages WHERE project_id = ?').all(p2Flow.projectId);
-    const p2EventsBefore = db.prepare('SELECT * FROM events WHERE project_id = ?').all(p2Flow.projectId);
-    const p2SnapshotsBefore = db.prepare('SELECT * FROM context_snapshots WHERE task_id = ?').all(p2Flow.taskId);
-    const p2ManifestsBefore = db.prepare('SELECT * FROM context_manifests WHERE snapshot_id = ?').all(
-      (p2SnapshotsBefore[0] as any)?.id ?? ''
-    );
-    const p2LeasesBefore = db.prepare('SELECT * FROM account_leases WHERE provider_account_id IN (?, ?)').all(
-      p2Flow.accountAId,
-      p2Flow.accountBId
-    );
-    const p2SlotsBefore = db.prepare('SELECT * FROM worker_slots WHERE provider_account_id IN (?, ?)').all(
-      p2Flow.accountAId,
-      p2Flow.accountBId
-    );
-    const p2RecoveryBefore = db.prepare('SELECT * FROM execution_recovery_states WHERE authorization_id = ?').all(
-      p2Flow.authorizationId!
-    );
+    // 2. Snapshot complete Project-2 isolation domain before Project 1 execution
+    const p2Before = captureProject2IsolationSnapshot(db, p2Flow);
 
-    // Verify Project 2 datasets are non-empty
-    expect(p2TransfersBefore.length).toBeGreaterThan(0);
-    expect(p2AuthsBefore.length).toBeGreaterThan(0);
+    // Verify Project 2 datasets are populated and non-empty
+    expect(p2Before.tasks.length).toBeGreaterThan(0);
+    expect(p2Before.attempts.length).toBeGreaterThan(0);
+    expect(p2Before.assignments.length).toBeGreaterThan(0);
+    expect(p2Before.transfers.length).toBeGreaterThan(0);
+    expect(p2Before.authorizations.length).toBeGreaterThan(0);
+    expect(p2Before.events.length).toBeGreaterThan(0);
+    expect(p2Before.accounts.length).toBeGreaterThan(0);
+    expect(p2Before.resources.length).toBeGreaterThan(0);
+    expect(p2Before.slots.length).toBeGreaterThan(0);
+    expect(p2Before.contextSnapshots.length).toBeGreaterThan(0);
+    expect(p2Before.contextItems.length).toBeGreaterThan(0);
+    expect(p2Before.contextManifests.length).toBeGreaterThan(0);
 
     // 3. Execute complete Provider A -> Provider B handoff for Project 1
     const p1Flow = await runProductionHandoffFlow({
@@ -1810,45 +2022,39 @@ describe('R5I7 Cross-Provider Handoff Evidence and Closure Integration Suite', (
     });
     expect(p1Flow.schedulerResult!.status).toBe('COMPLETED');
 
-    // 4. Snapshot every Project-2-related row after Project 1 execution
-    const p2TasksAfter = db.prepare('SELECT * FROM tasks WHERE project_id = ?').all(p2Flow.projectId);
-    const p2AttemptsAfter = db.prepare('SELECT * FROM task_attempts WHERE task_id = ?').all(p2Flow.taskId);
-    const p2AssignmentsAfter = db.prepare('SELECT * FROM agent_assignments WHERE project_id = ?').all(p2Flow.projectId);
-    const p2TransfersAfter = db.prepare('SELECT * FROM handoff_transfers WHERE task_id = ?').all(p2Flow.taskId);
-    const p2AuthsAfter = db.prepare('SELECT * FROM execution_authorizations WHERE project_id = ?').all(p2Flow.projectId);
-    const p2MessagesAfter = db.prepare('SELECT * FROM protocol_messages WHERE project_id = ?').all(p2Flow.projectId);
-    const p2EventsAfter = db.prepare('SELECT * FROM events WHERE project_id = ?').all(p2Flow.projectId);
-    const p2SnapshotsAfter = db.prepare('SELECT * FROM context_snapshots WHERE task_id = ?').all(p2Flow.taskId);
-    const p2ManifestsAfter = db.prepare('SELECT * FROM context_manifests WHERE snapshot_id = ?').all(
-      (p2SnapshotsBefore[0] as any)?.id ?? ''
-    );
-    const p2LeasesAfter = db.prepare('SELECT * FROM account_leases WHERE provider_account_id IN (?, ?)').all(
-      p2Flow.accountAId,
-      p2Flow.accountBId
-    );
-    const p2SlotsAfter = db.prepare('SELECT * FROM worker_slots WHERE provider_account_id IN (?, ?)').all(
-      p2Flow.accountAId,
-      p2Flow.accountBId
-    );
-    const p2RecoveryAfter = db.prepare('SELECT * FROM execution_recovery_states WHERE authorization_id = ?').all(
-      p2Flow.authorizationId!
-    );
+    // 4. Snapshot complete Project-2 isolation domain after Project 1 execution
+    const p2After = captureProject2IsolationSnapshot(db, p2Flow);
 
-    // 5. Canonically deep-compare all Project-2 rows before and after
-    expect(p2TasksAfter).toEqual(p2TasksBefore);
-    expect(p2AttemptsAfter).toEqual(p2AttemptsBefore);
-    expect(p2AssignmentsAfter).toEqual(p2AssignmentsBefore);
-    expect(p2TransfersAfter).toEqual(p2TransfersBefore);
-    expect(p2AuthsAfter).toEqual(p2AuthsBefore);
-    expect(p2MessagesAfter).toEqual(p2MessagesBefore);
-    expect(p2EventsAfter).toEqual(p2EventsBefore);
-    expect(p2SnapshotsAfter).toEqual(p2SnapshotsBefore);
-    expect(p2ManifestsAfter).toEqual(p2ManifestsBefore);
-    expect(p2LeasesAfter).toEqual(p2LeasesBefore);
-    expect(p2SlotsAfter).toEqual(p2SlotsBefore);
-    expect(p2RecoveryAfter).toEqual(p2RecoveryBefore);
+    // 5. Canonically deep-compare all Project-2 datasets before and after
+    expect(p2After).toEqual(p2Before);
 
-    // 6. Query and reject cross-project, cross-task, cross-account, and cross-resource references
+    // 6. Prove Project 1 assignments & authorizations reference no Project 2 accounts or resources
+    const p1AsgnsWithP2 = db.prepare(`
+      SELECT * FROM agent_assignments
+      WHERE project_id = ? AND (selected_account_id IN (?, ?) OR selected_resource_id IN (?, ?))
+    `).all(p1Flow.projectId, p2Flow.accountAId, p2Flow.accountBId, p2Flow.resourceAId, p2Flow.resourceBId);
+    expect(p1AsgnsWithP2.length).toBe(0);
+
+    const p1AuthsWithP2 = db.prepare(`
+      SELECT * FROM execution_authorizations
+      WHERE project_id = ? AND (selected_account_id IN (?, ?) OR selected_resource_id IN (?, ?))
+    `).all(p1Flow.projectId, p2Flow.accountAId, p2Flow.accountBId, p2Flow.resourceAId, p2Flow.resourceBId);
+    expect(p1AuthsWithP2.length).toBe(0);
+
+    // 7. Prove Project 1 leases and slots reference no Project 2 assignments/accounts/resources
+    const p1LeasesWithP2 = db.prepare(`
+      SELECT * FROM account_leases
+      WHERE provider_account_id IN (?, ?) AND (assignment_id = ? OR assignment_id = ?)
+    `).all(p1Flow.accountAId, p1Flow.accountBId, p2Flow.predAsgnId, p2Flow.succAsgnId!);
+    expect(p1LeasesWithP2.length).toBe(0);
+
+    // 8. Prove Project 2 rows reference no Project 1 task, attempt, assignment, authorization, account or resource
+    const p2EventsWithP1 = db.prepare('SELECT * FROM events WHERE project_id = ? AND task_id = ?').all(
+      p2Flow.projectId,
+      p1Flow.taskId
+    );
+    expect(p2EventsWithP1.length).toBe(0);
+
     const crossProjEvents = db.prepare('SELECT * FROM events WHERE project_id = ? AND task_id = ?').all(
       p1Flow.projectId,
       p2Flow.taskId
