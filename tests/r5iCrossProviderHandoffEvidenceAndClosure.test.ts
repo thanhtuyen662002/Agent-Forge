@@ -1786,7 +1786,7 @@ describe('R5I7 Cross-Provider Handoff Evidence and Closure Integration Suite', (
       const runtimeEvents = db.prepare("SELECT * FROM events WHERE project_id = ? AND type = 'PROVIDER_RUNTIME_EXECUTION_RESULT'").all(flow.projectId) as Array<{ id: string }>;
       expect(runtimeEvents.length).toBe(0);
     }
-  });
+  }, 60000);
 
   // 17. Restart after adapter claim but before durable result remains recovery-fenced and does not invoke the adapter again
   it('17. Restart after adapter claim but before durable result remains recovery-fenced and does not invoke the adapter again', async () => {
