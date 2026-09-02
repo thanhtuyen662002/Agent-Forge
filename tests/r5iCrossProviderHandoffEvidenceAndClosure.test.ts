@@ -1428,7 +1428,7 @@ describe('R5I7 Cross-Provider Handoff Evidence and Closure Integration Suite', (
       expect(detEvent.structured_payload_json).toBe(auth.settlement_evidence_json);
 
       // 7. Prove exactly one deterministic settlement event exists
-      const allDetEvents = db.prepare("SELECT * FROM events WHERE project_id = ? AND type LIKE 'HANDOFF_SUCCESSOR_EXECUTION_%'").all(flow.projectId);
+      const allDetEvents = db.prepare("SELECT * FROM events WHERE project_id = ? AND type LIKE 'HANDOFF_SUCCESSOR_EXECUTION_%'").all(flow.projectId) as Array<{ id: string }>;
       expect(allDetEvents.length).toBe(1);
       expect(allDetEvents[0].id).toBe(derivedEventId);
 
@@ -1556,16 +1556,33 @@ describe('R5I7 Cross-Provider Handoff Evidence and Closure Integration Suite', (
     // 2. Re-acquisition of a lease for the terminal assignment fails closed
     const reacquireLease = leaseService.acquireForAssignment(flow.succAsgnId!, 60000);
     expect(reacquireLease.status).toBe('FAILED');
+    if (reacquireLease.status !== 'FAILED') {
+      throw new Error(`Expected lease acquisition to fail, but status was ${reacquireLease.status}`);
+    }
     expect(reacquireLease.code).toBe('ASSIGNMENT_NOT_ACQUIRABLE');
+    expect(reacquireLease.error).toContain('ASSIGNMENT_NOT_ACQUIRABLE');
 
-    // 3. acceptHandoffSuccessorExecution replay fails closed
+    // 3. acceptHandoffSuccessorExecution replay with real historical lease fails closed
+    const historicalLeases = repo.getAccountLeasesByAssignment(flow.succAsgnId!);
+    expect(historicalLeases.length).toBe(1);
+    const histLease = historicalLeases[0];
+    expect(histLease.assignment_id).toBe(flow.succAsgnId);
+    expect(histLease.provider_account_id).toBe(flow.accountBId);
+    expect(histLease.worker_slot_id).toBe(flow.slotBId);
+    expect(histLease.released_at).not.toBeNull();
+    expect(typeof histLease.lease_token).toBe('string');
+    expect(histLease.lease_token.length).toBeGreaterThan(0);
+
     const replayAccept = repo.acceptHandoffSuccessorExecution({
       authorizationId: flow.authorizationId!,
-      leaseId: 'non-existent-lease',
-      leaseToken: 'dummy-token',
+      leaseId: histLease.id,
+      leaseToken: histLease.lease_token,
       expectedSuccessorEpoch: 2,
     });
     expect(replayAccept.success).toBe(false);
+    expect(replayAccept.errorCode).toBe('STATUS_CONFLICT');
+    expect(replayAccept.error).toBeDefined();
+    expect(replayAccept.error).toContain(flow.transfer.status);
 
     // 4. claimAdapterExecutionStart replay with stored execution ID returns idempotent success
     const replayStart = repo.claimAdapterExecutionStart({
@@ -1604,26 +1621,33 @@ describe('R5I7 Cross-Provider Handoff Evidence and Closure Integration Suite', (
     expect(finalSnapshot).toEqual(initialSnapshot);
 
     // Explicitly prove zero second lease, execution ID, context items, recovery rows, events, or adapter invocations
-    expect(db.prepare('SELECT COUNT(*) as c FROM account_leases').get().c).toBe(initialSnapshot.account_leases.length);
-    expect(db.prepare('SELECT COUNT(DISTINCT execution_id) as c FROM execution_authorizations WHERE execution_id IS NOT NULL').get().c).toBe(1);
-    expect(db.prepare('SELECT COUNT(*) as c FROM context_snapshots').get().c).toBe(initialSnapshot.context_snapshots.length);
-    expect(db.prepare('SELECT COUNT(*) as c FROM context_items').get().c).toBe(initialSnapshot.context_items.length);
-    expect(db.prepare('SELECT COUNT(*) as c FROM context_manifests').get().c).toBe(initialSnapshot.context_manifests.length);
-    expect(db.prepare('SELECT COUNT(*) as c FROM execution_recovery_states').get().c).toBe(initialSnapshot.execution_recovery_states.length);
-    expect(db.prepare('SELECT COUNT(*) as c FROM events').get().c).toBe(initialSnapshot.events.length);
+    expect((db.prepare('SELECT COUNT(*) as c FROM account_leases').get() as { c: number }).c).toBe(initialSnapshot.account_leases.length);
+    expect((db.prepare('SELECT COUNT(DISTINCT execution_id) as c FROM execution_authorizations WHERE execution_id IS NOT NULL').get() as { c: number }).c).toBe(1);
+    expect((db.prepare('SELECT COUNT(*) as c FROM context_snapshots').get() as { c: number }).c).toBe(initialSnapshot.context_snapshots.length);
+    expect((db.prepare('SELECT COUNT(*) as c FROM context_items').get() as { c: number }).c).toBe(initialSnapshot.context_items.length);
+    expect((db.prepare('SELECT COUNT(*) as c FROM context_manifests').get() as { c: number }).c).toBe(initialSnapshot.context_manifests.length);
+    expect((db.prepare('SELECT COUNT(*) as c FROM execution_recovery_states').get() as { c: number }).c).toBe(initialSnapshot.execution_recovery_states.length);
+    expect((db.prepare('SELECT COUNT(*) as c FROM events').get() as { c: number }).c).toBe(initialSnapshot.events.length);
     expect(adapterB.invocationCount).toBe(initialAdapterCount);
   });
 
-  // 16. Stale ownership epoch and corrupted provider/account/resource bindings fail before adapter invocation with zero authority mutation
-  it('16. Stale ownership epoch and corrupted provider/account/resource bindings fail before adapter invocation with zero authority mutation', async () => {
-    const subcases = [
+  // 16. Stale ownership epoch and corrupted provider/account/resource bindings fail before adapter invocation with fail-closed invalidation as the single permitted authority mutation
+  it('16. Stale ownership epoch and corrupted provider/account/resource bindings fail before adapter invocation with fail-closed invalidation as the single permitted authority mutation', async () => {
+    const subcases: Array<{
+      idSuffix: string;
+      name: string;
+      corrupt: (flow: ProductionHandoffContext) => void;
+      expectedStatus: 'FAILED';
+      expectedErrorCode: string | undefined;
+      expectedErrorSubstring: string;
+    }> = [
       {
         idSuffix: '1',
         name: 'Stale ownership epoch',
         corrupt: (flow: ProductionHandoffContext) => {
           db.prepare('UPDATE tasks SET ownership_epoch = 99 WHERE id = ?').run(flow.taskId);
         },
-        expectedStatus: 'FAILED' as const,
+        expectedStatus: 'FAILED',
         expectedErrorCode: 'RESOURCE_UNAVAILABLE',
         expectedErrorSubstring: 'does not match authorization authority',
       },
@@ -1632,14 +1656,14 @@ describe('R5I7 Cross-Provider Handoff Evidence and Closure Integration Suite', (
         name: 'Routing provider mismatch',
         corrupt: (flow: ProductionHandoffContext) => {
           const routingEvent = repo.getRoutingDecisionEvent(flow.routingDecisionId!)!;
-          const p = routingEvent.structured_payload as any;
+          const p = routingEvent.structured_payload as Record<string, unknown>;
           p.selectedProviderId = 'prov-mismatch-alpha';
           db.prepare('UPDATE events SET structured_payload_json = ? WHERE id = ?').run(
             JSON.stringify(p),
             routingEvent.id
           );
         },
-        expectedStatus: 'FAILED' as const,
+        expectedStatus: 'FAILED',
         expectedErrorCode: undefined,
         expectedErrorSubstring: 'EXECUTION_AUTHORIZATION_ROUTING_PROVIDER_MISMATCH',
       },
@@ -1648,15 +1672,15 @@ describe('R5I7 Cross-Provider Handoff Evidence and Closure Integration Suite', (
         name: 'Routing account mismatch',
         corrupt: (flow: ProductionHandoffContext) => {
           const routingEvent = repo.getRoutingDecisionEvent(flow.routingDecisionId!)!;
-          const p = routingEvent.structured_payload as any;
+          const p = routingEvent.structured_payload as Record<string, unknown>;
           p.selectedAccountId = 'acc-mismatch-beta';
           db.prepare('UPDATE events SET structured_payload_json = ? WHERE id = ?').run(
             JSON.stringify(p),
             routingEvent.id
           );
         },
-        expectedStatus: 'FAILED' as const,
-        expectedErrorCode: undefined,
+        expectedStatus: 'FAILED',
+        expectedErrorCode: 'RESOURCE_UNAVAILABLE',
         expectedErrorSubstring: 'payload does not match successor binding authority',
       },
       {
@@ -1664,14 +1688,14 @@ describe('R5I7 Cross-Provider Handoff Evidence and Closure Integration Suite', (
         name: 'Routing resource mismatch',
         corrupt: (flow: ProductionHandoffContext) => {
           const routingEvent = repo.getRoutingDecisionEvent(flow.routingDecisionId!)!;
-          const p = routingEvent.structured_payload as any;
+          const p = routingEvent.structured_payload as Record<string, unknown>;
           p.selectedResourceId = 'res-mismatch-beta';
           db.prepare('UPDATE events SET structured_payload_json = ? WHERE id = ?').run(
             JSON.stringify(p),
             routingEvent.id
           );
         },
-        expectedStatus: 'FAILED' as const,
+        expectedStatus: 'FAILED',
         expectedErrorCode: undefined,
         expectedErrorSubstring: 'EXECUTION_AUTHORIZATION_ROUTING_RESOURCE_MISMATCH',
       },
@@ -1684,8 +1708,8 @@ describe('R5I7 Cross-Provider Handoff Evidence and Closure Integration Suite', (
             flow.authorization!.selected_resource_id
           );
         },
-        expectedStatus: 'FAILED' as const,
-        expectedErrorCode: undefined,
+        expectedStatus: 'FAILED',
+        expectedErrorCode: 'RESOURCE_UNAVAILABLE',
         expectedErrorSubstring: 'ROUTING_RESOURCE_ACCOUNT_MISMATCH',
       },
     ];
@@ -1704,13 +1728,14 @@ describe('R5I7 Cross-Provider Handoff Evidence and Closure Integration Suite', (
 
       // 2. Capture complete graph after corruption and before dispatch
       const preSnapshot = captureAuthoritySnapshot(db, flow);
+      const preAuth = preSnapshot.authorityGraph.authorization as Record<string, unknown>;
+      expect(preAuth.status).toBe('AUTHORIZED');
 
       // 3. Invoke real dispatch path
       const res = await dispatchService.dispatch(flow.authorizationId!);
       expect(res.status).toBe(sc.expectedStatus);
-      if (sc.expectedErrorCode) {
-        expect(res.errorCode).toBe(sc.expectedErrorCode);
-      }
+      expect(res.errorCode).toBe(sc.expectedErrorCode);
+      expect(res.error).toBeDefined();
       expect(res.error).toContain(sc.expectedErrorSubstring);
 
       // 4. Capture complete graph after rejected dispatch
@@ -1720,7 +1745,7 @@ describe('R5I7 Cross-Provider Handoff Evidence and Closure Integration Suite', (
       expect(adapterB.invocationCount).toBe(initialAdapterCount);
 
       // 6. Assert authorization has no execution ID, timestamps, or settlement evidence
-      const postAuth = postSnapshot.authorityGraph.authorization as any;
+      const postAuth = postSnapshot.authorityGraph.authorization as Record<string, unknown>;
       expect(postAuth.status).toBe('INVALIDATED');
       expect(postAuth.execution_id).toBeNull();
       expect(postAuth.adapter_started_at).toBeNull();
@@ -1730,30 +1755,35 @@ describe('R5I7 Cross-Provider Handoff Evidence and Closure Integration Suite', (
       expect(postAuth.settlement_evidence_json).toBeNull();
       expect(postAuth.settlement_evidence_hash).toBeNull();
 
-      // 7. Deep-compare entire authorityGraph (accounting for status: INVALIDATED)
+      // 7. Deep-compare entire authorityGraph (accounting for status: INVALIDATED as the single permitted authority mutation)
       expect({
         ...postSnapshot.authorityGraph,
         authorization: { ...postAuth, status: 'AUTHORIZED' },
       }).toEqual(preSnapshot.authorityGraph);
 
       // 8. Assert event delta equals exactly one EXECUTION_AUTHORIZATION_REJECTED event
-      const preEventIds = new Set(preSnapshot.events.map((e: any) => e.id));
-      const postEvents = postSnapshot.events;
-      const newEvents = postEvents.filter((e: any) => !preEventIds.has(e.id));
+      const preEventIds = new Set(preSnapshot.events.map((e: { id: string }) => e.id));
+      const postEvents = postSnapshot.events as Array<{ id: string; type: string; project_id: string; task_id: string; structured_payload_json: string | null }>;
+      const newEvents = postEvents.filter((e) => !preEventIds.has(e.id));
       expect(newEvents.length).toBe(1);
       const rejEvent = newEvents[0];
       expect(rejEvent.type).toBe('EXECUTION_AUTHORIZATION_REJECTED');
       expect(rejEvent.project_id).toBe(flow.projectId);
       expect(rejEvent.task_id).toBe(flow.taskId);
+
       const rejPayload = JSON.parse(rejEvent.structured_payload_json ?? '{}');
       expect(rejPayload.authorizationId).toBe(flow.authorizationId);
-      expect(rejPayload.reason).toBeDefined();
+      expect(rejPayload.projectId).toBe(flow.projectId);
+      expect(rejPayload.taskId).toBe(flow.taskId);
+      expect(rejPayload.reason).toBe(res.error);
+      expect(rejPayload.status).toBe('INVALIDATED');
+      expect(rejPayload.reason).toContain(sc.expectedErrorSubstring);
 
       // 9. Assert zero settlement or runtime-result events
-      const detEvents = db.prepare("SELECT * FROM events WHERE project_id = ? AND type LIKE 'HANDOFF_SUCCESSOR_EXECUTION_%'").all(flow.projectId);
+      const detEvents = db.prepare("SELECT * FROM events WHERE project_id = ? AND type LIKE 'HANDOFF_SUCCESSOR_EXECUTION_%'").all(flow.projectId) as Array<{ id: string }>;
       expect(detEvents.length).toBe(0);
 
-      const runtimeEvents = db.prepare("SELECT * FROM events WHERE project_id = ? AND type = 'PROVIDER_RUNTIME_EXECUTION_RESULT'").all(flow.projectId);
+      const runtimeEvents = db.prepare("SELECT * FROM events WHERE project_id = ? AND type = 'PROVIDER_RUNTIME_EXECUTION_RESULT'").all(flow.projectId) as Array<{ id: string }>;
       expect(runtimeEvents.length).toBe(0);
     }
   });
