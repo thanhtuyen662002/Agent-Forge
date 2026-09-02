@@ -342,4 +342,221 @@ CREATE TABLE IF NOT EXISTS project_settings (
     value_json TEXT NOT NULL,
     PRIMARY KEY(project_id, key)
 );
+
+-- 24. Providers & Worker Slots (R5A / R5G / R5I)
+CREATE TABLE IF NOT EXISTS providers (
+    id TEXT PRIMARY KEY,
+    name TEXT NOT NULL,
+    adapter_type TEXT NOT NULL,
+    enabled INTEGER NOT NULL DEFAULT 1,
+    created_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS provider_accounts (
+    id TEXT PRIMARY KEY,
+    provider_id TEXT NOT NULL REFERENCES providers(id) ON DELETE CASCADE,
+    label TEXT NOT NULL,
+    auth_mode TEXT NOT NULL,
+    enabled INTEGER NOT NULL DEFAULT 1,
+    priority INTEGER NOT NULL DEFAULT 0,
+    health_status TEXT NOT NULL DEFAULT 'AVAILABLE',
+    concurrency_limit INTEGER NOT NULL DEFAULT 1,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS provider_resources (
+    id TEXT PRIMARY KEY,
+    provider_id TEXT NOT NULL REFERENCES providers(id) ON DELETE CASCADE,
+    provider_account_id TEXT REFERENCES provider_accounts(id) ON DELETE SET NULL,
+    model_name TEXT NOT NULL,
+    health_status TEXT NOT NULL DEFAULT 'AVAILABLE',
+    capabilities_json TEXT NOT NULL,
+    enabled INTEGER NOT NULL DEFAULT 1,
+    total_quota REAL,
+    remaining_quota REAL,
+    quota_source TEXT NOT NULL,
+    quota_confidence REAL NOT NULL DEFAULT 1.0,
+    last_health_check TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS worker_slots (
+    id TEXT PRIMARY KEY,
+    provider_account_id TEXT NOT NULL REFERENCES provider_accounts(id) ON DELETE CASCADE,
+    provider_resource_id TEXT REFERENCES provider_resources(id) ON DELETE SET NULL,
+    slot_index INTEGER NOT NULL,
+    status TEXT NOT NULL CHECK(status IN ('IDLE', 'LEASED', 'OFFLINE', 'DRAINING')) DEFAULT 'IDLE',
+    current_assignment_id TEXT,
+    current_execution_id TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    UNIQUE(provider_account_id, slot_index)
+);
+
+CREATE TABLE IF NOT EXISTS account_leases (
+    id TEXT PRIMARY KEY,
+    provider_account_id TEXT NOT NULL REFERENCES provider_accounts(id) ON DELETE CASCADE,
+    worker_slot_id TEXT NOT NULL REFERENCES worker_slots(id) ON DELETE CASCADE,
+    assignment_id TEXT NOT NULL,
+    lease_token TEXT NOT NULL UNIQUE,
+    acquired_at TEXT NOT NULL,
+    expires_at TEXT NOT NULL,
+    released_at TEXT,
+    created_at TEXT NOT NULL
+);
+
+-- 25. Agent Fabric & Assignments (R5A / R5I)
+CREATE TABLE IF NOT EXISTS role_profiles (
+    id TEXT PRIMARY KEY,
+    role TEXT NOT NULL,
+    display_name TEXT NOT NULL,
+    authority_scope_json TEXT NOT NULL,
+    output_protocol TEXT NOT NULL,
+    required_capabilities_json TEXT NOT NULL,
+    preferred_capabilities_json TEXT NOT NULL,
+    permissions_json TEXT NOT NULL,
+    enabled INTEGER NOT NULL DEFAULT 1,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS agent_profiles (
+    id TEXT PRIMARY KEY,
+    role_profile_id TEXT NOT NULL REFERENCES role_profiles(id) ON DELETE CASCADE,
+    name TEXT NOT NULL,
+    prompt_template TEXT NOT NULL,
+    config_json TEXT,
+    enabled INTEGER NOT NULL DEFAULT 1,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS agent_assignments (
+    id TEXT PRIMARY KEY,
+    project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+    task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+    attempt_id TEXT NOT NULL,
+    agent_id TEXT,
+    role_profile_id TEXT NOT NULL REFERENCES role_profiles(id),
+    agent_profile_id TEXT NOT NULL REFERENCES agent_profiles(id),
+    selected_provider_id TEXT NOT NULL REFERENCES providers(id),
+    selected_account_id TEXT NOT NULL REFERENCES provider_accounts(id),
+    selected_resource_id TEXT NOT NULL REFERENCES provider_resources(id),
+    selected_worker_slot_id TEXT REFERENCES worker_slots(id),
+    routing_decision_id TEXT NOT NULL,
+    preferred_metadata_json TEXT,
+    status TEXT NOT NULL CHECK(status IN ('ASSIGNED', 'RUNNING', 'COMPLETED', 'FAILED', 'CANCELLED', 'HANDED_OFF')),
+    created_at TEXT NOT NULL,
+    ended_at TEXT
+);
+
+-- 26. Context Fabric (R5B / R5I)
+CREATE TABLE IF NOT EXISTS context_snapshots (
+    id TEXT PRIMARY KEY,
+    project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+    task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+    attempt_id TEXT,
+    purpose TEXT NOT NULL,
+    created_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS context_manifests (
+    id TEXT PRIMARY KEY,
+    snapshot_id TEXT NOT NULL REFERENCES context_snapshots(id) ON DELETE CASCADE,
+    manifest_hash TEXT NOT NULL,
+    items_json TEXT NOT NULL,
+    created_at TEXT NOT NULL
+);
+
+-- 27. Handoff Transfers (R5I)
+CREATE TABLE IF NOT EXISTS handoff_transfers (
+    id TEXT PRIMARY KEY,
+    request_id TEXT NOT NULL UNIQUE,
+    task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+    source_attempt_id TEXT NOT NULL,
+    successor_attempt_id TEXT,
+    source_assignment_id TEXT NOT NULL,
+    successor_assignment_id TEXT,
+    successor_role_profile_id TEXT REFERENCES role_profiles(id),
+    successor_agent_profile_id TEXT REFERENCES agent_profiles(id),
+    successor_context_snapshot_id TEXT REFERENCES context_snapshots(id),
+    successor_context_spec_hash TEXT,
+    handoff_context_id TEXT,
+    checkpoint_id TEXT,
+    source_authorization_id TEXT,
+    successor_authorization_id TEXT,
+    reason TEXT NOT NULL,
+    status TEXT NOT NULL CHECK(status IN (
+        'REQUESTED', 'FROZEN', 'QUIESCING', 'RELINQUISHED',
+        'ROUTED', 'AUTHORIZED', 'ACCEPTED', 'COMPLETED', 'CANCELLED'
+    )),
+    source_ownership_epoch INTEGER NOT NULL DEFAULT 1,
+    successor_ownership_epoch INTEGER NOT NULL DEFAULT 2,
+    version INTEGER NOT NULL DEFAULT 1,
+    frozen_at TEXT,
+    quiescing_at TEXT,
+    relinquished_at TEXT,
+    accepted_at TEXT,
+    completed_at TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+
+-- 28. Execution Authorizations (R5I Extended)
+CREATE TABLE IF NOT EXISTS execution_authorizations (
+    id TEXT PRIMARY KEY,
+    project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+    task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+    attempt_id TEXT,
+    task_revision INTEGER NOT NULL DEFAULT 0,
+    base_sha TEXT NOT NULL,
+    repository_head_sha TEXT NOT NULL,
+    manager_message_id TEXT NOT NULL,
+    manager_payload_hash TEXT NOT NULL,
+    routing_decision_id TEXT NOT NULL,
+    selected_provider_id TEXT NOT NULL,
+    selected_account_id TEXT,
+    selected_resource_id TEXT NOT NULL,
+    instruction_payload_hash TEXT NOT NULL,
+    context_manifest_hash TEXT NOT NULL,
+    canonical_instructions_json TEXT NOT NULL,
+    context_files_json TEXT NOT NULL,
+    canonical_payload_json TEXT,
+    status TEXT NOT NULL CHECK(status IN (
+        'AUTHORIZED', 'DISPATCHED', 'EXECUTED', 'FAILED', 'REVOKED', 'REJECTED', 'EXPIRED'
+    )),
+    created_at TEXT NOT NULL,
+    dispatched_at TEXT,
+    task_ownership_epoch INTEGER NOT NULL DEFAULT 1,
+    assignment_id TEXT,
+    lifecycle_version INTEGER NOT NULL DEFAULT 0,
+    execution_id TEXT,
+    adapter_started_at TEXT,
+    adapter_finished_at TEXT,
+    adapter_outcome TEXT CHECK(adapter_outcome IN ('RETURNED', 'THREW', 'CANCELLED', 'TIMED_OUT', NULL)),
+    adapter_error_json TEXT,
+    settled_at TEXT,
+    settlement_status TEXT CHECK(settlement_status IN ('COMPLETED', 'FAILED', 'CANCELLED', NULL)),
+    settlement_evidence_json TEXT,
+    settlement_evidence_hash TEXT
+);
+
+-- 29. Execution Recovery States (R5I)
+CREATE TABLE IF NOT EXISTS execution_recovery_states (
+    id TEXT PRIMARY KEY,
+    authorization_id TEXT NOT NULL UNIQUE REFERENCES execution_authorizations(id) ON DELETE CASCADE,
+    project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+    task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+    attempt_id TEXT,
+    assignment_id TEXT,
+    transfer_id TEXT,
+    reconciled_at TEXT NOT NULL,
+    disposition TEXT NOT NULL CHECK(disposition IN (
+        'NO_OP', 'REVOKED_UNSTARTED', 'UNRESOLVED_FENCED',
+        'TERMINAL_STATE_RECONCILED', 'ERROR_FAILED'
+    )),
+    classification TEXT NOT NULL,
+    details_json TEXT NOT NULL,
+    created_at TEXT NOT NULL
+);
 ```

@@ -71,3 +71,20 @@ Agent-Forge guarantees:
    - Bearer Tokens & JWTs (`Bearer\s+[A-Za-z0-9-_=]+\.[A-Za-z0-9-_=]+\.?[A-Za-z0-9-_.+/=]*`)
    - Private Keys (`-----BEGIN (?:RSA )?PRIVATE KEY-----`)
    - Generic API Keys (`[a-zA-Z0-9_-]{32,}`)
+
+---
+
+## 5. Authorization Lifecycle & Provenance Governance (R5I)
+
+### 5.1 Immutable Authorization Verification
+1. **Lifecycle Versioning**: Every handoff-derived execution must declare `lifecycle_version = 1` and be strictly bound to a valid `assignment_id` and `selected_account_id`.
+2. **Authority Fencing**: Execution authorizations can be claimed only once (`DISPATCHED`). Start claims on worker slots require `status = 'LEASED'` and matching `task_ownership_epoch`.
+3. **Provenance Sanitization**: Adapter execution returns are stripped of all client-supplied provenance attributes and stamped with trusted server-side provenance.
+
+### 5.2 Worker Slot Lease Isolation & Watchdog Supervision
+1. **Guarded Slot Leasing**: Worker slots cannot execute concurrent tasks. Leases are bound to unique cryptographic tokens and guarded by active heartbeats (interval $\le \text{TTL}/3$).
+2. **Heartbeat Loss Handling**: If lease ownership is lost during execution, the scheduler issues cancellation and halts processing without releasing or destroying the underlying worktree, ensuring forensic evidence preservation.
+
+### 5.3 Crash Recovery Fencing
+1. **Post-Crash Quarantine**: Authorizations in-flight during a crash are classified as `ADAPTER_IN_FLIGHT_UNRESOLVED` and placed into `UNRESOLVED_FENCED` status. They cannot be re-dispatched without explicit re-authorization.
+2. **Deterministic Settlement Reconciliation**: Completed executions missing terminal graph updates are reconciled to `COMPLETED` exactly once with zero duplicate audit event emission.
