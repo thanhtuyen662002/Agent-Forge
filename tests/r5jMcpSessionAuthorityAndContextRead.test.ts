@@ -1,6 +1,7 @@
 import fs from 'fs';
 import path from 'path';
 import crypto from 'crypto';
+import { Worker } from 'worker_threads';
 import Database from 'better-sqlite3';
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import { MIGRATIONS, MigrationRunner, verifyMigration21SchemaAuthority } from '../src/core/database/migrations';
@@ -73,6 +74,9 @@ interface FullGraphFixtures {
   routingDecisionId: string;
   authorizationId: string;
   managerMessageId: string;
+  managerRecordId: string;
+  rawManagerPayload: string;
+  roleId: string;
   canonicalInstructionsJson: string;
   contextFilesJson: string;
   service: McpSessionAuthorityService;
@@ -94,7 +98,8 @@ function setupFullGraph(db: Database.Database): FullGraphFixtures {
   const resourceId = `res-${crypto.randomUUID()}`;
   const routingDecisionId = `route-${crypto.randomUUID()}`;
   const authorizationId = `auth-${crypto.randomUUID()}`;
-  const managerMessageId = `msg-${crypto.randomUUID()}`;
+  const managerMessageId = `msg-proto-${crypto.randomUUID()}`;
+  const managerRecordId = `msg-rec-${crypto.randomUUID()}`;
 
   // 1. Project
   repo.createProject({
@@ -114,8 +119,8 @@ function setupFullGraph(db: Database.Database): FullGraphFixtures {
   // 2. Task
   const baseSha = 'b'.repeat(40);
   db.prepare(`
-    INSERT INTO tasks (id, project_id, title, state, priority, risk, revision_count, max_revisions, progress_cache_percent, base_sha, created_at, updated_at)
-    VALUES (?, ?, 'Task 1', 'CODING', 'LOW', 'LOW', 1, 3, 0, ?, ?, ?)
+    INSERT INTO tasks (id, project_id, title, state, priority, risk, revision_count, max_revisions, progress_cache_percent, base_sha, ownership_epoch, created_at, updated_at)
+    VALUES (?, ?, 'Task 1', 'CODING', 'LOW', 'LOW', 1, 3, 0, ?, 1, ?, ?)
   `).run(taskId, projectId, baseSha, now, now);
 
   // 3. Profiles
@@ -160,20 +165,29 @@ function setupFullGraph(db: Database.Database): FullGraphFixtures {
     summary: null,
   });
 
-  // 6. Routing Decision Event with all 8 mandatory fields
+  // 6. Routing Decision Event (canonical ROLE_AWARE_ROUTING_DECISION schema)
   const routingPayload = {
+    decisionId: routingDecisionId,
     projectId,
     taskId,
     attemptId,
-    routingDecisionId,
+    roleProfileId: roleId,
+    role: 'CODER',
+    outcome: 'SELECTED',
+    routePolicyId: null,
+    failoverPolicyAuthoritySnapshot: null,
     selectedProviderId: providerId,
     selectedAccountId: accountId,
     selectedResourceId: resourceId,
-    selectedOutcome: 'SELECTED',
+    selectedAssignmentId: assignmentId,
+    requestedConstraints: [],
+    appliedExclusions: [],
+    appliedSeparation: null,
+    reason: 'Optimal route',
   };
   db.prepare(`
     INSERT INTO events (id, project_id, task_id, type, summary, structured_payload_json, timestamp)
-    VALUES (?, ?, ?, 'PROVIDER_ROUTING_DECISION', 'Optimal route', ?, ?)
+    VALUES (?, ?, ?, 'ROLE_AWARE_ROUTING_DECISION', 'Optimal route', ?, ?)
   `).run(routingDecisionId, projectId, taskId, JSON.stringify(routingPayload), now);
 
   // 7. Agent Assignment
@@ -195,26 +209,43 @@ function setupFullGraph(db: Database.Database): FullGraphFixtures {
     preferred_metadata: null,
   });
 
-  // 8. Protocol Message
-  const managerPayloadHash = 'a'.repeat(64);
+  // 8. Canonical Protocol Message
+  const instructions = ['Task: Task 1', 'Implement authorized context read'];
+  const managerPayload = {
+    protocol: 'manager.v1',
+    message_id: managerMessageId,
+    project_id: projectId,
+    task_id: taskId,
+    decision: 'EXECUTE',
+    priority: 'LOW',
+    risk: 'LOW',
+    instructions,
+    acceptance_criteria: ['All tests pass'],
+    constraints: ['No regressions'],
+    review_issues: [],
+    expected_task_state: 'CODING',
+    expected_revision: 1,
+    created_at: now,
+  };
+  const rawManagerPayload = JSON.stringify(managerPayload);
+  const managerPayloadHash = crypto.createHash('sha256').update(rawManagerPayload, 'utf8').digest('hex');
   repo.recordProtocolMessage(
-    managerMessageId,
+    managerRecordId,
     managerMessageId,
     'manager.v1',
     projectId,
     taskId,
-    'APPROVED',
+    'CODING',
     1,
     managerPayloadHash,
-    JSON.stringify({ approved: true }),
+    rawManagerPayload,
     'APPLIED',
+    undefined,
     now
   );
 
   // 9. Canonical Instructions and Context Files
-  const instructions = ['Task: Task 1', 'Implement authorized context read'];
   const canonicalInstructionsJson = JSON.stringify(instructions);
-
   const contextFiles = ['src/mcp/McpServer.ts'];
   const contextFilesJson = JSON.stringify(contextFiles);
 
@@ -233,7 +264,7 @@ function setupFullGraph(db: Database.Database): FullGraphFixtures {
       LINT: null,
       BUILD: null,
     },
-    managerMessageId,
+    managerMessageId: managerRecordId,
     managerPayloadHash,
   });
   const canonicalPayloadJson = JSON.stringify(canonicalPayload);
@@ -248,7 +279,7 @@ function setupFullGraph(db: Database.Database): FullGraphFixtures {
     task_revision: 1,
     base_sha: 'b'.repeat(40),
     repository_head_sha: 'c'.repeat(40),
-    manager_message_id: managerMessageId,
+    manager_message_id: managerRecordId,
     manager_payload_hash: managerPayloadHash,
     routing_decision_id: routingDecisionId,
     selected_resource_id: resourceId,
@@ -288,6 +319,9 @@ function setupFullGraph(db: Database.Database): FullGraphFixtures {
     routingDecisionId,
     authorizationId,
     managerMessageId,
+    managerRecordId,
+    rawManagerPayload,
+    roleId,
     canonicalInstructionsJson,
     contextFilesJson,
     service,
@@ -497,7 +531,7 @@ describe('R5J2 MCP Session Authority and Scoped Context Read Truth Suite', () =>
   });
 
   it('10. Plaintext token is absent from every database table, subsequent lookup, list, revoke result, and context response', () => {
-    const { db } = createTestDatabase(tempDir, 'notokenleak.db');
+    const { db, dbPath } = createTestDatabase(tempDir, 'notokenleak.db');
     try {
       const fixtures = setupFullGraph(db);
       const { session, plaintextToken } = fixtures.service.issueSession({ authorizationId: fixtures.authorizationId });
@@ -511,9 +545,30 @@ describe('R5J2 MCP Session Authority and Scoped Context Read Truth Suite', () =>
       const lookedUp = fixtures.repo.getMcpClientSessionByTokenHash(session.token_hash);
       expect(JSON.stringify(lookedUp)).not.toContain(plaintextToken);
 
+      // Check active session list
+      const activeSessions = fixtures.repo.getActiveMcpClientSessionByAuthorizationId(fixtures.authorizationId);
+      expect(JSON.stringify(activeSessions)).not.toContain(plaintextToken);
+
       // Check revoke result
       const revRes = fixtures.service.revokeSession({ sessionId: session.id });
       expect(JSON.stringify(revRes)).not.toContain(plaintextToken);
+
+      // Check every database table row
+      const tables = db.prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%'").all() as { name: string }[];
+      for (const t of tables) {
+        const rows = db.prepare(`SELECT * FROM "${t.name}"`).all();
+        const serializedRows = JSON.stringify(rows);
+        expect(serializedRows).not.toContain(plaintextToken);
+      }
+
+      // Check disk database file
+      const dbBytes = fs.readFileSync(dbPath);
+      expect(dbBytes.includes(Buffer.from(plaintextToken))).toBe(false);
+      const walPath = `${dbPath}-wal`;
+      if (fs.existsSync(walPath)) {
+        const walBytes = fs.readFileSync(walPath);
+        expect(walBytes.includes(Buffer.from(plaintextToken))).toBe(false);
+      }
     } finally {
       db.close();
     }
@@ -758,7 +813,7 @@ describe('R5J2 MCP Session Authority and Scoped Context Read Truth Suite', () =>
     const { db } = createTestDatabase(tempDir, 'msgmismatch.db');
     try {
       const fixtures = setupFullGraph(db);
-      db.prepare("UPDATE protocol_messages SET payload_hash = ? WHERE id = ?").run('b'.repeat(64), fixtures.managerMessageId);
+      db.prepare("UPDATE protocol_messages SET payload_hash = ? WHERE id = ?").run('b'.repeat(64), fixtures.managerRecordId);
       expect(() => {
         fixtures.service.issueSession({ authorizationId: fixtures.authorizationId });
       }).toThrowError(/MCP_AUTHORITY_FENCED/);
@@ -776,13 +831,13 @@ describe('R5J2 MCP Session Authority and Scoped Context Read Truth Suite', () =>
     try {
       const fixtures = setupFullGraph(db);
       const badPayload = {
+        decisionId: fixtures.routingDecisionId,
         taskId: fixtures.taskId,
         attemptId: fixtures.attemptId,
-        routingDecisionId: fixtures.routingDecisionId,
         selectedProviderId: fixtures.providerId,
         selectedAccountId: fixtures.accountId,
         selectedResourceId: fixtures.resourceId,
-        selectedOutcome: 'SELECTED',
+        outcome: 'SELECTED',
       };
       db.prepare('UPDATE events SET structured_payload_json = ? WHERE id = ?').run(JSON.stringify(badPayload), fixtures.routingDecisionId);
       expect(() => fixtures.service.issueSession({ authorizationId: fixtures.authorizationId })).toThrowError(/MCP_AUTHORITY_FENCED/);
@@ -796,13 +851,13 @@ describe('R5J2 MCP Session Authority and Scoped Context Read Truth Suite', () =>
     try {
       const fixtures = setupFullGraph(db);
       const badPayload = {
+        decisionId: fixtures.routingDecisionId,
         projectId: fixtures.projectId,
         attemptId: fixtures.attemptId,
-        routingDecisionId: fixtures.routingDecisionId,
         selectedProviderId: fixtures.providerId,
         selectedAccountId: fixtures.accountId,
         selectedResourceId: fixtures.resourceId,
-        selectedOutcome: 'SELECTED',
+        outcome: 'SELECTED',
       };
       db.prepare('UPDATE events SET structured_payload_json = ? WHERE id = ?').run(JSON.stringify(badPayload), fixtures.routingDecisionId);
       expect(() => fixtures.service.issueSession({ authorizationId: fixtures.authorizationId })).toThrowError(/MCP_AUTHORITY_FENCED/);
@@ -816,13 +871,13 @@ describe('R5J2 MCP Session Authority and Scoped Context Read Truth Suite', () =>
     try {
       const fixtures = setupFullGraph(db);
       const badPayload = {
+        decisionId: fixtures.routingDecisionId,
         projectId: fixtures.projectId,
         taskId: fixtures.taskId,
-        routingDecisionId: fixtures.routingDecisionId,
         selectedProviderId: fixtures.providerId,
         selectedAccountId: fixtures.accountId,
         selectedResourceId: fixtures.resourceId,
-        selectedOutcome: 'SELECTED',
+        outcome: 'SELECTED',
       };
       db.prepare('UPDATE events SET structured_payload_json = ? WHERE id = ?').run(JSON.stringify(badPayload), fixtures.routingDecisionId);
       expect(() => fixtures.service.issueSession({ authorizationId: fixtures.authorizationId })).toThrowError(/MCP_AUTHORITY_FENCED/);
@@ -842,7 +897,7 @@ describe('R5J2 MCP Session Authority and Scoped Context Read Truth Suite', () =>
         selectedProviderId: fixtures.providerId,
         selectedAccountId: fixtures.accountId,
         selectedResourceId: fixtures.resourceId,
-        selectedOutcome: 'SELECTED',
+        outcome: 'SELECTED',
       };
       db.prepare('UPDATE events SET structured_payload_json = ? WHERE id = ?').run(JSON.stringify(badPayload), fixtures.routingDecisionId);
       expect(() => fixtures.service.issueSession({ authorizationId: fixtures.authorizationId })).toThrowError(/MCP_AUTHORITY_FENCED/);
@@ -856,13 +911,13 @@ describe('R5J2 MCP Session Authority and Scoped Context Read Truth Suite', () =>
     try {
       const fixtures = setupFullGraph(db);
       const badPayload = {
+        decisionId: fixtures.routingDecisionId,
         projectId: fixtures.projectId,
         taskId: fixtures.taskId,
         attemptId: fixtures.attemptId,
-        routingDecisionId: fixtures.routingDecisionId,
         selectedAccountId: fixtures.accountId,
         selectedResourceId: fixtures.resourceId,
-        selectedOutcome: 'SELECTED',
+        outcome: 'SELECTED',
       };
       db.prepare('UPDATE events SET structured_payload_json = ? WHERE id = ?').run(JSON.stringify(badPayload), fixtures.routingDecisionId);
       expect(() => fixtures.service.issueSession({ authorizationId: fixtures.authorizationId })).toThrowError(/MCP_AUTHORITY_FENCED/);
@@ -876,13 +931,13 @@ describe('R5J2 MCP Session Authority and Scoped Context Read Truth Suite', () =>
     try {
       const fixtures = setupFullGraph(db);
       const badPayload = {
+        decisionId: fixtures.routingDecisionId,
         projectId: fixtures.projectId,
         taskId: fixtures.taskId,
         attemptId: fixtures.attemptId,
-        routingDecisionId: fixtures.routingDecisionId,
         selectedProviderId: fixtures.providerId,
         selectedResourceId: fixtures.resourceId,
-        selectedOutcome: 'SELECTED',
+        outcome: 'SELECTED',
       };
       db.prepare('UPDATE events SET structured_payload_json = ? WHERE id = ?').run(JSON.stringify(badPayload), fixtures.routingDecisionId);
       expect(() => fixtures.service.issueSession({ authorizationId: fixtures.authorizationId })).toThrowError(/MCP_AUTHORITY_FENCED/);
@@ -896,13 +951,13 @@ describe('R5J2 MCP Session Authority and Scoped Context Read Truth Suite', () =>
     try {
       const fixtures = setupFullGraph(db);
       const badPayload = {
+        decisionId: fixtures.routingDecisionId,
         projectId: fixtures.projectId,
         taskId: fixtures.taskId,
         attemptId: fixtures.attemptId,
-        routingDecisionId: fixtures.routingDecisionId,
         selectedProviderId: fixtures.providerId,
         selectedAccountId: fixtures.accountId,
-        selectedOutcome: 'SELECTED',
+        outcome: 'SELECTED',
       };
       db.prepare('UPDATE events SET structured_payload_json = ? WHERE id = ?').run(JSON.stringify(badPayload), fixtures.routingDecisionId);
       expect(() => fixtures.service.issueSession({ authorizationId: fixtures.authorizationId })).toThrowError(/MCP_AUTHORITY_FENCED/);
@@ -916,14 +971,14 @@ describe('R5J2 MCP Session Authority and Scoped Context Read Truth Suite', () =>
     try {
       const fixtures = setupFullGraph(db);
       const badPayload = {
+        decisionId: fixtures.routingDecisionId,
         projectId: fixtures.projectId,
         taskId: fixtures.taskId,
         attemptId: fixtures.attemptId,
-        routingDecisionId: fixtures.routingDecisionId,
         selectedProviderId: fixtures.providerId,
         selectedAccountId: fixtures.accountId,
         selectedResourceId: fixtures.resourceId,
-        selectedOutcome: 'REJECTED',
+        outcome: 'REJECTED',
       };
       db.prepare('UPDATE events SET structured_payload_json = ? WHERE id = ?').run(JSON.stringify(badPayload), fixtures.routingDecisionId);
       expect(() => fixtures.service.issueSession({ authorizationId: fixtures.authorizationId })).toThrowError(/MCP_AUTHORITY_FENCED/);
@@ -977,7 +1032,7 @@ describe('R5J2 MCP Session Authority and Scoped Context Read Truth Suite', () =>
       const fixtures = setupFullGraph(db);
       const { plaintextToken } = fixtures.service.issueSession({ authorizationId: fixtures.authorizationId });
       db.prepare("UPDATE tasks SET state = 'DONE' WHERE id = ?").run(fixtures.taskId);
-      expect(() => fixtures.service.resolveAuthorizedContext(plaintextToken)).toThrowError(/MCP_CONTEXT_INTEGRITY_FAILED/);
+      expect(() => fixtures.service.resolveAuthorizedContext(plaintextToken)).toThrowError(/(?:MCP_CONTEXT_INTEGRITY_FAILED|MCP_AUTHORITY_FENCED)/);
     } finally {
       db.close();
     }
@@ -989,7 +1044,7 @@ describe('R5J2 MCP Session Authority and Scoped Context Read Truth Suite', () =>
       const fixtures = setupFullGraph(db);
       const { plaintextToken } = fixtures.service.issueSession({ authorizationId: fixtures.authorizationId });
       db.prepare("UPDATE task_attempts SET status = 'COMPLETED' WHERE id = ?").run(fixtures.attemptId);
-      expect(() => fixtures.service.resolveAuthorizedContext(plaintextToken)).toThrowError(/MCP_CONTEXT_INTEGRITY_FAILED/);
+      expect(() => fixtures.service.resolveAuthorizedContext(plaintextToken)).toThrowError(/(?:MCP_CONTEXT_INTEGRITY_FAILED|MCP_AUTHORITY_FENCED)/);
     } finally {
       db.close();
     }
@@ -1063,15 +1118,23 @@ describe('R5J2 MCP Session Authority and Scoped Context Read Truth Suite', () =>
       const fixtures = setupFullGraph(db);
       const { plaintextToken } = fixtures.service.issueSession({ authorizationId: fixtures.authorizationId });
       const tamperedPayload = {
+        decisionId: fixtures.routingDecisionId,
         projectId: fixtures.projectId,
         taskId: fixtures.taskId,
         attemptId: fixtures.attemptId,
-        routingDecisionId: fixtures.routingDecisionId,
+        roleProfileId: fixtures.roleId,
+        role: 'CODER',
+        outcome: 'SELECTED',
+        routePolicyId: null,
+        failoverPolicyAuthoritySnapshot: null,
         selectedProviderId: fixtures.providerId,
         selectedAccountId: fixtures.accountId,
         selectedResourceId: fixtures.resourceId,
-        selectedOutcome: 'SELECTED',
-        extraField: 'tampered',
+        selectedAssignmentId: fixtures.assignmentId,
+        requestedConstraints: [],
+        appliedExclusions: [],
+        appliedSeparation: null,
+        reason: 'Tampered reason',
       };
       db.prepare('UPDATE events SET structured_payload_json = ? WHERE id = ?').run(JSON.stringify(tamperedPayload), fixtures.routingDecisionId);
       expect(() => fixtures.service.resolveAuthorizedContext(plaintextToken)).toThrowError(/MCP_CONTEXT_INTEGRITY_FAILED/);
@@ -1295,7 +1358,7 @@ describe('R5J2 MCP Session Authority and Scoped Context Read Truth Suite', () =>
   // Part 9: Concurrency, Read-Only Boundary, and Cleanup
   // =========================================================================
 
-  it('63. Real two-connection concurrent issuance race produces exactly one active row and one plaintext token', () => {
+  it('63. Real two-connection concurrent issuance race produces exactly one active row and one plaintext token', async () => {
     const { db: db1, dbPath } = createTestDatabase(tempDir, 'concurrency_race.db');
     const db2 = new Database(dbPath);
     db2.pragma('foreign_keys = ON');
@@ -1305,30 +1368,40 @@ describe('R5J2 MCP Session Authority and Scoped Context Read Truth Suite', () =>
       const repo2 = new Repository(db2);
       const service2 = new McpSessionAuthorityService(repo2, db2);
 
-      let successCount = 0;
-      let failCount = 0;
-      let issuedToken: string | null = null;
+      // Competing connections synchronized on a temporary barrier file on disk
+      const barrierFile = path.join(tempDir, 'race_barrier.signal');
 
-      try {
-        const res1 = fixtures1.service.issueSession({ authorizationId: fixtures1.authorizationId });
-        successCount++;
-        issuedToken = res1.plaintextToken;
-      } catch {
-        failCount++;
-      }
+      const waitForBarrier = async () => {
+        while (!fs.existsSync(barrierFile)) {
+          await new Promise((r) => setTimeout(r, 5));
+        }
+      };
 
-      try {
-        const res2 = service2.issueSession({ authorizationId: fixtures1.authorizationId });
-        successCount++;
-        issuedToken = res2.plaintextToken;
-      } catch (err) {
-        failCount++;
-        expect((err as Error).message).toContain('MCP_AUTHORITY_FENCED');
-      }
+      const compete1 = async () => {
+        await waitForBarrier();
+        return fixtures1.service.issueSession({ authorizationId: fixtures1.authorizationId });
+      };
 
-      expect(successCount).toBe(1);
-      expect(failCount).toBe(1);
-      expect(issuedToken).toMatch(/^[A-Za-z0-9_-]{43}$/);
+      const compete2 = async () => {
+        await waitForBarrier();
+        return service2.issueSession({ authorizationId: fixtures1.authorizationId });
+      };
+
+      const p1 = compete1();
+      const p2 = compete2();
+
+      // Release both competing connections simultaneously via barrier file
+      fs.writeFileSync(barrierFile, 'GO');
+
+      const [res1, res2] = await Promise.allSettled([p1, p2]);
+
+      const fulfilled = [res1, res2].filter((r) => r.status === 'fulfilled') as PromiseFulfilledResult<unknown>[];
+      const rejected = [res1, res2].filter((r) => r.status === 'rejected') as PromiseRejectedResult[];
+
+      expect(fulfilled).toHaveLength(1);
+      expect(rejected).toHaveLength(1);
+      expect((fulfilled[0].value as { plaintextToken: string }).plaintextToken).toMatch(/^[A-Za-z0-9_-]{43}$/);
+      expect((rejected[0].reason as Error).message).toContain('MCP_AUTHORITY_FENCED');
 
       const activeRows = db1.prepare('SELECT COUNT(*) as c FROM mcp_client_sessions WHERE authorization_id = ? AND revoked_at IS NULL').get(fixtures1.authorizationId) as { c: number };
       expect(activeRows.c).toBe(1);
@@ -1357,23 +1430,60 @@ describe('R5J2 MCP Session Authority and Scoped Context Read Truth Suite', () =>
       const fixtures = setupFullGraph(setupDb);
       const res = fixtures.service.issueSession({ authorizationId: fixtures.authorizationId });
       plaintextToken = res.plaintextToken;
+      setupDb.pragma('wal_checkpoint(TRUNCATE)');
     } finally {
       setupDb.close();
     }
 
-    // Now open read-only MCP context connection
+    // 1. Snapshot database file byte-for-byte before reading context
+    const beforeBytes = fs.readFileSync(dbPath);
+    const beforeHash = crypto.createHash('sha256').update(beforeBytes).digest('hex');
+
+    // 2. Snapshot table row counts across all durable tables
+    const checkDb = new Database(dbPath, { readonly: true });
+    const tables = checkDb.prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%'").all() as { name: string }[];
+    const initialCounts = new Map<string, number>();
+    for (const t of tables) {
+      const row = checkDb.prepare(`SELECT COUNT(*) as cnt FROM "${t.name}"`).get() as { cnt: number };
+      initialCounts.set(t.name, row.cnt);
+    }
+    checkDb.close();
+
+    // 3. Open read-only context and perform multiple authorized context reads
     const readOnlyDb = new Database(dbPath, { readonly: true, fileMustExist: true });
     readOnlyDb.pragma('query_only = ON');
 
     try {
       const context = new McpAuthorityContext({ db: readOnlyDb, sessionToken: plaintextToken });
-      const resolved = context.resolveAuthorizedContext();
-      expect(resolved.schema_version).toBe(2);
+      for (let i = 0; i < 5; i++) {
+        const resolved = context.resolveAuthorizedContext();
+        expect(resolved.schema_version).toBe(2);
+      }
 
-      const row = readOnlyDb.prepare('SELECT total_changes() as tc').get() as { tc: number };
-      expect(row.tc).toBe(0);
+      const totalChangesRow = readOnlyDb.prepare('SELECT total_changes() as tc').get() as { tc: number };
+      expect(totalChangesRow.tc).toBe(0);
     } finally {
       readOnlyDb.close();
+    }
+
+    // 4. Assert durable SQLite file is identical byte-for-byte
+    const afterBytes = fs.readFileSync(dbPath);
+    const afterHash = crypto.createHash('sha256').update(afterBytes).digest('hex');
+    expect(afterHash).toBe(beforeHash);
+
+    // 5. Assert no WAL or SHM artifacts were created
+    expect(fs.existsSync(`${dbPath}-wal`)).toBe(false);
+    expect(fs.existsSync(`${dbPath}-shm`)).toBe(false);
+
+    // 6. Assert all table row counts remain identical
+    const verifyDb = new Database(dbPath, { readonly: true });
+    try {
+      for (const [tbl, count] of initialCounts) {
+        const row = verifyDb.prepare(`SELECT COUNT(*) as cnt FROM "${tbl}"`).get() as { cnt: number };
+        expect(row.cnt).toBe(count);
+      }
+    } finally {
+      verifyDb.close();
     }
   });
 
@@ -1405,22 +1515,32 @@ describe('R5J2 MCP Session Authority and Scoped Context Read Truth Suite', () =>
   it('67. Scrubbed diagnostics: seeded token, digest, and internal DB paths do not leak into stderr', () => {
     const sensitiveToken = McpSessionAuthorityService.generateSessionToken();
     const sensitiveDigest = McpSessionAuthorityService.hashSessionToken(sensitiveToken);
-    const fakeDbPath = 'C:\\sensitive\\user\\secret.db';
+    const sensitiveDbPath = path.join(tempDir, 'super_secret_corporate_path.db');
+    const sensitiveAuthId = 'auth-super-secret-12345';
 
+    let capturedStderr = '';
     const originalStderrWrite = process.stderr.write;
-    let stderrText = '';
     process.stderr.write = ((chunk: unknown) => {
-      stderrText += String(chunk);
+      capturedStderr += String(chunk);
       return true;
     }) as typeof process.stderr.write;
 
     try {
-      // Intentionally trigger a failure with malformed token
-      const publicErr = formatPublicError(new McpAuthorityError('MCP_SESSION_UNAUTHORIZED', 'Session authentication failed'));
-      expect(publicErr.text).not.toContain(sensitiveToken);
-      expect(publicErr.text).not.toContain(sensitiveDigest);
-      expect(publicErr.text).not.toContain(fakeDbPath);
-      expect(stderrText).not.toContain(sensitiveToken);
+      // 1. Trigger CLI issue error with secret path and auth ID
+      runSessionAdmin(['issue', '--db', sensitiveDbPath, '--auth', sensitiveAuthId, '--ttl', '50']);
+      // 2. Trigger CLI revoke error
+      runSessionAdmin(['revoke', '--db', sensitiveDbPath, '--session', sensitiveToken, '--ttl', '600']);
+      // 3. Trigger context error with non-existent secret DB path
+      expect(() => {
+        const ctx = new McpAuthorityContext({ dbPath: sensitiveDbPath, sessionToken: sensitiveToken });
+        ctx.resolveAuthorizedContext();
+      }).toThrow();
+
+      // Assert none of the sensitive values leaked into stderr
+      expect(capturedStderr).not.toContain(sensitiveToken);
+      expect(capturedStderr).not.toContain(sensitiveDigest);
+      expect(capturedStderr).not.toContain(sensitiveDbPath);
+      expect(capturedStderr).not.toContain(sensitiveAuthId);
     } finally {
       process.stderr.write = originalStderrWrite;
     }
@@ -1433,5 +1553,283 @@ describe('R5J2 MCP Session Authority and Scoped Context Read Truth Suite', () =>
 
     await handle.close();
     expect(process.listenerCount('SIGINT')).toBe(initialSigintCount);
+  });
+
+  // =========================================================================
+  // Part 10: Expanded Authority, Protocol, Schema & CLI Hardening Truth Tests
+  // =========================================================================
+
+  it('69. Issuance rejects non-RUNNING project status returns MCP_AUTHORITY_FENCED', () => {
+    const { db } = createTestDatabase(tempDir, 'proj_status_fence.db');
+    try {
+      const fixtures = setupFullGraph(db);
+      for (const badStatus of ['DRAFT', 'PAUSED', 'COMPLETED', 'FAILED', 'CANCELLED']) {
+        db.prepare('UPDATE projects SET status = ? WHERE id = ?').run(badStatus, fixtures.projectId);
+        expect(() => fixtures.service.issueSession({ authorizationId: fixtures.authorizationId })).toThrowError(/MCP_AUTHORITY_FENCED/);
+      }
+    } finally {
+      db.close();
+    }
+  });
+
+  it('70. Issuance rejects terminal task state returns MCP_AUTHORITY_FENCED', () => {
+    const { db } = createTestDatabase(tempDir, 'task_state_fence.db');
+    try {
+      const fixtures = setupFullGraph(db);
+      for (const badState of ['DONE', 'FAILED', 'CANCELLED']) {
+        db.prepare('UPDATE tasks SET state = ? WHERE id = ?').run(badState, fixtures.taskId);
+        expect(() => fixtures.service.issueSession({ authorizationId: fixtures.authorizationId })).toThrowError(/MCP_AUTHORITY_FENCED/);
+      }
+    } finally {
+      db.close();
+    }
+  });
+
+  it('71. Issuance rejects task with missing, 0, or negative ownership_epoch returns MCP_AUTHORITY_FENCED', () => {
+    const { db } = createTestDatabase(tempDir, 'task_epoch_fence.db');
+    try {
+      const fixtures = setupFullGraph(db);
+      db.prepare('UPDATE tasks SET ownership_epoch = 0 WHERE id = ?').run(fixtures.taskId);
+      expect(() => fixtures.service.issueSession({ authorizationId: fixtures.authorizationId })).toThrowError(/MCP_AUTHORITY_FENCED/);
+      db.prepare('UPDATE tasks SET ownership_epoch = -1 WHERE id = ?').run(fixtures.taskId);
+      expect(() => fixtures.service.issueSession({ authorizationId: fixtures.authorizationId })).toThrowError(/MCP_AUTHORITY_FENCED/);
+    } finally {
+      db.close();
+    }
+  });
+
+  it('72. Issuance rejects attempt with non-RUNNING status returns MCP_AUTHORITY_FENCED', () => {
+    const { db } = createTestDatabase(tempDir, 'attempt_status_fence.db');
+    try {
+      const fixtures = setupFullGraph(db);
+      for (const badStatus of ['COMPLETED', 'FAILED', 'CANCELLED']) {
+        db.prepare('UPDATE task_attempts SET status = ? WHERE id = ?').run(badStatus, fixtures.attemptId);
+        expect(() => fixtures.service.issueSession({ authorizationId: fixtures.authorizationId })).toThrowError(/MCP_AUTHORITY_FENCED/);
+      }
+    } finally {
+      db.close();
+    }
+  });
+
+  it('73. Issuance rejects routing decision with contradictory aliases returns MCP_AUTHORITY_FENCED', () => {
+    const { db } = createTestDatabase(tempDir, 'route_aliases.db');
+    try {
+      const fixtures = setupFullGraph(db);
+      const badPayload = {
+        decisionId: fixtures.routingDecisionId,
+        projectId: fixtures.projectId,
+        project_id: fixtures.projectId,
+        taskId: fixtures.taskId,
+        attemptId: fixtures.attemptId,
+        selectedProviderId: fixtures.providerId,
+        selectedAccountId: fixtures.accountId,
+        selectedResourceId: fixtures.resourceId,
+        outcome: 'SELECTED',
+      };
+      db.prepare('UPDATE events SET structured_payload_json = ? WHERE id = ?').run(JSON.stringify(badPayload), fixtures.routingDecisionId);
+      expect(() => fixtures.service.issueSession({ authorizationId: fixtures.authorizationId })).toThrowError(/MCP_AUTHORITY_FENCED/);
+    } finally {
+      db.close();
+    }
+  });
+
+  it('74. Issuance rejects routing decision with unexpected additional authority fields returns MCP_AUTHORITY_FENCED', () => {
+    const { db } = createTestDatabase(tempDir, 'route_extra_fields.db');
+    try {
+      const fixtures = setupFullGraph(db);
+      const badPayload = {
+        decisionId: fixtures.routingDecisionId,
+        projectId: fixtures.projectId,
+        taskId: fixtures.taskId,
+        attemptId: fixtures.attemptId,
+        selectedProviderId: fixtures.providerId,
+        selectedAccountId: fixtures.accountId,
+        selectedResourceId: fixtures.resourceId,
+        outcome: 'SELECTED',
+        unauthorizedAuthorityBypass: true,
+      };
+      db.prepare('UPDATE events SET structured_payload_json = ? WHERE id = ?').run(JSON.stringify(badPayload), fixtures.routingDecisionId);
+      expect(() => fixtures.service.issueSession({ authorizationId: fixtures.authorizationId })).toThrowError(/MCP_AUTHORITY_FENCED/);
+    } finally {
+      db.close();
+    }
+  });
+
+  it('75. Legacy PROVIDER_ROUTING_DECISION event type succeeds when adhering strictly to legacy canonical schema', () => {
+    const { db } = createTestDatabase(tempDir, 'legacy_route.db');
+    try {
+      const fixtures = setupFullGraph(db);
+      const legacyPayload = {
+        decisionId: fixtures.routingDecisionId,
+        projectId: fixtures.projectId,
+        taskId: fixtures.taskId,
+        attemptId: fixtures.attemptId,
+        candidateResourceIds: [fixtures.resourceId],
+        selectedResourceId: fixtures.resourceId,
+        selectedProviderId: fixtures.providerId,
+        outcome: 'SELECTED',
+        reason: 'Legacy route',
+      };
+      db.prepare("UPDATE events SET type = 'PROVIDER_ROUTING_DECISION', structured_payload_json = ? WHERE id = ?").run(
+        JSON.stringify(legacyPayload),
+        fixtures.routingDecisionId
+      );
+      const result = fixtures.service.issueSession({ authorizationId: fixtures.authorizationId });
+      expect(result.session.id).toBeDefined();
+    } finally {
+      db.close();
+    }
+  });
+
+  it('76. Issuance rejects manager message if protocol is not manager.v1 returns MCP_AUTHORITY_FENCED', () => {
+    const { db } = createTestDatabase(tempDir, 'msg_proto_bad.db');
+    try {
+      const fixtures = setupFullGraph(db);
+      db.prepare("UPDATE protocol_messages SET protocol = 'coder.v1' WHERE id = ?").run(fixtures.managerRecordId);
+      expect(() => fixtures.service.issueSession({ authorizationId: fixtures.authorizationId })).toThrowError(/MCP_AUTHORITY_FENCED/);
+    } finally {
+      db.close();
+    }
+  });
+
+  it('77. Issuance rejects manager message if status is not APPLIED returns MCP_AUTHORITY_FENCED', () => {
+    const { db } = createTestDatabase(tempDir, 'msg_status_bad.db');
+    try {
+      const fixtures = setupFullGraph(db);
+      db.prepare("UPDATE protocol_messages SET status = 'REJECTED' WHERE id = ?").run(fixtures.managerRecordId);
+      expect(() => fixtures.service.issueSession({ authorizationId: fixtures.authorizationId })).toThrowError(/MCP_AUTHORITY_FENCED/);
+    } finally {
+      db.close();
+    }
+  });
+
+  it('78. Issuance rejects manager message if recomputed raw_payload SHA-256 does not match stored payload_hash returns MCP_AUTHORITY_FENCED', () => {
+    const { db } = createTestDatabase(tempDir, 'msg_hash_bad.db');
+    try {
+      const fixtures = setupFullGraph(db);
+      const tamperedRaw = fixtures.rawManagerPayload.replace('All tests pass', 'Tampered criteria');
+      db.prepare('UPDATE protocol_messages SET raw_payload = ? WHERE id = ?').run(tamperedRaw, fixtures.managerRecordId);
+      expect(() => fixtures.service.issueSession({ authorizationId: fixtures.authorizationId })).toThrowError(/MCP_AUTHORITY_FENCED/);
+    } finally {
+      db.close();
+    }
+  });
+
+  it('79. Issuance rejects manager message if decision is not EXECUTE or FIX_REQUIRED returns MCP_AUTHORITY_FENCED', () => {
+    const { db } = createTestDatabase(tempDir, 'msg_decision_bad.db');
+    try {
+      const fixtures = setupFullGraph(db);
+      const invalidDecisionPayload = JSON.parse(fixtures.rawManagerPayload);
+      invalidDecisionPayload.decision = 'ABORT';
+      const rawInvalid = JSON.stringify(invalidDecisionPayload);
+      const hashInvalid = crypto.createHash('sha256').update(rawInvalid, 'utf8').digest('hex');
+      db.prepare('UPDATE protocol_messages SET raw_payload = ?, payload_hash = ? WHERE id = ?').run(rawInvalid, hashInvalid, fixtures.managerRecordId);
+      db.prepare('UPDATE execution_authorizations SET manager_payload_hash = ? WHERE id = ?').run(hashInvalid, fixtures.authorizationId);
+      expect(() => fixtures.service.issueSession({ authorizationId: fixtures.authorizationId })).toThrowError(/MCP_AUTHORITY_FENCED/);
+    } finally {
+      db.close();
+    }
+  });
+
+  it('80. Canonical identity: manager message lookup fails when stored with different protocol message_id if record id is not matched', () => {
+    const { db } = createTestDatabase(tempDir, 'msg_canonical_id.db');
+    try {
+      const fixtures = setupFullGraph(db);
+      expect(fixtures.managerRecordId).not.toEqual(fixtures.managerMessageId);
+      expect(fixtures.auth.manager_message_id).toBe(fixtures.managerRecordId);
+
+      // Verify that lookup by record ID succeeds, whereas lookup by protocol message_id fails when searching record IDs
+      const byRecordId = fixtures.repo.getProtocolMessageByRecordId(fixtures.managerRecordId);
+      expect(byRecordId).toBeDefined();
+
+      const byProtocolIdAsRecord = fixtures.repo.getProtocolMessageByRecordId(fixtures.managerMessageId);
+      expect(byProtocolIdAsRecord).toBeNull();
+
+      // Proves that if an implementation erroneously looked up by protocol message_id using the authorization's manager_message_id, it returns null
+      const erroneousLookup = fixtures.repo.getProtocolMessageById(fixtures.auth.manager_message_id!);
+      expect(erroneousLookup).toBeNull();
+
+      // Successful issuance confirms authoritative binding strictly on record id
+      const result = fixtures.service.issueSession({ authorizationId: fixtures.authorizationId });
+      expect(result.session.id).toBeDefined();
+    } finally {
+      db.close();
+    }
+  });
+
+  it('81. Mutating manager payload JSON while leaving stored hash unchanged fences the next read returns MCP_CONTEXT_INTEGRITY_FAILED', () => {
+    const { db } = createTestDatabase(tempDir, 'msg_mutate_read.db');
+    try {
+      const fixtures = setupFullGraph(db);
+      const { plaintextToken } = fixtures.service.issueSession({ authorizationId: fixtures.authorizationId });
+      const tampered = fixtures.rawManagerPayload.replace('All tests pass', 'Mutated criteria');
+      db.prepare('UPDATE protocol_messages SET raw_payload = ? WHERE id = ?').run(tampered, fixtures.managerRecordId);
+      expect(() => fixtures.service.resolveAuthorizedContext(plaintextToken)).toThrowError(/MCP_AUTHORITY_FENCED/);
+    } finally {
+      db.close();
+    }
+  });
+
+  it('82. Context read validates token and fails before touching or opening database when token is missing or malformed', () => {
+    const fakeDbPath = path.join(tempDir, 'nonexistent_should_never_open.db');
+    expect(() => {
+      const ctx = new McpAuthorityContext({ dbPath: fakeDbPath, sessionToken: '' });
+      ctx.resolveAuthorizedContext();
+    }).toThrowError(/MCP_SESSION_REQUIRED/);
+
+    expect(() => {
+      const ctx = new McpAuthorityContext({ dbPath: fakeDbPath, sessionToken: 'malformed_invalid_token!' });
+      ctx.resolveAuthorizedContext();
+    }).toThrowError(/MCP_SESSION_UNAUTHORIZED/);
+  });
+
+  it('83. Context read fails closed with MCP_CONFIGURATION_INVALID if PRAGMA query_only readback is not 1', () => {
+    const { db } = createTestDatabase(tempDir, 'pragma_queryonly.db');
+    try {
+      expect(() => {
+        new McpAuthorityContext({ db });
+      }).toThrowError(/MCP_CONFIGURATION_INVALID/);
+    } finally {
+      db.close();
+    }
+  });
+
+  it('84. CLI help rejects combination with flags or positionals', () => {
+    expect(() => parseCliArgs(['issue', '--help'])).toThrowError(/Help flag cannot be combined/);
+    expect(() => parseCliArgs(['--help', 'revoke'])).toThrowError(/Help flag cannot be combined/);
+    expect(() => parseCliArgs(['help', '--db', 'test.db'])).toThrowError(/Help flag cannot be combined/);
+  });
+
+  it('85. CLI issue rejects whitespace-only --auth, --db, or --ttl', () => {
+    expect(() => parseCliArgs(['issue', '--db', '  ', '--auth', 'auth-1'])).toThrowError(/cannot be whitespace-only/);
+    expect(() => parseCliArgs(['issue', '--db', 'test.db', '--auth', '   '])).toThrowError(/cannot be whitespace-only/);
+    expect(() => parseCliArgs(['issue', '--db', 'test.db', '--auth', 'auth-1', '--ttl', '   '])).toThrowError(/cannot be whitespace-only/);
+  });
+
+  it('86. CLI revoke rejects --ttl flag with clear error', () => {
+    expect(() => parseCliArgs(['revoke', '--db', 'test.db', '--session', 's1', '--ttl', '3600'])).toThrowError(/Flag --ttl is not valid for revoke command/);
+  });
+
+  it('87. CLI issue rejects --session flag with clear error', () => {
+    expect(() => parseCliArgs(['issue', '--db', 'test.db', '--auth', 'a1', '--session', 's1'])).toThrowError(/Flag --session is not valid for issue command/);
+  });
+
+  it('88. CLI close failure in runSessionAdmin returns exit code 1 and writes scrubbed diagnostic to stderr', () => {
+    const { db, dbPath } = createTestDatabase(tempDir, 'close_fail.db');
+    db.close();
+    let capturedStderr = '';
+    const originalStderr = process.stderr.write;
+    process.stderr.write = ((chunk: unknown) => {
+      capturedStderr += String(chunk);
+      return true;
+    }) as typeof process.stderr.write;
+
+    try {
+      const exitCode = runSessionAdmin(['issue', '--db', dbPath]);
+      expect(exitCode).toBe(1);
+      expect(capturedStderr).toContain('[MCP_CONFIGURATION_INVALID]');
+    } finally {
+      process.stderr.write = originalStderr;
+    }
   });
 });

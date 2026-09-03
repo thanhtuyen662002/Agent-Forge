@@ -19,7 +19,21 @@ export interface CliArgs {
 }
 
 export function parseCliArgs(args: string[]): CliArgs {
-  let command: 'issue' | 'revoke' | 'help' | null = null;
+  // 1. Help must be a sole canonical invocation
+  const hasHelpFlag = args.includes('--help') || args.includes('-h') || args.includes('help');
+  if (hasHelpFlag) {
+    if (args.length === 1 && (args[0] === '--help' || args[0] === '-h' || args[0] === 'help')) {
+      return { command: 'help', jsonOutput: false };
+    }
+    throw new Error('Help flag cannot be combined with other arguments or commands');
+  }
+
+  if (args.length === 0) {
+    return { command: 'help', jsonOutput: false };
+  }
+
+  // 2. First non-flag argument must be command (issue or revoke)
+  let command: 'issue' | 'revoke' | null = null;
   let dbPath: string | undefined = process.env.AGENTFORGE_MCP_DB_PATH;
   let authorizationId: string | undefined;
   let sessionId: string | undefined;
@@ -32,13 +46,9 @@ export function parseCliArgs(args: string[]): CliArgs {
   for (let i = 0; i < args.length; i++) {
     const arg = args[i];
 
-    if (arg === '--help' || arg === '-h') {
-      return { command: 'help', jsonOutput: false };
-    }
-
     if (arg.startsWith('-')) {
-      // Flag handling
-      const normalizedFlag = arg === '-d' ? '--db'
+      const normalizedFlag =
+        arg === '-d' ? '--db'
         : arg === '-a' ? '--auth'
         : arg === '-s' ? '--session'
         : arg === '-t' ? '--ttl'
@@ -52,20 +62,24 @@ export function parseCliArgs(args: string[]): CliArgs {
       if (arg === '--json') {
         jsonOutput = true;
       } else if (arg === '--db' || arg === '-d') {
+        if (i + 1 >= args.length || args[i + 1].startsWith('-')) throw new Error(`Missing value for flag "${arg}"`);
         const val = args[++i];
-        if (!val || val.startsWith('-')) throw new Error(`Missing value for flag "${arg}"`);
-        dbPath = val;
+        if (val.trim().length === 0) throw new Error(`Flag "${arg}" cannot be whitespace-only`);
+        dbPath = val.trim();
       } else if (arg === '--auth' || arg === '-a') {
+        if (i + 1 >= args.length || args[i + 1].startsWith('-')) throw new Error(`Missing value for flag "${arg}"`);
         const val = args[++i];
-        if (!val || val.startsWith('-')) throw new Error(`Missing value for flag "${arg}"`);
-        authorizationId = val;
+        if (val.trim().length === 0) throw new Error(`Flag "${arg}" cannot be whitespace-only`);
+        authorizationId = val.trim();
       } else if (arg === '--session' || arg === '-s') {
+        if (i + 1 >= args.length || args[i + 1].startsWith('-')) throw new Error(`Missing value for flag "${arg}"`);
         const val = args[++i];
-        if (!val || val.startsWith('-')) throw new Error(`Missing value for flag "${arg}"`);
-        sessionId = val;
+        if (val.trim().length === 0) throw new Error(`Flag "${arg}" cannot be whitespace-only`);
+        sessionId = val.trim();
       } else if (arg === '--ttl' || arg === '-t') {
+        if (i + 1 >= args.length || args[i + 1].startsWith('-')) throw new Error(`Missing value for flag "${arg}"`);
         const val = args[++i];
-        if (!val || val.startsWith('-')) throw new Error(`Missing value for flag "${arg}"`);
+        if (val.trim().length === 0) throw new Error(`Flag "${arg}" cannot be whitespace-only`);
         ttlSeconds = validateTtlSeconds(val);
       } else {
         throw new Error(`Unknown flag "${arg}"`);
@@ -75,34 +89,45 @@ export function parseCliArgs(args: string[]): CliArgs {
     }
   }
 
-  if (positional.length > 0) {
-    const cmd = positional[0].toLowerCase();
-    if (cmd === 'issue' || cmd === 'revoke' || cmd === 'help') {
-      command = cmd;
-    } else {
-      throw new Error(`Unknown command "${positional[0]}"`);
-    }
-
-    if (positional.length > 1) {
-      throw new Error(`Surplus positional argument "${positional[1]}"`);
-    }
+  if (positional.length === 0) {
+    throw new Error('Missing command (expected "issue" or "revoke")');
   }
 
-  if (!command) {
-    command = 'help';
+  const rawCmd = positional[0].toLowerCase();
+  if (rawCmd === 'issue' || rawCmd === 'revoke') {
+    command = rawCmd;
+  } else {
+    throw new Error(`Unknown command "${positional[0]}"`);
+  }
+
+  if (positional.length > 1) {
+    throw new Error(`Surplus positional argument "${positional[1]}"`);
+  }
+
+  // 3. Command-specific closed grammar validation
+  if (command === 'issue') {
+    if (sessionId) {
+      throw new Error('Flag --session is not valid for issue command');
+    }
+    if (!authorizationId) {
+      throw new Error('Issue command requires --auth <authorization-id>');
+    }
+    if (!dbPath) {
+      throw new Error('Issue command requires --db <database-path>');
+    }
   }
 
   if (command === 'revoke') {
+    if (ttlSeconds !== undefined || seenFlags.has('--ttl')) {
+      throw new Error('Flag --ttl is not valid for revoke command');
+    }
     const hasSession = Boolean(sessionId);
     const hasAuth = Boolean(authorizationId);
     if ((hasSession && hasAuth) || (!hasSession && !hasAuth)) {
       throw new Error('Revoke requires exactly one selector: --session XOR --auth');
     }
-  }
-
-  if (command === 'issue') {
-    if (sessionId) {
-      throw new Error('Flag --session is not valid for issue command');
+    if (!dbPath) {
+      throw new Error('Revoke command requires --db <database-path>');
     }
   }
 
@@ -122,7 +147,7 @@ export function runSessionAdmin(rawArgs: string[]): number {
     options = parseCliArgs(rawArgs);
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
-    process.stderr.write(`ERROR: ${msg}\n`);
+    process.stderr.write(`ERROR: [MCP_CONFIGURATION_INVALID] ${msg}\n`);
     return 1;
   }
 
@@ -139,40 +164,38 @@ Usage:
   }
 
   if (!options.dbPath || typeof options.dbPath !== 'string' || options.dbPath.trim().length === 0) {
-    process.stderr.write('ERROR: Missing required --db path or AGENTFORGE_MCP_DB_PATH environment variable\n');
+    process.stderr.write('ERROR: [MCP_CONFIGURATION_INVALID] Missing required --db path\n');
     return 1;
   }
 
   const resolvedDbPath = path.resolve(options.dbPath.trim());
   if (!fs.existsSync(resolvedDbPath)) {
-    process.stderr.write(`ERROR: Database file does not exist at "${resolvedDbPath}"\n`);
+    process.stderr.write('ERROR: [MCP_CONFIGURATION_INVALID] Database file does not exist\n');
     return 1;
   }
 
-  let db: Database.Database;
+  let db: Database.Database | null = null;
   try {
-    db = new Database(resolvedDbPath, { fileMustExist: true });
-  } catch (error) {
-    const msg = error instanceof Error ? error.message : String(error);
-    process.stderr.write(`ERROR: Failed to open database: ${msg}\n`);
-    return 1;
-  }
+    try {
+      db = new Database(resolvedDbPath, { fileMustExist: true });
+    } catch {
+      process.stderr.write('ERROR: [MCP_CONFIGURATION_INVALID] Failed to open database\n');
+      return 1;
+    }
 
-  try {
     // 1. Enable and verify PRAGMA foreign_keys = ON
     db.pragma('foreign_keys = ON');
     const fkState = db.pragma('foreign_keys', { simple: true }) as number;
     if (fkState !== 1) {
-      process.stderr.write('ERROR: Failed to enable foreign_keys pragma on database connection\n');
+      process.stderr.write('ERROR: [MCP_CONFIGURATION_INVALID] Failed to enable foreign keys\n');
       return 1;
     }
 
-    // 2. Shared schema-authority verifier (fails closed on missing ledger or malformed schema)
+    // 2. Shared schema-authority verifier
     try {
       verifyMigration21SchemaAuthority(db);
-    } catch (err) {
-      const msg = err instanceof Error ? err.message : String(err);
-      process.stderr.write(`ERROR: Database schema authority check failed: ${msg}\n`);
+    } catch {
+      process.stderr.write('ERROR: [MCP_CONFIGURATION_INVALID] Database schema authority verification failed\n');
       return 1;
     }
 
@@ -181,7 +204,7 @@ Usage:
 
     if (options.command === 'issue') {
       if (!options.authorizationId) {
-        process.stderr.write('ERROR: Missing required --auth <authorization-id> argument for issue\n');
+        process.stderr.write('ERROR: [MCP_CONFIGURATION_INVALID] Missing required authorization ID\n');
         return 1;
       }
 
@@ -235,21 +258,27 @@ Usage:
 
     return 1;
   } catch (error) {
-    const msg = error instanceof McpAuthorityError ? error.rawMessage : error instanceof Error ? error.message : String(error);
-    process.stderr.write(`ERROR: ${msg}\n`);
+    if (error instanceof McpAuthorityError) {
+      process.stderr.write(`ERROR: [${error.category}] ${error.rawMessage}\n`);
+    } else {
+      process.stderr.write('ERROR: [MCP_AUTHORITY_FENCED] Administration operation failed\n');
+    }
     return 1;
   } finally {
-    try {
-      if (db.open) {
-        db.close();
+    if (db) {
+      try {
+        if (db.open) {
+          db.close();
+        }
+      } catch {
+        process.stderr.write('ERROR: [MCP_INTERNAL_ERROR] Database close failed\n');
+        return 1;
       }
-    } catch {
-      // Ignore cleanup error during shutdown
     }
   }
 }
 
-if (require.main === module) {
+if (typeof require !== 'undefined' && require.main === module) {
   const exitCode = runSessionAdmin(process.argv.slice(2));
   process.exit(exitCode);
 }

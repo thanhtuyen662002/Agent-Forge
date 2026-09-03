@@ -1447,7 +1447,7 @@ export function verifyMigration21SchemaAuthority(db: Database.Database): void {
     throw new Error('Table mcp_client_sessions is missing');
   }
 
-  // 3. Required columns, PK, notnull
+  // 3. Exactly eight required columns, PK, notnull, type
   const columns = db.prepare("PRAGMA table_info(mcp_client_sessions)").all() as {
     cid: number;
     name: string;
@@ -1456,6 +1456,9 @@ export function verifyMigration21SchemaAuthority(db: Database.Database): void {
     dflt_value: unknown;
     pk: number;
   }[];
+  if (columns.length !== 8) {
+    throw new Error(`Table mcp_client_sessions missing column authority: expected exactly 8 columns (found ${columns.length})`);
+  }
   const colMap = new Map(columns.map((c) => [c.name, c]));
 
   const requiredCols: Array<{ name: string; type: string; notnull: number; pk: number }> = [
@@ -1477,11 +1480,11 @@ export function verifyMigration21SchemaAuthority(db: Database.Database): void {
     if (col.type !== req.type) {
       throw new Error(`Column "${req.name}" has unexpected type "${col.type}" (expected "${req.type}")`);
     }
-    if (req.name === 'id' && col.pk !== 1) {
-      throw new Error('Column "id" must be primary key');
+    if (col.pk !== req.pk) {
+      throw new Error(`Column "${req.name}" pk authority mismatch (expected ${req.pk}, got ${col.pk})`);
     }
-    if (req.notnull === 1 && col.notnull !== 1) {
-      throw new Error(`Column "${req.name}" must be NOT NULL`);
+    if (col.notnull !== req.notnull) {
+      throw new Error(`Column "${req.name}" notnull authority mismatch (expected ${req.notnull}, got ${col.notnull})`);
     }
   }
 
@@ -1496,14 +1499,22 @@ export function verifyMigration21SchemaAuthority(db: Database.Database): void {
     on_delete: string;
     match: string;
   }[];
-  const authFk = fks.find(
-    (fk) => fk.table === 'execution_authorizations' && fk.from === 'authorization_id' && fk.to === 'id'
-  );
-  if (!authFk || authFk.on_delete !== 'RESTRICT') {
-    throw new Error('Table mcp_client_sessions missing RESTRICT foreign key on authorization_id -> execution_authorizations(id)');
+  if (fks.length !== 1) {
+    throw new Error(`Table mcp_client_sessions must have exactly 1 foreign key (found ${fks.length})`);
+  }
+  const authFk = fks[0];
+  if (
+    authFk.table !== 'execution_authorizations' ||
+    authFk.from !== 'authorization_id' ||
+    authFk.to !== 'id' ||
+    authFk.on_delete !== 'RESTRICT' ||
+    authFk.on_update !== 'NO ACTION' ||
+    authFk.match !== 'NONE'
+  ) {
+    throw new Error('Table mcp_client_sessions foreign key authority mismatch on authorization_id -> execution_authorizations(id)');
   }
 
-  // 5. Indexes
+  // 5. Indexes verification via PRAGMA index_list, index_info, and sqlite_master
   const indexes = db.prepare("PRAGMA index_list(mcp_client_sessions)").all() as {
     seq: number;
     name: string;
@@ -1513,33 +1524,76 @@ export function verifyMigration21SchemaAuthority(db: Database.Database): void {
   }[];
   const idxMap = new Map(indexes.map((idx) => [idx.name, idx]));
 
+  // 5.1 uq_mcp_client_sessions_active_auth
   const activeAuthIdx = idxMap.get('uq_mcp_client_sessions_active_auth');
   if (!activeAuthIdx || activeAuthIdx.unique !== 1 || activeAuthIdx.partial !== 1) {
     throw new Error('Table mcp_client_sessions missing unique partial index uq_mcp_client_sessions_active_auth');
   }
-
-  const tokenHashIdx = idxMap.get('idx_mcp_client_sessions_token_hash');
-  if (!tokenHashIdx || tokenHashIdx.unique !== 1) {
-    throw new Error('Table mcp_client_sessions missing unique index idx_mcp_client_sessions_token_hash');
+  const activeAuthCols = db.prepare("PRAGMA index_info('uq_mcp_client_sessions_active_auth')").all() as { seqno: number; cid: number; name: string }[];
+  if (activeAuthCols.length !== 1 || activeAuthCols[0].name !== 'authorization_id') {
+    throw new Error('Index uq_mcp_client_sessions_active_auth must index exactly [authorization_id]');
+  }
+  const activeAuthSqlRow = db
+    .prepare("SELECT sql FROM sqlite_master WHERE type = 'index' AND name = 'uq_mcp_client_sessions_active_auth'")
+    .get() as { sql: string } | undefined;
+  const activeAuthSql = (activeAuthSqlRow?.sql ?? '').replace(/\s+/g, ' ').trim();
+  if (!/WHERE\s+revoked_at\s+IS\s+NULL$/i.test(activeAuthSql)) {
+    throw new Error('Index uq_mcp_client_sessions_active_auth must have exact partial predicate WHERE revoked_at IS NULL');
   }
 
+  // 5.2 idx_mcp_client_sessions_token_hash
+  const tokenHashIdx = idxMap.get('idx_mcp_client_sessions_token_hash');
+  if (!tokenHashIdx || tokenHashIdx.unique !== 1 || tokenHashIdx.partial !== 0) {
+    throw new Error('Table mcp_client_sessions missing unique index idx_mcp_client_sessions_token_hash');
+  }
+  const tokenHashCols = db.prepare("PRAGMA index_info('idx_mcp_client_sessions_token_hash')").all() as { seqno: number; cid: number; name: string }[];
+  if (tokenHashCols.length !== 1 || tokenHashCols[0].name !== 'token_hash') {
+    throw new Error('Index idx_mcp_client_sessions_token_hash must index exactly [token_hash]');
+  }
+
+  // 5.3 idx_mcp_client_sessions_expires_at
   const expiresAtIdx = idxMap.get('idx_mcp_client_sessions_expires_at');
-  if (!expiresAtIdx) {
+  if (!expiresAtIdx || expiresAtIdx.unique !== 0 || expiresAtIdx.partial !== 0) {
     throw new Error('Table mcp_client_sessions missing index idx_mcp_client_sessions_expires_at');
+  }
+  const expiresAtCols = db.prepare("PRAGMA index_info('idx_mcp_client_sessions_expires_at')").all() as { seqno: number; cid: number; name: string }[];
+  if (expiresAtCols.length !== 1 || expiresAtCols[0].name !== 'expires_at') {
+    throw new Error('Index idx_mcp_client_sessions_expires_at must index exactly [expires_at]');
+  }
+
+  // 5.4 idx_mcp_client_sessions_auth_id
+  const authIdIdx = idxMap.get('idx_mcp_client_sessions_auth_id');
+  if (!authIdIdx || authIdIdx.unique !== 0 || authIdIdx.partial !== 0) {
+    throw new Error('Table mcp_client_sessions missing index idx_mcp_client_sessions_auth_id');
+  }
+  const authIdCols = db.prepare("PRAGMA index_info('idx_mcp_client_sessions_auth_id')").all() as { seqno: number; cid: number; name: string }[];
+  if (authIdCols.length !== 1 || authIdCols[0].name !== 'authorization_id') {
+    throw new Error('Index idx_mcp_client_sessions_auth_id must index exactly [authorization_id]');
   }
 
   // 6. CHECK constraints in table sql
   const tableSqlRow = db
     .prepare("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'mcp_client_sessions'")
     .get() as { sql: string } | undefined;
-  const sql = tableSqlRow?.sql ?? '';
-  if (
-    !sql.includes("scope = 'AUTHORIZED_CONTEXT_READ'") ||
-    !sql.includes("length(token_hash) = 64") ||
-    !sql.includes("length(authorization_fingerprint) = 64") ||
-    !sql.includes("expires_at > issued_at")
-  ) {
-    throw new Error('Table mcp_client_sessions missing required CHECK constraints');
+  const sql = (tableSqlRow?.sql ?? '').replace(/\s+/g, ' ');
+
+  if (!/CHECK\s*\(\s*scope\s*=\s*'AUTHORIZED_CONTEXT_READ'\s*\)/i.test(sql)) {
+    throw new Error('Table mcp_client_sessions missing scope CHECK constraint');
+  }
+  if (!/CHECK\s*\(\s*length\(token_hash\)\s*=\s*64\s+AND\s+token_hash\s+GLOB\s+'(\[0-9a-f\]){64}'\s*\)/i.test(sql)) {
+    throw new Error('Table mcp_client_sessions missing token_hash CHECK constraint');
+  }
+  if (!/CHECK\s*\(\s*length\(authorization_fingerprint\)\s*=\s*64\s+AND\s+authorization_fingerprint\s+GLOB\s+'(\[0-9a-f\]){64}'\s*\)/i.test(sql)) {
+    throw new Error('Table mcp_client_sessions missing authorization_fingerprint CHECK constraint');
+  }
+  if (!/CHECK\s*\(\s*length\(issued_at\)\s*>\s*0\s*\)/i.test(sql)) {
+    throw new Error('Table mcp_client_sessions missing issued_at CHECK constraint');
+  }
+  if (!/CHECK\s*\(\s*length\(expires_at\)\s*>\s*0\s+AND\s+expires_at\s*>\s*issued_at\s*\)/i.test(sql)) {
+    throw new Error('Table mcp_client_sessions missing expires_at CHECK constraint');
+  }
+  if (!/CHECK\s*\(\s*revoked_at\s+IS\s+NULL\s+OR\s+\(\s*length\(revoked_at\)\s*>\s*0\s+AND\s+revoked_at\s*>=\s*issued_at\s*\)\s*\)/i.test(sql)) {
+    throw new Error('Table mcp_client_sessions missing revoked_at CHECK constraint');
   }
 }
 

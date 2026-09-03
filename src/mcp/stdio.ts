@@ -17,9 +17,8 @@ export function runStdioServer(): StdioServerHandle {
     removeSignalListeners();
     try {
       resetDefaultAuthorityContext();
-    } catch (err) {
-      const msg = err instanceof Error ? err.message : String(err);
-      process.stderr.write(`[agentforge-mcp] Cleanup diagnostic: ${msg}\n`);
+    } catch {
+      process.stderr.write('[agentforge-mcp] Cleanup diagnostic: MCP_CLEANUP_FAILED\n');
     }
   };
 
@@ -43,9 +42,8 @@ export function runStdioServer(): StdioServerHandle {
 
   try {
     const handle = serveStdio(() => buildAgentForgeMcpServer(), {
-      onerror: (error: Error) => {
-        const message = error instanceof Error ? error.message : String(error);
-        process.stderr.write(`[agentforge-mcp] ${message}\n`);
+      onerror: () => {
+        process.stderr.write('[agentforge-mcp] MCP_SERVER_ERROR\n');
       },
     });
 
@@ -56,20 +54,18 @@ export function runStdioServer(): StdioServerHandle {
     };
 
     return handle;
-  } catch (error) {
-    const message = error instanceof Error ? error.message : String(error);
-    process.stderr.write(`[agentforge-mcp-fatal] Startup failure: ${message}\n`);
+  } catch {
+    process.stderr.write('[agentforge-mcp-fatal] Startup failure: MCP_STARTUP_FAILED\n');
     cleanup();
     process.exit(1);
   }
 }
 
-if (require.main === module) {
+if (typeof require !== 'undefined' && require.main === module) {
   try {
     runStdioServer();
-  } catch (error) {
-    const message = error instanceof Error ? error.message : String(error);
-    process.stderr.write(`[agentforge-mcp-fatal] ${message}\n`);
+  } catch {
+    process.stderr.write('[agentforge-mcp-fatal] MCP_FATAL_ERROR\n');
     process.exit(1);
   }
 }

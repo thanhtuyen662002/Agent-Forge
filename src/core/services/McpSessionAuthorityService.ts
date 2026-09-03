@@ -22,6 +22,7 @@ import {
   computeContextManifestHash,
   CanonicalExecutionPayload,
 } from './ExecutionAuthorizationService';
+import { ManagerProtocolSchema } from '../types/protocols';
 
 export class McpAuthorityError extends Error {
   public readonly category: McpSessionErrorCode;
@@ -185,6 +186,7 @@ export function computeCompleteAuthorityFingerprint(graph: ValidatedAuthorityGra
       id: project.id,
       name: project.name,
       repository_path: project.repository_path,
+      status: project.status,
     },
     task: {
       id: task.id,
@@ -192,6 +194,7 @@ export function computeCompleteAuthorityFingerprint(graph: ValidatedAuthorityGra
       title: task.title,
       state: task.state,
       revision_count: task.revision_count,
+      ownership_epoch: task.ownership_epoch ?? null,
     },
     attempt: {
       id: attempt.id,
@@ -232,37 +235,22 @@ export function computeCompleteAuthorityFingerprint(graph: ValidatedAuthorityGra
     routing: {
       id: routingEvent.id,
       type: routingEvent.type,
-      project_id: routingPayload.project_id ?? routingPayload.projectId,
-      task_id: routingPayload.task_id ?? routingPayload.taskId,
-      attempt_id: routingPayload.attempt_id ?? routingPayload.attemptId,
-      routing_decision_id:
-        routingPayload.routing_decision_id ??
-        routingPayload.routingDecisionId ??
-        routingPayload.decisionId,
-      selected_provider_id:
-        routingPayload.selected_provider_id ??
-        routingPayload.selectedProviderId ??
-        routingPayload.providerId,
-      selected_account_id:
-        routingPayload.selected_account_id ??
-        routingPayload.selectedAccountId ??
-        routingPayload.accountId,
-      selected_resource_id:
-        routingPayload.selected_resource_id ??
-        routingPayload.selectedResourceId ??
-        routingPayload.resourceId,
-      selected_outcome:
-        routingPayload.selected_outcome ??
-        routingPayload.selectedOutcome ??
-        routingPayload.outcome,
+      project_id: routingEvent.project_id,
+      task_id: routingEvent.task_id,
       raw_payload: routingPayload,
     },
     protocol_message: protocolMessage
       ? {
           id: protocolMessage.id,
-          payload_hash: protocolMessage.payload_hash,
+          message_id: protocolMessage.message_id,
+          protocol: protocolMessage.protocol,
           project_id: protocolMessage.project_id,
           task_id: protocolMessage.task_id,
+          decision: protocolMessage.decision,
+          sequence: protocolMessage.sequence,
+          state: protocolMessage.state,
+          payload_hash: protocolMessage.payload_hash,
+          payload_json: protocolMessage.payload_json,
         }
       : null,
   };
@@ -354,6 +342,9 @@ export class McpSessionAuthorityService {
     if (!project || project.id !== auth.project_id) {
       throw new McpAuthorityError('MCP_AUTHORITY_FENCED', `Project "${auth.project_id}" not found or mismatched`);
     }
+    if (project.status !== 'RUNNING') {
+      throw new McpAuthorityError('MCP_AUTHORITY_FENCED', `Project status "${project.status}" is not active RUNNING`);
+    }
 
     // 5. Task
     const task = this.repo.getTask(auth.task_id);
@@ -363,12 +354,18 @@ export class McpSessionAuthorityService {
     if (task.project_id !== auth.project_id) {
       throw new McpAuthorityError('MCP_AUTHORITY_FENCED', 'Task project_id does not match authorization project_id');
     }
+    if (task.state === 'DONE' || task.state === 'FAILED' || task.state === 'CANCELLED') {
+      throw new McpAuthorityError('MCP_AUTHORITY_FENCED', `Task state "${task.state}" is terminal`);
+    }
     if (task.revision_count !== auth.task_revision) {
       throw new McpAuthorityError('MCP_AUTHORITY_FENCED', 'Task revision_count does not match authorization task_revision');
     }
 
     // 6. Ownership epoch
-    const taskEpoch = (task as unknown as { ownership_epoch?: number }).ownership_epoch ?? auth.task_ownership_epoch;
+    const taskEpoch = task.ownership_epoch;
+    if (taskEpoch == null || taskEpoch <= 0) {
+      throw new McpAuthorityError('MCP_AUTHORITY_FENCED', 'Task missing valid ownership_epoch');
+    }
     if (auth.task_ownership_epoch == null || auth.task_ownership_epoch <= 0) {
       throw new McpAuthorityError('MCP_AUTHORITY_FENCED', 'Authorization missing valid task_ownership_epoch');
     }
@@ -389,6 +386,9 @@ export class McpSessionAuthorityService {
     }
     if (attempt.task_id !== auth.task_id) {
       throw new McpAuthorityError('MCP_AUTHORITY_FENCED', 'Attempt task_id does not match authorization task_id');
+    }
+    if (attempt.status !== 'RUNNING') {
+      throw new McpAuthorityError('MCP_AUTHORITY_FENCED', `Attempt status "${attempt.status}" is not active execution status RUNNING`);
     }
 
     // 8. Agent Assignment
@@ -471,6 +471,15 @@ export class McpSessionAuthorityService {
     if (!routingEvent) {
       throw new McpAuthorityError('MCP_AUTHORITY_FENCED', `Routing decision event "${auth.routing_decision_id}" not found`);
     }
+    if (routingEvent.id !== auth.routing_decision_id) {
+      throw new McpAuthorityError('MCP_AUTHORITY_FENCED', 'Routing event id mismatch');
+    }
+    if (routingEvent.project_id !== auth.project_id) {
+      throw new McpAuthorityError('MCP_AUTHORITY_FENCED', 'Routing event project_id mismatch');
+    }
+    if (routingEvent.task_id !== auth.task_id) {
+      throw new McpAuthorityError('MCP_AUTHORITY_FENCED', 'Routing event task_id mismatch');
+    }
     if (
       routingEvent.type !== 'PROVIDER_ROUTING_DECISION' &&
       routingEvent.type !== 'ROLE_AWARE_ROUTING_DECISION'
@@ -480,86 +489,208 @@ export class McpSessionAuthorityService {
 
     // Validate mandatory routing payload fields without optional truthiness
     const rPayload = (routingEvent.structured_payload ?? {}) as Record<string, unknown>;
-    if (typeof rPayload !== 'object' || rPayload === null) {
+    if (typeof rPayload !== 'object' || rPayload === null || Array.isArray(rPayload)) {
       throw new McpAuthorityError('MCP_AUTHORITY_FENCED', 'Routing decision structured payload is missing or malformed');
     }
 
-    const rProjId = rPayload.project_id ?? rPayload.projectId;
-    if (typeof rProjId !== 'string' || rProjId !== auth.project_id) {
-      throw new McpAuthorityError('MCP_AUTHORITY_FENCED', 'Routing payload project_id missing or mismatched');
+    // Check for prohibited snake_case or duplicate alias keys
+    const prohibitedAliases = [
+      'project_id',
+      'task_id',
+      'attempt_id',
+      'routing_decision_id',
+      'routingDecisionId',
+      'selected_provider_id',
+      'providerId',
+      'selected_account_id',
+      'accountId',
+      'selected_resource_id',
+      'resourceId',
+      'selected_outcome',
+      'selectedOutcome',
+    ];
+    for (const key of prohibitedAliases) {
+      if (key in rPayload) {
+        throw new McpAuthorityError('MCP_AUTHORITY_FENCED', `Routing payload contains non-canonical or contradictory alias field "${key}"`);
+      }
     }
 
-    const rTaskId = rPayload.task_id ?? rPayload.taskId;
-    if (typeof rTaskId !== 'string' || rTaskId !== auth.task_id) {
-      throw new McpAuthorityError('MCP_AUTHORITY_FENCED', 'Routing payload task_id missing or mismatched');
-    }
+    if (routingEvent.type === 'ROLE_AWARE_ROUTING_DECISION') {
+      const allowedKeys = new Set([
+        'decisionId',
+        'projectId',
+        'taskId',
+        'attemptId',
+        'roleProfileId',
+        'role',
+        'outcome',
+        'routePolicyId',
+        'failoverPolicyAuthoritySnapshot',
+        'selectedProviderId',
+        'selectedAccountId',
+        'selectedResourceId',
+        'selectedAssignmentId',
+        'requestedConstraints',
+        'appliedExclusions',
+        'appliedSeparation',
+        'reason',
+      ]);
+      for (const key of Object.keys(rPayload)) {
+        if (!allowedKeys.has(key)) {
+          throw new McpAuthorityError('MCP_AUTHORITY_FENCED', `Routing payload contains unauthorized additional field "${key}"`);
+        }
+      }
 
-    const rAttemptId = rPayload.attempt_id ?? rPayload.attemptId;
-    if (typeof rAttemptId !== 'string' || rAttemptId !== auth.attempt_id) {
-      throw new McpAuthorityError('MCP_AUTHORITY_FENCED', 'Routing payload attempt_id missing or mismatched');
-    }
+      if (typeof rPayload.decisionId !== 'string' || rPayload.decisionId !== auth.routing_decision_id) {
+        throw new McpAuthorityError('MCP_AUTHORITY_FENCED', 'Routing payload decisionId missing or mismatched');
+      }
+      if (typeof rPayload.projectId !== 'string' || rPayload.projectId !== auth.project_id) {
+        throw new McpAuthorityError('MCP_AUTHORITY_FENCED', 'Routing payload projectId missing or mismatched');
+      }
+      if (typeof rPayload.taskId !== 'string' || rPayload.taskId !== auth.task_id) {
+        throw new McpAuthorityError('MCP_AUTHORITY_FENCED', 'Routing payload taskId missing or mismatched');
+      }
+      if (typeof rPayload.attemptId !== 'string' || rPayload.attemptId !== auth.attempt_id) {
+        throw new McpAuthorityError('MCP_AUTHORITY_FENCED', 'Routing payload attemptId missing or mismatched');
+      }
+      if (typeof rPayload.selectedProviderId !== 'string' || rPayload.selectedProviderId !== auth.selected_provider_id) {
+        throw new McpAuthorityError('MCP_AUTHORITY_FENCED', 'Routing payload selectedProviderId missing or mismatched');
+      }
+      if (typeof rPayload.selectedAccountId !== 'string' || rPayload.selectedAccountId !== auth.selected_account_id) {
+        throw new McpAuthorityError('MCP_AUTHORITY_FENCED', 'Routing payload selectedAccountId missing or mismatched');
+      }
+      if (typeof rPayload.selectedResourceId !== 'string' || rPayload.selectedResourceId !== auth.selected_resource_id) {
+        throw new McpAuthorityError('MCP_AUTHORITY_FENCED', 'Routing payload selectedResourceId missing or mismatched');
+      }
+      if (typeof rPayload.outcome !== 'string' || rPayload.outcome !== 'SELECTED') {
+        throw new McpAuthorityError('MCP_AUTHORITY_FENCED', 'Routing payload outcome missing or not SELECTED');
+      }
+    } else {
+      // PROVIDER_ROUTING_DECISION (legacy)
+      const allowedKeys = new Set([
+        'decisionId',
+        'projectId',
+        'taskId',
+        'attemptId',
+        'candidateResourceIds',
+        'selectedResourceId',
+        'selectedProviderId',
+        'outcome',
+        'reason',
+        'candidateEvaluations',
+      ]);
+      for (const key of Object.keys(rPayload)) {
+        if (!allowedKeys.has(key)) {
+          throw new McpAuthorityError('MCP_AUTHORITY_FENCED', `Routing payload contains unauthorized additional field "${key}"`);
+        }
+      }
 
-    const rDecisionId =
-      rPayload.routing_decision_id ?? rPayload.routingDecisionId ?? rPayload.decisionId;
-    if (typeof rDecisionId !== 'string' || rDecisionId !== auth.routing_decision_id) {
-      throw new McpAuthorityError('MCP_AUTHORITY_FENCED', 'Routing payload routing_decision_id missing or mismatched');
-    }
-
-    const rProvId =
-      rPayload.selected_provider_id ?? rPayload.selectedProviderId ?? rPayload.providerId;
-    if (typeof rProvId !== 'string' || rProvId !== auth.selected_provider_id) {
-      throw new McpAuthorityError('MCP_AUTHORITY_FENCED', 'Routing payload selected_provider_id missing or mismatched');
-    }
-
-    const rAccId =
-      rPayload.selected_account_id ?? rPayload.selectedAccountId ?? rPayload.accountId;
-    if (typeof rAccId !== 'string' || rAccId !== auth.selected_account_id) {
-      throw new McpAuthorityError('MCP_AUTHORITY_FENCED', 'Routing payload selected_account_id missing or mismatched');
-    }
-
-    const rResId =
-      rPayload.selected_resource_id ?? rPayload.selectedResourceId ?? rPayload.resourceId;
-    if (typeof rResId !== 'string' || rResId !== auth.selected_resource_id) {
-      throw new McpAuthorityError('MCP_AUTHORITY_FENCED', 'Routing payload selected_resource_id missing or mismatched');
-    }
-
-    const rOutcome =
-      rPayload.selected_outcome ?? rPayload.selectedOutcome ?? rPayload.outcome;
-    if (typeof rOutcome !== 'string' || rOutcome !== 'SELECTED') {
-      throw new McpAuthorityError('MCP_AUTHORITY_FENCED', 'Routing payload outcome missing or not SELECTED');
+      if (typeof rPayload.decisionId !== 'string' || rPayload.decisionId !== auth.routing_decision_id) {
+        throw new McpAuthorityError('MCP_AUTHORITY_FENCED', 'Routing payload decisionId missing or mismatched');
+      }
+      if (typeof rPayload.projectId !== 'string' || rPayload.projectId !== auth.project_id) {
+        throw new McpAuthorityError('MCP_AUTHORITY_FENCED', 'Routing payload projectId missing or mismatched');
+      }
+      if (typeof rPayload.taskId !== 'string' || rPayload.taskId !== auth.task_id) {
+        throw new McpAuthorityError('MCP_AUTHORITY_FENCED', 'Routing payload taskId missing or mismatched');
+      }
+      if (typeof rPayload.attemptId !== 'string' || rPayload.attemptId !== auth.attempt_id) {
+        throw new McpAuthorityError('MCP_AUTHORITY_FENCED', 'Routing payload attemptId missing or mismatched');
+      }
+      if (typeof rPayload.selectedProviderId !== 'string' || rPayload.selectedProviderId !== auth.selected_provider_id) {
+        throw new McpAuthorityError('MCP_AUTHORITY_FENCED', 'Routing payload selectedProviderId missing or mismatched');
+      }
+      if (typeof rPayload.selectedResourceId !== 'string' || rPayload.selectedResourceId !== auth.selected_resource_id) {
+        throw new McpAuthorityError('MCP_AUTHORITY_FENCED', 'Routing payload selectedResourceId missing or mismatched');
+      }
+      if (typeof rPayload.outcome !== 'string' || rPayload.outcome !== 'SELECTED') {
+        throw new McpAuthorityError('MCP_AUTHORITY_FENCED', 'Routing payload outcome missing or not SELECTED');
+      }
     }
 
     // 13. Protocol Message
     let protocolMessage: ProtocolMessageRecord | null = null;
     if (auth.manager_message_id) {
-      const msgRow =
-        this.repo.getProtocolMessageByRecordId(auth.manager_message_id) ??
-        this.repo.getProtocolMessageById(auth.manager_message_id);
+      const msgRow = this.repo.getProtocolMessageByRecordId(auth.manager_message_id);
       if (!msgRow) {
-        throw new McpAuthorityError('MCP_AUTHORITY_FENCED', `Manager protocol message "${auth.manager_message_id}" not found`);
+        throw new McpAuthorityError('MCP_AUTHORITY_FENCED', `Manager protocol message record "${auth.manager_message_id}" not found`);
       }
+
+      if (msgRow.protocol !== 'manager.v1') {
+        throw new McpAuthorityError('MCP_AUTHORITY_FENCED', 'Protocol message protocol is not manager.v1');
+      }
+      if (msgRow.status !== 'APPLIED') {
+        throw new McpAuthorityError('MCP_AUTHORITY_FENCED', `Protocol message state "${msgRow.status}" is not APPLIED`);
+      }
+      if (msgRow.project_id !== auth.project_id) {
+        throw new McpAuthorityError('MCP_AUTHORITY_FENCED', 'Protocol message project_id mismatch');
+      }
+      if (msgRow.task_id !== auth.task_id) {
+        throw new McpAuthorityError('MCP_AUTHORITY_FENCED', 'Protocol message task_id mismatch');
+      }
+      if (msgRow.payload_hash !== auth.manager_payload_hash) {
+        throw new McpAuthorityError('MCP_AUTHORITY_FENCED', 'Protocol message payload_hash mismatch');
+      }
+
+      const rawPayload = String(msgRow.raw_payload ?? '');
+      const recomputedHash = crypto.createHash('sha256').update(rawPayload, 'utf8').digest('hex');
+      if (recomputedHash !== msgRow.payload_hash || recomputedHash !== auth.manager_payload_hash) {
+        throw new McpAuthorityError('MCP_AUTHORITY_FENCED', 'Manager payload hash recomputation mismatch');
+      }
+
+      let parsedManagerObj: unknown;
+      try {
+        parsedManagerObj = JSON.parse(rawPayload);
+      } catch {
+        throw new McpAuthorityError('MCP_AUTHORITY_FENCED', 'Manager payload JSON syntax error');
+      }
+
+      const parsedManagerResult = ManagerProtocolSchema.safeParse(parsedManagerObj);
+      if (!parsedManagerResult.success) {
+        throw new McpAuthorityError('MCP_AUTHORITY_FENCED', 'Manager payload schema validation failed');
+      }
+      const managerData = parsedManagerResult.data;
+
+      if (managerData.protocol !== 'manager.v1') {
+        throw new McpAuthorityError('MCP_AUTHORITY_FENCED', 'Parsed manager protocol is not manager.v1');
+      }
+      if (managerData.project_id !== auth.project_id) {
+        throw new McpAuthorityError('MCP_AUTHORITY_FENCED', 'Parsed manager project_id mismatch');
+      }
+      if (managerData.task_id !== auth.task_id) {
+        throw new McpAuthorityError('MCP_AUTHORITY_FENCED', 'Parsed manager task_id mismatch');
+      }
+      if (managerData.decision !== 'EXECUTE' && managerData.decision !== 'FIX_REQUIRED') {
+        throw new McpAuthorityError('MCP_AUTHORITY_FENCED', `Manager decision "${managerData.decision}" does not authorize execution`);
+      }
+
+      const expectedRev =
+        msgRow.expected_revision !== null && msgRow.expected_revision !== undefined
+          ? Number(msgRow.expected_revision)
+          : managerData.expected_revision;
+      if (managerData.decision === 'EXECUTE') {
+        if (expectedRev !== null && expectedRev !== undefined && expectedRev !== auth.task_revision) {
+          throw new McpAuthorityError('MCP_AUTHORITY_FENCED', 'Manager expected_revision does not match task_revision');
+        }
+      } else if (managerData.decision === 'FIX_REQUIRED') {
+        if (expectedRev !== null && expectedRev !== undefined && expectedRev + 1 !== auth.task_revision) {
+          throw new McpAuthorityError('MCP_AUTHORITY_FENCED', 'Manager expected_revision + 1 does not match task_revision');
+        }
+      }
+
       protocolMessage = {
         id: String(msgRow.id),
         message_id: String(msgRow.message_id),
         protocol: String(msgRow.protocol),
         project_id: String(msgRow.project_id),
         task_id: msgRow.task_id ? String(msgRow.task_id) : null,
-        decision: String(msgRow.decision),
-        sequence: Number(msgRow.sequence),
+        decision: managerData.decision,
+        sequence: expectedRev ?? auth.task_revision,
         payload_hash: String(msgRow.payload_hash),
-        payload_json: String(msgRow.payload_json),
-        state: String(msgRow.state),
+        payload_json: rawPayload,
+        state: String(msgRow.status),
         created_at: String(msgRow.created_at),
       };
-      if (protocolMessage.payload_hash !== auth.manager_payload_hash) {
-        throw new McpAuthorityError('MCP_AUTHORITY_FENCED', 'Protocol message payload_hash mismatch');
-      }
-      if (protocolMessage.project_id !== auth.project_id) {
-        throw new McpAuthorityError('MCP_AUTHORITY_FENCED', 'Protocol message project_id mismatch');
-      }
-      if (protocolMessage.task_id !== auth.task_id) {
-        throw new McpAuthorityError('MCP_AUTHORITY_FENCED', 'Protocol message task_id mismatch');
-      }
     }
 
     // 14. Canonical Execution Payload

@@ -4,6 +4,7 @@ import { Repository } from '../core/database/repositories';
 import {
   McpSessionAuthorityService,
   McpAuthorityError,
+  validateCanonicalSessionToken,
 } from '../core/services/McpSessionAuthorityService';
 import { verifyMigration21SchemaAuthority } from '../core/database/migrations';
 import { AuthorizedContextResponse } from '../core/types/domain';
@@ -40,9 +41,8 @@ export class McpAuthorityContext {
       }
       try {
         verifyMigration21SchemaAuthority(options.db);
-      } catch (err) {
-        const msg = err instanceof Error ? err.message : String(err);
-        throw new McpAuthorityError('MCP_CONFIGURATION_INVALID', `Database schema verification failed: ${msg}`);
+      } catch {
+        throw new McpAuthorityError('MCP_CONFIGURATION_INVALID', 'Database schema authority verification failed');
       }
 
       this.db = options.db;
@@ -69,37 +69,40 @@ export class McpAuthorityContext {
 
     const dbPath = this.getDbPath();
     if (!dbPath || typeof dbPath !== 'string' || dbPath.trim().length === 0) {
-      throw new McpAuthorityError('MCP_CONFIGURATION_INVALID', 'Missing AGENTFORGE_MCP_DB_PATH environment variable');
+      throw new McpAuthorityError('MCP_CONFIGURATION_INVALID', 'Missing database path configuration');
     }
 
     const trimmedPath = dbPath.trim();
     if (!fs.existsSync(trimmedPath)) {
-      throw new McpAuthorityError('MCP_CONFIGURATION_INVALID', `Database file does not exist at "${trimmedPath}"`);
+      throw new McpAuthorityError('MCP_CONFIGURATION_INVALID', 'Database file does not exist');
     }
 
     let db: Database.Database;
     try {
       db = new Database(trimmedPath, { readonly: true, fileMustExist: true });
-    } catch (err) {
-      const msg = err instanceof Error ? err.message : String(err);
-      throw new McpAuthorityError('MCP_CONFIGURATION_INVALID', `Failed to open database: ${msg}`);
+    } catch {
+      throw new McpAuthorityError('MCP_CONFIGURATION_INVALID', 'Failed to open database');
     }
 
     try {
       db.pragma('query_only = ON');
-    } catch (err) {
+    } catch {
       db.close();
-      const msg = err instanceof Error ? err.message : String(err);
-      throw new McpAuthorityError('MCP_CONFIGURATION_INVALID', `Failed to set query_only pragma: ${msg}`);
+      throw new McpAuthorityError('MCP_CONFIGURATION_INVALID', 'Failed to set query_only pragma');
+    }
+
+    const queryOnly = db.pragma('query_only', { simple: true }) as number;
+    if (queryOnly !== 1) {
+      db.close();
+      throw new McpAuthorityError('MCP_CONFIGURATION_INVALID', 'Failed to verify query_only pragma');
     }
 
     // Verify exact Migration 21 ledger and schema authority
     try {
       verifyMigration21SchemaAuthority(db);
-    } catch (err) {
+    } catch {
       db.close();
-      const msg = err instanceof Error ? err.message : String(err);
-      throw new McpAuthorityError('MCP_CONFIGURATION_INVALID', `Database schema verification failed: ${msg}`);
+      throw new McpAuthorityError('MCP_CONFIGURATION_INVALID', 'Database schema authority verification failed');
     }
 
     const repo = new Repository(db);
@@ -113,16 +116,26 @@ export class McpAuthorityContext {
 
   /**
    * Resolves the authorized context using the configured session token and database.
-   * Token is passed canonically without trimming or normalization.
+   * Session token is strictly validated before touching or opening the database.
    */
   public resolveAuthorizedContext(): AuthorizedContextResponse {
     const sessionToken = this.getSessionToken();
-    const { service } = this.getOrCreateDatabase();
-    return service.resolveAuthorizedContext(sessionToken);
+    const validatedToken = validateCanonicalSessionToken(sessionToken);
+    const { db, service } = this.getOrCreateDatabase();
+
+    const changesBefore = db.pragma('total_changes', { simple: true }) as number;
+    const response = service.resolveAuthorizedContext(validatedToken);
+    const changesAfter = db.pragma('total_changes', { simple: true }) as number;
+
+    if (changesBefore !== changesAfter) {
+      throw new McpAuthorityError('MCP_AUTHORITY_FENCED', 'Database mutation detected during context read');
+    }
+
+    return response;
   }
 
   /**
-   * Safely closes the database handle. Observable diagnostic on failure.
+   * Safely closes the database handle. Observable diagnostic on failure without leaking details.
    */
   public close(): void {
     if (this.db) {
@@ -134,8 +147,7 @@ export class McpAuthorityContext {
           dbToClose.close();
         }
       } catch (err) {
-        const msg = err instanceof Error ? err.message : String(err);
-        process.stderr.write(`[agentforge-mcp-context] Failed to close database: ${msg}\n`);
+        process.stderr.write('[agentforge-mcp-context] Database close failed: MCP_INTERNAL_ERROR\n');
         throw err;
       }
     }
