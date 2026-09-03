@@ -17,13 +17,47 @@ import {
   TOOL_ANNOTATIONS,
 } from '../src/mcp/McpProtocolSchemas';
 
-const STDIO_SCRIPT_PATH = path.resolve(__dirname, '../dist-electron/mcp/stdio.js');
+const DIST_ELECTRON_DIR = path.resolve(__dirname, '../dist-electron');
+const DIST_PACKAGE_JSON_PATH = path.resolve(DIST_ELECTRON_DIR, 'package.json');
+const STDIO_SCRIPT_PATH = path.resolve(DIST_ELECTRON_DIR, 'mcp/stdio.js');
 
 describe('R5J1 MCP Server Foundation Integration Suite', () => {
   beforeAll(() => {
-    // Ensure compiled stdio.js exists before tests spawn child processes
+    // 1. Always execute compilation
+    execSync('npx tsc -p tsconfig.node.json', { stdio: 'pipe' });
+
+    // 2. Unconditionally write the exact CommonJS runtime manifest
+    if (!fs.existsSync(DIST_ELECTRON_DIR)) {
+      fs.mkdirSync(DIST_ELECTRON_DIR, { recursive: true });
+    }
+    fs.writeFileSync(
+      DIST_PACKAGE_JSON_PATH,
+      JSON.stringify({ type: 'commonjs' }, null, 2),
+      'utf8'
+    );
+
+    // 3. Read it back and validate
+    const rawContent = fs.readFileSync(DIST_PACKAGE_JSON_PATH, 'utf8');
+    const parsed = JSON.parse(rawContent);
+    if (
+      typeof parsed !== 'object' ||
+      parsed === null ||
+      Array.isArray(parsed) ||
+      Object.prototype.toString.call(parsed) !== '[object Object]'
+    ) {
+      throw new Error('Runtime manifest dist-electron/package.json must be a plain object');
+    }
+    const keys = Object.keys(parsed);
+    if (keys.length !== 1 || keys[0] !== 'type') {
+      throw new Error(`Runtime manifest must have exactly one property ('type'), found: ${keys.join(', ')}`);
+    }
+    if (parsed.type !== 'commonjs') {
+      throw new Error(`Runtime manifest property 'type' must be 'commonjs', found: ${parsed.type}`);
+    }
+
+    // 4. Confirm dist-electron/mcp/stdio.js exists before any child process starts
     if (!fs.existsSync(STDIO_SCRIPT_PATH)) {
-      execSync('npx tsc -p tsconfig.node.json', { stdio: 'pipe' });
+      throw new Error(`Compiled MCP entrypoint not found at ${STDIO_SCRIPT_PATH}`);
     }
   });
 
