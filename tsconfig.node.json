@@ -16,5 +16,5 @@
       "@/*": ["src/*"]
     }
   },
-  "include": ["src/electron", "src/core"]
+  "include": ["src/electron", "src/core", "src/mcp"]
 }
