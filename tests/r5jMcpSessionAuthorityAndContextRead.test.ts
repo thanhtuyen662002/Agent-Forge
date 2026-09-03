@@ -1,9 +1,12 @@
 import fs from 'fs';
 import path from 'path';
 import crypto from 'crypto';
+import { spawn } from 'child_process';
 import { Worker } from 'worker_threads';
 import Database from 'better-sqlite3';
-import { describe, it, expect, beforeEach, afterEach } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
+import { Client, InMemoryTransport } from '@modelcontextprotocol/client';
+import { StdioClientTransport } from '@modelcontextprotocol/client/stdio';
 import { MIGRATIONS, MigrationRunner, verifyMigration21SchemaAuthority } from '../src/core/database/migrations';
 import { Repository } from '../src/core/database/repositories';
 import {
@@ -77,6 +80,7 @@ interface FullGraphFixtures {
   managerRecordId: string;
   rawManagerPayload: string;
   roleId: string;
+  agentId: string;
   canonicalInstructionsJson: string;
   contextFilesJson: string;
   service: McpSessionAuthorityService;
@@ -322,6 +326,7 @@ function setupFullGraph(db: Database.Database): FullGraphFixtures {
     managerRecordId,
     rawManagerPayload,
     roleId,
+    agentId,
     canonicalInstructionsJson,
     contextFilesJson,
     service,
@@ -530,44 +535,90 @@ describe('R5J2 MCP Session Authority and Scoped Context Read Truth Suite', () =>
     }
   });
 
-  it('10. Plaintext token is absent from every database table, subsequent lookup, list, revoke result, and context response', () => {
+  it('10. Successful CLI issue output contains returned plaintext token exactly once; every table, event, context, stdout/stderr, and database byte contains it zero times', () => {
     const { db, dbPath } = createTestDatabase(tempDir, 'notokenleak.db');
     try {
       const fixtures = setupFullGraph(db);
-      const { session, plaintextToken } = fixtures.service.issueSession({ authorizationId: fixtures.authorizationId });
 
-      // Check context response
+      // 1. Issue via CLI and capture stdout & stderr
+      let issueStdout = '';
+      let issueStderr = '';
+      const origStdout = process.stdout.write;
+      const origStderr = process.stderr.write;
+      process.stdout.write = ((chunk: unknown) => { issueStdout += String(chunk); return true; }) as typeof process.stdout.write;
+      process.stderr.write = ((chunk: unknown) => { issueStderr += String(chunk); return true; }) as typeof process.stderr.write;
+
+      let exitCode = 1;
+      try {
+        exitCode = runSessionAdmin(['issue', '--db', dbPath, '--auth', fixtures.authorizationId, '--json']);
+      } finally {
+        process.stdout.write = origStdout;
+        process.stderr.write = origStderr;
+      }
+
+      expect(exitCode).toBe(0);
+      const parsedIssue = JSON.parse(issueStdout);
+      const plaintextToken = parsedIssue.plaintext_token;
+      expect(plaintextToken).toMatch(/^[A-Za-z0-9_-]{43}$/);
+
+      // Plaintext token appears EXACTLY ONCE in successful issue stdout
+      const occurrences = issueStdout.split(plaintextToken).length - 1;
+      expect(occurrences).toBe(1);
+      expect(issueStderr).not.toContain(plaintextToken);
+
+      // 2. Check context response contains token ZERO times
       const ctx = fixtures.service.resolveAuthorizedContext(plaintextToken);
-      const serializedCtx = JSON.stringify(ctx);
-      expect(serializedCtx).not.toContain(plaintextToken);
+      expect(JSON.stringify(ctx)).not.toContain(plaintextToken);
 
-      // Check lookup
-      const lookedUp = fixtures.repo.getMcpClientSessionByTokenHash(session.token_hash);
+      // 3. Subsequent admin revoke: stdout and stderr contain token ZERO times
+      let revokeStdout = '';
+      let revokeStderr = '';
+      process.stdout.write = ((chunk: unknown) => { revokeStdout += String(chunk); return true; }) as typeof process.stdout.write;
+      process.stderr.write = ((chunk: unknown) => { revokeStderr += String(chunk); return true; }) as typeof process.stderr.write;
+      try {
+        const revExit = runSessionAdmin(['revoke', '--db', dbPath, '--session', parsedIssue.session.id, '--json']);
+        expect(revExit).toBe(0);
+      } finally {
+        process.stdout.write = origStdout;
+        process.stderr.write = origStderr;
+      }
+      expect(revokeStdout).not.toContain(plaintextToken);
+      expect(revokeStderr).not.toContain(plaintextToken);
+
+      // 4. Failed CLI commands: stdout and stderr contain token ZERO times
+      let failStderr = '';
+      process.stderr.write = ((chunk: unknown) => { failStderr += String(chunk); return true; }) as typeof process.stderr.write;
+      try {
+        runSessionAdmin(['issue', '--db', dbPath, '--auth', 'nonexistent-auth']);
+        runSessionAdmin(['revoke', '--db', dbPath, '--session', 'nonexistent-session']);
+      } finally {
+        process.stderr.write = origStderr;
+      }
+      expect(failStderr).not.toContain(plaintextToken);
+
+      // 5. Check lookup & active list contain token ZERO times
+      const lookedUp = fixtures.repo.getMcpClientSessionByTokenHash(parsedIssue.session.token_hash);
       expect(JSON.stringify(lookedUp)).not.toContain(plaintextToken);
-
-      // Check active session list
       const activeSessions = fixtures.repo.getActiveMcpClientSessionByAuthorizationId(fixtures.authorizationId);
       expect(JSON.stringify(activeSessions)).not.toContain(plaintextToken);
 
-      // Check revoke result
-      const revRes = fixtures.service.revokeSession({ sessionId: session.id });
-      expect(JSON.stringify(revRes)).not.toContain(plaintextToken);
-
-      // Check every database table row
+      // 6. Check every database table row contains token ZERO times
       const tables = db.prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%'").all() as { name: string }[];
       for (const t of tables) {
         const rows = db.prepare(`SELECT * FROM "${t.name}"`).all();
-        const serializedRows = JSON.stringify(rows);
-        expect(serializedRows).not.toContain(plaintextToken);
+        expect(JSON.stringify(rows)).not.toContain(plaintextToken);
       }
 
-      // Check disk database file
+      // 7. Check database file, WAL, and SHM bytes contain token ZERO times
       const dbBytes = fs.readFileSync(dbPath);
       expect(dbBytes.includes(Buffer.from(plaintextToken))).toBe(false);
       const walPath = `${dbPath}-wal`;
       if (fs.existsSync(walPath)) {
-        const walBytes = fs.readFileSync(walPath);
-        expect(walBytes.includes(Buffer.from(plaintextToken))).toBe(false);
+        expect(fs.readFileSync(walPath).includes(Buffer.from(plaintextToken))).toBe(false);
+      }
+      const shmPath = `${dbPath}-shm`;
+      if (fs.existsSync(shmPath)) {
+        expect(fs.readFileSync(shmPath).includes(Buffer.from(plaintextToken))).toBe(false);
       }
     } finally {
       db.close();
@@ -826,40 +877,44 @@ describe('R5J2 MCP Session Authority and Scoped Context Read Truth Suite', () =>
   // Part 4: Mandatory Routing Payload Field Validation (One at a time)
   // =========================================================================
 
-  it('29. Routing decision event missing project_id fails closed returns MCP_AUTHORITY_FENCED', () => {
+  it('29. Routing decision event mutated top-level project_id column fails closed returns MCP_AUTHORITY_FENCED', () => {
     const { db } = createTestDatabase(tempDir, 'route_noproj.db');
     try {
       const fixtures = setupFullGraph(db);
-      const badPayload = {
-        decisionId: fixtures.routingDecisionId,
-        taskId: fixtures.taskId,
-        attemptId: fixtures.attemptId,
-        selectedProviderId: fixtures.providerId,
-        selectedAccountId: fixtures.accountId,
-        selectedResourceId: fixtures.resourceId,
-        outcome: 'SELECTED',
-      };
-      db.prepare('UPDATE events SET structured_payload_json = ? WHERE id = ?').run(JSON.stringify(badPayload), fixtures.routingDecisionId);
+      const otherProjId = `proj-alt-${crypto.randomUUID()}`;
+      const now = new Date().toISOString();
+      fixtures.repo.createProject({
+        id: otherProjId,
+        name: 'Alternate Project',
+        description: 'Alt',
+        repository_path: '/path/alt',
+        default_branch: 'main',
+        status: 'RUNNING',
+        contract: null,
+        created_at: now,
+        updated_at: now,
+        started_at: now,
+        completed_at: null,
+      });
+      db.prepare('UPDATE events SET project_id = ? WHERE id = ?').run(otherProjId, fixtures.routingDecisionId);
       expect(() => fixtures.service.issueSession({ authorizationId: fixtures.authorizationId })).toThrowError(/MCP_AUTHORITY_FENCED/);
     } finally {
       db.close();
     }
   });
 
-  it('30. Routing decision event missing task_id fails closed returns MCP_AUTHORITY_FENCED', () => {
+  it('30. Routing decision event mutated top-level task_id column fails closed returns MCP_AUTHORITY_FENCED', () => {
     const { db } = createTestDatabase(tempDir, 'route_notask.db');
     try {
       const fixtures = setupFullGraph(db);
-      const badPayload = {
-        decisionId: fixtures.routingDecisionId,
-        projectId: fixtures.projectId,
-        attemptId: fixtures.attemptId,
-        selectedProviderId: fixtures.providerId,
-        selectedAccountId: fixtures.accountId,
-        selectedResourceId: fixtures.resourceId,
-        outcome: 'SELECTED',
-      };
-      db.prepare('UPDATE events SET structured_payload_json = ? WHERE id = ?').run(JSON.stringify(badPayload), fixtures.routingDecisionId);
+      const otherTaskId = `task-alt-${crypto.randomUUID()}`;
+      const now = new Date().toISOString();
+      const baseSha = 'b'.repeat(40);
+      db.prepare(`
+        INSERT INTO tasks (id, project_id, title, state, priority, risk, revision_count, max_revisions, progress_cache_percent, base_sha, ownership_epoch, created_at, updated_at)
+        VALUES (?, ?, 'Task Alt', 'CODING', 'LOW', 'LOW', 1, 3, 0, ?, 1, ?, ?)
+      `).run(otherTaskId, fixtures.projectId, baseSha, now, now);
+      db.prepare('UPDATE events SET task_id = ? WHERE id = ?').run(otherTaskId, fixtures.routingDecisionId);
       expect(() => fixtures.service.issueSession({ authorizationId: fixtures.authorizationId })).toThrowError(/MCP_AUTHORITY_FENCED/);
     } finally {
       db.close();
@@ -1358,56 +1413,99 @@ describe('R5J2 MCP Session Authority and Scoped Context Read Truth Suite', () =>
   // Part 9: Concurrency, Read-Only Boundary, and Cleanup
   // =========================================================================
 
-  it('63. Real two-connection concurrent issuance race produces exactly one active row and one plaintext token', async () => {
-    const { db: db1, dbPath } = createTestDatabase(tempDir, 'concurrency_race.db');
-    const db2 = new Database(dbPath);
-    db2.pragma('foreign_keys = ON');
+  it('63. Real two-worker concurrent issuance race produces exactly one active row and one plaintext token', async () => {
+    const { db: setupDb, dbPath } = createTestDatabase(tempDir, 'concurrency_race.db');
+    let authorizationId = '';
+    try {
+      const fixtures1 = setupFullGraph(setupDb);
+      authorizationId = fixtures1.authorizationId;
+      setupDb.pragma('wal_checkpoint(TRUNCATE)');
+    } finally {
+      setupDb.close();
+    }
+
+    const workerCode = `
+const { parentPort, workerData } = require('node:worker_threads');
+const path = require('node:path');
+const Database = require('better-sqlite3');
+const { Repository } = require(path.resolve(workerData.projectRoot, 'dist-electron/core/database/repositories.js'));
+const { McpSessionAuthorityService } = require(path.resolve(workerData.projectRoot, 'dist-electron/core/services/McpSessionAuthorityService.js'));
+
+const db = new Database(workerData.dbPath);
+db.pragma('foreign_keys = ON');
+const repo = new Repository(db);
+const service = new McpSessionAuthorityService(repo, db);
+
+parentPort.on('message', (msg) => {
+  if (msg === 'GO') {
+    try {
+      const result = service.issueSession({ authorizationId: workerData.authorizationId });
+      db.close();
+      parentPort.postMessage({ success: true, result });
+    } catch (err) {
+      db.close();
+      parentPort.postMessage({
+        success: false,
+        error: err instanceof Error ? err.message : String(err),
+        category: err && typeof err === 'object' && 'category' in err ? err.category : null,
+      });
+    }
+  }
+});
+parentPort.postMessage('READY');
+`;
+
+    const workerData = { dbPath, authorizationId, projectRoot: process.cwd() };
+    const w1 = new Worker(workerCode, { eval: true, workerData });
+    const w2 = new Worker(workerCode, { eval: true, workerData });
 
     try {
-      const fixtures1 = setupFullGraph(db1);
-      const repo2 = new Repository(db2);
-      const service2 = new McpSessionAuthorityService(repo2, db2);
+      const waitReady = (w: Worker) =>
+        new Promise<void>((resolve) => {
+          const handler = (m: unknown) => {
+            if (m === 'READY') {
+              w.off('message', handler);
+              resolve();
+            }
+          };
+          w.on('message', handler);
+        });
 
-      // Competing connections synchronized on a temporary barrier file on disk
-      const barrierFile = path.join(tempDir, 'race_barrier.signal');
+      // Assert both workers are concurrently running and ready before sending GO
+      await Promise.all([waitReady(w1), waitReady(w2)]);
 
-      const waitForBarrier = async () => {
-        while (!fs.existsSync(barrierFile)) {
-          await new Promise((r) => setTimeout(r, 5));
-        }
-      };
+      const waitResult = (w: Worker) =>
+        new Promise<{ success: boolean; result?: { plaintextToken: string }; error?: string; category?: string }>((resolve) => {
+          w.once('message', resolve);
+        });
 
-      const compete1 = async () => {
-        await waitForBarrier();
-        return fixtures1.service.issueSession({ authorizationId: fixtures1.authorizationId });
-      };
+      const p1 = waitResult(w1);
+      const p2 = waitResult(w2);
 
-      const compete2 = async () => {
-        await waitForBarrier();
-        return service2.issueSession({ authorizationId: fixtures1.authorizationId });
-      };
+      // Release both workers simultaneously
+      w1.postMessage('GO');
+      w2.postMessage('GO');
 
-      const p1 = compete1();
-      const p2 = compete2();
+      const results = await Promise.all([p1, p2]);
+      const successful = results.filter((r) => r.success);
+      const failed = results.filter((r) => !r.success);
 
-      // Release both competing connections simultaneously via barrier file
-      fs.writeFileSync(barrierFile, 'GO');
+      expect(successful).toHaveLength(1);
+      expect(failed).toHaveLength(1);
+      expect(successful[0].result?.plaintextToken).toMatch(/^[A-Za-z0-9_-]{43}$/);
+      expect(failed[0].category).toBe('MCP_AUTHORITY_FENCED');
 
-      const [res1, res2] = await Promise.allSettled([p1, p2]);
-
-      const fulfilled = [res1, res2].filter((r) => r.status === 'fulfilled') as PromiseFulfilledResult<unknown>[];
-      const rejected = [res1, res2].filter((r) => r.status === 'rejected') as PromiseRejectedResult[];
-
-      expect(fulfilled).toHaveLength(1);
-      expect(rejected).toHaveLength(1);
-      expect((fulfilled[0].value as { plaintextToken: string }).plaintextToken).toMatch(/^[A-Za-z0-9_-]{43}$/);
-      expect((rejected[0].reason as Error).message).toContain('MCP_AUTHORITY_FENCED');
-
-      const activeRows = db1.prepare('SELECT COUNT(*) as c FROM mcp_client_sessions WHERE authorization_id = ? AND revoked_at IS NULL').get(fixtures1.authorizationId) as { c: number };
-      expect(activeRows.c).toBe(1);
+      const verifyDb = new Database(dbPath, { readonly: true });
+      try {
+        const activeRows = verifyDb
+          .prepare('SELECT COUNT(*) as c FROM mcp_client_sessions WHERE authorization_id = ? AND revoked_at IS NULL')
+          .get(authorizationId) as { c: number };
+        expect(activeRows.c).toBe(1);
+      } finally {
+        verifyDb.close();
+      }
     } finally {
-      db1.close();
-      db2.close();
+      await Promise.all([w1.terminate(), w2.terminate()]);
     }
   });
 
@@ -1423,7 +1521,7 @@ describe('R5J2 MCP Session Authority and Scoped Context Read Truth Suite', () =>
     }
   });
 
-  it('65. Zero-mutation proof: context reads cause 0 durable database changes and total_changes() === 0', () => {
+  it('65. Zero-mutation proof: repeated production MCP tool and resource reads cause 0 durable changes, 0 mutation delta, and byte-identical database', async () => {
     const { db: setupDb, dbPath } = createTestDatabase(tempDir, 'zeromutation.db');
     let plaintextToken = '';
     try {
@@ -1439,49 +1537,69 @@ describe('R5J2 MCP Session Authority and Scoped Context Read Truth Suite', () =>
     const beforeBytes = fs.readFileSync(dbPath);
     const beforeHash = crypto.createHash('sha256').update(beforeBytes).digest('hex');
 
-    // 2. Snapshot table row counts across all durable tables
+    // 2. Snapshot table contents deterministically across all durable tables
     const checkDb = new Database(dbPath, { readonly: true });
-    const tables = checkDb.prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%'").all() as { name: string }[];
-    const initialCounts = new Map<string, number>();
+    const tables = checkDb.prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%' ORDER BY name ASC").all() as { name: string }[];
+    const initialTableSnapshots = new Map<string, string>();
     for (const t of tables) {
-      const row = checkDb.prepare(`SELECT COUNT(*) as cnt FROM "${t.name}"`).get() as { cnt: number };
-      initialCounts.set(t.name, row.cnt);
+      const rows = checkDb.prepare(`SELECT * FROM "${t.name}" ORDER BY rowid ASC`).all();
+      initialTableSnapshots.set(t.name, JSON.stringify(rows));
     }
     checkDb.close();
 
-    // 3. Open read-only context and perform multiple authorized context reads
-    const readOnlyDb = new Database(dbPath, { readonly: true, fileMustExist: true });
-    readOnlyDb.pragma('query_only = ON');
+    // 3. Set up production McpAuthorityContext and McpServer connected to MCP Client via InMemoryTransport
+    const context = new McpAuthorityContext({ dbPath, sessionToken: plaintextToken });
+    const server = buildAgentForgeMcpServer({ authorityContext: context });
+    const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+    await server.connect(serverTransport);
+    const client = new Client({ name: 'test-audit-client', version: '1.0.0' });
+    await client.connect(clientTransport);
 
     try {
-      const context = new McpAuthorityContext({ db: readOnlyDb, sessionToken: plaintextToken });
-      for (let i = 0; i < 5; i++) {
-        const resolved = context.resolveAuthorizedContext();
-        expect(resolved.schema_version).toBe(2);
-      }
+      // 4. Perform repeated authorized context reads via registered tool and registered resource
+      for (let i = 0; i < 3; i++) {
+        const toolRes = await client.callTool({
+          name: GET_AUTHORIZED_CONTEXT_TOOL_NAME,
+          arguments: {},
+        });
+        expect(toolRes.isError).toBeFalsy();
+        expect(toolRes.content).toHaveLength(1);
+        const toolText = (toolRes.content[0] as { type: 'text'; text: string }).text;
+        const parsedTool = JSON.parse(toolText);
+        expect(parsedTool.schema_version).toBe(2);
 
-      const totalChangesRow = readOnlyDb.prepare('SELECT total_changes() as tc').get() as { tc: number };
-      expect(totalChangesRow.tc).toBe(0);
+        const resourceRes = await client.readResource({
+          uri: AUTHORIZED_CONTEXT_RESOURCE_URI,
+        });
+        expect(resourceRes.contents).toHaveLength(1);
+        const resText = (resourceRes.contents[0] as { text: string }).text;
+        const parsedResource = JSON.parse(resText);
+        expect(parsedResource.schema_version).toBe(2);
+      }
     } finally {
-      readOnlyDb.close();
+      await client.close();
+      await server.close();
+      context.close();
     }
 
-    // 4. Assert durable SQLite file is identical byte-for-byte
+    // 5. Assert durable SQLite file is identical byte-for-byte
     const afterBytes = fs.readFileSync(dbPath);
     const afterHash = crypto.createHash('sha256').update(afterBytes).digest('hex');
     expect(afterHash).toBe(beforeHash);
 
-    // 5. Assert no WAL or SHM artifacts were created
+    // 6. Assert no WAL or SHM artifacts were created
     expect(fs.existsSync(`${dbPath}-wal`)).toBe(false);
     expect(fs.existsSync(`${dbPath}-shm`)).toBe(false);
 
-    // 6. Assert all table row counts remain identical
+    // 7. Assert all table contents remain byte-identical to initial snapshots
     const verifyDb = new Database(dbPath, { readonly: true });
     try {
-      for (const [tbl, count] of initialCounts) {
-        const row = verifyDb.prepare(`SELECT COUNT(*) as cnt FROM "${tbl}"`).get() as { cnt: number };
-        expect(row.cnt).toBe(count);
+      for (const t of tables) {
+        const rows = verifyDb.prepare(`SELECT * FROM "${t.name}" ORDER BY rowid ASC`).all();
+        expect(JSON.stringify(rows)).toBe(initialTableSnapshots.get(t.name));
       }
+      const totalChangesRow = verifyDb.prepare('SELECT total_changes() as tc').get() as { tc: number };
+      expect(totalChangesRow.tc).toBe(0);
     } finally {
       verifyDb.close();
     }
@@ -1513,10 +1631,13 @@ describe('R5J2 MCP Session Authority and Scoped Context Read Truth Suite', () =>
   });
 
   it('67. Scrubbed diagnostics: seeded token, digest, and internal DB paths do not leak into stderr', () => {
+    const { db, dbPath: sensitiveDbPath } = createTestDatabase(tempDir, 'super_secret_corporate_path.db');
     const sensitiveToken = McpSessionAuthorityService.generateSessionToken();
     const sensitiveDigest = McpSessionAuthorityService.hashSessionToken(sensitiveToken);
-    const sensitiveDbPath = path.join(tempDir, 'super_secret_corporate_path.db');
     const sensitiveAuthId = 'auth-super-secret-12345';
+    const sensitiveCredentialRef = 'cred-ref-classified-9999';
+    const sensitiveProfileRef = 'agent-profile-classified-secret';
+    const sensitiveSqliteMarker = 'SQLITE_CONSTRAINT_CHECK_REDACTED_SECRET';
 
     let capturedStderr = '';
     const originalStderrWrite = process.stderr.write;
@@ -1526,21 +1647,51 @@ describe('R5J2 MCP Session Authority and Scoped Context Read Truth Suite', () =>
     }) as typeof process.stderr.write;
 
     try {
-      // 1. Trigger CLI issue error with secret path and auth ID
-      runSessionAdmin(['issue', '--db', sensitiveDbPath, '--auth', sensitiveAuthId, '--ttl', '50']);
-      // 2. Trigger CLI revoke error
-      runSessionAdmin(['revoke', '--db', sensitiveDbPath, '--session', sensitiveToken, '--ttl', '600']);
-      // 3. Trigger context error with non-existent secret DB path
-      expect(() => {
-        const ctx = new McpAuthorityContext({ dbPath: sensitiveDbPath, sessionToken: sensitiveToken });
-        ctx.resolveAuthorizedContext();
-      }).toThrow();
+      // 1. Setup real graph with sensitive auth ID and mutate to force McpAuthorityError
+      const fixtures = setupFullGraph(db);
+      db.prepare("UPDATE execution_authorizations SET status = 'INVALIDATED' WHERE id = ?").run(fixtures.authorizationId);
+      db.close();
 
-      // Assert none of the sensitive values leaked into stderr
+      // 2. Trigger real CLI issue error with opened database
+      const exit1 = runSessionAdmin(['issue', '--db', sensitiveDbPath, '--auth', fixtures.authorizationId]);
+      expect(exit1).toBe(1);
+
+      // 3. Trigger CLI revoke error with opened database
+      const exit2 = runSessionAdmin(['revoke', '--db', sensitiveDbPath, '--session', '   ']);
+      expect(exit2).toBe(1);
+
+      // 4. Trigger context error with seeded secret token
+      const ctxToClose = new McpAuthorityContext({ dbPath: sensitiveDbPath, sessionToken: sensitiveToken });
+      try {
+        expect(() => {
+          ctxToClose.resolveAuthorizedContext();
+        }).toThrow();
+      } finally {
+        ctxToClose.close();
+      }
+
+      // 5. Test formatPublicError directly on an error carrying raw message with secrets
+      const rawErrorWithSecrets = new McpAuthorityError(
+        'MCP_AUTHORITY_FENCED',
+        `Authority failed for ${sensitiveAuthId} token=${sensitiveToken} digest=${sensitiveDigest} path=${sensitiveDbPath} cred=${sensitiveCredentialRef} marker=${sensitiveSqliteMarker}`
+      );
+      const formatted = formatPublicError(rawErrorWithSecrets);
+      expect(formatted.text).toBe('[MCP_AUTHORITY_FENCED] Execution authority fenced');
+      expect(formatted.text).not.toContain(sensitiveToken);
+      expect(formatted.text).not.toContain(sensitiveDigest);
+      expect(formatted.text).not.toContain(sensitiveDbPath);
+      expect(formatted.text).not.toContain(sensitiveAuthId);
+      expect(formatted.text).not.toContain(sensitiveCredentialRef);
+      expect(formatted.text).not.toContain(sensitiveSqliteMarker);
+
+      // 6. Assert none of the sensitive values leaked into stderr
       expect(capturedStderr).not.toContain(sensitiveToken);
       expect(capturedStderr).not.toContain(sensitiveDigest);
       expect(capturedStderr).not.toContain(sensitiveDbPath);
       expect(capturedStderr).not.toContain(sensitiveAuthId);
+      expect(capturedStderr).not.toContain(sensitiveCredentialRef);
+      expect(capturedStderr).not.toContain(sensitiveProfileRef);
+      expect(capturedStderr).not.toContain(sensitiveSqliteMarker);
     } finally {
       process.stderr.write = originalStderrWrite;
     }
@@ -1814,9 +1965,11 @@ describe('R5J2 MCP Session Authority and Scoped Context Read Truth Suite', () =>
     expect(() => parseCliArgs(['issue', '--db', 'test.db', '--auth', 'a1', '--session', 's1'])).toThrowError(/Flag --session is not valid for issue command/);
   });
 
-  it('88. CLI close failure in runSessionAdmin returns exit code 1 and writes scrubbed diagnostic to stderr', () => {
+  it('88. Forced Database.close() failure in runSessionAdmin returns exit code 1, emits MCP_CLEANUP_FAILED, and prevents detail leakage', () => {
     const { db, dbPath } = createTestDatabase(tempDir, 'close_fail.db');
+    const fixtures = setupFullGraph(db);
     db.close();
+
     let capturedStderr = '';
     const originalStderr = process.stderr.write;
     process.stderr.write = ((chunk: unknown) => {
@@ -1824,12 +1977,1136 @@ describe('R5J2 MCP Session Authority and Scoped Context Read Truth Suite', () =>
       return true;
     }) as typeof process.stderr.write;
 
+    const originalClose = Database.prototype.close;
+    let closeAttempts = 0;
+    let openedInstance: any = null;
     try {
-      const exitCode = runSessionAdmin(['issue', '--db', dbPath]);
+      Database.prototype.close = function (...args) {
+        openedInstance = this;
+        closeAttempts++;
+        throw new Error('Forced native close error: secret_path_leak_fail');
+      };
+
+      const exitCode = runSessionAdmin(['issue', '--db', dbPath, '--auth', fixtures.authorizationId]);
       expect(exitCode).toBe(1);
-      expect(capturedStderr).toContain('[MCP_CONFIGURATION_INVALID]');
+      expect(closeAttempts).toBeGreaterThan(0);
+      expect(capturedStderr).toContain('[MCP_CLEANUP_FAILED]');
+      expect(capturedStderr).not.toContain('secret_path_leak_fail');
+      expect(capturedStderr).not.toContain('Forced native close error');
     } finally {
+      Database.prototype.close = originalClose;
+      if (openedInstance && openedInstance.open) {
+        try {
+          openedInstance.close();
+        } catch {
+          // ignore
+        }
+      }
       process.stderr.write = originalStderr;
+    }
+  });
+
+  // =========================================================================
+  // Part 10: Corrective Pass 3 Required Independent Evidence Tests (89 - 115)
+  // =========================================================================
+
+  it('89. Mutation fencing: SELECT total_changes() observable mutation delta triggers MCP_AUTHORITY_FENCED and guard runs even if service throws', () => {
+    const { db, dbPath } = createTestDatabase(tempDir, 'mutation_fence.db');
+    let token = '';
+    try {
+      const fixtures = setupFullGraph(db);
+      token = fixtures.service.issueSession({ authorizationId: fixtures.authorizationId }).plaintextToken;
+    } finally {
+      db.close();
+    }
+
+    // Readonly context
+    const ctx = new McpAuthorityContext({ dbPath, sessionToken: token });
+    const { db: openedDb } = ctx.getOrCreateDatabase();
+    try {
+      // Spy on total_changes query by wrapping prepare
+      const origPrepare = openedDb.prepare.bind(openedDb);
+      let totalChangesCallCount = 0;
+      (openedDb as any).prepare = function (sql: string) {
+        const stmt = origPrepare(sql);
+        if (sql.includes('total_changes()')) {
+          const origGet = stmt.get.bind(stmt);
+          stmt.get = function (...args: any[]) {
+            totalChangesCallCount++;
+            // On the second call (after resolution), inject a simulated mutation delta
+            if (totalChangesCallCount === 2) {
+              return { total_changes: 1 };
+            }
+            return origGet(...args);
+          };
+        }
+        return stmt;
+      };
+
+      expect(() => ctx.resolveAuthorizedContext()).toThrowError(/MCP_AUTHORITY_FENCED/);
+      expect(totalChangesCallCount).toBe(2);
+    } finally {
+      ctx.close();
+    }
+  });
+
+  it('90. Migration 21 index column mismatch: rejects each of the four required indexes recreated on a wrong column', () => {
+    const { db } = createTestDatabase(tempDir, 'm21_wrong_col_indexes.db');
+    try {
+      // 1. idx_mcp_client_sessions_token_hash on wrong column (id instead of token_hash)
+      db.exec('DROP INDEX idx_mcp_client_sessions_token_hash;');
+      db.exec('CREATE UNIQUE INDEX idx_mcp_client_sessions_token_hash ON mcp_client_sessions(id);');
+      expect(() => verifyMigration21SchemaAuthority(db)).toThrow();
+      db.exec('DROP INDEX idx_mcp_client_sessions_token_hash;');
+      db.exec('CREATE UNIQUE INDEX idx_mcp_client_sessions_token_hash ON mcp_client_sessions(token_hash);');
+      verifyMigration21SchemaAuthority(db);
+
+      // 2. uq_mcp_client_sessions_active_auth on wrong column (id instead of authorization_id)
+      db.exec('DROP INDEX uq_mcp_client_sessions_active_auth;');
+      db.exec('CREATE UNIQUE INDEX uq_mcp_client_sessions_active_auth ON mcp_client_sessions(id) WHERE revoked_at IS NULL;');
+      expect(() => verifyMigration21SchemaAuthority(db)).toThrow();
+      db.exec('DROP INDEX uq_mcp_client_sessions_active_auth;');
+      db.exec('CREATE UNIQUE INDEX uq_mcp_client_sessions_active_auth ON mcp_client_sessions(authorization_id) WHERE revoked_at IS NULL;');
+      verifyMigration21SchemaAuthority(db);
+
+      // 3. idx_mcp_client_sessions_expires_at on wrong column (id instead of expires_at)
+      db.exec('DROP INDEX idx_mcp_client_sessions_expires_at;');
+      db.exec('CREATE INDEX idx_mcp_client_sessions_expires_at ON mcp_client_sessions(id);');
+      expect(() => verifyMigration21SchemaAuthority(db)).toThrow();
+      db.exec('DROP INDEX idx_mcp_client_sessions_expires_at;');
+      db.exec('CREATE INDEX idx_mcp_client_sessions_expires_at ON mcp_client_sessions(expires_at);');
+      verifyMigration21SchemaAuthority(db);
+
+      // 4. idx_mcp_client_sessions_auth_id on wrong column (id instead of authorization_id)
+      db.exec('DROP INDEX idx_mcp_client_sessions_auth_id;');
+      db.exec('CREATE INDEX idx_mcp_client_sessions_auth_id ON mcp_client_sessions(id);');
+      expect(() => verifyMigration21SchemaAuthority(db)).toThrow();
+    } finally {
+      db.close();
+    }
+  });
+
+  it('91. Migration 21 active session index: rejects missing predicate, wrong predicate, non-unique, or unexpected custom index', () => {
+    const { db } = createTestDatabase(tempDir, 'm21_index_predicates.db');
+    try {
+      // 1. Missing predicate (unconditional)
+      db.exec('DROP INDEX uq_mcp_client_sessions_active_auth;');
+      db.exec('CREATE UNIQUE INDEX uq_mcp_client_sessions_active_auth ON mcp_client_sessions(authorization_id);');
+      expect(() => verifyMigration21SchemaAuthority(db)).toThrow();
+
+      // 2. Inverted predicate
+      db.exec('DROP INDEX uq_mcp_client_sessions_active_auth;');
+      db.exec('CREATE UNIQUE INDEX uq_mcp_client_sessions_active_auth ON mcp_client_sessions(authorization_id) WHERE revoked_at IS NOT NULL;');
+      expect(() => verifyMigration21SchemaAuthority(db)).toThrow();
+
+      // 3. Non-unique
+      db.exec('DROP INDEX uq_mcp_client_sessions_active_auth;');
+      db.exec('CREATE INDEX uq_mcp_client_sessions_active_auth ON mcp_client_sessions(authorization_id) WHERE revoked_at IS NULL;');
+      expect(() => verifyMigration21SchemaAuthority(db)).toThrow();
+
+      // Restore canonical index
+      db.exec('DROP INDEX uq_mcp_client_sessions_active_auth;');
+      db.exec('CREATE UNIQUE INDEX uq_mcp_client_sessions_active_auth ON mcp_client_sessions(authorization_id) WHERE revoked_at IS NULL;');
+      verifyMigration21SchemaAuthority(db);
+
+      // 4. Unexpected user-defined index
+      db.exec('CREATE INDEX idx_unexpected_user_defined ON mcp_client_sessions(issued_at);');
+      expect(() => verifyMigration21SchemaAuthority(db)).toThrow();
+    } finally {
+      db.close();
+    }
+  });
+
+  it('92. Ledger authority: rejects later version, earlier version, duplicate version, or missing row', () => {
+    const { db } = createTestDatabase(tempDir, 'ledger_authority_checks.db');
+    try {
+      // 1. Later ledger version > 21
+      db.prepare("INSERT INTO schema_migrations (version, name, applied_at) VALUES (22, '022_future', datetime('now'))").run();
+      expect(() => verifyMigration21SchemaAuthority(db)).toThrow();
+      db.prepare('DELETE FROM schema_migrations WHERE version = 22').run();
+      verifyMigration21SchemaAuthority(db);
+
+      // 2. Earlier ledger version max (e.g. max is 20)
+      db.prepare('DELETE FROM schema_migrations WHERE version = 21').run();
+      expect(() => verifyMigration21SchemaAuthority(db)).toThrow();
+
+      // 3. Re-insert with wrong migration name
+      db.prepare("INSERT INTO schema_migrations (version, name, applied_at) VALUES (21, '021_wrong_name', datetime('now'))").run();
+      expect(() => verifyMigration21SchemaAuthority(db)).toThrow();
+
+      // 4. Re-insert with correct name
+      db.prepare('DELETE FROM schema_migrations WHERE version = 21').run();
+      db.prepare("INSERT INTO schema_migrations (version, name, applied_at) VALUES (21, '021_r5j_mcp_client_session_authority', datetime('now'))").run();
+      verifyMigration21SchemaAuthority(db);
+    } finally {
+      db.close();
+    }
+  });
+
+  it('93. Schema authority: rejects extra columns, missing columns, wrong types, wrong nullability, and wrong primary key', () => {
+    const { db } = createTestDatabase(tempDir, 'schema_auth_columns.db');
+    try {
+      // 1. Extra column
+      db.exec('ALTER TABLE mcp_client_sessions ADD COLUMN rogue_extra_column TEXT;');
+      expect(() => verifyMigration21SchemaAuthority(db)).toThrow();
+    } finally {
+      db.close();
+    }
+
+    // 2. Missing column
+    const { db: db2 } = createTestDatabase(tempDir, 'schema_auth_missing_col.db');
+    try {
+      db2.exec('DROP TABLE mcp_client_sessions;');
+      db2.exec(`
+        CREATE TABLE mcp_client_sessions (
+          id TEXT PRIMARY KEY,
+          authorization_id TEXT NOT NULL,
+          token_hash TEXT NOT NULL,
+          authorization_fingerprint TEXT NOT NULL,
+          issued_at TEXT NOT NULL,
+          expires_at TEXT NOT NULL,
+          revoked_at TEXT,
+          created_at TEXT NOT NULL
+        );
+      `);
+      expect(() => verifyMigration21SchemaAuthority(db2)).toThrow();
+    } finally {
+      db2.close();
+    }
+
+    // 3. Wrong column type
+    const { db: db3 } = createTestDatabase(tempDir, 'schema_auth_wrong_type.db');
+    try {
+      db3.exec('DROP TABLE mcp_client_sessions;');
+      db3.exec(`
+        CREATE TABLE mcp_client_sessions (
+          id TEXT PRIMARY KEY,
+          authorization_id TEXT NOT NULL,
+          token_hash TEXT NOT NULL,
+          scope INTEGER NOT NULL,
+          authorization_fingerprint TEXT NOT NULL,
+          issued_at TEXT NOT NULL,
+          expires_at TEXT NOT NULL,
+          revoked_at TEXT,
+          created_at TEXT NOT NULL
+        );
+      `);
+      expect(() => verifyMigration21SchemaAuthority(db3)).toThrow();
+    } finally {
+      db3.close();
+    }
+
+    // 4. Wrong nullability
+    const { db: db4 } = createTestDatabase(tempDir, 'schema_auth_wrong_nullability.db');
+    try {
+      db4.exec('DROP TABLE mcp_client_sessions;');
+      db4.exec(`
+        CREATE TABLE mcp_client_sessions (
+          id TEXT PRIMARY KEY,
+          authorization_id TEXT NOT NULL,
+          token_hash TEXT,
+          scope TEXT NOT NULL,
+          authorization_fingerprint TEXT NOT NULL,
+          issued_at TEXT NOT NULL,
+          expires_at TEXT NOT NULL,
+          revoked_at TEXT,
+          created_at TEXT NOT NULL
+        );
+      `);
+      expect(() => verifyMigration21SchemaAuthority(db4)).toThrow();
+    } finally {
+      db4.close();
+    }
+  });
+
+  it('94. Schema authority: rejects foreign key target mismatch, invalid action, or missing FK', () => {
+    // 1. Missing FK
+    const { db: db1 } = createTestDatabase(tempDir, 'schema_auth_missing_fk.db');
+    try {
+      db1.exec('DROP TABLE mcp_client_sessions;');
+      db1.exec(`
+        CREATE TABLE mcp_client_sessions (
+          id TEXT PRIMARY KEY,
+          authorization_id TEXT NOT NULL,
+          token_hash TEXT NOT NULL,
+          scope TEXT NOT NULL,
+          authorization_fingerprint TEXT NOT NULL,
+          issued_at TEXT NOT NULL,
+          expires_at TEXT NOT NULL,
+          revoked_at TEXT,
+          created_at TEXT NOT NULL
+        );
+      `);
+      expect(() => verifyMigration21SchemaAuthority(db1)).toThrow();
+    } finally {
+      db1.close();
+    }
+
+    // 2. FK referencing wrong table (tasks instead of execution_authorizations)
+    const { db: db2 } = createTestDatabase(tempDir, 'schema_auth_wrong_fk_target.db');
+    try {
+      db2.exec('DROP TABLE mcp_client_sessions;');
+      db2.exec(`
+        CREATE TABLE mcp_client_sessions (
+          id TEXT PRIMARY KEY,
+          authorization_id TEXT NOT NULL,
+          token_hash TEXT NOT NULL,
+          scope TEXT NOT NULL,
+          authorization_fingerprint TEXT NOT NULL,
+          issued_at TEXT NOT NULL,
+          expires_at TEXT NOT NULL,
+          revoked_at TEXT,
+          created_at TEXT NOT NULL,
+          FOREIGN KEY (authorization_id) REFERENCES tasks(id)
+        );
+      `);
+      expect(() => verifyMigration21SchemaAuthority(db2)).toThrow();
+    } finally {
+      db2.close();
+    }
+
+    // 3. FK with ON DELETE CASCADE instead of RESTRICT / NO ACTION
+    const { db: db3 } = createTestDatabase(tempDir, 'schema_auth_fk_cascade.db');
+    try {
+      db3.exec('DROP TABLE mcp_client_sessions;');
+      db3.exec(`
+        CREATE TABLE mcp_client_sessions (
+          id TEXT PRIMARY KEY,
+          authorization_id TEXT NOT NULL,
+          token_hash TEXT NOT NULL,
+          scope TEXT NOT NULL,
+          authorization_fingerprint TEXT NOT NULL,
+          issued_at TEXT NOT NULL,
+          expires_at TEXT NOT NULL,
+          revoked_at TEXT,
+          created_at TEXT NOT NULL,
+          FOREIGN KEY (authorization_id) REFERENCES execution_authorizations(id) ON DELETE CASCADE
+        );
+      `);
+      expect(() => verifyMigration21SchemaAuthority(db3)).toThrow();
+    } finally {
+      db3.close();
+    }
+  });
+
+  it('95. Migration 21 CHECK constraint: scope domain enforcement', () => {
+    const { db } = createTestDatabase(tempDir, 'chk_scope.db');
+    try {
+      const fixtures = setupFullGraph(db);
+      const issuedAt = new Date(Date.now() - 10000).toISOString();
+      const expiresAt = new Date(Date.now() + 60000).toISOString();
+      const validHash = 'a'.repeat(64);
+      const validFp = 'b'.repeat(64);
+
+      // Inserting an invalid scope throws SQLite constraint check error
+      expect(() => {
+        db.prepare(`
+          INSERT INTO mcp_client_sessions (id, authorization_id, token_hash, scope, authorization_fingerprint, issued_at, expires_at)
+          VALUES (?, ?, ?, 'INVALID_SCOPE', ?, ?, ?)
+        `).run('sess-1', fixtures.authorizationId, validHash, validFp, issuedAt, expiresAt);
+      }).toThrow(/CHECK constraint failed/);
+
+      // Inserting canonical AUTHORIZED_CONTEXT_READ succeeds
+      db.prepare(`
+        INSERT INTO mcp_client_sessions (id, authorization_id, token_hash, scope, authorization_fingerprint, issued_at, expires_at)
+        VALUES (?, ?, ?, 'AUTHORIZED_CONTEXT_READ', ?, ?, ?)
+      `).run('sess-valid', fixtures.authorizationId, validHash, validFp, issuedAt, expiresAt);
+    } finally {
+      db.close();
+    }
+  });
+
+  it('96. Migration 21 CHECK constraint: token_hash domain enforcement', () => {
+    const { db } = createTestDatabase(tempDir, 'chk_token_hash.db');
+    try {
+      const fixtures = setupFullGraph(db);
+      const issuedAt = new Date(Date.now() - 10000).toISOString();
+      const expiresAt = new Date(Date.now() + 60000).toISOString();
+      const validFp = 'b'.repeat(64);
+
+      // 63 chars (too short)
+      expect(() => {
+        db.prepare(`
+          INSERT INTO mcp_client_sessions (id, authorization_id, token_hash, scope, authorization_fingerprint, issued_at, expires_at)
+          VALUES (?, ?, ?, 'AUTHORIZED_CONTEXT_READ', ?, ?, ?)
+        `).run('sess-1', fixtures.authorizationId, 'a'.repeat(63), validFp, issuedAt, expiresAt);
+      }).toThrow(/CHECK constraint failed/);
+
+      // Uppercase hex
+      expect(() => {
+        db.prepare(`
+          INSERT INTO mcp_client_sessions (id, authorization_id, token_hash, scope, authorization_fingerprint, issued_at, expires_at)
+          VALUES (?, ?, ?, 'AUTHORIZED_CONTEXT_READ', ?, ?, ?)
+        `).run('sess-2', fixtures.authorizationId, 'A'.repeat(64), validFp, issuedAt, expiresAt);
+      }).toThrow(/CHECK constraint failed/);
+
+      // Non-hex
+      expect(() => {
+        db.prepare(`
+          INSERT INTO mcp_client_sessions (id, authorization_id, token_hash, scope, authorization_fingerprint, issued_at, expires_at)
+          VALUES (?, ?, ?, 'AUTHORIZED_CONTEXT_READ', ?, ?, ?)
+        `).run('sess-3', fixtures.authorizationId, 'g'.repeat(64), validFp, issuedAt, expiresAt);
+      }).toThrow(/CHECK constraint failed/);
+    } finally {
+      db.close();
+    }
+  });
+
+  it('97. Migration 21 CHECK constraint: authorization_fingerprint domain enforcement', () => {
+    const { db } = createTestDatabase(tempDir, 'chk_fingerprint.db');
+    try {
+      const fixtures = setupFullGraph(db);
+      const issuedAt = new Date(Date.now() - 10000).toISOString();
+      const expiresAt = new Date(Date.now() + 60000).toISOString();
+      const validHash = 'a'.repeat(64);
+
+      // 65 chars (too long)
+      expect(() => {
+        db.prepare(`
+          INSERT INTO mcp_client_sessions (id, authorization_id, token_hash, scope, authorization_fingerprint, issued_at, expires_at)
+          VALUES (?, ?, ?, 'AUTHORIZED_CONTEXT_READ', ?, ?, ?)
+        `).run('sess-1', fixtures.authorizationId, validHash, 'b'.repeat(65), issuedAt, expiresAt);
+      }).toThrow(/CHECK constraint failed/);
+
+      // Uppercase hex
+      expect(() => {
+        db.prepare(`
+          INSERT INTO mcp_client_sessions (id, authorization_id, token_hash, scope, authorization_fingerprint, issued_at, expires_at)
+          VALUES (?, ?, ?, 'AUTHORIZED_CONTEXT_READ', ?, ?, ?)
+        `).run('sess-2', fixtures.authorizationId, validHash, 'B'.repeat(64), issuedAt, expiresAt);
+      }).toThrow(/CHECK constraint failed/);
+    } finally {
+      db.close();
+    }
+  });
+
+  it('98. Migration 21 CHECK constraint: timestamp format domain enforcement', () => {
+    const { db } = createTestDatabase(tempDir, 'chk_timestamps.db');
+    try {
+      const fixtures = setupFullGraph(db);
+      const validHash = 'a'.repeat(64);
+      const validFp = 'b'.repeat(64);
+      const issuedAt = new Date(Date.now() - 10000).toISOString();
+      const expiresAt = new Date(Date.now() + 60000).toISOString();
+
+      // Invalid issued_at (empty string violates length(issued_at) > 0)
+      expect(() => {
+        db.prepare(`
+          INSERT INTO mcp_client_sessions (id, authorization_id, token_hash, scope, authorization_fingerprint, issued_at, expires_at)
+          VALUES (?, ?, ?, 'AUTHORIZED_CONTEXT_READ', ?, '', ?)
+        `).run('sess-1', fixtures.authorizationId, validHash, validFp, expiresAt);
+      }).toThrow(/CHECK constraint failed/);
+
+      // Invalid expires_at (expires_at <= issued_at violates expires_at > issued_at)
+      expect(() => {
+        db.prepare(`
+          INSERT INTO mcp_client_sessions (id, authorization_id, token_hash, scope, authorization_fingerprint, issued_at, expires_at)
+          VALUES (?, ?, ?, 'AUTHORIZED_CONTEXT_READ', ?, ?, ?)
+        `).run('sess-2', fixtures.authorizationId, validHash, validFp, issuedAt, issuedAt);
+      }).toThrow(/CHECK constraint failed/);
+
+      // Invalid revoked_at (revoked_at < issued_at violates revoked_at >= issued_at)
+      const earlier = new Date(Date.now() - 20000).toISOString();
+      expect(() => {
+        db.prepare(`
+          INSERT INTO mcp_client_sessions (id, authorization_id, token_hash, scope, authorization_fingerprint, issued_at, expires_at, revoked_at)
+          VALUES (?, ?, ?, 'AUTHORIZED_CONTEXT_READ', ?, ?, ?, ?)
+        `).run('sess-3', fixtures.authorizationId, validHash, validFp, issuedAt, expiresAt, earlier);
+      }).toThrow(/CHECK constraint failed/);
+    } finally {
+      db.close();
+    }
+  });
+
+  it('99. Protocol message tampering at issuance: tampered payload message_id rejected with 0 new session rows', () => {
+    const { db } = createTestDatabase(tempDir, 'tamper_payload_msg_id.db');
+    try {
+      const fixtures = setupFullGraph(db);
+      const payload = JSON.parse(fixtures.rawManagerPayload);
+      payload.message_id = 'different-proto-id';
+      const raw = JSON.stringify(payload);
+      const hash = crypto.createHash('sha256').update(raw).digest('hex');
+      db.prepare('UPDATE protocol_messages SET raw_payload = ?, payload_hash = ? WHERE id = ?').run(raw, hash, fixtures.managerRecordId);
+      db.prepare('UPDATE execution_authorizations SET manager_payload_hash = ? WHERE id = ?').run(hash, fixtures.authorizationId);
+
+      expect(() => fixtures.service.issueSession({ authorizationId: fixtures.authorizationId })).toThrowError(/MCP_AUTHORITY_FENCED/);
+      const sessionCount = db.prepare('SELECT COUNT(*) as count FROM mcp_client_sessions').get() as { count: number };
+      expect(sessionCount.count).toBe(0);
+    } finally {
+      db.close();
+    }
+  });
+
+  it('100. Protocol message tampering at issuance: tampered row message_id rejected with 0 new session rows', () => {
+    const { db } = createTestDatabase(tempDir, 'tamper_row_msg_id.db');
+    try {
+      const fixtures = setupFullGraph(db);
+      db.prepare('UPDATE protocol_messages SET message_id = ? WHERE id = ?').run('tampered-row-message-id', fixtures.managerRecordId);
+
+      expect(() => fixtures.service.issueSession({ authorizationId: fixtures.authorizationId })).toThrowError(/MCP_AUTHORITY_FENCED/);
+      const sessionCount = db.prepare('SELECT COUNT(*) as count FROM mcp_client_sessions').get() as { count: number };
+      expect(sessionCount.count).toBe(0);
+    } finally {
+      db.close();
+    }
+  });
+
+  it('101. Protocol message tampering at issuance: row revision vs payload revision mismatch rejected with 0 new session rows', () => {
+    const { db } = createTestDatabase(tempDir, 'tamper_revision.db');
+    try {
+      const fixtures = setupFullGraph(db);
+      const payload = JSON.parse(fixtures.rawManagerPayload);
+      payload.expected_revision = 999;
+      const raw = JSON.stringify(payload);
+      const hash = crypto.createHash('sha256').update(raw).digest('hex');
+      db.prepare('UPDATE protocol_messages SET raw_payload = ?, payload_hash = ? WHERE id = ?').run(raw, hash, fixtures.managerRecordId);
+      db.prepare('UPDATE execution_authorizations SET manager_payload_hash = ? WHERE id = ?').run(hash, fixtures.authorizationId);
+
+      expect(() => fixtures.service.issueSession({ authorizationId: fixtures.authorizationId })).toThrowError(/MCP_AUTHORITY_FENCED/);
+      const sessionCount = db.prepare('SELECT COUNT(*) as count FROM mcp_client_sessions').get() as { count: number };
+      expect(sessionCount.count).toBe(0);
+    } finally {
+      db.close();
+    }
+  });
+
+  it('102. Protocol message tampering at issuance: tampered protocol, project_id, or task_id rejected with 0 new session rows', () => {
+    const { db } = createTestDatabase(tempDir, 'tamper_row_bindings.db');
+    try {
+      const fixtures = setupFullGraph(db);
+
+      // 1. Mutate protocol to another valid DB protocol that is not manager.v1
+      db.prepare('UPDATE protocol_messages SET protocol = ? WHERE id = ?').run('coder.v1', fixtures.managerRecordId);
+      expect(() => fixtures.service.issueSession({ authorizationId: fixtures.authorizationId })).toThrowError(/MCP_AUTHORITY_FENCED/);
+
+      // Restore protocol
+      db.prepare('UPDATE protocol_messages SET protocol = ? WHERE id = ?').run('manager.v1', fixtures.managerRecordId);
+
+      // 2. Mutate task_id (using valid foreign key)
+      const altTaskId = `task-alt-${crypto.randomUUID()}`;
+      const now = new Date().toISOString();
+      const baseSha = 'b'.repeat(40);
+      db.prepare(`
+        INSERT INTO tasks (id, project_id, title, state, priority, risk, revision_count, max_revisions, progress_cache_percent, base_sha, ownership_epoch, created_at, updated_at)
+        VALUES (?, ?, 'Task Alt', 'CODING', 'LOW', 'LOW', 1, 3, 0, ?, 1, ?, ?)
+      `).run(altTaskId, fixtures.projectId, baseSha, now, now);
+      db.prepare('UPDATE protocol_messages SET task_id = ? WHERE id = ?').run(altTaskId, fixtures.managerRecordId);
+
+      expect(() => fixtures.service.issueSession({ authorizationId: fixtures.authorizationId })).toThrowError(/MCP_AUTHORITY_FENCED/);
+
+      const sessionCount = db.prepare('SELECT COUNT(*) as count FROM mcp_client_sessions').get() as { count: number };
+      expect(sessionCount.count).toBe(0);
+    } finally {
+      db.close();
+    }
+  });
+
+  it('103. Protocol message tampering at issuance: tampered state or decision in payload rejected with 0 new session rows', () => {
+    const { db } = createTestDatabase(tempDir, 'tamper_decision_state.db');
+    try {
+      const fixtures = setupFullGraph(db);
+      const payload = JSON.parse(fixtures.rawManagerPayload);
+      payload.decision = 'REJECTED';
+      const raw = JSON.stringify(payload);
+      const hash = crypto.createHash('sha256').update(raw).digest('hex');
+      db.prepare('UPDATE protocol_messages SET raw_payload = ?, payload_hash = ? WHERE id = ?').run(raw, hash, fixtures.managerRecordId);
+      db.prepare('UPDATE execution_authorizations SET manager_payload_hash = ? WHERE id = ?').run(hash, fixtures.authorizationId);
+
+      expect(() => fixtures.service.issueSession({ authorizationId: fixtures.authorizationId })).toThrowError(/MCP_AUTHORITY_FENCED/);
+
+      const sessionCount = db.prepare('SELECT COUNT(*) as count FROM mcp_client_sessions').get() as { count: number };
+      expect(sessionCount.count).toBe(0);
+    } finally {
+      db.close();
+    }
+  });
+
+  it('104. Post-issuance protocol message tampering: mutating protocol_messages row message_id post-issuance fences next read', () => {
+    const { db, dbPath } = createTestDatabase(tempDir, 'post_tamper_msg_id.db');
+    let token = '';
+    let msgRecId = '';
+    try {
+      const fixtures = setupFullGraph(db);
+      msgRecId = fixtures.managerRecordId;
+      token = fixtures.service.issueSession({ authorizationId: fixtures.authorizationId }).plaintextToken;
+    } finally {
+      db.close();
+    }
+
+    // Verify initial read succeeds
+    const ctx1 = new McpAuthorityContext({ dbPath, sessionToken: token });
+    expect(ctx1.resolveAuthorizedContext().schema_version).toBe(2);
+    ctx1.close();
+
+    // Tamper protocol_messages message_id in database
+    const modDb = new Database(dbPath);
+    modDb.prepare('UPDATE protocol_messages SET message_id = ? WHERE id = ?').run('post-mutated-id', msgRecId);
+    modDb.close();
+
+    // Verify next read is fenced
+    const ctx2 = new McpAuthorityContext({ dbPath, sessionToken: token });
+    try {
+      expect(() => ctx2.resolveAuthorizedContext()).toThrowError(/MCP_AUTHORITY_FENCED/);
+    } finally {
+      ctx2.close();
+    }
+  });
+
+  it('105. Post-issuance routing event tampering: mutating top-level project_id post-issuance fences next read', () => {
+    const { db, dbPath } = createTestDatabase(tempDir, 'post_tamper_event_proj.db');
+    let token = '';
+    let routeEventId = '';
+    let altProjId = '';
+    try {
+      const fixtures = setupFullGraph(db);
+      routeEventId = fixtures.routingDecisionId;
+      altProjId = `proj-alt-${crypto.randomUUID()}`;
+      const now = new Date().toISOString();
+      fixtures.repo.createProject({
+        id: altProjId,
+        name: 'Alt Proj',
+        description: 'Alt',
+        repository_path: '/path/alt',
+        default_branch: 'main',
+        status: 'RUNNING',
+        contract: null,
+        created_at: now,
+        updated_at: now,
+        started_at: now,
+        completed_at: null,
+      });
+      token = fixtures.service.issueSession({ authorizationId: fixtures.authorizationId }).plaintextToken;
+    } finally {
+      db.close();
+    }
+
+    // Mutate event project_id post-issuance
+    const modDb = new Database(dbPath);
+    modDb.prepare('UPDATE events SET project_id = ? WHERE id = ?').run(altProjId, routeEventId);
+    modDb.close();
+
+    const ctx = new McpAuthorityContext({ dbPath, sessionToken: token });
+    try {
+      expect(() => ctx.resolveAuthorizedContext()).toThrowError(/MCP_AUTHORITY_FENCED/);
+    } finally {
+      ctx.close();
+    }
+  });
+
+  it('106. Post-issuance routing payload tampering: mutating routing payload post-issuance fences next read', () => {
+    const { db, dbPath } = createTestDatabase(tempDir, 'post_tamper_route_payload.db');
+    let token = '';
+    let routeEventId = '';
+    try {
+      const fixtures = setupFullGraph(db);
+      routeEventId = fixtures.routingDecisionId;
+      token = fixtures.service.issueSession({ authorizationId: fixtures.authorizationId }).plaintextToken;
+    } finally {
+      db.close();
+    }
+
+    // Mutate structured_payload_json outcome to FAILED
+    const modDb = new Database(dbPath);
+    const row = modDb.prepare('SELECT structured_payload_json FROM events WHERE id = ?').get(routeEventId) as { structured_payload_json: string };
+    const payload = JSON.parse(row.structured_payload_json);
+    payload.outcome = 'FAILED';
+    modDb.prepare('UPDATE events SET structured_payload_json = ? WHERE id = ?').run(JSON.stringify(payload), routeEventId);
+    modDb.close();
+
+    const ctx = new McpAuthorityContext({ dbPath, sessionToken: token });
+    try {
+      expect(() => ctx.resolveAuthorizedContext()).toThrowError(/MCP_AUTHORITY_FENCED/);
+    } finally {
+      ctx.close();
+    }
+  });
+
+  it('107. Bounded close retry policy: transient close failure succeeds within bound, persistent failure throws canonical error', () => {
+    const { db, dbPath } = createTestDatabase(tempDir, 'bounded_close_retry.db');
+    let token = '';
+    try {
+      const fixtures = setupFullGraph(db);
+      token = fixtures.service.issueSession({ authorizationId: fixtures.authorizationId }).plaintextToken;
+    } finally {
+      db.close();
+    }
+
+    // 1. Transient close failure: fails twice with lock contention, then succeeds
+    const ctx1 = new McpAuthorityContext({ dbPath, sessionToken: token });
+    const { db: openedDb1 } = ctx1.getOrCreateDatabase();
+    let attempts = 0;
+    const origClose1 = openedDb1.close.bind(openedDb1);
+    openedDb1.close = function () {
+      attempts++;
+      if (attempts < 3) {
+        throw new Error('EBUSY: resource locked transiently');
+      }
+      return origClose1();
+    };
+    // ctx1.close() should retry and succeed cleanly without throwing
+    expect(() => ctx1.close()).not.toThrow();
+    expect(attempts).toBe(3);
+
+    // 2. Persistent close failure: exhausts retry bound and throws canonical MCP_CLEANUP_FAILED
+    const ctx2 = new McpAuthorityContext({ dbPath, sessionToken: token });
+    const { db: openedDb2 } = ctx2.getOrCreateDatabase();
+    const origClose2 = openedDb2.close.bind(openedDb2);
+    openedDb2.close = function () {
+      throw new Error('EPERM: persistent file lock');
+    };
+    try {
+      expect(() => ctx2.close()).toThrowError(/MCP_CLEANUP_FAILED/);
+    } finally {
+      openedDb2.close = origClose2;
+      ctx2.close();
+    }
+  });
+
+  it('108. Stdio server handle.close() and listener cleanup handles context close cleanly', async () => {
+    const handle = runStdioServer();
+    expect(handle).toBeDefined();
+    expect(typeof handle.close).toBe('function');
+    await handle.close();
+  });
+
+  it('109. CLI closed grammar: invalid commands and malformed flags cause zero mutations and never echo inputs', () => {
+    const { db, dbPath } = createTestDatabase(tempDir, 'closed_grammar.db');
+    try {
+      const fixtures = setupFullGraph(db);
+      let capturedStderr = '';
+      const origStderr = process.stderr.write;
+      process.stderr.write = ((chunk: unknown) => { capturedStderr += String(chunk); return true; }) as typeof process.stderr.write;
+
+      const maliciousPayload = "auth'; DROP TABLE mcp_client_sessions; --";
+      try {
+        const changesBefore = (db.prepare('SELECT total_changes() as tc').get() as { tc: number }).tc;
+        const sessionsBefore = (db.prepare('SELECT COUNT(*) as c FROM mcp_client_sessions').get() as { c: number }).c;
+
+        const exit1 = runSessionAdmin(['unknown_command', '--db', dbPath]);
+        expect(exit1).toBe(1);
+
+        const exit2 = runSessionAdmin(['issue', '--db', dbPath, '--auth', maliciousPayload]);
+        expect(exit2).toBe(1);
+
+        // Verify stderr does not echo the SQL injection payload
+        expect(capturedStderr).not.toContain('DROP TABLE');
+        expect(capturedStderr).not.toContain(maliciousPayload);
+
+        // Verify mcp_client_sessions table is still present and intact
+        const tableCheck = db.prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'mcp_client_sessions'").get();
+        expect(tableCheck).toBeDefined();
+
+        const changesAfter = (db.prepare('SELECT total_changes() as tc').get() as { tc: number }).tc;
+        const sessionsAfter = (db.prepare('SELECT COUNT(*) as c FROM mcp_client_sessions').get() as { c: number }).c;
+        expect(changesAfter - changesBefore).toBe(0);
+        expect(sessionsAfter - sessionsBefore).toBe(0);
+      } finally {
+        process.stderr.write = origStderr;
+      }
+    } finally {
+      db.close();
+    }
+  });
+
+  it('110. Comprehensive secret exclusion across public sinks: verifies admin, context, tool, and resource sinks', () => {
+    const sensitiveToken = McpSessionAuthorityService.generateSessionToken();
+    const sensitiveDigest = McpSessionAuthorityService.hashSessionToken(sensitiveToken);
+    const sensitivePath = path.join(tempDir, 'secret_classified_db.db');
+    const sensitiveAuth = 'auth-super-classified-id';
+    const sensitiveCred = 'cred-super-secret-key';
+    const sensitiveMarker = 'SQLITE_CONSTRAINT_CHECK_MARKER';
+
+    const err = new McpAuthorityError(
+      'MCP_AUTHORITY_FENCED',
+      `Internal detail: auth=${sensitiveAuth} token=${sensitiveToken} hash=${sensitiveDigest} path=${sensitivePath} cred=${sensitiveCred} marker=${sensitiveMarker}`
+    );
+
+    const publicError = formatPublicError(err);
+    expect(publicError.text).toBe('[MCP_AUTHORITY_FENCED] Execution authority fenced');
+    expect(publicError.text).not.toContain(sensitiveToken);
+    expect(publicError.text).not.toContain(sensitiveDigest);
+    expect(publicError.text).not.toContain(sensitivePath);
+    expect(publicError.text).not.toContain(sensitiveAuth);
+    expect(publicError.text).not.toContain(sensitiveCred);
+    expect(publicError.text).not.toContain(sensitiveMarker);
+  });
+
+  it('111. Compiled stdio child process integration: starts with valid DB, responds to tools/resources, and shuts down cleanly via EOF with database lock release', async () => {
+    const { db, dbPath } = createTestDatabase(tempDir, 'compiled_stdio_eof.db');
+    let token = '';
+    try {
+      const fixtures = setupFullGraph(db);
+      token = fixtures.service.issueSession({ authorizationId: fixtures.authorizationId }).plaintextToken;
+    } finally {
+      db.close();
+    }
+
+    const stdioScript = path.resolve(__dirname, '../dist-electron/mcp/stdio.js');
+    expect(fs.existsSync(stdioScript)).toBe(true);
+
+    const transport = new StdioClientTransport({
+      command: process.execPath,
+      args: [stdioScript],
+      env: {
+        ...process.env,
+        AGENTFORGE_MCP_DB_PATH: dbPath,
+        AGENTFORGE_MCP_SESSION_TOKEN: token,
+      },
+    });
+
+    const client = new Client({ name: 'test-stdio-client', version: '1.0.0' });
+    await client.connect(transport);
+
+    try {
+      // 1. Tool call
+      const toolRes = await client.callTool({
+        name: GET_AUTHORIZED_CONTEXT_TOOL_NAME,
+        arguments: {},
+      });
+      expect(toolRes.isError).toBeFalsy();
+      const parsedTool = JSON.parse((toolRes.content[0] as { type: 'text'; text: string }).text);
+      expect(parsedTool.schema_version).toBe(2);
+
+      // 2. Resource read
+      const resourceRes = await client.readResource({
+        uri: AUTHORIZED_CONTEXT_RESOURCE_URI,
+      });
+      expect(resourceRes.contents).toHaveLength(1);
+      const parsedRes = JSON.parse((resourceRes.contents[0] as { text: string }).text);
+      expect(parsedRes.schema_version).toBe(2);
+    } finally {
+      await client.close();
+    }
+
+    // Verify database file lock is released and file can be renamed and deleted
+    const renamed = path.join(tempDir, 'compiled_stdio_eof_renamed.db');
+    fs.renameSync(dbPath, renamed);
+    expect(fs.existsSync(renamed)).toBe(true);
+    fs.unlinkSync(renamed);
+    expect(fs.existsSync(renamed)).toBe(false);
+  });
+
+  it('112. Compiled stdio child process termination via signal exits cleanly with database lock release', async () => {
+    const { db, dbPath } = createTestDatabase(tempDir, 'compiled_stdio_sig.db');
+    let token = '';
+    try {
+      const fixtures = setupFullGraph(db);
+      token = fixtures.service.issueSession({ authorizationId: fixtures.authorizationId }).plaintextToken;
+    } finally {
+      db.close();
+    }
+
+    const stdioScript = path.resolve(__dirname, '../dist-electron/mcp/stdio.js');
+    const child = spawn(process.execPath, [stdioScript], {
+      env: {
+        ...process.env,
+        AGENTFORGE_MCP_DB_PATH: dbPath,
+        AGENTFORGE_MCP_SESSION_TOKEN: token,
+      },
+      stdio: ['pipe', 'pipe', 'pipe'],
+    });
+
+    // Wait for child to initialize
+    await new Promise((resolve) => setTimeout(resolve, 500));
+
+    // Send SIGTERM
+    child.kill('SIGTERM');
+
+    await new Promise<void>((resolve) => {
+      child.on('exit', () => resolve());
+    });
+
+    // File lock is released and can be renamed/deleted
+    const renamed = path.join(tempDir, 'compiled_stdio_sig_renamed.db');
+    fs.renameSync(dbPath, renamed);
+    expect(fs.existsSync(renamed)).toBe(true);
+    fs.unlinkSync(renamed);
+    expect(fs.existsSync(renamed)).toBe(false);
+  });
+
+  it('113. Concurrent issuance with distinct non-overlapping authorizations: both workers succeed with unique sessions', async () => {
+    const { db, dbPath } = createTestDatabase(tempDir, 'concurrent_distinct.db');
+    let authId1 = '';
+    let authId2 = '';
+    try {
+      const fixtures1 = setupFullGraph(db);
+      authId1 = fixtures1.authorizationId;
+
+      // Second auth in same db
+      const repo = new Repository(db);
+      const taskId2 = `task-2-${crypto.randomUUID()}`;
+      const attemptId2 = `att-2-${crypto.randomUUID()}`;
+      const assignmentId2 = `asgn-2-${crypto.randomUUID()}`;
+      const routingDecisionId2 = `route-2-${crypto.randomUUID()}`;
+      const managerMessageId2 = `mgr-proto-2-${crypto.randomUUID()}`;
+      const managerRecordId2 = `mgr-rec-2-${crypto.randomUUID()}`;
+      const authorizationId2 = `auth-2-${crypto.randomUUID()}`;
+      const now = new Date().toISOString();
+
+      // 1. Task 2
+      db.prepare(`
+        INSERT INTO tasks (id, project_id, title, state, priority, risk, revision_count, max_revisions, progress_cache_percent, base_sha, ownership_epoch, created_at, updated_at)
+        VALUES (?, ?, 'Task 2', 'CODING', 'LOW', 'LOW', 1, 3, 0, ?, 1, ?, ?)
+      `).run(taskId2, fixtures1.projectId, 'b'.repeat(40), now, now);
+
+      // 2. Attempt 2
+      repo.createTaskAttempt({
+        id: attemptId2,
+        task_id: taskId2,
+        attempt_number: 1,
+        status: 'RUNNING',
+        agent_profile_id: fixtures1.agentId,
+        agent_id: null,
+        started_at: now,
+        ended_at: null,
+        summary: null,
+      });
+
+      // 3. Routing Decision 2
+      const routingPayload2 = {
+        decisionId: routingDecisionId2,
+        projectId: fixtures1.projectId,
+        taskId: taskId2,
+        attemptId: attemptId2,
+        roleProfileId: fixtures1.roleId,
+        role: 'CODER',
+        outcome: 'SELECTED',
+        routePolicyId: null,
+        failoverPolicyAuthoritySnapshot: null,
+        selectedProviderId: fixtures1.providerId,
+        selectedAccountId: fixtures1.accountId,
+        selectedResourceId: fixtures1.resourceId,
+        selectedAssignmentId: assignmentId2,
+        requestedConstraints: [],
+        appliedExclusions: [],
+        appliedSeparation: null,
+        reason: 'Optimal route',
+      };
+      db.prepare(`
+        INSERT INTO events (id, project_id, task_id, type, summary, structured_payload_json, timestamp)
+        VALUES (?, ?, ?, 'ROLE_AWARE_ROUTING_DECISION', 'Optimal route', ?, ?)
+      `).run(routingDecisionId2, fixtures1.projectId, taskId2, JSON.stringify(routingPayload2), now);
+
+      // 4. Assignment 2
+      repo.createAgentAssignment({
+        id: assignmentId2,
+        project_id: fixtures1.projectId,
+        task_id: taskId2,
+        attempt_id: attemptId2,
+        role_profile_id: fixtures1.roleId,
+        agent_profile_id: fixtures1.agentId,
+        selected_provider_id: fixtures1.providerId,
+        selected_account_id: fixtures1.accountId,
+        selected_resource_id: fixtures1.resourceId,
+        selected_worker_slot_id: null,
+        routing_decision_id: routingDecisionId2,
+        status: 'ASSIGNED',
+        created_at: now,
+        ended_at: null,
+        preferred_metadata: null,
+      });
+
+      // 5. Protocol Message 2
+      const instructions2 = ['Task: Task 2', 'Implement secondary context read'];
+      const managerPayload2 = {
+        protocol: 'manager.v1',
+        message_id: managerMessageId2,
+        project_id: fixtures1.projectId,
+        task_id: taskId2,
+        decision: 'EXECUTE',
+        priority: 'LOW',
+        risk: 'LOW',
+        instructions: instructions2,
+        acceptance_criteria: ['All tests pass'],
+        constraints: ['No regressions'],
+        review_issues: [],
+        expected_task_state: 'CODING',
+        expected_revision: 1,
+        created_at: now,
+      };
+      const rawManagerPayload2 = JSON.stringify(managerPayload2);
+      const managerPayloadHash2 = crypto.createHash('sha256').update(rawManagerPayload2, 'utf8').digest('hex');
+      repo.recordProtocolMessage(
+        managerRecordId2,
+        managerMessageId2,
+        'manager.v1',
+        fixtures1.projectId,
+        taskId2,
+        'CODING',
+        1,
+        managerPayloadHash2,
+        rawManagerPayload2,
+        'APPLIED',
+        undefined,
+        now
+      );
+
+      // 6. Authorization 2
+      const canonicalPayload2 = computeCanonicalPayload({
+        projectId: fixtures1.projectId,
+        taskId: taskId2,
+        attemptId: attemptId2,
+        taskTitle: 'Task 2',
+        taskDescription: 'Test task description',
+        acceptanceCriteria: ['All tests pass'],
+        constraints: ['No regressions'],
+        instructions: instructions2,
+        contextFiles: ['src/mcp/McpServer.ts'],
+        verificationCommands: {
+          TEST: { executable: 'npm', args: ['test'] },
+          LINT: null,
+          BUILD: null,
+        },
+        managerMessageId: managerRecordId2,
+        managerPayloadHash: managerPayloadHash2,
+      });
+      const canonicalPayloadJson2 = JSON.stringify(canonicalPayload2);
+      const instructionPayloadHash2 = computePayloadHash(canonicalPayload2);
+      const contextManifestHash2 = computeContextManifestHash(['src/mcp/McpServer.ts']);
+
+      const auth2: ExecutionAuthorization = {
+        id: authorizationId2,
+        project_id: fixtures1.projectId,
+        task_id: taskId2,
+        task_revision: 1,
+        base_sha: 'b'.repeat(40),
+        repository_head_sha: 'c'.repeat(40),
+        manager_message_id: managerRecordId2,
+        manager_payload_hash: managerPayloadHash2,
+        routing_decision_id: routingDecisionId2,
+        selected_resource_id: fixtures1.resourceId,
+        selected_provider_id: fixtures1.providerId,
+        instruction_payload_hash: instructionPayloadHash2,
+        context_manifest_hash: contextManifestHash2,
+        canonical_instructions_json: canonicalPayloadJson2,
+        context_files_json: JSON.stringify(['src/mcp/McpServer.ts']),
+        canonical_payload_json: canonicalPayloadJson2,
+        status: 'AUTHORIZED',
+        created_at: now,
+        dispatched_at: null,
+        execution_id: null,
+        task_ownership_epoch: 1,
+        lifecycle_version: 1,
+        selected_account_id: fixtures1.accountId,
+        adapter_started_at: null,
+        adapter_finished_at: null,
+        adapter_error_json: null,
+        settlement_status: null,
+        settled_at: null,
+        settlement_evidence_json: null,
+        settlement_evidence_hash: null,
+        assignment_id: assignmentId2,
+        attempt_id: attemptId2,
+      };
+      repo.createExecutionAuthorization(auth2);
+      authId2 = authorizationId2;
+    } finally {
+      db.close();
+    }
+
+    const workerScript = `
+      const { parentPort, workerData } = require('worker_threads');
+      const Database = require('better-sqlite3');
+      const { Repository } = require('./dist-electron/core/database/repositories');
+      const { McpSessionAuthorityService } = require('./dist-electron/core/services/McpSessionAuthorityService');
+
+      try {
+        const db = new Database(workerData.dbPath);
+        db.pragma('foreign_keys = ON');
+        const repo = new Repository(db);
+        const service = new McpSessionAuthorityService(repo, db);
+        const result = service.issueSession({ authorizationId: workerData.authId });
+        db.close();
+        parentPort.postMessage({ success: true, token: result.plaintextToken });
+      } catch (err) {
+        parentPort.postMessage({ success: false, error: err.message });
+      }
+    `;
+
+    const w1 = new Worker(workerScript, { eval: true, workerData: { dbPath, authId: authId1 } });
+    const w2 = new Worker(workerScript, { eval: true, workerData: { dbPath, authId: authId2 } });
+
+    const [r1, r2] = await Promise.all([
+      new Promise<any>((res) => w1.once('message', res)),
+      new Promise<any>((res) => w2.once('message', res)),
+    ]);
+
+    await Promise.all([w1.terminate(), w2.terminate()]);
+
+    expect(r1.success).toBe(true);
+    expect(r2.success).toBe(true);
+    expect(r1.token).not.toBe(r2.token);
+
+    const checkDb = new Database(dbPath, { readonly: true });
+    try {
+      const activeCount = checkDb.prepare('SELECT COUNT(*) as cnt FROM mcp_client_sessions WHERE revoked_at IS NULL').get() as { cnt: number };
+      expect(activeCount.cnt).toBe(2);
+    } finally {
+      checkDb.close();
+    }
+  });
+
+  it('114. Multiple sequential tool & resource reads through InMemoryTransport return exact context without state leakage', async () => {
+    const { db, dbPath } = createTestDatabase(tempDir, 'multi_reads.db');
+    let token = '';
+    try {
+      const fixtures = setupFullGraph(db);
+      token = fixtures.service.issueSession({ authorizationId: fixtures.authorizationId }).plaintextToken;
+    } finally {
+      db.close();
+    }
+
+    const context = new McpAuthorityContext({ dbPath, sessionToken: token });
+    const server = buildAgentForgeMcpServer({ authorityContext: context });
+    const [cTrans, sTrans] = InMemoryTransport.createLinkedPair();
+    await server.connect(sTrans);
+    const client = new Client({ name: 'seq-client', version: '1.0.0' });
+    await client.connect(cTrans);
+
+    try {
+      for (let i = 0; i < 4; i++) {
+        const toolRes = await client.callTool({
+          name: GET_AUTHORIZED_CONTEXT_TOOL_NAME,
+          arguments: {},
+        });
+        expect(toolRes.isError).toBeFalsy();
+        const resText = (toolRes.content[0] as { text: string }).text;
+        expect(JSON.parse(resText).schema_version).toBe(2);
+
+        const resourceRes = await client.readResource({
+          uri: AUTHORIZED_CONTEXT_RESOURCE_URI,
+        });
+        expect(resourceRes.contents).toHaveLength(1);
+        expect(JSON.parse((resourceRes.contents[0] as { text: string }).text).schema_version).toBe(2);
+      }
+    } finally {
+      await client.close();
+      await server.close();
+      context.close();
+    }
+  });
+
+  it('115. Authority context read validates PRAGMA foreign_keys = ON and fails closed if OFF', () => {
+    const { db: setupDb, dbPath } = createTestDatabase(tempDir, 'fk_off.db');
+    let token = '';
+    try {
+      const fixtures = setupFullGraph(setupDb);
+      token = fixtures.service.issueSession({ authorizationId: fixtures.authorizationId }).plaintextToken;
+    } finally {
+      setupDb.close();
+    }
+
+    const readDb = new Database(dbPath, { readonly: true, fileMustExist: true });
+    readDb.pragma('query_only = ON');
+    // Turn foreign keys OFF
+    readDb.pragma('foreign_keys = OFF');
+
+    try {
+      expect(() => {
+        new McpAuthorityContext({ db: readDb, sessionToken: token });
+      }).toThrowError(/MCP_CONFIGURATION_INVALID/);
+    } finally {
+      readDb.close();
     }
   });
 });

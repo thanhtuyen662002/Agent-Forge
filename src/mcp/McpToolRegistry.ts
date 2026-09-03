@@ -13,10 +13,9 @@ import {
   TOOL_ANNOTATIONS,
 } from "./McpProtocolSchemas";
 import { McpAuthorityContext, getDefaultAuthorityContext } from "./McpAuthorityContext";
-import { McpAuthorityError } from "../core/services/McpSessionAuthorityService";
-import { McpSessionErrorCode } from "../core/types/domain";
+import { McpAuthorityError, McpExtendedErrorCode } from "../core/services/McpSessionAuthorityService";
 
-export function getCanonicalPublicErrorMessage(category: McpSessionErrorCode): string {
+export function getCanonicalPublicErrorMessage(category: McpExtendedErrorCode): string {
   switch (category) {
     case 'MCP_SESSION_REQUIRED':
       return 'Session token required';
@@ -28,13 +27,15 @@ export function getCanonicalPublicErrorMessage(category: McpSessionErrorCode): s
       return 'Execution authority fenced';
     case 'MCP_CONTEXT_INTEGRITY_FAILED':
       return 'Context integrity verification failed';
+    case 'MCP_CLEANUP_FAILED':
+      return 'Database cleanup failed';
     default:
       return 'Authority verification failed';
   }
 }
 
-export function formatPublicError(error: unknown): { category: McpSessionErrorCode; text: string } {
-  const category: McpSessionErrorCode =
+export function formatPublicError(error: unknown): { category: McpExtendedErrorCode; text: string } {
+  const category: McpExtendedErrorCode =
     error instanceof McpAuthorityError ? error.category : 'MCP_CONFIGURATION_INVALID';
   const canonicalMessage = getCanonicalPublicErrorMessage(category);
   return {

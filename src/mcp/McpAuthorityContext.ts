@@ -39,6 +39,13 @@ export class McpAuthorityContext {
           'Database connection must have PRAGMA query_only = ON'
         );
       }
+      const fkState = options.db.pragma('foreign_keys', { simple: true }) as number;
+      if (fkState !== 1) {
+        throw new McpAuthorityError(
+          'MCP_CONFIGURATION_INVALID',
+          'Database connection must have PRAGMA foreign_keys = ON'
+        );
+      }
       try {
         verifyMigration21SchemaAuthority(options.db);
       } catch {
@@ -97,6 +104,19 @@ export class McpAuthorityContext {
       throw new McpAuthorityError('MCP_CONFIGURATION_INVALID', 'Failed to verify query_only pragma');
     }
 
+    try {
+      db.pragma('foreign_keys = ON');
+    } catch {
+      db.close();
+      throw new McpAuthorityError('MCP_CONFIGURATION_INVALID', 'Failed to set foreign_keys pragma');
+    }
+
+    const fkState = db.pragma('foreign_keys', { simple: true }) as number;
+    if (fkState !== 1) {
+      db.close();
+      throw new McpAuthorityError('MCP_CONFIGURATION_INVALID', 'Failed to verify foreign_keys pragma');
+    }
+
     // Verify exact Migration 21 ledger and schema authority
     try {
       verifyMigration21SchemaAuthority(db);
@@ -114,43 +134,105 @@ export class McpAuthorityContext {
     return { db, service };
   }
 
+  private getRuntimeTotalChanges(db: Database.Database): number {
+    try {
+      const row = db.prepare('SELECT total_changes() AS total_changes').get() as { total_changes?: unknown } | undefined;
+      if (
+        !row ||
+        typeof row.total_changes !== 'number' ||
+        !Number.isFinite(row.total_changes) ||
+        row.total_changes < 0 ||
+        !Number.isInteger(row.total_changes)
+      ) {
+        throw new McpAuthorityError('MCP_CONFIGURATION_INVALID', 'Failed to read total_changes');
+      }
+      return row.total_changes;
+    } catch (err) {
+      if (err instanceof McpAuthorityError) {
+        throw err;
+      }
+      throw new McpAuthorityError('MCP_CONFIGURATION_INVALID', 'Failed to read total_changes');
+    }
+  }
+
   /**
    * Resolves the authorized context using the configured session token and database.
    * Session token is strictly validated before touching or opening the database.
+   * Connection-local mutations are strictly fenced using SELECT total_changes().
    */
   public resolveAuthorizedContext(): AuthorizedContextResponse {
     const sessionToken = this.getSessionToken();
     const validatedToken = validateCanonicalSessionToken(sessionToken);
     const { db, service } = this.getOrCreateDatabase();
 
-    const changesBefore = db.pragma('total_changes', { simple: true }) as number;
-    const response = service.resolveAuthorizedContext(validatedToken);
-    const changesAfter = db.pragma('total_changes', { simple: true }) as number;
+    const changesBefore = this.getRuntimeTotalChanges(db);
+    let serviceErr: unknown = null;
+    let response: AuthorizedContextResponse | null = null;
+
+    try {
+      response = service.resolveAuthorizedContext(validatedToken);
+    } catch (err) {
+      serviceErr = err;
+    }
+
+    let changesAfter: number;
+    try {
+      changesAfter = this.getRuntimeTotalChanges(db);
+    } catch {
+      throw new McpAuthorityError('MCP_AUTHORITY_FENCED', 'Database mutation verification failed');
+    }
 
     if (changesBefore !== changesAfter) {
       throw new McpAuthorityError('MCP_AUTHORITY_FENCED', 'Database mutation detected during context read');
     }
 
-    return response;
+    if (serviceErr) {
+      throw serviceErr;
+    }
+
+    return response!;
   }
 
   /**
-   * Safely closes the database handle. Observable diagnostic on failure without leaking details.
+   * Safely closes the database handle with bounded retry for Windows file locks.
+   * Observable diagnostic on failure without leaking details.
    */
   public close(): void {
-    if (this.db) {
-      const dbToClose = this.db;
-      this.db = null;
-      this.service = null;
+    if (!this.db) {
+      return;
+    }
+    const dbToClose = this.db;
+    this.db = null;
+    this.service = null;
+
+    if (!dbToClose.open) {
+      return;
+    }
+
+    let lastErr: unknown = null;
+    const maxRetries = 5;
+    const retryDelayMs = 25;
+
+    for (let attempt = 0; attempt < maxRetries; attempt++) {
       try {
         if (dbToClose.open) {
           dbToClose.close();
         }
+        return;
       } catch (err) {
-        process.stderr.write('[agentforge-mcp-context] Database close failed: MCP_INTERNAL_ERROR\n');
-        throw err;
+        lastErr = err;
+        if (attempt < maxRetries - 1) {
+          try {
+            Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, retryDelayMs);
+          } catch {
+            // fallback if SharedArrayBuffer unavailable
+          }
+        }
       }
     }
+
+    process.stderr.write('[agentforge-mcp-context] Database close failed: MCP_CLEANUP_FAILED\n');
+    throw new McpAuthorityError('MCP_CLEANUP_FAILED', 'Database close failed');
   }
 }
 
@@ -165,7 +247,8 @@ export function getDefaultAuthorityContext(): McpAuthorityContext {
 
 export function resetDefaultAuthorityContext(): void {
   if (defaultContextInstance) {
-    defaultContextInstance.close();
+    const instance = defaultContextInstance;
     defaultContextInstance = null;
+    instance.close();
   }
 }

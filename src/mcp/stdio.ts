@@ -4,6 +4,7 @@ import { resetDefaultAuthorityContext } from "./McpAuthorityContext";
 
 export function runStdioServer(): StdioServerHandle {
   let isCleaningUp = false;
+  let cleanupSuccess = true;
 
   const removeSignalListeners = () => {
     process.off("exit", onExit);
@@ -11,25 +12,28 @@ export function runStdioServer(): StdioServerHandle {
     process.off("SIGTERM", onSigTerm);
   };
 
-  const cleanup = () => {
-    if (isCleaningUp) return;
+  const cleanup = (): boolean => {
+    if (isCleaningUp) return cleanupSuccess;
     isCleaningUp = true;
     removeSignalListeners();
     try {
       resetDefaultAuthorityContext();
+      cleanupSuccess = true;
     } catch {
+      cleanupSuccess = false;
       process.stderr.write('[agentforge-mcp] Cleanup diagnostic: MCP_CLEANUP_FAILED\n');
     }
+    return cleanupSuccess;
   };
 
   const onSigInt = () => {
-    cleanup();
-    process.exit(0);
+    const success = cleanup();
+    process.exit(success ? 0 : 1);
   };
 
   const onSigTerm = () => {
-    cleanup();
-    process.exit(0);
+    const success = cleanup();
+    process.exit(success ? 0 : 1);
   };
 
   const onExit = () => {
@@ -49,8 +53,11 @@ export function runStdioServer(): StdioServerHandle {
 
     const originalClose = handle.close.bind(handle);
     handle.close = async () => {
-      cleanup();
-      return originalClose();
+      const success = cleanup();
+      await originalClose();
+      if (!success) {
+        throw new Error('Cleanup failed: MCP_CLEANUP_FAILED');
+      }
     };
 
     return handle;

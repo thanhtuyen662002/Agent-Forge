@@ -24,11 +24,13 @@ import {
 } from './ExecutionAuthorizationService';
 import { ManagerProtocolSchema } from '../types/protocols';
 
+export type McpExtendedErrorCode = McpSessionErrorCode | 'MCP_CLEANUP_FAILED' | 'MCP_INTERNAL_ERROR';
+
 export class McpAuthorityError extends Error {
-  public readonly category: McpSessionErrorCode;
+  public readonly category: McpExtendedErrorCode;
   public readonly rawMessage: string;
 
-  constructor(category: McpSessionErrorCode, message: string) {
+  constructor(category: McpExtendedErrorCode, message: string) {
     const cleanMessage = message.startsWith(`[${category}] `)
       ? message.slice(`[${category}] `.length)
       : message;
@@ -75,6 +77,7 @@ export interface ProtocolMessageRecord {
   payload_json: string;
   state: string;
   created_at: string;
+  processed_at?: string | null;
 }
 
 export interface ValidatedAuthorityGraph {
@@ -237,6 +240,9 @@ export function computeCompleteAuthorityFingerprint(graph: ValidatedAuthorityGra
       type: routingEvent.type,
       project_id: routingEvent.project_id,
       task_id: routingEvent.task_id,
+      agent_id: routingEvent.agent_id ?? null,
+      summary: routingEvent.summary,
+      timestamp: routingEvent.timestamp,
       raw_payload: routingPayload,
     },
     protocol_message: protocolMessage
@@ -251,6 +257,8 @@ export function computeCompleteAuthorityFingerprint(graph: ValidatedAuthorityGra
           state: protocolMessage.state,
           payload_hash: protocolMessage.payload_hash,
           payload_json: protocolMessage.payload_json,
+          created_at: protocolMessage.created_at,
+          processed_at: protocolMessage.processed_at ?? null,
         }
       : null,
   };
@@ -616,6 +624,9 @@ export class McpSessionAuthorityService {
         throw new McpAuthorityError('MCP_AUTHORITY_FENCED', `Manager protocol message record "${auth.manager_message_id}" not found`);
       }
 
+      if (typeof msgRow.message_id !== 'string' || msgRow.message_id.trim().length === 0) {
+        throw new McpAuthorityError('MCP_AUTHORITY_FENCED', 'Protocol message row message_id is empty or invalid');
+      }
       if (msgRow.protocol !== 'manager.v1') {
         throw new McpAuthorityError('MCP_AUTHORITY_FENCED', 'Protocol message protocol is not manager.v1');
       }
@@ -645,35 +656,88 @@ export class McpSessionAuthorityService {
         throw new McpAuthorityError('MCP_AUTHORITY_FENCED', 'Manager payload JSON syntax error');
       }
 
+      if (typeof parsedManagerObj !== 'object' || parsedManagerObj === null || Array.isArray(parsedManagerObj)) {
+        throw new McpAuthorityError('MCP_AUTHORITY_FENCED', 'Manager payload is not a JSON object');
+      }
+
+      // Strict envelope check locally: reject unexpected top-level fields
+      const allowedManagerKeys = new Set([
+        'protocol',
+        'message_id',
+        'project_id',
+        'task_id',
+        'decision',
+        'priority',
+        'risk',
+        'instructions',
+        'acceptance_criteria',
+        'constraints',
+        'review_issues',
+        'expected_task_state',
+        'expected_revision',
+        'created_at',
+      ]);
+      for (const key of Object.keys(parsedManagerObj as Record<string, unknown>)) {
+        if (!allowedManagerKeys.has(key)) {
+          throw new McpAuthorityError('MCP_AUTHORITY_FENCED', `Manager payload contains unexpected field "${key}"`);
+        }
+      }
+
       const parsedManagerResult = ManagerProtocolSchema.safeParse(parsedManagerObj);
       if (!parsedManagerResult.success) {
         throw new McpAuthorityError('MCP_AUTHORITY_FENCED', 'Manager payload schema validation failed');
       }
       const managerData = parsedManagerResult.data;
 
-      if (managerData.protocol !== 'manager.v1') {
-        throw new McpAuthorityError('MCP_AUTHORITY_FENCED', 'Parsed manager protocol is not manager.v1');
+      if (managerData.protocol !== 'manager.v1' || managerData.protocol !== msgRow.protocol) {
+        throw new McpAuthorityError('MCP_AUTHORITY_FENCED', 'Parsed manager protocol is not manager.v1 or does not match row');
       }
-      if (managerData.project_id !== auth.project_id) {
+      if (typeof managerData.message_id !== 'string' || managerData.message_id.trim().length === 0) {
+        throw new McpAuthorityError('MCP_AUTHORITY_FENCED', 'Parsed manager payload message_id is empty or invalid');
+      }
+      if (managerData.message_id !== msgRow.message_id) {
+        throw new McpAuthorityError('MCP_AUTHORITY_FENCED', 'Manager payload message_id does not match protocol message row message_id');
+      }
+      if (managerData.project_id !== auth.project_id || managerData.project_id !== msgRow.project_id) {
         throw new McpAuthorityError('MCP_AUTHORITY_FENCED', 'Parsed manager project_id mismatch');
       }
-      if (managerData.task_id !== auth.task_id) {
+      if (managerData.task_id !== auth.task_id || managerData.task_id !== msgRow.task_id) {
         throw new McpAuthorityError('MCP_AUTHORITY_FENCED', 'Parsed manager task_id mismatch');
       }
       if (managerData.decision !== 'EXECUTE' && managerData.decision !== 'FIX_REQUIRED') {
         throw new McpAuthorityError('MCP_AUTHORITY_FENCED', `Manager decision "${managerData.decision}" does not authorize execution`);
       }
 
-      const expectedRev =
+      // Check revision and expected_task_state agreement between row and payload
+      const rowRev =
         msgRow.expected_revision !== null && msgRow.expected_revision !== undefined
           ? Number(msgRow.expected_revision)
-          : managerData.expected_revision;
+          : null;
+      const payloadRev =
+        managerData.expected_revision !== null && managerData.expected_revision !== undefined
+          ? Number(managerData.expected_revision)
+          : null;
+
+      if (rowRev !== null && payloadRev !== null && rowRev !== payloadRev) {
+        throw new McpAuthorityError('MCP_AUTHORITY_FENCED', 'Protocol message expected_revision mismatch between row and payload');
+      }
+
+      if (
+        msgRow.expected_task_state != null &&
+        managerData.expected_task_state != null &&
+        msgRow.expected_task_state !== managerData.expected_task_state
+      ) {
+        throw new McpAuthorityError('MCP_AUTHORITY_FENCED', 'Protocol message expected_task_state mismatch between row and payload');
+      }
+
+      const derivedRev = payloadRev !== null ? payloadRev : rowRev;
+
       if (managerData.decision === 'EXECUTE') {
-        if (expectedRev !== null && expectedRev !== undefined && expectedRev !== auth.task_revision) {
+        if (derivedRev !== null && derivedRev !== auth.task_revision) {
           throw new McpAuthorityError('MCP_AUTHORITY_FENCED', 'Manager expected_revision does not match task_revision');
         }
       } else if (managerData.decision === 'FIX_REQUIRED') {
-        if (expectedRev !== null && expectedRev !== undefined && expectedRev + 1 !== auth.task_revision) {
+        if (derivedRev !== null && derivedRev + 1 !== auth.task_revision) {
           throw new McpAuthorityError('MCP_AUTHORITY_FENCED', 'Manager expected_revision + 1 does not match task_revision');
         }
       }
@@ -685,11 +749,12 @@ export class McpSessionAuthorityService {
         project_id: String(msgRow.project_id),
         task_id: msgRow.task_id ? String(msgRow.task_id) : null,
         decision: managerData.decision,
-        sequence: expectedRev ?? auth.task_revision,
+        sequence: derivedRev ?? auth.task_revision,
         payload_hash: String(msgRow.payload_hash),
         payload_json: rawPayload,
         state: String(msgRow.status),
         created_at: String(msgRow.created_at),
+        processed_at: msgRow.processed_at ? String(msgRow.processed_at) : null,
       };
     }
 

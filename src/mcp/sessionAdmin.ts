@@ -55,34 +55,34 @@ export function parseCliArgs(args: string[]): CliArgs {
         : arg;
 
       if (seenFlags.has(normalizedFlag)) {
-        throw new Error(`Duplicate flag "${arg}"`);
+        throw new Error('Duplicate flag');
       }
       seenFlags.add(normalizedFlag);
 
       if (arg === '--json') {
         jsonOutput = true;
       } else if (arg === '--db' || arg === '-d') {
-        if (i + 1 >= args.length || args[i + 1].startsWith('-')) throw new Error(`Missing value for flag "${arg}"`);
+        if (i + 1 >= args.length || args[i + 1].startsWith('-')) throw new Error('Missing value for flag');
         const val = args[++i];
-        if (val.trim().length === 0) throw new Error(`Flag "${arg}" cannot be whitespace-only`);
+        if (val.trim().length === 0) throw new Error('Flag cannot be whitespace-only');
         dbPath = val.trim();
       } else if (arg === '--auth' || arg === '-a') {
-        if (i + 1 >= args.length || args[i + 1].startsWith('-')) throw new Error(`Missing value for flag "${arg}"`);
+        if (i + 1 >= args.length || args[i + 1].startsWith('-')) throw new Error('Missing value for flag');
         const val = args[++i];
-        if (val.trim().length === 0) throw new Error(`Flag "${arg}" cannot be whitespace-only`);
+        if (val.trim().length === 0) throw new Error('Flag cannot be whitespace-only');
         authorizationId = val.trim();
       } else if (arg === '--session' || arg === '-s') {
-        if (i + 1 >= args.length || args[i + 1].startsWith('-')) throw new Error(`Missing value for flag "${arg}"`);
+        if (i + 1 >= args.length || args[i + 1].startsWith('-')) throw new Error('Missing value for flag');
         const val = args[++i];
-        if (val.trim().length === 0) throw new Error(`Flag "${arg}" cannot be whitespace-only`);
+        if (val.trim().length === 0) throw new Error('Flag cannot be whitespace-only');
         sessionId = val.trim();
       } else if (arg === '--ttl' || arg === '-t') {
-        if (i + 1 >= args.length || args[i + 1].startsWith('-')) throw new Error(`Missing value for flag "${arg}"`);
+        if (i + 1 >= args.length || args[i + 1].startsWith('-')) throw new Error('Missing value for flag');
         const val = args[++i];
-        if (val.trim().length === 0) throw new Error(`Flag "${arg}" cannot be whitespace-only`);
+        if (val.trim().length === 0) throw new Error('Flag cannot be whitespace-only');
         ttlSeconds = validateTtlSeconds(val);
       } else {
-        throw new Error(`Unknown flag "${arg}"`);
+        throw new Error('Unknown flag');
       }
     } else {
       positional.push(arg);
@@ -97,11 +97,11 @@ export function parseCliArgs(args: string[]): CliArgs {
   if (rawCmd === 'issue' || rawCmd === 'revoke') {
     command = rawCmd;
   } else {
-    throw new Error(`Unknown command "${positional[0]}"`);
+    throw new Error('Unknown command');
   }
 
   if (positional.length > 1) {
-    throw new Error(`Surplus positional argument "${positional[1]}"`);
+    throw new Error('Surplus positional argument');
   }
 
   // 3. Command-specific closed grammar validation
@@ -139,6 +139,23 @@ export function parseCliArgs(args: string[]): CliArgs {
     ttlSeconds,
     jsonOutput,
   };
+}
+
+export function getCanonicalAdminErrorMessage(category: string): string {
+  switch (category) {
+    case 'MCP_CONFIGURATION_INVALID':
+      return 'Invalid configuration or CLI arguments';
+    case 'MCP_AUTHORITY_FENCED':
+      return 'Authority verification failed';
+    case 'MCP_SESSION_UNAUTHORIZED':
+      return 'Session authentication failed';
+    case 'MCP_CONTEXT_INTEGRITY_FAILED':
+      return 'Authority integrity verification failed';
+    case 'MCP_CLEANUP_FAILED':
+      return 'Database cleanup failed';
+    default:
+      return 'Internal error occurred';
+  }
 }
 
 export function runSessionAdmin(rawArgs: string[]): number {
@@ -259,9 +276,9 @@ Usage:
     return 1;
   } catch (error) {
     if (error instanceof McpAuthorityError) {
-      process.stderr.write(`ERROR: [${error.category}] ${error.rawMessage}\n`);
+      process.stderr.write(`ERROR: [${error.category}] ${getCanonicalAdminErrorMessage(error.category)}\n`);
     } else {
-      process.stderr.write('ERROR: [MCP_AUTHORITY_FENCED] Administration operation failed\n');
+      process.stderr.write('ERROR: [MCP_AUTHORITY_FENCED] Authority verification failed\n');
     }
     return 1;
   } finally {
@@ -271,7 +288,7 @@ Usage:
           db.close();
         }
       } catch {
-        process.stderr.write('ERROR: [MCP_INTERNAL_ERROR] Database close failed\n');
+        process.stderr.write('ERROR: [MCP_CLEANUP_FAILED] Database cleanup failed\n');
         return 1;
       }
     }
