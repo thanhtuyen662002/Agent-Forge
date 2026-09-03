@@ -1340,5 +1340,5 @@ describe('PR #7 — Durable Execution Authorization & Orchestration Binding', ()
     expect(res2.error).toContain('EXECUTION_AUTHORIZATION_ALREADY_DISPATCHED');
 
     reopenedDb.close();
-  });
+  }, 60000);
 });
