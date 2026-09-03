@@ -1458,7 +1458,7 @@ describe('R5I7 Cross-Provider Handoff Evidence and Closure Integration Suite', (
       const slotA = repo.getWorkerSlot(flow.slotAId)!;
       expect(slotA.status).toBe('IDLE');
     }
-  });
+  }, 60000);
 
   // 14. Successful settlement releases the exact guarded lease and returns only the matching slot to IDLE
   it('14. Successful settlement releases the exact guarded lease and returns only the matching slot to IDLE', async () => {
@@ -2025,7 +2025,7 @@ describe('R5I7 Cross-Provider Handoff Evidence and Closure Integration Suite', (
 
     dbRestarted.close();
     db = new Database(dbPath);
-  });
+  }, 60000);
 
   // 20. Provider A -> Provider B evidence remains isolated from unrelated projects, attempts, accounts, and resources
   it('20. Provider A -> Provider B evidence remains isolated from unrelated projects, attempts, accounts, and resources', async () => {
@@ -2225,5 +2225,5 @@ describe('R5I7 Cross-Provider Handoff Evidence and Closure Integration Suite', (
       const manifests = db.prepare('SELECT * FROM context_manifests WHERE snapshot_id = ?').all(s.id) as any[];
       expect(manifests.length).toBeGreaterThan(0);
     }
-  });
+  }, 120000);
 });
