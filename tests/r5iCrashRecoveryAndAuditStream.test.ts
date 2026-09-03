@@ -503,7 +503,7 @@ describe('R5I6 Crash Recovery, Execution Lifecycle Linearization, and Durable Au
     const testDb = new Database(':memory:');
     MigrationRunner.run(testDb);
     const count = (testDb.prepare('SELECT COUNT(*) as c FROM schema_migrations').get() as any).c;
-    expect(count).toBe(20);
+    expect(count).toBe(21);
 
     const tables = (testDb.prepare("SELECT name FROM sqlite_master WHERE type='table'").all() as any[]).map((t) => t.name);
     expect(tables).toContain('execution_recovery_states');
@@ -543,7 +543,7 @@ describe('R5I6 Crash Recovery, Execution Lifecycle Linearization, and Durable Au
     MigrationRunner.run(upgradeDb);
 
     const postCount = (upgradeDb.prepare('SELECT COUNT(*) as c FROM schema_migrations').get() as any).c;
-    expect(postCount).toBe(20);
+    expect(postCount).toBe(21);
     upgradeDb.close();
   });
 
@@ -598,12 +598,12 @@ describe('R5I6 Crash Recovery, Execution Lifecycle Linearization, and Durable Au
     testDb.close();
   });
 
-  // 4. RC verifier requires exactly 20 migrations
-  it('4. should require exactly 20 migrations in static contract count', () => {
-    expect(MIGRATIONS.length).toBe(20);
+  // 4. RC verifier requires exactly 21 migrations
+  it('4. should require exactly 21 migrations in static contract count', () => {
+    expect(MIGRATIONS.length).toBe(21);
     const verifierScript = fs.readFileSync(path.join(process.cwd(), 'scripts/verify-demo-rc-win.ps1'), 'utf-8');
-    expect(verifierScript).toContain('Expected exactly 20 migrations');
-    expect(verifierScript).not.toContain('Expected exactly 19 migrations');
+    expect(verifierScript).toContain('Expected exactly 21 migrations');
+    expect(verifierScript).not.toContain('Expected exactly 20 migrations');
   });
 
   // 5. First acceptance arms lifecycle version atomically

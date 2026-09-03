@@ -14,6 +14,34 @@ import {
 } from "./McpProtocolSchemas";
 import { McpAuthorityContext, getDefaultAuthorityContext } from "./McpAuthorityContext";
 import { McpAuthorityError } from "../core/services/McpSessionAuthorityService";
+import { McpSessionErrorCode } from "../core/types/domain";
+
+export function getCanonicalPublicErrorMessage(category: McpSessionErrorCode): string {
+  switch (category) {
+    case 'MCP_SESSION_REQUIRED':
+      return 'Session token required';
+    case 'MCP_SESSION_UNAUTHORIZED':
+      return 'Session authentication failed';
+    case 'MCP_CONFIGURATION_INVALID':
+      return 'MCP configuration invalid';
+    case 'MCP_AUTHORITY_FENCED':
+      return 'Execution authority fenced';
+    case 'MCP_CONTEXT_INTEGRITY_FAILED':
+      return 'Context integrity verification failed';
+    default:
+      return 'Authority verification failed';
+  }
+}
+
+export function formatPublicError(error: unknown): { category: McpSessionErrorCode; text: string } {
+  const category: McpSessionErrorCode =
+    error instanceof McpAuthorityError ? error.category : 'MCP_CONFIGURATION_INVALID';
+  const canonicalMessage = getCanonicalPublicErrorMessage(category);
+  return {
+    category,
+    text: `[${category}] ${canonicalMessage}`,
+  };
+}
 
 export function registerAgentForgeCapabilities(
   server: McpServer,
@@ -82,14 +110,13 @@ export function registerAgentForgeCapabilities(
           ],
         };
       } catch (error) {
-        const category = error instanceof McpAuthorityError ? error.category : "MCP_CONFIGURATION_INVALID";
-        const message = error instanceof Error ? error.message : String(error);
+        const publicErr = formatPublicError(error);
         return {
           isError: true,
           content: [
             {
               type: "text" as const,
-              text: `[${category}] ${message}`,
+              text: publicErr.text,
             },
           ],
         };
@@ -120,9 +147,8 @@ export function registerAgentForgeCapabilities(
           ],
         };
       } catch (error) {
-        const category = error instanceof McpAuthorityError ? error.category : "MCP_CONFIGURATION_INVALID";
-        const message = error instanceof Error ? error.message : String(error);
-        throw new Error(`[${category}] ${message}`);
+        const publicErr = formatPublicError(error);
+        throw new Error(publicErr.text);
       }
     }
   );

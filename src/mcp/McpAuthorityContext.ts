@@ -5,7 +5,8 @@ import {
   McpSessionAuthorityService,
   McpAuthorityError,
 } from '../core/services/McpSessionAuthorityService';
-import { AuthorizedContextResponse, McpSessionErrorCode } from '../core/types/domain';
+import { verifyMigration21SchemaAuthority } from '../core/database/migrations';
+import { AuthorizedContextResponse } from '../core/types/domain';
 
 export interface McpAuthorityContextOptions {
   dbPath?: string;
@@ -23,6 +24,27 @@ export class McpAuthorityContext {
     this.configuredDbPath = options?.dbPath;
     this.configuredSessionToken = options?.sessionToken;
     if (options?.db) {
+      // Enforce production read-only boundary on injected connection
+      if (!options.db.readonly) {
+        throw new McpAuthorityError(
+          'MCP_CONFIGURATION_INVALID',
+          'Database connection must be opened with readonly: true'
+        );
+      }
+      const queryOnly = options.db.pragma('query_only', { simple: true }) as number;
+      if (queryOnly !== 1) {
+        throw new McpAuthorityError(
+          'MCP_CONFIGURATION_INVALID',
+          'Database connection must have PRAGMA query_only = ON'
+        );
+      }
+      try {
+        verifyMigration21SchemaAuthority(options.db);
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        throw new McpAuthorityError('MCP_CONFIGURATION_INVALID', `Database schema verification failed: ${msg}`);
+      }
+
       this.db = options.db;
       const repo = new Repository(this.db);
       this.service = new McpSessionAuthorityService(repo, this.db);
@@ -71,18 +93,13 @@ export class McpAuthorityContext {
       throw new McpAuthorityError('MCP_CONFIGURATION_INVALID', `Failed to set query_only pragma: ${msg}`);
     }
 
-    // Verify Migration 21 exists
+    // Verify exact Migration 21 ledger and schema authority
     try {
-      const row = db.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'mcp_client_sessions'").get();
-      if (!row) {
-        db.close();
-        throw new McpAuthorityError('MCP_CONFIGURATION_INVALID', 'Database is missing Migration 21 (mcp_client_sessions table absent)');
-      }
+      verifyMigration21SchemaAuthority(db);
     } catch (err) {
-      if (err instanceof McpAuthorityError) throw err;
       db.close();
       const msg = err instanceof Error ? err.message : String(err);
-      throw new McpAuthorityError('MCP_CONFIGURATION_INVALID', `Database verification failed: ${msg}`);
+      throw new McpAuthorityError('MCP_CONFIGURATION_INVALID', `Database schema verification failed: ${msg}`);
     }
 
     const repo = new Repository(db);
@@ -96,31 +113,31 @@ export class McpAuthorityContext {
 
   /**
    * Resolves the authorized context using the configured session token and database.
+   * Token is passed canonically without trimming or normalization.
    */
   public resolveAuthorizedContext(): AuthorizedContextResponse {
     const sessionToken = this.getSessionToken();
-    if (!sessionToken || sessionToken.trim().length === 0) {
-      throw new McpAuthorityError('MCP_SESSION_REQUIRED', 'Missing AGENTFORGE_MCP_SESSION_TOKEN environment variable');
-    }
-
     const { service } = this.getOrCreateDatabase();
-    return service.resolveAuthorizedContext(sessionToken.trim());
+    return service.resolveAuthorizedContext(sessionToken);
   }
 
   /**
-   * Safely closes the database handle.
+   * Safely closes the database handle. Observable diagnostic on failure.
    */
   public close(): void {
     if (this.db) {
-      try {
-        if (this.db.open) {
-          this.db.close();
-        }
-      } catch {
-        // Ignore close errors during teardown
-      }
+      const dbToClose = this.db;
       this.db = null;
       this.service = null;
+      try {
+        if (dbToClose.open) {
+          dbToClose.close();
+        }
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        process.stderr.write(`[agentforge-mcp-context] Failed to close database: ${msg}\n`);
+        throw err;
+      }
     }
   }
 }

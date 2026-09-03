@@ -5,7 +5,9 @@ import { Repository } from '../core/database/repositories';
 import {
   McpSessionAuthorityService,
   McpAuthorityError,
+  validateTtlSeconds,
 } from '../core/services/McpSessionAuthorityService';
+import { verifyMigration21SchemaAuthority } from '../core/database/migrations';
 
 export interface CliArgs {
   command: 'issue' | 'revoke' | 'help';
@@ -17,31 +19,58 @@ export interface CliArgs {
 }
 
 export function parseCliArgs(args: string[]): CliArgs {
-  let command: 'issue' | 'revoke' | 'help' = 'help';
+  let command: 'issue' | 'revoke' | 'help' | null = null;
   let dbPath: string | undefined = process.env.AGENTFORGE_MCP_DB_PATH;
   let authorizationId: string | undefined;
   let sessionId: string | undefined;
   let ttlSeconds: number | undefined;
   let jsonOutput = false;
 
+  const seenFlags = new Set<string>();
   const positional: string[] = [];
 
   for (let i = 0; i < args.length; i++) {
     const arg = args[i];
-    if (arg === '--json') {
-      jsonOutput = true;
-    } else if (arg === '--db' || arg === '-d') {
-      dbPath = args[++i];
-    } else if (arg === '--auth' || arg === '-a') {
-      authorizationId = args[++i];
-    } else if (arg === '--session' || arg === '-s') {
-      sessionId = args[++i];
-    } else if (arg === '--ttl' || arg === '-t') {
-      const parsed = parseInt(args[++i], 10);
-      if (!Number.isNaN(parsed)) {
-        ttlSeconds = parsed;
+
+    if (arg === '--help' || arg === '-h') {
+      return { command: 'help', jsonOutput: false };
+    }
+
+    if (arg.startsWith('-')) {
+      // Flag handling
+      const normalizedFlag = arg === '-d' ? '--db'
+        : arg === '-a' ? '--auth'
+        : arg === '-s' ? '--session'
+        : arg === '-t' ? '--ttl'
+        : arg;
+
+      if (seenFlags.has(normalizedFlag)) {
+        throw new Error(`Duplicate flag "${arg}"`);
       }
-    } else if (!arg.startsWith('-')) {
+      seenFlags.add(normalizedFlag);
+
+      if (arg === '--json') {
+        jsonOutput = true;
+      } else if (arg === '--db' || arg === '-d') {
+        const val = args[++i];
+        if (!val || val.startsWith('-')) throw new Error(`Missing value for flag "${arg}"`);
+        dbPath = val;
+      } else if (arg === '--auth' || arg === '-a') {
+        const val = args[++i];
+        if (!val || val.startsWith('-')) throw new Error(`Missing value for flag "${arg}"`);
+        authorizationId = val;
+      } else if (arg === '--session' || arg === '-s') {
+        const val = args[++i];
+        if (!val || val.startsWith('-')) throw new Error(`Missing value for flag "${arg}"`);
+        sessionId = val;
+      } else if (arg === '--ttl' || arg === '-t') {
+        const val = args[++i];
+        if (!val || val.startsWith('-')) throw new Error(`Missing value for flag "${arg}"`);
+        ttlSeconds = validateTtlSeconds(val);
+      } else {
+        throw new Error(`Unknown flag "${arg}"`);
+      }
+    } else {
       positional.push(arg);
     }
   }
@@ -50,6 +79,30 @@ export function parseCliArgs(args: string[]): CliArgs {
     const cmd = positional[0].toLowerCase();
     if (cmd === 'issue' || cmd === 'revoke' || cmd === 'help') {
       command = cmd;
+    } else {
+      throw new Error(`Unknown command "${positional[0]}"`);
+    }
+
+    if (positional.length > 1) {
+      throw new Error(`Surplus positional argument "${positional[1]}"`);
+    }
+  }
+
+  if (!command) {
+    command = 'help';
+  }
+
+  if (command === 'revoke') {
+    const hasSession = Boolean(sessionId);
+    const hasAuth = Boolean(authorizationId);
+    if ((hasSession && hasAuth) || (!hasSession && !hasAuth)) {
+      throw new Error('Revoke requires exactly one selector: --session XOR --auth');
+    }
+  }
+
+  if (command === 'issue') {
+    if (sessionId) {
+      throw new Error('Flag --session is not valid for issue command');
     }
   }
 
@@ -64,7 +117,14 @@ export function parseCliArgs(args: string[]): CliArgs {
 }
 
 export function runSessionAdmin(rawArgs: string[]): number {
-  const options = parseCliArgs(rawArgs);
+  let options: CliArgs;
+  try {
+    options = parseCliArgs(rawArgs);
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    process.stderr.write(`ERROR: ${msg}\n`);
+    return 1;
+  }
 
   if (options.command === 'help') {
     const usage = `
@@ -79,21 +139,18 @@ Usage:
   }
 
   if (!options.dbPath || typeof options.dbPath !== 'string' || options.dbPath.trim().length === 0) {
-    const err = 'ERROR: Missing required --db path or AGENTFORGE_MCP_DB_PATH environment variable\n';
-    process.stderr.write(err);
+    process.stderr.write('ERROR: Missing required --db path or AGENTFORGE_MCP_DB_PATH environment variable\n');
     return 1;
   }
 
   const resolvedDbPath = path.resolve(options.dbPath.trim());
   if (!fs.existsSync(resolvedDbPath)) {
-    const err = `ERROR: Database file does not exist at "${resolvedDbPath}"\n`;
-    process.stderr.write(err);
+    process.stderr.write(`ERROR: Database file does not exist at "${resolvedDbPath}"\n`);
     return 1;
   }
 
   let db: Database.Database;
   try {
-    // Open existing database without auto-creating
     db = new Database(resolvedDbPath, { fileMustExist: true });
   } catch (error) {
     const msg = error instanceof Error ? error.message : String(error);
@@ -102,12 +159,20 @@ Usage:
   }
 
   try {
-    // Fail if Migration 21 is absent - never auto-migrate
-    const migrationCheck = db
-      .prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'mcp_client_sessions'")
-      .get();
-    if (!migrationCheck) {
-      process.stderr.write('ERROR: Database is missing Migration 21 (table mcp_client_sessions does not exist)\n');
+    // 1. Enable and verify PRAGMA foreign_keys = ON
+    db.pragma('foreign_keys = ON');
+    const fkState = db.pragma('foreign_keys', { simple: true }) as number;
+    if (fkState !== 1) {
+      process.stderr.write('ERROR: Failed to enable foreign_keys pragma on database connection\n');
+      return 1;
+    }
+
+    // 2. Shared schema-authority verifier (fails closed on missing ledger or malformed schema)
+    try {
+      verifyMigration21SchemaAuthority(db);
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      process.stderr.write(`ERROR: Database schema authority check failed: ${msg}\n`);
       return 1;
     }
 
@@ -151,11 +216,6 @@ Usage:
     }
 
     if (options.command === 'revoke') {
-      if (!options.sessionId && !options.authorizationId) {
-        process.stderr.write('ERROR: Revoke requires either --session <session-id> or --auth <auth-id>\n');
-        return 1;
-      }
-
       const result = service.revokeSession({
         sessionId: options.sessionId,
         authorizationId: options.authorizationId,
@@ -175,7 +235,7 @@ Usage:
 
     return 1;
   } catch (error) {
-    const msg = error instanceof Error ? error.message : String(error);
+    const msg = error instanceof McpAuthorityError ? error.rawMessage : error instanceof Error ? error.message : String(error);
     process.stderr.write(`ERROR: ${msg}\n`);
     return 1;
   } finally {
@@ -184,7 +244,7 @@ Usage:
         db.close();
       }
     } catch {
-      // Ignore cleanup error
+      // Ignore cleanup error during shutdown
     }
   }
 }

@@ -14,7 +14,7 @@ export interface Migration {
   foreignKeyMode?: 'ENFORCED' | 'DISABLED_FOR_REBUILD';
 }
 
-const RAW_MIGRATIONS: Migration[] = [
+export const MIGRATIONS: Migration[] = [
   {
     version: 1,
     name: '001_initial_schema',
@@ -1389,7 +1389,7 @@ const RAW_MIGRATIONS: Migration[] = [
     name: '021_r5j_mcp_client_session_authority',
     up: (db: Database.Database) => {
       db.exec(`
-        CREATE TABLE IF NOT EXISTS mcp_client_sessions (
+        CREATE TABLE mcp_client_sessions (
           id TEXT PRIMARY KEY,
           authorization_id TEXT NOT NULL REFERENCES execution_authorizations(id) ON DELETE RESTRICT,
           scope TEXT NOT NULL CHECK (scope = 'AUTHORIZED_CONTEXT_READ'),
@@ -1406,34 +1406,142 @@ const RAW_MIGRATIONS: Migration[] = [
           revoked_at TEXT NULL CHECK (revoked_at IS NULL OR (length(revoked_at) > 0 AND revoked_at >= issued_at))
         );
 
-        CREATE UNIQUE INDEX IF NOT EXISTS uq_mcp_client_sessions_active_auth
+        CREATE UNIQUE INDEX uq_mcp_client_sessions_active_auth
         ON mcp_client_sessions(authorization_id)
         WHERE revoked_at IS NULL;
 
-        CREATE INDEX IF NOT EXISTS idx_mcp_client_sessions_token_hash
+        CREATE UNIQUE INDEX idx_mcp_client_sessions_token_hash
         ON mcp_client_sessions(token_hash);
 
-        CREATE INDEX IF NOT EXISTS idx_mcp_client_sessions_expires_at
+        CREATE INDEX idx_mcp_client_sessions_expires_at
         ON mcp_client_sessions(expires_at);
 
-        CREATE INDEX IF NOT EXISTS idx_mcp_client_sessions_auth_id
+        CREATE INDEX idx_mcp_client_sessions_auth_id
         ON mcp_client_sessions(authorization_id);
       `);
     },
   },
 ];
 
-export const MIGRATIONS: Migration[] = new Proxy(RAW_MIGRATIONS, {
-  get(target, prop, receiver) {
-    if (prop === 'length') {
-      const stack = new Error().stack || '';
-      if (stack.includes('r5iCrashRecoveryAndAuditStream')) {
-        return 20;
-      }
+export function verifyMigration21SchemaAuthority(db: Database.Database): void {
+  // 1. Exact ledger table and row
+  const ledgerTable = db
+    .prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'schema_migrations'")
+    .get() as { name: string } | undefined;
+  if (!ledgerTable) {
+    throw new Error('Database is missing Migration 21 ledger authority (021_r5j_mcp_client_session_authority)');
+  }
+
+  const row = db
+    .prepare("SELECT version, name FROM schema_migrations WHERE version = 21")
+    .get() as { version: number; name: string } | undefined;
+  if (!row || row.name !== '021_r5j_mcp_client_session_authority') {
+    throw new Error('Database is missing Migration 21 ledger authority (021_r5j_mcp_client_session_authority)');
+  }
+
+  // 2. Table existence
+  const table = db
+    .prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'mcp_client_sessions'")
+    .get() as { name: string } | undefined;
+  if (!table) {
+    throw new Error('Table mcp_client_sessions is missing');
+  }
+
+  // 3. Required columns, PK, notnull
+  const columns = db.prepare("PRAGMA table_info(mcp_client_sessions)").all() as {
+    cid: number;
+    name: string;
+    type: string;
+    notnull: number;
+    dflt_value: unknown;
+    pk: number;
+  }[];
+  const colMap = new Map(columns.map((c) => [c.name, c]));
+
+  const requiredCols: Array<{ name: string; type: string; notnull: number; pk: number }> = [
+    { name: 'id', type: 'TEXT', notnull: 0, pk: 1 },
+    { name: 'authorization_id', type: 'TEXT', notnull: 1, pk: 0 },
+    { name: 'scope', type: 'TEXT', notnull: 1, pk: 0 },
+    { name: 'token_hash', type: 'TEXT', notnull: 1, pk: 0 },
+    { name: 'authorization_fingerprint', type: 'TEXT', notnull: 1, pk: 0 },
+    { name: 'issued_at', type: 'TEXT', notnull: 1, pk: 0 },
+    { name: 'expires_at', type: 'TEXT', notnull: 1, pk: 0 },
+    { name: 'revoked_at', type: 'TEXT', notnull: 0, pk: 0 },
+  ];
+
+  for (const req of requiredCols) {
+    const col = colMap.get(req.name);
+    if (!col) {
+      throw new Error(`Table mcp_client_sessions missing column "${req.name}"`);
     }
-    return Reflect.get(target, prop, receiver);
-  },
-});
+    if (col.type !== req.type) {
+      throw new Error(`Column "${req.name}" has unexpected type "${col.type}" (expected "${req.type}")`);
+    }
+    if (req.name === 'id' && col.pk !== 1) {
+      throw new Error('Column "id" must be primary key');
+    }
+    if (req.notnull === 1 && col.notnull !== 1) {
+      throw new Error(`Column "${req.name}" must be NOT NULL`);
+    }
+  }
+
+  // 4. Foreign key on authorization_id -> execution_authorizations(id) with RESTRICT
+  const fks = db.prepare("PRAGMA foreign_key_list(mcp_client_sessions)").all() as {
+    id: number;
+    seq: number;
+    table: string;
+    from: string;
+    to: string;
+    on_update: string;
+    on_delete: string;
+    match: string;
+  }[];
+  const authFk = fks.find(
+    (fk) => fk.table === 'execution_authorizations' && fk.from === 'authorization_id' && fk.to === 'id'
+  );
+  if (!authFk || authFk.on_delete !== 'RESTRICT') {
+    throw new Error('Table mcp_client_sessions missing RESTRICT foreign key on authorization_id -> execution_authorizations(id)');
+  }
+
+  // 5. Indexes
+  const indexes = db.prepare("PRAGMA index_list(mcp_client_sessions)").all() as {
+    seq: number;
+    name: string;
+    unique: number;
+    origin: string;
+    partial: number;
+  }[];
+  const idxMap = new Map(indexes.map((idx) => [idx.name, idx]));
+
+  const activeAuthIdx = idxMap.get('uq_mcp_client_sessions_active_auth');
+  if (!activeAuthIdx || activeAuthIdx.unique !== 1 || activeAuthIdx.partial !== 1) {
+    throw new Error('Table mcp_client_sessions missing unique partial index uq_mcp_client_sessions_active_auth');
+  }
+
+  const tokenHashIdx = idxMap.get('idx_mcp_client_sessions_token_hash');
+  if (!tokenHashIdx || tokenHashIdx.unique !== 1) {
+    throw new Error('Table mcp_client_sessions missing unique index idx_mcp_client_sessions_token_hash');
+  }
+
+  const expiresAtIdx = idxMap.get('idx_mcp_client_sessions_expires_at');
+  if (!expiresAtIdx) {
+    throw new Error('Table mcp_client_sessions missing index idx_mcp_client_sessions_expires_at');
+  }
+
+  // 6. CHECK constraints in table sql
+  const tableSqlRow = db
+    .prepare("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'mcp_client_sessions'")
+    .get() as { sql: string } | undefined;
+  const sql = tableSqlRow?.sql ?? '';
+  if (
+    !sql.includes("scope = 'AUTHORIZED_CONTEXT_READ'") ||
+    !sql.includes("length(token_hash) = 64") ||
+    !sql.includes("length(authorization_fingerprint) = 64") ||
+    !sql.includes("expires_at > issued_at")
+  ) {
+    throw new Error('Table mcp_client_sessions missing required CHECK constraints');
+  }
+}
 
 export class MigrationRunner {
   public static run(db: Database.Database): void {
@@ -1449,12 +1557,7 @@ export class MigrationRunner {
     const appliedRows = db.prepare('SELECT version FROM schema_migrations ORDER BY version ASC').all() as { version: number }[];
     const appliedVersions = new Set(appliedRows.map((r) => r.version));
 
-    const isLegacyR5ITest = (new Error().stack || '').includes('r5iCrashRecoveryAndAuditStream');
-
     for (const migration of MIGRATIONS) {
-      if (isLegacyR5ITest && migration.version > 20) {
-        continue;
-      }
       if (!appliedVersions.has(migration.version)) {
         console.log(`[Migrations] Applying migration ${migration.version}: ${migration.name}...`);
 

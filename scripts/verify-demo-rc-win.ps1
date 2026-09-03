@@ -77,7 +77,6 @@ if (-not (Test-Path $migrationsPath)) {
   $migrationMatches = Select-String -Path $migrationsPath -Pattern "version:\s*(\d+)"
   $migrationCount = $migrationMatches.Count
   if ($migrationCount -ne 21) {
-    # Historical note: Expected exactly 20 migrations in R5I milestone
     $failures.Add("B_MIGRATION_COUNT_INVALID: Expected exactly 21 migrations, found $migrationCount")
   }
 }

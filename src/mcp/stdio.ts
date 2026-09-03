@@ -3,31 +3,59 @@ import { buildAgentForgeMcpServer } from "./McpServer";
 import { resetDefaultAuthorityContext } from "./McpAuthorityContext";
 
 export function runStdioServer(): StdioServerHandle {
+  let isCleaningUp = false;
+
+  const removeSignalListeners = () => {
+    process.off("exit", onExit);
+    process.off("SIGINT", onSigInt);
+    process.off("SIGTERM", onSigTerm);
+  };
+
   const cleanup = () => {
+    if (isCleaningUp) return;
+    isCleaningUp = true;
+    removeSignalListeners();
     try {
       resetDefaultAuthorityContext();
-    } catch {
-      // Ignore cleanup errors during process exit
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      process.stderr.write(`[agentforge-mcp] Cleanup diagnostic: ${msg}\n`);
     }
   };
 
-  process.once("exit", cleanup);
-  process.once("SIGINT", () => {
+  const onSigInt = () => {
     cleanup();
     process.exit(0);
-  });
-  process.once("SIGTERM", () => {
+  };
+
+  const onSigTerm = () => {
     cleanup();
     process.exit(0);
-  });
+  };
+
+  const onExit = () => {
+    cleanup();
+  };
+
+  process.once("exit", onExit);
+  process.once("SIGINT", onSigInt);
+  process.once("SIGTERM", onSigTerm);
 
   try {
-    return serveStdio(() => buildAgentForgeMcpServer(), {
+    const handle = serveStdio(() => buildAgentForgeMcpServer(), {
       onerror: (error: Error) => {
         const message = error instanceof Error ? error.message : String(error);
         process.stderr.write(`[agentforge-mcp] ${message}\n`);
       },
     });
+
+    const originalClose = handle.close.bind(handle);
+    handle.close = async () => {
+      cleanup();
+      return originalClose();
+    };
+
+    return handle;
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
     process.stderr.write(`[agentforge-mcp-fatal] Startup failure: ${message}\n`);
