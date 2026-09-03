@@ -1292,3 +1292,61 @@ export interface HandoffTransfer {
   created_at: string;
   updated_at: string;
 }
+
+export type McpSessionScope = 'AUTHORIZED_CONTEXT_READ';
+
+export interface McpClientSession {
+  id: string;
+  authorization_id: string;
+  scope: McpSessionScope;
+  token_hash: string;
+  authorization_fingerprint: string;
+  issued_at: string;
+  expires_at: string;
+  revoked_at: string | null;
+}
+
+export type McpSessionErrorCode =
+  | 'MCP_SESSION_REQUIRED'
+  | 'MCP_SESSION_UNAUTHORIZED'
+  | 'MCP_CONFIGURATION_INVALID'
+  | 'MCP_AUTHORITY_FENCED'
+  | 'MCP_CONTEXT_INTEGRITY_FAILED';
+
+export interface AuthorizedContextSessionMetadata {
+  id: string;
+  scope: McpSessionScope;
+  issued_at: string;
+  expires_at: string;
+}
+
+export interface AuthorizedContextAuthorizationBindings {
+  id: string;
+  project_id: string;
+  task_id: string;
+  attempt_id: string | null;
+  assignment_id: string;
+  task_ownership_epoch: number;
+  lifecycle_version: 1;
+  routing_decision_id: string;
+  selected_provider_id: string;
+  selected_account_id: string;
+  selected_resource_id: string;
+  task_revision: number;
+  base_sha: string;
+  repository_head_sha: string;
+  manager_message_id: string;
+  manager_payload_hash: string;
+  status: ExecutionAuthorizationStatus;
+  created_at: string;
+  dispatched_at: string | null;
+}
+
+export interface AuthorizedContextResponse {
+  schema_version: 2;
+  session: AuthorizedContextSessionMetadata;
+  authorization: AuthorizedContextAuthorizationBindings;
+  execution_payload: Record<string, unknown>;
+  instruction_payload_hash: string;
+  context_manifest_hash: string;
+}
