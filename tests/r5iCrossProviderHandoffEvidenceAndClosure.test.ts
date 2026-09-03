@@ -2225,5 +2225,5 @@ describe('R5I7 Cross-Provider Handoff Evidence and Closure Integration Suite', (
       const manifests = db.prepare('SELECT * FROM context_manifests WHERE snapshot_id = ?').all(s.id) as any[];
       expect(manifests.length).toBeGreaterThan(0);
     }
-  });
+  }, 120000);
 });

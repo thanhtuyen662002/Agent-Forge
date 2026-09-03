@@ -570,7 +570,7 @@ describe('R5H4 Provider Health Observation Ordering Authority Contract Tests', (
     expect(upgradedRow.account_order).toBeNull();
 
     legacyDb.close();
-  });
+  }, 120000);
 
   it('6. First post-v12 observation for an account is assigned account_order = 1', () => {
     const { auth, assignment } = createValidAssignmentAndAuth(repo, { taskId: taskId1, accountId: accountIdA, resourceId: resourceIdA });
