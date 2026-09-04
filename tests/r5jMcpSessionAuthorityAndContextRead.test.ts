@@ -578,6 +578,15 @@ function createStdioChildHarness(
         stdinErrorListeners.delete(onStdinErr);
         errorListeners.delete(onError);
         exitListeners.delete(onExit);
+        contaminationListeners.delete(onContamination);
+      };
+
+      const onContamination: ContaminationListener = (contamErr) => {
+        if (!isSettled) {
+          isSettled = true;
+          cleanup();
+          reject(contamErr);
+        }
       };
 
       const onStdinErr: StdinErrorListener = (err) => {
@@ -615,6 +624,7 @@ function createStdioChildHarness(
       stdinErrorListeners.add(onStdinErr);
       errorListeners.add(onError);
       exitListeners.add(onExit);
+      contaminationListeners.add(onContamination);
 
       try {
         const ok = childStdin.write(JSON.stringify(notif) + '\n', (writeErr) => {
@@ -700,10 +710,15 @@ function createStdioChildHarness(
     }
   };
 
-  let isClosed = false;
+  let isFinalized = false;
   let closePromise: Promise<void> | null = null;
 
   const finalizeHarness = () => {
+    if (isFinalized) {
+      return;
+    }
+    isFinalized = true;
+
     childStdout.removeListener('data', onStdoutData);
     childStderr.removeListener('data', onStderrData);
     childStdin.removeListener('error', onStdinError);
@@ -728,10 +743,7 @@ function createStdioChildHarness(
     terminate,
     getStdoutLines: () => [...stdoutLines],
     getStderr: () => stderrOutput,
-    close: async () => {
-      if (isClosed) {
-        return;
-      }
+    close: () => {
       if (closePromise) {
         return closePromise;
       }
@@ -749,7 +761,6 @@ function createStdioChildHarness(
             await harness.waitForExit(2000);
           }
         } finally {
-          isClosed = true;
           finalizeHarness();
         }
       })();
@@ -4867,29 +4878,72 @@ try {
     }
   });
 
-  it('128. Stdio child harness: close() surfaces exit wait failure visibly without swallowing', async () => {
-    const hangScript = path.join(tempDir, `hang_script_${crypto.randomUUID().slice(0, 8)}.js`);
-    fs.writeFileSync(
-      hangScript,
-      `
-      // Ignore SIGTERM/SIGINT and hang
-      process.on('SIGINT', () => {});
-      process.on('SIGTERM', () => {});
-      setInterval(() => {}, 1000);
-      `,
-      'utf8'
-    );
+  it('128. Stdio child harness: close() surfaces exit wait failure visibly, remains sticky on concurrent and repeated calls, detaches listeners at most once, and restores baseline', async () => {
+    let killInvocationCount = 0;
 
-    const harness = createStdioChildHarness(hangScript, {});
-    try {
-      const originalWaitForExit = harness.waitForExit;
-      harness.waitForExit = () => Promise.reject(new Error('[EXPECTED_CLEANUP_FAILURE] Timed out waiting for child exit'));
-      await expect(harness.close()).rejects.toThrow(/\[EXPECTED_CLEANUP_FAILURE\]/);
-      harness.waitForExit = originalWaitForExit;
-    } finally {
-      await harness.close();
-      if (fs.existsSync(hangScript)) fs.unlinkSync(hangScript);
+    class MockChildProcessFailedClose extends EventEmitter {
+      public stdin = new PassThrough();
+      public stdout = new PassThrough();
+      public stderr = new PassThrough();
+      public exitCode: number | null = null;
+      public signalCode: NodeJS.Signals | null = null;
+      public pid = 99999;
+      public kill(): boolean {
+        killInvocationCount++;
+        return true;
+      }
     }
+
+    const mockChild = new MockChildProcessFailedClose();
+    const baselineListeners = {
+      childError: mockChild.listenerCount('error'),
+      childExit: mockChild.listenerCount('exit'),
+      stdoutData: mockChild.stdout.listenerCount('data'),
+      stderrData: mockChild.stderr.listenerCount('data'),
+      stdinError: mockChild.stdin.listenerCount('error'),
+    };
+
+    const customSpawn = () => mockChild as unknown as ChildProcess;
+    const harness = createStdioChildHarness('dummy.js', {}, undefined, { customSpawn });
+
+    // Verify listeners attached
+    expect(mockChild.listenerCount('error')).toBe(baselineListeners.childError + 1);
+    expect(mockChild.listenerCount('exit')).toBe(baselineListeners.childExit + 1);
+    expect(mockChild.stdout.listenerCount('data')).toBe(baselineListeners.stdoutData + 1);
+    expect(mockChild.stderr.listenerCount('data')).toBe(baselineListeners.stderrData + 1);
+    expect(mockChild.stdin.listenerCount('error')).toBe(baselineListeners.stdinError + 1);
+
+    // Override waitForExit to deterministically fail with canonical cleanup failure
+    const cleanupError = new Error('[EXPECTED_CLEANUP_FAILURE] Timed out waiting for child exit');
+    harness.waitForExit = () => Promise.reject(cleanupError);
+
+    // 1. Concurrent close calls: both reject with the exact same diagnostic
+    const [res1, res2] = await Promise.allSettled([harness.close(), harness.close()]);
+    expect(res1.status).toBe('rejected');
+    expect(res2.status).toBe('rejected');
+    expect((res1 as PromiseRejectedResult).reason.message).toContain('[EXPECTED_CLEANUP_FAILURE] Timed out waiting for child exit');
+    expect((res2 as PromiseRejectedResult).reason.message).toContain('[EXPECTED_CLEANUP_FAILURE] Timed out waiting for child exit');
+
+    // 2. Subsequent repeated close call: must NOT resolve or hide error, must reject with the exact same diagnostic
+    await expect(harness.close()).rejects.toThrow(/\[EXPECTED_CLEANUP_FAILURE\] Timed out waiting for child exit/);
+
+    // 3. Kill and finalization occurred at most once
+    expect(killInvocationCount).toBe(1);
+
+    // 4. Exact listener-baseline restoration after failed close
+    expect(mockChild.listenerCount('error')).toBe(baselineListeners.childError);
+    expect(mockChild.listenerCount('exit')).toBe(baselineListeners.childExit);
+    expect(mockChild.stdout.listenerCount('data')).toBe(baselineListeners.stdoutData);
+    expect(mockChild.stderr.listenerCount('data')).toBe(baselineListeners.stderrData);
+    expect(mockChild.stdin.listenerCount('error')).toBe(baselineListeners.stdinError);
+
+    // 5. Repeated close preserves baseline listener counts
+    await expect(harness.close()).rejects.toThrow(/\[EXPECTED_CLEANUP_FAILURE\] Timed out waiting for child exit/);
+    expect(mockChild.listenerCount('error')).toBe(baselineListeners.childError);
+    expect(mockChild.listenerCount('exit')).toBe(baselineListeners.childExit);
+    expect(mockChild.stdout.listenerCount('data')).toBe(baselineListeners.stdoutData);
+    expect(mockChild.stderr.listenerCount('data')).toBe(baselineListeners.stderrData);
+    expect(mockChild.stdin.listenerCount('error')).toBe(baselineListeners.stdinError);
   });
 
   it('129. Stdio child harness: deterministic spawn error rejects waiting and future requests and exit waits immediately', async () => {
@@ -5211,5 +5265,97 @@ try {
     expect(mockChild.stdout.listenerCount('data')).toBe(baselineListeners.stdoutData);
     expect(mockChild.stderr.listenerCount('data')).toBe(baselineListeners.stderrData);
     expect(mockChild.stdin.listenerCount('error')).toBe(baselineListeners.stdinError);
+  });
+
+  it('136. Stdio child harness: future stdout protocol contamination actively settles pending notification writes and preserves once-only settlement', async () => {
+    class WithheldNotificationStdin extends PassThrough {
+      public withheldCallbacks: Array<(err?: Error | null) => void> = [];
+      override write(
+        chunk: unknown,
+        encodingOrCb?: BufferEncoding | ((error: Error | null | undefined) => void),
+        cb?: (error: Error | null | undefined) => void
+      ): boolean {
+        const callback = typeof encodingOrCb === 'function' ? encodingOrCb : cb;
+        if (typeof callback === 'function') {
+          this.withheldCallbacks.push(callback);
+        }
+        // Deliberately withhold calling write callback to simulate pending async write
+        return true;
+      }
+    }
+
+    class MockChildProcessContam extends EventEmitter {
+      public stdin = new WithheldNotificationStdin();
+      public stdout = new PassThrough();
+      public stderr = new PassThrough();
+      public exitCode: number | null = null;
+      public signalCode: NodeJS.Signals | null = null;
+      public pid = 77777;
+      public kill(signal?: NodeJS.Signals | number): boolean {
+        this.exitCode = 0;
+        this.signalCode = (signal as NodeJS.Signals) ?? null;
+        this.emit('exit', 0, this.signalCode);
+        return true;
+      }
+    }
+
+    const mockChild = new MockChildProcessContam();
+    const baselineListeners = {
+      childError: mockChild.listenerCount('error'),
+      childExit: mockChild.listenerCount('exit'),
+      stdoutData: mockChild.stdout.listenerCount('data'),
+      stderrData: mockChild.stderr.listenerCount('data'),
+      stdinError: mockChild.stdin.listenerCount('error'),
+    };
+
+    const customSpawn = () => mockChild as unknown as ChildProcess;
+    const harness = createStdioChildHarness('dummy.js', {}, undefined, { customSpawn });
+
+    const startTime = Date.now();
+    try {
+      // 1. Dispatch notification whose write callback is withheld
+      const notifPromise = harness.sendNotification({ jsonrpc: '2.0', method: 'notifications/initialized' }, 4000);
+      expect(mockChild.stdin.withheldCallbacks.length).toBe(1);
+
+      // 2. Emit malformed stdout protocol contamination
+      mockChild.stdout.write('NON_JSON_PROTOCOL_CONTAMINATION_PAYLOAD\n');
+
+      // 3. Pending notification must reject promptly with exact protocol contamination diagnostic
+      await expect(notifPromise).rejects.toThrow(
+        /Protocol contamination: non-JSON stdout line emitted by child: "NON_JSON_PROTOCOL_CONTAMINATION_PAYLOAD"/
+      );
+      const elapsed = Date.now() - startTime;
+      expect(elapsed).toBeLessThan(2000);
+
+      // 4. Late invocation of the saved write callback must NOT alter the settled rejection (once-only settlement)
+      const savedCb = mockChild.stdin.withheldCallbacks[0];
+      expect(() => savedCb(null)).not.toThrow();
+      expect(() => savedCb(new Error('late write error'))).not.toThrow();
+
+      // 5. Future notification rejects immediately from recorded protocol contamination state
+      await expect(
+        harness.sendNotification({ jsonrpc: '2.0', method: 'notifications/initialized' }, 4000)
+      ).rejects.toThrow(/Protocol contamination/);
+
+      // 6. Close restores harness-owned listener counts exactly to baseline
+      await harness.close();
+
+      expect(mockChild.listenerCount('error')).toBe(baselineListeners.childError);
+      expect(mockChild.listenerCount('exit')).toBe(baselineListeners.childExit);
+      expect(mockChild.stdout.listenerCount('data')).toBe(baselineListeners.stdoutData);
+      expect(mockChild.stderr.listenerCount('data')).toBe(baselineListeners.stderrData);
+      expect(mockChild.stdin.listenerCount('error')).toBe(baselineListeners.stdinError);
+
+      // 7. Repeated close preserves identical baseline restoration
+      await expect(harness.close()).resolves.toBeUndefined();
+
+      expect(mockChild.listenerCount('error')).toBe(baselineListeners.childError);
+      expect(mockChild.listenerCount('exit')).toBe(baselineListeners.childExit);
+      expect(mockChild.stdout.listenerCount('data')).toBe(baselineListeners.stdoutData);
+      expect(mockChild.stderr.listenerCount('data')).toBe(baselineListeners.stderrData);
+      expect(mockChild.stdin.listenerCount('error')).toBe(baselineListeners.stdinError);
+    } finally {
+      await harness.close();
+    }
   });
 });
