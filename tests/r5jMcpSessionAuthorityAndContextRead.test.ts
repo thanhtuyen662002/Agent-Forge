@@ -2,7 +2,7 @@ import fs from 'fs';
 import path from 'path';
 import os from 'os';
 import crypto from 'crypto';
-import { spawn, execFileSync } from 'child_process';
+import { spawn, execFileSync, ChildProcess } from 'child_process';
 import { Worker } from 'worker_threads';
 import Database from 'better-sqlite3';
 import { describe, it, expect, beforeEach, afterEach, afterAll, vi } from 'vitest';
@@ -62,11 +62,32 @@ function getOrMaterializeTestRuntime(): string {
   const manifestPath = path.join(tempRuntimeDir, 'package.json');
   fs.writeFileSync(manifestPath, JSON.stringify({ type: 'commonjs' }, null, 2), 'utf8');
 
-  // Verify runtime manifest
-  const writtenManifest = JSON.parse(fs.readFileSync(manifestPath, 'utf8'));
-  if (writtenManifest.type !== 'commonjs') {
-    throw new Error('Temporary test runtime manifest failed verification');
+  // Verify runtime manifest as a plain object with exactly one own property, type: 'commonjs'
+  const rawManifest = fs.readFileSync(manifestPath, 'utf8');
+  const parsedManifest: unknown = JSON.parse(rawManifest);
+  if (
+    typeof parsedManifest !== 'object' ||
+    parsedManifest === null ||
+    Array.isArray(parsedManifest) ||
+    Object.prototype.toString.call(parsedManifest) !== '[object Object]'
+  ) {
+    throw new Error('Temporary test runtime manifest must be a plain object');
   }
+  const manifestKeys = Object.keys(parsedManifest as Record<string, unknown>);
+  if (manifestKeys.length !== 1 || manifestKeys[0] !== 'type') {
+    throw new Error(`Temporary test runtime manifest must have exactly one property ('type'), found: ${manifestKeys.join(', ')}`);
+  }
+  if ((parsedManifest as Record<string, unknown>).type !== 'commonjs') {
+    throw new Error(`Temporary test runtime manifest property 'type' must be 'commonjs', found: ${(parsedManifest as Record<string, unknown>).type}`);
+  }
+
+  // Write IPC signal bridge preload script for Windows test harnesses
+  const signalPreloadPath = path.join(tempRuntimeDir, 'signal_preload.js');
+  fs.writeFileSync(
+    signalPreloadPath,
+    `if (process.send) {\n  process.on('message', (m) => {\n    if (m === 'SIGINT') process.emit('SIGINT');\n    if (m === 'SIGTERM') process.emit('SIGTERM');\n  });\n}\n`,
+    'utf8'
+  );
 
   // Symlink / junction project node_modules into temporary test runtime
   const targetNodeModules = path.join(projectRoot, 'node_modules');
@@ -76,45 +97,405 @@ function getOrMaterializeTestRuntime(): string {
     fs.symlinkSync(targetNodeModules, linkNodeModules, symlinkType);
   }
 
-  // Verify key compiled files exist in test runtime
+  // Verify key compiled files exist in test runtime and prove they come from the unique test-owned runtime rather than repository dist-electron
   const stdioEntry = path.join(tempRuntimeDir, 'mcp', 'stdio.js');
   const repoEntry = path.join(tempRuntimeDir, 'core', 'database', 'repositories.js');
   const serviceEntry = path.join(tempRuntimeDir, 'core', 'services', 'McpSessionAuthorityService.js');
   if (!fs.existsSync(stdioEntry) || !fs.existsSync(repoEntry) || !fs.existsSync(serviceEntry)) {
     throw new Error('Temporary test runtime is missing expected compiled modules');
   }
+  const normalizedTemp = path.resolve(tempRuntimeDir);
+  if (
+    !path.resolve(stdioEntry).startsWith(normalizedTemp) ||
+    !path.resolve(repoEntry).startsWith(normalizedTemp) ||
+    !path.resolve(serviceEntry).startsWith(normalizedTemp)
+  ) {
+    throw new Error('Compiled modules must originate strictly within test-owned runtime directory');
+  }
 
   sharedTestRuntimeDir = tempRuntimeDir;
   return sharedTestRuntimeDir;
 }
 
-function safeRemoveDir(dir: string, maxRetries = 10, delayMs = 100): void {
-  for (let i = 0; i < maxRetries; i++) {
+function safeRemoveDir(dir: string, maxRetries = 10, delayMs = 50): void {
+  if (!fs.existsSync(dir)) return;
+  let lastError: unknown = null;
+  for (let attempt = 0; attempt < maxRetries; attempt++) {
     try {
-      if (fs.existsSync(dir)) {
-        const nestedNodeModules = path.join(dir, 'node_modules');
-        if (fs.existsSync(nestedNodeModules)) {
-          try {
-            fs.unlinkSync(nestedNodeModules);
-          } catch {
-            try {
-              fs.rmdirSync(nestedNodeModules);
-            } catch {
-              // ignore
-            }
-          }
-        }
-        fs.rmSync(dir, { recursive: true, force: true });
+      fs.rmSync(dir, { recursive: true, force: true, maxRetries: 3, retryDelay: 50 });
+      if (!fs.existsSync(dir)) {
+        return;
       }
-      return;
     } catch (err) {
-      if (i === maxRetries - 1) {
-        throw new Error(`Failed to remove test directory "${dir}" after ${maxRetries} retries: ${err}`);
-      }
-      const end = Date.now() + delayMs;
-      while (Date.now() < end) {}
+      lastError = err;
+      Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, delayMs);
     }
   }
+  if (fs.existsSync(dir)) {
+    throw new Error(
+      `[CLEANUP_FAILURE] Directory "${dir}" still exists after ${maxRetries} removal attempts. Last error: ${
+        lastError instanceof Error ? lastError.message : String(lastError)
+      }`
+    );
+  }
+}
+
+interface WorkerHarness<TResult> {
+  readyPromise: Promise<void>;
+  resultPromise: Promise<TResult>;
+  cleanup: () => Promise<void>;
+}
+
+function createWorkerHarness<TResult>(w: Worker, timeoutMs = 8000): WorkerHarness<TResult> {
+  let isReadySettled = false;
+  let isResultSettled = false;
+  let readyResolve: () => void;
+  let readyReject: (err: Error) => void;
+  let resultResolve: (res: TResult) => void;
+  let resultReject: (err: Error) => void;
+  let readyTimer: NodeJS.Timeout | null = null;
+  let resultTimer: NodeJS.Timeout | null = null;
+
+  const cleanupListeners = () => {
+    if (readyTimer) {
+      clearTimeout(readyTimer);
+      readyTimer = null;
+    }
+    if (resultTimer) {
+      clearTimeout(resultTimer);
+      resultTimer = null;
+    }
+    w.off('message', onMessage);
+    w.off('error', onError);
+    w.off('exit', onExit);
+  };
+
+  const readyPromise = new Promise<void>((resolve, reject) => {
+    readyResolve = () => {
+      if (!isReadySettled) {
+        isReadySettled = true;
+        if (readyTimer) {
+          clearTimeout(readyTimer);
+          readyTimer = null;
+        }
+        resolve();
+      }
+    };
+    readyReject = (err: Error) => {
+      if (!isReadySettled) {
+        isReadySettled = true;
+        cleanupListeners();
+        reject(err);
+      }
+    };
+    readyTimer = setTimeout(() => {
+      readyReject(new Error(`Worker harness timed out waiting for READY after ${timeoutMs}ms`));
+    }, timeoutMs);
+  });
+
+  const resultPromise = new Promise<TResult>((resolve, reject) => {
+    resultResolve = (res: TResult) => {
+      if (!isResultSettled) {
+        isResultSettled = true;
+        cleanupListeners();
+        resolve(res);
+      }
+    };
+    resultReject = (err: Error) => {
+      if (!isResultSettled) {
+        isResultSettled = true;
+        cleanupListeners();
+        reject(err);
+      }
+    };
+    resultTimer = setTimeout(() => {
+      resultReject(new Error(`Worker harness timed out waiting for result after ${timeoutMs}ms`));
+    }, timeoutMs);
+  });
+
+  const onMessage = (msg: unknown) => {
+    if (msg === 'READY') {
+      readyResolve();
+      return;
+    }
+    if (typeof msg === 'object' && msg !== null && 'success' in msg) {
+      resultResolve(msg as TResult);
+    }
+  };
+
+  const onError = (err: Error) => {
+    readyReject(err);
+    resultReject(err);
+  };
+
+  const onExit = (code: number) => {
+    if (!isResultSettled) {
+      const exitErr = new Error(`Worker exited prematurely with code ${code}`);
+      readyReject(exitErr);
+      resultReject(exitErr);
+    }
+  };
+
+  w.on('message', onMessage);
+  w.on('error', onError);
+  w.on('exit', onExit);
+
+  return {
+    readyPromise,
+    resultPromise,
+    cleanup: async () => {
+      cleanupListeners();
+      await w.terminate();
+    },
+  };
+}
+
+interface StdioChildHarness {
+  child: ChildProcess;
+  closeStdin: () => void;
+  sendRequest: (req: Record<string, unknown>, timeoutMs?: number) => Promise<Record<string, unknown>>;
+  sendNotification: (notif: Record<string, unknown>) => void;
+  waitForExit: (timeoutMs?: number) => Promise<{ code: number | null; signal: NodeJS.Signals | null }>;
+  terminate: (signal: 'SIGINT' | 'SIGTERM') => void;
+  getStdoutLines: () => string[];
+  getStderr: () => string;
+  close: () => Promise<void>;
+}
+
+function createStdioChildHarness(
+  stdioScript: string,
+  envVars: Record<string, string>,
+  preloadScript?: string
+): StdioChildHarness {
+  const projectNodeModules = path.resolve(__dirname, '..', 'node_modules');
+  const spawnEnv: NodeJS.ProcessEnv = {
+    ...process.env,
+    NODE_PATH: projectNodeModules,
+    ...envVars,
+  };
+  const spawnArgs: string[] = [];
+  if (preloadScript) {
+    spawnArgs.push('-r', preloadScript);
+  }
+  spawnArgs.push(stdioScript);
+
+  const child = spawn(process.execPath, spawnArgs, {
+    env: spawnEnv,
+    stdio: ['pipe', 'pipe', 'pipe', 'ipc'],
+  });
+
+  if (!child.stdout || !child.stderr || !child.stdin) {
+    throw new Error('Child process stdio streams not available');
+  }
+  const childStdout = child.stdout;
+  const childStderr = child.stderr;
+  const childStdin = child.stdin;
+
+  const stdoutLines: string[] = [];
+  let stdoutBuffer = '';
+  let stderrOutput = '';
+
+  type LineListener = (line: string) => void;
+  const lineListeners = new Set<LineListener>();
+
+  childStdout.on('data', (chunk: Buffer | string) => {
+    stdoutBuffer += chunk.toString();
+    let newlineIdx = stdoutBuffer.indexOf('\n');
+    while (newlineIdx !== -1) {
+      const line = stdoutBuffer.slice(0, newlineIdx).trim();
+      stdoutBuffer = stdoutBuffer.slice(newlineIdx + 1);
+      if (line) {
+        stdoutLines.push(line);
+        for (const listener of lineListeners) {
+          listener(line);
+        }
+      }
+      newlineIdx = stdoutBuffer.indexOf('\n');
+    }
+  });
+
+  childStderr.on('data', (chunk: Buffer | string) => {
+    stderrOutput += chunk.toString();
+  });
+
+  let childExitResult: { code: number | null; signal: NodeJS.Signals | null } | null = null;
+  let childSpawnError: Error | null = null;
+
+  type ExitListener = (res: { code: number | null; signal: NodeJS.Signals | null }) => void;
+  const exitListeners = new Set<ExitListener>();
+
+  type ErrorListener = (err: Error) => void;
+  const errorListeners = new Set<ErrorListener>();
+
+  child.on('error', (err: Error) => {
+    childSpawnError = err;
+    for (const l of errorListeners) l(err);
+  });
+
+  child.on('exit', (code: number | null, signal: NodeJS.Signals | null) => {
+    childExitResult = { code, signal };
+    for (const l of exitListeners) l({ code, signal });
+  });
+
+  const sendRequest = (req: Record<string, unknown>, timeoutMs = 8000): Promise<Record<string, unknown>> => {
+    const reqId = req.id;
+    if (reqId === undefined) {
+      throw new Error('sendRequest requires a request with an id');
+    }
+
+    if (childSpawnError) {
+      return Promise.reject(new Error(`Cannot send request: child failed to spawn: ${childSpawnError.message}`));
+    }
+    if (childExitResult) {
+      return Promise.reject(new Error(`Cannot send request: child exited prematurely with code ${childExitResult.code}`));
+    }
+
+    for (const existingLine of stdoutLines) {
+      try {
+        const parsed = JSON.parse(existingLine) as Record<string, unknown>;
+        if (parsed.id === reqId) {
+          return Promise.resolve(parsed);
+        }
+      } catch {}
+    }
+
+    return new Promise<Record<string, unknown>>((resolve, reject) => {
+      let isSettled = false;
+      let timer: NodeJS.Timeout | null = null;
+
+      const cleanup = () => {
+        if (timer) {
+          clearTimeout(timer);
+          timer = null;
+        }
+        lineListeners.delete(onLine);
+        exitListeners.delete(onExit);
+        errorListeners.delete(onError);
+      };
+
+      const onLine: LineListener = (line: string) => {
+        try {
+          const parsed = JSON.parse(line) as Record<string, unknown>;
+          if (parsed.id === reqId && !isSettled) {
+            isSettled = true;
+            cleanup();
+            resolve(parsed);
+          }
+        } catch {}
+      };
+
+      const onExit: ExitListener = (res) => {
+        if (!isSettled) {
+          isSettled = true;
+          cleanup();
+          reject(new Error(`Child exited prematurely with code ${res.code} while waiting for response ${reqId}`));
+        }
+      };
+
+      const onError: ErrorListener = (err) => {
+        if (!isSettled) {
+          isSettled = true;
+          cleanup();
+          reject(err);
+        }
+      };
+
+      timer = setTimeout(() => {
+        if (!isSettled) {
+          isSettled = true;
+          cleanup();
+          reject(new Error(`Timeout (${timeoutMs}ms) waiting for JSON-RPC response ${reqId}. Lines: ${stdoutLines.join(' | ')}`));
+        }
+      }, timeoutMs);
+
+      lineListeners.add(onLine);
+      exitListeners.add(onExit);
+      errorListeners.add(onError);
+
+      childStdin.write(JSON.stringify(req) + '\n');
+    });
+  };
+
+  const sendNotification = (notif: Record<string, unknown>) => {
+    childStdin.write(JSON.stringify(notif) + '\n');
+  };
+
+  const waitForExit = (timeoutMs = 8000): Promise<{ code: number | null; signal: NodeJS.Signals | null }> => {
+    if (childExitResult) {
+      return Promise.resolve(childExitResult);
+    }
+    return new Promise((resolve, reject) => {
+      let isSettled = false;
+      let timer: NodeJS.Timeout | null = null;
+
+      const cleanup = () => {
+        if (timer) {
+          clearTimeout(timer);
+          timer = null;
+        }
+        exitListeners.delete(onExit);
+        errorListeners.delete(onError);
+      };
+
+      const onExit: ExitListener = (res) => {
+        if (!isSettled) {
+          isSettled = true;
+          cleanup();
+          resolve(res);
+        }
+      };
+
+      const onError: ErrorListener = (err) => {
+        if (!isSettled) {
+          isSettled = true;
+          cleanup();
+          reject(err);
+        }
+      };
+
+      timer = setTimeout(() => {
+        if (!isSettled) {
+          isSettled = true;
+          cleanup();
+          reject(new Error(`Timeout (${timeoutMs}ms) waiting for child exit`));
+        }
+      }, timeoutMs);
+
+      exitListeners.add(onExit);
+      errorListeners.add(onError);
+    });
+  };
+
+  const terminate = (signal: 'SIGINT' | 'SIGTERM') => {
+    if (process.platform === 'win32' && child.send) {
+      child.send(signal);
+    } else {
+      child.kill(signal);
+    }
+  };
+
+  const close = async () => {
+    if (child.exitCode === null && child.signalCode === null) {
+      try {
+        child.kill('SIGKILL');
+      } catch {}
+      await waitForExit(2000).catch(() => {});
+    }
+  };
+
+  return {
+    child,
+    closeStdin: () => {
+      childStdin.end();
+    },
+    sendRequest,
+    sendNotification,
+    waitForExit,
+    terminate,
+    getStdoutLines: () => stdoutLines,
+    getStderr: () => stderrOutput,
+    close,
+  };
 }
 
 function createTestDatabase(dir: string, name: string): { db: Database.Database; dbPath: string } {
@@ -411,12 +792,9 @@ describe('R5J2 MCP Session Authority and Scoped Context Read Truth Suite', () =>
   afterAll(() => {
     resetDefaultAuthorityContext();
     if (sharedTestRuntimeDir) {
-      try {
-        safeRemoveDir(sharedTestRuntimeDir);
-      } catch {
-        // bounded teardown
-      }
+      const dirToClean = sharedTestRuntimeDir;
       sharedTestRuntimeDir = null;
+      safeRemoveDir(dirToClean);
     }
   });
 
@@ -1569,68 +1947,8 @@ try {
     const w1 = new Worker(workerCode, { eval: true, workerData, env: { ...process.env, NODE_PATH: projectNodeModules } });
     const w2 = new Worker(workerCode, { eval: true, workerData, env: { ...process.env, NODE_PATH: projectNodeModules } });
 
-    const createWorkerHarness = (w: Worker) => {
-      let isReadyResolved = false;
-      let readyResolve: () => void;
-      let readyReject: (err: Error) => void;
-      const readyPromise = new Promise<void>((resolve, reject) => {
-        readyResolve = resolve;
-        readyReject = reject;
-      });
-
-      let isResultResolved = false;
-      let resultResolve: (res: SameAuthWorkerMessage) => void;
-      let resultReject: (err: Error) => void;
-      const resultPromise = new Promise<SameAuthWorkerMessage>((resolve, reject) => {
-        resultResolve = resolve;
-        resultReject = reject;
-      });
-
-      const messageHandler = (msg: unknown) => {
-        if (msg === 'READY' && !isReadyResolved) {
-          isReadyResolved = true;
-          readyResolve();
-          return;
-        }
-        if (typeof msg === 'object' && msg !== null && 'success' in msg && !isResultResolved) {
-          isResultResolved = true;
-          resultResolve(msg as SameAuthWorkerMessage);
-        }
-      };
-
-      const errorHandler = (err: Error) => {
-        if (!isReadyResolved) {
-          isReadyResolved = true;
-          readyReject(err);
-        }
-        if (!isResultResolved) {
-          isResultResolved = true;
-          resultReject(err);
-        }
-      };
-
-      const exitHandler = (exitCode: number) => {
-        const exitErr = new Error(`Worker exited prematurely with code ${exitCode}`);
-        errorHandler(exitErr);
-      };
-
-      w.on('message', messageHandler);
-      w.on('error', errorHandler);
-      w.on('exit', exitHandler);
-
-      return {
-        readyPromise,
-        resultPromise,
-        cleanup: () => {
-          w.off('message', messageHandler);
-          w.off('error', errorHandler);
-          w.off('exit', exitHandler);
-        },
-      };
-    };
-
-    const h1 = createWorkerHarness(w1);
-    const h2 = createWorkerHarness(w2);
+    const h1 = createWorkerHarness<SameAuthWorkerMessage>(w1);
+    const h2 = createWorkerHarness<SameAuthWorkerMessage>(w2);
 
     try {
       // Assert both workers are ready before release
@@ -1659,9 +1977,7 @@ try {
         verifyDb.close();
       }
     } finally {
-      h1.cleanup();
-      h2.cleanup();
-      await Promise.all([w1.terminate(), w2.terminate()]);
+      await Promise.all([h1.cleanup(), h2.cleanup()]);
     }
   });
 
@@ -1820,14 +2136,38 @@ try {
       // 1. Setup real graph with sensitive auth ID and seed secrets directly into the database graph
       const fixtures = setupFullGraph(db);
       try {
-        db.prepare("UPDATE role_profiles SET display_name = ? WHERE id = ?").run(sensitiveProfileRef, fixtures.roleId);
-        db.prepare("UPDATE execution_authorizations SET status = 'INVALIDATED' WHERE id = ?").run(fixtures.authorizationId);
+        db.prepare('UPDATE provider_accounts SET label = ? WHERE id = ?').run(sensitiveCredentialRef, fixtures.accountId);
+        db.prepare('UPDATE role_profiles SET display_name = ? WHERE id = ?').run(sensitiveProfileRef, fixtures.roleId);
+
+        db.exec(`
+          CREATE TRIGGER trig_secret_fail BEFORE INSERT ON mcp_client_sessions
+          BEGIN
+            SELECT RAISE(ABORT, '${sensitiveSqliteMarker}');
+          END;
+        `);
+
+        db.prepare('UPDATE execution_authorizations SET id = ? WHERE id = ?').run(sensitiveAuthId, fixtures.authorizationId);
+
+        // Prove sensitiveSqliteMarker enters the internal failing path:
+        const probeRepo = new Repository(db);
+        const probeService = new McpSessionAuthorityService(probeRepo, db);
+        let internalErr: Error | null = null;
+        try {
+          probeService.issueSession({ authorizationId: sensitiveAuthId });
+        } catch (err) {
+          internalErr = err as Error;
+        }
+        expect(internalErr).toBeDefined();
+        expect(internalErr?.message).toContain(sensitiveSqliteMarker);
+
+        db.exec('DROP TRIGGER trig_secret_fail;');
       } finally {
         db.close();
       }
 
-      // 2. Trigger real CLI issue error with opened database (reaches failing sink with sensitiveProfileRef)
-      const exit1 = runSessionAdmin(['issue', '--db', sensitiveDbPath, '--auth', fixtures.authorizationId]);
+      // 2. Trigger real CLI issue error with opened database (reaches failing sink with sensitiveAuthId)
+      const nonExistentSecretAuth = sensitiveAuthId + '-not-found';
+      const exit1 = runSessionAdmin(['issue', '--db', sensitiveDbPath, '--auth', nonExistentSecretAuth]);
       expect(exit1).toBe(1);
 
       // 3. Trigger CLI revoke error with opened database
@@ -2936,7 +3276,7 @@ try {
     }
   });
 
-  it('110. Comprehensive secret exclusion across public sinks: verifies admin, context, tool, and resource sinks', async () => {
+  it('110. Comprehensive secret exclusion across public sinks: verifies admin, context, tool, resource, compiled stdio, and cleanup sinks', async () => {
     const { db, dbPath: sensitivePath } = createTestDatabase(tempDir, 'secret_classified_db.db');
     const sensitiveToken = McpSessionAuthorityService.generateSessionToken();
     const sensitiveDigest = McpSessionAuthorityService.hashSessionToken(sensitiveToken);
@@ -2944,6 +3284,7 @@ try {
     const sensitiveCred = 'cred-super-secret-key';
     const sensitiveProfileRef = 'profile-confidential-classified';
     const sensitiveMarker = 'SQLITE_CONSTRAINT_CHECK_MARKER';
+    const sensitiveCleanupSecret = 'SECRET_CLEANUP_FAILED_INTERNAL_MARKER_777';
 
     let capturedStderr = '';
     const origStderr = process.stderr.write;
@@ -2956,9 +3297,22 @@ try {
       // 1. Seed secrets into database graph so they are present on internal paths
       const fixtures = setupFullGraph(db);
       try {
-        db.prepare("UPDATE role_profiles SET display_name = ? WHERE id = ?").run(sensitiveProfileRef, fixtures.roleId);
-        db.prepare("UPDATE execution_authorizations SET status = 'INVALIDATED', adapter_error_json = ? WHERE id = ?")
-          .run(JSON.stringify({ error: `failed: cred=${sensitiveCred} marker=${sensitiveMarker}` }), fixtures.authorizationId);
+        db.prepare('UPDATE provider_accounts SET label = ? WHERE id = ?').run(sensitiveCred, fixtures.accountId);
+        db.prepare('UPDATE role_profiles SET display_name = ? WHERE id = ?').run(sensitiveProfileRef, fixtures.roleId);
+        db.prepare("UPDATE execution_authorizations SET adapter_error_json = ?, instruction_payload_hash = 'corrupted_hash_deep_fail' WHERE id = ?")
+          .run(JSON.stringify({ marker: sensitiveMarker, cred: sensitiveCred }), fixtures.authorizationId);
+
+        // Prove internal failing path consumes deeper graph with adapter_error_json / corrupted instruction hash:
+        const probeRepo = new Repository(db);
+        const probeService = new McpSessionAuthorityService(probeRepo, db);
+        let internalErrProbe: Error | null = null;
+        try {
+          probeService.issueSession({ authorizationId: fixtures.authorizationId });
+        } catch (err) {
+          internalErrProbe = err as Error;
+        }
+        expect(internalErrProbe).toBeDefined();
+        expect(internalErrProbe?.message).toContain('[MCP_CONTEXT_INTEGRITY_FAILED]');
       } finally {
         db.close();
       }
@@ -2970,6 +3324,9 @@ try {
       try {
         const exitIssue = runSessionAdmin(['issue', '--db', sensitivePath, '--auth', fixtures.authorizationId]);
         expect(exitIssue).toBe(1);
+
+        const exitIssueUnknownAuth = runSessionAdmin(['issue', '--db', sensitivePath, '--auth', sensitiveAuth]);
+        expect(exitIssueUnknownAuth).toBe(1);
 
         const exitRevoke = runSessionAdmin(['revoke', '--db', sensitivePath, '--session', sensitiveToken]);
         expect(exitRevoke).toBe(0);
@@ -3025,25 +3382,104 @@ try {
         toolContext.close();
       }
 
-      // 5. Stdio transport error formatting
-      const internalErr = new McpAuthorityError(
-        'MCP_AUTHORITY_FENCED',
-        `Internal error: auth=${sensitiveAuth} token=${sensitiveToken} hash=${sensitiveDigest} path=${sensitivePath} cred=${sensitiveCred} prof=${sensitiveProfileRef} marker=${sensitiveMarker}`
-      );
-      const pubErr = formatPublicError(internalErr);
-      expect(pubErr.text).toBe('[MCP_AUTHORITY_FENCED] Execution authority fenced');
-      expect(pubErr.text).not.toContain(sensitiveToken);
-      expect(pubErr.text).not.toContain(sensitiveDigest);
-      expect(pubErr.text).not.toContain(sensitivePath);
-      expect(pubErr.text).not.toContain(sensitiveAuth);
-      expect(pubErr.text).not.toContain(sensitiveCred);
-      expect(pubErr.text).not.toContain(sensitiveProfileRef);
-      expect(pubErr.text).not.toContain(sensitiveMarker);
+      // 5. Compiled stdio child transport sink: send real JSON-RPC tools/call request over stdio
+      const runtimeDir = getOrMaterializeTestRuntime();
+      const stdioScript = path.resolve(runtimeDir, 'mcp', 'stdio.js');
+      const stdioHarness = createStdioChildHarness(stdioScript, {
+        AGENTFORGE_MCP_DB_PATH: sensitivePath,
+        AGENTFORGE_MCP_SESSION_TOKEN: sensitiveToken,
+      });
 
-      // 6. Assert captured stderr excludes all sensitive secrets
+      try {
+        // Initialize
+        await stdioHarness.sendRequest({
+          jsonrpc: '2.0',
+          id: 1,
+          method: 'initialize',
+          params: {
+            protocolVersion: '2024-11-05',
+            capabilities: {},
+            clientInfo: { name: 'test-stdio-sink', version: '1.0.0' },
+          },
+        });
+        stdioHarness.sendNotification({ jsonrpc: '2.0', method: 'notifications/initialized' });
+
+        // Tool call over real stdio transport
+        const stdioToolRes = await stdioHarness.sendRequest({
+          jsonrpc: '2.0',
+          id: 2,
+          method: 'tools/call',
+          params: { name: GET_AUTHORIZED_CONTEXT_TOOL_NAME, arguments: {} },
+        });
+        expect(stdioToolRes.result).toBeDefined();
+        expect((stdioToolRes.result as { isError?: boolean }).isError).toBe(true);
+        const stdioToolText = ((stdioToolRes.result as { content: Array<{ text: string }> }).content[0]).text;
+        expect(stdioToolText).toBe('[MCP_SESSION_UNAUTHORIZED] Session authentication failed');
+        expect(stdioToolText).not.toContain(sensitiveToken);
+        expect(stdioToolText).not.toContain(sensitiveDigest);
+        expect(stdioToolText).not.toContain(sensitivePath);
+        expect(stdioToolText).not.toContain(sensitiveAuth);
+        expect(stdioToolText).not.toContain(sensitiveCred);
+        expect(stdioToolText).not.toContain(sensitiveProfileRef);
+        expect(stdioToolText).not.toContain(sensitiveMarker);
+
+        stdioHarness.closeStdin();
+        await stdioHarness.waitForExit();
+
+        const stdioStdout = stdioHarness.getStdoutLines().join('\n');
+        expect(stdioStdout).not.toContain(sensitiveToken);
+        expect(stdioStdout).not.toContain(sensitiveDigest);
+        expect(stdioStdout).not.toContain(sensitivePath);
+        expect(stdioStdout).not.toContain(sensitiveAuth);
+        expect(stdioStdout).not.toContain(sensitiveCred);
+        expect(stdioStdout).not.toContain(sensitiveProfileRef);
+        expect(stdioStdout).not.toContain(sensitiveMarker);
+
+        const stdioStderr = stdioHarness.getStderr();
+        expect(stdioStderr).not.toContain(sensitiveToken);
+        expect(stdioStderr).not.toContain(sensitiveDigest);
+        expect(stdioStderr).not.toContain(sensitivePath);
+        expect(stdioStderr).not.toContain(sensitiveAuth);
+        expect(stdioStderr).not.toContain(sensitiveCred);
+        expect(stdioStderr).not.toContain(sensitiveProfileRef);
+        expect(stdioStderr).not.toContain(sensitiveMarker);
+      } finally {
+        await stdioHarness.close();
+      }
+
+      // 6. Cleanup sink: exercise real production cleanup sink receiving a secret-bearing failure
+      let cleanupStderr = '';
+      const cleanupStderrWrite = (chunk: unknown) => { cleanupStderr += String(chunk); return true; };
+      process.stderr.write = cleanupStderrWrite as typeof process.stderr.write;
+
+      const originalClose = Database.prototype.close;
+      let closeCalledWithSecret = 0;
+      const openedDbRef: { current: Database.Database | null } = { current: null };
+      try {
+        Database.prototype.close = function (this: Database.Database) {
+          openedDbRef.current = this;
+          closeCalledWithSecret++;
+          throw new Error(`Internal sqlite native close error: ${sensitiveCleanupSecret}`);
+        };
+
+        const cleanupExitCode = runSessionAdmin(['issue', '--db', sensitivePath, '--auth', fixtures.authorizationId]);
+        expect(cleanupExitCode).toBe(1);
+        expect(closeCalledWithSecret).toBeGreaterThan(0);
+        expect(cleanupStderr).toContain('[MCP_CLEANUP_FAILED]');
+        expect(cleanupStderr).not.toContain(sensitiveCleanupSecret);
+      } finally {
+        Database.prototype.close = originalClose;
+        if (openedDbRef.current && openedDbRef.current.open) {
+          originalClose.call(openedDbRef.current);
+        }
+        process.stderr.write = origStderr;
+      }
+
+      // 7. Assert captured stderr across all steps excludes all sensitive secrets
       expect(capturedStderr).not.toContain(sensitiveToken);
       expect(capturedStderr).not.toContain(sensitiveDigest);
       expect(capturedStderr).not.toContain(sensitivePath);
+      expect(capturedStderr).not.toContain(sensitiveAuth);
       expect(capturedStderr).not.toContain(sensitiveCred);
       expect(capturedStderr).not.toContain(sensitiveProfileRef);
       expect(capturedStderr).not.toContain(sensitiveMarker);
@@ -3066,59 +3502,14 @@ try {
     const stdioScript = path.resolve(runtimeDir, 'mcp', 'stdio.js');
     expect(fs.existsSync(stdioScript)).toBe(true);
 
-    const projectNodeModules = path.resolve(__dirname, '..', 'node_modules');
-    const child = spawn(process.execPath, [stdioScript], {
-      env: {
-        ...process.env,
-        NODE_PATH: projectNodeModules,
-        AGENTFORGE_MCP_DB_PATH: dbPath,
-        AGENTFORGE_MCP_SESSION_TOKEN: token,
-      },
-      stdio: ['pipe', 'pipe', 'pipe'],
+    const harness = createStdioChildHarness(stdioScript, {
+      AGENTFORGE_MCP_DB_PATH: dbPath,
+      AGENTFORGE_MCP_SESSION_TOKEN: token,
     });
-
-    const stdoutLines: string[] = [];
-    let stdoutBuffer = '';
-    child.stdout.on('data', (chunk) => {
-      stdoutBuffer += chunk.toString();
-      let newlineIdx = stdoutBuffer.indexOf('\n');
-      while (newlineIdx !== -1) {
-        const line = stdoutBuffer.slice(0, newlineIdx).trim();
-        stdoutBuffer = stdoutBuffer.slice(newlineIdx + 1);
-        if (line) {
-          stdoutLines.push(line);
-        }
-        newlineIdx = stdoutBuffer.indexOf('\n');
-      }
-    });
-
-    const waitForLine = (predicate: (data: unknown) => boolean, timeoutMs = 8000): Promise<unknown> => {
-      const start = Date.now();
-      return new Promise((resolve, reject) => {
-        const check = () => {
-          for (const line of stdoutLines) {
-            try {
-              const parsed = JSON.parse(line);
-              if (predicate(parsed)) {
-                return resolve(parsed);
-              }
-            } catch {
-              // non-json
-            }
-          }
-          if (Date.now() - start > timeoutMs) {
-            reject(new Error(`Timeout waiting for JSON-RPC line matching predicate. Received lines: ${stdoutLines.join(' | ')}`));
-          } else {
-            setTimeout(check, 50);
-          }
-        };
-        check();
-      });
-    };
 
     try {
       // 1. Send initialize
-      const initReq = JSON.stringify({
+      const initRes = await harness.sendRequest({
         jsonrpc: '2.0',
         id: 1,
         method: 'initialize',
@@ -3128,22 +3519,12 @@ try {
           clientInfo: { name: 'test-stdio-client', version: '1.0.0' },
         },
       });
-      child.stdin.write(initReq + '\n');
+      expect((initRes.result as { serverInfo: { name: string } }).serverInfo.name).toBe('agentforge');
 
-      const initRes = (await waitForLine((d: unknown) => typeof d === 'object' && d !== null && (d as { id?: number }).id === 1)) as {
-        result?: { serverInfo?: { name: string } };
-      };
-      expect(initRes.result?.serverInfo?.name).toBe('agentforge');
-
-      // Send initialized notification
-      const initializedNotification = JSON.stringify({
-        jsonrpc: '2.0',
-        method: 'notifications/initialized',
-      });
-      child.stdin.write(initializedNotification + '\n');
+      harness.sendNotification({ jsonrpc: '2.0', method: 'notifications/initialized' });
 
       // 2. Call tool get_authorized_context
-      const toolReq = JSON.stringify({
+      const toolRes = await harness.sendRequest({
         jsonrpc: '2.0',
         id: 2,
         method: 'tools/call',
@@ -3152,17 +3533,13 @@ try {
           arguments: {},
         },
       });
-      child.stdin.write(toolReq + '\n');
-
-      const toolRes = (await waitForLine((d: unknown) => typeof d === 'object' && d !== null && (d as { id?: number }).id === 2)) as {
-        result?: { content?: Array<{ type: string; text: string }>; isError?: boolean };
-      };
-      expect(toolRes.result?.isError).toBeFalsy();
-      const parsedToolContent = JSON.parse(toolRes.result?.content?.[0]?.text ?? '{}');
+      expect(toolRes.result).toBeDefined();
+      expect((toolRes.result as { isError?: boolean }).isError).toBeFalsy();
+      const parsedToolContent = JSON.parse(((toolRes.result as { content: Array<{ text: string }> }).content[0]).text);
       expect(parsedToolContent.schema_version).toBe(2);
 
       // 3. Read resource agentforge://context/authorized
-      const resourceReq = JSON.stringify({
+      const resourceRes = await harness.sendRequest({
         jsonrpc: '2.0',
         id: 3,
         method: 'resources/read',
@@ -3170,34 +3547,22 @@ try {
           uri: AUTHORIZED_CONTEXT_RESOURCE_URI,
         },
       });
-      child.stdin.write(resourceReq + '\n');
-
-      const resourceRes = (await waitForLine((d: unknown) => typeof d === 'object' && d !== null && (d as { id?: number }).id === 3)) as {
-        result?: { contents?: Array<{ uri: string; text: string }> };
-      };
-      expect(resourceRes.result?.contents).toHaveLength(1);
-      const parsedResContent = JSON.parse(resourceRes.result?.contents?.[0]?.text ?? '{}');
+      expect((resourceRes.result as { contents: Array<{ text: string }> }).contents).toHaveLength(1);
+      const parsedResContent = JSON.parse(((resourceRes.result as { contents: Array<{ text: string }> }).contents[0]).text);
       expect(parsedResContent.schema_version).toBe(2);
 
       // 4. Close stdin (EOF) and wait for child exit
-      const exitPromise = new Promise<{ code: number | null; signal: NodeJS.Signals | null }>((resolve) => {
-        child.on('exit', (code, signal) => resolve({ code, signal }));
-      });
-      child.stdin.end();
-
-      const exitResult = await Promise.race([
-        exitPromise,
-        new Promise<never>((_, reject) => setTimeout(() => reject(new Error('Child exit timed out after EOF')), 8000)),
-      ]);
+      harness.closeStdin();
+      const exitResult = await harness.waitForExit();
       expect(exitResult.code).toBe(0);
+      expect(exitResult.signal).toBeNull();
 
       // 5. Verify stdout protocol purity: every line in stdout MUST be valid JSON-RPC
-      expect(stdoutLines.length).toBeGreaterThanOrEqual(3);
-      for (const line of stdoutLines) {
-        expect(() => {
-          const p = JSON.parse(line);
-          expect(p.jsonrpc).toBe('2.0');
-        }).not.toThrow();
+      const lines = harness.getStdoutLines();
+      expect(lines.length).toBeGreaterThanOrEqual(3);
+      for (const line of lines) {
+        const p = JSON.parse(line) as { jsonrpc: string };
+        expect(p.jsonrpc).toBe('2.0');
       }
 
       // 6. Verify database file lock is released: rename and delete immediately on Windows
@@ -3207,9 +3572,7 @@ try {
       fs.unlinkSync(renamed);
       expect(fs.existsSync(renamed)).toBe(false);
     } finally {
-      if (child.exitCode === null && child.signalCode === null) {
-        child.kill('SIGKILL');
-      }
+      await harness.close();
     }
   });
 
@@ -3226,141 +3589,82 @@ try {
 
       const runtimeDir = getOrMaterializeTestRuntime();
       const stdioScript = path.resolve(runtimeDir, 'mcp', 'stdio.js');
+      const preloadScript = path.resolve(runtimeDir, 'signal_preload.js');
 
-      const projectNodeModules = path.resolve(__dirname, '..', 'node_modules');
-      const child = spawn(process.execPath, [stdioScript], {
-        env: {
-          ...process.env,
-          NODE_PATH: projectNodeModules,
+      const harness = createStdioChildHarness(
+        stdioScript,
+        {
           AGENTFORGE_MCP_DB_PATH: dbPath,
           AGENTFORGE_MCP_SESSION_TOKEN: token,
         },
-        stdio: ['pipe', 'pipe', 'pipe'],
-      });
-
-      let stderrOutput = '';
-      child.stderr.on('data', (chunk) => {
-        stderrOutput += chunk.toString();
-      });
-
-      const stdoutLines: string[] = [];
-      let stdoutBuffer = '';
-      child.stdout.on('data', (chunk) => {
-        stdoutBuffer += chunk.toString();
-        let newlineIdx = stdoutBuffer.indexOf('\n');
-        while (newlineIdx !== -1) {
-          const line = stdoutBuffer.slice(0, newlineIdx).trim();
-          stdoutBuffer = stdoutBuffer.slice(newlineIdx + 1);
-          if (line) {
-            stdoutLines.push(line);
-          }
-          newlineIdx = stdoutBuffer.indexOf('\n');
-        }
-      });
-
-      const waitForLine = (predicate: (data: unknown) => boolean, timeoutMs = 8000): Promise<unknown> => {
-        const start = Date.now();
-        return new Promise((resolve, reject) => {
-          const check = () => {
-            for (const line of stdoutLines) {
-              try {
-                const parsed = JSON.parse(line);
-                if (predicate(parsed)) {
-                  return resolve(parsed);
-                }
-              } catch {
-                // non-json
-              }
-            }
-            if (Date.now() - start > timeoutMs) {
-              reject(new Error(`Timeout waiting for JSON-RPC line. Lines: ${stdoutLines.join(' | ')}`));
-            } else {
-              setTimeout(check, 50);
-            }
-          };
-          check();
-        });
-      };
+        preloadScript
+      );
 
       try {
         // 1. Initialize
-        child.stdin.write(
-          JSON.stringify({
-            jsonrpc: '2.0',
-            id: 1,
-            method: 'initialize',
-            params: {
-              protocolVersion: '2024-11-05',
-              capabilities: {},
-              clientInfo: { name: 'test-stdio-client', version: '1.0.0' },
-            },
-          }) + '\n'
-        );
-        await waitForLine((d: unknown) => typeof d === 'object' && d !== null && (d as { id?: number }).id === 1);
+        const initRes = await harness.sendRequest({
+          jsonrpc: '2.0',
+          id: 1,
+          method: 'initialize',
+          params: {
+            protocolVersion: '2024-11-05',
+            capabilities: {},
+            clientInfo: { name: 'test-stdio-client', version: '1.0.0' },
+          },
+        });
+        expect((initRes.result as { serverInfo: { name: string } }).serverInfo.name).toBe('agentforge');
 
-        child.stdin.write(JSON.stringify({ jsonrpc: '2.0', method: 'notifications/initialized' }) + '\n');
+        harness.sendNotification({ jsonrpc: '2.0', method: 'notifications/initialized' });
 
-        // 2. Tool call get_authorized_context
-        child.stdin.write(
-          JSON.stringify({
-            jsonrpc: '2.0',
-            id: 2,
-            method: 'tools/call',
-            params: { name: GET_AUTHORIZED_CONTEXT_TOOL_NAME, arguments: {} },
-          }) + '\n'
-        );
-        const toolRes = (await waitForLine((d: unknown) => typeof d === 'object' && d !== null && (d as { id?: number }).id === 2)) as {
-          result?: { content?: Array<{ type: string; text: string }>; isError?: boolean };
-        };
-        expect(toolRes.result?.isError).toBeFalsy();
+        // 2. Tool call get_authorized_context before signal
+        const toolRes = await harness.sendRequest({
+          jsonrpc: '2.0',
+          id: 2,
+          method: 'tools/call',
+          params: { name: GET_AUTHORIZED_CONTEXT_TOOL_NAME, arguments: {} },
+        });
+        expect((toolRes.result as { isError?: boolean }).isError).toBeFalsy();
 
-        // 3. Resource read agentforge://context/authorized
-        child.stdin.write(
-          JSON.stringify({
-            jsonrpc: '2.0',
-            id: 3,
-            method: 'resources/read',
-            params: { uri: AUTHORIZED_CONTEXT_RESOURCE_URI },
-          }) + '\n'
-        );
-        const resRes = (await waitForLine((d: unknown) => typeof d === 'object' && d !== null && (d as { id?: number }).id === 3)) as {
-          result?: { contents?: Array<{ uri: string; text: string }> };
-        };
-        expect(resRes.result?.contents).toHaveLength(1);
+        // 3. Resource read agentforge://context/authorized before signal
+        const resRes = await harness.sendRequest({
+          jsonrpc: '2.0',
+          id: 3,
+          method: 'resources/read',
+          params: { uri: AUTHORIZED_CONTEXT_RESOURCE_URI },
+        });
+        expect((resRes.result as { contents: Array<unknown> }).contents).toHaveLength(1);
 
         // 4. Send signal to child process
-        const exitPromise = new Promise<{ code: number | null; signal: NodeJS.Signals | null }>((resolve) => {
-          child.on('exit', (code, signal) => resolve({ code, signal }));
-        });
+        harness.terminate(signal);
 
-        child.kill(signal);
+        // 5. Require handled termination: code === 0 and signal === null
+        const exitResult = await harness.waitForExit();
+        expect(exitResult.code).toBe(0);
+        expect(exitResult.signal).toBeNull();
 
-        const exitResult = await Promise.race([
-          exitPromise,
-          new Promise<never>((_, reject) => setTimeout(() => reject(new Error(`Child exit timed out after ${signal}`)), 8000)),
-        ]);
-
-        if (exitResult.code !== null) {
-          expect(exitResult.code).toBe(0);
-        } else {
-          expect(exitResult.signal).toBe(signal);
+        // 6. Assert JSON-RPC only stdout
+        const stdoutLines = harness.getStdoutLines();
+        expect(stdoutLines.length).toBeGreaterThanOrEqual(3);
+        for (const line of stdoutLines) {
+          const parsed = JSON.parse(line) as { jsonrpc: string };
+          expect(parsed.jsonrpc).toBe('2.0');
         }
 
-        // Assert stderr contains no sensitive secrets or unexpected errors
+        // 7. Assert stderr contains no sensitive secrets or unexpected errors
+        const stderrOutput = harness.getStderr();
         expect(stderrOutput).not.toContain(token);
         expect(stderrOutput).not.toContain(dbPath);
         expect(stderrOutput).not.toContain('MCP_FATAL_ERROR');
+        expect(stderrOutput).not.toContain('MCP_CLEANUP_FAILED');
 
-        // Assert database file lock released and can be renamed and deleted
+        // 8. Assert database file lock released and can be renamed and deleted
         const renamed = path.join(tempDir, `${dbName}_renamed.db`);
         fs.renameSync(dbPath, renamed);
         expect(fs.existsSync(renamed)).toBe(true);
         fs.unlinkSync(renamed);
         expect(fs.existsSync(renamed)).toBe(false);
       } finally {
-        if (child.exitCode === null && child.signalCode === null) {
-          child.kill('SIGKILL');
-        }
+        await harness.close();
       }
     };
 
@@ -3601,67 +3905,8 @@ try {
     const w1 = new Worker(workerScript, { eval: true, workerData: workerData1, env: { ...process.env, NODE_PATH: projectNodeModules } });
     const w2 = new Worker(workerScript, { eval: true, workerData: workerData2, env: { ...process.env, NODE_PATH: projectNodeModules } });
 
-    const createDistinctWorkerHarness = (w: Worker) => {
-      let isReadyResolved = false;
-      let readyResolve: () => void;
-      let readyReject: (err: Error) => void;
-      const readyPromise = new Promise<void>((resolve, reject) => {
-        readyResolve = resolve;
-        readyReject = reject;
-      });
-
-      let isResultResolved = false;
-      let resultResolve: (res: DistinctWorkerMessage) => void;
-      let resultReject: (err: Error) => void;
-      const resultPromise = new Promise<DistinctWorkerMessage>((resolve, reject) => {
-        resultResolve = resolve;
-        resultReject = reject;
-      });
-
-      const messageHandler = (msg: unknown) => {
-        if (msg === 'READY' && !isReadyResolved) {
-          isReadyResolved = true;
-          readyResolve();
-          return;
-        }
-        if (typeof msg === 'object' && msg !== null && 'success' in msg && !isResultResolved) {
-          isResultResolved = true;
-          resultResolve(msg as DistinctWorkerMessage);
-        }
-      };
-
-      const errorHandler = (err: Error) => {
-        if (!isReadyResolved) {
-          isReadyResolved = true;
-          readyReject(err);
-        }
-        if (!isResultResolved) {
-          isResultResolved = true;
-          resultReject(err);
-        }
-      };
-
-      const exitHandler = (exitCode: number) => {
-        errorHandler(new Error(`Worker exited with code ${exitCode}`));
-      };
-
-      w.on('message', messageHandler);
-      w.on('error', errorHandler);
-      w.on('exit', exitHandler);
-
-      return {
-        readyPromise,
-        resultPromise,
-        cleanup: () => {
-          w.off('message', messageHandler);
-          w.off('error', errorHandler);
-          w.off('exit', exitHandler);
-        },
-      };
-    };
-
-    const h1 = createDistinctWorkerHarness(w1);
-    const h2 = createDistinctWorkerHarness(w2);
+    const h1 = createWorkerHarness<DistinctWorkerMessage>(w1);
+    const h2 = createWorkerHarness<DistinctWorkerMessage>(w2);
 
     try {
       await Promise.all([h1.readyPromise, h2.readyPromise]);
@@ -3685,9 +3930,7 @@ try {
         checkDb.close();
       }
     } finally {
-      h1.cleanup();
-      h2.cleanup();
-      await Promise.all([w1.terminate(), w2.terminate()]);
+      await Promise.all([h1.cleanup(), h2.cleanup()]);
     }
   });
 
@@ -3828,7 +4071,7 @@ try {
   it('117. Exact CHECK constraint set authority rejects extra or duplicate CHECK constraints', () => {
     const { db } = createTestDatabase(tempDir, 'exact_check_constraints.db');
     try {
-      // Recreate table with 7 check constraints (one extra check constraint)
+      // 1. Extra seventh CHECK constraint
       db.exec('DROP TABLE mcp_client_sessions;');
       db.exec(`
         CREATE TABLE mcp_client_sessions (
@@ -3855,6 +4098,33 @@ try {
       `);
 
       // Found length is 7 instead of 6, must throw MCP_SCHEMA_AUTHORITY_INVALID
+      expect(() => verifyMigration21SchemaAuthority(db)).toThrowError(/MCP_SCHEMA_AUTHORITY_INVALID/);
+
+      // 2. Distinct malformed table containing a duplicate canonical CHECK while other canonical checks remain present
+      db.exec('DROP TABLE mcp_client_sessions;');
+      db.exec(`
+        CREATE TABLE mcp_client_sessions (
+          id TEXT PRIMARY KEY,
+          authorization_id TEXT NOT NULL REFERENCES execution_authorizations(id) ON DELETE RESTRICT,
+          scope TEXT NOT NULL CHECK (scope = 'AUTHORIZED_CONTEXT_READ'),
+          token_hash TEXT NOT NULL CHECK (
+            length(token_hash) = 64 AND
+            token_hash GLOB '[0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]'
+          ),
+          authorization_fingerprint TEXT NOT NULL CHECK (
+            length(authorization_fingerprint) = 64 AND
+            authorization_fingerprint GLOB '[0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]'
+          ),
+          issued_at TEXT NOT NULL CHECK (length(issued_at) > 0),
+          expires_at TEXT NOT NULL CHECK (length(expires_at) > 0 AND expires_at > issued_at),
+          revoked_at TEXT NULL CHECK (revoked_at IS NULL OR (length(revoked_at) > 0 AND revoked_at >= issued_at)),
+          CHECK (scope = 'AUTHORIZED_CONTEXT_READ')
+        );
+        CREATE UNIQUE INDEX uq_mcp_client_sessions_active_auth ON mcp_client_sessions(authorization_id) WHERE revoked_at IS NULL;
+        CREATE UNIQUE INDEX idx_mcp_client_sessions_token_hash ON mcp_client_sessions(token_hash);
+        CREATE INDEX idx_mcp_client_sessions_expires_at ON mcp_client_sessions(expires_at);
+        CREATE INDEX idx_mcp_client_sessions_auth_id ON mcp_client_sessions(authorization_id);
+      `);
       expect(() => verifyMigration21SchemaAuthority(db)).toThrowError(/MCP_SCHEMA_AUTHORITY_INVALID/);
     } finally {
       db.close();
@@ -3888,6 +4158,34 @@ try {
       db.prepare("UPDATE schema_migrations SET name = '001_wrong' WHERE version = 1").run();
       expect(() => verifyMigration21SchemaAuthority(db)).toThrowError(/MCP_SCHEMA_AUTHORITY_INVALID/);
       db.prepare("UPDATE schema_migrations SET name = '001_initial_schema' WHERE version = 1").run();
+      expect(() => verifyMigration21SchemaAuthority(db)).not.toThrow();
+
+      // 5. Controlled malformed ledger rebuild with duplicate version rows
+      db.exec(`
+        CREATE TABLE schema_migrations_malformed (
+          version INTEGER,
+          name TEXT NOT NULL,
+          applied_at TEXT NOT NULL
+        );
+        INSERT INTO schema_migrations_malformed SELECT version, name, applied_at FROM schema_migrations;
+        INSERT INTO schema_migrations_malformed VALUES (10, '010_r5h4_failover_lineage_budget_idempotency', datetime('now'));
+        DROP TABLE schema_migrations;
+        ALTER TABLE schema_migrations_malformed RENAME TO schema_migrations;
+      `);
+      expect(() => verifyMigration21SchemaAuthority(db)).toThrowError(/MCP_SCHEMA_AUTHORITY_INVALID/);
+
+      // Restore canonical ledger
+      db.exec(`
+        CREATE TABLE schema_migrations_restored (
+          version INTEGER PRIMARY KEY,
+          name TEXT NOT NULL,
+          applied_at TEXT NOT NULL
+        );
+        INSERT INTO schema_migrations_restored
+        SELECT DISTINCT version, name, applied_at FROM schema_migrations;
+        DROP TABLE schema_migrations;
+        ALTER TABLE schema_migrations_restored RENAME TO schema_migrations;
+      `);
       expect(() => verifyMigration21SchemaAuthority(db)).not.toThrow();
     } finally {
       db.close();
