@@ -4585,13 +4585,22 @@ try {
       expect(() => verifyMigration21SchemaAuthority(db)).not.toThrow();
 
       // 1. Missing version in 1..20
+      const subcase1V10 = db.prepare('SELECT version, name, applied_at FROM schema_migrations WHERE version = 10').get() as {
+        version: number;
+        name: string;
+        applied_at: string;
+      };
       db.prepare('DELETE FROM schema_migrations WHERE version = 10').run();
       expect(() => verifyMigration21SchemaAuthority(db)).toThrowError(/MCP_SCHEMA_AUTHORITY_INVALID/);
-      db.prepare("INSERT INTO schema_migrations (version, name, applied_at) VALUES (10, '010_r5h4_failover_lineage_budget_idempotency', datetime('now'))").run();
+      db.prepare('INSERT INTO schema_migrations (version, name, applied_at) VALUES (?, ?, ?)').run(
+        subcase1V10.version,
+        subcase1V10.name,
+        subcase1V10.applied_at
+      );
       expect(() => verifyMigration21SchemaAuthority(db)).not.toThrow();
 
       // 2. Extra version beyond 21
-      db.prepare("INSERT INTO schema_migrations (version, name, applied_at) VALUES (22, '022_extra', datetime('now'))").run();
+      db.prepare("INSERT INTO schema_migrations (version, name, applied_at) VALUES (22, '022_extra', '2026-01-01 00:00:00')").run();
       expect(() => verifyMigration21SchemaAuthority(db)).toThrowError(/MCP_SCHEMA_AUTHORITY_INVALID/);
       db.prepare('DELETE FROM schema_migrations WHERE version = 22').run();
       expect(() => verifyMigration21SchemaAuthority(db)).not.toThrow();
@@ -4609,31 +4618,122 @@ try {
       expect(() => verifyMigration21SchemaAuthority(db)).not.toThrow();
 
       // 5. Controlled malformed ledger rebuild with duplicate version rows
+      // Create malformed table without PRIMARY KEY constraint
       db.exec(`
         CREATE TABLE schema_migrations_malformed (
           version INTEGER,
           name TEXT NOT NULL,
           applied_at TEXT NOT NULL
         );
-        INSERT INTO schema_migrations_malformed SELECT version, name, applied_at FROM schema_migrations;
-        INSERT INTO schema_migrations_malformed VALUES (10, '010_r5h4_failover_lineage_budget_idempotency', datetime('now'));
+        INSERT INTO schema_migrations_malformed (version, name, applied_at)
+        SELECT version, name, applied_at FROM schema_migrations;
+      `);
+
+      // Assert exactly one canonical version-10 row exists before duplicate insertion
+      const preV10Rows = db.prepare('SELECT rowid, version, name, applied_at FROM schema_migrations_malformed WHERE version = 10').all() as Array<{
+        rowid: number;
+        version: number;
+        name: string;
+        applied_at: string;
+      }>;
+      expect(preV10Rows.length).toBe(1);
+      const originalV10 = preV10Rows[0];
+      expect(originalV10.name).toBe('010_r5h4_failover_lineage_budget_idempotency');
+
+      // Insert exact copy of existing canonical version-10 row (no wall-clock input)
+      db.exec(`
+        INSERT INTO schema_migrations_malformed (version, name, applied_at)
+        SELECT version, name, applied_at
+        FROM schema_migrations_malformed
+        WHERE version = 10;
+      `);
+
+      // Assert exactly two version-10 rows exist after insertion
+      const postV10Rows = db.prepare('SELECT rowid, version, name, applied_at FROM schema_migrations_malformed WHERE version = 10 ORDER BY rowid ASC').all() as Array<{
+        rowid: number;
+        version: number;
+        name: string;
+        applied_at: string;
+      }>;
+      expect(postV10Rows.length).toBe(2);
+      expect(postV10Rows[0].name).toBe('010_r5h4_failover_lineage_budget_idempotency');
+      expect(postV10Rows[1].name).toBe('010_r5h4_failover_lineage_budget_idempotency');
+      expect(postV10Rows[0].applied_at).toBe(originalV10.applied_at);
+      expect(postV10Rows[1].applied_at).toBe(originalV10.applied_at);
+
+      // Identify the exact duplicate row inserted (higher rowid)
+      const duplicateRowid = postV10Rows[1].rowid;
+      expect(duplicateRowid).toBeGreaterThan(postV10Rows[0].rowid);
+
+      // Assert total rows in malformed ledger is exactly 22
+      const malformedTotal = (db.prepare('SELECT COUNT(*) as count FROM schema_migrations_malformed').get() as { count: number }).count;
+      expect(malformedTotal).toBe(22);
+
+      // Swap malformed table in place of schema_migrations
+      db.exec(`
         DROP TABLE schema_migrations;
         ALTER TABLE schema_migrations_malformed RENAME TO schema_migrations;
       `);
+
+      // Call real verifier while duplicate rows are present: must reject with MCP_SCHEMA_AUTHORITY_INVALID
       expect(() => verifyMigration21SchemaAuthority(db)).toThrowError(/MCP_SCHEMA_AUTHORITY_INVALID/);
 
-      // Restore canonical ledger
+      // Prove rejection occurred while both duplicate rows were present
+      const midV10Rows = db.prepare('SELECT rowid, version, name, applied_at FROM schema_migrations WHERE version = 10').all();
+      expect(midV10Rows.length).toBe(2);
+
+      // Deterministic restoration: delete exactly the injected duplicate row by rowid
+      const deleteResult = db.prepare('DELETE FROM schema_migrations WHERE rowid = ?').run(duplicateRowid);
+      expect(deleteResult.changes).toBe(1);
+
+      // Assert exactly one version-10 row remains
+      const remainingV10Rows = db.prepare('SELECT rowid, version, name, applied_at FROM schema_migrations WHERE version = 10').all() as Array<{
+        rowid: number;
+        version: number;
+        name: string;
+        applied_at: string;
+      }>;
+      expect(remainingV10Rows.length).toBe(1);
+      expect(remainingV10Rows[0].name).toBe('010_r5h4_failover_lineage_budget_idempotency');
+      expect(remainingV10Rows[0].applied_at).toBe(originalV10.applied_at);
+
+      // Assert malformed table now contains exactly 21 rows with versions 1..21, one row per version
+      const dedupRows = db.prepare('SELECT version, name, applied_at FROM schema_migrations ORDER BY version ASC').all() as Array<{
+        version: number;
+        name: string;
+        applied_at: string;
+      }>;
+      expect(dedupRows.length).toBe(21);
+      for (let i = 0; i < 21; i++) {
+        expect(dedupRows[i].version).toBe(i + 1);
+      }
+
+      // Recreate schema_migrations_restored with canonical primary-key schema
+      // Copy all 21 rows directly without DISTINCT, timing functions, INSERT OR IGNORE, REPLACE, or conflict suppression
       db.exec(`
         CREATE TABLE schema_migrations_restored (
           version INTEGER PRIMARY KEY,
           name TEXT NOT NULL,
           applied_at TEXT NOT NULL
         );
-        INSERT INTO schema_migrations_restored
-        SELECT DISTINCT version, name, applied_at FROM schema_migrations;
+        INSERT INTO schema_migrations_restored (version, name, applied_at)
+        SELECT version, name, applied_at FROM schema_migrations;
         DROP TABLE schema_migrations;
         ALTER TABLE schema_migrations_restored RENAME TO schema_migrations;
       `);
+
+      // Assert restored table has exactly 21 rows and exactly one row for every contiguous version 1..21
+      const restoredRows = db.prepare('SELECT version, name, applied_at FROM schema_migrations ORDER BY version ASC').all() as Array<{
+        version: number;
+        name: string;
+        applied_at: string;
+      }>;
+      expect(restoredRows.length).toBe(21);
+      for (let i = 0; i < 21; i++) {
+        expect(restoredRows[i].version).toBe(i + 1);
+      }
+
+      // Call real verifier and prove canonical restored ledger passes
       expect(() => verifyMigration21SchemaAuthority(db)).not.toThrow();
     } finally {
       db.close();
