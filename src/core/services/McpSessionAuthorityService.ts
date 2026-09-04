@@ -708,29 +708,57 @@ export class McpSessionAuthorityService {
         throw new McpAuthorityError('MCP_AUTHORITY_FENCED', `Manager decision "${managerData.decision}" does not authorize execution`);
       }
 
-      // Check revision and expected_task_state agreement between row and payload
-      const rowRev =
-        msgRow.expected_revision !== null && msgRow.expected_revision !== undefined
-          ? Number(msgRow.expected_revision)
-          : null;
-      const payloadRev =
-        managerData.expected_revision !== null && managerData.expected_revision !== undefined
-          ? Number(managerData.expected_revision)
-          : null;
+      // Check revision and expected_task_state presence parity and agreement between row and payload
+      const hasRowRev = msgRow.expected_revision !== null && msgRow.expected_revision !== undefined;
+      const hasPayloadRev = managerData.expected_revision !== null && managerData.expected_revision !== undefined;
 
-      if (rowRev !== null && payloadRev !== null && rowRev !== payloadRev) {
-        throw new McpAuthorityError('MCP_AUTHORITY_FENCED', 'Protocol message expected_revision mismatch between row and payload');
+      if (hasRowRev !== hasPayloadRev) {
+        throw new McpAuthorityError(
+          'MCP_AUTHORITY_FENCED',
+          'Protocol message expected_revision presence parity mismatch between row and payload'
+        );
       }
 
-      if (
-        msgRow.expected_task_state != null &&
-        managerData.expected_task_state != null &&
-        msgRow.expected_task_state !== managerData.expected_task_state
-      ) {
-        throw new McpAuthorityError('MCP_AUTHORITY_FENCED', 'Protocol message expected_task_state mismatch between row and payload');
+      let derivedRev: number | null = null;
+      if (hasRowRev && hasPayloadRev) {
+        const rowRev = Number(msgRow.expected_revision);
+        const payloadRev = Number(managerData.expected_revision);
+
+        if (!Number.isInteger(rowRev) || rowRev < 0 || !Number.isInteger(payloadRev) || payloadRev < 0) {
+          throw new McpAuthorityError(
+            'MCP_AUTHORITY_FENCED',
+            'Protocol message expected_revision must be a canonical non-negative integer'
+          );
+        }
+
+        if (rowRev !== payloadRev) {
+          throw new McpAuthorityError(
+            'MCP_AUTHORITY_FENCED',
+            'Protocol message expected_revision mismatch between row and payload'
+          );
+        }
+
+        derivedRev = payloadRev;
       }
 
-      const derivedRev = payloadRev !== null ? payloadRev : rowRev;
+      const hasRowState = msgRow.expected_task_state !== null && msgRow.expected_task_state !== undefined;
+      const hasPayloadState = managerData.expected_task_state !== null && managerData.expected_task_state !== undefined;
+
+      if (hasRowState !== hasPayloadState) {
+        throw new McpAuthorityError(
+          'MCP_AUTHORITY_FENCED',
+          'Protocol message expected_task_state presence parity mismatch between row and payload'
+        );
+      }
+
+      if (hasRowState && hasPayloadState) {
+        if (msgRow.expected_task_state !== managerData.expected_task_state) {
+          throw new McpAuthorityError(
+            'MCP_AUTHORITY_FENCED',
+            'Protocol message expected_task_state mismatch between row and payload'
+          );
+        }
+      }
 
       if (managerData.decision === 'EXECUTE') {
         if (derivedRev !== null && derivedRev !== auth.task_revision) {

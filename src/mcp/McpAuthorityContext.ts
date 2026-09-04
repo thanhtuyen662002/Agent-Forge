@@ -20,6 +20,7 @@ export class McpAuthorityContext {
   private service: McpSessionAuthorityService | null = null;
   private readonly configuredDbPath?: string;
   private readonly configuredSessionToken?: string;
+  private unauthorizedMutationDetected = false;
 
   constructor(options?: McpAuthorityContextOptions) {
     this.configuredDbPath = options?.dbPath;
@@ -161,6 +162,10 @@ export class McpAuthorityContext {
    * Connection-local mutations are strictly fenced using SELECT total_changes().
    */
   public resolveAuthorizedContext(): AuthorizedContextResponse {
+    if (this.unauthorizedMutationDetected) {
+      throw new McpAuthorityError('MCP_AUTHORITY_FENCED', 'Database mutation detected during context read');
+    }
+
     const sessionToken = this.getSessionToken();
     const validatedToken = validateCanonicalSessionToken(sessionToken);
     const { db, service } = this.getOrCreateDatabase();
@@ -179,10 +184,12 @@ export class McpAuthorityContext {
     try {
       changesAfter = this.getRuntimeTotalChanges(db);
     } catch {
+      this.unauthorizedMutationDetected = true;
       throw new McpAuthorityError('MCP_AUTHORITY_FENCED', 'Database mutation verification failed');
     }
 
     if (changesBefore !== changesAfter) {
+      this.unauthorizedMutationDetected = true;
       throw new McpAuthorityError('MCP_AUTHORITY_FENCED', 'Database mutation detected during context read');
     }
 
@@ -193,34 +200,38 @@ export class McpAuthorityContext {
     return response!;
   }
 
+  public hasDetectedUnauthorizedMutation(): boolean {
+    return this.unauthorizedMutationDetected;
+  }
+
   /**
    * Safely closes the database handle with bounded retry for Windows file locks.
    * Observable diagnostic on failure without leaking details.
+   * Retains database and service references on failure for subsequent retry.
    */
   public close(): void {
     if (!this.db) {
       return;
     }
-    const dbToClose = this.db;
-    this.db = null;
-    this.service = null;
 
-    if (!dbToClose.open) {
+    if (!this.db.open) {
+      this.db = null;
+      this.service = null;
       return;
     }
 
-    let lastErr: unknown = null;
     const maxRetries = 5;
     const retryDelayMs = 25;
+    let closedSuccessfully = false;
 
     for (let attempt = 0; attempt < maxRetries; attempt++) {
       try {
-        if (dbToClose.open) {
-          dbToClose.close();
+        if (this.db.open) {
+          this.db.close();
         }
-        return;
-      } catch (err) {
-        lastErr = err;
+        closedSuccessfully = true;
+        break;
+      } catch {
         if (attempt < maxRetries - 1) {
           try {
             Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, retryDelayMs);
@@ -229,6 +240,12 @@ export class McpAuthorityContext {
           }
         }
       }
+    }
+
+    if (closedSuccessfully || !this.db.open) {
+      this.db = null;
+      this.service = null;
+      return;
     }
 
     process.stderr.write('[agentforge-mcp-context] Database close failed: MCP_CLEANUP_FAILED\n');
@@ -247,8 +264,7 @@ export function getDefaultAuthorityContext(): McpAuthorityContext {
 
 export function resetDefaultAuthorityContext(): void {
   if (defaultContextInstance) {
-    const instance = defaultContextInstance;
+    defaultContextInstance.close();
     defaultContextInstance = null;
-    instance.close();
   }
 }

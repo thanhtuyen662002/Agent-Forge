@@ -37,7 +37,10 @@ export function runStdioServer(): StdioServerHandle {
   };
 
   const onExit = () => {
-    cleanup();
+    const success = cleanup();
+    if (!success) {
+      process.exitCode = 1;
+    }
   };
 
   process.once("exit", onExit);
@@ -54,9 +57,17 @@ export function runStdioServer(): StdioServerHandle {
     const originalClose = handle.close.bind(handle);
     handle.close = async () => {
       const success = cleanup();
-      await originalClose();
+      let closeErr: unknown = null;
+      try {
+        await originalClose();
+      } catch (err) {
+        closeErr = err;
+      }
       if (!success) {
         throw new Error('Cleanup failed: MCP_CLEANUP_FAILED');
+      }
+      if (closeErr) {
+        throw closeErr;
       }
     };
 

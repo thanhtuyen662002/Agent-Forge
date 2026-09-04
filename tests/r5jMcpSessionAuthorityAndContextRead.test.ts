@@ -1,10 +1,11 @@
 import fs from 'fs';
 import path from 'path';
+import os from 'os';
 import crypto from 'crypto';
-import { spawn } from 'child_process';
+import { spawn, execFileSync } from 'child_process';
 import { Worker } from 'worker_threads';
 import Database from 'better-sqlite3';
-import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach, afterAll, vi } from 'vitest';
 import { Client, InMemoryTransport } from '@modelcontextprotocol/client';
 import { StdioClientTransport } from '@modelcontextprotocol/client/stdio';
 import { MIGRATIONS, MigrationRunner, verifyMigration21SchemaAuthority } from '../src/core/database/migrations';
@@ -41,10 +42,68 @@ import { parseCliArgs, runSessionAdmin } from '../src/mcp/sessionAdmin';
 import { runStdioServer } from '../src/mcp/stdio';
 import { ExecutionAuthorization } from '../src/core/types/domain';
 
+let sharedTestRuntimeDir: string | null = null;
+
+function getOrMaterializeTestRuntime(): string {
+  if (sharedTestRuntimeDir && fs.existsSync(sharedTestRuntimeDir)) {
+    return sharedTestRuntimeDir;
+  }
+  const projectRoot = path.resolve(__dirname, '..');
+  const tempRuntimeDir = path.join(os.tmpdir(), `af-mcp-test-runtime-${Date.now()}-${crypto.randomUUID().slice(0, 8)}`);
+  fs.mkdirSync(tempRuntimeDir, { recursive: true });
+
+  const tscBin = require.resolve('typescript/bin/tsc');
+  execFileSync(process.execPath, [tscBin, '-p', 'tsconfig.node.json', '--outDir', tempRuntimeDir], {
+    cwd: projectRoot,
+    stdio: 'pipe',
+    encoding: 'utf8',
+  });
+
+  const manifestPath = path.join(tempRuntimeDir, 'package.json');
+  fs.writeFileSync(manifestPath, JSON.stringify({ type: 'commonjs' }, null, 2), 'utf8');
+
+  // Verify runtime manifest
+  const writtenManifest = JSON.parse(fs.readFileSync(manifestPath, 'utf8'));
+  if (writtenManifest.type !== 'commonjs') {
+    throw new Error('Temporary test runtime manifest failed verification');
+  }
+
+  // Symlink / junction project node_modules into temporary test runtime
+  const targetNodeModules = path.join(projectRoot, 'node_modules');
+  const linkNodeModules = path.join(tempRuntimeDir, 'node_modules');
+  if (!fs.existsSync(linkNodeModules) && fs.existsSync(targetNodeModules)) {
+    const symlinkType = process.platform === 'win32' ? 'junction' : 'dir';
+    fs.symlinkSync(targetNodeModules, linkNodeModules, symlinkType);
+  }
+
+  // Verify key compiled files exist in test runtime
+  const stdioEntry = path.join(tempRuntimeDir, 'mcp', 'stdio.js');
+  const repoEntry = path.join(tempRuntimeDir, 'core', 'database', 'repositories.js');
+  const serviceEntry = path.join(tempRuntimeDir, 'core', 'services', 'McpSessionAuthorityService.js');
+  if (!fs.existsSync(stdioEntry) || !fs.existsSync(repoEntry) || !fs.existsSync(serviceEntry)) {
+    throw new Error('Temporary test runtime is missing expected compiled modules');
+  }
+
+  sharedTestRuntimeDir = tempRuntimeDir;
+  return sharedTestRuntimeDir;
+}
+
 function safeRemoveDir(dir: string, maxRetries = 10, delayMs = 100): void {
   for (let i = 0; i < maxRetries; i++) {
     try {
       if (fs.existsSync(dir)) {
+        const nestedNodeModules = path.join(dir, 'node_modules');
+        if (fs.existsSync(nestedNodeModules)) {
+          try {
+            fs.unlinkSync(nestedNodeModules);
+          } catch {
+            try {
+              fs.rmdirSync(nestedNodeModules);
+            } catch {
+              // ignore
+            }
+          }
+        }
         fs.rmSync(dir, { recursive: true, force: true });
       }
       return;
@@ -349,6 +408,18 @@ describe('R5J2 MCP Session Authority and Scoped Context Read Truth Suite', () =>
     safeRemoveDir(tempDir);
   });
 
+  afterAll(() => {
+    resetDefaultAuthorityContext();
+    if (sharedTestRuntimeDir) {
+      try {
+        safeRemoveDir(sharedTestRuntimeDir);
+      } catch {
+        // bounded teardown
+      }
+      sharedTestRuntimeDir = null;
+    }
+  });
+
   // =========================================================================
   // Part 1: Truthful Migration 21 Authority & Schema Integrity
   // =========================================================================
@@ -596,8 +667,18 @@ describe('R5J2 MCP Session Authority and Scoped Context Read Truth Suite', () =>
       }
       expect(failStderr).not.toContain(plaintextToken);
 
-      // 5. Check lookup & active list contain token ZERO times
-      const lookedUp = fixtures.repo.getMcpClientSessionByTokenHash(parsedIssue.session.token_hash);
+      // 5. Check lookup by ID and by token hash contain token ZERO times
+      const storedRow = fixtures.repo.getMcpClientSessionById(parsedIssue.session.id);
+      expect(storedRow).toBeDefined();
+      expect(parsedIssue.session.token_hash).toBeUndefined();
+      expect(storedRow?.token_hash).toBeDefined();
+      expect(storedRow?.token_hash).toMatch(/^[0-9a-f]{64}$/);
+      expect(JSON.stringify(storedRow)).not.toContain(plaintextToken);
+      expect(JSON.stringify(parsedIssue.session)).not.toContain(plaintextToken);
+
+      const lookedUp = fixtures.repo.getMcpClientSessionByTokenHash(storedRow!.token_hash);
+      expect(lookedUp).toBeDefined();
+      expect(lookedUp!.id).toBe(parsedIssue.session.id);
       expect(JSON.stringify(lookedUp)).not.toContain(plaintextToken);
       const activeSessions = fixtures.repo.getActiveMcpClientSessionByAuthorizationId(fixtures.authorizationId);
       expect(JSON.stringify(activeSessions)).not.toContain(plaintextToken);
@@ -1297,6 +1378,9 @@ describe('R5J2 MCP Session Authority and Scoped Context Read Truth Suite', () =>
         errRevoked = e as Error;
       }
 
+      expect(errUnknown).toBeInstanceOf(Error);
+      expect(errExpired).toBeInstanceOf(Error);
+      expect(errRevoked).toBeInstanceOf(Error);
       expect(errUnknown?.message).toBe(errExpired?.message);
       expect(errUnknown?.message).toBe(errRevoked?.message);
       expect(errUnknown?.message).toContain('MCP_SESSION_UNAUTHORIZED');
@@ -1424,75 +1508,145 @@ describe('R5J2 MCP Session Authority and Scoped Context Read Truth Suite', () =>
       setupDb.close();
     }
 
+    const runtimeDir = getOrMaterializeTestRuntime();
+
     const workerCode = `
 const { parentPort, workerData } = require('node:worker_threads');
 const path = require('node:path');
 const Database = require('better-sqlite3');
-const { Repository } = require(path.resolve(workerData.projectRoot, 'dist-electron/core/database/repositories.js'));
-const { McpSessionAuthorityService } = require(path.resolve(workerData.projectRoot, 'dist-electron/core/services/McpSessionAuthorityService.js'));
+const { Repository } = require(path.join(workerData.runtimeDir, 'core/database/repositories.js'));
+const { McpSessionAuthorityService } = require(path.join(workerData.runtimeDir, 'core/services/McpSessionAuthorityService.js'));
 
-const db = new Database(workerData.dbPath);
-db.pragma('foreign_keys = ON');
-const repo = new Repository(db);
-const service = new McpSessionAuthorityService(repo, db);
+let db;
+try {
+  db = new Database(workerData.dbPath);
+  db.pragma('foreign_keys = ON');
+  const repo = new Repository(db);
+  const service = new McpSessionAuthorityService(repo, db);
 
-parentPort.on('message', (msg) => {
-  if (msg === 'GO') {
-    try {
-      const result = service.issueSession({ authorizationId: workerData.authorizationId });
-      db.close();
-      parentPort.postMessage({ success: true, result });
-    } catch (err) {
-      db.close();
-      parentPort.postMessage({
-        success: false,
-        error: err instanceof Error ? err.message : String(err),
-        category: err && typeof err === 'object' && 'category' in err ? err.category : null,
-      });
+  parentPort.on('message', (msg) => {
+    if (msg === 'GO') {
+      try {
+        const result = service.issueSession({ authorizationId: workerData.authorizationId });
+        db.close();
+        parentPort.postMessage({ success: true, plaintextToken: result.plaintextToken });
+      } catch (err) {
+        db.close();
+        parentPort.postMessage({
+          success: false,
+          error: err instanceof Error ? err.message : String(err),
+          category: err && typeof err === 'object' && 'category' in err ? err.category : null,
+        });
+      }
     }
+  });
+  parentPort.postMessage('READY');
+} catch (initErr) {
+  if (db && db.open) {
+    db.close();
   }
-});
-parentPort.postMessage('READY');
+  parentPort.postMessage({
+    success: false,
+    error: initErr instanceof Error ? initErr.message : String(initErr),
+    category: 'INIT_ERROR',
+  });
+}
 `;
 
-    const workerData = { dbPath, authorizationId, projectRoot: process.cwd() };
-    const w1 = new Worker(workerCode, { eval: true, workerData });
-    const w2 = new Worker(workerCode, { eval: true, workerData });
+    interface SameAuthWorkerSuccess {
+      success: true;
+      plaintextToken: string;
+    }
+    interface SameAuthWorkerFailure {
+      success: false;
+      error: string;
+      category: string | null;
+    }
+    type SameAuthWorkerMessage = SameAuthWorkerSuccess | SameAuthWorkerFailure;
+
+    const workerData = { dbPath, authorizationId, runtimeDir };
+    const projectNodeModules = path.resolve(__dirname, '..', 'node_modules');
+    const w1 = new Worker(workerCode, { eval: true, workerData, env: { ...process.env, NODE_PATH: projectNodeModules } });
+    const w2 = new Worker(workerCode, { eval: true, workerData, env: { ...process.env, NODE_PATH: projectNodeModules } });
+
+    const createWorkerHarness = (w: Worker) => {
+      let isReadyResolved = false;
+      let readyResolve: () => void;
+      let readyReject: (err: Error) => void;
+      const readyPromise = new Promise<void>((resolve, reject) => {
+        readyResolve = resolve;
+        readyReject = reject;
+      });
+
+      let isResultResolved = false;
+      let resultResolve: (res: SameAuthWorkerMessage) => void;
+      let resultReject: (err: Error) => void;
+      const resultPromise = new Promise<SameAuthWorkerMessage>((resolve, reject) => {
+        resultResolve = resolve;
+        resultReject = reject;
+      });
+
+      const messageHandler = (msg: unknown) => {
+        if (msg === 'READY' && !isReadyResolved) {
+          isReadyResolved = true;
+          readyResolve();
+          return;
+        }
+        if (typeof msg === 'object' && msg !== null && 'success' in msg && !isResultResolved) {
+          isResultResolved = true;
+          resultResolve(msg as SameAuthWorkerMessage);
+        }
+      };
+
+      const errorHandler = (err: Error) => {
+        if (!isReadyResolved) {
+          isReadyResolved = true;
+          readyReject(err);
+        }
+        if (!isResultResolved) {
+          isResultResolved = true;
+          resultReject(err);
+        }
+      };
+
+      const exitHandler = (exitCode: number) => {
+        const exitErr = new Error(`Worker exited prematurely with code ${exitCode}`);
+        errorHandler(exitErr);
+      };
+
+      w.on('message', messageHandler);
+      w.on('error', errorHandler);
+      w.on('exit', exitHandler);
+
+      return {
+        readyPromise,
+        resultPromise,
+        cleanup: () => {
+          w.off('message', messageHandler);
+          w.off('error', errorHandler);
+          w.off('exit', exitHandler);
+        },
+      };
+    };
+
+    const h1 = createWorkerHarness(w1);
+    const h2 = createWorkerHarness(w2);
 
     try {
-      const waitReady = (w: Worker) =>
-        new Promise<void>((resolve) => {
-          const handler = (m: unknown) => {
-            if (m === 'READY') {
-              w.off('message', handler);
-              resolve();
-            }
-          };
-          w.on('message', handler);
-        });
+      // Assert both workers are ready before release
+      await Promise.all([h1.readyPromise, h2.readyPromise]);
 
-      // Assert both workers are concurrently running and ready before sending GO
-      await Promise.all([waitReady(w1), waitReady(w2)]);
-
-      const waitResult = (w: Worker) =>
-        new Promise<{ success: boolean; result?: { plaintextToken: string }; error?: string; category?: string }>((resolve) => {
-          w.once('message', resolve);
-        });
-
-      const p1 = waitResult(w1);
-      const p2 = waitResult(w2);
-
-      // Release both workers simultaneously
+      // Release both workers simultaneously with GO
       w1.postMessage('GO');
       w2.postMessage('GO');
 
-      const results = await Promise.all([p1, p2]);
-      const successful = results.filter((r) => r.success);
-      const failed = results.filter((r) => !r.success);
+      const results = await Promise.all([h1.resultPromise, h2.resultPromise]);
+      const successful = results.filter((r): r is SameAuthWorkerSuccess => r.success);
+      const failed = results.filter((r): r is SameAuthWorkerFailure => !r.success);
 
       expect(successful).toHaveLength(1);
       expect(failed).toHaveLength(1);
-      expect(successful[0].result?.plaintextToken).toMatch(/^[A-Za-z0-9_-]{43}$/);
+      expect(successful[0].plaintextToken).toMatch(/^[A-Za-z0-9_-]{43}$/);
       expect(failed[0].category).toBe('MCP_AUTHORITY_FENCED');
 
       const verifyDb = new Database(dbPath, { readonly: true });
@@ -1505,6 +1659,8 @@ parentPort.postMessage('READY');
         verifyDb.close();
       }
     } finally {
+      h1.cleanup();
+      h2.cleanup();
       await Promise.all([w1.terminate(), w2.terminate()]);
     }
   });
@@ -1557,25 +1713,39 @@ parentPort.postMessage('READY');
 
     try {
       // 4. Perform repeated authorized context reads via registered tool and registered resource
+      const { db: contextDb } = context.getOrCreateDatabase();
+      const initialTotalChanges = (contextDb.prepare('SELECT total_changes() as tc').get() as { tc: number }).tc;
+
       for (let i = 0; i < 3; i++) {
+        const tcBeforeTool = (contextDb.prepare('SELECT total_changes() as tc').get() as { tc: number }).tc;
         const toolRes = await client.callTool({
           name: GET_AUTHORIZED_CONTEXT_TOOL_NAME,
           arguments: {},
         });
+        const tcAfterTool = (contextDb.prepare('SELECT total_changes() as tc').get() as { tc: number }).tc;
+        expect(tcAfterTool - tcBeforeTool).toBe(0);
+
         expect(toolRes.isError).toBeFalsy();
         expect(toolRes.content).toHaveLength(1);
         const toolText = (toolRes.content[0] as { type: 'text'; text: string }).text;
         const parsedTool = JSON.parse(toolText);
         expect(parsedTool.schema_version).toBe(2);
 
+        const tcBeforeResource = (contextDb.prepare('SELECT total_changes() as tc').get() as { tc: number }).tc;
         const resourceRes = await client.readResource({
           uri: AUTHORIZED_CONTEXT_RESOURCE_URI,
         });
+        const tcAfterResource = (contextDb.prepare('SELECT total_changes() as tc').get() as { tc: number }).tc;
+        expect(tcAfterResource - tcBeforeResource).toBe(0);
+
         expect(resourceRes.contents).toHaveLength(1);
         const resText = (resourceRes.contents[0] as { text: string }).text;
         const parsedResource = JSON.parse(resText);
         expect(parsedResource.schema_version).toBe(2);
       }
+
+      const finalTotalChanges = (contextDb.prepare('SELECT total_changes() as tc').get() as { tc: number }).tc;
+      expect(finalTotalChanges - initialTotalChanges).toBe(0);
     } finally {
       await client.close();
       await server.close();
@@ -1630,7 +1800,7 @@ parentPort.postMessage('READY');
     expect(fs.existsSync(renamedPath)).toBe(false);
   });
 
-  it('67. Scrubbed diagnostics: seeded token, digest, and internal DB paths do not leak into stderr', () => {
+  it('67. Scrubbed diagnostics: seeded token, digest, and internal DB paths do not leak into stderr', async () => {
     const { db, dbPath: sensitiveDbPath } = createTestDatabase(tempDir, 'super_secret_corporate_path.db');
     const sensitiveToken = McpSessionAuthorityService.generateSessionToken();
     const sensitiveDigest = McpSessionAuthorityService.hashSessionToken(sensitiveToken);
@@ -1647,12 +1817,16 @@ parentPort.postMessage('READY');
     }) as typeof process.stderr.write;
 
     try {
-      // 1. Setup real graph with sensitive auth ID and mutate to force McpAuthorityError
+      // 1. Setup real graph with sensitive auth ID and seed secrets directly into the database graph
       const fixtures = setupFullGraph(db);
-      db.prepare("UPDATE execution_authorizations SET status = 'INVALIDATED' WHERE id = ?").run(fixtures.authorizationId);
-      db.close();
+      try {
+        db.prepare("UPDATE role_profiles SET display_name = ? WHERE id = ?").run(sensitiveProfileRef, fixtures.roleId);
+        db.prepare("UPDATE execution_authorizations SET status = 'INVALIDATED' WHERE id = ?").run(fixtures.authorizationId);
+      } finally {
+        db.close();
+      }
 
-      // 2. Trigger real CLI issue error with opened database
+      // 2. Trigger real CLI issue error with opened database (reaches failing sink with sensitiveProfileRef)
       const exit1 = runSessionAdmin(['issue', '--db', sensitiveDbPath, '--auth', fixtures.authorizationId]);
       expect(exit1).toBe(1);
 
@@ -1670,21 +1844,40 @@ parentPort.postMessage('READY');
         ctxToClose.close();
       }
 
-      // 5. Test formatPublicError directly on an error carrying raw message with secrets
-      const rawErrorWithSecrets = new McpAuthorityError(
-        'MCP_AUTHORITY_FENCED',
-        `Authority failed for ${sensitiveAuthId} token=${sensitiveToken} digest=${sensitiveDigest} path=${sensitiveDbPath} cred=${sensitiveCredentialRef} marker=${sensitiveSqliteMarker}`
-      );
-      const formatted = formatPublicError(rawErrorWithSecrets);
-      expect(formatted.text).toBe('[MCP_AUTHORITY_FENCED] Execution authority fenced');
-      expect(formatted.text).not.toContain(sensitiveToken);
-      expect(formatted.text).not.toContain(sensitiveDigest);
-      expect(formatted.text).not.toContain(sensitiveDbPath);
-      expect(formatted.text).not.toContain(sensitiveAuthId);
-      expect(formatted.text).not.toContain(sensitiveCredentialRef);
-      expect(formatted.text).not.toContain(sensitiveSqliteMarker);
+      // 5. Test real MCP server tool and resource sinks with the failing context
+      const toolContext = new McpAuthorityContext({ dbPath: sensitiveDbPath, sessionToken: sensitiveToken });
+      const server = buildAgentForgeMcpServer({ authorityContext: toolContext });
+      const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+      await server.connect(serverTransport);
+      const client = new Client({ name: 'test-scrub-client', version: '1.0.0' });
+      await client.connect(clientTransport);
 
-      // 6. Assert none of the sensitive values leaked into stderr
+      try {
+        const toolResult = await client.callTool({
+          name: GET_AUTHORIZED_CONTEXT_TOOL_NAME,
+          arguments: {},
+        });
+        expect(toolResult.isError).toBe(true);
+        const toolText = (toolResult.content[0] as { type: 'text'; text: string }).text;
+        expect(toolText).toBe('[MCP_SESSION_UNAUTHORIZED] Session authentication failed');
+        expect(toolText).not.toContain(sensitiveToken);
+        expect(toolText).not.toContain(sensitiveDigest);
+        expect(toolText).not.toContain(sensitiveDbPath);
+        expect(toolText).not.toContain(sensitiveAuthId);
+        expect(toolText).not.toContain(sensitiveCredentialRef);
+        expect(toolText).not.toContain(sensitiveProfileRef);
+        expect(toolText).not.toContain(sensitiveSqliteMarker);
+
+        await expect(
+          client.readResource({ uri: AUTHORIZED_CONTEXT_RESOURCE_URI })
+        ).rejects.toThrow();
+      } finally {
+        await client.close();
+        await server.close();
+        toolContext.close();
+      }
+
+      // 6. Assert none of the sensitive values leaked into stderr across all sinks
       expect(capturedStderr).not.toContain(sensitiveToken);
       expect(capturedStderr).not.toContain(sensitiveDigest);
       expect(capturedStderr).not.toContain(sensitiveDbPath);
@@ -1979,10 +2172,10 @@ parentPort.postMessage('READY');
 
     const originalClose = Database.prototype.close;
     let closeAttempts = 0;
-    let openedInstance: any = null;
+    const openedRef: { current: { open?: boolean; close: () => void } | null } = { current: null };
     try {
-      Database.prototype.close = function (...args) {
-        openedInstance = this;
+      Database.prototype.close = function (this: Database.Database) {
+        openedRef.current = this;
         closeAttempts++;
         throw new Error('Forced native close error: secret_path_leak_fail');
       };
@@ -1995,12 +2188,8 @@ parentPort.postMessage('READY');
       expect(capturedStderr).not.toContain('Forced native close error');
     } finally {
       Database.prototype.close = originalClose;
-      if (openedInstance && openedInstance.open) {
-        try {
-          openedInstance.close();
-        } catch {
-          // ignore
-        }
+      if (openedRef.current && openedRef.current.open) {
+        openedRef.current.close();
       }
       process.stderr.write = originalStderr;
     }
@@ -2020,33 +2209,64 @@ parentPort.postMessage('READY');
       db.close();
     }
 
-    // Readonly context
-    const ctx = new McpAuthorityContext({ dbPath, sessionToken: token });
-    const { db: openedDb } = ctx.getOrCreateDatabase();
+    // Path A: Service succeeds, but total_changes detects a mutation delta (simulated via statement spy)
+    const ctxSuccess = new McpAuthorityContext({ dbPath, sessionToken: token });
+    const { db: openedDbSuccess } = ctxSuccess.getOrCreateDatabase();
     try {
-      // Spy on total_changes query by wrapping prepare
-      const origPrepare = openedDb.prepare.bind(openedDb);
-      let totalChangesCallCount = 0;
-      (openedDb as any).prepare = function (sql: string) {
+      const origPrepare = openedDbSuccess.prepare.bind(openedDbSuccess);
+      let totalChangesCallsSuccess = 0;
+      openedDbSuccess.prepare = function (this: Database.Database, sql: string) {
         const stmt = origPrepare(sql);
         if (sql.includes('total_changes()')) {
           const origGet = stmt.get.bind(stmt);
-          stmt.get = function (...args: any[]) {
-            totalChangesCallCount++;
-            // On the second call (after resolution), inject a simulated mutation delta
-            if (totalChangesCallCount === 2) {
+          stmt.get = function (this: Database.Statement, ...args: unknown[]) {
+            totalChangesCallsSuccess++;
+            if (totalChangesCallsSuccess === 2) {
               return { total_changes: 1 };
             }
             return origGet(...args);
-          };
+          } as typeof stmt.get;
         }
         return stmt;
-      };
+      } as typeof openedDbSuccess.prepare;
 
-      expect(() => ctx.resolveAuthorizedContext()).toThrowError(/MCP_AUTHORITY_FENCED/);
-      expect(totalChangesCallCount).toBe(2);
+      expect(() => ctxSuccess.resolveAuthorizedContext()).toThrowError(/MCP_AUTHORITY_FENCED/);
+      expect(totalChangesCallsSuccess).toBe(2);
     } finally {
-      ctx.close();
+      ctxSuccess.close();
+    }
+
+    // Path B: Service throws an error, but total_changes guard still runs and reads post-call count
+    // Invalidate the session in database so service throws
+    const alterDb = new Database(dbPath);
+    try {
+      alterDb.prepare('UPDATE mcp_client_sessions SET revoked_at = ?').run(new Date(Date.now() + 1000).toISOString());
+    } finally {
+      alterDb.close();
+    }
+
+    const ctxThrow = new McpAuthorityContext({ dbPath, sessionToken: token });
+    const { db: openedDbThrow } = ctxThrow.getOrCreateDatabase();
+    try {
+      const origPrepare = openedDbThrow.prepare.bind(openedDbThrow);
+      let totalChangesCallsThrow = 0;
+      openedDbThrow.prepare = function (this: Database.Database, sql: string) {
+        const stmt = origPrepare(sql);
+        if (sql.includes('total_changes()')) {
+          const origGet = stmt.get.bind(stmt);
+          stmt.get = function (this: Database.Statement, ...args: unknown[]) {
+            totalChangesCallsThrow++;
+            return origGet(...args);
+          } as typeof stmt.get;
+        }
+        return stmt;
+      } as typeof openedDbThrow.prepare;
+
+      expect(() => ctxThrow.resolveAuthorizedContext()).toThrowError(/MCP_SESSION_UNAUTHORIZED/);
+      // Confirms guard ran in finally/post-call block even when service threw
+      expect(totalChangesCallsThrow).toBe(2);
+    } finally {
+      ctxThrow.close();
     }
   });
 
@@ -2654,12 +2874,20 @@ parentPort.postMessage('READY');
     openedDb2.close = function () {
       throw new Error('EPERM: persistent file lock');
     };
-    try {
-      expect(() => ctx2.close()).toThrowError(/MCP_CLEANUP_FAILED/);
-    } finally {
-      openedDb2.close = origClose2;
-      ctx2.close();
-    }
+
+    expect(() => ctx2.close()).toThrowError(/MCP_CLEANUP_FAILED/);
+    expect(openedDb2.open).toBe(true);
+
+    // After restoring close behavior, a later context close succeeds
+    openedDb2.close = origClose2;
+    expect(() => ctx2.close()).not.toThrow();
+
+    // Database can be renamed and deleted immediately on Windows
+    const renamedPath = path.join(tempDir, 'bounded_close_retry_renamed.db');
+    fs.renameSync(dbPath, renamedPath);
+    expect(fs.existsSync(renamedPath)).toBe(true);
+    fs.unlinkSync(renamedPath);
+    expect(fs.existsSync(renamedPath)).toBe(false);
   });
 
   it('108. Stdio server handle.close() and listener cleanup handles context close cleanly', async () => {
@@ -2708,27 +2936,120 @@ parentPort.postMessage('READY');
     }
   });
 
-  it('110. Comprehensive secret exclusion across public sinks: verifies admin, context, tool, and resource sinks', () => {
+  it('110. Comprehensive secret exclusion across public sinks: verifies admin, context, tool, and resource sinks', async () => {
+    const { db, dbPath: sensitivePath } = createTestDatabase(tempDir, 'secret_classified_db.db');
     const sensitiveToken = McpSessionAuthorityService.generateSessionToken();
     const sensitiveDigest = McpSessionAuthorityService.hashSessionToken(sensitiveToken);
-    const sensitivePath = path.join(tempDir, 'secret_classified_db.db');
     const sensitiveAuth = 'auth-super-classified-id';
     const sensitiveCred = 'cred-super-secret-key';
+    const sensitiveProfileRef = 'profile-confidential-classified';
     const sensitiveMarker = 'SQLITE_CONSTRAINT_CHECK_MARKER';
 
-    const err = new McpAuthorityError(
-      'MCP_AUTHORITY_FENCED',
-      `Internal detail: auth=${sensitiveAuth} token=${sensitiveToken} hash=${sensitiveDigest} path=${sensitivePath} cred=${sensitiveCred} marker=${sensitiveMarker}`
-    );
+    let capturedStderr = '';
+    const origStderr = process.stderr.write;
+    process.stderr.write = ((chunk: unknown) => {
+      capturedStderr += String(chunk);
+      return true;
+    }) as typeof process.stderr.write;
 
-    const publicError = formatPublicError(err);
-    expect(publicError.text).toBe('[MCP_AUTHORITY_FENCED] Execution authority fenced');
-    expect(publicError.text).not.toContain(sensitiveToken);
-    expect(publicError.text).not.toContain(sensitiveDigest);
-    expect(publicError.text).not.toContain(sensitivePath);
-    expect(publicError.text).not.toContain(sensitiveAuth);
-    expect(publicError.text).not.toContain(sensitiveCred);
-    expect(publicError.text).not.toContain(sensitiveMarker);
+    try {
+      // 1. Seed secrets into database graph so they are present on internal paths
+      const fixtures = setupFullGraph(db);
+      try {
+        db.prepare("UPDATE role_profiles SET display_name = ? WHERE id = ?").run(sensitiveProfileRef, fixtures.roleId);
+        db.prepare("UPDATE execution_authorizations SET status = 'INVALIDATED', adapter_error_json = ? WHERE id = ?")
+          .run(JSON.stringify({ error: `failed: cred=${sensitiveCred} marker=${sensitiveMarker}` }), fixtures.authorizationId);
+      } finally {
+        db.close();
+      }
+
+      // 2. Admin issue sink: fails closed, excludes secrets from stdout and stderr
+      let adminStdout = '';
+      const origStdout = process.stdout.write;
+      process.stdout.write = ((chunk: unknown) => { adminStdout += String(chunk); return true; }) as typeof process.stdout.write;
+      try {
+        const exitIssue = runSessionAdmin(['issue', '--db', sensitivePath, '--auth', fixtures.authorizationId]);
+        expect(exitIssue).toBe(1);
+
+        const exitRevoke = runSessionAdmin(['revoke', '--db', sensitivePath, '--session', sensitiveToken]);
+        expect(exitRevoke).toBe(0);
+
+        const exitRevokeInvalid = runSessionAdmin(['revoke', '--db', sensitivePath, '--session', '   ']);
+        expect(exitRevokeInvalid).toBe(1);
+      } finally {
+        process.stdout.write = origStdout;
+      }
+      expect(adminStdout).not.toContain(sensitiveToken);
+      expect(adminStdout).not.toContain(sensitiveDigest);
+      expect(adminStdout).not.toContain(sensitivePath);
+      expect(adminStdout).not.toContain(sensitiveCred);
+      expect(adminStdout).not.toContain(sensitiveProfileRef);
+      expect(adminStdout).not.toContain(sensitiveMarker);
+
+      // 3. Context resolution sink: throws McpAuthorityError, excludes secrets from public error
+      const ctx = new McpAuthorityContext({ dbPath: sensitivePath, sessionToken: sensitiveToken });
+      try {
+        expect(() => ctx.resolveAuthorizedContext()).toThrow();
+      } finally {
+        ctx.close();
+      }
+
+      // 4. MCP Server Tool and Resource sinks: execute via MCP protocol and assert sanitized errors
+      const toolContext = new McpAuthorityContext({ dbPath: sensitivePath, sessionToken: sensitiveToken });
+      const server = buildAgentForgeMcpServer({ authorityContext: toolContext });
+      const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+      await server.connect(serverTransport);
+      const client = new Client({ name: 'test-sink-client', version: '1.0.0' });
+      await client.connect(clientTransport);
+
+      try {
+        const toolRes = await client.callTool({
+          name: GET_AUTHORIZED_CONTEXT_TOOL_NAME,
+          arguments: {},
+        });
+        expect(toolRes.isError).toBe(true);
+        const toolErrText = (toolRes.content[0] as { type: 'text'; text: string }).text;
+        expect(toolErrText).toBe('[MCP_SESSION_UNAUTHORIZED] Session authentication failed');
+        expect(toolErrText).not.toContain(sensitiveToken);
+        expect(toolErrText).not.toContain(sensitiveDigest);
+        expect(toolErrText).not.toContain(sensitivePath);
+        expect(toolErrText).not.toContain(sensitiveAuth);
+        expect(toolErrText).not.toContain(sensitiveCred);
+        expect(toolErrText).not.toContain(sensitiveProfileRef);
+        expect(toolErrText).not.toContain(sensitiveMarker);
+
+        await expect(client.readResource({ uri: AUTHORIZED_CONTEXT_RESOURCE_URI })).rejects.toThrow();
+      } finally {
+        await client.close();
+        await server.close();
+        toolContext.close();
+      }
+
+      // 5. Stdio transport error formatting
+      const internalErr = new McpAuthorityError(
+        'MCP_AUTHORITY_FENCED',
+        `Internal error: auth=${sensitiveAuth} token=${sensitiveToken} hash=${sensitiveDigest} path=${sensitivePath} cred=${sensitiveCred} prof=${sensitiveProfileRef} marker=${sensitiveMarker}`
+      );
+      const pubErr = formatPublicError(internalErr);
+      expect(pubErr.text).toBe('[MCP_AUTHORITY_FENCED] Execution authority fenced');
+      expect(pubErr.text).not.toContain(sensitiveToken);
+      expect(pubErr.text).not.toContain(sensitiveDigest);
+      expect(pubErr.text).not.toContain(sensitivePath);
+      expect(pubErr.text).not.toContain(sensitiveAuth);
+      expect(pubErr.text).not.toContain(sensitiveCred);
+      expect(pubErr.text).not.toContain(sensitiveProfileRef);
+      expect(pubErr.text).not.toContain(sensitiveMarker);
+
+      // 6. Assert captured stderr excludes all sensitive secrets
+      expect(capturedStderr).not.toContain(sensitiveToken);
+      expect(capturedStderr).not.toContain(sensitiveDigest);
+      expect(capturedStderr).not.toContain(sensitivePath);
+      expect(capturedStderr).not.toContain(sensitiveCred);
+      expect(capturedStderr).not.toContain(sensitiveProfileRef);
+      expect(capturedStderr).not.toContain(sensitiveMarker);
+    } finally {
+      process.stderr.write = origStderr;
+    }
   });
 
   it('111. Compiled stdio child process integration: starts with valid DB, responds to tools/resources, and shuts down cleanly via EOF with database lock release', async () => {
@@ -2741,87 +3062,310 @@ parentPort.postMessage('READY');
       db.close();
     }
 
-    const stdioScript = path.resolve(__dirname, '../dist-electron/mcp/stdio.js');
+    const runtimeDir = getOrMaterializeTestRuntime();
+    const stdioScript = path.resolve(runtimeDir, 'mcp', 'stdio.js');
     expect(fs.existsSync(stdioScript)).toBe(true);
 
-    const transport = new StdioClientTransport({
-      command: process.execPath,
-      args: [stdioScript],
-      env: {
-        ...process.env,
-        AGENTFORGE_MCP_DB_PATH: dbPath,
-        AGENTFORGE_MCP_SESSION_TOKEN: token,
-      },
-    });
-
-    const client = new Client({ name: 'test-stdio-client', version: '1.0.0' });
-    await client.connect(transport);
-
-    try {
-      // 1. Tool call
-      const toolRes = await client.callTool({
-        name: GET_AUTHORIZED_CONTEXT_TOOL_NAME,
-        arguments: {},
-      });
-      expect(toolRes.isError).toBeFalsy();
-      const parsedTool = JSON.parse((toolRes.content[0] as { type: 'text'; text: string }).text);
-      expect(parsedTool.schema_version).toBe(2);
-
-      // 2. Resource read
-      const resourceRes = await client.readResource({
-        uri: AUTHORIZED_CONTEXT_RESOURCE_URI,
-      });
-      expect(resourceRes.contents).toHaveLength(1);
-      const parsedRes = JSON.parse((resourceRes.contents[0] as { text: string }).text);
-      expect(parsedRes.schema_version).toBe(2);
-    } finally {
-      await client.close();
-    }
-
-    // Verify database file lock is released and file can be renamed and deleted
-    const renamed = path.join(tempDir, 'compiled_stdio_eof_renamed.db');
-    fs.renameSync(dbPath, renamed);
-    expect(fs.existsSync(renamed)).toBe(true);
-    fs.unlinkSync(renamed);
-    expect(fs.existsSync(renamed)).toBe(false);
-  });
-
-  it('112. Compiled stdio child process termination via signal exits cleanly with database lock release', async () => {
-    const { db, dbPath } = createTestDatabase(tempDir, 'compiled_stdio_sig.db');
-    let token = '';
-    try {
-      const fixtures = setupFullGraph(db);
-      token = fixtures.service.issueSession({ authorizationId: fixtures.authorizationId }).plaintextToken;
-    } finally {
-      db.close();
-    }
-
-    const stdioScript = path.resolve(__dirname, '../dist-electron/mcp/stdio.js');
+    const projectNodeModules = path.resolve(__dirname, '..', 'node_modules');
     const child = spawn(process.execPath, [stdioScript], {
       env: {
         ...process.env,
+        NODE_PATH: projectNodeModules,
         AGENTFORGE_MCP_DB_PATH: dbPath,
         AGENTFORGE_MCP_SESSION_TOKEN: token,
       },
       stdio: ['pipe', 'pipe', 'pipe'],
     });
 
-    // Wait for child to initialize
-    await new Promise((resolve) => setTimeout(resolve, 500));
-
-    // Send SIGTERM
-    child.kill('SIGTERM');
-
-    await new Promise<void>((resolve) => {
-      child.on('exit', () => resolve());
+    const stdoutLines: string[] = [];
+    let stdoutBuffer = '';
+    child.stdout.on('data', (chunk) => {
+      stdoutBuffer += chunk.toString();
+      let newlineIdx = stdoutBuffer.indexOf('\n');
+      while (newlineIdx !== -1) {
+        const line = stdoutBuffer.slice(0, newlineIdx).trim();
+        stdoutBuffer = stdoutBuffer.slice(newlineIdx + 1);
+        if (line) {
+          stdoutLines.push(line);
+        }
+        newlineIdx = stdoutBuffer.indexOf('\n');
+      }
     });
 
-    // File lock is released and can be renamed/deleted
-    const renamed = path.join(tempDir, 'compiled_stdio_sig_renamed.db');
-    fs.renameSync(dbPath, renamed);
-    expect(fs.existsSync(renamed)).toBe(true);
-    fs.unlinkSync(renamed);
-    expect(fs.existsSync(renamed)).toBe(false);
+    const waitForLine = (predicate: (data: unknown) => boolean, timeoutMs = 8000): Promise<unknown> => {
+      const start = Date.now();
+      return new Promise((resolve, reject) => {
+        const check = () => {
+          for (const line of stdoutLines) {
+            try {
+              const parsed = JSON.parse(line);
+              if (predicate(parsed)) {
+                return resolve(parsed);
+              }
+            } catch {
+              // non-json
+            }
+          }
+          if (Date.now() - start > timeoutMs) {
+            reject(new Error(`Timeout waiting for JSON-RPC line matching predicate. Received lines: ${stdoutLines.join(' | ')}`));
+          } else {
+            setTimeout(check, 50);
+          }
+        };
+        check();
+      });
+    };
+
+    try {
+      // 1. Send initialize
+      const initReq = JSON.stringify({
+        jsonrpc: '2.0',
+        id: 1,
+        method: 'initialize',
+        params: {
+          protocolVersion: '2024-11-05',
+          capabilities: {},
+          clientInfo: { name: 'test-stdio-client', version: '1.0.0' },
+        },
+      });
+      child.stdin.write(initReq + '\n');
+
+      const initRes = (await waitForLine((d: unknown) => typeof d === 'object' && d !== null && (d as { id?: number }).id === 1)) as {
+        result?: { serverInfo?: { name: string } };
+      };
+      expect(initRes.result?.serverInfo?.name).toBe('agentforge');
+
+      // Send initialized notification
+      const initializedNotification = JSON.stringify({
+        jsonrpc: '2.0',
+        method: 'notifications/initialized',
+      });
+      child.stdin.write(initializedNotification + '\n');
+
+      // 2. Call tool get_authorized_context
+      const toolReq = JSON.stringify({
+        jsonrpc: '2.0',
+        id: 2,
+        method: 'tools/call',
+        params: {
+          name: GET_AUTHORIZED_CONTEXT_TOOL_NAME,
+          arguments: {},
+        },
+      });
+      child.stdin.write(toolReq + '\n');
+
+      const toolRes = (await waitForLine((d: unknown) => typeof d === 'object' && d !== null && (d as { id?: number }).id === 2)) as {
+        result?: { content?: Array<{ type: string; text: string }>; isError?: boolean };
+      };
+      expect(toolRes.result?.isError).toBeFalsy();
+      const parsedToolContent = JSON.parse(toolRes.result?.content?.[0]?.text ?? '{}');
+      expect(parsedToolContent.schema_version).toBe(2);
+
+      // 3. Read resource agentforge://context/authorized
+      const resourceReq = JSON.stringify({
+        jsonrpc: '2.0',
+        id: 3,
+        method: 'resources/read',
+        params: {
+          uri: AUTHORIZED_CONTEXT_RESOURCE_URI,
+        },
+      });
+      child.stdin.write(resourceReq + '\n');
+
+      const resourceRes = (await waitForLine((d: unknown) => typeof d === 'object' && d !== null && (d as { id?: number }).id === 3)) as {
+        result?: { contents?: Array<{ uri: string; text: string }> };
+      };
+      expect(resourceRes.result?.contents).toHaveLength(1);
+      const parsedResContent = JSON.parse(resourceRes.result?.contents?.[0]?.text ?? '{}');
+      expect(parsedResContent.schema_version).toBe(2);
+
+      // 4. Close stdin (EOF) and wait for child exit
+      const exitPromise = new Promise<{ code: number | null; signal: NodeJS.Signals | null }>((resolve) => {
+        child.on('exit', (code, signal) => resolve({ code, signal }));
+      });
+      child.stdin.end();
+
+      const exitResult = await Promise.race([
+        exitPromise,
+        new Promise<never>((_, reject) => setTimeout(() => reject(new Error('Child exit timed out after EOF')), 8000)),
+      ]);
+      expect(exitResult.code).toBe(0);
+
+      // 5. Verify stdout protocol purity: every line in stdout MUST be valid JSON-RPC
+      expect(stdoutLines.length).toBeGreaterThanOrEqual(3);
+      for (const line of stdoutLines) {
+        expect(() => {
+          const p = JSON.parse(line);
+          expect(p.jsonrpc).toBe('2.0');
+        }).not.toThrow();
+      }
+
+      // 6. Verify database file lock is released: rename and delete immediately on Windows
+      const renamed = path.join(tempDir, 'compiled_stdio_eof_renamed.db');
+      fs.renameSync(dbPath, renamed);
+      expect(fs.existsSync(renamed)).toBe(true);
+      fs.unlinkSync(renamed);
+      expect(fs.existsSync(renamed)).toBe(false);
+    } finally {
+      if (child.exitCode === null && child.signalCode === null) {
+        child.kill('SIGKILL');
+      }
+    }
+  });
+
+  it('112. Compiled stdio child process termination via signal exits cleanly with database lock release', async () => {
+    const testSignalTermination = async (signal: 'SIGINT' | 'SIGTERM', dbName: string) => {
+      const { db, dbPath } = createTestDatabase(tempDir, dbName);
+      let token = '';
+      try {
+        const fixtures = setupFullGraph(db);
+        token = fixtures.service.issueSession({ authorizationId: fixtures.authorizationId }).plaintextToken;
+      } finally {
+        db.close();
+      }
+
+      const runtimeDir = getOrMaterializeTestRuntime();
+      const stdioScript = path.resolve(runtimeDir, 'mcp', 'stdio.js');
+
+      const projectNodeModules = path.resolve(__dirname, '..', 'node_modules');
+      const child = spawn(process.execPath, [stdioScript], {
+        env: {
+          ...process.env,
+          NODE_PATH: projectNodeModules,
+          AGENTFORGE_MCP_DB_PATH: dbPath,
+          AGENTFORGE_MCP_SESSION_TOKEN: token,
+        },
+        stdio: ['pipe', 'pipe', 'pipe'],
+      });
+
+      let stderrOutput = '';
+      child.stderr.on('data', (chunk) => {
+        stderrOutput += chunk.toString();
+      });
+
+      const stdoutLines: string[] = [];
+      let stdoutBuffer = '';
+      child.stdout.on('data', (chunk) => {
+        stdoutBuffer += chunk.toString();
+        let newlineIdx = stdoutBuffer.indexOf('\n');
+        while (newlineIdx !== -1) {
+          const line = stdoutBuffer.slice(0, newlineIdx).trim();
+          stdoutBuffer = stdoutBuffer.slice(newlineIdx + 1);
+          if (line) {
+            stdoutLines.push(line);
+          }
+          newlineIdx = stdoutBuffer.indexOf('\n');
+        }
+      });
+
+      const waitForLine = (predicate: (data: unknown) => boolean, timeoutMs = 8000): Promise<unknown> => {
+        const start = Date.now();
+        return new Promise((resolve, reject) => {
+          const check = () => {
+            for (const line of stdoutLines) {
+              try {
+                const parsed = JSON.parse(line);
+                if (predicate(parsed)) {
+                  return resolve(parsed);
+                }
+              } catch {
+                // non-json
+              }
+            }
+            if (Date.now() - start > timeoutMs) {
+              reject(new Error(`Timeout waiting for JSON-RPC line. Lines: ${stdoutLines.join(' | ')}`));
+            } else {
+              setTimeout(check, 50);
+            }
+          };
+          check();
+        });
+      };
+
+      try {
+        // 1. Initialize
+        child.stdin.write(
+          JSON.stringify({
+            jsonrpc: '2.0',
+            id: 1,
+            method: 'initialize',
+            params: {
+              protocolVersion: '2024-11-05',
+              capabilities: {},
+              clientInfo: { name: 'test-stdio-client', version: '1.0.0' },
+            },
+          }) + '\n'
+        );
+        await waitForLine((d: unknown) => typeof d === 'object' && d !== null && (d as { id?: number }).id === 1);
+
+        child.stdin.write(JSON.stringify({ jsonrpc: '2.0', method: 'notifications/initialized' }) + '\n');
+
+        // 2. Tool call get_authorized_context
+        child.stdin.write(
+          JSON.stringify({
+            jsonrpc: '2.0',
+            id: 2,
+            method: 'tools/call',
+            params: { name: GET_AUTHORIZED_CONTEXT_TOOL_NAME, arguments: {} },
+          }) + '\n'
+        );
+        const toolRes = (await waitForLine((d: unknown) => typeof d === 'object' && d !== null && (d as { id?: number }).id === 2)) as {
+          result?: { content?: Array<{ type: string; text: string }>; isError?: boolean };
+        };
+        expect(toolRes.result?.isError).toBeFalsy();
+
+        // 3. Resource read agentforge://context/authorized
+        child.stdin.write(
+          JSON.stringify({
+            jsonrpc: '2.0',
+            id: 3,
+            method: 'resources/read',
+            params: { uri: AUTHORIZED_CONTEXT_RESOURCE_URI },
+          }) + '\n'
+        );
+        const resRes = (await waitForLine((d: unknown) => typeof d === 'object' && d !== null && (d as { id?: number }).id === 3)) as {
+          result?: { contents?: Array<{ uri: string; text: string }> };
+        };
+        expect(resRes.result?.contents).toHaveLength(1);
+
+        // 4. Send signal to child process
+        const exitPromise = new Promise<{ code: number | null; signal: NodeJS.Signals | null }>((resolve) => {
+          child.on('exit', (code, signal) => resolve({ code, signal }));
+        });
+
+        child.kill(signal);
+
+        const exitResult = await Promise.race([
+          exitPromise,
+          new Promise<never>((_, reject) => setTimeout(() => reject(new Error(`Child exit timed out after ${signal}`)), 8000)),
+        ]);
+
+        if (exitResult.code !== null) {
+          expect(exitResult.code).toBe(0);
+        } else {
+          expect(exitResult.signal).toBe(signal);
+        }
+
+        // Assert stderr contains no sensitive secrets or unexpected errors
+        expect(stderrOutput).not.toContain(token);
+        expect(stderrOutput).not.toContain(dbPath);
+        expect(stderrOutput).not.toContain('MCP_FATAL_ERROR');
+
+        // Assert database file lock released and can be renamed and deleted
+        const renamed = path.join(tempDir, `${dbName}_renamed.db`);
+        fs.renameSync(dbPath, renamed);
+        expect(fs.existsSync(renamed)).toBe(true);
+        fs.unlinkSync(renamed);
+        expect(fs.existsSync(renamed)).toBe(false);
+      } finally {
+        if (child.exitCode === null && child.signalCode === null) {
+          child.kill('SIGKILL');
+        }
+      }
+    };
+
+    await testSignalTermination('SIGINT', 'compiled_stdio_sigint.db');
+    await testSignalTermination('SIGTERM', 'compiled_stdio_sigterm.db');
   });
 
   it('113. Concurrent issuance with distinct non-overlapping authorizations: both workers succeed with unique sessions', async () => {
@@ -3004,45 +3548,146 @@ parentPort.postMessage('READY');
       db.close();
     }
 
-    const workerScript = `
-      const { parentPort, workerData } = require('worker_threads');
-      const Database = require('better-sqlite3');
-      const { Repository } = require('./dist-electron/core/database/repositories');
-      const { McpSessionAuthorityService } = require('./dist-electron/core/services/McpSessionAuthorityService');
+    const runtimeDir = getOrMaterializeTestRuntime();
 
+    const workerScript = `
+      const { parentPort, workerData } = require('node:worker_threads');
+      const path = require('node:path');
+      const Database = require('better-sqlite3');
+      const { Repository } = require(path.join(workerData.runtimeDir, 'core/database/repositories.js'));
+      const { McpSessionAuthorityService } = require(path.join(workerData.runtimeDir, 'core/services/McpSessionAuthorityService.js'));
+
+      let db;
       try {
-        const db = new Database(workerData.dbPath);
+        db = new Database(workerData.dbPath);
         db.pragma('foreign_keys = ON');
         const repo = new Repository(db);
         const service = new McpSessionAuthorityService(repo, db);
-        const result = service.issueSession({ authorizationId: workerData.authId });
-        db.close();
-        parentPort.postMessage({ success: true, token: result.plaintextToken });
-      } catch (err) {
-        parentPort.postMessage({ success: false, error: err.message });
+
+        parentPort.on('message', (msg) => {
+          if (msg === 'GO') {
+            try {
+              const result = service.issueSession({ authorizationId: workerData.authId });
+              db.close();
+              parentPort.postMessage({ success: true, token: result.plaintextToken });
+            } catch (err) {
+              db.close();
+              parentPort.postMessage({ success: false, error: err instanceof Error ? err.message : String(err) });
+            }
+          }
+        });
+        parentPort.postMessage('READY');
+      } catch (initErr) {
+        if (db && db.open) {
+          db.close();
+        }
+        parentPort.postMessage({ success: false, error: initErr instanceof Error ? initErr.message : String(initErr) });
       }
     `;
 
-    const w1 = new Worker(workerScript, { eval: true, workerData: { dbPath, authId: authId1 } });
-    const w2 = new Worker(workerScript, { eval: true, workerData: { dbPath, authId: authId2 } });
+    interface DistinctWorkerSuccess {
+      success: true;
+      token: string;
+    }
+    interface DistinctWorkerFailure {
+      success: false;
+      error: string;
+    }
+    type DistinctWorkerMessage = DistinctWorkerSuccess | DistinctWorkerFailure;
 
-    const [r1, r2] = await Promise.all([
-      new Promise<any>((res) => w1.once('message', res)),
-      new Promise<any>((res) => w2.once('message', res)),
-    ]);
+    const workerData1 = { dbPath, authId: authId1, runtimeDir };
+    const workerData2 = { dbPath, authId: authId2, runtimeDir };
+    const projectNodeModules = path.resolve(__dirname, '..', 'node_modules');
+    const w1 = new Worker(workerScript, { eval: true, workerData: workerData1, env: { ...process.env, NODE_PATH: projectNodeModules } });
+    const w2 = new Worker(workerScript, { eval: true, workerData: workerData2, env: { ...process.env, NODE_PATH: projectNodeModules } });
 
-    await Promise.all([w1.terminate(), w2.terminate()]);
+    const createDistinctWorkerHarness = (w: Worker) => {
+      let isReadyResolved = false;
+      let readyResolve: () => void;
+      let readyReject: (err: Error) => void;
+      const readyPromise = new Promise<void>((resolve, reject) => {
+        readyResolve = resolve;
+        readyReject = reject;
+      });
 
-    expect(r1.success).toBe(true);
-    expect(r2.success).toBe(true);
-    expect(r1.token).not.toBe(r2.token);
+      let isResultResolved = false;
+      let resultResolve: (res: DistinctWorkerMessage) => void;
+      let resultReject: (err: Error) => void;
+      const resultPromise = new Promise<DistinctWorkerMessage>((resolve, reject) => {
+        resultResolve = resolve;
+        resultReject = reject;
+      });
 
-    const checkDb = new Database(dbPath, { readonly: true });
+      const messageHandler = (msg: unknown) => {
+        if (msg === 'READY' && !isReadyResolved) {
+          isReadyResolved = true;
+          readyResolve();
+          return;
+        }
+        if (typeof msg === 'object' && msg !== null && 'success' in msg && !isResultResolved) {
+          isResultResolved = true;
+          resultResolve(msg as DistinctWorkerMessage);
+        }
+      };
+
+      const errorHandler = (err: Error) => {
+        if (!isReadyResolved) {
+          isReadyResolved = true;
+          readyReject(err);
+        }
+        if (!isResultResolved) {
+          isResultResolved = true;
+          resultReject(err);
+        }
+      };
+
+      const exitHandler = (exitCode: number) => {
+        errorHandler(new Error(`Worker exited with code ${exitCode}`));
+      };
+
+      w.on('message', messageHandler);
+      w.on('error', errorHandler);
+      w.on('exit', exitHandler);
+
+      return {
+        readyPromise,
+        resultPromise,
+        cleanup: () => {
+          w.off('message', messageHandler);
+          w.off('error', errorHandler);
+          w.off('exit', exitHandler);
+        },
+      };
+    };
+
+    const h1 = createDistinctWorkerHarness(w1);
+    const h2 = createDistinctWorkerHarness(w2);
+
     try {
-      const activeCount = checkDb.prepare('SELECT COUNT(*) as cnt FROM mcp_client_sessions WHERE revoked_at IS NULL').get() as { cnt: number };
-      expect(activeCount.cnt).toBe(2);
+      await Promise.all([h1.readyPromise, h2.readyPromise]);
+
+      w1.postMessage('GO');
+      w2.postMessage('GO');
+
+      const [r1, r2] = await Promise.all([h1.resultPromise, h2.resultPromise]);
+
+      expect(r1.success).toBe(true);
+      expect(r2.success).toBe(true);
+      if (r1.success && r2.success) {
+        expect(r1.token).not.toBe(r2.token);
+      }
+
+      const checkDb = new Database(dbPath, { readonly: true });
+      try {
+        const activeCount = checkDb.prepare('SELECT COUNT(*) as cnt FROM mcp_client_sessions WHERE revoked_at IS NULL').get() as { cnt: number };
+        expect(activeCount.cnt).toBe(2);
+      } finally {
+        checkDb.close();
+      }
     } finally {
-      checkDb.close();
+      h1.cleanup();
+      h2.cleanup();
+      await Promise.all([w1.terminate(), w2.terminate()]);
     }
   });
 
@@ -3107,6 +3752,310 @@ parentPort.postMessage('READY');
       }).toThrowError(/MCP_CONFIGURATION_INVALID/);
     } finally {
       readDb.close();
+    }
+  });
+
+  it('116. Exact index set authority rejects autoindex origin-u, extra user indexes, and non-id or composite primary keys', () => {
+    const { db } = createTestDatabase(tempDir, 'exact_index_set.db');
+    try {
+      // 1. Initially valid
+      expect(() => verifyMigration21SchemaAuthority(db)).not.toThrow();
+
+      // 2. Extra user index rejected
+      db.exec('CREATE INDEX idx_extra_test ON mcp_client_sessions(authorization_id, expires_at);');
+      expect(() => verifyMigration21SchemaAuthority(db)).toThrowError(/MCP_SCHEMA_AUTHORITY_INVALID/);
+      db.exec('DROP INDEX idx_extra_test;');
+      expect(() => verifyMigration21SchemaAuthority(db)).not.toThrow();
+
+      // 3. Autoindex with origin = 'u' (e.g. from inline UNIQUE column) rejected
+      db.exec('DROP TABLE mcp_client_sessions;');
+      db.exec(`
+        CREATE TABLE mcp_client_sessions (
+          id TEXT PRIMARY KEY,
+          authorization_id TEXT NOT NULL REFERENCES execution_authorizations(id) ON DELETE RESTRICT,
+          scope TEXT NOT NULL CHECK (scope = 'AUTHORIZED_CONTEXT_READ'),
+          token_hash TEXT NOT NULL UNIQUE CHECK (
+            length(token_hash) = 64 AND
+            token_hash GLOB '[0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]'
+          ),
+          authorization_fingerprint TEXT NOT NULL CHECK (
+            length(authorization_fingerprint) = 64 AND
+            authorization_fingerprint GLOB '[0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]'
+          ),
+          issued_at TEXT NOT NULL CHECK (length(issued_at) > 0),
+          expires_at TEXT NOT NULL CHECK (length(expires_at) > 0 AND expires_at > issued_at),
+          revoked_at TEXT NULL CHECK (revoked_at IS NULL OR (length(revoked_at) > 0 AND revoked_at >= issued_at))
+        );
+        CREATE UNIQUE INDEX uq_mcp_client_sessions_active_auth ON mcp_client_sessions(authorization_id) WHERE revoked_at IS NULL;
+        CREATE UNIQUE INDEX idx_mcp_client_sessions_token_hash ON mcp_client_sessions(token_hash);
+        CREATE INDEX idx_mcp_client_sessions_expires_at ON mcp_client_sessions(expires_at);
+        CREATE INDEX idx_mcp_client_sessions_auth_id ON mcp_client_sessions(authorization_id);
+      `);
+      // Has origin-u autoindex from UNIQUE keyword, must throw MCP_SCHEMA_AUTHORITY_INVALID
+      expect(() => verifyMigration21SchemaAuthority(db)).toThrowError(/MCP_SCHEMA_AUTHORITY_INVALID/);
+
+      // 4. Non-id or composite primary key rejected
+      db.exec('DROP TABLE mcp_client_sessions;');
+      db.exec(`
+        CREATE TABLE mcp_client_sessions (
+          id TEXT NOT NULL,
+          authorization_id TEXT NOT NULL REFERENCES execution_authorizations(id) ON DELETE RESTRICT,
+          scope TEXT NOT NULL CHECK (scope = 'AUTHORIZED_CONTEXT_READ'),
+          token_hash TEXT NOT NULL CHECK (
+            length(token_hash) = 64 AND
+            token_hash GLOB '[0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]'
+          ),
+          authorization_fingerprint TEXT NOT NULL CHECK (
+            length(authorization_fingerprint) = 64 AND
+            authorization_fingerprint GLOB '[0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]'
+          ),
+          issued_at TEXT NOT NULL CHECK (length(issued_at) > 0),
+          expires_at TEXT NOT NULL CHECK (length(expires_at) > 0 AND expires_at > issued_at),
+          revoked_at TEXT NULL CHECK (revoked_at IS NULL OR (length(revoked_at) > 0 AND revoked_at >= issued_at)),
+          PRIMARY KEY (id, authorization_id)
+        );
+        CREATE UNIQUE INDEX uq_mcp_client_sessions_active_auth ON mcp_client_sessions(authorization_id) WHERE revoked_at IS NULL;
+        CREATE UNIQUE INDEX idx_mcp_client_sessions_token_hash ON mcp_client_sessions(token_hash);
+        CREATE INDEX idx_mcp_client_sessions_expires_at ON mcp_client_sessions(expires_at);
+        CREATE INDEX idx_mcp_client_sessions_auth_id ON mcp_client_sessions(authorization_id);
+      `);
+      expect(() => verifyMigration21SchemaAuthority(db)).toThrowError(/MCP_SCHEMA_AUTHORITY_INVALID/);
+    } finally {
+      db.close();
+    }
+  });
+
+  it('117. Exact CHECK constraint set authority rejects extra or duplicate CHECK constraints', () => {
+    const { db } = createTestDatabase(tempDir, 'exact_check_constraints.db');
+    try {
+      // Recreate table with 7 check constraints (one extra check constraint)
+      db.exec('DROP TABLE mcp_client_sessions;');
+      db.exec(`
+        CREATE TABLE mcp_client_sessions (
+          id TEXT PRIMARY KEY,
+          authorization_id TEXT NOT NULL REFERENCES execution_authorizations(id) ON DELETE RESTRICT,
+          scope TEXT NOT NULL CHECK (scope = 'AUTHORIZED_CONTEXT_READ'),
+          token_hash TEXT NOT NULL CHECK (
+            length(token_hash) = 64 AND
+            token_hash GLOB '[0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]'
+          ),
+          authorization_fingerprint TEXT NOT NULL CHECK (
+            length(authorization_fingerprint) = 64 AND
+            authorization_fingerprint GLOB '[0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]'
+          ),
+          issued_at TEXT NOT NULL CHECK (length(issued_at) > 0),
+          expires_at TEXT NOT NULL CHECK (length(expires_at) > 0 AND expires_at > issued_at),
+          revoked_at TEXT NULL CHECK (revoked_at IS NULL OR (length(revoked_at) > 0 AND revoked_at >= issued_at)),
+          CHECK (length(id) > 0)
+        );
+        CREATE UNIQUE INDEX uq_mcp_client_sessions_active_auth ON mcp_client_sessions(authorization_id) WHERE revoked_at IS NULL;
+        CREATE UNIQUE INDEX idx_mcp_client_sessions_token_hash ON mcp_client_sessions(token_hash);
+        CREATE INDEX idx_mcp_client_sessions_expires_at ON mcp_client_sessions(expires_at);
+        CREATE INDEX idx_mcp_client_sessions_auth_id ON mcp_client_sessions(authorization_id);
+      `);
+
+      // Found length is 7 instead of 6, must throw MCP_SCHEMA_AUTHORITY_INVALID
+      expect(() => verifyMigration21SchemaAuthority(db)).toThrowError(/MCP_SCHEMA_AUTHORITY_INVALID/);
+    } finally {
+      db.close();
+    }
+  });
+
+  it('118. Contiguous ledger authority rejects gaps, duplicate versions, versions beyond 21, and earlier migration name mismatches', () => {
+    const { db } = createTestDatabase(tempDir, 'ledger_authority.db');
+    try {
+      expect(() => verifyMigration21SchemaAuthority(db)).not.toThrow();
+
+      // 1. Missing version in 1..20
+      db.prepare('DELETE FROM schema_migrations WHERE version = 10').run();
+      expect(() => verifyMigration21SchemaAuthority(db)).toThrowError(/MCP_SCHEMA_AUTHORITY_INVALID/);
+      db.prepare("INSERT INTO schema_migrations (version, name, applied_at) VALUES (10, '010_r5h4_failover_lineage_budget_idempotency', datetime('now'))").run();
+      expect(() => verifyMigration21SchemaAuthority(db)).not.toThrow();
+
+      // 2. Extra version beyond 21
+      db.prepare("INSERT INTO schema_migrations (version, name, applied_at) VALUES (22, '022_extra', datetime('now'))").run();
+      expect(() => verifyMigration21SchemaAuthority(db)).toThrowError(/MCP_SCHEMA_AUTHORITY_INVALID/);
+      db.prepare('DELETE FROM schema_migrations WHERE version = 22').run();
+      expect(() => verifyMigration21SchemaAuthority(db)).not.toThrow();
+
+      // 3. Name mismatch on version 21
+      db.prepare("UPDATE schema_migrations SET name = '021_wrong_name' WHERE version = 21").run();
+      expect(() => verifyMigration21SchemaAuthority(db)).toThrowError(/MCP_SCHEMA_AUTHORITY_INVALID/);
+      db.prepare("UPDATE schema_migrations SET name = '021_r5j_mcp_client_session_authority' WHERE version = 21").run();
+      expect(() => verifyMigration21SchemaAuthority(db)).not.toThrow();
+
+      // 4. Name mismatch on an earlier migration
+      db.prepare("UPDATE schema_migrations SET name = '001_wrong' WHERE version = 1").run();
+      expect(() => verifyMigration21SchemaAuthority(db)).toThrowError(/MCP_SCHEMA_AUTHORITY_INVALID/);
+      db.prepare("UPDATE schema_migrations SET name = '001_initial_schema' WHERE version = 1").run();
+      expect(() => verifyMigration21SchemaAuthority(db)).not.toThrow();
+    } finally {
+      db.close();
+    }
+  });
+
+  it('119. Manager row/payload revision presence parity rejected at issuance with zero new session rows and after issuance on next context read', () => {
+    const { db, dbPath } = createTestDatabase(tempDir, 'revision_presence_parity.db');
+    try {
+      const fixtures = setupFullGraph(db);
+
+      // 1. Tamper manager payload to remove expected_revision while row has revision = 1
+      const payloadWithoutRev = JSON.parse(fixtures.rawManagerPayload);
+      delete payloadWithoutRev.expected_revision;
+      const rawWithoutRev = JSON.stringify(payloadWithoutRev);
+      const hashWithoutRev = crypto.createHash('sha256').update(rawWithoutRev, 'utf8').digest('hex');
+
+      db.prepare('UPDATE protocol_messages SET raw_payload = ?, payload_hash = ? WHERE id = ?').run(
+        rawWithoutRev,
+        hashWithoutRev,
+        fixtures.managerRecordId
+      );
+      db.prepare('UPDATE execution_authorizations SET manager_payload_hash = ? WHERE id = ?').run(
+        hashWithoutRev,
+        fixtures.authorizationId
+      );
+
+      // Must reject at issuance with zero new session rows
+      expect(() => fixtures.service.issueSession({ authorizationId: fixtures.authorizationId })).toThrowError(/MCP_AUTHORITY_FENCED/);
+      const sessionCount = (db.prepare('SELECT COUNT(*) as c FROM mcp_client_sessions').get() as { c: number }).c;
+      expect(sessionCount).toBe(0);
+
+      // Restore payload and issue session
+      db.prepare('UPDATE protocol_messages SET raw_payload = ?, payload_hash = ? WHERE id = ?').run(
+        fixtures.rawManagerPayload,
+        fixtures.auth.manager_payload_hash,
+        fixtures.managerRecordId
+      );
+      db.prepare('UPDATE execution_authorizations SET manager_payload_hash = ? WHERE id = ?').run(
+        fixtures.auth.manager_payload_hash,
+        fixtures.authorizationId
+      );
+
+      const issued = fixtures.service.issueSession({ authorizationId: fixtures.authorizationId });
+      expect(issued.plaintextToken).toBeDefined();
+
+      // Read succeeds initially
+      const ctx1 = new McpAuthorityContext({ dbPath, sessionToken: issued.plaintextToken });
+      expect(ctx1.resolveAuthorizedContext().schema_version).toBe(2);
+      ctx1.close();
+
+      // Mutate post-issuance: row revision is set to NULL while payload has expected_revision = 1
+      db.prepare('UPDATE protocol_messages SET expected_revision = NULL WHERE id = ?').run(fixtures.managerRecordId);
+
+      // Next context read is fenced
+      const ctx2 = new McpAuthorityContext({ dbPath, sessionToken: issued.plaintextToken });
+      try {
+        expect(() => ctx2.resolveAuthorizedContext()).toThrowError(/MCP_AUTHORITY_FENCED/);
+      } finally {
+        ctx2.close();
+      }
+    } finally {
+      db.close();
+    }
+  });
+
+  it('120. Manager row/payload expected_task_state presence parity rejected at issuance with zero new session rows and after issuance on next context read', () => {
+    const { db, dbPath } = createTestDatabase(tempDir, 'state_presence_parity.db');
+    try {
+      const fixtures = setupFullGraph(db);
+
+      // 1. Tamper manager payload to remove expected_task_state while row has expected_task_state = 'CODING'
+      const payloadWithoutState = JSON.parse(fixtures.rawManagerPayload);
+      delete payloadWithoutState.expected_task_state;
+      const rawWithoutState = JSON.stringify(payloadWithoutState);
+      const hashWithoutState = crypto.createHash('sha256').update(rawWithoutState, 'utf8').digest('hex');
+
+      db.prepare('UPDATE protocol_messages SET raw_payload = ?, payload_hash = ? WHERE id = ?').run(
+        rawWithoutState,
+        hashWithoutState,
+        fixtures.managerRecordId
+      );
+      db.prepare('UPDATE execution_authorizations SET manager_payload_hash = ? WHERE id = ?').run(
+        hashWithoutState,
+        fixtures.authorizationId
+      );
+
+      // Must reject at issuance with zero new session rows
+      expect(() => fixtures.service.issueSession({ authorizationId: fixtures.authorizationId })).toThrowError(/MCP_AUTHORITY_FENCED/);
+      const sessionCount = (db.prepare('SELECT COUNT(*) as c FROM mcp_client_sessions').get() as { c: number }).c;
+      expect(sessionCount).toBe(0);
+
+      // Restore payload and issue session
+      db.prepare('UPDATE protocol_messages SET raw_payload = ?, payload_hash = ? WHERE id = ?').run(
+        fixtures.rawManagerPayload,
+        fixtures.auth.manager_payload_hash,
+        fixtures.managerRecordId
+      );
+      db.prepare('UPDATE execution_authorizations SET manager_payload_hash = ? WHERE id = ?').run(
+        fixtures.auth.manager_payload_hash,
+        fixtures.authorizationId
+      );
+
+      const issued = fixtures.service.issueSession({ authorizationId: fixtures.authorizationId });
+      expect(issued.plaintextToken).toBeDefined();
+
+      // Read succeeds initially
+      const ctx1 = new McpAuthorityContext({ dbPath, sessionToken: issued.plaintextToken });
+      expect(ctx1.resolveAuthorizedContext().schema_version).toBe(2);
+      ctx1.close();
+
+      // Mutate post-issuance: row expected_task_state is set to NULL while payload has expected_task_state = 'CODING'
+      db.prepare('UPDATE protocol_messages SET expected_task_state = NULL WHERE id = ?').run(fixtures.managerRecordId);
+
+      // Next context read is fenced
+      const ctx2 = new McpAuthorityContext({ dbPath, sessionToken: issued.plaintextToken });
+      try {
+        expect(() => ctx2.resolveAuthorizedContext()).toThrowError(/MCP_AUTHORITY_FENCED/);
+      } finally {
+        ctx2.close();
+      }
+    } finally {
+      db.close();
+    }
+  });
+
+  it('121. Historical unauthorized mutation flag remains permanently true across multiple reads and prevents re-entry', () => {
+    const { db, dbPath } = createTestDatabase(tempDir, 'permanent_mutation_flag.db');
+    let token = '';
+    try {
+      const fixtures = setupFullGraph(db);
+      token = fixtures.service.issueSession({ authorizationId: fixtures.authorizationId }).plaintextToken;
+    } finally {
+      db.close();
+    }
+
+    const ctx = new McpAuthorityContext({ dbPath, sessionToken: token });
+    const { db: openedDb } = ctx.getOrCreateDatabase();
+    try {
+      expect(ctx.hasDetectedUnauthorizedMutation()).toBe(false);
+
+      // Simulate mutation delta on first resolve call
+      const origPrepare = openedDb.prepare.bind(openedDb);
+      let totalChangesCalls = 0;
+      openedDb.prepare = function (this: Database.Database, sql: string) {
+        const stmt = origPrepare(sql);
+        if (sql.includes('total_changes()')) {
+          const origGet = stmt.get.bind(stmt);
+          stmt.get = function (this: Database.Statement, ...args: unknown[]) {
+            totalChangesCalls++;
+            if (totalChangesCalls === 2) {
+              return { total_changes: 1 };
+            }
+            return origGet(...args);
+          } as typeof stmt.get;
+        }
+        return stmt;
+      } as typeof openedDb.prepare;
+
+      expect(() => ctx.resolveAuthorizedContext()).toThrowError(/MCP_AUTHORITY_FENCED/);
+      // Historical flag is now permanently true
+      expect(ctx.hasDetectedUnauthorizedMutation()).toBe(true);
+
+      // Subsequent resolveAuthorizedContext calls immediately fail closed
+      expect(() => ctx.resolveAuthorizedContext()).toThrowError(/MCP_AUTHORITY_FENCED/);
+      expect(ctx.hasDetectedUnauthorizedMutation()).toBe(true);
+    } finally {
+      ctx.close();
     }
   });
 });

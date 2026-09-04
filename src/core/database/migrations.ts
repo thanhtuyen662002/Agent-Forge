@@ -1393,7 +1393,7 @@ export const MIGRATIONS: Migration[] = [
           id TEXT PRIMARY KEY,
           authorization_id TEXT NOT NULL REFERENCES execution_authorizations(id) ON DELETE RESTRICT,
           scope TEXT NOT NULL CHECK (scope = 'AUTHORIZED_CONTEXT_READ'),
-          token_hash TEXT NOT NULL UNIQUE CHECK (
+          token_hash TEXT NOT NULL CHECK (
             length(token_hash) = 64 AND
             token_hash GLOB '[0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]'
           ),
@@ -1424,42 +1424,19 @@ export const MIGRATIONS: Migration[] = [
 ];
 
 export function verifyMigration21SchemaAuthority(db: Database.Database): void {
-  // 1. Exact ledger table and row
+  // 1. Exact ledger table and version 21 row existence
   const ledgerTable = db
     .prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'schema_migrations'")
     .get() as { name: string } | undefined;
   if (!ledgerTable) {
-    throw new Error('Database is missing Migration 21 ledger authority (021_r5j_mcp_client_session_authority)');
+    throw new Error('[MCP_SCHEMA_AUTHORITY_INVALID] Database is missing Migration 21 ledger authority (021_r5j_mcp_client_session_authority)');
   }
 
-  const ledgerStats = db
-    .prepare("SELECT COUNT(*) as c, MAX(version) as max_v, MIN(version) as min_v FROM schema_migrations")
-    .get() as { c: number; max_v: number | null; min_v: number | null } | undefined;
-
-  if (!ledgerStats || ledgerStats.max_v == null || ledgerStats.max_v !== 21) {
-    throw new Error('Database is missing Migration 21 ledger authority (max version must be 21)');
-  }
-
-  const higherRows = db
-    .prepare("SELECT version FROM schema_migrations WHERE version > 21")
-    .all() as { version: number }[];
-  if (higherRows.length > 0) {
-    throw new Error('Database has invalid schema migrations beyond version 21');
-  }
-
-  // 1. Migration 21 ledger record authority & max version exactly 21
-  const maxVersionRow = db
-    .prepare("SELECT MAX(version) as max_version, COUNT(*) as total_rows FROM schema_migrations")
-    .get() as { max_version: number | null; total_rows: number } | undefined;
-  if (!maxVersionRow || maxVersionRow.max_version !== 21) {
-    throw new Error(`Database schema ledger max version must be exactly 21 (found ${maxVersionRow?.max_version})`);
-  }
-
-  const row21 = db
-    .prepare("SELECT version, name FROM schema_migrations WHERE version = 21")
-    .all() as { version: number; name: string }[];
-  if (row21.length !== 1 || row21[0].name !== '021_r5j_mcp_client_session_authority') {
-    throw new Error('Database is missing Migration 21 ledger authority (021_r5j_mcp_client_session_authority)');
+  const v21Row = db
+    .prepare("SELECT version, name FROM schema_migrations WHERE version = 21 AND name = '021_r5j_mcp_client_session_authority'")
+    .get() as { version: number; name: string } | undefined;
+  if (!v21Row) {
+    throw new Error('[MCP_SCHEMA_AUTHORITY_INVALID] Database is missing Migration 21 ledger authority (021_r5j_mcp_client_session_authority)');
   }
 
   // 2. Table existence
@@ -1467,7 +1444,7 @@ export function verifyMigration21SchemaAuthority(db: Database.Database): void {
     .prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'mcp_client_sessions'")
     .get() as { name: string } | undefined;
   if (!table) {
-    throw new Error('Table mcp_client_sessions is missing');
+    throw new Error('[MCP_SCHEMA_AUTHORITY_INVALID] Table mcp_client_sessions is missing');
   }
 
   // 3. Exactly eight required columns, PK, notnull, type
@@ -1480,7 +1457,7 @@ export function verifyMigration21SchemaAuthority(db: Database.Database): void {
     pk: number;
   }[];
   if (columns.length !== 8) {
-    throw new Error(`Table mcp_client_sessions missing column authority: expected exactly 8 columns (found ${columns.length})`);
+    throw new Error(`[MCP_SCHEMA_AUTHORITY_INVALID] Table mcp_client_sessions missing column authority: expected exactly 8 columns (found ${columns.length})`);
   }
   const colMap = new Map(columns.map((c) => [c.name, c]));
 
@@ -1499,19 +1476,19 @@ export function verifyMigration21SchemaAuthority(db: Database.Database): void {
     const req = requiredCols[i];
     const col = colMap.get(req.name);
     if (!col) {
-      throw new Error(`Table mcp_client_sessions missing column "${req.name}"`);
+      throw new Error(`[MCP_SCHEMA_AUTHORITY_INVALID] Table mcp_client_sessions missing column "${req.name}"`);
     }
     if (col.type !== req.type) {
-      throw new Error(`Column "${req.name}" has unexpected type "${col.type}" (expected "${req.type}")`);
+      throw new Error(`[MCP_SCHEMA_AUTHORITY_INVALID] Column "${req.name}" has unexpected type "${col.type}" (expected "${req.type}")`);
     }
     if (col.pk !== req.pk) {
-      throw new Error(`Column "${req.name}" pk authority mismatch (expected ${req.pk}, got ${col.pk})`);
+      throw new Error(`[MCP_SCHEMA_AUTHORITY_INVALID] Column "${req.name}" pk authority mismatch (expected ${req.pk}, got ${col.pk})`);
     }
     if (col.notnull !== req.notnull) {
-      throw new Error(`Column "${req.name}" notnull authority mismatch (expected ${req.notnull}, got ${col.notnull})`);
+      throw new Error(`[MCP_SCHEMA_AUTHORITY_INVALID] Column "${req.name}" notnull authority mismatch (expected ${req.notnull}, got ${col.notnull})`);
     }
     if (col.cid !== i) {
-      throw new Error(`Column "${req.name}" cid order authority mismatch (expected ${i}, got ${col.cid})`);
+      throw new Error(`[MCP_SCHEMA_AUTHORITY_INVALID] Column "${req.name}" cid order authority mismatch (expected ${i}, got ${col.cid})`);
     }
   }
 
@@ -1527,7 +1504,7 @@ export function verifyMigration21SchemaAuthority(db: Database.Database): void {
     match: string;
   }[];
   if (fks.length !== 1) {
-    throw new Error(`Table mcp_client_sessions must have exactly 1 foreign key (found ${fks.length})`);
+    throw new Error(`[MCP_SCHEMA_AUTHORITY_INVALID] Table mcp_client_sessions must have exactly 1 foreign key (found ${fks.length})`);
   }
   const authFk = fks[0];
   if (
@@ -1538,7 +1515,7 @@ export function verifyMigration21SchemaAuthority(db: Database.Database): void {
     authFk.on_update !== 'NO ACTION' ||
     authFk.match !== 'NONE'
   ) {
-    throw new Error('Table mcp_client_sessions foreign key authority mismatch on authorization_id -> execution_authorizations(id)');
+    throw new Error('[MCP_SCHEMA_AUTHORITY_INVALID] Table mcp_client_sessions foreign key authority mismatch on authorization_id -> execution_authorizations(id)');
   }
 
   // 5. Indexes verification via PRAGMA index_list, index_xinfo, and sqlite_master
@@ -1550,15 +1527,30 @@ export function verifyMigration21SchemaAuthority(db: Database.Database): void {
     partial: number;
   }[];
 
-  // Exact set: exactly 4 user-defined ('c') and only SQLite's expected implicit primary-key index ('pk')
-  const userDefinedIndexes = indexes.filter((idx) => idx.origin === 'c');
-  if (userDefinedIndexes.length !== 4) {
-    throw new Error(`Table mcp_client_sessions must have exactly 4 user-defined indexes (found ${userDefinedIndexes.length})`);
+  // Must have exactly 5 indexes total: exactly 4 user-defined ('c') + exactly 1 primary key ('pk')
+  // Reject every origin-u autoindex and every extra index.
+  if (indexes.length !== 5) {
+    throw new Error(`[MCP_SCHEMA_AUTHORITY_INVALID] Table mcp_client_sessions must have exactly 5 indexes (found ${indexes.length})`);
   }
 
-  const unexpectedOrigin = indexes.filter((idx) => idx.origin !== 'c' && idx.origin !== 'pk' && idx.origin !== 'u');
+  const userDefinedIndexes = indexes.filter((idx) => idx.origin === 'c');
+  if (userDefinedIndexes.length !== 4) {
+    throw new Error(`[MCP_SCHEMA_AUTHORITY_INVALID] Table mcp_client_sessions must have exactly 4 user-defined indexes (found ${userDefinedIndexes.length})`);
+  }
+
+  const pkIndexes = indexes.filter((idx) => idx.origin === 'pk');
+  if (pkIndexes.length !== 1) {
+    throw new Error(`[MCP_SCHEMA_AUTHORITY_INVALID] Table mcp_client_sessions must have exactly 1 primary-key index (found ${pkIndexes.length})`);
+  }
+
+  const originUIndexes = indexes.filter((idx) => idx.origin === 'u');
+  if (originUIndexes.length > 0) {
+    throw new Error(`[MCP_SCHEMA_AUTHORITY_INVALID] Table mcp_client_sessions contains forbidden origin-u autoindex: ${originUIndexes[0].name}`);
+  }
+
+  const unexpectedOrigin = indexes.filter((idx) => idx.origin !== 'c' && idx.origin !== 'pk');
   if (unexpectedOrigin.length > 0) {
-    throw new Error(`Table mcp_client_sessions contains unexpected index origin: ${unexpectedOrigin[0].origin}`);
+    throw new Error(`[MCP_SCHEMA_AUTHORITY_INVALID] Table mcp_client_sessions contains unexpected index origin: ${unexpectedOrigin[0].origin}`);
   }
 
   const expectedIndexNames = new Set([
@@ -1570,7 +1562,7 @@ export function verifyMigration21SchemaAuthority(db: Database.Database): void {
 
   for (const idx of userDefinedIndexes) {
     if (!expectedIndexNames.has(idx.name)) {
-      throw new Error(`Table mcp_client_sessions contains unexpected user-defined index "${idx.name}"`);
+      throw new Error(`[MCP_SCHEMA_AUTHORITY_INVALID] Table mcp_client_sessions contains unexpected user-defined index "${idx.name}"`);
     }
   }
 
@@ -1585,10 +1577,23 @@ export function verifyMigration21SchemaAuthority(db: Database.Database): void {
     key: number;
   }
 
+  // 5.0 Implicit primary-key index verification via PRAGMA index_xinfo
+  const pkIdxName = pkIndexes[0].name;
+  const pkXInfo = db.prepare(`PRAGMA index_xinfo('${pkIdxName}')`).all() as XInfoRow[];
+  const pkKeyCols = pkXInfo.filter((r) => r.key === 1);
+  if (
+    pkKeyCols.length !== 1 ||
+    pkKeyCols[0].name !== 'id' ||
+    pkKeyCols[0].coll !== 'BINARY' ||
+    pkKeyCols[0].desc !== 0
+  ) {
+    throw new Error('[MCP_SCHEMA_AUTHORITY_INVALID] Primary key index on mcp_client_sessions must index exactly [id] ascending with BINARY collation and no extra key expression');
+  }
+
   // 5.1 uq_mcp_client_sessions_active_auth
   const activeAuthIdx = idxMap.get('uq_mcp_client_sessions_active_auth');
   if (!activeAuthIdx || activeAuthIdx.unique !== 1 || activeAuthIdx.partial !== 1) {
-    throw new Error('Table mcp_client_sessions missing unique partial index uq_mcp_client_sessions_active_auth');
+    throw new Error('[MCP_SCHEMA_AUTHORITY_INVALID] Table mcp_client_sessions missing unique partial index uq_mcp_client_sessions_active_auth');
   }
   const activeAuthXInfo = db.prepare("PRAGMA index_xinfo('uq_mcp_client_sessions_active_auth')").all() as XInfoRow[];
   const activeAuthKeyCols = activeAuthXInfo.filter((r) => r.key === 1);
@@ -1598,20 +1603,20 @@ export function verifyMigration21SchemaAuthority(db: Database.Database): void {
     activeAuthKeyCols[0].coll !== 'BINARY' ||
     activeAuthKeyCols[0].desc !== 0
   ) {
-    throw new Error('Index uq_mcp_client_sessions_active_auth must index exactly [authorization_id] with BINARY collation');
+    throw new Error('[MCP_SCHEMA_AUTHORITY_INVALID] Index uq_mcp_client_sessions_active_auth must index exactly [authorization_id] with BINARY collation');
   }
   const activeAuthSqlRow = db
     .prepare("SELECT sql FROM sqlite_master WHERE type = 'index' AND name = 'uq_mcp_client_sessions_active_auth'")
     .get() as { sql: string } | undefined;
   const activeAuthSql = (activeAuthSqlRow?.sql ?? '').replace(/\s+/g, ' ').trim();
   if (!/WHERE\s+revoked_at\s+IS\s+NULL$/i.test(activeAuthSql) || /WHERE.*(?:OR|AND).*revoked_at\s+IS\s+NULL/i.test(activeAuthSql)) {
-    throw new Error('Index uq_mcp_client_sessions_active_auth must have exact partial predicate WHERE revoked_at IS NULL');
+    throw new Error('[MCP_SCHEMA_AUTHORITY_INVALID] Index uq_mcp_client_sessions_active_auth must have exact partial predicate WHERE revoked_at IS NULL');
   }
 
   // 5.2 idx_mcp_client_sessions_token_hash
   const tokenHashIdx = idxMap.get('idx_mcp_client_sessions_token_hash');
   if (!tokenHashIdx || tokenHashIdx.unique !== 1 || tokenHashIdx.partial !== 0) {
-    throw new Error('Table mcp_client_sessions missing unique index idx_mcp_client_sessions_token_hash');
+    throw new Error('[MCP_SCHEMA_AUTHORITY_INVALID] Table mcp_client_sessions missing unique index idx_mcp_client_sessions_token_hash');
   }
   const tokenHashXInfo = db.prepare("PRAGMA index_xinfo('idx_mcp_client_sessions_token_hash')").all() as XInfoRow[];
   const tokenHashKeyCols = tokenHashXInfo.filter((r) => r.key === 1);
@@ -1621,13 +1626,13 @@ export function verifyMigration21SchemaAuthority(db: Database.Database): void {
     tokenHashKeyCols[0].coll !== 'BINARY' ||
     tokenHashKeyCols[0].desc !== 0
   ) {
-    throw new Error('Index idx_mcp_client_sessions_token_hash must index exactly [token_hash] with BINARY collation');
+    throw new Error('[MCP_SCHEMA_AUTHORITY_INVALID] Index idx_mcp_client_sessions_token_hash must index exactly [token_hash] with BINARY collation');
   }
 
   // 5.3 idx_mcp_client_sessions_expires_at
   const expiresAtIdx = idxMap.get('idx_mcp_client_sessions_expires_at');
   if (!expiresAtIdx || expiresAtIdx.unique !== 0 || expiresAtIdx.partial !== 0) {
-    throw new Error('Table mcp_client_sessions missing index idx_mcp_client_sessions_expires_at');
+    throw new Error('[MCP_SCHEMA_AUTHORITY_INVALID] Table mcp_client_sessions missing index idx_mcp_client_sessions_expires_at');
   }
   const expiresAtXInfo = db.prepare("PRAGMA index_xinfo('idx_mcp_client_sessions_expires_at')").all() as XInfoRow[];
   const expiresAtKeyCols = expiresAtXInfo.filter((r) => r.key === 1);
@@ -1637,13 +1642,13 @@ export function verifyMigration21SchemaAuthority(db: Database.Database): void {
     expiresAtKeyCols[0].coll !== 'BINARY' ||
     expiresAtKeyCols[0].desc !== 0
   ) {
-    throw new Error('Index idx_mcp_client_sessions_expires_at must index exactly [expires_at] with BINARY collation');
+    throw new Error('[MCP_SCHEMA_AUTHORITY_INVALID] Index idx_mcp_client_sessions_expires_at must index exactly [expires_at] with BINARY collation');
   }
 
   // 5.4 idx_mcp_client_sessions_auth_id
   const authIdIdx = idxMap.get('idx_mcp_client_sessions_auth_id');
   if (!authIdIdx || authIdIdx.unique !== 0 || authIdIdx.partial !== 0) {
-    throw new Error('Table mcp_client_sessions missing index idx_mcp_client_sessions_auth_id');
+    throw new Error('[MCP_SCHEMA_AUTHORITY_INVALID] Table mcp_client_sessions missing index idx_mcp_client_sessions_auth_id');
   }
   const authIdXInfo = db.prepare("PRAGMA index_xinfo('idx_mcp_client_sessions_auth_id')").all() as XInfoRow[];
   const authIdKeyCols = authIdXInfo.filter((r) => r.key === 1);
@@ -1653,32 +1658,57 @@ export function verifyMigration21SchemaAuthority(db: Database.Database): void {
     authIdKeyCols[0].coll !== 'BINARY' ||
     authIdKeyCols[0].desc !== 0
   ) {
-    throw new Error('Index idx_mcp_client_sessions_auth_id must index exactly [authorization_id] with BINARY collation');
+    throw new Error('[MCP_SCHEMA_AUTHORITY_INVALID] Index idx_mcp_client_sessions_auth_id must index exactly [authorization_id] with BINARY collation');
   }
 
-  // 6. CHECK constraints in table sql
+  // 6. CHECK constraints in table sql (must be exactly 6 canonical constraints)
   const tableSqlRow = db
     .prepare("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'mcp_client_sessions'")
     .get() as { sql: string } | undefined;
   const sql = (tableSqlRow?.sql ?? '').replace(/\s+/g, ' ');
 
+  const checkMatches = sql.match(/\bCHECK\s*\(/gi);
+  if (!checkMatches || checkMatches.length !== 6) {
+    throw new Error(`[MCP_SCHEMA_AUTHORITY_INVALID] Table mcp_client_sessions must contain exactly 6 CHECK constraints (found ${checkMatches?.length ?? 0})`);
+  }
+
   if (!/CHECK\s*\(\s*scope\s*=\s*'AUTHORIZED_CONTEXT_READ'\s*\)/i.test(sql)) {
-    throw new Error('Table mcp_client_sessions missing scope CHECK constraint');
+    throw new Error('[MCP_SCHEMA_AUTHORITY_INVALID] Table mcp_client_sessions missing scope CHECK constraint');
   }
   if (!/CHECK\s*\(\s*length\(token_hash\)\s*=\s*64\s+AND\s+token_hash\s+GLOB\s+'(\[0-9a-f\]){64}'\s*\)/i.test(sql)) {
-    throw new Error('Table mcp_client_sessions missing token_hash CHECK constraint');
+    throw new Error('[MCP_SCHEMA_AUTHORITY_INVALID] Table mcp_client_sessions missing token_hash CHECK constraint');
   }
   if (!/CHECK\s*\(\s*length\(authorization_fingerprint\)\s*=\s*64\s+AND\s+authorization_fingerprint\s+GLOB\s+'(\[0-9a-f\]){64}'\s*\)/i.test(sql)) {
-    throw new Error('Table mcp_client_sessions missing authorization_fingerprint CHECK constraint');
+    throw new Error('[MCP_SCHEMA_AUTHORITY_INVALID] Table mcp_client_sessions missing authorization_fingerprint CHECK constraint');
   }
   if (!/CHECK\s*\(\s*length\(issued_at\)\s*>\s*0\s*\)/i.test(sql)) {
-    throw new Error('Table mcp_client_sessions missing issued_at CHECK constraint');
+    throw new Error('[MCP_SCHEMA_AUTHORITY_INVALID] Table mcp_client_sessions missing issued_at CHECK constraint');
   }
   if (!/CHECK\s*\(\s*length\(expires_at\)\s*>\s*0\s+AND\s+expires_at\s*>\s*issued_at\s*\)/i.test(sql)) {
-    throw new Error('Table mcp_client_sessions missing expires_at CHECK constraint');
+    throw new Error('[MCP_SCHEMA_AUTHORITY_INVALID] Table mcp_client_sessions missing expires_at CHECK constraint');
   }
   if (!/CHECK\s*\(\s*revoked_at\s+IS\s+NULL\s+OR\s+\(\s*length\(revoked_at\)\s*>\s*0\s+AND\s+revoked_at\s*>=\s*issued_at\s*\)\s*\)/i.test(sql)) {
-    throw new Error('Table mcp_client_sessions missing revoked_at CHECK constraint');
+    throw new Error('[MCP_SCHEMA_AUTHORITY_INVALID] Table mcp_client_sessions missing revoked_at CHECK constraint');
+  }
+
+  // 7. Contiguous, unique migration ledger 1..21 whose names match MIGRATIONS
+  const ledgerRows = db
+    .prepare('SELECT version, name FROM schema_migrations ORDER BY version ASC')
+    .all() as { version: number; name: string }[];
+
+  if (ledgerRows.length !== 21 || ledgerRows.length !== MIGRATIONS.length) {
+    throw new Error(`[MCP_SCHEMA_AUTHORITY_INVALID] Database schema migrations ledger must contain exactly 21 migrations (found ${ledgerRows.length})`);
+  }
+
+  for (let i = 0; i < ledgerRows.length; i++) {
+    const expectedVersion = i + 1;
+    const expectedMigration = MIGRATIONS[i];
+    if (ledgerRows[i].version !== expectedVersion) {
+      throw new Error(`[MCP_SCHEMA_AUTHORITY_INVALID] Database schema ledger is not contiguous: expected version ${expectedVersion}, got ${ledgerRows[i].version}`);
+    }
+    if (ledgerRows[i].name !== expectedMigration.name) {
+      throw new Error(`[MCP_SCHEMA_AUTHORITY_INVALID] Database schema ledger migration name mismatch at version ${expectedVersion}: expected "${expectedMigration.name}", got "${ledgerRows[i].name}"`);
+    }
   }
 }
 
