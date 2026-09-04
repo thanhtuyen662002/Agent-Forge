@@ -4,6 +4,8 @@ import os from 'os';
 import crypto from 'crypto';
 import { spawn, execFileSync, ChildProcess } from 'child_process';
 import { Worker } from 'worker_threads';
+import { EventEmitter } from 'events';
+import { PassThrough } from 'stream';
 import Database from 'better-sqlite3';
 import { describe, it, expect, beforeEach, afterEach, afterAll, vi } from 'vitest';
 import { Client, InMemoryTransport } from '@modelcontextprotocol/client';
@@ -254,21 +256,44 @@ function createWorkerHarness<TResult>(w: Worker, timeoutMs = 8000): WorkerHarnes
   w.on('error', onError);
   w.on('exit', onExit);
 
+  let cleanupPromise: Promise<void> | null = null;
+  const cleanup = (): Promise<void> => {
+    if (cleanupPromise) {
+      return cleanupPromise;
+    }
+    cleanupPromise = (async () => {
+      const cleanupErr = new Error('[WORKER_CLEANUP_CANCELLED] Worker harness was cleaned up before settlement');
+      if (!isReadySettled) {
+        isReadySettled = true;
+        readyReject(cleanupErr);
+      }
+      if (!isResultSettled) {
+        isResultSettled = true;
+        resultReject(cleanupErr);
+      }
+      cleanupTimersAndListeners();
+      await w.terminate();
+    })();
+    return cleanupPromise;
+  };
+
   return {
     readyPromise,
     resultPromise,
-    cleanup: async () => {
-      cleanupTimersAndListeners();
-      await w.terminate();
-    },
+    cleanup,
   };
+}
+
+interface StdioChildHarnessOptions {
+  customExecutable?: string;
+  customSpawn?: (command: string, args: readonly string[], options: Record<string, unknown>) => ChildProcess;
 }
 
 interface StdioChildHarness {
   child: ChildProcess;
   closeStdin: () => void;
   sendRequest: (req: Record<string, unknown>, timeoutMs?: number) => Promise<Record<string, unknown>>;
-  sendNotification: (notif: Record<string, unknown>) => void;
+  sendNotification: (notif: Record<string, unknown>) => Promise<void>;
   waitForExit: (timeoutMs?: number) => Promise<{ code: number | null; signal: NodeJS.Signals | null }>;
   terminate: (signal: 'SIGINT' | 'SIGTERM') => void;
   getStdoutLines: () => string[];
@@ -279,7 +304,8 @@ interface StdioChildHarness {
 function createStdioChildHarness(
   stdioScript: string,
   envVars: Record<string, string>,
-  preloadScript?: string
+  preloadScript?: string,
+  options?: StdioChildHarnessOptions
 ): StdioChildHarness {
   const projectNodeModules = path.resolve(__dirname, '..', 'node_modules');
   const spawnEnv: NodeJS.ProcessEnv = {
@@ -293,7 +319,9 @@ function createStdioChildHarness(
   }
   spawnArgs.push(stdioScript);
 
-  const child = spawn(process.execPath, spawnArgs, {
+  const spawnFn = options?.customSpawn ?? spawn;
+  const executable = options?.customExecutable ?? process.execPath;
+  const child = spawnFn(executable, spawnArgs, {
     env: spawnEnv,
     stdio: ['pipe', 'pipe', 'pipe', 'ipc'],
   });
@@ -312,6 +340,7 @@ function createStdioChildHarness(
   let protocolContaminationError: Error | null = null;
   let childExitResult: { code: number | null; signal: NodeJS.Signals | null } | null = null;
   let childSpawnError: Error | null = null;
+  let childStdinError: Error | null = null;
 
   type MessageListener = (msg: Record<string, unknown>) => void;
   const messageListeners = new Set<MessageListener>();
@@ -369,6 +398,10 @@ function createStdioChildHarness(
     stderrOutput += chunk.toString();
   });
 
+  childStdin.on('error', (err: Error) => {
+    childStdinError = err;
+  });
+
   child.on('error', (err: Error) => {
     childSpawnError = err;
     for (const l of errorListeners) l(err);
@@ -391,8 +424,14 @@ function createStdioChildHarness(
     if (childSpawnError) {
       return Promise.reject(new Error(`Cannot send request: child failed to spawn: ${childSpawnError.message}`));
     }
+    if (childStdinError) {
+      return Promise.reject(new Error(`Cannot send request: child stdin error: ${childStdinError.message}`));
+    }
     if (childExitResult) {
       return Promise.reject(new Error(`Cannot send request: child exited prematurely with code ${childExitResult.code}`));
+    }
+    if (childStdin.destroyed || !childStdin.writable) {
+      return Promise.reject(new Error('Cannot send request: child stdin is closed or destroyed'));
     }
 
     for (const existingMsg of parsedMessages) {
@@ -461,18 +500,62 @@ function createStdioChildHarness(
       errorListeners.add(onError);
       contaminationListeners.add(onContamination);
 
-      childStdin.write(JSON.stringify(req) + '\n', (writeErr) => {
-        if (writeErr && !isSettled) {
+      try {
+        const ok = childStdin.write(JSON.stringify(req) + '\n', (writeErr) => {
+          if (writeErr && !isSettled) {
+            isSettled = true;
+            cleanup();
+            reject(new Error(`Failed to write request ${reqId} to child stdin: ${writeErr.message}`));
+          }
+        });
+        if (!ok && childStdin.destroyed && !isSettled) {
           isSettled = true;
           cleanup();
-          reject(new Error(`Failed to write request ${reqId} to child stdin: ${writeErr.message}`));
+          reject(new Error(`Failed to write request ${reqId} to child stdin: stream destroyed`));
         }
-      });
+      } catch (writeErr) {
+        if (!isSettled) {
+          isSettled = true;
+          cleanup();
+          reject(writeErr instanceof Error ? writeErr : new Error(String(writeErr)));
+        }
+      }
     });
   };
 
-  const sendNotification = (notif: Record<string, unknown>) => {
-    childStdin.write(JSON.stringify(notif) + '\n');
+  const sendNotification = (notif: Record<string, unknown>): Promise<void> => {
+    if (protocolContaminationError) {
+      return Promise.reject(protocolContaminationError);
+    }
+    if (childSpawnError) {
+      return Promise.reject(new Error(`Cannot send notification: child failed to spawn: ${childSpawnError.message}`));
+    }
+    if (childStdinError) {
+      return Promise.reject(new Error(`Cannot send notification: child stdin error: ${childStdinError.message}`));
+    }
+    if (childExitResult) {
+      return Promise.reject(new Error(`Cannot send notification: child exited prematurely with code ${childExitResult.code}`));
+    }
+    if (childStdin.destroyed || !childStdin.writable) {
+      return Promise.reject(new Error('Cannot send notification: child stdin is closed or destroyed'));
+    }
+
+    return new Promise<void>((resolve, reject) => {
+      try {
+        const ok = childStdin.write(JSON.stringify(notif) + '\n', (writeErr) => {
+          if (writeErr) {
+            reject(new Error(`Failed to write notification to child stdin: ${writeErr.message}`));
+          } else {
+            resolve();
+          }
+        });
+        if (!ok && childStdin.destroyed) {
+          reject(new Error('Failed to write notification: child stdin destroyed'));
+        }
+      } catch (err) {
+        reject(err instanceof Error ? err : new Error(String(err)));
+      }
+    });
   };
 
   const waitForExit = (timeoutMs = 8000): Promise<{ code: number | null; signal: NodeJS.Signals | null }> => {
@@ -544,6 +627,12 @@ function createStdioChildHarness(
     getStdoutLines: () => [...stdoutLines],
     getStderr: () => stderrOutput,
     close: async () => {
+      if (childSpawnError) {
+        if (!childStdin.destroyed) {
+          childStdin.destroy();
+        }
+        return;
+      }
       if (child.exitCode === null && child.signalCode === null) {
         child.kill('SIGKILL');
         await harness.waitForExit(2000);
@@ -2195,31 +2284,46 @@ try {
       try {
         db.prepare('UPDATE execution_authorizations SET id = ? WHERE id = ?').run(sensitiveAuthId, fixtures.authorizationId);
 
+        // Seed real active session derived from sensitiveToken with sensitiveDigest and sensitiveAuthId
+        const nowIso = new Date().toISOString();
+        const expiresIso = new Date(Date.now() + 3600 * 1000).toISOString();
+        const validFp = 'b'.repeat(64);
+        db.prepare(`
+          INSERT INTO mcp_client_sessions (id, authorization_id, token_hash, scope, authorization_fingerprint, issued_at, expires_at, revoked_at)
+          VALUES (?, ?, ?, 'AUTHORIZED_CONTEXT_READ', ?, ?, ?, NULL)
+        `).run('session-secret-67', sensitiveAuthId, sensitiveDigest, validFp, nowIso, expiresIso);
+
+        // Introduce downstream authority conflict (project status CANCELLED)
+        db.prepare('UPDATE projects SET status = ? WHERE id = ?').run('CANCELLED', fixtures.projectId);
+
         // Positive internal reachability assertion for sensitiveAuthId:
-        // Service internally verifies authorization ID and reflects it in the unscrubbed internal error
+        // Issue session for sensitiveAuthId reaches downstream authority validation and fails closed with MCP_AUTHORITY_FENCED
         const probeRepo = new Repository(db);
         const probeService = new McpSessionAuthorityService(probeRepo, db);
-        let internalAuthErr: Error | null = null;
+        let internalIssueErr: unknown = null;
         try {
-          probeService.issueSession({ authorizationId: sensitiveAuthId + '-not-found' });
-        } catch (err) {
-          internalAuthErr = err as Error;
+          probeService.issueSession({ authorizationId: sensitiveAuthId });
+        } catch (err: unknown) {
+          internalIssueErr = err;
         }
-        expect(internalAuthErr).toBeDefined();
-        expect(internalAuthErr?.message).toContain(sensitiveAuthId);
+        expect(internalIssueErr).toBeInstanceOf(McpAuthorityError);
+        const typedIssueErr = internalIssueErr as McpAuthorityError;
+        expect(typedIssueErr.category).toBe('MCP_AUTHORITY_FENCED');
+        expect(typedIssueErr.message).toContain('Project status "CANCELLED"');
 
         // Positive internal reachability assertion for sensitiveToken and sensitiveDigest:
-        // Service validates token canonical form and looks up token_hash in database
-        expect(validateCanonicalSessionToken(sensitiveToken)).toBe(sensitiveToken);
-        expect(McpSessionAuthorityService.hashSessionToken(sensitiveToken)).toBe(sensitiveDigest);
-        let internalTokenErr: Error | null = null;
+        // Context resolution authenticates sensitiveToken, computes sensitiveDigest, matches DB session,
+        // traverses downstream authority graph for sensitiveAuthId, and throws MCP_AUTHORITY_FENCED
+        let internalContextErr: unknown = null;
         try {
           probeService.resolveAuthorizedContext(sensitiveToken);
-        } catch (err) {
-          internalTokenErr = err as Error;
+        } catch (err: unknown) {
+          internalContextErr = err;
         }
-        expect(internalTokenErr).toBeDefined();
-        expect(internalTokenErr?.message).toBe('[MCP_SESSION_UNAUTHORIZED] Session authentication failed');
+        expect(internalContextErr).toBeInstanceOf(McpAuthorityError);
+        const typedContextErr = internalContextErr as McpAuthorityError;
+        expect(typedContextErr.category).toBe('MCP_AUTHORITY_FENCED');
+        expect(typedContextErr.message).toContain('Project status "CANCELLED"');
 
         // Positive internal reachability assertion for sensitiveDbPath:
         // Verify real file exists on filesystem and is opened as SQLite handle
@@ -2229,23 +2333,30 @@ try {
       }
 
       // 2. Trigger real CLI issue error with opened database (reaches failing sink with sensitiveAuthId)
-      const nonExistentSecretAuth = sensitiveAuthId + '-not-found';
-      const exit1 = runSessionAdmin(['issue', '--db', sensitiveDbPath, '--auth', nonExistentSecretAuth]);
+      const exit1 = runSessionAdmin(['issue', '--db', sensitiveDbPath, '--auth', sensitiveAuthId]);
       expect(exit1).toBe(1);
 
       // 3. Trigger CLI revoke error with opened database
       const exit2 = runSessionAdmin(['revoke', '--db', sensitiveDbPath, '--session', '   ']);
       expect(exit2).toBe(1);
 
-      // 4. Trigger context error with seeded secret token
+      // 4. Trigger context error with seeded secret token (captures typed error and proves secret absence)
       const ctxToClose = new McpAuthorityContext({ dbPath: sensitiveDbPath, sessionToken: sensitiveToken });
+      let publicCtxErr: unknown = null;
       try {
-        expect(() => {
-          ctxToClose.resolveAuthorizedContext();
-        }).toThrow();
+        ctxToClose.resolveAuthorizedContext();
+      } catch (err: unknown) {
+        publicCtxErr = err;
       } finally {
         ctxToClose.close();
       }
+      expect(publicCtxErr).toBeInstanceOf(McpAuthorityError);
+      const typedPublicCtxErr = publicCtxErr as McpAuthorityError;
+      expect(typedPublicCtxErr.category).toBe('MCP_AUTHORITY_FENCED');
+      expect(typedPublicCtxErr.message).not.toContain(sensitiveToken);
+      expect(typedPublicCtxErr.message).not.toContain(sensitiveDigest);
+      expect(typedPublicCtxErr.message).not.toContain(sensitiveDbPath);
+      expect(typedPublicCtxErr.message).not.toContain(sensitiveAuthId);
 
       // 5. Test real MCP server tool and resource sinks with the failing context
       const toolContext = new McpAuthorityContext({ dbPath: sensitiveDbPath, sessionToken: sensitiveToken });
@@ -2261,16 +2372,29 @@ try {
           arguments: {},
         });
         expect(toolResult.isError).toBe(true);
+        expect(toolResult.content).toHaveLength(1);
         const toolText = (toolResult.content[0] as { type: 'text'; text: string }).text;
-        expect(toolText).toBe('[MCP_SESSION_UNAUTHORIZED] Session authentication failed');
+        expect(toolText).toBe('[MCP_AUTHORITY_FENCED] Execution authority fenced');
         expect(toolText).not.toContain(sensitiveToken);
         expect(toolText).not.toContain(sensitiveDigest);
         expect(toolText).not.toContain(sensitiveDbPath);
         expect(toolText).not.toContain(sensitiveAuthId);
 
-        await expect(
-          client.readResource({ uri: AUTHORIZED_CONTEXT_RESOURCE_URI })
-        ).rejects.toThrow();
+        let resourceErr: unknown = null;
+        try {
+          await client.readResource({ uri: AUTHORIZED_CONTEXT_RESOURCE_URI });
+        } catch (err: unknown) {
+          resourceErr = err;
+        }
+        expect(resourceErr).toBeInstanceOf(Error);
+        const typedResourceErr = resourceErr as Error & { code?: number; data?: unknown };
+        expect(typedResourceErr.message).toBe('[MCP_AUTHORITY_FENCED] Execution authority fenced');
+        expect(typedResourceErr.code).toBe(-32603);
+        expect(typedResourceErr.data).toBeUndefined();
+        expect(typedResourceErr.message).not.toContain(sensitiveToken);
+        expect(typedResourceErr.message).not.toContain(sensitiveDigest);
+        expect(typedResourceErr.message).not.toContain(sensitiveDbPath);
+        expect(typedResourceErr.message).not.toContain(sensitiveAuthId);
       } finally {
         await client.close();
         await server.close();
@@ -3351,22 +3475,45 @@ try {
       // 1. Setup real graph and prove positive internal reachability for retained sentinels
       const fixtures = setupFullGraph(db);
       try {
+        db.prepare('UPDATE execution_authorizations SET id = ? WHERE id = ?').run(sensitiveAuth, fixtures.authorizationId);
+
+        // Seed real active session derived from sensitiveToken with sensitiveDigest and sensitiveAuth
+        const nowIso = new Date().toISOString();
+        const expiresIso = new Date(Date.now() + 3600 * 1000).toISOString();
+        const validFp = 'b'.repeat(64);
+        db.prepare(`
+          INSERT INTO mcp_client_sessions (id, authorization_id, token_hash, scope, authorization_fingerprint, issued_at, expires_at, revoked_at)
+          VALUES (?, ?, ?, 'AUTHORIZED_CONTEXT_READ', ?, ?, ?, NULL)
+        `).run('session-secret-110', sensitiveAuth, sensitiveDigest, validFp, nowIso, expiresIso);
+
+        // Downstream authority conflict: cancel project
+        db.prepare('UPDATE projects SET status = ? WHERE id = ?').run('CANCELLED', fixtures.projectId);
+
         // Positive internal reachability assertion for sensitiveAuth:
         const probeRepo = new Repository(db);
         const probeService = new McpSessionAuthorityService(probeRepo, db);
-        let internalAuthErr: Error | null = null;
+        let internalAuthErr: unknown = null;
         try {
           probeService.issueSession({ authorizationId: sensitiveAuth });
-        } catch (err) {
-          internalAuthErr = err as Error;
+        } catch (err: unknown) {
+          internalAuthErr = err;
         }
-        expect(internalAuthErr).toBeDefined();
-        expect(internalAuthErr?.message).toContain(sensitiveAuth);
+        expect(internalAuthErr).toBeInstanceOf(McpAuthorityError);
+        const typedAuthErr = internalAuthErr as McpAuthorityError;
+        expect(typedAuthErr.category).toBe('MCP_AUTHORITY_FENCED');
+        expect(typedAuthErr.message).toContain('Project status "CANCELLED"');
 
         // Positive internal reachability assertion for sensitiveToken and sensitiveDigest:
-        expect(validateCanonicalSessionToken(sensitiveToken)).toBe(sensitiveToken);
-        expect(McpSessionAuthorityService.hashSessionToken(sensitiveToken)).toBe(sensitiveDigest);
-        expect(probeRepo.getMcpClientSessionByTokenHash(sensitiveDigest)).toBeNull();
+        let internalTokenErr: unknown = null;
+        try {
+          probeService.resolveAuthorizedContext(sensitiveToken);
+        } catch (err: unknown) {
+          internalTokenErr = err;
+        }
+        expect(internalTokenErr).toBeInstanceOf(McpAuthorityError);
+        const typedTokenErr = internalTokenErr as McpAuthorityError;
+        expect(typedTokenErr.category).toBe('MCP_AUTHORITY_FENCED');
+        expect(typedTokenErr.message).toContain('Project status "CANCELLED"');
 
         // Positive reachability assertion for sensitivePath:
         expect(fs.existsSync(sensitivePath)).toBe(true);
@@ -3374,34 +3521,49 @@ try {
         db.close();
       }
 
-      // 2. Admin issue sink: fails closed, excludes secrets from stdout and stderr
+      // 2. Admin issue sink: fails closed with MCP_AUTHORITY_FENCED, excludes secrets from stdout and stderr
       let adminStdout = '';
+      let adminStderr = '';
       const origStdout = process.stdout.write;
+      const origStderr = process.stderr.write;
       process.stdout.write = ((chunk: unknown) => { adminStdout += String(chunk); return true; }) as typeof process.stdout.write;
+      process.stderr.write = ((chunk: unknown) => { adminStderr += String(chunk); return true; }) as typeof process.stderr.write;
       try {
-        const exitIssueUnknownAuth = runSessionAdmin(['issue', '--db', sensitivePath, '--auth', sensitiveAuth]);
-        expect(exitIssueUnknownAuth).toBe(1);
-
-        const exitRevoke = runSessionAdmin(['revoke', '--db', sensitivePath, '--session', sensitiveToken]);
-        expect(exitRevoke).toBe(0);
+        const exitIssueFencedAuth = runSessionAdmin(['issue', '--db', sensitivePath, '--auth', sensitiveAuth]);
+        expect(exitIssueFencedAuth).toBe(1);
 
         const exitRevokeInvalid = runSessionAdmin(['revoke', '--db', sensitivePath, '--session', '   ']);
         expect(exitRevokeInvalid).toBe(1);
       } finally {
         process.stdout.write = origStdout;
+        process.stderr.write = origStderr;
       }
       expect(adminStdout).not.toContain(sensitiveToken);
       expect(adminStdout).not.toContain(sensitiveDigest);
       expect(adminStdout).not.toContain(sensitivePath);
       expect(adminStdout).not.toContain(sensitiveAuth);
+      expect(adminStderr).not.toContain(sensitiveToken);
+      expect(adminStderr).not.toContain(sensitiveDigest);
+      expect(adminStderr).not.toContain(sensitivePath);
+      expect(adminStderr).not.toContain(sensitiveAuth);
 
-      // 3. Context resolution sink: throws McpAuthorityError, excludes secrets from public error
+      // 3. Context resolution sink: throws McpAuthorityError, captures error, excludes secrets from public error
       const ctx = new McpAuthorityContext({ dbPath: sensitivePath, sessionToken: sensitiveToken });
+      let publicCtxErr: unknown = null;
       try {
-        expect(() => ctx.resolveAuthorizedContext()).toThrow();
+        ctx.resolveAuthorizedContext();
+      } catch (err: unknown) {
+        publicCtxErr = err;
       } finally {
         ctx.close();
       }
+      expect(publicCtxErr).toBeInstanceOf(McpAuthorityError);
+      const typedPublicCtxErr = publicCtxErr as McpAuthorityError;
+      expect(typedPublicCtxErr.category).toBe('MCP_AUTHORITY_FENCED');
+      expect(typedPublicCtxErr.message).not.toContain(sensitiveToken);
+      expect(typedPublicCtxErr.message).not.toContain(sensitiveDigest);
+      expect(typedPublicCtxErr.message).not.toContain(sensitivePath);
+      expect(typedPublicCtxErr.message).not.toContain(sensitiveAuth);
 
       // 4. MCP Server Tool and Resource sinks: execute via MCP protocol and assert sanitized errors
       const toolContext = new McpAuthorityContext({ dbPath: sensitivePath, sessionToken: sensitiveToken });
@@ -3417,21 +3579,36 @@ try {
           arguments: {},
         });
         expect(toolRes.isError).toBe(true);
+        expect(toolRes.content).toHaveLength(1);
         const toolErrText = (toolRes.content[0] as { type: 'text'; text: string }).text;
-        expect(toolErrText).toBe('[MCP_SESSION_UNAUTHORIZED] Session authentication failed');
+        expect(toolErrText).toBe('[MCP_AUTHORITY_FENCED] Execution authority fenced');
         expect(toolErrText).not.toContain(sensitiveToken);
         expect(toolErrText).not.toContain(sensitiveDigest);
         expect(toolErrText).not.toContain(sensitivePath);
         expect(toolErrText).not.toContain(sensitiveAuth);
 
-        await expect(client.readResource({ uri: AUTHORIZED_CONTEXT_RESOURCE_URI })).rejects.toThrow();
+        let resourceErr: unknown = null;
+        try {
+          await client.readResource({ uri: AUTHORIZED_CONTEXT_RESOURCE_URI });
+        } catch (err: unknown) {
+          resourceErr = err;
+        }
+        expect(resourceErr).toBeInstanceOf(Error);
+        const typedResourceErr = resourceErr as Error & { code?: number; data?: unknown };
+        expect(typedResourceErr.message).toBe('[MCP_AUTHORITY_FENCED] Execution authority fenced');
+        expect(typedResourceErr.code).toBe(-32603);
+        expect(typedResourceErr.data).toBeUndefined();
+        expect(typedResourceErr.message).not.toContain(sensitiveToken);
+        expect(typedResourceErr.message).not.toContain(sensitiveDigest);
+        expect(typedResourceErr.message).not.toContain(sensitivePath);
+        expect(typedResourceErr.message).not.toContain(sensitiveAuth);
       } finally {
         await client.close();
         await server.close();
         toolContext.close();
       }
 
-      // 5. Compiled stdio child transport sink: send real JSON-RPC tools/call request over stdio
+      // 5. Compiled stdio child transport sink: send real JSON-RPC tools/call and resources/read request over stdio
       const runtimeDir = getOrMaterializeTestRuntime();
       const stdioScript = path.resolve(runtimeDir, 'mcp', 'stdio.js');
       const stdioHarness = createStdioChildHarness(stdioScript, {
@@ -3450,7 +3627,7 @@ try {
             clientInfo: { name: 'test-stdio-sink', version: '1.0.0' },
           },
         });
-        stdioHarness.sendNotification({ jsonrpc: '2.0', method: 'notifications/initialized' });
+        await stdioHarness.sendNotification({ jsonrpc: '2.0', method: 'notifications/initialized' });
 
         const stdioToolRes = await stdioHarness.sendRequest({
           jsonrpc: '2.0',
@@ -3459,16 +3636,34 @@ try {
           params: { name: GET_AUTHORIZED_CONTEXT_TOOL_NAME, arguments: {} },
         });
         expect(stdioToolRes.result).toBeDefined();
-        expect((stdioToolRes.result as { isError?: boolean }).isError).toBe(true);
-        const stdioToolText = ((stdioToolRes.result as { content: Array<{ text: string }> }).content[0]).text;
-        expect(stdioToolText).toBe('[MCP_SESSION_UNAUTHORIZED] Session authentication failed');
+        const stdioToolResult = stdioToolRes.result as { isError?: boolean; content?: Array<{ text: string }> };
+        expect(stdioToolResult.isError).toBe(true);
+        expect(stdioToolResult.content).toBeDefined();
+        const stdioToolText = stdioToolResult.content?.[0]?.text;
+        expect(stdioToolText).toBe('[MCP_AUTHORITY_FENCED] Execution authority fenced');
         expect(stdioToolText).not.toContain(sensitiveToken);
         expect(stdioToolText).not.toContain(sensitiveDigest);
         expect(stdioToolText).not.toContain(sensitivePath);
         expect(stdioToolText).not.toContain(sensitiveAuth);
 
+        const stdioResourceRes = await stdioHarness.sendRequest({
+          jsonrpc: '2.0',
+          id: 3,
+          method: 'resources/read',
+          params: { uri: AUTHORIZED_CONTEXT_RESOURCE_URI },
+        });
+        expect(stdioResourceRes.error).toBeDefined();
+        const stdioResourceErr = stdioResourceRes.error as { code?: number; message?: string };
+        expect(stdioResourceErr.code).toBe(-32603);
+        expect(stdioResourceErr.message).toBe('[MCP_AUTHORITY_FENCED] Execution authority fenced');
+        expect(stdioResourceErr.message).not.toContain(sensitiveToken);
+        expect(stdioResourceErr.message).not.toContain(sensitiveDigest);
+        expect(stdioResourceErr.message).not.toContain(sensitivePath);
+        expect(stdioResourceErr.message).not.toContain(sensitiveAuth);
+
         stdioHarness.closeStdin();
-        await stdioHarness.waitForExit();
+        const stdioExit = await stdioHarness.waitForExit();
+        expect(stdioExit.code).toBe(0);
 
         const stdioStdout = stdioHarness.getStdoutLines().join('\n');
         expect(stdioStdout).not.toContain(sensitiveToken);
@@ -3485,6 +3680,29 @@ try {
         await stdioHarness.close();
       }
 
+      // 5.5. Admin revoke sink: revoke sensitiveAuth, verify exit code 0, exclude secrets from output
+      let revokeStdout = '';
+      let revokeStderr = '';
+      const origRevokeStdout = process.stdout.write;
+      const origRevokeStderr = process.stderr.write;
+      process.stdout.write = ((chunk: unknown) => { revokeStdout += String(chunk); return true; }) as typeof process.stdout.write;
+      process.stderr.write = ((chunk: unknown) => { revokeStderr += String(chunk); return true; }) as typeof process.stderr.write;
+      try {
+        const exitRevoke = runSessionAdmin(['revoke', '--db', sensitivePath, '--auth', sensitiveAuth]);
+        expect(exitRevoke).toBe(0);
+      } finally {
+        process.stdout.write = origRevokeStdout;
+        process.stderr.write = origRevokeStderr;
+      }
+      expect(revokeStdout).not.toContain(sensitiveToken);
+      expect(revokeStdout).not.toContain(sensitiveDigest);
+      expect(revokeStdout).not.toContain(sensitivePath);
+      expect(revokeStdout).not.toContain(sensitiveAuth);
+      expect(revokeStderr).not.toContain(sensitiveToken);
+      expect(revokeStderr).not.toContain(sensitiveDigest);
+      expect(revokeStderr).not.toContain(sensitivePath);
+      expect(revokeStderr).not.toContain(sensitiveAuth);
+
       // 6. Cleanup sink: exercise real production cleanup sink receiving a secret-bearing failure
       let cleanupStderr = '';
       const cleanupStderrWrite = (chunk: unknown) => { cleanupStderr += String(chunk); return true; };
@@ -3500,9 +3718,8 @@ try {
           throw new Error(`Internal sqlite native close error: ${sensitiveCleanupSecret}`);
         };
 
-        const cleanupExitCode = runSessionAdmin(['issue', '--db', sensitivePath, '--auth', fixtures.authorizationId]);
+        const cleanupExitCode = runSessionAdmin(['issue', '--db', sensitivePath, '--auth', sensitiveAuth]);
         expect(cleanupExitCode).toBe(1);
-        // Positive reachability assertion that production close threw the sensitive cleanup secret:
         expect(closeCalledWithSecret).toBeGreaterThan(0);
         expect(cleanupStderr).toContain('[MCP_CLEANUP_FAILED]');
         expect(cleanupStderr).not.toContain(sensitiveCleanupSecret);
@@ -3557,7 +3774,7 @@ try {
       });
       expect((initRes.result as { serverInfo: { name: string } }).serverInfo.name).toBe('agentforge');
 
-      harness.sendNotification({ jsonrpc: '2.0', method: 'notifications/initialized' });
+      await harness.sendNotification({ jsonrpc: '2.0', method: 'notifications/initialized' });
 
       // 2. Call tool get_authorized_context
       const toolRes = await harness.sendRequest({
@@ -3653,7 +3870,7 @@ try {
         });
         expect((initRes.result as { serverInfo: { name: string } }).serverInfo.name).toBe('agentforge');
 
-        harness.sendNotification({ jsonrpc: '2.0', method: 'notifications/initialized' });
+        await harness.sendNotification({ jsonrpc: '2.0', method: 'notifications/initialized' });
 
         // 2. Tool call get_authorized_context before signal
         const toolRes = await harness.sendRequest({
@@ -4419,7 +4636,7 @@ try {
     }
   });
 
-  it('123. Stdio child harness: rejects request and exit wait immediately on spawn error / missing module within local budget', async () => {
+  it('123. Stdio child harness: rejects request and exit wait on module-load failure / missing script within local budget', async () => {
     const missingScript = path.join(tempDir, `missing_script_${crypto.randomUUID().slice(0, 8)}.js`);
     const harness = createStdioChildHarness(missingScript, {});
     const startTime = Date.now();
@@ -4558,6 +4775,167 @@ try {
     } finally {
       await harness.close();
       if (fs.existsSync(hangScript)) fs.unlinkSync(hangScript);
+    }
+  });
+
+  it('129. Stdio child harness: deterministic spawn error rejects waiting and future requests and exit waits immediately', async () => {
+    class MockChildProcess extends EventEmitter {
+      public stdin = new PassThrough();
+      public stdout = new PassThrough();
+      public stderr = new PassThrough();
+      public exitCode: number | null = null;
+      public signalCode: NodeJS.Signals | null = null;
+      public pid = 12345;
+      public kill(): boolean {
+        return true;
+      }
+    }
+
+    // 1. Prior request and prior waitForExit reject immediately on emitted spawn error
+    const mockChild1 = new MockChildProcess();
+    const customSpawn1 = () => mockChild1 as unknown as ChildProcess;
+    const harness1 = createStdioChildHarness('dummy.js', {}, undefined, { customSpawn: customSpawn1 });
+
+    const waitingRequestPromise = harness1.sendRequest({ jsonrpc: '2.0', id: 1, method: 'ping' }, 4000);
+    const priorExitPromise = harness1.waitForExit(4000);
+
+    const testSpawnError = new Error('spawn ENOENT: injected test spawn error');
+    mockChild1.emit('error', testSpawnError);
+
+    await expect(waitingRequestPromise).rejects.toThrow(/injected test spawn error/);
+    await expect(priorExitPromise).rejects.toThrow(/injected test spawn error/);
+
+    // 2. Later request and future waitForExit reject immediately from recorded spawn error
+    await expect(
+      harness1.sendRequest({ jsonrpc: '2.0', id: 2, method: 'ping' }, 4000)
+    ).rejects.toThrow(/Cannot send request: child failed to spawn/);
+
+    await expect(
+      harness1.waitForExit(4000)
+    ).rejects.toThrow(/Child failed to spawn/);
+
+    // 3. Cleanup is visible and completes cleanly without trying to kill nonexistent PID
+    await expect(harness1.close()).resolves.toBeUndefined();
+  });
+
+  it('130. Stdio child harness: notification and request write failure reject promptly without unhandled stream errors', async () => {
+    const hangScript = path.join(tempDir, `hang_notif_${crypto.randomUUID().slice(0, 8)}.js`);
+    fs.writeFileSync(
+      hangScript,
+      `
+      setInterval(() => {}, 1000);
+      `,
+      'utf8'
+    );
+    const harness = createStdioChildHarness(hangScript, {});
+    const startTime = Date.now();
+    try {
+      // Close / destroy child stdin
+      harness.closeStdin();
+
+      // Notification write to closed/destroyed stdin must reject promptly
+      await expect(
+        harness.sendNotification({ jsonrpc: '2.0', method: 'notifications/initialized' })
+      ).rejects.toThrow(/closed or destroyed/);
+
+      // Request write to closed/destroyed stdin must also reject promptly
+      await expect(
+        harness.sendRequest({ jsonrpc: '2.0', id: 1, method: 'ping' }, 4000)
+      ).rejects.toThrow(/closed or destroyed/);
+
+      const elapsed = Date.now() - startTime;
+      expect(elapsed).toBeLessThan(2000);
+    } finally {
+      await harness.close();
+      if (fs.existsSync(hangScript)) fs.unlinkSync(hangScript);
+    }
+  });
+
+  it('131. Worker harness: cleanup() before READY settles both readiness and result promises with typed diagnostic', async () => {
+    const workerScript = `
+      // Never emits READY
+      setInterval(() => {}, 1000);
+    `;
+    const w = new Worker(workerScript, { eval: true });
+    const harness = createWorkerHarness<{ success: boolean }>(w, 4000);
+    const startTime = Date.now();
+    try {
+      const [readyOutcome, resultOutcome, cleanupOutcome] = await Promise.allSettled([
+        harness.readyPromise,
+        harness.resultPromise,
+        harness.cleanup(),
+      ]);
+
+      const elapsed = Date.now() - startTime;
+      expect(elapsed).toBeLessThan(2000);
+      expect(cleanupOutcome.status).toBe('fulfilled');
+      expect(readyOutcome.status).toBe('rejected');
+      expect(resultOutcome.status).toBe('rejected');
+      expect((readyOutcome as PromiseRejectedResult).reason.message).toContain('[WORKER_CLEANUP_CANCELLED]');
+      expect((resultOutcome as PromiseRejectedResult).reason.message).toContain('[WORKER_CLEANUP_CANCELLED]');
+
+      // Idempotent cleanup call
+      await expect(harness.cleanup()).resolves.toBeUndefined();
+    } finally {
+      await harness.cleanup();
+    }
+  });
+
+  it('132. Worker harness: cleanup() after READY but before result settles result promise with typed diagnostic', async () => {
+    const workerScript = `
+      const { parentPort } = require('node:worker_threads');
+      parentPort.postMessage('READY');
+      // Keeps running without emitting result
+      setInterval(() => {}, 1000);
+    `;
+    const w = new Worker(workerScript, { eval: true });
+    const harness = createWorkerHarness<{ success: boolean }>(w, 4000);
+    const startTime = Date.now();
+    try {
+      await harness.readyPromise;
+
+      const [resultOutcome, cleanupOutcome] = await Promise.allSettled([
+        harness.resultPromise,
+        harness.cleanup(),
+      ]);
+
+      const elapsed = Date.now() - startTime;
+      expect(elapsed).toBeLessThan(2000);
+      expect(cleanupOutcome.status).toBe('fulfilled');
+      expect(resultOutcome.status).toBe('rejected');
+      expect((resultOutcome as PromiseRejectedResult).reason.message).toContain('[WORKER_CLEANUP_CANCELLED]');
+    } finally {
+      await harness.cleanup();
+    }
+  });
+
+  it('133. Worker harness: cleanup() propagates worker termination failure visibly and settles exposed promises', async () => {
+    const workerScript = `
+      setInterval(() => {}, 1000);
+    `;
+    const w = new Worker(workerScript, { eval: true });
+    const harness = createWorkerHarness<{ success: boolean }>(w, 4000);
+    const startTime = Date.now();
+    try {
+      w.terminate = () => Promise.reject(new Error('[INJECTED_TERMINATION_FAILURE] Worker failed to terminate'));
+
+      const [readyOutcome, resultOutcome, cleanupOutcome] = await Promise.allSettled([
+        harness.readyPromise,
+        harness.resultPromise,
+        harness.cleanup(),
+      ]);
+
+      const elapsed = Date.now() - startTime;
+      expect(elapsed).toBeLessThan(2000);
+      expect(cleanupOutcome.status).toBe('rejected');
+      expect((cleanupOutcome as PromiseRejectedResult).reason.message).toContain('[INJECTED_TERMINATION_FAILURE]');
+      expect(readyOutcome.status).toBe('rejected');
+      expect((readyOutcome as PromiseRejectedResult).reason.message).toContain('[WORKER_CLEANUP_CANCELLED]');
+      expect(resultOutcome.status).toBe('rejected');
+      expect((resultOutcome as PromiseRejectedResult).reason.message).toContain('[WORKER_CLEANUP_CANCELLED]');
+    } finally {
+      w.terminate = Worker.prototype.terminate;
+      await w.terminate();
     }
   });
 });
