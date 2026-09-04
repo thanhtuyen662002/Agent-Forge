@@ -287,6 +287,7 @@ function createWorkerHarness<TResult>(w: Worker, timeoutMs = 8000): WorkerHarnes
 interface StdioChildHarnessOptions {
   customExecutable?: string;
   customSpawn?: (command: string, args: readonly string[], options: Record<string, unknown>) => ChildProcess;
+  closeExitWaitOverride?: (timeoutMs?: number) => Promise<{ code: number | null; signal: NodeJS.Signals | null }>;
 }
 
 interface StdioChildHarness {
@@ -299,6 +300,8 @@ interface StdioChildHarness {
   getStdoutLines: () => string[];
   getStderr: () => string;
   close: () => Promise<void>;
+  setCloseExitWaitForTesting?: (fn: (timeoutMs?: number) => Promise<{ code: number | null; signal: NodeJS.Signals | null }>) => void;
+  getPendingOperationCountForTesting?: () => number;
 }
 
 function createStdioChildHarness(
@@ -342,6 +345,11 @@ function createStdioChildHarness(
   let childSpawnError: Error | null = null;
   let childStdinError: Error | null = null;
 
+  interface PendingOperation {
+    terminate: (closeErr: Error) => void;
+  }
+  const pendingOperations = new Set<PendingOperation>();
+
   type MessageListener = (msg: Record<string, unknown>) => void;
   const messageListeners = new Set<MessageListener>();
 
@@ -372,7 +380,7 @@ function createStdioChildHarness(
           const errMsg = parseErr instanceof Error ? parseErr.message : String(parseErr);
           const contamErr = new Error(`Protocol contamination: non-JSON stdout line emitted by child: "${line}" (${errMsg})`);
           protocolContaminationError = contamErr;
-          for (const l of contaminationListeners) {
+          for (const l of Array.from(contaminationListeners)) {
             l(contamErr);
           }
           return;
@@ -381,7 +389,7 @@ function createStdioChildHarness(
         if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) {
           const contamErr = new Error(`Protocol contamination: non-object JSON stdout line emitted: "${line}"`);
           protocolContaminationError = contamErr;
-          for (const l of contaminationListeners) {
+          for (const l of Array.from(contaminationListeners)) {
             l(contamErr);
           }
           return;
@@ -389,7 +397,7 @@ function createStdioChildHarness(
 
         const msgObj = parsed as Record<string, unknown>;
         parsedMessages.push(msgObj);
-        for (const listener of messageListeners) {
+        for (const listener of Array.from(messageListeners)) {
           listener(msgObj);
         }
       }
@@ -403,21 +411,21 @@ function createStdioChildHarness(
 
   const onStdinError = (err: Error) => {
     childStdinError = err;
-    for (const l of stdinErrorListeners) {
+    for (const l of Array.from(stdinErrorListeners)) {
       l(err);
     }
   };
 
   const onChildError = (err: Error) => {
     childSpawnError = err;
-    for (const l of errorListeners) {
+    for (const l of Array.from(errorListeners)) {
       l(err);
     }
   };
 
   const onChildExit = (code: number | null, signal: NodeJS.Signals | null) => {
     childExitResult = { code, signal };
-    for (const l of exitListeners) {
+    for (const l of Array.from(exitListeners)) {
       l({ code, signal });
     }
   };
@@ -427,6 +435,9 @@ function createStdioChildHarness(
   childStdin.on('error', onStdinError);
   child.on('error', onChildError);
   child.on('exit', onChildExit);
+
+  let isFinalized = false;
+  let closePromise: Promise<void> | null = null;
 
   const sendRequest = (req: Record<string, unknown>, timeoutMs = 8000): Promise<Record<string, unknown>> => {
     const reqId = req.id;
@@ -445,6 +456,9 @@ function createStdioChildHarness(
     }
     if (childExitResult) {
       return Promise.reject(new Error(`Cannot send request: child exited prematurely with code ${childExitResult.code}`));
+    }
+    if (closePromise || isFinalized) {
+      return Promise.reject(new Error('[HARNESS_CLOSE_FAILED] stdio child harness closed before operation completion'));
     }
     if (childStdin.destroyed || !childStdin.writable) {
       return Promise.reject(new Error('Cannot send request: child stdin is closed or destroyed'));
@@ -465,12 +479,24 @@ function createStdioChildHarness(
           clearTimeout(timer);
           timer = null;
         }
+        pendingOperations.delete(op);
         messageListeners.delete(onMessage);
         exitListeners.delete(onExit);
         errorListeners.delete(onError);
         contaminationListeners.delete(onContamination);
         stdinErrorListeners.delete(onStdinErr);
       };
+
+      const op: PendingOperation = {
+        terminate: (closeErr: Error) => {
+          if (!isSettled) {
+            isSettled = true;
+            cleanup();
+            reject(closeErr);
+          }
+        },
+      };
+      pendingOperations.add(op);
 
       const onStdinErr: StdinErrorListener = (err) => {
         if (!isSettled) {
@@ -562,6 +588,9 @@ function createStdioChildHarness(
     if (childExitResult) {
       return Promise.reject(new Error(`Cannot send notification: child exited prematurely with code ${childExitResult.code}`));
     }
+    if (closePromise || isFinalized) {
+      return Promise.reject(new Error('[HARNESS_CLOSE_FAILED] stdio child harness closed before operation completion'));
+    }
     if (childStdin.destroyed || !childStdin.writable) {
       return Promise.reject(new Error('Cannot send notification: child stdin is closed or destroyed'));
     }
@@ -575,11 +604,23 @@ function createStdioChildHarness(
           clearTimeout(timer);
           timer = null;
         }
+        pendingOperations.delete(op);
         stdinErrorListeners.delete(onStdinErr);
         errorListeners.delete(onError);
         exitListeners.delete(onExit);
         contaminationListeners.delete(onContamination);
       };
+
+      const op: PendingOperation = {
+        terminate: (closeErr: Error) => {
+          if (!isSettled) {
+            isSettled = true;
+            cleanup();
+            reject(closeErr);
+          }
+        },
+      };
+      pendingOperations.add(op);
 
       const onContamination: ContaminationListener = (contamErr) => {
         if (!isSettled) {
@@ -660,7 +701,10 @@ function createStdioChildHarness(
     if (childExitResult) {
       return Promise.resolve(childExitResult);
     }
-    return new Promise((resolve, reject) => {
+    if (closePromise || isFinalized) {
+      return Promise.reject(new Error('[HARNESS_CLOSE_FAILED] stdio child harness closed before operation completion'));
+    }
+    return new Promise<{ code: number | null; signal: NodeJS.Signals | null }>((resolve, reject) => {
       let isSettled = false;
       let timer: NodeJS.Timeout | null = null;
 
@@ -669,9 +713,21 @@ function createStdioChildHarness(
           clearTimeout(timer);
           timer = null;
         }
+        pendingOperations.delete(op);
         exitListeners.delete(onExit);
         errorListeners.delete(onError);
       };
+
+      const op: PendingOperation = {
+        terminate: (closeErr: Error) => {
+          if (!isSettled) {
+            isSettled = true;
+            cleanup();
+            reject(closeErr);
+          }
+        },
+      };
+      pendingOperations.add(op);
 
       const onExit: ExitListener = (res) => {
         if (!isSettled) {
@@ -710,14 +766,19 @@ function createStdioChildHarness(
     }
   };
 
-  let isFinalized = false;
-  let closePromise: Promise<void> | null = null;
-
   const finalizeHarness = () => {
     if (isFinalized) {
       return;
     }
     isFinalized = true;
+
+    // Actively settle all remaining in-flight operations with scrubbed deterministic terminal error
+    const closeError = new Error('[HARNESS_CLOSE_FAILED] stdio child harness closed before operation completion');
+    const remainingOps = Array.from(pendingOperations);
+    for (const op of remainingOps) {
+      op.terminate(closeError);
+    }
+    pendingOperations.clear();
 
     childStdout.removeListener('data', onStdoutData);
     childStderr.removeListener('data', onStderrData);
@@ -731,6 +792,12 @@ function createStdioChildHarness(
     contaminationListeners.clear();
     stdinErrorListeners.clear();
   };
+
+  let closeExitWaitFn = options?.closeExitWaitOverride ?? waitForExit;
+  const setCloseExitWaitForTesting = (fn: (timeoutMs?: number) => Promise<{ code: number | null; signal: NodeJS.Signals | null }>) => {
+    closeExitWaitFn = fn;
+  };
+  const getPendingOperationCountForTesting = () => pendingOperations.size;
 
   const harness: StdioChildHarness = {
     child,
@@ -758,7 +825,7 @@ function createStdioChildHarness(
           }
           if (child.exitCode === null && child.signalCode === null) {
             child.kill('SIGKILL');
-            await harness.waitForExit(2000);
+            await closeExitWaitFn(2000);
           }
         } finally {
           finalizeHarness();
@@ -767,6 +834,8 @@ function createStdioChildHarness(
 
       return closePromise;
     },
+    setCloseExitWaitForTesting,
+    getPendingOperationCountForTesting,
   };
 
   return harness;
@@ -4878,11 +4947,27 @@ try {
     }
   });
 
-  it('128. Stdio child harness: close() surfaces exit wait failure visibly, remains sticky on concurrent and repeated calls, detaches listeners at most once, and restores baseline', async () => {
+  it('128. Stdio child harness: failed close actively settles pending request, notification, and external exit wait promptly, remains sticky with exact Promise identity, detaches listeners at most once, and restores baseline', async () => {
     let killInvocationCount = 0;
 
+    class WithheldCallbackStdin128 extends PassThrough {
+      public withheldCallbacks: Array<(err?: Error | null) => void> = [];
+      override write(
+        chunk: unknown,
+        encodingOrCb?: BufferEncoding | ((error: Error | null | undefined) => void),
+        cb?: (error: Error | null | undefined) => void
+      ): boolean {
+        const callback = typeof encodingOrCb === 'function' ? encodingOrCb : cb;
+        if (typeof callback === 'function') {
+          this.withheldCallbacks.push(callback);
+        }
+        // Deliberately withhold calling write callback to simulate pending in-flight write
+        return true;
+      }
+    }
+
     class MockChildProcessFailedClose extends EventEmitter {
-      public stdin = new PassThrough();
+      public stdin = new WithheldCallbackStdin128();
       public stdout = new PassThrough();
       public stderr = new PassThrough();
       public exitCode: number | null = null;
@@ -4895,6 +4980,10 @@ try {
     }
 
     const mockChild = new MockChildProcessFailedClose();
+    const capturedBaselineErrors: Error[] = [];
+    mockChild.on('error', (err: Error) => {
+      capturedBaselineErrors.push(err);
+    });
     const baselineListeners = {
       childError: mockChild.listenerCount('error'),
       childExit: mockChild.listenerCount('exit'),
@@ -4903,8 +4992,12 @@ try {
       stdinError: mockChild.stdin.listenerCount('error'),
     };
 
+    const cleanupError = new Error('[EXPECTED_CLEANUP_FAILURE] Timed out waiting for child exit');
     const customSpawn = () => mockChild as unknown as ChildProcess;
-    const harness = createStdioChildHarness('dummy.js', {}, undefined, { customSpawn });
+    const harness = createStdioChildHarness('dummy.js', {}, undefined, {
+      customSpawn,
+      closeExitWaitOverride: () => Promise.reject(cleanupError),
+    });
 
     // Verify listeners attached
     expect(mockChild.listenerCount('error')).toBe(baselineListeners.childError + 1);
@@ -4913,37 +5006,109 @@ try {
     expect(mockChild.stderr.listenerCount('data')).toBe(baselineListeners.stderrData + 1);
     expect(mockChild.stdin.listenerCount('error')).toBe(baselineListeners.stdinError + 1);
 
-    // Override waitForExit to deterministically fail with canonical cleanup failure
-    const cleanupError = new Error('[EXPECTED_CLEANUP_FAILURE] Timed out waiting for child exit');
-    harness.waitForExit = () => Promise.reject(cleanupError);
+    // 1. Before invoking concurrent close, create all three real outstanding operation types
+    const pendingRequestPromise = harness.sendRequest({ jsonrpc: '2.0', id: 101, method: 'tools/call' }, 8000);
+    const pendingNotificationPromise = harness.sendNotification({ jsonrpc: '2.0', method: 'notifications/initialized' }, 8000);
+    const pendingExternalExitPromise = harness.waitForExit(8000);
 
-    // 1. Concurrent close calls: both reject with the exact same diagnostic
-    const [res1, res2] = await Promise.allSettled([harness.close(), harness.close()]);
-    expect(res1.status).toBe('rejected');
-    expect(res2.status).toBe('rejected');
-    expect((res1 as PromiseRejectedResult).reason.message).toContain('[EXPECTED_CLEANUP_FAILURE] Timed out waiting for child exit');
-    expect((res2 as PromiseRejectedResult).reason.message).toContain('[EXPECTED_CLEANUP_FAILURE] Timed out waiting for child exit');
+    expect(mockChild.stdin.withheldCallbacks.length).toBe(2);
+    expect(harness.getPendingOperationCountForTesting?.()).toBe(3);
 
-    // 2. Subsequent repeated close call: must NOT resolve or hide error, must reject with the exact same diagnostic
-    await expect(harness.close()).rejects.toThrow(/\[EXPECTED_CLEANUP_FAILURE\] Timed out waiting for child exit/);
+    const startTime = Date.now();
 
-    // 3. Kill and finalization occurred at most once
+    // 2. Invoke at least two concurrent close() calls
+    const closeOne = harness.close();
+    const closeTwo = harness.close();
+
+    // 3. Concurrent close calls return the exact same Promise object (identity test)
+    expect(closeTwo).toBe(closeOne);
+
+    // 4. Await all five Promises
+    const [
+      closeOneResult,
+      closeTwoResult,
+      requestResult,
+      notificationResult,
+      externalExitResult,
+    ] = await Promise.allSettled([
+      closeOne,
+      closeTwo,
+      pendingRequestPromise,
+      pendingNotificationPromise,
+      pendingExternalExitPromise,
+    ]);
+
+    const elapsed = Date.now() - startTime;
+
+    // 5. All five Promises settle within a bounded interval materially shorter than individual timeouts
+    expect(elapsed).toBeLessThan(1500);
+
+    // 6. Every close caller rejects with the same original, exact close failure
+    expect(closeOneResult.status).toBe('rejected');
+    expect(closeTwoResult.status).toBe('rejected');
+    expect((closeOneResult as PromiseRejectedResult).reason).toBe(cleanupError);
+    expect((closeTwoResult as PromiseRejectedResult).reason).toBe(cleanupError);
+    expect((closeOneResult as PromiseRejectedResult).reason.message).toBe('[EXPECTED_CLEANUP_FAILURE] Timed out waiting for child exit');
+    expect((closeTwoResult as PromiseRejectedResult).reason.message).toBe('[EXPECTED_CLEANUP_FAILURE] Timed out waiting for child exit');
+
+    // 7. The pending request, notification, and external exit wait settle promptly because of close finalization
+    expect(requestResult.status).toBe('rejected');
+    expect(notificationResult.status).toBe('rejected');
+    expect(externalExitResult.status).toBe('rejected');
+
+    const expectedCloseOpError = '[HARNESS_CLOSE_FAILED] stdio child harness closed before operation completion';
+    expect((requestResult as PromiseRejectedResult).reason.message).toBe(expectedCloseOpError);
+    expect((notificationResult as PromiseRejectedResult).reason.message).toBe(expectedCloseOpError);
+    expect((externalExitResult as PromiseRejectedResult).reason.message).toBe(expectedCloseOpError);
+
+    // 8. Kill and finalization occurred at most once
     expect(killInvocationCount).toBe(1);
 
-    // 4. Exact listener-baseline restoration after failed close
+    // 9. Withheld stdin callbacks delivered after finalization do not change any settled result
+    for (const cb of mockChild.stdin.withheldCallbacks) {
+      expect(() => cb(null)).not.toThrow();
+      expect(() => cb(new Error('late write error'))).not.toThrow();
+    }
+
+    // 10. Late exit/error/stdout/stderr events do not change any settled result
+    expect(() => {
+      mockChild.emit('exit', 0, null);
+      mockChild.emit('error', new Error('late child error'));
+      mockChild.stdout.write('late stdout line\n');
+      mockChild.stderr.write('late stderr line\n');
+    }).not.toThrow();
+    expect(capturedBaselineErrors.length).toBe(1);
+    expect(capturedBaselineErrors[0].message).toBe('late child error');
+
+    // 11. All harness listener counts return to their pre-test baseline
     expect(mockChild.listenerCount('error')).toBe(baselineListeners.childError);
     expect(mockChild.listenerCount('exit')).toBe(baselineListeners.childExit);
     expect(mockChild.stdout.listenerCount('data')).toBe(baselineListeners.stdoutData);
     expect(mockChild.stderr.listenerCount('data')).toBe(baselineListeners.stderrData);
     expect(mockChild.stdin.listenerCount('error')).toBe(baselineListeners.stdinError);
 
-    // 5. Repeated close preserves baseline listener counts
-    await expect(harness.close()).rejects.toThrow(/\[EXPECTED_CLEANUP_FAILURE\] Timed out waiting for child exit/);
+    // 12. The pending-operation registry is empty
+    expect(harness.getPendingOperationCountForTesting?.()).toBe(0);
+
+    // 13. Repeating close() returns the same sticky rejected Promise and performs no additional cleanup
+    const closeThree = harness.close();
+    expect(closeThree).toBe(closeOne);
+    let closeThreeErr: unknown = null;
+    try {
+      await closeThree;
+    } catch (err) {
+      closeThreeErr = err;
+    }
+    expect(closeThreeErr).toBe(cleanupError);
+    expect(killInvocationCount).toBe(1);
+
+    // Baseline listener counts remain preserved
     expect(mockChild.listenerCount('error')).toBe(baselineListeners.childError);
     expect(mockChild.listenerCount('exit')).toBe(baselineListeners.childExit);
     expect(mockChild.stdout.listenerCount('data')).toBe(baselineListeners.stdoutData);
     expect(mockChild.stderr.listenerCount('data')).toBe(baselineListeners.stderrData);
     expect(mockChild.stdin.listenerCount('error')).toBe(baselineListeners.stdinError);
+    expect(harness.getPendingOperationCountForTesting?.()).toBe(0);
   });
 
   it('129. Stdio child harness: deterministic spawn error rejects waiting and future requests and exit waits immediately', async () => {
@@ -5311,35 +5476,60 @@ try {
     const customSpawn = () => mockChild as unknown as ChildProcess;
     const harness = createStdioChildHarness('dummy.js', {}, undefined, { customSpawn });
 
+    const expectedContaminationMessage = 'Protocol contamination: non-object JSON stdout line emitted: "[]"';
     const startTime = Date.now();
     try {
       // 1. Dispatch notification whose write callback is withheld
       const notifPromise = harness.sendNotification({ jsonrpc: '2.0', method: 'notifications/initialized' }, 4000);
       expect(mockChild.stdin.withheldCallbacks.length).toBe(1);
+      expect(harness.getPendingOperationCountForTesting?.()).toBe(1);
 
-      // 2. Emit malformed stdout protocol contamination
-      mockChild.stdout.write('NON_JSON_PROTOCOL_CONTAMINATION_PAYLOAD\n');
+      // 2. Emit deterministic protocol contamination input (non-object JSON array)
+      mockChild.stdout.write('[]\n');
 
-      // 3. Pending notification must reject promptly with exact protocol contamination diagnostic
-      await expect(notifPromise).rejects.toThrow(
-        /Protocol contamination: non-JSON stdout line emitted by child: "NON_JSON_PROTOCOL_CONTAMINATION_PAYLOAD"/
-      );
+      // 3. Capture rejection as a value (no broad regex or substring matching)
+      let capturedError: unknown = null;
+      try {
+        await notifPromise;
+      } catch (err) {
+        capturedError = err;
+      }
+
       const elapsed = Date.now() - startTime;
       expect(elapsed).toBeLessThan(2000);
+
+      // Assert exact error type/category and exact message equality
+      expect(capturedError).toBeInstanceOf(Error);
+      const typedCapturedError = capturedError as Error;
+      expect(typedCapturedError.message).toBe(expectedContaminationMessage);
+
+      // Verify registry baseline after operation settled
+      expect(harness.getPendingOperationCountForTesting?.()).toBe(0);
 
       // 4. Late invocation of the saved write callback must NOT alter the settled rejection (once-only settlement)
       const savedCb = mockChild.stdin.withheldCallbacks[0];
       expect(() => savedCb(null)).not.toThrow();
       expect(() => savedCb(new Error('late write error'))).not.toThrow();
+      expect(harness.getPendingOperationCountForTesting?.()).toBe(0);
 
-      // 5. Future notification rejects immediately from recorded protocol contamination state
-      await expect(
-        harness.sendNotification({ jsonrpc: '2.0', method: 'notifications/initialized' }, 4000)
-      ).rejects.toThrow(/Protocol contamination/);
+      // 5. Future notification rejects immediately from recorded protocol contamination state with exact same recorded error
+      let futureError: unknown = null;
+      try {
+        await harness.sendNotification({ jsonrpc: '2.0', method: 'notifications/initialized' }, 4000);
+      } catch (err) {
+        futureError = err;
+      }
+
+      expect(futureError).toBeInstanceOf(Error);
+      const typedFutureError = futureError as Error;
+      expect(typedFutureError.message).toBe(expectedContaminationMessage);
+      expect(futureError).toBe(capturedError);
+      expect(harness.getPendingOperationCountForTesting?.()).toBe(0);
 
       // 6. Close restores harness-owned listener counts exactly to baseline
       await harness.close();
 
+      expect(harness.getPendingOperationCountForTesting?.()).toBe(0);
       expect(mockChild.listenerCount('error')).toBe(baselineListeners.childError);
       expect(mockChild.listenerCount('exit')).toBe(baselineListeners.childExit);
       expect(mockChild.stdout.listenerCount('data')).toBe(baselineListeners.stdoutData);
