@@ -209,8 +209,660 @@ try {
   Write-Host "INSTALLED_SQLITE_PATH=$dbPath" -ForegroundColor Green
   Write-Host "INSTALLED_SQLITE_SIZE_BYTES=$dbSize" -ForegroundColor Green
 
+  # 8. Installed MCP Client Bridge & Node-Mode Stdio Proof
+  Write-Host "[8/8] Testing installed MCP client bridge and stdio server..." -ForegroundColor Green
+  $installedAsar = Join-Path $tempInstallDir "resources\app.asar"
+  if (-not (Test-Path $installedAsar)) {
+    throw "INSTALLED_ASAR_MISSING: resources\app.asar not found at '$installedAsar'"
+  }
+  Write-Host "INSTALLED_ASAR_PATH=$installedAsar" -ForegroundColor Green
+
+  # Terminate GUI application cleanly before MCP proof to verify isolation
+  if ($null -ne $proc -and -not $proc.HasExited) {
+    Write-Host "Closing installed GUI process $($proc.Id)..." -ForegroundColor Green
+    try {
+      $proc.CloseMainWindow() | Out-Null
+      $closedInTime = $proc.WaitForExit(4000)
+      if (-not $closedInTime) {
+        Write-Host "INSTALLED_GUI_CLOSE_TIMEOUT: Process $($proc.Id) did not exit after CloseMainWindow"
+      }
+    } catch {
+      Write-Host "INSTALLED_GUI_CLOSE_WARN: CloseMainWindow error: $_"
+    }
+    if (-not $proc.HasExited) {
+      try {
+        $proc.Kill()
+      } catch {
+        Write-Host "INSTALLED_GUI_KILL_WARN: Kill error: $_"
+      }
+      $killWait = $proc.WaitForExit(2000)
+      if (-not $killWait) {
+        throw "INSTALLED_GUI_TERMINATION_FAILED: Process $($proc.Id) survived kill attempt"
+      }
+    }
+    Write-Host "INSTALLED_GUI_TERMINATED=PASS" -ForegroundColor Green
+  }
+
+  $tempMcpDir = Join-Path ([System.IO.Path]::GetTempPath()) "af-installed-mcp-smoke-$smokeGuid"
+  New-Item -ItemType Directory -Path $tempMcpDir -Force | Out-Null
+  $mcpDbPath = Join-Path $tempMcpDir "mcp-installed.db"
+  $bootstrapScript = Join-Path $tempMcpDir "installed-mcp-proof.js"
+
+  $bootstrapContent = @'
+const path = require('path');
+const fs = require('fs');
+const crypto = require('crypto');
+const { spawn } = require('child_process');
+
+const asarPath = path.resolve(process.argv[2]);
+const dbPath = path.resolve(process.argv[3]);
+const projectRoot = process.argv[4] ? path.resolve(process.argv[4]) : null;
+
+if (!fs.existsSync(asarPath)) {
+  console.error("FAIL: app.asar does not exist at " + asarPath);
+  process.exit(1);
+}
+
+console.log("R5J3_FACT_EXEC_PATH=" + process.execPath);
+console.log("R5J3_FACT_ELECTRON_VERSION=" + (process.versions.electron || "UNKNOWN"));
+console.log("R5J3_FACT_NODE_VERSION=" + process.versions.node);
+console.log("R5J3_FACT_ASAR_PATH=" + asarPath);
+
+if (!process.env.ELECTRON_RUN_AS_NODE) {
+  console.error("R5J3_FAIL: ELECTRON_RUN_AS_NODE is not set");
+  process.exit(1);
+}
+
+// F1: Package-rooted native module resolution
+const pkgRequire = require('module').createRequire(path.join(asarPath, 'package.json'));
+const jsEntryPath = pkgRequire.resolve('better-sqlite3');
+console.log("R5J3_FACT_JS_ENTRY_PATH=" + jsEntryPath);
+
+const Database = pkgRequire('better-sqlite3');
+
+const migrationsPath = path.join(asarPath, 'dist-electron', 'core', 'database', 'migrations.js');
+const repoPath = path.join(asarPath, 'dist-electron', 'core', 'database', 'repositories.js');
+const authorityServicePath = path.join(asarPath, 'dist-electron', 'core', 'services', 'McpSessionAuthorityService.js');
+const authServicePath = path.join(asarPath, 'dist-electron', 'core', 'services', 'ExecutionAuthorizationService.js');
+
+if (!fs.existsSync(migrationsPath) || !fs.existsSync(repoPath) || !fs.existsSync(authorityServicePath) || !fs.existsSync(authServicePath)) {
+  console.error("FAIL: Packaged modules missing in app.asar");
+  process.exit(1);
+}
+
+// Force native addon loading
+const db = new Database(dbPath);
+db.pragma('foreign_keys = ON');
+
+const loadedNodeKeys = Object.keys(require.cache).filter((k) => k.endsWith('.node'));
+const betterSqliteKey = loadedNodeKeys.find((k) => k.toLowerCase().includes('better_sqlite3'));
+if (!betterSqliteKey) {
+  console.error("FAIL: better_sqlite3.node was not loaded into require.cache");
+  process.exit(1);
+}
+
+const nativeBindingPath = betterSqliteKey.replace(/app\.asar/i, 'app.asar.unpacked');
+if (!fs.existsSync(nativeBindingPath)) {
+  console.error("FAIL: Physical native binding not found on disk at: " + nativeBindingPath);
+  process.exit(1);
+}
+console.log("R5J3_FACT_NATIVE_BINDING_PATH=" + nativeBindingPath);
+
+// Verify native binding origin: must be inside <isolated-install-root>/resources/app.asar.unpacked/node_modules/better-sqlite3
+const expectedInstalledRoot = path.join(path.dirname(asarPath), 'app.asar.unpacked', 'node_modules', 'better-sqlite3');
+if (!nativeBindingPath.toLowerCase().startsWith(expectedInstalledRoot.toLowerCase())) {
+  console.error("FAIL: Native binding was not loaded from installed package tree: " + nativeBindingPath);
+  process.exit(1);
+}
+if (projectRoot && nativeBindingPath.toLowerCase().includes(projectRoot.toLowerCase())) {
+  console.error("FAIL: Native binding resolved to repository tree instead of install: " + nativeBindingPath);
+  process.exit(1);
+}
+if (nativeBindingPath.toLowerCase().includes('win-unpacked')) {
+  console.error("FAIL: Native binding resolved to win-unpacked instead of install: " + nativeBindingPath);
+  process.exit(1);
+}
+if (nativeBindingPath.toLowerCase().includes('temp\\node_modules')) {
+  console.error("FAIL: Native binding resolved to temp node_modules: " + nativeBindingPath);
+  process.exit(1);
+}
+
+const { MigrationRunner } = require(migrationsPath);
+const { Repository } = require(repoPath);
+const { McpSessionAuthorityService } = require(authorityServicePath);
+const { computeCanonicalPayload, computePayloadHash, computeContextManifestHash } = require(authServicePath);
+
+MigrationRunner.run(db);
+
+const repo = new Repository(db);
+const service = new McpSessionAuthorityService(repo, db);
+
+const now = new Date().toISOString();
+const projectId = 'proj-inst-' + crypto.randomUUID();
+const taskId = 'task-inst-' + crypto.randomUUID();
+const attemptId = 'att-inst-' + crypto.randomUUID();
+const assignmentId = 'asgn-inst-' + crypto.randomUUID();
+const authorizationId = 'auth-inst-' + crypto.randomUUID();
+const managerRecordId = 'mgr-rec-inst-' + crypto.randomUUID();
+const managerProtoMsgId = 'proto-msg-inst-' + crypto.randomUUID();
+const routingDecisionId = 'route-inst-' + crypto.randomUUID();
+const providerId = 'prov-inst-' + crypto.randomUUID();
+const accountId = 'acc-inst-' + crypto.randomUUID();
+const resourceId = 'res-inst-' + crypto.randomUUID();
+
+repo.createProject({
+  id: projectId,
+  name: 'Installed Smoke Project',
+  description: 'Installed smoke',
+  repository_path: 'D:/fake/installed',
+  default_branch: 'main',
+  status: 'RUNNING',
+  contract: null,
+  created_at: now,
+  updated_at: now,
+  started_at: null,
+  completed_at: null,
+});
+
+db.prepare(`
+  INSERT INTO tasks (id, project_id, title, state, priority, risk, revision_count, max_revisions, progress_cache_percent, base_sha, ownership_epoch, created_at, updated_at)
+  VALUES (?, ?, 'Installed Smoke Task', 'CODING', 'LOW', 'LOW', 1, 3, 0, ?, 1, ?, ?)
+`).run(taskId, projectId, 'a'.repeat(40), now, now);
+
+const roleId = 'role-inst-' + crypto.randomUUID();
+const agentId = 'agent-inst-' + crypto.randomUUID();
+db.prepare(`
+  INSERT INTO role_profiles (id, role, display_name, required_capabilities_json, preferred_capabilities_json, permissions_json, enabled, created_at, updated_at)
+  VALUES (?, 'CODER', 'Coder Role', '["CODING"]', '[]', '[]', 1, ?, ?)
+`).run(roleId, now, now);
+
+db.prepare(`
+  INSERT INTO agent_profiles (id, role_profile_id, name, enabled, created_at, updated_at)
+  VALUES (?, ?, 'Agent Coder', 1, ?, ?)
+`).run(agentId, roleId, now, now);
+
+db.prepare(`
+  INSERT OR IGNORE INTO providers (id, name, adapter_type, enabled, created_at)
+  VALUES (?, 'Anthropic Claude', 'LOCAL_CLI', 1, ?)
+`).run(providerId, now);
+
+db.prepare(`
+  INSERT INTO provider_accounts (id, provider_id, label, auth_mode, enabled, priority, health_status, concurrency_limit, created_at, updated_at)
+  VALUES (?, ?, 'default-account', 'NATIVE_PROFILE', 1, 10, 'AVAILABLE', 20, ?, ?)
+`).run(accountId, providerId, now, now);
+
+db.prepare(`
+  INSERT INTO provider_resources (id, provider_id, provider_account_id, model_name, health_status, capabilities_json, enabled, total_quota, remaining_quota, quota_unit, quota_source, quota_confidence, last_health_check)
+  VALUES (?, ?, ?, 'claude-3-7-sonnet', 'AVAILABLE', '["CODING"]', 1, 1000, 1000, 'REQUESTS', 'PROVIDER_REPORTED', 1.0, ?)
+`).run(resourceId, providerId, accountId, now);
+
+repo.createTaskAttempt({
+  id: attemptId,
+  task_id: taskId,
+  attempt_number: 1,
+  status: 'RUNNING',
+  agent_profile_id: agentId,
+  agent_id: null,
+  started_at: now,
+  ended_at: null,
+  summary: null,
+});
+
+const routingPayload = {
+  decisionId: routingDecisionId,
+  projectId,
+  taskId,
+  attemptId,
+  roleProfileId: roleId,
+  role: 'CODER',
+  outcome: 'SELECTED',
+  routePolicyId: null,
+  failoverPolicyAuthoritySnapshot: null,
+  selectedProviderId: providerId,
+  selectedAccountId: accountId,
+  selectedResourceId: resourceId,
+  selectedAssignmentId: assignmentId,
+  requestedConstraints: [],
+  appliedExclusions: [],
+  appliedSeparation: null,
+  reason: 'Optimal route',
+};
+db.prepare(`
+  INSERT INTO events (id, project_id, task_id, type, summary, structured_payload_json, timestamp)
+  VALUES (?, ?, ?, 'ROLE_AWARE_ROUTING_DECISION', 'Optimal route', ?, ?)
+`).run(routingDecisionId, projectId, taskId, JSON.stringify(routingPayload), now);
+
+repo.createAgentAssignment({
+  id: assignmentId,
+  project_id: projectId,
+  task_id: taskId,
+  attempt_id: attemptId,
+  role_profile_id: roleId,
+  agent_profile_id: agentId,
+  selected_provider_id: providerId,
+  selected_account_id: accountId,
+  selected_resource_id: resourceId,
+  selected_worker_slot_id: null,
+  routing_decision_id: routingDecisionId,
+  status: 'ASSIGNED',
+  created_at: now,
+  ended_at: null,
+  preferred_metadata: null,
+});
+
+const instructions = ['Task: Installed Smoke Task', 'Verify installed context read'];
+const managerPayload = {
+  protocol: 'manager.v1',
+  message_id: managerProtoMsgId,
+  project_id: projectId,
+  task_id: taskId,
+  decision: 'EXECUTE',
+  priority: 'LOW',
+  risk: 'LOW',
+  instructions,
+  acceptance_criteria: ['Smoke passes'],
+  constraints: ['None'],
+  review_issues: [],
+  expected_task_state: 'CODING',
+  expected_revision: 1,
+  created_at: now,
+};
+const rawManagerPayload = JSON.stringify(managerPayload);
+const managerPayloadHash = crypto.createHash('sha256').update(rawManagerPayload, 'utf8').digest('hex');
+repo.recordProtocolMessage(
+  managerRecordId,
+  managerProtoMsgId,
+  'manager.v1',
+  projectId,
+  taskId,
+  'CODING',
+  1,
+  managerPayloadHash,
+  rawManagerPayload,
+  'APPLIED',
+  undefined,
+  now
+);
+
+const canonicalInstructionsJson = JSON.stringify(instructions);
+const contextFiles = ['src/mcp/stdio.ts'];
+const contextFilesJson = JSON.stringify(contextFiles);
+
+const canonicalPayload = computeCanonicalPayload({
+  projectId,
+  taskId,
+  attemptId,
+  taskTitle: 'Installed Smoke Task',
+  taskDescription: 'Installed smoke verification',
+  acceptanceCriteria: ['Smoke passes'],
+  constraints: ['None'],
+  instructions,
+  contextFiles,
+  verificationCommands: { TEST: null, LINT: null, BUILD: null },
+  managerMessageId: managerRecordId,
+  managerPayloadHash,
+});
+const canonicalPayloadJson = JSON.stringify(canonicalPayload);
+const instructionPayloadHash = computePayloadHash(canonicalPayload);
+const contextManifestHash = computeContextManifestHash(contextFiles);
+
+const auth = {
+  id: authorizationId,
+  project_id: projectId,
+  task_id: taskId,
+  task_revision: 1,
+  base_sha: 'a'.repeat(40),
+  repository_head_sha: 'b'.repeat(40),
+  manager_message_id: managerRecordId,
+  manager_payload_hash: managerPayloadHash,
+  routing_decision_id: routingDecisionId,
+  selected_resource_id: resourceId,
+  selected_provider_id: providerId,
+  instruction_payload_hash: instructionPayloadHash,
+  context_manifest_hash: contextManifestHash,
+  canonical_instructions_json: canonicalInstructionsJson,
+  context_files_json: contextFilesJson,
+  canonical_payload_json: canonicalPayloadJson,
+  status: 'AUTHORIZED',
+  created_at: now,
+  dispatched_at: null,
+  execution_id: null,
+  task_ownership_epoch: 1,
+  lifecycle_version: 1,
+  selected_account_id: accountId,
+  adapter_started_at: null,
+  adapter_finished_at: null,
+  adapter_error_json: null,
+  settlement_status: null,
+  settled_at: null,
+  settlement_evidence_json: null,
+  settlement_evidence_hash: null,
+  assignment_id: assignmentId,
+  attempt_id: attemptId,
+};
+repo.createExecutionAuthorization(auth);
+
+const issueResult = service.issueSession({ authorizationId, ttlSeconds: 300 });
+const sessionToken = issueResult.plaintextToken;
+const sessionId = issueResult.session.id;
+
+db.close();
+
+const stdioScript = path.join(asarPath, 'dist-electron', 'mcp', 'stdio.js');
+console.log("R5J3_FACT_STDIO_SCRIPT=" + stdioScript);
+
+const childEnv = Object.assign({}, process.env, {
+  ELECTRON_RUN_AS_NODE: '1',
+  AGENTFORGE_MCP_DB_PATH: dbPath,
+  AGENTFORGE_MCP_SESSION_TOKEN: sessionToken,
+});
+
+const startTime = Date.now();
+const child = spawn(process.execPath, [stdioScript], {
+  env: childEnv,
+  stdio: ['pipe', 'pipe', 'pipe'],
+});
+console.log("R5J3_FACT_CHILD_PID=" + child.pid);
+
+// F2: Event-driven, single-settlement RPC harness
+class McpRpcHarness {
+  constructor(childProcess, overallTimeoutMs = 25000) {
+    this.child = childProcess;
+    this.pending = new Map();
+    this.closed = false;
+    this.stdoutBuffer = '';
+    this.exitResult = null;
+
+    this.overallTimer = setTimeout(() => {
+      this._terminate(new Error('OVERALL_HARNESS_TIMEOUT'));
+    }, overallTimeoutMs);
+
+    this.exitPromise = new Promise((resolve) => {
+      this.child.on('exit', (code, signal) => {
+        this.exitResult = { code, signal };
+        this._terminate(new Error(`CHILD_EXIT_PREMATURE: code=${code}, signal=${signal}`));
+        resolve(this.exitResult);
+      });
+      this.child.on('error', (err) => {
+        this._terminate(new Error(`CHILD_ERROR: ${err.message}`));
+      });
+    });
+
+    this.child.stdout.on('data', (chunk) => {
+      this.stdoutBuffer += chunk.toString('utf8');
+      let newlineIdx;
+      while ((newlineIdx = this.stdoutBuffer.indexOf('\n')) !== -1) {
+        const rawLine = this.stdoutBuffer.slice(0, newlineIdx).trim();
+        this.stdoutBuffer = this.stdoutBuffer.slice(newlineIdx + 1);
+        if (rawLine) {
+          this._handleLine(rawLine);
+        }
+      }
+    });
+  }
+
+  _handleLine(rawLine) {
+    let msg;
+    try {
+      msg = JSON.parse(rawLine);
+    } catch {
+      this._terminate(new Error('PROTOCOL_CONTAMINATION: Non-JSON stdout received: ' + rawLine));
+      return;
+    }
+
+    if (!msg || typeof msg !== 'object') {
+      this._terminate(new Error('PROTOCOL_CONTAMINATION: Non-object message received'));
+      return;
+    }
+
+    if (msg.id !== undefined && msg.id !== null) {
+      const entry = this.pending.get(msg.id);
+      if (entry) {
+        clearTimeout(entry.timer);
+        this.pending.delete(msg.id);
+        entry.resolve(msg);
+      }
+    }
+  }
+
+  _terminate(reason) {
+    if (this.closed) return;
+    this.closed = true;
+    clearTimeout(this.overallTimer);
+
+    for (const entry of this.pending.values()) {
+      clearTimeout(entry.timer);
+      entry.reject(reason);
+    }
+    this.pending.clear();
+  }
+
+  async sendRequest(req, timeoutMs = 4000) {
+    if (this.closed) {
+      throw new Error('Harness is closed');
+    }
+    return new Promise((resolve, reject) => {
+      const timer = setTimeout(() => {
+        if (this.pending.has(req.id)) {
+          this.pending.delete(req.id);
+          reject(new Error(`RPC_TIMEOUT: Request ${req.id} timed out after ${timeoutMs}ms`));
+        }
+      }, timeoutMs);
+
+      this.pending.set(req.id, {
+        resolve: (val) => resolve(val),
+        reject: (err) => reject(err),
+        timer,
+      });
+
+      this.child.stdin.write(JSON.stringify(req) + '\n', (err) => {
+        if (err) {
+          clearTimeout(timer);
+          this.pending.delete(req.id);
+          reject(new Error(`WRITE_ERROR: ${err.message}`));
+        }
+      });
+    });
+  }
+
+  async sendNotification(notif) {
+    if (this.closed) {
+      throw new Error('Harness is closed');
+    }
+    return new Promise((resolve, reject) => {
+      this.child.stdin.write(JSON.stringify(notif) + '\n', (err) => {
+        if (err) reject(new Error(`NOTIF_WRITE_ERROR: ${err.message}`));
+        else resolve();
+      });
+    });
+  }
+
+  async close(timeoutMs = 4000) {
+    clearTimeout(this.overallTimer);
+    this.closed = true;
+
+    this.child.stdin.end();
+
+    const timeoutPromise = new Promise((_, reject) => {
+      const t = setTimeout(() => {
+        try {
+          this.child.kill('SIGKILL');
+        } catch (killErr) {
+          console.error("R5J3_CLOSE_KILL_ERROR: " + (killErr instanceof Error ? killErr.message : String(killErr)));
+        }
+        reject(new Error(`SHUTDOWN_TIMEOUT: Child did not exit within ${timeoutMs}ms`));
+      }, timeoutMs);
+      this.exitPromise.finally(() => clearTimeout(t));
+    });
+
+    return Promise.race([this.exitPromise, timeoutPromise]);
+  }
+}
+
+const harness = new McpRpcHarness(child);
+
+(async () => {
+  try {
+    const initRes = await harness.sendRequest({
+      jsonrpc: '2.0',
+      id: 1,
+      method: 'initialize',
+      params: { protocolVersion: '2024-11-05', capabilities: {}, clientInfo: { name: 'installed-smoke-test', version: '1.0.0' } }
+    });
+    console.log("R5J3_INITIALIZE_ELAPSED_MS=" + (Date.now() - startTime));
+    if (initRes.error) throw new Error("Initialize failed: " + JSON.stringify(initRes.error));
+
+    await harness.sendNotification({ jsonrpc: '2.0', method: 'notifications/initialized' });
+
+    const toolReqStart = Date.now();
+    const toolRes = await harness.sendRequest({
+      jsonrpc: '2.0',
+      id: 2,
+      method: 'tools/call',
+      params: { name: 'agentforge_get_authorized_context', arguments: {} }
+    });
+    console.log("R5J3_TOOL_READ_ELAPSED_MS=" + (Date.now() - toolReqStart));
+    if (toolRes.error) throw new Error("Tool read failed: " + JSON.stringify(toolRes.error));
+    const toolPayload = JSON.parse(toolRes.result.content[0].text);
+    if (toolPayload.execution_payload?.taskTitle !== 'Installed Smoke Task') {
+      throw new Error("Payload mismatch in tool read");
+    }
+
+    const resReqStart = Date.now();
+    const resRead = await harness.sendRequest({
+      jsonrpc: '2.0',
+      id: 3,
+      method: 'resources/read',
+      params: { uri: 'agentforge://session/authorized-context' }
+    });
+    console.log("R5J3_RESOURCE_READ_ELAPSED_MS=" + (Date.now() - resReqStart));
+    if (resRead.error) throw new Error("Resource read failed: " + JSON.stringify(resRead.error));
+    const resPayload = JSON.parse(resRead.result.contents[0].text);
+    if (JSON.stringify(resPayload) !== JSON.stringify(toolPayload)) {
+      throw new Error("Resource payload does not match tool payload");
+    }
+
+    const revokeDb = new Database(dbPath);
+    const revokeService = new McpSessionAuthorityService(new Repository(revokeDb), revokeDb);
+    revokeService.revokeSession({ sessionId });
+    revokeDb.close();
+
+    const failRes = await harness.sendRequest({
+      jsonrpc: '2.0',
+      id: 4,
+      method: 'tools/call',
+      params: { name: 'agentforge_get_authorized_context', arguments: {} }
+    });
+    const isError = Boolean(failRes.error) || failRes.result?.isError === true;
+    if (!isError) throw new Error("Expected revoked session to fail closed");
+    console.log("R5J3_REVOKE_FAIL_CLOSED=PASS");
+
+    const shutdownStart = Date.now();
+    const exitResult = await harness.close(4000);
+    console.log("R5J3_SHUTDOWN_ELAPSED_MS=" + (Date.now() - shutdownStart));
+    console.log("R5J3_CHILD_EXIT_CODE=" + exitResult.code);
+    console.log("R5J3_CHILD_SIGNAL=" + (exitResult.signal || "NONE"));
+
+    if (exitResult.code !== 0) {
+      throw new Error("Expected exit code 0, got " + exitResult.code);
+    }
+
+    const verifyDb = new Database(dbPath, { readonly: true });
+    verifyDb.close();
+
+    console.log("R5J3_INSTALLED_MCP_BRIDGE_PROOF=PASS");
+    process.exit(0);
+  } catch (err) {
+    console.error("R5J3_INSTALLED_MCP_BRIDGE_PROOF_ERROR: " + (err instanceof Error ? err.stack : String(err)));
+    try {
+      child.kill('SIGKILL');
+    } catch (killErr) {
+      console.error("R5J3_CHILD_KILL_ERROR: " + (killErr instanceof Error ? killErr.message : String(killErr)));
+    }
+    process.exit(1);
+  }
+})();
+'@
+
+  Set-Content -Path $bootstrapScript -Value $bootstrapContent -Encoding UTF8
+
+  $mcpStartInfo = New-Object System.Diagnostics.ProcessStartInfo
+  $mcpStartInfo.FileName = $installedExe
+  $mcpStartInfo.Arguments = "`"$bootstrapScript`" `"$installedAsar`" `"$mcpDbPath`" `"$ProjectRoot`""
+  $mcpStartInfo.EnvironmentVariables["ELECTRON_RUN_AS_NODE"] = "1"
+  $mcpStartInfo.UseShellExecute = $false
+  $mcpStartInfo.RedirectStandardOutput = $true
+  $mcpStartInfo.RedirectStandardError = $true
+
+  $mcpProc = [System.Diagnostics.Process]::Start($mcpStartInfo)
+  if ($null -eq $mcpProc) {
+    throw "R5J3_PROCESS_SPAWN_FAILED: Failed to start installed MCP proof runner"
+  }
+  $mcpPid = $mcpProc.Id
+
+  # F3: Asynchronous non-blocking stream reads
+  $stdoutTask = $mcpProc.StandardOutput.ReadToEndAsync()
+  $stderrTask = $mcpProc.StandardError.ReadToEndAsync()
+
+  $timeoutMs = 35000
+  $exitedInTime = $mcpProc.WaitForExit($timeoutMs)
+
+  if (-not $exitedInTime) {
+    Write-Host "R5J3_TIMEOUT: Installed MCP proof process $mcpPid did not terminate within $timeoutMs ms"
+    try {
+      $mcpProc.Kill()
+    } catch {
+      Write-Host "R5J3_CLEANUP_NOTE: Process $mcpPid kill attempted: $_"
+    }
+    $killWait = $mcpProc.WaitForExit(4000)
+    if (-not $killWait) {
+      throw "R5J3_PROCESS_TERMINATION_FAILED: Process $mcpPid survived kill attempt"
+    }
+    [System.Threading.Tasks.Task]::WaitAll(@($stdoutTask, $stderrTask), 3000)
+    $mcpStdout = $stdoutTask.Result
+    $mcpStderr = $stderrTask.Result
+    throw "R5J3_PROCESS_TIMEOUT: Installed MCP proof process timed out after $timeoutMs ms (PID: $mcpPid)"
+  }
+
+  [System.Threading.Tasks.Task]::WaitAll(@($stdoutTask, $stderrTask), 3000)
+  $mcpStdout = $stdoutTask.Result
+  $mcpStderr = $stderrTask.Result
+
+  Write-Host "Installed MCP Proof Output:"
+  Write-Host $mcpStdout
+
+  if ($mcpProc.ExitCode -ne 0 -or -not ($mcpStdout -match "R5J3_INSTALLED_MCP_BRIDGE_PROOF=PASS")) {
+    throw "Installed MCP bridge verification failed (exit code $($mcpProc.ExitCode)): $mcpStderr"
+  }
+
+  Write-Host "[8/8] Installed MCP Client Bridge & Node-Mode Stdio Proof: PASS" -ForegroundColor Green
+
+  # Verify no surviving processes in install dir
+  $surviving = Get-Process -Name "AgentForge" -ErrorAction SilentlyContinue | Where-Object {
+    try { $_.Path -like "$tempInstallDir*" } catch { $false }
+  }
+  if ($surviving) {
+    throw "R5J3_SURVIVING_PROCESS_DETECTED: AgentForge process remained active in $tempInstallDir"
+  }
+  Write-Host "INSTALLED_NO_SURVIVING_PROCESSES=PASS" -ForegroundColor Green
+
+  # F3: Fail-visible cleanup of synthetic test materials
+  if (Test-Path $mcpDbPath) {
+    Remove-Item -Force $mcpDbPath
+    if (Test-Path $mcpDbPath) {
+      throw "R5J3_CLEANUP_FAILED: Database handle remained locked after child exit"
+    }
+    Write-Host "INSTALLED_MCP_DB_RELEASE=PASS" -ForegroundColor Green
+  }
+  if (Test-Path $tempMcpDir) {
+    Remove-Item -Recurse -Force $tempMcpDir
+    if (Test-Path $tempMcpDir) {
+      throw "R5J3_CLEANUP_FAILED: Temporary MCP directory could not be removed: $tempMcpDir"
+    }
+  }
+
   Write-Host "=================================================================" -ForegroundColor Cyan
-  Write-Host "   Real Production Installed Smoke Test: PASS (All Gates Passed) " -ForegroundColor Green
+  Write-Host "   Real Production Installed Smoke Test: PASS (All 8 Gates Passed) " -ForegroundColor Green
   Write-Host "=================================================================" -ForegroundColor Cyan
 
 } catch {
@@ -258,6 +910,12 @@ try {
     try {
       Remove-Item -Recurse -Force $tempUserDataDir -ErrorAction SilentlyContinue
     } catch {}
+  }
+  if ($tempMcpDir -and (Test-Path $tempMcpDir)) {
+    Remove-Item -Recurse -Force $tempMcpDir
+    if (Test-Path $tempMcpDir) {
+      Write-Host "WARNING: Temporary MCP directory persisted after cleanup: $tempMcpDir"
+    }
   }
 }
 
