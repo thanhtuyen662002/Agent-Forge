@@ -8,9 +8,14 @@ import {
   validateTtlSeconds,
 } from '../core/services/McpSessionAuthorityService';
 import { verifyMigration21SchemaAuthority } from '../core/database/migrations';
+import {
+  generateClientConfig,
+  generateClientConfigEnvelope,
+} from './clientBridge';
 
 export interface CliArgs {
-  command: 'issue' | 'revoke' | 'help';
+  command: 'issue' | 'revoke' | 'configure-client' | 'help';
+  client?: string;
   dbPath?: string;
   authorizationId?: string;
   sessionId?: string;
@@ -32,9 +37,10 @@ export function parseCliArgs(args: string[]): CliArgs {
     return { command: 'help', jsonOutput: false };
   }
 
-  // 2. First non-flag argument must be command (issue or revoke)
-  let command: 'issue' | 'revoke' | null = null;
-  let dbPath: string | undefined = process.env.AGENTFORGE_MCP_DB_PATH;
+  // 2. Parse flags and positionals
+  let command: 'issue' | 'revoke' | 'configure-client' | null = null;
+  let client: string | undefined;
+  let rawCliDbPath: string | undefined;
   let authorizationId: string | undefined;
   let sessionId: string | undefined;
   let ttlSeconds: number | undefined;
@@ -52,6 +58,7 @@ export function parseCliArgs(args: string[]): CliArgs {
         : arg === '-a' ? '--auth'
         : arg === '-s' ? '--session'
         : arg === '-t' ? '--ttl'
+        : arg === '-c' ? '--client'
         : arg;
 
       if (seenFlags.has(normalizedFlag)) {
@@ -61,11 +68,16 @@ export function parseCliArgs(args: string[]): CliArgs {
 
       if (arg === '--json') {
         jsonOutput = true;
+      } else if (arg === '--client' || arg === '-c') {
+        if (i + 1 >= args.length || args[i + 1].startsWith('-')) throw new Error('Missing value for flag');
+        const val = args[++i];
+        if (val.trim().length === 0) throw new Error('Flag cannot be whitespace-only');
+        client = val.trim();
       } else if (arg === '--db' || arg === '-d') {
         if (i + 1 >= args.length || args[i + 1].startsWith('-')) throw new Error('Missing value for flag');
         const val = args[++i];
         if (val.trim().length === 0) throw new Error('Flag cannot be whitespace-only');
-        dbPath = val.trim();
+        rawCliDbPath = val.trim();
       } else if (arg === '--auth' || arg === '-a') {
         if (i + 1 >= args.length || args[i + 1].startsWith('-')) throw new Error('Missing value for flag');
         const val = args[++i];
@@ -90,11 +102,11 @@ export function parseCliArgs(args: string[]): CliArgs {
   }
 
   if (positional.length === 0) {
-    throw new Error('Missing command (expected "issue" or "revoke")');
+    throw new Error('Missing command (expected "issue", "revoke", or "configure-client")');
   }
 
   const rawCmd = positional[0].toLowerCase();
-  if (rawCmd === 'issue' || rawCmd === 'revoke') {
+  if (rawCmd === 'issue' || rawCmd === 'revoke' || rawCmd === 'configure-client') {
     command = rawCmd;
   } else {
     throw new Error('Unknown command');
@@ -105,19 +117,40 @@ export function parseCliArgs(args: string[]): CliArgs {
   }
 
   // 3. Command-specific closed grammar validation
-  if (command === 'issue') {
+  let dbPath: string | undefined;
+
+  if (command === 'configure-client') {
+    if (authorizationId !== undefined || seenFlags.has('--auth')) {
+      throw new Error('Flag --auth is not valid for configure-client command');
+    }
+    if (sessionId !== undefined || seenFlags.has('--session')) {
+      throw new Error('Flag --session is not valid for configure-client command');
+    }
+    if (ttlSeconds !== undefined || seenFlags.has('--ttl')) {
+      throw new Error('Flag --ttl is not valid for configure-client command');
+    }
+    if (!client) {
+      throw new Error('Configure-client requires --client <antigravity|cursor|claude>');
+    }
+    dbPath = rawCliDbPath;
+  } else if (command === 'issue') {
+    if (client !== undefined || seenFlags.has('--client')) {
+      throw new Error('Flag --client is not valid for issue command');
+    }
     if (sessionId) {
       throw new Error('Flag --session is not valid for issue command');
     }
     if (!authorizationId) {
       throw new Error('Issue command requires --auth <authorization-id>');
     }
+    dbPath = rawCliDbPath ?? process.env.AGENTFORGE_MCP_DB_PATH;
     if (!dbPath) {
       throw new Error('Issue command requires --db <database-path>');
     }
-  }
-
-  if (command === 'revoke') {
+  } else if (command === 'revoke') {
+    if (client !== undefined || seenFlags.has('--client')) {
+      throw new Error('Flag --client is not valid for revoke command');
+    }
     if (ttlSeconds !== undefined || seenFlags.has('--ttl')) {
       throw new Error('Flag --ttl is not valid for revoke command');
     }
@@ -126,13 +159,15 @@ export function parseCliArgs(args: string[]): CliArgs {
     if ((hasSession && hasAuth) || (!hasSession && !hasAuth)) {
       throw new Error('Revoke requires exactly one selector: --session XOR --auth');
     }
+    dbPath = rawCliDbPath ?? process.env.AGENTFORGE_MCP_DB_PATH;
     if (!dbPath) {
       throw new Error('Revoke command requires --db <database-path>');
     }
   }
 
   return {
-    command,
+    command: command!,
+    client,
     dbPath,
     authorizationId,
     sessionId,
@@ -173,11 +208,35 @@ export function runSessionAdmin(rawArgs: string[]): number {
 AgentForge MCP Session Administration CLI
 
 Usage:
+  node sessionAdmin.js configure-client --client <antigravity|cursor|claude> [--db <db-path>] [--json]
   node sessionAdmin.js issue --db <db-path> --auth <auth-id> [--ttl <seconds>] [--json]
   node sessionAdmin.js revoke --db <db-path> (--session <session-id> | --auth <auth-id>) [--json]
 `;
     process.stdout.write(usage);
     return 0;
+  }
+
+  if (options.command === 'configure-client') {
+    try {
+      if (options.jsonOutput) {
+        const envelope = generateClientConfigEnvelope({
+          client: options.client!,
+          dbPath: options.dbPath,
+        });
+        process.stdout.write(JSON.stringify(envelope, null, 2) + '\n');
+      } else {
+        const template = generateClientConfig({
+          client: options.client!,
+          dbPath: options.dbPath,
+        });
+        process.stdout.write(JSON.stringify(template, null, 2) + '\n');
+      }
+      return 0;
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : 'Configuration generation failed';
+      process.stderr.write(`ERROR: [MCP_CONFIGURATION_INVALID] ${msg}\n`);
+      return 1;
+    }
   }
 
   if (!options.dbPath || typeof options.dbPath !== 'string' || options.dbPath.trim().length === 0) {
