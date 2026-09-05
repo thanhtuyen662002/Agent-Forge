@@ -59,7 +59,7 @@ export function normalizeClient(client: string): SupportedClient {
   if (SUPPORTED_CLIENTS.includes(trimmed as SupportedClient)) {
     return trimmed as SupportedClient;
   }
-  throw new Error(`Unsupported client '${trimmed}'. Supported clients: ${SUPPORTED_CLIENTS.join(', ')}`);
+  throw new Error(`Unsupported client '${trimmed}'`);
 }
 
 /**
@@ -122,7 +122,6 @@ export function deriveRuntimePaths(options?: {
 
   const candidateStdio =
     options?.stdioScriptPath ??
-    process.env.AGENTFORGE_MCP_STDIO_PATH ??
     path.join(path.dirname(__filename), 'stdio.js');
   if (!candidateStdio || typeof candidateStdio !== 'string' || candidateStdio.trim().length === 0) {
     throw new Error('Stdio script path cannot be empty');

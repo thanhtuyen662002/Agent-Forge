@@ -190,14 +190,24 @@ try {
     Write-Host "Terminating GUI smoke process $($proc.Id)..."
     try {
       $proc.CloseMainWindow() | Out-Null
-      $proc.WaitForExit(3000)
-    } catch {}
+      $closedInTime = $proc.WaitForExit(3000)
+      if (-not $closedInTime) {
+        Write-Host "PACKAGED_GUI_CLOSE_TIMEOUT: Process $($proc.Id) did not exit after CloseMainWindow"
+      }
+    } catch {
+      Write-Host "PACKAGED_GUI_CLOSE_WARN: CloseMainWindow error: $_"
+    }
 
     if (-not $proc.HasExited) {
       try {
         $proc.Kill()
-        $proc.WaitForExit(2000)
-      } catch {}
+      } catch {
+        Write-Host "PACKAGED_GUI_KILL_WARN: Kill error: $_"
+      }
+      $killWait = $proc.WaitForExit(2000)
+      if (-not $killWait) {
+        throw "PACKAGED_GUI_TERMINATION_FAILED: Process $($proc.Id) survived kill attempt"
+      }
     }
   }
 
@@ -211,6 +221,11 @@ try {
     Write-Error "Packaged app.asar not found at '$unpackedAsar'."
     exit 1
   }
+
+  # 9. Packaged MCP Client Bridge & Node-Mode Stdio Proof
+  Write-Host "=================================================================" -ForegroundColor Cyan
+  Write-Host "   [9/9] Packaged MCP Client Bridge & Node-Mode Stdio Proof       " -ForegroundColor Cyan
+  Write-Host "=================================================================" -ForegroundColor Cyan
 
   $mcpSmokeId = [Guid]::NewGuid().ToString()
   $tempMcpDir = Join-Path ([System.IO.Path]::GetTempPath()) "af-mcp-pkg-smoke-$mcpSmokeId"
@@ -226,6 +241,7 @@ const { spawn } = require('child_process');
 
 const asarPath = path.resolve(process.argv[2]);
 const dbPath = path.resolve(process.argv[3]);
+const projectRoot = process.argv[4] ? path.resolve(process.argv[4]) : null;
 
 if (!fs.existsSync(asarPath)) {
   console.error("FAIL: app.asar does not exist at " + asarPath);
@@ -235,16 +251,21 @@ if (!fs.existsSync(asarPath)) {
 console.log("R5J3_FACT_ELECTRON_VERSION=" + (process.versions.electron || "UNKNOWN"));
 console.log("R5J3_FACT_NODE_VERSION=" + process.versions.node);
 console.log("R5J3_FACT_EXEC_PATH=" + process.execPath);
+console.log("R5J3_FACT_ASAR_PATH=" + asarPath);
 
-const Database = require('better-sqlite3');
-console.log("R5J3_FACT_SQLITE_PATH=" + require.resolve('better-sqlite3'));
+// F1: Package-rooted native module resolution
+const pkgRequire = require('module').createRequire(path.join(asarPath, 'package.json'));
+const jsEntryPath = pkgRequire.resolve('better-sqlite3');
+console.log("R5J3_FACT_JS_ENTRY_PATH=" + jsEntryPath);
+
+const Database = pkgRequire('better-sqlite3');
 
 const migrationsPath = path.join(asarPath, 'dist-electron', 'core', 'database', 'migrations.js');
 const repoPath = path.join(asarPath, 'dist-electron', 'core', 'database', 'repositories.js');
 const authorityServicePath = path.join(asarPath, 'dist-electron', 'core', 'services', 'McpSessionAuthorityService.js');
 const authServicePath = path.join(asarPath, 'dist-electron', 'core', 'services', 'ExecutionAuthorizationService.js');
 
-if (!fs.existsSync(migrationsPath) || !fs.existsSync(repoPath) || !fs.existsSync(authorityServicePath)) {
+if (!fs.existsSync(migrationsPath) || !fs.existsSync(repoPath) || !fs.existsSync(authorityServicePath) || !fs.existsSync(authServicePath)) {
   console.error("FAIL: Packaged modules missing in app.asar");
   process.exit(1);
 }
@@ -254,8 +275,44 @@ const { Repository } = require(repoPath);
 const { McpSessionAuthorityService } = require(authorityServicePath);
 const { computeCanonicalPayload, computePayloadHash, computeContextManifestHash } = require(authServicePath);
 
+// Force native addon loading
 const db = new Database(dbPath);
 db.pragma('foreign_keys = ON');
+
+const loadedNodeKeys = Object.keys(require.cache).filter((k) => k.endsWith('.node'));
+const betterSqliteKey = loadedNodeKeys.find((k) => k.toLowerCase().includes('better_sqlite3'));
+if (!betterSqliteKey) {
+  console.error("FAIL: better_sqlite3.node was not loaded into require.cache");
+  process.exit(1);
+}
+
+const nativeBindingPath = betterSqliteKey.replace(/app\.asar/i, 'app.asar.unpacked');
+if (!fs.existsSync(nativeBindingPath)) {
+  console.error("FAIL: Physical native binding not found on disk at: " + nativeBindingPath);
+  process.exit(1);
+}
+console.log("R5J3_FACT_NATIVE_BINDING_PATH=" + nativeBindingPath);
+
+// Verify native binding origin: must be inside <release/win-unpacked>/resources/app.asar.unpacked/node_modules/better-sqlite3
+const expectedUnpackedRoot = path.join(path.dirname(asarPath), 'app.asar.unpacked', 'node_modules', 'better-sqlite3');
+if (!nativeBindingPath.toLowerCase().startsWith(expectedUnpackedRoot.toLowerCase())) {
+  console.error("FAIL: Native binding was not loaded from unpacked package tree: " + nativeBindingPath);
+  process.exit(1);
+}
+const repoNodeModules = path.join(projectRoot, 'node_modules');
+if (projectRoot && nativeBindingPath.toLowerCase().includes(repoNodeModules.toLowerCase())) {
+  console.error("FAIL: Native binding resolved to repository node_modules instead of package: " + nativeBindingPath);
+  process.exit(1);
+}
+if (nativeBindingPath.toLowerCase().includes('af-prod-smoke-install')) {
+  console.error("FAIL: Native binding resolved to installed tier instead of unpacked: " + nativeBindingPath);
+  process.exit(1);
+}
+if (nativeBindingPath.toLowerCase().includes('temp\\node_modules')) {
+  console.error("FAIL: Native binding resolved to temp node_modules: " + nativeBindingPath);
+  process.exit(1);
+}
+
 MigrationRunner.run(db);
 
 const repo = new Repository(db);
@@ -488,45 +545,146 @@ const child = spawn(process.execPath, [stdioScript], {
 });
 console.log("R5J3_FACT_CHILD_PID=" + child.pid);
 
-let childStdout = '';
-let childStderr = '';
-const stdoutLines = [];
+// F2: Event-driven, single-settlement RPC harness
+class McpRpcHarness {
+  constructor(childProcess, overallTimeoutMs = 25000) {
+    this.child = childProcess;
+    this.pending = new Map();
+    this.closed = false;
+    this.stdoutBuffer = '';
+    this.exitResult = null;
 
-child.stdout.on('data', (chunk) => {
-  childStdout += chunk.toString('utf8');
-  let newlineIdx = childStdout.indexOf('\n');
-  while (newlineIdx !== -1) {
-    const line = childStdout.slice(0, newlineIdx).trim();
-    childStdout = childStdout.slice(newlineIdx + 1);
-    if (line) stdoutLines.push(line);
-    newlineIdx = childStdout.indexOf('\n');
-  }
-});
+    this.overallTimer = setTimeout(() => {
+      this._terminate(new Error('OVERALL_HARNESS_TIMEOUT'));
+    }, overallTimeoutMs);
 
-child.stderr.on('data', (chunk) => {
-  childStderr += chunk.toString('utf8');
-});
-
-async function sendRpc(req, timeoutMs = 4000) {
-  return new Promise((resolve, reject) => {
-    const timer = setTimeout(() => reject(new Error("RPC timed out: " + req.id)), timeoutMs);
-    const checkInterval = setInterval(() => {
-      const match = stdoutLines.find(l => {
-        try { return JSON.parse(l).id === req.id; } catch { return false; }
+    this.exitPromise = new Promise((resolve) => {
+      this.child.on('exit', (code, signal) => {
+        this.exitResult = { code, signal };
+        this._terminate(new Error(`CHILD_EXIT_PREMATURE: code=${code}, signal=${signal}`));
+        resolve(this.exitResult);
       });
-      if (match) {
-        clearTimeout(timer);
-        clearInterval(checkInterval);
-        resolve(JSON.parse(match));
+      this.child.on('error', (err) => {
+        this._terminate(new Error(`CHILD_ERROR: ${err.message}`));
+      });
+    });
+
+    this.child.stdout.on('data', (chunk) => {
+      this.stdoutBuffer += chunk.toString('utf8');
+      let newlineIdx;
+      while ((newlineIdx = this.stdoutBuffer.indexOf('\n')) !== -1) {
+        const rawLine = this.stdoutBuffer.slice(0, newlineIdx).trim();
+        this.stdoutBuffer = this.stdoutBuffer.slice(newlineIdx + 1);
+        if (rawLine) {
+          this._handleLine(rawLine);
+        }
       }
-    }, 20);
-    child.stdin.write(JSON.stringify(req) + '\n');
-  });
+    });
+  }
+
+  _handleLine(rawLine) {
+    let msg;
+    try {
+      msg = JSON.parse(rawLine);
+    } catch {
+      this._terminate(new Error('PROTOCOL_CONTAMINATION: Non-JSON stdout received: ' + rawLine));
+      return;
+    }
+
+    if (!msg || typeof msg !== 'object') {
+      this._terminate(new Error('PROTOCOL_CONTAMINATION: Non-object message received'));
+      return;
+    }
+
+    if (msg.id !== undefined && msg.id !== null) {
+      const entry = this.pending.get(msg.id);
+      if (entry) {
+        clearTimeout(entry.timer);
+        this.pending.delete(msg.id);
+        entry.resolve(msg);
+      }
+    }
+  }
+
+  _terminate(reason) {
+    if (this.closed) return;
+    this.closed = true;
+    clearTimeout(this.overallTimer);
+
+    for (const entry of this.pending.values()) {
+      clearTimeout(entry.timer);
+      entry.reject(reason);
+    }
+    this.pending.clear();
+  }
+
+  async sendRequest(req, timeoutMs = 4000) {
+    if (this.closed) {
+      throw new Error('Harness is closed');
+    }
+    return new Promise((resolve, reject) => {
+      const timer = setTimeout(() => {
+        if (this.pending.has(req.id)) {
+          this.pending.delete(req.id);
+          reject(new Error(`RPC_TIMEOUT: Request ${req.id} timed out after ${timeoutMs}ms`));
+        }
+      }, timeoutMs);
+
+      this.pending.set(req.id, {
+        resolve: (val) => resolve(val),
+        reject: (err) => reject(err),
+        timer,
+      });
+
+      this.child.stdin.write(JSON.stringify(req) + '\n', (err) => {
+        if (err) {
+          clearTimeout(timer);
+          this.pending.delete(req.id);
+          reject(new Error(`WRITE_ERROR: ${err.message}`));
+        }
+      });
+    });
+  }
+
+  async sendNotification(notif) {
+    if (this.closed) {
+      throw new Error('Harness is closed');
+    }
+    return new Promise((resolve, reject) => {
+      this.child.stdin.write(JSON.stringify(notif) + '\n', (err) => {
+        if (err) reject(new Error(`NOTIF_WRITE_ERROR: ${err.message}`));
+        else resolve();
+      });
+    });
+  }
+
+  async close(timeoutMs = 4000) {
+    clearTimeout(this.overallTimer);
+    this.closed = true;
+
+    this.child.stdin.end();
+
+    const timeoutPromise = new Promise((_, reject) => {
+      const t = setTimeout(() => {
+        try {
+          this.child.kill('SIGKILL');
+        } catch (killErr) {
+          console.error("R5J3_CLOSE_KILL_ERROR: " + (killErr instanceof Error ? killErr.message : String(killErr)));
+        }
+        reject(new Error(`SHUTDOWN_TIMEOUT: Child did not exit within ${timeoutMs}ms`));
+      }, timeoutMs);
+      this.exitPromise.finally(() => clearTimeout(t));
+    });
+
+    return Promise.race([this.exitPromise, timeoutPromise]);
+  }
 }
+
+const harness = new McpRpcHarness(child);
 
 (async () => {
   try {
-    const initRes = await sendRpc({
+    const initRes = await harness.sendRequest({
       jsonrpc: '2.0',
       id: 1,
       method: 'initialize',
@@ -535,10 +693,10 @@ async function sendRpc(req, timeoutMs = 4000) {
     console.log("R5J3_INITIALIZE_ELAPSED_MS=" + (Date.now() - startTime));
     if (initRes.error) throw new Error("Initialize failed: " + JSON.stringify(initRes.error));
 
-    child.stdin.write(JSON.stringify({ jsonrpc: '2.0', method: 'notifications/initialized' }) + '\n');
+    await harness.sendNotification({ jsonrpc: '2.0', method: 'notifications/initialized' });
 
     const toolReqStart = Date.now();
-    const toolRes = await sendRpc({
+    const toolRes = await harness.sendRequest({
       jsonrpc: '2.0',
       id: 2,
       method: 'tools/call',
@@ -552,7 +710,7 @@ async function sendRpc(req, timeoutMs = 4000) {
     }
 
     const resReqStart = Date.now();
-    const resRead = await sendRpc({
+    const resRead = await harness.sendRequest({
       jsonrpc: '2.0',
       id: 3,
       method: 'resources/read',
@@ -570,7 +728,7 @@ async function sendRpc(req, timeoutMs = 4000) {
     revokeService.revokeSession({ sessionId });
     revokeDb.close();
 
-    const failRes = await sendRpc({
+    const failRes = await harness.sendRequest({
       jsonrpc: '2.0',
       id: 4,
       method: 'tools/call',
@@ -581,22 +739,14 @@ async function sendRpc(req, timeoutMs = 4000) {
     console.log("R5J3_REVOKE_FAIL_CLOSED=PASS");
 
     const shutdownStart = Date.now();
-    child.stdin.end();
+    const exitResult = await harness.close(4000);
+    console.log("R5J3_SHUTDOWN_ELAPSED_MS=" + (Date.now() - shutdownStart));
+    console.log("R5J3_CHILD_EXIT_CODE=" + exitResult.code);
+    console.log("R5J3_CHILD_SIGNAL=" + (exitResult.signal || "NONE"));
 
-    await new Promise((resolve, reject) => {
-      const exitTimer = setTimeout(() => {
-        child.kill('SIGKILL');
-        reject(new Error("Shutdown timed out"));
-      }, 4000);
-      child.on('exit', (code, signal) => {
-        clearTimeout(exitTimer);
-        console.log("R5J3_SHUTDOWN_ELAPSED_MS=" + (Date.now() - shutdownStart));
-        console.log("R5J3_CHILD_EXIT_CODE=" + code);
-        console.log("R5J3_CHILD_SIGNAL=" + (signal || "NONE"));
-        if (code !== 0) reject(new Error("Expected exit code 0, got " + code));
-        resolve();
-      });
-    });
+    if (exitResult.code !== 0) {
+      throw new Error("Expected exit code 0, got " + exitResult.code);
+    }
 
     const verifyDb = new Database(dbPath, { readonly: true });
     verifyDb.close();
@@ -605,7 +755,11 @@ async function sendRpc(req, timeoutMs = 4000) {
     process.exit(0);
   } catch (err) {
     console.error("R5J3_MCP_BRIDGE_PROOF_ERROR: " + (err instanceof Error ? err.stack : String(err)));
-    try { child.kill('SIGKILL'); } catch {}
+    try {
+      child.kill('SIGKILL');
+    } catch (killErr) {
+      console.error("R5J3_CHILD_KILL_ERROR: " + (killErr instanceof Error ? killErr.message : String(killErr)));
+    }
     process.exit(1);
   }
 })();
@@ -615,16 +769,45 @@ async function sendRpc(req, timeoutMs = 4000) {
 
   $mcpStartInfo = New-Object System.Diagnostics.ProcessStartInfo
   $mcpStartInfo.FileName = $exePath
-  $mcpStartInfo.Arguments = "`"$bootstrapScript`" `"$unpackedAsar`" `"$mcpDbPath`""
+  $mcpStartInfo.Arguments = "`"$bootstrapScript`" `"$unpackedAsar`" `"$mcpDbPath`" `"$ProjectRoot`""
   $mcpStartInfo.EnvironmentVariables["ELECTRON_RUN_AS_NODE"] = "1"
   $mcpStartInfo.UseShellExecute = $false
   $mcpStartInfo.RedirectStandardOutput = $true
   $mcpStartInfo.RedirectStandardError = $true
 
   $mcpProc = [System.Diagnostics.Process]::Start($mcpStartInfo)
-  $mcpStdout = $mcpProc.StandardOutput.ReadToEnd()
-  $mcpStderr = $mcpProc.StandardError.ReadToEnd()
-  $mcpProc.WaitForExit(30000)
+  if ($null -eq $mcpProc) {
+    throw "R5J3_PROCESS_SPAWN_FAILED: Failed to start MCP proof runner"
+  }
+  $mcpPid = $mcpProc.Id
+
+  # F3: Asynchronous non-blocking stream reads
+  $stdoutTask = $mcpProc.StandardOutput.ReadToEndAsync()
+  $stderrTask = $mcpProc.StandardError.ReadToEndAsync()
+
+  $timeoutMs = 35000
+  $exitedInTime = $mcpProc.WaitForExit($timeoutMs)
+
+  if (-not $exitedInTime) {
+    Write-Host "R5J3_TIMEOUT: MCP proof process $mcpPid did not terminate within $timeoutMs ms"
+    try {
+      $mcpProc.Kill()
+    } catch {
+      Write-Host "R5J3_CLEANUP_NOTE: Process $mcpPid kill attempted: $_"
+    }
+    $killWait = $mcpProc.WaitForExit(4000)
+    if (-not $killWait) {
+      throw "R5J3_PROCESS_TERMINATION_FAILED: Process $mcpPid survived kill attempt"
+    }
+    [System.Threading.Tasks.Task]::WaitAll(@($stdoutTask, $stderrTask), 3000)
+    $mcpStdout = $stdoutTask.Result
+    $mcpStderr = $stderrTask.Result
+    throw "R5J3_PROCESS_TIMEOUT: MCP proof process timed out after $timeoutMs ms (PID: $mcpPid)"
+  }
+
+  [System.Threading.Tasks.Task]::WaitAll(@($stdoutTask, $stderrTask), 3000)
+  $mcpStdout = $stdoutTask.Result
+  $mcpStderr = $stderrTask.Result
 
   Write-Host "MCP Proof Output:"
   Write-Host $mcpStdout
@@ -635,6 +818,30 @@ async function sendRpc(req, timeoutMs = 4000) {
   }
 
   Write-Host "[9/9] Packaged MCP Client Bridge & Node-Mode Stdio Proof: PASS" -ForegroundColor Green
+
+  # Verify no surviving processes in package dir
+  $surviving = Get-Process -Name "AgentForge" -ErrorAction SilentlyContinue | Where-Object {
+    try { $_.Path -like "$ProjectRoot\release\win-unpacked*" } catch { $false }
+  }
+  if ($surviving) {
+    throw "R5J3_SURVIVING_PROCESS_DETECTED: AgentForge process remained active in release/win-unpacked"
+  }
+  Write-Host "PACKAGED_NO_SURVIVING_PROCESSES=PASS" -ForegroundColor Green
+
+  # F3: Fail-visible cleanup of synthetic test materials
+  if (Test-Path $mcpDbPath) {
+    Remove-Item -Force $mcpDbPath
+    if (Test-Path $mcpDbPath) {
+      throw "R5J3_CLEANUP_FAILED: Database file handle remained locked after child exit"
+    }
+  }
+  if (Test-Path $tempMcpDir) {
+    Remove-Item -Recurse -Force $tempMcpDir
+    if (Test-Path $tempMcpDir) {
+      throw "R5J3_CLEANUP_FAILED: Temporary MCP directory could not be removed: $tempMcpDir"
+    }
+  }
+
   Write-Host "=== Packaged Runtime Smoke Test: SUCCESS (All 9 Gates Passed) ===" -ForegroundColor Green
 
 } finally {
@@ -667,9 +874,10 @@ async function sendRpc(req, timeoutMs = 4000) {
     } catch {}
   }
   if ($tempMcpDir -and (Test-Path $tempMcpDir)) {
-    try {
-      Remove-Item -Recurse -Force $tempMcpDir -ErrorAction SilentlyContinue
-    } catch {}
+    Remove-Item -Recurse -Force $tempMcpDir
+    if (Test-Path $tempMcpDir) {
+      Write-Host "WARNING: Temporary MCP directory persisted after cleanup: $tempMcpDir"
+    }
   }
 }
 

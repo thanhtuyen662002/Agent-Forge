@@ -49,10 +49,33 @@ export function parseCliArgs(args: string[]): CliArgs {
   const seenFlags = new Set<string>();
   const positional: string[] = [];
 
+  const isConfigureClient = args.some(
+    (a) => a.toLowerCase() === 'configure-client'
+  );
+
   for (let i = 0; i < args.length; i++) {
     const arg = args[i];
 
     if (arg.startsWith('-')) {
+      if (isConfigureClient) {
+        if (arg === '--auth' || arg === '-a') {
+          throw new Error('Flag --auth is not valid for configure-client command');
+        }
+        if (arg === '--session' || arg === '-s') {
+          throw new Error('Flag --session is not valid for configure-client command');
+        }
+        if (arg === '--ttl' || arg === '-t') {
+          throw new Error('Flag --ttl is not valid for configure-client command');
+        }
+        if (arg === '-c' || arg === '-d' || arg === '-j') {
+          throw new Error(`Short flag ${arg} is not supported for configure-client command`);
+        }
+        // Closed grammar for configure-client: only --client, --db, and --json permitted
+        if (arg !== '--client' && arg !== '--db' && arg !== '--json') {
+          throw new Error('Unknown flag');
+        }
+      }
+
       const normalizedFlag =
         arg === '-d' ? '--db'
         : arg === '-a' ? '--auth'
@@ -68,12 +91,12 @@ export function parseCliArgs(args: string[]): CliArgs {
 
       if (arg === '--json') {
         jsonOutput = true;
-      } else if (arg === '--client' || arg === '-c') {
+      } else if (arg === '--client' || (!isConfigureClient && arg === '-c')) {
         if (i + 1 >= args.length || args[i + 1].startsWith('-')) throw new Error('Missing value for flag');
         const val = args[++i];
         if (val.trim().length === 0) throw new Error('Flag cannot be whitespace-only');
         client = val.trim();
-      } else if (arg === '--db' || arg === '-d') {
+      } else if (arg === '--db' || (!isConfigureClient && arg === '-d')) {
         if (i + 1 >= args.length || args[i + 1].startsWith('-')) throw new Error('Missing value for flag');
         const val = args[++i];
         if (val.trim().length === 0) throw new Error('Flag cannot be whitespace-only');
@@ -193,13 +216,26 @@ export function getCanonicalAdminErrorMessage(category: string): string {
   }
 }
 
-export function runSessionAdmin(rawArgs: string[]): number {
+export function runSessionAdmin(
+  args: string[],
+  testOverrides?: { executablePath?: string; stdioScriptPath?: string }
+): number {
+  const isConfigureClient = args.some(
+    (a) => a.toLowerCase() === 'configure-client'
+  );
+
   let options: CliArgs;
   try {
-    options = parseCliArgs(rawArgs);
+    options = parseCliArgs(args);
   } catch (err) {
-    const msg = err instanceof Error ? err.message : String(err);
-    process.stderr.write(`ERROR: [MCP_CONFIGURATION_INVALID] ${msg}\n`);
+    if (isConfigureClient) {
+      process.stderr.write(
+        'ERROR: [MCP_CONFIGURATION_INVALID] Invalid configuration or CLI arguments\n'
+      );
+    } else {
+      const msg = err instanceof Error ? err.message : String(err);
+      process.stderr.write(`ERROR: [MCP_CONFIGURATION_INVALID] ${msg}\n`);
+    }
     return 1;
   }
 
@@ -222,19 +258,22 @@ Usage:
         const envelope = generateClientConfigEnvelope({
           client: options.client!,
           dbPath: options.dbPath,
+          executablePath: testOverrides?.executablePath,
+          stdioScriptPath: testOverrides?.stdioScriptPath,
         });
         process.stdout.write(JSON.stringify(envelope, null, 2) + '\n');
       } else {
         const template = generateClientConfig({
           client: options.client!,
           dbPath: options.dbPath,
+          executablePath: testOverrides?.executablePath,
+          stdioScriptPath: testOverrides?.stdioScriptPath,
         });
         process.stdout.write(JSON.stringify(template, null, 2) + '\n');
       }
       return 0;
-    } catch (err) {
-      const msg = err instanceof Error ? err.message : 'Configuration generation failed';
-      process.stderr.write(`ERROR: [MCP_CONFIGURATION_INVALID] ${msg}\n`);
+    } catch {
+      process.stderr.write('ERROR: [MCP_CONFIGURATION_INVALID] Invalid configuration or CLI arguments\n');
       return 1;
     }
   }

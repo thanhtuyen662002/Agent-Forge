@@ -170,24 +170,24 @@ Output:
   "session": {
     "id": "sess-67890",
     "authorization_id": "auth-12345",
-    "scope": "READ_AUTHORIZED_CONTEXT",
+    "scope": "AUTHORIZED_CONTEXT_READ",
     "issued_at": "2026-09-05T12:00:00.000Z",
     "expires_at": "2026-09-05T13:00:00.000Z"
   },
-  "plaintext_token": "af_live_0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+  "plaintext_token": "<OPERATOR_SESSION_TOKEN_REQUIRED>"
 }
 ```
 
 ### Step 3: Insert Token into Local Client Settings
 Replace the literal placeholder `<OPERATOR_SESSION_TOKEN_REQUIRED>` in your client configuration file with the issued `plaintext_token`:
 ```json
-"AGENTFORGE_MCP_SESSION_TOKEN": "af_live_0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+"AGENTFORGE_MCP_SESSION_TOKEN": "<OPERATOR_SESSION_TOKEN_REQUIRED>"
 ```
 
 ### Step 4: Verify Connection
 Launch your client or trigger a tool discovery request. The client will discover:
-- `agentforge_get_capabilities`
-- `agentforge_get_authorized_context`
+- Tools: `agentforge_get_capabilities`, `agentforge_get_authorized_context`
+- Resources: `agentforge://server/capabilities`, `agentforge://session/authorized-context`
 
 ### Step 5: Session Revocation & Rotation
 When a task finishes, changes scope, or a session token is retired:
@@ -222,21 +222,21 @@ Operators must observe the following immutable security rules:
 | :--- | :--- | :--- |
 | **Client Template Generation** | Implemented | Pure deterministic unit & CLI suite |
 | **Standardized MCP SDK stdio** | Automated | Automated end-to-end integration suite |
-| **Unpacked Package Runtime** | Automated | Windows CI unpacked smoke gate (`smoke-packaged-win.ps1`) |
-| **NSIS-Installed Package Runtime** | Automated | Windows CI isolated NSIS smoke gate (`smoke-installed-production-win.ps1`) |
-| **Proprietary Client GUI Interop** | Documented Template Only | Pinned SDK compatibility; GUI live tests deferred |
+| **Unpacked Package Runtime** | Automated | Required Windows CI gate (`smoke-packaged-win.ps1`); verified upon Package Windows job success |
+| **NSIS-Installed Package Runtime** | Automated | Required Windows CI gate (`smoke-installed-production-win.ps1`); verified upon Package Windows job success |
+| **Proprietary Client GUI Interop** | Documented Template Only | Pinned SDK process contract verified; third-party GUI desktop integration is documented template guidance |
 
 ---
 
 ## 8. Troubleshooting
 
 ### 1. Missing Executable or Stdio Script
-- **Symptom**: CLI exits with `ERROR: [MCP_CONFIGURATION_INVALID] Executable file does not exist` or `Stdio script file does not exist`.
+- **Symptom**: CLI exits with `ERROR: [MCP_CONFIGURATION_INVALID] Invalid configuration or CLI arguments`.
 - **Cause**: The application was moved, or `npm run build` has not been executed in developer mode.
 - **Remedy**: Verify that the executable path exists and points to `AgentForge.exe` or `node.exe`. In dev mode, run `npm run build` to compile TypeScript to `dist-electron`.
 
 ### 2. Relative Database Path Rejected
-- **Symptom**: CLI exits with `ERROR: [MCP_CONFIGURATION_INVALID] Database path must be an absolute path`.
+- **Symptom**: CLI exits with `ERROR: [MCP_CONFIGURATION_INVALID] Invalid configuration or CLI arguments`.
 - **Cause**: A relative path (e.g. `./agent-forge.db`) was passed to `--db`.
 - **Remedy**: Pass a fully-qualified absolute path (e.g., `D:\Projects\Agent-Forge\database\agent-forge.db`).
 
@@ -245,10 +245,13 @@ Operators must observe the following immutable security rules:
 - **Cause**: Token is missing, malformed, expired, revoked, or bound to a different authorization graph.
 - **Remedy**: Re-issue a session token using `sessionAdmin.js issue` and verify task authorization state.
 
-### 4. Native Addon Load Failure (`better-sqlite3`)
-- **Symptom**: Child process terminates immediately; stderr reports `NODE_MODULE_VERSION` mismatch.
-- **Cause**: When running with `AgentForge.exe`, `ELECTRON_RUN_AS_NODE=1` was omitted, or native addons were not compiled against Electron's ABI.
-- **Remedy**: Ensure `ELECTRON_RUN_AS_NODE: "1"` is present in the client configuration `env` block. In development, run `npx @electron/rebuild -f -w better-sqlite3`.
+### 4. Module Resolution vs. Native Addon Incompatibility
+- **Symptom A (`MODULE_NOT_FOUND`)**: Child process reports `Error: Cannot find module 'better-sqlite3'`.
+  - **Cause**: The execution environment cannot locate the module because package-scoped resolution was bypassed or files are missing from `resources/app.asar`.
+  - **Remedy**: External clients must launch the packaged `AgentForge.exe` pointing directly to `<package-root>\resources\app.asar\dist-electron\mcp\stdio.js`.
+- **Symptom B (`NODE_MODULE_VERSION` mismatch)**: Child process reports `The module 'better_sqlite3.node' was compiled against a different Node.js version`.
+  - **Cause**: The MCP stdio server was launched with an incompatible host Node runtime instead of the packaged runtime matching the compiled binary ABI.
+  - **Remedy**: For packaged/installed tiers, always use `AgentForge.exe` with `ELECTRON_RUN_AS_NODE=1`. For developer checkouts, ensure native dependencies are compiled for host Node via `npm rebuild better-sqlite3`. (Note: Packaged and installed distributions contain pre-compiled native bindings and must never be rebuilt by an operator).
 
 ### 5. Protocol Contamination
 - **Symptom**: Client reports JSON-RPC parsing error on initialization or tool calls.
@@ -258,4 +261,4 @@ Operators must observe the following immutable security rules:
 ### 6. Database Lock / Cleanup Failure
 - **Symptom**: File is locked after client shutdown.
 - **Cause**: Child process did not receive clean EOF or SIGINT/SIGTERM.
-- **Remedy**: Terminate lingering Node processes. AgentForge stdio server performs clean SQLite close upon EOF (`stdin.end()`) or `SIGINT`/`SIGTERM`.
+- **Remedy**: Terminate lingering child processes. AgentForge stdio server performs clean SQLite close upon EOF (`stdin.end()`) or `SIGINT`/`SIGTERM`.
