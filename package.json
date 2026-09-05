@@ -18,7 +18,8 @@
     "test:installed:win": "powershell -ExecutionPolicy Bypass -File scripts/test-installed-update-win.ps1",
     "test": "vitest run",
     "test:watch": "vitest",
-    "mcp:stdio": "node dist-electron/mcp/stdio.js"
+    "mcp:stdio": "node dist-electron/mcp/stdio.js",
+    "mcp:session-admin": "node dist-electron/mcp/sessionAdmin.js"
   },
   "dependencies": {
     "@modelcontextprotocol/server": "2.0.0",

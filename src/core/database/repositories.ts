@@ -23,6 +23,7 @@ import {
   ProjectStatus,
   ExecutionAuthorization,
   ExecutionAuthorizationStatus,
+  McpClientSession,
   RoleProfile,
   AgentProfile,
   ProviderAccount,
@@ -3409,6 +3410,88 @@ export class Repository {
       settled_at: row.settled_at ? String(row.settled_at) : null,
       settlement_evidence_json: row.settlement_evidence_json ? String(row.settlement_evidence_json) : null,
       settlement_evidence_hash: row.settlement_evidence_hash ? String(row.settlement_evidence_hash) : null,
+    };
+  }
+
+  // ==========================================
+  // MCP Client Sessions Authority (R5J2)
+  // ==========================================
+  public createMcpClientSession(session: McpClientSession): void {
+    this.db
+      .prepare(`
+        INSERT INTO mcp_client_sessions (
+          id,
+          authorization_id,
+          scope,
+          token_hash,
+          authorization_fingerprint,
+          issued_at,
+          expires_at,
+          revoked_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+      `)
+      .run(
+        session.id,
+        session.authorization_id,
+        session.scope,
+        session.token_hash,
+        session.authorization_fingerprint,
+        session.issued_at,
+        session.expires_at,
+        session.revoked_at
+      );
+  }
+
+  public getMcpClientSessionByTokenHash(tokenHash: string): McpClientSession | null {
+    const row = this.db
+      .prepare('SELECT * FROM mcp_client_sessions WHERE token_hash = ?')
+      .get(tokenHash) as Record<string, unknown> | undefined;
+    if (!row) return null;
+    return this.mapMcpClientSession(row);
+  }
+
+  public getMcpClientSessionById(id: string): McpClientSession | null {
+    const row = this.db
+      .prepare('SELECT * FROM mcp_client_sessions WHERE id = ?')
+      .get(id) as Record<string, unknown> | undefined;
+    if (!row) return null;
+    return this.mapMcpClientSession(row);
+  }
+
+  public getActiveMcpClientSessionByAuthorizationId(authId: string): McpClientSession | null {
+    const row = this.db
+      .prepare('SELECT * FROM mcp_client_sessions WHERE authorization_id = ? AND revoked_at IS NULL')
+      .get(authId) as Record<string, unknown> | undefined;
+    if (!row) return null;
+    return this.mapMcpClientSession(row);
+  }
+
+  public revokeMcpClientSession(params: { sessionId?: string; authorizationId?: string; revokedAt: string }): boolean {
+    if (params.sessionId) {
+      const res = this.db
+        .prepare('UPDATE mcp_client_sessions SET revoked_at = ? WHERE id = ? AND revoked_at IS NULL')
+        .run(params.revokedAt, params.sessionId);
+      return res.changes > 0;
+    }
+    if (params.authorizationId) {
+      const res = this.db
+        .prepare('UPDATE mcp_client_sessions SET revoked_at = ? WHERE authorization_id = ? AND revoked_at IS NULL')
+        .run(params.revokedAt, params.authorizationId);
+      return res.changes > 0;
+    }
+    return false;
+  }
+
+  private mapMcpClientSession(row: Record<string, unknown>): McpClientSession {
+    return {
+      id: String(row.id),
+      authorization_id: String(row.authorization_id),
+      scope: row.scope as McpClientSession['scope'],
+      token_hash: String(row.token_hash),
+      authorization_fingerprint: String(row.authorization_fingerprint),
+      issued_at: String(row.issued_at),
+      expires_at: String(row.expires_at),
+      revoked_at: row.revoked_at ? String(row.revoked_at) : null,
     };
   }
 

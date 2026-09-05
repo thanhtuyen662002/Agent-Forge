@@ -1,0 +1,1028 @@
+import crypto from 'crypto';
+import Database from 'better-sqlite3';
+import { Repository } from '../database/repositories';
+import {
+  ExecutionAuthorization,
+  McpClientSession,
+  McpSessionErrorCode,
+  AuthorizedContextResponse,
+  Project,
+  Task,
+  TaskAttempt,
+  AgentAssignment,
+  Provider,
+  ProviderAccount,
+  ProviderResource,
+  EventRecord,
+} from '../types/domain';
+import { canonicalJsonStringify, computeSha256 } from '../context/ContextIntegrity';
+import {
+  CanonicalExecutionPayloadSchema,
+  computePayloadHash,
+  computeContextManifestHash,
+  CanonicalExecutionPayload,
+} from './ExecutionAuthorizationService';
+import { ManagerProtocolSchema } from '../types/protocols';
+
+export type McpExtendedErrorCode = McpSessionErrorCode | 'MCP_CLEANUP_FAILED' | 'MCP_INTERNAL_ERROR';
+
+export class McpAuthorityError extends Error {
+  public readonly category: McpExtendedErrorCode;
+  public readonly rawMessage: string;
+
+  constructor(category: McpExtendedErrorCode, message: string) {
+    const cleanMessage = message.startsWith(`[${category}] `)
+      ? message.slice(`[${category}] `.length)
+      : message;
+    super(`[${category}] ${cleanMessage}`);
+    this.name = 'McpAuthorityError';
+    this.category = category;
+    this.rawMessage = cleanMessage;
+    Object.setPrototypeOf(this, McpAuthorityError.prototype);
+  }
+}
+
+export const MCP_SESSION_DEFAULT_TTL_SECONDS = 3600;
+export const MCP_SESSION_MIN_TTL_SECONDS = 300;
+export const MCP_SESSION_MAX_TTL_SECONDS = 86400;
+
+export interface IssueSessionParams {
+  authorizationId: string;
+  ttlSeconds?: number;
+}
+
+export interface IssueSessionResult {
+  session: McpClientSession;
+  plaintextToken: string;
+}
+
+export interface RevokeSessionParams {
+  sessionId?: string;
+  authorizationId?: string;
+}
+
+export interface RevokeSessionResult {
+  revoked: boolean;
+}
+
+export interface ProtocolMessageRecord {
+  id: string;
+  message_id: string;
+  protocol: string;
+  project_id: string;
+  task_id: string | null;
+  decision: string;
+  sequence: number;
+  payload_hash: string;
+  payload_json: string;
+  state: string;
+  created_at: string;
+  processed_at?: string | null;
+}
+
+export interface ValidatedAuthorityGraph {
+  auth: ExecutionAuthorization;
+  project: Project;
+  task: Task;
+  attempt: TaskAttempt;
+  assignment: AgentAssignment;
+  provider: Provider;
+  account: ProviderAccount;
+  resource: ProviderResource;
+  routingEvent: EventRecord;
+  routingPayload: Record<string, unknown>;
+  protocolMessage: ProtocolMessageRecord | null;
+  payload: CanonicalExecutionPayload;
+}
+
+/**
+ * Validates a session token string against the canonical base64url domain (32 bytes = 43 chars).
+ * Prohibits whitespace, trimming, normalization, or non-canonical encodings.
+ */
+export function validateCanonicalSessionToken(token: unknown): string {
+  if (token === undefined || token === null || token === '') {
+    throw new McpAuthorityError('MCP_SESSION_REQUIRED', 'Missing session token');
+  }
+  if (typeof token !== 'string') {
+    throw new McpAuthorityError('MCP_SESSION_UNAUTHORIZED', 'Session authentication failed');
+  }
+  // Canonical 32-byte base64url token without padding is exactly 43 chars of [A-Za-z0-9_-]
+  if (!/^[A-Za-z0-9_-]{43}$/.test(token)) {
+    throw new McpAuthorityError('MCP_SESSION_UNAUTHORIZED', 'Session authentication failed');
+  }
+  return token;
+}
+
+/**
+ * Validates TTL seconds strictly as an integer within authorized bounds.
+ * Rejects fractions, NaN, infinities, signs, exponent notation, suffixes, and partial parseInt inputs.
+ */
+export function validateTtlSeconds(ttl: unknown): number {
+  if (ttl === undefined) {
+    return MCP_SESSION_DEFAULT_TTL_SECONDS;
+  }
+  if (typeof ttl === 'number') {
+    if (!Number.isSafeInteger(ttl) || !/^\d+$/.test(String(ttl))) {
+      throw new McpAuthorityError(
+        'MCP_CONFIGURATION_INVALID',
+        `Invalid session TTL: must be a canonical positive integer within bounds`
+      );
+    }
+  } else if (typeof ttl === 'string') {
+    if (!/^\d+$/.test(ttl)) {
+      throw new McpAuthorityError(
+        'MCP_CONFIGURATION_INVALID',
+        `Invalid session TTL: must be a canonical positive integer within bounds`
+      );
+    }
+    ttl = Number(ttl);
+  } else {
+    throw new McpAuthorityError(
+      'MCP_CONFIGURATION_INVALID',
+      `Invalid session TTL: must be a canonical positive integer within bounds`
+    );
+  }
+
+  const numericTtl = ttl as number;
+  if (numericTtl < MCP_SESSION_MIN_TTL_SECONDS || numericTtl > MCP_SESSION_MAX_TTL_SECONDS) {
+    throw new McpAuthorityError(
+      'MCP_CONFIGURATION_INVALID',
+      `Session TTL ${numericTtl}s is out of authorized bounds [${MCP_SESSION_MIN_TTL_SECONDS}, ${MCP_SESSION_MAX_TTL_SECONDS}]`
+    );
+  }
+  return numericTtl;
+}
+
+/**
+ * Computes a deterministic canonical SHA-256 fingerprint over the COMPLETE authority graph.
+ */
+export function computeCompleteAuthorityFingerprint(graph: ValidatedAuthorityGraph): string {
+  const {
+    auth,
+    project,
+    task,
+    attempt,
+    assignment,
+    provider,
+    account,
+    resource,
+    routingEvent,
+    routingPayload,
+    protocolMessage,
+  } = graph;
+
+  const spec = {
+    authorization: {
+      id: auth.id,
+      lifecycle_version: auth.lifecycle_version,
+      status: auth.status,
+      base_sha: auth.base_sha,
+      repository_head_sha: auth.repository_head_sha,
+      task_revision: auth.task_revision,
+      task_ownership_epoch: auth.task_ownership_epoch,
+      instruction_payload_hash: auth.instruction_payload_hash,
+      context_manifest_hash: auth.context_manifest_hash,
+      manager_message_id: auth.manager_message_id,
+      manager_payload_hash: auth.manager_payload_hash,
+    },
+    project: {
+      id: project.id,
+      name: project.name,
+      repository_path: project.repository_path,
+      status: project.status,
+    },
+    task: {
+      id: task.id,
+      project_id: task.project_id,
+      title: task.title,
+      state: task.state,
+      revision_count: task.revision_count,
+      ownership_epoch: task.ownership_epoch ?? null,
+    },
+    attempt: {
+      id: attempt.id,
+      task_id: attempt.task_id,
+      attempt_number: attempt.attempt_number,
+      status: attempt.status,
+    },
+    assignment: {
+      id: assignment.id,
+      project_id: assignment.project_id,
+      task_id: assignment.task_id,
+      attempt_id: assignment.attempt_id,
+      selected_provider_id: assignment.selected_provider_id,
+      selected_account_id: assignment.selected_account_id,
+      selected_resource_id: assignment.selected_resource_id,
+      routing_decision_id: assignment.routing_decision_id,
+      status: assignment.status,
+    },
+    provider: {
+      id: provider.id,
+      name: provider.name,
+      adapter_type: provider.adapter_type,
+      enabled: provider.enabled,
+    },
+    account: {
+      id: account.id,
+      provider_id: account.provider_id,
+      label: account.label,
+      enabled: account.enabled,
+    },
+    resource: {
+      id: resource.id,
+      provider_id: resource.provider_id,
+      provider_account_id: resource.provider_account_id,
+      model_name: resource.model_name,
+      enabled: resource.enabled,
+    },
+    routing: {
+      id: routingEvent.id,
+      type: routingEvent.type,
+      project_id: routingEvent.project_id,
+      task_id: routingEvent.task_id,
+      agent_id: routingEvent.agent_id ?? null,
+      summary: routingEvent.summary,
+      timestamp: routingEvent.timestamp,
+      raw_payload: routingPayload,
+    },
+    protocol_message: protocolMessage
+      ? {
+          id: protocolMessage.id,
+          message_id: protocolMessage.message_id,
+          protocol: protocolMessage.protocol,
+          project_id: protocolMessage.project_id,
+          task_id: protocolMessage.task_id,
+          decision: protocolMessage.decision,
+          sequence: protocolMessage.sequence,
+          state: protocolMessage.state,
+          payload_hash: protocolMessage.payload_hash,
+          payload_json: protocolMessage.payload_json,
+          created_at: protocolMessage.created_at,
+          processed_at: protocolMessage.processed_at ?? null,
+        }
+      : null,
+  };
+
+  return computeSha256(canonicalJsonStringify(spec));
+}
+
+/**
+ * Backward compatibility helper aliased to complete graph fingerprint when graph available.
+ */
+export function computeAuthorizationFingerprint(auth: ExecutionAuthorization): string {
+  const spec = {
+    assignment_id: auth.assignment_id ?? null,
+    attempt_id: auth.attempt_id ?? null,
+    authorization_id: auth.id,
+    base_sha: auth.base_sha,
+    canonical_payload_json: auth.canonical_payload_json,
+    context_manifest_hash: auth.context_manifest_hash,
+    instruction_payload_hash: auth.instruction_payload_hash,
+    lifecycle_version: auth.lifecycle_version ?? null,
+    manager_message_id: auth.manager_message_id,
+    manager_payload_hash: auth.manager_payload_hash,
+    project_id: auth.project_id,
+    repository_head_sha: auth.repository_head_sha,
+    routing_decision_id: auth.routing_decision_id,
+    selected_account_id: auth.selected_account_id ?? null,
+    selected_provider_id: auth.selected_provider_id,
+    selected_resource_id: auth.selected_resource_id,
+    task_id: auth.task_id,
+    task_ownership_epoch: auth.task_ownership_epoch ?? null,
+    task_revision: auth.task_revision,
+  };
+  return computeSha256(canonicalJsonStringify(spec));
+}
+
+export class McpSessionAuthorityService {
+  constructor(
+    private readonly repo: Repository,
+    private readonly db: Database.Database
+  ) {}
+
+  public static generateSessionToken(): string {
+    return crypto.randomBytes(32).toString('base64url');
+  }
+
+  public static hashSessionToken(token: string): string {
+    return crypto.createHash('sha256').update(token, 'utf8').digest('hex').toLowerCase();
+  }
+
+  /**
+   * Internal complete authority graph validator shared between issueSession and resolveAuthorizedContext.
+   * Performs exhaustive, non-optional graph validation.
+   */
+  public validateCompleteAuthorityGraph(authId: string): ValidatedAuthorityGraph {
+    // 1. Authorization row & lifecycle version
+    const auth = this.repo.getExecutionAuthorization(authId);
+    if (!auth) {
+      throw new McpAuthorityError('MCP_AUTHORITY_FENCED', `Authorization "${authId}" not found`);
+    }
+    if (auth.lifecycle_version !== 1) {
+      throw new McpAuthorityError(
+        'MCP_AUTHORITY_FENCED',
+        `Authorization "${authId}" is not lifecycle version 1 (found ${auth.lifecycle_version})`
+      );
+    }
+
+    // 2. Authorization status
+    if (auth.status !== 'AUTHORIZED' && auth.status !== 'DISPATCHED') {
+      throw new McpAuthorityError(
+        'MCP_AUTHORITY_FENCED',
+        `Authorization status "${auth.status}" is not active`
+      );
+    }
+
+    // 3. No terminal settlement
+    if (
+      auth.settlement_status != null ||
+      auth.settled_at != null ||
+      auth.settlement_evidence_hash != null
+    ) {
+      throw new McpAuthorityError(
+        'MCP_AUTHORITY_FENCED',
+        `Authorization already has terminal settlement`
+      );
+    }
+
+    // 4. Project
+    const project = this.repo.getProject(auth.project_id);
+    if (!project || project.id !== auth.project_id) {
+      throw new McpAuthorityError('MCP_AUTHORITY_FENCED', `Project "${auth.project_id}" not found or mismatched`);
+    }
+    if (project.status !== 'RUNNING') {
+      throw new McpAuthorityError('MCP_AUTHORITY_FENCED', `Project status "${project.status}" is not active RUNNING`);
+    }
+
+    // 5. Task
+    const task = this.repo.getTask(auth.task_id);
+    if (!task || task.id !== auth.task_id) {
+      throw new McpAuthorityError('MCP_AUTHORITY_FENCED', `Task "${auth.task_id}" not found or mismatched`);
+    }
+    if (task.project_id !== auth.project_id) {
+      throw new McpAuthorityError('MCP_AUTHORITY_FENCED', 'Task project_id does not match authorization project_id');
+    }
+    if (task.state === 'DONE' || task.state === 'FAILED' || task.state === 'CANCELLED') {
+      throw new McpAuthorityError('MCP_AUTHORITY_FENCED', `Task state "${task.state}" is terminal`);
+    }
+    if (task.revision_count !== auth.task_revision) {
+      throw new McpAuthorityError('MCP_AUTHORITY_FENCED', 'Task revision_count does not match authorization task_revision');
+    }
+
+    // 6. Ownership epoch
+    const taskEpoch = task.ownership_epoch;
+    if (taskEpoch == null || taskEpoch <= 0) {
+      throw new McpAuthorityError('MCP_AUTHORITY_FENCED', 'Task missing valid ownership_epoch');
+    }
+    if (auth.task_ownership_epoch == null || auth.task_ownership_epoch <= 0) {
+      throw new McpAuthorityError('MCP_AUTHORITY_FENCED', 'Authorization missing valid task_ownership_epoch');
+    }
+    if (taskEpoch !== auth.task_ownership_epoch) {
+      throw new McpAuthorityError(
+        'MCP_AUTHORITY_FENCED',
+        `Task ownership epoch ${taskEpoch} does not match authorization epoch ${auth.task_ownership_epoch}`
+      );
+    }
+
+    // 7. Task Attempt
+    if (!auth.attempt_id) {
+      throw new McpAuthorityError('MCP_AUTHORITY_FENCED', 'Authorization missing attempt_id');
+    }
+    const attempt = this.repo.getTaskAttempt(auth.attempt_id);
+    if (!attempt || attempt.id !== auth.attempt_id) {
+      throw new McpAuthorityError('MCP_AUTHORITY_FENCED', `Attempt "${auth.attempt_id}" not found`);
+    }
+    if (attempt.task_id !== auth.task_id) {
+      throw new McpAuthorityError('MCP_AUTHORITY_FENCED', 'Attempt task_id does not match authorization task_id');
+    }
+    if (attempt.status !== 'RUNNING') {
+      throw new McpAuthorityError('MCP_AUTHORITY_FENCED', `Attempt status "${attempt.status}" is not active execution status RUNNING`);
+    }
+
+    // 8. Agent Assignment
+    if (!auth.assignment_id) {
+      throw new McpAuthorityError('MCP_AUTHORITY_FENCED', 'Authorization missing assignment_id');
+    }
+    const assignment = this.repo.getAgentAssignment(auth.assignment_id);
+    if (!assignment || assignment.id !== auth.assignment_id) {
+      throw new McpAuthorityError('MCP_AUTHORITY_FENCED', `Assignment "${auth.assignment_id}" not found`);
+    }
+    if (assignment.project_id !== auth.project_id) {
+      throw new McpAuthorityError('MCP_AUTHORITY_FENCED', 'Assignment project_id does not match authorization project_id');
+    }
+    if (assignment.task_id !== auth.task_id) {
+      throw new McpAuthorityError('MCP_AUTHORITY_FENCED', 'Assignment task_id does not match authorization task_id');
+    }
+    if (assignment.attempt_id !== auth.attempt_id) {
+      throw new McpAuthorityError('MCP_AUTHORITY_FENCED', 'Assignment attempt_id does not match authorization attempt_id');
+    }
+    if (assignment.selected_provider_id !== auth.selected_provider_id) {
+      throw new McpAuthorityError('MCP_AUTHORITY_FENCED', 'Assignment selected_provider_id does not match authorization');
+    }
+    if (assignment.selected_account_id !== auth.selected_account_id) {
+      throw new McpAuthorityError('MCP_AUTHORITY_FENCED', 'Assignment selected_account_id does not match authorization');
+    }
+    if (assignment.selected_resource_id !== auth.selected_resource_id) {
+      throw new McpAuthorityError('MCP_AUTHORITY_FENCED', 'Assignment selected_resource_id does not match authorization');
+    }
+    if (assignment.routing_decision_id !== auth.routing_decision_id) {
+      throw new McpAuthorityError('MCP_AUTHORITY_FENCED', 'Assignment routing_decision_id does not match authorization');
+    }
+    if (assignment.status !== 'ASSIGNED' && assignment.status !== 'RUNNING') {
+      throw new McpAuthorityError(
+        'MCP_AUTHORITY_FENCED',
+        `Assignment status "${assignment.status}" is not active (ASSIGNED or RUNNING)`
+      );
+    }
+
+    // 9. Provider
+    const provider = this.repo.getProvider(auth.selected_provider_id);
+    if (!provider || provider.id !== auth.selected_provider_id) {
+      throw new McpAuthorityError('MCP_AUTHORITY_FENCED', `Provider "${auth.selected_provider_id}" not found`);
+    }
+    if (!provider.enabled) {
+      throw new McpAuthorityError('MCP_AUTHORITY_FENCED', `Provider "${auth.selected_provider_id}" is disabled`);
+    }
+
+    // 10. Provider Account
+    if (!auth.selected_account_id) {
+      throw new McpAuthorityError('MCP_AUTHORITY_FENCED', 'Authorization missing selected_account_id');
+    }
+    const account = this.repo.getProviderAccount(auth.selected_account_id);
+    if (!account || account.id !== auth.selected_account_id) {
+      throw new McpAuthorityError('MCP_AUTHORITY_FENCED', `Provider account "${auth.selected_account_id}" not found`);
+    }
+    if (account.provider_id !== auth.selected_provider_id) {
+      throw new McpAuthorityError('MCP_AUTHORITY_FENCED', 'Account provider_id does not match selected_provider_id');
+    }
+    if (!account.enabled) {
+      throw new McpAuthorityError('MCP_AUTHORITY_FENCED', `Provider account "${auth.selected_account_id}" is disabled`);
+    }
+
+    // 11. Provider Resource
+    const resource = this.repo.getProviderResource(auth.selected_resource_id);
+    if (!resource || resource.id !== auth.selected_resource_id) {
+      throw new McpAuthorityError('MCP_AUTHORITY_FENCED', `Resource "${auth.selected_resource_id}" not found`);
+    }
+    if (resource.provider_id !== auth.selected_provider_id) {
+      throw new McpAuthorityError('MCP_AUTHORITY_FENCED', 'Resource provider_id does not match selected_provider_id');
+    }
+    if (resource.provider_account_id == null || resource.provider_account_id !== auth.selected_account_id) {
+      throw new McpAuthorityError('MCP_AUTHORITY_FENCED', 'Resource account binding does not match selected_account_id');
+    }
+    if (!resource.enabled) {
+      throw new McpAuthorityError('MCP_AUTHORITY_FENCED', `Resource "${auth.selected_resource_id}" is disabled`);
+    }
+
+    // 12. Routing Decision Event
+    const routingEvent = this.repo.getRoutingDecisionEvent(auth.routing_decision_id);
+    if (!routingEvent) {
+      throw new McpAuthorityError('MCP_AUTHORITY_FENCED', `Routing decision event "${auth.routing_decision_id}" not found`);
+    }
+    if (routingEvent.id !== auth.routing_decision_id) {
+      throw new McpAuthorityError('MCP_AUTHORITY_FENCED', 'Routing event id mismatch');
+    }
+    if (routingEvent.project_id !== auth.project_id) {
+      throw new McpAuthorityError('MCP_AUTHORITY_FENCED', 'Routing event project_id mismatch');
+    }
+    if (routingEvent.task_id !== auth.task_id) {
+      throw new McpAuthorityError('MCP_AUTHORITY_FENCED', 'Routing event task_id mismatch');
+    }
+    if (
+      routingEvent.type !== 'PROVIDER_ROUTING_DECISION' &&
+      routingEvent.type !== 'ROLE_AWARE_ROUTING_DECISION'
+    ) {
+      throw new McpAuthorityError('MCP_AUTHORITY_FENCED', `Routing event type "${routingEvent.type}" is not an authoritative routing decision`);
+    }
+
+    // Validate mandatory routing payload fields without optional truthiness
+    const rPayload = (routingEvent.structured_payload ?? {}) as Record<string, unknown>;
+    if (typeof rPayload !== 'object' || rPayload === null || Array.isArray(rPayload)) {
+      throw new McpAuthorityError('MCP_AUTHORITY_FENCED', 'Routing decision structured payload is missing or malformed');
+    }
+
+    // Check for prohibited snake_case or duplicate alias keys
+    const prohibitedAliases = [
+      'project_id',
+      'task_id',
+      'attempt_id',
+      'routing_decision_id',
+      'routingDecisionId',
+      'selected_provider_id',
+      'providerId',
+      'selected_account_id',
+      'accountId',
+      'selected_resource_id',
+      'resourceId',
+      'selected_outcome',
+      'selectedOutcome',
+    ];
+    for (const key of prohibitedAliases) {
+      if (key in rPayload) {
+        throw new McpAuthorityError('MCP_AUTHORITY_FENCED', `Routing payload contains non-canonical or contradictory alias field "${key}"`);
+      }
+    }
+
+    if (routingEvent.type === 'ROLE_AWARE_ROUTING_DECISION') {
+      const allowedKeys = new Set([
+        'decisionId',
+        'projectId',
+        'taskId',
+        'attemptId',
+        'roleProfileId',
+        'role',
+        'outcome',
+        'routePolicyId',
+        'failoverPolicyAuthoritySnapshot',
+        'selectedProviderId',
+        'selectedAccountId',
+        'selectedResourceId',
+        'selectedAssignmentId',
+        'requestedConstraints',
+        'appliedExclusions',
+        'appliedSeparation',
+        'reason',
+      ]);
+      for (const key of Object.keys(rPayload)) {
+        if (!allowedKeys.has(key)) {
+          throw new McpAuthorityError('MCP_AUTHORITY_FENCED', `Routing payload contains unauthorized additional field "${key}"`);
+        }
+      }
+
+      if (typeof rPayload.decisionId !== 'string' || rPayload.decisionId !== auth.routing_decision_id) {
+        throw new McpAuthorityError('MCP_AUTHORITY_FENCED', 'Routing payload decisionId missing or mismatched');
+      }
+      if (typeof rPayload.projectId !== 'string' || rPayload.projectId !== auth.project_id) {
+        throw new McpAuthorityError('MCP_AUTHORITY_FENCED', 'Routing payload projectId missing or mismatched');
+      }
+      if (typeof rPayload.taskId !== 'string' || rPayload.taskId !== auth.task_id) {
+        throw new McpAuthorityError('MCP_AUTHORITY_FENCED', 'Routing payload taskId missing or mismatched');
+      }
+      if (typeof rPayload.attemptId !== 'string' || rPayload.attemptId !== auth.attempt_id) {
+        throw new McpAuthorityError('MCP_AUTHORITY_FENCED', 'Routing payload attemptId missing or mismatched');
+      }
+      if (typeof rPayload.selectedProviderId !== 'string' || rPayload.selectedProviderId !== auth.selected_provider_id) {
+        throw new McpAuthorityError('MCP_AUTHORITY_FENCED', 'Routing payload selectedProviderId missing or mismatched');
+      }
+      if (typeof rPayload.selectedAccountId !== 'string' || rPayload.selectedAccountId !== auth.selected_account_id) {
+        throw new McpAuthorityError('MCP_AUTHORITY_FENCED', 'Routing payload selectedAccountId missing or mismatched');
+      }
+      if (typeof rPayload.selectedResourceId !== 'string' || rPayload.selectedResourceId !== auth.selected_resource_id) {
+        throw new McpAuthorityError('MCP_AUTHORITY_FENCED', 'Routing payload selectedResourceId missing or mismatched');
+      }
+      if (typeof rPayload.outcome !== 'string' || rPayload.outcome !== 'SELECTED') {
+        throw new McpAuthorityError('MCP_AUTHORITY_FENCED', 'Routing payload outcome missing or not SELECTED');
+      }
+    } else {
+      // PROVIDER_ROUTING_DECISION (legacy)
+      const allowedKeys = new Set([
+        'decisionId',
+        'projectId',
+        'taskId',
+        'attemptId',
+        'candidateResourceIds',
+        'selectedResourceId',
+        'selectedProviderId',
+        'outcome',
+        'reason',
+        'candidateEvaluations',
+      ]);
+      for (const key of Object.keys(rPayload)) {
+        if (!allowedKeys.has(key)) {
+          throw new McpAuthorityError('MCP_AUTHORITY_FENCED', `Routing payload contains unauthorized additional field "${key}"`);
+        }
+      }
+
+      if (typeof rPayload.decisionId !== 'string' || rPayload.decisionId !== auth.routing_decision_id) {
+        throw new McpAuthorityError('MCP_AUTHORITY_FENCED', 'Routing payload decisionId missing or mismatched');
+      }
+      if (typeof rPayload.projectId !== 'string' || rPayload.projectId !== auth.project_id) {
+        throw new McpAuthorityError('MCP_AUTHORITY_FENCED', 'Routing payload projectId missing or mismatched');
+      }
+      if (typeof rPayload.taskId !== 'string' || rPayload.taskId !== auth.task_id) {
+        throw new McpAuthorityError('MCP_AUTHORITY_FENCED', 'Routing payload taskId missing or mismatched');
+      }
+      if (typeof rPayload.attemptId !== 'string' || rPayload.attemptId !== auth.attempt_id) {
+        throw new McpAuthorityError('MCP_AUTHORITY_FENCED', 'Routing payload attemptId missing or mismatched');
+      }
+      if (typeof rPayload.selectedProviderId !== 'string' || rPayload.selectedProviderId !== auth.selected_provider_id) {
+        throw new McpAuthorityError('MCP_AUTHORITY_FENCED', 'Routing payload selectedProviderId missing or mismatched');
+      }
+      if (typeof rPayload.selectedResourceId !== 'string' || rPayload.selectedResourceId !== auth.selected_resource_id) {
+        throw new McpAuthorityError('MCP_AUTHORITY_FENCED', 'Routing payload selectedResourceId missing or mismatched');
+      }
+      if (typeof rPayload.outcome !== 'string' || rPayload.outcome !== 'SELECTED') {
+        throw new McpAuthorityError('MCP_AUTHORITY_FENCED', 'Routing payload outcome missing or not SELECTED');
+      }
+    }
+
+    // 13. Protocol Message
+    let protocolMessage: ProtocolMessageRecord | null = null;
+    if (auth.manager_message_id) {
+      const msgRow = this.repo.getProtocolMessageByRecordId(auth.manager_message_id);
+      if (!msgRow) {
+        throw new McpAuthorityError('MCP_AUTHORITY_FENCED', `Manager protocol message record "${auth.manager_message_id}" not found`);
+      }
+
+      if (typeof msgRow.message_id !== 'string' || msgRow.message_id.trim().length === 0) {
+        throw new McpAuthorityError('MCP_AUTHORITY_FENCED', 'Protocol message row message_id is empty or invalid');
+      }
+      if (msgRow.protocol !== 'manager.v1') {
+        throw new McpAuthorityError('MCP_AUTHORITY_FENCED', 'Protocol message protocol is not manager.v1');
+      }
+      if (msgRow.status !== 'APPLIED') {
+        throw new McpAuthorityError('MCP_AUTHORITY_FENCED', `Protocol message state "${msgRow.status}" is not APPLIED`);
+      }
+      if (msgRow.project_id !== auth.project_id) {
+        throw new McpAuthorityError('MCP_AUTHORITY_FENCED', 'Protocol message project_id mismatch');
+      }
+      if (msgRow.task_id !== auth.task_id) {
+        throw new McpAuthorityError('MCP_AUTHORITY_FENCED', 'Protocol message task_id mismatch');
+      }
+      if (msgRow.payload_hash !== auth.manager_payload_hash) {
+        throw new McpAuthorityError('MCP_AUTHORITY_FENCED', 'Protocol message payload_hash mismatch');
+      }
+
+      const rawPayload = String(msgRow.raw_payload ?? '');
+      const recomputedHash = crypto.createHash('sha256').update(rawPayload, 'utf8').digest('hex');
+      if (recomputedHash !== msgRow.payload_hash || recomputedHash !== auth.manager_payload_hash) {
+        throw new McpAuthorityError('MCP_AUTHORITY_FENCED', 'Manager payload hash recomputation mismatch');
+      }
+
+      let parsedManagerObj: unknown;
+      try {
+        parsedManagerObj = JSON.parse(rawPayload);
+      } catch {
+        throw new McpAuthorityError('MCP_AUTHORITY_FENCED', 'Manager payload JSON syntax error');
+      }
+
+      if (typeof parsedManagerObj !== 'object' || parsedManagerObj === null || Array.isArray(parsedManagerObj)) {
+        throw new McpAuthorityError('MCP_AUTHORITY_FENCED', 'Manager payload is not a JSON object');
+      }
+
+      // Strict envelope check locally: reject unexpected top-level fields
+      const allowedManagerKeys = new Set([
+        'protocol',
+        'message_id',
+        'project_id',
+        'task_id',
+        'decision',
+        'priority',
+        'risk',
+        'instructions',
+        'acceptance_criteria',
+        'constraints',
+        'review_issues',
+        'expected_task_state',
+        'expected_revision',
+        'created_at',
+      ]);
+      for (const key of Object.keys(parsedManagerObj as Record<string, unknown>)) {
+        if (!allowedManagerKeys.has(key)) {
+          throw new McpAuthorityError('MCP_AUTHORITY_FENCED', `Manager payload contains unexpected field "${key}"`);
+        }
+      }
+
+      const parsedManagerResult = ManagerProtocolSchema.safeParse(parsedManagerObj);
+      if (!parsedManagerResult.success) {
+        throw new McpAuthorityError('MCP_AUTHORITY_FENCED', 'Manager payload schema validation failed');
+      }
+      const managerData = parsedManagerResult.data;
+
+      if (managerData.protocol !== 'manager.v1' || managerData.protocol !== msgRow.protocol) {
+        throw new McpAuthorityError('MCP_AUTHORITY_FENCED', 'Parsed manager protocol is not manager.v1 or does not match row');
+      }
+      if (typeof managerData.message_id !== 'string' || managerData.message_id.trim().length === 0) {
+        throw new McpAuthorityError('MCP_AUTHORITY_FENCED', 'Parsed manager payload message_id is empty or invalid');
+      }
+      if (managerData.message_id !== msgRow.message_id) {
+        throw new McpAuthorityError('MCP_AUTHORITY_FENCED', 'Manager payload message_id does not match protocol message row message_id');
+      }
+      if (managerData.project_id !== auth.project_id || managerData.project_id !== msgRow.project_id) {
+        throw new McpAuthorityError('MCP_AUTHORITY_FENCED', 'Parsed manager project_id mismatch');
+      }
+      if (managerData.task_id !== auth.task_id || managerData.task_id !== msgRow.task_id) {
+        throw new McpAuthorityError('MCP_AUTHORITY_FENCED', 'Parsed manager task_id mismatch');
+      }
+      if (managerData.decision !== 'EXECUTE' && managerData.decision !== 'FIX_REQUIRED') {
+        throw new McpAuthorityError('MCP_AUTHORITY_FENCED', `Manager decision "${managerData.decision}" does not authorize execution`);
+      }
+
+      // Check revision and expected_task_state presence parity and agreement between row and payload
+      const hasRowRev = msgRow.expected_revision !== null && msgRow.expected_revision !== undefined;
+      const hasPayloadRev = managerData.expected_revision !== null && managerData.expected_revision !== undefined;
+
+      if (hasRowRev !== hasPayloadRev) {
+        throw new McpAuthorityError(
+          'MCP_AUTHORITY_FENCED',
+          'Protocol message expected_revision presence parity mismatch between row and payload'
+        );
+      }
+
+      let derivedRev: number | null = null;
+      if (hasRowRev && hasPayloadRev) {
+        const rowRev = Number(msgRow.expected_revision);
+        const payloadRev = Number(managerData.expected_revision);
+
+        if (!Number.isInteger(rowRev) || rowRev < 0 || !Number.isInteger(payloadRev) || payloadRev < 0) {
+          throw new McpAuthorityError(
+            'MCP_AUTHORITY_FENCED',
+            'Protocol message expected_revision must be a canonical non-negative integer'
+          );
+        }
+
+        if (rowRev !== payloadRev) {
+          throw new McpAuthorityError(
+            'MCP_AUTHORITY_FENCED',
+            'Protocol message expected_revision mismatch between row and payload'
+          );
+        }
+
+        derivedRev = payloadRev;
+      }
+
+      const hasRowState = msgRow.expected_task_state !== null && msgRow.expected_task_state !== undefined;
+      const hasPayloadState = managerData.expected_task_state !== null && managerData.expected_task_state !== undefined;
+
+      if (hasRowState !== hasPayloadState) {
+        throw new McpAuthorityError(
+          'MCP_AUTHORITY_FENCED',
+          'Protocol message expected_task_state presence parity mismatch between row and payload'
+        );
+      }
+
+      if (hasRowState && hasPayloadState) {
+        if (msgRow.expected_task_state !== managerData.expected_task_state) {
+          throw new McpAuthorityError(
+            'MCP_AUTHORITY_FENCED',
+            'Protocol message expected_task_state mismatch between row and payload'
+          );
+        }
+      }
+
+      if (managerData.decision === 'EXECUTE') {
+        if (derivedRev !== null && derivedRev !== auth.task_revision) {
+          throw new McpAuthorityError('MCP_AUTHORITY_FENCED', 'Manager expected_revision does not match task_revision');
+        }
+      } else if (managerData.decision === 'FIX_REQUIRED') {
+        if (derivedRev !== null && derivedRev + 1 !== auth.task_revision) {
+          throw new McpAuthorityError('MCP_AUTHORITY_FENCED', 'Manager expected_revision + 1 does not match task_revision');
+        }
+      }
+
+      protocolMessage = {
+        id: String(msgRow.id),
+        message_id: String(msgRow.message_id),
+        protocol: String(msgRow.protocol),
+        project_id: String(msgRow.project_id),
+        task_id: msgRow.task_id ? String(msgRow.task_id) : null,
+        decision: managerData.decision,
+        sequence: derivedRev ?? auth.task_revision,
+        payload_hash: String(msgRow.payload_hash),
+        payload_json: rawPayload,
+        state: String(msgRow.status),
+        created_at: String(msgRow.created_at),
+        processed_at: msgRow.processed_at ? String(msgRow.processed_at) : null,
+      };
+    }
+
+    // 14. Canonical Execution Payload
+    if (!auth.canonical_payload_json || auth.canonical_payload_json.trim() === '') {
+      throw new McpAuthorityError('MCP_CONTEXT_INTEGRITY_FAILED', 'Canonical execution payload JSON is missing');
+    }
+    let rawPayload: unknown;
+    try {
+      rawPayload = JSON.parse(auth.canonical_payload_json);
+    } catch {
+      throw new McpAuthorityError('MCP_CONTEXT_INTEGRITY_FAILED', 'Malformed canonical execution payload JSON');
+    }
+    const schemaValidation = CanonicalExecutionPayloadSchema.safeParse(rawPayload);
+    if (!schemaValidation.success) {
+      throw new McpAuthorityError('MCP_CONTEXT_INTEGRITY_FAILED', 'Canonical execution payload schema validation failed');
+    }
+    const payload: CanonicalExecutionPayload = schemaValidation.data;
+
+    // Verify identifiers
+    if (
+      payload.projectId !== auth.project_id ||
+      payload.taskId !== auth.task_id ||
+      payload.attemptId !== auth.attempt_id ||
+      payload.managerMessageId !== auth.manager_message_id ||
+      payload.managerPayloadHash !== auth.manager_payload_hash
+    ) {
+      throw new McpAuthorityError('MCP_CONTEXT_INTEGRITY_FAILED', 'Payload identifiers mismatch with authorization bindings');
+    }
+
+    // Recompute hashes
+    const recomputedPayloadHash = computePayloadHash(payload);
+    if (recomputedPayloadHash !== auth.instruction_payload_hash) {
+      throw new McpAuthorityError('MCP_CONTEXT_INTEGRITY_FAILED', 'Instruction payload hash recomputation mismatch');
+    }
+
+    const recomputedManifestHash = computeContextManifestHash(payload.contextFiles);
+    if (recomputedManifestHash !== auth.context_manifest_hash) {
+      throw new McpAuthorityError('MCP_CONTEXT_INTEGRITY_FAILED', 'Context manifest hash recomputation mismatch');
+    }
+
+    return {
+      auth,
+      project,
+      task,
+      attempt,
+      assignment,
+      provider,
+      account,
+      resource,
+      routingEvent,
+      routingPayload: rPayload,
+      protocolMessage,
+      payload,
+    };
+  }
+
+  /**
+   * Issue a task-scoped MCP session for a lifecycle-v1 execution authorization.
+   * Acquires write authority deterministically using an immediate transaction.
+   * Plaintext token is returned exactly once.
+   */
+  public issueSession(params: IssueSessionParams): IssueSessionResult {
+    const ttlSeconds = validateTtlSeconds(params.ttlSeconds);
+
+    const runTx = this.db.transaction((): IssueSessionResult => {
+      // 1. Validate complete authority graph
+      const graph = this.validateCompleteAuthorityGraph(params.authorizationId);
+
+      // 2. Reject if an active unrevoked session already exists
+      const existingSession = this.repo.getActiveMcpClientSessionByAuthorizationId(graph.auth.id);
+      if (existingSession) {
+        throw new McpAuthorityError(
+          'MCP_AUTHORITY_FENCED',
+          `An active unrevoked session already exists for authorization "${graph.auth.id}"`
+        );
+      }
+
+      // 3. Generate credentials & compute complete authority graph fingerprint
+      const plaintextToken = McpSessionAuthorityService.generateSessionToken();
+      const tokenHash = McpSessionAuthorityService.hashSessionToken(plaintextToken);
+      const authorizationFingerprint = computeCompleteAuthorityFingerprint(graph);
+      const issuedAt = new Date().toISOString();
+      const expiresAt = new Date(Date.now() + ttlSeconds * 1000).toISOString();
+      const sessionId = crypto.randomUUID();
+
+      const session: McpClientSession = {
+        id: sessionId,
+        authorization_id: graph.auth.id,
+        scope: 'AUTHORIZED_CONTEXT_READ',
+        token_hash: tokenHash,
+        authorization_fingerprint: authorizationFingerprint,
+        issued_at: issuedAt,
+        expires_at: expiresAt,
+        revoked_at: null,
+      };
+
+      this.repo.createMcpClientSession(session);
+
+      return {
+        session,
+        plaintextToken,
+      };
+    });
+
+    try {
+      return runTx.immediate();
+    } catch (err) {
+      if (err instanceof McpAuthorityError) {
+        throw err;
+      }
+      const msg = err instanceof Error ? err.message : String(err);
+      if (
+        msg.includes('UNIQUE constraint') ||
+        msg.includes('SQLITE_BUSY') ||
+        msg.includes('SQLITE_LOCKED')
+      ) {
+        throw new McpAuthorityError(
+          'MCP_AUTHORITY_FENCED',
+          'Concurrent active session or authority conflict'
+        );
+      }
+      throw new McpAuthorityError('MCP_AUTHORITY_FENCED', `Authority acquisition failed: ${msg}`);
+    }
+  }
+
+  /**
+   * Idempotently revokes an active session by session ID or authorization ID using an immediate transaction.
+   */
+  public revokeSession(params: RevokeSessionParams): RevokeSessionResult {
+    if (!params.sessionId && !params.authorizationId) {
+      throw new McpAuthorityError('MCP_CONFIGURATION_INVALID', 'Must provide sessionId or authorizationId to revoke');
+    }
+    if (params.sessionId && params.authorizationId) {
+      throw new McpAuthorityError('MCP_CONFIGURATION_INVALID', 'Cannot provide both sessionId and authorizationId to revoke');
+    }
+
+    const runTx = this.db.transaction((): RevokeSessionResult => {
+      const revokedAt = new Date().toISOString();
+      const revoked = this.repo.revokeMcpClientSession({
+        sessionId: params.sessionId,
+        authorizationId: params.authorizationId,
+        revokedAt,
+      });
+      return { revoked };
+    });
+
+    try {
+      return runTx.immediate();
+    } catch (err) {
+      if (err instanceof McpAuthorityError) {
+        throw err;
+      }
+      const msg = err instanceof Error ? err.message : String(err);
+      throw new McpAuthorityError('MCP_AUTHORITY_FENCED', `Revocation failed: ${msg}`);
+    }
+  }
+
+  /**
+   * Authenticates a session token and resolves the authorized context within a single read transaction snapshot.
+   * Public errors are non-oracular.
+   */
+  public resolveAuthorizedContext(rawToken: unknown): AuthorizedContextResponse {
+    // 1. Strict canonical base64url token validation
+    const token = validateCanonicalSessionToken(rawToken);
+    const tokenHash = McpSessionAuthorityService.hashSessionToken(token);
+
+    // 2. Execute within a single read transaction snapshot
+    const readTx = this.db.transaction((): AuthorizedContextResponse => {
+      // Look up session by token hash
+      const session = this.repo.getMcpClientSessionByTokenHash(tokenHash);
+      if (!session) {
+        throw new McpAuthorityError('MCP_SESSION_UNAUTHORIZED', 'Session authentication failed');
+      }
+
+      // Non-oracular equivalence: revoked or expired tokens return MCP_SESSION_UNAUTHORIZED
+      if (session.revoked_at != null) {
+        throw new McpAuthorityError('MCP_SESSION_UNAUTHORIZED', 'Session authentication failed');
+      }
+
+      const now = Date.now();
+      const expiresAtMs = new Date(session.expires_at).getTime();
+      if (Number.isNaN(expiresAtMs) || expiresAtMs <= now) {
+        throw new McpAuthorityError('MCP_SESSION_UNAUTHORIZED', 'Session authentication failed');
+      }
+
+      if (session.scope !== 'AUTHORIZED_CONTEXT_READ') {
+        throw new McpAuthorityError('MCP_SESSION_UNAUTHORIZED', 'Session authentication failed');
+      }
+
+      // Validate complete authority graph
+      const graph = this.validateCompleteAuthorityGraph(session.authorization_id);
+
+      // Recompute complete authority graph fingerprint
+      const recomputedFingerprint = computeCompleteAuthorityFingerprint(graph);
+      if (recomputedFingerprint !== session.authorization_fingerprint) {
+        throw new McpAuthorityError(
+          'MCP_CONTEXT_INTEGRITY_FAILED',
+          'Authority graph fingerprint integrity verification failed'
+        );
+      }
+
+      // Return strictly sanitized, non-secret response
+      const response: AuthorizedContextResponse = {
+        schema_version: 2,
+        session: {
+          id: session.id,
+          scope: session.scope,
+          issued_at: session.issued_at,
+          expires_at: session.expires_at,
+        },
+        authorization: {
+          id: graph.auth.id,
+          project_id: graph.auth.project_id,
+          task_id: graph.auth.task_id,
+          attempt_id: graph.attempt.id,
+          assignment_id: graph.assignment.id,
+          task_ownership_epoch: graph.auth.task_ownership_epoch ?? 1,
+          lifecycle_version: 1,
+          routing_decision_id: graph.auth.routing_decision_id,
+          selected_provider_id: graph.provider.id,
+          selected_account_id: graph.account.id,
+          selected_resource_id: graph.resource.id,
+          task_revision: graph.auth.task_revision,
+          base_sha: graph.auth.base_sha,
+          repository_head_sha: graph.auth.repository_head_sha,
+          manager_message_id: graph.auth.manager_message_id,
+          manager_payload_hash: graph.auth.manager_payload_hash,
+          status: graph.auth.status,
+          created_at: graph.auth.created_at,
+          dispatched_at: graph.auth.dispatched_at,
+        },
+        execution_payload: graph.payload as unknown as Record<string, unknown>,
+        instruction_payload_hash: graph.auth.instruction_payload_hash,
+        context_manifest_hash: graph.auth.context_manifest_hash,
+      };
+
+      return response;
+    });
+
+    return readTx();
+  }
+}

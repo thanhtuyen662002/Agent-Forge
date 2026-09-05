@@ -9,7 +9,9 @@ import {
   SERVER_NAME,
   SERVER_VERSION,
   GET_CAPABILITIES_TOOL_NAME,
+  GET_AUTHORIZED_CONTEXT_TOOL_NAME,
   CAPABILITIES_RESOURCE_URI,
+  AUTHORIZED_CONTEXT_RESOURCE_URI,
   CAPABILITIES_RESOURCE_NAME,
   CAPABILITIES_MIME_TYPE,
   CANONICAL_CAPABILITY_PAYLOAD,
@@ -159,7 +161,7 @@ describe('R5J1 MCP Server Foundation Integration Suite', () => {
   });
 
   // 5. Exact tool list
-  it('5. Exact tool list exposes only agentforge_get_capabilities', async () => {
+  it('5. Exact tool list exposes authorized tools', async () => {
     const transport = new StdioClientTransport({
       command: process.execPath,
       args: [STDIO_SCRIPT_PATH],
@@ -168,15 +170,17 @@ describe('R5J1 MCP Server Foundation Integration Suite', () => {
     try {
       await client.connect(transport);
       const toolList = await client.listTools();
-      expect(toolList.tools).toHaveLength(1);
-      expect(toolList.tools[0].name).toBe(GET_CAPABILITIES_TOOL_NAME);
+      expect(toolList.tools).toHaveLength(2);
+      const toolNames = toolList.tools.map((t) => t.name);
+      expect(toolNames).toContain(GET_CAPABILITIES_TOOL_NAME);
+      expect(toolNames).toContain(GET_AUTHORIZED_CONTEXT_TOOL_NAME);
     } finally {
       await client.close();
     }
   });
 
   // 6. Exact resource list
-  it('6. Exact resource list exposes only agentforge://server/capabilities', async () => {
+  it('6. Exact resource list exposes authorized resources', async () => {
     const transport = new StdioClientTransport({
       command: process.execPath,
       args: [STDIO_SCRIPT_PATH],
@@ -185,10 +189,10 @@ describe('R5J1 MCP Server Foundation Integration Suite', () => {
     try {
       await client.connect(transport);
       const resourceList = await client.listResources();
-      expect(resourceList.resources).toHaveLength(1);
-      expect(resourceList.resources[0].name).toBe(CAPABILITIES_RESOURCE_NAME);
-      expect(resourceList.resources[0].uri).toBe(CAPABILITIES_RESOURCE_URI);
-      expect(resourceList.resources[0].mimeType).toBe(CAPABILITIES_MIME_TYPE);
+      expect(resourceList.resources).toHaveLength(2);
+      const uris = resourceList.resources.map((r) => r.uri);
+      expect(uris).toContain(CAPABILITIES_RESOURCE_URI);
+      expect(uris).toContain(AUTHORIZED_CONTEXT_RESOURCE_URI);
     } finally {
       await client.close();
     }
@@ -220,12 +224,14 @@ describe('R5J1 MCP Server Foundation Integration Suite', () => {
     try {
       await client.connect(transport);
       const toolList = await client.listTools();
-      const tool = toolList.tools[0];
-      expect(tool.annotations).toEqual(TOOL_ANNOTATIONS);
-      expect(tool.annotations?.readOnlyHint).toBe(true);
-      expect(tool.annotations?.destructiveHint).toBe(false);
-      expect(tool.annotations?.idempotentHint).toBe(true);
-      expect(tool.annotations?.openWorldHint).toBe(false);
+      expect(toolList.tools.length).toBeGreaterThanOrEqual(1);
+      for (const tool of toolList.tools) {
+        expect(tool.annotations).toEqual(TOOL_ANNOTATIONS);
+        expect(tool.annotations?.readOnlyHint).toBe(true);
+        expect(tool.annotations?.destructiveHint).toBe(false);
+        expect(tool.annotations?.idempotentHint).toBe(true);
+        expect(tool.annotations?.openWorldHint).toBe(false);
+      }
     } finally {
       await client.close();
     }
@@ -457,13 +463,13 @@ function waitFor(fn: () => boolean, timeoutMs = 5000): Promise<void> {
       await client.connect(transport);
 
       const t1 = await client.listTools();
-      expect(t1.tools).toHaveLength(1);
+      expect(t1.tools).toHaveLength(2);
 
       const c1 = await client.callTool({ name: GET_CAPABILITIES_TOOL_NAME, arguments: {} });
       expect(c1.isError).toBeFalsy();
 
       const r1 = await client.listResources();
-      expect(r1.resources).toHaveLength(1);
+      expect(r1.resources).toHaveLength(2);
 
       const res1 = await client.readResource({ uri: CAPABILITIES_RESOURCE_URI });
       expect(res1.contents).toHaveLength(1);
@@ -602,7 +608,9 @@ function waitFor(fn: () => boolean, timeoutMs = 5000): Promise<void> {
   // 20. Static/runtime proof of zero database access, filesystem writes, network listeners, and authority mutation
   it('20. Static and runtime proof of zero database access, filesystem writes, network listeners, and authority mutation', () => {
     // Runtime authority proof
-    expect(CANONICAL_CAPABILITY_PAYLOAD.authority.database_access).toBe(false);
+    expect(CANONICAL_CAPABILITY_PAYLOAD.schema_version).toBe(2);
+    expect(CANONICAL_CAPABILITY_PAYLOAD.mode).toBe('AUTHORIZED_CONTEXT_READ');
+    expect(CANONICAL_CAPABILITY_PAYLOAD.authority.database_access).toBe('READ_ONLY');
     expect(CANONICAL_CAPABILITY_PAYLOAD.authority.execution_mutation).toBe(false);
     expect(CANONICAL_CAPABILITY_PAYLOAD.authority.filesystem_write).toBe(false);
     expect(CANONICAL_CAPABILITY_PAYLOAD.authority.network_listen).toBe(false);
@@ -613,12 +621,7 @@ function waitFor(fn: () => boolean, timeoutMs = 5000): Promise<void> {
     expect(files.length).toBeGreaterThan(0);
 
     const prohibitedImports = [
-      'better-sqlite3',
-      'Database',
       'MigrationRunner',
-      'Repository',
-      'src/core/database',
-      'src/core/services',
     ];
 
     const prohibitedMutatingToolNames = [
