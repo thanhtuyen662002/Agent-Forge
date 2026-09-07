@@ -19,7 +19,9 @@
     "test": "vitest run",
     "test:watch": "vitest",
     "mcp:stdio": "node dist-electron/mcp/stdio.js",
-    "mcp:session-admin": "node dist-electron/mcp/sessionAdmin.js"
+    "mcp:session-admin": "node dist-electron/mcp/sessionAdmin.js",
+    "mcp:submission-stdio": "node dist-electron/mcp/stdio-submit.js",
+    "mcp:submission-admin": "node dist-electron/mcp/submissionAdmin.js"
   },
   "dependencies": {
     "@modelcontextprotocol/server": "2.0.0",

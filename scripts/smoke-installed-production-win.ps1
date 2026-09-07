@@ -354,7 +354,7 @@ repo.createProject({
   id: projectId,
   name: 'Installed Smoke Project',
   description: 'Installed smoke',
-  repository_path: 'D:/fake/installed',
+  repository_path: projectRoot,
   default_branch: 'main',
   status: 'RUNNING',
   contract: null,
@@ -771,6 +771,109 @@ const harness = new McpRpcHarness(child);
     verifyDb.close();
 
     console.log("R5J3_INSTALLED_MCP_BRIDGE_PROOF=PASS");
+
+    // R5J4: Test Coder Submission Stdio Server in Installed Environment
+    console.log("Starting R5J4 Installed Coder Submission Stdio Verification...");
+    const subProtocolPath = path.join(asarPath, 'dist-electron', 'mcp', 'submissionProtocol.js');
+    const { generateSubmissionToken, computeAuthorityFingerprint } = require(subProtocolPath);
+    const subPlaintextToken = generateSubmissionToken();
+    const subTokenHash = crypto.createHash('sha256').update(subPlaintextToken, 'utf8').digest('hex');
+    const subSessionId = crypto.randomUUID();
+
+    const subDb = new Database(dbPath);
+    const subNow = new Date().toISOString();
+    const subExpires = new Date(Date.now() + 3600000).toISOString();
+    const { execSync } = require('child_process');
+    const realHeadSha = execSync('git rev-parse HEAD', { cwd: projectRoot, encoding: 'utf8' }).trim().toLowerCase();
+    subDb.prepare("UPDATE execution_authorizations SET status = 'DISPATCHED', dispatched_at = ?, execution_id = ?, repository_head_sha = ? WHERE id = ?").run(subNow, 'exec-inst-1', realHeadSha, authorizationId);
+    const subRepo = new Repository(subDb);
+    const subAuth = subRepo.getExecutionAuthorization(authorizationId);
+    const subTask = subRepo.getTask(subAuth.task_id);
+    const subFingerprint = computeAuthorityFingerprint({
+      assignment_id: subAuth.assignment_id ?? null,
+      attempt_id: subAuth.attempt_id ?? null,
+      authorization_id: subAuth.id,
+      authorization_status: subAuth.status,
+      base_sha: subAuth.base_sha,
+      dispatched_at: subAuth.dispatched_at ?? '',
+      execution_id: subAuth.execution_id ?? null,
+      lifecycle_version: subAuth.lifecycle_version ?? null,
+      manager_message_id: subAuth.manager_message_id,
+      manager_payload_hash: subAuth.manager_payload_hash,
+      project_id: subAuth.project_id,
+      repository_head_sha: subAuth.repository_head_sha,
+      routing_decision_id: subAuth.routing_decision_id,
+      selected_account_id: subAuth.selected_account_id ?? null,
+      selected_provider_id: subAuth.selected_provider_id,
+      selected_resource_id: subAuth.selected_resource_id,
+      task_id: subAuth.task_id,
+      task_ownership_epoch: subTask?.ownership_epoch ?? subAuth.task_ownership_epoch ?? 1,
+      task_revision: subAuth.task_revision,
+    });
+    subDb.prepare(`
+      INSERT INTO mcp_submission_sessions (id, authorization_id, scope, token_hash, authorization_fingerprint, issued_at, expires_at)
+      VALUES (?, ?, 'CODER_SUBMISSION', ?, ?, ?, ?)
+    `).run(subSessionId, authorizationId, subTokenHash, subFingerprint, subNow, subExpires);
+    subDb.close();
+
+    const subStdioScript = path.join(asarPath, 'dist-electron', 'mcp', 'stdio-submit.js');
+    if (!fs.existsSync(subStdioScript)) {
+      throw new Error("stdio-submit.js missing in installed app.asar");
+    }
+
+    const subChild = spawn(process.execPath, [subStdioScript], {
+      env: Object.assign({}, process.env, {
+        ELECTRON_RUN_AS_NODE: '1',
+        AGENTFORGE_MCP_DB_PATH: dbPath,
+        AGENTFORGE_MCP_SUBMISSION_TOKEN: subPlaintextToken,
+      }),
+      stdio: ['pipe', 'pipe', 'pipe'],
+    });
+
+    const subHarness = new McpRpcHarness(subChild);
+    const subInitRes = await subHarness.sendRequest({
+      jsonrpc: '2.0',
+      id: 10,
+      method: 'initialize',
+      params: { protocolVersion: '2024-11-05', capabilities: {}, clientInfo: { name: 'smoke-sub-installed', version: '1.0.0' } }
+    });
+    if (subInitRes.error) throw new Error("Submission initialize failed: " + JSON.stringify(subInitRes.error));
+    await subHarness.sendNotification({ jsonrpc: '2.0', method: 'notifications/initialized' });
+
+    const submissionId = '00000000-0000-4000-8000-000000000002';
+    const subToolRes = await subHarness.sendRequest({
+      jsonrpc: '2.0',
+      id: 11,
+      method: 'tools/call',
+      params: {
+        name: 'agentforge_submit_coder_claim',
+        arguments: {
+          submission_id: submissionId,
+          status: 'COMPLETED',
+          summary: 'Installed smoke claim verified',
+          changed_files: ['src/mcp/stdio-submit.ts'],
+          tests_claimed: ['smoke-sub-installed-1'],
+        }
+      }
+    });
+
+    if (subToolRes.error || subToolRes.result?.isError) {
+      throw new Error("Submission tool call failed: " + JSON.stringify(subToolRes));
+    }
+
+    const subExitRes = await subHarness.close(4000);
+    if (subExitRes.code !== 0) {
+      throw new Error("Expected submission stdio exit code 0, got " + subExitRes.code);
+    }
+
+    const checkDb = new Database(dbPath, { readonly: true });
+    const subRow = checkDb.prepare("SELECT * FROM coder_submissions WHERE id = ?").get(submissionId);
+    if (!subRow) {
+      throw new Error("Coder submission row was not inserted into database");
+    }
+    checkDb.close();
+
+    console.log("R5J4_INSTALLED_MCP_SUBMISSION_PROOF=PASS");
     process.exit(0);
   } catch (err) {
     console.error("R5J3_INSTALLED_MCP_BRIDGE_PROOF_ERROR: " + (err instanceof Error ? err.stack : String(err)));
@@ -831,7 +934,7 @@ const harness = new McpRpcHarness(child);
   Write-Host "Installed MCP Proof Output:"
   Write-Host $mcpStdout
 
-  if ($mcpProc.ExitCode -ne 0 -or -not ($mcpStdout -match "R5J3_INSTALLED_MCP_BRIDGE_PROOF=PASS")) {
+  if ($mcpProc.ExitCode -ne 0 -or -not ($mcpStdout -match "R5J3_INSTALLED_MCP_BRIDGE_PROOF=PASS") -or -not ($mcpStdout -match "R5J4_INSTALLED_MCP_SUBMISSION_PROOF=PASS")) {
     throw "Installed MCP bridge verification failed (exit code $($mcpProc.ExitCode)): $mcpStderr"
   }
 

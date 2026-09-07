@@ -129,9 +129,14 @@ export function deriveRuntimePaths(options?: {
   if (!path.isAbsolute(candidateStdio)) {
     throw new Error('Stdio script path must be absolute');
   }
-  const resolvedStdio = path.resolve(candidateStdio);
+  let resolvedStdio = path.resolve(candidateStdio);
   if (!fs.existsSync(resolvedStdio)) {
-    throw new Error('Stdio script file does not exist');
+    const tsAlternative = resolvedStdio.replace(/\.js$/, '.ts');
+    if (fs.existsSync(tsAlternative)) {
+      resolvedStdio = tsAlternative;
+    } else {
+      throw new Error('Stdio script file does not exist');
+    }
   }
 
   const isElectron = isElectronExecutable(resolvedExe);
@@ -195,6 +200,92 @@ export function generateClientConfigEnvelope(
 ): ClientConfigEnvelope {
   const canonicalClient = normalizeClient(options.client);
   const config = generateClientConfig(options);
+
+  return {
+    status: 'TEMPLATE_GENERATED',
+    client: canonicalClient,
+    incomplete: true,
+    secret_delivery: 'MANUAL_OPERATOR_INPUT',
+    config,
+  };
+}
+
+export const OPERATOR_SUBMISSION_TOKEN_PLACEHOLDER = '<OPERATOR_SUBMISSION_TOKEN_REQUIRED>';
+
+export interface AgentForgeSubmissionMcpServerConfig {
+  command: string;
+  args: [string];
+  env: {
+    ELECTRON_RUN_AS_NODE?: string;
+    AGENTFORGE_MCP_DB_PATH: string;
+    AGENTFORGE_MCP_SUBMISSION_TOKEN: string;
+  };
+}
+
+export interface SubmissionClientConfigTemplate {
+  mcpServers: {
+    'agentforge-submit': AgentForgeSubmissionMcpServerConfig;
+  };
+}
+
+export interface SubmissionClientConfigEnvelope {
+  status: 'TEMPLATE_GENERATED';
+  client: SupportedClient;
+  incomplete: true;
+  secret_delivery: 'MANUAL_OPERATOR_INPUT';
+  config: SubmissionClientConfigTemplate;
+}
+
+export function generateSubmissionClientConfig(
+  options: GenerateClientConfigOptions
+): SubmissionClientConfigTemplate {
+  normalizeClient(options.client);
+
+  let resolvedDbPath: string;
+  if (options.dbPath !== undefined) {
+    if (typeof options.dbPath !== 'string' || options.dbPath.trim().length === 0) {
+      throw new Error('Database path cannot be empty');
+    }
+    if (!path.isAbsolute(options.dbPath)) {
+      throw new Error('Database path must be an absolute path');
+    }
+    resolvedDbPath = path.resolve(options.dbPath);
+  } else {
+    resolvedDbPath = getDefaultPlatformDbPath();
+  }
+
+  const defaultStdioPath = path.join(
+    path.dirname(options.stdioScriptPath ?? __filename),
+    'stdio-submit.js'
+  );
+
+  const { executable, stdioScript, isElectron } = deriveRuntimePaths({
+    executablePath: options.executablePath,
+    stdioScriptPath: options.stdioScriptPath ?? defaultStdioPath,
+  });
+
+  const env: AgentForgeSubmissionMcpServerConfig['env'] = {
+    ...(isElectron ? { ELECTRON_RUN_AS_NODE: '1' } : {}),
+    AGENTFORGE_MCP_DB_PATH: resolvedDbPath,
+    AGENTFORGE_MCP_SUBMISSION_TOKEN: OPERATOR_SUBMISSION_TOKEN_PLACEHOLDER,
+  };
+
+  return {
+    mcpServers: {
+      'agentforge-submit': {
+        command: executable,
+        args: [stdioScript],
+        env,
+      },
+    },
+  };
+}
+
+export function generateSubmissionClientConfigEnvelope(
+  options: GenerateClientConfigOptions
+): SubmissionClientConfigEnvelope {
+  const canonicalClient = normalizeClient(options.client);
+  const config = generateSubmissionClientConfig(options);
 
   return {
     status: 'TEMPLATE_GENERATED',
