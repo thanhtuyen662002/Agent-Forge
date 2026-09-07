@@ -453,16 +453,24 @@ describe('R5J4 Durable Coder Submission Authority Comprehensive Suite', () => {
     db = created.db;
     dbPath = created.dbPath;
     fixtures = setupFullSubmissionGraph(db);
-  });
+  }, 120000);
 
   afterEach(() => {
-    try {
-      if (db.open) db.close();
-    } catch {}
-    try {
-      fs.rmSync(tempDir, { recursive: true, force: true });
-    } catch {}
-  });
+    if (db && db.open) {
+      try {
+        db.close();
+      } catch (e) {
+        throw new Error(`[FIXTURE_CLEANUP_ERROR] Failed to close database: ${e instanceof Error ? e.message : String(e)}`);
+      }
+    }
+    if (fs.existsSync(tempDir)) {
+      try {
+        fs.rmSync(tempDir, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
+      } catch (e) {
+        throw new Error(`[FIXTURE_CLEANUP_ERROR] Failed to remove temporary directory: ${e instanceof Error ? e.message : String(e)}`);
+      }
+    }
+  }, 120000);
 
   // =========================================================================
   // Group 1: Wire Protocol, Discriminated Schemas, and Argument Bounds

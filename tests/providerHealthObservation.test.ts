@@ -1160,15 +1160,17 @@ describe('R5H4 Durable Provider Health Observation Contract', () => {
   it('39. atomic validation race / TOCTOU closed proof: concurrent writer cannot leave stale pre-read', () => {
     const tempDbDir = fs.mkdtempSync(path.join(os.tmpdir(), 'af-toctou-obs-'));
     const dbPath = path.join(tempDbDir, 'toctou.db');
+    let db1: Database.Database | null = null;
+    let db2: Database.Database | null = null;
 
     try {
-      const db1 = new Database(dbPath);
+      db1 = new Database(dbPath);
       db1.pragma('foreign_keys = ON');
       MigrationRunner.run(db1);
       const repo1 = new Repository(db1);
       const hierarchy = createHierarchy(repo1, repoDir, baseSha);
 
-      const db2 = new Database(dbPath);
+      db2 = new Database(dbPath);
       db2.pragma('foreign_keys = ON');
       db2.pragma('busy_timeout = 0');
       const repo2 = new Repository(db2);
@@ -1210,15 +1212,28 @@ describe('R5H4 Durable Provider Health Observation Contract', () => {
       }).toThrow(/AUTHORIZATION_NOT_DISPATCHED/);
 
       expect(repo2.getProviderHealthObservation(hierarchy.authId)).toBeNull();
-
-      db1.close();
-      db2.close();
     } finally {
+      if (db2 && db2.open) {
+        try {
+          db2.close();
+        } catch (e) {
+          throw new Error(`[CLEANUP_ERROR] Failed to close db2 handle: ${e instanceof Error ? e.message : String(e)}`);
+        }
+      }
+      if (db1 && db1.open) {
+        try {
+          db1.close();
+        } catch (e) {
+          throw new Error(`[CLEANUP_ERROR] Failed to close db1 handle: ${e instanceof Error ? e.message : String(e)}`);
+        }
+      }
       try {
-        fs.rmSync(tempDbDir, { recursive: true, force: true });
-      } catch {}
+        fs.rmSync(tempDbDir, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
+      } catch (e) {
+        throw new Error(`[CLEANUP_ERROR] Failed to remove temporary directory: ${e instanceof Error ? e.message : String(e)}`);
+      }
     }
-  });
+  }, 60000);
 
   // 40. Raw claim fails closed when authorization status != DISPATCHED
   it('40. raw claim fails closed when authorization status != DISPATCHED', () => {
