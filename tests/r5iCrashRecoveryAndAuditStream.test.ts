@@ -501,9 +501,9 @@ describe('R5I6 Crash Recovery, Execution Lifecycle Linearization, and Durable Au
   // 1. Migration 20 fresh install
   it('1. should cleanly apply Migration 20 on a fresh database', () => {
     const testDb = new Database(':memory:');
-    MigrationRunner.run(testDb);
+    MigrationRunner.run(testDb, 20);
     const count = (testDb.prepare('SELECT COUNT(*) as c FROM schema_migrations').get() as any).c;
-    expect(count).toBe(21);
+    expect(count).toBe(20);
 
     const tables = (testDb.prepare("SELECT name FROM sqlite_master WHERE type='table'").all() as any[]).map((t) => t.name);
     expect(tables).toContain('execution_recovery_states');
@@ -540,10 +540,10 @@ describe('R5I6 Crash Recovery, Execution Lifecycle Linearization, and Durable Au
     expect(preCount).toBe(19);
 
     // Apply remaining migrations (Migration 20)
-    MigrationRunner.run(upgradeDb);
+    MigrationRunner.run(upgradeDb, 20);
 
     const postCount = (upgradeDb.prepare('SELECT COUNT(*) as c FROM schema_migrations').get() as any).c;
-    expect(postCount).toBe(21);
+    expect(postCount).toBe(20);
     upgradeDb.close();
   });
 
@@ -591,18 +591,18 @@ describe('R5I6 Crash Recovery, Execution Lifecycle Linearization, and Durable Au
     `).run();
 
     // Now run migration 20
-    MigrationRunner.run(testDb);
+    MigrationRunner.run(testDb, 20);
 
     const row = testDb.prepare('SELECT lifecycle_version FROM execution_authorizations WHERE id = ?').get('auth-hist') as any;
     expect(row.lifecycle_version).toBeNull();
     testDb.close();
   });
 
-  // 4. RC verifier requires exactly 21 migrations
-  it('4. should require exactly 21 migrations in static contract count', () => {
-    expect(MIGRATIONS.length).toBe(21);
+  // 4. RC verifier requires exactly 22 migrations
+  it('4. should require exactly 22 migrations in static contract count', () => {
+    expect(MIGRATIONS.length).toBe(22);
     const verifierScript = fs.readFileSync(path.join(process.cwd(), 'scripts/verify-demo-rc-win.ps1'), 'utf-8');
-    expect(verifierScript).toContain('Expected exactly 21 migrations');
+    expect(verifierScript).toContain('Expected exactly 22 migrations');
     expect(verifierScript).not.toContain('Expected exactly 20 migrations');
   });
 

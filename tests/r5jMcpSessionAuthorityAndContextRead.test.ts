@@ -845,7 +845,7 @@ function createTestDatabase(dir: string, name: string): { db: Database.Database;
   const dbPath = path.join(dir, name);
   const db = new Database(dbPath);
   db.pragma('foreign_keys = ON');
-  MigrationRunner.run(db);
+  MigrationRunner.run(db, 21);
   return { db, dbPath };
 }
 
@@ -1146,12 +1146,15 @@ describe('R5J2 MCP Session Authority and Scoped Context Read Truth Suite', () =>
   // =========================================================================
 
   it('1. Fresh Migration 1->21 applies cleanly ending at version 21 without proxy or stack sniffing', () => {
-    const { db } = createTestDatabase(tempDir, 'fresh21.db');
+    const dbPath = path.join(tempDir, 'fresh21.db');
+    const db = new Database(dbPath);
+    db.pragma('foreign_keys = ON');
     try {
+      MigrationRunner.run(db, 21);
       const row = db.prepare('SELECT COUNT(*) as c, MAX(version) as max_v FROM schema_migrations').get() as { c: number; max_v: number };
       expect(row.c).toBe(21);
       expect(row.max_v).toBe(21);
-      expect(MIGRATIONS.length).toBe(21);
+      expect(MIGRATIONS.length).toBe(22);
       expect(Array.isArray(MIGRATIONS)).toBe(true);
     } finally {
       db.close();
@@ -1177,7 +1180,7 @@ describe('R5J2 MCP Session Authority and Scoped Context Read Truth Suite', () =>
           new Date().toISOString()
         );
       }
-      MigrationRunner.run(upgradeDb);
+      MigrationRunner.run(upgradeDb, 21);
       const row = upgradeDb.prepare('SELECT COUNT(*) as c, MAX(version) as max_v FROM schema_migrations').get() as { c: number; max_v: number };
       expect(row.c).toBe(21);
       expect(row.max_v).toBe(21);
@@ -1192,10 +1195,16 @@ describe('R5J2 MCP Session Authority and Scoped Context Read Truth Suite', () =>
     expect(migrationsSource).not.toContain('new Error().stack');
     expect(migrationsSource).not.toContain('new Proxy');
     expect(migrationsSource).not.toContain('RAW_MIGRATIONS');
+    expect(migrationsSource).not.toContain('__vitest_worker__');
+    expect(migrationsSource).not.toContain('process.argv');
+    expect(migrationsSource).not.toContain('filepath');
+    expect(migrationsSource).not.toContain('ContextRead');
+    expect(migrationsSource).not.toContain('CrashRecovery');
+    expect(migrationsSource).not.toMatch(/process\.env\.[A-Z_]*MIGRATION/i);
 
     const rcScript = fs.readFileSync(path.join(process.cwd(), 'scripts/verify-demo-rc-win.ps1'), 'utf-8');
     expect(rcScript).not.toContain('Expected exactly 20 migrations');
-    expect(rcScript).toContain('Expected exactly 21 migrations');
+    expect(rcScript).toContain('Expected exactly 22 migrations');
   });
 
   it('4. Migration 21 fails closed on pre-existing conflicting mcp_client_sessions table with no ledger row written', () => {

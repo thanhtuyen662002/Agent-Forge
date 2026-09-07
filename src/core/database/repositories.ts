@@ -117,6 +117,7 @@ export interface McpSubmissionSession {
   id: string;
   authorization_id: string;
   scope: 'CODER_SUBMISSION';
+  issuer_identity: 'OWNER_LOCAL_CLI';
   token_hash: string;
   authorization_fingerprint: string;
   issued_at: string;
@@ -132,6 +133,12 @@ export interface CoderSubmission {
   task_id: string;
   task_ownership_epoch: number;
   session_id: string;
+  schema_version: number;
+  authorization_status: string;
+  dispatched_at: string;
+  authority_fingerprint: string;
+  manager_payload_hash: string;
+  task_revision: number;
   lifecycle_version: number | null;
   execution_id: string | null;
   attempt_id: string | null;
@@ -3561,18 +3568,20 @@ export class Repository {
           id,
           authorization_id,
           scope,
+          issuer_identity,
           token_hash,
           authorization_fingerprint,
           issued_at,
           expires_at,
           revoked_at,
           revocation_reason
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       `)
       .run(
         session.id,
         session.authorization_id,
         session.scope,
+        session.issuer_identity,
         session.token_hash,
         session.authorization_fingerprint,
         session.issued_at,
@@ -3645,6 +3654,7 @@ export class Repository {
       id: String(row.id),
       authorization_id: String(row.authorization_id),
       scope: row.scope as McpSubmissionSession['scope'],
+      issuer_identity: row.issuer_identity as McpSubmissionSession['issuer_identity'],
       token_hash: String(row.token_hash),
       authorization_fingerprint: String(row.authorization_fingerprint),
       issued_at: String(row.issued_at),
@@ -3667,6 +3677,12 @@ export class Repository {
           task_id,
           task_ownership_epoch,
           session_id,
+          schema_version,
+          authorization_status,
+          dispatched_at,
+          authority_fingerprint,
+          manager_payload_hash,
+          task_revision,
           lifecycle_version,
           execution_id,
           attempt_id,
@@ -3694,7 +3710,8 @@ export class Repository {
         ) VALUES (
           ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
           ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
-          ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+          ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+          ?, ?, ?, ?, ?, ?
         )
       `)
       .run(
@@ -3704,6 +3721,12 @@ export class Repository {
         submission.task_id,
         submission.task_ownership_epoch,
         submission.session_id,
+        submission.schema_version,
+        submission.authorization_status,
+        submission.dispatched_at,
+        submission.authority_fingerprint,
+        submission.manager_payload_hash,
+        submission.task_revision,
         submission.lifecycle_version ?? null,
         submission.execution_id ?? null,
         submission.attempt_id ?? null,
@@ -3747,6 +3770,12 @@ export class Repository {
       task_id: String(row.task_id),
       task_ownership_epoch: Number(row.task_ownership_epoch),
       session_id: String(row.session_id),
+      schema_version: Number(row.schema_version),
+      authorization_status: String(row.authorization_status),
+      dispatched_at: String(row.dispatched_at),
+      authority_fingerprint: String(row.authority_fingerprint),
+      manager_payload_hash: String(row.manager_payload_hash),
+      task_revision: Number(row.task_revision),
       lifecycle_version: row.lifecycle_version != null ? Number(row.lifecycle_version) : null,
       execution_id: row.execution_id != null ? String(row.execution_id) : null,
       attempt_id: row.attempt_id != null ? String(row.attempt_id) : null,

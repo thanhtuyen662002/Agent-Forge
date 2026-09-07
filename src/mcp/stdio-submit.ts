@@ -115,9 +115,9 @@ export function runSubmissionStdioServer(): StdioServerHandle {
 
     try {
       verifyMigration22SchemaAuthority(db);
-    } catch (err) {
+    } catch {
       db.close();
-      process.stderr.write(`[agentforge-submit-fatal] Startup failure: Schema authority verification failed: ${(err as Error).message}\n`);
+      process.stderr.write('[agentforge-submit-fatal] Startup failure: Schema authority verification failed\n');
       cleanup();
       process.exit(1);
     }

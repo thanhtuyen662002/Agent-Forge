@@ -254,9 +254,12 @@ export const ClosedClientMetadataSchema = z
 
 export type ClosedClientMetadata = z.infer<typeof ClosedClientMetadataSchema>;
 
+export const BOUNDED_DB_ID_REGEX = /^(?!\s*$).+/;
+
 /**
  * Strict Zod Input Schema for coder submission tool arguments.
  * Rejects unknown keys, token, evidence_hash, and server-generated hashes.
+ * Requires all 16 authority tuple fields explicitly.
  * Requires uniqueItems across all arrays.
  */
 export const CoderSubmissionInputZodSchema = z
@@ -268,21 +271,47 @@ export const CoderSubmissionInputZodSchema = z
     authorization_id: z
       .string()
       .trim()
-      .regex(UUID_V4_REGEX, 'Must be RFC 4122 UUID v4 in lowercase')
-      .optional(),
-    project_id: z.string().trim().min(1).max(128).optional(),
-    task_id: z.string().trim().min(1).max(128).optional(),
-    task_ownership_epoch: z.number().int().positive('Ownership epoch must be a positive integer').optional(),
+      .min(1, 'authorization_id cannot be empty')
+      .max(128, 'authorization_id max length is 128 characters')
+      .regex(BOUNDED_DB_ID_REGEX, 'authorization_id cannot be whitespace-only'),
+    project_id: z
+      .string()
+      .trim()
+      .min(1, 'project_id cannot be empty')
+      .max(128, 'project_id max length is 128 characters')
+      .regex(BOUNDED_DB_ID_REGEX, 'project_id cannot be whitespace-only'),
+    task_id: z
+      .string()
+      .trim()
+      .min(1, 'task_id cannot be empty')
+      .max(128, 'task_id max length is 128 characters')
+      .regex(BOUNDED_DB_ID_REGEX, 'task_id cannot be whitespace-only'),
+    attempt_id: z
+      .string()
+      .trim()
+      .min(1, 'attempt_id cannot be empty')
+      .max(128, 'attempt_id max length is 128 characters')
+      .regex(BOUNDED_DB_ID_REGEX, 'attempt_id cannot be whitespace-only')
+      .nullable(),
+    assignment_id: z
+      .string()
+      .trim()
+      .min(1, 'assignment_id cannot be empty')
+      .max(128, 'assignment_id max length is 128 characters')
+      .regex(BOUNDED_DB_ID_REGEX, 'assignment_id cannot be whitespace-only')
+      .nullable(),
+    task_ownership_epoch: z
+      .number()
+      .int()
+      .positive('Ownership epoch must be a positive integer'),
     base_sha: z
       .string()
       .trim()
-      .regex(HEX_40_REGEX, 'Base SHA must be 40 lowercase hex characters')
-      .optional(),
+      .regex(HEX_40_REGEX, 'Base SHA must be 40 lowercase hex characters'),
     repository_head_sha: z
       .string()
       .trim()
-      .regex(HEX_40_REGEX, 'Repository head SHA must be 40 lowercase hex characters')
-      .optional(),
+      .regex(HEX_40_REGEX, 'Repository head SHA must be 40 lowercase hex characters'),
     status: z.enum(['COMPLETED', 'IN_PROGRESS', 'BLOCKED', 'FAILED']),
     summary: z
       .string()
@@ -301,7 +330,6 @@ export const CoderSubmissionInputZodSchema = z
           .refine((p) => isPortablePath(p), 'Must be portable relative path without dot segments')
       )
       .max(1000)
-      .default([])
       .refine((items) => new Set(items).size === items.length, {
         message: 'changed_files array elements must be unique',
       }),
@@ -315,7 +343,6 @@ export const CoderSubmissionInputZodSchema = z
           .regex(/^(?!\s*$).+/, 'Test name cannot be whitespace-only')
       )
       .max(1000)
-      .default([])
       .refine((items) => new Set(items).size === items.length, {
         message: 'tests_claimed array elements must be unique',
       }),
@@ -329,12 +356,11 @@ export const CoderSubmissionInputZodSchema = z
           .regex(/^(?!\s*$).+/, 'Blocker description cannot be whitespace-only')
       )
       .max(1000)
-      .default([])
       .refine((items) => new Set(items).size === items.length, {
         message: 'blockers array elements must be unique',
       }),
-    review_requested: z.boolean().default(true),
-    client_metadata: ClosedClientMetadataSchema.default({}),
+    review_requested: z.boolean(),
+    client_metadata: ClosedClientMetadataSchema,
   })
   .strict();
 
@@ -342,10 +368,28 @@ export type CoderSubmissionInput = z.infer<typeof CoderSubmissionInputZodSchema>
 
 /**
  * Exported JSON Schema equivalent for MCP tool argument definition.
+ * Strictly requires all 16 fields, exactly aligned with Zod schema.
  */
 export const CODER_SUBMISSION_INPUT_JSON_SCHEMA = {
   type: 'object',
-  required: ['submission_id', 'status', 'summary'],
+  required: [
+    'submission_id',
+    'authorization_id',
+    'project_id',
+    'task_id',
+    'attempt_id',
+    'assignment_id',
+    'task_ownership_epoch',
+    'base_sha',
+    'repository_head_sha',
+    'status',
+    'summary',
+    'changed_files',
+    'tests_claimed',
+    'blockers',
+    'review_requested',
+    'client_metadata',
+  ],
   properties: {
     submission_id: {
       type: 'string',
@@ -354,35 +398,53 @@ export const CODER_SUBMISSION_INPUT_JSON_SCHEMA = {
     },
     authorization_id: {
       type: 'string',
-      pattern: '^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$',
-      description: 'Optional execution authorization UUID',
+      minLength: 1,
+      maxLength: 128,
+      pattern: '^(?!\\s*$).+',
+      description: 'Execution authorization identifier',
     },
     project_id: {
       type: 'string',
       minLength: 1,
       maxLength: 128,
-      description: 'Optional project identifier',
+      pattern: '^(?!\\s*$).+',
+      description: 'Project identifier',
     },
     task_id: {
       type: 'string',
       minLength: 1,
       maxLength: 128,
-      description: 'Optional task identifier',
+      pattern: '^(?!\\s*$).+',
+      description: 'Task identifier',
+    },
+    attempt_id: {
+      type: ['string', 'null'],
+      minLength: 1,
+      maxLength: 128,
+      pattern: '^(?!\\s*$).+',
+      description: 'Execution attempt identifier or null for legacy lifecycle',
+    },
+    assignment_id: {
+      type: ['string', 'null'],
+      minLength: 1,
+      maxLength: 128,
+      pattern: '^(?!\\s*$).+',
+      description: 'Execution assignment identifier or null for legacy lifecycle',
     },
     task_ownership_epoch: {
       type: 'integer',
       minimum: 1,
-      description: 'Optional task ownership epoch',
+      description: 'Task ownership epoch (positive integer)',
     },
     base_sha: {
       type: 'string',
       pattern: '^[0-9a-f]{40}$',
-      description: 'Optional base git SHA (40 lowercase hex)',
+      description: 'Base git SHA (40 lowercase hex)',
     },
     repository_head_sha: {
       type: 'string',
       pattern: '^[0-9a-f]{40}$',
-      description: 'Optional repository head git SHA (40 lowercase hex)',
+      description: 'Repository head git SHA (40 lowercase hex)',
     },
     status: {
       type: 'string',
@@ -405,7 +467,6 @@ export const CODER_SUBMISSION_INPUT_JSON_SCHEMA = {
       },
       maxItems: 1000,
       uniqueItems: true,
-      default: [],
     },
     tests_claimed: {
       type: 'array',
@@ -417,7 +478,6 @@ export const CODER_SUBMISSION_INPUT_JSON_SCHEMA = {
       },
       maxItems: 1000,
       uniqueItems: true,
-      default: [],
     },
     blockers: {
       type: 'array',
@@ -429,11 +489,10 @@ export const CODER_SUBMISSION_INPUT_JSON_SCHEMA = {
       },
       maxItems: 1000,
       uniqueItems: true,
-      default: [],
     },
     review_requested: {
       type: 'boolean',
-      default: true,
+      description: 'Whether code review is requested',
     },
     client_metadata: {
       type: 'object',
@@ -443,7 +502,6 @@ export const CODER_SUBMISSION_INPUT_JSON_SCHEMA = {
         client_session_mode: { type: 'string', enum: ['GUI_EXTERNAL', 'CLI_EXTERNAL', 'SUBAGENT_CODER'] },
       },
       additionalProperties: false,
-      default: {},
     },
   },
   additionalProperties: false,

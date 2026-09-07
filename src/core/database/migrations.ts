@@ -1434,6 +1434,7 @@ const ALL_MIGRATIONS_LIST: Migration[] = [
           ),
           authorization_id TEXT NOT NULL REFERENCES execution_authorizations(id) ON DELETE RESTRICT,
           scope TEXT NOT NULL CHECK (scope = 'CODER_SUBMISSION'),
+          issuer_identity TEXT NOT NULL CHECK (issuer_identity = 'OWNER_LOCAL_CLI'),
           token_hash TEXT NOT NULL CHECK (
             length(token_hash) = 64 AND
             token_hash GLOB '[0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]'
@@ -1501,6 +1502,7 @@ const ALL_MIGRATIONS_LIST: Migration[] = [
             WHEN NEW.id != OLD.id
               OR NEW.authorization_id != OLD.authorization_id
               OR NEW.scope != OLD.scope
+              OR NEW.issuer_identity != OLD.issuer_identity
               OR NEW.token_hash != OLD.token_hash
               OR NEW.authorization_fingerprint != OLD.authorization_fingerprint
               OR NEW.issued_at != OLD.issued_at
@@ -1539,6 +1541,23 @@ const ALL_MIGRATIONS_LIST: Migration[] = [
             length(authorized_head_sha) = 40 AND
             authorized_head_sha GLOB '[0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]'
           ),
+          schema_version INTEGER NOT NULL CHECK (schema_version = 1),
+          authorization_status TEXT NOT NULL CHECK (authorization_status = 'DISPATCHED'),
+          dispatched_at TEXT NOT NULL CHECK (
+            length(dispatched_at) = 24 AND
+            dispatched_at GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9].[0-9][0-9][0-9]Z' AND
+            unixepoch(dispatched_at) IS NOT NULL AND
+            strftime('%Y-%m-%dT%H:%M:%fZ', dispatched_at) = dispatched_at
+          ),
+          authority_fingerprint TEXT NOT NULL CHECK (
+            length(authority_fingerprint) = 64 AND
+            authority_fingerprint GLOB '[0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]'
+          ),
+          manager_payload_hash TEXT NOT NULL CHECK (
+            length(manager_payload_hash) = 64 AND
+            manager_payload_hash GLOB '[0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]'
+          ),
+          task_revision INTEGER NOT NULL CHECK (task_revision >= 0),
           claimed_status TEXT NOT NULL CHECK (claimed_status IN ('COMPLETED', 'IN_PROGRESS', 'BLOCKED', 'FAILED')),
           quarantine_status TEXT NOT NULL CHECK (quarantine_status = 'QUARANTINED'),
           summary TEXT NOT NULL CHECK (
@@ -1672,23 +1691,7 @@ const ALL_MIGRATIONS_LIST: Migration[] = [
   },
 ];
 
-const isLegacyR5JReadContextSuite = (() => {
-  const g = globalThis as Record<string, unknown>;
-  const worker = g.__vitest_worker__ as { filepath?: string } | undefined;
-  if (worker?.filepath && (worker.filepath.includes('ContextRead') || worker.filepath.includes('CrashRecovery'))) {
-    return true;
-  }
-  if (typeof process !== 'undefined' && Array.isArray(process.argv)) {
-    if (process.argv.some((arg) => typeof arg === 'string' && (arg.includes('ContextRead') || arg.includes('CrashRecovery')))) {
-      return true;
-    }
-  }
-  return false;
-})();
-
-export const MIGRATIONS: Migration[] = isLegacyR5JReadContextSuite
-  ? ALL_MIGRATIONS_LIST.slice(0, 21)
-  : ALL_MIGRATIONS_LIST;
+export const MIGRATIONS: readonly Migration[] = ALL_MIGRATIONS_LIST;
 
 export function verifyMigration21SchemaAuthority(db: Database.Database): void {
   // 1. Exact ledger table and version 21 row existence
@@ -2044,14 +2047,15 @@ export function verifyMigration22SchemaAuthority(db: Database.Database): void {
     dflt_value: unknown;
     pk: number;
   }[];
-  if (sessColumns.length !== 9) {
-    throw new Error(`[MCP_SCHEMA_AUTHORITY_INVALID] Table mcp_submission_sessions missing column authority: expected exactly 9 columns (found ${sessColumns.length})`);
+  if (sessColumns.length !== 10) {
+    throw new Error(`[MCP_SCHEMA_AUTHORITY_INVALID] Table mcp_submission_sessions missing column authority: expected exactly 10 columns (found ${sessColumns.length})`);
   }
   const sessColMap = new Map(sessColumns.map((c) => [c.name, c]));
   const reqSessCols: Array<{ name: string; type: string; notnull: number; pk: number }> = [
     { name: 'id', type: 'TEXT', notnull: 0, pk: 1 },
     { name: 'authorization_id', type: 'TEXT', notnull: 1, pk: 0 },
     { name: 'scope', type: 'TEXT', notnull: 1, pk: 0 },
+    { name: 'issuer_identity', type: 'TEXT', notnull: 1, pk: 0 },
     { name: 'token_hash', type: 'TEXT', notnull: 1, pk: 0 },
     { name: 'authorization_fingerprint', type: 'TEXT', notnull: 1, pk: 0 },
     { name: 'issued_at', type: 'TEXT', notnull: 1, pk: 0 },
@@ -2089,6 +2093,7 @@ export function verifyMigration22SchemaAuthority(db: Database.Database): void {
     to: string;
     on_update: string;
     on_delete: string;
+    match: string;
   }[];
   if (sessFks.length !== 1) {
     throw new Error(`[MCP_SCHEMA_AUTHORITY_INVALID] Table mcp_submission_sessions must contain exactly 1 foreign key (found ${sessFks.length})`);
@@ -2098,7 +2103,9 @@ export function verifyMigration22SchemaAuthority(db: Database.Database): void {
     sessFk.table !== 'execution_authorizations' ||
     sessFk.from !== 'authorization_id' ||
     sessFk.to !== 'id' ||
-    sessFk.on_delete.toUpperCase() !== 'RESTRICT'
+    sessFk.on_delete.toUpperCase() !== 'RESTRICT' ||
+    sessFk.on_update.toUpperCase() !== 'NO ACTION' ||
+    sessFk.match !== 'NONE'
   ) {
     throw new Error('[MCP_SCHEMA_AUTHORITY_INVALID] Table mcp_submission_sessions foreign key on authorization_id must reference execution_authorizations(id) ON DELETE RESTRICT');
   }
@@ -2111,9 +2118,16 @@ export function verifyMigration22SchemaAuthority(db: Database.Database): void {
     origin: string;
     partial: number;
   }[];
+  if (sessIdxList.length !== 5) {
+    throw new Error(`[MCP_SCHEMA_AUTHORITY_INVALID] Table mcp_submission_sessions must have exactly 5 indexes total (found ${sessIdxList.length})`);
+  }
   const sessUserIdxs = sessIdxList.filter((idx) => idx.origin === 'c');
   if (sessUserIdxs.length !== 4) {
     throw new Error(`[MCP_SCHEMA_AUTHORITY_INVALID] Table mcp_submission_sessions must have exactly 4 user-defined indexes (found ${sessUserIdxs.length})`);
+  }
+  const sessPkIdxs = sessIdxList.filter((idx) => idx.origin === 'pk');
+  if (sessPkIdxs.length !== 1) {
+    throw new Error(`[MCP_SCHEMA_AUTHORITY_INVALID] Table mcp_submission_sessions must have exactly 1 primary-key index (found ${sessPkIdxs.length})`);
   }
   const autoIdxs = sessIdxList.filter((idx) => idx.origin === 'u');
   if (autoIdxs.length > 0) {
@@ -2125,17 +2139,66 @@ export function verifyMigration22SchemaAuthority(db: Database.Database): void {
   if (!uqActive || uqActive.unique !== 1 || uqActive.partial !== 1) {
     throw new Error('[MCP_SCHEMA_AUTHORITY_INVALID] Table mcp_submission_sessions missing partial unique index uq_mcp_submission_sessions_active_auth');
   }
+  const uqActiveXInfo = db.prepare("PRAGMA index_xinfo('uq_mcp_submission_sessions_active_auth')").all() as XInfoRow[];
+  const uqActiveKeyCols = uqActiveXInfo.filter((r) => r.key === 1);
+  if (
+    uqActiveKeyCols.length !== 1 ||
+    uqActiveKeyCols[0].name !== 'authorization_id' ||
+    uqActiveKeyCols[0].coll !== 'BINARY' ||
+    uqActiveKeyCols[0].desc !== 0
+  ) {
+    throw new Error('[MCP_SCHEMA_AUTHORITY_INVALID] Index uq_mcp_submission_sessions_active_auth must index [authorization_id] with BINARY collation');
+  }
+  const uqActiveSqlRow = db
+    .prepare("SELECT sql FROM sqlite_master WHERE type = 'index' AND name = 'uq_mcp_submission_sessions_active_auth'")
+    .get() as { sql: string } | undefined;
+  if (!uqActiveSqlRow || !/WHERE\s+revoked_at\s+IS\s+NULL/i.test(uqActiveSqlRow.sql)) {
+    throw new Error('[MCP_SCHEMA_AUTHORITY_INVALID] Index uq_mcp_submission_sessions_active_auth missing WHERE revoked_at IS NULL predicate');
+  }
+
   const tokenHashIdx = sessIdxMap.get('idx_mcp_submission_sessions_token_hash');
   if (!tokenHashIdx || tokenHashIdx.unique !== 1 || tokenHashIdx.partial !== 0) {
     throw new Error('[MCP_SCHEMA_AUTHORITY_INVALID] Table mcp_submission_sessions missing unique index idx_mcp_submission_sessions_token_hash');
   }
+  const tokenHashXInfo = db.prepare("PRAGMA index_xinfo('idx_mcp_submission_sessions_token_hash')").all() as XInfoRow[];
+  const tokenHashKeyCols = tokenHashXInfo.filter((r) => r.key === 1);
+  if (
+    tokenHashKeyCols.length !== 1 ||
+    tokenHashKeyCols[0].name !== 'token_hash' ||
+    tokenHashKeyCols[0].coll !== 'BINARY' ||
+    tokenHashKeyCols[0].desc !== 0
+  ) {
+    throw new Error('[MCP_SCHEMA_AUTHORITY_INVALID] Index idx_mcp_submission_sessions_token_hash must index [token_hash] with BINARY collation');
+  }
+
   const expiresAtIdx = sessIdxMap.get('idx_mcp_submission_sessions_expires_at');
   if (!expiresAtIdx || expiresAtIdx.unique !== 0 || expiresAtIdx.partial !== 0) {
     throw new Error('[MCP_SCHEMA_AUTHORITY_INVALID] Table mcp_submission_sessions missing index idx_mcp_submission_sessions_expires_at');
   }
+  const expiresAtXInfo = db.prepare("PRAGMA index_xinfo('idx_mcp_submission_sessions_expires_at')").all() as XInfoRow[];
+  const expiresAtKeyCols = expiresAtXInfo.filter((r) => r.key === 1);
+  if (
+    expiresAtKeyCols.length !== 1 ||
+    expiresAtKeyCols[0].name !== 'expires_at' ||
+    expiresAtKeyCols[0].coll !== 'BINARY' ||
+    expiresAtKeyCols[0].desc !== 0
+  ) {
+    throw new Error('[MCP_SCHEMA_AUTHORITY_INVALID] Index idx_mcp_submission_sessions_expires_at must index [expires_at] with BINARY collation');
+  }
+
   const authIdIdx = sessIdxMap.get('idx_mcp_submission_sessions_auth_id');
   if (!authIdIdx || authIdIdx.unique !== 0 || authIdIdx.partial !== 0) {
     throw new Error('[MCP_SCHEMA_AUTHORITY_INVALID] Table mcp_submission_sessions missing index idx_mcp_submission_sessions_auth_id');
+  }
+  const authIdXInfo = db.prepare("PRAGMA index_xinfo('idx_mcp_submission_sessions_auth_id')").all() as XInfoRow[];
+  const authIdKeyCols = authIdXInfo.filter((r) => r.key === 1);
+  if (
+    authIdKeyCols.length !== 1 ||
+    authIdKeyCols[0].name !== 'authorization_id' ||
+    authIdKeyCols[0].coll !== 'BINARY' ||
+    authIdKeyCols[0].desc !== 0
+  ) {
+    throw new Error('[MCP_SCHEMA_AUTHORITY_INVALID] Index idx_mcp_submission_sessions_auth_id must index [authorization_id] with BINARY collation');
   }
 
   // CHECK constraints on mcp_submission_sessions
@@ -2144,11 +2207,20 @@ export function verifyMigration22SchemaAuthority(db: Database.Database): void {
     .get() as { sql: string } | undefined;
   const sessSql = (sessSqlRow?.sql ?? '').replace(/\s+/g, ' ');
   const sessChecks = sessSql.match(/\bCHECK\s*\(/gi);
-  if (!sessChecks || sessChecks.length !== 7) {
-    throw new Error(`[MCP_SCHEMA_AUTHORITY_INVALID] Table mcp_submission_sessions must contain exactly 7 CHECK constraints (found ${sessChecks?.length ?? 0})`);
+  if (!sessChecks || sessChecks.length !== 8) {
+    throw new Error(`[MCP_SCHEMA_AUTHORITY_INVALID] Table mcp_submission_sessions must contain exactly 8 CHECK constraints (found ${sessChecks?.length ?? 0})`);
   }
   if (!/scope\s*=\s*'CODER_SUBMISSION'/i.test(sessSql)) {
     throw new Error('[MCP_SCHEMA_AUTHORITY_INVALID] Table mcp_submission_sessions missing scope CHECK constraint');
+  }
+  if (!/issuer_identity\s*=\s*'OWNER_LOCAL_CLI'/i.test(sessSql)) {
+    throw new Error('[MCP_SCHEMA_AUTHORITY_INVALID] Table mcp_submission_sessions missing issuer_identity CHECK constraint');
+  }
+  if (!/length\(token_hash\)\s*=\s*64\s+AND\s+token_hash\s+GLOB\s+'(\[0-9a-f\]){64}'/i.test(sessSql)) {
+    throw new Error('[MCP_SCHEMA_AUTHORITY_INVALID] Table mcp_submission_sessions missing token_hash CHECK constraint');
+  }
+  if (!/length\(authorization_fingerprint\)\s*=\s*64\s+AND\s+authorization_fingerprint\s+GLOB\s+'(\[0-9a-f\]){64}'/i.test(sessSql)) {
+    throw new Error('[MCP_SCHEMA_AUTHORITY_INVALID] Table mcp_submission_sessions missing authorization_fingerprint CHECK constraint');
   }
   if (!/strftime\('%Y-%m-%dT%H:%M:%fZ',\s*issued_at\)\s*=\s*issued_at/i.test(sessSql)) {
     throw new Error('[MCP_SCHEMA_AUTHORITY_INVALID] Table mcp_submission_sessions missing issued_at round-trip CHECK constraint');
@@ -2156,20 +2228,36 @@ export function verifyMigration22SchemaAuthority(db: Database.Database): void {
   if (!/strftime\('%Y-%m-%dT%H:%M:%fZ',\s*expires_at\)\s*=\s*expires_at/i.test(sessSql)) {
     throw new Error('[MCP_SCHEMA_AUTHORITY_INVALID] Table mcp_submission_sessions missing expires_at round-trip CHECK constraint');
   }
-  if (!/strftime\('%Y-%m-%dT%H:%M:%fZ',\s*revoked_at\)\s*=\s*revoked_at/i.test(sessSql)) {
-    throw new Error('[MCP_SCHEMA_AUTHORITY_INVALID] Table mcp_submission_sessions missing revoked_at round-trip CHECK constraint');
+  if (!/\(unixepoch\(expires_at\)\s*-\s*unixepoch\(issued_at\)\)\s*>=\s*300\s+AND\s+\(unixepoch\(expires_at\)\s*-\s*unixepoch\(issued_at\)\)\s*<=\s*86400/i.test(sessSql)) {
+    throw new Error('[MCP_SCHEMA_AUTHORITY_INVALID] Table mcp_submission_sessions missing TTL bounds CHECK constraint');
+  }
+  if (!/revoked_at\s+IS\s+NULL\s+AND\s+revocation_reason\s+IS\s+NULL/i.test(sessSql)) {
+    throw new Error('[MCP_SCHEMA_AUTHORITY_INVALID] Table mcp_submission_sessions missing revoked_at CHECK constraint');
   }
 
   // Triggers on mcp_submission_sessions
   const sessTriggers = db
-    .prepare("SELECT name FROM sqlite_master WHERE type = 'trigger' AND tbl_name = 'mcp_submission_sessions'")
-    .all() as { name: string }[];
-  const sessTrigNames = new Set(sessTriggers.map((t) => t.name));
-  if (!sessTrigNames.has('trg_mcp_submission_sessions_no_delete') || !sessTrigNames.has('trg_mcp_submission_sessions_immutable_update')) {
+    .prepare("SELECT name, sql FROM sqlite_master WHERE type = 'trigger' AND tbl_name = 'mcp_submission_sessions'")
+    .all() as { name: string; sql: string }[];
+  const sessTrigMap = new Map(sessTriggers.map((t) => [t.name, t]));
+  if (!sessTrigMap.has('trg_mcp_submission_sessions_no_delete') || !sessTrigMap.has('trg_mcp_submission_sessions_immutable_update')) {
     throw new Error('[MCP_SCHEMA_AUTHORITY_INVALID] Table mcp_submission_sessions missing required triggers');
   }
-  if (sessTrigNames.size !== 2) {
-    throw new Error(`[MCP_SCHEMA_AUTHORITY_INVALID] Table mcp_submission_sessions has unexpected triggers (found ${sessTrigNames.size})`);
+  if (sessTriggers.length !== 2) {
+    throw new Error(`[MCP_SCHEMA_AUTHORITY_INVALID] Table mcp_submission_sessions has unexpected triggers (found ${sessTriggers.length})`);
+  }
+  const noDeleteTrig = sessTrigMap.get('trg_mcp_submission_sessions_no_delete')!;
+  if (!/BEFORE\s+DELETE\s+ON\s+mcp_submission_sessions/i.test(noDeleteTrig.sql) || !/MCP_SUBMISSION_SESSION_DELETE_FORBIDDEN/i.test(noDeleteTrig.sql)) {
+    throw new Error('[MCP_SCHEMA_AUTHORITY_INVALID] Trigger trg_mcp_submission_sessions_no_delete authority mismatch');
+  }
+  const immutableUpdateTrig = sessTrigMap.get('trg_mcp_submission_sessions_immutable_update')!;
+  if (
+    !/BEFORE\s+UPDATE\s+ON\s+mcp_submission_sessions/i.test(immutableUpdateTrig.sql) ||
+    !/MCP_SUBMISSION_SESSION_ALREADY_REVOKED/i.test(immutableUpdateTrig.sql) ||
+    !/MCP_SUBMISSION_SESSION_MUTATION_FORBIDDEN/i.test(immutableUpdateTrig.sql) ||
+    !/NEW\.issuer_identity\s*!=\s*OLD\.issuer_identity/i.test(immutableUpdateTrig.sql)
+  ) {
+    throw new Error('[MCP_SCHEMA_AUTHORITY_INVALID] Trigger trg_mcp_submission_sessions_immutable_update authority mismatch');
   }
 
   // 3. Table: coder_submissions
@@ -2188,8 +2276,8 @@ export function verifyMigration22SchemaAuthority(db: Database.Database): void {
     dflt_value: unknown;
     pk: number;
   }[];
-  if (subColumns.length !== 30) {
-    throw new Error(`[MCP_SCHEMA_AUTHORITY_INVALID] Table coder_submissions missing column authority: expected exactly 30 columns (found ${subColumns.length})`);
+  if (subColumns.length !== 36) {
+    throw new Error(`[MCP_SCHEMA_AUTHORITY_INVALID] Table coder_submissions missing column authority: expected exactly 36 columns (found ${subColumns.length})`);
   }
   const subColMap = new Map(subColumns.map((c) => [c.name, c]));
   const reqSubCols: Array<{ name: string; type: string; notnull: number; pk: number }> = [
@@ -2210,6 +2298,12 @@ export function verifyMigration22SchemaAuthority(db: Database.Database): void {
     { name: 'routing_decision_id', type: 'TEXT', notnull: 1, pk: 0 },
     { name: 'base_sha', type: 'TEXT', notnull: 1, pk: 0 },
     { name: 'authorized_head_sha', type: 'TEXT', notnull: 1, pk: 0 },
+    { name: 'schema_version', type: 'INTEGER', notnull: 1, pk: 0 },
+    { name: 'authorization_status', type: 'TEXT', notnull: 1, pk: 0 },
+    { name: 'dispatched_at', type: 'TEXT', notnull: 1, pk: 0 },
+    { name: 'authority_fingerprint', type: 'TEXT', notnull: 1, pk: 0 },
+    { name: 'manager_payload_hash', type: 'TEXT', notnull: 1, pk: 0 },
+    { name: 'task_revision', type: 'INTEGER', notnull: 1, pk: 0 },
     { name: 'claimed_status', type: 'TEXT', notnull: 1, pk: 0 },
     { name: 'quarantine_status', type: 'TEXT', notnull: 1, pk: 0 },
     { name: 'summary', type: 'TEXT', notnull: 1, pk: 0 },
@@ -2245,20 +2339,37 @@ export function verifyMigration22SchemaAuthority(db: Database.Database): void {
     }
   }
 
-  // FKs on coder_submissions: exactly 12 FKs
+  // FKs on coder_submissions: exactly 9 FKs
   const subFks = db.prepare("PRAGMA foreign_key_list(coder_submissions)").all() as {
     id: number;
     table: string;
     from: string;
     to: string;
+    on_update: string;
     on_delete: string;
+    match: string;
   }[];
   if (subFks.length !== 9) {
     throw new Error(`[MCP_SCHEMA_AUTHORITY_INVALID] Table coder_submissions must contain exactly 9 foreign keys (found ${subFks.length})`);
   }
+  const expectedFkMap = new Map([
+    ['authorization_id', { table: 'execution_authorizations', to: 'id' }],
+    ['project_id', { table: 'projects', to: 'id' }],
+    ['task_id', { table: 'tasks', to: 'id' }],
+    ['session_id', { table: 'mcp_submission_sessions', to: 'id' }],
+    ['attempt_id', { table: 'task_attempts', to: 'id' }],
+    ['assignment_id', { table: 'agent_assignments', to: 'id' }],
+    ['selected_provider_id', { table: 'providers', to: 'id' }],
+    ['selected_account_id', { table: 'provider_accounts', to: 'id' }],
+    ['selected_resource_id', { table: 'provider_resources', to: 'id' }],
+  ]);
   for (const fk of subFks) {
-    if (fk.on_delete.toUpperCase() !== 'RESTRICT') {
+    if (fk.on_delete.toUpperCase() !== 'RESTRICT' || fk.on_update.toUpperCase() !== 'NO ACTION' || fk.match !== 'NONE') {
       throw new Error(`[MCP_SCHEMA_AUTHORITY_INVALID] Foreign key on "${fk.from}" must be ON DELETE RESTRICT (got ${fk.on_delete})`);
+    }
+    const exp = expectedFkMap.get(fk.from);
+    if (!exp || exp.table !== fk.table || exp.to !== fk.to) {
+      throw new Error(`[MCP_SCHEMA_AUTHORITY_INVALID] Foreign key on "${fk.from}" references unexpected table "${fk.table}"("${fk.to}")`);
     }
   }
 
@@ -2267,14 +2378,42 @@ export function verifyMigration22SchemaAuthority(db: Database.Database): void {
     name: string;
     unique: number;
     origin: string;
+    partial: number;
   }[];
+  if (subIdxList.length !== 7) {
+    throw new Error(`[MCP_SCHEMA_AUTHORITY_INVALID] Table coder_submissions must have exactly 7 indexes total (found ${subIdxList.length})`);
+  }
   const subUserIdxs = subIdxList.filter((idx) => idx.origin === 'c');
   if (subUserIdxs.length !== 6) {
     throw new Error(`[MCP_SCHEMA_AUTHORITY_INVALID] Table coder_submissions must have exactly 6 user-defined indexes (found ${subUserIdxs.length})`);
   }
-  for (const idx of subUserIdxs) {
-    if (idx.unique !== 0) {
-      throw new Error(`[MCP_SCHEMA_AUTHORITY_INVALID] Table coder_submissions index "${idx.name}" must not be unique`);
+  const subPkIdxs = subIdxList.filter((idx) => idx.origin === 'pk');
+  if (subPkIdxs.length !== 1) {
+    throw new Error(`[MCP_SCHEMA_AUTHORITY_INVALID] Table coder_submissions must have exactly 1 primary-key index (found ${subPkIdxs.length})`);
+  }
+  const subAutoIdxs = subIdxList.filter((idx) => idx.origin === 'u');
+  if (subAutoIdxs.length > 0) {
+    throw new Error('[MCP_SCHEMA_AUTHORITY_INVALID] Table coder_submissions contains unexpected auto-indexes (origin = "u")');
+  }
+
+  const expectedSubIndexes = new Map([
+    ['idx_coder_submissions_auth_id', 'authorization_id'],
+    ['idx_coder_submissions_task_id', 'task_id'],
+    ['idx_coder_submissions_session_id', 'session_id'],
+    ['idx_coder_submissions_content_hash', 'claim_content_hash'],
+    ['idx_coder_submissions_envelope_hash', 'canonical_envelope_hash'],
+    ['idx_coder_submissions_submitted_at', 'submitted_at'],
+  ]);
+
+  for (const [idxName, colName] of expectedSubIndexes.entries()) {
+    const idx = subIdxList.find((i) => i.name === idxName);
+    if (!idx || idx.unique !== 0 || idx.partial !== 0) {
+      throw new Error(`[MCP_SCHEMA_AUTHORITY_INVALID] Index "${idxName}" on coder_submissions missing or not non-unique non-partial`);
+    }
+    const xinfo = db.prepare(`PRAGMA index_xinfo('${idxName}')`).all() as XInfoRow[];
+    const keyCols = xinfo.filter((r) => r.key === 1);
+    if (keyCols.length !== 1 || keyCols[0].name !== colName || keyCols[0].coll !== 'BINARY' || keyCols[0].desc !== 0) {
+      throw new Error(`[MCP_SCHEMA_AUTHORITY_INVALID] Index "${idxName}" must index [${colName}] with BINARY collation`);
     }
   }
 
@@ -2284,8 +2423,26 @@ export function verifyMigration22SchemaAuthority(db: Database.Database): void {
     .get() as { sql: string } | undefined;
   const subSql = (subSqlRow?.sql ?? '').replace(/\s+/g, ' ');
   const subChecks = subSql.match(/\bCHECK\s*\(/gi);
-  if (!subChecks || subChecks.length !== 19) {
-    throw new Error(`[MCP_SCHEMA_AUTHORITY_INVALID] Table coder_submissions must contain exactly 19 CHECK constraints (found ${subChecks?.length ?? 0})`);
+  if (!subChecks || subChecks.length !== 25) {
+    throw new Error(`[MCP_SCHEMA_AUTHORITY_INVALID] Table coder_submissions must contain exactly 25 CHECK constraints (found ${subChecks?.length ?? 0})`);
+  }
+  if (!/schema_version\s*=\s*1/i.test(subSql)) {
+    throw new Error('[MCP_SCHEMA_AUTHORITY_INVALID] Table coder_submissions missing schema_version CHECK constraint');
+  }
+  if (!/authorization_status\s*=\s*'DISPATCHED'/i.test(subSql)) {
+    throw new Error('[MCP_SCHEMA_AUTHORITY_INVALID] Table coder_submissions missing authorization_status CHECK constraint');
+  }
+  if (!/strftime\('%Y-%m-%dT%H:%M:%fZ',\s*dispatched_at\)\s*=\s*dispatched_at/i.test(subSql)) {
+    throw new Error('[MCP_SCHEMA_AUTHORITY_INVALID] Table coder_submissions missing dispatched_at round-trip CHECK constraint');
+  }
+  if (!/length\(authority_fingerprint\)\s*=\s*64\s+AND\s+authority_fingerprint\s+GLOB\s+'(\[0-9a-f\]){64}'/i.test(subSql)) {
+    throw new Error('[MCP_SCHEMA_AUTHORITY_INVALID] Table coder_submissions missing authority_fingerprint CHECK constraint');
+  }
+  if (!/length\(manager_payload_hash\)\s*=\s*64\s+AND\s+manager_payload_hash\s+GLOB\s+'(\[0-9a-f\]){64}'/i.test(subSql)) {
+    throw new Error('[MCP_SCHEMA_AUTHORITY_INVALID] Table coder_submissions missing manager_payload_hash CHECK constraint');
+  }
+  if (!/task_revision\s*>=\s*0/i.test(subSql)) {
+    throw new Error('[MCP_SCHEMA_AUTHORITY_INVALID] Table coder_submissions missing task_revision CHECK constraint');
   }
   if (!/strftime\('%Y-%m-%dT%H:%M:%fZ',\s*submitted_at\)\s*=\s*submitted_at/i.test(subSql)) {
     throw new Error('[MCP_SCHEMA_AUTHORITY_INVALID] Table coder_submissions missing submitted_at round-trip CHECK constraint');
@@ -2293,17 +2450,31 @@ export function verifyMigration22SchemaAuthority(db: Database.Database): void {
   if (!/quarantine_status\s*=\s*'QUARANTINED'/i.test(subSql)) {
     throw new Error('[MCP_SCHEMA_AUTHORITY_INVALID] Table coder_submissions missing quarantine_status CHECK constraint');
   }
+  if (!/json_valid\(claim_content_json\)\s*=\s*1\s+AND\s+json_type\(claim_content_json\)\s*=\s*'object'/i.test(subSql)) {
+    throw new Error('[MCP_SCHEMA_AUTHORITY_INVALID] Table coder_submissions missing claim_content_json object CHECK constraint');
+  }
+  if (!/json_valid\(canonical_envelope_json\)\s*=\s*1\s+AND\s+json_type\(canonical_envelope_json\)\s*=\s*'object'/i.test(subSql)) {
+    throw new Error('[MCP_SCHEMA_AUTHORITY_INVALID] Table coder_submissions missing canonical_envelope_json object CHECK constraint');
+  }
 
   // Triggers on coder_submissions
   const subTriggers = db
-    .prepare("SELECT name FROM sqlite_master WHERE type = 'trigger' AND tbl_name = 'coder_submissions'")
-    .all() as { name: string }[];
-  const subTrigNames = new Set(subTriggers.map((t) => t.name));
-  if (!subTrigNames.has('trg_coder_submissions_no_update') || !subTrigNames.has('trg_coder_submissions_no_delete')) {
+    .prepare("SELECT name, sql FROM sqlite_master WHERE type = 'trigger' AND tbl_name = 'coder_submissions'")
+    .all() as { name: string; sql: string }[];
+  const subTrigMap = new Map(subTriggers.map((t) => [t.name, t]));
+  if (!subTrigMap.has('trg_coder_submissions_no_update') || !subTrigMap.has('trg_coder_submissions_no_delete')) {
     throw new Error('[MCP_SCHEMA_AUTHORITY_INVALID] Table coder_submissions missing required triggers');
   }
-  if (subTrigNames.size !== 2) {
-    throw new Error(`[MCP_SCHEMA_AUTHORITY_INVALID] Table coder_submissions has unexpected triggers (found ${subTrigNames.size})`);
+  if (subTriggers.length !== 2) {
+    throw new Error(`[MCP_SCHEMA_AUTHORITY_INVALID] Table coder_submissions has unexpected triggers (found ${subTriggers.length})`);
+  }
+  const subNoUpdateTrig = subTrigMap.get('trg_coder_submissions_no_update')!;
+  if (!/BEFORE\s+UPDATE\s+ON\s+coder_submissions/i.test(subNoUpdateTrig.sql) || !/coder_submissions is strictly append-only: UPDATE is prohibited/i.test(subNoUpdateTrig.sql)) {
+    throw new Error('[MCP_SCHEMA_AUTHORITY_INVALID] Trigger trg_coder_submissions_no_update authority mismatch');
+  }
+  const subNoDeleteTrig = subTrigMap.get('trg_coder_submissions_no_delete')!;
+  if (!/BEFORE\s+DELETE\s+ON\s+coder_submissions/i.test(subNoDeleteTrig.sql) || !/coder_submissions is strictly append-only: DELETE is prohibited/i.test(subNoDeleteTrig.sql)) {
+    throw new Error('[MCP_SCHEMA_AUTHORITY_INVALID] Trigger trg_coder_submissions_no_delete authority mismatch');
   }
 
   // 4. Table: coder_submission_dispositions
@@ -2362,7 +2533,9 @@ export function verifyMigration22SchemaAuthority(db: Database.Database): void {
     table: string;
     from: string;
     to: string;
+    on_update: string;
     on_delete: string;
+    match: string;
   }[];
   if (dispFks.length !== 1) {
     throw new Error(`[MCP_SCHEMA_AUTHORITY_INVALID] Table coder_submission_dispositions must contain exactly 1 foreign key (found ${dispFks.length})`);
@@ -2371,7 +2544,9 @@ export function verifyMigration22SchemaAuthority(db: Database.Database): void {
     dispFks[0].table !== 'coder_submissions' ||
     dispFks[0].from !== 'submission_id' ||
     dispFks[0].to !== 'id' ||
-    dispFks[0].on_delete.toUpperCase() !== 'RESTRICT'
+    dispFks[0].on_delete.toUpperCase() !== 'RESTRICT' ||
+    dispFks[0].on_update.toUpperCase() !== 'NO ACTION' ||
+    dispFks[0].match !== 'NONE'
   ) {
     throw new Error('[MCP_SCHEMA_AUTHORITY_INVALID] Table coder_submission_dispositions foreign key must reference coder_submissions(id) ON DELETE RESTRICT');
   }
@@ -2381,10 +2556,40 @@ export function verifyMigration22SchemaAuthority(db: Database.Database): void {
     name: string;
     unique: number;
     origin: string;
+    partial: number;
   }[];
+  if (dispIdxList.length !== 4) {
+    throw new Error(`[MCP_SCHEMA_AUTHORITY_INVALID] Table coder_submission_dispositions must have exactly 4 indexes total (found ${dispIdxList.length})`);
+  }
   const dispUserIdxs = dispIdxList.filter((idx) => idx.origin === 'c');
   if (dispUserIdxs.length !== 3) {
     throw new Error(`[MCP_SCHEMA_AUTHORITY_INVALID] Table coder_submission_dispositions must have exactly 3 user-defined indexes (found ${dispUserIdxs.length})`);
+  }
+  const dispPkIdxs = dispIdxList.filter((idx) => idx.origin === 'pk');
+  if (dispPkIdxs.length !== 1) {
+    throw new Error(`[MCP_SCHEMA_AUTHORITY_INVALID] Table coder_submission_dispositions must have exactly 1 primary-key index (found ${dispPkIdxs.length})`);
+  }
+  const dispAutoIdxs = dispIdxList.filter((idx) => idx.origin === 'u');
+  if (dispAutoIdxs.length > 0) {
+    throw new Error('[MCP_SCHEMA_AUTHORITY_INVALID] Table coder_submission_dispositions contains unexpected auto-indexes (origin = "u")');
+  }
+
+  const expectedDispIndexes = new Map([
+    ['idx_coder_submission_dispositions_submission', 'submission_id'],
+    ['idx_coder_submission_dispositions_event', 'disposition_event'],
+    ['idx_coder_submission_dispositions_created_at', 'created_at'],
+  ]);
+
+  for (const [idxName, colName] of expectedDispIndexes.entries()) {
+    const idx = dispIdxList.find((i) => i.name === idxName);
+    if (!idx || idx.unique !== 0 || idx.partial !== 0) {
+      throw new Error(`[MCP_SCHEMA_AUTHORITY_INVALID] Index "${idxName}" on coder_submission_dispositions missing or invalid`);
+    }
+    const xinfo = db.prepare(`PRAGMA index_xinfo('${idxName}')`).all() as XInfoRow[];
+    const keyCols = xinfo.filter((r) => r.key === 1);
+    if (keyCols.length !== 1 || keyCols[0].name !== colName || keyCols[0].coll !== 'BINARY' || keyCols[0].desc !== 0) {
+      throw new Error(`[MCP_SCHEMA_AUTHORITY_INVALID] Index "${idxName}" must index [${colName}] with BINARY collation`);
+    }
   }
 
   // CHECK constraints on coder_submission_dispositions
@@ -2399,17 +2604,77 @@ export function verifyMigration22SchemaAuthority(db: Database.Database): void {
   if (!/strftime\('%Y-%m-%dT%H:%M:%fZ',\s*created_at\)\s*=\s*created_at/i.test(dispSql)) {
     throw new Error('[MCP_SCHEMA_AUTHORITY_INVALID] Table coder_submission_dispositions missing created_at round-trip CHECK constraint');
   }
+  if (!/actor_type\s+IN\s+\('SYSTEM',\s*'MCP_CLIENT',\s*'OPERATOR'\)/i.test(dispSql)) {
+    throw new Error('[MCP_SCHEMA_AUTHORITY_INVALID] Table coder_submission_dispositions missing actor_type CHECK constraint');
+  }
 
   // Triggers on coder_submission_dispositions
   const dispTriggers = db
-    .prepare("SELECT name FROM sqlite_master WHERE type = 'trigger' AND tbl_name = 'coder_submission_dispositions'")
-    .all() as { name: string }[];
-  const dispTrigNames = new Set(dispTriggers.map((t) => t.name));
-  if (!dispTrigNames.has('trg_coder_submission_dispositions_no_update') || !dispTrigNames.has('trg_coder_submission_dispositions_no_delete')) {
+    .prepare("SELECT name, sql FROM sqlite_master WHERE type = 'trigger' AND tbl_name = 'coder_submission_dispositions'")
+    .all() as { name: string; sql: string }[];
+  const dispTrigMap = new Map(dispTriggers.map((t) => [t.name, t]));
+  if (!dispTrigMap.has('trg_coder_submission_dispositions_no_update') || !dispTrigMap.has('trg_coder_submission_dispositions_no_delete')) {
     throw new Error('[MCP_SCHEMA_AUTHORITY_INVALID] Table coder_submission_dispositions missing required triggers');
   }
-  if (dispTrigNames.size !== 2) {
-    throw new Error(`[MCP_SCHEMA_AUTHORITY_INVALID] Table coder_submission_dispositions has unexpected triggers (found ${dispTrigNames.size})`);
+  if (dispTriggers.length !== 2) {
+    throw new Error(`[MCP_SCHEMA_AUTHORITY_INVALID] Table coder_submission_dispositions has unexpected triggers (found ${dispTriggers.length})`);
+  }
+  const dispNoUpdateTrig = dispTrigMap.get('trg_coder_submission_dispositions_no_update')!;
+  if (!/BEFORE\s+UPDATE\s+ON\s+coder_submission_dispositions/i.test(dispNoUpdateTrig.sql) || !/coder_submission_dispositions is strictly append-only: UPDATE is prohibited/i.test(dispNoUpdateTrig.sql)) {
+    throw new Error('[MCP_SCHEMA_AUTHORITY_INVALID] Trigger trg_coder_submission_dispositions_no_update authority mismatch');
+  }
+  const dispNoDeleteTrig = dispTrigMap.get('trg_coder_submission_dispositions_no_delete')!;
+  if (!/BEFORE\s+DELETE\s+ON\s+coder_submission_dispositions/i.test(dispNoDeleteTrig.sql) || !/coder_submission_dispositions is strictly append-only: DELETE is prohibited/i.test(dispNoDeleteTrig.sql)) {
+    throw new Error('[MCP_SCHEMA_AUTHORITY_INVALID] Trigger trg_coder_submission_dispositions_no_delete authority mismatch');
+  }
+
+  // 5. Prohibit unexpected extra tables, indexes, or triggers in sqlite_master
+  const allMasterRows = db
+    .prepare("SELECT type, name, tbl_name FROM sqlite_master WHERE type IN ('table', 'index', 'trigger')")
+    .all() as { type: string; name: string; tbl_name: string }[];
+
+  const allowedAuthorityTables = new Set(['mcp_submission_sessions', 'coder_submissions', 'coder_submission_dispositions']);
+  for (const row of allMasterRows) {
+    if (row.type === 'table') {
+      if ((row.name.startsWith('mcp_sub') || row.name.startsWith('coder_sub')) && !allowedAuthorityTables.has(row.name)) {
+        throw new Error(`[MCP_SCHEMA_AUTHORITY_INVALID] Unexpected authority table in schema: "${row.name}"`);
+      }
+    } else if (row.type === 'trigger') {
+      if (allowedAuthorityTables.has(row.tbl_name)) {
+        const allowedTriggers = new Set([
+          'trg_mcp_submission_sessions_no_delete',
+          'trg_mcp_submission_sessions_immutable_update',
+          'trg_coder_submissions_no_update',
+          'trg_coder_submissions_no_delete',
+          'trg_coder_submission_dispositions_no_update',
+          'trg_coder_submission_dispositions_no_delete',
+        ]);
+        if (!allowedTriggers.has(row.name)) {
+          throw new Error(`[MCP_SCHEMA_AUTHORITY_INVALID] Unexpected authority trigger: "${row.name}" on table "${row.tbl_name}"`);
+        }
+      }
+    } else if (row.type === 'index') {
+      if (allowedAuthorityTables.has(row.tbl_name)) {
+        const allowedIndexes = new Set([
+          'uq_mcp_submission_sessions_active_auth',
+          'idx_mcp_submission_sessions_token_hash',
+          'idx_mcp_submission_sessions_expires_at',
+          'idx_mcp_submission_sessions_auth_id',
+          'idx_coder_submissions_auth_id',
+          'idx_coder_submissions_task_id',
+          'idx_coder_submissions_session_id',
+          'idx_coder_submissions_content_hash',
+          'idx_coder_submissions_envelope_hash',
+          'idx_coder_submissions_submitted_at',
+          'idx_coder_submission_dispositions_submission',
+          'idx_coder_submission_dispositions_event',
+          'idx_coder_submission_dispositions_created_at',
+        ]);
+        if (!allowedIndexes.has(row.name) && !row.name.startsWith('sqlite_autoindex_')) {
+          throw new Error(`[MCP_SCHEMA_AUTHORITY_INVALID] Unexpected authority index: "${row.name}" on table "${row.tbl_name}"`);
+        }
+      }
+    }
   }
 }
 

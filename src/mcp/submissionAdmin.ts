@@ -336,6 +336,14 @@ Usage:
       const tokenHash = computeSha256(plaintextToken);
       const sessionId = crypto.randomUUID();
       const task = repo.getTask(auth.task_id);
+      if (!task || task.ownership_epoch === undefined || task.ownership_epoch <= 0) {
+        process.stderr.write(`ERROR: [MCP_AUTHORITY_FENCED] Task ownership epoch missing or non-positive\n`);
+        return 1;
+      }
+      if (task.ownership_epoch !== auth.task_ownership_epoch) {
+        process.stderr.write(`ERROR: [MCP_AUTHORITY_FENCED] Task ownership epoch mismatch with authorization\n`);
+        return 1;
+      }
       const authorizationFingerprint = computeAuthorityFingerprint({
         assignment_id: auth.assignment_id ?? null,
         attempt_id: auth.attempt_id ?? null,
@@ -354,7 +362,7 @@ Usage:
         selected_provider_id: auth.selected_provider_id,
         selected_resource_id: auth.selected_resource_id,
         task_id: auth.task_id,
-        task_ownership_epoch: task?.ownership_epoch ?? auth.task_ownership_epoch ?? 1,
+        task_ownership_epoch: auth.task_ownership_epoch,
         task_revision: auth.task_revision,
       });
 
@@ -371,6 +379,7 @@ Usage:
           id: sessionId,
           authorization_id: authId,
           scope: 'CODER_SUBMISSION',
+          issuer_identity: 'OWNER_LOCAL_CLI',
           token_hash: tokenHash,
           authorization_fingerprint: authorizationFingerprint,
           issued_at: nowIso,
