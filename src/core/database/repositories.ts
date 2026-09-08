@@ -113,6 +113,69 @@ function isValidIsoTimestamp(ts: any): boolean {
   return /^\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}:\d{2}(\.\d+)?(Z|[+-]\d{2}:?\d{2})?$/.test(ts.trim());
 }
 
+export interface McpSubmissionSession {
+  id: string;
+  authorization_id: string;
+  scope: 'CODER_SUBMISSION';
+  issuer_identity: 'OWNER_LOCAL_CLI';
+  token_hash: string;
+  authorization_fingerprint: string;
+  issued_at: string;
+  expires_at: string;
+  revoked_at: string | null;
+  revocation_reason: string | null;
+}
+
+export interface CoderSubmission {
+  id: string;
+  authorization_id: string;
+  project_id: string;
+  task_id: string;
+  task_ownership_epoch: number;
+  session_id: string;
+  schema_version: number;
+  authorization_status: string;
+  dispatched_at: string;
+  authority_fingerprint: string;
+  manager_payload_hash: string;
+  task_revision: number;
+  lifecycle_version: number | null;
+  execution_id: string | null;
+  attempt_id: string | null;
+  assignment_id: string | null;
+  selected_provider_id: string;
+  selected_account_id: string | null;
+  selected_resource_id: string;
+  manager_message_id: string;
+  routing_decision_id: string;
+  base_sha: string;
+  authorized_head_sha: string;
+  claimed_status: string;
+  quarantine_status: 'QUARANTINED';
+  summary: string;
+  changed_files_count: number;
+  tests_claimed_count: number;
+  blockers_count: number;
+  review_requested: number;
+  claim_content_hash: string;
+  canonical_envelope_hash: string;
+  claim_content_json: string;
+  canonical_envelope_json: string;
+  canonical_arguments_bytes: number;
+  submitted_at: string;
+}
+
+export interface CoderSubmissionDisposition {
+  id: string;
+  submission_id: string;
+  disposition_event: string;
+  disposition_reason: string;
+  actor_type: 'SYSTEM' | 'MCP_CLIENT' | 'OPERATOR';
+  actor_id: string;
+  disposition_metadata_json: string | null;
+  created_at: string;
+}
+
 export class Repository {
   constructor(private db: Database.Database) {}
 
@@ -3492,6 +3555,337 @@ export class Repository {
       issued_at: String(row.issued_at),
       expires_at: String(row.expires_at),
       revoked_at: row.revoked_at ? String(row.revoked_at) : null,
+    };
+  }
+
+  // ==========================================
+  // MCP Submission Sessions Authority (R5J4)
+  // ==========================================
+  public createMcpSubmissionSession(session: McpSubmissionSession): McpSubmissionSession {
+    this.db
+      .prepare(`
+        INSERT INTO mcp_submission_sessions (
+          id,
+          authorization_id,
+          scope,
+          issuer_identity,
+          token_hash,
+          authorization_fingerprint,
+          issued_at,
+          expires_at,
+          revoked_at,
+          revocation_reason
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      `)
+      .run(
+        session.id,
+        session.authorization_id,
+        session.scope,
+        session.issuer_identity,
+        session.token_hash,
+        session.authorization_fingerprint,
+        session.issued_at,
+        session.expires_at,
+        session.revoked_at ?? null,
+        session.revocation_reason ?? null
+      );
+    return session;
+  }
+
+  public getMcpSubmissionSessionByTokenHash(tokenHash: string): McpSubmissionSession | null {
+    const row = this.db
+      .prepare('SELECT * FROM mcp_submission_sessions WHERE token_hash = ?')
+      .get(tokenHash) as Record<string, unknown> | undefined;
+    if (!row) return null;
+    return this.mapMcpSubmissionSession(row);
+  }
+
+  public getMcpSubmissionSessionById(id: string): McpSubmissionSession | null {
+    const row = this.db
+      .prepare('SELECT * FROM mcp_submission_sessions WHERE id = ?')
+      .get(id) as Record<string, unknown> | undefined;
+    if (!row) return null;
+    return this.mapMcpSubmissionSession(row);
+  }
+
+  public getActiveMcpSubmissionSessionByAuthorizationId(authId: string): McpSubmissionSession | null {
+    const row = this.db
+      .prepare('SELECT * FROM mcp_submission_sessions WHERE authorization_id = ? AND revoked_at IS NULL')
+      .get(authId) as Record<string, unknown> | undefined;
+    if (!row) return null;
+    return this.mapMcpSubmissionSession(row);
+  }
+
+  public revokeMcpSubmissionSession(
+    paramsOrId:
+      | {
+          sessionId?: string;
+          authorizationId?: string;
+          revokedAt: string;
+          reason: string;
+        }
+      | string,
+    revokedAt?: string,
+    reason?: string
+  ): boolean {
+    if (typeof paramsOrId === 'string') {
+      const res = this.db
+        .prepare('UPDATE mcp_submission_sessions SET revoked_at = ?, revocation_reason = ? WHERE id = ? AND revoked_at IS NULL')
+        .run(revokedAt!, reason!, paramsOrId);
+      return res.changes > 0;
+    }
+    if (paramsOrId.sessionId) {
+      const res = this.db
+        .prepare('UPDATE mcp_submission_sessions SET revoked_at = ?, revocation_reason = ? WHERE id = ? AND revoked_at IS NULL')
+        .run(paramsOrId.revokedAt, paramsOrId.reason, paramsOrId.sessionId);
+      return res.changes > 0;
+    }
+    if (paramsOrId.authorizationId) {
+      const res = this.db
+        .prepare('UPDATE mcp_submission_sessions SET revoked_at = ?, revocation_reason = ? WHERE authorization_id = ? AND revoked_at IS NULL')
+        .run(paramsOrId.revokedAt, paramsOrId.reason, paramsOrId.authorizationId);
+      return res.changes > 0;
+    }
+    return false;
+  }
+
+  private mapMcpSubmissionSession(row: Record<string, unknown>): McpSubmissionSession {
+    return {
+      id: String(row.id),
+      authorization_id: String(row.authorization_id),
+      scope: row.scope as McpSubmissionSession['scope'],
+      issuer_identity: row.issuer_identity as McpSubmissionSession['issuer_identity'],
+      token_hash: String(row.token_hash),
+      authorization_fingerprint: String(row.authorization_fingerprint),
+      issued_at: String(row.issued_at),
+      expires_at: String(row.expires_at),
+      revoked_at: row.revoked_at != null ? String(row.revoked_at) : null,
+      revocation_reason: row.revocation_reason != null ? String(row.revocation_reason) : null,
+    };
+  }
+
+  // ==========================================
+  // Coder Submissions Quarantined Ledger (R5J4)
+  // ==========================================
+  public createCoderSubmission(submission: CoderSubmission): void {
+    this.db
+      .prepare(`
+        INSERT INTO coder_submissions (
+          id,
+          authorization_id,
+          project_id,
+          task_id,
+          task_ownership_epoch,
+          session_id,
+          schema_version,
+          authorization_status,
+          dispatched_at,
+          authority_fingerprint,
+          manager_payload_hash,
+          task_revision,
+          lifecycle_version,
+          execution_id,
+          attempt_id,
+          assignment_id,
+          selected_provider_id,
+          selected_account_id,
+          selected_resource_id,
+          manager_message_id,
+          routing_decision_id,
+          base_sha,
+          authorized_head_sha,
+          claimed_status,
+          quarantine_status,
+          summary,
+          changed_files_count,
+          tests_claimed_count,
+          blockers_count,
+          review_requested,
+          claim_content_hash,
+          canonical_envelope_hash,
+          claim_content_json,
+          canonical_envelope_json,
+          canonical_arguments_bytes,
+          submitted_at
+        ) VALUES (
+          ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+          ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+          ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+          ?, ?, ?, ?, ?, ?
+        )
+      `)
+      .run(
+        submission.id,
+        submission.authorization_id,
+        submission.project_id,
+        submission.task_id,
+        submission.task_ownership_epoch,
+        submission.session_id,
+        submission.schema_version,
+        submission.authorization_status,
+        submission.dispatched_at,
+        submission.authority_fingerprint,
+        submission.manager_payload_hash,
+        submission.task_revision,
+        submission.lifecycle_version ?? null,
+        submission.execution_id ?? null,
+        submission.attempt_id ?? null,
+        submission.assignment_id ?? null,
+        submission.selected_provider_id,
+        submission.selected_account_id ?? null,
+        submission.selected_resource_id,
+        submission.manager_message_id,
+        submission.routing_decision_id,
+        submission.base_sha,
+        submission.authorized_head_sha,
+        submission.claimed_status,
+        submission.quarantine_status,
+        submission.summary,
+        submission.changed_files_count,
+        submission.tests_claimed_count,
+        submission.blockers_count,
+        submission.review_requested,
+        submission.claim_content_hash,
+        submission.canonical_envelope_hash,
+        submission.claim_content_json,
+        submission.canonical_envelope_json,
+        submission.canonical_arguments_bytes,
+        submission.submitted_at
+      );
+  }
+
+  public getCoderSubmissionById(id: string): CoderSubmission | null {
+    const row = this.db
+      .prepare('SELECT * FROM coder_submissions WHERE id = ?')
+      .get(id) as Record<string, unknown> | undefined;
+    if (!row) return null;
+    return this.mapCoderSubmission(row);
+  }
+
+  private mapCoderSubmission(row: Record<string, unknown>): CoderSubmission {
+    return {
+      id: String(row.id),
+      authorization_id: String(row.authorization_id),
+      project_id: String(row.project_id),
+      task_id: String(row.task_id),
+      task_ownership_epoch: Number(row.task_ownership_epoch),
+      session_id: String(row.session_id),
+      schema_version: Number(row.schema_version),
+      authorization_status: String(row.authorization_status),
+      dispatched_at: String(row.dispatched_at),
+      authority_fingerprint: String(row.authority_fingerprint),
+      manager_payload_hash: String(row.manager_payload_hash),
+      task_revision: Number(row.task_revision),
+      lifecycle_version: row.lifecycle_version != null ? Number(row.lifecycle_version) : null,
+      execution_id: row.execution_id != null ? String(row.execution_id) : null,
+      attempt_id: row.attempt_id != null ? String(row.attempt_id) : null,
+      assignment_id: row.assignment_id != null ? String(row.assignment_id) : null,
+      selected_provider_id: String(row.selected_provider_id),
+      selected_account_id: row.selected_account_id != null ? String(row.selected_account_id) : null,
+      selected_resource_id: String(row.selected_resource_id),
+      manager_message_id: String(row.manager_message_id),
+      routing_decision_id: String(row.routing_decision_id),
+      base_sha: String(row.base_sha),
+      authorized_head_sha: String(row.authorized_head_sha),
+      claimed_status: String(row.claimed_status),
+      quarantine_status: 'QUARANTINED',
+      summary: String(row.summary),
+      changed_files_count: Number(row.changed_files_count),
+      tests_claimed_count: Number(row.tests_claimed_count),
+      blockers_count: Number(row.blockers_count),
+      review_requested: Number(row.review_requested),
+      claim_content_hash: String(row.claim_content_hash),
+      canonical_envelope_hash: String(row.canonical_envelope_hash),
+      claim_content_json: String(row.claim_content_json),
+      canonical_envelope_json: String(row.canonical_envelope_json),
+      canonical_arguments_bytes: Number(row.canonical_arguments_bytes),
+      submitted_at: String(row.submitted_at),
+    };
+  }
+
+  // ==========================================
+  // Coder Submission Dispositions (R5J4)
+  // ==========================================
+  public createCoderSubmissionDisposition(disp: CoderSubmissionDisposition): void {
+    this.db
+      .prepare(`
+        INSERT INTO coder_submission_dispositions (
+          id,
+          submission_id,
+          disposition_event,
+          disposition_reason,
+          actor_type,
+          actor_id,
+          disposition_metadata_json,
+          created_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+      `)
+      .run(
+        disp.id,
+        disp.submission_id,
+        disp.disposition_event,
+        disp.disposition_reason,
+        disp.actor_type,
+        disp.actor_id,
+        disp.disposition_metadata_json ?? null,
+        disp.created_at
+      );
+  }
+
+  public getCoderSubmissionDispositions(submissionId: string): CoderSubmissionDisposition[] {
+    const rows = this.db
+      .prepare('SELECT * FROM coder_submission_dispositions WHERE submission_id = ? ORDER BY created_at ASC')
+      .all(submissionId) as Record<string, unknown>[];
+    return rows.map((r) => this.mapCoderSubmissionDisposition(r));
+  }
+
+  public getInitialCoderSubmissionDisposition(submissionId: string): CoderSubmissionDisposition | null {
+    const row = this.db
+      .prepare(`
+        SELECT * FROM coder_submission_dispositions
+        WHERE submission_id = ? AND disposition_event = 'SUBMITTED' AND disposition_reason = 'INITIAL_SUBMISSION'
+      `)
+      .get(submissionId) as Record<string, unknown> | undefined;
+    if (!row) return null;
+    return this.mapCoderSubmissionDisposition(row);
+  }
+
+  private mapCoderSubmissionDisposition(row: Record<string, unknown>): CoderSubmissionDisposition {
+    return {
+      id: String(row.id),
+      submission_id: String(row.submission_id),
+      disposition_event: String(row.disposition_event),
+      disposition_reason: String(row.disposition_reason),
+      actor_type: row.actor_type as CoderSubmissionDisposition['actor_type'],
+      actor_id: String(row.actor_id),
+      disposition_metadata_json: row.disposition_metadata_json != null ? String(row.disposition_metadata_json) : null,
+      created_at: String(row.created_at),
+    };
+  }
+
+  public getDeterministicEvent(eventId: string): {
+    id: string;
+    project_id: string;
+    task_id: string | null;
+    agent_id: string | null;
+    type: string;
+    summary: string;
+    structured_payload_json: string | null;
+    timestamp: string;
+  } | null {
+    const row = this.db
+      .prepare('SELECT * FROM events WHERE id = ?')
+      .get(eventId) as Record<string, unknown> | undefined;
+    if (!row) return null;
+    return {
+      id: String(row.id),
+      project_id: String(row.project_id),
+      task_id: row.task_id != null ? String(row.task_id) : null,
+      agent_id: row.agent_id != null ? String(row.agent_id) : null,
+      type: String(row.type),
+      summary: String(row.summary),
+      structured_payload_json: row.structured_payload_json != null ? String(row.structured_payload_json) : null,
+      timestamp: String(row.timestamp),
     };
   }
 

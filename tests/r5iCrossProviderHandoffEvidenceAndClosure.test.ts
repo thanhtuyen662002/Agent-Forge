@@ -161,16 +161,24 @@ describe('R5I7 Cross-Provider Handoff Evidence and Closure Integration Suite', (
     contextBuilder = new ContextBuilderService(repo);
     handoffService = new HandoffTransferService(repo, contextBuilder, routingService);
     scanner = new ExecutionRecoveryScanner(db, repo, eventService);
-  });
+  }, 120000);
 
   afterEach(() => {
     if (db && db.open) {
-      db.close();
+      try {
+        db.close();
+      } catch (e) {
+        throw new Error(`[FIXTURE_CLEANUP_ERROR] Failed to close database: ${e instanceof Error ? e.message : String(e)}`);
+      }
     }
     if (fs.existsSync(testDir)) {
-      fs.rmSync(testDir, { recursive: true, force: true });
+      try {
+        fs.rmSync(testDir, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
+      } catch (e) {
+        throw new Error(`[FIXTURE_CLEANUP_ERROR] Failed to remove test directory: ${e instanceof Error ? e.message : String(e)}`);
+      }
     }
-  });
+  }, 120000);
 
   // Helper to seed initial static topology and predecessor fixture
   async function seedClosureTopology(options?: {
@@ -1211,20 +1219,28 @@ describe('R5I7 Cross-Provider Handoff Evidence and Closure Integration Suite', (
     const eventService2 = new EventService(repo2);
     const dispatchService2 = new ProviderDispatchService(registry, repo2, eventService2, worktreeService);
 
-    // Concurrently dispatch from connection 1 and connection 2
-    const [res1, res2] = await Promise.all([
-      dispatchService.dispatch(flow.authorizationId!),
-      dispatchService2.dispatch(flow.authorizationId!),
-    ]);
+    try {
+      // Concurrently dispatch from connection 1 and connection 2
+      const [res1, res2] = await Promise.all([
+        dispatchService.dispatch(flow.authorizationId!),
+        dispatchService2.dispatch(flow.authorizationId!),
+      ]);
 
-    db2.close();
-
-    expect(adapterB.invocationCount).toBe(1);
-    const completedCount = [res1, res2].filter((r) => r.status === 'COMPLETED').length;
-    const failedCount = [res1, res2].filter((r) => r.status === 'FAILED').length;
-    expect(completedCount).toBe(1);
-    expect(failedCount).toBe(1);
-  });
+      expect(adapterB.invocationCount).toBe(1);
+      const completedCount = [res1, res2].filter((r) => r.status === 'COMPLETED').length;
+      const failedCount = [res1, res2].filter((r) => r.status === 'FAILED').length;
+      expect(completedCount).toBe(1);
+      expect(failedCount).toBe(1);
+    } finally {
+      if (db2 && db2.open) {
+        try {
+          db2.close();
+        } catch (e) {
+          throw new Error(`[CLEANUP_ERROR] Failed to close db2 handle: ${e instanceof Error ? e.message : String(e)}`);
+        }
+      }
+    }
+  }, 60000);
 
   // 12. Spoofed adapter provenance is removed and replaced with authentic durable Provider B provenance
   it('12. Spoofed adapter provenance is removed and replaced with authentic durable Provider B provenance', async () => {

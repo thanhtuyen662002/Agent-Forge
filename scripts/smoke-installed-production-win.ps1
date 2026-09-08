@@ -354,7 +354,7 @@ repo.createProject({
   id: projectId,
   name: 'Installed Smoke Project',
   description: 'Installed smoke',
-  repository_path: 'D:/fake/installed',
+  repository_path: projectRoot,
   default_branch: 'main',
   status: 'RUNNING',
   contract: null,
@@ -571,6 +571,7 @@ class McpRpcHarness {
     this.pending = new Map();
     this.closed = false;
     this.stdoutBuffer = '';
+    this.stderrBuffer = '';
     this.exitResult = null;
 
     this.overallTimer = setTimeout(() => {
@@ -580,13 +581,20 @@ class McpRpcHarness {
     this.exitPromise = new Promise((resolve) => {
       this.child.on('exit', (code, signal) => {
         this.exitResult = { code, signal };
-        this._terminate(new Error(`CHILD_EXIT_PREMATURE: code=${code}, signal=${signal}`));
+        const errDetail = this.stderrBuffer ? ` stderr: ${this.stderrBuffer.trim()}` : '';
+        this._terminate(new Error(`CHILD_EXIT_PREMATURE: code=${code}, signal=${signal}${errDetail}`));
         resolve(this.exitResult);
       });
       this.child.on('error', (err) => {
         this._terminate(new Error(`CHILD_ERROR: ${err.message}`));
       });
     });
+
+    if (this.child.stderr) {
+      this.child.stderr.on('data', (chunk) => {
+        this.stderrBuffer += chunk.toString('utf8');
+      });
+    }
 
     this.child.stdout.on('data', (chunk) => {
       this.stdoutBuffer += chunk.toString('utf8');
@@ -771,13 +779,527 @@ const harness = new McpRpcHarness(child);
     verifyDb.close();
 
     console.log("R5J3_INSTALLED_MCP_BRIDGE_PROOF=PASS");
+
+    // R5J4: Test Coder Submission Stdio Server in Installed Environment
+    console.log("Starting R5J4 Installed Coder Submission Stdio Verification...");
+    const subAdminScript = path.join(asarPath, 'dist-electron', 'mcp', 'submissionAdmin.js');
+    if (!fs.existsSync(subAdminScript)) {
+      throw new Error("submissionAdmin.js missing in installed app.asar");
+    }
+    const subProtocolScript = path.join(asarPath, 'dist-electron', 'mcp', 'submissionProtocol.js');
+    if (!fs.existsSync(subProtocolScript)) {
+      throw new Error("submissionProtocol.js missing in installed app.asar");
+    }
+    const { deriveDeterministicEventId, canonicalJsonStringify } = require(subProtocolScript);
+    if (typeof deriveDeterministicEventId !== 'function' || typeof canonicalJsonStringify !== 'function') {
+      throw new Error("submissionProtocol exports missing deriveDeterministicEventId or canonicalJsonStringify");
+    }
+
+    const { execSync } = require('child_process');
+    const realHeadSha = execSync('git rev-parse HEAD', { cwd: projectRoot, encoding: 'utf8' }).trim().toLowerCase();
+    let realBaseSha = realHeadSha;
+    try {
+      realBaseSha = execSync('git rev-parse HEAD~1', { cwd: projectRoot, encoding: 'utf8' }).trim().toLowerCase();
+    } catch {
+      realBaseSha = realHeadSha;
+    }
+
+    const subNow = new Date().toISOString();
+    const prepDb = new Database(dbPath);
+    prepDb.prepare("UPDATE execution_authorizations SET status = 'DISPATCHED', dispatched_at = ?, execution_id = ?, repository_head_sha = ?, base_sha = ? WHERE id = ?").run(subNow, 'exec-inst-1', realHeadSha, realBaseSha, authorizationId);
+    prepDb.prepare("UPDATE tasks SET base_sha = ? WHERE id = ?").run(realBaseSha, taskId);
+    prepDb.close();
+
+    // 1. Issue first session via production admin CLI
+    const issueOut1 = execSync(`"${process.execPath}" "${subAdminScript}" issue --auth "${authorizationId}" --db "${dbPath}" --json`, {
+      env: Object.assign({}, process.env, { ELECTRON_RUN_AS_NODE: '1' }),
+      encoding: 'utf8',
+    });
+    const parsedIssue1 = JSON.parse(issueOut1);
+    const firstSessionId = parsedIssue1.session.id;
+    const firstPlaintextToken = parsedIssue1.plaintext_token;
+
+    // 2. Issue second session via production admin CLI to prove atomic replacement
+    const issueOut2 = execSync(`"${process.execPath}" "${subAdminScript}" issue --auth "${authorizationId}" --db "${dbPath}" --json`, {
+      env: Object.assign({}, process.env, { ELECTRON_RUN_AS_NODE: '1' }),
+      encoding: 'utf8',
+    });
+    const parsedIssue2 = JSON.parse(issueOut2);
+    const activeSessionId = parsedIssue2.session.id;
+    const activePlaintextToken = parsedIssue2.plaintext_token;
+
+    // Verify atomic replacement in database: first session revoked, issuer_identity = 'OWNER_LOCAL_CLI'
+    const adminCheckDb = new Database(dbPath, { readonly: true });
+    const sess1Row = adminCheckDb.prepare("SELECT * FROM mcp_submission_sessions WHERE id = ?").get(firstSessionId);
+    const sess2Row = adminCheckDb.prepare("SELECT * FROM mcp_submission_sessions WHERE id = ?").get(activeSessionId);
+    if (!sess1Row || sess1Row.revoked_at === null || sess1Row.revocation_reason !== 'SUPERSEDED_BY_NEW_SESSION') {
+      throw new Error("First session was not atomically revoked with SUPERSEDED_BY_NEW_SESSION");
+    }
+    if (sess1Row.issuer_identity !== 'OWNER_LOCAL_CLI' || sess2Row.issuer_identity !== 'OWNER_LOCAL_CLI') {
+      throw new Error("Session issuer_identity is not OWNER_LOCAL_CLI");
+    }
+    adminCheckDb.close();
+
+    // 3. Token absent from durable files and diagnostics
+    const dbBytes = fs.readFileSync(dbPath);
+    if (dbBytes.includes(Buffer.from(activePlaintextToken, 'utf8')) || dbBytes.includes(Buffer.from(firstPlaintextToken, 'utf8'))) {
+      throw new Error("Plaintext token detected in database file bytes");
+    }
+
+    // 4. Capture domain table and Git snapshots before submission
+    const preDb = new Database(dbPath, { readonly: true });
+    const preAuth = preDb.prepare("SELECT * FROM execution_authorizations WHERE id = ?").get(authorizationId);
+    const preTask = preDb.prepare("SELECT * FROM tasks WHERE id = ?").get(taskId);
+    const preAttempt = preDb.prepare("SELECT * FROM task_attempts WHERE id = ?").get(attemptId);
+    const preAssignment = preDb.prepare("SELECT * FROM agent_assignments WHERE id = ?").get(assignmentId);
+    const preProtoMsg = preDb.prepare("SELECT * FROM protocol_messages WHERE id = ?").get(managerRecordId);
+    if (!preProtoMsg || preProtoMsg.id !== managerRecordId) {
+      throw new Error("Pre-submission protocol message snapshot missing or invalid");
+    }
+    const preGitStatus = execSync('git status --porcelain', { cwd: projectRoot, encoding: 'utf8' }).trim();
+    const preGitHead = execSync('git rev-parse HEAD', { cwd: projectRoot, encoding: 'utf8' }).trim();
+    preDb.close();
+
+    // 5. Spawn stdio-submit child process
+    const subStdioScript = path.join(asarPath, 'dist-electron', 'mcp', 'stdio-submit.js');
+    if (!fs.existsSync(subStdioScript)) {
+      throw new Error("stdio-submit.js missing in installed app.asar");
+    }
+
+    const subChild = spawn(process.execPath, [subStdioScript], {
+      env: Object.assign({}, process.env, {
+        ELECTRON_RUN_AS_NODE: '1',
+        AGENTFORGE_MCP_DB_PATH: dbPath,
+        AGENTFORGE_MCP_SUBMISSION_TOKEN: activePlaintextToken,
+      }),
+      stdio: ['pipe', 'pipe', 'pipe'],
+    });
+
+    const subHarness = new McpRpcHarness(subChild);
+
+    // MCP initialize
+    const subInitRes = await subHarness.sendRequest({
+      jsonrpc: '2.0',
+      id: 10,
+      method: 'initialize',
+      params: { protocolVersion: '2024-11-05', capabilities: {}, clientInfo: { name: 'smoke-sub-installed', version: '1.0.0' } }
+    });
+    if (subInitRes.error) throw new Error("Submission initialize failed: " + JSON.stringify(subInitRes.error));
+    await subHarness.sendNotification({ jsonrpc: '2.0', method: 'notifications/initialized' });
+
+    // Exact tool discovery: tools/list returns only agentforge_submit_coder_claim
+    const toolsListRes = await subHarness.sendRequest({
+      jsonrpc: '2.0',
+      id: 11,
+      method: 'tools/list',
+      params: {}
+    });
+    if (toolsListRes.error || !toolsListRes.result?.tools) {
+      throw new Error("tools/list failed");
+    }
+    const tools = toolsListRes.result.tools;
+    if (tools.length !== 1 || tools[0].name !== 'agentforge_submit_coder_claim') {
+      throw new Error("tools/list did not return exactly agentforge_submit_coder_claim: " + JSON.stringify(tools));
+    }
+    if (!tools[0].annotations || tools[0].annotations.idempotentHint !== true || tools[0].annotations.readOnlyHint !== false) {
+      throw new Error("Tool annotations mismatch: " + JSON.stringify(tools[0].annotations));
+    }
+
+    // 6. Full-tuple submission
+    const submissionId = '00000000-0000-4000-8000-000000000002';
+    const subArgs = {
+      submission_id: submissionId,
+      authorization_id: authorizationId,
+      project_id: projectId,
+      task_id: taskId,
+      attempt_id: attemptId,
+      assignment_id: assignmentId,
+      task_ownership_epoch: 1,
+      base_sha: realBaseSha,
+      repository_head_sha: realHeadSha,
+      status: 'COMPLETED',
+      summary: 'Installed smoke claim verified',
+      changed_files: ['src/mcp/stdio-submit.ts'],
+      tests_claimed: ['smoke-sub-installed-1'],
+      blockers: [],
+      review_requested: true,
+      client_metadata: {
+        client_name: 'smoke-installed',
+        client_version: '1.0.0',
+        client_session_mode: 'CLI_EXTERNAL',
+      },
+    };
+
+    const subToolRes = await subHarness.sendRequest({
+      jsonrpc: '2.0',
+      id: 12,
+      method: 'tools/call',
+      params: {
+        name: 'agentforge_submit_coder_claim',
+        arguments: subArgs,
+      }
+    });
+
+    if (subToolRes.error || !subToolRes.result || subToolRes.result.isError) {
+      throw new Error("Submission tool call failed: " + JSON.stringify(subToolRes));
+    }
+    if (!Array.isArray(subToolRes.result.content) || subToolRes.result.content.length === 0 || subToolRes.result.content[0].type !== 'text') {
+      throw new Error("Submission response missing human-readable text item");
+    }
+    const subHumanText = subToolRes.result.content[0].text;
+    if (typeof subHumanText !== 'string' || subHumanText.length === 0) {
+      throw new Error("Submission human text item is invalid");
+    }
+    if (subHumanText.includes(activePlaintextToken) || subHumanText.includes(firstPlaintextToken) || subHumanText.includes(dbPath) || subHumanText.includes(projectRoot)) {
+      throw new Error("Submission human text exposes sensitive tokens or paths");
+    }
+    const initResult = subToolRes.result.structuredContent;
+    if (!initResult || typeof initResult !== 'object' || Array.isArray(initResult)) {
+      throw new Error("Submission structuredContent must be a non-null object");
+    }
+    const expectedSuccessKeys = ['accepted', 'canonical_envelope_hash', 'claim_content_hash', 'is_duplicate', 'quarantine_status', 'submission_id', 'submitted_at'];
+    if (JSON.stringify(Object.keys(initResult).sort()) !== JSON.stringify(expectedSuccessKeys)) {
+      throw new Error("Submission structuredContent keys mismatch: " + JSON.stringify(Object.keys(initResult).sort()));
+    }
+    if (initResult.accepted !== true) {
+      throw new Error("Submission accepted must be true");
+    }
+    if (initResult.submission_id !== submissionId) {
+      throw new Error("Submission id mismatch");
+    }
+    if (initResult.quarantine_status !== 'QUARANTINED') {
+      throw new Error("Submission quarantine_status mismatch");
+    }
+    if (typeof initResult.claim_content_hash !== 'string' || !/^[0-9a-f]{64}$/.test(initResult.claim_content_hash)) {
+      throw new Error("Submission claim_content_hash invalid format");
+    }
+    if (typeof initResult.canonical_envelope_hash !== 'string' || !/^[0-9a-f]{64}$/.test(initResult.canonical_envelope_hash)) {
+      throw new Error("Submission canonical_envelope_hash invalid format");
+    }
+    if (typeof initResult.submitted_at !== 'string' || isNaN(Date.parse(initResult.submitted_at))) {
+      throw new Error("Submission submitted_at invalid timestamp");
+    }
+    if (initResult.is_duplicate !== false) {
+      throw new Error("Initial submission is_duplicate must be false");
+    }
+
+    // 7. Row, content, envelope, hash, disposition, and event readback
+    const checkDb = new Database(dbPath, { readonly: true });
+    const subRow = checkDb.prepare("SELECT * FROM coder_submissions WHERE id = ?").get(submissionId);
+    if (!subRow) {
+      throw new Error("Coder submission row was not inserted into database");
+    }
+    if (subRow.quarantine_status !== 'QUARANTINED' || subRow.claimed_status !== 'COMPLETED' || subRow.summary !== subArgs.summary) {
+      throw new Error("Coder submission row content mismatch");
+    }
+    if (subRow.review_requested !== 1 || subRow.changed_files_count !== 1 || subRow.tests_claimed_count !== 1 || subRow.blockers_count !== 0) {
+      throw new Error("Coder submission scalar counters mismatch");
+    }
+    if (initResult.claim_content_hash !== subRow.claim_content_hash || initResult.canonical_envelope_hash !== subRow.canonical_envelope_hash) {
+      throw new Error("Structured result hashes do not match durable row");
+    }
+    if (initResult.submitted_at !== subRow.submitted_at) {
+      throw new Error("Structured result submitted_at does not match durable row");
+    }
+
+    // Disposition readback
+    const disps = checkDb.prepare("SELECT * FROM coder_submission_dispositions WHERE submission_id = ?").all(submissionId);
+    if (disps.length !== 1 || disps[0].disposition_event !== 'SUBMITTED' || disps[0].disposition_reason !== 'INITIAL_SUBMISSION') {
+      throw new Error("Initial disposition mismatch or missing");
+    }
+    if (disps[0].actor_type !== 'MCP_CLIENT' || disps[0].actor_id !== activeSessionId) {
+      throw new Error("Disposition actor mismatch");
+    }
+    if (disps[0].created_at !== subRow.submitted_at) {
+      throw new Error("Disposition created_at mismatch with durable submission timestamp");
+    }
+    const dispMeta = JSON.parse(disps[0].disposition_metadata_json);
+    if (!dispMeta || typeof dispMeta !== 'object' || Array.isArray(dispMeta)) {
+      throw new Error("Disposition metadata must be a non-null object");
+    }
+    const expectedDispMetaKeys = ['client_name', 'client_session_mode', 'client_version'];
+    if (JSON.stringify(Object.keys(dispMeta).sort()) !== JSON.stringify(expectedDispMetaKeys)) {
+      throw new Error("Disposition metadata keys mismatch");
+    }
+    if (dispMeta.client_name !== subArgs.client_metadata.client_name || dispMeta.client_version !== '1.0.0' || dispMeta.client_session_mode !== 'CLI_EXTERNAL') {
+      throw new Error("Disposition metadata values mismatch");
+    }
+    if (disps[0].disposition_metadata_json !== canonicalJsonStringify({
+      client_name: subArgs.client_metadata.client_name,
+      client_session_mode: 'CLI_EXTERNAL',
+      client_version: '1.0.0',
+    })) {
+      throw new Error("Disposition metadata JSON is not canonical");
+    }
+
+    // Deterministic event readback
+    const detEventId = deriveDeterministicEventId(submissionId);
+    const detEvent = checkDb.prepare("SELECT * FROM events WHERE id = ?").get(detEventId);
+    if (!detEvent || detEvent.type !== 'CODER_SUBMISSION_QUARANTINED') {
+      throw new Error("Deterministic event missing or wrong type");
+    }
+    if (detEvent.id !== detEventId) {
+      throw new Error("Deterministic event ID mismatch");
+    }
+    if (detEvent.project_id !== subRow.project_id || detEvent.task_id !== subRow.task_id) {
+      throw new Error("Deterministic event project/task binding mismatch");
+    }
+    if (detEvent.summary !== 'Quarantined untrusted coder claim and report') {
+      throw new Error("Deterministic event summary mismatch");
+    }
+    if (detEvent.timestamp !== subRow.submitted_at) {
+      throw new Error("Deterministic event timestamp mismatch");
+    }
+    const detPayload = JSON.parse(detEvent.structured_payload_json);
+    if (!detPayload || typeof detPayload !== 'object' || Array.isArray(detPayload)) {
+      throw new Error("Deterministic event payload must be a non-null object");
+    }
+    const expectedPayloadKeys = ['canonical_envelope_hash', 'claim_content_hash', 'claimed_status', 'submission_id', 'submitted_at'];
+    if (JSON.stringify(Object.keys(detPayload).sort()) !== JSON.stringify(expectedPayloadKeys)) {
+      throw new Error("Deterministic event structured payload keys mismatch");
+    }
+    if (detPayload.submission_id !== submissionId ||
+        detPayload.claim_content_hash !== subRow.claim_content_hash ||
+        detPayload.canonical_envelope_hash !== subRow.canonical_envelope_hash ||
+        detPayload.claimed_status !== 'COMPLETED' ||
+        detPayload.submitted_at !== subRow.submitted_at) {
+      throw new Error("Deterministic event structured payload mismatch");
+    }
+    if (detEvent.structured_payload_json !== canonicalJsonStringify({
+      canonical_envelope_hash: subRow.canonical_envelope_hash,
+      claim_content_hash: subRow.claim_content_hash,
+      claimed_status: 'COMPLETED',
+      submission_id: submissionId,
+      submitted_at: subRow.submitted_at,
+    })) {
+      throw new Error("Deterministic event structured payload JSON is not canonical");
+    }
+
+    const totalSubRowsBeforeReplay = checkDb.prepare("SELECT COUNT(*) as c FROM coder_submissions").get().c;
+    const totalDispRowsBeforeReplay = checkDb.prepare("SELECT COUNT(*) as c FROM coder_submission_dispositions").get().c;
+    const totalEventRowsBeforeReplay = checkDb.prepare("SELECT COUNT(*) as c FROM events").get().c;
+    checkDb.close();
+
+    // 8. Exact idempotent replay with no new rows
+    const replayToolRes = await subHarness.sendRequest({
+      jsonrpc: '2.0',
+      id: 13,
+      method: 'tools/call',
+      params: {
+        name: 'agentforge_submit_coder_claim',
+        arguments: subArgs,
+      }
+    });
+    if (replayToolRes.error || !replayToolRes.result || replayToolRes.result.isError) {
+      throw new Error("Replay tool call failed: " + JSON.stringify(replayToolRes));
+    }
+    if (!Array.isArray(replayToolRes.result.content) || replayToolRes.result.content.length === 0 || replayToolRes.result.content[0].type !== 'text') {
+      throw new Error("Replay response missing human-readable text item");
+    }
+    const replayHumanText = replayToolRes.result.content[0].text;
+    if (typeof replayHumanText !== 'string' || replayHumanText.length === 0) {
+      throw new Error("Replay human text item is invalid");
+    }
+    if (replayHumanText.includes(activePlaintextToken) || replayHumanText.includes(firstPlaintextToken) || replayHumanText.includes(dbPath) || replayHumanText.includes(projectRoot)) {
+      throw new Error("Replay human text exposes sensitive tokens or paths");
+    }
+    const replayResult = replayToolRes.result.structuredContent;
+    if (!replayResult || typeof replayResult !== 'object' || Array.isArray(replayResult)) {
+      throw new Error("Replay structuredContent must be a non-null object");
+    }
+    if (JSON.stringify(Object.keys(replayResult).sort()) !== JSON.stringify(expectedSuccessKeys)) {
+      throw new Error("Replay structuredContent keys mismatch");
+    }
+    if (replayResult.accepted !== true) {
+      throw new Error("Replay accepted must be true");
+    }
+    if (replayResult.is_duplicate !== true) {
+      throw new Error("Replay was not recognized as duplicate: " + JSON.stringify(replayResult));
+    }
+    if (replayResult.submission_id !== initResult.submission_id ||
+        replayResult.quarantine_status !== initResult.quarantine_status ||
+        replayResult.claim_content_hash !== initResult.claim_content_hash ||
+        replayResult.canonical_envelope_hash !== initResult.canonical_envelope_hash ||
+        replayResult.submitted_at !== initResult.submitted_at) {
+      throw new Error("Replay structured fields mismatch with initial submission");
+    }
+
+    const replayCheckDb = new Database(dbPath, { readonly: true });
+    const totalSubRowsAfter = replayCheckDb.prepare("SELECT COUNT(*) as c FROM coder_submissions").get().c;
+    const totalDispRowsAfter = replayCheckDb.prepare("SELECT COUNT(*) as c FROM coder_submission_dispositions").get().c;
+    const totalEventRowsAfter = replayCheckDb.prepare("SELECT COUNT(*) as c FROM events").get().c;
+    if (totalSubRowsAfter !== totalSubRowsBeforeReplay || totalDispRowsAfter !== totalDispRowsBeforeReplay || totalEventRowsAfter !== totalEventRowsBeforeReplay) {
+      throw new Error("Replay mutated database rows");
+    }
+
+    // Zero mutation check on domain tables and Git
+    const postAuth = replayCheckDb.prepare("SELECT * FROM execution_authorizations WHERE id = ?").get(authorizationId);
+    const postTask = replayCheckDb.prepare("SELECT * FROM tasks WHERE id = ?").get(taskId);
+    const postAttempt = replayCheckDb.prepare("SELECT * FROM task_attempts WHERE id = ?").get(attemptId);
+    const postAssignment = replayCheckDb.prepare("SELECT * FROM agent_assignments WHERE id = ?").get(assignmentId);
+    const postProtoMsg = replayCheckDb.prepare("SELECT * FROM protocol_messages WHERE id = ?").get(managerRecordId);
+    if (!postProtoMsg || postProtoMsg.id !== managerRecordId) {
+      throw new Error("Post-replay protocol message snapshot missing or invalid");
+    }
+    replayCheckDb.close();
+
+    if (JSON.stringify(postAuth) !== JSON.stringify(preAuth)) throw new Error("Execution authorization was mutated");
+    if (JSON.stringify(postTask) !== JSON.stringify(preTask)) throw new Error("Task was mutated");
+    if (JSON.stringify(postAttempt) !== JSON.stringify(preAttempt)) throw new Error("Task attempt was mutated");
+    if (JSON.stringify(postAssignment) !== JSON.stringify(preAssignment)) throw new Error("Agent assignment was mutated");
+    if (JSON.stringify(postProtoMsg) !== JSON.stringify(preProtoMsg)) throw new Error("Protocol message was mutated");
+
+    const postGitStatus = execSync('git status --porcelain', { cwd: projectRoot, encoding: 'utf8' }).trim();
+    const postGitHead = execSync('git rev-parse HEAD', { cwd: projectRoot, encoding: 'utf8' }).trim();
+    if (postGitStatus !== preGitStatus || postGitHead !== preGitHead) {
+      throw new Error("Git working tree or HEAD was mutated");
+    }
+
+    // 9. Revoked token refusal
+    execSync(`"${process.execPath}" "${subAdminScript}" revoke --auth "${authorizationId}" --db "${dbPath}" --json`, {
+      env: Object.assign({}, process.env, { ELECTRON_RUN_AS_NODE: '1' }),
+      encoding: 'utf8',
+    });
+
+    const revokedSubRes = await subHarness.sendRequest({
+      jsonrpc: '2.0',
+      id: 14,
+      method: 'tools/call',
+      params: {
+        name: 'agentforge_submit_coder_claim',
+        arguments: Object.assign({}, subArgs, { submission_id: '00000000-0000-4000-8000-000000000009' }),
+      }
+    });
+    if (!revokedSubRes.result || revokedSubRes.result.isError !== true) {
+      throw new Error("Submission with revoked session did not return isError === true");
+    }
+    if (!Array.isArray(revokedSubRes.result.content) || revokedSubRes.result.content.length === 0 || revokedSubRes.result.content[0].type !== 'text') {
+      throw new Error("Revoked response missing human-readable text item");
+    }
+    const revokedHumanText = revokedSubRes.result.content[0].text;
+    if (revokedHumanText.includes(activePlaintextToken) || revokedHumanText.includes(firstPlaintextToken) || revokedHumanText.includes(dbPath) || revokedHumanText.includes(projectRoot)) {
+      throw new Error("Revoked response text exposed sensitive tokens or paths");
+    }
+    const revokedResult = revokedSubRes.result.structuredContent;
+    if (!revokedResult || typeof revokedResult !== 'object' || Array.isArray(revokedResult)) {
+      throw new Error("Revoked structuredContent must be a non-null object");
+    }
+    const expectedRevokedKeys = ['accepted', 'error_code', 'message', 'retryable'];
+    if (JSON.stringify(Object.keys(revokedResult).sort()) !== JSON.stringify(expectedRevokedKeys)) {
+      throw new Error("Revoked structuredContent keys mismatch");
+    }
+    if (revokedResult.accepted !== false) {
+      throw new Error("Revoked accepted must be false");
+    }
+    if (revokedResult.error_code !== 'MCP_SESSION_REVOKED') {
+      throw new Error("Revoked error_code mismatch: " + revokedResult.error_code);
+    }
+    if (revokedResult.message !== 'Submission session has been revoked') {
+      throw new Error("Revoked message mismatch");
+    }
+    if (revokedResult.retryable !== false) {
+      throw new Error("Revoked retryable must be false");
+    }
+
+    const postRevokeDb = new Database(dbPath, { readonly: true });
+    const totalSubAfterRevoke = postRevokeDb.prepare("SELECT COUNT(*) as c FROM coder_submissions").get().c;
+    const totalDispAfterRevoke = postRevokeDb.prepare("SELECT COUNT(*) as c FROM coder_submission_dispositions").get().c;
+    const totalEventAfterRevoke = postRevokeDb.prepare("SELECT COUNT(*) as c FROM events").get().c;
+    postRevokeDb.close();
+    if (totalSubAfterRevoke !== totalSubRowsAfter || totalDispAfterRevoke !== totalDispRowsAfter || totalEventAfterRevoke !== totalEventRowsAfter) {
+      throw new Error("Revoked submission mutated rows");
+    }
+
+    // 10. Clean EOF exit with code 0 and database unlock
+    const subExitRes = await subHarness.close(4000);
+    if (subExitRes.code !== 0) {
+      throw new Error("Expected submission stdio exit code 0, got " + subExitRes.code);
+    }
+    if (subExitRes.signal !== null) {
+      throw new Error("Expected submission stdio exit signal null, got " + subExitRes.signal);
+    }
+    const unlockCheckDb = new Database(dbPath);
+    unlockCheckDb.close();
+
+    // 11. Handled SIGINT and SIGTERM exit/cleanup using bounded event-driven harnesses
+    const signalPreload = path.join(path.dirname(dbPath), 'signal_preload.js');
+    const signalCode = "if (process.send) { process.on('message', (m) => { if (m === 'SIGINT') process.emit('SIGINT'); if (m === 'SIGTERM') process.emit('SIGTERM'); }); }\n";
+    fs.writeFileSync(signalPreload, signalCode, 'utf8');
+
+    const preloadReadback = fs.readFileSync(signalPreload, 'utf8');
+    if (!preloadReadback.endsWith('\n') || preloadReadback.includes('\\n')) {
+      throw new Error("signal_preload.js line terminator invalid or contains literal \\n");
+    }
+    if (!preloadReadback.includes("process.emit('SIGINT')") || !preloadReadback.includes("process.emit('SIGTERM')")) {
+      throw new Error("signal_preload.js missing intended IPC-to-signal bridge");
+    }
+    if (preloadReadback.includes(activePlaintextToken) || preloadReadback.includes(firstPlaintextToken) || preloadReadback.includes(dbPath) || preloadReadback.includes(projectRoot)) {
+      throw new Error("signal_preload.js contains sensitive tokens or paths");
+    }
+    const vm = require('vm');
+    new vm.Script(preloadReadback);
+
+    const testSignalExit = async (sig) => {
+      let sigStderr = '';
+      let sigStdout = '';
+      const sigChild = spawn(process.execPath, [subStdioScript], {
+        env: Object.assign({}, process.env, {
+          ELECTRON_RUN_AS_NODE: '1',
+          NODE_OPTIONS: `-r "${signalPreload.replace(/\\/g, '/')}"`,
+          AGENTFORGE_MCP_DB_PATH: dbPath,
+          AGENTFORGE_MCP_SUBMISSION_TOKEN: activePlaintextToken,
+        }),
+        stdio: ['pipe', 'pipe', 'pipe', 'ipc'],
+      });
+      sigChild.stderr.on('data', (d) => { sigStderr += d.toString(); });
+      sigChild.stdout.on('data', (d) => { sigStdout += d.toString(); });
+
+      const sigHarness = new McpRpcHarness(sigChild);
+      const sigInitRes = await sigHarness.sendRequest({
+        jsonrpc: '2.0',
+        id: 20,
+        method: 'initialize',
+        params: { protocolVersion: '2024-11-05', capabilities: {}, clientInfo: { name: 'sig-test', version: '1.0.0' } }
+      });
+      if (sigInitRes.error) throw new Error(`${sig} initialize failed`);
+
+      const exitP = new Promise((resolve, reject) => {
+        const timer = setTimeout(() => {
+          try { sigChild.kill(); } catch (killErr) { void killErr; }
+          reject(new Error(sig + " shutdown timeout"));
+        }, 4000);
+        sigChild.on('exit', (code, signal) => {
+          clearTimeout(timer);
+          resolve({ code, signal });
+        });
+      });
+      if (process.platform === 'win32' && sigChild.send) {
+        sigChild.send(sig);
+      } else {
+        sigChild.kill(sig);
+      }
+      const res = await exitP;
+      if (res.code !== 0) throw new Error(`${sig} exit code was ${res.code}`);
+      if (res.signal !== null) throw new Error(`${sig} exit signal was ${res.signal}`);
+      if (sigStderr.includes(activePlaintextToken) || sigStderr.includes(firstPlaintextToken)) {
+        throw new Error(`${sig} stderr exposed sensitive tokens`);
+      }
+      const chkDb = new Database(dbPath);
+      chkDb.close();
+    };
+
+    await testSignalExit('SIGINT');
+    await testSignalExit('SIGTERM');
+
+    console.log("R5J4_INSTALLED_MCP_SUBMISSION_PROOF=PASS");
     process.exit(0);
   } catch (err) {
-    console.error("R5J3_INSTALLED_MCP_BRIDGE_PROOF_ERROR: " + (err instanceof Error ? err.stack : String(err)));
+    const errMsg = err instanceof Error ? err.message : String(err);
+    console.error("R5J4_INSTALLED_MCP_SUBMISSION_PROOF_ERROR: " + errMsg.replace(/af-[a-zA-Z0-9_-]+/g, '[REDACTED_TOKEN]'));
     try {
-      child.kill('SIGKILL');
+      if (child && !child.killed) child.kill();
     } catch (killErr) {
-      console.error("R5J3_CHILD_KILL_ERROR: " + (killErr instanceof Error ? killErr.message : String(killErr)));
+      void killErr;
     }
     process.exit(1);
   }
@@ -831,7 +1353,7 @@ const harness = new McpRpcHarness(child);
   Write-Host "Installed MCP Proof Output:"
   Write-Host $mcpStdout
 
-  if ($mcpProc.ExitCode -ne 0 -or -not ($mcpStdout -match "R5J3_INSTALLED_MCP_BRIDGE_PROOF=PASS")) {
+  if ($mcpProc.ExitCode -ne 0 -or -not ($mcpStdout -match "R5J3_INSTALLED_MCP_BRIDGE_PROOF=PASS") -or -not ($mcpStdout -match "R5J4_INSTALLED_MCP_SUBMISSION_PROOF=PASS")) {
     throw "Installed MCP bridge verification failed (exit code $($mcpProc.ExitCode)): $mcpStderr"
   }
 

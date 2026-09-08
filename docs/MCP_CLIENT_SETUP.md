@@ -7,10 +7,10 @@ This document describes the operator setup, configuration generation, session li
 ## 1. Preconditions & Execution Tiers
 
 ### System Preconditions
-- **AgentForge Version**: `0.1.0` or higher (capability schema version 2).
-- **Database**: SQLite database initialized with migrations up to version 21 (`verifyMigration21SchemaAuthority`).
+- **AgentForge Version**: `0.1.0` or higher (capability schema version 2, database migration 22).
+- **Database**: SQLite database initialized with migrations up to version 22 (`verifyMigration22SchemaAuthority`).
 - **Authorization State**: An existing, valid `ExecutionAuthorization` record with status `AUTHORIZED` bound to a specific project, task, and task attempt.
-- **Session Authority**: Short-lived, cryptographic session token issued through `sessionAdmin.js issue` or `McpSessionAuthorityService`.
+- **Session Authority**: Short-lived, cryptographic session token issued through `sessionAdmin.js issue` (`AUTHORIZED_CONTEXT_READ` scope) or `submissionAdmin.js issue` (`CODER_SUBMISSION` scope).
 
 ### Supported Windows Execution Tiers
 1. **Developer Tier (Host Node.js)**
@@ -262,3 +262,41 @@ Operators must observe the following immutable security rules:
 - **Symptom**: File is locked after client shutdown.
 - **Cause**: Child process did not receive clean EOF or SIGINT/SIGTERM.
 - **Remedy**: Terminate lingering child processes. AgentForge stdio server performs clean SQLite close upon EOF (`stdin.end()`) or `SIGINT`/`SIGTERM`.
+
+---
+
+## 9. Durable Coder Submission Authority (`agentforge-submit`)
+
+R5J4 introduces a dedicated, separate MCP stdio surface and credential scope for ingesting untrusted coder reports and execution claims into an append-only quarantined ledger.
+
+### Architectural Boundaries
+1. **Isolated Submission Surface**: `agentforge-submit` is a separate stdio process (`stdio-submit.js`), entirely decoupled from `agentforge` context read (`stdio.js`).
+2. **Dedicated Tool**: Exposes exactly one tool: `agentforge_submit_coder_claim`. Zero resources and zero prompts are advertised.
+3. **Dedicated Credential Scope**: Requires tokens with scope `CODER_SUBMISSION` (prefixed with `af-sub-`). Tokens from `mcp_client_sessions` (`af-mcp-`) fail closed with `INVALID_SUBMISSION_TOKEN`.
+4. **Quarantined Ledger**: Ingested claims are committed to `coder_submissions` and `coder_submission_dispositions` with initial disposition status `QUARANTINED`. Database triggers forbid any `UPDATE` or `DELETE`.
+
+### Configuration Generation
+```powershell
+# Developer checkout
+node dist-electron/mcp/submissionAdmin.js configure-client --client cursor [--db <absolute-path>] [--json]
+
+# Packaged / Installed executable
+$env:ELECTRON_RUN_AS_NODE = "1"
+& "C:\Path\To\AgentForge.exe" "C:\Path\To\resources\app.asar\dist-electron\mcp\submissionAdmin.js" configure-client --client cursor --json
+$env:ELECTRON_RUN_AS_NODE = $null
+```
+
+> [!SECURITY]
+> The `--token` flag is explicitly forbidden in `submissionAdmin configure-client` to prevent plaintext credential leakage into shell command history. The command always emits the literal placeholder `<OPERATOR_SUBMISSION_TOKEN_REQUIRED>`.
+
+### Session Issuance & Revocation
+```powershell
+# Issue a submission token (atomically replaces any unrevoked session for the authorization)
+node dist-electron/mcp/submissionAdmin.js issue --db "C:\AgentForge\database\agent-forge.db" --auth "auth-12345" --ttl 3600 --json
+
+# Revoke by session ID
+node dist-electron/mcp/submissionAdmin.js revoke --db "C:\AgentForge\database\agent-forge.db" --session "sess-67890"
+
+# Revoke by authorization ID
+node dist-electron/mcp/submissionAdmin.js revoke --db "C:\AgentForge\database\agent-forge.db" --auth "auth-12345"
+```
