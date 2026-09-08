@@ -78,6 +78,10 @@ export class VerificationService {
     private artifactStore: ArtifactStore
   ) {}
 
+  public getArtifactStore(): ArtifactStore {
+    return this.artifactStore;
+  }
+
   public async runTests(
     projectId: string,
     taskId: string,
@@ -181,6 +185,85 @@ export class VerificationService {
     });
 
     // 4. Parse test results & metrics
+    const stdout = result.stdout;
+    const stderr = result.stderr;
+    const combinedOutput = `=== STDOUT ===\n${stdout}\n\n=== STDERR ===\n${stderr}`;
+
+    const evidenceId = crypto.randomUUID();
+    const evidence = this.artifactStore.store(
+      evidenceId,
+      projectId,
+      taskId,
+      attemptId,
+      'TEST_RESULT',
+      `Test Execution (${commandName}): Exit Code ${result.exitCode}`,
+      combinedOutput,
+      'text/plain'
+    );
+    this.repo.createEvidence(evidence);
+
+    const metrics = parseTestMetrics(stdout, result.exitCode);
+
+    const testRun: TestRun = {
+      id: crypto.randomUUID(),
+      task_id: taskId,
+      command: fullCommandStr,
+      passed_count: metrics.passedCount,
+      failed_count: metrics.failedCount,
+      skipped_count: metrics.skippedCount,
+      duration_ms: result.durationMs,
+      exit_code: result.exitCode,
+      evidence_id: evidenceId,
+      created_at: new Date().toISOString(),
+    };
+
+    this.repo.createTestRun(testRun);
+    return testRun;
+  }
+
+  public async runTestsWithFrozenCommand(
+    projectId: string,
+    taskId: string,
+    attemptId: string | null,
+    repoPath: string,
+    frozenCommand: {
+      executable: string;
+      args: string[];
+      timeout_ms?: number;
+      name?: string;
+    }
+  ): Promise<TestRun> {
+    const executable = frozenCommand.executable;
+    const args = frozenCommand.args;
+    const timeoutMs = frozenCommand.timeout_ms || 120000;
+    const commandName = frozenCommand.name || 'Frozen Authorization Test Suite';
+    const fullCommandStr = `${executable} ${args.join(' ')}`;
+
+    // 1. PolicyService execution gate
+    const policy = PolicyService.evaluateProcessExecution(executable, args, false);
+    if (!policy.allowed) {
+      return this.recordFailure(
+        projectId,
+        taskId,
+        attemptId,
+        fullCommandStr,
+        `Verification denied by PolicyService: ${policy.reason} (${policy.decision})`
+      );
+    }
+
+    // 2. Execute with ProcessRunner, persisting process output evidence
+    const result = await ProcessRunner.execute({
+      executable,
+      args,
+      cwd: repoPath,
+      timeoutMs,
+      repo: this.repo,
+      artifactStore: this.artifactStore,
+      projectId,
+      taskId,
+    });
+
+    // 3. Parse test results & metrics
     const stdout = result.stdout;
     const stderr = result.stderr;
     const combinedOutput = `=== STDOUT ===\n${stdout}\n\n=== STDERR ===\n${stderr}`;

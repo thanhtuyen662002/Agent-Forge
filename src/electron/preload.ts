@@ -94,10 +94,36 @@ export interface OrchestratorApi {
       BUILD?: string | null;
     };
   }) => Promise<any>;
-}
+
+  // R5J5: Quarantined Submissions Adjudication
+  listQuarantinedSubmissions: (data?: {
+    projectId?: string;
+    taskId?: string;
+    limit?: number;
+    offset?: number;
+    reverse?: boolean;
+  }) => Promise<any>;
+  inspectQuarantinedSubmission: (data: { submissionId: string }) => Promise<any>;
+  admitQuarantinedSubmission: (data: { requestId: string; submissionId: string }) => Promise<any>;
+  rejectQuarantinedSubmission: (data: { requestId: string; submissionId: string; reason: string }) => Promise<any>;
+  supersedeQuarantinedSubmission: (data: {
+    requestId: string;
+    submissionId: string;
+    replacementSubmissionId: string;
+    reason: string;
+  }) => Promise<any>;
+  resumeAdmittedSubmission: (data: { requestId: string; submissionId: string; lifecycleVersion?: number }) => Promise<any>;
+  acknowledgeRecoveryFencedSubmission: (data: {
+    requestId: string;
+    submissionId: string;
+    lifecycleVersion?: number;
+    decision: 'RETRY' | 'CANCEL';
+  }) => Promise<any>;
+};
 
 const api: OrchestratorApi = {
   selectRepositoryDirectory: () => ipcRenderer.invoke('dialog:selectRepository'),
+
   getProjects: () => ipcRenderer.invoke('project:list'),
   createProject: (data) => ipcRenderer.invoke('project:create', data),
   importContract: (data) => ipcRenderer.invoke('project:importContract', data),
@@ -147,6 +173,14 @@ const api: OrchestratorApi = {
     ipcRenderer.invoke('verification:getCommands', { projectId }),
   saveVerificationCommands: (data) =>
     ipcRenderer.invoke('verification:saveCommands', data),
+
+  listQuarantinedSubmissions: (data) => ipcRenderer.invoke('submissions:list', data),
+  inspectQuarantinedSubmission: (data) => ipcRenderer.invoke('submissions:inspect', data),
+  admitQuarantinedSubmission: (data) => ipcRenderer.invoke('submissions:admit', data),
+  rejectQuarantinedSubmission: (data) => ipcRenderer.invoke('submissions:reject', data),
+  supersedeQuarantinedSubmission: (data) => ipcRenderer.invoke('submissions:supersede', data),
+  resumeAdmittedSubmission: (data) => ipcRenderer.invoke('submissions:resume', data),
+  acknowledgeRecoveryFencedSubmission: (data) => ipcRenderer.invoke('submissions:acknowledgeFenced', data),
 };
 
 contextBridge.exposeInMainWorld('orchestrator', api);

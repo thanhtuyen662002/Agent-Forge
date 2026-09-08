@@ -216,3 +216,71 @@ export const SaveVerificationCommandsIpcSchema = z
   })
   .strict();
 export type SaveVerificationCommandsIpc = z.infer<typeof SaveVerificationCommandsIpcSchema>;
+
+// ==========================================
+// R5J5: Quarantined Submission Adjudication Schemas
+// ==========================================
+
+export const ListQuarantinedSubmissionsIpcSchema = z
+  .object({
+    projectId: z.string().min(1).optional(),
+    taskId: z.string().min(1).optional(),
+    limit: z.number().int().min(1).max(100).optional().default(50),
+    offset: z.number().int().min(0).optional().default(0),
+    reverse: z.boolean().optional().default(false),
+  })
+  .strict();
+export type ListQuarantinedSubmissionsIpc = z.infer<typeof ListQuarantinedSubmissionsIpcSchema>;
+
+export const InspectQuarantinedSubmissionIpcSchema = z
+  .object({
+    submissionId: z.string().uuid('A valid UUID submission ID is required'),
+  })
+  .strict();
+export type InspectQuarantinedSubmissionIpc = z.infer<typeof InspectQuarantinedSubmissionIpcSchema>;
+
+export const AdmitQuarantinedSubmissionIpcSchema = z
+  .object({
+    requestId: z.string().uuid('A valid UUID request ID is required'),
+    submissionId: z.string().uuid('A valid UUID submission ID is required'),
+  })
+  .strict();
+export type AdmitQuarantinedSubmissionIpc = z.infer<typeof AdmitQuarantinedSubmissionIpcSchema>;
+
+export const RejectQuarantinedSubmissionIpcSchema = z
+  .object({
+    requestId: z.string().uuid('A valid UUID request ID is required'),
+    submissionId: z.string().uuid('A valid UUID submission ID is required'),
+    reason: z.string().min(1, 'Reason is required').max(1000),
+  })
+  .strict();
+export type RejectQuarantinedSubmissionIpc = z.infer<typeof RejectQuarantinedSubmissionIpcSchema>;
+
+export const SupersedeQuarantinedSubmissionIpcSchema = z
+  .object({
+    requestId: z.string().uuid('A valid UUID request ID is required'),
+    submissionId: z.string().uuid('A valid UUID submission ID is required'),
+    replacementSubmissionId: z.string().uuid('A valid UUID replacement submission ID is required'),
+    reason: z.string().min(1, 'Reason is required').max(1000),
+  })
+  .strict();
+export type SupersedeQuarantinedSubmissionIpc = z.infer<typeof SupersedeQuarantinedSubmissionIpcSchema>;
+
+export const ResumeAdmittedSubmissionIpcSchema = z
+  .object({
+    requestId: z.string().uuid('A valid UUID request ID is required'),
+    submissionId: z.string().uuid('A valid UUID submission ID is required'),
+    lifecycleVersion: z.number().int().positive().optional(),
+  })
+  .strict();
+export type ResumeAdmittedSubmissionIpc = z.infer<typeof ResumeAdmittedSubmissionIpcSchema>;
+
+export const AcknowledgeRecoveryFencedIpcSchema = z
+  .object({
+    requestId: z.string().uuid('A valid UUID request ID is required'),
+    submissionId: z.string().uuid('A valid UUID submission ID is required'),
+    lifecycleVersion: z.number().int().positive().optional(),
+    decision: z.enum(['RETRY', 'CANCEL']),
+  })
+  .strict();
+export type AcknowledgeRecoveryFencedIpc = z.infer<typeof AcknowledgeRecoveryFencedIpcSchema>;

@@ -1689,6 +1689,226 @@ const ALL_MIGRATIONS_LIST: Migration[] = [
       `);
     },
   },
+  {
+    version: 23,
+    name: '023_r5j_quarantined_submission_adjudication_and_verification_admission',
+    up: (db: Database.Database) => {
+      db.exec(`
+        -- 1. Coder Submission Adjudications Table
+        CREATE TABLE coder_submission_adjudications (
+          id TEXT PRIMARY KEY CHECK (
+            length(id) = 36 AND
+            id GLOB '[0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]-[0-9a-f][0-9a-f][0-9a-f][0-9a-f]-4[0-9a-f][0-9a-f][0-9a-f]-[89ab][0-9a-f][0-9a-f][0-9a-f]-[0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]'
+          ),
+          request_id TEXT NOT NULL UNIQUE CHECK (
+            length(request_id) = 36 AND
+            request_id GLOB '[0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]-[0-9a-f][0-9a-f][0-9a-f][0-9a-f]-4[0-9a-f][0-9a-f][0-9a-f]-[89ab][0-9a-f][0-9a-f][0-9a-f]-[0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]'
+          ),
+          submission_id TEXT NOT NULL REFERENCES coder_submissions(id) ON DELETE RESTRICT,
+          authorization_id TEXT NOT NULL REFERENCES execution_authorizations(id) ON DELETE RESTRICT,
+          project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE RESTRICT,
+          task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE RESTRICT,
+          attempt_id TEXT NOT NULL REFERENCES task_attempts(id) ON DELETE RESTRICT,
+          assignment_id TEXT NOT NULL REFERENCES agent_assignments(id) ON DELETE RESTRICT,
+          task_ownership_epoch INTEGER NOT NULL CHECK (task_ownership_epoch > 0),
+          action TEXT NOT NULL CHECK (action IN ('ADMIT_VERIFICATION', 'REJECT', 'SUPERSEDE')),
+          status TEXT NOT NULL CHECK (status IN ('ADMITTED', 'VERIFYING', 'VERIFIED', 'VERIFICATION_FAILED', 'RECOVERY_FENCED', 'REJECTED', 'SUPERSEDED')),
+          lifecycle_version INTEGER NOT NULL CHECK (lifecycle_version >= 1),
+          authority_snapshot_json TEXT NOT NULL CHECK (
+            json_valid(authority_snapshot_json) = 1 AND
+            json_type(authority_snapshot_json) = 'object'
+          ),
+          authority_snapshot_hash TEXT NOT NULL CHECK (
+            length(authority_snapshot_hash) = 64 AND
+            authority_snapshot_hash GLOB '[0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]'
+          ),
+          verification_commands_json TEXT NULL CHECK (
+            verification_commands_json IS NULL OR (
+              json_valid(verification_commands_json) = 1 AND
+              json_type(verification_commands_json) = 'object'
+            )
+          ),
+          verification_commands_hash TEXT NULL CHECK (
+            verification_commands_hash IS NULL OR (
+              length(verification_commands_hash) = 64 AND
+              verification_commands_hash GLOB '[0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]'
+            )
+          ),
+          workspace_snapshot_before_json TEXT NULL CHECK (
+            workspace_snapshot_before_json IS NULL OR (
+              json_valid(workspace_snapshot_before_json) = 1 AND
+              json_type(workspace_snapshot_before_json) = 'object'
+            )
+          ),
+          workspace_snapshot_before_hash TEXT NULL CHECK (
+            workspace_snapshot_before_hash IS NULL OR (
+              length(workspace_snapshot_before_hash) = 64 AND
+              workspace_snapshot_before_hash GLOB '[0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]'
+            )
+          ),
+          verification_execution_id TEXT NULL,
+          protocol_message_id TEXT NULL REFERENCES protocol_messages(id) ON DELETE SET NULL,
+          test_run_id TEXT NULL REFERENCES test_runs(id) ON DELETE SET NULL,
+          git_status_evidence_id TEXT NULL REFERENCES evidence(id) ON DELETE SET NULL,
+          git_diff_evidence_id TEXT NULL REFERENCES evidence(id) ON DELETE SET NULL,
+          failure_code TEXT NULL,
+          failure_json TEXT NULL CHECK (
+            failure_json IS NULL OR (
+              json_valid(failure_json) = 1 AND
+              json_type(failure_json) = 'object'
+            )
+          ),
+          created_at TEXT NOT NULL CHECK (
+            length(created_at) = 24 AND
+            created_at GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9].[0-9][0-9][0-9]Z' AND
+            unixepoch(created_at) IS NOT NULL AND
+            strftime('%Y-%m-%dT%H:%M:%fZ', created_at) = created_at
+          ),
+          verification_started_at TEXT NULL CHECK (
+            verification_started_at IS NULL OR (
+              length(verification_started_at) = 24 AND
+              verification_started_at GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9].[0-9][0-9][0-9]Z' AND
+              unixepoch(verification_started_at) IS NOT NULL AND
+              strftime('%Y-%m-%dT%H:%M:%fZ', verification_started_at) = verification_started_at AND
+              verification_started_at >= created_at
+            )
+          ),
+          completed_at TEXT NULL CHECK (
+            completed_at IS NULL OR (
+              length(completed_at) = 24 AND
+              completed_at GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9].[0-9][0-9][0-9]Z' AND
+              unixepoch(completed_at) IS NOT NULL AND
+              strftime('%Y-%m-%dT%H:%M:%fZ', completed_at) = completed_at AND
+              completed_at >= created_at
+            )
+          ),
+          recovery_fenced_at TEXT NULL CHECK (
+            recovery_fenced_at IS NULL OR (
+              length(recovery_fenced_at) = 24 AND
+              recovery_fenced_at GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9].[0-9][0-9][0-9]Z' AND
+              unixepoch(recovery_fenced_at) IS NOT NULL AND
+              strftime('%Y-%m-%dT%H:%M:%fZ', recovery_fenced_at) = recovery_fenced_at AND
+              recovery_fenced_at >= created_at
+            )
+          ),
+          CHECK (
+            (action = 'ADMIT_VERIFICATION' AND verification_commands_json IS NOT NULL AND verification_commands_hash IS NOT NULL) OR
+            (action IN ('REJECT', 'SUPERSEDE') AND verification_commands_json IS NULL AND verification_commands_hash IS NULL)
+          ),
+          CHECK (
+            (status = 'ADMITTED' AND verification_started_at IS NULL AND completed_at IS NULL AND recovery_fenced_at IS NULL AND verification_execution_id IS NULL) OR
+            (status = 'VERIFYING' AND verification_started_at IS NOT NULL AND completed_at IS NULL AND recovery_fenced_at IS NULL AND verification_execution_id IS NOT NULL AND workspace_snapshot_before_json IS NOT NULL AND workspace_snapshot_before_hash IS NOT NULL) OR
+            (status = 'VERIFIED' AND verification_started_at IS NOT NULL AND completed_at IS NOT NULL AND recovery_fenced_at IS NULL AND test_run_id IS NOT NULL AND git_status_evidence_id IS NOT NULL AND git_diff_evidence_id IS NOT NULL) OR
+            (status = 'VERIFICATION_FAILED' AND completed_at IS NOT NULL AND recovery_fenced_at IS NULL AND failure_code IS NOT NULL) OR
+            (status = 'RECOVERY_FENCED' AND recovery_fenced_at IS NOT NULL AND failure_code IS NOT NULL) OR
+            (status IN ('REJECTED', 'SUPERSEDED') AND completed_at IS NOT NULL AND recovery_fenced_at IS NULL)
+          )
+        );
+
+        CREATE INDEX idx_coder_submission_adjudications_submission
+        ON coder_submission_adjudications(submission_id);
+
+        CREATE INDEX idx_coder_submission_adjudications_task
+        ON coder_submission_adjudications(task_id);
+
+        CREATE INDEX idx_coder_submission_adjudications_auth
+        ON coder_submission_adjudications(authorization_id);
+
+        CREATE INDEX idx_coder_submission_adjudications_status
+        ON coder_submission_adjudications(status);
+
+        CREATE UNIQUE INDEX idx_coder_submission_adjudications_active
+        ON coder_submission_adjudications(submission_id)
+        WHERE status IN ('ADMITTED', 'VERIFYING', 'RECOVERY_FENCED');
+
+        CREATE TRIGGER trg_coder_submission_adjudications_no_delete
+        BEFORE DELETE ON coder_submission_adjudications
+        BEGIN
+          SELECT RAISE(ABORT, 'coder_submission_adjudications is strictly append-only: DELETE is prohibited');
+        END;
+
+        CREATE TRIGGER trg_coder_submission_adjudications_lifecycle_cas
+        BEFORE UPDATE ON coder_submission_adjudications
+        BEGIN
+          SELECT CASE
+            WHEN NEW.lifecycle_version != OLD.lifecycle_version + 1
+            THEN RAISE(ABORT, 'Adjudication lifecycle_version must increment by exactly 1')
+            WHEN NOT (
+              (OLD.status = 'ADMITTED' AND NEW.status IN ('VERIFYING', 'RECOVERY_FENCED')) OR
+              (OLD.status = 'VERIFYING' AND NEW.status IN ('VERIFIED', 'VERIFICATION_FAILED', 'RECOVERY_FENCED')) OR
+              (OLD.status = 'RECOVERY_FENCED' AND NEW.status IN ('VERIFICATION_FAILED', 'ADMITTED'))
+            )
+            THEN RAISE(ABORT, 'Invalid adjudication lifecycle status transition')
+          END;
+        END;
+
+        CREATE TRIGGER trg_coder_submission_adjudications_immutable_fields
+        BEFORE UPDATE ON coder_submission_adjudications
+        BEGIN
+          SELECT CASE
+            WHEN OLD.id != NEW.id OR
+                 OLD.request_id != NEW.request_id OR
+                 OLD.submission_id != NEW.submission_id OR
+                 OLD.authorization_id != NEW.authorization_id OR
+                 OLD.project_id != NEW.project_id OR
+                 OLD.task_id != NEW.task_id OR
+                 OLD.attempt_id != NEW.attempt_id OR
+                 OLD.assignment_id != NEW.assignment_id OR
+                 OLD.task_ownership_epoch != NEW.task_ownership_epoch OR
+                 OLD.action != NEW.action OR
+                 OLD.authority_snapshot_json != NEW.authority_snapshot_json OR
+                 OLD.authority_snapshot_hash != NEW.authority_snapshot_hash OR
+                 OLD.created_at != NEW.created_at
+            THEN RAISE(ABORT, 'coder_submission_adjudications immutable decision and binding fields cannot be updated')
+          END;
+        END;
+
+        -- 2. Coder Submission Adjudication Events Table (Append-Only)
+        CREATE TABLE coder_submission_adjudication_events (
+          id TEXT PRIMARY KEY CHECK (
+            length(id) = 36 AND
+            id GLOB '[0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]-[0-9a-f][0-9a-f][0-9a-f][0-9a-f]-4[0-9a-f][0-9a-f][0-9a-f]-[89ab][0-9a-f][0-9a-f][0-9a-f]-[0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]'
+          ),
+          adjudication_id TEXT NOT NULL REFERENCES coder_submission_adjudications(id) ON DELETE RESTRICT,
+          sequence INTEGER NOT NULL CHECK (sequence >= 1),
+          event_type TEXT NOT NULL CHECK (event_type IN ('ADMITTED', 'VERIFICATION_CLAIMED', 'VERIFICATION_SUCCEEDED', 'VERIFICATION_FAILED', 'RECOVERY_FENCED', 'REJECTED', 'SUPERSEDED')),
+          payload_json TEXT NOT NULL CHECK (
+            json_valid(payload_json) = 1 AND
+            json_type(payload_json) = 'object'
+          ),
+          payload_hash TEXT NOT NULL CHECK (
+            length(payload_hash) = 64 AND
+            payload_hash GLOB '[0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]'
+          ),
+          created_at TEXT NOT NULL CHECK (
+            length(created_at) = 24 AND
+            created_at GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9].[0-9][0-9][0-9]Z' AND
+            unixepoch(created_at) IS NOT NULL AND
+            strftime('%Y-%m-%dT%H:%M:%fZ', created_at) = created_at
+          ),
+          UNIQUE (adjudication_id, sequence)
+        );
+
+        CREATE INDEX idx_coder_submission_adjudication_events_adj
+        ON coder_submission_adjudication_events(adjudication_id);
+
+        CREATE INDEX idx_coder_submission_adjudication_events_type
+        ON coder_submission_adjudication_events(event_type);
+
+        CREATE TRIGGER trg_coder_submission_adjudication_events_no_update
+        BEFORE UPDATE ON coder_submission_adjudication_events
+        BEGIN
+          SELECT RAISE(ABORT, 'coder_submission_adjudication_events is strictly append-only: UPDATE is prohibited');
+        END;
+
+        CREATE TRIGGER trg_coder_submission_adjudication_events_no_delete
+        BEFORE DELETE ON coder_submission_adjudication_events
+        BEGIN
+          SELECT RAISE(ABORT, 'coder_submission_adjudication_events is strictly append-only: DELETE is prohibited');
+        END;
+      `);
+    },
+  },
 ];
 
 export const MIGRATIONS: readonly Migration[] = ALL_MIGRATIONS_LIST;
@@ -1967,7 +2187,9 @@ export function verifyMigration21SchemaAuthority(db: Database.Database): void {
     .all() as { version: number; name: string }[];
 
   if (ledgerRows.length !== 21) {
-    if (!(ledgerRows.length === 22 && ledgerRows[21]?.version === 22 && ledgerRows[21]?.name === '022_r5j_coder_submission_authority')) {
+    const isCanonical22 = ledgerRows.length === 22 && ledgerRows[21]?.version === 22 && ledgerRows[21]?.name === '022_r5j_coder_submission_authority';
+    const isCanonical23 = ledgerRows.length === 23 && ledgerRows[21]?.version === 22 && ledgerRows[21]?.name === '022_r5j_coder_submission_authority' && ledgerRows[22]?.version === 23 && ledgerRows[22]?.name === '023_r5j_quarantined_submission_adjudication_and_verification_admission';
+    if (!isCanonical22 && !isCanonical23) {
       throw new Error(`[MCP_SCHEMA_AUTHORITY_INVALID] Database schema migrations ledger must contain exactly 21 migrations (found ${ledgerRows.length})`);
     }
   }
@@ -2006,8 +2228,11 @@ export function verifyMigration22SchemaAuthority(db: Database.Database): void {
     .prepare('SELECT version, name FROM schema_migrations ORDER BY version ASC')
     .all() as { version: number; name: string }[];
 
-  if (ledgerRows.length !== 22 || ledgerRows.length !== MIGRATIONS.length) {
-    throw new Error(`[MCP_SCHEMA_AUTHORITY_INVALID] Database schema migrations ledger must contain exactly 22 migrations (found ${ledgerRows.length})`);
+  if (ledgerRows.length !== 22) {
+    const isCanonical23 = ledgerRows.length === 23 && ledgerRows[22]?.version === 23 && ledgerRows[22]?.name === '023_r5j_quarantined_submission_adjudication_and_verification_admission';
+    if (!isCanonical23) {
+      throw new Error(`[MCP_SCHEMA_AUTHORITY_INVALID] Database schema migrations ledger must contain exactly 22 migrations (found ${ledgerRows.length})`);
+    }
   }
 
   for (let i = 0; i < ledgerRows.length; i++) {
@@ -2633,14 +2858,19 @@ export function verifyMigration22SchemaAuthority(db: Database.Database): void {
     .prepare("SELECT type, name, tbl_name FROM sqlite_master WHERE type IN ('table', 'index', 'trigger')")
     .all() as { type: string; name: string; tbl_name: string }[];
 
-  const allowedAuthorityTables = new Set(['mcp_submission_sessions', 'coder_submissions', 'coder_submission_dispositions']);
+  const v22Tables = new Set(['mcp_submission_sessions', 'coder_submissions', 'coder_submission_dispositions']);
+  const allowedAuthorityTables = new Set(v22Tables);
+  if (ledgerRows.length >= 23) {
+    allowedAuthorityTables.add('coder_submission_adjudications');
+    allowedAuthorityTables.add('coder_submission_adjudication_events');
+  }
   for (const row of allMasterRows) {
     if (row.type === 'table') {
       if ((row.name.startsWith('mcp_sub') || row.name.startsWith('coder_sub')) && !allowedAuthorityTables.has(row.name)) {
         throw new Error(`[MCP_SCHEMA_AUTHORITY_INVALID] Unexpected authority table in schema: "${row.name}"`);
       }
     } else if (row.type === 'trigger') {
-      if (allowedAuthorityTables.has(row.tbl_name)) {
+      if (v22Tables.has(row.tbl_name)) {
         const allowedTriggers = new Set([
           'trg_mcp_submission_sessions_no_delete',
           'trg_mcp_submission_sessions_immutable_update',
@@ -2654,7 +2884,7 @@ export function verifyMigration22SchemaAuthority(db: Database.Database): void {
         }
       }
     } else if (row.type === 'index') {
-      if (allowedAuthorityTables.has(row.tbl_name)) {
+      if (v22Tables.has(row.tbl_name)) {
         const allowedIndexes = new Set([
           'uq_mcp_submission_sessions_active_auth',
           'idx_mcp_submission_sessions_token_hash',
@@ -2675,6 +2905,139 @@ export function verifyMigration22SchemaAuthority(db: Database.Database): void {
         }
       }
     }
+  }
+}
+
+export function verifyMigration23SchemaAuthority(db: Database.Database): void {
+  // 1. Exact ledger entry
+  const v23Row = db
+    .prepare("SELECT version, name FROM schema_migrations WHERE version = 23 AND name = '023_r5j_quarantined_submission_adjudication_and_verification_admission'")
+    .get() as { version: number; name: string } | undefined;
+  if (!v23Row) {
+    throw new Error('[ADJUDICATION_SCHEMA_AUTHORITY_INVALID] Database is missing Migration 23 ledger authority (023_r5j_quarantined_submission_adjudication_and_verification_admission)');
+  }
+
+  // 2. Table existence
+  const adjTable = db.prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'coder_submission_adjudications'").get();
+  if (!adjTable) {
+    throw new Error('[ADJUDICATION_SCHEMA_AUTHORITY_INVALID] Table coder_submission_adjudications is missing');
+  }
+
+  const eventsTable = db.prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'coder_submission_adjudication_events'").get();
+  if (!eventsTable) {
+    throw new Error('[ADJUDICATION_SCHEMA_AUTHORITY_INVALID] Table coder_submission_adjudication_events is missing');
+  }
+
+  // 3. Columns on coder_submission_adjudications: exactly 29 columns
+  const adjColumns = db.prepare("PRAGMA table_info(coder_submission_adjudications)").all() as {
+    cid: number;
+    name: string;
+    type: string;
+    notnull: number;
+    dflt_value: unknown;
+    pk: number;
+  }[];
+  if (adjColumns.length !== 29) {
+    throw new Error(`[ADJUDICATION_SCHEMA_AUTHORITY_INVALID] Table coder_submission_adjudications missing column authority: expected exactly 29 columns (found ${adjColumns.length})`);
+  }
+
+  const expectedAdjColumns: Record<string, { type: string; notnull: number; pk: number }> = {
+    id: { type: 'TEXT', notnull: 0, pk: 1 },
+    request_id: { type: 'TEXT', notnull: 1, pk: 0 },
+    submission_id: { type: 'TEXT', notnull: 1, pk: 0 },
+    authorization_id: { type: 'TEXT', notnull: 1, pk: 0 },
+    project_id: { type: 'TEXT', notnull: 1, pk: 0 },
+    task_id: { type: 'TEXT', notnull: 1, pk: 0 },
+    attempt_id: { type: 'TEXT', notnull: 1, pk: 0 },
+    assignment_id: { type: 'TEXT', notnull: 1, pk: 0 },
+    task_ownership_epoch: { type: 'INTEGER', notnull: 1, pk: 0 },
+    action: { type: 'TEXT', notnull: 1, pk: 0 },
+    status: { type: 'TEXT', notnull: 1, pk: 0 },
+    lifecycle_version: { type: 'INTEGER', notnull: 1, pk: 0 },
+    authority_snapshot_json: { type: 'TEXT', notnull: 1, pk: 0 },
+    authority_snapshot_hash: { type: 'TEXT', notnull: 1, pk: 0 },
+    verification_commands_json: { type: 'TEXT', notnull: 0, pk: 0 },
+    verification_commands_hash: { type: 'TEXT', notnull: 0, pk: 0 },
+    workspace_snapshot_before_json: { type: 'TEXT', notnull: 0, pk: 0 },
+    workspace_snapshot_before_hash: { type: 'TEXT', notnull: 0, pk: 0 },
+    verification_execution_id: { type: 'TEXT', notnull: 0, pk: 0 },
+    protocol_message_id: { type: 'TEXT', notnull: 0, pk: 0 },
+    test_run_id: { type: 'TEXT', notnull: 0, pk: 0 },
+    git_status_evidence_id: { type: 'TEXT', notnull: 0, pk: 0 },
+    git_diff_evidence_id: { type: 'TEXT', notnull: 0, pk: 0 },
+    failure_code: { type: 'TEXT', notnull: 0, pk: 0 },
+    failure_json: { type: 'TEXT', notnull: 0, pk: 0 },
+    created_at: { type: 'TEXT', notnull: 1, pk: 0 },
+    verification_started_at: { type: 'TEXT', notnull: 0, pk: 0 },
+    completed_at: { type: 'TEXT', notnull: 0, pk: 0 },
+    recovery_fenced_at: { type: 'TEXT', notnull: 0, pk: 0 },
+  };
+
+  for (const [colName, expected] of Object.entries(expectedAdjColumns)) {
+    const col = adjColumns.find((c) => c.name === colName);
+    if (!col) {
+      throw new Error(`[ADJUDICATION_SCHEMA_AUTHORITY_INVALID] Table coder_submission_adjudications missing column "${colName}"`);
+    }
+    if (col.type !== expected.type || col.notnull !== expected.notnull || col.pk !== expected.pk) {
+      throw new Error(`[ADJUDICATION_SCHEMA_AUTHORITY_INVALID] Table coder_submission_adjudications column "${colName}" attributes mismatch`);
+    }
+  }
+
+  // 4. FKs on coder_submission_adjudications: exactly 10 foreign keys
+  const adjFks = db.prepare("PRAGMA foreign_key_list(coder_submission_adjudications)").all() as {
+    table: string;
+    from: string;
+    to: string;
+    on_delete: string;
+  }[];
+  if (adjFks.length !== 10) {
+    throw new Error(`[ADJUDICATION_SCHEMA_AUTHORITY_INVALID] Table coder_submission_adjudications must contain exactly 10 foreign keys (found ${adjFks.length})`);
+  }
+
+  // 5. Indexes on coder_submission_adjudications
+  const adjIdxs = db.prepare("PRAGMA index_list(coder_submission_adjudications)").all() as {
+    name: string;
+    unique: number;
+    origin: string;
+    partial: number;
+  }[];
+  const activePartialIdx = adjIdxs.find((i) => i.name === 'idx_coder_submission_adjudications_active');
+  if (!activePartialIdx || activePartialIdx.unique !== 1 || activePartialIdx.partial !== 1) {
+    throw new Error('[ADJUDICATION_SCHEMA_AUTHORITY_INVALID] Partial unique index idx_coder_submission_adjudications_active missing or invalid');
+  }
+
+  // 6. Triggers on coder_submission_adjudications
+  const adjTriggers = db.prepare("SELECT name FROM sqlite_master WHERE type = 'trigger' AND tbl_name = 'coder_submission_adjudications'").all() as { name: string }[];
+  const expectedAdjTriggers = new Set([
+    'trg_coder_submission_adjudications_no_delete',
+    'trg_coder_submission_adjudications_immutable_fields',
+    'trg_coder_submission_adjudications_lifecycle_cas',
+  ]);
+  if (adjTriggers.length !== expectedAdjTriggers.size || adjTriggers.some((t) => !expectedAdjTriggers.has(t.name))) {
+    throw new Error('[ADJUDICATION_SCHEMA_AUTHORITY_INVALID] Triggers on coder_submission_adjudications mismatch expected authority');
+  }
+
+  // 7. Columns on coder_submission_adjudication_events: exactly 7 columns
+  const evColumns = db.prepare("PRAGMA table_info(coder_submission_adjudication_events)").all() as {
+    cid: number;
+    name: string;
+    type: string;
+    notnull: number;
+    dflt_value: unknown;
+    pk: number;
+  }[];
+  if (evColumns.length !== 7) {
+    throw new Error(`[ADJUDICATION_SCHEMA_AUTHORITY_INVALID] Table coder_submission_adjudication_events missing column authority: expected exactly 7 columns (found ${evColumns.length})`);
+  }
+
+  // 8. Triggers on coder_submission_adjudication_events
+  const evTriggers = db.prepare("SELECT name FROM sqlite_master WHERE type = 'trigger' AND tbl_name = 'coder_submission_adjudication_events'").all() as { name: string }[];
+  const expectedEvTriggers = new Set([
+    'trg_coder_submission_adjudication_events_no_update',
+    'trg_coder_submission_adjudication_events_no_delete',
+  ]);
+  if (evTriggers.length !== expectedEvTriggers.size || evTriggers.some((t) => !expectedEvTriggers.has(t.name))) {
+    throw new Error('[ADJUDICATION_SCHEMA_AUTHORITY_INVALID] Triggers on coder_submission_adjudication_events mismatch expected authority');
   }
 }
 

@@ -63,6 +63,19 @@ interface OrchestratorContextType {
       BUILD?: string | null;
     };
   }) => Promise<any>;
+  listQuarantinedSubmissions: (options?: {
+    projectId?: string;
+    taskId?: string;
+    limit?: number;
+    offset?: number;
+    reverse?: boolean;
+  }) => Promise<any>;
+  inspectQuarantinedSubmission: (submissionId: string) => Promise<any>;
+  admitQuarantinedSubmission: (submissionId: string) => Promise<any>;
+  rejectQuarantinedSubmission: (submissionId: string, reason: string) => Promise<any>;
+  supersedeQuarantinedSubmission: (submissionId: string, replacementSubmissionId: string, reason: string) => Promise<any>;
+  resumeAdmittedSubmission: (submissionId: string, lifecycleVersion?: number) => Promise<any>;
+  acknowledgeRecoveryFencedSubmission: (submissionId: string, decision: 'RETRY' | 'CANCEL', lifecycleVersion?: number) => Promise<any>;
 }
 
 const OrchestratorContext = createContext<OrchestratorContextType | null>(null);
@@ -373,6 +386,80 @@ export const OrchestratorProvider: React.FC<{ children: React.ReactNode }> = ({ 
     return orchestrator.saveVerificationCommands(data);
   };
 
+  const listQuarantinedSubmissions = async (options?: {
+    projectId?: string;
+    taskId?: string;
+    limit?: number;
+    offset?: number;
+    reverse?: boolean;
+  }) => {
+    if (!orchestrator) return { success: false, items: [], total: 0 };
+    return orchestrator.listQuarantinedSubmissions(options);
+  };
+
+  const inspectQuarantinedSubmission = async (submissionId: string) => {
+    if (!orchestrator) return { success: false, error: 'Desktop required.' };
+    return orchestrator.inspectQuarantinedSubmission({ submissionId });
+  };
+
+  const admitQuarantinedSubmission = async (submissionId: string) => {
+    if (!orchestrator) return { success: false, error: 'Desktop required.' };
+    const requestId = crypto.randomUUID();
+    const res = await orchestrator.admitQuarantinedSubmission({ requestId, submissionId });
+    await refreshData();
+    return res;
+  };
+
+  const rejectQuarantinedSubmission = async (submissionId: string, reason: string) => {
+    if (!orchestrator) return { success: false, error: 'Desktop required.' };
+    const requestId = crypto.randomUUID();
+    const res = await orchestrator.rejectQuarantinedSubmission({ requestId, submissionId, reason });
+    await refreshData();
+    return res;
+  };
+
+  const supersedeQuarantinedSubmission = async (
+    submissionId: string,
+    replacementSubmissionId: string,
+    reason: string
+  ) => {
+    if (!orchestrator) return { success: false, error: 'Desktop required.' };
+    const requestId = crypto.randomUUID();
+    const res = await orchestrator.supersedeQuarantinedSubmission({
+      requestId,
+      submissionId,
+      replacementSubmissionId,
+      reason,
+    });
+    await refreshData();
+    return res;
+  };
+
+  const resumeAdmittedSubmission = async (submissionId: string, lifecycleVersion?: number) => {
+    if (!orchestrator) return { success: false, error: 'Desktop required.' };
+    const requestId = crypto.randomUUID();
+    const res = await orchestrator.resumeAdmittedSubmission({ requestId, submissionId, lifecycleVersion });
+    await refreshData();
+    return res;
+  };
+
+  const acknowledgeRecoveryFencedSubmission = async (
+    submissionId: string,
+    decision: 'RETRY' | 'CANCEL',
+    lifecycleVersion?: number
+  ) => {
+    if (!orchestrator) return { success: false, error: 'Desktop required.' };
+    const requestId = crypto.randomUUID();
+    const res = await orchestrator.acknowledgeRecoveryFencedSubmission({
+      requestId,
+      submissionId,
+      decision,
+      lifecycleVersion,
+    });
+    await refreshData();
+    return res;
+  };
+
   return (
     <OrchestratorContext.Provider
       value={{
@@ -414,6 +501,13 @@ export const OrchestratorProvider: React.FC<{ children: React.ReactNode }> = ({ 
         generateAuthorizedWorkOrder,
         getVerificationCommands,
         saveVerificationCommands,
+        listQuarantinedSubmissions,
+        inspectQuarantinedSubmission,
+        admitQuarantinedSubmission,
+        rejectQuarantinedSubmission,
+        supersedeQuarantinedSubmission,
+        resumeAdmittedSubmission,
+        acknowledgeRecoveryFencedSubmission,
       }}
     >
       {children}

@@ -12,6 +12,13 @@ import {
   DispatchAuthorizationIpcSchema,
   GetOwnerHandoffSnapshotIpcSchema,
   GenerateAuthorizedWorkOrderIpcSchema,
+  ListQuarantinedSubmissionsIpcSchema,
+  InspectQuarantinedSubmissionIpcSchema,
+  RejectQuarantinedSubmissionIpcSchema,
+  SupersedeQuarantinedSubmissionIpcSchema,
+  AdmitQuarantinedSubmissionIpcSchema,
+  ResumeAdmittedSubmissionIpcSchema,
+  AcknowledgeRecoveryFencedIpcSchema,
 } from '../src/core/types/ipc';
 import { PolicyService } from '../src/core/services/PolicyService';
 
@@ -230,6 +237,97 @@ describe('IPC Validation & Security Gates', () => {
       GenerateAuthorizedWorkOrderIpcSchema.safeParse({
         authorizationId: 'AUTH-123',
         prompt: 'override prompt', // forbidden
+      }).success
+    ).toBe(false);
+  });
+
+  it('should validate R5J5 quarantined submission adjudication IPC schemas strictly', () => {
+    // List schema
+    expect(ListQuarantinedSubmissionsIpcSchema.safeParse({}).success).toBe(true);
+    expect(ListQuarantinedSubmissionsIpcSchema.safeParse({ limit: 10, offset: 0 }).success).toBe(true);
+    expect(ListQuarantinedSubmissionsIpcSchema.safeParse({ limit: 101 }).success).toBe(false); // exceeds max 100
+    expect(ListQuarantinedSubmissionsIpcSchema.safeParse({ limit: -1 }).success).toBe(false);
+    expect(ListQuarantinedSubmissionsIpcSchema.safeParse({ extraKey: 'bad' }).success).toBe(false); // unknown key
+
+    // Inspect schema
+    expect(InspectQuarantinedSubmissionIpcSchema.safeParse({ submissionId: '00000000-0000-4000-8000-000000000001' }).success).toBe(true);
+    expect(InspectQuarantinedSubmissionIpcSchema.safeParse({ submissionId: 'not-a-uuid' }).success).toBe(false);
+    expect(InspectQuarantinedSubmissionIpcSchema.safeParse({ submissionId: '00000000-0000-4000-8000-000000000001', sql: 'DROP TABLE' }).success).toBe(false);
+
+    // Reject schema
+    expect(
+      RejectQuarantinedSubmissionIpcSchema.safeParse({
+        requestId: '00000000-0000-4000-8000-000000000002',
+        submissionId: '00000000-0000-4000-8000-000000000001',
+        reason: 'Operator rejected code',
+      }).success
+    ).toBe(true);
+    expect(RejectQuarantinedSubmissionIpcSchema.safeParse({ requestId: 'not-uuid', submissionId: '00000000-0000-4000-8000-000000000001', reason: 'reason' }).success).toBe(false);
+
+    // Supersede schema
+    expect(
+      SupersedeQuarantinedSubmissionIpcSchema.safeParse({
+        requestId: '00000000-0000-4000-8000-000000000003',
+        submissionId: '00000000-0000-4000-8000-000000000001',
+        replacementSubmissionId: '00000000-0000-4000-8000-000000000002',
+        reason: 'Superseded by newer submission',
+      }).success
+    ).toBe(true);
+    expect(
+      SupersedeQuarantinedSubmissionIpcSchema.safeParse({
+        requestId: '00000000-0000-4000-8000-000000000003',
+        submissionId: '00000000-0000-4000-8000-000000000001',
+        replacementSubmissionId: '00000000-0000-4000-8000-000000000002',
+        reason: '', // empty reason fails
+      }).success
+    ).toBe(false);
+
+    // Admit schema
+    expect(
+      AdmitQuarantinedSubmissionIpcSchema.safeParse({
+        requestId: '00000000-0000-4000-8000-000000000004',
+        submissionId: '00000000-0000-4000-8000-000000000001',
+      }).success
+    ).toBe(true);
+    expect(
+      AdmitQuarantinedSubmissionIpcSchema.safeParse({
+        requestId: '00000000-0000-4000-8000-000000000004',
+        submissionId: '00000000-0000-4000-8000-000000000001',
+        commandOverride: 'npm test', // forbidden command injection
+      }).success
+    ).toBe(false);
+
+    // Resume schema
+    expect(
+      ResumeAdmittedSubmissionIpcSchema.safeParse({
+        requestId: '00000000-0000-4000-8000-000000000005',
+        submissionId: '00000000-0000-4000-8000-000000000006',
+        lifecycleVersion: 1,
+      }).success
+    ).toBe(true);
+    expect(
+      ResumeAdmittedSubmissionIpcSchema.safeParse({
+        requestId: '00000000-0000-4000-8000-000000000005',
+        submissionId: '00000000-0000-4000-8000-000000000006',
+        lifecycleVersion: 0, // must be positive int
+      }).success
+    ).toBe(false);
+
+    // Acknowledge recovery fenced schema
+    expect(
+      AcknowledgeRecoveryFencedIpcSchema.safeParse({
+        requestId: '00000000-0000-4000-8000-000000000007',
+        submissionId: '00000000-0000-4000-8000-000000000008',
+        lifecycleVersion: 2,
+        decision: 'CANCEL',
+      }).success
+    ).toBe(true);
+    expect(
+      AcknowledgeRecoveryFencedIpcSchema.safeParse({
+        requestId: '00000000-0000-4000-8000-000000000007',
+        submissionId: '00000000-0000-4000-8000-000000000008',
+        lifecycleVersion: 2,
+        decision: 'RERUN', // not in enum ['RETRY', 'CANCEL']
       }).success
     ).toBe(false);
   });

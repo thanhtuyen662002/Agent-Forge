@@ -75,6 +75,11 @@ import {
   ExecutionRecoveryClassification,
   ExecutionRecoveryDisposition,
   ExecutionRecoveryState,
+  CoderSubmissionAdjudication,
+  CoderSubmissionAdjudicationEvent,
+  AdjudicationAction,
+  AdjudicationStatus,
+  AdjudicationEventType,
 } from '../types/domain';
 import type { ProviderDispatchExecutionResult } from '../services/ProviderDispatchService';
 import { ExecutionFailureClassifier } from '../services/ExecutionFailureClassifier';
@@ -178,6 +183,10 @@ export interface CoderSubmissionDisposition {
 
 export class Repository {
   constructor(private db: Database.Database) {}
+
+  public getDatabase(): Database.Database {
+    return this.db;
+  }
 
   public runInTransaction<T>(fn: () => T): T {
     const tx = this.db.transaction(fn);
@@ -3861,6 +3870,367 @@ export class Repository {
       disposition_metadata_json: row.disposition_metadata_json != null ? String(row.disposition_metadata_json) : null,
       created_at: String(row.created_at),
     };
+  }
+
+  // ==========================================
+  // Coder Submission Adjudications (R5J5)
+  // ==========================================
+  public createCoderSubmissionAdjudication(adj: CoderSubmissionAdjudication): void {
+    this.db
+      .prepare(`
+        INSERT INTO coder_submission_adjudications (
+          id,
+          request_id,
+          submission_id,
+          authorization_id,
+          project_id,
+          task_id,
+          attempt_id,
+          assignment_id,
+          task_ownership_epoch,
+          action,
+          status,
+          lifecycle_version,
+          authority_snapshot_json,
+          authority_snapshot_hash,
+          verification_commands_json,
+          verification_commands_hash,
+          workspace_snapshot_before_json,
+          workspace_snapshot_before_hash,
+          verification_execution_id,
+          protocol_message_id,
+          test_run_id,
+          git_status_evidence_id,
+          git_diff_evidence_id,
+          failure_code,
+          failure_json,
+          created_at,
+          verification_started_at,
+          completed_at,
+          recovery_fenced_at
+        ) VALUES (
+          ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+          ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+          ?, ?, ?, ?, ?, ?, ?, ?, ?
+        )
+      `)
+      .run(
+        adj.id,
+        adj.request_id,
+        adj.submission_id,
+        adj.authorization_id,
+        adj.project_id,
+        adj.task_id,
+        adj.attempt_id,
+        adj.assignment_id,
+        adj.task_ownership_epoch,
+        adj.action,
+        adj.status,
+        adj.lifecycle_version,
+        adj.authority_snapshot_json,
+        adj.authority_snapshot_hash,
+        adj.verification_commands_json ?? null,
+        adj.verification_commands_hash ?? null,
+        adj.workspace_snapshot_before_json ?? null,
+        adj.workspace_snapshot_before_hash ?? null,
+        adj.verification_execution_id ?? null,
+        adj.protocol_message_id ?? null,
+        adj.test_run_id ?? null,
+        adj.git_status_evidence_id ?? null,
+        adj.git_diff_evidence_id ?? null,
+        adj.failure_code ?? null,
+        adj.failure_json ?? null,
+        adj.created_at,
+        adj.verification_started_at ?? null,
+        adj.completed_at ?? null,
+        adj.recovery_fenced_at ?? null
+      );
+  }
+
+  public updateCoderSubmissionAdjudication(
+    id: string,
+    expectedVersion: number,
+    updates: {
+      status?: AdjudicationStatus;
+      verification_execution_id?: string | null;
+      verification_started_at?: string | null;
+      workspace_snapshot_before_json?: string | null;
+      workspace_snapshot_before_hash?: string | null;
+      protocol_message_id?: string | null;
+      test_run_id?: string | null;
+      git_status_evidence_id?: string | null;
+      git_diff_evidence_id?: string | null;
+      failure_code?: string | null;
+      failure_json?: string | null;
+      completed_at?: string | null;
+      recovery_fenced_at?: string | null;
+    }
+  ): boolean {
+    const setClauses: string[] = ['lifecycle_version = lifecycle_version + 1'];
+    const params: unknown[] = [];
+
+    if (updates.status !== undefined) {
+      setClauses.push('status = ?');
+      params.push(updates.status);
+    }
+    if (updates.verification_execution_id !== undefined) {
+      setClauses.push('verification_execution_id = ?');
+      params.push(updates.verification_execution_id);
+    }
+    if (updates.verification_started_at !== undefined) {
+      setClauses.push('verification_started_at = ?');
+      params.push(updates.verification_started_at);
+    }
+    if (updates.workspace_snapshot_before_json !== undefined) {
+      setClauses.push('workspace_snapshot_before_json = ?');
+      params.push(updates.workspace_snapshot_before_json);
+    }
+    if (updates.workspace_snapshot_before_hash !== undefined) {
+      setClauses.push('workspace_snapshot_before_hash = ?');
+      params.push(updates.workspace_snapshot_before_hash);
+    }
+    if (updates.protocol_message_id !== undefined) {
+      setClauses.push('protocol_message_id = ?');
+      params.push(updates.protocol_message_id);
+    }
+    if (updates.test_run_id !== undefined) {
+      setClauses.push('test_run_id = ?');
+      params.push(updates.test_run_id);
+    }
+    if (updates.git_status_evidence_id !== undefined) {
+      setClauses.push('git_status_evidence_id = ?');
+      params.push(updates.git_status_evidence_id);
+    }
+    if (updates.git_diff_evidence_id !== undefined) {
+      setClauses.push('git_diff_evidence_id = ?');
+      params.push(updates.git_diff_evidence_id);
+    }
+    if (updates.failure_code !== undefined) {
+      setClauses.push('failure_code = ?');
+      params.push(updates.failure_code);
+    }
+    if (updates.failure_json !== undefined) {
+      setClauses.push('failure_json = ?');
+      params.push(updates.failure_json);
+    }
+    if (updates.completed_at !== undefined) {
+      setClauses.push('completed_at = ?');
+      params.push(updates.completed_at);
+    }
+    if (updates.recovery_fenced_at !== undefined) {
+      setClauses.push('recovery_fenced_at = ?');
+      params.push(updates.recovery_fenced_at);
+    }
+
+    params.push(id, expectedVersion);
+    const sql = `
+      UPDATE coder_submission_adjudications
+      SET ${setClauses.join(', ')}
+      WHERE id = ? AND lifecycle_version = ?
+    `;
+    const res = this.db.prepare(sql).run(...params);
+    return res.changes === 1;
+  }
+
+  public getCoderSubmissionAdjudicationById(id: string): CoderSubmissionAdjudication | null {
+    const row = this.db
+      .prepare('SELECT * FROM coder_submission_adjudications WHERE id = ?')
+      .get(id) as Record<string, unknown> | undefined;
+    if (!row) return null;
+    return this.mapCoderSubmissionAdjudication(row);
+  }
+
+  public getCoderSubmissionAdjudicationByRequestId(requestId: string): CoderSubmissionAdjudication | null {
+    const row = this.db
+      .prepare('SELECT * FROM coder_submission_adjudications WHERE request_id = ?')
+      .get(requestId) as Record<string, unknown> | undefined;
+    if (!row) return null;
+    return this.mapCoderSubmissionAdjudication(row);
+  }
+
+  public getActiveCoderSubmissionAdjudication(submissionId: string): CoderSubmissionAdjudication | null {
+    const row = this.db
+      .prepare(`
+        SELECT * FROM coder_submission_adjudications
+        WHERE submission_id = ? AND status IN ('ADMITTED', 'VERIFYING', 'RECOVERY_FENCED')
+        LIMIT 1
+      `)
+      .get(submissionId) as Record<string, unknown> | undefined;
+    if (!row) return null;
+    return this.mapCoderSubmissionAdjudication(row);
+  }
+
+  public getCoderSubmissionAdjudicationsBySubmission(submissionId: string): CoderSubmissionAdjudication[] {
+    const rows = this.db
+      .prepare('SELECT * FROM coder_submission_adjudications WHERE submission_id = ? ORDER BY created_at ASC, lifecycle_version ASC')
+      .all(submissionId) as Record<string, unknown>[];
+    return rows.map((r) => this.mapCoderSubmissionAdjudication(r));
+  }
+
+  public getCoderSubmissionAdjudicationsByTask(taskId: string): CoderSubmissionAdjudication[] {
+    const rows = this.db
+      .prepare('SELECT * FROM coder_submission_adjudications WHERE task_id = ? ORDER BY created_at DESC, lifecycle_version DESC')
+      .all(taskId) as Record<string, unknown>[];
+    return rows.map((r) => this.mapCoderSubmissionAdjudication(r));
+  }
+
+  public getUnresolvedCoderSubmissionAdjudications(): CoderSubmissionAdjudication[] {
+    const rows = this.db
+      .prepare(`
+        SELECT * FROM coder_submission_adjudications
+        WHERE status IN ('ADMITTED', 'VERIFYING', 'RECOVERY_FENCED')
+        ORDER BY created_at ASC
+      `)
+      .all() as Record<string, unknown>[];
+    return rows.map((r) => this.mapCoderSubmissionAdjudication(r));
+  }
+
+  private mapCoderSubmissionAdjudication(row: Record<string, unknown>): CoderSubmissionAdjudication {
+    return {
+      id: String(row.id),
+      request_id: String(row.request_id),
+      submission_id: String(row.submission_id),
+      authorization_id: String(row.authorization_id),
+      project_id: String(row.project_id),
+      task_id: String(row.task_id),
+      attempt_id: String(row.attempt_id),
+      assignment_id: String(row.assignment_id),
+      task_ownership_epoch: Number(row.task_ownership_epoch),
+      action: row.action as AdjudicationAction,
+      status: row.status as AdjudicationStatus,
+      lifecycle_version: Number(row.lifecycle_version),
+      authority_snapshot_json: String(row.authority_snapshot_json),
+      authority_snapshot_hash: String(row.authority_snapshot_hash),
+      verification_commands_json: row.verification_commands_json != null ? String(row.verification_commands_json) : null,
+      verification_commands_hash: row.verification_commands_hash != null ? String(row.verification_commands_hash) : null,
+      workspace_snapshot_before_json: row.workspace_snapshot_before_json != null ? String(row.workspace_snapshot_before_json) : null,
+      workspace_snapshot_before_hash: row.workspace_snapshot_before_hash != null ? String(row.workspace_snapshot_before_hash) : null,
+      verification_execution_id: row.verification_execution_id != null ? String(row.verification_execution_id) : null,
+      protocol_message_id: row.protocol_message_id != null ? String(row.protocol_message_id) : null,
+      test_run_id: row.test_run_id != null ? String(row.test_run_id) : null,
+      git_status_evidence_id: row.git_status_evidence_id != null ? String(row.git_status_evidence_id) : null,
+      git_diff_evidence_id: row.git_diff_evidence_id != null ? String(row.git_diff_evidence_id) : null,
+      failure_code: row.failure_code != null ? String(row.failure_code) : null,
+      failure_json: row.failure_json != null ? String(row.failure_json) : null,
+      created_at: String(row.created_at),
+      verification_started_at: row.verification_started_at != null ? String(row.verification_started_at) : null,
+      completed_at: row.completed_at != null ? String(row.completed_at) : null,
+      recovery_fenced_at: row.recovery_fenced_at != null ? String(row.recovery_fenced_at) : null,
+    };
+  }
+
+  // ==========================================
+  // Coder Submission Adjudication Events (R5J5)
+  // ==========================================
+  public createCoderSubmissionAdjudicationEvent(ev: CoderSubmissionAdjudicationEvent): void {
+    this.db
+      .prepare(`
+        INSERT INTO coder_submission_adjudication_events (
+          id,
+          adjudication_id,
+          sequence,
+          event_type,
+          payload_json,
+          payload_hash,
+          created_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?)
+      `)
+      .run(
+        ev.id,
+        ev.adjudication_id,
+        ev.sequence,
+        ev.event_type,
+        ev.payload_json,
+        ev.payload_hash,
+        ev.created_at
+      );
+  }
+
+  public getCoderSubmissionAdjudicationEvents(adjudicationId: string): CoderSubmissionAdjudicationEvent[] {
+    const rows = this.db
+      .prepare('SELECT * FROM coder_submission_adjudication_events WHERE adjudication_id = ? ORDER BY sequence ASC')
+      .all(adjudicationId) as Record<string, unknown>[];
+    return rows.map((r) => this.mapCoderSubmissionAdjudicationEvent(r));
+  }
+
+  public getNextAdjudicationEventSequence(adjudicationId: string): number {
+    const row = this.db
+      .prepare('SELECT COALESCE(MAX(sequence), 0) + 1 AS next_seq FROM coder_submission_adjudication_events WHERE adjudication_id = ?')
+      .get(adjudicationId) as { next_seq: number };
+    return row.next_seq;
+  }
+
+  private mapCoderSubmissionAdjudicationEvent(row: Record<string, unknown>): CoderSubmissionAdjudicationEvent {
+    return {
+      id: String(row.id),
+      adjudication_id: String(row.adjudication_id),
+      sequence: Number(row.sequence),
+      event_type: row.event_type as AdjudicationEventType,
+      payload_json: String(row.payload_json),
+      payload_hash: String(row.payload_hash),
+      created_at: String(row.created_at),
+    };
+  }
+
+  // ==========================================
+  // Quarantined Submissions Querying (R5J5)
+  // ==========================================
+  public listRawQuarantinedSubmissions(options: {
+    projectId?: string;
+    taskId?: string;
+    limit?: number;
+    offset?: number;
+    reverse?: boolean;
+  }): CoderSubmission[] {
+    const conditions: string[] = [];
+    const params: unknown[] = [];
+
+    if (options.projectId) {
+      conditions.push('project_id = ?');
+      params.push(options.projectId);
+    }
+    if (options.taskId) {
+      conditions.push('task_id = ?');
+      params.push(options.taskId);
+    }
+
+    const whereClause = conditions.length > 0 ? `WHERE ${conditions.join(' AND ')}` : '';
+    const orderDirection = options.reverse ? 'DESC' : 'ASC';
+    const limit = Math.min(Math.max(options.limit ?? 50, 1), 100);
+    const offset = Math.max(options.offset ?? 0, 0);
+
+    params.push(limit, offset);
+    const sql = `
+      SELECT * FROM coder_submissions
+      ${whereClause}
+      ORDER BY submitted_at ${orderDirection}, id ${orderDirection}
+      LIMIT ? OFFSET ?
+    `;
+
+    const rows = this.db.prepare(sql).all(...params) as Record<string, unknown>[];
+    return rows.map((r) => this.mapCoderSubmission(r));
+  }
+
+  public getQuarantinedSubmissionsCount(options?: {
+    projectId?: string;
+    taskId?: string;
+  }): number {
+    const conditions: string[] = [];
+    const params: unknown[] = [];
+
+    if (options?.projectId) {
+      conditions.push('project_id = ?');
+      params.push(options.projectId);
+    }
+    if (options?.taskId) {
+      conditions.push('task_id = ?');
+      params.push(options.taskId);
+    }
+
+    const whereClause = conditions.length > 0 ? `WHERE ${conditions.join(' AND ')}` : '';
+    const sql = `SELECT COUNT(*) AS c FROM coder_submissions ${whereClause}`;
+    const row = this.db.prepare(sql).get(...params) as { c: number };
+    return row.c;
   }
 
   public getDeterministicEvent(eventId: string): {
@@ -7600,6 +7970,25 @@ export class Repository {
     const row = this.db
       .prepare('SELECT * FROM test_runs WHERE task_id = ? ORDER BY created_at DESC, rowid DESC LIMIT 1')
       .get(taskId) as Record<string, unknown> | undefined;
+    if (!row) return null;
+    return {
+      id: String(row.id),
+      task_id: String(row.task_id),
+      command: String(row.command),
+      passed_count: Number(row.passed_count),
+      failed_count: Number(row.failed_count),
+      skipped_count: Number(row.skipped_count),
+      duration_ms: Number(row.duration_ms),
+      exit_code: Number(row.exit_code),
+      evidence_id: row.evidence_id ? String(row.evidence_id) : null,
+      created_at: String(row.created_at),
+    };
+  }
+
+  public getTestRun(id: string): TestRun | null {
+    const row = this.db
+      .prepare('SELECT * FROM test_runs WHERE id = ?')
+      .get(id) as Record<string, unknown> | undefined;
     if (!row) return null;
     return {
       id: String(row.id),

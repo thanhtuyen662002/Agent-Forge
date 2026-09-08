@@ -230,6 +230,17 @@ try {
   $mcpSmokeId = [Guid]::NewGuid().ToString()
   $tempMcpDir = Join-Path ([System.IO.Path]::GetTempPath()) "af-mcp-pkg-smoke-$mcpSmokeId"
   New-Item -ItemType Directory -Path $tempMcpDir -Force | Out-Null
+  $smokeRepoDir = Join-Path $tempMcpDir "smoke-repo"
+  New-Item -ItemType Directory -Path $smokeRepoDir -Force | Out-Null
+  & git -C $smokeRepoDir init | Out-Null
+  & git -C $smokeRepoDir config user.name "Smoke Test" | Out-Null
+  & git -C $smokeRepoDir config user.email "smoke@agentforge.test" | Out-Null
+  Set-Content -Path (Join-Path $smokeRepoDir "README.md") -Value "# Base Repo" -Encoding UTF8
+  & git -C $smokeRepoDir add README.md | Out-Null
+  & git -C $smokeRepoDir commit -m "Base commit" | Out-Null
+  Set-Content -Path (Join-Path $smokeRepoDir "README.md") -Value "# Smoke Test Repo" -Encoding UTF8
+  & git -C $smokeRepoDir add README.md | Out-Null
+  & git -C $smokeRepoDir commit -m "Initial smoke commit" | Out-Null
   $mcpDbPath = Join-Path $tempMcpDir "mcp-packaged.db"
   $bootstrapScript = Join-Path $tempMcpDir "mcp-runner.cjs"
 
@@ -242,6 +253,7 @@ const { spawn } = require('child_process');
 const asarPath = path.resolve(process.argv[2]);
 const dbPath = path.resolve(process.argv[3]);
 const projectRoot = process.argv[4] ? path.resolve(process.argv[4]) : null;
+const workspaceRoot = process.argv[5] ? path.resolve(process.argv[5]) : null;
 
 if (!fs.existsSync(asarPath)) {
   console.error("FAIL: app.asar does not exist at " + asarPath);
@@ -299,8 +311,9 @@ if (!nativeBindingPath.toLowerCase().startsWith(expectedUnpackedRoot.toLowerCase
   console.error("FAIL: Native binding was not loaded from unpacked package tree: " + nativeBindingPath);
   process.exit(1);
 }
-const repoNodeModules = path.join(projectRoot, 'node_modules');
-if (projectRoot && nativeBindingPath.toLowerCase().includes(repoNodeModules.toLowerCase())) {
+const checkRoot = workspaceRoot || projectRoot;
+const repoNodeModules = path.join(checkRoot, 'node_modules');
+if (checkRoot && nativeBindingPath.toLowerCase().includes(repoNodeModules.toLowerCase())) {
   console.error("FAIL: Native binding resolved to repository node_modules instead of package: " + nativeBindingPath);
   process.exit(1);
 }
@@ -479,7 +492,7 @@ const canonicalPayload = computeCanonicalPayload({
   constraints: ['None'],
   instructions,
   contextFiles,
-  verificationCommands: { TEST: null, LINT: null, BUILD: null },
+  verificationCommands: { TEST: { executable: 'git', args: ['--version'] }, LINT: null, BUILD: null },
   managerMessageId: managerRecordId,
   managerPayloadHash,
 });
@@ -1273,9 +1286,142 @@ const harness = new McpRpcHarness(child);
     await testSignalExit('SIGTERM');
 
     console.log("R5J4_MCP_SUBMISSION_PROOF=PASS");
+
+    // =========================================================================
+    // R5J5: Packaged Owner-Mediated Quarantined Submission Adjudication Proof
+    // =========================================================================
+    console.log("Starting R5J5 Packaged Coder Submission Adjudication Verification...");
+    const adjServicePath = path.join(asarPath, 'dist-electron', 'core', 'services', 'CoderSubmissionAdjudicationService.js');
+    const verServicePath = path.join(asarPath, 'dist-electron', 'core', 'services', 'VerificationService.js');
+    const pkgGenPath = path.join(asarPath, 'dist-electron', 'core', 'protocol', 'packageGenerator.js');
+    const artStorePath = path.join(asarPath, 'dist-electron', 'core', 'services', 'ArtifactStore.js');
+    if (!fs.existsSync(adjServicePath) || !fs.existsSync(verServicePath) || !fs.existsSync(pkgGenPath) || !fs.existsSync(artStorePath)) {
+      throw new Error("R5J5 packaged services missing in app.asar");
+    }
+
+    const { CoderSubmissionAdjudicationService } = require(adjServicePath);
+    const { VerificationService } = require(verServicePath);
+    const { ArtifactStore } = require(artStorePath);
+    const { PackageGenerator } = require(pkgGenPath);
+
+    const adjDb = new Database(dbPath);
+    adjDb.pragma('foreign_keys = ON');
+    const adjRepo = new Repository(adjDb);
+    const adjArtifactStore = new ArtifactStore(path.join(path.dirname(dbPath), 'artifacts'));
+    const adjVerService = new VerificationService(adjRepo, adjArtifactStore);
+    const adjService = new CoderSubmissionAdjudicationService(adjRepo, adjDb, adjVerService);
+
+    // 1. List quarantined submissions - must include candidate
+    const listRes = adjService.listQuarantinedSubmissions({ limit: 10, offset: 0 });
+    if (!listRes.items || listRes.items.length === 0) {
+      throw new Error("R5J5 listQuarantinedSubmissions returned empty items");
+    }
+    const candidateSummary = listRes.items.find((it) => it.id === submissionId);
+    if (!candidateSummary) {
+      throw new Error("R5J5 candidate submission not found in listQuarantinedSubmissions");
+    }
+    if (candidateSummary.integrity_status !== 'VALID') {
+      throw new Error("R5J5 candidate submission integrity status is not VALID: " + candidateSummary.integrity_status);
+    }
+
+    // 2. Inspect candidate
+    const inspectRes = adjService.inspectQuarantinedSubmission(submissionId);
+    if (!inspectRes.candidate || inspectRes.candidate.id !== submissionId) {
+      throw new Error("R5J5 inspectQuarantinedSubmission returned invalid candidate");
+    }
+    if (!inspectRes.authority_snapshot || inspectRes.authority_snapshot.submission_id !== submissionId) {
+      throw new Error("R5J5 inspectQuarantinedSubmission returned invalid authority_snapshot");
+    }
+
+    // 3. Operator admits for verification
+    const admitReqId = crypto.randomUUID();
+    const admitRes = await adjService.admitSubmissionForVerification({
+      requestId: admitReqId,
+      submissionId: submissionId,
+    });
+    if (!admitRes.adjudication || admitRes.adjudication.status !== 'VERIFIED') {
+      throw new Error("R5J5 admitSubmissionForVerification did not reach VERIFIED status: " + (admitRes.adjudication?.status || 'UNKNOWN'));
+    }
+
+    // 4. Assert durable database records
+    const checkAdjDb = new Database(dbPath, { readonly: true });
+    const durableAdj = checkAdjDb.prepare("SELECT * FROM coder_submission_adjudications WHERE id = ?").get(admitRes.adjudication.id);
+    if (!durableAdj || durableAdj.status !== 'VERIFIED') {
+      throw new Error("R5J5 durable adjudication record missing or not VERIFIED");
+    }
+    if (durableAdj.action !== 'ADMIT_VERIFICATION') {
+      throw new Error("R5J5 durable adjudication action mismatch");
+    }
+    if (!durableAdj.test_run_id || !durableAdj.git_status_evidence_id || !durableAdj.git_diff_evidence_id) {
+      throw new Error("R5J5 durable adjudication missing test or git evidence IDs");
+    }
+
+    const adjEvents = checkAdjDb.prepare("SELECT * FROM coder_submission_adjudication_events WHERE adjudication_id = ? ORDER BY sequence ASC").all(admitRes.adjudication.id);
+    const eventTypes = adjEvents.map((e) => e.event_type);
+    if (JSON.stringify(eventTypes) !== JSON.stringify(['ADMITTED', 'VERIFICATION_CLAIMED', 'VERIFICATION_SUCCEEDED'])) {
+      throw new Error("R5J5 adjudication events sequence mismatch: " + JSON.stringify(eventTypes));
+    }
+
+    const postDisps = checkAdjDb.prepare("SELECT * FROM coder_submission_dispositions WHERE submission_id = ? ORDER BY created_at ASC").all(submissionId);
+    const finalDisp = postDisps[postDisps.length - 1];
+    if (!finalDisp || finalDisp.disposition_event !== 'SETTLED' || finalDisp.disposition_reason !== 'ACCEPTED_VERIFIED') {
+      throw new Error("R5J5 final disposition is not SETTLED / ACCEPTED_VERIFIED: " + JSON.stringify(finalDisp));
+    }
+
+    const finalTask = adjRepo.getTask(taskId);
+    if (!finalTask || finalTask.state !== 'REVIEW_READY') {
+      throw new Error("R5J5 final task state is not REVIEW_READY: " + (finalTask?.state || 'UNKNOWN'));
+    }
+
+    // 5. Test review package generation with exact adjudication linkage
+    const linkedProtoMsg = checkAdjDb.prepare("SELECT * FROM protocol_messages WHERE id = ?").get(durableAdj.protocol_message_id);
+    const linkedTestRun = checkAdjDb.prepare("SELECT * FROM test_runs WHERE id = ?").get(durableAdj.test_run_id);
+    const linkedGitStatus = checkAdjDb.prepare("SELECT * FROM evidence WHERE id = ?").get(durableAdj.git_status_evidence_id);
+    const linkedGitDiff = checkAdjDb.prepare("SELECT * FROM evidence WHERE id = ?").get(durableAdj.git_diff_evidence_id);
+    const durableSub = checkAdjDb.prepare("SELECT * FROM coder_submissions WHERE id = ?").get(submissionId);
+    const durableProj = adjRepo.getProject(projectId);
+
+    const reviewPkg = PackageGenerator.generateReviewPackage(
+      durableProj,
+      finalTask,
+      null,
+      '',
+      '',
+      linkedTestRun,
+      [],
+      linkedGitDiff,
+      {
+        adjudication: durableAdj,
+        submission: durableSub,
+        testRun: linkedTestRun,
+        gitStatusEvidence: linkedGitStatus,
+        gitDiffEvidence: linkedGitDiff,
+      }
+    );
+
+    if (!reviewPkg.includes('### Coder Claims (Unverified)')) {
+      throw new Error("Review package missing '### Coder Claims (Unverified)' section");
+    }
+    if (!reviewPkg.includes('### Owner Adjudication')) {
+      throw new Error("Review package missing '### Owner Adjudication' section");
+    }
+    if (!reviewPkg.includes('### Authoritative Test Evidence')) {
+      throw new Error("Review package missing '### Authoritative Test Evidence' section");
+    }
+    if (!reviewPkg.includes('### Git Status Evidence')) {
+      throw new Error("Review package missing '### Git Status Evidence' section");
+    }
+    if (!reviewPkg.includes('### Git Diff Evidence')) {
+      throw new Error("Review package missing '### Git Diff Evidence' section");
+    }
+
+    checkAdjDb.close();
+    adjDb.close();
+
+    console.log("R5J5_OWNER_ADJUDICATION_PROOF=PASS");
     process.exit(0);
   } catch (err) {
-    const errMsg = err instanceof Error ? err.message : String(err);
+    const errMsg = err instanceof Error && err.stack ? err.stack : (err instanceof Error ? err.message : String(err));
     console.error("R5J4_MCP_SUBMISSION_PROOF_ERROR: " + errMsg.replace(/af-[a-zA-Z0-9_-]+/g, '[REDACTED_TOKEN]'));
     try {
       if (child && !child.killed) child.kill();
@@ -1291,7 +1437,7 @@ const harness = new McpRpcHarness(child);
 
   $mcpStartInfo = New-Object System.Diagnostics.ProcessStartInfo
   $mcpStartInfo.FileName = $exePath
-  $mcpStartInfo.Arguments = "`"$bootstrapScript`" `"$unpackedAsar`" `"$mcpDbPath`" `"$ProjectRoot`""
+  $mcpStartInfo.Arguments = "`"$bootstrapScript`" `"$unpackedAsar`" `"$mcpDbPath`" `"$smokeRepoDir`" `"$ProjectRoot`""
   $mcpStartInfo.EnvironmentVariables["ELECTRON_RUN_AS_NODE"] = "1"
   $mcpStartInfo.UseShellExecute = $false
   $mcpStartInfo.RedirectStandardOutput = $true
@@ -1324,6 +1470,10 @@ const harness = new McpRpcHarness(child);
     [System.Threading.Tasks.Task]::WaitAll(@($stdoutTask, $stderrTask), 3000)
     $mcpStdout = $stdoutTask.Result
     $mcpStderr = $stderrTask.Result
+    Write-Host "MCP Proof Output (before timeout):"
+    Write-Host $mcpStdout
+    Write-Host "MCP Proof Error (before timeout):"
+    Write-Host $mcpStderr
     throw "R5J3_PROCESS_TIMEOUT: MCP proof process timed out after $timeoutMs ms (PID: $mcpPid)"
   }
 
@@ -1334,12 +1484,13 @@ const harness = new McpRpcHarness(child);
   Write-Host "MCP Proof Output:"
   Write-Host $mcpStdout
 
-  if ($mcpProc.ExitCode -ne 0 -or -not ($mcpStdout -match "R5J3_MCP_BRIDGE_PROOF=PASS") -or -not ($mcpStdout -match "R5J4_MCP_SUBMISSION_PROOF=PASS")) {
+  if ($mcpProc.ExitCode -ne 0 -or -not ($mcpStdout -match "R5J3_MCP_BRIDGE_PROOF=PASS") -or -not ($mcpStdout -match "R5J4_MCP_SUBMISSION_PROOF=PASS") -or -not ($mcpStdout -match "R5J5_OWNER_ADJUDICATION_PROOF=PASS")) {
     Write-Error "Packaged MCP bridge verification failed (exit code $($mcpProc.ExitCode)): $mcpStderr"
     exit 1
   }
 
   Write-Host "[9/9] Packaged MCP Client Bridge & Node-Mode Stdio Proof: PASS" -ForegroundColor Green
+  Write-Host "R5J5_OWNER_ADJUDICATION_PROOF=PASS" -ForegroundColor Green
 
   # Verify no surviving processes in package dir
   $surviving = Get-Process -Name "AgentForge" -ErrorAction SilentlyContinue | Where-Object {
@@ -1396,7 +1547,7 @@ const harness = new McpRpcHarness(child);
     } catch {}
   }
   if ($tempMcpDir -and (Test-Path $tempMcpDir)) {
-    Remove-Item -Recurse -Force $tempMcpDir
+    Remove-Item -Recurse -Force $tempMcpDir -ErrorAction SilentlyContinue
     if (Test-Path $tempMcpDir) {
       Write-Host "WARNING: Temporary MCP directory persisted after cleanup: $tempMcpDir"
     }
