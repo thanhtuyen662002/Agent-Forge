@@ -428,17 +428,45 @@ export const ManualBridgeView: React.FC = () => {
     setAdjudicationError(null);
     setAdjudicationFeedback(null);
     try {
-      let res: any;
+      const activeAdj = submissionDetail?.adjudications && submissionDetail.adjudications.length > 0
+        ? submissionDetail.adjudications[submissionDetail.adjudications.length - 1]
+        : null;
+      const adjId = activeAdj?.id;
+      const expectedLifecycleVersion = typeof activeAdj?.lifecycle_version === 'number'
+        ? activeAdj.lifecycle_version
+        : 0;
+
+      let res: { success?: boolean; error?: string; message?: string } | undefined;
       if (confirmModalAction === 'ADMIT') {
-        res = await admitQuarantinedSubmission(selectedSubmissionId);
+        res = await admitQuarantinedSubmission(selectedSubmissionId, expectedLifecycleVersion);
       } else if (confirmModalAction === 'REJECT') {
-        res = await rejectQuarantinedSubmission(selectedSubmissionId, adjudicationReason.trim() || 'Rejected by Owner');
+        res = await rejectQuarantinedSubmission(
+          selectedSubmissionId,
+          expectedLifecycleVersion,
+          adjudicationReason.trim() || 'Rejected by Owner'
+        );
       } else if (confirmModalAction === 'SUPERSEDE') {
-        res = await supersedeQuarantinedSubmission(selectedSubmissionId, replacementSubId.trim(), adjudicationReason.trim() || 'Superseded by Owner');
+        res = await supersedeQuarantinedSubmission(
+          selectedSubmissionId,
+          expectedLifecycleVersion,
+          replacementSubId.trim(),
+          adjudicationReason.trim() || 'Superseded by Owner'
+        );
       } else if (confirmModalAction === 'RESUME') {
-        res = await resumeAdmittedSubmission(selectedSubmissionId);
+        if (!adjId) {
+          throw new Error('Active adjudication required to resume.');
+        }
+        res = await resumeAdmittedSubmission(selectedSubmissionId, adjId, expectedLifecycleVersion);
       } else if (confirmModalAction === 'ACKNOWLEDGE') {
-        res = await acknowledgeRecoveryFencedSubmission(selectedSubmissionId, 'CANCEL');
+        if (!adjId) {
+          throw new Error('Active adjudication required to acknowledge.');
+        }
+        res = await acknowledgeRecoveryFencedSubmission(
+          selectedSubmissionId,
+          adjId,
+          expectedLifecycleVersion,
+          'ACKNOWLEDGE'
+        );
       }
 
       if (res && res.success) {
@@ -454,8 +482,9 @@ export const ManualBridgeView: React.FC = () => {
       } else {
         setAdjudicationError(res?.error || res?.message || t('quarantinedQueue.actionFailedNotice'));
       }
-    } catch (err: any) {
-      setAdjudicationError(err?.message || t('quarantinedQueue.actionFailedNotice'));
+    } catch (err: unknown) {
+      const errorMsg = err instanceof Error ? err.message : String(err);
+      setAdjudicationError(errorMsg || t('quarantinedQueue.actionFailedNotice'));
     } finally {
       setIsAdjudicating(false);
     }

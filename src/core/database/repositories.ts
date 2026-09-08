@@ -1341,6 +1341,47 @@ export class Repository {
       );
   }
 
+  public createDeterministicGenericEvent(event: EventRecord): void {
+    const existing = this.db
+      .prepare('SELECT id, project_id, task_id, type, structured_payload_json FROM events WHERE id = ?')
+      .get(event.id) as Record<string, unknown> | undefined;
+
+    const payloadJson =
+      typeof event.structured_payload === 'string'
+        ? event.structured_payload
+        : JSON.stringify(event.structured_payload);
+
+    if (existing) {
+      if (
+        String(existing.type) === event.type &&
+        String(existing.project_id) === event.project_id &&
+        String(existing.structured_payload_json) === payloadJson
+      ) {
+        // Exact duplicate deterministic generic event -> no-op
+        return;
+      }
+      throw new Error(
+        `GENERIC_EVENT_COLLISION_CONFLICT: Deterministic generic event collision on "${event.id}" with differing payload or type.`
+      );
+    }
+
+    this.db
+      .prepare(`
+        INSERT INTO events (id, project_id, task_id, agent_id, type, summary, structured_payload_json, timestamp)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+      `)
+      .run(
+        event.id,
+        event.project_id,
+        event.task_id,
+        event.agent_id,
+        event.type,
+        event.summary,
+        payloadJson,
+        event.timestamp
+      );
+  }
+
   public getEvents(projectId?: string, limit: number = 100): EventRecord[] {
     let query = 'SELECT * FROM events';
     const params: unknown[] = [];
@@ -4123,6 +4164,25 @@ export class Repository {
   // Coder Submission Adjudication Events (R5J5)
   // ==========================================
   public createCoderSubmissionAdjudicationEvent(ev: CoderSubmissionAdjudicationEvent): void {
+    const existing = this.db
+      .prepare('SELECT id, adjudication_id, sequence, event_type, payload_json, payload_hash FROM coder_submission_adjudication_events WHERE id = ?')
+      .get(ev.id) as Record<string, unknown> | undefined;
+
+    if (existing) {
+      if (
+        String(existing.adjudication_id) === ev.adjudication_id &&
+        String(existing.event_type) === ev.event_type &&
+        String(existing.payload_hash) === ev.payload_hash &&
+        String(existing.payload_json) === ev.payload_json
+      ) {
+        // Exact duplicate deterministic event -> no-op
+        return;
+      }
+      throw new Error(
+        `EVENT_COLLISION_CONFLICT: Deterministic adjudication event collision on "${ev.id}" with differing payload or type.`
+      );
+    }
+
     this.db
       .prepare(`
         INSERT INTO coder_submission_adjudication_events (

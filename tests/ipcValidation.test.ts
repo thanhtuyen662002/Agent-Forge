@@ -259,16 +259,25 @@ describe('IPC Validation & Security Gates', () => {
       RejectQuarantinedSubmissionIpcSchema.safeParse({
         requestId: '00000000-0000-4000-8000-000000000002',
         submissionId: '00000000-0000-4000-8000-000000000001',
+        expectedLifecycleVersion: 0,
         reason: 'Operator rejected code',
       }).success
     ).toBe(true);
-    expect(RejectQuarantinedSubmissionIpcSchema.safeParse({ requestId: 'not-uuid', submissionId: '00000000-0000-4000-8000-000000000001', reason: 'reason' }).success).toBe(false);
+    expect(
+      RejectQuarantinedSubmissionIpcSchema.safeParse({
+        requestId: '00000000-0000-4000-8000-000000000002',
+        submissionId: '00000000-0000-4000-8000-000000000001',
+        reason: 'Missing expectedLifecycleVersion',
+      }).success
+    ).toBe(false);
+    expect(RejectQuarantinedSubmissionIpcSchema.safeParse({ requestId: 'not-uuid', submissionId: '00000000-0000-4000-8000-000000000001', expectedLifecycleVersion: 0, reason: 'reason' }).success).toBe(false);
 
     // Supersede schema
     expect(
       SupersedeQuarantinedSubmissionIpcSchema.safeParse({
         requestId: '00000000-0000-4000-8000-000000000003',
         submissionId: '00000000-0000-4000-8000-000000000001',
+        expectedLifecycleVersion: 1,
         replacementSubmissionId: '00000000-0000-4000-8000-000000000002',
         reason: 'Superseded by newer submission',
       }).success
@@ -277,8 +286,17 @@ describe('IPC Validation & Security Gates', () => {
       SupersedeQuarantinedSubmissionIpcSchema.safeParse({
         requestId: '00000000-0000-4000-8000-000000000003',
         submissionId: '00000000-0000-4000-8000-000000000001',
+        expectedLifecycleVersion: 1,
         replacementSubmissionId: '00000000-0000-4000-8000-000000000002',
         reason: '', // empty reason fails
+      }).success
+    ).toBe(false);
+    expect(
+      SupersedeQuarantinedSubmissionIpcSchema.safeParse({
+        requestId: '00000000-0000-4000-8000-000000000003',
+        submissionId: '00000000-0000-4000-8000-000000000001',
+        replacementSubmissionId: '00000000-0000-4000-8000-000000000002',
+        reason: 'Missing expectedLifecycleVersion',
       }).success
     ).toBe(false);
 
@@ -287,6 +305,13 @@ describe('IPC Validation & Security Gates', () => {
       AdmitQuarantinedSubmissionIpcSchema.safeParse({
         requestId: '00000000-0000-4000-8000-000000000004',
         submissionId: '00000000-0000-4000-8000-000000000001',
+      }).success
+    ).toBe(true);
+    expect(
+      AdmitQuarantinedSubmissionIpcSchema.safeParse({
+        requestId: '00000000-0000-4000-8000-000000000004',
+        submissionId: '00000000-0000-4000-8000-000000000001',
+        expectedLifecycleVersion: 0,
       }).success
     ).toBe(true);
     expect(
@@ -302,23 +327,33 @@ describe('IPC Validation & Security Gates', () => {
       ResumeAdmittedSubmissionIpcSchema.safeParse({
         requestId: '00000000-0000-4000-8000-000000000005',
         submissionId: '00000000-0000-4000-8000-000000000006',
-        lifecycleVersion: 1,
+        adjudicationId: '00000000-0000-4000-8000-000000000099',
+        expectedLifecycleVersion: 1,
       }).success
     ).toBe(true);
     expect(
       ResumeAdmittedSubmissionIpcSchema.safeParse({
         requestId: '00000000-0000-4000-8000-000000000005',
         submissionId: '00000000-0000-4000-8000-000000000006',
-        lifecycleVersion: 0, // must be positive int
+        adjudicationId: '00000000-0000-4000-8000-000000000099',
+        expectedLifecycleVersion: 0, // must be positive int
       }).success
     ).toBe(false);
+    expect(
+      ResumeAdmittedSubmissionIpcSchema.safeParse({
+        requestId: '00000000-0000-4000-8000-000000000005',
+        submissionId: '00000000-0000-4000-8000-000000000006',
+        expectedLifecycleVersion: 1,
+      }).success
+    ).toBe(false); // missing adjudicationId
 
     // Acknowledge recovery fenced schema
     expect(
       AcknowledgeRecoveryFencedIpcSchema.safeParse({
         requestId: '00000000-0000-4000-8000-000000000007',
         submissionId: '00000000-0000-4000-8000-000000000008',
-        lifecycleVersion: 2,
+        adjudicationId: '00000000-0000-4000-8000-000000000099',
+        expectedLifecycleVersion: 2,
         decision: 'CANCEL',
       }).success
     ).toBe(true);
@@ -326,8 +361,27 @@ describe('IPC Validation & Security Gates', () => {
       AcknowledgeRecoveryFencedIpcSchema.safeParse({
         requestId: '00000000-0000-4000-8000-000000000007',
         submissionId: '00000000-0000-4000-8000-000000000008',
-        lifecycleVersion: 2,
-        decision: 'RERUN', // not in enum ['RETRY', 'CANCEL']
+        adjudicationId: '00000000-0000-4000-8000-000000000099',
+        expectedLifecycleVersion: 2,
+        decision: 'ACKNOWLEDGE',
+      }).success
+    ).toBe(true);
+    expect(
+      AcknowledgeRecoveryFencedIpcSchema.safeParse({
+        requestId: '00000000-0000-4000-8000-000000000007',
+        submissionId: '00000000-0000-4000-8000-000000000008',
+        adjudicationId: '00000000-0000-4000-8000-000000000099',
+        expectedLifecycleVersion: 2,
+        decision: 'RETRY', // forbidden in corrective pass 1
+      }).success
+    ).toBe(false);
+    expect(
+      AcknowledgeRecoveryFencedIpcSchema.safeParse({
+        requestId: '00000000-0000-4000-8000-000000000007',
+        submissionId: '00000000-0000-4000-8000-000000000008',
+        adjudicationId: '00000000-0000-4000-8000-000000000099',
+        expectedLifecycleVersion: 2,
+        decision: 'RERUN', // not in enum ['ACKNOWLEDGE', 'CANCEL']
       }).success
     ).toBe(false);
   });

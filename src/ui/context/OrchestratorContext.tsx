@@ -71,11 +71,11 @@ interface OrchestratorContextType {
     reverse?: boolean;
   }) => Promise<any>;
   inspectQuarantinedSubmission: (submissionId: string) => Promise<any>;
-  admitQuarantinedSubmission: (submissionId: string) => Promise<any>;
-  rejectQuarantinedSubmission: (submissionId: string, reason: string) => Promise<any>;
-  supersedeQuarantinedSubmission: (submissionId: string, replacementSubmissionId: string, reason: string) => Promise<any>;
-  resumeAdmittedSubmission: (submissionId: string, lifecycleVersion?: number) => Promise<any>;
-  acknowledgeRecoveryFencedSubmission: (submissionId: string, decision: 'RETRY' | 'CANCEL', lifecycleVersion?: number) => Promise<any>;
+  admitQuarantinedSubmission: (submissionId: string, expectedLifecycleVersion?: number) => Promise<any>;
+  rejectQuarantinedSubmission: (submissionId: string, expectedLifecycleVersion: number, reason: string) => Promise<any>;
+  supersedeQuarantinedSubmission: (submissionId: string, expectedLifecycleVersion: number, replacementSubmissionId: string, reason: string) => Promise<any>;
+  resumeAdmittedSubmission: (submissionId: string, adjudicationId: string, expectedLifecycleVersion: number) => Promise<any>;
+  acknowledgeRecoveryFencedSubmission: (submissionId: string, adjudicationId: string, expectedLifecycleVersion: number, decision: 'ACKNOWLEDGE' | 'CANCEL') => Promise<any>;
 }
 
 const OrchestratorContext = createContext<OrchestratorContextType | null>(null);
@@ -402,24 +402,25 @@ export const OrchestratorProvider: React.FC<{ children: React.ReactNode }> = ({ 
     return orchestrator.inspectQuarantinedSubmission({ submissionId });
   };
 
-  const admitQuarantinedSubmission = async (submissionId: string) => {
+  const admitQuarantinedSubmission = async (submissionId: string, expectedLifecycleVersion?: number) => {
     if (!orchestrator) return { success: false, error: 'Desktop required.' };
     const requestId = crypto.randomUUID();
-    const res = await orchestrator.admitQuarantinedSubmission({ requestId, submissionId });
+    const res = await orchestrator.admitQuarantinedSubmission({ requestId, submissionId, expectedLifecycleVersion });
     await refreshData();
     return res;
   };
 
-  const rejectQuarantinedSubmission = async (submissionId: string, reason: string) => {
+  const rejectQuarantinedSubmission = async (submissionId: string, expectedLifecycleVersion: number, reason: string) => {
     if (!orchestrator) return { success: false, error: 'Desktop required.' };
     const requestId = crypto.randomUUID();
-    const res = await orchestrator.rejectQuarantinedSubmission({ requestId, submissionId, reason });
+    const res = await orchestrator.rejectQuarantinedSubmission({ requestId, submissionId, expectedLifecycleVersion, reason });
     await refreshData();
     return res;
   };
 
   const supersedeQuarantinedSubmission = async (
     submissionId: string,
+    expectedLifecycleVersion: number,
     replacementSubmissionId: string,
     reason: string
   ) => {
@@ -428,6 +429,7 @@ export const OrchestratorProvider: React.FC<{ children: React.ReactNode }> = ({ 
     const res = await orchestrator.supersedeQuarantinedSubmission({
       requestId,
       submissionId,
+      expectedLifecycleVersion,
       replacementSubmissionId,
       reason,
     });
@@ -435,26 +437,37 @@ export const OrchestratorProvider: React.FC<{ children: React.ReactNode }> = ({ 
     return res;
   };
 
-  const resumeAdmittedSubmission = async (submissionId: string, lifecycleVersion?: number) => {
+  const resumeAdmittedSubmission = async (
+    submissionId: string,
+    adjudicationId: string,
+    expectedLifecycleVersion: number
+  ) => {
     if (!orchestrator) return { success: false, error: 'Desktop required.' };
     const requestId = crypto.randomUUID();
-    const res = await orchestrator.resumeAdmittedSubmission({ requestId, submissionId, lifecycleVersion });
+    const res = await orchestrator.resumeAdmittedSubmission({
+      requestId,
+      submissionId,
+      adjudicationId,
+      expectedLifecycleVersion,
+    });
     await refreshData();
     return res;
   };
 
   const acknowledgeRecoveryFencedSubmission = async (
     submissionId: string,
-    decision: 'RETRY' | 'CANCEL',
-    lifecycleVersion?: number
+    adjudicationId: string,
+    expectedLifecycleVersion: number,
+    decision: 'ACKNOWLEDGE' | 'CANCEL' = 'ACKNOWLEDGE'
   ) => {
     if (!orchestrator) return { success: false, error: 'Desktop required.' };
     const requestId = crypto.randomUUID();
     const res = await orchestrator.acknowledgeRecoveryFencedSubmission({
       requestId,
       submissionId,
+      adjudicationId,
+      expectedLifecycleVersion,
       decision,
-      lifecycleVersion,
     });
     await refreshData();
     return res;

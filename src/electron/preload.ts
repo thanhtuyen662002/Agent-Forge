@@ -102,23 +102,25 @@ export interface OrchestratorApi {
     limit?: number;
     offset?: number;
     reverse?: boolean;
-  }) => Promise<any>;
-  inspectQuarantinedSubmission: (data: { submissionId: string }) => Promise<any>;
-  admitQuarantinedSubmission: (data: { requestId: string; submissionId: string }) => Promise<any>;
-  rejectQuarantinedSubmission: (data: { requestId: string; submissionId: string; reason: string }) => Promise<any>;
+  }) => Promise<unknown>;
+  inspectQuarantinedSubmission: (data: { submissionId: string }) => Promise<unknown>;
+  admitQuarantinedSubmission: (data: { requestId: string; submissionId: string; expectedLifecycleVersion?: number }) => Promise<unknown>;
+  rejectQuarantinedSubmission: (data: { requestId: string; submissionId: string; expectedLifecycleVersion: number; reason: string }) => Promise<unknown>;
   supersedeQuarantinedSubmission: (data: {
     requestId: string;
     submissionId: string;
+    expectedLifecycleVersion: number;
     replacementSubmissionId: string;
     reason: string;
-  }) => Promise<any>;
-  resumeAdmittedSubmission: (data: { requestId: string; submissionId: string; lifecycleVersion?: number }) => Promise<any>;
+  }) => Promise<unknown>;
+  resumeAdmittedSubmission: (data: { requestId: string; submissionId: string; adjudicationId: string; expectedLifecycleVersion: number }) => Promise<unknown>;
   acknowledgeRecoveryFencedSubmission: (data: {
     requestId: string;
     submissionId: string;
-    lifecycleVersion?: number;
-    decision: 'RETRY' | 'CANCEL';
-  }) => Promise<any>;
+    adjudicationId: string;
+    expectedLifecycleVersion: number;
+    decision: 'ACKNOWLEDGE' | 'CANCEL';
+  }) => Promise<unknown>;
 };
 
 const api: OrchestratorApi = {

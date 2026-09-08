@@ -4,6 +4,11 @@ import { ArtifactStore } from './ArtifactStore';
 import { PolicyService } from './PolicyService';
 import { Repository } from '../database/repositories';
 import { TestRun } from '../types/domain';
+import {
+  SealedVerificationExecutionInput,
+  SealedVerificationResult,
+} from '../types/adjudication';
+import { computeSha256 } from '../../mcp/submissionProtocol';
 
 export { shouldRunCoderVerification } from '../state/taskStateMachine';
 
@@ -219,6 +224,238 @@ export class VerificationService {
 
     this.repo.createTestRun(testRun);
     return testRun;
+  }
+
+  public async executeSealedVerification(
+    input: SealedVerificationExecutionInput
+  ): Promise<SealedVerificationResult> {
+    // 1. Recompute and verify the sealed input before process spawn
+    const recomputedCommandsHash = computeSha256(input.verification_commands_json);
+    if (recomputedCommandsHash !== input.verification_commands_hash) {
+      return {
+        outcome: 'COMMAND_POLICY_REJECTED',
+        reason: `Verification commands hash mismatch: expected "${input.verification_commands_hash}", computed "${recomputedCommandsHash}"`,
+      };
+    }
+
+    const recomputedWorkspaceHash = computeSha256(input.workspace_snapshot_before_json);
+    if (recomputedWorkspaceHash !== input.workspace_snapshot_before_hash) {
+      return {
+        outcome: 'COMMAND_POLICY_REJECTED',
+        reason: `Workspace snapshot before hash mismatch: expected "${input.workspace_snapshot_before_hash}", computed "${recomputedWorkspaceHash}"`,
+      };
+    }
+
+    // Strict positive bounded integer timeout validation
+    const timeoutMs = input.policy?.timeout_ms;
+    if (
+      typeof timeoutMs !== 'number' ||
+      !Number.isInteger(timeoutMs) ||
+      timeoutMs <= 0 ||
+      timeoutMs > 600000
+    ) {
+      return {
+        outcome: 'COMMAND_POLICY_REJECTED',
+        reason: `Timeout must be a validated positive bounded integer between 1 and 600000 ms (got ${timeoutMs})`,
+      };
+    }
+
+    // 2. Parse frozen command snapshot (must be non-null plain object)
+    let parsedCommands: unknown;
+    try {
+      parsedCommands = JSON.parse(input.verification_commands_json);
+    } catch {
+      return {
+        outcome: 'COMMAND_POLICY_REJECTED',
+        reason: 'Verification commands snapshot is malformed JSON',
+      };
+    }
+
+    if (
+      typeof parsedCommands !== 'object' ||
+      parsedCommands === null ||
+      Array.isArray(parsedCommands)
+    ) {
+      return {
+        outcome: 'COMMAND_POLICY_REJECTED',
+        reason: 'Verification commands snapshot must be a non-null plain object',
+      };
+    }
+
+    const commandsObj = parsedCommands as Record<string, unknown>;
+    const testCmd = commandsObj.TEST;
+    if (
+      typeof testCmd !== 'object' ||
+      testCmd === null ||
+      Array.isArray(testCmd)
+    ) {
+      return {
+        outcome: 'COMMAND_POLICY_REJECTED',
+        reason: 'No valid TEST command found in verification commands snapshot',
+      };
+    }
+
+    const testCmdObj = testCmd as Record<string, unknown>;
+    if (typeof testCmdObj.executable !== 'string' || !Array.isArray(testCmdObj.args)) {
+      return {
+        outcome: 'COMMAND_POLICY_REJECTED',
+        reason: 'TEST command missing valid executable string or args array',
+      };
+    }
+
+    const executable = testCmdObj.executable;
+    const args: string[] = [];
+    for (const a of testCmdObj.args) {
+      if (typeof a !== 'string') {
+        return {
+          outcome: 'COMMAND_POLICY_REJECTED',
+          reason: 'TEST command args must only contain strings',
+        };
+      }
+      args.push(a);
+    }
+
+    const commandName = typeof testCmdObj.name === 'string' ? testCmdObj.name : 'Frozen Authorization Test Suite';
+    const fullCommandStr = `${executable} ${args.join(' ')}`;
+
+    // 3. PolicyService execution gate
+    const policy = PolicyService.evaluateProcessExecution(executable, args, false);
+    if (!policy.allowed) {
+      return {
+        outcome: 'COMMAND_POLICY_REJECTED',
+        reason: `Verification denied by PolicyService: ${policy.reason} (${policy.decision})`,
+      };
+    }
+
+    // 4. Spawn and execute with ProcessRunner
+    let result: import('./ProcessRunner').ProcessRunResult;
+    try {
+      result = await ProcessRunner.execute({
+        executable,
+        args,
+        cwd: input.repo_path,
+        timeoutMs,
+        maxStdoutBytes: input.policy.max_stdout_bytes,
+        maxStderrBytes: input.policy.max_stderr_bytes,
+        allowedEnvKeys: input.policy.allowed_env_keys,
+        repo: this.repo,
+        artifactStore: this.artifactStore,
+        projectId: input.project_id,
+        taskId: input.task_id,
+        attemptId: input.attempt_id,
+        executionId: input.verification_execution_id,
+      });
+    } catch (spawnErr: unknown) {
+      const errMsg = spawnErr instanceof Error ? spawnErr.message : String(spawnErr);
+      return {
+        outcome: 'PROCESS_START_FAILED',
+        error: `Synchronous process spawn failure: ${errMsg}`,
+      };
+    }
+
+    // 5. Classify process outcome per Section 6.3:
+    // - proven synchronous spawn failure: PROCESS_START_FAILED
+    if (result.errorCode === 'PROCESS_LAUNCH_FAILED' && result.pid === null) {
+      return {
+        outcome: 'PROCESS_START_FAILED',
+        error: result.stderr || 'Process launch failed before spawn',
+      };
+    }
+
+    // - process may have started but termination is not durably proven: RECOVERY_FENCED
+    if (result.pid !== null && (result.cancelled || (result.exitCode === -1 && !result.timedOut))) {
+      return {
+        outcome: 'RECOVERY_FENCED',
+        failure_code: 'ORPHANED_VERIFICATION_INTERRUPTED',
+        error: result.stderr || 'Process termination is not durably proven',
+      };
+    }
+
+    // Format output and build TestRun
+    const stdout = result.stdout;
+    const stderr = result.stderr;
+    const combinedOutput = `=== STDOUT ===\n${stdout}\n\n=== STDERR ===\n${stderr}`;
+
+    let evidenceId: string;
+    try {
+      evidenceId = crypto.randomUUID();
+      const evidence = this.artifactStore.store(
+        evidenceId,
+        input.project_id,
+        input.task_id,
+        input.attempt_id,
+        'TEST_RESULT',
+        `Test Execution (${commandName}): Exit Code ${result.exitCode}`,
+        combinedOutput,
+        'text/plain'
+      );
+      this.repo.createEvidence(evidence);
+    } catch (evErr: unknown) {
+      const msg = evErr instanceof Error ? evErr.message : String(evErr);
+      return {
+        outcome: 'RECOVERY_FENCED',
+        failure_code: 'EVIDENCE_CAPTURE_FAILED',
+        error: `Failed to persist process test result evidence: ${msg}`,
+      };
+    }
+
+    const metrics = parseTestMetrics(stdout, result.exitCode);
+
+    const testRun: TestRun = {
+      id: crypto.randomUUID(),
+      task_id: input.task_id,
+      command: fullCommandStr,
+      passed_count: metrics.passedCount,
+      failed_count: metrics.failedCount,
+      skipped_count: metrics.skippedCount,
+      duration_ms: result.durationMs,
+      exit_code: result.exitCode,
+      evidence_id: evidenceId,
+      created_at: new Date().toISOString(),
+    };
+
+    try {
+      this.repo.createTestRun(testRun);
+    } catch (runErr: unknown) {
+      const msg = runErr instanceof Error ? runErr.message : String(runErr);
+      return {
+        outcome: 'RECOVERY_FENCED',
+        failure_code: 'EVIDENCE_CAPTURE_FAILED',
+        error: `Failed to persist test run record: ${msg}`,
+      };
+    }
+
+    // - authoritative timeout with proven termination: TEST_TIMEOUT
+    if (result.timedOut) {
+      return {
+        outcome: 'TEST_TIMEOUT',
+        test_run: testRun,
+        duration_ms: result.durationMs,
+      };
+    }
+
+    // - authoritative non-zero exit: TEST_FAILED
+    if (result.exitCode !== 0) {
+      return {
+        outcome: 'TEST_FAILED',
+        test_run: testRun,
+        metrics,
+        stdout,
+        stderr,
+        duration_ms: result.durationMs,
+        exit_code: result.exitCode,
+      };
+    }
+
+    // - success: authoritative 0 exit
+    return {
+      outcome: 'SUCCESS',
+      test_run: testRun,
+      metrics,
+      stdout,
+      stderr,
+      duration_ms: result.durationMs,
+    };
   }
 
   public async runTestsWithFrozenCommand(

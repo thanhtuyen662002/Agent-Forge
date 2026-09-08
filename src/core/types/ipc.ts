@@ -243,6 +243,7 @@ export const AdmitQuarantinedSubmissionIpcSchema = z
   .object({
     requestId: z.string().uuid('A valid UUID request ID is required'),
     submissionId: z.string().uuid('A valid UUID submission ID is required'),
+    expectedLifecycleVersion: z.number().int().nonnegative('Expected lifecycle version must be non-negative').optional(),
   })
   .strict();
 export type AdmitQuarantinedSubmissionIpc = z.infer<typeof AdmitQuarantinedSubmissionIpcSchema>;
@@ -251,6 +252,7 @@ export const RejectQuarantinedSubmissionIpcSchema = z
   .object({
     requestId: z.string().uuid('A valid UUID request ID is required'),
     submissionId: z.string().uuid('A valid UUID submission ID is required'),
+    expectedLifecycleVersion: z.number().int().nonnegative('Expected lifecycle version must be non-negative'),
     reason: z.string().min(1, 'Reason is required').max(1000),
   })
   .strict();
@@ -260,6 +262,7 @@ export const SupersedeQuarantinedSubmissionIpcSchema = z
   .object({
     requestId: z.string().uuid('A valid UUID request ID is required'),
     submissionId: z.string().uuid('A valid UUID submission ID is required'),
+    expectedLifecycleVersion: z.number().int().nonnegative('Expected lifecycle version must be non-negative'),
     replacementSubmissionId: z.string().uuid('A valid UUID replacement submission ID is required'),
     reason: z.string().min(1, 'Reason is required').max(1000),
   })
@@ -270,7 +273,8 @@ export const ResumeAdmittedSubmissionIpcSchema = z
   .object({
     requestId: z.string().uuid('A valid UUID request ID is required'),
     submissionId: z.string().uuid('A valid UUID submission ID is required'),
-    lifecycleVersion: z.number().int().positive().optional(),
+    adjudicationId: z.string().min(1, 'Adjudication ID is required'),
+    expectedLifecycleVersion: z.number().int().positive('Expected lifecycle version must be a positive integer'),
   })
   .strict();
 export type ResumeAdmittedSubmissionIpc = z.infer<typeof ResumeAdmittedSubmissionIpcSchema>;
@@ -279,8 +283,9 @@ export const AcknowledgeRecoveryFencedIpcSchema = z
   .object({
     requestId: z.string().uuid('A valid UUID request ID is required'),
     submissionId: z.string().uuid('A valid UUID submission ID is required'),
-    lifecycleVersion: z.number().int().positive().optional(),
-    decision: z.enum(['RETRY', 'CANCEL']),
+    adjudicationId: z.string().min(1, 'Adjudication ID is required'),
+    expectedLifecycleVersion: z.number().int().positive('Expected lifecycle version must be a positive integer'),
+    decision: z.enum(['ACKNOWLEDGE', 'CANCEL']),
   })
   .strict();
 export type AcknowledgeRecoveryFencedIpc = z.infer<typeof AcknowledgeRecoveryFencedIpcSchema>;

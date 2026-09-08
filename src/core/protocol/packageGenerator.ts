@@ -382,10 +382,11 @@ Guidelines:
     gitDiffEvidence?: Evidence | null,
     adjudicationLinkage?: AdjudicationReviewPackageLinkage | null
   ): string {
+    const taskRecord = task as unknown as Record<string, unknown>;
     const criteria = Array.isArray(task.acceptance_criteria)
       ? task.acceptance_criteria
-      : (typeof (task as any)?.acceptance_criteria_json === 'string'
-          ? JSON.parse((task as any).acceptance_criteria_json)
+      : (typeof taskRecord.acceptance_criteria_json === 'string'
+          ? (JSON.parse(taskRecord.acceptance_criteria_json) as string[])
           : []);
     const criteriaList = criteria.length > 0
       ? criteria.map((c: string, i: number) => `${i + 1}. ${c}`).join('\n')
@@ -406,10 +407,10 @@ Guidelines:
     } else if (gitDiffContent.length <= MAX_DIFF_LENGTH) {
       formattedDiff = gitDiffContent;
     } else {
-      if (!gitDiffEvidence && !adjudicationLinkage?.gitDiffEvidence) {
+      const activeEv = adjudicationLinkage ? adjudicationLinkage.gitDiffEvidence : gitDiffEvidence;
+      if (!activeEv) {
         throw new Error('AUTHORITATIVE_DIFF_EVIDENCE_MISSING: Large Git diff cannot be rendered in review package without authoritative evidence record.');
       }
-      const activeEv = gitDiffEvidence || adjudicationLinkage?.gitDiffEvidence!;
       formattedDiff =
         gitDiffContent.substring(0, MAX_DIFF_LENGTH) +
         `\n\n... [TRUNCATED: Diff is ${activeEv.byte_size} bytes]\n` +
@@ -432,14 +433,26 @@ Guidelines:
       if (adjudication.project_id !== project.id) {
         throw new Error(`ADJUDICATION_LINKAGE_MISMATCH: project ID mismatch (${adjudication.project_id} vs ${project.id})`);
       }
-      if (adjudication.test_run_id && linkedTestRun && adjudication.test_run_id !== linkedTestRun.id) {
-        throw new Error(`ADJUDICATION_LINKAGE_MISMATCH: test run ID mismatch (${adjudication.test_run_id} vs ${linkedTestRun.id})`);
+      if (adjudication.test_run_id) {
+        if (!linkedTestRun || adjudication.test_run_id !== linkedTestRun.id) {
+          throw new Error(`ADJUDICATION_LINKAGE_MISMATCH: test run ID mismatch (${adjudication.test_run_id} vs ${linkedTestRun?.id ?? 'null'})`);
+        }
+      } else if (linkedTestRun) {
+        throw new Error('ADJUDICATION_LINKAGE_MISMATCH: test run provided when adjudication has no test_run_id');
       }
-      if (adjudication.git_status_evidence_id && gitStatusEvidence && adjudication.git_status_evidence_id !== gitStatusEvidence.id) {
-        throw new Error(`ADJUDICATION_LINKAGE_MISMATCH: git status evidence ID mismatch (${adjudication.git_status_evidence_id} vs ${gitStatusEvidence.id})`);
+      if (adjudication.git_status_evidence_id) {
+        if (!gitStatusEvidence || adjudication.git_status_evidence_id !== gitStatusEvidence.id) {
+          throw new Error(`ADJUDICATION_LINKAGE_MISMATCH: git status evidence ID mismatch (${adjudication.git_status_evidence_id} vs ${gitStatusEvidence?.id ?? 'null'})`);
+        }
+      } else if (gitStatusEvidence) {
+        throw new Error('ADJUDICATION_LINKAGE_MISMATCH: git status evidence provided when adjudication has no git_status_evidence_id');
       }
-      if (adjudication.git_diff_evidence_id && linkedDiffEv && adjudication.git_diff_evidence_id !== linkedDiffEv.id) {
-        throw new Error(`ADJUDICATION_LINKAGE_MISMATCH: git diff evidence ID mismatch (${adjudication.git_diff_evidence_id} vs ${linkedDiffEv.id})`);
+      if (adjudication.git_diff_evidence_id) {
+        if (!linkedDiffEv || adjudication.git_diff_evidence_id !== linkedDiffEv.id) {
+          throw new Error(`ADJUDICATION_LINKAGE_MISMATCH: git diff evidence ID mismatch (${adjudication.git_diff_evidence_id} vs ${linkedDiffEv?.id ?? 'null'})`);
+        }
+      } else if (linkedDiffEv) {
+        throw new Error('ADJUDICATION_LINKAGE_MISMATCH: git diff evidence provided when adjudication has no git_diff_evidence_id');
       }
 
       // Parse untrusted claim fields from raw submission
@@ -457,8 +470,8 @@ Guidelines:
         // preserve defaults
       }
 
-      const activeTestRun = linkedTestRun || testRun;
-      const activeDiffEv = linkedDiffEv || gitDiffEvidence;
+      const activeTestRun = linkedTestRun;
+      const activeDiffEv = linkedDiffEv;
 
       const testEvidenceText = activeTestRun
         ? `

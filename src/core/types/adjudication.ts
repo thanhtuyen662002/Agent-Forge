@@ -1,6 +1,6 @@
 import { z } from 'zod';
 import { CoderSubmission } from '../database/repositories';
-import { ExecutionAuthorization, Task, Project, TaskAttempt, AgentAssignment } from './domain';
+import { ExecutionAuthorization, Task, Project, TaskAttempt, AgentAssignment, TestRun } from './domain';
 
 // ==========================================
 // 1. Core Adjudication Actions & Statuses
@@ -40,15 +40,21 @@ export type AdjudicationActorType = z.infer<typeof AdjudicationActorTypeEnum>;
 
 export const AdjudicationFailureCodeEnum = z.enum([
   'PROCESS_START_FAILED',
-  'VERIFICATION_TIMEOUT',
+  'TEST_FAILED',
   'TESTS_FAILED',
+  'TEST_TIMEOUT',
+  'VERIFICATION_TIMEOUT',
+  'COMMAND_POLICY_REJECTED',
   'POLICY_VIOLATION',
   'WORKTREE_DRIFT',
   'EVIDENCE_CAPTURE_FAILED',
   'ORPHANED_VERIFICATION_INTERRUPTED',
+  'ORPHANED_VERIFICATION_CANCELLED',
   'PRECONDITION_FAILED',
   'INTEGRITY_MISMATCH',
   'COMMAND_CONFIG_MISSING',
+  'RECOVERY_FENCED',
+  'RECOVERY_ACKNOWLEDGED',
 ]);
 export type AdjudicationFailureCode = z.infer<typeof AdjudicationFailureCodeEnum>;
 
@@ -321,3 +327,101 @@ export interface AdjudicationRecoveryScanReport {
   items: AdjudicationRecoveryScanItemResult[];
   scannedAt: string;
 }
+
+// ==========================================
+// 7. Workspace Fingerprint & Sealed Verification
+// ==========================================
+
+export interface CanonicalWorkspaceFingerprint {
+  head_sha: string;
+  status_lines: string[];
+  status_hash: string;
+  diff_hash: string;
+  untracked_files_hash: string;
+  fingerprint_hash: string;
+  isClean?: boolean;
+  branch?: string | null;
+}
+
+export interface SealedVerificationExecutionInput {
+  adjudication_id: string;
+  lifecycle_version: number;
+  verification_execution_id: string;
+  authorization_id: string;
+  project_id: string;
+  task_id: string;
+  attempt_id: string;
+  assignment_id: string;
+  repo_path: string;
+  verification_commands_json: string;
+  verification_commands_hash: string;
+  workspace_snapshot_before_json: string;
+  workspace_snapshot_before_hash: string;
+  policy: {
+    timeout_ms: number;
+    max_stdout_bytes: number;
+    max_stderr_bytes: number;
+    allowed_env_keys: string[];
+  };
+}
+
+export interface ParsedTestMetrics {
+  passedCount: number;
+  failedCount: number;
+  skippedCount: number;
+}
+
+export type SealedVerificationResult =
+  | {
+      outcome: 'SUCCESS';
+      test_run: TestRun;
+      metrics: ParsedTestMetrics;
+      stdout: string;
+      stderr: string;
+      duration_ms: number;
+    }
+  | {
+      outcome: 'TEST_FAILED';
+      test_run: TestRun;
+      metrics: ParsedTestMetrics;
+      stdout: string;
+      stderr: string;
+      duration_ms: number;
+      exit_code: number;
+    }
+  | {
+      outcome: 'TEST_TIMEOUT';
+      test_run: TestRun;
+      duration_ms: number;
+    }
+  | {
+      outcome: 'COMMAND_POLICY_REJECTED';
+      reason: string;
+    }
+  | {
+      outcome: 'PROCESS_START_FAILED';
+      error: string;
+    }
+  | {
+      outcome: 'RECOVERY_FENCED';
+      failure_code: 'ORPHANED_VERIFICATION_INTERRUPTED' | 'EVIDENCE_CAPTURE_FAILED' | 'INTEGRITY_MISMATCH';
+      error: string;
+    };
+
+export type SubmissionAuthorityIntegrityResult =
+  | {
+      valid: true;
+      claim_content_hash_matches: true;
+      canonical_envelope_hash_matches: true;
+      parsed_claim: Record<string, unknown>;
+      parsed_envelope: Record<string, unknown>;
+      fenced_reasons: [];
+    }
+  | {
+      valid: false;
+      claim_content_hash_matches: boolean;
+      canonical_envelope_hash_matches: boolean;
+      parsed_claim: Record<string, unknown> | null;
+      parsed_envelope: Record<string, unknown> | null;
+      fenced_reasons: string[];
+    };

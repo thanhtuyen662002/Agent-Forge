@@ -10,6 +10,11 @@ import {
 } from '../types/adjudication';
 import { canonicalJsonStringify, computeSha256 } from '../context/ContextIntegrity';
 import { TaskStateMachine } from '../state/taskStateMachine';
+import {
+  deriveDeterministicAdjudicationEventId,
+  deriveDeterministicGenericAdjudicationEventId,
+  deriveDeterministicDispositionId,
+} from './CoderSubmissionAdjudicationService';
 
 export class CoderSubmissionAdjudicationRecoveryScanner {
   constructor(
@@ -175,9 +180,22 @@ export class CoderSubmissionAdjudicationRecoveryScanner {
       const gitStatusEv = adj.git_status_evidence_id ? this.repo.getEvidence(adj.git_status_evidence_id) : null;
       const gitDiffEv = adj.git_diff_evidence_id ? this.repo.getEvidence(adj.git_diff_evidence_id) : null;
 
-      const hasCompleteDurableEvidence = !!testRun && !!gitStatusEv && !!gitDiffEv;
+      let hasCompleteDurableEvidence = false;
+      if (testRun && gitStatusEv && gitDiffEv) {
+        const fksMatch =
+          testRun.task_id === adj.task_id &&
+          gitStatusEv.task_id === adj.task_id &&
+          gitDiffEv.task_id === adj.task_id;
+        const exitCodeValid = typeof testRun.exit_code === 'number';
+        const hashesValid =
+          gitStatusEv.hash === computeSha256(gitStatusEv.raw_payload ?? '') &&
+          gitDiffEv.hash === computeSha256(gitDiffEv.raw_payload ?? '');
+        if (fksMatch && exitCodeValid && hashesValid) {
+          hasCompleteDurableEvidence = true;
+        }
+      }
 
-      if (hasCompleteDurableEvidence) {
+      if (hasCompleteDurableEvidence && testRun && gitStatusEv && gitDiffEv) {
         // Complete only the missing atomic DB settlement after full hash/FK verification
         const settlementSuccess = this.reconcileMissingSettlement(
           adj,
@@ -192,6 +210,23 @@ export class CoderSubmissionAdjudicationRecoveryScanner {
           classification: 'VERIFICATION_RESULT_STATE_INCOMPLETE',
           action_taken: settlementSuccess ? 'SETTLED' : 'FENCED',
           task_transition: settlementSuccess ? (testRun.exit_code === 0 ? 'REVIEW_READY' : 'NEEDS_HUMAN') : undefined,
+        };
+      }
+
+      if (!hasCompleteDurableEvidence && (testRun || gitStatusEv || gitDiffEv)) {
+        this.fenceAdjudication(
+          adj,
+          'INTEGRITY_MISMATCH',
+          'VERIFYING adjudication has incomplete, corrupted, or mismatched terminal evidence',
+          nowIso,
+          true
+        );
+        return {
+          adjudication_id: adj.id,
+          submission_id: adj.submission_id,
+          classification: 'AUTHORITY_CONFLICT',
+          action_taken: 'FENCED_CONFLICT',
+          error: 'Corrupted or incomplete terminal evidence on VERIFYING row',
         };
       }
 
@@ -230,6 +265,7 @@ export class CoderSubmissionAdjudicationRecoveryScanner {
     transitionTask: boolean = false
   ): void {
     const failureJson = canonicalJsonStringify({ reason, recovered_at: nowIso });
+    const nextVersion = adj.lifecycle_version + 1;
 
     const tx = this.db.transaction(() => {
       const updateRes = this.db
@@ -255,25 +291,48 @@ export class CoderSubmissionAdjudicationRecoveryScanner {
         reason,
         recovered_at: nowIso,
       });
+      const payloadHash = computeSha256(eventPayload);
 
       const fenceEvent: CoderSubmissionAdjudicationEvent = {
-        id: crypto.randomUUID(),
+        id: deriveDeterministicAdjudicationEventId(
+          adj.id,
+          nextVersion,
+          'RECOVERY_FENCED',
+          payloadHash
+        ),
         adjudication_id: adj.id,
         sequence: seq,
         event_type: 'RECOVERY_FENCED',
         payload_json: eventPayload,
-        payload_hash: computeSha256(eventPayload),
+        payload_hash: payloadHash,
         created_at: nowIso,
       };
       this.repo.createCoderSubmissionAdjudicationEvent(fenceEvent);
 
       if (this.eventService) {
-        this.eventService.record(
-          adj.project_id,
+        const payloadObj = {
+          adjudication_id: adj.id,
+          failure_code: failureCode,
+          reason,
+        };
+        const genericEventPayload = canonicalJsonStringify(payloadObj);
+        const genericPayloadHash = computeSha256(genericEventPayload);
+        const genericEventId = deriveDeterministicGenericAdjudicationEventId(
+          adj.id,
+          nextVersion,
           'CODER_SUBMISSION_RECOVERY_FENCED',
-          `Adjudication ${adj.id} was fenced during crash recovery: ${reason}`,
-          { adjudication_id: adj.id, failure_code: failureCode, reason }
+          genericPayloadHash
         );
+        this.repo.createDeterministicGenericEvent({
+          id: genericEventId,
+          project_id: adj.project_id,
+          task_id: adj.task_id,
+          agent_id: null,
+          type: 'CODER_SUBMISSION_RECOVERY_FENCED',
+          summary: `Adjudication ${adj.id} was fenced during crash recovery: ${reason}`,
+          structured_payload: payloadObj,
+          timestamp: nowIso,
+        });
       }
 
       if (transitionTask) {
@@ -303,11 +362,12 @@ export class CoderSubmissionAdjudicationRecoveryScanner {
     gitDiffEvidenceId: string,
     nowIso: string
   ): boolean {
-    try {
-      const isSuccess = testRun.exit_code === 0;
-      const targetStatus = isSuccess ? 'VERIFIED' : 'VERIFICATION_FAILED';
-      const eventType = isSuccess ? 'VERIFICATION_SUCCEEDED' : 'VERIFICATION_FAILED';
+    const isSuccess = testRun.exit_code === 0;
+    const targetStatus = isSuccess ? 'VERIFIED' : 'VERIFICATION_FAILED';
+    const eventType = isSuccess ? 'VERIFICATION_SUCCEEDED' : 'VERIFICATION_FAILED';
+    const nextVersion = adj.lifecycle_version + 1;
 
+    try {
       const tx = this.db.transaction(() => {
         const updateRes = this.db
           .prepare(`
@@ -342,21 +402,27 @@ export class CoderSubmissionAdjudicationRecoveryScanner {
           settled_at: nowIso,
           recovered: true,
         });
+        const payloadHash = computeSha256(eventPayload);
 
         const settlementEvent: CoderSubmissionAdjudicationEvent = {
-          id: crypto.randomUUID(),
+          id: deriveDeterministicAdjudicationEventId(
+            adj.id,
+            nextVersion,
+            eventType,
+            payloadHash
+          ),
           adjudication_id: adj.id,
           sequence: seq,
           event_type: eventType,
           payload_json: eventPayload,
-          payload_hash: computeSha256(eventPayload),
+          payload_hash: payloadHash,
           created_at: nowIso,
         };
         this.repo.createCoderSubmissionAdjudicationEvent(settlementEvent);
 
         if (isSuccess) {
           this.repo.createCoderSubmissionDisposition({
-            id: crypto.randomUUID(),
+            id: deriveDeterministicDispositionId(adj.submission_id, adj.id, nextVersion),
             submission_id: adj.submission_id,
             disposition_event: 'SETTLED',
             disposition_reason: 'ACCEPTED_VERIFIED',
@@ -384,8 +450,11 @@ export class CoderSubmissionAdjudicationRecoveryScanner {
 
       tx();
       return true;
-    } catch {
-      return false;
+    } catch (err: unknown) {
+      if (err instanceof Error && err.message.includes('RECOVERY_CAS_FAILED')) {
+        return false;
+      }
+      throw err;
     }
   }
 }
