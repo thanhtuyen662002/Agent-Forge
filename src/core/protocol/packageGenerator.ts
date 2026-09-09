@@ -7,7 +7,7 @@ import {
 } from '../types/domain';
 import { CoderProtocol } from '../types/protocols';
 import { Repository, CoderSubmission } from '../database/repositories';
-import { CoderSubmissionAdjudication } from '../types/adjudication';
+import { CoderSubmissionAdjudication, VerifiedAdjudicationReviewProjection } from '../types/adjudication';
 import {
   computeContextManifestHash,
   computePayloadHash,
@@ -372,6 +372,152 @@ Guidelines:
 `;
   }
 
+  public static renderVerifiedAdjudicationReviewProjection(
+    projection: VerifiedAdjudicationReviewProjection
+  ): string {
+    if (!projection || typeof projection !== 'object' || !projection.projection_hash) {
+      throw new Error('VERIFIED_PROJECTION_INVALID: Review package requires a verified projection with valid projection_hash.');
+    }
+
+    const criteriaList = projection.acceptance_criteria.length > 0
+      ? projection.acceptance_criteria.map((c, i) => `${i + 1}. ${c}`).join('\n')
+      : 'None specified.';
+
+    const issuesText = projection.previous_issues.length > 0
+      ? projection.previous_issues
+          .map((iss) => `- **[${iss.severity}]** ${iss.title} (${iss.file_path || 'general'}): ${iss.description}`)
+          .join('\n')
+      : 'No previous review issues.';
+
+    const MAX_DIFF_LENGTH = 32 * 1024;
+    let formattedDiff = '';
+    const diffSummary = projection.authoritative_git_diff;
+    if (!diffSummary || !diffSummary.diff_content.trim()) {
+      formattedDiff = '(No git diff detected)';
+    } else if (diffSummary.diff_content.length <= MAX_DIFF_LENGTH) {
+      formattedDiff = diffSummary.diff_content;
+    } else {
+      formattedDiff =
+        diffSummary.diff_content.substring(0, MAX_DIFF_LENGTH) +
+        `\n\n... [TRUNCATED: Diff is ${diffSummary.byte_size} bytes]\n` +
+        `- **Evidence ID**: \`${diffSummary.evidence_id}\`\n` +
+        `- **SHA-256 Checksum**: \`${diffSummary.evidence_hash}\`\n` +
+        `- **Byte Size**: \`${diffSummary.byte_size} bytes\`\n` +
+        `- **Storage Type**: \`${diffSummary.storage_type}\``;
+    }
+
+    const testVerif = projection.authoritative_verification;
+    const testEvidenceText = testVerif.test_run_id
+      ? `
+- **Test Run ID**: \`${testVerif.test_run_id}\`
+- **Command Snapshot SHA-256**: \`${testVerif.command_snapshot_hash || 'None'}\`
+- **Command**: \`${testVerif.command}\`
+- **Authoritative Verdict**: ${testVerif.exit_code === 0 ? '🟢 PASSED' : '🔴 FAILED'} (Exit Code: \`${testVerif.exit_code}\`)
+- **Metrics**: ${testVerif.passed_count} Passed | ${testVerif.failed_count} Failed | ${testVerif.skipped_count} Skipped
+- **Duration**: ${testVerif.duration_ms}ms
+- **Evidence Reference**: \`${testVerif.test_result_evidence_id || 'INLINE'}\`
+`
+      : '⚠️ [TEST EVIDENCE UNAVAILABLE / NOT RUN / ERROR]';
+
+    const claim = projection.untrusted_claim;
+    const gitStatus = projection.authoritative_git_status;
+
+    return `# REVIEW PACKAGE: ${projection.task_id} — ${projection.task_title}
+
+## Task Overview
+- **Project**: ${projection.project_name} (${projection.project_id})
+- **Task ID**: \`${projection.task_id}\`
+- **Priority**: \`${projection.task_priority}\` | **Risk**: \`${projection.task_risk}\`
+- **Current Revision**: ${projection.task_revision_count} / ${projection.task_max_revisions}
+- **Base SHA**: \`${projection.task_base_sha}\`
+- **Working SHA**: \`${projection.task_working_sha}\`
+
+### Acceptance Criteria
+${criteriaList}
+
+---
+
+## Authoritative Verification Evidence (Ground Truth)
+
+### Owner Adjudication
+- **Adjudication ID**: \`${projection.adjudication_id}\`
+- **Recovery Classification**: ${projection.recovery_fencing_state?.is_fenced ? 'RECOVERY_FENCED' : 'NORMAL'}
+- **Projection Hash**: \`${projection.projection_hash}\`
+
+### Authoritative Test Evidence
+${testEvidenceText}
+
+### Git Status Evidence
+- **Evidence ID**: \`${gitStatus?.evidence_id || 'None'}\`
+- **SHA-256 Checksum**: \`${gitStatus?.evidence_hash || 'None'}\`
+- **Storage Type**: \`${gitStatus?.storage_type || 'None'}\`
+
+### Git Diff Evidence
+- **Evidence ID**: \`${diffSummary?.evidence_id || 'None'}\`
+- **SHA-256 Checksum**: \`${diffSummary?.evidence_hash || 'None'}\`
+- **Byte Size**: \`${diffSummary?.byte_size ?? 0} bytes\`
+- **Storage Type**: \`${diffSummary?.storage_type || 'None'}\`
+
+\`\`\`diff
+${formattedDiff}
+\`\`\`
+
+---
+
+### Coder Claims (Unverified)
+*(Non-Authoritative — Untrusted Coder Claim)*
+- **Submission ID**: \`${projection.submission_id}\`
+- **Claim Content SHA-256**: \`${claim.claim_content_hash}\`
+- **Summary**: ${claim.summary || 'No summary provided.'}
+- **Completed Items**:
+${claim.completed.length > 0 ? claim.completed.map((c) => `  - ${c}`).join('\n') : '  - None'}
+- **Files Claimed Changed**:
+${claim.files_claimed_changed.length > 0 ? claim.files_claimed_changed.map((f) => `  - \`${f}\``).join('\n') : '  - None'}
+- **Tests Claimed**:
+${claim.tests_claimed.length > 0 ? claim.tests_claimed.map((t) => `  - ${t}`).join('\n') : '  - None'}
+- **Blockers**:
+${claim.blockers.length > 0 ? claim.blockers.map((b) => `  - ${b}`).join('\n') : '  - None'}
+
+---
+
+## Previous Review History
+${issuesText}
+
+---
+
+## Required Response Protocol (\`manager.v1\`)
+Evaluate the authoritative evidence above against the acceptance criteria and return your verdict in the following JSON format:
+
+\`\`\`json
+{
+  "protocol": "manager.v1",
+  "message_id": "msg-mgr-${projection.task_id}-${Date.now()}",
+  "project_id": "${projection.project_id}",
+  "task_id": "${projection.task_id}",
+  "decision": "PASS | FIX_REQUIRED | BLOCK | NEEDS_OWNER",
+  "priority": "${projection.task_priority}",
+  "risk": "${projection.task_risk}",
+  "instructions": [
+    "Specific feedback or next instructions"
+  ],
+  "acceptance_criteria": [
+    "Remaining criteria if fix required"
+  ],
+  "review_issues": [
+    {
+      "severity": "BLOCKER | REQUIRED | OPTIONAL | NIT",
+      "title": "Issue title",
+      "file_path": "src/file.ts",
+      "description": "Specific issue description"
+    }
+  ],
+  "expected_task_state": "REVIEWING",
+  "expected_revision": ${projection.task_revision_count}
+}
+\`\`\`
+`;
+  }
+
   public static generateReviewPackage(
     project: Project,
     task: Task,
@@ -381,8 +527,14 @@ Guidelines:
     testRun: TestRun | null,
     previousReviews: Review[] = [],
     gitDiffEvidence?: Evidence | null,
-    adjudicationLinkage?: AdjudicationReviewPackageLinkage | null
+    adjudicationLinkageOrProjection?: VerifiedAdjudicationReviewProjection | AdjudicationReviewPackageLinkage | null
   ): string {
+    if (adjudicationLinkageOrProjection && 'projection_hash' in adjudicationLinkageOrProjection) {
+      return PackageGenerator.renderVerifiedAdjudicationReviewProjection(
+        adjudicationLinkageOrProjection as VerifiedAdjudicationReviewProjection
+      );
+    }
+
     const taskRecord = task as unknown as Record<string, unknown>;
     const criteria = Array.isArray(task.acceptance_criteria)
       ? task.acceptance_criteria
@@ -408,7 +560,9 @@ Guidelines:
     } else if (gitDiffContent.length <= MAX_DIFF_LENGTH) {
       formattedDiff = gitDiffContent;
     } else {
-      const activeEv = adjudicationLinkage ? adjudicationLinkage.gitDiffEvidence : gitDiffEvidence;
+      const activeEv = (adjudicationLinkageOrProjection && 'gitDiffEvidence' in adjudicationLinkageOrProjection)
+        ? adjudicationLinkageOrProjection.gitDiffEvidence
+        : gitDiffEvidence;
       if (!activeEv) {
         throw new Error('AUTHORITATIVE_DIFF_EVIDENCE_MISSING: Large Git diff cannot be rendered in review package without authoritative evidence record.');
       }
@@ -421,8 +575,8 @@ Guidelines:
         `- **Storage Type**: \`${activeEv.storage_type}\``;
     }
 
-    if (adjudicationLinkage) {
-      const { adjudication, submission, testRun: linkedTestRun, gitStatusEvidence, gitDiffEvidence: linkedDiffEv } = adjudicationLinkage;
+    if (adjudicationLinkageOrProjection && 'adjudication' in adjudicationLinkageOrProjection) {
+      const { adjudication, submission, testRun: linkedTestRun, gitStatusEvidence, gitDiffEvidence: linkedDiffEv } = adjudicationLinkageOrProjection;
 
       // Fail closed validation: never silently substitute a different submission, test run, or evidence row
       if (adjudication.submission_id !== submission.id) {

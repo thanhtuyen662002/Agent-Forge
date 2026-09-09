@@ -6,6 +6,12 @@ import { PolicyService } from './PolicyService';
 import { Repository } from '../database/repositories';
 import { ArtifactStore } from './ArtifactStore';
 
+export type ProcessStartTruth = 'NOT_STARTED_PROVEN' | 'STARTED_PROVEN' | 'START_AMBIGUOUS';
+export type ProcessTerminationTruth =
+  | 'NOT_APPLICABLE'
+  | 'PROCESS_TREE_TERMINATED_PROVEN'
+  | 'TERMINATION_UNRESOLVED';
+
 export interface ProcessRunResult {
   executionId: string;
   pid: number | null;
@@ -21,6 +27,8 @@ export interface ProcessRunResult {
   errorCode?: 'TIMEOUT' | 'CANCELLED' | 'PROCESS_LAUNCH_FAILED' | 'NONZERO_EXIT' | 'OUTPUT_LIMIT_EXCEEDED' | null;
   stdoutEvidenceId?: string | null;
   stderrEvidenceId?: string | null;
+  processStart: ProcessStartTruth;
+  processTermination: ProcessTerminationTruth;
 }
 
 export interface StructuredProcessOptions {
@@ -335,6 +343,8 @@ export class ProcessRunner {
           cancelled: false,
           outputLimitExceeded: false,
           errorCode: 'PROCESS_LAUNCH_FAILED',
+          processStart: 'NOT_STARTED_PROVEN',
+          processTermination: 'NOT_APPLICABLE',
         };
       }
       if (this.activeProcesses.has(options.executionId)) {
@@ -351,6 +361,8 @@ export class ProcessRunner {
           cancelled: false,
           outputLimitExceeded: false,
           errorCode: 'PROCESS_LAUNCH_FAILED',
+          processStart: 'NOT_STARTED_PROVEN',
+          processTermination: 'NOT_APPLICABLE',
         };
       }
       executionId = options.executionId;
@@ -411,6 +423,8 @@ export class ProcessRunner {
         cancelled: false,
         outputLimitExceeded: false,
         errorCode: 'PROCESS_LAUNCH_FAILED',
+        processStart: 'NOT_STARTED_PROVEN',
+        processTermination: 'NOT_APPLICABLE',
       };
     }
 
@@ -449,6 +463,8 @@ export class ProcessRunner {
         cancelled: false,
         outputLimitExceeded: false,
         errorCode: 'PROCESS_LAUNCH_FAILED',
+        processStart: 'NOT_STARTED_PROVEN',
+        processTermination: 'NOT_APPLICABLE',
       };
     }
 
@@ -492,6 +508,8 @@ export class ProcessRunner {
         cancelled: false,
         outputLimitExceeded: false,
         errorCode: 'PROCESS_LAUNCH_FAILED',
+        processStart: 'NOT_STARTED_PROVEN',
+        processTermination: 'NOT_APPLICABLE',
       };
     }
 
@@ -523,6 +541,8 @@ export class ProcessRunner {
           cancelled: false,
           outputLimitExceeded: false,
           errorCode: 'PROCESS_LAUNCH_FAILED',
+          processStart: 'NOT_STARTED_PROVEN',
+          processTermination: 'NOT_APPLICABLE',
         };
       }
     }
@@ -551,9 +571,14 @@ export class ProcessRunner {
       const procEntry = { process: child, command: commandStr, isCancelled: false, repo: options.repo };
       this.activeProcesses.set(executionId, procEntry);
 
+      let startTruth: ProcessStartTruth = 'STARTED_PROVEN';
+      let terminationTruth: ProcessTerminationTruth = 'NOT_APPLICABLE';
+
       const timer = setTimeout(() => {
         isTimedOut = true;
-        this.killProcessTree(child);
+        ProcessRunner.killProcessTreeAsync(child).then((res) => {
+          terminationTruth = res;
+        });
       }, timeoutMs);
 
       // Safe stdin writing when provided
@@ -587,7 +612,9 @@ export class ProcessRunner {
               stdoutAcc += chunkBuf.subarray(0, remaining).toString('utf8');
               stdoutByteCount += remaining;
             }
-            this.killProcessTree(child);
+            ProcessRunner.killProcessTreeAsync(child).then((res) => {
+              terminationTruth = res;
+            });
             return;
           }
 
@@ -609,7 +636,9 @@ export class ProcessRunner {
               stderrAcc += chunkBuf.subarray(0, remaining).toString('utf8');
               stderrByteCount += remaining;
             }
-            this.killProcessTree(child);
+            ProcessRunner.killProcessTreeAsync(child).then((res) => {
+              terminationTruth = res;
+            });
             return;
           }
 
@@ -644,6 +673,10 @@ export class ProcessRunner {
           );
         }
 
+        const hasPid = typeof child.pid === 'number' && child.pid > 0;
+        const startStatus: ProcessStartTruth = hasPid ? 'START_AMBIGUOUS' : 'NOT_STARTED_PROVEN';
+        const termStatus: ProcessTerminationTruth = hasPid ? 'TERMINATION_UNRESOLVED' : 'NOT_APPLICABLE';
+
         resolve({
           executionId,
           pid: child.pid ?? null,
@@ -657,10 +690,12 @@ export class ProcessRunner {
           cancelled: wasCancelled,
           outputLimitExceeded: isOutputLimitExceeded,
           errorCode: finalErrorCode,
+          processStart: startStatus,
+          processTermination: termStatus,
         });
       });
 
-      child.on('close', (code) => {
+      child.on('close', async (code) => {
         clearTimeout(timer);
         const wasCancelled = procEntry.isCancelled;
         this.activeProcesses.delete(executionId);
@@ -683,6 +718,14 @@ export class ProcessRunner {
         } else if (code !== 0) {
           terminalStatus = 'FAILED';
           finalErrorCode = 'NONZERO_EXIT';
+        }
+
+        if (isTimedOut || wasCancelled || isOutputLimitExceeded) {
+          if (terminationTruth !== 'PROCESS_TREE_TERMINATED_PROVEN') {
+            terminationTruth = await ProcessRunner.killProcessTreeAsync(child);
+          }
+        } else {
+          terminationTruth = 'PROCESS_TREE_TERMINATED_PROVEN';
         }
 
         let stdoutEvidenceId: string | null = null;
@@ -754,6 +797,8 @@ export class ProcessRunner {
           errorCode: finalErrorCode,
           stdoutEvidenceId,
           stderrEvidenceId,
+          processStart: startTruth,
+          processTermination: terminationTruth,
         });
       });
     });
@@ -789,11 +834,72 @@ export class ProcessRunner {
     return this.activeProcesses.size;
   }
 
+  public static async killProcessTreeAsync(
+    child: ChildProcess,
+    timeoutMs = 5000
+  ): Promise<ProcessTerminationTruth> {
+    if (!child.pid) return 'NOT_APPLICABLE';
+
+    if (process.platform === 'win32') {
+      try {
+        const exitCode = await new Promise<number | null>((resolve) => {
+          let tk: ChildProcess;
+          try {
+            tk = spawn('taskkill', ['/F', '/T', '/PID', child.pid!.toString()], {
+              windowsHide: true,
+              stdio: 'ignore',
+            });
+          } catch (spawnErr: unknown) {
+            console.debug(`[ProcessRunner] taskkill spawn error: ${spawnErr instanceof Error ? spawnErr.message : String(spawnErr)}`);
+            return resolve(null);
+          }
+          const timer = setTimeout(() => {
+            try {
+              tk.kill('SIGKILL');
+            } catch (killErr: unknown) {
+              console.debug(`[ProcessRunner] taskkill self-kill error: ${killErr instanceof Error ? killErr.message : String(killErr)}`);
+            }
+            resolve(null);
+          }, timeoutMs);
+          tk.on('error', () => {
+            clearTimeout(timer);
+            resolve(null);
+          });
+          tk.on('close', (closeCode) => {
+            clearTimeout(timer);
+            resolve(closeCode);
+          });
+        });
+
+        // 0 = successful termination, 128 = process already terminated/not found
+        if (exitCode === 0 || exitCode === 128) {
+          return 'PROCESS_TREE_TERMINATED_PROVEN';
+        }
+        return 'TERMINATION_UNRESOLVED';
+      } catch (waitErr: unknown) {
+        console.debug(`[ProcessRunner] taskkill await error: ${waitErr instanceof Error ? waitErr.message : String(waitErr)}`);
+        return 'TERMINATION_UNRESOLVED';
+      }
+    } else {
+      try {
+        child.kill('SIGKILL');
+        return 'PROCESS_TREE_TERMINATED_PROVEN';
+      } catch (killErr: unknown) {
+        console.debug(`[ProcessRunner] POSIX child kill error: ${killErr instanceof Error ? killErr.message : String(killErr)}`);
+        return 'TERMINATION_UNRESOLVED';
+      }
+    }
+  }
+
   private static killProcessTree(child: ChildProcess): void {
     if (!child.pid) return;
     try {
       if (process.platform === 'win32') {
-        spawn('taskkill', ['/pid', child.pid.toString(), '/f', '/t'], { windowsHide: true });
+        const tk = spawn('taskkill', ['/pid', child.pid.toString(), '/f', '/t'], {
+          windowsHide: true,
+          stdio: 'ignore',
+        });
+        tk.on('error', () => {});
       } else {
         child.kill('SIGKILL');
       }

@@ -1251,6 +1251,11 @@ export class Repository {
     return this.getEvidenceById(id);
   }
 
+  public isEvidenceFilePathReferenced(filePath: string): boolean {
+    const row = this.db.prepare('SELECT 1 FROM evidence WHERE file_path = ? LIMIT 1').get(filePath);
+    return row !== undefined;
+  }
+
   // ==========================================
   // Reviews & Issues
   // ==========================================
@@ -3950,12 +3955,17 @@ export class Repository {
           created_at,
           verification_started_at,
           completed_at,
-          recovery_fenced_at
+          recovery_fenced_at,
+          resolution_action,
+          resolution_timestamp,
+          resolution_evidence_json,
+          resolution_evidence_hash,
+          resolver_id
         ) VALUES (
           ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
           ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
           ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
-          ?
+          ?, ?, ?, ?, ?, ?
         )
       `)
       .run(
@@ -3989,7 +3999,12 @@ export class Repository {
         adj.created_at,
         adj.verification_started_at ?? null,
         adj.completed_at ?? null,
-        adj.recovery_fenced_at ?? null
+        adj.recovery_fenced_at ?? null,
+        adj.resolution_action ?? null,
+        adj.resolution_timestamp ?? null,
+        adj.resolution_evidence_json ?? null,
+        adj.resolution_evidence_hash ?? null,
+        adj.resolver_id ?? null
       );
   }
 
@@ -4012,6 +4027,11 @@ export class Repository {
       failure_json?: string | null;
       completed_at?: string | null;
       recovery_fenced_at?: string | null;
+      resolution_action?: 'ACKNOWLEDGE' | 'CANCEL' | null;
+      resolution_timestamp?: string | null;
+      resolution_evidence_json?: string | null;
+      resolution_evidence_hash?: string | null;
+      resolver_id?: string | null;
     }
   ): boolean {
     const setClauses: string[] = ['lifecycle_version = lifecycle_version + 1'];
@@ -4077,6 +4097,26 @@ export class Repository {
       setClauses.push('recovery_fenced_at = ?');
       params.push(updates.recovery_fenced_at);
     }
+    if (updates.resolution_action !== undefined) {
+      setClauses.push('resolution_action = ?');
+      params.push(updates.resolution_action);
+    }
+    if (updates.resolution_timestamp !== undefined) {
+      setClauses.push('resolution_timestamp = ?');
+      params.push(updates.resolution_timestamp);
+    }
+    if (updates.resolution_evidence_json !== undefined) {
+      setClauses.push('resolution_evidence_json = ?');
+      params.push(updates.resolution_evidence_json);
+    }
+    if (updates.resolution_evidence_hash !== undefined) {
+      setClauses.push('resolution_evidence_hash = ?');
+      params.push(updates.resolution_evidence_hash);
+    }
+    if (updates.resolver_id !== undefined) {
+      setClauses.push('resolver_id = ?');
+      params.push(updates.resolver_id);
+    }
 
     params.push(id, expectedVersion);
     const sql = `
@@ -4109,6 +4149,7 @@ export class Repository {
       .prepare(`
         SELECT * FROM coder_submission_adjudications
         WHERE submission_id = ? AND status IN ('ADMITTED', 'VERIFYING', 'RECOVERY_FENCED')
+        ORDER BY lifecycle_version DESC, created_at DESC
         LIMIT 1
       `)
       .get(submissionId) as Record<string, unknown> | undefined;
@@ -4124,7 +4165,10 @@ export class Repository {
   }
 
   public getCoderSubmissionAdjudicationsBySubmissionId(submissionId: string): CoderSubmissionAdjudication[] {
-    return this.getCoderSubmissionAdjudicationsBySubmission(submissionId);
+    const rows = this.db
+      .prepare('SELECT * FROM coder_submission_adjudications WHERE submission_id = ? ORDER BY created_at DESC, lifecycle_version DESC')
+      .all(submissionId) as Record<string, unknown>[];
+    return rows.map((r) => this.mapCoderSubmissionAdjudication(r));
   }
 
   public getCoderSubmissionAdjudicationsByTask(taskId: string): CoderSubmissionAdjudication[] {
@@ -4178,6 +4222,11 @@ export class Repository {
       verification_started_at: row.verification_started_at != null ? String(row.verification_started_at) : null,
       completed_at: row.completed_at != null ? String(row.completed_at) : null,
       recovery_fenced_at: row.recovery_fenced_at != null ? String(row.recovery_fenced_at) : null,
+      resolution_action: row.resolution_action != null ? (row.resolution_action as 'ACKNOWLEDGE' | 'CANCEL') : null,
+      resolution_timestamp: row.resolution_timestamp != null ? String(row.resolution_timestamp) : null,
+      resolution_evidence_json: row.resolution_evidence_json != null ? String(row.resolution_evidence_json) : null,
+      resolution_evidence_hash: row.resolution_evidence_hash != null ? String(row.resolution_evidence_hash) : null,
+      resolver_id: row.resolver_id != null ? String(row.resolver_id) : null,
     };
   }
 

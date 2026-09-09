@@ -1803,6 +1803,29 @@ const ALL_MIGRATIONS_LIST: Migration[] = [
               recovery_fenced_at >= created_at
             )
           ),
+          resolution_action TEXT NULL CHECK (resolution_action IS NULL OR resolution_action IN ('ACKNOWLEDGE', 'CANCEL')),
+          resolution_timestamp TEXT NULL CHECK (
+            resolution_timestamp IS NULL OR (
+              length(resolution_timestamp) = 24 AND
+              resolution_timestamp GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9].[0-9][0-9][0-9]Z' AND
+              unixepoch(resolution_timestamp) IS NOT NULL AND
+              strftime('%Y-%m-%dT%H:%M:%fZ', resolution_timestamp) = resolution_timestamp AND
+              resolution_timestamp >= created_at
+            )
+          ),
+          resolution_evidence_json TEXT NULL CHECK (
+            resolution_evidence_json IS NULL OR (
+              json_valid(resolution_evidence_json) = 1 AND
+              json_type(resolution_evidence_json) = 'object'
+            )
+          ),
+          resolution_evidence_hash TEXT NULL CHECK (
+            resolution_evidence_hash IS NULL OR (
+              length(resolution_evidence_hash) = 64 AND
+              resolution_evidence_hash GLOB '[0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]'
+            )
+          ),
+          resolver_id TEXT NULL,
           CHECK (
             (action = 'ADMIT_VERIFICATION' AND verification_commands_json IS NOT NULL AND verification_commands_hash IS NOT NULL) OR
             (action IN ('REJECT', 'SUPERSEDE') AND verification_commands_json IS NULL AND verification_commands_hash IS NULL)
@@ -1878,6 +1901,9 @@ const ALL_MIGRATIONS_LIST: Migration[] = [
                  (OLD.verification_started_at IS NOT NULL AND (NEW.verification_started_at IS NULL OR NEW.verification_started_at != OLD.verification_started_at)) OR
                  (OLD.recovery_fenced_at IS NOT NULL AND (NEW.recovery_fenced_at IS NULL OR NEW.recovery_fenced_at != OLD.recovery_fenced_at))
             THEN RAISE(ABORT, 'coder_submission_adjudications execution and fence markers cannot be altered or cleared once set')
+            WHEN (OLD.resolution_action IS NOT NULL AND (NEW.resolution_action IS NULL OR NEW.resolution_action != OLD.resolution_action)) OR
+                 (OLD.resolution_timestamp IS NOT NULL AND (NEW.resolution_timestamp IS NULL OR NEW.resolution_timestamp != OLD.resolution_timestamp))
+            THEN RAISE(ABORT, 'coder_submission_adjudications resolution records cannot be altered or cleared once set')
           END;
         END;
 
@@ -2946,7 +2972,7 @@ export function verifyMigration23SchemaAuthority(db: Database.Database): void {
     throw new Error('[ADJUDICATION_SCHEMA_AUTHORITY_INVALID] Table coder_submission_adjudication_events is missing');
   }
 
-  // 3. Columns on coder_submission_adjudications: exactly 31 columns
+  // 3. Columns on coder_submission_adjudications: exactly 36 columns
   const adjColumns = db.prepare("PRAGMA table_info(coder_submission_adjudications)").all() as {
     cid: number;
     name: string;
@@ -2955,8 +2981,8 @@ export function verifyMigration23SchemaAuthority(db: Database.Database): void {
     dflt_value: unknown;
     pk: number;
   }[];
-  if (adjColumns.length !== 31) {
-    throw new Error(`[ADJUDICATION_SCHEMA_AUTHORITY_INVALID] Table coder_submission_adjudications missing column authority: expected exactly 31 columns (found ${adjColumns.length})`);
+  if (adjColumns.length !== 36) {
+    throw new Error(`[ADJUDICATION_SCHEMA_AUTHORITY_INVALID] Table coder_submission_adjudications missing column authority: expected exactly 36 columns (found ${adjColumns.length})`);
   }
 
   const expectedAdjColumns: Record<string, { type: string; notnull: number; pk: number }> = {
@@ -2991,6 +3017,11 @@ export function verifyMigration23SchemaAuthority(db: Database.Database): void {
     verification_started_at: { type: 'TEXT', notnull: 0, pk: 0 },
     completed_at: { type: 'TEXT', notnull: 0, pk: 0 },
     recovery_fenced_at: { type: 'TEXT', notnull: 0, pk: 0 },
+    resolution_action: { type: 'TEXT', notnull: 0, pk: 0 },
+    resolution_timestamp: { type: 'TEXT', notnull: 0, pk: 0 },
+    resolution_evidence_json: { type: 'TEXT', notnull: 0, pk: 0 },
+    resolution_evidence_hash: { type: 'TEXT', notnull: 0, pk: 0 },
+    resolver_id: { type: 'TEXT', notnull: 0, pk: 0 },
   };
 
   for (const [colName, expected] of Object.entries(expectedAdjColumns)) {

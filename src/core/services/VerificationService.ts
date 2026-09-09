@@ -7,6 +7,7 @@ import { TestRun } from '../types/domain';
 import {
   SealedVerificationExecutionInput,
   SealedVerificationResult,
+  VerificationExecutionObservation,
 } from '../types/adjudication';
 import { computeSha256 } from '../../mcp/submissionProtocol';
 
@@ -78,10 +79,16 @@ export function parseTestMetrics(stdout: string, exitCode: number): ParsedTestMe
 }
 
 export class VerificationService {
+  public processRunner?: { execute: typeof ProcessRunner.execute };
+
   constructor(
     private repo: Repository,
     private artifactStore: ArtifactStore
   ) {}
+
+  public setProcessRunner(runner: { execute: typeof ProcessRunner.execute }): void {
+    this.processRunner = runner;
+  }
 
   public getArtifactStore(): ArtifactStore {
     return this.artifactStore;
@@ -228,13 +235,32 @@ export class VerificationService {
 
   public async executeSealedVerification(
     input: SealedVerificationExecutionInput
-  ): Promise<SealedVerificationResult> {
+  ): Promise<VerificationExecutionObservation> {
+    const startedAtIso = new Date().toISOString();
+
     // 1. Recompute and verify the sealed input before process spawn
     const recomputedCommandsHash = computeSha256(input.verification_commands_json);
     if (recomputedCommandsHash !== input.verification_commands_hash) {
       return {
         outcome: 'COMMAND_POLICY_REJECTED',
+        failure_code: 'COMMAND_POLICY_REJECTED',
         reason: `Verification commands hash mismatch: expected "${input.verification_commands_hash}", computed "${recomputedCommandsHash}"`,
+        command: '',
+        repo_path: input.repo_path,
+        started_at: startedAtIso,
+        finished_at: new Date().toISOString(),
+        exit_code: -1,
+        duration_ms: 0,
+        stdout: '',
+        stderr: 'Verification commands hash mismatch',
+        stdout_bytes: 0,
+        stderr_bytes: 0,
+        combined_output: '',
+        metrics: { passedCount: 0, failedCount: 0, skippedCount: 0 },
+        process_start: 'NOT_STARTED_PROVEN',
+        process_termination: 'NOT_APPLICABLE',
+        timed_out: false,
+        cancelled: false,
       };
     }
 
@@ -242,7 +268,24 @@ export class VerificationService {
     if (recomputedWorkspaceHash !== input.workspace_snapshot_before_hash) {
       return {
         outcome: 'COMMAND_POLICY_REJECTED',
+        failure_code: 'COMMAND_POLICY_REJECTED',
         reason: `Workspace snapshot before hash mismatch: expected "${input.workspace_snapshot_before_hash}", computed "${recomputedWorkspaceHash}"`,
+        command: '',
+        repo_path: input.repo_path,
+        started_at: startedAtIso,
+        finished_at: new Date().toISOString(),
+        exit_code: -1,
+        duration_ms: 0,
+        stdout: '',
+        stderr: 'Workspace snapshot before hash mismatch',
+        stdout_bytes: 0,
+        stderr_bytes: 0,
+        combined_output: '',
+        metrics: { passedCount: 0, failedCount: 0, skippedCount: 0 },
+        process_start: 'NOT_STARTED_PROVEN',
+        process_termination: 'NOT_APPLICABLE',
+        timed_out: false,
+        cancelled: false,
       };
     }
 
@@ -256,7 +299,24 @@ export class VerificationService {
     ) {
       return {
         outcome: 'COMMAND_POLICY_REJECTED',
+        failure_code: 'COMMAND_POLICY_REJECTED',
         reason: `Timeout must be a validated positive bounded integer between 1 and 600000 ms (got ${timeoutMs})`,
+        command: '',
+        repo_path: input.repo_path,
+        started_at: startedAtIso,
+        finished_at: new Date().toISOString(),
+        exit_code: -1,
+        duration_ms: 0,
+        stdout: '',
+        stderr: 'Invalid timeout',
+        stdout_bytes: 0,
+        stderr_bytes: 0,
+        combined_output: '',
+        metrics: { passedCount: 0, failedCount: 0, skippedCount: 0 },
+        process_start: 'NOT_STARTED_PROVEN',
+        process_termination: 'NOT_APPLICABLE',
+        timed_out: false,
+        cancelled: false,
       };
     }
 
@@ -267,7 +327,24 @@ export class VerificationService {
     } catch {
       return {
         outcome: 'COMMAND_POLICY_REJECTED',
+        failure_code: 'COMMAND_POLICY_REJECTED',
         reason: 'Verification commands snapshot is malformed JSON',
+        command: '',
+        repo_path: input.repo_path,
+        started_at: startedAtIso,
+        finished_at: new Date().toISOString(),
+        exit_code: -1,
+        duration_ms: 0,
+        stdout: '',
+        stderr: 'Malformed commands JSON',
+        stdout_bytes: 0,
+        stderr_bytes: 0,
+        combined_output: '',
+        metrics: { passedCount: 0, failedCount: 0, skippedCount: 0 },
+        process_start: 'NOT_STARTED_PROVEN',
+        process_termination: 'NOT_APPLICABLE',
+        timed_out: false,
+        cancelled: false,
       };
     }
 
@@ -278,7 +355,24 @@ export class VerificationService {
     ) {
       return {
         outcome: 'COMMAND_POLICY_REJECTED',
+        failure_code: 'COMMAND_POLICY_REJECTED',
         reason: 'Verification commands snapshot must be a non-null plain object',
+        command: '',
+        repo_path: input.repo_path,
+        started_at: startedAtIso,
+        finished_at: new Date().toISOString(),
+        exit_code: -1,
+        duration_ms: 0,
+        stdout: '',
+        stderr: 'Snapshot must be plain object',
+        stdout_bytes: 0,
+        stderr_bytes: 0,
+        combined_output: '',
+        metrics: { passedCount: 0, failedCount: 0, skippedCount: 0 },
+        process_start: 'NOT_STARTED_PROVEN',
+        process_termination: 'NOT_APPLICABLE',
+        timed_out: false,
+        cancelled: false,
       };
     }
 
@@ -291,7 +385,24 @@ export class VerificationService {
     ) {
       return {
         outcome: 'COMMAND_POLICY_REJECTED',
+        failure_code: 'COMMAND_POLICY_REJECTED',
         reason: 'No valid TEST command found in verification commands snapshot',
+        command: '',
+        repo_path: input.repo_path,
+        started_at: startedAtIso,
+        finished_at: new Date().toISOString(),
+        exit_code: -1,
+        duration_ms: 0,
+        stdout: '',
+        stderr: 'Missing TEST command',
+        stdout_bytes: 0,
+        stderr_bytes: 0,
+        combined_output: '',
+        metrics: { passedCount: 0, failedCount: 0, skippedCount: 0 },
+        process_start: 'NOT_STARTED_PROVEN',
+        process_termination: 'NOT_APPLICABLE',
+        timed_out: false,
+        cancelled: false,
       };
     }
 
@@ -299,7 +410,24 @@ export class VerificationService {
     if (typeof testCmdObj.executable !== 'string' || !Array.isArray(testCmdObj.args)) {
       return {
         outcome: 'COMMAND_POLICY_REJECTED',
+        failure_code: 'COMMAND_POLICY_REJECTED',
         reason: 'TEST command missing valid executable string or args array',
+        command: '',
+        repo_path: input.repo_path,
+        started_at: startedAtIso,
+        finished_at: new Date().toISOString(),
+        exit_code: -1,
+        duration_ms: 0,
+        stdout: '',
+        stderr: 'Invalid TEST command structure',
+        stdout_bytes: 0,
+        stderr_bytes: 0,
+        combined_output: '',
+        metrics: { passedCount: 0, failedCount: 0, skippedCount: 0 },
+        process_start: 'NOT_STARTED_PROVEN',
+        process_termination: 'NOT_APPLICABLE',
+        timed_out: false,
+        cancelled: false,
       };
     }
 
@@ -309,7 +437,24 @@ export class VerificationService {
       if (typeof a !== 'string') {
         return {
           outcome: 'COMMAND_POLICY_REJECTED',
+          failure_code: 'COMMAND_POLICY_REJECTED',
           reason: 'TEST command args must only contain strings',
+          command: '',
+          repo_path: input.repo_path,
+          started_at: startedAtIso,
+          finished_at: new Date().toISOString(),
+          exit_code: -1,
+          duration_ms: 0,
+          stdout: '',
+          stderr: 'Invalid arg types',
+          stdout_bytes: 0,
+          stderr_bytes: 0,
+          combined_output: '',
+          metrics: { passedCount: 0, failedCount: 0, skippedCount: 0 },
+          process_start: 'NOT_STARTED_PROVEN',
+          process_termination: 'NOT_APPLICABLE',
+          timed_out: false,
+          cancelled: false,
         };
       }
       args.push(a);
@@ -323,28 +468,41 @@ export class VerificationService {
     if (!policy.allowed) {
       return {
         outcome: 'COMMAND_POLICY_REJECTED',
+        failure_code: 'POLICY_VIOLATION',
         reason: `Verification denied by PolicyService: ${policy.reason} (${policy.decision})`,
+        command: fullCommandStr,
+        repo_path: input.repo_path,
+        started_at: startedAtIso,
+        finished_at: new Date().toISOString(),
+        exit_code: -1,
+        duration_ms: 0,
+        stdout: '',
+        stderr: `Security Policy Violation: ${policy.reason}`,
+        stdout_bytes: 0,
+        stderr_bytes: 0,
+        combined_output: '',
+        metrics: { passedCount: 0, failedCount: 0, skippedCount: 0 },
+        process_start: 'NOT_STARTED_PROVEN',
+        process_termination: 'NOT_APPLICABLE',
+        timed_out: false,
+        cancelled: false,
       };
     }
 
-    // 4. Spawn and execute with ProcessRunner
+    // 4. Spawn and execute with ProcessRunner (ZERO DB WRITES!)
     let result: import('./ProcessRunner').ProcessRunResult;
     try {
-      const runner = (this as any).processRunner || ProcessRunner;
+      const runner = this.processRunner || ProcessRunner;
       result = await runner.execute({
         executable,
         args,
         cwd: input.repo_path,
         timeoutMs,
-        maxStdoutBytes: input.policy.max_stdout_bytes,
-        maxStderrBytes: input.policy.max_stderr_bytes,
-        allowedEnvKeys: input.policy.allowed_env_keys,
-        repo: this.repo,
-        artifactStore: this.artifactStore,
-        projectId: input.project_id,
-        taskId: input.task_id,
-        attemptId: input.attempt_id,
+        maxStdoutBytes: input.policy?.max_stdout_bytes,
+        maxStderrBytes: input.policy?.max_stderr_bytes,
+        allowedEnvKeys: input.policy?.allowed_env_keys,
         executionId: input.verification_execution_id,
+        // ZERO DB WRITES: repo and artifactStore are omitted!
       });
     } catch (spawnErr: unknown) {
       const errMsg = spawnErr instanceof Error ? spawnErr.message : String(spawnErr);
@@ -352,111 +510,164 @@ export class VerificationService {
         outcome: 'RECOVERY_FENCED',
         failure_code: 'ORPHANED_VERIFICATION_INTERRUPTED',
         error: `Ambiguous process execution failure: ${errMsg}`,
+        command: fullCommandStr,
+        repo_path: input.repo_path,
+        started_at: startedAtIso,
+        finished_at: new Date().toISOString(),
+        exit_code: -1,
+        duration_ms: 0,
+        stdout: '',
+        stderr: errMsg,
+        stdout_bytes: 0,
+        stderr_bytes: 0,
+        combined_output: '',
+        metrics: { passedCount: 0, failedCount: 0, skippedCount: 0 },
+        process_start: 'START_AMBIGUOUS',
+        process_termination: 'TERMINATION_UNRESOLVED',
+        timed_out: false,
+        cancelled: false,
       };
     }
 
-    // 5. Classify process outcome per Section 6.3:
-    // - proven synchronous spawn failure: PROCESS_START_FAILED
-    if (result.errorCode === 'PROCESS_LAUNCH_FAILED' && result.pid === null) {
-      return {
-        outcome: 'PROCESS_START_FAILED',
-        error: result.stderr || 'Process launch failed before spawn',
-      };
-    }
-
-    // - process may have started but termination is not durably proven: RECOVERY_FENCED
-    if (result.pid !== null && (result.cancelled || (result.exitCode === -1 && !result.timedOut))) {
-      return {
-        outcome: 'RECOVERY_FENCED',
-        failure_code: 'ORPHANED_VERIFICATION_INTERRUPTED',
-        error: result.stderr || 'Process termination is not durably proven',
-      };
-    }
-
-    // Format output and build TestRun
+    const finishedAtIso = new Date().toISOString();
     const stdout = result.stdout;
     const stderr = result.stderr;
     const combinedOutput = `=== STDOUT ===\n${stdout}\n\n=== STDERR ===\n${stderr}`;
-
-    let evidenceId: string;
-    try {
-      evidenceId = crypto.randomUUID();
-      const evidence = this.artifactStore.store(
-        evidenceId,
-        input.project_id,
-        input.task_id,
-        input.attempt_id,
-        'TEST_RESULT',
-        `Test Execution (${commandName}): Exit Code ${result.exitCode}`,
-        combinedOutput,
-        'text/plain'
-      );
-      this.repo.createEvidence(evidence);
-    } catch (evErr: unknown) {
-      const msg = evErr instanceof Error ? evErr.message : String(evErr);
-      return {
-        outcome: 'RECOVERY_FENCED',
-        failure_code: 'EVIDENCE_CAPTURE_FAILED',
-        error: `Failed to persist process test result evidence: ${msg}`,
-      };
-    }
-
     const metrics = parseTestMetrics(stdout, result.exitCode);
+    const stdoutBytes = Buffer.byteLength(stdout, 'utf8');
+    const stderrBytes = Buffer.byteLength(stderr, 'utf8');
 
-    const testRun: TestRun = {
-      id: crypto.randomUUID(),
-      task_id: input.task_id,
-      command: fullCommandStr,
-      passed_count: metrics.passedCount,
-      failed_count: metrics.failedCount,
-      skipped_count: metrics.skippedCount,
-      duration_ms: result.durationMs,
-      exit_code: result.exitCode,
-      evidence_id: evidenceId,
-      created_at: new Date().toISOString(),
-    };
-
-    try {
-      this.repo.createTestRun(testRun);
-    } catch (runErr: unknown) {
-      const msg = runErr instanceof Error ? runErr.message : String(runErr);
+    // 5. Explicit Process Truth Classification per Section 6.4:
+    // - Policy / launch failure before spawn
+    if (result.errorCode === 'PROCESS_LAUNCH_FAILED' && result.pid === null && result.processStart === 'NOT_STARTED_PROVEN') {
       return {
-        outcome: 'RECOVERY_FENCED',
-        failure_code: 'EVIDENCE_CAPTURE_FAILED',
-        error: `Failed to persist test run record: ${msg}`,
+        outcome: 'PROCESS_START_FAILED',
+        failure_code: 'PROCESS_START_FAILED',
+        error: result.stderr || 'Process launch failed before spawn',
+        command: fullCommandStr,
+        repo_path: input.repo_path,
+        started_at: startedAtIso,
+        finished_at: finishedAtIso,
+        exit_code: -1,
+        duration_ms: result.durationMs,
+        stdout,
+        stderr,
+        stdout_bytes: stdoutBytes,
+        stderr_bytes: stderrBytes,
+        combined_output: combinedOutput,
+        metrics,
+        process_start: 'NOT_STARTED_PROVEN',
+        process_termination: 'NOT_APPLICABLE',
+        timed_out: false,
+        cancelled: false,
       };
     }
 
-    // - authoritative timeout with proven termination: TEST_TIMEOUT
+    // - Ambiguous process start or unresolved process tree termination MUST produce RECOVERY_FENCED
+    if (
+      result.processStart === 'START_AMBIGUOUS' ||
+      result.processTermination === 'TERMINATION_UNRESOLVED' ||
+      (result.pid !== null && (result.cancelled || (result.exitCode === -1 && !result.timedOut)))
+    ) {
+      let failureCode = 'ORPHANED_VERIFICATION_INTERRUPTED';
+      if (result.processStart === 'START_AMBIGUOUS' || result.processStart === 'NOT_STARTED_PROVEN') {
+        failureCode = 'PROCESS_START_FAILED';
+      } else if (result.processTermination === 'TERMINATION_UNRESOLVED') {
+        failureCode = 'PROCESS_TERMINATION_UNRESOLVED';
+      }
+      return {
+        outcome: 'RECOVERY_FENCED',
+        failure_code: failureCode,
+        error: result.stderr || 'Process start or termination truth is not durably proven',
+        command: fullCommandStr,
+        repo_path: input.repo_path,
+        started_at: startedAtIso,
+        finished_at: finishedAtIso,
+        exit_code: result.exitCode,
+        duration_ms: result.durationMs,
+        stdout,
+        stderr,
+        stdout_bytes: stdoutBytes,
+        stderr_bytes: stderrBytes,
+        combined_output: combinedOutput,
+        metrics,
+        process_start: result.processStart,
+        process_termination: result.processTermination,
+        timed_out: result.timedOut,
+        cancelled: result.cancelled,
+      };
+    }
+
+    // - Authoritative timeout with proven termination
     if (result.timedOut) {
       return {
         outcome: 'TEST_TIMEOUT',
-        test_run: testRun,
+        failure_code: 'VERIFICATION_TIMEOUT',
+        error: `Test execution timed out after ${result.durationMs}ms`,
+        command: fullCommandStr,
+        repo_path: input.repo_path,
+        started_at: startedAtIso,
+        finished_at: finishedAtIso,
+        exit_code: result.exitCode,
         duration_ms: result.durationMs,
+        stdout,
+        stderr,
+        stdout_bytes: stdoutBytes,
+        stderr_bytes: stderrBytes,
+        combined_output: combinedOutput,
+        metrics,
+        process_start: result.processStart,
+        process_termination: result.processTermination,
+        timed_out: true,
+        cancelled: false,
       };
     }
 
-    // - authoritative non-zero exit: TEST_FAILED
+    // - Authoritative non-zero exit
     if (result.exitCode !== 0) {
       return {
         outcome: 'TEST_FAILED',
-        test_run: testRun,
-        metrics,
+        failure_code: 'TESTS_FAILED',
+        error: `Test run failed with exit code ${result.exitCode}`,
+        command: fullCommandStr,
+        repo_path: input.repo_path,
+        started_at: startedAtIso,
+        finished_at: finishedAtIso,
+        exit_code: result.exitCode,
+        duration_ms: result.durationMs,
         stdout,
         stderr,
-        duration_ms: result.durationMs,
-        exit_code: result.exitCode,
+        stdout_bytes: stdoutBytes,
+        stderr_bytes: stderrBytes,
+        combined_output: combinedOutput,
+        metrics,
+        process_start: result.processStart,
+        process_termination: result.processTermination,
+        timed_out: false,
+        cancelled: false,
       };
     }
 
-    // - success: authoritative 0 exit
+    // - Authoritative 0 exit (Success)
     return {
       outcome: 'SUCCESS',
-      test_run: testRun,
-      metrics,
+      failure_code: null,
+      command: fullCommandStr,
+      repo_path: input.repo_path,
+      started_at: startedAtIso,
+      finished_at: finishedAtIso,
+      exit_code: 0,
+      duration_ms: result.durationMs,
       stdout,
       stderr,
-      duration_ms: result.durationMs,
+      stdout_bytes: stdoutBytes,
+      stderr_bytes: stderrBytes,
+      combined_output: combinedOutput,
+      metrics,
+      process_start: result.processStart,
+      process_termination: result.processTermination,
+      timed_out: false,
+      cancelled: false,
     };
   }
 

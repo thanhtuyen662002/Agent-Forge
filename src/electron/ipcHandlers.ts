@@ -450,21 +450,27 @@ export function registerIpcHandlers(
           `ADJUDICATION_SUBMISSION_NOT_FOUND: Submission "${activeOrLatestAdj.submission_id}" bound to adjudication "${activeOrLatestAdj.id}" not found.`
         );
       }
-      const adjTestRun = activeOrLatestAdj.test_run_id ? repo.getTestRun(activeOrLatestAdj.test_run_id) : null;
-      const gitStatusEv = activeOrLatestAdj.git_status_evidence_id
-        ? repo.getEvidence(activeOrLatestAdj.git_status_evidence_id)
-        : null;
-      const gitDiffEvFromAdj = activeOrLatestAdj.git_diff_evidence_id
-        ? repo.getEvidence(activeOrLatestAdj.git_diff_evidence_id)
-        : null;
+      try {
+        const projection = adjService.buildVerifiedAdjudicationReviewProjection(activeOrLatestAdj.id);
+        const reviewPackage = PackageGenerator.renderVerifiedAdjudicationReviewProjection(projection);
+        return { success: true, reviewPackage };
+      } catch {
+        const adjTestRun = activeOrLatestAdj.test_run_id ? repo.getTestRun(activeOrLatestAdj.test_run_id) : null;
+        const gitStatusEv = activeOrLatestAdj.git_status_evidence_id
+          ? repo.getEvidence(activeOrLatestAdj.git_status_evidence_id)
+          : null;
+        const gitDiffEvFromAdj = activeOrLatestAdj.git_diff_evidence_id
+          ? repo.getEvidence(activeOrLatestAdj.git_diff_evidence_id)
+          : null;
 
-      adjudicationLinkage = {
-        adjudication: activeOrLatestAdj,
-        submission,
-        testRun: adjTestRun,
-        gitStatusEvidence: gitStatusEv,
-        gitDiffEvidence: gitDiffEvFromAdj || gitDiffEv,
-      };
+        adjudicationLinkage = {
+          adjudication: activeOrLatestAdj,
+          submission,
+          testRun: adjTestRun,
+          gitStatusEvidence: gitStatusEv,
+          gitDiffEvidence: gitDiffEvFromAdj || gitDiffEv,
+        };
+      }
     }
 
     const reviewPackage = PackageGenerator.generateReviewPackage(

@@ -104,10 +104,16 @@ export interface CoderSubmissionAdjudication {
   recovery_fenced_at: string | null;
   verification_result_envelope_json?: string | null;
   verification_result_envelope_hash?: string | null;
+  resolution_action?: 'ACKNOWLEDGE' | 'CANCEL' | null;
+  resolution_timestamp?: string | null;
+  resolution_evidence_json?: string | null;
+  resolution_evidence_hash?: string | null;
+  resolver_id?: string | null;
 }
 
 export const CANONICAL_VERIFICATION_RESULT_ENVELOPE_KEYS = [
   'adjudication_id',
+  'artifact_manifest_hash',
   'assignment_id',
   'attempt_id',
   'authorization_id',
@@ -139,6 +145,7 @@ export type CanonicalVerificationResultEnvelopeKey = (typeof CANONICAL_VERIFICAT
 
 export interface CanonicalVerificationResultEnvelope {
   adjudication_id: string;
+  artifact_manifest_hash: string;
   assignment_id: string;
   attempt_id: string;
   authorization_id: string;
@@ -152,12 +159,12 @@ export interface CanonicalVerificationResultEnvelope {
   git_status_evidence_hash: string;
   git_status_evidence_id: string;
   lifecycle_version: number;
-  process_start_classification: 'SPAWNED_PROVEN' | 'LAUNCH_FAILED_PROVEN';
+  process_start_classification: 'SPAWNED_PROVEN' | 'LAUNCH_FAILED_PROVEN' | 'NOT_STARTED_PROVEN';
   project_id: string;
   start_timestamp: string;
   task_id: string;
   task_ownership_epoch: number;
-  termination_classification: 'TERMINATION_PROVEN' | 'TERMINATION_AMBIGUOUS';
+  termination_classification: 'TERMINATION_PROVEN' | 'TERMINATION_AMBIGUOUS' | 'NOT_APPLICABLE';
   test_result_evidence_hash: string;
   test_result_evidence_id: string;
   test_run_id: string;
@@ -503,6 +510,98 @@ export type SealedVerificationResult =
       failure_code: 'ORPHANED_VERIFICATION_INTERRUPTED' | 'EVIDENCE_CAPTURE_FAILED' | 'INTEGRITY_MISMATCH';
       error: string;
     };
+
+export interface VerificationExecutionObservation {
+  outcome: 'SUCCESS' | 'TEST_FAILED' | 'TEST_TIMEOUT' | 'COMMAND_POLICY_REJECTED' | 'PROCESS_START_FAILED' | 'RECOVERY_FENCED';
+  failure_code?: string | null;
+  reason?: string;
+  error?: string;
+  command: string;
+  repo_path: string;
+  started_at: string;
+  finished_at: string;
+  exit_code: number;
+  duration_ms: number;
+  stdout: string;
+  stderr: string;
+  stdout_bytes: number;
+  stderr_bytes: number;
+  combined_output: string;
+  metrics: ParsedTestMetrics;
+  process_start: 'NOT_STARTED_PROVEN' | 'STARTED_PROVEN' | 'START_AMBIGUOUS';
+  process_termination: 'NOT_APPLICABLE' | 'PROCESS_TREE_TERMINATED_PROVEN' | 'TERMINATION_UNRESOLVED';
+  timed_out: boolean;
+  cancelled: boolean;
+  scrubbed_diagnostic_code?: string;
+}
+
+export interface VerifiedAdjudicationReviewProjection {
+  adjudication_id: string;
+  submission_id: string;
+  project_id: string;
+  project_name: string;
+  task_id: string;
+  task_title: string;
+  task_priority: string;
+  task_risk: string;
+  task_revision_count: number;
+  task_max_revisions: number;
+  task_base_sha: string;
+  task_working_sha: string;
+  acceptance_criteria: string[];
+  previous_issues: Array<{ severity: string; title: string; file_path?: string; description: string }>;
+  untrusted_claim: {
+    summary: string;
+    completed: string[];
+    files_claimed_changed: string[];
+    tests_claimed: string[];
+    blockers: string[];
+    claim_content_hash: string;
+  };
+  authoritative_verification: {
+    test_run_id: string | null;
+    command: string | null;
+    command_snapshot_hash: string | null;
+    exit_code: number | null;
+    passed_count: number;
+    failed_count: number;
+    skipped_count: number;
+    duration_ms: number;
+    test_result_evidence_id: string | null;
+    test_result_evidence_hash: string | null;
+    verdict: 'PASSED' | 'FAILED' | 'TIMEOUT' | 'FENCED' | 'NOT_RUN';
+  };
+  authoritative_git_status: {
+    evidence_id: string | null;
+    evidence_hash: string | null;
+    storage_type: 'INLINE' | 'FILE';
+    is_clean: boolean;
+    branch?: string | null;
+    summary: string;
+  } | null;
+  authoritative_git_diff: {
+    evidence_id: string | null;
+    evidence_hash: string | null;
+    storage_type: 'INLINE' | 'FILE';
+    byte_size: number;
+    diff_content: string;
+    is_truncated: boolean;
+    files_changed_count?: number;
+  } | null;
+  recovery_fencing_state: {
+    is_fenced: boolean;
+    status: AdjudicationStatus;
+    failure_code: string | null;
+    recovery_fenced_at: string | null;
+    resolution_action: string | null;
+  } | null;
+  operator_disposition: {
+    disposition_event: string | null;
+    disposition_reason: string | null;
+    decided_at: string | null;
+  } | null;
+  projection_hash: string;
+}
 
 export type SubmissionAuthorityIntegrityResult =
   | {

@@ -19,6 +19,7 @@ import {
   deriveDeterministicGenericAdjudicationEventId,
   deriveDeterministicDispositionId,
 } from './CoderSubmissionAdjudicationService';
+import { verifyEvidenceIntegrity } from './ArtifactStore';
 
 export class CoderSubmissionAdjudicationRecoveryScanner {
   private adjudicationService: CoderSubmissionAdjudicationService;
@@ -26,9 +27,10 @@ export class CoderSubmissionAdjudicationRecoveryScanner {
   constructor(
     private db: Database.Database,
     private repo: Repository,
-    private eventService?: EventService
+    private eventService?: EventService,
+    adjudicationService?: CoderSubmissionAdjudicationService
   ) {
-    this.adjudicationService = new CoderSubmissionAdjudicationService(this.repo, this.db);
+    this.adjudicationService = adjudicationService ?? new CoderSubmissionAdjudicationService(this.repo, this.db);
   }
 
   public scanAndReconcile(): AdjudicationRecoveryScanReport {
@@ -166,6 +168,36 @@ export class CoderSubmissionAdjudicationRecoveryScanner {
       adj.status === 'SUPERSEDED' ||
       adj.status === 'RECOVERY_FENCED'
     ) {
+      if (adj.status === 'VERIFIED') {
+        let contradiction: string | null = null;
+        if (!adj.test_run_id) {
+          contradiction = 'VERIFIED adjudication missing test_run_id';
+        } else {
+          const tr = this.repo.getTestRun(adj.test_run_id);
+          if (!tr || tr.exit_code !== 0) {
+            contradiction = 'VERIFIED adjudication test run missing or non-zero exit code';
+          }
+        }
+        if (!contradiction && task && (task.state === 'VALIDATING' || task.state === 'CODING')) {
+          contradiction = `VERIFIED adjudication has contradictory live task state: ${task.state}`;
+        }
+        if (contradiction) {
+          this.fenceAdjudication(
+            adj,
+            'INTEGRITY_MISMATCH',
+            contradiction,
+            nowIso
+          );
+          return {
+            adjudication_id: adj.id,
+            submission_id: adj.submission_id,
+            classification: 'AUTHORITY_CONFLICT',
+            action_taken: 'FENCED_CONFLICT',
+            error: contradiction,
+          };
+        }
+      }
+
       return {
         adjudication_id: adj.id,
         submission_id: adj.submission_id,
@@ -176,6 +208,23 @@ export class CoderSubmissionAdjudicationRecoveryScanner {
 
     // 3. ADMITTED: PRE_VERIFICATION_NOT_STARTED
     if (adj.status === 'ADMITTED') {
+      const authIntegrity = this.adjudicationService.validateSubmissionAndAuthorityIntegrity(sub);
+      if (!authIntegrity.valid) {
+        this.fenceAdjudication(
+          adj,
+          'INTEGRITY_MISMATCH',
+          `Authority verifier failed on ADMITTED row: ${authIntegrity.fenced_reasons.join('; ')}`,
+          nowIso
+        );
+        return {
+          adjudication_id: adj.id,
+          submission_id: adj.submission_id,
+          classification: 'AUTHORITY_CONFLICT',
+          action_taken: 'FENCED_CONFLICT',
+          error: 'Authority integrity failed on ADMITTED row',
+        };
+      }
+
       if (!adj.verification_execution_id && !adj.verification_started_at) {
         // Keep admitted, do NOT run command, expose Owner resume/cancel action
         return {
@@ -288,7 +337,7 @@ export class CoderSubmissionAdjudicationRecoveryScanner {
         }
       }
 
-      // Condition 7: Test-result evidence exists with exact bindings
+      // Condition 7: Test-result evidence exists with exact bindings and integrity
       if (!settlementError && parsedEnvelope && parsedEnvelope.test_result_evidence_id) {
         const testEv = this.repo.getEvidence(parsedEnvelope.test_result_evidence_id);
         if (!testEv) {
@@ -301,10 +350,15 @@ export class CoderSubmissionAdjudicationRecoveryScanner {
           testEv.hash !== parsedEnvelope.test_result_evidence_hash
         ) {
           settlementError = 'Test result evidence authority bindings or hash mismatch';
+        } else {
+          const integ = verifyEvidenceIntegrity(testEv, this.adjudicationService.getArtifactStore());
+          if (!integ.valid) {
+            settlementError = `Test result evidence integrity failed: ${integ.reason}`;
+          }
         }
       }
 
-      // Condition 8: Git status and Git diff evidence exist with exact bindings
+      // Condition 8: Git status and Git diff evidence exist with exact bindings and disk/inline integrity
       let gitStatusEvId: string | null = null;
       let gitDiffEvId: string | null = null;
       if (!settlementError && parsedEnvelope) {
@@ -317,12 +371,16 @@ export class CoderSubmissionAdjudicationRecoveryScanner {
             gse.task_id !== adj.task_id ||
             gse.attempt_id !== adj.attempt_id ||
             gse.evidence_type !== 'GIT_STATUS' ||
-            gse.hash !== parsedEnvelope.git_status_evidence_hash ||
-            computeSha256(gse.raw_payload ?? '') !== gse.hash
+            gse.hash !== parsedEnvelope.git_status_evidence_hash
           ) {
             settlementError = 'Git status evidence authority bindings or hash mismatch';
           } else {
-            gitStatusEvId = gse.id;
+            const integ = verifyEvidenceIntegrity(gse, this.adjudicationService.getArtifactStore());
+            if (!integ.valid) {
+              settlementError = `Git status evidence integrity failed: ${integ.reason}`;
+            } else {
+              gitStatusEvId = gse.id;
+            }
           }
         }
         if (!settlementError && parsedEnvelope.git_diff_evidence_id) {
@@ -334,12 +392,16 @@ export class CoderSubmissionAdjudicationRecoveryScanner {
             gde.task_id !== adj.task_id ||
             gde.attempt_id !== adj.attempt_id ||
             gde.evidence_type !== 'GIT_DIFF' ||
-            gde.hash !== parsedEnvelope.git_diff_evidence_hash ||
-            computeSha256(gde.raw_payload ?? '') !== gde.hash
+            gde.hash !== parsedEnvelope.git_diff_evidence_hash
           ) {
             settlementError = 'Git diff evidence authority bindings or hash mismatch';
           } else {
-            gitDiffEvId = gde.id;
+            const integ = verifyEvidenceIntegrity(gde, this.adjudicationService.getArtifactStore());
+            if (!integ.valid) {
+              settlementError = `Git diff evidence integrity failed: ${integ.reason}`;
+            } else {
+              gitDiffEvId = gde.id;
+            }
           }
         }
       }
@@ -525,12 +587,11 @@ export class CoderSubmissionAdjudicationRecoveryScanner {
       if (transitionTask) {
         const liveTask = this.repo.getTask(adj.task_id);
         if (liveTask && liveTask.state === 'VALIDATING') {
-          // Legal state machine transition only: no direct updateTaskState bypass
           const trans = TaskStateMachine.transition(liveTask.state, 'TESTS_FAILED', {
-            revisionCount: 999,
-            maxRevisions: 1,
+            revisionCount: liveTask.revision_count,
+            maxRevisions: liveTask.max_revisions ?? 3,
           });
-          this.repo.updateTaskState(liveTask.id, trans.nextState);
+          this.repo.updateTaskState(liveTask.id, trans.nextState, null, trans.incrementRevision);
         }
       }
     });

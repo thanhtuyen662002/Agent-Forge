@@ -51,7 +51,9 @@ function Stop-ProcessWithBoundedWait {
   if (-not $TargetProcess.HasExited) {
     try {
       taskkill /F /T /PID $TargetProcess.Id 2>$null | Out-Null
-    } catch {}
+    } catch {
+      Write-Host "CLEANUP_NOTE: taskkill /F /T failed: $_"
+    }
     try {
       $TargetProcess.Kill()
       $TargetProcess.WaitForExit($KillTimeoutMs) | Out-Null
@@ -197,7 +199,9 @@ try {
         if ($null -ne $report -and ($report.status -eq 'READY' -or $report.status -eq 'FAILED')) {
           break
         }
-      } catch {}
+      } catch {
+        Write-Verbose "Read smoke report attempt failed: $_"
+      }
     }
   }
 
