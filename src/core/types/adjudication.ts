@@ -55,6 +55,7 @@ export const AdjudicationFailureCodeEnum = z.enum([
   'COMMAND_CONFIG_MISSING',
   'RECOVERY_FENCED',
   'RECOVERY_ACKNOWLEDGED',
+  'POST_COMMIT_FINALIZATION_UNCERTAINTY',
 ]);
 export type AdjudicationFailureCode = z.infer<typeof AdjudicationFailureCodeEnum>;
 
@@ -101,6 +102,93 @@ export interface CoderSubmissionAdjudication {
   verification_started_at: string | null;
   completed_at: string | null;
   recovery_fenced_at: string | null;
+  verification_result_envelope_json?: string | null;
+  verification_result_envelope_hash?: string | null;
+}
+
+export const CANONICAL_VERIFICATION_RESULT_ENVELOPE_KEYS = [
+  'adjudication_id',
+  'assignment_id',
+  'attempt_id',
+  'authorization_id',
+  'command_snapshot_hash',
+  'exit_classification',
+  'failure_code',
+  'failure_payload',
+  'finish_timestamp',
+  'git_diff_evidence_hash',
+  'git_diff_evidence_id',
+  'git_status_evidence_hash',
+  'git_status_evidence_id',
+  'lifecycle_version',
+  'process_start_classification',
+  'project_id',
+  'start_timestamp',
+  'task_id',
+  'task_ownership_epoch',
+  'termination_classification',
+  'test_result_evidence_hash',
+  'test_result_evidence_id',
+  'test_run_id',
+  'verification_execution_id',
+  'workspace_snapshot_after_hash',
+  'workspace_snapshot_before_hash',
+] as const;
+
+export type CanonicalVerificationResultEnvelopeKey = (typeof CANONICAL_VERIFICATION_RESULT_ENVELOPE_KEYS)[number];
+
+export interface CanonicalVerificationResultEnvelope {
+  adjudication_id: string;
+  assignment_id: string;
+  attempt_id: string;
+  authorization_id: string;
+  command_snapshot_hash: string;
+  exit_classification: 'EXIT_ZERO' | 'EXIT_NONZERO' | 'TIMEOUT' | 'CANCELLED' | 'UNKNOWN';
+  failure_code: string | null;
+  failure_payload: Record<string, unknown> | null;
+  finish_timestamp: string;
+  git_diff_evidence_hash: string;
+  git_diff_evidence_id: string;
+  git_status_evidence_hash: string;
+  git_status_evidence_id: string;
+  lifecycle_version: number;
+  process_start_classification: 'SPAWNED_PROVEN' | 'LAUNCH_FAILED_PROVEN';
+  project_id: string;
+  start_timestamp: string;
+  task_id: string;
+  task_ownership_epoch: number;
+  termination_classification: 'TERMINATION_PROVEN' | 'TERMINATION_AMBIGUOUS';
+  test_result_evidence_hash: string;
+  test_result_evidence_id: string;
+  test_run_id: string;
+  verification_execution_id: string;
+  workspace_snapshot_after_hash: string;
+  workspace_snapshot_before_hash: string;
+}
+
+export interface StagedEvidenceFile {
+  id: string;
+  project_id: string;
+  task_id: string;
+  attempt_id: string | null;
+  evidence_type: 'TEST_RESULT' | 'GIT_STATUS' | 'GIT_DIFF';
+  summary: string;
+  content_type: string;
+  hash: string;
+  byte_size: number;
+  storage_type: 'INLINE' | 'FILE';
+  staged_file_path: string | null;
+  final_file_path: string | null;
+  raw_payload: string | null;
+}
+
+export interface StagingManifest {
+  manifest_id: string;
+  adjudication_id: string;
+  execution_id: string;
+  created_at: string;
+  entries: StagedEvidenceFile[];
+  manifest_hash: string;
 }
 
 export interface CoderSubmissionAdjudicationEvent {
@@ -245,6 +333,14 @@ export interface QuarantinedSubmissionInspection {
     claim_content_hash_matches: boolean;
     canonical_envelope_hash_matches: boolean;
     fenced_reasons: string[];
+  };
+  integrity_status?: string;
+  integrity_fenced_reasons?: string[];
+  untrusted_claim?: {
+    summary?: string;
+    files_claimed_changed?: string[];
+    tests_claimed?: string[];
+    blockers?: string[];
   };
   dispositions: Array<{
     id: string;

@@ -709,6 +709,13 @@ export interface TranslationDictionary {
     confirmRejectMessage: string;
     confirmSupersedeTitle: string;
     confirmSupersedeMessage: string;
+    confirmResumeTitle: string;
+    confirmResumeMessage: string;
+    confirmAcknowledgeTitle: string;
+    confirmAcknowledgeMessage: string;
+    nonAuthoritativeBadge: string;
+    noSummaryProvided: string;
+    none: string;
     rejectReasonLabel: string;
     rejectReasonPlaceholder: string;
     supersedeReasonLabel: string;

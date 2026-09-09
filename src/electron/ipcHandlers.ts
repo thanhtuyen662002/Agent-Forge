@@ -51,12 +51,15 @@ import {
   ResumeAdmittedSubmissionIpcSchema,
   AcknowledgeRecoveryFencedIpcSchema,
 } from '../core/types/ipc';
-import { CoderSubmissionAdjudicationService } from '../core/services/CoderSubmissionAdjudicationService';
+import {
+  CoderSubmissionAdjudicationService,
+  scrubAdjudicationDiagnostics,
+} from '../core/services/CoderSubmissionAdjudicationService';
 import { CoderSubmissionAdjudicationError } from '../core/types/adjudication';
 
-function scrubAdjudicationError(err: unknown): { code: string; message: string } {
+export function scrubAdjudicationError(err: unknown): { code: string; message: string } {
   if (err instanceof CoderSubmissionAdjudicationError) {
-    return { code: err.code, message: err.message };
+    return { code: err.code, message: scrubAdjudicationDiagnostics(err.message) };
   }
   const msg = err instanceof Error ? err.message : String(err);
   if (msg.includes('NOT_FOUND')) return { code: 'NOT_FOUND', message: 'Requested resource not found.' };

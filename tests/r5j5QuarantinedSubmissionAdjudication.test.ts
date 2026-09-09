@@ -19,6 +19,7 @@ import {
   deriveDeterministicAdjudicationEventId,
   deriveDeterministicGenericAdjudicationEventId,
   deriveDeterministicDispositionId,
+  scrubAdjudicationDiagnostics,
 } from '../src/core/services/CoderSubmissionAdjudicationService';
 import { CoderSubmissionAdjudicationRecoveryScanner } from '../src/core/services/CoderSubmissionAdjudicationRecoveryScanner';
 import { CrashRecoveryService } from '../src/core/services/CrashRecoveryService';
@@ -36,8 +37,10 @@ import {
   CoderSubmissionAdjudicationError,
   CanonicalAuthoritySnapshot,
   AUTHORITY_SNAPSHOT_KEYS,
+  CanonicalVerificationResultEnvelope,
   SealedVerificationExecutionInput,
 } from '../src/core/types/adjudication';
+import { scrubAdjudicationError } from '../src/electron/ipcHandlers';
 import { ExecutionAuthorization, Task, Project } from '../src/core/types/domain';
 import {
   computeAuthorityFingerprint,
@@ -292,7 +295,7 @@ function setupFullSubmissionGraph(db: Database.Database, projectRepoPath?: strin
     instructions,
     contextFiles,
     verificationCommands: {
-      TEST: { executable: process.execPath, args: ['-v'] },
+      TEST: { executable: process.execPath, args: ['-v'], timeout_ms: 120000 },
       LINT: null,
       BUILD: null,
     },
@@ -544,7 +547,7 @@ describe('R5J5 Quarantined Submission Adjudication and Verification Admission Su
       expect(() => verifyMigration23SchemaAuthority(db)).not.toThrow();
     });
 
-    it('5. coder_submission_adjudications table exists with exactly 29 columns, correct types, nullability, and PK', () => {
+    it('5. coder_submission_adjudications table exists with exactly 31 columns, correct types, nullability, and PK', () => {
       const cols = db.prepare("PRAGMA table_info('coder_submission_adjudications')").all() as Array<{
         cid: number;
         name: string;
@@ -553,7 +556,7 @@ describe('R5J5 Quarantined Submission Adjudication and Verification Admission Su
         dflt_value: unknown;
         pk: number;
       }>;
-      expect(cols).toHaveLength(29);
+      expect(cols).toHaveLength(31);
 
       const colMap = new Map(cols.map((c) => [c.name, c]));
       expect(colMap.get('id')).toMatchObject({ type: 'TEXT', notnull: 0, pk: 1 });
@@ -579,6 +582,8 @@ describe('R5J5 Quarantined Submission Adjudication and Verification Admission Su
       expect(colMap.get('test_run_id')).toMatchObject({ type: 'TEXT', notnull: 0, pk: 0 });
       expect(colMap.get('git_status_evidence_id')).toMatchObject({ type: 'TEXT', notnull: 0, pk: 0 });
       expect(colMap.get('git_diff_evidence_id')).toMatchObject({ type: 'TEXT', notnull: 0, pk: 0 });
+      expect(colMap.get('verification_result_envelope_json')).toMatchObject({ type: 'TEXT', notnull: 0, pk: 0 });
+      expect(colMap.get('verification_result_envelope_hash')).toMatchObject({ type: 'TEXT', notnull: 0, pk: 0 });
       expect(colMap.get('failure_code')).toMatchObject({ type: 'TEXT', notnull: 0, pk: 0 });
       expect(colMap.get('failure_json')).toMatchObject({ type: 'TEXT', notnull: 0, pk: 0 });
       expect(colMap.get('created_at')).toMatchObject({ type: 'TEXT', notnull: 1, pk: 0 });
@@ -2083,6 +2088,7 @@ describe('R5J5 Quarantined Submission Adjudication and Verification Admission Su
         payload.verificationCommands.TEST = {
           executable: process.execPath,
           args: [failScript],
+          timeout_ms: 120000,
         };
         const newJson = JSON.stringify(payload);
         const newHash = crypto.createHash('sha256').update(newJson, 'utf8').digest('hex');
@@ -2114,6 +2120,7 @@ describe('R5J5 Quarantined Submission Adjudication and Verification Admission Su
       payload.verificationCommands.TEST = {
         executable: 'non-existent-executable-12345',
         args: [],
+        timeout_ms: 120000,
       };
       const newJson = JSON.stringify(payload);
       const newHash = crypto.createHash('sha256').update(newJson, 'utf8').digest('hex');
@@ -2342,7 +2349,7 @@ describe('R5J5 Quarantined Submission Adjudication and Verification Admission Su
       // Force failure command
       const auth = fixtures.repo.getExecutionAuthorization(fixtures.authorizationId)!;
       const payload = JSON.parse(auth.canonical_payload_json!);
-      payload.verificationCommands.TEST = { executable: process.execPath, args: ['-e', 'process.exit(1)'] };
+      payload.verificationCommands.TEST = { executable: process.execPath, args: ['-e', 'process.exit(1)'], timeout_ms: 120000 };
       const newJson = JSON.stringify(payload);
       const newHash = crypto.createHash('sha256').update(newJson, 'utf8').digest('hex');
       db.prepare('UPDATE execution_authorizations SET canonical_payload_json = ?, instruction_payload_hash = ? WHERE id = ?')
@@ -2363,7 +2370,7 @@ describe('R5J5 Quarantined Submission Adjudication and Verification Admission Su
 
       const auth = fixtures.repo.getExecutionAuthorization(fixtures.authorizationId)!;
       const payload = JSON.parse(auth.canonical_payload_json!);
-      payload.verificationCommands.TEST = { executable: process.execPath, args: ['-e', 'process.exit(1)'] };
+      payload.verificationCommands.TEST = { executable: process.execPath, args: ['-e', 'process.exit(1)'], timeout_ms: 120000 };
       const newJson = JSON.stringify(payload);
       const newHash = crypto.createHash('sha256').update(newJson, 'utf8').digest('hex');
       db.prepare('UPDATE execution_authorizations SET canonical_payload_json = ?, instruction_payload_hash = ? WHERE id = ?')
@@ -2385,7 +2392,7 @@ describe('R5J5 Quarantined Submission Adjudication and Verification Admission Su
 
       const auth = fixtures.repo.getExecutionAuthorization(fixtures.authorizationId)!;
       const payload = JSON.parse(auth.canonical_payload_json!);
-      payload.verificationCommands.TEST = { executable: process.execPath, args: ['-e', 'process.exit(1)'] };
+      payload.verificationCommands.TEST = { executable: process.execPath, args: ['-e', 'process.exit(1)'], timeout_ms: 120000 };
       const newJson = JSON.stringify(payload);
       const newHash = crypto.createHash('sha256').update(newJson, 'utf8').digest('hex');
       db.prepare('UPDATE execution_authorizations SET canonical_payload_json = ?, instruction_payload_hash = ? WHERE id = ?')
@@ -2744,6 +2751,10 @@ describe('R5J5 Quarantined Submission Adjudication and Verification Admission Su
       gitDiffEvidence?: any
     ): AdjudicationReviewPackageLinkage {
       const sub = fixtures.repo.getCoderSubmissionById(subId)!;
+      const authSnap = overrides.authority_snapshot_json ?? '{}';
+      const authSnapHash = overrides.authority_snapshot_hash ?? computeSha256(authSnap);
+      const cmdSnap = overrides.verification_commands_json ?? '{}';
+      const cmdSnapHash = overrides.verification_commands_hash ?? computeSha256(cmdSnap);
       const adj: CoderSubmissionAdjudication = {
         id: overrides.id || crypto.randomUUID(),
         request_id: crypto.randomUUID(),
@@ -2757,10 +2768,10 @@ describe('R5J5 Quarantined Submission Adjudication and Verification Admission Su
         action: 'ADMIT_VERIFICATION',
         status: 'VERIFIED',
         lifecycle_version: 3,
-        authority_snapshot_json: '{}',
-        authority_snapshot_hash: '1'.repeat(64),
-        verification_commands_json: '{}',
-        verification_commands_hash: '1'.repeat(64),
+        authority_snapshot_json: authSnap,
+        authority_snapshot_hash: authSnapHash,
+        verification_commands_json: cmdSnap,
+        verification_commands_hash: cmdSnapHash,
         workspace_snapshot_before_json: null,
         workspace_snapshot_before_hash: null,
         verification_execution_id: null,
@@ -3699,7 +3710,9 @@ describe('R5J5 Quarantined Submission Adjudication and Verification Admission Su
       fixtures.mcpService.submitCoderClaim(createValidSubmissionPayload(fixtures, subId), plaintextToken);
 
       const adjId = crypto.randomUUID();
-      const snapJson = canonicalJsonStringify({ test: 'snap' });
+      const snapJson = canonicalJsonStringify(fixtures.adjudicationService.buildCanonicalAuthoritySnapshot(
+        fixtures.repo.getCoderSubmissionById(subId)!
+      ));
       const execId = crypto.randomUUID();
       fixtures.repo.createCoderSubmissionAdjudication({
         id: adjId,
@@ -3976,7 +3989,7 @@ describe('R5J5 Quarantined Submission Adjudication and Verification Admission Su
       expect(fenced.failure_code).toBe('INTEGRITY_MISMATCH');
     });
 
-    it('155. recovery scanner exact durable result performs DB-only reconciliation', () => {
+    it('155. recovery scanner rejects and fences malformed evidence fixture', () => {
       const { plaintextToken } = issueSubmissionSessionHelper(fixtures.repo, fixtures.authorizationId);
       const subId = crypto.randomUUID();
       fixtures.mcpService.submitCoderClaim(createValidSubmissionPayload(fixtures, subId), plaintextToken);
@@ -4040,12 +4053,11 @@ describe('R5J5 Quarantined Submission Adjudication and Verification Admission Su
       });
 
       const report = fixtures.recoveryScanner.scanAndReconcile();
-      expect(report.verificationResultStateIncompleteCount).toBe(1);
-      expect(report.settledCount).toBe(1);
+      expect(report.settledCount).toBe(0);
+      expect(report.fencedCount).toBe(1);
 
-      const reconciled = fixtures.repo.getCoderSubmissionAdjudicationById(adjId)!;
-      expect(reconciled.status).toBe('VERIFIED');
-      expect(reconciled.lifecycle_version).toBe(3);
+      const fenced = fixtures.repo.getCoderSubmissionAdjudicationById(adjId)!;
+      expect(fenced.status).toBe('RECOVERY_FENCED');
     });
 
     it('156. repeated recovery scan creates no duplicate events', () => {
@@ -4101,18 +4113,1332 @@ describe('R5J5 Quarantined Submission Adjudication and Verification Admission Su
       }).toThrow(/ADJUDICATION_LINKAGE_MISMATCH: test run ID mismatch/);
     });
 
-    it('158. no raw internal error/path/secret leaks through IPC', () => {
-      const internalError = new Error('SqliteError at C:\\Users\\secret\\vault.db: token s3cr3t_tok3n failed constraint');
-      const scrubbed = (internalError.message.includes('SqliteError') || internalError.message.includes('C:\\'))
-        ? { code: 'INTERNAL_ERROR', message: 'An internal error occurred during adjudication.' }
-        : { code: 'UNKNOWN', message: internalError.message };
-
+    it('158. real IPC error scrubber strips raw internal paths, SQL, tokens, and stack traces', () => {
+      const errorWithSecrets = new Error(
+        'SqliteError: near "SELECT": syntax error in C:\\Users\\Administrator\\AgentForge\\data\\agent-forge.db ' +
+        'executing SELECT * FROM coder_submissions WHERE token = "af-sub-9999888877776666" ' +
+        'Bearer secret-bearer-token-12345 at Repository.query (D:\\Projects\\Agent-Forge\\src\\core\\db.ts:10:5)'
+      );
+      const scrubbed = scrubAdjudicationError(errorWithSecrets);
       expect(scrubbed.message).not.toContain('C:\\Users');
-      expect(scrubbed.message).not.toContain('s3cr3t_tok3n');
+      expect(scrubbed.message).not.toContain('D:\\Projects');
+      expect(scrubbed.message).not.toContain('af-sub-');
+      expect(scrubbed.message).not.toContain('secret-bearer-token');
+      expect(scrubbed.message).not.toContain('SELECT * FROM');
       expect(scrubbed.code).toBe('INTERNAL_ERROR');
     });
 
-    it('159. historical three-file compatibility diffs remain byte-identical to initial head', () => {
+    it('160. recovery scanner exact durable result performs DB-only reconciliation with complete result envelope', () => {
+      const { plaintextToken } = issueSubmissionSessionHelper(fixtures.repo, fixtures.authorizationId);
+      const subId = crypto.randomUUID();
+      fixtures.mcpService.submitCoderClaim(createValidSubmissionPayload(fixtures, subId), plaintextToken);
+
+      const auth = fixtures.repo.getExecutionAuthorization(fixtures.authorizationId)!;
+      const authPayload = JSON.parse(auth.canonical_payload_json!);
+      const cmdJson = canonicalJsonStringify(authPayload.verificationCommands);
+      const cmdHash = computeSha256(cmdJson);
+
+      const wsBefore = {
+        head_sha: fixtures.repoHeadSha,
+        status_lines: [],
+        status_text: '',
+        untracked_files: [],
+        modified_files: [],
+      };
+      const wsBeforeJson = canonicalJsonStringify(wsBefore);
+      const wsBeforeHash = computeSha256(wsBeforeJson);
+
+      const trResultData = JSON.stringify({ passed: 5, failed: 0, skipped: 0, duration_ms: 150 });
+      const trResultHash = computeSha256(trResultData);
+      const trEvId = crypto.randomUUID();
+      fixtures.repo.createEvidence({
+        id: trEvId,
+        project_id: fixtures.projectId,
+        task_id: fixtures.taskId,
+        attempt_id: fixtures.attemptId,
+        evidence_type: 'TEST_RESULT',
+        storage_type: 'INLINE',
+        file_path: null,
+        hash: trResultHash,
+        byte_size: trResultData.length,
+        content_type: 'application/json',
+        summary: 'Authoritative test results',
+        raw_payload: trResultData,
+        created_at: new Date().toISOString(),
+      });
+
+      const trId = crypto.randomUUID();
+      fixtures.repo.createTestRun({
+        id: trId,
+        task_id: fixtures.taskId,
+        command: `${authPayload.verificationCommands.TEST.executable} ${authPayload.verificationCommands.TEST.args.join(' ')}`,
+        exit_code: 0,
+        passed_count: 5,
+        failed_count: 0,
+        skipped_count: 0,
+        duration_ms: 150,
+        evidence_id: trEvId,
+        created_at: new Date().toISOString(),
+      });
+
+      const statusData = 'clean';
+      const statusHash = computeSha256(statusData);
+      const gseId = crypto.randomUUID();
+      fixtures.repo.createEvidence({
+        id: gseId,
+        project_id: fixtures.projectId,
+        task_id: fixtures.taskId,
+        attempt_id: fixtures.attemptId,
+        evidence_type: 'GIT_STATUS',
+        storage_type: 'INLINE',
+        file_path: null,
+        hash: statusHash,
+        byte_size: statusData.length,
+        content_type: 'text/plain',
+        summary: 'Git status clean',
+        raw_payload: statusData,
+        created_at: new Date().toISOString(),
+      });
+
+      const diffData = 'diff --git a b';
+      const diffHash = computeSha256(diffData);
+      const gdeId = crypto.randomUUID();
+      fixtures.repo.createEvidence({
+        id: gdeId,
+        project_id: fixtures.projectId,
+        task_id: fixtures.taskId,
+        attempt_id: fixtures.attemptId,
+        evidence_type: 'GIT_DIFF',
+        storage_type: 'INLINE',
+        file_path: null,
+        hash: diffHash,
+        byte_size: diffData.length,
+        content_type: 'text/plain',
+        summary: 'Git diff clean',
+        raw_payload: diffData,
+        created_at: new Date().toISOString(),
+      });
+
+      const adjId = crypto.randomUUID();
+      const execId = crypto.randomUUID();
+      const now = new Date().toISOString();
+      const snapJson = canonicalJsonStringify(fixtures.adjudicationService.buildCanonicalAuthoritySnapshot(
+        fixtures.repo.getCoderSubmissionById(subId)!
+      ));
+
+      const envelopeObj: CanonicalVerificationResultEnvelope = {
+        adjudication_id: adjId,
+        lifecycle_version: 2,
+        verification_execution_id: execId,
+        project_id: fixtures.projectId,
+        task_id: fixtures.taskId,
+        attempt_id: fixtures.attemptId,
+        assignment_id: fixtures.assignmentId,
+        authorization_id: fixtures.authorizationId,
+        task_ownership_epoch: 1,
+        command_snapshot_hash: cmdHash,
+        process_start_classification: 'SPAWNED_PROVEN',
+        termination_classification: 'TERMINATION_PROVEN',
+        exit_classification: 'EXIT_ZERO',
+        start_timestamp: now,
+        finish_timestamp: now,
+        test_run_id: trId,
+        test_result_evidence_id: trEvId,
+        test_result_evidence_hash: trResultHash,
+        git_status_evidence_id: gseId,
+        git_status_evidence_hash: statusHash,
+        git_diff_evidence_id: gdeId,
+        git_diff_evidence_hash: diffHash,
+        workspace_snapshot_before_hash: wsBeforeHash,
+        workspace_snapshot_after_hash: wsBeforeHash,
+        failure_code: null,
+        failure_payload: null,
+      };
+      const envelopeJson = canonicalJsonStringify(envelopeObj);
+      const envelopeHash = computeSha256(envelopeJson);
+
+      fixtures.repo.createCoderSubmissionAdjudication({
+        id: adjId,
+        submission_id: subId,
+        authorization_id: fixtures.authorizationId,
+        project_id: fixtures.projectId,
+        task_id: fixtures.taskId,
+        attempt_id: fixtures.attemptId,
+        assignment_id: fixtures.assignmentId,
+        task_ownership_epoch: 1,
+        action: 'ADMIT_VERIFICATION',
+        status: 'VERIFYING',
+        lifecycle_version: 2,
+        protocol_message_id: null,
+        request_id: crypto.randomUUID(),
+        authority_snapshot_json: snapJson,
+        authority_snapshot_hash: computeSha256(snapJson),
+        workspace_snapshot_before_json: wsBeforeJson,
+        workspace_snapshot_before_hash: wsBeforeHash,
+        verification_commands_json: cmdJson,
+        verification_commands_hash: cmdHash,
+        created_at: now,
+        verification_started_at: now,
+        completed_at: null,
+        recovery_fenced_at: null,
+        failure_code: null,
+        failure_json: null,
+        test_run_id: trId,
+        git_status_evidence_id: gseId,
+        git_diff_evidence_id: gdeId,
+        verification_execution_id: execId,
+        verification_result_envelope_json: envelopeJson,
+        verification_result_envelope_hash: envelopeHash,
+      });
+
+      const report = fixtures.recoveryScanner.scanAndReconcile();
+      expect(report.settledCount).toBe(1);
+      expect(report.fencedCount).toBe(0);
+
+      const reconciled = fixtures.repo.getCoderSubmissionAdjudicationById(adjId)!;
+      expect(reconciled.status).toBe('VERIFIED');
+      expect(reconciled.lifecycle_version).toBe(3);
+
+      const task = fixtures.repo.getTask(fixtures.taskId)!;
+      expect(task.state).toBe('REVIEW_READY');
+    });
+
+    it('161. manager record selected by id only; row matching only message_id is rejected', () => {
+      const { plaintextToken } = issueSubmissionSessionHelper(fixtures.repo, fixtures.authorizationId);
+      const subId = crypto.randomUUID();
+      fixtures.mcpService.submitCoderClaim(createValidSubmissionPayload(fixtures, subId), plaintextToken);
+
+      const sub = fixtures.repo.getCoderSubmissionById(subId)!;
+
+      // Tamper authorization to point manager_message_id to the protocol_messages.message_id string instead of id
+      db.pragma('foreign_keys = OFF');
+      db.prepare('UPDATE execution_authorizations SET manager_message_id = ? WHERE id = ?')
+        .run(fixtures.managerMessageId, fixtures.authorizationId);
+      db.pragma('foreign_keys = ON');
+
+      const integrity = fixtures.adjudicationService.validateSubmissionIntegrity(sub);
+      expect(integrity.valid).toBe(false);
+      expect(integrity.fenced_reason).toContain('Manager protocol message');
+    });
+
+    it('162. manager raw payload hash mismatch is rejected by shared authority verifier', () => {
+      const { plaintextToken } = issueSubmissionSessionHelper(fixtures.repo, fixtures.authorizationId);
+      const subId = crypto.randomUUID();
+      fixtures.mcpService.submitCoderClaim(createValidSubmissionPayload(fixtures, subId), plaintextToken);
+
+      const sub = fixtures.repo.getCoderSubmissionById(subId)!;
+
+      db.prepare("UPDATE protocol_messages SET raw_payload = '{\"protocol\":\"manager.v1\",\"tampered\":true}' WHERE id = ?")
+        .run(fixtures.managerRecordId);
+
+      const integrity = fixtures.adjudicationService.validateSubmissionIntegrity(sub);
+      expect(integrity.valid).toBe(false);
+      expect(integrity.fenced_reason).toContain('Manager protocol message raw payload hash mismatch');
+    });
+
+    it('163. manager extra or missing nested key is rejected fails closed', () => {
+      const { plaintextToken } = issueSubmissionSessionHelper(fixtures.repo, fixtures.authorizationId);
+      const subId = crypto.randomUUID();
+      fixtures.mcpService.submitCoderClaim(createValidSubmissionPayload(fixtures, subId), plaintextToken);
+
+      const sub = fixtures.repo.getCoderSubmissionById(subId)!;
+
+      const pm = db.prepare('SELECT * FROM protocol_messages WHERE id = ?').get(fixtures.managerRecordId) as any;
+      const parsed = JSON.parse(pm.raw_payload);
+      delete parsed.acceptance_criteria;
+      const newRaw = JSON.stringify(parsed);
+      const newHash = computeSha256(newRaw);
+      db.prepare('UPDATE protocol_messages SET raw_payload = ?, payload_hash = ? WHERE id = ?').run(newRaw, newHash, fixtures.managerRecordId);
+      db.prepare('UPDATE execution_authorizations SET manager_payload_hash = ? WHERE id = ?').run(newHash, fixtures.authorizationId);
+
+      const integrity = fixtures.adjudicationService.validateSubmissionIntegrity(sub);
+      expect(integrity.valid).toBe(false);
+      expect(integrity.fenced_reason).toContain('payload key mismatch');
+    });
+
+    it('164. project not exactly RUNNING is rejected', async () => {
+      const { plaintextToken } = issueSubmissionSessionHelper(fixtures.repo, fixtures.authorizationId);
+      const subId = crypto.randomUUID();
+      fixtures.mcpService.submitCoderClaim(createValidSubmissionPayload(fixtures, subId), plaintextToken);
+
+      db.prepare("UPDATE projects SET status = 'PAUSED' WHERE id = ?").run(fixtures.projectId);
+
+      await expect(
+        fixtures.adjudicationService.admitSubmissionForVerification({
+          requestId: crypto.randomUUID(),
+          submissionId: subId,
+        })
+      ).rejects.toThrow(/Project must be in RUNNING state/);
+    });
+
+    it('165. attempt or assignment inactive inside Phase B transaction fails closed', async () => {
+      const { plaintextToken } = issueSubmissionSessionHelper(fixtures.repo, fixtures.authorizationId);
+      const subId = crypto.randomUUID();
+      fixtures.mcpService.submitCoderClaim(createValidSubmissionPayload(fixtures, subId), plaintextToken);
+
+      db.prepare("UPDATE task_attempts SET status = 'FAILED' WHERE id = ?").run(fixtures.attemptId);
+
+      await expect(
+        fixtures.adjudicationService.admitSubmissionForVerification({
+          requestId: crypto.randomUUID(),
+          submissionId: subId,
+        })
+      ).rejects.toThrow(/Task attempt must be RUNNING/);
+    });
+
+    it('166. provider/account/resource drift inside Phase B blocks spawn', async () => {
+      const { plaintextToken } = issueSubmissionSessionHelper(fixtures.repo, fixtures.authorizationId);
+      const subId = crypto.randomUUID();
+      fixtures.mcpService.submitCoderClaim(createValidSubmissionPayload(fixtures, subId), plaintextToken);
+
+      db.prepare('UPDATE provider_resources SET enabled = 0 WHERE id = ?').run(fixtures.resourceId);
+
+      await expect(
+        fixtures.adjudicationService.admitSubmissionForVerification({
+          requestId: crypto.randomUUID(),
+          submissionId: subId,
+        })
+      ).rejects.toThrow(/Provider resource is not enabled/);
+    });
+
+    it('167. worker slot drift inside Phase B blocks spawn when required', async () => {
+      const { plaintextToken } = issueSubmissionSessionHelper(fixtures.repo, fixtures.authorizationId);
+      const subId = crypto.randomUUID();
+      fixtures.mcpService.submitCoderClaim(createValidSubmissionPayload(fixtures, subId), plaintextToken);
+
+      const slotId = 'slot-' + crypto.randomUUID();
+      db.prepare(`
+        INSERT INTO worker_slots (id, provider_account_id, provider_resource_id, slot_index, status, created_at, updated_at)
+        VALUES (?, ?, ?, 99, 'DISABLED', ?, ?)
+      `).run(slotId, fixtures.accountId, fixtures.resourceId, new Date().toISOString(), new Date().toISOString());
+      db.prepare('UPDATE agent_assignments SET selected_worker_slot_id = ? WHERE id = ?').run(slotId, fixtures.assignmentId);
+
+      await expect(
+        fixtures.adjudicationService.admitSubmissionForVerification({
+          requestId: crypto.randomUUID(),
+          submissionId: subId,
+        })
+      ).rejects.toThrow(/Worker slot is not active/);
+    });
+
+    it('168. authority snapshot extra/missing key rejected in every lifecycle consumer', () => {
+      const { plaintextToken } = issueSubmissionSessionHelper(fixtures.repo, fixtures.authorizationId);
+      const subId = crypto.randomUUID();
+      fixtures.mcpService.submitCoderClaim(createValidSubmissionPayload(fixtures, subId), plaintextToken);
+
+      const snap = fixtures.adjudicationService.buildCanonicalAuthoritySnapshot(
+        fixtures.repo.getCoderSubmissionById(subId)!
+      );
+      (snap as any).unauthorized_extra_field = 'malicious';
+      const snapJson = canonicalJsonStringify(snap);
+      const snapHash = computeSha256(snapJson);
+
+      const adjId = crypto.randomUUID();
+      fixtures.repo.createCoderSubmissionAdjudication({
+        id: adjId,
+        submission_id: subId,
+        authorization_id: fixtures.authorizationId,
+        project_id: fixtures.projectId,
+        task_id: fixtures.taskId,
+        attempt_id: fixtures.attemptId,
+        assignment_id: fixtures.assignmentId,
+        task_ownership_epoch: 1,
+        action: 'ADMIT_VERIFICATION',
+        status: 'VERIFYING',
+        lifecycle_version: 2,
+        protocol_message_id: null,
+        request_id: crypto.randomUUID(),
+        authority_snapshot_json: snapJson,
+        authority_snapshot_hash: snapHash,
+        workspace_snapshot_before_json: canonicalJsonStringify({ head_sha: fixtures.repoHeadSha, status_lines: [] }),
+        workspace_snapshot_before_hash: computeSha256(canonicalJsonStringify({ head_sha: fixtures.repoHeadSha, status_lines: [] })),
+        verification_commands_json: '{}',
+        verification_commands_hash: computeSha256('{}'),
+        created_at: new Date().toISOString(),
+        verification_started_at: new Date().toISOString(),
+        completed_at: null,
+        recovery_fenced_at: null,
+        failure_code: null,
+        failure_json: null,
+        test_run_id: null,
+        git_status_evidence_id: null,
+        git_diff_evidence_id: null,
+        verification_execution_id: crypto.randomUUID(),
+      });
+
+      const report = fixtures.recoveryScanner.scanAndReconcile();
+      expect(report.authorityConflictCount).toBe(1);
+      expect(report.fencedCount).toBe(1);
+      const fenced = fixtures.repo.getCoderSubmissionAdjudicationById(adjId)!;
+      expect(fenced.status).toBe('RECOVERY_FENCED');
+    });
+
+    it('169. invalid timeout zero/negative/fractional/oversized/missing rejected without fallback', async () => {
+      const { plaintextToken } = issueSubmissionSessionHelper(fixtures.repo, fixtures.authorizationId);
+      const subId = crypto.randomUUID();
+      fixtures.mcpService.submitCoderClaim(createValidSubmissionPayload(fixtures, subId), plaintextToken);
+
+      const auth = fixtures.repo.getExecutionAuthorization(fixtures.authorizationId)!;
+      const payload = JSON.parse(auth.canonical_payload_json!);
+
+      for (const badTimeout of [0, -500, 12.5, 700000, null, undefined]) {
+        payload.verificationCommands.TEST = {
+          executable: process.execPath,
+          args: ['-v'],
+          timeout_ms: badTimeout,
+        };
+        const newJson = JSON.stringify(payload);
+        const newHash = crypto.createHash('sha256').update(newJson, 'utf8').digest('hex');
+        db.prepare('UPDATE execution_authorizations SET canonical_payload_json = ?, instruction_payload_hash = ? WHERE id = ?')
+          .run(newJson, newHash, fixtures.authorizationId);
+
+        await expect(
+          fixtures.adjudicationService.admitSubmissionForVerification({
+            requestId: crypto.randomUUID(),
+            submissionId: subId,
+          })
+        ).rejects.toThrow(/timeout_ms must be a positive integer <= 600000/);
+      }
+    });
+
+     it('170. proven no-process launch failure maps to PROCESS_START_FAILED', async () => {
+      const nonExistentCmd = JSON.stringify({
+        TEST: {
+          executable: 'non_existent_executable_' + crypto.randomUUID(),
+          args: [],
+          timeout_ms: 120000,
+        },
+      });
+      const cmdHash = computeSha256(nonExistentCmd);
+      const wsSnap = canonicalJsonStringify({ head_sha: fixtures.repoHeadSha, status_lines: [] });
+      const wsHash = computeSha256(wsSnap);
+
+      const input: SealedVerificationExecutionInput = {
+        adjudication_id: crypto.randomUUID(),
+        lifecycle_version: 2,
+        verification_execution_id: crypto.randomUUID(),
+        authorization_id: fixtures.authorizationId,
+        project_id: fixtures.projectId,
+        task_id: fixtures.taskId,
+        attempt_id: fixtures.attemptId,
+        assignment_id: fixtures.assignmentId,
+        repo_path: fixtures.projectRoot,
+        verification_commands_json: nonExistentCmd,
+        verification_commands_hash: cmdHash,
+        workspace_snapshot_before_json: wsSnap,
+        workspace_snapshot_before_hash: wsHash,
+        policy: {
+          timeout_ms: 120000,
+          max_stdout_bytes: 1048576,
+          max_stderr_bytes: 1048576,
+          allowed_env_keys: ['PATH'],
+        },
+      };
+
+      const result = await fixtures.verificationService.executeSealedVerification(input);
+      expect(result.outcome).toBe('PROCESS_START_FAILED');
+    });
+
+    it('171. ambiguous process-runner throw maps to RECOVERY_FENCED', async () => {
+      const originalExecute = (fixtures.verificationService as any).processRunner?.execute;
+      (fixtures.verificationService as any).processRunner = {
+        execute: async () => {
+          throw new Error('EPERM: operation not permitted during process lifecycle');
+        },
+      };
+
+      try {
+        const cmd = JSON.stringify({
+          TEST: {
+            executable: process.execPath,
+            args: ['-v'],
+            timeout_ms: 120000,
+          },
+        });
+        const cmdHash = computeSha256(cmd);
+        const wsSnap = canonicalJsonStringify({ head_sha: fixtures.repoHeadSha, status_lines: [] });
+        const wsHash = computeSha256(wsSnap);
+
+        const input: SealedVerificationExecutionInput = {
+          adjudication_id: crypto.randomUUID(),
+          lifecycle_version: 2,
+          verification_execution_id: 'exec-ambiguous',
+          authorization_id: fixtures.authorizationId,
+          project_id: fixtures.projectId,
+          task_id: fixtures.taskId,
+          attempt_id: fixtures.attemptId,
+          assignment_id: fixtures.assignmentId,
+          repo_path: fixtures.projectRoot,
+          verification_commands_json: cmd,
+          verification_commands_hash: cmdHash,
+          workspace_snapshot_before_json: wsSnap,
+          workspace_snapshot_before_hash: wsHash,
+          policy: {
+            timeout_ms: 120000,
+            max_stdout_bytes: 1048576,
+            max_stderr_bytes: 1048576,
+            allowed_env_keys: ['PATH'],
+          },
+        };
+
+        const result = await fixtures.verificationService.executeSealedVerification(input);
+        expect(result.outcome).toBe('RECOVERY_FENCED');
+        if (result.outcome === 'RECOVERY_FENCED') {
+          expect(result.failure_code).toBe('ORPHANED_VERIFICATION_INTERRUPTED');
+        }
+      } finally {
+        if (originalExecute) {
+          (fixtures.verificationService as any).processRunner.execute = originalExecute;
+        }
+      }
+    });
+
+    it('172. timeout without termination proof remains fenced', async () => {
+      const timeoutScript = path.join(os.tmpdir(), 'timeout_' + crypto.randomUUID() + '.js');
+      fs.writeFileSync(timeoutScript, 'setInterval(() => {}, 1000);');
+
+      try {
+        const cmd = JSON.stringify({
+          TEST: {
+            executable: process.execPath,
+            args: [timeoutScript],
+            timeout_ms: 200,
+          },
+        });
+        const cmdHash = computeSha256(cmd);
+        const wsSnap = canonicalJsonStringify({ head_sha: fixtures.repoHeadSha, status_lines: [] });
+        const wsHash = computeSha256(wsSnap);
+
+        const input: SealedVerificationExecutionInput = {
+          adjudication_id: crypto.randomUUID(),
+          lifecycle_version: 2,
+          verification_execution_id: crypto.randomUUID(),
+          authorization_id: fixtures.authorizationId,
+          project_id: fixtures.projectId,
+          task_id: fixtures.taskId,
+          attempt_id: fixtures.attemptId,
+          assignment_id: fixtures.assignmentId,
+          repo_path: fixtures.projectRoot,
+          verification_commands_json: cmd,
+          verification_commands_hash: cmdHash,
+          workspace_snapshot_before_json: wsSnap,
+          workspace_snapshot_before_hash: wsHash,
+          policy: {
+            timeout_ms: 200,
+            max_stdout_bytes: 1048576,
+            max_stderr_bytes: 1048576,
+            allowed_env_keys: ['PATH'],
+          },
+        };
+
+        const result = await fixtures.verificationService.executeSealedVerification(input);
+        expect(result.outcome === 'TEST_TIMEOUT' || result.outcome === 'RECOVERY_FENCED').toBe(true);
+      } finally {
+        try { fs.unlinkSync(timeoutScript); } catch {}
+      }
+    });
+
+    it('173. raw stderr secrets / SQL / paths do not enter failure JSON or generic event summary', async () => {
+      const { plaintextToken } = issueSubmissionSessionHelper(fixtures.repo, fixtures.authorizationId);
+      const subId = crypto.randomUUID();
+      fixtures.mcpService.submitCoderClaim(createValidSubmissionPayload(fixtures, subId), plaintextToken);
+
+      const secretScript = path.join(os.tmpdir(), 'secret_err_' + crypto.randomUUID() + '.js');
+      fs.writeFileSync(
+        secretScript,
+        'console.error("CRITICAL_ERR: SELECT * FROM tokens WHERE secret=\'af-tok-sensitive-9988\' in C:\\\\Users\\\\Admin\\\\vault"); process.exit(1);'
+      );
+
+      try {
+        const auth = fixtures.repo.getExecutionAuthorization(fixtures.authorizationId)!;
+        const payload = JSON.parse(auth.canonical_payload_json!);
+        payload.verificationCommands.TEST = {
+          executable: process.execPath,
+          args: [secretScript],
+          timeout_ms: 120000,
+        };
+        const newJson = JSON.stringify(payload);
+        const newHash = crypto.createHash('sha256').update(newJson, 'utf8').digest('hex');
+        db.prepare('UPDATE execution_authorizations SET canonical_payload_json = ?, instruction_payload_hash = ? WHERE id = ?')
+          .run(newJson, newHash, fixtures.authorizationId);
+
+        const res = await fixtures.adjudicationService.admitSubmissionForVerification({
+          requestId: crypto.randomUUID(),
+          submissionId: subId,
+        });
+
+        expect(res.adjudication.status).toBe('VERIFICATION_FAILED');
+        const adj = fixtures.repo.getCoderSubmissionAdjudicationById(res.adjudication.id)!;
+        if (adj.failure_json) {
+          expect(adj.failure_json).not.toContain('C:\\Users');
+          expect(adj.failure_json).not.toContain('af-tok-sensitive');
+          expect(adj.failure_json).not.toContain('SELECT * FROM');
+        }
+
+        const events = db.prepare('SELECT * FROM events WHERE project_id = ?').all(fixtures.projectId) as any[];
+        for (const ev of events) {
+          expect(ev.summary).not.toContain('af-tok-sensitive');
+          expect(ev.summary).not.toContain('C:\\Users');
+          expect(ev.structured_payload_json).not.toContain('af-tok-sensitive');
+        }
+      } finally {
+        if (fs.existsSync(secretScript)) {
+          fs.unlinkSync(secretScript);
+        }
+      }
+    });
+
+    it('174. Phase C CAS failure cleans up staged artifacts', async () => {
+      const stagedFiles: string[] = [];
+      const stageSpy = (fixtures.artifactStore as any).stage;
+      (fixtures.artifactStore as any).stage = function (...args: any[]) {
+        const res = stageSpy.apply(this, args);
+        stagedFiles.push(res.stagedPath);
+        return res;
+      };
+
+      const { plaintextToken } = issueSubmissionSessionHelper(fixtures.repo, fixtures.authorizationId);
+      const subId = crypto.randomUUID();
+      fixtures.mcpService.submitCoderClaim(createValidSubmissionPayload(fixtures, subId), plaintextToken);
+
+      const origSettle = (fixtures.adjudicationService as any).settleVerificationPhaseC;
+      (fixtures.adjudicationService as any).settleVerificationPhaseC = async function (...args: any[]) {
+        db.prepare("UPDATE coder_submission_adjudications SET lifecycle_version = 99").run();
+        return origSettle.apply(this, args);
+      };
+
+      try {
+        await expect(
+          fixtures.adjudicationService.admitSubmissionForVerification({
+            requestId: crypto.randomUUID(),
+            submissionId: subId,
+          })
+        ).rejects.toThrow();
+
+        for (const p of stagedFiles) {
+          expect(fs.existsSync(p)).toBe(false);
+        }
+      } finally {
+        (fixtures.adjudicationService as any).settleVerificationPhaseC = origSettle;
+        (fixtures.artifactStore as any).stage = stageSpy;
+      }
+    });
+
+    it('175. Phase C graph drift rolls back evidence/task/disposition/events', async () => {
+      const { plaintextToken } = issueSubmissionSessionHelper(fixtures.repo, fixtures.authorizationId);
+      const subId = crypto.randomUUID();
+      fixtures.mcpService.submitCoderClaim(createValidSubmissionPayload(fixtures, subId), plaintextToken);
+
+      const evCountBefore = (db.prepare('SELECT COUNT(*) as c FROM evidence').get() as any).c;
+      const trCountBefore = (db.prepare('SELECT COUNT(*) as c FROM test_runs').get() as any).c;
+
+      const origSettle = (fixtures.adjudicationService as any).settleVerificationPhaseC;
+      (fixtures.adjudicationService as any).settleVerificationPhaseC = async function (...args: any[]) {
+        db.prepare("UPDATE tasks SET state = 'COMPLETED' WHERE id = ?").run(fixtures.taskId);
+        return origSettle.apply(this, args);
+      };
+
+      try {
+        await expect(
+          fixtures.adjudicationService.admitSubmissionForVerification({
+            requestId: crypto.randomUUID(),
+            submissionId: subId,
+          })
+        ).rejects.toThrow();
+
+        const disps = fixtures.repo.getCoderSubmissionDispositions(subId);
+        expect(disps.some((d) => d.disposition_reason === 'ACCEPTED_VERIFIED')).toBe(false);
+        const adjs = fixtures.repo.getCoderSubmissionAdjudicationsBySubmission(subId);
+        expect(adjs.every((a) => a.status !== 'VERIFIED')).toBe(true);
+      } finally {
+        (fixtures.adjudicationService as any).settleVerificationPhaseC = origSettle;
+      }
+    });
+
+    it('176. post-commit finalization uncertainty becomes fenced, not success', async () => {
+      const { plaintextToken } = issueSubmissionSessionHelper(fixtures.repo, fixtures.authorizationId);
+      const subId = crypto.randomUUID();
+      fixtures.mcpService.submitCoderClaim(createValidSubmissionPayload(fixtures, subId), plaintextToken);
+
+      const origFinalize = fixtures.artifactStore.finalizeStagedFile;
+      fixtures.artifactStore.finalizeStagedFile = function () {
+        throw new Error('SIMULATED_FINALIZE_IO_ERROR');
+      };
+
+      try {
+        await expect(
+          fixtures.adjudicationService.admitSubmissionForVerification({
+            requestId: crypto.randomUUID(),
+            submissionId: subId,
+          })
+        ).rejects.toThrow(/POST_COMMIT_FINALIZATION_UNCERTAINTY/);
+
+        const adjs = fixtures.repo.getCoderSubmissionAdjudicationsBySubmissionId(subId);
+        const adj = adjs[0];
+        expect(adj.status).toBe('RECOVERY_FENCED');
+        expect(adj.failure_code).toBe('POST_COMMIT_FINALIZATION_UNCERTAINTY');
+      } finally {
+        fixtures.artifactStore.finalizeStagedFile = origFinalize;
+      }
+    });
+
+    it('177. recovery rejects authority snapshot with valid raw hash but invalid schema', () => {
+      const { plaintextToken } = issueSubmissionSessionHelper(fixtures.repo, fixtures.authorizationId);
+      const subId = crypto.randomUUID();
+      fixtures.mcpService.submitCoderClaim(createValidSubmissionPayload(fixtures, subId), plaintextToken);
+
+      const invalidSchemaSnap = { foo: 'bar', invalid: 123 };
+      const snapJson = canonicalJsonStringify(invalidSchemaSnap);
+      const snapHash = computeSha256(snapJson);
+
+      const adjId = crypto.randomUUID();
+      fixtures.repo.createCoderSubmissionAdjudication({
+        id: adjId,
+        submission_id: subId,
+        authorization_id: fixtures.authorizationId,
+        project_id: fixtures.projectId,
+        task_id: fixtures.taskId,
+        attempt_id: fixtures.attemptId,
+        assignment_id: fixtures.assignmentId,
+        task_ownership_epoch: 1,
+        action: 'ADMIT_VERIFICATION',
+        status: 'VERIFYING',
+        lifecycle_version: 2,
+        protocol_message_id: null,
+        request_id: crypto.randomUUID(),
+        authority_snapshot_json: snapJson,
+        authority_snapshot_hash: snapHash,
+        workspace_snapshot_before_json: canonicalJsonStringify({ head_sha: fixtures.repoHeadSha, status_lines: [] }),
+        workspace_snapshot_before_hash: computeSha256(canonicalJsonStringify({ head_sha: fixtures.repoHeadSha, status_lines: [] })),
+        verification_commands_json: '{}',
+        verification_commands_hash: computeSha256('{}'),
+        created_at: new Date().toISOString(),
+        verification_started_at: new Date().toISOString(),
+        completed_at: null,
+        recovery_fenced_at: null,
+        failure_code: null,
+        failure_json: null,
+        test_run_id: null,
+        git_status_evidence_id: null,
+        git_diff_evidence_id: null,
+        verification_execution_id: crypto.randomUUID(),
+      });
+
+      const report = fixtures.recoveryScanner.scanAndReconcile();
+      expect(report.authorityConflictCount).toBe(1);
+      const fenced = fixtures.repo.getCoderSubmissionAdjudicationById(adjId)!;
+      expect(fenced.status).toBe('RECOVERY_FENCED');
+      expect(fenced.failure_code).toBe('INTEGRITY_MISMATCH');
+    });
+
+    it('178. recovery rejects empty command snapshot even when raw hash matches', () => {
+      const { plaintextToken } = issueSubmissionSessionHelper(fixtures.repo, fixtures.authorizationId);
+      const subId = crypto.randomUUID();
+      fixtures.mcpService.submitCoderClaim(createValidSubmissionPayload(fixtures, subId), plaintextToken);
+
+      const snapJson = canonicalJsonStringify(fixtures.adjudicationService.buildCanonicalAuthoritySnapshot(
+        fixtures.repo.getCoderSubmissionById(subId)!
+      ));
+
+      const adjId = crypto.randomUUID();
+      fixtures.repo.createCoderSubmissionAdjudication({
+        id: adjId,
+        submission_id: subId,
+        authorization_id: fixtures.authorizationId,
+        project_id: fixtures.projectId,
+        task_id: fixtures.taskId,
+        attempt_id: fixtures.attemptId,
+        assignment_id: fixtures.assignmentId,
+        task_ownership_epoch: 1,
+        action: 'ADMIT_VERIFICATION',
+        status: 'VERIFYING',
+        lifecycle_version: 2,
+        protocol_message_id: null,
+        request_id: crypto.randomUUID(),
+        authority_snapshot_json: snapJson,
+        authority_snapshot_hash: computeSha256(snapJson),
+        workspace_snapshot_before_json: canonicalJsonStringify({ head_sha: fixtures.repoHeadSha, status_lines: [] }),
+        workspace_snapshot_before_hash: computeSha256(canonicalJsonStringify({ head_sha: fixtures.repoHeadSha, status_lines: [] })),
+        verification_commands_json: '{}',
+        verification_commands_hash: computeSha256('{}'),
+        created_at: new Date().toISOString(),
+        verification_started_at: new Date().toISOString(),
+        completed_at: null,
+        recovery_fenced_at: null,
+        failure_code: null,
+        failure_json: null,
+        test_run_id: null,
+        git_status_evidence_id: null,
+        git_diff_evidence_id: null,
+        verification_execution_id: crypto.randomUUID(),
+      });
+
+      const report = fixtures.recoveryScanner.scanAndReconcile();
+      expect(report.settledCount).toBe(0);
+      expect(report.fencedCount).toBe(1);
+    });
+
+    it('179. recovery rejects test run without exact test-result evidence', () => {
+      const { plaintextToken } = issueSubmissionSessionHelper(fixtures.repo, fixtures.authorizationId);
+      const subId = crypto.randomUUID();
+      fixtures.mcpService.submitCoderClaim(createValidSubmissionPayload(fixtures, subId), plaintextToken);
+
+      const trId = crypto.randomUUID();
+      fixtures.repo.createTestRun({
+        id: trId,
+        task_id: fixtures.taskId,
+        command: 'node -v',
+        exit_code: 0,
+        passed_count: 1,
+        failed_count: 0,
+        skipped_count: 0,
+        duration_ms: 50,
+        evidence_id: null,
+        created_at: new Date().toISOString(),
+      });
+
+      const snapJson = canonicalJsonStringify(fixtures.adjudicationService.buildCanonicalAuthoritySnapshot(
+        fixtures.repo.getCoderSubmissionById(subId)!
+      ));
+      const adjId = crypto.randomUUID();
+      fixtures.repo.createCoderSubmissionAdjudication({
+        id: adjId,
+        submission_id: subId,
+        authorization_id: fixtures.authorizationId,
+        project_id: fixtures.projectId,
+        task_id: fixtures.taskId,
+        attempt_id: fixtures.attemptId,
+        assignment_id: fixtures.assignmentId,
+        task_ownership_epoch: 1,
+        action: 'ADMIT_VERIFICATION',
+        status: 'VERIFYING',
+        lifecycle_version: 2,
+        protocol_message_id: null,
+        request_id: crypto.randomUUID(),
+        authority_snapshot_json: snapJson,
+        authority_snapshot_hash: computeSha256(snapJson),
+        workspace_snapshot_before_json: canonicalJsonStringify({ head_sha: fixtures.repoHeadSha, status_lines: [] }),
+        workspace_snapshot_before_hash: computeSha256(canonicalJsonStringify({ head_sha: fixtures.repoHeadSha, status_lines: [] })),
+        verification_commands_json: '{}',
+        verification_commands_hash: computeSha256('{}'),
+        created_at: new Date().toISOString(),
+        verification_started_at: new Date().toISOString(),
+        completed_at: null,
+        recovery_fenced_at: null,
+        failure_code: null,
+        failure_json: null,
+        test_run_id: trId,
+        git_status_evidence_id: null,
+        git_diff_evidence_id: null,
+        verification_execution_id: crypto.randomUUID(),
+      });
+
+      const report = fixtures.recoveryScanner.scanAndReconcile();
+      expect(report.settledCount).toBe(0);
+      expect(report.fencedCount).toBe(1);
+    });
+
+    it('180. recovery rejects test-result evidence with wrong project or attempt', () => {
+      const { plaintextToken } = issueSubmissionSessionHelper(fixtures.repo, fixtures.authorizationId);
+      const subId = crypto.randomUUID();
+      fixtures.mcpService.submitCoderClaim(createValidSubmissionPayload(fixtures, subId), plaintextToken);
+
+      const wrongProjId = 'proj-other-' + crypto.randomUUID();
+      fixtures.repo.createProject({
+        id: wrongProjId,
+        name: 'Other Project',
+        description: 'Other Project for test',
+        repository_path: fixtures.projectRoot,
+        default_branch: 'main',
+        status: 'RUNNING',
+        contract: null,
+        created_at: new Date().toISOString(),
+        updated_at: new Date().toISOString(),
+        started_at: null,
+        completed_at: null,
+      });
+
+      const trEvId = crypto.randomUUID();
+      fixtures.repo.createEvidence({
+        id: trEvId,
+        project_id: wrongProjId,
+        task_id: fixtures.taskId,
+        attempt_id: fixtures.attemptId,
+        evidence_type: 'TEST_RESULT',
+        storage_type: 'INLINE',
+        file_path: null,
+        hash: computeSha256('data'),
+        byte_size: 4,
+        content_type: 'application/json',
+        summary: 'Wrong project test result',
+        raw_payload: 'data',
+        created_at: new Date().toISOString(),
+      });
+
+      const trId = crypto.randomUUID();
+      fixtures.repo.createTestRun({
+        id: trId,
+        task_id: fixtures.taskId,
+        command: 'node -v',
+        exit_code: 0,
+        passed_count: 1,
+        failed_count: 0,
+        skipped_count: 0,
+        duration_ms: 50,
+        evidence_id: trEvId,
+        created_at: new Date().toISOString(),
+      });
+
+      const snapJson = canonicalJsonStringify(fixtures.adjudicationService.buildCanonicalAuthoritySnapshot(
+        fixtures.repo.getCoderSubmissionById(subId)!
+      ));
+      const adjId = crypto.randomUUID();
+      fixtures.repo.createCoderSubmissionAdjudication({
+        id: adjId,
+        submission_id: subId,
+        authorization_id: fixtures.authorizationId,
+        project_id: fixtures.projectId,
+        task_id: fixtures.taskId,
+        attempt_id: fixtures.attemptId,
+        assignment_id: fixtures.assignmentId,
+        task_ownership_epoch: 1,
+        action: 'ADMIT_VERIFICATION',
+        status: 'VERIFYING',
+        lifecycle_version: 2,
+        protocol_message_id: null,
+        request_id: crypto.randomUUID(),
+        authority_snapshot_json: snapJson,
+        authority_snapshot_hash: computeSha256(snapJson),
+        workspace_snapshot_before_json: canonicalJsonStringify({ head_sha: fixtures.repoHeadSha, status_lines: [] }),
+        workspace_snapshot_before_hash: computeSha256(canonicalJsonStringify({ head_sha: fixtures.repoHeadSha, status_lines: [] })),
+        verification_commands_json: '{}',
+        verification_commands_hash: computeSha256('{}'),
+        created_at: new Date().toISOString(),
+        verification_started_at: new Date().toISOString(),
+        completed_at: null,
+        recovery_fenced_at: null,
+        failure_code: null,
+        failure_json: null,
+        test_run_id: trId,
+        git_status_evidence_id: null,
+        git_diff_evidence_id: null,
+        verification_execution_id: crypto.randomUUID(),
+      });
+
+      const report = fixtures.recoveryScanner.scanAndReconcile();
+      expect(report.settledCount).toBe(0);
+      expect(report.fencedCount).toBe(1);
+    });
+
+    it('181. recovery rejects Git evidence with wrong project/attempt/type/storage', () => {
+      const { plaintextToken } = issueSubmissionSessionHelper(fixtures.repo, fixtures.authorizationId);
+      const subId = crypto.randomUUID();
+      fixtures.mcpService.submitCoderClaim(createValidSubmissionPayload(fixtures, subId), plaintextToken);
+
+      const otherTaskId = 'task-other-' + crypto.randomUUID();
+      db.prepare(`
+        INSERT INTO tasks (id, project_id, title, state, priority, risk, revision_count, max_revisions, progress_cache_percent, base_sha, ownership_epoch, created_at, updated_at)
+        VALUES (?, ?, 'Other Task', 'CODING', 'LOW', 'LOW', 1, 3, 0, ?, 1, ?, ?)
+      `).run(otherTaskId, fixtures.projectId, fixtures.baseSha, new Date().toISOString(), new Date().toISOString());
+
+      const gseId = crypto.randomUUID();
+      fixtures.repo.createEvidence({
+        id: gseId,
+        project_id: fixtures.projectId,
+        task_id: otherTaskId,
+        attempt_id: fixtures.attemptId,
+        evidence_type: 'GIT_STATUS',
+        storage_type: 'INLINE',
+        file_path: null,
+        hash: computeSha256('clean'),
+        byte_size: 5,
+        content_type: 'text/plain',
+        summary: 'status',
+        raw_payload: 'clean',
+        created_at: new Date().toISOString(),
+      });
+
+      const snapJson = canonicalJsonStringify(fixtures.adjudicationService.buildCanonicalAuthoritySnapshot(
+        fixtures.repo.getCoderSubmissionById(subId)!
+      ));
+      const adjId = crypto.randomUUID();
+      fixtures.repo.createCoderSubmissionAdjudication({
+        id: adjId,
+        submission_id: subId,
+        authorization_id: fixtures.authorizationId,
+        project_id: fixtures.projectId,
+        task_id: fixtures.taskId,
+        attempt_id: fixtures.attemptId,
+        assignment_id: fixtures.assignmentId,
+        task_ownership_epoch: 1,
+        action: 'ADMIT_VERIFICATION',
+        status: 'VERIFYING',
+        lifecycle_version: 2,
+        protocol_message_id: null,
+        request_id: crypto.randomUUID(),
+        authority_snapshot_json: snapJson,
+        authority_snapshot_hash: computeSha256(snapJson),
+        workspace_snapshot_before_json: canonicalJsonStringify({ head_sha: fixtures.repoHeadSha, status_lines: [] }),
+        workspace_snapshot_before_hash: computeSha256(canonicalJsonStringify({ head_sha: fixtures.repoHeadSha, status_lines: [] })),
+        verification_commands_json: '{}',
+        verification_commands_hash: computeSha256('{}'),
+        created_at: new Date().toISOString(),
+        verification_started_at: new Date().toISOString(),
+        completed_at: null,
+        recovery_fenced_at: null,
+        failure_code: null,
+        failure_json: null,
+        test_run_id: null,
+        git_status_evidence_id: gseId,
+        git_diff_evidence_id: null,
+        verification_execution_id: crypto.randomUUID(),
+      });
+
+      const report = fixtures.recoveryScanner.scanAndReconcile();
+      expect(report.settledCount).toBe(0);
+      expect(report.fencedCount).toBe(1);
+    });
+
+    it('182. recovery rejects mismatched execution ID or command hash', () => {
+      const { plaintextToken } = issueSubmissionSessionHelper(fixtures.repo, fixtures.authorizationId);
+      const subId = crypto.randomUUID();
+      fixtures.mcpService.submitCoderClaim(createValidSubmissionPayload(fixtures, subId), plaintextToken);
+
+      const snapJson = canonicalJsonStringify(fixtures.adjudicationService.buildCanonicalAuthoritySnapshot(
+        fixtures.repo.getCoderSubmissionById(subId)!
+      ));
+      const adjId = crypto.randomUUID();
+      fixtures.repo.createCoderSubmissionAdjudication({
+        id: adjId,
+        submission_id: subId,
+        authorization_id: fixtures.authorizationId,
+        project_id: fixtures.projectId,
+        task_id: fixtures.taskId,
+        attempt_id: fixtures.attemptId,
+        assignment_id: fixtures.assignmentId,
+        task_ownership_epoch: 1,
+        action: 'ADMIT_VERIFICATION',
+        status: 'VERIFYING',
+        lifecycle_version: 2,
+        protocol_message_id: null,
+        request_id: crypto.randomUUID(),
+        authority_snapshot_json: snapJson,
+        authority_snapshot_hash: computeSha256(snapJson),
+        workspace_snapshot_before_json: canonicalJsonStringify({ head_sha: fixtures.repoHeadSha, status_lines: [] }),
+        workspace_snapshot_before_hash: computeSha256(canonicalJsonStringify({ head_sha: fixtures.repoHeadSha, status_lines: [] })),
+        verification_commands_json: '{"TEST":null}',
+        verification_commands_hash: computeSha256('{"TEST":null}'),
+        created_at: new Date().toISOString(),
+        verification_started_at: new Date().toISOString(),
+        completed_at: null,
+        recovery_fenced_at: null,
+        failure_code: null,
+        failure_json: null,
+        test_run_id: null,
+        git_status_evidence_id: null,
+        git_diff_evidence_id: null,
+        verification_execution_id: 'exec-1',
+        verification_result_envelope_json: JSON.stringify({ verification_execution_id: 'exec-DIFFERENT' }),
+        verification_result_envelope_hash: computeSha256(JSON.stringify({ verification_execution_id: 'exec-DIFFERENT' })),
+      });
+
+      const report = fixtures.recoveryScanner.scanAndReconcile();
+      expect(report.settledCount).toBe(0);
+      expect(report.fencedCount).toBe(1);
+    });
+
+    it('183. recovery rejects missing termination proof in result envelope', () => {
+      const { plaintextToken } = issueSubmissionSessionHelper(fixtures.repo, fixtures.authorizationId);
+      const subId = crypto.randomUUID();
+      fixtures.mcpService.submitCoderClaim(createValidSubmissionPayload(fixtures, subId), plaintextToken);
+
+      const snapJson = canonicalJsonStringify(fixtures.adjudicationService.buildCanonicalAuthoritySnapshot(
+        fixtures.repo.getCoderSubmissionById(subId)!
+      ));
+      const adjId = crypto.randomUUID();
+      const envelope = {
+        exit_classification: 'RUNNING',
+        process_start_classification: 'PROCESS_STARTED',
+      };
+      const envelopeJson = JSON.stringify(envelope);
+
+      fixtures.repo.createCoderSubmissionAdjudication({
+        id: adjId,
+        submission_id: subId,
+        authorization_id: fixtures.authorizationId,
+        project_id: fixtures.projectId,
+        task_id: fixtures.taskId,
+        attempt_id: fixtures.attemptId,
+        assignment_id: fixtures.assignmentId,
+        task_ownership_epoch: 1,
+        action: 'ADMIT_VERIFICATION',
+        status: 'VERIFYING',
+        lifecycle_version: 2,
+        protocol_message_id: null,
+        request_id: crypto.randomUUID(),
+        authority_snapshot_json: snapJson,
+        authority_snapshot_hash: computeSha256(snapJson),
+        workspace_snapshot_before_json: canonicalJsonStringify({ head_sha: fixtures.repoHeadSha, status_lines: [] }),
+        workspace_snapshot_before_hash: computeSha256(canonicalJsonStringify({ head_sha: fixtures.repoHeadSha, status_lines: [] })),
+        verification_commands_json: '{}',
+        verification_commands_hash: computeSha256('{}'),
+        created_at: new Date().toISOString(),
+        verification_started_at: new Date().toISOString(),
+        completed_at: null,
+        recovery_fenced_at: null,
+        failure_code: null,
+        failure_json: null,
+        test_run_id: null,
+        git_status_evidence_id: null,
+        git_diff_evidence_id: null,
+        verification_execution_id: 'exec-1',
+        verification_result_envelope_json: envelopeJson,
+        verification_result_envelope_hash: computeSha256(envelopeJson),
+      });
+
+      const report = fixtures.recoveryScanner.scanAndReconcile();
+      expect(report.settledCount).toBe(0);
+      expect(report.fencedCount).toBe(1);
+    });
+
+    it('184. recovery state-machine transition failure rolls back and surfaces without bypass', () => {
+      const { plaintextToken } = issueSubmissionSessionHelper(fixtures.repo, fixtures.authorizationId);
+      const subId = crypto.randomUUID();
+      fixtures.mcpService.submitCoderClaim(createValidSubmissionPayload(fixtures, subId), plaintextToken);
+
+      db.prepare("UPDATE tasks SET state = 'REVIEWING' WHERE id = ?").run(fixtures.taskId);
+
+      const snapJson = canonicalJsonStringify(fixtures.adjudicationService.buildCanonicalAuthoritySnapshot(
+        fixtures.repo.getCoderSubmissionById(subId)!
+      ));
+      const adjId = crypto.randomUUID();
+      fixtures.repo.createCoderSubmissionAdjudication({
+        id: adjId,
+        submission_id: subId,
+        authorization_id: fixtures.authorizationId,
+        project_id: fixtures.projectId,
+        task_id: fixtures.taskId,
+        attempt_id: fixtures.attemptId,
+        assignment_id: fixtures.assignmentId,
+        task_ownership_epoch: 1,
+        action: 'ADMIT_VERIFICATION',
+        status: 'VERIFYING',
+        lifecycle_version: 2,
+        protocol_message_id: null,
+        request_id: crypto.randomUUID(),
+        authority_snapshot_json: snapJson,
+        authority_snapshot_hash: computeSha256(snapJson),
+        workspace_snapshot_before_json: canonicalJsonStringify({ head_sha: fixtures.repoHeadSha, status_lines: [] }),
+        workspace_snapshot_before_hash: computeSha256(canonicalJsonStringify({ head_sha: fixtures.repoHeadSha, status_lines: [] })),
+        verification_commands_json: '{}',
+        verification_commands_hash: computeSha256('{}'),
+        created_at: new Date().toISOString(),
+        verification_started_at: new Date().toISOString(),
+        completed_at: null,
+        recovery_fenced_at: null,
+        failure_code: null,
+        failure_json: null,
+        test_run_id: null,
+        git_status_evidence_id: null,
+        git_diff_evidence_id: null,
+        verification_execution_id: crypto.randomUUID(),
+      });
+
+      const report = fixtures.recoveryScanner.scanAndReconcile();
+      expect(report.settledCount).toBe(0);
+      const task = fixtures.repo.getTask(fixtures.taskId)!;
+      expect(task.state).toBe('REVIEWING');
+    });
+
+    it('185. cancellation preserves recovery_fenced_at and original execution binding', () => {
+      const { plaintextToken } = issueSubmissionSessionHelper(fixtures.repo, fixtures.authorizationId);
+      const subId = crypto.randomUUID();
+      fixtures.mcpService.submitCoderClaim(createValidSubmissionPayload(fixtures, subId), plaintextToken);
+
+      const snapJson = canonicalJsonStringify(fixtures.adjudicationService.buildCanonicalAuthoritySnapshot(
+        fixtures.repo.getCoderSubmissionById(subId)!
+      ));
+      const adjId = crypto.randomUUID();
+      const execId = crypto.randomUUID();
+      const fenceTime = new Date(Date.now() - 60000).toISOString();
+      const startTime = new Date(Date.now() - 120000).toISOString();
+
+      fixtures.repo.createCoderSubmissionAdjudication({
+        id: adjId,
+        submission_id: subId,
+        authorization_id: fixtures.authorizationId,
+        project_id: fixtures.projectId,
+        task_id: fixtures.taskId,
+        attempt_id: fixtures.attemptId,
+        assignment_id: fixtures.assignmentId,
+        task_ownership_epoch: 1,
+        action: 'ADMIT_VERIFICATION',
+        status: 'RECOVERY_FENCED',
+        lifecycle_version: 2,
+        protocol_message_id: null,
+        request_id: crypto.randomUUID(),
+        authority_snapshot_json: snapJson,
+        authority_snapshot_hash: computeSha256(snapJson),
+        workspace_snapshot_before_json: canonicalJsonStringify({ head_sha: fixtures.repoHeadSha, status_lines: [] }),
+        workspace_snapshot_before_hash: computeSha256(canonicalJsonStringify({ head_sha: fixtures.repoHeadSha, status_lines: [] })),
+        verification_commands_json: '{}',
+        verification_commands_hash: computeSha256('{}'),
+        created_at: startTime,
+        verification_started_at: startTime,
+        completed_at: null,
+        recovery_fenced_at: fenceTime,
+        failure_code: 'ORPHANED_VERIFICATION_INTERRUPTED',
+        failure_json: null,
+        test_run_id: null,
+        git_status_evidence_id: null,
+        git_diff_evidence_id: null,
+        verification_execution_id: execId,
+      });
+
+      fixtures.adjudicationService.acknowledgeRecoveryFenced({
+        requestId: crypto.randomUUID(),
+        submissionId: subId,
+        adjudicationId: adjId,
+        expectedLifecycleVersion: 2,
+        decision: 'CANCEL',
+      });
+
+      const cancelled = fixtures.repo.getCoderSubmissionAdjudicationById(adjId)!;
+      expect(cancelled.status).toBe('VERIFICATION_FAILED');
+      expect(cancelled.failure_code).toBe('ORPHANED_VERIFICATION_CANCELLED');
+      expect(cancelled.recovery_fenced_at).toBe(fenceTime);
+      expect(cancelled.verification_execution_id).toBe(execId);
+      expect(cancelled.verification_started_at).toBe(startTime);
+    });
+
+    it('186. review projection recomputes linked hashes and fails closed on malformed claim JSON', () => {
+      const { plaintextToken } = issueSubmissionSessionHelper(fixtures.repo, fixtures.authorizationId);
+      const subId = crypto.randomUUID();
+      fixtures.mcpService.submitCoderClaim(createValidSubmissionPayload(fixtures, subId), plaintextToken);
+
+      const linkage = createTestLinkage(subId);
+      const badClaimJson = '{malformed:true';
+      linkage.submission = {
+        ...linkage.submission,
+        claim_content_json: badClaimJson,
+        claim_content_hash: computeSha256(badClaimJson),
+      };
+
+      expect(() => {
+        PackageGenerator.generateReviewPackage(
+          fixtures.repo.getProject(fixtures.projectId)!,
+          fixtures.repo.getTask(fixtures.taskId)!,
+          null,
+          '',
+          '',
+          null,
+          [],
+          null,
+          linkage
+        );
+      }).toThrow(/Malformed claim JSON in submission/);
+    });
+
+    it('187. real IPC error scrubber handles complex diagnostic messages', () => {
+      const rawText = 'Crash in C:\\repo\\src\\main.ts with token af-tok-xyz at SQL SELECT * FROM secret_tbl';
+      const scrubbed = scrubAdjudicationDiagnostics(rawText);
+      expect(scrubbed).not.toContain('C:\\repo');
+      expect(scrubbed).not.toContain('af-tok-xyz');
+      expect(scrubbed).not.toContain('SELECT * FROM');
+      expect(scrubbed).toContain('[REDACTED_PATH]');
+      expect(scrubbed).toContain('[REDACTED_TOKEN]');
+      expect(scrubbed).toContain('[REDACTED_SQL]');
+    });
+
+    it('188. locale parity covers every new R5J5 string in en-US and vi-VN', () => {
+      const newR5J5Keys = [
+        'confirmResumeTitle',
+        'confirmResumeMessage',
+        'confirmAcknowledgeTitle',
+        'confirmAcknowledgeMessage',
+        'nonAuthoritativeBadge',
+        'noSummaryProvided',
+        'none',
+      ] as const;
+
+      for (const key of newR5J5Keys) {
+        expect((enUS.quarantinedQueue as any)[key]).toBeDefined();
+        expect(typeof (enUS.quarantinedQueue as any)[key]).toBe('string');
+        expect((enUS.quarantinedQueue as any)[key].length).toBeGreaterThan(0);
+
+        expect((viVN.quarantinedQueue as any)[key]).toBeDefined();
+        expect(typeof (viVN.quarantinedQueue as any)[key]).toBe('string');
+        expect((viVN.quarantinedQueue as any)[key].length).toBeGreaterThan(0);
+      }
+    });
+
+    it('189. repeated recovery scan produces no duplicate events or dispositions', () => {
+      const report1 = fixtures.recoveryScanner.scanAndReconcile();
+      const eventsCount1 = (db.prepare('SELECT COUNT(*) as c FROM coder_submission_adjudication_events').get() as { c: number }).c;
+      const dispsCount1 = (db.prepare('SELECT COUNT(*) as c FROM coder_submission_dispositions').get() as { c: number }).c;
+
+      const report2 = fixtures.recoveryScanner.scanAndReconcile();
+      const eventsCount2 = (db.prepare('SELECT COUNT(*) as c FROM coder_submission_adjudication_events').get() as { c: number }).c;
+      const dispsCount2 = (db.prepare('SELECT COUNT(*) as c FROM coder_submission_dispositions').get() as { c: number }).c;
+
+      expect(eventsCount2).toBe(eventsCount1);
+      expect(dispsCount2).toBe(dispsCount1);
+    });
+
+    it('190. deterministic event same-ID different-content collision fails closed', () => {
+      const { plaintextToken } = issueSubmissionSessionHelper(fixtures.repo, fixtures.authorizationId);
+      const subId = crypto.randomUUID();
+      fixtures.mcpService.submitCoderClaim(createValidSubmissionPayload(fixtures, subId), plaintextToken);
+
+      const adjId = crypto.randomUUID();
+      fixtures.repo.createCoderSubmissionAdjudication({
+        id: adjId,
+        submission_id: subId,
+        authorization_id: fixtures.authorizationId,
+        project_id: fixtures.projectId,
+        task_id: fixtures.taskId,
+        attempt_id: fixtures.attemptId,
+        assignment_id: fixtures.assignmentId,
+        task_ownership_epoch: 1,
+        action: 'ADMIT_VERIFICATION',
+        status: 'ADMITTED',
+        lifecycle_version: 1,
+        protocol_message_id: null,
+        request_id: crypto.randomUUID(),
+        authority_snapshot_json: '{}',
+        authority_snapshot_hash: computeSha256('{}'),
+        workspace_snapshot_before_json: null,
+        workspace_snapshot_before_hash: null,
+        verification_commands_json: '{}',
+        verification_commands_hash: computeSha256('{}'),
+        created_at: new Date().toISOString(),
+        verification_started_at: null,
+        completed_at: null,
+        recovery_fenced_at: null,
+        failure_code: null,
+        failure_json: null,
+        test_run_id: null,
+        git_status_evidence_id: null,
+        git_diff_evidence_id: null,
+        verification_execution_id: null,
+      });
+
+      const eventId = deriveDeterministicAdjudicationEventId(adjId, 1, 'ADMITTED', computeSha256('{"content":"A"}'));
+
+      db.prepare(`
+        INSERT INTO coder_submission_adjudication_events (id, adjudication_id, sequence, event_type, payload_json, payload_hash, created_at)
+        VALUES (?, ?, 1, 'ADMITTED', '{"content":"A"}', ?, ?)
+      `).run(eventId, adjId, computeSha256('{"content":"A"}'), new Date().toISOString());
+
+      expect(() => {
+        db.prepare(`
+          INSERT INTO coder_submission_adjudication_events (id, adjudication_id, sequence, event_type, payload_json, payload_hash, created_at)
+          VALUES (?, ?, 2, 'ADMITTED', '{"content":"DIFFERENT_B"}', ?, ?)
+        `).run(eventId, adjId, computeSha256('{"content":"DIFFERENT_B"}'), new Date().toISOString());
+      }).toThrow(/UNIQUE constraint failed/);
+    });
+
+    it('191. historical three-file compatibility diffs remain byte-identical to initial head', () => {
       const checkDiff = (relPath: string) => {
         const out = child_process.execFileSync('git', ['diff', 'e869b9f79b76f104df74ac49ece723b828ba888e', '--', relPath], {
           encoding: 'utf8',

@@ -15,6 +15,7 @@ import {
   CanonicalExecutionPayloadSchema,
 } from '../services/ExecutionAuthorizationService';
 import { CommandParser } from '../services/CommandParser';
+import { computeSha256, CLAIM_CONTENT_KEYS } from '../../mcp/submissionProtocol';
 
 export interface AdjudicationReviewPackageLinkage {
   adjudication: CoderSubmissionAdjudication;
@@ -433,42 +434,90 @@ Guidelines:
       if (adjudication.project_id !== project.id) {
         throw new Error(`ADJUDICATION_LINKAGE_MISMATCH: project ID mismatch (${adjudication.project_id} vs ${project.id})`);
       }
+
+      // Recompute stored hashes
+      if (computeSha256(submission.claim_content_json) !== submission.claim_content_hash) {
+        throw new Error('ADJUDICATION_LINKAGE_MISMATCH: submission claim_content_hash mismatch');
+      }
+      if (computeSha256(submission.canonical_envelope_json) !== submission.canonical_envelope_hash) {
+        throw new Error('ADJUDICATION_LINKAGE_MISMATCH: submission canonical_envelope_hash mismatch');
+      }
+      if (computeSha256(adjudication.authority_snapshot_json) !== adjudication.authority_snapshot_hash) {
+        throw new Error('ADJUDICATION_LINKAGE_MISMATCH: adjudication authority_snapshot_hash mismatch');
+      }
+      if (
+        adjudication.verification_commands_json &&
+        computeSha256(adjudication.verification_commands_json) !== adjudication.verification_commands_hash
+      ) {
+        throw new Error('ADJUDICATION_LINKAGE_MISMATCH: adjudication verification_commands_hash mismatch');
+      }
+
       if (adjudication.test_run_id) {
         if (!linkedTestRun || adjudication.test_run_id !== linkedTestRun.id) {
           throw new Error(`ADJUDICATION_LINKAGE_MISMATCH: test run ID mismatch (${adjudication.test_run_id} vs ${linkedTestRun?.id ?? 'null'})`);
         }
+        if (linkedTestRun.task_id !== task.id) {
+          throw new Error(`ADJUDICATION_LINKAGE_MISMATCH: test run task ID mismatch (${linkedTestRun.task_id} vs ${task.id})`);
+        }
       } else if (linkedTestRun) {
         throw new Error('ADJUDICATION_LINKAGE_MISMATCH: test run provided when adjudication has no test_run_id');
       }
+
       if (adjudication.git_status_evidence_id) {
         if (!gitStatusEvidence || adjudication.git_status_evidence_id !== gitStatusEvidence.id) {
           throw new Error(`ADJUDICATION_LINKAGE_MISMATCH: git status evidence ID mismatch (${adjudication.git_status_evidence_id} vs ${gitStatusEvidence?.id ?? 'null'})`);
         }
+        if (
+          gitStatusEvidence.project_id !== project.id ||
+          gitStatusEvidence.task_id !== task.id ||
+          gitStatusEvidence.evidence_type !== 'GIT_STATUS' ||
+          (typeof gitStatusEvidence.raw_payload === 'string' && computeSha256(gitStatusEvidence.raw_payload) !== gitStatusEvidence.hash)
+        ) {
+          throw new Error('ADJUDICATION_LINKAGE_MISMATCH: git status evidence authority or payload hash mismatch');
+        }
       } else if (gitStatusEvidence) {
         throw new Error('ADJUDICATION_LINKAGE_MISMATCH: git status evidence provided when adjudication has no git_status_evidence_id');
       }
+
       if (adjudication.git_diff_evidence_id) {
         if (!linkedDiffEv || adjudication.git_diff_evidence_id !== linkedDiffEv.id) {
           throw new Error(`ADJUDICATION_LINKAGE_MISMATCH: git diff evidence ID mismatch (${adjudication.git_diff_evidence_id} vs ${linkedDiffEv?.id ?? 'null'})`);
+        }
+        if (
+          linkedDiffEv.project_id !== project.id ||
+          linkedDiffEv.task_id !== task.id ||
+          linkedDiffEv.evidence_type !== 'GIT_DIFF' ||
+          (typeof linkedDiffEv.raw_payload === 'string' && computeSha256(linkedDiffEv.raw_payload) !== linkedDiffEv.hash)
+        ) {
+          throw new Error('ADJUDICATION_LINKAGE_MISMATCH: git diff evidence authority or payload hash mismatch');
         }
       } else if (linkedDiffEv) {
         throw new Error('ADJUDICATION_LINKAGE_MISMATCH: git diff evidence provided when adjudication has no git_diff_evidence_id');
       }
 
-      // Parse untrusted claim fields from raw submission
-      let completedClaimed: string[] = [];
-      let filesClaimed: string[] = [];
-      let testsClaimed: string[] = [];
-      let blockersClaimed: string[] = [];
+      // Parse untrusted claim fields strictly; fail closed on malformed JSON or extra/missing keys
+      let rawClaim: Record<string, unknown>;
       try {
-        const rawClaim = JSON.parse(submission.claim_content_json);
-        if (Array.isArray(rawClaim.completed)) completedClaimed = rawClaim.completed;
-        if (Array.isArray(rawClaim.files_claimed_changed)) filesClaimed = rawClaim.files_claimed_changed;
-        if (Array.isArray(rawClaim.tests_claimed)) testsClaimed = rawClaim.tests_claimed;
-        if (Array.isArray(rawClaim.blockers)) blockersClaimed = rawClaim.blockers;
-      } catch {
-        // preserve defaults
+        const parsed = JSON.parse(submission.claim_content_json);
+        if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) {
+          throw new Error('claim_content_json must be a non-null plain object');
+        }
+        const claimKeys = Object.keys(parsed).sort();
+        const expectedKeys = [...CLAIM_CONTENT_KEYS].sort();
+        if (claimKeys.length !== expectedKeys.length || claimKeys.some((k, i) => k !== expectedKeys[i])) {
+          throw new Error(`claim_content_json own-property set mismatch: ${claimKeys.join(',')}`);
+        }
+        rawClaim = parsed;
+      } catch (err) {
+        throw new Error(
+          `ADJUDICATION_LINKAGE_MISMATCH: Malformed claim JSON in submission: ${err instanceof Error ? err.message : String(err)}`
+        );
       }
+
+      const completedClaimed: string[] = Array.isArray(rawClaim.completed) ? (rawClaim.completed as string[]) : [];
+      const filesClaimed: string[] = Array.isArray(rawClaim.files_claimed_changed) ? (rawClaim.files_claimed_changed as string[]) : [];
+      const testsClaimed: string[] = Array.isArray(rawClaim.tests_claimed) ? (rawClaim.tests_claimed as string[]) : [];
+      const blockersClaimed: string[] = Array.isArray(rawClaim.blockers) ? (rawClaim.blockers as string[]) : [];
 
       const activeTestRun = linkedTestRun;
       const activeDiffEv = linkedDiffEv;

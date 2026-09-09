@@ -1746,6 +1746,18 @@ const ALL_MIGRATIONS_LIST: Migration[] = [
               workspace_snapshot_before_hash GLOB '[0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]'
             )
           ),
+          verification_result_envelope_json TEXT NULL CHECK (
+            verification_result_envelope_json IS NULL OR (
+              json_valid(verification_result_envelope_json) = 1 AND
+              json_type(verification_result_envelope_json) = 'object'
+            )
+          ),
+          verification_result_envelope_hash TEXT NULL CHECK (
+            verification_result_envelope_hash IS NULL OR (
+              length(verification_result_envelope_hash) = 64 AND
+              verification_result_envelope_hash GLOB '[0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]'
+            )
+          ),
           verification_execution_id TEXT NULL,
           protocol_message_id TEXT NULL REFERENCES protocol_messages(id) ON DELETE SET NULL,
           test_run_id TEXT NULL REFERENCES test_runs(id) ON DELETE SET NULL,
@@ -1798,8 +1810,8 @@ const ALL_MIGRATIONS_LIST: Migration[] = [
           CHECK (
             (status = 'ADMITTED' AND verification_started_at IS NULL AND completed_at IS NULL AND recovery_fenced_at IS NULL AND verification_execution_id IS NULL) OR
             (status = 'VERIFYING' AND verification_started_at IS NOT NULL AND completed_at IS NULL AND recovery_fenced_at IS NULL AND verification_execution_id IS NOT NULL AND workspace_snapshot_before_json IS NOT NULL AND workspace_snapshot_before_hash IS NOT NULL) OR
-            (status = 'VERIFIED' AND verification_started_at IS NOT NULL AND completed_at IS NOT NULL AND recovery_fenced_at IS NULL AND test_run_id IS NOT NULL AND git_status_evidence_id IS NOT NULL AND git_diff_evidence_id IS NOT NULL) OR
-            (status = 'VERIFICATION_FAILED' AND completed_at IS NOT NULL AND recovery_fenced_at IS NULL AND failure_code IS NOT NULL) OR
+            (status = 'VERIFIED' AND verification_started_at IS NOT NULL AND completed_at IS NOT NULL AND recovery_fenced_at IS NULL AND test_run_id IS NOT NULL AND git_status_evidence_id IS NOT NULL AND git_diff_evidence_id IS NOT NULL AND verification_result_envelope_json IS NOT NULL AND verification_result_envelope_hash IS NOT NULL) OR
+            (status = 'VERIFICATION_FAILED' AND completed_at IS NOT NULL AND failure_code IS NOT NULL) OR
             (status = 'RECOVERY_FENCED' AND recovery_fenced_at IS NOT NULL AND failure_code IS NOT NULL) OR
             (status IN ('REJECTED', 'SUPERSEDED') AND completed_at IS NOT NULL AND recovery_fenced_at IS NULL)
           )
@@ -1836,7 +1848,9 @@ const ALL_MIGRATIONS_LIST: Migration[] = [
             WHEN NOT (
               (OLD.status = 'ADMITTED' AND NEW.status IN ('VERIFYING', 'RECOVERY_FENCED')) OR
               (OLD.status = 'VERIFYING' AND NEW.status IN ('VERIFIED', 'VERIFICATION_FAILED', 'RECOVERY_FENCED')) OR
-              (OLD.status = 'RECOVERY_FENCED' AND NEW.status IN ('VERIFICATION_FAILED', 'ADMITTED'))
+              (OLD.status = 'VERIFIED' AND NEW.status = 'RECOVERY_FENCED') OR
+              (OLD.status = 'VERIFICATION_FAILED' AND NEW.status = 'RECOVERY_FENCED') OR
+              (OLD.status = 'RECOVERY_FENCED' AND NEW.status IN ('VERIFICATION_FAILED', 'RECOVERY_FENCED'))
             )
             THEN RAISE(ABORT, 'Invalid adjudication lifecycle status transition')
           END;
@@ -1860,6 +1874,10 @@ const ALL_MIGRATIONS_LIST: Migration[] = [
                  OLD.authority_snapshot_hash != NEW.authority_snapshot_hash OR
                  OLD.created_at != NEW.created_at
             THEN RAISE(ABORT, 'coder_submission_adjudications immutable decision and binding fields cannot be updated')
+            WHEN (OLD.verification_execution_id IS NOT NULL AND (NEW.verification_execution_id IS NULL OR NEW.verification_execution_id != OLD.verification_execution_id)) OR
+                 (OLD.verification_started_at IS NOT NULL AND (NEW.verification_started_at IS NULL OR NEW.verification_started_at != OLD.verification_started_at)) OR
+                 (OLD.recovery_fenced_at IS NOT NULL AND (NEW.recovery_fenced_at IS NULL OR NEW.recovery_fenced_at != OLD.recovery_fenced_at))
+            THEN RAISE(ABORT, 'coder_submission_adjudications execution and fence markers cannot be altered or cleared once set')
           END;
         END;
 
@@ -2928,7 +2946,7 @@ export function verifyMigration23SchemaAuthority(db: Database.Database): void {
     throw new Error('[ADJUDICATION_SCHEMA_AUTHORITY_INVALID] Table coder_submission_adjudication_events is missing');
   }
 
-  // 3. Columns on coder_submission_adjudications: exactly 29 columns
+  // 3. Columns on coder_submission_adjudications: exactly 31 columns
   const adjColumns = db.prepare("PRAGMA table_info(coder_submission_adjudications)").all() as {
     cid: number;
     name: string;
@@ -2937,8 +2955,8 @@ export function verifyMigration23SchemaAuthority(db: Database.Database): void {
     dflt_value: unknown;
     pk: number;
   }[];
-  if (adjColumns.length !== 29) {
-    throw new Error(`[ADJUDICATION_SCHEMA_AUTHORITY_INVALID] Table coder_submission_adjudications missing column authority: expected exactly 29 columns (found ${adjColumns.length})`);
+  if (adjColumns.length !== 31) {
+    throw new Error(`[ADJUDICATION_SCHEMA_AUTHORITY_INVALID] Table coder_submission_adjudications missing column authority: expected exactly 31 columns (found ${adjColumns.length})`);
   }
 
   const expectedAdjColumns: Record<string, { type: string; notnull: number; pk: number }> = {
@@ -2960,6 +2978,8 @@ export function verifyMigration23SchemaAuthority(db: Database.Database): void {
     verification_commands_hash: { type: 'TEXT', notnull: 0, pk: 0 },
     workspace_snapshot_before_json: { type: 'TEXT', notnull: 0, pk: 0 },
     workspace_snapshot_before_hash: { type: 'TEXT', notnull: 0, pk: 0 },
+    verification_result_envelope_json: { type: 'TEXT', notnull: 0, pk: 0 },
+    verification_result_envelope_hash: { type: 'TEXT', notnull: 0, pk: 0 },
     verification_execution_id: { type: 'TEXT', notnull: 0, pk: 0 },
     protocol_message_id: { type: 'TEXT', notnull: 0, pk: 0 },
     test_run_id: { type: 'TEXT', notnull: 0, pk: 0 },

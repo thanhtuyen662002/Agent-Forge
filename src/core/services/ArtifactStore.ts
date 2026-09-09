@@ -79,6 +79,107 @@ export class ArtifactStore {
     };
   }
 
+  public stage(
+    id: string,
+    projectId: string,
+    taskId: string | null,
+    attemptId: string | null,
+    evidenceType: EvidenceType,
+    summary: string,
+    payload: string,
+    contentType: string = 'text/plain'
+  ): {
+    evidence: Evidence;
+    stagedPath: string | null;
+    finalPath: string | null;
+    isStagedFile: boolean;
+  } {
+    const hash = crypto.createHash('sha256').update(payload, 'utf8').digest('hex');
+    const byteSize = Buffer.byteLength(payload, 'utf8');
+    const now = new Date().toISOString();
+
+    const baseDir = this.getBaseDir();
+    const stagedPath = path.join(baseDir, `staged_${id}_${hash}.bin`);
+    const finalPath = path.join(baseDir, `${hash}.bin`);
+
+    fs.writeFileSync(stagedPath, payload, 'utf8');
+
+    const evidence: Evidence = {
+      id,
+      project_id: projectId,
+      task_id: taskId,
+      attempt_id: attemptId,
+      evidence_type: evidenceType,
+      storage_type: 'FILE',
+      file_path: finalPath,
+      hash,
+      byte_size: byteSize,
+      content_type: contentType,
+      summary,
+      raw_payload: null,
+      created_at: now,
+    };
+
+    return { evidence, stagedPath, finalPath, isStagedFile: true };
+  }
+
+  public finalizeStagedFile(stagedPath: string, finalPath: string, expectedHash: string): void {
+    if (!fs.existsSync(stagedPath)) {
+      if (fs.existsSync(finalPath)) {
+        // Already finalized
+        const existingContent = fs.readFileSync(finalPath);
+        const existingHash = crypto.createHash('sha256').update(existingContent).digest('hex');
+        if (existingHash === expectedHash) {
+          return;
+        }
+      }
+      throw new Error(`[ArtifactStore] Staged file missing before finalization: "${stagedPath}".`);
+    }
+
+    // Move or copy to final path
+    try {
+      fs.renameSync(stagedPath, finalPath);
+    } catch {
+      // Fallback to copy and unlink
+      fs.copyFileSync(stagedPath, finalPath);
+      fs.unlinkSync(stagedPath);
+    }
+
+    // Verify final content hash
+    const finalContent = fs.readFileSync(finalPath);
+    const finalHash = crypto.createHash('sha256').update(finalContent).digest('hex');
+    if (finalHash !== expectedHash) {
+      throw new Error(
+        `[ArtifactStore] Finalized artifact hash mismatch: expected ${expectedHash}, got ${finalHash}`
+      );
+    }
+  }
+
+  public cleanupStagedFile(stagedPath: string): void {
+    if (!stagedPath || !fs.existsSync(stagedPath)) {
+      return;
+    }
+
+    let lastError: Error | null = null;
+    for (let attempt = 1; attempt <= 3; attempt++) {
+      try {
+        fs.unlinkSync(stagedPath);
+        return;
+      } catch (err: unknown) {
+        lastError = err instanceof Error ? err : new Error(String(err));
+        // Bounded busy wait backoff
+        const start = Date.now();
+        while (Date.now() - start < 25) {
+          // busy wait
+        }
+      }
+    }
+
+    if (lastError && fs.existsSync(stagedPath)) {
+      throw new Error(`[STAGING_CLEANUP_FAILED] Failed to delete staged file "${stagedPath}": ${lastError.message}`);
+    }
+  }
+
   public read(evidence: Evidence): string {
     if (evidence.storage_type === 'INLINE') {
       if (evidence.raw_payload === null) {

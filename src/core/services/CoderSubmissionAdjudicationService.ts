@@ -22,8 +22,12 @@ import {
   CanonicalWorkspaceFingerprint,
   SealedVerificationExecutionInput,
   SubmissionAuthorityIntegrityResult,
+  CanonicalVerificationResultEnvelope,
+  CANONICAL_VERIFICATION_RESULT_ENVELOPE_KEYS,
+  StagedEvidenceFile,
 } from '../types/adjudication';
 import { Evidence, GitStatusSummary, GitDiffSummary } from '../types/domain';
+import { ArtifactStore } from './ArtifactStore';
 import { VerificationService } from './VerificationService';
 import { EventService } from './EventService';
 import { GitService } from './GitService';
@@ -36,6 +40,24 @@ import {
   CANONICAL_ENVELOPE_KEYS,
 } from '../../mcp/submissionProtocol';
 import { computePayloadHash } from './ExecutionAuthorizationService';
+
+export function scrubAdjudicationDiagnostics(text: string): string {
+  if (!text || typeof text !== 'string') return '';
+  let scrubbed = text;
+  // 1. Redact Windows drive paths: e.g. C:\... or d:/...
+  scrubbed = scrubbed.replace(/[A-Za-z]:[\\/][^ \n\r\t,;"']+(?:[\\/][^ \n\r\t,;"']+)*/g, '[REDACTED_PATH]');
+  // 2. Redact Unix paths: e.g. /home/... /usr/... /tmp/...
+  scrubbed = scrubbed.replace(/(?:^|[\s,;("'])\/(?:usr|home|etc|var|tmp|opt|root|bin|proc|sys)[^\s,;)"']*/g, ' [REDACTED_PATH]');
+  // 3. Redact SQL statements
+  scrubbed = scrubbed.replace(/\b(?:SELECT|INSERT\s+INTO|UPDATE|DELETE\s+FROM|CREATE\s+TABLE|DROP\s+TABLE|ALTER\s+TABLE)\b[\s\S]*?(?:;|\n|$)/gi, '[REDACTED_SQL]');
+  // 4. Redact tokens, Bearer headers, sensitive secrets
+  scrubbed = scrubbed.replace(/\baf-[a-zA-Z0-9_\-]+\b/gi, '[REDACTED_TOKEN]');
+  scrubbed = scrubbed.replace(/Bearer\s+[A-Za-z0-9_\-\.]+/gi, 'Bearer [REDACTED_SECRET]');
+  scrubbed = scrubbed.replace(/\b(?:token|token_hash|secret|password|api_key)\s*[:= ]\s*['"]?[A-Za-z0-9_\-\.]+['"]?/gi, '[REDACTED_SECRET]');
+  // 5. Redact stack traces (lines starting with at ...)
+  scrubbed = scrubbed.replace(/\n\s*at\s+[^\n]+/g, '\n[STACK_TRACE_REDACTED]');
+  return scrubbed.trim();
+}
 
 export function deriveDeterministicAdjudicationId(submissionId: string, requestId: string): string {
   const hash = crypto.createHash('sha256').update(`agentforge:adjudication:v1:${submissionId}:${requestId}`).digest();
@@ -92,7 +114,7 @@ export class CoderSubmissionAdjudicationService {
   constructor(
     private readonly repo: Repository,
     private readonly db: Database.Database,
-    private readonly verificationService: VerificationService,
+    private readonly verificationService?: VerificationService,
     private readonly eventService?: EventService
   ) {}
 
@@ -270,6 +292,14 @@ export class CoderSubmissionAdjudicationService {
         canonical_envelope_hash_matches: integrity.canonical_envelope_hash_matches,
         fenced_reasons: integrity.fenced_reasons,
       },
+      integrity_status: integrity.valid ? 'VALID' : 'FENCED_INTEGRITY_CONFLICT',
+      integrity_fenced_reasons: integrity.fenced_reasons,
+      untrusted_claim: {
+        summary: sub.summary,
+        files_claimed_changed: changedFiles,
+        tests_claimed: testsClaimed,
+        blockers: blockers,
+      },
       dispositions,
       adjudications,
     };
@@ -371,6 +401,8 @@ export class CoderSubmissionAdjudicationService {
       verification_started_at: null,
       completed_at: nowIso,
       recovery_fenced_at: null,
+      verification_result_envelope_json: null,
+      verification_result_envelope_hash: null,
     };
 
     const disposition: CoderSubmissionDisposition = {
@@ -547,6 +579,8 @@ export class CoderSubmissionAdjudicationService {
       verification_started_at: null,
       completed_at: nowIso,
       recovery_fenced_at: null,
+      verification_result_envelope_json: null,
+      verification_result_envelope_hash: null,
     };
 
     const disposition: CoderSubmissionDisposition = {
@@ -872,6 +906,8 @@ export class CoderSubmissionAdjudicationService {
         verification_started_at: null,
         completed_at: null,
         recovery_fenced_at: null,
+        verification_result_envelope_json: null,
+        verification_result_envelope_hash: null,
       };
 
       const admitEventPayload = canonicalJsonStringify({
@@ -1026,7 +1062,11 @@ export class CoderSubmissionAdjudicationService {
 
     let claimed = false;
     this.repo.runInTransaction(() => {
-      // Reload and verify live adjudication state in claim transaction
+      // Reload and verify live submission and adjudication state in claim transaction
+      const currentSub = this.repo.getCoderSubmissionById(sub.id);
+      if (!currentSub) {
+        throw new CoderSubmissionAdjudicationError('NOT_FOUND', `Submission ${sub.id} not found`);
+      }
       const currentAdj = this.repo.getCoderSubmissionAdjudicationById(adjudicationId);
       if (!currentAdj) {
         throw new CoderSubmissionAdjudicationError('NOT_FOUND', `Adjudication ${adjudicationId} not found`);
@@ -1038,6 +1078,29 @@ export class CoderSubmissionAdjudicationService {
         );
       }
 
+      // Run the full shared authority verifier inside transaction
+      const liveAuthIntegrity = this.validateSubmissionAndAuthorityIntegrity(currentSub);
+      if (!liveAuthIntegrity.valid) {
+        throw new CoderSubmissionAdjudicationError(
+          'PRECONDITION_FENCED',
+          `Phase B authority verification failed: ${liveAuthIntegrity.fenced_reasons.join('; ')}`
+        );
+      }
+
+      // Validate project/task/attempt/assignment/auth/provider/account/resource/slot/lease state
+      const liveProject = this.repo.getProject(sub.project_id);
+      if (!liveProject || liveProject.status !== 'RUNNING') {
+        throw new CoderSubmissionAdjudicationError('STATUS_CONFLICT', 'Project is not RUNNING');
+      }
+      const liveAttempt = this.repo.getTaskAttempt(snapshot.attempt_id);
+      if (!liveAttempt || liveAttempt.status !== 'RUNNING') {
+        throw new CoderSubmissionAdjudicationError('STATUS_CONFLICT', 'Task attempt is inactive');
+      }
+      const liveAssignment = this.repo.getAgentAssignment(snapshot.assignment_id);
+      if (!liveAssignment || (liveAssignment.status !== 'ASSIGNED' && liveAssignment.status !== 'RUNNING')) {
+        throw new CoderSubmissionAdjudicationError('STATUS_CONFLICT', 'Agent assignment is inactive');
+      }
+
       claimed = this.repo.updateCoderSubmissionAdjudication(adjudicationId, currentAdj.lifecycle_version, {
         status: 'VERIFYING',
         verification_execution_id: executionId,
@@ -1046,19 +1109,24 @@ export class CoderSubmissionAdjudicationService {
         workspace_snapshot_before_hash: workspaceSnapshotHash,
       });
 
-      if (claimed) {
-        this.repo.createCoderSubmissionAdjudicationEvent(claimEvent);
-        this.repo.createDeterministicGenericEvent({
-          id: genericClaimEventId,
-          project_id: sub.project_id,
-          task_id: sub.task_id,
-          agent_id: null,
-          type: 'CODER_SUBMISSION_CLAIMED',
-          summary: `Verification execution claimed on adjudication ${adjudicationId}`,
-          structured_payload: { adjudicationId, executionId, startedAt: phaseBNowIso },
-          timestamp: phaseBNowIso,
-        });
+      if (!claimed) {
+        throw new CoderSubmissionAdjudicationError(
+          'VERIFICATION_IN_FLIGHT',
+          `Settlement claim CAS failed on adjudication ${adjudicationId}`
+        );
       }
+
+      this.repo.createCoderSubmissionAdjudicationEvent(claimEvent);
+      this.repo.createDeterministicGenericEvent({
+        id: genericClaimEventId,
+        project_id: sub.project_id,
+        task_id: sub.task_id,
+        agent_id: null,
+        type: 'CODER_SUBMISSION_CLAIMED',
+        summary: `Verification execution claimed on adjudication ${adjudicationId}`,
+        structured_payload: { adjudicationId, executionId, startedAt: phaseBNowIso },
+        timestamp: phaseBNowIso,
+      });
     });
 
     if (!claimed) {
@@ -1072,10 +1140,13 @@ export class CoderSubmissionAdjudicationService {
     // EXTERNAL VERIFICATION EXECUTION (Outside All Database Transactions)
     // =========================================================================
     const rawTimeout = frozenTestCmd.timeout_ms;
-    const timeoutMs =
-      typeof rawTimeout === 'number' && Number.isInteger(rawTimeout) && rawTimeout > 0 && rawTimeout <= 600000
-        ? rawTimeout
-        : 120000;
+    if (typeof rawTimeout !== 'number' || !Number.isInteger(rawTimeout) || rawTimeout <= 0 || rawTimeout > 600000) {
+      throw new CoderSubmissionAdjudicationError(
+        'COMMAND_SNAPSHOT_INVALID',
+        `Verification test command timeout_ms must be a positive integer <= 600000 (got ${rawTimeout})`
+      );
+    }
+    const timeoutMs = rawTimeout;
 
     const sealedInput: SealedVerificationExecutionInput = {
       adjudication_id: adjudicationId,
@@ -1099,7 +1170,7 @@ export class CoderSubmissionAdjudicationService {
       },
     };
 
-    const verificationResult = await this.verificationService.executeSealedVerification(sealedInput);
+    const verificationResult = await this.verificationService!.executeSealedVerification(sealedInput);
 
     // Collect post-run Git evidence & post-run observation outside all transactions
     let postGitStatus: GitStatusSummary | null = null;
@@ -1134,13 +1205,14 @@ export class CoderSubmissionAdjudicationService {
     // =========================================================================
     // CRITICAL: NO filesystem, Git, or artifact-store writes may occur while SQLite transaction is open!
     // We create and hash the staging package OUTSIDE the transaction first.
-    const artifactStore = this.verificationService.getArtifactStore();
+    const artifactStore = this.verificationService!.getArtifactStore();
+    const stagedFiles: StagedEvidenceFile[] = [];
     let stagedGitStatusEvidence: Evidence | null = null;
     let stagedGitDiffEvidence: Evidence | null = null;
 
     if (postGitStatus) {
       const statusEvId = crypto.randomUUID();
-      stagedGitStatusEvidence = artifactStore.store(
+      const staged = artifactStore.stage(
         statusEvId,
         sub.project_id,
         sub.task_id,
@@ -1150,11 +1222,29 @@ export class CoderSubmissionAdjudicationService {
         JSON.stringify(postGitStatus, null, 2),
         'application/json'
       );
+      stagedGitStatusEvidence = staged.evidence;
+      if (staged.isStagedFile && staged.stagedPath && staged.finalPath) {
+        stagedFiles.push({
+          id: statusEvId,
+          project_id: sub.project_id,
+          task_id: sub.task_id,
+          attempt_id: snapshot.attempt_id,
+          evidence_type: 'GIT_STATUS',
+          summary: staged.evidence.summary,
+          content_type: 'application/json',
+          hash: staged.evidence.hash,
+          byte_size: staged.evidence.byte_size,
+          storage_type: 'FILE',
+          staged_file_path: staged.stagedPath,
+          final_file_path: staged.finalPath,
+          raw_payload: null,
+        });
+      }
     }
 
     if (postGitDiff) {
       const diffEvId = crypto.randomUUID();
-      stagedGitDiffEvidence = artifactStore.store(
+      const staged = artifactStore.stage(
         diffEvId,
         sub.project_id,
         sub.task_id,
@@ -1164,6 +1254,24 @@ export class CoderSubmissionAdjudicationService {
         postGitDiff.diffContent ?? '',
         'text/x-diff'
       );
+      stagedGitDiffEvidence = staged.evidence;
+      if (staged.isStagedFile && staged.stagedPath && staged.finalPath) {
+        stagedFiles.push({
+          id: diffEvId,
+          project_id: sub.project_id,
+          task_id: sub.task_id,
+          attempt_id: snapshot.attempt_id,
+          evidence_type: 'GIT_DIFF',
+          summary: staged.evidence.summary,
+          content_type: 'text/x-diff',
+          hash: staged.evidence.hash,
+          byte_size: staged.evidence.byte_size,
+          storage_type: 'FILE',
+          staged_file_path: staged.stagedPath,
+          final_file_path: staged.finalPath,
+          raw_payload: null,
+        });
+      }
     }
 
     const phaseCNowIso = new Date().toISOString();
@@ -1198,6 +1306,67 @@ export class CoderSubmissionAdjudicationService {
       failureDetail = verificationResult.error;
     }
 
+    const scrubbedFailureDetail = failureDetail ? scrubAdjudicationDiagnostics(failureDetail) : null;
+
+    // Canonical verification result envelope
+    const testResultEvidenceId =
+      'evidence' in verificationResult && (verificationResult as any).evidence ? (verificationResult as any).evidence.id : null;
+    const testResultEvidenceHash =
+      'evidence' in verificationResult && (verificationResult as any).evidence ? (verificationResult as any).evidence.hash : null;
+
+    const exitClassification =
+      verificationResult.outcome === 'SUCCESS'
+        ? 'EXIT_ZERO'
+        : verificationResult.outcome === 'TEST_FAILED'
+        ? 'EXIT_NONZERO'
+        : verificationResult.outcome === 'TEST_TIMEOUT'
+        ? 'TIMEOUT'
+        : 'UNKNOWN';
+
+    const processStartClass =
+      verificationResult.outcome === 'PROCESS_START_FAILED' ? 'LAUNCH_FAILED_PROVEN' : 'SPAWNED_PROVEN';
+
+    const terminationClass =
+      verificationResult.outcome === 'SUCCESS' ||
+      verificationResult.outcome === 'TEST_FAILED' ||
+      verificationResult.outcome === 'TEST_TIMEOUT'
+        ? 'TERMINATION_PROVEN'
+        : 'TERMINATION_AMBIGUOUS';
+
+    const afterFingerprintJson = canonicalJsonStringify(postObservation ?? {});
+    const afterFingerprintHash = computeSha256(afterFingerprintJson);
+
+    const resultEnvelope: CanonicalVerificationResultEnvelope = {
+      adjudication_id: adjudicationId,
+      assignment_id: snapshot.assignment_id,
+      attempt_id: snapshot.attempt_id,
+      authorization_id: sub.authorization_id,
+      command_snapshot_hash: verificationCommandsHash,
+      exit_classification: exitClassification,
+      failure_code: failureCode,
+      failure_payload: failureDetail ? { error: scrubbedFailureDetail } : null,
+      finish_timestamp: phaseCNowIso,
+      git_diff_evidence_hash: stagedGitDiffEvidence?.hash ?? '',
+      git_diff_evidence_id: stagedGitDiffEvidence?.id ?? '',
+      git_status_evidence_hash: stagedGitStatusEvidence?.hash ?? '',
+      git_status_evidence_id: stagedGitStatusEvidence?.id ?? '',
+      lifecycle_version: 3,
+      process_start_classification: processStartClass,
+      project_id: sub.project_id,
+      start_timestamp: phaseBNowIso,
+      task_id: sub.task_id,
+      task_ownership_epoch: sub.task_ownership_epoch,
+      termination_classification: terminationClass,
+      test_result_evidence_hash: testResultEvidenceHash ?? '',
+      test_result_evidence_id: testResultEvidenceId ?? '',
+      test_run_id: testRunId ?? '',
+      verification_execution_id: executionId,
+      workspace_snapshot_after_hash: afterFingerprintHash,
+      workspace_snapshot_before_hash: workspaceSnapshotHash,
+    };
+    const resultEnvelopeJson = canonicalJsonStringify(resultEnvelope);
+    const resultEnvelopeHash = computeSha256(resultEnvelopeJson);
+
     const eventPayload = isSuccess
       ? canonicalJsonStringify({
           adjudication_id: adjudicationId,
@@ -1206,7 +1375,7 @@ export class CoderSubmissionAdjudicationService {
         })
       : canonicalJsonStringify({
           adjudication_id: adjudicationId,
-          error: failureDetail,
+          error: scrubbedFailureDetail,
           failure_code: failureCode || 'TESTS_FAILED',
         });
 
@@ -1227,136 +1396,288 @@ export class CoderSubmissionAdjudicationService {
 
     const dispositionId = deriveDeterministicDispositionId(sub.id, adjudicationId, 3);
 
-    // OPEN SHORT SETTLEMENT TRANSACTION
-    this.repo.runInTransaction(() => {
-      const currentTask = this.repo.getTask(sub.task_id);
-      if (!currentTask) {
-        throw new Error(`Task ${sub.task_id} missing during settlement`);
-      }
-
-      // Persist staged evidence rows inside transaction
-      if (stagedGitStatusEvidence) {
-        this.repo.createEvidence(stagedGitStatusEvidence);
-      }
-      if (stagedGitDiffEvidence) {
-        this.repo.createEvidence(stagedGitDiffEvidence);
-      }
-
-      if (isSuccess) {
-        // Authoritative Success Path:
-        // Transition task: VALIDATING -> REVIEW_READY
-        const trans = TaskStateMachine.transition(currentTask.state, 'EVIDENCE_GATHERED', {
-          revisionCount: currentTask.revision_count,
-          maxRevisions: currentTask.max_revisions,
-        });
-
-        this.repo.updateTaskState(currentTask.id, trans.nextState);
-        this.repo.updateTaskShas(currentTask.id, sub.base_sha, freshPhaseBObservation.head_sha);
-
-        // Append terminal disposition: SETTLED / ACCEPTED_VERIFIED
-        const disposition: CoderSubmissionDisposition = {
-          id: dispositionId,
-          submission_id: sub.id,
-          disposition_event: 'SETTLED',
-          disposition_reason: 'ACCEPTED_VERIFIED',
-          actor_type: 'OPERATOR',
-          actor_id: 'OWNER_LOCAL_UI',
-          disposition_metadata_json: canonicalJsonStringify({
-            adjudication_id: adjudicationId,
-            exit_code: 0,
-            test_run_id: testRunId,
-          }),
-          created_at: phaseCNowIso,
-        };
-        this.repo.createCoderSubmissionDisposition(disposition);
-
-        // Update adjudication: VERIFIED (CAS version 2 -> 3)
-        const updated = this.repo.updateCoderSubmissionAdjudication(adjudicationId, 2, {
-          status: 'VERIFIED',
-          test_run_id: testRunId,
-          git_status_evidence_id: stagedGitStatusEvidence?.id ?? null,
-          git_diff_evidence_id: stagedGitDiffEvidence?.id ?? null,
-          completed_at: phaseCNowIso,
-        });
-
-        if (!updated) {
-          throw new CoderSubmissionAdjudicationError('STATUS_CONFLICT', 'Settlement CAS failed (expected version 2)');
+    try {
+      finalAdjudication = await this.settleVerificationPhaseC({
+        sub,
+        adjudicationId,
+        isSuccess,
+        testRunId,
+        stagedGitStatusEvidence,
+        stagedGitDiffEvidence,
+        stagedFiles,
+        freshPhaseBObservation: postObservation ?? {},
+        dispositionId,
+        finalEventId,
+        genericFinalEventId,
+        eventType: eventType as AdjudicationEventType,
+        eventPayload,
+        eventPayloadHash,
+        failureCode,
+        scrubbedFailureDetail,
+        resultEnvelopeJson,
+        resultEnvelopeHash,
+        phaseCNowIso,
+        artifactStore,
+      });
+    } catch (err) {
+      // Pre-commit failure: perform bounded cleanup of staged files
+      for (const stagedFile of stagedFiles) {
+        if (stagedFile.staged_file_path) {
+          try {
+            artifactStore.cleanupStagedFile(stagedFile.staged_file_path);
+          } catch (cleanupErr) {
+            throw cleanupErr;
+          }
         }
-
-        // Create deterministic events atomically
-        this.repo.createCoderSubmissionAdjudicationEvent({
-          id: finalEventId,
-          adjudication_id: adjudicationId,
-          sequence: 3,
-          event_type: 'VERIFICATION_SUCCEEDED',
-          payload_json: eventPayload,
-          payload_hash: eventPayloadHash,
-          created_at: phaseCNowIso,
-        });
-
-        this.repo.createDeterministicGenericEvent({
-          id: genericFinalEventId,
-          project_id: sub.project_id,
-          task_id: sub.task_id,
-          agent_id: null,
-          type: 'CODER_SUBMISSION_VERIFIED',
-          summary: `Quarantined submission ${sub.id} successfully verified. Task advanced to REVIEW_READY.`,
-          structured_payload: { adjudicationId, submissionId: sub.id, testRunId },
-          timestamp: phaseCNowIso,
-        });
-      } else {
-        // Authoritative Failure Path:
-        const trans = TaskStateMachine.transition(currentTask.state, 'TESTS_FAILED', {
-          revisionCount: currentTask.revision_count,
-          maxRevisions: currentTask.max_revisions,
-        });
-
-        this.repo.updateTaskState(currentTask.id, trans.nextState, null, trans.incrementRevision);
-
-        // Update adjudication: VERIFICATION_FAILED (CAS version 2 -> 3)
-        const updated = this.repo.updateCoderSubmissionAdjudication(adjudicationId, 2, {
-          status: 'VERIFICATION_FAILED',
-          test_run_id: testRunId,
-          git_status_evidence_id: stagedGitStatusEvidence?.id ?? null,
-          git_diff_evidence_id: stagedGitDiffEvidence?.id ?? null,
-          failure_code: failureCode || 'TESTS_FAILED',
-          failure_json: canonicalJsonStringify({ error: failureDetail }),
-          completed_at: phaseCNowIso,
-        });
-
-        if (!updated) {
-          throw new CoderSubmissionAdjudicationError('STATUS_CONFLICT', 'Settlement CAS failed (expected version 2)');
-        }
-
-        this.repo.createCoderSubmissionAdjudicationEvent({
-          id: finalEventId,
-          adjudication_id: adjudicationId,
-          sequence: 3,
-          event_type: 'VERIFICATION_FAILED',
-          payload_json: eventPayload,
-          payload_hash: eventPayloadHash,
-          created_at: phaseCNowIso,
-        });
-
-        this.repo.createDeterministicGenericEvent({
-          id: genericFinalEventId,
-          project_id: sub.project_id,
-          task_id: sub.task_id,
-          agent_id: null,
-          type: 'CODER_SUBMISSION_VERIFICATION_FAILED',
-          summary: `Quarantined submission ${sub.id} verification failed (${failureCode}): ${failureDetail}. Task state: ${trans.nextState}.`,
-          structured_payload: { adjudicationId, error: failureDetail, failureCode, submissionId: sub.id },
-          timestamp: phaseCNowIso,
-        });
       }
-
-      finalAdjudication = this.repo.getCoderSubmissionAdjudicationById(adjudicationId)!;
-    });
+      throw err;
+    }
 
     return {
-      adjudication: finalAdjudication!,
-      status: finalAdjudication!.status,
+      adjudication: finalAdjudication,
+      status: finalAdjudication.status,
     };
+  }
+
+  public async settleVerificationPhaseC(params: {
+    sub: CoderSubmission;
+    adjudicationId: string;
+    isSuccess: boolean;
+    testRunId: string | null;
+    stagedGitStatusEvidence: Evidence | null;
+    stagedGitDiffEvidence: Evidence | null;
+    stagedFiles: StagedEvidenceFile[];
+    freshPhaseBObservation: CanonicalWorkspaceFingerprint | Record<string, unknown>;
+    dispositionId: string;
+    finalEventId: string;
+    genericFinalEventId: string;
+    eventType: AdjudicationEventType;
+    eventPayload: string;
+    eventPayloadHash: string;
+    failureCode: string | null;
+    scrubbedFailureDetail: string | null;
+    resultEnvelopeJson: string;
+    resultEnvelopeHash: string;
+    phaseCNowIso: string;
+    artifactStore: ArtifactStore;
+  }): Promise<CoderSubmissionAdjudication> {
+    const {
+      sub,
+      adjudicationId,
+      isSuccess,
+      testRunId,
+      stagedGitStatusEvidence,
+      stagedGitDiffEvidence,
+      stagedFiles,
+      freshPhaseBObservation,
+      dispositionId,
+      finalEventId,
+      genericFinalEventId,
+      eventType,
+      eventPayload,
+      eventPayloadHash,
+      failureCode,
+      scrubbedFailureDetail,
+      resultEnvelopeJson,
+      resultEnvelopeHash,
+      phaseCNowIso,
+      artifactStore,
+    } = params;
+
+    let finalAdjudication: CoderSubmissionAdjudication | null = null;
+
+    // OPEN SHORT SETTLEMENT TRANSACTION
+    try {
+      this.repo.runInTransaction(() => {
+        const currentSub = this.repo.getCoderSubmissionById(sub.id);
+        if (!currentSub) {
+          throw new Error(`Submission ${sub.id} missing during settlement`);
+        }
+        const liveIntegrity = this.validateSubmissionAndAuthorityIntegrity(currentSub);
+        if (!liveIntegrity.valid) {
+          throw new CoderSubmissionAdjudicationError(
+            'STATUS_CONFLICT',
+            `Phase C authority verification failed: ${liveIntegrity.fenced_reasons.join('; ')}`
+          );
+        }
+
+        const currentTask = this.repo.getTask(sub.task_id);
+        if (!currentTask) {
+          throw new Error(`Task ${sub.task_id} missing during settlement`);
+        }
+
+        // Persist staged evidence rows inside transaction
+        if (stagedGitStatusEvidence) {
+          this.repo.createEvidence(stagedGitStatusEvidence);
+        }
+        if (stagedGitDiffEvidence) {
+          this.repo.createEvidence(stagedGitDiffEvidence);
+        }
+
+        if (isSuccess) {
+          // Authoritative Success Path:
+          // Transition task: VALIDATING -> REVIEW_READY
+          const trans = TaskStateMachine.transition(currentTask.state, 'EVIDENCE_GATHERED', {
+            revisionCount: currentTask.revision_count,
+            maxRevisions: currentTask.max_revisions,
+          });
+
+          this.repo.updateTaskState(currentTask.id, trans.nextState);
+          this.repo.updateTaskShas(
+            currentTask.id,
+            sub.base_sha,
+            typeof (freshPhaseBObservation as any).head_sha === 'string' ? (freshPhaseBObservation as any).head_sha : null
+          );
+
+          // Append terminal disposition: SETTLED / ACCEPTED_VERIFIED
+          const disposition: CoderSubmissionDisposition = {
+            id: dispositionId,
+            submission_id: sub.id,
+            disposition_event: 'SETTLED',
+            disposition_reason: 'ACCEPTED_VERIFIED',
+            actor_type: 'OPERATOR',
+            actor_id: 'OWNER_LOCAL_UI',
+            disposition_metadata_json: canonicalJsonStringify({
+              adjudication_id: adjudicationId,
+              exit_code: 0,
+              test_run_id: testRunId,
+            }),
+            created_at: phaseCNowIso,
+          };
+          this.repo.createCoderSubmissionDisposition(disposition);
+
+          // Update adjudication: VERIFIED (CAS version 2 -> 3)
+          const updated = this.repo.updateCoderSubmissionAdjudication(adjudicationId, 2, {
+            status: 'VERIFIED',
+            test_run_id: testRunId,
+            git_status_evidence_id: stagedGitStatusEvidence?.id ?? null,
+            git_diff_evidence_id: stagedGitDiffEvidence?.id ?? null,
+            completed_at: phaseCNowIso,
+            verification_result_envelope_json: resultEnvelopeJson,
+            verification_result_envelope_hash: resultEnvelopeHash,
+          });
+
+          if (!updated) {
+            throw new CoderSubmissionAdjudicationError('STATUS_CONFLICT', 'Settlement CAS failed (expected version 2)');
+          }
+
+          // Create deterministic events atomically
+          this.repo.createCoderSubmissionAdjudicationEvent({
+            id: finalEventId,
+            adjudication_id: adjudicationId,
+            sequence: 3,
+            event_type: 'VERIFICATION_SUCCEEDED',
+            payload_json: eventPayload,
+            payload_hash: eventPayloadHash,
+            created_at: phaseCNowIso,
+          });
+
+          this.repo.createDeterministicGenericEvent({
+            id: genericFinalEventId,
+            project_id: sub.project_id,
+            task_id: sub.task_id,
+            agent_id: null,
+            type: 'CODER_SUBMISSION_VERIFIED',
+            summary: `Quarantined submission ${sub.id} successfully verified. Task advanced to REVIEW_READY.`,
+            structured_payload: { adjudicationId, submissionId: sub.id, testRunId },
+            timestamp: phaseCNowIso,
+          });
+        } else {
+          // Authoritative Failure Path:
+          const trans = TaskStateMachine.transition(currentTask.state, 'TESTS_FAILED', {
+            revisionCount: currentTask.revision_count,
+            maxRevisions: currentTask.max_revisions,
+          });
+
+          this.repo.updateTaskState(currentTask.id, trans.nextState, null, trans.incrementRevision);
+
+          // Update adjudication: VERIFICATION_FAILED (CAS version 2 -> 3)
+          const updated = this.repo.updateCoderSubmissionAdjudication(adjudicationId, 2, {
+            status: 'VERIFICATION_FAILED',
+            test_run_id: testRunId,
+            git_status_evidence_id: stagedGitStatusEvidence?.id ?? null,
+            git_diff_evidence_id: stagedGitDiffEvidence?.id ?? null,
+            failure_code: failureCode || 'TESTS_FAILED',
+            failure_json: canonicalJsonStringify({ error: scrubbedFailureDetail }),
+            completed_at: phaseCNowIso,
+            verification_result_envelope_json: resultEnvelopeJson,
+            verification_result_envelope_hash: resultEnvelopeHash,
+          });
+
+          if (!updated) {
+            throw new CoderSubmissionAdjudicationError('STATUS_CONFLICT', 'Settlement CAS failed (expected version 2)');
+          }
+
+          this.repo.createCoderSubmissionAdjudicationEvent({
+            id: finalEventId,
+            adjudication_id: adjudicationId,
+            sequence: 3,
+            event_type: 'VERIFICATION_FAILED',
+            payload_json: eventPayload,
+            payload_hash: eventPayloadHash,
+            created_at: phaseCNowIso,
+          });
+
+          this.repo.createDeterministicGenericEvent({
+            id: genericFinalEventId,
+            project_id: sub.project_id,
+            task_id: sub.task_id,
+            agent_id: null,
+            type: 'CODER_SUBMISSION_VERIFICATION_FAILED',
+            summary: `Quarantined submission ${sub.id} verification failed (${failureCode}): ${scrubbedFailureDetail}. Task state: ${trans.nextState}.`,
+            structured_payload: { adjudicationId, error: scrubbedFailureDetail, failureCode, submissionId: sub.id },
+            timestamp: phaseCNowIso,
+          });
+        }
+
+        finalAdjudication = this.repo.getCoderSubmissionAdjudicationById(adjudicationId)!;
+      });
+    } catch (err) {
+      // Pre-commit failure: perform bounded cleanup of staged files
+      for (const stagedFile of stagedFiles) {
+        try {
+          if (stagedFile.staged_file_path) {
+            artifactStore.cleanupStagedFile(stagedFile.staged_file_path);
+          }
+        } catch (cleanupErr) {
+          // Visible error, never swallowed
+          throw cleanupErr;
+        }
+      }
+      throw err;
+    }
+
+    // Post-commit: finalize staged files to authoritative final paths
+    for (const stagedFile of stagedFiles) {
+      if (stagedFile.staged_file_path && stagedFile.final_file_path) {
+        try {
+          artifactStore.finalizeStagedFile(
+            stagedFile.staged_file_path,
+            stagedFile.final_file_path,
+            stagedFile.hash
+          );
+        } catch (finalizeErr) {
+          // Post-commit file-finalization uncertainty: fence for recovery
+          this.repo.runInTransaction(() => {
+            this.repo.updateCoderSubmissionAdjudication(adjudicationId, finalAdjudication!.lifecycle_version, {
+              status: 'RECOVERY_FENCED',
+              recovery_fenced_at: new Date().toISOString(),
+              failure_code: 'POST_COMMIT_FINALIZATION_UNCERTAINTY',
+              failure_json: canonicalJsonStringify({
+                reason: `Post-commit artifact finalization failed: ${finalizeErr instanceof Error ? finalizeErr.message : String(finalizeErr)}`,
+              }),
+            });
+          });
+          finalAdjudication = this.repo.getCoderSubmissionAdjudicationById(adjudicationId)!;
+          throw new CoderSubmissionAdjudicationError(
+            'RECOVERY_FENCED',
+            `POST_COMMIT_FINALIZATION_UNCERTAINTY: ${finalizeErr instanceof Error ? finalizeErr.message : String(finalizeErr)}`
+          );
+        }
+      }
+    }
+
+    return finalAdjudication!;
   }
 
   /**
@@ -1467,12 +1788,12 @@ export class CoderSubmissionAdjudicationService {
     );
 
     this.repo.runInTransaction(() => {
-      // NEVER clear verification_execution_id or verification_started_at!
+      // NEVER clear verification_execution_id or verification_started_at or recovery_fenced_at!
       const updated = this.repo.updateCoderSubmissionAdjudication(adj.id, adj.lifecycle_version, {
         status: nextStatus,
         failure_code: params.decision === 'CANCEL' ? 'ORPHANED_VERIFICATION_CANCELLED' : adj.failure_code,
         completed_at: params.decision === 'CANCEL' ? nowIso : null,
-        recovery_fenced_at: params.decision === 'CANCEL' ? null : adj.recovery_fenced_at,
+        recovery_fenced_at: adj.recovery_fenced_at, // IMMUTABLE
       });
 
       if (!updated) {
@@ -1503,8 +1824,12 @@ export class CoderSubmissionAdjudicationService {
 
       if (params.decision === 'CANCEL') {
         const liveTask = this.repo.getTask(adj.task_id);
-        if (liveTask && (liveTask.state === 'VALIDATING' || liveTask.state === 'CODING')) {
-          this.repo.updateTaskState(liveTask.id, 'NEEDS_HUMAN');
+        if (liveTask && (liveTask.state === 'VALIDATING' || liveTask.state === 'CODING' || liveTask.state === 'BLOCKED')) {
+          const trans = TaskStateMachine.transition(liveTask.state, 'CANCEL', {
+            revisionCount: liveTask.revision_count,
+            maxRevisions: liveTask.max_revisions,
+          });
+          this.repo.updateTaskState(liveTask.id, trans.nextState);
         }
       }
     });
@@ -1592,8 +1917,8 @@ export class CoderSubmissionAdjudicationService {
     const project = this.repo.getProject(sub.project_id);
     if (!project) {
       fenced_reasons.push(`Project "${sub.project_id}" not found`);
-    } else if ((project.status as string) === 'ARCHIVED' || project.status === 'CANCELLED') {
-      fenced_reasons.push(`Project "${sub.project_id}" is ${project.status}`);
+    } else if (project.status !== 'RUNNING') {
+      fenced_reasons.push(`Project must be in RUNNING state (got ${project.status})`);
     }
 
     const task = this.repo.getTask(sub.task_id);
@@ -1619,6 +1944,9 @@ export class CoderSubmissionAdjudicationService {
       if (attempt.task_id !== sub.task_id) {
         fenced_reasons.push(`Task attempt belongs to task "${attempt.task_id}", expected "${sub.task_id}"`);
       }
+      if (attempt.status !== 'RUNNING') {
+        fenced_reasons.push(`Task attempt must be RUNNING (got ${attempt.status})`);
+      }
     }
 
     const assignment = sub.assignment_id ? this.repo.getAgentAssignment(sub.assignment_id) : null;
@@ -1628,6 +1956,11 @@ export class CoderSubmissionAdjudicationService {
       if (assignment.attempt_id !== sub.attempt_id) {
         fenced_reasons.push(
           `Agent assignment belongs to attempt "${assignment.attempt_id}", expected "${sub.attempt_id}"`
+        );
+      }
+      if (assignment.status !== 'ASSIGNED' && assignment.status !== 'RUNNING') {
+        fenced_reasons.push(
+          `Agent assignment "${sub.assignment_id}" status must be ASSIGNED or RUNNING (got ${assignment.status})`
         );
       }
     }
@@ -1675,22 +2008,56 @@ export class CoderSubmissionAdjudicationService {
         }
       }
 
+      if (auth.selected_resource_id) {
+        const resource = this.repo.getProviderResource(auth.selected_resource_id);
+        if (!resource) {
+          fenced_reasons.push(`Provider resource "${auth.selected_resource_id}" not found`);
+        } else if (!resource.enabled) {
+          fenced_reasons.push('Provider resource is not enabled');
+        }
+      }
+
       if (!auth.canonical_payload_json) {
         fenced_reasons.push('Execution authorization missing canonical_payload_json');
-      } else if (auth.instruction_payload_hash) {
+      } else {
         let matches = false;
         try {
           const parsed = JSON.parse(auth.canonical_payload_json);
-          if (computePayloadHash(parsed) === auth.instruction_payload_hash) {
-            matches = true;
+          if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) {
+            fenced_reasons.push('Execution authorization canonical payload must be a plain object');
+          } else {
+            if (auth.instruction_payload_hash && computePayloadHash(parsed) === auth.instruction_payload_hash) {
+              matches = true;
+            }
+            // Strict check on verificationCommands inside authorization
+            const frozenCmds = parsed.verificationCommands;
+            if (!frozenCmds || typeof frozenCmds !== 'object' || Array.isArray(frozenCmds)) {
+              fenced_reasons.push('Execution authorization missing frozen verification commands (verificationCommands object)');
+            } else {
+              const testCmd = frozenCmds.TEST;
+              if (!testCmd || typeof testCmd !== 'object' || Array.isArray(testCmd)) {
+                fenced_reasons.push('Execution authorization missing verificationCommands TEST object');
+              } else {
+                if (typeof testCmd.executable !== 'string' || !testCmd.executable.trim()) {
+                  fenced_reasons.push('Execution authorization verificationCommands TEST executable must be non-empty string');
+                }
+                if (!Array.isArray(testCmd.args)) {
+                  fenced_reasons.push('Execution authorization verificationCommands TEST args must be an array');
+                }
+                const rawTimeout = testCmd.timeout_ms;
+                if (typeof rawTimeout !== 'number' || !Number.isInteger(rawTimeout) || rawTimeout <= 0 || rawTimeout > 600000) {
+                  fenced_reasons.push('Execution authorization verificationCommands TEST timeout_ms must be a positive integer <= 600000');
+                }
+              }
+            }
           }
         } catch {
-          // ignore parse error
+          fenced_reasons.push('Execution authorization canonical payload is malformed JSON');
         }
-        if (!matches && computeSha256(auth.canonical_payload_json) === auth.instruction_payload_hash) {
+        if (!matches && auth.instruction_payload_hash && computeSha256(auth.canonical_payload_json) === auth.instruction_payload_hash) {
           matches = true;
         }
-        if (!matches) {
+        if (auth.instruction_payload_hash && !matches) {
           fenced_reasons.push(
             'Execution authorization canonical payload hash mismatch (INSTRUCTION_PAYLOAD_HASH_MISMATCH)'
           );
@@ -1703,6 +2070,8 @@ export class CoderSubmissionAdjudicationService {
         const slot = this.repo.getWorkerSlot(slotId);
         if (!slot) {
           fenced_reasons.push(`Worker slot "${slotId}" not found`);
+        } else if (slot.status !== 'IDLE' && slot.status !== 'LEASED' && slot.status !== 'RUNNING') {
+          fenced_reasons.push(`Worker slot is not active (got ${slot.status})`);
         }
         const lease = this.repo.getActiveLeaseForSlot(slotId);
         if (!lease) {
@@ -1716,20 +2085,63 @@ export class CoderSubmissionAdjudicationService {
         fenced_reasons.push('Authorization missing manager_message_id');
       } else {
         const msgRow = this.db
-          .prepare('SELECT * FROM protocol_messages WHERE id = ? OR message_id = ?')
-          .get(managerMsgId, managerMsgId) as Record<string, unknown> | undefined;
+          .prepare('SELECT * FROM protocol_messages WHERE id = ?')
+          .get(managerMsgId) as Record<string, unknown> | undefined;
         if (!msgRow) {
           fenced_reasons.push(`Manager protocol message "${managerMsgId}" not found by exact record ID`);
         } else {
-          const rawMsgPayload =
-            typeof msgRow.raw_payload === 'string'
-              ? msgRow.raw_payload
-              : typeof msgRow.payload_json === 'string'
-              ? msgRow.payload_json
-              : '';
-          const recomputedMsgHash = computeSha256(rawMsgPayload);
-          if (recomputedMsgHash !== auth.manager_payload_hash) {
-            fenced_reasons.push('Manager protocol message raw payload hash mismatch');
+          if (typeof msgRow.raw_payload !== 'string') {
+            fenced_reasons.push('Manager protocol message raw_payload missing or not a string');
+          } else {
+            const rawMsgPayload = msgRow.raw_payload;
+            const recomputedMsgHash = computeSha256(rawMsgPayload);
+            if (recomputedMsgHash !== auth.manager_payload_hash) {
+              fenced_reasons.push('Manager protocol message raw payload hash mismatch');
+            }
+            if (msgRow.payload_hash !== auth.manager_payload_hash) {
+              fenced_reasons.push('Manager protocol message stored payload_hash mismatch');
+            }
+            try {
+              const parsedPayload = JSON.parse(rawMsgPayload);
+              if (typeof parsedPayload !== 'object' || parsedPayload === null || Array.isArray(parsedPayload)) {
+                fenced_reasons.push('Manager protocol message raw_payload must be a non-null plain object');
+              } else {
+                const expectedManagerKeys = [
+                  'protocol',
+                  'message_id',
+                  'project_id',
+                  'task_id',
+                  'decision',
+                  'priority',
+                  'risk',
+                  'instructions',
+                  'acceptance_criteria',
+                  'constraints',
+                  'review_issues',
+                  'expected_task_state',
+                  'expected_revision',
+                  'created_at',
+                ].sort();
+                const actualKeys = Object.keys(parsedPayload).sort();
+                if (
+                  actualKeys.length !== expectedManagerKeys.length ||
+                  actualKeys.some((k, i) => k !== expectedManagerKeys[i])
+                ) {
+                  fenced_reasons.push('Manager protocol message payload key mismatch (missing or extra keys)');
+                }
+                if (parsedPayload.protocol !== 'manager.v1') {
+                  fenced_reasons.push(`Manager protocol message protocol must be manager.v1 (got ${parsedPayload.protocol})`);
+                }
+                if (parsedPayload.project_id !== sub.project_id) {
+                  fenced_reasons.push('Manager protocol message project_id mismatch');
+                }
+                if (parsedPayload.task_id && parsedPayload.task_id !== sub.task_id) {
+                  fenced_reasons.push('Manager protocol message task_id mismatch');
+                }
+              }
+            } catch {
+              fenced_reasons.push('Manager protocol message raw_payload is malformed JSON');
+            }
           }
         }
       }
@@ -1764,6 +2176,7 @@ export class CoderSubmissionAdjudicationService {
     claim_content_hash_matches: boolean;
     canonical_envelope_hash_matches: boolean;
     fenced_reasons: string[];
+    fenced_reason: string | null;
   } {
     const result = this.validateSubmissionAndAuthorityIntegrity(sub);
     return {
@@ -1771,6 +2184,7 @@ export class CoderSubmissionAdjudicationService {
       claim_content_hash_matches: result.claim_content_hash_matches,
       canonical_envelope_hash_matches: result.canonical_envelope_hash_matches,
       fenced_reasons: result.fenced_reasons,
+      fenced_reason: result.fenced_reasons.length > 0 ? result.fenced_reasons.join('; ') : null,
     };
   }
 

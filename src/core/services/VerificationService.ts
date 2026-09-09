@@ -330,7 +330,8 @@ export class VerificationService {
     // 4. Spawn and execute with ProcessRunner
     let result: import('./ProcessRunner').ProcessRunResult;
     try {
-      result = await ProcessRunner.execute({
+      const runner = (this as any).processRunner || ProcessRunner;
+      result = await runner.execute({
         executable,
         args,
         cwd: input.repo_path,
@@ -348,8 +349,9 @@ export class VerificationService {
     } catch (spawnErr: unknown) {
       const errMsg = spawnErr instanceof Error ? spawnErr.message : String(spawnErr);
       return {
-        outcome: 'PROCESS_START_FAILED',
-        error: `Synchronous process spawn failure: ${errMsg}`,
+        outcome: 'RECOVERY_FENCED',
+        failure_code: 'ORPHANED_VERIFICATION_INTERRUPTED',
+        error: `Ambiguous process execution failure: ${errMsg}`,
       };
     }
 
@@ -472,7 +474,21 @@ export class VerificationService {
   ): Promise<TestRun> {
     const executable = frozenCommand.executable;
     const args = frozenCommand.args;
-    const timeoutMs = frozenCommand.timeout_ms || 120000;
+    const timeoutMs = frozenCommand.timeout_ms;
+    if (
+      typeof timeoutMs !== 'number' ||
+      !Number.isInteger(timeoutMs) ||
+      timeoutMs <= 0 ||
+      timeoutMs > 600000
+    ) {
+      return this.recordFailure(
+        projectId,
+        taskId,
+        attemptId,
+        frozenCommand.name || 'Frozen Command',
+        `COMMAND_POLICY_REJECTED: Frozen command timeout must be a positive integer between 1 and 600000 ms (got ${timeoutMs})`
+      );
+    }
     const commandName = frozenCommand.name || 'Frozen Authorization Test Suite';
     const fullCommandStr = `${executable} ${args.join(' ')}`;
 

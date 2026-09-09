@@ -3938,6 +3938,8 @@ export class Repository {
           verification_commands_hash,
           workspace_snapshot_before_json,
           workspace_snapshot_before_hash,
+          verification_result_envelope_json,
+          verification_result_envelope_hash,
           verification_execution_id,
           protocol_message_id,
           test_run_id,
@@ -3952,7 +3954,8 @@ export class Repository {
         ) VALUES (
           ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
           ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
-          ?, ?, ?, ?, ?, ?, ?, ?, ?
+          ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+          ?
         )
       `)
       .run(
@@ -3974,6 +3977,8 @@ export class Repository {
         adj.verification_commands_hash ?? null,
         adj.workspace_snapshot_before_json ?? null,
         adj.workspace_snapshot_before_hash ?? null,
+        adj.verification_result_envelope_json ?? null,
+        adj.verification_result_envelope_hash ?? null,
         adj.verification_execution_id ?? null,
         adj.protocol_message_id ?? null,
         adj.test_run_id ?? null,
@@ -3997,6 +4002,8 @@ export class Repository {
       verification_started_at?: string | null;
       workspace_snapshot_before_json?: string | null;
       workspace_snapshot_before_hash?: string | null;
+      verification_result_envelope_json?: string | null;
+      verification_result_envelope_hash?: string | null;
       protocol_message_id?: string | null;
       test_run_id?: string | null;
       git_status_evidence_id?: string | null;
@@ -4029,6 +4036,14 @@ export class Repository {
     if (updates.workspace_snapshot_before_hash !== undefined) {
       setClauses.push('workspace_snapshot_before_hash = ?');
       params.push(updates.workspace_snapshot_before_hash);
+    }
+    if (updates.verification_result_envelope_json !== undefined) {
+      setClauses.push('verification_result_envelope_json = ?');
+      params.push(updates.verification_result_envelope_json);
+    }
+    if (updates.verification_result_envelope_hash !== undefined) {
+      setClauses.push('verification_result_envelope_hash = ?');
+      params.push(updates.verification_result_envelope_hash);
     }
     if (updates.protocol_message_id !== undefined) {
       setClauses.push('protocol_message_id = ?');
@@ -4108,6 +4123,10 @@ export class Repository {
     return rows.map((r) => this.mapCoderSubmissionAdjudication(r));
   }
 
+  public getCoderSubmissionAdjudicationsBySubmissionId(submissionId: string): CoderSubmissionAdjudication[] {
+    return this.getCoderSubmissionAdjudicationsBySubmission(submissionId);
+  }
+
   public getCoderSubmissionAdjudicationsByTask(taskId: string): CoderSubmissionAdjudication[] {
     const rows = this.db
       .prepare('SELECT * FROM coder_submission_adjudications WHERE task_id = ? ORDER BY created_at DESC, lifecycle_version DESC')
@@ -4120,7 +4139,7 @@ export class Repository {
       .prepare(`
         SELECT * FROM coder_submission_adjudications
         WHERE status IN ('ADMITTED', 'VERIFYING', 'RECOVERY_FENCED')
-        ORDER BY created_at ASC
+        ORDER BY created_at ASC, lifecycle_version ASC
       `)
       .all() as Record<string, unknown>[];
     return rows.map((r) => this.mapCoderSubmissionAdjudication(r));
@@ -4146,6 +4165,8 @@ export class Repository {
       verification_commands_hash: row.verification_commands_hash != null ? String(row.verification_commands_hash) : null,
       workspace_snapshot_before_json: row.workspace_snapshot_before_json != null ? String(row.workspace_snapshot_before_json) : null,
       workspace_snapshot_before_hash: row.workspace_snapshot_before_hash != null ? String(row.workspace_snapshot_before_hash) : null,
+      verification_result_envelope_json: row.verification_result_envelope_json != null ? String(row.verification_result_envelope_json) : null,
+      verification_result_envelope_hash: row.verification_result_envelope_hash != null ? String(row.verification_result_envelope_hash) : null,
       verification_execution_id: row.verification_execution_id != null ? String(row.verification_execution_id) : null,
       protocol_message_id: row.protocol_message_id != null ? String(row.protocol_message_id) : null,
       test_run_id: row.test_run_id != null ? String(row.test_run_id) : null,

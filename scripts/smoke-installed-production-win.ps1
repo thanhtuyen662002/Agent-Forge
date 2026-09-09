@@ -12,6 +12,58 @@ param (
 
 $ErrorActionPreference = "Stop"
 
+function Remove-PathWithBoundedRetry {
+  param(
+    [Parameter(Mandatory=$true)][string]$Path,
+    [int]$MaxRetries = 25,
+    [int]$DelayMs = 300
+  )
+  if (-not (Test-Path $Path)) { return }
+  for ($i = 1; $i -le $MaxRetries; $i++) {
+    try {
+      Remove-Item -Recurse -Force $Path -ErrorAction Stop
+      if (-not (Test-Path $Path)) { return }
+    } catch {
+      if ($i -eq $MaxRetries) {
+        throw "SMOKE_CLEANUP_EXHAUSTED: Failed to remove path '$Path' after $MaxRetries attempts: $_"
+      }
+      Start-Sleep -Milliseconds $DelayMs
+    }
+  }
+  if (Test-Path $Path) {
+    throw "SMOKE_CLEANUP_EXHAUSTED: Path '$Path' still exists after $MaxRetries removal attempts."
+  }
+}
+
+function Stop-ProcessWithBoundedWait {
+  param(
+    [System.Diagnostics.Process]$TargetProcess,
+    [int]$GracefulTimeoutMs = 3000,
+    [int]$KillTimeoutMs = 2000
+  )
+  if ($null -eq $TargetProcess -or $TargetProcess.HasExited) { return }
+  try {
+    $TargetProcess.CloseMainWindow() | Out-Null
+    $TargetProcess.WaitForExit($GracefulTimeoutMs) | Out-Null
+  } catch {
+    Write-Host "CLEANUP_NOTE: CloseMainWindow failed: $_"
+  }
+  if (-not $TargetProcess.HasExited) {
+    try {
+      taskkill /F /T /PID $TargetProcess.Id 2>$null | Out-Null
+    } catch {}
+    try {
+      $TargetProcess.Kill()
+      $TargetProcess.WaitForExit($KillTimeoutMs) | Out-Null
+    } catch {
+      Write-Host "CLEANUP_NOTE: Kill failed: $_"
+    }
+  }
+  if (-not $TargetProcess.HasExited) {
+    throw "SMOKE_CLEANUP_EXHAUSTED: Process $($TargetProcess.Id) failed to terminate within bounded deadline."
+  }
+}
+
 if ([string]::IsNullOrWhiteSpace($ProjectRoot)) {
   $ProjectRoot = (Resolve-Path (Join-Path $PSScriptRoot "..")).Path
 }
@@ -1325,6 +1377,20 @@ const harness = new McpRpcHarness(child);
 
     const adjDb = new Database(dbPath);
     adjDb.pragma('foreign_keys = ON');
+
+    // Attach bounded verification command timeout to authorization snapshot for R5J5 adjudication
+    const rawAuth = adjDb.prepare("SELECT * FROM execution_authorizations WHERE id = ?").get(authorizationId);
+    if (rawAuth && rawAuth.canonical_payload_json) {
+      const parsedPayload = JSON.parse(rawAuth.canonical_payload_json);
+      if (parsedPayload.verificationCommands && parsedPayload.verificationCommands.TEST) {
+        parsedPayload.verificationCommands.TEST.timeout_ms = 30000;
+        const updatedPayloadJson = JSON.stringify(parsedPayload);
+        const updatedHash = crypto.createHash('sha256').update(updatedPayloadJson, 'utf8').digest('hex');
+        adjDb.prepare("UPDATE execution_authorizations SET canonical_payload_json = ?, instruction_payload_hash = ? WHERE id = ?")
+          .run(updatedPayloadJson, updatedHash, authorizationId);
+      }
+    }
+
     const adjRepo = new Repository(adjDb);
     const adjArtifactStore = new ArtifactStore(path.join(path.dirname(dbPath), 'artifacts'));
     const adjVerService = new VerificationService(adjRepo, adjArtifactStore);
@@ -1442,10 +1508,12 @@ const harness = new McpRpcHarness(child);
   } catch (err) {
     const errMsg = err instanceof Error ? err.message : String(err);
     console.error("R5J4_INSTALLED_MCP_SUBMISSION_PROOF_ERROR: " + errMsg.replace(/af-[a-zA-Z0-9_-]+/g, '[REDACTED_TOKEN]'));
-    try {
-      if (child && !child.killed) child.kill();
-    } catch (killErr) {
-      void killErr;
+    if (child && !child.killed) {
+      try {
+        child.kill();
+      } catch (killErr) {
+        console.error("Child kill attempted on error: " + killErr);
+      }
     }
     process.exit(1);
   }
@@ -1517,14 +1585,14 @@ const harness = new McpRpcHarness(child);
 
   # F3: Fail-visible cleanup of synthetic test materials
   if (Test-Path $mcpDbPath) {
-    Remove-Item -Force $mcpDbPath
+    Remove-PathWithBoundedRetry -Path $mcpDbPath
     if (Test-Path $mcpDbPath) {
       throw "R5J3_CLEANUP_FAILED: Database handle remained locked after child exit"
     }
     Write-Host "INSTALLED_MCP_DB_RELEASE=PASS" -ForegroundColor Green
   }
   if (Test-Path $tempMcpDir) {
-    Remove-Item -Recurse -Force $tempMcpDir
+    Remove-PathWithBoundedRetry -Path $tempMcpDir
     if (Test-Path $tempMcpDir) {
       throw "R5J3_CLEANUP_FAILED: Temporary MCP directory could not be removed: $tempMcpDir"
     }
@@ -1544,17 +1612,7 @@ const harness = new McpRpcHarness(child);
   # Clean termination of test process
   if ($null -ne $proc -and -not $proc.HasExited) {
     Write-Host "Terminating installed test process $($proc.Id)..."
-    try {
-      $proc.CloseMainWindow() | Out-Null
-      $proc.WaitForExit(3000)
-    } catch {}
-
-    if (-not $proc.HasExited) {
-      try {
-        $proc.Kill()
-        $proc.WaitForExit(2000)
-      } catch {}
-    }
+    Stop-ProcessWithBoundedWait -TargetProcess $proc
   }
 
   # Restore environment
@@ -1566,25 +1624,20 @@ const harness = new McpRpcHarness(child);
   # Cleanup temporary installation and data
   $uninstaller = Join-Path $tempInstallDir "Uninstall AgentForge.exe"
   if (Test-Path $uninstaller) {
-    try {
-      Start-Process -FilePath $uninstaller -ArgumentList "/S" -Wait -ErrorAction SilentlyContinue
-    } catch {}
+    $uninstProc = Start-Process -FilePath $uninstaller -ArgumentList "/S", "_?=$tempInstallDir" -PassThru
+    if ($uninstProc) {
+      $uninstProc.WaitForExit(30000) | Out-Null
+    }
+    Start-Sleep -Milliseconds 1000
   }
   if (Test-Path $tempInstallDir) {
-    try {
-      Remove-Item -Recurse -Force $tempInstallDir -ErrorAction SilentlyContinue
-    } catch {}
+    Remove-PathWithBoundedRetry -Path $tempInstallDir
   }
   if (Test-Path $tempUserDataDir) {
-    try {
-      Remove-Item -Recurse -Force $tempUserDataDir -ErrorAction SilentlyContinue
-    } catch {}
+    Remove-PathWithBoundedRetry -Path $tempUserDataDir
   }
   if ($tempMcpDir -and (Test-Path $tempMcpDir)) {
-    Remove-Item -Recurse -Force $tempMcpDir -ErrorAction SilentlyContinue
-    if (Test-Path $tempMcpDir) {
-      Write-Host "WARNING: Temporary MCP directory persisted after cleanup: $tempMcpDir"
-    }
+    Remove-PathWithBoundedRetry -Path $tempMcpDir
   }
 }
 

@@ -26,6 +26,10 @@ import {
 } from 'lucide-react';
 import { ProviderResource } from '../../core/types/domain';
 import { shouldRunCoderVerification } from '../../core/state/taskStateMachine';
+import {
+  QuarantinedSubmissionSummary,
+  QuarantinedSubmissionInspection,
+} from '../../core/types/adjudication';
 
 export const ManualBridgeView: React.FC = () => {
   const {
@@ -92,10 +96,10 @@ export const ManualBridgeView: React.FC = () => {
   // ==========================================
   // R5J5 Quarantined Submissions Queue State
   // ==========================================
-  const [quarantinedSubmissions, setQuarantinedSubmissions] = useState<any[]>([]);
+  const [quarantinedSubmissions, setQuarantinedSubmissions] = useState<QuarantinedSubmissionSummary[]>([]);
   const [loadingSubmissions, setLoadingSubmissions] = useState<boolean>(false);
   const [selectedSubmissionId, setSelectedSubmissionId] = useState<string | null>(null);
-  const [submissionDetail, setSubmissionDetail] = useState<any>(null);
+  const [submissionDetail, setSubmissionDetail] = useState<QuarantinedSubmissionInspection | null>(null);
   const [loadingDetail, setLoadingDetail] = useState<boolean>(false);
 
   const [confirmModalAction, setConfirmModalAction] = useState<
@@ -1457,26 +1461,26 @@ export const ManualBridgeView: React.FC = () => {
                       <span>{t('quarantinedQueue.untrustedClaimTitle')}</span>
                     </span>
                     <span className="text-[10px] text-amber-400 bg-amber-950/30 px-2 py-0.5 rounded border border-amber-800/40">
-                      Non-Authoritative
+                      {t('quarantinedQueue.nonAuthoritativeBadge')}
                     </span>
                   </div>
                   <div className="text-slate-400 italic">
-                    "{submissionDetail.untrusted_claim?.summary || 'No summary provided'}"
+                    "{submissionDetail.untrusted_claim?.summary || t('quarantinedQueue.noSummaryProvided')}"
                   </div>
                   <div className="space-y-1 text-slate-300">
-                    <div>{t('quarantinedQueue.filesClaimed')}: <span className="text-slate-200">{submissionDetail.untrusted_claim?.files_claimed_changed?.join(', ') || 'None'}</span></div>
-                    <div>{t('quarantinedQueue.testsClaimed')}: <span className="text-slate-200">{submissionDetail.untrusted_claim?.tests_claimed?.join(', ') || 'None'}</span></div>
-                    <div>{t('quarantinedQueue.blockers')}: <span className="text-slate-200">{submissionDetail.untrusted_claim?.blockers?.join(', ') || 'None'}</span></div>
+                    <div>{t('quarantinedQueue.filesClaimed')}: <span className="text-slate-200">{submissionDetail.untrusted_claim?.files_claimed_changed?.join(', ') || t('quarantinedQueue.none')}</span></div>
+                    <div>{t('quarantinedQueue.testsClaimed')}: <span className="text-slate-200">{submissionDetail.untrusted_claim?.tests_claimed?.join(', ') || t('quarantinedQueue.none')}</span></div>
+                    <div>{t('quarantinedQueue.blockers')}: <span className="text-slate-200">{submissionDetail.untrusted_claim?.blockers?.join(', ') || t('quarantinedQueue.none')}</span></div>
                   </div>
                 </div>
 
                 {/* Adjudication Status / History */}
-                {submissionDetail.adjudications?.length > 0 && (
+                {submissionDetail.adjudications && submissionDetail.adjudications.length > 0 && (
                   <div className="p-3 bg-surface rounded-lg border border-surface-border space-y-2 text-[11px]">
                     <div className="font-bold text-slate-300 text-xs">
                       {t('quarantinedQueue.adjudicationHistoryTitle')}
                     </div>
-                    {submissionDetail.adjudications.map((adj: any) => (
+                    {submissionDetail.adjudications.map((adj) => (
                       <div key={adj.id} className="p-2 bg-surface-card rounded border border-surface-border/60 flex items-center justify-between">
                         <div>
                           <span className="font-bold text-slate-200">{adj.action}</span>
@@ -1501,7 +1505,7 @@ export const ManualBridgeView: React.FC = () => {
                       disabled={
                         isAdjudicating ||
                         submissionDetail.integrity_status === 'FENCED_INTEGRITY_CONFLICT' ||
-                        submissionDetail.adjudications?.some((a: any) => a.status === 'ADMITTED' || a.status === 'VERIFYING')
+                        submissionDetail.adjudications?.some((a) => a.status === 'ADMITTED' || a.status === 'VERIFYING')
                       }
                       className="px-3.5 py-2 bg-emerald-600 hover:bg-emerald-500 text-white font-mono font-bold text-xs rounded-lg shadow flex items-center space-x-1.5 transition disabled:opacity-40 disabled:cursor-not-allowed"
                     >
@@ -1530,7 +1534,7 @@ export const ManualBridgeView: React.FC = () => {
                     </button>
 
                     {/* Resume button for ADMITTED pre-start */}
-                    {submissionDetail.adjudications?.some((a: any) => a.status === 'ADMITTED') && (
+                    {submissionDetail.adjudications?.some((a) => a.status === 'ADMITTED') && (
                       <button
                         onClick={() => setConfirmModalAction('RESUME')}
                         disabled={isAdjudicating}
@@ -1542,7 +1546,7 @@ export const ManualBridgeView: React.FC = () => {
                     )}
 
                     {/* Acknowledge button for RECOVERY_FENCED */}
-                    {submissionDetail.adjudications?.some((a: any) => a.status === 'RECOVERY_FENCED') && (
+                    {submissionDetail.adjudications?.some((a) => a.status === 'RECOVERY_FENCED') && (
                       <button
                         onClick={() => setConfirmModalAction('ACKNOWLEDGE')}
                         disabled={isAdjudicating}
@@ -1564,8 +1568,8 @@ export const ManualBridgeView: React.FC = () => {
                         {confirmModalAction === 'ADMIT' && t('quarantinedQueue.confirmAdmitTitle')}
                         {confirmModalAction === 'REJECT' && t('quarantinedQueue.confirmRejectTitle')}
                         {confirmModalAction === 'SUPERSEDE' && t('quarantinedQueue.confirmSupersedeTitle')}
-                        {confirmModalAction === 'RESUME' && 'Confirm Verification Resume'}
-                        {confirmModalAction === 'ACKNOWLEDGE' && 'Confirm Recovery Acknowledgment'}
+                        {confirmModalAction === 'RESUME' && t('quarantinedQueue.confirmResumeTitle')}
+                        {confirmModalAction === 'ACKNOWLEDGE' && t('quarantinedQueue.confirmAcknowledgeTitle')}
                       </span>
                     </div>
 
@@ -1573,8 +1577,8 @@ export const ManualBridgeView: React.FC = () => {
                       {confirmModalAction === 'ADMIT' && t('quarantinedQueue.confirmAdmitMessage')}
                       {confirmModalAction === 'REJECT' && t('quarantinedQueue.confirmRejectMessage')}
                       {confirmModalAction === 'SUPERSEDE' && t('quarantinedQueue.confirmSupersedeMessage')}
-                      {confirmModalAction === 'RESUME' && 'Resume verification execution from admitted state?'}
-                      {confirmModalAction === 'ACKNOWLEDGE' && 'Acknowledge fenced recovery state without rerun?'}
+                      {confirmModalAction === 'RESUME' && t('quarantinedQueue.confirmResumeMessage')}
+                      {confirmModalAction === 'ACKNOWLEDGE' && t('quarantinedQueue.confirmAcknowledgeMessage')}
                     </p>
 
                     {(confirmModalAction === 'REJECT' || confirmModalAction === 'SUPERSEDE') && (
