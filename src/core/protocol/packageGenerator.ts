@@ -7,7 +7,7 @@ import {
 } from '../types/domain';
 import { CoderProtocol } from '../types/protocols';
 import { Repository, CoderSubmission } from '../database/repositories';
-import { CoderSubmissionAdjudication, VerifiedAdjudicationReviewProjection } from '../types/adjudication';
+import { CoderSubmissionAdjudication, VerifiedAdjudicationReviewProjection, VERIFIED_ADJUDICATION_REVIEW_PROJECTION_KEYS } from '../types/adjudication';
 import {
   computeContextManifestHash,
   computePayloadHash,
@@ -15,7 +15,7 @@ import {
   CanonicalExecutionPayloadSchema,
 } from '../services/ExecutionAuthorizationService';
 import { CommandParser } from '../services/CommandParser';
-import { computeSha256, CLAIM_CONTENT_KEYS } from '../../mcp/submissionProtocol';
+import { computeSha256, CLAIM_CONTENT_KEYS, canonicalJsonStringify } from '../../mcp/submissionProtocol';
 
 export interface AdjudicationReviewPackageLinkage {
   adjudication: CoderSubmissionAdjudication;
@@ -375,8 +375,41 @@ Guidelines:
   public static renderVerifiedAdjudicationReviewProjection(
     projection: VerifiedAdjudicationReviewProjection
   ): string {
-    if (!projection || typeof projection !== 'object' || !projection.projection_hash) {
+    if (!projection || typeof projection !== 'object') {
+      throw new Error('VERIFIED_PROJECTION_INVALID: Review package requires a non-null VerifiedAdjudicationReviewProjection.');
+    }
+
+    const projKeys = Object.keys(projection).sort();
+    const expectedKeys = [...VERIFIED_ADJUDICATION_REVIEW_PROJECTION_KEYS].sort();
+    if (projKeys.length !== expectedKeys.length || projKeys.some((k, i) => k !== expectedKeys[i])) {
+      throw new Error('VERIFIED_PROJECTION_INVALID: Projection key set mismatch');
+    }
+
+    if (!projection.projection_hash || typeof projection.projection_hash !== 'string') {
       throw new Error('VERIFIED_PROJECTION_INVALID: Review package requires a verified projection with valid projection_hash.');
+    }
+
+    // Recompute projection_hash and reject forgery
+    const { projection_hash, ...baseProjection } = projection;
+    const computedHash = computeSha256(canonicalJsonStringify(baseProjection));
+    if (computedHash !== projection_hash) {
+      throw new Error(`PROJECTION_HASH_MISMATCH: Projection hash mismatch (expected "${computedHash}", received "${projection_hash}")`);
+    }
+
+    // Strictly validate authoritative git status if present
+    if (projection.authoritative_git_status) {
+      const gs = projection.authoritative_git_status;
+      if (typeof gs.is_clean !== 'boolean' || !gs.evidence_id || !gs.evidence_hash) {
+        throw new Error('VERIFIED_PROJECTION_INVALID: Malformed authoritative_git_status evidence in projection');
+      }
+    }
+
+    // Strictly validate authoritative git diff if present
+    if (projection.authoritative_git_diff) {
+      const gd = projection.authoritative_git_diff;
+      if (typeof gd.diff_content !== 'string' || !gd.evidence_id || !gd.evidence_hash) {
+        throw new Error('VERIFIED_PROJECTION_INVALID: Malformed authoritative_git_diff evidence in projection');
+      }
     }
 
     const criteriaList = projection.acceptance_criteria.length > 0
@@ -407,17 +440,30 @@ Guidelines:
     }
 
     const testVerif = projection.authoritative_verification;
+    let verdictDisplay = '🔴 FAILED';
+    if (testVerif.verdict === 'PASSED') {
+      verdictDisplay = '🟢 PASSED';
+    } else if (testVerif.verdict === 'FENCED') {
+      verdictDisplay = '⚠️ RECOVERY_FENCED / UNRESOLVED';
+    } else if (testVerif.verdict === 'TIMEOUT') {
+      verdictDisplay = '⏱️ TIMEOUT';
+    } else if (testVerif.verdict === 'NOT_RUN') {
+      verdictDisplay = '⚠️ NOT RUN';
+    } else {
+      verdictDisplay = '🔴 FAILED';
+    }
+
     const testEvidenceText = testVerif.test_run_id
       ? `
 - **Test Run ID**: \`${testVerif.test_run_id}\`
 - **Command Snapshot SHA-256**: \`${testVerif.command_snapshot_hash || 'None'}\`
 - **Command**: \`${testVerif.command}\`
-- **Authoritative Verdict**: ${testVerif.exit_code === 0 ? '🟢 PASSED' : '🔴 FAILED'} (Exit Code: \`${testVerif.exit_code}\`)
+- **Authoritative Verdict**: ${verdictDisplay} (Verdict: \`${testVerif.verdict}\`, Exit Code: \`${testVerif.exit_code !== null ? testVerif.exit_code : 'None'}\`)
 - **Metrics**: ${testVerif.passed_count} Passed | ${testVerif.failed_count} Failed | ${testVerif.skipped_count} Skipped
 - **Duration**: ${testVerif.duration_ms}ms
 - **Evidence Reference**: \`${testVerif.test_result_evidence_id || 'INLINE'}\`
 `
-      : '⚠️ [TEST EVIDENCE UNAVAILABLE / NOT RUN / ERROR]';
+      : `⚠️ [TEST EVIDENCE UNAVAILABLE / NOT RUN / ERROR] (${verdictDisplay})`;
 
     const claim = projection.untrusted_claim;
     const gitStatus = projection.authoritative_git_status;
@@ -491,7 +537,7 @@ Evaluate the authoritative evidence above against the acceptance criteria and re
 \`\`\`json
 {
   "protocol": "manager.v1",
-  "message_id": "msg-mgr-${projection.task_id}-${Date.now()}",
+  "message_id": "msg-mgr-${projection.task_id}-${projection.projection_hash.slice(0, 16)}",
   "project_id": "${projection.project_id}",
   "task_id": "${projection.task_id}",
   "decision": "PASS | FIX_REQUIRED | BLOCK | NEEDS_OWNER",
@@ -527,12 +573,28 @@ Evaluate the authoritative evidence above against the acceptance criteria and re
     testRun: TestRun | null,
     previousReviews: Review[] = [],
     gitDiffEvidence?: Evidence | null,
-    adjudicationLinkageOrProjection?: VerifiedAdjudicationReviewProjection | AdjudicationReviewPackageLinkage | null
+    adjudicationLinkageOrProjection?: VerifiedAdjudicationReviewProjection | AdjudicationReviewPackageLinkage | null,
+    legacyLinkage?: any
   ): string {
-    if (adjudicationLinkageOrProjection && 'projection_hash' in adjudicationLinkageOrProjection) {
-      return PackageGenerator.renderVerifiedAdjudicationReviewProjection(
-        adjudicationLinkageOrProjection as VerifiedAdjudicationReviewProjection
+    if (legacyLinkage) {
+      throw new Error(
+        'LEGACY_LINKAGE_REJECTED: Adjudication review package generation requires VerifiedAdjudicationReviewProjection.'
       );
+    }
+    if (adjudicationLinkageOrProjection) {
+      if ('projection_hash' in (adjudicationLinkageOrProjection as unknown as Record<string, unknown>)) {
+        return PackageGenerator.renderVerifiedAdjudicationReviewProjection(
+          adjudicationLinkageOrProjection as VerifiedAdjudicationReviewProjection
+        );
+      }
+      if (
+        'adjudication_id' in (adjudicationLinkageOrProjection as unknown as Record<string, unknown>) &&
+        !('adjudication' in (adjudicationLinkageOrProjection as unknown as Record<string, unknown>))
+      ) {
+        throw new Error(
+          'LEGACY_LINKAGE_REJECTED: Adjudication review package generation requires VerifiedAdjudicationReviewProjection.'
+        );
+      }
     }
 
     const taskRecord = task as unknown as Record<string, unknown>;
@@ -560,9 +622,7 @@ Evaluate the authoritative evidence above against the acceptance criteria and re
     } else if (gitDiffContent.length <= MAX_DIFF_LENGTH) {
       formattedDiff = gitDiffContent;
     } else {
-      const activeEv = (adjudicationLinkageOrProjection && 'gitDiffEvidence' in adjudicationLinkageOrProjection)
-        ? adjudicationLinkageOrProjection.gitDiffEvidence
-        : gitDiffEvidence;
+      const activeEv = gitDiffEvidence;
       if (!activeEv) {
         throw new Error('AUTHORITATIVE_DIFF_EVIDENCE_MISSING: Large Git diff cannot be rendered in review package without authoritative evidence record.');
       }
@@ -572,7 +632,7 @@ Evaluate the authoritative evidence above against the acceptance criteria and re
         `- **Evidence ID**: \`${activeEv.id}\`\n` +
         `- **SHA-256 Checksum**: \`${activeEv.hash}\`\n` +
         `- **Byte Size**: \`${activeEv.byte_size} bytes\`\n` +
-        `- **Storage Type**: \`${activeEv.storage_type}\``;
+        `- **Storage Type**: \`${activeEv.storage_type}\`\n`;
     }
 
     if (adjudicationLinkageOrProjection && 'adjudication' in adjudicationLinkageOrProjection) {
@@ -866,7 +926,7 @@ Evaluate the authoritative evidence above against the acceptance criteria and re
 \`\`\`json
 {
   "protocol": "manager.v1",
-  "message_id": "msg-mgr-${task.id}-${Date.now()}",
+  "message_id": "msg-mgr-${task.id}-rev${task.revision_count}",
   "project_id": "${project.id}",
   "task_id": "${task.id}",
   "decision": "PASS | FIX_REQUIRED | BLOCK | NEEDS_OWNER",

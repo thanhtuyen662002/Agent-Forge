@@ -62,6 +62,7 @@ export class ProcessRunner {
     string,
     { process: ChildProcess; command: string; isCancelled: boolean; repo?: Repository }
   >();
+  private static terminationPromises = new Map<number, Promise<ProcessTerminationTruth>>();
 
   public static readonly DEFAULT_MAX_OUTPUT_BYTES = 8 * 1024 * 1024; // 8 MiB default
   public static readonly MAX_ALLOWED_OUTPUT_BYTES = 32 * 1024 * 1024; // 32 MiB hard cap
@@ -576,9 +577,7 @@ export class ProcessRunner {
 
       const timer = setTimeout(() => {
         isTimedOut = true;
-        ProcessRunner.killProcessTreeAsync(child).then((res) => {
-          terminationTruth = res;
-        });
+        ProcessRunner.terminateProcessTree(child);
       }, timeoutMs);
 
       // Safe stdin writing when provided
@@ -612,9 +611,7 @@ export class ProcessRunner {
               stdoutAcc += chunkBuf.subarray(0, remaining).toString('utf8');
               stdoutByteCount += remaining;
             }
-            ProcessRunner.killProcessTreeAsync(child).then((res) => {
-              terminationTruth = res;
-            });
+            ProcessRunner.terminateProcessTree(child);
             return;
           }
 
@@ -636,9 +633,7 @@ export class ProcessRunner {
               stderrAcc += chunkBuf.subarray(0, remaining).toString('utf8');
               stderrByteCount += remaining;
             }
-            ProcessRunner.killProcessTreeAsync(child).then((res) => {
-              terminationTruth = res;
-            });
+            ProcessRunner.terminateProcessTree(child);
             return;
           }
 
@@ -721,9 +716,7 @@ export class ProcessRunner {
         }
 
         if (isTimedOut || wasCancelled || isOutputLimitExceeded) {
-          if (terminationTruth !== 'PROCESS_TREE_TERMINATED_PROVEN') {
-            terminationTruth = await ProcessRunner.killProcessTreeAsync(child);
-          }
+          terminationTruth = await ProcessRunner.terminateProcessTree(child);
         } else {
           terminationTruth = 'PROCESS_TREE_TERMINATED_PROVEN';
         }
@@ -811,10 +804,22 @@ export class ProcessRunner {
       if (entry.repo) {
         entry.repo.updateProcessRun(executionId, 'CANCELLED', -1, new Date().toISOString());
       }
-      this.killProcessTree(entry.process);
+      this.terminateProcessTree(entry.process);
       return true;
     }
     return false;
+  }
+
+  public static async cancelAsync(executionId: string): Promise<ProcessTerminationTruth> {
+    const entry = this.activeProcesses.get(executionId);
+    if (entry) {
+      entry.isCancelled = true;
+      if (entry.repo) {
+        entry.repo.updateProcessRun(executionId, 'CANCELLED', -1, new Date().toISOString());
+      }
+      return this.terminateProcessTree(entry.process);
+    }
+    return 'NOT_APPLICABLE';
   }
 
   public static terminateAllProcesses(): number {
@@ -824,87 +829,129 @@ export class ProcessRunner {
       if (entry.repo) {
         entry.repo.updateProcessRun(id, 'CANCELLED', -1, new Date().toISOString());
       }
-      this.killProcessTree(entry.process);
+      this.terminateProcessTree(entry.process);
       this.activeProcesses.delete(id);
     }
     return count;
+  }
+
+  public static async terminateAllProcessesAsync(): Promise<{ count: number; unproven: number; allTerminatedProven: boolean }> {
+    const count = this.activeProcesses.size;
+    const promises: Promise<ProcessTerminationTruth>[] = [];
+    for (const [id, entry] of this.activeProcesses.entries()) {
+      entry.isCancelled = true;
+      if (entry.repo) {
+        entry.repo.updateProcessRun(id, 'CANCELLED', -1, new Date().toISOString());
+      }
+      promises.push(this.terminateProcessTree(entry.process));
+      this.activeProcesses.delete(id);
+    }
+    const results = await Promise.all(promises);
+    const unproven = results.filter((r) => r !== 'PROCESS_TREE_TERMINATED_PROVEN' && r !== 'NOT_APPLICABLE').length;
+    return { count, unproven, allTerminatedProven: unproven === 0 };
   }
 
   public static getActiveProcessCount(): number {
     return this.activeProcesses.size;
   }
 
+  public static terminateProcessTree(
+    child: ChildProcess,
+    timeoutMs = 5000
+  ): Promise<ProcessTerminationTruth> {
+    if (!child.pid) return Promise.resolve('NOT_APPLICABLE');
+    const pid = child.pid;
+    const existing = this.terminationPromises.get(pid);
+    if (existing) {
+      return existing;
+    }
+
+    const promise = (async (): Promise<ProcessTerminationTruth> => {
+      try {
+        if (process.platform === 'win32') {
+          const taskkillExitCode = await new Promise<number | null>((resolve) => {
+            let tk: ChildProcess;
+            try {
+              tk = spawn('taskkill', ['/F', '/T', '/PID', pid.toString()], {
+                windowsHide: true,
+                stdio: 'ignore',
+              });
+            } catch {
+              return resolve(null);
+            }
+            const timer = setTimeout(() => {
+              try {
+                tk.kill('SIGKILL');
+              } catch {}
+              resolve(null);
+            }, timeoutMs);
+            tk.on('error', () => {
+              clearTimeout(timer);
+              resolve(null);
+            });
+            tk.on('close', (closeCode) => {
+              clearTimeout(timer);
+              resolve(closeCode);
+            });
+          });
+
+          // Explicit bounded post-kill liveness verification
+          const isDead = await ProcessRunner.verifyProcessDeadWithDeadline(pid, timeoutMs);
+
+          if (isDead && (taskkillExitCode === 0 || taskkillExitCode === 128)) {
+            return 'PROCESS_TREE_TERMINATED_PROVEN';
+          }
+          return 'TERMINATION_UNRESOLVED';
+        } else {
+          try {
+            process.kill(-pid, 'SIGKILL');
+          } catch {
+            try {
+              child.kill('SIGKILL');
+            } catch {}
+          }
+          const isDead = await ProcessRunner.verifyProcessDeadWithDeadline(pid, timeoutMs);
+          return isDead ? 'PROCESS_TREE_TERMINATED_PROVEN' : 'TERMINATION_UNRESOLVED';
+        }
+      } catch {
+        return 'TERMINATION_UNRESOLVED';
+      }
+    })();
+
+    this.terminationPromises.set(pid, promise);
+    return promise;
+  }
+
+  public static async verifyProcessDeadWithDeadline(pid: number, timeoutMs = 2000): Promise<boolean> {
+    const deadline = Date.now() + Math.min(timeoutMs, 2000);
+    while (Date.now() <= deadline) {
+      try {
+        process.kill(pid, 0);
+        // Still alive
+        await new Promise((r) => setTimeout(r, 25));
+      } catch (err: unknown) {
+        const code = (err as { code?: string })?.code;
+        if (code === 'ESRCH') {
+          return true;
+        }
+        return false;
+      }
+    }
+    return false;
+  }
+
+  public async verifyProcessDeadWithDeadline(pid: number, timeoutMs = 2000): Promise<boolean> {
+    return ProcessRunner.verifyProcessDeadWithDeadline(pid, timeoutMs);
+  }
+
+  public async terminateAllProcessesAsync(): Promise<void> {
+    await ProcessRunner.terminateAllProcessesAsync();
+  }
+
   public static async killProcessTreeAsync(
     child: ChildProcess,
     timeoutMs = 5000
   ): Promise<ProcessTerminationTruth> {
-    if (!child.pid) return 'NOT_APPLICABLE';
-
-    if (process.platform === 'win32') {
-      try {
-        const exitCode = await new Promise<number | null>((resolve) => {
-          let tk: ChildProcess;
-          try {
-            tk = spawn('taskkill', ['/F', '/T', '/PID', child.pid!.toString()], {
-              windowsHide: true,
-              stdio: 'ignore',
-            });
-          } catch (spawnErr: unknown) {
-            console.debug(`[ProcessRunner] taskkill spawn error: ${spawnErr instanceof Error ? spawnErr.message : String(spawnErr)}`);
-            return resolve(null);
-          }
-          const timer = setTimeout(() => {
-            try {
-              tk.kill('SIGKILL');
-            } catch (killErr: unknown) {
-              console.debug(`[ProcessRunner] taskkill self-kill error: ${killErr instanceof Error ? killErr.message : String(killErr)}`);
-            }
-            resolve(null);
-          }, timeoutMs);
-          tk.on('error', () => {
-            clearTimeout(timer);
-            resolve(null);
-          });
-          tk.on('close', (closeCode) => {
-            clearTimeout(timer);
-            resolve(closeCode);
-          });
-        });
-
-        // 0 = successful termination, 128 = process already terminated/not found
-        if (exitCode === 0 || exitCode === 128) {
-          return 'PROCESS_TREE_TERMINATED_PROVEN';
-        }
-        return 'TERMINATION_UNRESOLVED';
-      } catch (waitErr: unknown) {
-        console.debug(`[ProcessRunner] taskkill await error: ${waitErr instanceof Error ? waitErr.message : String(waitErr)}`);
-        return 'TERMINATION_UNRESOLVED';
-      }
-    } else {
-      try {
-        child.kill('SIGKILL');
-        return 'PROCESS_TREE_TERMINATED_PROVEN';
-      } catch (killErr: unknown) {
-        console.debug(`[ProcessRunner] POSIX child kill error: ${killErr instanceof Error ? killErr.message : String(killErr)}`);
-        return 'TERMINATION_UNRESOLVED';
-      }
-    }
-  }
-
-  private static killProcessTree(child: ChildProcess): void {
-    if (!child.pid) return;
-    try {
-      if (process.platform === 'win32') {
-        const tk = spawn('taskkill', ['/pid', child.pid.toString(), '/f', '/t'], {
-          windowsHide: true,
-          stdio: 'ignore',
-        });
-        tk.on('error', () => {});
-      } else {
-        child.kill('SIGKILL');
-      }
-    } catch {
-      // Process already terminated
-    }
+    return this.terminateProcessTree(child, timeoutMs);
   }
 }

@@ -104,6 +104,9 @@ export interface CoderSubmissionAdjudication {
   recovery_fenced_at: string | null;
   verification_result_envelope_json?: string | null;
   verification_result_envelope_hash?: string | null;
+  artifact_manifest_json?: string | null;
+  artifact_manifest_hash?: string | null;
+  workspace_lease_id?: string | null;
   resolution_action?: 'ACKNOWLEDGE' | 'CANCEL' | null;
   resolution_timestamp?: string | null;
   resolution_evidence_json?: string | null;
@@ -197,6 +200,63 @@ export interface StagingManifest {
   entries: StagedEvidenceFile[];
   manifest_hash: string;
 }
+
+export type WorkspaceLeaseState = 'ACQUIRED' | 'VERIFYING' | 'RELEASED' | 'FENCED';
+
+export interface CoderSubmissionWorkspaceLease {
+  id: string;
+  adjudication_id: string;
+  worktree_identity_hash: string;
+  admitted_workspace_fingerprint_hash: string;
+  pre_execution_fingerprint_hash: string | null;
+  claim_nonce: string;
+  execution_id: string;
+  lease_owner_identity: string;
+  assignment_id: string;
+  authorization_id: string;
+  acquired_at: string;
+  released_at: string | null;
+  lifecycle_version: number;
+  state: WorkspaceLeaseState;
+  failure_code: string | null;
+  failure_evidence_hash: string | null;
+}
+
+export interface ArtifactManifestEntry {
+  evidence_id: string;
+  evidence_type: string;
+  content_type: string;
+  byte_size: number;
+  sha256: string;
+  storage_class: 'INLINE' | 'FILE';
+  relative_path: string;
+}
+
+export const ARTIFACT_MANIFEST_ENTRY_KEYS = [
+  'byte_size',
+  'content_type',
+  'evidence_id',
+  'evidence_type',
+  'relative_path',
+  'sha256',
+  'storage_class',
+] as const;
+
+export interface ArtifactManifest {
+  manifest_schema_version: 1;
+  adjudication_id: string;
+  lifecycle_version: number;
+  verification_execution_id: string;
+  entries: ArtifactManifestEntry[];
+}
+
+export const ARTIFACT_MANIFEST_KEYS = [
+  'adjudication_id',
+  'entries',
+  'lifecycle_version',
+  'manifest_schema_version',
+  'verification_execution_id',
+] as const;
 
 export interface CoderSubmissionAdjudicationEvent {
   id: string;
@@ -602,6 +662,30 @@ export interface VerifiedAdjudicationReviewProjection {
   } | null;
   projection_hash: string;
 }
+
+export const VERIFIED_ADJUDICATION_REVIEW_PROJECTION_KEYS = [
+  'acceptance_criteria',
+  'adjudication_id',
+  'authoritative_git_diff',
+  'authoritative_git_status',
+  'authoritative_verification',
+  'operator_disposition',
+  'previous_issues',
+  'project_id',
+  'project_name',
+  'projection_hash',
+  'recovery_fencing_state',
+  'submission_id',
+  'task_base_sha',
+  'task_id',
+  'task_max_revisions',
+  'task_priority',
+  'task_revision_count',
+  'task_risk',
+  'task_title',
+  'task_working_sha',
+  'untrusted_claim',
+] as const;
 
 export type SubmissionAuthorityIntegrityResult =
   | {

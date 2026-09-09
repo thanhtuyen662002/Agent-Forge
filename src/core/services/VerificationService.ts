@@ -570,10 +570,12 @@ export class VerificationService {
       (result.pid !== null && (result.cancelled || (result.exitCode === -1 && !result.timedOut)))
     ) {
       let failureCode = 'ORPHANED_VERIFICATION_INTERRUPTED';
-      if (result.processStart === 'START_AMBIGUOUS' || result.processStart === 'NOT_STARTED_PROVEN') {
+      if (result.processStart === 'NOT_STARTED_PROVEN') {
         failureCode = 'PROCESS_START_FAILED';
       } else if (result.processTermination === 'TERMINATION_UNRESOLVED') {
         failureCode = 'PROCESS_TERMINATION_UNRESOLVED';
+      } else {
+        failureCode = 'ORPHANED_VERIFICATION_INTERRUPTED';
       }
       return {
         outcome: 'RECOVERY_FENCED',

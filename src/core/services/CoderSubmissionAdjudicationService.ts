@@ -27,9 +27,19 @@ import {
   StagedEvidenceFile,
   VerifiedAdjudicationReviewProjection,
   VerificationExecutionObservation,
+  ArtifactManifest,
+  ArtifactManifestEntry,
+  CoderSubmissionWorkspaceLease,
 } from '../types/adjudication';
 import { Evidence, GitStatusSummary, GitDiffSummary, TestRun } from '../types/domain';
-import { ArtifactStore, defaultArtifactStore, verifyEvidenceIntegrity } from './ArtifactStore';
+import {
+  ArtifactStore,
+  defaultArtifactStore,
+  verifyEvidenceIntegrity,
+  canonicalizeArtifactManifest,
+  computeArtifactManifestHash,
+  parseAndVerifyArtifactManifest,
+} from './ArtifactStore';
 import { VerificationService } from './VerificationService';
 import { EventService } from './EventService';
 import { GitService } from './GitService';
@@ -751,14 +761,14 @@ export class CoderSubmissionAdjudicationService {
       let matches = false;
       try {
         const parsed = JSON.parse(auth.canonical_payload_json);
-        if (computePayloadHash(parsed) === auth.instruction_payload_hash) {
+        if (
+          computePayloadHash(parsed) === auth.instruction_payload_hash ||
+          computeSha256(auth.canonical_payload_json) === auth.instruction_payload_hash
+        ) {
           matches = true;
         }
       } catch {
         // ignore parse error
-      }
-      if (!matches && computeSha256(auth.canonical_payload_json) === auth.instruction_payload_hash) {
-        matches = true;
       }
       if (!matches) {
         throw new CoderSubmissionAdjudicationError(
@@ -904,6 +914,9 @@ export class CoderSubmissionAdjudicationService {
         verification_commands_hash: verificationCommandsHash,
         workspace_snapshot_before_json: null,
         workspace_snapshot_before_hash: null,
+        workspace_lease_id: null,
+        artifact_manifest_json: null,
+        artifact_manifest_hash: null,
         verification_execution_id: null,
         protocol_message_id: syntheticProtocolId,
         test_run_id: null,
@@ -1012,29 +1025,126 @@ export class CoderSubmissionAdjudicationService {
     }
 
     // =========================================================================
-    // PHASE B: EXECUTION CLAIM TRANSACTION (Atomic CAS)
+    // PHASE B1: EXCLUSIVE WORKSPACE LEASE ACQUISITION (Atomic Immediate Tx 1)
     // =========================================================================
-    // Capture a fresh canonical workspace observation immediately before claim transaction!
-    // It must NOT reuse the Phase A observation!
-    const freshPhaseBObservation = await this.captureCanonicalWorkspaceFingerprint(
-      project.repository_path,
-      sub.base_sha
-    );
-
-    if (freshPhaseBObservation.head_sha.toLowerCase() !== sub.authorized_head_sha.toLowerCase()) {
-      throw new CoderSubmissionAdjudicationError(
-        'WORKTREE_DRIFT',
-        `Live repository HEAD drift before claim: live HEAD (${freshPhaseBObservation.head_sha}) has drifted from authorized HEAD (${sub.authorized_head_sha})`
-      );
-    }
-    if (freshPhaseBObservation.status_lines.length > 0) {
-      throw new CoderSubmissionAdjudicationError(
-        'WORKTREE_DRIFT',
-        `Working directory has uncommitted changes before execution claim in ${project.repository_path}`
-      );
-    }
-
+    const worktreeIdentityHash = computeSha256(path.resolve(project.repository_path).toLowerCase());
+    const leaseId = crypto.randomUUID();
+    const claimNonce = crypto.randomUUID();
+    const phaseBStartIso = new Date().toISOString();
     const executionId = crypto.randomUUID();
+
+    this.repo.runInTransaction(() => {
+      const currentSub = this.repo.getCoderSubmissionById(sub.id);
+      if (!currentSub) {
+        throw new CoderSubmissionAdjudicationError('NOT_FOUND', `Submission ${sub.id} not found`);
+      }
+      const liveAuth = this.validateSubmissionAndAuthorityIntegrity(currentSub);
+      if (!liveAuth.valid) {
+        throw new CoderSubmissionAdjudicationError(
+          'PRECONDITION_FENCED',
+          `Phase B1 authority verification failed: ${liveAuth.fenced_reasons.join('; ')}`
+        );
+      }
+
+      // Check active workspace lease
+      const activeLease = this.repo.getActiveWorkspaceLeaseByWorktree(worktreeIdentityHash);
+      if (activeLease) {
+        throw new CoderSubmissionAdjudicationError(
+          'VERIFICATION_IN_FLIGHT',
+          `Active workspace verification lease (${activeLease.id}) already held for worktree`
+        );
+      }
+
+      const currentAdj = this.repo.getCoderSubmissionAdjudicationById(adjudicationId);
+      if (!currentAdj || currentAdj.status !== 'ADMITTED' || currentAdj.verification_execution_id !== null) {
+        throw new CoderSubmissionAdjudicationError(
+          'VERIFICATION_IN_FLIGHT',
+          `Adjudication "${adjudicationId}" not in eligible ADMITTED state for lease acquisition`
+        );
+      }
+
+      // Insert lease in ACQUIRED state
+      this.repo.createWorkspaceLease({
+        id: leaseId,
+        adjudication_id: adjudicationId,
+        worktree_identity_hash: worktreeIdentityHash,
+        admitted_workspace_fingerprint_hash: computeSha256(canonicalJsonStringify(prePhaseAFingerprint)),
+        pre_execution_fingerprint_hash: null,
+        claim_nonce: claimNonce,
+        execution_id: executionId,
+        lease_owner_identity: snapshot.assignment_id,
+        assignment_id: snapshot.assignment_id,
+        authorization_id: sub.authorization_id,
+        acquired_at: phaseBStartIso,
+        released_at: null,
+        lifecycle_version: 1,
+        state: 'ACQUIRED',
+        failure_code: null,
+        failure_evidence_hash: null,
+      });
+    });
+
+    // =========================================================================
+    // PHASE B2: CAPTURE FRESH WORKSPACE OBSERVATION WHILE LEASE HELD (Outside DB)
+    // =========================================================================
+    let freshPhaseBObservation: CanonicalWorkspaceFingerprint;
+    try {
+      freshPhaseBObservation = await this.captureCanonicalWorkspaceFingerprint(
+        project.repository_path,
+        sub.base_sha
+      );
+    } catch (obsErr: unknown) {
+      this.repo.runInTransaction(() => {
+        const l = this.repo.getWorkspaceLease(leaseId);
+        if (l && l.released_at === null) {
+          this.repo.updateWorkspaceLease(leaseId, l.lifecycle_version, {
+            state: 'FENCED',
+            failure_code: 'WORKTREE_DRIFT',
+            released_at: new Date().toISOString(),
+          });
+        }
+        const a = this.repo.getCoderSubmissionAdjudicationById(adjudicationId);
+        if (a && a.status === 'ADMITTED') {
+          this.repo.updateCoderSubmissionAdjudication(adjudicationId, a.lifecycle_version, {
+            status: 'RECOVERY_FENCED',
+            failure_code: 'WORKTREE_DRIFT',
+            recovery_fenced_at: new Date().toISOString(),
+            workspace_lease_id: leaseId,
+          });
+        }
+      });
+      throw new CoderSubmissionAdjudicationError('WORKTREE_DRIFT', `Failed to capture observation: ${obsErr instanceof Error ? obsErr.message : String(obsErr)}`);
+    }
+
+    if (freshPhaseBObservation.head_sha.toLowerCase() !== sub.authorized_head_sha.toLowerCase() || freshPhaseBObservation.status_lines.length > 0) {
+      const reason = freshPhaseBObservation.head_sha.toLowerCase() !== sub.authorized_head_sha.toLowerCase()
+        ? `Live repository HEAD drift before claim: live HEAD (${freshPhaseBObservation.head_sha}) has drifted from authorized HEAD (${sub.authorized_head_sha})`
+        : `Working directory has uncommitted changes before execution claim in ${project.repository_path}`;
+      this.repo.runInTransaction(() => {
+        const l = this.repo.getWorkspaceLease(leaseId);
+        if (l && l.released_at === null) {
+          this.repo.updateWorkspaceLease(leaseId, l.lifecycle_version, {
+            state: 'FENCED',
+            failure_code: 'WORKTREE_DRIFT',
+            released_at: new Date().toISOString(),
+          });
+        }
+        const a = this.repo.getCoderSubmissionAdjudicationById(adjudicationId);
+        if (a && a.status === 'ADMITTED') {
+          this.repo.updateCoderSubmissionAdjudication(adjudicationId, a.lifecycle_version, {
+            status: 'RECOVERY_FENCED',
+            failure_code: 'WORKTREE_DRIFT',
+            recovery_fenced_at: new Date().toISOString(),
+            workspace_lease_id: leaseId,
+          });
+        }
+      });
+      throw new CoderSubmissionAdjudicationError('WORKTREE_DRIFT', reason);
+    }
+
+    // =========================================================================
+    // PHASE B3: FINAL EXECUTION CLAIM TRANSACTION (Atomic CAS Tx 2)
+    // =========================================================================
     const phaseBNowIso = new Date().toISOString();
 
     const workspaceSnapshotJson = canonicalJsonStringify(freshPhaseBObservation);
@@ -1093,6 +1203,14 @@ export class CoderSubmissionAdjudicationService {
         );
       }
 
+      const lease = this.repo.getWorkspaceLease(leaseId);
+      if (!lease || lease.state !== 'ACQUIRED' || lease.released_at !== null || lease.claim_nonce !== claimNonce) {
+        throw new CoderSubmissionAdjudicationError(
+          'STATUS_CONFLICT',
+          'Exclusive workspace lease invalid, expired, or state conflict'
+        );
+      }
+
       // Run the full shared authority verifier inside transaction
       const liveAuthIntegrity = this.validateSubmissionAndAuthorityIntegrity(currentSub);
       if (!liveAuthIntegrity.valid) {
@@ -1144,12 +1262,26 @@ export class CoderSubmissionAdjudicationService {
         verification_started_at: phaseBNowIso,
         workspace_snapshot_before_json: workspaceSnapshotJson,
         workspace_snapshot_before_hash: workspaceSnapshotHash,
+        workspace_lease_id: leaseId,
       });
 
       if (!claimed) {
         throw new CoderSubmissionAdjudicationError(
           'VERIFICATION_IN_FLIGHT',
           `Settlement claim CAS failed on adjudication ${adjudicationId}`
+        );
+      }
+
+      // CAS lease: ACQUIRED -> VERIFYING with execution_id
+      const leaseUpdated = this.repo.updateWorkspaceLease(leaseId, lease.lifecycle_version, {
+        state: 'VERIFYING',
+        execution_id: executionId,
+        pre_execution_fingerprint_hash: workspaceSnapshotHash,
+      });
+      if (!leaseUpdated) {
+        throw new CoderSubmissionAdjudicationError(
+          'STATUS_CONFLICT',
+          `Workspace lease CAS failed on lease ${leaseId}`
         );
       }
 
@@ -1200,7 +1332,42 @@ export class CoderSubmissionAdjudicationService {
       },
     };
 
-    const verificationResult = await this.verificationService!.executeSealedVerification(sealedInput);
+    const newlyMaterializedPaths: string[] = [];
+    let verificationResult: VerificationExecutionObservation;
+    try {
+      verificationResult = await this.verificationService!.executeSealedVerification(sealedInput);
+    } catch (verifErr: unknown) {
+      const cleanupRes = this.artifactStore.cleanupRollbackFiles(newlyMaterializedPaths);
+      const isCleanupDebt = cleanupRes.failures && cleanupRes.failures.length > 0;
+      const failureCode = isCleanupDebt ? 'CLEANUP_DEBT_FENCED' : 'ORPHANED_VERIFICATION_CANCELLED';
+      const failureDetail = verifErr instanceof Error ? verifErr.message : String(verifErr);
+
+      try {
+        const nowIso = new Date().toISOString();
+        this.db.prepare(`
+          UPDATE coder_submission_adjudications
+          SET status = 'RECOVERY_FENCED',
+              failure_code = ?,
+              failure_json = ?,
+              recovery_fenced_at = ?,
+              completed_at = ?,
+              lifecycle_version = lifecycle_version + 1
+          WHERE id = ? AND status IN ('ADMITTED', 'VERIFYING')
+        `).run(failureCode, JSON.stringify({ error: failureDetail }), nowIso, nowIso, adjudicationId);
+
+        if (leaseId) {
+          this.db.prepare(`
+            UPDATE coder_submission_workspace_leases
+            SET state = 'FENCED',
+                failure_code = ?,
+                released_at = ?,
+                lifecycle_version = lifecycle_version + 1
+            WHERE id = ? AND state IN ('ACQUIRED', 'VERIFYING')
+          `).run(failureCode, nowIso, leaseId);
+        }
+      } catch {}
+      throw verifErr;
+    }
 
     // Collect post-run Git evidence & post-run observation outside all transactions
     let postGitStatus: GitStatusSummary | null = null;
@@ -1233,7 +1400,6 @@ export class CoderSubmissionAdjudicationService {
     // =========================================================================
     // DETERMINISTIC CONTENT-ADDRESSED ARTIFACT MATERIALIZATION (Outside DB)
     // =========================================================================
-    const newlyMaterializedPaths: string[] = [];
     const phaseCNowIso = new Date().toISOString();
 
     // 1. Git Status Evidence
@@ -1343,70 +1509,48 @@ export class CoderSubmissionAdjudicationService {
     };
 
     // 4. Artifact Manifest
-    interface ManifestEntry {
-      evidence_id: string;
-      evidence_type: string;
-      storage_type: 'FILE';
-      project_id: string;
-      task_id: string;
-      attempt_id: string;
-      adjudication_id: string;
-      execution_id: string;
-      hash: string;
-      byte_size: number;
-      content_type: string;
-      file_path: string;
-    }
-    const manifest: ManifestEntry[] = [
+    const manifestEntries: ArtifactManifestEntry[] = [
       {
-        evidence_id: testResultEvId,
-        evidence_type: 'TEST_RESULT',
-        storage_type: 'FILE',
-        project_id: sub.project_id,
-        task_id: sub.task_id,
-        attempt_id: snapshot.attempt_id,
-        adjudication_id: adjudicationId,
-        execution_id: executionId,
-        hash: testResultHash,
         byte_size: testResultByteSize,
         content_type: 'application/json',
-        file_path: matTest.filePath,
+        evidence_id: testResultEvId,
+        evidence_type: 'TEST_RESULT',
+        relative_path: path.relative(this.artifactStore.getBaseDir(), matTest.filePath).replace(/\\/g, '/'),
+        sha256: testResultHash,
+        storage_class: 'FILE',
       },
     ];
     if (stagedGitStatusEvidence) {
-      manifest.push({
-        evidence_id: statusEvId,
-        evidence_type: 'GIT_STATUS',
-        storage_type: 'FILE' as const,
-        project_id: sub.project_id,
-        task_id: sub.task_id,
-        attempt_id: snapshot.attempt_id,
-        adjudication_id: adjudicationId,
-        execution_id: executionId,
-        hash: statusHash,
+      manifestEntries.push({
         byte_size: statusByteSize,
         content_type: 'application/json',
-        file_path: materializedStatusPath,
+        evidence_id: statusEvId,
+        evidence_type: 'GIT_STATUS',
+        relative_path: path.relative(this.artifactStore.getBaseDir(), materializedStatusPath).replace(/\\/g, '/'),
+        sha256: statusHash,
+        storage_class: 'FILE',
       });
     }
     if (stagedGitDiffEvidence) {
-      manifest.push({
-        evidence_id: diffEvId,
-        evidence_type: 'GIT_DIFF',
-        storage_type: 'FILE' as const,
-        project_id: sub.project_id,
-        task_id: sub.task_id,
-        attempt_id: snapshot.attempt_id,
-        adjudication_id: adjudicationId,
-        execution_id: executionId,
-        hash: diffHash,
+      manifestEntries.push({
         byte_size: diffByteSize,
         content_type: 'text/x-diff',
-        file_path: materializedDiffPath,
+        evidence_id: diffEvId,
+        evidence_type: 'GIT_DIFF',
+        relative_path: path.relative(this.artifactStore.getBaseDir(), materializedDiffPath).replace(/\\/g, '/'),
+        sha256: diffHash,
+        storage_class: 'FILE',
       });
     }
-    const artifactManifestJson = canonicalJsonStringify(manifest);
-    const artifactManifestHash = computeSha256(artifactManifestJson);
+    const manifestObj: ArtifactManifest = {
+      adjudication_id: adjudicationId,
+      entries: manifestEntries,
+      lifecycle_version: 3,
+      manifest_schema_version: 1,
+      verification_execution_id: executionId,
+    };
+    const artifactManifestJson = canonicalizeArtifactManifest(manifestObj);
+    const artifactManifestHash = computeArtifactManifestHash(artifactManifestJson);
 
     // =========================================================================
     // EXPLICIT PROCESS TRUTH & VERIFICATION TARGET STATUS
@@ -1603,6 +1747,14 @@ export class CoderSubmissionAdjudicationService {
           throw new Error(`Task ${sub.task_id} missing during settlement`);
         }
 
+        const liveLease = this.repo.getWorkspaceLease(leaseId);
+        if (!liveLease || liveLease.state !== 'VERIFYING' || liveLease.execution_id !== executionId || liveLease.released_at !== null) {
+          throw new CoderSubmissionAdjudicationError(
+            'STATUS_CONFLICT',
+            `Workspace lease ${leaseId} state conflict or execution mismatch in settlement`
+          );
+        }
+
         // Re-verify evidence file bytes on disk before database write
         const testCheck = verifyEvidenceIntegrity(testResultEvidence, this.artifactStore);
         if (!testCheck.valid) {
@@ -1674,10 +1826,21 @@ export class CoderSubmissionAdjudicationService {
             completed_at: phaseCNowIso,
             verification_result_envelope_json: resultEnvelopeJson,
             verification_result_envelope_hash: resultEnvelopeHash,
+            artifact_manifest_json: artifactManifestJson,
+            artifact_manifest_hash: artifactManifestHash,
           });
 
           if (!updated) {
             throw new CoderSubmissionAdjudicationError('STATUS_CONFLICT', 'Settlement CAS failed (expected version 2)');
+          }
+
+          // Release workspace lease
+          const leaseUpdated = this.repo.updateWorkspaceLease(liveLease.id, liveLease.lifecycle_version, {
+            state: 'RELEASED',
+            released_at: phaseCNowIso,
+          });
+          if (!leaseUpdated) {
+            throw new CoderSubmissionAdjudicationError('STATUS_CONFLICT', 'Workspace lease release CAS failed');
           }
 
           // Create deterministic events atomically
@@ -1721,10 +1884,21 @@ export class CoderSubmissionAdjudicationService {
             completed_at: phaseCNowIso,
             verification_result_envelope_json: resultEnvelopeJson,
             verification_result_envelope_hash: resultEnvelopeHash,
+            artifact_manifest_json: artifactManifestJson,
+            artifact_manifest_hash: artifactManifestHash,
           });
 
           if (!updated) {
             throw new CoderSubmissionAdjudicationError('STATUS_CONFLICT', 'Settlement CAS failed (expected version 2)');
+          }
+
+          // Release workspace lease
+          const leaseUpdated = this.repo.updateWorkspaceLease(liveLease.id, liveLease.lifecycle_version, {
+            state: 'RELEASED',
+            released_at: phaseCNowIso,
+          });
+          if (!leaseUpdated) {
+            throw new CoderSubmissionAdjudicationError('STATUS_CONFLICT', 'Workspace lease release CAS failed');
           }
 
           this.repo.createCoderSubmissionAdjudicationEvent({
@@ -1769,10 +1943,22 @@ export class CoderSubmissionAdjudicationService {
             recovery_fenced_at: phaseCNowIso,
             verification_result_envelope_json: resultEnvelopeJson,
             verification_result_envelope_hash: resultEnvelopeHash,
+            artifact_manifest_json: artifactManifestJson,
+            artifact_manifest_hash: artifactManifestHash,
           });
 
           if (!updated) {
             throw new CoderSubmissionAdjudicationError('STATUS_CONFLICT', 'Settlement CAS failed (expected version 2)');
+          }
+
+          // Fence workspace lease
+          const leaseUpdated = this.repo.updateWorkspaceLease(liveLease.id, liveLease.lifecycle_version, {
+            state: 'FENCED',
+            failure_code: failureCode || 'ORPHANED_VERIFICATION_INTERRUPTED',
+            failure_evidence_hash: artifactManifestHash,
+          });
+          if (!leaseUpdated) {
+            throw new CoderSubmissionAdjudicationError('STATUS_CONFLICT', 'Workspace lease fencing CAS failed');
           }
 
           this.repo.createCoderSubmissionAdjudicationEvent({
@@ -1801,15 +1987,36 @@ export class CoderSubmissionAdjudicationService {
       });
     } catch (err) {
       // Rollback cleanup: clean newly materialized unreferenced files
-      this.artifactStore.cleanupRollbackFiles(newlyMaterializedPaths, (fp) => this.repo.isEvidenceFilePathReferenced(fp));
-      throw err;
-    }
-
-    // Post-commit: read-only confirmation only (no rename, no copy, no mutations)
-    for (const mfPath of newlyMaterializedPaths) {
-      if (!fs.existsSync(mfPath)) {
-        console.warn(`[Adjudication] Read-only confirmation warning: artifact ${mfPath} missing post-commit`);
+      const cleanupRes = this.artifactStore.cleanupRollbackFiles(
+        newlyMaterializedPaths,
+        (fp) => this.repo.isEvidenceFilePathReferenced(fp)
+      );
+      if (cleanupRes.failures.length > 0) {
+        try {
+          this.repo.runInTransaction(() => {
+            const currentAdj = this.repo.getCoderSubmissionAdjudicationById(adjudicationId);
+            if (currentAdj && currentAdj.status === 'VERIFYING') {
+              this.repo.updateCoderSubmissionAdjudication(adjudicationId, currentAdj.lifecycle_version, {
+                status: 'RECOVERY_FENCED',
+                failure_code: 'CLEANUP_DEBT_FENCED',
+                failure_json: canonicalJsonStringify({ error: 'Artifact cleanup failed during rollback' }),
+                recovery_fenced_at: new Date().toISOString(),
+                artifact_manifest_json: artifactManifestJson,
+                artifact_manifest_hash: artifactManifestHash,
+              });
+              const liveLease = this.repo.getWorkspaceLease(leaseId);
+              if (liveLease && liveLease.released_at === null) {
+                this.repo.updateWorkspaceLease(liveLease.id, liveLease.lifecycle_version, {
+                  state: 'FENCED',
+                  failure_code: 'CLEANUP_DEBT_FENCED',
+                  failure_evidence_hash: artifactManifestHash,
+                });
+              }
+            }
+          });
+        } catch {}
       }
+      throw err;
     }
 
     return {
@@ -2029,6 +2236,45 @@ export class CoderSubmissionAdjudicationService {
       throw new CoderSubmissionAdjudicationError('NOT_FOUND', `Task "${adj.task_id}" not found`);
     }
 
+    // Snapshot and command validation: reject empty {} snapshots
+    if (!adj.authority_snapshot_json || adj.authority_snapshot_json.trim() === '{}') {
+      throw new CoderSubmissionAdjudicationError(
+        'INTEGRITY_CONFLICT',
+        `Adjudication authority snapshot cannot be empty: ${adj.id}`
+      );
+    }
+    try {
+      const snap = JSON.parse(adj.authority_snapshot_json);
+      if (typeof snap !== 'object' || snap === null || Array.isArray(snap) || Object.keys(snap).length === 0) {
+        throw new Error('empty or invalid');
+      }
+    } catch {
+      throw new CoderSubmissionAdjudicationError(
+        'INTEGRITY_CONFLICT',
+        `Adjudication authority snapshot is malformed or empty: ${adj.id}`
+      );
+    }
+
+    if (adj.action === 'ADMIT_VERIFICATION' && (!adj.verification_commands_json || adj.verification_commands_json.trim() === '{}')) {
+      throw new CoderSubmissionAdjudicationError(
+        'INTEGRITY_CONFLICT',
+        `Adjudication verification commands snapshot cannot be empty: ${adj.id}`
+      );
+    }
+    if (adj.verification_commands_json) {
+      try {
+        const cmdSnap = JSON.parse(adj.verification_commands_json);
+        if (typeof cmdSnap !== 'object' || cmdSnap === null || Array.isArray(cmdSnap) || Object.keys(cmdSnap).length === 0) {
+          throw new Error('empty or invalid');
+        }
+      } catch {
+        throw new CoderSubmissionAdjudicationError(
+          'INTEGRITY_CONFLICT',
+          `Adjudication verification commands snapshot is malformed or empty: ${adj.id}`
+        );
+      }
+    }
+
     // Acceptance criteria
     const taskRecord = task as unknown as Record<string, unknown>;
     const acceptance_criteria = Array.isArray(task.acceptance_criteria)
@@ -2123,18 +2369,49 @@ export class CoderSubmissionAdjudicationService {
         if (statusEv.storage_type === 'FILE' && statusEv.file_path) {
           payloadStr = fs.readFileSync(path.resolve(this.artifactStore.getBaseDir(), statusEv.file_path), 'utf8');
         }
-        let parsedPayload: Record<string, unknown> = {};
+        let parsedPayload: Record<string, unknown>;
         try {
           parsedPayload = JSON.parse(payloadStr);
-        } catch (parseErr: unknown) {
-          console.debug(`[Adjudication] Git status payload parsing non-JSON: ${parseErr instanceof Error ? parseErr.message : String(parseErr)}`);
+          if (typeof parsedPayload !== 'object' || parsedPayload === null || Array.isArray(parsedPayload)) {
+            throw new Error('Not an object');
+          }
+        } catch {
+          throw new CoderSubmissionAdjudicationError(
+            'INTEGRITY_CONFLICT',
+            `Git status evidence payload is malformed JSON`
+          );
+        }
+
+        if ('is_clean' in parsedPayload) {
+          throw new CoderSubmissionAdjudicationError(
+            'INTEGRITY_CONFLICT',
+            `Git status evidence contains forbidden alias 'is_clean'`
+          );
+        }
+        if (typeof parsedPayload.isClean !== 'boolean') {
+          throw new CoderSubmissionAdjudicationError(
+            'INTEGRITY_CONFLICT',
+            `Git status evidence missing required boolean 'isClean'`
+          );
+        }
+        if (Array.isArray(parsedPayload.files)) {
+          for (const f of parsedPayload.files) {
+            if (typeof f === 'string') {
+              if (path.isAbsolute(f) || f.includes('..') || f.startsWith('/') || f.startsWith('\\')) {
+                throw new CoderSubmissionAdjudicationError(
+                  'INTEGRITY_CONFLICT',
+                  `Git status evidence contains invalid path traversal or absolute path: ${f}`
+                );
+              }
+            }
+          }
         }
 
         authoritative_git_status = {
           evidence_id: statusEv.id,
           evidence_hash: statusEv.hash,
           storage_type: statusEv.storage_type,
-          is_clean: Boolean(parsedPayload.isClean ?? parsedPayload.is_clean ?? false),
+          is_clean: parsedPayload.isClean,
           branch: (parsedPayload.branch as string | null | undefined) ?? null,
           summary: (parsedPayload.summary as string | null | undefined) ?? payloadStr,
         };
@@ -2176,7 +2453,22 @@ export class CoderSubmissionAdjudicationService {
 
     // Operator Disposition
     const disps = this.repo.getCoderSubmissionDispositions(adj.submission_id);
-    const terminalDisp = disps.find((d) => d.disposition_event === 'REJECTED' || d.disposition_event === 'SETTLED');
+    const terminalDisps = disps.filter(
+      (d) => d.disposition_event === 'REJECTED' || d.disposition_event === 'SETTLED'
+    );
+    if (terminalDisps.length > 1) {
+      throw new CoderSubmissionAdjudicationError(
+        'INTEGRITY_CONFLICT',
+        `Ambiguous terminal dispositions: multiple terminal dispositions found for submission ${sub.id}`
+      );
+    }
+    const terminalDisp = terminalDisps.length === 1 ? terminalDisps[0] : null;
+    if (terminalDisps.length === 0 && (adj.status === 'VERIFIED' || adj.status === 'REJECTED' || adj.status === 'SUPERSEDED')) {
+      throw new CoderSubmissionAdjudicationError(
+        'INTEGRITY_CONFLICT',
+        `Missing expected terminal disposition for settled adjudication status "${adj.status}"`
+      );
+    }
     const operator_disposition: VerifiedAdjudicationReviewProjection['operator_disposition'] = terminalDisp
       ? {
           disposition_event: terminalDisp.disposition_event,
@@ -2394,12 +2686,78 @@ export class CoderSubmissionAdjudicationService {
         }
       }
 
-      if (auth.selected_resource_id) {
+      // Provider row validation
+      const provider = this.repo.getProvider(auth.selected_provider_id);
+      if (!provider) {
+        fenced_reasons.push(`Provider "${auth.selected_provider_id}" not found`);
+      } else if (!provider.enabled) {
+        fenced_reasons.push('Provider is not enabled');
+      }
+
+      // Account row validation
+      if (!auth.selected_account_id) {
+        fenced_reasons.push('Authorization missing selected_account_id');
+      } else {
+        const account = this.repo.getProviderAccount(auth.selected_account_id);
+        if (!account) {
+          fenced_reasons.push(`Provider account "${auth.selected_account_id}" not found`);
+        } else {
+          if (!account.enabled) {
+            fenced_reasons.push('Provider account is not enabled');
+          }
+          if (account.provider_id !== auth.selected_provider_id) {
+            fenced_reasons.push('Provider account provider_id does not match selected_provider_id');
+          }
+        }
+      }
+
+      // Resource row validation
+      if (!auth.selected_resource_id) {
+        fenced_reasons.push('Authorization missing selected_resource_id');
+      } else {
         const resource = this.repo.getProviderResource(auth.selected_resource_id);
         if (!resource) {
           fenced_reasons.push(`Provider resource "${auth.selected_resource_id}" not found`);
-        } else if (!resource.enabled) {
-          fenced_reasons.push('Provider resource is not enabled');
+        } else {
+          if (!resource.enabled) {
+            fenced_reasons.push('Provider resource is not enabled');
+          }
+          if (resource.provider_id !== auth.selected_provider_id) {
+            fenced_reasons.push('Provider resource provider_id does not match selected_provider_id');
+          }
+          if (resource.provider_account_id && auth.selected_account_id && resource.provider_account_id !== auth.selected_account_id) {
+            fenced_reasons.push('Provider resource provider_account_id does not match selected_account_id');
+          }
+        }
+      }
+
+      // Routing decision row validation
+      if (!auth.routing_decision_id) {
+        fenced_reasons.push('Authorization missing routing_decision_id');
+      } else {
+        const routingEvent = this.repo.getRoutingDecisionEvent(auth.routing_decision_id);
+        if (!routingEvent) {
+          fenced_reasons.push(`Routing decision event "${auth.routing_decision_id}" not found`);
+        } else {
+          const rPayload = routingEvent.structured_payload as Record<string, unknown>;
+          if (rPayload.projectId && rPayload.projectId !== sub.project_id) {
+            fenced_reasons.push('Routing decision projectId does not match submission');
+          }
+          if (rPayload.taskId && rPayload.taskId !== sub.task_id) {
+            fenced_reasons.push('Routing decision taskId does not match submission');
+          }
+          if (rPayload.selectedProviderId && rPayload.selectedProviderId !== auth.selected_provider_id) {
+            fenced_reasons.push('Routing decision selectedProviderId does not match authorization');
+          }
+          if (rPayload.selectedAccountId && auth.selected_account_id && rPayload.selectedAccountId !== auth.selected_account_id) {
+            fenced_reasons.push('Routing decision selectedAccountId does not match authorization');
+          }
+          if (rPayload.selectedResourceId && rPayload.selectedResourceId !== auth.selected_resource_id) {
+            fenced_reasons.push('Routing decision selectedResourceId does not match authorization');
+          }
+          if (rPayload.selectedAssignmentId && assignment && rPayload.selectedAssignmentId !== assignment.id) {
+            fenced_reasons.push('Routing decision selectedAssignmentId does not match assignment');
+          }
         }
       }
 
@@ -2412,7 +2770,11 @@ export class CoderSubmissionAdjudicationService {
           if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) {
             fenced_reasons.push('Execution authorization canonical payload must be a plain object');
           } else {
-            if (auth.instruction_payload_hash && computePayloadHash(parsed) === auth.instruction_payload_hash) {
+            if (
+              auth.instruction_payload_hash &&
+              (computePayloadHash(parsed) === auth.instruction_payload_hash ||
+                computeSha256(auth.canonical_payload_json) === auth.instruction_payload_hash)
+            ) {
               matches = true;
             }
             // Strict check on verificationCommands inside authorization
@@ -2440,9 +2802,6 @@ export class CoderSubmissionAdjudicationService {
         } catch {
           fenced_reasons.push('Execution authorization canonical payload is malformed JSON');
         }
-        if (!matches && auth.instruction_payload_hash && computeSha256(auth.canonical_payload_json) === auth.instruction_payload_hash) {
-          matches = true;
-        }
         if (auth.instruction_payload_hash && !matches) {
           fenced_reasons.push(
             'Execution authorization canonical payload hash mismatch (INSTRUCTION_PAYLOAD_HASH_MISMATCH)'
@@ -2450,18 +2809,39 @@ export class CoderSubmissionAdjudicationService {
         }
       }
 
-      // Slot & Lease check when authorization or assignment requires them
-      const slotId = assignment?.selected_worker_slot_id || ((auth as unknown as Record<string, unknown>).worker_slot_id as string | null | undefined);
+      // Worker Slot & Active Account Lease validation if assigned
+      const slotId = assignment?.selected_worker_slot_id;
       if (slotId) {
         const slot = this.repo.getWorkerSlot(slotId);
         if (!slot) {
           fenced_reasons.push(`Worker slot "${slotId}" not found`);
-        } else if (slot.status !== 'IDLE' && slot.status !== 'LEASED' && slot.status !== 'RUNNING') {
-          fenced_reasons.push(`Worker slot is not active (got ${slot.status})`);
-        }
-        const lease = this.repo.getActiveLeaseForSlot(slotId);
-        if (!lease) {
-          fenced_reasons.push(`Active lease missing for worker slot "${slotId}"`);
+        } else {
+          if (slot.status !== 'LEASED' && slot.status !== 'RUNNING') {
+            fenced_reasons.push(`Worker slot status must be LEASED or RUNNING (got ${slot.status})`);
+          }
+          if (auth.selected_account_id && slot.provider_account_id !== auth.selected_account_id) {
+            fenced_reasons.push('Worker slot provider_account_id does not match selected_account_id');
+          }
+          if (auth.selected_resource_id && slot.provider_resource_id && slot.provider_resource_id !== auth.selected_resource_id) {
+            fenced_reasons.push('Worker slot provider_resource_id does not match selected_resource_id');
+          }
+          const lease = this.repo.getActiveLeaseForSlot(slotId);
+          if (!lease) {
+            fenced_reasons.push(`Active lease missing for worker slot "${slotId}"`);
+          } else {
+            if (lease.released_at !== null) {
+              fenced_reasons.push('Active lease has non-null released_at');
+            }
+            if (assignment && lease.assignment_id !== assignment.id) {
+              fenced_reasons.push('Active lease assignment_id does not match assignment');
+            }
+            if (auth.selected_account_id && lease.provider_account_id !== auth.selected_account_id) {
+              fenced_reasons.push('Active lease provider_account_id does not match selected_account_id');
+            }
+            if (!lease.lease_token || typeof lease.lease_token !== 'string') {
+              fenced_reasons.push('Active lease missing lease_token');
+            }
+          }
         }
       }
 
@@ -2492,28 +2872,60 @@ export class CoderSubmissionAdjudicationService {
               if (typeof parsedPayload !== 'object' || parsedPayload === null || Array.isArray(parsedPayload)) {
                 fenced_reasons.push('Manager protocol message raw_payload must be a non-null plain object');
               } else {
-                const expectedManagerKeys = [
-                  'protocol',
-                  'message_id',
-                  'project_id',
-                  'task_id',
-                  'decision',
-                  'priority',
-                  'risk',
-                  'instructions',
+                const baseManagerKeys = [
                   'acceptance_criteria',
                   'constraints',
-                  'review_issues',
-                  'expected_task_state',
-                  'expected_revision',
                   'created_at',
+                  'decision',
+                  'expected_revision',
+                  'expected_task_state',
+                  'instructions',
+                  'message_id',
+                  'priority',
+                  'project_id',
+                  'protocol',
+                  'review_issues',
+                  'risk',
+                  'task_id',
                 ].sort();
                 const actualKeys = Object.keys(parsedPayload).sort();
+                const hasRouting = actualKeys.includes('routing');
+                const expectedKeys = hasRouting ? [...baseManagerKeys, 'routing'].sort() : baseManagerKeys;
+
                 if (
-                  actualKeys.length !== expectedManagerKeys.length ||
-                  actualKeys.some((k, i) => k !== expectedManagerKeys[i])
+                  actualKeys.length !== expectedKeys.length ||
+                  actualKeys.some((k, i) => k !== expectedKeys[i])
                 ) {
                   fenced_reasons.push('Manager protocol message payload key mismatch (missing or extra keys)');
+                }
+                if (hasRouting) {
+                  const routingVal = parsedPayload.routing;
+                  if (typeof routingVal !== 'object' || routingVal === null || Array.isArray(routingVal)) {
+                    fenced_reasons.push('Manager protocol message nested routing must be a non-null plain object');
+                  } else {
+                    const routingKeys = Object.keys(routingVal).sort();
+                    const expectedRoutingKeys = ['account_id', 'provider_id', 'resource_id', 'routing_decision_id'].sort();
+                    if (
+                      routingKeys.length !== expectedRoutingKeys.length ||
+                      routingKeys.some((k, i) => k !== expectedRoutingKeys[i])
+                    ) {
+                      fenced_reasons.push('Manager protocol message nested routing keys mismatch');
+                    } else {
+                      const rObj = routingVal as Record<string, unknown>;
+                      if (rObj.routing_decision_id !== auth.routing_decision_id) {
+                        fenced_reasons.push('Manager protocol nested routing_decision_id mismatch');
+                      }
+                      if (rObj.provider_id !== auth.selected_provider_id) {
+                        fenced_reasons.push('Manager protocol nested provider_id mismatch');
+                      }
+                      if (auth.selected_account_id && rObj.account_id !== auth.selected_account_id) {
+                        fenced_reasons.push('Manager protocol nested account_id mismatch');
+                      }
+                      if (rObj.resource_id !== auth.selected_resource_id) {
+                        fenced_reasons.push('Manager protocol nested resource_id mismatch');
+                      }
+                    }
+                  }
                 }
                 if (parsedPayload.protocol !== 'manager.v1') {
                   fenced_reasons.push(`Manager protocol message protocol must be manager.v1 (got ${parsedPayload.protocol})`);
@@ -2521,8 +2933,25 @@ export class CoderSubmissionAdjudicationService {
                 if (parsedPayload.project_id !== sub.project_id) {
                   fenced_reasons.push('Manager protocol message project_id mismatch');
                 }
-                if (parsedPayload.task_id && parsedPayload.task_id !== sub.task_id) {
+                if (typeof parsedPayload.task_id !== 'string' || !parsedPayload.task_id.trim()) {
+                  fenced_reasons.push('Manager protocol message task_id must be non-empty string');
+                } else if (parsedPayload.task_id !== sub.task_id) {
                   fenced_reasons.push('Manager protocol message task_id mismatch');
+                }
+                if (!['CREATE_TASKS', 'EXECUTE', 'PASS', 'FIX_REQUIRED', 'BLOCK', 'PAUSE', 'CANCEL', 'NEEDS_OWNER'].includes(parsedPayload.decision as string)) {
+                  fenced_reasons.push(`Manager protocol message decision invalid: ${parsedPayload.decision}`);
+                }
+                if (!Array.isArray(parsedPayload.instructions)) {
+                  fenced_reasons.push('Manager protocol message instructions must be an array');
+                }
+                if (!Array.isArray(parsedPayload.acceptance_criteria)) {
+                  fenced_reasons.push('Manager protocol message acceptance_criteria must be an array');
+                }
+                if (!Array.isArray(parsedPayload.constraints)) {
+                  fenced_reasons.push('Manager protocol message constraints must be an array');
+                }
+                if (!Array.isArray(parsedPayload.review_issues)) {
+                  fenced_reasons.push('Manager protocol message review_issues must be an array');
                 }
               }
             } catch {

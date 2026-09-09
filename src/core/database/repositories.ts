@@ -81,6 +81,7 @@ import {
   AdjudicationStatus,
   AdjudicationEventType,
 } from '../types/domain';
+import type { CoderSubmissionWorkspaceLease, WorkspaceLeaseState } from '../types/adjudication';
 import type { ProviderDispatchExecutionResult } from '../services/ProviderDispatchService';
 import { ExecutionFailureClassifier } from '../services/ExecutionFailureClassifier';
 import { FailureHealthMutationPolicyService } from '../services/FailureHealthMutationPolicyService';
@@ -3960,12 +3961,15 @@ export class Repository {
           resolution_timestamp,
           resolution_evidence_json,
           resolution_evidence_hash,
-          resolver_id
+          resolver_id,
+          artifact_manifest_json,
+          artifact_manifest_hash,
+          workspace_lease_id
         ) VALUES (
           ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
           ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
           ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
-          ?, ?, ?, ?, ?, ?
+          ?, ?, ?, ?, ?, ?, ?, ?, ?
         )
       `)
       .run(
@@ -4004,7 +4008,10 @@ export class Repository {
         adj.resolution_timestamp ?? null,
         adj.resolution_evidence_json ?? null,
         adj.resolution_evidence_hash ?? null,
-        adj.resolver_id ?? null
+        adj.resolver_id ?? null,
+        adj.artifact_manifest_json ?? null,
+        adj.artifact_manifest_hash ?? null,
+        adj.workspace_lease_id ?? null
       );
   }
 
@@ -4032,6 +4039,9 @@ export class Repository {
       resolution_evidence_json?: string | null;
       resolution_evidence_hash?: string | null;
       resolver_id?: string | null;
+      artifact_manifest_json?: string | null;
+      artifact_manifest_hash?: string | null;
+      workspace_lease_id?: string | null;
     }
   ): boolean {
     const setClauses: string[] = ['lifecycle_version = lifecycle_version + 1'];
@@ -4116,6 +4126,18 @@ export class Repository {
     if (updates.resolver_id !== undefined) {
       setClauses.push('resolver_id = ?');
       params.push(updates.resolver_id);
+    }
+    if (updates.artifact_manifest_json !== undefined) {
+      setClauses.push('artifact_manifest_json = ?');
+      params.push(updates.artifact_manifest_json);
+    }
+    if (updates.artifact_manifest_hash !== undefined) {
+      setClauses.push('artifact_manifest_hash = ?');
+      params.push(updates.artifact_manifest_hash);
+    }
+    if (updates.workspace_lease_id !== undefined) {
+      setClauses.push('workspace_lease_id = ?');
+      params.push(updates.workspace_lease_id);
     }
 
     params.push(id, expectedVersion);
@@ -4227,8 +4249,157 @@ export class Repository {
       resolution_evidence_json: row.resolution_evidence_json != null ? String(row.resolution_evidence_json) : null,
       resolution_evidence_hash: row.resolution_evidence_hash != null ? String(row.resolution_evidence_hash) : null,
       resolver_id: row.resolver_id != null ? String(row.resolver_id) : null,
+      artifact_manifest_json: row.artifact_manifest_json != null ? String(row.artifact_manifest_json) : null,
+      artifact_manifest_hash: row.artifact_manifest_hash != null ? String(row.artifact_manifest_hash) : null,
+      workspace_lease_id: row.workspace_lease_id != null ? String(row.workspace_lease_id) : null,
     };
   }
+
+  // ==========================================
+  // Coder Submission Workspace Leases (R5J5 Pass 4)
+  // ==========================================
+  public createWorkspaceLease(lease: CoderSubmissionWorkspaceLease): void {
+    this.db
+      .prepare(`
+        INSERT INTO coder_submission_workspace_leases (
+          id,
+          adjudication_id,
+          worktree_identity_hash,
+          admitted_workspace_fingerprint_hash,
+          pre_execution_fingerprint_hash,
+          claim_nonce,
+          execution_id,
+          lease_owner_identity,
+          assignment_id,
+          authorization_id,
+          acquired_at,
+          released_at,
+          lifecycle_version,
+          state,
+          failure_code,
+          failure_evidence_hash
+        ) VALUES (
+          ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+        )
+      `)
+      .run(
+        lease.id,
+        lease.adjudication_id,
+        lease.worktree_identity_hash,
+        lease.admitted_workspace_fingerprint_hash,
+        lease.pre_execution_fingerprint_hash ?? null,
+        lease.claim_nonce,
+        lease.execution_id,
+        lease.lease_owner_identity,
+        lease.assignment_id,
+        lease.authorization_id,
+        lease.acquired_at,
+        lease.released_at ?? null,
+        lease.lifecycle_version,
+        lease.state,
+        lease.failure_code ?? null,
+        lease.failure_evidence_hash ?? null
+      );
+  }
+
+  public getWorkspaceLease(id: string): CoderSubmissionWorkspaceLease | null {
+    const row = this.db
+      .prepare('SELECT * FROM coder_submission_workspace_leases WHERE id = ?')
+      .get(id) as Record<string, unknown> | undefined;
+    if (!row) return null;
+    return this.mapWorkspaceLease(row);
+  }
+
+  public getActiveWorkspaceLeaseByWorktree(worktreeHash: string): CoderSubmissionWorkspaceLease | null {
+    const row = this.db
+      .prepare(`
+        SELECT * FROM coder_submission_workspace_leases
+        WHERE worktree_identity_hash = ? AND state IN ('ACQUIRED', 'VERIFYING')
+        ORDER BY acquired_at DESC
+        LIMIT 1
+      `)
+      .get(worktreeHash) as Record<string, unknown> | undefined;
+    if (!row) return null;
+    return this.mapWorkspaceLease(row);
+  }
+
+  public getWorkspaceLeaseByAdjudication(adjudicationId: string): CoderSubmissionWorkspaceLease | null {
+    const row = this.db
+      .prepare(`
+        SELECT * FROM coder_submission_workspace_leases
+        WHERE adjudication_id = ?
+        ORDER BY acquired_at DESC
+        LIMIT 1
+      `)
+      .get(adjudicationId) as Record<string, unknown> | undefined;
+    if (!row) return null;
+    return this.mapWorkspaceLease(row);
+  }
+
+  public updateWorkspaceLease(
+    id: string,
+    expectedVersion: number,
+    updates: Partial<CoderSubmissionWorkspaceLease>
+  ): boolean {
+    const setClauses: string[] = ['lifecycle_version = lifecycle_version + 1'];
+    const params: unknown[] = [];
+
+    if (updates.execution_id !== undefined) {
+      setClauses.push('execution_id = ?');
+      params.push(updates.execution_id);
+    }
+    if (updates.pre_execution_fingerprint_hash !== undefined) {
+      setClauses.push('pre_execution_fingerprint_hash = ?');
+      params.push(updates.pre_execution_fingerprint_hash);
+    }
+    if (updates.state !== undefined) {
+      setClauses.push('state = ?');
+      params.push(updates.state);
+    }
+    if (updates.released_at !== undefined) {
+      setClauses.push('released_at = ?');
+      params.push(updates.released_at);
+    }
+    if (updates.failure_code !== undefined) {
+      setClauses.push('failure_code = ?');
+      params.push(updates.failure_code);
+    }
+    if (updates.failure_evidence_hash !== undefined) {
+      setClauses.push('failure_evidence_hash = ?');
+      params.push(updates.failure_evidence_hash);
+    }
+
+    params.push(id, expectedVersion);
+    const sql = `
+      UPDATE coder_submission_workspace_leases
+      SET ${setClauses.join(', ')}
+      WHERE id = ? AND lifecycle_version = ?
+    `;
+    const res = this.db.prepare(sql).run(...params);
+    return res.changes === 1;
+  }
+
+  private mapWorkspaceLease(row: Record<string, unknown>): CoderSubmissionWorkspaceLease {
+    return {
+      id: String(row.id),
+      adjudication_id: String(row.adjudication_id),
+      worktree_identity_hash: String(row.worktree_identity_hash),
+      admitted_workspace_fingerprint_hash: String(row.admitted_workspace_fingerprint_hash),
+      pre_execution_fingerprint_hash: row.pre_execution_fingerprint_hash != null ? String(row.pre_execution_fingerprint_hash) : null,
+      claim_nonce: String(row.claim_nonce),
+      execution_id: String(row.execution_id),
+      lease_owner_identity: String(row.lease_owner_identity),
+      assignment_id: String(row.assignment_id),
+      authorization_id: String(row.authorization_id),
+      acquired_at: String(row.acquired_at),
+      released_at: row.released_at != null ? String(row.released_at) : null,
+      lifecycle_version: Number(row.lifecycle_version),
+      state: row.state as WorkspaceLeaseState,
+      failure_code: row.failure_code != null ? String(row.failure_code) : null,
+      failure_evidence_hash: row.failure_evidence_hash != null ? String(row.failure_evidence_hash) : null,
+    };
+  }
+
 
   // ==========================================
   // Coder Submission Adjudication Events (R5J5)
