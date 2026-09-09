@@ -1,3 +1,5 @@
+import crypto from 'crypto';
+import fs from 'fs';
 import Database from 'better-sqlite3';
 import { Repository, CoderSubmission } from '../database/repositories';
 import { TestRun } from '../types/domain';
@@ -20,7 +22,7 @@ import {
   deriveDeterministicGenericAdjudicationEventId,
   deriveDeterministicDispositionId,
 } from './CoderSubmissionAdjudicationService';
-import { verifyEvidenceIntegrity } from './ArtifactStore';
+import { verifyEvidenceIntegrity, parseAndVerifyArtifactManifest } from './ArtifactStore';
 
 export class CoderSubmissionAdjudicationRecoveryScanner {
   private adjudicationService: CoderSubmissionAdjudicationService;
@@ -208,26 +210,47 @@ export class CoderSubmissionAdjudicationRecoveryScanner {
 
       // Check manifest if present or required
       if (!contradiction && adj.artifact_manifest_json) {
-        if (computeSha256(adj.artifact_manifest_json) !== adj.artifact_manifest_hash) {
-          contradiction = 'Artifact manifest hash mismatch';
+        if (!adj.artifact_manifest_hash) {
+          contradiction = 'Artifact manifest hash missing';
         } else {
           try {
-            const parsedMf = JSON.parse(adj.artifact_manifest_json);
-            if (typeof parsedMf !== 'object' || parsedMf === null || Array.isArray(parsedMf)) {
-              contradiction = 'Artifact manifest is not a plain object';
-            } else if (parsedMf.adjudication_id !== adj.id) {
+            const parsedMf = parseAndVerifyArtifactManifest(
+              adj.artifact_manifest_json,
+              adj.artifact_manifest_hash
+            );
+            if (parsedMf.adjudication_id !== adj.id) {
               contradiction = 'Artifact manifest adjudication_id mismatch';
-            } else if (Array.isArray(parsedMf.entries)) {
+            } else {
               for (const entry of parsedMf.entries) {
-                const entryHash = entry.sha256 || entry.hash;
-                if (!entry.evidence_id || !entryHash) {
+                if (!entry.evidence_id || !entry.sha256 || !entry.relative_path) {
                   contradiction = 'Artifact manifest entry has missing or invalid fields';
                   break;
                 }
+                const ev = this.repo.getEvidence(entry.evidence_id);
+                if (!ev || ev.hash !== entry.sha256 || ev.byte_size !== entry.byte_size) {
+                  contradiction = `Artifact manifest entry ${entry.evidence_id} missing or mismatch in evidence row`;
+                  break;
+                }
+                if (ev.storage_type === 'FILE' && ev.file_path) {
+                  if (!fs.existsSync(ev.file_path)) {
+                    contradiction = `Artifact manifest file missing on disk: ${entry.relative_path}`;
+                    break;
+                  }
+                  const fileBytes = fs.readFileSync(ev.file_path);
+                  if (fileBytes.length !== entry.byte_size) {
+                    contradiction = `Artifact manifest file size mismatch: ${entry.relative_path}`;
+                    break;
+                  }
+                  const fileHash = crypto.createHash('sha256').update(fileBytes).digest('hex');
+                  if (fileHash !== entry.sha256) {
+                    contradiction = `Artifact manifest file hash mismatch: ${entry.relative_path}`;
+                    break;
+                  }
+                }
               }
             }
-          } catch {
-            contradiction = 'Artifact manifest is malformed JSON';
+          } catch (mErr: unknown) {
+            contradiction = `Artifact manifest validation failed: ${mErr instanceof Error ? mErr.message : String(mErr)}`;
           }
         }
       }
@@ -544,6 +567,23 @@ export class CoderSubmissionAdjudicationRecoveryScanner {
       }
 
       if (!settlementError && testRun && parsedEnvelope) {
+        if (!artifactManifestJson || !artifactManifestHash) {
+          this.fenceAdjudication(
+            adj,
+            'INTEGRITY_MISMATCH',
+            'VERIFYING adjudication missing artifact manifest for settlement',
+            nowIso,
+            true
+          );
+          return {
+            adjudication_id: adj.id,
+            submission_id: adj.submission_id,
+            classification: 'AUTHORITY_CONFLICT',
+            action_taken: 'FENCED_CONFLICT',
+            error: 'Missing artifact manifest',
+          };
+        }
+
         const settlementSuccess = this.reconcileMissingSettlement(
           adj,
           testRun,
@@ -554,13 +594,30 @@ export class CoderSubmissionAdjudicationRecoveryScanner {
           artifactManifestHash,
           nowIso
         );
-        return {
-          adjudication_id: adj.id,
-          submission_id: adj.submission_id,
-          classification: 'VERIFICATION_RESULT_STATE_INCOMPLETE',
-          action_taken: settlementSuccess ? 'SETTLED' : 'FENCED',
-          task_transition: settlementSuccess ? (testRun.exit_code === 0 ? 'REVIEW_READY' : 'NEEDS_HUMAN') : undefined,
-        };
+        if (settlementSuccess) {
+          return {
+            adjudication_id: adj.id,
+            submission_id: adj.submission_id,
+            classification: 'VERIFICATION_RESULT_STATE_INCOMPLETE',
+            action_taken: 'SETTLED',
+            task_transition: testRun.exit_code === 0 && parsedEnvelope.exit_classification === 'EXIT_ZERO' && !parsedEnvelope.failure_code ? 'REVIEW_READY' : 'NEEDS_HUMAN',
+          };
+        } else {
+          this.fenceAdjudication(
+            adj,
+            'INTEGRITY_MISMATCH',
+            'Settlement reconciliation failed; fenced',
+            nowIso,
+            true
+          );
+          return {
+            adjudication_id: adj.id,
+            submission_id: adj.submission_id,
+            classification: 'AUTHORITY_CONFLICT',
+            action_taken: 'FENCED_CONFLICT',
+            error: 'Settlement reconciliation failed',
+          };
+        }
       }
 
       if (
@@ -730,7 +787,7 @@ export class CoderSubmissionAdjudicationRecoveryScanner {
     artifactManifestHash: string | null,
     nowIso: string
   ): boolean {
-    const isSuccess = testRun.exit_code === 0;
+    const isSuccess = envelope.exit_classification === 'EXIT_ZERO' && testRun.exit_code === 0 && !envelope.failure_code;
     const targetStatus = isSuccess ? 'VERIFIED' : 'VERIFICATION_FAILED';
     const eventType = isSuccess ? 'VERIFICATION_SUCCEEDED' : 'VERIFICATION_FAILED';
     const nextVersion = adj.lifecycle_version + 1;
@@ -738,25 +795,16 @@ export class CoderSubmissionAdjudicationRecoveryScanner {
     const envelopeJson = canonicalJsonStringify(envelope);
     const envelopeHash = computeSha256(envelopeJson);
 
-    let resolvedManifestJson = artifactManifestJson;
-    let resolvedManifestHash = artifactManifestHash;
-    if (!resolvedManifestJson) {
-      const manifestObj = {
-        adjudication_id: adj.id,
-        entries: [
-          ...(testRun.evidence_id ? [{ evidence_id: testRun.evidence_id, sha256: envelope.test_result_evidence_hash, storage_class: 'FILE' }] : []),
-          ...(gitStatusEvidenceId ? [{ evidence_id: gitStatusEvidenceId, sha256: envelope.git_status_evidence_hash, storage_class: 'FILE' }] : []),
-          ...(gitDiffEvidenceId ? [{ evidence_id: gitDiffEvidenceId, sha256: envelope.git_diff_evidence_hash, storage_class: 'FILE' }] : []),
-        ],
-        lifecycle_version: nextVersion,
-        manifest_schema_version: 1,
-        verification_execution_id: envelope.verification_execution_id,
-      };
-      resolvedManifestJson = canonicalJsonStringify(manifestObj);
-      if (!resolvedManifestHash) {
-        resolvedManifestHash = computeSha256(resolvedManifestJson);
-      }
+    if (!artifactManifestJson || !artifactManifestHash) {
+      return false;
     }
+    try {
+      parseAndVerifyArtifactManifest(artifactManifestJson, artifactManifestHash);
+    } catch {
+      return false;
+    }
+    const resolvedManifestJson = artifactManifestJson;
+    const resolvedManifestHash = artifactManifestHash;
 
     try {
       const tx = this.db.transaction(() => {
@@ -796,10 +844,13 @@ export class CoderSubmissionAdjudicationRecoveryScanner {
         if (adj.workspace_lease_id) {
           const l = this.repo.getWorkspaceLease(adj.workspace_lease_id);
           if (l && l.released_at === null) {
-            this.repo.updateWorkspaceLease(l.id, l.lifecycle_version, {
+            const leaseUpdated = this.repo.updateWorkspaceLease(l.id, l.lifecycle_version, {
               state: 'RELEASED',
               released_at: nowIso,
             });
+            if (!leaseUpdated) {
+              throw new Error(`RECOVERY_CAS_FAILED: Workspace lease release CAS failed for lease ${l.id}`);
+            }
           }
         }
 

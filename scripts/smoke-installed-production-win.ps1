@@ -501,6 +501,12 @@ db.prepare(`
   VALUES (?, ?, ?, 'ROLE_AWARE_ROUTING_DECISION', 'Optimal route', ?, ?)
 `).run(routingDecisionId, projectId, taskId, JSON.stringify(routingPayload), now);
 
+const workerSlotId = 'slot-inst-' + crypto.randomUUID();
+db.prepare(`
+  INSERT INTO worker_slots (id, provider_account_id, provider_resource_id, slot_index, status, current_assignment_id, created_at, updated_at)
+  VALUES (?, ?, ?, 1, 'RUNNING', ?, ?, ?)
+`).run(workerSlotId, accountId, resourceId, assignmentId, now, now);
+
 repo.createAgentAssignment({
   id: assignmentId,
   project_id: projectId,
@@ -511,13 +517,28 @@ repo.createAgentAssignment({
   selected_provider_id: providerId,
   selected_account_id: accountId,
   selected_resource_id: resourceId,
-  selected_worker_slot_id: null,
+  selected_worker_slot_id: workerSlotId,
   routing_decision_id: routingDecisionId,
   status: 'ASSIGNED',
   created_at: now,
   ended_at: null,
   preferred_metadata: null,
 });
+
+const accountLeaseId = 'lease-inst-' + crypto.randomUUID();
+db.prepare(`
+  INSERT INTO account_leases (id, assignment_id, provider_account_id, worker_slot_id, lease_token, acquired_at, expires_at, heartbeat_at, released_at)
+  VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL)
+`).run(
+  accountLeaseId,
+  assignmentId,
+  accountId,
+  workerSlotId,
+  'lease-token-' + crypto.randomUUID(),
+  now,
+  new Date(Date.now() + 3600000).toISOString(),
+  now
+);
 
 const instructions = ['Task: Installed Smoke Task', 'Verify installed context read'];
 const managerPayload = {
@@ -1389,7 +1410,7 @@ const harness = new McpRpcHarness(child);
       if (parsedPayload.verificationCommands && parsedPayload.verificationCommands.TEST) {
         parsedPayload.verificationCommands.TEST.timeout_ms = 30000;
         const updatedPayloadJson = JSON.stringify(parsedPayload);
-        const updatedHash = crypto.createHash('sha256').update(updatedPayloadJson, 'utf8').digest('hex');
+        const updatedHash = computePayloadHash(parsedPayload);
         adjDb.prepare("UPDATE execution_authorizations SET canonical_payload_json = ?, instruction_payload_hash = ? WHERE id = ?")
           .run(updatedPayloadJson, updatedHash, authorizationId);
       }
@@ -1462,14 +1483,11 @@ const harness = new McpRpcHarness(child);
       throw new Error("R5J5 final task state is not REVIEW_READY: " + (finalTask?.state || 'UNKNOWN'));
     }
 
-    // 5. Test review package generation with exact adjudication linkage
-    const linkedProtoMsg = checkAdjDb.prepare("SELECT * FROM protocol_messages WHERE id = ?").get(durableAdj.protocol_message_id);
-    const linkedTestRun = checkAdjDb.prepare("SELECT * FROM test_runs WHERE id = ?").get(durableAdj.test_run_id);
-    const linkedGitStatus = checkAdjDb.prepare("SELECT * FROM evidence WHERE id = ?").get(durableAdj.git_status_evidence_id);
-    const linkedGitDiff = checkAdjDb.prepare("SELECT * FROM evidence WHERE id = ?").get(durableAdj.git_diff_evidence_id);
-    const durableSub = checkAdjDb.prepare("SELECT * FROM coder_submissions WHERE id = ?").get(submissionId);
+    // 5. Test review package generation with verified projection
     const durableProj = adjRepo.getProject(projectId);
-
+    const linkedTestRun = checkAdjDb.prepare("SELECT * FROM test_runs WHERE id = ?").get(durableAdj.test_run_id);
+    const linkedGitDiff = checkAdjDb.prepare("SELECT * FROM evidence WHERE id = ?").get(durableAdj.git_diff_evidence_id);
+    const verifiedProjection = adjService.buildVerifiedAdjudicationReviewProjection(durableAdj.id);
     const reviewPkg = PackageGenerator.generateReviewPackage(
       durableProj,
       finalTask,
@@ -1479,13 +1497,7 @@ const harness = new McpRpcHarness(child);
       linkedTestRun,
       [],
       linkedGitDiff,
-      {
-        adjudication: durableAdj,
-        submission: durableSub,
-        testRun: linkedTestRun,
-        gitStatusEvidence: linkedGitStatus,
-        gitDiffEvidence: linkedGitDiff,
-      }
+      verifiedProjection
     );
 
     if (!reviewPkg.includes('### Coder Claims (Unverified)')) {

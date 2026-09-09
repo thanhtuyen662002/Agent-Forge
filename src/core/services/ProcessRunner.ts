@@ -264,11 +264,12 @@ export class ProcessRunner {
             error: `Resolved command shim does not exist or is not a file: "${resolvedPath}".`,
           };
         }
-      } catch (err: any) {
+      } catch (err: unknown) {
+        const errMsg = err instanceof Error ? err.message : String(err);
         return {
           executable,
           args,
-          error: `Cannot access resolved command shim: ${err.message}`,
+          error: `Cannot access resolved command shim: ${errMsg}`,
         };
       }
 
@@ -528,7 +529,8 @@ export class ProcessRunner {
           status: 'RUNNING',
           start_time: startIso,
         });
-      } catch (err: any) {
+      } catch (err: unknown) {
+        const errMsg = err instanceof Error ? err.message : String(err);
         return {
           executionId,
           pid: null,
@@ -536,7 +538,7 @@ export class ProcessRunner {
           cwd: options.cwd,
           exitCode: -1,
           stdout: '',
-          stderr: `PERSISTED_PROCESS_RUN_COLLISION: Failed to create process run record for ID "${executionId}": ${err.message}`,
+          stderr: `PERSISTED_PROCESS_RUN_COLLISION: Failed to create process run record for ID "${executionId}": ${errMsg}`,
           durationMs: 0,
           timedOut: false,
           cancelled: false,
@@ -642,7 +644,7 @@ export class ProcessRunner {
         });
       }
 
-      child.on('error', (err) => {
+      child.on('error', async (err) => {
         clearTimeout(timer);
         const wasCancelled = procEntry.isCancelled;
         this.activeProcesses.delete(executionId);
@@ -669,8 +671,11 @@ export class ProcessRunner {
         }
 
         const hasPid = typeof child.pid === 'number' && child.pid > 0;
+        let termStatus: ProcessTerminationTruth = 'NOT_APPLICABLE';
+        if (hasPid) {
+          termStatus = await ProcessRunner.terminateProcessTree(child);
+        }
         const startStatus: ProcessStartTruth = hasPid ? 'START_AMBIGUOUS' : 'NOT_STARTED_PROVEN';
-        const termStatus: ProcessTerminationTruth = hasPid ? 'TERMINATION_UNRESOLVED' : 'NOT_APPLICABLE';
 
         resolve({
           executionId,
@@ -882,7 +887,9 @@ export class ProcessRunner {
             const timer = setTimeout(() => {
               try {
                 tk.kill('SIGKILL');
-              } catch {}
+              } catch {
+                // termination attempt bounded
+              }
               resolve(null);
             }, timeoutMs);
             tk.on('error', () => {
@@ -908,13 +915,17 @@ export class ProcessRunner {
           } catch {
             try {
               child.kill('SIGKILL');
-            } catch {}
+            } catch {
+              // fallback kill bounded
+            }
           }
           const isDead = await ProcessRunner.verifyProcessDeadWithDeadline(pid, timeoutMs);
           return isDead ? 'PROCESS_TREE_TERMINATED_PROVEN' : 'TERMINATION_UNRESOLVED';
         }
       } catch {
         return 'TERMINATION_UNRESOLVED';
+      } finally {
+        this.terminationPromises.delete(pid);
       }
     })();
 

@@ -113,11 +113,12 @@ export class PackageGenerator {
         throw new Error(parseResult.error.issues.map((i) => i.message).join(', '));
       }
       canonicalPayload = parseResult.data;
-    } catch (err: any) {
-      if (err.message && err.message.includes('AUTHORIZED_WORKORDER_VERIFICATION_SNAPSHOT_MISSING')) {
+    } catch (err: unknown) {
+      const errMsg = err instanceof Error ? err.message : String(err);
+      if (errMsg.includes('AUTHORIZED_WORKORDER_VERIFICATION_SNAPSHOT_MISSING')) {
         throw err;
       }
-      throw new Error(`EXECUTION_AUTHORIZATION_CORRUPTED: Invalid canonical_payload_json (${err.message})`);
+      throw new Error(`EXECUTION_AUTHORIZATION_CORRUPTED: Invalid canonical_payload_json (${errMsg})`);
     }
 
     // 7. Verify frozen scope and authority bindings
@@ -156,8 +157,9 @@ export class PackageGenerator {
       if (!Array.isArray(canonicalInstructions) || !canonicalInstructions.every((i) => typeof i === 'string')) {
         throw new Error('Must be an array of strings');
       }
-    } catch (err: any) {
-      throw new Error(`EXECUTION_AUTHORIZATION_CORRUPTED: Invalid canonical_instructions_json (${err.message})`);
+    } catch (err: unknown) {
+      const errMsg = err instanceof Error ? err.message : String(err);
+      throw new Error(`EXECUTION_AUTHORIZATION_CORRUPTED: Invalid canonical_instructions_json (${errMsg})`);
     }
 
     let contextFiles: string[];
@@ -166,8 +168,9 @@ export class PackageGenerator {
       if (!Array.isArray(contextFiles) || !contextFiles.every((f) => typeof f === 'string')) {
         throw new Error('Must be an array of strings');
       }
-    } catch (err: any) {
-      throw new Error(`EXECUTION_AUTHORIZATION_CORRUPTED: Invalid context_files_json (${err.message})`);
+    } catch (err: unknown) {
+      const errMsg = err instanceof Error ? err.message : String(err);
+      throw new Error(`EXECUTION_AUTHORIZATION_CORRUPTED: Invalid context_files_json (${errMsg})`);
     }
 
     // 9. Require exact deep equality between payload and authorization record fields
@@ -399,8 +402,22 @@ Guidelines:
     // Strictly validate authoritative git status if present
     if (projection.authoritative_git_status) {
       const gs = projection.authoritative_git_status;
+      if (!gs || typeof gs !== 'object' || Array.isArray(gs)) {
+        throw new Error('VERIFIED_PROJECTION_INVALID: Malformed authoritative_git_status evidence in projection');
+      }
+      const allowedGitStatusKeys = ['branch', 'evidence_hash', 'evidence_id', 'is_clean', 'storage_type', 'summary'].sort();
+      const actualKeys = Object.keys(gs).sort();
+      for (const k of actualKeys) {
+        if (!allowedGitStatusKeys.includes(k)) {
+          throw new Error(`VERIFIED_PROJECTION_INVALID: Unauthorized field "${k}" in authoritative_git_status`);
+        }
+      }
       if (typeof gs.is_clean !== 'boolean' || !gs.evidence_id || !gs.evidence_hash) {
         throw new Error('VERIFIED_PROJECTION_INVALID: Malformed authoritative_git_status evidence in projection');
+      }
+      const rawGs = gs as unknown as Record<string, unknown>;
+      if (rawGs.storage_class || rawGs.hash || rawGs.clean) {
+        throw new Error('VERIFIED_PROJECTION_INVALID: Non-canonical alias in authoritative_git_status');
       }
     }
 
@@ -441,7 +458,12 @@ Guidelines:
 
     const testVerif = projection.authoritative_verification;
     let verdictDisplay = '🔴 FAILED';
-    if (testVerif.verdict === 'PASSED') {
+    if (projection.recovery_fencing_state?.is_fenced) {
+      verdictDisplay = '⚠️ RECOVERY_FENCED / UNRESOLVED';
+    } else if (testVerif.verdict === 'PASSED') {
+      if (testVerif.exit_code !== 0 || !testVerif.test_run_id) {
+        throw new Error('VERIFIED_PROJECTION_INVALID: PASSED verdict requires exit_code === 0 and valid test_run_id');
+      }
       verdictDisplay = '🟢 PASSED';
     } else if (testVerif.verdict === 'FENCED') {
       verdictDisplay = '⚠️ RECOVERY_FENCED / UNRESOLVED';
@@ -571,30 +593,47 @@ Evaluate the authoritative evidence above against the acceptance criteria and re
     gitDiffStat: string,
     gitDiffContent: string,
     testRun: TestRun | null,
+    previousReviews?: Review[],
+    gitDiffEvidence?: Evidence | null,
+    adjudicationProjection?: VerifiedAdjudicationReviewProjection | null
+  ): string;
+  public static generateReviewPackage(
+    project: Project,
+    task: Task,
+    coderReport: CoderProtocol | null,
+    gitDiffStat: string,
+    gitDiffContent: string,
+    testRun: TestRun | null,
+    previousReviews?: Review[],
+    gitDiffEvidence?: Evidence | null,
+    adjudicationProjection?: unknown
+  ): string;
+  public static generateReviewPackage(
+    project: Project,
+    task: Task,
+    coderReport: CoderProtocol | null,
+    gitDiffStat: string,
+    gitDiffContent: string,
+    testRun: TestRun | null,
     previousReviews: Review[] = [],
     gitDiffEvidence?: Evidence | null,
-    adjudicationLinkageOrProjection?: VerifiedAdjudicationReviewProjection | AdjudicationReviewPackageLinkage | null,
-    legacyLinkage?: any
+    adjudicationProjection?: unknown
   ): string {
-    if (legacyLinkage) {
-      throw new Error(
-        'LEGACY_LINKAGE_REJECTED: Adjudication review package generation requires VerifiedAdjudicationReviewProjection.'
-      );
-    }
-    if (adjudicationLinkageOrProjection) {
-      if ('projection_hash' in (adjudicationLinkageOrProjection as unknown as Record<string, unknown>)) {
-        return PackageGenerator.renderVerifiedAdjudicationReviewProjection(
-          adjudicationLinkageOrProjection as VerifiedAdjudicationReviewProjection
-        );
-      }
+    if (adjudicationProjection) {
       if (
-        'adjudication_id' in (adjudicationLinkageOrProjection as unknown as Record<string, unknown>) &&
-        !('adjudication' in (adjudicationLinkageOrProjection as unknown as Record<string, unknown>))
+        typeof adjudicationProjection !== 'object' ||
+        adjudicationProjection === null ||
+        'adjudication' in (adjudicationProjection as Record<string, unknown>) ||
+        'submission' in (adjudicationProjection as Record<string, unknown>) ||
+        !('projection_hash' in (adjudicationProjection as Record<string, unknown>))
       ) {
         throw new Error(
           'LEGACY_LINKAGE_REJECTED: Adjudication review package generation requires VerifiedAdjudicationReviewProjection.'
         );
       }
+      return PackageGenerator.renderVerifiedAdjudicationReviewProjection(
+        adjudicationProjection as VerifiedAdjudicationReviewProjection
+      );
     }
 
     const taskRecord = task as unknown as Record<string, unknown>;
@@ -633,227 +672,6 @@ Evaluate the authoritative evidence above against the acceptance criteria and re
         `- **SHA-256 Checksum**: \`${activeEv.hash}\`\n` +
         `- **Byte Size**: \`${activeEv.byte_size} bytes\`\n` +
         `- **Storage Type**: \`${activeEv.storage_type}\`\n`;
-    }
-
-    if (adjudicationLinkageOrProjection && 'adjudication' in adjudicationLinkageOrProjection) {
-      const { adjudication, submission, testRun: linkedTestRun, gitStatusEvidence, gitDiffEvidence: linkedDiffEv } = adjudicationLinkageOrProjection;
-
-      // Fail closed validation: never silently substitute a different submission, test run, or evidence row
-      if (adjudication.submission_id !== submission.id) {
-        throw new Error(`ADJUDICATION_LINKAGE_MISMATCH: submission ID mismatch (${adjudication.submission_id} vs ${submission.id})`);
-      }
-      if (adjudication.task_id !== task.id) {
-        throw new Error(`ADJUDICATION_LINKAGE_MISMATCH: task ID mismatch (${adjudication.task_id} vs ${task.id})`);
-      }
-      if (adjudication.project_id !== project.id) {
-        throw new Error(`ADJUDICATION_LINKAGE_MISMATCH: project ID mismatch (${adjudication.project_id} vs ${project.id})`);
-      }
-
-      // Recompute stored hashes
-      if (computeSha256(submission.claim_content_json) !== submission.claim_content_hash) {
-        throw new Error('ADJUDICATION_LINKAGE_MISMATCH: submission claim_content_hash mismatch');
-      }
-      if (computeSha256(submission.canonical_envelope_json) !== submission.canonical_envelope_hash) {
-        throw new Error('ADJUDICATION_LINKAGE_MISMATCH: submission canonical_envelope_hash mismatch');
-      }
-      if (computeSha256(adjudication.authority_snapshot_json) !== adjudication.authority_snapshot_hash) {
-        throw new Error('ADJUDICATION_LINKAGE_MISMATCH: adjudication authority_snapshot_hash mismatch');
-      }
-      if (
-        adjudication.verification_commands_json &&
-        computeSha256(adjudication.verification_commands_json) !== adjudication.verification_commands_hash
-      ) {
-        throw new Error('ADJUDICATION_LINKAGE_MISMATCH: adjudication verification_commands_hash mismatch');
-      }
-
-      if (adjudication.test_run_id) {
-        if (!linkedTestRun || adjudication.test_run_id !== linkedTestRun.id) {
-          throw new Error(`ADJUDICATION_LINKAGE_MISMATCH: test run ID mismatch (${adjudication.test_run_id} vs ${linkedTestRun?.id ?? 'null'})`);
-        }
-        if (linkedTestRun.task_id !== task.id) {
-          throw new Error(`ADJUDICATION_LINKAGE_MISMATCH: test run task ID mismatch (${linkedTestRun.task_id} vs ${task.id})`);
-        }
-      } else if (linkedTestRun) {
-        throw new Error('ADJUDICATION_LINKAGE_MISMATCH: test run provided when adjudication has no test_run_id');
-      }
-
-      if (adjudication.git_status_evidence_id) {
-        if (!gitStatusEvidence || adjudication.git_status_evidence_id !== gitStatusEvidence.id) {
-          throw new Error(`ADJUDICATION_LINKAGE_MISMATCH: git status evidence ID mismatch (${adjudication.git_status_evidence_id} vs ${gitStatusEvidence?.id ?? 'null'})`);
-        }
-        if (
-          gitStatusEvidence.project_id !== project.id ||
-          gitStatusEvidence.task_id !== task.id ||
-          gitStatusEvidence.evidence_type !== 'GIT_STATUS' ||
-          (typeof gitStatusEvidence.raw_payload === 'string' && computeSha256(gitStatusEvidence.raw_payload) !== gitStatusEvidence.hash)
-        ) {
-          throw new Error('ADJUDICATION_LINKAGE_MISMATCH: git status evidence authority or payload hash mismatch');
-        }
-      } else if (gitStatusEvidence) {
-        throw new Error('ADJUDICATION_LINKAGE_MISMATCH: git status evidence provided when adjudication has no git_status_evidence_id');
-      }
-
-      if (adjudication.git_diff_evidence_id) {
-        if (!linkedDiffEv || adjudication.git_diff_evidence_id !== linkedDiffEv.id) {
-          throw new Error(`ADJUDICATION_LINKAGE_MISMATCH: git diff evidence ID mismatch (${adjudication.git_diff_evidence_id} vs ${linkedDiffEv?.id ?? 'null'})`);
-        }
-        if (
-          linkedDiffEv.project_id !== project.id ||
-          linkedDiffEv.task_id !== task.id ||
-          linkedDiffEv.evidence_type !== 'GIT_DIFF' ||
-          (typeof linkedDiffEv.raw_payload === 'string' && computeSha256(linkedDiffEv.raw_payload) !== linkedDiffEv.hash)
-        ) {
-          throw new Error('ADJUDICATION_LINKAGE_MISMATCH: git diff evidence authority or payload hash mismatch');
-        }
-      } else if (linkedDiffEv) {
-        throw new Error('ADJUDICATION_LINKAGE_MISMATCH: git diff evidence provided when adjudication has no git_diff_evidence_id');
-      }
-
-      // Parse untrusted claim fields strictly; fail closed on malformed JSON or extra/missing keys
-      let rawClaim: Record<string, unknown>;
-      try {
-        const parsed = JSON.parse(submission.claim_content_json);
-        if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) {
-          throw new Error('claim_content_json must be a non-null plain object');
-        }
-        const claimKeys = Object.keys(parsed).sort();
-        const expectedKeys = [...CLAIM_CONTENT_KEYS].sort();
-        if (claimKeys.length !== expectedKeys.length || claimKeys.some((k, i) => k !== expectedKeys[i])) {
-          throw new Error(`claim_content_json own-property set mismatch: ${claimKeys.join(',')}`);
-        }
-        rawClaim = parsed;
-      } catch (err) {
-        throw new Error(
-          `ADJUDICATION_LINKAGE_MISMATCH: Malformed claim JSON in submission: ${err instanceof Error ? err.message : String(err)}`
-        );
-      }
-
-      const completedClaimed: string[] = Array.isArray(rawClaim.completed) ? (rawClaim.completed as string[]) : [];
-      const filesClaimed: string[] = Array.isArray(rawClaim.files_claimed_changed) ? (rawClaim.files_claimed_changed as string[]) : [];
-      const testsClaimed: string[] = Array.isArray(rawClaim.tests_claimed) ? (rawClaim.tests_claimed as string[]) : [];
-      const blockersClaimed: string[] = Array.isArray(rawClaim.blockers) ? (rawClaim.blockers as string[]) : [];
-
-      const activeTestRun = linkedTestRun;
-      const activeDiffEv = linkedDiffEv;
-
-      const testEvidenceText = activeTestRun
-        ? `
-- **Test Run ID**: \`${activeTestRun.id}\`
-- **Command Snapshot SHA-256**: \`${adjudication.verification_commands_hash || 'None'}\`
-- **Command**: \`${activeTestRun.command}\`
-- **Authoritative Verdict**: ${activeTestRun.exit_code === 0 ? '🟢 PASSED' : '🔴 FAILED'} (Exit Code: \`${activeTestRun.exit_code}\`)
-- **Metrics**: ${activeTestRun.passed_count} Passed | ${activeTestRun.failed_count} Failed | ${activeTestRun.skipped_count} Skipped
-- **Duration**: ${activeTestRun.duration_ms}ms
-- **Evidence Reference**: \`${activeTestRun.evidence_id || 'INLINE'}\`
-`
-        : '⚠️ [TEST EVIDENCE UNAVAILABLE / NOT RUN / ERROR]';
-
-      return `# REVIEW PACKAGE: ${task.id} — ${task.title}
-
-## Task Overview
-- **Project**: ${project.name} (${project.id})
-- **Task ID**: \`${task.id}\`
-- **Priority**: \`${task.priority}\` | **Risk**: \`${task.risk}\`
-- **Current Revision**: ${task.revision_count} / ${task.max_revisions}
-- **Base SHA**: \`${task.base_sha || 'HEAD'}\`
-- **Working SHA**: \`${task.current_sha || 'UNCOMMITTED / UNKNOWN'}\`
-
-### Acceptance Criteria
-${criteriaList}
-
----
-
-## Authoritative Verification Evidence (Ground Truth)
-
-### Owner Adjudication
-- **Adjudication ID**: \`${adjudication.id}\`
-- **Action**: \`${adjudication.action}\`
-- **Actor Boundary**: \`OWNER_LOCAL_UI\`
-- **Status**: \`${adjudication.status}\`
-- **Lifecycle Version**: ${adjudication.lifecycle_version}
-- **Authority Snapshot SHA-256**: \`${adjudication.authority_snapshot_hash}\`
-- **Created At**: \`${adjudication.created_at}\`
-- **Verification Started At**: \`${adjudication.verification_started_at || 'None'}\`
-- **Completed At**: \`${adjudication.completed_at || 'None'}\`
-- **Recovery Classification**: ${adjudication.recovery_fenced_at ? 'RECOVERY_FENCED' : 'NORMAL'}
-
-### Authoritative Test Evidence
-${testEvidenceText}
-
-### Git Status Evidence
-- **Evidence ID**: \`${gitStatusEvidence?.id || 'None'}\`
-- **SHA-256 Checksum**: \`${gitStatusEvidence?.hash || 'None'}\`
-- **Storage Type**: \`${gitStatusEvidence?.storage_type || 'None'}\`
-
-### Git Diff Evidence
-- **Evidence ID**: \`${activeDiffEv?.id || 'None'}\`
-- **SHA-256 Checksum**: \`${activeDiffEv?.hash || 'None'}\`
-- **Byte Size**: \`${activeDiffEv?.byte_size ?? 0} bytes\`
-- **Storage Type**: \`${activeDiffEv?.storage_type || 'None'}\`
-- **Statistics**: \`${gitDiffStat || 'No Git diff statistics available.'}\`
-
-\`\`\`diff
-${formattedDiff}
-\`\`\`
-
----
-
-### Coder Claims (Unverified)
-*(Non-Authoritative — Untrusted Coder Claim)*
-- **Submission ID**: \`${submission.id}\`
-- **Quarantine Status**: \`${submission.quarantine_status}\`
-- **Canonical Envelope SHA-256**: \`${submission.canonical_envelope_hash}\`
-- **Claim Content SHA-256**: \`${submission.claim_content_hash}\`
-- **Submitted At**: \`${submission.submitted_at}\`
-- **Status Claimed**: \`${submission.claimed_status}\`
-- **Summary**: ${submission.summary || 'No summary provided.'}
-- **Completed Items**:
-${completedClaimed.length > 0 ? completedClaimed.map((c) => `  - ${c}`).join('\n') : '  - None'}
-- **Files Claimed Changed**:
-${filesClaimed.length > 0 ? filesClaimed.map((f) => `  - \`${f}\``).join('\n') : '  - None'}
-- **Tests Claimed**:
-${testsClaimed.length > 0 ? testsClaimed.map((t) => `  - ${t}`).join('\n') : '  - None'}
-- **Blockers**:
-${blockersClaimed.length > 0 ? blockersClaimed.map((b) => `  - ${b}`).join('\n') : '  - None'}
-
----
-
-## Previous Review History
-${issuesText}
-
----
-
-## Required Response Protocol (\`manager.v1\`)
-Evaluate the authoritative evidence above against the acceptance criteria and return your verdict in the following JSON format:
-
-\`\`\`json
-{
-  "protocol": "manager.v1",
-  "message_id": "msg-mgr-${task.id}-${Date.now()}",
-  "project_id": "${project.id}",
-  "task_id": "${task.id}",
-  "decision": "PASS | FIX_REQUIRED | BLOCK | NEEDS_OWNER",
-  "priority": "${task.priority}",
-  "risk": "${task.risk}",
-  "instructions": [
-    "Specific feedback or next instructions"
-  ],
-  "acceptance_criteria": [
-    "Remaining criteria if fix required"
-  ],
-  "review_issues": [
-    {
-      "severity": "BLOCKER | REQUIRED | OPTIONAL | NIT",
-      "title": "Issue title",
-      "file_path": "src/file.ts",
-      "description": "Specific issue description"
-    }
-  ],
-  "expected_task_state": "REVIEWING",
-  "expected_revision": ${task.revision_count}
-}
-\`\`\`
-`;
     }
 
     const coderClaimsText = coderReport

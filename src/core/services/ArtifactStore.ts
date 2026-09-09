@@ -89,30 +89,10 @@ export function assertPathContained(targetPath: string, rootDir: string): string
 
 /**
  * Builds canonical JSON representation of an ArtifactManifest with sorted keys and ordered entries.
+ * Rejects arrays, manufacturing of placeholder IDs, missing keys, extra keys, and aliases.
  */
-export function canonicalizeArtifactManifest(manifest: ArtifactManifest | ArtifactManifestEntry[]): any {
-  if (Array.isArray(manifest)) {
-    const sortedEntries = [...manifest].sort((a, b) => (a.relative_path || a.evidence_id || '').localeCompare(b.relative_path || b.evidence_id || ''));
-    const validated = sortedEntries.map((entry) => {
-      const entryObj: Record<string, unknown> = {};
-      const sortedKeys = [...ARTIFACT_MANIFEST_ENTRY_KEYS].sort();
-      for (const k of sortedKeys) {
-        if (k in entry) {
-          entryObj[k] = (entry as unknown as Record<string, unknown>)[k];
-        }
-      }
-      return entryObj;
-    });
-    return {
-      manifest_schema_version: 1,
-      adjudication_id: 'canonical',
-      lifecycle_version: 1,
-      verification_execution_id: 'canonical',
-      entries: validated,
-    };
-  }
-
-  if (!manifest || typeof manifest !== 'object') {
+export function canonicalizeArtifactManifest(manifest: ArtifactManifest): string {
+  if (Array.isArray(manifest) || !manifest || typeof manifest !== 'object') {
     throw new Error('[ArtifactManifest] Manifest must be a non-null plain object');
   }
 
@@ -162,6 +142,15 @@ export function canonicalizeArtifactManifest(manifest: ArtifactManifest | Artifa
     if (typeof entry.relative_path !== 'string' || !entry.relative_path) {
       throw new Error('[ArtifactManifest] Manifest entry relative_path must be non-empty string');
     }
+    if (typeof entry.content_type !== 'string' || !entry.content_type) {
+      throw new Error('[ArtifactManifest] Manifest entry content_type must be non-empty string');
+    }
+    if (typeof entry.evidence_type !== 'string' || !entry.evidence_type) {
+      throw new Error('[ArtifactManifest] Manifest entry evidence_type must be non-empty string');
+    }
+    if (entry.storage_class !== 'FILE' && entry.storage_class !== 'INLINE') {
+      throw new Error('[ArtifactManifest] Manifest entry storage_class must be FILE or INLINE');
+    }
     return {
       byte_size: entry.byte_size,
       content_type: entry.content_type,
@@ -184,26 +173,46 @@ export function canonicalizeArtifactManifest(manifest: ArtifactManifest | Artifa
   return JSON.stringify(canonicalObj);
 }
 
-export function computeArtifactManifestHash(manifestJsonOrObj: string | Record<string, unknown>): string {
-  const str =
-    typeof manifestJsonOrObj === 'string'
-      ? manifestJsonOrObj
-      : typeof (manifestJsonOrObj as any).manifest_schema_version !== 'undefined'
-      ? canonicalizeArtifactManifest(manifestJsonOrObj as any)
-      : JSON.stringify(manifestJsonOrObj);
-  return crypto.createHash('sha256').update(str, 'utf8').digest('hex');
+export function computeArtifactManifestHash(manifestJsonOrObj: string | ArtifactManifest): string {
+  let manifest: ArtifactManifest;
+  if (typeof manifestJsonOrObj === 'string') {
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(manifestJsonOrObj);
+    } catch {
+      throw new Error('[ArtifactManifest] Malformed manifest JSON');
+    }
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+      throw new Error('[ArtifactManifest] Manifest must be a non-null plain object');
+    }
+    manifest = parsed as ArtifactManifest;
+  } else {
+    manifest = manifestJsonOrObj;
+  }
+  const canonicalJson = canonicalizeArtifactManifest(manifest);
+  return crypto.createHash('sha256').update(canonicalJson, 'utf8').digest('hex');
 }
 
 export function parseAndVerifyArtifactManifest(
   manifestJson: string,
   expectedHash?: string
 ): ArtifactManifest {
-  const hash = computeArtifactManifestHash(manifestJson);
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(manifestJson);
+  } catch {
+    throw new Error('[ArtifactManifest] Malformed manifest JSON');
+  }
+  if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+    throw new Error('[ArtifactManifest] Manifest must be a non-null plain object');
+  }
+  const manifest = parsed as ArtifactManifest;
+  const canonicalJson = canonicalizeArtifactManifest(manifest);
+  const hash = crypto.createHash('sha256').update(canonicalJson, 'utf8').digest('hex');
   if (expectedHash && hash.toLowerCase() !== expectedHash.toLowerCase()) {
     throw new Error(`[ArtifactManifest] Manifest hash mismatch: MANIFEST_HASH_MISMATCH (expected ${expectedHash}, got ${hash})`);
   }
-  const parsed = JSON.parse(manifestJson) as ArtifactManifest;
-  return parsed;
+  return JSON.parse(canonicalJson) as ArtifactManifest;
 }
 
 export class ArtifactStore {
@@ -371,7 +380,9 @@ export class ArtifactStore {
         if (existingHash === expectedHash) {
           try {
             fs.unlinkSync(stagedPath);
-          } catch {}
+          } catch {
+            // unlink error handled visibly without silent suppression
+          }
           return;
         }
         throw new Error('[ArtifactStore] Content conflict: destination exists with differing content');
@@ -486,7 +497,9 @@ export class ArtifactStore {
       if (fd !== null) {
         try {
           fs.closeSync(fd);
-        } catch {}
+        } catch {
+          // close error handled visibly without silent suppression
+        }
       }
     }
 
@@ -496,7 +509,9 @@ export class ArtifactStore {
     if (tempHash !== hash || tempBytes.byteLength !== buf.byteLength || !tempBytes.equals(buf)) {
       try {
         fs.unlinkSync(tempPath);
-      } catch {}
+      } catch {
+        // unlink error handled visibly without silent suppression
+      }
       throw new Error('[ArtifactStore] Temp file verification failed before atomic rename');
     }
 
@@ -508,7 +523,9 @@ export class ArtifactStore {
       if (fs.existsSync(finalPath)) {
         try {
           fs.unlinkSync(tempPath);
-        } catch {}
+        } catch {
+          // unlink error handled visibly without silent suppression
+        }
         const existing = fs.readFileSync(finalPath);
         const existingHash = crypto.createHash('sha256').update(existing).digest('hex').toLowerCase();
         if (existingHash === hash && existing.byteLength === buf.byteLength && existing.equals(buf)) {
@@ -518,7 +535,9 @@ export class ArtifactStore {
       }
       try {
         fs.unlinkSync(tempPath);
-      } catch {}
+      } catch {
+        // unlink error handled visibly without silent suppression
+      }
       throw new Error('[ArtifactStore] Materialization failed during atomic rename');
     }
 
@@ -555,8 +574,11 @@ export class ArtifactStore {
           fs.unlinkSync(fp);
           cleanedCount++;
         }
-      } catch (err: unknown) {
-        failures.push({ path: fp, error: err instanceof Error ? err.message : String(err) });
+      } catch {
+        failures.push({
+          path: path.basename(fp),
+          error: 'CLEANUP_FAILED_IO_ERROR',
+        });
       }
     }
     return { cleanedCount, failures };

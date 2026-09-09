@@ -51,7 +51,106 @@ import {
   CLAIM_CONTENT_KEYS,
   CANONICAL_ENVELOPE_KEYS,
 } from '../../mcp/submissionProtocol';
-import { computePayloadHash } from './ExecutionAuthorizationService';
+import { computePayloadHash, CanonicalExecutionPayload } from './ExecutionAuthorizationService';
+
+export const CANONICAL_EXECUTION_PAYLOAD_EXACT_KEYS = [
+  'acceptanceCriteria',
+  'attemptId',
+  'constraints',
+  'contextFiles',
+  'instructions',
+  'managerMessageId',
+  'managerPayloadHash',
+  'projectId',
+  'taskDescription',
+  'taskId',
+  'taskTitle',
+  'verificationCommands',
+] as const;
+
+export function validateAndHashCanonicalExecutionPayload(rawJson: string): {
+  valid: boolean;
+  computedHash: string;
+  parsed: Record<string, unknown> | null;
+  error?: string;
+} {
+  if (!rawJson || typeof rawJson !== 'string' || rawJson.trim() === '') {
+    return { valid: false, computedHash: '', parsed: null, error: 'Empty or missing canonical_payload_json' };
+  }
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(rawJson);
+  } catch {
+    return { valid: false, computedHash: '', parsed: null, error: 'Malformed JSON in canonical_payload_json' };
+  }
+  if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed) || Object.getPrototypeOf(parsed) !== Object.prototype) {
+    return { valid: false, computedHash: '', parsed: null, error: 'canonical_payload_json must be a strict plain object' };
+  }
+  const obj = parsed as Record<string, unknown>;
+  const keys = Object.keys(obj).sort();
+  const expectedKeys = [...CANONICAL_EXECUTION_PAYLOAD_EXACT_KEYS].sort();
+  if (keys.length !== expectedKeys.length || keys.some((k, i) => k !== expectedKeys[i])) {
+    return { valid: false, computedHash: '', parsed: null, error: 'canonical_payload_json has invalid property set (missing or extra keys)' };
+  }
+
+  // Reject snake_case aliases or empty values
+  if (typeof obj.projectId !== 'string' || !obj.projectId.trim()) {
+    return { valid: false, computedHash: '', parsed: null, error: 'projectId must be non-empty string' };
+  }
+  if (typeof obj.taskId !== 'string' || !obj.taskId.trim()) {
+    return { valid: false, computedHash: '', parsed: null, error: 'taskId must be non-empty string' };
+  }
+  if (obj.attemptId !== null && (typeof obj.attemptId !== 'string' || !obj.attemptId.trim())) {
+    return { valid: false, computedHash: '', parsed: null, error: 'attemptId must be string or null' };
+  }
+  if (typeof obj.taskTitle !== 'string') {
+    return { valid: false, computedHash: '', parsed: null, error: 'taskTitle must be string' };
+  }
+  if (obj.taskDescription !== null && typeof obj.taskDescription !== 'string') {
+    return { valid: false, computedHash: '', parsed: null, error: 'taskDescription must be string or null' };
+  }
+  if (!Array.isArray(obj.acceptanceCriteria) || !obj.acceptanceCriteria.every((c) => typeof c === 'string')) {
+    return { valid: false, computedHash: '', parsed: null, error: 'acceptanceCriteria must be string array' };
+  }
+  if (!Array.isArray(obj.constraints) || !obj.constraints.every((c) => typeof c === 'string')) {
+    return { valid: false, computedHash: '', parsed: null, error: 'constraints must be string array' };
+  }
+  if (!Array.isArray(obj.instructions) || !obj.instructions.every((c) => typeof c === 'string')) {
+    return { valid: false, computedHash: '', parsed: null, error: 'instructions must be string array' };
+  }
+  if (!Array.isArray(obj.contextFiles) || !obj.contextFiles.every((c) => typeof c === 'string')) {
+    return { valid: false, computedHash: '', parsed: null, error: 'contextFiles must be string array' };
+  }
+  if (typeof obj.managerMessageId !== 'string' || !obj.managerMessageId.trim()) {
+    return { valid: false, computedHash: '', parsed: null, error: 'managerMessageId must be non-empty string' };
+  }
+  if (typeof obj.managerPayloadHash !== 'string' || !/^[0-9a-f]{64}$/i.test(obj.managerPayloadHash)) {
+    return { valid: false, computedHash: '', parsed: null, error: 'managerPayloadHash must be 64-char hex' };
+  }
+  if (!obj.verificationCommands || typeof obj.verificationCommands !== 'object' || Array.isArray(obj.verificationCommands)) {
+    return { valid: false, computedHash: '', parsed: null, error: 'verificationCommands must be non-null object' };
+  }
+
+  const vCmds = obj.verificationCommands as Record<string, unknown>;
+  const vTest = vCmds.TEST;
+  if (!vTest || typeof vTest !== 'object' || Array.isArray(vTest)) {
+    return { valid: false, computedHash: '', parsed: null, error: 'verificationCommands.TEST must be non-null object' };
+  }
+  const testObj = vTest as Record<string, unknown>;
+  if (typeof testObj.executable !== 'string' || !testObj.executable.trim()) {
+    return { valid: false, computedHash: '', parsed: null, error: 'verificationCommands.TEST executable must be non-empty string' };
+  }
+  if (!Array.isArray(testObj.args) || !testObj.args.every((a) => typeof a === 'string')) {
+    return { valid: false, computedHash: '', parsed: null, error: 'verificationCommands.TEST args must be string array' };
+  }
+  const tMs = testObj.timeout_ms;
+  if (typeof tMs !== 'number' || !Number.isInteger(tMs) || tMs <= 0 || tMs > 600000) {
+    return { valid: false, computedHash: '', parsed: null, error: 'verificationCommands.TEST timeout_ms must be a positive integer <= 600000' };
+  }
+
+  const computedHash = computePayloadHash(obj as unknown as CanonicalExecutionPayload);
+  return { valid: true, computedHash, parsed: obj };
+}
 
 export function scrubAdjudicationDiagnostics(text: string): string {
   if (!text || typeof text !== 'string') return '';
@@ -757,25 +856,18 @@ export class CoderSubmissionAdjudicationService {
         'Execution authorization missing or lacks canonical_payload_json'
       );
     }
-    if (auth.instruction_payload_hash) {
-      let matches = false;
-      try {
-        const parsed = JSON.parse(auth.canonical_payload_json);
-        if (
-          computePayloadHash(parsed) === auth.instruction_payload_hash ||
-          computeSha256(auth.canonical_payload_json) === auth.instruction_payload_hash
-        ) {
-          matches = true;
-        }
-      } catch {
-        // ignore parse error
-      }
-      if (!matches) {
-        throw new CoderSubmissionAdjudicationError(
-          'INTEGRITY_CONFLICT',
-          'Execution authorization canonical payload hash mismatch (INSTRUCTION_PAYLOAD_HASH_MISMATCH)'
-        );
-      }
+    const payloadValidation = validateAndHashCanonicalExecutionPayload(auth.canonical_payload_json);
+    if (!payloadValidation.valid) {
+      throw new CoderSubmissionAdjudicationError(
+        'COMMAND_SNAPSHOT_INVALID',
+        `Execution authorization canonical payload invalid: ${payloadValidation.error}`
+      );
+    }
+    if (auth.instruction_payload_hash && payloadValidation.computedHash !== auth.instruction_payload_hash) {
+      throw new CoderSubmissionAdjudicationError(
+        'INTEGRITY_CONFLICT',
+        'Execution authorization canonical payload hash mismatch (INSTRUCTION_PAYLOAD_HASH_MISMATCH)'
+      );
     }
     if (auth.status !== 'DISPATCHED') {
       throw new CoderSubmissionAdjudicationError('PRECONDITION_FENCED', `Execution authorization must be in DISPATCHED status (got ${auth.status})`);
@@ -1923,15 +2015,11 @@ export class CoderSubmissionAdjudicationService {
           });
         } else {
           // RECOVERY_FENCED Path:
-          try {
-            const trans = TaskStateMachine.transition(currentTask.state, 'TESTS_FAILED', {
-              revisionCount: currentTask.revision_count,
-              maxRevisions: currentTask.max_revisions,
-            });
-            this.repo.updateTaskState(currentTask.id, trans.nextState, null, trans.incrementRevision);
-          } catch (transErr: unknown) {
-            console.debug(`[Adjudication] State machine TESTS_FAILED transition skipped during fencing: ${transErr instanceof Error ? transErr.message : String(transErr)}`);
-          }
+          const trans = TaskStateMachine.transition(currentTask.state, 'TESTS_FAILED', {
+            revisionCount: currentTask.revision_count,
+            maxRevisions: currentTask.max_revisions,
+          });
+          this.repo.updateTaskState(currentTask.id, trans.nextState, null, trans.incrementRevision);
 
           const updated = this.repo.updateCoderSubmissionAdjudication(adjudicationId, 2, {
             status: 'RECOVERY_FENCED',
@@ -2725,7 +2813,9 @@ export class CoderSubmissionAdjudicationService {
           if (resource.provider_id !== auth.selected_provider_id) {
             fenced_reasons.push('Provider resource provider_id does not match selected_provider_id');
           }
-          if (resource.provider_account_id && auth.selected_account_id && resource.provider_account_id !== auth.selected_account_id) {
+          if (!resource.provider_account_id) {
+            fenced_reasons.push('Provider resource missing provider_account_id');
+          } else if (auth.selected_account_id && resource.provider_account_id !== auth.selected_account_id) {
             fenced_reasons.push('Provider resource provider_account_id does not match selected_account_id');
           }
         }
@@ -2740,23 +2830,127 @@ export class CoderSubmissionAdjudicationService {
           fenced_reasons.push(`Routing decision event "${auth.routing_decision_id}" not found`);
         } else {
           const rPayload = routingEvent.structured_payload as Record<string, unknown>;
-          if (rPayload.projectId && rPayload.projectId !== sub.project_id) {
-            fenced_reasons.push('Routing decision projectId does not match submission');
-          }
-          if (rPayload.taskId && rPayload.taskId !== sub.task_id) {
-            fenced_reasons.push('Routing decision taskId does not match submission');
-          }
-          if (rPayload.selectedProviderId && rPayload.selectedProviderId !== auth.selected_provider_id) {
-            fenced_reasons.push('Routing decision selectedProviderId does not match authorization');
-          }
-          if (rPayload.selectedAccountId && auth.selected_account_id && rPayload.selectedAccountId !== auth.selected_account_id) {
-            fenced_reasons.push('Routing decision selectedAccountId does not match authorization');
-          }
-          if (rPayload.selectedResourceId && rPayload.selectedResourceId !== auth.selected_resource_id) {
-            fenced_reasons.push('Routing decision selectedResourceId does not match authorization');
-          }
-          if (rPayload.selectedAssignmentId && assignment && rPayload.selectedAssignmentId !== assignment.id) {
-            fenced_reasons.push('Routing decision selectedAssignmentId does not match assignment');
+          if (!rPayload || typeof rPayload !== 'object' || Array.isArray(rPayload)) {
+            fenced_reasons.push('Routing decision payload must be a non-null plain object');
+          } else {
+            // Prohibit snake_case aliases
+            const prohibitedAliases = [
+              'selected_provider_id',
+              'selected_account_id',
+              'selected_resource_id',
+              'selected_assignment_id',
+              'project_id',
+              'task_id',
+              'attempt_id',
+              'decision_id',
+            ];
+            for (const alias of prohibitedAliases) {
+              if (alias in rPayload) {
+                fenced_reasons.push(`Routing payload contains non-canonical alias field "${alias}"`);
+              }
+            }
+
+            if (routingEvent.type === 'ROLE_AWARE_ROUTING_DECISION') {
+              const allowedKeys = new Set([
+                'decisionId',
+                'projectId',
+                'taskId',
+                'attemptId',
+                'roleProfileId',
+                'role',
+                'outcome',
+                'routePolicyId',
+                'failoverPolicyAuthoritySnapshot',
+                'selectedProviderId',
+                'selectedAccountId',
+                'selectedResourceId',
+                'selectedAssignmentId',
+                'requestedConstraints',
+                'appliedExclusions',
+                'appliedSeparation',
+                'reason',
+              ]);
+              for (const key of Object.keys(rPayload)) {
+                if (!allowedKeys.has(key)) {
+                  fenced_reasons.push(`Routing payload contains unauthorized additional field "${key}"`);
+                }
+              }
+              if (typeof rPayload.decisionId !== 'string' || rPayload.decisionId !== auth.routing_decision_id) {
+                fenced_reasons.push('Routing decision decisionId does not match authorization');
+              }
+              if (typeof rPayload.projectId !== 'string' || rPayload.projectId !== sub.project_id) {
+                fenced_reasons.push('Routing decision projectId does not match submission');
+              }
+              if (typeof rPayload.taskId !== 'string' || rPayload.taskId !== sub.task_id) {
+                fenced_reasons.push('Routing decision taskId does not match submission');
+              }
+              if (typeof rPayload.attemptId !== 'string' || rPayload.attemptId !== auth.attempt_id) {
+                fenced_reasons.push('Routing decision attemptId does not match authorization');
+              }
+              if (typeof rPayload.selectedProviderId !== 'string' || rPayload.selectedProviderId !== auth.selected_provider_id) {
+                fenced_reasons.push('Routing decision selectedProviderId does not match authorization');
+              }
+              if (typeof rPayload.selectedAccountId !== 'string' || rPayload.selectedAccountId !== auth.selected_account_id) {
+                fenced_reasons.push('Routing decision selectedAccountId does not match authorization');
+              }
+              if (typeof rPayload.selectedResourceId !== 'string' || rPayload.selectedResourceId !== auth.selected_resource_id) {
+                fenced_reasons.push('Routing decision selectedResourceId does not match authorization');
+              }
+              if (assignment && (typeof rPayload.selectedAssignmentId !== 'string' || rPayload.selectedAssignmentId !== assignment.id)) {
+                fenced_reasons.push('Routing decision selectedAssignmentId does not match assignment');
+              }
+              if (rPayload.appliedExclusions !== undefined && !Array.isArray(rPayload.appliedExclusions)) {
+                fenced_reasons.push('Routing decision appliedExclusions must be an array');
+              }
+              if (rPayload.appliedSeparation !== undefined && rPayload.appliedSeparation !== null && (typeof rPayload.appliedSeparation !== 'object' || Array.isArray(rPayload.appliedSeparation))) {
+                fenced_reasons.push('Routing decision appliedSeparation must be a plain object or null');
+              }
+              if (rPayload.requestedConstraints !== undefined && (typeof rPayload.requestedConstraints !== 'object' || rPayload.requestedConstraints === null)) {
+                fenced_reasons.push('Routing decision requestedConstraints must be an object or array');
+              }
+            } else {
+              const allowedKeys = new Set([
+                'decisionId',
+                'projectId',
+                'taskId',
+                'attemptId',
+                'candidateResourceIds',
+                'selectedResourceId',
+                'selectedProviderId',
+                'outcome',
+                'reason',
+                'candidateEvaluations',
+              ]);
+              for (const key of Object.keys(rPayload)) {
+                if (!allowedKeys.has(key)) {
+                  fenced_reasons.push(`Routing payload contains unauthorized additional field "${key}"`);
+                }
+              }
+              if (typeof rPayload.decisionId !== 'string' || rPayload.decisionId !== auth.routing_decision_id) {
+                fenced_reasons.push('Routing decision decisionId does not match authorization');
+              }
+              if (typeof rPayload.projectId !== 'string' || rPayload.projectId !== sub.project_id) {
+                fenced_reasons.push('Routing decision projectId does not match submission');
+              }
+              if (typeof rPayload.taskId !== 'string' || rPayload.taskId !== sub.task_id) {
+                fenced_reasons.push('Routing decision taskId does not match submission');
+              }
+              if (typeof rPayload.attemptId !== 'string' || rPayload.attemptId !== auth.attempt_id) {
+                fenced_reasons.push('Routing decision attemptId does not match authorization');
+              }
+              if (typeof rPayload.selectedProviderId !== 'string' || rPayload.selectedProviderId !== auth.selected_provider_id) {
+                fenced_reasons.push('Routing decision selectedProviderId does not match authorization');
+              }
+              if (typeof rPayload.selectedResourceId !== 'string' || rPayload.selectedResourceId !== auth.selected_resource_id) {
+                fenced_reasons.push('Routing decision selectedResourceId does not match authorization');
+              }
+              if (rPayload.candidateResourceIds !== undefined && !Array.isArray(rPayload.candidateResourceIds)) {
+                fenced_reasons.push('Routing decision candidateResourceIds must be an array');
+              }
+              if (rPayload.candidateEvaluations !== undefined && !Array.isArray(rPayload.candidateEvaluations)) {
+                fenced_reasons.push('Routing decision candidateEvaluations must be an array');
+              }
+            }
           }
         }
       }
@@ -2764,45 +2958,10 @@ export class CoderSubmissionAdjudicationService {
       if (!auth.canonical_payload_json) {
         fenced_reasons.push('Execution authorization missing canonical_payload_json');
       } else {
-        let matches = false;
-        try {
-          const parsed = JSON.parse(auth.canonical_payload_json);
-          if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) {
-            fenced_reasons.push('Execution authorization canonical payload must be a plain object');
-          } else {
-            if (
-              auth.instruction_payload_hash &&
-              (computePayloadHash(parsed) === auth.instruction_payload_hash ||
-                computeSha256(auth.canonical_payload_json) === auth.instruction_payload_hash)
-            ) {
-              matches = true;
-            }
-            // Strict check on verificationCommands inside authorization
-            const frozenCmds = parsed.verificationCommands;
-            if (!frozenCmds || typeof frozenCmds !== 'object' || Array.isArray(frozenCmds)) {
-              fenced_reasons.push('Execution authorization missing frozen verification commands (verificationCommands object)');
-            } else {
-              const testCmd = frozenCmds.TEST;
-              if (!testCmd || typeof testCmd !== 'object' || Array.isArray(testCmd)) {
-                fenced_reasons.push('Execution authorization missing verificationCommands TEST object');
-              } else {
-                if (typeof testCmd.executable !== 'string' || !testCmd.executable.trim()) {
-                  fenced_reasons.push('Execution authorization verificationCommands TEST executable must be non-empty string');
-                }
-                if (!Array.isArray(testCmd.args)) {
-                  fenced_reasons.push('Execution authorization verificationCommands TEST args must be an array');
-                }
-                const rawTimeout = testCmd.timeout_ms;
-                if (typeof rawTimeout !== 'number' || !Number.isInteger(rawTimeout) || rawTimeout <= 0 || rawTimeout > 600000) {
-                  fenced_reasons.push('Execution authorization verificationCommands TEST timeout_ms must be a positive integer <= 600000');
-                }
-              }
-            }
-          }
-        } catch {
-          fenced_reasons.push('Execution authorization canonical payload is malformed JSON');
-        }
-        if (auth.instruction_payload_hash && !matches) {
+        const payloadValidation = validateAndHashCanonicalExecutionPayload(auth.canonical_payload_json);
+        if (!payloadValidation.valid) {
+          fenced_reasons.push(`Execution authorization canonical payload invalid: ${payloadValidation.error}`);
+        } else if (auth.instruction_payload_hash && payloadValidation.computedHash !== auth.instruction_payload_hash) {
           fenced_reasons.push(
             'Execution authorization canonical payload hash mismatch (INSTRUCTION_PAYLOAD_HASH_MISMATCH)'
           );
@@ -2811,7 +2970,9 @@ export class CoderSubmissionAdjudicationService {
 
       // Worker Slot & Active Account Lease validation if assigned
       const slotId = assignment?.selected_worker_slot_id;
-      if (slotId) {
+      if (!slotId) {
+        fenced_reasons.push('Assignment missing selected_worker_slot_id');
+      } else {
         const slot = this.repo.getWorkerSlot(slotId);
         if (!slot) {
           fenced_reasons.push(`Worker slot "${slotId}" not found`);
@@ -3032,8 +3193,15 @@ export class CoderSubmissionAdjudicationService {
     if (!auth.manager_message_id || typeof auth.manager_message_id !== 'string') {
       throw new CoderSubmissionAdjudicationError('PRECONDITION_FENCED', 'Authorization missing manager_message_id');
     }
-    if (!auth.canonical_payload_json) {
+    if (!auth.canonical_payload_json || typeof auth.canonical_payload_json !== 'string') {
       throw new CoderSubmissionAdjudicationError('PRECONDITION_FENCED', 'Authorization missing canonical_payload_json');
+    }
+    const payloadValidation = validateAndHashCanonicalExecutionPayload(auth.canonical_payload_json);
+    if (!payloadValidation.valid) {
+      throw new CoderSubmissionAdjudicationError(
+        'COMMAND_SNAPSHOT_INVALID',
+        `Execution authorization canonical payload invalid: ${payloadValidation.error}`
+      );
     }
 
     const snapshot: CanonicalAuthoritySnapshot = {
@@ -3042,7 +3210,7 @@ export class CoderSubmissionAdjudicationService {
       attempt_id: attempt.id,
       attempt_number: attempt.attempt_number,
       attempt_status: attempt.status,
-      authorization_canonical_payload_hash: computeSha256(auth.canonical_payload_json),
+      authorization_canonical_payload_hash: payloadValidation.computedHash,
       authorization_id: auth.id,
       authorization_lifecycle_version: auth.lifecycle_version,
       authorization_status: auth.status,
