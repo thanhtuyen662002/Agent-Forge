@@ -209,8 +209,13 @@ export function parseAndVerifyArtifactManifest(
   const manifest = parsed as ArtifactManifest;
   const canonicalJson = canonicalizeArtifactManifest(manifest);
   const hash = crypto.createHash('sha256').update(canonicalJson, 'utf8').digest('hex');
-  if (expectedHash && hash.toLowerCase() !== expectedHash.toLowerCase()) {
-    throw new Error(`[ArtifactManifest] Manifest hash mismatch: MANIFEST_HASH_MISMATCH (expected ${expectedHash}, got ${hash})`);
+  if (expectedHash !== undefined) {
+    if (typeof expectedHash !== 'string' || !/^[0-9a-f]{64}$/.test(expectedHash)) {
+      throw new Error('[ArtifactManifest] Expected manifest hash must be a 64-char lowercase hex string');
+    }
+    if (hash !== expectedHash) {
+      throw new Error(`[ArtifactManifest] Manifest hash mismatch: MANIFEST_HASH_MISMATCH (expected ${expectedHash}, got ${hash})`);
+    }
   }
   return JSON.parse(canonicalJson) as ArtifactManifest;
 }

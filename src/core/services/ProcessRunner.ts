@@ -68,6 +68,15 @@ export function sanitizeStdinError(err: unknown): string {
   return 'STDIN_WRITE_FAILED: STREAM_ERROR';
 }
 
+export interface PersistenceFencedEntry {
+  executionId: string;
+  status: 'PERSISTENCE_FENCED';
+  error: string;
+  durableError: Error;
+  result: ProcessRunResult;
+  timestamp: string;
+}
+
 export class ProcessRunner {
   private static activeProcesses = new Map<
     string,
@@ -83,10 +92,52 @@ export class ProcessRunner {
       ) => Promise<ProcessRunResult>;
     }
   >();
+  private static persistenceFencedEntries = new Map<string, PersistenceFencedEntry>();
   private static terminationPromises = new Map<number, Promise<ProcessTerminationTruth>>();
 
   public static readonly DEFAULT_MAX_OUTPUT_BYTES = 8 * 1024 * 1024; // 8 MiB default
   public static readonly MAX_ALLOWED_OUTPUT_BYTES = 32 * 1024 * 1024; // 32 MiB hard cap
+
+  public static getPersistenceFencedEntries(): PersistenceFencedEntry[] {
+    return Array.from(this.persistenceFencedEntries.values());
+  }
+
+  public static getPersistenceFencedEntry(executionId: string): PersistenceFencedEntry | undefined {
+    return this.persistenceFencedEntries.get(executionId);
+  }
+
+  public static retryPersistenceFenced(executionId: string, repo: Repository): boolean {
+    const entry = this.persistenceFencedEntries.get(executionId);
+    if (!entry) return false;
+    try {
+      repo.updateProcessRun(
+        executionId,
+        entry.result.cancelled ? 'CANCELLED' : entry.result.timedOut ? 'TIMED_OUT' : entry.result.exitCode === 0 ? 'COMPLETED' : 'FAILED',
+        entry.result.exitCode,
+        new Date().toISOString(),
+        entry.result.stdoutEvidenceId ?? null,
+        entry.result.stderrEvidenceId ?? null
+      );
+      this.persistenceFencedEntries.delete(executionId);
+      this.activeProcesses.delete(executionId);
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  public static acknowledgePersistenceFenced(executionId: string, reason?: string): boolean {
+    void reason;
+    this.activeProcesses.delete(executionId);
+    return this.persistenceFencedEntries.delete(executionId);
+  }
+
+  public static clearPersistenceFencedForTestTeardown(): void {
+    for (const id of this.persistenceFencedEntries.keys()) {
+      this.activeProcesses.delete(id);
+    }
+    this.persistenceFencedEntries.clear();
+  }
 
   private static validateCustomEnv(
     customEnv?: Record<string, string>,
@@ -720,6 +771,7 @@ export class ProcessRunner {
           }
 
           let durableUpdateError: Error | null = null;
+          let terminalResult: ProcessRunResult | null = null;
           if (options.repo) {
             try {
               options.repo.updateProcessRun(
@@ -736,13 +788,7 @@ export class ProcessRunner {
             }
           }
 
-          ProcessRunner.activeProcesses.delete(executionId);
-
-          if (durableUpdateError) {
-            throw durableUpdateError;
-          }
-
-          return {
+          terminalResult = {
             executionId,
             pid: child.pid ?? null,
             command: ProcessRunner.scrubSecrets(commandStr),
@@ -760,6 +806,24 @@ export class ProcessRunner {
             processStart: startTruth,
             processTermination: termTruth,
           };
+
+          try {
+            if (durableUpdateError) {
+              ProcessRunner.persistenceFencedEntries.set(executionId, {
+                executionId,
+                status: 'PERSISTENCE_FENCED',
+                error: durableUpdateError.message,
+                durableError: durableUpdateError,
+                result: terminalResult,
+                timestamp: endIso,
+              });
+              throw durableUpdateError;
+            }
+
+            return terminalResult;
+          } finally {
+            ProcessRunner.activeProcesses.delete(executionId);
+          }
         })();
 
         settlementPromise.then(resolve, reject);
@@ -776,7 +840,7 @@ export class ProcessRunner {
       this.activeProcesses.set(executionId, procEntry);
 
       const timer = setTimeout(() => {
-        void settleOnce('TIMEOUT');
+        settleOnce('TIMEOUT').catch((err) => reject(err));
       }, timeoutMs);
 
       const handleStdinFailure = (err: unknown) => {
@@ -785,10 +849,10 @@ export class ProcessRunner {
         stdinErrorMessage = sanitizeStdinError(err);
         try {
           child.stdin?.destroy();
-        } catch (destroyErr: unknown) {
-          void destroyErr;
+        } catch {
+          // Ignore destroy error
         }
-        void settleOnce('STDIN_FAILURE');
+        settleOnce('STDIN_FAILURE').catch((err) => reject(err));
       };
 
       if (options.stdin !== undefined && child.stdin) {
@@ -828,7 +892,7 @@ export class ProcessRunner {
               stdoutAcc += chunkBuf.subarray(0, remaining).toString('utf8');
               stdoutByteCount += remaining;
             }
-            void settleOnce('OUTPUT_LIMIT');
+            settleOnce('OUTPUT_LIMIT').catch((err) => reject(err));
             return;
           }
 
@@ -849,7 +913,7 @@ export class ProcessRunner {
               stderrAcc += chunkBuf.subarray(0, remaining).toString('utf8');
               stderrByteCount += remaining;
             }
-            void settleOnce('OUTPUT_LIMIT');
+            settleOnce('OUTPUT_LIMIT').catch((err) => reject(err));
             return;
           }
 
@@ -859,11 +923,11 @@ export class ProcessRunner {
       }
 
       child.on('error', (err) => {
-        void settleOnce('ERROR', null, err);
+        settleOnce('ERROR', null, err).catch((err2) => reject(err2));
       });
 
       child.on('close', (code) => {
-        void settleOnce('CLOSE', code);
+        settleOnce('CLOSE', code).catch((err) => reject(err));
       });
     });
   }
@@ -874,10 +938,10 @@ export class ProcessRunner {
       entry.isCancelled = true;
       try {
         entry.process.kill('SIGTERM');
-      } catch (killErr: unknown) {
-        void killErr;
+      } catch {
+        // Process might already be dead
       }
-      void entry.settle('CANCEL');
+      entry.settle('CANCEL').catch(() => {});
       return true;
     }
     return false;
@@ -899,10 +963,10 @@ export class ProcessRunner {
       try {
         entry.process.kill('SIGTERM');
         count++;
-      } catch (killErr: unknown) {
-        void killErr;
+      } catch {
+        // Process might already be dead
       }
-      void entry.settle('CANCEL');
+      entry.settle('CANCEL').catch(() => {});
     }
     return count;
   }
