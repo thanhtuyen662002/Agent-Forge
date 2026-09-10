@@ -25,6 +25,8 @@ import {
   evaluateCanonicalSettlementDecision,
   validateAndParseCanonicalResultEnvelope,
   CanonicalSettlementDecision,
+  isCanonicalUtcIso,
+  scrubAdjudicationDiagnostics,
 } from './CoderSubmissionAdjudicationService';
 import { verifyEvidenceIntegrity, parseAndVerifyArtifactManifest } from './ArtifactStore';
 
@@ -201,7 +203,7 @@ export class CoderSubmissionAdjudicationRecoveryScanner {
             adj.verification_result_envelope_hash
           );
           if (!parseRes.valid || !parseRes.envelope) {
-            contradiction = parseRes.error || 'Verification result envelope validation failed';
+            contradiction = scrubAdjudicationDiagnostics(parseRes.error || 'Verification result envelope validation failed');
           } else {
             parsedEnvelope = parseRes.envelope;
           }
@@ -210,7 +212,7 @@ export class CoderSubmissionAdjudicationRecoveryScanner {
 
       // Check manifest if present or required
       let parsedManifest: ArtifactManifest | null = null;
-      if (!contradiction && (adj.artifact_manifest_json || adj.status === 'VERIFIED')) {
+      if (!contradiction && (adj.artifact_manifest_json || adj.status === 'VERIFIED' || adj.status === 'VERIFICATION_FAILED')) {
         if (!adj.artifact_manifest_json || !adj.artifact_manifest_hash) {
           contradiction = `${adj.status} adjudication missing artifact manifest or hash`;
         } else {
@@ -220,7 +222,7 @@ export class CoderSubmissionAdjudicationRecoveryScanner {
               adj.artifact_manifest_hash
             );
           } catch (mErr: unknown) {
-            contradiction = `Artifact manifest validation failed: ${mErr instanceof Error ? mErr.message : String(mErr)}`;
+            contradiction = `Artifact manifest validation failed: ${scrubAdjudicationDiagnostics(mErr instanceof Error ? mErr.message : String(mErr))}`;
           }
         }
       }
@@ -284,15 +286,15 @@ export class CoderSubmissionAdjudicationRecoveryScanner {
           const disps = this.repo.getCoderSubmissionDispositions(adj.submission_id);
           const terminalDisps = disps.filter((d) => d.disposition_event === 'SETTLED' || d.disposition_event === 'REJECTED');
           if (terminalDisps.length !== 1 || terminalDisps[0].disposition_event !== 'SETTLED' || terminalDisps[0].disposition_reason !== 'ACCEPTED_VERIFIED') {
-            contradiction = 'VERIFIED adjudication missing exact SETTLED terminal disposition or has ambiguous dispositions';
+            contradiction = 'VERIFIED adjudication missing exact SETTLED terminal disposition or has contradictory dispositions';
           }
         }
 
         if (!contradiction) {
           const events = this.repo.getCoderSubmissionAdjudicationEvents(adj.id);
-          const hasSucceededEvent = events.some((e) => e.event_type === 'VERIFICATION_SUCCEEDED');
-          if (!hasSucceededEvent) {
-            contradiction = 'VERIFIED adjudication missing VERIFICATION_SUCCEEDED settlement event';
+          const terminalEvents = events.filter((e) => e.event_type === 'VERIFICATION_SUCCEEDED' || e.event_type === 'VERIFICATION_FAILED' || e.event_type === 'RECOVERY_FENCED');
+          if (terminalEvents.length !== 1 || terminalEvents[0].event_type !== 'VERIFICATION_SUCCEEDED') {
+            contradiction = 'VERIFIED adjudication missing exact VERIFICATION_SUCCEEDED settlement event or has contradictory events';
           }
         }
 
@@ -305,17 +307,24 @@ export class CoderSubmissionAdjudicationRecoveryScanner {
       }
 
       if (!contradiction && adj.status === 'VERIFICATION_FAILED') {
-        const disps = this.repo.getCoderSubmissionDispositions(adj.submission_id);
-        const settledDisp = disps.find((d) => d.disposition_event === 'SETTLED');
-        if (settledDisp) {
-          contradiction = 'VERIFICATION_FAILED adjudication has contradictory SETTLED disposition';
+        if (task && task.state === 'VALIDATING') {
+          contradiction = `VERIFICATION_FAILED adjudication has contradictory live task state: ${task.state}`;
+        }
+
+        if (!contradiction) {
+          const disps = this.repo.getCoderSubmissionDispositions(adj.submission_id);
+          const settledDisp = disps.find((d) => d.disposition_event === 'SETTLED');
+          if (settledDisp) {
+            contradiction = 'VERIFICATION_FAILED adjudication has contradictory SETTLED disposition';
+          }
         }
 
         if (!contradiction) {
           const events = this.repo.getCoderSubmissionAdjudicationEvents(adj.id);
           const hasFailedEvent = events.some((e) => e.event_type === 'VERIFICATION_FAILED');
-          if (!hasFailedEvent) {
-            contradiction = 'VERIFICATION_FAILED adjudication missing VERIFICATION_FAILED settlement event';
+          const hasSucceededEvent = events.some((e) => e.event_type === 'VERIFICATION_SUCCEEDED');
+          if (!hasFailedEvent || hasSucceededEvent) {
+            contradiction = 'VERIFICATION_FAILED adjudication missing VERIFICATION_FAILED settlement event or has contradictory events';
           }
         }
 
@@ -328,20 +337,85 @@ export class CoderSubmissionAdjudicationRecoveryScanner {
       }
 
       if (!contradiction && adj.status === 'RECOVERY_FENCED') {
-        if (!adj.failure_code || !adj.recovery_fenced_at) {
-          contradiction = 'RECOVERY_FENCED adjudication missing failure_code or recovery_fenced_at';
-        }
-        if (!contradiction) {
-          const disps = this.repo.getCoderSubmissionDispositions(adj.submission_id);
-          const settledDisp = disps.find((d) => d.disposition_event === 'SETTLED');
-          if (settledDisp) {
-            contradiction = 'RECOVERY_FENCED adjudication has contradictory SETTLED disposition';
+        const isResultBearing = !!adj.verification_result_envelope_json;
+        if (isResultBearing) {
+          if (!adj.failure_code || !adj.recovery_fenced_at || !isCanonicalUtcIso(adj.recovery_fenced_at)) {
+            contradiction = 'Result-bearing RECOVERY_FENCED missing valid failure_code or canonical recovery_fenced_at';
           }
-        }
-        if (!contradiction && adj.workspace_lease_id) {
-          const l = this.repo.getWorkspaceLease(adj.workspace_lease_id);
-          if (l && l.state !== 'FENCED' && l.state !== 'RELEASED') {
-            contradiction = `RECOVERY_FENCED adjudication has un-fenced workspace lease: ${l.state}`;
+          if (!contradiction && task && task.state === 'VALIDATING') {
+            contradiction = `RECOVERY_FENCED adjudication has contradictory live task state: ${task.state}`;
+          }
+          if (!contradiction) {
+            const disps = this.repo.getCoderSubmissionDispositions(adj.submission_id);
+            const settledDisp = disps.find((d) => d.disposition_event === 'SETTLED');
+            if (settledDisp) {
+              contradiction = 'Result-bearing RECOVERY_FENCED has contradictory SETTLED disposition';
+            }
+          }
+          if (!contradiction) {
+            const events = this.repo.getCoderSubmissionAdjudicationEvents(adj.id);
+            const hasSucceededEvent = events.some((e) => e.event_type === 'VERIFICATION_SUCCEEDED');
+            if (hasSucceededEvent) {
+              contradiction = 'Result-bearing RECOVERY_FENCED has contradictory VERIFICATION_SUCCEEDED event';
+            }
+          }
+          if (!contradiction && adj.workspace_lease_id) {
+            const l = this.repo.getWorkspaceLease(adj.workspace_lease_id);
+            if (l && l.state !== 'FENCED' && l.state !== 'RELEASED') {
+              contradiction = `RECOVERY_FENCED adjudication has un-fenced workspace lease: ${l.state}`;
+            }
+          }
+        } else {
+          // Pre-result RECOVERY_FENCED exact validator
+          const hasAbsenceViolations =
+            adj.verification_result_envelope_json !== null ||
+            adj.verification_result_envelope_hash !== null ||
+            adj.artifact_manifest_json !== null ||
+            adj.artifact_manifest_hash !== null ||
+            adj.test_run_id !== null;
+          if (hasAbsenceViolations) {
+            contradiction = 'Pre-result RECOVERY_FENCED violates exact absence group (envelope, manifest, test_run_id must be null)';
+          }
+
+          if (!contradiction) {
+            const hasPresenceViolations =
+              typeof adj.failure_code !== 'string' ||
+              !adj.failure_code.trim() ||
+              typeof adj.recovery_fenced_at !== 'string' ||
+              !isCanonicalUtcIso(adj.recovery_fenced_at) ||
+              typeof adj.lifecycle_version !== 'number' ||
+              adj.lifecycle_version < 3;
+            if (hasPresenceViolations) {
+              contradiction = 'Pre-result RECOVERY_FENCED violates exact presence group (failure_code, canonical recovery_fenced_at, lifecycle_version >= 3 required)';
+            }
+          }
+
+          if (!contradiction && task && task.state === 'VALIDATING') {
+            contradiction = `Pre-result RECOVERY_FENCED has contradictory live task state: ${task.state}`;
+          }
+
+          if (!contradiction && adj.workspace_lease_id) {
+            const l = this.repo.getWorkspaceLease(adj.workspace_lease_id);
+            if (l && l.state !== 'FENCED' && l.state !== 'RELEASED') {
+              contradiction = `Pre-result RECOVERY_FENCED has non-fenced workspace lease: ${l.state}`;
+            }
+          }
+
+          if (!contradiction) {
+            const disps = this.repo.getCoderSubmissionDispositions(adj.submission_id);
+            const settledDisp = disps.find((d) => d.disposition_event === 'SETTLED');
+            if (settledDisp) {
+              contradiction = 'Pre-result RECOVERY_FENCED has contradictory SETTLED disposition';
+            }
+          }
+
+          if (!contradiction) {
+            const events = this.repo.getCoderSubmissionAdjudicationEvents(adj.id);
+            const hasSucceededEvent = events.some((e) => e.event_type === 'VERIFICATION_SUCCEEDED');
+            const hasFailedEvent = events.some((e) => e.event_type === 'VERIFICATION_FAILED');
+            if (hasSucceededEvent || hasFailedEvent) {
+              contradiction = 'Pre-result RECOVERY_FENCED has contradictory settlement events';
+            }
           }
         }
       }
@@ -360,7 +434,7 @@ export class CoderSubmissionAdjudicationRecoveryScanner {
           submission_id: adj.submission_id,
           classification: 'AUTHORITY_CONFLICT',
           action_taken: 'NO_OP',
-          error: contradiction,
+          error: scrubAdjudicationDiagnostics(contradiction),
         };
       }
 
@@ -635,7 +709,7 @@ export class CoderSubmissionAdjudicationRecoveryScanner {
           this.fenceAdjudication(
             adj,
             'INTEGRITY_MISMATCH',
-            `Manifest validation failed: ${manErr instanceof Error ? manErr.message : String(manErr)}`,
+            `Manifest validation failed: ${scrubAdjudicationDiagnostics(manErr instanceof Error ? manErr.message : String(manErr))}`,
             nowIso,
             true
           );
@@ -644,7 +718,7 @@ export class CoderSubmissionAdjudicationRecoveryScanner {
             submission_id: adj.submission_id,
             classification: 'AUTHORITY_CONFLICT',
             action_taken: 'FENCED_CONFLICT',
-            error: 'Manifest validation failed',
+            error: scrubAdjudicationDiagnostics('Manifest validation failed'),
           };
         }
 
@@ -668,7 +742,7 @@ export class CoderSubmissionAdjudicationRecoveryScanner {
           this.fenceAdjudication(
             adj,
             decision.failureCode || 'INTEGRITY_MISMATCH',
-            decision.failureDetail || decision.contradictionReason || 'Canonical settlement evaluation failed',
+            scrubAdjudicationDiagnostics(decision.failureDetail || decision.contradictionReason || 'Canonical settlement evaluation failed'),
             nowIso,
             true
           );
@@ -677,7 +751,7 @@ export class CoderSubmissionAdjudicationRecoveryScanner {
             submission_id: adj.submission_id,
             classification: 'AUTHORITY_CONFLICT',
             action_taken: 'FENCED_CONFLICT',
-            error: decision.contradictionReason || decision.failureDetail || 'Canonical settlement evaluation failed',
+            error: scrubAdjudicationDiagnostics(decision.contradictionReason || decision.failureDetail || 'Canonical settlement evaluation failed'),
           };
         }
 
@@ -706,7 +780,7 @@ export class CoderSubmissionAdjudicationRecoveryScanner {
             submission_id: adj.submission_id,
             classification: 'AUTHORITY_CONFLICT',
             action_taken: 'NO_OP',
-            error: 'Settlement reconciliation CAS or transition failed',
+            error: scrubAdjudicationDiagnostics('Settlement reconciliation CAS or transition failed'),
           };
         }
       }
@@ -721,7 +795,7 @@ export class CoderSubmissionAdjudicationRecoveryScanner {
         this.fenceAdjudication(
           adj,
           'INTEGRITY_MISMATCH',
-          `VERIFYING adjudication has incomplete or invalid recovery evidence: ${settlementError}`,
+          `VERIFYING adjudication has incomplete or invalid recovery evidence: ${scrubAdjudicationDiagnostics(settlementError)}`,
           nowIso,
           true
         );
@@ -730,7 +804,7 @@ export class CoderSubmissionAdjudicationRecoveryScanner {
           submission_id: adj.submission_id,
           classification: 'AUTHORITY_CONFLICT',
           action_taken: 'FENCED_CONFLICT',
-          error: settlementError,
+          error: scrubAdjudicationDiagnostics(settlementError),
         };
       }
 

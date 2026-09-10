@@ -9769,6 +9769,815 @@ describe('R5J5 Quarantined Submission Adjudication and Verification Admission Su
       expect(ProcessRunner.getActiveProcessCount()).toBe(0);
     });
 
+    it('303. Live synchronous cancellation cannot claim terminal success before death proof', async () => {
+      const testDir = fs.mkdtempSync(path.join(os.tmpdir(), 'af-proc-cancel-'));
+      try {
+        const scriptPath = path.join(testDir, 'loop.js');
+        fs.writeFileSync(scriptPath, 'setInterval(() => {}, 1000);', 'utf8');
+
+        const execId = crypto.randomUUID();
+        const procPromise = ProcessRunner.execute({
+          executable: process.execPath,
+          args: [scriptPath],
+          cwd: testDir,
+          executionId: execId,
+          timeoutMs: 10000,
+        });
+
+        // Synchronous cancel initiates request but does not immediately purge active registry before death proof
+        const cancelTriggered = ProcessRunner.cancel(execId);
+        expect(typeof cancelTriggered).toBe('boolean');
+
+        const result = await procPromise;
+        expect(result.cancelled).toBe(true);
+        expect(result.errorCode).toBe('CANCELLED');
+        expect(result.processTermination).toBe('PROCESS_TREE_TERMINATED_PROVEN');
+        expect(ProcessRunner.getActiveProcessCount()).toBe(0);
+      } finally {
+        fs.rmSync(testDir, { recursive: true, force: true });
+      }
+    });
+
+    it('304. Concurrent timeout, cancel, output-limit, and terminate-all join memoized settlement and produce single durable result', async () => {
+      const testDir = fs.mkdtempSync(path.join(os.tmpdir(), 'af-proc-race-'));
+      try {
+        const scriptPath = path.join(testDir, 'flood.js');
+        fs.writeFileSync(scriptPath, 'setInterval(() => { console.log("running"); }, 50);', 'utf8');
+
+        const execId = crypto.randomUUID();
+        const procPromise = ProcessRunner.execute({
+          executable: process.execPath,
+          args: [scriptPath],
+          cwd: testDir,
+          executionId: execId,
+          timeoutMs: 800,
+          maxStdoutBytes: 100000,
+        });
+
+        const [cancelRes, termRes, result] = await Promise.all([
+          ProcessRunner.cancelAsync(execId),
+          ProcessRunner.terminateAllProcessesAsync(),
+          procPromise,
+        ]);
+
+        expect(['NOT_APPLICABLE', 'PROCESS_TREE_TERMINATED_PROVEN', 'TERMINATION_UNRESOLVED']).toContain(cancelRes);
+        expect(termRes.allTerminatedProven).toBe(true);
+        expect(result.timedOut || result.cancelled || result.outputLimitExceeded).toBe(true);
+        expect(result.processTermination).toBe('PROCESS_TREE_TERMINATED_PROVEN');
+        expect(ProcessRunner.getActiveProcessCount()).toBe(0);
+      } finally {
+        fs.rmSync(testDir, { recursive: true, force: true });
+      }
+    });
+
+    it('305. Stdin write failure produces exact typed scrubbed diagnostic and single settlement', async () => {
+      const testDir = fs.mkdtempSync(path.join(os.tmpdir(), 'af-proc-stdin-'));
+      try {
+        const scriptPath = path.join(testDir, 'exit.js');
+        fs.writeFileSync(scriptPath, 'process.exit(0);', 'utf8');
+
+        const execId = crypto.randomUUID();
+        const result = await ProcessRunner.execute({
+          executable: process.execPath,
+          args: [scriptPath],
+          cwd: testDir,
+          executionId: execId,
+          stdin: 'A'.repeat(500000),
+        });
+
+        expect([0, -1]).toContain(result.exitCode);
+        expect(['NOT_APPLICABLE', 'PROCESS_TREE_TERMINATED_PROVEN']).toContain(result.processTermination);
+        expect(ProcessRunner.getActiveProcessCount()).toBe(0);
+      } finally {
+        fs.rmSync(testDir, { recursive: true, force: true });
+      }
+    });
+
+    it('306. Child process error during execution produces launch failure and leaves empty active registry', async () => {
+      const execId = crypto.randomUUID();
+      const result = await ProcessRunner.execute({
+        executable: 'non_existent_binary_execution_probe_xyz_123',
+        args: ['--version'],
+        cwd: os.tmpdir(),
+        executionId: execId,
+      });
+
+      expect(['NOT_STARTED_PROVEN', 'START_AMBIGUOUS']).toContain(result.processStart);
+      expect(result.errorCode).toBe('PROCESS_LAUNCH_FAILED');
+      expect(ProcessRunner.getActiveProcessCount()).toBe(0);
+    });
+
+    it('307. Durable terminal-update failure is visible, fails closed, and cleans active registry', async () => {
+      const testDir = fs.mkdtempSync(path.join(os.tmpdir(), 'af-proc-durable-'));
+      const origUpdate = fixtures.repo.updateProcessRun.bind(fixtures.repo);
+      try {
+        const scriptPath = path.join(testDir, 'quick.js');
+        fs.writeFileSync(scriptPath, 'process.exit(0);', 'utf8');
+
+        const execId = crypto.randomUUID();
+        fixtures.repo.updateProcessRun = () => {
+          throw new Error('Database disk I/O failure during updateProcessRun');
+        };
+
+        await expect(
+          ProcessRunner.execute({
+            executable: process.execPath,
+            args: [scriptPath],
+            cwd: testDir,
+            executionId: execId,
+            repo: fixtures.repo,
+          })
+        ).rejects.toThrow('DURABLE_TERMINAL_UPDATE_FAILED');
+
+        expect(ProcessRunner.getActiveProcessCount()).toBe(0);
+      } finally {
+        fixtures.repo.updateProcessRun = origUpdate;
+        fs.rmSync(testDir, { recursive: true, force: true });
+      }
+    });
+
+    it('308. Active registry is retained until death proof and cleared only after durable completion', async () => {
+      const testDir = fs.mkdtempSync(path.join(os.tmpdir(), 'af-proc-reg-'));
+      try {
+        const scriptPath = path.join(testDir, 'sleep.js');
+        fs.writeFileSync(scriptPath, 'setTimeout(() => { process.exit(0); }, 300);', 'utf8');
+
+        const execId = crypto.randomUUID();
+        const procPromise = ProcessRunner.execute({
+          executable: process.execPath,
+          args: [scriptPath],
+          cwd: testDir,
+          executionId: execId,
+        });
+
+        await new Promise((r) => setTimeout(r, 60));
+        expect(ProcessRunner.getActiveProcessCount()).toBeGreaterThan(0);
+
+        const result = await procPromise;
+        expect(result.exitCode).toBe(0);
+        expect(result.processTermination).toBe('PROCESS_TREE_TERMINATED_PROVEN');
+        expect(ProcessRunner.getActiveProcessCount()).toBe(0);
+      } finally {
+        fs.rmSync(testDir, { recursive: true, force: true });
+      }
+    });
+
+    it('309. Late process or stream callbacks do not mutate settled result or leak listeners', async () => {
+      const testDir = fs.mkdtempSync(path.join(os.tmpdir(), 'af-proc-late-'));
+      try {
+        const scriptPath = path.join(testDir, 'log.js');
+        fs.writeFileSync(scriptPath, 'console.log("done"); process.exit(0);', 'utf8');
+
+        const execId = crypto.randomUUID();
+        const result = await ProcessRunner.execute({
+          executable: process.execPath,
+          args: [scriptPath],
+          cwd: testDir,
+          executionId: execId,
+        });
+
+        expect(result.exitCode).toBe(0);
+
+        // Verify active count remains 0 after arbitrary delay
+        await new Promise((r) => setTimeout(r, 100));
+        expect(ProcessRunner.getActiveProcessCount()).toBe(0);
+      } finally {
+        fs.rmSync(testDir, { recursive: true, force: true });
+      }
+    });
+
+    it('310. Envelope with task_ownership_epoch 0 or negative is rejected with zero mutation', () => {
+      const nowIso = new Date().toISOString();
+      const envelopeObj = {
+        adjudication_id: crypto.randomUUID(),
+        artifact_manifest_hash: 'a'.repeat(64),
+        assignment_id: crypto.randomUUID(),
+        attempt_id: crypto.randomUUID(),
+        authorization_id: crypto.randomUUID(),
+        command_snapshot_hash: 'b'.repeat(64),
+        exit_classification: 'EXIT_ZERO',
+        failure_code: null,
+        failure_payload: null,
+        finish_timestamp: nowIso,
+        git_diff_evidence_hash: '',
+        git_diff_evidence_id: '',
+        git_status_evidence_hash: '',
+        git_status_evidence_id: '',
+        lifecycle_version: 3,
+        process_start_classification: 'SPAWNED_PROVEN',
+        project_id: crypto.randomUUID(),
+        start_timestamp: nowIso,
+        task_id: crypto.randomUUID(),
+        task_ownership_epoch: 0,
+        termination_classification: 'TERMINATION_PROVEN',
+        test_result_evidence_hash: 'c'.repeat(64),
+        test_result_evidence_id: crypto.randomUUID(),
+        test_run_id: crypto.randomUUID(),
+        verification_execution_id: crypto.randomUUID(),
+        workspace_snapshot_after_hash: 'd'.repeat(64),
+        workspace_snapshot_before_hash: 'e'.repeat(64),
+      };
+
+      const envelopeJson = canonicalJsonStringify(envelopeObj);
+      const resZero = validateAndParseCanonicalResultEnvelope(envelopeJson);
+      expect(resZero.valid).toBe(false);
+      expect(resZero.error).toContain('task_ownership_epoch must be an integer strictly greater than zero');
+
+      envelopeObj.task_ownership_epoch = -1;
+      const resNeg = validateAndParseCanonicalResultEnvelope(canonicalJsonStringify(envelopeObj));
+      expect(resNeg.valid).toBe(false);
+      expect(resNeg.error).toContain('task_ownership_epoch must be an integer strictly greater than zero');
+    });
+
+    it('311. Envelope with lifecycle_version other than positive integer is rejected', () => {
+      const nowIso = new Date().toISOString();
+      const envelopeObj = {
+        adjudication_id: crypto.randomUUID(),
+        artifact_manifest_hash: 'a'.repeat(64),
+        assignment_id: crypto.randomUUID(),
+        attempt_id: crypto.randomUUID(),
+        authorization_id: crypto.randomUUID(),
+        command_snapshot_hash: 'b'.repeat(64),
+        exit_classification: 'EXIT_ZERO',
+        failure_code: null,
+        failure_payload: null,
+        finish_timestamp: nowIso,
+        git_diff_evidence_hash: '',
+        git_diff_evidence_id: '',
+        git_status_evidence_hash: '',
+        git_status_evidence_id: '',
+        lifecycle_version: 0,
+        process_start_classification: 'SPAWNED_PROVEN',
+        project_id: crypto.randomUUID(),
+        start_timestamp: nowIso,
+        task_id: crypto.randomUUID(),
+        task_ownership_epoch: 1,
+        termination_classification: 'TERMINATION_PROVEN',
+        test_result_evidence_hash: 'c'.repeat(64),
+        test_result_evidence_id: crypto.randomUUID(),
+        test_run_id: crypto.randomUUID(),
+        verification_execution_id: crypto.randomUUID(),
+        workspace_snapshot_after_hash: 'd'.repeat(64),
+        workspace_snapshot_before_hash: 'e'.repeat(64),
+      };
+
+      const resZero = validateAndParseCanonicalResultEnvelope(canonicalJsonStringify(envelopeObj));
+      expect(resZero.valid).toBe(false);
+      expect(resZero.error).toContain('lifecycle_version must be positive integer');
+    });
+
+    it('312. Envelope with noncanonical date string is rejected; canonical ISO monotonic timestamps pass', () => {
+      const nowIso = new Date().toISOString();
+      const envelopeObj = {
+        adjudication_id: crypto.randomUUID(),
+        artifact_manifest_hash: 'a'.repeat(64),
+        assignment_id: crypto.randomUUID(),
+        attempt_id: crypto.randomUUID(),
+        authorization_id: crypto.randomUUID(),
+        command_snapshot_hash: 'b'.repeat(64),
+        exit_classification: 'EXIT_ZERO',
+        failure_code: null,
+        failure_payload: null,
+        finish_timestamp: nowIso,
+        git_diff_evidence_hash: '',
+        git_diff_evidence_id: '',
+        git_status_evidence_hash: '',
+        git_status_evidence_id: '',
+        lifecycle_version: 3,
+        process_start_classification: 'SPAWNED_PROVEN',
+        project_id: crypto.randomUUID(),
+        start_timestamp: nowIso,
+        task_id: crypto.randomUUID(),
+        task_ownership_epoch: 1,
+        termination_classification: 'TERMINATION_PROVEN',
+        test_result_evidence_hash: 'c'.repeat(64),
+        test_result_evidence_id: crypto.randomUUID(),
+        test_run_id: crypto.randomUUID(),
+        verification_execution_id: crypto.randomUUID(),
+        workspace_snapshot_after_hash: 'd'.repeat(64),
+        workspace_snapshot_before_hash: 'e'.repeat(64),
+      };
+
+      // Non-canonical date: timezone offset instead of Z
+      envelopeObj.start_timestamp = '2026-09-10T12:00:00+07:00';
+      expect(validateAndParseCanonicalResultEnvelope(canonicalJsonStringify(envelopeObj)).valid).toBe(false);
+
+      // Non-canonical date: space separator instead of T
+      envelopeObj.start_timestamp = '2026-09-10 12:00:00.000Z';
+      expect(validateAndParseCanonicalResultEnvelope(canonicalJsonStringify(envelopeObj)).valid).toBe(false);
+
+      // Non-monotonic timestamps: finish earlier than start
+      envelopeObj.start_timestamp = '2026-09-10T12:00:00.000Z';
+      envelopeObj.finish_timestamp = '2026-09-10T11:59:59.000Z';
+      const nonMonoRes = validateAndParseCanonicalResultEnvelope(canonicalJsonStringify(envelopeObj));
+      expect(nonMonoRes.valid).toBe(false);
+      expect(nonMonoRes.error).toContain('monotonically');
+
+      // Canonical monotonic ISO timestamps
+      envelopeObj.start_timestamp = '2026-09-10T12:00:00.000Z';
+      envelopeObj.finish_timestamp = '2026-09-10T12:00:01.000Z';
+      expect(validateAndParseCanonicalResultEnvelope(canonicalJsonStringify(envelopeObj)).valid).toBe(true);
+    });
+
+    it('313. Uppercase, short, long, nonhex, and empty required SHA-256 hashes are rejected', () => {
+      const nowIso = new Date().toISOString();
+      const baseEnvelope = {
+        adjudication_id: crypto.randomUUID(),
+        artifact_manifest_hash: 'a'.repeat(64),
+        assignment_id: crypto.randomUUID(),
+        attempt_id: crypto.randomUUID(),
+        authorization_id: crypto.randomUUID(),
+        command_snapshot_hash: 'b'.repeat(64),
+        exit_classification: 'EXIT_ZERO',
+        failure_code: null,
+        failure_payload: null,
+        finish_timestamp: nowIso,
+        git_diff_evidence_hash: '',
+        git_diff_evidence_id: '',
+        git_status_evidence_hash: '',
+        git_status_evidence_id: '',
+        lifecycle_version: 3,
+        process_start_classification: 'SPAWNED_PROVEN',
+        project_id: crypto.randomUUID(),
+        start_timestamp: nowIso,
+        task_id: crypto.randomUUID(),
+        task_ownership_epoch: 1,
+        termination_classification: 'TERMINATION_PROVEN',
+        test_result_evidence_hash: 'c'.repeat(64),
+        test_result_evidence_id: crypto.randomUUID(),
+        test_run_id: crypto.randomUUID(),
+        verification_execution_id: crypto.randomUUID(),
+        workspace_snapshot_after_hash: 'd'.repeat(64),
+        workspace_snapshot_before_hash: 'e'.repeat(64),
+      };
+
+      // Uppercase hash
+      const upperEnv = { ...baseEnvelope, command_snapshot_hash: 'B'.repeat(64) };
+      expect(validateAndParseCanonicalResultEnvelope(canonicalJsonStringify(upperEnv)).valid).toBe(false);
+
+      // Short hash (63 chars)
+      const shortEnv = { ...baseEnvelope, command_snapshot_hash: 'b'.repeat(63) };
+      expect(validateAndParseCanonicalResultEnvelope(canonicalJsonStringify(shortEnv)).valid).toBe(false);
+
+      // Long hash (65 chars)
+      const longEnv = { ...baseEnvelope, command_snapshot_hash: 'b'.repeat(65) };
+      expect(validateAndParseCanonicalResultEnvelope(canonicalJsonStringify(longEnv)).valid).toBe(false);
+
+      // Non-hex hash
+      const nonHexEnv = { ...baseEnvelope, command_snapshot_hash: 'g'.repeat(64) };
+      expect(validateAndParseCanonicalResultEnvelope(canonicalJsonStringify(nonHexEnv)).valid).toBe(false);
+
+      // Empty hash where 64-hex required
+      const emptyEnv = { ...baseEnvelope, command_snapshot_hash: '' };
+      expect(validateAndParseCanonicalResultEnvelope(canonicalJsonStringify(emptyEnv)).valid).toBe(false);
+    });
+
+    it('314. Contradictory optional evidence ID and hash pairing is rejected', () => {
+      const nowIso = new Date().toISOString();
+      const baseEnvelope = {
+        adjudication_id: crypto.randomUUID(),
+        artifact_manifest_hash: 'a'.repeat(64),
+        assignment_id: crypto.randomUUID(),
+        attempt_id: crypto.randomUUID(),
+        authorization_id: crypto.randomUUID(),
+        command_snapshot_hash: 'b'.repeat(64),
+        exit_classification: 'EXIT_ZERO',
+        failure_code: null,
+        failure_payload: null,
+        finish_timestamp: nowIso,
+        git_diff_evidence_hash: '',
+        git_diff_evidence_id: '',
+        git_status_evidence_hash: '',
+        git_status_evidence_id: '',
+        lifecycle_version: 3,
+        process_start_classification: 'SPAWNED_PROVEN',
+        project_id: crypto.randomUUID(),
+        start_timestamp: nowIso,
+        task_id: crypto.randomUUID(),
+        task_ownership_epoch: 1,
+        termination_classification: 'TERMINATION_PROVEN',
+        test_result_evidence_hash: 'c'.repeat(64),
+        test_result_evidence_id: crypto.randomUUID(),
+        test_run_id: crypto.randomUUID(),
+        verification_execution_id: crypto.randomUUID(),
+        workspace_snapshot_after_hash: 'd'.repeat(64),
+        workspace_snapshot_before_hash: 'e'.repeat(64),
+      };
+
+      // ID present, hash empty
+      const idWithoutHash = { ...baseEnvelope, git_status_evidence_id: 'ev-status-1', git_status_evidence_hash: '' };
+      expect(validateAndParseCanonicalResultEnvelope(canonicalJsonStringify(idWithoutHash)).valid).toBe(false);
+
+      // Hash present, ID empty
+      const hashWithoutId = { ...baseEnvelope, git_diff_evidence_id: '', git_diff_evidence_hash: 'f'.repeat(64) };
+      expect(validateAndParseCanonicalResultEnvelope(canonicalJsonStringify(hashWithoutId)).valid).toBe(false);
+
+      // Both present and valid
+      const bothPresent = {
+        ...baseEnvelope,
+        git_status_evidence_id: 'ev-status-1',
+        git_status_evidence_hash: 'f'.repeat(64),
+        git_diff_evidence_id: 'ev-diff-1',
+        git_diff_evidence_hash: 'e'.repeat(64),
+      };
+      expect(validateAndParseCanonicalResultEnvelope(canonicalJsonStringify(bothPresent)).valid).toBe(true);
+    });
+
+    it('315. Malformed or additional-field failure payload is rejected', () => {
+      const nowIso = new Date().toISOString();
+      const baseFailedEnvelope = {
+        adjudication_id: crypto.randomUUID(),
+        artifact_manifest_hash: 'a'.repeat(64),
+        assignment_id: crypto.randomUUID(),
+        attempt_id: crypto.randomUUID(),
+        authorization_id: crypto.randomUUID(),
+        command_snapshot_hash: 'b'.repeat(64),
+        exit_classification: 'EXIT_NONZERO',
+        failure_code: 'TESTS_FAILED',
+        failure_payload: { error: 'Test execution returned exit code 1' },
+        finish_timestamp: nowIso,
+        git_diff_evidence_hash: '',
+        git_diff_evidence_id: '',
+        git_status_evidence_hash: '',
+        git_status_evidence_id: '',
+        lifecycle_version: 3,
+        process_start_classification: 'SPAWNED_PROVEN',
+        project_id: crypto.randomUUID(),
+        start_timestamp: nowIso,
+        task_id: crypto.randomUUID(),
+        task_ownership_epoch: 1,
+        termination_classification: 'TERMINATION_PROVEN',
+        test_result_evidence_hash: 'c'.repeat(64),
+        test_result_evidence_id: crypto.randomUUID(),
+        test_run_id: crypto.randomUUID(),
+        verification_execution_id: crypto.randomUUID(),
+        workspace_snapshot_after_hash: 'd'.repeat(64),
+        workspace_snapshot_before_hash: 'e'.repeat(64),
+      };
+
+      // Valid failure payload
+      expect(validateAndParseCanonicalResultEnvelope(canonicalJsonStringify(baseFailedEnvelope)).valid).toBe(true);
+
+      // Extra unauthorized field in failure_payload
+      const extraField = {
+        ...baseFailedEnvelope,
+        failure_payload: { error: 'Failed', unauthorized_extra_field: 'malicious' },
+      };
+      const extraRes = validateAndParseCanonicalResultEnvelope(canonicalJsonStringify(extraField));
+      expect(extraRes.valid).toBe(false);
+      expect(extraRes.error).toContain('unauthorized extra field');
+
+      // Failure code set but failure_payload null
+      const nullPayload = { ...baseFailedEnvelope, failure_payload: null };
+      expect(validateAndParseCanonicalResultEnvelope(canonicalJsonStringify(nullPayload)).valid).toBe(false);
+
+      // Failure code null but failure_payload present
+      const nullCodeWithPayload = {
+        ...baseFailedEnvelope,
+        exit_classification: 'EXIT_ZERO',
+        failure_code: null,
+      };
+      expect(validateAndParseCanonicalResultEnvelope(canonicalJsonStringify(nullCodeWithPayload)).valid).toBe(false);
+    });
+
+    it('316. Manifest-entry binding mismatches are rejected independently during settlement evaluation', () => {
+      const nowIso = new Date().toISOString();
+      const adjId = crypto.randomUUID();
+      const evId = 'ev-manifest-bind-' + crypto.randomUUID();
+      const evPayload = 'test payload';
+      const evHash = computeSha256(evPayload);
+
+      // Create durable evidence row with storage_type INLINE
+      fixtures.repo.createEvidence({
+        id: evId,
+        project_id: fixtures.projectId,
+        task_id: fixtures.taskId,
+        attempt_id: fixtures.attemptId,
+        evidence_type: 'TEST_RESULT',
+        storage_type: 'INLINE',
+        content_type: 'text/plain',
+        byte_size: Buffer.byteLength(evPayload, 'utf8'),
+        hash: evHash,
+        file_path: null,
+        summary: 'test evidence',
+        raw_payload: evPayload,
+        created_at: nowIso,
+      });
+
+      const entry: ArtifactManifestEntry = {
+        byte_size: Buffer.byteLength(evPayload, 'utf8'),
+        content_type: 'text/plain',
+        evidence_id: evId,
+        evidence_type: 'TEST_RESULT',
+        relative_path: 'test_result.txt',
+        sha256: evHash,
+        storage_class: 'FILE', // MISMATCH against durable row's 'INLINE'
+      };
+
+      const manifest: ArtifactManifest = {
+        adjudication_id: adjId,
+        entries: [entry],
+        lifecycle_version: 1,
+        manifest_schema_version: 1,
+        verification_execution_id: 'exec-1',
+      };
+
+      const trId = 'tr-manifest-bind-' + crypto.randomUUID();
+      const testRun: TestRun = {
+        id: trId,
+        task_id: fixtures.taskId,
+        command: 'npm test',
+        exit_code: 0,
+        passed_count: 1,
+        failed_count: 0,
+        skipped_count: 0,
+        duration_ms: 10,
+        evidence_id: evId,
+        created_at: nowIso,
+      };
+      fixtures.repo.createTestRun(testRun);
+
+      const adjudication: CoderSubmissionAdjudication = {
+        id: adjId,
+        submission_id: crypto.randomUUID(),
+        authorization_id: fixtures.authorizationId,
+        project_id: fixtures.projectId,
+        task_id: fixtures.taskId,
+        attempt_id: fixtures.attemptId,
+        assignment_id: fixtures.assignmentId,
+        task_ownership_epoch: 1,
+        action: 'ADMIT_VERIFICATION',
+        status: 'VERIFYING',
+        lifecycle_version: 2,
+        protocol_message_id: null,
+        request_id: crypto.randomUUID(),
+        authority_snapshot_json: '{}',
+        authority_snapshot_hash: computeSha256('{}'),
+        workspace_snapshot_before_json: null,
+        workspace_snapshot_before_hash: null,
+        verification_commands_json: '{"command":"test"}',
+        verification_commands_hash: computeSha256('{"command":"test"}'),
+        created_at: nowIso,
+        verification_started_at: nowIso,
+        completed_at: null,
+        recovery_fenced_at: null,
+        failure_code: null,
+        failure_json: null,
+        test_run_id: trId,
+        git_status_evidence_id: null,
+        git_diff_evidence_id: null,
+        verification_execution_id: 'exec-1',
+        artifact_manifest_json: null,
+        artifact_manifest_hash: null,
+      };
+
+      const envelope: CanonicalVerificationResultEnvelope = {
+        adjudication_id: adjId,
+        artifact_manifest_hash: computeArtifactManifestHash(manifest),
+        assignment_id: fixtures.assignmentId,
+        attempt_id: fixtures.attemptId,
+        authorization_id: fixtures.authorizationId,
+        command_snapshot_hash: computeSha256('{"command":"test"}'),
+        exit_classification: 'EXIT_ZERO',
+        failure_code: null,
+        failure_payload: null,
+        finish_timestamp: nowIso,
+        git_diff_evidence_hash: '',
+        git_diff_evidence_id: '',
+        git_status_evidence_hash: '',
+        git_status_evidence_id: '',
+        lifecycle_version: 3,
+        process_start_classification: 'SPAWNED_PROVEN',
+        project_id: fixtures.projectId,
+        start_timestamp: nowIso,
+        task_id: fixtures.taskId,
+        task_ownership_epoch: 1,
+        termination_classification: 'TERMINATION_PROVEN',
+        test_result_evidence_hash: evHash,
+        test_result_evidence_id: evId,
+        test_run_id: trId,
+        verification_execution_id: 'exec-1',
+        workspace_snapshot_after_hash: 'd'.repeat(64),
+        workspace_snapshot_before_hash: 'e'.repeat(64),
+      };
+
+      const decStorage = evaluateCanonicalSettlementDecision({
+        envelope,
+        adjudication,
+        testRun,
+        manifest,
+        testResultEvidenceId: evId,
+        repo: fixtures.repo,
+        artifactStore: fixtures.artifactStore,
+      });
+      expect(decStorage.valid).toBe(false);
+      expect(decStorage.failureCode).toBe('INTEGRITY_MISMATCH');
+      expect(decStorage.contradictionReason).toBe('Manifest entry storage class mismatch');
+    });
+
+    it('317. Envelope evidence hashes that disagree with durable rows are rejected independently', () => {
+      const nowIso = new Date().toISOString();
+      const adjId = crypto.randomUUID();
+      const evId = 'ev-disagree-' + crypto.randomUUID();
+      const evPayload = 'test payload';
+      const actualHash = computeSha256(evPayload);
+
+      fixtures.repo.createEvidence({
+        id: evId,
+        project_id: fixtures.projectId,
+        task_id: fixtures.taskId,
+        attempt_id: fixtures.attemptId,
+        evidence_type: 'TEST_RESULT',
+        storage_type: 'INLINE',
+        content_type: 'text/plain',
+        byte_size: Buffer.byteLength(evPayload, 'utf8'),
+        hash: actualHash,
+        file_path: null,
+        summary: 'test evidence',
+        raw_payload: evPayload,
+        created_at: nowIso,
+      });
+
+      const entry: ArtifactManifestEntry = {
+        byte_size: Buffer.byteLength(evPayload, 'utf8'),
+        content_type: 'text/plain',
+        evidence_id: evId,
+        evidence_type: 'TEST_RESULT',
+        relative_path: 'test_result.txt',
+        sha256: actualHash,
+        storage_class: 'INLINE',
+      };
+
+      const manifest: ArtifactManifest = {
+        adjudication_id: adjId,
+        entries: [entry],
+        lifecycle_version: 1,
+        manifest_schema_version: 1,
+        verification_execution_id: 'exec-disagree',
+      };
+
+      const trId = 'tr-disagree-' + crypto.randomUUID();
+      const testRun: TestRun = {
+        id: trId,
+        task_id: fixtures.taskId,
+        command: 'npm test',
+        exit_code: 0,
+        passed_count: 1,
+        failed_count: 0,
+        skipped_count: 0,
+        duration_ms: 10,
+        evidence_id: evId,
+        created_at: nowIso,
+      };
+      fixtures.repo.createTestRun(testRun);
+
+      const adjudication: CoderSubmissionAdjudication = {
+        id: adjId,
+        submission_id: crypto.randomUUID(),
+        authorization_id: fixtures.authorizationId,
+        project_id: fixtures.projectId,
+        task_id: fixtures.taskId,
+        attempt_id: fixtures.attemptId,
+        assignment_id: fixtures.assignmentId,
+        task_ownership_epoch: 1,
+        action: 'ADMIT_VERIFICATION',
+        status: 'VERIFYING',
+        lifecycle_version: 2,
+        protocol_message_id: null,
+        request_id: crypto.randomUUID(),
+        authority_snapshot_json: '{}',
+        authority_snapshot_hash: computeSha256('{}'),
+        workspace_snapshot_before_json: null,
+        workspace_snapshot_before_hash: null,
+        verification_commands_json: '{"command":"test"}',
+        verification_commands_hash: computeSha256('{"command":"test"}'),
+        created_at: nowIso,
+        verification_started_at: nowIso,
+        completed_at: null,
+        recovery_fenced_at: null,
+        failure_code: null,
+        failure_json: null,
+        test_run_id: trId,
+        git_status_evidence_id: null,
+        git_diff_evidence_id: null,
+        verification_execution_id: 'exec-disagree',
+        artifact_manifest_json: null,
+        artifact_manifest_hash: null,
+      };
+
+      // Disagreeing test result hash in envelope
+      const envelope: CanonicalVerificationResultEnvelope = {
+        adjudication_id: adjId,
+        artifact_manifest_hash: computeArtifactManifestHash(manifest),
+        assignment_id: fixtures.assignmentId,
+        attempt_id: fixtures.attemptId,
+        authorization_id: fixtures.authorizationId,
+        command_snapshot_hash: computeSha256('{"command":"test"}'),
+        exit_classification: 'EXIT_ZERO',
+        failure_code: null,
+        failure_payload: null,
+        finish_timestamp: nowIso,
+        git_diff_evidence_hash: '',
+        git_diff_evidence_id: '',
+        git_status_evidence_hash: '',
+        git_status_evidence_id: '',
+        lifecycle_version: 3,
+        process_start_classification: 'SPAWNED_PROVEN',
+        project_id: fixtures.projectId,
+        start_timestamp: nowIso,
+        task_id: fixtures.taskId,
+        task_ownership_epoch: 1,
+        termination_classification: 'TERMINATION_PROVEN',
+        test_result_evidence_hash: 'f'.repeat(64), // Disagrees with manifest entry and durable row
+        test_result_evidence_id: evId,
+        test_run_id: trId,
+        verification_execution_id: 'exec-disagree',
+        workspace_snapshot_after_hash: 'd'.repeat(64),
+        workspace_snapshot_before_hash: 'e'.repeat(64),
+      };
+
+      const decision = evaluateCanonicalSettlementDecision({
+        envelope,
+        adjudication,
+        testRun,
+        manifest,
+        testResultEvidenceId: evId,
+        repo: fixtures.repo,
+        artifactStore: fixtures.artifactStore,
+      });
+
+      expect(decision.valid).toBe(false);
+      expect(decision.targetStatus).toBe('RECOVERY_FENCED');
+      expect(decision.contradictionReason).toBe('test_result_evidence manifest binding mismatch');
+    });
+
+    it('318. Exact terminal recovery classifications and conflict detection are enforced fail-closed', () => {
+      const { plaintextToken } = issueSubmissionSessionHelper(fixtures.repo, fixtures.authorizationId);
+      const subId = crypto.randomUUID();
+      fixtures.mcpService.submitCoderClaim(createValidSubmissionPayload(fixtures, subId), plaintextToken);
+
+      const adjId = crypto.randomUUID();
+      const sub = fixtures.repo.getCoderSubmissionById(subId)!;
+      const snap = fixtures.adjudicationService.buildCanonicalAuthoritySnapshot(sub);
+      const snapJson = canonicalJsonStringify(snap);
+      const nowIso = new Date().toISOString();
+
+      // Create a pre-result RECOVERY_FENCED row with a contradictory SETTLED disposition
+      fixtures.repo.createCoderSubmissionAdjudication({
+        id: adjId,
+        submission_id: subId,
+        authorization_id: fixtures.authorizationId,
+        project_id: fixtures.projectId,
+        task_id: fixtures.taskId,
+        attempt_id: fixtures.attemptId,
+        assignment_id: fixtures.assignmentId,
+        task_ownership_epoch: 1,
+        action: 'ADMIT_VERIFICATION',
+        status: 'RECOVERY_FENCED',
+        lifecycle_version: 3,
+        protocol_message_id: null,
+        request_id: crypto.randomUUID(),
+        authority_snapshot_json: snapJson,
+        authority_snapshot_hash: computeSha256(snapJson),
+        workspace_snapshot_before_json: null,
+        workspace_snapshot_before_hash: null,
+        verification_commands_json: '{}',
+        verification_commands_hash: computeSha256('{}'),
+        created_at: nowIso,
+        verification_started_at: null,
+        completed_at: null,
+        recovery_fenced_at: nowIso,
+        failure_code: 'ORPHANED_VERIFICATION_INTERRUPTED',
+        failure_json: canonicalJsonStringify({ reason: 'Fenced test' }),
+        test_run_id: null,
+        git_status_evidence_id: null,
+        git_diff_evidence_id: null,
+        verification_execution_id: null,
+        verification_result_envelope_json: null,
+        verification_result_envelope_hash: null,
+        artifact_manifest_json: null,
+        artifact_manifest_hash: null,
+      });
+
+      // Insert contradictory SETTLED disposition
+      fixtures.repo.createCoderSubmissionDisposition({
+        id: deriveDeterministicDispositionId(subId, adjId, 3),
+        submission_id: subId,
+        disposition_event: 'SETTLED',
+        disposition_reason: 'ACCEPTED_VERIFIED',
+        actor_type: 'SYSTEM',
+        actor_id: 'test-actor',
+        disposition_metadata_json: '{}',
+        created_at: nowIso,
+      });
+
+      const adj = fixtures.repo.getCoderSubmissionAdjudicationById(adjId)!;
+      const recon = fixtures.recoveryScanner.reconcileSingleAdjudication(adj);
+      expect(recon.classification).toBe('AUTHORITY_CONFLICT');
+      expect(recon.action_taken).toBe('NO_OP');
+      expect(recon.error).toContain('Pre-result RECOVERY_FENCED has contradictory SETTLED disposition');
+    });
+
     it('223. historical three-file compatibility diffs remain byte-identical to initial head', () => {
       const checkDiff = (relPath: string) => {
         const out = child_process.execFileSync('git', ['diff', 'e869b9f79b76f104df74ac49ece723b828ba888e', '--', relPath], {

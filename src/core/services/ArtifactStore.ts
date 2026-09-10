@@ -215,6 +215,28 @@ export function parseAndVerifyArtifactManifest(
   return JSON.parse(canonicalJson) as ArtifactManifest;
 }
 
+export const ALLOWED_FS_CODES = new Set([
+  'ENOENT',
+  'EACCES',
+  'EPERM',
+  'EBUSY',
+  'ENOTEMPTY',
+  'EEXIST',
+  'EMFILE',
+  'ENFILE',
+  'EISDIR',
+]);
+
+export function sanitizeFsErrorCode(err: unknown): string {
+  if (err && typeof err === 'object' && 'code' in err) {
+    const rawCode = (err as { code: unknown }).code;
+    if (typeof rawCode === 'string' && ALLOWED_FS_CODES.has(rawCode)) {
+      return rawCode;
+    }
+  }
+  return 'IO_ERROR';
+}
+
 export class ArtifactStore {
   public static assertPathContained(targetPath: string, rootDir: string): string {
     return assertPathContained(targetPath, rootDir);
@@ -594,6 +616,10 @@ export class ArtifactStore {
     return { filePath: finalPath, hash, byteSize: buf.byteLength, newlyCreated: true };
   }
 
+  public static sanitizeFsErrorCode(err: unknown): string {
+    return sanitizeFsErrorCode(err);
+  }
+
   public static cleanupRollbackFiles(
     filePaths: string[],
     isFileReferencedDurable?: (fp: string) => boolean,
@@ -618,7 +644,7 @@ export class ArtifactStore {
           cleanedCount++;
         }
       } catch (cleanErr: unknown) {
-        const code = (cleanErr as { code?: string })?.code || 'IO_ERROR';
+        const code = sanitizeFsErrorCode(cleanErr);
         failures.push({
           path: path.basename(fp),
           error: `UNLINK_FAILED_${code}`,

@@ -221,6 +221,31 @@ export function deriveDeterministicDispositionId(
   return `${hex.substring(0, 8)}-${hex.substring(8, 12)}-${hex.substring(12, 16)}-${hex.substring(16, 20)}-${hex.substring(20, 32)}`;
 }
 
+export function isCanonicalUtcIso(value: unknown): boolean {
+  if (typeof value !== 'string') return false;
+  try {
+    return new Date(value).toISOString() === value;
+  } catch (err: unknown) {
+    void err;
+    return false;
+  }
+}
+
+export function extractFailureDetailFromPayload(
+  payload: Record<string, unknown> | null,
+  defaultDetail: string
+): string {
+  if (payload && typeof payload === 'object' && !Array.isArray(payload)) {
+    if (typeof payload.error === 'string' && payload.error.trim()) {
+      return payload.error.trim();
+    }
+    if (typeof payload.reason === 'string' && payload.reason.trim()) {
+      return payload.reason.trim();
+    }
+  }
+  return defaultDetail;
+}
+
 export function validateAndParseCanonicalResultEnvelope(
   rawJson: string,
   expectedHash?: string
@@ -236,7 +261,8 @@ export function validateAndParseCanonicalResultEnvelope(
   let parsed: unknown;
   try {
     parsed = JSON.parse(rawJson);
-  } catch {
+  } catch (parseErr: unknown) {
+    void parseErr;
     return { valid: false, envelope: null, error: 'Malformed JSON in verification result envelope' };
   }
 
@@ -291,8 +317,8 @@ export function validateAndParseCanonicalResultEnvelope(
   if (typeof obj.authorization_id !== 'string' || !obj.authorization_id.trim()) {
     return { valid: false, envelope: null, error: 'authorization_id must be non-empty string' };
   }
-  if (typeof obj.task_ownership_epoch !== 'number' || !Number.isInteger(obj.task_ownership_epoch) || obj.task_ownership_epoch < 0) {
-    return { valid: false, envelope: null, error: 'task_ownership_epoch must be non-negative integer' };
+  if (typeof obj.task_ownership_epoch !== 'number' || !Number.isInteger(obj.task_ownership_epoch) || obj.task_ownership_epoch <= 0) {
+    return { valid: false, envelope: null, error: 'task_ownership_epoch must be an integer strictly greater than zero' };
   }
   if (typeof obj.lifecycle_version !== 'number' || !Number.isInteger(obj.lifecycle_version) || obj.lifecycle_version < 1) {
     return { valid: false, envelope: null, error: 'lifecycle_version must be positive integer' };
@@ -300,25 +326,25 @@ export function validateAndParseCanonicalResultEnvelope(
   if (typeof obj.verification_execution_id !== 'string' || !obj.verification_execution_id.trim()) {
     return { valid: false, envelope: null, error: 'verification_execution_id must be non-empty string' };
   }
-  if (typeof obj.command_snapshot_hash !== 'string' || !/^[0-9a-f]{64}$/i.test(obj.command_snapshot_hash)) {
-    return { valid: false, envelope: null, error: 'command_snapshot_hash must be 64-char hex string' };
+  if (typeof obj.command_snapshot_hash !== 'string' || !/^[0-9a-f]{64}$/.test(obj.command_snapshot_hash)) {
+    return { valid: false, envelope: null, error: 'command_snapshot_hash must be a 64-char lowercase hex string' };
   }
-  if (typeof obj.workspace_snapshot_before_hash !== 'string' || !obj.workspace_snapshot_before_hash.trim()) {
-    return { valid: false, envelope: null, error: 'workspace_snapshot_before_hash must be non-empty string' };
+  if (typeof obj.workspace_snapshot_before_hash !== 'string' || !/^[0-9a-f]{64}$/.test(obj.workspace_snapshot_before_hash)) {
+    return { valid: false, envelope: null, error: 'workspace_snapshot_before_hash must be a 64-char lowercase hex string' };
   }
-  if (typeof obj.workspace_snapshot_after_hash !== 'string' || !obj.workspace_snapshot_after_hash.trim()) {
-    return { valid: false, envelope: null, error: 'workspace_snapshot_after_hash must be non-empty string' };
+  if (typeof obj.workspace_snapshot_after_hash !== 'string' || !/^[0-9a-f]{64}$/.test(obj.workspace_snapshot_after_hash)) {
+    return { valid: false, envelope: null, error: 'workspace_snapshot_after_hash must be a 64-char lowercase hex string' };
   }
-  if (typeof obj.artifact_manifest_hash !== 'string' || !/^[0-9a-f]{64}$/i.test(obj.artifact_manifest_hash)) {
-    return { valid: false, envelope: null, error: 'artifact_manifest_hash must be 64-char hex string' };
+  if (typeof obj.artifact_manifest_hash !== 'string' || !/^[0-9a-f]{64}$/.test(obj.artifact_manifest_hash)) {
+    return { valid: false, envelope: null, error: 'artifact_manifest_hash must be a 64-char lowercase hex string' };
   }
-  if (typeof obj.start_timestamp !== 'string' || isNaN(Date.parse(obj.start_timestamp))) {
-    return { valid: false, envelope: null, error: 'start_timestamp must be valid ISO timestamp' };
+  if (!isCanonicalUtcIso(obj.start_timestamp)) {
+    return { valid: false, envelope: null, error: 'start_timestamp must be canonical UTC ISO-8601 string' };
   }
-  if (typeof obj.finish_timestamp !== 'string' || isNaN(Date.parse(obj.finish_timestamp))) {
-    return { valid: false, envelope: null, error: 'finish_timestamp must be valid ISO timestamp' };
+  if (!isCanonicalUtcIso(obj.finish_timestamp)) {
+    return { valid: false, envelope: null, error: 'finish_timestamp must be canonical UTC ISO-8601 string' };
   }
-  if (Date.parse(obj.finish_timestamp) < Date.parse(obj.start_timestamp)) {
+  if (Date.parse(obj.finish_timestamp as string) < Date.parse(obj.start_timestamp as string)) {
     return { valid: false, envelope: null, error: 'finish_timestamp must be monotonically >= start_timestamp' };
   }
 
@@ -337,33 +363,83 @@ export function validateAndParseCanonicalResultEnvelope(
     return { valid: false, envelope: null, error: `Invalid process_start_classification: ${obj.process_start_classification}` };
   }
 
-  if (typeof obj.git_diff_evidence_hash !== 'string') {
-    return { valid: false, envelope: null, error: 'git_diff_evidence_hash must be string' };
+  // Optional evidence ID/hash closed domain validation
+  const hasGitDiffId = typeof obj.git_diff_evidence_id === 'string' && obj.git_diff_evidence_id.trim() !== '';
+  const hasGitDiffHash = typeof obj.git_diff_evidence_hash === 'string' && obj.git_diff_evidence_hash.trim() !== '';
+  if (hasGitDiffId !== hasGitDiffHash) {
+    return { valid: false, envelope: null, error: 'git_diff_evidence_id and git_diff_evidence_hash must be both present or both empty' };
   }
-  if (typeof obj.git_diff_evidence_id !== 'string') {
-    return { valid: false, envelope: null, error: 'git_diff_evidence_id must be string' };
+  if (hasGitDiffHash && !/^[0-9a-f]{64}$/.test(obj.git_diff_evidence_hash as string)) {
+    return { valid: false, envelope: null, error: 'git_diff_evidence_hash must be a 64-char lowercase hex string when present' };
   }
-  if (typeof obj.git_status_evidence_hash !== 'string') {
-    return { valid: false, envelope: null, error: 'git_status_evidence_hash must be string' };
+  if (!hasGitDiffId && obj.git_diff_evidence_id !== '') {
+    return { valid: false, envelope: null, error: 'git_diff_evidence_id must be empty string when diff evidence is absent' };
   }
-  if (typeof obj.git_status_evidence_id !== 'string') {
-    return { valid: false, envelope: null, error: 'git_status_evidence_id must be string' };
-  }
-  if (typeof obj.test_result_evidence_hash !== 'string') {
-    return { valid: false, envelope: null, error: 'test_result_evidence_hash must be string' };
-  }
-  if (typeof obj.test_result_evidence_id !== 'string') {
-    return { valid: false, envelope: null, error: 'test_result_evidence_id must be string' };
-  }
-  if (typeof obj.test_run_id !== 'string') {
-    return { valid: false, envelope: null, error: 'test_run_id must be string' };
+  if (!hasGitDiffHash && obj.git_diff_evidence_hash !== '') {
+    return { valid: false, envelope: null, error: 'git_diff_evidence_hash must be empty string when diff evidence is absent' };
   }
 
-  if (obj.failure_code !== null && (typeof obj.failure_code !== 'string' || !obj.failure_code.trim())) {
-    return { valid: false, envelope: null, error: 'failure_code must be string or null' };
+  const hasGitStatusId = typeof obj.git_status_evidence_id === 'string' && obj.git_status_evidence_id.trim() !== '';
+  const hasGitStatusHash = typeof obj.git_status_evidence_hash === 'string' && obj.git_status_evidence_hash.trim() !== '';
+  if (hasGitStatusId !== hasGitStatusHash) {
+    return { valid: false, envelope: null, error: 'git_status_evidence_id and git_status_evidence_hash must be both present or both empty' };
   }
-  if (obj.failure_payload !== null && (typeof obj.failure_payload !== 'object' || Array.isArray(obj.failure_payload))) {
-    return { valid: false, envelope: null, error: 'failure_payload must be plain object or null' };
+  if (hasGitStatusHash && !/^[0-9a-f]{64}$/.test(obj.git_status_evidence_hash as string)) {
+    return { valid: false, envelope: null, error: 'git_status_evidence_hash must be a 64-char lowercase hex string when present' };
+  }
+  if (!hasGitStatusId && obj.git_status_evidence_id !== '') {
+    return { valid: false, envelope: null, error: 'git_status_evidence_id must be empty string when status evidence is absent' };
+  }
+  if (!hasGitStatusHash && obj.git_status_evidence_hash !== '') {
+    return { valid: false, envelope: null, error: 'git_status_evidence_hash must be empty string when status evidence is absent' };
+  }
+
+  if (typeof obj.test_result_evidence_hash !== 'string' || !/^[0-9a-f]{64}$/.test(obj.test_result_evidence_hash)) {
+    return { valid: false, envelope: null, error: 'test_result_evidence_hash must be a 64-char lowercase hex string' };
+  }
+  if (typeof obj.test_result_evidence_id !== 'string' || !obj.test_result_evidence_id.trim()) {
+    return { valid: false, envelope: null, error: 'test_result_evidence_id must be non-empty string' };
+  }
+  if (typeof obj.test_run_id !== 'string' || !obj.test_run_id.trim()) {
+    return { valid: false, envelope: null, error: 'test_run_id must be non-empty string' };
+  }
+
+  if (obj.failure_code === null) {
+    if (obj.failure_payload !== null) {
+      return { valid: false, envelope: null, error: 'failure_payload must be null when failure_code is null' };
+    }
+  } else if (typeof obj.failure_code === 'string' && obj.failure_code.trim()) {
+    if (obj.failure_payload === null || typeof obj.failure_payload !== 'object' || Array.isArray(obj.failure_payload)) {
+      return { valid: false, envelope: null, error: 'failure_payload must be non-null plain object when failure_code is set' };
+    }
+    const payload = obj.failure_payload as Record<string, unknown>;
+    const allowedPayloadKeys = new Set(['error', 'reason', 'is_fenced']);
+    const keys = Object.keys(payload);
+    if (keys.length === 0) {
+      return { valid: false, envelope: null, error: 'failure_payload must contain at least one recognized field' };
+    }
+    for (const k of keys) {
+      if (!allowedPayloadKeys.has(k)) {
+        return { valid: false, envelope: null, error: `failure_payload contains unauthorized extra field: ${k}` };
+      }
+    }
+    if ('error' in payload) {
+      if (typeof payload.error !== 'string' || !payload.error.trim() || payload.error.length > 4096) {
+        return { valid: false, envelope: null, error: 'failure_payload.error must be a bounded non-empty string' };
+      }
+    }
+    if ('reason' in payload) {
+      if (typeof payload.reason !== 'string' || !payload.reason.trim() || payload.reason.length > 4096) {
+        return { valid: false, envelope: null, error: 'failure_payload.reason must be a bounded non-empty string' };
+      }
+    }
+    if ('is_fenced' in payload) {
+      if (typeof payload.is_fenced !== 'boolean' || payload.is_fenced !== true) {
+        return { valid: false, envelope: null, error: 'failure_payload.is_fenced must be strictly boolean true' };
+      }
+    }
+  } else {
+    return { valid: false, envelope: null, error: 'failure_code must be non-empty string or null' };
   }
 
   return { valid: true, envelope: obj as unknown as CanonicalVerificationResultEnvelope };
@@ -402,7 +478,7 @@ export function evaluateCanonicalSettlementDecision(
   input: CanonicalSettlementEvaluationInput
 ): CanonicalSettlementDecision {
   const {
-    envelope,
+    envelope: rawEnvelopeInput,
     rawEnvelopeJson,
     expectedEnvelopeHash,
     adjudication,
@@ -417,10 +493,11 @@ export function evaluateCanonicalSettlementDecision(
     artifactStore,
   } = input;
 
-  // 1. Validate envelope shape, canonical JSON equality, and hash recomputation
+  let envelope = rawEnvelopeInput;
   if (rawEnvelopeJson !== undefined) {
-    const parseRes = validateAndParseCanonicalResultEnvelope(rawEnvelopeJson, expectedEnvelopeHash);
-    if (!parseRes.valid) {
+    const effectiveExpectedEnvelopeHash = expectedEnvelopeHash ?? computeSha256(rawEnvelopeJson);
+    const parseRes = validateAndParseCanonicalResultEnvelope(rawEnvelopeJson, effectiveExpectedEnvelopeHash);
+    if (!parseRes.valid || !parseRes.envelope) {
       return {
         valid: false,
         isSuccess: false,
@@ -434,6 +511,7 @@ export function evaluateCanonicalSettlementDecision(
         contradictionReason: parseRes.error || 'Envelope validation failed',
       };
     }
+    envelope = parseRes.envelope;
   }
 
   if (!envelope || typeof envelope !== 'object' || Array.isArray(envelope)) {
@@ -468,7 +546,64 @@ export function evaluateCanonicalSettlementDecision(
     };
   }
 
-  // 2. Validate binding consistency with adjudication
+  // 2. Validate artifact manifest presence, parsing, hash
+  let parsedManifest: ArtifactManifest | null = null;
+  const effectiveRawManifestJson = rawManifestJson ?? (manifest ? canonicalizeArtifactManifest(manifest) : undefined);
+  const effectiveExpectedManifestHash = expectedManifestHash ?? (effectiveRawManifestJson ? computeArtifactManifestHash(effectiveRawManifestJson) : undefined);
+
+  if (effectiveRawManifestJson && effectiveExpectedManifestHash) {
+    try {
+      parsedManifest = parseAndVerifyArtifactManifest(effectiveRawManifestJson, effectiveExpectedManifestHash);
+    } catch (mParseErr: unknown) {
+      return {
+        valid: false,
+        isSuccess: false,
+        targetStatus: 'RECOVERY_FENCED',
+        taskTransition: 'NEEDS_HUMAN',
+        eventType: 'RECOVERY_FENCED',
+        dispositionEvent: 'REJECTED',
+        dispositionReason: 'RECOVERY_FENCED',
+        failureCode: 'INTEGRITY_MISMATCH',
+        failureDetail: `Artifact manifest parsing failed: ${mParseErr instanceof Error ? mParseErr.message : String(mParseErr)}`,
+        contradictionReason: 'Artifact manifest parsing failed',
+      };
+    }
+
+    const computedManifestHash = computeArtifactManifestHash(parsedManifest);
+    if (effectiveExpectedManifestHash !== computedManifestHash || envelope.artifact_manifest_hash !== computedManifestHash) {
+      return {
+        valid: false,
+        isSuccess: false,
+        targetStatus: 'RECOVERY_FENCED',
+        taskTransition: 'NEEDS_HUMAN',
+        eventType: 'RECOVERY_FENCED',
+        dispositionEvent: 'REJECTED',
+        dispositionReason: 'RECOVERY_FENCED',
+        failureCode: 'INTEGRITY_MISMATCH',
+        failureDetail: 'Envelope artifact_manifest_hash mismatch computed manifest hash',
+        contradictionReason: 'Artifact manifest hash mismatch',
+      };
+    }
+
+    if (parsedManifest.adjudication_id !== adjudication.id) {
+      return {
+        valid: false,
+        isSuccess: false,
+        targetStatus: 'RECOVERY_FENCED',
+        taskTransition: 'NEEDS_HUMAN',
+        eventType: 'RECOVERY_FENCED',
+        dispositionEvent: 'REJECTED',
+        dispositionReason: 'RECOVERY_FENCED',
+        failureCode: 'INTEGRITY_MISMATCH',
+        failureDetail: 'Manifest adjudication_id mismatch',
+        contradictionReason: 'Manifest adjudication_id mismatch',
+      };
+    }
+  } else if (manifest) {
+    parsedManifest = manifest;
+  }
+
+  // 4. Validate binding consistency with adjudication
   if (
     envelope.adjudication_id !== adjudication.id ||
     envelope.project_id !== adjudication.project_id ||
@@ -493,7 +628,7 @@ export function evaluateCanonicalSettlementDecision(
     };
   }
 
-  // 3. Validate command snapshot & lifecycle version
+  // 5. Validate command snapshot & lifecycle version
   if (
     !envelope.command_snapshot_hash ||
     envelope.command_snapshot_hash !== adjudication.verification_commands_hash
@@ -512,7 +647,7 @@ export function evaluateCanonicalSettlementDecision(
     };
   }
 
-  // 4. Validate workspace before snapshot
+  // 6. Validate workspace before & after snapshot bindings to durable authoritative state
   if (
     adjudication.workspace_snapshot_before_hash &&
     envelope.workspace_snapshot_before_hash !== adjudication.workspace_snapshot_before_hash
@@ -526,33 +661,11 @@ export function evaluateCanonicalSettlementDecision(
       dispositionEvent: 'REJECTED',
       dispositionReason: 'RECOVERY_FENCED',
       failureCode: 'INTEGRITY_MISMATCH',
-      failureDetail: 'Envelope workspace_snapshot_before_hash mismatch adjudication',
+      failureDetail: 'Envelope workspace_snapshot_before_hash mismatch adjudication durable snapshot before hash',
       contradictionReason: 'workspace_snapshot_before_hash mismatch',
     };
   }
-
-  // 5. Validate artifact manifest presence, parsing, hash, and disk evidence
-  let parsedManifest = manifest;
-  if (rawManifestJson !== undefined) {
-    try {
-      parsedManifest = parseAndVerifyArtifactManifest(rawManifestJson, expectedManifestHash ?? envelope.artifact_manifest_hash);
-    } catch (mParseErr: unknown) {
-      return {
-        valid: false,
-        isSuccess: false,
-        targetStatus: 'RECOVERY_FENCED',
-        taskTransition: 'NEEDS_HUMAN',
-        eventType: 'RECOVERY_FENCED',
-        dispositionEvent: 'REJECTED',
-        dispositionReason: 'RECOVERY_FENCED',
-        failureCode: 'INTEGRITY_MISMATCH',
-        failureDetail: `Artifact manifest parsing failed: ${mParseErr instanceof Error ? mParseErr.message : String(mParseErr)}`,
-        contradictionReason: 'Artifact manifest parsing failed',
-      };
-    }
-  }
-
-  if (!parsedManifest) {
+  if (!envelope.workspace_snapshot_after_hash || !/^[0-9a-f]{64}$/.test(envelope.workspace_snapshot_after_hash)) {
     return {
       valid: false,
       isSuccess: false,
@@ -562,44 +675,17 @@ export function evaluateCanonicalSettlementDecision(
       dispositionEvent: 'REJECTED',
       dispositionReason: 'RECOVERY_FENCED',
       failureCode: 'INTEGRITY_MISMATCH',
-      failureDetail: 'Artifact manifest missing for settlement',
-      contradictionReason: 'Missing artifact manifest',
+      failureDetail: 'Envelope workspace_snapshot_after_hash must be a 64-char lowercase hex string',
+      contradictionReason: 'workspace_snapshot_after_hash invalid',
     };
   }
 
-  const computedManifestHash = computeArtifactManifestHash(parsedManifest);
-  if (envelope.artifact_manifest_hash !== computedManifestHash) {
-    return {
-      valid: false,
-      isSuccess: false,
-      targetStatus: 'RECOVERY_FENCED',
-      taskTransition: 'NEEDS_HUMAN',
-      eventType: 'RECOVERY_FENCED',
-      dispositionEvent: 'REJECTED',
-      dispositionReason: 'RECOVERY_FENCED',
-      failureCode: 'INTEGRITY_MISMATCH',
-      failureDetail: 'Envelope artifact_manifest_hash mismatch computed manifest hash',
-      contradictionReason: 'Artifact manifest hash mismatch',
-    };
-  }
-
-  if (parsedManifest.adjudication_id !== adjudication.id) {
-    return {
-      valid: false,
-      isSuccess: false,
-      targetStatus: 'RECOVERY_FENCED',
-      taskTransition: 'NEEDS_HUMAN',
-      eventType: 'RECOVERY_FENCED',
-      dispositionEvent: 'REJECTED',
-      dispositionReason: 'RECOVERY_FENCED',
-      failureCode: 'INTEGRITY_MISMATCH',
-      failureDetail: 'Manifest adjudication_id mismatch',
-      contradictionReason: 'Manifest adjudication_id mismatch',
-    };
-  }
-
-  if (repo) {
+  // 7. Validate every manifest entry against its durable evidence row:
+  // evidence ID, project, task, attempt, evidence type, storage type, content type, size, SHA-256, disk integrity
+  const manifestMap = new Map<string, ArtifactManifestEntry>();
+  if (parsedManifest) {
     for (const entry of parsedManifest.entries) {
+      manifestMap.set(entry.evidence_id, entry);
       if (!entry.evidence_id || !entry.sha256 || !entry.relative_path) {
         return {
           valid: false,
@@ -614,8 +700,13 @@ export function evaluateCanonicalSettlementDecision(
           contradictionReason: 'Manifest entry invalid',
         };
       }
+    }
+  }
+
+  if (repo && artifactStore && parsedManifest) {
+    for (const entry of parsedManifest.entries) {
       const ev = repo.getEvidence(entry.evidence_id);
-      if (!ev || ev.hash !== entry.sha256 || ev.byte_size !== entry.byte_size || ev.project_id !== adjudication.project_id || ev.task_id !== adjudication.task_id) {
+      if (!ev) {
         return {
           valid: false,
           isSuccess: false,
@@ -625,46 +716,242 @@ export function evaluateCanonicalSettlementDecision(
           dispositionEvent: 'REJECTED',
           dispositionReason: 'RECOVERY_FENCED',
           failureCode: 'INTEGRITY_MISMATCH',
-          failureDetail: `Manifest entry evidence ${entry.evidence_id} missing or mismatched in database`,
+          failureDetail: `Manifest entry evidence ${entry.evidence_id} missing in database`,
           contradictionReason: 'Manifest entry evidence mismatch',
         };
       }
-      if (ev.storage_type === 'FILE' && ev.file_path) {
-        if (!fs.existsSync(ev.file_path)) {
-          return {
-            valid: false,
-            isSuccess: false,
-            targetStatus: 'RECOVERY_FENCED',
-            taskTransition: 'NEEDS_HUMAN',
-            eventType: 'RECOVERY_FENCED',
-            dispositionEvent: 'REJECTED',
-            dispositionReason: 'RECOVERY_FENCED',
-            failureCode: 'INTEGRITY_MISMATCH',
-            failureDetail: `Manifest file missing on disk: ${entry.relative_path}`,
-            contradictionReason: 'Manifest file missing on disk',
-          };
-        }
-        const fileBytes = fs.readFileSync(ev.file_path);
-        const actualHash = crypto.createHash('sha256').update(fileBytes).digest('hex');
-        if (fileBytes.length !== entry.byte_size || actualHash !== entry.sha256) {
-          return {
-            valid: false,
-            isSuccess: false,
-            targetStatus: 'RECOVERY_FENCED',
-            taskTransition: 'NEEDS_HUMAN',
-            eventType: 'RECOVERY_FENCED',
-            dispositionEvent: 'REJECTED',
-            dispositionReason: 'RECOVERY_FENCED',
-            failureCode: 'INTEGRITY_MISMATCH',
-            failureDetail: `Manifest file disk size or hash mismatch: ${entry.relative_path}`,
-            contradictionReason: 'Manifest file disk integrity mismatch',
-          };
-        }
+      if (ev.project_id !== adjudication.project_id) {
+        return {
+          valid: false,
+          isSuccess: false,
+          targetStatus: 'RECOVERY_FENCED',
+          taskTransition: 'NEEDS_HUMAN',
+          eventType: 'RECOVERY_FENCED',
+          dispositionEvent: 'REJECTED',
+          dispositionReason: 'RECOVERY_FENCED',
+          failureCode: 'INTEGRITY_MISMATCH',
+          failureDetail: `Manifest entry evidence ${entry.evidence_id} project_id mismatch: expected ${adjudication.project_id}, got ${ev.project_id}`,
+          contradictionReason: 'Manifest entry evidence project mismatch',
+        };
+      }
+      if (ev.task_id !== adjudication.task_id) {
+        return {
+          valid: false,
+          isSuccess: false,
+          targetStatus: 'RECOVERY_FENCED',
+          taskTransition: 'NEEDS_HUMAN',
+          eventType: 'RECOVERY_FENCED',
+          dispositionEvent: 'REJECTED',
+          dispositionReason: 'RECOVERY_FENCED',
+          failureCode: 'INTEGRITY_MISMATCH',
+          failureDetail: `Manifest entry evidence ${entry.evidence_id} task_id mismatch: expected ${adjudication.task_id}, got ${ev.task_id}`,
+          contradictionReason: 'Manifest entry evidence task mismatch',
+        };
+      }
+      if (adjudication.attempt_id && ev.attempt_id !== adjudication.attempt_id) {
+        return {
+          valid: false,
+          isSuccess: false,
+          targetStatus: 'RECOVERY_FENCED',
+          taskTransition: 'NEEDS_HUMAN',
+          eventType: 'RECOVERY_FENCED',
+          dispositionEvent: 'REJECTED',
+          dispositionReason: 'RECOVERY_FENCED',
+          failureCode: 'INTEGRITY_MISMATCH',
+          failureDetail: `Manifest entry evidence ${entry.evidence_id} attempt_id mismatch: expected ${adjudication.attempt_id}, got ${ev.attempt_id}`,
+          contradictionReason: 'Manifest entry evidence attempt mismatch',
+        };
+      }
+      if (ev.evidence_type !== entry.evidence_type) {
+        return {
+          valid: false,
+          isSuccess: false,
+          targetStatus: 'RECOVERY_FENCED',
+          taskTransition: 'NEEDS_HUMAN',
+          eventType: 'RECOVERY_FENCED',
+          dispositionEvent: 'REJECTED',
+          dispositionReason: 'RECOVERY_FENCED',
+          failureCode: 'INTEGRITY_MISMATCH',
+          failureDetail: `Manifest entry evidence ${entry.evidence_id} evidence_type mismatch: expected ${entry.evidence_type}, got ${ev.evidence_type}`,
+          contradictionReason: 'Manifest entry evidence type mismatch',
+        };
+      }
+      if (ev.storage_type !== entry.storage_class) {
+        return {
+          valid: false,
+          isSuccess: false,
+          targetStatus: 'RECOVERY_FENCED',
+          taskTransition: 'NEEDS_HUMAN',
+          eventType: 'RECOVERY_FENCED',
+          dispositionEvent: 'REJECTED',
+          dispositionReason: 'RECOVERY_FENCED',
+          failureCode: 'INTEGRITY_MISMATCH',
+          failureDetail: `Manifest entry evidence ${entry.evidence_id} storage_class mismatch: expected ${entry.storage_class}, got ${ev.storage_type}`,
+          contradictionReason: 'Manifest entry storage class mismatch',
+        };
+      }
+      if (ev.content_type !== entry.content_type) {
+        return {
+          valid: false,
+          isSuccess: false,
+          targetStatus: 'RECOVERY_FENCED',
+          taskTransition: 'NEEDS_HUMAN',
+          eventType: 'RECOVERY_FENCED',
+          dispositionEvent: 'REJECTED',
+          dispositionReason: 'RECOVERY_FENCED',
+          failureCode: 'INTEGRITY_MISMATCH',
+          failureDetail: `Manifest entry evidence ${entry.evidence_id} content_type mismatch: expected ${entry.content_type}, got ${ev.content_type}`,
+          contradictionReason: 'Manifest entry content type mismatch',
+        };
+      }
+      if (ev.byte_size !== entry.byte_size) {
+        return {
+          valid: false,
+          isSuccess: false,
+          targetStatus: 'RECOVERY_FENCED',
+          taskTransition: 'NEEDS_HUMAN',
+          eventType: 'RECOVERY_FENCED',
+          dispositionEvent: 'REJECTED',
+          dispositionReason: 'RECOVERY_FENCED',
+          failureCode: 'INTEGRITY_MISMATCH',
+          failureDetail: `Manifest entry evidence ${entry.evidence_id} byte_size mismatch: expected ${entry.byte_size}, got ${ev.byte_size}`,
+          contradictionReason: 'Manifest entry byte size mismatch',
+        };
+      }
+      if (ev.hash !== entry.sha256) {
+        return {
+          valid: false,
+          isSuccess: false,
+          targetStatus: 'RECOVERY_FENCED',
+          taskTransition: 'NEEDS_HUMAN',
+          eventType: 'RECOVERY_FENCED',
+          dispositionEvent: 'REJECTED',
+          dispositionReason: 'RECOVERY_FENCED',
+          failureCode: 'INTEGRITY_MISMATCH',
+          failureDetail: `Manifest entry evidence ${entry.evidence_id} sha256 mismatch: expected ${entry.sha256}, got ${ev.hash}`,
+          contradictionReason: 'Manifest entry hash mismatch',
+        };
+      }
+      const integ = verifyEvidenceIntegrity(ev, artifactStore);
+      if (!integ.valid) {
+        return {
+          valid: false,
+          isSuccess: false,
+          targetStatus: 'RECOVERY_FENCED',
+          taskTransition: 'NEEDS_HUMAN',
+          eventType: 'RECOVERY_FENCED',
+          dispositionEvent: 'REJECTED',
+          dispositionReason: 'RECOVERY_FENCED',
+          failureCode: 'INTEGRITY_MISMATCH',
+          failureDetail: `Manifest entry evidence ${entry.evidence_id} disk integrity verification failed: ${integ.reason}`,
+          contradictionReason: 'Manifest entry disk integrity failed',
+        };
+      }
+    }
+
+    // 8. Bind each git/test evidence ID and hash in envelope to matching durable row and manifest entry
+    // Test result evidence binding
+    const trManifest = manifestMap.get(envelope.test_result_evidence_id);
+    if (!trManifest || trManifest.sha256 !== envelope.test_result_evidence_hash) {
+      return {
+        valid: false,
+        isSuccess: false,
+        targetStatus: 'RECOVERY_FENCED',
+        taskTransition: 'NEEDS_HUMAN',
+        eventType: 'RECOVERY_FENCED',
+        dispositionEvent: 'REJECTED',
+        dispositionReason: 'RECOVERY_FENCED',
+        failureCode: 'INTEGRITY_MISMATCH',
+        failureDetail: 'Envelope test_result_evidence_id and hash do not match manifest entry',
+        contradictionReason: 'test_result_evidence manifest binding mismatch',
+      };
+    }
+    const trRow = repo.getEvidence(envelope.test_result_evidence_id);
+    if (!trRow || trRow.hash !== envelope.test_result_evidence_hash) {
+      return {
+        valid: false,
+        isSuccess: false,
+        targetStatus: 'RECOVERY_FENCED',
+        taskTransition: 'NEEDS_HUMAN',
+        eventType: 'RECOVERY_FENCED',
+        dispositionEvent: 'REJECTED',
+        dispositionReason: 'RECOVERY_FENCED',
+        failureCode: 'INTEGRITY_MISMATCH',
+        failureDetail: 'Envelope test_result_evidence_id and hash do not match durable evidence row',
+        contradictionReason: 'test_result_evidence durable binding mismatch',
+      };
+    }
+
+    // Git status evidence binding
+    if (envelope.git_status_evidence_id) {
+      const gsManifest = manifestMap.get(envelope.git_status_evidence_id);
+      if (!gsManifest || gsManifest.sha256 !== envelope.git_status_evidence_hash) {
+        return {
+          valid: false,
+          isSuccess: false,
+          targetStatus: 'RECOVERY_FENCED',
+          taskTransition: 'NEEDS_HUMAN',
+          eventType: 'RECOVERY_FENCED',
+          dispositionEvent: 'REJECTED',
+          dispositionReason: 'RECOVERY_FENCED',
+          failureCode: 'INTEGRITY_MISMATCH',
+          failureDetail: 'Envelope git_status_evidence_id and hash do not match manifest entry',
+          contradictionReason: 'git_status_evidence manifest binding mismatch',
+        };
+      }
+      const gsRow = repo.getEvidence(envelope.git_status_evidence_id);
+      if (!gsRow || gsRow.hash !== envelope.git_status_evidence_hash) {
+        return {
+          valid: false,
+          isSuccess: false,
+          targetStatus: 'RECOVERY_FENCED',
+          taskTransition: 'NEEDS_HUMAN',
+          eventType: 'RECOVERY_FENCED',
+          dispositionEvent: 'REJECTED',
+          dispositionReason: 'RECOVERY_FENCED',
+          failureCode: 'INTEGRITY_MISMATCH',
+          failureDetail: 'Envelope git_status_evidence_id and hash do not match durable evidence row',
+          contradictionReason: 'git_status_evidence durable binding mismatch',
+        };
+      }
+    }
+
+    // Git diff evidence binding
+    if (envelope.git_diff_evidence_id) {
+      const gdManifest = manifestMap.get(envelope.git_diff_evidence_id);
+      if (!gdManifest || gdManifest.sha256 !== envelope.git_diff_evidence_hash) {
+        return {
+          valid: false,
+          isSuccess: false,
+          targetStatus: 'RECOVERY_FENCED',
+          taskTransition: 'NEEDS_HUMAN',
+          eventType: 'RECOVERY_FENCED',
+          dispositionEvent: 'REJECTED',
+          dispositionReason: 'RECOVERY_FENCED',
+          failureCode: 'INTEGRITY_MISMATCH',
+          failureDetail: 'Envelope git_diff_evidence_id and hash do not match manifest entry',
+          contradictionReason: 'git_diff_evidence manifest binding mismatch',
+        };
+      }
+      const gdRow = repo.getEvidence(envelope.git_diff_evidence_id);
+      if (!gdRow || gdRow.hash !== envelope.git_diff_evidence_hash) {
+        return {
+          valid: false,
+          isSuccess: false,
+          targetStatus: 'RECOVERY_FENCED',
+          taskTransition: 'NEEDS_HUMAN',
+          eventType: 'RECOVERY_FENCED',
+          dispositionEvent: 'REJECTED',
+          dispositionReason: 'RECOVERY_FENCED',
+          failureCode: 'INTEGRITY_MISMATCH',
+          failureDetail: 'Envelope git_diff_evidence_id and hash do not match durable evidence row',
+          contradictionReason: 'git_diff_evidence durable binding mismatch',
+        };
       }
     }
   }
 
-  // 6. Validate evidence IDs if provided
+  // Caller evidence ID consistency check (if caller explicitly passed IDs)
   if (
     gitStatusEvidenceId !== undefined &&
     (envelope.git_status_evidence_id || null) !== (gitStatusEvidenceId || null)
@@ -717,61 +1004,7 @@ export function evaluateCanonicalSettlementDecision(
     };
   }
 
-  if (repo && artifactStore) {
-    if (envelope.git_status_evidence_id) {
-      const gse = repo.getEvidence(envelope.git_status_evidence_id);
-      if (!gse || !verifyEvidenceIntegrity(gse, artifactStore).valid) {
-        return {
-          valid: false,
-          isSuccess: false,
-          targetStatus: 'RECOVERY_FENCED',
-          taskTransition: 'NEEDS_HUMAN',
-          eventType: 'RECOVERY_FENCED',
-          dispositionEvent: 'REJECTED',
-          dispositionReason: 'RECOVERY_FENCED',
-          failureCode: 'INTEGRITY_MISMATCH',
-          failureDetail: 'Git status evidence integrity failed',
-          contradictionReason: 'git_status_evidence integrity failed',
-        };
-      }
-    }
-    if (envelope.git_diff_evidence_id) {
-      const gde = repo.getEvidence(envelope.git_diff_evidence_id);
-      if (!gde || !verifyEvidenceIntegrity(gde, artifactStore).valid) {
-        return {
-          valid: false,
-          isSuccess: false,
-          targetStatus: 'RECOVERY_FENCED',
-          taskTransition: 'NEEDS_HUMAN',
-          eventType: 'RECOVERY_FENCED',
-          dispositionEvent: 'REJECTED',
-          dispositionReason: 'RECOVERY_FENCED',
-          failureCode: 'INTEGRITY_MISMATCH',
-          failureDetail: 'Git diff evidence integrity failed',
-          contradictionReason: 'git_diff_evidence integrity failed',
-        };
-      }
-    }
-    if (envelope.test_result_evidence_id) {
-      const tre = repo.getEvidence(envelope.test_result_evidence_id);
-      if (!tre || !verifyEvidenceIntegrity(tre, artifactStore).valid) {
-        return {
-          valid: false,
-          isSuccess: false,
-          targetStatus: 'RECOVERY_FENCED',
-          taskTransition: 'NEEDS_HUMAN',
-          eventType: 'RECOVERY_FENCED',
-          dispositionEvent: 'REJECTED',
-          dispositionReason: 'RECOVERY_FENCED',
-          failureCode: 'INTEGRITY_MISMATCH',
-          failureDetail: 'Test result evidence integrity failed',
-          contradictionReason: 'test_result_evidence integrity failed',
-        };
-      }
-    }
-  }
-
-  // 7. Test run consistency check (consistency check only, not standalone authority)
+  // 9. Test run consistency check
   if (testRun) {
     if (envelope.test_run_id !== testRun.id) {
       return {
@@ -831,7 +1064,7 @@ export function evaluateCanonicalSettlementDecision(
     };
   }
 
-  // 8. Internal envelope contradiction check
+  // 10. Internal envelope contradiction check
   if (envelope.exit_classification === 'EXIT_ZERO') {
     if (envelope.failure_code !== null) {
       return {
@@ -877,7 +1110,7 @@ export function evaluateCanonicalSettlementDecision(
     }
   }
 
-  // 9. Determine settlement decision
+  // 11. Determine settlement decision
   const isCleanSuccess =
     envelope.exit_classification === 'EXIT_ZERO' &&
     envelope.failure_code === null &&
@@ -921,7 +1154,7 @@ export function evaluateCanonicalSettlementDecision(
       dispositionEvent: 'REJECTED',
       dispositionReason: 'RECOVERY_FENCED',
       failureCode: envelope.failure_code || 'INTEGRITY_MISMATCH',
-      failureDetail: (envelope.failure_payload?.error as string) || envelope.failure_code || 'Process execution ambiguous',
+      failureDetail: extractFailureDetailFromPayload(envelope.failure_payload, envelope.failure_code || 'Process execution ambiguous'),
     };
   }
 
@@ -934,7 +1167,7 @@ export function evaluateCanonicalSettlementDecision(
     dispositionEvent: 'REJECTED',
     dispositionReason: 'VERIFICATION_FAILED',
     failureCode: envelope.failure_code || (envelope.exit_classification === 'TIMEOUT' ? 'VERIFICATION_TIMEOUT' : 'TESTS_FAILED'),
-    failureDetail: (envelope.failure_payload?.error as string) || `Verification failed: ${envelope.exit_classification}`,
+    failureDetail: extractFailureDetailFromPayload(envelope.failure_payload, `Verification failed: ${envelope.exit_classification}`),
   };
 }
 
@@ -2488,54 +2721,6 @@ export class CoderSubmissionAdjudicationService {
     const resultEnvelopeJson = canonicalJsonStringify(resultEnvelope);
     const resultEnvelopeHash = computeSha256(resultEnvelopeJson);
 
-    const currentAdjForDecision = this.repo.getCoderSubmissionAdjudicationById(adjudicationId);
-    if (!currentAdjForDecision) {
-      throw new Error(`Adjudication ${adjudicationId} missing prior to Phase C settlement`);
-    }
-
-    const decision = evaluateCanonicalSettlementDecision({
-      envelope: resultEnvelope,
-      adjudication: currentAdjForDecision,
-      testRun,
-      manifest: manifestObj,
-      gitStatusEvidenceId: stagedGitStatusEvidence?.id ?? null,
-      gitDiffEvidenceId: stagedGitDiffEvidence?.id ?? null,
-      testResultEvidenceId: testResultEvidence.id,
-    });
-
-    targetStatus = decision.targetStatus;
-    const isSuccess = decision.isSuccess;
-    failureCode = decision.failureCode;
-    const effectiveFailureDetail = decision.failureDetail ? scrubAdjudicationDiagnostics(decision.failureDetail) : null;
-    const eventType = decision.eventType;
-    const eventPayload = isSuccess
-      ? canonicalJsonStringify({
-          adjudication_id: adjudicationId,
-          exit_code: 0,
-          test_run_id: testRunId,
-        })
-      : canonicalJsonStringify({
-          adjudication_id: adjudicationId,
-          error: effectiveFailureDetail,
-          failure_code: failureCode || 'TESTS_FAILED',
-        });
-
-    const eventPayloadHash = computeSha256(eventPayload);
-    const finalEventId = deriveDeterministicAdjudicationEventId(
-      adjudicationId,
-      3,
-      eventType,
-      eventPayloadHash
-    );
-    const genericFinalEventId = deriveDeterministicGenericAdjudicationEventId(
-      adjudicationId,
-      3,
-      eventType,
-      eventPayloadHash
-    );
-
-    const dispositionId = deriveDeterministicDispositionId(sub.id, adjudicationId, 3);
-
     // =========================================================================
     // PHASE C: SETTLEMENT TRANSACTION (Single Atomic BEGIN IMMEDIATE)
     // =========================================================================
@@ -2620,6 +2805,55 @@ export class CoderSubmissionAdjudicationService {
 
         // Insert test run
         this.repo.createTestRun(testRun);
+
+        const decision = evaluateCanonicalSettlementDecision({
+          envelope: resultEnvelope,
+          rawEnvelopeJson: resultEnvelopeJson,
+          expectedEnvelopeHash: resultEnvelopeHash,
+          adjudication: currentAdj,
+          testRun,
+          manifest: manifestObj,
+          rawManifestJson: artifactManifestJson,
+          expectedManifestHash: artifactManifestHash,
+          gitStatusEvidenceId: stagedGitStatusEvidence?.id ?? null,
+          gitDiffEvidenceId: stagedGitDiffEvidence?.id ?? null,
+          testResultEvidenceId: testResultEvidence.id,
+          repo: this.repo,
+          artifactStore: this.artifactStore,
+        });
+
+        targetStatus = decision.targetStatus;
+        const isSuccess = decision.isSuccess;
+        failureCode = decision.failureCode;
+        const effectiveFailureDetail = decision.failureDetail ? scrubAdjudicationDiagnostics(decision.failureDetail) : null;
+        const eventType = decision.eventType;
+        const eventPayload = isSuccess
+          ? canonicalJsonStringify({
+              adjudication_id: adjudicationId,
+              exit_code: 0,
+              test_run_id: testRunId,
+            })
+          : canonicalJsonStringify({
+              adjudication_id: adjudicationId,
+              error: effectiveFailureDetail,
+              failure_code: failureCode || 'TESTS_FAILED',
+            });
+
+        const eventPayloadHash = computeSha256(eventPayload);
+        const finalEventId = deriveDeterministicAdjudicationEventId(
+          adjudicationId,
+          3,
+          eventType,
+          eventPayloadHash
+        );
+        const genericFinalEventId = deriveDeterministicGenericAdjudicationEventId(
+          adjudicationId,
+          3,
+          eventType,
+          eventPayloadHash
+        );
+
+        const dispositionId = deriveDeterministicDispositionId(sub.id, adjudicationId, 3);
 
         if (targetStatus === 'VERIFIED') {
           // Authoritative Success Path:
