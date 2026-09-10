@@ -168,7 +168,7 @@ export class ProcessRunner {
             return path.resolve(trimmed);
           }
         }
-      } catch {
+      } catch (statErr: unknown) {
         // Continue to next candidate on filesystem error
       }
     }
@@ -407,7 +407,7 @@ export class ProcessRunner {
             start_time: startIso,
           });
           options.repo.updateProcessRun(executionId, 'FAILED', -1, new Date().toISOString(), null, null);
-        } catch {
+        } catch (dbErr: unknown) {
           // Ignore collision or persistence error on rejection path
         }
       }
@@ -447,7 +447,7 @@ export class ProcessRunner {
             start_time: startIso,
           });
           options.repo.updateProcessRun(executionId, 'FAILED', -1, new Date().toISOString(), null, null);
-        } catch {
+        } catch (dbErr: unknown) {
           // Ignore collision or persistence error on rejection path
         }
       }
@@ -577,25 +577,25 @@ export class ProcessRunner {
       let startTruth: ProcessStartTruth = 'STARTED_PROVEN';
       let terminationTruth: ProcessTerminationTruth = 'NOT_APPLICABLE';
 
-      const timer = setTimeout(() => {
+      const timer = setTimeout(async () => {
         isTimedOut = true;
-        ProcessRunner.terminateProcessTree(child);
+        await ProcessRunner.terminateProcessTree(child);
       }, timeoutMs);
 
       // Safe stdin writing when provided
       if (options.stdin !== undefined && child.stdin) {
-        child.stdin.on('error', () => {
+        child.stdin.on('error', (stdinErr: unknown) => {
           // Ignore EPIPE if child process exits early or closes stdin
         });
         try {
           child.stdin.write(options.stdin, 'utf8', () => {
             try {
               child.stdin?.end();
-            } catch {
+            } catch (endErr: unknown) {
               // Ignore
             }
           });
-        } catch {
+        } catch (writeErr: unknown) {
           // Ignore
         }
       }
@@ -613,7 +613,7 @@ export class ProcessRunner {
               stdoutAcc += chunkBuf.subarray(0, remaining).toString('utf8');
               stdoutByteCount += remaining;
             }
-            ProcessRunner.terminateProcessTree(child);
+            void ProcessRunner.terminateProcessTree(child);
             return;
           }
 
@@ -635,7 +635,7 @@ export class ProcessRunner {
               stderrAcc += chunkBuf.subarray(0, remaining).toString('utf8');
               stderrByteCount += remaining;
             }
-            ProcessRunner.terminateProcessTree(child);
+            void ProcessRunner.terminateProcessTree(child);
             return;
           }
 
@@ -771,7 +771,7 @@ export class ProcessRunner {
               stdoutEvidenceId,
               stderrEvidenceId
             );
-          } catch {
+          } catch (dbErr: unknown) {
             // DB connection may be closed if test teardown completed
           }
         }
@@ -881,13 +881,13 @@ export class ProcessRunner {
                 windowsHide: true,
                 stdio: 'ignore',
               });
-            } catch {
+            } catch (spawnErr: unknown) {
               return resolve(null);
             }
             const timer = setTimeout(() => {
               try {
                 tk.kill('SIGKILL');
-              } catch {
+              } catch (killErr: unknown) {
                 // termination attempt bounded
               }
               resolve(null);
@@ -912,17 +912,17 @@ export class ProcessRunner {
         } else {
           try {
             process.kill(-pid, 'SIGKILL');
-          } catch {
+          } catch (pKillErr: unknown) {
             try {
               child.kill('SIGKILL');
-            } catch {
+            } catch (cKillErr: unknown) {
               // fallback kill bounded
             }
           }
           const isDead = await ProcessRunner.verifyProcessDeadWithDeadline(pid, timeoutMs);
           return isDead ? 'PROCESS_TREE_TERMINATED_PROVEN' : 'TERMINATION_UNRESOLVED';
         }
-      } catch {
+      } catch (termErr: unknown) {
         return 'TERMINATION_UNRESOLVED';
       } finally {
         this.terminationPromises.delete(pid);

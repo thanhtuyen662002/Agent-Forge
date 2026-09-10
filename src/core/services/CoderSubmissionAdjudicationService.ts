@@ -80,7 +80,7 @@ export function validateAndHashCanonicalExecutionPayload(rawJson: string): {
   let parsed: unknown;
   try {
     parsed = JSON.parse(rawJson);
-  } catch {
+  } catch (parseErr: unknown) {
     return { valid: false, computedHash: '', parsed: null, error: 'Malformed JSON in canonical_payload_json' };
   }
   if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed) || Object.getPrototypeOf(parsed) !== Object.prototype) {
@@ -221,6 +221,320 @@ export function deriveDeterministicDispositionId(
   return `${hex.substring(0, 8)}-${hex.substring(8, 12)}-${hex.substring(12, 16)}-${hex.substring(16, 20)}-${hex.substring(20, 32)}`;
 }
 
+export interface CanonicalSettlementEvaluationInput {
+  envelope: CanonicalVerificationResultEnvelope;
+  adjudication: CoderSubmissionAdjudication;
+  testRun: TestRun | null;
+  manifest: ArtifactManifest | null;
+  gitStatusEvidenceId?: string | null;
+  gitDiffEvidenceId?: string | null;
+  testResultEvidenceId?: string | null;
+}
+
+export interface CanonicalSettlementDecision {
+  valid: boolean;
+  isSuccess: boolean;
+  targetStatus: 'VERIFIED' | 'VERIFICATION_FAILED' | 'RECOVERY_FENCED';
+  taskTransition: 'REVIEW_READY' | 'NEEDS_HUMAN';
+  eventType: 'VERIFICATION_SUCCEEDED' | 'VERIFICATION_FAILED' | 'RECOVERY_FENCED';
+  dispositionEvent: 'SETTLED' | 'REJECTED';
+  dispositionReason: 'ACCEPTED_VERIFIED' | 'VERIFICATION_FAILED' | 'RECOVERY_FENCED';
+  failureCode: string | null;
+  failureDetail: string | null;
+  contradictionReason?: string;
+}
+
+export function evaluateCanonicalSettlementDecision(
+  input: CanonicalSettlementEvaluationInput
+): CanonicalSettlementDecision {
+  const { envelope, adjudication, testRun, manifest, gitStatusEvidenceId, gitDiffEvidenceId, testResultEvidenceId } = input;
+
+  // 1. Validate envelope shape and exact keys
+  if (!envelope || typeof envelope !== 'object' || Array.isArray(envelope)) {
+    return {
+      valid: false,
+      isSuccess: false,
+      targetStatus: 'RECOVERY_FENCED',
+      taskTransition: 'NEEDS_HUMAN',
+      eventType: 'RECOVERY_FENCED',
+      dispositionEvent: 'REJECTED',
+      dispositionReason: 'RECOVERY_FENCED',
+      failureCode: 'INTEGRITY_MISMATCH',
+      failureDetail: 'Verification result envelope is missing or not a plain object',
+      contradictionReason: 'Envelope not a plain object',
+    };
+  }
+
+  const envKeys = Object.keys(envelope).sort();
+  const expectedKeys = [...CANONICAL_VERIFICATION_RESULT_ENVELOPE_KEYS].sort();
+  if (envKeys.length !== expectedKeys.length || envKeys.some((k, i) => k !== expectedKeys[i])) {
+    return {
+      valid: false,
+      isSuccess: false,
+      targetStatus: 'RECOVERY_FENCED',
+      taskTransition: 'NEEDS_HUMAN',
+      eventType: 'RECOVERY_FENCED',
+      dispositionEvent: 'REJECTED',
+      dispositionReason: 'RECOVERY_FENCED',
+      failureCode: 'INTEGRITY_MISMATCH',
+      failureDetail: 'Verification result envelope key set mismatch',
+      contradictionReason: 'Envelope key set mismatch',
+    };
+  }
+
+  // 2. Validate binding consistency with adjudication
+  if (
+    envelope.adjudication_id !== adjudication.id ||
+    envelope.project_id !== adjudication.project_id ||
+    envelope.task_id !== adjudication.task_id ||
+    envelope.attempt_id !== adjudication.attempt_id ||
+    envelope.assignment_id !== adjudication.assignment_id ||
+    envelope.authorization_id !== adjudication.authorization_id ||
+    envelope.task_ownership_epoch !== adjudication.task_ownership_epoch
+  ) {
+    return {
+      valid: false,
+      isSuccess: false,
+      targetStatus: 'RECOVERY_FENCED',
+      taskTransition: 'NEEDS_HUMAN',
+      eventType: 'RECOVERY_FENCED',
+      dispositionEvent: 'REJECTED',
+      dispositionReason: 'RECOVERY_FENCED',
+      failureCode: 'INTEGRITY_MISMATCH',
+      failureDetail: 'Envelope bindings mismatch adjudication record',
+      contradictionReason: 'Envelope adjudication binding mismatch',
+    };
+  }
+
+  // 3. Validate command snapshot & lifecycle version
+  if (envelope.command_snapshot_hash !== adjudication.verification_commands_hash) {
+    return {
+      valid: false,
+      isSuccess: false,
+      targetStatus: 'RECOVERY_FENCED',
+      taskTransition: 'NEEDS_HUMAN',
+      eventType: 'RECOVERY_FENCED',
+      dispositionEvent: 'REJECTED',
+      dispositionReason: 'RECOVERY_FENCED',
+      failureCode: 'INTEGRITY_MISMATCH',
+      failureDetail: 'Envelope command_snapshot_hash mismatch adjudication verification_commands_hash',
+      contradictionReason: 'Command snapshot hash mismatch',
+    };
+  }
+
+  // 4. Validate artifact manifest presence and hash
+  if (!manifest) {
+    return {
+      valid: false,
+      isSuccess: false,
+      targetStatus: 'RECOVERY_FENCED',
+      taskTransition: 'NEEDS_HUMAN',
+      eventType: 'RECOVERY_FENCED',
+      dispositionEvent: 'REJECTED',
+      dispositionReason: 'RECOVERY_FENCED',
+      failureCode: 'INTEGRITY_MISMATCH',
+      failureDetail: 'Artifact manifest missing for settlement',
+      contradictionReason: 'Missing artifact manifest',
+    };
+  }
+
+  const computedManifestHash = computeArtifactManifestHash(manifest);
+  if (envelope.artifact_manifest_hash !== computedManifestHash) {
+    return {
+      valid: false,
+      isSuccess: false,
+      targetStatus: 'RECOVERY_FENCED',
+      taskTransition: 'NEEDS_HUMAN',
+      eventType: 'RECOVERY_FENCED',
+      dispositionEvent: 'REJECTED',
+      dispositionReason: 'RECOVERY_FENCED',
+      failureCode: 'INTEGRITY_MISMATCH',
+      failureDetail: 'Envelope artifact_manifest_hash mismatch computed manifest hash',
+      contradictionReason: 'Artifact manifest hash mismatch',
+    };
+  }
+
+  // 5. Validate evidence IDs if provided
+  if (gitStatusEvidenceId !== undefined && envelope.git_status_evidence_id !== gitStatusEvidenceId) {
+    return {
+      valid: false,
+      isSuccess: false,
+      targetStatus: 'RECOVERY_FENCED',
+      taskTransition: 'NEEDS_HUMAN',
+      eventType: 'RECOVERY_FENCED',
+      dispositionEvent: 'REJECTED',
+      dispositionReason: 'RECOVERY_FENCED',
+      failureCode: 'INTEGRITY_MISMATCH',
+      failureDetail: 'Envelope git_status_evidence_id mismatch',
+      contradictionReason: 'git_status_evidence_id mismatch',
+    };
+  }
+  if (gitDiffEvidenceId !== undefined && envelope.git_diff_evidence_id !== gitDiffEvidenceId) {
+    return {
+      valid: false,
+      isSuccess: false,
+      targetStatus: 'RECOVERY_FENCED',
+      taskTransition: 'NEEDS_HUMAN',
+      eventType: 'RECOVERY_FENCED',
+      dispositionEvent: 'REJECTED',
+      dispositionReason: 'RECOVERY_FENCED',
+      failureCode: 'INTEGRITY_MISMATCH',
+      failureDetail: 'Envelope git_diff_evidence_id mismatch',
+      contradictionReason: 'git_diff_evidence_id mismatch',
+    };
+  }
+  if (testResultEvidenceId !== undefined && envelope.test_result_evidence_id !== testResultEvidenceId) {
+    return {
+      valid: false,
+      isSuccess: false,
+      targetStatus: 'RECOVERY_FENCED',
+      taskTransition: 'NEEDS_HUMAN',
+      eventType: 'RECOVERY_FENCED',
+      dispositionEvent: 'REJECTED',
+      dispositionReason: 'RECOVERY_FENCED',
+      failureCode: 'INTEGRITY_MISMATCH',
+      failureDetail: 'Envelope test_result_evidence_id mismatch',
+      contradictionReason: 'test_result_evidence_id mismatch',
+    };
+  }
+
+  // 6. Test run consistency check (consistency check only, not standalone authority)
+  if (testRun) {
+    if (envelope.test_run_id !== testRun.id) {
+      return {
+        valid: false,
+        isSuccess: false,
+        targetStatus: 'RECOVERY_FENCED',
+        taskTransition: 'NEEDS_HUMAN',
+        eventType: 'RECOVERY_FENCED',
+        dispositionEvent: 'REJECTED',
+        dispositionReason: 'RECOVERY_FENCED',
+        failureCode: 'INTEGRITY_MISMATCH',
+        failureDetail: 'Envelope test_run_id mismatch test run record',
+        contradictionReason: 'test_run_id mismatch',
+      };
+    }
+    // Check contradictions between envelope and testRun
+    if (envelope.exit_classification === 'EXIT_ZERO' && testRun.exit_code !== 0) {
+      return {
+        valid: false,
+        isSuccess: false,
+        targetStatus: 'RECOVERY_FENCED',
+        taskTransition: 'NEEDS_HUMAN',
+        eventType: 'RECOVERY_FENCED',
+        dispositionEvent: 'REJECTED',
+        dispositionReason: 'RECOVERY_FENCED',
+        failureCode: 'INTEGRITY_MISMATCH',
+        failureDetail: `Test run exit code ${testRun.exit_code} contradicts envelope EXIT_ZERO`,
+        contradictionReason: 'exit_code non-zero with EXIT_ZERO',
+      };
+    }
+    if (envelope.exit_classification !== 'EXIT_ZERO' && testRun.exit_code === 0) {
+      return {
+        valid: false,
+        isSuccess: false,
+        targetStatus: 'RECOVERY_FENCED',
+        taskTransition: 'NEEDS_HUMAN',
+        eventType: 'RECOVERY_FENCED',
+        dispositionEvent: 'REJECTED',
+        dispositionReason: 'RECOVERY_FENCED',
+        failureCode: 'INTEGRITY_MISMATCH',
+        failureDetail: `Test run exit code 0 contradicts envelope ${envelope.exit_classification}`,
+        contradictionReason: 'exit_code zero with non-zero classification',
+      };
+    }
+  } else if (envelope.exit_classification === 'EXIT_ZERO') {
+    return {
+      valid: false,
+      isSuccess: false,
+      targetStatus: 'RECOVERY_FENCED',
+      taskTransition: 'NEEDS_HUMAN',
+      eventType: 'RECOVERY_FENCED',
+      dispositionEvent: 'REJECTED',
+      dispositionReason: 'RECOVERY_FENCED',
+      failureCode: 'INTEGRITY_MISMATCH',
+      failureDetail: 'Missing test run record for EXIT_ZERO envelope',
+      contradictionReason: 'Missing test run record',
+    };
+  }
+
+  // 7. Internal envelope contradiction check
+  if (envelope.exit_classification === 'EXIT_ZERO' && envelope.failure_code !== null) {
+    return {
+      valid: false,
+      isSuccess: false,
+      targetStatus: 'RECOVERY_FENCED',
+      taskTransition: 'NEEDS_HUMAN',
+      eventType: 'RECOVERY_FENCED',
+      dispositionEvent: 'REJECTED',
+      dispositionReason: 'RECOVERY_FENCED',
+      failureCode: 'INTEGRITY_MISMATCH',
+      failureDetail: `Contradiction: exit_classification is EXIT_ZERO but failure_code is "${envelope.failure_code}"`,
+      contradictionReason: 'EXIT_ZERO with failure_code',
+    };
+  }
+
+  // 8. Determine settlement decision
+  const isCleanSuccess =
+    envelope.exit_classification === 'EXIT_ZERO' &&
+    envelope.failure_code === null &&
+    envelope.process_start_classification === 'SPAWNED_PROVEN' &&
+    envelope.termination_classification === 'TERMINATION_PROVEN' &&
+    (!testRun || testRun.exit_code === 0);
+
+  if (isCleanSuccess) {
+    return {
+      valid: true,
+      isSuccess: true,
+      targetStatus: 'VERIFIED',
+      taskTransition: 'REVIEW_READY',
+      eventType: 'VERIFICATION_SUCCEEDED',
+      dispositionEvent: 'SETTLED',
+      dispositionReason: 'ACCEPTED_VERIFIED',
+      failureCode: null,
+      failureDetail: null,
+    };
+  }
+
+  // Handle failure classifications
+  const isFencedCode =
+    envelope.failure_code === 'ORPHANED_VERIFICATION_INTERRUPTED' ||
+    envelope.failure_code === 'ORPHANED_VERIFICATION_CANCELLED' ||
+    envelope.failure_code === 'EVIDENCE_CAPTURE_FAILED' ||
+    envelope.failure_code === 'INTEGRITY_MISMATCH' ||
+    envelope.failure_code === 'RECOVERY_FENCED' ||
+    envelope.failure_code === 'CLEANUP_DEBT_FENCED' ||
+    envelope.termination_classification === 'TERMINATION_AMBIGUOUS' ||
+    envelope.process_start_classification === 'LAUNCH_FAILED_PROVEN' ||
+    Boolean(envelope.failure_payload?.is_fenced);
+
+  if (isFencedCode) {
+    return {
+      valid: true,
+      isSuccess: false,
+      targetStatus: 'RECOVERY_FENCED',
+      taskTransition: 'NEEDS_HUMAN',
+      eventType: 'RECOVERY_FENCED',
+      dispositionEvent: 'REJECTED',
+      dispositionReason: 'RECOVERY_FENCED',
+      failureCode: envelope.failure_code || 'INTEGRITY_MISMATCH',
+      failureDetail: envelope.failure_payload?.error as string || envelope.failure_code || 'Process execution ambiguous',
+    };
+  }
+
+  return {
+    valid: true,
+    isSuccess: false,
+    targetStatus: 'VERIFICATION_FAILED',
+    taskTransition: 'NEEDS_HUMAN',
+    eventType: 'VERIFICATION_FAILED',
+    dispositionEvent: 'REJECTED',
+    dispositionReason: 'VERIFICATION_FAILED',
+    failureCode: envelope.failure_code || (envelope.exit_classification === 'TIMEOUT' ? 'VERIFICATION_TIMEOUT' : 'TESTS_FAILED'),
+    failureDetail: envelope.failure_payload?.error as string || `Verification failed: ${envelope.exit_classification}`,
+  };
+}
+
 export class CoderSubmissionAdjudicationService {
   private readonly artifactStore: ArtifactStore;
 
@@ -326,7 +640,7 @@ export class CoderSubmissionAdjudicationService {
       if (typeof parsedEnv === 'object' && parsedEnv !== null && !Array.isArray(parsedEnv)) {
         canonicalEnvelope = parsedEnv as Record<string, unknown>;
       }
-    } catch {
+    } catch (claimParseErr: unknown) {
       // Malformed stored JSON
     }
 
@@ -339,7 +653,9 @@ export class CoderSubmissionAdjudicationService {
           if (typeof parsed === 'object' && parsed !== null && !Array.isArray(parsed)) {
             metadata = parsed as Record<string, unknown>;
           }
-        } catch {}
+        } catch (metaErr: unknown) {
+          // malformed metadata handled
+        }
       }
       return {
         id: d.id,
@@ -371,7 +687,7 @@ export class CoderSubmissionAdjudicationService {
     let authoritySnapshot: CanonicalAuthoritySnapshot | null = null;
     try {
       authoritySnapshot = this.buildCanonicalAuthoritySnapshot(sub);
-    } catch {
+    } catch (authSnapErr: unknown) {
       // Incomplete or malformed authority graph
     }
 
@@ -921,7 +1237,7 @@ export class CoderSubmissionAdjudicationService {
         throw new Error('Not an object');
       }
       authPayload = parsed as Record<string, unknown>;
-    } catch {
+    } catch (parseErr: unknown) {
       throw new CoderSubmissionAdjudicationError(
         'COMMAND_SNAPSHOT_INVALID',
         'Authorization canonical payload is malformed JSON'
@@ -1457,7 +1773,11 @@ export class CoderSubmissionAdjudicationService {
             WHERE id = ? AND state IN ('ACQUIRED', 'VERIFYING')
           `).run(failureCode, nowIso, leaseId);
         }
-      } catch {}
+      } catch (fenceErr: unknown) {
+        const fenceMsg = fenceErr instanceof Error ? fenceErr.message : String(fenceErr);
+        const origMsg = verifErr instanceof Error ? verifErr.message : String(verifErr);
+        throw new Error(`VERIFICATION_ABORT_WITH_FENCE_FAILURE: Verification aborted: [${origMsg}]. Lease fencing failed: [${fenceMsg}].`);
+      }
       throw verifErr;
     }
 
@@ -1735,7 +2055,14 @@ export class CoderSubmissionAdjudicationService {
       command_snapshot_hash: verificationCommandsHash,
       exit_classification: exitClassification,
       failure_code: failureCode,
-      failure_payload: failureDetail ? { error: scrubbedFailureDetail } : null,
+      failure_payload: failureDetail
+        ? {
+            error: scrubbedFailureDetail,
+            ...(isAmbiguous ? { is_fenced: true } : {}),
+          }
+        : isAmbiguous
+        ? { is_fenced: true }
+        : null,
       finish_timestamp: phaseCNowIso,
       git_diff_evidence_hash: stagedGitDiffEvidence?.hash ?? '',
       git_diff_evidence_id: stagedGitDiffEvidence?.id ?? '',
@@ -1758,7 +2085,26 @@ export class CoderSubmissionAdjudicationService {
     const resultEnvelopeJson = canonicalJsonStringify(resultEnvelope);
     const resultEnvelopeHash = computeSha256(resultEnvelopeJson);
 
-    const isSuccess = targetStatus === 'VERIFIED';
+    const currentAdjForDecision = this.repo.getCoderSubmissionAdjudicationById(adjudicationId);
+    if (!currentAdjForDecision) {
+      throw new Error(`Adjudication ${adjudicationId} missing prior to Phase C settlement`);
+    }
+
+    const decision = evaluateCanonicalSettlementDecision({
+      envelope: resultEnvelope,
+      adjudication: currentAdjForDecision,
+      testRun,
+      manifest: manifestObj,
+      gitStatusEvidenceId: stagedGitStatusEvidence?.id ?? null,
+      gitDiffEvidenceId: stagedGitDiffEvidence?.id ?? null,
+      testResultEvidenceId: testResultEvidence.id,
+    });
+
+    targetStatus = decision.targetStatus;
+    const isSuccess = decision.isSuccess;
+    failureCode = decision.failureCode;
+    const effectiveFailureDetail = decision.failureDetail ? scrubAdjudicationDiagnostics(decision.failureDetail) : null;
+    const eventType = decision.eventType;
     const eventPayload = isSuccess
       ? canonicalJsonStringify({
           adjudication_id: adjudicationId,
@@ -1767,16 +2113,11 @@ export class CoderSubmissionAdjudicationService {
         })
       : canonicalJsonStringify({
           adjudication_id: adjudicationId,
-          error: scrubbedFailureDetail,
+          error: effectiveFailureDetail,
           failure_code: failureCode || 'TESTS_FAILED',
         });
 
     const eventPayloadHash = computeSha256(eventPayload);
-    const eventType = isSuccess
-      ? 'VERIFICATION_SUCCEEDED'
-      : targetStatus === 'RECOVERY_FENCED'
-      ? 'RECOVERY_FENCED'
-      : 'VERIFICATION_FAILED';
     const finalEventId = deriveDeterministicAdjudicationEventId(
       adjudicationId,
       3,
@@ -2102,7 +2443,11 @@ export class CoderSubmissionAdjudicationService {
               }
             }
           });
-        } catch {}
+        } catch (debtErr: unknown) {
+          const debtMsg = debtErr instanceof Error ? debtErr.message : String(debtErr);
+          const primaryMsg = err instanceof Error ? err.message : String(err);
+          throw new Error(`PHASE_C_ROLLBACK_AND_CLEANUP_DEBT_FAILURE: Primary error: [${primaryMsg}]. Cleanup debt fencing failed: [${debtMsg}].`);
+        }
       }
       throw err;
     }
@@ -2336,7 +2681,7 @@ export class CoderSubmissionAdjudicationService {
       if (typeof snap !== 'object' || snap === null || Array.isArray(snap) || Object.keys(snap).length === 0) {
         throw new Error('empty or invalid');
       }
-    } catch {
+    } catch (snapErr: unknown) {
       throw new CoderSubmissionAdjudicationError(
         'INTEGRITY_CONFLICT',
         `Adjudication authority snapshot is malformed or empty: ${adj.id}`
@@ -2355,7 +2700,7 @@ export class CoderSubmissionAdjudicationService {
         if (typeof cmdSnap !== 'object' || cmdSnap === null || Array.isArray(cmdSnap) || Object.keys(cmdSnap).length === 0) {
           throw new Error('empty or invalid');
         }
-      } catch {
+      } catch (cmdErr: unknown) {
         throw new CoderSubmissionAdjudicationError(
           'INTEGRITY_CONFLICT',
           `Adjudication verification commands snapshot is malformed or empty: ${adj.id}`
@@ -2463,7 +2808,7 @@ export class CoderSubmissionAdjudicationService {
           if (typeof parsedPayload !== 'object' || parsedPayload === null || Array.isArray(parsedPayload)) {
             throw new Error('Not an object');
           }
-        } catch {
+        } catch (statusErr: unknown) {
           throw new CoderSubmissionAdjudicationError(
             'INTEGRITY_CONFLICT',
             `Git status evidence payload is malformed JSON`
@@ -2621,7 +2966,7 @@ export class CoderSubmissionAdjudicationService {
       } else {
         fenced_reasons.push('claim_content_json must be a non-null plain object');
       }
-    } catch {
+    } catch (claimErr: unknown) {
       fenced_reasons.push('claim_content_json is malformed JSON');
     }
 
@@ -2632,7 +2977,7 @@ export class CoderSubmissionAdjudicationService {
       } else {
         fenced_reasons.push('canonical_envelope_json must be a non-null plain object');
       }
-    } catch {
+    } catch (envErr: unknown) {
       fenced_reasons.push('canonical_envelope_json is malformed JSON');
     }
 
@@ -3115,7 +3460,7 @@ export class CoderSubmissionAdjudicationService {
                   fenced_reasons.push('Manager protocol message review_issues must be an array');
                 }
               }
-            } catch {
+            } catch (msgErr: unknown) {
               fenced_reasons.push('Manager protocol message raw_payload is malformed JSON');
             }
           }
@@ -3305,8 +3650,8 @@ export class CoderSubmissionAdjudicationService {
             const buf = fs.readFileSync(absPath);
             contentHash = crypto.createHash('sha256').update(buf).digest('hex');
           }
-        } catch {
-          // Unreadable file
+        } catch (readErr: unknown) {
+          contentHash = 'UNREADABLE';
         }
         untrackedFileLines.push(`${relPath}:${contentHash}`);
       }

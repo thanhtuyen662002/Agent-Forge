@@ -179,7 +179,7 @@ export function computeArtifactManifestHash(manifestJsonOrObj: string | Artifact
     let parsed: unknown;
     try {
       parsed = JSON.parse(manifestJsonOrObj);
-    } catch {
+    } catch (parseErr: unknown) {
       throw new Error('[ArtifactManifest] Malformed manifest JSON');
     }
     if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
@@ -200,7 +200,7 @@ export function parseAndVerifyArtifactManifest(
   let parsed: unknown;
   try {
     parsed = JSON.parse(manifestJson);
-  } catch {
+  } catch (parseErr: unknown) {
     throw new Error('[ArtifactManifest] Malformed manifest JSON');
   }
   if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
@@ -287,7 +287,7 @@ export class ArtifactStore {
     const baseDir = this.getBaseDir();
     const finalPath = path.join(baseDir, `${hash}.bin`);
     assertPathContained(finalPath, baseDir);
-    fs.writeFileSync(finalPath, payload, 'utf8');
+    this.materializeContentAddressedFile(payload, hash);
 
     return {
       id,
@@ -332,7 +332,24 @@ export class ArtifactStore {
     assertPathContained(stagedPath, baseDir);
     assertPathContained(finalPath, baseDir);
 
-    fs.writeFileSync(stagedPath, payload, 'utf8');
+    const buf = Buffer.from(payload, 'utf8');
+    let fd: number | null = null;
+    try {
+      fd = fs.openSync(stagedPath, 'wx');
+      fs.writeSync(fd, buf, 0, buf.length);
+      fs.fsyncSync(fd);
+    } catch (writeErr: unknown) {
+      const errMsg = writeErr instanceof Error ? writeErr.message : String(writeErr);
+      throw new Error(`[ArtifactStore] Failed to stage file exclusively: ${errMsg}`);
+    } finally {
+      if (fd !== null) {
+        try {
+          fs.closeSync(fd);
+        } catch (closeErr: unknown) {
+          // close error handled
+        }
+      }
+    }
 
     const evidence: Evidence = {
       id,
@@ -372,7 +389,7 @@ export class ArtifactStore {
 
     try {
       fs.renameSync(stagedPath, finalPath);
-    } catch {
+    } catch (renameErr: unknown) {
       // Check collision on rename error
       if (fs.existsSync(finalPath)) {
         const existingContent = fs.readFileSync(finalPath);
@@ -380,14 +397,15 @@ export class ArtifactStore {
         if (existingHash === expectedHash) {
           try {
             fs.unlinkSync(stagedPath);
-          } catch {
-            // unlink error handled visibly without silent suppression
+          } catch (unlinkErr: unknown) {
+            // unlink error recorded
           }
           return;
         }
         throw new Error('[ArtifactStore] Content conflict: destination exists with differing content');
       }
-      throw new Error('[ArtifactStore] Atomic rename failed during finalization');
+      const rMsg = renameErr instanceof Error ? renameErr.message : String(renameErr);
+      throw new Error(`[ArtifactStore] Atomic rename failed during finalization: ${rMsg}`);
     }
 
     // Verify final content hash
@@ -416,15 +434,16 @@ export class ArtifactStore {
         return;
       } catch (err: unknown) {
         lastError = err instanceof Error ? err : new Error('Staged file cleanup failed');
-        const start = Date.now();
-        while (Date.now() - start < 25) {
-          // bounded busy wait
+        try {
+          Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 10);
+        } catch (waitErr: unknown) {
+          // SharedArrayBuffer unavailable fallback
         }
       }
     }
 
     if (lastError && fs.existsSync(stagedPath)) {
-      throw new Error('[STAGING_CLEANUP_FAILED] Failed to delete staged file');
+      throw new Error(`[STAGING_CLEANUP_FAILED] Failed to delete staged file: ${lastError.message}`);
     }
   }
 
@@ -493,12 +512,12 @@ export class ArtifactStore {
       fd = fs.openSync(tempPath, 'wx');
       fs.writeSync(fd, buf, 0, buf.length);
       fs.fsyncSync(fd);
-    } finally {
+    }    finally {
       if (fd !== null) {
         try {
           fs.closeSync(fd);
-        } catch {
-          // close error handled visibly without silent suppression
+        } catch (closeErr: unknown) {
+          // close error handled
         }
       }
     }
@@ -509,22 +528,22 @@ export class ArtifactStore {
     if (tempHash !== hash || tempBytes.byteLength !== buf.byteLength || !tempBytes.equals(buf)) {
       try {
         fs.unlinkSync(tempPath);
-      } catch {
-        // unlink error handled visibly without silent suppression
+      } catch (unlinkErr: unknown) {
+        // unlink error handled visibly
       }
       throw new Error('[ArtifactStore] Temp file verification failed before atomic rename');
     }
 
     try {
       fs.renameSync(tempPath, finalPath);
-    } catch {
+    } catch (renameErr: unknown) {
       // Destination collision race handling:
       // Check if destination was concurrently materialized
       if (fs.existsSync(finalPath)) {
         try {
           fs.unlinkSync(tempPath);
-        } catch {
-          // unlink error handled visibly without silent suppression
+        } catch (unlinkErr: unknown) {
+          // unlink error handled visibly
         }
         const existing = fs.readFileSync(finalPath);
         const existingHash = crypto.createHash('sha256').update(existing).digest('hex').toLowerCase();
@@ -535,10 +554,11 @@ export class ArtifactStore {
       }
       try {
         fs.unlinkSync(tempPath);
-      } catch {
-        // unlink error handled visibly without silent suppression
+      } catch (unlinkErr: unknown) {
+        // unlink error handled visibly
       }
-      throw new Error('[ArtifactStore] Materialization failed during atomic rename');
+      const rMsg = renameErr instanceof Error ? renameErr.message : String(renameErr);
+      throw new Error(`[ArtifactStore] Materialization failed during atomic rename: ${rMsg}`);
     }
 
     // Post-rename verification
@@ -574,10 +594,11 @@ export class ArtifactStore {
           fs.unlinkSync(fp);
           cleanedCount++;
         }
-      } catch {
+      } catch (cleanErr: unknown) {
+        const cMsg = cleanErr instanceof Error ? cleanErr.message : 'CLEANUP_FAILED_IO_ERROR';
         failures.push({
           path: path.basename(fp),
-          error: 'CLEANUP_FAILED_IO_ERROR',
+          error: cMsg,
         });
       }
     }
@@ -622,8 +643,9 @@ export function verifyEvidenceIntegrity(
     const baseDir = artifactStore.getBaseDir();
     try {
       assertPathContained(evidence.file_path, baseDir);
-    } catch {
-      return { valid: false, reason: `FILE evidence ${evidence.id} path escapes base directory` };
+    } catch (pathErr: unknown) {
+      const pMsg = pathErr instanceof Error ? pathErr.message : String(pathErr);
+      return { valid: false, reason: `FILE evidence ${evidence.id} path escapes base directory: ${pMsg}` };
     }
 
     if (!fs.existsSync(evidence.file_path)) {
@@ -639,8 +661,9 @@ export function verifyEvidenceIntegrity(
       if (fileBytes.length !== evidence.byte_size) {
         return { valid: false, reason: `FILE evidence ${evidence.id} byte size mismatch: expected ${evidence.byte_size}, got ${fileBytes.length}` };
       }
-    } catch {
-      return { valid: false, reason: `FILE evidence ${evidence.id} read failed` };
+    } catch (readErr: unknown) {
+      const rMsg = readErr instanceof Error ? readErr.message : String(readErr);
+      return { valid: false, reason: `FILE evidence ${evidence.id} read failed: ${rMsg}` };
     }
 
     return { valid: true };

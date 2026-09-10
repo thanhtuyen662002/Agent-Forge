@@ -17,14 +17,6 @@ import {
 import { CommandParser } from '../services/CommandParser';
 import { computeSha256, CLAIM_CONTENT_KEYS, canonicalJsonStringify } from '../../mcp/submissionProtocol';
 
-export interface AdjudicationReviewPackageLinkage {
-  adjudication: CoderSubmissionAdjudication;
-  submission: CoderSubmission;
-  testRun: TestRun | null;
-  gitStatusEvidence: Evidence | null;
-  gitDiffEvidence: Evidence | null;
-}
-
 export class PackageGenerator {
   private static formatVerificationCommand(
     commands: Array<{ command_type: string; executable: string; args: string[]; enabled?: boolean }>,
@@ -509,7 +501,8 @@ ${criteriaList}
 
 ### Owner Adjudication
 - **Adjudication ID**: \`${projection.adjudication_id}\`
-- **Recovery Classification**: ${projection.recovery_fencing_state?.is_fenced ? 'RECOVERY_FENCED' : 'NORMAL'}
+- **Fencing State**: ${projection.recovery_fencing_state?.is_fenced ? `RECOVERY_FENCED (${projection.recovery_fencing_state.failure_code || 'UNSPECIFIED'})` : 'NORMAL'}
+- **Disposition**: ${projection.operator_disposition?.disposition_event || 'NONE'}
 - **Projection Hash**: \`${projection.projection_hash}\`
 
 ### Authoritative Test Evidence
@@ -593,39 +586,17 @@ Evaluate the authoritative evidence above against the acceptance criteria and re
     gitDiffStat: string,
     gitDiffContent: string,
     testRun: TestRun | null,
-    previousReviews?: Review[],
-    gitDiffEvidence?: Evidence | null,
-    adjudicationProjection?: VerifiedAdjudicationReviewProjection | null
-  ): string;
-  public static generateReviewPackage(
-    project: Project,
-    task: Task,
-    coderReport: CoderProtocol | null,
-    gitDiffStat: string,
-    gitDiffContent: string,
-    testRun: TestRun | null,
-    previousReviews?: Review[],
-    gitDiffEvidence?: Evidence | null,
-    adjudicationProjection?: unknown
-  ): string;
-  public static generateReviewPackage(
-    project: Project,
-    task: Task,
-    coderReport: CoderProtocol | null,
-    gitDiffStat: string,
-    gitDiffContent: string,
-    testRun: TestRun | null,
     previousReviews: Review[] = [],
     gitDiffEvidence?: Evidence | null,
-    adjudicationProjection?: unknown
+    adjudicationProjection?: VerifiedAdjudicationReviewProjection | Record<string, unknown> | null
   ): string {
-    if (adjudicationProjection) {
+    if (adjudicationProjection !== undefined && adjudicationProjection !== null) {
+      const candidate = adjudicationProjection as unknown as Record<string, unknown>;
       if (
-        typeof adjudicationProjection !== 'object' ||
-        adjudicationProjection === null ||
-        'adjudication' in (adjudicationProjection as Record<string, unknown>) ||
-        'submission' in (adjudicationProjection as Record<string, unknown>) ||
-        !('projection_hash' in (adjudicationProjection as Record<string, unknown>))
+        typeof candidate !== 'object' ||
+        'adjudication' in candidate ||
+        'submission' in candidate ||
+        !('projection_hash' in candidate)
       ) {
         throw new Error(
           'LEGACY_LINKAGE_REJECTED: Adjudication review package generation requires VerifiedAdjudicationReviewProjection.'

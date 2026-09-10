@@ -1497,6 +1497,37 @@ const harness = new McpRpcHarness(child);
       throw new Error("Review package missing '### Git Diff Evidence' section");
     }
 
+    // 6. Test that legacy linkage object is strictly rejected
+    let legacyAccepted = false;
+    try {
+      PackageGenerator.generateReviewPackage(
+        durableProj,
+        finalTask,
+        null,
+        '',
+        '',
+        linkedTestRun,
+        [],
+        linkedGitDiff,
+        {
+          adjudication: durableAdj,
+          submission: { id: durableAdj.submission_id },
+          testRun: linkedTestRun,
+          gitStatusEvidence: null,
+          gitDiffEvidence: linkedGitDiff,
+        }
+      );
+      legacyAccepted = true;
+    } catch (legacyErr) {
+      const msg = legacyErr instanceof Error ? legacyErr.message : String(legacyErr);
+      if (!msg.includes('LEGACY_LINKAGE_REJECTED')) {
+        throw new Error("Expected LEGACY_LINKAGE_REJECTED error, but got: " + msg);
+      }
+    }
+    if (legacyAccepted) {
+      throw new Error("LEGACY_LINKAGE_FATAL: PackageGenerator accepted legacy linkage object!");
+    }
+
     checkAdjDb.close();
     adjDb.close();
 

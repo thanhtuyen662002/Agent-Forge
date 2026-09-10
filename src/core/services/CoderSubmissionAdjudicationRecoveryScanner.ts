@@ -13,6 +13,7 @@ import {
   CanonicalVerificationResultEnvelope,
   CANONICAL_VERIFICATION_RESULT_ENVELOPE_KEYS,
   AUTHORITY_SNAPSHOT_KEYS,
+  ArtifactManifest,
 } from '../types/adjudication';
 import { canonicalJsonStringify, computeSha256 } from '../context/ContextIntegrity';
 import { TaskStateMachine } from '../state/taskStateMachine';
@@ -21,6 +22,7 @@ import {
   deriveDeterministicAdjudicationEventId,
   deriveDeterministicGenericAdjudicationEventId,
   deriveDeterministicDispositionId,
+  evaluateCanonicalSettlementDecision,
 } from './CoderSubmissionAdjudicationService';
 import { verifyEvidenceIntegrity, parseAndVerifyArtifactManifest } from './ArtifactStore';
 
@@ -122,7 +124,7 @@ export class CoderSubmissionAdjudicationRecoveryScanner {
             authoritySnapshotValid = true;
           }
         }
-      } catch {
+      } catch (snapErr: unknown) {
         authoritySnapshotValid = false;
       }
     }
@@ -202,7 +204,7 @@ export class CoderSubmissionAdjudicationRecoveryScanner {
             } else if (adj.status === 'VERIFICATION_FAILED' && rawEnv.exit_classification === 'EXIT_ZERO' && !rawEnv.failure_code) {
               contradiction = 'VERIFICATION_FAILED adjudication result envelope contradicts failure status';
             }
-          } catch {
+          } catch (envParseErr: unknown) {
             contradiction = 'Verification result envelope is malformed JSON';
           }
         }
@@ -406,7 +408,7 @@ export class CoderSubmissionAdjudicationRecoveryScanner {
                 parsedEnvelope = rawEnvelope as CanonicalVerificationResultEnvelope;
               }
             }
-          } catch {
+          } catch (trParseErr: unknown) {
             settlementError = 'Canonical verification-result envelope is malformed JSON';
           }
         }
@@ -537,7 +539,7 @@ export class CoderSubmissionAdjudicationRecoveryScanner {
             ) {
               settlementError = 'Workspace snapshot before is not a valid workspace fingerprint';
             }
-          } catch {
+          } catch (fpErr: unknown) {
             settlementError = 'Workspace snapshot before is malformed JSON';
           }
         }
@@ -595,12 +597,30 @@ export class CoderSubmissionAdjudicationRecoveryScanner {
           nowIso
         );
         if (settlementSuccess) {
+          let recDecisionTaskTrans: 'REVIEW_READY' | 'NEEDS_HUMAN' = 'NEEDS_HUMAN';
+          try {
+            const m = artifactManifestJson && artifactManifestHash
+              ? parseAndVerifyArtifactManifest(artifactManifestJson, artifactManifestHash)
+              : null;
+            const dec = evaluateCanonicalSettlementDecision({
+              envelope: parsedEnvelope,
+              adjudication: adj,
+              testRun,
+              manifest: m,
+              gitStatusEvidenceId: gitStatusEvId,
+              gitDiffEvidenceId: gitDiffEvId,
+              testResultEvidenceId: testRun.evidence_id,
+            });
+            recDecisionTaskTrans = dec.taskTransition;
+          } catch (decErr: unknown) {
+            recDecisionTaskTrans = 'NEEDS_HUMAN';
+          }
           return {
             adjudication_id: adj.id,
             submission_id: adj.submission_id,
             classification: 'VERIFICATION_RESULT_STATE_INCOMPLETE',
             action_taken: 'SETTLED',
-            task_transition: testRun.exit_code === 0 && parsedEnvelope.exit_classification === 'EXIT_ZERO' && !parsedEnvelope.failure_code ? 'REVIEW_READY' : 'NEEDS_HUMAN',
+            task_transition: recDecisionTaskTrans,
           };
         } else {
           this.fenceAdjudication(
@@ -787,24 +807,37 @@ export class CoderSubmissionAdjudicationRecoveryScanner {
     artifactManifestHash: string | null,
     nowIso: string
   ): boolean {
-    const isSuccess = envelope.exit_classification === 'EXIT_ZERO' && testRun.exit_code === 0 && !envelope.failure_code;
-    const targetStatus = isSuccess ? 'VERIFIED' : 'VERIFICATION_FAILED';
-    const eventType = isSuccess ? 'VERIFICATION_SUCCEEDED' : 'VERIFICATION_FAILED';
+    if (!artifactManifestJson || !artifactManifestHash) {
+      return false;
+    }
+    let parsedManifest: ArtifactManifest;
+    try {
+      parsedManifest = parseAndVerifyArtifactManifest(artifactManifestJson, artifactManifestHash);
+    } catch (manErr: unknown) {
+      return false;
+    }
+
+    const decision = evaluateCanonicalSettlementDecision({
+      envelope,
+      adjudication: adj,
+      testRun,
+      manifest: parsedManifest,
+      gitStatusEvidenceId,
+      gitDiffEvidenceId,
+      testResultEvidenceId: testRun.evidence_id,
+    });
+
+    if (!decision.valid) {
+      return false;
+    }
+
+    const targetStatus = decision.targetStatus;
+    const eventType = decision.eventType;
+    const isSuccess = decision.isSuccess;
     const nextVersion = adj.lifecycle_version + 1;
 
     const envelopeJson = canonicalJsonStringify(envelope);
     const envelopeHash = computeSha256(envelopeJson);
-
-    if (!artifactManifestJson || !artifactManifestHash) {
-      return false;
-    }
-    try {
-      parseAndVerifyArtifactManifest(artifactManifestJson, artifactManifestHash);
-    } catch {
-      return false;
-    }
-    const resolvedManifestJson = artifactManifestJson;
-    const resolvedManifestHash = artifactManifestHash;
 
     try {
       const tx = this.db.transaction(() => {
@@ -831,8 +864,8 @@ export class CoderSubmissionAdjudicationRecoveryScanner {
             gitDiffEvidenceId,
             envelopeJson,
             envelopeHash,
-            resolvedManifestJson,
-            resolvedManifestHash,
+            artifactManifestJson,
+            artifactManifestHash,
             adj.id,
             adj.lifecycle_version
           );
@@ -881,16 +914,20 @@ export class CoderSubmissionAdjudicationRecoveryScanner {
         this.repo.createCoderSubmissionAdjudicationEvent(settlementEvent);
 
         if (isSuccess) {
-          this.repo.createCoderSubmissionDisposition({
-            id: deriveDeterministicDispositionId(adj.submission_id, adj.id, nextVersion),
-            submission_id: adj.submission_id,
-            disposition_event: 'SETTLED',
-            disposition_reason: 'ACCEPTED_VERIFIED',
-            actor_type: 'SYSTEM',
-            actor_id: 'SYSTEM',
-            disposition_metadata_json: null,
-            created_at: nowIso,
-          });
+          const existingDisps = this.repo.getCoderSubmissionDispositions(adj.submission_id);
+          const hasTerminalDisp = existingDisps.some((d) => d.disposition_event === 'SETTLED' || d.disposition_event === 'REJECTED');
+          if (!hasTerminalDisp) {
+            this.repo.createCoderSubmissionDisposition({
+              id: deriveDeterministicDispositionId(adj.submission_id, adj.id, nextVersion),
+              submission_id: adj.submission_id,
+              disposition_event: decision.dispositionEvent,
+              disposition_reason: decision.dispositionReason,
+              actor_type: 'SYSTEM',
+              actor_id: 'RECOVERY_SCANNER',
+              disposition_metadata_json: null,
+              created_at: nowIso,
+            });
+          }
         }
 
         const liveTask = this.repo.getTask(adj.task_id);

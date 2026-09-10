@@ -20,6 +20,7 @@ import {
   deriveDeterministicGenericAdjudicationEventId,
   deriveDeterministicDispositionId,
   scrubAdjudicationDiagnostics,
+  evaluateCanonicalSettlementDecision,
 } from '../src/core/services/CoderSubmissionAdjudicationService';
 import { CoderSubmissionAdjudicationRecoveryScanner } from '../src/core/services/CoderSubmissionAdjudicationRecoveryScanner';
 import { CrashRecoveryService } from '../src/core/services/CrashRecoveryService';
@@ -39,7 +40,7 @@ import { ProjectService } from '../src/core/services/ProjectService';
 import { EmergencyStopService } from '../src/core/services/EmergencyStopService';
 import { ProcessRunner, StructuredProcessOptions, ProcessRunResult } from '../src/core/services/ProcessRunner';
 import { TaskStateMachine } from '../src/core/state/taskStateMachine';
-import { PackageGenerator, AdjudicationReviewPackageLinkage } from '../src/core/protocol/packageGenerator';
+import { PackageGenerator } from '../src/core/protocol/packageGenerator';
 import {
   AdjudicationAction,
   AdjudicationStatus,
@@ -57,7 +58,7 @@ import {
   ARTIFACT_MANIFEST_KEYS,
 } from '../src/core/types/adjudication';
 import { registerIpcHandlers, scrubAdjudicationError } from '../src/electron/ipcHandlers';
-import { ExecutionAuthorization, Task, Project, Evidence } from '../src/core/types/domain';
+import { ExecutionAuthorization, Task, Project, Evidence, TestRun } from '../src/core/types/domain';
 import {
   computeAuthorityFingerprint,
   canonicalJsonStringify,
@@ -2781,7 +2782,7 @@ describe('R5J5 Quarantined Submission Adjudication and Verification Admission Su
       const snapshotHash = computeSha256(snapshotJson);
       const auth = fixtures.repo.getExecutionAuthorization(fixtures.authorizationId)!;
       const authPayload = JSON.parse(auth.canonical_payload_json!);
-      const cmdJson = JSON.stringify(authPayload.verificationCommands);
+      const cmdJson = canonicalJsonStringify(authPayload.verificationCommands);
       const cmdHash = computeSha256(cmdJson);
 
       db.prepare(`
@@ -2849,13 +2850,22 @@ describe('R5J5 Quarantined Submission Adjudication and Verification Admission Su
 
 
   describe('Group 7: Category G — Review Package, IPC, UI Contracts & Packaging', () => {
+    interface LegacyLinkageTestPayload {
+      [key: string]: unknown;
+      adjudication: CoderSubmissionAdjudication;
+      submission: CoderSubmission;
+      testRun: unknown;
+      gitStatusEvidence: unknown;
+      gitDiffEvidence: unknown;
+    }
+
     function createTestLinkage(
       subId: string,
       overrides: Partial<CoderSubmissionAdjudication> = {},
-      testRun?: any,
-      gitStatusEvidence?: any,
-      gitDiffEvidence?: any
-    ): AdjudicationReviewPackageLinkage {
+      testRun?: { id?: string } | null,
+      gitStatusEvidence?: { id?: string } | null,
+      gitDiffEvidence?: { id?: string } | null
+    ): LegacyLinkageTestPayload {
       const sub = fixtures.repo.getCoderSubmissionById(subId)!;
       const authSnap = overrides.authority_snapshot_json ?? '{}';
       const authSnapHash = overrides.authority_snapshot_hash ?? computeSha256(authSnap);
@@ -8273,6 +8283,598 @@ describe('R5J5 Quarantined Submission Adjudication and Verification Admission Su
       const fenced = fixtures.repo.getCoderSubmissionAdjudicationById(adjId)!;
       expect(fenced.status).toBe('RECOVERY_FENCED');
       expect(fenced.failure_code).toBe('INTEGRITY_MISMATCH');
+    });
+
+    it('273. Exact manifest parser rejects top-level and entry aliases, extra and missing keys', () => {
+      const validEntry = {
+        byte_size: 10,
+        content_type: 'text/plain',
+        evidence_id: 'ev-test-1',
+        evidence_type: 'LOG',
+        relative_path: 'log.txt',
+        sha256: 'a'.repeat(64),
+        storage_class: 'FILE' as const,
+      };
+
+      const validManifest: ArtifactManifest = {
+        adjudication_id: 'adj-test-1',
+        entries: [validEntry],
+        lifecycle_version: 1,
+        manifest_schema_version: 1,
+        verification_execution_id: 'exec-test-1',
+      };
+
+      // 1. Missing top-level key (adjudication_id missing)
+      const missingKeyObj: Record<string, unknown> = {
+        entries: [validEntry],
+        lifecycle_version: 1,
+        manifest_schema_version: 1,
+        verification_execution_id: 'exec-test-1',
+      };
+      expect(() => {
+        parseAndVerifyArtifactManifest(JSON.stringify(missingKeyObj));
+      }).toThrow(/Invalid manifest property set/);
+
+      // 2. Extra top-level key
+      const extraKeyObj: Record<string, unknown> = {
+        ...validManifest,
+        unexpected_extra_property: true,
+      };
+      expect(() => {
+        parseAndVerifyArtifactManifest(JSON.stringify(extraKeyObj));
+      }).toThrow(/Invalid manifest property set/);
+
+      // 3. Entry missing required key (missing storage_class)
+      const missingEntryProp: Record<string, unknown> = {
+        byte_size: 10,
+        content_type: 'text/plain',
+        evidence_id: 'ev-test-1',
+        evidence_type: 'LOG',
+        relative_path: 'log.txt',
+        sha256: 'a'.repeat(64),
+      };
+      const manifestMissingEntryProp = {
+        ...validManifest,
+        entries: [missingEntryProp],
+      };
+      expect(() => {
+        parseAndVerifyArtifactManifest(JSON.stringify(manifestMissingEntryProp));
+      }).toThrow(/Invalid manifest entry property set/);
+
+      // 4. Entry alias (storageClass instead of storage_class)
+      const aliasEntryProp: Record<string, unknown> = {
+        byte_size: 10,
+        content_type: 'text/plain',
+        evidence_id: 'ev-test-1',
+        evidence_type: 'LOG',
+        relative_path: 'log.txt',
+        sha256: 'a'.repeat(64),
+        storageClass: 'FILE',
+      };
+      const manifestAliasEntryProp = {
+        ...validManifest,
+        entries: [aliasEntryProp],
+      };
+      expect(() => {
+        parseAndVerifyArtifactManifest(JSON.stringify(manifestAliasEntryProp));
+      }).toThrow(/Invalid manifest entry property set/);
+    });
+
+    it('274. Exact manifest parser rejects raw versus canonical hash disagreement', () => {
+      const entryA = {
+        byte_size: 10,
+        content_type: 'text/plain',
+        evidence_id: 'ev-b',
+        evidence_type: 'LOG',
+        relative_path: 'b.txt',
+        sha256: 'b'.repeat(64),
+        storage_class: 'FILE' as const,
+      };
+      const entryB = {
+        byte_size: 20,
+        content_type: 'text/plain',
+        evidence_id: 'ev-a',
+        evidence_type: 'LOG',
+        relative_path: 'a.txt',
+        sha256: 'a'.repeat(64),
+        storage_class: 'FILE' as const,
+      };
+
+      const manifestObj: ArtifactManifest = {
+        adjudication_id: 'adj-test-hash',
+        entries: [entryA, entryB],
+        lifecycle_version: 1,
+        manifest_schema_version: 1,
+        verification_execution_id: 'exec-test-hash',
+      };
+
+      const rawJson = JSON.stringify(manifestObj);
+      const rawSha = crypto.createHash('sha256').update(rawJson, 'utf8').digest('hex');
+      const canonicalHash = computeArtifactManifestHash(manifestObj);
+
+      expect(() => {
+        parseAndVerifyArtifactManifest(rawJson, rawSha);
+      }).toThrow(/MANIFEST_HASH_MISMATCH/);
+
+      const parsed = parseAndVerifyArtifactManifest(rawJson, canonicalHash);
+      expect(parsed.adjudication_id).toBe('adj-test-hash');
+      expect(parsed.entries[0].evidence_id).toBe('ev-a');
+      expect(parsed.entries[1].evidence_id).toBe('ev-b');
+    });
+
+    it('275. Evidence integrity fails closed when disk byte size differs from manifest or hash mismatches', () => {
+      const testDir = fs.mkdtempSync(path.join(os.tmpdir(), 'af-evidence-test-'));
+      try {
+        const filePath = path.join(testDir, 'evidence.txt');
+        const content = 'Hello Evidence Store';
+        fs.writeFileSync(filePath, content, 'utf8');
+        const actualSha = crypto.createHash('sha256').update(content, 'utf8').digest('hex');
+        const actualBytes = Buffer.byteLength(content, 'utf8');
+
+        const wrongSizeEvidence: Evidence = {
+          id: 'ev-wrong-size',
+          project_id: fixtures.projectId,
+          task_id: fixtures.taskId,
+          attempt_id: fixtures.attemptId,
+          evidence_type: 'TEST_RESULT',
+          storage_type: 'FILE',
+          content_type: 'text/plain',
+          file_path: filePath,
+          byte_size: actualBytes + 999,
+          hash: actualSha,
+          summary: 'test summary',
+          raw_payload: null,
+          created_at: new Date().toISOString(),
+        };
+        const store = new ArtifactStore(testDir);
+        expect(verifyEvidenceIntegrity(wrongSizeEvidence, store).valid).toBe(false);
+
+        const wrongShaEvidence: Evidence = {
+          id: 'ev-wrong-sha',
+          project_id: fixtures.projectId,
+          task_id: fixtures.taskId,
+          attempt_id: fixtures.attemptId,
+          evidence_type: 'TEST_RESULT',
+          storage_type: 'FILE',
+          content_type: 'text/plain',
+          file_path: filePath,
+          byte_size: actualBytes,
+          hash: 'f'.repeat(64),
+          summary: 'test summary',
+          raw_payload: null,
+          created_at: new Date().toISOString(),
+        };
+        expect(verifyEvidenceIntegrity(wrongShaEvidence, store).valid).toBe(false);
+
+        const validEvidence: Evidence = {
+          id: 'ev-valid',
+          project_id: fixtures.projectId,
+          task_id: fixtures.taskId,
+          attempt_id: fixtures.attemptId,
+          evidence_type: 'TEST_RESULT',
+          storage_type: 'FILE',
+          content_type: 'text/plain',
+          file_path: filePath,
+          byte_size: actualBytes,
+          hash: actualSha,
+          summary: 'test summary',
+          raw_payload: null,
+          created_at: new Date().toISOString(),
+        };
+        expect(verifyEvidenceIntegrity(validEvidence, store).valid).toBe(true);
+      } finally {
+        fs.rmSync(testDir, { recursive: true, force: true });
+      }
+    });
+
+    it('276. Public R5J5 artifact methods cannot overwrite an existing different-content target', () => {
+      const testDir = fs.mkdtempSync(path.join(os.tmpdir(), 'af-store-no-overwrite-'));
+      try {
+        const store = new ArtifactStore(testDir, 0);
+        const contentA = 'Original Immutable Content';
+        const resultA = store.store(
+          'ev-store-no-ow',
+          fixtures.projectId,
+          fixtures.taskId,
+          fixtures.attemptId,
+          'PROCESS_LOG',
+          'summary',
+          contentA,
+          'text/plain'
+        );
+        expect(resultA.file_path).toBeDefined();
+        expect(fs.readFileSync(resultA.file_path!, 'utf8')).toBe(contentA);
+
+        fs.writeFileSync(resultA.file_path!, 'Corrupted Tampered Content', 'utf8');
+
+        expect(() => {
+          store.store(
+            'ev-store-no-ow-2',
+            fixtures.projectId,
+            fixtures.taskId,
+            fixtures.attemptId,
+            'PROCESS_LOG',
+            'summary',
+            contentA,
+            'text/plain'
+          );
+        }).toThrow(/HASH_COLLISION_MISMATCH/);
+
+        expect(fs.readFileSync(resultA.file_path!, 'utf8')).toBe('Corrupted Tampered Content');
+      } finally {
+        fs.rmSync(testDir, { recursive: true, force: true });
+      }
+    });
+
+    it('277. Exclusive creation: ArtifactStore.stage rejects overwrite of existing staged file', () => {
+      const testDir = fs.mkdtempSync(path.join(os.tmpdir(), 'af-stage-exclusive-'));
+      try {
+        const store = new ArtifactStore(testDir);
+        const id = 'ev-exclusive-1';
+        const payload = 'Staged Content One';
+        const res1 = store.stage(id, fixtures.projectId, fixtures.taskId, fixtures.attemptId, 'PROCESS_LOG', 'sum', payload);
+        expect(res1.stagedPath).toBeDefined();
+        expect(fs.existsSync(res1.stagedPath!)).toBe(true);
+
+        expect(() => {
+          store.stage(id, fixtures.projectId, fixtures.taskId, fixtures.attemptId, 'PROCESS_LOG', 'sum', payload);
+        }).toThrow(/Failed to stage file exclusively.*EEXIST/);
+      } finally {
+        fs.rmSync(testDir, { recursive: true, force: true });
+      }
+    });
+
+    it('278. Same-content concurrent writers to ArtifactStore converge and leave no temp files', async () => {
+      const testDir = fs.mkdtempSync(path.join(os.tmpdir(), 'af-concurrent-store-'));
+      try {
+        const store = new ArtifactStore(testDir, 0);
+        const payload = 'Shared Concurrent Content for Multi-Writer Convergence';
+
+        const promises = Array.from({ length: 8 }, (_, i) =>
+          Promise.resolve().then(() =>
+            store.store(
+              `ev-concurrent-${i}`,
+              fixtures.projectId,
+              fixtures.taskId,
+              fixtures.attemptId,
+              'PROCESS_LOG',
+              'summary',
+              payload,
+              'text/plain'
+            )
+          )
+        );
+
+        const results = await Promise.all(promises);
+        const firstPath = results[0].file_path!;
+        const firstHash = results[0].hash;
+
+        for (const res of results) {
+          expect(res.file_path).toBe(firstPath);
+          expect(res.hash).toBe(firstHash);
+        }
+
+        expect(fs.readFileSync(firstPath, 'utf8')).toBe(payload);
+
+        const filesInDir: string[] = [];
+        const scan = (d: string) => {
+          for (const item of fs.readdirSync(d)) {
+            const p = path.join(d, item);
+            if (fs.statSync(p).isDirectory()) scan(p);
+            else filesInDir.push(item);
+          }
+        };
+        scan(testDir);
+        const tempFiles = filesInDir.filter((f) => f.includes('.tmp.'));
+        expect(tempFiles).toEqual([]);
+      } finally {
+        fs.rmSync(testDir, { recursive: true, force: true });
+      }
+    });
+
+    it('279. Rollback cleanup failure creates visible durable cleanup debt and fences adjudication', async () => {
+      const { plaintextToken } = issueSubmissionSessionHelper(fixtures.repo, fixtures.authorizationId);
+      const subId = crypto.randomUUID();
+      fixtures.mcpService.submitCoderClaim(createValidSubmissionPayload(fixtures, subId), plaintextToken);
+
+      const origCleanup = fixtures.artifactStore.cleanupRollbackFiles.bind(fixtures.artifactStore);
+      const origExecute = fixtures.verificationService.executeSealedVerification.bind(fixtures.verificationService);
+
+      try {
+        fixtures.artifactStore.cleanupRollbackFiles = () => ({
+          cleanedCount: 0,
+          failures: [{ path: '/leaked/quarantine_artifact.bin', error: 'Permission denied on delete' }],
+        });
+
+        fixtures.verificationService.executeSealedVerification = () =>
+          Promise.reject(new Error('Simulated verification crash to trigger rollback'));
+
+        await expect(
+          fixtures.adjudicationService.admitSubmissionForVerification({
+            requestId: crypto.randomUUID(),
+            submissionId: subId,
+          })
+        ).rejects.toThrow(/Simulated verification crash to trigger rollback/);
+
+        const adjs = fixtures.repo.getCoderSubmissionAdjudicationsBySubmissionId(subId);
+        expect(adjs.length).toBe(1);
+        expect(adjs[0].status).toBe('RECOVERY_FENCED');
+        expect(adjs[0].failure_code).toBe('CLEANUP_DEBT_FENCED');
+      } finally {
+        fixtures.artifactStore.cleanupRollbackFiles = origCleanup;
+        fixtures.verificationService.executeSealedVerification = origExecute;
+      }
+    });
+
+    it('280. ProcessRunner timeout awaits memoized termination promise before settling result', async () => {
+      const testDir = fs.mkdtempSync(path.join(os.tmpdir(), 'af-proc-timeout-'));
+      try {
+        const scriptPath = path.join(testDir, 'sleep.js');
+        fs.writeFileSync(scriptPath, 'setTimeout(() => {}, 15000);', 'utf8');
+
+        const res = await ProcessRunner.execute({
+          executable: process.execPath,
+          args: [scriptPath],
+          cwd: testDir,
+          timeoutMs: 150,
+        });
+
+        expect(res.timedOut).toBe(true);
+        expect(res.errorCode).toBe('TIMEOUT');
+        expect(res.processTermination).toBe('PROCESS_TREE_TERMINATED_PROVEN');
+        if (res.pid !== null) {
+          const isDead = await ProcessRunner.verifyProcessDeadWithDeadline(res.pid, 2000);
+          expect(isDead).toBe(true);
+        }
+      } finally {
+        fs.rmSync(testDir, { recursive: true, force: true });
+      }
+    });
+
+    it('281. ProcessRunner output limit exceeds cap and awaits termination promise', async () => {
+      const testDir = fs.mkdtempSync(path.join(os.tmpdir(), 'af-proc-output-'));
+      try {
+        const scriptPath = path.join(testDir, 'flood.js');
+        fs.writeFileSync(
+          scriptPath,
+          'for (let i = 0; i < 200; i++) { process.stdout.write("overflow-stream-buffer-" + i + "\\n"); }',
+          'utf8'
+        );
+
+        const res = await ProcessRunner.execute({
+          executable: process.execPath,
+          args: [scriptPath],
+          cwd: testDir,
+          maxStdoutBytes: 80,
+        });
+
+        expect(res.outputLimitExceeded).toBe(true);
+        expect(res.errorCode).toBe('OUTPUT_LIMIT_EXCEEDED');
+        expect(res.processTermination).toBe('PROCESS_TREE_TERMINATED_PROVEN');
+        if (res.pid !== null) {
+          const isDead = await ProcessRunner.verifyProcessDeadWithDeadline(res.pid, 2000);
+          expect(isDead).toBe(true);
+        }
+      } finally {
+        fs.rmSync(testDir, { recursive: true, force: true });
+      }
+    });
+
+    it('282. Concurrent cancelAsync and terminateAllProcessesAsync share termination promise and leave PID registry empty', async () => {
+      const testDir = fs.mkdtempSync(path.join(os.tmpdir(), 'af-proc-concurrent-'));
+      try {
+        const scriptPath = path.join(testDir, 'long.js');
+        fs.writeFileSync(scriptPath, 'setTimeout(() => {}, 20000);', 'utf8');
+
+        const executionId = crypto.randomUUID();
+        const runPromise = ProcessRunner.execute({
+          executionId,
+          executable: process.execPath,
+          args: [scriptPath],
+          cwd: testDir,
+          timeoutMs: 30000,
+        });
+
+        await new Promise((resolve) => setTimeout(resolve, 80));
+
+        const [cancelRes, termRes] = await Promise.all([
+          ProcessRunner.cancelAsync(executionId),
+          ProcessRunner.terminateAllProcessesAsync(),
+        ]);
+
+        expect(['PROCESS_TREE_TERMINATED_PROVEN', 'NOT_APPLICABLE']).toContain(cancelRes);
+        expect(termRes.allTerminatedProven).toBe(true);
+
+        const runResult = await runPromise;
+        expect(runResult.cancelled).toBe(true);
+        expect(ProcessRunner.getActiveProcessCount()).toBe(0);
+      } finally {
+        fs.rmSync(testDir, { recursive: true, force: true });
+      }
+    });
+
+    it('283. evaluateCanonicalSettlementDecision rejects exit 0 when result envelope contains failure_code or contradiction', () => {
+      const nowIso = new Date().toISOString();
+      const subId = crypto.randomUUID();
+      const adjId = crypto.randomUUID();
+
+      const validEntry: ArtifactManifestEntry = {
+        byte_size: 10,
+        content_type: 'text/plain',
+        evidence_id: 'ev-test-manifest',
+        evidence_type: 'LOG',
+        relative_path: 'test.log',
+        sha256: 'b'.repeat(64),
+        storage_class: 'FILE',
+      };
+
+      const manifest: ArtifactManifest = {
+        adjudication_id: adjId,
+        entries: [validEntry],
+        lifecycle_version: 1,
+        manifest_schema_version: 1,
+        verification_execution_id: 'exec-test-1',
+      };
+
+      const manifestHash = computeArtifactManifestHash(manifest);
+      const cmdHash = computeSha256('{"command":"test"}');
+
+      const adjudication: CoderSubmissionAdjudication = {
+        id: adjId,
+        submission_id: subId,
+        authorization_id: fixtures.authorizationId,
+        project_id: fixtures.projectId,
+        task_id: fixtures.taskId,
+        attempt_id: fixtures.attemptId,
+        assignment_id: fixtures.assignmentId,
+        task_ownership_epoch: 1,
+        action: 'ADMIT_VERIFICATION',
+        status: 'VERIFYING',
+        lifecycle_version: 2,
+        protocol_message_id: null,
+        request_id: crypto.randomUUID(),
+        authority_snapshot_json: '{}',
+        authority_snapshot_hash: computeSha256('{}'),
+        workspace_snapshot_before_json: null,
+        workspace_snapshot_before_hash: null,
+        verification_commands_json: '{"command":"test"}',
+        verification_commands_hash: cmdHash,
+        created_at: nowIso,
+        verification_started_at: nowIso,
+        completed_at: null,
+        recovery_fenced_at: null,
+        failure_code: null,
+        failure_json: null,
+        test_run_id: 'tr-exit-zero',
+        git_status_evidence_id: 'ev-status-1',
+        git_diff_evidence_id: 'ev-diff-1',
+        verification_execution_id: 'exec-test-1',
+        artifact_manifest_json: null,
+        artifact_manifest_hash: null,
+      };
+
+      const testRun: TestRun = {
+        id: 'tr-exit-zero',
+        task_id: fixtures.taskId,
+        command: 'npm test',
+        exit_code: 0,
+        passed_count: 10,
+        failed_count: 0,
+        skipped_count: 0,
+        duration_ms: 50,
+        evidence_id: null,
+        created_at: nowIso,
+      };
+
+      const contradictoryEnvelope: CanonicalVerificationResultEnvelope = {
+        adjudication_id: adjId,
+        artifact_manifest_hash: manifestHash,
+        assignment_id: fixtures.assignmentId,
+        attempt_id: fixtures.attemptId,
+        authorization_id: fixtures.authorizationId,
+        command_snapshot_hash: cmdHash,
+        exit_classification: 'EXIT_ZERO',
+        failure_code: 'INTEGRITY_MISMATCH',
+        failure_payload: { reason: 'Contradiction test' },
+        finish_timestamp: nowIso,
+        git_diff_evidence_hash: 'e'.repeat(64),
+        git_diff_evidence_id: 'ev-diff-1',
+        git_status_evidence_hash: 'f'.repeat(64),
+        git_status_evidence_id: 'ev-status-1',
+        lifecycle_version: 2,
+        process_start_classification: 'SPAWNED_PROVEN',
+        project_id: fixtures.projectId,
+        start_timestamp: nowIso,
+        task_id: fixtures.taskId,
+        task_ownership_epoch: 1,
+        termination_classification: 'TERMINATION_PROVEN',
+        test_result_evidence_hash: '1'.repeat(64),
+        test_result_evidence_id: 'ev-tr-1',
+        test_run_id: 'tr-exit-zero',
+        verification_execution_id: 'exec-test-1',
+        workspace_snapshot_after_hash: '2'.repeat(64),
+        workspace_snapshot_before_hash: '3'.repeat(64),
+      };
+
+      const decision = evaluateCanonicalSettlementDecision({
+        envelope: contradictoryEnvelope,
+        adjudication,
+        testRun,
+        manifest,
+        gitStatusEvidenceId: 'ev-status-1',
+        gitDiffEvidenceId: 'ev-diff-1',
+        testResultEvidenceId: 'ev-tr-1',
+      });
+
+      expect(decision.valid).toBe(false);
+      expect(decision.isSuccess).toBe(false);
+      expect(decision.targetStatus).toBe('RECOVERY_FENCED');
+      expect(decision.failureCode).toBe('INTEGRITY_MISMATCH');
+      expect(decision.contradictionReason).toBe('EXIT_ZERO with failure_code');
+    });
+
+    it('284. Repeated recovery scanner execution on settled adjudication is strictly idempotent with no duplicate events or dispositions', () => {
+      const { plaintextToken } = issueSubmissionSessionHelper(fixtures.repo, fixtures.authorizationId);
+      const subId = crypto.randomUUID();
+      fixtures.mcpService.submitCoderClaim(createValidSubmissionPayload(fixtures, subId), plaintextToken);
+
+      const nowIso = new Date().toISOString();
+      const adjId = crypto.randomUUID();
+
+      fixtures.repo.createCoderSubmissionAdjudication({
+        id: adjId,
+        submission_id: subId,
+        authorization_id: fixtures.authorizationId,
+        project_id: fixtures.projectId,
+        task_id: fixtures.taskId,
+        attempt_id: fixtures.attemptId,
+        assignment_id: fixtures.assignmentId,
+        task_ownership_epoch: 1,
+        action: 'ADMIT_VERIFICATION',
+        status: 'VERIFYING',
+        lifecycle_version: 2,
+        protocol_message_id: null,
+        request_id: crypto.randomUUID(),
+        authority_snapshot_json: '{}',
+        authority_snapshot_hash: computeSha256('{}'),
+        workspace_snapshot_before_json: canonicalJsonStringify({ head_sha: fixtures.repoHeadSha, status_lines: [] }),
+        workspace_snapshot_before_hash: computeSha256(canonicalJsonStringify({ head_sha: fixtures.repoHeadSha, status_lines: [] })),
+        verification_commands_json: '{}',
+        verification_commands_hash: computeSha256('{}'),
+        created_at: nowIso,
+        verification_started_at: nowIso,
+        completed_at: null,
+        recovery_fenced_at: null,
+        failure_code: null,
+        failure_json: null,
+        test_run_id: null,
+        git_status_evidence_id: null,
+        git_diff_evidence_id: null,
+        verification_execution_id: crypto.randomUUID(),
+        artifact_manifest_json: null,
+        artifact_manifest_hash: null,
+      });
+
+      // Pass 1: reconcile and fence the missing manifest
+      const report1 = fixtures.recoveryScanner.scanAndReconcile();
+      expect(report1.settledCount).toBe(0);
+      expect(report1.fencedCount).toBe(1);
+
+      const eventsAfterPass1 = fixtures.repo.getCoderSubmissionAdjudicationEvents(adjId);
+      const dispAfterPass1 = fixtures.repo.getCoderSubmissionDispositions(subId);
+      expect(eventsAfterPass1.length).toBeGreaterThanOrEqual(1);
+      expect(dispAfterPass1.length).toBe(1);
+
+      // Pass 2: replay scanAndReconcile on the already-fenced adjudication
+      const report2 = fixtures.recoveryScanner.scanAndReconcile();
+      expect(report2.settledCount).toBe(0);
+      expect(report2.fencedCount).toBe(0);
+
+      const eventsAfterPass2 = fixtures.repo.getCoderSubmissionAdjudicationEvents(adjId);
+      const dispAfterPass2 = fixtures.repo.getCoderSubmissionDispositions(subId);
+
+      expect(eventsAfterPass2.length).toBe(eventsAfterPass1.length);
+      expect(dispAfterPass2.length).toBe(dispAfterPass1.length);
     });
 
     it('223. historical three-file compatibility diffs remain byte-identical to initial head', () => {
