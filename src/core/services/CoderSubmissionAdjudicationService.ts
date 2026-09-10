@@ -221,14 +221,168 @@ export function deriveDeterministicDispositionId(
   return `${hex.substring(0, 8)}-${hex.substring(8, 12)}-${hex.substring(12, 16)}-${hex.substring(16, 20)}-${hex.substring(20, 32)}`;
 }
 
+export function validateAndParseCanonicalResultEnvelope(
+  rawJson: string,
+  expectedHash?: string
+): {
+  valid: boolean;
+  envelope: CanonicalVerificationResultEnvelope | null;
+  error?: string;
+} {
+  if (!rawJson || typeof rawJson !== 'string' || rawJson.trim() === '') {
+    return { valid: false, envelope: null, error: 'Empty or missing result envelope JSON' };
+  }
+
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(rawJson);
+  } catch {
+    return { valid: false, envelope: null, error: 'Malformed JSON in verification result envelope' };
+  }
+
+  if (
+    typeof parsed !== 'object' ||
+    parsed === null ||
+    Array.isArray(parsed) ||
+    Object.getPrototypeOf(parsed) !== Object.prototype
+  ) {
+    return { valid: false, envelope: null, error: 'Verification result envelope must be a strict plain object' };
+  }
+
+  const obj = parsed as Record<string, unknown>;
+  const actualKeys = Object.keys(obj).sort();
+  const expectedKeys = [...CANONICAL_VERIFICATION_RESULT_ENVELOPE_KEYS].sort();
+
+  if (
+    actualKeys.length !== expectedKeys.length ||
+    actualKeys.some((k, i) => k !== expectedKeys[i])
+  ) {
+    return { valid: false, envelope: null, error: 'Verification result envelope property set mismatch (missing or extra keys)' };
+  }
+
+  // Canonical JSON byte equality check
+  const canonicalForm = canonicalJsonStringify(obj);
+  if (canonicalForm !== rawJson) {
+    return { valid: false, envelope: null, error: 'Verification result envelope is not byte-identical to its canonical JSON representation' };
+  }
+
+  // SHA-256 hash recomputation
+  const computedHash = computeSha256(rawJson);
+  if (expectedHash && computedHash.toLowerCase() !== expectedHash.toLowerCase()) {
+    return { valid: false, envelope: null, error: `Verification result envelope hash mismatch: expected ${expectedHash}, got ${computedHash}` };
+  }
+
+  // Exact field domain validations
+  if (typeof obj.adjudication_id !== 'string' || !obj.adjudication_id.trim()) {
+    return { valid: false, envelope: null, error: 'adjudication_id must be non-empty string' };
+  }
+  if (typeof obj.project_id !== 'string' || !obj.project_id.trim()) {
+    return { valid: false, envelope: null, error: 'project_id must be non-empty string' };
+  }
+  if (typeof obj.task_id !== 'string' || !obj.task_id.trim()) {
+    return { valid: false, envelope: null, error: 'task_id must be non-empty string' };
+  }
+  if (obj.attempt_id !== null && (typeof obj.attempt_id !== 'string' || !obj.attempt_id.trim())) {
+    return { valid: false, envelope: null, error: 'attempt_id must be string or null' };
+  }
+  if (typeof obj.assignment_id !== 'string' || !obj.assignment_id.trim()) {
+    return { valid: false, envelope: null, error: 'assignment_id must be non-empty string' };
+  }
+  if (typeof obj.authorization_id !== 'string' || !obj.authorization_id.trim()) {
+    return { valid: false, envelope: null, error: 'authorization_id must be non-empty string' };
+  }
+  if (typeof obj.task_ownership_epoch !== 'number' || !Number.isInteger(obj.task_ownership_epoch) || obj.task_ownership_epoch < 0) {
+    return { valid: false, envelope: null, error: 'task_ownership_epoch must be non-negative integer' };
+  }
+  if (typeof obj.lifecycle_version !== 'number' || !Number.isInteger(obj.lifecycle_version) || obj.lifecycle_version < 1) {
+    return { valid: false, envelope: null, error: 'lifecycle_version must be positive integer' };
+  }
+  if (typeof obj.verification_execution_id !== 'string' || !obj.verification_execution_id.trim()) {
+    return { valid: false, envelope: null, error: 'verification_execution_id must be non-empty string' };
+  }
+  if (typeof obj.command_snapshot_hash !== 'string' || !/^[0-9a-f]{64}$/i.test(obj.command_snapshot_hash)) {
+    return { valid: false, envelope: null, error: 'command_snapshot_hash must be 64-char hex string' };
+  }
+  if (typeof obj.workspace_snapshot_before_hash !== 'string' || !obj.workspace_snapshot_before_hash.trim()) {
+    return { valid: false, envelope: null, error: 'workspace_snapshot_before_hash must be non-empty string' };
+  }
+  if (typeof obj.workspace_snapshot_after_hash !== 'string' || !obj.workspace_snapshot_after_hash.trim()) {
+    return { valid: false, envelope: null, error: 'workspace_snapshot_after_hash must be non-empty string' };
+  }
+  if (typeof obj.artifact_manifest_hash !== 'string' || !/^[0-9a-f]{64}$/i.test(obj.artifact_manifest_hash)) {
+    return { valid: false, envelope: null, error: 'artifact_manifest_hash must be 64-char hex string' };
+  }
+  if (typeof obj.start_timestamp !== 'string' || isNaN(Date.parse(obj.start_timestamp))) {
+    return { valid: false, envelope: null, error: 'start_timestamp must be valid ISO timestamp' };
+  }
+  if (typeof obj.finish_timestamp !== 'string' || isNaN(Date.parse(obj.finish_timestamp))) {
+    return { valid: false, envelope: null, error: 'finish_timestamp must be valid ISO timestamp' };
+  }
+  if (Date.parse(obj.finish_timestamp) < Date.parse(obj.start_timestamp)) {
+    return { valid: false, envelope: null, error: 'finish_timestamp must be monotonically >= start_timestamp' };
+  }
+
+  const validExit = ['EXIT_ZERO', 'EXIT_NONZERO', 'NONZERO_EXIT', 'TIMEOUT', 'CANCELLED', 'UNKNOWN', 'PROCESS_LAUNCH_FAILED', 'OUTPUT_LIMIT_EXCEEDED'];
+  if (typeof obj.exit_classification !== 'string' || !validExit.includes(obj.exit_classification)) {
+    return { valid: false, envelope: null, error: `Invalid exit_classification: ${obj.exit_classification}` };
+  }
+
+  const validTerm = ['TERMINATION_PROVEN', 'TERMINATION_AMBIGUOUS', 'NOT_APPLICABLE'];
+  if (typeof obj.termination_classification !== 'string' || !validTerm.includes(obj.termination_classification)) {
+    return { valid: false, envelope: null, error: `Invalid termination_classification: ${obj.termination_classification}` };
+  }
+
+  const validStart = ['SPAWNED_PROVEN', 'LAUNCH_FAILED_PROVEN', 'NOT_STARTED_PROVEN', 'LAUNCH_AMBIGUOUS'];
+  if (typeof obj.process_start_classification !== 'string' || !validStart.includes(obj.process_start_classification)) {
+    return { valid: false, envelope: null, error: `Invalid process_start_classification: ${obj.process_start_classification}` };
+  }
+
+  if (typeof obj.git_diff_evidence_hash !== 'string') {
+    return { valid: false, envelope: null, error: 'git_diff_evidence_hash must be string' };
+  }
+  if (typeof obj.git_diff_evidence_id !== 'string') {
+    return { valid: false, envelope: null, error: 'git_diff_evidence_id must be string' };
+  }
+  if (typeof obj.git_status_evidence_hash !== 'string') {
+    return { valid: false, envelope: null, error: 'git_status_evidence_hash must be string' };
+  }
+  if (typeof obj.git_status_evidence_id !== 'string') {
+    return { valid: false, envelope: null, error: 'git_status_evidence_id must be string' };
+  }
+  if (typeof obj.test_result_evidence_hash !== 'string') {
+    return { valid: false, envelope: null, error: 'test_result_evidence_hash must be string' };
+  }
+  if (typeof obj.test_result_evidence_id !== 'string') {
+    return { valid: false, envelope: null, error: 'test_result_evidence_id must be string' };
+  }
+  if (typeof obj.test_run_id !== 'string') {
+    return { valid: false, envelope: null, error: 'test_run_id must be string' };
+  }
+
+  if (obj.failure_code !== null && (typeof obj.failure_code !== 'string' || !obj.failure_code.trim())) {
+    return { valid: false, envelope: null, error: 'failure_code must be string or null' };
+  }
+  if (obj.failure_payload !== null && (typeof obj.failure_payload !== 'object' || Array.isArray(obj.failure_payload))) {
+    return { valid: false, envelope: null, error: 'failure_payload must be plain object or null' };
+  }
+
+  return { valid: true, envelope: obj as unknown as CanonicalVerificationResultEnvelope };
+}
+
 export interface CanonicalSettlementEvaluationInput {
   envelope: CanonicalVerificationResultEnvelope;
+  rawEnvelopeJson?: string;
+  expectedEnvelopeHash?: string;
   adjudication: CoderSubmissionAdjudication;
   testRun: TestRun | null;
   manifest: ArtifactManifest | null;
+  rawManifestJson?: string;
+  expectedManifestHash?: string;
   gitStatusEvidenceId?: string | null;
   gitDiffEvidenceId?: string | null;
   testResultEvidenceId?: string | null;
+  repo?: Repository;
+  artifactStore?: ArtifactStore;
 }
 
 export interface CanonicalSettlementDecision {
@@ -247,9 +401,41 @@ export interface CanonicalSettlementDecision {
 export function evaluateCanonicalSettlementDecision(
   input: CanonicalSettlementEvaluationInput
 ): CanonicalSettlementDecision {
-  const { envelope, adjudication, testRun, manifest, gitStatusEvidenceId, gitDiffEvidenceId, testResultEvidenceId } = input;
+  const {
+    envelope,
+    rawEnvelopeJson,
+    expectedEnvelopeHash,
+    adjudication,
+    testRun,
+    manifest,
+    rawManifestJson,
+    expectedManifestHash,
+    gitStatusEvidenceId,
+    gitDiffEvidenceId,
+    testResultEvidenceId,
+    repo,
+    artifactStore,
+  } = input;
 
-  // 1. Validate envelope shape and exact keys
+  // 1. Validate envelope shape, canonical JSON equality, and hash recomputation
+  if (rawEnvelopeJson !== undefined) {
+    const parseRes = validateAndParseCanonicalResultEnvelope(rawEnvelopeJson, expectedEnvelopeHash);
+    if (!parseRes.valid) {
+      return {
+        valid: false,
+        isSuccess: false,
+        targetStatus: 'RECOVERY_FENCED',
+        taskTransition: 'NEEDS_HUMAN',
+        eventType: 'RECOVERY_FENCED',
+        dispositionEvent: 'REJECTED',
+        dispositionReason: 'RECOVERY_FENCED',
+        failureCode: 'INTEGRITY_MISMATCH',
+        failureDetail: parseRes.error || 'Verification result envelope validation failed',
+        contradictionReason: parseRes.error || 'Envelope validation failed',
+      };
+    }
+  }
+
   if (!envelope || typeof envelope !== 'object' || Array.isArray(envelope)) {
     return {
       valid: false,
@@ -290,7 +476,8 @@ export function evaluateCanonicalSettlementDecision(
     envelope.attempt_id !== adjudication.attempt_id ||
     envelope.assignment_id !== adjudication.assignment_id ||
     envelope.authorization_id !== adjudication.authorization_id ||
-    envelope.task_ownership_epoch !== adjudication.task_ownership_epoch
+    envelope.task_ownership_epoch !== adjudication.task_ownership_epoch ||
+    (adjudication.verification_execution_id && envelope.verification_execution_id !== adjudication.verification_execution_id)
   ) {
     return {
       valid: false,
@@ -307,7 +494,10 @@ export function evaluateCanonicalSettlementDecision(
   }
 
   // 3. Validate command snapshot & lifecycle version
-  if (envelope.command_snapshot_hash !== adjudication.verification_commands_hash) {
+  if (
+    !envelope.command_snapshot_hash ||
+    envelope.command_snapshot_hash !== adjudication.verification_commands_hash
+  ) {
     return {
       valid: false,
       isSuccess: false,
@@ -322,8 +512,47 @@ export function evaluateCanonicalSettlementDecision(
     };
   }
 
-  // 4. Validate artifact manifest presence and hash
-  if (!manifest) {
+  // 4. Validate workspace before snapshot
+  if (
+    adjudication.workspace_snapshot_before_hash &&
+    envelope.workspace_snapshot_before_hash !== adjudication.workspace_snapshot_before_hash
+  ) {
+    return {
+      valid: false,
+      isSuccess: false,
+      targetStatus: 'RECOVERY_FENCED',
+      taskTransition: 'NEEDS_HUMAN',
+      eventType: 'RECOVERY_FENCED',
+      dispositionEvent: 'REJECTED',
+      dispositionReason: 'RECOVERY_FENCED',
+      failureCode: 'INTEGRITY_MISMATCH',
+      failureDetail: 'Envelope workspace_snapshot_before_hash mismatch adjudication',
+      contradictionReason: 'workspace_snapshot_before_hash mismatch',
+    };
+  }
+
+  // 5. Validate artifact manifest presence, parsing, hash, and disk evidence
+  let parsedManifest = manifest;
+  if (rawManifestJson !== undefined) {
+    try {
+      parsedManifest = parseAndVerifyArtifactManifest(rawManifestJson, expectedManifestHash ?? envelope.artifact_manifest_hash);
+    } catch (mParseErr: unknown) {
+      return {
+        valid: false,
+        isSuccess: false,
+        targetStatus: 'RECOVERY_FENCED',
+        taskTransition: 'NEEDS_HUMAN',
+        eventType: 'RECOVERY_FENCED',
+        dispositionEvent: 'REJECTED',
+        dispositionReason: 'RECOVERY_FENCED',
+        failureCode: 'INTEGRITY_MISMATCH',
+        failureDetail: `Artifact manifest parsing failed: ${mParseErr instanceof Error ? mParseErr.message : String(mParseErr)}`,
+        contradictionReason: 'Artifact manifest parsing failed',
+      };
+    }
+  }
+
+  if (!parsedManifest) {
     return {
       valid: false,
       isSuccess: false,
@@ -338,7 +567,7 @@ export function evaluateCanonicalSettlementDecision(
     };
   }
 
-  const computedManifestHash = computeArtifactManifestHash(manifest);
+  const computedManifestHash = computeArtifactManifestHash(parsedManifest);
   if (envelope.artifact_manifest_hash !== computedManifestHash) {
     return {
       valid: false,
@@ -354,8 +583,92 @@ export function evaluateCanonicalSettlementDecision(
     };
   }
 
-  // 5. Validate evidence IDs if provided
-  if (gitStatusEvidenceId !== undefined && envelope.git_status_evidence_id !== gitStatusEvidenceId) {
+  if (parsedManifest.adjudication_id !== adjudication.id) {
+    return {
+      valid: false,
+      isSuccess: false,
+      targetStatus: 'RECOVERY_FENCED',
+      taskTransition: 'NEEDS_HUMAN',
+      eventType: 'RECOVERY_FENCED',
+      dispositionEvent: 'REJECTED',
+      dispositionReason: 'RECOVERY_FENCED',
+      failureCode: 'INTEGRITY_MISMATCH',
+      failureDetail: 'Manifest adjudication_id mismatch',
+      contradictionReason: 'Manifest adjudication_id mismatch',
+    };
+  }
+
+  if (repo) {
+    for (const entry of parsedManifest.entries) {
+      if (!entry.evidence_id || !entry.sha256 || !entry.relative_path) {
+        return {
+          valid: false,
+          isSuccess: false,
+          targetStatus: 'RECOVERY_FENCED',
+          taskTransition: 'NEEDS_HUMAN',
+          eventType: 'RECOVERY_FENCED',
+          dispositionEvent: 'REJECTED',
+          dispositionReason: 'RECOVERY_FENCED',
+          failureCode: 'INTEGRITY_MISMATCH',
+          failureDetail: 'Manifest entry missing required fields',
+          contradictionReason: 'Manifest entry invalid',
+        };
+      }
+      const ev = repo.getEvidence(entry.evidence_id);
+      if (!ev || ev.hash !== entry.sha256 || ev.byte_size !== entry.byte_size || ev.project_id !== adjudication.project_id || ev.task_id !== adjudication.task_id) {
+        return {
+          valid: false,
+          isSuccess: false,
+          targetStatus: 'RECOVERY_FENCED',
+          taskTransition: 'NEEDS_HUMAN',
+          eventType: 'RECOVERY_FENCED',
+          dispositionEvent: 'REJECTED',
+          dispositionReason: 'RECOVERY_FENCED',
+          failureCode: 'INTEGRITY_MISMATCH',
+          failureDetail: `Manifest entry evidence ${entry.evidence_id} missing or mismatched in database`,
+          contradictionReason: 'Manifest entry evidence mismatch',
+        };
+      }
+      if (ev.storage_type === 'FILE' && ev.file_path) {
+        if (!fs.existsSync(ev.file_path)) {
+          return {
+            valid: false,
+            isSuccess: false,
+            targetStatus: 'RECOVERY_FENCED',
+            taskTransition: 'NEEDS_HUMAN',
+            eventType: 'RECOVERY_FENCED',
+            dispositionEvent: 'REJECTED',
+            dispositionReason: 'RECOVERY_FENCED',
+            failureCode: 'INTEGRITY_MISMATCH',
+            failureDetail: `Manifest file missing on disk: ${entry.relative_path}`,
+            contradictionReason: 'Manifest file missing on disk',
+          };
+        }
+        const fileBytes = fs.readFileSync(ev.file_path);
+        const actualHash = crypto.createHash('sha256').update(fileBytes).digest('hex');
+        if (fileBytes.length !== entry.byte_size || actualHash !== entry.sha256) {
+          return {
+            valid: false,
+            isSuccess: false,
+            targetStatus: 'RECOVERY_FENCED',
+            taskTransition: 'NEEDS_HUMAN',
+            eventType: 'RECOVERY_FENCED',
+            dispositionEvent: 'REJECTED',
+            dispositionReason: 'RECOVERY_FENCED',
+            failureCode: 'INTEGRITY_MISMATCH',
+            failureDetail: `Manifest file disk size or hash mismatch: ${entry.relative_path}`,
+            contradictionReason: 'Manifest file disk integrity mismatch',
+          };
+        }
+      }
+    }
+  }
+
+  // 6. Validate evidence IDs if provided
+  if (
+    gitStatusEvidenceId !== undefined &&
+    (envelope.git_status_evidence_id || null) !== (gitStatusEvidenceId || null)
+  ) {
     return {
       valid: false,
       isSuccess: false,
@@ -369,7 +682,10 @@ export function evaluateCanonicalSettlementDecision(
       contradictionReason: 'git_status_evidence_id mismatch',
     };
   }
-  if (gitDiffEvidenceId !== undefined && envelope.git_diff_evidence_id !== gitDiffEvidenceId) {
+  if (
+    gitDiffEvidenceId !== undefined &&
+    (envelope.git_diff_evidence_id || null) !== (gitDiffEvidenceId || null)
+  ) {
     return {
       valid: false,
       isSuccess: false,
@@ -383,7 +699,10 @@ export function evaluateCanonicalSettlementDecision(
       contradictionReason: 'git_diff_evidence_id mismatch',
     };
   }
-  if (testResultEvidenceId !== undefined && envelope.test_result_evidence_id !== testResultEvidenceId) {
+  if (
+    testResultEvidenceId !== undefined &&
+    (envelope.test_result_evidence_id || null) !== (testResultEvidenceId || null)
+  ) {
     return {
       valid: false,
       isSuccess: false,
@@ -398,7 +717,61 @@ export function evaluateCanonicalSettlementDecision(
     };
   }
 
-  // 6. Test run consistency check (consistency check only, not standalone authority)
+  if (repo && artifactStore) {
+    if (envelope.git_status_evidence_id) {
+      const gse = repo.getEvidence(envelope.git_status_evidence_id);
+      if (!gse || !verifyEvidenceIntegrity(gse, artifactStore).valid) {
+        return {
+          valid: false,
+          isSuccess: false,
+          targetStatus: 'RECOVERY_FENCED',
+          taskTransition: 'NEEDS_HUMAN',
+          eventType: 'RECOVERY_FENCED',
+          dispositionEvent: 'REJECTED',
+          dispositionReason: 'RECOVERY_FENCED',
+          failureCode: 'INTEGRITY_MISMATCH',
+          failureDetail: 'Git status evidence integrity failed',
+          contradictionReason: 'git_status_evidence integrity failed',
+        };
+      }
+    }
+    if (envelope.git_diff_evidence_id) {
+      const gde = repo.getEvidence(envelope.git_diff_evidence_id);
+      if (!gde || !verifyEvidenceIntegrity(gde, artifactStore).valid) {
+        return {
+          valid: false,
+          isSuccess: false,
+          targetStatus: 'RECOVERY_FENCED',
+          taskTransition: 'NEEDS_HUMAN',
+          eventType: 'RECOVERY_FENCED',
+          dispositionEvent: 'REJECTED',
+          dispositionReason: 'RECOVERY_FENCED',
+          failureCode: 'INTEGRITY_MISMATCH',
+          failureDetail: 'Git diff evidence integrity failed',
+          contradictionReason: 'git_diff_evidence integrity failed',
+        };
+      }
+    }
+    if (envelope.test_result_evidence_id) {
+      const tre = repo.getEvidence(envelope.test_result_evidence_id);
+      if (!tre || !verifyEvidenceIntegrity(tre, artifactStore).valid) {
+        return {
+          valid: false,
+          isSuccess: false,
+          targetStatus: 'RECOVERY_FENCED',
+          taskTransition: 'NEEDS_HUMAN',
+          eventType: 'RECOVERY_FENCED',
+          dispositionEvent: 'REJECTED',
+          dispositionReason: 'RECOVERY_FENCED',
+          failureCode: 'INTEGRITY_MISMATCH',
+          failureDetail: 'Test result evidence integrity failed',
+          contradictionReason: 'test_result_evidence integrity failed',
+        };
+      }
+    }
+  }
+
+  // 7. Test run consistency check (consistency check only, not standalone authority)
   if (testRun) {
     if (envelope.test_run_id !== testRun.id) {
       return {
@@ -458,23 +831,53 @@ export function evaluateCanonicalSettlementDecision(
     };
   }
 
-  // 7. Internal envelope contradiction check
-  if (envelope.exit_classification === 'EXIT_ZERO' && envelope.failure_code !== null) {
-    return {
-      valid: false,
-      isSuccess: false,
-      targetStatus: 'RECOVERY_FENCED',
-      taskTransition: 'NEEDS_HUMAN',
-      eventType: 'RECOVERY_FENCED',
-      dispositionEvent: 'REJECTED',
-      dispositionReason: 'RECOVERY_FENCED',
-      failureCode: 'INTEGRITY_MISMATCH',
-      failureDetail: `Contradiction: exit_classification is EXIT_ZERO but failure_code is "${envelope.failure_code}"`,
-      contradictionReason: 'EXIT_ZERO with failure_code',
-    };
+  // 8. Internal envelope contradiction check
+  if (envelope.exit_classification === 'EXIT_ZERO') {
+    if (envelope.failure_code !== null) {
+      return {
+        valid: false,
+        isSuccess: false,
+        targetStatus: 'RECOVERY_FENCED',
+        taskTransition: 'NEEDS_HUMAN',
+        eventType: 'RECOVERY_FENCED',
+        dispositionEvent: 'REJECTED',
+        dispositionReason: 'RECOVERY_FENCED',
+        failureCode: 'INTEGRITY_MISMATCH',
+        failureDetail: `Contradiction: exit_classification is EXIT_ZERO but failure_code is "${envelope.failure_code}"`,
+        contradictionReason: 'EXIT_ZERO with failure_code',
+      };
+    }
+    if (envelope.termination_classification !== 'TERMINATION_PROVEN') {
+      return {
+        valid: false,
+        isSuccess: false,
+        targetStatus: 'RECOVERY_FENCED',
+        taskTransition: 'NEEDS_HUMAN',
+        eventType: 'RECOVERY_FENCED',
+        dispositionEvent: 'REJECTED',
+        dispositionReason: 'RECOVERY_FENCED',
+        failureCode: 'INTEGRITY_MISMATCH',
+        failureDetail: 'Contradiction: exit_classification is EXIT_ZERO but termination_classification is not TERMINATION_PROVEN',
+        contradictionReason: 'EXIT_ZERO with unproven termination',
+      };
+    }
+    if (envelope.process_start_classification !== 'SPAWNED_PROVEN') {
+      return {
+        valid: false,
+        isSuccess: false,
+        targetStatus: 'RECOVERY_FENCED',
+        taskTransition: 'NEEDS_HUMAN',
+        eventType: 'RECOVERY_FENCED',
+        dispositionEvent: 'REJECTED',
+        dispositionReason: 'RECOVERY_FENCED',
+        failureCode: 'INTEGRITY_MISMATCH',
+        failureDetail: 'Contradiction: exit_classification is EXIT_ZERO but process_start_classification is not SPAWNED_PROVEN',
+        contradictionReason: 'EXIT_ZERO with unspawned process',
+      };
+    }
   }
 
-  // 8. Determine settlement decision
+  // 9. Determine settlement decision
   const isCleanSuccess =
     envelope.exit_classification === 'EXIT_ZERO' &&
     envelope.failure_code === null &&
@@ -518,7 +921,7 @@ export function evaluateCanonicalSettlementDecision(
       dispositionEvent: 'REJECTED',
       dispositionReason: 'RECOVERY_FENCED',
       failureCode: envelope.failure_code || 'INTEGRITY_MISMATCH',
-      failureDetail: envelope.failure_payload?.error as string || envelope.failure_code || 'Process execution ambiguous',
+      failureDetail: (envelope.failure_payload?.error as string) || envelope.failure_code || 'Process execution ambiguous',
     };
   }
 
@@ -531,7 +934,7 @@ export function evaluateCanonicalSettlementDecision(
     dispositionEvent: 'REJECTED',
     dispositionReason: 'VERIFICATION_FAILED',
     failureCode: envelope.failure_code || (envelope.exit_classification === 'TIMEOUT' ? 'VERIFICATION_TIMEOUT' : 'TESTS_FAILED'),
-    failureDetail: envelope.failure_payload?.error as string || `Verification failed: ${envelope.exit_classification}`,
+    failureDetail: (envelope.failure_payload?.error as string) || `Verification failed: ${envelope.exit_classification}`,
   };
 }
 

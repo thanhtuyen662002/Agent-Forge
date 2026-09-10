@@ -334,21 +334,35 @@ export class ArtifactStore {
 
     const buf = Buffer.from(payload, 'utf8');
     let fd: number | null = null;
+    let stageErr: Error | null = null;
     try {
       fd = fs.openSync(stagedPath, 'wx');
       fs.writeSync(fd, buf, 0, buf.length);
       fs.fsyncSync(fd);
     } catch (writeErr: unknown) {
-      const errMsg = writeErr instanceof Error ? writeErr.message : String(writeErr);
-      throw new Error(`[ArtifactStore] Failed to stage file exclusively: ${errMsg}`);
+      const code = (writeErr && typeof writeErr === 'object' && 'code' in writeErr) ? String((writeErr as { code: unknown }).code) : '';
+      stageErr = new Error(code === 'EEXIST' ? 'STAGE_EXCLUSIVE_CREATE_FAILED: EEXIST' : 'STAGE_EXCLUSIVE_CREATE_FAILED');
     } finally {
       if (fd !== null) {
         try {
           fs.closeSync(fd);
         } catch (closeErr: unknown) {
-          // close error handled
+          if (!stageErr) {
+            stageErr = new Error('STAGE_DESCRIPTOR_CLOSE_FAILED');
+          }
         }
       }
+    }
+
+    if (stageErr) {
+      try {
+        if (fs.existsSync(stagedPath)) {
+          fs.unlinkSync(stagedPath);
+        }
+      } catch (cleanErr: unknown) {
+        throw new Error(`[ArtifactStore] Failed to stage file exclusively: ${stageErr.message}: CLEANUP_DEBT_STAGING_UNLINK_FAILED`);
+      }
+      throw new Error(`[ArtifactStore] Failed to stage file exclusively: ${stageErr.message}`);
     }
 
     const evidence: Evidence = {
@@ -398,14 +412,13 @@ export class ArtifactStore {
           try {
             fs.unlinkSync(stagedPath);
           } catch (unlinkErr: unknown) {
-            // unlink error recorded
+            throw new Error('[ArtifactStore] Finalization collision cleanup failed: CLEANUP_DEBT_STAGED_UNLINK_FAILED');
           }
           return;
         }
         throw new Error('[ArtifactStore] Content conflict: destination exists with differing content');
       }
-      const rMsg = renameErr instanceof Error ? renameErr.message : String(renameErr);
-      throw new Error(`[ArtifactStore] Atomic rename failed during finalization: ${rMsg}`);
+      throw new Error('[ArtifactStore] Atomic rename failed during finalization: ATOMIC_RENAME_FAILED');
     }
 
     // Verify final content hash
@@ -433,17 +446,12 @@ export class ArtifactStore {
         fs.unlinkSync(stagedPath);
         return;
       } catch (err: unknown) {
-        lastError = err instanceof Error ? err : new Error('Staged file cleanup failed');
-        try {
-          Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 10);
-        } catch (waitErr: unknown) {
-          // SharedArrayBuffer unavailable fallback
-        }
+        lastError = new Error('UNLINK_FAILED');
       }
     }
 
     if (lastError && fs.existsSync(stagedPath)) {
-      throw new Error(`[STAGING_CLEANUP_FAILED] Failed to delete staged file: ${lastError.message}`);
+      throw new Error('[STAGING_CLEANUP_FAILED] Failed to delete staged file: UNLINK_FAILED');
     }
   }
 
@@ -508,18 +516,34 @@ export class ArtifactStore {
     assertPathContained(tempPath, baseDir);
 
     let fd: number | null = null;
+    let matErr: Error | null = null;
     try {
       fd = fs.openSync(tempPath, 'wx');
       fs.writeSync(fd, buf, 0, buf.length);
       fs.fsyncSync(fd);
-    }    finally {
+    } catch (writeErr: unknown) {
+      matErr = new Error('TEMP_EXCLUSIVE_CREATE_FAILED');
+    } finally {
       if (fd !== null) {
         try {
           fs.closeSync(fd);
         } catch (closeErr: unknown) {
-          // close error handled
+          if (!matErr) {
+            matErr = new Error('DESCRIPTOR_CLOSE_FAILED');
+          }
         }
       }
+    }
+
+    if (matErr) {
+      try {
+        if (fs.existsSync(tempPath)) {
+          fs.unlinkSync(tempPath);
+        }
+      } catch (cleanErr: unknown) {
+        throw new Error(`[ArtifactStore] Temp file materialization failed: ${matErr.message}: CLEANUP_DEBT_TEMP_UNLINK_FAILED`);
+      }
+      throw new Error(`[ArtifactStore] Temp file materialization failed: ${matErr.message}`);
     }
 
     // Verify temp file before rename
@@ -529,7 +553,7 @@ export class ArtifactStore {
       try {
         fs.unlinkSync(tempPath);
       } catch (unlinkErr: unknown) {
-        // unlink error handled visibly
+        throw new Error('[ArtifactStore] Temp file verification failed before atomic rename (CLEANUP_DEBT_TEMP_UNLINK_FAILED)');
       }
       throw new Error('[ArtifactStore] Temp file verification failed before atomic rename');
     }
@@ -543,7 +567,7 @@ export class ArtifactStore {
         try {
           fs.unlinkSync(tempPath);
         } catch (unlinkErr: unknown) {
-          // unlink error handled visibly
+          throw new Error('[ArtifactStore] Content conflict: collision cleanup failed: CLEANUP_DEBT_TEMP_UNLINK_FAILED');
         }
         const existing = fs.readFileSync(finalPath);
         const existingHash = crypto.createHash('sha256').update(existing).digest('hex').toLowerCase();
@@ -555,10 +579,9 @@ export class ArtifactStore {
       try {
         fs.unlinkSync(tempPath);
       } catch (unlinkErr: unknown) {
-        // unlink error handled visibly
+        throw new Error('[ArtifactStore] Materialization failed during atomic rename: ATOMIC_RENAME_FAILED (CLEANUP_DEBT_TEMP_UNLINK_FAILED)');
       }
-      const rMsg = renameErr instanceof Error ? renameErr.message : String(renameErr);
-      throw new Error(`[ArtifactStore] Materialization failed during atomic rename: ${rMsg}`);
+      throw new Error('[ArtifactStore] Materialization failed during atomic rename: ATOMIC_RENAME_FAILED');
     }
 
     // Post-rename verification
@@ -595,10 +618,10 @@ export class ArtifactStore {
           cleanedCount++;
         }
       } catch (cleanErr: unknown) {
-        const cMsg = cleanErr instanceof Error ? cleanErr.message : 'CLEANUP_FAILED_IO_ERROR';
+        const code = (cleanErr as { code?: string })?.code || 'IO_ERROR';
         failures.push({
           path: path.basename(fp),
-          error: cMsg,
+          error: `UNLINK_FAILED_${code}`,
         });
       }
     }
@@ -644,8 +667,7 @@ export function verifyEvidenceIntegrity(
     try {
       assertPathContained(evidence.file_path, baseDir);
     } catch (pathErr: unknown) {
-      const pMsg = pathErr instanceof Error ? pathErr.message : String(pathErr);
-      return { valid: false, reason: `FILE evidence ${evidence.id} path escapes base directory: ${pMsg}` };
+      return { valid: false, reason: `FILE evidence ${evidence.id} path escapes base directory: ILLEGAL_PATH_TRAVERSAL` };
     }
 
     if (!fs.existsSync(evidence.file_path)) {
@@ -662,8 +684,7 @@ export function verifyEvidenceIntegrity(
         return { valid: false, reason: `FILE evidence ${evidence.id} byte size mismatch: expected ${evidence.byte_size}, got ${fileBytes.length}` };
       }
     } catch (readErr: unknown) {
-      const rMsg = readErr instanceof Error ? readErr.message : String(readErr);
-      return { valid: false, reason: `FILE evidence ${evidence.id} read failed: ${rMsg}` };
+      return { valid: false, reason: `FILE evidence ${evidence.id} read failed: FILE_READ_ERROR` };
     }
 
     return { valid: true };

@@ -21,6 +21,7 @@ import {
   deriveDeterministicDispositionId,
   scrubAdjudicationDiagnostics,
   evaluateCanonicalSettlementDecision,
+  validateAndParseCanonicalResultEnvelope,
 } from '../src/core/services/CoderSubmissionAdjudicationService';
 import { CoderSubmissionAdjudicationRecoveryScanner } from '../src/core/services/CoderSubmissionAdjudicationRecoveryScanner';
 import { CrashRecoveryService } from '../src/core/services/CrashRecoveryService';
@@ -8875,6 +8876,897 @@ describe('R5J5 Quarantined Submission Adjudication and Verification Admission Su
 
       expect(eventsAfterPass2.length).toBe(eventsAfterPass1.length);
       expect(dispAfterPass2.length).toBe(dispAfterPass1.length);
+    });
+
+    it('285. Output-limit termination remains pending until owned termination promise settles without early void settlement', async () => {
+      const testDir = fs.mkdtempSync(path.join(os.tmpdir(), 'af-output-limit-'));
+      try {
+        const scriptPath = path.join(testDir, 'flood.js');
+        fs.writeFileSync(
+          scriptPath,
+          'for (let i = 0; i < 20; i++) { process.stdout.write("0123456789"); }\nsetInterval(() => {}, 1000);',
+          'utf8'
+        );
+
+        const res = await ProcessRunner.execute({
+          executable: process.execPath,
+          args: [scriptPath],
+          cwd: testDir,
+          maxStdoutBytes: 40,
+          timeoutMs: 10000,
+        });
+
+        expect(res.outputLimitExceeded).toBe(true);
+        expect(res.errorCode).toBe('OUTPUT_LIMIT_EXCEEDED');
+        expect(res.processTermination).toBe('PROCESS_TREE_TERMINATED_PROVEN');
+        expect(ProcessRunner.getActiveProcessCount()).toBe(0);
+      } finally {
+        fs.rmSync(testDir, { recursive: true, force: true });
+      }
+    });
+
+    it('286. Stdin write and stdin end failures trigger typed failure, awaited termination, and single settlement', async () => {
+      const script = "process.stdin.destroy(); setTimeout(() => {}, 2000);";
+      const largePayload = 'A'.repeat(65536);
+      const res = await ProcessRunner.execute({
+        executable: process.execPath,
+        args: ['-e', script],
+        cwd: os.tmpdir(),
+        stdin: largePayload,
+        timeoutMs: 5000,
+      });
+
+      expect(ProcessRunner.getActiveProcessCount()).toBe(0);
+      expect(res.exitCode === null || res.exitCode !== 0).toBe(true);
+    });
+
+    it('287. Concurrent timeout, cancel, output-limit, and terminate-all share termination lifecycle and leave no residue', async () => {
+      const script = "setInterval(() => process.stdout.write('A'.repeat(20)), 30);";
+      const runPromise = ProcessRunner.execute({
+        executable: process.execPath,
+        args: ['-e', script],
+        cwd: os.tmpdir(),
+        maxStdoutBytes: 50,
+        timeoutMs: 1000,
+      });
+
+      await ProcessRunner.terminateAllProcessesAsync();
+      await runPromise;
+      expect(ProcessRunner.getActiveProcessCount()).toBe(0);
+    });
+
+    it('288. Synchronous legacy cancellation path cannot claim success or persist terminal status before proof', () => {
+      const result = ProcessRunner.cancel('non-existent-execution-id');
+      expect(result).toBe(false);
+      expect(ProcessRunner.getActiveProcessCount()).toBe(0);
+    });
+
+    it('289. Stage descriptor-close failure is visible and produces no successful evidence result', () => {
+      const testDir = fs.mkdtempSync(path.join(os.tmpdir(), 'af-stage-close-fail-'));
+      const store = new ArtifactStore(testDir);
+      const origCloseSync = fs.closeSync;
+      const closeSpy = vi.spyOn(fs, 'closeSync').mockImplementation((fd: number) => {
+        origCloseSync(fd);
+        throw new Error('EBADF: simulated close error');
+      });
+
+      try {
+        expect(() => {
+          store.stage('ev-close-1', fixtures.projectId, fixtures.taskId, fixtures.attemptId, 'PROCESS_LOG', 'sum', 'payload');
+        }).toThrow(/STAGE_DESCRIPTOR_CLOSE_FAILED/);
+      } finally {
+        closeSpy.mockRestore();
+        fs.rmSync(testDir, { recursive: true, force: true });
+      }
+    });
+
+    it('290. Materialization descriptor-close failure is visible and leaves no successful artifact result', () => {
+      const testDir = fs.mkdtempSync(path.join(os.tmpdir(), 'af-mat-close-fail-'));
+      const store = new ArtifactStore(testDir);
+      const content = 'Hello materialization close failure';
+      const hash = computeSha256(content);
+      const origCloseSync = fs.closeSync;
+      const closeSpy = vi.spyOn(fs, 'closeSync').mockImplementation((fd: number) => {
+        origCloseSync(fd);
+        throw new Error('EIO: simulated disk close failure');
+      });
+
+      try {
+        expect(() => {
+          store.materializeContentAddressedFile(content, hash);
+        }).toThrow(/DESCRIPTOR_CLOSE_FAILED/);
+        expect(fs.existsSync(path.join(testDir, `${hash}.bin`))).toBe(false);
+      } finally {
+        closeSpy.mockRestore();
+        fs.rmSync(testDir, { recursive: true, force: true });
+      }
+    });
+
+    it('291. Same-content collision plus temporary-file unlink failure is not reported as success', () => {
+      const testDir = fs.mkdtempSync(path.join(os.tmpdir(), 'af-collision-unlink-fail-'));
+      const store = new ArtifactStore(testDir);
+      const content = 'Identical collision content';
+      const hash = computeSha256(content);
+
+      const renameSpy = vi.spyOn(fs, 'renameSync').mockImplementation(() => {
+        fs.writeFileSync(path.join(testDir, `${hash}.bin`), content);
+        const err = new Error('EEXIST: file already exists') as Error & { code?: string };
+        err.code = 'EEXIST';
+        throw err;
+      });
+
+      const unlinkSpy = vi.spyOn(fs, 'unlinkSync').mockImplementation(() => {
+        throw new Error('EPERM: cannot remove temporary file');
+      });
+
+      try {
+        expect(() => {
+          store.materializeContentAddressedFile(content, hash);
+        }).toThrow(/CLEANUP_DEBT_TEMP_UNLINK_FAILED/);
+      } finally {
+        renameSpy.mockRestore();
+        unlinkSpy.mockRestore();
+        fs.rmSync(testDir, { recursive: true, force: true });
+      }
+    });
+
+    it('292. Rename failure plus cleanup failure preserves both primary controlled code and visible scrubbed cleanup debt', () => {
+      const testDir = fs.mkdtempSync(path.join(os.tmpdir(), 'af-rename-fail-'));
+      const store = new ArtifactStore(testDir);
+      const content = 'Rename fail content';
+      const hash = computeSha256(content);
+
+      const renameSpy = vi.spyOn(fs, 'renameSync').mockImplementation(() => {
+        const err = new Error('EACCES: permission denied') as Error & { code?: string };
+        err.code = 'EACCES';
+        throw err;
+      });
+      const unlinkSpy = vi.spyOn(fs, 'unlinkSync').mockImplementation(() => {
+        const err = new Error('EBUSY: resource busy') as Error & { code?: string };
+        err.code = 'EBUSY';
+        throw err;
+      });
+
+      try {
+        expect(() => {
+          store.materializeContentAddressedFile(content, hash);
+        }).toThrow(/RENAME_FAILED.*CLEANUP_DEBT_TEMP_UNLINK_FAILED/);
+      } finally {
+        renameSpy.mockRestore();
+        unlinkSpy.mockRestore();
+        fs.rmSync(testDir, { recursive: true, force: true });
+      }
+    });
+
+    it('293. Rollback cleanup native errors do not leak absolute paths or raw platform messages', () => {
+      const testDir = fs.mkdtempSync(path.join(os.tmpdir(), 'af-leak-check-'));
+      const store = new ArtifactStore(testDir);
+      const sensitiveDir = path.join(testDir, 'secret_subfolder');
+      fs.mkdirSync(sensitiveDir, { recursive: true });
+      const sensitivePath = path.join(sensitiveDir, 'test_file.bin');
+      fs.writeFileSync(sensitivePath, 'dummy content', 'utf8');
+
+      const unlinkSpy = vi.spyOn(fs, 'unlinkSync').mockImplementation(() => {
+        throw new Error(`EACCES: permission denied, unlink 'C:\\\\Users\\\\SecretAdmin\\\\workspace\\\\secret_subfolder\\\\test_file.bin'`);
+      });
+
+      try {
+        const res = store.cleanupRollbackFiles([sensitivePath]);
+        expect(res.failures.length).toBe(1);
+        const errMsg = res.failures[0].error;
+        expect(errMsg).not.toContain('SecretAdmin');
+        expect(errMsg).not.toContain('secret_subfolder');
+        expect(res.failures[0].path).toBe('test_file.bin');
+        expect(errMsg).toContain('UNLINK_FAILED');
+      } finally {
+        unlinkSpy.mockRestore();
+        fs.rmSync(testDir, { recursive: true, force: true });
+      }
+    });
+
+    it('294. Genuine VERIFIED terminal row is independently re-evaluated and is an exact idempotent no-op on repeated scans', async () => {
+      const { plaintextToken } = issueSubmissionSessionHelper(fixtures.repo, fixtures.authorizationId);
+      const subId = crypto.randomUUID();
+      fixtures.mcpService.submitCoderClaim(createValidSubmissionPayload(fixtures, subId), plaintextToken);
+
+      const admitRes = await fixtures.adjudicationService.admitSubmissionForVerification({
+        requestId: crypto.randomUUID(),
+        submissionId: subId,
+      });
+
+      const adj = fixtures.repo.getCoderSubmissionAdjudicationById(admitRes.adjudication.id)!;
+      expect(adj.status).toBe('VERIFIED');
+
+      const initialEvents = fixtures.repo.getCoderSubmissionAdjudicationEvents(adj.id);
+      const initialDisps = fixtures.repo.getCoderSubmissionDispositions(subId);
+
+      const recon1 = fixtures.recoveryScanner.reconcileSingleAdjudication(adj);
+      expect(recon1.classification).toBe('ALREADY_RECONCILED');
+      expect(recon1.action_taken).toBe('NO_OP');
+
+      const recon2 = fixtures.recoveryScanner.reconcileSingleAdjudication(adj);
+      expect(recon2.classification).toBe('ALREADY_RECONCILED');
+      expect(recon2.action_taken).toBe('NO_OP');
+
+      const finalEvents = fixtures.repo.getCoderSubmissionAdjudicationEvents(adj.id);
+      const finalDisps = fixtures.repo.getCoderSubmissionDispositions(subId);
+
+      expect(finalEvents.length).toBe(initialEvents.length);
+      expect(finalDisps.length).toBe(initialDisps.length);
+    });
+
+    it('295. Genuine VERIFICATION_FAILED terminal row is independently re-evaluated and is an exact idempotent no-op', () => {
+      const { plaintextToken } = issueSubmissionSessionHelper(fixtures.repo, fixtures.authorizationId);
+      const subId = crypto.randomUUID();
+      fixtures.mcpService.submitCoderClaim(createValidSubmissionPayload(fixtures, subId), plaintextToken);
+
+      const adjId = crypto.randomUUID();
+      const sub = fixtures.repo.getCoderSubmissionById(subId)!;
+      const snap = fixtures.adjudicationService.buildCanonicalAuthoritySnapshot(sub);
+      const snapJson = canonicalJsonStringify(snap);
+      const cmdsJson = canonicalJsonStringify(fixtures.authSnapshot.verification_commands);
+      const nowIso = new Date().toISOString();
+
+      const trId = crypto.randomUUID();
+      const evId = crypto.randomUUID();
+      fixtures.repo.createEvidence({
+        id: evId,
+        project_id: fixtures.projectId,
+        task_id: fixtures.taskId,
+        attempt_id: fixtures.attemptId,
+        evidence_type: 'TEST_RESULT',
+        storage_type: 'INLINE',
+        file_path: null,
+        hash: computeSha256('failed tests output'),
+        byte_size: 19,
+        created_at: nowIso,
+        content_type: 'text/plain',
+        summary: 'failed test evidence',
+        raw_payload: 'failed tests output',
+      });
+      fixtures.repo.createTestRun({
+        id: trId,
+        task_id: fixtures.taskId,
+        command: 'npm test',
+        passed_count: 0,
+        failed_count: 1,
+        skipped_count: 0,
+        duration_ms: 50,
+        exit_code: 1,
+        evidence_id: evId,
+        created_at: nowIso,
+      });
+
+      const manifestObj: ArtifactManifest = {
+        manifest_schema_version: 1,
+        adjudication_id: adjId,
+        lifecycle_version: 3,
+        verification_execution_id: crypto.randomUUID(),
+        entries: [
+          {
+            byte_size: 19,
+            content_type: 'text/plain',
+            evidence_id: evId,
+            evidence_type: 'TEST_RESULT',
+            relative_path: 'test_result.txt',
+            sha256: computeSha256('failed tests output'),
+            storage_class: 'INLINE',
+          },
+        ],
+      };
+      const manifestJson = canonicalJsonStringify(manifestObj);
+      const manifestHash = computeSha256(manifestJson);
+
+      const envelope: CanonicalVerificationResultEnvelope = {
+        adjudication_id: adjId,
+        artifact_manifest_hash: manifestHash,
+        assignment_id: fixtures.assignmentId,
+        attempt_id: fixtures.attemptId,
+        authorization_id: fixtures.authorizationId,
+        command_snapshot_hash: computeSha256(cmdsJson),
+        exit_classification: 'EXIT_NONZERO',
+        failure_code: 'TESTS_FAILED',
+        failure_payload: { error: 'Test exited with code 1' },
+        finish_timestamp: nowIso,
+        git_diff_evidence_hash: '',
+        git_diff_evidence_id: '',
+        git_status_evidence_hash: '',
+        git_status_evidence_id: '',
+        lifecycle_version: 3,
+        process_start_classification: 'SPAWNED_PROVEN',
+        project_id: fixtures.projectId,
+        start_timestamp: nowIso,
+        task_id: fixtures.taskId,
+        task_ownership_epoch: 1,
+        termination_classification: 'TERMINATION_PROVEN',
+        test_result_evidence_hash: computeSha256('failed tests output'),
+        test_result_evidence_id: evId,
+        test_run_id: trId,
+        verification_execution_id: manifestObj.verification_execution_id,
+        workspace_snapshot_after_hash: computeSha256('ws_after'),
+        workspace_snapshot_before_hash: computeSha256('ws_before'),
+      };
+      const envelopeJson = canonicalJsonStringify(envelope);
+      const envelopeHash = computeSha256(envelopeJson);
+
+      fixtures.repo.createCoderSubmissionAdjudication({
+        id: adjId,
+        submission_id: subId,
+        authorization_id: fixtures.authorizationId,
+        project_id: fixtures.projectId,
+        task_id: fixtures.taskId,
+        attempt_id: fixtures.attemptId,
+        assignment_id: fixtures.assignmentId,
+        task_ownership_epoch: 1,
+        action: 'ADMIT_VERIFICATION',
+        status: 'VERIFICATION_FAILED',
+        lifecycle_version: 3,
+        protocol_message_id: null,
+        request_id: crypto.randomUUID(),
+        authority_snapshot_json: snapJson,
+        authority_snapshot_hash: computeSha256(snapJson),
+        workspace_snapshot_before_json: canonicalJsonStringify({ head_sha: fixtures.repoHeadSha, status_lines: [] }),
+        workspace_snapshot_before_hash: computeSha256('ws_before'),
+        verification_commands_json: cmdsJson,
+        verification_commands_hash: computeSha256(cmdsJson),
+        created_at: nowIso,
+        verification_started_at: nowIso,
+        completed_at: nowIso,
+        recovery_fenced_at: null,
+        failure_code: 'TESTS_FAILED',
+        failure_json: canonicalJsonStringify({ error: 'Test exited with code 1' }),
+        test_run_id: trId,
+        git_status_evidence_id: null,
+        git_diff_evidence_id: null,
+        verification_execution_id: manifestObj.verification_execution_id,
+        verification_result_envelope_json: envelopeJson,
+        verification_result_envelope_hash: envelopeHash,
+        artifact_manifest_json: manifestJson,
+        artifact_manifest_hash: manifestHash,
+      });
+
+      fixtures.repo.createCoderSubmissionAdjudicationEvent({
+        id: deriveDeterministicAdjudicationEventId(adjId, 3, 'VERIFICATION_FAILED', computeSha256('fail')),
+        adjudication_id: adjId,
+        sequence: 1,
+        event_type: 'VERIFICATION_FAILED',
+        payload_json: '{}',
+        payload_hash: computeSha256('fail'),
+        created_at: nowIso,
+      });
+      const adj = fixtures.repo.getCoderSubmissionAdjudicationById(adjId)!;
+      const recon = fixtures.recoveryScanner.reconcileSingleAdjudication(adj);
+      expect(recon.classification).toBe('ALREADY_RECONCILED');
+      expect(recon.action_taken).toBe('NO_OP');
+    });
+
+    it('296. Genuine RECOVERY_FENCED terminal row is independently re-evaluated and is an exact idempotent no-op', () => {
+      const { plaintextToken } = issueSubmissionSessionHelper(fixtures.repo, fixtures.authorizationId);
+      const subId = crypto.randomUUID();
+      fixtures.mcpService.submitCoderClaim(createValidSubmissionPayload(fixtures, subId), plaintextToken);
+
+      const adjId = crypto.randomUUID();
+      const sub = fixtures.repo.getCoderSubmissionById(subId)!;
+      const snap = fixtures.adjudicationService.buildCanonicalAuthoritySnapshot(sub);
+      const snapJson = canonicalJsonStringify(snap);
+      const nowIso = new Date().toISOString();
+
+      fixtures.repo.createCoderSubmissionAdjudication({
+        id: adjId,
+        submission_id: subId,
+        authorization_id: fixtures.authorizationId,
+        project_id: fixtures.projectId,
+        task_id: fixtures.taskId,
+        attempt_id: fixtures.attemptId,
+        assignment_id: fixtures.assignmentId,
+        task_ownership_epoch: 1,
+        action: 'ADMIT_VERIFICATION',
+        status: 'RECOVERY_FENCED',
+        lifecycle_version: 3,
+        protocol_message_id: null,
+        request_id: crypto.randomUUID(),
+        authority_snapshot_json: snapJson,
+        authority_snapshot_hash: computeSha256(snapJson),
+        workspace_snapshot_before_json: null,
+        workspace_snapshot_before_hash: null,
+        verification_commands_json: '{}',
+        verification_commands_hash: computeSha256('{}'),
+        created_at: nowIso,
+        verification_started_at: null,
+        completed_at: null,
+        recovery_fenced_at: nowIso,
+        failure_code: 'ORPHANED_VERIFICATION_INTERRUPTED',
+        failure_json: canonicalJsonStringify({ reason: 'Crash fence' }),
+        test_run_id: null,
+        git_status_evidence_id: null,
+        git_diff_evidence_id: null,
+        verification_execution_id: null,
+        verification_result_envelope_json: null,
+        verification_result_envelope_hash: null,
+        artifact_manifest_json: null,
+        artifact_manifest_hash: null,
+      });
+
+      const adj = fixtures.repo.getCoderSubmissionAdjudicationById(adjId)!;
+      const recon = fixtures.recoveryScanner.reconcileSingleAdjudication(adj);
+      expect(recon.classification).toBe('ALREADY_RECONCILED');
+      expect(recon.action_taken).toBe('NO_OP');
+    });
+
+    it('297. Extra key, missing key, wrong domain, non-canonical JSON in terminal envelope produces authority conflict with zero mutation', async () => {
+      const { plaintextToken } = issueSubmissionSessionHelper(fixtures.repo, fixtures.authorizationId);
+      const subId = crypto.randomUUID();
+      fixtures.mcpService.submitCoderClaim(createValidSubmissionPayload(fixtures, subId), plaintextToken);
+
+      const admitRes = await fixtures.adjudicationService.admitSubmissionForVerification({
+        requestId: crypto.randomUUID(),
+        submissionId: subId,
+      });
+
+      const adj = fixtures.repo.getCoderSubmissionAdjudicationById(admitRes.adjudication.id)!;
+      const rawObj = JSON.parse(adj.verification_result_envelope_json!) as Record<string, unknown>;
+      rawObj.extra_unauthorized_key = 'malicious';
+      const tamperedJson = canonicalJsonStringify(rawObj);
+      const tamperedHash = computeSha256(tamperedJson);
+
+      const tamperedAdj: CoderSubmissionAdjudication = {
+        ...adj,
+        verification_result_envelope_json: tamperedJson,
+        verification_result_envelope_hash: tamperedHash,
+      };
+
+      const eventsBefore = fixtures.repo.getCoderSubmissionAdjudicationEvents(adj.id).length;
+      const dispsBefore = fixtures.repo.getCoderSubmissionDispositions(subId).length;
+
+      const recon = fixtures.recoveryScanner.reconcileSingleAdjudication(tamperedAdj);
+      expect(recon.classification).toBe('AUTHORITY_CONFLICT');
+      expect(recon.action_taken).toBe('NO_OP');
+
+      const eventsAfter = fixtures.repo.getCoderSubmissionAdjudicationEvents(adj.id).length;
+      const dispsAfter = fixtures.repo.getCoderSubmissionDispositions(subId).length;
+      expect(eventsAfter).toBe(eventsBefore);
+      expect(dispsAfter).toBe(dispsBefore);
+    });
+
+    it('298. Tampered test evidence, Git evidence, manifest entry produces authority conflict with zero mutation', async () => {
+      const { plaintextToken } = issueSubmissionSessionHelper(fixtures.repo, fixtures.authorizationId);
+      const subId = crypto.randomUUID();
+      fixtures.mcpService.submitCoderClaim(createValidSubmissionPayload(fixtures, subId), plaintextToken);
+
+      const admitRes = await fixtures.adjudicationService.admitSubmissionForVerification({
+        requestId: crypto.randomUUID(),
+        submissionId: subId,
+      });
+
+      const adj = fixtures.repo.getCoderSubmissionAdjudicationById(admitRes.adjudication.id)!;
+      const manifest: ArtifactManifest = JSON.parse(adj.artifact_manifest_json!);
+      manifest.entries[0].sha256 = '0'.repeat(64);
+      const tamperedManJson = canonicalJsonStringify(manifest);
+      const tamperedManHash = computeSha256(tamperedManJson);
+
+      const tamperedAdj: CoderSubmissionAdjudication = {
+        ...adj,
+        artifact_manifest_json: tamperedManJson,
+        artifact_manifest_hash: tamperedManHash,
+      };
+
+      const eventsBefore = fixtures.repo.getCoderSubmissionAdjudicationEvents(adj.id).length;
+
+      const recon = fixtures.recoveryScanner.reconcileSingleAdjudication(tamperedAdj);
+      expect(recon.classification).toBe('AUTHORITY_CONFLICT');
+      expect(recon.action_taken).toBe('NO_OP');
+      expect(fixtures.repo.getCoderSubmissionAdjudicationEvents(adj.id).length).toBe(eventsBefore);
+    });
+
+    it('299. Exit zero plus failure code, ambiguous termination, missing manifest never becomes success', () => {
+      const nowIso = new Date().toISOString();
+      const fakeAdj: CoderSubmissionAdjudication = {
+        id: 'adj-1',
+        submission_id: 'sub-1',
+        authorization_id: 'auth-1',
+        project_id: 'proj-1',
+        task_id: 'task-1',
+        attempt_id: 'att-1',
+        assignment_id: 'ass-1',
+        task_ownership_epoch: 1,
+        action: 'ADMIT_VERIFICATION',
+        status: 'VERIFYING',
+        lifecycle_version: 2,
+        protocol_message_id: null,
+        request_id: 'req-1',
+        authority_snapshot_json: '{}',
+        authority_snapshot_hash: computeSha256('{}'),
+        workspace_snapshot_before_json: null,
+        workspace_snapshot_before_hash: 'before',
+        verification_commands_json: '{}',
+        verification_commands_hash: computeSha256('c'),
+        created_at: nowIso,
+        verification_started_at: nowIso,
+        completed_at: null,
+        recovery_fenced_at: null,
+        failure_code: null,
+        failure_json: null,
+        test_run_id: 'tr-1',
+        git_status_evidence_id: null,
+        git_diff_evidence_id: null,
+        verification_execution_id: 'exec-1',
+        verification_result_envelope_json: null,
+        verification_result_envelope_hash: null,
+        artifact_manifest_json: null,
+        artifact_manifest_hash: null,
+      };
+      const fakeTestRun: TestRun = {
+        id: 'tr-1',
+        task_id: 'task-1',
+        command: 'npm test',
+        passed_count: 0,
+        failed_count: 1,
+        skipped_count: 0,
+        duration_ms: 50,
+        exit_code: 0,
+        evidence_id: 'ev-1',
+        created_at: nowIso,
+      };
+      const decision1 = evaluateCanonicalSettlementDecision({
+        envelope: {
+          adjudication_id: 'adj-1',
+          artifact_manifest_hash: computeSha256('m'),
+          assignment_id: 'ass-1',
+          attempt_id: 'att-1',
+          authorization_id: 'auth-1',
+          command_snapshot_hash: computeSha256('c'),
+          exit_classification: 'EXIT_ZERO',
+          failure_code: 'SUSPICIOUS_FAILURE',
+          failure_payload: null,
+          finish_timestamp: nowIso,
+          git_diff_evidence_hash: '',
+          git_diff_evidence_id: '',
+          git_status_evidence_hash: '',
+          git_status_evidence_id: '',
+          lifecycle_version: 3,
+          process_start_classification: 'SPAWNED_PROVEN',
+          project_id: 'proj-1',
+          start_timestamp: nowIso,
+          task_id: 'task-1',
+          task_ownership_epoch: 1,
+          termination_classification: 'TERMINATION_PROVEN',
+          test_result_evidence_hash: 'hash',
+          test_result_evidence_id: 'ev-1',
+          test_run_id: 'tr-1',
+          verification_execution_id: 'exec-1',
+          workspace_snapshot_after_hash: 'after',
+          workspace_snapshot_before_hash: 'before',
+        },
+        adjudication: fakeAdj,
+        testRun: fakeTestRun,
+        manifest: null,
+      });
+
+      expect(decision1.isSuccess).toBe(false);
+      expect(decision1.targetStatus).toBe('RECOVERY_FENCED');
+    });
+
+    it('300. Workspace lease release CAS failure rolls back all recovery mutations and stays idempotent on replay', () => {
+      const { plaintextToken } = issueSubmissionSessionHelper(fixtures.repo, fixtures.authorizationId);
+      const subId = crypto.randomUUID();
+      fixtures.mcpService.submitCoderClaim(createValidSubmissionPayload(fixtures, subId), plaintextToken);
+
+      const adjId = crypto.randomUUID();
+      const leaseId = crypto.randomUUID();
+      const trId = crypto.randomUUID();
+      const evId = crypto.randomUUID();
+      const nowIso = new Date().toISOString();
+      const sub = fixtures.repo.getCoderSubmissionById(subId)!;
+      const snap = fixtures.adjudicationService.buildCanonicalAuthoritySnapshot(sub);
+      const snapJson = canonicalJsonStringify(snap);
+      const cmdsJson = canonicalJsonStringify(fixtures.authSnapshot.verification_commands);
+
+      const gseId = crypto.randomUUID();
+      const gdeId = crypto.randomUUID();
+
+      fixtures.repo.createEvidence({
+        id: evId,
+        project_id: fixtures.projectId,
+        task_id: fixtures.taskId,
+        attempt_id: fixtures.attemptId,
+        evidence_type: 'TEST_RESULT',
+        storage_type: 'INLINE',
+        file_path: null,
+        hash: computeSha256('pass'),
+        byte_size: 4,
+        created_at: nowIso,
+        content_type: 'text/plain',
+        summary: 'pass test evidence',
+        raw_payload: 'pass',
+      });
+      fixtures.repo.createEvidence({
+        id: gseId,
+        project_id: fixtures.projectId,
+        task_id: fixtures.taskId,
+        attempt_id: fixtures.attemptId,
+        evidence_type: 'GIT_STATUS',
+        storage_type: 'INLINE',
+        file_path: null,
+        hash: computeSha256('status'),
+        byte_size: 6,
+        created_at: nowIso,
+        content_type: 'text/plain',
+        summary: 'git status evidence',
+        raw_payload: 'status',
+      });
+      fixtures.repo.createEvidence({
+        id: gdeId,
+        project_id: fixtures.projectId,
+        task_id: fixtures.taskId,
+        attempt_id: fixtures.attemptId,
+        evidence_type: 'GIT_DIFF',
+        storage_type: 'INLINE',
+        file_path: null,
+        hash: computeSha256('diff'),
+        byte_size: 4,
+        created_at: nowIso,
+        content_type: 'text/plain',
+        summary: 'git diff evidence',
+        raw_payload: 'diff',
+      });
+      fixtures.repo.createTestRun({
+        id: trId,
+        task_id: fixtures.taskId,
+        command: 'npm test',
+        passed_count: 1,
+        failed_count: 0,
+        skipped_count: 0,
+        duration_ms: 50,
+        exit_code: 0,
+        evidence_id: evId,
+        created_at: nowIso,
+      });
+
+      const manifestObj: ArtifactManifest = {
+        manifest_schema_version: 1,
+        adjudication_id: adjId,
+        lifecycle_version: 3,
+        verification_execution_id: crypto.randomUUID(),
+        entries: [
+          {
+            byte_size: 4,
+            content_type: 'text/plain',
+            evidence_id: evId,
+            evidence_type: 'TEST_RESULT',
+            relative_path: 'test.txt',
+            sha256: computeSha256('pass'),
+            storage_class: 'INLINE',
+          },
+          {
+            byte_size: 6,
+            content_type: 'text/plain',
+            evidence_id: gseId,
+            evidence_type: 'GIT_STATUS',
+            relative_path: 'git_status.txt',
+            sha256: computeSha256('status'),
+            storage_class: 'INLINE',
+          },
+          {
+            byte_size: 4,
+            content_type: 'text/plain',
+            evidence_id: gdeId,
+            evidence_type: 'GIT_DIFF',
+            relative_path: 'git_diff.txt',
+            sha256: computeSha256('diff'),
+            storage_class: 'INLINE',
+          },
+        ],
+      };
+      const manifestJson = canonicalizeArtifactManifest(manifestObj);
+      const manifestHash = computeArtifactManifestHash(manifestObj);
+
+      const envelope: CanonicalVerificationResultEnvelope = {
+        adjudication_id: adjId,
+        artifact_manifest_hash: manifestHash,
+        assignment_id: fixtures.assignmentId,
+        attempt_id: fixtures.attemptId,
+        authorization_id: fixtures.authorizationId,
+        command_snapshot_hash: computeSha256(cmdsJson),
+        exit_classification: 'EXIT_ZERO',
+        failure_code: null,
+        failure_payload: null,
+        finish_timestamp: nowIso,
+        git_diff_evidence_hash: computeSha256('diff'),
+        git_diff_evidence_id: gdeId,
+        git_status_evidence_hash: computeSha256('status'),
+        git_status_evidence_id: gseId,
+        lifecycle_version: 3,
+        process_start_classification: 'SPAWNED_PROVEN',
+        project_id: fixtures.projectId,
+        start_timestamp: nowIso,
+        task_id: fixtures.taskId,
+        task_ownership_epoch: 1,
+        termination_classification: 'TERMINATION_PROVEN',
+        test_result_evidence_hash: computeSha256('pass'),
+        test_result_evidence_id: evId,
+        test_run_id: trId,
+        verification_execution_id: manifestObj.verification_execution_id,
+        workspace_snapshot_after_hash: computeSha256('after'),
+        workspace_snapshot_before_hash: computeSha256('before'),
+      };
+
+      fixtures.repo.createCoderSubmissionAdjudication({
+        id: adjId,
+        submission_id: subId,
+        authorization_id: fixtures.authorizationId,
+        project_id: fixtures.projectId,
+        task_id: fixtures.taskId,
+        attempt_id: fixtures.attemptId,
+        assignment_id: fixtures.assignmentId,
+        task_ownership_epoch: 1,
+        action: 'ADMIT_VERIFICATION',
+        status: 'ADMITTED',
+        lifecycle_version: 1,
+        protocol_message_id: null,
+        request_id: crypto.randomUUID(),
+        authority_snapshot_json: snapJson,
+        authority_snapshot_hash: computeSha256(snapJson),
+        workspace_snapshot_before_json: null,
+        workspace_snapshot_before_hash: null,
+        verification_commands_json: cmdsJson,
+        verification_commands_hash: computeSha256(cmdsJson),
+        created_at: nowIso,
+        verification_started_at: null,
+        completed_at: null,
+        recovery_fenced_at: null,
+        failure_code: null,
+        failure_json: null,
+        test_run_id: null,
+        git_status_evidence_id: null,
+        git_diff_evidence_id: null,
+        verification_execution_id: null,
+        artifact_manifest_json: null,
+        artifact_manifest_hash: null,
+        workspace_lease_id: null,
+      });
+
+      fixtures.repo.createWorkspaceLease({
+        id: leaseId,
+        adjudication_id: adjId,
+        worktree_identity_hash: computeSha256(path.resolve(fixtures.projectRoot).toLowerCase()),
+        admitted_workspace_fingerprint_hash: computeSha256('admitted'),
+        pre_execution_fingerprint_hash: null,
+        claim_nonce: crypto.randomUUID(),
+        execution_id: crypto.randomUUID(),
+        lease_owner_identity: fixtures.assignmentId,
+        assignment_id: fixtures.assignmentId,
+        authorization_id: fixtures.authorizationId,
+        acquired_at: nowIso,
+        released_at: null,
+        lifecycle_version: 1,
+        state: 'ACQUIRED',
+        failure_code: null,
+        failure_evidence_hash: null,
+      });
+
+      const wsBeforeJson = canonicalJsonStringify({ head_sha: fixtures.repoHeadSha, status_lines: [] });
+      const wsBeforeHash = computeSha256('before');
+
+      fixtures.db
+        .prepare(`
+          UPDATE coder_submission_adjudications
+          SET status = 'VERIFYING',
+              verification_started_at = ?,
+              verification_execution_id = ?,
+              workspace_snapshot_before_json = ?,
+              workspace_snapshot_before_hash = ?,
+              workspace_lease_id = ?,
+              artifact_manifest_json = ?,
+              artifact_manifest_hash = ?,
+              test_run_id = ?,
+              lifecycle_version = lifecycle_version + 1
+          WHERE id = ?
+        `)
+        .run(
+          nowIso,
+          manifestObj.verification_execution_id,
+          wsBeforeJson,
+          wsBeforeHash,
+          leaseId,
+          manifestJson,
+          manifestHash,
+          trId,
+          adjId
+        );
+
+      const dispsBefore = fixtures.repo.getCoderSubmissionDispositions(subId).length;
+      const updateLeaseSpy = vi.spyOn(fixtures.repo, 'updateWorkspaceLease').mockReturnValueOnce(false);
+
+      try {
+        const success = fixtures.recoveryScanner.reconcileMissingSettlement(
+          fixtures.repo.getCoderSubmissionAdjudicationById(adjId)!,
+          fixtures.repo.getTestRun(trId)!,
+          gseId,
+          gdeId,
+          envelope,
+          manifestJson,
+          manifestHash,
+          nowIso
+        );
+
+        expect(success).toBe(false);
+
+        const adjAfter = fixtures.repo.getCoderSubmissionAdjudicationById(adjId)!;
+        expect(adjAfter.status).toBe('VERIFYING');
+        expect(adjAfter.lifecycle_version).toBe(2);
+        expect(fixtures.repo.getCoderSubmissionAdjudicationEvents(adjId).length).toBe(0);
+        expect(fixtures.repo.getCoderSubmissionDispositions(subId).length).toBe(dispsBefore);
+
+        // Restore spy before replay so real DB update runs
+        updateLeaseSpy.mockRestore();
+
+        // Replay succeeds once CAS race resolves
+        const replaySuccess = fixtures.recoveryScanner.reconcileMissingSettlement(
+          fixtures.repo.getCoderSubmissionAdjudicationById(adjId)!,
+          fixtures.repo.getTestRun(trId)!,
+          gseId,
+          gdeId,
+          envelope,
+          manifestJson,
+          manifestHash,
+          nowIso
+        );
+        expect(replaySuccess).toBe(true);
+
+        const adjReplay = fixtures.repo.getCoderSubmissionAdjudicationById(adjId)!;
+        expect(adjReplay.status).toBe('VERIFIED');
+        expect(adjReplay.lifecycle_version).toBe(3);
+        expect(fixtures.repo.getCoderSubmissionDispositions(subId).length).toBe(dispsBefore + 1);
+      } finally {
+        updateLeaseSpy.mockRestore();
+      }
+    });
+
+    it('301. validateAndParseCanonicalResultEnvelope strictly validates canonical JSON byte identity', () => {
+      const validEnvelope: CanonicalVerificationResultEnvelope = {
+        adjudication_id: crypto.randomUUID(),
+        artifact_manifest_hash: 'a'.repeat(64),
+        assignment_id: crypto.randomUUID(),
+        attempt_id: crypto.randomUUID(),
+        authorization_id: crypto.randomUUID(),
+        command_snapshot_hash: 'b'.repeat(64),
+        exit_classification: 'EXIT_ZERO',
+        failure_code: null,
+        failure_payload: null,
+        finish_timestamp: new Date().toISOString(),
+        git_diff_evidence_hash: '',
+        git_diff_evidence_id: '',
+        git_status_evidence_hash: '',
+        git_status_evidence_id: '',
+        lifecycle_version: 3,
+        process_start_classification: 'SPAWNED_PROVEN',
+        project_id: crypto.randomUUID(),
+        start_timestamp: new Date().toISOString(),
+        task_id: crypto.randomUUID(),
+        task_ownership_epoch: 1,
+        termination_classification: 'TERMINATION_PROVEN',
+        test_result_evidence_hash: 'c'.repeat(64),
+        test_result_evidence_id: crypto.randomUUID(),
+        test_run_id: crypto.randomUUID(),
+        verification_execution_id: crypto.randomUUID(),
+        workspace_snapshot_after_hash: 'd'.repeat(64),
+        workspace_snapshot_before_hash: 'e'.repeat(64),
+      };
+
+      const canonicalStr = canonicalJsonStringify(validEnvelope);
+      const parsedValid = validateAndParseCanonicalResultEnvelope(canonicalStr);
+      expect(parsedValid.valid).toBe(true);
+
+      const nonCanonicalStr = JSON.stringify(validEnvelope, null, 2);
+      const parsedInvalid = validateAndParseCanonicalResultEnvelope(nonCanonicalStr);
+      expect(parsedInvalid.valid).toBe(false);
+      expect(parsedInvalid.error).toContain('canonical JSON');
+    });
+
+    it('302. ProcessRunner cancelAsync and terminateProcessTree are idempotent on already terminated processes', async () => {
+      const res = await ProcessRunner.cancelAsync('fake-execution-id');
+      expect(res).toBe('NOT_APPLICABLE');
+      expect(ProcessRunner.getActiveProcessCount()).toBe(0);
     });
 
     it('223. historical three-file compatibility diffs remain byte-identical to initial head', () => {

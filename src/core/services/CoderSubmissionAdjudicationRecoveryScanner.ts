@@ -23,6 +23,8 @@ import {
   deriveDeterministicGenericAdjudicationEventId,
   deriveDeterministicDispositionId,
   evaluateCanonicalSettlementDecision,
+  validateAndParseCanonicalResultEnvelope,
+  CanonicalSettlementDecision,
 } from './CoderSubmissionAdjudicationService';
 import { verifyEvidenceIntegrity, parseAndVerifyArtifactManifest } from './ArtifactStore';
 
@@ -189,80 +191,78 @@ export class CoderSubmissionAdjudicationRecoveryScanner {
       }
 
       // Check result envelope if present or required
-      if (!contradiction && adj.verification_result_envelope_json) {
-        if (computeSha256(adj.verification_result_envelope_json) !== adj.verification_result_envelope_hash) {
-          contradiction = 'Verification result envelope hash mismatch';
+      let parsedEnvelope: CanonicalVerificationResultEnvelope | null = null;
+      if (!contradiction && (adj.verification_result_envelope_json || adj.status === 'VERIFIED' || adj.status === 'VERIFICATION_FAILED')) {
+        if (!adj.verification_result_envelope_json || !adj.verification_result_envelope_hash) {
+          contradiction = `${adj.status} adjudication missing verification result envelope or hash`;
         } else {
-          try {
-            const rawEnv = JSON.parse(adj.verification_result_envelope_json);
-            if (typeof rawEnv !== 'object' || rawEnv === null || Array.isArray(rawEnv)) {
-              contradiction = 'Verification result envelope is not a plain object';
-            } else if (rawEnv.adjudication_id !== adj.id || (adj.verification_execution_id && rawEnv.verification_execution_id !== adj.verification_execution_id)) {
-              contradiction = 'Verification result envelope identity bindings mismatch';
-            } else if (adj.status === 'VERIFIED' && (rawEnv.exit_classification !== 'EXIT_ZERO' || rawEnv.termination_classification !== 'TERMINATION_PROVEN')) {
-              contradiction = 'VERIFIED adjudication result envelope has non-zero exit or unproven termination';
-            } else if (adj.status === 'VERIFICATION_FAILED' && rawEnv.exit_classification === 'EXIT_ZERO' && !rawEnv.failure_code) {
-              contradiction = 'VERIFICATION_FAILED adjudication result envelope contradicts failure status';
-            }
-          } catch (envParseErr: unknown) {
-            contradiction = 'Verification result envelope is malformed JSON';
+          const parseRes = validateAndParseCanonicalResultEnvelope(
+            adj.verification_result_envelope_json,
+            adj.verification_result_envelope_hash
+          );
+          if (!parseRes.valid || !parseRes.envelope) {
+            contradiction = parseRes.error || 'Verification result envelope validation failed';
+          } else {
+            parsedEnvelope = parseRes.envelope;
           }
         }
       }
 
       // Check manifest if present or required
-      if (!contradiction && adj.artifact_manifest_json) {
-        if (!adj.artifact_manifest_hash) {
-          contradiction = 'Artifact manifest hash missing';
+      let parsedManifest: ArtifactManifest | null = null;
+      if (!contradiction && (adj.artifact_manifest_json || adj.status === 'VERIFIED')) {
+        if (!adj.artifact_manifest_json || !adj.artifact_manifest_hash) {
+          contradiction = `${adj.status} adjudication missing artifact manifest or hash`;
         } else {
           try {
-            const parsedMf = parseAndVerifyArtifactManifest(
+            parsedManifest = parseAndVerifyArtifactManifest(
               adj.artifact_manifest_json,
               adj.artifact_manifest_hash
             );
-            if (parsedMf.adjudication_id !== adj.id) {
-              contradiction = 'Artifact manifest adjudication_id mismatch';
-            } else {
-              for (const entry of parsedMf.entries) {
-                if (!entry.evidence_id || !entry.sha256 || !entry.relative_path) {
-                  contradiction = 'Artifact manifest entry has missing or invalid fields';
-                  break;
-                }
-                const ev = this.repo.getEvidence(entry.evidence_id);
-                if (!ev || ev.hash !== entry.sha256 || ev.byte_size !== entry.byte_size) {
-                  contradiction = `Artifact manifest entry ${entry.evidence_id} missing or mismatch in evidence row`;
-                  break;
-                }
-                if (ev.storage_type === 'FILE' && ev.file_path) {
-                  if (!fs.existsSync(ev.file_path)) {
-                    contradiction = `Artifact manifest file missing on disk: ${entry.relative_path}`;
-                    break;
-                  }
-                  const fileBytes = fs.readFileSync(ev.file_path);
-                  if (fileBytes.length !== entry.byte_size) {
-                    contradiction = `Artifact manifest file size mismatch: ${entry.relative_path}`;
-                    break;
-                  }
-                  const fileHash = crypto.createHash('sha256').update(fileBytes).digest('hex');
-                  if (fileHash !== entry.sha256) {
-                    contradiction = `Artifact manifest file hash mismatch: ${entry.relative_path}`;
-                    break;
-                  }
-                }
-              }
-            }
           } catch (mErr: unknown) {
             contradiction = `Artifact manifest validation failed: ${mErr instanceof Error ? mErr.message : String(mErr)}`;
           }
         }
       }
 
+      // Evaluate canonical settlement decision if envelope is present or required
+      if (!contradiction && parsedEnvelope) {
+        const tr = adj.test_run_id ? this.repo.getTestRun(adj.test_run_id) : null;
+        const dec = evaluateCanonicalSettlementDecision({
+          envelope: parsedEnvelope,
+          rawEnvelopeJson: adj.verification_result_envelope_json ?? undefined,
+          expectedEnvelopeHash: adj.verification_result_envelope_hash ?? undefined,
+          adjudication: adj,
+          testRun: tr,
+          manifest: parsedManifest,
+          rawManifestJson: adj.artifact_manifest_json ?? undefined,
+          expectedManifestHash: adj.artifact_manifest_hash ?? undefined,
+          gitStatusEvidenceId: adj.git_status_evidence_id,
+          gitDiffEvidenceId: adj.git_diff_evidence_id,
+          testResultEvidenceId: tr?.evidence_id ?? null,
+          repo: this.repo,
+          artifactStore: this.adjudicationService.getArtifactStore(),
+        });
+
+        if (!dec.valid) {
+          contradiction = dec.contradictionReason || dec.failureDetail || 'Canonical settlement evaluation failed';
+        } else if (adj.status === 'VERIFIED') {
+          if (dec.targetStatus !== 'VERIFIED' || !dec.isSuccess) {
+            contradiction = dec.contradictionReason || 'Canonical settlement decision contradicts VERIFIED status';
+          }
+        } else if (adj.status === 'VERIFICATION_FAILED') {
+          if (dec.targetStatus !== 'VERIFICATION_FAILED' || dec.isSuccess) {
+            contradiction = dec.contradictionReason || 'Canonical settlement decision contradicts VERIFICATION_FAILED status';
+          }
+        } else if (adj.status === 'RECOVERY_FENCED') {
+          if (dec.targetStatus !== 'RECOVERY_FENCED') {
+            contradiction = dec.contradictionReason || 'Canonical settlement decision contradicts RECOVERY_FENCED status';
+          }
+        }
+      }
+
       if (!contradiction && adj.status === 'VERIFIED') {
-        if (!adj.artifact_manifest_json || !adj.artifact_manifest_hash) {
-          contradiction = 'VERIFIED adjudication missing artifact manifest';
-        } else if (!adj.verification_result_envelope_json || !adj.verification_result_envelope_hash) {
-          contradiction = 'VERIFIED adjudication missing verification result envelope';
-        } else if (!adj.test_run_id) {
+        if (!adj.test_run_id) {
           contradiction = 'VERIFIED adjudication missing test_run_id';
         } else {
           const tr = this.repo.getTestRun(adj.test_run_id);
@@ -283,8 +283,46 @@ export class CoderSubmissionAdjudicationRecoveryScanner {
         if (!contradiction) {
           const disps = this.repo.getCoderSubmissionDispositions(adj.submission_id);
           const terminalDisps = disps.filter((d) => d.disposition_event === 'SETTLED' || d.disposition_event === 'REJECTED');
-          if (terminalDisps.length !== 1 || terminalDisps[0].disposition_event !== 'SETTLED') {
+          if (terminalDisps.length !== 1 || terminalDisps[0].disposition_event !== 'SETTLED' || terminalDisps[0].disposition_reason !== 'ACCEPTED_VERIFIED') {
             contradiction = 'VERIFIED adjudication missing exact SETTLED terminal disposition or has ambiguous dispositions';
+          }
+        }
+
+        if (!contradiction) {
+          const events = this.repo.getCoderSubmissionAdjudicationEvents(adj.id);
+          const hasSucceededEvent = events.some((e) => e.event_type === 'VERIFICATION_SUCCEEDED');
+          if (!hasSucceededEvent) {
+            contradiction = 'VERIFIED adjudication missing VERIFICATION_SUCCEEDED settlement event';
+          }
+        }
+
+        if (!contradiction && adj.workspace_lease_id) {
+          const l = this.repo.getWorkspaceLease(adj.workspace_lease_id);
+          if (l && l.state !== 'RELEASED') {
+            contradiction = `VERIFIED adjudication has unreleased workspace lease: ${l.state}`;
+          }
+        }
+      }
+
+      if (!contradiction && adj.status === 'VERIFICATION_FAILED') {
+        const disps = this.repo.getCoderSubmissionDispositions(adj.submission_id);
+        const settledDisp = disps.find((d) => d.disposition_event === 'SETTLED');
+        if (settledDisp) {
+          contradiction = 'VERIFICATION_FAILED adjudication has contradictory SETTLED disposition';
+        }
+
+        if (!contradiction) {
+          const events = this.repo.getCoderSubmissionAdjudicationEvents(adj.id);
+          const hasFailedEvent = events.some((e) => e.event_type === 'VERIFICATION_FAILED');
+          if (!hasFailedEvent) {
+            contradiction = 'VERIFICATION_FAILED adjudication missing VERIFICATION_FAILED settlement event';
+          }
+        }
+
+        if (!contradiction && adj.workspace_lease_id) {
+          const l = this.repo.getWorkspaceLease(adj.workspace_lease_id);
+          if (l && l.state !== 'RELEASED') {
+            contradiction = `VERIFICATION_FAILED adjudication has unreleased workspace lease: ${l.state}`;
           }
         }
       }
@@ -292,6 +330,19 @@ export class CoderSubmissionAdjudicationRecoveryScanner {
       if (!contradiction && adj.status === 'RECOVERY_FENCED') {
         if (!adj.failure_code || !adj.recovery_fenced_at) {
           contradiction = 'RECOVERY_FENCED adjudication missing failure_code or recovery_fenced_at';
+        }
+        if (!contradiction) {
+          const disps = this.repo.getCoderSubmissionDispositions(adj.submission_id);
+          const settledDisp = disps.find((d) => d.disposition_event === 'SETTLED');
+          if (settledDisp) {
+            contradiction = 'RECOVERY_FENCED adjudication has contradictory SETTLED disposition';
+          }
+        }
+        if (!contradiction && adj.workspace_lease_id) {
+          const l = this.repo.getWorkspaceLease(adj.workspace_lease_id);
+          if (l && l.state !== 'FENCED' && l.state !== 'RELEASED') {
+            contradiction = `RECOVERY_FENCED adjudication has un-fenced workspace lease: ${l.state}`;
+          }
         }
       }
 
@@ -387,29 +438,20 @@ export class CoderSubmissionAdjudicationRecoveryScanner {
       if (!settlementError) {
         if (!adj.verification_result_envelope_json || !adj.verification_result_envelope_hash) {
           settlementError = 'Canonical verification-result envelope missing';
-        } else if (computeSha256(adj.verification_result_envelope_json) !== adj.verification_result_envelope_hash) {
-          settlementError = 'Canonical verification-result envelope hash mismatch';
         } else {
-          try {
-            const rawEnvelope = JSON.parse(adj.verification_result_envelope_json);
-            if (typeof rawEnvelope !== 'object' || rawEnvelope === null || Array.isArray(rawEnvelope)) {
-              settlementError = 'Canonical verification-result envelope is not a plain object';
-            } else {
-              const envKeys = Object.keys(rawEnvelope).sort();
-              const expectedKeys = [...CANONICAL_VERIFICATION_RESULT_ENVELOPE_KEYS].sort();
-              if (envKeys.length !== expectedKeys.length || envKeys.some((k, i) => k !== expectedKeys[i])) {
-                settlementError = `Envelope keys mismatch (got: ${envKeys.join(',')})`;
-              } else if (
-                rawEnvelope.adjudication_id !== adj.id ||
-                rawEnvelope.verification_execution_id !== adj.verification_execution_id
-              ) {
-                settlementError = 'Envelope identity bindings mismatch';
-              } else {
-                parsedEnvelope = rawEnvelope as CanonicalVerificationResultEnvelope;
-              }
-            }
-          } catch (trParseErr: unknown) {
-            settlementError = 'Canonical verification-result envelope is malformed JSON';
+          const parseRes = validateAndParseCanonicalResultEnvelope(
+            adj.verification_result_envelope_json,
+            adj.verification_result_envelope_hash
+          );
+          if (!parseRes.valid || !parseRes.envelope) {
+            settlementError = parseRes.error || 'Verification result envelope validation failed';
+          } else if (
+            parseRes.envelope.adjudication_id !== adj.id ||
+            parseRes.envelope.verification_execution_id !== adj.verification_execution_id
+          ) {
+            settlementError = 'Envelope identity bindings mismatch';
+          } else {
+            parsedEnvelope = parseRes.envelope;
           }
         }
       }
@@ -586,47 +628,14 @@ export class CoderSubmissionAdjudicationRecoveryScanner {
           };
         }
 
-        const settlementSuccess = this.reconcileMissingSettlement(
-          adj,
-          testRun,
-          gitStatusEvId,
-          gitDiffEvId,
-          parsedEnvelope,
-          artifactManifestJson,
-          artifactManifestHash,
-          nowIso
-        );
-        if (settlementSuccess) {
-          let recDecisionTaskTrans: 'REVIEW_READY' | 'NEEDS_HUMAN' = 'NEEDS_HUMAN';
-          try {
-            const m = artifactManifestJson && artifactManifestHash
-              ? parseAndVerifyArtifactManifest(artifactManifestJson, artifactManifestHash)
-              : null;
-            const dec = evaluateCanonicalSettlementDecision({
-              envelope: parsedEnvelope,
-              adjudication: adj,
-              testRun,
-              manifest: m,
-              gitStatusEvidenceId: gitStatusEvId,
-              gitDiffEvidenceId: gitDiffEvId,
-              testResultEvidenceId: testRun.evidence_id,
-            });
-            recDecisionTaskTrans = dec.taskTransition;
-          } catch (decErr: unknown) {
-            recDecisionTaskTrans = 'NEEDS_HUMAN';
-          }
-          return {
-            adjudication_id: adj.id,
-            submission_id: adj.submission_id,
-            classification: 'VERIFICATION_RESULT_STATE_INCOMPLETE',
-            action_taken: 'SETTLED',
-            task_transition: recDecisionTaskTrans,
-          };
-        } else {
+        let parsedManifest: ArtifactManifest;
+        try {
+          parsedManifest = parseAndVerifyArtifactManifest(artifactManifestJson, artifactManifestHash);
+        } catch (manErr: unknown) {
           this.fenceAdjudication(
             adj,
             'INTEGRITY_MISMATCH',
-            'Settlement reconciliation failed; fenced',
+            `Manifest validation failed: ${manErr instanceof Error ? manErr.message : String(manErr)}`,
             nowIso,
             true
           );
@@ -635,7 +644,69 @@ export class CoderSubmissionAdjudicationRecoveryScanner {
             submission_id: adj.submission_id,
             classification: 'AUTHORITY_CONFLICT',
             action_taken: 'FENCED_CONFLICT',
-            error: 'Settlement reconciliation failed',
+            error: 'Manifest validation failed',
+          };
+        }
+
+        const decision = evaluateCanonicalSettlementDecision({
+          envelope: parsedEnvelope,
+          rawEnvelopeJson: adj.verification_result_envelope_json ?? canonicalJsonStringify(parsedEnvelope),
+          expectedEnvelopeHash: adj.verification_result_envelope_hash ?? computeSha256(canonicalJsonStringify(parsedEnvelope)),
+          adjudication: adj,
+          testRun,
+          manifest: parsedManifest,
+          rawManifestJson: artifactManifestJson,
+          expectedManifestHash: artifactManifestHash,
+          gitStatusEvidenceId: gitStatusEvId,
+          gitDiffEvidenceId: gitDiffEvId,
+          testResultEvidenceId: testRun.evidence_id,
+          repo: this.repo,
+          artifactStore: this.adjudicationService.getArtifactStore(),
+        });
+
+        if (!decision.valid) {
+          this.fenceAdjudication(
+            adj,
+            decision.failureCode || 'INTEGRITY_MISMATCH',
+            decision.failureDetail || decision.contradictionReason || 'Canonical settlement evaluation failed',
+            nowIso,
+            true
+          );
+          return {
+            adjudication_id: adj.id,
+            submission_id: adj.submission_id,
+            classification: 'AUTHORITY_CONFLICT',
+            action_taken: 'FENCED_CONFLICT',
+            error: decision.contradictionReason || decision.failureDetail || 'Canonical settlement evaluation failed',
+          };
+        }
+
+        const settlementSuccess = this.reconcileMissingSettlement(
+          adj,
+          testRun,
+          gitStatusEvId,
+          gitDiffEvId,
+          parsedEnvelope,
+          artifactManifestJson,
+          artifactManifestHash,
+          nowIso,
+          decision
+        );
+        if (settlementSuccess) {
+          return {
+            adjudication_id: adj.id,
+            submission_id: adj.submission_id,
+            classification: 'VERIFICATION_RESULT_STATE_INCOMPLETE',
+            action_taken: 'SETTLED',
+            task_transition: decision.taskTransition,
+          };
+        } else {
+          return {
+            adjudication_id: adj.id,
+            submission_id: adj.submission_id,
+            classification: 'AUTHORITY_CONFLICT',
+            action_taken: 'NO_OP',
+            error: 'Settlement reconciliation CAS or transition failed',
           };
         }
       }
@@ -785,12 +856,15 @@ export class CoderSubmissionAdjudicationRecoveryScanner {
         ? this.repo.getWorkspaceLease(adj.workspace_lease_id)
         : this.repo.getWorkspaceLeaseByAdjudication(adj.id);
       if (l && l.released_at === null) {
-        this.repo.updateWorkspaceLease(l.id, l.lifecycle_version, {
+        const leaseUpdated = this.repo.updateWorkspaceLease(l.id, l.lifecycle_version, {
           state: 'FENCED',
           failure_code: failureCode,
           failure_evidence_hash: adj.artifact_manifest_hash ?? null,
           released_at: effectiveNow,
         });
+        if (!leaseUpdated) {
+          throw new Error(`RECOVERY_CAS_FAILED: Workspace lease fence CAS failed for lease ${l.id}`);
+        }
       }
     });
 
@@ -805,7 +879,8 @@ export class CoderSubmissionAdjudicationRecoveryScanner {
     envelope: CanonicalVerificationResultEnvelope,
     artifactManifestJson: string | null,
     artifactManifestHash: string | null,
-    nowIso: string
+    nowIso: string,
+    precomputedDecision?: CanonicalSettlementDecision
   ): boolean {
     if (!artifactManifestJson || !artifactManifestHash) {
       return false;
@@ -817,15 +892,23 @@ export class CoderSubmissionAdjudicationRecoveryScanner {
       return false;
     }
 
-    const decision = evaluateCanonicalSettlementDecision({
-      envelope,
-      adjudication: adj,
-      testRun,
-      manifest: parsedManifest,
-      gitStatusEvidenceId,
-      gitDiffEvidenceId,
-      testResultEvidenceId: testRun.evidence_id,
-    });
+    const decision =
+      precomputedDecision ??
+      evaluateCanonicalSettlementDecision({
+        envelope,
+        rawEnvelopeJson: canonicalJsonStringify(envelope),
+        expectedEnvelopeHash: computeSha256(canonicalJsonStringify(envelope)),
+        adjudication: adj,
+        testRun,
+        manifest: parsedManifest,
+        rawManifestJson: artifactManifestJson,
+        expectedManifestHash: artifactManifestHash,
+        gitStatusEvidenceId,
+        gitDiffEvidenceId,
+        testResultEvidenceId: testRun.evidence_id,
+        repo: this.repo,
+        artifactStore: this.adjudicationService.getArtifactStore(),
+      });
 
     if (!decision.valid) {
       return false;
@@ -913,21 +996,19 @@ export class CoderSubmissionAdjudicationRecoveryScanner {
         };
         this.repo.createCoderSubmissionAdjudicationEvent(settlementEvent);
 
-        if (isSuccess) {
-          const existingDisps = this.repo.getCoderSubmissionDispositions(adj.submission_id);
-          const hasTerminalDisp = existingDisps.some((d) => d.disposition_event === 'SETTLED' || d.disposition_event === 'REJECTED');
-          if (!hasTerminalDisp) {
-            this.repo.createCoderSubmissionDisposition({
-              id: deriveDeterministicDispositionId(adj.submission_id, adj.id, nextVersion),
-              submission_id: adj.submission_id,
-              disposition_event: decision.dispositionEvent,
-              disposition_reason: decision.dispositionReason,
-              actor_type: 'SYSTEM',
-              actor_id: 'RECOVERY_SCANNER',
-              disposition_metadata_json: null,
-              created_at: nowIso,
-            });
-          }
+        const existingDisps = this.repo.getCoderSubmissionDispositions(adj.submission_id);
+        const hasTerminalDisp = existingDisps.some((d) => d.disposition_event === 'SETTLED' || d.disposition_event === 'REJECTED');
+        if (!hasTerminalDisp && isSuccess) {
+          this.repo.createCoderSubmissionDisposition({
+            id: deriveDeterministicDispositionId(adj.submission_id, adj.id, nextVersion),
+            submission_id: adj.submission_id,
+            disposition_event: decision.dispositionEvent,
+            disposition_reason: decision.dispositionReason,
+            actor_type: 'SYSTEM',
+            actor_id: 'RECOVERY_SCANNER',
+            disposition_metadata_json: null,
+            created_at: nowIso,
+          });
         }
 
         const liveTask = this.repo.getTask(adj.task_id);

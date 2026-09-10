@@ -550,13 +550,11 @@ export class ProcessRunner {
       }
     }
 
-    return new Promise((resolve) => {
+    return new Promise(async (resolve) => {
       let stdoutAcc = '';
       let stderrAcc = '';
       let stdoutByteCount = 0;
       let stderrByteCount = 0;
-      let isTimedOut = false;
-      let isOutputLimitExceeded = false;
 
       // Spawn child process directly with minimal sanitized environment
       const child = spawn(invocation.executable, invocation.args, {
@@ -574,35 +572,66 @@ export class ProcessRunner {
       const procEntry = { process: child, command: commandStr, isCancelled: false, repo: options.repo };
       this.activeProcesses.set(executionId, procEntry);
 
-      let startTruth: ProcessStartTruth = 'STARTED_PROVEN';
-      let terminationTruth: ProcessTerminationTruth = 'NOT_APPLICABLE';
+      let isTimedOut = false;
+      let isOutputLimitExceeded = false;
+      let isStdinFailed = false;
+      let stdinErrorMessage: string | null = null;
+
+      let termPromise: Promise<ProcessTerminationTruth> | null = null;
+      const ensureTerminating = async (): Promise<ProcessTerminationTruth> => {
+        if (!termPromise) {
+          termPromise = ProcessRunner.terminateProcessTree(child);
+        }
+        return termPromise;
+      };
+
+      const handleStdinFailure = async (err: unknown) => {
+        if (isStdinFailed || settled) return;
+        isStdinFailed = true;
+        const errMsg = err instanceof Error ? err.message : String(err);
+        stdinErrorMessage = `STDIN_WRITE_FAILED: ${errMsg}`;
+        try {
+          child.stdin?.destroy();
+        } catch {
+          // safe destroy
+        }
+        await ensureTerminating();
+      };
 
       const timer = setTimeout(async () => {
         isTimedOut = true;
-        await ProcessRunner.terminateProcessTree(child);
+        await ensureTerminating();
       }, timeoutMs);
 
       // Safe stdin writing when provided
       if (options.stdin !== undefined && child.stdin) {
-        child.stdin.on('error', (stdinErr: unknown) => {
-          // Ignore EPIPE if child process exits early or closes stdin
+        child.stdin.on('error', async (stdinErr: unknown) => {
+          await handleStdinFailure(stdinErr);
         });
         try {
-          child.stdin.write(options.stdin, 'utf8', () => {
+          child.stdin.write(options.stdin, 'utf8', async (writeErr?: Error | null) => {
+            if (writeErr) {
+              await handleStdinFailure(writeErr);
+              return;
+            }
             try {
-              child.stdin?.end();
+              child.stdin?.end(async (endErr?: Error | null) => {
+                if (endErr) {
+                  await handleStdinFailure(endErr);
+                }
+              });
             } catch (endErr: unknown) {
-              // Ignore
+              await handleStdinFailure(endErr);
             }
           });
         } catch (writeErr: unknown) {
-          // Ignore
+          await handleStdinFailure(writeErr);
         }
       }
 
       if (child.stdout) {
-        child.stdout.on('data', (data: Buffer | string) => {
-          if (isOutputLimitExceeded) return;
+        child.stdout.on('data', async (data: Buffer | string) => {
+          if (isOutputLimitExceeded || settled) return;
           const chunkBuf = Buffer.isBuffer(data) ? data : Buffer.from(data, 'utf8');
           const chunkLen = chunkBuf.length;
 
@@ -613,7 +642,13 @@ export class ProcessRunner {
               stdoutAcc += chunkBuf.subarray(0, remaining).toString('utf8');
               stdoutByteCount += remaining;
             }
-            void ProcessRunner.terminateProcessTree(child);
+            try {
+              child.stdout?.pause();
+              child.stderr?.pause();
+            } catch {
+              // safe pause
+            }
+            await ensureTerminating();
             return;
           }
 
@@ -623,8 +658,8 @@ export class ProcessRunner {
       }
 
       if (child.stderr) {
-        child.stderr.on('data', (data: Buffer | string) => {
-          if (isOutputLimitExceeded) return;
+        child.stderr.on('data', async (data: Buffer | string) => {
+          if (isOutputLimitExceeded || settled) return;
           const chunkBuf = Buffer.isBuffer(data) ? data : Buffer.from(data, 'utf8');
           const chunkLen = chunkBuf.length;
 
@@ -635,7 +670,13 @@ export class ProcessRunner {
               stderrAcc += chunkBuf.subarray(0, remaining).toString('utf8');
               stderrByteCount += remaining;
             }
-            void ProcessRunner.terminateProcessTree(child);
+            try {
+              child.stdout?.pause();
+              child.stderr?.pause();
+            } catch {
+              // safe pause
+            }
+            await ensureTerminating();
             return;
           }
 
@@ -644,63 +685,20 @@ export class ProcessRunner {
         });
       }
 
-      child.on('error', async (err) => {
+      let settled = false;
+      const settleOnce = async (
+        trigger: 'CLOSE' | 'ERROR',
+        exitCode: number | null,
+        err?: Error
+      ) => {
+        if (settled) return;
+        settled = true;
         clearTimeout(timer);
-        const wasCancelled = procEntry.isCancelled;
         this.activeProcesses.delete(executionId);
+
         const durationMs = Date.now() - startTime;
         const endIso = new Date().toISOString();
-
-        let finalErrorCode: 'TIMEOUT' | 'CANCELLED' | 'PROCESS_LAUNCH_FAILED' | 'NONZERO_EXIT' | 'OUTPUT_LIMIT_EXCEEDED' =
-          'PROCESS_LAUNCH_FAILED';
-        if (wasCancelled) {
-          finalErrorCode = 'CANCELLED';
-        } else if (isTimedOut) {
-          finalErrorCode = 'TIMEOUT';
-        } else if (isOutputLimitExceeded) {
-          finalErrorCode = 'OUTPUT_LIMIT_EXCEEDED';
-        }
-
-        if (options.repo) {
-          options.repo.updateProcessRun(
-            executionId,
-            wasCancelled ? 'CANCELLED' : 'FAILED',
-            -1,
-            endIso
-          );
-        }
-
-        const hasPid = typeof child.pid === 'number' && child.pid > 0;
-        let termStatus: ProcessTerminationTruth = 'NOT_APPLICABLE';
-        if (hasPid) {
-          termStatus = await ProcessRunner.terminateProcessTree(child);
-        }
-        const startStatus: ProcessStartTruth = hasPid ? 'START_AMBIGUOUS' : 'NOT_STARTED_PROVEN';
-
-        resolve({
-          executionId,
-          pid: child.pid ?? null,
-          command: this.scrubSecrets(commandStr),
-          cwd: options.cwd,
-          exitCode: -1,
-          stdout: this.scrubSecrets(stdoutAcc),
-          stderr: this.scrubSecrets(`Failed to start process: ${err.message}`),
-          durationMs,
-          timedOut: isTimedOut,
-          cancelled: wasCancelled,
-          outputLimitExceeded: isOutputLimitExceeded,
-          errorCode: finalErrorCode,
-          processStart: startStatus,
-          processTermination: termStatus,
-        });
-      });
-
-      child.on('close', async (code) => {
-        clearTimeout(timer);
         const wasCancelled = procEntry.isCancelled;
-        this.activeProcesses.delete(executionId);
-        const durationMs = Date.now() - startTime;
-        const endIso = new Date().toISOString();
 
         let terminalStatus: 'COMPLETED' | 'FAILED' | 'CANCELLED' | 'TIMED_OUT' = 'COMPLETED';
         let finalErrorCode: 'TIMEOUT' | 'CANCELLED' | 'PROCESS_LAUNCH_FAILED' | 'NONZERO_EXIT' | 'OUTPUT_LIMIT_EXCEEDED' | null =
@@ -715,23 +713,54 @@ export class ProcessRunner {
         } else if (isOutputLimitExceeded) {
           terminalStatus = 'FAILED';
           finalErrorCode = 'OUTPUT_LIMIT_EXCEEDED';
-        } else if (code !== 0) {
+        } else if (isStdinFailed || trigger === 'ERROR') {
+          terminalStatus = 'FAILED';
+          finalErrorCode = 'PROCESS_LAUNCH_FAILED';
+        } else if (exitCode !== 0) {
           terminalStatus = 'FAILED';
           finalErrorCode = 'NONZERO_EXIT';
         }
 
-        if (isTimedOut || wasCancelled || isOutputLimitExceeded) {
-          terminationTruth = await ProcessRunner.terminateProcessTree(child);
-        } else {
-          terminationTruth = 'PROCESS_TREE_TERMINATED_PROVEN';
+        const hasPid = typeof child.pid === 'number' && child.pid > 0;
+        let termTruth: ProcessTerminationTruth = 'NOT_APPLICABLE';
+
+        if (hasPid) {
+          if (isTimedOut || wasCancelled || isOutputLimitExceeded || isStdinFailed || trigger === 'ERROR') {
+            termTruth = await ensureTerminating();
+          } else {
+            termTruth = 'PROCESS_TREE_TERMINATED_PROVEN';
+          }
         }
+
+        const startTruth: ProcessStartTruth =
+          trigger === 'ERROR' && !hasPid
+            ? 'NOT_STARTED_PROVEN'
+            : trigger === 'ERROR' && hasPid
+            ? 'START_AMBIGUOUS'
+            : 'STARTED_PROVEN';
+
+        const effectiveExitCode =
+          exitCode ??
+          (isTimedOut ? -2 : wasCancelled ? -1 : isOutputLimitExceeded ? -3 : isStdinFailed || trigger === 'ERROR' ? -1 : 0);
+
+        let finalStderr = stderrAcc;
+        if (isOutputLimitExceeded) {
+          finalStderr = `${stderrAcc}\n[Process output limit exceeded]`.trim();
+        } else if (isStdinFailed && stdinErrorMessage) {
+          finalStderr = `${stderrAcc}\n[${stdinErrorMessage}]`.trim();
+        } else if (trigger === 'ERROR' && err) {
+          finalStderr = `Failed to start process: ${err.message}`;
+        }
+
+        finalStderr = this.scrubSecrets(finalStderr);
+        const finalStdout = this.scrubSecrets(stdoutAcc);
 
         let stdoutEvidenceId: string | null = null;
         let stderrEvidenceId: string | null = null;
 
         // Persist outputs as Evidence if artifactStore & projectId are configured
         if (options.artifactStore && options.repo && options.projectId) {
-          if (stdoutAcc.trim().length > 0) {
+          if (finalStdout.trim().length > 0) {
             const ev = options.artifactStore.store(
               crypto.randomUUID(),
               options.projectId,
@@ -739,13 +768,13 @@ export class ProcessRunner {
               null,
               'PROCESS_LOG',
               `Stdout for ${this.scrubSecrets(commandStr)}`,
-              this.scrubSecrets(stdoutAcc),
+              finalStdout,
               'text/plain'
             );
             options.repo.createEvidence(ev);
             stdoutEvidenceId = ev.id;
           }
-          if (stderrAcc.trim().length > 0) {
+          if (finalStderr.trim().length > 0) {
             const ev = options.artifactStore.store(
               crypto.randomUUID(),
               options.projectId,
@@ -753,7 +782,7 @@ export class ProcessRunner {
               null,
               'PROCESS_LOG',
               `Stderr for ${this.scrubSecrets(commandStr)}`,
-              this.scrubSecrets(stderrAcc),
+              finalStderr,
               'text/plain'
             );
             options.repo.createEvidence(ev);
@@ -766,7 +795,7 @@ export class ProcessRunner {
             options.repo.updateProcessRun(
               executionId,
               terminalStatus,
-              code ?? (isTimedOut ? -2 : wasCancelled ? -1 : isOutputLimitExceeded ? -3 : 0),
+              effectiveExitCode,
               endIso,
               stdoutEvidenceId,
               stderrEvidenceId
@@ -781,13 +810,9 @@ export class ProcessRunner {
           pid: child.pid ?? null,
           command: this.scrubSecrets(commandStr),
           cwd: options.cwd,
-          exitCode: code ?? (isTimedOut ? -2 : wasCancelled ? -1 : isOutputLimitExceeded ? -3 : 0),
-          stdout: this.scrubSecrets(stdoutAcc),
-          stderr: this.scrubSecrets(
-            isOutputLimitExceeded
-              ? `${stderrAcc}\n[Process output limit exceeded]`.trim()
-              : stderrAcc
-          ),
+          exitCode: effectiveExitCode,
+          stdout: finalStdout,
+          stderr: finalStderr,
           durationMs,
           timedOut: isTimedOut,
           cancelled: wasCancelled,
@@ -796,8 +821,16 @@ export class ProcessRunner {
           stdoutEvidenceId,
           stderrEvidenceId,
           processStart: startTruth,
-          processTermination: terminationTruth,
+          processTermination: termTruth,
         });
+      };
+
+      child.on('error', async (err) => {
+        await settleOnce('ERROR', null, err);
+      });
+
+      child.on('close', async (code) => {
+        await settleOnce('CLOSE', code);
       });
     });
   }
@@ -806,10 +839,11 @@ export class ProcessRunner {
     const entry = this.activeProcesses.get(executionId);
     if (entry) {
       entry.isCancelled = true;
-      if (entry.repo) {
-        entry.repo.updateProcessRun(executionId, 'CANCELLED', -1, new Date().toISOString());
+      try {
+        entry.process.kill('SIGTERM');
+      } catch {
+        // safe signal attempt
       }
-      this.terminateProcessTree(entry.process);
       return true;
     }
     return false;
@@ -819,23 +853,25 @@ export class ProcessRunner {
     const entry = this.activeProcesses.get(executionId);
     if (entry) {
       entry.isCancelled = true;
-      if (entry.repo) {
+      const truth = await this.terminateProcessTree(entry.process);
+      if (entry.repo && truth === 'PROCESS_TREE_TERMINATED_PROVEN') {
         entry.repo.updateProcessRun(executionId, 'CANCELLED', -1, new Date().toISOString());
       }
-      return this.terminateProcessTree(entry.process);
+      return truth;
     }
     return 'NOT_APPLICABLE';
   }
 
   public static terminateAllProcesses(): number {
-    const count = this.activeProcesses.size;
+    let count = 0;
     for (const [id, entry] of this.activeProcesses.entries()) {
       entry.isCancelled = true;
-      if (entry.repo) {
-        entry.repo.updateProcessRun(id, 'CANCELLED', -1, new Date().toISOString());
+      try {
+        entry.process.kill('SIGTERM');
+        count++;
+      } catch {
+        // safe signal
       }
-      this.terminateProcessTree(entry.process);
-      this.activeProcesses.delete(id);
     }
     return count;
   }
@@ -845,9 +881,6 @@ export class ProcessRunner {
     const promises: Promise<ProcessTerminationTruth>[] = [];
     for (const [id, entry] of this.activeProcesses.entries()) {
       entry.isCancelled = true;
-      if (entry.repo) {
-        entry.repo.updateProcessRun(id, 'CANCELLED', -1, new Date().toISOString());
-      }
       promises.push(this.terminateProcessTree(entry.process));
       this.activeProcesses.delete(id);
     }
