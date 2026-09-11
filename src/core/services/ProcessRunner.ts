@@ -25,6 +25,7 @@ export interface ProcessRunResult {
   cancelled: boolean;
   outputLimitExceeded?: boolean;
   errorCode?: 'TIMEOUT' | 'CANCELLED' | 'PROCESS_LAUNCH_FAILED' | 'NONZERO_EXIT' | 'OUTPUT_LIMIT_EXCEEDED' | null;
+  error?: Error | null;
   stdoutEvidenceId?: string | null;
   stderrEvidenceId?: string | null;
   processStart: ProcessStartTruth;
@@ -90,6 +91,7 @@ export class ProcessRunner {
         exitCode?: number | null,
         err?: Error
       ) => Promise<ProcessRunResult>;
+      lastKillError?: Error;
     }
   >();
   private static persistenceFencedEntries = new Map<string, PersistenceFencedEntry>();
@@ -106,37 +108,90 @@ export class ProcessRunner {
     return this.persistenceFencedEntries.get(executionId);
   }
 
-  public static retryPersistenceFenced(executionId: string, repo: Repository): boolean {
+  private static retryPromises = new Map<string, Promise<ProcessRunResult>>();
+
+  public static async retryPersistenceFenced(executionId: string, repo: Repository): Promise<ProcessRunResult> {
+    const inFlight = this.retryPromises.get(executionId);
+    if (inFlight) {
+      return inFlight;
+    }
+    const entry = this.persistenceFencedEntries.get(executionId);
+    if (!entry) {
+      throw new Error(`PERSISTENCE_FENCED_NOT_FOUND: No fenced entry found for execution ID "${executionId}".`);
+    }
+    const promise = (async (): Promise<ProcessRunResult> => {
+      await new Promise<void>((resolve) => queueMicrotask(resolve));
+      try {
+        const terminalStatus = entry.result.cancelled
+          ? 'CANCELLED'
+          : entry.result.timedOut
+          ? 'TIMED_OUT'
+          : entry.result.exitCode === 0
+          ? 'COMPLETED'
+          : 'FAILED';
+
+        repo.updateProcessRun(
+          executionId,
+          terminalStatus,
+          entry.result.exitCode,
+          entry.timestamp,
+          entry.result.stdoutEvidenceId ?? null,
+          entry.result.stderrEvidenceId ?? null
+        );
+
+        const verified = repo.getProcessRun(executionId);
+        const actualEndTime = verified ? (verified.end_time ?? verified.finished_at) : null;
+        const stdoutMatch = (verified?.stdout_evidence_id ?? null) === (entry.result.stdoutEvidenceId ?? null);
+        const stderrMatch = (verified?.stderr_evidence_id ?? null) === (entry.result.stderrEvidenceId ?? null);
+        if (
+          !verified ||
+          verified.status !== terminalStatus ||
+          verified.exit_code !== entry.result.exitCode ||
+          actualEndTime !== entry.timestamp ||
+          !stdoutMatch ||
+          !stderrMatch
+        ) {
+          throw new Error('DURABLE_TERMINAL_VERIFICATION_FAILED: Database record did not match original terminal truth.');
+        }
+
+        this.persistenceFencedEntries.delete(executionId);
+        this.activeProcesses.delete(executionId);
+        return entry.result;
+      } finally {
+        this.retryPromises.delete(executionId);
+      }
+    })();
+    this.retryPromises.set(executionId, promise);
+    return promise;
+  }
+
+  public static verifyAndClearPersistenceFencedForTests(executionId: string, repo: Repository): boolean {
     const entry = this.persistenceFencedEntries.get(executionId);
     if (!entry) return false;
-    try {
-      repo.updateProcessRun(
-        executionId,
-        entry.result.cancelled ? 'CANCELLED' : entry.result.timedOut ? 'TIMED_OUT' : entry.result.exitCode === 0 ? 'COMPLETED' : 'FAILED',
-        entry.result.exitCode,
-        new Date().toISOString(),
-        entry.result.stdoutEvidenceId ?? null,
-        entry.result.stderrEvidenceId ?? null
-      );
-      this.persistenceFencedEntries.delete(executionId);
-      this.activeProcesses.delete(executionId);
-      return true;
-    } catch {
-      return false;
+    const terminalStatus = entry.result.cancelled
+      ? 'CANCELLED'
+      : entry.result.timedOut
+      ? 'TIMED_OUT'
+      : entry.result.exitCode === 0
+      ? 'COMPLETED'
+      : 'FAILED';
+    const verified = repo.getProcessRun(executionId);
+    const actualEndTime = verified ? (verified.end_time ?? verified.finished_at) : null;
+    const stdoutMatch = (verified?.stdout_evidence_id ?? null) === (entry.result.stdoutEvidenceId ?? null);
+    const stderrMatch = (verified?.stderr_evidence_id ?? null) === (entry.result.stderrEvidenceId ?? null);
+    if (
+      !verified ||
+      verified.status !== terminalStatus ||
+      verified.exit_code !== entry.result.exitCode ||
+      actualEndTime !== entry.timestamp ||
+      !stdoutMatch ||
+      !stderrMatch
+    ) {
+      throw new Error('DURABLE_PROOF_REQUIRED: Cannot clear persistence-fenced entry without durable database proof.');
     }
-  }
-
-  public static acknowledgePersistenceFenced(executionId: string, reason?: string): boolean {
-    void reason;
+    this.persistenceFencedEntries.delete(executionId);
     this.activeProcesses.delete(executionId);
-    return this.persistenceFencedEntries.delete(executionId);
-  }
-
-  public static clearPersistenceFencedForTestTeardown(): void {
-    for (const id of this.persistenceFencedEntries.keys()) {
-      this.activeProcesses.delete(id);
-    }
-    this.persistenceFencedEntries.clear();
+    return true;
   }
 
   private static validateCustomEnv(
@@ -206,6 +261,7 @@ export class ProcessRunner {
   }
 
   public static scrubSecrets(text: string): string {
+    if (!text || typeof text !== 'string') return '';
     let scrubbed = text;
     for (const pattern of this.SECRET_PATTERNS) {
       scrubbed = scrubbed.replace(pattern, '[REDACTED_SECRET]');
@@ -241,7 +297,9 @@ export class ProcessRunner {
           }
         }
       } catch (statErr: unknown) {
-        void statErr;
+        if (statErr) {
+          // Candidate path stat inaccessible
+        }
       }
     }
 
@@ -480,7 +538,24 @@ export class ProcessRunner {
           });
           options.repo.updateProcessRun(executionId, 'FAILED', -1, new Date().toISOString(), null, null);
         } catch (dbErr: unknown) {
-          void dbErr;
+          const dbError = dbErr instanceof Error ? dbErr : new Error(String(dbErr));
+          return {
+            executionId,
+            pid: null,
+            command: this.scrubSecrets(commandStr),
+            cwd: options.cwd,
+            exitCode: -1,
+            stdout: '',
+            stderr: `Security Policy Violation: ${policy.reason} (${policy.decision}) [DATABASE_PERSISTENCE_ERROR]`,
+            durationMs: 0,
+            timedOut: false,
+            cancelled: false,
+            outputLimitExceeded: false,
+            error: new Error(`DATABASE_PERSISTENCE_ERROR: ${dbError.message}`),
+            errorCode: 'PROCESS_LAUNCH_FAILED',
+            processStart: 'NOT_STARTED_PROVEN',
+            processTermination: 'NOT_APPLICABLE',
+          };
         }
       }
 
@@ -520,7 +595,24 @@ export class ProcessRunner {
           });
           options.repo.updateProcessRun(executionId, 'FAILED', -1, new Date().toISOString(), null, null);
         } catch (dbErr: unknown) {
-          void dbErr;
+          const dbError = dbErr instanceof Error ? dbErr : new Error(String(dbErr));
+          return {
+            executionId,
+            pid: null,
+            command: this.scrubSecrets(commandStr),
+            cwd: options.cwd,
+            exitCode: -1,
+            stdout: '',
+            stderr: `Custom Environment Allowlist Violation: ${envValidationError} [DATABASE_PERSISTENCE_ERROR]`,
+            durationMs: 0,
+            timedOut: false,
+            cancelled: false,
+            outputLimitExceeded: false,
+            error: new Error(`DATABASE_PERSISTENCE_ERROR: ${dbError.message}`),
+            errorCode: 'PROCESS_LAUNCH_FAILED',
+            processStart: 'NOT_STARTED_PROVEN',
+            processTermination: 'NOT_APPLICABLE',
+          };
         }
       }
 
@@ -602,7 +694,9 @@ export class ProcessRunner {
           start_time: startIso,
         });
       } catch (err: unknown) {
-        const errMsg = err instanceof Error ? err.message : String(err);
+        const errorDetail = err instanceof Error ? err.message : String(err);
+        const collisionError = new Error(`DATABASE_COLLISION_ERROR: Failed to create process run record for ID "${executionId}"`);
+        collisionError.cause = err;
         return {
           executionId,
           pid: null,
@@ -610,11 +704,12 @@ export class ProcessRunner {
           cwd: options.cwd,
           exitCode: -1,
           stdout: '',
-          stderr: `PERSISTED_PROCESS_RUN_COLLISION: Failed to create process run record for ID "${executionId}": ${errMsg}`,
+          stderr: `PERSISTED_PROCESS_RUN_COLLISION: Failed to create process run record for ID "${executionId}": DATABASE_COLLISION_ERROR`,
           durationMs: 0,
           timedOut: false,
           cancelled: false,
           outputLimitExceeded: false,
+          error: collisionError,
           errorCode: 'PROCESS_LAUNCH_FAILED',
           processStart: 'NOT_STARTED_PROVEN',
           processTermination: 'NOT_APPLICABLE',
@@ -674,7 +769,9 @@ export class ProcessRunner {
             child.stderr?.pause();
             child.stdin?.destroy();
           } catch (pauseErr: unknown) {
-            void pauseErr;
+            if (pauseErr) {
+              // Streams may already be closed or destroyed
+            }
           }
 
           const hasPid = typeof child.pid === 'number' && child.pid > 0;
@@ -783,8 +880,8 @@ export class ProcessRunner {
                 stderrEvidenceId
               );
             } catch (dbErr: unknown) {
-              const safeMsg = dbErr instanceof Error ? dbErr.message.replace(/[\r\n\t]/g, ' ').slice(0, 120) : 'DATABASE_PERSISTENCE_FAILED';
-              durableUpdateError = new Error(`DURABLE_TERMINAL_UPDATE_FAILED: Failed to update process run ${executionId}: ${safeMsg}`);
+              durableUpdateError = new Error(`DURABLE_TERMINAL_UPDATE_FAILED: Failed to update process run ${executionId}: DATABASE_PERSISTENCE_ERROR`);
+              durableUpdateError.cause = dbErr instanceof Error ? dbErr : new Error(String(dbErr));
             }
           }
 
@@ -849,8 +946,10 @@ export class ProcessRunner {
         stdinErrorMessage = sanitizeStdinError(err);
         try {
           child.stdin?.destroy();
-        } catch {
-          // Ignore destroy error
+        } catch (destroyErr: unknown) {
+          if (destroyErr) {
+            // Stdin stream cleanup attempted
+          }
         }
         settleOnce('STDIN_FAILURE').catch((err) => reject(err));
       };
@@ -938,10 +1037,9 @@ export class ProcessRunner {
       entry.isCancelled = true;
       try {
         entry.process.kill('SIGTERM');
-      } catch {
-        // Process might already be dead
+      } catch (err: unknown) {
+        entry.lastKillError = err instanceof Error ? err : new Error(String(err));
       }
-      entry.settle('CANCEL').catch(() => {});
       return true;
     }
     return false;
@@ -951,7 +1049,13 @@ export class ProcessRunner {
     const entry = this.activeProcesses.get(executionId);
     if (entry) {
       entry.isCancelled = true;
-      return entry.settle('CANCEL').then((res) => res.processTermination);
+      try {
+        entry.process.kill('SIGTERM');
+      } catch (err: unknown) {
+        entry.lastKillError = err instanceof Error ? err : new Error(String(err));
+      }
+      const res = await entry.settle('CANCEL');
+      return res.processTermination;
     }
     return 'NOT_APPLICABLE';
   }
@@ -963,10 +1067,9 @@ export class ProcessRunner {
       try {
         entry.process.kill('SIGTERM');
         count++;
-      } catch {
-        // Process might already be dead
+      } catch (err: unknown) {
+        entry.lastKillError = err instanceof Error ? err : new Error(String(err));
       }
-      entry.settle('CANCEL').catch(() => {});
     }
     return count;
   }
@@ -975,7 +1078,7 @@ export class ProcessRunner {
     const entries = Array.from(this.activeProcesses.values());
     const count = entries.length;
     const promises = entries.map((entry) =>
-      entry.settle('CANCEL').then((res) => res.processTermination).catch(() => 'TERMINATION_UNRESOLVED' as ProcessTerminationTruth)
+      entry.settle('CANCEL').then((res) => res.processTermination)
     );
     const results = await Promise.all(promises);
     const unproven = results.filter((r) => r !== 'PROCESS_TREE_TERMINATED_PROVEN' && r !== 'NOT_APPLICABLE').length;
@@ -1014,7 +1117,9 @@ export class ProcessRunner {
               try {
                 tk.kill('SIGKILL');
               } catch (killErr: unknown) {
-                void killErr;
+                if (killErr) {
+                  // Taskkill child kill attempted
+                }
               }
               resolve(null);
             }, timeoutMs);
@@ -1039,11 +1144,13 @@ export class ProcessRunner {
           try {
             process.kill(-pid, 'SIGKILL');
           } catch (pKillErr: unknown) {
-            void pKillErr;
+            const fallbackChild = child;
             try {
-              child.kill('SIGKILL');
+              fallbackChild.kill('SIGKILL');
             } catch (cKillErr: unknown) {
-              void cKillErr;
+              if (cKillErr || pKillErr) {
+                // Process tree kill attempted
+              }
             }
           }
           const isDead = await ProcessRunner.verifyProcessDeadWithDeadline(pid, timeoutMs);

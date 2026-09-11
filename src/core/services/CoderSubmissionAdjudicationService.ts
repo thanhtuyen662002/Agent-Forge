@@ -31,7 +31,7 @@ import {
   ArtifactManifestEntry,
   CoderSubmissionWorkspaceLease,
 } from '../types/adjudication';
-import { Evidence, GitStatusSummary, GitDiffSummary, TestRun } from '../types/domain';
+import { Evidence, EvidenceType, GitStatusSummary, GitDiffSummary, TestRun } from '../types/domain';
 import {
   ArtifactStore,
   defaultArtifactStore,
@@ -377,6 +377,9 @@ export function validateAndParseCanonicalResultEnvelope(
   if (typeof obj.workspace_snapshot_before_hash !== 'string' || !/^[0-9a-f]{64}$/.test(obj.workspace_snapshot_before_hash)) {
     return { valid: false, envelope: null, error: 'workspace_snapshot_before_hash must be a 64-char lowercase hex string' };
   }
+  if (typeof obj.workspace_snapshot_after_evidence_id !== 'string' || !obj.workspace_snapshot_after_evidence_id.trim()) {
+    return { valid: false, envelope: null, error: 'workspace_snapshot_after_evidence_id must be non-empty string' };
+  }
   if (typeof obj.workspace_snapshot_after_hash !== 'string' || !/^[0-9a-f]{64}$/.test(obj.workspace_snapshot_after_hash)) {
     return { valid: false, envelope: null, error: 'workspace_snapshot_after_hash must be a 64-char lowercase hex string' };
   }
@@ -483,34 +486,20 @@ export function validateAndParseCanonicalResultEnvelope(
     const payload = obj.failure_payload as Record<string, unknown>;
     const payloadKeys = Object.keys(payload).sort();
 
-    if (FENCED_FAILURE_CODES.has(code) || (code === 'PROCESS_START_FAILED' && 'is_fenced' in payload)) {
-      // Must have is_fenced: true and error or reason
-      if (!('is_fenced' in payload) || payload.is_fenced !== true) {
-        return { valid: false, envelope: null, error: `failure_payload for fenced code ${code} must have is_fenced: true` };
-      }
-      const allowedFencedKeys = new Set(['error', 'reason', 'is_fenced']);
+    if (!FENCED_FAILURE_CODES.has(code) && 'is_fenced' in payload) {
+      return { valid: false, envelope: null, error: `failure_payload for non-fenced code ${code} must not include is_fenced` };
+    }
+
+    if (code === 'TESTS_FAILED') {
+      const allowedKeys = ['error', 'failed_tests_count'];
       for (const k of payloadKeys) {
-        if (!allowedFencedKeys.has(k)) {
-          return { valid: false, envelope: null, error: `failure_payload contains unrecognized key or unauthorized extra field: "${k}"` };
+        if (!allowedKeys.includes(k)) {
+          return { valid: false, envelope: null, error: 'failure_payload contains unrecognized key or unauthorized extra field' };
         }
       }
-      const msg = payload.error ?? payload.reason;
-      if (typeof msg !== 'string' || !msg.trim() || msg.length > 4096) {
-        return { valid: false, envelope: null, error: 'failure_payload error/reason must be a non-empty string <= 4096 characters' };
-      }
-    } else {
-      // Non-fenced: is_fenced is strictly forbidden (contradictory)
-      if ('is_fenced' in payload) {
-        return {
-          valid: false,
-          envelope: null,
-          error: `failure_payload for non-fenced code ${code} must not include is_fenced`,
-        };
-      }
-      const allowedNonFencedKeys = new Set(['error', 'reason', 'failed_tests_count']);
-      for (const k of payloadKeys) {
-        if (!allowedNonFencedKeys.has(k)) {
-          return { valid: false, envelope: null, error: `failure_payload contains unrecognized key or unauthorized extra field: "${k}"` };
+      if ('error' in payload) {
+        if (typeof payload.error !== 'string' || !payload.error.trim() || payload.error.length > 4096) {
+          return { valid: false, envelope: null, error: 'failure_payload.error must be a non-empty string <= 4096 characters' };
         }
       }
       if ('failed_tests_count' in payload) {
@@ -518,14 +507,54 @@ export function validateAndParseCanonicalResultEnvelope(
           return { valid: false, envelope: null, error: 'failure_payload.failed_tests_count must be a non-negative integer' };
         }
       }
-      if ('error' in payload || 'reason' in payload) {
-        const msg = (payload.error ?? payload.reason) as unknown;
-        if (typeof msg !== 'string' || !msg.trim() || msg.length > 4096) {
-          return { valid: false, envelope: null, error: 'failure_payload error/reason must be a non-empty string <= 4096 characters' };
+      if (!('error' in payload) && !('failed_tests_count' in payload)) {
+        return { valid: false, envelope: null, error: 'failure_payload for TESTS_FAILED must contain at least error or failed_tests_count' };
+      }
+    } else if (FENCED_FAILURE_CODES.has(code)) {
+      const allowedKeys = ['error', 'is_fenced', 'reason'];
+      for (const k of payloadKeys) {
+        if (!allowedKeys.includes(k)) {
+          return { valid: false, envelope: null, error: 'failure_payload contains unrecognized key or unauthorized extra field' };
         }
       }
-      if (payloadKeys.length === 0) {
-        return { valid: false, envelope: null, error: `failure_payload for code ${code} must contain at least one valid field` };
+      if (payload.is_fenced !== true) {
+        return { valid: false, envelope: null, error: `failure_payload for fenced code ${code} must have is_fenced: true` };
+      }
+      if ('error' in payload) {
+        if (typeof payload.error !== 'string' || !payload.error.trim() || payload.error.length > 4096) {
+          return { valid: false, envelope: null, error: 'failure_payload.error must be a non-empty string <= 4096 characters' };
+        }
+      }
+      if ('reason' in payload) {
+        if (typeof payload.reason !== 'string' || !payload.reason.trim() || payload.reason.length > 4096) {
+          return { valid: false, envelope: null, error: 'failure_payload.reason must be a non-empty string <= 4096 characters' };
+        }
+      }
+      if (!('error' in payload) && !('reason' in payload)) {
+        return { valid: false, envelope: null, error: `failure_payload for fenced code ${code} must contain error or reason` };
+      }
+    } else {
+      if ('is_fenced' in payload) {
+        return { valid: false, envelope: null, error: `failure_payload for non-fenced code ${code} must not include is_fenced` };
+      }
+      const allowedKeys = ['error', 'reason'];
+      for (const k of payloadKeys) {
+        if (!allowedKeys.includes(k)) {
+          return { valid: false, envelope: null, error: 'failure_payload contains unrecognized key or unauthorized extra field' };
+        }
+      }
+      if ('error' in payload) {
+        if (typeof payload.error !== 'string' || !payload.error.trim() || payload.error.length > 4096) {
+          return { valid: false, envelope: null, error: 'failure_payload.error must be a non-empty string <= 4096 characters' };
+        }
+      }
+      if ('reason' in payload) {
+        if (typeof payload.reason !== 'string' || !payload.reason.trim() || payload.reason.length > 4096) {
+          return { valid: false, envelope: null, error: 'failure_payload.reason must be a non-empty string <= 4096 characters' };
+        }
+      }
+      if (!('error' in payload) && !('reason' in payload)) {
+        return { valid: false, envelope: null, error: `failure_payload for code ${code} must contain error or reason` };
       }
     }
   } else {
@@ -877,12 +906,24 @@ export function evaluateCanonicalSettlementDecision(
     };
   }
 
-  // Bind workspace_snapshot_after_hash to durable captured evidence in repo
-  const taskEvidenceList = input.repo.getEvidenceByTask(input.adjudication.task_id);
-  const matchingAfterEvidence = taskEvidenceList.find(
-    (ev) => ev.hash === envelope.workspace_snapshot_after_hash
-  );
-  if (!matchingAfterEvidence) {
+  // Bind workspace_snapshot_after_hash to durable captured evidence in repo via exact identifier
+  if (!envelope.workspace_snapshot_after_evidence_id || typeof envelope.workspace_snapshot_after_evidence_id !== 'string') {
+    return {
+      valid: false,
+      isSuccess: false,
+      targetStatus: 'RECOVERY_FENCED',
+      taskTransition: 'NEEDS_HUMAN',
+      eventType: 'RECOVERY_FENCED',
+      dispositionEvent: 'REJECTED',
+      dispositionReason: 'RECOVERY_FENCED',
+      failureCode: 'INTEGRITY_MISMATCH',
+      failureDetail: 'Envelope workspace_snapshot_after_evidence_id must be non-empty string',
+      contradictionReason: 'workspace_snapshot_after_evidence_id missing',
+    };
+  }
+
+  const matchingAfterEvidence = input.repo.getEvidence(envelope.workspace_snapshot_after_evidence_id);
+  if (!matchingAfterEvidence || matchingAfterEvidence.hash !== envelope.workspace_snapshot_after_hash) {
     return {
       valid: false,
       isSuccess: false,
@@ -897,11 +938,57 @@ export function evaluateCanonicalSettlementDecision(
     };
   }
 
+  const VALID_WORKSPACE_SNAPSHOT_TYPES: ReadonlySet<EvidenceType> = new Set([
+    'CUSTOM',
+    'FILE_SNAPSHOT',
+    'GIT_STATUS',
+    'GIT_DIFF',
+  ]);
+  if (
+    !VALID_WORKSPACE_SNAPSHOT_TYPES.has(matchingAfterEvidence.evidence_type) ||
+    matchingAfterEvidence.project_id !== input.adjudication.project_id ||
+    matchingAfterEvidence.task_id !== input.adjudication.task_id ||
+    (input.adjudication.attempt_id && matchingAfterEvidence.attempt_id !== input.adjudication.attempt_id)
+  ) {
+    return {
+      valid: false,
+      isSuccess: false,
+      targetStatus: 'RECOVERY_FENCED',
+      taskTransition: 'NEEDS_HUMAN',
+      eventType: 'RECOVERY_FENCED',
+      dispositionEvent: 'REJECTED',
+      dispositionReason: 'RECOVERY_FENCED',
+      failureCode: 'INTEGRITY_MISMATCH',
+      failureDetail: 'Workspace snapshot after evidence authority bindings, type, or hash mismatch',
+      contradictionReason: 'workspace_snapshot_after evidence authority mismatch',
+    };
+  }
+
+  const taskEvidenceList = input.repo.getEvidenceByTask(input.adjudication.task_id);
+  const duplicateHashRows = taskEvidenceList.filter(
+    (ev) => ev.hash === envelope.workspace_snapshot_after_hash && ev.id !== matchingAfterEvidence.id
+  );
+  if (duplicateHashRows.length > 0) {
+    return {
+      valid: false,
+      isSuccess: false,
+      targetStatus: 'RECOVERY_FENCED',
+      taskTransition: 'NEEDS_HUMAN',
+      eventType: 'RECOVERY_FENCED',
+      dispositionEvent: 'REJECTED',
+      dispositionReason: 'RECOVERY_FENCED',
+      failureCode: 'INTEGRITY_MISMATCH',
+      failureDetail: 'Duplicate workspace snapshot after evidence hash rows detected',
+      contradictionReason: 'workspace_snapshot_after duplicate hash rows',
+    };
+  }
+
   // 1-to-1 set equality between manifest entries and all envelope evidence bindings
   const expectedEvidenceIds = new Set<string>();
   expectedEvidenceIds.add(envelope.test_result_evidence_id);
   if (envelope.git_status_evidence_id) expectedEvidenceIds.add(envelope.git_status_evidence_id);
   if (envelope.git_diff_evidence_id) expectedEvidenceIds.add(envelope.git_diff_evidence_id);
+  if (envelope.workspace_snapshot_after_evidence_id) expectedEvidenceIds.add(envelope.workspace_snapshot_after_evidence_id);
 
   const manifestMap = new Map<string, ArtifactManifestEntry>();
   for (const entry of parsedManifest.entries) {
@@ -1378,8 +1465,7 @@ export function evaluateCanonicalSettlementDecision(
     envelope.failure_code === 'CLEANUP_DEBT_FENCED' ||
     envelope.failure_code === 'PROCESS_TERMINATION_UNRESOLVED' ||
     envelope.termination_classification === 'TERMINATION_AMBIGUOUS' ||
-    envelope.process_start_classification === 'LAUNCH_FAILED_PROVEN' ||
-    Boolean(envelope.failure_payload?.is_fenced);
+    envelope.process_start_classification === 'LAUNCH_AMBIGUOUS';
 
   if (isFencedCode) {
     return {
@@ -2032,11 +2118,8 @@ export function evaluateNonAuthoritativeSettlementDecisionForTests(
   }
 
   if (repo) {
-    const taskEvidenceList = repo.getEvidenceByTask(adjudication.task_id);
-    const matchingAfterEvidence = taskEvidenceList.find(
-      (ev) => ev.hash === envelope.workspace_snapshot_after_hash
-    );
-    if (!matchingAfterEvidence) {
+    const matchingAfterEvidence = repo.getEvidence(envelope.workspace_snapshot_after_evidence_id);
+    if (!matchingAfterEvidence || matchingAfterEvidence.hash !== envelope.workspace_snapshot_after_hash) {
       return {
         valid: false,
         isSuccess: false,
@@ -2048,6 +2131,51 @@ export function evaluateNonAuthoritativeSettlementDecisionForTests(
         failureCode: 'INTEGRITY_MISMATCH',
         failureDetail: 'Envelope workspace_snapshot_after_hash is not backed by durable captured evidence',
         contradictionReason: 'workspace_snapshot_after_hash not backed by durable evidence',
+      };
+    }
+
+    const VALID_WORKSPACE_SNAPSHOT_TYPES: ReadonlySet<EvidenceType> = new Set([
+      'CUSTOM',
+      'FILE_SNAPSHOT',
+      'GIT_STATUS',
+      'GIT_DIFF',
+    ]);
+    if (
+      !VALID_WORKSPACE_SNAPSHOT_TYPES.has(matchingAfterEvidence.evidence_type) ||
+      matchingAfterEvidence.project_id !== adjudication.project_id ||
+      matchingAfterEvidence.task_id !== adjudication.task_id ||
+      (adjudication.attempt_id && matchingAfterEvidence.attempt_id !== adjudication.attempt_id)
+    ) {
+      return {
+        valid: false,
+        isSuccess: false,
+        targetStatus: 'RECOVERY_FENCED',
+        taskTransition: 'NEEDS_HUMAN',
+        eventType: 'RECOVERY_FENCED',
+        dispositionEvent: 'REJECTED',
+        dispositionReason: 'RECOVERY_FENCED',
+        failureCode: 'INTEGRITY_MISMATCH',
+        failureDetail: 'Workspace snapshot after evidence authority bindings, type, or hash mismatch',
+        contradictionReason: 'workspace_snapshot_after evidence authority mismatch',
+      };
+    }
+
+    const taskEvidenceList = repo.getEvidenceByTask(adjudication.task_id);
+    const duplicateHashRows = taskEvidenceList.filter(
+      (ev) => ev.hash === envelope.workspace_snapshot_after_hash && ev.id !== matchingAfterEvidence.id
+    );
+    if (duplicateHashRows.length > 0) {
+      return {
+        valid: false,
+        isSuccess: false,
+        targetStatus: 'RECOVERY_FENCED',
+        taskTransition: 'NEEDS_HUMAN',
+        eventType: 'RECOVERY_FENCED',
+        dispositionEvent: 'REJECTED',
+        dispositionReason: 'RECOVERY_FENCED',
+        failureCode: 'INTEGRITY_MISMATCH',
+        failureDetail: 'Duplicate workspace snapshot after evidence hash rows detected',
+        contradictionReason: 'workspace_snapshot_after duplicate hash rows',
       };
     }
   }
@@ -2185,8 +2313,7 @@ export function evaluateNonAuthoritativeSettlementDecisionForTests(
     envelope.failure_code === 'CLEANUP_DEBT_FENCED' ||
     envelope.failure_code === 'PROCESS_TERMINATION_UNRESOLVED' ||
     envelope.termination_classification === 'TERMINATION_AMBIGUOUS' ||
-    envelope.process_start_classification === 'LAUNCH_FAILED_PROVEN' ||
-    Boolean(envelope.failure_payload?.is_fenced);
+    envelope.process_start_classification === 'LAUNCH_AMBIGUOUS';
 
   if (isFencedCode) {
     return {
@@ -3709,11 +3836,13 @@ export class CoderSubmissionAdjudicationService {
         ? 'EXIT_NONZERO'
         : 'UNKNOWN';
 
-    const processStartClass: 'SPAWNED_PROVEN' | 'LAUNCH_FAILED_PROVEN' | 'NOT_STARTED_PROVEN' =
+    const processStartClass: 'SPAWNED_PROVEN' | 'LAUNCH_FAILED_PROVEN' | 'NOT_STARTED_PROVEN' | 'LAUNCH_AMBIGUOUS' =
       verificationResult.process_start === 'STARTED_PROVEN'
         ? 'SPAWNED_PROVEN'
         : verificationResult.process_start === 'NOT_STARTED_PROVEN'
         ? 'NOT_STARTED_PROVEN'
+        : verificationResult.process_start === 'START_AMBIGUOUS'
+        ? 'LAUNCH_AMBIGUOUS'
         : 'LAUNCH_FAILED_PROVEN';
 
     const terminationClass: 'TERMINATION_PROVEN' | 'TERMINATION_AMBIGUOUS' | 'NOT_APPLICABLE' =
@@ -3723,6 +3852,7 @@ export class CoderSubmissionAdjudicationService {
         ? 'NOT_APPLICABLE'
         : 'TERMINATION_AMBIGUOUS';
 
+    const afterEvidenceId = stagedGitStatusEvidence?.id ?? stagedGitDiffEvidence?.id ?? testResultEvId;
     const afterEvidenceHash = stagedGitStatusEvidence?.hash ?? stagedGitDiffEvidence?.hash ?? testResultHash;
 
     const resultEnvelope: CanonicalVerificationResultEnvelope = {
@@ -3735,7 +3865,12 @@ export class CoderSubmissionAdjudicationService {
       exit_classification: exitClassification,
       failure_code: failureCode,
       failure_payload: failureCode
-        ? isAmbiguous
+        ? failureCode === 'TESTS_FAILED'
+          ? {
+              error: scrubbedFailureDetail || 'Verification failed',
+              failed_tests_count: 1,
+            }
+          : FENCED_FAILURE_CODES.has(failureCode as SupportedFailureCode)
           ? {
               error: scrubbedFailureDetail || 'Process execution ambiguous',
               is_fenced: true,
@@ -3760,6 +3895,7 @@ export class CoderSubmissionAdjudicationService {
       test_result_evidence_id: testResultEvId,
       test_run_id: testRunId,
       verification_execution_id: executionId,
+      workspace_snapshot_after_evidence_id: afterEvidenceId,
       workspace_snapshot_after_hash: afterEvidenceHash,
       workspace_snapshot_before_hash: workspaceSnapshotHash,
     };
@@ -4014,6 +4150,22 @@ export class CoderSubmissionAdjudicationService {
             throw new CoderSubmissionAdjudicationError('STATUS_CONFLICT', 'Workspace lease release CAS failed');
           }
 
+          const dispReason = failureCode === 'INTEGRITY_MISMATCH' ? 'INTEGRITY_MISMATCH' : 'FENCED_PRECONDITION';
+          this.repo.createCoderSubmissionDisposition({
+            id: dispositionId,
+            submission_id: sub.id,
+            disposition_event: 'REJECTED',
+            disposition_reason: dispReason,
+            actor_type: 'SYSTEM',
+            actor_id: 'SYSTEM_VERIFICATION_EVALUATOR',
+            disposition_metadata_json: canonicalJsonStringify({
+              adjudication_id: adjudicationId,
+              error: scrubbedFailureDetail,
+              failure_code: failureCode || 'TESTS_FAILED',
+            }),
+            created_at: phaseCNowIso,
+          });
+
           this.repo.createCoderSubmissionAdjudicationEvent({
             id: finalEventId,
             adjudication_id: adjudicationId,
@@ -4069,6 +4221,23 @@ export class CoderSubmissionAdjudicationService {
           if (!leaseUpdated) {
             throw new CoderSubmissionAdjudicationError('STATUS_CONFLICT', 'Workspace lease fencing CAS failed');
           }
+
+          const dispReason = failureCode === 'INTEGRITY_MISMATCH' ? 'INTEGRITY_MISMATCH' : 'FENCED_PRECONDITION';
+          this.repo.createCoderSubmissionDisposition({
+            id: dispositionId,
+            submission_id: sub.id,
+            disposition_event: 'REJECTED',
+            disposition_reason: dispReason,
+            actor_type: 'SYSTEM',
+            actor_id: 'SYSTEM_VERIFICATION_EVALUATOR',
+            disposition_metadata_json: canonicalJsonStringify({
+              adjudication_id: adjudicationId,
+              error: scrubbedFailureDetail,
+              failure_code: failureCode || 'ORPHANED_VERIFICATION_INTERRUPTED',
+              is_fenced: true,
+            }),
+            created_at: phaseCNowIso,
+          });
 
           this.repo.createCoderSubmissionAdjudicationEvent({
             id: finalEventId,

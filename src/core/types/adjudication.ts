@@ -140,6 +140,7 @@ export const CANONICAL_VERIFICATION_RESULT_ENVELOPE_KEYS = [
   'test_result_evidence_id',
   'test_run_id',
   'verification_execution_id',
+  'workspace_snapshot_after_evidence_id',
   'workspace_snapshot_after_hash',
   'workspace_snapshot_before_hash',
 ] as const;
@@ -162,7 +163,7 @@ export interface CanonicalVerificationResultEnvelope {
   git_status_evidence_hash: string;
   git_status_evidence_id: string;
   lifecycle_version: number;
-  process_start_classification: 'SPAWNED_PROVEN' | 'LAUNCH_FAILED_PROVEN' | 'NOT_STARTED_PROVEN';
+  process_start_classification: 'SPAWNED_PROVEN' | 'LAUNCH_FAILED_PROVEN' | 'NOT_STARTED_PROVEN' | 'LAUNCH_AMBIGUOUS';
   project_id: string;
   start_timestamp: string;
   task_id: string;
@@ -172,6 +173,7 @@ export interface CanonicalVerificationResultEnvelope {
   test_result_evidence_id: string;
   test_run_id: string;
   verification_execution_id: string;
+  workspace_snapshot_after_evidence_id: string;
   workspace_snapshot_after_hash: string;
   workspace_snapshot_before_hash: string;
 }

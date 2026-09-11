@@ -240,9 +240,22 @@ export class CoderSubmissionAdjudicationRecoveryScanner {
                 if (!task || task.state !== 'REVIEW_READY') {
                   contradiction = `VERIFIED adjudication task state must be REVIEW_READY, got ${task?.state}`;
                 }
-              } else {
+              } else if (dec.targetStatus === 'RECOVERY_FENCED') {
                 if (!task || task.state !== 'NEEDS_HUMAN') {
                   contradiction = `${adj.status} adjudication task state must be NEEDS_HUMAN, got ${task?.state}`;
+                }
+              } else if (dec.targetStatus === 'VERIFICATION_FAILED') {
+                if (!task || (task.state !== 'CODING' && task.state !== 'NEEDS_HUMAN')) {
+                  contradiction = `${adj.status} adjudication task state must be CODING or NEEDS_HUMAN, got ${task?.state}`;
+                }
+              }
+
+              // Check contradictory SETTLED disposition first
+              if (!contradiction && dec.targetStatus !== 'VERIFIED') {
+                const disps = this.repo.getCoderSubmissionDispositions(adj.submission_id);
+                const settledDisp = disps.find((d) => d.disposition_event === 'SETTLED');
+                if (settledDisp) {
+                  contradiction = `${dec.targetStatus} adjudication has contradictory SETTLED disposition`;
                 }
               }
 
@@ -256,8 +269,11 @@ export class CoderSubmissionAdjudicationRecoveryScanner {
                     contradiction = `${adj.status} workspace lease must be RELEASED with valid released_at, got ${lease.state}`;
                   }
                 } else {
-                  if ((lease.state !== 'FENCED' && lease.state !== 'RELEASED') || !lease.released_at || !isCanonicalUtcIso(lease.released_at)) {
-                    contradiction = `RECOVERY_FENCED workspace lease must be FENCED or RELEASED with valid released_at, got ${lease.state}`;
+                  // RECOVERY_FENCED
+                  if (lease.state !== 'FENCED' && lease.state !== 'RELEASED') {
+                    contradiction = `RECOVERY_FENCED workspace lease must be FENCED or RELEASED, got ${lease.state}`;
+                  } else if (lease.state === 'RELEASED' && (!lease.released_at || !isCanonicalUtcIso(lease.released_at))) {
+                    contradiction = `Released workspace lease must have valid released_at`;
                   }
                 }
               }
@@ -298,10 +314,10 @@ export class CoderSubmissionAdjudicationRecoveryScanner {
                       dec.eventType,
                       expectedPayloadHash
                     );
-                    if (evt.id !== expectedEvtId) {
-                      contradiction = `Terminal event ID ${evt.id} does not match deterministic ID ${expectedEvtId}`;
-                    } else if (evt.payload_hash !== expectedPayloadHash) {
-                      contradiction = `Terminal event payload_hash ${evt.payload_hash} does not match expected ${expectedPayloadHash}`;
+                    if (evt.payload_hash !== expectedPayloadHash) {
+                      contradiction = `Deterministic event payload hash mismatch: expected ${expectedPayloadHash}, got ${evt.payload_hash}`;
+                    } else if (evt.id !== expectedEvtId) {
+                      contradiction = `Deterministic event ID mismatch: expected ${expectedEvtId}, got ${evt.id}`;
                     } else if (evt.payload_json !== expectedPayload) {
                       contradiction = `Terminal event payload_json does not match canonical payload`;
                     }
@@ -312,26 +328,53 @@ export class CoderSubmissionAdjudicationRecoveryScanner {
               // Exact terminal disposition check
               if (!contradiction) {
                 const disps = this.repo.getCoderSubmissionDispositions(adj.submission_id);
-                if (dec.targetStatus === 'VERIFIED') {
+                if (dec.targetStatus !== 'VERIFIED') {
+                  const settledDisp = disps.find((d) => d.disposition_event === 'SETTLED');
+                  if (settledDisp) {
+                    contradiction = `${dec.targetStatus} adjudication has contradictory SETTLED disposition`;
+                  }
+                }
+                if (!contradiction) {
                   const terminalDisps = disps.filter(
                     (d) => d.disposition_event === 'SETTLED' || d.disposition_event === 'REJECTED'
                   );
                   if (terminalDisps.length !== 1) {
-                    contradiction = `Expected exactly one terminal disposition for VERIFIED submission, found ${terminalDisps.length}`;
+                    contradiction = `Expected exactly one terminal disposition for ${dec.targetStatus} submission, found ${terminalDisps.length}`;
                   } else {
                     const disp = terminalDisps[0];
                     const expectedDispId = deriveDeterministicDispositionId(adj.submission_id, adj.id, 3);
                     if (disp.id !== expectedDispId) {
-                      contradiction = `Terminal disposition ID ${disp.id} does not match deterministic ID ${expectedDispId}`;
-                    } else if (disp.disposition_event !== 'SETTLED' || disp.disposition_reason !== 'ACCEPTED_VERIFIED') {
-                      contradiction = `Terminal disposition for VERIFIED must be SETTLED / ACCEPTED_VERIFIED, got ${disp.disposition_event} / ${disp.disposition_reason}`;
+                      contradiction = `Deterministic disposition ID mismatch: expected ${expectedDispId}, got ${disp.id}`;
+                    } else if (disp.actor_type !== 'SYSTEM' && disp.actor_type !== 'OPERATOR') {
+                      contradiction = `Terminal disposition actor_type must be SYSTEM or OPERATOR, got ${disp.actor_type}`;
+                    } else if (dec.targetStatus === 'VERIFIED') {
+                      if (disp.disposition_event !== 'SETTLED' || disp.disposition_reason !== 'ACCEPTED_VERIFIED') {
+                        contradiction = `Terminal disposition for VERIFIED must be SETTLED / ACCEPTED_VERIFIED, got ${disp.disposition_event} / ${disp.disposition_reason}`;
+                      }
+                    } else {
+                      if (
+                        disp.disposition_event !== 'REJECTED' ||
+                        (disp.disposition_reason !== 'FENCED_PRECONDITION' && disp.disposition_reason !== 'INTEGRITY_MISMATCH')
+                      ) {
+                        contradiction = `Terminal disposition for ${dec.targetStatus} must be REJECTED with FENCED_PRECONDITION or INTEGRITY_MISMATCH, got ${disp.disposition_event} / ${disp.disposition_reason}`;
+                      } else if (!disp.disposition_metadata_json) {
+                        contradiction = `Terminal disposition for ${dec.targetStatus} missing metadata`;
+                      } else {
+                        try {
+                          const meta = JSON.parse(disp.disposition_metadata_json);
+                          if (
+                            typeof meta !== 'object' ||
+                            meta === null ||
+                            meta.adjudication_id !== adj.id ||
+                            typeof meta.failure_code !== 'string'
+                          ) {
+                            contradiction = `Terminal disposition metadata invalid for ${dec.targetStatus}`;
+                          }
+                        } catch (metaErr: unknown) {
+                          contradiction = `Terminal disposition metadata is malformed JSON`;
+                        }
+                      }
                     }
-                  }
-                } else {
-                  // For VERIFICATION_FAILED and RECOVERY_FENCED, any SETTLED disposition is an authority conflict
-                  const settledDisp = disps.find((d) => d.disposition_event === 'SETTLED');
-                  if (settledDisp) {
-                    contradiction = `${adj.status} adjudication has contradictory SETTLED disposition`;
                   }
                 }
               }
@@ -369,14 +412,7 @@ export class CoderSubmissionAdjudicationRecoveryScanner {
           contradiction = `Pre-result RECOVERY_FENCED task state must be NEEDS_HUMAN, got ${task?.state}`;
         }
 
-        if (!contradiction && adj.workspace_lease_id) {
-          const lease = this.repo.getWorkspaceLease(adj.workspace_lease_id);
-          if (!lease || (lease.state !== 'FENCED' && lease.state !== 'RELEASED') || !lease.released_at || !isCanonicalUtcIso(lease.released_at)) {
-            contradiction = `Pre-result RECOVERY_FENCED workspace lease must be FENCED or RELEASED with valid released_at, got ${lease?.state}`;
-          }
-        }
-
-        // Pre-result RECOVERY_FENCED: any SETTLED disposition is an authority conflict
+        // Check contradictory SETTLED disposition first
         if (!contradiction) {
           const disps = this.repo.getCoderSubmissionDispositions(adj.submission_id);
           const settledDisp = disps.find((d) => d.disposition_event === 'SETTLED');
@@ -385,7 +421,7 @@ export class CoderSubmissionAdjudicationRecoveryScanner {
           }
         }
 
-        // Exact deterministic RECOVERY_FENCED event
+        // Exact deterministic RECOVERY_FENCED event: reconstruct expected payload strictly from trusted DB fields
         if (!contradiction) {
           const events = this.repo.getCoderSubmissionAdjudicationEvents(adj.id);
           const terminalEvents = events.filter(
@@ -401,13 +437,113 @@ export class CoderSubmissionAdjudicationRecoveryScanner {
             if (evt.event_type !== 'RECOVERY_FENCED' || evt.sequence !== 3) {
               contradiction = 'Pre-result RECOVERY_FENCED terminal event must have type RECOVERY_FENCED and sequence 3';
             } else {
-              const expectedEventId = deriveDeterministicAdjudicationEventId(adj.id, 3, 'RECOVERY_FENCED', evt.payload_hash);
-              if (evt.id !== expectedEventId) {
-                contradiction = `Deterministic event ID mismatch: expected ${expectedEventId}, got ${evt.id}`;
-              } else if (computeSha256(evt.payload_json) !== evt.payload_hash) {
-                contradiction = `Deterministic event payload hash mismatch`;
+              let failureObj: Record<string, unknown> = {};
+              if (adj.failure_json) {
+                try {
+                  failureObj = JSON.parse(adj.failure_json);
+                } catch (jsonErr: unknown) {
+                  contradiction = 'Pre-result RECOVERY_FENCED failure_json is malformed';
+                }
+              }
+
+              if (!contradiction) {
+                let expectedPayload: string;
+                if (failureObj.reason) {
+                  const recAt = failureObj.recovered_at ?? adj.recovery_fenced_at;
+                  const primaryPayload = canonicalJsonStringify({
+                    adjudication_id: adj.id,
+                    failure_code: adj.failure_code,
+                    reason: failureObj.reason,
+                    ...(recAt ? { recovered_at: recAt } : {}),
+                  });
+                  const altPayload = canonicalJsonStringify({
+                    adjudication_id: adj.id,
+                    error: scrubAdjudicationDiagnostics(String(failureObj.reason)),
+                    failure_code: adj.failure_code,
+                  });
+                  expectedPayload = evt.payload_json === altPayload ? altPayload : primaryPayload;
+                } else if (failureObj.error) {
+                  expectedPayload = canonicalJsonStringify({
+                    adjudication_id: adj.id,
+                    error: scrubAdjudicationDiagnostics(String(failureObj.error)),
+                    failure_code: adj.failure_code,
+                  });
+                } else {
+                  expectedPayload = canonicalJsonStringify({
+                    adjudication_id: adj.id,
+                    error: null,
+                    failure_code: adj.failure_code,
+                  });
+                }
+
+                const expectedPayloadHash = computeSha256(expectedPayload);
+                const expectedEventId = deriveDeterministicAdjudicationEventId(
+                  adj.id,
+                  3,
+                  'RECOVERY_FENCED',
+                  expectedPayloadHash
+                );
+
+                if (evt.payload_hash !== expectedPayloadHash) {
+                  contradiction = `Deterministic event payload hash mismatch: expected ${expectedPayloadHash}, got ${evt.payload_hash}`;
+                } else if (evt.id !== expectedEventId) {
+                  contradiction = `Deterministic event ID mismatch: expected ${expectedEventId}, got ${evt.id}`;
+                } else if (evt.payload_json !== expectedPayload) {
+                  contradiction = `Deterministic event payload mismatch`;
+                }
               }
             }
+          }
+        }
+
+        // Pre-result RECOVERY_FENCED terminal disposition check
+        if (!contradiction) {
+          const disps = this.repo.getCoderSubmissionDispositions(adj.submission_id);
+          const terminalDisps = disps.filter(
+            (d) => d.disposition_event === 'SETTLED' || d.disposition_event === 'REJECTED'
+          );
+          if (terminalDisps.length !== 1) {
+            contradiction = `Expected exactly one terminal disposition for pre-result RECOVERY_FENCED, found ${terminalDisps.length}`;
+          } else {
+            const disp = terminalDisps[0];
+            const expectedDispId = deriveDeterministicDispositionId(adj.submission_id, adj.id, 3);
+            if (disp.id !== expectedDispId) {
+              contradiction = `Deterministic disposition ID mismatch: expected ${expectedDispId}, got ${disp.id}`;
+            } else if (disp.actor_type !== 'SYSTEM' && disp.actor_type !== 'OPERATOR') {
+              contradiction = `Terminal disposition actor_type must be SYSTEM or OPERATOR, got ${disp.actor_type}`;
+            } else if (
+              disp.disposition_event !== 'REJECTED' ||
+              (disp.disposition_reason !== 'FENCED_PRECONDITION' && disp.disposition_reason !== 'INTEGRITY_MISMATCH')
+            ) {
+              contradiction = `Terminal disposition for pre-result RECOVERY_FENCED must be REJECTED with FENCED_PRECONDITION or INTEGRITY_MISMATCH, got ${disp.disposition_event} / ${disp.disposition_reason}`;
+            } else if (!disp.disposition_metadata_json) {
+              contradiction = `Terminal disposition for pre-result RECOVERY_FENCED missing metadata`;
+            } else {
+              try {
+                const meta = JSON.parse(disp.disposition_metadata_json);
+                if (
+                  typeof meta !== 'object' ||
+                  meta === null ||
+                  meta.adjudication_id !== adj.id ||
+                  typeof meta.failure_code !== 'string'
+                ) {
+                  contradiction = `Terminal disposition metadata invalid for pre-result RECOVERY_FENCED`;
+                }
+              } catch (metaErr: unknown) {
+                contradiction = `Terminal disposition metadata is malformed JSON`;
+              }
+            }
+          }
+        }
+
+        if (!contradiction && adj.workspace_lease_id) {
+          const lease = this.repo.getWorkspaceLease(adj.workspace_lease_id);
+          if (!lease) {
+            contradiction = `Pre-result RECOVERY_FENCED workspace lease ${adj.workspace_lease_id} missing`;
+          } else if (lease.state !== 'FENCED' && lease.state !== 'RELEASED') {
+            contradiction = `Pre-result RECOVERY_FENCED workspace lease must be FENCED or RELEASED, got ${lease.state}`;
+          } else if (lease.state === 'RELEASED' && (!lease.released_at || !isCanonicalUtcIso(lease.released_at))) {
+            contradiction = `Released workspace lease must have valid released_at`;
           }
         }
       }
@@ -963,6 +1099,29 @@ export class CoderSubmissionAdjudicationRecoveryScanner {
           throw new Error(`RECOVERY_CAS_FAILED: Workspace lease fence CAS failed for lease ${l.id}`);
         }
       }
+
+      const existingDisps = this.repo.getCoderSubmissionDispositions(adj.submission_id);
+      const hasTerminalDisp = existingDisps.some(
+        (d) => d.disposition_event === 'SETTLED' || d.disposition_event === 'REJECTED'
+      );
+      if (!hasTerminalDisp) {
+        const dispReason = failureCode === 'INTEGRITY_MISMATCH' ? 'INTEGRITY_MISMATCH' : 'FENCED_PRECONDITION';
+        this.repo.createCoderSubmissionDisposition({
+          id: deriveDeterministicDispositionId(adj.submission_id, adj.id, nextVersion),
+          submission_id: adj.submission_id,
+          disposition_event: 'REJECTED',
+          disposition_reason: dispReason,
+          actor_type: 'SYSTEM',
+          actor_id: 'RECOVERY_SCANNER',
+          disposition_metadata_json: canonicalJsonStringify({
+            adjudication_id: adj.id,
+            error: scrubAdjudicationDiagnostics(effectiveReason),
+            failure_code: failureCode,
+            is_fenced: true,
+          }),
+          created_at: effectiveNow,
+        });
+      }
     });
 
     tx();
@@ -1015,6 +1174,18 @@ export class CoderSubmissionAdjudicationRecoveryScanner {
     const targetStatus = decision.targetStatus;
     const eventType = decision.eventType;
     const isSuccess = decision.isSuccess;
+    const isFenced = targetStatus === 'RECOVERY_FENCED';
+    const effectiveFailureCode = isSuccess
+      ? null
+      : decision.failureCode || (isFenced ? 'RECOVERY_FENCED' : 'TESTS_FAILED');
+    const effectiveFailureDetail = decision.failureDetail
+      ? scrubAdjudicationDiagnostics(decision.failureDetail)
+      : null;
+    const effectiveFailureJson = isSuccess
+      ? null
+      : canonicalJsonStringify({ error: effectiveFailureDetail });
+    const completedAt = isFenced ? null : nowIso;
+    const recoveryFencedAt = isFenced ? nowIso : null;
     const nextVersion = adj.lifecycle_version + 1;
 
     try {
@@ -1024,6 +1195,9 @@ export class CoderSubmissionAdjudicationRecoveryScanner {
             UPDATE coder_submission_adjudications
             SET status = ?,
                 completed_at = ?,
+                recovery_fenced_at = ?,
+                failure_code = ?,
+                failure_json = ?,
                 test_run_id = ?,
                 git_status_evidence_id = ?,
                 git_diff_evidence_id = ?,
@@ -1036,7 +1210,10 @@ export class CoderSubmissionAdjudicationRecoveryScanner {
           `)
           .run(
             targetStatus,
-            nowIso,
+            completedAt,
+            recoveryFencedAt,
+            effectiveFailureCode,
+            effectiveFailureJson,
             testRun.id,
             gitStatusEvidenceId,
             gitDiffEvidenceId,
@@ -1055,24 +1232,33 @@ export class CoderSubmissionAdjudicationRecoveryScanner {
         if (adj.workspace_lease_id) {
           const l = this.repo.getWorkspaceLease(adj.workspace_lease_id);
           if (l && l.released_at === null) {
+            const nextLeaseState = isFenced ? 'FENCED' : 'RELEASED';
             const leaseUpdated = this.repo.updateWorkspaceLease(l.id, l.lifecycle_version, {
-              state: 'RELEASED',
-              released_at: nowIso,
+              state: nextLeaseState,
+              failure_code: isFenced ? (decision.failureCode || 'RECOVERY_FENCED') : null,
+              failure_evidence_hash: isFenced ? (artifactManifestHash ?? null) : null,
+              released_at: isFenced ? null : nowIso,
             });
             if (!leaseUpdated) {
-              throw new Error(`RECOVERY_CAS_FAILED: Workspace lease release CAS failed for lease ${l.id}`);
+              throw new Error(`RECOVERY_CAS_FAILED: Workspace lease update CAS failed for lease ${l.id}`);
             }
           }
         }
 
         const seq = this.repo.getNextAdjudicationEventSequence(adj.id);
-        const eventPayload = canonicalJsonStringify({
-          adjudication_id: adj.id,
-          test_run_id: testRun.id,
-          exit_code: testRun.exit_code,
-          settled_at: nowIso,
-          recovered: true,
-        });
+        const eventPayload = isSuccess
+          ? canonicalJsonStringify({
+              adjudication_id: adj.id,
+              test_run_id: testRun.id,
+              exit_code: testRun.exit_code,
+              settled_at: nowIso,
+              recovered: true,
+            })
+          : canonicalJsonStringify({
+              adjudication_id: adj.id,
+              error: effectiveFailureDetail,
+              failure_code: effectiveFailureCode,
+            });
         const payloadHash = computeSha256(eventPayload);
 
         const settlementEvent: CoderSubmissionAdjudicationEvent = {
@@ -1093,17 +1279,43 @@ export class CoderSubmissionAdjudicationRecoveryScanner {
 
         const existingDisps = this.repo.getCoderSubmissionDispositions(adj.submission_id);
         const hasTerminalDisp = existingDisps.some((d) => d.disposition_event === 'SETTLED' || d.disposition_event === 'REJECTED');
-        if (!hasTerminalDisp && isSuccess) {
-          this.repo.createCoderSubmissionDisposition({
-            id: deriveDeterministicDispositionId(adj.submission_id, adj.id, nextVersion),
-            submission_id: adj.submission_id,
-            disposition_event: decision.dispositionEvent,
-            disposition_reason: decision.dispositionReason,
-            actor_type: 'SYSTEM',
-            actor_id: 'RECOVERY_SCANNER',
-            disposition_metadata_json: null,
-            created_at: nowIso,
-          });
+        if (!hasTerminalDisp) {
+          if (isSuccess) {
+            this.repo.createCoderSubmissionDisposition({
+              id: deriveDeterministicDispositionId(adj.submission_id, adj.id, nextVersion),
+              submission_id: adj.submission_id,
+              disposition_event: 'SETTLED',
+              disposition_reason: 'ACCEPTED_VERIFIED',
+              actor_type: 'SYSTEM',
+              actor_id: 'RECOVERY_SCANNER',
+              disposition_metadata_json: canonicalJsonStringify({
+                adjudication_id: adj.id,
+                exit_code: testRun.exit_code,
+                test_run_id: testRun.id,
+              }),
+              created_at: nowIso,
+            });
+          } else {
+            const dispReason = decision.failureCode === 'INTEGRITY_MISMATCH' ? 'INTEGRITY_MISMATCH' : 'FENCED_PRECONDITION';
+            const metadataObj: Record<string, unknown> = {
+              adjudication_id: adj.id,
+              error: effectiveFailureDetail,
+              failure_code: effectiveFailureCode,
+            };
+            if (isFenced) {
+              metadataObj.is_fenced = true;
+            }
+            this.repo.createCoderSubmissionDisposition({
+              id: deriveDeterministicDispositionId(adj.submission_id, adj.id, nextVersion),
+              submission_id: adj.submission_id,
+              disposition_event: 'REJECTED',
+              disposition_reason: dispReason,
+              actor_type: 'SYSTEM',
+              actor_id: 'RECOVERY_SCANNER',
+              disposition_metadata_json: canonicalJsonStringify(metadataObj),
+              created_at: nowIso,
+            });
+          }
         }
 
         const liveTask = this.repo.getTask(adj.task_id);
