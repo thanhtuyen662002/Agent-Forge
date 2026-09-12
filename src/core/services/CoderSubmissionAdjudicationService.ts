@@ -30,6 +30,8 @@ import {
   ArtifactManifest,
   ArtifactManifestEntry,
   CoderSubmissionWorkspaceLease,
+  CANONICAL_WORKSPACE_SNAPSHOT_AFTER_KEYS,
+  CanonicalWorkspaceSnapshotAfterPayload,
 } from '../types/adjudication';
 import { Evidence, EvidenceType, GitStatusSummary, GitDiffSummary, TestRun } from '../types/domain';
 import {
@@ -219,6 +221,109 @@ export function deriveDeterministicDispositionId(
   hash[8] = (hash[8] & 0x3f) | 0x80;
   const hex = hash.toString('hex');
   return `${hex.substring(0, 8)}-${hex.substring(8, 12)}-${hex.substring(12, 16)}-${hex.substring(16, 20)}-${hex.substring(20, 32)}`;
+}
+
+export function deriveDeterministicWorkspaceAfterEvidenceId(
+  adjudicationId: string,
+  executionId: string
+): string {
+  const hash = crypto
+    .createHash('sha256')
+    .update(`agentforge:workspace-after-evidence:v1:${adjudicationId}:${executionId}`)
+    .digest();
+  hash[6] = (hash[6] & 0x0f) | 0x40;
+  hash[8] = (hash[8] & 0x3f) | 0x80;
+  const hex = hash.toString('hex');
+  return `${hex.substring(0, 8)}-${hex.substring(8, 12)}-${hex.substring(12, 16)}-${hex.substring(16, 20)}-${hex.substring(20, 32)}`;
+}
+
+export function buildCanonicalTerminalEventPayload(
+  eventType: 'VERIFICATION_SUCCEEDED' | 'VERIFICATION_FAILED' | 'RECOVERY_FENCED',
+  adjudicationId: string,
+  arg1: string,
+  arg2?: string | number | null
+): string {
+  if (eventType === 'VERIFICATION_SUCCEEDED') {
+    return canonicalJsonStringify({
+      adjudication_id: adjudicationId,
+      exit_code: typeof arg2 === 'number' ? arg2 : 0,
+      test_run_id: arg1,
+    });
+  }
+  const failureCode = arg1;
+  const error = typeof arg2 === 'string' ? scrubAdjudicationDiagnostics(arg2) : null;
+  return canonicalJsonStringify({
+    adjudication_id: adjudicationId,
+    error,
+    failure_code: failureCode,
+  });
+}
+
+export function buildCanonicalTerminalDisposition(
+  targetStatus: 'VERIFIED' | 'VERIFICATION_FAILED' | 'RECOVERY_FENCED',
+  adjudicationId: string,
+  submissionId: string,
+  nowIso: string,
+  opts?: {
+    testRunId?: string;
+    failureCode?: string | null;
+    error?: string | null;
+    isResultBearing?: boolean;
+  }
+): CoderSubmissionDisposition {
+  const dispId = deriveDeterministicDispositionId(submissionId, adjudicationId, 3);
+  if (targetStatus === 'VERIFIED') {
+    return {
+      id: dispId,
+      submission_id: submissionId,
+      disposition_event: 'SETTLED',
+      disposition_reason: 'ACCEPTED_VERIFIED',
+      actor_type: 'OPERATOR',
+      actor_id: 'OWNER_LOCAL_UI',
+      disposition_metadata_json: canonicalJsonStringify({
+        adjudication_id: adjudicationId,
+        test_run_id: opts?.testRunId ?? '',
+      }),
+      created_at: nowIso,
+    };
+  }
+
+  if (targetStatus === 'VERIFICATION_FAILED') {
+    const dispReason = opts?.failureCode === 'INTEGRITY_MISMATCH' ? 'INTEGRITY_MISMATCH' : 'FENCED_PRECONDITION';
+    return {
+      id: dispId,
+      submission_id: submissionId,
+      disposition_event: 'REJECTED',
+      disposition_reason: dispReason,
+      actor_type: 'SYSTEM',
+      actor_id: 'SYSTEM_VERIFICATION_EVALUATOR',
+      disposition_metadata_json: canonicalJsonStringify({
+        adjudication_id: adjudicationId,
+        error: opts?.error ? scrubAdjudicationDiagnostics(opts.error) : null,
+        failure_code: opts?.failureCode || 'TESTS_FAILED',
+      }),
+      created_at: nowIso,
+    };
+  }
+
+  // RECOVERY_FENCED
+  const isResultBearing = opts?.isResultBearing ?? false;
+  const dispReason = opts?.failureCode === 'INTEGRITY_MISMATCH' ? 'INTEGRITY_MISMATCH' : 'FENCED_PRECONDITION';
+  return {
+    id: dispId,
+    submission_id: submissionId,
+    disposition_event: 'REJECTED',
+    disposition_reason: dispReason,
+    actor_type: 'SYSTEM',
+    actor_id: isResultBearing ? 'SYSTEM_VERIFICATION_EVALUATOR' : 'RECOVERY_SCANNER',
+    disposition_metadata_json: canonicalJsonStringify({
+      adjudication_id: adjudicationId,
+      error: opts?.error ? scrubAdjudicationDiagnostics(opts.error) : null,
+      failure_code: opts?.failureCode || 'RECOVERY_FENCED',
+      is_fenced: true,
+    }),
+    created_at: nowIso,
+  };
 }
 
 export function isCanonicalUtcIso(value: unknown): boolean {
@@ -906,7 +1011,7 @@ export function evaluateCanonicalSettlementDecision(
     };
   }
 
-  // Bind workspace_snapshot_after_hash to durable captured evidence in repo via exact identifier
+  // Dedicated canonical FILE_SNAPSHOT workspace-after evidence validation
   if (!envelope.workspace_snapshot_after_evidence_id || typeof envelope.workspace_snapshot_after_evidence_id !== 'string') {
     return {
       valid: false,
@@ -938,14 +1043,45 @@ export function evaluateCanonicalSettlementDecision(
     };
   }
 
-  const VALID_WORKSPACE_SNAPSHOT_TYPES: ReadonlySet<EvidenceType> = new Set([
-    'CUSTOM',
-    'FILE_SNAPSHOT',
-    'GIT_STATUS',
-    'GIT_DIFF',
-  ]);
+  if (matchingAfterEvidence.evidence_type !== 'FILE_SNAPSHOT' && matchingAfterEvidence.evidence_type !== 'CUSTOM') {
+    return {
+      valid: false,
+      isSuccess: false,
+      targetStatus: 'RECOVERY_FENCED',
+      taskTransition: 'NEEDS_HUMAN',
+      eventType: 'RECOVERY_FENCED',
+      dispositionEvent: 'REJECTED',
+      dispositionReason: 'RECOVERY_FENCED',
+      failureCode: 'INTEGRITY_MISMATCH',
+      failureDetail: `Workspace snapshot after evidence must have type FILE_SNAPSHOT or CUSTOM, got ${matchingAfterEvidence.evidence_type}`,
+      contradictionReason: 'workspace_snapshot_after evidence type mismatch',
+    };
+  }
+
+  // Reject reuse of test result, git status, or git diff evidence as workspace-after evidence
   if (
-    !VALID_WORKSPACE_SNAPSHOT_TYPES.has(matchingAfterEvidence.evidence_type) ||
+    matchingAfterEvidence.id === envelope.test_result_evidence_id ||
+    (envelope.git_status_evidence_id && matchingAfterEvidence.id === envelope.git_status_evidence_id) ||
+    (envelope.git_diff_evidence_id && matchingAfterEvidence.id === envelope.git_diff_evidence_id) ||
+    matchingAfterEvidence.hash === envelope.test_result_evidence_hash ||
+    (envelope.git_status_evidence_hash && matchingAfterEvidence.hash === envelope.git_status_evidence_hash) ||
+    (envelope.git_diff_evidence_hash && matchingAfterEvidence.hash === envelope.git_diff_evidence_hash)
+  ) {
+    return {
+      valid: false,
+      isSuccess: false,
+      targetStatus: 'RECOVERY_FENCED',
+      taskTransition: 'NEEDS_HUMAN',
+      eventType: 'RECOVERY_FENCED',
+      dispositionEvent: 'REJECTED',
+      dispositionReason: 'RECOVERY_FENCED',
+      failureCode: 'INTEGRITY_MISMATCH',
+      failureDetail: 'Workspace snapshot after evidence cannot reuse test result, git status, or git diff evidence',
+      contradictionReason: 'workspace_snapshot_after evidence reuse detected',
+    };
+  }
+
+  if (
     matchingAfterEvidence.project_id !== input.adjudication.project_id ||
     matchingAfterEvidence.task_id !== input.adjudication.task_id ||
     (input.adjudication.attempt_id && matchingAfterEvidence.attempt_id !== input.adjudication.attempt_id)
@@ -959,16 +1095,26 @@ export function evaluateCanonicalSettlementDecision(
       dispositionEvent: 'REJECTED',
       dispositionReason: 'RECOVERY_FENCED',
       failureCode: 'INTEGRITY_MISMATCH',
-      failureDetail: 'Workspace snapshot after evidence authority bindings, type, or hash mismatch',
+      failureDetail: 'Workspace snapshot after evidence authority bindings mismatch adjudication record',
       contradictionReason: 'workspace_snapshot_after evidence authority mismatch',
     };
   }
 
-  const taskEvidenceList = input.repo.getEvidenceByTask(input.adjudication.task_id);
-  const duplicateHashRows = taskEvidenceList.filter(
-    (ev) => ev.hash === envelope.workspace_snapshot_after_hash && ev.id !== matchingAfterEvidence.id
-  );
-  if (duplicateHashRows.length > 0) {
+  // Retrieve and validate dedicated workspace snapshot after file content
+  let afterContent: string | null = null;
+  if (matchingAfterEvidence.raw_payload) {
+    afterContent = matchingAfterEvidence.raw_payload;
+  } else if (matchingAfterEvidence.file_path && fs.existsSync(matchingAfterEvidence.file_path)) {
+    afterContent = fs.readFileSync(matchingAfterEvidence.file_path, 'utf8');
+  } else if (input.artifactStore) {
+    try {
+      afterContent = input.artifactStore.read(matchingAfterEvidence);
+    } catch {
+      afterContent = null;
+    }
+  }
+
+  if (!afterContent) {
     return {
       valid: false,
       isSuccess: false,
@@ -978,9 +1124,112 @@ export function evaluateCanonicalSettlementDecision(
       dispositionEvent: 'REJECTED',
       dispositionReason: 'RECOVERY_FENCED',
       failureCode: 'INTEGRITY_MISMATCH',
-      failureDetail: 'Duplicate workspace snapshot after evidence hash rows detected',
-      contradictionReason: 'workspace_snapshot_after duplicate hash rows',
+      failureDetail: 'Workspace snapshot after evidence file content could not be retrieved',
+      contradictionReason: 'workspace_snapshot_after content missing',
     };
+  }
+
+  if (computeSha256(afterContent) !== matchingAfterEvidence.hash) {
+    return {
+      valid: false,
+      isSuccess: false,
+      targetStatus: 'RECOVERY_FENCED',
+      taskTransition: 'NEEDS_HUMAN',
+      eventType: 'RECOVERY_FENCED',
+      dispositionEvent: 'REJECTED',
+      dispositionReason: 'RECOVERY_FENCED',
+      failureCode: 'INTEGRITY_MISMATCH',
+      failureDetail: 'Workspace snapshot after evidence file content hash mismatch',
+      contradictionReason: 'workspace_snapshot_after hash mismatch',
+    };
+  }
+
+  if (matchingAfterEvidence.evidence_type === 'FILE_SNAPSHOT') {
+    let afterObj: Record<string, unknown>;
+    try {
+      const p = JSON.parse(afterContent);
+      if (typeof p !== 'object' || p === null || Array.isArray(p)) {
+        throw new Error('Not a plain object');
+      }
+      afterObj = p as Record<string, unknown>;
+    } catch (parseErr: unknown) {
+      return {
+        valid: false,
+        isSuccess: false,
+        targetStatus: 'RECOVERY_FENCED',
+        taskTransition: 'NEEDS_HUMAN',
+        eventType: 'RECOVERY_FENCED',
+        dispositionEvent: 'REJECTED',
+        dispositionReason: 'RECOVERY_FENCED',
+        failureCode: 'INTEGRITY_MISMATCH',
+        failureDetail: 'Workspace snapshot after evidence file is malformed JSON',
+        contradictionReason: 'workspace_snapshot_after malformed JSON',
+      };
+    }
+
+    const afterKeys = Object.keys(afterObj).sort();
+    const expectedAfterKeys = [...CANONICAL_WORKSPACE_SNAPSHOT_AFTER_KEYS].sort();
+    if (
+      afterKeys.length !== expectedAfterKeys.length ||
+      afterKeys.some((k, i) => k !== expectedAfterKeys[i])
+    ) {
+      return {
+        valid: false,
+        isSuccess: false,
+        targetStatus: 'RECOVERY_FENCED',
+        taskTransition: 'NEEDS_HUMAN',
+        eventType: 'RECOVERY_FENCED',
+        dispositionEvent: 'REJECTED',
+        dispositionReason: 'RECOVERY_FENCED',
+        failureCode: 'INTEGRITY_MISMATCH',
+        failureDetail: 'Workspace snapshot after evidence property set mismatch (missing or extra keys)',
+        contradictionReason: 'workspace_snapshot_after key mismatch',
+      };
+    }
+
+    if (canonicalJsonStringify(afterObj) !== afterContent) {
+      return {
+        valid: false,
+        isSuccess: false,
+        targetStatus: 'RECOVERY_FENCED',
+        taskTransition: 'NEEDS_HUMAN',
+        eventType: 'RECOVERY_FENCED',
+        dispositionEvent: 'REJECTED',
+        dispositionReason: 'RECOVERY_FENCED',
+        failureCode: 'INTEGRITY_MISMATCH',
+        failureDetail: 'Workspace snapshot after evidence is not byte-identical to its canonical JSON representation',
+        contradictionReason: 'workspace_snapshot_after non-canonical JSON',
+      };
+    }
+
+    if (
+      afterObj.adjudication_id !== input.adjudication.id ||
+      afterObj.project_id !== input.adjudication.project_id ||
+      afterObj.task_id !== input.adjudication.task_id ||
+      afterObj.attempt_id !== input.adjudication.attempt_id ||
+      afterObj.assignment_id !== input.adjudication.assignment_id ||
+      afterObj.authorization_id !== input.adjudication.authorization_id ||
+      afterObj.task_ownership_epoch !== input.adjudication.task_ownership_epoch ||
+      afterObj.verification_execution_id !== envelope.verification_execution_id ||
+      afterObj.git_status_evidence_hash !== envelope.git_status_evidence_hash ||
+      afterObj.git_diff_evidence_hash !== envelope.git_diff_evidence_hash ||
+      afterObj.schema_version !== 1 ||
+      typeof afterObj.captured_at !== 'string' ||
+      !isCanonicalUtcIso(afterObj.captured_at)
+    ) {
+      return {
+        valid: false,
+        isSuccess: false,
+        targetStatus: 'RECOVERY_FENCED',
+        taskTransition: 'NEEDS_HUMAN',
+        eventType: 'RECOVERY_FENCED',
+        dispositionEvent: 'REJECTED',
+        dispositionReason: 'RECOVERY_FENCED',
+        failureCode: 'INTEGRITY_MISMATCH',
+        failureDetail: 'Workspace snapshot after evidence canonical envelope bindings mismatch adjudication record or envelope',
+        contradictionReason: 'workspace_snapshot_after bindings mismatch',
+      };
+    }
   }
 
   // 1-to-1 set equality between manifest entries and all envelope evidence bindings
@@ -3727,7 +3976,46 @@ export class CoderSubmissionAdjudicationService {
       created_at: phaseCNowIso,
     };
 
-    // 4. Artifact Manifest
+    // 4. Dedicated Workspace-After FILE_SNAPSHOT Evidence
+    const workspaceAfterEvId = deriveDeterministicWorkspaceAfterEvidenceId(adjudicationId, executionId);
+    const workspaceAfterPayload: CanonicalWorkspaceSnapshotAfterPayload = {
+      adjudication_id: adjudicationId,
+      assignment_id: snapshot.assignment_id,
+      attempt_id: snapshot.attempt_id,
+      authorization_id: sub.authorization_id,
+      captured_at: phaseCNowIso,
+      captured_repository_head_sha: postObservation ? postObservation.head_sha : (freshPhaseBObservation ? freshPhaseBObservation.head_sha : ''),
+      git_diff_evidence_hash: stagedGitDiffEvidence?.hash ?? '',
+      git_status_evidence_hash: stagedGitStatusEvidence?.hash ?? '',
+      project_id: sub.project_id,
+      schema_version: 1,
+      task_id: sub.task_id,
+      task_ownership_epoch: sub.task_ownership_epoch,
+      verification_execution_id: executionId,
+    };
+    const workspaceAfterJson = canonicalJsonStringify(workspaceAfterPayload);
+    const workspaceAfterHash = computeSha256(workspaceAfterJson);
+    const workspaceAfterByteSize = Buffer.byteLength(workspaceAfterJson, 'utf8');
+    const matWorkspaceAfter = this.artifactStore.materializeContentAddressedFile(workspaceAfterJson, workspaceAfterHash);
+    if (matWorkspaceAfter.newlyCreated) newlyMaterializedPaths.push(matWorkspaceAfter.filePath);
+
+    const workspaceAfterEvidence: Evidence = {
+      id: workspaceAfterEvId,
+      project_id: sub.project_id,
+      task_id: sub.task_id,
+      attempt_id: snapshot.attempt_id,
+      evidence_type: 'FILE_SNAPSHOT',
+      summary: `Canonical Post-Execution Workspace Snapshot for adjudication ${adjudicationId}`,
+      content_type: 'application/json',
+      hash: workspaceAfterHash,
+      byte_size: workspaceAfterByteSize,
+      storage_type: 'FILE',
+      file_path: matWorkspaceAfter.filePath,
+      raw_payload: null,
+      created_at: phaseCNowIso,
+    };
+
+    // 5. Artifact Manifest
     const manifestEntries: ArtifactManifestEntry[] = [
       {
         byte_size: testResultByteSize,
@@ -3736,6 +4024,15 @@ export class CoderSubmissionAdjudicationService {
         evidence_type: 'TEST_RESULT',
         relative_path: path.relative(this.artifactStore.getBaseDir(), matTest.filePath).replace(/\\/g, '/'),
         sha256: testResultHash,
+        storage_class: 'FILE',
+      },
+      {
+        byte_size: workspaceAfterByteSize,
+        content_type: 'application/json',
+        evidence_id: workspaceAfterEvId,
+        evidence_type: 'FILE_SNAPSHOT',
+        relative_path: path.relative(this.artifactStore.getBaseDir(), matWorkspaceAfter.filePath).replace(/\\/g, '/'),
+        sha256: workspaceAfterHash,
         storage_class: 'FILE',
       },
     ];
@@ -3852,9 +4149,6 @@ export class CoderSubmissionAdjudicationService {
         ? 'NOT_APPLICABLE'
         : 'TERMINATION_AMBIGUOUS';
 
-    const afterEvidenceId = stagedGitStatusEvidence?.id ?? stagedGitDiffEvidence?.id ?? testResultEvId;
-    const afterEvidenceHash = stagedGitStatusEvidence?.hash ?? stagedGitDiffEvidence?.hash ?? testResultHash;
-
     const resultEnvelope: CanonicalVerificationResultEnvelope = {
       adjudication_id: adjudicationId,
       artifact_manifest_hash: artifactManifestHash,
@@ -3895,8 +4189,8 @@ export class CoderSubmissionAdjudicationService {
       test_result_evidence_id: testResultEvId,
       test_run_id: testRunId,
       verification_execution_id: executionId,
-      workspace_snapshot_after_evidence_id: afterEvidenceId,
-      workspace_snapshot_after_hash: afterEvidenceHash,
+      workspace_snapshot_after_evidence_id: workspaceAfterEvId,
+      workspace_snapshot_after_hash: workspaceAfterHash,
       workspace_snapshot_before_hash: workspaceSnapshotHash,
     };
     const resultEnvelopeJson = canonicalJsonStringify(resultEnvelope);
@@ -3974,6 +4268,10 @@ export class CoderSubmissionAdjudicationService {
             throw new Error(`Git diff evidence file integrity check failed: ${dc.reason}`);
           }
         }
+        const wc = verifyEvidenceIntegrity(workspaceAfterEvidence, this.artifactStore);
+        if (!wc.valid) {
+          throw new Error(`Workspace after evidence file integrity check failed: ${wc.reason}`);
+        }
 
         // Insert evidence rows
         this.repo.createEvidence(testResultEvidence);
@@ -3983,6 +4281,7 @@ export class CoderSubmissionAdjudicationService {
         if (stagedGitDiffEvidence) {
           this.repo.createEvidence(stagedGitDiffEvidence);
         }
+        this.repo.createEvidence(workspaceAfterEvidence);
 
         // Insert test run
         this.repo.createTestRun(testRun);
@@ -4007,16 +4306,13 @@ export class CoderSubmissionAdjudicationService {
         const effectiveFailureDetail = decision.failureDetail ? scrubAdjudicationDiagnostics(decision.failureDetail) : null;
         const eventType = decision.eventType;
         const eventPayload = isSuccess
-          ? canonicalJsonStringify({
-              adjudication_id: adjudicationId,
-              exit_code: 0,
-              test_run_id: testRunId,
-            })
-          : canonicalJsonStringify({
-              adjudication_id: adjudicationId,
-              error: effectiveFailureDetail,
-              failure_code: failureCode || 'TESTS_FAILED',
-            });
+          ? buildCanonicalTerminalEventPayload('VERIFICATION_SUCCEEDED', adjudicationId, testRunId, 0)
+          : buildCanonicalTerminalEventPayload(
+              targetStatus === 'RECOVERY_FENCED' ? 'RECOVERY_FENCED' : 'VERIFICATION_FAILED',
+              adjudicationId,
+              failureCode || (targetStatus === 'RECOVERY_FENCED' ? 'ORPHANED_VERIFICATION_INTERRUPTED' : 'TESTS_FAILED'),
+              effectiveFailureDetail
+            );
 
         const eventPayloadHash = computeSha256(eventPayload);
         const finalEventId = deriveDeterministicAdjudicationEventId(
@@ -4050,20 +4346,7 @@ export class CoderSubmissionAdjudicationService {
           );
 
           // Append terminal disposition: SETTLED / ACCEPTED_VERIFIED
-          const disposition: CoderSubmissionDisposition = {
-            id: dispositionId,
-            submission_id: sub.id,
-            disposition_event: 'SETTLED',
-            disposition_reason: 'ACCEPTED_VERIFIED',
-            actor_type: 'OPERATOR',
-            actor_id: 'OWNER_LOCAL_UI',
-            disposition_metadata_json: canonicalJsonStringify({
-              adjudication_id: adjudicationId,
-              exit_code: 0,
-              test_run_id: testRunId,
-            }),
-            created_at: phaseCNowIso,
-          };
+          const disposition = buildCanonicalTerminalDisposition('VERIFIED', adjudicationId, sub.id, phaseCNowIso, { testRunId });
           this.repo.createCoderSubmissionDisposition(disposition);
 
           // Update adjudication: VERIFIED (CAS version 2 -> 3)
@@ -4150,21 +4433,11 @@ export class CoderSubmissionAdjudicationService {
             throw new CoderSubmissionAdjudicationError('STATUS_CONFLICT', 'Workspace lease release CAS failed');
           }
 
-          const dispReason = failureCode === 'INTEGRITY_MISMATCH' ? 'INTEGRITY_MISMATCH' : 'FENCED_PRECONDITION';
-          this.repo.createCoderSubmissionDisposition({
-            id: dispositionId,
-            submission_id: sub.id,
-            disposition_event: 'REJECTED',
-            disposition_reason: dispReason,
-            actor_type: 'SYSTEM',
-            actor_id: 'SYSTEM_VERIFICATION_EVALUATOR',
-            disposition_metadata_json: canonicalJsonStringify({
-              adjudication_id: adjudicationId,
-              error: scrubbedFailureDetail,
-              failure_code: failureCode || 'TESTS_FAILED',
-            }),
-            created_at: phaseCNowIso,
+          const disposition = buildCanonicalTerminalDisposition('VERIFICATION_FAILED', adjudicationId, sub.id, phaseCNowIso, {
+            failureCode,
+            error: scrubbedFailureDetail,
           });
+          this.repo.createCoderSubmissionDisposition(disposition);
 
           this.repo.createCoderSubmissionAdjudicationEvent({
             id: finalEventId,
@@ -4222,22 +4495,12 @@ export class CoderSubmissionAdjudicationService {
             throw new CoderSubmissionAdjudicationError('STATUS_CONFLICT', 'Workspace lease fencing CAS failed');
           }
 
-          const dispReason = failureCode === 'INTEGRITY_MISMATCH' ? 'INTEGRITY_MISMATCH' : 'FENCED_PRECONDITION';
-          this.repo.createCoderSubmissionDisposition({
-            id: dispositionId,
-            submission_id: sub.id,
-            disposition_event: 'REJECTED',
-            disposition_reason: dispReason,
-            actor_type: 'SYSTEM',
-            actor_id: 'SYSTEM_VERIFICATION_EVALUATOR',
-            disposition_metadata_json: canonicalJsonStringify({
-              adjudication_id: adjudicationId,
-              error: scrubbedFailureDetail,
-              failure_code: failureCode || 'ORPHANED_VERIFICATION_INTERRUPTED',
-              is_fenced: true,
-            }),
-            created_at: phaseCNowIso,
+          const disposition = buildCanonicalTerminalDisposition('RECOVERY_FENCED', adjudicationId, sub.id, phaseCNowIso, {
+            failureCode: failureCode || 'ORPHANED_VERIFICATION_INTERRUPTED',
+            error: scrubbedFailureDetail,
+            isResultBearing: true,
           });
+          this.repo.createCoderSubmissionDisposition(disposition);
 
           this.repo.createCoderSubmissionAdjudicationEvent({
             id: finalEventId,

@@ -183,7 +183,7 @@ export interface StagedEvidenceFile {
   project_id: string;
   task_id: string;
   attempt_id: string | null;
-  evidence_type: 'TEST_RESULT' | 'GIT_STATUS' | 'GIT_DIFF';
+  evidence_type: 'TEST_RESULT' | 'GIT_STATUS' | 'GIT_DIFF' | 'FILE_SNAPSHOT';
   summary: string;
   content_type: string;
   hash: string;
@@ -192,6 +192,40 @@ export interface StagedEvidenceFile {
   staged_file_path: string | null;
   final_file_path: string | null;
   raw_payload: string | null;
+}
+
+export const CANONICAL_WORKSPACE_SNAPSHOT_AFTER_KEYS = [
+  'adjudication_id',
+  'assignment_id',
+  'attempt_id',
+  'authorization_id',
+  'captured_at',
+  'captured_repository_head_sha',
+  'git_diff_evidence_hash',
+  'git_status_evidence_hash',
+  'project_id',
+  'schema_version',
+  'task_id',
+  'task_ownership_epoch',
+  'verification_execution_id',
+] as const;
+
+export type CanonicalWorkspaceSnapshotAfterKey = (typeof CANONICAL_WORKSPACE_SNAPSHOT_AFTER_KEYS)[number];
+
+export interface CanonicalWorkspaceSnapshotAfterPayload {
+  adjudication_id: string;
+  assignment_id: string;
+  attempt_id: string | null;
+  authorization_id: string;
+  captured_at: string;
+  captured_repository_head_sha: string;
+  git_diff_evidence_hash: string;
+  git_status_evidence_hash: string;
+  project_id: string;
+  schema_version: 1;
+  task_id: string;
+  task_ownership_epoch: number;
+  verification_execution_id: string;
 }
 
 export interface StagingManifest {

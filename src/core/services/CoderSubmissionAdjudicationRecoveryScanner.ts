@@ -22,11 +22,15 @@ import {
   deriveDeterministicAdjudicationEventId,
   deriveDeterministicGenericAdjudicationEventId,
   deriveDeterministicDispositionId,
+  deriveDeterministicWorkspaceAfterEvidenceId,
+  buildCanonicalTerminalEventPayload,
+  buildCanonicalTerminalDisposition,
   evaluateCanonicalSettlementDecision,
   validateAndParseCanonicalResultEnvelope,
   CanonicalSettlementDecision,
   isCanonicalUtcIso,
   scrubAdjudicationDiagnostics,
+  extractFailureDetailFromPayload,
   SUPPORTED_FAILURE_CODES,
 } from './CoderSubmissionAdjudicationService';
 import { verifyEvidenceIntegrity, parseAndVerifyArtifactManifest } from './ArtifactStore';
@@ -146,7 +150,13 @@ export class CoderSubmissionAdjudicationRecoveryScanner {
         adj.verification_commands_hash === computeSha256(adj.verification_commands_json));
 
     if (!isAuthorityIntact) {
-      if (adj.status !== 'RECOVERY_FENCED' && adj.status !== 'REJECTED' && adj.status !== 'SUPERSEDED') {
+      if (
+        adj.status !== 'RECOVERY_FENCED' &&
+        adj.status !== 'REJECTED' &&
+        adj.status !== 'SUPERSEDED' &&
+        adj.status !== 'VERIFIED' &&
+        adj.status !== 'VERIFICATION_FAILED'
+      ) {
         this.fenceAdjudication(
           adj,
           'INTEGRITY_MISMATCH',
@@ -297,16 +307,13 @@ export class CoderSubmissionAdjudicationRecoveryScanner {
                     contradiction = `Terminal event sequence must be exactly 3, got ${evt.sequence}`;
                   } else {
                     const expectedPayload = dec.isSuccess
-                      ? canonicalJsonStringify({
-                          adjudication_id: adj.id,
-                          exit_code: 0,
-                          test_run_id: adj.test_run_id,
-                        })
-                      : canonicalJsonStringify({
-                          adjudication_id: adj.id,
-                          error: dec.failureDetail ? scrubAdjudicationDiagnostics(dec.failureDetail) : null,
-                          failure_code: dec.failureCode || (dec.targetStatus === 'RECOVERY_FENCED' ? 'RECOVERY_FENCED' : 'TESTS_FAILED'),
-                        });
+                      ? buildCanonicalTerminalEventPayload('VERIFICATION_SUCCEEDED', adj.id, adj.test_run_id!, 0)
+                      : buildCanonicalTerminalEventPayload(
+                          dec.eventType as any,
+                          adj.id,
+                          dec.failureCode || (dec.targetStatus === 'RECOVERY_FENCED' ? 'RECOVERY_FENCED' : 'TESTS_FAILED'),
+                          dec.failureDetail
+                        );
                     const expectedPayloadHash = computeSha256(expectedPayload);
                     const expectedEvtId = deriveDeterministicAdjudicationEventId(
                       adj.id,
@@ -314,7 +321,11 @@ export class CoderSubmissionAdjudicationRecoveryScanner {
                       dec.eventType,
                       expectedPayloadHash
                     );
-                    if (evt.payload_hash !== expectedPayloadHash) {
+                    if (!isCanonicalUtcIso(evt.created_at)) {
+                      contradiction = 'Terminal event created_at must be canonical UTC ISO string';
+                    } else if (Date.parse(evt.created_at) < Date.parse(adj.created_at)) {
+                      contradiction = 'Terminal event created_at precedes adjudication created_at';
+                    } else if (evt.payload_hash !== expectedPayloadHash) {
                       contradiction = `Deterministic event payload hash mismatch: expected ${expectedPayloadHash}, got ${evt.payload_hash}`;
                     } else if (evt.id !== expectedEvtId) {
                       contradiction = `Deterministic event ID mismatch: expected ${expectedEvtId}, got ${evt.id}`;
@@ -342,36 +353,42 @@ export class CoderSubmissionAdjudicationRecoveryScanner {
                     contradiction = `Expected exactly one terminal disposition for ${dec.targetStatus} submission, found ${terminalDisps.length}`;
                   } else {
                     const disp = terminalDisps[0];
-                    const expectedDispId = deriveDeterministicDispositionId(adj.submission_id, adj.id, 3);
-                    if (disp.id !== expectedDispId) {
-                      contradiction = `Deterministic disposition ID mismatch: expected ${expectedDispId}, got ${disp.id}`;
-                    } else if (disp.actor_type !== 'SYSTEM' && disp.actor_type !== 'OPERATOR') {
-                      contradiction = `Terminal disposition actor_type must be SYSTEM or OPERATOR, got ${disp.actor_type}`;
-                    } else if (dec.targetStatus === 'VERIFIED') {
-                      if (disp.disposition_event !== 'SETTLED' || disp.disposition_reason !== 'ACCEPTED_VERIFIED') {
-                        contradiction = `Terminal disposition for VERIFIED must be SETTLED / ACCEPTED_VERIFIED, got ${disp.disposition_event} / ${disp.disposition_reason}`;
-                      }
+                    if (!isCanonicalUtcIso(disp.created_at)) {
+                      contradiction = 'Terminal disposition created_at must be canonical UTC ISO string';
+                    } else if (Date.parse(disp.created_at) < Date.parse(adj.created_at)) {
+                      contradiction = 'Terminal disposition created_at precedes adjudication created_at';
                     } else {
-                      if (
-                        disp.disposition_event !== 'REJECTED' ||
-                        (disp.disposition_reason !== 'FENCED_PRECONDITION' && disp.disposition_reason !== 'INTEGRITY_MISMATCH')
-                      ) {
-                        contradiction = `Terminal disposition for ${dec.targetStatus} must be REJECTED with FENCED_PRECONDITION or INTEGRITY_MISMATCH, got ${disp.disposition_event} / ${disp.disposition_reason}`;
-                      } else if (!disp.disposition_metadata_json) {
-                        contradiction = `Terminal disposition for ${dec.targetStatus} missing metadata`;
+                      const expectedDispId = deriveDeterministicDispositionId(adj.submission_id, adj.id, 3);
+                      if (disp.id !== expectedDispId) {
+                        contradiction = `Deterministic disposition ID mismatch: expected ${expectedDispId}, got ${disp.id}`;
+                      } else if (disp.actor_type !== 'SYSTEM' && disp.actor_type !== 'OPERATOR') {
+                        contradiction = `Terminal disposition actor_type must be SYSTEM or OPERATOR, got ${disp.actor_type}`;
+                      } else if (dec.targetStatus === 'VERIFIED') {
+                        if (disp.disposition_event !== 'SETTLED' || disp.disposition_reason !== 'ACCEPTED_VERIFIED') {
+                          contradiction = `Terminal disposition for VERIFIED must be SETTLED / ACCEPTED_VERIFIED, got ${disp.disposition_event} / ${disp.disposition_reason}`;
+                        }
                       } else {
-                        try {
-                          const meta = JSON.parse(disp.disposition_metadata_json);
-                          if (
-                            typeof meta !== 'object' ||
-                            meta === null ||
-                            meta.adjudication_id !== adj.id ||
-                            typeof meta.failure_code !== 'string'
-                          ) {
-                            contradiction = `Terminal disposition metadata invalid for ${dec.targetStatus}`;
+                        if (
+                          disp.disposition_event !== 'REJECTED' ||
+                          (disp.disposition_reason !== 'FENCED_PRECONDITION' && disp.disposition_reason !== 'INTEGRITY_MISMATCH')
+                        ) {
+                          contradiction = `Terminal disposition for ${dec.targetStatus} must be REJECTED with FENCED_PRECONDITION or INTEGRITY_MISMATCH, got ${disp.disposition_event} / ${disp.disposition_reason}`;
+                        } else if (!disp.disposition_metadata_json) {
+                          contradiction = `Terminal disposition for ${dec.targetStatus} missing metadata`;
+                        } else {
+                          try {
+                            const meta = JSON.parse(disp.disposition_metadata_json);
+                            if (
+                              typeof meta !== 'object' ||
+                              meta === null ||
+                              meta.adjudication_id !== adj.id ||
+                              typeof meta.failure_code !== 'string'
+                            ) {
+                              contradiction = `Terminal disposition metadata invalid for ${dec.targetStatus}`;
+                            }
+                          } catch (metaErr: unknown) {
+                            contradiction = `Terminal disposition metadata is malformed JSON`;
                           }
-                        } catch (metaErr: unknown) {
-                          contradiction = `Terminal disposition metadata is malformed JSON`;
                         }
                       }
                     }
@@ -447,35 +464,13 @@ export class CoderSubmissionAdjudicationRecoveryScanner {
               }
 
               if (!contradiction) {
-                let expectedPayload: string;
-                if (failureObj.reason) {
-                  const recAt = failureObj.recovered_at ?? adj.recovery_fenced_at;
-                  const primaryPayload = canonicalJsonStringify({
-                    adjudication_id: adj.id,
-                    failure_code: adj.failure_code,
-                    reason: failureObj.reason,
-                    ...(recAt ? { recovered_at: recAt } : {}),
-                  });
-                  const altPayload = canonicalJsonStringify({
-                    adjudication_id: adj.id,
-                    error: scrubAdjudicationDiagnostics(String(failureObj.reason)),
-                    failure_code: adj.failure_code,
-                  });
-                  expectedPayload = evt.payload_json === altPayload ? altPayload : primaryPayload;
-                } else if (failureObj.error) {
-                  expectedPayload = canonicalJsonStringify({
-                    adjudication_id: adj.id,
-                    error: scrubAdjudicationDiagnostics(String(failureObj.error)),
-                    failure_code: adj.failure_code,
-                  });
-                } else {
-                  expectedPayload = canonicalJsonStringify({
-                    adjudication_id: adj.id,
-                    error: null,
-                    failure_code: adj.failure_code,
-                  });
-                }
-
+                const failError = extractFailureDetailFromPayload(failureObj, '');
+                const expectedPayload = buildCanonicalTerminalEventPayload(
+                  'RECOVERY_FENCED',
+                  adj.id,
+                  adj.failure_code || 'RECOVERY_FENCED',
+                  failError || null
+                );
                 const expectedPayloadHash = computeSha256(expectedPayload);
                 const expectedEventId = deriveDeterministicAdjudicationEventId(
                   adj.id,
@@ -490,6 +485,12 @@ export class CoderSubmissionAdjudicationRecoveryScanner {
                   contradiction = `Deterministic event ID mismatch: expected ${expectedEventId}, got ${evt.id}`;
                 } else if (evt.payload_json !== expectedPayload) {
                   contradiction = `Deterministic event payload mismatch`;
+                } else if (
+                  typeof evt.created_at !== 'string' ||
+                  !isCanonicalUtcIso(evt.created_at) ||
+                  (adj.recovery_fenced_at && evt.created_at < adj.recovery_fenced_at)
+                ) {
+                  contradiction = `Pre-result RECOVERY_FENCED event timestamp non-canonical or non-monotonic`;
                 }
               }
             }
@@ -506,6 +507,14 @@ export class CoderSubmissionAdjudicationRecoveryScanner {
             contradiction = `Expected exactly one terminal disposition for pre-result RECOVERY_FENCED, found ${terminalDisps.length}`;
           } else {
             const disp = terminalDisps[0];
+            let failureObj: Record<string, unknown> = {};
+            if (adj.failure_json) {
+              try {
+                failureObj = JSON.parse(adj.failure_json);
+              } catch (jsonErr: unknown) {
+                void jsonErr;
+              }
+            }
             const expectedDispId = deriveDeterministicDispositionId(adj.submission_id, adj.id, 3);
             if (disp.id !== expectedDispId) {
               contradiction = `Deterministic disposition ID mismatch: expected ${expectedDispId}, got ${disp.id}`;
@@ -532,6 +541,13 @@ export class CoderSubmissionAdjudicationRecoveryScanner {
               } catch (metaErr: unknown) {
                 contradiction = `Terminal disposition metadata is malformed JSON`;
               }
+            }
+            if (!contradiction && (
+              typeof disp.created_at !== 'string' ||
+              !isCanonicalUtcIso(disp.created_at) ||
+              (adj.recovery_fenced_at && disp.created_at < adj.recovery_fenced_at)
+            )) {
+              contradiction = `Pre-result RECOVERY_FENCED disposition timestamp non-canonical or non-monotonic`;
             }
           }
         }
@@ -1024,12 +1040,12 @@ export class CoderSubmissionAdjudicationRecoveryScanner {
       }
 
       const seq = this.repo.getNextAdjudicationEventSequence(adj.id);
-      const eventPayload = canonicalJsonStringify({
-        adjudication_id: adj.id,
-        failure_code: failureCode,
-        reason: effectiveReason,
-        recovered_at: effectiveNow,
-      });
+      const eventPayload = buildCanonicalTerminalEventPayload(
+        'RECOVERY_FENCED',
+        adj.id,
+        failureCode,
+        effectiveReason
+      );
       const payloadHash = computeSha256(eventPayload);
 
       const fenceEvent: CoderSubmissionAdjudicationEvent = {
@@ -1105,22 +1121,18 @@ export class CoderSubmissionAdjudicationRecoveryScanner {
         (d) => d.disposition_event === 'SETTLED' || d.disposition_event === 'REJECTED'
       );
       if (!hasTerminalDisp) {
-        const dispReason = failureCode === 'INTEGRITY_MISMATCH' ? 'INTEGRITY_MISMATCH' : 'FENCED_PRECONDITION';
-        this.repo.createCoderSubmissionDisposition({
-          id: deriveDeterministicDispositionId(adj.submission_id, adj.id, nextVersion),
-          submission_id: adj.submission_id,
-          disposition_event: 'REJECTED',
-          disposition_reason: dispReason,
-          actor_type: 'SYSTEM',
-          actor_id: 'RECOVERY_SCANNER',
-          disposition_metadata_json: canonicalJsonStringify({
-            adjudication_id: adj.id,
-            error: scrubAdjudicationDiagnostics(effectiveReason),
-            failure_code: failureCode,
-            is_fenced: true,
-          }),
-          created_at: effectiveNow,
-        });
+        const fenceDisp = buildCanonicalTerminalDisposition(
+          'RECOVERY_FENCED',
+          adj.id,
+          adj.submission_id,
+          effectiveNow,
+          {
+            failureCode,
+            error: effectiveReason,
+            isResultBearing: false,
+          }
+        );
+        this.repo.createCoderSubmissionDisposition(fenceDisp);
       }
     });
 
@@ -1247,18 +1259,8 @@ export class CoderSubmissionAdjudicationRecoveryScanner {
 
         const seq = this.repo.getNextAdjudicationEventSequence(adj.id);
         const eventPayload = isSuccess
-          ? canonicalJsonStringify({
-              adjudication_id: adj.id,
-              test_run_id: testRun.id,
-              exit_code: testRun.exit_code,
-              settled_at: nowIso,
-              recovered: true,
-            })
-          : canonicalJsonStringify({
-              adjudication_id: adj.id,
-              error: effectiveFailureDetail,
-              failure_code: effectiveFailureCode,
-            });
+          ? buildCanonicalTerminalEventPayload('VERIFICATION_SUCCEEDED', adj.id, testRun.id, testRun.exit_code)
+          : buildCanonicalTerminalEventPayload('VERIFICATION_FAILED', adj.id, effectiveFailureCode || 'TESTS_FAILED', effectiveFailureDetail);
         const payloadHash = computeSha256(eventPayload);
 
         const settlementEvent: CoderSubmissionAdjudicationEvent = {
@@ -1280,42 +1282,19 @@ export class CoderSubmissionAdjudicationRecoveryScanner {
         const existingDisps = this.repo.getCoderSubmissionDispositions(adj.submission_id);
         const hasTerminalDisp = existingDisps.some((d) => d.disposition_event === 'SETTLED' || d.disposition_event === 'REJECTED');
         if (!hasTerminalDisp) {
-          if (isSuccess) {
-            this.repo.createCoderSubmissionDisposition({
-              id: deriveDeterministicDispositionId(adj.submission_id, adj.id, nextVersion),
-              submission_id: adj.submission_id,
-              disposition_event: 'SETTLED',
-              disposition_reason: 'ACCEPTED_VERIFIED',
-              actor_type: 'SYSTEM',
-              actor_id: 'RECOVERY_SCANNER',
-              disposition_metadata_json: canonicalJsonStringify({
-                adjudication_id: adj.id,
-                exit_code: testRun.exit_code,
-                test_run_id: testRun.id,
-              }),
-              created_at: nowIso,
-            });
-          } else {
-            const dispReason = decision.failureCode === 'INTEGRITY_MISMATCH' ? 'INTEGRITY_MISMATCH' : 'FENCED_PRECONDITION';
-            const metadataObj: Record<string, unknown> = {
-              adjudication_id: adj.id,
+          const terminalDisp = buildCanonicalTerminalDisposition(
+            targetStatus as 'VERIFIED' | 'VERIFICATION_FAILED' | 'RECOVERY_FENCED',
+            adj.id,
+            adj.submission_id,
+            nowIso,
+            {
+              testRunId: testRun.id,
+              failureCode: effectiveFailureCode,
               error: effectiveFailureDetail,
-              failure_code: effectiveFailureCode,
-            };
-            if (isFenced) {
-              metadataObj.is_fenced = true;
+              isResultBearing: true,
             }
-            this.repo.createCoderSubmissionDisposition({
-              id: deriveDeterministicDispositionId(adj.submission_id, adj.id, nextVersion),
-              submission_id: adj.submission_id,
-              disposition_event: 'REJECTED',
-              disposition_reason: dispReason,
-              actor_type: 'SYSTEM',
-              actor_id: 'RECOVERY_SCANNER',
-              disposition_metadata_json: canonicalJsonStringify(metadataObj),
-              created_at: nowIso,
-            });
-          }
+          );
+          this.repo.createCoderSubmissionDisposition(terminalDisp);
         }
 
         const liveTask = this.repo.getTask(adj.task_id);

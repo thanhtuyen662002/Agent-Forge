@@ -61,6 +61,8 @@ import {
   ArtifactManifestEntry,
   ARTIFACT_MANIFEST_ENTRY_KEYS,
   ARTIFACT_MANIFEST_KEYS,
+  CanonicalWorkspaceSnapshotAfterPayload,
+  CANONICAL_WORKSPACE_SNAPSHOT_AFTER_KEYS,
 } from '../src/core/types/adjudication';
 import { registerIpcHandlers, scrubAdjudicationError } from '../src/electron/ipcHandlers';
 import { ExecutionAuthorization, Task, Project, Evidence, TestRun } from '../src/core/types/domain';
@@ -4409,6 +4411,41 @@ describe('R5J5 Quarantined Submission Adjudication and Verification Admission Su
         fixtures.repo.getCoderSubmissionById(subId)!
       ));
 
+      const wsAfterObj: CanonicalWorkspaceSnapshotAfterPayload = {
+        adjudication_id: adjId,
+        assignment_id: fixtures.assignmentId,
+        attempt_id: fixtures.attemptId,
+        authorization_id: fixtures.authorizationId,
+        captured_at: now,
+        captured_repository_head_sha: fixtures.repoHeadSha,
+        git_diff_evidence_hash: gde.hash,
+        git_status_evidence_hash: gse.hash,
+        project_id: fixtures.projectId,
+        schema_version: 1,
+        task_id: fixtures.taskId,
+        task_ownership_epoch: 1,
+        verification_execution_id: execId,
+      };
+      const wsAfterContent = canonicalJsonStringify(wsAfterObj);
+      const wsAfterHash = computeSha256(wsAfterContent);
+      const matWsAfter = fixtures.artifactStore.materializeContentAddressedFile(wsAfterContent, wsAfterHash);
+      const wsAfterEv: Evidence = {
+        id: crypto.randomUUID(),
+        project_id: fixtures.projectId,
+        task_id: fixtures.taskId,
+        attempt_id: fixtures.attemptId,
+        evidence_type: 'FILE_SNAPSHOT',
+        storage_type: 'FILE',
+        file_path: matWsAfter.filePath,
+        hash: wsAfterHash,
+        byte_size: matWsAfter.byteSize,
+        content_type: 'application/json',
+        summary: 'Workspace snapshot after',
+        raw_payload: null,
+        created_at: new Date().toISOString(),
+      };
+      fixtures.repo.createEvidence(wsAfterEv);
+
       const artifactManifest: ArtifactManifest = {
         manifest_schema_version: 1,
         adjudication_id: adjId,
@@ -4442,6 +4479,15 @@ describe('R5J5 Quarantined Submission Adjudication and Verification Admission Su
             storage_class: 'FILE',
             relative_path: path.relative(fixtures.artifactStore.getBaseDir(), gde.file_path!),
           },
+          {
+            evidence_id: wsAfterEv.id,
+            evidence_type: wsAfterEv.evidence_type,
+            content_type: wsAfterEv.content_type,
+            byte_size: wsAfterEv.byte_size,
+            sha256: wsAfterEv.hash,
+            storage_class: 'FILE',
+            relative_path: path.relative(fixtures.artifactStore.getBaseDir(), wsAfterEv.file_path!),
+          },
         ],
       };
       const artifactManifestJson = canonicalizeArtifactManifest(artifactManifest);
@@ -4473,8 +4519,8 @@ describe('R5J5 Quarantined Submission Adjudication and Verification Admission Su
         test_result_evidence_id: trEv.id,
         test_run_id: trId,
         verification_execution_id: execId,
-        workspace_snapshot_after_evidence_id: gse.id,
-        workspace_snapshot_after_hash: gse.hash,
+        workspace_snapshot_after_evidence_id: wsAfterEv.id,
+        workspace_snapshot_after_hash: wsAfterHash,
         workspace_snapshot_before_hash: wsBeforeHash,
       };
       const envelopeJson = canonicalJsonStringify(envelopeObj);
@@ -8958,9 +9004,9 @@ describe('R5J5 Quarantined Submission Adjudication and Verification Admission Su
       expect(ProcessRunner.getActiveProcessCount()).toBe(0);
     });
 
-    it('288. Synchronous legacy cancellation path cannot claim success or persist terminal status before proof', () => {
-      const result = ProcessRunner.cancel('non-existent-execution-id');
-      expect(result).toBe(false);
+    it('288. Synchronous legacy cancellation path cannot claim success or persist terminal status before proof', async () => {
+      const result = await ProcessRunner.cancel('non-existent-execution-id');
+      expect(result).toBe('NOT_APPLICABLE');
       expect(ProcessRunner.getActiveProcessCount()).toBe(0);
     });
 
@@ -9457,21 +9503,41 @@ describe('R5J5 Quarantined Submission Adjudication and Verification Admission Su
         summary: 'git diff evidence',
         raw_payload: 'diff',
       });
+      const execId = crypto.randomUUID();
+      const wsAfterId = 'ev-ws-after-' + crypto.randomUUID();
+      const wsAfterObj: CanonicalWorkspaceSnapshotAfterPayload = {
+        adjudication_id: adjId,
+        assignment_id: fixtures.assignmentId,
+        attempt_id: fixtures.attemptId,
+        authorization_id: fixtures.authorizationId,
+        captured_at: nowIso,
+        captured_repository_head_sha: fixtures.repoHeadSha,
+        git_diff_evidence_hash: computeSha256('diff'),
+        git_status_evidence_hash: computeSha256('status'),
+        project_id: fixtures.projectId,
+        schema_version: 1,
+        task_id: fixtures.taskId,
+        task_ownership_epoch: 1,
+        verification_execution_id: execId,
+      };
+      const wsAfterContent = canonicalJsonStringify(wsAfterObj);
+      const wsAfterHash = computeSha256(wsAfterContent);
       fixtures.repo.createEvidence({
-        id: 'ev-ws-after-' + crypto.randomUUID(),
+        id: wsAfterId,
         project_id: fixtures.projectId,
         task_id: fixtures.taskId,
         attempt_id: fixtures.attemptId,
-        evidence_type: 'CUSTOM',
+        evidence_type: 'FILE_SNAPSHOT',
         storage_type: 'INLINE',
         file_path: null,
-        hash: computeSha256('after'),
-        byte_size: 5,
+        hash: wsAfterHash,
+        byte_size: Buffer.byteLength(wsAfterContent, 'utf8'),
         created_at: nowIso,
-        content_type: 'text/plain',
+        content_type: 'application/json',
         summary: 'ws after evidence',
-        raw_payload: 'after',
+        raw_payload: wsAfterContent,
       });
+
       fixtures.repo.createTestRun({
         id: trId,
         task_id: fixtures.taskId,
@@ -9489,7 +9555,7 @@ describe('R5J5 Quarantined Submission Adjudication and Verification Admission Su
         manifest_schema_version: 1,
         adjudication_id: adjId,
         lifecycle_version: 3,
-        verification_execution_id: crypto.randomUUID(),
+        verification_execution_id: execId,
         entries: [
           {
             byte_size: 4,
@@ -9516,6 +9582,15 @@ describe('R5J5 Quarantined Submission Adjudication and Verification Admission Su
             evidence_type: 'GIT_DIFF',
             relative_path: 'git_diff.txt',
             sha256: computeSha256('diff'),
+            storage_class: 'INLINE',
+          },
+          {
+            byte_size: Buffer.byteLength(wsAfterContent, 'utf8'),
+            content_type: 'application/json',
+            evidence_id: wsAfterId,
+            evidence_type: 'FILE_SNAPSHOT',
+            relative_path: 'workspace_snapshot_after.json',
+            sha256: wsAfterHash,
             storage_class: 'INLINE',
           },
         ],
@@ -9548,9 +9623,9 @@ describe('R5J5 Quarantined Submission Adjudication and Verification Admission Su
         test_result_evidence_hash: computeSha256('pass'),
         test_result_evidence_id: evId,
         test_run_id: trId,
-        verification_execution_id: manifestObj.verification_execution_id,
-        workspace_snapshot_after_evidence_id: gseId,
-        workspace_snapshot_after_hash: computeSha256('status'),
+        verification_execution_id: execId,
+        workspace_snapshot_after_evidence_id: wsAfterId,
+        workspace_snapshot_after_hash: wsAfterHash,
         workspace_snapshot_before_hash: computeSha256('before'),
       };
 
@@ -9750,9 +9825,9 @@ describe('R5J5 Quarantined Submission Adjudication and Verification Admission Su
           timeoutMs: 10000,
         });
 
-        // Synchronous cancel initiates request but does not immediately purge active registry before death proof
-        const cancelTriggered = ProcessRunner.cancel(execId);
-        expect(typeof cancelTriggered).toBe('boolean');
+        // Asynchronous cancel awaits death proof and returns ProcessTerminationTruth
+        const cancelResult = await ProcessRunner.cancel(execId);
+        expect(cancelResult).toBe('PROCESS_TREE_TERMINATED_PROVEN');
 
         const result = await procPromise;
         expect(result.cancelled).toBe(true);
@@ -9855,7 +9930,16 @@ describe('R5J5 Quarantined Submission Adjudication and Verification Admission Su
           })
         ).rejects.toThrow('DURABLE_TERMINAL_UPDATE_FAILED');
 
+        // Visible in authority accounting as persistence-fenced
+        expect(ProcessRunner.getActiveProcessCount()).toBe(1);
+        expect(ProcessRunner.getPersistenceFencedCount()).toBe(1);
+
+        // Retrying with restored persistence succeeds and cleans registry
+        fixtures.repo.updateProcessRun = origUpdate;
+        const retryResult = await ProcessRunner.retryPersistenceFenced(execId, fixtures.repo);
+        expect(retryResult.exitCode).toBe(0);
         expect(ProcessRunner.getActiveProcessCount()).toBe(0);
+        expect(ProcessRunner.getPersistenceFencedCount()).toBe(0);
       } finally {
         fixtures.repo.updateProcessRun = origUpdate;
         fs.rmSync(testDir, { recursive: true, force: true });
@@ -11348,11 +11432,47 @@ describe('R5J5 Quarantined Submission Adjudication and Verification Admission Su
       const adjMissingId = crypto.randomUUID();
       const rawMan = JSON.parse(adj.artifact_manifest_json!);
       rawMan.adjudication_id = adjMissingId;
-      const newManJson = canonicalizeArtifactManifest(rawMan);
-      const newManHash = computeArtifactManifestHash(rawMan);
 
       const rawEnv = JSON.parse(adj.verification_result_envelope_json!);
       rawEnv.adjudication_id = adjMissingId;
+
+      const oldWsAfter = fixtures.repo.getEvidence(rawEnv.workspace_snapshot_after_evidence_id)!;
+      const oldWsObj = JSON.parse(oldWsAfter.raw_payload || (oldWsAfter.file_path ? fs.readFileSync(oldWsAfter.file_path, 'utf8') : '{}'));
+      const newWsObj = { ...oldWsObj, adjudication_id: adjMissingId };
+      const newWsContent = canonicalJsonStringify(newWsObj);
+      const newWsHash = computeSha256(newWsContent);
+      const matWs = fixtures.artifactStore.materializeContentAddressedFile(newWsContent, newWsHash);
+      const newWsEv: Evidence = {
+        id: crypto.randomUUID(),
+        project_id: fixtures.projectId,
+        task_id: fixtures.taskId,
+        attempt_id: fixtures.attemptId,
+        evidence_type: 'FILE_SNAPSHOT',
+        storage_type: 'FILE',
+        file_path: matWs.filePath,
+        hash: newWsHash,
+        byte_size: matWs.byteSize,
+        content_type: 'application/json',
+        summary: 'Workspace snapshot after',
+        raw_payload: null,
+        created_at: new Date().toISOString(),
+      };
+      fixtures.repo.createEvidence(newWsEv);
+
+      rawEnv.workspace_snapshot_after_evidence_id = newWsEv.id;
+      rawEnv.workspace_snapshot_after_hash = newWsHash;
+
+      const wsIdx = rawMan.entries.findIndex((e: any) => e.evidence_type === 'FILE_SNAPSHOT');
+      if (wsIdx >= 0) {
+        rawMan.entries[wsIdx].evidence_id = newWsEv.id;
+        rawMan.entries[wsIdx].sha256 = newWsHash;
+        rawMan.entries[wsIdx].byte_size = newWsEv.byte_size;
+        rawMan.entries[wsIdx].relative_path = path.relative(fixtures.artifactStore.getBaseDir(), matWs.filePath).replace(/\\/g, '/');
+      }
+
+      const newManJson = canonicalizeArtifactManifest(rawMan);
+      const newManHash = computeArtifactManifestHash(newManJson);
+
       rawEnv.artifact_manifest_hash = newManHash;
       const newEnvJson = canonicalJsonStringify(rawEnv);
       const newEnvHash = computeSha256(newEnvJson);
@@ -12689,7 +12809,7 @@ describe('R5J5 Quarantined Submission Adjudication and Verification Admission Su
       }
     });
 
-    it('339. Synchronous public APIs cannot claim settlement success', async () => {
+    it('339. Asynchronous public APIs prove settlement and terminal truth', async () => {
       const testDir = fs.mkdtempSync(path.join(os.tmpdir(), 'af-proc-sync-claim-'));
       try {
         const scriptPath = path.join(testDir, 'sleep.js');
@@ -12708,22 +12828,22 @@ describe('R5J5 Quarantined Submission Adjudication and Verification Admission Su
         await new Promise((r) => setTimeout(r, 60));
         expect(ProcessRunner.getActiveProcessCount()).toBeGreaterThan(0);
 
-        // Calling cancel returns boolean, NOT a promise, and cannot claim settlement
-        const cancelReturnValue = ProcessRunner.cancel(execId);
-        expect(typeof cancelReturnValue).toBe('boolean');
-        expect(cancelReturnValue).toBe(true);
-
-        // At this synchronous instant, the process is still registered and terminal DB record not committed
-        expect(ProcessRunner.getActiveProcessCount()).toBeGreaterThan(0);
-
-        // Calling terminateAllProcesses is synchronous signal dispatch
-        ProcessRunner.terminateAllProcesses();
+        // Calling cancel returns a Promise<ProcessTerminationTruth>, not an immediate boolean
+        const cancelPromise = ProcessRunner.cancel(execId);
+        expect(cancelPromise instanceof Promise).toBe(true);
+        const cancelResult = await cancelPromise;
+        expect(cancelResult).toBe('PROCESS_TREE_TERMINATED_PROVEN');
 
         // True terminal truth requires awaiting the execution promise
         const result = await procPromise;
         expect(result.cancelled).toBe(true);
         expect(result.processTermination).toBe('PROCESS_TREE_TERMINATED_PROVEN');
         expect(ProcessRunner.getActiveProcessCount()).toBe(0);
+
+        // terminateAllProcesses is async and returns summary
+        const termSummary = await ProcessRunner.terminateAllProcesses();
+        expect(termSummary.allTerminatedProven).toBe(true);
+        expect(termSummary.unproven).toBe(0);
       } finally {
         fs.rmSync(testDir, { recursive: true, force: true });
       }
@@ -12993,19 +13113,37 @@ describe('R5J5 Quarantined Submission Adjudication and Verification Admission Su
         created_at: nowIso,
       });
 
-      const afterEvContent = 'workspace snapshot after content 343';
+      const adjId = crypto.randomUUID();
+      const execId = crypto.randomUUID();
+
+      const wsAfterObj: CanonicalWorkspaceSnapshotAfterPayload = {
+        adjudication_id: adjId,
+        assignment_id: fixtures.assignmentId,
+        attempt_id: fixtures.attemptId,
+        authorization_id: fixtures.authorizationId,
+        captured_at: nowIso,
+        captured_repository_head_sha: fixtures.repoHeadSha,
+        git_diff_evidence_hash: '',
+        git_status_evidence_hash: '',
+        project_id: fixtures.projectId,
+        schema_version: 1,
+        task_id: fixtures.taskId,
+        task_ownership_epoch: 1,
+        verification_execution_id: execId,
+      };
+      const afterEvContent = canonicalJsonStringify(wsAfterObj);
       const afterEvHash = computeSha256(afterEvContent);
       const afterEv: Evidence = {
         id: crypto.randomUUID(),
         project_id: fixtures.projectId,
         task_id: fixtures.taskId,
         attempt_id: fixtures.attemptId,
-        evidence_type: 'GIT_DIFF',
+        evidence_type: 'FILE_SNAPSHOT',
         storage_type: 'INLINE',
         file_path: null,
         hash: afterEvHash,
-        byte_size: afterEvContent.length,
-        content_type: 'text/plain',
+        byte_size: Buffer.byteLength(afterEvContent, 'utf8'),
+        content_type: 'application/json',
         summary: 'Workspace snapshot after',
         raw_payload: afterEvContent,
         created_at: nowIso,
@@ -13014,9 +13152,9 @@ describe('R5J5 Quarantined Submission Adjudication and Verification Admission Su
 
       const manifestObj: ArtifactManifest = {
         manifest_schema_version: 1,
-        adjudication_id: crypto.randomUUID(),
+        adjudication_id: adjId,
         lifecycle_version: 3,
-        verification_execution_id: crypto.randomUUID(),
+        verification_execution_id: execId,
         entries: [
           {
             byte_size: testResultEv.byte_size,
@@ -13042,7 +13180,7 @@ describe('R5J5 Quarantined Submission Adjudication and Verification Admission Su
       const manifestHash = computeArtifactManifestHash(manifestJson);
 
       const envelopeObj: CanonicalVerificationResultEnvelope = {
-        adjudication_id: manifestObj.adjudication_id,
+        adjudication_id: adjId,
         artifact_manifest_hash: manifestHash,
         assignment_id: fixtures.assignmentId,
         attempt_id: fixtures.attemptId,
@@ -13066,14 +13204,14 @@ describe('R5J5 Quarantined Submission Adjudication and Verification Admission Su
         test_result_evidence_hash: testResultEv.hash,
         test_result_evidence_id: testResultEv.id,
         test_run_id: trId,
-        verification_execution_id: manifestObj.verification_execution_id,
+        verification_execution_id: execId,
         workspace_snapshot_after_evidence_id: afterEv.id,
         workspace_snapshot_after_hash: afterEvHash,
         workspace_snapshot_before_hash: computeSha256('before'),
       };
 
       const adjStub: CoderSubmissionAdjudication = {
-        id: envelopeObj.adjudication_id,
+        id: adjId,
         submission_id: crypto.randomUUID(),
         authorization_id: fixtures.authorizationId,
         project_id: fixtures.projectId,
@@ -13101,7 +13239,7 @@ describe('R5J5 Quarantined Submission Adjudication and Verification Admission Su
         test_run_id: trId,
         git_status_evidence_id: null,
         git_diff_evidence_id: null,
-        verification_execution_id: manifestObj.verification_execution_id,
+        verification_execution_id: execId,
         verification_result_envelope_json: canonicalJsonStringify(envelopeObj),
         verification_result_envelope_hash: computeSha256(canonicalJsonStringify(envelopeObj)),
         artifact_manifest_json: manifestJson,
@@ -13110,6 +13248,23 @@ describe('R5J5 Quarantined Submission Adjudication and Verification Admission Su
       };
 
       const tr = fixtures.repo.getTestRun(trId)!;
+
+      // Probe 0: Authentic baseline passes
+      const rawValid = canonicalJsonStringify(envelopeObj);
+      const decValid = evaluateCanonicalSettlementDecision({
+        rawEnvelopeJson: rawValid,
+        storedEnvelopeHash: computeSha256(rawValid),
+        rawManifestJson: manifestJson,
+        storedManifestHash: manifestHash,
+        adjudication: adjStub,
+        testRun: tr,
+        gitStatusEvidenceId: null,
+        gitDiffEvidenceId: null,
+        testResultEvidenceId: testResultEv.id,
+        repo: fixtures.repo,
+        artifactStore: fixtures.artifactStore,
+      });
+      expect(decValid.valid).toBe(true);
 
       // Probe 1: Non-existent evidence ID fails closed
       const envBadId = { ...envelopeObj, workspace_snapshot_after_evidence_id: crypto.randomUUID() };
@@ -13187,9 +13342,9 @@ describe('R5J5 Quarantined Submission Adjudication and Verification Admission Su
       // Probe 4: Manifest omission (after evidence omitted from manifest)
       const omittedManifestObj: ArtifactManifest = {
         manifest_schema_version: 1,
-        adjudication_id: manifestObj.adjudication_id,
+        adjudication_id: adjId,
         lifecycle_version: 3,
-        verification_execution_id: manifestObj.verification_execution_id,
+        verification_execution_id: execId,
         entries: [
           {
             byte_size: testResultEv.byte_size,
@@ -13220,6 +13375,46 @@ describe('R5J5 Quarantined Submission Adjudication and Verification Admission Su
       });
       expect(decOmitted.targetStatus).toBe('RECOVERY_FENCED');
       expect(decOmitted.failureCode).toBe('INTEGRITY_MISMATCH');
+
+      // Probe 5: Wrong evidence type (not FILE_SNAPSHOT or CUSTOM)
+      const wrongTypeEv: Evidence = { ...afterEv, id: crypto.randomUUID(), evidence_type: 'PROCESS_LOG' };
+      fixtures.repo.createEvidence(wrongTypeEv);
+      const envWrongType = { ...envelopeObj, workspace_snapshot_after_evidence_id: wrongTypeEv.id };
+      const rawWrongType = canonicalJsonStringify(envWrongType);
+      const decWrongType = evaluateCanonicalSettlementDecision({
+        rawEnvelopeJson: rawWrongType,
+        storedEnvelopeHash: computeSha256(rawWrongType),
+        rawManifestJson: manifestJson,
+        storedManifestHash: manifestHash,
+        adjudication: adjStub,
+        testRun: tr,
+        gitStatusEvidenceId: null,
+        gitDiffEvidenceId: null,
+        testResultEvidenceId: testResultEv.id,
+        repo: fixtures.repo,
+        artifactStore: fixtures.artifactStore,
+      });
+      expect(decWrongType.targetStatus).toBe('RECOVERY_FENCED');
+      expect(decWrongType.failureCode).toBe('INTEGRITY_MISMATCH');
+
+      // Probe 6: Reusing test result evidence as workspace-after evidence
+      const envReuse = { ...envelopeObj, workspace_snapshot_after_evidence_id: testResultEv.id, workspace_snapshot_after_hash: testResultEv.hash };
+      const rawReuse = canonicalJsonStringify(envReuse);
+      const decReuse = evaluateCanonicalSettlementDecision({
+        rawEnvelopeJson: rawReuse,
+        storedEnvelopeHash: computeSha256(rawReuse),
+        rawManifestJson: manifestJson,
+        storedManifestHash: manifestHash,
+        adjudication: adjStub,
+        testRun: tr,
+        gitStatusEvidenceId: null,
+        gitDiffEvidenceId: null,
+        testResultEvidenceId: testResultEv.id,
+        repo: fixtures.repo,
+        artifactStore: fixtures.artifactStore,
+      });
+      expect(decReuse.targetStatus).toBe('RECOVERY_FENCED');
+      expect(decReuse.failureCode).toBe('INTEGRITY_MISMATCH');
     });
 
     it('344. VERIFICATION_FAILED recovery rejects missing, duplicate, extra, wrong-ID, wrong-actor, wrong-metadata, SETTLED dispositions with zero mutation', () => {
@@ -14021,6 +14216,405 @@ describe('R5J5 Quarantined Submission Adjudication and Verification Admission Su
       const rLeaseConflict = fixtures.recoveryScanner.reconcileSingleAdjudication(adj);
       expect(rLeaseConflict.classification).toBe('AUTHORITY_CONFLICT');
       expect(rLeaseConflict.error).toContain('VERIFIED workspace lease must be RELEASED');
+
+      // Restore lease
+      fixtures.db.prepare("UPDATE coder_submission_workspace_leases SET state = 'RELEASED', failure_code = NULL, lifecycle_version = lifecycle_version + 1 WHERE id = ?").run(adj.workspace_lease_id);
+    });
+
+    it('349. Async public cancellation returns Promise<ProcessTerminationTruth> and no immediate boolean success', async () => {
+      const testDir = fs.mkdtempSync(path.join(os.tmpdir(), 'af-cancel-349-'));
+      try {
+        const scriptPath = path.join(testDir, 'spin.js');
+        fs.writeFileSync(scriptPath, 'setInterval(() => {}, 1000);', 'utf8');
+
+        const execId = crypto.randomUUID();
+        const procPromise = ProcessRunner.execute({
+          executable: process.execPath,
+          args: [scriptPath],
+          cwd: testDir,
+          executionId: execId,
+        });
+
+        await new Promise((resolve) => setTimeout(resolve, 50));
+        expect(ProcessRunner.getActiveProcessCount()).toBeGreaterThan(0);
+
+        const cancelPromise = ProcessRunner.cancel(execId);
+        expect(cancelPromise instanceof Promise).toBe(true);
+
+        const cancelTruth = await cancelPromise;
+        expect(cancelTruth).toBe('PROCESS_TREE_TERMINATED_PROVEN');
+
+        const result = await procPromise;
+        expect(result.cancelled).toBe(true);
+        expect(result.processTermination).toBe('PROCESS_TREE_TERMINATED_PROVEN');
+        expect(ProcessRunner.getActiveProcessCount()).toBe(0);
+      } finally {
+        fs.rmSync(testDir, { recursive: true, force: true });
+      }
+    });
+
+    it('350. Concurrent cancellation callers for the same execution join the same settlement authority', async () => {
+      const testDir = fs.mkdtempSync(path.join(os.tmpdir(), 'af-cancel-350-'));
+      try {
+        const scriptPath = path.join(testDir, 'loop.js');
+        fs.writeFileSync(scriptPath, 'setInterval(() => {}, 1000);', 'utf8');
+
+        const execId = crypto.randomUUID();
+        const procPromise = ProcessRunner.execute({
+          executable: process.execPath,
+          args: [scriptPath],
+          cwd: testDir,
+          executionId: execId,
+        });
+
+        await new Promise((resolve) => setTimeout(resolve, 50));
+        expect(ProcessRunner.getActiveProcessCount()).toBeGreaterThan(0);
+
+        const [c1, c2, c3] = await Promise.all([
+          ProcessRunner.cancel(execId),
+          ProcessRunner.cancel(execId),
+          ProcessRunner.cancel(execId),
+        ]);
+
+        expect(c1).toBe('PROCESS_TREE_TERMINATED_PROVEN');
+        expect(c2).toBe('PROCESS_TREE_TERMINATED_PROVEN');
+        expect(c3).toBe('PROCESS_TREE_TERMINATED_PROVEN');
+
+        const result = await procPromise;
+        expect(result.cancelled).toBe(true);
+        expect(ProcessRunner.getActiveProcessCount()).toBe(0);
+      } finally {
+        fs.rmSync(testDir, { recursive: true, force: true });
+      }
+    });
+
+    it('351. Unknown or already-terminal execution IDs return typed NOT_APPLICABLE truth', async () => {
+      const unknownId = 'unknown-execution-' + crypto.randomUUID();
+      const resUnknown = await ProcessRunner.cancel(unknownId);
+      expect(resUnknown).toBe('NOT_APPLICABLE');
+      expect(ProcessRunner.getActiveProcessCount()).toBe(0);
+    });
+
+    it('352. Process-tree death proof is verified before successful cancellation return', async () => {
+      const testDir = fs.mkdtempSync(path.join(os.tmpdir(), 'af-cancel-352-'));
+      try {
+        const scriptPath = path.join(testDir, 'long.js');
+        fs.writeFileSync(scriptPath, 'setInterval(() => {}, 1000);', 'utf8');
+
+        const execId = crypto.randomUUID();
+        let capturedPid: number | null = null;
+        const procPromise = ProcessRunner.execute({
+          executable: process.execPath,
+          args: [scriptPath],
+          cwd: testDir,
+          executionId: execId,
+        });
+
+        await new Promise((resolve) => setTimeout(resolve, 50));
+        const activeCount = ProcessRunner.getActiveProcessCount();
+        expect(activeCount).toBe(1);
+
+        const cancelResult = await ProcessRunner.cancel(execId);
+        expect(cancelResult).toBe('PROCESS_TREE_TERMINATED_PROVEN');
+
+        const result = await procPromise;
+        capturedPid = result.pid;
+        expect(capturedPid).not.toBeNull();
+        if (capturedPid !== null) {
+          const isDead = await ProcessRunner.verifyProcessDeadWithDeadline(capturedPid, 500);
+          expect(isDead).toBe(true);
+        }
+        expect(ProcessRunner.getActiveProcessCount()).toBe(0);
+      } finally {
+        fs.rmSync(testDir, { recursive: true, force: true });
+      }
+    });
+
+    it('353. Durable terminal state is persisted before successful cancellation return', async () => {
+      const testDir = fs.mkdtempSync(path.join(os.tmpdir(), 'af-cancel-353-'));
+      try {
+        const scriptPath = path.join(testDir, 'script.js');
+        fs.writeFileSync(scriptPath, 'setInterval(() => {}, 1000);', 'utf8');
+
+        const execId = crypto.randomUUID();
+        const procPromise = ProcessRunner.execute({
+          executable: process.execPath,
+          args: [scriptPath],
+          cwd: testDir,
+          executionId: execId,
+          repo: fixtures.repo,
+        });
+
+        await new Promise((resolve) => setTimeout(resolve, 50));
+        const cancelTruth = await ProcessRunner.cancel(execId);
+        expect(cancelTruth).toBe('PROCESS_TREE_TERMINATED_PROVEN');
+
+        // Verify that by the time cancel returns, the durable process run is already marked terminal
+        const runRow = fixtures.repo.getProcessRun(execId);
+        expect(runRow).toBeDefined();
+        expect(runRow?.status).toBe('CANCELLED');
+        expect(runRow?.end_time || runRow?.finished_at).toBeDefined();
+
+        await procPromise;
+        expect(ProcessRunner.getActiveProcessCount()).toBe(0);
+      } finally {
+        fs.rmSync(testDir, { recursive: true, force: true });
+      }
+    });
+
+    it('354. Durable terminal persistence failure keeps execution visibly counted as active and unproven', async () => {
+      const testDir = fs.mkdtempSync(path.join(os.tmpdir(), 'af-persist-354-'));
+      const origUpdate = fixtures.repo.updateProcessRun.bind(fixtures.repo);
+      try {
+        const scriptPath = path.join(testDir, 'quick.js');
+        fs.writeFileSync(scriptPath, 'process.exit(0);', 'utf8');
+
+        const execId = crypto.randomUUID();
+        fixtures.repo.updateProcessRun = () => {
+          throw new Error('Simulated disk write failure on terminal persistence');
+        };
+
+        await expect(
+          ProcessRunner.execute({
+            executable: process.execPath,
+            args: [scriptPath],
+            cwd: testDir,
+            executionId: execId,
+            repo: fixtures.repo,
+          })
+        ).rejects.toThrow('DURABLE_TERMINAL_UPDATE_FAILED');
+
+        // Unresolved persistence-fenced execution is counted in active count and unproven
+        expect(ProcessRunner.getActiveProcessCount()).toBe(1);
+        expect(ProcessRunner.getPersistenceFencedCount()).toBe(1);
+
+        const termSummary = await ProcessRunner.terminateAllProcesses();
+        expect(termSummary.unproven).toBe(1);
+        expect(termSummary.allTerminatedProven).toBe(false);
+
+        // Clean up fenced entry by retrying persistence with restored repo
+        fixtures.repo.updateProcessRun = origUpdate;
+        const retryResult = await ProcessRunner.retryPersistenceFenced(execId, fixtures.repo);
+        expect(retryResult.exitCode).toBe(0);
+        expect(ProcessRunner.getActiveProcessCount()).toBe(0);
+        expect(ProcessRunner.getPersistenceFencedCount()).toBe(0);
+      } finally {
+        fixtures.repo.updateProcessRun = origUpdate;
+        fs.rmSync(testDir, { recursive: true, force: true });
+      }
+    });
+
+    it('355. terminateAllProcesses returns exact count, unproven, and allTerminatedProven', async () => {
+      const testDir = fs.mkdtempSync(path.join(os.tmpdir(), 'af-termall-355-'));
+      try {
+        const scriptPath = path.join(testDir, 'hold.js');
+        fs.writeFileSync(scriptPath, 'setInterval(() => {}, 1000);', 'utf8');
+
+        const exec1 = crypto.randomUUID();
+        const exec2 = crypto.randomUUID();
+
+        const p1 = ProcessRunner.execute({
+          executable: process.execPath,
+          args: [scriptPath],
+          cwd: testDir,
+          executionId: exec1,
+        });
+
+        const p2 = ProcessRunner.execute({
+          executable: process.execPath,
+          args: [scriptPath],
+          cwd: testDir,
+          executionId: exec2,
+        });
+
+        await new Promise((resolve) => setTimeout(resolve, 60));
+        expect(ProcessRunner.getActiveProcessCount()).toBe(2);
+
+        const summary = await ProcessRunner.terminateAllProcesses();
+        expect(summary.count).toBe(2);
+        expect(summary.unproven).toBe(0);
+        expect(summary.allTerminatedProven).toBe(true);
+
+        await Promise.all([p1, p2]);
+        expect(ProcessRunner.getActiveProcessCount()).toBe(0);
+      } finally {
+        fs.rmSync(testDir, { recursive: true, force: true });
+      }
+    });
+
+    it('356. EmergencyStopService truthfully awaits global process termination', async () => {
+      const testDir = fs.mkdtempSync(path.join(os.tmpdir(), 'af-estop-356-'));
+      try {
+        const scriptPath = path.join(testDir, 'loop.js');
+        fs.writeFileSync(scriptPath, 'setInterval(() => {}, 1000);', 'utf8');
+
+        const execId = crypto.randomUUID();
+        const procPromise = ProcessRunner.execute({
+          executable: process.execPath,
+          args: [scriptPath],
+          cwd: testDir,
+          executionId: execId,
+        });
+
+        await new Promise((resolve) => setTimeout(resolve, 50));
+        expect(ProcessRunner.getActiveProcessCount()).toBe(1);
+
+        const stopRes = await fixtures.emergencyStopService.triggerEmergencyStop('Automated test emergency stop');
+
+        expect(stopRes.processesTerminated).toBe(1);
+        expect(ProcessRunner.getActiveProcessCount()).toBe(0);
+        await procPromise;
+      } finally {
+        fs.rmSync(testDir, { recursive: true, force: true });
+      }
+    });
+
+    it('357. Dedicated canonical FILE_SNAPSHOT production creation and binding in adjudication settlement', async () => {
+      const { plaintextToken } = issueSubmissionSessionHelper(fixtures.repo, fixtures.authorizationId);
+      const subId = crypto.randomUUID();
+      fixtures.mcpService.submitCoderClaim(createValidSubmissionPayload(fixtures, subId), plaintextToken);
+
+      const admitRes = await fixtures.adjudicationService.admitSubmissionForVerification({
+        requestId: crypto.randomUUID(),
+        submissionId: subId,
+      });
+
+      const adj = fixtures.repo.getCoderSubmissionAdjudicationById(admitRes.adjudication.id)!;
+      expect(adj.status).toBe('VERIFIED');
+      const env = JSON.parse(adj.verification_result_envelope_json!);
+      expect(env.workspace_snapshot_after_evidence_id).toBeTruthy();
+
+      const afterEvidence = fixtures.repo.getEvidence(env.workspace_snapshot_after_evidence_id!);
+      expect(afterEvidence).toBeDefined();
+      expect(afterEvidence?.evidence_type).toBe('FILE_SNAPSHOT');
+
+      // Verify artifact manifest includes dedicated workspace-after evidence
+      const manifest = JSON.parse(adj.artifact_manifest_json!);
+      const wsAfterEntry = manifest.entries.find((e: { evidence_id: string }) => e.evidence_id === afterEvidence?.id);
+      expect(wsAfterEntry).toBeDefined();
+      expect(wsAfterEntry.evidence_type).toBe('FILE_SNAPSHOT');
+      expect(wsAfterEntry.sha256).toBe(afterEvidence?.hash);
+
+      // Verify content is valid canonical JSON with exact 13 keys
+      let content = afterEvidence?.raw_payload;
+      if (!content && afterEvidence?.file_path) {
+        content = fs.readFileSync(afterEvidence.file_path, 'utf8');
+      }
+      expect(content).toBeDefined();
+      const parsed = JSON.parse(content!);
+      const actualKeys = Object.keys(parsed).sort();
+      const expectedKeys = [...CANONICAL_WORKSPACE_SNAPSHOT_AFTER_KEYS].sort();
+      expect(actualKeys).toEqual(expectedKeys);
+      expect(canonicalJsonStringify(parsed)).toBe(content);
+      expect(computeSha256(content!)).toBe(afterEvidence?.hash);
+      expect(parsed.adjudication_id).toBe(adj.id);
+      expect(parsed.task_id).toBe(fixtures.taskId);
+      expect(parsed.project_id).toBe(fixtures.projectId);
+    });
+
+    it('358. Initial settlement and replay rejection of workspace evidence tampering', async () => {
+      const { plaintextToken } = issueSubmissionSessionHelper(fixtures.repo, fixtures.authorizationId);
+      const subId = crypto.randomUUID();
+      fixtures.mcpService.submitCoderClaim(createValidSubmissionPayload(fixtures, subId), plaintextToken);
+
+      const admitRes = await fixtures.adjudicationService.admitSubmissionForVerification({
+        requestId: crypto.randomUUID(),
+        submissionId: subId,
+      });
+
+      const adj = fixtures.repo.getCoderSubmissionAdjudicationById(admitRes.adjudication.id)!;
+      expect(adj.status).toBe('VERIFIED');
+
+      // Tamper with workspace-after evidence raw payload in DB
+      const env = JSON.parse(adj.verification_result_envelope_json!);
+      const afterEvId = env.workspace_snapshot_after_evidence_id!;
+      fixtures.db.prepare('UPDATE evidence SET raw_payload = ? WHERE id = ?').run('tampered-payload', afterEvId);
+
+      const reconTampered = fixtures.recoveryScanner.reconcileSingleAdjudication(adj);
+      expect(reconTampered.classification).toBe('AUTHORITY_CONFLICT');
+      expect(reconTampered.error).toContain('workspace_snapshot_after');
+    });
+
+    it('359. Recovery scanner rejects missing or contradictory terminal disposition or deterministic event', async () => {
+      const { plaintextToken } = issueSubmissionSessionHelper(fixtures.repo, fixtures.authorizationId);
+      const subId = crypto.randomUUID();
+      fixtures.mcpService.submitCoderClaim(createValidSubmissionPayload(fixtures, subId), plaintextToken);
+
+      const admitRes = await fixtures.adjudicationService.admitSubmissionForVerification({
+        requestId: crypto.randomUUID(),
+        submissionId: subId,
+      });
+
+      const adj = fixtures.repo.getCoderSubmissionAdjudicationById(admitRes.adjudication.id)!;
+
+      // 1. Missing disposition
+      const origGetDisps = fixtures.repo.getCoderSubmissionDispositions.bind(fixtures.repo);
+      fixtures.repo.getCoderSubmissionDispositions = () => [];
+      const reconMissingDisp = fixtures.recoveryScanner.reconcileSingleAdjudication(adj);
+      expect(reconMissingDisp.classification).toBe('AUTHORITY_CONFLICT');
+      expect(reconMissingDisp.error).toContain('terminal disposition');
+      fixtures.repo.getCoderSubmissionDispositions = origGetDisps;
+
+      // 2. Contradictory REJECTED disposition on VERIFIED adjudication
+      fixtures.repo.createCoderSubmissionDisposition({
+        id: crypto.randomUUID(),
+        submission_id: subId,
+        disposition_event: 'REJECTED',
+        disposition_reason: 'COLLISION_CONFLICT',
+        actor_type: 'SYSTEM',
+        actor_id: 'SCANNER',
+        disposition_metadata_json: null,
+        created_at: new Date().toISOString(),
+      });
+
+      const reconContradictory = fixtures.recoveryScanner.reconcileSingleAdjudication(adj);
+      expect(reconContradictory.classification).toBe('AUTHORITY_CONFLICT');
+    });
+
+    it('360. Mutation-free authority conflict with byte/row-count identity proof across all tables', async () => {
+      const { plaintextToken } = issueSubmissionSessionHelper(fixtures.repo, fixtures.authorizationId);
+      const subId = crypto.randomUUID();
+      fixtures.mcpService.submitCoderClaim(createValidSubmissionPayload(fixtures, subId), plaintextToken);
+
+      const admitRes = await fixtures.adjudicationService.admitSubmissionForVerification({
+        requestId: crypto.randomUUID(),
+        submissionId: subId,
+      });
+
+      const adj = fixtures.repo.getCoderSubmissionAdjudicationById(admitRes.adjudication.id)!;
+
+      // Corrupt lease state to create authority conflict without violating immutable triggers
+      fixtures.db.prepare("UPDATE coder_submission_workspace_leases SET state = 'FENCED', failure_code = 'ORPHANED_VERIFICATION_INTERRUPTED', lifecycle_version = lifecycle_version + 1 WHERE id = ?").run(adj.workspace_lease_id);
+
+      // Snapshot all tables before
+      const adjBefore = fixtures.db.prepare('SELECT * FROM coder_submission_adjudications').all();
+      const eventsBefore = fixtures.db.prepare('SELECT * FROM coder_submission_adjudication_events').all();
+      const dispsBefore = fixtures.db.prepare('SELECT * FROM coder_submission_dispositions').all();
+      const leasesBefore = fixtures.db.prepare('SELECT * FROM coder_submission_workspace_leases').all();
+      const tasksBefore = fixtures.db.prepare('SELECT * FROM tasks').all();
+      const evidenceBefore = fixtures.db.prepare('SELECT * FROM evidence').all();
+
+      const recon = fixtures.recoveryScanner.reconcileSingleAdjudication(adj);
+      expect(recon.classification).toBe('AUTHORITY_CONFLICT');
+      expect(recon.action_taken).toBe('NO_OP');
+
+      // Snapshot all tables after
+      const adjAfter = fixtures.db.prepare('SELECT * FROM coder_submission_adjudications').all();
+      const eventsAfter = fixtures.db.prepare('SELECT * FROM coder_submission_adjudication_events').all();
+      const dispsAfter = fixtures.db.prepare('SELECT * FROM coder_submission_dispositions').all();
+      const leasesAfter = fixtures.db.prepare('SELECT * FROM coder_submission_workspace_leases').all();
+      const tasksAfter = fixtures.db.prepare('SELECT * FROM tasks').all();
+      const evidenceAfter = fixtures.db.prepare('SELECT * FROM evidence').all();
+
+      expect(JSON.stringify(adjAfter)).toBe(JSON.stringify(adjBefore));
+      expect(JSON.stringify(eventsAfter)).toBe(JSON.stringify(eventsBefore));
+      expect(JSON.stringify(dispsAfter)).toBe(JSON.stringify(dispsBefore));
+      expect(JSON.stringify(leasesAfter)).toBe(JSON.stringify(leasesBefore));
+      expect(JSON.stringify(tasksAfter)).toBe(JSON.stringify(tasksBefore));
+      expect(JSON.stringify(evidenceAfter)).toBe(JSON.stringify(evidenceBefore));
+
+      // Clean up restored lease
+      fixtures.db.prepare("UPDATE coder_submission_workspace_leases SET state = 'RELEASED', failure_code = NULL, lifecycle_version = lifecycle_version + 1 WHERE id = ?").run(adj.workspace_lease_id);
     });
 
     it('223. historical three-file compatibility diffs remain byte-identical to initial head', () => {
