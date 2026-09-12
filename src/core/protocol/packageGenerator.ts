@@ -6,7 +6,8 @@ import {
   TestRun,
 } from '../types/domain';
 import { CoderProtocol } from '../types/protocols';
-import { Repository } from '../database/repositories';
+import { Repository, CoderSubmission } from '../database/repositories';
+import { CoderSubmissionAdjudication, VerifiedAdjudicationReviewProjection, VERIFIED_ADJUDICATION_REVIEW_PROJECTION_KEYS } from '../types/adjudication';
 import {
   computeContextManifestHash,
   computePayloadHash,
@@ -14,6 +15,7 @@ import {
   CanonicalExecutionPayloadSchema,
 } from '../services/ExecutionAuthorizationService';
 import { CommandParser } from '../services/CommandParser';
+import { computeSha256, CLAIM_CONTENT_KEYS, canonicalJsonStringify } from '../../mcp/submissionProtocol';
 
 export class PackageGenerator {
   private static formatVerificationCommand(
@@ -103,11 +105,12 @@ export class PackageGenerator {
         throw new Error(parseResult.error.issues.map((i) => i.message).join(', '));
       }
       canonicalPayload = parseResult.data;
-    } catch (err: any) {
-      if (err.message && err.message.includes('AUTHORIZED_WORKORDER_VERIFICATION_SNAPSHOT_MISSING')) {
+    } catch (err: unknown) {
+      const errMsg = err instanceof Error ? err.message : String(err);
+      if (errMsg.includes('AUTHORIZED_WORKORDER_VERIFICATION_SNAPSHOT_MISSING')) {
         throw err;
       }
-      throw new Error(`EXECUTION_AUTHORIZATION_CORRUPTED: Invalid canonical_payload_json (${err.message})`);
+      throw new Error(`EXECUTION_AUTHORIZATION_CORRUPTED: Invalid canonical_payload_json (${errMsg})`);
     }
 
     // 7. Verify frozen scope and authority bindings
@@ -146,8 +149,9 @@ export class PackageGenerator {
       if (!Array.isArray(canonicalInstructions) || !canonicalInstructions.every((i) => typeof i === 'string')) {
         throw new Error('Must be an array of strings');
       }
-    } catch (err: any) {
-      throw new Error(`EXECUTION_AUTHORIZATION_CORRUPTED: Invalid canonical_instructions_json (${err.message})`);
+    } catch (err: unknown) {
+      const errMsg = err instanceof Error ? err.message : String(err);
+      throw new Error(`EXECUTION_AUTHORIZATION_CORRUPTED: Invalid canonical_instructions_json (${errMsg})`);
     }
 
     let contextFiles: string[];
@@ -156,8 +160,9 @@ export class PackageGenerator {
       if (!Array.isArray(contextFiles) || !contextFiles.every((f) => typeof f === 'string')) {
         throw new Error('Must be an array of strings');
       }
-    } catch (err: any) {
-      throw new Error(`EXECUTION_AUTHORIZATION_CORRUPTED: Invalid context_files_json (${err.message})`);
+    } catch (err: unknown) {
+      const errMsg = err instanceof Error ? err.message : String(err);
+      throw new Error(`EXECUTION_AUTHORIZATION_CORRUPTED: Invalid context_files_json (${errMsg})`);
     }
 
     // 9. Require exact deep equality between payload and authorization record fields
@@ -362,6 +367,218 @@ Guidelines:
 `;
   }
 
+  public static renderVerifiedAdjudicationReviewProjection(
+    projection: VerifiedAdjudicationReviewProjection
+  ): string {
+    if (!projection || typeof projection !== 'object') {
+      throw new Error('VERIFIED_PROJECTION_INVALID: Review package requires a non-null VerifiedAdjudicationReviewProjection.');
+    }
+
+    const projKeys = Object.keys(projection).sort();
+    const expectedKeys = [...VERIFIED_ADJUDICATION_REVIEW_PROJECTION_KEYS].sort();
+    if (projKeys.length !== expectedKeys.length || projKeys.some((k, i) => k !== expectedKeys[i])) {
+      throw new Error('VERIFIED_PROJECTION_INVALID: Projection key set mismatch');
+    }
+
+    if (!projection.projection_hash || typeof projection.projection_hash !== 'string') {
+      throw new Error('VERIFIED_PROJECTION_INVALID: Review package requires a verified projection with valid projection_hash.');
+    }
+
+    // Recompute projection_hash and reject forgery
+    const { projection_hash, ...baseProjection } = projection;
+    const computedHash = computeSha256(canonicalJsonStringify(baseProjection));
+    if (computedHash !== projection_hash) {
+      throw new Error(`PROJECTION_HASH_MISMATCH: Projection hash mismatch (expected "${computedHash}", received "${projection_hash}")`);
+    }
+
+    // Strictly validate authoritative git status if present
+    if (projection.authoritative_git_status) {
+      const gs = projection.authoritative_git_status;
+      if (!gs || typeof gs !== 'object' || Array.isArray(gs)) {
+        throw new Error('VERIFIED_PROJECTION_INVALID: Malformed authoritative_git_status evidence in projection');
+      }
+      const allowedGitStatusKeys = ['branch', 'evidence_hash', 'evidence_id', 'is_clean', 'storage_type', 'summary'].sort();
+      const actualKeys = Object.keys(gs).sort();
+      for (const k of actualKeys) {
+        if (!allowedGitStatusKeys.includes(k)) {
+          throw new Error(`VERIFIED_PROJECTION_INVALID: Unauthorized field "${k}" in authoritative_git_status`);
+        }
+      }
+      if (typeof gs.is_clean !== 'boolean' || !gs.evidence_id || !gs.evidence_hash) {
+        throw new Error('VERIFIED_PROJECTION_INVALID: Malformed authoritative_git_status evidence in projection');
+      }
+      const rawGs = gs as unknown as Record<string, unknown>;
+      if (rawGs.storage_class || rawGs.hash || rawGs.clean) {
+        throw new Error('VERIFIED_PROJECTION_INVALID: Non-canonical alias in authoritative_git_status');
+      }
+    }
+
+    // Strictly validate authoritative git diff if present
+    if (projection.authoritative_git_diff) {
+      const gd = projection.authoritative_git_diff;
+      if (typeof gd.diff_content !== 'string' || !gd.evidence_id || !gd.evidence_hash) {
+        throw new Error('VERIFIED_PROJECTION_INVALID: Malformed authoritative_git_diff evidence in projection');
+      }
+    }
+
+    const criteriaList = projection.acceptance_criteria.length > 0
+      ? projection.acceptance_criteria.map((c, i) => `${i + 1}. ${c}`).join('\n')
+      : 'None specified.';
+
+    const issuesText = projection.previous_issues.length > 0
+      ? projection.previous_issues
+          .map((iss) => `- **[${iss.severity}]** ${iss.title} (${iss.file_path || 'general'}): ${iss.description}`)
+          .join('\n')
+      : 'No previous review issues.';
+
+    const MAX_DIFF_LENGTH = 32 * 1024;
+    let formattedDiff = '';
+    const diffSummary = projection.authoritative_git_diff;
+    if (!diffSummary || !diffSummary.diff_content.trim()) {
+      formattedDiff = '(No git diff detected)';
+    } else if (diffSummary.diff_content.length <= MAX_DIFF_LENGTH) {
+      formattedDiff = diffSummary.diff_content;
+    } else {
+      formattedDiff =
+        diffSummary.diff_content.substring(0, MAX_DIFF_LENGTH) +
+        `\n\n... [TRUNCATED: Diff is ${diffSummary.byte_size} bytes]\n` +
+        `- **Evidence ID**: \`${diffSummary.evidence_id}\`\n` +
+        `- **SHA-256 Checksum**: \`${diffSummary.evidence_hash}\`\n` +
+        `- **Byte Size**: \`${diffSummary.byte_size} bytes\`\n` +
+        `- **Storage Type**: \`${diffSummary.storage_type}\``;
+    }
+
+    const testVerif = projection.authoritative_verification;
+    let verdictDisplay = '🔴 FAILED';
+    if (projection.recovery_fencing_state?.is_fenced) {
+      verdictDisplay = '⚠️ RECOVERY_FENCED / UNRESOLVED';
+    } else if (testVerif.verdict === 'PASSED') {
+      if (testVerif.exit_code !== 0 || !testVerif.test_run_id) {
+        throw new Error('VERIFIED_PROJECTION_INVALID: PASSED verdict requires exit_code === 0 and valid test_run_id');
+      }
+      verdictDisplay = '🟢 PASSED';
+    } else if (testVerif.verdict === 'FENCED') {
+      verdictDisplay = '⚠️ RECOVERY_FENCED / UNRESOLVED';
+    } else if (testVerif.verdict === 'TIMEOUT') {
+      verdictDisplay = '⏱️ TIMEOUT';
+    } else if (testVerif.verdict === 'NOT_RUN') {
+      verdictDisplay = '⚠️ NOT RUN';
+    } else {
+      verdictDisplay = '🔴 FAILED';
+    }
+
+    const testEvidenceText = testVerif.test_run_id
+      ? `
+- **Test Run ID**: \`${testVerif.test_run_id}\`
+- **Command Snapshot SHA-256**: \`${testVerif.command_snapshot_hash || 'None'}\`
+- **Command**: \`${testVerif.command}\`
+- **Authoritative Verdict**: ${verdictDisplay} (Verdict: \`${testVerif.verdict}\`, Exit Code: \`${testVerif.exit_code !== null ? testVerif.exit_code : 'None'}\`)
+- **Metrics**: ${testVerif.passed_count} Passed | ${testVerif.failed_count} Failed | ${testVerif.skipped_count} Skipped
+- **Duration**: ${testVerif.duration_ms}ms
+- **Evidence Reference**: \`${testVerif.test_result_evidence_id || 'INLINE'}\`
+`
+      : `⚠️ [TEST EVIDENCE UNAVAILABLE / NOT RUN / ERROR] (${verdictDisplay})`;
+
+    const claim = projection.untrusted_claim;
+    const gitStatus = projection.authoritative_git_status;
+
+    return `# REVIEW PACKAGE: ${projection.task_id} — ${projection.task_title}
+
+## Task Overview
+- **Project**: ${projection.project_name} (${projection.project_id})
+- **Task ID**: \`${projection.task_id}\`
+- **Priority**: \`${projection.task_priority}\` | **Risk**: \`${projection.task_risk}\`
+- **Current Revision**: ${projection.task_revision_count} / ${projection.task_max_revisions}
+- **Base SHA**: \`${projection.task_base_sha}\`
+- **Working SHA**: \`${projection.task_working_sha}\`
+
+### Acceptance Criteria
+${criteriaList}
+
+---
+
+## Authoritative Verification Evidence (Ground Truth)
+
+### Owner Adjudication
+- **Adjudication ID**: \`${projection.adjudication_id}\`
+- **Fencing State**: ${projection.recovery_fencing_state?.is_fenced ? `RECOVERY_FENCED (${projection.recovery_fencing_state.failure_code || 'UNSPECIFIED'})` : 'NORMAL'}
+- **Disposition**: ${projection.operator_disposition?.disposition_event || 'NONE'}
+- **Projection Hash**: \`${projection.projection_hash}\`
+
+### Authoritative Test Evidence
+${testEvidenceText}
+
+### Git Status Evidence
+- **Evidence ID**: \`${gitStatus?.evidence_id || 'None'}\`
+- **SHA-256 Checksum**: \`${gitStatus?.evidence_hash || 'None'}\`
+- **Storage Type**: \`${gitStatus?.storage_type || 'None'}\`
+
+### Git Diff Evidence
+- **Evidence ID**: \`${diffSummary?.evidence_id || 'None'}\`
+- **SHA-256 Checksum**: \`${diffSummary?.evidence_hash || 'None'}\`
+- **Byte Size**: \`${diffSummary?.byte_size ?? 0} bytes\`
+- **Storage Type**: \`${diffSummary?.storage_type || 'None'}\`
+
+\`\`\`diff
+${formattedDiff}
+\`\`\`
+
+---
+
+### Coder Claims (Unverified)
+*(Non-Authoritative — Untrusted Coder Claim)*
+- **Submission ID**: \`${projection.submission_id}\`
+- **Claim Content SHA-256**: \`${claim.claim_content_hash}\`
+- **Summary**: ${claim.summary || 'No summary provided.'}
+- **Completed Items**:
+${claim.completed.length > 0 ? claim.completed.map((c) => `  - ${c}`).join('\n') : '  - None'}
+- **Files Claimed Changed**:
+${claim.files_claimed_changed.length > 0 ? claim.files_claimed_changed.map((f) => `  - \`${f}\``).join('\n') : '  - None'}
+- **Tests Claimed**:
+${claim.tests_claimed.length > 0 ? claim.tests_claimed.map((t) => `  - ${t}`).join('\n') : '  - None'}
+- **Blockers**:
+${claim.blockers.length > 0 ? claim.blockers.map((b) => `  - ${b}`).join('\n') : '  - None'}
+
+---
+
+## Previous Review History
+${issuesText}
+
+---
+
+## Required Response Protocol (\`manager.v1\`)
+Evaluate the authoritative evidence above against the acceptance criteria and return your verdict in the following JSON format:
+
+\`\`\`json
+{
+  "protocol": "manager.v1",
+  "message_id": "msg-mgr-${projection.task_id}-${projection.projection_hash.slice(0, 16)}",
+  "project_id": "${projection.project_id}",
+  "task_id": "${projection.task_id}",
+  "decision": "PASS | FIX_REQUIRED | BLOCK | NEEDS_OWNER",
+  "priority": "${projection.task_priority}",
+  "risk": "${projection.task_risk}",
+  "instructions": [
+    "Specific feedback or next instructions"
+  ],
+  "acceptance_criteria": [
+    "Remaining criteria if fix required"
+  ],
+  "review_issues": [
+    {
+      "severity": "BLOCKER | REQUIRED | OPTIONAL | NIT",
+      "title": "Issue title",
+      "file_path": "src/file.ts",
+      "description": "Specific issue description"
+    }
+  ],
+  "expected_task_state": "REVIEWING",
+  "expected_revision": ${projection.task_revision_count}
+}
+\`\`\`
+`;
+  }
+
   public static generateReviewPackage(
     project: Project,
     task: Task,
@@ -370,10 +587,34 @@ Guidelines:
     gitDiffContent: string,
     testRun: TestRun | null,
     previousReviews: Review[] = [],
-    gitDiffEvidence?: Evidence | null
+    gitDiffEvidence?: Evidence | null,
+    adjudicationProjection?: VerifiedAdjudicationReviewProjection | Record<string, unknown> | null
   ): string {
-    const criteriaList = task.acceptance_criteria.length > 0
-      ? task.acceptance_criteria.map((c, i) => `${i + 1}. ${c}`).join('\n')
+    if (adjudicationProjection !== undefined && adjudicationProjection !== null) {
+      const candidate = adjudicationProjection as unknown as Record<string, unknown>;
+      if (
+        typeof candidate !== 'object' ||
+        'adjudication' in candidate ||
+        'submission' in candidate ||
+        !('projection_hash' in candidate)
+      ) {
+        throw new Error(
+          'LEGACY_LINKAGE_REJECTED: Adjudication review package generation requires VerifiedAdjudicationReviewProjection.'
+        );
+      }
+      return PackageGenerator.renderVerifiedAdjudicationReviewProjection(
+        adjudicationProjection as VerifiedAdjudicationReviewProjection
+      );
+    }
+
+    const taskRecord = task as unknown as Record<string, unknown>;
+    const criteria = Array.isArray(task.acceptance_criteria)
+      ? task.acceptance_criteria
+      : (typeof taskRecord.acceptance_criteria_json === 'string'
+          ? (JSON.parse(taskRecord.acceptance_criteria_json) as string[])
+          : []);
+    const criteriaList = criteria.length > 0
+      ? criteria.map((c: string, i: number) => `${i + 1}. ${c}`).join('\n')
       : 'None specified.';
 
     const previousIssuesList = previousReviews.flatMap((r) => r.issues || []);
@@ -382,6 +623,27 @@ Guidelines:
           .map((iss) => `- **[${iss.severity}]** ${iss.title} (${iss.file_path || 'general'}): ${iss.description}`)
           .join('\n')
       : 'No previous review issues.';
+
+    // Format Bounded Diff Content with Artifact Metadata for Large Diffs
+    const MAX_DIFF_LENGTH = 32 * 1024;
+    let formattedDiff = '';
+    if (!gitDiffContent || !gitDiffContent.trim()) {
+      formattedDiff = '(No git diff detected)';
+    } else if (gitDiffContent.length <= MAX_DIFF_LENGTH) {
+      formattedDiff = gitDiffContent;
+    } else {
+      const activeEv = gitDiffEvidence;
+      if (!activeEv) {
+        throw new Error('AUTHORITATIVE_DIFF_EVIDENCE_MISSING: Large Git diff cannot be rendered in review package without authoritative evidence record.');
+      }
+      formattedDiff =
+        gitDiffContent.substring(0, MAX_DIFF_LENGTH) +
+        `\n\n... [TRUNCATED: Diff is ${activeEv.byte_size} bytes]\n` +
+        `- **Evidence ID**: \`${activeEv.id}\`\n` +
+        `- **SHA-256 Checksum**: \`${activeEv.hash}\`\n` +
+        `- **Byte Size**: \`${activeEv.byte_size} bytes\`\n` +
+        `- **Storage Type**: \`${activeEv.storage_type}\`\n`;
+    }
 
     const coderClaimsText = coderReport
       ? `
@@ -404,26 +666,6 @@ ${coderReport.tests_claimed.map((t) => `  - ${t}`).join('\n') || '  - None'}
 - **Evidence Reference**: \`${testRun.evidence_id || 'INLINE'}\`
 `
       : '⚠️ [TEST EVIDENCE UNAVAILABLE / NOT RUN / ERROR]';
-
-    // Format Bounded Diff Content with Artifact Metadata for Large Diffs
-    const MAX_DIFF_LENGTH = 32 * 1024;
-    let formattedDiff = '';
-    if (!gitDiffContent || !gitDiffContent.trim()) {
-      formattedDiff = '(No git diff detected)';
-    } else if (gitDiffContent.length <= MAX_DIFF_LENGTH) {
-      formattedDiff = gitDiffContent;
-    } else {
-      if (!gitDiffEvidence) {
-        throw new Error('AUTHORITATIVE_DIFF_EVIDENCE_MISSING: Large Git diff cannot be rendered in review package without authoritative evidence record.');
-      }
-      formattedDiff =
-        gitDiffContent.substring(0, MAX_DIFF_LENGTH) +
-        `\n\n... [TRUNCATED: Diff is ${gitDiffEvidence.byte_size} bytes]\n` +
-        `- **Evidence ID**: \`${gitDiffEvidence.id}\`\n` +
-        `- **SHA-256 Checksum**: \`${gitDiffEvidence.hash}\`\n` +
-        `- **Byte Size**: \`${gitDiffEvidence.byte_size} bytes\`\n` +
-        `- **Storage Type**: \`${gitDiffEvidence.storage_type}\``;
-    }
 
     return `# REVIEW PACKAGE: ${task.id} — ${task.title}
 
@@ -473,7 +715,7 @@ Evaluate the authoritative evidence above against the acceptance criteria and re
 \`\`\`json
 {
   "protocol": "manager.v1",
-  "message_id": "msg-mgr-${task.id}-${Date.now()}",
+  "message_id": "msg-mgr-${task.id}-rev${task.revision_count}",
   "project_id": "${project.id}",
   "task_id": "${task.id}",
   "decision": "PASS | FIX_REQUIRED | BLOCK | NEEDS_OWNER",

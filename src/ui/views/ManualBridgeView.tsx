@@ -26,6 +26,10 @@ import {
 } from 'lucide-react';
 import { ProviderResource } from '../../core/types/domain';
 import { shouldRunCoderVerification } from '../../core/state/taskStateMachine';
+import {
+  QuarantinedSubmissionSummary,
+  QuarantinedSubmissionInspection,
+} from '../../core/types/adjudication';
 
 export const ManualBridgeView: React.FC = () => {
   const {
@@ -42,11 +46,18 @@ export const ManualBridgeView: React.FC = () => {
     dispatchAuthorization,
     getOwnerHandoffSnapshot,
     generateAuthorizedWorkOrder,
+    listQuarantinedSubmissions,
+    inspectQuarantinedSubmission,
+    admitQuarantinedSubmission,
+    rejectQuarantinedSubmission,
+    supersedeQuarantinedSubmission,
+    resumeAdmittedSubmission,
+    acknowledgeRecoveryFencedSubmission,
   } = useOrchestrator();
 
   const { t } = useI18n();
 
-  const [activeTab, setActiveTab] = useState<'routing-handoff' | 'manager-inbox' | 'coder-inbox' | 'outbox'>(
+  const [activeTab, setActiveTab] = useState<'routing-handoff' | 'manager-inbox' | 'quarantined-queue' | 'outbox'>(
     'routing-handoff'
   );
 
@@ -83,12 +94,22 @@ export const ManualBridgeView: React.FC = () => {
   const [managerApplyStatus, setManagerApplyStatus] = useState<string | null>(null);
 
   // ==========================================
-  // Coder Inbox State
+  // R5J5 Quarantined Submissions Queue State
   // ==========================================
-  const [coderInput, setCoderInput] = useState<string>('');
-  const [coderParseResult, setCoderParseResult] = useState<any>(null);
-  const [coderApplyStatus, setCoderApplyStatus] = useState<string | null>(null);
-  const [isVerifying, setIsVerifying] = useState<boolean>(false);
+  const [quarantinedSubmissions, setQuarantinedSubmissions] = useState<QuarantinedSubmissionSummary[]>([]);
+  const [loadingSubmissions, setLoadingSubmissions] = useState<boolean>(false);
+  const [selectedSubmissionId, setSelectedSubmissionId] = useState<string | null>(null);
+  const [submissionDetail, setSubmissionDetail] = useState<QuarantinedSubmissionInspection | null>(null);
+  const [loadingDetail, setLoadingDetail] = useState<boolean>(false);
+
+  const [confirmModalAction, setConfirmModalAction] = useState<
+    'ADMIT' | 'REJECT' | 'SUPERSEDE' | 'RESUME' | 'ACKNOWLEDGE' | null
+  >(null);
+  const [adjudicationReason, setAdjudicationReason] = useState<string>('');
+  const [replacementSubId, setReplacementSubId] = useState<string>('');
+  const [isAdjudicating, setIsAdjudicating] = useState<boolean>(false);
+  const [adjudicationFeedback, setAdjudicationFeedback] = useState<string | null>(null);
+  const [adjudicationError, setAdjudicationError] = useState<string | null>(null);
 
   // ==========================================
   // Outbox State
@@ -354,49 +375,122 @@ export const ManualBridgeView: React.FC = () => {
   };
 
   // ==========================================
-  // Coder Inbox Handlers
+  // R5J5 Quarantined Submissions Queue Handlers
   // ==========================================
-  const handleParseCoder = async () => {
-    if (!coderInput.trim()) return;
-    const res = await parseProtocol(coderInput);
-    setCoderParseResult(res);
-    setCoderApplyStatus(null);
-  };
-
-  const handleApplyCoder = async () => {
-    if (!coderInput.trim()) return;
-    setIsVerifying(true);
+  const loadSubmissions = useCallback(async () => {
+    setLoadingSubmissions(true);
     try {
-      const res = await applyProtocol(coderInput);
-      if (res.success) {
-        if (res.task?.id && shouldRunCoderVerification(res.task.state)) {
-          setCoderApplyStatus(
-            t('manualBridge.coderReportAppliedRunningTests', {
-              message: res.message || t('manualBridge.coderReportAppliedDefault'),
-            })
-          );
-          const verifRes = await runVerificationTests(res.task.id);
-          const outcome = verifRes.success ? t('manualBridge.testsPassed') : t('manualBridge.testsFailed');
-          setCoderApplyStatus(
-            t('manualBridge.coderReportAppliedWithTests', {
-              outcome,
-              code: (verifRes.testRun?.exit_code ?? 0).toString(),
-              state: verifRes.finalTaskState || '',
-            })
-          );
-        } else {
-          setCoderApplyStatus(res.message || t('manualBridge.coderReportAppliedDefault'));
+      const res = await listQuarantinedSubmissions({
+        projectId: activeProject?.id,
+      });
+      if (res && res.items) {
+        setQuarantinedSubmissions(res.items);
+        if (res.items.length > 0 && !selectedSubmissionId) {
+          setSelectedSubmissionId(res.items[0].id);
         }
-        await loadSnapshot();
-      } else {
-        const errorDetail = res.error || t('common.unknown');
-        setCoderApplyStatus(t('manualBridge.coderReportApplyError', { error: errorDetail }));
       }
-    } catch (err: any) {
-      const errorDetail = err.message || t('common.unknown');
-      setCoderApplyStatus(t('manualBridge.verificationError', { error: errorDetail }));
+    } catch {
+      // ignore
     } finally {
-      setIsVerifying(false);
+      setLoadingSubmissions(false);
+    }
+  }, [activeProject, listQuarantinedSubmissions, selectedSubmissionId]);
+
+  useEffect(() => {
+    if (activeTab === 'quarantined-queue') {
+      loadSubmissions();
+    }
+  }, [activeTab, loadSubmissions]);
+
+  useEffect(() => {
+    if (!selectedSubmissionId) {
+      setSubmissionDetail(null);
+      return;
+    }
+    let cancelled = false;
+    setLoadingDetail(true);
+    inspectQuarantinedSubmission(selectedSubmissionId)
+      .then((res) => {
+        if (!cancelled && res && res.detail) {
+          setSubmissionDetail(res.detail);
+        }
+      })
+      .catch(() => {
+        if (!cancelled) setSubmissionDetail(null);
+      })
+      .finally(() => {
+        if (!cancelled) setLoadingDetail(false);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [selectedSubmissionId, inspectQuarantinedSubmission]);
+
+  const handleExecuteAdjudication = async () => {
+    if (!selectedSubmissionId || !confirmModalAction) return;
+    setIsAdjudicating(true);
+    setAdjudicationError(null);
+    setAdjudicationFeedback(null);
+    try {
+      const activeAdj = submissionDetail?.adjudications && submissionDetail.adjudications.length > 0
+        ? submissionDetail.adjudications[submissionDetail.adjudications.length - 1]
+        : null;
+      const adjId = activeAdj?.id;
+      const expectedLifecycleVersion = typeof activeAdj?.lifecycle_version === 'number'
+        ? activeAdj.lifecycle_version
+        : 0;
+
+      let res: { success?: boolean; error?: string; message?: string } | undefined;
+      if (confirmModalAction === 'ADMIT') {
+        res = await admitQuarantinedSubmission(selectedSubmissionId, expectedLifecycleVersion);
+      } else if (confirmModalAction === 'REJECT') {
+        res = await rejectQuarantinedSubmission(
+          selectedSubmissionId,
+          expectedLifecycleVersion,
+          adjudicationReason.trim() || 'Rejected by Owner'
+        );
+      } else if (confirmModalAction === 'SUPERSEDE') {
+        res = await supersedeQuarantinedSubmission(
+          selectedSubmissionId,
+          expectedLifecycleVersion,
+          replacementSubId.trim(),
+          adjudicationReason.trim() || 'Superseded by Owner'
+        );
+      } else if (confirmModalAction === 'RESUME') {
+        if (!adjId) {
+          throw new Error('Active adjudication required to resume.');
+        }
+        res = await resumeAdmittedSubmission(selectedSubmissionId, adjId, expectedLifecycleVersion);
+      } else if (confirmModalAction === 'ACKNOWLEDGE') {
+        if (!adjId) {
+          throw new Error('Active adjudication required to acknowledge.');
+        }
+        res = await acknowledgeRecoveryFencedSubmission(
+          selectedSubmissionId,
+          adjId,
+          expectedLifecycleVersion,
+          'ACKNOWLEDGE'
+        );
+      }
+
+      if (res && res.success) {
+        setAdjudicationFeedback(t('quarantinedQueue.actionSuccessNotice'));
+        setConfirmModalAction(null);
+        setAdjudicationReason('');
+        setReplacementSubId('');
+        await loadSubmissions();
+        const detailRes = await inspectQuarantinedSubmission(selectedSubmissionId);
+        if (detailRes && detailRes.detail) {
+          setSubmissionDetail(detailRes.detail);
+        }
+      } else {
+        setAdjudicationError(res?.error || res?.message || t('quarantinedQueue.actionFailedNotice'));
+      }
+    } catch (err: unknown) {
+      const errorMsg = err instanceof Error ? err.message : String(err);
+      setAdjudicationError(errorMsg || t('quarantinedQueue.actionFailedNotice'));
+    } finally {
+      setIsAdjudicating(false);
     }
   };
 
@@ -503,15 +597,15 @@ export const ManualBridgeView: React.FC = () => {
             <span>{t('managerInbox.title')}</span>
           </button>
           <button
-            onClick={() => setActiveTab('coder-inbox')}
+            onClick={() => setActiveTab('quarantined-queue')}
             className={`px-3.5 py-1.5 rounded-md transition flex items-center space-x-2 ${
-              activeTab === 'coder-inbox'
+              activeTab === 'quarantined-queue'
                 ? 'bg-forge-cyan/20 text-forge-cyan font-bold border border-forge-cyan/40 shadow'
                 : 'text-slate-400 hover:text-slate-200'
             }`}
           >
             <Terminal className="w-3.5 h-3.5" />
-            <span>{t('coderInbox.title')}</span>
+            <span>{t('quarantinedQueue.title')}</span>
           </button>
           <button
             onClick={() => setActiveTab('outbox')}
@@ -1072,7 +1166,7 @@ export const ManualBridgeView: React.FC = () => {
                     </div>
 
                     <button
-                      onClick={() => setActiveTab('coder-inbox')}
+                      onClick={() => setActiveTab('quarantined-queue')}
                       className="px-4 py-2 bg-forge-cyan hover:bg-cyan-500 text-slate-950 font-bold rounded-lg shadow transition flex items-center space-x-2 shrink-0"
                     >
                       <Terminal className="w-4 h-4" />
@@ -1190,96 +1284,355 @@ export const ManualBridgeView: React.FC = () => {
       )}
 
       {/* ========================================================================= */}
-      {/* TAB 3: CODER INBOX */}
+      {/* TAB 3: QUARANTINED SUBMISSIONS QUEUE (R5J5) */}
       {/* ========================================================================= */}
-      {activeTab === 'coder-inbox' && (
-        <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
-          {/* Left: Coder Input Textarea */}
-          <div className="bg-surface-card border border-surface-border rounded-xl p-5 shadow space-y-4 flex flex-col justify-between">
-            <div className="space-y-2">
-              <div className="flex items-center justify-between">
-                <label className="text-xs font-mono font-semibold text-slate-300 flex items-center space-x-2">
-                  <Terminal className="w-4 h-4 text-forge-cyan" />
-                  <span>{t('coderInbox.pasteLabel')}</span>
-                </label>
-                <span className="text-[11px] text-slate-500 font-mono">{t('coderInbox.requiresProtocolHint')}</span>
+      {activeTab === 'quarantined-queue' && (
+        <div className="grid grid-cols-1 lg:grid-cols-12 gap-6">
+          {/* Left: Quarantined Submissions List (5 cols) */}
+          <div className="lg:col-span-5 bg-surface-card border border-surface-border rounded-xl p-5 shadow space-y-4">
+            <div className="flex items-center justify-between">
+              <div>
+                <h3 className="text-xs font-mono font-semibold text-slate-300 uppercase tracking-wider">
+                  {t('quarantinedQueue.candidateListTitle')}
+                </h3>
+                <p className="text-[11px] text-slate-500 font-mono">
+                  {t('quarantinedQueue.subtitle')}
+                </p>
               </div>
-              <textarea
-                value={coderInput}
-                onChange={(e) => setCoderInput(e.target.value)}
-                placeholder={t('coderInbox.placeholder')}
-                className="w-full h-80 bg-surface border border-surface-border rounded-lg p-3.5 text-xs text-slate-100 font-mono focus:outline-none focus:border-forge-cyan resize-none"
-              />
+              <button
+                onClick={loadSubmissions}
+                disabled={loadingSubmissions}
+                className="px-2.5 py-1.5 bg-surface hover:bg-surface-border text-slate-300 rounded border border-surface-border text-xs font-mono flex items-center space-x-1.5 transition"
+              >
+                <RefreshCw className={`w-3.5 h-3.5 ${loadingSubmissions ? 'animate-spin' : ''}`} />
+                <span>{t('quarantinedQueue.refresh')}</span>
+              </button>
             </div>
 
-            <div className="flex items-center justify-between pt-2">
-              <button
-                onClick={() => setCoderInput('')}
-                className="text-xs text-slate-400 hover:text-slate-200 font-mono"
-              >
-                {t('common.clear')}
-              </button>
-              <button
-                onClick={handleParseCoder}
-                className="px-4 py-2 bg-forge-cyan hover:bg-cyan-600 text-slate-950 font-mono font-bold text-xs rounded-lg shadow flex items-center space-x-2 transition"
-              >
-                <Sparkles className="w-4 h-4" />
-                <span>{t('coderInbox.parseReportButton')}</span>
-              </button>
-            </div>
+            {quarantinedSubmissions.length === 0 ? (
+              <div className="h-72 flex flex-col items-center justify-center text-slate-500 space-y-2 border border-dashed border-surface-border rounded-lg p-6 text-center">
+                <FileCheck className="w-8 h-8 text-slate-600" />
+                <span className="text-xs font-mono">{t('quarantinedQueue.noSubmissions')}</span>
+              </div>
+            ) : (
+              <div className="space-y-2 max-h-[580px] overflow-y-auto pr-1">
+                {quarantinedSubmissions.map((sub) => {
+                  const isSelected = sub.id === selectedSubmissionId;
+                  const isFenced = sub.integrity_status === 'FENCED_INTEGRITY_CONFLICT';
+
+                  let statusBadge = (
+                    <span className="px-1.5 py-0.5 rounded text-[10px] font-mono bg-slate-800 text-slate-400 border border-slate-700">
+                      {sub.active_adjudication?.status || 'QUEUED'}
+                    </span>
+                  );
+                  if (sub.active_adjudication?.status === 'ADMITTED') {
+                    statusBadge = (
+                      <span className="px-1.5 py-0.5 rounded text-[10px] font-mono bg-blue-950/40 text-blue-400 border border-blue-800/50">
+                        {t('quarantinedQueue.statusAdmitted')}
+                      </span>
+                    );
+                  } else if (sub.active_adjudication?.status === 'VERIFYING') {
+                    statusBadge = (
+                      <span className="px-1.5 py-0.5 rounded text-[10px] font-mono bg-amber-950/40 text-amber-400 border border-amber-800/50 animate-pulse">
+                        {t('quarantinedQueue.statusVerifying')}
+                      </span>
+                    );
+                  } else if (sub.active_adjudication?.status === 'VERIFIED') {
+                    statusBadge = (
+                      <span className="px-1.5 py-0.5 rounded text-[10px] font-mono bg-emerald-950/40 text-emerald-400 border border-emerald-800/50">
+                        {t('quarantinedQueue.statusVerified')}
+                      </span>
+                    );
+                  } else if (sub.active_adjudication?.status === 'VERIFICATION_FAILED') {
+                    statusBadge = (
+                      <span className="px-1.5 py-0.5 rounded text-[10px] font-mono bg-rose-950/40 text-rose-400 border border-rose-800/50">
+                        {t('quarantinedQueue.statusVerificationFailed')}
+                      </span>
+                    );
+                  } else if (sub.active_adjudication?.status === 'RECOVERY_FENCED') {
+                    statusBadge = (
+                      <span className="px-1.5 py-0.5 rounded text-[10px] font-mono bg-orange-950/40 text-orange-400 border border-orange-800/50">
+                        {t('quarantinedQueue.statusRecoveryFenced')}
+                      </span>
+                    );
+                  }
+
+                  return (
+                    <div
+                      key={sub.id}
+                      onClick={() => setSelectedSubmissionId(sub.id)}
+                      className={`p-3 rounded-lg border text-xs font-mono cursor-pointer transition ${
+                        isSelected
+                          ? 'bg-surface border-forge-cyan shadow-sm'
+                          : 'bg-surface/50 border-surface-border hover:border-slate-600'
+                      }`}
+                    >
+                      <div className="flex items-center justify-between mb-1">
+                        <span className="font-bold text-slate-200">
+                          {sub.id.substring(0, 8)}...
+                        </span>
+                        {statusBadge}
+                      </div>
+                      <div className="text-[11px] text-slate-400 mb-1">
+                        Task: <strong className="text-forge-cyan">{sub.task_id}</strong>
+                      </div>
+                      <div className="flex items-center justify-between text-[10px]">
+                        <span className="text-slate-500">{new Date(sub.submitted_at).toLocaleTimeString()}</span>
+                        {isFenced ? (
+                          <span className="text-rose-400 font-semibold flex items-center space-x-1">
+                            <AlertTriangle className="w-3 h-3" />
+                            <span>{t('quarantinedQueue.integrityFenced')}</span>
+                          </span>
+                        ) : (
+                          <span className="text-emerald-400 font-semibold flex items-center space-x-1">
+                            <CheckCircle2 className="w-3 h-3" />
+                            <span>{t('quarantinedQueue.integrityValid')}</span>
+                          </span>
+                        )}
+                      </div>
+                    </div>
+                  );
+                })}
+              </div>
+            )}
           </div>
 
-          {/* Right: Validation & Verification Trigger */}
-          <div className="bg-surface-card border border-surface-border rounded-xl p-5 shadow space-y-4">
+          {/* Right: Inspection & Owner Adjudication Controls (7 cols) */}
+          <div className="lg:col-span-7 bg-surface-card border border-surface-border rounded-xl p-5 shadow space-y-4">
             <h3 className="text-xs font-mono font-semibold text-slate-300 uppercase tracking-wider">
-              {t('coderInbox.claimsVsEvidenceTitle')}
+              {t('quarantinedQueue.inspectTitle')}
             </h3>
 
-            {!coderParseResult ? (
-              <div className="h-80 flex flex-col items-center justify-center text-slate-500 space-y-2 border border-dashed border-surface-border rounded-lg p-6 text-center">
-                <FileCheck className="w-8 h-8 text-slate-600" />
-                <span className="text-xs font-mono">{t('coderInbox.emptyParseHint')}</span>
+            {!selectedSubmissionId || !submissionDetail ? (
+              <div className="h-96 flex flex-col items-center justify-center text-slate-500 space-y-2 border border-dashed border-surface-border rounded-lg p-6 text-center">
+                <Shield className="w-8 h-8 text-slate-600" />
+                <span className="text-xs font-mono">Select a quarantined submission from the queue to inspect authority bindings and take action.</span>
               </div>
-            ) : coderParseResult.success ? (
+            ) : (
               <div className="space-y-4 text-xs font-mono">
-                <div className="p-3 bg-emerald-950/20 border border-emerald-800/30 rounded-lg text-emerald-300 flex items-center space-x-2">
-                  <Check className="w-4 h-4 text-emerald-400 shrink-0" />
-                  <span>
-                    {t('coderInbox.validReportDetected', {
-                      protocolType: coderParseResult.protocolType || 'coder.v1',
-                    })}
-                  </span>
-                </div>
-
-                <div className="bg-surface p-4 rounded-lg border border-surface-border space-y-2">
-                  <div>{t('managerInbox.targetTaskLabel')}: <strong className="text-forge-cyan">{coderParseResult.data?.data?.task_id}</strong></div>
-                  <div>{t('coderInbox.claimedStatusLabel')}: <span className="text-white font-bold">{coderParseResult.data?.data?.status}</span></div>
-                  <div>{t('coderInbox.filesChanged')}: <span className="text-slate-300">{coderParseResult.data?.data?.files_claimed_changed?.join(', ') || t('common.none')}</span></div>
-                  <div>{t('coderInbox.testsClaimed')}: <span className="text-slate-300">{coderParseResult.data?.data?.tests_claimed?.join(', ') || t('common.none')}</span></div>
-                </div>
-
-                {coderApplyStatus && (
-                  <div className={`p-3 rounded-lg border ${coderApplyStatus.startsWith('Success') ? 'bg-emerald-950/30 border-emerald-800/40 text-emerald-300' : 'bg-rose-950/30 border-rose-800/40 text-rose-300'}`}>
-                    {coderApplyStatus}
+                {/* Feedback notices */}
+                {adjudicationFeedback && (
+                  <div className="p-3 bg-emerald-950/30 border border-emerald-800/40 rounded-lg text-emerald-300 flex items-center space-x-2">
+                    <CheckCircle2 className="w-4 h-4 text-emerald-400 shrink-0" />
+                    <span>{adjudicationFeedback}</span>
+                  </div>
+                )}
+                {adjudicationError && (
+                  <div className="p-3 bg-rose-950/30 border border-rose-800/40 rounded-lg text-rose-300 flex items-center space-x-2">
+                    <AlertCircle className="w-4 h-4 text-rose-400 shrink-0" />
+                    <span>{adjudicationError}</span>
                   </div>
                 )}
 
-                <button
-                  onClick={handleApplyCoder}
-                  disabled={isVerifying}
-                  className="w-full py-2.5 bg-forge-cyan hover:bg-cyan-500 text-slate-950 font-mono font-bold text-xs rounded-lg shadow-lg flex items-center justify-center space-x-2 transition disabled:opacity-50"
-                >
-                  <Play className="w-4 h-4 fill-current" />
-                  <span>{isVerifying ? t('coderInbox.runningAutomatedTestsButton') : t('coderInbox.applyRunVerificationButton')}</span>
-                </button>
-              </div>
-            ) : (
-              <div className="p-4 bg-rose-950/20 border border-rose-800/30 rounded-lg text-xs font-mono text-rose-300 space-y-2">
-                <div className="flex items-center space-x-2 font-bold">
-                  <AlertCircle className="w-4 h-4 text-rose-400" />
-                  <span>{t('coderInbox.validationErrorTitle')}</span>
+                {/* Integrity Fenced Banner */}
+                {submissionDetail.integrity_status === 'FENCED_INTEGRITY_CONFLICT' && (
+                  <div className="p-3 bg-rose-950/40 border border-rose-800/60 rounded-lg text-rose-300 space-y-1">
+                    <div className="font-bold flex items-center space-x-2">
+                      <AlertTriangle className="w-4 h-4 text-rose-400 shrink-0" />
+                      <span>{t('quarantinedQueue.integrityFencedNotice')}</span>
+                    </div>
+                    {submissionDetail.integrity_fenced_reasons?.map((r: string, idx: number) => (
+                      <div key={idx} className="text-[11px] text-rose-400 pl-6">• {r}</div>
+                    ))}
+                  </div>
+                )}
+
+                {/* Authority Bindings */}
+                <div className="p-3.5 bg-surface rounded-lg border border-surface-border space-y-1.5 text-[11px]">
+                  <div className="font-bold text-slate-300 text-xs mb-1 flex items-center space-x-2">
+                    <Lock className="w-3.5 h-3.5 text-forge-amber" />
+                    <span>{t('quarantinedQueue.authorityBindingsTitle')}</span>
+                  </div>
+                  <div className="grid grid-cols-2 gap-2">
+                    <div>Submission ID: <span className="text-slate-200">{submissionDetail.submission?.id}</span></div>
+                    <div>Task ID: <span className="text-forge-cyan">{submissionDetail.submission?.task_id}</span></div>
+                    <div>Authorization ID: <span className="text-slate-200">{submissionDetail.submission?.authorization_id}</span></div>
+                    <div>Epoch: <span className="text-slate-200">{submissionDetail.submission?.task_ownership_epoch}</span></div>
+                    <div>Base SHA: <span className="text-slate-300 font-mono">{submissionDetail.submission?.base_sha?.substring(0, 10)}...</span></div>
+                    <div>Authorized HEAD: <span className="text-slate-300 font-mono">{submissionDetail.submission?.authorized_head_sha?.substring(0, 10)}...</span></div>
+                  </div>
                 </div>
-                <p className="text-slate-300">{coderParseResult.error}</p>
+
+                {/* Untrusted Coder Claim */}
+                <div className="p-3.5 bg-surface rounded-lg border border-surface-border space-y-2 text-[11px]">
+                  <div className="flex items-center justify-between">
+                    <span className="font-bold text-slate-300 text-xs flex items-center space-x-2">
+                      <Terminal className="w-3.5 h-3.5 text-forge-cyan" />
+                      <span>{t('quarantinedQueue.untrustedClaimTitle')}</span>
+                    </span>
+                    <span className="text-[10px] text-amber-400 bg-amber-950/30 px-2 py-0.5 rounded border border-amber-800/40">
+                      {t('quarantinedQueue.nonAuthoritativeBadge')}
+                    </span>
+                  </div>
+                  <div className="text-slate-400 italic">
+                    "{submissionDetail.untrusted_claim?.summary || t('quarantinedQueue.noSummaryProvided')}"
+                  </div>
+                  <div className="space-y-1 text-slate-300">
+                    <div>{t('quarantinedQueue.filesClaimed')}: <span className="text-slate-200">{submissionDetail.untrusted_claim?.files_claimed_changed?.join(', ') || t('quarantinedQueue.none')}</span></div>
+                    <div>{t('quarantinedQueue.testsClaimed')}: <span className="text-slate-200">{submissionDetail.untrusted_claim?.tests_claimed?.join(', ') || t('quarantinedQueue.none')}</span></div>
+                    <div>{t('quarantinedQueue.blockers')}: <span className="text-slate-200">{submissionDetail.untrusted_claim?.blockers?.join(', ') || t('quarantinedQueue.none')}</span></div>
+                  </div>
+                </div>
+
+                {/* Adjudication Status / History */}
+                {submissionDetail.adjudications && submissionDetail.adjudications.length > 0 && (
+                  <div className="p-3 bg-surface rounded-lg border border-surface-border space-y-2 text-[11px]">
+                    <div className="font-bold text-slate-300 text-xs">
+                      {t('quarantinedQueue.adjudicationHistoryTitle')}
+                    </div>
+                    {submissionDetail.adjudications.map((adj) => (
+                      <div key={adj.id} className="p-2 bg-surface-card rounded border border-surface-border/60 flex items-center justify-between">
+                        <div>
+                          <span className="font-bold text-slate-200">{adj.action}</span>
+                          <span className="text-slate-500 ml-2">({adj.status}, v{adj.lifecycle_version})</span>
+                        </div>
+                        <span className="text-slate-400 text-[10px]">{new Date(adj.created_at).toLocaleTimeString()}</span>
+                      </div>
+                    ))}
+                  </div>
+                )}
+
+                {/* Owner Adjudication Action Controls */}
+                <div className="pt-2 border-t border-surface-border space-y-3">
+                  <div className="font-bold text-slate-300 text-xs">
+                    {t('quarantinedQueue.adjudicationActionsTitle')}
+                  </div>
+
+                  <div className="flex flex-wrap gap-2.5">
+                    {/* Admit button */}
+                    <button
+                      onClick={() => setConfirmModalAction('ADMIT')}
+                      disabled={
+                        isAdjudicating ||
+                        submissionDetail.integrity_status === 'FENCED_INTEGRITY_CONFLICT' ||
+                        submissionDetail.adjudications?.some((a) => a.status === 'ADMITTED' || a.status === 'VERIFYING')
+                      }
+                      className="px-3.5 py-2 bg-emerald-600 hover:bg-emerald-500 text-white font-mono font-bold text-xs rounded-lg shadow flex items-center space-x-1.5 transition disabled:opacity-40 disabled:cursor-not-allowed"
+                    >
+                      <Check className="w-3.5 h-3.5" />
+                      <span>{t('quarantinedQueue.admitButton')}</span>
+                    </button>
+
+                    {/* Reject button */}
+                    <button
+                      onClick={() => setConfirmModalAction('REJECT')}
+                      disabled={isAdjudicating}
+                      className="px-3.5 py-2 bg-rose-700 hover:bg-rose-600 text-white font-mono font-bold text-xs rounded-lg shadow flex items-center space-x-1.5 transition disabled:opacity-40"
+                    >
+                      <XCircle className="w-3.5 h-3.5" />
+                      <span>{t('quarantinedQueue.rejectButton')}</span>
+                    </button>
+
+                    {/* Supersede button */}
+                    <button
+                      onClick={() => setConfirmModalAction('SUPERSEDE')}
+                      disabled={isAdjudicating}
+                      className="px-3.5 py-2 bg-purple-700 hover:bg-purple-600 text-white font-mono font-bold text-xs rounded-lg shadow flex items-center space-x-1.5 transition disabled:opacity-40"
+                    >
+                      <ArrowLeftRight className="w-3.5 h-3.5" />
+                      <span>{t('quarantinedQueue.supersedeButton')}</span>
+                    </button>
+
+                    {/* Resume button for ADMITTED pre-start */}
+                    {submissionDetail.adjudications?.some((a) => a.status === 'ADMITTED') && (
+                      <button
+                        onClick={() => setConfirmModalAction('RESUME')}
+                        disabled={isAdjudicating}
+                        className="px-3.5 py-2 bg-cyan-700 hover:bg-cyan-600 text-white font-mono font-bold text-xs rounded-lg shadow flex items-center space-x-1.5 transition disabled:opacity-40"
+                      >
+                        <Play className="w-3.5 h-3.5" />
+                        <span>{t('quarantinedQueue.resumeButton')}</span>
+                      </button>
+                    )}
+
+                    {/* Acknowledge button for RECOVERY_FENCED */}
+                    {submissionDetail.adjudications?.some((a) => a.status === 'RECOVERY_FENCED') && (
+                      <button
+                        onClick={() => setConfirmModalAction('ACKNOWLEDGE')}
+                        disabled={isAdjudicating}
+                        className="px-3.5 py-2 bg-orange-700 hover:bg-orange-600 text-white font-mono font-bold text-xs rounded-lg shadow flex items-center space-x-1.5 transition disabled:opacity-40"
+                      >
+                        <Shield className="w-3.5 h-3.5" />
+                        <span>{t('quarantinedQueue.acknowledgeButton')}</span>
+                      </button>
+                    )}
+                  </div>
+                </div>
+
+                {/* Explicit Confirmation Modal */}
+                {confirmModalAction && (
+                  <div className="p-4 bg-surface rounded-lg border border-forge-amber/60 shadow-lg space-y-3">
+                    <div className="flex items-center space-x-2 text-forge-amber font-bold text-xs">
+                      <AlertTriangle className="w-4 h-4" />
+                      <span>
+                        {confirmModalAction === 'ADMIT' && t('quarantinedQueue.confirmAdmitTitle')}
+                        {confirmModalAction === 'REJECT' && t('quarantinedQueue.confirmRejectTitle')}
+                        {confirmModalAction === 'SUPERSEDE' && t('quarantinedQueue.confirmSupersedeTitle')}
+                        {confirmModalAction === 'RESUME' && t('quarantinedQueue.confirmResumeTitle')}
+                        {confirmModalAction === 'ACKNOWLEDGE' && t('quarantinedQueue.confirmAcknowledgeTitle')}
+                      </span>
+                    </div>
+
+                    <p className="text-slate-300 text-[11px]">
+                      {confirmModalAction === 'ADMIT' && t('quarantinedQueue.confirmAdmitMessage')}
+                      {confirmModalAction === 'REJECT' && t('quarantinedQueue.confirmRejectMessage')}
+                      {confirmModalAction === 'SUPERSEDE' && t('quarantinedQueue.confirmSupersedeMessage')}
+                      {confirmModalAction === 'RESUME' && t('quarantinedQueue.confirmResumeMessage')}
+                      {confirmModalAction === 'ACKNOWLEDGE' && t('quarantinedQueue.confirmAcknowledgeMessage')}
+                    </p>
+
+                    {(confirmModalAction === 'REJECT' || confirmModalAction === 'SUPERSEDE') && (
+                      <div className="space-y-1">
+                        <label className="text-[10px] text-slate-400">
+                          {confirmModalAction === 'REJECT' ? t('quarantinedQueue.rejectReasonLabel') : t('quarantinedQueue.supersedeReasonLabel')}
+                        </label>
+                        <input
+                          type="text"
+                          value={adjudicationReason}
+                          onChange={(e) => setAdjudicationReason(e.target.value)}
+                          placeholder={confirmModalAction === 'REJECT' ? t('quarantinedQueue.rejectReasonPlaceholder') : t('quarantinedQueue.supersedeReasonPlaceholder')}
+                          className="w-full bg-surface-card border border-surface-border rounded px-2.5 py-1.5 text-xs text-white focus:outline-none focus:border-forge-amber"
+                        />
+                      </div>
+                    )}
+
+                    {confirmModalAction === 'SUPERSEDE' && (
+                      <div className="space-y-1">
+                        <label className="text-[10px] text-slate-400">
+                          {t('quarantinedQueue.replacementSubmissionIdLabel')}
+                        </label>
+                        <input
+                          type="text"
+                          value={replacementSubId}
+                          onChange={(e) => setReplacementSubId(e.target.value)}
+                          placeholder={t('quarantinedQueue.replacementSubmissionIdPlaceholder')}
+                          className="w-full bg-surface-card border border-surface-border rounded px-2.5 py-1.5 text-xs text-white focus:outline-none focus:border-forge-amber font-mono"
+                        />
+                      </div>
+                    )}
+
+                    <div className="flex items-center justify-end space-x-2 pt-1">
+                      <button
+                        onClick={() => {
+                          setConfirmModalAction(null);
+                          setAdjudicationReason('');
+                          setReplacementSubId('');
+                        }}
+                        disabled={isAdjudicating}
+                        className="px-3 py-1.5 bg-surface hover:bg-surface-border text-slate-400 rounded text-xs transition"
+                      >
+                        {t('common.cancel')}
+                      </button>
+                      <button
+                        onClick={handleExecuteAdjudication}
+                        disabled={isAdjudicating || (confirmModalAction === 'SUPERSEDE' && !replacementSubId.trim())}
+                        className="px-4 py-1.5 bg-forge-amber hover:bg-amber-500 text-slate-950 font-bold rounded text-xs transition disabled:opacity-40"
+                      >
+                        {isAdjudicating ? t('common.loading') : t('common.confirm')}
+                      </button>
+                    </div>
+                  </div>
+                )}
               </div>
             )}
           </div>

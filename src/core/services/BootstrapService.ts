@@ -18,6 +18,7 @@ import { GeminiCliAdapter } from '../adapters/GeminiCliAdapter';
 import { ProviderRoutingService } from './ProviderRoutingService';
 import { ProviderDispatchService } from './ProviderDispatchService';
 import { ExecutionAuthorizationService } from './ExecutionAuthorizationService';
+import { CoderSubmissionAdjudicationService } from './CoderSubmissionAdjudicationService';
 
 export interface BootstrapResult {
   db: Database.Database;
@@ -33,6 +34,7 @@ export interface BootstrapResult {
   providerRoutingService: ProviderRoutingService;
   providerDispatchService: ProviderDispatchService;
   executionAuthorizationService: ExecutionAuthorizationService;
+  coderSubmissionAdjudicationService: CoderSubmissionAdjudicationService;
 }
 
 export class BootstrapService {
@@ -155,6 +157,14 @@ export class BootstrapService {
     const executionAuthorizationService = new ExecutionAuthorizationService(repo, eventService);
     const providerDispatchService = new ProviderDispatchService(providerRegistry, repo, eventService);
 
+    // 7. Initialize R5J5 Coder Submission Adjudication Service
+    const coderSubmissionAdjudicationService = new CoderSubmissionAdjudicationService(
+      repo,
+      db,
+      verificationService,
+      eventService
+    );
+
     return {
       db,
       dbEngine,
@@ -169,6 +179,7 @@ export class BootstrapService {
       providerRoutingService,
       providerDispatchService,
       executionAuthorizationService,
+      coderSubmissionAdjudicationService,
     };
   }
 }

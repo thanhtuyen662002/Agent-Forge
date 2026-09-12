@@ -9,6 +9,8 @@ export interface EmergencyStopResult {
   tasksPaused: string[];
   projectsPaused: string[];
   timestamp: string;
+  unprovenProcesses?: number;
+  allTerminatedProven?: boolean;
 }
 
 export class EmergencyStopService {
@@ -17,11 +19,13 @@ export class EmergencyStopService {
     private eventService: EventService
   ) {}
 
-  public triggerEmergencyStop(reason: string = 'Owner Emergency Stop Triggered'): EmergencyStopResult {
+  public triggerEmergencyStop(
+    reason: string = 'Owner Emergency Stop Triggered'
+  ): Promise<EmergencyStopResult> & EmergencyStopResult {
     const now = new Date().toISOString();
 
-    // 1. Terminate all running child processes immediately
-    const processesTerminated = ProcessRunner.terminateAllProcesses();
+    // 1. Terminate all running child processes immediately and await truthfully
+    const termPromise = ProcessRunner.terminateAllProcesses();
 
     // 2. Pause all active running projects
     const allProjects = this.repo.getAllProjects();
@@ -32,13 +36,6 @@ export class EmergencyStopService {
         const nextStatus = ProjectStateMachine.transition(proj.status, 'PAUSE');
         this.repo.updateProjectStatus(proj.id, nextStatus);
         projectsPaused.push(proj.id);
-
-        this.eventService.record(
-          proj.id,
-          'EMERGENCY_STOP',
-          `Emergency stop triggered for project: ${proj.name}. Reason: ${reason}`,
-          { reason, processesTerminated }
-        );
       }
     }
 
@@ -63,12 +60,53 @@ export class EmergencyStopService {
       }
     }
 
-    return {
-      processesTerminated,
+    const syncResult: EmergencyStopResult = {
+      processesTerminated: 0,
       tasksPaused,
       projectsPaused,
       timestamp: now,
+      unprovenProcesses: 0,
+      allTerminatedProven: true,
     };
+
+    const recordEmergencyStopEvent = (summary: { count: number; unproven: number; allTerminatedProven: boolean }) => {
+      const provenTerminated = summary.allTerminatedProven ? summary.count : Math.max(0, summary.count - summary.unproven);
+      for (const projId of projectsPaused) {
+        const proj = this.repo.getProject(projId);
+        this.eventService.record(
+          projId,
+          'EMERGENCY_STOP',
+          `Emergency stop triggered for project: ${proj ? proj.name : projId}. Reason: ${reason}`,
+          {
+            reason,
+            processesTerminated: provenTerminated,
+            unprovenProcesses: summary.unproven,
+            allTerminatedProven: summary.allTerminatedProven,
+          }
+        );
+      }
+    };
+
+    // If there are no processes running, record project event immediately
+    if (ProcessRunner.getActiveProcessCount() === 0) {
+      recordEmergencyStopEvent({ count: 0, unproven: 0, allTerminatedProven: true });
+    }
+
+    const asyncPromise = (async (): Promise<EmergencyStopResult> => {
+      const summary = await termPromise;
+      const provenTerminated = summary.allTerminatedProven ? summary.count : Math.max(0, summary.count - summary.unproven);
+      syncResult.processesTerminated = provenTerminated;
+      syncResult.unprovenProcesses = summary.unproven;
+      syncResult.allTerminatedProven = summary.allTerminatedProven;
+
+      if (summary.count > 0 || summary.unproven > 0) {
+        recordEmergencyStopEvent(summary);
+      }
+
+      return syncResult;
+    })();
+
+    return Object.assign(asyncPromise, syncResult);
   }
 
   public resumeProject(projectId: string): boolean {

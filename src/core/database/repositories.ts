@@ -75,7 +75,13 @@ import {
   ExecutionRecoveryClassification,
   ExecutionRecoveryDisposition,
   ExecutionRecoveryState,
+  CoderSubmissionAdjudication,
+  CoderSubmissionAdjudicationEvent,
+  AdjudicationAction,
+  AdjudicationStatus,
+  AdjudicationEventType,
 } from '../types/domain';
+import type { CoderSubmissionWorkspaceLease, WorkspaceLeaseState } from '../types/adjudication';
 import type { ProviderDispatchExecutionResult } from '../services/ProviderDispatchService';
 import { ExecutionFailureClassifier } from '../services/ExecutionFailureClassifier';
 import { FailureHealthMutationPolicyService } from '../services/FailureHealthMutationPolicyService';
@@ -178,6 +184,10 @@ export interface CoderSubmissionDisposition {
 
 export class Repository {
   constructor(private db: Database.Database) {}
+
+  public getDatabase(): Database.Database {
+    return this.db;
+  }
 
   public runInTransaction<T>(fn: () => T): T {
     const tx = this.db.transaction(fn);
@@ -1242,6 +1252,11 @@ export class Repository {
     return this.getEvidenceById(id);
   }
 
+  public isEvidenceFilePathReferenced(filePath: string): boolean {
+    const row = this.db.prepare('SELECT 1 FROM evidence WHERE file_path = ? LIMIT 1').get(filePath);
+    return row !== undefined;
+  }
+
   // ==========================================
   // Reviews & Issues
   // ==========================================
@@ -1328,6 +1343,47 @@ export class Repository {
         event.type,
         event.summary,
         JSON.stringify(event.structured_payload),
+        event.timestamp
+      );
+  }
+
+  public createDeterministicGenericEvent(event: EventRecord): void {
+    const existing = this.db
+      .prepare('SELECT id, project_id, task_id, type, structured_payload_json FROM events WHERE id = ?')
+      .get(event.id) as Record<string, unknown> | undefined;
+
+    const payloadJson =
+      typeof event.structured_payload === 'string'
+        ? event.structured_payload
+        : JSON.stringify(event.structured_payload);
+
+    if (existing) {
+      if (
+        String(existing.type) === event.type &&
+        String(existing.project_id) === event.project_id &&
+        String(existing.structured_payload_json) === payloadJson
+      ) {
+        // Exact duplicate deterministic generic event -> no-op
+        return;
+      }
+      throw new Error(
+        `GENERIC_EVENT_COLLISION_CONFLICT: Deterministic generic event collision on "${event.id}" with differing payload or type.`
+      );
+    }
+
+    this.db
+      .prepare(`
+        INSERT INTO events (id, project_id, task_id, agent_id, type, summary, structured_payload_json, timestamp)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+      `)
+      .run(
+        event.id,
+        event.project_id,
+        event.task_id,
+        event.agent_id,
+        event.type,
+        event.summary,
+        payloadJson,
         event.timestamp
       );
   }
@@ -3861,6 +3917,621 @@ export class Repository {
       disposition_metadata_json: row.disposition_metadata_json != null ? String(row.disposition_metadata_json) : null,
       created_at: String(row.created_at),
     };
+  }
+
+  // ==========================================
+  // Coder Submission Adjudications (R5J5)
+  // ==========================================
+  public createCoderSubmissionAdjudication(adj: CoderSubmissionAdjudication): void {
+    this.db
+      .prepare(`
+        INSERT INTO coder_submission_adjudications (
+          id,
+          request_id,
+          submission_id,
+          authorization_id,
+          project_id,
+          task_id,
+          attempt_id,
+          assignment_id,
+          task_ownership_epoch,
+          action,
+          status,
+          lifecycle_version,
+          authority_snapshot_json,
+          authority_snapshot_hash,
+          verification_commands_json,
+          verification_commands_hash,
+          workspace_snapshot_before_json,
+          workspace_snapshot_before_hash,
+          verification_result_envelope_json,
+          verification_result_envelope_hash,
+          verification_execution_id,
+          protocol_message_id,
+          test_run_id,
+          git_status_evidence_id,
+          git_diff_evidence_id,
+          failure_code,
+          failure_json,
+          created_at,
+          verification_started_at,
+          completed_at,
+          recovery_fenced_at,
+          resolution_action,
+          resolution_timestamp,
+          resolution_evidence_json,
+          resolution_evidence_hash,
+          resolver_id,
+          artifact_manifest_json,
+          artifact_manifest_hash,
+          workspace_lease_id
+        ) VALUES (
+          ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+          ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+          ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+          ?, ?, ?, ?, ?, ?, ?, ?, ?
+        )
+      `)
+      .run(
+        adj.id,
+        adj.request_id,
+        adj.submission_id,
+        adj.authorization_id,
+        adj.project_id,
+        adj.task_id,
+        adj.attempt_id,
+        adj.assignment_id,
+        adj.task_ownership_epoch,
+        adj.action,
+        adj.status,
+        adj.lifecycle_version,
+        adj.authority_snapshot_json,
+        adj.authority_snapshot_hash,
+        adj.verification_commands_json ?? null,
+        adj.verification_commands_hash ?? null,
+        adj.workspace_snapshot_before_json ?? null,
+        adj.workspace_snapshot_before_hash ?? null,
+        adj.verification_result_envelope_json ?? null,
+        adj.verification_result_envelope_hash ?? null,
+        adj.verification_execution_id ?? null,
+        adj.protocol_message_id ?? null,
+        adj.test_run_id ?? null,
+        adj.git_status_evidence_id ?? null,
+        adj.git_diff_evidence_id ?? null,
+        adj.failure_code ?? null,
+        adj.failure_json ?? null,
+        adj.created_at,
+        adj.verification_started_at ?? null,
+        adj.completed_at ?? null,
+        adj.recovery_fenced_at ?? null,
+        adj.resolution_action ?? null,
+        adj.resolution_timestamp ?? null,
+        adj.resolution_evidence_json ?? null,
+        adj.resolution_evidence_hash ?? null,
+        adj.resolver_id ?? null,
+        adj.artifact_manifest_json ?? null,
+        adj.artifact_manifest_hash ?? null,
+        adj.workspace_lease_id ?? null
+      );
+  }
+
+  public updateCoderSubmissionAdjudication(
+    id: string,
+    expectedVersion: number,
+    updates: {
+      status?: AdjudicationStatus;
+      verification_execution_id?: string | null;
+      verification_started_at?: string | null;
+      workspace_snapshot_before_json?: string | null;
+      workspace_snapshot_before_hash?: string | null;
+      verification_result_envelope_json?: string | null;
+      verification_result_envelope_hash?: string | null;
+      protocol_message_id?: string | null;
+      test_run_id?: string | null;
+      git_status_evidence_id?: string | null;
+      git_diff_evidence_id?: string | null;
+      failure_code?: string | null;
+      failure_json?: string | null;
+      completed_at?: string | null;
+      recovery_fenced_at?: string | null;
+      resolution_action?: 'ACKNOWLEDGE' | 'CANCEL' | null;
+      resolution_timestamp?: string | null;
+      resolution_evidence_json?: string | null;
+      resolution_evidence_hash?: string | null;
+      resolver_id?: string | null;
+      artifact_manifest_json?: string | null;
+      artifact_manifest_hash?: string | null;
+      workspace_lease_id?: string | null;
+    }
+  ): boolean {
+    const setClauses: string[] = ['lifecycle_version = lifecycle_version + 1'];
+    const params: unknown[] = [];
+
+    if (updates.status !== undefined) {
+      setClauses.push('status = ?');
+      params.push(updates.status);
+    }
+    if (updates.verification_execution_id !== undefined) {
+      setClauses.push('verification_execution_id = ?');
+      params.push(updates.verification_execution_id);
+    }
+    if (updates.verification_started_at !== undefined) {
+      setClauses.push('verification_started_at = ?');
+      params.push(updates.verification_started_at);
+    }
+    if (updates.workspace_snapshot_before_json !== undefined) {
+      setClauses.push('workspace_snapshot_before_json = ?');
+      params.push(updates.workspace_snapshot_before_json);
+    }
+    if (updates.workspace_snapshot_before_hash !== undefined) {
+      setClauses.push('workspace_snapshot_before_hash = ?');
+      params.push(updates.workspace_snapshot_before_hash);
+    }
+    if (updates.verification_result_envelope_json !== undefined) {
+      setClauses.push('verification_result_envelope_json = ?');
+      params.push(updates.verification_result_envelope_json);
+    }
+    if (updates.verification_result_envelope_hash !== undefined) {
+      setClauses.push('verification_result_envelope_hash = ?');
+      params.push(updates.verification_result_envelope_hash);
+    }
+    if (updates.protocol_message_id !== undefined) {
+      setClauses.push('protocol_message_id = ?');
+      params.push(updates.protocol_message_id);
+    }
+    if (updates.test_run_id !== undefined) {
+      setClauses.push('test_run_id = ?');
+      params.push(updates.test_run_id);
+    }
+    if (updates.git_status_evidence_id !== undefined) {
+      setClauses.push('git_status_evidence_id = ?');
+      params.push(updates.git_status_evidence_id);
+    }
+    if (updates.git_diff_evidence_id !== undefined) {
+      setClauses.push('git_diff_evidence_id = ?');
+      params.push(updates.git_diff_evidence_id);
+    }
+    if (updates.failure_code !== undefined) {
+      setClauses.push('failure_code = ?');
+      params.push(updates.failure_code);
+    }
+    if (updates.failure_json !== undefined) {
+      setClauses.push('failure_json = ?');
+      params.push(updates.failure_json);
+    }
+    if (updates.completed_at !== undefined) {
+      setClauses.push('completed_at = ?');
+      params.push(updates.completed_at);
+    }
+    if (updates.recovery_fenced_at !== undefined) {
+      setClauses.push('recovery_fenced_at = ?');
+      params.push(updates.recovery_fenced_at);
+    }
+    if (updates.resolution_action !== undefined) {
+      setClauses.push('resolution_action = ?');
+      params.push(updates.resolution_action);
+    }
+    if (updates.resolution_timestamp !== undefined) {
+      setClauses.push('resolution_timestamp = ?');
+      params.push(updates.resolution_timestamp);
+    }
+    if (updates.resolution_evidence_json !== undefined) {
+      setClauses.push('resolution_evidence_json = ?');
+      params.push(updates.resolution_evidence_json);
+    }
+    if (updates.resolution_evidence_hash !== undefined) {
+      setClauses.push('resolution_evidence_hash = ?');
+      params.push(updates.resolution_evidence_hash);
+    }
+    if (updates.resolver_id !== undefined) {
+      setClauses.push('resolver_id = ?');
+      params.push(updates.resolver_id);
+    }
+    if (updates.artifact_manifest_json !== undefined) {
+      setClauses.push('artifact_manifest_json = ?');
+      params.push(updates.artifact_manifest_json);
+    }
+    if (updates.artifact_manifest_hash !== undefined) {
+      setClauses.push('artifact_manifest_hash = ?');
+      params.push(updates.artifact_manifest_hash);
+    }
+    if (updates.workspace_lease_id !== undefined) {
+      setClauses.push('workspace_lease_id = ?');
+      params.push(updates.workspace_lease_id);
+    }
+
+    params.push(id, expectedVersion);
+    const sql = `
+      UPDATE coder_submission_adjudications
+      SET ${setClauses.join(', ')}
+      WHERE id = ? AND lifecycle_version = ?
+    `;
+    const res = this.db.prepare(sql).run(...params);
+    return res.changes === 1;
+  }
+
+  public getCoderSubmissionAdjudicationById(id: string): CoderSubmissionAdjudication | null {
+    const row = this.db
+      .prepare('SELECT * FROM coder_submission_adjudications WHERE id = ?')
+      .get(id) as Record<string, unknown> | undefined;
+    if (!row) return null;
+    return this.mapCoderSubmissionAdjudication(row);
+  }
+
+  public getCoderSubmissionAdjudicationByRequestId(requestId: string): CoderSubmissionAdjudication | null {
+    const row = this.db
+      .prepare('SELECT * FROM coder_submission_adjudications WHERE request_id = ?')
+      .get(requestId) as Record<string, unknown> | undefined;
+    if (!row) return null;
+    return this.mapCoderSubmissionAdjudication(row);
+  }
+
+  public getActiveCoderSubmissionAdjudication(submissionId: string): CoderSubmissionAdjudication | null {
+    const row = this.db
+      .prepare(`
+        SELECT * FROM coder_submission_adjudications
+        WHERE submission_id = ? AND status IN ('ADMITTED', 'VERIFYING', 'RECOVERY_FENCED')
+        ORDER BY lifecycle_version DESC, created_at DESC
+        LIMIT 1
+      `)
+      .get(submissionId) as Record<string, unknown> | undefined;
+    if (!row) return null;
+    return this.mapCoderSubmissionAdjudication(row);
+  }
+
+  public getCoderSubmissionAdjudicationsBySubmission(submissionId: string): CoderSubmissionAdjudication[] {
+    const rows = this.db
+      .prepare('SELECT * FROM coder_submission_adjudications WHERE submission_id = ? ORDER BY created_at ASC, lifecycle_version ASC')
+      .all(submissionId) as Record<string, unknown>[];
+    return rows.map((r) => this.mapCoderSubmissionAdjudication(r));
+  }
+
+  public getCoderSubmissionAdjudicationsBySubmissionId(submissionId: string): CoderSubmissionAdjudication[] {
+    const rows = this.db
+      .prepare('SELECT * FROM coder_submission_adjudications WHERE submission_id = ? ORDER BY created_at DESC, lifecycle_version DESC')
+      .all(submissionId) as Record<string, unknown>[];
+    return rows.map((r) => this.mapCoderSubmissionAdjudication(r));
+  }
+
+  public getCoderSubmissionAdjudicationsByTask(taskId: string): CoderSubmissionAdjudication[] {
+    const rows = this.db
+      .prepare('SELECT * FROM coder_submission_adjudications WHERE task_id = ? ORDER BY created_at DESC, lifecycle_version DESC')
+      .all(taskId) as Record<string, unknown>[];
+    return rows.map((r) => this.mapCoderSubmissionAdjudication(r));
+  }
+
+  public getUnresolvedCoderSubmissionAdjudications(): CoderSubmissionAdjudication[] {
+    const rows = this.db
+      .prepare(`
+        SELECT * FROM coder_submission_adjudications
+        WHERE status IN ('ADMITTED', 'VERIFYING', 'RECOVERY_FENCED')
+        ORDER BY created_at ASC, lifecycle_version ASC
+      `)
+      .all() as Record<string, unknown>[];
+    return rows.map((r) => this.mapCoderSubmissionAdjudication(r));
+  }
+
+  private mapCoderSubmissionAdjudication(row: Record<string, unknown>): CoderSubmissionAdjudication {
+    return {
+      id: String(row.id),
+      request_id: String(row.request_id),
+      submission_id: String(row.submission_id),
+      authorization_id: String(row.authorization_id),
+      project_id: String(row.project_id),
+      task_id: String(row.task_id),
+      attempt_id: String(row.attempt_id),
+      assignment_id: String(row.assignment_id),
+      task_ownership_epoch: Number(row.task_ownership_epoch),
+      action: row.action as AdjudicationAction,
+      status: row.status as AdjudicationStatus,
+      lifecycle_version: Number(row.lifecycle_version),
+      authority_snapshot_json: String(row.authority_snapshot_json),
+      authority_snapshot_hash: String(row.authority_snapshot_hash),
+      verification_commands_json: row.verification_commands_json != null ? String(row.verification_commands_json) : null,
+      verification_commands_hash: row.verification_commands_hash != null ? String(row.verification_commands_hash) : null,
+      workspace_snapshot_before_json: row.workspace_snapshot_before_json != null ? String(row.workspace_snapshot_before_json) : null,
+      workspace_snapshot_before_hash: row.workspace_snapshot_before_hash != null ? String(row.workspace_snapshot_before_hash) : null,
+      verification_result_envelope_json: row.verification_result_envelope_json != null ? String(row.verification_result_envelope_json) : null,
+      verification_result_envelope_hash: row.verification_result_envelope_hash != null ? String(row.verification_result_envelope_hash) : null,
+      verification_execution_id: row.verification_execution_id != null ? String(row.verification_execution_id) : null,
+      protocol_message_id: row.protocol_message_id != null ? String(row.protocol_message_id) : null,
+      test_run_id: row.test_run_id != null ? String(row.test_run_id) : null,
+      git_status_evidence_id: row.git_status_evidence_id != null ? String(row.git_status_evidence_id) : null,
+      git_diff_evidence_id: row.git_diff_evidence_id != null ? String(row.git_diff_evidence_id) : null,
+      failure_code: row.failure_code != null ? String(row.failure_code) : null,
+      failure_json: row.failure_json != null ? String(row.failure_json) : null,
+      created_at: String(row.created_at),
+      verification_started_at: row.verification_started_at != null ? String(row.verification_started_at) : null,
+      completed_at: row.completed_at != null ? String(row.completed_at) : null,
+      recovery_fenced_at: row.recovery_fenced_at != null ? String(row.recovery_fenced_at) : null,
+      resolution_action: row.resolution_action != null ? (row.resolution_action as 'ACKNOWLEDGE' | 'CANCEL') : null,
+      resolution_timestamp: row.resolution_timestamp != null ? String(row.resolution_timestamp) : null,
+      resolution_evidence_json: row.resolution_evidence_json != null ? String(row.resolution_evidence_json) : null,
+      resolution_evidence_hash: row.resolution_evidence_hash != null ? String(row.resolution_evidence_hash) : null,
+      resolver_id: row.resolver_id != null ? String(row.resolver_id) : null,
+      artifact_manifest_json: row.artifact_manifest_json != null ? String(row.artifact_manifest_json) : null,
+      artifact_manifest_hash: row.artifact_manifest_hash != null ? String(row.artifact_manifest_hash) : null,
+      workspace_lease_id: row.workspace_lease_id != null ? String(row.workspace_lease_id) : null,
+    };
+  }
+
+  // ==========================================
+  // Coder Submission Workspace Leases (R5J5 Pass 4)
+  // ==========================================
+  public createWorkspaceLease(lease: CoderSubmissionWorkspaceLease): void {
+    this.db
+      .prepare(`
+        INSERT INTO coder_submission_workspace_leases (
+          id,
+          adjudication_id,
+          worktree_identity_hash,
+          admitted_workspace_fingerprint_hash,
+          pre_execution_fingerprint_hash,
+          claim_nonce,
+          execution_id,
+          lease_owner_identity,
+          assignment_id,
+          authorization_id,
+          acquired_at,
+          released_at,
+          lifecycle_version,
+          state,
+          failure_code,
+          failure_evidence_hash
+        ) VALUES (
+          ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+        )
+      `)
+      .run(
+        lease.id,
+        lease.adjudication_id,
+        lease.worktree_identity_hash,
+        lease.admitted_workspace_fingerprint_hash,
+        lease.pre_execution_fingerprint_hash ?? null,
+        lease.claim_nonce,
+        lease.execution_id,
+        lease.lease_owner_identity,
+        lease.assignment_id,
+        lease.authorization_id,
+        lease.acquired_at,
+        lease.released_at ?? null,
+        lease.lifecycle_version,
+        lease.state,
+        lease.failure_code ?? null,
+        lease.failure_evidence_hash ?? null
+      );
+  }
+
+  public getWorkspaceLease(id: string): CoderSubmissionWorkspaceLease | null {
+    const row = this.db
+      .prepare('SELECT * FROM coder_submission_workspace_leases WHERE id = ?')
+      .get(id) as Record<string, unknown> | undefined;
+    if (!row) return null;
+    return this.mapWorkspaceLease(row);
+  }
+
+  public getActiveWorkspaceLeaseByWorktree(worktreeHash: string): CoderSubmissionWorkspaceLease | null {
+    const row = this.db
+      .prepare(`
+        SELECT * FROM coder_submission_workspace_leases
+        WHERE worktree_identity_hash = ? AND state IN ('ACQUIRED', 'VERIFYING')
+        ORDER BY acquired_at DESC
+        LIMIT 1
+      `)
+      .get(worktreeHash) as Record<string, unknown> | undefined;
+    if (!row) return null;
+    return this.mapWorkspaceLease(row);
+  }
+
+  public getWorkspaceLeaseByAdjudication(adjudicationId: string): CoderSubmissionWorkspaceLease | null {
+    const row = this.db
+      .prepare(`
+        SELECT * FROM coder_submission_workspace_leases
+        WHERE adjudication_id = ?
+        ORDER BY acquired_at DESC
+        LIMIT 1
+      `)
+      .get(adjudicationId) as Record<string, unknown> | undefined;
+    if (!row) return null;
+    return this.mapWorkspaceLease(row);
+  }
+
+  public updateWorkspaceLease(
+    id: string,
+    expectedVersion: number,
+    updates: Partial<CoderSubmissionWorkspaceLease>
+  ): boolean {
+    const setClauses: string[] = ['lifecycle_version = lifecycle_version + 1'];
+    const params: unknown[] = [];
+
+    if (updates.execution_id !== undefined) {
+      setClauses.push('execution_id = ?');
+      params.push(updates.execution_id);
+    }
+    if (updates.pre_execution_fingerprint_hash !== undefined) {
+      setClauses.push('pre_execution_fingerprint_hash = ?');
+      params.push(updates.pre_execution_fingerprint_hash);
+    }
+    if (updates.state !== undefined) {
+      setClauses.push('state = ?');
+      params.push(updates.state);
+    }
+    if (updates.released_at !== undefined) {
+      setClauses.push('released_at = ?');
+      params.push(updates.released_at);
+    }
+    if (updates.failure_code !== undefined) {
+      setClauses.push('failure_code = ?');
+      params.push(updates.failure_code);
+    }
+    if (updates.failure_evidence_hash !== undefined) {
+      setClauses.push('failure_evidence_hash = ?');
+      params.push(updates.failure_evidence_hash);
+    }
+
+    params.push(id, expectedVersion);
+    const sql = `
+      UPDATE coder_submission_workspace_leases
+      SET ${setClauses.join(', ')}
+      WHERE id = ? AND lifecycle_version = ?
+    `;
+    const res = this.db.prepare(sql).run(...params);
+    return res.changes === 1;
+  }
+
+  private mapWorkspaceLease(row: Record<string, unknown>): CoderSubmissionWorkspaceLease {
+    return {
+      id: String(row.id),
+      adjudication_id: String(row.adjudication_id),
+      worktree_identity_hash: String(row.worktree_identity_hash),
+      admitted_workspace_fingerprint_hash: String(row.admitted_workspace_fingerprint_hash),
+      pre_execution_fingerprint_hash: row.pre_execution_fingerprint_hash != null ? String(row.pre_execution_fingerprint_hash) : null,
+      claim_nonce: String(row.claim_nonce),
+      execution_id: String(row.execution_id),
+      lease_owner_identity: String(row.lease_owner_identity),
+      assignment_id: String(row.assignment_id),
+      authorization_id: String(row.authorization_id),
+      acquired_at: String(row.acquired_at),
+      released_at: row.released_at != null ? String(row.released_at) : null,
+      lifecycle_version: Number(row.lifecycle_version),
+      state: row.state as WorkspaceLeaseState,
+      failure_code: row.failure_code != null ? String(row.failure_code) : null,
+      failure_evidence_hash: row.failure_evidence_hash != null ? String(row.failure_evidence_hash) : null,
+    };
+  }
+
+
+  // ==========================================
+  // Coder Submission Adjudication Events (R5J5)
+  // ==========================================
+  public createCoderSubmissionAdjudicationEvent(ev: CoderSubmissionAdjudicationEvent): void {
+    const existing = this.db
+      .prepare('SELECT id, adjudication_id, sequence, event_type, payload_json, payload_hash FROM coder_submission_adjudication_events WHERE id = ?')
+      .get(ev.id) as Record<string, unknown> | undefined;
+
+    if (existing) {
+      if (
+        String(existing.adjudication_id) === ev.adjudication_id &&
+        String(existing.event_type) === ev.event_type &&
+        String(existing.payload_hash) === ev.payload_hash &&
+        String(existing.payload_json) === ev.payload_json
+      ) {
+        // Exact duplicate deterministic event -> no-op
+        return;
+      }
+      throw new Error(
+        `EVENT_COLLISION_CONFLICT: Deterministic adjudication event collision on "${ev.id}" with differing payload or type.`
+      );
+    }
+
+    this.db
+      .prepare(`
+        INSERT INTO coder_submission_adjudication_events (
+          id,
+          adjudication_id,
+          sequence,
+          event_type,
+          payload_json,
+          payload_hash,
+          created_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?)
+      `)
+      .run(
+        ev.id,
+        ev.adjudication_id,
+        ev.sequence,
+        ev.event_type,
+        ev.payload_json,
+        ev.payload_hash,
+        ev.created_at
+      );
+  }
+
+  public getCoderSubmissionAdjudicationEvents(adjudicationId: string): CoderSubmissionAdjudicationEvent[] {
+    const rows = this.db
+      .prepare('SELECT * FROM coder_submission_adjudication_events WHERE adjudication_id = ? ORDER BY sequence ASC')
+      .all(adjudicationId) as Record<string, unknown>[];
+    return rows.map((r) => this.mapCoderSubmissionAdjudicationEvent(r));
+  }
+
+  public getNextAdjudicationEventSequence(adjudicationId: string): number {
+    const row = this.db
+      .prepare('SELECT COALESCE(MAX(sequence), 0) + 1 AS next_seq FROM coder_submission_adjudication_events WHERE adjudication_id = ?')
+      .get(adjudicationId) as { next_seq: number };
+    return row.next_seq;
+  }
+
+  private mapCoderSubmissionAdjudicationEvent(row: Record<string, unknown>): CoderSubmissionAdjudicationEvent {
+    return {
+      id: String(row.id),
+      adjudication_id: String(row.adjudication_id),
+      sequence: Number(row.sequence),
+      event_type: row.event_type as AdjudicationEventType,
+      payload_json: String(row.payload_json),
+      payload_hash: String(row.payload_hash),
+      created_at: String(row.created_at),
+    };
+  }
+
+  // ==========================================
+  // Quarantined Submissions Querying (R5J5)
+  // ==========================================
+  public listRawQuarantinedSubmissions(options: {
+    projectId?: string;
+    taskId?: string;
+    limit?: number;
+    offset?: number;
+    reverse?: boolean;
+  }): CoderSubmission[] {
+    const conditions: string[] = [];
+    const params: unknown[] = [];
+
+    if (options.projectId) {
+      conditions.push('project_id = ?');
+      params.push(options.projectId);
+    }
+    if (options.taskId) {
+      conditions.push('task_id = ?');
+      params.push(options.taskId);
+    }
+
+    const whereClause = conditions.length > 0 ? `WHERE ${conditions.join(' AND ')}` : '';
+    const orderDirection = options.reverse ? 'DESC' : 'ASC';
+    const limit = Math.min(Math.max(options.limit ?? 50, 1), 100);
+    const offset = Math.max(options.offset ?? 0, 0);
+
+    params.push(limit, offset);
+    const sql = `
+      SELECT * FROM coder_submissions
+      ${whereClause}
+      ORDER BY submitted_at ${orderDirection}, id ${orderDirection}
+      LIMIT ? OFFSET ?
+    `;
+
+    const rows = this.db.prepare(sql).all(...params) as Record<string, unknown>[];
+    return rows.map((r) => this.mapCoderSubmission(r));
+  }
+
+  public getQuarantinedSubmissionsCount(options?: {
+    projectId?: string;
+    taskId?: string;
+  }): number {
+    const conditions: string[] = [];
+    const params: unknown[] = [];
+
+    if (options?.projectId) {
+      conditions.push('project_id = ?');
+      params.push(options.projectId);
+    }
+    if (options?.taskId) {
+      conditions.push('task_id = ?');
+      params.push(options.taskId);
+    }
+
+    const whereClause = conditions.length > 0 ? `WHERE ${conditions.join(' AND ')}` : '';
+    const sql = `SELECT COUNT(*) AS c FROM coder_submissions ${whereClause}`;
+    const row = this.db.prepare(sql).get(...params) as { c: number };
+    return row.c;
   }
 
   public getDeterministicEvent(eventId: string): {
@@ -7600,6 +8271,25 @@ export class Repository {
     const row = this.db
       .prepare('SELECT * FROM test_runs WHERE task_id = ? ORDER BY created_at DESC, rowid DESC LIMIT 1')
       .get(taskId) as Record<string, unknown> | undefined;
+    if (!row) return null;
+    return {
+      id: String(row.id),
+      task_id: String(row.task_id),
+      command: String(row.command),
+      passed_count: Number(row.passed_count),
+      failed_count: Number(row.failed_count),
+      skipped_count: Number(row.skipped_count),
+      duration_ms: Number(row.duration_ms),
+      exit_code: Number(row.exit_code),
+      evidence_id: row.evidence_id ? String(row.evidence_id) : null,
+      created_at: String(row.created_at),
+    };
+  }
+
+  public getTestRun(id: string): TestRun | null {
+    const row = this.db
+      .prepare('SELECT * FROM test_runs WHERE id = ?')
+      .get(id) as Record<string, unknown> | undefined;
     if (!row) return null;
     return {
       id: String(row.id),

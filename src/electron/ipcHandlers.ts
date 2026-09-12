@@ -43,7 +43,36 @@ import {
   GetAppInfoIpcSchema,
   GetVerificationCommandsIpcSchema,
   SaveVerificationCommandsIpcSchema,
+  ListQuarantinedSubmissionsIpcSchema,
+  InspectQuarantinedSubmissionIpcSchema,
+  AdmitQuarantinedSubmissionIpcSchema,
+  RejectQuarantinedSubmissionIpcSchema,
+  SupersedeQuarantinedSubmissionIpcSchema,
+  ResumeAdmittedSubmissionIpcSchema,
+  AcknowledgeRecoveryFencedIpcSchema,
 } from '../core/types/ipc';
+import {
+  CoderSubmissionAdjudicationService,
+  scrubAdjudicationDiagnostics,
+} from '../core/services/CoderSubmissionAdjudicationService';
+import { CoderSubmissionAdjudicationError } from '../core/types/adjudication';
+
+export function scrubAdjudicationError(err: unknown): { code: string; message: string } {
+  if (err instanceof CoderSubmissionAdjudicationError) {
+    return { code: err.code, message: scrubAdjudicationDiagnostics(err.message) };
+  }
+  const msg = err instanceof Error ? err.message : String(err);
+  if (msg.includes('NOT_FOUND')) return { code: 'NOT_FOUND', message: 'Requested resource not found.' };
+  if (msg.includes('INTEGRITY') || msg.includes('CHECKSUM') || msg.includes('HASH')) return { code: 'INTEGRITY_CONFLICT', message: 'Durable integrity conflict detected.' };
+  if (msg.includes('PRECONDITION') || msg.includes('FENCED')) return { code: 'PRECONDITION_FENCED', message: 'Precondition check failed or authority fenced.' };
+  if (msg.includes('STATUS') || msg.includes('STATE')) return { code: 'STATUS_CONFLICT', message: 'Incompatible status transition.' };
+  if (msg.includes('REQUEST_ID') || msg.includes('IDEMPOTENCY')) return { code: 'REQUEST_ID_CONFLICT', message: 'Request ID collision or conflict.' };
+  if (msg.includes('WORKTREE') || msg.includes('DRIFT')) return { code: 'WORKTREE_DRIFT', message: 'Working tree or Git repository drift.' };
+  if (msg.includes('COMMAND') || msg.includes('SNAPSHOT')) return { code: 'COMMAND_SNAPSHOT_INVALID', message: 'Verification command snapshot is invalid.' };
+  if (msg.includes('IN_FLIGHT') || msg.includes('CLAIMED')) return { code: 'VERIFICATION_IN_FLIGHT', message: 'Verification is currently in-flight.' };
+  if (msg.includes('RECOVERY_FENCED')) return { code: 'RECOVERY_FENCED', message: 'Execution is recovery-fenced.' };
+  return { code: 'INTERNAL_ERROR', message: 'An internal error occurred during adjudication.' };
+}
 
 export function registerIpcHandlers(
   repo: Repository,
@@ -54,8 +83,12 @@ export function registerIpcHandlers(
   providerRoutingService?: ProviderRoutingService,
   executionAuthorizationService?: ExecutionAuthorizationService,
   providerDispatchService?: ProviderDispatchService,
-  updateService?: UpdateService
+  updateService?: UpdateService,
+  coderSubmissionAdjudicationService?: CoderSubmissionAdjudicationService
 ): void {
+  const adjService =
+    coderSubmissionAdjudicationService ||
+    new CoderSubmissionAdjudicationService(repo, repo.getDatabase(), verificationService);
   // ==========================================
   // Trusted Repository Selection Dialog
   // ==========================================
@@ -403,6 +436,43 @@ export function registerIpcHandlers(
       }
     }
 
+    // Exact adjudication linkage for R5J5 (never substitute unrelated protocol message)
+    let adjudicationLinkage = null;
+    const taskAdjudications = repo.getCoderSubmissionAdjudicationsByTask(task.id);
+    const activeOrLatestAdj =
+      taskAdjudications.find((a) => a.status === 'VERIFIED' || a.status === 'ADMITTED' || a.status === 'VERIFYING') ||
+      taskAdjudications[0];
+
+    if (activeOrLatestAdj) {
+      const submission = repo.getCoderSubmissionById(activeOrLatestAdj.submission_id);
+      if (!submission) {
+        throw new Error(
+          `ADJUDICATION_SUBMISSION_NOT_FOUND: Submission "${activeOrLatestAdj.submission_id}" bound to adjudication "${activeOrLatestAdj.id}" not found.`
+        );
+      }
+      try {
+        const projection = adjService.buildVerifiedAdjudicationReviewProjection(activeOrLatestAdj.id);
+        const reviewPackage = PackageGenerator.renderVerifiedAdjudicationReviewProjection(projection);
+        return { success: true, reviewPackage };
+      } catch {
+        const adjTestRun = activeOrLatestAdj.test_run_id ? repo.getTestRun(activeOrLatestAdj.test_run_id) : null;
+        const gitStatusEv = activeOrLatestAdj.git_status_evidence_id
+          ? repo.getEvidence(activeOrLatestAdj.git_status_evidence_id)
+          : null;
+        const gitDiffEvFromAdj = activeOrLatestAdj.git_diff_evidence_id
+          ? repo.getEvidence(activeOrLatestAdj.git_diff_evidence_id)
+          : null;
+
+        adjudicationLinkage = {
+          adjudication: activeOrLatestAdj,
+          submission,
+          testRun: adjTestRun,
+          gitStatusEvidence: gitStatusEv,
+          gitDiffEvidence: gitDiffEvFromAdj || gitDiffEv,
+        };
+      }
+    }
+
     const reviewPackage = PackageGenerator.generateReviewPackage(
       project,
       task,
@@ -411,7 +481,8 @@ export function registerIpcHandlers(
       diffContent,
       latestTestRun,
       reviews,
-      gitDiffEv || undefined
+      gitDiffEv || undefined,
+      adjudicationLinkage
     );
 
     return { success: true, reviewPackage };
@@ -911,6 +982,107 @@ export function registerIpcHandlers(
       return { success: true };
     } catch (err: any) {
       return { success: false, error: err.message || 'Failed to install update.' };
+    }
+  });
+
+  // ==========================================
+  // R5J5: Quarantined Submission Adjudication
+  // ==========================================
+  ipcMain.handle('submissions:list', async (_, payload: unknown) => {
+    const parsed = ListQuarantinedSubmissionsIpcSchema.safeParse(payload || {});
+    if (!parsed.success) {
+      return { success: false, error: 'INVALID_ARGUMENTS', message: parsed.error.issues.map((i) => i.message).join(', ') };
+    }
+    try {
+      const result = adjService.listQuarantinedSubmissions(parsed.data);
+      return { success: true, ...result };
+    } catch (err: unknown) {
+      const scrubbed = scrubAdjudicationError(err);
+      return { success: false, error: scrubbed.code, message: scrubbed.message };
+    }
+  });
+
+  ipcMain.handle('submissions:inspect', async (_, payload: unknown) => {
+    const parsed = InspectQuarantinedSubmissionIpcSchema.safeParse(payload);
+    if (!parsed.success) {
+      return { success: false, error: 'INVALID_ARGUMENTS', message: parsed.error.issues.map((i) => i.message).join(', ') };
+    }
+    try {
+      const detail = adjService.inspectQuarantinedSubmission(parsed.data.submissionId);
+      return { success: true, detail };
+    } catch (err: unknown) {
+      const scrubbed = scrubAdjudicationError(err);
+      return { success: false, error: scrubbed.code, message: scrubbed.message };
+    }
+  });
+
+  ipcMain.handle('submissions:admit', async (_, payload: unknown) => {
+    const parsed = AdmitQuarantinedSubmissionIpcSchema.safeParse(payload);
+    if (!parsed.success) {
+      return { success: false, error: 'INVALID_ARGUMENTS', message: parsed.error.issues.map((i) => i.message).join(', ') };
+    }
+    try {
+      const result = await adjService.admitSubmissionForVerification(parsed.data);
+      return { success: true, result };
+    } catch (err: unknown) {
+      const scrubbed = scrubAdjudicationError(err);
+      return { success: false, error: scrubbed.code, message: scrubbed.message };
+    }
+  });
+
+  ipcMain.handle('submissions:reject', async (_, payload: unknown) => {
+    const parsed = RejectQuarantinedSubmissionIpcSchema.safeParse(payload);
+    if (!parsed.success) {
+      return { success: false, error: 'INVALID_ARGUMENTS', message: parsed.error.issues.map((i) => i.message).join(', ') };
+    }
+    try {
+      const result = adjService.rejectSubmission(parsed.data);
+      return { success: true, result };
+    } catch (err: unknown) {
+      const scrubbed = scrubAdjudicationError(err);
+      return { success: false, error: scrubbed.code, message: scrubbed.message };
+    }
+  });
+
+  ipcMain.handle('submissions:supersede', async (_, payload: unknown) => {
+    const parsed = SupersedeQuarantinedSubmissionIpcSchema.safeParse(payload);
+    if (!parsed.success) {
+      return { success: false, error: 'INVALID_ARGUMENTS', message: parsed.error.issues.map((i) => i.message).join(', ') };
+    }
+    try {
+      const result = adjService.supersedeSubmission(parsed.data);
+      return { success: true, result };
+    } catch (err: unknown) {
+      const scrubbed = scrubAdjudicationError(err);
+      return { success: false, error: scrubbed.code, message: scrubbed.message };
+    }
+  });
+
+  ipcMain.handle('submissions:resume', async (_, payload: unknown) => {
+    const parsed = ResumeAdmittedSubmissionIpcSchema.safeParse(payload);
+    if (!parsed.success) {
+      return { success: false, error: 'INVALID_ARGUMENTS', message: parsed.error.issues.map((i) => i.message).join(', ') };
+    }
+    try {
+      const result = await adjService.resumeAdmittedSubmission(parsed.data);
+      return { success: true, result };
+    } catch (err: unknown) {
+      const scrubbed = scrubAdjudicationError(err);
+      return { success: false, error: scrubbed.code, message: scrubbed.message };
+    }
+  });
+
+  ipcMain.handle('submissions:acknowledgeFenced', async (_, payload: unknown) => {
+    const parsed = AcknowledgeRecoveryFencedIpcSchema.safeParse(payload);
+    if (!parsed.success) {
+      return { success: false, error: 'INVALID_ARGUMENTS', message: parsed.error.issues.map((i) => i.message).join(', ') };
+    }
+    try {
+      const result = adjService.acknowledgeRecoveryFenced(parsed.data);
+      return { success: true, result };
+    } catch (err: unknown) {
+      const scrubbed = scrubAdjudicationError(err);
+      return { success: false, error: scrubbed.code, message: scrubbed.message };
     }
   });
 }
