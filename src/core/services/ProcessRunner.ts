@@ -96,6 +96,7 @@ export class ProcessRunner {
   >();
   private static persistenceFencedEntries = new Map<string, PersistenceFencedEntry>();
   private static terminationPromises = new Map<number, Promise<ProcessTerminationTruth>>();
+  private static cancellationPromises = new Map<string, Promise<ProcessTerminationTruth>>();
 
   public static readonly DEFAULT_MAX_OUTPUT_BYTES = 8 * 1024 * 1024; // 8 MiB default
   public static readonly MAX_ALLOWED_OUTPUT_BYTES = 32 * 1024 * 1024; // 32 MiB hard cap
@@ -1029,26 +1030,43 @@ export class ProcessRunner {
     });
   }
 
-  public static async cancel(executionId: string): Promise<ProcessTerminationTruth> {
+  public static cancel(executionId: string): Promise<ProcessTerminationTruth> {
+    const inFlight = this.cancellationPromises.get(executionId);
+    if (inFlight) {
+      return inFlight;
+    }
+    if (this.persistenceFencedEntries.has(executionId)) {
+      return Promise.resolve('TERMINATION_UNRESOLVED');
+    }
     const entry = this.activeProcesses.get(executionId);
     if (!entry) {
-      return 'NOT_APPLICABLE';
+      return Promise.resolve('NOT_APPLICABLE');
     }
-    entry.isCancelled = true;
-    try {
-      entry.process.kill('SIGTERM');
-    } catch (err: unknown) {
-      entry.lastKillError = err instanceof Error ? err : new Error(String(err));
-    }
-    try {
-      const res = await entry.settle('CANCEL');
-      if (this.persistenceFencedEntries.has(executionId)) {
-        return 'TERMINATION_UNRESOLVED';
+
+    const promise = (async (): Promise<ProcessTerminationTruth> => {
+      try {
+        entry.isCancelled = true;
+        try {
+          entry.process.kill('SIGTERM');
+        } catch (err: unknown) {
+          entry.lastKillError = err instanceof Error ? err : new Error(String(err));
+        }
+        try {
+          const res = await entry.settle('CANCEL');
+          if (this.persistenceFencedEntries.has(executionId)) {
+            return 'TERMINATION_UNRESOLVED';
+          }
+          return res.processTermination;
+        } catch (err: unknown) {
+          return 'TERMINATION_UNRESOLVED';
+        }
+      } finally {
+        this.cancellationPromises.delete(executionId);
       }
-      return res.processTermination;
-    } catch (err: unknown) {
-      return 'TERMINATION_UNRESOLVED';
-    }
+    })();
+
+    this.cancellationPromises.set(executionId, promise);
+    return promise;
   }
 
   public static async cancelAsync(executionId: string): Promise<ProcessTerminationTruth> {
@@ -1086,6 +1104,7 @@ export class ProcessRunner {
     const allIds = new Set<string>([
       ...initialActive.map(([id]) => id),
       ...initialFencedKeys,
+      ...this.persistenceFencedEntries.keys(),
     ]);
 
     let unproven = 0;
@@ -1099,7 +1118,7 @@ export class ProcessRunner {
       }
     }
 
-    for (const fencedId of initialFencedKeys) {
+    for (const fencedId of this.persistenceFencedEntries.keys()) {
       if (!initialActive.some(([id]) => id === fencedId)) {
         unproven++;
       }

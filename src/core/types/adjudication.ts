@@ -196,36 +196,46 @@ export interface StagedEvidenceFile {
 
 export const CANONICAL_WORKSPACE_SNAPSHOT_AFTER_KEYS = [
   'adjudication_id',
+  'adjudication_lifecycle_version',
   'assignment_id',
   'attempt_id',
   'authorization_id',
   'captured_at',
   'captured_repository_head_sha',
+  'expected_head_sha',
   'git_diff_evidence_hash',
   'git_status_evidence_hash',
   'project_id',
   'schema_version',
+  'submission_id',
   'task_id',
   'task_ownership_epoch',
   'verification_execution_id',
+  'workspace_lease_id',
+  'worktree_identity_hash',
 ] as const;
 
 export type CanonicalWorkspaceSnapshotAfterKey = (typeof CANONICAL_WORKSPACE_SNAPSHOT_AFTER_KEYS)[number];
 
 export interface CanonicalWorkspaceSnapshotAfterPayload {
   adjudication_id: string;
+  adjudication_lifecycle_version: number;
   assignment_id: string;
   attempt_id: string | null;
   authorization_id: string;
   captured_at: string;
   captured_repository_head_sha: string;
+  expected_head_sha: string;
   git_diff_evidence_hash: string;
   git_status_evidence_hash: string;
   project_id: string;
   schema_version: 1;
+  submission_id: string;
   task_id: string;
   task_ownership_epoch: number;
   verification_execution_id: string;
+  workspace_lease_id: string;
+  worktree_identity_hash: string;
 }
 
 export interface StagingManifest {

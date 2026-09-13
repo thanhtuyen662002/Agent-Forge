@@ -237,6 +237,242 @@ export function deriveDeterministicWorkspaceAfterEvidenceId(
   return `${hex.substring(0, 8)}-${hex.substring(8, 12)}-${hex.substring(12, 16)}-${hex.substring(16, 20)}-${hex.substring(20, 32)}`;
 }
 
+export function buildCanonicalWorkspaceSnapshotAfterPayload(params: {
+  adjudicationId: string;
+  adjudicationLifecycleVersion?: 3;
+  assignmentId: string;
+  attemptId: string | null;
+  authorizationId: string;
+  capturedAt: string;
+  capturedRepositoryHeadSha: string;
+  expectedHeadSha: string;
+  gitDiffEvidenceHash: string;
+  gitStatusEvidenceHash: string;
+  projectId: string;
+  schemaVersion?: 1;
+  submissionId: string;
+  taskId: string;
+  taskOwnershipEpoch: number;
+  verificationExecutionId: string;
+  workspaceLeaseId: string;
+  worktreeIdentityHash: string;
+}): CanonicalWorkspaceSnapshotAfterPayload {
+  return {
+    adjudication_id: params.adjudicationId,
+    adjudication_lifecycle_version: params.adjudicationLifecycleVersion ?? 3,
+    assignment_id: params.assignmentId,
+    attempt_id: params.attemptId,
+    authorization_id: params.authorizationId,
+    captured_at: params.capturedAt,
+    captured_repository_head_sha: params.capturedRepositoryHeadSha,
+    expected_head_sha: params.expectedHeadSha,
+    git_diff_evidence_hash: params.gitDiffEvidenceHash,
+    git_status_evidence_hash: params.gitStatusEvidenceHash,
+    project_id: params.projectId,
+    schema_version: params.schemaVersion ?? 1,
+    submission_id: params.submissionId,
+    task_id: params.taskId,
+    task_ownership_epoch: params.taskOwnershipEpoch,
+    verification_execution_id: params.verificationExecutionId,
+    workspace_lease_id: params.workspaceLeaseId,
+    worktree_identity_hash: params.worktreeIdentityHash,
+  };
+}
+
+export interface ValidateWorkspaceSnapshotAfterParams {
+  rawContent: string;
+  expectedHash?: string;
+  adjudication: CoderSubmissionAdjudication;
+  submission?: CoderSubmission | null;
+  lease?: CoderSubmissionWorkspaceLease | null;
+  verificationExecutionId?: string;
+  gitStatusEvidenceHash?: string;
+  gitDiffEvidenceHash?: string;
+}
+
+export function validateCanonicalWorkspaceSnapshotAfter(params: ValidateWorkspaceSnapshotAfterParams): {
+  valid: boolean;
+  payload: CanonicalWorkspaceSnapshotAfterPayload | null;
+  error?: string;
+} {
+  const {
+    rawContent,
+    expectedHash,
+    adjudication,
+    submission,
+    lease,
+    verificationExecutionId,
+    gitStatusEvidenceHash,
+    gitDiffEvidenceHash,
+  } = params;
+
+  if (!rawContent || typeof rawContent !== 'string' || rawContent.trim() === '') {
+    return { valid: false, payload: null, error: 'Workspace snapshot after evidence file content could not be retrieved or is empty' };
+  }
+
+  if (expectedHash !== undefined) {
+    if (typeof expectedHash !== 'string' || !/^[0-9a-f]{64}$/.test(expectedHash)) {
+      return { valid: false, payload: null, error: 'Workspace snapshot after expectedHash must be a 64-char lowercase hex string' };
+    }
+    const computedHash = computeSha256(rawContent);
+    if (computedHash !== expectedHash) {
+      return { valid: false, payload: null, error: 'Workspace snapshot after evidence file content hash mismatch' };
+    }
+  }
+
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(rawContent);
+  } catch (parseErr: unknown) {
+    return { valid: false, payload: null, error: 'Workspace snapshot after evidence file is malformed JSON' };
+  }
+
+  if (
+    typeof parsed !== 'object' ||
+    parsed === null ||
+    Array.isArray(parsed) ||
+    Object.getPrototypeOf(parsed) !== Object.prototype
+  ) {
+    return { valid: false, payload: null, error: 'Workspace snapshot after evidence must be a strict plain object' };
+  }
+
+  const obj = parsed as Record<string, unknown>;
+  const keys = Object.keys(obj).sort();
+  const expectedKeys = [...CANONICAL_WORKSPACE_SNAPSHOT_AFTER_KEYS].sort();
+
+  if (keys.length !== expectedKeys.length || keys.some((k, i) => k !== expectedKeys[i])) {
+    return { valid: false, payload: null, error: 'Workspace snapshot after evidence property set mismatch (missing or extra keys)' };
+  }
+
+  if (canonicalJsonStringify(obj) !== rawContent) {
+    return { valid: false, payload: null, error: 'Workspace snapshot after evidence is not byte-identical to its canonical JSON representation' };
+  }
+
+  // Exact 18 fields verification
+  if (obj.schema_version !== 1) {
+    return { valid: false, payload: null, error: 'schema_version must be integer 1' };
+  }
+  if (obj.adjudication_lifecycle_version !== 3) {
+    return { valid: false, payload: null, error: 'adjudication_lifecycle_version must be integer 3' };
+  }
+  if (typeof obj.adjudication_id !== 'string' || !obj.adjudication_id.trim()) {
+    return { valid: false, payload: null, error: 'adjudication_id must be non-empty string' };
+  }
+  if (obj.adjudication_id !== adjudication.id) {
+    return { valid: false, payload: null, error: 'adjudication_id mismatch adjudication record' };
+  }
+  if (typeof obj.submission_id !== 'string' || !obj.submission_id.trim()) {
+    return { valid: false, payload: null, error: 'submission_id must be non-empty string' };
+  }
+  if (obj.submission_id !== adjudication.submission_id) {
+    return { valid: false, payload: null, error: 'submission_id mismatch adjudication record' };
+  }
+  if (submission && obj.submission_id !== submission.id) {
+    return { valid: false, payload: null, error: 'submission_id mismatch submission record' };
+  }
+  if (typeof obj.authorization_id !== 'string' || !obj.authorization_id.trim()) {
+    return { valid: false, payload: null, error: 'authorization_id must be non-empty string' };
+  }
+  if (obj.authorization_id !== adjudication.authorization_id) {
+    return { valid: false, payload: null, error: 'authorization_id mismatch adjudication record' };
+  }
+  if (submission && obj.authorization_id !== submission.authorization_id) {
+    return { valid: false, payload: null, error: 'authorization_id mismatch submission record' };
+  }
+  if (typeof obj.project_id !== 'string' || !obj.project_id.trim()) {
+    return { valid: false, payload: null, error: 'project_id must be non-empty string' };
+  }
+  if (obj.project_id !== adjudication.project_id) {
+    return { valid: false, payload: null, error: 'project_id mismatch adjudication record' };
+  }
+  if (submission && obj.project_id !== submission.project_id) {
+    return { valid: false, payload: null, error: 'project_id mismatch submission record' };
+  }
+  if (typeof obj.task_id !== 'string' || !obj.task_id.trim()) {
+    return { valid: false, payload: null, error: 'task_id must be non-empty string' };
+  }
+  if (obj.task_id !== adjudication.task_id) {
+    return { valid: false, payload: null, error: 'task_id mismatch adjudication record' };
+  }
+  if (submission && obj.task_id !== submission.task_id) {
+    return { valid: false, payload: null, error: 'task_id mismatch submission record' };
+  }
+  if (adjudication.attempt_id !== null && obj.attempt_id !== adjudication.attempt_id) {
+    return { valid: false, payload: null, error: 'attempt_id mismatch adjudication record' };
+  }
+  if (adjudication.attempt_id === null && obj.attempt_id !== null) {
+    return { valid: false, payload: null, error: 'attempt_id must be null when adjudication attempt_id is null' };
+  }
+  if (obj.attempt_id !== null && (typeof obj.attempt_id !== 'string' || !obj.attempt_id.trim())) {
+    return { valid: false, payload: null, error: 'attempt_id must be string or null' };
+  }
+  if (typeof obj.assignment_id !== 'string' || !obj.assignment_id.trim()) {
+    return { valid: false, payload: null, error: 'assignment_id must be non-empty string' };
+  }
+  if (obj.assignment_id !== adjudication.assignment_id) {
+    return { valid: false, payload: null, error: 'assignment_id mismatch adjudication record' };
+  }
+  if (typeof obj.task_ownership_epoch !== 'number' || !Number.isInteger(obj.task_ownership_epoch) || obj.task_ownership_epoch <= 0) {
+    return { valid: false, payload: null, error: 'task_ownership_epoch must be positive integer' };
+  }
+  if (obj.task_ownership_epoch !== adjudication.task_ownership_epoch) {
+    return { valid: false, payload: null, error: 'task_ownership_epoch mismatch adjudication record' };
+  }
+  if (submission && obj.task_ownership_epoch !== submission.task_ownership_epoch) {
+    return { valid: false, payload: null, error: 'task_ownership_epoch mismatch submission record' };
+  }
+  if (typeof obj.verification_execution_id !== 'string' || !obj.verification_execution_id.trim()) {
+    return { valid: false, payload: null, error: 'verification_execution_id must be non-empty string' };
+  }
+  if (verificationExecutionId !== undefined && obj.verification_execution_id !== verificationExecutionId) {
+    return { valid: false, payload: null, error: 'verification_execution_id mismatch verification execution' };
+  }
+  if (adjudication.verification_execution_id && obj.verification_execution_id !== adjudication.verification_execution_id) {
+    return { valid: false, payload: null, error: 'verification_execution_id mismatch adjudication record' };
+  }
+  if (gitStatusEvidenceHash !== undefined && obj.git_status_evidence_hash !== gitStatusEvidenceHash) {
+    return { valid: false, payload: null, error: 'git_status_evidence_hash mismatch git status evidence' };
+  }
+  if (gitDiffEvidenceHash !== undefined && obj.git_diff_evidence_hash !== gitDiffEvidenceHash) {
+    return { valid: false, payload: null, error: 'git_diff_evidence_hash mismatch git diff evidence' };
+  }
+  if (typeof obj.workspace_lease_id !== 'string' || !obj.workspace_lease_id.trim()) {
+    return { valid: false, payload: null, error: 'workspace_lease_id must be non-empty string' };
+  }
+  if (adjudication.workspace_lease_id && obj.workspace_lease_id !== adjudication.workspace_lease_id) {
+    return { valid: false, payload: null, error: 'workspace_lease_id mismatch adjudication record' };
+  }
+  if (lease && obj.workspace_lease_id !== lease.id) {
+    return { valid: false, payload: null, error: 'workspace_lease_id mismatch lease record' };
+  }
+  if (typeof obj.worktree_identity_hash !== 'string' || !/^[0-9a-f]{64}$/i.test(obj.worktree_identity_hash)) {
+    return { valid: false, payload: null, error: 'worktree_identity_hash must be a 64-char hex string' };
+  }
+  if (lease && obj.worktree_identity_hash.toLowerCase() !== lease.worktree_identity_hash.toLowerCase()) {
+    return { valid: false, payload: null, error: 'worktree_identity_hash mismatch lease record' };
+  }
+  if (typeof obj.expected_head_sha !== 'string' || !obj.expected_head_sha.trim()) {
+    return { valid: false, payload: null, error: 'expected_head_sha must be non-empty string' };
+  }
+  if (submission && obj.expected_head_sha.toLowerCase() !== submission.authorized_head_sha.toLowerCase()) {
+    return { valid: false, payload: null, error: 'expected_head_sha mismatch submission authorized_head_sha' };
+  }
+  if (typeof obj.captured_repository_head_sha !== 'string' || !obj.captured_repository_head_sha.trim()) {
+    return { valid: false, payload: null, error: 'captured_repository_head_sha must be non-empty string' };
+  }
+  if (submission && obj.captured_repository_head_sha.toLowerCase() !== submission.authorized_head_sha.toLowerCase()) {
+    return { valid: false, payload: null, error: 'captured_repository_head_sha repository-head conflict with authorized_head_sha' };
+  }
+  if (obj.captured_repository_head_sha.toLowerCase() !== obj.expected_head_sha.toLowerCase()) {
+    return { valid: false, payload: null, error: 'captured_repository_head_sha conflicts with expected_head_sha' };
+  }
+  if (typeof obj.captured_at !== 'string' || !isCanonicalUtcIso(obj.captured_at)) {
+    return { valid: false, payload: null, error: 'captured_at must be canonical UTC ISO-8601 string' };
+  }
+
+  return { valid: true, payload: obj as unknown as CanonicalWorkspaceSnapshotAfterPayload };
+}
+
 export function buildCanonicalTerminalEventPayload(
   eventType: 'VERIFICATION_SUCCEEDED' | 'VERIFICATION_FAILED' | 'RECOVERY_FENCED',
   adjudicationId: string,
@@ -1043,7 +1279,7 @@ export function evaluateCanonicalSettlementDecision(
     };
   }
 
-  if (matchingAfterEvidence.evidence_type !== 'FILE_SNAPSHOT' && matchingAfterEvidence.evidence_type !== 'CUSTOM') {
+  if (matchingAfterEvidence.evidence_type !== 'FILE_SNAPSHOT') {
     return {
       valid: false,
       isSuccess: false,
@@ -1053,7 +1289,7 @@ export function evaluateCanonicalSettlementDecision(
       dispositionEvent: 'REJECTED',
       dispositionReason: 'RECOVERY_FENCED',
       failureCode: 'INTEGRITY_MISMATCH',
-      failureDetail: `Workspace snapshot after evidence must have type FILE_SNAPSHOT or CUSTOM, got ${matchingAfterEvidence.evidence_type}`,
+      failureDetail: `Workspace snapshot after evidence must have type FILE_SNAPSHOT, got ${matchingAfterEvidence.evidence_type}`,
       contradictionReason: 'workspace_snapshot_after evidence type mismatch',
     };
   }
@@ -1144,92 +1380,33 @@ export function evaluateCanonicalSettlementDecision(
     };
   }
 
-  if (matchingAfterEvidence.evidence_type === 'FILE_SNAPSHOT') {
-    let afterObj: Record<string, unknown>;
-    try {
-      const p = JSON.parse(afterContent);
-      if (typeof p !== 'object' || p === null || Array.isArray(p)) {
-        throw new Error('Not a plain object');
-      }
-      afterObj = p as Record<string, unknown>;
-    } catch (parseErr: unknown) {
-      return {
-        valid: false,
-        isSuccess: false,
-        targetStatus: 'RECOVERY_FENCED',
-        taskTransition: 'NEEDS_HUMAN',
-        eventType: 'RECOVERY_FENCED',
-        dispositionEvent: 'REJECTED',
-        dispositionReason: 'RECOVERY_FENCED',
-        failureCode: 'INTEGRITY_MISMATCH',
-        failureDetail: 'Workspace snapshot after evidence file is malformed JSON',
-        contradictionReason: 'workspace_snapshot_after malformed JSON',
-      };
-    }
+  const sub = input.repo.getCoderSubmissionById(input.adjudication.submission_id);
+  const lease = input.adjudication.workspace_lease_id ? input.repo.getWorkspaceLease(input.adjudication.workspace_lease_id) : null;
 
-    const afterKeys = Object.keys(afterObj).sort();
-    const expectedAfterKeys = [...CANONICAL_WORKSPACE_SNAPSHOT_AFTER_KEYS].sort();
-    if (
-      afterKeys.length !== expectedAfterKeys.length ||
-      afterKeys.some((k, i) => k !== expectedAfterKeys[i])
-    ) {
-      return {
-        valid: false,
-        isSuccess: false,
-        targetStatus: 'RECOVERY_FENCED',
-        taskTransition: 'NEEDS_HUMAN',
-        eventType: 'RECOVERY_FENCED',
-        dispositionEvent: 'REJECTED',
-        dispositionReason: 'RECOVERY_FENCED',
-        failureCode: 'INTEGRITY_MISMATCH',
-        failureDetail: 'Workspace snapshot after evidence property set mismatch (missing or extra keys)',
-        contradictionReason: 'workspace_snapshot_after key mismatch',
-      };
-    }
+  const afterRes = validateCanonicalWorkspaceSnapshotAfter({
+    rawContent: afterContent,
+    expectedHash: envelope.workspace_snapshot_after_hash,
+    adjudication: input.adjudication,
+    submission: sub,
+    lease,
+    verificationExecutionId: envelope.verification_execution_id,
+    gitStatusEvidenceHash: envelope.git_status_evidence_hash,
+    gitDiffEvidenceHash: envelope.git_diff_evidence_hash,
+  });
 
-    if (canonicalJsonStringify(afterObj) !== afterContent) {
-      return {
-        valid: false,
-        isSuccess: false,
-        targetStatus: 'RECOVERY_FENCED',
-        taskTransition: 'NEEDS_HUMAN',
-        eventType: 'RECOVERY_FENCED',
-        dispositionEvent: 'REJECTED',
-        dispositionReason: 'RECOVERY_FENCED',
-        failureCode: 'INTEGRITY_MISMATCH',
-        failureDetail: 'Workspace snapshot after evidence is not byte-identical to its canonical JSON representation',
-        contradictionReason: 'workspace_snapshot_after non-canonical JSON',
-      };
-    }
-
-    if (
-      afterObj.adjudication_id !== input.adjudication.id ||
-      afterObj.project_id !== input.adjudication.project_id ||
-      afterObj.task_id !== input.adjudication.task_id ||
-      afterObj.attempt_id !== input.adjudication.attempt_id ||
-      afterObj.assignment_id !== input.adjudication.assignment_id ||
-      afterObj.authorization_id !== input.adjudication.authorization_id ||
-      afterObj.task_ownership_epoch !== input.adjudication.task_ownership_epoch ||
-      afterObj.verification_execution_id !== envelope.verification_execution_id ||
-      afterObj.git_status_evidence_hash !== envelope.git_status_evidence_hash ||
-      afterObj.git_diff_evidence_hash !== envelope.git_diff_evidence_hash ||
-      afterObj.schema_version !== 1 ||
-      typeof afterObj.captured_at !== 'string' ||
-      !isCanonicalUtcIso(afterObj.captured_at)
-    ) {
-      return {
-        valid: false,
-        isSuccess: false,
-        targetStatus: 'RECOVERY_FENCED',
-        taskTransition: 'NEEDS_HUMAN',
-        eventType: 'RECOVERY_FENCED',
-        dispositionEvent: 'REJECTED',
-        dispositionReason: 'RECOVERY_FENCED',
-        failureCode: 'INTEGRITY_MISMATCH',
-        failureDetail: 'Workspace snapshot after evidence canonical envelope bindings mismatch adjudication record or envelope',
-        contradictionReason: 'workspace_snapshot_after bindings mismatch',
-      };
-    }
+  if (!afterRes.valid) {
+    return {
+      valid: false,
+      isSuccess: false,
+      targetStatus: 'RECOVERY_FENCED',
+      taskTransition: 'NEEDS_HUMAN',
+      eventType: 'RECOVERY_FENCED',
+      dispositionEvent: 'REJECTED',
+      dispositionReason: 'RECOVERY_FENCED',
+      failureCode: 'INTEGRITY_MISMATCH',
+      failureDetail: afterRes.error || 'Workspace snapshot after evidence validation failed',
+      contradictionReason: afterRes.error || 'workspace_snapshot_after validation failed',
+    };
   }
 
   // 1-to-1 set equality between manifest entries and all envelope evidence bindings
@@ -2032,6 +2209,12 @@ export function evaluateNonAuthoritativeSettlementDecisionForTests(
     if (envelope.test_result_evidence_id) expectedEvidenceIds.add(envelope.test_result_evidence_id);
     if (envelope.git_status_evidence_id) expectedEvidenceIds.add(envelope.git_status_evidence_id);
     if (envelope.git_diff_evidence_id) expectedEvidenceIds.add(envelope.git_diff_evidence_id);
+    if (
+      envelope.workspace_snapshot_after_evidence_id &&
+      parsedManifest.entries.some((e) => e.evidence_id === envelope.workspace_snapshot_after_evidence_id)
+    ) {
+      expectedEvidenceIds.add(envelope.workspace_snapshot_after_evidence_id);
+    }
 
     for (const entry of parsedManifest.entries) {
       if (manifestMap.has(entry.evidence_id)) {
@@ -2383,14 +2566,8 @@ export function evaluateNonAuthoritativeSettlementDecisionForTests(
       };
     }
 
-    const VALID_WORKSPACE_SNAPSHOT_TYPES: ReadonlySet<EvidenceType> = new Set([
-      'CUSTOM',
-      'FILE_SNAPSHOT',
-      'GIT_STATUS',
-      'GIT_DIFF',
-    ]);
     if (
-      !VALID_WORKSPACE_SNAPSHOT_TYPES.has(matchingAfterEvidence.evidence_type) ||
+      matchingAfterEvidence.evidence_type !== 'FILE_SNAPSHOT' ||
       matchingAfterEvidence.project_id !== adjudication.project_id ||
       matchingAfterEvidence.task_id !== adjudication.task_id ||
       (adjudication.attempt_id && matchingAfterEvidence.attempt_id !== adjudication.attempt_id)
@@ -2404,8 +2581,8 @@ export function evaluateNonAuthoritativeSettlementDecisionForTests(
         dispositionEvent: 'REJECTED',
         dispositionReason: 'RECOVERY_FENCED',
         failureCode: 'INTEGRITY_MISMATCH',
-        failureDetail: 'Workspace snapshot after evidence authority bindings, type, or hash mismatch',
-        contradictionReason: 'workspace_snapshot_after evidence authority mismatch',
+        failureDetail: `Workspace snapshot after evidence must have type FILE_SNAPSHOT, got ${matchingAfterEvidence.evidence_type}`,
+        contradictionReason: 'workspace_snapshot_after evidence type or authority mismatch',
       };
     }
 
@@ -3156,6 +3333,42 @@ export class CoderSubmissionAdjudicationService {
           'REQUEST_ID_CONFLICT',
           `Request ID "${params.requestId}" already exists with different parameters`
         );
+      }
+      if (existingAdj.verification_result_envelope_json) {
+        try {
+          const env = JSON.parse(existingAdj.verification_result_envelope_json) as CanonicalVerificationResultEnvelope;
+          if (env.workspace_snapshot_after_evidence_id) {
+            const wsEv = this.repo.getEvidence(env.workspace_snapshot_after_evidence_id);
+            if (!wsEv || wsEv.evidence_type !== 'FILE_SNAPSHOT') {
+              throw new CoderSubmissionAdjudicationError(
+                'INTEGRITY_CONFLICT',
+                `Workspace snapshot after evidence on replayed adjudication must have type FILE_SNAPSHOT, got ${wsEv?.evidence_type ?? 'missing'}`
+              );
+            }
+            let content = wsEv.raw_payload;
+            if (!content && wsEv.file_path) {
+              content = fs.readFileSync(wsEv.file_path, 'utf8');
+            }
+            const val = validateCanonicalWorkspaceSnapshotAfter({
+              rawContent: content || '',
+              expectedHash: env.workspace_snapshot_after_hash,
+              adjudication: existingAdj,
+              verificationExecutionId: env.verification_execution_id,
+            });
+            if (!val.valid) {
+              throw new CoderSubmissionAdjudicationError(
+                'INTEGRITY_CONFLICT',
+                `Workspace snapshot after evidence validation failed on replay: ${val.error}`
+              );
+            }
+          }
+        } catch (err: unknown) {
+          if (err instanceof CoderSubmissionAdjudicationError) throw err;
+          throw new CoderSubmissionAdjudicationError(
+            'INTEGRITY_CONFLICT',
+            `Replay verification evidence validation failed: ${err instanceof Error ? err.message : String(err)}`
+          );
+        }
       }
       return { adjudication: existingAdj, status: existingAdj.status };
     }
@@ -3978,21 +4191,24 @@ export class CoderSubmissionAdjudicationService {
 
     // 4. Dedicated Workspace-After FILE_SNAPSHOT Evidence
     const workspaceAfterEvId = deriveDeterministicWorkspaceAfterEvidenceId(adjudicationId, executionId);
-    const workspaceAfterPayload: CanonicalWorkspaceSnapshotAfterPayload = {
-      adjudication_id: adjudicationId,
-      assignment_id: snapshot.assignment_id,
-      attempt_id: snapshot.attempt_id,
-      authorization_id: sub.authorization_id,
-      captured_at: phaseCNowIso,
-      captured_repository_head_sha: postObservation ? postObservation.head_sha : (freshPhaseBObservation ? freshPhaseBObservation.head_sha : ''),
-      git_diff_evidence_hash: stagedGitDiffEvidence?.hash ?? '',
-      git_status_evidence_hash: stagedGitStatusEvidence?.hash ?? '',
-      project_id: sub.project_id,
-      schema_version: 1,
-      task_id: sub.task_id,
-      task_ownership_epoch: sub.task_ownership_epoch,
-      verification_execution_id: executionId,
-    };
+    const workspaceAfterPayload = buildCanonicalWorkspaceSnapshotAfterPayload({
+      adjudicationId,
+      assignmentId: snapshot.assignment_id,
+      attemptId: snapshot.attempt_id,
+      authorizationId: sub.authorization_id,
+      capturedAt: phaseCNowIso,
+      capturedRepositoryHeadSha: postObservation ? postObservation.head_sha : (freshPhaseBObservation ? freshPhaseBObservation.head_sha : ''),
+      expectedHeadSha: sub.authorized_head_sha,
+      gitDiffEvidenceHash: stagedGitDiffEvidence?.hash ?? '',
+      gitStatusEvidenceHash: stagedGitStatusEvidence?.hash ?? '',
+      projectId: sub.project_id,
+      submissionId: sub.id,
+      taskId: sub.task_id,
+      taskOwnershipEpoch: sub.task_ownership_epoch,
+      verificationExecutionId: executionId,
+      workspaceLeaseId: leaseId,
+      worktreeIdentityHash: worktreeIdentityHash,
+    });
     const workspaceAfterJson = canonicalJsonStringify(workspaceAfterPayload);
     const workspaceAfterHash = computeSha256(workspaceAfterJson);
     const workspaceAfterByteSize = Buffer.byteLength(workspaceAfterJson, 'utf8');
