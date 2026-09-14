@@ -222,8 +222,8 @@ describe('ProcessRunner Persistence, PID Tracking & Cancellation', () => {
     expect(activeRuns.length).toBeGreaterThan(0);
     const activeId = activeRuns[0].id;
 
-    const cancelledOk = ProcessRunner.cancel(activeId);
-    expect(cancelledOk).toBe(true);
+    const cancellationTruth = await ProcessRunner.cancel(activeId);
+    expect(cancellationTruth).toBe('PROCESS_TREE_TERMINATED_PROVEN');
 
     const res = await execPromise;
     expect(res.cancelled).toBe(true);

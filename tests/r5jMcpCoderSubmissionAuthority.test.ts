@@ -1559,7 +1559,7 @@ describe('R5J4 Durable Coder Submission Authority Comprehensive Suite', () => {
     it('67. Full Migration 1->22 applies cleanly on empty database', () => {
       const testDb = new Database(':memory:');
       testDb.pragma('foreign_keys = ON');
-      MigrationRunner.run(testDb);
+      MigrationRunner.run(testDb, 22);
       const count = (testDb.prepare('SELECT COUNT(*) as c FROM schema_migrations').get() as any).c;
       expect(count).toBe(22);
       verifyMigration22SchemaAuthority(testDb);
@@ -2004,8 +2004,8 @@ describe('R5J4 Durable Coder Submission Authority Comprehensive Suite', () => {
   // Group 9: Section 6.1 — Production Determinism and Migration Compatibility
   // =========================================================================
   describe('Group 9: Section 6.1 — Production Determinism and Migration Compatibility', () => {
-    it('111. MIGRATIONS is exactly 22 in every caller/process/test filename', () => {
-      expect(MIGRATIONS).toHaveLength(22);
+    it('111. MIGRATIONS is exactly 23 in every caller/process/test filename', () => {
+      expect(MIGRATIONS).toHaveLength(23);
       expect(MIGRATIONS[21].version).toBe(22);
       expect(MIGRATIONS[21].name).toBe('022_r5j_coder_submission_authority');
     });
@@ -2016,7 +2016,7 @@ describe('R5J4 Durable Coder Submission Authority Comprehensive Suite', () => {
       try {
         process.argv.push('--file=ContextRead.test.ts');
         process.env.TEST_NAME = 'CrashRecovery';
-        expect(MIGRATIONS).toHaveLength(22);
+        expect(MIGRATIONS).toHaveLength(23);
       } finally {
         process.argv = originalArgv;
         process.env.TEST_NAME = originalEnv;
@@ -2052,7 +2052,7 @@ describe('R5J4 Durable Coder Submission Authority Comprehensive Suite', () => {
     it('116. R5I crash recovery works on a current Migration 22 database', () => {
       const testDb = new Database(':memory:');
       testDb.pragma('foreign_keys = ON');
-      MigrationRunner.run(testDb);
+      MigrationRunner.run(testDb, 22);
       const count = (testDb.prepare('SELECT COUNT(*) as c FROM schema_migrations').get() as any).c;
       expect(count).toBe(22);
       const tables = (testDb.prepare("SELECT name FROM sqlite_master WHERE type='table'").all() as any[]).map((t) => t.name);
@@ -2063,10 +2063,10 @@ describe('R5J4 Durable Coder Submission Authority Comprehensive Suite', () => {
     it('117. verifyMigration21 accepts canonical 21 and canonical 1..22 ledgers, but rejects unknown suffixes', () => {
       const testDb = new Database(':memory:');
       testDb.pragma('foreign_keys = ON');
-      MigrationRunner.run(testDb);
+      MigrationRunner.run(testDb, 22);
       expect(() => verifyMigration21SchemaAuthority(testDb)).not.toThrow();
 
-      testDb.prepare("INSERT INTO schema_migrations (version, name, applied_at) VALUES (23, '023_unknown', datetime('now'))").run();
+      testDb.prepare("INSERT INTO schema_migrations (version, name, applied_at) VALUES (24, '024_unknown', datetime('now'))").run();
       expect(() => verifyMigration21SchemaAuthority(testDb)).toThrow();
       testDb.close();
     });

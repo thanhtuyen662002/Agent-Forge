@@ -1154,7 +1154,7 @@ describe('R5J2 MCP Session Authority and Scoped Context Read Truth Suite', () =>
       const row = db.prepare('SELECT COUNT(*) as c, MAX(version) as max_v FROM schema_migrations').get() as { c: number; max_v: number };
       expect(row.c).toBe(21);
       expect(row.max_v).toBe(21);
-      expect(MIGRATIONS.length).toBe(22);
+      expect(MIGRATIONS.length).toBe(23);
       expect(Array.isArray(MIGRATIONS)).toBe(true);
     } finally {
       db.close();
@@ -1204,7 +1204,7 @@ describe('R5J2 MCP Session Authority and Scoped Context Read Truth Suite', () =>
 
     const rcScript = fs.readFileSync(path.join(process.cwd(), 'scripts/verify-demo-rc-win.ps1'), 'utf-8');
     expect(rcScript).not.toContain('Expected exactly 20 migrations');
-    expect(rcScript).toContain('Expected exactly 22 migrations');
+    expect(rcScript).toContain('Expected exactly 23 migrations');
   });
 
   it('4. Migration 21 fails closed on pre-existing conflicting mcp_client_sessions table with no ledger row written', () => {

@@ -1468,9 +1468,9 @@ describe('Owner Routing & Manual Bridge Handoff Loop (PR #8)', () => {
       expect(exec.status).toBe('AWAITING_OWNER');
     });
 
-    it('39. Emergency Stop remains functional and unaffected', () => {
+    it('39. Emergency Stop remains functional and unaffected', async () => {
       repo.updateProjectStatus(testProjectId, 'RUNNING');
-      const stopRes = emergencyStopService.triggerEmergencyStop('Test stop');
+      const stopRes = await emergencyStopService.triggerEmergencyStop('Test stop');
       expect(stopRes.projectsPaused).toContain(testProjectId);
       expect(repo.getProject(testProjectId)?.status).toBe('PAUSED');
 

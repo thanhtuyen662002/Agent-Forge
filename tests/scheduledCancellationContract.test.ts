@@ -483,7 +483,7 @@ setInterval(() => {
   });
 
   afterEach(async () => {
-    ProcessRunner.terminateAllProcesses();
+    await ProcessRunner.terminateAllProcesses();
     db.close();
     try {
       if (fs.existsSync(tempBaseDir)) {
@@ -611,7 +611,7 @@ setInterval(() => {
     expect(res2.errorCode).toBe('PROCESS_LAUNCH_FAILED');
     expect(res2.stderr).toContain('DUPLICATE_ACTIVE_PROCESS_ID');
 
-    ProcessRunner.cancel(customId);
+    await ProcessRunner.cancel(customId);
     await p1;
   });
 
@@ -1070,8 +1070,8 @@ setInterval(() => {
 
   it('38. ProcessRunner.cancel(unknown ID) creates no pending cancellation state', async () => {
     const unknownId = crypto.randomUUID();
-    const cancelled = ProcessRunner.cancel(unknownId);
-    expect(cancelled).toBe(false);
+    const cancelled = await ProcessRunner.cancel(unknownId);
+    expect(cancelled).toBe('NOT_APPLICABLE');
 
     const res = await ProcessRunner.execute({
       executable: process.execPath,

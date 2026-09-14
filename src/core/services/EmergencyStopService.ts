@@ -9,6 +9,8 @@ export interface EmergencyStopResult {
   tasksPaused: string[];
   projectsPaused: string[];
   timestamp: string;
+  unprovenProcesses: number;
+  allTerminatedProven: boolean;
 }
 
 export class EmergencyStopService {
@@ -17,11 +19,16 @@ export class EmergencyStopService {
     private eventService: EventService
   ) {}
 
-  public triggerEmergencyStop(reason: string = 'Owner Emergency Stop Triggered'): EmergencyStopResult {
+  public async triggerEmergencyStop(
+    reason: string = 'Owner Emergency Stop Triggered'
+  ): Promise<EmergencyStopResult> {
     const now = new Date().toISOString();
 
-    // 1. Terminate all running child processes immediately
-    const processesTerminated = ProcessRunner.terminateAllProcesses();
+    // 1. Terminate all running child processes immediately and await truthfully before writing any events
+    const summary = await ProcessRunner.terminateAllProcesses();
+    const provenTerminated = summary.allTerminatedProven
+      ? summary.count
+      : Math.max(0, summary.count - summary.unproven);
 
     // 2. Pause all active running projects
     const allProjects = this.repo.getAllProjects();
@@ -32,18 +39,12 @@ export class EmergencyStopService {
         const nextStatus = ProjectStateMachine.transition(proj.status, 'PAUSE');
         this.repo.updateProjectStatus(proj.id, nextStatus);
         projectsPaused.push(proj.id);
-
-        this.eventService.record(
-          proj.id,
-          'EMERGENCY_STOP',
-          `Emergency stop triggered for project: ${proj.name}. Reason: ${reason}`,
-          { reason, processesTerminated }
-        );
       }
     }
 
     // 3. Pause all active tasks in progress
     const tasksPaused: string[] = [];
+    const taskProjectIds: string[] = [];
     for (const proj of allProjects) {
       const tasks = this.repo.getTasksByProject(proj.id);
       for (const t of tasks) {
@@ -51,6 +52,7 @@ export class EmergencyStopService {
           const transitionRes = TaskStateMachine.transition(t.state, 'PAUSE');
           this.repo.updateTaskState(t.id, transitionRes.nextState, transitionRes.pausedFromState);
           tasksPaused.push(t.id);
+          taskProjectIds.push(proj.id);
 
           this.eventService.record(
             proj.id,
@@ -63,11 +65,30 @@ export class EmergencyStopService {
       }
     }
 
+    // 4. Emit exactly one canonical emergency-stop event per affected project with identical termination summary
+    const affectedProjectIds = Array.from(new Set([...projectsPaused, ...taskProjectIds]));
+    for (const projId of affectedProjectIds) {
+      const proj = this.repo.getProject(projId);
+      this.eventService.record(
+        projId,
+        'EMERGENCY_STOP',
+        `Emergency stop triggered for project: ${proj ? proj.name : projId}. Reason: ${reason}`,
+        {
+          reason,
+          processesTerminated: provenTerminated,
+          unprovenProcesses: summary.unproven,
+          allTerminatedProven: summary.allTerminatedProven,
+        }
+      );
+    }
+
     return {
-      processesTerminated,
+      processesTerminated: provenTerminated,
       tasksPaused,
       projectsPaused,
       timestamp: now,
+      unprovenProcesses: summary.unproven,
+      allTerminatedProven: summary.allTerminatedProven,
     };
   }
 

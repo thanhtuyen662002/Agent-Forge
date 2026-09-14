@@ -1350,3 +1350,5 @@ export interface AuthorizedContextResponse {
   instruction_payload_hash: string;
   context_manifest_hash: string;
 }
+
+export * from './adjudication';

@@ -4,6 +4,8 @@ import { EventService } from './EventService';
 import { Repository } from '../database/repositories';
 import { ExecutionRecoveryScanner } from './ExecutionRecoveryScanner';
 import { ExecutionRecoveryScanReport } from '../types/domain';
+import { CoderSubmissionAdjudicationRecoveryScanner } from './CoderSubmissionAdjudicationRecoveryScanner';
+import { AdjudicationRecoveryScanReport } from '../types/adjudication';
 
 export interface RecoveryReport {
   migrationsApplied: boolean;
@@ -11,6 +13,7 @@ export interface RecoveryReport {
   staleLeasesCleared: number;
   recoveredAt: string;
   executionRecovery?: ExecutionRecoveryScanReport;
+  adjudicationRecovery?: AdjudicationRecoveryScanReport;
 }
 
 export class CrashRecoveryService {
@@ -30,6 +33,10 @@ export class CrashRecoveryService {
     // 2. Focused R5I Execution Recovery Scanner (runs after migrations, before dispatch-capable services)
     const scanner = new ExecutionRecoveryScanner(this.db, this.repo, this.eventService);
     const executionRecoveryReport = scanner.scanAndReconcile();
+
+    // 2b. Focused R5J5 Coder Submission Adjudication Recovery Scanner
+    const adjudicationScanner = new CoderSubmissionAdjudicationRecoveryScanner(this.db, this.repo, this.eventService);
+    const adjudicationRecoveryReport = adjudicationScanner.scanAndReconcile();
 
     // 3. Mark any unfinished legacy process runs from a prior crashed session as CANCELLED
     const orphanedProcInfo = this.db
@@ -55,6 +62,7 @@ export class CrashRecoveryService {
       staleLeasesCleared: staleLeasesInfo.changes,
       recoveredAt: now,
       executionRecovery: executionRecoveryReport,
+      adjudicationRecovery: adjudicationRecoveryReport,
     };
 
     const allProjects = this.repo.getAllProjects();

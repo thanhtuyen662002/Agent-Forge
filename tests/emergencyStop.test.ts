@@ -88,8 +88,8 @@ describe('EmergencyStopService', () => {
     db.close();
   });
 
-  it('should safely pause all active tasks and projects on Emergency Stop', () => {
-    const res = emergencyStopService.triggerEmergencyStop('Manual Test Trigger');
+  it('should safely pause all active tasks and projects on Emergency Stop', async () => {
+    const res = await emergencyStopService.triggerEmergencyStop('Manual Test Trigger');
     expect(res.projectsPaused).toContain('PROJ-RUNNING');
     expect(res.tasksPaused).toContain('TASK-CODING');
     expect(res.tasksPaused).toContain('TASK-VALIDATING');
@@ -106,8 +106,8 @@ describe('EmergencyStopService', () => {
     expect(updatedT2.paused_from_state).toBe('VALIDATING');
   });
 
-  it('should deterministically resume paused tasks to their exact prior state', () => {
-    emergencyStopService.triggerEmergencyStop('Manual Pause');
+  it('should deterministically resume paused tasks to their exact prior state', async () => {
+    await emergencyStopService.triggerEmergencyStop('Manual Pause');
     emergencyStopService.resumeProject('PROJ-RUNNING');
 
     const updatedProj = repo.getProject('PROJ-RUNNING')!;
