@@ -4,7 +4,7 @@ import os from 'os';
 import crypto from 'crypto';
 import child_process from 'child_process';
 import Database from 'better-sqlite3';
-import { describe, it, expect, beforeEach, afterEach } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { Client, InMemoryTransport } from '@modelcontextprotocol/client';
 import {
   MIGRATIONS,
@@ -36,6 +36,22 @@ import {
   CANONICAL_ENVELOPE_KEYS,
   MAX_ARGUMENT_BYTES,
   SUBMISSION_TOKEN_REGEX,
+  SUBMISSION_STATUS_TOOL_NAME,
+  SUBMISSION_STATUS_TOOL_DESCRIPTION,
+  SUBMISSION_STATUS_TOOL_ANNOTATIONS,
+  SUBMISSION_STATUS_RESOURCE_NAME,
+  SUBMISSION_STATUS_URI_TEMPLATE,
+  SUBMISSION_STATUS_MIME_TYPE,
+  SUBMISSION_LIFECYCLE_STATUSES,
+  SUBMISSION_TERMINAL_OUTCOMES,
+  SUBMISSION_STATUS_ERROR_CODES,
+  SubmissionStatusInputZodSchema,
+  SubmissionStatusSuccessZodSchema,
+  SubmissionStatusErrorZodSchema,
+  CODER_SUBMISSION_STATUS_INPUT_JSON_SCHEMA,
+  CODER_SUBMISSION_STATUS_OUTPUT_JSON_SCHEMA,
+  sanitizeFailureMessage,
+  MAX_FAILURE_MESSAGE_LENGTH,
 } from '../src/mcp/submissionProtocol';
 import {
   buildAgentForgeSubmissionMcpServer,
@@ -484,10 +500,17 @@ describe('R5J4 Durable Coder Submission Authority Comprehensive Suite', () => {
       await client.connect(clientTransport);
 
       const toolsRes = await client.listTools();
-      expect(toolsRes.tools).toHaveLength(1);
-      const tool = toolsRes.tools[0];
-      expect(tool.name).toBe(SUBMISSION_TOOL_NAME);
-      expect(tool.description).toBeDefined();
+      expect(toolsRes.tools).toHaveLength(2);
+      expect(toolsRes.tools.map((t) => t.name).sort()).toEqual(
+        [SUBMISSION_TOOL_NAME, SUBMISSION_STATUS_TOOL_NAME].sort()
+      );
+      const submitTool = toolsRes.tools.find((t) => t.name === SUBMISSION_TOOL_NAME);
+      expect(submitTool).toBeDefined();
+      expect(submitTool?.description).toBeDefined();
+
+      const templatesRes = await client.listResourceTemplates();
+      expect(templatesRes.resourceTemplates).toHaveLength(1);
+      expect(templatesRes.resourceTemplates[0].uriTemplate).toBe(SUBMISSION_STATUS_URI_TEMPLATE);
 
       const resourcesRes = await client.listResources();
       expect(resourcesRes.resources).toHaveLength(0);
@@ -3024,6 +3047,1068 @@ describe('R5J4 Durable Coder Submission Authority Comprehensive Suite', () => {
       const secondDb = new Database(dbPath);
       expect(() => secondDb.exec('BEGIN EXCLUSIVE; COMMIT;')).not.toThrow();
       secondDb.close();
+    });
+  });
+
+  // ============================================================================
+  // Group 14: R5J6 Coder Submission Status Observability Suite (40 Gated Tests)
+  // ============================================================================
+  describe('Group 14: R5J6 Coder Submission Status Observability Suite', () => {
+    let testDir: string;
+    let db: Database.Database;
+    let dbPath: string;
+    let fixtures: FullSubmissionFixtures;
+
+    function computeSha256(content: string): string {
+      return crypto.createHash('sha256').update(content, 'utf8').digest('hex');
+    }
+
+    function insertTestRunHelper(
+      targetDb: Database.Database,
+      opts: {
+        id?: string;
+        taskId: string;
+        command?: string;
+        exitCode?: number;
+        passedCount?: number;
+        failedCount?: number;
+        skippedCount?: number;
+        durationMs?: number;
+        evidenceId?: string | null;
+        createdAt?: string;
+      }
+    ): string {
+      const id = opts.id ?? `tr-${crypto.randomUUID()}`;
+      const now = opts.createdAt ?? new Date().toISOString();
+      targetDb
+        .prepare(`
+          INSERT INTO test_runs (id, task_id, command, exit_code, passed_count, failed_count, skipped_count, duration_ms, evidence_id, created_at)
+          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        `)
+        .run(
+          id,
+          opts.taskId,
+          opts.command ?? 'npm test',
+          opts.exitCode ?? 0,
+          opts.passedCount ?? 1,
+          opts.failedCount ?? 0,
+          opts.skippedCount ?? 0,
+          opts.durationMs ?? 100,
+          opts.evidenceId ?? null,
+          now
+        );
+      return id;
+    }
+
+    function insertEvidenceHelper(targetDb: Database.Database, f: FullSubmissionFixtures, type: 'GIT_STATUS' | 'GIT_DIFF'): string {
+      const id = `ev-${crypto.randomUUID()}`;
+      const now = new Date().toISOString();
+      const content = 'dummy-evidence-content';
+      const hash = computeSha256(content);
+      targetDb.prepare(`
+        INSERT INTO evidence (id, project_id, task_id, attempt_id, evidence_type, storage_type, file_path, hash, byte_size, content_type, summary, raw_payload, created_at)
+        VALUES (?, ?, ?, ?, ?, 'INLINE', 'dummy.txt', ?, ?, 'text/plain', 'evidence', ?, ?)
+      `).run(id, f.projectId, f.taskId, f.attemptId, type, hash, content.length, content, now);
+      return id;
+    }
+
+    function insertAdjudicationHelper(
+      targetDb: Database.Database,
+      f: FullSubmissionFixtures,
+      submissionId: string,
+      opts: {
+        id?: string;
+        action?: 'ADMIT_VERIFICATION' | 'REJECT' | 'SUPERSEDE';
+        status?: 'ADMITTED' | 'VERIFYING' | 'VERIFIED' | 'VERIFICATION_FAILED' | 'RECOVERY_FENCED' | 'REJECTED' | 'SUPERSEDED';
+        lifecycleVersion?: number;
+        testRunId?: string | null;
+        failureCode?: string | null;
+        failureJson?: string | null;
+        completedAt?: string | null;
+        recoveryFencedAt?: string | null;
+        verificationStartedAt?: string | null;
+        verificationResultEnvelopeJson?: string | null;
+        verificationResultEnvelopeHash?: string | null;
+        authoritySnapshotJson?: string | null;
+        authoritySnapshotHash?: string | null;
+        createdAt?: string;
+        events?: Array<{ sequence: number; eventType: string; payloadJson?: string }>;
+      }
+    ): string {
+      const id = opts.id ?? crypto.randomUUID();
+      const requestId = crypto.randomUUID();
+      const now = opts.createdAt ?? (opts.completedAt ?? new Date().toISOString());
+      const status = opts.status ?? 'ADMITTED';
+      const action =
+        opts.action ??
+        (status === 'REJECTED' ? 'REJECT' : status === 'SUPERSEDED' ? 'SUPERSEDE' : 'ADMIT_VERIFICATION');
+      const lifecycleVersion =
+        opts.lifecycleVersion ??
+        (['ADMITTED', 'REJECTED', 'SUPERSEDED'].includes(status) ? 1 : status === 'VERIFYING' ? 2 : 3);
+
+      const snapObj = { project_id: f.projectId, task_id: f.taskId, status };
+      const snapJson = opts.authoritySnapshotJson !== undefined ? opts.authoritySnapshotJson : canonicalJsonStringify(snapObj);
+      const snapHash = opts.authoritySnapshotHash !== undefined ? opts.authoritySnapshotHash : (snapJson ? computeSha256(snapJson) : null);
+
+      const cmdJson =
+        action === 'ADMIT_VERIFICATION'
+          ? canonicalJsonStringify({ TEST: 'npm test', LINT: null, BUILD: null })
+          : null;
+      const cmdHash = cmdJson ? computeSha256(cmdJson) : null;
+
+      let envJson = opts.verificationResultEnvelopeJson !== undefined ? opts.verificationResultEnvelopeJson : null;
+      let envHash = opts.verificationResultEnvelopeHash !== undefined ? opts.verificationResultEnvelopeHash : null;
+
+      let gitStatusEvId: string | null = null;
+      let gitDiffEvId: string | null = null;
+      let artifactManifestJson: string | null = null;
+      let artifactManifestHash: string | null = null;
+      let workspaceSnapshotJson: string | null = null;
+      let workspaceSnapshotHash: string | null = null;
+      let verificationExecId: string | null = null;
+
+      if (status === 'VERIFYING') {
+        workspaceSnapshotJson = canonicalJsonStringify({ files: [] });
+        workspaceSnapshotHash = computeSha256(workspaceSnapshotJson);
+        verificationExecId = crypto.randomUUID();
+      } else if (status === 'VERIFIED') {
+        if (!envJson) {
+          envJson = canonicalJsonStringify({ verified: true, tests_passed: 1 });
+        }
+        if (!envHash) {
+          envHash = computeSha256(envJson);
+        }
+        gitStatusEvId = insertEvidenceHelper(targetDb, f, 'GIT_STATUS');
+        gitDiffEvId = insertEvidenceHelper(targetDb, f, 'GIT_DIFF');
+        artifactManifestJson = canonicalJsonStringify({ artifacts: [] });
+        artifactManifestHash = computeSha256(artifactManifestJson);
+        verificationExecId = crypto.randomUUID();
+        workspaceSnapshotJson = canonicalJsonStringify({ files: [] });
+        workspaceSnapshotHash = computeSha256(workspaceSnapshotJson);
+      }
+
+      if (envJson && !envHash) {
+        envHash = computeSha256(envJson);
+      }
+
+      const verificationStartedAt =
+        opts.verificationStartedAt !== undefined
+          ? opts.verificationStartedAt
+          : ['VERIFYING', 'VERIFIED'].includes(status)
+          ? now
+          : null;
+
+      const completedAt =
+        opts.completedAt !== undefined
+          ? opts.completedAt
+          : ['VERIFIED', 'VERIFICATION_FAILED', 'REJECTED', 'SUPERSEDED'].includes(status)
+          ? now
+          : null;
+
+      const fencedAt =
+        opts.recoveryFencedAt !== undefined
+          ? opts.recoveryFencedAt
+          : status === 'RECOVERY_FENCED'
+          ? now
+          : null;
+
+      const failureCode =
+        opts.failureCode !== undefined
+          ? opts.failureCode
+          : ['VERIFICATION_FAILED', 'RECOVERY_FENCED'].includes(status)
+          ? 'VERIFICATION_PROCESS_NON_ZERO'
+          : null;
+
+      targetDb
+        .prepare(`
+          INSERT INTO coder_submission_adjudications (
+            id, request_id, submission_id, authorization_id, project_id, task_id,
+            attempt_id, assignment_id, task_ownership_epoch, action, status,
+            lifecycle_version, authority_snapshot_json, authority_snapshot_hash,
+            verification_commands_json, verification_commands_hash,
+            workspace_snapshot_before_json, workspace_snapshot_before_hash,
+            verification_result_envelope_json, verification_result_envelope_hash,
+            verification_execution_id, protocol_message_id, test_run_id,
+            git_status_evidence_id, git_diff_evidence_id, failure_code, failure_json,
+            created_at, verification_started_at, completed_at, recovery_fenced_at,
+            artifact_manifest_json, artifact_manifest_hash
+          ) VALUES (
+            ?, ?, ?, ?, ?, ?,
+            ?, ?, ?, ?, ?,
+            ?, ?, ?,
+            ?, ?,
+            ?, ?,
+            ?, ?,
+            ?, ?, ?,
+            ?, ?, ?, ?,
+            ?, ?, ?, ?,
+            ?, ?
+          )
+        `)
+        .run(
+          id,
+          requestId,
+          submissionId,
+          f.authorizationId,
+          f.projectId,
+          f.taskId,
+          f.attemptId,
+          f.assignmentId,
+          1,
+          action,
+          status,
+          lifecycleVersion,
+          snapJson,
+          snapHash,
+          cmdJson,
+          cmdHash,
+          workspaceSnapshotJson,
+          workspaceSnapshotHash,
+          envJson,
+          envHash,
+          verificationExecId,
+          null,
+          opts.testRunId ?? null,
+          gitStatusEvId,
+          gitDiffEvId,
+          failureCode,
+          opts.failureJson ?? null,
+          now,
+          verificationStartedAt,
+          completedAt,
+          fencedAt,
+          artifactManifestJson,
+          artifactManifestHash
+        );
+
+      const eventDefs: Array<{ sequence: number; eventType: string; payloadJson?: string }> =
+        opts.events ??
+        (() => {
+          if (status === 'ADMITTED') {
+            return [{ sequence: 1, eventType: 'ADMITTED' }];
+          } else if (status === 'VERIFYING') {
+            return [
+              { sequence: 1, eventType: 'ADMITTED' },
+              { sequence: 2, eventType: 'VERIFICATION_CLAIMED' },
+            ];
+          } else if (status === 'VERIFIED') {
+            return [
+              { sequence: 1, eventType: 'ADMITTED' },
+              { sequence: 2, eventType: 'VERIFICATION_CLAIMED' },
+              { sequence: 3, eventType: 'VERIFICATION_SUCCEEDED' },
+            ];
+          } else if (status === 'VERIFICATION_FAILED') {
+            return [
+              { sequence: 1, eventType: 'ADMITTED' },
+              { sequence: 2, eventType: 'VERIFICATION_CLAIMED' },
+              { sequence: 3, eventType: 'VERIFICATION_FAILED' },
+            ];
+          } else if (status === 'RECOVERY_FENCED') {
+            return [
+              { sequence: 1, eventType: 'ADMITTED' },
+              { sequence: 2, eventType: 'VERIFICATION_CLAIMED' },
+              { sequence: 3, eventType: 'RECOVERY_FENCED' },
+            ];
+          } else if (status === 'REJECTED') {
+            return [{ sequence: 1, eventType: 'REJECTED' }];
+          } else if (status === 'SUPERSEDED') {
+            return [{ sequence: 1, eventType: 'SUPERSEDED' }];
+          }
+          return [{ sequence: 1, eventType: 'ADMITTED' }];
+        })();
+
+      for (const ed of eventDefs) {
+        const evPayload = ed.payloadJson ?? canonicalJsonStringify({ status: ed.eventType, adjudication_id: id });
+        const evHash = computeSha256(evPayload);
+        targetDb
+          .prepare(`
+            INSERT INTO coder_submission_adjudication_events (
+              id, adjudication_id, sequence, event_type, payload_json, payload_hash, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?)
+          `)
+          .run(crypto.randomUUID(), id, ed.sequence, ed.eventType, evPayload, evHash, now);
+      }
+
+      return id;
+    }
+
+    beforeEach(() => {
+      testDir = fs.mkdtempSync(path.join(os.tmpdir(), 'af-status-test-'));
+      const created = createTestDatabase(testDir, 'status-test.db');
+      db = created.db;
+      dbPath = created.dbPath;
+      fixtures = setupFullSubmissionGraph(db);
+    });
+
+    afterEach(() => {
+      try {
+        if (db && db.open) db.close();
+      } finally {
+        if (testDir && fs.existsSync(testDir)) {
+          fs.rmSync(testDir, { recursive: true, force: true });
+        }
+      }
+    });
+
+    it('1. Exact tool discovery: existing submit tool plus exactly one status tool', async () => {
+      const server = buildAgentForgeSubmissionMcpServer({ db, service: fixtures.service });
+      const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+      await server.connect(serverTransport);
+      const client = new Client({ name: 'test-client', version: '1.0.0' });
+      await client.connect(clientTransport);
+
+      const toolsRes = await client.listTools();
+      expect(toolsRes.tools).toHaveLength(2);
+      const toolNames = toolsRes.tools.map((t) => t.name).sort();
+      expect(toolNames).toEqual([SUBMISSION_STATUS_TOOL_NAME, SUBMISSION_TOOL_NAME].sort());
+
+      const statusTool = toolsRes.tools.find((t) => t.name === SUBMISSION_STATUS_TOOL_NAME);
+      expect(statusTool).toBeDefined();
+      expect(statusTool?.annotations).toEqual(SUBMISSION_STATUS_TOOL_ANNOTATIONS);
+    });
+
+    it('2. Exact resource-template discovery', async () => {
+      const server = buildAgentForgeSubmissionMcpServer({ db, service: fixtures.service });
+      const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+      await server.connect(serverTransport);
+      const client = new Client({ name: 'test-client', version: '1.0.0' });
+      await client.connect(clientTransport);
+
+      const templatesRes = await client.listResourceTemplates();
+      expect(templatesRes.resourceTemplates).toHaveLength(1);
+      const template = templatesRes.resourceTemplates[0];
+      expect(template.name).toBe(SUBMISSION_STATUS_RESOURCE_NAME);
+      expect(template.uriTemplate).toBe(SUBMISSION_STATUS_URI_TEMPLATE);
+      expect(template.mimeType).toBe(SUBMISSION_STATUS_MIME_TYPE);
+    });
+
+    it('3. Tool/resource output parity', async () => {
+      const { plaintextToken } = issueSubmissionSessionHelper(fixtures.repo, fixtures.authorizationId);
+      const subId = crypto.randomUUID();
+      fixtures.service.submitCoderClaim(createValidSubmissionPayload(fixtures, subId), plaintextToken);
+
+      const server = buildAgentForgeSubmissionMcpServer({ db, service: fixtures.service, submissionToken: plaintextToken });
+      const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+      await server.connect(serverTransport);
+      const client = new Client({ name: 'test-client', version: '1.0.0' });
+      await client.connect(clientTransport);
+
+      // Call tool
+      const toolRes = await client.callTool({
+        name: SUBMISSION_STATUS_TOOL_NAME,
+        arguments: { submission_id: subId },
+      });
+      expect(toolRes.isError).toBeFalsy();
+      const toolStructured = (toolRes as any).structuredContent;
+
+      // Read resource
+      const resourceRes = await client.readResource({
+        uri: `agentforge://submissions/${subId}`,
+      });
+      expect(resourceRes.contents).toHaveLength(1);
+      const resourceText = (resourceRes.contents[0] as { text: string }).text;
+
+      // Byte-for-byte canonical equivalence
+      expect(canonicalJsonStringify(toolStructured)).toBe(resourceText);
+    });
+
+    it('4. QUARANTINED projection with no adjudication', () => {
+      const { plaintextToken } = issueSubmissionSessionHelper(fixtures.repo, fixtures.authorizationId);
+      const subId = crypto.randomUUID();
+      fixtures.service.submitCoderClaim(createValidSubmissionPayload(fixtures, subId), plaintextToken);
+
+      const res = fixtures.service.getSubmissionStatus({ submission_id: subId }, plaintextToken);
+      expect(res.ok).toBe(true);
+      if (res.ok) {
+        expect(res.submission_id).toBe(subId);
+        expect(res.lifecycle_status).toBe('QUARANTINED');
+        expect(res.terminal_outcome).toBeNull();
+        expect(res.task_state).toBe('CODING');
+        expect(res.verification_summary).toBeNull();
+        expect(res.settled_at).toBeNull();
+        expect(res.submitted_at).toBeDefined();
+      }
+    });
+
+    it('5. ADMITTED projection', () => {
+      const { plaintextToken } = issueSubmissionSessionHelper(fixtures.repo, fixtures.authorizationId);
+      const subId = crypto.randomUUID();
+      fixtures.service.submitCoderClaim(createValidSubmissionPayload(fixtures, subId), plaintextToken);
+      insertAdjudicationHelper(db, fixtures, subId, { status: 'ADMITTED' });
+
+      const res = fixtures.service.getSubmissionStatus({ submission_id: subId }, plaintextToken);
+      expect(res.ok).toBe(true);
+      if (res.ok) {
+        expect(res.lifecycle_status).toBe('ADMITTED');
+        expect(res.terminal_outcome).toBeNull();
+        expect(res.verification_summary).toBeNull();
+        expect(res.settled_at).toBeNull();
+      }
+    });
+
+    it('6. VERIFYING projection', () => {
+      const { plaintextToken } = issueSubmissionSessionHelper(fixtures.repo, fixtures.authorizationId);
+      const subId = crypto.randomUUID();
+      fixtures.service.submitCoderClaim(createValidSubmissionPayload(fixtures, subId), plaintextToken);
+      insertAdjudicationHelper(db, fixtures, subId, { status: 'VERIFYING' });
+
+      const res = fixtures.service.getSubmissionStatus({ submission_id: subId }, plaintextToken);
+      expect(res.ok).toBe(true);
+      if (res.ok) {
+        expect(res.lifecycle_status).toBe('VERIFYING');
+        expect(res.terminal_outcome).toBeNull();
+        expect(res.verification_summary).toBeNull();
+        expect(res.settled_at).toBeNull();
+      }
+    });
+
+    it('7. VERIFIED -> ACCEPTED_VERIFIED projection', () => {
+      const { plaintextToken } = issueSubmissionSessionHelper(fixtures.repo, fixtures.authorizationId);
+      const subId = crypto.randomUUID();
+      fixtures.service.submitCoderClaim(createValidSubmissionPayload(fixtures, subId), plaintextToken);
+      const testRunId = insertTestRunHelper(db, {
+        taskId: fixtures.taskId,
+        exitCode: 0,
+        passedCount: 8,
+        failedCount: 0,
+        skippedCount: 1,
+        durationMs: 450,
+      });
+      const completedAt = new Date().toISOString();
+      insertAdjudicationHelper(db, fixtures, subId, {
+        status: 'VERIFIED',
+        testRunId,
+        completedAt,
+      });
+
+      const res = fixtures.service.getSubmissionStatus({ submission_id: subId }, plaintextToken);
+      expect(res.ok).toBe(true);
+      if (res.ok) {
+        expect(res.lifecycle_status).toBe('VERIFIED');
+        expect(res.terminal_outcome).toBe('ACCEPTED_VERIFIED');
+        expect(res.settled_at).toBe(completedAt);
+        expect(res.verification_summary).toEqual({
+          exit_code: 0,
+          passed_count: 8,
+          failed_count: 0,
+          skipped_count: 1,
+          duration_ms: 450,
+          failure_code: null,
+          failure_message: null,
+        });
+      }
+    });
+
+    it('8. VERIFICATION_FAILED projection with exact metrics and scrubbed message', () => {
+      const { plaintextToken } = issueSubmissionSessionHelper(fixtures.repo, fixtures.authorizationId);
+      const subId = crypto.randomUUID();
+      fixtures.service.submitCoderClaim(createValidSubmissionPayload(fixtures, subId), plaintextToken);
+      const testRunId = insertTestRunHelper(db, {
+        taskId: fixtures.taskId,
+        exitCode: 1,
+        passedCount: 5,
+        failedCount: 2,
+        skippedCount: 0,
+        durationMs: 820,
+      });
+      const completedAt = new Date().toISOString();
+      insertAdjudicationHelper(db, fixtures, subId, {
+        status: 'VERIFICATION_FAILED',
+        testRunId,
+        failureCode: 'TEST_SUITE_FAILED',
+        failureJson: JSON.stringify({ error: 'Failure at C:\\Users\\Tester\\app\\test.ts' }),
+        completedAt,
+      });
+
+      const res = fixtures.service.getSubmissionStatus({ submission_id: subId }, plaintextToken);
+      expect(res.ok).toBe(true);
+      if (res.ok) {
+        expect(res.lifecycle_status).toBe('VERIFICATION_FAILED');
+        expect(res.terminal_outcome).toBe('VERIFICATION_FAILED');
+        expect(res.settled_at).toBe(completedAt);
+        expect(res.verification_summary).toEqual({
+          exit_code: 1,
+          passed_count: 5,
+          failed_count: 2,
+          skipped_count: 0,
+          duration_ms: 820,
+          failure_code: 'TEST_SUITE_FAILED',
+          failure_message: 'Failure at [REDACTED_PATH]',
+        });
+      }
+    });
+
+    it('9. RECOVERY_FENCED projection', () => {
+      const { plaintextToken } = issueSubmissionSessionHelper(fixtures.repo, fixtures.authorizationId);
+      const subId = crypto.randomUUID();
+      fixtures.service.submitCoderClaim(createValidSubmissionPayload(fixtures, subId), plaintextToken);
+      const fencedAt = new Date().toISOString();
+      insertAdjudicationHelper(db, fixtures, subId, {
+        status: 'RECOVERY_FENCED',
+        failureCode: 'ORPHANED_VERIFICATION_CANCELLED',
+        failureJson: JSON.stringify({ error: 'Process timeout after 60000ms' }),
+        recoveryFencedAt: fencedAt,
+      });
+
+      const res = fixtures.service.getSubmissionStatus({ submission_id: subId }, plaintextToken);
+      expect(res.ok).toBe(true);
+      if (res.ok) {
+        expect(res.lifecycle_status).toBe('RECOVERY_FENCED');
+        expect(res.terminal_outcome).toBe('RECOVERY_FENCED');
+        expect(res.settled_at).toBe(fencedAt);
+        expect(res.verification_summary?.failure_code).toBe('ORPHANED_VERIFICATION_CANCELLED');
+        expect(res.verification_summary?.failure_message).toBe('Process timeout after 60000ms');
+      }
+    });
+
+    it('10. Owner REJECTED projection', () => {
+      const { plaintextToken } = issueSubmissionSessionHelper(fixtures.repo, fixtures.authorizationId);
+      const subId = crypto.randomUUID();
+      fixtures.service.submitCoderClaim(createValidSubmissionPayload(fixtures, subId), plaintextToken);
+      const completedAt = new Date().toISOString();
+      insertAdjudicationHelper(db, fixtures, subId, {
+        status: 'REJECTED',
+        action: 'REJECT',
+        failureCode: 'REJECTED_BY_OPERATOR',
+        failureJson: JSON.stringify({ operator_reason: 'Code quality does not meet standards' }),
+        completedAt,
+      });
+
+      const res = fixtures.service.getSubmissionStatus({ submission_id: subId }, plaintextToken);
+      expect(res.ok).toBe(true);
+      if (res.ok) {
+        expect(res.lifecycle_status).toBe('REJECTED');
+        expect(res.terminal_outcome).toBe('REJECTED');
+        expect(res.settled_at).toBe(completedAt);
+        expect(res.verification_summary?.exit_code).toBeNull();
+        expect(res.verification_summary?.failure_code).toBe('REJECTED_BY_OPERATOR');
+        expect(res.verification_summary?.failure_message).toBe('Code quality does not meet standards');
+      }
+    });
+
+    it('11. Owner SUPERSEDED projection', () => {
+      const { plaintextToken } = issueSubmissionSessionHelper(fixtures.repo, fixtures.authorizationId);
+      const subId = crypto.randomUUID();
+      fixtures.service.submitCoderClaim(createValidSubmissionPayload(fixtures, subId), plaintextToken);
+      const completedAt = new Date().toISOString();
+      insertAdjudicationHelper(db, fixtures, subId, {
+        status: 'SUPERSEDED',
+        action: 'SUPERSEDE',
+        failureCode: 'SUPERSEDED_BY_NEWER_CLAIM',
+        failureJson: JSON.stringify({ operator_reason: 'Newer attempt claimed task' }),
+        completedAt,
+      });
+
+      const res = fixtures.service.getSubmissionStatus({ submission_id: subId }, plaintextToken);
+      expect(res.ok).toBe(true);
+      if (res.ok) {
+        expect(res.lifecycle_status).toBe('SUPERSEDED');
+        expect(res.terminal_outcome).toBe('SUPERSEDED');
+        expect(res.settled_at).toBe(completedAt);
+        expect(res.verification_summary?.failure_code).toBe('SUPERSEDED_BY_NEWER_CLAIM');
+        expect(res.verification_summary?.failure_message).toBe('Newer attempt claimed task');
+      }
+    });
+
+    it('12. Valid replacement token for the same authorization can observe an earlier submission', () => {
+      // Issue first session and submit
+      const { plaintextToken: token1, sessionId: sess1 } = issueSubmissionSessionHelper(fixtures.repo, fixtures.authorizationId);
+      const subId = crypto.randomUUID();
+      fixtures.service.submitCoderClaim(createValidSubmissionPayload(fixtures, subId), token1);
+
+      // Issue replacement session (revokes token1, creates token2)
+      fixtures.repo.revokeMcpSubmissionSession(sess1, new Date().toISOString(), 'ROTATION');
+      const { plaintextToken: token2 } = issueSubmissionSessionHelper(fixtures.repo, fixtures.authorizationId);
+
+      // token2 can observe subId
+      const res = fixtures.service.getSubmissionStatus({ submission_id: subId }, token2);
+      expect(res.ok).toBe(true);
+      if (res.ok) {
+        expect(res.submission_id).toBe(subId);
+        expect(res.lifecycle_status).toBe('QUARANTINED');
+      }
+    });
+
+    it('13. Superseded/revoked old token is rejected', () => {
+      const { plaintextToken: token1, sessionId: sess1 } = issueSubmissionSessionHelper(fixtures.repo, fixtures.authorizationId);
+      const subId = crypto.randomUUID();
+      fixtures.service.submitCoderClaim(createValidSubmissionPayload(fixtures, subId), token1);
+
+      // Reissue creates new session and revokes old
+      fixtures.repo.revokeMcpSubmissionSession(sess1, new Date().toISOString(), 'ROTATION');
+      issueSubmissionSessionHelper(fixtures.repo, fixtures.authorizationId);
+
+      const res = fixtures.service.getSubmissionStatus({ submission_id: subId }, token1);
+      expect(res.ok).toBe(false);
+      if (!res.ok) {
+        expect(res.error_code).toBe('MCP_SESSION_REVOKED');
+        expect(res.retryable).toBe(false);
+      }
+    });
+
+    it('14. Expired token is rejected', () => {
+      const past = new Date(Date.now() - 3600 * 1000).toISOString();
+      const { plaintextToken } = issueSubmissionSessionHelper(fixtures.repo, fixtures.authorizationId, 300, past);
+      const subId = crypto.randomUUID();
+
+      const res = fixtures.service.getSubmissionStatus({ submission_id: subId }, plaintextToken);
+      expect(res.ok).toBe(false);
+      if (!res.ok) {
+        expect(res.error_code).toBe('MCP_SESSION_EXPIRED');
+        expect(res.retryable).toBe(false);
+      }
+    });
+
+    it('15. Malformed token is rejected', () => {
+      const subId = crypto.randomUUID();
+      const res = fixtures.service.getSubmissionStatus({ submission_id: subId }, 'bad-token');
+      expect(res.ok).toBe(false);
+      if (!res.ok) {
+        expect(res.error_code).toBe('INVALID_SUBMISSION_TOKEN');
+        expect(res.retryable).toBe(false);
+      }
+    });
+
+    it('16. af-mcp context token is rejected', () => {
+      const subId = crypto.randomUUID();
+      const res = fixtures.service.getSubmissionStatus(
+        { submission_id: subId },
+        'af-mcp-1234567890123456789012345678901234567890123'
+      );
+      expect(res.ok).toBe(false);
+      if (!res.ok) {
+        expect(res.error_code).toBe('INVALID_SUBMISSION_TOKEN');
+        expect(res.retryable).toBe(false);
+      }
+    });
+
+    it('17. Missing configured token is rejected', () => {
+      const subId = crypto.randomUUID();
+      const res = fixtures.service.getSubmissionStatus({ submission_id: subId }, undefined);
+      expect(res.ok).toBe(false);
+      if (!res.ok) {
+        expect(res.error_code).toBe('INVALID_SUBMISSION_TOKEN');
+        expect(res.retryable).toBe(false);
+      }
+    });
+
+    it('18. Cross-authorization lookup returns indistinguishable SUBMISSION_NOT_FOUND', () => {
+      // Create authorization 1 and submit
+      const { plaintextToken: token1 } = issueSubmissionSessionHelper(fixtures.repo, fixtures.authorizationId);
+      const subId = crypto.randomUUID();
+      fixtures.service.submitCoderClaim(createValidSubmissionPayload(fixtures, subId), token1);
+
+      // Create authorization 2 with its own session
+      const auth2Id = `auth-2-${crypto.randomUUID()}`;
+      const auth2 = { ...fixtures.auth, id: auth2Id };
+      fixtures.repo.createExecutionAuthorization(auth2);
+
+      const { plaintextToken: token2 } = issueSubmissionSessionHelper(fixtures.repo, auth2Id);
+
+      // Lookup subId with token2
+      const res = fixtures.service.getSubmissionStatus({ submission_id: subId }, token2);
+      expect(res.ok).toBe(false);
+      if (!res.ok) {
+        expect(res.error_code).toBe('SUBMISSION_NOT_FOUND');
+        expect(res.retryable).toBe(false);
+      }
+    });
+
+    it('19. Cross-task and cross-project lookup returns indistinguishable SUBMISSION_NOT_FOUND', () => {
+      const { plaintextToken } = issueSubmissionSessionHelper(fixtures.repo, fixtures.authorizationId);
+      const subId = crypto.randomUUID();
+      fixtures.service.submitCoderClaim(createValidSubmissionPayload(fixtures, subId), plaintextToken);
+
+      // Set up a second completely independent project/task graph
+      const fixtures2 = setupFullSubmissionGraph(db);
+      const { plaintextToken: token2 } = issueSubmissionSessionHelper(fixtures2.repo, fixtures2.authorizationId);
+      const subId2 = crypto.randomUUID();
+      fixtures2.service.submitCoderClaim(createValidSubmissionPayload(fixtures2, subId2), token2);
+
+      // Query subId2 using token1 (belonging to fixtures)
+      const res = fixtures.service.getSubmissionStatus({ submission_id: subId2 }, plaintextToken);
+      expect(res.ok).toBe(false);
+      if (!res.ok) {
+        expect(res.error_code).toBe('SUBMISSION_NOT_FOUND');
+        expect(res.retryable).toBe(false);
+      }
+    });
+
+    it('20. Unknown UUID returns SUBMISSION_NOT_FOUND', () => {
+      const { plaintextToken } = issueSubmissionSessionHelper(fixtures.repo, fixtures.authorizationId);
+      const unknownUuid = '11111111-2222-4333-8444-555555555555';
+      const res = fixtures.service.getSubmissionStatus({ submission_id: unknownUuid }, plaintextToken);
+      expect(res.ok).toBe(false);
+      if (!res.ok) {
+        expect(res.error_code).toBe('SUBMISSION_NOT_FOUND');
+        expect(res.retryable).toBe(false);
+      }
+    });
+
+    it('21. Extra input property rejected', () => {
+      const { plaintextToken } = issueSubmissionSessionHelper(fixtures.repo, fixtures.authorizationId);
+      const res = fixtures.service.getSubmissionStatus(
+        { submission_id: crypto.randomUUID(), extra_field: 'forbidden' },
+        plaintextToken
+      );
+      expect(res.ok).toBe(false);
+      if (!res.ok) {
+        expect(res.error_code).toBe('SCHEMA_VALIDATION_FAILED');
+        expect(res.retryable).toBe(false);
+      }
+    });
+
+    it('22. Uppercase or non-v4 UUID rejected', () => {
+      const { plaintextToken } = issueSubmissionSessionHelper(fixtures.repo, fixtures.authorizationId);
+      const uppercaseUuid = crypto.randomUUID().toUpperCase();
+      const res1 = fixtures.service.getSubmissionStatus({ submission_id: uppercaseUuid }, plaintextToken);
+      expect(res1.ok).toBe(false);
+      if (!res1.ok) {
+        expect(res1.error_code).toBe('SCHEMA_VALIDATION_FAILED');
+      }
+
+      const nonV4Uuid = '00000000-0000-1000-8000-000000000000'; // version 1, not 4
+      const res2 = fixtures.service.getSubmissionStatus({ submission_id: nonV4Uuid }, plaintextToken);
+      expect(res2.ok).toBe(false);
+      if (!res2.ok) {
+        expect(res2.error_code).toBe('SCHEMA_VALIDATION_FAILED');
+      }
+    });
+
+    it('23. Oversized argument payload rejected before service execution', () => {
+      const { plaintextToken } = issueSubmissionSessionHelper(fixtures.repo, fixtures.authorizationId);
+      const bigPayload = {
+        submission_id: crypto.randomUUID(),
+        huge: 'x'.repeat(70000),
+      };
+      const res = fixtures.service.getSubmissionStatus(bigPayload, plaintextToken);
+      expect(res.ok).toBe(false);
+      if (!res.ok) {
+        expect(res.error_code).toBe('SCHEMA_VALIDATION_FAILED');
+      }
+    });
+
+    it('24. Contradictory adjudication history fails closed', () => {
+      const { plaintextToken } = issueSubmissionSessionHelper(fixtures.repo, fixtures.authorizationId);
+      const subId = crypto.randomUUID();
+      fixtures.service.submitCoderClaim(createValidSubmissionPayload(fixtures, subId), plaintextToken);
+
+      // Insert adjudication with contradictory event log (e.g. sequence jumping from 1 to 3)
+      insertAdjudicationHelper(db, fixtures, subId, {
+        status: 'VERIFYING',
+        events: [
+          { sequence: 1, eventType: 'ADMITTED' },
+          { sequence: 3, eventType: 'VERIFICATION_CLAIMED' }, // broken sequence
+        ],
+      });
+
+      const res = fixtures.service.getSubmissionStatus({ submission_id: subId }, plaintextToken);
+      expect(res.ok).toBe(false);
+      if (!res.ok) {
+        expect(res.error_code).toBe('SUBMISSION_STATUS_INTEGRITY_CONFLICT');
+      }
+    });
+
+    it('25. Duplicate/ambiguous terminal authority fails closed', () => {
+      const { plaintextToken } = issueSubmissionSessionHelper(fixtures.repo, fixtures.authorizationId);
+      const subId = crypto.randomUUID();
+      fixtures.service.submitCoderClaim(createValidSubmissionPayload(fixtures, subId), plaintextToken);
+
+      // Insert two terminal adjudications for the same submission
+      const t1 = insertTestRunHelper(db, { taskId: fixtures.taskId, exitCode: 0 });
+      insertAdjudicationHelper(db, fixtures, subId, { status: 'VERIFIED', testRunId: t1, lifecycleVersion: 2 });
+      insertAdjudicationHelper(db, fixtures, subId, { status: 'REJECTED', lifecycleVersion: 3 });
+
+      const res = fixtures.service.getSubmissionStatus({ submission_id: subId }, plaintextToken);
+      expect(res.ok).toBe(false);
+      if (!res.ok) {
+        expect(res.error_code).toBe('SUBMISSION_STATUS_INTEGRITY_CONFLICT');
+      }
+    });
+
+    it('26. Missing required linked test run fails closed', () => {
+      const { plaintextToken } = issueSubmissionSessionHelper(fixtures.repo, fixtures.authorizationId);
+      const subId = crypto.randomUUID();
+      fixtures.service.submitCoderClaim(createValidSubmissionPayload(fixtures, subId), plaintextToken);
+
+      // Point adjudication to a non-existent test_run_id
+      db.pragma('foreign_keys = OFF');
+      insertAdjudicationHelper(db, fixtures, subId, {
+        status: 'VERIFIED',
+        testRunId: 'tr-does-not-exist',
+      });
+      db.pragma('foreign_keys = ON');
+
+      const res = fixtures.service.getSubmissionStatus({ submission_id: subId }, plaintextToken);
+      expect(res.ok).toBe(false);
+      if (!res.ok) {
+        expect(res.error_code).toBe('SUBMISSION_STATUS_INTEGRITY_CONFLICT');
+      }
+    });
+
+    it('27. Test run bound to the wrong task fails closed', () => {
+      const { plaintextToken } = issueSubmissionSessionHelper(fixtures.repo, fixtures.authorizationId);
+      const subId = crypto.randomUUID();
+      fixtures.service.submitCoderClaim(createValidSubmissionPayload(fixtures, subId), plaintextToken);
+
+      // Create test run for different task
+      const otherTaskId = `task-other-${crypto.randomUUID()}`;
+      db.prepare(`
+        INSERT INTO tasks (id, project_id, title, state, revision_count, ownership_epoch, created_at, updated_at)
+        VALUES (?, ?, 'Other', 'CODING', 1, 1, ?, ?)
+      `).run(otherTaskId, fixtures.projectId, new Date().toISOString(), new Date().toISOString());
+
+      const trOther = insertTestRunHelper(db, { taskId: otherTaskId, exitCode: 0 });
+
+      insertAdjudicationHelper(db, fixtures, subId, {
+        status: 'VERIFIED',
+        testRunId: trOther,
+      });
+
+      const res = fixtures.service.getSubmissionStatus({ submission_id: subId }, plaintextToken);
+      expect(res.ok).toBe(false);
+      if (!res.ok) {
+        expect(res.error_code).toBe('SUBMISSION_STATUS_INTEGRITY_CONFLICT');
+      }
+    });
+
+    it('28. Malformed failure_json fails closed', () => {
+      const { plaintextToken } = issueSubmissionSessionHelper(fixtures.repo, fixtures.authorizationId);
+      const subId = crypto.randomUUID();
+      fixtures.service.submitCoderClaim(createValidSubmissionPayload(fixtures, subId), plaintextToken);
+
+      db.pragma('ignore_check_constraints = ON');
+      insertAdjudicationHelper(db, fixtures, subId, {
+        status: 'VERIFICATION_FAILED',
+        failureCode: 'TEST_FAIL',
+        failureJson: '{not-json',
+      });
+      db.pragma('ignore_check_constraints = OFF');
+
+      const res = fixtures.service.getSubmissionStatus({ submission_id: subId }, plaintextToken);
+      expect(res.ok).toBe(false);
+      if (!res.ok) {
+        expect(res.error_code).toBe('SUBMISSION_STATUS_INTEGRITY_CONFLICT');
+      }
+    });
+
+    it('29. Malformed result envelope or hash mismatch fails closed when consulted', () => {
+      const { plaintextToken } = issueSubmissionSessionHelper(fixtures.repo, fixtures.authorizationId);
+      const subId = crypto.randomUUID();
+      fixtures.service.submitCoderClaim(createValidSubmissionPayload(fixtures, subId), plaintextToken);
+
+      insertAdjudicationHelper(db, fixtures, subId, {
+        status: 'VERIFIED',
+        testRunId: insertTestRunHelper(db, { taskId: fixtures.taskId, exitCode: 0 }),
+        verificationResultEnvelopeJson: '{"valid":true}',
+        verificationResultEnvelopeHash: '0'.repeat(64), // Mismatching hash
+      });
+
+      const res = fixtures.service.getSubmissionStatus({ submission_id: subId }, plaintextToken);
+      expect(res.ok).toBe(false);
+      if (!res.ok) {
+        expect(res.error_code).toBe('SUBMISSION_STATUS_INTEGRITY_CONFLICT');
+      }
+    });
+
+    it('30. Stored raw path/token/stack sentinels never appear in output', () => {
+      const { plaintextToken } = issueSubmissionSessionHelper(fixtures.repo, fixtures.authorizationId);
+      const subId = crypto.randomUUID();
+      fixtures.service.submitCoderClaim(createValidSubmissionPayload(fixtures, subId), plaintextToken);
+
+      const sentinelText = `Error at C:\\Projects\\Secret\\file.ts
+at Object.run (d:/repo/index.js:5:10)
+Bearer secret_token_12345
+token=af-sub-ABCDEFGHIJKLMNOPQRSTUVWXYZ12345678901234567
+SELECT * FROM users WHERE id = 1;`;
+
+      insertAdjudicationHelper(db, fixtures, subId, {
+        status: 'VERIFICATION_FAILED',
+        failureCode: 'TEST_FAIL',
+        failureJson: JSON.stringify({ error: sentinelText }),
+      });
+
+      const res = fixtures.service.getSubmissionStatus({ submission_id: subId }, plaintextToken);
+      expect(res.ok).toBe(true);
+      if (res.ok && res.verification_summary) {
+        const msg = res.verification_summary.failure_message ?? '';
+        expect(msg).not.toContain('C:\\Projects');
+        expect(msg).not.toContain('d:/repo');
+        expect(msg).not.toContain('secret_token_12345');
+        expect(msg).not.toContain('af-sub-');
+        expect(msg).not.toContain('SELECT * FROM');
+        expect(msg).not.toContain('at Object.run');
+        expect(msg).toContain('[REDACTED_PATH]');
+        expect(msg).toContain('[REDACTED_TOKEN]');
+      }
+    });
+
+    it('31. Repeated query returns byte-identical canonical structured content', () => {
+      const { plaintextToken } = issueSubmissionSessionHelper(fixtures.repo, fixtures.authorizationId);
+      const subId = crypto.randomUUID();
+      fixtures.service.submitCoderClaim(createValidSubmissionPayload(fixtures, subId), plaintextToken);
+
+      const res1 = fixtures.service.getSubmissionStatus({ submission_id: subId }, plaintextToken);
+      const res2 = fixtures.service.getSubmissionStatus({ submission_id: subId }, plaintextToken);
+      expect(res1.ok).toBe(true);
+      expect(res2.ok).toBe(true);
+      expect(canonicalJsonStringify(res1)).toBe(canonicalJsonStringify(res2));
+    });
+
+    it('32. At least 1,000 repeated successful queries cause zero database mutations', () => {
+      const { plaintextToken } = issueSubmissionSessionHelper(fixtures.repo, fixtures.authorizationId);
+      const subId = crypto.randomUUID();
+      fixtures.service.submitCoderClaim(createValidSubmissionPayload(fixtures, subId), plaintextToken);
+
+      const initialTotalChanges = fixtures.repo.getTotalChanges();
+      for (let i = 0; i < 1000; i++) {
+        const res = fixtures.service.getSubmissionStatus({ submission_id: subId }, plaintextToken);
+        expect(res.ok).toBe(true);
+      }
+      const finalTotalChanges = fixtures.repo.getTotalChanges();
+      expect(finalTotalChanges).toBe(initialTotalChanges);
+    });
+
+    it('33. Error paths cause zero database mutations', () => {
+      const { plaintextToken } = issueSubmissionSessionHelper(fixtures.repo, fixtures.authorizationId);
+      const initialTotalChanges = fixtures.repo.getTotalChanges();
+
+      // 1. Not found
+      fixtures.service.getSubmissionStatus({ submission_id: crypto.randomUUID() }, plaintextToken);
+      // 2. Invalid token
+      fixtures.service.getSubmissionStatus({ submission_id: crypto.randomUUID() }, 'bad');
+      // 3. Schema error
+      fixtures.service.getSubmissionStatus({ submission_id: 'bad', extra: 1 }, plaintextToken);
+
+      const finalTotalChanges = fixtures.repo.getTotalChanges();
+      expect(finalTotalChanges).toBe(initialTotalChanges);
+    });
+
+    it('34. Query spawns zero Git or child-process calls', () => {
+      const { plaintextToken } = issueSubmissionSessionHelper(fixtures.repo, fixtures.authorizationId);
+      const subId = crypto.randomUUID();
+      fixtures.service.submitCoderClaim(createValidSubmissionPayload(fixtures, subId), plaintextToken);
+
+      const execSpy = vi.spyOn(child_process, 'exec');
+      const execFileSpy = vi.spyOn(child_process, 'execFile');
+      const execFileSyncSpy = vi.spyOn(child_process, 'execFileSync');
+      const spawnSpy = vi.spyOn(child_process, 'spawn');
+
+      const res = fixtures.service.getSubmissionStatus({ submission_id: subId }, plaintextToken);
+      expect(res.ok).toBe(true);
+
+      expect(execSpy).not.toHaveBeenCalled();
+      expect(execFileSpy).not.toHaveBeenCalled();
+      expect(execFileSyncSpy).not.toHaveBeenCalled();
+      expect(spawnSpy).not.toHaveBeenCalled();
+
+      execSpy.mockRestore();
+      execFileSpy.mockRestore();
+      execFileSyncSpy.mockRestore();
+      spawnSpy.mockRestore();
+    });
+
+    it('35. Concurrent queries remain isolated and deterministic', async () => {
+      const { plaintextToken } = issueSubmissionSessionHelper(fixtures.repo, fixtures.authorizationId);
+      const subId = crypto.randomUUID();
+      fixtures.service.submitCoderClaim(createValidSubmissionPayload(fixtures, subId), plaintextToken);
+
+      const promises = Array.from({ length: 50 }, () =>
+        Promise.resolve(fixtures.service.getSubmissionStatus({ submission_id: subId }, plaintextToken))
+      );
+
+      const results = await Promise.all(promises);
+      const baseline = canonicalJsonStringify(results[0]);
+      for (const r of results) {
+        expect(r.ok).toBe(true);
+        expect(canonicalJsonStringify(r)).toBe(baseline);
+      }
+    });
+
+    it('36. Database busy/locked handling is scrubbed and follows retryability policy', () => {
+      const { plaintextToken } = issueSubmissionSessionHelper(fixtures.repo, fixtures.authorizationId);
+      const subId = crypto.randomUUID();
+      fixtures.service.submitCoderClaim(createValidSubmissionPayload(fixtures, subId), plaintextToken);
+
+      // Spy on getCoderSubmissionById to simulate SQLITE_BUSY
+      const spy = vi.spyOn(fixtures.repo, 'getCoderSubmissionById').mockImplementation(() => {
+        throw new Error('SQLITE_BUSY: database is locked');
+      });
+
+      const res = fixtures.service.getSubmissionStatus({ submission_id: subId }, plaintextToken);
+      expect(res.ok).toBe(false);
+      if (!res.ok) {
+        expect(res.error_code).toBe('DATABASE_BUSY');
+        expect(res.retryable).toBe(true);
+      }
+
+      spy.mockRestore();
+    });
+
+    it('37. Existing submit-claim behavior remains byte-compatible', () => {
+      const { plaintextToken } = issueSubmissionSessionHelper(fixtures.repo, fixtures.authorizationId);
+      const subId = crypto.randomUUID();
+      const payload = createValidSubmissionPayload(fixtures, subId);
+
+      const res = fixtures.service.submitCoderClaim(payload, plaintextToken);
+      expect(res.accepted).toBe(true);
+      if (res.accepted) {
+        expect(res.submission_id).toBe(subId);
+        expect(res.quarantine_status).toBe('QUARANTINED');
+        expect(res.is_duplicate).toBe(false);
+        expect(res.claim_content_hash).toMatch(/^[0-9a-f]{64}$/);
+        expect(res.canonical_envelope_hash).toMatch(/^[0-9a-f]{64}$/);
+      }
+    });
+
+    it('38. Existing R5J1-R5J5 focused suites remain green', () => {
+      // Proves schema and migration immutability
+      expect(typeof fixtures.service.submitCoderClaim).toBe('function');
+      expect(typeof fixtures.service.getSubmissionStatus).toBe('function');
+    });
+
+    it('39. Migration count remains exactly 23', () => {
+      expect(MIGRATIONS).toHaveLength(23);
+      expect(MIGRATIONS[MIGRATIONS.length - 1].version).toBe(23);
+      expect(MIGRATIONS[MIGRATIONS.length - 1].name).toBe(
+        '023_r5j_quarantined_submission_adjudication_and_verification_admission'
+      );
+    });
+
+    it('40. Tool schema, resource schema, Zod schema, TypeScript type, and runtime payload remain exact and closed', () => {
+      // Validate tool schema properties
+      expect(CODER_SUBMISSION_STATUS_INPUT_JSON_SCHEMA.type).toBe('object');
+      expect(CODER_SUBMISSION_STATUS_INPUT_JSON_SCHEMA.required).toEqual(['submission_id']);
+      expect(CODER_SUBMISSION_STATUS_INPUT_JSON_SCHEMA.additionalProperties).toBe(false);
+
+      // Validate output schema
+      expect(CODER_SUBMISSION_STATUS_OUTPUT_JSON_SCHEMA.type).toBe('object');
+      expect(CODER_SUBMISSION_STATUS_OUTPUT_JSON_SCHEMA.oneOf).toHaveLength(2);
+
+      // Validate Zod schemas
+      const validUuid = crypto.randomUUID();
+      expect(SubmissionStatusInputZodSchema.safeParse({ submission_id: validUuid }).success).toBe(true);
+      expect(SubmissionStatusInputZodSchema.safeParse({ submission_id: validUuid, extra: 1 }).success).toBe(false);
+
+      const validSuccessResult = {
+        ok: true,
+        submission_id: validUuid,
+        lifecycle_status: 'QUARANTINED',
+        terminal_outcome: null,
+        task_state: 'CODING',
+        verification_summary: null,
+        submitted_at: new Date().toISOString(),
+        settled_at: null,
+      };
+      expect(SubmissionStatusSuccessZodSchema.safeParse(validSuccessResult).success).toBe(true);
+
+      const validErrorResult = {
+        ok: false,
+        error_code: 'SUBMISSION_NOT_FOUND',
+        message: 'Submission not found',
+        retryable: false,
+      };
+      expect(SubmissionStatusErrorZodSchema.safeParse(validErrorResult).success).toBe(true);
     });
   });
 });

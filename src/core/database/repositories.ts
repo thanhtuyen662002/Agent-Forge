@@ -3906,6 +3906,11 @@ export class Repository {
     return this.mapCoderSubmissionDisposition(row);
   }
 
+  public getTotalChanges(): number {
+    return (this.db.prepare('SELECT total_changes() AS c').get() as { c: number }).c;
+  }
+
+
   private mapCoderSubmissionDisposition(row: Record<string, unknown>): CoderSubmissionDisposition {
     return {
       id: String(row.id),

@@ -22,7 +22,15 @@ import {
   CLAIM_CONTENT_KEYS,
   CANONICAL_ENVELOPE_KEYS,
   MAX_ARGUMENT_BYTES,
+  SubmissionStatusResult,
+  SubmissionStatusErrorCode,
+  SubmissionStatusInputZodSchema,
+  SubmissionLifecycleStatus,
+  SubmissionTerminalOutcome,
+  SubmissionVerificationSummary,
+  sanitizeFailureMessage,
 } from '../../mcp/submissionProtocol';
+import { TestRun } from '../types/domain';
 
 export class McpSubmissionAuthorityError extends Error {
   constructor(
@@ -32,6 +40,17 @@ export class McpSubmissionAuthorityError extends Error {
   ) {
     super(message);
     this.name = 'McpSubmissionAuthorityError';
+  }
+}
+
+export class McpSubmissionStatusError extends Error {
+  constructor(
+    public readonly code: SubmissionStatusErrorCode,
+    message: string,
+    public readonly retryable: boolean = false
+  ) {
+    super(message);
+    this.name = 'McpSubmissionStatusError';
   }
 }
 
@@ -1065,5 +1084,639 @@ export class McpSubmissionAuthorityService {
       submitted_at: transactionNowIso,
       is_duplicate: false,
     };
+  }
+
+  /**
+   * Authoritative entrypoint for coder submission status observation (R5J6).
+   * Strictly read-only: executes SELECT-only paths, enforces zero mutations,
+   * validates token, session, authorization graph, submission, and adjudication integrity.
+   */
+  public getSubmissionStatus(rawArgs: unknown, token?: string): SubmissionStatusResult {
+    // Record initial database total_changes to guarantee zero mutations
+    const initialChanges = this.repo.getTotalChanges();
+
+    const checkZeroMutations = (): void => {
+      const currentChanges = this.repo.getTotalChanges();
+      if (currentChanges !== initialChanges) {
+        throw new McpSubmissionStatusError(
+          'SUBMISSION_STATUS_INTEGRITY_CONFLICT',
+          'Read-only submission status observation caused database mutations'
+        );
+      }
+    };
+
+    try {
+      // 1. Argument size and schema validation
+      let canonicalArgsJson = '';
+      try {
+        canonicalArgsJson = canonicalJsonStringify(rawArgs);
+      } catch {
+        canonicalArgsJson = JSON.stringify(rawArgs ?? {});
+      }
+
+      const canonicalBytes = Buffer.byteLength(canonicalArgsJson, 'utf8');
+      if (canonicalBytes > MAX_ARGUMENT_BYTES) {
+        return {
+          ok: false,
+          error_code: 'SCHEMA_VALIDATION_FAILED',
+          message: `Argument payload size (${canonicalBytes} bytes) exceeds limit of ${MAX_ARGUMENT_BYTES} bytes`,
+          retryable: false,
+        };
+      }
+
+      const parseResult = SubmissionStatusInputZodSchema.safeParse(rawArgs);
+      if (!parseResult.success) {
+        return {
+          ok: false,
+          error_code: 'SCHEMA_VALIDATION_FAILED',
+          message: `Schema validation failed: ${parseResult.error.errors.map((e) => e.message).join('; ')}`,
+          retryable: false,
+        };
+      }
+      const submissionId = parseResult.data.submission_id;
+
+      // 2. Token grammar validation and hashing
+      if (!token || typeof token !== 'string' || !validateSubmissionToken(token)) {
+        return {
+          ok: false,
+          error_code: 'INVALID_SUBMISSION_TOKEN',
+          message: 'Invalid or missing submission token',
+          retryable: false,
+        };
+      }
+      const tokenHash = computeSha256(token);
+
+      // 3. Authenticate session
+      const nowIso = new Date().toISOString();
+      const session = this.repo.getMcpSubmissionSessionByTokenHash(tokenHash);
+      if (!session) {
+        return {
+          ok: false,
+          error_code: 'INVALID_SUBMISSION_TOKEN',
+          message: 'Session token not found or invalid for coder submission',
+          retryable: false,
+        };
+      }
+
+      if (session.scope !== 'CODER_SUBMISSION') {
+        return {
+          ok: false,
+          error_code: 'INVALID_SUBMISSION_TOKEN',
+          message: 'Session scope is not authorized for coder submission',
+          retryable: false,
+        };
+      }
+
+      if (session.revoked_at !== null) {
+        return {
+          ok: false,
+          error_code: 'MCP_SESSION_REVOKED',
+          message: 'Submission session has been revoked',
+          retryable: false,
+        };
+      }
+
+      if (session.expires_at <= nowIso) {
+        return {
+          ok: false,
+          error_code: 'MCP_SESSION_EXPIRED',
+          message: 'Submission session has expired',
+          retryable: false,
+        };
+      }
+
+      // 4. Execution authorization and graph bindings
+      const auth = this.repo.getExecutionAuthorization(session.authorization_id);
+      if (!auth) {
+        return {
+          ok: false,
+          error_code: 'SUBMISSION_NOT_FOUND',
+          message: 'Submission not found',
+          retryable: false,
+        };
+      }
+
+      const project = this.repo.getProject(auth.project_id);
+      if (!project) {
+        return {
+          ok: false,
+          error_code: 'SUBMISSION_NOT_FOUND',
+          message: 'Submission not found',
+          retryable: false,
+        };
+      }
+
+      const task = this.repo.getTask(auth.task_id);
+      if (!task || task.project_id !== project.id) {
+        return {
+          ok: false,
+          error_code: 'SUBMISSION_NOT_FOUND',
+          message: 'Submission not found',
+          retryable: false,
+        };
+      }
+
+      // 5. Load requested coder submission
+      const submission = this.repo.getCoderSubmissionById(submissionId);
+      if (!submission) {
+        return {
+          ok: false,
+          error_code: 'SUBMISSION_NOT_FOUND',
+          message: 'Submission not found',
+          retryable: false,
+        };
+      }
+
+      // Authorization-scoped observation:
+      // Must match auth.id, project.id, and task.id.
+      // Do not require submission.session_id to equal current session.id.
+      // Cross-auth, cross-task, cross-project lookups collapse to SUBMISSION_NOT_FOUND.
+      if (
+        submission.authorization_id !== auth.id ||
+        submission.project_id !== project.id ||
+        submission.task_id !== task.id
+      ) {
+        return {
+          ok: false,
+          error_code: 'SUBMISSION_NOT_FOUND',
+          message: 'Submission not found',
+          retryable: false,
+        };
+      }
+
+      // 6. Validate durable submission integrity
+      if (
+        typeof submission.submitted_at !== 'string' ||
+        isNaN(Date.parse(submission.submitted_at))
+      ) {
+        throw new McpSubmissionStatusError(
+          'SUBMISSION_STATUS_INTEGRITY_CONFLICT',
+          'Submission submitted_at is an invalid timestamp'
+        );
+      }
+
+      // Verify dispositions
+      const disps = this.repo.getCoderSubmissionDispositions(submission.id);
+      const initialDisp = disps.find(
+        (d) => d.disposition_event === 'SUBMITTED' && d.disposition_reason === 'INITIAL_SUBMISSION'
+      );
+      if (!initialDisp || initialDisp.created_at !== submission.submitted_at) {
+        throw new McpSubmissionStatusError(
+          'SUBMISSION_STATUS_INTEGRITY_CONFLICT',
+          'Initial submission disposition missing or timestamp mismatch'
+        );
+      }
+
+      // 7. Load adjudications and validate history and integrity
+      const adjudications = this.repo.getCoderSubmissionAdjudicationsBySubmission(submission.id);
+
+      // Rule 1: No adjudication -> QUARANTINED
+      if (adjudications.length === 0) {
+        checkZeroMutations();
+        return {
+          ok: true,
+          submission_id: submission.id,
+          lifecycle_status: 'QUARANTINED',
+          terminal_outcome: null,
+          task_state: task.state,
+          verification_summary: null,
+          submitted_at: submission.submitted_at,
+          settled_at: null,
+        };
+      }
+
+      // Adjudications exist: validate integrity and graph bindings
+      for (const adj of adjudications) {
+        if (
+          adj.submission_id !== submission.id ||
+          adj.authorization_id !== auth.id ||
+          adj.project_id !== project.id ||
+          adj.task_id !== task.id
+        ) {
+          throw new McpSubmissionStatusError(
+            'SUBMISSION_STATUS_INTEGRITY_CONFLICT',
+            'Adjudication bound to contradictory authority graph'
+          );
+        }
+
+        // Validate authority snapshot if present
+        if (adj.authority_snapshot_json) {
+          try {
+            const parsedSnap = JSON.parse(adj.authority_snapshot_json);
+            if (typeof parsedSnap !== 'object' || parsedSnap === null || Array.isArray(parsedSnap)) {
+              throw new Error('Not an object');
+            }
+          } catch {
+            throw new McpSubmissionStatusError(
+              'SUBMISSION_STATUS_INTEGRITY_CONFLICT',
+              'Adjudication authority snapshot JSON is malformed'
+            );
+          }
+          const computedHash = computeSha256(adj.authority_snapshot_json);
+          if (computedHash !== adj.authority_snapshot_hash) {
+            throw new McpSubmissionStatusError(
+              'SUBMISSION_STATUS_INTEGRITY_CONFLICT',
+              'Adjudication authority snapshot hash mismatch'
+            );
+          }
+        }
+
+        // Validate verification result envelope if present
+        if (adj.verification_result_envelope_json) {
+          try {
+            const parsedEnv = JSON.parse(adj.verification_result_envelope_json);
+            if (typeof parsedEnv !== 'object' || parsedEnv === null || Array.isArray(parsedEnv)) {
+              throw new Error('Not an object');
+            }
+          } catch {
+            throw new McpSubmissionStatusError(
+              'SUBMISSION_STATUS_INTEGRITY_CONFLICT',
+              'Verification result envelope JSON is malformed'
+            );
+          }
+          if (adj.verification_result_envelope_hash) {
+            const computedEnvHash = computeSha256(adj.verification_result_envelope_json);
+            if (computedEnvHash !== adj.verification_result_envelope_hash) {
+              throw new McpSubmissionStatusError(
+                'SUBMISSION_STATUS_INTEGRITY_CONFLICT',
+                'Verification result envelope hash mismatch'
+              );
+            }
+          }
+        }
+
+        // Validate failure_json if present
+        if (adj.failure_json) {
+          try {
+            const parsedFail = JSON.parse(adj.failure_json);
+            if (typeof parsedFail !== 'object' || parsedFail === null || Array.isArray(parsedFail)) {
+              throw new Error('Not an object');
+            }
+          } catch {
+            throw new McpSubmissionStatusError(
+              'SUBMISSION_STATUS_INTEGRITY_CONFLICT',
+              'Adjudication failure_json is malformed'
+            );
+          }
+        }
+
+        // Validate timestamps
+        if (typeof adj.created_at !== 'string' || isNaN(Date.parse(adj.created_at))) {
+          throw new McpSubmissionStatusError(
+            'SUBMISSION_STATUS_INTEGRITY_CONFLICT',
+            'Adjudication created_at timestamp is invalid'
+          );
+        }
+        if (
+          adj.completed_at !== null &&
+          (typeof adj.completed_at !== 'string' || isNaN(Date.parse(adj.completed_at)))
+        ) {
+          throw new McpSubmissionStatusError(
+            'SUBMISSION_STATUS_INTEGRITY_CONFLICT',
+            'Adjudication completed_at timestamp is invalid'
+          );
+        }
+        if (
+          adj.recovery_fenced_at !== null &&
+          (typeof adj.recovery_fenced_at !== 'string' || isNaN(Date.parse(adj.recovery_fenced_at)))
+        ) {
+          throw new McpSubmissionStatusError(
+            'SUBMISSION_STATUS_INTEGRITY_CONFLICT',
+            'Adjudication recovery_fenced_at timestamp is invalid'
+          );
+        }
+      }
+
+      // Check for duplicate / ambiguous terminal authority
+      const terminalStatuses = ['VERIFIED', 'VERIFICATION_FAILED', 'RECOVERY_FENCED', 'REJECTED', 'SUPERSEDED'];
+      const terminalAdjudications = adjudications.filter((a) => terminalStatuses.includes(a.status));
+      const activeAdjudications = adjudications.filter((a) => ['ADMITTED', 'VERIFYING'].includes(a.status));
+
+      if (terminalAdjudications.length > 1) {
+        throw new McpSubmissionStatusError(
+          'SUBMISSION_STATUS_INTEGRITY_CONFLICT',
+          'Duplicate terminal adjudication authority detected'
+        );
+      }
+      if (terminalAdjudications.length > 0 && activeAdjudications.length > 0) {
+        throw new McpSubmissionStatusError(
+          'SUBMISSION_STATUS_INTEGRITY_CONFLICT',
+          'Contradictory adjudication state: both terminal and active records exist'
+        );
+      }
+      if (activeAdjudications.length > 1) {
+        throw new McpSubmissionStatusError(
+          'SUBMISSION_STATUS_INTEGRITY_CONFLICT',
+          'Multiple active adjudications detected for submission'
+        );
+      }
+
+      // Lifecycle versions uniqueness
+      const versions = adjudications.map((a) => a.lifecycle_version);
+      const uniqueVersions = new Set(versions);
+      if (uniqueVersions.size !== versions.length) {
+        throw new McpSubmissionStatusError(
+          'SUBMISSION_STATUS_INTEGRITY_CONFLICT',
+          'Contradictory adjudications claim same lifecycle_version'
+        );
+      }
+
+      // Choose authoritative adjudication
+      const chosenAdj = adjudications[adjudications.length - 1];
+
+      // Validate events for chosen adjudication
+      const events = this.repo.getCoderSubmissionAdjudicationEvents(chosenAdj.id);
+      if (events.length === 0) {
+        throw new McpSubmissionStatusError(
+          'SUBMISSION_STATUS_INTEGRITY_CONFLICT',
+          'Adjudication missing required lifecycle event log'
+        );
+      }
+
+      // Verify event sequence continuity (1, 2, ...) and payload hashes
+      for (let i = 0; i < events.length; i++) {
+        const ev = events[i];
+        if (ev.sequence !== i + 1) {
+          throw new McpSubmissionStatusError(
+            'SUBMISSION_STATUS_INTEGRITY_CONFLICT',
+            `Adjudication event sequence broken: expected ${i + 1}, found ${ev.sequence}`
+          );
+        }
+        if (computeSha256(ev.payload_json) !== ev.payload_hash) {
+          throw new McpSubmissionStatusError(
+            'SUBMISSION_STATUS_INTEGRITY_CONFLICT',
+            `Adjudication event payload hash mismatch at sequence ${ev.sequence}`
+          );
+        }
+      }
+
+      // Verify event transition validity
+      const initialEvent = events[0];
+      if (!['ADMITTED', 'REJECTED', 'SUPERSEDED'].includes(initialEvent.event_type)) {
+        throw new McpSubmissionStatusError(
+          'SUBMISSION_STATUS_INTEGRITY_CONFLICT',
+          `Initial adjudication event type invalid: ${initialEvent.event_type}`
+        );
+      }
+
+      const terminalEventTypes = ['VERIFICATION_SUCCEEDED', 'VERIFICATION_FAILED', 'RECOVERY_FENCED', 'REJECTED', 'SUPERSEDED'];
+      let seenTerminalEvent = false;
+      for (const ev of events) {
+        if (seenTerminalEvent) {
+          throw new McpSubmissionStatusError(
+            'SUBMISSION_STATUS_INTEGRITY_CONFLICT',
+            'Additional events logged after terminal lifecycle event'
+          );
+        }
+        if (terminalEventTypes.includes(ev.event_type)) {
+          seenTerminalEvent = true;
+        }
+      }
+
+      const lastEvent = events[events.length - 1];
+      const eventStatusMap: Record<string, string> = {
+        ADMITTED: 'ADMITTED',
+        VERIFICATION_CLAIMED: 'VERIFYING',
+        VERIFICATION_SUCCEEDED: 'VERIFIED',
+        VERIFICATION_FAILED: 'VERIFICATION_FAILED',
+        RECOVERY_FENCED: 'RECOVERY_FENCED',
+        REJECTED: 'REJECTED',
+        SUPERSEDED: 'SUPERSEDED',
+      };
+      if (eventStatusMap[lastEvent.event_type] !== chosenAdj.status) {
+        throw new McpSubmissionStatusError(
+          'SUBMISSION_STATUS_INTEGRITY_CONFLICT',
+          `Adjudication status "${chosenAdj.status}" contradicts final event "${lastEvent.event_type}"`
+        );
+      }
+
+      // Validate linked test run
+      let testRun: TestRun | null = null;
+      if (chosenAdj.test_run_id) {
+        testRun = this.repo.getTestRun(chosenAdj.test_run_id);
+        if (!testRun) {
+          throw new McpSubmissionStatusError(
+            'SUBMISSION_STATUS_INTEGRITY_CONFLICT',
+            'Referenced test_run record does not exist'
+          );
+        }
+        if (testRun.task_id !== submission.task_id) {
+          throw new McpSubmissionStatusError(
+            'SUBMISSION_STATUS_INTEGRITY_CONFLICT',
+            'Referenced test_run belongs to different task'
+          );
+        }
+      }
+
+      if (chosenAdj.status === 'VERIFIED') {
+        if (!chosenAdj.test_run_id || !testRun) {
+          throw new McpSubmissionStatusError(
+            'SUBMISSION_STATUS_INTEGRITY_CONFLICT',
+            'Verified adjudication missing required linked test run'
+          );
+        }
+        if (testRun.exit_code !== 0) {
+          throw new McpSubmissionStatusError(
+            'SUBMISSION_STATUS_INTEGRITY_CONFLICT',
+            'Verified adjudication has non-zero test run exit code'
+          );
+        }
+      }
+
+      // Map status to projection rules
+      let lifecycleStatus: SubmissionLifecycleStatus;
+      let terminalOutcome: SubmissionTerminalOutcome | null = null;
+      let verificationSummary: SubmissionVerificationSummary | null = null;
+      let settledAt: string | null = null;
+
+      switch (chosenAdj.status) {
+        case 'ADMITTED':
+          lifecycleStatus = 'ADMITTED';
+          terminalOutcome = null;
+          verificationSummary = null;
+          settledAt = null;
+          break;
+
+        case 'VERIFYING':
+          lifecycleStatus = 'VERIFYING';
+          terminalOutcome = null;
+          verificationSummary = null;
+          settledAt = null;
+          break;
+
+        case 'VERIFIED': {
+          lifecycleStatus = 'VERIFIED';
+          terminalOutcome = 'ACCEPTED_VERIFIED';
+          settledAt = chosenAdj.completed_at;
+          if (!settledAt) {
+            throw new McpSubmissionStatusError(
+              'SUBMISSION_STATUS_INTEGRITY_CONFLICT',
+              'Verified adjudication missing completed_at timestamp'
+            );
+          }
+          verificationSummary = {
+            exit_code: testRun!.exit_code,
+            passed_count: Math.max(0, testRun!.passed_count ?? 0),
+            failed_count: Math.max(0, testRun!.failed_count ?? 0),
+            skipped_count: Math.max(0, testRun!.skipped_count ?? 0),
+            duration_ms: Math.max(0, testRun!.duration_ms ?? 0),
+            failure_code: null,
+            failure_message: null,
+          };
+          break;
+        }
+
+        case 'VERIFICATION_FAILED': {
+          lifecycleStatus = 'VERIFICATION_FAILED';
+          terminalOutcome = 'VERIFICATION_FAILED';
+          settledAt = chosenAdj.completed_at ?? chosenAdj.recovery_fenced_at;
+          if (!settledAt) {
+            throw new McpSubmissionStatusError(
+              'SUBMISSION_STATUS_INTEGRITY_CONFLICT',
+              'Failed adjudication missing completed_at timestamp'
+            );
+          }
+          const rawMessage = this.extractRawFailureMessage(chosenAdj.failure_json, chosenAdj.failure_code);
+          verificationSummary = {
+            exit_code: testRun ? testRun.exit_code : null,
+            passed_count: testRun ? Math.max(0, testRun.passed_count ?? 0) : null,
+            failed_count: testRun ? Math.max(0, testRun.failed_count ?? 0) : null,
+            skipped_count: testRun ? Math.max(0, testRun.skipped_count ?? 0) : null,
+            duration_ms: testRun ? Math.max(0, testRun.duration_ms ?? 0) : null,
+            failure_code: chosenAdj.failure_code ? sanitizeFailureMessage(chosenAdj.failure_code) : null,
+            failure_message: sanitizeFailureMessage(rawMessage),
+          };
+          break;
+        }
+
+        case 'RECOVERY_FENCED': {
+          lifecycleStatus = 'RECOVERY_FENCED';
+          terminalOutcome = 'RECOVERY_FENCED';
+          settledAt = chosenAdj.recovery_fenced_at ?? chosenAdj.completed_at;
+          if (!settledAt) {
+            throw new McpSubmissionStatusError(
+              'SUBMISSION_STATUS_INTEGRITY_CONFLICT',
+              'Recovery-fenced adjudication missing fence timestamp'
+            );
+          }
+          const rawMessage = this.extractRawFailureMessage(chosenAdj.failure_json, chosenAdj.failure_code);
+          verificationSummary = {
+            exit_code: testRun ? testRun.exit_code : null,
+            passed_count: testRun ? Math.max(0, testRun.passed_count ?? 0) : null,
+            failed_count: testRun ? Math.max(0, testRun.failed_count ?? 0) : null,
+            skipped_count: testRun ? Math.max(0, testRun.skipped_count ?? 0) : null,
+            duration_ms: testRun ? Math.max(0, testRun.duration_ms ?? 0) : null,
+            failure_code: chosenAdj.failure_code ? sanitizeFailureMessage(chosenAdj.failure_code) : null,
+            failure_message: sanitizeFailureMessage(rawMessage),
+          };
+          break;
+        }
+
+        case 'REJECTED': {
+          lifecycleStatus = 'REJECTED';
+          terminalOutcome = 'REJECTED';
+          settledAt = chosenAdj.completed_at;
+          if (!settledAt) {
+            throw new McpSubmissionStatusError(
+              'SUBMISSION_STATUS_INTEGRITY_CONFLICT',
+              'Rejected adjudication missing completed_at timestamp'
+            );
+          }
+          const rawMessage = this.extractRawFailureMessage(chosenAdj.failure_json, chosenAdj.failure_code);
+          verificationSummary = {
+            exit_code: null,
+            passed_count: null,
+            failed_count: null,
+            skipped_count: null,
+            duration_ms: null,
+            failure_code: chosenAdj.failure_code ? sanitizeFailureMessage(chosenAdj.failure_code) : null,
+            failure_message: sanitizeFailureMessage(rawMessage),
+          };
+          break;
+        }
+
+        case 'SUPERSEDED': {
+          lifecycleStatus = 'SUPERSEDED';
+          terminalOutcome = 'SUPERSEDED';
+          settledAt = chosenAdj.completed_at;
+          if (!settledAt) {
+            throw new McpSubmissionStatusError(
+              'SUBMISSION_STATUS_INTEGRITY_CONFLICT',
+              'Superseded adjudication missing completed_at timestamp'
+            );
+          }
+          const rawMessage = this.extractRawFailureMessage(chosenAdj.failure_json, chosenAdj.failure_code);
+          verificationSummary = {
+            exit_code: null,
+            passed_count: null,
+            failed_count: null,
+            skipped_count: null,
+            duration_ms: null,
+            failure_code: chosenAdj.failure_code ? sanitizeFailureMessage(chosenAdj.failure_code) : null,
+            failure_message: sanitizeFailureMessage(rawMessage),
+          };
+          break;
+        }
+
+        default:
+          throw new McpSubmissionStatusError(
+            'SUBMISSION_STATUS_INTEGRITY_CONFLICT',
+            `Unknown adjudication status: ${chosenAdj.status}`
+          );
+      }
+
+      checkZeroMutations();
+
+      return {
+        ok: true,
+        submission_id: submission.id,
+        lifecycle_status: lifecycleStatus,
+        terminal_outcome: terminalOutcome,
+        task_state: task.state,
+        verification_summary: verificationSummary,
+        submitted_at: submission.submitted_at,
+        settled_at: settledAt,
+      };
+    } catch (err: unknown) {
+      checkZeroMutations();
+      if (err instanceof McpSubmissionStatusError) {
+        return {
+          ok: false,
+          error_code: err.code,
+          message: err.message,
+          retryable: err.retryable,
+        };
+      }
+      const errStr = String(err);
+      if (errStr.includes('SQLITE_BUSY') || errStr.includes('database is locked')) {
+        return {
+          ok: false,
+          error_code: 'DATABASE_BUSY',
+          message: 'Database is locked or busy under concurrent write transaction',
+          retryable: true,
+        };
+      }
+      return {
+        ok: false,
+        error_code: 'INTERNAL_SUBMISSION_STATUS_ERROR',
+        message: 'Internal error processing submission status query',
+        retryable: false,
+      };
+    }
+  }
+
+  private extractRawFailureMessage(failureJson: string | null, failureCode: string | null): string | null {
+    if (failureJson) {
+      try {
+        const parsed = JSON.parse(failureJson);
+        if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+          const msg = parsed.error ?? parsed.operator_reason ?? parsed.message ?? null;
+          if (msg) return String(msg);
+        }
+      } catch {
+        // malformed handled during adjudication validation
+      }
+    }
+    return failureCode;
   }
 }

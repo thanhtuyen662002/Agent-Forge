@@ -704,6 +704,8 @@ export const CODER_SUBMISSION_CAPABILITY_METADATA = Object.freeze({
   server_name: 'agentforge-submit',
   protocol_version: '2024-11-05',
   tool_name: 'agentforge_submit_coder_claim',
+  status_tool_name: 'agentforge_get_submission_status',
+  resource_template: 'agentforge://submissions/{submission_id}',
   credential_scope: 'CODER_SUBMISSION',
   envelope_keys_count: 28,
   content_keys_count: 7,
@@ -711,3 +713,285 @@ export const CODER_SUBMISSION_CAPABILITY_METADATA = Object.freeze({
   max_argument_bytes: MAX_ARGUMENT_BYTES,
   quarantine_status: 'QUARANTINED',
 });
+
+// ============================================================================
+// R5J6 Coder Submission Status Observation Surface & Projection Contract
+// ============================================================================
+
+export const SUBMISSION_STATUS_TOOL_NAME = 'agentforge_get_submission_status';
+export const SUBMISSION_STATUS_TOOL_DESCRIPTION =
+  'Observe quarantined coder execution lifecycle status and sanitized verification feedback for a submission.';
+
+export const SUBMISSION_STATUS_TOOL_ANNOTATIONS = Object.freeze({
+  readOnlyHint: true,
+  destructiveHint: false,
+  idempotentHint: true,
+  openWorldHint: false,
+});
+
+export const SUBMISSION_STATUS_RESOURCE_NAME = 'agentforge_submission_status';
+export const SUBMISSION_STATUS_URI_TEMPLATE = 'agentforge://submissions/{submission_id}';
+export const SUBMISSION_STATUS_MIME_TYPE = 'application/json';
+
+export const SUBMISSION_LIFECYCLE_STATUSES = [
+  'QUARANTINED',
+  'ADMITTED',
+  'VERIFYING',
+  'VERIFIED',
+  'VERIFICATION_FAILED',
+  'RECOVERY_FENCED',
+  'REJECTED',
+  'SUPERSEDED',
+] as const;
+
+export type SubmissionLifecycleStatus = (typeof SUBMISSION_LIFECYCLE_STATUSES)[number];
+
+export const SUBMISSION_TERMINAL_OUTCOMES = [
+  'ACCEPTED_VERIFIED',
+  'VERIFICATION_FAILED',
+  'RECOVERY_FENCED',
+  'REJECTED',
+  'SUPERSEDED',
+] as const;
+
+export type SubmissionTerminalOutcome = (typeof SUBMISSION_TERMINAL_OUTCOMES)[number];
+
+export const SUBMISSION_STATUS_ERROR_CODES = [
+  'INVALID_SUBMISSION_TOKEN',
+  'MCP_SESSION_EXPIRED',
+  'MCP_SESSION_REVOKED',
+  'SCHEMA_VALIDATION_FAILED',
+  'SUBMISSION_NOT_FOUND',
+  'SUBMISSION_STATUS_INTEGRITY_CONFLICT',
+  'DATABASE_BUSY',
+  'INTERNAL_SUBMISSION_STATUS_ERROR',
+] as const;
+
+export type SubmissionStatusErrorCode = (typeof SUBMISSION_STATUS_ERROR_CODES)[number];
+
+/**
+ * Strict Zod Input Schema for submission status query.
+ * Rejects unknown keys, token, authorization_id, project_id, task_id, etc.
+ * Requires exactly lowercase RFC 4122 UUID v4 submission_id.
+ */
+export const SubmissionStatusInputZodSchema = z
+  .object({
+    submission_id: z
+      .string()
+      .regex(UUID_V4_REGEX, 'submission_id must be RFC 4122 UUID v4 in lowercase'),
+  })
+  .strict();
+
+export type SubmissionStatusInput = z.infer<typeof SubmissionStatusInputZodSchema>;
+
+export const CODER_SUBMISSION_STATUS_INPUT_JSON_SCHEMA = {
+  type: 'object',
+  properties: {
+    submission_id: {
+      type: 'string',
+      pattern: '^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$',
+      description: 'Client-generated RFC 4122 UUID v4 in lowercase',
+    },
+  },
+  required: ['submission_id'],
+  additionalProperties: false,
+} as const;
+
+export const SubmissionVerificationSummaryZodSchema = z
+  .object({
+    exit_code: z.number().int().nullable(),
+    passed_count: z.number().int().nonnegative().nullable(),
+    failed_count: z.number().int().nonnegative().nullable(),
+    skipped_count: z.number().int().nonnegative().nullable(),
+    duration_ms: z.number().int().nonnegative().nullable(),
+    failure_code: z.string().max(256).nullable(),
+    failure_message: z.string().max(1024).nullable(),
+  })
+  .strict();
+
+export type SubmissionVerificationSummary = z.infer<typeof SubmissionVerificationSummaryZodSchema>;
+
+export const SUBMISSION_VERIFICATION_SUMMARY_JSON_SCHEMA = {
+  type: 'object',
+  properties: {
+    exit_code: { type: ['integer', 'null'] },
+    passed_count: { type: ['integer', 'null'], minimum: 0 },
+    failed_count: { type: ['integer', 'null'], minimum: 0 },
+    skipped_count: { type: ['integer', 'null'], minimum: 0 },
+    duration_ms: { type: ['integer', 'null'], minimum: 0 },
+    failure_code: { type: ['string', 'null'], maxLength: 256 },
+    failure_message: { type: ['string', 'null'], maxLength: 1024 },
+  },
+  required: [
+    'exit_code',
+    'passed_count',
+    'failed_count',
+    'skipped_count',
+    'duration_ms',
+    'failure_code',
+    'failure_message',
+  ],
+  additionalProperties: false,
+} as const;
+
+export const SubmissionStatusSuccessZodSchema = z
+  .object({
+    ok: z.literal(true),
+    submission_id: z.string().regex(UUID_V4_REGEX),
+    lifecycle_status: z.enum(SUBMISSION_LIFECYCLE_STATUSES),
+    terminal_outcome: z.enum(SUBMISSION_TERMINAL_OUTCOMES).nullable(),
+    task_state: z.string().min(1).max(64),
+    verification_summary: SubmissionVerificationSummaryZodSchema.nullable(),
+    submitted_at: z.string().datetime({ offset: true }),
+    settled_at: z.string().datetime({ offset: true }).nullable(),
+  })
+  .strict();
+
+export type SubmissionStatusSuccessResult = z.infer<typeof SubmissionStatusSuccessZodSchema>;
+
+export const SubmissionStatusErrorZodSchema = z
+  .object({
+    ok: z.literal(false),
+    error_code: z.enum(SUBMISSION_STATUS_ERROR_CODES),
+    message: z.string().min(1).max(2048),
+    retryable: z.boolean(),
+  })
+  .strict();
+
+export type SubmissionStatusErrorResult = z.infer<typeof SubmissionStatusErrorZodSchema>;
+
+export type SubmissionStatusResult = SubmissionStatusSuccessResult | SubmissionStatusErrorResult;
+
+export const CODER_SUBMISSION_STATUS_OUTPUT_JSON_SCHEMA = {
+  type: 'object',
+  oneOf: [
+    {
+      type: 'object',
+      required: [
+        'ok',
+        'submission_id',
+        'lifecycle_status',
+        'terminal_outcome',
+        'task_state',
+        'verification_summary',
+        'submitted_at',
+        'settled_at',
+      ],
+      properties: {
+        ok: { const: true },
+        submission_id: {
+          type: 'string',
+          pattern: '^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$',
+        },
+        lifecycle_status: {
+          type: 'string',
+          enum: SUBMISSION_LIFECYCLE_STATUSES,
+        },
+        terminal_outcome: {
+          type: ['string', 'null'],
+          enum: [...SUBMISSION_TERMINAL_OUTCOMES, null],
+        },
+        task_state: {
+          type: 'string',
+        },
+        verification_summary: {
+          oneOf: [
+            { type: 'null' },
+            SUBMISSION_VERIFICATION_SUMMARY_JSON_SCHEMA,
+          ],
+        },
+        submitted_at: {
+          type: 'string',
+          pattern: '^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}\\.\\d{3}Z$',
+        },
+        settled_at: {
+          type: ['string', 'null'],
+        },
+      },
+      additionalProperties: false,
+    },
+    {
+      type: 'object',
+      required: ['ok', 'error_code', 'message', 'retryable'],
+      properties: {
+        ok: { const: false },
+        error_code: {
+          type: 'string',
+          enum: SUBMISSION_STATUS_ERROR_CODES,
+        },
+        message: { type: 'string', minLength: 1, maxLength: 2048 },
+        retryable: { type: 'boolean' },
+      },
+      additionalProperties: false,
+    },
+  ],
+} as const;
+
+export const MAX_FAILURE_MESSAGE_LENGTH = 1024;
+
+/**
+ * Sanitizes failure messages according to R5J6 strict bounds:
+ * - Redacts Windows drive and UNC paths
+ * - Redacts POSIX absolute paths
+ * - Redacts SQL statements
+ * - Redacts tokens, token hashes, and secrets
+ * - Redacts environment variable assignments
+ * - Redacts stack traces
+ * - Unwraps or redacts raw JSON envelopes
+ * - Bounded to MAX_FAILURE_MESSAGE_LENGTH (1024 characters)
+ */
+export function sanitizeFailureMessage(rawMsg: string | null | undefined): string | null {
+  if (rawMsg == null) return null;
+  if (typeof rawMsg !== 'string') return null;
+  let text = rawMsg.trim();
+  if (text.length === 0) return null;
+
+  // Unpack JSON envelope string if present
+  if (text.startsWith('{') && text.endsWith('}')) {
+    try {
+      const parsed = JSON.parse(text);
+      if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+        text = String(parsed.error ?? parsed.operator_reason ?? parsed.message ?? '[REDACTED_ENVELOPE]');
+      }
+    } catch {
+      // not valid json, continue string sanitization
+    }
+  }
+
+  // 1. Redact Windows drive paths: e.g. C:\... or d:/...
+  text = text.replace(/[A-Za-z]:[\\/][^ \n\r\t,;"']+(?:[\\/][^ \n\r\t,;"']+)*/g, '[REDACTED_PATH]');
+
+  // 2. Redact Windows UNC paths: \\server\share...
+  text = text.replace(/\\\\[^ \n\r\t,;"']+/g, '[REDACTED_PATH]');
+
+  // 3. Redact POSIX absolute paths: /(usr|home|etc|var|tmp|opt|root|bin|proc|sys|Users|private|app|node_modules)[^ \n\r\t,;"')\]]*/gi
+  text = text.replace(/(?:^|[\s,;("'])\/(?:usr|home|etc|var|tmp|opt|root|bin|proc|sys|Users|private|app|node_modules)[^\s,;)"']*/gi, ' [REDACTED_PATH]');
+  text = text.replace(/(?:^|[\s,;("'])\/(?:[a-zA-Z0-9_.-]+\/)+[a-zA-Z0-9_.-]*/g, ' [REDACTED_PATH]');
+
+  // 4. Redact SQL statements and clauses
+  text = text.replace(/\b(?:SELECT|INSERT\s+INTO|UPDATE|DELETE\s+FROM|CREATE\s+TABLE|DROP\s+TABLE|ALTER\s+TABLE|PRAGMA)\b[\s\S]*?(?:;|\n|$)/gi, '[REDACTED_SQL]');
+
+  // 5. Redact tokens, Bearer headers, sensitive secrets
+  text = text.replace(/\baf-[a-zA-Z0-9_-]+\b/gi, '[REDACTED_TOKEN]');
+  text = text.replace(/Bearer\s+[A-Za-z0-9_.\-]+/gi, 'Bearer [REDACTED_SECRET]');
+  text = text.replace(/\b(?:token|token_hash|secret|password|api_key)\s*[:= ]\s*['"]?[A-Za-z0-9_.\-]+['"]?/gi, '[REDACTED_SECRET]');
+
+  // 6. Redact hashes (40 or 64 hex characters)
+  text = text.replace(/\b[0-9a-f]{64}\b/gi, '[REDACTED_HASH]');
+  text = text.replace(/\b[0-9a-f]{40}\b/gi, '[REDACTED_HASH]');
+
+  // 7. Redact environment variable assignments (e.g. FOO=bar, SECRET_KEY=xyz)
+  text = text.replace(/\b[A-Z0-9_]{3,}\s*=\s*['"]?[^ \n\r\t,;"']+['"]?/g, '[REDACTED_ENV]');
+
+  // 8. Redact stack traces
+  text = text.replace(/\n\s*at\s+[^\n]+/g, '\n[STACK_TRACE_REDACTED]');
+  text = text.replace(/\bat\s+[a-zA-Z0-9_.$<>]+\s+\([^)]+\)/g, '[STACK_TRACE_REDACTED]');
+
+  // 9. Bound length
+  text = text.trim();
+  if (text.length > MAX_FAILURE_MESSAGE_LENGTH) {
+    text = text.slice(0, MAX_FAILURE_MESSAGE_LENGTH);
+  }
+
+  return text.length > 0 ? text : null;
+}
