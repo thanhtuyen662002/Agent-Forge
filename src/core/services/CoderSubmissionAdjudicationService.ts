@@ -237,6 +237,21 @@ export function deriveDeterministicWorkspaceAfterEvidenceId(
   return `${hex.substring(0, 8)}-${hex.substring(8, 12)}-${hex.substring(12, 16)}-${hex.substring(16, 20)}-${hex.substring(20, 32)}`;
 }
 
+export function canonicalizeSnapshotEvidenceHash(
+  value: string | null | undefined,
+  field: 'gitStatusEvidenceHash' | 'gitDiffEvidenceHash'
+): string {
+  if (value === undefined || value === null || value === '') {
+    return computeSha256('');
+  }
+  const HEX_64_REGEX = /^[0-9a-f]{64}$/;
+  if (typeof value === 'string' && HEX_64_REGEX.test(value)) {
+    return value;
+  }
+  const fieldLabel = field === 'gitStatusEvidenceHash' ? 'git status evidence hash' : 'git diff evidence hash';
+  throw new Error(`Invalid ${field}: ${fieldLabel} must be absent/empty or a 64-character lowercase hexadecimal hash`);
+}
+
 export function buildCanonicalWorkspaceSnapshotAfterPayload(params: {
   adjudicationId: string;
   adjudicationLifecycleVersion?: 3;
@@ -257,13 +272,8 @@ export function buildCanonicalWorkspaceSnapshotAfterPayload(params: {
   workspaceLeaseId: string;
   worktreeIdentityHash: string;
 }): CanonicalWorkspaceSnapshotAfterPayload {
-  const HEX_64_REGEX = /^[0-9a-f]{64}$/;
-  const diffHash = params.gitDiffEvidenceHash && HEX_64_REGEX.test(params.gitDiffEvidenceHash)
-    ? params.gitDiffEvidenceHash
-    : computeSha256('');
-  const statusHash = params.gitStatusEvidenceHash && HEX_64_REGEX.test(params.gitStatusEvidenceHash)
-    ? params.gitStatusEvidenceHash
-    : computeSha256('');
+  const statusHash = canonicalizeSnapshotEvidenceHash(params.gitStatusEvidenceHash, 'gitStatusEvidenceHash');
+  const diffHash = canonicalizeSnapshotEvidenceHash(params.gitDiffEvidenceHash, 'gitDiffEvidenceHash');
 
   return {
     adjudication_id: params.adjudicationId,

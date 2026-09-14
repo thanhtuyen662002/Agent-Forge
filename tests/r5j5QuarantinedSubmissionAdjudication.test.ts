@@ -30,6 +30,7 @@ import {
   SupportedFailureCode,
   buildCanonicalWorkspaceSnapshotAfterPayload,
   validateCanonicalWorkspaceSnapshotAfter,
+  canonicalizeSnapshotEvidenceHash,
 } from '../src/core/services/CoderSubmissionAdjudicationService';
 import { CoderSubmissionAdjudicationRecoveryScanner } from '../src/core/services/CoderSubmissionAdjudicationRecoveryScanner';
 import { CrashRecoveryService } from '../src/core/services/CrashRecoveryService';
@@ -17015,6 +17016,535 @@ describe('R5J5 Quarantined Submission Adjudication and Verification Admission Su
       expect(eventCountAfter.c).toBe(eventCountBefore.c);
       expect(dispCountAfter.c).toBe(dispCountBefore.c);
       expect(adjAfter).toEqual(adjBefore);
+    });
+
+    it('396. buildCanonicalWorkspaceSnapshotAfterPayload: undefined, null, and exact empty string independently canonicalize to computeSha256(\'\') for both fields', () => {
+      const nowIso = new Date().toISOString();
+      const emptySha = computeSha256('');
+
+      // Both undefined
+      const payloadUndefined = buildCanonicalWorkspaceSnapshotAfterPayload({
+        adjudicationId: 'adj-' + crypto.randomUUID(),
+        assignmentId: fixtures.assignmentId,
+        attemptId: fixtures.attemptId,
+        authorizationId: fixtures.authorizationId,
+        capturedAt: nowIso,
+        capturedRepositoryHeadSha: fixtures.repoHeadSha,
+        expectedHeadSha: fixtures.repoHeadSha,
+        gitDiffEvidenceHash: undefined,
+        gitStatusEvidenceHash: undefined,
+        projectId: fixtures.projectId,
+        submissionId: crypto.randomUUID(),
+        taskId: fixtures.taskId,
+        taskOwnershipEpoch: 1,
+        verificationExecutionId: 'exec-' + crypto.randomUUID(),
+        workspaceLeaseId: 'lease-' + crypto.randomUUID(),
+        worktreeIdentityHash: computeSha256(fixtures.projectRoot.toLowerCase()),
+      });
+      expect(payloadUndefined.git_status_evidence_hash).toBe(emptySha);
+      expect(payloadUndefined.git_diff_evidence_hash).toBe(emptySha);
+
+      // Both null
+      const payloadNull = buildCanonicalWorkspaceSnapshotAfterPayload({
+        adjudicationId: 'adj-' + crypto.randomUUID(),
+        assignmentId: fixtures.assignmentId,
+        attemptId: fixtures.attemptId,
+        authorizationId: fixtures.authorizationId,
+        capturedAt: nowIso,
+        capturedRepositoryHeadSha: fixtures.repoHeadSha,
+        expectedHeadSha: fixtures.repoHeadSha,
+        gitDiffEvidenceHash: null,
+        gitStatusEvidenceHash: null,
+        projectId: fixtures.projectId,
+        submissionId: crypto.randomUUID(),
+        taskId: fixtures.taskId,
+        taskOwnershipEpoch: 1,
+        verificationExecutionId: 'exec-' + crypto.randomUUID(),
+        workspaceLeaseId: 'lease-' + crypto.randomUUID(),
+        worktreeIdentityHash: computeSha256(fixtures.projectRoot.toLowerCase()),
+      });
+      expect(payloadNull.git_status_evidence_hash).toBe(emptySha);
+      expect(payloadNull.git_diff_evidence_hash).toBe(emptySha);
+
+      // Both exact empty string
+      const payloadEmptyStr = buildCanonicalWorkspaceSnapshotAfterPayload({
+        adjudicationId: 'adj-' + crypto.randomUUID(),
+        assignmentId: fixtures.assignmentId,
+        attemptId: fixtures.attemptId,
+        authorizationId: fixtures.authorizationId,
+        capturedAt: nowIso,
+        capturedRepositoryHeadSha: fixtures.repoHeadSha,
+        expectedHeadSha: fixtures.repoHeadSha,
+        gitDiffEvidenceHash: '',
+        gitStatusEvidenceHash: '',
+        projectId: fixtures.projectId,
+        submissionId: crypto.randomUUID(),
+        taskId: fixtures.taskId,
+        taskOwnershipEpoch: 1,
+        verificationExecutionId: 'exec-' + crypto.randomUUID(),
+        workspaceLeaseId: 'lease-' + crypto.randomUUID(),
+        worktreeIdentityHash: computeSha256(fixtures.projectRoot.toLowerCase()),
+      });
+      expect(payloadEmptyStr.git_status_evidence_hash).toBe(emptySha);
+      expect(payloadEmptyStr.git_diff_evidence_hash).toBe(emptySha);
+
+      // Mixed: status null, diff undefined
+      const payloadMixed1 = buildCanonicalWorkspaceSnapshotAfterPayload({
+        adjudicationId: 'adj-' + crypto.randomUUID(),
+        assignmentId: fixtures.assignmentId,
+        attemptId: fixtures.attemptId,
+        authorizationId: fixtures.authorizationId,
+        capturedAt: nowIso,
+        capturedRepositoryHeadSha: fixtures.repoHeadSha,
+        expectedHeadSha: fixtures.repoHeadSha,
+        gitDiffEvidenceHash: undefined,
+        gitStatusEvidenceHash: null,
+        projectId: fixtures.projectId,
+        submissionId: crypto.randomUUID(),
+        taskId: fixtures.taskId,
+        taskOwnershipEpoch: 1,
+        verificationExecutionId: 'exec-' + crypto.randomUUID(),
+        workspaceLeaseId: 'lease-' + crypto.randomUUID(),
+        worktreeIdentityHash: computeSha256(fixtures.projectRoot.toLowerCase()),
+      });
+      expect(payloadMixed1.git_status_evidence_hash).toBe(emptySha);
+      expect(payloadMixed1.git_diff_evidence_hash).toBe(emptySha);
+
+      // Mixed: status empty string, diff null
+      const payloadMixed2 = buildCanonicalWorkspaceSnapshotAfterPayload({
+        adjudicationId: 'adj-' + crypto.randomUUID(),
+        assignmentId: fixtures.assignmentId,
+        attemptId: fixtures.attemptId,
+        authorizationId: fixtures.authorizationId,
+        capturedAt: nowIso,
+        capturedRepositoryHeadSha: fixtures.repoHeadSha,
+        expectedHeadSha: fixtures.repoHeadSha,
+        gitDiffEvidenceHash: null,
+        gitStatusEvidenceHash: '',
+        projectId: fixtures.projectId,
+        submissionId: crypto.randomUUID(),
+        taskId: fixtures.taskId,
+        taskOwnershipEpoch: 1,
+        verificationExecutionId: 'exec-' + crypto.randomUUID(),
+        workspaceLeaseId: 'lease-' + crypto.randomUUID(),
+        worktreeIdentityHash: computeSha256(fixtures.projectRoot.toLowerCase()),
+      });
+      expect(payloadMixed2.git_status_evidence_hash).toBe(emptySha);
+      expect(payloadMixed2.git_diff_evidence_hash).toBe(emptySha);
+    });
+
+    it('397. buildCanonicalWorkspaceSnapshotAfterPayload: valid lowercase 64-character hash is preserved byte-for-byte for each field', () => {
+      const nowIso = new Date().toISOString();
+      const validStatusHash = computeSha256('custom-status-payload-sample');
+      const validDiffHash = computeSha256('custom-diff-payload-sample');
+
+      expect(/^[0-9a-f]{64}$/.test(validStatusHash)).toBe(true);
+      expect(/^[0-9a-f]{64}$/.test(validDiffHash)).toBe(true);
+
+      const payload = buildCanonicalWorkspaceSnapshotAfterPayload({
+        adjudicationId: 'adj-' + crypto.randomUUID(),
+        assignmentId: fixtures.assignmentId,
+        attemptId: fixtures.attemptId,
+        authorizationId: fixtures.authorizationId,
+        capturedAt: nowIso,
+        capturedRepositoryHeadSha: fixtures.repoHeadSha,
+        expectedHeadSha: fixtures.repoHeadSha,
+        gitDiffEvidenceHash: validDiffHash,
+        gitStatusEvidenceHash: validStatusHash,
+        projectId: fixtures.projectId,
+        submissionId: crypto.randomUUID(),
+        taskId: fixtures.taskId,
+        taskOwnershipEpoch: 1,
+        verificationExecutionId: 'exec-' + crypto.randomUUID(),
+        workspaceLeaseId: 'lease-' + crypto.randomUUID(),
+        worktreeIdentityHash: computeSha256(fixtures.projectRoot.toLowerCase()),
+      });
+
+      expect(payload.git_status_evidence_hash).toBe(validStatusHash);
+      expect(payload.git_diff_evidence_hash).toBe(validDiffHash);
+
+      // One valid, one absent/empty
+      const payloadMixed = buildCanonicalWorkspaceSnapshotAfterPayload({
+        adjudicationId: 'adj-' + crypto.randomUUID(),
+        assignmentId: fixtures.assignmentId,
+        attemptId: fixtures.attemptId,
+        authorizationId: fixtures.authorizationId,
+        capturedAt: nowIso,
+        capturedRepositoryHeadSha: fixtures.repoHeadSha,
+        expectedHeadSha: fixtures.repoHeadSha,
+        gitDiffEvidenceHash: null,
+        gitStatusEvidenceHash: validStatusHash,
+        projectId: fixtures.projectId,
+        submissionId: crypto.randomUUID(),
+        taskId: fixtures.taskId,
+        taskOwnershipEpoch: 1,
+        verificationExecutionId: 'exec-' + crypto.randomUUID(),
+        workspaceLeaseId: 'lease-' + crypto.randomUUID(),
+        worktreeIdentityHash: computeSha256(fixtures.projectRoot.toLowerCase()),
+      });
+      expect(payloadMixed.git_status_evidence_hash).toBe(validStatusHash);
+      expect(payloadMixed.git_diff_evidence_hash).toBe(computeSha256(''));
+    });
+
+    it('398. buildCanonicalWorkspaceSnapshotAfterPayload: invalid gitStatusEvidenceHash values throw synchronously with deterministic error', () => {
+      const nowIso = new Date().toISOString();
+      const validDiffHash = computeSha256('diff-valid');
+      const validStatusHash = computeSha256('status-valid');
+
+      const invalidVariants: Array<{ label: string; value: string }> = [
+        { label: 'uppercase hex', value: validStatusHash.toUpperCase() },
+        { label: '63 characters', value: validStatusHash.substring(0, 63) },
+        { label: '65 characters', value: validStatusHash + 'a' },
+        { label: 'non-hexadecimal character', value: validStatusHash.substring(0, 63) + 'g' },
+        { label: 'whitespace-only (single space)', value: ' ' },
+        { label: 'whitespace-only (multi spaces)', value: '   ' },
+        { label: 'leading whitespace', value: ' ' + validStatusHash },
+        { label: 'trailing whitespace', value: validStatusHash + ' ' },
+        { label: 'newline-containing', value: validStatusHash.substring(0, 32) + '\n' + validStatusHash.substring(33) },
+      ];
+
+      for (const variant of invalidVariants) {
+        expect(() => {
+          buildCanonicalWorkspaceSnapshotAfterPayload({
+            adjudicationId: 'adj-' + crypto.randomUUID(),
+            assignmentId: fixtures.assignmentId,
+            attemptId: fixtures.attemptId,
+            authorizationId: fixtures.authorizationId,
+            capturedAt: nowIso,
+            capturedRepositoryHeadSha: fixtures.repoHeadSha,
+            expectedHeadSha: fixtures.repoHeadSha,
+            gitDiffEvidenceHash: validDiffHash,
+            gitStatusEvidenceHash: variant.value,
+            projectId: fixtures.projectId,
+            submissionId: crypto.randomUUID(),
+            taskId: fixtures.taskId,
+            taskOwnershipEpoch: 1,
+            verificationExecutionId: 'exec-' + crypto.randomUUID(),
+            workspaceLeaseId: 'lease-' + crypto.randomUUID(),
+            worktreeIdentityHash: computeSha256(fixtures.projectRoot.toLowerCase()),
+          });
+        }).toThrowError(/Invalid gitStatusEvidenceHash:.*git status.*must be absent\/empty or a 64-character lowercase hexadecimal hash/);
+
+        // Verify the thrown error does not leak raw input value or secrets
+        try {
+          buildCanonicalWorkspaceSnapshotAfterPayload({
+            adjudicationId: 'adj-' + crypto.randomUUID(),
+            assignmentId: fixtures.assignmentId,
+            attemptId: fixtures.attemptId,
+            authorizationId: fixtures.authorizationId,
+            capturedAt: nowIso,
+            capturedRepositoryHeadSha: fixtures.repoHeadSha,
+            expectedHeadSha: fixtures.repoHeadSha,
+            gitDiffEvidenceHash: validDiffHash,
+            gitStatusEvidenceHash: variant.value,
+            projectId: fixtures.projectId,
+            submissionId: crypto.randomUUID(),
+            taskId: fixtures.taskId,
+            taskOwnershipEpoch: 1,
+            verificationExecutionId: 'exec-' + crypto.randomUUID(),
+            workspaceLeaseId: 'lease-' + crypto.randomUUID(),
+            worktreeIdentityHash: computeSha256(fixtures.projectRoot.toLowerCase()),
+          });
+        } catch (err: unknown) {
+          const errMsg = err instanceof Error ? err.message : String(err);
+          expect(errMsg).toBe('Invalid gitStatusEvidenceHash: git status evidence hash must be absent/empty or a 64-character lowercase hexadecimal hash');
+          if (variant.value.trim().length > 0) {
+            expect(errMsg).not.toContain(variant.value.trim());
+          }
+          expect(errMsg).not.toContain('SELECT');
+          expect(errMsg).not.toContain('TOKEN');
+          expect(errMsg).not.toContain('Bearer');
+        }
+      }
+    });
+
+    it('399. buildCanonicalWorkspaceSnapshotAfterPayload: invalid gitDiffEvidenceHash values throw synchronously with deterministic error', () => {
+      const nowIso = new Date().toISOString();
+      const validStatusHash = computeSha256('status-valid');
+      const validDiffHash = computeSha256('diff-valid');
+
+      const invalidVariants: Array<{ label: string; value: string }> = [
+        { label: 'uppercase hex', value: validDiffHash.toUpperCase() },
+        { label: '63 characters', value: validDiffHash.substring(0, 63) },
+        { label: '65 characters', value: validDiffHash + 'b' },
+        { label: 'non-hexadecimal character', value: validDiffHash.substring(0, 63) + 'z' },
+        { label: 'whitespace-only (single space)', value: ' ' },
+        { label: 'whitespace-only (multi spaces)', value: '   ' },
+        { label: 'leading whitespace', value: ' ' + validDiffHash },
+        { label: 'trailing whitespace', value: validDiffHash + ' ' },
+        { label: 'newline-containing', value: validDiffHash.substring(0, 32) + '\r\n' + validDiffHash.substring(34) },
+      ];
+
+      for (const variant of invalidVariants) {
+        expect(() => {
+          buildCanonicalWorkspaceSnapshotAfterPayload({
+            adjudicationId: 'adj-' + crypto.randomUUID(),
+            assignmentId: fixtures.assignmentId,
+            attemptId: fixtures.attemptId,
+            authorizationId: fixtures.authorizationId,
+            capturedAt: nowIso,
+            capturedRepositoryHeadSha: fixtures.repoHeadSha,
+            expectedHeadSha: fixtures.repoHeadSha,
+            gitDiffEvidenceHash: variant.value,
+            gitStatusEvidenceHash: validStatusHash,
+            projectId: fixtures.projectId,
+            submissionId: crypto.randomUUID(),
+            taskId: fixtures.taskId,
+            taskOwnershipEpoch: 1,
+            verificationExecutionId: 'exec-' + crypto.randomUUID(),
+            workspaceLeaseId: 'lease-' + crypto.randomUUID(),
+            worktreeIdentityHash: computeSha256(fixtures.projectRoot.toLowerCase()),
+          });
+        }).toThrowError(/Invalid gitDiffEvidenceHash:.*git diff.*must be absent\/empty or a 64-character lowercase hexadecimal hash/);
+
+        // Verify the thrown error does not leak raw input value or secrets
+        try {
+          buildCanonicalWorkspaceSnapshotAfterPayload({
+            adjudicationId: 'adj-' + crypto.randomUUID(),
+            assignmentId: fixtures.assignmentId,
+            attemptId: fixtures.attemptId,
+            authorizationId: fixtures.authorizationId,
+            capturedAt: nowIso,
+            capturedRepositoryHeadSha: fixtures.repoHeadSha,
+            expectedHeadSha: fixtures.repoHeadSha,
+            gitDiffEvidenceHash: variant.value,
+            gitStatusEvidenceHash: validStatusHash,
+            projectId: fixtures.projectId,
+            submissionId: crypto.randomUUID(),
+            taskId: fixtures.taskId,
+            taskOwnershipEpoch: 1,
+            verificationExecutionId: 'exec-' + crypto.randomUUID(),
+            workspaceLeaseId: 'lease-' + crypto.randomUUID(),
+            worktreeIdentityHash: computeSha256(fixtures.projectRoot.toLowerCase()),
+          });
+        } catch (err: unknown) {
+          const errMsg = err instanceof Error ? err.message : String(err);
+          expect(errMsg).toBe('Invalid gitDiffEvidenceHash: git diff evidence hash must be absent/empty or a 64-character lowercase hexadecimal hash');
+          if (variant.value.trim().length > 0) {
+            expect(errMsg).not.toContain(variant.value.trim());
+          }
+          expect(errMsg).not.toContain('SELECT');
+          expect(errMsg).not.toContain('TOKEN');
+          expect(errMsg).not.toContain('Bearer');
+        }
+      }
+    });
+
+    it('400. Fail-closed: malformed evidence hashes prevent payload construction and cause zero durable repository mutation', () => {
+      const nowIso = new Date().toISOString();
+      const validDiffHash = computeSha256('diff-valid');
+
+      const adjCountBefore = (fixtures.db.prepare('SELECT count(*) as c FROM coder_submission_adjudications').get() as { c: number }).c;
+      const eventCountBefore = (fixtures.db.prepare('SELECT count(*) as c FROM coder_submission_adjudication_events').get() as { c: number }).c;
+      const dispCountBefore = (fixtures.db.prepare('SELECT count(*) as c FROM coder_submission_dispositions').get() as { c: number }).c;
+      const evidenceCountBefore = (fixtures.db.prepare('SELECT count(*) as c FROM evidence').get() as { c: number }).c;
+
+      let caughtStatusErr = false;
+      try {
+        buildCanonicalWorkspaceSnapshotAfterPayload({
+          adjudicationId: 'adj-' + crypto.randomUUID(),
+          assignmentId: fixtures.assignmentId,
+          attemptId: fixtures.attemptId,
+          authorizationId: fixtures.authorizationId,
+          capturedAt: nowIso,
+          capturedRepositoryHeadSha: fixtures.repoHeadSha,
+          expectedHeadSha: fixtures.repoHeadSha,
+          gitDiffEvidenceHash: validDiffHash,
+          gitStatusEvidenceHash: 'INVALID_STATUS_HASH_UPPERCASE_AND_BAD_LENGTH',
+          projectId: fixtures.projectId,
+          submissionId: crypto.randomUUID(),
+          taskId: fixtures.taskId,
+          taskOwnershipEpoch: 1,
+          verificationExecutionId: 'exec-' + crypto.randomUUID(),
+          workspaceLeaseId: 'lease-' + crypto.randomUUID(),
+          worktreeIdentityHash: computeSha256(fixtures.projectRoot.toLowerCase()),
+        });
+      } catch (err) {
+        caughtStatusErr = true;
+      }
+      expect(caughtStatusErr).toBe(true);
+
+      let caughtDiffErr = false;
+      try {
+        buildCanonicalWorkspaceSnapshotAfterPayload({
+          adjudicationId: 'adj-' + crypto.randomUUID(),
+          assignmentId: fixtures.assignmentId,
+          attemptId: fixtures.attemptId,
+          authorizationId: fixtures.authorizationId,
+          capturedAt: nowIso,
+          capturedRepositoryHeadSha: fixtures.repoHeadSha,
+          expectedHeadSha: fixtures.repoHeadSha,
+          gitDiffEvidenceHash: '   whitespace_diff_evidence   ',
+          gitStatusEvidenceHash: computeSha256('status-valid'),
+          projectId: fixtures.projectId,
+          submissionId: crypto.randomUUID(),
+          taskId: fixtures.taskId,
+          taskOwnershipEpoch: 1,
+          verificationExecutionId: 'exec-' + crypto.randomUUID(),
+          workspaceLeaseId: 'lease-' + crypto.randomUUID(),
+          worktreeIdentityHash: computeSha256(fixtures.projectRoot.toLowerCase()),
+        });
+      } catch (err) {
+        caughtDiffErr = true;
+      }
+      expect(caughtDiffErr).toBe(true);
+
+      const adjCountAfter = (fixtures.db.prepare('SELECT count(*) as c FROM coder_submission_adjudications').get() as { c: number }).c;
+      const eventCountAfter = (fixtures.db.prepare('SELECT count(*) as c FROM coder_submission_adjudication_events').get() as { c: number }).c;
+      const dispCountAfter = (fixtures.db.prepare('SELECT count(*) as c FROM coder_submission_dispositions').get() as { c: number }).c;
+      const evidenceCountAfter = (fixtures.db.prepare('SELECT count(*) as c FROM evidence').get() as { c: number }).c;
+
+      expect(adjCountAfter).toBe(adjCountBefore);
+      expect(eventCountAfter).toBe(eventCountBefore);
+      expect(dispCountAfter).toBe(dispCountBefore);
+      expect(evidenceCountAfter).toBe(evidenceCountBefore);
+    });
+
+    it('401. validateCanonicalWorkspaceSnapshotAfter: rejects missing, malformed, or mismatched authority hashes without mutation', async () => {
+      const { plaintextToken } = issueSubmissionSessionHelper(fixtures.repo, fixtures.authorizationId);
+      const subId = crypto.randomUUID();
+      fixtures.mcpService.submitCoderClaim(createValidSubmissionPayload(fixtures, subId), plaintextToken);
+
+      const admitRes = await fixtures.adjudicationService.admitSubmissionForVerification({
+        requestId: crypto.randomUUID(),
+        submissionId: subId,
+      });
+
+      const adj = fixtures.repo.getCoderSubmissionAdjudicationById(admitRes.adjudication.id)!;
+      const sub = fixtures.repo.getCoderSubmissionById(subId)!;
+      const lease = fixtures.repo.getWorkspaceLease(adj.workspace_lease_id!)!;
+      const env = JSON.parse(adj.verification_result_envelope_json!);
+      const afterEv = fixtures.repo.getEvidence(env.workspace_snapshot_after_evidence_id!)!;
+      const rawContent = afterEv.raw_payload || (afterEv.file_path ? fs.readFileSync(afterEv.file_path, 'utf8') : '{}');
+      const expectedHash = env.workspace_snapshot_after_hash;
+
+      const eventCountBefore = (fixtures.db.prepare('SELECT count(*) as c FROM coder_submission_adjudication_events').get() as { c: number }).c;
+      const dispCountBefore = (fixtures.db.prepare('SELECT count(*) as c FROM coder_submission_dispositions').get() as { c: number }).c;
+
+      // 1. Missing gitStatusEvidenceHash authority input
+      const resMissingStatus = validateCanonicalWorkspaceSnapshotAfter({
+        rawContent,
+        expectedHash,
+        adjudication: adj,
+        submission: sub,
+        lease,
+        verificationExecutionId: env.verification_execution_id,
+        gitStatusEvidenceHash: null,
+        gitDiffEvidenceHash: env.git_diff_evidence_hash || computeSha256(''),
+        expectedCapturedAt: env.finish_timestamp,
+      });
+      expect(resMissingStatus.valid).toBe(false);
+      expect(resMissingStatus.error).toContain('gitStatusEvidenceHash authority input must be a 64-char lowercase hex string');
+
+      // 2. Malformed uppercase gitStatusEvidenceHash authority input
+      const resUpperStatus = validateCanonicalWorkspaceSnapshotAfter({
+        rawContent,
+        expectedHash,
+        adjudication: adj,
+        submission: sub,
+        lease,
+        verificationExecutionId: env.verification_execution_id,
+        gitStatusEvidenceHash: (env.git_status_evidence_hash || computeSha256('')).toUpperCase(),
+        gitDiffEvidenceHash: env.git_diff_evidence_hash || computeSha256(''),
+        expectedCapturedAt: env.finish_timestamp,
+      });
+      expect(resUpperStatus.valid).toBe(false);
+      expect(resUpperStatus.error).toContain('gitStatusEvidenceHash authority input must be a 64-char lowercase hex string');
+
+      // 3. Mismatched gitStatusEvidenceHash authority input
+      const resMismatchStatus = validateCanonicalWorkspaceSnapshotAfter({
+        rawContent,
+        expectedHash,
+        adjudication: adj,
+        submission: sub,
+        lease,
+        verificationExecutionId: env.verification_execution_id,
+        gitStatusEvidenceHash: computeSha256('mismatched-status-authority'),
+        gitDiffEvidenceHash: env.git_diff_evidence_hash || computeSha256(''),
+        expectedCapturedAt: env.finish_timestamp,
+      });
+      expect(resMismatchStatus.valid).toBe(false);
+      expect(resMismatchStatus.error).toContain('git_status_evidence_hash mismatch git status evidence');
+
+      // 4. Missing gitDiffEvidenceHash authority input
+      const resMissingDiff = validateCanonicalWorkspaceSnapshotAfter({
+        rawContent,
+        expectedHash,
+        adjudication: adj,
+        submission: sub,
+        lease,
+        verificationExecutionId: env.verification_execution_id,
+        gitStatusEvidenceHash: env.git_status_evidence_hash || computeSha256(''),
+        gitDiffEvidenceHash: undefined,
+        expectedCapturedAt: env.finish_timestamp,
+      });
+      expect(resMissingDiff.valid).toBe(false);
+      expect(resMissingDiff.error).toContain('gitDiffEvidenceHash authority input must be a 64-char lowercase hex string');
+
+      // 5. Malformed 63-char gitDiffEvidenceHash authority input
+      const resShortDiff = validateCanonicalWorkspaceSnapshotAfter({
+        rawContent,
+        expectedHash,
+        adjudication: adj,
+        submission: sub,
+        lease,
+        verificationExecutionId: env.verification_execution_id,
+        gitStatusEvidenceHash: env.git_status_evidence_hash || computeSha256(''),
+        gitDiffEvidenceHash: (env.git_diff_evidence_hash || computeSha256('')).substring(0, 63),
+        expectedCapturedAt: env.finish_timestamp,
+      });
+      expect(resShortDiff.valid).toBe(false);
+      expect(resShortDiff.error).toContain('gitDiffEvidenceHash authority input must be a 64-char lowercase hex string');
+
+      // 6. Mismatched gitDiffEvidenceHash authority input
+      const resMismatchDiff = validateCanonicalWorkspaceSnapshotAfter({
+        rawContent,
+        expectedHash,
+        adjudication: adj,
+        submission: sub,
+        lease,
+        verificationExecutionId: env.verification_execution_id,
+        gitStatusEvidenceHash: env.git_status_evidence_hash || computeSha256(''),
+        gitDiffEvidenceHash: computeSha256('mismatched-diff-authority'),
+        expectedCapturedAt: env.finish_timestamp,
+      });
+      expect(resMismatchDiff.valid).toBe(false);
+      expect(resMismatchDiff.error).toContain('git_diff_evidence_hash mismatch git diff evidence');
+
+      // Zero durable mutation
+      const eventCountAfter = (fixtures.db.prepare('SELECT count(*) as c FROM coder_submission_adjudication_events').get() as { c: number }).c;
+      const dispCountAfter = (fixtures.db.prepare('SELECT count(*) as c FROM coder_submission_dispositions').get() as { c: number }).c;
+      expect(eventCountAfter).toBe(eventCountBefore);
+      expect(dispCountAfter).toBe(dispCountBefore);
+    });
+
+    it('402. Production helper canonicalizeSnapshotEvidenceHash decision table verification', () => {
+      const emptySha = computeSha256('');
+      const validSample = computeSha256('evidence-hash-test');
+
+      // A. Absent / empty input
+      expect(canonicalizeSnapshotEvidenceHash(undefined, 'gitStatusEvidenceHash')).toBe(emptySha);
+      expect(canonicalizeSnapshotEvidenceHash(null, 'gitStatusEvidenceHash')).toBe(emptySha);
+      expect(canonicalizeSnapshotEvidenceHash('', 'gitStatusEvidenceHash')).toBe(emptySha);
+      expect(canonicalizeSnapshotEvidenceHash(undefined, 'gitDiffEvidenceHash')).toBe(emptySha);
+      expect(canonicalizeSnapshotEvidenceHash(null, 'gitDiffEvidenceHash')).toBe(emptySha);
+      expect(canonicalizeSnapshotEvidenceHash('', 'gitDiffEvidenceHash')).toBe(emptySha);
+
+      // B. Valid input
+      expect(canonicalizeSnapshotEvidenceHash(validSample, 'gitStatusEvidenceHash')).toBe(validSample);
+      expect(canonicalizeSnapshotEvidenceHash(validSample, 'gitDiffEvidenceHash')).toBe(validSample);
+
+      // C. Invalid non-empty input
+      expect(() => canonicalizeSnapshotEvidenceHash(validSample.toUpperCase(), 'gitStatusEvidenceHash')).toThrow(
+        /Invalid gitStatusEvidenceHash: git status evidence hash must be absent\/empty or a 64-character lowercase hexadecimal hash/
+      );
+      expect(() => canonicalizeSnapshotEvidenceHash(validSample.toUpperCase(), 'gitDiffEvidenceHash')).toThrow(
+        /Invalid gitDiffEvidenceHash: git diff evidence hash must be absent\/empty or a 64-character lowercase hexadecimal hash/
+      );
+      expect(() => canonicalizeSnapshotEvidenceHash('   ', 'gitStatusEvidenceHash')).toThrow(/Invalid gitStatusEvidenceHash/);
+      expect(() => canonicalizeSnapshotEvidenceHash('   ', 'gitDiffEvidenceHash')).toThrow(/Invalid gitDiffEvidenceHash/);
+      expect(() => canonicalizeSnapshotEvidenceHash(validSample.substring(0, 63), 'gitStatusEvidenceHash')).toThrow(/Invalid gitStatusEvidenceHash/);
+      expect(() => canonicalizeSnapshotEvidenceHash(validSample + 'f', 'gitDiffEvidenceHash')).toThrow(/Invalid gitDiffEvidenceHash/);
     });
   });
 });
