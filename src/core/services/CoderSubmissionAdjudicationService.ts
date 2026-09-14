@@ -246,8 +246,8 @@ export function buildCanonicalWorkspaceSnapshotAfterPayload(params: {
   capturedAt: string;
   capturedRepositoryHeadSha: string;
   expectedHeadSha: string;
-  gitDiffEvidenceHash: string;
-  gitStatusEvidenceHash: string;
+  gitDiffEvidenceHash?: string | null;
+  gitStatusEvidenceHash?: string | null;
   projectId: string;
   schemaVersion?: 1;
   submissionId: string;
@@ -257,6 +257,14 @@ export function buildCanonicalWorkspaceSnapshotAfterPayload(params: {
   workspaceLeaseId: string;
   worktreeIdentityHash: string;
 }): CanonicalWorkspaceSnapshotAfterPayload {
+  const HEX_64_REGEX = /^[0-9a-f]{64}$/;
+  const diffHash = params.gitDiffEvidenceHash && HEX_64_REGEX.test(params.gitDiffEvidenceHash)
+    ? params.gitDiffEvidenceHash
+    : computeSha256('');
+  const statusHash = params.gitStatusEvidenceHash && HEX_64_REGEX.test(params.gitStatusEvidenceHash)
+    ? params.gitStatusEvidenceHash
+    : computeSha256('');
+
   return {
     adjudication_id: params.adjudicationId,
     adjudication_lifecycle_version: params.adjudicationLifecycleVersion ?? 3,
@@ -266,8 +274,8 @@ export function buildCanonicalWorkspaceSnapshotAfterPayload(params: {
     captured_at: params.capturedAt,
     captured_repository_head_sha: params.capturedRepositoryHeadSha,
     expected_head_sha: params.expectedHeadSha,
-    git_diff_evidence_hash: params.gitDiffEvidenceHash,
-    git_status_evidence_hash: params.gitStatusEvidenceHash,
+    git_diff_evidence_hash: diffHash,
+    git_status_evidence_hash: statusHash,
     project_id: params.projectId,
     schema_version: params.schemaVersion ?? 1,
     submission_id: params.submissionId,
@@ -281,14 +289,14 @@ export function buildCanonicalWorkspaceSnapshotAfterPayload(params: {
 
 export interface ValidateWorkspaceSnapshotAfterParams {
   rawContent: string;
-  expectedHash?: string;
+  expectedHash?: string | null;
   adjudication: CoderSubmissionAdjudication;
   submission?: CoderSubmission | null;
   lease?: CoderSubmissionWorkspaceLease | null;
-  verificationExecutionId?: string;
-  gitStatusEvidenceHash?: string;
-  gitDiffEvidenceHash?: string;
-  expectedCapturedAt?: string;
+  verificationExecutionId?: string | null;
+  gitStatusEvidenceHash?: string | null;
+  gitDiffEvidenceHash?: string | null;
+  expectedCapturedAt?: string | null;
 }
 
 export function validateCanonicalWorkspaceSnapshotAfter(params: ValidateWorkspaceSnapshotAfterParams): {
@@ -315,14 +323,40 @@ export function validateCanonicalWorkspaceSnapshotAfter(params: ValidateWorkspac
   const HEX_64_REGEX = /^[0-9a-f]{64}$/;
   const HEX_40_REGEX = /^[0-9a-f]{40}$/;
 
-  if (expectedHash !== undefined) {
-    if (typeof expectedHash !== 'string' || !HEX_64_REGEX.test(expectedHash)) {
-      return { valid: false, payload: null, error: 'Workspace snapshot after expectedHash must be a 64-char lowercase hex string' };
-    }
-    const computedHash = computeSha256(rawContent);
-    if (computedHash !== expectedHash) {
-      return { valid: false, payload: null, error: 'Workspace snapshot after evidence file content hash mismatch' };
-    }
+  if (!expectedHash || typeof expectedHash !== 'string' || !HEX_64_REGEX.test(expectedHash)) {
+    return { valid: false, payload: null, error: 'Workspace snapshot after expectedHash must be a 64-char lowercase hex string' };
+  }
+  const computedHash = computeSha256(rawContent);
+  if (computedHash !== expectedHash) {
+    return { valid: false, payload: null, error: 'Workspace snapshot after evidence file content hash mismatch' };
+  }
+
+  if (!adjudication || typeof adjudication !== 'object') {
+    return { valid: false, payload: null, error: 'adjudication authority input is required for workspace snapshot after validation' };
+  }
+
+  if (!submission || typeof submission !== 'object') {
+    return { valid: false, payload: null, error: 'submission authority input is required for workspace snapshot after validation' };
+  }
+
+  if (!lease || typeof lease !== 'object') {
+    return { valid: false, payload: null, error: 'lease authority input is required for workspace snapshot after validation' };
+  }
+
+  if (!verificationExecutionId || typeof verificationExecutionId !== 'string' || !verificationExecutionId.trim()) {
+    return { valid: false, payload: null, error: 'verificationExecutionId authority input must be a non-empty string' };
+  }
+
+  if (!gitStatusEvidenceHash || typeof gitStatusEvidenceHash !== 'string' || !HEX_64_REGEX.test(gitStatusEvidenceHash)) {
+    return { valid: false, payload: null, error: 'gitStatusEvidenceHash authority input must be a 64-char lowercase hex string' };
+  }
+
+  if (!gitDiffEvidenceHash || typeof gitDiffEvidenceHash !== 'string' || !HEX_64_REGEX.test(gitDiffEvidenceHash)) {
+    return { valid: false, payload: null, error: 'gitDiffEvidenceHash authority input must be a 64-char lowercase hex string' };
+  }
+
+  if (!expectedCapturedAt || typeof expectedCapturedAt !== 'string' || !isCanonicalUtcIso(expectedCapturedAt)) {
+    return { valid: false, payload: null, error: 'expectedCapturedAt authority input must be a canonical UTC ISO-8601 string' };
   }
 
   let parsed: unknown;
@@ -372,7 +406,7 @@ export function validateCanonicalWorkspaceSnapshotAfter(params: ValidateWorkspac
   if (obj.submission_id !== adjudication.submission_id) {
     return { valid: false, payload: null, error: 'submission_id mismatch adjudication record' };
   }
-  if (submission && obj.submission_id !== submission.id) {
+  if (obj.submission_id !== submission.id) {
     return { valid: false, payload: null, error: 'submission_id mismatch submission record' };
   }
   if (typeof obj.authorization_id !== 'string' || !obj.authorization_id.trim()) {
@@ -381,7 +415,7 @@ export function validateCanonicalWorkspaceSnapshotAfter(params: ValidateWorkspac
   if (obj.authorization_id !== adjudication.authorization_id) {
     return { valid: false, payload: null, error: 'authorization_id mismatch adjudication record' };
   }
-  if (submission && obj.authorization_id !== submission.authorization_id) {
+  if (obj.authorization_id !== submission.authorization_id) {
     return { valid: false, payload: null, error: 'authorization_id mismatch submission record' };
   }
   if (typeof obj.project_id !== 'string' || !obj.project_id.trim()) {
@@ -390,7 +424,7 @@ export function validateCanonicalWorkspaceSnapshotAfter(params: ValidateWorkspac
   if (obj.project_id !== adjudication.project_id) {
     return { valid: false, payload: null, error: 'project_id mismatch adjudication record' };
   }
-  if (submission && obj.project_id !== submission.project_id) {
+  if (obj.project_id !== submission.project_id) {
     return { valid: false, payload: null, error: 'project_id mismatch submission record' };
   }
   if (typeof obj.task_id !== 'string' || !obj.task_id.trim()) {
@@ -399,7 +433,7 @@ export function validateCanonicalWorkspaceSnapshotAfter(params: ValidateWorkspac
   if (obj.task_id !== adjudication.task_id) {
     return { valid: false, payload: null, error: 'task_id mismatch adjudication record' };
   }
-  if (submission && obj.task_id !== submission.task_id) {
+  if (obj.task_id !== submission.task_id) {
     return { valid: false, payload: null, error: 'task_id mismatch submission record' };
   }
   if (adjudication.attempt_id !== null && obj.attempt_id !== adjudication.attempt_id) {
@@ -423,13 +457,13 @@ export function validateCanonicalWorkspaceSnapshotAfter(params: ValidateWorkspac
   if (obj.task_ownership_epoch !== adjudication.task_ownership_epoch) {
     return { valid: false, payload: null, error: 'task_ownership_epoch mismatch adjudication record' };
   }
-  if (submission && obj.task_ownership_epoch !== submission.task_ownership_epoch) {
+  if (obj.task_ownership_epoch !== submission.task_ownership_epoch) {
     return { valid: false, payload: null, error: 'task_ownership_epoch mismatch submission record' };
   }
   if (typeof obj.verification_execution_id !== 'string' || !obj.verification_execution_id.trim()) {
     return { valid: false, payload: null, error: 'verification_execution_id must be non-empty string' };
   }
-  if (verificationExecutionId !== undefined && obj.verification_execution_id !== verificationExecutionId) {
+  if (obj.verification_execution_id !== verificationExecutionId) {
     return { valid: false, payload: null, error: 'verification_execution_id mismatch verification execution' };
   }
   if (adjudication.verification_execution_id && obj.verification_execution_id !== adjudication.verification_execution_id) {
@@ -437,23 +471,17 @@ export function validateCanonicalWorkspaceSnapshotAfter(params: ValidateWorkspac
   }
 
   // Exact 64-char lowercase hex checks for SHA-256 hashes
-  if (
-    typeof obj.git_status_evidence_hash !== 'string' ||
-    (obj.git_status_evidence_hash !== '' && !HEX_64_REGEX.test(obj.git_status_evidence_hash))
-  ) {
+  if (typeof obj.git_status_evidence_hash !== 'string' || !HEX_64_REGEX.test(obj.git_status_evidence_hash)) {
     return { valid: false, payload: null, error: 'git_status_evidence_hash must be a 64-char lowercase hex string' };
   }
-  if (gitStatusEvidenceHash !== undefined && obj.git_status_evidence_hash !== gitStatusEvidenceHash) {
+  if (obj.git_status_evidence_hash !== gitStatusEvidenceHash) {
     return { valid: false, payload: null, error: 'git_status_evidence_hash mismatch git status evidence' };
   }
 
-  if (
-    typeof obj.git_diff_evidence_hash !== 'string' ||
-    (obj.git_diff_evidence_hash !== '' && !HEX_64_REGEX.test(obj.git_diff_evidence_hash))
-  ) {
+  if (typeof obj.git_diff_evidence_hash !== 'string' || !HEX_64_REGEX.test(obj.git_diff_evidence_hash)) {
     return { valid: false, payload: null, error: 'git_diff_evidence_hash must be a 64-char lowercase hex string' };
   }
-  if (gitDiffEvidenceHash !== undefined && obj.git_diff_evidence_hash !== gitDiffEvidenceHash) {
+  if (obj.git_diff_evidence_hash !== gitDiffEvidenceHash) {
     return { valid: false, payload: null, error: 'git_diff_evidence_hash mismatch git diff evidence' };
   }
 
@@ -463,14 +491,14 @@ export function validateCanonicalWorkspaceSnapshotAfter(params: ValidateWorkspac
   if (adjudication.workspace_lease_id && obj.workspace_lease_id !== adjudication.workspace_lease_id) {
     return { valid: false, payload: null, error: 'workspace_lease_id mismatch adjudication record' };
   }
-  if (lease && obj.workspace_lease_id !== lease.id) {
+  if (obj.workspace_lease_id !== lease.id) {
     return { valid: false, payload: null, error: 'workspace_lease_id mismatch lease record' };
   }
 
   if (typeof obj.worktree_identity_hash !== 'string' || !HEX_64_REGEX.test(obj.worktree_identity_hash)) {
     return { valid: false, payload: null, error: 'worktree_identity_hash must be a 64-char lowercase hex string' };
   }
-  if (lease && obj.worktree_identity_hash !== lease.worktree_identity_hash) {
+  if (obj.worktree_identity_hash !== lease.worktree_identity_hash) {
     return { valid: false, payload: null, error: 'worktree_identity_hash mismatch lease record' };
   }
 
@@ -478,14 +506,14 @@ export function validateCanonicalWorkspaceSnapshotAfter(params: ValidateWorkspac
   if (typeof obj.expected_head_sha !== 'string' || !HEX_40_REGEX.test(obj.expected_head_sha)) {
     return { valid: false, payload: null, error: 'expected_head_sha must be a 40-char lowercase hex string' };
   }
-  if (submission && obj.expected_head_sha !== submission.authorized_head_sha) {
+  if (obj.expected_head_sha !== submission.authorized_head_sha) {
     return { valid: false, payload: null, error: 'expected_head_sha mismatch submission authorized_head_sha' };
   }
 
   if (typeof obj.captured_repository_head_sha !== 'string' || !HEX_40_REGEX.test(obj.captured_repository_head_sha)) {
     return { valid: false, payload: null, error: 'captured_repository_head_sha must be a 40-char lowercase hex string' };
   }
-  if (submission && obj.captured_repository_head_sha !== submission.authorized_head_sha) {
+  if (obj.captured_repository_head_sha !== submission.authorized_head_sha) {
     return { valid: false, payload: null, error: 'captured_repository_head_sha repository-head conflict with authorized_head_sha' };
   }
   if (obj.captured_repository_head_sha !== obj.expected_head_sha) {
@@ -495,13 +523,8 @@ export function validateCanonicalWorkspaceSnapshotAfter(params: ValidateWorkspac
   if (typeof obj.captured_at !== 'string' || !isCanonicalUtcIso(obj.captured_at)) {
     return { valid: false, payload: null, error: 'captured_at must be canonical UTC ISO-8601 string' };
   }
-  if (expectedCapturedAt !== undefined) {
-    if (typeof expectedCapturedAt !== 'string' || !isCanonicalUtcIso(expectedCapturedAt)) {
-      return { valid: false, payload: null, error: 'expectedCapturedAt must be canonical UTC ISO-8601 string' };
-    }
-    if (obj.captured_at !== expectedCapturedAt) {
-      return { valid: false, payload: null, error: `captured_at (${obj.captured_at}) does not match expected finish timestamp (${expectedCapturedAt})` };
-    }
+  if (obj.captured_at !== expectedCapturedAt) {
+    return { valid: false, payload: null, error: `captured_at (${obj.captured_at}) does not match expected finish timestamp (${expectedCapturedAt})` };
   }
 
   return { valid: true, payload: obj as unknown as CanonicalWorkspaceSnapshotAfterPayload };
@@ -1444,8 +1467,8 @@ export function evaluateCanonicalSettlementDecision(
     submission: sub,
     lease,
     verificationExecutionId: envelope.verification_execution_id,
-    gitStatusEvidenceHash: envelope.git_status_evidence_hash,
-    gitDiffEvidenceHash: envelope.git_diff_evidence_hash,
+    gitStatusEvidenceHash: envelope.git_status_evidence_hash || computeSha256(''),
+    gitDiffEvidenceHash: envelope.git_diff_evidence_hash || computeSha256(''),
     expectedCapturedAt: envelope.finish_timestamp,
   });
 
@@ -3430,8 +3453,8 @@ export class CoderSubmissionAdjudicationService {
               submission: replaySub,
               lease: replayLease,
               verificationExecutionId: env.verification_execution_id,
-              gitStatusEvidenceHash: env.git_status_evidence_hash,
-              gitDiffEvidenceHash: env.git_diff_evidence_hash,
+              gitStatusEvidenceHash: env.git_status_evidence_hash || computeSha256(''),
+              gitDiffEvidenceHash: env.git_diff_evidence_hash || computeSha256(''),
               expectedCapturedAt: env.finish_timestamp,
             });
             if (!val.valid) {
@@ -4278,8 +4301,8 @@ export class CoderSubmissionAdjudicationService {
       capturedAt: phaseCNowIso,
       capturedRepositoryHeadSha: postObservation ? postObservation.head_sha : (freshPhaseBObservation ? freshPhaseBObservation.head_sha : ''),
       expectedHeadSha: sub.authorized_head_sha,
-      gitDiffEvidenceHash: stagedGitDiffEvidence?.hash ?? '',
-      gitStatusEvidenceHash: stagedGitStatusEvidence?.hash ?? '',
+      gitDiffEvidenceHash: (stagedGitDiffEvidence && stagedGitDiffEvidence.hash) ? stagedGitDiffEvidence.hash : computeSha256(''),
+      gitStatusEvidenceHash: (stagedGitStatusEvidence && stagedGitStatusEvidence.hash) ? stagedGitStatusEvidence.hash : computeSha256(''),
       projectId: sub.project_id,
       submissionId: sub.id,
       taskId: sub.task_id,
@@ -4330,8 +4353,8 @@ export class CoderSubmissionAdjudicationService {
       submission: sub,
       lease: currentLeaseForValidation,
       verificationExecutionId: executionId,
-      gitStatusEvidenceHash: stagedGitStatusEvidence?.hash ?? '',
-      gitDiffEvidenceHash: stagedGitDiffEvidence?.hash ?? '',
+      gitStatusEvidenceHash: (stagedGitStatusEvidence && stagedGitStatusEvidence.hash) ? stagedGitStatusEvidence.hash : computeSha256(''),
+      gitDiffEvidenceHash: (stagedGitDiffEvidence && stagedGitDiffEvidence.hash) ? stagedGitDiffEvidence.hash : computeSha256(''),
       expectedCapturedAt: phaseCNowIso,
     });
     if (!initialValidation.valid) {

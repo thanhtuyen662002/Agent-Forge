@@ -520,11 +520,16 @@ export class CoderSubmissionAdjudicationRecoveryScanner {
                 } else if (evt.payload_json !== expectedPayload) {
                   contradiction = `Deterministic event payload mismatch`;
                 } else if (
+                  typeof adj.recovery_fenced_at !== 'string' ||
+                  !isCanonicalUtcIso(adj.recovery_fenced_at)
+                ) {
+                  contradiction = 'Pre-result RECOVERY_FENCED recovery_fenced_at must be non-null canonical UTC ISO';
+                } else if (
                   typeof evt.created_at !== 'string' ||
                   !isCanonicalUtcIso(evt.created_at) ||
-                  (adj.recovery_fenced_at && evt.created_at < adj.recovery_fenced_at)
+                  evt.created_at !== adj.recovery_fenced_at
                 ) {
-                  contradiction = `Pre-result RECOVERY_FENCED event timestamp non-canonical or non-monotonic`;
+                  contradiction = `Pre-result RECOVERY_FENCED event timestamp mismatch: expected ${adj.recovery_fenced_at}, got ${evt.created_at}`;
                 }
               }
             }
@@ -861,7 +866,7 @@ export class CoderSubmissionAdjudicationRecoveryScanner {
               const lease = adj.workspace_lease_id ? this.repo.getWorkspaceLease(adj.workspace_lease_id) : null;
               if (
                 !sub ||
-                (adj.workspace_lease_id && !lease) ||
+                !lease ||
                 !parsedEnvelope.verification_execution_id ||
                 !parsedEnvelope.finish_timestamp
               ) {
@@ -874,8 +879,8 @@ export class CoderSubmissionAdjudicationRecoveryScanner {
                   submission: sub,
                   lease,
                   verificationExecutionId: parsedEnvelope.verification_execution_id,
-                  gitStatusEvidenceHash: parsedEnvelope.git_status_evidence_hash,
-                  gitDiffEvidenceHash: parsedEnvelope.git_diff_evidence_hash,
+                  gitStatusEvidenceHash: parsedEnvelope.git_status_evidence_hash || computeSha256(''),
+                  gitDiffEvidenceHash: parsedEnvelope.git_diff_evidence_hash || computeSha256(''),
                   expectedCapturedAt: parsedEnvelope.finish_timestamp,
                 });
                 if (!afterVal.valid) {
