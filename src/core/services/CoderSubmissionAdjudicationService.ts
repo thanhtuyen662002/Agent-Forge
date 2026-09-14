@@ -288,6 +288,7 @@ export interface ValidateWorkspaceSnapshotAfterParams {
   verificationExecutionId?: string;
   gitStatusEvidenceHash?: string;
   gitDiffEvidenceHash?: string;
+  expectedCapturedAt?: string;
 }
 
 export function validateCanonicalWorkspaceSnapshotAfter(params: ValidateWorkspaceSnapshotAfterParams): {
@@ -304,14 +305,18 @@ export function validateCanonicalWorkspaceSnapshotAfter(params: ValidateWorkspac
     verificationExecutionId,
     gitStatusEvidenceHash,
     gitDiffEvidenceHash,
+    expectedCapturedAt,
   } = params;
 
   if (!rawContent || typeof rawContent !== 'string' || rawContent.trim() === '') {
     return { valid: false, payload: null, error: 'Workspace snapshot after evidence file content could not be retrieved or is empty' };
   }
 
+  const HEX_64_REGEX = /^[0-9a-f]{64}$/;
+  const HEX_40_REGEX = /^[0-9a-f]{40}$/;
+
   if (expectedHash !== undefined) {
-    if (typeof expectedHash !== 'string' || !/^[0-9a-f]{64}$/.test(expectedHash)) {
+    if (typeof expectedHash !== 'string' || !HEX_64_REGEX.test(expectedHash)) {
       return { valid: false, payload: null, error: 'Workspace snapshot after expectedHash must be a 64-char lowercase hex string' };
     }
     const computedHash = computeSha256(rawContent);
@@ -430,12 +435,28 @@ export function validateCanonicalWorkspaceSnapshotAfter(params: ValidateWorkspac
   if (adjudication.verification_execution_id && obj.verification_execution_id !== adjudication.verification_execution_id) {
     return { valid: false, payload: null, error: 'verification_execution_id mismatch adjudication record' };
   }
+
+  // Exact 64-char lowercase hex checks for SHA-256 hashes
+  if (
+    typeof obj.git_status_evidence_hash !== 'string' ||
+    (obj.git_status_evidence_hash !== '' && !HEX_64_REGEX.test(obj.git_status_evidence_hash))
+  ) {
+    return { valid: false, payload: null, error: 'git_status_evidence_hash must be a 64-char lowercase hex string' };
+  }
   if (gitStatusEvidenceHash !== undefined && obj.git_status_evidence_hash !== gitStatusEvidenceHash) {
     return { valid: false, payload: null, error: 'git_status_evidence_hash mismatch git status evidence' };
+  }
+
+  if (
+    typeof obj.git_diff_evidence_hash !== 'string' ||
+    (obj.git_diff_evidence_hash !== '' && !HEX_64_REGEX.test(obj.git_diff_evidence_hash))
+  ) {
+    return { valid: false, payload: null, error: 'git_diff_evidence_hash must be a 64-char lowercase hex string' };
   }
   if (gitDiffEvidenceHash !== undefined && obj.git_diff_evidence_hash !== gitDiffEvidenceHash) {
     return { valid: false, payload: null, error: 'git_diff_evidence_hash mismatch git diff evidence' };
   }
+
   if (typeof obj.workspace_lease_id !== 'string' || !obj.workspace_lease_id.trim()) {
     return { valid: false, payload: null, error: 'workspace_lease_id must be non-empty string' };
   }
@@ -445,29 +466,42 @@ export function validateCanonicalWorkspaceSnapshotAfter(params: ValidateWorkspac
   if (lease && obj.workspace_lease_id !== lease.id) {
     return { valid: false, payload: null, error: 'workspace_lease_id mismatch lease record' };
   }
-  if (typeof obj.worktree_identity_hash !== 'string' || !/^[0-9a-f]{64}$/i.test(obj.worktree_identity_hash)) {
-    return { valid: false, payload: null, error: 'worktree_identity_hash must be a 64-char hex string' };
+
+  if (typeof obj.worktree_identity_hash !== 'string' || !HEX_64_REGEX.test(obj.worktree_identity_hash)) {
+    return { valid: false, payload: null, error: 'worktree_identity_hash must be a 64-char lowercase hex string' };
   }
-  if (lease && obj.worktree_identity_hash.toLowerCase() !== lease.worktree_identity_hash.toLowerCase()) {
+  if (lease && obj.worktree_identity_hash !== lease.worktree_identity_hash) {
     return { valid: false, payload: null, error: 'worktree_identity_hash mismatch lease record' };
   }
-  if (typeof obj.expected_head_sha !== 'string' || !obj.expected_head_sha.trim()) {
-    return { valid: false, payload: null, error: 'expected_head_sha must be non-empty string' };
+
+  // Exact 40-char lowercase hex checks for Git commit SHAs
+  if (typeof obj.expected_head_sha !== 'string' || !HEX_40_REGEX.test(obj.expected_head_sha)) {
+    return { valid: false, payload: null, error: 'expected_head_sha must be a 40-char lowercase hex string' };
   }
-  if (submission && obj.expected_head_sha.toLowerCase() !== submission.authorized_head_sha.toLowerCase()) {
+  if (submission && obj.expected_head_sha !== submission.authorized_head_sha) {
     return { valid: false, payload: null, error: 'expected_head_sha mismatch submission authorized_head_sha' };
   }
-  if (typeof obj.captured_repository_head_sha !== 'string' || !obj.captured_repository_head_sha.trim()) {
-    return { valid: false, payload: null, error: 'captured_repository_head_sha must be non-empty string' };
+
+  if (typeof obj.captured_repository_head_sha !== 'string' || !HEX_40_REGEX.test(obj.captured_repository_head_sha)) {
+    return { valid: false, payload: null, error: 'captured_repository_head_sha must be a 40-char lowercase hex string' };
   }
-  if (submission && obj.captured_repository_head_sha.toLowerCase() !== submission.authorized_head_sha.toLowerCase()) {
+  if (submission && obj.captured_repository_head_sha !== submission.authorized_head_sha) {
     return { valid: false, payload: null, error: 'captured_repository_head_sha repository-head conflict with authorized_head_sha' };
   }
-  if (obj.captured_repository_head_sha.toLowerCase() !== obj.expected_head_sha.toLowerCase()) {
+  if (obj.captured_repository_head_sha !== obj.expected_head_sha) {
     return { valid: false, payload: null, error: 'captured_repository_head_sha conflicts with expected_head_sha' };
   }
+
   if (typeof obj.captured_at !== 'string' || !isCanonicalUtcIso(obj.captured_at)) {
     return { valid: false, payload: null, error: 'captured_at must be canonical UTC ISO-8601 string' };
+  }
+  if (expectedCapturedAt !== undefined) {
+    if (typeof expectedCapturedAt !== 'string' || !isCanonicalUtcIso(expectedCapturedAt)) {
+      return { valid: false, payload: null, error: 'expectedCapturedAt must be canonical UTC ISO-8601 string' };
+    }
+    if (obj.captured_at !== expectedCapturedAt) {
+      return { valid: false, payload: null, error: `captured_at (${obj.captured_at}) does not match expected finish timestamp (${expectedCapturedAt})` };
+    }
   }
 
   return { valid: true, payload: obj as unknown as CanonicalWorkspaceSnapshotAfterPayload };
@@ -1383,6 +1417,26 @@ export function evaluateCanonicalSettlementDecision(
   const sub = input.repo.getCoderSubmissionById(input.adjudication.submission_id);
   const lease = input.adjudication.workspace_lease_id ? input.repo.getWorkspaceLease(input.adjudication.workspace_lease_id) : null;
 
+  if (
+    !sub ||
+    (input.adjudication.workspace_lease_id && !lease) ||
+    !envelope.verification_execution_id ||
+    !envelope.finish_timestamp
+  ) {
+    return {
+      valid: false,
+      isSuccess: false,
+      targetStatus: 'RECOVERY_FENCED',
+      taskTransition: 'NEEDS_HUMAN',
+      eventType: 'RECOVERY_FENCED',
+      dispositionEvent: 'REJECTED',
+      dispositionReason: 'RECOVERY_FENCED',
+      failureCode: 'INTEGRITY_MISMATCH',
+      failureDetail: 'Missing required authority bindings for workspace snapshot after validation',
+      contradictionReason: 'Missing required authority bindings for workspace_snapshot_after validation',
+    };
+  }
+
   const afterRes = validateCanonicalWorkspaceSnapshotAfter({
     rawContent: afterContent,
     expectedHash: envelope.workspace_snapshot_after_hash,
@@ -1392,6 +1446,7 @@ export function evaluateCanonicalSettlementDecision(
     verificationExecutionId: envelope.verification_execution_id,
     gitStatusEvidenceHash: envelope.git_status_evidence_hash,
     gitDiffEvidenceHash: envelope.git_diff_evidence_hash,
+    expectedCapturedAt: envelope.finish_timestamp,
   });
 
   if (!afterRes.valid) {
@@ -3346,14 +3401,38 @@ export class CoderSubmissionAdjudicationService {
               );
             }
             let content = wsEv.raw_payload;
-            if (!content && wsEv.file_path) {
+            if (!content && wsEv.file_path && fs.existsSync(wsEv.file_path)) {
               content = fs.readFileSync(wsEv.file_path, 'utf8');
+            } else if (!content && this.artifactStore) {
+              try {
+                content = this.artifactStore.read(wsEv);
+              } catch {
+                content = null;
+              }
+            }
+            const replaySub = this.repo.getCoderSubmissionById(existingAdj.submission_id);
+            const replayLease = existingAdj.workspace_lease_id ? this.repo.getWorkspaceLease(existingAdj.workspace_lease_id) : null;
+            if (
+              !replaySub ||
+              (existingAdj.workspace_lease_id && !replayLease) ||
+              !env.verification_execution_id ||
+              !env.finish_timestamp
+            ) {
+              throw new CoderSubmissionAdjudicationError(
+                'INTEGRITY_CONFLICT',
+                'Missing required authority bindings for replayed workspace snapshot after validation'
+              );
             }
             const val = validateCanonicalWorkspaceSnapshotAfter({
               rawContent: content || '',
               expectedHash: env.workspace_snapshot_after_hash,
               adjudication: existingAdj,
+              submission: replaySub,
+              lease: replayLease,
               verificationExecutionId: env.verification_execution_id,
+              gitStatusEvidenceHash: env.git_status_evidence_hash,
+              gitDiffEvidenceHash: env.git_diff_evidence_hash,
+              expectedCapturedAt: env.finish_timestamp,
             });
             if (!val.valid) {
               throw new CoderSubmissionAdjudicationError(
@@ -4211,6 +4290,57 @@ export class CoderSubmissionAdjudicationService {
     });
     const workspaceAfterJson = canonicalJsonStringify(workspaceAfterPayload);
     const workspaceAfterHash = computeSha256(workspaceAfterJson);
+
+    const currentLeaseForValidation = this.repo.getWorkspaceLease(leaseId);
+    const initialValidation = validateCanonicalWorkspaceSnapshotAfter({
+      rawContent: workspaceAfterJson,
+      expectedHash: workspaceAfterHash,
+      adjudication: {
+        id: adjudicationId,
+        request_id: params.requestId,
+        submission_id: sub.id,
+        authorization_id: sub.authorization_id,
+        project_id: sub.project_id,
+        task_id: sub.task_id,
+        attempt_id: snapshot.attempt_id,
+        assignment_id: snapshot.assignment_id,
+        task_ownership_epoch: sub.task_ownership_epoch,
+        action: 'ADMIT_VERIFICATION',
+        status: 'VERIFYING',
+        lifecycle_version: 3,
+        authority_snapshot_json: '',
+        authority_snapshot_hash: '',
+        verification_commands_json: null,
+        verification_commands_hash: null,
+        workspace_snapshot_before_json: null,
+        workspace_snapshot_before_hash: null,
+        verification_execution_id: executionId,
+        protocol_message_id: null,
+        test_run_id: testRunId,
+        git_status_evidence_id: null,
+        git_diff_evidence_id: null,
+        failure_code: null,
+        failure_json: null,
+        created_at: phaseCNowIso,
+        verification_started_at: phaseCNowIso,
+        completed_at: null,
+        recovery_fenced_at: null,
+        workspace_lease_id: leaseId,
+      },
+      submission: sub,
+      lease: currentLeaseForValidation,
+      verificationExecutionId: executionId,
+      gitStatusEvidenceHash: stagedGitStatusEvidence?.hash ?? '',
+      gitDiffEvidenceHash: stagedGitDiffEvidence?.hash ?? '',
+      expectedCapturedAt: phaseCNowIso,
+    });
+    if (!initialValidation.valid) {
+      throw new CoderSubmissionAdjudicationError(
+        'INTEGRITY_CONFLICT',
+        `Generated workspace snapshot after validation failed: ${initialValidation.error}`
+      );
+    }
+
     const workspaceAfterByteSize = Buffer.byteLength(workspaceAfterJson, 'utf8');
     const matWorkspaceAfter = this.artifactStore.materializeContentAddressedFile(workspaceAfterJson, workspaceAfterHash);
     if (matWorkspaceAfter.newlyCreated) newlyMaterializedPaths.push(matWorkspaceAfter.filePath);

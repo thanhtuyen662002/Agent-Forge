@@ -1045,12 +1045,6 @@ export class ProcessRunner {
 
     const promise = (async (): Promise<ProcessTerminationTruth> => {
       try {
-        entry.isCancelled = true;
-        try {
-          entry.process.kill('SIGTERM');
-        } catch (err: unknown) {
-          entry.lastKillError = err instanceof Error ? err : new Error(String(err));
-        }
         try {
           const res = await entry.settle('CANCEL');
           if (this.persistenceFencedEntries.has(executionId)) {
@@ -1081,20 +1075,15 @@ export class ProcessRunner {
     const initialActive = Array.from(this.activeProcesses.entries());
     const initialFencedKeys = new Set(this.persistenceFencedEntries.keys());
 
-    for (const [, entry] of initialActive) {
-      entry.isCancelled = true;
-      try {
-        entry.process.kill('SIGTERM');
-      } catch (err: unknown) {
-        entry.lastKillError = err instanceof Error ? err : new Error(String(err));
-      }
-    }
-
     const settlementResults = await Promise.all(
-      initialActive.map(async ([id, entry]) => {
+      initialActive.map(async ([id]) => {
         try {
-          const res = await entry.settle('CANCEL');
-          return { id, truth: res.processTermination, success: true };
+          const truth = await this.cancel(id);
+          return {
+            id,
+            truth,
+            success: truth === 'PROCESS_TREE_TERMINATED_PROVEN' || truth === 'NOT_APPLICABLE',
+          };
         } catch {
           return { id, truth: 'TERMINATION_UNRESOLVED' as ProcessTerminationTruth, success: false };
         }

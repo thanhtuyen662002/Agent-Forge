@@ -24,8 +24,11 @@ export class EmergencyStopService {
   ): Promise<EmergencyStopResult> {
     const now = new Date().toISOString();
 
-    // 1. Terminate all running child processes immediately and await truthfully
-    const termPromise = ProcessRunner.terminateAllProcesses();
+    // 1. Terminate all running child processes immediately and await truthfully before writing any events
+    const summary = await ProcessRunner.terminateAllProcesses();
+    const provenTerminated = summary.allTerminatedProven
+      ? summary.count
+      : Math.max(0, summary.count - summary.unproven);
 
     // 2. Pause all active running projects
     const allProjects = this.repo.getAllProjects();
@@ -41,6 +44,7 @@ export class EmergencyStopService {
 
     // 3. Pause all active tasks in progress
     const tasksPaused: string[] = [];
+    const taskProjectIds: string[] = [];
     for (const proj of allProjects) {
       const tasks = this.repo.getTasksByProject(proj.id);
       for (const t of tasks) {
@@ -48,6 +52,7 @@ export class EmergencyStopService {
           const transitionRes = TaskStateMachine.transition(t.state, 'PAUSE');
           this.repo.updateTaskState(t.id, transitionRes.nextState, transitionRes.pausedFromState);
           tasksPaused.push(t.id);
+          taskProjectIds.push(proj.id);
 
           this.eventService.record(
             proj.id,
@@ -60,14 +65,9 @@ export class EmergencyStopService {
       }
     }
 
-    // 4. Await truthful process termination summary before reporting results and recording events
-    const summary = await termPromise;
-    const provenTerminated = summary.allTerminatedProven
-      ? summary.count
-      : Math.max(0, summary.count - summary.unproven);
-
-    // 5. Emit exactly one canonical emergency-stop event per affected project
-    for (const projId of projectsPaused) {
+    // 4. Emit exactly one canonical emergency-stop event per affected project with identical termination summary
+    const affectedProjectIds = Array.from(new Set([...projectsPaused, ...taskProjectIds]));
+    for (const projId of affectedProjectIds) {
       const proj = this.repo.getProject(projId);
       this.eventService.record(
         projId,

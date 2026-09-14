@@ -27,6 +27,7 @@ import {
   buildCanonicalTerminalDisposition,
   evaluateCanonicalSettlementDecision,
   validateAndParseCanonicalResultEnvelope,
+  validateCanonicalWorkspaceSnapshotAfter,
   CanonicalSettlementDecision,
   isCanonicalUtcIso,
   scrubAdjudicationDiagnostics,
@@ -331,19 +332,33 @@ export class CoderSubmissionAdjudicationRecoveryScanner {
                       dec.eventType,
                       expectedPayloadHash
                     );
-                    const terminalTimestamp = adj.completed_at ?? adj.recovery_fenced_at;
-                    if (!isCanonicalUtcIso(evt.created_at)) {
-                      contradiction = 'Terminal event created_at must be canonical UTC ISO string';
-                    } else if (Date.parse(evt.created_at) < Date.parse(adj.created_at)) {
-                      contradiction = 'Terminal event created_at precedes adjudication created_at';
-                    } else if (terminalTimestamp && evt.created_at !== terminalTimestamp) {
-                      contradiction = `Terminal event created_at (${evt.created_at}) does not match adjudication terminal timestamp (${terminalTimestamp})`;
-                    } else if (evt.payload_hash !== expectedPayloadHash) {
-                      contradiction = `Deterministic event payload hash mismatch: expected ${expectedPayloadHash}, got ${evt.payload_hash}`;
-                    } else if (evt.id !== expectedEvtId) {
-                      contradiction = `Deterministic event ID mismatch: expected ${expectedEvtId}, got ${evt.id}`;
-                    } else if (evt.payload_json !== expectedPayload) {
-                      contradiction = `Terminal event payload_json does not match canonical payload`;
+                    let targetTerminalTimestamp: string | null = null;
+                    if (dec.targetStatus === 'VERIFIED' || dec.targetStatus === 'VERIFICATION_FAILED') {
+                      targetTerminalTimestamp = adj.completed_at;
+                      if (!targetTerminalTimestamp || !isCanonicalUtcIso(targetTerminalTimestamp)) {
+                        contradiction = `${dec.targetStatus} adjudication completed_at must be non-null canonical UTC ISO string`;
+                      }
+                    } else {
+                      targetTerminalTimestamp = adj.recovery_fenced_at;
+                      if (!targetTerminalTimestamp || !isCanonicalUtcIso(targetTerminalTimestamp)) {
+                        contradiction = `RECOVERY_FENCED adjudication recovery_fenced_at must be non-null canonical UTC ISO string`;
+                      }
+                    }
+
+                    if (!contradiction) {
+                      if (!isCanonicalUtcIso(evt.created_at)) {
+                        contradiction = 'Terminal event created_at must be canonical UTC ISO string';
+                      } else if (Date.parse(evt.created_at) < Date.parse(adj.created_at)) {
+                        contradiction = 'Terminal event created_at precedes adjudication created_at';
+                      } else if (evt.created_at !== targetTerminalTimestamp) {
+                        contradiction = `Terminal event created_at (${evt.created_at}) does not match adjudication terminal timestamp (${targetTerminalTimestamp})`;
+                      } else if (evt.payload_hash !== expectedPayloadHash) {
+                        contradiction = `Deterministic event payload hash mismatch: expected ${expectedPayloadHash}, got ${evt.payload_hash}`;
+                      } else if (evt.id !== expectedEvtId) {
+                        contradiction = `Deterministic event ID mismatch: expected ${expectedEvtId}, got ${evt.id}`;
+                      } else if (evt.payload_json !== expectedPayload) {
+                        contradiction = `Terminal event payload_json does not match canonical payload`;
+                      }
                     }
                   }
                 }
@@ -366,70 +381,49 @@ export class CoderSubmissionAdjudicationRecoveryScanner {
                     contradiction = `Expected exactly one terminal disposition for ${dec.targetStatus} submission, found ${terminalDisps.length}`;
                   } else {
                     const disp = terminalDisps[0];
-                    if (!isCanonicalUtcIso(disp.created_at)) {
-                      contradiction = 'Terminal disposition created_at must be canonical UTC ISO string';
-                    } else if (Date.parse(disp.created_at) < Date.parse(adj.created_at)) {
-                      contradiction = 'Terminal disposition created_at precedes adjudication created_at';
+                    let targetTerminalTimestamp: string | null = null;
+                    if (dec.targetStatus === 'VERIFIED' || dec.targetStatus === 'VERIFICATION_FAILED') {
+                      targetTerminalTimestamp = adj.completed_at;
+                      if (!targetTerminalTimestamp || !isCanonicalUtcIso(targetTerminalTimestamp)) {
+                        contradiction = `${dec.targetStatus} adjudication completed_at must be non-null canonical UTC ISO string`;
+                      }
                     } else {
-                      const terminalTimestamp = adj.completed_at ?? adj.recovery_fenced_at;
-                      const expectedDispId = deriveDeterministicDispositionId(adj.submission_id, adj.id, 3);
-                      if (disp.id !== expectedDispId) {
-                        contradiction = `Deterministic disposition ID mismatch: expected ${expectedDispId}, got ${disp.id}`;
-                      } else if (disp.actor_type !== 'SYSTEM' && disp.actor_type !== 'OPERATOR') {
-                        contradiction = `Terminal disposition actor_type must be SYSTEM or OPERATOR, got ${disp.actor_type}`;
-                      } else if (dec.targetStatus === 'VERIFIED') {
-                        if (disp.actor_type !== 'OPERATOR') {
-                          contradiction = `Terminal disposition actor_type for VERIFIED must be OPERATOR, got ${disp.actor_type}`;
-                        } else if (disp.actor_id !== 'OWNER_LOCAL_UI') {
-                          contradiction = `Terminal disposition actor_id for VERIFIED must be OWNER_LOCAL_UI, got ${disp.actor_id}`;
-                        } else if (disp.disposition_event !== 'SETTLED' || disp.disposition_reason !== 'ACCEPTED_VERIFIED') {
-                          contradiction = `Terminal disposition for VERIFIED must be SETTLED / ACCEPTED_VERIFIED, got ${disp.disposition_event} / ${disp.disposition_reason}`;
-                        }
-                      } else {
-                        // VERIFICATION_FAILED or RECOVERY_FENCED
-                        if (disp.actor_type !== 'SYSTEM') {
-                          contradiction = `Terminal disposition actor_type for ${dec.targetStatus} must be SYSTEM, got ${disp.actor_type}`;
-                        } else if (
-                          disp.actor_id !== 'SYSTEM_VERIFICATION_EVALUATOR' &&
-                          disp.actor_id !== 'SCANNER' &&
-                          disp.actor_id !== 'RECOVERY_SCANNER'
-                        ) {
-                          contradiction = `Terminal disposition actor_id invalid for ${dec.targetStatus}: ${disp.actor_id}`;
-                        } else if (
-                          disp.disposition_event !== 'REJECTED' ||
-                          (disp.disposition_reason !== 'FENCED_PRECONDITION' && disp.disposition_reason !== 'INTEGRITY_MISMATCH')
-                        ) {
-                          contradiction = `Terminal disposition for ${dec.targetStatus} must be REJECTED with FENCED_PRECONDITION or INTEGRITY_MISMATCH, got ${disp.disposition_event} / ${disp.disposition_reason}`;
-                        }
+                      targetTerminalTimestamp = adj.recovery_fenced_at;
+                      if (!targetTerminalTimestamp || !isCanonicalUtcIso(targetTerminalTimestamp)) {
+                        contradiction = `RECOVERY_FENCED adjudication recovery_fenced_at must be non-null canonical UTC ISO string`;
                       }
+                    }
 
-                      if (!contradiction) {
-                        if (!disp.disposition_metadata_json) {
-                          contradiction = `Terminal disposition for ${dec.targetStatus} missing metadata`;
-                        } else {
-                          try {
-                            const meta = JSON.parse(disp.disposition_metadata_json);
-                            if (
-                              typeof meta !== 'object' ||
-                              meta === null ||
-                              Array.isArray(meta) ||
-                              canonicalJsonStringify(meta) !== disp.disposition_metadata_json ||
-                              meta.adjudication_id !== adj.id
-                            ) {
-                              contradiction = `Terminal disposition metadata invalid or noncanonical JSON for ${dec.targetStatus}`;
-                            } else if (dec.targetStatus === 'VERIFIED' && typeof meta.test_run_id !== 'string') {
-                              contradiction = `Terminal disposition metadata missing test_run_id`;
-                            } else if (dec.targetStatus !== 'VERIFIED' && typeof meta.failure_code !== 'string') {
-                              contradiction = `Terminal disposition metadata missing failure_code`;
-                            }
-                          } catch {
-                            contradiction = `Terminal disposition metadata is malformed JSON`;
-                          }
+                    if (!contradiction) {
+                      const expectedDisp = buildCanonicalTerminalDisposition(
+                        dec.targetStatus as 'VERIFIED' | 'VERIFICATION_FAILED' | 'RECOVERY_FENCED',
+                        adj.id,
+                        adj.submission_id,
+                        targetTerminalTimestamp!,
+                        {
+                          testRunId: adj.test_run_id ?? undefined,
+                          failureCode: dec.failureCode ?? (dec.targetStatus === 'RECOVERY_FENCED' ? (adj.failure_code ?? 'RECOVERY_FENCED') : 'TESTS_FAILED'),
+                          error: dec.failureDetail ?? null,
+                          isResultBearing: true,
                         }
-                      }
+                      );
 
-                      if (!contradiction && terminalTimestamp && disp.created_at !== terminalTimestamp) {
-                        contradiction = `Terminal disposition created_at (${disp.created_at}) does not match adjudication terminal timestamp (${terminalTimestamp})`;
+                      if (disp.id !== expectedDisp.id) {
+                        contradiction = `Deterministic disposition ID mismatch: expected ${expectedDisp.id}, got ${disp.id}`;
+                      } else if (disp.submission_id !== expectedDisp.submission_id) {
+                        contradiction = `Terminal disposition submission_id mismatch: expected ${expectedDisp.submission_id}, got ${disp.submission_id}`;
+                      } else if (disp.disposition_event !== expectedDisp.disposition_event) {
+                        contradiction = `Terminal disposition disposition_event mismatch for ${dec.targetStatus}: expected ${expectedDisp.disposition_event}, got ${disp.disposition_event}`;
+                      } else if (disp.disposition_reason !== expectedDisp.disposition_reason) {
+                        contradiction = `Terminal disposition disposition_reason mismatch for ${dec.targetStatus}: expected ${expectedDisp.disposition_reason}, got ${disp.disposition_reason}`;
+                      } else if (disp.actor_type !== expectedDisp.actor_type) {
+                        contradiction = `Terminal disposition actor_type for ${dec.targetStatus} must be ${expectedDisp.actor_type}, got ${disp.actor_type}`;
+                      } else if (disp.actor_id !== expectedDisp.actor_id) {
+                        contradiction = `Terminal disposition actor_id for ${dec.targetStatus} must be ${expectedDisp.actor_id}, got ${disp.actor_id}`;
+                      } else if (disp.disposition_metadata_json !== expectedDisp.disposition_metadata_json) {
+                        contradiction = `Terminal disposition metadata mismatch for ${dec.targetStatus}: expected byte-identical canonical JSON`;
+                      } else if (disp.created_at !== expectedDisp.created_at) {
+                        contradiction = `Terminal disposition created_at (${disp.created_at}) does not match adjudication terminal timestamp (${expectedDisp.created_at})`;
                       }
                     }
                   }
@@ -555,48 +549,43 @@ export class CoderSubmissionAdjudicationRecoveryScanner {
                 contradiction = 'Pre-result RECOVERY_FENCED failure_json is malformed';
               }
             }
-              const terminalTimestamp = adj.recovery_fenced_at ?? adj.completed_at;
-              const expectedDispId = deriveDeterministicDispositionId(adj.submission_id, adj.id, 3);
-              if (disp.id !== expectedDispId) {
-                contradiction = `Deterministic disposition ID mismatch: expected ${expectedDispId}, got ${disp.id}`;
-              } else if (disp.actor_type !== 'SYSTEM' && disp.actor_type !== 'OPERATOR') {
-                contradiction = `Terminal disposition actor_type must be SYSTEM or OPERATOR, got ${disp.actor_type}`;
-              } else if (disp.actor_type !== 'SYSTEM') {
-                contradiction = `Terminal disposition actor_type for pre-result RECOVERY_FENCED must be SYSTEM, got ${disp.actor_type}`;
-              } else if (
-                disp.actor_id !== 'SYSTEM_VERIFICATION_EVALUATOR' &&
-                disp.actor_id !== 'SCANNER' &&
-                disp.actor_id !== 'RECOVERY_SCANNER'
-              ) {
-                contradiction = `Terminal disposition actor_id invalid for pre-result RECOVERY_FENCED: ${disp.actor_id}`;
-              } else if (
-                disp.disposition_event !== 'REJECTED' ||
-                (disp.disposition_reason !== 'FENCED_PRECONDITION' && disp.disposition_reason !== 'INTEGRITY_MISMATCH')
-              ) {
-                contradiction = `Terminal disposition for pre-result RECOVERY_FENCED must be REJECTED with FENCED_PRECONDITION or INTEGRITY_MISMATCH, got ${disp.disposition_event} / ${disp.disposition_reason}`;
-              } else if (!disp.disposition_metadata_json) {
-                contradiction = `Terminal disposition for pre-result RECOVERY_FENCED missing metadata`;
-              } else {
-                try {
-                  const meta = JSON.parse(disp.disposition_metadata_json);
-                  if (
-                    typeof meta !== 'object' ||
-                    meta === null ||
-                    Array.isArray(meta) ||
-                    canonicalJsonStringify(meta) !== disp.disposition_metadata_json ||
-                    meta.adjudication_id !== adj.id ||
-                    typeof meta.failure_code !== 'string'
-                  ) {
-                    contradiction = `Terminal disposition metadata invalid for pre-result RECOVERY_FENCED`;
-                  }
-                } catch {
-                  contradiction = `Terminal disposition metadata is malformed JSON`;
-                }
-              }
+            const targetTerminalTimestamp = adj.recovery_fenced_at;
+            if (!targetTerminalTimestamp || !isCanonicalUtcIso(targetTerminalTimestamp)) {
+              contradiction = 'Pre-result RECOVERY_FENCED recovery_fenced_at must be non-null canonical UTC ISO string';
+            }
 
-              if (!contradiction && terminalTimestamp && disp.created_at !== terminalTimestamp) {
-                contradiction = `Terminal disposition created_at (${disp.created_at}) does not match adjudication recovery_fenced_at (${terminalTimestamp})`;
+            if (!contradiction) {
+              const failError = extractFailureDetailFromPayload(failureObj, '');
+              const expectedDisp = buildCanonicalTerminalDisposition(
+                'RECOVERY_FENCED',
+                adj.id,
+                adj.submission_id,
+                targetTerminalTimestamp!,
+                {
+                  failureCode: adj.failure_code || 'RECOVERY_FENCED',
+                  error: failError || null,
+                  isResultBearing: false,
+                }
+              );
+
+              if (disp.id !== expectedDisp.id) {
+                contradiction = `Deterministic disposition ID mismatch: expected ${expectedDisp.id}, got ${disp.id}`;
+              } else if (disp.submission_id !== expectedDisp.submission_id) {
+                contradiction = `Terminal disposition submission_id mismatch: expected ${expectedDisp.submission_id}, got ${disp.submission_id}`;
+              } else if (disp.disposition_event !== expectedDisp.disposition_event) {
+                contradiction = `Terminal disposition disposition_event mismatch for pre-result RECOVERY_FENCED: expected ${expectedDisp.disposition_event}, got ${disp.disposition_event}`;
+              } else if (disp.disposition_reason !== expectedDisp.disposition_reason) {
+                contradiction = `Terminal disposition disposition_reason mismatch for pre-result RECOVERY_FENCED: expected ${expectedDisp.disposition_reason}, got ${disp.disposition_reason}`;
+              } else if (disp.actor_type !== expectedDisp.actor_type) {
+                contradiction = `Terminal disposition actor_type for pre-result RECOVERY_FENCED must be ${expectedDisp.actor_type}, got ${disp.actor_type}`;
+              } else if (disp.actor_id !== expectedDisp.actor_id) {
+                contradiction = `Terminal disposition actor_id for pre-result RECOVERY_FENCED must be ${expectedDisp.actor_id}, got ${disp.actor_id}`;
+              } else if (disp.disposition_metadata_json !== expectedDisp.disposition_metadata_json) {
+                contradiction = `Terminal disposition metadata mismatch for pre-result RECOVERY_FENCED: expected byte-identical canonical JSON`;
+              } else if (disp.created_at !== expectedDisp.created_at) {
+                contradiction = `Terminal disposition created_at (${disp.created_at}) does not match adjudication recovery_fenced_at (${expectedDisp.created_at})`;
               }
+            }
           }
         }
 
@@ -849,6 +838,51 @@ export class CoderSubmissionAdjudicationRecoveryScanner {
             }
           } catch (fpErr: unknown) {
             settlementError = 'Workspace snapshot before is malformed JSON';
+          }
+        }
+
+        if (!settlementError && parsedEnvelope.workspace_snapshot_after_evidence_id) {
+          const wsAfterEv = this.repo.getEvidence(parsedEnvelope.workspace_snapshot_after_evidence_id);
+          if (!wsAfterEv) {
+            settlementError = `Workspace snapshot after evidence ${parsedEnvelope.workspace_snapshot_after_evidence_id} not found`;
+          } else if (wsAfterEv.evidence_type !== 'FILE_SNAPSHOT') {
+            settlementError = `Workspace snapshot after evidence must have type FILE_SNAPSHOT, got ${wsAfterEv.evidence_type}`;
+          } else {
+            let afterContent = wsAfterEv.raw_payload;
+            if (!afterContent && wsAfterEv.file_path) {
+              try {
+                afterContent = fs.readFileSync(wsAfterEv.file_path, 'utf8');
+              } catch {
+                settlementError = 'Workspace snapshot after evidence file content unreadable';
+              }
+            }
+            if (!settlementError) {
+              const sub = this.repo.getCoderSubmissionById(adj.submission_id);
+              const lease = adj.workspace_lease_id ? this.repo.getWorkspaceLease(adj.workspace_lease_id) : null;
+              if (
+                !sub ||
+                (adj.workspace_lease_id && !lease) ||
+                !parsedEnvelope.verification_execution_id ||
+                !parsedEnvelope.finish_timestamp
+              ) {
+                settlementError = 'Missing required authority bindings for workspace snapshot after validation';
+              } else {
+                const afterVal = validateCanonicalWorkspaceSnapshotAfter({
+                  rawContent: afterContent || '',
+                  expectedHash: parsedEnvelope.workspace_snapshot_after_hash,
+                  adjudication: adj,
+                  submission: sub,
+                  lease,
+                  verificationExecutionId: parsedEnvelope.verification_execution_id,
+                  gitStatusEvidenceHash: parsedEnvelope.git_status_evidence_hash,
+                  gitDiffEvidenceHash: parsedEnvelope.git_diff_evidence_hash,
+                  expectedCapturedAt: parsedEnvelope.finish_timestamp,
+                });
+                if (!afterVal.valid) {
+                  settlementError = `Workspace snapshot after validation failed: ${afterVal.error}`;
+                }
+              }
+            }
           }
         }
       }

@@ -23,6 +23,8 @@ import {
   evaluateCanonicalSettlementDecision,
   evaluateNonAuthoritativeSettlementDecisionForTests,
   validateAndParseCanonicalResultEnvelope,
+  buildCanonicalTerminalEventPayload,
+  buildCanonicalTerminalDisposition,
   SUPPORTED_FAILURE_CODES,
   FENCED_FAILURE_CODES,
   SupportedFailureCode,
@@ -9260,11 +9262,7 @@ describe('R5J5 Quarantined Submission Adjudication and Verification Admission Su
 
       fixtures.db.prepare("UPDATE tasks SET state = 'NEEDS_HUMAN' WHERE id = ?").run(fixtures.taskId);
 
-      const fencedPayload = canonicalJsonStringify({
-        adjudication_id: adjId,
-        error: 'Crash fence',
-        failure_code: 'ORPHANED_VERIFICATION_INTERRUPTED',
-      });
+      const fencedPayload = buildCanonicalTerminalEventPayload('RECOVERY_FENCED', adjId, 'ORPHANED_VERIFICATION_INTERRUPTED', 'Crash fence');
       const fencedPayloadHash = computeSha256(fencedPayload);
       fixtures.repo.createCoderSubmissionAdjudicationEvent({
         id: deriveDeterministicAdjudicationEventId(adjId, 3, 'RECOVERY_FENCED', fencedPayloadHash),
@@ -9276,16 +9274,13 @@ describe('R5J5 Quarantined Submission Adjudication and Verification Admission Su
         created_at: nowIso,
       });
 
-      fixtures.repo.createCoderSubmissionDisposition({
-        id: deriveDeterministicDispositionId(subId, adjId, 3),
-        submission_id: subId,
-        disposition_event: 'REJECTED',
-        disposition_reason: 'FENCED_PRECONDITION',
-        actor_type: 'SYSTEM',
-        actor_id: 'SCANNER',
-        disposition_metadata_json: canonicalJsonStringify({ adjudication_id: adjId, failure_code: 'ORPHANED_VERIFICATION_INTERRUPTED' }),
-        created_at: nowIso,
-      });
+      fixtures.repo.createCoderSubmissionDisposition(
+        buildCanonicalTerminalDisposition('RECOVERY_FENCED', adjId, subId, nowIso, {
+          failureCode: 'ORPHANED_VERIFICATION_INTERRUPTED',
+          error: 'Crash fence',
+          isResultBearing: false,
+        })
+      );
 
       const adj = fixtures.repo.getCoderSubmissionAdjudicationById(adjId)!;
       const recon = fixtures.recoveryScanner.reconcileSingleAdjudication(adj);
@@ -11739,11 +11734,7 @@ describe('R5J5 Quarantined Submission Adjudication and Verification Admission Su
         fixtures.db.exec('PRAGMA foreign_keys = ON;');
       }
 
-      const failPayload = canonicalJsonStringify({
-        adjudication_id: adjId,
-        error: 'Test failed',
-        failure_code: 'TESTS_FAILED',
-      });
+      const failPayload = buildCanonicalTerminalEventPayload('VERIFICATION_FAILED', adjId, 'TESTS_FAILED', 'Test failed');
       const failPayloadHash = computeSha256(failPayload);
       fixtures.repo.createCoderSubmissionAdjudicationEvent({
         id: deriveDeterministicAdjudicationEventId(adjId, 3, 'VERIFICATION_FAILED', failPayloadHash),
@@ -11755,16 +11746,12 @@ describe('R5J5 Quarantined Submission Adjudication and Verification Admission Su
         created_at: nowIso,
       });
 
-      fixtures.repo.createCoderSubmissionDisposition({
-        id: deriveDeterministicDispositionId(subId, adjId, 3),
-        submission_id: subId,
-        disposition_event: 'REJECTED',
-        disposition_reason: 'FENCED_PRECONDITION',
-        actor_type: 'SYSTEM',
-        actor_id: 'SCANNER',
-        disposition_metadata_json: canonicalJsonStringify({ adjudication_id: adjId, failure_code: 'TESTS_FAILED' }),
-        created_at: nowIso,
-      });
+      fixtures.repo.createCoderSubmissionDisposition(
+        buildCanonicalTerminalDisposition('VERIFICATION_FAILED', adjId, subId, nowIso, {
+          failureCode: 'TESTS_FAILED',
+          error: 'Test failed',
+        })
+      );
 
       fixtures.db.prepare("UPDATE tasks SET state = 'NEEDS_HUMAN' WHERE id = ?").run(fixtures.taskId);
 
@@ -12225,11 +12212,7 @@ describe('R5J5 Quarantined Submission Adjudication and Verification Admission Su
 
       fixtures.db.prepare('UPDATE coder_submission_adjudications SET workspace_lease_id = ?, lifecycle_version = 3 WHERE id = ?').run(leaseId, adjId);
 
-      const fencedPayload = canonicalJsonStringify({
-        adjudication_id: adjId,
-        error: 'Test fence',
-        failure_code: 'RECOVERY_FENCED',
-      });
+      const fencedPayload = buildCanonicalTerminalEventPayload('RECOVERY_FENCED', adjId, 'RECOVERY_FENCED', 'Test fence');
       const fencedPayloadHash = computeSha256(fencedPayload);
       fixtures.repo.createCoderSubmissionAdjudicationEvent({
         id: deriveDeterministicAdjudicationEventId(adjId, 3, 'RECOVERY_FENCED', fencedPayloadHash),
@@ -12241,16 +12224,13 @@ describe('R5J5 Quarantined Submission Adjudication and Verification Admission Su
         created_at: nowIso,
       });
 
-      fixtures.repo.createCoderSubmissionDisposition({
-        id: deriveDeterministicDispositionId(subId, adjId, 3),
-        submission_id: subId,
-        disposition_event: 'REJECTED',
-        disposition_reason: 'FENCED_PRECONDITION',
-        actor_type: 'SYSTEM',
-        actor_id: 'SCANNER',
-        disposition_metadata_json: canonicalJsonStringify({ adjudication_id: adjId, failure_code: 'RECOVERY_FENCED' }),
-        created_at: nowIso,
-      });
+      fixtures.repo.createCoderSubmissionDisposition(
+        buildCanonicalTerminalDisposition('RECOVERY_FENCED', adjId, subId, nowIso, {
+          failureCode: 'RECOVERY_FENCED',
+          error: 'Test fence',
+          isResultBearing: true,
+        })
+      );
 
       fixtures.db.prepare("UPDATE tasks SET state = 'NEEDS_HUMAN' WHERE id = ?").run(fixtures.taskId);
 
@@ -12576,11 +12556,7 @@ describe('R5J5 Quarantined Submission Adjudication and Verification Admission Su
 
       fixtures.db.prepare('UPDATE coder_submission_adjudications SET workspace_lease_id = ?, lifecycle_version = 3 WHERE id = ?').run(leaseId, adjId);
 
-      const fencedPayload = canonicalJsonStringify({
-        adjudication_id: adjId,
-        error: 'Early fence',
-        failure_code: 'ORPHANED_VERIFICATION_INTERRUPTED',
-      });
+      const fencedPayload = buildCanonicalTerminalEventPayload('RECOVERY_FENCED', adjId, 'ORPHANED_VERIFICATION_INTERRUPTED', 'Early fence');
       const fencedPayloadHash = computeSha256(fencedPayload);
       fixtures.repo.createCoderSubmissionAdjudicationEvent({
         id: deriveDeterministicAdjudicationEventId(adjId, 3, 'RECOVERY_FENCED', fencedPayloadHash),
@@ -12592,16 +12568,13 @@ describe('R5J5 Quarantined Submission Adjudication and Verification Admission Su
         created_at: nowIso,
       });
 
-      fixtures.repo.createCoderSubmissionDisposition({
-        id: deriveDeterministicDispositionId(subId, adjId, 3),
-        submission_id: subId,
-        disposition_event: 'REJECTED',
-        disposition_reason: 'FENCED_PRECONDITION',
-        actor_type: 'SYSTEM',
-        actor_id: 'SCANNER',
-        disposition_metadata_json: canonicalJsonStringify({ adjudication_id: adjId, failure_code: 'ORPHANED_VERIFICATION_INTERRUPTED' }),
-        created_at: nowIso,
-      });
+      fixtures.repo.createCoderSubmissionDisposition(
+        buildCanonicalTerminalDisposition('RECOVERY_FENCED', adjId, subId, nowIso, {
+          failureCode: 'ORPHANED_VERIFICATION_INTERRUPTED',
+          error: 'Early fence',
+          isResultBearing: false,
+        })
+      );
 
       fixtures.db.prepare("UPDATE tasks SET state = 'NEEDS_HUMAN' WHERE id = ?").run(fixtures.taskId);
 
@@ -13265,7 +13238,9 @@ describe('R5J5 Quarantined Submission Adjudication and Verification Admission Su
         created_at: nowIso,
       });
 
+      const { plaintextToken } = issueSubmissionSessionHelper(fixtures.repo, fixtures.authorizationId);
       const subId = crypto.randomUUID();
+      fixtures.mcpService.submitCoderClaim(createValidSubmissionPayload(fixtures, subId), plaintextToken);
       const adjId = crypto.randomUUID();
       const execId = crypto.randomUUID();
 
@@ -13888,7 +13863,7 @@ describe('R5J5 Quarantined Submission Adjudication and Verification Admission Su
       const adj4 = fx4.repo.getCoderSubmissionAdjudicationById(setup4.adjId)!;
       const rWrongActor = fx4.recoveryScanner.reconcileSingleAdjudication(adj4);
       expect(rWrongActor.classification).toBe('AUTHORITY_CONFLICT');
-      expect(rWrongActor.error).toContain('Terminal disposition actor_type must be SYSTEM or OPERATOR');
+      expect(rWrongActor.error).toContain('Terminal disposition actor_type for VERIFICATION_FAILED must be SYSTEM');
 
       // Probe 5: Wrong metadata
       const fx5 = createFreshFixtures();
@@ -13899,14 +13874,14 @@ describe('R5J5 Quarantined Submission Adjudication and Verification Admission Su
         disposition_event: 'REJECTED',
         disposition_reason: 'FENCED_PRECONDITION',
         actor_type: 'SYSTEM',
-        actor_id: 'SCANNER',
+        actor_id: 'SYSTEM_VERIFICATION_EVALUATOR',
         disposition_metadata_json: canonicalJsonStringify({ adjudication_id: crypto.randomUUID() }),
         created_at: setup5.nowIso,
       });
       const adj5 = fx5.repo.getCoderSubmissionAdjudicationById(setup5.adjId)!;
       const rWrongMeta = fx5.recoveryScanner.reconcileSingleAdjudication(adj5);
       expect(rWrongMeta.classification).toBe('AUTHORITY_CONFLICT');
-      expect(rWrongMeta.error).toContain('Terminal disposition metadata invalid');
+      expect(rWrongMeta.error).toContain('Terminal disposition metadata mismatch');
 
       // Probe 6: Contradictory SETTLED disposition
       const fx6 = createFreshFixtures();
@@ -14810,43 +14785,130 @@ describe('R5J5 Quarantined Submission Adjudication and Verification Admission Su
       expect(reconTampered.error).toContain('workspace_snapshot_after');
     });
 
-    it('359. Recovery scanner rejects missing or contradictory terminal disposition or deterministic event', async () => {
-      const { plaintextToken } = issueSubmissionSessionHelper(fixtures.repo, fixtures.authorizationId);
-      const subId = crypto.randomUUID();
-      fixtures.mcpService.submitCoderClaim(createValidSubmissionPayload(fixtures, subId), plaintextToken);
+    it('359. Recovery scanner rejects missing or contradictory terminal disposition or deterministic event across 4 independent subcases', async () => {
+      // Subcase 1: Missing terminal disposition
+      {
+        const { plaintextToken } = issueSubmissionSessionHelper(fixtures.repo, fixtures.authorizationId);
+        const subId = crypto.randomUUID();
+        fixtures.mcpService.submitCoderClaim(createValidSubmissionPayload(fixtures, subId), plaintextToken);
+        const admitRes = await fixtures.adjudicationService.admitSubmissionForVerification({
+          requestId: crypto.randomUUID(),
+          submissionId: subId,
+        });
+        const adj = fixtures.repo.getCoderSubmissionAdjudicationById(admitRes.adjudication.id)!;
+        expect(adj.status).toBe('VERIFIED');
 
-      const admitRes = await fixtures.adjudicationService.admitSubmissionForVerification({
-        requestId: crypto.randomUUID(),
-        submissionId: subId,
-      });
+        const origGetDisps = fixtures.repo.getCoderSubmissionDispositions.bind(fixtures.repo);
+        fixtures.repo.getCoderSubmissionDispositions = () => [];
+        try {
+          const recon = fixtures.recoveryScanner.reconcileSingleAdjudication(adj);
+          expect(recon.classification).toBe('AUTHORITY_CONFLICT');
+          expect(recon.action_taken).toBe('NO_OP');
+          expect(recon.error).toContain('terminal disposition');
+          const adjAfter = fixtures.repo.getCoderSubmissionAdjudicationById(adj.id)!;
+          expect(adjAfter.status).toBe('VERIFIED');
+          expect(adjAfter.lifecycle_version).toBe(adj.lifecycle_version);
+        } finally {
+          fixtures.repo.getCoderSubmissionDispositions = origGetDisps;
+        }
+      }
 
-      const adj = fixtures.repo.getCoderSubmissionAdjudicationById(admitRes.adjudication.id)!;
+      // Subcase 2: Contradictory terminal disposition
+      {
+        const fx2 = setupFullSubmissionGraph(fixtures.db, fixtures.projectRoot, fixtures.artifactStore.getBaseDir());
+        const { plaintextToken } = issueSubmissionSessionHelper(fx2.repo, fx2.authorizationId);
+        const subId = crypto.randomUUID();
+        fx2.mcpService.submitCoderClaim(createValidSubmissionPayload(fx2, subId), plaintextToken);
+        const admitRes = await fx2.adjudicationService.admitSubmissionForVerification({
+          requestId: crypto.randomUUID(),
+          submissionId: subId,
+        });
+        const adj = fx2.repo.getCoderSubmissionAdjudicationById(admitRes.adjudication.id)!;
+        expect(adj.status).toBe('VERIFIED');
 
-      // 1. Missing disposition
-      const origGetDisps = fixtures.repo.getCoderSubmissionDispositions.bind(fixtures.repo);
-      fixtures.repo.getCoderSubmissionDispositions = () => [];
-      const reconMissingDisp = fixtures.recoveryScanner.reconcileSingleAdjudication(adj);
-      expect(reconMissingDisp.classification).toBe('AUTHORITY_CONFLICT');
-      expect(reconMissingDisp.error).toContain('terminal disposition');
-      fixtures.repo.getCoderSubmissionDispositions = origGetDisps;
+        // Add contradictory REJECTED disposition on VERIFIED adjudication
+        fx2.repo.createCoderSubmissionDisposition({
+          id: crypto.randomUUID(),
+          submission_id: subId,
+          disposition_event: 'REJECTED',
+          disposition_reason: 'COLLISION_CONFLICT',
+          actor_type: 'SYSTEM',
+          actor_id: 'SYSTEM_VERIFICATION_EVALUATOR',
+          disposition_metadata_json: canonicalJsonStringify({ adjudication_id: adj.id, error: 'conflict', failure_code: 'TESTS_FAILED' }),
+          created_at: adj.completed_at!,
+        });
 
-      // 2. Contradictory REJECTED disposition on VERIFIED adjudication
-      fixtures.repo.createCoderSubmissionDisposition({
-        id: crypto.randomUUID(),
-        submission_id: subId,
-        disposition_event: 'REJECTED',
-        disposition_reason: 'COLLISION_CONFLICT',
-        actor_type: 'SYSTEM',
-        actor_id: 'SCANNER',
-        disposition_metadata_json: null,
-        created_at: new Date().toISOString(),
-      });
+        const recon = fx2.recoveryScanner.reconcileSingleAdjudication(adj);
+        expect(recon.classification).toBe('AUTHORITY_CONFLICT');
+        expect(recon.action_taken).toBe('NO_OP');
+        const adjAfter = fx2.repo.getCoderSubmissionAdjudicationById(adj.id)!;
+        expect(adjAfter.status).toBe('VERIFIED');
+        expect(adjAfter.lifecycle_version).toBe(adj.lifecycle_version);
+      }
 
-      const reconContradictory = fixtures.recoveryScanner.reconcileSingleAdjudication(adj);
-      expect(reconContradictory.classification).toBe('AUTHORITY_CONFLICT');
+      // Subcase 3: Missing deterministic terminal event
+      {
+        const fx3 = setupFullSubmissionGraph(fixtures.db, fixtures.projectRoot, fixtures.artifactStore.getBaseDir());
+        const { plaintextToken } = issueSubmissionSessionHelper(fx3.repo, fx3.authorizationId);
+        const subId = crypto.randomUUID();
+        fx3.mcpService.submitCoderClaim(createValidSubmissionPayload(fx3, subId), plaintextToken);
+        const admitRes = await fx3.adjudicationService.admitSubmissionForVerification({
+          requestId: crypto.randomUUID(),
+          submissionId: subId,
+        });
+        const adj = fx3.repo.getCoderSubmissionAdjudicationById(admitRes.adjudication.id)!;
+        expect(adj.status).toBe('VERIFIED');
+
+        const origGetEvents = fx3.repo.getCoderSubmissionAdjudicationEvents.bind(fx3.repo);
+        fx3.repo.getCoderSubmissionAdjudicationEvents = () => [];
+        try {
+          const recon = fx3.recoveryScanner.reconcileSingleAdjudication(adj);
+          expect(recon.classification).toBe('AUTHORITY_CONFLICT');
+          expect(recon.action_taken).toBe('NO_OP');
+          expect(recon.error).toContain('terminal event');
+          const adjAfter = fx3.repo.getCoderSubmissionAdjudicationById(adj.id)!;
+          expect(adjAfter.status).toBe('VERIFIED');
+          expect(adjAfter.lifecycle_version).toBe(adj.lifecycle_version);
+        } finally {
+          fx3.repo.getCoderSubmissionAdjudicationEvents = origGetEvents;
+        }
+      }
+
+      // Subcase 4: Contradictory event sequence
+      {
+        const fx4 = setupFullSubmissionGraph(fixtures.db, fixtures.projectRoot, fixtures.artifactStore.getBaseDir());
+        const { plaintextToken } = issueSubmissionSessionHelper(fx4.repo, fx4.authorizationId);
+        const subId = crypto.randomUUID();
+        fx4.mcpService.submitCoderClaim(createValidSubmissionPayload(fx4, subId), plaintextToken);
+        const admitRes = await fx4.adjudicationService.admitSubmissionForVerification({
+          requestId: crypto.randomUUID(),
+          submissionId: subId,
+        });
+        const adj = fx4.repo.getCoderSubmissionAdjudicationById(admitRes.adjudication.id)!;
+        expect(adj.status).toBe('VERIFIED');
+
+        // Tamper with terminal event sequence (contradictory sequence)
+        const origGetEvents = fx4.repo.getCoderSubmissionAdjudicationEvents.bind(fx4.repo);
+        fx4.repo.getCoderSubmissionAdjudicationEvents = (adjId: string) => {
+          const events = origGetEvents(adjId);
+          return events.map((e) => (e.sequence === 3 ? { ...e, sequence: 99 } : e));
+        };
+
+        try {
+          const recon = fx4.recoveryScanner.reconcileSingleAdjudication(adj);
+          expect(recon.classification).toBe('AUTHORITY_CONFLICT');
+          expect(recon.action_taken).toBe('NO_OP');
+          expect(recon.error).toContain('sequence');
+          const adjAfter = fx4.repo.getCoderSubmissionAdjudicationById(adj.id)!;
+          expect(adjAfter.status).toBe('VERIFIED');
+          expect(adjAfter.lifecycle_version).toBe(adj.lifecycle_version);
+        } finally {
+          fx4.repo.getCoderSubmissionAdjudicationEvents = origGetEvents;
+        }
+      }
     });
 
-    it('360. Mutation-free authority conflict with byte/row-count identity proof across all tables', async () => {
+    it('360. Mutation-free authority conflict with byte/row-count identity proof across all application tables', async () => {
       const { plaintextToken } = issueSubmissionSessionHelper(fixtures.repo, fixtures.authorizationId);
       const subId = crypto.randomUUID();
       fixtures.mcpService.submitCoderClaim(createValidSubmissionPayload(fixtures, subId), plaintextToken);
@@ -14861,32 +14923,37 @@ describe('R5J5 Quarantined Submission Adjudication and Verification Admission Su
       // Corrupt lease state to create authority conflict without violating immutable triggers
       fixtures.db.prepare("UPDATE coder_submission_workspace_leases SET state = 'FENCED', failure_code = 'ORPHANED_VERIFICATION_INTERRUPTED', lifecycle_version = lifecycle_version + 1 WHERE id = ?").run(adj.workspace_lease_id);
 
-      // Snapshot all tables before
-      const adjBefore = fixtures.db.prepare('SELECT * FROM coder_submission_adjudications').all();
-      const eventsBefore = fixtures.db.prepare('SELECT * FROM coder_submission_adjudication_events').all();
-      const dispsBefore = fixtures.db.prepare('SELECT * FROM coder_submission_dispositions').all();
-      const leasesBefore = fixtures.db.prepare('SELECT * FROM coder_submission_workspace_leases').all();
-      const tasksBefore = fixtures.db.prepare('SELECT * FROM tasks').all();
-      const evidenceBefore = fixtures.db.prepare('SELECT * FROM evidence').all();
+      // Dynamically query all application tables from sqlite_master, excluding internal SQLite tables
+      const allAppTables = (fixtures.db.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%' ORDER BY name ASC").all() as { name: string }[])
+        .map((row) => row.name);
+      expect(allAppTables.length).toBeGreaterThanOrEqual(10);
+
+      // Snapshot all application tables before reconciliation
+      const snapshotBefore = new Map<string, { count: number; canonicalJson: string }>();
+      for (const tableName of allAppTables) {
+        const rows = fixtures.db.prepare(`SELECT * FROM "${tableName}" ORDER BY rowid ASC`).all();
+        snapshotBefore.set(tableName, {
+          count: rows.length,
+          canonicalJson: canonicalJsonStringify(rows),
+        });
+      }
+
+      const totalChangesBefore = (fixtures.db.prepare('SELECT total_changes() AS tc').get() as { tc: number }).tc;
 
       const recon = fixtures.recoveryScanner.reconcileSingleAdjudication(adj);
       expect(recon.classification).toBe('AUTHORITY_CONFLICT');
       expect(recon.action_taken).toBe('NO_OP');
 
-      // Snapshot all tables after
-      const adjAfter = fixtures.db.prepare('SELECT * FROM coder_submission_adjudications').all();
-      const eventsAfter = fixtures.db.prepare('SELECT * FROM coder_submission_adjudication_events').all();
-      const dispsAfter = fixtures.db.prepare('SELECT * FROM coder_submission_dispositions').all();
-      const leasesAfter = fixtures.db.prepare('SELECT * FROM coder_submission_workspace_leases').all();
-      const tasksAfter = fixtures.db.prepare('SELECT * FROM tasks').all();
-      const evidenceAfter = fixtures.db.prepare('SELECT * FROM evidence').all();
+      const totalChangesAfter = (fixtures.db.prepare('SELECT total_changes() AS tc').get() as { tc: number }).tc;
+      expect(totalChangesAfter - totalChangesBefore).toBe(0);
 
-      expect(JSON.stringify(adjAfter)).toBe(JSON.stringify(adjBefore));
-      expect(JSON.stringify(eventsAfter)).toBe(JSON.stringify(eventsBefore));
-      expect(JSON.stringify(dispsAfter)).toBe(JSON.stringify(dispsBefore));
-      expect(JSON.stringify(leasesAfter)).toBe(JSON.stringify(leasesBefore));
-      expect(JSON.stringify(tasksAfter)).toBe(JSON.stringify(tasksBefore));
-      expect(JSON.stringify(evidenceAfter)).toBe(JSON.stringify(evidenceBefore));
+      // Verify exact row counts and byte-identical canonical JSON serialization for every application table
+      for (const tableName of allAppTables) {
+        const rowsAfter = fixtures.db.prepare(`SELECT * FROM "${tableName}" ORDER BY rowid ASC`).all();
+        const before = snapshotBefore.get(tableName)!;
+        expect(rowsAfter.length).toBe(before.count);
+        expect(canonicalJsonStringify(rowsAfter)).toBe(before.canonicalJson);
+      }
 
       // Clean up restored lease
       fixtures.db.prepare("UPDATE coder_submission_workspace_leases SET state = 'RELEASED', failure_code = NULL, lifecycle_version = lifecycle_version + 1 WHERE id = ?").run(adj.workspace_lease_id);
@@ -15272,7 +15339,7 @@ describe('R5J5 Quarantined Submission Adjudication and Verification Admission Su
       expect(recon.error).toContain('workspace_snapshot_after');
     });
 
-    it('371. Recovery scanner rejects interchangeable SYSTEM and OPERATOR actor type in terminal disposition', async () => {
+    it('371. Recovery scanner independently rejects invalid actor type, actor ID, and SCANNER alias in terminal disposition', async () => {
       const { plaintextToken } = issueSubmissionSessionHelper(fixtures.repo, fixtures.authorizationId);
       const subId = crypto.randomUUID();
       fixtures.mcpService.submitCoderClaim(createValidSubmissionPayload(fixtures, subId), plaintextToken);
@@ -15286,16 +15353,32 @@ describe('R5J5 Quarantined Submission Adjudication and Verification Admission Su
 
       fixtures.db.exec('DROP TRIGGER IF EXISTS trg_coder_submission_dispositions_no_update;');
       try {
-        // Update terminal disposition to have actor_type 'SYSTEM' instead of 'OPERATOR' for VERIFIED
+        // 1. Invalid actor_type: 'SYSTEM' for VERIFIED (must be OPERATOR)
         fixtures.db.prepare("UPDATE coder_submission_dispositions SET actor_type = 'SYSTEM' WHERE submission_id = ?").run(subId);
-
-        const recon = fixtures.recoveryScanner.reconcileSingleAdjudication(adj);
-        expect(recon.classification).toBe('AUTHORITY_CONFLICT');
-        expect(recon.action_taken).toBe('NO_OP');
-        expect(recon.error).toContain('Terminal disposition actor_type for VERIFIED must be OPERATOR, got SYSTEM');
+        const recon1 = fixtures.recoveryScanner.reconcileSingleAdjudication(adj);
+        expect(recon1.classification).toBe('AUTHORITY_CONFLICT');
+        expect(recon1.action_taken).toBe('NO_OP');
+        expect(recon1.error).toContain('actor_type');
 
         // Restore actor_type
         fixtures.db.prepare("UPDATE coder_submission_dispositions SET actor_type = 'OPERATOR' WHERE submission_id = ?").run(subId);
+
+        // 2. Invalid actor_id: 'UNKNOWN_OPERATOR' for VERIFIED (must be OWNER_LOCAL_UI)
+        fixtures.db.prepare("UPDATE coder_submission_dispositions SET actor_id = 'UNKNOWN_OPERATOR' WHERE submission_id = ?").run(subId);
+        const recon2 = fixtures.recoveryScanner.reconcileSingleAdjudication(adj);
+        expect(recon2.classification).toBe('AUTHORITY_CONFLICT');
+        expect(recon2.action_taken).toBe('NO_OP');
+        expect(recon2.error).toContain('actor_id');
+
+        // 3. Prohibited noncanonical alias: 'SCANNER'
+        fixtures.db.prepare("UPDATE coder_submission_dispositions SET actor_id = 'SCANNER' WHERE submission_id = ?").run(subId);
+        const recon3 = fixtures.recoveryScanner.reconcileSingleAdjudication(adj);
+        expect(recon3.classification).toBe('AUTHORITY_CONFLICT');
+        expect(recon3.action_taken).toBe('NO_OP');
+        expect(recon3.error).toContain('actor_id');
+
+        // Restore actor_id
+        fixtures.db.prepare("UPDATE coder_submission_dispositions SET actor_id = 'OWNER_LOCAL_UI' WHERE submission_id = ?").run(subId);
       } finally {
         fixtures.db.exec(`
           CREATE TRIGGER IF NOT EXISTS trg_coder_submission_dispositions_no_update
@@ -15307,7 +15390,7 @@ describe('R5J5 Quarantined Submission Adjudication and Verification Admission Su
       }
     });
 
-    it('372. Recovery scanner rejects terminal disposition with timestamp mismatch or contradictory metadata', async () => {
+    it('372. Recovery scanner independently rejects terminal disposition metadata mutations and timestamp mismatch', async () => {
       const { plaintextToken } = issueSubmissionSessionHelper(fixtures.repo, fixtures.authorizationId);
       const subId = crypto.randomUUID();
       fixtures.mcpService.submitCoderClaim(createValidSubmissionPayload(fixtures, subId), plaintextToken);
@@ -15318,17 +15401,59 @@ describe('R5J5 Quarantined Submission Adjudication and Verification Admission Su
       });
 
       const adj = fixtures.repo.getCoderSubmissionAdjudicationById(admitRes.adjudication.id)!;
+      const originalDisp = fixtures.repo.getCoderSubmissionDispositions(subId).find((d) => d.disposition_event === 'SETTLED')!;
+      const validMeta = JSON.parse(originalDisp.disposition_metadata_json!);
 
       fixtures.db.exec('DROP TRIGGER IF EXISTS trg_coder_submission_dispositions_no_update;');
       try {
-        // Update terminal disposition created_at to a different timestamp
+        // 1. Missing metadata key (remove test_run_id)
+        const missingKeyMeta = { ...validMeta };
+        delete missingKeyMeta.test_run_id;
+        fixtures.db.prepare('UPDATE coder_submission_dispositions SET disposition_metadata_json = ? WHERE submission_id = ?')
+          .run(canonicalJsonStringify(missingKeyMeta), subId);
+        const recon1 = fixtures.recoveryScanner.reconcileSingleAdjudication(adj);
+        expect(recon1.classification).toBe('AUTHORITY_CONFLICT');
+        expect(recon1.action_taken).toBe('NO_OP');
+        expect(recon1.error).toContain('metadata');
+
+        // 2. Extra metadata key (add illegal extra key)
+        const extraKeyMeta = { ...validMeta, extra_unrecognized_key: 'forbidden' };
+        fixtures.db.prepare('UPDATE coder_submission_dispositions SET disposition_metadata_json = ? WHERE submission_id = ?')
+          .run(canonicalJsonStringify(extraKeyMeta), subId);
+        const recon2 = fixtures.recoveryScanner.reconcileSingleAdjudication(adj);
+        expect(recon2.classification).toBe('AUTHORITY_CONFLICT');
+        expect(recon2.action_taken).toBe('NO_OP');
+        expect(recon2.error).toContain('metadata');
+
+        // 3. Wrong metadata value (wrong adjudication_id)
+        const wrongValMeta = { ...validMeta, adjudication_id: crypto.randomUUID() };
+        fixtures.db.prepare('UPDATE coder_submission_dispositions SET disposition_metadata_json = ? WHERE submission_id = ?')
+          .run(canonicalJsonStringify(wrongValMeta), subId);
+        const recon3 = fixtures.recoveryScanner.reconcileSingleAdjudication(adj);
+        expect(recon3.classification).toBe('AUTHORITY_CONFLICT');
+        expect(recon3.action_taken).toBe('NO_OP');
+        expect(recon3.error).toContain('metadata');
+
+        // 4. Noncanonical metadata serialization (pretty-printed JSON)
+        const nonCanonicalMeta = JSON.stringify(validMeta, null, 2);
+        fixtures.db.prepare('UPDATE coder_submission_dispositions SET disposition_metadata_json = ? WHERE submission_id = ?')
+          .run(nonCanonicalMeta, subId);
+        const recon4 = fixtures.recoveryScanner.reconcileSingleAdjudication(adj);
+        expect(recon4.classification).toBe('AUTHORITY_CONFLICT');
+        expect(recon4.action_taken).toBe('NO_OP');
+        expect(recon4.error).toContain('metadata');
+
+        // Restore metadata
+        fixtures.db.prepare('UPDATE coder_submission_dispositions SET disposition_metadata_json = ? WHERE submission_id = ?')
+          .run(originalDisp.disposition_metadata_json, subId);
+
+        // 5. Terminal timestamp mismatch
         const mismatchedTime = new Date(Date.now() + 100000).toISOString();
         fixtures.db.prepare('UPDATE coder_submission_dispositions SET created_at = ? WHERE submission_id = ?').run(mismatchedTime, subId);
-
-        const recon = fixtures.recoveryScanner.reconcileSingleAdjudication(adj);
-        expect(recon.classification).toBe('AUTHORITY_CONFLICT');
-        expect(recon.action_taken).toBe('NO_OP');
-        expect(recon.error).toContain('does not match adjudication terminal timestamp');
+        const recon5 = fixtures.recoveryScanner.reconcileSingleAdjudication(adj);
+        expect(recon5.classification).toBe('AUTHORITY_CONFLICT');
+        expect(recon5.action_taken).toBe('NO_OP');
+        expect(recon5.error).toContain('does not match adjudication terminal timestamp');
 
         // Restore timestamp
         fixtures.db.prepare('UPDATE coder_submission_dispositions SET created_at = ? WHERE submission_id = ?').run(adj.completed_at, subId);
@@ -15343,7 +15468,609 @@ describe('R5J5 Quarantined Submission Adjudication and Verification Admission Su
       }
     });
 
-    it('373. historical three-file compatibility diffs remain byte-identical to initial head', () => {
+    it('373. Concurrent ProcessRunner.cancel() and ProcessRunner.terminateAllProcesses() join single settlement authority and write terminal state exactly once', async () => {
+      const execId = crypto.randomUUID();
+      const scriptPath = path.join(fixtures.projectRoot, 'test-373.js');
+      fs.writeFileSync(scriptPath, 'setInterval(() => {}, 1000);', 'utf8');
+
+      let updateCalls = 0;
+      const originalUpdateProcessRun = fixtures.repo.updateProcessRun.bind(fixtures.repo);
+      const updateSpy = vi.spyOn(fixtures.repo, 'updateProcessRun').mockImplementation((...args) => {
+        updateCalls++;
+        return originalUpdateProcessRun(...args);
+      });
+
+      // Launch process via ProcessRunner.execute()
+      const runPromise = ProcessRunner.execute({
+        executable: process.execPath,
+        args: [scriptPath],
+        cwd: fixtures.projectRoot,
+        executionId: execId,
+        timeoutMs: 30000,
+        repo: fixtures.repo,
+      });
+
+      // Bounded wait for process to register in activeProcesses
+      await vi.waitFor(() => {
+        expect(ProcessRunner.getActiveProcessCount()).toBeGreaterThan(0);
+      });
+
+      // Concurrently invoke cancel() and terminateAllProcesses()
+      const [cancelTruth, termSummary] = await Promise.all([
+        ProcessRunner.cancel(execId),
+        ProcessRunner.terminateAllProcesses(),
+      ]);
+
+      expect(cancelTruth).toBe('PROCESS_TREE_TERMINATED_PROVEN');
+      expect(termSummary.count).toBeGreaterThanOrEqual(1);
+      expect(termSummary.allTerminatedProven).toBe(true);
+      expect(termSummary.unproven).toBe(0);
+
+      // Exactly one durable DB terminal update
+      expect(updateCalls).toBe(1);
+
+      // Active registry is completely cleared
+      expect(ProcessRunner.getActiveProcessCount()).toBe(0);
+
+      const runResult = await runPromise;
+      expect(runResult.cancelled).toBe(true);
+      updateSpy.mockRestore();
+    });
+
+    it('374. EmergencyStopService: Two active running projects yield exactly two EMERGENCY_STOP events with identical final termination summary', async () => {
+      // Create two distinct projects in RUNNING state
+      const proj1Id = 'proj-stop-1-' + crypto.randomUUID();
+      const proj2Id = 'proj-stop-2-' + crypto.randomUUID();
+      fixtures.repo.createProject({
+        id: proj1Id,
+        name: 'Project One',
+        description: null,
+        repository_path: fixtures.projectRoot,
+        default_branch: 'main',
+        status: 'RUNNING',
+        contract: null,
+        created_at: new Date().toISOString(),
+        updated_at: new Date().toISOString(),
+        started_at: new Date().toISOString(),
+        completed_at: null,
+      });
+      fixtures.repo.createProject({
+        id: proj2Id,
+        name: 'Project Two',
+        description: null,
+        repository_path: fixtures.projectRoot,
+        default_branch: 'main',
+        status: 'RUNNING',
+        contract: null,
+        created_at: new Date().toISOString(),
+        updated_at: new Date().toISOString(),
+        started_at: new Date().toISOString(),
+        completed_at: null,
+      });
+
+      const stopResult = await fixtures.emergencyStopService.triggerEmergencyStop('Multi-project emergency pause');
+      expect(stopResult.projectsPaused).toContain(proj1Id);
+      expect(stopResult.projectsPaused).toContain(proj2Id);
+      expect(stopResult.allTerminatedProven).toBe(true);
+
+      // Verify events in repo
+      const events1 = fixtures.repo.getEvents(proj1Id).filter((e) => e.type === 'EMERGENCY_STOP');
+      const events2 = fixtures.repo.getEvents(proj2Id).filter((e) => e.type === 'EMERGENCY_STOP');
+
+      // Exactly one event per project, zero duplicates
+      expect(events1.length).toBe(1);
+      expect(events2.length).toBe(1);
+
+      // Identical termination summary payloads
+      const payload1 = events1[0].structured_payload;
+      const payload2 = events2[0].structured_payload;
+      expect(payload1).not.toBeNull();
+      expect(payload2).not.toBeNull();
+      if (payload1 && payload2) {
+        expect(payload1.processesTerminated).toBe(payload2.processesTerminated);
+        expect(payload1.unprovenProcesses).toBe(payload2.unprovenProcesses);
+        expect(payload1.allTerminatedProven).toBe(payload2.allTerminatedProven);
+        expect(payload1.reason).toBe(payload2.reason);
+        expect(payload1.reason).toBe('Multi-project emergency pause');
+      }
+    });
+
+    it('375. validateCanonicalWorkspaceSnapshotAfter strictly rejects uppercase SHA-256 and uppercase Git commit SHAs', async () => {
+      const { plaintextToken } = issueSubmissionSessionHelper(fixtures.repo, fixtures.authorizationId);
+      const subId = crypto.randomUUID();
+      fixtures.mcpService.submitCoderClaim(createValidSubmissionPayload(fixtures, subId), plaintextToken);
+
+      const admitRes = await fixtures.adjudicationService.admitSubmissionForVerification({
+        requestId: crypto.randomUUID(),
+        submissionId: subId,
+      });
+
+      const adj = fixtures.repo.getCoderSubmissionAdjudicationById(admitRes.adjudication.id)!;
+      const sub = fixtures.repo.getCoderSubmissionById(subId)!;
+      const lease = fixtures.repo.getWorkspaceLease(adj.workspace_lease_id!)!;
+      const env = JSON.parse(adj.verification_result_envelope_json!);
+      const afterEv = fixtures.repo.getEvidence(env.workspace_snapshot_after_evidence_id!)!;
+      const rawContent = afterEv.raw_payload || (afterEv.file_path ? fs.readFileSync(afterEv.file_path, 'utf8') : '{}');
+      const validPayload = JSON.parse(rawContent) as Record<string, unknown>;
+
+      // 1. Uppercase git_status_evidence_hash
+      const upperStatusHash = { ...validPayload, git_status_evidence_hash: (validPayload.git_status_evidence_hash as string).toUpperCase() };
+      const res1 = validateCanonicalWorkspaceSnapshotAfter({
+        rawContent: canonicalJsonStringify(upperStatusHash),
+        adjudication: adj,
+        submission: sub,
+        lease,
+        verificationExecutionId: env.verification_execution_id,
+        gitStatusEvidenceHash: env.git_status_evidence_hash,
+        gitDiffEvidenceHash: env.git_diff_evidence_hash,
+      });
+      expect(res1.valid).toBe(false);
+      expect(res1.error).toContain('git_status_evidence_hash must be a 64-char lowercase hex string');
+
+      // 2. Uppercase git_diff_evidence_hash
+      const upperDiffHash = { ...validPayload, git_diff_evidence_hash: (validPayload.git_diff_evidence_hash as string).toUpperCase() };
+      const res2 = validateCanonicalWorkspaceSnapshotAfter({
+        rawContent: canonicalJsonStringify(upperDiffHash),
+        adjudication: adj,
+        submission: sub,
+        lease,
+        verificationExecutionId: env.verification_execution_id,
+        gitStatusEvidenceHash: env.git_status_evidence_hash,
+        gitDiffEvidenceHash: env.git_diff_evidence_hash,
+      });
+      expect(res2.valid).toBe(false);
+      expect(res2.error).toContain('git_diff_evidence_hash must be a 64-char lowercase hex string');
+
+      // 3. Uppercase worktree_identity_hash
+      const upperWorktreeHash = { ...validPayload, worktree_identity_hash: (validPayload.worktree_identity_hash as string).toUpperCase() };
+      const res3 = validateCanonicalWorkspaceSnapshotAfter({
+        rawContent: canonicalJsonStringify(upperWorktreeHash),
+        adjudication: adj,
+        submission: sub,
+        lease,
+        verificationExecutionId: env.verification_execution_id,
+        gitStatusEvidenceHash: env.git_status_evidence_hash,
+        gitDiffEvidenceHash: env.git_diff_evidence_hash,
+      });
+      expect(res3.valid).toBe(false);
+      expect(res3.error).toContain('worktree_identity_hash must be a 64-char lowercase hex string');
+
+      // 4. Uppercase expected_head_sha
+      const upperExpectedHead = { ...validPayload, expected_head_sha: (validPayload.expected_head_sha as string).toUpperCase() };
+      const res4 = validateCanonicalWorkspaceSnapshotAfter({
+        rawContent: canonicalJsonStringify(upperExpectedHead),
+        adjudication: adj,
+        submission: sub,
+        lease,
+        verificationExecutionId: env.verification_execution_id,
+        gitStatusEvidenceHash: env.git_status_evidence_hash,
+        gitDiffEvidenceHash: env.git_diff_evidence_hash,
+      });
+      expect(res4.valid).toBe(false);
+      expect(res4.error).toContain('expected_head_sha must be a 40-char lowercase hex string');
+
+      // 5. Uppercase captured_repository_head_sha
+      const upperCapturedHead = { ...validPayload, captured_repository_head_sha: (validPayload.captured_repository_head_sha as string).toUpperCase() };
+      const res5 = validateCanonicalWorkspaceSnapshotAfter({
+        rawContent: canonicalJsonStringify(upperCapturedHead),
+        adjudication: adj,
+        submission: sub,
+        lease,
+        verificationExecutionId: env.verification_execution_id,
+        gitStatusEvidenceHash: env.git_status_evidence_hash,
+        gitDiffEvidenceHash: env.git_diff_evidence_hash,
+      });
+      expect(res5.valid).toBe(false);
+      expect(res5.error).toContain('captured_repository_head_sha must be a 40-char lowercase hex string');
+    });
+
+    it('376. Recovery scanner rejects target-status-specific null or contradictory terminal timestamps', async () => {
+      const { plaintextToken } = issueSubmissionSessionHelper(fixtures.repo, fixtures.authorizationId);
+      const subId = crypto.randomUUID();
+      fixtures.mcpService.submitCoderClaim(createValidSubmissionPayload(fixtures, subId), plaintextToken);
+
+      const admitRes = await fixtures.adjudicationService.admitSubmissionForVerification({
+        requestId: crypto.randomUUID(),
+        submissionId: subId,
+      });
+
+      const adj = fixtures.repo.getCoderSubmissionAdjudicationById(admitRes.adjudication.id)!;
+      expect(adj.status).toBe('VERIFIED');
+
+      // 1. VERIFIED with null completed_at fails closed
+      const recon1 = fixtures.recoveryScanner.reconcileSingleAdjudication({
+        ...adj,
+        completed_at: null as unknown as string,
+      });
+      expect(recon1.classification).toBe('AUTHORITY_CONFLICT');
+      expect(recon1.action_taken).toBe('NO_OP');
+      expect(recon1.error).toContain('completed_at must be non-null canonical UTC ISO string');
+
+      // 2. VERIFIED with non-canonical completed_at fails closed
+      const recon2 = fixtures.recoveryScanner.reconcileSingleAdjudication({
+        ...adj,
+        completed_at: 'not-a-date',
+      });
+      expect(recon2.classification).toBe('AUTHORITY_CONFLICT');
+      expect(recon2.action_taken).toBe('NO_OP');
+      expect(recon2.error).toContain('completed_at must be non-null canonical UTC ISO string');
+    });
+
+    it('377. Pre-result RECOVERY_FENCED rejects noncanonical SCANNER alias and requires RECOVERY_SCANNER', async () => {
+      const nowIso = new Date().toISOString();
+
+      // Subcase 1: Bad actor_id 'SCANNER' produces AUTHORITY_CONFLICT
+      const { plaintextToken: token1 } = issueSubmissionSessionHelper(fixtures.repo, fixtures.authorizationId);
+      const subId1 = crypto.randomUUID();
+      fixtures.mcpService.submitCoderClaim(createValidSubmissionPayload(fixtures, subId1), token1);
+      fixtures.db.prepare("UPDATE tasks SET state = 'NEEDS_HUMAN' WHERE id = ?").run(fixtures.taskId);
+
+      const adjId1 = crypto.randomUUID();
+      const snapshot1 = fixtures.adjudicationService['buildCanonicalAuthoritySnapshot'](fixtures.repo.getCoderSubmissionById(subId1)!);
+      const snapshotJson1 = canonicalJsonStringify(snapshot1);
+
+      fixtures.repo.createCoderSubmissionAdjudication({
+        id: adjId1,
+        request_id: crypto.randomUUID(),
+        submission_id: subId1,
+        authorization_id: fixtures.authorizationId,
+        project_id: fixtures.projectId,
+        task_id: fixtures.taskId,
+        attempt_id: fixtures.attemptId,
+        assignment_id: fixtures.assignmentId,
+        task_ownership_epoch: 1,
+        action: 'ADMIT_VERIFICATION',
+        status: 'RECOVERY_FENCED',
+        lifecycle_version: 3,
+        authority_snapshot_json: snapshotJson1,
+        authority_snapshot_hash: computeSha256(snapshotJson1),
+        verification_commands_json: '{}',
+        verification_commands_hash: computeSha256('{}'),
+        workspace_snapshot_before_json: null,
+        workspace_snapshot_before_hash: null,
+        protocol_message_id: null,
+        failure_code: 'ORPHANED_VERIFICATION_INTERRUPTED',
+        failure_json: null,
+        created_at: nowIso,
+        recovery_fenced_at: nowIso,
+        workspace_lease_id: null,
+        verification_started_at: null,
+        verification_execution_id: null,
+        test_run_id: null,
+        git_status_evidence_id: null,
+        git_diff_evidence_id: null,
+        artifact_manifest_json: null,
+        artifact_manifest_hash: null,
+        verification_result_envelope_json: null,
+        verification_result_envelope_hash: null,
+        completed_at: null,
+      });
+
+      const eventPayload1 = buildCanonicalTerminalEventPayload('RECOVERY_FENCED', adjId1, 'ORPHANED_VERIFICATION_INTERRUPTED', null);
+      const payloadHash1 = computeSha256(eventPayload1);
+      fixtures.repo.createCoderSubmissionAdjudicationEvent({
+        id: deriveDeterministicAdjudicationEventId(adjId1, 3, 'RECOVERY_FENCED', payloadHash1),
+        adjudication_id: adjId1,
+        sequence: 3,
+        event_type: 'RECOVERY_FENCED',
+        payload_json: eventPayload1,
+        payload_hash: payloadHash1,
+        created_at: nowIso,
+      });
+
+      const badDisp = buildCanonicalTerminalDisposition('RECOVERY_FENCED', adjId1, subId1, nowIso, {
+        failureCode: 'ORPHANED_VERIFICATION_INTERRUPTED',
+        isResultBearing: false,
+      });
+      fixtures.repo.createCoderSubmissionDisposition({
+        ...badDisp,
+        actor_id: 'SCANNER',
+      });
+
+      const fencedAdj1 = fixtures.repo.getCoderSubmissionAdjudicationById(adjId1)!;
+      const reconBadAlias = fixtures.recoveryScanner.reconcileSingleAdjudication(fencedAdj1);
+      expect(reconBadAlias.classification).toBe('AUTHORITY_CONFLICT');
+      expect(reconBadAlias.action_taken).toBe('NO_OP');
+      expect(reconBadAlias.error).toContain('actor_id');
+
+      // Subcase 2: Canonical actor_id 'RECOVERY_SCANNER' produces ALREADY_RECONCILED
+      fixtures.db.prepare("UPDATE tasks SET state = 'CODING' WHERE id = ?").run(fixtures.taskId);
+      const existingAuth = fixtures.repo.getExecutionAuthorization(fixtures.authorizationId)!;
+      const auth2Id = crypto.randomUUID();
+      fixtures.repo.createExecutionAuthorization({
+        ...existingAuth,
+        id: auth2Id,
+      });
+      const { plaintextToken: token2 } = issueSubmissionSessionHelper(fixtures.repo, auth2Id);
+      const subId2 = crypto.randomUUID();
+      fixtures.mcpService.submitCoderClaim(
+        createValidSubmissionPayload(fixtures, subId2, { authorization_id: auth2Id }),
+        token2
+      );
+      fixtures.db.prepare("UPDATE tasks SET state = 'NEEDS_HUMAN' WHERE id = ?").run(fixtures.taskId);
+
+      const adjId2 = crypto.randomUUID();
+      const snapshot2 = fixtures.adjudicationService['buildCanonicalAuthoritySnapshot'](fixtures.repo.getCoderSubmissionById(subId2)!);
+      const snapshotJson2 = canonicalJsonStringify(snapshot2);
+
+      fixtures.repo.createCoderSubmissionAdjudication({
+        id: adjId2,
+        request_id: crypto.randomUUID(),
+        submission_id: subId2,
+        authorization_id: auth2Id,
+        project_id: fixtures.projectId,
+        task_id: fixtures.taskId,
+        attempt_id: fixtures.attemptId,
+        assignment_id: fixtures.assignmentId,
+        task_ownership_epoch: 1,
+        action: 'ADMIT_VERIFICATION',
+        status: 'RECOVERY_FENCED',
+        lifecycle_version: 3,
+        authority_snapshot_json: snapshotJson2,
+        authority_snapshot_hash: computeSha256(snapshotJson2),
+        verification_commands_json: '{}',
+        verification_commands_hash: computeSha256('{}'),
+        workspace_snapshot_before_json: null,
+        workspace_snapshot_before_hash: null,
+        protocol_message_id: null,
+        failure_code: 'ORPHANED_VERIFICATION_INTERRUPTED',
+        failure_json: null,
+        created_at: nowIso,
+        recovery_fenced_at: nowIso,
+        workspace_lease_id: null,
+        verification_started_at: null,
+        verification_execution_id: null,
+        test_run_id: null,
+        git_status_evidence_id: null,
+        git_diff_evidence_id: null,
+        artifact_manifest_json: null,
+        artifact_manifest_hash: null,
+        verification_result_envelope_json: null,
+        verification_result_envelope_hash: null,
+        completed_at: null,
+      });
+
+      const eventPayload2 = buildCanonicalTerminalEventPayload('RECOVERY_FENCED', adjId2, 'ORPHANED_VERIFICATION_INTERRUPTED', null);
+      const payloadHash2 = computeSha256(eventPayload2);
+      fixtures.repo.createCoderSubmissionAdjudicationEvent({
+        id: deriveDeterministicAdjudicationEventId(adjId2, 3, 'RECOVERY_FENCED', payloadHash2),
+        adjudication_id: adjId2,
+        sequence: 3,
+        event_type: 'RECOVERY_FENCED',
+        payload_json: eventPayload2,
+        payload_hash: payloadHash2,
+        created_at: nowIso,
+      });
+
+      const validDisp = buildCanonicalTerminalDisposition('RECOVERY_FENCED', adjId2, subId2, nowIso, {
+        failureCode: 'ORPHANED_VERIFICATION_INTERRUPTED',
+        isResultBearing: false,
+      });
+      fixtures.repo.createCoderSubmissionDisposition(validDisp);
+
+      const fencedAdj2 = fixtures.repo.getCoderSubmissionAdjudicationById(adjId2)!;
+      const reconValid = fixtures.recoveryScanner.reconcileSingleAdjudication(fencedAdj2);
+      expect(reconValid.classification).toBe('ALREADY_RECONCILED');
+      expect(reconValid.action_taken).toBe('NO_OP');
+    });
+
+    it('378. validateCanonicalWorkspaceSnapshotAfter strictly validates expectedCapturedAt against finish timestamp', async () => {
+      const { plaintextToken } = issueSubmissionSessionHelper(fixtures.repo, fixtures.authorizationId);
+      const subId = crypto.randomUUID();
+      fixtures.mcpService.submitCoderClaim(createValidSubmissionPayload(fixtures, subId), plaintextToken);
+
+      const admitRes = await fixtures.adjudicationService.admitSubmissionForVerification({
+        requestId: crypto.randomUUID(),
+        submissionId: subId,
+      });
+
+      const adj = fixtures.repo.getCoderSubmissionAdjudicationById(admitRes.adjudication.id)!;
+      const sub = fixtures.repo.getCoderSubmissionById(subId)!;
+      const lease = fixtures.repo.getWorkspaceLease(adj.workspace_lease_id!)!;
+      const env = JSON.parse(adj.verification_result_envelope_json!);
+      const afterEv = fixtures.repo.getEvidence(env.workspace_snapshot_after_evidence_id!)!;
+      const rawContent = afterEv.raw_payload || (afterEv.file_path ? fs.readFileSync(afterEv.file_path, 'utf8') : '{}');
+
+      // Passing matching finish timestamp succeeds
+      const validRes = validateCanonicalWorkspaceSnapshotAfter({
+        rawContent,
+        adjudication: adj,
+        submission: sub,
+        lease,
+        verificationExecutionId: env.verification_execution_id,
+        gitStatusEvidenceHash: env.git_status_evidence_hash,
+        gitDiffEvidenceHash: env.git_diff_evidence_hash,
+        expectedCapturedAt: env.finish_timestamp,
+      });
+      expect(validRes.valid).toBe(true);
+
+      // Passing contradictory finish timestamp fails closed
+      const mismatchedTime = new Date(Date.now() + 50000).toISOString();
+      const invalidRes = validateCanonicalWorkspaceSnapshotAfter({
+        rawContent,
+        adjudication: adj,
+        submission: sub,
+        lease,
+        verificationExecutionId: env.verification_execution_id,
+        gitStatusEvidenceHash: env.git_status_evidence_hash,
+        gitDiffEvidenceHash: env.git_diff_evidence_hash,
+        expectedCapturedAt: mismatchedTime,
+      });
+      expect(invalidRes.valid).toBe(false);
+      expect(invalidRes.error).toContain('does not match expected finish timestamp');
+    });
+
+    it('379. ProcessRunner.cancel() does not pre-signal entry.process.kill() prior to canonical settlement', async () => {
+      const execId = crypto.randomUUID();
+      const scriptPath = path.join(fixtures.projectRoot, 'test-379.js');
+      fs.writeFileSync(scriptPath, 'setInterval(() => {}, 1000);', 'utf8');
+
+      let killMethodCalled = false;
+
+      const runPromise = ProcessRunner.execute({
+        executable: process.execPath,
+        args: [scriptPath],
+        cwd: fixtures.projectRoot,
+        executionId: execId,
+        timeoutMs: 30000,
+        repo: fixtures.repo,
+      });
+
+      await vi.waitFor(() => {
+        expect(ProcessRunner.getActiveProcessCount()).toBeGreaterThan(0);
+      });
+
+      const active = (ProcessRunner as unknown as {
+        activeProcesses: Map<string, { process: child_process.ChildProcess }>
+      }).activeProcesses.get(execId);
+      expect(active).toBeDefined();
+      if (active) {
+        const origKill = active.process.kill.bind(active.process);
+        active.process.kill = (signal?: NodeJS.Signals | number) => {
+          killMethodCalled = true;
+          return origKill(signal as NodeJS.Signals);
+        };
+      }
+
+      const cancelTruth = await ProcessRunner.cancel(execId);
+      expect(cancelTruth).toBe('PROCESS_TREE_TERMINATED_PROVEN');
+      expect(killMethodCalled).toBe(false);
+
+      await runPromise;
+      try {
+        fs.unlinkSync(scriptPath);
+      } catch {}
+    });
+
+    it('380. CoderSubmissionAdjudicationService: Evaluator fails closed with INTEGRITY_MISMATCH when required authority bindings are absent', async () => {
+      const { plaintextToken } = issueSubmissionSessionHelper(fixtures.repo, fixtures.authorizationId);
+      const subId = crypto.randomUUID();
+      fixtures.mcpService.submitCoderClaim(createValidSubmissionPayload(fixtures, subId), plaintextToken);
+
+      const admitRes = await fixtures.adjudicationService.admitSubmissionForVerification({
+        requestId: crypto.randomUUID(),
+        submissionId: subId,
+      });
+
+      const adj = fixtures.repo.getCoderSubmissionAdjudicationById(admitRes.adjudication.id)!;
+      const env = JSON.parse(adj.verification_result_envelope_json!);
+      const tr = fixtures.repo.getTestRun(adj.test_run_id!)!;
+
+      // Create dummy repo with getCoderSubmissionById returning null
+      const stubRepo = Object.create(fixtures.repo) as Repository;
+      stubRepo.getCoderSubmissionById = () => null;
+
+      const dec = evaluateCanonicalSettlementDecision({
+        rawEnvelopeJson: adj.verification_result_envelope_json!,
+        storedEnvelopeHash: adj.verification_result_envelope_hash!,
+        rawManifestJson: adj.artifact_manifest_json!,
+        storedManifestHash: adj.artifact_manifest_hash!,
+        adjudication: adj,
+        testRun: tr,
+        gitStatusEvidenceId: adj.git_status_evidence_id,
+        gitDiffEvidenceId: adj.git_diff_evidence_id,
+        testResultEvidenceId: env.test_result_evidence_id,
+        repo: stubRepo,
+        artifactStore: fixtures.artifactStore,
+      });
+
+      expect(dec.valid).toBe(false);
+      expect(dec.failureCode).toBe('INTEGRITY_MISMATCH');
+      expect(dec.contradictionReason).toContain('Missing required authority bindings');
+    });
+
+    it('381. CoderSubmissionAdjudicationService: Replay path fails closed with INTEGRITY_CONFLICT when workspace lease binding is missing', async () => {
+      const { plaintextToken } = issueSubmissionSessionHelper(fixtures.repo, fixtures.authorizationId);
+      const subId = crypto.randomUUID();
+      fixtures.mcpService.submitCoderClaim(createValidSubmissionPayload(fixtures, subId), plaintextToken);
+
+      const reqId = crypto.randomUUID();
+      await fixtures.adjudicationService.admitSubmissionForVerification({
+        requestId: reqId,
+        submissionId: subId,
+      });
+
+      const leaseSpy = vi.spyOn(fixtures.repo, 'getWorkspaceLease').mockReturnValue(null);
+      try {
+        await expect(
+          fixtures.adjudicationService.admitSubmissionForVerification({
+            requestId: reqId,
+            submissionId: subId,
+          })
+        ).rejects.toThrow(/Missing required authority bindings for replayed workspace snapshot/);
+      } finally {
+        leaseSpy.mockRestore();
+      }
+    });
+
+    it('382. CoderSubmissionAdjudicationService: Initial settlement strictly validates generated workspace-after evidence through canonical validator', async () => {
+      const { plaintextToken } = issueSubmissionSessionHelper(fixtures.repo, fixtures.authorizationId);
+      const subId = crypto.randomUUID();
+      fixtures.mcpService.submitCoderClaim(createValidSubmissionPayload(fixtures, subId), plaintextToken);
+
+      const admitRes = await fixtures.adjudicationService.admitSubmissionForVerification({
+        requestId: crypto.randomUUID(),
+        submissionId: subId,
+      });
+
+      const adj = fixtures.repo.getCoderSubmissionAdjudicationById(admitRes.adjudication.id)!;
+      const env = JSON.parse(adj.verification_result_envelope_json!);
+      const wsEv = fixtures.repo.getEvidence(env.workspace_snapshot_after_evidence_id!);
+
+      expect(wsEv).toBeDefined();
+      expect(wsEv).not.toBeNull();
+      if (!wsEv) {
+        throw new Error('Workspace-after evidence was not found in repository.');
+      }
+      expect(wsEv.evidence_type).toBe('FILE_SNAPSHOT');
+      expect(wsEv.content_type).toBe('application/json');
+
+      const content = wsEv.raw_payload || (wsEv.file_path ? fs.readFileSync(wsEv.file_path, 'utf8') : '');
+      const payload = JSON.parse(content);
+
+      // Verify exact 18 fields are present and canonical
+      expect(Object.keys(payload).sort()).toEqual([...CANONICAL_WORKSPACE_SNAPSHOT_AFTER_KEYS].sort());
+      expect(payload.schema_version).toBe(1);
+      expect(payload.adjudication_lifecycle_version).toBe(3);
+      expect(payload.adjudication_id).toBe(adj.id);
+      expect(payload.submission_id).toBe(subId);
+    });
+
+    it('383. Recovery scanner: Evaluator and recovery share canonical workspace-after validator and fail closed on tampered worktree identity hash', async () => {
+      const { plaintextToken } = issueSubmissionSessionHelper(fixtures.repo, fixtures.authorizationId);
+      const subId = crypto.randomUUID();
+      fixtures.mcpService.submitCoderClaim(createValidSubmissionPayload(fixtures, subId), plaintextToken);
+
+      const admitRes = await fixtures.adjudicationService.admitSubmissionForVerification({
+        requestId: crypto.randomUUID(),
+        submissionId: subId,
+      });
+
+      const adj = fixtures.repo.getCoderSubmissionAdjudicationById(admitRes.adjudication.id)!;
+      const env = JSON.parse(adj.verification_result_envelope_json!);
+      const afterEv = fixtures.repo.getEvidence(env.workspace_snapshot_after_evidence_id!)!;
+      const content = afterEv.raw_payload || fs.readFileSync(afterEv.file_path!, 'utf8');
+      const payload = JSON.parse(content);
+
+      // Tamper worktree_identity_hash to a random lowercase hex string that does not match lease
+      payload.worktree_identity_hash = 'f'.repeat(64);
+      const tamperedJson = canonicalJsonStringify(payload);
+      if (afterEv.file_path) {
+        fs.writeFileSync(afterEv.file_path, tamperedJson, 'utf8');
+      }
+
+      const recon = fixtures.recoveryScanner.reconcileSingleAdjudication(adj);
+      expect(recon.classification).toBe('AUTHORITY_CONFLICT');
+      expect(recon.action_taken).toBe('NO_OP');
+      expect(recon.error).toMatch(/worktree_identity_hash|hash mismatch/);
+
+      // Restore content
+      if (afterEv.file_path) {
+        fs.writeFileSync(afterEv.file_path, content, 'utf8');
+      }
+    });
+
+    it('384. historical three-file compatibility diffs remain byte-identical to initial head', () => {
       const checkDiff = (relPath: string) => {
         const out = child_process.execFileSync('git', ['diff', 'e869b9f79b76f104df74ac49ece723b828ba888e', '--', relPath], {
           encoding: 'utf8',
