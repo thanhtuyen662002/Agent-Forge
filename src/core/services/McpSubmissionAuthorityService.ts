@@ -30,7 +30,9 @@ import {
   SubmissionVerificationSummary,
   sanitizeFailureMessage,
 } from '../../mcp/submissionProtocol';
-import { TestRun } from '../types/domain';
+import { TestRun, TaskStateEnum, Project, Task, ExecutionAuthorization } from '../types/domain';
+import { AUTHORITY_SNAPSHOT_KEYS, CoderSubmissionAdjudication } from '../types/adjudication';
+import { validateAndParseCanonicalResultEnvelope } from './CoderSubmissionAdjudicationService';
 
 export class McpSubmissionAuthorityError extends Error {
   constructor(
@@ -1228,13 +1230,14 @@ export class McpSubmissionAuthorityService {
       }
 
       // Authorization-scoped observation:
-      // Must match auth.id, project.id, and task.id.
-      // Do not require submission.session_id to equal current session.id.
-      // Cross-auth, cross-task, cross-project lookups collapse to SUBMISSION_NOT_FOUND.
+      // Must match auth.id, project.id, task.id, and attempt/assignment when set on auth.
+      // Cross-auth, cross-task, cross-project, cross-attempt, cross-assignment lookups collapse to SUBMISSION_NOT_FOUND.
       if (
         submission.authorization_id !== auth.id ||
         submission.project_id !== project.id ||
-        submission.task_id !== task.id
+        submission.task_id !== task.id ||
+        (auth.attempt_id !== null && submission.attempt_id !== auth.attempt_id) ||
+        (auth.assignment_id !== null && submission.assignment_id !== auth.assignment_id)
       ) {
         return {
           ok: false,
@@ -1243,6 +1246,9 @@ export class McpSubmissionAuthorityService {
           retryable: false,
         };
       }
+
+      // Reconcile submission canonical envelope
+      this.validateSubmissionEnvelope(submission, auth, project, task);
 
       // 6. Validate durable submission integrity
       if (
@@ -1257,13 +1263,42 @@ export class McpSubmissionAuthorityService {
 
       // Verify dispositions
       const disps = this.repo.getCoderSubmissionDispositions(submission.id);
-      const initialDisp = disps.find(
+      const initialDisps = disps.filter(
         (d) => d.disposition_event === 'SUBMITTED' && d.disposition_reason === 'INITIAL_SUBMISSION'
       );
-      if (!initialDisp || initialDisp.created_at !== submission.submitted_at) {
+      if (initialDisps.length !== 1) {
+        throw new McpSubmissionStatusError(
+          'SUBMISSION_STATUS_INTEGRITY_CONFLICT',
+          'Submission must have exactly one initial SUBMITTED/INITIAL_SUBMISSION disposition'
+        );
+      }
+      if (initialDisps[0].created_at !== submission.submitted_at) {
         throw new McpSubmissionStatusError(
           'SUBMISSION_STATUS_INTEGRITY_CONFLICT',
           'Initial submission disposition missing or timestamp mismatch'
+        );
+      }
+
+      const terminalDisps = disps.filter(
+        (d) =>
+          d.disposition_event === 'SETTLED' ||
+          d.disposition_event === 'REJECTED' ||
+          ['ACCEPTED_VERIFIED', 'VERIFICATION_FAILED', 'RECOVERY_FENCED', 'REJECTED', 'SUPERSEDED'].includes(
+            d.disposition_reason
+          )
+      );
+      if (terminalDisps.length > 1) {
+        throw new McpSubmissionStatusError(
+          'SUBMISSION_STATUS_INTEGRITY_CONFLICT',
+          'Contradictory terminal dispositions detected'
+        );
+      }
+
+      // Validate task.state enum validity
+      if (!TaskStateEnum.safeParse(task.state).success) {
+        throw new McpSubmissionStatusError(
+          'SUBMISSION_STATUS_INTEGRITY_CONFLICT',
+          `Task state "${task.state}" is not a valid TaskStateEnum value`
         );
       }
 
@@ -1272,26 +1307,41 @@ export class McpSubmissionAuthorityService {
 
       // Rule 1: No adjudication -> QUARANTINED
       if (adjudications.length === 0) {
+        if (terminalDisps.length > 0) {
+          throw new McpSubmissionStatusError(
+            'SUBMISSION_STATUS_INTEGRITY_CONFLICT',
+            'Terminal disposition exists for quarantined submission without adjudication'
+          );
+        }
+        if (!['CODING', 'VALIDATING', 'QUEUED'].includes(task.state)) {
+          throw new McpSubmissionStatusError(
+            'SUBMISSION_STATUS_INTEGRITY_CONFLICT',
+            `Quarantined submission has contradictory task state "${task.state}"`
+          );
+        }
         checkZeroMutations();
         return {
           ok: true,
           submission_id: submission.id,
           lifecycle_status: 'QUARANTINED',
           terminal_outcome: null,
-          task_state: task.state,
+          task_state: task.state as any,
           verification_summary: null,
           submitted_at: submission.submitted_at,
           settled_at: null,
         };
       }
 
-      // Adjudications exist: validate integrity and graph bindings
+      // Adjudications exist: validate integrity and graph bindings for EVERY adjudication
       for (const adj of adjudications) {
         if (
           adj.submission_id !== submission.id ||
           adj.authorization_id !== auth.id ||
           adj.project_id !== project.id ||
-          adj.task_id !== task.id
+          adj.task_id !== task.id ||
+          adj.attempt_id !== submission.attempt_id ||
+          adj.assignment_id !== submission.assignment_id ||
+          adj.task_ownership_epoch !== submission.task_ownership_epoch
         ) {
           throw new McpSubmissionStatusError(
             'SUBMISSION_STATUS_INTEGRITY_CONFLICT',
@@ -1299,66 +1349,20 @@ export class McpSubmissionAuthorityService {
           );
         }
 
-        // Validate authority snapshot if present
-        if (adj.authority_snapshot_json) {
-          try {
-            const parsedSnap = JSON.parse(adj.authority_snapshot_json);
-            if (typeof parsedSnap !== 'object' || parsedSnap === null || Array.isArray(parsedSnap)) {
-              throw new Error('Not an object');
-            }
-          } catch {
-            throw new McpSubmissionStatusError(
-              'SUBMISSION_STATUS_INTEGRITY_CONFLICT',
-              'Adjudication authority snapshot JSON is malformed'
-            );
-          }
-          const computedHash = computeSha256(adj.authority_snapshot_json);
-          if (computedHash !== adj.authority_snapshot_hash) {
-            throw new McpSubmissionStatusError(
-              'SUBMISSION_STATUS_INTEGRITY_CONFLICT',
-              'Adjudication authority snapshot hash mismatch'
-            );
-          }
+        if (
+          typeof adj.lifecycle_version !== 'number' ||
+          !Number.isSafeInteger(adj.lifecycle_version) ||
+          adj.lifecycle_version < 1
+        ) {
+          throw new McpSubmissionStatusError(
+            'SUBMISSION_STATUS_INTEGRITY_CONFLICT',
+            'Adjudication lifecycle_version must be a positive safe integer'
+          );
         }
 
-        // Validate verification result envelope if present
-        if (adj.verification_result_envelope_json) {
-          try {
-            const parsedEnv = JSON.parse(adj.verification_result_envelope_json);
-            if (typeof parsedEnv !== 'object' || parsedEnv === null || Array.isArray(parsedEnv)) {
-              throw new Error('Not an object');
-            }
-          } catch {
-            throw new McpSubmissionStatusError(
-              'SUBMISSION_STATUS_INTEGRITY_CONFLICT',
-              'Verification result envelope JSON is malformed'
-            );
-          }
-          if (adj.verification_result_envelope_hash) {
-            const computedEnvHash = computeSha256(adj.verification_result_envelope_json);
-            if (computedEnvHash !== adj.verification_result_envelope_hash) {
-              throw new McpSubmissionStatusError(
-                'SUBMISSION_STATUS_INTEGRITY_CONFLICT',
-                'Verification result envelope hash mismatch'
-              );
-            }
-          }
-        }
-
-        // Validate failure_json if present
-        if (adj.failure_json) {
-          try {
-            const parsedFail = JSON.parse(adj.failure_json);
-            if (typeof parsedFail !== 'object' || parsedFail === null || Array.isArray(parsedFail)) {
-              throw new Error('Not an object');
-            }
-          } catch {
-            throw new McpSubmissionStatusError(
-              'SUBMISSION_STATUS_INTEGRITY_CONFLICT',
-              'Adjudication failure_json is malformed'
-            );
-          }
-        }
+        this.validateAuthoritySnapshot(adj.authority_snapshot_json, adj.authority_snapshot_hash, submission, auth, project, task);
+        this.validateVerificationResultEnvelope(adj.verification_result_envelope_json, adj.verification_result_envelope_hash, adj, submission, auth, project, task);
+        this.validateFailureJson(adj.failure_json);
 
         // Validate timestamps
         if (typeof adj.created_at !== 'string' || isNaN(Date.parse(adj.created_at))) {
@@ -1383,6 +1387,86 @@ export class McpSubmissionAuthorityService {
           throw new McpSubmissionStatusError(
             'SUBMISSION_STATUS_INTEGRITY_CONFLICT',
             'Adjudication recovery_fenced_at timestamp is invalid'
+          );
+        }
+
+        // Validate events for EVERY adjudication in lineage
+        const events = this.repo.getCoderSubmissionAdjudicationEvents(adj.id);
+        if (events.length === 0) {
+          throw new McpSubmissionStatusError(
+            'SUBMISSION_STATUS_INTEGRITY_CONFLICT',
+            `Adjudication "${adj.id}" missing required lifecycle event log`
+          );
+        }
+
+        // Verify event sequence continuity (1, 2, ...) and payload hashes
+        for (let i = 0; i < events.length; i++) {
+          const ev = events[i];
+          if (ev.sequence !== i + 1) {
+            throw new McpSubmissionStatusError(
+              'SUBMISSION_STATUS_INTEGRITY_CONFLICT',
+              `Adjudication event sequence broken: expected ${i + 1}, found ${ev.sequence}`
+            );
+          }
+          if (computeSha256(ev.payload_json) !== ev.payload_hash) {
+            throw new McpSubmissionStatusError(
+              'SUBMISSION_STATUS_INTEGRITY_CONFLICT',
+              `Adjudication event payload hash mismatch at sequence ${ev.sequence}`
+            );
+          }
+          try {
+            const parsedEv = JSON.parse(ev.payload_json);
+            if (typeof parsedEv !== 'object' || parsedEv === null || Array.isArray(parsedEv)) {
+              throw new Error('Not object');
+            }
+            if (canonicalJsonStringify(parsedEv) !== ev.payload_json) {
+              throw new Error('Not canonical');
+            }
+          } catch {
+            throw new McpSubmissionStatusError(
+              'SUBMISSION_STATUS_INTEGRITY_CONFLICT',
+              `Adjudication event payload is not canonically formatted JSON at sequence ${ev.sequence}`
+            );
+          }
+        }
+
+        // Verify event transition validity
+        const initialEvent = events[0];
+        if (!['ADMITTED', 'REJECTED', 'SUPERSEDED'].includes(initialEvent.event_type)) {
+          throw new McpSubmissionStatusError(
+            'SUBMISSION_STATUS_INTEGRITY_CONFLICT',
+            `Initial adjudication event type invalid: ${initialEvent.event_type}`
+          );
+        }
+
+        const terminalEventTypes = ['VERIFICATION_SUCCEEDED', 'VERIFICATION_FAILED', 'RECOVERY_FENCED', 'REJECTED', 'SUPERSEDED'];
+        let seenTerminalEvent = false;
+        for (const ev of events) {
+          if (seenTerminalEvent) {
+            throw new McpSubmissionStatusError(
+              'SUBMISSION_STATUS_INTEGRITY_CONFLICT',
+              'Additional events logged after terminal lifecycle event'
+            );
+          }
+          if (terminalEventTypes.includes(ev.event_type)) {
+            seenTerminalEvent = true;
+          }
+        }
+
+        const lastEvent = events[events.length - 1];
+        const eventStatusMap: Record<string, string> = {
+          ADMITTED: 'ADMITTED',
+          VERIFICATION_CLAIMED: 'VERIFYING',
+          VERIFICATION_SUCCEEDED: 'VERIFIED',
+          VERIFICATION_FAILED: 'VERIFICATION_FAILED',
+          RECOVERY_FENCED: 'RECOVERY_FENCED',
+          REJECTED: 'REJECTED',
+          SUPERSEDED: 'SUPERSEDED',
+        };
+        if (eventStatusMap[lastEvent.event_type] !== adj.status) {
+          throw new McpSubmissionStatusError(
+            'SUBMISSION_STATUS_INTEGRITY_CONFLICT',
+            `Adjudication status "${adj.status}" contradicts final event "${lastEvent.event_type}"`
           );
         }
       }
@@ -1421,73 +1505,88 @@ export class McpSubmissionAuthorityService {
         );
       }
 
-      // Choose authoritative adjudication
+      // Deterministically sort adjudications
+      adjudications.sort((a, b) => a.lifecycle_version - b.lifecycle_version || a.created_at.localeCompare(b.created_at));
       const chosenAdj = adjudications[adjudications.length - 1];
 
-      // Validate events for chosen adjudication
-      const events = this.repo.getCoderSubmissionAdjudicationEvents(chosenAdj.id);
-      if (events.length === 0) {
-        throw new McpSubmissionStatusError(
-          'SUBMISSION_STATUS_INTEGRITY_CONFLICT',
-          'Adjudication missing required lifecycle event log'
-        );
-      }
-
-      // Verify event sequence continuity (1, 2, ...) and payload hashes
-      for (let i = 0; i < events.length; i++) {
-        const ev = events[i];
-        if (ev.sequence !== i + 1) {
-          throw new McpSubmissionStatusError(
-            'SUBMISSION_STATUS_INTEGRITY_CONFLICT',
-            `Adjudication event sequence broken: expected ${i + 1}, found ${ev.sequence}`
-          );
-        }
-        if (computeSha256(ev.payload_json) !== ev.payload_hash) {
-          throw new McpSubmissionStatusError(
-            'SUBMISSION_STATUS_INTEGRITY_CONFLICT',
-            `Adjudication event payload hash mismatch at sequence ${ev.sequence}`
-          );
+      // Terminal disposition consistency
+      if (terminalStatuses.includes(chosenAdj.status)) {
+        if (terminalDisps.length === 1) {
+          const tDisp = terminalDisps[0];
+          const expectedReasonMap: Record<string, string> = {
+            VERIFIED: 'ACCEPTED_VERIFIED',
+            VERIFICATION_FAILED: 'VERIFICATION_FAILED',
+            RECOVERY_FENCED: 'RECOVERY_FENCED',
+            REJECTED: 'REJECTED',
+            SUPERSEDED: 'SUPERSEDED',
+          };
+          if (tDisp.disposition_reason !== expectedReasonMap[chosenAdj.status]) {
+            throw new McpSubmissionStatusError(
+              'SUBMISSION_STATUS_INTEGRITY_CONFLICT',
+              `Terminal disposition reason "${tDisp.disposition_reason}" contradicts adjudication status "${chosenAdj.status}"`
+            );
+          }
         }
       }
 
-      // Verify event transition validity
-      const initialEvent = events[0];
-      if (!['ADMITTED', 'REJECTED', 'SUPERSEDED'].includes(initialEvent.event_type)) {
-        throw new McpSubmissionStatusError(
-          'SUBMISSION_STATUS_INTEGRITY_CONFLICT',
-          `Initial adjudication event type invalid: ${initialEvent.event_type}`
-        );
-      }
-
-      const terminalEventTypes = ['VERIFICATION_SUCCEEDED', 'VERIFICATION_FAILED', 'RECOVERY_FENCED', 'REJECTED', 'SUPERSEDED'];
-      let seenTerminalEvent = false;
-      for (const ev of events) {
-        if (seenTerminalEvent) {
-          throw new McpSubmissionStatusError(
-            'SUBMISSION_STATUS_INTEGRITY_CONFLICT',
-            'Additional events logged after terminal lifecycle event'
-          );
-        }
-        if (terminalEventTypes.includes(ev.event_type)) {
-          seenTerminalEvent = true;
-        }
-      }
-
-      const lastEvent = events[events.length - 1];
-      const eventStatusMap: Record<string, string> = {
-        ADMITTED: 'ADMITTED',
-        VERIFICATION_CLAIMED: 'VERIFYING',
-        VERIFICATION_SUCCEEDED: 'VERIFIED',
-        VERIFICATION_FAILED: 'VERIFICATION_FAILED',
-        RECOVERY_FENCED: 'RECOVERY_FENCED',
-        REJECTED: 'REJECTED',
-        SUPERSEDED: 'SUPERSEDED',
-      };
-      if (eventStatusMap[lastEvent.event_type] !== chosenAdj.status) {
-        throw new McpSubmissionStatusError(
-          'SUBMISSION_STATUS_INTEGRITY_CONFLICT',
-          `Adjudication status "${chosenAdj.status}" contradicts final event "${lastEvent.event_type}"`
-        );
+      // Task state consistency with adjudication lifecycle
+      switch (chosenAdj.status) {
+        case 'VERIFYING':
+          if (task.state !== 'VALIDATING') {
+            throw new McpSubmissionStatusError(
+              'SUBMISSION_STATUS_INTEGRITY_CONFLICT',
+              `Active verification requires task state "VALIDATING" (found "${task.state}")`
+            );
+          }
+          break;
+        case 'VERIFIED':
+          if (!['REVIEW_READY', 'REVIEWING', 'DONE'].includes(task.state)) {
+            throw new McpSubmissionStatusError(
+              'SUBMISSION_STATUS_INTEGRITY_CONFLICT',
+              `Verified adjudication requires settled task state ("REVIEW_READY", "REVIEWING", or "DONE"), found "${task.state}"`
+            );
+          }
+          break;
+        case 'VERIFICATION_FAILED':
+          if (!['FIX_REQUIRED', 'FAILED', 'VALIDATING'].includes(task.state)) {
+            throw new McpSubmissionStatusError(
+              'SUBMISSION_STATUS_INTEGRITY_CONFLICT',
+              `Verification failed adjudication contradicts task state "${task.state}"`
+            );
+          }
+          break;
+        case 'RECOVERY_FENCED':
+          if (!['FIX_REQUIRED', 'FAILED', 'PAUSED', 'VALIDATING', 'NEEDS_HUMAN'].includes(task.state)) {
+            throw new McpSubmissionStatusError(
+              'SUBMISSION_STATUS_INTEGRITY_CONFLICT',
+              `Recovery-fenced adjudication contradicts task state "${task.state}"`
+            );
+          }
+          break;
+        case 'REJECTED':
+          if (!['FIX_REQUIRED', 'CANCELLED', 'FAILED', 'NEEDS_HUMAN', 'BLOCKED'].includes(task.state)) {
+            throw new McpSubmissionStatusError(
+              'SUBMISSION_STATUS_INTEGRITY_CONFLICT',
+              `Rejected adjudication contradicts task state "${task.state}"`
+            );
+          }
+          break;
+        case 'SUPERSEDED':
+          if (!['CODING', 'VALIDATING', 'CANCELLED', 'QUEUED', 'FIX_REQUIRED'].includes(task.state)) {
+            throw new McpSubmissionStatusError(
+              'SUBMISSION_STATUS_INTEGRITY_CONFLICT',
+              `Superseded adjudication contradicts task state "${task.state}"`
+            );
+          }
+          break;
+        case 'ADMITTED':
+          if (!['VALIDATING', 'CODING', 'QUEUED'].includes(task.state)) {
+            throw new McpSubmissionStatusError(
+              'SUBMISSION_STATUS_INTEGRITY_CONFLICT',
+              `Admitted adjudication contradicts task state "${task.state}"`
+            );
+          }
+          break;
       }
 
       // Validate linked test run
@@ -1513,12 +1612,6 @@ export class McpSubmissionAuthorityService {
           throw new McpSubmissionStatusError(
             'SUBMISSION_STATUS_INTEGRITY_CONFLICT',
             'Verified adjudication missing required linked test run'
-          );
-        }
-        if (testRun.exit_code !== 0) {
-          throw new McpSubmissionStatusError(
-            'SUBMISSION_STATUS_INTEGRITY_CONFLICT',
-            'Verified adjudication has non-zero test run exit code'
           );
         }
       }
@@ -1554,12 +1647,19 @@ export class McpSubmissionAuthorityService {
               'Verified adjudication missing completed_at timestamp'
             );
           }
+          const exitCode = this.validateExitCode(testRun!.exit_code, true);
+          if (exitCode !== 0) {
+            throw new McpSubmissionStatusError(
+              'SUBMISSION_STATUS_INTEGRITY_CONFLICT',
+              'Verified adjudication has non-zero test run exit code'
+            );
+          }
           verificationSummary = {
-            exit_code: testRun!.exit_code,
-            passed_count: Math.max(0, testRun!.passed_count ?? 0),
-            failed_count: Math.max(0, testRun!.failed_count ?? 0),
-            skipped_count: Math.max(0, testRun!.skipped_count ?? 0),
-            duration_ms: Math.max(0, testRun!.duration_ms ?? 0),
+            exit_code: exitCode,
+            passed_count: this.validateTestMetric(testRun!.passed_count, 'passed_count', true)!,
+            failed_count: this.validateTestMetric(testRun!.failed_count, 'failed_count', true)!,
+            skipped_count: this.validateTestMetric(testRun!.skipped_count, 'skipped_count', true)!,
+            duration_ms: this.validateTestMetric(testRun!.duration_ms, 'duration_ms', true)!,
             failure_code: null,
             failure_message: null,
           };
@@ -1578,11 +1678,11 @@ export class McpSubmissionAuthorityService {
           }
           const rawMessage = this.extractRawFailureMessage(chosenAdj.failure_json, chosenAdj.failure_code);
           verificationSummary = {
-            exit_code: testRun ? testRun.exit_code : null,
-            passed_count: testRun ? Math.max(0, testRun.passed_count ?? 0) : null,
-            failed_count: testRun ? Math.max(0, testRun.failed_count ?? 0) : null,
-            skipped_count: testRun ? Math.max(0, testRun.skipped_count ?? 0) : null,
-            duration_ms: testRun ? Math.max(0, testRun.duration_ms ?? 0) : null,
+            exit_code: testRun ? this.validateExitCode(testRun.exit_code, false) : null,
+            passed_count: testRun ? this.validateTestMetric(testRun.passed_count, 'passed_count', false) : null,
+            failed_count: testRun ? this.validateTestMetric(testRun.failed_count, 'failed_count', false) : null,
+            skipped_count: testRun ? this.validateTestMetric(testRun.skipped_count, 'skipped_count', false) : null,
+            duration_ms: testRun ? this.validateTestMetric(testRun.duration_ms, 'duration_ms', false) : null,
             failure_code: chosenAdj.failure_code ? sanitizeFailureMessage(chosenAdj.failure_code) : null,
             failure_message: sanitizeFailureMessage(rawMessage),
           };
@@ -1601,11 +1701,11 @@ export class McpSubmissionAuthorityService {
           }
           const rawMessage = this.extractRawFailureMessage(chosenAdj.failure_json, chosenAdj.failure_code);
           verificationSummary = {
-            exit_code: testRun ? testRun.exit_code : null,
-            passed_count: testRun ? Math.max(0, testRun.passed_count ?? 0) : null,
-            failed_count: testRun ? Math.max(0, testRun.failed_count ?? 0) : null,
-            skipped_count: testRun ? Math.max(0, testRun.skipped_count ?? 0) : null,
-            duration_ms: testRun ? Math.max(0, testRun.duration_ms ?? 0) : null,
+            exit_code: testRun ? this.validateExitCode(testRun.exit_code, false) : null,
+            passed_count: testRun ? this.validateTestMetric(testRun.passed_count, 'passed_count', false) : null,
+            failed_count: testRun ? this.validateTestMetric(testRun.failed_count, 'failed_count', false) : null,
+            skipped_count: testRun ? this.validateTestMetric(testRun.skipped_count, 'skipped_count', false) : null,
+            duration_ms: testRun ? this.validateTestMetric(testRun.duration_ms, 'duration_ms', false) : null,
             failure_code: chosenAdj.failure_code ? sanitizeFailureMessage(chosenAdj.failure_code) : null,
             failure_message: sanitizeFailureMessage(rawMessage),
           };
@@ -1672,7 +1772,7 @@ export class McpSubmissionAuthorityService {
         submission_id: submission.id,
         lifecycle_status: lifecycleStatus,
         terminal_outcome: terminalOutcome,
-        task_state: task.state,
+        task_state: task.state as any,
         verification_summary: verificationSummary,
         submitted_at: submission.submitted_at,
         settled_at: settledAt,
@@ -1718,5 +1818,270 @@ export class McpSubmissionAuthorityService {
       }
     }
     return failureCode;
+  }
+
+  private validateTestMetric(
+    val: unknown,
+    fieldName: string,
+    required: boolean
+  ): number | null {
+    if (val === null || val === undefined) {
+      if (required) {
+        throw new McpSubmissionStatusError(
+          'SUBMISSION_STATUS_INTEGRITY_CONFLICT',
+          `Required test run metric "${fieldName}" is missing`
+        );
+      }
+      return null;
+    }
+    if (typeof val !== 'number' || !Number.isSafeInteger(val) || val < 0) {
+      throw new McpSubmissionStatusError(
+        'SUBMISSION_STATUS_INTEGRITY_CONFLICT',
+        `Test run metric "${fieldName}" must be a non-negative safe integer (got ${val})`
+      );
+    }
+    return val;
+  }
+
+  private validateExitCode(
+    val: unknown,
+    required: boolean
+  ): number | null {
+    if (val === null || val === undefined) {
+      if (required) {
+        throw new McpSubmissionStatusError(
+          'SUBMISSION_STATUS_INTEGRITY_CONFLICT',
+          'Required test run metric "exit_code" is missing'
+        );
+      }
+      return null;
+    }
+    if (typeof val !== 'number' || !Number.isSafeInteger(val)) {
+      throw new McpSubmissionStatusError(
+        'SUBMISSION_STATUS_INTEGRITY_CONFLICT',
+        `Test run metric "exit_code" must be a safe integer (got ${val})`
+      );
+    }
+    return val;
+  }
+
+  private validateSubmissionEnvelope(
+    sub: CoderSubmission,
+    auth: ExecutionAuthorization,
+    project: Project,
+    task: Task
+  ): void {
+    if (sub.canonical_envelope_json) {
+      const computedHash = computeSha256(sub.canonical_envelope_json);
+      if (computedHash !== sub.canonical_envelope_hash) {
+        throw new McpSubmissionStatusError(
+          'SUBMISSION_STATUS_INTEGRITY_CONFLICT',
+          'Submission canonical envelope hash mismatch'
+        );
+      }
+
+      let parsed: unknown;
+      try {
+        parsed = JSON.parse(sub.canonical_envelope_json);
+      } catch {
+        throw new McpSubmissionStatusError(
+          'SUBMISSION_STATUS_INTEGRITY_CONFLICT',
+          'Submission canonical envelope JSON is malformed'
+        );
+      }
+
+      if (
+        typeof parsed !== 'object' ||
+        parsed === null ||
+        Array.isArray(parsed) ||
+        Object.getPrototypeOf(parsed) !== Object.prototype
+      ) {
+        throw new McpSubmissionStatusError(
+          'SUBMISSION_STATUS_INTEGRITY_CONFLICT',
+          'Submission canonical envelope must be a plain object'
+        );
+      }
+
+      const envObj = parsed as Record<string, unknown>;
+      let canonicalForm: string;
+      try {
+        canonicalForm = canonicalJsonStringify(envObj);
+      } catch {
+        throw new McpSubmissionStatusError(
+          'SUBMISSION_STATUS_INTEGRITY_CONFLICT',
+          'Submission canonical envelope cannot be canonically stringified'
+        );
+      }
+
+      if (canonicalForm !== sub.canonical_envelope_json) {
+        throw new McpSubmissionStatusError(
+          'SUBMISSION_STATUS_INTEGRITY_CONFLICT',
+          'Submission canonical envelope is not canonically formatted JSON'
+        );
+      }
+
+      if (
+        envObj.submission_id !== sub.id ||
+        envObj.authorization_id !== auth.id ||
+        envObj.project_id !== project.id ||
+        envObj.task_id !== task.id ||
+        (auth.attempt_id !== null && envObj.attempt_id !== auth.attempt_id) ||
+        (auth.assignment_id !== null && envObj.assignment_id !== auth.assignment_id) ||
+        envObj.authority_fingerprint !== sub.authority_fingerprint ||
+        envObj.task_ownership_epoch !== sub.task_ownership_epoch
+      ) {
+        throw new McpSubmissionStatusError(
+          'SUBMISSION_STATUS_INTEGRITY_CONFLICT',
+          'Submission canonical envelope contradictory to authorization graph'
+        );
+      }
+    }
+  }
+
+  private validateAuthoritySnapshot(
+    rawJson: string | null | undefined,
+    expectedHash: string | null | undefined,
+    sub: CoderSubmission,
+    auth: ExecutionAuthorization,
+    project: Project,
+    task: Task
+  ): void {
+    if (!rawJson) return;
+
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(rawJson);
+    } catch {
+      throw new McpSubmissionStatusError(
+        'SUBMISSION_STATUS_INTEGRITY_CONFLICT',
+        'Adjudication authority snapshot JSON is malformed'
+      );
+    }
+
+    if (
+      typeof parsed !== 'object' ||
+      parsed === null ||
+      Array.isArray(parsed) ||
+      Object.getPrototypeOf(parsed) !== Object.prototype
+    ) {
+      throw new McpSubmissionStatusError(
+        'SUBMISSION_STATUS_INTEGRITY_CONFLICT',
+        'Adjudication authority snapshot must be a strict plain object'
+      );
+    }
+
+    const snap = parsed as Record<string, unknown>;
+    const actualKeys = Object.keys(snap).sort();
+    const expectedKeys = [...AUTHORITY_SNAPSHOT_KEYS].sort();
+
+    if (
+      actualKeys.length !== expectedKeys.length ||
+      actualKeys.some((k, i) => k !== expectedKeys[i])
+    ) {
+      throw new McpSubmissionStatusError(
+        'SUBMISSION_STATUS_INTEGRITY_CONFLICT',
+        'Adjudication authority snapshot property set mismatch (missing or extra keys)'
+      );
+    }
+
+    let canonicalForm: string;
+    try {
+      canonicalForm = canonicalJsonStringify(snap);
+    } catch {
+      throw new McpSubmissionStatusError(
+        'SUBMISSION_STATUS_INTEGRITY_CONFLICT',
+        'Adjudication authority snapshot cannot be canonically stringified'
+      );
+    }
+
+    if (canonicalForm !== rawJson) {
+      throw new McpSubmissionStatusError(
+        'SUBMISSION_STATUS_INTEGRITY_CONFLICT',
+        'Adjudication authority snapshot is not canonically formatted JSON'
+      );
+    }
+
+    if (expectedHash) {
+      const computedHash = computeSha256(rawJson);
+      if (computedHash !== expectedHash) {
+        throw new McpSubmissionStatusError(
+          'SUBMISSION_STATUS_INTEGRITY_CONFLICT',
+          'Adjudication authority snapshot hash mismatch'
+        );
+      }
+    }
+
+    // Reconcile embedded authority/identity fields
+    if (
+      snap.submission_id !== sub.id ||
+      snap.authorization_id !== auth.id ||
+      snap.project_id !== project.id ||
+      snap.task_id !== task.id ||
+      snap.task_ownership_epoch !== sub.task_ownership_epoch ||
+      (sub.attempt_id !== null && snap.attempt_id !== sub.attempt_id) ||
+      (sub.assignment_id !== null && snap.assignment_id !== sub.assignment_id) ||
+      snap.canonical_envelope_hash !== sub.canonical_envelope_hash ||
+      snap.claim_content_hash !== sub.claim_content_hash
+    ) {
+      throw new McpSubmissionStatusError(
+        'SUBMISSION_STATUS_INTEGRITY_CONFLICT',
+        'Adjudication authority snapshot contradictory to bound submission/authorization graph'
+      );
+    }
+  }
+
+  private validateVerificationResultEnvelope(
+    rawJson: string | null | undefined,
+    expectedHash: string | null | undefined,
+    adj: CoderSubmissionAdjudication,
+    sub: CoderSubmission,
+    auth: ExecutionAuthorization,
+    project: Project,
+    task: Task
+  ): void {
+    if (!rawJson) return;
+
+    const res = validateAndParseCanonicalResultEnvelope(rawJson, expectedHash ?? undefined);
+    if (!res.valid || !res.envelope) {
+      throw new McpSubmissionStatusError(
+        'SUBMISSION_STATUS_INTEGRITY_CONFLICT',
+        res.error ?? 'Verification result envelope is invalid or hash mismatch'
+      );
+    }
+
+    const env = res.envelope;
+    if (
+      env.adjudication_id !== adj.id ||
+      env.authorization_id !== auth.id ||
+      env.project_id !== project.id ||
+      env.task_id !== task.id ||
+      (sub.attempt_id !== null && env.attempt_id !== sub.attempt_id) ||
+      (sub.assignment_id !== null && env.assignment_id !== sub.assignment_id)
+    ) {
+      throw new McpSubmissionStatusError(
+        'SUBMISSION_STATUS_INTEGRITY_CONFLICT',
+        'Verification result envelope contradictory to bound authority graph'
+      );
+    }
+  }
+
+  private validateFailureJson(rawJson: string | null | undefined): void {
+    if (!rawJson) return;
+    try {
+      const parsed = JSON.parse(rawJson);
+      if (
+        typeof parsed !== 'object' ||
+        parsed === null ||
+        Array.isArray(parsed) ||
+        Object.getPrototypeOf(parsed) !== Object.prototype
+      ) {
+        throw new Error('Not an object');
+      }
+    } catch {
+      throw new McpSubmissionStatusError(
+        'SUBMISSION_STATUS_INTEGRITY_CONFLICT',
+        'Adjudication failure_json is malformed'
+      );
+    }
   }
 }

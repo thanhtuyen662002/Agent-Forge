@@ -2,7 +2,7 @@ import fs from 'fs';
 import Database from 'better-sqlite3';
 import { McpServer, fromJsonSchema, ResourceTemplate } from '@modelcontextprotocol/server';
 import { Repository } from '../core/database/repositories';
-import { verifyMigration22SchemaAuthority } from '../core/database/migrations';
+import { verifyMigration22SchemaAuthority, verifyMigration23SchemaAuthority } from '../core/database/migrations';
 import {
   CODER_SUBMISSION_INPUT_JSON_SCHEMA,
   CODER_SUBMISSION_STATUS_INPUT_JSON_SCHEMA,
@@ -50,6 +50,8 @@ export class SubmissionMcpAuthorityContext {
       this.service = options.service;
     }
     if (options?.db) {
+      verifyMigration22SchemaAuthority(options.db);
+      verifyMigration23SchemaAuthority(options.db);
       this.db = options.db;
       this.repo = options?.repo ?? new Repository(this.db);
       if (!this.service) {
@@ -103,6 +105,7 @@ export class SubmissionMcpAuthorityContext {
 
     try {
       verifyMigration22SchemaAuthority(db);
+      verifyMigration23SchemaAuthority(db);
     } catch (err) {
       db.close();
       throw new Error(`[MCP_CONFIGURATION_INVALID] Database schema authority verification failed: ${(err as Error).message}`);

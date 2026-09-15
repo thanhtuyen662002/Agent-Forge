@@ -2,7 +2,7 @@ import fs from 'fs';
 import Database from 'better-sqlite3';
 import { serveStdio, StdioServerHandle } from '@modelcontextprotocol/server/stdio';
 import { Repository } from '../core/database/repositories';
-import { verifyMigration22SchemaAuthority } from '../core/database/migrations';
+import { verifyMigration22SchemaAuthority, verifyMigration23SchemaAuthority } from '../core/database/migrations';
 import { McpSubmissionAuthorityService } from '../core/services/McpSubmissionAuthorityService';
 import { buildAgentForgeSubmissionMcpServer } from './submissionServer';
 
@@ -115,6 +115,7 @@ export function runSubmissionStdioServer(): StdioServerHandle {
 
     try {
       verifyMigration22SchemaAuthority(db);
+      verifyMigration23SchemaAuthority(db);
     } catch {
       db.close();
       process.stderr.write('[agentforge-submit-fatal] Startup failure: Schema authority verification failed\n');

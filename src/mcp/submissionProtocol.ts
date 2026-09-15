@@ -1,5 +1,6 @@
 import crypto from 'crypto';
 import { z } from 'zod';
+import { TaskStateEnum } from '../core/types/domain';
 
 /**
  * Authoritative regex and domain constants for R5J4 Durable Coder Submission Authority.
@@ -840,7 +841,7 @@ export const SubmissionStatusSuccessZodSchema = z
     submission_id: z.string().regex(UUID_V4_REGEX),
     lifecycle_status: z.enum(SUBMISSION_LIFECYCLE_STATUSES),
     terminal_outcome: z.enum(SUBMISSION_TERMINAL_OUTCOMES).nullable(),
-    task_state: z.string().min(1).max(64),
+    task_state: TaskStateEnum,
     verification_summary: SubmissionVerificationSummaryZodSchema.nullable(),
     submitted_at: z.string().datetime({ offset: true }),
     settled_at: z.string().datetime({ offset: true }).nullable(),
@@ -893,6 +894,7 @@ export const CODER_SUBMISSION_STATUS_OUTPUT_JSON_SCHEMA = {
         },
         task_state: {
           type: 'string',
+          enum: [...TaskStateEnum.options],
         },
         verification_summary: {
           oneOf: [

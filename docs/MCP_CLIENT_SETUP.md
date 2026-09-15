@@ -339,7 +339,7 @@ A successful query returns a closed object with exactly 8 top-level fields:
   "submission_id": "00000000-0000-4000-8000-000000000001",
   "lifecycle_status": "VERIFIED",
   "terminal_outcome": "ACCEPTED_VERIFIED",
-  "task_state": "VERIFYING",
+  "task_state": "REVIEW_READY",
   "verification_summary": {
     "exit_code": 0,
     "passed_count": 5,
