@@ -300,3 +300,92 @@ node dist-electron/mcp/submissionAdmin.js revoke --db "C:\AgentForge\database\ag
 # Revoke by authorization ID
 node dist-electron/mcp/submissionAdmin.js revoke --db "C:\AgentForge\database\agent-forge.db" --auth "auth-12345"
 ```
+
+---
+
+## 10. Coder Submission Observability (`agentforge-submit`)
+
+R5J6 closes the external coder feedback loop by adding token-guarded, strictly read-only status observation to the `agentforge-submit` stdio MCP server. External coders can observe the durable lifecycle and sanitized verification feedback of a submission without triggering adjudication, verification, recovery, task transitions, or database mutations.
+
+### 1. Authorized Surfaces
+`agentforge-submit` advertises:
+- **Tools**:
+  - `agentforge_submit_coder_claim`: Ingest quarantined coder claims and reports.
+  - `agentforge_get_submission_status`: Query lifecycle status, terminal outcome, and sanitized verification feedback.
+- **Resource Templates**:
+  - `agentforge://submissions/{submission_id}`: Read-only canonical projection matching the status tool.
+- **Prompts**: Zero prompts are advertised.
+
+### 2. Exact Tool Input Domain
+The caller provides exclusively the client-generated submission UUID:
+```json
+{
+  "submission_id": "00000000-0000-4000-8000-000000000001"
+}
+```
+> [!SECURITY]
+> The caller **must not** supply `authorization_id`, `project_id`, `task_id`, `session_id`, `token`, database path, or repository path. Authority is derived strictly from the configured `af-sub-` token and durable database bindings.
+
+### 3. Resource Template Surface
+- **URI Template**: `agentforge://submissions/{submission_id}`
+- **MIME Type**: `application/json`
+- **Output Parity**: The resource template and tool share the exact same service method, authorization resolution, and canonical structured projection.
+
+### 4. Canonical Success Projection
+A successful query returns a closed object with exactly 8 top-level fields:
+```json
+{
+  "ok": true,
+  "submission_id": "00000000-0000-4000-8000-000000000001",
+  "lifecycle_status": "VERIFIED",
+  "terminal_outcome": "ACCEPTED_VERIFIED",
+  "task_state": "REVIEW_READY",
+  "verification_summary": {
+    "exit_code": 0,
+    "passed_count": 5,
+    "failed_count": 0,
+    "skipped_count": 0,
+    "duration_ms": 1240,
+    "failure_code": null,
+    "failure_message": null
+  },
+  "submitted_at": "2026-09-14T12:00:00.000Z",
+  "settled_at": "2026-09-14T12:01:30.000Z"
+}
+```
+
+#### Lifecycle Status Domain
+- `QUARANTINED`: Submission ingested, awaiting adjudication.
+- `ADMITTED`: Adjudicated for verification admission.
+- `VERIFYING`: Automated verification execution actively in progress under workspace lease.
+- `VERIFIED`: Verification passed with exit code 0 (`terminal_outcome: "ACCEPTED_VERIFIED"`).
+- `VERIFICATION_FAILED`: Verification executed and failed tests or verification commands (`terminal_outcome: "VERIFICATION_FAILED"`).
+- `RECOVERY_FENCED`: Verification process orphaned, timed out, or lease fenced (`terminal_outcome: "RECOVERY_FENCED"`).
+- `REJECTED`: Submission rejected by operator (`terminal_outcome: "REJECTED"`).
+- `SUPERSEDED`: Submission superseded by a newer claim (`terminal_outcome: "SUPERSEDED"`).
+
+#### Terminal Outcome Domain
+- `null`: Submission is not yet terminal (`QUARANTINED`, `ADMITTED`, or `VERIFYING`).
+- `ACCEPTED_VERIFIED`, `VERIFICATION_FAILED`, `RECOVERY_FENCED`, `REJECTED`, `SUPERSEDED`.
+
+### 5. Sanitized Verification Feedback Limitations
+To preserve security and prevent credential/path leakage across trust boundaries:
+- `verification_summary.failure_message` is bounded to at most 1024 characters.
+- All Windows drive paths, UNC paths, and POSIX absolute paths are replaced with `[REDACTED_PATH]`.
+- SQL statements and PRAGMA settings are replaced with `[REDACTED_SQL]`.
+- Tokens and secrets (`af-*`, `Bearer *`) are replaced with `[REDACTED_TOKEN]` / `[REDACTED_SECRET]`.
+- Hashes (40/64 hex characters) are replaced with `[REDACTED_HASH]`.
+- Stack traces are replaced with `[STACK_TRACE_REDACTED]`.
+- Raw stdout and raw stderr streams are never exposed over the MCP observation surface.
+
+### 6. Polling & Read-Only Guarantees
+- **No Background Mutations**: The status query executes pure `SELECT` operations. It will never open write transactions, advance sequence numbers, mutate leases, update timestamps, or append audit events.
+- **Zero Subprocesses**: Querying status spawns zero Git processes or child processes.
+- **Recommended Polling Interval**: External agents should poll status with exponential backoff or fixed intervals of 2 to 5 seconds until `terminal_outcome` becomes non-null.
+- **No Network Push**: In accordance with AgentForge security policy, no webhook, SSE, or network listener is authorized; observation is strictly via local stdio request/response.
+
+### 7. Token Rotation & Superseded Session Semantics
+- Status observation is **authorization-scoped**, not session-ID-scoped.
+- When an operator issues a replacement token for an authorization, the new token immediately authorizes status observation for all submissions previously created under that authorization.
+- Revoked or expired tokens immediately fail closed (`MCP_SESSION_REVOKED` or `MCP_SESSION_EXPIRED`) and cannot observe status.
+- Looking up a submission belonging to another authorization, project, or task returns indistinguishable `SUBMISSION_NOT_FOUND`.

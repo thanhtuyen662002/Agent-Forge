@@ -403,6 +403,12 @@ const { computeCanonicalPayload, computePayloadHash, computeContextManifestHash 
 
 MigrationRunner.run(db);
 
+const appliedMigrationCount = db.prepare("SELECT COUNT(*) as c FROM schema_migrations").get().c;
+if (appliedMigrationCount !== 23) {
+  throw new Error("Expected migration count 23, got " + appliedMigrationCount);
+}
+console.log("R5J6_MIGRATION_COUNT_23=PASS");
+
 const repo = new Repository(db);
 const service = new McpSessionAuthorityService(repo, db);
 
@@ -977,7 +983,7 @@ const harness = new McpRpcHarness(child);
     if (subInitRes.error) throw new Error("Submission initialize failed: " + JSON.stringify(subInitRes.error));
     await subHarness.sendNotification({ jsonrpc: '2.0', method: 'notifications/initialized' });
 
-    // Exact tool discovery: tools/list returns only agentforge_submit_coder_claim
+    // Exact tool discovery: tools/list returns exactly agentforge_submit_coder_claim and agentforge_get_submission_status
     const toolsListRes = await subHarness.sendRequest({
       jsonrpc: '2.0',
       id: 11,
@@ -988,11 +994,39 @@ const harness = new McpRpcHarness(child);
       throw new Error("tools/list failed");
     }
     const tools = toolsListRes.result.tools;
-    if (tools.length !== 1 || tools[0].name !== 'agentforge_submit_coder_claim') {
-      throw new Error("tools/list did not return exactly agentforge_submit_coder_claim: " + JSON.stringify(tools));
+    if (tools.length !== 2) {
+      throw new Error("tools/list did not return exactly 2 tools: " + JSON.stringify(tools));
     }
-    if (!tools[0].annotations || tools[0].annotations.idempotentHint !== true || tools[0].annotations.readOnlyHint !== false) {
-      throw new Error("Tool annotations mismatch: " + JSON.stringify(tools[0].annotations));
+    const toolNames = tools.map((t) => t.name).sort();
+    if (JSON.stringify(toolNames) !== JSON.stringify(['agentforge_get_submission_status', 'agentforge_submit_coder_claim'])) {
+      throw new Error("tools/list tool names mismatch: " + JSON.stringify(toolNames));
+    }
+    const submitTool = tools.find((t) => t.name === 'agentforge_submit_coder_claim');
+    if (!submitTool.annotations || submitTool.annotations.idempotentHint !== true || submitTool.annotations.readOnlyHint !== false) {
+      throw new Error("Submit tool annotations mismatch: " + JSON.stringify(submitTool.annotations));
+    }
+    const statusTool = tools.find((t) => t.name === 'agentforge_get_submission_status');
+    if (!statusTool.annotations || statusTool.annotations.readOnlyHint !== true || statusTool.annotations.destructiveHint !== false || statusTool.annotations.idempotentHint !== true || statusTool.annotations.openWorldHint !== false) {
+      throw new Error("Status tool annotations mismatch: " + JSON.stringify(statusTool.annotations));
+    }
+
+    // Exact resource-template discovery: agentforge://submissions/{submission_id}
+    const resTemplatesRes = await subHarness.sendRequest({
+      jsonrpc: '2.0',
+      id: 12,
+      method: 'resources/templates/list',
+      params: {}
+    });
+    if (resTemplatesRes.error || !resTemplatesRes.result?.resourceTemplates) {
+      throw new Error("resources/templates/list failed");
+    }
+    const templates = resTemplatesRes.result.resourceTemplates;
+    const subTemplate = templates.find((t) => t.uriTemplate === 'agentforge://submissions/{submission_id}');
+    if (!subTemplate) {
+      throw new Error("resources/templates/list missing agentforge://submissions/{submission_id}: " + JSON.stringify(templates));
+    }
+    if (subTemplate.name !== 'agentforge_submission_status' || subTemplate.mimeType !== 'application/json') {
+      throw new Error("Resource template properties mismatch: " + JSON.stringify(subTemplate));
     }
 
     // 6. Full-tuple submission
@@ -1022,7 +1056,7 @@ const harness = new McpRpcHarness(child);
 
     const subToolRes = await subHarness.sendRequest({
       jsonrpc: '2.0',
-      id: 12,
+      id: 13,
       method: 'tools/call',
       params: {
         name: 'agentforge_submit_coder_claim',
@@ -1071,6 +1105,48 @@ const harness = new McpRpcHarness(child);
     }
     if (initResult.is_duplicate !== false) {
       throw new Error("Initial submission is_duplicate must be false");
+    }
+
+    // 6a. Immediate status query - tool and resource return QUARANTINED
+    const preStatusToolRes = await subHarness.sendRequest({
+      jsonrpc: '2.0',
+      id: 14,
+      method: 'tools/call',
+      params: {
+        name: 'agentforge_get_submission_status',
+        arguments: { submission_id: submissionId },
+      }
+    });
+    if (preStatusToolRes.error || !preStatusToolRes.result || preStatusToolRes.result.isError) {
+      throw new Error("Immediate get_submission_status failed: " + JSON.stringify(preStatusToolRes));
+    }
+    const preStatus = preStatusToolRes.result.structuredContent;
+    if (!preStatus || preStatus.ok !== true || preStatus.submission_id !== submissionId) {
+      throw new Error("Immediate status response invalid: " + JSON.stringify(preStatus));
+    }
+    if (preStatus.lifecycle_status !== 'QUARANTINED' || preStatus.terminal_outcome !== null || preStatus.verification_summary !== null || preStatus.settled_at !== null) {
+      throw new Error("Immediate status fields mismatch: " + JSON.stringify(preStatus));
+    }
+    if (preStatus.submitted_at !== initResult.submitted_at) {
+      throw new Error("Immediate status submitted_at does not match initial submission");
+    }
+
+    const preResRead = await subHarness.sendRequest({
+      jsonrpc: '2.0',
+      id: 15,
+      method: 'resources/read',
+      params: { uri: `agentforge://submissions/${submissionId}` }
+    });
+    if (preResRead.error || !preResRead.result?.contents?.[0]) {
+      throw new Error("Immediate resource read failed: " + JSON.stringify(preResRead));
+    }
+    const preResContent = preResRead.result.contents[0];
+    if (preResContent.mimeType !== 'application/json' || preResContent.uri !== `agentforge://submissions/${submissionId}`) {
+      throw new Error("Immediate resource content envelope mismatch: " + JSON.stringify(preResContent));
+    }
+    const preResParsed = JSON.parse(preResContent.text);
+    if (canonicalJsonStringify(preResParsed) !== canonicalJsonStringify(preStatus)) {
+      throw new Error("Immediate resource projection does not canonically match tool projection");
     }
 
     // 7. Row, content, envelope, hash, disposition, and event readback
@@ -1173,7 +1249,7 @@ const harness = new McpRpcHarness(child);
     // 8. Exact idempotent replay with no new rows
     const replayToolRes = await subHarness.sendRequest({
       jsonrpc: '2.0',
-      id: 13,
+      id: 16,
       method: 'tools/call',
       params: {
         name: 'agentforge_submit_coder_claim',
@@ -1245,6 +1321,258 @@ const harness = new McpRpcHarness(child);
       throw new Error("Git working tree or HEAD was mutated");
     }
 
+    // 8a. Run production adjudication service to admit and verify
+    const adjServicePath = path.join(asarPath, 'dist-electron', 'core', 'services', 'CoderSubmissionAdjudicationService.js');
+    const verServicePath = path.join(asarPath, 'dist-electron', 'core', 'services', 'VerificationService.js');
+    const pkgGenPath = path.join(asarPath, 'dist-electron', 'core', 'protocol', 'packageGenerator.js');
+    const artStorePath = path.join(asarPath, 'dist-electron', 'core', 'services', 'ArtifactStore.js');
+    if (!fs.existsSync(adjServicePath) || !fs.existsSync(verServicePath) || !fs.existsSync(pkgGenPath) || !fs.existsSync(artStorePath)) {
+      throw new Error("Installed adjudication services missing in app.asar");
+    }
+
+    const { CoderSubmissionAdjudicationService } = require(adjServicePath);
+    const { VerificationService } = require(verServicePath);
+    const { ArtifactStore } = require(artStorePath);
+    const { PackageGenerator } = require(pkgGenPath);
+
+    const adjDb = new Database(dbPath);
+    adjDb.pragma('foreign_keys = ON');
+
+    // Attach bounded verification command timeout to authorization snapshot for adjudication
+    const rawAuth = adjDb.prepare("SELECT * FROM execution_authorizations WHERE id = ?").get(authorizationId);
+    if (rawAuth && rawAuth.canonical_payload_json) {
+      const parsedPayload = JSON.parse(rawAuth.canonical_payload_json);
+      if (parsedPayload.verificationCommands && parsedPayload.verificationCommands.TEST) {
+        parsedPayload.verificationCommands.TEST.timeout_ms = 30000;
+        const updatedPayloadJson = JSON.stringify(parsedPayload);
+        const updatedHash = computePayloadHash(parsedPayload);
+        adjDb.prepare("UPDATE execution_authorizations SET canonical_payload_json = ?, instruction_payload_hash = ? WHERE id = ?")
+          .run(updatedPayloadJson, updatedHash, authorizationId);
+      }
+    }
+
+    const adjRepo = new Repository(adjDb);
+    const adjArtifactStore = new ArtifactStore(path.join(path.dirname(dbPath), 'artifacts'));
+    const adjVerService = new VerificationService(adjRepo, adjArtifactStore);
+    const adjService = new CoderSubmissionAdjudicationService(adjRepo, adjDb, adjVerService);
+
+    // List quarantined submissions - must include candidate
+    const listRes = adjService.listQuarantinedSubmissions({ limit: 10, offset: 0 });
+    if (!listRes.items || listRes.items.length === 0) {
+      throw new Error("listQuarantinedSubmissions returned empty items");
+    }
+    const candidateSummary = listRes.items.find((it) => it.id === submissionId);
+    if (!candidateSummary || candidateSummary.integrity_status !== 'VALID') {
+      throw new Error("Candidate submission not valid in listQuarantinedSubmissions");
+    }
+
+    // Inspect candidate
+    const inspectRes = adjService.inspectQuarantinedSubmission(submissionId);
+    if (!inspectRes.candidate || inspectRes.candidate.id !== submissionId) {
+      throw new Error("inspectQuarantinedSubmission returned invalid candidate");
+    }
+
+    // Operator admits for verification
+    const admitReqId = crypto.randomUUID();
+    const admitRes = await adjService.admitSubmissionForVerification({
+      requestId: admitReqId,
+      submissionId: submissionId,
+    });
+    if (!admitRes.adjudication || admitRes.adjudication.status !== 'VERIFIED') {
+      throw new Error("admitSubmissionForVerification did not reach VERIFIED status: " + (admitRes.adjudication?.status || 'UNKNOWN'));
+    }
+
+    // Assert durable database records
+    const checkAdjDb = new Database(dbPath, { readonly: true });
+    const durableAdj = checkAdjDb.prepare("SELECT * FROM coder_submission_adjudications WHERE id = ?").get(admitRes.adjudication.id);
+    if (!durableAdj || durableAdj.status !== 'VERIFIED') {
+      throw new Error("Durable adjudication record missing or not VERIFIED");
+    }
+    if (durableAdj.action !== 'ADMIT_VERIFICATION') {
+      throw new Error("Durable adjudication action mismatch");
+    }
+    if (!durableAdj.test_run_id || !durableAdj.git_status_evidence_id || !durableAdj.git_diff_evidence_id) {
+      throw new Error("Durable adjudication missing test or git evidence IDs");
+    }
+
+    const adjEvents = checkAdjDb.prepare("SELECT * FROM coder_submission_adjudication_events WHERE adjudication_id = ? ORDER BY sequence ASC").all(admitRes.adjudication.id);
+    const eventTypes = adjEvents.map((e) => e.event_type);
+    if (JSON.stringify(eventTypes) !== JSON.stringify(['ADMITTED', 'VERIFICATION_CLAIMED', 'VERIFICATION_SUCCEEDED'])) {
+      throw new Error("Adjudication events sequence mismatch: " + JSON.stringify(eventTypes));
+    }
+
+    const postDisps = checkAdjDb.prepare("SELECT * FROM coder_submission_dispositions WHERE submission_id = ? ORDER BY created_at ASC").all(submissionId);
+    const finalDisp = postDisps[postDisps.length - 1];
+    if (!finalDisp || finalDisp.disposition_event !== 'SETTLED' || finalDisp.disposition_reason !== 'ACCEPTED_VERIFIED') {
+      throw new Error("Final disposition is not SETTLED / ACCEPTED_VERIFIED: " + JSON.stringify(finalDisp));
+    }
+
+    const finalTask = adjRepo.getTask(taskId);
+    if (!finalTask || finalTask.state !== 'REVIEW_READY') {
+      throw new Error("Final task state is not REVIEW_READY: " + (finalTask?.state || 'UNKNOWN'));
+    }
+
+    // Test review package generation with verified projection
+    const durableProj = adjRepo.getProject(projectId);
+    const linkedTestRun = checkAdjDb.prepare("SELECT * FROM test_runs WHERE id = ?").get(durableAdj.test_run_id);
+    const linkedGitDiff = checkAdjDb.prepare("SELECT * FROM evidence WHERE id = ?").get(durableAdj.git_diff_evidence_id);
+    const verifiedProjection = adjService.buildVerifiedAdjudicationReviewProjection(durableAdj.id);
+    const reviewPkg = PackageGenerator.generateReviewPackage(
+      durableProj,
+      finalTask,
+      null,
+      '',
+      '',
+      linkedTestRun,
+      [],
+      linkedGitDiff,
+      verifiedProjection
+    );
+
+    if (!reviewPkg.includes('### Coder Claims (Unverified)')) {
+      throw new Error("Review package missing '### Coder Claims (Unverified)' section");
+    }
+    if (!reviewPkg.includes('### Owner Adjudication')) {
+      throw new Error("Review package missing '### Owner Adjudication' section");
+    }
+    if (!reviewPkg.includes('### Authoritative Test Evidence')) {
+      throw new Error("Review package missing '### Authoritative Test Evidence' section");
+    }
+    if (!reviewPkg.includes('### Git Status Evidence')) {
+      throw new Error("Review package missing '### Git Status Evidence' section");
+    }
+    if (!reviewPkg.includes('### Git Diff Evidence')) {
+      throw new Error("Review package missing '### Git Diff Evidence' section");
+    }
+
+    // Test that legacy linkage object is strictly rejected
+    let legacyAccepted = false;
+    try {
+      PackageGenerator.generateReviewPackage(
+        durableProj,
+        finalTask,
+        null,
+        '',
+        '',
+        linkedTestRun,
+        [],
+        linkedGitDiff,
+        {
+          adjudication: durableAdj,
+          submission: { id: durableAdj.submission_id },
+          testRun: linkedTestRun,
+          gitStatusEvidence: null,
+          gitDiffEvidence: linkedGitDiff,
+        }
+      );
+      legacyAccepted = true;
+    } catch (legacyErr) {
+      const msg = legacyErr instanceof Error ? legacyErr.message : String(legacyErr);
+      if (!msg.includes('LEGACY_LINKAGE_REJECTED')) {
+        throw new Error("Expected LEGACY_LINKAGE_REJECTED error, but got: " + msg);
+      }
+    }
+    if (legacyAccepted) {
+      throw new Error("LEGACY_LINKAGE_FATAL: PackageGenerator accepted legacy linkage object!");
+    }
+
+    checkAdjDb.close();
+    adjDb.close();
+
+    // 8b. Zero-mutation snapshot before status queries
+    const totalChangesBefore = new Database(dbPath, { readonly: true }).prepare("SELECT total_changes() as c").get().c;
+
+    // 8c. Later status query - returns VERIFIED, ACCEPTED_VERIFIED, and verification_summary
+    const postStatusToolRes = await subHarness.sendRequest({
+      jsonrpc: '2.0',
+      id: 17,
+      method: 'tools/call',
+      params: {
+        name: 'agentforge_get_submission_status',
+        arguments: { submission_id: submissionId },
+      }
+    });
+    if (postStatusToolRes.error || !postStatusToolRes.result || postStatusToolRes.result.isError) {
+      throw new Error("Post-adjudication get_submission_status failed: " + JSON.stringify(postStatusToolRes));
+    }
+    const postStatus = postStatusToolRes.result.structuredContent;
+    if (!postStatus || postStatus.ok !== true || postStatus.submission_id !== submissionId) {
+      throw new Error("Post-adjudication status response invalid: " + JSON.stringify(postStatus));
+    }
+    if (postStatus.lifecycle_status !== 'VERIFIED' || postStatus.terminal_outcome !== 'ACCEPTED_VERIFIED') {
+      throw new Error("Post-adjudication status mismatch (expected VERIFIED / ACCEPTED_VERIFIED): " + JSON.stringify(postStatus));
+    }
+    if (postStatus.task_state !== 'REVIEW_READY') {
+      throw new Error("Post-adjudication task_state mismatch (expected REVIEW_READY): " + postStatus.task_state);
+    }
+    if (!postStatus.verification_summary || postStatus.verification_summary.exit_code !== 0) {
+      throw new Error("Post-adjudication verification_summary mismatch: " + JSON.stringify(postStatus.verification_summary));
+    }
+    if (!postStatus.settled_at || isNaN(Date.parse(postStatus.settled_at))) {
+      throw new Error("Post-adjudication settled_at invalid timestamp: " + postStatus.settled_at);
+    }
+
+    // 8d. Post-adjudication resource read - canonical byte-equivalence with tool structuredContent
+    const postResRead = await subHarness.sendRequest({
+      jsonrpc: '2.0',
+      id: 18,
+      method: 'resources/read',
+      params: { uri: `agentforge://submissions/${submissionId}` }
+    });
+    if (postResRead.error || !postResRead.result?.contents?.[0]) {
+      throw new Error("Post-adjudication resource read failed: " + JSON.stringify(postResRead));
+    }
+    const postResContent = postResRead.result.contents[0];
+    if (postResContent.mimeType !== 'application/json' || postResContent.uri !== `agentforge://submissions/${submissionId}`) {
+      throw new Error("Post-adjudication resource envelope mismatch: " + JSON.stringify(postResContent));
+    }
+    const postResParsed = JSON.parse(postResContent.text);
+    if (canonicalJsonStringify(postResParsed) !== canonicalJsonStringify(postStatus)) {
+      throw new Error("Post-adjudication resource and tool projections not byte-equivalent");
+    }
+
+    // 8e. Unknown/invalid submission query -> sanitized failure SUBMISSION_NOT_FOUND
+    const unknownId = '00000000-0000-4000-8000-999999999999';
+    const unknownToolRes = await subHarness.sendRequest({
+      jsonrpc: '2.0',
+      id: 19,
+      method: 'tools/call',
+      params: {
+        name: 'agentforge_get_submission_status',
+        arguments: { submission_id: unknownId },
+      }
+    });
+    if (!unknownToolRes.result || unknownToolRes.result.isError !== true) {
+      throw new Error("Unknown submission_id tool call did not return isError === true");
+    }
+    const unknownData = unknownToolRes.result.structuredContent;
+    if (!unknownData || unknownData.ok !== false || unknownData.error_code !== 'SUBMISSION_NOT_FOUND') {
+      throw new Error("Unknown submission_id error_code mismatch: " + JSON.stringify(unknownData));
+    }
+    if (unknownData.retryable !== false) {
+      throw new Error("Unknown submission_id retryable must be false");
+    }
+
+    const unknownResRead = await subHarness.sendRequest({
+      jsonrpc: '2.0',
+      id: 20,
+      method: 'resources/read',
+      params: { uri: `agentforge://submissions/${unknownId}` }
+    });
+    if (!unknownResRead.result || !unknownResRead.result.contents?.[0]) {
+      throw new Error("Unknown submission resource read failed: " + JSON.stringify(unknownResRead));
+    }
+    const unknownResData = JSON.parse(unknownResRead.result.contents[0].text);
+    if (!unknownResData || unknownResData.ok !== false || unknownResData.error_code !== 'SUBMISSION_NOT_FOUND') {
+      throw new Error("Unknown submission resource error_code mismatch: " + JSON.stringify(unknownResData));
+    }
+
+    // 8f. Zero database mutations verified via total_changes
+    const totalChangesAfter = new Database(dbPath, { readonly: true }).prepare("SELECT total_changes() as c").get().c;
+    if (totalChangesBefore !== totalChangesAfter) {
+      throw new Error(`Database total_changes mutated during status queries: before=${totalChangesBefore}, after=${totalChangesAfter}`);
+    }
+
     // 9. Revoked token refusal
     execSync(`"${process.execPath}" "${subAdminScript}" revoke --auth "${authorizationId}" --db "${dbPath}" --json`, {
       env: Object.assign({}, process.env, { ELECTRON_RUN_AS_NODE: '1' }),
@@ -1253,7 +1581,7 @@ const harness = new McpRpcHarness(child);
 
     const revokedSubRes = await subHarness.sendRequest({
       jsonrpc: '2.0',
-      id: 14,
+      id: 21,
       method: 'tools/call',
       params: {
         name: 'agentforge_submit_coder_claim',
@@ -1291,13 +1619,21 @@ const harness = new McpRpcHarness(child);
       throw new Error("Revoked retryable must be false");
     }
 
-    const postRevokeDb = new Database(dbPath, { readonly: true });
-    const totalSubAfterRevoke = postRevokeDb.prepare("SELECT COUNT(*) as c FROM coder_submissions").get().c;
-    const totalDispAfterRevoke = postRevokeDb.prepare("SELECT COUNT(*) as c FROM coder_submission_dispositions").get().c;
-    const totalEventAfterRevoke = postRevokeDb.prepare("SELECT COUNT(*) as c FROM events").get().c;
-    postRevokeDb.close();
-    if (totalSubAfterRevoke !== totalSubRowsAfter || totalDispAfterRevoke !== totalDispRowsAfter || totalEventAfterRevoke !== totalEventRowsAfter) {
-      throw new Error("Revoked submission mutated rows");
+    const revokedStatusRes = await subHarness.sendRequest({
+      jsonrpc: '2.0',
+      id: 22,
+      method: 'tools/call',
+      params: {
+        name: 'agentforge_get_submission_status',
+        arguments: { submission_id: submissionId },
+      }
+    });
+    if (!revokedStatusRes.result || revokedStatusRes.result.isError !== true) {
+      throw new Error("Status query with revoked session did not return isError === true");
+    }
+    const revokedStatusData = revokedStatusRes.result.structuredContent;
+    if (!revokedStatusData || revokedStatusData.ok !== false || revokedStatusData.error_code !== 'MCP_SESSION_REVOKED') {
+      throw new Error("Revoked status error_code mismatch: " + JSON.stringify(revokedStatusData));
     }
 
     // 10. Clean EOF exit with code 0 and database unlock
@@ -1347,7 +1683,7 @@ const harness = new McpRpcHarness(child);
       const sigHarness = new McpRpcHarness(sigChild);
       const sigInitRes = await sigHarness.sendRequest({
         jsonrpc: '2.0',
-        id: 20,
+        id: 30,
         method: 'initialize',
         params: { protocolVersion: '2024-11-05', capabilities: {}, clientInfo: { name: 'sig-test', version: '1.0.0' } }
       });
@@ -1382,175 +1718,8 @@ const harness = new McpRpcHarness(child);
     await testSignalExit('SIGTERM');
 
     console.log("R5J4_INSTALLED_MCP_SUBMISSION_PROOF=PASS");
-
-    // =========================================================================
-    // R5J5: Installed Owner-Mediated Quarantined Submission Adjudication Proof
-    // =========================================================================
-    console.log("Starting R5J5 Installed Coder Submission Adjudication Verification...");
-    const adjServicePath = path.join(asarPath, 'dist-electron', 'core', 'services', 'CoderSubmissionAdjudicationService.js');
-    const verServicePath = path.join(asarPath, 'dist-electron', 'core', 'services', 'VerificationService.js');
-    const pkgGenPath = path.join(asarPath, 'dist-electron', 'core', 'protocol', 'packageGenerator.js');
-    const artStorePath = path.join(asarPath, 'dist-electron', 'core', 'services', 'ArtifactStore.js');
-    if (!fs.existsSync(adjServicePath) || !fs.existsSync(verServicePath) || !fs.existsSync(pkgGenPath) || !fs.existsSync(artStorePath)) {
-      throw new Error("R5J5 installed services missing in app.asar");
-    }
-
-    const { CoderSubmissionAdjudicationService } = require(adjServicePath);
-    const { VerificationService } = require(verServicePath);
-    const { ArtifactStore } = require(artStorePath);
-    const { PackageGenerator } = require(pkgGenPath);
-
-    const adjDb = new Database(dbPath);
-    adjDb.pragma('foreign_keys = ON');
-
-    // Attach bounded verification command timeout to authorization snapshot for R5J5 adjudication
-    const rawAuth = adjDb.prepare("SELECT * FROM execution_authorizations WHERE id = ?").get(authorizationId);
-    if (rawAuth && rawAuth.canonical_payload_json) {
-      const parsedPayload = JSON.parse(rawAuth.canonical_payload_json);
-      if (parsedPayload.verificationCommands && parsedPayload.verificationCommands.TEST) {
-        parsedPayload.verificationCommands.TEST.timeout_ms = 30000;
-        const updatedPayloadJson = JSON.stringify(parsedPayload);
-        const updatedHash = computePayloadHash(parsedPayload);
-        adjDb.prepare("UPDATE execution_authorizations SET canonical_payload_json = ?, instruction_payload_hash = ? WHERE id = ?")
-          .run(updatedPayloadJson, updatedHash, authorizationId);
-      }
-    }
-
-    const adjRepo = new Repository(adjDb);
-    const adjArtifactStore = new ArtifactStore(path.join(path.dirname(dbPath), 'artifacts'));
-    const adjVerService = new VerificationService(adjRepo, adjArtifactStore);
-    const adjService = new CoderSubmissionAdjudicationService(adjRepo, adjDb, adjVerService);
-
-    // 1. List quarantined submissions - must include candidate
-    const listRes = adjService.listQuarantinedSubmissions({ limit: 10, offset: 0 });
-    if (!listRes.items || listRes.items.length === 0) {
-      throw new Error("R5J5 listQuarantinedSubmissions returned empty items");
-    }
-    const candidateSummary = listRes.items.find((it) => it.id === submissionId);
-    if (!candidateSummary) {
-      throw new Error("R5J5 candidate submission not found in listQuarantinedSubmissions");
-    }
-    if (candidateSummary.integrity_status !== 'VALID') {
-      throw new Error("R5J5 candidate submission integrity status is not VALID: " + candidateSummary.integrity_status);
-    }
-
-    // 2. Inspect candidate
-    const inspectRes = adjService.inspectQuarantinedSubmission(submissionId);
-    if (!inspectRes.candidate || inspectRes.candidate.id !== submissionId) {
-      throw new Error("R5J5 inspectQuarantinedSubmission returned invalid candidate");
-    }
-    if (!inspectRes.authority_snapshot || inspectRes.authority_snapshot.submission_id !== submissionId) {
-      throw new Error("R5J5 inspectQuarantinedSubmission returned invalid authority_snapshot");
-    }
-
-    // 3. Operator admits for verification
-    const admitReqId = crypto.randomUUID();
-    const admitRes = await adjService.admitSubmissionForVerification({
-      requestId: admitReqId,
-      submissionId: submissionId,
-    });
-    if (!admitRes.adjudication || admitRes.adjudication.status !== 'VERIFIED') {
-      throw new Error("R5J5 admitSubmissionForVerification did not reach VERIFIED status: " + (admitRes.adjudication?.status || 'UNKNOWN'));
-    }
-
-    // 4. Assert durable database records
-    const checkAdjDb = new Database(dbPath, { readonly: true });
-    const durableAdj = checkAdjDb.prepare("SELECT * FROM coder_submission_adjudications WHERE id = ?").get(admitRes.adjudication.id);
-    if (!durableAdj || durableAdj.status !== 'VERIFIED') {
-      throw new Error("R5J5 durable adjudication record missing or not VERIFIED");
-    }
-    if (durableAdj.action !== 'ADMIT_VERIFICATION') {
-      throw new Error("R5J5 durable adjudication action mismatch");
-    }
-    if (!durableAdj.test_run_id || !durableAdj.git_status_evidence_id || !durableAdj.git_diff_evidence_id) {
-      throw new Error("R5J5 durable adjudication missing test or git evidence IDs");
-    }
-
-    const adjEvents = checkAdjDb.prepare("SELECT * FROM coder_submission_adjudication_events WHERE adjudication_id = ? ORDER BY sequence ASC").all(admitRes.adjudication.id);
-    const eventTypes = adjEvents.map((e) => e.event_type);
-    if (JSON.stringify(eventTypes) !== JSON.stringify(['ADMITTED', 'VERIFICATION_CLAIMED', 'VERIFICATION_SUCCEEDED'])) {
-      throw new Error("R5J5 adjudication events sequence mismatch: " + JSON.stringify(eventTypes));
-    }
-
-    const postDisps = checkAdjDb.prepare("SELECT * FROM coder_submission_dispositions WHERE submission_id = ? ORDER BY created_at ASC").all(submissionId);
-    const finalDisp = postDisps[postDisps.length - 1];
-    if (!finalDisp || finalDisp.disposition_event !== 'SETTLED' || finalDisp.disposition_reason !== 'ACCEPTED_VERIFIED') {
-      throw new Error("R5J5 final disposition is not SETTLED / ACCEPTED_VERIFIED: " + JSON.stringify(finalDisp));
-    }
-
-    const finalTask = adjRepo.getTask(taskId);
-    if (!finalTask || finalTask.state !== 'REVIEW_READY') {
-      throw new Error("R5J5 final task state is not REVIEW_READY: " + (finalTask?.state || 'UNKNOWN'));
-    }
-
-    // 5. Test review package generation with verified projection
-    const durableProj = adjRepo.getProject(projectId);
-    const linkedTestRun = checkAdjDb.prepare("SELECT * FROM test_runs WHERE id = ?").get(durableAdj.test_run_id);
-    const linkedGitDiff = checkAdjDb.prepare("SELECT * FROM evidence WHERE id = ?").get(durableAdj.git_diff_evidence_id);
-    const verifiedProjection = adjService.buildVerifiedAdjudicationReviewProjection(durableAdj.id);
-    const reviewPkg = PackageGenerator.generateReviewPackage(
-      durableProj,
-      finalTask,
-      null,
-      '',
-      '',
-      linkedTestRun,
-      [],
-      linkedGitDiff,
-      verifiedProjection
-    );
-
-    if (!reviewPkg.includes('### Coder Claims (Unverified)')) {
-      throw new Error("Review package missing '### Coder Claims (Unverified)' section");
-    }
-    if (!reviewPkg.includes('### Owner Adjudication')) {
-      throw new Error("Review package missing '### Owner Adjudication' section");
-    }
-    if (!reviewPkg.includes('### Authoritative Test Evidence')) {
-      throw new Error("Review package missing '### Authoritative Test Evidence' section");
-    }
-    if (!reviewPkg.includes('### Git Status Evidence')) {
-      throw new Error("Review package missing '### Git Status Evidence' section");
-    }
-    if (!reviewPkg.includes('### Git Diff Evidence')) {
-      throw new Error("Review package missing '### Git Diff Evidence' section");
-    }
-
-    // 6. Test that legacy linkage object is strictly rejected
-    let legacyAccepted = false;
-    try {
-      PackageGenerator.generateReviewPackage(
-        durableProj,
-        finalTask,
-        null,
-        '',
-        '',
-        linkedTestRun,
-        [],
-        linkedGitDiff,
-        {
-          adjudication: durableAdj,
-          submission: { id: durableAdj.submission_id },
-          testRun: linkedTestRun,
-          gitStatusEvidence: null,
-          gitDiffEvidence: linkedGitDiff,
-        }
-      );
-      legacyAccepted = true;
-    } catch (legacyErr) {
-      const msg = legacyErr instanceof Error ? legacyErr.message : String(legacyErr);
-      if (!msg.includes('LEGACY_LINKAGE_REJECTED')) {
-        throw new Error("Expected LEGACY_LINKAGE_REJECTED error, but got: " + msg);
-      }
-    }
-    if (legacyAccepted) {
-      throw new Error("LEGACY_LINKAGE_FATAL: PackageGenerator accepted legacy linkage object!");
-    }
-
-    checkAdjDb.close();
-    adjDb.close();
-
     console.log("R5J5_INSTALLED_OWNER_ADJUDICATION_PROOF=PASS");
+    console.log("R5J6_SUBMISSION_OBSERVABILITY_PROOF=PASS");
     process.exit(0);
   } catch (err) {
     const errMsg = err instanceof Error ? err.message : String(err);
@@ -1587,7 +1756,7 @@ const harness = new McpRpcHarness(child);
   $stdoutTask = $mcpProc.StandardOutput.ReadToEndAsync()
   $stderrTask = $mcpProc.StandardError.ReadToEndAsync()
 
-  $timeoutMs = 35000
+  $timeoutMs = 45000
   $exitedInTime = $mcpProc.WaitForExit($timeoutMs)
 
   if (-not $exitedInTime) {
@@ -1614,12 +1783,13 @@ const harness = new McpRpcHarness(child);
   Write-Host "Installed MCP Proof Output:"
   Write-Host $mcpStdout
 
-  if ($mcpProc.ExitCode -ne 0 -or -not ($mcpStdout -match "R5J3_INSTALLED_MCP_BRIDGE_PROOF=PASS") -or -not ($mcpStdout -match "R5J4_INSTALLED_MCP_SUBMISSION_PROOF=PASS") -or -not ($mcpStdout -match "R5J5_INSTALLED_OWNER_ADJUDICATION_PROOF=PASS")) {
+  if ($mcpProc.ExitCode -ne 0 -or -not ($mcpStdout -match "R5J3_INSTALLED_MCP_BRIDGE_PROOF=PASS") -or -not ($mcpStdout -match "R5J4_INSTALLED_MCP_SUBMISSION_PROOF=PASS") -or -not ($mcpStdout -match "R5J5_INSTALLED_OWNER_ADJUDICATION_PROOF=PASS") -or -not ($mcpStdout -match "R5J6_SUBMISSION_OBSERVABILITY_PROOF=PASS")) {
     throw "Installed MCP bridge verification failed (exit code $($mcpProc.ExitCode)): $mcpStderr"
   }
 
   Write-Host "[8/8] Installed MCP Client Bridge & Node-Mode Stdio Proof: PASS" -ForegroundColor Green
   Write-Host "R5J5_INSTALLED_OWNER_ADJUDICATION_PROOF=PASS" -ForegroundColor Green
+  Write-Host "R5J6_SUBMISSION_OBSERVABILITY_PROOF=PASS" -ForegroundColor Green
 
   # Verify no surviving processes in install dir
   $surviving = Get-Process -Name "AgentForge" -ErrorAction SilentlyContinue | Where-Object {

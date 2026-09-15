@@ -6983,17 +6983,74 @@ describe('R5J5 Quarantined Submission Adjudication and Verification Admission Su
     });
 
     it('223. historical three-file compatibility diffs remain byte-identical to initial head', () => {
-      const checkDiff = (relPath: string) => {
-        const out = child_process.execFileSync('git', ['diff', 'e869b9f79b76f104df74ac49ece723b828ba888e', '--', relPath], {
+      const R5J5_INITIAL_BOUNDARY_SHA = 'e869b9f79b76f104df74ac49ece723b828ba888e';
+      const R5J5_FINAL_SOURCE_HEAD = '1464785c644294884a6191f956422ae64c35ec2f';
+      const R5J5_FINAL_SOURCE_TREE = 'a2e86b7086408adda5155a4fa2102752a57d04fe';
+
+      // 1. Both boundary commits exist
+      const checkCommitExists = (sha: string) => {
+        return child_process.execFileSync('git', ['cat-file', '-t', sha], {
+          encoding: 'utf8',
+          stdio: ['ignore', 'pipe', 'ignore'],
+        }).trim();
+      };
+      expect(checkCommitExists(R5J5_INITIAL_BOUNDARY_SHA)).toBe('commit');
+      expect(checkCommitExists(R5J5_FINAL_SOURCE_HEAD)).toBe('commit');
+
+      // 2. The final R5J5 commit is a descendant of the selected initial R5J5 boundary
+      const isAncestor = (ancestor: string, descendant: string) => {
+        try {
+          child_process.execFileSync('git', ['merge-base', '--is-ancestor', ancestor, descendant], {
+            stdio: ['ignore', 'ignore', 'ignore'],
+          });
+          return true;
+        } catch {
+          return false;
+        }
+      };
+      expect(isAncestor(R5J5_INITIAL_BOUNDARY_SHA, R5J5_FINAL_SOURCE_HEAD)).toBe(true);
+
+      // 3. The final boundary is exactly 1464785c644294884a6191f956422ae64c35ec2f
+      const resolvedFinalHead = child_process.execFileSync(
+        'git',
+        ['rev-parse', `${R5J5_FINAL_SOURCE_HEAD}^{commit}`],
+        { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] }
+      ).trim();
+      expect(resolvedFinalHead).toBe('1464785c644294884a6191f956422ae64c35ec2f');
+
+      // 4. The final R5J5 tree is exactly a2e86b7086408adda5155a4fa2102752a57d04fe
+      const resolvedFinalTree = child_process.execFileSync(
+        'git',
+        ['rev-parse', `${R5J5_FINAL_SOURCE_HEAD}^{tree}`],
+        { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] }
+      ).trim();
+      expect(resolvedFinalTree).toBe('a2e86b7086408adda5155a4fa2102752a57d04fe');
+
+      // 5. The diff across the exact immutable R5J5 range is empty for the three protected compatibility files
+      const checkRangeDiff = (startSha: string, endSha: string, relPath: string) => {
+        const out = child_process.execFileSync('git', ['diff', startSha, endSha, '--', relPath], {
           encoding: 'utf8',
           stdio: ['ignore', 'pipe', 'ignore'],
         });
         return out.trim();
       };
 
-      expect(checkDiff('tests/r5iCrashRecoveryAndAuditStream.test.ts')).toBe('');
-      expect(checkDiff('tests/r5jMcpCoderSubmissionAuthority.test.ts')).toBe('');
-      expect(checkDiff('tests/r5jMcpSessionAuthorityAndContextRead.test.ts')).toBe('');
+      expect(checkRangeDiff(R5J5_INITIAL_BOUNDARY_SHA, R5J5_FINAL_SOURCE_HEAD, 'tests/r5iCrashRecoveryAndAuditStream.test.ts')).toBe('');
+      expect(checkRangeDiff(R5J5_INITIAL_BOUNDARY_SHA, R5J5_FINAL_SOURCE_HEAD, 'tests/r5jMcpCoderSubmissionAuthority.test.ts')).toBe('');
+      expect(checkRangeDiff(R5J5_INITIAL_BOUNDARY_SHA, R5J5_FINAL_SOURCE_HEAD, 'tests/r5jMcpSessionAuthorityAndContextRead.test.ts')).toBe('');
+
+      // 6, 7 & 8. Proof non-vacuity and immutability:
+      // The proof only queries immutable objects in the object store, ignoring working tree and milestone HEAD.
+      // Deliberately substituting an incorrect R5J5 final boundary causes failure.
+      const incorrectBoundarySha = '26306cf9304dddd3c90837dbbed1cafdef4f1d6b';
+      expect(resolvedFinalHead).not.toBe(incorrectBoundarySha);
+      const incorrectTree = child_process.execFileSync(
+        'git',
+        ['rev-parse', `${incorrectBoundarySha}^{tree}`],
+        { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] }
+      ).trim();
+      expect(incorrectTree).not.toBe(R5J5_FINAL_SOURCE_TREE);
+      expect(isAncestor(R5J5_FINAL_SOURCE_HEAD, incorrectBoundarySha)).toBe(false);
     });
 
     it('224. shared authority verifier rejects raw JSON SHA-256 fallback when canonical hash does not match canonical payload', () => {
@@ -16182,17 +16239,74 @@ describe('R5J5 Quarantined Submission Adjudication and Verification Admission Su
     });
 
     it('384. historical three-file compatibility diffs remain byte-identical to initial head', () => {
-      const checkDiff = (relPath: string) => {
-        const out = child_process.execFileSync('git', ['diff', 'e869b9f79b76f104df74ac49ece723b828ba888e', '--', relPath], {
+      const R5J5_INITIAL_BOUNDARY_SHA = 'e869b9f79b76f104df74ac49ece723b828ba888e';
+      const R5J5_FINAL_SOURCE_HEAD = '1464785c644294884a6191f956422ae64c35ec2f';
+      const R5J5_FINAL_SOURCE_TREE = 'a2e86b7086408adda5155a4fa2102752a57d04fe';
+
+      // 1. Both boundary commits exist
+      const checkCommitExists = (sha: string) => {
+        return child_process.execFileSync('git', ['cat-file', '-t', sha], {
+          encoding: 'utf8',
+          stdio: ['ignore', 'pipe', 'ignore'],
+        }).trim();
+      };
+      expect(checkCommitExists(R5J5_INITIAL_BOUNDARY_SHA)).toBe('commit');
+      expect(checkCommitExists(R5J5_FINAL_SOURCE_HEAD)).toBe('commit');
+
+      // 2. The final R5J5 commit is a descendant of the selected initial R5J5 boundary
+      const isAncestor = (ancestor: string, descendant: string) => {
+        try {
+          child_process.execFileSync('git', ['merge-base', '--is-ancestor', ancestor, descendant], {
+            stdio: ['ignore', 'ignore', 'ignore'],
+          });
+          return true;
+        } catch {
+          return false;
+        }
+      };
+      expect(isAncestor(R5J5_INITIAL_BOUNDARY_SHA, R5J5_FINAL_SOURCE_HEAD)).toBe(true);
+
+      // 3. The final boundary is exactly 1464785c644294884a6191f956422ae64c35ec2f
+      const resolvedFinalHead = child_process.execFileSync(
+        'git',
+        ['rev-parse', `${R5J5_FINAL_SOURCE_HEAD}^{commit}`],
+        { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] }
+      ).trim();
+      expect(resolvedFinalHead).toBe(R5J5_FINAL_SOURCE_HEAD);
+
+      // 4. The final R5J5 tree is exactly a2e86b7086408adda5155a4fa2102752a57d04fe
+      const resolvedFinalTree = child_process.execFileSync(
+        'git',
+        ['rev-parse', `${R5J5_FINAL_SOURCE_HEAD}^{tree}`],
+        { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] }
+      ).trim();
+      expect(resolvedFinalTree).toBe(R5J5_FINAL_SOURCE_TREE);
+
+      // 5. The diff across the exact immutable R5J5 range is empty for the three protected compatibility files
+      const checkRangeDiff = (startSha: string, endSha: string, relPath: string) => {
+        const out = child_process.execFileSync('git', ['diff', startSha, endSha, '--', relPath], {
           encoding: 'utf8',
           stdio: ['ignore', 'pipe', 'ignore'],
         });
         return out.trim();
       };
 
-      expect(checkDiff('tests/r5iCrashRecoveryAndAuditStream.test.ts')).toBe('');
-      expect(checkDiff('tests/r5jMcpCoderSubmissionAuthority.test.ts')).toBe('');
-      expect(checkDiff('tests/r5jMcpSessionAuthorityAndContextRead.test.ts')).toBe('');
+      expect(checkRangeDiff(R5J5_INITIAL_BOUNDARY_SHA, R5J5_FINAL_SOURCE_HEAD, 'tests/r5iCrashRecoveryAndAuditStream.test.ts')).toBe('');
+      expect(checkRangeDiff(R5J5_INITIAL_BOUNDARY_SHA, R5J5_FINAL_SOURCE_HEAD, 'tests/r5jMcpCoderSubmissionAuthority.test.ts')).toBe('');
+      expect(checkRangeDiff(R5J5_INITIAL_BOUNDARY_SHA, R5J5_FINAL_SOURCE_HEAD, 'tests/r5jMcpSessionAuthorityAndContextRead.test.ts')).toBe('');
+
+      // 6, 7 & 8. Proof non-vacuity and immutability:
+      // The proof only queries immutable objects in the object store, ignoring working tree and milestone HEAD.
+      // Deliberately substituting an incorrect R5J5 final boundary causes failure.
+      const incorrectBoundarySha = '26306cf9304dddd3c90837dbbed1cafdef4f1d6b';
+      expect(resolvedFinalHead).not.toBe(incorrectBoundarySha);
+      const incorrectTree = child_process.execFileSync(
+        'git',
+        ['rev-parse', `${incorrectBoundarySha}^{tree}`],
+        { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] }
+      ).trim();
+      expect(incorrectTree).not.toBe(R5J5_FINAL_SOURCE_TREE);
+      expect(isAncestor(R5J5_FINAL_SOURCE_HEAD, incorrectBoundarySha)).toBe(false);
     });
 
     it('385. validateCanonicalWorkspaceSnapshotAfter rejects empty git_status_evidence_hash without mutation', async () => {

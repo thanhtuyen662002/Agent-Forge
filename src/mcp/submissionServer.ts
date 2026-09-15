@@ -1,11 +1,20 @@
 import fs from 'fs';
 import Database from 'better-sqlite3';
-import { McpServer, fromJsonSchema } from '@modelcontextprotocol/server';
+import { McpServer, fromJsonSchema, ResourceTemplate } from '@modelcontextprotocol/server';
 import { Repository } from '../core/database/repositories';
-import { verifyMigration22SchemaAuthority } from '../core/database/migrations';
+import { verifyMigration22SchemaAuthority, verifyMigration23SchemaAuthority } from '../core/database/migrations';
 import {
   CODER_SUBMISSION_INPUT_JSON_SCHEMA,
+  CODER_SUBMISSION_STATUS_INPUT_JSON_SCHEMA,
+  SUBMISSION_STATUS_TOOL_NAME,
+  SUBMISSION_STATUS_TOOL_DESCRIPTION,
+  SUBMISSION_STATUS_TOOL_ANNOTATIONS,
+  SUBMISSION_STATUS_RESOURCE_NAME,
+  SUBMISSION_STATUS_URI_TEMPLATE,
+  SUBMISSION_STATUS_MIME_TYPE,
   SubmissionResult,
+  SubmissionStatusResult,
+  canonicalJsonStringify,
 } from './submissionProtocol';
 import { McpSubmissionAuthorityService } from '../core/services/McpSubmissionAuthorityService';
 
@@ -41,6 +50,8 @@ export class SubmissionMcpAuthorityContext {
       this.service = options.service;
     }
     if (options?.db) {
+      verifyMigration22SchemaAuthority(options.db);
+      verifyMigration23SchemaAuthority(options.db);
       this.db = options.db;
       this.repo = options?.repo ?? new Repository(this.db);
       if (!this.service) {
@@ -94,6 +105,7 @@ export class SubmissionMcpAuthorityContext {
 
     try {
       verifyMigration22SchemaAuthority(db);
+      verifyMigration23SchemaAuthority(db);
     } catch (err) {
       db.close();
       throw new Error(`[MCP_CONFIGURATION_INVALID] Database schema authority verification failed: ${(err as Error).message}`);
@@ -173,6 +185,111 @@ export function registerSubmissionCapabilities(
 
       // Ensure structuredData is NEVER emitted per Section 2.7
       return response as any;
+    }
+  );
+
+  server.registerTool(
+    SUBMISSION_STATUS_TOOL_NAME,
+    {
+      description: SUBMISSION_STATUS_TOOL_DESCRIPTION,
+      inputSchema: fromJsonSchema(CODER_SUBMISSION_STATUS_INPUT_JSON_SCHEMA as any),
+      annotations: SUBMISSION_STATUS_TOOL_ANNOTATIONS,
+    },
+    async (rawArgs: unknown) => {
+      let service: McpSubmissionAuthorityService;
+      try {
+        service = context.getOrCreateService();
+      } catch (err) {
+        const message = err instanceof Error ? err.message : 'MCP configuration invalid';
+        return {
+          isError: true,
+          content: [
+            {
+              type: 'text' as const,
+              text: `[MCP_CONFIGURATION_INVALID] ${message}`,
+            },
+          ],
+          structuredContent: {
+            ok: false,
+            error_code: 'INVALID_SUBMISSION_TOKEN',
+            message,
+            retryable: false,
+          },
+        };
+      }
+
+      const token = context.getSubmissionToken();
+      const result: SubmissionStatusResult = service.getSubmissionStatus(rawArgs, token);
+
+      const explanation = result.ok
+        ? `[${result.lifecycle_status}] Submission ${result.submission_id}: lifecycle=${result.lifecycle_status}, terminal=${result.terminal_outcome ?? 'none'}, task_state=${result.task_state}.`
+        : `[${result.error_code}] ${result.message}`;
+
+      const response: Record<string, unknown> = {
+        content: [
+          {
+            type: 'text' as const,
+            text: explanation,
+          },
+        ],
+        structuredContent: result,
+        isError: !result.ok,
+      };
+
+      return response as any;
+    }
+  );
+
+  const statusResourceTemplate = new ResourceTemplate(
+    SUBMISSION_STATUS_URI_TEMPLATE,
+    { list: undefined }
+  );
+
+  server.registerResource(
+    SUBMISSION_STATUS_RESOURCE_NAME,
+    statusResourceTemplate,
+    {
+      description: 'Observe quarantined coder submission lifecycle and sanitized verification feedback.',
+      mimeType: SUBMISSION_STATUS_MIME_TYPE,
+    },
+    async (uri, vars) => {
+      let service: McpSubmissionAuthorityService;
+      const uriString = typeof uri === 'string' ? uri : (uri as { href: string }).href;
+      try {
+        service = context.getOrCreateService();
+      } catch (err) {
+        const message = err instanceof Error ? err.message : 'MCP configuration invalid';
+        const failObj: SubmissionStatusResult = {
+          ok: false,
+          error_code: 'INVALID_SUBMISSION_TOKEN',
+          message,
+          retryable: false,
+        };
+        return {
+          contents: [
+            {
+              uri: uriString,
+              mimeType: SUBMISSION_STATUS_MIME_TYPE,
+              text: canonicalJsonStringify(failObj),
+            },
+          ],
+        };
+      }
+
+      const token = context.getSubmissionToken();
+      const submissionId = typeof vars.submission_id === 'string' ? vars.submission_id : String(vars.submission_id ?? '');
+      const rawArgs = { submission_id: submissionId };
+      const result: SubmissionStatusResult = service.getSubmissionStatus(rawArgs, token);
+
+      return {
+        contents: [
+          {
+            uri: uriString,
+            mimeType: SUBMISSION_STATUS_MIME_TYPE,
+            text: canonicalJsonStringify(result),
+          },
+        ],
+      };
     }
   );
 }
