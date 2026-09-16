@@ -404,10 +404,10 @@ const { computeCanonicalPayload, computePayloadHash, computeContextManifestHash 
 MigrationRunner.run(db);
 
 const appliedMigrationCount = db.prepare("SELECT COUNT(*) as c FROM schema_migrations").get().c;
-if (appliedMigrationCount !== 23) {
-  throw new Error("Expected migration count 23, got " + appliedMigrationCount);
+if (appliedMigrationCount !== 24) {
+  throw new Error("Expected migration count 24, got " + appliedMigrationCount);
 }
-console.log("R5J6_MIGRATION_COUNT_23=PASS");
+console.log("R5J7_MIGRATION_COUNT_24=PASS");
 
 const repo = new Repository(db);
 const service = new McpSessionAuthorityService(repo, db);
@@ -1783,13 +1783,14 @@ const harness = new McpRpcHarness(child);
   Write-Host "Installed MCP Proof Output:"
   Write-Host $mcpStdout
 
-  if ($mcpProc.ExitCode -ne 0 -or -not ($mcpStdout -match "R5J3_INSTALLED_MCP_BRIDGE_PROOF=PASS") -or -not ($mcpStdout -match "R5J4_INSTALLED_MCP_SUBMISSION_PROOF=PASS") -or -not ($mcpStdout -match "R5J5_INSTALLED_OWNER_ADJUDICATION_PROOF=PASS") -or -not ($mcpStdout -match "R5J6_SUBMISSION_OBSERVABILITY_PROOF=PASS")) {
+  if ($mcpProc.ExitCode -ne 0 -or -not ($mcpStdout -match "R5J3_INSTALLED_MCP_BRIDGE_PROOF=PASS") -or -not ($mcpStdout -match "R5J4_INSTALLED_MCP_SUBMISSION_PROOF=PASS") -or -not ($mcpStdout -match "R5J5_INSTALLED_OWNER_ADJUDICATION_PROOF=PASS") -or -not ($mcpStdout -match "R5J6_SUBMISSION_OBSERVABILITY_PROOF=PASS") -or -not ($mcpStdout -match "R5J7_MIGRATION_COUNT_24=PASS")) {
     throw "Installed MCP bridge verification failed (exit code $($mcpProc.ExitCode)): $mcpStderr"
   }
 
   Write-Host "[8/8] Installed MCP Client Bridge & Node-Mode Stdio Proof: PASS" -ForegroundColor Green
   Write-Host "R5J5_INSTALLED_OWNER_ADJUDICATION_PROOF=PASS" -ForegroundColor Green
   Write-Host "R5J6_SUBMISSION_OBSERVABILITY_PROOF=PASS" -ForegroundColor Green
+  Write-Host "R5J7_MIGRATION_COUNT_24=PASS" -ForegroundColor Green
 
   # Verify no surviving processes in install dir
   $surviving = Get-Process -Name "AgentForge" -ErrorAction SilentlyContinue | Where-Object {

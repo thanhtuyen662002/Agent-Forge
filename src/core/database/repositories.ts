@@ -82,6 +82,8 @@ import {
   AdjudicationEventType,
 } from '../types/domain';
 import type { CoderSubmissionWorkspaceLease, WorkspaceLeaseState } from '../types/adjudication';
+import type { McpReviewerSession, ReviewerAuthorityFenceState } from '../../types/reviewer';
+export type { McpReviewerSession, ReviewerAuthorityFenceState };
 import type { ProviderDispatchExecutionResult } from '../services/ProviderDispatchService';
 import { ExecutionFailureClassifier } from '../services/ExecutionFailureClassifier';
 import { FailureHealthMutationPolicyService } from '../services/FailureHealthMutationPolicyService';
@@ -3717,6 +3719,166 @@ export class Repository {
       expires_at: String(row.expires_at),
       revoked_at: row.revoked_at != null ? String(row.revoked_at) : null,
       revocation_reason: row.revocation_reason != null ? String(row.revocation_reason) : null,
+    };
+  }
+
+  // ==========================================
+  // MCP Reviewer Sessions Authority (R5J7)
+  // ==========================================
+  public createMcpReviewerSession(session: McpReviewerSession): void {
+    this.db
+      .prepare(`
+        INSERT INTO mcp_reviewer_sessions (
+          id,
+          adjudication_id,
+          submission_id,
+          reviewer_agent_id,
+          reviewer_provider_id,
+          reviewer_account_id,
+          reviewer_resource_id,
+          scope,
+          token_hash,
+          task_ownership_epoch,
+          authority_snapshot_hash,
+          verification_result_envelope_hash,
+          projection_schema,
+          projection_hash,
+          projection_json,
+          issued_at,
+          expires_at,
+          revoked_at,
+          revocation_reason
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      `)
+      .run(
+        session.id,
+        session.adjudication_id,
+        session.submission_id,
+        session.reviewer_agent_id,
+        session.reviewer_provider_id,
+        session.reviewer_account_id,
+        session.reviewer_resource_id,
+        session.scope,
+        session.token_hash,
+        session.task_ownership_epoch,
+        session.authority_snapshot_hash,
+        session.verification_result_envelope_hash,
+        session.projection_schema,
+        session.projection_hash,
+        session.projection_json,
+        session.issued_at,
+        session.expires_at,
+        session.revoked_at,
+        session.revocation_reason
+      );
+  }
+
+  public getMcpReviewerSessionById(id: string): McpReviewerSession | null {
+    const row = this.db
+      .prepare('SELECT * FROM mcp_reviewer_sessions WHERE id = ?')
+      .get(id) as Record<string, unknown> | undefined;
+    if (!row) return null;
+    return this.mapMcpReviewerSession(row);
+  }
+
+  public getMcpReviewerSessionByTokenHash(tokenHash: string): McpReviewerSession | null {
+    const row = this.db
+      .prepare('SELECT * FROM mcp_reviewer_sessions WHERE token_hash = ?')
+      .get(tokenHash) as Record<string, unknown> | undefined;
+    if (!row) return null;
+    return this.mapMcpReviewerSession(row);
+  }
+
+  public getActiveMcpReviewerSession(adjudicationId: string, reviewerAgentId: string): McpReviewerSession | null {
+    const row = this.db
+      .prepare('SELECT * FROM mcp_reviewer_sessions WHERE adjudication_id = ? AND reviewer_agent_id = ? AND revoked_at IS NULL')
+      .get(adjudicationId, reviewerAgentId) as Record<string, unknown> | undefined;
+    if (!row) return null;
+    return this.mapMcpReviewerSession(row);
+  }
+
+  public listMcpReviewerSessions(filters?: { adjudicationId?: string; sessionId?: string; activeOnly?: boolean }): McpReviewerSession[] {
+    let query = 'SELECT * FROM mcp_reviewer_sessions WHERE 1=1';
+    const params: unknown[] = [];
+    if (filters?.adjudicationId) {
+      query += ' AND adjudication_id = ?';
+      params.push(filters.adjudicationId);
+    }
+    if (filters?.sessionId) {
+      query += ' AND id = ?';
+      params.push(filters.sessionId);
+    }
+    if (filters?.activeOnly) {
+      query += ' AND revoked_at IS NULL';
+    }
+    query += ' ORDER BY issued_at DESC';
+    const rows = this.db.prepare(query).all(...params) as Record<string, unknown>[];
+    return rows.map((r) => this.mapMcpReviewerSession(r));
+  }
+
+  public revokeMcpReviewerSession(id: string, reason: string, revokedAt?: string): boolean {
+    const ts = revokedAt ?? new Date().toISOString();
+    const res = this.db
+      .prepare('UPDATE mcp_reviewer_sessions SET revoked_at = ?, revocation_reason = ? WHERE id = ? AND revoked_at IS NULL')
+      .run(ts, reason, id);
+    return res.changes > 0;
+  }
+
+  public rotateExpiredReviewerSession(expiredSessionId: string, newSession: McpReviewerSession): void {
+    const rotateTx = this.db.transaction(() => {
+      const revokedAt = newSession.issued_at;
+      const revokeRes = this.db
+        .prepare('UPDATE mcp_reviewer_sessions SET revoked_at = ?, revocation_reason = ? WHERE id = ? AND revoked_at IS NULL')
+        .run(revokedAt, 'EXPIRED_AUTOMATIC_ROTATION', expiredSessionId);
+      if (revokeRes.changes !== 1) {
+        throw new Error(`Failed to revoke expired session ${expiredSessionId} during automatic rotation`);
+      }
+      this.createMcpReviewerSession(newSession);
+    });
+    rotateTx();
+  }
+
+  public getAdjudicationAuthorityFenceState(adjudicationId: string): ReviewerAuthorityFenceState | null {
+    const row = this.db.prepare(`
+      SELECT 
+        csa.status AS adjudication_status,
+        csa.recovery_fenced_at AS adjudication_recovery_fenced_at,
+        csa.authority_snapshot_hash AS current_authority_snapshot_hash,
+        t.ownership_epoch AS current_task_ownership_epoch
+      FROM coder_submission_adjudications csa
+      JOIN tasks t ON t.id = csa.task_id
+      WHERE csa.id = ?
+    `).get(adjudicationId) as Record<string, unknown> | undefined;
+    if (!row) return null;
+    return {
+      adjudication_status: String(row.adjudication_status),
+      adjudication_recovery_fenced_at: row.adjudication_recovery_fenced_at ? String(row.adjudication_recovery_fenced_at) : null,
+      current_authority_snapshot_hash: String(row.current_authority_snapshot_hash),
+      current_task_ownership_epoch: Number(row.current_task_ownership_epoch),
+    };
+  }
+
+  private mapMcpReviewerSession(row: Record<string, unknown>): McpReviewerSession {
+    return {
+      id: String(row.id),
+      adjudication_id: String(row.adjudication_id),
+      submission_id: String(row.submission_id),
+      reviewer_agent_id: String(row.reviewer_agent_id),
+      reviewer_provider_id: String(row.reviewer_provider_id),
+      reviewer_account_id: String(row.reviewer_account_id),
+      reviewer_resource_id: String(row.reviewer_resource_id),
+      scope: String(row.scope),
+      token_hash: String(row.token_hash),
+      task_ownership_epoch: Number(row.task_ownership_epoch),
+      authority_snapshot_hash: String(row.authority_snapshot_hash),
+      verification_result_envelope_hash: String(row.verification_result_envelope_hash),
+      projection_schema: Number(row.projection_schema),
+      projection_hash: String(row.projection_hash),
+      projection_json: String(row.projection_json),
+      issued_at: String(row.issued_at),
+      expires_at: String(row.expires_at),
+      revoked_at: row.revoked_at ? String(row.revoked_at) : null,
+      revocation_reason: row.revocation_reason ? String(row.revocation_reason) : null,
     };
   }
 

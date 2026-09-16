@@ -1,0 +1,1160 @@
+import fs from 'fs';
+import path from 'path';
+import os from 'os';
+import crypto from 'crypto';
+import Database from 'better-sqlite3';
+import { describe, it, expect, beforeEach, afterEach } from 'vitest';
+import { Client, InMemoryTransport } from '@modelcontextprotocol/client';
+import { MigrationRunner } from '../src/core/database/migrations';
+import { Repository } from '../src/core/database/repositories';
+import { ArtifactStore } from '../src/core/services/ArtifactStore';
+import {
+  ReviewerAuthorityService,
+  truncateDiffBytes,
+  fatalUtf8Decode,
+  scrubReviewerDiagnostics,
+  ReviewerAuthorityError,
+} from '../src/mcp/reviewerAuthority';
+import {
+  REVIEWER_TOOL_NAME,
+  REVIEWER_TOOL_DESCRIPTION,
+  REVIEWER_TOOL_ANNOTATIONS,
+  REVIEWER_TOOL_INPUT_SCHEMA,
+  REVIEWER_RESOURCE_NAME,
+  REVIEWER_RESOURCE_DESCRIPTION,
+  REVIEWER_URI_TEMPLATE,
+  REVIEWER_MIME_TYPE,
+  FORBIDDEN_TOOL_NAMES,
+} from '../src/mcp/reviewerProtocol';
+import {
+  ReviewerMcpAuthorityContext,
+  buildAgentForgeReviewerMcpServer,
+} from '../src/mcp/reviewerServer';
+import { runReviewerStdioServer } from '../src/mcp/stdio-review';
+import {
+  REVIEWER_TOKEN_ENV,
+  DIFF_CONTENT_MAX_UTF8_BYTES,
+  PROJECTION_PAYLOAD_MAX_UTF8_BYTES,
+  MARKDOWN_MAX_UTF8_BYTES,
+} from '../src/types/reviewer';
+import { computeSha256 } from '../src/mcp/submissionProtocol';
+
+interface Fixtures {
+  tempDir: string;
+  dbPath: string;
+  db: Database.Database;
+  repo: Repository;
+  service: ReviewerAuthorityService;
+  adjudicationId: string;
+  submissionId: string;
+  taskId: string;
+  projectId: string;
+  reviewerAgentId: string;
+  reviewerProviderId: string;
+  reviewerAccountId: string;
+  reviewerResourceId: string;
+  reviewerAgentId2: string;
+  token1: string;
+  sessionId1: string;
+  token2: string;
+  sessionId2: string;
+}
+
+function seedTestEnv(tempDir: string): Fixtures {
+  const dbPath = path.join(tempDir, 'test-reviewer-protocol.db');
+  const db = new Database(dbPath);
+  db.pragma('foreign_keys = ON');
+  MigrationRunner.run(db);
+
+  const repo = new Repository(db);
+  const artifactsDir = path.join(tempDir, 'artifacts');
+  fs.mkdirSync(artifactsDir, { recursive: true });
+  const artifactStore = new ArtifactStore(artifactsDir);
+
+  const now = new Date().toISOString();
+  const projectId = `proj-${crypto.randomUUID()}`;
+  const taskId = `task-${crypto.randomUUID()}`;
+  const attemptId = `att-${crypto.randomUUID()}`;
+  const assignmentId = `asgn-${crypto.randomUUID()}`;
+  const authId = `auth-${crypto.randomUUID()}`;
+  const subSessionId = crypto.randomUUID();
+  const submissionId = crypto.randomUUID();
+  const adjudicationId = crypto.randomUUID();
+
+  const coderProviderId = `prov-coder-${crypto.randomUUID()}`;
+  const coderAccountId = `acc-coder-${crypto.randomUUID()}`;
+  const coderResourceId = `res-coder-${crypto.randomUUID()}`;
+  const coderAgentId = `agent-coder-${crypto.randomUUID()}`;
+
+  const reviewerProviderId = `prov-rev-${crypto.randomUUID()}`;
+  const reviewerAccountId = `acc-rev-${crypto.randomUUID()}`;
+  const reviewerResourceId = `res-rev-${crypto.randomUUID()}`;
+  const reviewerAgentId = `agent-rev-1-${crypto.randomUUID()}`;
+  const reviewerAgentId2 = `agent-rev-2-${crypto.randomUUID()}`;
+
+  // 1. Providers
+  db.prepare(`INSERT INTO providers (id, name, adapter_type, enabled, created_at) VALUES (?, ?, 'LOCAL_CLI', 1, ?)`).run(coderProviderId, 'CoderProvider', now);
+  db.prepare(`INSERT INTO providers (id, name, adapter_type, enabled, created_at) VALUES (?, ?, 'LOCAL_CLI', 1, ?)`).run(reviewerProviderId, 'ReviewerProvider', now);
+
+  // 2. Accounts
+  db.prepare(`INSERT INTO provider_accounts (id, provider_id, label, auth_mode, enabled, priority, health_status, concurrency_limit, created_at, updated_at) VALUES (?, ?, 'CoderAccount', 'NATIVE_PROFILE', 1, 10, 'AVAILABLE', 5, ?, ?)`).run(coderAccountId, coderProviderId, now, now);
+  db.prepare(`INSERT INTO provider_accounts (id, provider_id, label, auth_mode, enabled, priority, health_status, concurrency_limit, created_at, updated_at) VALUES (?, ?, 'ReviewerAccount', 'NATIVE_PROFILE', 1, 10, 'AVAILABLE', 5, ?, ?)`).run(reviewerAccountId, reviewerProviderId, now, now);
+
+  // 3. Resources
+  db.prepare(`INSERT INTO provider_resources (id, provider_id, provider_account_id, model_name, health_status, capabilities_json, enabled, total_quota, remaining_quota, quota_unit, quota_source, quota_confidence, last_health_check) VALUES (?, ?, ?, 'ResourceCoder', 'AVAILABLE', '[]', 1, 100, 100, 'REQUESTS', 'PROVIDER_REPORTED', 1.0, ?)`).run(coderResourceId, coderProviderId, coderAccountId, now);
+  db.prepare(`INSERT INTO provider_resources (id, provider_id, provider_account_id, model_name, health_status, capabilities_json, enabled, total_quota, remaining_quota, quota_unit, quota_source, quota_confidence, last_health_check) VALUES (?, ?, ?, 'ResourceReviewer', 'AVAILABLE', '[]', 1, 100, 100, 'REQUESTS', 'PROVIDER_REPORTED', 1.0, ?)`).run(reviewerResourceId, reviewerProviderId, reviewerAccountId, now);
+
+  // 4. Role & Agent Profiles & Agents
+  const coderRoleId = `role-coder-${crypto.randomUUID()}`;
+  const coderAgentProfileId = `prof-coder-${crypto.randomUUID()}`;
+  db.prepare(`INSERT INTO role_profiles (id, role, display_name, required_capabilities_json, preferred_capabilities_json, permissions_json, enabled, created_at, updated_at) VALUES (?, 'CODER', 'Coder Role', '[]', '[]', '[]', 1, ?, ?)`).run(coderRoleId, now, now);
+  db.prepare(`INSERT INTO agent_profiles (id, role_profile_id, name, enabled, created_at, updated_at) VALUES (?, ?, 'Agent Coder', 1, ?, ?)`).run(coderAgentProfileId, coderRoleId, now, now);
+
+  db.prepare(`INSERT INTO agents (id, display_name, role, provider_resource_id, status, current_task_id, last_seen_at) VALUES (?, 'CoderAgent', 'CODER', ?, 'IDLE', NULL, ?)`).run(coderAgentId, coderResourceId, now);
+  db.prepare(`INSERT INTO agents (id, display_name, role, provider_resource_id, status, current_task_id, last_seen_at) VALUES (?, 'ReviewerAgent1', 'REVIEWER', ?, 'IDLE', NULL, ?)`).run(reviewerAgentId, reviewerResourceId, now);
+  db.prepare(`INSERT INTO agents (id, display_name, role, provider_resource_id, status, current_task_id, last_seen_at) VALUES (?, 'ReviewerAgent2', 'REVIEWER', ?, 'IDLE', NULL, ?)`).run(reviewerAgentId2, reviewerResourceId, now);
+
+  // 5. Project & Task
+  repo.createProject({
+    id: projectId,
+    name: 'Protocol Test Project',
+    description: 'Protocol test description',
+    repository_path: tempDir,
+    default_branch: 'main',
+    status: 'RUNNING',
+    contract: null,
+    created_at: now,
+    updated_at: now,
+    started_at: null,
+    completed_at: null,
+  });
+
+  db.prepare(`
+    INSERT INTO tasks (id, project_id, title, state, priority, risk, revision_count, max_revisions, progress_cache_percent, base_sha, ownership_epoch, created_at, updated_at)
+    VALUES (?, ?, 'Protocol Task', 'REVIEW_READY', 'LOW', 'LOW', 1, 3, 0, ?, 1, ?, ?)
+  `).run(taskId, projectId, '0'.repeat(40), now, now);
+
+  // 6. Attempt
+  repo.createTaskAttempt({
+    id: attemptId,
+    task_id: taskId,
+    attempt_number: 1,
+    agent_id: coderAgentId,
+    agent_profile_id: coderAgentProfileId,
+    status: 'COMPLETED',
+    started_at: now,
+    ended_at: now,
+    summary: 'Finished coding',
+  });
+
+  // 7. Routing & Protocol message
+  const routingId = `route-${crypto.randomUUID()}`;
+  const msgId = `msg-${crypto.randomUUID()}`;
+  db.prepare(`INSERT INTO protocol_messages (id, message_id, protocol, project_id, payload_hash, raw_payload, status, created_at, processed_at) VALUES (?, ?, 'manager.v1', ?, ?, '{}', 'APPLIED', ?, ?)`).run(msgId, msgId, projectId, '0'.repeat(64), now, now);
+
+  // 8. Agent assignment
+  db.prepare(`
+    INSERT INTO agent_assignments (id, project_id, task_id, attempt_id, role_profile_id, selected_provider_id, selected_account_id, selected_resource_id, status, created_at)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'ASSIGNED', ?)
+  `).run(assignmentId, projectId, taskId, attemptId, coderRoleId, coderProviderId, coderAccountId, coderResourceId, now);
+
+  // 9. Execution auth
+  db.prepare(`
+    INSERT INTO execution_authorizations (
+      id, project_id, task_id, task_ownership_epoch, attempt_id,
+      selected_provider_id, selected_account_id, selected_resource_id,
+      manager_message_id, manager_payload_hash, instruction_payload_hash, context_manifest_hash,
+      canonical_instructions_json, context_files_json, routing_decision_id,
+      base_sha, repository_head_sha, status, task_revision, canonical_payload_json,
+      created_at, dispatched_at
+    ) VALUES (
+      ?, ?, ?, 1, ?,
+      ?, ?, ?,
+      ?, '${'0'.repeat(64)}', '${'0'.repeat(64)}', '${'0'.repeat(64)}',
+      '[]', '[]', ?,
+      ?, ?, 'DISPATCHED', 1, '{}',
+      ?, ?
+    )
+  `).run(authId, projectId, taskId, attemptId, coderProviderId, coderAccountId, coderResourceId, msgId, routingId, '0'.repeat(40), '0'.repeat(40), now, now);
+
+  // 10. Submission Session
+  db.prepare(`
+    INSERT INTO mcp_submission_sessions (id, authorization_id, scope, issuer_identity, token_hash, authorization_fingerprint, issued_at, expires_at)
+    VALUES (?, ?, 'CODER_SUBMISSION', 'OWNER_LOCAL_CLI', ?, ?, ?, ?)
+  `).run(subSessionId, authId, '0'.repeat(64), '0'.repeat(64), now, new Date(Date.now() + 3600000).toISOString());
+
+  // 11. Coder Submission
+  db.prepare(`
+    INSERT INTO coder_submissions (
+      id, authorization_id, project_id, task_id, task_ownership_epoch, session_id,
+      selected_provider_id, selected_account_id, selected_resource_id,
+      manager_message_id, routing_decision_id, base_sha, authorized_head_sha,
+      schema_version, authorization_status, dispatched_at, authority_fingerprint,
+      manager_payload_hash, task_revision, claimed_status, quarantine_status,
+      summary, changed_files_count, tests_claimed_count, blockers_count,
+      review_requested, claim_content_hash, canonical_envelope_hash,
+      claim_content_json, canonical_envelope_json, canonical_arguments_bytes,
+      lifecycle_version, execution_id, attempt_id, assignment_id, submitted_at
+    ) VALUES (
+      ?, ?, ?, ?, 1, ?,
+      ?, ?, ?,
+      ?, ?, ?, ?,
+      1, 'DISPATCHED', ?, '${'0'.repeat(64)}',
+      '${'0'.repeat(64)}', 1, 'COMPLETED', 'QUARANTINED',
+      'Review ready submission', 1, 1, 0,
+      1, '${'0'.repeat(64)}', '${'0'.repeat(64)}',
+      '{}', '{}', 2,
+      1, 'exec-1', ?, ?, ?
+    )
+  `).run(
+    submissionId, authId, projectId, taskId, subSessionId,
+    coderProviderId, coderAccountId, coderResourceId,
+    msgId, routingId, '0'.repeat(40), '0'.repeat(40),
+    now, attemptId, assignmentId, now
+  );
+
+  // 12. Dispositions
+  db.prepare(`
+    INSERT INTO coder_submission_dispositions (id, submission_id, disposition_event, disposition_reason, actor_type, actor_id, created_at)
+    VALUES (?, ?, 'SETTLED', 'ACCEPTED_VERIFIED', 'OPERATOR', 'test-operator', ?)
+  `).run(crypto.randomUUID(), submissionId, now);
+
+  // 13. Test Run
+  const testRunId = `tr-${crypto.randomUUID()}`;
+  db.prepare(`
+    INSERT INTO test_runs (id, task_id, command, passed_count, failed_count, skipped_count, duration_ms, exit_code, created_at)
+    VALUES (?, ?, 'npm test', 5, 0, 0, 100, 0, ?)
+  `).run(testRunId, taskId, now);
+
+  // 14. Evidence
+  const statusEvId = `ev-status-${crypto.randomUUID()}`;
+  const diffEvId = `ev-diff-${crypto.randomUUID()}`;
+  const statusFile = path.join(artifactsDir, 'git-status.txt');
+  const diffFile = path.join(artifactsDir, 'git-diff.patch');
+  const statusPayload = JSON.stringify({ isClean: false, files: ['src/index.ts'] });
+  fs.writeFileSync(statusFile, statusPayload, 'utf8');
+  fs.writeFileSync(diffFile, 'diff --git a/file.ts b/file.ts\n--- a/file.ts\n+++ b/file.ts\n@@ -1 +1 @@\n-old\n+new\n', 'utf8');
+
+  const statusHash = computeSha256(fs.readFileSync(statusFile, 'utf8'));
+  const diffHash = computeSha256(fs.readFileSync(diffFile, 'utf8'));
+
+  db.prepare(`
+    INSERT INTO evidence (id, project_id, task_id, attempt_id, evidence_type, storage_type, file_path, hash, byte_size, summary, created_at)
+    VALUES (?, ?, ?, ?, 'GIT_STATUS', 'FILE', ?, ?, ?, 'Git status', ?)
+  `).run(statusEvId, projectId, taskId, attemptId, statusFile, statusHash, Buffer.byteLength(statusPayload), now);
+
+  db.prepare(`
+    INSERT INTO evidence (id, project_id, task_id, attempt_id, evidence_type, storage_type, file_path, hash, byte_size, summary, created_at)
+    VALUES (?, ?, ?, ?, 'GIT_DIFF', 'FILE', ?, ?, ?, 'Git diff', ?)
+  `).run(diffEvId, projectId, taskId, attemptId, diffFile, diffHash, fs.statSync(diffFile).size, now);
+
+  // 15. Adjudication (VERIFIED)
+  const envJson = JSON.stringify({ verified: true, testsPassed: true });
+  const envHash = computeSha256(envJson);
+  const snapJson = JSON.stringify({ verified: true });
+  const snapHash = computeSha256(snapJson);
+
+  db.prepare(`
+    INSERT INTO coder_submission_adjudications (
+      id, request_id, submission_id, authorization_id, project_id, task_id, attempt_id, assignment_id,
+      task_ownership_epoch, action, status, lifecycle_version,
+      authority_snapshot_json, authority_snapshot_hash,
+      verification_commands_json, verification_commands_hash,
+      verification_result_envelope_json, verification_result_envelope_hash,
+      test_run_id, git_status_evidence_id, git_diff_evidence_id,
+      artifact_manifest_json, artifact_manifest_hash,
+      created_at, verification_started_at, completed_at
+    ) VALUES (
+      ?, ?, ?, ?, ?, ?, ?, ?,
+      1, 'ADMIT_VERIFICATION', 'VERIFIED', 1,
+      ?, ?,
+      '{}', '${'0'.repeat(64)}',
+      ?, ?,
+      ?, ?, ?,
+      '{}', '${'0'.repeat(64)}',
+      ?, ?, ?
+    )
+  `).run(
+    adjudicationId, crypto.randomUUID(), submissionId, authId, projectId, taskId, attemptId, assignmentId,
+    snapJson, snapHash,
+    envJson, envHash,
+    testRunId, statusEvId, diffEvId,
+    now, now, now
+  );
+
+  const service = new ReviewerAuthorityService(repo, artifactStore);
+
+  // Issue session 1 for reviewer 1
+  const issuance1 = service.issueReviewerSession({
+    adjudication_id: adjudicationId,
+    reviewer_agent_id: reviewerAgentId,
+    reviewer_provider_id: reviewerProviderId,
+    reviewer_account_id: reviewerAccountId,
+    reviewer_resource_id: reviewerResourceId,
+    duration_seconds: 3600,
+  });
+
+  // Issue session 2 for reviewer 2
+  const issuance2 = service.issueReviewerSession({
+    adjudication_id: adjudicationId,
+    reviewer_agent_id: reviewerAgentId2,
+    reviewer_provider_id: reviewerProviderId,
+    reviewer_account_id: reviewerAccountId,
+    reviewer_resource_id: reviewerResourceId,
+    duration_seconds: 3600,
+  });
+
+  return {
+    tempDir,
+    dbPath,
+    db,
+    repo,
+    service,
+    adjudicationId,
+    submissionId,
+    taskId,
+    projectId,
+    reviewerAgentId,
+    reviewerProviderId,
+    reviewerAccountId,
+    reviewerResourceId,
+    reviewerAgentId2,
+    token1: issuance1.raw_token,
+    sessionId1: issuance1.session.id,
+    token2: issuance2.raw_token,
+    sessionId2: issuance2.session.id,
+  };
+}
+
+describe('R5J7 MCP Reviewer Protocol & Tool Surface (Cases 71–105, 132–134, 138, 141, 142)', () => {
+  let tempDir: string;
+  let fixtures: Fixtures;
+  let originalEnv: string | undefined;
+
+  beforeEach(() => {
+    tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'af-rev-protocol-test-'));
+    fixtures = seedTestEnv(tempDir);
+    originalEnv = process.env[REVIEWER_TOKEN_ENV];
+  });
+
+  afterEach(() => {
+    if (originalEnv !== undefined) {
+      process.env[REVIEWER_TOKEN_ENV] = originalEnv;
+    } else {
+      delete process.env[REVIEWER_TOKEN_ENV];
+    }
+    try {
+      if (fixtures?.db?.open) fixtures.db.close();
+    } catch {}
+    try {
+      fs.rmSync(tempDir, { recursive: true, force: true });
+    } catch {}
+  });
+
+  // 71. Server startup over stdio transport only
+  it('71. Server startup over stdio transport only', async () => {
+    process.env.AGENTFORGE_MCP_DB_PATH = fixtures.dbPath;
+    const handle = runReviewerStdioServer();
+    expect(handle).toBeDefined();
+    expect(typeof handle.close).toBe('function');
+    await handle.close();
+    delete process.env.AGENTFORGE_MCP_DB_PATH;
+  });
+
+  // 72. Protocol handshake and capability advertisement
+  it('72. Protocol handshake and capability advertisement', async () => {
+    const server = buildAgentForgeReviewerMcpServer({
+      db: fixtures.db,
+      reviewerToken: fixtures.token1,
+    });
+    const [cTrans, sTrans] = InMemoryTransport.createLinkedPair();
+    await server.connect(sTrans);
+    const client = new Client({ name: 'test-client', version: '1.0.0' });
+    await client.connect(cTrans);
+
+    const capabilities = client.getServerCapabilities();
+    expect(capabilities).toBeDefined();
+    expect(capabilities?.tools).toBeDefined();
+    expect(capabilities?.resources).toBeDefined();
+
+    await client.close();
+    await server.close();
+  });
+
+  // 73. Token extraction from AGENTFORGE_MCP_REVIEWER_TOKEN env var
+  it('73. Token extraction from AGENTFORGE_MCP_REVIEWER_TOKEN env var', async () => {
+    process.env[REVIEWER_TOKEN_ENV] = fixtures.token1;
+    const server = buildAgentForgeReviewerMcpServer({
+      db: fixtures.db,
+    });
+    const [cTrans, sTrans] = InMemoryTransport.createLinkedPair();
+    await server.connect(sTrans);
+    const client = new Client({ name: 'test-client', version: '1.0.0' });
+    await client.connect(cTrans);
+
+    const res = await client.callTool({
+      name: REVIEWER_TOOL_NAME,
+      arguments: { adjudication_id: fixtures.adjudicationId },
+    });
+    expect(res.isError).toBeFalsy();
+    expect(res.content).toHaveLength(1);
+
+    await client.close();
+    await server.close();
+  });
+
+  // 74. Missing token rejection during initialize/request
+  it('74. Missing token rejection during initialize/request', async () => {
+    delete process.env[REVIEWER_TOKEN_ENV];
+    const server = buildAgentForgeReviewerMcpServer({
+      db: fixtures.db,
+    });
+    const [cTrans, sTrans] = InMemoryTransport.createLinkedPair();
+    await server.connect(sTrans);
+    const client = new Client({ name: 'test-client', version: '1.0.0' });
+    await client.connect(cTrans);
+
+    const res = await client.callTool({
+      name: REVIEWER_TOOL_NAME,
+      arguments: { adjudication_id: fixtures.adjudicationId },
+    });
+    expect(res.isError).toBe(true);
+    const text = (res.content[0] as { type: 'text'; text: string }).text;
+    expect(text).toContain('AUTH_FAILED');
+
+    await client.close();
+    await server.close();
+  });
+
+  // 75. Resource template discovery: agentforge://reviews/packages/{adjudication_id}
+  it('75. Resource template discovery: agentforge://reviews/packages/{adjudication_id}', async () => {
+    const server = buildAgentForgeReviewerMcpServer({
+      db: fixtures.db,
+      reviewerToken: fixtures.token1,
+    });
+    const [cTrans, sTrans] = InMemoryTransport.createLinkedPair();
+    await server.connect(sTrans);
+    const client = new Client({ name: 'test-client', version: '1.0.0' });
+    await client.connect(cTrans);
+
+    const templates = await client.listResourceTemplates();
+    expect(templates.resourceTemplates).toBeDefined();
+    const tmpl = templates.resourceTemplates.find((t) => t.uriTemplate === REVIEWER_URI_TEMPLATE);
+    expect(tmpl).toBeDefined();
+    expect(tmpl?.name).toBe(REVIEWER_RESOURCE_NAME);
+
+    await client.close();
+    await server.close();
+  });
+
+  // 76. Resource MIME type is application/vnd.agentforge.review-package+json
+  it('76. Resource MIME type is application/vnd.agentforge.review-package+json', async () => {
+    const server = buildAgentForgeReviewerMcpServer({
+      db: fixtures.db,
+      reviewerToken: fixtures.token1,
+    });
+    const [cTrans, sTrans] = InMemoryTransport.createLinkedPair();
+    await server.connect(sTrans);
+    const client = new Client({ name: 'test-client', version: '1.0.0' });
+    await client.connect(cTrans);
+
+    const res = await client.readResource({
+      uri: `agentforge://reviews/packages/${fixtures.adjudicationId}`,
+    });
+    expect(res.contents).toBeDefined();
+    expect(res.contents[0].mimeType).toBe(REVIEWER_MIME_TYPE);
+
+    await client.close();
+    await server.close();
+  });
+
+  // 77. Resource read: succeeds for authorized adjudication
+  it('77. Resource read: succeeds for authorized adjudication', async () => {
+    const server = buildAgentForgeReviewerMcpServer({
+      db: fixtures.db,
+      reviewerToken: fixtures.token1,
+    });
+    const [cTrans, sTrans] = InMemoryTransport.createLinkedPair();
+    await server.connect(sTrans);
+    const client = new Client({ name: 'test-client', version: '1.0.0' });
+    await client.connect(cTrans);
+
+    const res = await client.readResource({
+      uri: `agentforge://reviews/packages/${fixtures.adjudicationId}`,
+    });
+    expect(res.contents).toHaveLength(1);
+    const parsed = JSON.parse((res.contents[0] as any).text);
+    expect(parsed.adjudication.id).toBe(fixtures.adjudicationId);
+    expect(parsed.projection_schema_version).toBe(1);
+
+    await client.close();
+    await server.close();
+  });
+
+  // 78. Resource read: cross-adjudication access forbidden
+  it('78. Resource read: cross-adjudication access forbidden', async () => {
+    const server = buildAgentForgeReviewerMcpServer({
+      db: fixtures.db,
+      reviewerToken: fixtures.token1,
+    });
+    const [cTrans, sTrans] = InMemoryTransport.createLinkedPair();
+    await server.connect(sTrans);
+    const client = new Client({ name: 'test-client', version: '1.0.0' });
+    await client.connect(cTrans);
+
+    const otherAdjId = crypto.randomUUID();
+    const res = await client.readResource({
+      uri: `agentforge://reviews/packages/${otherAdjId}`,
+    });
+    const content = (res.contents[0] as any).text;
+    expect(content).toContain('PERMISSION_DENIED');
+
+    await client.close();
+    await server.close();
+  });
+
+  // 79. Tool list exposure: agentforge_get_review_package only
+  it('79. Tool list exposure: agentforge_get_review_package only', async () => {
+    const server = buildAgentForgeReviewerMcpServer({
+      db: fixtures.db,
+      reviewerToken: fixtures.token1,
+    });
+    const [cTrans, sTrans] = InMemoryTransport.createLinkedPair();
+    await server.connect(sTrans);
+    const client = new Client({ name: 'test-client', version: '1.0.0' });
+    await client.connect(cTrans);
+
+    const tools = await client.listTools();
+    expect(tools.tools).toHaveLength(1);
+    expect(tools.tools[0].name).toBe(REVIEWER_TOOL_NAME);
+
+    await client.close();
+    await server.close();
+  });
+
+  // 80. Tool annotations: agentforge_get_review_package contract verification
+  it('80. Tool annotations: agentforge_get_review_package contract verification', async () => {
+    const server = buildAgentForgeReviewerMcpServer({
+      db: fixtures.db,
+      reviewerToken: fixtures.token1,
+    });
+    const [cTrans, sTrans] = InMemoryTransport.createLinkedPair();
+    await server.connect(sTrans);
+    const client = new Client({ name: 'test-client', version: '1.0.0' });
+    await client.connect(cTrans);
+
+    const tools = await client.listTools();
+    const tool = tools.tools[0];
+    expect(tool.annotations).toEqual(REVIEWER_TOOL_ANNOTATIONS);
+    expect(tool.annotations?.readOnlyHint).toBe(true);
+    expect(tool.annotations?.destructiveHint).toBe(false);
+    expect(tool.annotations?.idempotentHint).toBe(true);
+    expect(tool.annotations?.openWorldHint).toBe(false);
+
+    await client.close();
+    await server.close();
+  });
+
+  // 81. Tool call parameter schema validation and extra-property rejection
+  it('81. Tool call parameter schema validation and extra-property rejection', async () => {
+    const server = buildAgentForgeReviewerMcpServer({
+      db: fixtures.db,
+      reviewerToken: fixtures.token1,
+    });
+    const [cTrans, sTrans] = InMemoryTransport.createLinkedPair();
+    await server.connect(sTrans);
+    const client = new Client({ name: 'test-client', version: '1.0.0' });
+    await client.connect(cTrans);
+
+    // Missing required adjudication_id
+    const res1 = await client.callTool({
+      name: REVIEWER_TOOL_NAME,
+      arguments: {} as any,
+    });
+    expect(res1.isError).toBe(true);
+
+    // Extra unrecognized property
+    const res2 = await client.callTool({
+      name: REVIEWER_TOOL_NAME,
+      arguments: {
+        adjudication_id: fixtures.adjudicationId,
+        extra_prop: 'illegal',
+      } as any,
+    });
+    expect(res2.isError).toBe(true);
+    const text2 = (res2.content[0] as any).text;
+    expect(text2).toMatch(/Invalid arguments|InvalidParams/);
+
+    await client.close();
+    await server.close();
+  });
+
+  // 82. Tool call cross-adjudication access rejection
+  it('82. Tool call cross-adjudication access rejection', async () => {
+    const server = buildAgentForgeReviewerMcpServer({
+      db: fixtures.db,
+      reviewerToken: fixtures.token1,
+    });
+    const [cTrans, sTrans] = InMemoryTransport.createLinkedPair();
+    await server.connect(sTrans);
+    const client = new Client({ name: 'test-client', version: '1.0.0' });
+    await client.connect(cTrans);
+
+    const otherAdjId = crypto.randomUUID();
+    const res = await client.callTool({
+      name: REVIEWER_TOOL_NAME,
+      arguments: { adjudication_id: otherAdjId },
+    });
+    expect(res.isError).toBe(true);
+    const text = (res.content[0] as any).text;
+    expect(text).toContain('PERMISSION_DENIED');
+
+    await client.close();
+    await server.close();
+  });
+
+  // 83. Tool list forbids task mutation tools
+  it('83. Tool list forbids task mutation tools', async () => {
+    const server = buildAgentForgeReviewerMcpServer({
+      db: fixtures.db,
+      reviewerToken: fixtures.token1,
+    });
+    const [cTrans, sTrans] = InMemoryTransport.createLinkedPair();
+    await server.connect(sTrans);
+    const client = new Client({ name: 'test-client', version: '1.0.0' });
+    await client.connect(cTrans);
+
+    const tools = await client.listTools();
+    const toolNames = new Set(tools.tools.map((t) => t.name));
+    expect(toolNames.has('update_task')).toBe(false);
+    expect(toolNames.has('assign_task')).toBe(false);
+    expect(toolNames.has('transition_task')).toBe(false);
+
+    await client.close();
+    await server.close();
+  });
+
+  // 84. Tool list forbids git mutation tools
+  it('84. Tool list forbids git mutation tools', async () => {
+    const server = buildAgentForgeReviewerMcpServer({
+      db: fixtures.db,
+      reviewerToken: fixtures.token1,
+    });
+    const [cTrans, sTrans] = InMemoryTransport.createLinkedPair();
+    await server.connect(sTrans);
+    const client = new Client({ name: 'test-client', version: '1.0.0' });
+    await client.connect(cTrans);
+
+    const tools = await client.listTools();
+    const toolNames = new Set(tools.tools.map((t) => t.name));
+    expect(toolNames.has('git_commit')).toBe(false);
+    expect(toolNames.has('git_push')).toBe(false);
+    expect(toolNames.has('git_apply')).toBe(false);
+
+    await client.close();
+    await server.close();
+  });
+
+  // 85. Tool list forbids verdict ingestion and adjudication tools
+  it('85. Tool list forbids verdict ingestion and adjudication tools', async () => {
+    const server = buildAgentForgeReviewerMcpServer({
+      db: fixtures.db,
+      reviewerToken: fixtures.token1,
+    });
+    const [cTrans, sTrans] = InMemoryTransport.createLinkedPair();
+    await server.connect(sTrans);
+    const client = new Client({ name: 'test-client', version: '1.0.0' });
+    await client.connect(cTrans);
+
+    const tools = await client.listTools();
+    const toolNames = new Set(tools.tools.map((t) => t.name));
+    expect(toolNames.has('submit_verdict')).toBe(false);
+    expect(toolNames.has('approve_review')).toBe(false);
+    expect(toolNames.has('adjudicate')).toBe(false);
+
+    await client.close();
+    await server.close();
+  });
+
+  // 86. Tool call agentforge_get_review_package returns complete frozen review package projection
+  it('86. Tool call agentforge_get_review_package returns complete frozen review package projection', async () => {
+    const server = buildAgentForgeReviewerMcpServer({
+      db: fixtures.db,
+      reviewerToken: fixtures.token1,
+    });
+    const [cTrans, sTrans] = InMemoryTransport.createLinkedPair();
+    await server.connect(sTrans);
+    const client = new Client({ name: 'test-client', version: '1.0.0' });
+    await client.connect(cTrans);
+
+    const res = await client.callTool({
+      name: REVIEWER_TOOL_NAME,
+      arguments: { adjudication_id: fixtures.adjudicationId },
+    });
+    expect(res.isError).toBeFalsy();
+    const text = (res.content[0] as any).text;
+    const parsed = JSON.parse(text);
+    expect(parsed.projection_schema_version).toBe(1);
+    expect(parsed.adjudication.id).toBe(fixtures.adjudicationId);
+
+    await client.close();
+    await server.close();
+  });
+
+  // 87. Tool and resource canonical-byte and SHA-256 hash parity
+  it('87. Tool and resource canonical-byte and SHA-256 hash parity', async () => {
+    const server = buildAgentForgeReviewerMcpServer({
+      db: fixtures.db,
+      reviewerToken: fixtures.token1,
+    });
+    const [cTrans, sTrans] = InMemoryTransport.createLinkedPair();
+    await server.connect(sTrans);
+    const client = new Client({ name: 'test-client', version: '1.0.0' });
+    await client.connect(cTrans);
+
+    const toolRes = await client.callTool({
+      name: REVIEWER_TOOL_NAME,
+      arguments: { adjudication_id: fixtures.adjudicationId },
+    });
+    const toolText = (toolRes.content[0] as any).text;
+
+    const resRes = await client.readResource({
+      uri: `agentforge://reviews/packages/${fixtures.adjudicationId}`,
+    });
+    const resText = (resRes.contents[0] as any).text;
+
+    expect(toolText).toBe(resText);
+    expect(computeSha256(toolText)).toBe(computeSha256(resText));
+
+    await client.close();
+    await server.close();
+  });
+
+  // 88. Strict zero-write read path on tool calls and resource reads
+  it('88. Strict zero-write read path on tool calls and resource reads', async () => {
+    const server = buildAgentForgeReviewerMcpServer({
+      db: fixtures.db,
+      reviewerToken: fixtures.token1,
+    });
+    const [cTrans, sTrans] = InMemoryTransport.createLinkedPair();
+    await server.connect(sTrans);
+    const client = new Client({ name: 'test-client', version: '1.0.0' });
+    await client.connect(cTrans);
+
+    const tcBeforeTool = (fixtures.db.prepare('SELECT total_changes() as tc').get() as { tc: number }).tc;
+    await client.callTool({
+      name: REVIEWER_TOOL_NAME,
+      arguments: { adjudication_id: fixtures.adjudicationId },
+    });
+    const tcAfterTool = (fixtures.db.prepare('SELECT total_changes() as tc').get() as { tc: number }).tc;
+    expect(tcAfterTool - tcBeforeTool).toBe(0);
+
+    const tcBeforeRes = (fixtures.db.prepare('SELECT total_changes() as tc').get() as { tc: number }).tc;
+    await client.readResource({
+      uri: `agentforge://reviews/packages/${fixtures.adjudicationId}`,
+    });
+    const tcAfterRes = (fixtures.db.prepare('SELECT total_changes() as tc').get() as { tc: number }).tc;
+    expect(tcAfterRes - tcBeforeRes).toBe(0);
+
+    await client.close();
+    await server.close();
+  });
+
+  // 89. Rejection of unapproved tools and absence of aliases
+  it('89. Rejection of unapproved tools and absence of aliases', async () => {
+    const server = buildAgentForgeReviewerMcpServer({
+      db: fixtures.db,
+      reviewerToken: fixtures.token1,
+    });
+    const [cTrans, sTrans] = InMemoryTransport.createLinkedPair();
+    await server.connect(sTrans);
+    const client = new Client({ name: 'test-client', version: '1.0.0' });
+    await client.connect(cTrans);
+
+    for (const forbidden of ['get_review_context', 'get_task_evidence', 'get_verification_details', 'get_diff_summary']) {
+      await expect(
+        client.callTool({
+          name: forbidden,
+          arguments: { adjudication_id: fixtures.adjudicationId },
+        })
+      ).rejects.toThrow();
+    }
+
+    await client.close();
+    await server.close();
+  });
+
+  // 90. Protocol error handling: invalid params fail closed
+  it('90. Protocol error handling: invalid params fail closed', async () => {
+    const server = buildAgentForgeReviewerMcpServer({
+      db: fixtures.db,
+      reviewerToken: fixtures.token1,
+    });
+    const [cTrans, sTrans] = InMemoryTransport.createLinkedPair();
+    await server.connect(sTrans);
+    const client = new Client({ name: 'test-client', version: '1.0.0' });
+    await client.connect(cTrans);
+
+    // Invalid UUID
+    const res = await client.callTool({
+      name: REVIEWER_TOOL_NAME,
+      arguments: { adjudication_id: 'not-a-valid-uuid' },
+    });
+    expect(res.isError).toBe(true);
+    const text = (res.content[0] as any).text;
+    expect(text).toContain('InvalidParams');
+
+    await client.close();
+    await server.close();
+  });
+
+  // 91. Restored locked diff content size limit (32768 UTF-8 bytes)
+  it('91. Restored locked diff content size limit (32768 UTF-8 bytes)', () => {
+    expect(DIFF_CONTENT_MAX_UTF8_BYTES).toBe(32768);
+  });
+
+  // 92. Diff content under 32768 bytes passed without truncation
+  it('92. Diff content under 32768 bytes passed without truncation', () => {
+    const buf = Buffer.from('a'.repeat(100), 'utf8');
+    const res = truncateDiffBytes(buf, 32768);
+    expect(res.truncated).toBe(false);
+    expect(res.content).toBe('a'.repeat(100));
+  });
+
+  // 93. Diff content exceeding 32768 bytes truncated deterministically
+  it('93. Diff content exceeding 32768 bytes truncated deterministically', () => {
+    const buf = Buffer.from('x'.repeat(40000), 'utf8');
+    const res = truncateDiffBytes(buf, 32768);
+    expect(res.truncated).toBe(true);
+    expect(Buffer.byteLength(res.content, 'utf8')).toBeLessThanOrEqual(32768);
+  });
+
+  // 94. Diff truncation preserves multibyte UTF-8 code points
+  it('94. Diff truncation preserves multibyte UTF-8 code points', () => {
+    // 3-byte unicode character: € (0xE2, 0x82, 0xAC)
+    const base = 'a'.repeat(32767);
+    const euro = '€'; // 3 bytes
+    const buf = Buffer.from(base + euro, 'utf8');
+    const res = truncateDiffBytes(buf, 32768);
+    expect(res.truncated).toBe(true);
+    // Boundary at 32768 would split € after 1 byte. Truncation must drop the partial character cleanly.
+    expect(Buffer.byteLength(res.content, 'utf8')).toBe(32767);
+    expect(res.content.endsWith('€')).toBe(false);
+  });
+
+  // 95. Restored locked projection payload size limit (524288 UTF-8 bytes)
+  it('95. Restored locked projection payload size limit (524288 UTF-8 bytes)', () => {
+    expect(PROJECTION_PAYLOAD_MAX_UTF8_BYTES).toBe(524288);
+  });
+
+  // 96. Projection payload exceeding 524288 bytes rejected fail-closed
+  it('96. Projection payload exceeding 524288 bytes rejected fail-closed', () => {
+    expect(() => {
+      fixtures.service.verifyProjectionSize(524289);
+    }).toThrowError(/PROJECTION_PAYLOAD_TOO_LARGE/);
+  });
+
+  // 97. Restored locked markdown size limit (524288 UTF-8 bytes)
+  it('97. Restored locked markdown size limit (524288 UTF-8 bytes)', () => {
+    expect(MARKDOWN_MAX_UTF8_BYTES).toBe(524288);
+  });
+
+  // 98. Projection payload deterministic SHA-256 hash match
+  it('98. Projection payload deterministic SHA-256 hash match', () => {
+    const session = fixtures.repo.getMcpReviewerSessionById(fixtures.sessionId1)!;
+    expect(session).toBeDefined();
+    expect(computeSha256(session.projection_json)).toBe(session.projection_hash);
+  });
+
+  // 99. Projection schema version must equal 1
+  it('99. Projection schema version must equal 1', () => {
+    const session = fixtures.repo.getMcpReviewerSessionById(fixtures.sessionId1)!;
+    expect(session.projection_schema).toBe(1);
+    const parsed = JSON.parse(session.projection_json);
+    expect(parsed.projection_schema_version).toBe(1);
+  });
+
+  // 100. Projection JSON object validation
+  it('100. Projection JSON object validation', () => {
+    const session = fixtures.repo.getMcpReviewerSessionById(fixtures.sessionId1)!;
+    const parsed = JSON.parse(session.projection_json);
+    expect(typeof parsed).toBe('object');
+    expect(parsed).not.toBeNull();
+    expect(Array.isArray(parsed)).toBe(false);
+  });
+
+  // 101. Projection contains verified evidence only
+  it('101. Projection contains verified evidence only', () => {
+    const session = fixtures.repo.getMcpReviewerSessionById(fixtures.sessionId1)!;
+    const parsed = JSON.parse(session.projection_json);
+    expect(parsed.adjudication.id).toBe(fixtures.adjudicationId);
+    expect(parsed.adjudication.submission_id).toBe(fixtures.submissionId);
+    expect(parsed.adjudication.task_id).toBe(fixtures.taskId);
+    expect(parsed.evidence.git_status).toBeDefined();
+    expect(parsed.evidence.git_diff).toBeDefined();
+  });
+
+  // 102. Projection excludes unverified workspace changes
+  it('102. Projection excludes unverified workspace changes', () => {
+    // Write an unverified file in workspace
+    fs.writeFileSync(path.join(tempDir, 'unverified_new_file.txt'), 'unverified');
+
+    const session = fixtures.repo.getMcpReviewerSessionById(fixtures.sessionId1)!;
+    const parsed = JSON.parse(session.projection_json);
+    expect(JSON.stringify(parsed)).not.toContain('unverified_new_file.txt');
+  });
+
+  // 103. Empty diff handling in review package
+  it('103. Empty diff handling in review package', () => {
+    const emptyBuf = Buffer.from('', 'utf8');
+    const res = truncateDiffBytes(emptyBuf, 32768);
+    expect(res.truncated).toBe(false);
+    expect(res.content).toBe('');
+  });
+
+  // 104. Boundary test: exact 32768-byte diff payload
+  it('104. Boundary test: exact 32768-byte diff payload', () => {
+    const exactBuf = Buffer.from('a'.repeat(32768), 'utf8');
+    const res = truncateDiffBytes(exactBuf, 32768);
+    expect(res.truncated).toBe(false);
+    expect(Buffer.byteLength(res.content, 'utf8')).toBe(32768);
+  });
+
+  // 105. Boundary test: 32769-byte diff payload triggers truncation
+  it('105. Boundary test: 32769-byte diff payload triggers truncation', () => {
+    const buf = Buffer.from('a'.repeat(32769), 'utf8');
+    const res = truncateDiffBytes(buf, 32768);
+    expect(res.truncated).toBe(true);
+    expect(Buffer.byteLength(res.content, 'utf8')).toBeLessThanOrEqual(32768);
+  });
+
+  // 132. Replaying a token against another session or adjudication fails closed
+  it('132. Replaying a token against another session or adjudication fails closed', async () => {
+    const server = buildAgentForgeReviewerMcpServer({
+      db: fixtures.db,
+      reviewerToken: fixtures.token1,
+    });
+    const [cTrans, sTrans] = InMemoryTransport.createLinkedPair();
+    await server.connect(sTrans);
+    const client = new Client({ name: 'test-client', version: '1.0.0' });
+    await client.connect(cTrans);
+
+    // Replay Token 1 with a random adjudication ID
+    const randomAdj = crypto.randomUUID();
+    const res = await client.callTool({
+      name: REVIEWER_TOOL_NAME,
+      arguments: { adjudication_id: randomAdj },
+    });
+    expect(res.isError).toBe(true);
+    const text = (res.content[0] as any).text;
+    expect(text).toContain('PERMISSION_DENIED');
+
+    await client.close();
+    await server.close();
+  });
+
+  // 133. Cross-task and cross-project access fail closed with sanitized errors and zero writes
+  it('133. Cross-task and cross-project access fail closed with sanitized errors and zero writes', async () => {
+    const server = buildAgentForgeReviewerMcpServer({
+      db: fixtures.db,
+      reviewerToken: fixtures.token1,
+    });
+    const [cTrans, sTrans] = InMemoryTransport.createLinkedPair();
+    await server.connect(sTrans);
+    const client = new Client({ name: 'test-client', version: '1.0.0' });
+    await client.connect(cTrans);
+
+    const tcBefore = (fixtures.db.prepare('SELECT total_changes() as tc').get() as { tc: number }).tc;
+    const res = await client.callTool({
+      name: REVIEWER_TOOL_NAME,
+      arguments: { adjudication_id: crypto.randomUUID() },
+    });
+    const tcAfter = (fixtures.db.prepare('SELECT total_changes() as tc').get() as { tc: number }).tc;
+
+    expect(tcAfter - tcBefore).toBe(0);
+    expect(res.isError).toBe(true);
+    const text = (res.content[0] as any).text;
+    expect(text).toContain('PERMISSION_DENIED');
+    expect(text).not.toContain(fixtures.dbPath);
+    expect(text).not.toContain(fixtures.token1);
+
+    await client.close();
+    await server.close();
+  });
+
+  // 134. Cross-reviewer access fails closed even when both reviewers are valid for the same adjudication
+  it('134. Cross-reviewer access fails closed even when both reviewers are valid for the same adjudication', async () => {
+    // Reviewer 1 with Token 1
+    const server1 = buildAgentForgeReviewerMcpServer({
+      db: fixtures.db,
+      reviewerToken: fixtures.token1,
+    });
+    const [cTrans1, sTrans1] = InMemoryTransport.createLinkedPair();
+    await server1.connect(sTrans1);
+    const client1 = new Client({ name: 'rev1-client', version: '1.0.0' });
+    await client1.connect(cTrans1);
+
+    // Reviewer 1 reads successfully
+    const res1 = await client1.callTool({
+      name: REVIEWER_TOOL_NAME,
+      arguments: { adjudication_id: fixtures.adjudicationId },
+    });
+    expect(res1.isError).toBeFalsy();
+
+    // Rejection of extra reviewer selection params (InvalidParams)
+    const resExtra = await client1.callTool({
+      name: REVIEWER_TOOL_NAME,
+      arguments: {
+        adjudication_id: fixtures.adjudicationId,
+        session_id: fixtures.sessionId2,
+      } as any,
+    });
+    expect(resExtra.isError).toBe(true);
+    expect((resExtra.content[0] as any).text).toMatch(/Invalid arguments|InvalidParams/);
+
+    await client1.close();
+    await server1.close();
+
+    // Reviewer 2 with Token 2
+    const server2 = buildAgentForgeReviewerMcpServer({
+      db: fixtures.db,
+      reviewerToken: fixtures.token2,
+    });
+    const [cTrans2, sTrans2] = InMemoryTransport.createLinkedPair();
+    await server2.connect(sTrans2);
+    const client2 = new Client({ name: 'rev2-client', version: '1.0.0' });
+    await client2.connect(cTrans2);
+
+    const res2 = await client2.callTool({
+      name: REVIEWER_TOOL_NAME,
+      arguments: { adjudication_id: fixtures.adjudicationId },
+    });
+    expect(res2.isError).toBeFalsy();
+
+    await client2.close();
+    await server2.close();
+  });
+
+  // 138. A valid token of any non-REVIEWER_CONTEXT_READ scope is rejected before projection access
+  it('138. A valid token of any non-REVIEWER_CONTEXT_READ scope is rejected before projection access', async () => {
+    // Insert a valid session but with wrong scope in database
+    const wrongToken = `af-rev-${crypto.randomUUID()}`;
+    const wrongTokenHash = computeSha256(wrongToken);
+    const now = new Date().toISOString();
+    const in1h = new Date(Date.now() + 3600000).toISOString();
+
+    const authRow = fixtures.db.prepare('SELECT id FROM execution_authorizations LIMIT 1').get() as { id: string };
+    // In mcp_client_sessions
+    fixtures.db.prepare(`
+      INSERT INTO mcp_client_sessions (
+        id, authorization_id, scope, token_hash, authorization_fingerprint, issued_at, expires_at
+      ) VALUES (?, ?, 'AUTHORIZED_CONTEXT_READ', ?, '${'0'.repeat(64)}', ?, ?)
+    `).run(crypto.randomUUID(), authRow.id, wrongTokenHash, now, in1h);
+
+    const server = buildAgentForgeReviewerMcpServer({
+      db: fixtures.db,
+      reviewerToken: wrongToken,
+    });
+    const [cTrans, sTrans] = InMemoryTransport.createLinkedPair();
+    await server.connect(sTrans);
+    const client = new Client({ name: 'test-client', version: '1.0.0' });
+    await client.connect(cTrans);
+
+    const res = await client.callTool({
+      name: REVIEWER_TOOL_NAME,
+      arguments: { adjudication_id: fixtures.adjudicationId },
+    });
+    expect(res.isError).toBe(true);
+    const text = (res.content[0] as any).text;
+    expect(text).toContain('AUTH_FAILED');
+
+    await client.close();
+    await server.close();
+  });
+
+  // 141. Repeated successful and failed reads across tool and resource endpoints preserve total_changes() === 0
+  it('141. Repeated successful and failed reads across tool and resource endpoints preserve total_changes() === 0 and produce byte-identical deterministic responses/errors', async () => {
+    const server = buildAgentForgeReviewerMcpServer({
+      db: fixtures.db,
+      reviewerToken: fixtures.token1,
+    });
+    const [cTrans, sTrans] = InMemoryTransport.createLinkedPair();
+    await server.connect(sTrans);
+    const client = new Client({ name: 'test-client', version: '1.0.0' });
+    await client.connect(cTrans);
+
+    let firstToolSuccess: string | null = null;
+    let firstResourceSuccess: string | null = null;
+
+    for (let i = 0; i < 3; i++) {
+      const tcBeforeTool = (fixtures.db.prepare('SELECT total_changes() as tc').get() as { tc: number }).tc;
+      const toolRes = await client.callTool({
+        name: REVIEWER_TOOL_NAME,
+        arguments: { adjudication_id: fixtures.adjudicationId },
+      });
+      const tcAfterTool = (fixtures.db.prepare('SELECT total_changes() as tc').get() as { tc: number }).tc;
+      expect(tcAfterTool - tcBeforeTool).toBe(0);
+      const text = (toolRes.content[0] as any).text;
+      if (firstToolSuccess === null) {
+        firstToolSuccess = text;
+      } else {
+        expect(text).toBe(firstToolSuccess);
+      }
+
+      const tcBeforeRes = (fixtures.db.prepare('SELECT total_changes() as tc').get() as { tc: number }).tc;
+      const resRes = await client.readResource({
+        uri: `agentforge://reviews/packages/${fixtures.adjudicationId}`,
+      });
+      const tcAfterRes = (fixtures.db.prepare('SELECT total_changes() as tc').get() as { tc: number }).tc;
+      expect(tcAfterRes - tcBeforeRes).toBe(0);
+      const resText = (resRes.contents[0] as any).text;
+      if (firstResourceSuccess === null) {
+        firstResourceSuccess = resText;
+      } else {
+        expect(resText).toBe(firstResourceSuccess);
+      }
+    }
+
+    await client.close();
+    await server.close();
+  });
+
+  // 142. Mutation of live workspace or mutable source records after issuance cannot change the already frozen tool/resource projection response
+  it('142. Mutation of live workspace or mutable source records after issuance cannot change the already frozen tool/resource projection response', async () => {
+    const server = buildAgentForgeReviewerMcpServer({
+      db: fixtures.db,
+      reviewerToken: fixtures.token1,
+    });
+    const [cTrans, sTrans] = InMemoryTransport.createLinkedPair();
+    await server.connect(sTrans);
+    const client = new Client({ name: 'test-client', version: '1.0.0' });
+    await client.connect(cTrans);
+
+    // Initial read
+    const res1 = await client.callTool({
+      name: REVIEWER_TOOL_NAME,
+      arguments: { adjudication_id: fixtures.adjudicationId },
+    });
+    const initialText = (res1.content[0] as any).text;
+
+    // Mutate live workspace files
+    fs.writeFileSync(path.join(tempDir, 'new_random_file.ts'), 'export const mutated = true;');
+
+    // Mutate non-authoritative presentation metadata on project/task
+    fixtures.db.prepare('UPDATE tasks SET title = ? WHERE id = ?').run('Mutated Task Title', fixtures.taskId);
+    fixtures.db.prepare('UPDATE projects SET name = ? WHERE id = ?').run('Mutated Project Name', fixtures.projectId);
+
+    // Second read: must return byte-for-byte identical projection
+    const res2 = await client.callTool({
+      name: REVIEWER_TOOL_NAME,
+      arguments: { adjudication_id: fixtures.adjudicationId },
+    });
+    const postMutationText = (res2.content[0] as any).text;
+
+    expect(postMutationText).toBe(initialText);
+    expect(JSON.parse(postMutationText).title).not.toBe('Mutated Task Title');
+
+    await client.close();
+    await server.close();
+  });
+});

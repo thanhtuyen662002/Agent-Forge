@@ -21,7 +21,9 @@
     "mcp:stdio": "node dist-electron/mcp/stdio.js",
     "mcp:session-admin": "node dist-electron/mcp/sessionAdmin.js",
     "mcp:submission-stdio": "node dist-electron/mcp/stdio-submit.js",
-    "mcp:submission-admin": "node dist-electron/mcp/submissionAdmin.js"
+    "mcp:submission-admin": "node dist-electron/mcp/submissionAdmin.js",
+    "mcp:reviewer-stdio": "node dist-electron/mcp/stdio-review.js",
+    "mcp:reviewer-admin": "node dist-electron/mcp/reviewerAdmin.js"
   },
   "dependencies": {
     "@modelcontextprotocol/server": "2.0.0",
