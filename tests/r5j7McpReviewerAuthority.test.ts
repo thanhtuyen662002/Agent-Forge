@@ -4,7 +4,14 @@ import os from 'os';
 import crypto from 'crypto';
 import Database from 'better-sqlite3';
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
-import { MigrationRunner, MIGRATIONS, verifyMigration24SchemaAuthority } from '../src/core/database/migrations';
+import {
+  MigrationRunner,
+  MIGRATIONS,
+  verifyMigration24SchemaAuthority,
+  MIGRATION_24_EXPECTED_SQL_SHA256,
+  MIGRATION_24_GZIP_CHUNKS,
+  decompressMigration24Sql,
+} from '../src/core/database/migrations';
 import { Repository } from '../src/core/database/repositories';
 import { ArtifactStore } from '../src/core/services/ArtifactStore';
 import {
@@ -14,6 +21,7 @@ import {
   fatalUtf8Decode,
 } from '../src/mcp/reviewerAuthority';
 import {
+  McpReviewerSession,
   REVIEWER_TOKEN_PREFIX,
   REVIEWER_TOKEN_SCOPE,
   DIFF_CONTENT_MAX_UTF8_BYTES,
@@ -1513,4 +1521,439 @@ describe('R5J7 MCP Reviewer Authority & Invariants (Cases 1–70, 124–131, 135
     const count = (fixtures.db.prepare('SELECT COUNT(*) as c FROM mcp_reviewer_sessions').get() as any).c;
     expect(count).toBe(0);
   });
+
+  function createAdjudicationWithEvidence(statusEvId: string, diffEvId: string): string {
+    const adjId = crypto.randomUUID();
+    const now = new Date().toISOString();
+    const baseAdj = fixtures.repo.getCoderSubmissionAdjudicationById(fixtures.adjudicationId)!;
+    fixtures.db.prepare(`
+      INSERT INTO coder_submission_adjudications (
+        id, request_id, submission_id, authorization_id, project_id, task_id, attempt_id, assignment_id,
+        task_ownership_epoch, action, status, lifecycle_version,
+        authority_snapshot_json, authority_snapshot_hash,
+        verification_commands_json, verification_commands_hash,
+        verification_result_envelope_json, verification_result_envelope_hash,
+        test_run_id, git_status_evidence_id, git_diff_evidence_id,
+        artifact_manifest_json, artifact_manifest_hash,
+        created_at, verification_started_at, completed_at
+      ) VALUES (
+        ?, ?, ?, ?, ?, ?, ?, ?,
+        1, 'ADMIT_VERIFICATION', 'VERIFIED', 1,
+        ?, ?,
+        '{}', '${'0'.repeat(64)}',
+        ?, ?,
+        ?, ?, ?,
+        '{}', '${'0'.repeat(64)}',
+        ?, ?, ?
+      )
+    `).run(
+      adjId, crypto.randomUUID(), fixtures.submissionId, fixtures.authId, fixtures.projectId, fixtures.taskId, fixtures.attemptId, fixtures.assignmentId,
+      baseAdj.authority_snapshot_json, baseAdj.authority_snapshot_hash,
+      baseAdj.verification_result_envelope_json, baseAdj.verification_result_envelope_hash,
+      baseAdj.test_run_id, statusEvId, diffEvId,
+      now, now, now
+    );
+    return adjId;
+  }
+
+  // 143. INLINE git-status hash mismatch fails closed before session insertion
+  it('143. INLINE git-status hash mismatch fails closed before session insertion', () => {
+    const inlineStatusId = `ev-inline-status-${crypto.randomUUID()}`;
+    const payload = JSON.stringify({ isClean: true, files: [] });
+    const realBytes = Buffer.byteLength(payload, 'utf8');
+    const corruptedHash = 'e'.repeat(64);
+
+    fixtures.db.prepare(`
+      INSERT INTO evidence (id, project_id, task_id, attempt_id, evidence_type, storage_type, raw_payload, hash, byte_size, summary, created_at)
+      VALUES (?, ?, ?, ?, 'GIT_STATUS', 'INLINE', ?, ?, ?, 'Inline status mismatch', ?)
+    `).run(inlineStatusId, fixtures.projectId, fixtures.taskId, fixtures.attemptId, payload, corruptedHash, realBytes, new Date().toISOString());
+
+    const testAdjId = createAdjudicationWithEvidence(inlineStatusId, (fixtures.repo.getCoderSubmissionAdjudicationById(fixtures.adjudicationId) as any).git_diff_evidence_id);
+
+    expect(() => {
+      fixtures.service.issueReviewerSession({
+        adjudication_id: testAdjId,
+        reviewer_agent_id: fixtures.reviewerAgentId,
+        reviewer_provider_id: fixtures.reviewerProviderId,
+        reviewer_account_id: fixtures.reviewerAccountId,
+        reviewer_resource_id: fixtures.reviewerResourceId,
+      });
+    }).toThrowError(/PROJECTION_HASH_MISMATCH/);
+
+    const count = (fixtures.db.prepare('SELECT COUNT(*) as c FROM mcp_reviewer_sessions WHERE adjudication_id = ?').get(testAdjId) as any).c;
+    expect(count).toBe(0);
+  });
+
+  // 144. INLINE git-status byte-size mismatch fails closed before session insertion
+  it('144. INLINE git-status byte-size mismatch fails closed before session insertion', () => {
+    const inlineStatusId = `ev-inline-status-${crypto.randomUUID()}`;
+    const payload = JSON.stringify({ isClean: true, files: [] });
+    const realHash = computeSha256(payload);
+    const wrongBytes = Buffer.byteLength(payload, 'utf8') + 42;
+
+    fixtures.db.prepare(`
+      INSERT INTO evidence (id, project_id, task_id, attempt_id, evidence_type, storage_type, raw_payload, hash, byte_size, summary, created_at)
+      VALUES (?, ?, ?, ?, 'GIT_STATUS', 'INLINE', ?, ?, ?, 'Inline status size mismatch', ?)
+    `).run(inlineStatusId, fixtures.projectId, fixtures.taskId, fixtures.attemptId, payload, realHash, wrongBytes, new Date().toISOString());
+
+    const testAdjId = createAdjudicationWithEvidence(inlineStatusId, (fixtures.repo.getCoderSubmissionAdjudicationById(fixtures.adjudicationId) as any).git_diff_evidence_id);
+
+    expect(() => {
+      fixtures.service.issueReviewerSession({
+        adjudication_id: testAdjId,
+        reviewer_agent_id: fixtures.reviewerAgentId,
+        reviewer_provider_id: fixtures.reviewerProviderId,
+        reviewer_account_id: fixtures.reviewerAccountId,
+        reviewer_resource_id: fixtures.reviewerResourceId,
+      });
+    }).toThrowError(/PROJECTION_HASH_MISMATCH/);
+
+    const count = (fixtures.db.prepare('SELECT COUNT(*) as c FROM mcp_reviewer_sessions WHERE adjudication_id = ?').get(testAdjId) as any).c;
+    expect(count).toBe(0);
+  });
+
+  // 145. INLINE git-diff hash mismatch fails closed before session insertion
+  it('145. INLINE git-diff hash mismatch fails closed before session insertion', () => {
+    const inlineDiffId = `ev-inline-diff-${crypto.randomUUID()}`;
+    const payload = 'diff --git a/test.ts b/test.ts\n--- a/test.ts\n+++ b/test.ts\n@@ -1 +1 @@\n-1\n+2\n';
+    const realBytes = Buffer.byteLength(payload, 'utf8');
+    const corruptedHash = 'd'.repeat(64);
+
+    fixtures.db.prepare(`
+      INSERT INTO evidence (id, project_id, task_id, attempt_id, evidence_type, storage_type, raw_payload, hash, byte_size, summary, created_at)
+      VALUES (?, ?, ?, ?, 'GIT_DIFF', 'INLINE', ?, ?, ?, 'Inline diff mismatch', ?)
+    `).run(inlineDiffId, fixtures.projectId, fixtures.taskId, fixtures.attemptId, payload, corruptedHash, realBytes, new Date().toISOString());
+
+    const testAdjId = createAdjudicationWithEvidence((fixtures.repo.getCoderSubmissionAdjudicationById(fixtures.adjudicationId) as any).git_status_evidence_id, inlineDiffId);
+
+    expect(() => {
+      fixtures.service.issueReviewerSession({
+        adjudication_id: testAdjId,
+        reviewer_agent_id: fixtures.reviewerAgentId,
+        reviewer_provider_id: fixtures.reviewerProviderId,
+        reviewer_account_id: fixtures.reviewerAccountId,
+        reviewer_resource_id: fixtures.reviewerResourceId,
+      });
+    }).toThrowError(/PROJECTION_HASH_MISMATCH/);
+
+    const count = (fixtures.db.prepare('SELECT COUNT(*) as c FROM mcp_reviewer_sessions WHERE adjudication_id = ?').get(testAdjId) as any).c;
+    expect(count).toBe(0);
+  });
+
+  // 146. INLINE git-diff byte-size mismatch fails closed before session insertion
+  it('146. INLINE git-diff byte-size mismatch fails closed before session insertion', () => {
+    const inlineDiffId = `ev-inline-diff-${crypto.randomUUID()}`;
+    const payload = 'diff --git a/test.ts b/test.ts\n--- a/test.ts\n+++ b/test.ts\n@@ -1 +1 @@\n-1\n+2\n';
+    const realHash = computeSha256(payload);
+    const wrongBytes = Buffer.byteLength(payload, 'utf8') + 99;
+
+    fixtures.db.prepare(`
+      INSERT INTO evidence (id, project_id, task_id, attempt_id, evidence_type, storage_type, raw_payload, hash, byte_size, summary, created_at)
+      VALUES (?, ?, ?, ?, 'GIT_DIFF', 'INLINE', ?, ?, ?, 'Inline diff size mismatch', ?)
+    `).run(inlineDiffId, fixtures.projectId, fixtures.taskId, fixtures.attemptId, payload, realHash, wrongBytes, new Date().toISOString());
+
+    const testAdjId = createAdjudicationWithEvidence((fixtures.repo.getCoderSubmissionAdjudicationById(fixtures.adjudicationId) as any).git_status_evidence_id, inlineDiffId);
+
+    expect(() => {
+      fixtures.service.issueReviewerSession({
+        adjudication_id: testAdjId,
+        reviewer_agent_id: fixtures.reviewerAgentId,
+        reviewer_provider_id: fixtures.reviewerProviderId,
+        reviewer_account_id: fixtures.reviewerAccountId,
+        reviewer_resource_id: fixtures.reviewerResourceId,
+      });
+    }).toThrowError(/PROJECTION_HASH_MISMATCH/);
+
+    const count = (fixtures.db.prepare('SELECT COUNT(*) as c FROM mcp_reviewer_sessions WHERE adjudication_id = ?').get(testAdjId) as any).c;
+    expect(count).toBe(0);
+  });
+
+  // 147. Zero reviewer-session rows written after every failed issuance
+  it('147. Zero reviewer-session rows written after every failed issuance', () => {
+    const beforeCount = (fixtures.db.prepare('SELECT COUNT(*) as c FROM mcp_reviewer_sessions').get() as any).c;
+
+    // Trigger failure by unknown adjudication
+    expect(() => {
+      fixtures.service.issueReviewerSession({
+        adjudication_id: crypto.randomUUID(),
+        reviewer_agent_id: fixtures.reviewerAgentId,
+        reviewer_provider_id: fixtures.reviewerProviderId,
+        reviewer_account_id: fixtures.reviewerAccountId,
+        reviewer_resource_id: fixtures.reviewerResourceId,
+      });
+    }).toThrowError(/NOT_FOUND/);
+
+    const afterCount = (fixtures.db.prepare('SELECT COUNT(*) as c FROM mcp_reviewer_sessions').get() as any).c;
+    expect(afterCount).toBe(beforeCount);
+  });
+
+  // 148. Migration 24 deterministic decompression, explicit expected SHA-256 hash match, and schema verification
+  it('148. Migration 24 deterministic decompression, explicit expected SHA-256 hash match, and schema verification', () => {
+    // 1. Decompress stored GZIP chunks
+    const decompressedSql = decompressMigration24Sql(MIGRATION_24_GZIP_CHUNKS);
+    expect(decompressedSql.length).toBeGreaterThan(0);
+
+    // 2. Assert explicit deterministic SHA-256 hash
+    const computedHash = computeSha256(decompressedSql);
+    expect(computedHash).toBe(MIGRATION_24_EXPECTED_SQL_SHA256);
+    expect(MIGRATION_24_EXPECTED_SQL_SHA256).toBe('2fc99142425342a96d76c187ad86f5ed433c214718f0a3790e482c2767a751fd');
+
+    // 3. Assert complete schema authority on live database (19 columns, 6 RESTRICT FKs, 4 indexes, 3 triggers)
+    expect(() => verifyMigration24SchemaAuthority(fixtures.db)).not.toThrow();
+
+    // 4. Corrupted compressed chunks must fail loudly and fail closed
+    expect(() => decompressMigration24Sql(['not-valid-base64-or-gzip'])).toThrowError(/MIGRATION_24_DECOMPRESSION_FAILED/);
+  });
+
+  // 149. Direct DB test: Malformed projection_json fails closed on read with PROJECTION_CORRUPTED
+  it('149. Direct DB test: Malformed projection_json fails closed on read with PROJECTION_CORRUPTED', () => {
+    const rawToken = `${REVIEWER_TOKEN_PREFIX}${crypto.randomUUID()}`;
+    const tokenHash = computeSha256(rawToken);
+    const now = new Date().toISOString();
+    const expiresAt = new Date(Date.now() + 3600000).toISOString();
+    const malformedJson = '{invalid-json-content: true';
+    const malformedHash = computeSha256(malformedJson);
+
+    const adj = fixtures.repo.getCoderSubmissionAdjudicationById(fixtures.adjudicationId)!;
+
+    // 1. Assert DB level CHECK constraint rejects non-JSON insertion
+    expect(() => {
+      fixtures.db.prepare(`
+        INSERT INTO mcp_reviewer_sessions (
+          id, adjudication_id, submission_id, reviewer_agent_id, reviewer_provider_id,
+          reviewer_account_id, reviewer_resource_id, scope, token_hash, task_ownership_epoch,
+          authority_snapshot_hash, verification_result_envelope_hash, projection_schema,
+          projection_hash, projection_json, issued_at, expires_at, revoked_at, revocation_reason
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?, NULL, NULL)
+      `).run(
+        crypto.randomUUID(), fixtures.adjudicationId, fixtures.submissionId, fixtures.reviewerAgentId,
+        fixtures.reviewerProviderId, fixtures.reviewerAccountId, fixtures.reviewerResourceId,
+        REVIEWER_TOKEN_SCOPE, tokenHash, adj.task_ownership_epoch, adj.authority_snapshot_hash,
+        adj.verification_result_envelope_hash, malformedHash, malformedJson, now, expiresAt
+      );
+    }).toThrowError(/CHECK constraint failed.*projection_json/);
+
+    // 2. Assert read-time service validation also fails closed on malformed projection_json
+    const mockCorruptedSession: McpReviewerSession = {
+      id: crypto.randomUUID(),
+      adjudication_id: fixtures.adjudicationId,
+      submission_id: fixtures.submissionId,
+      reviewer_agent_id: fixtures.reviewerAgentId,
+      reviewer_provider_id: fixtures.reviewerProviderId,
+      reviewer_account_id: fixtures.reviewerAccountId,
+      reviewer_resource_id: fixtures.reviewerResourceId,
+      scope: REVIEWER_TOKEN_SCOPE,
+      token_hash: tokenHash,
+      task_ownership_epoch: adj.task_ownership_epoch,
+      authority_snapshot_hash: adj.authority_snapshot_hash,
+      verification_result_envelope_hash: adj.verification_result_envelope_hash!,
+      projection_schema: 1,
+      projection_hash: malformedHash,
+      projection_json: malformedJson,
+      issued_at: now,
+      expires_at: expiresAt,
+      revoked_at: null,
+      revocation_reason: null,
+    };
+
+    const initialChanges = (fixtures.db.prepare('SELECT total_changes() as c').get() as any).c;
+    expect(() => {
+      fixtures.service.getReviewPackage(mockCorruptedSession, fixtures.adjudicationId);
+    }).toThrowError(/PROJECTION_CORRUPTED/);
+
+    const finalChanges = (fixtures.db.prepare('SELECT total_changes() as c').get() as any).c;
+    expect(finalChanges).toBe(initialChanges);
+  });
+
+  // 150. Direct DB test: Mismatched projection_hash fails closed on read with PROJECTION_HASH_MISMATCH
+  it('150. Direct DB test: Mismatched projection_hash fails closed on read with PROJECTION_HASH_MISMATCH', () => {
+    const rawToken = `${REVIEWER_TOKEN_PREFIX}${crypto.randomUUID()}`;
+    const tokenHash = computeSha256(rawToken);
+    const now = new Date().toISOString();
+    const expiresAt = new Date(Date.now() + 3600000).toISOString();
+    const validJson = JSON.stringify({
+      projection_schema_version: 1,
+      adjudication: { id: fixtures.adjudicationId },
+      evidence: { git_status: {}, git_diff: {} },
+      disposition: { disposition_event: 'SETTLED', disposition_reason: 'ACCEPTED_VERIFIED' },
+    });
+    const mismatchedHash = 'a'.repeat(64);
+
+    const adj = fixtures.repo.getCoderSubmissionAdjudicationById(fixtures.adjudicationId)!;
+
+    const corruptedSessionId = crypto.randomUUID();
+    fixtures.db.prepare(`
+      INSERT INTO mcp_reviewer_sessions (
+        id, adjudication_id, submission_id, reviewer_agent_id, reviewer_provider_id,
+        reviewer_account_id, reviewer_resource_id, scope, token_hash, task_ownership_epoch,
+        authority_snapshot_hash, verification_result_envelope_hash, projection_schema,
+        projection_hash, projection_json, issued_at, expires_at, revoked_at, revocation_reason
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?, NULL, NULL)
+    `).run(
+      corruptedSessionId, fixtures.adjudicationId, fixtures.submissionId, fixtures.reviewerAgentId,
+      fixtures.reviewerProviderId, fixtures.reviewerAccountId, fixtures.reviewerResourceId,
+      REVIEWER_TOKEN_SCOPE, tokenHash, adj.task_ownership_epoch, adj.authority_snapshot_hash,
+      adj.verification_result_envelope_hash, mismatchedHash, validJson, now, expiresAt
+    );
+
+    const session = fixtures.repo.getMcpReviewerSessionById(corruptedSessionId)!;
+    const initialChanges = (fixtures.db.prepare('SELECT total_changes() as c').get() as any).c;
+
+    expect(() => {
+      fixtures.service.getReviewPackage(session, fixtures.adjudicationId);
+    }).toThrowError(/PROJECTION_HASH_MISMATCH/);
+
+    const finalChanges = (fixtures.db.prepare('SELECT total_changes() as c').get() as any).c;
+    expect(finalChanges).toBe(initialChanges);
+  });
+
+  // 151. Direct DB test: Unsupported projection_schema version fails closed on read with PROJECTION_SCHEMA_INVALID
+  it('151. Direct DB test: Unsupported projection_schema version fails closed on read with PROJECTION_SCHEMA_INVALID', () => {
+    const rawToken = `${REVIEWER_TOKEN_PREFIX}${crypto.randomUUID()}`;
+    const tokenHash = computeSha256(rawToken);
+    const now = new Date().toISOString();
+    const expiresAt = new Date(Date.now() + 3600000).toISOString();
+    const validJson = JSON.stringify({
+      projection_schema_version: 1,
+      adjudication: { id: fixtures.adjudicationId },
+      evidence: { git_status: {}, git_diff: {} },
+      disposition: { disposition_event: 'SETTLED', disposition_reason: 'ACCEPTED_VERIFIED' },
+    });
+    const validHash = computeSha256(validJson);
+
+    const adj = fixtures.repo.getCoderSubmissionAdjudicationById(fixtures.adjudicationId)!;
+
+    // 1. Assert DB level CHECK constraint rejects projection_schema != 1
+    expect(() => {
+      fixtures.db.prepare(`
+        INSERT INTO mcp_reviewer_sessions (
+          id, adjudication_id, submission_id, reviewer_agent_id, reviewer_provider_id,
+          reviewer_account_id, reviewer_resource_id, scope, token_hash, task_ownership_epoch,
+          authority_snapshot_hash, verification_result_envelope_hash, projection_schema,
+          projection_hash, projection_json, issued_at, expires_at, revoked_at, revocation_reason
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 2, ?, ?, ?, ?, NULL, NULL)
+      `).run(
+        crypto.randomUUID(), fixtures.adjudicationId, fixtures.submissionId, fixtures.reviewerAgentId,
+        fixtures.reviewerProviderId, fixtures.reviewerAccountId, fixtures.reviewerResourceId,
+        REVIEWER_TOKEN_SCOPE, tokenHash, adj.task_ownership_epoch, adj.authority_snapshot_hash,
+        adj.verification_result_envelope_hash, validHash, validJson, now, expiresAt
+      );
+    }).toThrowError(/CHECK constraint failed.*projection_schema/);
+
+    // 2. Assert read-time service validation also fails closed on unsupported schema
+    const mockUnsupportedSchemaSession: McpReviewerSession = {
+      id: crypto.randomUUID(),
+      adjudication_id: fixtures.adjudicationId,
+      submission_id: fixtures.submissionId,
+      reviewer_agent_id: fixtures.reviewerAgentId,
+      reviewer_provider_id: fixtures.reviewerProviderId,
+      reviewer_account_id: fixtures.reviewerAccountId,
+      reviewer_resource_id: fixtures.reviewerResourceId,
+      scope: REVIEWER_TOKEN_SCOPE,
+      token_hash: tokenHash,
+      task_ownership_epoch: adj.task_ownership_epoch,
+      authority_snapshot_hash: adj.authority_snapshot_hash,
+      verification_result_envelope_hash: adj.verification_result_envelope_hash!,
+      projection_schema: 2,
+      projection_hash: validHash,
+      projection_json: validJson,
+      issued_at: now,
+      expires_at: expiresAt,
+      revoked_at: null,
+      revocation_reason: null,
+    };
+
+    const initialChanges = (fixtures.db.prepare('SELECT total_changes() as c').get() as any).c;
+    expect(() => {
+      fixtures.service.getReviewPackage(mockUnsupportedSchemaSession, fixtures.adjudicationId);
+    }).toThrowError(/PROJECTION_SCHEMA_INVALID/);
+
+    const finalChanges = (fixtures.db.prepare('SELECT total_changes() as c').get() as any).c;
+    expect(finalChanges).toBe(initialChanges);
+  });
+
+  // 152. Direct DB test: Oversized projection_json payload (>512 KiB) fails closed on read with PROJECTION_PAYLOAD_TOO_LARGE
+  it('152. Direct DB test: Oversized projection_json payload (>512 KiB) fails closed on read with PROJECTION_PAYLOAD_TOO_LARGE', () => {
+    const rawToken = `${REVIEWER_TOKEN_PREFIX}${crypto.randomUUID()}`;
+    const tokenHash = computeSha256(rawToken);
+    const now = new Date().toISOString();
+    const expiresAt = new Date(Date.now() + 3600000).toISOString();
+    const oversizedJson = JSON.stringify({
+      projection_schema_version: 1,
+      adjudication: { id: fixtures.adjudicationId },
+      evidence: { git_status: {}, git_diff: { diff_content: 'x'.repeat(PROJECTION_PAYLOAD_MAX_UTF8_BYTES + 1024) } },
+      disposition: { disposition_event: 'SETTLED', disposition_reason: 'ACCEPTED_VERIFIED' },
+    });
+    const oversizedHash = computeSha256(oversizedJson);
+
+    const adj = fixtures.repo.getCoderSubmissionAdjudicationById(fixtures.adjudicationId)!;
+
+    const corruptedSessionId = crypto.randomUUID();
+    fixtures.db.prepare(`
+      INSERT INTO mcp_reviewer_sessions (
+        id, adjudication_id, submission_id, reviewer_agent_id, reviewer_provider_id,
+        reviewer_account_id, reviewer_resource_id, scope, token_hash, task_ownership_epoch,
+        authority_snapshot_hash, verification_result_envelope_hash, projection_schema,
+        projection_hash, projection_json, issued_at, expires_at, revoked_at, revocation_reason
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?, NULL, NULL)
+    `).run(
+      corruptedSessionId, fixtures.adjudicationId, fixtures.submissionId, fixtures.reviewerAgentId,
+      fixtures.reviewerProviderId, fixtures.reviewerAccountId, fixtures.reviewerResourceId,
+      REVIEWER_TOKEN_SCOPE, tokenHash, adj.task_ownership_epoch, adj.authority_snapshot_hash,
+      adj.verification_result_envelope_hash, oversizedHash, oversizedJson, now, expiresAt
+    );
+
+    const session = fixtures.repo.getMcpReviewerSessionById(corruptedSessionId)!;
+    const initialChanges = (fixtures.db.prepare('SELECT total_changes() as c').get() as any).c;
+
+    expect(() => {
+      fixtures.service.getReviewPackage(session, fixtures.adjudicationId);
+    }).toThrowError(/PROJECTION_PAYLOAD_TOO_LARGE/);
+
+    const finalChanges = (fixtures.db.prepare('SELECT total_changes() as c').get() as any).c;
+    expect(finalChanges).toBe(initialChanges);
+  });
+
+  // 153. Direct DB test: Corrupted bounded projection object structure fails closed on read
+  it('153. Direct DB test: Corrupted bounded projection object structure fails closed on read', () => {
+    const rawToken = `${REVIEWER_TOKEN_PREFIX}${crypto.randomUUID()}`;
+    const tokenHash = computeSha256(rawToken);
+    const now = new Date().toISOString();
+    const expiresAt = new Date(Date.now() + 3600000).toISOString();
+    const missingEvidenceJson = JSON.stringify({
+      projection_schema_version: 1,
+      adjudication: { id: fixtures.adjudicationId },
+      // evidence missing
+      disposition: { disposition_event: 'SETTLED', disposition_reason: 'ACCEPTED_VERIFIED' },
+    });
+    const missingHash = computeSha256(missingEvidenceJson);
+
+    const adj = fixtures.repo.getCoderSubmissionAdjudicationById(fixtures.adjudicationId)!;
+
+    const corruptedSessionId = crypto.randomUUID();
+    fixtures.db.prepare(`
+      INSERT INTO mcp_reviewer_sessions (
+        id, adjudication_id, submission_id, reviewer_agent_id, reviewer_provider_id,
+        reviewer_account_id, reviewer_resource_id, scope, token_hash, task_ownership_epoch,
+        authority_snapshot_hash, verification_result_envelope_hash, projection_schema,
+        projection_hash, projection_json, issued_at, expires_at, revoked_at, revocation_reason
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?, NULL, NULL)
+    `).run(
+      corruptedSessionId, fixtures.adjudicationId, fixtures.submissionId, fixtures.reviewerAgentId,
+      fixtures.reviewerProviderId, fixtures.reviewerAccountId, fixtures.reviewerResourceId,
+      REVIEWER_TOKEN_SCOPE, tokenHash, adj.task_ownership_epoch, adj.authority_snapshot_hash,
+      adj.verification_result_envelope_hash, missingHash, missingEvidenceJson, now, expiresAt
+    );
+
+    const session = fixtures.repo.getMcpReviewerSessionById(corruptedSessionId)!;
+    const initialChanges = (fixtures.db.prepare('SELECT total_changes() as c').get() as any).c;
+
+    expect(() => {
+      fixtures.service.getReviewPackage(session, fixtures.adjudicationId);
+    }).toThrowError(/PROJECTION_CORRUPTED/);
+
+    const finalChanges = (fixtures.db.prepare('SELECT total_changes() as c').get() as any).c;
+    expect(finalChanges).toBe(initialChanges);
+  });
+
 });

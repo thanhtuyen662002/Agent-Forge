@@ -62,6 +62,43 @@ export interface ReviewerAuthorityFenceState {
   current_task_ownership_epoch: number;
 }
 
+export interface ReviewerAuthorityLiveValidationParams {
+  sessionId?: string;
+  adjudicationId: string;
+  reviewerAgentId: string;
+  reviewerProviderId: string;
+  reviewerAccountId: string;
+  reviewerResourceId: string;
+}
+
+export interface ReviewerAuthorityLiveValidationResult {
+  adjudication_exists: boolean;
+  adjudication_action: string | null;
+  adjudication_status: string | null;
+  adjudication_recovery_fenced_at: string | null;
+  current_authority_snapshot_hash: string | null;
+  task_exists: boolean;
+  task_state: string | null;
+  current_task_ownership_epoch: number | null;
+  agent_exists: boolean;
+  agent_role: string | null;
+  agent_status: string | null;
+  agent_resource_id: string | null;
+  provider_exists: boolean;
+  provider_enabled: boolean | null;
+  account_exists: boolean;
+  account_provider_id: string | null;
+  account_enabled: boolean | null;
+  account_health_status: string | null;
+  resource_exists: boolean;
+  resource_provider_id: string | null;
+  resource_account_id: string | null;
+  resource_enabled: boolean | null;
+  resource_health_status: string | null;
+  coder_agent_id: string | null;
+  coder_selected_account_id: string | null;
+}
+
 export interface SafeReviewerSessionMetadata {
   id: string;
   adjudication_id: string;

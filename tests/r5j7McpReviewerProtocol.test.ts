@@ -3,7 +3,7 @@ import path from 'path';
 import os from 'os';
 import crypto from 'crypto';
 import Database from 'better-sqlite3';
-import { describe, it, expect, beforeEach, afterEach } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { Client, InMemoryTransport } from '@modelcontextprotocol/client';
 import { MigrationRunner } from '../src/core/database/migrations';
 import { Repository } from '../src/core/database/repositories';
@@ -33,6 +33,8 @@ import {
 import { runReviewerStdioServer } from '../src/mcp/stdio-review';
 import {
   REVIEWER_TOKEN_ENV,
+  REVIEWER_TOKEN_PREFIX,
+  REVIEWER_TOKEN_SCOPE,
   DIFF_CONTENT_MAX_UTF8_BYTES,
   PROJECTION_PAYLOAD_MAX_UTF8_BYTES,
   MARKDOWN_MAX_UTF8_BYTES,
@@ -54,6 +56,8 @@ interface Fixtures {
   reviewerAccountId: string;
   reviewerResourceId: string;
   reviewerAgentId2: string;
+  coderAccountId: string;
+  coderAgentId: string;
   token1: string;
   sessionId1: string;
   token2: string;
@@ -319,6 +323,8 @@ function seedTestEnv(tempDir: string): Fixtures {
     reviewerAccountId,
     reviewerResourceId,
     reviewerAgentId2,
+    coderAccountId,
+    coderAgentId,
     token1: issuance1.raw_token,
     sessionId1: issuance1.session.id,
     token2: issuance2.raw_token,
@@ -326,7 +332,7 @@ function seedTestEnv(tempDir: string): Fixtures {
   };
 }
 
-describe('R5J7 MCP Reviewer Protocol & Tool Surface (Cases 71–105, 132–134, 138, 141, 142)', () => {
+describe('R5J7 MCP Reviewer Protocol & Tool Surface (Cases 71–105, 132–134, 138, 141, 142, 154–170)', () => {
   let tempDir: string;
   let fixtures: Fixtures;
   let originalEnv: string | undefined;
@@ -1156,5 +1162,389 @@ describe('R5J7 MCP Reviewer Protocol & Tool Surface (Cases 71–105, 132–134, 
 
     await client.close();
     await server.close();
+  });
+
+  // --- Section 4 Authority-Drift Regression Tests (154–170) ---
+
+  async function assertFailClosedReadSurface(options: {
+    db: Database.Database;
+    dbPath: string;
+    token: string;
+    adjudicationId: string;
+    expectedErrorCode: string;
+  }) {
+    const server = buildAgentForgeReviewerMcpServer({
+      db: options.db,
+      reviewerToken: options.token,
+    });
+    const [cTrans, sTrans] = InMemoryTransport.createLinkedPair();
+    await server.connect(sTrans);
+    const client = new Client({ name: 'test-client', version: '1.0.0' });
+    await client.connect(cTrans);
+
+    try {
+      // 1. Verify mutation tools are never available
+      const toolList = await client.listTools();
+      expect(toolList.tools.length).toBe(1);
+      expect(toolList.tools[0].name).toBe(REVIEWER_TOOL_NAME);
+      const names = new Set(toolList.tools.map((t) => t.name));
+      for (const forbidden of ['update_task', 'assign_task', 'transition_task', 'git_commit', 'approve_review', 'reject_review']) {
+        expect(names.has(forbidden)).toBe(false);
+      }
+
+      // 2. Tool access fails closed with zero DB writes and sanitized error
+      const tcBeforeTool = (options.db.prepare('SELECT total_changes() as tc').get() as { tc: number }).tc;
+      const toolRes = await client.callTool({
+        name: REVIEWER_TOOL_NAME,
+        arguments: { adjudication_id: options.adjudicationId },
+      });
+      const tcAfterTool = (options.db.prepare('SELECT total_changes() as tc').get() as { tc: number }).tc;
+
+      expect(tcAfterTool - tcBeforeTool).toBe(0);
+      expect(toolRes.isError).toBe(true);
+      const toolText = (toolRes.content[0] as any).text;
+      expect(toolText).toContain(options.expectedErrorCode);
+      expect(toolText).not.toContain(options.dbPath);
+      expect(toolText).not.toContain(options.token);
+
+      // 3. Resource access fails closed with zero DB writes and sanitized error
+      const tcBeforeRes = (options.db.prepare('SELECT total_changes() as tc').get() as { tc: number }).tc;
+      const resRes = await client.readResource({
+        uri: `agentforge://reviews/packages/${options.adjudicationId}`,
+      });
+      const tcAfterRes = (options.db.prepare('SELECT total_changes() as tc').get() as { tc: number }).tc;
+
+      expect(tcAfterRes - tcBeforeRes).toBe(0);
+      const resText = (resRes.contents[0] as any).text;
+      expect(resText).toContain(options.expectedErrorCode);
+      expect(resText).not.toContain(options.dbPath);
+      expect(resText).not.toContain(options.token);
+    } finally {
+      await client.close();
+      await server.close();
+    }
+  }
+
+  // 154. Authority drift: Task leaves REVIEW_READY -> fails closed with zero writes
+  it('154. Authority drift: Task leaves REVIEW_READY -> fails closed with zero writes', async () => {
+    fixtures.db.prepare("UPDATE tasks SET state = 'CODING' WHERE id = ?").run(fixtures.taskId);
+    await assertFailClosedReadSurface({
+      db: fixtures.db,
+      dbPath: fixtures.dbPath,
+      token: fixtures.token1,
+      adjudicationId: fixtures.adjudicationId,
+      expectedErrorCode: 'TASK_STATE_INVALID',
+    });
+  });
+
+  // 155. Authority drift: Task ownership epoch changes -> fails closed with zero writes
+  it('155. Authority drift: Task ownership epoch changes -> fails closed with zero writes', async () => {
+    fixtures.db.prepare("UPDATE tasks SET ownership_epoch = 2 WHERE id = ?").run(fixtures.taskId);
+    await assertFailClosedReadSurface({
+      db: fixtures.db,
+      dbPath: fixtures.dbPath,
+      token: fixtures.token1,
+      adjudicationId: fixtures.adjudicationId,
+      expectedErrorCode: 'STALE_REVIEWER_AUTHORITY',
+    });
+  });
+
+  // 156. Authority drift: Adjudication becomes recovery-fenced -> fails closed with zero writes
+  it('156. Authority drift: Adjudication becomes recovery-fenced -> fails closed with zero writes', async () => {
+    fixtures.db.prepare(`
+      UPDATE coder_submission_adjudications
+      SET status = 'RECOVERY_FENCED', recovery_fenced_at = ?, failure_code = 'RECOVERY_FENCED_FOR_DRIFT_TEST', lifecycle_version = lifecycle_version + 1
+      WHERE id = ?
+    `).run(new Date().toISOString(), fixtures.adjudicationId);
+
+    await assertFailClosedReadSurface({
+      db: fixtures.db,
+      dbPath: fixtures.dbPath,
+      token: fixtures.token1,
+      adjudicationId: fixtures.adjudicationId,
+      expectedErrorCode: 'REVIEW_AUTHORITY_FENCED',
+    });
+  });
+
+  // 157. Authority drift: Reviewer agent becomes OFFLINE -> fails closed with zero writes
+  it('157. Authority drift: Reviewer agent becomes OFFLINE -> fails closed with zero writes', async () => {
+    fixtures.db.prepare("UPDATE agents SET status = 'OFFLINE' WHERE id = ?").run(fixtures.reviewerAgentId);
+    await assertFailClosedReadSurface({
+      db: fixtures.db,
+      dbPath: fixtures.dbPath,
+      token: fixtures.token1,
+      adjudicationId: fixtures.adjudicationId,
+      expectedErrorCode: 'REVIEWER_AGENT_INVALID',
+    });
+  });
+
+  // 158. Authority drift: Reviewer agent role is no longer REVIEWER -> fails closed with zero writes
+  it('158. Authority drift: Reviewer agent role is no longer REVIEWER -> fails closed with zero writes', async () => {
+    fixtures.db.prepare("UPDATE agents SET role = 'CODER' WHERE id = ?").run(fixtures.reviewerAgentId);
+    await assertFailClosedReadSurface({
+      db: fixtures.db,
+      dbPath: fixtures.dbPath,
+      token: fixtures.token1,
+      adjudicationId: fixtures.adjudicationId,
+      expectedErrorCode: 'REVIEWER_AGENT_INVALID',
+    });
+  });
+
+  // 159. Authority drift: Reviewer agent resource binding changes incompatibly -> fails closed with zero writes
+  it('159. Authority drift: Reviewer agent resource binding changes incompatibly -> fails closed with zero writes', async () => {
+    const otherResId = `res-other-${crypto.randomUUID()}`;
+    const now = new Date().toISOString();
+    fixtures.db.prepare(`
+      INSERT INTO provider_resources (id, provider_id, provider_account_id, model_name, health_status, capabilities_json, enabled, total_quota, remaining_quota, quota_unit, quota_source, quota_confidence, last_health_check)
+      VALUES (?, ?, ?, 'OtherModel', 'AVAILABLE', '[]', 1, 100, 100, 'REQUESTS', 'PROVIDER_REPORTED', 1.0, ?)
+    `).run(otherResId, fixtures.reviewerProviderId, fixtures.reviewerAccountId, now);
+    fixtures.db.prepare("UPDATE agents SET provider_resource_id = ? WHERE id = ?").run(otherResId, fixtures.reviewerAgentId);
+
+    await assertFailClosedReadSurface({
+      db: fixtures.db,
+      dbPath: fixtures.dbPath,
+      token: fixtures.token1,
+      adjudicationId: fixtures.adjudicationId,
+      expectedErrorCode: 'REVIEWER_AGENT_INVALID',
+    });
+  });
+
+  // 160. Authority drift: Reviewer provider is disabled -> fails closed with zero writes
+  it('160. Authority drift: Reviewer provider is disabled -> fails closed with zero writes', async () => {
+    fixtures.db.prepare("UPDATE providers SET enabled = 0 WHERE id = ?").run(fixtures.reviewerProviderId);
+    await assertFailClosedReadSurface({
+      db: fixtures.db,
+      dbPath: fixtures.dbPath,
+      token: fixtures.token1,
+      adjudicationId: fixtures.adjudicationId,
+      expectedErrorCode: 'REVIEWER_PROVIDER_INVALID',
+    });
+  });
+
+  // 161. Authority drift: Reviewer account is disabled -> fails closed with zero writes
+  it('161. Authority drift: Reviewer account is disabled -> fails closed with zero writes', async () => {
+    fixtures.db.prepare("UPDATE provider_accounts SET enabled = 0 WHERE id = ?").run(fixtures.reviewerAccountId);
+    await assertFailClosedReadSurface({
+      db: fixtures.db,
+      dbPath: fixtures.dbPath,
+      token: fixtures.token1,
+      adjudicationId: fixtures.adjudicationId,
+      expectedErrorCode: 'REVIEWER_ACCOUNT_INVALID',
+    });
+  });
+
+  // 162. Authority drift: Reviewer account becomes unhealthy -> fails closed with zero writes
+  it('162. Authority drift: Reviewer account becomes unhealthy -> fails closed with zero writes', async () => {
+    fixtures.db.prepare("UPDATE provider_accounts SET health_status = 'UNHEALTHY' WHERE id = ?").run(fixtures.reviewerAccountId);
+    await assertFailClosedReadSurface({
+      db: fixtures.db,
+      dbPath: fixtures.dbPath,
+      token: fixtures.token1,
+      adjudicationId: fixtures.adjudicationId,
+      expectedErrorCode: 'REVIEWER_ACCOUNT_INVALID',
+    });
+  });
+
+  // 163. Authority drift: Reviewer resource is disabled -> fails closed with zero writes
+  it('163. Authority drift: Reviewer resource is disabled -> fails closed with zero writes', async () => {
+    fixtures.db.prepare("UPDATE provider_resources SET enabled = 0 WHERE id = ?").run(fixtures.reviewerResourceId);
+    await assertFailClosedReadSurface({
+      db: fixtures.db,
+      dbPath: fixtures.dbPath,
+      token: fixtures.token1,
+      adjudicationId: fixtures.adjudicationId,
+      expectedErrorCode: 'REVIEWER_RESOURCE_INVALID',
+    });
+  });
+
+  // 164. Authority drift: Reviewer resource becomes unhealthy -> fails closed with zero writes
+  it('164. Authority drift: Reviewer resource becomes unhealthy -> fails closed with zero writes', async () => {
+    fixtures.db.prepare("UPDATE provider_resources SET health_status = 'UNHEALTHY' WHERE id = ?").run(fixtures.reviewerResourceId);
+    await assertFailClosedReadSurface({
+      db: fixtures.db,
+      dbPath: fixtures.dbPath,
+      token: fixtures.token1,
+      adjudicationId: fixtures.adjudicationId,
+      expectedErrorCode: 'REVIEWER_RESOURCE_INVALID',
+    });
+  });
+
+  // 165. Authority drift: Resource/account binding changes incompatibly -> fails closed with zero writes
+  it('165. Authority drift: Resource/account binding changes incompatibly -> fails closed with zero writes', async () => {
+    const otherAccId = `acc-other-${crypto.randomUUID()}`;
+    const now = new Date().toISOString();
+    fixtures.db.prepare(`
+      INSERT INTO provider_accounts (id, provider_id, label, auth_mode, enabled, priority, health_status, concurrency_limit, created_at, updated_at)
+      VALUES (?, ?, 'OtherAccount', 'NATIVE_PROFILE', 1, 10, 'AVAILABLE', 5, ?, ?)
+    `).run(otherAccId, fixtures.reviewerProviderId, now, now);
+    fixtures.db.prepare("UPDATE provider_resources SET provider_account_id = ? WHERE id = ?").run(otherAccId, fixtures.reviewerResourceId);
+
+    await assertFailClosedReadSurface({
+      db: fixtures.db,
+      dbPath: fixtures.dbPath,
+      token: fixtures.token1,
+      adjudicationId: fixtures.adjudicationId,
+      expectedErrorCode: 'REVIEWER_RESOURCE_INVALID',
+    });
+  });
+
+  // 166. Authority drift: Agent-level self-review becomes true -> fails closed with zero writes
+  it('166. Authority drift: Agent-level self-review becomes true -> fails closed with zero writes', async () => {
+    fixtures.db.prepare(`
+      UPDATE task_attempts
+      SET agent_id = ?
+      WHERE id = (SELECT attempt_id FROM coder_submission_adjudications WHERE id = ?)
+    `).run(fixtures.reviewerAgentId, fixtures.adjudicationId);
+
+    await assertFailClosedReadSurface({
+      db: fixtures.db,
+      dbPath: fixtures.dbPath,
+      token: fixtures.token1,
+      adjudicationId: fixtures.adjudicationId,
+      expectedErrorCode: 'SELF_REVIEW_FORBIDDEN',
+    });
+  });
+
+  // 167. Authority drift: Account-level self-review becomes true -> fails closed with zero writes
+  it('167. Authority drift: Account-level self-review becomes true -> fails closed with zero writes', async () => {
+    // Drop trigger in isolated test DB to mutate coder submission account to match reviewer account
+    fixtures.db.exec('DROP TRIGGER IF EXISTS trg_coder_submissions_no_update');
+    fixtures.db.prepare('UPDATE coder_submissions SET selected_account_id = ? WHERE id = ?').run(
+      fixtures.reviewerAccountId,
+      fixtures.submissionId
+    );
+
+    await assertFailClosedReadSurface({
+      db: fixtures.db,
+      dbPath: fixtures.dbPath,
+      token: fixtures.token1,
+      adjudicationId: fixtures.adjudicationId,
+      expectedErrorCode: 'SELF_REVIEW_FORBIDDEN',
+    });
+  });
+
+  // 168. Authority drift: projection_hash does not match projection_json -> fails closed with zero writes
+  it('168. Authority drift: projection_hash does not match projection_json -> fails closed with zero writes', async () => {
+    const rawToken = `${REVIEWER_TOKEN_PREFIX}${crypto.randomUUID()}`;
+    const tokenHash = computeSha256(rawToken);
+    const now = new Date().toISOString();
+    const expiresAt = new Date(Date.now() + 3600000).toISOString();
+    const existingSession = fixtures.repo.getMcpReviewerSessionById(fixtures.sessionId1)!;
+
+    const reviewerAgentId4 = `agent-rev-4-${crypto.randomUUID()}`;
+    fixtures.db.prepare(`
+      INSERT INTO agents (id, display_name, role, provider_resource_id, status, current_task_id, last_seen_at)
+      VALUES (?, 'ReviewerAgent4', 'REVIEWER', ?, 'IDLE', NULL, ?)
+    `).run(reviewerAgentId4, fixtures.reviewerResourceId, now);
+
+    const corruptedSessionId = crypto.randomUUID();
+    fixtures.db.prepare(`
+      INSERT INTO mcp_reviewer_sessions (
+        id, adjudication_id, submission_id, reviewer_agent_id, reviewer_provider_id,
+        reviewer_account_id, reviewer_resource_id, scope, token_hash, task_ownership_epoch,
+        authority_snapshot_hash, verification_result_envelope_hash, projection_schema,
+        projection_hash, projection_json, issued_at, expires_at, revoked_at, revocation_reason
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?, NULL, NULL)
+    `).run(
+      corruptedSessionId, fixtures.adjudicationId, fixtures.submissionId, reviewerAgentId4,
+      fixtures.reviewerProviderId, fixtures.reviewerAccountId, fixtures.reviewerResourceId,
+      REVIEWER_TOKEN_SCOPE, tokenHash, existingSession.task_ownership_epoch, existingSession.authority_snapshot_hash,
+      existingSession.verification_result_envelope_hash, '0'.repeat(64), // Mismatched hash
+      existingSession.projection_json, now, expiresAt
+    );
+
+    await assertFailClosedReadSurface({
+      db: fixtures.db,
+      dbPath: fixtures.dbPath,
+      token: rawToken,
+      adjudicationId: fixtures.adjudicationId,
+      expectedErrorCode: 'PROJECTION_HASH_MISMATCH',
+    });
+  });
+
+  // 169. Authority drift: projection_json is malformed -> fails closed with zero writes
+  it('169. Authority drift: projection_json is malformed -> fails closed with zero writes', async () => {
+    const rawToken = `${REVIEWER_TOKEN_PREFIX}${crypto.randomUUID()}`;
+    const existingSession = fixtures.repo.getMcpReviewerSessionById(fixtures.sessionId1)!;
+
+    // Direct DB insertion of malformed JSON is rejected by SQLite check constraint
+    expect(() => {
+      fixtures.db.prepare(`
+        INSERT INTO mcp_reviewer_sessions (
+          id, adjudication_id, submission_id, reviewer_agent_id, reviewer_provider_id,
+          reviewer_account_id, reviewer_resource_id, scope, token_hash, task_ownership_epoch,
+          authority_snapshot_hash, verification_result_envelope_hash, projection_schema,
+          projection_hash, projection_json, issued_at, expires_at, revoked_at, revocation_reason
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?, NULL, NULL)
+      `).run(
+        crypto.randomUUID(), fixtures.adjudicationId, fixtures.submissionId, fixtures.reviewerAgentId2,
+        fixtures.reviewerProviderId, fixtures.reviewerAccountId, fixtures.reviewerResourceId,
+        REVIEWER_TOKEN_SCOPE, computeSha256(rawToken), existingSession.task_ownership_epoch,
+        existingSession.authority_snapshot_hash, existingSession.verification_result_envelope_hash,
+        '0'.repeat(64), '{malformed-json-payload', new Date().toISOString(), new Date(Date.now() + 3600000).toISOString()
+      );
+    }).toThrowError(/CHECK constraint failed/);
+
+    // When returning a malformed session from repository, read fence fails closed with PROJECTION_CORRUPTED
+    const spy = vi.spyOn(Repository.prototype, 'getMcpReviewerSessionByTokenHash').mockReturnValue({
+      ...existingSession,
+      projection_json: '{malformed-json',
+      projection_hash: computeSha256('{malformed-json'),
+    });
+
+    try {
+      await assertFailClosedReadSurface({
+        db: fixtures.db,
+        dbPath: fixtures.dbPath,
+        token: fixtures.token1,
+        adjudicationId: fixtures.adjudicationId,
+        expectedErrorCode: 'PROJECTION_CORRUPTED',
+      });
+    } finally {
+      spy.mockRestore();
+    }
+  });
+
+  // 170. Authority drift: projection schema is unsupported -> fails closed with zero writes
+  it('170. Authority drift: projection schema is unsupported -> fails closed with zero writes', async () => {
+    const rawToken = `${REVIEWER_TOKEN_PREFIX}${crypto.randomUUID()}`;
+    const existingSession = fixtures.repo.getMcpReviewerSessionById(fixtures.sessionId1)!;
+
+    // Direct DB insertion of unsupported schema is rejected by SQLite check constraint
+    expect(() => {
+      fixtures.db.prepare(`
+        INSERT INTO mcp_reviewer_sessions (
+          id, adjudication_id, submission_id, reviewer_agent_id, reviewer_provider_id,
+          reviewer_account_id, reviewer_resource_id, scope, token_hash, task_ownership_epoch,
+          authority_snapshot_hash, verification_result_envelope_hash, projection_schema,
+          projection_hash, projection_json, issued_at, expires_at, revoked_at, revocation_reason
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 2, ?, ?, ?, ?, NULL, NULL)
+      `).run(
+        crypto.randomUUID(), fixtures.adjudicationId, fixtures.submissionId, fixtures.reviewerAgentId2,
+        fixtures.reviewerProviderId, fixtures.reviewerAccountId, fixtures.reviewerResourceId,
+        REVIEWER_TOKEN_SCOPE, computeSha256(rawToken), existingSession.task_ownership_epoch,
+        existingSession.authority_snapshot_hash, existingSession.verification_result_envelope_hash,
+        existingSession.projection_hash, existingSession.projection_json, new Date().toISOString(),
+        new Date(Date.now() + 3600000).toISOString()
+      );
+    }).toThrowError(/CHECK constraint failed/);
+
+    // When returning an unsupported schema session from repository, read fence fails closed with PROJECTION_SCHEMA_INVALID
+    const spy = vi.spyOn(Repository.prototype, 'getMcpReviewerSessionByTokenHash').mockReturnValue({
+      ...existingSession,
+      projection_schema: 2 as any,
+    });
+
+    try {
+      await assertFailClosedReadSurface({
+        db: fixtures.db,
+        dbPath: fixtures.dbPath,
+        token: fixtures.token1,
+        adjudicationId: fixtures.adjudicationId,
+        expectedErrorCode: 'PROJECTION_SCHEMA_INVALID',
+      });
+    } finally {
+      spy.mockRestore();
+    }
   });
 });

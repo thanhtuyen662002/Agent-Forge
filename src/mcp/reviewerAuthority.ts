@@ -284,6 +284,14 @@ export class ReviewerAuthorityService {
       if (typeof statusEv.raw_payload !== 'string') {
         throw new ReviewerAuthorityError('INTEGRITY_CONFLICT', 'INLINE git status evidence has null payload');
       }
+      const rawStatusBytes = Buffer.from(statusEv.raw_payload, 'utf8');
+      if (rawStatusBytes.byteLength !== statusEv.byte_size) {
+        throw new ReviewerAuthorityError('PROJECTION_HASH_MISMATCH', 'INLINE git status evidence byte size mismatch');
+      }
+      const computedHash = crypto.createHash('sha256').update(rawStatusBytes).digest('hex');
+      if (computedHash !== statusEv.hash) {
+        throw new ReviewerAuthorityError('PROJECTION_HASH_MISMATCH', 'INLINE git status evidence content hash mismatch');
+      }
       rawStatusPayload = statusEv.raw_payload;
     }
 
@@ -348,6 +356,14 @@ export class ReviewerAuthorityService {
     } else {
       if (typeof diffEv.raw_payload !== 'string') {
         throw new ReviewerAuthorityError('INTEGRITY_CONFLICT', 'INLINE git diff evidence has null payload');
+      }
+      const rawDiffBytes = Buffer.from(diffEv.raw_payload, 'utf8');
+      if (rawDiffBytes.byteLength !== diffEv.byte_size) {
+        throw new ReviewerAuthorityError('PROJECTION_HASH_MISMATCH', 'INLINE git diff evidence byte size mismatch');
+      }
+      const computedHash = crypto.createHash('sha256').update(rawDiffBytes).digest('hex');
+      if (computedHash !== diffEv.hash) {
+        throw new ReviewerAuthorityError('PROJECTION_HASH_MISMATCH', 'INLINE git diff evidence content hash mismatch');
       }
       rawDiffPayload = diffEv.raw_payload;
     }
@@ -509,13 +525,16 @@ export class ReviewerAuthorityService {
   }
 
   public validateAuthorityFence(session: McpReviewerSession): void {
+    // 1. Session revocation check
     if (session.revoked_at !== null) {
       throw new ReviewerAuthorityError('TOKEN_REVOKED', `Session was revoked at ${session.revoked_at}`);
     }
+    // 2. Session expiration check
     if (new Date(session.expires_at).getTime() <= Date.now()) {
       throw new ReviewerAuthorityError('TOKEN_EXPIRED', `Session expired at ${session.expires_at}`);
     }
 
+    // 3. Adjudication authority fence state check (supports existing tests mocking getAdjudicationAuthorityFenceState)
     const fence = this.repo.getAdjudicationAuthorityFenceState(session.adjudication_id);
     if (!fence) {
       throw new ReviewerAuthorityError('STALE_REVIEWER_AUTHORITY', `Adjudication ${session.adjudication_id} no longer exists`);
@@ -538,6 +557,98 @@ export class ReviewerAuthorityService {
         'Adjudication authority snapshot hash changed since session issuance'
       );
     }
+
+    // 4. Complete live authority revalidation across the 4-tuple and adjudication/task state
+    const liveState = this.repo.getReviewerAuthorityLiveValidationState({
+      sessionId: session.id,
+      adjudicationId: session.adjudication_id,
+      reviewerAgentId: session.reviewer_agent_id,
+      reviewerProviderId: session.reviewer_provider_id,
+      reviewerAccountId: session.reviewer_account_id,
+      reviewerResourceId: session.reviewer_resource_id,
+    });
+
+    if (!liveState.adjudication_exists) {
+      throw new ReviewerAuthorityError('STALE_REVIEWER_AUTHORITY', `Adjudication ${session.adjudication_id} no longer exists`);
+    }
+    if (liveState.adjudication_recovery_fenced_at !== null || liveState.adjudication_status === 'RECOVERY_FENCED') {
+      throw new ReviewerAuthorityError('REVIEW_AUTHORITY_FENCED', `Adjudication ${session.adjudication_id} is recovery fenced`);
+    }
+    if (liveState.adjudication_status !== 'VERIFIED') {
+      throw new ReviewerAuthorityError('STALE_REVIEWER_AUTHORITY', `Adjudication status is no longer VERIFIED (got ${liveState.adjudication_status})`);
+    }
+    if (liveState.adjudication_action !== 'ADMIT_VERIFICATION') {
+      throw new ReviewerAuthorityError('STALE_REVIEWER_AUTHORITY', `Adjudication action is no longer ADMIT_VERIFICATION (got ${liveState.adjudication_action})`);
+    }
+    if (liveState.current_authority_snapshot_hash !== session.authority_snapshot_hash) {
+      throw new ReviewerAuthorityError('STALE_REVIEWER_AUTHORITY', 'Adjudication authority snapshot hash changed since session issuance');
+    }
+
+    if (!liveState.task_exists) {
+      throw new ReviewerAuthorityError('STALE_REVIEWER_AUTHORITY', 'Task no longer exists');
+    }
+    if (liveState.task_state !== 'REVIEW_READY') {
+      throw new ReviewerAuthorityError('TASK_STATE_INVALID', `Task is no longer in REVIEW_READY state (got ${liveState.task_state})`);
+    }
+    if (liveState.current_task_ownership_epoch !== session.task_ownership_epoch) {
+      throw new ReviewerAuthorityError(
+        'STALE_REVIEWER_AUTHORITY',
+        `Task ownership epoch changed from ${session.task_ownership_epoch} to ${liveState.current_task_ownership_epoch}`
+      );
+    }
+
+    if (!liveState.agent_exists) {
+      throw new ReviewerAuthorityError('REVIEWER_AGENT_INVALID', `Reviewer agent ${session.reviewer_agent_id} not found`);
+    }
+    if (liveState.agent_role !== 'REVIEWER') {
+      throw new ReviewerAuthorityError('REVIEWER_AGENT_INVALID', `Reviewer agent role must be REVIEWER (got ${liveState.agent_role})`);
+    }
+    if (liveState.agent_status === 'OFFLINE') {
+      throw new ReviewerAuthorityError('REVIEWER_AGENT_INVALID', 'Reviewer agent status cannot be OFFLINE');
+    }
+    if (liveState.agent_resource_id !== null && liveState.agent_resource_id !== session.reviewer_resource_id) {
+      throw new ReviewerAuthorityError('REVIEWER_AGENT_INVALID', 'Reviewer agent resource binding is incompatible with session resource');
+    }
+
+    if (!liveState.provider_exists || !liveState.provider_enabled) {
+      throw new ReviewerAuthorityError('REVIEWER_PROVIDER_INVALID', `Reviewer provider ${session.reviewer_provider_id} is missing or disabled`);
+    }
+
+    if (!liveState.account_exists) {
+      throw new ReviewerAuthorityError('REVIEWER_ACCOUNT_INVALID', `Reviewer account ${session.reviewer_account_id} not found`);
+    }
+    if (liveState.account_provider_id !== session.reviewer_provider_id) {
+      throw new ReviewerAuthorityError('REVIEWER_ACCOUNT_INVALID', 'Reviewer account does not belong to reviewer provider');
+    }
+    if (!liveState.account_enabled) {
+      throw new ReviewerAuthorityError('REVIEWER_ACCOUNT_INVALID', 'Reviewer account is disabled');
+    }
+    if (!['AVAILABLE', 'BUSY', 'LOW_QUOTA'].includes(liveState.account_health_status ?? '')) {
+      throw new ReviewerAuthorityError('REVIEWER_ACCOUNT_INVALID', `Reviewer account health status is not operational (${liveState.account_health_status})`);
+    }
+
+    if (!liveState.resource_exists) {
+      throw new ReviewerAuthorityError('REVIEWER_RESOURCE_INVALID', `Reviewer resource ${session.reviewer_resource_id} not found`);
+    }
+    if (liveState.resource_provider_id !== session.reviewer_provider_id) {
+      throw new ReviewerAuthorityError('REVIEWER_RESOURCE_INVALID', 'Reviewer resource does not belong to reviewer provider');
+    }
+    if (!liveState.resource_enabled) {
+      throw new ReviewerAuthorityError('REVIEWER_RESOURCE_INVALID', 'Reviewer resource is disabled');
+    }
+    if (!['AVAILABLE', 'BUSY', 'LOW_QUOTA'].includes(liveState.resource_health_status ?? '')) {
+      throw new ReviewerAuthorityError('REVIEWER_RESOURCE_INVALID', `Reviewer resource health status is not operational (${liveState.resource_health_status})`);
+    }
+    if (liveState.resource_account_id !== null && liveState.resource_account_id !== session.reviewer_account_id) {
+      throw new ReviewerAuthorityError('REVIEWER_RESOURCE_INVALID', 'Reviewer resource is bound to a different provider account');
+    }
+
+    if (liveState.coder_agent_id !== null && liveState.coder_agent_id === session.reviewer_agent_id) {
+      throw new ReviewerAuthorityError('SELF_REVIEW_FORBIDDEN', 'Reviewer agent cannot be the coder agent who submitted work');
+    }
+    if (liveState.coder_selected_account_id !== null && liveState.coder_selected_account_id === session.reviewer_account_id) {
+      throw new ReviewerAuthorityError('SELF_REVIEW_FORBIDDEN', 'Reviewer account cannot match the coder submission selected account');
+    }
   }
 
   public getReviewPackage(
@@ -551,8 +662,67 @@ export class ReviewerAuthorityService {
       );
     }
 
-    // Stale authority read fence check (SELECT-only)
+    // 1. Stale authority read fence check (SELECT-only)
     this.validateAuthorityFence(session);
+
+    // 2. Projection schema validation
+    if (session.projection_schema !== 1) {
+      throw new ReviewerAuthorityError(
+        'PROJECTION_SCHEMA_INVALID',
+        `Unsupported projection schema version: ${session.projection_schema} (expected 1)`
+      );
+    }
+
+    // 3. Projection size limit check
+    if (typeof session.projection_json !== 'string') {
+      throw new ReviewerAuthorityError('PROJECTION_CORRUPTED', 'Projection payload must be a non-empty string');
+    }
+    const payloadBytes = Buffer.byteLength(session.projection_json, 'utf8');
+    if (payloadBytes > PROJECTION_PAYLOAD_MAX_UTF8_BYTES) {
+      throw new ReviewerAuthorityError(
+        'PROJECTION_PAYLOAD_TOO_LARGE',
+        `Projection payload exceeds ${PROJECTION_PAYLOAD_MAX_UTF8_BYTES} bytes`
+      );
+    }
+
+    // 4. Recompute SHA-256 over exact stored projection bytes
+    const computedHash = computeSha256(session.projection_json);
+    if (computedHash !== session.projection_hash) {
+      throw new ReviewerAuthorityError(
+        'PROJECTION_HASH_MISMATCH',
+        'Projection content hash does not match stored projection_hash'
+      );
+    }
+
+    // 5. Parse and validate stored JSON as bounded object structure
+    let parsed: Record<string, unknown>;
+    try {
+      parsed = JSON.parse(session.projection_json);
+      if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) {
+        throw new Error('Not an object');
+      }
+    } catch {
+      throw new ReviewerAuthorityError('PROJECTION_CORRUPTED', 'Projection payload is not a valid JSON object');
+    }
+
+    if (parsed.projection_schema_version !== 1) {
+      throw new ReviewerAuthorityError('PROJECTION_SCHEMA_INVALID', 'Projection JSON projection_schema_version must equal 1');
+    }
+
+    const adj = parsed.adjudication as Record<string, unknown> | undefined;
+    if (!adj || typeof adj !== 'object' || Array.isArray(adj) || adj.id !== session.adjudication_id) {
+      throw new ReviewerAuthorityError('PROJECTION_CORRUPTED', 'Projection adjudication object is missing or mismatched');
+    }
+
+    const ev = parsed.evidence as Record<string, unknown> | undefined;
+    if (!ev || typeof ev !== 'object' || Array.isArray(ev) || !ev.git_status || !ev.git_diff) {
+      throw new ReviewerAuthorityError('PROJECTION_CORRUPTED', 'Projection evidence structure is invalid');
+    }
+
+    const disp = parsed.disposition as Record<string, unknown> | undefined;
+    if (!disp || typeof disp !== 'object' || Array.isArray(disp) || disp.disposition_event !== 'SETTLED' || disp.disposition_reason !== 'ACCEPTED_VERIFIED') {
+      throw new ReviewerAuthorityError('PROJECTION_CORRUPTED', 'Projection disposition structure is invalid');
+    }
 
     // Return strictly the stored frozen projection JSON
     return {

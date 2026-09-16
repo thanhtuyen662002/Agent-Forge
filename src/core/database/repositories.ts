@@ -82,8 +82,18 @@ import {
   AdjudicationEventType,
 } from '../types/domain';
 import type { CoderSubmissionWorkspaceLease, WorkspaceLeaseState } from '../types/adjudication';
-import type { McpReviewerSession, ReviewerAuthorityFenceState } from '../../types/reviewer';
-export type { McpReviewerSession, ReviewerAuthorityFenceState };
+import type {
+  McpReviewerSession,
+  ReviewerAuthorityFenceState,
+  ReviewerAuthorityLiveValidationParams,
+  ReviewerAuthorityLiveValidationResult,
+} from '../../types/reviewer';
+export type {
+  McpReviewerSession,
+  ReviewerAuthorityFenceState,
+  ReviewerAuthorityLiveValidationParams,
+  ReviewerAuthorityLiveValidationResult,
+};
 import type { ProviderDispatchExecutionResult } from '../services/ProviderDispatchService';
 import { ExecutionFailureClassifier } from '../services/ExecutionFailureClassifier';
 import { FailureHealthMutationPolicyService } from '../services/FailureHealthMutationPolicyService';
@@ -3855,6 +3865,120 @@ export class Repository {
       adjudication_recovery_fenced_at: row.adjudication_recovery_fenced_at ? String(row.adjudication_recovery_fenced_at) : null,
       current_authority_snapshot_hash: String(row.current_authority_snapshot_hash),
       current_task_ownership_epoch: Number(row.current_task_ownership_epoch),
+    };
+  }
+
+  public getReviewerAuthorityLiveValidationState(
+    params: ReviewerAuthorityLiveValidationParams
+  ): ReviewerAuthorityLiveValidationResult {
+    const row = this.db.prepare(`
+      SELECT
+        -- Adjudication
+        csa.id AS adjudication_id,
+        csa.action AS adjudication_action,
+        csa.status AS adjudication_status,
+        csa.recovery_fenced_at AS adjudication_recovery_fenced_at,
+        csa.authority_snapshot_hash AS current_authority_snapshot_hash,
+        -- Task
+        t.id AS task_id,
+        t.state AS task_state,
+        t.ownership_epoch AS current_task_ownership_epoch,
+        -- Reviewer Agent
+        a.id AS agent_id,
+        a.role AS agent_role,
+        a.status AS agent_status,
+        a.provider_resource_id AS agent_resource_id,
+        -- Reviewer Provider
+        p.id AS provider_id,
+        p.enabled AS provider_enabled,
+        -- Reviewer Account
+        pa.id AS account_id,
+        pa.provider_id AS account_provider_id,
+        pa.enabled AS account_enabled,
+        pa.health_status AS account_health_status,
+        -- Reviewer Resource
+        pr.id AS resource_id,
+        pr.provider_id AS resource_provider_id,
+        pr.provider_account_id AS resource_account_id,
+        pr.enabled AS resource_enabled,
+        pr.health_status AS resource_health_status,
+        -- Coder attempt agent (self-review check)
+        coder_att.agent_id AS coder_agent_id,
+        -- Coder submission selected account (self-review check)
+        cs.selected_account_id AS coder_selected_account_id
+      FROM coder_submission_adjudications csa
+      LEFT JOIN tasks t ON t.id = csa.task_id
+      LEFT JOIN coder_submissions cs ON cs.id = csa.submission_id
+      LEFT JOIN task_attempts coder_att ON coder_att.id = csa.attempt_id
+      LEFT JOIN agents a ON a.id = ?
+      LEFT JOIN providers p ON p.id = ?
+      LEFT JOIN provider_accounts pa ON pa.id = ?
+      LEFT JOIN provider_resources pr ON pr.id = ?
+      WHERE csa.id = ?
+    `).get(
+      params.reviewerAgentId,
+      params.reviewerProviderId,
+      params.reviewerAccountId,
+      params.reviewerResourceId,
+      params.adjudicationId
+    ) as Record<string, unknown> | undefined;
+
+    if (!row) {
+      return {
+        adjudication_exists: false,
+        adjudication_action: null,
+        adjudication_status: null,
+        adjudication_recovery_fenced_at: null,
+        current_authority_snapshot_hash: null,
+        task_exists: false,
+        task_state: null,
+        current_task_ownership_epoch: null,
+        agent_exists: false,
+        agent_role: null,
+        agent_status: null,
+        agent_resource_id: null,
+        provider_exists: false,
+        provider_enabled: null,
+        account_exists: false,
+        account_provider_id: null,
+        account_enabled: null,
+        account_health_status: null,
+        resource_exists: false,
+        resource_provider_id: null,
+        resource_account_id: null,
+        resource_enabled: null,
+        resource_health_status: null,
+        coder_agent_id: null,
+        coder_selected_account_id: null,
+      };
+    }
+
+    return {
+      adjudication_exists: true,
+      adjudication_action: row.adjudication_action ? String(row.adjudication_action) : null,
+      adjudication_status: row.adjudication_status ? String(row.adjudication_status) : null,
+      adjudication_recovery_fenced_at: row.adjudication_recovery_fenced_at ? String(row.adjudication_recovery_fenced_at) : null,
+      current_authority_snapshot_hash: row.current_authority_snapshot_hash ? String(row.current_authority_snapshot_hash) : null,
+      task_exists: row.task_id !== null && row.task_id !== undefined,
+      task_state: row.task_state ? String(row.task_state) : null,
+      current_task_ownership_epoch: row.current_task_ownership_epoch !== null && row.current_task_ownership_epoch !== undefined ? Number(row.current_task_ownership_epoch) : null,
+      agent_exists: row.agent_id !== null && row.agent_id !== undefined,
+      agent_role: row.agent_role ? String(row.agent_role) : null,
+      agent_status: row.agent_status ? String(row.agent_status) : null,
+      agent_resource_id: row.agent_resource_id ? String(row.agent_resource_id) : null,
+      provider_exists: row.provider_id !== null && row.provider_id !== undefined,
+      provider_enabled: row.provider_enabled !== null && row.provider_enabled !== undefined ? Boolean(row.provider_enabled) : null,
+      account_exists: row.account_id !== null && row.account_id !== undefined,
+      account_provider_id: row.account_provider_id ? String(row.account_provider_id) : null,
+      account_enabled: row.account_enabled !== null && row.account_enabled !== undefined ? Boolean(row.account_enabled) : null,
+      account_health_status: row.account_health_status ? String(row.account_health_status) : null,
+      resource_exists: row.resource_id !== null && row.resource_id !== undefined,
+      resource_provider_id: row.resource_provider_id ? String(row.resource_provider_id) : null,
+      resource_account_id: row.resource_account_id ? String(row.resource_account_id) : null,
+      resource_enabled: row.resource_enabled !== null && row.resource_enabled !== undefined ? Boolean(row.resource_enabled) : null,
+      resource_health_status: row.resource_health_status ? String(row.resource_health_status) : null,
+      coder_agent_id: row.coder_agent_id ? String(row.coder_agent_id) : null,
+      coder_selected_account_id: row.coder_selected_account_id ? String(row.coder_selected_account_id) : null,
     };
   }
 
