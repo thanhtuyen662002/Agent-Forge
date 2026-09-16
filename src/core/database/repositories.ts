@@ -3840,7 +3840,7 @@ export class Repository {
 
   public getAdjudicationAuthorityFenceState(adjudicationId: string): ReviewerAuthorityFenceState | null {
     const row = this.db.prepare(`
-      SELECT 
+      SELECT
         csa.status AS adjudication_status,
         csa.recovery_fenced_at AS adjudication_recovery_fenced_at,
         csa.authority_snapshot_hash AS current_authority_snapshot_hash,
