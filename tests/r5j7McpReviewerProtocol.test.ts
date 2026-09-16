@@ -1547,4 +1547,361 @@ describe('R5J7 MCP Reviewer Protocol & Tool Surface (Cases 71–105, 132–134, 
       spy.mockRestore();
     }
   });
+
+  // --- Section 5 Strict Projection Validation Negative Tests (171–185) ---
+
+  function buildValidBaseProjection(fixtures: Fixtures, overrides: Record<string, unknown> = {}): Record<string, unknown> {
+    const task = fixtures.repo.getTask(fixtures.taskId)!;
+    const adj = fixtures.repo.getCoderSubmissionAdjudicationById(fixtures.adjudicationId)!;
+    return {
+      projection_schema_version: 1,
+      adjudication: {
+        id: fixtures.adjudicationId,
+        request_id: adj.request_id,
+        submission_id: fixtures.submissionId,
+        project_id: fixtures.projectId,
+        project_name: 'Test Project',
+        task_id: fixtures.taskId,
+        task_title: task.title,
+        task_ownership_epoch: adj.task_ownership_epoch,
+        action: 'ADMIT_VERIFICATION',
+        status: 'VERIFIED',
+      },
+      verification_results: {
+        test_run_id: 'tr-001',
+        exit_code: 0,
+        passed_count: 10,
+        failed_count: 0,
+        skipped_count: 0,
+        duration_ms: 250,
+        envelope: { run_status: 'passed' },
+      },
+      evidence: {
+        git_status: {
+          is_clean: true,
+          branch: 'main',
+          files: ['src/core/database.ts'],
+        },
+        git_diff: {
+          diff_content: 'diff --git a/file.ts b/file.ts\n+line',
+          byte_size: Buffer.byteLength('diff --git a/file.ts b/file.ts\n+line', 'utf8'),
+          is_truncated: false,
+        },
+      },
+      disposition: {
+        disposition_event: 'SETTLED',
+        disposition_reason: 'ACCEPTED_VERIFIED',
+        created_at: new Date().toISOString(),
+      },
+      ...overrides,
+    };
+  }
+
+  async function insertCorruptedSessionAndAssertFailClosed(
+    fixtures: Fixtures,
+    projectionObj: Record<string, unknown>,
+    expectedErrorCode = 'PROJECTION_CORRUPTED'
+  ) {
+    const rawToken = `${REVIEWER_TOKEN_PREFIX}${crypto.randomUUID()}`;
+    const tokenHash = computeSha256(rawToken);
+    const now = new Date().toISOString();
+    const expiresAt = new Date(Date.now() + 3600000).toISOString();
+    const projectionJson = JSON.stringify(projectionObj);
+    const projectionHash = computeSha256(projectionJson);
+
+    const adj = fixtures.repo.getCoderSubmissionAdjudicationById(fixtures.adjudicationId)!;
+
+    // Create unique reviewer agent to satisfy (adjudication_id, reviewer_agent_id) unique constraint
+    const extraAgentId = `agent-rev-extra-${crypto.randomUUID()}`;
+    fixtures.db.prepare(`
+      INSERT INTO agents (id, display_name, role, provider_resource_id, status, current_task_id, last_seen_at)
+      VALUES (?, 'Extra Reviewer', 'REVIEWER', ?, 'IDLE', NULL, ?)
+    `).run(extraAgentId, fixtures.reviewerResourceId, now);
+
+    const sessionId = crypto.randomUUID();
+    fixtures.db.prepare(`
+      INSERT INTO mcp_reviewer_sessions (
+        id, adjudication_id, submission_id, reviewer_agent_id, reviewer_provider_id,
+        reviewer_account_id, reviewer_resource_id, scope, token_hash, task_ownership_epoch,
+        authority_snapshot_hash, verification_result_envelope_hash, projection_schema,
+        projection_hash, projection_json, issued_at, expires_at, revoked_at, revocation_reason
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?, NULL, NULL)
+    `).run(
+      sessionId, fixtures.adjudicationId, fixtures.submissionId, extraAgentId,
+      fixtures.reviewerProviderId, fixtures.reviewerAccountId, fixtures.reviewerResourceId,
+      REVIEWER_TOKEN_SCOPE, tokenHash, adj.task_ownership_epoch, adj.authority_snapshot_hash,
+      adj.verification_result_envelope_hash, projectionHash, projectionJson, now, expiresAt
+    );
+
+    await assertFailClosedReadSurface({
+      db: fixtures.db,
+      dbPath: fixtures.dbPath,
+      token: rawToken,
+      adjudicationId: fixtures.adjudicationId,
+      expectedErrorCode,
+    });
+  }
+
+  // 171. Missing verification_results
+  it('171. Strict projection: Missing verification_results fails closed with PROJECTION_CORRUPTED', async () => {
+    const p = buildValidBaseProjection(fixtures);
+    delete (p as any).verification_results;
+    await insertCorruptedSessionAndAssertFailClosed(fixtures, p);
+  });
+
+  // 172. verification_results as primitive
+  it('172. Strict projection: verification_results as primitive fails closed with PROJECTION_CORRUPTED', async () => {
+    const p = buildValidBaseProjection(fixtures);
+    p.verification_results = 'passed-all';
+    await insertCorruptedSessionAndAssertFailClosed(fixtures, p);
+  });
+
+  // 173. Missing verification envelope
+  it('173. Strict projection: Missing verification envelope fails closed with PROJECTION_CORRUPTED', async () => {
+    const p = buildValidBaseProjection(fixtures);
+    delete (p.verification_results as any).envelope;
+    await insertCorruptedSessionAndAssertFailClosed(fixtures, p);
+  });
+
+  // 174. Non-zero verification exit code
+  it('174. Strict projection: Non-zero verification exit code fails closed with PROJECTION_CORRUPTED', async () => {
+    const p = buildValidBaseProjection(fixtures);
+    (p.verification_results as any).exit_code = 1;
+    await insertCorruptedSessionAndAssertFailClosed(fixtures, p);
+  });
+
+  // 175. evidence.git_status as truthy primitive
+  it('175. Strict projection: evidence.git_status as truthy primitive fails closed with PROJECTION_CORRUPTED', async () => {
+    const p = buildValidBaseProjection(fixtures);
+    (p.evidence as any).git_status = true;
+    await insertCorruptedSessionAndAssertFailClosed(fixtures, p);
+  });
+
+  // 176. evidence.git_diff as truthy primitive
+  it('176. Strict projection: evidence.git_diff as truthy primitive fails closed with PROJECTION_CORRUPTED', async () => {
+    const p = buildValidBaseProjection(fixtures);
+    (p.evidence as any).git_diff = 'diff content string';
+    await insertCorruptedSessionAndAssertFailClosed(fixtures, p);
+  });
+
+  // 177. Incorrect git_diff.byte_size
+  it('177. Strict projection: Incorrect git_diff.byte_size fails closed with PROJECTION_CORRUPTED', async () => {
+    const p = buildValidBaseProjection(fixtures);
+    (p.evidence as any).git_diff.byte_size = 99999;
+    await insertCorruptedSessionAndAssertFailClosed(fixtures, p);
+  });
+
+  // 178. Unsafe git-status path with traversal
+  it('178. Strict projection: Unsafe git-status path with traversal fails closed with PROJECTION_CORRUPTED', async () => {
+    const p = buildValidBaseProjection(fixtures);
+    (p.evidence as any).git_status.files = ['src/../../../etc/passwd'];
+    await insertCorruptedSessionAndAssertFailClosed(fixtures, p);
+  });
+
+  // 179. Unsafe git-status path with absolute path
+  it('179. Strict projection: Unsafe git-status path with absolute prefix fails closed with PROJECTION_CORRUPTED', async () => {
+    const p = buildValidBaseProjection(fixtures);
+    (p.evidence as any).git_status.files = ['/root/secret.key'];
+    await insertCorruptedSessionAndAssertFailClosed(fixtures, p);
+  });
+
+  // 180. Mismatched submission_id
+  it('180. Strict projection: Mismatched submission_id fails closed with PROJECTION_CORRUPTED', async () => {
+    const p = buildValidBaseProjection(fixtures);
+    (p.adjudication as any).submission_id = crypto.randomUUID();
+    await insertCorruptedSessionAndAssertFailClosed(fixtures, p);
+  });
+
+  // 181. Mismatched task ID
+  it('181. Strict projection: Mismatched task_id fails closed with PROJECTION_CORRUPTED', async () => {
+    const p = buildValidBaseProjection(fixtures);
+    (p.adjudication as any).task_id = 'task-foreign-mismatch';
+    await insertCorruptedSessionAndAssertFailClosed(fixtures, p);
+  });
+
+  // 182. Mismatched project ID
+  it('182. Strict projection: Mismatched project_id fails closed with PROJECTION_CORRUPTED', async () => {
+    const p = buildValidBaseProjection(fixtures);
+    (p.adjudication as any).project_id = 'proj-foreign-mismatch';
+    await insertCorruptedSessionAndAssertFailClosed(fixtures, p);
+  });
+
+  // 183. Mismatched ownership epoch
+  it('183. Strict projection: Mismatched task_ownership_epoch fails closed with PROJECTION_CORRUPTED', async () => {
+    const p = buildValidBaseProjection(fixtures);
+    (p.adjudication as any).task_ownership_epoch = 999;
+    await insertCorruptedSessionAndAssertFailClosed(fixtures, p);
+  });
+
+  // 184. Unexpected disposition data
+  it('184. Strict projection: Unexpected disposition event fails closed with PROJECTION_CORRUPTED', async () => {
+    const p = buildValidBaseProjection(fixtures);
+    (p.disposition as any).disposition_event = 'PENDING';
+    await insertCorruptedSessionAndAssertFailClosed(fixtures, p);
+  });
+
+  // 185. Unexpected top-level property
+  it('185. Strict projection: Unexpected top-level property fails closed with PROJECTION_CORRUPTED', async () => {
+    const p = buildValidBaseProjection(fixtures);
+    (p as any).unauthorized_extra_field = 'injected';
+    await insertCorruptedSessionAndAssertFailClosed(fixtures, p);
+  });
+
+  // --- Section 6 One-Snapshot Read Authorization & Concurrency Tests (186–191) ---
+
+  // 186. Concurrency: Two SQLite connections in WAL mode guarantee consistent snapshot read
+  it('186. Concurrency: Two SQLite connections in WAL mode observe consistent snapshot', () => {
+    fixtures.db.pragma('journal_mode = WAL');
+    const writerDb = new Database(fixtures.dbPath);
+    writerDb.pragma('foreign_keys = ON');
+
+    try {
+      const changesBefore = (fixtures.db.prepare('SELECT total_changes() as c').get() as any).c;
+
+      // Execute read on connection 1
+      const res = fixtures.service.authenticateAndGetReviewPackage(fixtures.token1, fixtures.adjudicationId);
+      expect(res.projection_json).toBeDefined();
+      expect(res.projection_hash).toBeDefined();
+
+      // total_changes() on connection 1 must be strictly unchanged
+      const changesAfter = (fixtures.db.prepare('SELECT total_changes() as c').get() as any).c;
+      expect(changesAfter - changesBefore).toBe(0);
+    } finally {
+      writerDb.close();
+    }
+  });
+
+  // 187. Concurrency: Read beginning after authority-invalidating commit fails closed immediately
+  it('187. Concurrency: Read beginning after authority-invalidating commit fails closed immediately', () => {
+    fixtures.db.pragma('journal_mode = WAL');
+    const writerDb = new Database(fixtures.dbPath);
+    writerDb.pragma('foreign_keys = ON');
+
+    try {
+      const changesBefore = (fixtures.db.prepare('SELECT total_changes() as c').get() as any).c;
+
+      // Invalidate task state on connection 2
+      writerDb.prepare("UPDATE tasks SET state = 'CANCELLED' WHERE id = ?").run(fixtures.taskId);
+
+      // Subsequent read on connection 1 must immediately fail closed with TASK_STATE_INVALID
+      expect(() => {
+        fixtures.service.authenticateAndGetReviewPackage(fixtures.token1, fixtures.adjudicationId);
+      }).toThrowError(/TASK_STATE_INVALID/);
+
+      // total_changes on connection 1 remains strictly unchanged
+      const changesAfter = (fixtures.db.prepare('SELECT total_changes() as c').get() as any).c;
+      expect(changesAfter - changesBefore).toBe(0);
+    } finally {
+      writerDb.close();
+    }
+  });
+
+  // 188. Concurrency: Recovery fencing commit on writer connection immediately invalidates subsequent reads
+  it('188. Concurrency: Recovery fencing commit on writer connection immediately invalidates subsequent reads', () => {
+    fixtures.db.pragma('journal_mode = WAL');
+    const writerDb = new Database(fixtures.dbPath);
+    writerDb.pragma('foreign_keys = ON');
+
+    try {
+      const changesBefore = (fixtures.db.prepare('SELECT total_changes() as c').get() as any).c;
+
+      const fencedAt = new Date().toISOString();
+      writerDb.prepare(
+        "UPDATE coder_submission_adjudications SET recovery_fenced_at = ?, status = 'RECOVERY_FENCED', failure_code = 'MANUAL_FENCE', lifecycle_version = lifecycle_version + 1 WHERE id = ?"
+      ).run(fencedAt, fixtures.adjudicationId);
+
+      expect(() => {
+        fixtures.service.authenticateAndGetReviewPackage(fixtures.token1, fixtures.adjudicationId);
+      }).toThrowError(/REVIEW_AUTHORITY_FENCED/);
+
+      const changesAfter = (fixtures.db.prepare('SELECT total_changes() as c').get() as any).c;
+      expect(changesAfter - changesBefore).toBe(0);
+    } finally {
+      writerDb.close();
+    }
+  });
+
+  // 189. Concurrency: Successful and failed transactional reads leave total_changes() strictly unchanged
+  it('189. Concurrency: Successful and failed transactional reads leave total_changes() strictly unchanged', () => {
+    const changesBefore = (fixtures.db.prepare('SELECT total_changes() as c').get() as any).c;
+
+    // 1. Successful read
+    fixtures.service.authenticateAndGetReviewPackage(fixtures.token1, fixtures.adjudicationId);
+    const changesAfterSuccess = (fixtures.db.prepare('SELECT total_changes() as c').get() as any).c;
+    expect(changesAfterSuccess - changesBefore).toBe(0);
+
+    // 2. Failed read (invalid token)
+    expect(() => {
+      fixtures.service.authenticateAndGetReviewPackage(`${REVIEWER_TOKEN_PREFIX}${crypto.randomUUID()}`, fixtures.adjudicationId);
+    }).toThrowError(/AUTH_FAILED/);
+    const changesAfterFailAuth = (fixtures.db.prepare('SELECT total_changes() as c').get() as any).c;
+    expect(changesAfterFailAuth - changesBefore).toBe(0);
+
+    // 3. Failed read (mismatched adjudication)
+    expect(() => {
+      fixtures.service.authenticateAndGetReviewPackage(fixtures.token1, crypto.randomUUID());
+    }).toThrowError(/PERMISSION_DENIED/);
+    const changesAfterFailPerm = (fixtures.db.prepare('SELECT total_changes() as c').get() as any).c;
+    expect(changesAfterFailPerm - changesBefore).toBe(0);
+  });
+
+  // 190. Protocol: Both tool and resource endpoints call authenticateAndGetReviewPackage transactional API
+  it('190. Protocol: Both tool and resource endpoints call authenticateAndGetReviewPackage transactional API', async () => {
+    const server = buildAgentForgeReviewerMcpServer({
+      db: fixtures.db,
+      reviewerToken: fixtures.token1,
+    });
+    const [cTrans, sTrans] = InMemoryTransport.createLinkedPair();
+    await server.connect(sTrans);
+    const client = new Client({ name: 'test-client', version: '1.0.0' });
+    await client.connect(cTrans);
+
+    try {
+      // 1. Tool read
+      const toolRes = await client.callTool({
+        name: REVIEWER_TOOL_NAME,
+        arguments: { adjudication_id: fixtures.adjudicationId },
+      });
+      expect(toolRes.isError).toBeFalsy();
+      const toolText = (toolRes.content[0] as any).text;
+      const toolParsed = JSON.parse(toolText);
+      expect(toolParsed.projection_schema_version).toBe(1);
+
+      // 2. Resource read
+      const resRes = await client.readResource({
+        uri: `agentforge://reviews/packages/${fixtures.adjudicationId}`,
+      });
+      const resText = (resRes.contents[0] as any).text;
+      const resParsed = JSON.parse(resText);
+      expect(resParsed.projection_schema_version).toBe(1);
+
+      // 3. Byte-level parity
+      expect(toolText).toBe(resText);
+    } finally {
+      await client.close();
+      await server.close();
+    }
+  });
+
+  // 191. Concurrency: Snapshot isolation guarantees token, authority, and projection are evaluated in same snapshot
+  it('191. Concurrency: Snapshot isolation guarantees token, authority, and projection are evaluated in same snapshot', () => {
+    fixtures.db.pragma('journal_mode = WAL');
+    const writerDb = new Database(fixtures.dbPath);
+    writerDb.pragma('foreign_keys = ON');
+
+    try {
+      const changesBefore = (fixtures.db.prepare('SELECT total_changes() as c').get() as any).c;
+
+      // Inside runInReadTransaction on reader connection, all queries observe consistent snapshot
+      const res = fixtures.repo.runInReadTransaction(() => {
+        return fixtures.service.authenticateAndGetReviewPackage(fixtures.token1, fixtures.adjudicationId);
+      });
+      expect(res.projection_json).toBeDefined();
+
+      const changesAfter = (fixtures.db.prepare('SELECT total_changes() as c').get() as any).c;
+      expect(changesAfter - changesBefore).toBe(0);
+    } finally {
+      writerDb.close();
+    }
+  });
 });

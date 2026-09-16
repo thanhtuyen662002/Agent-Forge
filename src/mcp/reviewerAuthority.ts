@@ -18,6 +18,9 @@ import {
   SESSION_DURATION_MIN_SECONDS,
   SESSION_DURATION_MAX_SECONDS,
   SESSION_DURATION_DEFAULT_SECONDS,
+  ReviewerAuthorityLiveValidationResult,
+  StrictFrozenProjectionSchema,
+  StrictFrozenProjection,
 } from '../types/reviewer';
 
 export class ReviewerAuthorityError extends Error {
@@ -72,6 +75,79 @@ export function truncateDiffBytes(buf: Buffer | string, maxBytes: number = DIFF_
 export function fatalUtf8Decode(bytes: Buffer | Uint8Array): string {
   const decoder = new TextDecoder('utf-8', { fatal: true });
   return decoder.decode(bytes);
+}
+
+export function hasPrototypePollution(obj: unknown): boolean {
+  if (!obj || typeof obj !== 'object') return false;
+  if (
+    Object.prototype.hasOwnProperty.call(obj, '__proto__') ||
+    Object.prototype.hasOwnProperty.call(obj, 'constructor') ||
+    Object.prototype.hasOwnProperty.call(obj, 'prototype')
+  ) {
+    return true;
+  }
+  for (const key of Object.keys(obj)) {
+    const val = (obj as Record<string, unknown>)[key];
+    if (typeof val === 'object' && val !== null) {
+      if (hasPrototypePollution(val)) return true;
+    }
+  }
+  return false;
+}
+
+export function validateFrozenProjection(
+  parsed: unknown,
+  session: McpReviewerSession,
+  liveState: ReviewerAuthorityLiveValidationResult
+): StrictFrozenProjection {
+  if (hasPrototypePollution(parsed)) {
+    throw new ReviewerAuthorityError('PROJECTION_CORRUPTED', 'Projection contains forbidden prototype-sensitive properties');
+  }
+
+  const result = StrictFrozenProjectionSchema.safeParse(parsed);
+  if (!result.success) {
+    throw new ReviewerAuthorityError(
+      'PROJECTION_CORRUPTED',
+      `Projection schema validation failed: ${result.error.issues.map((i) => `${i.path.join('.')}: ${i.message}`).join('; ')}`
+    );
+  }
+
+  const projection = result.data;
+
+  // Verify adjudication bindings with authenticated session
+  if (projection.adjudication.id !== session.adjudication_id) {
+    throw new ReviewerAuthorityError('PROJECTION_CORRUPTED', 'Projection adjudication ID does not match session adjudication ID');
+  }
+  if (projection.adjudication.submission_id !== session.submission_id) {
+    throw new ReviewerAuthorityError('PROJECTION_CORRUPTED', 'Projection submission ID does not match session submission ID');
+  }
+  if (projection.adjudication.task_ownership_epoch !== session.task_ownership_epoch) {
+    throw new ReviewerAuthorityError('PROJECTION_CORRUPTED', 'Projection task ownership epoch does not match session epoch');
+  }
+
+  // Verify adjudication bindings with live authority snapshot
+  if (liveState.adjudication_id && projection.adjudication.id !== liveState.adjudication_id) {
+    throw new ReviewerAuthorityError('PROJECTION_CORRUPTED', 'Projection adjudication ID does not match live authority adjudication ID');
+  }
+  if (liveState.submission_id && projection.adjudication.submission_id !== liveState.submission_id) {
+    throw new ReviewerAuthorityError('PROJECTION_CORRUPTED', 'Projection submission ID does not match live authority submission ID');
+  }
+  if (liveState.task_id && projection.adjudication.task_id !== liveState.task_id) {
+    throw new ReviewerAuthorityError('PROJECTION_CORRUPTED', 'Projection task ID does not match live authority task ID');
+  }
+  if (liveState.project_id && projection.adjudication.project_id !== liveState.project_id) {
+    throw new ReviewerAuthorityError('PROJECTION_CORRUPTED', 'Projection project ID does not match live authority project ID');
+  }
+  if (liveState.current_task_ownership_epoch !== null && projection.adjudication.task_ownership_epoch !== liveState.current_task_ownership_epoch) {
+    throw new ReviewerAuthorityError('PROJECTION_CORRUPTED', 'Projection task ownership epoch does not match live authority epoch');
+  }
+
+  // Verify verification_result_envelope_hash consistency
+  if (liveState.verification_result_envelope_hash && session.verification_result_envelope_hash !== liveState.verification_result_envelope_hash) {
+    throw new ReviewerAuthorityError('PROJECTION_CORRUPTED', 'Session verification envelope hash does not match live authority envelope hash');
+  }
+
+  return projection;
 }
 
 export class ReviewerAuthorityService {
@@ -524,50 +600,10 @@ export class ReviewerAuthorityService {
     return session;
   }
 
-  public validateAuthorityFence(session: McpReviewerSession): void {
-    // 1. Session revocation check
-    if (session.revoked_at !== null) {
-      throw new ReviewerAuthorityError('TOKEN_REVOKED', `Session was revoked at ${session.revoked_at}`);
-    }
-    // 2. Session expiration check
-    if (new Date(session.expires_at).getTime() <= Date.now()) {
-      throw new ReviewerAuthorityError('TOKEN_EXPIRED', `Session expired at ${session.expires_at}`);
-    }
-
-    // 3. Adjudication authority fence state check (supports existing tests mocking getAdjudicationAuthorityFenceState)
-    const fence = this.repo.getAdjudicationAuthorityFenceState(session.adjudication_id);
-    if (!fence) {
-      throw new ReviewerAuthorityError('STALE_REVIEWER_AUTHORITY', `Adjudication ${session.adjudication_id} no longer exists`);
-    }
-
-    if (fence.adjudication_status === 'RECOVERY_FENCED' || fence.adjudication_recovery_fenced_at !== null) {
-      throw new ReviewerAuthorityError('REVIEW_AUTHORITY_FENCED', `Adjudication ${session.adjudication_id} is recovery fenced`);
-    }
-
-    if (fence.current_task_ownership_epoch !== session.task_ownership_epoch) {
-      throw new ReviewerAuthorityError(
-        'STALE_REVIEWER_AUTHORITY',
-        `Task ownership epoch changed from ${session.task_ownership_epoch} to ${fence.current_task_ownership_epoch}`
-      );
-    }
-
-    if (fence.current_authority_snapshot_hash !== session.authority_snapshot_hash) {
-      throw new ReviewerAuthorityError(
-        'STALE_REVIEWER_AUTHORITY',
-        'Adjudication authority snapshot hash changed since session issuance'
-      );
-    }
-
-    // 4. Complete live authority revalidation across the 4-tuple and adjudication/task state
-    const liveState = this.repo.getReviewerAuthorityLiveValidationState({
-      sessionId: session.id,
-      adjudicationId: session.adjudication_id,
-      reviewerAgentId: session.reviewer_agent_id,
-      reviewerProviderId: session.reviewer_provider_id,
-      reviewerAccountId: session.reviewer_account_id,
-      reviewerResourceId: session.reviewer_resource_id,
-    });
-
+  public validateLiveAuthorityState(
+    session: McpReviewerSession,
+    liveState: ReviewerAuthorityLiveValidationResult
+  ): void {
     if (!liveState.adjudication_exists) {
       throw new ReviewerAuthorityError('STALE_REVIEWER_AUTHORITY', `Adjudication ${session.adjudication_id} no longer exists`);
     }
@@ -583,18 +619,18 @@ export class ReviewerAuthorityService {
     if (liveState.current_authority_snapshot_hash !== session.authority_snapshot_hash) {
       throw new ReviewerAuthorityError('STALE_REVIEWER_AUTHORITY', 'Adjudication authority snapshot hash changed since session issuance');
     }
+    if (liveState.current_task_ownership_epoch !== null && liveState.current_task_ownership_epoch !== session.task_ownership_epoch) {
+      throw new ReviewerAuthorityError(
+        'STALE_REVIEWER_AUTHORITY',
+        `Task ownership epoch changed from ${session.task_ownership_epoch} to ${liveState.current_task_ownership_epoch}`
+      );
+    }
 
     if (!liveState.task_exists) {
       throw new ReviewerAuthorityError('STALE_REVIEWER_AUTHORITY', 'Task no longer exists');
     }
     if (liveState.task_state !== 'REVIEW_READY') {
       throw new ReviewerAuthorityError('TASK_STATE_INVALID', `Task is no longer in REVIEW_READY state (got ${liveState.task_state})`);
-    }
-    if (liveState.current_task_ownership_epoch !== session.task_ownership_epoch) {
-      throw new ReviewerAuthorityError(
-        'STALE_REVIEWER_AUTHORITY',
-        `Task ownership epoch changed from ${session.task_ownership_epoch} to ${liveState.current_task_ownership_epoch}`
-      );
     }
 
     if (!liveState.agent_exists) {
@@ -651,6 +687,53 @@ export class ReviewerAuthorityService {
     }
   }
 
+  public validateAuthorityFence(session: McpReviewerSession): void {
+    // 1. Session revocation check
+    if (session.revoked_at !== null) {
+      throw new ReviewerAuthorityError('TOKEN_REVOKED', `Session was revoked at ${session.revoked_at}`);
+    }
+    // 2. Session expiration check
+    if (new Date(session.expires_at).getTime() <= Date.now()) {
+      throw new ReviewerAuthorityError('TOKEN_EXPIRED', `Session expired at ${session.expires_at}`);
+    }
+
+    // 3. Adjudication authority fence state check (supports existing tests mocking getAdjudicationAuthorityFenceState)
+    const fence = this.repo.getAdjudicationAuthorityFenceState(session.adjudication_id);
+    if (!fence) {
+      throw new ReviewerAuthorityError('STALE_REVIEWER_AUTHORITY', `Adjudication ${session.adjudication_id} no longer exists`);
+    }
+
+    if (fence.adjudication_status === 'RECOVERY_FENCED' || fence.adjudication_recovery_fenced_at !== null) {
+      throw new ReviewerAuthorityError('REVIEW_AUTHORITY_FENCED', `Adjudication ${session.adjudication_id} is recovery fenced`);
+    }
+
+    if (fence.current_task_ownership_epoch !== session.task_ownership_epoch) {
+      throw new ReviewerAuthorityError(
+        'STALE_REVIEWER_AUTHORITY',
+        `Task ownership epoch changed from ${session.task_ownership_epoch} to ${fence.current_task_ownership_epoch}`
+      );
+    }
+
+    if (fence.current_authority_snapshot_hash !== session.authority_snapshot_hash) {
+      throw new ReviewerAuthorityError(
+        'STALE_REVIEWER_AUTHORITY',
+        'Adjudication authority snapshot hash changed since session issuance'
+      );
+    }
+
+    // 4. Complete live authority revalidation across the 4-tuple and adjudication/task state
+    const liveState = this.repo.getReviewerAuthorityLiveValidationState({
+      sessionId: session.id,
+      adjudicationId: session.adjudication_id,
+      reviewerAgentId: session.reviewer_agent_id,
+      reviewerProviderId: session.reviewer_provider_id,
+      reviewerAccountId: session.reviewer_account_id,
+      reviewerResourceId: session.reviewer_resource_id,
+    });
+
+    this.validateLiveAuthorityState(session, liveState);
+  }
+
   public getReviewPackage(
     session: McpReviewerSession,
     requestedAdjudicationId: string
@@ -695,7 +778,7 @@ export class ReviewerAuthorityService {
     }
 
     // 5. Parse and validate stored JSON as bounded object structure
-    let parsed: Record<string, unknown>;
+    let parsed: unknown;
     try {
       parsed = JSON.parse(session.projection_json);
       if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) {
@@ -705,30 +788,133 @@ export class ReviewerAuthorityService {
       throw new ReviewerAuthorityError('PROJECTION_CORRUPTED', 'Projection payload is not a valid JSON object');
     }
 
-    if (parsed.projection_schema_version !== 1) {
-      throw new ReviewerAuthorityError('PROJECTION_SCHEMA_INVALID', 'Projection JSON projection_schema_version must equal 1');
-    }
+    const liveState = this.repo.getReviewerAuthorityLiveValidationState({
+      sessionId: session.id,
+      adjudicationId: session.adjudication_id,
+      reviewerAgentId: session.reviewer_agent_id,
+      reviewerProviderId: session.reviewer_provider_id,
+      reviewerAccountId: session.reviewer_account_id,
+      reviewerResourceId: session.reviewer_resource_id,
+    });
 
-    const adj = parsed.adjudication as Record<string, unknown> | undefined;
-    if (!adj || typeof adj !== 'object' || Array.isArray(adj) || adj.id !== session.adjudication_id) {
-      throw new ReviewerAuthorityError('PROJECTION_CORRUPTED', 'Projection adjudication object is missing or mismatched');
-    }
-
-    const ev = parsed.evidence as Record<string, unknown> | undefined;
-    if (!ev || typeof ev !== 'object' || Array.isArray(ev) || !ev.git_status || !ev.git_diff) {
-      throw new ReviewerAuthorityError('PROJECTION_CORRUPTED', 'Projection evidence structure is invalid');
-    }
-
-    const disp = parsed.disposition as Record<string, unknown> | undefined;
-    if (!disp || typeof disp !== 'object' || Array.isArray(disp) || disp.disposition_event !== 'SETTLED' || disp.disposition_reason !== 'ACCEPTED_VERIFIED') {
-      throw new ReviewerAuthorityError('PROJECTION_CORRUPTED', 'Projection disposition structure is invalid');
-    }
+    validateFrozenProjection(parsed, session, liveState);
 
     // Return strictly the stored frozen projection JSON
     return {
       projection_json: session.projection_json,
       projection_hash: session.projection_hash,
     };
+  }
+
+  public authenticateAndGetReviewPackage(
+    token: string,
+    adjudicationId: string
+  ): { projection_json: string; projection_hash: string } {
+    return this.repo.runInReadTransaction(() => {
+      // Linearization point: Beginning of this explicit SQLite deferred read transaction.
+      // All subsequent reads observe a single consistent snapshot.
+      if (typeof token !== 'string') {
+        throw new ReviewerAuthorityError('INVALID_REVIEWER_TOKEN', 'Token must be a non-empty string');
+      }
+
+      // Precedence 1: Lexical prefix & format check
+      const uuidPattern = '^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$';
+      const regex = new RegExp(`^${REVIEWER_TOKEN_PREFIX}([0-9a-f-]{36})$`, 'i');
+      const match = token.match(regex);
+      if (!match || !new RegExp(uuidPattern, 'i').test(match[1])) {
+        throw new ReviewerAuthorityError('INVALID_REVIEWER_TOKEN', 'Token does not match expected af-rev- UUIDv4 format');
+      }
+
+      // Precedence 2: Hash lookup
+      const tokenHash = computeSha256(token);
+      const session = this.repo.getMcpReviewerSessionByTokenHash(tokenHash);
+      if (!session) {
+        throw new ReviewerAuthorityError('AUTH_FAILED', 'Reviewer session not found for token hash');
+      }
+
+      // Precedence 3: Scope verification
+      if (session.scope !== 'AUTHORIZED_REVIEW_READ' && session.scope !== 'REVIEWER_CONTEXT_READ') {
+        throw new ReviewerAuthorityError('INSUFFICIENT_SCOPE', `Session scope ${session.scope} does not permit review read`);
+      }
+
+      // Precedence 4: Revocation verification
+      if (session.revoked_at !== null) {
+        throw new ReviewerAuthorityError('TOKEN_REVOKED', `Session was revoked at ${session.revoked_at}`);
+      }
+
+      // Precedence 5: Expiration verification
+      if (new Date().getTime() >= new Date(session.expires_at).getTime()) {
+        throw new ReviewerAuthorityError('TOKEN_EXPIRED', `Session expired at ${session.expires_at}`);
+      }
+
+      // Precedence 6: Bound adjudication check
+      if (adjudicationId !== session.adjudication_id) {
+        throw new ReviewerAuthorityError(
+          'PERMISSION_DENIED',
+          `Authenticated session is bound to adjudication ${session.adjudication_id}, cannot access ${adjudicationId}`
+        );
+      }
+
+      // Comprehensive live authority query in this exact read transaction snapshot
+      // (Supersedes the redundant legacy fence query)
+      const liveState = this.repo.getReviewerAuthorityLiveValidationState({
+        sessionId: session.id,
+        adjudicationId: session.adjudication_id,
+        reviewerAgentId: session.reviewer_agent_id,
+        reviewerProviderId: session.reviewer_provider_id,
+        reviewerAccountId: session.reviewer_account_id,
+        reviewerResourceId: session.reviewer_resource_id,
+      });
+
+      this.validateLiveAuthorityState(session, liveState);
+
+      // Projection schema validation
+      if (session.projection_schema !== 1) {
+        throw new ReviewerAuthorityError(
+          'PROJECTION_SCHEMA_INVALID',
+          `Unsupported projection schema version: ${session.projection_schema} (expected 1)`
+        );
+      }
+
+      // Projection size limit check
+      if (typeof session.projection_json !== 'string') {
+        throw new ReviewerAuthorityError('PROJECTION_CORRUPTED', 'Projection payload must be a non-empty string');
+      }
+      const payloadBytes = Buffer.byteLength(session.projection_json, 'utf8');
+      if (payloadBytes > PROJECTION_PAYLOAD_MAX_UTF8_BYTES) {
+        throw new ReviewerAuthorityError(
+          'PROJECTION_PAYLOAD_TOO_LARGE',
+          `Projection payload exceeds ${PROJECTION_PAYLOAD_MAX_UTF8_BYTES} bytes`
+        );
+      }
+
+      // Recompute SHA-256 over exact stored projection bytes
+      const computedHash = computeSha256(session.projection_json);
+      if (computedHash !== session.projection_hash) {
+        throw new ReviewerAuthorityError(
+          'PROJECTION_HASH_MISMATCH',
+          'Projection content hash does not match stored projection_hash'
+        );
+      }
+
+      // Strict projection structure, bounds, and live authority binding validation
+      let parsed: unknown;
+      try {
+        parsed = JSON.parse(session.projection_json);
+        if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) {
+          throw new Error('Not an object');
+        }
+      } catch {
+        throw new ReviewerAuthorityError('PROJECTION_CORRUPTED', 'Projection payload is not a valid JSON object');
+      }
+
+      validateFrozenProjection(parsed, session, liveState);
+
+      return {
+        projection_json: session.projection_json,
+        projection_hash: session.projection_hash,
+      };
+    });
   }
 
   public revokeReviewerSession(sessionId: string, reason: string): boolean {

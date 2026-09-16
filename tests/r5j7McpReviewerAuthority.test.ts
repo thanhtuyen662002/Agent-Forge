@@ -4,6 +4,7 @@ import os from 'os';
 import crypto from 'crypto';
 import Database from 'better-sqlite3';
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
+import zlib from 'zlib';
 import {
   MigrationRunner,
   MIGRATIONS,
@@ -11,6 +12,7 @@ import {
   MIGRATION_24_EXPECTED_SQL_SHA256,
   MIGRATION_24_GZIP_CHUNKS,
   decompressMigration24Sql,
+  decompressAndVerifyMigration24Sql,
 } from '../src/core/database/migrations';
 import { Repository } from '../src/core/database/repositories';
 import { ArtifactStore } from '../src/core/services/ArtifactStore';
@@ -1689,20 +1691,51 @@ describe('R5J7 MCP Reviewer Authority & Invariants (Cases 1–70, 124–131, 135
 
   // 148. Migration 24 deterministic decompression, explicit expected SHA-256 hash match, and schema verification
   it('148. Migration 24 deterministic decompression, explicit expected SHA-256 hash match, and schema verification', () => {
-    // 1. Decompress stored GZIP chunks
-    const decompressedSql = decompressMigration24Sql(MIGRATION_24_GZIP_CHUNKS);
-    expect(decompressedSql.length).toBeGreaterThan(0);
+    // 1. Decompress stored GZIP chunks through verified production path
+    const verifiedSql = decompressAndVerifyMigration24Sql(MIGRATION_24_GZIP_CHUNKS, MIGRATION_24_EXPECTED_SQL_SHA256);
+    expect(verifiedSql.length).toBeGreaterThan(0);
 
     // 2. Assert explicit deterministic SHA-256 hash
-    const computedHash = computeSha256(decompressedSql);
+    const computedHash = computeSha256(verifiedSql);
     expect(computedHash).toBe(MIGRATION_24_EXPECTED_SQL_SHA256);
     expect(MIGRATION_24_EXPECTED_SQL_SHA256).toBe('2fc99142425342a96d76c187ad86f5ed433c214718f0a3790e482c2767a751fd');
 
-    // 3. Assert complete schema authority on live database (19 columns, 6 RESTRICT FKs, 4 indexes, 3 triggers)
+    // 3. Assert rejection of invalid Base64 input
+    expect(() => {
+      decompressAndVerifyMigration24Sql(['@@@invalid-base64@@@'], MIGRATION_24_EXPECTED_SQL_SHA256);
+    }).toThrowError(/MIGRATION_24_INTEGRITY_VIOLATION.*invalid Base64/);
+
+    // 4. Assert rejection of invalid GZIP input
+    const nonGzipBase64 = Buffer.from('this is plain text, definitely not gzip').toString('base64');
+    expect(() => {
+      decompressAndVerifyMigration24Sql([nonGzipBase64], MIGRATION_24_EXPECTED_SQL_SHA256);
+    }).toThrowError(/MIGRATION_24_INTEGRITY_VIOLATION.*Failed to decompress Migration 24 GZIP stream/);
+
+    // 5. Assert rejection of invalid UTF-8 after decompression
+    const invalidUtf8Bytes = Buffer.from([0x80, 0x81, 0x82, 0xff]);
+    const invalidUtf8GzipBase64 = zlib.gzipSync(invalidUtf8Bytes).toString('base64');
+    expect(() => {
+      decompressAndVerifyMigration24Sql([invalidUtf8GzipBase64], MIGRATION_24_EXPECTED_SQL_SHA256);
+    }).toThrowError(/MIGRATION_24_INTEGRITY_VIOLATION.*invalid UTF-8 bytes/);
+
+    // 6. Assert rejection of syntactically valid GZIP stream containing modified SQL
+    const modifiedSql = 'CREATE TABLE modified_table (id TEXT PRIMARY KEY);';
+    const modifiedSqlGzipBase64 = zlib.gzipSync(Buffer.from(modifiedSql, 'utf8')).toString('base64');
+    expect(() => {
+      decompressAndVerifyMigration24Sql([modifiedSqlGzipBase64], MIGRATION_24_EXPECTED_SQL_SHA256);
+    }).toThrowError(/MIGRATION_24_INTEGRITY_VIOLATION.*SHA-256 mismatch/);
+
+    // 7. Assert rejection of valid SQL supplied with incorrect expected hash
+    expect(() => {
+      decompressAndVerifyMigration24Sql(MIGRATION_24_GZIP_CHUNKS, '0'.repeat(64));
+    }).toThrowError(/MIGRATION_24_INTEGRITY_VIOLATION.*SHA-256 mismatch/);
+
+    // 8. Assert complete schema authority on live database (19 columns, 6 RESTRICT FKs, 4 indexes, 3 triggers)
     expect(() => verifyMigration24SchemaAuthority(fixtures.db)).not.toThrow();
 
-    // 4. Corrupted compressed chunks must fail loudly and fail closed
-    expect(() => decompressMigration24Sql(['not-valid-base64-or-gzip'])).toThrowError(/MIGRATION_24_DECOMPRESSION_FAILED/);
+    // 9. Legacy decompressMigration24Sql wrapper succeeds on canonical chunks and fails on corrupted chunks
+    expect(decompressMigration24Sql(MIGRATION_24_GZIP_CHUNKS)).toBe(verifiedSql);
+    expect(() => decompressMigration24Sql(['not-valid-base64-or-gzip'])).toThrowError(/MIGRATION_24_INTEGRITY_VIOLATION/);
   });
 
   // 149. Direct DB test: Malformed projection_json fails closed on read with PROJECTION_CORRUPTED

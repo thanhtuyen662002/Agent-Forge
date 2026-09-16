@@ -167,8 +167,7 @@ export function registerReviewerCapabilities(
       }
 
       try {
-        const session = authorityService.authenticateToken(token);
-        const { projection_json } = authorityService.getReviewPackage(session, validatedArgs.adjudication_id);
+        const { projection_json } = authorityService.authenticateAndGetReviewPackage(token, validatedArgs.adjudication_id);
 
         return {
           content: [
@@ -257,8 +256,7 @@ export function registerReviewerCapabilities(
       }
 
       try {
-        const session = authorityService.authenticateToken(token);
-        const { projection_json } = authorityService.getReviewPackage(session, adjudicationId);
+        const { projection_json } = authorityService.authenticateAndGetReviewPackage(token, adjudicationId);
 
         return {
           contents: [

@@ -7,6 +7,7 @@
 
 import Database from 'better-sqlite3';
 import zlib from 'zlib';
+import crypto from 'crypto';
 
 export interface Migration {
   version: number;
@@ -2074,10 +2075,11 @@ const ALL_MIGRATIONS_LIST: Migration[] = [
 ];
 
 // Migration 24 raw DDL SQL is stored as compressed Base64/GZIP chunks to provide
-// tamper-resistant, deterministic SQL integrity across heterogeneous host platforms
+// deterministic SQL integrity across heterogeneous host platforms
 // (preventing line-ending divergence between CRLF/LF environments during Git checkouts
 // for complex trigger procedural statements), while maintaining compact source file size.
-// Integrity is strictly verified via deterministic SHA-256 decompression assertions.
+// Integrity is verified at module initialization via deterministic SHA-256 comparison against
+// MIGRATION_24_EXPECTED_SQL_SHA256 in decompressAndVerifyMigration24Sql.
 export const MIGRATION_24_EXPECTED_SQL_SHA256 = '2fc99142425342a96d76c187ad86f5ed433c214718f0a3790e482c2767a751fd';
 
 export const MIGRATION_24_GZIP_CHUNKS = [
@@ -2086,17 +2088,67 @@ export const MIGRATION_24_GZIP_CHUNKS = [
   "A2VuaqxLeFUOqnVTzeDT2WxP8moP6je1n1JrVdHs76iXpYsbKmZ/d7E8APP+3pWys+X4sCNrJwVIac4uMfPmlbcFRNblx0iBxvE5xtOqklW9Pbz1Dc6qqHZ0CTioDGyLSmFvRtfZ4behMbm2Jgb3kmuYN/rYGG56S5RW8oTFmS8MCDB+ug7wAnyaRGF26uYOpKw4SE+Q44zREH4CfTBA1w4aukX1KT1bcefAmppO+8dOA2zSZrJ7D0lKSYRL1iRg6ZsIma783QMb/YkGTqZjB37ow+uW6KaH1vl/Rds+FLo20GVXEN4XNmDfEQuOPvngThzdQWUoDFZxzDfmGVC4Ng8FGoiuSkB6S+MuzW0aPHyvbG5Ilz8twxRqJcD4wYP1suDPym6G5EGNlfVSe/qgySZpFZKDSsQ2vIv3X/QLZDol5nZ2fErfNpJSMA4XOdbI7kJ2J7RGo7FhovTcIuj44QUzer8gkF8P4J4GPg0e9ndD+qoTyMcTCcOG25OACPeEogWIyNYqq9lx5Ic+aJnu8nob9zbeNcq7cnbrbqDoN96MOvt64tq2bowhshXOyLeUDp0CcZ4PAb8D+/tjW7z3BZEEb6SAd+N6KTCKetmWkJan/aJsIOrrNtOyy2jlXH1PFmHwACwsyLqSzVLUhRGJRU7hBcwJXrD54YAU761BJAdepIy82s05RUaKjb3RxDU4pYXUkOxQmTYL/UY3xnxKwtvF+XRyx59j69b9a2o5urZ3rNloYk3tAdrmkCJ9D/FIgzfUBSJ3+cH1YfOFQIhi2Wdxb2tOyjjHRzgtbnJafKTTigIkq1Ob3mQFqIGiMUB3xcQEjUf5q44jyz43hkNkbjSCcgzI5iRtk+mK5LTv2FddzBhZRiwBhkWDxWWHzZaOa7K4V8zjmpvJN8GVxXQGWHrZyPBKl45D7Lh7RUIWxGP8Ur05CaxfMZXE2+pe9nPBPybqSubkLgAA"
 ];
 
-export function decompressMigration24Sql(chunks: readonly string[] = MIGRATION_24_GZIP_CHUNKS): string {
+export function decompressAndVerifyMigration24Sql(
+  chunks: readonly string[] = MIGRATION_24_GZIP_CHUNKS,
+  expectedHash: string = MIGRATION_24_EXPECTED_SQL_SHA256
+): string {
+  // 1. Strict Base64 validation and decoding
+  const base64Regex = /^[A-Za-z0-9+/=]+$/;
+  const buffers: Buffer[] = [];
+  for (let i = 0; i < chunks.length; i++) {
+    const chunk = chunks[i];
+    if (typeof chunk !== 'string' || chunk.length === 0) {
+      throw new Error(`[MIGRATION_24_INTEGRITY_VIOLATION] Migration 24 chunk ${i} must be a non-empty string`);
+    }
+    const cleanChunk = chunk.replace(/[\r\n\s]+/g, '');
+    if (!base64Regex.test(cleanChunk)) {
+      throw new Error(`[MIGRATION_24_INTEGRITY_VIOLATION] Migration 24 chunk ${i} contains invalid Base64 characters`);
+    }
+    const buf = Buffer.from(cleanChunk, 'base64');
+    // Round-trip check to catch invalid Base64 padding or malformed sequences
+    if (buf.toString('base64').replace(/=/g, '') !== cleanChunk.replace(/=/g, '')) {
+      throw new Error(`[MIGRATION_24_INTEGRITY_VIOLATION] Migration 24 chunk ${i} failed strict Base64 roundtrip verification`);
+    }
+    buffers.push(buf);
+  }
+
+  // 2. Strict GZIP decompression
+  let decompressedBuffer: Buffer;
   try {
-    const rawBuffer = Buffer.concat(chunks.map((c) => Buffer.from(c, 'base64')));
-    return zlib.gunzipSync(rawBuffer).toString('utf8');
+    const concatenated = Buffer.concat(buffers);
+    decompressedBuffer = zlib.gunzipSync(concatenated);
   } catch (err: unknown) {
     const msg = err instanceof Error ? err.message : String(err);
-    throw new Error(`[MIGRATION_24_DECOMPRESSION_FAILED] Failed to decompress Migration 24 SQL: ${msg}`);
+    throw new Error(`[MIGRATION_24_INTEGRITY_VIOLATION] Failed to decompress Migration 24 GZIP stream: ${msg}`);
   }
+
+  // 3. Fatal UTF-8 decoding
+  let decompressedSql: string;
+  try {
+    decompressedSql = new TextDecoder('utf-8', { fatal: true }).decode(decompressedBuffer);
+  } catch (err: unknown) {
+    throw new Error('[MIGRATION_24_INTEGRITY_VIOLATION] Migration 24 decompressed payload contains invalid UTF-8 bytes');
+  }
+
+  // 4. SHA-256 hash calculation and verification
+  const computedHash = crypto.createHash('sha256').update(decompressedSql, 'utf8').digest('hex');
+  if (computedHash !== expectedHash) {
+    throw new Error(
+      `[MIGRATION_24_INTEGRITY_VIOLATION] Migration 24 SQL SHA-256 mismatch: expected ${expectedHash}, computed ${computedHash}`
+    );
+  }
+
+  return decompressedSql;
 }
 
-export const MIGRATION_24_RAW_SQL = decompressMigration24Sql();
+export function decompressMigration24Sql(chunks: readonly string[] = MIGRATION_24_GZIP_CHUNKS): string {
+  return decompressAndVerifyMigration24Sql(chunks, MIGRATION_24_EXPECTED_SQL_SHA256);
+}
+
+export const MIGRATION_24_RAW_SQL = decompressAndVerifyMigration24Sql(
+  MIGRATION_24_GZIP_CHUNKS,
+  MIGRATION_24_EXPECTED_SQL_SHA256
+);
 
 export const MIGRATIONS: readonly Migration[] = ALL_MIGRATIONS_LIST;
 

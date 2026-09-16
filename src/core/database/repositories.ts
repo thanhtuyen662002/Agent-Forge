@@ -211,6 +211,11 @@ export class Repository {
     return tx.immediate();
   }
 
+  public runInReadTransaction<T>(fn: () => T): T {
+    const tx = this.db.transaction(fn);
+    return tx.deferred();
+  }
+
   // ==========================================
   // Projects
   // ==========================================
@@ -3875,10 +3880,13 @@ export class Repository {
       SELECT
         -- Adjudication
         csa.id AS adjudication_id,
+        csa.submission_id AS submission_id,
+        csa.project_id AS project_id,
         csa.action AS adjudication_action,
         csa.status AS adjudication_status,
         csa.recovery_fenced_at AS adjudication_recovery_fenced_at,
         csa.authority_snapshot_hash AS current_authority_snapshot_hash,
+        csa.verification_result_envelope_hash AS verification_result_envelope_hash,
         -- Task
         t.id AS task_id,
         t.state AS task_state,
@@ -3926,11 +3934,16 @@ export class Repository {
     if (!row) {
       return {
         adjudication_exists: false,
+        adjudication_id: null,
+        submission_id: null,
+        project_id: null,
         adjudication_action: null,
         adjudication_status: null,
         adjudication_recovery_fenced_at: null,
         current_authority_snapshot_hash: null,
+        verification_result_envelope_hash: null,
         task_exists: false,
+        task_id: null,
         task_state: null,
         current_task_ownership_epoch: null,
         agent_exists: false,
@@ -3955,11 +3968,16 @@ export class Repository {
 
     return {
       adjudication_exists: true,
+      adjudication_id: row.adjudication_id ? String(row.adjudication_id) : null,
+      submission_id: row.submission_id ? String(row.submission_id) : null,
+      project_id: row.project_id ? String(row.project_id) : null,
       adjudication_action: row.adjudication_action ? String(row.adjudication_action) : null,
       adjudication_status: row.adjudication_status ? String(row.adjudication_status) : null,
       adjudication_recovery_fenced_at: row.adjudication_recovery_fenced_at ? String(row.adjudication_recovery_fenced_at) : null,
       current_authority_snapshot_hash: row.current_authority_snapshot_hash ? String(row.current_authority_snapshot_hash) : null,
+      verification_result_envelope_hash: row.verification_result_envelope_hash ? String(row.verification_result_envelope_hash) : null,
       task_exists: row.task_id !== null && row.task_id !== undefined,
+      task_id: row.task_id ? String(row.task_id) : null,
       task_state: row.task_state ? String(row.task_state) : null,
       current_task_ownership_epoch: row.current_task_ownership_epoch !== null && row.current_task_ownership_epoch !== undefined ? Number(row.current_task_ownership_epoch) : null,
       agent_exists: row.agent_id !== null && row.agent_id !== undefined,

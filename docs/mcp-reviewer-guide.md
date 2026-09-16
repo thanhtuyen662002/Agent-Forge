@@ -156,14 +156,52 @@ node dist-electron/mcp/reviewerAdmin.js configure-client \
 
 ---
 
-## 6. Migration 24 Representation & Verification
+## 6. Migration 24 Representation & Integrity Verification
 
-Migration 24 (`024_r5j_reviewer_session_authority`) establishes the durable reviewer session schema. Its raw SQL is stored as compressed Base64/GZIP chunks in `MIGRATION_24_GZIP_CHUNKS` to guarantee tamper-resistant deterministic DDL across CRLF/LF operating systems.
+Migration 24 (`024_r5j_reviewer_session_authority`) establishes the durable reviewer session schema. Its raw SQL is stored as compressed Base64/GZIP chunks in `MIGRATION_24_GZIP_CHUNKS` to guarantee deterministic DDL representation across CRLF/LF operating systems.
 
-Deterministic verification asserts:
-- Decompressed SQL SHA-256 exactly equals `2fc99142425342a96d76c187ad86f5ed433c214718f0a3790e482c2767a751fd` (`MIGRATION_24_EXPECTED_SQL_SHA256`).
+Deterministic integrity verification is performed in production via:
+`decompressAndVerifyMigration24Sql(chunks: readonly string[], expectedHash: string): string`
+
+This production function executes during module evaluation to construct `MIGRATION_24_RAW_SQL` prior to any database execution in `applyPendingMigrations()` / `db.exec()`. It:
+1. Strictly decodes Base64 chunks (validating characters and canonical padding).
+2. Decompresses the GZIP stream via `zlib.gunzipSync`.
+3. Decodes the bytes using fatal UTF-8 decoding (`new TextDecoder('utf-8', { fatal: true })`).
+4. Recomputes SHA-256 over the exact UTF-8 bytes.
+5. Asserts exact equality with `MIGRATION_24_EXPECTED_SQL_SHA256` (`2fc99142425342a96d76c187ad86f5ed433c214718f0a3790e482c2767a751fd`).
+6. Throws a fail-closed error `[MIGRATION_24_INTEGRITY_VIOLATION]` before database execution if decoding, decompression, UTF-8 parsing, or hash verification fails.
+
+*(Note: This is deterministic integrity verification against chunk corruption or transport drift, not a separate cryptographic trust boundary, as the chunks and expected hash are checked within the same codebase.)*
+
+In addition, schema authority post-migration asserts:
 - Table `mcp_reviewer_sessions` contains exactly 19 columns with required types and CHECK constraints.
 - Exactly 6 foreign keys with `ON DELETE RESTRICT`.
 - Exactly 4 user indexes.
 - Exactly 3 triggers: delete prevention, immutable update, and insert-time authority fencing.
-- Altered or corrupt compressed chunks fail loudly and fail closed.
+
+---
+
+## 7. One-Snapshot Read Authorization Architecture
+
+Reviewer context reads use a single authoritative API:
+`ReviewerAuthorityService.authenticateAndGetReviewPackage(token: string, adjudicationId: string)`
+
+Both the MCP tool (`agentforge_get_review_package`) and MCP resource (`agentforge://reviews/packages/{adjudication_id}`) handlers call this single API.
+
+### Transactional Guarantees & Linearization Point
+- **Linearization Point**: The beginning of the explicit SQLite deferred read transaction (`Repository.runInReadTransaction`).
+- **Snapshot Isolation**: The entire read operation (token format validation, token hash lookup, session validation, comprehensive live authority validation, projection hash verification, and strict structural validation) runs inside this single transaction. All queries observe one consistent database MVCC snapshot.
+- **Strictly Read-Only**: Zero database mutations occur (`total_changes()` remains strictly unchanged). No INSERT, UPDATE, DELETE, cleanup, token rotation, last-read tracking, or expiration mutation is performed.
+- **Single Live Authority Query**: The comprehensive live authority query (`getReviewerAuthorityLiveValidationState`) evaluates all 4-tuple bindings, adjudication status, task state, and self-review fences in the same transaction snapshot, superseding the redundant legacy fence query.
+
+### Strict Frozen-Projection Validation
+Projections are validated against `StrictFrozenProjectionSchema` via `validateFrozenProjection`:
+- Top-level structure: exactly `projection_schema_version`, `adjudication`, `verification_results`, `evidence`, and `disposition` (unexpected properties rejected).
+- Nested validation:
+  - `adjudication`: action `ADMIT_VERIFICATION`, status `VERIFIED`, identifiers bound to both session and live authority state (`id`, `submission_id`, `task_id`, `project_id`, `task_ownership_epoch`).
+  - `verification_results`: non-null plain object, test run ID, `exit_code === 0`, `failed_count === 0`, non-negative integer counts and duration, non-null envelope object, and consistent `verification_result_envelope_hash`.
+  - `evidence.git_status`: non-null plain object, `is_clean` boolean, safe repository-relative file paths (rejecting absolute paths, empty segments, and traversal `..`).
+  - `evidence.git_diff`: non-null plain object, content string <= 32 KiB, `byte_size` matching exact UTF-8 byte length, and consistent truncation metadata.
+  - `disposition`: `SETTLED`, `ACCEPTED_VERIFIED`, valid ISO timestamp.
+- Prototype-sensitive keys (`__proto__`, `constructor`, `prototype`) are rejected.
+- Sanitized fail-closed errors are returned on any violation, exposing no projection content.
