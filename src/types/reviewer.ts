@@ -101,7 +101,17 @@ export interface ReviewerAuthorityLiveValidationResult {
   coder_selected_account_id: string | null;
   submission_id: string | null;
   project_id: string | null;
+  test_run_id: string | null;
   verification_result_envelope_hash: string | null;
+  verification_result_envelope_json: string | null;
+}
+
+export interface ReviewerAuthorityReadOptions {
+  /**
+   * Deterministic test-only hook executed immediately after the first SELECT
+   * (which establishes the SQLite WAL read snapshot) and prior to live-state evaluation.
+   */
+  _testAfterFirstSelectHook?: () => void;
 }
 
 export interface SafeReviewerSessionMetadata {

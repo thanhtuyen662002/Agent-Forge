@@ -189,17 +189,20 @@ Reviewer context reads use a single authoritative API:
 Both the MCP tool (`agentforge_get_review_package`) and MCP resource (`agentforge://reviews/packages/{adjudication_id}`) handlers call this single API.
 
 ### Transactional Guarantees & Linearization Point
-- **Linearization Point**: The beginning of the explicit SQLite deferred read transaction (`Repository.runInReadTransaction`).
-- **Snapshot Isolation**: The entire read operation (token format validation, token hash lookup, session validation, comprehensive live authority validation, projection hash verification, and strict structural validation) runs inside this single transaction. All queries observe one consistent database MVCC snapshot.
+- **Linearization Point**: Established upon the first SELECT statement (`getMcpReviewerSessionByTokenHash`) within the explicit SQLite deferred read transaction (`Repository.runInReadTransaction`). In SQLite WAL mode, a deferred transaction pins its read mark (MVCC snapshot) upon executing its first read operation, not upon transaction entry.
+- **Snapshot Isolation**: All subsequent reads in the transaction (including the comprehensive live authority query and projection validation) observe this exact pinned snapshot. A concurrent writer committing an authority-invalidating update after the first read cannot cause the ongoing read to observe mixed pre- and post-mutation state.
+- **Interleaving Concurrency Verification**: Verified deterministically in tests via an injected barrier hook (`_testAfterFirstSelectHook`) triggered immediately after the snapshot-establishing first read. While Connection 1 holds its read snapshot, Connection 2 commits an authority-invalidating mutation (e.g., task cancellation or session revocation). Connection 1 continues and completes its read observing the consistent pre-mutation snapshot with zero writes (`total_changes() === 0`). The subsequent read initiates a new transaction, observes the committed mutation, and fails closed immediately.
 - **Strictly Read-Only**: Zero database mutations occur (`total_changes()` remains strictly unchanged). No INSERT, UPDATE, DELETE, cleanup, token rotation, last-read tracking, or expiration mutation is performed.
-- **Single Live Authority Query**: The comprehensive live authority query (`getReviewerAuthorityLiveValidationState`) evaluates all 4-tuple bindings, adjudication status, task state, and self-review fences in the same transaction snapshot, superseding the redundant legacy fence query.
+- **Single Live Authority Query**: The comprehensive live authority query (`getReviewerAuthorityLiveValidationState`) evaluates all 4-tuple bindings, adjudication status, task state, durable `test_run_id`, durable `verification_result_envelope_json`, and self-review fences in the same transaction snapshot, superseding the redundant legacy fence query.
 
-### Strict Frozen-Projection Validation
+### Strict Frozen-Projection Validation & Durable Truth Binding
 Projections are validated against `StrictFrozenProjectionSchema` via `validateFrozenProjection`:
 - Top-level structure: exactly `projection_schema_version`, `adjudication`, `verification_results`, `evidence`, and `disposition` (unexpected properties rejected).
 - Nested validation:
   - `adjudication`: action `ADMIT_VERIFICATION`, status `VERIFIED`, identifiers bound to both session and live authority state (`id`, `submission_id`, `task_id`, `project_id`, `task_ownership_epoch`).
-  - `verification_results`: non-null plain object, test run ID, `exit_code === 0`, `failed_count === 0`, non-negative integer counts and duration, non-null envelope object, and consistent `verification_result_envelope_hash`.
+  - `verification_results`: non-null plain object, `exit_code === 0`, `failed_count === 0`, non-negative integer counts and duration, non-null envelope object, and consistent `verification_result_envelope_hash`.
+  - `test_run_id` durable binding: `projection.verification_results.test_run_id` is strictly bound to the durable adjudication `test_run_id` in the same snapshot.
+  - `envelope` durable semantic equality: `projection.verification_results.envelope` is compared against the durable adjudication's `verification_result_envelope_json` using safe, deterministic canonicalization (`canonicalizeJson`). This guarantees semantic JSON equality regardless of source JSON key ordering or whitespace, while strictly rejecting prototype-sensitive keys (`__proto__`, `constructor`, `prototype`), `undefined`, non-finite numbers (`NaN`, `Infinity`), and non-JSON types.
   - `evidence.git_status`: non-null plain object, `is_clean` boolean, safe repository-relative file paths (rejecting absolute paths, empty segments, and traversal `..`).
   - `evidence.git_diff`: non-null plain object, content string <= 32 KiB, `byte_size` matching exact UTF-8 byte length, and consistent truncation metadata.
   - `disposition`: `SETTLED`, `ACCEPTED_VERIFIED`, valid ISO timestamp.

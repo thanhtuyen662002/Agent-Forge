@@ -19,6 +19,7 @@ import {
   SESSION_DURATION_MAX_SECONDS,
   SESSION_DURATION_DEFAULT_SECONDS,
   ReviewerAuthorityLiveValidationResult,
+  ReviewerAuthorityReadOptions,
   StrictFrozenProjectionSchema,
   StrictFrozenProjection,
 } from '../types/reviewer';
@@ -95,6 +96,70 @@ export function hasPrototypePollution(obj: unknown): boolean {
   return false;
 }
 
+export function canonicalizeJson(value: unknown): string {
+  if (value === undefined) {
+    throw new ReviewerAuthorityError('CANONICALIZATION_ERROR', 'Canonical JSON does not accept undefined');
+  }
+  if (typeof value === 'function' || typeof value === 'symbol' || typeof value === 'bigint') {
+    throw new ReviewerAuthorityError('CANONICALIZATION_ERROR', `Canonical JSON does not accept type ${typeof value}`);
+  }
+  if (value === null) {
+    return 'null';
+  }
+  if (typeof value === 'boolean') {
+    return value ? 'true' : 'false';
+  }
+  if (typeof value === 'number') {
+    if (!Number.isFinite(value)) {
+      throw new ReviewerAuthorityError('CANONICALIZATION_ERROR', 'Canonical JSON does not accept non-finite numbers');
+    }
+    if (Object.is(value, -0)) {
+      return '0';
+    }
+    return JSON.stringify(value);
+  }
+  if (typeof value === 'string') {
+    return JSON.stringify(value);
+  }
+  if (Array.isArray(value)) {
+    const elements = value.map((el) => canonicalizeJson(el));
+    return `[${elements.join(',')}]`;
+  }
+  if (typeof value === 'object') {
+    const proto = Object.getPrototypeOf(value);
+    if (proto !== null && proto !== Object.prototype) {
+      throw new ReviewerAuthorityError('CANONICALIZATION_ERROR', 'Canonical JSON only accepts plain objects');
+    }
+
+    if (
+      Object.prototype.hasOwnProperty.call(value, '__proto__') ||
+      Object.prototype.hasOwnProperty.call(value, 'constructor') ||
+      Object.prototype.hasOwnProperty.call(value, 'prototype')
+    ) {
+      throw new ReviewerAuthorityError('CANONICALIZATION_ERROR', 'Forbidden prototype-sensitive key detected');
+    }
+
+    const keys = Object.keys(value as Record<string, unknown>).sort();
+    for (const key of keys) {
+      if (key === '__proto__' || key === 'constructor' || key === 'prototype') {
+        throw new ReviewerAuthorityError('CANONICALIZATION_ERROR', 'Forbidden prototype-sensitive key detected');
+      }
+    }
+
+    const pairs = keys.map((key) => {
+      const val = (value as Record<string, unknown>)[key];
+      if (val === undefined) {
+        throw new ReviewerAuthorityError('CANONICALIZATION_ERROR', `Property "${key}" has undefined value`);
+      }
+      return `${JSON.stringify(key)}:${canonicalizeJson(val)}`;
+    });
+
+    return `{${pairs.join(',')}}`;
+  }
+
+  throw new ReviewerAuthorityError('CANONICALIZATION_ERROR', `Unsupported type for canonical JSON: ${typeof value}`);
+}
+
 export function validateFrozenProjection(
   parsed: unknown,
   session: McpReviewerSession,
@@ -142,9 +207,52 @@ export function validateFrozenProjection(
     throw new ReviewerAuthorityError('PROJECTION_CORRUPTED', 'Projection task ownership epoch does not match live authority epoch');
   }
 
-  // Verify verification_result_envelope_hash consistency
+  // Verify verification_result_envelope_hash consistency between session and live state
   if (liveState.verification_result_envelope_hash && session.verification_result_envelope_hash !== liveState.verification_result_envelope_hash) {
     throw new ReviewerAuthorityError('PROJECTION_CORRUPTED', 'Session verification envelope hash does not match live authority envelope hash');
+  }
+
+  // Verify test_run_id binding with durable adjudication truth
+  if (!liveState.test_run_id || projection.verification_results.test_run_id !== liveState.test_run_id) {
+    throw new ReviewerAuthorityError('PROJECTION_CORRUPTED', 'Projection test_run_id does not match durable adjudication test_run_id');
+  }
+
+  // Verify verification envelope binding with durable adjudication truth
+  if (!liveState.verification_result_envelope_json) {
+    throw new ReviewerAuthorityError('PROJECTION_CORRUPTED', 'Durable adjudication is missing verification_result_envelope_json');
+  }
+
+  let durableEnvelope: unknown;
+  try {
+    durableEnvelope = JSON.parse(liveState.verification_result_envelope_json);
+    if (typeof durableEnvelope !== 'object' || durableEnvelope === null || Array.isArray(durableEnvelope)) {
+      throw new Error('Not an object');
+    }
+  } catch {
+    throw new ReviewerAuthorityError('PROJECTION_CORRUPTED', 'Durable verification result envelope is malformed JSON');
+  }
+
+  if (hasPrototypePollution(projection.verification_results.envelope) || hasPrototypePollution(durableEnvelope)) {
+    throw new ReviewerAuthorityError('PROJECTION_CORRUPTED', 'Verification result envelope contains forbidden prototype-sensitive properties');
+  }
+
+  let canonicalProjEnv: string;
+  let canonicalDurableEnv: string;
+  try {
+    canonicalProjEnv = canonicalizeJson(projection.verification_results.envelope);
+    canonicalDurableEnv = canonicalizeJson(durableEnvelope);
+  } catch (err: any) {
+    throw new ReviewerAuthorityError('PROJECTION_CORRUPTED', `Verification envelope canonicalization failed: ${err.message}`);
+  }
+
+  if (canonicalProjEnv !== canonicalDurableEnv) {
+    throw new ReviewerAuthorityError('PROJECTION_CORRUPTED', 'Projection verification envelope does not match durable adjudication envelope');
+  }
+
+  const canonicalProjEnvHash = computeSha256(canonicalProjEnv);
+  const canonicalDurableEnvHash = computeSha256(canonicalDurableEnv);
+  if (canonicalProjEnvHash !== canonicalDurableEnvHash) {
+    throw new ReviewerAuthorityError('PROJECTION_CORRUPTED', 'Projection verification envelope hash does not match durable adjudication envelope hash');
   }
 
   return projection;
@@ -808,11 +916,12 @@ export class ReviewerAuthorityService {
 
   public authenticateAndGetReviewPackage(
     token: string,
-    adjudicationId: string
+    adjudicationId: string,
+    options?: ReviewerAuthorityReadOptions
   ): { projection_json: string; projection_hash: string } {
     return this.repo.runInReadTransaction(() => {
-      // Linearization point: Beginning of this explicit SQLite deferred read transaction.
-      // All subsequent reads observe a single consistent snapshot.
+      // Linearization point: Established at the first SELECT/read statement within this explicit
+      // SQLite deferred read transaction. All subsequent reads in this transaction observe that exact snapshot.
       if (typeof token !== 'string') {
         throw new ReviewerAuthorityError('INVALID_REVIEWER_TOKEN', 'Token must be a non-empty string');
       }
@@ -825,11 +934,17 @@ export class ReviewerAuthorityService {
         throw new ReviewerAuthorityError('INVALID_REVIEWER_TOKEN', 'Token does not match expected af-rev- UUIDv4 format');
       }
 
-      // Precedence 2: Hash lookup
+      // Precedence 2: Hash lookup (first SELECT establishes SQLite WAL read mark snapshot)
       const tokenHash = computeSha256(token);
       const session = this.repo.getMcpReviewerSessionByTokenHash(tokenHash);
       if (!session) {
         throw new ReviewerAuthorityError('AUTH_FAILED', 'Reviewer session not found for token hash');
+      }
+
+      // Deterministic test barrier hook: executed immediately after the first SELECT establishes the read snapshot,
+      // enabling real concurrency/TOCTOU tests before live-state and projection validation.
+      if (options?._testAfterFirstSelectHook) {
+        options._testAfterFirstSelectHook();
       }
 
       // Precedence 3: Scope verification

@@ -14,6 +14,7 @@ import {
   fatalUtf8Decode,
   scrubReviewerDiagnostics,
   ReviewerAuthorityError,
+  canonicalizeJson,
 } from '../src/mcp/reviewerAuthority';
 import {
   REVIEWER_TOOL_NAME,
@@ -1553,6 +1554,9 @@ describe('R5J7 MCP Reviewer Protocol & Tool Surface (Cases 71–105, 132–134, 
   function buildValidBaseProjection(fixtures: Fixtures, overrides: Record<string, unknown> = {}): Record<string, unknown> {
     const task = fixtures.repo.getTask(fixtures.taskId)!;
     const adj = fixtures.repo.getCoderSubmissionAdjudicationById(fixtures.adjudicationId)!;
+    const durableEnvelope = adj.verification_result_envelope_json
+      ? JSON.parse(adj.verification_result_envelope_json)
+      : { verified: true, testsPassed: true };
     return {
       projection_schema_version: 1,
       adjudication: {
@@ -1568,13 +1572,13 @@ describe('R5J7 MCP Reviewer Protocol & Tool Surface (Cases 71–105, 132–134, 
         status: 'VERIFIED',
       },
       verification_results: {
-        test_run_id: 'tr-001',
+        test_run_id: adj.test_run_id ?? 'tr-001',
         exit_code: 0,
         passed_count: 10,
         failed_count: 0,
         skipped_count: 0,
         duration_ms: 250,
-        envelope: { run_status: 'passed' },
+        envelope: durableEnvelope,
       },
       evidence: {
         git_status: {
@@ -1747,25 +1751,184 @@ describe('R5J7 MCP Reviewer Protocol & Tool Surface (Cases 71–105, 132–134, 
     await insertCorruptedSessionAndAssertFailClosed(fixtures, p);
   });
 
+  // 185a. Forged verification envelope with valid projection_hash fails closed
+  it('185a. Strict projection: Forged verification envelope with valid recomputed projection_hash fails closed with PROJECTION_CORRUPTED', async () => {
+    const p = buildValidBaseProjection(fixtures);
+    // Maliciously forge envelope content while keeping valid schema and recomputing valid projection_hash
+    (p.verification_results as any).envelope = { verified: false, forged_flag: true };
+    await insertCorruptedSessionAndAssertFailClosed(fixtures, p);
+  });
+
+  // 185b. Forged test_run_id with valid projection_hash fails closed
+  it('185b. Strict projection: Forged test_run_id with valid recomputed projection_hash fails closed with PROJECTION_CORRUPTED', async () => {
+    const p = buildValidBaseProjection(fixtures);
+    (p.verification_results as any).test_run_id = 'tr-forged-unbound-run-id';
+    await insertCorruptedSessionAndAssertFailClosed(fixtures, p);
+  });
+
+  // 185c. Semantic JSON equality: permuted key order succeeds under canonicalization
+  it('185c. Semantic JSON equality: permuted key order succeeds under canonicalization', async () => {
+    const p = buildValidBaseProjection(fixtures);
+    // Permute the key order of envelope: original was { verified: true, testsPassed: true }
+    // Permuted: { testsPassed: true, verified: true }
+    (p.verification_results as any).envelope = {
+      testsPassed: true,
+      verified: true,
+    };
+    // Directly verify that canonicalizeJson produces identical string
+    const adj = fixtures.repo.getCoderSubmissionAdjudicationById(fixtures.adjudicationId)!;
+    const originalEnv = JSON.parse(adj.verification_result_envelope_json!);
+    expect(canonicalizeJson((p.verification_results as any).envelope)).toBe(canonicalizeJson(originalEnv));
+
+    // Insert session with permuted envelope and assert read succeeds
+    const rawToken = `${REVIEWER_TOKEN_PREFIX}${crypto.randomUUID()}`;
+    const tokenHash = computeSha256(rawToken);
+    const now = new Date().toISOString();
+    const expiresAt = new Date(Date.now() + 3600000).toISOString();
+    const projectionJson = JSON.stringify(p);
+    const projectionHash = computeSha256(projectionJson);
+
+    const extraAgentId = `agent-rev-permuted-${crypto.randomUUID()}`;
+    fixtures.db.prepare(`
+      INSERT INTO agents (id, display_name, role, provider_resource_id, status, current_task_id, last_seen_at)
+      VALUES (?, 'Permuted Key Reviewer', 'REVIEWER', ?, 'IDLE', NULL, ?)
+    `).run(extraAgentId, fixtures.reviewerResourceId, now);
+
+    fixtures.db.prepare(`
+      INSERT INTO mcp_reviewer_sessions (
+        id, adjudication_id, submission_id, reviewer_agent_id, reviewer_provider_id,
+        reviewer_account_id, reviewer_resource_id, scope, token_hash, task_ownership_epoch,
+        authority_snapshot_hash, verification_result_envelope_hash, projection_schema,
+        projection_hash, projection_json, issued_at, expires_at, revoked_at, revocation_reason
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?, NULL, NULL)
+    `).run(
+      crypto.randomUUID(), fixtures.adjudicationId, fixtures.submissionId, extraAgentId,
+      fixtures.reviewerProviderId, fixtures.reviewerAccountId, fixtures.reviewerResourceId,
+      REVIEWER_TOKEN_SCOPE, tokenHash, adj.task_ownership_epoch, adj.authority_snapshot_hash,
+      adj.verification_result_envelope_hash, projectionHash, projectionJson, now, expiresAt
+    );
+
+    const res = fixtures.service.authenticateAndGetReviewPackage(rawToken, fixtures.adjudicationId);
+    expect(res.projection_json).toBe(projectionJson);
+    expect(res.projection_hash).toBe(projectionHash);
+  });
+
+  // 185d. CanonicalizeJson invariants: deterministic, handles primitives/arrays/objects, rejects invalid types
+  it('185d. CanonicalizeJson invariants: rejects prototype keys, non-finite numbers, and invalid types', () => {
+    // Deterministic key sorting
+    expect(canonicalizeJson({ z: 1, a: 2, m: 3 })).toBe('{"a":2,"m":3,"z":1}');
+    // Normalizes -0 to 0
+    expect(canonicalizeJson(-0)).toBe('0');
+    // Array preservation
+    expect(canonicalizeJson([3, 1, 2])).toBe('[3,1,2]');
+    // Primitives
+    expect(canonicalizeJson(null)).toBe('null');
+    expect(canonicalizeJson(true)).toBe('true');
+    expect(canonicalizeJson('hello world')).toBe('"hello world"');
+
+    // Rejects undefined
+    expect(() => canonicalizeJson(undefined)).toThrowError(/CANONICALIZATION_ERROR/);
+    expect(() => canonicalizeJson({ a: undefined })).toThrowError(/CANONICALIZATION_ERROR/);
+
+    // Rejects non-finite numbers
+    expect(() => canonicalizeJson(NaN)).toThrowError(/CANONICALIZATION_ERROR/);
+    expect(() => canonicalizeJson(Infinity)).toThrowError(/CANONICALIZATION_ERROR/);
+    expect(() => canonicalizeJson(-Infinity)).toThrowError(/CANONICALIZATION_ERROR/);
+
+    // Rejects non-JSON types
+    expect(() => canonicalizeJson(() => {})).toThrowError(/CANONICALIZATION_ERROR/);
+    expect(() => canonicalizeJson(Symbol('test'))).toThrowError(/CANONICALIZATION_ERROR/);
+    expect(() => canonicalizeJson(BigInt(123))).toThrowError(/CANONICALIZATION_ERROR/);
+
+    // Rejects prototype-sensitive keys
+    expect(() => canonicalizeJson({ __proto__: {} })).toThrowError(/CANONICALIZATION_ERROR/);
+    expect(() => canonicalizeJson({ constructor: {} })).toThrowError(/CANONICALIZATION_ERROR/);
+    expect(() => canonicalizeJson({ prototype: {} })).toThrowError(/CANONICALIZATION_ERROR/);
+  });
+
   // --- Section 6 One-Snapshot Read Authorization & Concurrency Tests (186–191) ---
 
-  // 186. Concurrency: Two SQLite connections in WAL mode guarantee consistent snapshot read
-  it('186. Concurrency: Two SQLite connections in WAL mode observe consistent snapshot', () => {
+  // 186. Concurrency: Real interleaving barrier proves single read observes consistent snapshot across mutation
+  it('186. Concurrency: Real interleaving barrier proves single read observes consistent snapshot across mutation', () => {
     fixtures.db.pragma('journal_mode = WAL');
     const writerDb = new Database(fixtures.dbPath);
     writerDb.pragma('foreign_keys = ON');
 
     try {
       const changesBefore = (fixtures.db.prepare('SELECT total_changes() as c').get() as any).c;
+      let barrierFired = false;
 
-      // Execute read on connection 1
-      const res = fixtures.service.authenticateAndGetReviewPackage(fixtures.token1, fixtures.adjudicationId);
+      // Connection 1 begins read transaction; barrier hook executes after first SELECT (snapshot established)
+      const res = fixtures.service.authenticateAndGetReviewPackage(
+        fixtures.token1,
+        fixtures.adjudicationId,
+        {
+          _testAfterFirstSelectHook: () => {
+            barrierFired = true;
+            // Connection 2 commits an authority-invalidating update
+            writerDb.prepare("UPDATE tasks SET state = 'CANCELLED' WHERE id = ?").run(fixtures.taskId);
+          },
+        }
+      );
+
+      expect(barrierFired).toBe(true);
       expect(res.projection_json).toBeDefined();
       expect(res.projection_hash).toBeDefined();
 
-      // total_changes() on connection 1 must be strictly unchanged
+      // total_changes() on reader connection 1 must be strictly unchanged
       const changesAfter = (fixtures.db.prepare('SELECT total_changes() as c').get() as any).c;
       expect(changesAfter - changesBefore).toBe(0);
+
+      // Subsequent read on reader connection begins new snapshot, observes committed cancellation, and fails closed
+      expect(() => {
+        fixtures.service.authenticateAndGetReviewPackage(fixtures.token1, fixtures.adjudicationId);
+      }).toThrowError(/TASK_STATE_INVALID/);
+
+      const changesAfterFail = (fixtures.db.prepare('SELECT total_changes() as c').get() as any).c;
+      expect(changesAfterFail - changesBefore).toBe(0);
+    } finally {
+      writerDb.close();
+    }
+  });
+
+  // 186b. Concurrency: Interleaving barrier with session revocation mutation during read
+  it('186b. Concurrency: Interleaving barrier with session revocation mutation during read', () => {
+    fixtures.db.pragma('journal_mode = WAL');
+    const writerDb = new Database(fixtures.dbPath);
+    writerDb.pragma('foreign_keys = ON');
+
+    try {
+      const changesBefore = (fixtures.db.prepare('SELECT total_changes() as c').get() as any).c;
+      let barrierFired = false;
+
+      // Reader 2 begins read; barrier hook revokes session on Connection 2
+      const res = fixtures.service.authenticateAndGetReviewPackage(
+        fixtures.token2,
+        fixtures.adjudicationId,
+        {
+          _testAfterFirstSelectHook: () => {
+            barrierFired = true;
+            writerDb.prepare("UPDATE mcp_reviewer_sessions SET revoked_at = ?, revocation_reason = 'concurrent test revocation' WHERE id = ?").run(
+              new Date().toISOString(),
+              fixtures.sessionId2
+            );
+          },
+        }
+      );
+
+      expect(barrierFired).toBe(true);
+      expect(res.projection_json).toBeDefined();
+
+      const changesAfter = (fixtures.db.prepare('SELECT total_changes() as c').get() as any).c;
+      expect(changesAfter - changesBefore).toBe(0);
+
+      // Subsequent read observes committed revocation and fails closed with TOKEN_REVOKED
+      expect(() => {
+        fixtures.service.authenticateAndGetReviewPackage(fixtures.token2, fixtures.adjudicationId);
+      }).toThrowError(/TOKEN_REVOKED/);
+
+      const changesAfterFail = (fixtures.db.prepare('SELECT total_changes() as c').get() as any).c;
+      expect(changesAfterFail - changesBefore).toBe(0);
     } finally {
       writerDb.close();
     }
@@ -1883,25 +2046,17 @@ describe('R5J7 MCP Reviewer Protocol & Tool Surface (Cases 71–105, 132–134, 
     }
   });
 
-  // 191. Concurrency: Snapshot isolation guarantees token, authority, and projection are evaluated in same snapshot
-  it('191. Concurrency: Snapshot isolation guarantees token, authority, and projection are evaluated in same snapshot', () => {
-    fixtures.db.pragma('journal_mode = WAL');
-    const writerDb = new Database(fixtures.dbPath);
-    writerDb.pragma('foreign_keys = ON');
+  // 191. Transaction nesting: Calling authenticateAndGetReviewPackage inside an outer read transaction
+  it('191. Transaction nesting: Calling authenticateAndGetReviewPackage inside an outer read transaction', () => {
+    const changesBefore = (fixtures.db.prepare('SELECT total_changes() as c').get() as any).c;
 
-    try {
-      const changesBefore = (fixtures.db.prepare('SELECT total_changes() as c').get() as any).c;
+    // Inside outer runInReadTransaction on reader connection, nested read operates consistently
+    const res = fixtures.repo.runInReadTransaction(() => {
+      return fixtures.service.authenticateAndGetReviewPackage(fixtures.token1, fixtures.adjudicationId);
+    });
+    expect(res.projection_json).toBeDefined();
 
-      // Inside runInReadTransaction on reader connection, all queries observe consistent snapshot
-      const res = fixtures.repo.runInReadTransaction(() => {
-        return fixtures.service.authenticateAndGetReviewPackage(fixtures.token1, fixtures.adjudicationId);
-      });
-      expect(res.projection_json).toBeDefined();
-
-      const changesAfter = (fixtures.db.prepare('SELECT total_changes() as c').get() as any).c;
-      expect(changesAfter - changesBefore).toBe(0);
-    } finally {
-      writerDb.close();
-    }
+    const changesAfter = (fixtures.db.prepare('SELECT total_changes() as c').get() as any).c;
+    expect(changesAfter - changesBefore).toBe(0);
   });
 });
