@@ -82,6 +82,18 @@ import {
   AdjudicationEventType,
 } from '../types/domain';
 import type { CoderSubmissionWorkspaceLease, WorkspaceLeaseState } from '../types/adjudication';
+import type {
+  McpReviewerSession,
+  ReviewerAuthorityFenceState,
+  ReviewerAuthorityLiveValidationParams,
+  ReviewerAuthorityLiveValidationResult,
+} from '../../types/reviewer';
+export type {
+  McpReviewerSession,
+  ReviewerAuthorityFenceState,
+  ReviewerAuthorityLiveValidationParams,
+  ReviewerAuthorityLiveValidationResult,
+};
 import type { ProviderDispatchExecutionResult } from '../services/ProviderDispatchService';
 import { ExecutionFailureClassifier } from '../services/ExecutionFailureClassifier';
 import { FailureHealthMutationPolicyService } from '../services/FailureHealthMutationPolicyService';
@@ -197,6 +209,11 @@ export class Repository {
   public runInImmediateTransaction<T>(fn: () => T): T {
     const tx = this.db.transaction(fn);
     return tx.immediate();
+  }
+
+  public runInReadTransaction<T>(fn: () => T): T {
+    const tx = this.db.transaction(fn);
+    return tx.deferred();
   }
 
   // ==========================================
@@ -3717,6 +3734,299 @@ export class Repository {
       expires_at: String(row.expires_at),
       revoked_at: row.revoked_at != null ? String(row.revoked_at) : null,
       revocation_reason: row.revocation_reason != null ? String(row.revocation_reason) : null,
+    };
+  }
+
+  // ==========================================
+  // MCP Reviewer Sessions Authority (R5J7)
+  // ==========================================
+  public createMcpReviewerSession(session: McpReviewerSession): void {
+    this.db
+      .prepare(`
+        INSERT INTO mcp_reviewer_sessions (
+          id,
+          adjudication_id,
+          submission_id,
+          reviewer_agent_id,
+          reviewer_provider_id,
+          reviewer_account_id,
+          reviewer_resource_id,
+          scope,
+          token_hash,
+          task_ownership_epoch,
+          authority_snapshot_hash,
+          verification_result_envelope_hash,
+          projection_schema,
+          projection_hash,
+          projection_json,
+          issued_at,
+          expires_at,
+          revoked_at,
+          revocation_reason
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      `)
+      .run(
+        session.id,
+        session.adjudication_id,
+        session.submission_id,
+        session.reviewer_agent_id,
+        session.reviewer_provider_id,
+        session.reviewer_account_id,
+        session.reviewer_resource_id,
+        session.scope,
+        session.token_hash,
+        session.task_ownership_epoch,
+        session.authority_snapshot_hash,
+        session.verification_result_envelope_hash,
+        session.projection_schema,
+        session.projection_hash,
+        session.projection_json,
+        session.issued_at,
+        session.expires_at,
+        session.revoked_at,
+        session.revocation_reason
+      );
+  }
+
+  public getMcpReviewerSessionById(id: string): McpReviewerSession | null {
+    const row = this.db
+      .prepare('SELECT * FROM mcp_reviewer_sessions WHERE id = ?')
+      .get(id) as Record<string, unknown> | undefined;
+    if (!row) return null;
+    return this.mapMcpReviewerSession(row);
+  }
+
+  public getMcpReviewerSessionByTokenHash(tokenHash: string): McpReviewerSession | null {
+    const row = this.db
+      .prepare('SELECT * FROM mcp_reviewer_sessions WHERE token_hash = ?')
+      .get(tokenHash) as Record<string, unknown> | undefined;
+    if (!row) return null;
+    return this.mapMcpReviewerSession(row);
+  }
+
+  public getActiveMcpReviewerSession(adjudicationId: string, reviewerAgentId: string): McpReviewerSession | null {
+    const row = this.db
+      .prepare('SELECT * FROM mcp_reviewer_sessions WHERE adjudication_id = ? AND reviewer_agent_id = ? AND revoked_at IS NULL')
+      .get(adjudicationId, reviewerAgentId) as Record<string, unknown> | undefined;
+    if (!row) return null;
+    return this.mapMcpReviewerSession(row);
+  }
+
+  public listMcpReviewerSessions(filters?: { adjudicationId?: string; sessionId?: string; activeOnly?: boolean }): McpReviewerSession[] {
+    let query = 'SELECT * FROM mcp_reviewer_sessions WHERE 1=1';
+    const params: unknown[] = [];
+    if (filters?.adjudicationId) {
+      query += ' AND adjudication_id = ?';
+      params.push(filters.adjudicationId);
+    }
+    if (filters?.sessionId) {
+      query += ' AND id = ?';
+      params.push(filters.sessionId);
+    }
+    if (filters?.activeOnly) {
+      query += ' AND revoked_at IS NULL';
+    }
+    query += ' ORDER BY issued_at DESC';
+    const rows = this.db.prepare(query).all(...params) as Record<string, unknown>[];
+    return rows.map((r) => this.mapMcpReviewerSession(r));
+  }
+
+  public revokeMcpReviewerSession(id: string, reason: string, revokedAt?: string): boolean {
+    const ts = revokedAt ?? new Date().toISOString();
+    const res = this.db
+      .prepare('UPDATE mcp_reviewer_sessions SET revoked_at = ?, revocation_reason = ? WHERE id = ? AND revoked_at IS NULL')
+      .run(ts, reason, id);
+    return res.changes > 0;
+  }
+
+  public rotateExpiredReviewerSession(expiredSessionId: string, newSession: McpReviewerSession): void {
+    const rotateTx = this.db.transaction(() => {
+      const revokedAt = newSession.issued_at;
+      const revokeRes = this.db
+        .prepare('UPDATE mcp_reviewer_sessions SET revoked_at = ?, revocation_reason = ? WHERE id = ? AND revoked_at IS NULL')
+        .run(revokedAt, 'EXPIRED_AUTOMATIC_ROTATION', expiredSessionId);
+      if (revokeRes.changes !== 1) {
+        throw new Error(`Failed to revoke expired session ${expiredSessionId} during automatic rotation`);
+      }
+      this.createMcpReviewerSession(newSession);
+    });
+    rotateTx();
+  }
+
+  public getAdjudicationAuthorityFenceState(adjudicationId: string): ReviewerAuthorityFenceState | null {
+    const row = this.db.prepare(`
+      SELECT
+        csa.status AS adjudication_status,
+        csa.recovery_fenced_at AS adjudication_recovery_fenced_at,
+        csa.authority_snapshot_hash AS current_authority_snapshot_hash,
+        t.ownership_epoch AS current_task_ownership_epoch
+      FROM coder_submission_adjudications csa
+      JOIN tasks t ON t.id = csa.task_id
+      WHERE csa.id = ?
+    `).get(adjudicationId) as Record<string, unknown> | undefined;
+    if (!row) return null;
+    return {
+      adjudication_status: String(row.adjudication_status),
+      adjudication_recovery_fenced_at: row.adjudication_recovery_fenced_at ? String(row.adjudication_recovery_fenced_at) : null,
+      current_authority_snapshot_hash: String(row.current_authority_snapshot_hash),
+      current_task_ownership_epoch: Number(row.current_task_ownership_epoch),
+    };
+  }
+
+  public getReviewerAuthorityLiveValidationState(
+    params: ReviewerAuthorityLiveValidationParams
+  ): ReviewerAuthorityLiveValidationResult {
+    const row = this.db.prepare(`
+      SELECT
+        -- Adjudication
+        csa.id AS adjudication_id,
+        csa.submission_id AS submission_id,
+        csa.project_id AS project_id,
+        csa.action AS adjudication_action,
+        csa.status AS adjudication_status,
+        csa.recovery_fenced_at AS adjudication_recovery_fenced_at,
+        csa.authority_snapshot_hash AS current_authority_snapshot_hash,
+        csa.verification_result_envelope_hash AS verification_result_envelope_hash,
+        csa.verification_result_envelope_json AS verification_result_envelope_json,
+        csa.test_run_id AS test_run_id,
+        -- Task
+        t.id AS task_id,
+        t.state AS task_state,
+        t.ownership_epoch AS current_task_ownership_epoch,
+        -- Reviewer Agent
+        a.id AS agent_id,
+        a.role AS agent_role,
+        a.status AS agent_status,
+        a.provider_resource_id AS agent_resource_id,
+        -- Reviewer Provider
+        p.id AS provider_id,
+        p.enabled AS provider_enabled,
+        -- Reviewer Account
+        pa.id AS account_id,
+        pa.provider_id AS account_provider_id,
+        pa.enabled AS account_enabled,
+        pa.health_status AS account_health_status,
+        -- Reviewer Resource
+        pr.id AS resource_id,
+        pr.provider_id AS resource_provider_id,
+        pr.provider_account_id AS resource_account_id,
+        pr.enabled AS resource_enabled,
+        pr.health_status AS resource_health_status,
+        -- Coder attempt agent (self-review check)
+        coder_att.agent_id AS coder_agent_id,
+        -- Coder submission selected account (self-review check)
+        cs.selected_account_id AS coder_selected_account_id
+      FROM coder_submission_adjudications csa
+      LEFT JOIN tasks t ON t.id = csa.task_id
+      LEFT JOIN coder_submissions cs ON cs.id = csa.submission_id
+      LEFT JOIN task_attempts coder_att ON coder_att.id = csa.attempt_id
+      LEFT JOIN agents a ON a.id = ?
+      LEFT JOIN providers p ON p.id = ?
+      LEFT JOIN provider_accounts pa ON pa.id = ?
+      LEFT JOIN provider_resources pr ON pr.id = ?
+      WHERE csa.id = ?
+    `).get(
+      params.reviewerAgentId,
+      params.reviewerProviderId,
+      params.reviewerAccountId,
+      params.reviewerResourceId,
+      params.adjudicationId
+    ) as Record<string, unknown> | undefined;
+
+    if (!row) {
+      return {
+        adjudication_exists: false,
+        adjudication_id: null,
+        submission_id: null,
+        project_id: null,
+        adjudication_action: null,
+        adjudication_status: null,
+        adjudication_recovery_fenced_at: null,
+        current_authority_snapshot_hash: null,
+        test_run_id: null,
+        verification_result_envelope_hash: null,
+        verification_result_envelope_json: null,
+        task_exists: false,
+        task_id: null,
+        task_state: null,
+        current_task_ownership_epoch: null,
+        agent_exists: false,
+        agent_role: null,
+        agent_status: null,
+        agent_resource_id: null,
+        provider_exists: false,
+        provider_enabled: null,
+        account_exists: false,
+        account_provider_id: null,
+        account_enabled: null,
+        account_health_status: null,
+        resource_exists: false,
+        resource_provider_id: null,
+        resource_account_id: null,
+        resource_enabled: null,
+        resource_health_status: null,
+        coder_agent_id: null,
+        coder_selected_account_id: null,
+      };
+    }
+
+    return {
+      adjudication_exists: true,
+      adjudication_id: row.adjudication_id ? String(row.adjudication_id) : null,
+      submission_id: row.submission_id ? String(row.submission_id) : null,
+      project_id: row.project_id ? String(row.project_id) : null,
+      adjudication_action: row.adjudication_action ? String(row.adjudication_action) : null,
+      adjudication_status: row.adjudication_status ? String(row.adjudication_status) : null,
+      adjudication_recovery_fenced_at: row.adjudication_recovery_fenced_at ? String(row.adjudication_recovery_fenced_at) : null,
+      current_authority_snapshot_hash: row.current_authority_snapshot_hash ? String(row.current_authority_snapshot_hash) : null,
+      test_run_id: row.test_run_id ? String(row.test_run_id) : null,
+      verification_result_envelope_hash: row.verification_result_envelope_hash ? String(row.verification_result_envelope_hash) : null,
+      verification_result_envelope_json: row.verification_result_envelope_json ? String(row.verification_result_envelope_json) : null,
+      task_exists: row.task_id !== null && row.task_id !== undefined,
+      task_id: row.task_id ? String(row.task_id) : null,
+      task_state: row.task_state ? String(row.task_state) : null,
+      current_task_ownership_epoch: row.current_task_ownership_epoch !== null && row.current_task_ownership_epoch !== undefined ? Number(row.current_task_ownership_epoch) : null,
+      agent_exists: row.agent_id !== null && row.agent_id !== undefined,
+      agent_role: row.agent_role ? String(row.agent_role) : null,
+      agent_status: row.agent_status ? String(row.agent_status) : null,
+      agent_resource_id: row.agent_resource_id ? String(row.agent_resource_id) : null,
+      provider_exists: row.provider_id !== null && row.provider_id !== undefined,
+      provider_enabled: row.provider_enabled !== null && row.provider_enabled !== undefined ? Boolean(row.provider_enabled) : null,
+      account_exists: row.account_id !== null && row.account_id !== undefined,
+      account_provider_id: row.account_provider_id ? String(row.account_provider_id) : null,
+      account_enabled: row.account_enabled !== null && row.account_enabled !== undefined ? Boolean(row.account_enabled) : null,
+      account_health_status: row.account_health_status ? String(row.account_health_status) : null,
+      resource_exists: row.resource_id !== null && row.resource_id !== undefined,
+      resource_provider_id: row.resource_provider_id ? String(row.resource_provider_id) : null,
+      resource_account_id: row.resource_account_id ? String(row.resource_account_id) : null,
+      resource_enabled: row.resource_enabled !== null && row.resource_enabled !== undefined ? Boolean(row.resource_enabled) : null,
+      resource_health_status: row.resource_health_status ? String(row.resource_health_status) : null,
+      coder_agent_id: row.coder_agent_id ? String(row.coder_agent_id) : null,
+      coder_selected_account_id: row.coder_selected_account_id ? String(row.coder_selected_account_id) : null,
+    };
+  }
+
+  private mapMcpReviewerSession(row: Record<string, unknown>): McpReviewerSession {
+    return {
+      id: String(row.id),
+      adjudication_id: String(row.adjudication_id),
+      submission_id: String(row.submission_id),
+      reviewer_agent_id: String(row.reviewer_agent_id),
+      reviewer_provider_id: String(row.reviewer_provider_id),
+      reviewer_account_id: String(row.reviewer_account_id),
+      reviewer_resource_id: String(row.reviewer_resource_id),
+      scope: String(row.scope),
+      token_hash: String(row.token_hash),
+      task_ownership_epoch: Number(row.task_ownership_epoch),
+      authority_snapshot_hash: String(row.authority_snapshot_hash),
+      verification_result_envelope_hash: String(row.verification_result_envelope_hash),
+      projection_schema: Number(row.projection_schema),
+      projection_hash: String(row.projection_hash),
+      projection_json: String(row.projection_json),
+      issued_at: String(row.issued_at),
+      expires_at: String(row.expires_at),
+      revoked_at: row.revoked_at ? String(row.revoked_at) : null,
+      revocation_reason: row.revocation_reason ? String(row.revocation_reason) : null,
     };
   }
 

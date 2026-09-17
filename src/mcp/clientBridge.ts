@@ -295,3 +295,89 @@ export function generateSubmissionClientConfigEnvelope(
     config,
   };
 }
+
+export const OPERATOR_REVIEWER_TOKEN_PLACEHOLDER = '<OPERATOR_REVIEWER_TOKEN_REQUIRED>';
+
+export interface AgentForgeReviewerMcpServerConfig {
+  command: string;
+  args: [string];
+  env: {
+    ELECTRON_RUN_AS_NODE?: string;
+    AGENTFORGE_MCP_DB_PATH: string;
+    AGENTFORGE_MCP_REVIEWER_TOKEN: string;
+  };
+}
+
+export interface ReviewerClientConfigTemplate {
+  mcpServers: {
+    'agentforge-review': AgentForgeReviewerMcpServerConfig;
+  };
+}
+
+export interface ReviewerClientConfigEnvelope {
+  status: 'TEMPLATE_GENERATED';
+  client: SupportedClient;
+  incomplete: true;
+  secret_delivery: 'MANUAL_OPERATOR_INPUT';
+  config: ReviewerClientConfigTemplate;
+}
+
+export function generateReviewerClientConfig(
+  options: GenerateClientConfigOptions
+): ReviewerClientConfigTemplate {
+  normalizeClient(options.client);
+
+  let resolvedDbPath: string;
+  if (options.dbPath !== undefined) {
+    if (typeof options.dbPath !== 'string' || options.dbPath.trim().length === 0) {
+      throw new Error('Database path cannot be empty');
+    }
+    if (!path.isAbsolute(options.dbPath)) {
+      throw new Error('Database path must be an absolute path');
+    }
+    resolvedDbPath = path.resolve(options.dbPath);
+  } else {
+    resolvedDbPath = getDefaultPlatformDbPath();
+  }
+
+  const defaultStdioPath = path.join(
+    path.dirname(options.stdioScriptPath ?? __filename),
+    'stdio-review.js'
+  );
+
+  const { executable, stdioScript, isElectron } = deriveRuntimePaths({
+    executablePath: options.executablePath,
+    stdioScriptPath: options.stdioScriptPath ?? defaultStdioPath,
+  });
+
+  const env: AgentForgeReviewerMcpServerConfig['env'] = {
+    ...(isElectron ? { ELECTRON_RUN_AS_NODE: '1' } : {}),
+    AGENTFORGE_MCP_DB_PATH: resolvedDbPath,
+    AGENTFORGE_MCP_REVIEWER_TOKEN: OPERATOR_REVIEWER_TOKEN_PLACEHOLDER,
+  };
+
+  return {
+    mcpServers: {
+      'agentforge-review': {
+        command: executable,
+        args: [stdioScript],
+        env,
+      },
+    },
+  };
+}
+
+export function generateReviewerClientConfigEnvelope(
+  options: GenerateClientConfigOptions
+): ReviewerClientConfigEnvelope {
+  const canonicalClient = normalizeClient(options.client);
+  const config = generateReviewerClientConfig(options);
+
+  return {
+    status: 'TEMPLATE_GENERATED',
+    client: canonicalClient,
+    incomplete: true,
+    secret_delivery: 'MANUAL_OPERATOR_INPUT',
+    config,
+  };
+}
