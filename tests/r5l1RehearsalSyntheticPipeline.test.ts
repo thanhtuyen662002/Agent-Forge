@@ -1273,4 +1273,3 @@ describe('R5L1 Rehearsal Synthetic Pipeline Suite', () => {
     expect(fs.existsSync(dummyTempDir)).toBe(false);
   });
 });
-
