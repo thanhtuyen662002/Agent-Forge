@@ -75,7 +75,11 @@ interface SyntheticRehearsalEnv {
 
 function setupSyntheticRehearsalEnv(options?: {
   failVerification?: boolean;
+  taskTitleMarker?: string;
 }): SyntheticRehearsalEnv {
+  const taskTitle = options?.taskTitleMarker
+    ? `Synthetic Task with marker ${options.taskTitleMarker}`
+    : 'Synthetic Task 1';
   const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'af-r5l1-rehearsal-'));
   const repoDir = path.join(tempDir, 'repo');
   fs.mkdirSync(repoDir, { recursive: true });
@@ -206,8 +210,8 @@ function setupSyntheticRehearsalEnv(options?: {
 
   db.prepare(`
     INSERT INTO tasks (id, project_id, title, state, priority, risk, revision_count, max_revisions, progress_cache_percent, base_sha, ownership_epoch, created_at, updated_at)
-    VALUES (?, ?, 'Synthetic Task 1', 'CODING', 'LOW', 'LOW', 1, 3, 0, ?, 1, ?, ?)
-  `).run(taskId, projectId, baseSha, now, now);
+    VALUES (?, ?, ?, 'CODING', 'LOW', 'LOW', 1, 3, 0, ?, 1, ?, ?)
+  `).run(taskId, projectId, taskTitle, baseSha, now, now);
 
   // 4. Task Attempt
   repo.createTaskAttempt({
@@ -342,7 +346,7 @@ function setupSyntheticRehearsalEnv(options?: {
     projectId,
     taskId,
     attemptId,
-    taskTitle: 'Synthetic Task 1',
+    taskTitle,
     taskDescription: 'R5L1 Rehearsal Synthetic Task',
     acceptanceCriteria: ['Verification passes clean'],
     constraints: ['No regression'],
@@ -492,23 +496,119 @@ function getDbTotalChanges(db: Database.Database): number {
   return (db.prepare('SELECT total_changes() as tc').get() as { tc: number }).tc;
 }
 
+export interface SafeCleanupOptions {
+  clients?: Array<Client | null | undefined>;
+  servers?: Array<{ close: () => Promise<void> } | null | undefined>;
+  dbs?: Array<Database.Database | null | undefined>;
+  tempDirs?: Array<string | null | undefined>;
+  restoreTimers?: boolean;
+  extraSteps?: Array<() => Promise<void> | void>;
+}
+
+export async function performSafeCleanup(options: SafeCleanupOptions): Promise<void> {
+  const errors: Error[] = [];
+
+  // 1. Timers
+  if (options.restoreTimers) {
+    try {
+      vi.useRealTimers();
+    } catch (err: any) {
+      errors.push(err instanceof Error ? err : new Error(`Failed to restore timers: ${String(err)}`));
+    }
+  }
+
+  // 2. MCP Clients
+  if (options.clients) {
+    for (const client of options.clients) {
+      if (client) {
+        try {
+          await client.close();
+        } catch (err: any) {
+          errors.push(err instanceof Error ? err : new Error(`Failed to close MCP client: ${String(err)}`));
+        }
+      }
+    }
+  }
+
+  // 3. MCP Servers
+  if (options.servers) {
+    for (const server of options.servers) {
+      if (server) {
+        try {
+          await server.close();
+        } catch (err: any) {
+          errors.push(err instanceof Error ? err : new Error(`Failed to close MCP server: ${String(err)}`));
+        }
+      }
+    }
+  }
+
+  // 4. Custom extra steps
+  if (options.extraSteps) {
+    for (const step of options.extraSteps) {
+      try {
+        await step();
+      } catch (err: any) {
+        errors.push(err instanceof Error ? err : new Error(`Cleanup extra step failed: ${String(err)}`));
+      }
+    }
+  }
+
+  // 5. Databases
+  if (options.dbs) {
+    for (const db of options.dbs) {
+      if (db && db.open) {
+        try {
+          db.close();
+        } catch (err: any) {
+          errors.push(err instanceof Error ? err : new Error(`Failed to close database: ${String(err)}`));
+        }
+      }
+    }
+  }
+
+  // 6. Temporary directories
+  if (options.tempDirs) {
+    for (const dir of options.tempDirs) {
+      if (dir) {
+        try {
+          if (fs.existsSync(dir)) {
+            fs.rmSync(dir, { recursive: true, force: true });
+          }
+          if (fs.existsSync(dir)) {
+            errors.push(new Error(`Failed to remove temporary directory: ${dir} still exists`));
+          }
+        } catch (err: any) {
+          errors.push(err instanceof Error ? err : new Error(`Failed to delete temporary directory "${dir}": ${String(err)}`));
+        }
+      }
+    }
+  }
+
+  if (errors.length === 1) {
+    throw errors[0];
+  } else if (errors.length > 1) {
+    throw new AggregateError(
+      errors,
+      `Teardown encountered ${errors.length} cleanup errors:\n` + errors.map((e) => ` - ${e.message}`).join('\n')
+    );
+  }
+}
+
 describe('R5L1 Rehearsal Synthetic Pipeline Suite', () => {
   let env: SyntheticRehearsalEnv | null = null;
 
-  afterEach(() => {
-    vi.useRealTimers();
-    if (env) {
-      if (env.db?.open) {
-        try {
-          env.db.close();
-        } catch {}
-      }
-      try {
-        if (fs.existsSync(env.tempDir)) {
-          fs.rmSync(env.tempDir, { recursive: true, force: true });
-        }
-      } catch {}
-      env = null;
+  afterEach(async () => {
+    const currentEnv = env;
+    env = null;
+    if (currentEnv) {
+      await performSafeCleanup({
+        dbs: [currentEnv.db],
+        tempDirs: [currentEnv.tempDir],
+        restoreTimers: true,
+      });
+    } else {
+      vi.useRealTimers();
     }
   });
 
@@ -517,7 +617,8 @@ describe('R5L1 Rehearsal Synthetic Pipeline Suite', () => {
   // Quarantined Submission -> Admission -> Verification -> Settlement -> Reviewer Read
   // =========================================================================
   it('1. Full synthetic pipeline: quarantined submission -> admission -> verification -> settlement -> reviewer read (zero-write)', async () => {
-    env = setupSyntheticRehearsalEnv({ failVerification: false });
+    const PROJECTION_CONFIDENTIAL_MARKER = 'FROZEN_PROJECTION_SECRET_MARKER_' + crypto.randomUUID();
+    env = setupSyntheticRehearsalEnv({ failVerification: false, taskTitleMarker: PROJECTION_CONFIDENTIAL_MARKER });
     const { repo, db, mcpService, adjudicationService, reviewerService } = env;
 
     // --- STEP 1: Quarantined Submission ---
@@ -534,7 +635,7 @@ describe('R5L1 Rehearsal Synthetic Pipeline Suite', () => {
       base_sha: env.baseSha,
       repository_head_sha: env.repoHeadSha,
       status: 'COMPLETED',
-      summary: 'Synthetic execution completed with verified tests',
+      summary: `Synthetic execution completed with marker ${PROJECTION_CONFIDENTIAL_MARKER}`,
       changed_files: ['README.md'],
       tests_claimed: ['test-synthetic-1'],
       blockers: [],
@@ -619,16 +720,19 @@ describe('R5L1 Rehearsal Synthetic Pipeline Suite', () => {
     });
     expect(issuance.raw_token).toBeDefined();
 
-    const mcpServer = buildAgentForgeReviewerMcpServer({
-      db,
-      reviewerToken: issuance.raw_token,
-    });
-    const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
-    await mcpServer.connect(serverTransport);
-    const mcpClient = new Client({ name: 'synthetic-reviewer-client', version: '1.0.0' });
-    await mcpClient.connect(clientTransport);
+    let mcpServer: any | null = null;
+    let mcpClient: Client | null = null;
 
     try {
+      mcpServer = buildAgentForgeReviewerMcpServer({
+        db,
+        reviewerToken: issuance.raw_token,
+      });
+      const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+      await mcpServer.connect(serverTransport);
+      mcpClient = new Client({ name: 'synthetic-reviewer-client', version: '1.0.0' });
+      await mcpClient.connect(clientTransport);
+
       // Baseline database state before reviewer reads
       const changesBefore = getDbTotalChanges(db);
       const dataVersionBefore = db.pragma('data_version', { simple: true }) as number;
@@ -644,6 +748,8 @@ describe('R5L1 Rehearsal Synthetic Pipeline Suite', () => {
       const toolPackage = JSON.parse(toolText);
       expect(toolPackage.adjudication.id).toBe(adjudicationId);
       expect(computeSha256(toolText)).toBe(issuance.session.projection_hash);
+      // Verify confidential marker is present in successful tool projection read
+      expect(toolText).toContain(PROJECTION_CONFIDENTIAL_MARKER);
 
       // Reviewer reads resource
       const resourceRes = await mcpClient.readResource({
@@ -655,6 +761,8 @@ describe('R5L1 Rehearsal Synthetic Pipeline Suite', () => {
       const resourcePackage = JSON.parse(resourceText);
       expect(resourcePackage.adjudication.id).toBe(adjudicationId);
       expect(computeSha256(resourceText)).toBe(issuance.session.projection_hash);
+      // Verify confidential marker is present in successful resource projection read
+      expect(resourceText).toContain(PROJECTION_CONFIDENTIAL_MARKER);
 
       // Assert Zero-Write: no row modifications and no data version bump during reads
       const changesAfter = getDbTotalChanges(db);
@@ -662,8 +770,10 @@ describe('R5L1 Rehearsal Synthetic Pipeline Suite', () => {
       expect(changesAfter).toBe(changesBefore);
       expect(dataVersionAfter).toBe(dataVersionBefore);
     } finally {
-      await mcpClient.close().catch(() => {});
-      await mcpServer.close().catch(() => {});
+      await performSafeCleanup({
+        clients: [mcpClient],
+        servers: [mcpServer],
+      });
     }
 
     // --- STEP 7: Teardown Cleanliness (No leaked worktree / process) ---
@@ -741,7 +851,8 @@ describe('R5L1 Rehearsal Synthetic Pipeline Suite', () => {
   // Expired token, revoked session, cross-adjudication, task-state drift, projection tamper
   // =========================================================================
   it('3. Reviewer read rejection branches: expired token, revoked session, cross-adjudication, and task-state drift', async () => {
-    env = setupSyntheticRehearsalEnv({ failVerification: false });
+    const REJECTION_PROJECTION_MARKER = 'FROZEN_REJECTION_PROJECTION_MARKER_' + crypto.randomUUID();
+    env = setupSyntheticRehearsalEnv({ failVerification: false, taskTitleMarker: REJECTION_PROJECTION_MARKER });
     const { repo, db, mcpService, adjudicationService, reviewerService } = env;
 
     const { plaintextToken } = issueSubmissionSession(repo, env.authorizationId);
@@ -758,7 +869,7 @@ describe('R5L1 Rehearsal Synthetic Pipeline Suite', () => {
         base_sha: env.baseSha,
         repository_head_sha: env.repoHeadSha,
         status: 'COMPLETED',
-        summary: 'Submission for rejection testing',
+        summary: `Submission containing ${REJECTION_PROJECTION_MARKER}`,
         changed_files: ['README.md'],
         tests_claimed: ['test-synth'],
         blockers: [],
@@ -791,13 +902,15 @@ describe('R5L1 Rehearsal Synthetic Pipeline Suite', () => {
       duration_seconds: 3600,
     });
 
-    const serverExpired = buildAgentForgeReviewerMcpServer({ db, reviewerToken: expiredIssuance.raw_token });
-    const [cTransExp, sTransExp] = InMemoryTransport.createLinkedPair();
-    await serverExpired.connect(sTransExp);
-    const clientExp = new Client({ name: 'expired-client', version: '1.0.0' });
-    await clientExp.connect(cTransExp);
-
+    let clientExp: Client | null = null;
+    let serverExpired: any | null = null;
     try {
+      serverExpired = buildAgentForgeReviewerMcpServer({ db, reviewerToken: expiredIssuance.raw_token });
+      const [cTransExp, sTransExp] = InMemoryTransport.createLinkedPair();
+      await serverExpired.connect(sTransExp);
+      clientExp = new Client({ name: 'expired-client', version: '1.0.0' });
+      await clientExp.connect(cTransExp);
+
       // Fast-forward time past expiration
       vi.useFakeTimers();
       vi.setSystemTime(new Date(Date.now() + 7200 * 1000));
@@ -813,7 +926,10 @@ describe('R5L1 Rehearsal Synthetic Pipeline Suite', () => {
       expect(expiredToolCall.isError).toBe(true);
       const toolErrText = (expiredToolCall.content[0] as { text: string }).text;
       expect(toolErrText).toContain('TOKEN_EXPIRED');
+      expect(toolErrText).not.toContain(REJECTION_PROJECTION_MARKER);
+      expect(toolErrText).not.toContain(expiredIssuance.raw_token);
       expect(toolErrText).not.toContain('authoritative_verification');
+      expect(toolErrText).not.toContain('untrusted_claim');
 
       // Resource Read Rejection
       const tcBeforeRes = getDbTotalChanges(db);
@@ -824,11 +940,16 @@ describe('R5L1 Rehearsal Synthetic Pipeline Suite', () => {
       expect(tcAfterRes).toBe(tcBeforeRes);
       const resErrText = (expiredResourceRes.contents[0] as { text: string }).text;
       expect(resErrText).toContain('TOKEN_EXPIRED');
+      expect(resErrText).not.toContain(REJECTION_PROJECTION_MARKER);
+      expect(resErrText).not.toContain(expiredIssuance.raw_token);
       expect(resErrText).not.toContain('authoritative_verification');
+      expect(resErrText).not.toContain('untrusted_claim');
     } finally {
-      vi.useRealTimers();
-      await clientExp.close().catch(() => {});
-      await serverExpired.close().catch(() => {});
+      await performSafeCleanup({
+        clients: [clientExp],
+        servers: [serverExpired],
+        restoreTimers: true,
+      });
     }
 
     // --- Branch B: Revoked Session (Tool & Resource, Zero-Write, Sanitized Error) ---
@@ -842,13 +963,15 @@ describe('R5L1 Rehearsal Synthetic Pipeline Suite', () => {
     });
     reviewerService.revokeReviewerSession(revokedIssuance.session.id, 'Security revocation for test');
 
-    const serverRevoked = buildAgentForgeReviewerMcpServer({ db, reviewerToken: revokedIssuance.raw_token });
-    const [cTransRev, sTransRev] = InMemoryTransport.createLinkedPair();
-    await serverRevoked.connect(sTransRev);
-    const clientRev = new Client({ name: 'revoked-client', version: '1.0.0' });
-    await clientRev.connect(cTransRev);
-
+    let clientRev: Client | null = null;
+    let serverRevoked: any | null = null;
     try {
+      serverRevoked = buildAgentForgeReviewerMcpServer({ db, reviewerToken: revokedIssuance.raw_token });
+      const [cTransRev, sTransRev] = InMemoryTransport.createLinkedPair();
+      await serverRevoked.connect(sTransRev);
+      clientRev = new Client({ name: 'revoked-client', version: '1.0.0' });
+      await clientRev.connect(cTransRev);
+
       // Tool Call Rejection
       const tcBeforeTool = getDbTotalChanges(db);
       const revokedToolCall = await clientRev.callTool({
@@ -860,7 +983,10 @@ describe('R5L1 Rehearsal Synthetic Pipeline Suite', () => {
       expect(revokedToolCall.isError).toBe(true);
       const toolErrText = (revokedToolCall.content[0] as { text: string }).text;
       expect(toolErrText).toContain('TOKEN_REVOKED');
+      expect(toolErrText).not.toContain(REJECTION_PROJECTION_MARKER);
+      expect(toolErrText).not.toContain(revokedIssuance.raw_token);
       expect(toolErrText).not.toContain('authoritative_verification');
+      expect(toolErrText).not.toContain('untrusted_claim');
 
       // Resource Read Rejection
       const tcBeforeRes = getDbTotalChanges(db);
@@ -871,10 +997,15 @@ describe('R5L1 Rehearsal Synthetic Pipeline Suite', () => {
       expect(tcAfterRes).toBe(tcBeforeRes);
       const resErrText = (revokedResourceRes.contents[0] as { text: string }).text;
       expect(resErrText).toContain('TOKEN_REVOKED');
+      expect(resErrText).not.toContain(REJECTION_PROJECTION_MARKER);
+      expect(resErrText).not.toContain(revokedIssuance.raw_token);
       expect(resErrText).not.toContain('authoritative_verification');
+      expect(resErrText).not.toContain('untrusted_claim');
     } finally {
-      await clientRev.close().catch(() => {});
-      await serverRevoked.close().catch(() => {});
+      await performSafeCleanup({
+        clients: [clientRev],
+        servers: [serverRevoked],
+      });
     }
 
     // --- Branch C: Cross-Adjudication Access Rejection (Tool & Resource, Zero-Write, Sanitized Error) ---
@@ -886,13 +1017,16 @@ describe('R5L1 Rehearsal Synthetic Pipeline Suite', () => {
       reviewer_resource_id: env.reviewerResourceId,
       duration_seconds: 3600,
     });
-    const serverValid = buildAgentForgeReviewerMcpServer({ db, reviewerToken: validIssuance.raw_token });
-    const [cTransVal, sTransVal] = InMemoryTransport.createLinkedPair();
-    await serverValid.connect(sTransVal);
-    const clientVal = new Client({ name: 'valid-client', version: '1.0.0' });
-    await clientVal.connect(cTransVal);
 
+    let clientVal: Client | null = null;
+    let serverValid: any | null = null;
     try {
+      serverValid = buildAgentForgeReviewerMcpServer({ db, reviewerToken: validIssuance.raw_token });
+      const [cTransVal, sTransVal] = InMemoryTransport.createLinkedPair();
+      await serverValid.connect(sTransVal);
+      clientVal = new Client({ name: 'valid-client', version: '1.0.0' });
+      await clientVal.connect(cTransVal);
+
       const foreignAdjudicationId = crypto.randomUUID();
 
       // Tool Call Rejection
@@ -906,7 +1040,10 @@ describe('R5L1 Rehearsal Synthetic Pipeline Suite', () => {
       expect(crossAdjToolCall.isError).toBe(true);
       const toolErrText = (crossAdjToolCall.content[0] as { text: string }).text;
       expect(toolErrText).toContain('PERMISSION_DENIED');
+      expect(toolErrText).not.toContain(REJECTION_PROJECTION_MARKER);
+      expect(toolErrText).not.toContain(validIssuance.raw_token);
       expect(toolErrText).not.toContain('authoritative_verification');
+      expect(toolErrText).not.toContain('untrusted_claim');
 
       // Resource Read Rejection
       const tcBeforeRes = getDbTotalChanges(db);
@@ -917,23 +1054,30 @@ describe('R5L1 Rehearsal Synthetic Pipeline Suite', () => {
       expect(tcAfterRes).toBe(tcBeforeRes);
       const resErrText = (crossAdjResourceRes.contents[0] as { text: string }).text;
       expect(resErrText).toContain('PERMISSION_DENIED');
+      expect(resErrText).not.toContain(REJECTION_PROJECTION_MARKER);
+      expect(resErrText).not.toContain(validIssuance.raw_token);
       expect(resErrText).not.toContain('authoritative_verification');
+      expect(resErrText).not.toContain('untrusted_claim');
     } finally {
-      await clientVal.close().catch(() => {});
-      await serverValid.close().catch(() => {});
+      await performSafeCleanup({
+        clients: [clientVal],
+        servers: [serverValid],
+      });
     }
 
     // --- Branch D: Stale Authority (Task State Drift) Rejection ---
     // If task leaves REVIEW_READY state, live authority fence rejects the reviewer read
     db.prepare(`UPDATE tasks SET state = 'CODING' WHERE id = ?`).run(env.taskId);
 
-    const serverDrift = buildAgentForgeReviewerMcpServer({ db, reviewerToken: validIssuance.raw_token });
-    const [cTransDrift, sTransDrift] = InMemoryTransport.createLinkedPair();
-    await serverDrift.connect(sTransDrift);
-    const clientDrift = new Client({ name: 'drift-client', version: '1.0.0' });
-    await clientDrift.connect(cTransDrift);
-
+    let clientDrift: Client | null = null;
+    let serverDrift: any | null = null;
     try {
+      serverDrift = buildAgentForgeReviewerMcpServer({ db, reviewerToken: validIssuance.raw_token });
+      const [cTransDrift, sTransDrift] = InMemoryTransport.createLinkedPair();
+      await serverDrift.connect(sTransDrift);
+      clientDrift = new Client({ name: 'drift-client', version: '1.0.0' });
+      await clientDrift.connect(cTransDrift);
+
       // Tool Call Rejection
       const tcBeforeTool = getDbTotalChanges(db);
       const driftToolCall = await clientDrift.callTool({
@@ -945,7 +1089,10 @@ describe('R5L1 Rehearsal Synthetic Pipeline Suite', () => {
       expect(driftToolCall.isError).toBe(true);
       const toolErrText = (driftToolCall.content[0] as { text: string }).text;
       expect(toolErrText).toContain('TASK_STATE_INVALID');
+      expect(toolErrText).not.toContain(REJECTION_PROJECTION_MARKER);
+      expect(toolErrText).not.toContain(validIssuance.raw_token);
       expect(toolErrText).not.toContain('authoritative_verification');
+      expect(toolErrText).not.toContain('untrusted_claim');
 
       // Resource Read Rejection
       const tcBeforeRes = getDbTotalChanges(db);
@@ -956,12 +1103,21 @@ describe('R5L1 Rehearsal Synthetic Pipeline Suite', () => {
       expect(tcAfterRes).toBe(tcBeforeRes);
       const resErrText = (driftResourceRes.contents[0] as { text: string }).text;
       expect(resErrText).toContain('TASK_STATE_INVALID');
+      expect(resErrText).not.toContain(REJECTION_PROJECTION_MARKER);
+      expect(resErrText).not.toContain(validIssuance.raw_token);
       expect(resErrText).not.toContain('authoritative_verification');
+      expect(resErrText).not.toContain('untrusted_claim');
     } finally {
-      await clientDrift.close().catch(() => {});
-      await serverDrift.close().catch(() => {});
-      // Restore task state to REVIEW_READY
-      db.prepare(`UPDATE tasks SET state = 'REVIEW_READY' WHERE id = ?`).run(env.taskId);
+      await performSafeCleanup({
+        clients: [clientDrift],
+        servers: [serverDrift],
+        extraSteps: [
+          () => {
+            // Restore task state to REVIEW_READY
+            db.prepare(`UPDATE tasks SET state = 'REVIEW_READY' WHERE id = ?`).run(env!.taskId);
+          },
+        ],
+      });
     }
   });
 
@@ -1060,26 +1216,61 @@ describe('R5L1 Rehearsal Synthetic Pipeline Suite', () => {
       expect(toolRes.isError).toBeFalsy();
     } finally {
       // Guaranteed cleanup even if assertions fail
-      vi.useRealTimers();
-      if (client) {
-        await client.close().catch(() => {});
-      }
-      if (server) {
-        await server.close().catch(() => {});
-      }
-      if (testEnv.db?.open) {
-        testEnv.db.close();
-      }
-      // Delete temporary directory without swallowing errors
-      if (fs.existsSync(testEnv.tempDir)) {
-        fs.rmSync(testEnv.tempDir, { recursive: true });
-        tempDirCleaned = true;
-      }
+      await performSafeCleanup({
+        clients: [client],
+        servers: [server],
+        dbs: [testEnv.db],
+        tempDirs: [testEnv.tempDir],
+        restoreTimers: true,
+      });
+      tempDirCleaned = !fs.existsSync(testEnv.tempDir);
     }
 
     // Verify temp directory has actually vanished from filesystem
     expect(tempDirCleaned).toBe(true);
     expect(fs.existsSync(testEnv.tempDir)).toBe(false);
+  });
+
+  // =========================================================================
+  // SCENARIO 5: Teardown Helper Resilience Under Partial Failure
+  // =========================================================================
+  it('5. Shared teardown helper resilience: error in earlier step does not block subsequent steps and propagates error', async () => {
+    const dummyTempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'af-test-cleanup-resilience-'));
+    const dummyDbPath = path.join(dummyTempDir, 'dummy.db');
+    const dummyDb = new Database(dummyDbPath);
+
+    expect(fs.existsSync(dummyTempDir)).toBe(true);
+    expect(dummyDb.open).toBe(true);
+
+    // Simulated failing server whose close method throws an error
+    const simulatedError = new Error('Simulated server close failure');
+    const failingServer = {
+      close: async () => {
+        throw simulatedError;
+      },
+    };
+
+    let caughtError: Error | null = null;
+    try {
+      await performSafeCleanup({
+        servers: [failingServer],
+        dbs: [dummyDb],
+        tempDirs: [dummyTempDir],
+        restoreTimers: true,
+      });
+    } catch (err: any) {
+      caughtError = err;
+    }
+
+    // 1. Error was propagated and not swallowed
+    expect(caughtError).not.toBeNull();
+    expect(caughtError?.message).toContain('Simulated server close failure');
+
+    // 2. Subsequent steps still executed despite the earlier failure:
+    // - Database was closed
+    expect(dummyDb.open).toBe(false);
+    // - Temporary directory was deleted
+    expect(fs.existsSync(dummyTempDir)).toBe(false);
   });
 });
 
