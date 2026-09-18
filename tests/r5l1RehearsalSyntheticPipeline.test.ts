@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach, afterAll, vi } from 'vitest';
 import Database from 'better-sqlite3';
 import path from 'path';
 import fs from 'fs';
@@ -6,6 +6,7 @@ import os from 'os';
 import crypto from 'crypto';
 import child_process from 'child_process';
 import { Client, InMemoryTransport } from '@modelcontextprotocol/client';
+import { StdioClientTransport } from '@modelcontextprotocol/client/stdio';
 
 import { MigrationRunner } from '../src/core/database/migrations';
 import { Repository } from '../src/core/database/repositories';
@@ -76,36 +77,47 @@ interface SyntheticRehearsalEnv {
 function setupSyntheticRehearsalEnv(options?: {
   failVerification?: boolean;
   taskTitleMarker?: string;
+  _simulateSetupFailure?: boolean;
 }): SyntheticRehearsalEnv {
-  const taskTitle = options?.taskTitleMarker
-    ? `Synthetic Task with marker ${options.taskTitleMarker}`
-    : 'Synthetic Task 1';
-  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'af-r5l1-rehearsal-'));
-  const repoDir = path.join(tempDir, 'repo');
-  fs.mkdirSync(repoDir, { recursive: true });
+  let createdTempDir: string | null = null;
+  let openedDb: Database.Database | null = null;
 
-  // Initialize a synthetic git repository
-  child_process.execFileSync('git', ['init', '-b', 'main'], { cwd: repoDir, stdio: 'ignore' });
-  child_process.execFileSync('git', ['config', 'user.name', 'Synthetic Agent'], { cwd: repoDir, stdio: 'ignore' });
-  child_process.execFileSync('git', ['config', 'user.email', 'synthetic@agentforge.local'], { cwd: repoDir, stdio: 'ignore' });
-  fs.writeFileSync(path.join(repoDir, 'README.md'), '# Synthetic Rehearsal Project\n', 'utf8');
-  fs.writeFileSync(path.join(repoDir, 'solution.txt'), 'Initial codebase state\n', 'utf8');
-  fs.writeFileSync(path.join(repoDir, 'test_pass.js'), 'console.log("Synthetic test passed"); process.exit(0);\n', 'utf8');
-  fs.writeFileSync(path.join(repoDir, 'test_fail.js'), 'console.error("Synthetic test failed"); process.exit(1);\n', 'utf8');
-  child_process.execFileSync('git', ['add', '.'], { cwd: repoDir, stdio: 'ignore' });
-  child_process.execFileSync('git', ['commit', '-m', 'Initial synthetic commit'], { cwd: repoDir, stdio: 'ignore' });
+  try {
+    const taskTitle = options?.taskTitleMarker
+      ? `Synthetic Task with marker ${options.taskTitleMarker}`
+      : 'Synthetic Task 1';
+    const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'af-r5l1-rehearsal-'));
+    createdTempDir = tempDir;
+    const repoDir = path.join(tempDir, 'repo');
+    fs.mkdirSync(repoDir, { recursive: true });
 
-  const repoHeadSha = child_process
-    .execFileSync('git', ['rev-parse', 'HEAD'], { cwd: repoDir, encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] })
-    .trim()
-    .toLowerCase();
-  const baseSha = repoHeadSha;
+    // Initialize a synthetic git repository
+    child_process.execFileSync('git', ['init', '-b', 'main'], { cwd: repoDir, stdio: 'ignore' });
+    child_process.execFileSync('git', ['config', 'user.name', 'Synthetic Agent'], { cwd: repoDir, stdio: 'ignore' });
+    child_process.execFileSync('git', ['config', 'user.email', 'synthetic@agentforge.local'], { cwd: repoDir, stdio: 'ignore' });
+    fs.writeFileSync(path.join(repoDir, 'README.md'), '# Synthetic Rehearsal Project\n', 'utf8');
+    fs.writeFileSync(path.join(repoDir, 'solution.txt'), 'Initial codebase state\n', 'utf8');
+    fs.writeFileSync(path.join(repoDir, 'test_pass.js'), 'console.log("Synthetic test passed"); process.exit(0);\n', 'utf8');
+    fs.writeFileSync(path.join(repoDir, 'test_fail.js'), 'console.error("Synthetic test failed"); process.exit(1);\n', 'utf8');
+    child_process.execFileSync('git', ['add', '.'], { cwd: repoDir, stdio: 'ignore' });
+    child_process.execFileSync('git', ['commit', '-m', 'Initial synthetic commit'], { cwd: repoDir, stdio: 'ignore' });
 
-  // Initialize dedicated SQLite database and run all migrations
-  const dbPath = path.join(tempDir, 'rehearsal.db');
-  const db = new Database(dbPath);
-  db.pragma('foreign_keys = ON');
-  MigrationRunner.run(db);
+    const repoHeadSha = child_process
+      .execFileSync('git', ['rev-parse', 'HEAD'], { cwd: repoDir, encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] })
+      .trim()
+      .toLowerCase();
+    const baseSha = repoHeadSha;
+
+    // Initialize dedicated SQLite database and run all migrations
+    const dbPath = path.join(tempDir, 'rehearsal.db');
+    const db = new Database(dbPath);
+    openedDb = db;
+    db.pragma('foreign_keys = ON');
+    MigrationRunner.run(db);
+
+    if (options?._simulateSetupFailure) {
+      throw new Error('Simulated setup failure before returning env');
+    }
 
   // Initialize artifact storage and core services
   const artifactsDir = path.join(tempDir, 'artifacts');
@@ -437,6 +449,23 @@ function setupSyntheticRehearsalEnv(options?: {
     managerPayloadHash,
     instructions,
   };
+  } catch (setupError: any) {
+    if (openedDb && openedDb.open) {
+      try {
+        openedDb.close();
+      } catch {
+        // preserve setupError
+      }
+    }
+    if (createdTempDir && fs.existsSync(createdTempDir)) {
+      try {
+        fs.rmSync(createdTempDir, { recursive: true, force: true });
+      } catch {
+        // preserve setupError
+      }
+    }
+    throw setupError;
+  }
 }
 
 function issueSubmissionSession(
@@ -499,6 +528,7 @@ function getDbTotalChanges(db: Database.Database): number {
 export interface SafeCleanupOptions {
   clients?: Array<Client | null | undefined>;
   servers?: Array<{ close: () => Promise<void> } | null | undefined>;
+  transports?: Array<{ close: () => Promise<void> } | null | undefined>;
   dbs?: Array<Database.Database | null | undefined>;
   tempDirs?: Array<string | null | undefined>;
   restoreTimers?: boolean;
@@ -538,6 +568,19 @@ export async function performSafeCleanup(options: SafeCleanupOptions): Promise<v
           await server.close();
         } catch (err: any) {
           errors.push(err instanceof Error ? err : new Error(`Failed to close MCP server: ${String(err)}`));
+        }
+      }
+    }
+  }
+
+  // 3b. MCP Transports (e.g. StdioClientTransport subprocesses)
+  if (options.transports) {
+    for (const transport of options.transports) {
+      if (transport) {
+        try {
+          await transport.close();
+        } catch (err: any) {
+          errors.push(err instanceof Error ? err : new Error(`Failed to close MCP transport: ${String(err)}`));
         }
       }
     }
@@ -595,8 +638,79 @@ export async function performSafeCleanup(options: SafeCleanupOptions): Promise<v
   }
 }
 
+let sharedTestRuntimeDir: string | null = null;
+
+function getOrMaterializeTestRuntime(): string {
+  if (sharedTestRuntimeDir && fs.existsSync(sharedTestRuntimeDir)) {
+    return sharedTestRuntimeDir;
+  }
+  const projectRoot = path.resolve(__dirname, '..');
+  const distElectronReview = path.join(projectRoot, 'dist-electron', 'mcp', 'stdio-review.js');
+  const distElectronPkg = path.join(projectRoot, 'dist-electron', 'package.json');
+  if (fs.existsSync(distElectronReview) && fs.existsSync(distElectronPkg)) {
+    sharedTestRuntimeDir = path.join(projectRoot, 'dist-electron');
+    return sharedTestRuntimeDir;
+  }
+
+  const tempRuntimeDir = path.join(os.tmpdir(), `af-mcp-test-runtime-${Date.now()}-${crypto.randomUUID().slice(0, 8)}`);
+  fs.mkdirSync(tempRuntimeDir, { recursive: true });
+
+  const tscBin = require.resolve('typescript/bin/tsc');
+  child_process.execFileSync(process.execPath, [tscBin, '-p', 'tsconfig.node.json', '--outDir', tempRuntimeDir], {
+    cwd: projectRoot,
+    stdio: 'pipe',
+    encoding: 'utf8',
+  });
+
+  const manifestPath = path.join(tempRuntimeDir, 'package.json');
+  fs.writeFileSync(manifestPath, JSON.stringify({ type: 'commonjs' }, null, 2), 'utf8');
+
+  const targetNodeModules = path.join(projectRoot, 'node_modules');
+  const linkNodeModules = path.join(tempRuntimeDir, 'node_modules');
+  if (!fs.existsSync(linkNodeModules) && fs.existsSync(targetNodeModules)) {
+    const symlinkType = process.platform === 'win32' ? 'junction' : 'dir';
+    fs.symlinkSync(targetNodeModules, linkNodeModules, symlinkType);
+  }
+
+  sharedTestRuntimeDir = tempRuntimeDir;
+  return sharedTestRuntimeDir;
+}
+
+async function verifyProcessTerminated(pid: number, maxWaitMs = 3000): Promise<boolean> {
+  const start = Date.now();
+  while (Date.now() - start < maxWaitMs) {
+    try {
+      process.kill(pid, 0);
+      await new Promise((r) => setTimeout(r, 50));
+    } catch (e: any) {
+      if (e.code === 'ESRCH') {
+        return true;
+      }
+      throw e;
+    }
+  }
+  try {
+    process.kill(pid, 0);
+    return false;
+  } catch (e: any) {
+    return e.code === 'ESRCH';
+  }
+}
+
 describe('R5L1 Rehearsal Synthetic Pipeline Suite', () => {
   let env: SyntheticRehearsalEnv | null = null;
+
+  afterAll(async () => {
+    const projectRoot = path.resolve(__dirname, '..');
+    const distElectronDir = path.join(projectRoot, 'dist-electron');
+    if (sharedTestRuntimeDir && sharedTestRuntimeDir !== distElectronDir && fs.existsSync(sharedTestRuntimeDir)) {
+      try {
+        fs.rmSync(sharedTestRuntimeDir, { recursive: true, force: true });
+      } catch {
+        // ignore
+      }
+    }
+  });
 
   afterEach(async () => {
     const currentEnv = env;
@@ -1271,5 +1385,408 @@ describe('R5L1 Rehearsal Synthetic Pipeline Suite', () => {
     expect(dummyDb.open).toBe(false);
     // - Temporary directory was deleted
     expect(fs.existsSync(dummyTempDir)).toBe(false);
+  });
+
+  // =========================================================================
+  // SCENARIO 6: Real Stdio Subprocess MCP Reviewer Read (Happy Path)
+  // Tool call & Resource read over real OS subprocess, zero DB mutation,
+  // secret exclusion from logs, authoritative OS PID termination proof
+  // =========================================================================
+  it('6. Real stdio subprocess MCP reviewer read: tool call & resource read, zero-write, zero token leak in stderr/stdout, OS process termination receipt, and clean directory deletion', async () => {
+    const PROJECTION_CONFIDENTIAL_MARKER = 'FROZEN_PROJECTION_STDIO_SECRET_' + crypto.randomUUID();
+    const testEnv = setupSyntheticRehearsalEnv({ failVerification: false, taskTitleMarker: PROJECTION_CONFIDENTIAL_MARKER });
+    let transport: StdioClientTransport | null = null;
+    let client: Client | null = null;
+    let subprocessPid: number | null = null;
+    let stderrOutput = '';
+
+    try {
+      const { repo, db, mcpService, adjudicationService, reviewerService } = testEnv;
+
+      // 1. Quarantined submission -> admission -> verification -> settlement
+      const { plaintextToken } = issueSubmissionSession(repo, testEnv.authorizationId);
+      const submissionId = crypto.randomUUID();
+      mcpService.submitCoderClaim(
+        {
+          submission_id: submissionId,
+          authorization_id: testEnv.authorizationId,
+          project_id: testEnv.projectId,
+          task_id: testEnv.taskId,
+          attempt_id: testEnv.attemptId,
+          assignment_id: testEnv.assignmentId,
+          task_ownership_epoch: 1,
+          base_sha: testEnv.baseSha,
+          repository_head_sha: testEnv.repoHeadSha,
+          status: 'COMPLETED',
+          summary: `Stdio subprocess happy path with marker ${PROJECTION_CONFIDENTIAL_MARKER}`,
+          changed_files: ['README.md'],
+          tests_claimed: ['test-stdio'],
+          blockers: [],
+          review_requested: true,
+          client_metadata: { client_name: 'synthetic-coder-agent', client_version: '1.0.0', client_session_mode: 'CLI_EXTERNAL' },
+        },
+        plaintextToken
+      );
+
+      const admitRes = await adjudicationService.admitSubmissionForVerification({
+        requestId: crypto.randomUUID(),
+        submissionId,
+      });
+      expect(admitRes.status).toBe('VERIFIED');
+      expect(admitRes.adjudication).toBeDefined();
+      const adjudicationId = admitRes.adjudication.id;
+
+      // 2. Issue reviewer session
+      const issuance = reviewerService.issueReviewerSession({
+        adjudication_id: adjudicationId,
+        reviewer_agent_id: testEnv.agentIdReviewer,
+        reviewer_provider_id: testEnv.providerId,
+        reviewer_account_id: testEnv.reviewerAccountId,
+        reviewer_resource_id: testEnv.reviewerResourceId,
+        duration_seconds: 3600,
+      });
+      const rawToken = issuance.raw_token;
+      expect(rawToken).toBeDefined();
+
+      // 3. Spawn real stdio subprocess using StdioClientTransport
+      const runtimeDir = getOrMaterializeTestRuntime();
+      const stdioScript = path.join(runtimeDir, 'mcp', 'stdio-review.js');
+      expect(fs.existsSync(stdioScript)).toBe(true);
+
+      transport = new StdioClientTransport({
+        command: process.execPath,
+        args: [stdioScript],
+        env: {
+          AGENTFORGE_MCP_DB_PATH: testEnv.dbPath,
+          AGENTFORGE_MCP_REVIEWER_TOKEN: rawToken,
+          NODE_PATH: path.resolve(__dirname, '..', 'node_modules'),
+        },
+        cwd: testEnv.tempDir,
+        stderr: 'pipe',
+      });
+
+      if (transport.stderr) {
+        transport.stderr.on('data', (chunk: Buffer | string) => {
+          stderrOutput += chunk.toString();
+        });
+      }
+
+      client = new Client({ name: 'synthetic-reviewer-stdio-client', version: '1.0.0' });
+      await client.connect(transport);
+
+      subprocessPid = transport.pid;
+      expect(subprocessPid).toBeDefined();
+      expect(typeof subprocessPid).toBe('number');
+      expect(subprocessPid!).toBeGreaterThan(0);
+
+      // Verify subprocess is alive at OS level
+      let initialPidAlive = false;
+      try {
+        process.kill(subprocessPid!, 0);
+        initialPidAlive = true;
+      } catch {
+        initialPidAlive = false;
+      }
+      expect(initialPidAlive).toBe(true);
+
+      // 4. Baseline database state before stdio reviewer reads
+      const tcBeforeReads = getDbTotalChanges(db);
+      const dataVersionBefore = db.pragma('data_version', { simple: true }) as number;
+
+      // 5. Reviewer reads review package via MCP Tool over stdio subprocess
+      const toolRes = await client.callTool({
+        name: REVIEWER_TOOL_NAME,
+        arguments: { adjudication_id: adjudicationId },
+      });
+      expect(toolRes.isError).toBeFalsy();
+      expect(toolRes.content).toHaveLength(1);
+      const toolText = (toolRes.content[0] as { type: 'text'; text: string }).text;
+      const toolPackage = JSON.parse(toolText);
+      expect(toolPackage.adjudication.id).toBe(adjudicationId);
+      expect(computeSha256(toolText)).toBe(issuance.session.projection_hash);
+      expect(toolText).toContain(PROJECTION_CONFIDENTIAL_MARKER);
+
+      // Prove zero writes across tool read
+      expect(getDbTotalChanges(db)).toBe(tcBeforeReads);
+      expect(db.pragma('data_version', { simple: true }) as number).toBe(dataVersionBefore);
+
+      // 6. Reviewer reads review package via MCP Resource over stdio subprocess
+      const resourceUri = `agentforge://reviews/packages/${adjudicationId}`;
+      const resourceRes = await client.readResource({ uri: resourceUri });
+      expect(resourceRes.contents).toHaveLength(1);
+      const resourceItem = resourceRes.contents[0] as { uri: string; mimeType?: string; text?: string };
+      expect(resourceItem.uri).toBe(resourceUri);
+      expect(resourceItem.mimeType).toBe(REVIEWER_MIME_TYPE);
+      expect(resourceItem.text).toBeDefined();
+      expect(computeSha256(resourceItem.text!)).toBe(issuance.session.projection_hash);
+      expect(resourceItem.text!).toContain(PROJECTION_CONFIDENTIAL_MARKER);
+
+      // Prove zero writes across resource read
+      expect(getDbTotalChanges(db)).toBe(tcBeforeReads);
+      expect(db.pragma('data_version', { simple: true }) as number).toBe(dataVersionBefore);
+
+      // 7. Token exclusion verification
+      expect(stderrOutput).not.toContain(rawToken);
+      expect(toolText).not.toContain(rawToken);
+      expect(resourceItem.text!).not.toContain(rawToken);
+    } finally {
+      // 8. Controlled shutdown & teardown via performSafeCleanup
+      await performSafeCleanup({
+        clients: [client],
+        transports: [transport],
+        dbs: [testEnv.db],
+        tempDirs: [testEnv.tempDir],
+        restoreTimers: true,
+      });
+    }
+
+    // 9. Authoritative OS process termination receipt verification
+    expect(subprocessPid).not.toBeNull();
+    const isTerminated = await verifyProcessTerminated(subprocessPid!);
+    expect(isTerminated).toBe(true);
+
+    // 10. Clean temp directory deletion verification
+    expect(fs.existsSync(testEnv.tempDir)).toBe(false);
+  });
+
+  // =========================================================================
+  // SCENARIO 7: Real Stdio Subprocess MCP Reviewer Rejections
+  // Expired token and cross-adjudication over stdio subprocess,
+  // zero-write, no token/projection leak, OS process termination proof
+  // =========================================================================
+  it('7. Real stdio subprocess MCP reviewer rejection: revoked token & cross-adjudication over stdio subprocess, zero-write, no token/projection leak, OS process termination', async () => {
+    const REJECTION_PROJECTION_MARKER = 'FROZEN_REJECTION_STDIO_MARKER_' + crypto.randomUUID();
+    const testEnv = setupSyntheticRehearsalEnv({ failVerification: false, taskTitleMarker: REJECTION_PROJECTION_MARKER });
+    const runtimeDir = getOrMaterializeTestRuntime();
+    const stdioScript = path.join(runtimeDir, 'mcp', 'stdio-review.js');
+
+    try {
+      const { repo, db, mcpService, adjudicationService, reviewerService } = testEnv;
+
+      const { plaintextToken } = issueSubmissionSession(repo, testEnv.authorizationId);
+      const submissionId = crypto.randomUUID();
+      mcpService.submitCoderClaim(
+        {
+          submission_id: submissionId,
+          authorization_id: testEnv.authorizationId,
+          project_id: testEnv.projectId,
+          task_id: testEnv.taskId,
+          attempt_id: testEnv.attemptId,
+          assignment_id: testEnv.assignmentId,
+          task_ownership_epoch: 1,
+          base_sha: testEnv.baseSha,
+          repository_head_sha: testEnv.repoHeadSha,
+          status: 'COMPLETED',
+          summary: `Submission containing ${REJECTION_PROJECTION_MARKER}`,
+          changed_files: ['README.md'],
+          tests_claimed: ['test-synth'],
+          blockers: [],
+          review_requested: true,
+          client_metadata: { client_name: 'synthetic-agent', client_version: '1.0.0', client_session_mode: 'CLI_EXTERNAL' },
+        },
+        plaintextToken
+      );
+
+      const admitRes = await adjudicationService.admitSubmissionForVerification({
+        requestId: crypto.randomUUID(),
+        submissionId,
+      });
+      const adjudicationId = admitRes.adjudication.id;
+
+      // --- Branch A: Revoked Token in DB over Stdio Subprocess ---
+      const revokedIssuance = reviewerService.issueReviewerSession({
+        adjudication_id: adjudicationId,
+        reviewer_agent_id: testEnv.agentIdReviewer,
+        reviewer_provider_id: testEnv.providerId,
+        reviewer_account_id: testEnv.reviewerAccountId,
+        reviewer_resource_id: testEnv.reviewerResourceId,
+        duration_seconds: 3600,
+      });
+
+      // Revoke the session via reviewerService (strictly complying with immutable trigger)
+      reviewerService.revokeReviewerSession(revokedIssuance.session.id, 'Security revocation for stdio rehearsal');
+
+      let transportRev: StdioClientTransport | null = null;
+      let clientRev: Client | null = null;
+      let revStderr = '';
+      let revPid: number | null = null;
+
+      try {
+        transportRev = new StdioClientTransport({
+          command: process.execPath,
+          args: [stdioScript],
+          env: {
+            AGENTFORGE_MCP_DB_PATH: testEnv.dbPath,
+            AGENTFORGE_MCP_REVIEWER_TOKEN: revokedIssuance.raw_token,
+            NODE_PATH: path.resolve(__dirname, '..', 'node_modules'),
+          },
+          cwd: testEnv.tempDir,
+          stderr: 'pipe',
+        });
+        if (transportRev.stderr) {
+          transportRev.stderr.on('data', (chunk) => { revStderr += chunk.toString(); });
+        }
+        clientRev = new Client({ name: 'revoked-stdio-client', version: '1.0.0' });
+        await clientRev.connect(transportRev);
+        revPid = transportRev.pid;
+
+        // Tool Call Rejection
+        const tcBeforeTool = getDbTotalChanges(db);
+        const revokedToolCall = await clientRev.callTool({
+          name: REVIEWER_TOOL_NAME,
+          arguments: { adjudication_id: adjudicationId },
+        });
+        const tcAfterTool = getDbTotalChanges(db);
+        expect(tcAfterTool).toBe(tcBeforeTool);
+        expect(revokedToolCall.isError).toBe(true);
+        const toolErrText = (revokedToolCall.content[0] as { text: string }).text;
+        expect(toolErrText).toContain('TOKEN_REVOKED');
+        expect(toolErrText).not.toContain(REJECTION_PROJECTION_MARKER);
+        expect(toolErrText).not.toContain(revokedIssuance.raw_token);
+        expect(toolErrText).not.toContain('authoritative_verification');
+        expect(toolErrText).not.toContain('untrusted_claim');
+
+        // Resource Read Rejection
+        const tcBeforeRes = getDbTotalChanges(db);
+        const revokedResourceRes = await clientRev.readResource({
+          uri: `agentforge://reviews/packages/${adjudicationId}`,
+        });
+        const tcAfterRes = getDbTotalChanges(db);
+        expect(tcAfterRes).toBe(tcBeforeRes);
+        const resErrText = (revokedResourceRes.contents[0] as { text: string }).text;
+        expect(resErrText).toContain('TOKEN_REVOKED');
+        expect(resErrText).not.toContain(REJECTION_PROJECTION_MARKER);
+        expect(resErrText).not.toContain(revokedIssuance.raw_token);
+        expect(resErrText).not.toContain('authoritative_verification');
+        expect(resErrText).not.toContain('untrusted_claim');
+
+        // Stderr token exclusion
+        expect(revStderr).not.toContain(revokedIssuance.raw_token);
+      } finally {
+        await performSafeCleanup({
+          clients: [clientRev],
+          transports: [transportRev],
+        });
+      }
+
+      expect(revPid).not.toBeNull();
+      expect(await verifyProcessTerminated(revPid!)).toBe(true);
+
+      // --- Branch B: Cross-Adjudication Rejection over Stdio Subprocess ---
+      const validAgentId = 'agent-rev-valid-' + crypto.randomUUID();
+      db.prepare(`INSERT INTO agents (id, display_name, role, provider_resource_id, status, current_task_id, last_seen_at) VALUES (?, 'Valid Reviewer Agent', 'REVIEWER', ?, 'IDLE', NULL, ?)`).run(validAgentId, testEnv.reviewerResourceId, new Date().toISOString());
+
+      const validIssuance = reviewerService.issueReviewerSession({
+        adjudication_id: adjudicationId,
+        reviewer_agent_id: validAgentId,
+        reviewer_provider_id: testEnv.providerId,
+        reviewer_account_id: testEnv.reviewerAccountId,
+        reviewer_resource_id: testEnv.reviewerResourceId,
+        duration_seconds: 3600,
+      });
+
+      const foreignAdjudicationId = crypto.randomUUID();
+      let transportVal: StdioClientTransport | null = null;
+      let clientVal: Client | null = null;
+      let valStderr = '';
+      let valPid: number | null = null;
+
+      try {
+        transportVal = new StdioClientTransport({
+          command: process.execPath,
+          args: [stdioScript],
+          env: {
+            AGENTFORGE_MCP_DB_PATH: testEnv.dbPath,
+            AGENTFORGE_MCP_REVIEWER_TOKEN: validIssuance.raw_token,
+            NODE_PATH: path.resolve(__dirname, '..', 'node_modules'),
+          },
+          cwd: testEnv.tempDir,
+          stderr: 'pipe',
+        });
+        if (transportVal.stderr) {
+          transportVal.stderr.on('data', (chunk) => { valStderr += chunk.toString(); });
+        }
+        clientVal = new Client({ name: 'valid-stdio-client', version: '1.0.0' });
+        await clientVal.connect(transportVal);
+        valPid = transportVal.pid;
+
+        // Cross-adjudication tool call rejection
+        const tcBeforeTool = getDbTotalChanges(db);
+        const crossAdjToolCall = await clientVal.callTool({
+          name: REVIEWER_TOOL_NAME,
+          arguments: { adjudication_id: foreignAdjudicationId },
+        });
+        const tcAfterTool = getDbTotalChanges(db);
+        expect(tcAfterTool).toBe(tcBeforeTool);
+        expect(crossAdjToolCall.isError).toBe(true);
+        const toolErrText = (crossAdjToolCall.content[0] as { text: string }).text;
+        expect(toolErrText).toContain('PERMISSION_DENIED');
+        expect(toolErrText).not.toContain(REJECTION_PROJECTION_MARKER);
+        expect(toolErrText).not.toContain(validIssuance.raw_token);
+        expect(toolErrText).not.toContain('authoritative_verification');
+        expect(toolErrText).not.toContain('untrusted_claim');
+
+        // Cross-adjudication resource read rejection
+        const tcBeforeRes = getDbTotalChanges(db);
+        const crossAdjResourceRes = await clientVal.readResource({
+          uri: `agentforge://reviews/packages/${foreignAdjudicationId}`,
+        });
+        const tcAfterRes = getDbTotalChanges(db);
+        expect(tcAfterRes).toBe(tcBeforeRes);
+        const resErrText = (crossAdjResourceRes.contents[0] as { text: string }).text;
+        expect(resErrText).toContain('PERMISSION_DENIED');
+        expect(resErrText).not.toContain(REJECTION_PROJECTION_MARKER);
+        expect(resErrText).not.toContain(validIssuance.raw_token);
+        expect(resErrText).not.toContain('authoritative_verification');
+        expect(resErrText).not.toContain('untrusted_claim');
+
+        // Stderr token exclusion
+        expect(valStderr).not.toContain(validIssuance.raw_token);
+      } finally {
+        await performSafeCleanup({
+          clients: [clientVal],
+          transports: [transportVal],
+        });
+      }
+
+      expect(valPid).not.toBeNull();
+      expect(await verifyProcessTerminated(valPid!)).toBe(true);
+    } finally {
+      await performSafeCleanup({
+        dbs: [testEnv.db],
+        tempDirs: [testEnv.tempDir],
+        restoreTimers: true,
+      });
+    }
+
+    expect(fs.existsSync(testEnv.tempDir)).toBe(false);
+  });
+
+  // =========================================================================
+  // SCENARIO 8: Fixture Setup Cleanup Resilience
+  // Abortive failure before returning env closes DB and deletes temp dir
+  // =========================================================================
+  it('8. Fixture setup cleanup: abortive failure before returning env closes DB and leaves no orphaned temp dir', () => {
+    let capturedTempDir: string | null = null;
+    const originalMkdtempSync = fs.mkdtempSync;
+    const spyMkdtempSync = vi.spyOn(fs, 'mkdtempSync').mockImplementation(((prefix: string, options?: any) => {
+      const result = originalMkdtempSync(prefix, options as any);
+      capturedTempDir = result as string;
+      return result;
+    }) as any);
+
+    try {
+      expect(() => {
+        setupSyntheticRehearsalEnv({ _simulateSetupFailure: true });
+      }).toThrow('Simulated setup failure before returning env');
+
+      expect(capturedTempDir).not.toBeNull();
+      expect(fs.existsSync(capturedTempDir!)).toBe(false);
+    } finally {
+      spyMkdtempSync.mockRestore();
+      if (capturedTempDir && fs.existsSync(capturedTempDir)) {
+        fs.rmSync(capturedTempDir, { recursive: true, force: true });
+      }
+    }
   });
 });
