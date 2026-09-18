@@ -249,22 +249,28 @@ $$\text{ROLE} \neq \text{AGENT PROFILE} \neq \text{PROVIDER} \neq \text{MODEL RE
 4. **R5D Verification Boundary**: R5C establishes configuration mapping. All multi-profile runtime account isolation remains classified as `PENDING_R5D` until verified during live R5D execution proofs.
 ---
 
-## 8. Next Gates (Authoritative R5-v1.1 Roadmap)
+## 8. Authoritative R5-v1.1 Roadmap Status
 
-The R5 planning sequence is governed by the authoritative R5-v1.1 roadmap:
+The R5 milestone sequence is governed by the authoritative R5-v1.1 roadmap. All gates R5A through R5J have been implemented, verified, and merged into `main`. Milestone R5L is the current operational gate, commencing with R5L0 planning and readiness auditing.
 
-- **R5A — Role-Agnostic Domain Foundation** `[CLOSED_SUCCESSFULLY]`: Durable entity separation (`ROLE != PROFILE != PROVIDER != RESOURCE != ACCOUNT != SLOT`), schema migrations, relational provenance validation.
-- **R5B — Durable Memory & Context Fabric** `[CLOSED_SUCCESSFULLY]`: Local structured task/project memory, versioned context snapshots, manifest hashing, deterministic context builders.
-- **R5C — Local Account & Credential Fabric** `[CURRENT GATE]`: Secure credential references, Windows Credential Manager integration, profile resolvers, zero plaintext in SQLite.
-- **R5D — Native Multi-Profile Execution Proof**: Multi-profile isolation and authentication validation across distinct provider accounts.
-- **R5E — Role-Aware Router & Separation Policy**: Capability matching, conflict-of-interest enforcement (reviewer != coder), affinity policies.
-- **R5F — Production CLI Runtime Adapters**: Live runtime execution bridges for Codex, Gemini, Claude, and Manual Bridge.
-- **R5G — Concurrent Scheduler & Worktree Isolation**: Multi-agent slot allocation, isolated git worktrees, task concurrency control.
-- **R5H — Quota / Account / Provider Failover**: Dynamic quota tracking, rate-limit backoff, multi-account failover handlers.
-- **R5I — Cross-Agent / Cross-Provider Mid-Task Handoff**: Context preservation across agent handoffs and model transitions.
-- **R5J — AgentForge MCP + IDE/Client Bridge**: MCP protocol servers and IDE integration endpoints.
-- **R5K — Optional Local LLM Gateway**: Local inference adapter and model gateway integration.
-- **R5L — Dynamic Multi-Role / Multi-Account / Context-Continuity Production Trial**: End-to-end multi-agent production verification.
+- **R5A — Role-Agnostic Domain Foundation** `[CLOSED_SUCCESSFULLY]`: Durable entity separation (`ROLE != PROFILE != PROVIDER != RESOURCE != ACCOUNT != SLOT`), schema migrations, relational provenance validation. Merged in commit `3fe9134`.
+- **R5B — Durable Memory & Context Fabric** `[CLOSED_SUCCESSFULLY]`: Local structured task/project memory, versioned context snapshots, manifest hashing, deterministic context builders. Merged in commit `f79094f`.
+- **R5C — Local Account & Credential Fabric** `[CLOSED_SUCCESSFULLY]`: Secure credential references, Windows Credential Manager integration, profile resolvers, zero plaintext in SQLite. Merged in commit `3eab956`.
+- **R5D — Native Multi-Profile Execution Proof** `[CLOSED_SUCCESSFULLY]`: Multi-profile isolation and authentication validation across distinct provider accounts. Merged in commits `84217a8`, `480cc1e`, and `6068f58`.
+- **R5E — Role-Aware Router & Separation Policy** `[CLOSED_SUCCESSFULLY]`: Capability matching, conflict-of-interest enforcement (reviewer != coder), affinity policies. Merged in commit `f68f13d`.
+- **R5F — Production CLI Runtime Adapters** `[CLOSED_SUCCESSFULLY]`: Live runtime execution bridges for Codex, Gemini, Claude, and Manual Bridge. Merged in commits `9f0d7b1`, `eeab27f`, and `db911ec`.
+- **R5G — Concurrent Scheduler & Worktree Isolation** `[CLOSED_SUCCESSFULLY]`: Multi-agent slot allocation, isolated git worktrees, task concurrency control. Merged in commit `3208004`.
+- **R5H — Quota / Account / Provider Failover** `[CLOSED_SUCCESSFULLY]`: Dynamic quota tracking, rate-limit backoff, multi-account failover handlers, and durable health precedence. Merged in commits `475dd77` through `dc1a6aa`.
+- **R5I — Cross-Agent / Cross-Provider Mid-Task Handoff** `[CLOSED_SUCCESSFULLY]`: Context preservation across agent handoffs, predecessor relinquishment, and idempotent successor routing. Merged in commits `d940d6e` through `8b0d145`.
+- **R5J — AgentForge MCP + IDE/Client Bridge** `[CLOSED_SUCCESSFULLY]`: MCP protocol servers, client bridge, durable coder submission authority, quarantined submission adjudication, and independent reviewer context read authority (R5J1–R5J7). Merged in commits `a44ce0b` through `0dbf81a`.
+- **R5K — Optional Local LLM Gateway** `[DEFERRED_OPTIONAL]`: Local inference adapter and model gateway integration. Deferred by management decision. R5K is **not** a prerequisite for R5L and may be reopened only if production-trial evidence demonstrates a concrete operational need for local inference.
+- **R5L — Dynamic Multi-Role / Multi-Account / Context-Continuity Production Trial** `[CURRENT GATE — R5L0 PLANNING]`: End-to-end multi-agent production verification. R5L begins with R5L0 (Production Trial Specification & Readiness Audit).
+
+> [!IMPORTANT]
+> **Operational Boundary Clarifications**:
+> - **R5K Deferral**: R5K is not required for R5L execution. Agent Forge multi-role fabric operates against authenticated external CLI providers and manual bridges.
+> - **CI vs Production Trial**: Passing CI, automated tests, and Windows packaging smoke gates does **not** itself constitute a completed production trial.
+> - **R5L0 Authority Boundary**: R5L begins strictly with R5L0 specification and readiness auditing as codified in [docs/R5L_PRODUCTION_TRIAL_PLAN.md](R5L_PRODUCTION_TRIAL_PLAN.md). R5L0 authorizes planning only; it does not authorize live execution, credential consumption, external dispatch, or production data mutation.
 
 ---
 
