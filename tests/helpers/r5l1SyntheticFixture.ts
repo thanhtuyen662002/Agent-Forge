@@ -25,6 +25,385 @@ import {
 } from '../../src/mcp/submissionProtocol';
 import { computePayloadHash } from '../../src/core/services/ExecutionAuthorizationService';
 import { ExecutionAuthorization } from '../../src/core/types/domain';
+import { ContextBuilderService } from '../../src/core/services/ContextBuilderService';
+import { ProviderRegistry } from '../../src/core/adapters/ProviderRegistry';
+import { RoleAwareRoutingService } from '../../src/core/services/RoleAwareRoutingService';
+import { WorkerSlotLeaseService } from '../../src/core/services/WorkerSlotLeaseService';
+import { ExecutionAuthorizationService } from '../../src/core/services/ExecutionAuthorizationService';
+import { GitWorktreeService, WorktreeOwnershipTuple } from '../../src/core/services/GitWorktreeService';
+import { ProviderDispatchService } from '../../src/core/services/ProviderDispatchService';
+import { ProcessRunner } from '../../src/core/services/ProcessRunner';
+import {
+  ProviderAdapter,
+  AgentExecutionRequest,
+  AgentExecutionResult,
+  QuotaSnapshotInfo,
+} from '../../src/core/adapters/ProviderAdapter';
+import {
+  Capability,
+  ProviderHealthStatus,
+  ProviderAdapterType,
+} from '../../src/core/types/domain';
+
+export function resolveGitExecutable(): string {
+  if (process.platform === 'win32') {
+    try {
+      const out = child_process
+        .execFileSync('where.exe', ['git'], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] })
+        .trim()
+        .split(/\r?\n/)[0];
+      if (out && fs.existsSync(out)) return path.resolve(out);
+    } catch {}
+    const defaultWinGit = 'C:\\Program Files\\Git\\cmd\\git.exe';
+    if (fs.existsSync(defaultWinGit)) return defaultWinGit;
+  } else {
+    try {
+      const out = child_process
+        .execFileSync('which', ['git'], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] })
+        .trim();
+      if (out && fs.existsSync(out)) return path.resolve(out);
+    } catch {}
+  }
+  return path.resolve('git');
+}
+
+export class SyntheticLocalCliAdapter implements ProviderAdapter {
+  readonly id: string;
+  readonly name = 'Synthetic Local CLI Adapter';
+  readonly adapterType: ProviderAdapterType = 'LOCAL_CLI';
+
+  constructor(
+    providerId: string,
+    private gitExecutable: string,
+    private repo: Repository,
+    private artifactStore: ArtifactStore
+  ) {
+    this.id = providerId;
+  }
+
+  async getCapabilities(): Promise<Capability[]> {
+    return ['CODING'];
+  }
+
+  async getHealth(): Promise<ProviderHealthStatus> {
+    return 'AVAILABLE';
+  }
+
+  async getQuota(): Promise<QuotaSnapshotInfo> {
+    return {
+      remaining: 1000,
+      total: 1000,
+      unit: 'REQUESTS',
+      source: 'PROVIDER_REPORTED',
+      confidence: 1.0,
+      resetAt: null,
+    };
+  }
+
+  async execute(request: AgentExecutionRequest): Promise<AgentExecutionResult> {
+    const worktreePath = request.runtimeBinding?.workspace?.workingDirectory;
+    if (!worktreePath || !fs.existsSync(worktreePath)) {
+      throw new Error(`Worktree working directory does not exist: ${worktreePath}`);
+    }
+
+    // Execute real local Node child process inside worktree via ProcessRunner
+    const scriptFile = path.join(worktreePath, 'synthetic_coder.js');
+    fs.writeFileSync(
+      scriptFile,
+      "const fs = require('fs'); fs.appendFileSync('README.md', '\\n## Changes from synthetic coder subprocess\\n'); process.stdout.write('Subprocess successfully modified README.md\\n'); process.exit(0);",
+      'utf8'
+    );
+    const procRes = await ProcessRunner.execute({
+      executable: process.execPath,
+      args: ['synthetic_coder.js'],
+      cwd: worktreePath,
+      timeoutMs: 30000,
+      allowShell: false,
+      repo: this.repo,
+      artifactStore: this.artifactStore,
+      projectId: request.projectId,
+      taskId: request.taskId,
+      attemptId: request.attemptId ?? null,
+    });
+
+    if (procRes.exitCode !== 0) {
+      throw new Error(`Synthetic coder subprocess exited with code ${procRes.exitCode}: ${procRes.stderr}`);
+    }
+
+    // Commit changes inside worktree via Git CLI
+    child_process.execFileSync(this.gitExecutable, ['config', 'user.name', 'Synthetic Coder Subprocess'], { cwd: worktreePath, stdio: 'ignore' });
+    child_process.execFileSync(this.gitExecutable, ['config', 'user.email', 'coder-subprocess@agentforge.local'], { cwd: worktreePath, stdio: 'ignore' });
+    child_process.execFileSync(this.gitExecutable, ['add', '.'], { cwd: worktreePath, stdio: 'ignore' });
+    child_process.execFileSync(this.gitExecutable, ['commit', '-m', 'Commit from synthetic coder subprocess'], { cwd: worktreePath, stdio: 'ignore' });
+
+    return {
+      executionId: request.runtimeBinding?.executionId || crypto.randomUUID(),
+      status: 'COMPLETED',
+      stdoutEvidenceId: procRes.stdoutEvidenceId,
+      stderrEvidenceId: procRes.stderrEvidenceId,
+    };
+  }
+
+  async cancel(executionId: string): Promise<void> {}
+}
+
+export interface SyntheticRehearsalBootstrapEnv {
+  tempDir: string;
+  repoDir: string;
+  managedWorktreesDir: string;
+  dbPath: string;
+  db: Database.Database;
+  repo: Repository;
+  artifactStore: ArtifactStore;
+  verificationService: VerificationService;
+  mcpService: McpSubmissionAuthorityService;
+  adjudicationService: CoderSubmissionAdjudicationService;
+  reviewerService: ReviewerAuthorityService;
+  eventService: EventService;
+  taskService: TaskService;
+  projectService: ProjectService;
+  contextBuilderService: ContextBuilderService;
+  providerRegistry: ProviderRegistry;
+  roleAwareRoutingService: RoleAwareRoutingService;
+  workerSlotLeaseService: WorkerSlotLeaseService;
+  authorizationService: ExecutionAuthorizationService;
+  gitWorktreeService: GitWorktreeService;
+  providerDispatchService: ProviderDispatchService;
+  gitExecutable: string;
+  projectId: string;
+  providerId: string;
+  coderAccountId: string;
+  reviewerAccountId: string;
+  coderResourceId: string;
+  reviewerResourceId: string;
+  roleIdCoder: string;
+  roleIdReviewer: string;
+  coderAgentProfileId: string;
+  reviewerAgentProfileId: string;
+  agentIdCoder: string;
+  agentIdReviewer: string;
+  workerSlotId: string;
+  baseSha: string;
+  testPassCommandId: string;
+}
+
+export function setupSyntheticRehearsalBootstrap(options?: {
+  afterDatabaseOpened?: (resources: { tempDir: string; db: Database.Database }) => void;
+}): SyntheticRehearsalBootstrapEnv {
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'af-r5l1-rehearsal-bootstrap-'));
+  const repoDir = path.join(tempDir, 'repo');
+  const managedWorktreesDir = path.join(tempDir, 'managed-worktrees');
+  let setupDb: Database.Database | undefined;
+  try {
+    fs.mkdirSync(repoDir, { recursive: true });
+    fs.mkdirSync(managedWorktreesDir, { recursive: true });
+
+    const gitExecutable = resolveGitExecutable();
+
+    // 1. Initialize a synthetic git repository
+    child_process.execFileSync(gitExecutable, ['init', '-b', 'main'], { cwd: repoDir, stdio: 'ignore' });
+    child_process.execFileSync(gitExecutable, ['config', 'user.name', 'Synthetic Bootstrap Agent'], { cwd: repoDir, stdio: 'ignore' });
+    child_process.execFileSync(gitExecutable, ['config', 'user.email', 'synthetic-bootstrap@agentforge.local'], { cwd: repoDir, stdio: 'ignore' });
+    fs.writeFileSync(path.join(repoDir, 'README.md'), '# Synthetic Rehearsal Project\n', 'utf8');
+    fs.writeFileSync(path.join(repoDir, 'solution.txt'), 'Initial codebase state\n', 'utf8');
+    fs.writeFileSync(path.join(repoDir, 'test_pass.js'), 'console.log("Synthetic test passed"); process.exit(0);\n', 'utf8');
+    fs.writeFileSync(path.join(repoDir, 'test_fail.js'), 'console.error("Synthetic test failed"); process.exit(1);\n', 'utf8');
+    child_process.execFileSync(gitExecutable, ['add', '.'], { cwd: repoDir, stdio: 'ignore' });
+    child_process.execFileSync(gitExecutable, ['commit', '-m', 'Initial synthetic commit'], { cwd: repoDir, stdio: 'ignore' });
+
+    const baseSha = child_process
+      .execFileSync(gitExecutable, ['rev-parse', 'HEAD'], { cwd: repoDir, encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] })
+      .trim()
+      .toLowerCase();
+
+    // 2. Initialize dedicated SQLite database and run all migrations
+    const dbPath = path.join(tempDir, 'rehearsal.db');
+    const db = new Database(dbPath);
+    setupDb = db;
+    options?.afterDatabaseOpened?.({ tempDir, db });
+    db.pragma('foreign_keys = ON');
+    MigrationRunner.run(db);
+
+    // 3. ArtifactStore & Services
+    const artifactsDir = path.join(tempDir, 'artifacts');
+    fs.mkdirSync(artifactsDir, { recursive: true });
+    const artifactStore = new ArtifactStore(artifactsDir);
+    const repo = new Repository(db);
+    const eventService = new EventService(repo);
+    const verificationService = new VerificationService(repo, artifactStore);
+    const mcpService = new McpSubmissionAuthorityService(repo, db);
+    const adjudicationService = new CoderSubmissionAdjudicationService(repo, db, verificationService, eventService);
+    const reviewerService = new ReviewerAuthorityService(repo, artifactStore);
+    const projectService = new ProjectService(repo, eventService);
+    const taskService = new TaskService(repo, eventService, verificationService, artifactStore);
+    const contextBuilderService = new ContextBuilderService(repo);
+    const providerRegistry = new ProviderRegistry();
+    const roleAwareRoutingService = new RoleAwareRoutingService(repo, providerRegistry, eventService);
+    const workerSlotLeaseService = new WorkerSlotLeaseService(repo);
+    const authorizationService = new ExecutionAuthorizationService(repo, eventService);
+    const gitWorktreeService = new GitWorktreeService({
+      gitExecutable,
+      repositoryRoot: repoDir,
+      managedRoot: managedWorktreesDir,
+    });
+    const providerDispatchService = new ProviderDispatchService(
+      providerRegistry,
+      repo,
+      eventService,
+      gitWorktreeService
+    );
+    providerDispatchService.setGitWorktreeService(gitWorktreeService);
+
+    const now = new Date().toISOString();
+    const projectId = 'proj-synth-' + crypto.randomUUID();
+    const providerId = 'prov-synth-' + crypto.randomUUID();
+    const coderAccountId = 'acc-coder-' + crypto.randomUUID();
+    const reviewerAccountId = 'acc-rev-' + crypto.randomUUID();
+    const coderResourceId = 'res-coder-' + crypto.randomUUID();
+    const reviewerResourceId = 'res-rev-' + crypto.randomUUID();
+    const roleIdCoder = 'role-coder-' + crypto.randomUUID();
+    const roleIdReviewer = 'role-rev-' + crypto.randomUUID();
+    const coderAgentProfileId = 'prof-coder-' + crypto.randomUUID();
+    const reviewerAgentProfileId = 'prof-rev-' + crypto.randomUUID();
+    const agentIdCoder = 'agent-coder-' + crypto.randomUUID();
+    const agentIdReviewer = 'agent-rev-' + crypto.randomUUID();
+    const workerSlotId = 'slot-synth-' + crypto.randomUUID();
+    const testPassCommandId = 'cmd-pass-' + crypto.randomUUID();
+
+    // 4. Seed Minimal Synthetic Input Configuration (Topology only)
+    repo.createProject({
+      id: projectId,
+      name: 'Synthetic Rehearsal Project',
+      description: 'Project for R5L1 rehearsal synthetic pipeline',
+      repository_path: repoDir,
+      default_branch: 'main',
+      status: 'RUNNING',
+      contract: null,
+      created_at: now,
+      updated_at: now,
+      started_at: null,
+      completed_at: null,
+    });
+
+    repo.createVerificationCommand({
+      id: testPassCommandId,
+      project_id: projectId,
+      name: 'Synthetic Pass Test',
+      command_type: 'TEST',
+      executable: process.execPath,
+      args: ['test_pass.js'],
+      timeout_ms: 60000,
+      enabled: true,
+    });
+
+    db.prepare(`
+      INSERT INTO providers (id, name, adapter_type, enabled, created_at)
+      VALUES (?, 'Synthetic Local CLI Provider', 'LOCAL_CLI', 1, ?)
+    `).run(providerId, now);
+
+    db.prepare(`
+      INSERT INTO provider_accounts (id, provider_id, label, auth_mode, enabled, priority, health_status, concurrency_limit, created_at, updated_at)
+      VALUES (?, ?, 'synthetic-coder-account', 'NATIVE_PROFILE', 1, 10, 'AVAILABLE', 10, ?, ?)
+    `).run(coderAccountId, providerId, now, now);
+
+    db.prepare(`
+      INSERT INTO provider_accounts (id, provider_id, label, auth_mode, enabled, priority, health_status, concurrency_limit, created_at, updated_at)
+      VALUES (?, ?, 'synthetic-reviewer-account', 'NATIVE_PROFILE', 1, 10, 'AVAILABLE', 10, ?, ?)
+    `).run(reviewerAccountId, providerId, now, now);
+
+    db.prepare(`
+      INSERT INTO provider_resources (id, provider_id, provider_account_id, model_name, health_status, capabilities_json, enabled, total_quota, remaining_quota, quota_unit, quota_source, quota_confidence, last_health_check)
+      VALUES (?, ?, ?, 'synthetic-claude-coder', 'AVAILABLE', '["CODING"]', 1, 1000, 1000, 'REQUESTS', 'PROVIDER_REPORTED', 1.0, ?)
+    `).run(coderResourceId, providerId, coderAccountId, now);
+
+    db.prepare(`
+      INSERT INTO provider_resources (id, provider_id, provider_account_id, model_name, health_status, capabilities_json, enabled, total_quota, remaining_quota, quota_unit, quota_source, quota_confidence, last_health_check)
+      VALUES (?, ?, ?, 'synthetic-claude-reviewer', 'AVAILABLE', '["REVIEWING"]', 1, 1000, 1000, 'REQUESTS', 'PROVIDER_REPORTED', 1.0, ?)
+    `).run(reviewerResourceId, providerId, reviewerAccountId, now);
+
+    db.prepare(`
+      INSERT INTO role_profiles (id, role, display_name, required_capabilities_json, preferred_capabilities_json, permissions_json, enabled, created_at, updated_at)
+      VALUES (?, 'CODER', 'Synthetic Coder Role', '["CODING"]', '[]', '[]', 1, ?, ?)
+    `).run(roleIdCoder, now, now);
+
+    db.prepare(`
+      INSERT INTO role_profiles (id, role, display_name, required_capabilities_json, preferred_capabilities_json, permissions_json, enabled, created_at, updated_at)
+      VALUES (?, 'REVIEWER', 'Synthetic Reviewer Role', '["REVIEWING"]', '[]', '[]', 1, ?, ?)
+    `).run(roleIdReviewer, now, now);
+
+    db.prepare(`
+      INSERT INTO agent_profiles (id, role_profile_id, name, enabled, created_at, updated_at)
+      VALUES (?, ?, 'Synthetic Coder Profile', 1, ?, ?)
+    `).run(coderAgentProfileId, roleIdCoder, now, now);
+
+    db.prepare(`
+      INSERT INTO agent_profiles (id, role_profile_id, name, enabled, created_at, updated_at)
+      VALUES (?, ?, 'Synthetic Reviewer Profile', 1, ?, ?)
+    `).run(reviewerAgentProfileId, roleIdReviewer, now, now);
+
+    db.prepare(`
+      INSERT INTO agents (id, display_name, role, provider_resource_id, status, current_task_id, last_seen_at)
+      VALUES (?, 'Synthetic Coder Agent', 'CODER', ?, 'IDLE', NULL, ?)
+    `).run(agentIdCoder, coderResourceId, now);
+
+    db.prepare(`
+      INSERT INTO agents (id, display_name, role, provider_resource_id, status, current_task_id, last_seen_at)
+      VALUES (?, 'Synthetic Reviewer Agent', 'REVIEWER', ?, 'IDLE', NULL, ?)
+    `).run(agentIdReviewer, reviewerResourceId, now);
+
+    // Initial worker slot is IDLE, with NO assignment and NO lease
+    db.prepare(`
+      INSERT INTO worker_slots (id, provider_account_id, provider_resource_id, slot_index, status, current_assignment_id, created_at, updated_at)
+      VALUES (?, ?, ?, 1, 'IDLE', NULL, ?, ?)
+    `).run(workerSlotId, coderAccountId, coderResourceId, now, now);
+
+    return {
+      tempDir,
+      repoDir,
+      managedWorktreesDir,
+      dbPath,
+      db,
+      repo,
+      artifactStore,
+      verificationService,
+      mcpService,
+      adjudicationService,
+      reviewerService,
+      eventService,
+      taskService,
+      projectService,
+      contextBuilderService,
+      providerRegistry,
+      roleAwareRoutingService,
+      workerSlotLeaseService,
+      authorizationService,
+      gitWorktreeService,
+      providerDispatchService,
+      gitExecutable,
+      projectId,
+      providerId,
+      coderAccountId,
+      reviewerAccountId,
+      coderResourceId,
+      reviewerResourceId,
+      roleIdCoder,
+      roleIdReviewer,
+      coderAgentProfileId,
+      reviewerAgentProfileId,
+      agentIdCoder,
+      agentIdReviewer,
+      workerSlotId,
+      baseSha,
+      testPassCommandId,
+    };
+  } catch (cause) {
+    const errors: unknown[] = [cause];
+    try { if (setupDb?.open) setupDb.close(); } catch (error) { errors.push(error); }
+    try { fs.rmSync(tempDir, { recursive: true, force: true }); } catch (error) { errors.push(error); }
+    if (errors.length > 1) throw new AggregateError(errors, 'Bootstrap fixture setup and cleanup failed');
+    throw cause;
+  }
+}
 
 export interface SyntheticRehearsalEnv {
   tempDir: string;
