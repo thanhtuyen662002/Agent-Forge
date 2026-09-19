@@ -1,0 +1,164 @@
+{
+  "trial_id": "r5l1-rehearsal-8e7ba9c9-84f2-4d83-8090-7b879070361d",
+  "schema_version": 1,
+  "phase": "R5L1",
+  "environment": {
+    "os_version": "Windows_NT 10.0.26200 (x64)",
+    "node_version": "v22.14.0",
+    "git_version": "git version 2.45.1.windows.1",
+    "application_version": "0.1.0"
+  },
+  "provenance": {
+    "source_commit": "a0fd9b2946cf777b35a0b3cd3db6a54463aed967",
+    "git_tree_sha": "f816ba5b7a57675616adb6baa6525f41f0857b84",
+    "ci_run_id": null
+  },
+  "lifecycle_steps": {
+    "step_01_task_creation": {
+      "status": "PASS",
+      "provenance": "SERVICE_EXECUTED",
+      "method": "TaskService.createTask",
+      "task_id": "TSK-9BE38098",
+      "initial_state": "PLANNED"
+    },
+    "step_02_task_planning_approval": {
+      "status": "PASS",
+      "provenance": "SERVICE_EXECUTED",
+      "method": "TaskService.applyManagerDecision(EXECUTE)",
+      "manager_message_id": "msg-exec-663aac68-d234-4ac1-afa0-d4ed630f9abc",
+      "manager_payload_hash": "c1deba85042d55c81e271e34e8610b2026a943cff8054d935ee9f94486bc0873",
+      "transitioned_state": "CODING",
+      "bound_base_sha": "8293f7ea1e61efee98d37d5d81edca48e5a3eb7c"
+    },
+    "step_03_context_snapshot": {
+      "status": "PASS",
+      "provenance": "SERVICE_EXECUTED",
+      "method": "ContextBuilderService.buildContextSnapshot",
+      "snapshot_id": "ctx-snap-2f86c1b3-b23b-4972-bab0-37ac95488045",
+      "manifest_id": "ctx-man-707fdcfe-7169-454d-9710-a1650286b1ce",
+      "manifest_hash": "ef2ed9e7bd840fbac948b48aeb2eed0789d8aeee040ec3e6f931b4fb951a021a"
+    },
+    "step_04_role_aware_routing": {
+      "status": "PASS",
+      "provenance": "SERVICE_EXECUTED",
+      "method": "RoleAwareRoutingService.routeRole",
+      "decision_id": "8e616026-bb3f-4f6b-afbd-e47a4eccc2d5",
+      "outcome": "SELECTED",
+      "selected_assignment_id": "ef9c273c-3761-4273-a829-396dce522c3c",
+      "selected_provider_id": "prov-synth-1dc75d3b-bddd-460e-875f-1fc0ab411fb4",
+      "selected_account_id": "acc-coder-a5a9d4bb-8c2c-4447-9603-c10095aee31f",
+      "selected_resource_id": "res-coder-fb44cc36-84d7-4c8d-a73b-5b314bf4c08f"
+    },
+    "step_05_slot_lease_allocation": {
+      "status": "PASS",
+      "provenance": "SERVICE_EXECUTED",
+      "method": "WorkerSlotLeaseService.acquireForAssignment",
+      "lease_id": "9f6ae4c8-1181-41e4-a816-43a6fa2b3d57",
+      "worker_slot_id": "slot-synth-b5ba89fa-ce84-4a40-a61c-6a559bec6373",
+      "worker_slot_status": "LEASED"
+    },
+    "step_06_authorization_resolution": {
+      "status": "PASS",
+      "provenance": "SERVICE_EXECUTED",
+      "method": "ExecutionAuthorizationService.createAuthorization",
+      "authorization_id": "3e73693a-9c95-460a-86eb-7dbcb24622f4",
+      "authorization_status": "AUTHORIZED",
+      "instruction_payload_hash": "673f5b1978f9e79fc5d8c106b83899c9df399a079d8743e8bce302bb9771727f",
+      "context_manifest_hash": "be3ae3b6479236a18da3e876a0de9dfe9ae2428896d83c3e804db008861b12d0"
+    },
+    "step_07_worktree_provisioning": {
+      "status": "PASS",
+      "provenance": "SERVICE_EXECUTED",
+      "method": "GitWorktreeService.createWorktree",
+      "worktree_path": "C:\\Users\\Vo Thanh Tuyen\\AppData\\Local\\Temp\\af-r5l1-rehearsal-bootstrap-7nkRJx\\managed-worktrees\\afw-b8793445f04b2dc4b08bd6123f54d9f8",
+      "ownership_digest": "b8793445f04b2dc4b08bd6123f54d9f82e7362f6f6cfb05ca4a116d14966a44f"
+    },
+    "step_08_coder_dispatch_execution": {
+      "status": "PASS",
+      "provenance": "SERVICE_EXECUTED",
+      "method": "ProviderDispatchService.dispatchScheduled + SyntheticLocalCliAdapter(ProcessRunner.execute)",
+      "execution_id": "962f4e99-b74a-47a6-9a74-4646e787a05a",
+      "authorization_final_status": "DISPATCHED",
+      "process_run_id": "3497a19b-992b-4f5c-9e38-22fbefb60452",
+      "subprocess_pid": 10704,
+      "subprocess_exit_code": 0,
+      "worktree_head_sha": "b296d17e47fe573b359c661a27aca81d2c2e5266"
+    },
+    "step_09_quarantined_submission": {
+      "status": "PASS",
+      "provenance": "SERVICE_EXECUTED",
+      "method": "McpSubmissionAuthorityService.submitCoderClaim",
+      "submission_id": "eea8b15a-f576-46c8-b151-b8c0ee4629e5",
+      "submission_status": "QUARANTINED",
+      "claim_content_hash": "b4b460065e57cb41c4fdd8cad23b541fdedbe724a61d577e9e080db7419c9e2b"
+    },
+    "step_10_mid_task_handoff": {
+      "status": "NOT_EXERCISED (CONDITIONAL)",
+      "provenance": "NOT_EXERCISED",
+      "reason": "Single-attempt rehearsal without pre-relinquishment cancellation, quota exhaustion, or agent-switch triggers. Handoff is conditional and only exercised when mid-task transfer is required."
+    },
+    "step_11_adjudication_admission": {
+      "status": "PASS",
+      "provenance": "SERVICE_EXECUTED",
+      "method": "CoderSubmissionAdjudicationService.admitSubmissionForVerification",
+      "adjudication_id": "689bfac9-f247-45c5-b472-b80840c43914",
+      "workspace_lease_id": "3b680f93-2707-4ecd-af2b-1a109dffd192"
+    },
+    "step_12_verification_settlement": {
+      "status": "PASS",
+      "provenance": "SERVICE_EXECUTED",
+      "method": "VerificationService.runTests + CoderSubmissionAdjudicationService",
+      "adjudication_status": "VERIFIED",
+      "disposition_id": "6cca8d05-7b11-4611-90b7-d056d3aaf301",
+      "disposition_event": "SETTLED",
+      "disposition_reason": "ACCEPTED_VERIFIED",
+      "task_final_state": "REVIEW_READY"
+    },
+    "step_13_reviewer_session_issuance": {
+      "status": "PASS",
+      "provenance": "SERVICE_EXECUTED",
+      "method": "ReviewerAuthorityService.issueReviewerSession",
+      "reviewer_session_id": "eedd79a1-4467-4510-ae61-1697befe7aea",
+      "projection_hash": "25d2e8eb0fdbbbaa8f5afbfa120877f0605a83e10556b22615e144a9379122b5"
+    },
+    "step_14_reviewer_stdio_read": {
+      "status": "PASS",
+      "provenance": "SERVICE_EXECUTED",
+      "method": "ReviewerAuthorityService stdio subprocess + MCP Client",
+      "reviewer_pid": 14908,
+      "read_receipts_count": 8,
+      "child_connection_zero_writes_proven": true,
+      "token_secrecy_proven": true
+    },
+    "step_15_observational_audit_and_cleanup": {
+      "status": "PASS",
+      "provenance": "SERVICE_EXECUTED",
+      "method": "performSafeCleanup + assertExited (ESRCH) + directory unlinking",
+      "subprocess_death_proven": true,
+      "reviewer_death_proven": true,
+      "temp_directory_deleted": true
+    }
+  },
+  "topology_input_configuration": {
+    "provenance": "FIXTURE_SEEDED",
+    "provider_id": "prov-synth-1dc75d3b-bddd-460e-875f-1fc0ab411fb4",
+    "coder_account_id": "acc-coder-a5a9d4bb-8c2c-4447-9603-c10095aee31f",
+    "reviewer_account_id": "acc-rev-c8665556-285b-43d9-8c32-1aa2e153b3c5",
+    "coder_resource_id": "res-coder-fb44cc36-84d7-4c8d-a73b-5b314bf4c08f",
+    "reviewer_resource_id": "res-rev-6d8925bd-ceac-4952-a9b9-574867e0a781",
+    "worker_slot_id": "slot-synth-b5ba89fa-ce84-4a40-a61c-6a559bec6373",
+    "initial_worker_slot_status": "IDLE",
+    "project_id": "proj-synth-bf7d842a-e5ee-4434-8561-cabb131651af"
+  },
+  "terminal_outcome": {
+    "task_state": "REVIEW_READY",
+    "adjudication_status": "VERIFIED",
+    "disposition_event": "SETTLED",
+    "disposition_reason": "ACCEPTED_VERIFIED"
+  },
+  "sign_off": {
+    "operator": "Synthetic Rehearsal Pipeline",
+    "audit_status": "PENDING_FORMAL_R5L1_CLOSURE",
+    "manifest_sha256": "b74ec3c13bf0e9a5a240fc7507982e6367eda218640c7169ef553b07b29f5048"
+  }
+}
