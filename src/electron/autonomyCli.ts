@@ -10,6 +10,7 @@ import { ProcessRunner } from '../core/services/ProcessRunner';
 import { SelfHostTaskSchema } from '../core/autonomy/contracts';
 import { assertPathContained } from '../core/services/ArtifactStore';
 import crypto from 'crypto';
+import { GithubCiObserver } from '../core/autonomy/github';
 
 const controlRepo = process.env.AGENT_FORGE_CONTROL_REPO ?? process.cwd();
 const worktreeRoot = process.env.AGENT_FORGE_WORKTREE_ROOT ?? path.resolve(controlRepo, '..', 'AI', 'Agent-Forge-Worktrees');
@@ -79,6 +80,7 @@ async function main(): Promise<number> {
   if (command === 'doctor') return doctor();
   const store = AutonomyStore.open(runtimeRoot);
   const supervisor = new AutonomySupervisor({ store: store.store, mode: command === 'shadow' ? 'SHADOW' : 'PILOT', runtimeRoot, controlRepo, worktreeRoot });
+  const ci = new GithubCiObserver(store.store, controlRepo, supervisor.manager);
   if (command === 'status') { process.stdout.write(`${JSON.stringify({ mode: supervisor.mode, maxWorkers: supervisor.maxWorkers, orders: supervisor.store.listAll(), activeSlots: supervisor.store.listActiveSlots(), runtimeRoot })}\n`); return 0; }
   if (command === 'stop') { store.store.requestStop(); process.stdout.write('Stop requested in durable state.\n'); return 0; }
   if (command === 'enqueue') {
@@ -86,6 +88,17 @@ async function main(): Promise<number> {
     assertPathContained(file, runtimeRoot);
     store.store.enqueue(SelfHostTaskSchema.parse(JSON.parse(fs.readFileSync(file, 'utf8'))));
     process.stdout.write('Task enqueued in SQLite.\n'); return 0;
+  }
+  if (command === 'register-ci') {
+    const file = path.resolve(process.argv[3] ?? '');
+    assertPathContained(file, runtimeRoot);
+    const input = JSON.parse(fs.readFileSync(file, 'utf8')) as { task_id: string; work_order_id?: string | null; repository: string; pr_number: number; branch: string; expected_head_sha: string };
+    const watch = ci.register({ taskId: input.task_id, workOrderId: input.work_order_id, repository: input.repository, prNumber: input.pr_number, branch: input.branch, expectedHeadSha: input.expected_head_sha });
+    process.stdout.write(`${JSON.stringify(watch)}\n`); return 0;
+  }
+  if (command === 'observe') {
+    const observations = await ci.observeDue();
+    process.stdout.write(`${JSON.stringify(observations)}\n`); return 0;
   }
   const owner = store.store.acquireOwner();
   const cancellation = setInterval(() => { if (store.store.shouldStop()) void ProcessRunner.terminateAllProcesses(); }, 1000);
@@ -104,15 +117,24 @@ async function main(): Promise<number> {
     process.stdout.write('Agent Forge PILOT supervisor started (one worker; no push or merge).\n');
     while (!store.store.shouldStop()) {
       const task = store.store.claimNext();
-      if (!task) { await new Promise((resolve) => setTimeout(resolve, 1000)); continue; }
-      try {
+      if (task) try {
         const result = await runDisposableSelfHostProof({ controlRepo, worktreeRoot, supervisor, task });
+        let publishedHead: string | null = null;
+        if (result.result.accepted) {
+          publishedHead = await ci.publishAcceptedRepair(task.task_id, result.worktree, result.branch);
+        }
         store.store.event(task.task_id, 'TASK_SETTLED', { accepted: result.result.accepted ?? false, state: result.result.state, worktree: result.worktree, branch: result.branch, error: result.result.error });
-        process.stdout.write(`${JSON.stringify({ task: task.task_id, accepted: result.result.accepted ?? false, state: result.result.state })}\n`);
+        process.stdout.write(`${JSON.stringify({ task: task.task_id, accepted: result.result.accepted ?? false, state: result.result.state, publishedHead })}\n`);
       } catch (error) {
         store.store.event(task.task_id, 'TASK_BLOCKED', { error: redact(String(error)) });
         process.stdout.write(`${task.task_id}: BLOCKED\n`);
       }
+      try {
+        for (const observation of await ci.observeDue()) process.stdout.write(`${JSON.stringify({ ci: observation.watch.pr_number, conclusion: observation.conclusion, headSha: observation.headSha, repairTaskId: observation.repairTaskId })}\n`);
+      } catch (error) {
+        process.stdout.write(`CI observer retry deferred: ${redact(String(error))}\n`);
+      }
+      if (!task) await new Promise((resolve) => setTimeout(resolve, 1000));
     }
     return 0;
   }

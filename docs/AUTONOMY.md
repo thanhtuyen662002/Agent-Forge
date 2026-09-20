@@ -55,6 +55,8 @@ npm.cmd run autonomy:start
 npm.cmd run autonomy:status
 npm.cmd run autonomy:stop
 npm.cmd run autonomy:recover
+npm.cmd run autonomy:observe
+npm.cmd run autonomy:register-ci <runtime-watch-json>
 ```
 
 Doctor exercises live provider contracts and disposable worktree creation/removal.
@@ -101,16 +103,33 @@ bypass a fence. Inspect PIDs, registration, branch, HEAD, and diff before a new
 authorized attempt. Full automatic orphan/process reconciliation remains backlog.
 
 Reviews survive restart. No remote branch or PR is inferred from local PASS.
-CI_WAIT slot release is available as a primitive; automatic GitHub publication
-and CI polling are not wired into this kernel.
+CI_WAIT releases the Antigravity slot. The GitHub observer now binds a Draft PR
+to its repository, branch, task, and exact expected head SHA; polls checks with
+bounded exponential backoff; fetches failed job logs through `gh run view
+--log-failed`; persists sanitized evidence; and transitions CI_WAIT to
+MERGE_READY or REPAIR. A machine-readable REPAIR diagnosis creates a durable
+repair request. After a locally accepted repair, the Supervisor commits only
+allowed files and pushes with `--force-with-lease` against the exact observed
+head before returning the watch to CI_WAIT. A changed PR head, non-Draft PR,
+branch mismatch, duplicate claim, missing review, or push lease mismatch fails
+closed.
+
+Register a watch using a JSON file under the runtime root:
+
+```json
+{"task_id":"task-1","work_order_id":"<sqlite-work-order-id>","repository":"owner/repo","pr_number":62,"branch":"agent/task-1","expected_head_sha":"<40-char-sha>"}
+```
+
+`autonomy:observe` performs one due poll. `autonomy:start` performs the same
+bounded observation between durable task dispatches; it does not busy-poll.
 
 ## Next work through the self-host supervisor
 
 Integrate existing product task/authorization/lease services, manager-selected
-dependencies, cooldowns, process recovery proofs, GitHub claims and Draft PRs,
-CI_WAIT observation, and supervised self-update. Multi-worker scheduling and
-automatic integration remain disabled. Keep the running version fixed and
-implement self-development in worktrees before reviewing and updating it.
+dependencies, cooldowns, process recovery proofs, provider failover, and
+supervised self-update. Multi-worker scheduling and automatic integration
+remain disabled. Keep the running version fixed and implement self-development
+in worktrees before reviewing and updating it.
 
 The all-target fast-pr.yml supplements main-target CI. Windows/Ubuntu checks,
 Windows packaging, installed-app verification, and RC verification remain.

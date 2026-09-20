@@ -28,6 +28,23 @@ export interface AutonomySlot {
   leaseEpoch: number;
 }
 
+export interface AutonomyCiWatch {
+  id: string;
+  task_id: string;
+  work_order_id: string | null;
+  repository: string;
+  pr_number: number;
+  branch: string;
+  expected_head_sha: string;
+  state: 'CI_WAIT' | 'CI_SUCCESS' | 'CI_FAILURE' | 'REPAIR_QUEUED' | 'BLOCKED';
+  repair_task_id: string | null;
+  poll_attempt: number;
+  next_poll_at: string;
+  last_observed_at: string | null;
+  created_at: string;
+  updated_at: string;
+}
+
 /**
  * Autonomy state is an extension owned by the supervisor. The product migration
  * ledger is intentionally immutable at v24; this initializer is idempotent and
@@ -69,6 +86,15 @@ export const AUTONOMY_SCHEMA_SQL = `
     id TEXT PRIMARY KEY, work_order_id TEXT, event_type TEXT NOT NULL, payload_json TEXT NOT NULL, created_at TEXT NOT NULL
   );
   CREATE INDEX IF NOT EXISTS idx_autonomy_events_order ON autonomy_events(work_order_id, created_at);
+  CREATE TABLE IF NOT EXISTS autonomy_ci_watches (
+    id TEXT PRIMARY KEY, task_id TEXT NOT NULL, work_order_id TEXT,
+    repository TEXT NOT NULL, pr_number INTEGER NOT NULL, branch TEXT NOT NULL,
+    expected_head_sha TEXT NOT NULL, state TEXT NOT NULL CHECK(state IN ('CI_WAIT','CI_SUCCESS','CI_FAILURE','REPAIR_QUEUED','BLOCKED')),
+    repair_task_id TEXT, poll_attempt INTEGER NOT NULL DEFAULT 0,
+    next_poll_at TEXT NOT NULL, last_observed_at TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
+    UNIQUE(repository, pr_number)
+  );
+  CREATE INDEX IF NOT EXISTS idx_autonomy_ci_watches_due ON autonomy_ci_watches(state, next_poll_at);
   CREATE TABLE IF NOT EXISTS autonomy_owner (id INTEGER PRIMARY KEY CHECK(id=1), pid INTEGER NOT NULL, token TEXT NOT NULL, stop_requested INTEGER NOT NULL DEFAULT 0);
 `;
 
@@ -222,6 +248,63 @@ export class AutonomyStore {
       if (String(error).includes('UNIQUE')) return false;
       throw error;
     }
+  }
+
+  reconcileExternalClaim(source: string, externalId: string, workOrderId: string, headSha: string, state: string): 'CREATED' | 'MATCHED' {
+    return this.db.transaction(() => {
+      const existing = this.db.prepare('SELECT work_order_id,head_sha FROM autonomy_claims WHERE source=? AND external_id=?').get(source, externalId) as { work_order_id: string; head_sha: string } | undefined;
+      if (existing) {
+        if (existing.work_order_id !== workOrderId) throw new Error('DUPLICATE_GITHUB_CLAIM');
+        this.db.prepare('UPDATE autonomy_claims SET head_sha=?,state=?,observed_at=? WHERE source=? AND external_id=?').run(headSha, state, new Date().toISOString(), source, externalId);
+        return 'MATCHED';
+      }
+      this.db.prepare('INSERT INTO autonomy_claims (claim_key,source,external_id,work_order_id,head_sha,state,observed_at) VALUES (?,?,?,?,?,?,?)')
+        .run(`${source}:${externalId}`, source, externalId, workOrderId, headSha, state, new Date().toISOString());
+      return 'CREATED';
+    })();
+  }
+
+  registerCiWatch(input: { taskId: string; workOrderId?: string | null; repository: string; prNumber: number; branch: string; expectedHeadSha: string }): AutonomyCiWatch {
+    return this.db.transaction(() => {
+      const now = new Date().toISOString();
+      const existing = this.db.prepare('SELECT * FROM autonomy_ci_watches WHERE repository=? AND pr_number=?').get(input.repository, input.prNumber) as AutonomyCiWatch | undefined;
+      if (existing) {
+        if (existing.task_id !== input.taskId || existing.branch !== input.branch || existing.expected_head_sha !== input.expectedHeadSha) throw new Error('DUPLICATE_GITHUB_CLAIM');
+        return existing;
+      }
+      const row: AutonomyCiWatch = {
+        id: crypto.randomUUID(), task_id: input.taskId, work_order_id: input.workOrderId ?? null,
+        repository: input.repository, pr_number: input.prNumber, branch: input.branch,
+        expected_head_sha: input.expectedHeadSha.toLowerCase(), state: 'CI_WAIT', repair_task_id: null,
+        poll_attempt: 0, next_poll_at: now, last_observed_at: null, created_at: now, updated_at: now,
+      };
+      this.db.prepare(`INSERT INTO autonomy_ci_watches (id,task_id,work_order_id,repository,pr_number,branch,expected_head_sha,state,repair_task_id,poll_attempt,next_poll_at,last_observed_at,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)`)
+        .run(row.id,row.task_id,row.work_order_id,row.repository,row.pr_number,row.branch,row.expected_head_sha,row.state,row.repair_task_id,row.poll_attempt,row.next_poll_at,row.last_observed_at,row.created_at,row.updated_at);
+      this.event(input.workOrderId ?? input.taskId, 'CI_WATCH_REGISTERED', row);
+      return row;
+    })();
+  }
+
+  listDueCiWatches(now = new Date().toISOString()): AutonomyCiWatch[] {
+    return this.db.prepare("SELECT * FROM autonomy_ci_watches WHERE state IN ('CI_WAIT','CI_FAILURE') AND next_poll_at<=? ORDER BY next_poll_at").all(now) as AutonomyCiWatch[];
+  }
+
+  getCiWatchForRepairTask(taskId: string): AutonomyCiWatch | null {
+    return (this.db.prepare('SELECT * FROM autonomy_ci_watches WHERE repair_task_id=?').get(taskId) as AutonomyCiWatch | undefined) ?? null;
+  }
+
+  updateCiWatch(id: string, changes: Partial<Pick<AutonomyCiWatch, 'work_order_id' | 'expected_head_sha' | 'state' | 'repair_task_id' | 'poll_attempt' | 'next_poll_at' | 'last_observed_at'>>): void {
+    const entries = Object.entries(changes);
+    if (!entries.length) return;
+    const allowed = new Set(['work_order_id','expected_head_sha','state','repair_task_id','poll_attempt','next_poll_at','last_observed_at']);
+    if (entries.some(([key]) => !allowed.has(key))) throw new Error('CI_WATCH_UPDATE_INVALID');
+    const fields = entries.map(([key]) => `${key}=?`).join(',');
+    const result = this.db.prepare(`UPDATE autonomy_ci_watches SET ${fields},updated_at=? WHERE id=?`).run(...entries.map(([, value]) => value), new Date().toISOString(), id);
+    if (result.changes !== 1) throw new Error('CI_WATCH_NOT_FOUND');
+  }
+
+  findLatestWorkOrderByTask(taskId: string): AutonomyWorkOrderRow | null {
+    return (this.db.prepare('SELECT * FROM autonomy_work_orders WHERE task_id=? ORDER BY attempt DESC LIMIT 1').get(taskId) as AutonomyWorkOrderRow | undefined) ?? null;
   }
 
   listActiveSlots(): AutonomySlot[] {
