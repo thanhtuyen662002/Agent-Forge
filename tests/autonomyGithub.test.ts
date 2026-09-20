@@ -61,4 +61,3 @@ describe('durable GitHub CI observation', () => {
     db.close();
   });
 });
-
