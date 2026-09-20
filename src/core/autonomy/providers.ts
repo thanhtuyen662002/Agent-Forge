@@ -180,7 +180,7 @@ export class CodexManagerAdapter {
     // Plain non-interactive output is the most portable Codex contract across
     // installed versions. The prompt requires one JSON object, and the
     // parser independently validates it before accepting the decision.
-    const run = await this.run([...this.execArgs(), prompt], input.workOrder.worktree, '');
+    const run = await this.run([...this.execArgs(), '-'], input.workOrder.worktree, prompt);
     if (run.status !== 'SUCCESSFUL_PROCESS_EXIT') return { run };
     try {
       const review = ManagerReviewSchema.parse(parseManagerReview(run.stdout));
@@ -200,7 +200,7 @@ export class CodexManagerAdapter {
       'Use no forbidden paths and keep the task limited to the objective.',
       JSON.stringify({ protocol_version: 'workorder.v1', ...seed, issue_number: null, dependencies: [], allowed_paths: seed.allowed_paths ?? [], forbidden_paths: seed.forbidden_paths ?? ['.git', 'main', 'D:/Projects/Agent-Forge'], required_tests: seed.required_tests ?? [], context_files: [], constraints: seed.constraints ?? [], attempt: 1, lease_epoch: 1 }),
     ].join('\n');
-    const run = await this.run([...this.execArgs(), prompt], seed.worktree, '');
+    const run = await this.run([...this.execArgs(), '-'], seed.worktree, prompt);
     if (run.status !== 'SUCCESSFUL_PROCESS_EXIT') return { run };
     try {
       const workOrder = parseWorkOrder(run.stdout);

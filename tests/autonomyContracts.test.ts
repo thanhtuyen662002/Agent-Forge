@@ -97,7 +97,8 @@ describe('autonomy durable contracts', () => {
     const root = worktree();
     const seeded = order(root);
     const manager = new CodexManagerAdapter({ executable: 'fake', runner: async (options) => {
-      expect(options.stdin).toBe('');
+      expect(options.stdin).toContain(seeded.task_id);
+      expect(options.args.at(-1)).toBe('-');
       return processResult({ stdout: JSON.stringify({ ...seeded, worktree: process.cwd() }) });
     } });
     const result = await manager.plan(seeded);
