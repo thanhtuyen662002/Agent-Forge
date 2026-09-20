@@ -269,8 +269,11 @@ export class AutonomyStore {
       const now = new Date().toISOString();
       const existing = this.db.prepare('SELECT * FROM autonomy_ci_watches WHERE repository=? AND pr_number=?').get(input.repository, input.prNumber) as AutonomyCiWatch | undefined;
       if (existing) {
-        if (existing.task_id !== input.taskId || existing.branch !== input.branch || existing.expected_head_sha !== input.expectedHeadSha) throw new Error('DUPLICATE_GITHUB_CLAIM');
-        return existing;
+        if (existing.task_id !== input.taskId || existing.branch !== input.branch) throw new Error('DUPLICATE_GITHUB_CLAIM');
+        const now = new Date().toISOString();
+        this.db.prepare("UPDATE autonomy_ci_watches SET expected_head_sha=?,state='CI_WAIT',repair_task_id=NULL,poll_attempt=0,next_poll_at=?,last_observed_at=NULL,updated_at=? WHERE id=?")
+          .run(input.expectedHeadSha.toLowerCase(), now, now, existing.id);
+        return this.db.prepare('SELECT * FROM autonomy_ci_watches WHERE id=?').get(existing.id) as AutonomyCiWatch;
       }
       const row: AutonomyCiWatch = {
         id: crypto.randomUUID(), task_id: input.taskId, work_order_id: input.workOrderId ?? null,
