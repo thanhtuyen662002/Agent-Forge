@@ -1,8 +1,9 @@
 import path from 'path';
-import { spawnSync } from 'child_process';
 import { ManagerReview, SelfHostTask, WorkOrder, sanitizeAutonomyText } from './contracts';
 import { AutonomyCiWatch, AutonomyStore } from './store';
 import { CodexManagerAdapter, ManagerEvidence, ProviderRun } from './providers';
+import { ProcessRunner } from '../services/ProcessRunner';
+import { Repository } from '../database/repositories';
 
 export type CiConclusion = 'PENDING' | 'SUCCESS' | 'FAILURE';
 
@@ -38,9 +39,9 @@ type Command = (executable: string, args: string[], cwd: string) => Promise<Comm
 const successConclusions = new Set(['SUCCESS', 'NEUTRAL', 'SKIPPED', 'PASS']);
 const failureConclusions = new Set(['FAILURE', 'CANCELLED', 'TIMED_OUT', 'ACTION_REQUIRED', 'STARTUP_FAILURE', 'STALE']);
 
-function defaultCommand(executable: string, args: string[], cwd: string): Promise<CommandResult> {
-  const result = spawnSync(executable, args, { cwd, encoding: 'utf8', windowsHide: true, shell: false, timeout: 60_000 });
-  return Promise.resolve({ status: result.status, stdout: String(result.stdout ?? ''), stderr: String(result.stderr ?? '') });
+async function defaultCommand(repository: Repository, executable: string, args: string[], cwd: string): Promise<CommandResult> {
+  const result = await ProcessRunner.execute({ executable, args, cwd, timeoutMs: 60_000, allowShell: false, stdin: '', repo: repository });
+  return { status: result.exitCode, stdout: result.stdout, stderr: result.stderr || result.error?.message || '' };
 }
 
 function parseJson<T>(output: string): T {
@@ -69,8 +70,12 @@ export class GithubCiObserver {
     private readonly store: AutonomyStore,
     private readonly controlRepo: string,
     private readonly manager?: CodexManagerAdapter,
-    private readonly command: Command = defaultCommand,
-  ) {}
+    command?: Command,
+  ) {
+    this.command = command ?? ((executable, args, cwd) => defaultCommand(new Repository(store.getDatabase()), executable, args, cwd));
+  }
+
+  private readonly command: Command;
 
   register(input: { taskId: string; workOrderId?: string | null; repository: string; prNumber: number; branch: string; expectedHeadSha: string }): AutonomyCiWatch {
     if (!/^[0-9a-f]{40}$/i.test(input.expectedHeadSha)) throw new Error('CONTRACT_INVALID: expected PR head must be a Git SHA');
