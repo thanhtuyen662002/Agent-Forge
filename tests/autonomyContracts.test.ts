@@ -154,4 +154,14 @@ describe('autonomy durable contracts', () => {
     expect(store.listActiveSlots()).toHaveLength(0);
     db.close();
   });
+
+  it('keeps containment case-sensitive on POSIX while preserving Windows folding', () => {
+    const control = fs.mkdtempSync(path.join(os.tmpdir(), 'Control-'));
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'MixedCase-'));
+    const candidate = path.join(root, 'WorkerCase'); fs.mkdirSync(candidate);
+    expect(AutonomySupervisor.isSafeWorktree(control, candidate)).toBe(true);
+    expect(AutonomySupervisor.isSafeWorktree(control, control)).toBe(false);
+    expect(AutonomySupervisor.isSafeWorktree(control, path.join(control, 'child'))).toBe(false);
+    fs.rmSync(root, { recursive: true, force: true }); fs.rmSync(control, { recursive: true, force: true });
+  });
 });

@@ -180,8 +180,15 @@ export class AutonomySupervisor {
   }
 
   static isSafeWorktree(controlRepo: string, worktree: string): boolean {
-    const control = path.resolve(controlRepo).toLowerCase();
-    const candidate = path.resolve(worktree).toLowerCase();
-    return candidate !== control && !candidate.startsWith(`${control}${path.sep}`) && fs.existsSync(candidate);
+    const controlResolved = path.resolve(controlRepo);
+    const candidateResolved = path.resolve(worktree);
+    // Resolve the filesystem using the original spelling. Lowercasing before
+    // existsSync breaks POSIX paths with mixed-case temp directory names.
+    if (!fs.existsSync(candidateResolved)) return false;
+    const normalize = (value: string) => process.platform === 'win32' ? value.toLowerCase() : value;
+    const control = normalize(controlResolved);
+    const candidate = normalize(candidateResolved);
+    const relative = path.relative(control, candidate);
+    return candidate !== control && !relative.startsWith('..') && !path.isAbsolute(relative);
   }
 }
