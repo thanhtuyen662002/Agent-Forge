@@ -19,7 +19,9 @@ Agent-Forge guarantees that the durable source of truth resides entirely in:
 
 ---
 
-## Current Status: `DEMO_READINESS_I18N_AUTO_UPDATE`
+## Current Status: `AUTONOMY_BOOTSTRAP_PILOT`
+
+The experimental PILOT kernel runs Codex planning/review and Antigravity file edits in isolated worktrees, captures independent Git/test evidence, and persists attempts in SQLite. It starts with one worker. Product task/authorization integration, complete crash reconciliation, automatic GitHub/CI handling, and multi-worker operation remain backlog work; see [the implemented boundaries](docs/AUTONOMY.md).
 
 - **Core Foundation & Database Migrations (PR #1)**: **IMPLEMENTED & VERIFIED** (SQLite WAL mode, strict foreign keys, state machine, Git ground truth).
 - **Continuous Integration Pipeline (PR #2)**: **IMPLEMENTED & VERIFIED** (Multi-platform Windows & Ubuntu CI with diff hygiene).
@@ -30,7 +32,7 @@ Agent-Forge guarantees that the durable source of truth resides entirely in:
 - **Owner Routing & Manual Bridge UI Loop (PR #8)**: **IMPLEMENTED & VERIFIED** (Human-in-the-Loop routing controller, explicit candidate reordering, truthful UNKNOWN quota rendering, typed single-argument dispatch IPC, 1-click WorkOrder copy, and durable restart reconstruction).
 - **Demo Readiness, Bilingual i18n & Installed-App Updates (PR #9)**: **IMPLEMENTED & VERIFIED** (Vietnamese `vi-VN` and English `en-US` typed translation dictionaries with 100% key parity, durable locale persistence, visible versioning, installed-app update foundation with `electron-updater`, live progress, Owner-controlled restart/install, and safe restart guards).
 - **Cross-Provider Handoff & Crash Recovery Closure (R5I1–R5I7)**: **IMPLEMENTED & VERIFIED** (Atomic multi-provider handoff lifecycle across discrete roles/accounts/slots, monotonic `ownership_epoch` fencing, SHA-256 context manifest binding, guarded worker slot leasing, crash recovery scanner with fenced reconciliation, and 20-point end-to-end integration proof matrix).
-- **Automated Production Providers**: Production Codex CLI remains `OFFLINE` (`capabilities=[]`, fails closed without spawning processes) on hosts without verified contracts. System operates reliably via the **Owner Manual Bridge**.
+- **Experimental PILOT Providers**: Separate CLI adapters support Codex manager/reviewer and Antigravity file editing. Existing desktop provider routing remains unchanged. Live contracts and a disposable proof are required before self-development.
 - **Code Signing Status**: **UNSIGNED DESKTOP FOUNDATION** (`CODE_SIGNED=NO`; Windows executable is unsigned; explicitly noted in About and Update UI).
 
 ---
@@ -61,8 +63,16 @@ Agent-Forge incorporates a secure, human-in-the-loop update foundation:
 
 ## Operating Modes
 
-### Human-in-the-Loop Operating Mode (Owner Manual Relay)
-In the current release, the human owner operates the manual routing and handoff loop from the desktop UI:
+### Operating mode and autonomous loop
+The desktop manual bridge remains available. The experimental PILOT Supervisor runs this local loop:
+1. Recover durable state and fence unfinished child processes and interrupted attempts.
+2. Select executable READY work, acquire a task lease and worker slot, and create an isolated worktree bound to an exact base SHA.
+3. Generate a versioned WorkOrder and run `agy -p` only inside that worktree.
+4. Recompute Git status/diff/changed files and deterministic test outcomes independently of worker claims.
+5. Ask structured Codex for PASS, REPAIR, or BLOCKED; reject stale reviewed HEADs and repair in the same fenced worktree.
+6. Persist local acceptance and release the implementation slot. Automatic Draft PR publication and CI monitoring are future self-host tasks.
+
+The manual bridge remains available for explicit owner-controlled execution:
 1. Owner pastes **ChatGPT Manager** responses into the **Manager Inbox** to record and apply `EXECUTE` / `FIX_REQUIRED` protocol decisions.
 2. In the **Owner Routing / Handoff** view, the Owner reviews task authority, explicitly selects and orders candidate `ProviderResource` instances (starts empty; no implicit provider auto-selection), and explicitly opts into Manual Bridge fallback.
 3. The Owner triggers deterministic routing (`ProviderRoutingService.route`) and generates an immutable `ExecutionAuthorization` bound to durable Manager authority and Git repository HEAD.
@@ -157,3 +167,4 @@ npm run package:win
 - [Protocols & Idempotent Messaging](docs/PROTOCOLS.md)
 - [Threat Model & Security Boundary](docs/THREAT_MODEL.md)
 - [Security & Process Execution Policy](docs/SECURITY.md)
+- [Autonomous Engineering Loop](docs/AUTONOMY.md)
