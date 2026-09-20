@@ -189,6 +189,6 @@ export class AutonomySupervisor {
     const control = normalize(controlResolved);
     const candidate = normalize(candidateResolved);
     const relative = path.relative(control, candidate);
-    return candidate !== control && !relative.startsWith('..') && !path.isAbsolute(relative);
+    return candidate !== control && (relative.startsWith('..') || path.isAbsolute(relative));
   }
 }
