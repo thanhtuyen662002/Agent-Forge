@@ -6,12 +6,14 @@ import { CodexManagerAdapter } from './providers';
 import { AutonomousTaskSpec, SelfHostTask, createWorkOrder } from './contracts';
 import { AutonomySupervisor, SupervisorRunResult } from './supervisor';
 import { GitWorktreeService } from '../services/GitWorktreeService';
+import { ManagerProviderPool } from './managerPool';
 
 export interface SelfHostProofOptions {
   controlRepo: string;
   worktreeRoot: string;
   supervisor: AutonomySupervisor;
   manager?: CodexManagerAdapter;
+  managerPool?: ManagerProviderPool;
   task?: SelfHostTask;
 }
 
@@ -48,7 +50,7 @@ export async function runDisposableSelfHostProof(options: SelfHostProofOptions):
   const branchResult = git(['switch', '-c', branch], worktree);
   if (!branchResult.ok) throw new Error(`SELF_HOST_BRANCH_CREATE_FAILED: ${branchResult.stderr || branchResult.stdout}`);
 
-  const manager = options.manager ?? supervisor.manager;
+  const managerPool = options.managerPool ?? (options.manager ? ManagerProviderPool.fromPrimary(supervisor.store, options.manager) : supervisor.managerPool);
   const seed: AutonomousTaskSpec = {
     taskId,
     issueNumber: null,
@@ -70,7 +72,9 @@ export async function runDisposableSelfHostProof(options: SelfHostProofOptions):
   const planned = authorized ? {
     workOrder: createWorkOrder(seed),
     run: { status: 'SUCCESSFUL_PROCESS_EXIT' as const, exitCode: 0, executionId: '', stdout: '', stderr: '', durationMs: 0 },
-  } : await manager.plan({
+    resource_id: 'authorized',
+    attempts: [],
+  } : await managerPool.plan({
     task_id: seed.taskId, worker_id: seed.workerId, objective: seed.objective,
     base_sha: seed.baseSha, branch: seed.branch, worktree: seed.worktree,
     acceptance_criteria: seed.acceptanceCriteria,

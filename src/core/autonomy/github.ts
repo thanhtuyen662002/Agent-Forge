@@ -1,9 +1,10 @@
 import path from 'path';
 import { ManagerReview, SelfHostTask, WorkOrder, sanitizeAutonomyText } from './contracts';
 import { AutonomyCiWatch, AutonomyStore } from './store';
-import { CodexManagerAdapter, ManagerEvidence, ProviderRun } from './providers';
+import { CodexManagerAdapter, ProviderRun } from './providers';
 import { ProcessRunner } from '../services/ProcessRunner';
 import { Repository } from '../database/repositories';
+import { ManagerProviderPool, buildManagerContextPackage } from './managerPool';
 
 export type CiConclusion = 'PENDING' | 'SUCCESS' | 'FAILURE';
 
@@ -66,16 +67,24 @@ function runId(url: string | null | undefined): string | null {
 }
 
 export class GithubCiObserver {
+  private readonly managerPool?: ManagerProviderPool;
+  private readonly command: Command;
+
   constructor(
     private readonly store: AutonomyStore,
     private readonly controlRepo: string,
-    private readonly manager?: CodexManagerAdapter,
+    manager?: CodexManagerAdapter | ManagerProviderPool,
     command?: Command,
   ) {
+    if (manager instanceof ManagerProviderPool) {
+      this.managerPool = manager;
+    } else if (manager instanceof CodexManagerAdapter) {
+      this.managerPool = ManagerProviderPool.fromPrimary(store, manager);
+    } else if (manager && typeof (manager as any).review === 'function') {
+      this.managerPool = manager as ManagerProviderPool;
+    }
     this.command = command ?? ((executable, args, cwd) => defaultCommand(new Repository(store.getDatabase()), executable, args, cwd));
   }
-
-  private readonly command: Command;
 
   register(input: { taskId: string; workOrderId?: string | null; repository: string; prNumber: number; branch: string; expectedHeadSha: string }): AutonomyCiWatch {
     if (!/^[0-9a-f]{40}$/i.test(input.expectedHeadSha)) throw new Error('CONTRACT_INVALID: expected PR head must be a Git SHA');
@@ -131,10 +140,38 @@ export class GithubCiObserver {
     this.store.updateCiWatch(watch.id, { state: 'CI_FAILURE', poll_attempt: watch.poll_attempt + 1, next_poll_at: nextPoll(watch.poll_attempt), last_observed_at: observedAt });
     this.store.event(watch.work_order_id ?? watch.task_id, 'CI_FAILURE_EVIDENCE', { headSha, evidence, checks: pr.statusCheckRollup ?? [] });
     const row = watch.work_order_id ? this.store.getWorkOrder(watch.work_order_id) : null;
-    if (!row || !this.manager) return { watch, conclusion, headSha, evidence };
-    const reviewResult = await this.manager.review({ workOrder: JSON.parse(row.payload_json) as WorkOrder, evidence: JSON.stringify({ pull_request: pr, headSha, ci_evidence: evidence }) } satisfies ManagerEvidence);
+    if (!row || !this.managerPool) return { watch, conclusion, headSha, evidence };
+    const order = JSON.parse(row.payload_json) as WorkOrder;
+    const context = buildManagerContextPackage({
+      workOrder: order,
+      currentHead: headSha,
+      actualDiff: evidence,
+      changedFiles: order.allowed_paths,
+      deterministicTests: pr.statusCheckRollup ?? [],
+      previousManagerDecisions: this.store.getDatabase().prepare('SELECT payload_json FROM autonomy_reviews WHERE work_order_id=? ORDER BY created_at').all(row.id),
+      repairHistory: this.store.getDatabase().prepare("SELECT payload_json FROM autonomy_events WHERE work_order_id=? AND event_type IN ('REPAIR_REQUIRED','CI_REPAIR_QUEUED') ORDER BY created_at").all(row.id),
+      prState: pr,
+      ciState: {
+        watch_id: watch.id,
+        repository: watch.repository,
+        pr_number: watch.pr_number,
+        branch: watch.branch,
+        expected_head_sha: watch.expected_head_sha,
+        status_checks: pr.statusCheckRollup ?? [],
+        failure_evidence: evidence,
+      },
+      architecturePolicyContext: [
+        'Supervisor owns leases, worktrees, GitHub, and verification.',
+        'Diagnose CI failure from check logs; verdict must be REPAIR if actionable or BLOCKED if fatal.',
+        'PASS requires reviewed_head_sha equal to current evidence HEAD.',
+      ],
+    });
+    const reviewResult = await this.managerPool.review(context);
     this.store.recordRun(row.id, 'codex-ci-review', reviewResult.run);
     if (!reviewResult.review) {
+      if (reviewResult.run.stderr === 'ALL_MANAGER_RESOURCES_UNAVAILABLE') {
+        this.store.event(row.id, 'MANAGER_CAPACITY_UNAVAILABLE', { attempts: reviewResult.attempts, contextSha: reviewResult.context_sha });
+      }
       this.store.event(row.id, 'CI_DIAGNOSIS_BLOCKED', { status: reviewResult.run.status, error: reviewResult.run.error, stderr: reviewResult.run.stderr });
       return { watch, conclusion, headSha, evidence, managerRun: reviewResult.run };
     }

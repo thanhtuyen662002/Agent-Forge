@@ -7,7 +7,7 @@ import { AutonomyStore } from './store';
 import { Repository } from '../database/repositories';
 import { ProcessRunner } from '../services/ProcessRunner';
 import { assertPathContained } from '../services/ArtifactStore';
-import { ManagerProviderPool } from './managerPool';
+import { ManagerProviderPool, buildManagerContextPackage } from './managerPool';
 
 export type AutonomyMode = 'SHADOW' | 'PILOT' | 'AUTONOMOUS';
 
@@ -113,18 +113,18 @@ export class AutonomySupervisor {
         const allowed = (name: string) => order.allowed_paths.some((entry) => name === entry || name.startsWith(`${entry.replace(/\/$/, '')}/`));
         if (evidence.changedFiles.some((name) => !allowed(name) || order.forbidden_paths.some((entry) => name === entry || name.startsWith(`${entry}/`)))) throw new Error('WORKER_PATH_VIOLATION');
         this.store.updateState(row.id, 'MANAGER_REVIEW', order.lease_epoch);
-        const reviewResult = await this.managerPool.review({
-          protocol_version: 'managercontext.v1',
-          task_identity: { task_id: order.task_id, attempt: order.attempt, worker_id: order.worker_id },
-          work_order: order, acceptance_criteria: order.acceptance_criteria, base_sha: order.base_sha,
-          current_head: evidence.headSha, actual_diff: evidence.diff, changed_files: evidence.changedFiles,
-          deterministic_tests: evidence.tests,
-          previous_manager_decisions: this.store.getDatabase().prepare('SELECT payload_json FROM autonomy_reviews WHERE work_order_id=? ORDER BY created_at').all(row.id),
-          repair_history: this.store.getDatabase().prepare("SELECT payload_json FROM autonomy_events WHERE work_order_id=? AND event_type='REPAIR_REQUIRED' ORDER BY created_at").all(row.id),
-          pr_state: this.store.getDatabase().prepare('SELECT * FROM autonomy_claims WHERE work_order_id=?').all(row.id),
-          ci_state: this.store.getDatabase().prepare('SELECT * FROM autonomy_ci_watches WHERE work_order_id=?').all(row.id),
-          architecture_policy_context: ['Supervisor owns leases, worktrees, GitHub, and verification.', 'PASS requires a fresh exact HEAD match.'],
-        });
+        const reviewResult = await this.managerPool.review(buildManagerContextPackage({
+          workOrder: order,
+          currentHead: evidence.headSha,
+          actualDiff: evidence.diff,
+          changedFiles: evidence.changedFiles,
+          deterministicTests: evidence.tests,
+          previousManagerDecisions: this.store.getDatabase().prepare('SELECT payload_json FROM autonomy_reviews WHERE work_order_id=? ORDER BY created_at').all(row.id),
+          repairHistory: this.store.getDatabase().prepare("SELECT payload_json FROM autonomy_events WHERE work_order_id=? AND event_type='REPAIR_REQUIRED' ORDER BY created_at").all(row.id),
+          prState: this.store.getDatabase().prepare('SELECT * FROM autonomy_claims WHERE work_order_id=?').all(row.id),
+          ciState: this.store.getDatabase().prepare('SELECT * FROM autonomy_ci_watches WHERE work_order_id=?').all(row.id),
+          architecturePolicyContext: ['Supervisor owns leases, worktrees, GitHub, and verification.', 'PASS requires a fresh exact HEAD match.'],
+        }));
         this.store.recordRun(row.id, 'codex-review', reviewResult.run);
         if (!reviewResult.review) {
           if (reviewResult.run.stderr === 'ALL_MANAGER_RESOURCES_UNAVAILABLE') {

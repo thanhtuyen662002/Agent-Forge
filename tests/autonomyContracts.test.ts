@@ -13,7 +13,7 @@ import {
 import { AntigravityAdapter, CodexManagerAdapter } from '../src/core/autonomy/providers';
 import { AutonomyStore } from '../src/core/autonomy/store';
 import { AutonomySupervisor } from '../src/core/autonomy/supervisor';
-import { ManagerProviderPool } from '../src/core/autonomy/managerPool';
+import { ManagerProviderPool, ManagerContextPackageSchema } from '../src/core/autonomy/managerPool';
 import { EvidenceCollector } from '../src/core/autonomy/evidence';
 import { execFileSync } from 'child_process';
 
@@ -43,6 +43,7 @@ describe('autonomy durable contracts', () => {
     expect(order(path.join(os.tmpdir(), 'agentforge-worktree'))).toMatchObject({ protocol_version: 'workorder.v1', lease_epoch: 1 });
     expect(WorkerResultSchema.parse({ protocol_version: 'workerresult.v1', task_id: 't', worker_id: 'w', attempt: 1, status: 'COMPLETED', summary: 'done', changed_files: [], commands_run: [], tests: [], known_risks: [], blockers: [] })).toBeTruthy();
     expect(() => WorkerResultSchema.parse({ protocol_version: 'workerresult.v1' })).toThrow();
+    expect(ManagerContextPackageSchema.safeParse({ protocol_version: 'managercontext.v1' }).success).toBe(false);
   });
 
   it('parses only structured manager review and rejects prose', () => {

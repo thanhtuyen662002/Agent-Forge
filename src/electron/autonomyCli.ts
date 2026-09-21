@@ -80,7 +80,7 @@ async function main(): Promise<number> {
   if (command === 'doctor') return doctor();
   const store = AutonomyStore.open(runtimeRoot);
   const supervisor = new AutonomySupervisor({ store: store.store, mode: command === 'shadow' ? 'SHADOW' : 'PILOT', runtimeRoot, controlRepo, worktreeRoot });
-  const ci = new GithubCiObserver(store.store, controlRepo, supervisor.manager);
+  const ci = new GithubCiObserver(store.store, controlRepo, supervisor.managerPool);
   if (command === 'status') { process.stdout.write(`${JSON.stringify({ mode: supervisor.mode, maxWorkers: supervisor.maxWorkers, orders: supervisor.store.listAll(), activeSlots: supervisor.store.listActiveSlots(), runtimeRoot })}\n`); return 0; }
   if (command === 'stop') { store.store.requestStop(); process.stdout.write('Stop requested in durable state.\n'); return 0; }
   if (command === 'enqueue' || command === 'enqueue-authorized') {

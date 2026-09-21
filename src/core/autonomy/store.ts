@@ -104,6 +104,9 @@ export const AUTONOMY_SCHEMA_SQL = `
   CREATE TABLE IF NOT EXISTS autonomy_manager_attempts (
     id TEXT PRIMARY KEY, work_order_id TEXT, resource_id TEXT NOT NULL, context_sha TEXT NOT NULL, state TEXT NOT NULL, created_at TEXT NOT NULL
   );
+  CREATE TABLE IF NOT EXISTS autonomy_manager_contexts (
+    context_sha TEXT PRIMARY KEY, context_json TEXT NOT NULL, created_at TEXT NOT NULL
+  );
   CREATE TABLE IF NOT EXISTS autonomy_owner (id INTEGER PRIMARY KEY CHECK(id=1), pid INTEGER NOT NULL, token TEXT NOT NULL, stop_requested INTEGER NOT NULL DEFAULT 0);
 `;
 
@@ -334,6 +337,18 @@ export class AutonomyStore {
   recordManagerAttempt(workOrderId: string | null, resourceId: string, contextSha: string, state: string): void {
     this.db.prepare('INSERT INTO autonomy_manager_attempts(id,work_order_id,resource_id,context_sha,state,created_at) VALUES(?,?,?,?,?,?)')
       .run(crypto.randomUUID(), workOrderId, resourceId, contextSha, state, new Date().toISOString());
+  }
+
+  recordManagerContext(contextSha: string, contextJson: string): void {
+    this.db.prepare('INSERT OR IGNORE INTO autonomy_manager_contexts(context_sha,context_json,created_at) VALUES(?,?,?)')
+      .run(contextSha, contextJson, new Date().toISOString());
+    const persisted = this.db.prepare('SELECT context_json FROM autonomy_manager_contexts WHERE context_sha=?').get(contextSha) as { context_json: string } | undefined;
+    if (!persisted || persisted.context_json !== contextJson) throw new Error('MANAGER_CONTEXT_HASH_COLLISION');
+  }
+
+  getManagerContext(contextSha: string): string | null {
+    const row = this.db.prepare('SELECT context_json FROM autonomy_manager_contexts WHERE context_sha=?').get(contextSha) as { context_json: string } | undefined;
+    return row?.context_json ?? null;
   }
 
   listActiveSlots(): AutonomySlot[] {

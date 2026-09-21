@@ -114,16 +114,25 @@ head before returning the watch to CI_WAIT. A changed PR head, non-Draft PR,
 branch mismatch, duplicate claim, missing review, or push lease mismatch fails
 closed.
 
-Manager review uses a durable provider pool. The default resource is
-`codex-chatgpt-primary`; an API resource is opt-in and must be explicitly
-configured with its own credential and billing policy. Resources are persisted
-with `AVAILABLE`, `AUTH_ERROR`, `RATE_LIMITED`, `CREDITS_EXHAUSTED`, `COOLDOWN`,
-`OFFLINE`, or `CONTRACT_INVALID` state. Active cooldowns are skipped without
-retrying. Every provider receives the same `managercontext.v1` package,
-including the WorkOrder, exact HEAD, diff, tests, prior decisions, repair
-history, PR/CI state, and policy context. A provider switch never relaxes the
-fresh HEAD check or deterministic test gate. ChatGPT accounts are never rotated
-automatically to evade workspace limits.
+All autonomous Manager and Reviewer call paths—WorkOrder planning, local verification
+review, and GitHub CI failure diagnosis—use an explicitly configured manager provider
+pool rather than a singleton Codex dependency. The primary resource is `codex-chatgpt-primary`;
+an API resource `codex-api-fallback` is opt-in (`AGENT_FORGE_ENABLE_OPENAI_API_FALLBACK=1`)
+and configured with its own credential and billing limits. An extension point allows
+registering compatible resources. Resources are persisted with `AVAILABLE`, `AUTH_ERROR`,
+`RATE_LIMITED`, `CREDITS_EXHAUSTED`, `COOLDOWN`, `OFFLINE`, or `CONTRACT_INVALID` state.
+Active cooldowns and known unavailable resources are skipped without invoking them.
+Every review receives the durable `managercontext.v1` package, including task identity,
+immutable WorkOrder, acceptance criteria, exact base SHA, fresh current HEAD, actual diff/evidence,
+deterministic tests, previous manager decisions, repair history, PR state, CI state, and policy context.
+The package is stored by content hash and can be resumed by a newly configured provider only while
+its recorded current HEAD still matches a fresh Supervisor observation.
+Planning and review fail over across eligible providers upon capacity, rate limits, or contract failures.
+Provider switching strictly preserves exact-head review fencing, leases, authorization, deterministic
+test gates, and audit trails. ChatGPT workspace capacity and OpenAI API quota/billing state
+remain separate. A manager outage leaves the affected task resumable and does not stop Antigravity slots,
+GitHub CI observation, or unrelated executable work. Stale reviewed HEADs force a `REPAIR` verdict,
+malformed provider contracts fail closed, and ChatGPT accounts are never rotated automatically.
 
 Register a watch using a JSON file under the runtime root:
 
