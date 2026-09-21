@@ -13,6 +13,7 @@ import {
 import { AntigravityAdapter, CodexManagerAdapter } from '../src/core/autonomy/providers';
 import { AutonomyStore } from '../src/core/autonomy/store';
 import { AutonomySupervisor } from '../src/core/autonomy/supervisor';
+import { ManagerProviderPool } from '../src/core/autonomy/managerPool';
 import { EvidenceCollector } from '../src/core/autonomy/evidence';
 import { execFileSync } from 'child_process';
 
@@ -139,6 +140,23 @@ describe('autonomy durable contracts', () => {
       expect(store.listActiveSlots()).toHaveLength(0);
       db.close();
     }
+  });
+
+  it('keeps a task resumable when all manager providers are capacity-unavailable', async () => {
+    const root = worktree(); const child = path.join(root, 'child'); fs.mkdirSync(child);
+    const db = new Database(':memory:'); MigrationRunner.run(db);
+    const store = new AutonomyStore(db);
+    const managerPool = new ManagerProviderPool(store, [{ id: 'primary', priority: 1, enabled: true, review: async () => ({ run: { status: 'QUOTA_OR_RATE_LIMIT', exitCode: 1, executionId: '', stdout: '', stderr: 'ALL_MANAGER_RESOURCES_UNAVAILABLE', durationMs: 1 } }) }]);
+    const supervisor = new AutonomySupervisor({ store, worktreeRoot: root, managerPool,
+      agy: new AntigravityAdapter({ executable: 'fake', runner: async () => processResult() }),
+      evidence: { collect: async () => ({ headSha: 'a'.repeat(40), snapshotSha: 'clean', status: '', changedFiles: [], diff: '', tests: [{ command: 'test', exitCode: 0, stdout: '', stderr: '', durationMs: 1 }] }) },
+    });
+    const result = await supervisor.run({ taskId: 'manager-capacity', workerId: 'agy-01', objective: 'wait for manager', baseSha: 'a'.repeat(40), branch: 'agent/manager-capacity', worktree: child, acceptanceCriteria: ['wait'], allowedPaths: ['src'], requiredTests: ['test'] });
+    expect(result.state).toBe('MANAGER_REVIEW');
+    expect(result.error).toBe('MANAGER_CAPACITY_UNAVAILABLE');
+    expect(store.listActiveSlots()).toHaveLength(0);
+    expect(store.getDatabase().prepare("SELECT state FROM autonomy_work_orders WHERE task_id='manager-capacity'").pluck().get()).toBe('MANAGER_REVIEW');
+    db.close();
   });
 
   it('prevents shared worktrees and fences interrupted attempts on recovery', () => {

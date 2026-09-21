@@ -20,7 +20,7 @@ export interface ManagerPoolResult { run: ProviderRun; review?: ManagerReview; r
 function classify(run: ProviderRun): { state: ManagerResourceState; cooldownUntil: string | null } {
   const text = `${run.stdout}\n${run.stderr}\n${run.error ?? ''}`;
   if (run.status === 'SUCCESSFUL_PROCESS_EXIT') return { state: 'AVAILABLE', cooldownUntil: null };
-  if (/out of credits|workspace.*credit|credits.*exhausted/i.test(text)) return { state: 'CREDITS_EXHAUSTED', cooldownUntil: null };
+  if (/out of credits|workspace.*credit|credits.*exhausted|insufficient[_ -]?quota|quota.*exhaust|spend.?limit|billing.?limit/i.test(text)) return { state: 'CREDITS_EXHAUSTED', cooldownUntil: null };
   if (/rate.?limit|too many requests|\b429\b/i.test(text)) return { state: 'RATE_LIMITED', cooldownUntil: new Date(Date.now() + 60_000).toISOString() };
   if (/auth|not logged|unauthorized|invalid token/i.test(text)) return { state: 'AUTH_ERROR', cooldownUntil: null };
   if (run.status === 'CONTRACT_INVALID') return { state: 'CONTRACT_INVALID', cooldownUntil: null };
@@ -39,9 +39,13 @@ export class ManagerProviderPool {
     // Recover known capacity failures from earlier singleton manager attempts.
     // This prevents a restart from immediately retrying an exhausted resource.
     for (const resource of resources) {
+      // Legacy singleton evidence belongs only to the ChatGPT workspace
+      // resource. API fallback billing/quota is independent and must remain
+      // eligible until its own provider reports a capacity failure.
+      if (resource.id !== 'codex-chatgpt-primary') continue;
       if (this.store.getManagerResourceHealth(resource.id)) continue;
       const prior = this.store.getDatabase().prepare("SELECT stderr,stdout FROM autonomy_runs WHERE provider IN ('codex-review','codex-ci-review') ORDER BY started_at DESC LIMIT 20").all() as Array<{ stderr: string; stdout: string }>;
-      if (prior.some((run) => /out of credits|workspace.*credit|credits.*exhausted/i.test(`${run.stdout}\n${run.stderr}`))) {
+      if (prior.some((run) => /out of credits|workspace.*credit|credits.*exhausted|insufficient[_ -]?quota|quota.*exhaust|spend.?limit|billing.?limit/i.test(`${run.stdout}\n${run.stderr}`))) {
         this.store.recordManagerResource(resource.id, 'CREDITS_EXHAUSTED', 'Recovered from durable manager run evidence');
       }
     }

@@ -127,6 +127,13 @@ export class AutonomySupervisor {
         });
         this.store.recordRun(row.id, 'codex-review', reviewResult.run);
         if (!reviewResult.review) {
+          if (reviewResult.run.stderr === 'ALL_MANAGER_RESOURCES_UNAVAILABLE') {
+            // Capacity is a durable provider-resource condition, not a task
+            // failure. Keep the task resumable and release the implementation
+            // slot in finally so independent work can continue.
+            this.store.event(row.id, 'MANAGER_CAPACITY_UNAVAILABLE', { attempts: reviewResult.attempts, contextSha: reviewResult.context_sha });
+            return { workOrder: order, state: 'MANAGER_REVIEW', provider, repairLoops, error: 'MANAGER_CAPACITY_UNAVAILABLE' };
+          }
           this.store.updateState(row.id, 'FAILED', order.lease_epoch);
           return { workOrder: order, state: 'FAILED', provider, repairLoops, error: reviewResult.run.error ?? reviewResult.run.stderr };
         }

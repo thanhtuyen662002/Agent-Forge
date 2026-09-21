@@ -42,10 +42,23 @@ describe('manager provider pool', () => {
     expect(result.review).toBeUndefined(); expect(result.run.stderr).toContain('ALL_MANAGER_RESOURCES_UNAVAILABLE'); db.close();
   });
 
+  it('does not recover ChatGPT capacity evidence onto an independent API fallback', () => {
+    const { db, store } = setup();
+    const legacy = createWorkOrder({ taskId: 'legacy-task', workerId: 'agy-01', objective: 'legacy', baseSha: sha, branch: 'agent/legacy', worktree: 'D:/Projects/AI/Agent-Forge-Worktrees/legacy', acceptanceCriteria: ['passes'], allowedPaths: ['src'], requiredTests: ['npm test'] });
+    const legacyRow = store.createWorkOrder(legacy);
+    store.recordRun(legacyRow.id, 'codex-review', run('workspace out of credits'));
+    new ManagerProviderPool(store, [
+      { id: 'codex-chatgpt-primary', priority: 100, enabled: true, review: async () => ({ run: run('', 0), review: pass() }) },
+      { id: 'codex-api-fallback', priority: 50, enabled: true, review: async () => ({ run: run('', 0), review: pass() }) },
+    ]);
+    expect(store.getManagerResourceHealth('codex-chatgpt-primary')?.state).toBe('CREDITS_EXHAUSTED');
+    expect(store.getManagerResourceHealth('codex-api-fallback')).toBeNull();
+    db.close();
+  });
+
   it('rejects a stale review across a provider switch', async () => {
     const { db, store } = setup();
     const result = await new ManagerProviderPool(store, [{ id: 'fallback', priority: 1, enabled: true, review: async () => ({ run: run('', 0), review: pass('b'.repeat(40)) }) }]).review(context());
     expect(result.review?.verdict).toBe('REPAIR'); db.close();
   });
 });
-
