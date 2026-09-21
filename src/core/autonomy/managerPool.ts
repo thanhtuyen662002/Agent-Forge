@@ -146,7 +146,9 @@ export class ManagerProviderPool {
       // resource. API fallback billing/quota is independent and must remain
       // eligible until its own provider reports a capacity failure.
       if (resource.id !== 'codex-chatgpt-primary') continue;
-      if (this.store.getManagerResourceHealth(resource.id)) continue;
+      const productHealth = this.checkProductResourceHealth(resource.id);
+      if (productHealth.configured && !productHealth.eligible) continue;
+      if (!productHealth.configured && this.store.getManagerResourceHealth(resource.id)) continue;
       const prior = this.store
         .getDatabase()
         .prepare(
@@ -160,7 +162,7 @@ export class ManagerProviderPool {
           ),
         )
       ) {
-        this.store.recordManagerResource(resource.id, 'CREDITS_EXHAUSTED', 'Recovered from durable manager run evidence');
+        this.recordResourceHealth(resource.id, 'CREDITS_EXHAUSTED', 'Recovered from durable manager run evidence', null);
       }
     }
   }
@@ -223,6 +225,83 @@ export class ManagerProviderPool {
     return this.resources.find((r) => r.id === id);
   }
 
+  checkProductResourceHealth(resourceId: string): { configured: boolean; eligible: boolean; reason?: string } {
+    const db = this.store.getDatabase();
+    const resource = db.prepare(
+      'SELECT enabled,health_status,provider_account_id,remaining_quota,quota_source FROM provider_resources WHERE id=?',
+    ).get(resourceId) as {
+      enabled: number;
+      health_status: string;
+      provider_account_id: string | null;
+      remaining_quota: number | null;
+      quota_source: string;
+    } | undefined;
+    if (!resource) return { configured: false, eligible: true };
+    if (!resource.enabled) return { configured: true, eligible: false, reason: 'PROVIDER_RESOURCE_DISABLED' };
+    if (['DISABLED', 'OFFLINE', 'UNHEALTHY', 'QUOTA_EXHAUSTED', 'AUTH_ERROR', 'BUSY'].includes(resource.health_status)) {
+      return { configured: true, eligible: false, reason: `PROVIDER_RESOURCE_${resource.health_status}` };
+    }
+    if (
+      ['MEASURED', 'PROVIDER_REPORTED', 'MANUAL'].includes(resource.quota_source) &&
+      resource.remaining_quota !== null && resource.remaining_quota <= 0
+    ) {
+      return { configured: true, eligible: false, reason: 'PROVIDER_RESOURCE_QUOTA_EXHAUSTED' };
+    }
+    if (!resource.provider_account_id) return { configured: true, eligible: false, reason: 'PROVIDER_ACCOUNT_NOT_BOUND' };
+    const account = db.prepare(
+      'SELECT enabled,health_status,cooldown_until FROM provider_accounts WHERE id=?',
+    ).get(resource.provider_account_id) as { enabled: number; health_status: string; cooldown_until: string | null } | undefined;
+    if (!account) return { configured: true, eligible: false, reason: 'PROVIDER_ACCOUNT_NOT_FOUND' };
+    if (!account.enabled) return { configured: true, eligible: false, reason: 'PROVIDER_ACCOUNT_DISABLED' };
+    if (['AUTH_ERROR', 'OFFLINE', 'UNHEALTHY', 'QUOTA_EXHAUSTED', 'DISABLED', 'BUSY'].includes(account.health_status)) {
+      return { configured: true, eligible: false, reason: `PROVIDER_ACCOUNT_${account.health_status}` };
+    }
+    if (resource.health_status === 'RATE_LIMITED' || resource.health_status === 'COOLDOWN' || account.health_status === 'RATE_LIMITED' || account.health_status === 'COOLDOWN') {
+      if (!account.cooldown_until || Date.parse(account.cooldown_until) > Date.now()) {
+        return { configured: true, eligible: false, reason: 'PROVIDER_ACCOUNT_COOLDOWN' };
+      }
+    }
+    return { configured: true, eligible: true };
+  }
+
+  private recordResourceHealth(
+    resourceId: string,
+    classifiedState: ManagerResourceState,
+    errorText: string,
+    cooldownUntil: string | null,
+  ): void {
+    if (!this.syncProductResourceHealth(resourceId, classifiedState, cooldownUntil)) {
+      this.store.recordManagerResource(resourceId, classifiedState, errorText, cooldownUntil);
+    }
+  }
+
+  syncProductResourceHealth(resourceId: string, classifiedState: ManagerResourceState, cooldownUntil: string | null): boolean {
+    const db = this.store.getDatabase();
+    const resource = db.prepare('SELECT provider_account_id FROM provider_resources WHERE id=?').get(resourceId) as {
+      provider_account_id: string | null;
+    } | undefined;
+    if (!resource) return false;
+    const health = classifiedState === 'CREDITS_EXHAUSTED'
+      ? 'QUOTA_EXHAUSTED'
+      : classifiedState === 'CONTRACT_INVALID'
+        ? 'UNHEALTHY'
+        : classifiedState;
+    const now = new Date().toISOString();
+    db.transaction(() => {
+      db.prepare(`UPDATE provider_resources SET health_status=?,last_health_check=?,remaining_quota=
+        CASE WHEN ?='QUOTA_EXHAUSTED' THEN 0 ELSE remaining_quota END WHERE id=?`)
+        .run(health, now, health, resourceId);
+      if (resource.provider_account_id) {
+        db.prepare(`UPDATE provider_accounts SET health_status=?,cooldown_until=?,
+          last_success_at=CASE WHEN ?='AVAILABLE' THEN ? ELSE last_success_at END,
+          last_failure_at=CASE WHEN ?='AVAILABLE' THEN last_failure_at ELSE ? END,
+          last_failure_code=CASE WHEN ?='AVAILABLE' THEN NULL ELSE ? END,updated_at=? WHERE id=?`)
+          .run(health, cooldownUntil, health, now, health, now, health, classifiedState, now, resource.provider_account_id);
+      }
+    })();
+    return true;
+  }
+
   async review(context: ManagerContextPackage): Promise<ManagerPoolResult> {
     const validatedContext = ManagerContextPackageSchema.parse(context);
     const evidence = JSON.stringify(validatedContext);
@@ -233,7 +312,9 @@ export class ManagerProviderPool {
 
     for (const resource of candidates) {
       const health = this.store.getManagerResourceHealth(resource.id);
-      if (!isEligible(health?.state, health?.cooldown_until)) continue;
+      const productHealth = this.checkProductResourceHealth(resource.id);
+      if (!productHealth.configured && !isEligible(health?.state, health?.cooldown_until)) continue;
+      if (!productHealth.eligible) continue;
 
       attempts.push(resource.id);
       this.store.recordManagerAttempt(validatedContext.work_order.task_id, resource.id, contextSha, 'STARTED');
@@ -265,7 +346,7 @@ export class ManagerProviderPool {
         };
       }
       const classified = classify(result.run);
-      this.store.recordManagerResource(
+      this.recordResourceHealth(
         resource.id,
         classified.state,
         sanitizeAutonomyText(result.run.stderr || result.run.error || ''),
@@ -305,7 +386,7 @@ export class ManagerProviderPool {
           return { ...result, review, resource_id: resource.id, context_sha: contextSha, attempts };
         } catch (err) {
           const errMsg = err instanceof Error ? err.message : String(err);
-          this.store.recordManagerResource(resource.id, 'CONTRACT_INVALID', sanitizeAutonomyText(errMsg));
+          this.recordResourceHealth(resource.id, 'CONTRACT_INVALID', sanitizeAutonomyText(errMsg), null);
           this.store.recordManagerAttempt(validatedContext.work_order.task_id, resource.id, contextSha, 'CONTRACT_INVALID');
           continue;
         }
@@ -356,7 +437,9 @@ export class ManagerProviderPool {
 
     for (const resource of candidates) {
       const health = this.store.getManagerResourceHealth(resource.id);
-      if (!isEligible(health?.state, health?.cooldown_until)) continue;
+      const productHealth = this.checkProductResourceHealth(resource.id);
+      if (!productHealth.configured && !isEligible(health?.state, health?.cooldown_until)) continue;
+      if (!productHealth.eligible) continue;
       if (!resource.plan) continue;
 
       attempts.push(resource.id);
@@ -389,7 +472,7 @@ export class ManagerProviderPool {
         };
       }
       const classified = classify(result.run);
-      this.store.recordManagerResource(
+      this.recordResourceHealth(
         resource.id,
         classified.state,
         sanitizeAutonomyText(result.run.stderr || result.run.error || ''),
@@ -408,7 +491,7 @@ export class ManagerProviderPool {
           return { ...result, workOrder, resource_id: resource.id, attempts };
         } catch (err) {
           const errMsg = err instanceof Error ? err.message : String(err);
-          this.store.recordManagerResource(resource.id, 'CONTRACT_INVALID', sanitizeAutonomyText(errMsg));
+          this.recordResourceHealth(resource.id, 'CONTRACT_INVALID', sanitizeAutonomyText(errMsg), null);
           this.store.recordManagerAttempt(seed.task_id, resource.id, planSha, 'CONTRACT_INVALID');
           continue;
         }

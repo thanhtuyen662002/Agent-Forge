@@ -8620,6 +8620,24 @@ export class Repository {
     };
   }
 
+  public getTestRunsByTaskId(taskId: string): TestRun[] {
+    const rows = this.db
+      .prepare('SELECT * FROM test_runs WHERE task_id = ? ORDER BY created_at ASC, rowid ASC')
+      .all(taskId) as Record<string, unknown>[];
+    return rows.map((row) => ({
+      id: String(row.id),
+      task_id: String(row.task_id),
+      command: String(row.command),
+      passed_count: Number(row.passed_count),
+      failed_count: Number(row.failed_count),
+      skipped_count: Number(row.skipped_count),
+      duration_ms: Number(row.duration_ms),
+      exit_code: Number(row.exit_code),
+      evidence_id: row.evidence_id ? String(row.evidence_id) : null,
+      created_at: String(row.created_at),
+    }));
+  }
+
   public getLatestEvidence(taskId: string, evidenceType: string): Evidence | null {
     const row = this.db
       .prepare('SELECT * FROM evidence WHERE task_id = ? AND evidence_type = ? ORDER BY created_at DESC, rowid DESC LIMIT 1')

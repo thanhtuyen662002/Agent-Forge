@@ -108,6 +108,15 @@ export const AUTONOMY_SCHEMA_SQL = `
     context_sha TEXT PRIMARY KEY, context_json TEXT NOT NULL, created_at TEXT NOT NULL
   );
   CREATE TABLE IF NOT EXISTS autonomy_owner (id INTEGER PRIMARY KEY CHECK(id=1), pid INTEGER NOT NULL, token TEXT NOT NULL, stop_requested INTEGER NOT NULL DEFAULT 0);
+  CREATE TABLE IF NOT EXISTS autonomy_compatibility_inventory (
+    table_name TEXT PRIMARY KEY,
+    total_rows INTEGER NOT NULL,
+    active_rows INTEGER NOT NULL,
+    retained_status TEXT NOT NULL,
+    is_lifecycle_authoritative INTEGER NOT NULL DEFAULT 0,
+    inventoried_at TEXT NOT NULL,
+    notes TEXT
+  );
 `;
 
 export class AutonomyStore {
@@ -122,6 +131,7 @@ export class AutonomyStore {
     MigrationRunner.run(db);
     const store = new AutonomyStore(db);
     store.ensureSchema();
+    store.inventoryLegacyState();
     return { store, engine, dbPath };
   }
 
@@ -360,4 +370,183 @@ export class AutonomyStore {
     this.db.prepare('INSERT INTO autonomy_events (id,work_order_id,event_type,payload_json,created_at) VALUES (?,?,?,?,?)')
       .run(crypto.randomUUID(), workOrderId, eventType, JSON.stringify(payload), new Date().toISOString());
   }
+
+  isProductTask(taskId: string): boolean {
+    try {
+      const hasTasks = this.db.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='tasks'").get();
+      if (!hasTasks) return false;
+      const row = this.db.prepare('SELECT 1 FROM tasks WHERE id = ?').get(taskId);
+      return !!row;
+    } catch {
+      return false;
+    }
+  }
+
+  isLegacyTableAuthoritative(tableName: string): boolean {
+    // Legacy autonomy lifecycle rows are explicitly non-authoritative for product tasks
+    if (tableName === 'autonomy_work_orders') return false;
+    return false;
+  }
+
+  inventoryLegacyState(): LegacyAutonomyInventoryReport {
+    const db = this.db;
+    const now = new Date().toISOString();
+
+    const countTable = (name: string, where?: string): number => {
+      try {
+        const query = where ? `SELECT COUNT(*) as cnt FROM ${name} WHERE ${where}` : `SELECT COUNT(*) as cnt FROM ${name}`;
+        const row = db.prepare(query).get() as { cnt: number } | undefined;
+        return row?.cnt ?? 0;
+      } catch {
+        return 0;
+      }
+    };
+
+    const tables: LegacyTableInventory[] = [
+      {
+        tableName: 'autonomy_work_orders',
+        totalRows: countTable('autonomy_work_orders'),
+        activeRows: countTable('autonomy_work_orders', "state NOT IN ('MERGED','BLOCKED','FAILED')"),
+        retainedStatus: 'RETAINED_READ_ONLY_COMPATIBILITY',
+        isAuthoritative: false,
+        notes: 'Legacy autonomy lifecycle rows retained for audit/compatibility; non-authoritative for product tasks',
+      },
+      {
+        tableName: 'autonomy_slots',
+        totalRows: countTable('autonomy_slots'),
+        activeRows: countTable('autonomy_slots', 'released_at IS NULL AND work_order_id IS NOT NULL'),
+        retainedStatus: 'RETAINED_ACTIVE_LEASES',
+        isAuthoritative: false,
+        notes: 'Legacy worker slots retained; new product tasks use WorkerSlotLeaseService',
+      },
+      {
+        tableName: 'autonomy_runs',
+        totalRows: countTable('autonomy_runs'),
+        activeRows: countTable('autonomy_runs'),
+        retainedStatus: 'RETAINED_ACTIVE_EVIDENCE',
+        isAuthoritative: false,
+        notes: 'Execution run records retained as audit evidence',
+      },
+      {
+        tableName: 'autonomy_reviews',
+        totalRows: countTable('autonomy_reviews'),
+        activeRows: countTable('autonomy_reviews'),
+        retainedStatus: 'RETAINED_ACTIVE_REVIEWS',
+        isAuthoritative: false,
+        notes: 'Manager review history retained for audit',
+      },
+      {
+        tableName: 'autonomy_ci_watches',
+        totalRows: countTable('autonomy_ci_watches'),
+        activeRows: countTable('autonomy_ci_watches', "state IN ('CI_WAIT','CI_FAILURE')"),
+        retainedStatus: 'RETAINED_ACTIVE_WATCHES',
+        isAuthoritative: false,
+        notes: 'Active CI watches retained and continuously monitored',
+      },
+      {
+        tableName: 'autonomy_claims',
+        totalRows: countTable('autonomy_claims'),
+        activeRows: countTable('autonomy_claims'),
+        retainedStatus: 'RETAINED_COMPATIBILITY_CLAIMS',
+        isAuthoritative: false,
+        notes: 'External GitHub/PR claims retained',
+      },
+      {
+        tableName: 'autonomy_events',
+        totalRows: countTable('autonomy_events'),
+        activeRows: countTable('autonomy_events'),
+        retainedStatus: 'RETAINED_AUDIT_LOGS',
+        isAuthoritative: false,
+        notes: 'Event stream retained for historical traceability',
+      },
+      {
+        tableName: 'autonomy_manager_resources',
+        totalRows: countTable('autonomy_manager_resources'),
+        activeRows: countTable('autonomy_manager_resources'),
+        retainedStatus: 'RETAINED_MANAGER_RESOURCES',
+        isAuthoritative: false,
+        notes: 'Manager resource health states retained',
+      },
+      {
+        tableName: 'autonomy_manager_attempts',
+        totalRows: countTable('autonomy_manager_attempts'),
+        activeRows: countTable('autonomy_manager_attempts'),
+        retainedStatus: 'RETAINED_MANAGER_ATTEMPTS',
+        isAuthoritative: false,
+        notes: 'Manager attempt history retained',
+      },
+      {
+        tableName: 'autonomy_manager_contexts',
+        totalRows: countTable('autonomy_manager_contexts'),
+        activeRows: countTable('autonomy_manager_contexts'),
+        retainedStatus: 'RETAINED_MANAGER_CONTEXTS',
+        isAuthoritative: false,
+        notes: 'Manager context snapshots retained',
+      },
+    ];
+
+    try {
+      const insertOrReplace = db.prepare(`
+        INSERT OR REPLACE INTO autonomy_compatibility_inventory
+        (table_name, total_rows, active_rows, retained_status, is_lifecycle_authoritative, inventoried_at, notes)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
+      `);
+
+      db.transaction(() => {
+        for (const t of tables) {
+          insertOrReplace.run(
+            t.tableName,
+            t.totalRows,
+            t.activeRows,
+            t.retainedStatus,
+            t.isAuthoritative ? 1 : 0,
+            now,
+            t.notes
+          );
+        }
+      })();
+    } catch {
+      // Table may not exist yet or running in raw mode
+    }
+
+    return {
+      inventoriedAt: now,
+      tables,
+      totalRetainedRows: tables.reduce((acc, t) => acc + t.totalRows, 0),
+      activeRetainedCount: tables.reduce((acc, t) => acc + t.activeRows, 0),
+    };
+  }
+}
+
+export type LegacyRetainedStatus =
+  | 'RETAINED_READ_ONLY_COMPATIBILITY'
+  | 'RETAINED_ACTIVE_LEASES'
+  | 'RETAINED_ACTIVE_EVIDENCE'
+  | 'RETAINED_ACTIVE_REVIEWS'
+  | 'RETAINED_ACTIVE_WATCHES'
+  | 'RETAINED_COMPATIBILITY_CLAIMS'
+  | 'RETAINED_AUDIT_LOGS'
+  | 'RETAINED_MANAGER_RESOURCES'
+  | 'RETAINED_MANAGER_ATTEMPTS'
+  | 'RETAINED_MANAGER_CONTEXTS';
+
+export interface LegacyTableInventory {
+  tableName: string;
+  totalRows: number;
+  activeRows: number;
+  retainedStatus: LegacyRetainedStatus;
+  isAuthoritative: boolean;
+  notes: string;
+}
+
+export interface LegacyAutonomyInventoryReport {
+  inventoriedAt: string;
+  tables: LegacyTableInventory[];
+  totalRetainedRows: number;
+  activeRetainedCount: number;
+}
+
+export function migrateLegacyAutonomyCompatibility(db: Database.Database): LegacyAutonomyInventoryReport {
+  const store = new AutonomyStore(db);
+  return store.inventoryLegacyState();
 }

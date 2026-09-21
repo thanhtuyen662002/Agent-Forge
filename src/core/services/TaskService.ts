@@ -39,6 +39,12 @@ export interface ValidationFlowResult {
   error?: string;
 }
 
+export interface AuthorizedTaskTransitionResult {
+  success: boolean;
+  task?: Task;
+  error?: string;
+}
+
 export class TaskService {
   constructor(
     private repo: Repository,
@@ -46,6 +52,56 @@ export class TaskService {
     private verificationService?: VerificationService,
     private artifactStore?: ArtifactStore
   ) {}
+
+  /**
+   * Product-authoritative transition used by the consolidated self-host path.
+   * The ownership epoch is checked in the same immediate transaction as the
+   * TaskStateMachine transition so an old worker cannot advance a reassigned task.
+   */
+  public transitionAuthorizedTask(
+    taskId: string,
+    trigger: TaskTrigger,
+    expectedOwnershipEpoch: number,
+  ): AuthorizedTaskTransitionResult {
+    try {
+      return this.repo.runInImmediateTransaction(() => {
+        const task = this.repo.getTask(taskId);
+        if (!task) return { success: false, error: `Task "${taskId}" not found.` };
+        if (task.ownership_epoch !== expectedOwnershipEpoch) {
+          return {
+            success: false,
+            error: `OWNERSHIP_EPOCH_MISMATCH: expected ${expectedOwnershipEpoch}, current ${String(task.ownership_epoch)}.`,
+          };
+        }
+        const transition = TaskStateMachine.transition(task.state, trigger, {
+          pausedFromState: task.paused_from_state,
+          revisionCount: task.revision_count,
+          maxRevisions: task.max_revisions,
+        });
+        this.repo.updateTaskState(
+          task.id,
+          transition.nextState,
+          transition.pausedFromState,
+          transition.incrementRevision,
+        );
+        this.eventService.record(
+          task.project_id,
+          'AUTHORIZED_AUTONOMY_TASK_TRANSITION',
+          `Authorized autonomy transition ${trigger} moved task ${task.id} from ${task.state} to ${transition.nextState}.`,
+          {
+            trigger,
+            fromState: task.state,
+            toState: transition.nextState,
+            ownershipEpoch: expectedOwnershipEpoch,
+          },
+          task.id,
+        );
+        return { success: true, task: this.repo.getTask(task.id)! };
+      });
+    } catch (error) {
+      return { success: false, error: error instanceof Error ? error.message : String(error) };
+    }
+  }
 
   public createTask(spec: TaskCreationSpec): Task {
     const project = this.repo.getProject(spec.projectId);
