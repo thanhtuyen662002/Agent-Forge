@@ -109,6 +109,12 @@ export class AutonomySupervisor {
         const allowed = (name: string) => order.allowed_paths.some((entry) => name === entry || name.startsWith(`${entry.replace(/\/$/, '')}/`));
         if (evidence.changedFiles.some((name) => !allowed(name) || order.forbidden_paths.some((entry) => name === entry || name.startsWith(`${entry}/`)))) throw new Error('WORKER_PATH_VIOLATION');
         this.store.updateState(row.id, 'MANAGER_REVIEW', order.lease_epoch);
+        // Temporary bootstrap fence until resource-aware manager routing is installed.
+        // Persisted exhaustion is not permission to retry the same workspace.
+        if (this.store.getDatabase().prepare("SELECT id FROM autonomy_runs WHERE provider='codex-review' AND (stdout LIKE '%out of credits%' OR stderr LIKE '%out of credits%') LIMIT 1").get()) {
+          this.store.event(row.id, 'MANAGER_CAPACITY_WAIT', { reason: 'Known workspace credit exhaustion', evidenceHead: evidence.headSha });
+          return { workOrder: order, state: 'MANAGER_REVIEW', repairLoops, error: 'MANAGER_CAPACITY_UNAVAILABLE' };
+        }
         const reviewResult = await this.manager.review({ workOrder: order, evidence: JSON.stringify(evidence) } satisfies ManagerEvidence);
         this.store.recordRun(row.id, 'codex-review', reviewResult.run);
         if (!reviewResult.review) {

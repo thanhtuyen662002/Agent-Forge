@@ -3,7 +3,7 @@ import fs from 'fs';
 import path from 'path';
 import { spawnSync } from 'child_process';
 import { CodexManagerAdapter } from './providers';
-import { AutonomousTaskSpec, SelfHostTask } from './contracts';
+import { AutonomousTaskSpec, SelfHostTask, createWorkOrder } from './contracts';
 import { AutonomySupervisor, SupervisorRunResult } from './supervisor';
 import { GitWorktreeService } from '../services/GitWorktreeService';
 
@@ -64,7 +64,13 @@ export async function runDisposableSelfHostProof(options: SelfHostProofOptions):
     contextFiles: options.task?.context_files ?? [],
     constraints: ['Do not push or merge.', 'Do not modify files outside the allowed path.', ...(options.task?.constraints ?? [])],
   };
-  const planned = await manager.plan({
+  // An operator/manager may authorize the immutable task seed before dispatch.
+  // This supplies planning only: tests and the independent review still apply.
+  const authorized = supervisor.store.getDatabase().prepare("SELECT id FROM autonomy_events WHERE work_order_id=? AND event_type='TASK_MANAGER_AUTHORIZED'").get(taskId);
+  const planned = authorized ? {
+    workOrder: createWorkOrder(seed),
+    run: { status: 'SUCCESSFUL_PROCESS_EXIT' as const, exitCode: 0, executionId: '', stdout: '', stderr: '', durationMs: 0 },
+  } : await manager.plan({
     task_id: seed.taskId, worker_id: seed.workerId, objective: seed.objective,
     base_sha: seed.baseSha, branch: seed.branch, worktree: seed.worktree,
     acceptance_criteria: seed.acceptanceCriteria,

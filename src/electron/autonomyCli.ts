@@ -83,10 +83,14 @@ async function main(): Promise<number> {
   const ci = new GithubCiObserver(store.store, controlRepo, supervisor.manager);
   if (command === 'status') { process.stdout.write(`${JSON.stringify({ mode: supervisor.mode, maxWorkers: supervisor.maxWorkers, orders: supervisor.store.listAll(), activeSlots: supervisor.store.listActiveSlots(), runtimeRoot })}\n`); return 0; }
   if (command === 'stop') { store.store.requestStop(); process.stdout.write('Stop requested in durable state.\n'); return 0; }
-  if (command === 'enqueue') {
+  if (command === 'enqueue' || command === 'enqueue-authorized') {
     const file = path.resolve(process.argv[3] ?? '');
     assertPathContained(file, runtimeRoot);
-    store.store.enqueue(SelfHostTaskSchema.parse(JSON.parse(fs.readFileSync(file, 'utf8'))));
+    const task = SelfHostTaskSchema.parse(JSON.parse(fs.readFileSync(file, 'utf8')));
+    store.store.getDatabase().transaction(() => {
+      store.store.enqueue(task);
+      if (command === 'enqueue-authorized') store.store.event(task.task_id, 'TASK_MANAGER_AUTHORIZED', { task, source: 'operator-manager', reviewRequired: true });
+    })();
     process.stdout.write('Task enqueued in SQLite.\n'); return 0;
   }
   if (command === 'register-ci') {
@@ -115,9 +119,10 @@ async function main(): Promise<number> {
     const proven = store.store.getDatabase().prepare("SELECT id FROM autonomy_events WHERE event_type='LOCAL_ACCEPTED' LIMIT 1").get();
     if (!proven) throw new Error('PILOT_PROOF_REQUIRED');
     process.stdout.write('Agent Forge PILOT supervisor started (one worker; no push or merge).\n');
+    let activeTask: Promise<void> | null = null;
     while (!store.store.shouldStop()) {
-      const task = store.store.claimNext();
-      if (task) try {
+      const task = activeTask ? null : store.store.claimNext();
+      if (task) activeTask = (async () => { try {
         const result = await runDisposableSelfHostProof({ controlRepo, worktreeRoot, supervisor, task });
         let publishedHead: string | null = null;
         if (result.result.accepted) {
@@ -128,7 +133,7 @@ async function main(): Promise<number> {
       } catch (error) {
         store.store.event(task.task_id, 'TASK_BLOCKED', { error: redact(String(error)) });
         process.stdout.write(`${task.task_id}: BLOCKED\n`);
-      }
+      } })().finally(() => { activeTask = null; });
       try {
         for (const observation of await ci.observeDue()) process.stdout.write(`${JSON.stringify({ ci: observation.watch.pr_number, conclusion: observation.conclusion, headSha: observation.headSha, repairTaskId: observation.repairTaskId })}\n`);
       } catch (error) {
@@ -136,6 +141,7 @@ async function main(): Promise<number> {
       }
       if (!task) await new Promise((resolve) => setTimeout(resolve, 1000));
     }
+    await activeTask;
     return 0;
   }
   process.stderr.write(`Unknown autonomy command: ${command}\n`); return 2;
