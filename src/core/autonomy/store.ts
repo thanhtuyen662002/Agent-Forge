@@ -45,6 +45,9 @@ export interface AutonomyCiWatch {
   updated_at: string;
 }
 
+export type ManagerResourceState = 'AVAILABLE' | 'AUTH_ERROR' | 'RATE_LIMITED' | 'CREDITS_EXHAUSTED' | 'COOLDOWN' | 'OFFLINE' | 'CONTRACT_INVALID';
+export interface ManagerResourceHealth { resource_id: string; state: ManagerResourceState; cooldown_until: string | null; last_error: string | null; updated_at: string; }
+
 /**
  * Autonomy state is an extension owned by the supervisor. The product migration
  * ledger is intentionally immutable at v24; this initializer is idempotent and
@@ -95,6 +98,12 @@ export const AUTONOMY_SCHEMA_SQL = `
     UNIQUE(repository, pr_number)
   );
   CREATE INDEX IF NOT EXISTS idx_autonomy_ci_watches_due ON autonomy_ci_watches(state, next_poll_at);
+  CREATE TABLE IF NOT EXISTS autonomy_manager_resources (
+    resource_id TEXT PRIMARY KEY, state TEXT NOT NULL, cooldown_until TEXT, last_error TEXT, updated_at TEXT NOT NULL
+  );
+  CREATE TABLE IF NOT EXISTS autonomy_manager_attempts (
+    id TEXT PRIMARY KEY, work_order_id TEXT, resource_id TEXT NOT NULL, context_sha TEXT NOT NULL, state TEXT NOT NULL, created_at TEXT NOT NULL
+  );
   CREATE TABLE IF NOT EXISTS autonomy_owner (id INTEGER PRIMARY KEY CHECK(id=1), pid INTEGER NOT NULL, token TEXT NOT NULL, stop_requested INTEGER NOT NULL DEFAULT 0);
 `;
 
@@ -308,6 +317,23 @@ export class AutonomyStore {
 
   findLatestWorkOrderByTask(taskId: string): AutonomyWorkOrderRow | null {
     return (this.db.prepare('SELECT * FROM autonomy_work_orders WHERE task_id=? ORDER BY attempt DESC LIMIT 1').get(taskId) as AutonomyWorkOrderRow | undefined) ?? null;
+  }
+
+  getManagerResourceHealth(resourceId: string): ManagerResourceHealth | null {
+    return (this.db.prepare('SELECT * FROM autonomy_manager_resources WHERE resource_id=?').get(resourceId) as ManagerResourceHealth | undefined) ?? null;
+  }
+
+  listManagerResourceHealth(): ManagerResourceHealth[] { return this.db.prepare('SELECT * FROM autonomy_manager_resources ORDER BY resource_id').all() as ManagerResourceHealth[]; }
+
+  recordManagerResource(resourceId: string, state: ManagerResourceState, error: string | null, cooldownUntil: string | null = null): void {
+    const now = new Date().toISOString();
+    this.db.prepare(`INSERT INTO autonomy_manager_resources(resource_id,state,cooldown_until,last_error,updated_at) VALUES(?,?,?,?,?) ON CONFLICT(resource_id) DO UPDATE SET state=excluded.state,cooldown_until=excluded.cooldown_until,last_error=excluded.last_error,updated_at=excluded.updated_at`)
+      .run(resourceId, state, cooldownUntil, error, now);
+  }
+
+  recordManagerAttempt(workOrderId: string | null, resourceId: string, contextSha: string, state: string): void {
+    this.db.prepare('INSERT INTO autonomy_manager_attempts(id,work_order_id,resource_id,context_sha,state,created_at) VALUES(?,?,?,?,?,?)')
+      .run(crypto.randomUUID(), workOrderId, resourceId, contextSha, state, new Date().toISOString());
   }
 
   listActiveSlots(): AutonomySlot[] {

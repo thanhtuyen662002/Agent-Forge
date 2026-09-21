@@ -7,6 +7,7 @@ import { AutonomyStore } from './store';
 import { Repository } from '../database/repositories';
 import { ProcessRunner } from '../services/ProcessRunner';
 import { assertPathContained } from '../services/ArtifactStore';
+import { ManagerProviderPool } from './managerPool';
 
 export type AutonomyMode = 'SHADOW' | 'PILOT' | 'AUTONOMOUS';
 
@@ -17,6 +18,7 @@ export interface SupervisorConfig {
   runtimeRoot?: string;
   agy?: AntigravityAdapter;
   manager?: CodexManagerAdapter;
+  managerPool?: ManagerProviderPool;
   evidence?: Pick<EvidenceCollector, 'collect'>;
   store?: AutonomyStore;
   controlRepo?: string;
@@ -41,6 +43,7 @@ export class AutonomySupervisor {
   readonly store: AutonomyStore;
   readonly agy: AntigravityAdapter;
   readonly manager: CodexManagerAdapter;
+  readonly managerPool: ManagerProviderPool;
   readonly evidence: Pick<EvidenceCollector, 'collect'>;
   readonly controlRepo: string;
   readonly worktreeRoot: string;
@@ -56,6 +59,7 @@ export class AutonomySupervisor {
     const runner: typeof ProcessRunner.execute = (options) => ProcessRunner.execute({ ...options, repo });
     this.agy = config.agy ?? new AntigravityAdapter({ runner });
     this.manager = config.manager ?? new CodexManagerAdapter({ runner });
+    this.managerPool = config.managerPool ?? ManagerProviderPool.fromEnvironment(this.store, this.manager);
     this.evidence = config.evidence ?? new EvidenceCollector({ execute: runner });
     this.store.ensureSlots(this.maxWorkers);
   }
@@ -109,13 +113,18 @@ export class AutonomySupervisor {
         const allowed = (name: string) => order.allowed_paths.some((entry) => name === entry || name.startsWith(`${entry.replace(/\/$/, '')}/`));
         if (evidence.changedFiles.some((name) => !allowed(name) || order.forbidden_paths.some((entry) => name === entry || name.startsWith(`${entry}/`)))) throw new Error('WORKER_PATH_VIOLATION');
         this.store.updateState(row.id, 'MANAGER_REVIEW', order.lease_epoch);
-        // Temporary bootstrap fence until resource-aware manager routing is installed.
-        // Persisted exhaustion is not permission to retry the same workspace.
-        if (this.store.getDatabase().prepare("SELECT id FROM autonomy_runs WHERE provider='codex-review' AND (stdout LIKE '%out of credits%' OR stderr LIKE '%out of credits%') LIMIT 1").get()) {
-          this.store.event(row.id, 'MANAGER_CAPACITY_WAIT', { reason: 'Known workspace credit exhaustion', evidenceHead: evidence.headSha });
-          return { workOrder: order, state: 'MANAGER_REVIEW', repairLoops, error: 'MANAGER_CAPACITY_UNAVAILABLE' };
-        }
-        const reviewResult = await this.manager.review({ workOrder: order, evidence: JSON.stringify(evidence) } satisfies ManagerEvidence);
+        const reviewResult = await this.managerPool.review({
+          protocol_version: 'managercontext.v1',
+          task_identity: { task_id: order.task_id, attempt: order.attempt, worker_id: order.worker_id },
+          work_order: order, acceptance_criteria: order.acceptance_criteria, base_sha: order.base_sha,
+          current_head: evidence.headSha, actual_diff: evidence.diff, changed_files: evidence.changedFiles,
+          deterministic_tests: evidence.tests,
+          previous_manager_decisions: this.store.getDatabase().prepare('SELECT payload_json FROM autonomy_reviews WHERE work_order_id=? ORDER BY created_at').all(row.id),
+          repair_history: this.store.getDatabase().prepare("SELECT payload_json FROM autonomy_events WHERE work_order_id=? AND event_type='REPAIR_REQUIRED' ORDER BY created_at").all(row.id),
+          pr_state: this.store.getDatabase().prepare('SELECT * FROM autonomy_claims WHERE work_order_id=?').all(row.id),
+          ci_state: this.store.getDatabase().prepare('SELECT * FROM autonomy_ci_watches WHERE work_order_id=?').all(row.id),
+          architecture_policy_context: ['Supervisor owns leases, worktrees, GitHub, and verification.', 'PASS requires a fresh exact HEAD match.'],
+        });
         this.store.recordRun(row.id, 'codex-review', reviewResult.run);
         if (!reviewResult.review) {
           this.store.updateState(row.id, 'FAILED', order.lease_epoch);

@@ -114,6 +114,17 @@ head before returning the watch to CI_WAIT. A changed PR head, non-Draft PR,
 branch mismatch, duplicate claim, missing review, or push lease mismatch fails
 closed.
 
+Manager review uses a durable provider pool. The default resource is
+`codex-chatgpt-primary`; an API resource is opt-in and must be explicitly
+configured with its own credential and billing policy. Resources are persisted
+with `AVAILABLE`, `AUTH_ERROR`, `RATE_LIMITED`, `CREDITS_EXHAUSTED`, `COOLDOWN`,
+`OFFLINE`, or `CONTRACT_INVALID` state. Active cooldowns are skipped without
+retrying. Every provider receives the same `managercontext.v1` package,
+including the WorkOrder, exact HEAD, diff, tests, prior decisions, repair
+history, PR/CI state, and policy context. A provider switch never relaxes the
+fresh HEAD check or deterministic test gate. ChatGPT accounts are never rotated
+automatically to evade workspace limits.
+
 Register a watch using a JSON file under the runtime root:
 
 ```json
