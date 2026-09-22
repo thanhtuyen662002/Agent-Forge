@@ -23,6 +23,7 @@ export interface CreateAuthorizationParams {
   contextManifestId?: string | null;
   assignmentId?: string | null;
   taskOwnershipEpoch?: number;
+  executionScope?: CanonicalExecutionScope;
 }
 
 export interface HandoffSuccessorExecutionAuthorityV1 {
@@ -175,6 +176,22 @@ export const VerificationCommandsSnapshotSchema = z
 
 export type VerificationCommandsSnapshot = z.infer<typeof VerificationCommandsSnapshotSchema>;
 
+export const CanonicalExecutionScopeSchema = z
+  .object({
+    branch: z.string().min(1),
+    worktree: z
+      .string()
+      .min(1)
+      .refine((val) => path.isAbsolute(val) || path.win32.isAbsolute(val) || path.posix.isAbsolute(val), {
+        message: 'Worktree must be an absolute path.',
+      }),
+    allowedPaths: z.array(z.string()),
+    forbiddenPaths: z.array(z.string()),
+  })
+  .strict();
+
+export type CanonicalExecutionScope = z.infer<typeof CanonicalExecutionScopeSchema>;
+
 export const CanonicalExecutionPayloadSchema = z
   .object({
     projectId: z.string().min(1),
@@ -189,6 +206,7 @@ export const CanonicalExecutionPayloadSchema = z
     verificationCommands: VerificationCommandsSnapshotSchema,
     managerMessageId: z.string().min(1),
     managerPayloadHash: z.string().min(1),
+    executionScope: CanonicalExecutionScopeSchema.optional(),
   })
   .strict();
 
@@ -258,8 +276,9 @@ export function computeCanonicalPayload(params: {
   verificationCommands: VerificationCommandsSnapshot;
   managerMessageId: string;
   managerPayloadHash: string;
+  executionScope?: CanonicalExecutionScope;
 }): CanonicalExecutionPayload {
-  return {
+  const payload: CanonicalExecutionPayload = {
     projectId: params.projectId,
     taskId: params.taskId,
     attemptId: params.attemptId,
@@ -283,6 +302,17 @@ export function computeCanonicalPayload(params: {
     managerMessageId: params.managerMessageId,
     managerPayloadHash: params.managerPayloadHash,
   };
+
+  if (params.executionScope !== undefined) {
+    payload.executionScope = {
+      branch: params.executionScope.branch,
+      worktree: params.executionScope.worktree,
+      allowedPaths: [...params.executionScope.allowedPaths],
+      forbiddenPaths: [...params.executionScope.forbiddenPaths],
+    };
+  }
+
+  return payload;
 }
 
 export function computePayloadHash(payload: CanonicalExecutionPayload): string {
@@ -291,6 +321,14 @@ export function computePayloadHash(payload: CanonicalExecutionPayload): string {
     attemptId: payload.attemptId,
     constraints: payload.constraints,
     contextFiles: payload.contextFiles,
+    executionScope: payload.executionScope
+      ? {
+          allowedPaths: payload.executionScope.allowedPaths,
+          branch: payload.executionScope.branch,
+          forbiddenPaths: payload.executionScope.forbiddenPaths,
+          worktree: payload.executionScope.worktree,
+        }
+      : undefined,
     instructions: payload.instructions,
     managerMessageId: payload.managerMessageId,
     managerPayloadHash: payload.managerPayloadHash,
@@ -567,6 +605,7 @@ export class ExecutionAuthorizationService {
       verificationCommands: verificationSnapshot,
       managerMessageId,
       managerPayloadHash,
+      executionScope: params.executionScope,
     });
     const canonicalPayloadJson = JSON.stringify(canonicalPayload);
     const instructionPayloadHash = computePayloadHash(canonicalPayload);

@@ -61,7 +61,11 @@ describe('product-task autonomy consolidation', () => {
     fs.rmSync(root, { recursive: true, force: true });
   });
 
-  function seed(taskId = 'task-product-1'): Fixture {
+  function seed(
+    taskId = 'task-product-1',
+    includeExecutionScope = true,
+    executionScopeOverrides: Partial<NonNullable<CanonicalExecutionPayload['executionScope']>> = {},
+  ): Fixture {
     const now = new Date().toISOString();
     const projectId = 'project-product';
     if (!repo.getProject(projectId)) {
@@ -212,6 +216,15 @@ describe('product-task autonomy consolidation', () => {
       },
       managerMessageId: `manager-${taskId}`,
       managerPayloadHash: crypto.createHash('sha256').update(taskId).digest('hex'),
+      ...(includeExecutionScope ? {
+        executionScope: {
+          branch: `agent/agy-01/${taskId}`,
+          worktree: path.join(root, 'worktrees', taskId),
+          allowedPaths: ['src'],
+          forbiddenPaths: ['.git'],
+          ...executionScopeOverrides,
+        },
+      } : {}),
     };
     repo.recordProtocolMessage(
       canonicalPayload.managerMessageId,
@@ -264,6 +277,7 @@ describe('product-task autonomy consolidation', () => {
       branch: `agent/agy-01/${fixture.task.id}`,
       worktree: path.join(root, 'worktrees', fixture.task.id),
       allowedPaths: ['src'],
+      forbiddenPaths: ['.git'],
     };
   }
 
@@ -296,6 +310,12 @@ describe('product-task autonomy consolidation', () => {
       },
       managerMessageId: `manager-retry-${fixture.task.id}-rev${revision}`,
       managerPayloadHash: crypto.createHash('sha256').update(`retry-${fixture.task.id}-rev${revision}`).digest('hex'),
+      executionScope: {
+        branch: `agent/agy-01/${fixture.task.id}`,
+        worktree: path.join(root, 'worktrees', fixture.task.id),
+        allowedPaths: ['src'],
+        forbiddenPaths: ['.git'],
+      },
     };
     repo.recordProtocolMessage(
       retryPayload.managerMessageId,
@@ -346,6 +366,89 @@ describe('product-task autonomy consolidation', () => {
     expect(result.valid).toBe(true);
     expect(result.authority?.task.id).toBe(fixture.task.id);
   });
+
+  it('fails closed when a product authorization omits durable execution scope', async () => {
+    const fixture = seed('task-scope-missing', false);
+    let coderCalled = false;
+    const result = await adapter.executeProductTask({
+      ...workOrderInput(fixture),
+      runCoder: async () => {
+        coderCalled = true;
+        return { success: true, currentHeadSha: BASE_SHA };
+      },
+      runVerification: async () => { throw new Error('verification must not run'); },
+      conductReview: async () => { throw new Error('review must not run'); },
+    });
+
+    expect(result.success).toBe(false);
+    expect(result.leaseAcquired).toBe(false);
+    expect(result.error).toContain('EXECUTION_SCOPE_MISSING');
+    expect(coderCalled).toBe(false);
+    expect(repo.getWorkerSlot(fixture.slotId)?.status).toBe('IDLE');
+  });
+
+  it('detects durable execution-scope tampering through instruction_payload_hash', () => {
+    const fixture = seed('task-scope-hash-tamper');
+    const payload = JSON.parse(fixture.authorization.canonical_payload_json!) as CanonicalExecutionPayload;
+    payload.executionScope!.allowedPaths = ['src', 'docs'];
+    store.getDatabase().prepare(
+      'UPDATE execution_authorizations SET canonical_payload_json=? WHERE id=?',
+    ).run(JSON.stringify(payload), fixture.authorization.id);
+
+    const result = adapter.validateAuthority(workOrderInput(fixture));
+    expect(result.valid).toBe(false);
+    expect(result.code).toBe('CANONICAL_PAYLOAD_HASH_MISMATCH');
+  });
+
+  const executionScopeMismatchCases = [
+    {
+      name: 'expanded allowed paths',
+      mutate: (input: ReturnType<typeof workOrderInput>) => ({ ...input, allowedPaths: ['src', 'docs'] }),
+      code: 'ALLOWED_PATHS_MISMATCH',
+    },
+    {
+      name: 'narrowed allowed paths',
+      mutate: (input: ReturnType<typeof workOrderInput>) => ({ ...input, allowedPaths: ['src/core'] }),
+      code: 'ALLOWED_PATHS_MISMATCH',
+    },
+    {
+      name: 'weakened forbidden paths',
+      mutate: (input: ReturnType<typeof workOrderInput>) => ({ ...input, forbiddenPaths: [] }),
+      code: 'FORBIDDEN_PATHS_MISMATCH',
+    },
+    {
+      name: 'different branch',
+      mutate: (input: ReturnType<typeof workOrderInput>) => ({ ...input, branch: `${input.branch}-other` }),
+      code: 'BRANCH_MISMATCH',
+    },
+    {
+      name: 'different worktree',
+      mutate: (input: ReturnType<typeof workOrderInput>) => ({ ...input, worktree: `${input.worktree}-other` }),
+      code: 'WORKTREE_MISMATCH',
+    },
+  ];
+
+  for (const scopeCase of executionScopeMismatchCases) {
+    it(`rejects ${scopeCase.name} before lease acquisition or coder execution`, async () => {
+      const fixture = seed(`task-scope-${scopeCase.name.replace(/\s+/g, '-')}`);
+      let coderCalled = false;
+      const result = await adapter.executeProductTask({
+        ...scopeCase.mutate(workOrderInput(fixture)),
+        runCoder: async () => {
+          coderCalled = true;
+          return { success: true, currentHeadSha: BASE_SHA };
+        },
+        runVerification: async () => { throw new Error('verification must not run'); },
+        conductReview: async () => { throw new Error('review must not run'); },
+      });
+
+      expect(result.success).toBe(false);
+      expect(result.leaseAcquired).toBe(false);
+      expect(result.error).toContain(scopeCase.code);
+      expect(coderCalled).toBe(false);
+      expect(repo.getWorkerSlot(fixture.slotId)?.status).toBe('IDLE');
+    });
+  }
 
   it('fences a stale authorization after ownership epoch changes', () => {
     const fixture = seed();
@@ -818,6 +921,7 @@ describe('product-task autonomy consolidation', () => {
       branch: `agent/agy-01/${fixture.task.id}`,
       worktree: path.join(root, 'worktrees', fixture.task.id),
       allowedPaths: ['src'],
+      forbiddenPaths: ['.git'],
       acceptanceCriteria: ['product task completes through product authority'],
       requiredTests: ['node --version'],
     };
@@ -871,7 +975,7 @@ describe('product-task autonomy consolidation', () => {
   });
 
   it('fails closed before verification or review if independently collected changedFiles include paths outside allowed_paths', async () => {
-    const fixture = seed('task-out-of-scope-edit');
+    const fixture = seed('task-out-of-scope-edit', true, { allowedPaths: ['src/core'] });
     const input = workOrderInput(fixture);
     let verificationCalled = false;
     let reviewCalled = false;
@@ -909,7 +1013,7 @@ describe('product-task autonomy consolidation', () => {
   });
 
   it('fails closed before verification or review if independently collected changedFiles include paths inside forbidden_paths', async () => {
-    const fixture = seed('task-forbidden-edit');
+    const fixture = seed('task-forbidden-edit', true, { forbiddenPaths: ['.git', 'src/forbidden'] });
     const input = workOrderInput(fixture);
     let verificationCalled = false;
     let reviewCalled = false;
@@ -1042,6 +1146,12 @@ describe('product-task autonomy consolidation', () => {
       },
       managerMessageId: `manager-retry-${fixture.task.id}`,
       managerPayloadHash: crypto.createHash('sha256').update(`retry-${fixture.task.id}`).digest('hex'),
+      executionScope: {
+        branch: `agent/agy-01/${fixture.task.id}`,
+        worktree: path.join(root, 'worktrees', fixture.task.id),
+        allowedPaths: ['src'],
+        forbiddenPaths: ['.git'],
+      },
     };
     repo.recordProtocolMessage(
       retryPayload.managerMessageId,
@@ -1614,6 +1724,7 @@ describe('product-task autonomy consolidation', () => {
       branch: `agent/agy-01/${fixture.task.id}`,
       worktree: path.join(root, 'worktrees', fixture.task.id),
       allowedPaths: ['src'],
+      forbiddenPaths: ['.git'],
       acceptanceCriteria: ['product task survives manager review outage'],
       requiredTests: ['node --version'],
     };

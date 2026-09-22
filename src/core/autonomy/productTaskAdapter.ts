@@ -2,7 +2,10 @@ import crypto from 'crypto';
 import path from 'path';
 import { Repository } from '../database/repositories';
 import { verifyContextManifestIntegrity } from '../context/ContextIntegrity';
-import { CanonicalExecutionPayloadSchema, computePayloadHash } from '../services/ExecutionAuthorizationService';
+import {
+  CanonicalExecutionPayloadSchema,
+  computePayloadHash,
+} from '../services/ExecutionAuthorizationService';
 import { ArtifactStore } from '../services/ArtifactStore';
 import { EventService } from '../services/EventService';
 import { TaskService } from '../services/TaskService';
@@ -82,6 +85,26 @@ export interface AuthorizedWorkOrderInput {
   dependencies?: string[];
 }
 
+export interface ValidateAuthorityInput {
+  authorizationId: string;
+  currentHeadSha: string;
+  workerId?: string;
+  branch?: string;
+  worktree?: string;
+  allowedPaths?: string[];
+  forbiddenPaths?: string[];
+  requireScopeMatch?: boolean;
+}
+
+export function areStringArraysIdentical(a?: string[], b?: string[]): boolean {
+  if (!Array.isArray(a) || !Array.isArray(b)) return false;
+  if (a.length !== b.length) return false;
+  for (let i = 0; i < a.length; i++) {
+    if (a[i] !== b[i]) return false;
+  }
+  return true;
+}
+
 export interface ExecuteProductTaskParams extends AuthorizedWorkOrderInput {
   runCoder: (workOrder: WorkOrder) => Promise<{ success: boolean; currentHeadSha: string; error?: string }>;
   runVerification: (authority: ProductTaskAuthority, workOrder?: WorkOrder) => Promise<TestRun>;
@@ -159,7 +182,7 @@ export class ProductTaskAutonomyAdapter {
     return this.options.repo;
   }
 
-  public validateAuthority(input: { authorizationId: string; currentHeadSha: string }): AuthorityValidationResult {
+  public validateAuthority(input: ValidateAuthorityInput): AuthorityValidationResult {
     const authorization = this.repo.getExecutionAuthorization(input.authorizationId);
     if (!authorization) return fail('AUTHORIZATION_NOT_FOUND', `ExecutionAuthorization "${input.authorizationId}" was not found.`);
     if (authorization.status !== 'AUTHORIZED' && authorization.status !== 'DISPATCHED') {
@@ -226,6 +249,61 @@ export class ProductTaskAutonomyAdapter {
       return fail('CANONICAL_PAYLOAD_BINDING_MISMATCH', 'Canonical payload no longer matches durable task identity.');
     }
 
+    if (!canonicalPayload.executionScope) {
+      return fail('EXECUTION_SCOPE_MISSING', 'ExecutionAuthorization canonical payload is missing required executionScope.');
+    }
+    const authorizedScope = canonicalPayload.executionScope;
+    if (!path.isAbsolute(authorizedScope.worktree) && !path.win32.isAbsolute(authorizedScope.worktree) && !path.posix.isAbsolute(authorizedScope.worktree)) {
+      return fail('WORKTREE_MUST_BE_ABSOLUTE', 'Authorized executionScope worktree must be an absolute path.');
+    }
+    if (!authorizedScope.allowedPaths || authorizedScope.allowedPaths.length === 0) {
+      return fail('ALLOWED_PATHS_REQUIRED', 'Authorized executionScope allowedPaths must contain at least one path.');
+    }
+
+    const hasAnyRuntimeScope =
+      input.branch !== undefined ||
+      input.worktree !== undefined ||
+      input.allowedPaths !== undefined ||
+      input.forbiddenPaths !== undefined;
+
+    if (input.requireScopeMatch || hasAnyRuntimeScope) {
+      if (
+        input.branch === undefined ||
+        input.worktree === undefined ||
+        input.allowedPaths === undefined ||
+        input.forbiddenPaths === undefined
+      ) {
+        return fail(
+          'RUNTIME_SCOPE_MISSING',
+          'Runtime execution scope (branch, worktree, allowedPaths, forbiddenPaths) is required and cannot be omitted.'
+        );
+      }
+      if (input.branch !== authorizedScope.branch) {
+        return fail(
+          'BRANCH_MISMATCH',
+          `Runtime branch "${input.branch}" does not match authorized branch "${authorizedScope.branch}".`
+        );
+      }
+      if (input.worktree !== authorizedScope.worktree) {
+        return fail(
+          'WORKTREE_MISMATCH',
+          `Runtime worktree "${input.worktree}" does not match authorized worktree "${authorizedScope.worktree}".`
+        );
+      }
+      if (!areStringArraysIdentical(input.allowedPaths, authorizedScope.allowedPaths)) {
+        return fail(
+          'ALLOWED_PATHS_MISMATCH',
+          `Runtime allowedPaths [${input.allowedPaths.join(', ')}] do not match authorized allowedPaths [${authorizedScope.allowedPaths.join(', ')}].`
+        );
+      }
+      if (!areStringArraysIdentical(input.forbiddenPaths, authorizedScope.forbiddenPaths)) {
+        return fail(
+          'FORBIDDEN_PATHS_MISMATCH',
+          `Runtime forbiddenPaths [${input.forbiddenPaths.join(', ')}] do not match authorized forbiddenPaths [${authorizedScope.forbiddenPaths.join(', ')}].`
+        );
+      }
+    }
+
     const manifest = this.repo.getContextManifestByHash(authorization.context_manifest_hash);
     if (!manifest) return fail('CONTEXT_MANIFEST_NOT_FOUND', 'Authorization does not reference an existing ContextManifest.');
     const manifestResult = verifyContextManifestIntegrity(this.repo, manifest);
@@ -245,13 +323,17 @@ export class ProductTaskAutonomyAdapter {
   }
 
   public buildAuthorizedWorkOrder(input: AuthorizedWorkOrderInput): WorkOrder {
-    const validated = this.validateAuthority(input);
+    const validated = this.validateAuthority({ ...input, requireScopeMatch: true });
     if (!validated.valid || !validated.authority) throw new Error(`${validated.code}: ${validated.error}`);
-    if (!path.isAbsolute(input.worktree)) throw new Error('WORKTREE_MUST_BE_ABSOLUTE');
-    if (!input.allowedPaths.length) throw new Error('ALLOWED_PATHS_REQUIRED');
 
     const { task, authorization, assignment } = validated.authority;
     const payload = CanonicalExecutionPayloadSchema.parse(JSON.parse(authorization.canonical_payload_json!));
+    const authorizedScope = payload.executionScope!;
+    if (!path.isAbsolute(authorizedScope.worktree) && !path.win32.isAbsolute(authorizedScope.worktree) && !path.posix.isAbsolute(authorizedScope.worktree)) {
+      throw new Error('WORKTREE_MUST_BE_ABSOLUTE');
+    }
+    if (!authorizedScope.allowedPaths.length) throw new Error('ALLOWED_PATHS_REQUIRED');
+
     const requiredTests = Object.values(payload.verificationCommands)
       .filter((command): command is { executable: string; args: string[] } => command !== null)
       .map(renderCommand);
@@ -263,11 +345,11 @@ export class ProductTaskAutonomyAdapter {
       workerId: input.workerId,
       objective: task.description ?? task.title,
       baseSha: authorization.base_sha,
-      branch: input.branch,
-      worktree: input.worktree,
+      branch: authorizedScope.branch,
+      worktree: authorizedScope.worktree,
       dependencies: input.dependencies ?? [],
-      allowedPaths: input.allowedPaths,
-      forbiddenPaths: input.forbiddenPaths ?? ['.git'],
+      allowedPaths: [...authorizedScope.allowedPaths],
+      forbiddenPaths: [...authorizedScope.forbiddenPaths],
       acceptanceCriteria: [...payload.acceptanceCriteria],
       requiredTests,
       contextFiles: [...payload.contextFiles],
@@ -445,7 +527,7 @@ export class ProductTaskAutonomyAdapter {
   }
 
   public async executeProductTask(input: ExecuteProductTaskParams): Promise<ExecuteProductTaskResult> {
-    const validated = this.validateAuthority(input);
+    const validated = this.validateAuthority({ ...input, requireScopeMatch: true });
     if (!validated.valid || !validated.authority) {
       return { success: false, finalTaskState: 'UNKNOWN', leaseAcquired: false, leaseReleased: false, error: `${validated.code}: ${validated.error}` };
     }
@@ -566,6 +648,11 @@ export class ProductTaskAutonomyAdapter {
         const refreshedAuthority = this.validateAuthority({
           authorizationId: input.authorizationId,
           currentHeadSha: postReviewEvidence.headSha,
+          branch: input.branch,
+          worktree: input.worktree,
+          allowedPaths: input.allowedPaths,
+          forbiddenPaths: input.forbiddenPaths,
+          requireScopeMatch: true,
         });
         if (!freshness.fresh) {
           task = this.transitionTask(task.id, 'FIX_VERDICT', authorityEpoch);

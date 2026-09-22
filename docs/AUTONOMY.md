@@ -42,10 +42,23 @@ operational self-host dispatcher routes product tasks strictly through
 ProductTaskAutonomyAdapter with durable ExecutionAuthorization, failing closed
 (PRODUCT_TASK_REQUIRES_EXECUTION_AUTHORIZATION) if unauthenticated and rejecting
 any attempt to execute product tasks through legacy autonomy state
-(PRODUCT_TASK_CANNOT_USE_LEGACY_AUTONOMY_LIFECYCLE). ProductTaskAutonomyAdapter
-independently observes Git evidence and enforces path boundaries before verification
-or review: any changed file outside workOrder.allowed_paths or inside
-workOrder.forbidden_paths fails closed with WORKER_PATH_VIOLATION. When a manager
+(PRODUCT_TASK_CANNOT_USE_LEGACY_AUTONOMY_LIFECYCLE). Furthermore,
+ExecutionAuthorizationService authenticates execution scope (`branch`, absolute
+`worktree`, `allowedPaths`, and `forbiddenPaths`) within the durable
+CanonicalExecutionPayload and verifies it in `instruction_payload_hash`.
+ProductTaskAutonomyAdapter requires this authenticated executionScope, builds its
+WorkOrder strictly from the authorized scope values, and validates that runtime
+scope does not differ in any way. Any missing scope (EXECUTION_SCOPE_MISSING,
+RUNTIME_SCOPE_MISSING), expanded or narrowed/different allowed paths
+(ALLOWED_PATHS_MISMATCH), changed forbidden paths (FORBIDDEN_PATHS_MISMATCH),
+branch mismatch (BRANCH_MISMATCH), or worktree mismatch (WORKTREE_MISMATCH) fails
+closed before worker slot lease acquisition and coder execution. Non-product
+callers retain schema compatibility as executionScope is globally optional in
+CanonicalExecutionPayloadSchema, but product autonomy strictly fails closed when
+absent. ProductTaskAutonomyAdapter independently observes Git evidence and
+enforces path boundaries before verification or review: any changed file outside
+workOrder.allowed_paths or inside workOrder.forbidden_paths fails closed with
+WORKER_PATH_VIOLATION. When a manager
 review exception occurs (such as provider capacity, auth, rate-limit, timeout, offline,
 or contract-invalid failures) or a post-review HEAD or working-tree snapshot freshness
 violation occurs, the adapter transitions the authoritative task via TaskService using
