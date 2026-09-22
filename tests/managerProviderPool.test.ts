@@ -425,6 +425,15 @@ describe('manager provider pool', () => {
     expect(classify({ ...run('bad output'), status: 'CONTRACT_INVALID' }).state).toBe('CONTRACT_INVALID');
   });
 
+  it('does not misclassify contract diagnostics mentioning authorization as auth failures', () => {
+    expect(classify({
+      ...run('CONTRACT_INVALID: routed manager changed authorized constraints'),
+      status: 'CONTRACT_INVALID',
+      error: 'CONTRACT_INVALID: routed manager changed authorized constraints',
+    }).state)
+      .toBe('CONTRACT_INVALID');
+  });
+
   it('resumes a review from the durable context package after a provider switch', async () => {
     const { db, store } = setup();
     const first = new ManagerProviderPool(store, [{

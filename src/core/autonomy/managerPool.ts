@@ -146,6 +146,11 @@ function ensureProductEndpointResource(store: AutonomyStore, endpoint: ProviderE
 export function classify(run: ProviderRun): { state: ManagerResourceState; cooldownUntil: string | null } {
   const text = `${run.stdout}\n${run.stderr}\n${run.error ?? ''}`;
   if (run.status === 'SUCCESSFUL_PROCESS_EXIT') return { state: 'AVAILABLE', cooldownUntil: null };
+  // Explicit transport/contract status is authoritative. Contract diagnostics
+  // frequently contain words such as "authorized"; text heuristics must not
+  // misclassify those validation failures as credential failures.
+  if (run.status === 'AUTH_ERROR') return { state: 'AUTH_ERROR', cooldownUntil: null };
+  if (run.status === 'CONTRACT_INVALID') return { state: 'CONTRACT_INVALID', cooldownUntil: null };
   if (/ROUTE_CAPACITY_EXHAUSTED|capacity.*exhaust/i.test(text)) {
     return { state: 'CAPACITY_EXHAUSTED', cooldownUntil: null };
   }
@@ -162,10 +167,10 @@ export function classify(run: ProviderRun): { state: ManagerResourceState; coold
   if (/cooldown/i.test(text)) {
     return { state: 'COOLDOWN', cooldownUntil: new Date(Date.now() + 60_000).toISOString() };
   }
-  if (run.status === 'AUTH_ERROR' || /auth|not logged|unauthorized|invalid token/i.test(text)) {
+  if (/auth|not logged|unauthorized|invalid token/i.test(text)) {
     return { state: 'AUTH_ERROR', cooldownUntil: null };
   }
-  if (run.status === 'CONTRACT_INVALID' || /CONTRACT_INVALID/i.test(text)) {
+  if (/CONTRACT_INVALID/i.test(text)) {
     return { state: 'CONTRACT_INVALID', cooldownUntil: null };
   }
   if (run.status === 'TIMEOUT') {
