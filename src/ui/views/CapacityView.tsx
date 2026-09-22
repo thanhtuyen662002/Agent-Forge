@@ -2,26 +2,108 @@ import React, { useState } from 'react';
 import { useOrchestrator } from '../context/OrchestratorContext';
 import { useI18n } from '../context/I18nContext';
 import { QuotaBadge } from '../components/QuotaBadge';
-import { ProviderResource } from '../../core/types/domain';
-import { Cpu, Edit2, ShieldAlert, Check, RefreshCw } from 'lucide-react';
+import { ProviderResource, QuotaSource } from '../../core/types/domain';
+import { Cpu, Edit2 } from 'lucide-react';
+
+export interface QuotaSnapshotResolution {
+  remaining: number | null;
+  total: number | null;
+  source: QuotaSource;
+  confidence: number;
+}
+
+/**
+ * Formats a provider quota value for display in the quota editor input.
+ * Preserves a real zero as '0' and represents null/undefined as an empty string ('')
+ * rather than inventing numeric defaults like 0 or 100.
+ */
+export function formatQuotaInput(value: number | string | null | undefined): string {
+  if (value === null || value === undefined) {
+    return '';
+  }
+  if (typeof value === 'string') {
+    return value.trim();
+  }
+  return String(value);
+}
+
+/**
+ * Parses an input value from the quota editor.
+ * Returns null for empty strings, null, or undefined.
+ * Returns the parsed number if finite numeric (preserving zero as 0).
+ */
+export function parseQuotaInput(input: number | string | null | undefined): number | null {
+  if (input === null || input === undefined) {
+    return null;
+  }
+  if (typeof input === 'number') {
+    return Number.isFinite(input) ? input : null;
+  }
+  const trimmed = String(input).trim();
+  if (trimmed === '') {
+    return null;
+  }
+  const parsed = Number(trimmed);
+  return Number.isFinite(parsed) ? parsed : null;
+}
+
+export const parseQuotaValue = parseQuotaInput;
+
+/**
+ * Resolves editor inputs into a truthful quota snapshot payload.
+ *
+ * Rules:
+ * 1. If both remaining and total inputs are empty/null:
+ *    persists remaining=null, total=null, source='UNKNOWN', confidence=0.
+ * 2. If entered numeric quota values are provided:
+ *    persists numeric remaining/total with source='MANUAL' and confidence=1.
+ */
+export function resolveQuotaSnapshot(
+  remainingInput: number | string | null | undefined,
+  totalInput: number | string | null | undefined
+): QuotaSnapshotResolution {
+  const remaining = parseQuotaInput(remainingInput);
+  const total = parseQuotaInput(totalInput);
+
+  if (remaining === null && total === null) {
+    return {
+      remaining: null,
+      total: null,
+      source: 'UNKNOWN',
+      confidence: 0,
+    };
+  }
+
+  return {
+    remaining,
+    total,
+    source: 'MANUAL',
+    confidence: 1,
+  };
+}
+
+export const resolveQuotaUpdate = resolveQuotaSnapshot;
 
 export const CapacityView: React.FC = () => {
   const { resources, updateResourceQuota } = useOrchestrator();
   const { t } = useI18n();
   const [editingResource, setEditingResource] = useState<ProviderResource | null>(null);
-  const [editRemaining, setEditRemaining] = useState<number>(0);
-  const [editTotal, setEditTotal] = useState<number>(100);
+  const [editRemaining, setEditRemaining] = useState<string>('');
+  const [editTotal, setEditTotal] = useState<string>('');
 
   const handleSaveQuota = async () => {
     if (!editingResource) return;
+    const snapshot = resolveQuotaSnapshot(editRemaining, editTotal);
     await updateResourceQuota(
       editingResource.id,
-      editRemaining,
-      editTotal,
-      'MANUAL',
-      1.0
+      snapshot.remaining,
+      snapshot.total,
+      snapshot.source,
+      snapshot.confidence
     );
     setEditingResource(null);
+    setEditRemaining('');
+    setEditTotal('');
   };
 
   return (
@@ -78,8 +160,8 @@ export const CapacityView: React.FC = () => {
               <button
                 onClick={() => {
                   setEditingResource(res);
-                  setEditRemaining(res.remaining_quota || 0);
-                  setEditTotal(res.total_quota || 100);
+                  setEditRemaining(formatQuotaInput(res.remaining_quota));
+                  setEditTotal(formatQuotaInput(res.total_quota));
                 }}
                 className="w-full py-1.5 bg-surface hover:bg-surface-hover text-slate-300 rounded-lg border border-surface-border text-xs font-mono flex items-center justify-center space-x-1.5 transition"
               >
@@ -107,7 +189,8 @@ export const CapacityView: React.FC = () => {
                 <input
                   type="number"
                   value={editRemaining}
-                  onChange={(e) => setEditRemaining(Number(e.target.value))}
+                  onChange={(e) => setEditRemaining(e.target.value)}
+                  placeholder="—"
                   className="w-full bg-surface-card border border-surface-border rounded-lg px-3 py-2 text-white font-mono focus:outline-none focus:border-forge-cyan"
                 />
               </div>
@@ -117,7 +200,8 @@ export const CapacityView: React.FC = () => {
                 <input
                   type="number"
                   value={editTotal}
-                  onChange={(e) => setEditTotal(Number(e.target.value))}
+                  onChange={(e) => setEditTotal(e.target.value)}
+                  placeholder="—"
                   className="w-full bg-surface-card border border-surface-border rounded-lg px-3 py-2 text-white font-mono focus:outline-none focus:border-forge-cyan"
                 />
               </div>
@@ -125,7 +209,11 @@ export const CapacityView: React.FC = () => {
 
             <div className="flex justify-end space-x-3 pt-3 border-t border-surface-border">
               <button
-                onClick={() => setEditingResource(null)}
+                onClick={() => {
+                  setEditingResource(null);
+                  setEditRemaining('');
+                  setEditTotal('');
+                }}
                 className="px-4 py-2 bg-surface-card hover:bg-surface-border text-slate-300 rounded-lg text-xs"
               >
                 {t('capacity.cancel')}
