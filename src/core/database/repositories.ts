@@ -1139,6 +1139,62 @@ export class Repository {
       .run(remaining, total, source, confidence, now, id);
   }
 
+  /**
+   * Atomically records route/resource health and, when the resource is bound
+   * to an Agent Forge account identity, mirrors that route-level state onto
+   * the account. Provider implementations must use this repository boundary
+   * instead of writing account-health columns directly.
+   *
+   * An unbound resource is valid here: externally routed endpoints may keep
+   * their credentials in an external secret source and expose only one
+   * route-level capacity resource to Agent Forge.
+   */
+  public recordProviderResourceHealth(
+    id: string,
+    healthStatus: ProviderHealthStatus,
+    cooldownUntil: string | null,
+    failureCode: string | null,
+    exhaustQuota = false
+  ): void {
+    const resource = this.getProviderResource(id);
+    if (!resource) {
+      throw new Error(`Provider resource '${id}' not found`);
+    }
+    const now = new Date().toISOString();
+    this.db.transaction(() => {
+      this.db
+        .prepare(`
+          UPDATE provider_resources
+          SET health_status = ?,
+              last_health_check = ?,
+              remaining_quota = CASE WHEN ? = 1 THEN 0 ELSE remaining_quota END
+          WHERE id = ?
+        `)
+        .run(healthStatus, now, exhaustQuota ? 1 : 0, id);
+
+      if (!resource.provider_account_id) return;
+      if (healthStatus === 'AVAILABLE') {
+        this.db
+          .prepare(`
+            UPDATE provider_accounts
+            SET health_status = 'AVAILABLE', cooldown_until = NULL,
+                last_success_at = ?, updated_at = ?
+            WHERE id = ?
+          `)
+          .run(now, now, resource.provider_account_id);
+        return;
+      }
+      this.db
+        .prepare(`
+          UPDATE provider_accounts
+          SET health_status = ?, cooldown_until = ?, last_failure_at = ?,
+              last_failure_code = ?, updated_at = ?
+          WHERE id = ?
+        `)
+        .run(healthStatus, cooldownUntil, now, failureCode, now, resource.provider_account_id);
+    })();
+  }
+
   // ==========================================
   // Agents
   // ==========================================
@@ -8618,6 +8674,24 @@ export class Repository {
       evidence_id: row.evidence_id ? String(row.evidence_id) : null,
       created_at: String(row.created_at),
     };
+  }
+
+  public getTestRunsByTaskId(taskId: string): TestRun[] {
+    const rows = this.db
+      .prepare('SELECT * FROM test_runs WHERE task_id = ? ORDER BY created_at ASC, rowid ASC')
+      .all(taskId) as Record<string, unknown>[];
+    return rows.map((row) => ({
+      id: String(row.id),
+      task_id: String(row.task_id),
+      command: String(row.command),
+      passed_count: Number(row.passed_count),
+      failed_count: Number(row.failed_count),
+      skipped_count: Number(row.skipped_count),
+      duration_ms: Number(row.duration_ms),
+      exit_code: Number(row.exit_code),
+      evidence_id: row.evidence_id ? String(row.evidence_id) : null,
+      created_at: String(row.created_at),
+    }));
   }
 
   public getLatestEvidence(taskId: string, evidenceType: string): Evidence | null {

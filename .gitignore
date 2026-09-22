@@ -12,6 +12,8 @@ coverage/
 
 # Local SQLite & Runtime Data
 .agent-forge/
+.agent-forge-runtime/
+.agent-forge-worktrees/
 .test-artifacts/
 *.log
 *.sqlite

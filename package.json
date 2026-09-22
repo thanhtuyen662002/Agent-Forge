@@ -23,7 +23,17 @@
     "mcp:submission-stdio": "node dist-electron/mcp/stdio-submit.js",
     "mcp:submission-admin": "node dist-electron/mcp/submissionAdmin.js",
     "mcp:reviewer-stdio": "node dist-electron/mcp/stdio-review.js",
-    "mcp:reviewer-admin": "node dist-electron/mcp/reviewerAdmin.js"
+    "mcp:reviewer-admin": "node dist-electron/mcp/reviewerAdmin.js",
+    "autonomy:doctor": "node dist-electron/electron/autonomyCli.js doctor",
+    "autonomy:doctor:omniroute": "node dist-electron/electron/autonomyCli.js doctor-omniroute",
+    "autonomy:shadow": "node dist-electron/electron/autonomyCli.js shadow",
+    "autonomy:pilot": "node dist-electron/electron/autonomyCli.js pilot",
+    "autonomy:start": "node dist-electron/electron/autonomyCli.js start",
+    "autonomy:status": "node dist-electron/electron/autonomyCli.js status",
+    "autonomy:stop": "node dist-electron/electron/autonomyCli.js stop",
+    "autonomy:recover": "node dist-electron/electron/autonomyCli.js recover",
+    "autonomy:observe": "node dist-electron/electron/autonomyCli.js observe",
+    "autonomy:register-ci": "node dist-electron/electron/autonomyCli.js register-ci"
   },
   "dependencies": {
     "@modelcontextprotocol/server": "2.0.0",

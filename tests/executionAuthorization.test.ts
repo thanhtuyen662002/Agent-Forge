@@ -29,9 +29,10 @@ import {
   ExecutionAuthorizationService,
   computeCanonicalPayload,
   computePayloadHash,
-  computeContextManifestHash,
   sanitizeContextFiles,
 } from '../src/core/services/ExecutionAuthorizationService';
+import { ContextBuilderService } from '../src/core/services/ContextBuilderService';
+import { ProductTaskAutonomyAdapter } from '../src/core/autonomy/productTaskAdapter';
 
 class MockExecutionAdapter implements ProviderAdapter {
   public executionCount = 0;
@@ -1341,4 +1342,862 @@ describe('PR #7 — Durable Execution Authorization & Orchestration Binding', ()
 
     reopenedDb.close();
   }, 60000);
+
+  // =========================================================================
+  // PR62 — PRODUCT EXECUTION AUTHORIZATION DURABLE BINDINGS
+  // =========================================================================
+  describe('PR62 — Product Execution Authorization Durable Bindings', () => {
+    function setupProductBindingFixture(overrides: {
+      taskId?: string;
+      projectId?: string;
+      taskOwnershipEpoch?: number;
+      accountEnabled?: boolean;
+      providerEnabled?: boolean;
+      resourceAccountMismatch?: boolean;
+      resourceEnabled?: boolean;
+      routingDecisionId?: string;
+      assignmentRoutingDecisionId?: string;
+      assignmentAttemptId?: string | null;
+      assignmentTaskId?: string;
+      assignmentProjectId?: string;
+      assignmentProviderId?: string;
+      assignmentAccountId?: string;
+      assignmentResourceId?: string;
+      manifestAssignmentId?: string;
+      routingSelectedAssignmentId?: string | null;
+      routingSelectedAccountId?: string | null;
+      preferredMetadataEpoch?: number;
+      taskState?: 'CODING' | 'APPROVED' | 'DONE';
+    } = {}) {
+      const now = new Date().toISOString();
+      const projectId = overrides.projectId ?? 'PROJ-AUTH';
+      const taskId = overrides.taskId ?? 'TSK-AUTH-001';
+      const providerId = 'prov-prod-1';
+      const accountId = 'acc-prod-1';
+      const resourceId = 'res-prod-1';
+      const roleProfileId = 'role-prod-coder';
+      const assignmentId = `asgn-${taskId}-${crypto.randomUUID().slice(0, 8)}`;
+      const routingDecisionId = overrides.routingDecisionId ?? `route-dec-${taskId}-${crypto.randomUUID().slice(0, 8)}`;
+      const taskEpoch = overrides.taskOwnershipEpoch ?? 1;
+
+      if (!repo.getProject(projectId)) {
+        repo.createProject({
+          id: projectId,
+          name: `Project ${projectId}`,
+          description: null,
+          repository_path: tmpDir,
+          default_branch: 'main',
+          status: 'RUNNING',
+          contract: null,
+          created_at: now,
+          updated_at: now,
+          started_at: null,
+          completed_at: null,
+        });
+      }
+
+      if (!repo.getTask(taskId)) {
+        repo.createTask({
+          id: taskId,
+          project_id: projectId,
+          milestone_id: null,
+          title: `Task ${taskId}`,
+          description: `Task description for ${taskId}`,
+          state: overrides.taskState ?? 'CODING',
+          paused_from_state: null,
+          priority: 'HIGH',
+          risk: 'MEDIUM',
+          assigned_agent_id: null,
+          revision_count: 0,
+          max_revisions: 3,
+          base_sha: initialGitSha,
+          current_sha: null,
+          progress_cache_percent: 0,
+          progress_computed_at: null,
+          acceptance_criteria: ['AC'],
+          constraints: [],
+          ownership_epoch: taskEpoch,
+          created_at: now,
+          updated_at: now,
+        });
+        recordAppliedManagerMessage(projectId, taskId, {
+          decision: 'EXECUTE',
+          expected_revision: 0,
+        });
+      } else {
+        db.prepare('UPDATE tasks SET ownership_epoch = ? WHERE id = ?').run(taskEpoch, taskId);
+        if (overrides.taskState) {
+          db.prepare('UPDATE tasks SET state = ? WHERE id = ?').run(overrides.taskState, taskId);
+        }
+      }
+
+      let mock = registry.get(providerId) as MockExecutionAdapter;
+      if (!mock) {
+        mock = new MockExecutionAdapter(providerId, `Mock ${providerId}`);
+        registry.register(mock);
+      }
+
+      if (!repo.getProvider(providerId)) {
+        repo.createProvider({
+          id: providerId,
+          name: `Provider ${providerId}`,
+          adapter_type: 'LOCAL_CLI',
+          enabled: overrides.providerEnabled ?? true,
+          created_at: now,
+        });
+      } else if (overrides.providerEnabled !== undefined) {
+        db.prepare('UPDATE providers SET enabled = ? WHERE id = ?').run(overrides.providerEnabled ? 1 : 0, providerId);
+      }
+
+      if (overrides.assignmentProviderId && overrides.assignmentProviderId !== providerId) {
+        if (!repo.getProvider(overrides.assignmentProviderId)) {
+          repo.createProvider({
+            id: overrides.assignmentProviderId,
+            name: `Provider ${overrides.assignmentProviderId}`,
+            adapter_type: 'LOCAL_CLI',
+            enabled: true,
+            created_at: now,
+          });
+        }
+      }
+
+      if (!repo.getProviderAccount(accountId)) {
+        repo.createProviderAccount({
+          id: accountId,
+          provider_id: providerId,
+          label: 'Product Account 1',
+          auth_mode: 'NATIVE_PROFILE',
+          credential_ref: null,
+          profile_ref: 'native-profile://antigravity/default',
+          enabled: overrides.accountEnabled ?? true,
+          priority: 100,
+          health_status: 'AVAILABLE',
+          cooldown_until: null,
+          concurrency_limit: 2,
+          last_success_at: null,
+          last_failure_at: null,
+          last_failure_code: null,
+          created_at: now,
+          updated_at: now,
+        });
+      } else if (overrides.accountEnabled !== undefined) {
+        db.prepare('UPDATE provider_accounts SET enabled = ? WHERE id = ?').run(overrides.accountEnabled ? 1 : 0, accountId);
+      }
+
+      if (overrides.resourceAccountMismatch) {
+        if (!repo.getProviderAccount('other-acc-mismatch')) {
+          repo.createProviderAccount({
+            id: 'other-acc-mismatch',
+            provider_id: providerId,
+            label: 'Other Account For Mismatch',
+            auth_mode: 'NATIVE_PROFILE',
+            credential_ref: null,
+            profile_ref: 'native-profile://antigravity/other',
+            enabled: true,
+            priority: 100,
+            health_status: 'AVAILABLE',
+            cooldown_until: null,
+            concurrency_limit: 2,
+            last_success_at: null,
+            last_failure_at: null,
+            last_failure_code: null,
+            created_at: now,
+            updated_at: now,
+          });
+        }
+      }
+
+      const assignedAccountForResource = overrides.resourceAccountMismatch
+        ? 'other-acc-mismatch'
+        : accountId;
+
+      if (!repo.getProviderResource(resourceId)) {
+        repo.createProviderResource({
+          id: resourceId,
+          provider_id: providerId,
+          provider_account_id: assignedAccountForResource,
+          model_name: 'Product Model',
+          health_status: 'AVAILABLE',
+          capabilities: ['CODING', 'FILESYSTEM_EDIT', 'TEST_EXECUTION'],
+          enabled: overrides.resourceEnabled ?? true,
+          total_quota: null,
+          remaining_quota: null,
+          quota_unit: 'REQUESTS',
+          quota_reset_at: null,
+          quota_source: 'UNKNOWN',
+          quota_confidence: 0,
+          last_health_check: now,
+        });
+      } else {
+        if (overrides.resourceEnabled !== undefined) {
+          db.prepare('UPDATE provider_resources SET enabled = ? WHERE id = ?').run(overrides.resourceEnabled ? 1 : 0, resourceId);
+        }
+        if (overrides.resourceAccountMismatch !== undefined) {
+          db.prepare('UPDATE provider_resources SET provider_account_id = ? WHERE id = ?').run(assignedAccountForResource, resourceId);
+        }
+      }
+
+      if (overrides.assignmentResourceId && overrides.assignmentResourceId !== resourceId) {
+        if (!repo.getProviderResource(overrides.assignmentResourceId)) {
+          repo.createProviderResource({
+            id: overrides.assignmentResourceId,
+            provider_id: providerId,
+            provider_account_id: accountId,
+            model_name: 'Other Model',
+            health_status: 'AVAILABLE',
+            capabilities: ['CODING'],
+            enabled: true,
+            total_quota: null,
+            remaining_quota: null,
+            quota_unit: 'REQUESTS',
+            quota_reset_at: null,
+            quota_source: 'UNKNOWN',
+            quota_confidence: 0,
+            last_health_check: now,
+          });
+        }
+      }
+
+      if (!repo.getRoleProfile(roleProfileId)) {
+        repo.createRoleProfile({
+          id: roleProfileId,
+          role: 'CODER',
+          display_name: 'Coder',
+          required_capabilities: ['CODING'],
+          preferred_capabilities: [],
+          authority_scope: null,
+          permissions: ['FILESYSTEM_EDIT'],
+          output_protocol: 'coder.v1',
+          enabled: true,
+          created_at: now,
+          updated_at: now,
+        });
+      }
+
+      if (overrides.assignmentProjectId && !repo.getProject(overrides.assignmentProjectId)) {
+        repo.createProject({
+          id: overrides.assignmentProjectId,
+          name: `Project ${overrides.assignmentProjectId}`,
+          description: null,
+          repository_path: tmpDir,
+          default_branch: 'main',
+          status: 'RUNNING',
+          contract: null,
+          created_at: now,
+          updated_at: now,
+          started_at: null,
+          completed_at: null,
+        });
+      }
+
+      if (overrides.assignmentTaskId && !repo.getTask(overrides.assignmentTaskId)) {
+        repo.createTask({
+          id: overrides.assignmentTaskId,
+          project_id: overrides.assignmentProjectId ?? projectId,
+          milestone_id: null,
+          title: `Task ${overrides.assignmentTaskId}`,
+          description: null,
+          state: 'CODING',
+          paused_from_state: null,
+          priority: 'HIGH',
+          risk: 'MEDIUM',
+          assigned_agent_id: null,
+          revision_count: 0,
+          max_revisions: 3,
+          base_sha: initialGitSha,
+          current_sha: null,
+          progress_cache_percent: 0,
+          progress_computed_at: null,
+          acceptance_criteria: [],
+          constraints: [],
+          ownership_epoch: 1,
+          created_at: now,
+          updated_at: now,
+        });
+      }
+
+      if (overrides.assignmentAttemptId && !repo.getTaskAttempt(overrides.assignmentAttemptId)) {
+        repo.createTaskAttempt({
+          id: overrides.assignmentAttemptId,
+          task_id: overrides.assignmentTaskId ?? taskId,
+          attempt_number: 1,
+          agent_id: 'agent-1',
+          status: 'RUNNING',
+          started_at: now,
+          ended_at: null,
+          summary: null,
+        });
+      }
+
+      if (overrides.assignmentAccountId && overrides.assignmentAccountId !== accountId) {
+        if (!repo.getProviderAccount(overrides.assignmentAccountId)) {
+          repo.createProviderAccount({
+            id: overrides.assignmentAccountId,
+            provider_id: providerId,
+            label: 'Temp Missing Account',
+            auth_mode: 'NATIVE_PROFILE',
+            credential_ref: null,
+            profile_ref: 'native-profile://antigravity/default',
+            enabled: true,
+            priority: 100,
+            health_status: 'AVAILABLE',
+            cooldown_until: null,
+            concurrency_limit: 2,
+            last_success_at: null,
+            last_failure_at: null,
+            last_failure_code: null,
+            created_at: now,
+            updated_at: now,
+          });
+        }
+      }
+
+      repo.createAgentAssignment({
+        id: assignmentId,
+        project_id: overrides.assignmentProjectId ?? projectId,
+        task_id: overrides.assignmentTaskId ?? taskId,
+        attempt_id: overrides.assignmentAttemptId !== undefined ? overrides.assignmentAttemptId : null,
+        role_profile_id: roleProfileId,
+        agent_profile_id: null,
+        selected_provider_id: overrides.assignmentProviderId ?? providerId,
+        selected_account_id: overrides.assignmentAccountId ?? accountId,
+        selected_resource_id: overrides.assignmentResourceId ?? resourceId,
+        selected_worker_slot_id: null,
+        routing_decision_id: overrides.assignmentRoutingDecisionId !== undefined ? overrides.assignmentRoutingDecisionId : routingDecisionId,
+        preferred_metadata: overrides.preferredMetadataEpoch !== undefined ? { ownership_epoch: overrides.preferredMetadataEpoch } : null,
+        status: 'ASSIGNED',
+        created_at: now,
+        ended_at: null,
+      });
+
+      if (overrides.assignmentAccountId === 'acc-nonexistent') {
+        db.pragma('foreign_keys = OFF');
+        db.prepare('DELETE FROM provider_accounts WHERE id = ?').run(overrides.assignmentAccountId);
+        db.pragma('foreign_keys = ON');
+      }
+
+      if (overrides.manifestAssignmentId && !repo.getAgentAssignment(overrides.manifestAssignmentId)) {
+        repo.createAgentAssignment({
+          id: overrides.manifestAssignmentId,
+          project_id: projectId,
+          task_id: taskId,
+          attempt_id: null,
+          role_profile_id: roleProfileId,
+          agent_profile_id: null,
+          selected_provider_id: providerId,
+          selected_account_id: accountId,
+          selected_resource_id: resourceId,
+          selected_worker_slot_id: null,
+          routing_decision_id: routingDecisionId,
+          preferred_metadata: null,
+          status: 'ASSIGNED',
+          created_at: now,
+          ended_at: null,
+        });
+      }
+
+      const routingPayload: Record<string, unknown> = {
+        decisionId: routingDecisionId,
+        projectId,
+        taskId,
+        attemptId: null,
+        candidateResourceIds: [resourceId],
+        selectedResourceId: resourceId,
+        selectedProviderId: providerId,
+        outcome: 'SELECTED',
+        reason: 'Selected product account',
+        candidateEvaluations: [],
+      };
+
+      if (overrides.routingSelectedAccountId !== null) {
+        routingPayload.selectedAccountId = overrides.routingSelectedAccountId ?? accountId;
+      }
+      if (overrides.routingSelectedAssignmentId !== null) {
+        routingPayload.selectedAssignmentId = overrides.routingSelectedAssignmentId ?? assignmentId;
+      }
+
+      eventService.record(
+        projectId,
+        'PROVIDER_ROUTING_DECISION',
+        `Routing decision: SELECTED for task ${taskId}`,
+        routingPayload,
+        taskId
+      );
+
+      let contextAssignmentId = overrides.manifestAssignmentId ?? assignmentId;
+      if (overrides.assignmentProjectId || overrides.assignmentTaskId) {
+        const validContextAssignmentId = `asgn-ctx-${taskId}`;
+        if (!repo.getAgentAssignment(validContextAssignmentId)) {
+          repo.createAgentAssignment({
+            id: validContextAssignmentId,
+            project_id: projectId,
+            task_id: taskId,
+            attempt_id: null,
+            role_profile_id: roleProfileId,
+            agent_profile_id: null,
+            selected_provider_id: providerId,
+            selected_account_id: accountId,
+            selected_resource_id: resourceId,
+            selected_worker_slot_id: null,
+            routing_decision_id: routingDecisionId,
+            preferred_metadata: null,
+            status: 'ASSIGNED',
+            created_at: now,
+            ended_at: null,
+          });
+        }
+        contextAssignmentId = validContextAssignmentId;
+      }
+
+      const context = new ContextBuilderService(repo).buildContextSnapshot({
+        projectId,
+        taskId,
+        assignmentId: contextAssignmentId,
+        purpose: 'EXECUTION',
+        includeProjectMemory: false,
+        includeTaskMemory: false,
+        includeLatestCheckpoint: false,
+        includeLatestHandoff: false,
+      });
+
+      const executionScope = {
+        branch: `agent/agy-01/${taskId}`,
+        worktree: path.join(tmpDir, 'worktrees', taskId),
+        allowedPaths: ['src'],
+        forbiddenPaths: ['.git'],
+      };
+
+      return {
+        projectId,
+        taskId,
+        routingDecisionId,
+        assignmentId,
+        accountId,
+        resourceId,
+        providerId,
+        taskEpoch,
+        contextManifestId: context.manifest.id,
+        executionScope,
+        mock,
+      };
+    }
+
+    it('creates product-bound authorization and durably persists assignment_id, selected_account_id, task_ownership_epoch, lifecycle_version=1', async () => {
+      const f = setupProductBindingFixture();
+
+      const auth = await authService.createAuthorization({
+        projectId: f.projectId,
+        taskId: f.taskId,
+        routingDecisionId: f.routingDecisionId,
+        assignmentId: f.assignmentId,
+        taskOwnershipEpoch: f.taskEpoch,
+        contextManifestId: f.contextManifestId,
+        executionScope: f.executionScope,
+      });
+
+      // Assert in-memory return values
+      expect(auth.assignment_id).toBe(f.assignmentId);
+      expect(auth.selected_account_id).toBe(f.accountId);
+      expect(auth.task_ownership_epoch).toBe(f.taskEpoch);
+      expect(auth.lifecycle_version).toBe(1);
+      expect(auth.status).toBe('AUTHORIZED');
+
+      // Assert durable persistence in SQLite repository
+      const loaded = repo.getExecutionAuthorization(auth.id);
+      expect(loaded).not.toBeNull();
+      expect(loaded!.assignment_id).toBe(f.assignmentId);
+      expect(loaded!.selected_account_id).toBe(f.accountId);
+      expect(loaded!.task_ownership_epoch).toBe(f.taskEpoch);
+      expect(loaded!.lifecycle_version).toBe(1);
+
+      // Raw database query
+      const row = db
+        .prepare('SELECT assignment_id, selected_account_id, task_ownership_epoch, lifecycle_version FROM execution_authorizations WHERE id = ?')
+        .get(auth.id) as Record<string, unknown>;
+      expect(row.assignment_id).toBe(f.assignmentId);
+      expect(row.selected_account_id).toBe(f.accountId);
+      expect(row.task_ownership_epoch).toBe(f.taskEpoch);
+      expect(row.lifecycle_version).toBe(1);
+
+      // Validate that ProductTaskAutonomyAdapter accepts this authority cleanly
+      const adapter = new ProductTaskAutonomyAdapter({ repo, artifactStore: {} as any });
+      const valResult = adapter.validateAuthority({
+        authorizationId: auth.id,
+        currentHeadSha: initialGitSha,
+        branch: f.executionScope.branch,
+        worktree: f.executionScope.worktree,
+        allowedPaths: f.executionScope.allowedPaths,
+        forbiddenPaths: f.executionScope.forbiddenPaths,
+        requireScopeMatch: true,
+      });
+      expect(valResult.valid).toBe(true);
+      expect(valResult.authority?.assignment.id).toBe(f.assignmentId);
+      expect(valResult.authority?.authorization.selected_account_id).toBe(f.accountId);
+      const repoAccount = repo.getProviderAccount(valResult.authority?.authorization.selected_account_id!);
+      expect(repoAccount).not.toBeNull();
+      expect(repoAccount?.id).toBe(f.accountId);
+    });
+
+    it('rejects partial product binding inputs when any required field is missing', async () => {
+      const f = setupProductBindingFixture();
+
+      // Missing assignmentId
+      await expect(
+        authService.createAuthorization({
+          projectId: f.projectId,
+          taskId: f.taskId,
+          routingDecisionId: f.routingDecisionId,
+          taskOwnershipEpoch: f.taskEpoch,
+          contextManifestId: f.contextManifestId,
+          executionScope: f.executionScope,
+        })
+      ).rejects.toThrow('EXECUTION_AUTHORIZATION_PRODUCT_BINDING_INCOMPLETE');
+
+      // Missing taskOwnershipEpoch
+      await expect(
+        authService.createAuthorization({
+          projectId: f.projectId,
+          taskId: f.taskId,
+          routingDecisionId: f.routingDecisionId,
+          assignmentId: f.assignmentId,
+          contextManifestId: f.contextManifestId,
+          executionScope: f.executionScope,
+        })
+      ).rejects.toThrow('EXECUTION_AUTHORIZATION_PRODUCT_BINDING_INCOMPLETE');
+
+      // Missing contextManifestId
+      await expect(
+        authService.createAuthorization({
+          projectId: f.projectId,
+          taskId: f.taskId,
+          routingDecisionId: f.routingDecisionId,
+          assignmentId: f.assignmentId,
+          taskOwnershipEpoch: f.taskEpoch,
+          executionScope: f.executionScope,
+        })
+      ).rejects.toThrow('EXECUTION_AUTHORIZATION_PRODUCT_BINDING_INCOMPLETE');
+
+      // Missing executionScope
+      await expect(
+        authService.createAuthorization({
+          projectId: f.projectId,
+          taskId: f.taskId,
+          routingDecisionId: f.routingDecisionId,
+          assignmentId: f.assignmentId,
+          taskOwnershipEpoch: f.taskEpoch,
+          contextManifestId: f.contextManifestId,
+        })
+      ).rejects.toThrow('EXECUTION_AUTHORIZATION_PRODUCT_BINDING_INCOMPLETE');
+
+      // Only executionScope passed
+      await expect(
+        authService.createAuthorization({
+          projectId: f.projectId,
+          taskId: f.taskId,
+          routingDecisionId: f.routingDecisionId,
+          executionScope: f.executionScope,
+        })
+      ).rejects.toThrow('EXECUTION_AUTHORIZATION_PRODUCT_BINDING_INCOMPLETE');
+
+      // Only assignmentId passed
+      await expect(
+        authService.createAuthorization({
+          projectId: f.projectId,
+          taskId: f.taskId,
+          routingDecisionId: f.routingDecisionId,
+          assignmentId: f.assignmentId,
+        })
+      ).rejects.toThrow('EXECUTION_AUTHORIZATION_PRODUCT_BINDING_INCOMPLETE');
+    });
+
+    it('rejects invalid executionScope with relative worktree or empty allowedPaths', async () => {
+      const f = setupProductBindingFixture();
+
+      // Relative worktree
+      await expect(
+        authService.createAuthorization({
+          projectId: f.projectId,
+          taskId: f.taskId,
+          routingDecisionId: f.routingDecisionId,
+          assignmentId: f.assignmentId,
+          taskOwnershipEpoch: f.taskEpoch,
+          contextManifestId: f.contextManifestId,
+          executionScope: {
+            branch: f.executionScope.branch,
+            worktree: './relative/path',
+            allowedPaths: ['src'],
+            forbiddenPaths: [],
+          },
+        })
+      ).rejects.toThrow('EXECUTION_AUTHORIZATION_SCOPE_INVALID');
+
+      // Empty allowedPaths
+      await expect(
+        authService.createAuthorization({
+          projectId: f.projectId,
+          taskId: f.taskId,
+          routingDecisionId: f.routingDecisionId,
+          assignmentId: f.assignmentId,
+          taskOwnershipEpoch: f.taskEpoch,
+          contextManifestId: f.contextManifestId,
+          executionScope: {
+            branch: f.executionScope.branch,
+            worktree: f.executionScope.worktree,
+            allowedPaths: [],
+            forbiddenPaths: [],
+          },
+        })
+      ).rejects.toThrow('EXECUTION_AUTHORIZATION_SCOPE_INVALID');
+    });
+
+    it('rejects when task ownership epoch does not match requested epoch or assignment metadata', async () => {
+      const f = setupProductBindingFixture({ taskOwnershipEpoch: 2 });
+
+      // Request epoch 1 when task epoch is 2
+      await expect(
+        authService.createAuthorization({
+          projectId: f.projectId,
+          taskId: f.taskId,
+          routingDecisionId: f.routingDecisionId,
+          assignmentId: f.assignmentId,
+          taskOwnershipEpoch: 1,
+          contextManifestId: f.contextManifestId,
+          executionScope: f.executionScope,
+        })
+      ).rejects.toThrow('EXECUTION_AUTHORIZATION_OWNERSHIP_EPOCH_MISMATCH');
+
+      // Assignment preferred metadata epoch mismatch
+      repo.createTask({
+        id: 'TSK-EPOCH-META',
+        project_id: 'PROJ-AUTH',
+        milestone_id: null,
+        title: 'Epoch Meta Task',
+        description: 'Task with metadata epoch',
+        state: 'CODING',
+        paused_from_state: null,
+        priority: 'HIGH',
+        risk: 'LOW',
+        assigned_agent_id: null,
+        revision_count: 0,
+        max_revisions: 3,
+        base_sha: initialGitSha,
+        current_sha: null,
+        progress_cache_percent: 0,
+        progress_computed_at: null,
+        acceptance_criteria: [],
+        constraints: [],
+        ownership_epoch: 1,
+        created_at: new Date().toISOString(),
+        updated_at: new Date().toISOString(),
+      });
+      recordAppliedManagerMessage('PROJ-AUTH', 'TSK-EPOCH-META', {
+        decision: 'EXECUTE',
+        expected_revision: 0,
+      });
+      const f2 = setupProductBindingFixture({ taskId: 'TSK-EPOCH-META', preferredMetadataEpoch: 5 });
+
+      await expect(
+        authService.createAuthorization({
+          projectId: f2.projectId,
+          taskId: 'TSK-EPOCH-META',
+          routingDecisionId: f2.routingDecisionId,
+          assignmentId: f2.assignmentId,
+          taskOwnershipEpoch: 1,
+          contextManifestId: f2.contextManifestId,
+          executionScope: f2.executionScope,
+        })
+      ).rejects.toThrow('EXECUTION_AUTHORIZATION_OWNERSHIP_EPOCH_MISMATCH');
+    });
+
+    it('rejects when AgentAssignment does not belong to the same project/task/attempt/routing decision', async () => {
+      // Assignment not found
+      const f = setupProductBindingFixture();
+      await expect(
+        authService.createAuthorization({
+          projectId: f.projectId,
+          taskId: f.taskId,
+          routingDecisionId: f.routingDecisionId,
+          assignmentId: 'non-existent-assignment',
+          taskOwnershipEpoch: f.taskEpoch,
+          contextManifestId: f.contextManifestId,
+          executionScope: f.executionScope,
+        })
+      ).rejects.toThrow('EXECUTION_AUTHORIZATION_ASSIGNMENT_NOT_FOUND');
+
+      // Attempt mismatch
+      const fAtt = setupProductBindingFixture({ assignmentAttemptId: 'att-123' });
+      await expect(
+        authService.createAuthorization({
+          projectId: fAtt.projectId,
+          taskId: fAtt.taskId,
+          attemptId: null,
+          routingDecisionId: fAtt.routingDecisionId,
+          assignmentId: fAtt.assignmentId,
+          taskOwnershipEpoch: fAtt.taskEpoch,
+          contextManifestId: fAtt.contextManifestId,
+          executionScope: fAtt.executionScope,
+        })
+      ).rejects.toThrow('EXECUTION_AUTHORIZATION_ASSIGNMENT_MISMATCH');
+
+      // Routing decision mismatch
+      const fRoute = setupProductBindingFixture({ assignmentRoutingDecisionId: 'route-different' });
+      await expect(
+        authService.createAuthorization({
+          projectId: fRoute.projectId,
+          taskId: fRoute.taskId,
+          routingDecisionId: fRoute.routingDecisionId,
+          assignmentId: fRoute.assignmentId,
+          taskOwnershipEpoch: fRoute.taskEpoch,
+          contextManifestId: fRoute.contextManifestId,
+          executionScope: fRoute.executionScope,
+        })
+      ).rejects.toThrow('EXECUTION_AUTHORIZATION_ASSIGNMENT_MISMATCH');
+    });
+
+    it('rejects when routing decision event bindings disagree with assignment', async () => {
+      // routing selectedAssignmentId missing
+      const fAsgnMissing = setupProductBindingFixture({ routingSelectedAssignmentId: null });
+      await expect(
+        authService.createAuthorization({
+          projectId: fAsgnMissing.projectId,
+          taskId: fAsgnMissing.taskId,
+          routingDecisionId: fAsgnMissing.routingDecisionId,
+          assignmentId: fAsgnMissing.assignmentId,
+          taskOwnershipEpoch: fAsgnMissing.taskEpoch,
+          contextManifestId: fAsgnMissing.contextManifestId,
+          executionScope: fAsgnMissing.executionScope,
+        })
+      ).rejects.toThrow('EXECUTION_AUTHORIZATION_ROUTING_MISMATCH');
+
+      // routing selectedAssignmentId mismatch
+      const fAsgn = setupProductBindingFixture({ routingSelectedAssignmentId: 'asgn-other' });
+      await expect(
+        authService.createAuthorization({
+          projectId: fAsgn.projectId,
+          taskId: fAsgn.taskId,
+          routingDecisionId: fAsgn.routingDecisionId,
+          assignmentId: fAsgn.assignmentId,
+          taskOwnershipEpoch: fAsgn.taskEpoch,
+          contextManifestId: fAsgn.contextManifestId,
+          executionScope: fAsgn.executionScope,
+        })
+      ).rejects.toThrow('EXECUTION_AUTHORIZATION_ROUTING_MISMATCH');
+
+      // routing selectedAccountId missing
+      const fAccMissing = setupProductBindingFixture({ routingSelectedAccountId: null });
+      await expect(
+        authService.createAuthorization({
+          projectId: fAccMissing.projectId,
+          taskId: fAccMissing.taskId,
+          routingDecisionId: fAccMissing.routingDecisionId,
+          assignmentId: fAccMissing.assignmentId,
+          taskOwnershipEpoch: fAccMissing.taskEpoch,
+          contextManifestId: fAccMissing.contextManifestId,
+          executionScope: fAccMissing.executionScope,
+        })
+      ).rejects.toThrow('EXECUTION_AUTHORIZATION_ROUTING_MISMATCH');
+
+      // routing selectedAccountId mismatch
+      const fAcc = setupProductBindingFixture({ routingSelectedAccountId: 'acc-other' });
+      await expect(
+        authService.createAuthorization({
+          projectId: fAcc.projectId,
+          taskId: fAcc.taskId,
+          routingDecisionId: fAcc.routingDecisionId,
+          assignmentId: fAcc.assignmentId,
+          taskOwnershipEpoch: fAcc.taskEpoch,
+          contextManifestId: fAcc.contextManifestId,
+          executionScope: fAcc.executionScope,
+        })
+      ).rejects.toThrow('EXECUTION_AUTHORIZATION_ROUTING_MISMATCH');
+
+      // assignment resource mismatch
+      const fRes = setupProductBindingFixture({ assignmentResourceId: 'res-other' });
+      await expect(
+        authService.createAuthorization({
+          projectId: fRes.projectId,
+          taskId: fRes.taskId,
+          routingDecisionId: fRes.routingDecisionId,
+          assignmentId: fRes.assignmentId,
+          taskOwnershipEpoch: fRes.taskEpoch,
+          contextManifestId: fRes.contextManifestId,
+          executionScope: fRes.executionScope,
+        })
+      ).rejects.toThrow('EXECUTION_AUTHORIZATION_ROUTING_MISMATCH');
+    });
+
+    it('rejects when selected ProviderAccount is disabled', async () => {
+      // Account disabled
+      const fDisabled = setupProductBindingFixture({ accountEnabled: false });
+      await expect(
+        authService.createAuthorization({
+          projectId: fDisabled.projectId,
+          taskId: fDisabled.taskId,
+          routingDecisionId: fDisabled.routingDecisionId,
+          assignmentId: fDisabled.assignmentId,
+          taskOwnershipEpoch: fDisabled.taskEpoch,
+          contextManifestId: fDisabled.contextManifestId,
+          executionScope: fDisabled.executionScope,
+        })
+      ).rejects.toThrow('EXECUTION_AUTHORIZATION_ACCOUNT_DISABLED');
+
+    });
+
+    it('rejects when ContextManifest snapshot assignment_id does not match bound assignment', async () => {
+      const f = setupProductBindingFixture({ manifestAssignmentId: 'asgn-other-manifest' });
+
+      await expect(
+        authService.createAuthorization({
+          projectId: f.projectId,
+          taskId: f.taskId,
+          routingDecisionId: f.routingDecisionId,
+          assignmentId: f.assignmentId,
+          taskOwnershipEpoch: f.taskEpoch,
+          contextManifestId: f.contextManifestId,
+          executionScope: f.executionScope,
+        })
+      ).rejects.toThrow('EXECUTION_AUTHORIZATION_MANIFEST_MISMATCH');
+    });
+
+    it('preserves legacy manual authorization compatibility when no product bindings are requested', async () => {
+      setupResource('res-legacy-compat', 'prov-legacy-compat');
+      const decision = await router.route({
+        projectId: 'PROJ-AUTH',
+        taskId: 'TSK-AUTH-001',
+        requiredCapabilities: ['CODING'],
+        candidateResourceIds: ['res-legacy-compat'],
+        allowManualBridge: false,
+      });
+
+      // Call createAuthorization without any product binding fields
+      const auth = await authService.createAuthorization({
+        projectId: 'PROJ-AUTH',
+        taskId: 'TSK-AUTH-001',
+        routingDecisionId: decision.decisionId,
+      });
+
+      expect(auth).toBeDefined();
+      expect(auth.status).toBe('AUTHORIZED');
+      expect(auth.assignment_id).toBeNull();
+      expect(auth.selected_account_id).toBeUndefined();
+      expect(auth.task_ownership_epoch).toBeUndefined();
+      expect(auth.lifecycle_version).toBeNull();
+
+      // Check DB row: does not receive falsely complete product lifecycle binding
+      const loaded = repo.getExecutionAuthorization(auth.id);
+      expect(loaded).not.toBeNull();
+      expect(loaded!.assignment_id).toBeNull();
+      expect(loaded!.selected_account_id).toBeUndefined();
+      expect(loaded!.lifecycle_version).toBeNull();
+
+      // ProductTaskAutonomyAdapter rejects legacy authorizations because assignment_id is null
+      const adapter = new ProductTaskAutonomyAdapter({ repo, artifactStore: {} as any });
+      const valResult = adapter.validateAuthority({
+        authorizationId: auth.id,
+        currentHeadSha: initialGitSha,
+      });
+      expect(valResult.valid).toBe(false);
+      expect(valResult.code).toBe('ASSIGNMENT_NOT_BOUND');
+    });
+  });
 });

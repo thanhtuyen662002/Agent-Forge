@@ -1,5 +1,6 @@
 import React, { createContext, useContext, useState, useEffect, useCallback } from 'react';
 import { Project, Task, Agent, ProviderResource, EventRecord, Evidence, UIDensityMode } from '../../core/types/domain';
+import type { CanonicalExecutionScope } from '../../core/services/ExecutionAuthorizationService';
 
 // Check if Electron IPC is available
 const isElectron = typeof window !== 'undefined' && Boolean((window as any).orchestrator);
@@ -50,6 +51,7 @@ interface OrchestratorContextType {
     attemptId?: string | null;
     routingDecisionId: string;
     contextFiles?: string[];
+    executionScope?: CanonicalExecutionScope;
   }) => Promise<any>;
   dispatchAuthorization: (authorizationId: string) => Promise<any>;
   getOwnerHandoffSnapshot: (taskId: string) => Promise<any>;
@@ -345,6 +347,7 @@ export const OrchestratorProvider: React.FC<{ children: React.ReactNode }> = ({ 
     attemptId?: string | null;
     routingDecisionId: string;
     contextFiles?: string[];
+    executionScope?: CanonicalExecutionScope;
   }) => {
     if (!orchestrator) return { success: false, error: 'Desktop required.' };
     const res = await orchestrator.authorizeRoutedTask(data);

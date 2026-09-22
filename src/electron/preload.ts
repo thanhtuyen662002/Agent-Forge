@@ -1,4 +1,5 @@
 import { contextBridge, ipcRenderer } from 'electron';
+import type { CanonicalExecutionScope } from '../core/services/ExecutionAuthorizationService';
 
 export interface OrchestratorApi {
   // Repository Dialog
@@ -72,6 +73,7 @@ export interface OrchestratorApi {
     attemptId?: string | null;
     routingDecisionId: string;
     contextFiles?: string[];
+    executionScope?: CanonicalExecutionScope;
   }) => Promise<any>;
   dispatchAuthorization: (authorizationId: string) => Promise<any>;
   getOwnerHandoffSnapshot: (taskId: string) => Promise<any>;
