@@ -2,12 +2,15 @@ import crypto from 'crypto';
 import fs from 'fs';
 import os from 'os';
 import path from 'path';
-import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { ContextBuilderService } from '../src/core/services/ContextBuilderService';
 import {
   CanonicalExecutionPayload,
+  ExecutionAuthorizationService,
   computePayloadHash,
 } from '../src/core/services/ExecutionAuthorizationService';
+import { GitService } from '../src/core/services/GitService';
+import { EventService } from '../src/core/services/EventService';
 import { ArtifactStore } from '../src/core/services/ArtifactStore';
 import { WorkerSlotLeaseService } from '../src/core/services/WorkerSlotLeaseService';
 import { Repository } from '../src/core/database/repositories';
@@ -365,6 +368,175 @@ describe('product-task autonomy consolidation', () => {
     const result = adapter.validateAuthority(workOrderInput(fixture));
     expect(result.valid).toBe(true);
     expect(result.authority?.task.id).toBe(fixture.task.id);
+  });
+
+  it('validates an authorization created by the real ExecutionAuthorizationService without tests manually fabricating the authorization record', async () => {
+    seed(); // ensure project, provider, account, resource, role profile are seeded
+
+    const gitSpy = vi.spyOn(GitService, 'getHeadSha').mockResolvedValue({ status: 'SUCCESS', sha: BASE_SHA });
+    try {
+      const taskId = 'task-real-auth-service';
+      const projectId = 'project-product';
+      const now = new Date().toISOString();
+
+      const task: Task = {
+        id: taskId,
+        project_id: projectId,
+        milestone_id: null,
+        title: 'Real Service Authorization Task',
+        description: 'Exercise createAuthorization with real service',
+        state: 'CODING',
+        paused_from_state: null,
+        priority: 'HIGH',
+        risk: 'MEDIUM',
+        assigned_agent_id: null,
+        revision_count: 0,
+        max_revisions: 3,
+        base_sha: BASE_SHA,
+        current_sha: BASE_SHA,
+        progress_cache_percent: 0,
+        progress_computed_at: null,
+        acceptance_criteria: ['Authorization created by service validates cleanly'],
+        constraints: ['MAX_AGY_WORKERS=1'],
+        ownership_epoch: 1,
+        created_at: now,
+        updated_at: now,
+      };
+      repo.createTask(task);
+
+      // Record applied Manager EXECUTE message
+      const msgId = 'mgr-msg-real-auth';
+      const rawPayload = JSON.stringify({
+        protocol: 'manager.v1',
+        message_id: msgId,
+        project_id: projectId,
+        task_id: taskId,
+        decision: 'EXECUTE',
+        expected_revision: 0,
+        instructions: ['Implement task using real service authorization'],
+        acceptance_criteria: task.acceptance_criteria,
+        constraints: task.constraints,
+      });
+      const pHash = crypto.createHash('sha256').update(rawPayload).digest('hex');
+      repo.recordProtocolMessage(
+        'rec-mgr-real-auth',
+        msgId,
+        'manager.v1',
+        projectId,
+        taskId,
+        'APPROVED',
+        0,
+        pHash,
+        rawPayload,
+        'APPLIED',
+        undefined,
+        now
+      );
+
+      const routingDecisionId = 'route-decision-real-auth';
+      const assignmentId = `assignment-${taskId}`;
+
+      // Create assignment matching routing decision and provider/account/resource
+      repo.createAgentAssignment({
+        id: assignmentId,
+        project_id: projectId,
+        task_id: taskId,
+        attempt_id: null,
+        role_profile_id: 'role-coder',
+        agent_profile_id: null,
+        selected_provider_id: 'provider-agy',
+        selected_account_id: 'account-agy',
+        selected_resource_id: 'resource-agy',
+        selected_worker_slot_id: null,
+        routing_decision_id: routingDecisionId,
+        preferred_metadata: null,
+        status: 'ASSIGNED',
+        created_at: now,
+        ended_at: null,
+      });
+
+      // Record routing decision event
+      const eventService = new EventService(repo);
+      eventService.record(
+        projectId,
+        'PROVIDER_ROUTING_DECISION',
+        `Routing decision: SELECTED for task ${taskId}`,
+        {
+          decisionId: routingDecisionId,
+          projectId,
+          taskId,
+          attemptId: null,
+          candidateResourceIds: ['resource-agy'],
+          selectedResourceId: 'resource-agy',
+          selectedProviderId: 'provider-agy',
+          selectedAccountId: 'account-agy',
+          selectedAssignmentId: assignmentId,
+          outcome: 'SELECTED',
+          reason: 'Selected Antigravity account',
+          candidateEvaluations: [],
+        },
+        taskId
+      );
+
+      // Create context manifest bound to assignment
+      const context = new ContextBuilderService(repo).buildContextSnapshot({
+        projectId,
+        taskId,
+        assignmentId,
+        purpose: 'EXECUTION',
+        includeProjectMemory: false,
+        includeTaskMemory: false,
+        includeLatestCheckpoint: false,
+        includeLatestHandoff: false,
+      });
+
+      const executionScope = {
+        branch: `agent/agy-01/${taskId}`,
+        worktree: path.join(root, 'worktrees', taskId),
+        allowedPaths: ['src'],
+        forbiddenPaths: ['.git'],
+      };
+
+      // Call the REAL service to create the authorization
+      const authService = new ExecutionAuthorizationService(repo, eventService);
+      const createdAuth = await authService.createAuthorization({
+        projectId,
+        taskId,
+        routingDecisionId,
+        assignmentId,
+        taskOwnershipEpoch: 1,
+        contextManifestId: context.manifest.id,
+        executionScope,
+      });
+
+      expect(createdAuth.assignment_id).toBe(assignmentId);
+      expect(createdAuth.selected_account_id).toBe('account-agy');
+      expect(createdAuth.task_ownership_epoch).toBe(1);
+      expect(createdAuth.lifecycle_version).toBe(1);
+      expect(createdAuth.status).toBe('AUTHORIZED');
+
+      // Now validate authority via ProductTaskAutonomyAdapter
+      const validation = adapter.validateAuthority({
+        authorizationId: createdAuth.id,
+        currentHeadSha: BASE_SHA,
+        branch: executionScope.branch,
+        worktree: executionScope.worktree,
+        allowedPaths: executionScope.allowedPaths,
+        forbiddenPaths: executionScope.forbiddenPaths,
+        requireScopeMatch: true,
+      });
+
+      expect(validation.valid).toBe(true);
+      expect(validation.authority?.task.id).toBe(taskId);
+      expect(validation.authority?.authorization.id).toBe(createdAuth.id);
+      expect(validation.authority?.assignment.id).toBe(assignmentId);
+      expect(validation.authority?.authorization.selected_account_id).toBe('account-agy');
+      const repoAccount = repo.getProviderAccount(validation.authority?.authorization.selected_account_id!);
+      expect(repoAccount).not.toBeNull();
+      expect(repoAccount?.id).toBe('account-agy');
+    } finally {
+      gitSpy.mockRestore();
+    }
   });
 
   it('fails closed when a product authorization omits durable execution scope', async () => {

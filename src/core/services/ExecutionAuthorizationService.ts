@@ -7,8 +7,9 @@ import { PolicyService } from './PolicyService';
 import { GitService } from './GitService';
 import { ProtocolParser } from '../protocol/parser';
 import {
+  AgentAssignment,
   ExecutionAuthorization,
-  TaskState,
+  ProviderAccount,
 } from '../types/domain';
 import { ManagerProtocol } from '../types/protocols';
 import { sanitizeContextFiles, verifyContextManifestIntegrity } from '../context/ContextIntegrity';
@@ -363,6 +364,38 @@ export class ExecutionAuthorizationService {
     const createdAt = new Date().toISOString();
     const normalizedAttemptId = params.attemptId ?? null;
 
+    // Determine if product execution binding is requested
+    const isProductBindingRequested = Boolean(
+      (params.assignmentId !== undefined && params.assignmentId !== null) ||
+      (params.taskOwnershipEpoch !== undefined && params.taskOwnershipEpoch !== null) ||
+      (params.executionScope !== undefined && params.executionScope !== null)
+    );
+
+    // If product execution bindings are requested, fail closed unless assignmentId, taskOwnershipEpoch, contextManifestId, and executionScope are all present
+    if (isProductBindingRequested) {
+      if (
+        !params.assignmentId ||
+        params.taskOwnershipEpoch === undefined ||
+        params.taskOwnershipEpoch === null ||
+        !params.contextManifestId ||
+        !params.executionScope
+      ) {
+        const reason =
+          'EXECUTION_AUTHORIZATION_PRODUCT_BINDING_INCOMPLETE: Product execution binding requires assignmentId, taskOwnershipEpoch, contextManifestId, and executionScope.';
+        this.recordRejectionEvent(params, reason);
+        throw new Error(`EXECUTION_AUTHORIZATION_FAILED: ${reason}`);
+      }
+
+      const scopeParse = CanonicalExecutionScopeSchema.safeParse(params.executionScope);
+      if (!scopeParse.success || params.executionScope.allowedPaths.length === 0) {
+        const reason = `EXECUTION_AUTHORIZATION_SCOPE_INVALID: ${
+          scopeParse.success ? 'allowedPaths must contain at least one path' : scopeParse.error.issues[0]?.message ?? 'Invalid execution scope'
+        }`;
+        this.recordRejectionEvent(params, reason);
+        throw new Error(`EXECUTION_AUTHORIZATION_FAILED: ${reason}`);
+      }
+    }
+
     // 1. Validate Scope: Project, Task, Attempt
     const project = this.repo.getProject(params.projectId);
     if (!project) {
@@ -384,6 +417,15 @@ export class ExecutionAuthorizationService {
       throw new Error(
         `EXECUTION_AUTHORIZATION_FAILED: Task "${params.taskId}" does not belong to project "${params.projectId}".`
       );
+    }
+
+    const currentTaskEpoch = task.ownership_epoch ?? 1;
+    if (isProductBindingRequested) {
+      if (params.taskOwnershipEpoch !== currentTaskEpoch) {
+        const reason = `EXECUTION_AUTHORIZATION_OWNERSHIP_EPOCH_MISMATCH: Task "${params.taskId}" ownership epoch is ${currentTaskEpoch}, but authorization requested ${params.taskOwnershipEpoch}.`;
+        this.recordRejectionEvent(params, reason);
+        throw new Error(`EXECUTION_AUTHORIZATION_FAILED: ${reason}`);
+      }
     }
 
     if (params.attemptId) {
@@ -528,6 +570,127 @@ export class ExecutionAuthorizationService {
       throw new Error(`EXECUTION_AUTHORIZATION_FAILED: ${reason}`);
     }
 
+    // 5b. Validate AgentAssignment, Selected ProviderAccount, and Mutual Consistency for Product Binding
+    let boundAssignment: AgentAssignment | undefined;
+    let boundAccount: ProviderAccount | undefined;
+
+    if (isProductBindingRequested) {
+      const assignment = this.repo.getAgentAssignment(params.assignmentId!);
+      if (!assignment) {
+        const reason = `EXECUTION_AUTHORIZATION_ASSIGNMENT_NOT_FOUND: AgentAssignment "${params.assignmentId}" not found.`;
+        this.recordRejectionEvent(params, reason);
+        throw new Error(`EXECUTION_AUTHORIZATION_FAILED: ${reason}`);
+      }
+
+      if (assignment.project_id !== params.projectId) {
+        const reason = `EXECUTION_AUTHORIZATION_ASSIGNMENT_MISMATCH: AgentAssignment project "${assignment.project_id}" does not match authorization project "${params.projectId}".`;
+        this.recordRejectionEvent(params, reason);
+        throw new Error(`EXECUTION_AUTHORIZATION_FAILED: ${reason}`);
+      }
+
+      if (assignment.task_id !== params.taskId) {
+        const reason = `EXECUTION_AUTHORIZATION_ASSIGNMENT_MISMATCH: AgentAssignment task "${assignment.task_id}" does not match authorization task "${params.taskId}".`;
+        this.recordRejectionEvent(params, reason);
+        throw new Error(`EXECUTION_AUTHORIZATION_FAILED: ${reason}`);
+      }
+
+      if ((assignment.attempt_id ?? null) !== normalizedAttemptId) {
+        const reason = `EXECUTION_AUTHORIZATION_ASSIGNMENT_MISMATCH: AgentAssignment attempt "${assignment.attempt_id ?? null}" does not match authorization attempt "${normalizedAttemptId}".`;
+        this.recordRejectionEvent(params, reason);
+        throw new Error(`EXECUTION_AUTHORIZATION_FAILED: ${reason}`);
+      }
+
+      if (assignment.routing_decision_id !== params.routingDecisionId) {
+        const reason = `EXECUTION_AUTHORIZATION_ASSIGNMENT_MISMATCH: AgentAssignment routing decision "${assignment.routing_decision_id}" does not match authorization routing decision "${params.routingDecisionId}".`;
+        this.recordRejectionEvent(params, reason);
+        throw new Error(`EXECUTION_AUTHORIZATION_FAILED: ${reason}`);
+      }
+
+      if (
+        assignment.preferred_metadata &&
+        typeof (assignment.preferred_metadata as Record<string, unknown>).ownership_epoch === 'number' &&
+        (assignment.preferred_metadata as Record<string, unknown>).ownership_epoch !== currentTaskEpoch
+      ) {
+        const reason = `EXECUTION_AUTHORIZATION_OWNERSHIP_EPOCH_MISMATCH: AgentAssignment preferred_metadata ownership epoch is ${(assignment.preferred_metadata as Record<string, unknown>).ownership_epoch}, does not match task ownership epoch ${currentTaskEpoch}.`;
+        this.recordRejectionEvent(params, reason);
+        throw new Error(`EXECUTION_AUTHORIZATION_FAILED: ${reason}`);
+      }
+
+      const routingSelectedAssignmentId = routingPayload.selectedAssignmentId as string | undefined;
+      if (
+        !routingSelectedAssignmentId ||
+        typeof routingSelectedAssignmentId !== 'string' ||
+        routingSelectedAssignmentId.trim() === '' ||
+        routingSelectedAssignmentId !== assignment.id
+      ) {
+        const reason =
+          !routingSelectedAssignmentId ||
+          typeof routingSelectedAssignmentId !== 'string' ||
+          routingSelectedAssignmentId.trim() === ''
+            ? 'EXECUTION_AUTHORIZATION_ROUTING_MISMATCH: Routing decision missing required selectedAssignmentId for product-bound authorization.'
+            : `EXECUTION_AUTHORIZATION_ROUTING_MISMATCH: Routing decision selectedAssignmentId "${routingSelectedAssignmentId}" does not match assignment "${assignment.id}".`;
+        this.recordRejectionEvent(params, reason);
+        throw new Error(`EXECUTION_AUTHORIZATION_FAILED: ${reason}`);
+      }
+
+      if (assignment.selected_provider_id !== selectedProviderId) {
+        const reason = `EXECUTION_AUTHORIZATION_ROUTING_MISMATCH: AgentAssignment selected_provider_id "${assignment.selected_provider_id}" does not match routing provider "${selectedProviderId}".`;
+        this.recordRejectionEvent(params, reason);
+        throw new Error(`EXECUTION_AUTHORIZATION_FAILED: ${reason}`);
+      }
+
+      const routingSelectedAccountId = routingPayload.selectedAccountId as string | undefined;
+      if (
+        !routingSelectedAccountId ||
+        typeof routingSelectedAccountId !== 'string' ||
+        routingSelectedAccountId.trim() === '' ||
+        routingSelectedAccountId !== assignment.selected_account_id
+      ) {
+        const reason =
+          !routingSelectedAccountId ||
+          typeof routingSelectedAccountId !== 'string' ||
+          routingSelectedAccountId.trim() === ''
+            ? 'EXECUTION_AUTHORIZATION_ROUTING_MISMATCH: Routing decision missing required selectedAccountId for product-bound authorization.'
+            : `EXECUTION_AUTHORIZATION_ROUTING_MISMATCH: Routing decision selectedAccountId "${routingSelectedAccountId}" does not match assignment account "${assignment.selected_account_id}".`;
+        this.recordRejectionEvent(params, reason);
+        throw new Error(`EXECUTION_AUTHORIZATION_FAILED: ${reason}`);
+      }
+
+      if (assignment.selected_resource_id !== selectedResourceId) {
+        const reason = `EXECUTION_AUTHORIZATION_ROUTING_MISMATCH: AgentAssignment selected_resource_id "${assignment.selected_resource_id}" does not match routing resource "${selectedResourceId}".`;
+        this.recordRejectionEvent(params, reason);
+        throw new Error(`EXECUTION_AUTHORIZATION_FAILED: ${reason}`);
+      }
+
+      const account = this.repo.getProviderAccount(assignment.selected_account_id);
+      if (!account) {
+        const reason = `EXECUTION_AUTHORIZATION_ACCOUNT_NOT_FOUND: Selected ProviderAccount "${assignment.selected_account_id}" not found.`;
+        this.recordRejectionEvent(params, reason);
+        throw new Error(`EXECUTION_AUTHORIZATION_FAILED: ${reason}`);
+      }
+
+      if (!account.enabled) {
+        const reason = `EXECUTION_AUTHORIZATION_ACCOUNT_DISABLED: Selected ProviderAccount "${account.id}" is disabled.`;
+        this.recordRejectionEvent(params, reason);
+        throw new Error(`EXECUTION_AUTHORIZATION_FAILED: ${reason}`);
+      }
+
+      if (account.provider_id !== selectedProviderId) {
+        const reason = `EXECUTION_AUTHORIZATION_ACCOUNT_MISMATCH: Selected ProviderAccount provider_id "${account.provider_id}" does not match selected provider "${selectedProviderId}".`;
+        this.recordRejectionEvent(params, reason);
+        throw new Error(`EXECUTION_AUTHORIZATION_FAILED: ${reason}`);
+      }
+
+      if (resource.provider_account_id !== account.id) {
+        const reason = `EXECUTION_AUTHORIZATION_RESOURCE_ACCOUNT_MISMATCH: Selected ProviderResource "${resource.id}" provider_account_id "${resource.provider_account_id}" does not match selected account "${account.id}".`;
+        this.recordRejectionEvent(params, reason);
+        throw new Error(`EXECUTION_AUTHORIZATION_FAILED: ${reason}`);
+      }
+
+      boundAssignment = assignment;
+      boundAccount = account;
+    }
+
     // 6. Base SHA and Real Git Repository HEAD Authority
     if (!task.base_sha || task.base_sha.trim() === '') {
       const reason = `EXECUTION_AUTHORIZATION_BASE_SHA_MISSING: Task "${params.taskId}" is missing durable base_sha.`;
@@ -579,6 +742,12 @@ export class ExecutionAuthorizationService {
         throw new Error(`EXECUTION_AUTHORIZATION_FAILED: ${reason}`);
       }
 
+      if (isProductBindingRequested && boundAssignment && snapshot.assignment_id !== boundAssignment.id) {
+        const reason = `EXECUTION_AUTHORIZATION_MANIFEST_MISMATCH: ContextManifest "${params.contextManifestId}" assignment binding "${snapshot.assignment_id}" does not match authorization assignment "${boundAssignment.id}".`;
+        this.recordRejectionEvent(params, reason);
+        throw new Error(`EXECUTION_AUTHORIZATION_FAILED: ${reason}`);
+      }
+
       contextManifestHash = durableManifest.manifest_hash;
     }
 
@@ -622,6 +791,7 @@ export class ExecutionAuthorizationService {
       manager_message_id: managerMessageId,
       manager_payload_hash: managerPayloadHash,
       routing_decision_id: params.routingDecisionId,
+      selected_account_id: isProductBindingRequested && boundAccount ? boundAccount.id : undefined,
       selected_resource_id: selectedResourceId,
       selected_provider_id: selectedProviderId,
       instruction_payload_hash: instructionPayloadHash,
@@ -632,6 +802,9 @@ export class ExecutionAuthorizationService {
       status: 'AUTHORIZED',
       created_at: createdAt,
       dispatched_at: null,
+      task_ownership_epoch: isProductBindingRequested ? currentTaskEpoch : undefined,
+      assignment_id: isProductBindingRequested && boundAssignment ? boundAssignment.id : null,
+      lifecycle_version: isProductBindingRequested ? 1 : null,
     };
 
     this.repo.createExecutionAuthorization(authorization);
@@ -659,6 +832,14 @@ export class ExecutionAuthorizationService {
           contextManifestHash,
           contextFileCount: canonicalContextFiles.length,
           status: 'AUTHORIZED',
+          ...(isProductBindingRequested && boundAssignment && boundAccount
+            ? {
+                assignmentId: boundAssignment.id,
+                selectedAccountId: boundAccount.id,
+                taskOwnershipEpoch: currentTaskEpoch,
+                lifecycleVersion: 1,
+              }
+            : {}),
         },
         params.taskId
       );
