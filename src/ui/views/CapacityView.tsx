@@ -190,7 +190,7 @@ export const CapacityView: React.FC = () => {
                   type="number"
                   value={editRemaining}
                   onChange={(e) => setEditRemaining(e.target.value)}
-                  placeholder="—"
+                  placeholder={t('common.unknown')}
                   className="w-full bg-surface-card border border-surface-border rounded-lg px-3 py-2 text-white font-mono focus:outline-none focus:border-forge-cyan"
                 />
               </div>
@@ -201,7 +201,7 @@ export const CapacityView: React.FC = () => {
                   type="number"
                   value={editTotal}
                   onChange={(e) => setEditTotal(e.target.value)}
-                  placeholder="—"
+                  placeholder={t('common.unknown')}
                   className="w-full bg-surface-card border border-surface-border rounded-lg px-3 py-2 text-white font-mono focus:outline-none focus:border-forge-cyan"
                 />
               </div>
