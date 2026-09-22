@@ -42,8 +42,15 @@ operational self-host dispatcher routes product tasks strictly through
 ProductTaskAutonomyAdapter with durable ExecutionAuthorization, failing closed
 (PRODUCT_TASK_REQUIRES_EXECUTION_AUTHORIZATION) if unauthenticated and rejecting
 any attempt to execute product tasks through legacy autonomy state
-(PRODUCT_TASK_CANNOT_USE_LEGACY_AUTONOMY_LIFECYCLE). Legacy `autonomy_*` rows
-are inventoried and retained as compatibility/audit evidence; they are not
+(PRODUCT_TASK_CANNOT_USE_LEGACY_AUTONOMY_LIFECYCLE). ProductTaskAutonomyAdapter
+independently observes Git evidence and enforces path boundaries before verification
+or review: any changed file outside workOrder.allowed_paths or inside
+workOrder.forbidden_paths fails closed with WORKER_PATH_VIOLATION. When a post-review
+HEAD or working-tree snapshot freshness violation occurs, the adapter transitions the
+authoritative task via TaskService using FIX_VERDICT into the durable resumable repair
+state (CODING) while strictly fencing against the active task ownership epoch, ensuring
+the task is never wedged and can be resumed with a new revision authorization. Legacy
+`autonomy_*` rows are inventoried and retained as compatibility/audit evidence; they are not
 silently discarded or authoritative for new product tasks. The consolidated path
 strictly enforces a hard cap of `MAX_AGY_WORKERS=1` in both AutonomySupervisor
 and autonomyCli, throwing `CONSOLIDATION_REQUIRES_MAX_AGY_WORKERS_1` on any higher
@@ -118,8 +125,9 @@ authorized attempt. Full automatic orphan/process reconciliation remains backlog
 Reviews survive restart. No remote branch or PR is inferred from local PASS.
 CI_WAIT releases the Antigravity slot. The GitHub observer now binds a Draft PR
 to its repository, branch, task, and exact expected head SHA; polls checks with
-bounded exponential backoff; fetches failed job logs through `gh run view
---log-failed`; persists sanitized evidence; and transitions CI_WAIT to
+bounded exponential backoff; fetches failed job logs through `gh run view <workflow-run-id>
+--log-failed`, resolving the workflow run ID parsed from a validated GitHub Actions
+`detailsUrl` rather than status-check `databaseId`; persists sanitized evidence; and transitions CI_WAIT to
 MERGE_READY or REPAIR. A machine-readable REPAIR diagnosis creates a durable
 repair request. After a locally accepted repair, the Supervisor commits only
 allowed files and pushes with `--force-with-lease` against the exact observed

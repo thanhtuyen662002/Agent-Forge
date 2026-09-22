@@ -39,7 +39,7 @@ describe('durable GitHub CI observation', () => {
     const { db, store, row } = setup();
     const manager = new CodexManagerAdapter({ executable: 'fake', runner: async () => ({ executionId: 'review', pid: null, command: 'fake', cwd: process.cwd(), exitCode: 0, stdout: JSON.stringify({ protocol_version: 'managerreview.v1', verdict: 'REPAIR', reviewed_head_sha: sha, findings: [{ severity: 'HIGH', title: 'CI failure', description: 'Fix it' }], required_actions: ['fix it'], risk: 'HIGH', notes: '' }), stderr: '', durationMs: 1, timedOut: false, cancelled: false, processStart: 'STARTED_PROVEN', processTermination: 'PROCESS_TREE_TERMINATED_PROVEN', errorCode: null }) as any });
     const observer = new GithubCiObserver(store, process.cwd(), manager, async (_exe, args) => ({
-      status: 0, stderr: '', stdout: args[0] === 'pr' ? JSON.stringify({ number: 63, isDraft: true, headRefName: row.branch, headRefOid: sha, statusCheckRollup: [{ name: 'Fast', status: 'COMPLETED', conclusion: 'FAILURE', databaseId: 123 }] }) : 'job failed: assertion',
+      status: 0, stderr: '', stdout: args[0] === 'pr' ? JSON.stringify({ number: 63, isDraft: true, headRefName: row.branch, headRefOid: sha, statusCheckRollup: [{ name: 'Fast', status: 'COMPLETED', conclusion: 'FAILURE', databaseId: 123, detailsUrl: 'https://github.com/owner/repo/actions/runs/1001/job/123' }] }) : 'job failed: assertion',
     }));
     const watch = observer.register({ taskId: row.task_id, workOrderId: row.id, repository: 'owner/repo', prNumber: 63, branch: row.branch, expectedHeadSha: sha });
     const result = await observer.observe(watch);
@@ -100,7 +100,7 @@ describe('durable GitHub CI observation', () => {
       },
     ]);
     const observer = new GithubCiObserver(store, process.cwd(), pool, async (_exe, args) => ({
-      status: 0, stderr: '', stdout: args[0] === 'pr' ? JSON.stringify({ number: 65, isDraft: true, headRefName: row.branch, headRefOid: sha, statusCheckRollup: [{ name: 'Fast', status: 'COMPLETED', conclusion: 'FAILURE', databaseId: 456 }] }) : 'job failed: test fail',
+      status: 0, stderr: '', stdout: args[0] === 'pr' ? JSON.stringify({ number: 65, isDraft: true, headRefName: row.branch, headRefOid: sha, statusCheckRollup: [{ name: 'Fast', status: 'COMPLETED', conclusion: 'FAILURE', databaseId: 456, detailsUrl: 'https://github.com/owner/repo/actions/runs/1002/job/456' }] }) : 'job failed: test fail',
     }));
     const watch = observer.register({ taskId: row.task_id, workOrderId: row.id, repository: 'owner/repo', prNumber: 65, branch: row.branch, expectedHeadSha: sha });
     const result = await observer.observe(watch);
@@ -123,7 +123,7 @@ describe('durable GitHub CI observation', () => {
       { id: 'primary', priority: 100, enabled: true, review: async () => ({ run: { status: 'SUCCESSFUL_PROCESS_EXIT', exitCode: 0, executionId: '', stdout: '', stderr: '', durationMs: 1 } }) },
     ]);
     const observer = new GithubCiObserver(store, process.cwd(), pool, async (_exe, args) => ({
-      status: 0, stderr: '', stdout: args[0] === 'pr' ? JSON.stringify({ number: 66, isDraft: true, headRefName: row.branch, headRefOid: sha, statusCheckRollup: [{ name: 'Fast', status: 'COMPLETED', conclusion: 'FAILURE', databaseId: 789 }] }) : 'job failed: timeout',
+      status: 0, stderr: '', stdout: args[0] === 'pr' ? JSON.stringify({ number: 66, isDraft: true, headRefName: row.branch, headRefOid: sha, statusCheckRollup: [{ name: 'Fast', status: 'COMPLETED', conclusion: 'FAILURE', databaseId: 789, detailsUrl: 'https://github.com/owner/repo/actions/runs/1003/job/789' }] }) : 'job failed: timeout',
     }));
     const watch = observer.register({ taskId: row.task_id, workOrderId: row.id, repository: 'owner/repo', prNumber: 66, branch: row.branch, expectedHeadSha: sha });
     const result = await observer.observe(watch);
@@ -132,6 +132,67 @@ describe('durable GitHub CI observation', () => {
     expect(result.managerRun?.stderr).toBe('ALL_MANAGER_RESOURCES_UNAVAILABLE');
     expect(store.getWorkOrder(row.id)?.state).toBe('CI_WAIT');
     expect(store.listDueCiWatches()).toHaveLength(0);
+    db.close();
+  });
+
+  it('resolves workflow run ID from detailsUrl instead of databaseId when collecting failure evidence', async () => {
+    const { db, store } = setup();
+    const invokedRunIds: string[] = [];
+    const observer = new GithubCiObserver(store, process.cwd(), undefined, async (_exe, args) => {
+      if (args[0] === 'run' && args[1] === 'view') {
+        invokedRunIds.push(args[2]);
+        return { status: 0, stdout: 'job log: failed at step 4', stderr: '' };
+      }
+      return { status: 0, stdout: '', stderr: '' };
+    });
+
+    const checks = [
+      {
+        name: 'Unit Tests',
+        status: 'COMPLETED',
+        conclusion: 'FAILURE',
+        databaseId: 999111,
+        detailsUrl: 'https://github.com/owner/repo/actions/runs/555444333/job/999111',
+      },
+    ];
+
+    const evidence = await observer.failureEvidence('owner/repo', checks);
+    expect(invokedRunIds).toEqual(['555444333']);
+    expect(invokedRunIds).not.toContain('999111');
+    expect(evidence).toContain('job log: failed at step 4');
+    db.close();
+  });
+
+  it('gracefully handles checks without detailsUrl or with non-actions URL without invoking gh run view with databaseId', async () => {
+    const { db, store } = setup();
+    let runViewInvoked = false;
+    const observer = new GithubCiObserver(store, process.cwd(), undefined, async (_exe, args) => {
+      if (args[0] === 'run' && args[1] === 'view') {
+        runViewInvoked = true;
+      }
+      return { status: 0, stdout: '', stderr: '' };
+    });
+
+    const checks = [
+      {
+        name: 'External CI',
+        status: 'COMPLETED',
+        conclusion: 'FAILURE',
+        databaseId: 12345,
+        detailsUrl: 'https://external-ci.example.com/build/12345',
+      },
+      {
+        name: 'Missing URL',
+        status: 'COMPLETED',
+        conclusion: 'FAILURE',
+        databaseId: 67890,
+      },
+    ];
+
+    const evidence = await observer.failureEvidence('owner/repo', checks);
+    expect(runViewInvoked).toBe(false);
+    expect(evidence).toContain('External CI: https://external-ci.example.com/build/12345');
+    expect(evidence).toContain('Missing URL: no details URL');
     db.close();
   });
 });

@@ -112,6 +112,28 @@ function renderCommand(command: { executable: string; args: string[] }): string 
   return [command.executable, ...command.args].map((part) => JSON.stringify(part)).join(' ');
 }
 
+export function isPathContainedInBoundary(filePath: string, boundaryPath: string): boolean {
+  const normFile = filePath.replace(/\\/g, '/').replace(/^\.\//, '');
+  const normBoundary = boundaryPath.replace(/\\/g, '/').replace(/^\.\//, '').replace(/\/+$/, '');
+  if (normBoundary === '' || normBoundary === '.') return true;
+  return normFile === normBoundary || normFile.startsWith(`${normBoundary}/`);
+}
+
+export function validateChangedFilesBoundaries(
+  changedFiles: string[],
+  allowedPaths: string[],
+  forbiddenPaths: string[] = [],
+): { valid: boolean; violatingFile?: string } {
+  for (const file of changedFiles) {
+    const isAllowed = allowedPaths.some((entry) => isPathContainedInBoundary(file, entry));
+    const isForbidden = forbiddenPaths.some((entry) => isPathContainedInBoundary(file, entry));
+    if (!isAllowed || isForbidden) {
+      return { valid: false, violatingFile: file };
+    }
+  }
+  return { valid: true };
+}
+
 /**
  * Adapter from the proven self-host executor into existing product authority.
  * It owns no task lifecycle table: transitions target `tasks`, while capacity
@@ -268,7 +290,7 @@ export class ProductTaskAutonomyAdapter {
     return this.leaseService.release(leaseId, leaseToken);
   }
 
-  public transitionTask(taskId: string, trigger: TaskTrigger): Task {
+  public transitionTask(taskId: string, trigger: TaskTrigger, expectedOwnershipEpoch?: number): Task {
     const task = this.repo.getTask(taskId);
     if (!task) throw new Error(`TASK_NOT_FOUND: ${taskId}`);
     // Validate the transition locally for a deterministic error, then let
@@ -278,7 +300,8 @@ export class ProductTaskAutonomyAdapter {
       revisionCount: task.revision_count,
       maxRevisions: task.max_revisions,
     });
-    const result = this.taskService.transitionAuthorizedTask(task.id, trigger, task.ownership_epoch ?? 1);
+    const epoch = expectedOwnershipEpoch ?? task.ownership_epoch ?? 1;
+    const result = this.taskService.transitionAuthorizedTask(task.id, trigger, epoch);
     if (!result.success || !result.task) throw new Error(result.error ?? 'AUTHORIZED_TASK_TRANSITION_FAILED');
     return result.task;
   }
@@ -436,9 +459,10 @@ export class ProductTaskAutonomyAdapter {
 
     let result: ExecuteProductTaskResult;
     try {
+      const authorityEpoch = validated.authority.task.ownership_epoch ?? 1;
       let task = this.repo.getTask(validated.authority.task.id)!;
-      if (task.state === 'APPROVED' || task.state === 'QUEUED') task = this.transitionTask(task.id, 'DISPATCH');
-      if (task.state === 'DISPATCHED') task = this.transitionTask(task.id, 'START_CODING');
+      if (task.state === 'APPROVED' || task.state === 'QUEUED') task = this.transitionTask(task.id, 'DISPATCH', authorityEpoch);
+      if (task.state === 'DISPATCHED' || task.state === 'FIX_REQUIRED') task = this.transitionTask(task.id, 'START_CODING', authorityEpoch);
       if (task.state !== 'CODING') throw new Error(`PRODUCT_TASK_NOT_CODING: ${task.state}`);
 
       const coder = await input.runCoder(workOrder);
@@ -449,8 +473,20 @@ export class ProductTaskAutonomyAdapter {
       if (coder.currentHeadSha && coder.currentHeadSha.toLowerCase() !== preReviewEvidence.headSha.toLowerCase()) {
         throw new Error(`CODER_HEAD_MISMATCH: coder claimed ${coder.currentHeadSha}, observed ${preReviewEvidence.headSha}`);
       }
+
+      // Fail closed before verification/review if independently collected changedFiles include
+      // any path outside workOrder.allowed_paths or inside workOrder.forbidden_paths
+      const boundaryCheck = validateChangedFilesBoundaries(
+        preReviewEvidence.changedFiles,
+        workOrder.allowed_paths,
+        workOrder.forbidden_paths,
+      );
+      if (!boundaryCheck.valid) {
+        throw new Error('WORKER_PATH_VIOLATION');
+      }
+
       this.repo.updateTaskShas(task.id, undefined, preReviewEvidence.headSha);
-      task = this.transitionTask(task.id, 'SUBMIT_REPORT');
+      task = this.transitionTask(task.id, 'SUBMIT_REPORT', authorityEpoch);
 
       // Verification acceptance strictly requires a newly persisted TestRun
       // and its process/evidence lineage from this authorization attempt.
@@ -489,7 +525,7 @@ export class ProductTaskAutonomyAdapter {
       );
 
       if (!currentTestRunPassed) {
-        task = this.transitionTask(task.id, 'TESTS_FAILED');
+        task = this.transitionTask(task.id, 'TESTS_FAILED', authorityEpoch);
         const verificationError = !currentTestRun
           ? 'CURRENT_VERIFICATION_TEST_RUN_MISSING'
           : !currentRunBound
@@ -505,8 +541,8 @@ export class ProductTaskAutonomyAdapter {
           error: verificationError,
         };
       } else {
-        task = this.transitionTask(task.id, 'EVIDENCE_GATHERED');
-        task = this.transitionTask(task.id, 'START_REVIEW');
+        task = this.transitionTask(task.id, 'EVIDENCE_GATHERED', authorityEpoch);
+        task = this.transitionTask(task.id, 'START_REVIEW', authorityEpoch);
         const context = this.buildManagerContext(workOrder, preReviewEvidence.headSha, {
           ...input.managerContext,
           actualDiff: input.managerContext?.actualDiff ?? preReviewEvidence.diff,
@@ -527,6 +563,7 @@ export class ProductTaskAutonomyAdapter {
           currentHeadSha: postReviewEvidence.headSha,
         });
         if (!freshness.fresh) {
+          task = this.transitionTask(task.id, 'FIX_VERDICT', authorityEpoch);
           result = {
             success: false,
             finalTaskState: task.state,
@@ -541,6 +578,13 @@ export class ProductTaskAutonomyAdapter {
             error: freshness.error,
           };
         } else if (!refreshedAuthority.valid) {
+          if (refreshedAuthority.code !== 'OWNERSHIP_EPOCH_MISMATCH') {
+            try {
+              task = this.transitionTask(task.id, 'FIX_VERDICT', authorityEpoch);
+            } catch {
+              // Fenced mutation retains current task state
+            }
+          }
           result = {
             success: false,
             finalTaskState: task.state,
@@ -555,7 +599,7 @@ export class ProductTaskAutonomyAdapter {
             error: `AUTHORITY_FENCED_DURING_EXECUTION: ${refreshedAuthority.code}: ${refreshedAuthority.error}`,
           };
         } else if (review.verdict !== 'PASS') {
-          task = this.transitionTask(task.id, review.verdict === 'REPAIR' ? 'FIX_VERDICT' : 'MAX_REVISIONS_EXCEEDED');
+          task = this.transitionTask(task.id, review.verdict === 'REPAIR' ? 'FIX_VERDICT' : 'MAX_REVISIONS_EXCEEDED', authorityEpoch);
           result = {
             success: false,
             finalTaskState: task.state,
@@ -569,7 +613,7 @@ export class ProductTaskAutonomyAdapter {
             error: `MANAGER_${review.verdict}`,
           };
         } else {
-          task = this.transitionTask(task.id, 'PASS_VERDICT');
+          task = this.transitionTask(task.id, 'PASS_VERDICT', authorityEpoch);
           result = {
             success: true,
             finalTaskState: task.state,

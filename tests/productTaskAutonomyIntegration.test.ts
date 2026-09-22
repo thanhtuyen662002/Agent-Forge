@@ -501,6 +501,8 @@ describe('product-task autonomy consolidation', () => {
     expect(result.success).toBe(false);
     expect(result.staleReview).toBe(true);
     expect(result.error).toContain('WORKING_TREE_SNAPSHOT_FENCING_VIOLATION');
+    expect(result.finalTaskState).toBe('CODING');
+    expect(repo.getTask(fixture.task.id)?.state).toBe('CODING');
     expect(repo.getTask(fixture.task.id)?.state).not.toBe('DONE');
   });
 
@@ -550,6 +552,8 @@ describe('product-task autonomy consolidation', () => {
     expect(result.success).toBe(false);
     expect(result.staleReview).toBe(true);
     expect(result.error).toContain('EXACT_HEAD_FENCING_VIOLATION');
+    expect(result.finalTaskState).toBe('CODING');
+    expect(repo.getTask(fixture.task.id)?.state).toBe('CODING');
     expect(repo.getTask(fixture.task.id)?.state).not.toBe('DONE');
   });
 
@@ -791,5 +795,320 @@ describe('product-task autonomy consolidation', () => {
       artifactStore: new ArtifactStore(path.join(root, 'other-artifacts')),
       maxWorkers: MAX_AGY_WORKERS + 1,
     })).toThrow('PRODUCT_TASK_CONSOLIDATION_REQUIRES_MAX_AGY_WORKERS_1');
+  });
+
+  it('fails closed before verification or review if independently collected changedFiles include paths outside allowed_paths', async () => {
+    const fixture = seed('task-out-of-scope-edit');
+    const input = workOrderInput(fixture);
+    let verificationCalled = false;
+    let reviewCalled = false;
+
+    const result = await adapter.executeProductTask({
+      ...input,
+      allowedPaths: ['src/core'],
+      runCoder: async () => ({ success: true, currentHeadSha: BASE_SHA }),
+      evidenceCollector: {
+        collect: async () => ({
+          headSha: BASE_SHA,
+          snapshotSha: 'snapshot-out-of-scope',
+          status: 'M package.json',
+          changedFiles: ['src/core/valid.ts', 'package.json'],
+          diff: 'diff-out-of-scope',
+          tests: [],
+        }),
+      },
+      runVerification: async () => {
+        verificationCalled = true;
+        throw new Error('runVerification must not be called on out-of-scope edit');
+      },
+      conductReview: async () => {
+        reviewCalled = true;
+        throw new Error('conductReview must not be called on out-of-scope edit');
+      },
+    });
+
+    expect(result.success).toBe(false);
+    expect(result.error).toBe('WORKER_PATH_VIOLATION');
+    expect(verificationCalled).toBe(false);
+    expect(reviewCalled).toBe(false);
+    expect(result.leaseReleased).toBe(true);
+    expect(repo.getTask(fixture.task.id)?.state).not.toBe('DONE');
+  });
+
+  it('fails closed before verification or review if independently collected changedFiles include paths inside forbidden_paths', async () => {
+    const fixture = seed('task-forbidden-edit');
+    const input = workOrderInput(fixture);
+    let verificationCalled = false;
+    let reviewCalled = false;
+
+    const result = await adapter.executeProductTask({
+      ...input,
+      allowedPaths: ['src'],
+      forbiddenPaths: ['.git', 'src/forbidden'],
+      runCoder: async () => ({ success: true, currentHeadSha: BASE_SHA }),
+      evidenceCollector: {
+        collect: async () => ({
+          headSha: BASE_SHA,
+          snapshotSha: 'snapshot-forbidden',
+          status: 'M src/forbidden/secret.ts',
+          changedFiles: ['src/forbidden/secret.ts'],
+          diff: 'diff-forbidden',
+          tests: [],
+        }),
+      },
+      runVerification: async () => {
+        verificationCalled = true;
+        throw new Error('runVerification must not be called on forbidden edit');
+      },
+      conductReview: async () => {
+        reviewCalled = true;
+        throw new Error('conductReview must not be called on forbidden edit');
+      },
+    });
+
+    expect(result.success).toBe(false);
+    expect(result.error).toBe('WORKER_PATH_VIOLATION');
+    expect(verificationCalled).toBe(false);
+    expect(reviewCalled).toBe(false);
+    expect(result.leaseReleased).toBe(true);
+    expect(repo.getTask(fixture.task.id)?.state).not.toBe('DONE');
+  });
+
+  it('transitions stale post-review HEAD or snapshot to durable CODING repair state and proves task is resumable and not wedged', async () => {
+    const fixture = seed('task-stale-resumption');
+    const input = workOrderInput(fixture);
+    let collectCount = 0;
+
+    // First attempt: stale review due to working-tree snapshot modification post-review
+    const initialResult = await adapter.executeProductTask({
+      ...input,
+      runCoder: async () => ({ success: true, currentHeadSha: BASE_SHA }),
+      evidenceCollector: {
+        collect: async () => {
+          collectCount++;
+          return {
+            headSha: BASE_SHA,
+            snapshotSha: collectCount === 1 ? 'snapshot-pre-review' : 'snapshot-post-review-MODIFIED',
+            status: '',
+            changedFiles: ['src'],
+            diff: 'diff-initial',
+            tests: [],
+          };
+        },
+      },
+      runVerification: async (authority, workOrder) => adapter.recordVerificationObservation({
+        projectId: authority.task.project_id,
+        taskId: authority.task.id,
+        attemptId: authority.authorization.attempt_id,
+        command: 'node --version',
+        status: 'COMPLETED',
+        exitCode: 0,
+        passedCount: 1,
+        failedCount: 0,
+        durationMs: 1,
+        stdout: process.version,
+        workingDirectory: workOrder!.worktree,
+      }),
+      conductReview: async (context) => ({
+        protocol_version: 'managerreview.v1',
+        verdict: 'PASS',
+        reviewed_head_sha: context.current_head,
+        findings: [],
+        required_actions: [],
+        risk: 'LOW',
+        notes: 'initial review passes but snapshot becomes stale',
+      }),
+    });
+
+    // Verify first attempt fails closed into durable resumable repair state
+    expect(initialResult.success).toBe(false);
+    expect(initialResult.staleReview).toBe(true);
+    expect(initialResult.error).toContain('WORKING_TREE_SNAPSHOT_FENCING_VIOLATION');
+    expect(initialResult.finalTaskState).toBe('CODING');
+    expect(initialResult.leaseReleased).toBe(true);
+
+    // Verify task state in database
+    const taskAfterStale = repo.getTask(fixture.task.id)!;
+    expect(taskAfterStale.state).toBe('CODING');
+    expect(taskAfterStale.revision_count).toBe(1);
+
+    // Prove authorization fencing: stale revision 0 authorization cannot be reused
+    const staleAuthValidation = adapter.validateAuthority({
+      authorizationId: fixture.authorization.id,
+      currentHeadSha: BASE_SHA,
+    });
+    expect(staleAuthValidation.valid).toBe(false);
+    expect(staleAuthValidation.code).toBe('TASK_REVISION_MISMATCH');
+
+    // Create durable execution authorization for revision 1
+    const now = new Date().toISOString();
+    const retryContext = new ContextBuilderService(repo).buildContextSnapshot({
+      projectId: fixture.task.project_id,
+      taskId: fixture.task.id,
+      assignmentId: fixture.assignmentId,
+      purpose: 'EXECUTION',
+      includeProjectMemory: false,
+      includeTaskMemory: false,
+      includeLatestCheckpoint: false,
+      includeLatestHandoff: false,
+    });
+    const retryPayload: CanonicalExecutionPayload = {
+      projectId: fixture.task.project_id,
+      taskId: fixture.task.id,
+      attemptId: null,
+      taskTitle: fixture.task.title,
+      taskDescription: fixture.task.description,
+      acceptanceCriteria: fixture.task.acceptance_criteria,
+      constraints: fixture.task.constraints,
+      instructions: ['Resumed repair execution'],
+      contextFiles: [],
+      verificationCommands: {
+        TEST: { executable: process.execPath, args: ['--version'] },
+        LINT: null,
+        BUILD: null,
+      },
+      managerMessageId: `manager-retry-${fixture.task.id}`,
+      managerPayloadHash: crypto.createHash('sha256').update(`retry-${fixture.task.id}`).digest('hex'),
+    };
+    repo.recordProtocolMessage(
+      retryPayload.managerMessageId,
+      `external-${retryPayload.managerMessageId}`,
+      'manager.v1',
+      fixture.task.project_id,
+      fixture.task.id,
+      'CODING',
+      1,
+      retryPayload.managerPayloadHash,
+      JSON.stringify({ decision: 'EXECUTE', taskId: fixture.task.id }),
+      'APPLIED',
+    );
+    const retryAuthId = `authorization-${fixture.task.id}-rev1`;
+    repo.createExecutionAuthorization({
+      id: retryAuthId,
+      project_id: fixture.task.project_id,
+      task_id: fixture.task.id,
+      attempt_id: null,
+      task_revision: 1,
+      base_sha: BASE_SHA,
+      repository_head_sha: BASE_SHA,
+      manager_message_id: retryPayload.managerMessageId,
+      manager_payload_hash: retryPayload.managerPayloadHash,
+      routing_decision_id: `route-retry-${fixture.task.id}`,
+      selected_account_id: 'account-agy',
+      selected_resource_id: 'resource-agy',
+      selected_provider_id: 'provider-agy',
+      instruction_payload_hash: computePayloadHash(retryPayload),
+      context_manifest_hash: retryContext.manifest.manifest_hash,
+      canonical_instructions_json: JSON.stringify(retryPayload.instructions),
+      context_files_json: '[]',
+      canonical_payload_json: JSON.stringify(retryPayload),
+      expected_task_revision: 1,
+      status: 'AUTHORIZED',
+      created_at: now,
+      dispatched_at: null,
+      task_ownership_epoch: 1,
+      assignment_id: fixture.assignmentId,
+      lifecycle_version: 1,
+    });
+
+    // Second attempt: Resumption from CODING succeeds end-to-end and proves task is NOT wedged
+    const retryResult = await adapter.executeProductTask({
+      ...input,
+      authorizationId: retryAuthId,
+      runCoder: async () => ({ success: true, currentHeadSha: BASE_SHA }),
+      evidenceCollector: {
+        collect: async () => ({
+          headSha: BASE_SHA,
+          snapshotSha: 'snapshot-retry-clean',
+          status: '',
+          changedFiles: ['src'],
+          diff: 'diff-retry',
+          tests: [],
+        }),
+      },
+      runVerification: async (authority, workOrder) => adapter.recordVerificationObservation({
+        projectId: authority.task.project_id,
+        taskId: authority.task.id,
+        attemptId: authority.authorization.attempt_id,
+        command: 'node --version',
+        status: 'COMPLETED',
+        exitCode: 0,
+        passedCount: 1,
+        failedCount: 0,
+        durationMs: 1,
+        stdout: process.version,
+        workingDirectory: workOrder!.worktree,
+      }),
+      conductReview: async (context) => ({
+        protocol_version: 'managerreview.v1',
+        verdict: 'PASS',
+        reviewed_head_sha: context.current_head,
+        findings: [],
+        required_actions: [],
+        risk: 'LOW',
+        notes: 'retry passes review and fresh snapshot check',
+      }),
+    });
+
+    expect(retryResult.success).toBe(true);
+    expect(retryResult.finalTaskState).toBe('DONE');
+    expect(retryResult.leaseAcquired).toBe(true);
+    expect(retryResult.leaseReleased).toBe(true);
+    expect(repo.getTask(fixture.task.id)?.state).toBe('DONE');
+    expect(repo.getWorkerSlot(fixture.slotId)?.status).toBe('IDLE');
+  });
+
+  it('preserves ownership epoch fencing when task ownership epoch changes during stale review handling', async () => {
+    const fixture = seed('task-epoch-fence-stale');
+    const input = workOrderInput(fixture);
+    let collectCount = 0;
+
+    const result = await adapter.executeProductTask({
+      ...input,
+      runCoder: async () => ({ success: true, currentHeadSha: BASE_SHA }),
+      evidenceCollector: {
+        collect: async () => {
+          collectCount++;
+          return {
+            headSha: collectCount === 1 ? BASE_SHA : OTHER_SHA,
+            snapshotSha: 'snapshot-fixed',
+            status: '',
+            changedFiles: ['src'],
+            diff: 'diff',
+            tests: [],
+          };
+        },
+      },
+      runVerification: async (authority, workOrder) => adapter.recordVerificationObservation({
+        projectId: authority.task.project_id,
+        taskId: authority.task.id,
+        attemptId: authority.authorization.attempt_id,
+        command: 'node --version',
+        status: 'COMPLETED',
+        exitCode: 0,
+        passedCount: 1,
+        failedCount: 0,
+        durationMs: 1,
+        stdout: process.version,
+        workingDirectory: workOrder!.worktree,
+      }),
+      conductReview: async (context) => {
+        // Reassign task / bump ownership epoch while review is taking place
+        repo.bumpTaskOwnershipEpoch(fixture.task.id, 1);
+        return {
+          protocol_version: 'managerreview.v1',
+          verdict: 'PASS',
+          reviewed_head_sha: context.current_head,
+          findings: [],
+          required_actions: [],
+          risk: 'LOW',
+          notes: 'review ok',
+        };
+      },
+    });
+
+    expect(result.success).toBe(false);
+    expect(result.error).toContain('OWNERSHIP_EPOCH_MISMATCH');
+    expect(result.leaseReleased).toBe(true);
   });
 });

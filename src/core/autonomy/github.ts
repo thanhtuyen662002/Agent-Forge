@@ -61,10 +61,12 @@ function classifyChecks(checks: GithubCheck[] | undefined): CiConclusion {
   return checks.every((check) => successConclusions.has(String(check.conclusion ?? '').toUpperCase())) ? 'SUCCESS' : 'PENDING';
 }
 
-function runId(url: string | null | undefined): string | null {
+export function extractWorkflowRunId(url: string | null | undefined): string | null {
   const match = url?.match(/\/actions\/runs\/(\d+)/);
   return match?.[1] ?? null;
 }
+
+export const runId = extractWorkflowRunId;
 
 export class GithubCiObserver {
   private readonly managerPool?: ManagerProviderPool;
@@ -199,10 +201,13 @@ export class GithubCiObserver {
     const failed = checks.filter((check) => failureConclusions.has(String(check.conclusion ?? '').toUpperCase()));
     const chunks: string[] = [];
     for (const check of failed) {
-      const id = check.databaseId?.toString() ?? runId(check.detailsUrl);
-      if (!id) { chunks.push(`${check.name ?? 'unknown'}: ${check.detailsUrl ?? 'no details URL'}`); continue; }
-      const result = await this.command('gh', ['run', 'view', id, '--repo', repository, '--log-failed'], this.controlRepo);
-      chunks.push(`${check.name ?? id}\n${sanitizeAutonomyText(result.stdout || result.stderr)}`);
+      const workflowRunId = extractWorkflowRunId(check.detailsUrl);
+      if (!workflowRunId) {
+        chunks.push(`${check.name ?? 'unknown'}: ${check.detailsUrl ?? 'no details URL'}`);
+        continue;
+      }
+      const result = await this.command('gh', ['run', 'view', workflowRunId, '--repo', repository, '--log-failed'], this.controlRepo);
+      chunks.push(`${check.name ?? workflowRunId}\n${sanitizeAutonomyText(result.stdout || result.stderr)}`);
     }
     return sanitizeAutonomyText(chunks.join('\n\n'));
   }
