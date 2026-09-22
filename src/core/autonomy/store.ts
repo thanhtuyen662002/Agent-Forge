@@ -45,7 +45,17 @@ export interface AutonomyCiWatch {
   updated_at: string;
 }
 
-export type ManagerResourceState = 'AVAILABLE' | 'AUTH_ERROR' | 'RATE_LIMITED' | 'CREDITS_EXHAUSTED' | 'COOLDOWN' | 'OFFLINE' | 'CONTRACT_INVALID';
+export type ManagerResourceState =
+  | 'AVAILABLE'
+  | 'DEGRADED'
+  | 'AUTH_ERROR'
+  | 'RATE_LIMITED'
+  | 'CREDITS_EXHAUSTED'
+  | 'CAPACITY_EXHAUSTED'
+  | 'COOLDOWN'
+  | 'TIMEOUT'
+  | 'OFFLINE'
+  | 'CONTRACT_INVALID';
 export interface ManagerResourceHealth { resource_id: string; state: ManagerResourceState; cooldown_until: string | null; last_error: string | null; updated_at: string; }
 
 /**

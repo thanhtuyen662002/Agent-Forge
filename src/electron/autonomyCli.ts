@@ -11,6 +11,7 @@ import { SelfHostTaskSchema } from '../core/autonomy/contracts';
 import { assertPathContained } from '../core/services/ArtifactStore';
 import crypto from 'crypto';
 import { GithubCiObserver } from '../core/autonomy/github';
+import { loadOmniRouteEndpointFromEnvironment, ResponsesManagerEndpointTransport } from '../core/autonomy/responsesEndpoint';
 
 const controlRepo = process.env.AGENT_FORGE_CONTROL_REPO ?? process.cwd();
 const worktreeRoot = process.env.AGENT_FORGE_WORKTREE_ROOT ?? path.resolve(controlRepo, '..', 'AI', 'Agent-Forge-Worktrees');
@@ -75,9 +76,30 @@ async function doctor(): Promise<number> {
   return failedChecks === 0 ? 0 : 1;
 }
 
+async function doctorOmniRoute(): Promise<number> {
+  const manager = loadOmniRouteEndpointFromEnvironment('MANAGER');
+  const reviewer = loadOmniRouteEndpointFromEnvironment('REVIEWER');
+  if (!manager || !reviewer) {
+    check('OmniRoute configuration', false, 'Set AGENT_FORGE_OMNIROUTE_ENABLED=1, base URL, auth env reference, and role models');
+    return 1;
+  }
+  check('OmniRoute configuration', true, 'external route and auth reference loaded');
+  check('OmniRoute manager model', true, manager.model_or_route);
+  check('OmniRoute reviewer model', true, reviewer.model_or_route);
+  const transport = new ResponsesManagerEndpointTransport();
+  const [managerContract, reviewerContract] = await Promise.all([
+    transport.contract(manager),
+    transport.contract(reviewer),
+  ]);
+  check('OmniRoute manager Responses contract', managerContract.compatible, managerContract.run.status);
+  check('OmniRoute reviewer Responses contract', reviewerContract.compatible, reviewerContract.run.status);
+  return managerContract.compatible && reviewerContract.compatible ? 0 : 1;
+}
+
 async function main(): Promise<number> {
   const command = process.argv[2] ?? 'status';
   if (command === 'doctor') return doctor();
+  if (command === 'doctor-omniroute') return doctorOmniRoute();
   const store = AutonomyStore.open(runtimeRoot);
   const supervisor = new AutonomySupervisor({ store: store.store, mode: command === 'shadow' ? 'SHADOW' : 'PILOT', runtimeRoot, controlRepo, worktreeRoot });
   const ci = new GithubCiObserver(store.store, controlRepo, supervisor.managerPool);

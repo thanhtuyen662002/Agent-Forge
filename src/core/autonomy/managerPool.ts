@@ -11,6 +11,9 @@ import {
 } from './contracts';
 import { AutonomyStore, ManagerResourceState } from './store';
 import { CodexManagerAdapter, ManagerEvidence, ProviderRun } from './providers';
+import { Repository } from '../database/repositories';
+import { managerResourceFromEndpoint, ProviderEndpointConfig } from './providerEndpoint';
+import { loadOmniRouteEndpointFromEnvironment, ResponsesManagerEndpointTransport } from './responsesEndpoint';
 
 export const ManagerContextPackageSchema = z.object({
   protocol_version: z.literal('managercontext.v1'),
@@ -89,6 +92,11 @@ export interface ManagerResource {
   id: string;
   priority: number;
   enabled: boolean;
+  endpoint?: {
+    resource_id: string;
+    role: 'MANAGER' | 'REVIEWER' | 'CODER';
+    adapter_type: 'DIRECT_PROVIDER' | 'API_PROVIDER' | 'EXTERNAL_ROUTER';
+  };
   review(input: ManagerEvidence): Promise<{ run: ProviderRun; review?: ManagerReview }>;
   plan?(seed: ManagerPlanSeed): Promise<{ run: ProviderRun; workOrder?: WorkOrder }>;
 }
@@ -101,9 +109,46 @@ export interface ManagerPoolResult {
   attempts: string[];
 }
 
+function ensureProductEndpointResource(store: AutonomyStore, endpoint: ProviderEndpointConfig): void {
+  const repo = new Repository(store.getDatabase());
+  const providerId = 'provider-external-router';
+  const existingProvider = repo.getProvider(providerId);
+  if (!existingProvider) {
+    repo.createProvider({
+      id: providerId,
+      name: 'Configured external router',
+      adapter_type: 'API',
+      enabled: true,
+      created_at: new Date().toISOString(),
+    });
+  } else if (existingProvider.adapter_type !== 'API') {
+    throw new Error('EXTERNAL_ROUTER_PROVIDER_CONTRACT_INVALID');
+  }
+  if (repo.getProviderResource(endpoint.resource_id)) return;
+  repo.createProviderResource({
+    id: endpoint.resource_id,
+    provider_id: providerId,
+    provider_account_id: null,
+    model_name: endpoint.model_or_route,
+    health_status: 'AVAILABLE',
+    capabilities: [...endpoint.capabilities],
+    enabled: endpoint.enabled,
+    total_quota: null,
+    remaining_quota: null,
+    quota_unit: 'ROUTE_REQUESTS',
+    quota_reset_at: null,
+    quota_source: 'UNKNOWN',
+    quota_confidence: 0,
+    last_health_check: null,
+  });
+}
+
 export function classify(run: ProviderRun): { state: ManagerResourceState; cooldownUntil: string | null } {
   const text = `${run.stdout}\n${run.stderr}\n${run.error ?? ''}`;
   if (run.status === 'SUCCESSFUL_PROCESS_EXIT') return { state: 'AVAILABLE', cooldownUntil: null };
+  if (/ROUTE_CAPACITY_EXHAUSTED|capacity.*exhaust/i.test(text)) {
+    return { state: 'CAPACITY_EXHAUSTED', cooldownUntil: null };
+  }
   if (
     /out of credits|workspace.*credit|credits.*exhausted|credit.*exhaust|exhaust.*credit|insufficient[_ -]?quota|quota.*exhaust|spend.?limit|billing.?limit/i.test(
       text,
@@ -123,15 +168,18 @@ export function classify(run: ProviderRun): { state: ManagerResourceState; coold
   if (run.status === 'CONTRACT_INVALID' || /CONTRACT_INVALID/i.test(text)) {
     return { state: 'CONTRACT_INVALID', cooldownUntil: null };
   }
-  if (run.status === 'PROCESS_NOT_FOUND' || run.status === 'TIMEOUT') {
+  if (run.status === 'TIMEOUT') {
+    return { state: 'TIMEOUT', cooldownUntil: new Date(Date.now() + 60_000).toISOString() };
+  }
+  if (run.status === 'PROCESS_NOT_FOUND') {
     return { state: 'OFFLINE', cooldownUntil: new Date(Date.now() + 60_000).toISOString() };
   }
   return { state: 'OFFLINE', cooldownUntil: new Date(Date.now() + 60_000).toISOString() };
 }
 
 export function isEligible(state: ManagerResourceState | undefined, until: string | null | undefined): boolean {
-  if (!state || state === 'AVAILABLE') return true;
-  if (state === 'RATE_LIMITED' || state === 'COOLDOWN' || state === 'OFFLINE') {
+  if (!state || state === 'AVAILABLE' || state === 'DEGRADED') return true;
+  if (state === 'RATE_LIMITED' || state === 'COOLDOWN' || state === 'TIMEOUT' || state === 'OFFLINE') {
     return !!until && Date.parse(until) <= Date.now();
   }
   return false;
@@ -184,7 +232,19 @@ export class ManagerProviderPool {
     primary: CodexManagerAdapter,
     additionalResources: ManagerResource[] = [],
   ): ManagerProviderPool {
-    const resources: ManagerResource[] = [
+    const resources: ManagerResource[] = [];
+    const routeTransport = new ResponsesManagerEndpointTransport();
+    const reviewerRoute = loadOmniRouteEndpointFromEnvironment('REVIEWER');
+    const managerRoute = loadOmniRouteEndpointFromEnvironment('MANAGER');
+    if (reviewerRoute) {
+      ensureProductEndpointResource(store, reviewerRoute);
+      resources.push(managerResourceFromEndpoint(reviewerRoute, routeTransport));
+    }
+    if (managerRoute) {
+      ensureProductEndpointResource(store, managerRoute);
+      resources.push(managerResourceFromEndpoint(managerRoute, routeTransport));
+    }
+    resources.push(
       {
         id: 'codex-chatgpt-primary',
         priority: 100,
@@ -192,7 +252,7 @@ export class ManagerProviderPool {
         review: (input) => primary.review(input),
         plan: (seed) => primary.plan(seed),
       },
-    ];
+    );
     if (process.env.AGENT_FORGE_ENABLE_OPENAI_API_FALLBACK === '1') {
       resources.push({
         id: 'codex-api-fallback',
@@ -228,17 +288,18 @@ export class ManagerProviderPool {
   checkProductResourceHealth(resourceId: string): { configured: boolean; eligible: boolean; reason?: string } {
     const db = this.store.getDatabase();
     const resource = db.prepare(
-      'SELECT enabled,health_status,provider_account_id,remaining_quota,quota_source FROM provider_resources WHERE id=?',
+      'SELECT enabled,health_status,provider_account_id,remaining_quota,quota_source,last_health_check FROM provider_resources WHERE id=?',
     ).get(resourceId) as {
       enabled: number;
       health_status: string;
       provider_account_id: string | null;
       remaining_quota: number | null;
       quota_source: string;
+      last_health_check: string | null;
     } | undefined;
     if (!resource) return { configured: false, eligible: true };
     if (!resource.enabled) return { configured: true, eligible: false, reason: 'PROVIDER_RESOURCE_DISABLED' };
-    if (['DISABLED', 'OFFLINE', 'UNHEALTHY', 'QUOTA_EXHAUSTED', 'AUTH_ERROR', 'BUSY'].includes(resource.health_status)) {
+    if (['DISABLED', 'UNHEALTHY', 'QUOTA_EXHAUSTED', 'AUTH_ERROR', 'BUSY'].includes(resource.health_status)) {
       return { configured: true, eligible: false, reason: `PROVIDER_RESOURCE_${resource.health_status}` };
     }
     if (
@@ -247,7 +308,18 @@ export class ManagerProviderPool {
     ) {
       return { configured: true, eligible: false, reason: 'PROVIDER_RESOURCE_QUOTA_EXHAUSTED' };
     }
-    if (!resource.provider_account_id) return { configured: true, eligible: false, reason: 'PROVIDER_ACCOUNT_NOT_BOUND' };
+    if (['RATE_LIMITED', 'COOLDOWN', 'OFFLINE'].includes(resource.health_status)) {
+      const retryAt = resource.last_health_check
+        ? Date.parse(resource.last_health_check) + 60_000
+        : Number.POSITIVE_INFINITY;
+      if (retryAt > Date.now()) {
+        return { configured: true, eligible: false, reason: `PROVIDER_RESOURCE_${resource.health_status}_COOLDOWN` };
+      }
+    }
+    // A resource may intentionally be account-unbound when it represents one
+    // externally routed endpoint. In that case Agent Forge owns route health,
+    // while the upstream router owns its hidden account pool.
+    if (!resource.provider_account_id) return { configured: true, eligible: true };
     const account = db.prepare(
       'SELECT enabled,health_status,cooldown_until FROM provider_accounts WHERE id=?',
     ).get(resource.provider_account_id) as { enabled: number; health_status: string; cooldown_until: string | null } | undefined;
@@ -276,29 +348,25 @@ export class ManagerProviderPool {
   }
 
   syncProductResourceHealth(resourceId: string, classifiedState: ManagerResourceState, cooldownUntil: string | null): boolean {
-    const db = this.store.getDatabase();
-    const resource = db.prepare('SELECT provider_account_id FROM provider_resources WHERE id=?').get(resourceId) as {
-      provider_account_id: string | null;
-    } | undefined;
+    const repo = new Repository(this.store.getDatabase());
+    const resource = repo.getProviderResource(resourceId);
     if (!resource) return false;
-    const health = classifiedState === 'CREDITS_EXHAUSTED'
+    const health = classifiedState === 'CREDITS_EXHAUSTED' || classifiedState === 'CAPACITY_EXHAUSTED'
       ? 'QUOTA_EXHAUSTED'
       : classifiedState === 'CONTRACT_INVALID'
         ? 'UNHEALTHY'
-        : classifiedState;
-    const now = new Date().toISOString();
-    db.transaction(() => {
-      db.prepare(`UPDATE provider_resources SET health_status=?,last_health_check=?,remaining_quota=
-        CASE WHEN ?='QUOTA_EXHAUSTED' THEN 0 ELSE remaining_quota END WHERE id=?`)
-        .run(health, now, health, resourceId);
-      if (resource.provider_account_id) {
-        db.prepare(`UPDATE provider_accounts SET health_status=?,cooldown_until=?,
-          last_success_at=CASE WHEN ?='AVAILABLE' THEN ? ELSE last_success_at END,
-          last_failure_at=CASE WHEN ?='AVAILABLE' THEN last_failure_at ELSE ? END,
-          last_failure_code=CASE WHEN ?='AVAILABLE' THEN NULL ELSE ? END,updated_at=? WHERE id=?`)
-          .run(health, cooldownUntil, health, now, health, now, health, classifiedState, now, resource.provider_account_id);
-      }
-    })();
+        : classifiedState === 'TIMEOUT'
+          ? 'OFFLINE'
+          : classifiedState === 'DEGRADED'
+            ? 'LOW_QUOTA'
+            : classifiedState;
+    repo.recordProviderResourceHealth(
+      resourceId,
+      health,
+      cooldownUntil,
+      classifiedState,
+      health === 'QUOTA_EXHAUSTED',
+    );
     return true;
   }
 

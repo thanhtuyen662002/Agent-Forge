@@ -1139,6 +1139,62 @@ export class Repository {
       .run(remaining, total, source, confidence, now, id);
   }
 
+  /**
+   * Atomically records route/resource health and, when the resource is bound
+   * to an Agent Forge account identity, mirrors that route-level state onto
+   * the account. Provider implementations must use this repository boundary
+   * instead of writing account-health columns directly.
+   *
+   * An unbound resource is valid here: externally routed endpoints may keep
+   * their credentials in an external secret source and expose only one
+   * route-level capacity resource to Agent Forge.
+   */
+  public recordProviderResourceHealth(
+    id: string,
+    healthStatus: ProviderHealthStatus,
+    cooldownUntil: string | null,
+    failureCode: string | null,
+    exhaustQuota = false
+  ): void {
+    const resource = this.getProviderResource(id);
+    if (!resource) {
+      throw new Error(`Provider resource '${id}' not found`);
+    }
+    const now = new Date().toISOString();
+    this.db.transaction(() => {
+      this.db
+        .prepare(`
+          UPDATE provider_resources
+          SET health_status = ?,
+              last_health_check = ?,
+              remaining_quota = CASE WHEN ? = 1 THEN 0 ELSE remaining_quota END
+          WHERE id = ?
+        `)
+        .run(healthStatus, now, exhaustQuota ? 1 : 0, id);
+
+      if (!resource.provider_account_id) return;
+      if (healthStatus === 'AVAILABLE') {
+        this.db
+          .prepare(`
+            UPDATE provider_accounts
+            SET health_status = 'AVAILABLE', cooldown_until = NULL,
+                last_success_at = ?, updated_at = ?
+            WHERE id = ?
+          `)
+          .run(now, now, resource.provider_account_id);
+        return;
+      }
+      this.db
+        .prepare(`
+          UPDATE provider_accounts
+          SET health_status = ?, cooldown_until = ?, last_failure_at = ?,
+              last_failure_code = ?, updated_at = ?
+          WHERE id = ?
+        `)
+        .run(healthStatus, cooldownUntil, now, failureCode, now, resource.provider_account_id);
+    })();
+  }
+
   // ==========================================
   // Agents
   // ==========================================

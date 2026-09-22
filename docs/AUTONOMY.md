@@ -1,7 +1,7 @@
 # Local self-host bootstrap
 
 The bootstrap is a bounded PILOT inside Agent Forge, in `src/core/autonomy`.
-It runs one file-editing Antigravity worker and a read-only Codex manager.
+It runs one file-editing Antigravity worker and a read-only manager provider pool.
 It does not merge, replace the running supervisor, or automatically resume R5L1.
 
 ## Implemented loop
@@ -9,14 +9,14 @@ It does not merge, replace the running supervisor, or automatically resume R5L1.
 1. Claim the SQLite supervisor owner record and reconcile unfinished processes.
 2. Claim a durable task request, resolve its exact base SHA, and create a locked
    isolated worktree through the existing GitWorktreeService.
-3. Ask Codex to produce a validated workorder.v1; reject changes to seeded
+3. Ask the selected Manager resource to produce a validated workorder.v1; reject changes to seeded
    identity, paths, tests, constraints, or acceptance criteria.
 4. Persist the WorkOrder and acquire its transactional slot/epoch before AGY.
 5. Run agy --mode accept-edits --sandbox -p in that worktree. Workers use
    file tools; the supervisor exclusively executes the required tests.
 6. Capture status, tracked diff, untracked content, SHA-256 snapshot, HEAD,
    test exit codes, timing, and sanitized logs.
-7. Ask codex exec --json --sandbox read-only for managerreview.v1.
+7. Ask the selected Reviewer resource for managerreview.v1.
 8. Accept PASS only when every test passed and both HEAD and the working-file
    snapshot are unchanged. Record LOCAL_ACCEPTED; this is not a PR or merge.
 9. REPAIR persists findings in a new attempt/epoch in the same worktree.
@@ -27,15 +27,15 @@ permission denial is a contract failure. No permission-bypass flags are used.
 CODEX_MANAGER_MODEL selects the manager model. JSONL logs preserve the official
 thread ID. Reviews always receive fresh evidence.
 
-## Reuse and provisional boundaries
+## Product-task consolidation and compatibility
 
-The kernel reuses DatabaseEngine/WAL, existing product migrations,
-ProcessRunner/PolicyService, Repository.process_runs, GitWorktreeService, and
-ArtifactStore path containment checks. Bootstrap WorkOrders, slots, runs,
-reviews, claims, and events currently use an idempotent SQLite extension schema.
-They are not yet connected to the desktop TaskService, execution authorization,
-account routing, or WorkerSlotLeaseService. Consolidation is required before
-adopting existing product tasks. There is no migration 25 in this slice.
+New product-task execution is adapted from the existing `tasks`, TaskService,
+ExecutionAuthorization, AgentAssignment, ProviderResource, ContextManifest,
+WorkerSlotLeaseService, process_runs, evidence, and test_runs authorities.
+The product task state machine remains the sole lifecycle authority. Legacy
+`autonomy_*` rows are inventoried and retained as compatibility/audit evidence;
+they are not silently discarded or authoritative for new product tasks. The
+consolidated path remains fenced to `MAX_AGY_WORKERS=1`.
 
 SQLite lives at RUNTIME_ROOT/state/agent-forge.sqlite. Provider logs, prompts,
 review/session events, and evidence live in that database. Operator files belong
@@ -49,6 +49,7 @@ commands use that fixed build and never rebuild a running controller.
 
 ```powershell
 npm.cmd run autonomy:doctor
+npm.cmd run autonomy:doctor:omniroute
 npm.cmd run autonomy:shadow
 npm.cmd run autonomy:pilot
 npm.cmd run autonomy:start
@@ -116,11 +117,13 @@ closed.
 
 All autonomous Manager and Reviewer call paths—WorkOrder planning, local verification
 review, and GitHub CI failure diagnosis—use an explicitly configured manager provider
-pool rather than a singleton Codex dependency. The primary resource is `codex-chatgpt-primary`;
-an API resource `codex-api-fallback` is opt-in (`AGENT_FORGE_ENABLE_OPENAI_API_FALLBACK=1`)
-and configured with its own credential and billing limits. An extension point allows
-registering compatible resources. Resources are persisted with `AVAILABLE`, `AUTH_ERROR`,
-`RATE_LIMITED`, `CREDITS_EXHAUSTED`, `COOLDOWN`, `OFFLINE`, or `CONTRACT_INVALID` state.
+pool rather than a singleton Codex dependency. When enabled, `manager-omniroute` and
+`reviewer-omniroute` are the preferred resources and use a direct Responses-compatible
+HTTP transport. `codex-chatgpt-primary` remains a bootstrap/fallback resource; the
+independently billed `codex-api-fallback` remains opt-in
+(`AGENT_FORGE_ENABLE_OPENAI_API_FALLBACK=1`). Resources record route-level
+`AVAILABLE`, `DEGRADED`, `AUTH_ERROR`, `RATE_LIMITED`, `CREDITS_EXHAUSTED`,
+`CAPACITY_EXHAUSTED`, `COOLDOWN`, `TIMEOUT`, `OFFLINE`, or `CONTRACT_INVALID` state.
 Active cooldowns and known unavailable resources are skipped without invoking them.
 Every review receives the durable `managercontext.v1` package, including task identity,
 immutable WorkOrder, acceptance criteria, exact base SHA, fresh current HEAD, actual diff/evidence,
@@ -133,6 +136,38 @@ test gates, and audit trails. ChatGPT workspace capacity and OpenAI API quota/bi
 remain separate. A manager outage leaves the affected task resumable and does not stop Antigravity slots,
 GitHub CI observation, or unrelated executable work. Stale reviewed HEADs force a `REPAIR` verdict,
 malformed provider contracts fail closed, and ChatGPT accounts are never rotated automatically.
+
+### OmniRoute configuration
+
+The company URL, authorization value, and model aliases stay outside Git. Agent Forge
+does not inspect or rotate accounts behind the route. Configure the direct transport
+through the process environment:
+
+```text
+AGENT_FORGE_OMNIROUTE_ENABLED=1
+AGENT_FORGE_OMNIROUTE_BASE_URL=<external Responses-compatible base URL>
+AGENT_FORGE_OMNIROUTE_AUTH_ENV=OMNIROUTE_AUTH_HEADER
+AGENT_FORGE_OMNIROUTE_AUTH_HEADER_NAME=<configured HTTP header name>
+AGENT_FORGE_MANAGER_MODEL=<configured manager model or route>
+AGENT_FORGE_REVIEWER_MODEL=<configured reviewer model or route; defaults to manager>
+AGENT_FORGE_CODER_MODEL=<configured coder model or route, when Phase C is enabled>
+AGENT_FORGE_OMNIROUTE_TIMEOUT_MS=120000
+```
+
+HTTPS is required by default. A previously approved non-TLS company route must
+set `AGENT_FORGE_OMNIROUTE_ALLOW_HTTP=1` explicitly; the doctor otherwise fails
+closed.
+
+The auth source stores only an `env://...` reference. The secret value is read at
+dispatch time and is never included in a WorkOrder, ManagerContextPackage, SQLite
+evidence, diagnostics, or logs. `autonomy:doctor:omniroute` performs an explicit live
+Responses contract probe and reports only compatibility/state and configured model
+names. Normal unit tests use fake endpoints.
+
+Coder routing already uses the product ProviderAdapter/role-aware resource path. A
+configured external-router coder adapter is available for Phase C, but AGY CLI remains
+the self-host bootstrap implementation until a real coder contract and model alias are
+explicitly configured and proven.
 
 Register a watch using a JSON file under the runtime root:
 
