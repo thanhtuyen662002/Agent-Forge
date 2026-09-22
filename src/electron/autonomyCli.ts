@@ -98,15 +98,15 @@ async function doctorOmniRoute(): Promise<number> {
 
 async function main(): Promise<number> {
   const rawMaxWorkers = process.env.MAX_AGY_WORKERS !== undefined ? Number(process.env.MAX_AGY_WORKERS) : 1;
-  if (rawMaxWorkers > 1 || rawMaxWorkers < 1 || Number.isNaN(rawMaxWorkers)) {
-    process.stderr.write('CONSOLIDATION_REQUIRES_MAX_AGY_WORKERS_1: Autonomy CLI rejects MAX_AGY_WORKERS > 1 while consolidation is active\n');
+  if (!Number.isInteger(rawMaxWorkers) || rawMaxWorkers < 1 || rawMaxWorkers > 2) {
+    process.stderr.write('CONSOLIDATION_REQUIRES_MAX_AGY_WORKERS_BOUNDS: Autonomy CLI accepts only MAX_AGY_WORKERS integers from 1 through 2\n');
     return 1;
   }
   const command = process.argv[2] ?? 'status';
   if (command === 'doctor') return doctor();
   if (command === 'doctor-omniroute') return doctorOmniRoute();
   const store = AutonomyStore.open(runtimeRoot);
-  const supervisor = new AutonomySupervisor({ store: store.store, mode: command === 'shadow' ? 'SHADOW' : 'PILOT', runtimeRoot, controlRepo, worktreeRoot });
+  const supervisor = new AutonomySupervisor({ store: store.store, mode: command === 'shadow' ? 'SHADOW' : 'PILOT', runtimeRoot, controlRepo, worktreeRoot, maxWorkers: rawMaxWorkers });
   const ci = new GithubCiObserver(store.store, controlRepo, supervisor.managerPool);
   if (command === 'status') { process.stdout.write(`${JSON.stringify({ mode: supervisor.mode, maxWorkers: supervisor.maxWorkers, orders: supervisor.store.listAll(), activeSlots: supervisor.store.listActiveSlots(), runtimeRoot, legacyInventory: supervisor.store.inventoryLegacyState() })}\n`); return 0; }
   if (command === 'inventory-legacy') { process.stdout.write(`${JSON.stringify(supervisor.store.inventoryLegacyState(), null, 2)}\n`); return 0; }
@@ -146,31 +146,25 @@ async function main(): Promise<number> {
   if (command === 'start') {
     const proven = store.store.getDatabase().prepare("SELECT id FROM autonomy_events WHERE event_type='LOCAL_ACCEPTED' LIMIT 1").get();
     if (!proven) throw new Error('PILOT_PROOF_REQUIRED');
-    process.stdout.write('Agent Forge PILOT supervisor started (one worker; no push or merge).\n');
-    let activeTask: Promise<void> | null = null;
-    while (!store.store.shouldStop()) {
-      const task = activeTask ? null : store.store.claimNext();
-      if (task) activeTask = (async () => { try {
-        const result = await runDisposableSelfHostProof({ controlRepo, worktreeRoot, supervisor, task });
-        let publishedHead: string | null = null;
-        if (result.result.accepted) {
-          publishedHead = await ci.publishAcceptedRepair(task.task_id, result.worktree, result.branch);
+    const workerDescription = supervisor.maxWorkers === 1 ? 'one worker' : 'two workers';
+    process.stdout.write(`Agent Forge PILOT supervisor started (${workerDescription}; no push or merge).\n`);
+    const queue = supervisor.createContinuousQueue({
+      ci,
+      controlRepo,
+      worktreeRoot,
+      onEvent: (type, payload) => {
+        if (type === 'TASK_SETTLED') {
+          process.stdout.write(`${JSON.stringify({ task: payload.task, accepted: payload.accepted, state: payload.state, publishedHead: payload.publishedHead })}\n`);
+        } else if (type === 'TASK_BLOCKED') {
+          process.stdout.write(`${payload.task}: BLOCKED\n`);
+        } else if (type === 'CI_OBSERVATION') {
+          process.stdout.write(`${JSON.stringify({ ci: payload.watch.pr_number, conclusion: payload.conclusion, headSha: payload.headSha, repairTaskId: payload.repairTaskId })}\n`);
+        } else if (type === 'CI_RETRY_DEFERRED') {
+          process.stdout.write(`CI observer retry deferred: ${redact(payload.error)}\n`);
         }
-        store.store.event(task.task_id, 'TASK_SETTLED', { accepted: result.result.accepted ?? false, state: result.result.state, worktree: result.worktree, branch: result.branch, error: result.result.error });
-        process.stdout.write(`${JSON.stringify({ task: task.task_id, accepted: result.result.accepted ?? false, state: result.result.state, publishedHead })}\n`);
-      } catch (error) {
-        store.store.event(task.task_id, 'TASK_BLOCKED', { error: redact(String(error)) });
-        process.stdout.write(`${task.task_id}: BLOCKED\n`);
-      } })().finally(() => { activeTask = null; });
-      try {
-        for (const observation of await ci.observeDue()) process.stdout.write(`${JSON.stringify({ ci: observation.watch.pr_number, conclusion: observation.conclusion, headSha: observation.headSha, repairTaskId: observation.repairTaskId })}\n`);
-      } catch (error) {
-        process.stdout.write(`CI observer retry deferred: ${redact(String(error))}\n`);
-      }
-      if (!task) await new Promise((resolve) => setTimeout(resolve, 1000));
-    }
-    await activeTask;
-    return 0;
+      },
+    });
+    return queue.run();
   }
   process.stderr.write(`Unknown autonomy command: ${command}\n`); return 2;
   } finally { clearInterval(cancellation); store.store.releaseOwner(owner); store.engine.close(); }

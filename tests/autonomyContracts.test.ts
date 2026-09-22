@@ -194,14 +194,19 @@ describe('autonomy durable contracts', () => {
     fs.rmSync(root, { recursive: true, force: true }); fs.rmSync(control, { recursive: true, force: true });
   });
 
-  it('enforces consolidation hard cap MAX_AGY_WORKERS=1 and rejects higher values', () => {
+  it('enforces consolidation cap MAX_AGY_WORKERS accepting 1 through 2 and rejecting other values', () => {
     const db = new Database(':memory:'); MigrationRunner.run(db);
     const store = new AutonomyStore(db);
-    expect(() => new AutonomySupervisor({ store, maxWorkers: 2 })).toThrow(/CONSOLIDATION_REQUIRES_MAX_AGY_WORKERS_1/);
+    expect(() => new AutonomySupervisor({ store, maxWorkers: 3 })).toThrow(/CONSOLIDATION_REQUIRES_MAX_AGY_WORKERS/);
+    expect(() => new AutonomySupervisor({ store, maxWorkers: 0 })).toThrow(/CONSOLIDATION_REQUIRES_MAX_AGY_WORKERS/);
+    expect(() => new AutonomySupervisor({ store, maxWorkers: -1 })).toThrow(/CONSOLIDATION_REQUIRES_MAX_AGY_WORKERS/);
+    expect(() => new AutonomySupervisor({ store, maxWorkers: 1.5 })).toThrow(/CONSOLIDATION_REQUIRES_MAX_AGY_WORKERS/);
     const prevEnv = process.env.MAX_AGY_WORKERS;
     try {
       process.env.MAX_AGY_WORKERS = '3';
-      expect(() => new AutonomySupervisor({ store })).toThrow(/CONSOLIDATION_REQUIRES_MAX_AGY_WORKERS_1/);
+      expect(() => new AutonomySupervisor({ store })).toThrow(/CONSOLIDATION_REQUIRES_MAX_AGY_WORKERS/);
+      process.env.MAX_AGY_WORKERS = '0';
+      expect(() => new AutonomySupervisor({ store })).toThrow(/CONSOLIDATION_REQUIRES_MAX_AGY_WORKERS/);
     } finally {
       if (prevEnv !== undefined) {
         process.env.MAX_AGY_WORKERS = prevEnv;
@@ -209,8 +214,12 @@ describe('autonomy durable contracts', () => {
         delete process.env.MAX_AGY_WORKERS;
       }
     }
-    const supervisor = new AutonomySupervisor({ store, maxWorkers: 1 });
-    expect(supervisor).toBeDefined();
+    const supervisor1 = new AutonomySupervisor({ store, maxWorkers: 1 });
+    expect(supervisor1).toBeDefined();
+    expect(supervisor1.maxWorkers).toBe(1);
+    const supervisor2 = new AutonomySupervisor({ store, maxWorkers: 2 });
+    expect(supervisor2).toBeDefined();
+    expect(supervisor2.maxWorkers).toBe(2);
     db.close();
   });
 });

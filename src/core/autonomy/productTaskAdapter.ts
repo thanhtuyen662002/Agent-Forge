@@ -25,8 +25,8 @@ import {
 } from './managerPool';
 import { AutonomyStore, LegacyAutonomyInventoryReport } from './store';
 
-/** Consolidation remains deliberately single-worker until a real product task proof passes. */
-export const MAX_AGY_WORKERS = 1;
+/** Consolidation supports an explicitly configured two-worker maximum (1 or 2). */
+export const MAX_AGY_WORKERS = 2;
 
 export interface ProductTaskAuthority {
   task: Task;
@@ -131,7 +131,7 @@ function fail(code: string, error: string): AuthorityValidationResult {
   return { valid: false, code, error };
 }
 
-function renderCommand(command: { executable: string; args: string[] }): string {
+export function renderCommand(command: { executable: string; args: string[] }): string {
   return [command.executable, ...command.args].map((part) => JSON.stringify(part)).join(' ');
 }
 
@@ -171,10 +171,11 @@ export class ProductTaskAutonomyAdapter {
   constructor(private readonly options: ProductTaskAutonomyAdapterOptions) {
     this.leaseService = options.leaseService ?? new WorkerSlotLeaseService(options.repo);
     this.taskService = options.taskService ?? new TaskService(options.repo, new EventService(options.repo));
-    this.maxWorkers = options.maxWorkers ?? MAX_AGY_WORKERS;
-    if (this.maxWorkers !== MAX_AGY_WORKERS) {
-      throw new Error('PRODUCT_TASK_CONSOLIDATION_REQUIRES_MAX_AGY_WORKERS_1');
+    const rawWorkers = options.maxWorkers ?? (process.env.MAX_AGY_WORKERS !== undefined ? Number(process.env.MAX_AGY_WORKERS) : 1);
+    if (!Number.isInteger(rawWorkers) || rawWorkers < 1 || rawWorkers > 2) {
+      throw new Error('PRODUCT_TASK_CONSOLIDATION_REQUIRES_MAX_AGY_WORKERS_BOUNDS: ProductTaskAutonomyAdapter accepts maxWorkers integers from 1 through 2');
     }
+    this.maxWorkers = rawWorkers;
     this.evidenceCollector = options.evidenceCollector;
   }
 
@@ -363,7 +364,7 @@ export class ProductTaskAutonomyAdapter {
   public acquireWorkerSlotLease(assignmentId: string): AcquireSlotLeaseResult {
     const active = this.repo.getAllWorkerSlots().filter((slot) => slot.status === 'LEASED' || slot.status === 'RUNNING');
     if (active.length >= this.maxWorkers && !active.some((slot) => slot.current_assignment_id === assignmentId)) {
-      return { status: 'FAILED', code: 'ACCOUNT_CAPACITY_EXHAUSTED', error: 'MAX_WORKERS_EXCEEDED: consolidation is fenced to one Antigravity worker.' };
+      return { status: 'FAILED', code: 'ACCOUNT_CAPACITY_EXHAUSTED', error: `MAX_WORKERS_EXCEEDED: consolidation is fenced to ${this.maxWorkers} Antigravity worker${this.maxWorkers === 1 ? '' : 's'}.` };
     }
     return this.leaseService.acquireForAssignment(assignmentId);
   }

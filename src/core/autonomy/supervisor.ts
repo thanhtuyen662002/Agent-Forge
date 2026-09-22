@@ -1,14 +1,19 @@
+import crypto from 'crypto';
 import fs from 'fs';
 import path from 'path';
+import { spawnSync } from 'child_process';
 import { EvidenceCollector } from './evidence';
 import { AntigravityAdapter, CodexManagerAdapter, ManagerEvidence, ProviderRun } from './providers';
-import { AutonomyState, AutonomousTaskSpec, ManagerReview, WorkOrder, createWorkOrder } from './contracts';
+import { AutonomyState, AutonomousTaskSpec, ManagerReview, SelfHostTask, WorkOrder, createWorkOrder } from './contracts';
 import { AutonomyStore } from './store';
 import { Repository } from '../database/repositories';
 import { ProcessRunner } from '../services/ProcessRunner';
 import { assertPathContained, ArtifactStore } from '../services/ArtifactStore';
 import { ManagerProviderPool, buildManagerContextPackage } from './managerPool';
-import { ProductTaskAutonomyAdapter } from './productTaskAdapter';
+import { ProductTaskAutonomyAdapter, renderCommand } from './productTaskAdapter';
+import { GitWorktreeService } from '../services/GitWorktreeService';
+import { AgentAssignment, ExecutionAuthorization, Task } from '../types/domain';
+import { CanonicalExecutionPayload, CanonicalExecutionPayloadSchema } from '../services/ExecutionAuthorizationService';
 
 export type AutonomyMode = 'SHADOW' | 'PILOT' | 'AUTONOMOUS';
 
@@ -54,10 +59,10 @@ export class AutonomySupervisor {
   constructor(config: SupervisorConfig = {}) {
     this.mode = config.mode ?? ((process.env.AGENT_FORGE_MODE as AutonomyMode | undefined) ?? 'PILOT');
     const rawWorkers = config.maxWorkers ?? (process.env.MAX_AGY_WORKERS !== undefined ? Number(process.env.MAX_AGY_WORKERS) : 1);
-    if (rawWorkers > 1 || rawWorkers < 1 || Number.isNaN(rawWorkers)) {
-      throw new Error('CONSOLIDATION_REQUIRES_MAX_AGY_WORKERS_1: AutonomySupervisor rejects MAX_AGY_WORKERS > 1 while consolidation is active');
+    if (!Number.isInteger(rawWorkers) || rawWorkers < 1 || rawWorkers > 2) {
+      throw new Error('CONSOLIDATION_REQUIRES_MAX_AGY_WORKERS_BOUNDS: AutonomySupervisor accepts only MAX_AGY_WORKERS integers from 1 through 2');
     }
-    this.maxWorkers = 1;
+    this.maxWorkers = rawWorkers;
     this.maxRepairLoops = config.maxRepairLoops ?? Number(process.env.MAX_REPAIR_LOOPS ?? 3);
     this.controlRepo = path.resolve(config.controlRepo ?? process.env.AGENT_FORGE_CONTROL_REPO ?? process.cwd());
     this.worktreeRoot = path.resolve(config.worktreeRoot ?? process.env.AGENT_FORGE_WORKTREE_ROOT ?? path.join(this.controlRepo, '..', 'AI', 'Agent-Forge-Worktrees'));
@@ -84,7 +89,9 @@ export class AutonomySupervisor {
     if (!path.isAbsolute(order.worktree)) throw new Error('CONTRACT_INVALID: worktree must be absolute');
     if (path.resolve(order.worktree).toLowerCase() === this.controlRepo.toLowerCase()) throw new Error('WORKTREE_IS_CONTROL_REPO: workers cannot run in the control repository');
     if (this.mode !== 'SHADOW') {
-      assertPathContained(order.worktree, this.worktreeRoot);
+      if (!this.store.isProductTask(order.task_id)) {
+        assertPathContained(order.worktree, this.worktreeRoot);
+      }
       if (!AutonomySupervisor.isSafeWorktree(this.controlRepo, order.worktree)) throw new Error('UNSAFE_WORKTREE');
       if (!order.allowed_paths.length || !order.required_tests.length) throw new Error('CONTRACT_INVALID: allowed paths and deterministic tests are required');
       for (const entry of order.allowed_paths) assertPathContained(path.resolve(order.worktree, entry), order.worktree);
@@ -296,6 +303,22 @@ export class AutonomySupervisor {
     };
   }
 
+  getAvailableWorkerId(activeWorkerIds: Iterable<string> = []): string | null {
+    const active = new Set(activeWorkerIds);
+    for (const slot of this.store.listActiveSlots()) {
+      if (slot.workerId) active.add(slot.workerId);
+    }
+    for (let i = 1; i <= this.maxWorkers; i++) {
+      const candidate = `agy-${String(i).padStart(2, '0')}`;
+      if (!active.has(candidate)) return candidate;
+    }
+    return null;
+  }
+
+  createContinuousQueue(options: Omit<SupervisorQueueOptions, 'supervisor'> = {}): SupervisorContinuousQueue {
+    return new SupervisorContinuousQueue({ ...options, supervisor: this });
+  }
+
   static isSafeWorktree(controlRepo: string, worktree: string): boolean {
     const controlResolved = path.resolve(controlRepo);
     const candidateResolved = path.resolve(worktree);
@@ -307,5 +330,363 @@ export class AutonomySupervisor {
     const candidate = normalize(candidateResolved);
     const relative = path.relative(control, candidate);
     return candidate !== control && (relative.startsWith('..') || path.isAbsolute(relative));
+  }
+}
+
+export interface SupervisorQueueTaskResult {
+  accepted: boolean;
+  state: AutonomyState;
+  worktree?: string;
+  branch?: string;
+  error?: string;
+  publishedHead?: string | null;
+}
+
+export interface SupervisorQueueCiObserver {
+  observeDue: () => Promise<any[]>;
+  publishAcceptedRepair?: (taskId: string, worktree: string, branch: string) => Promise<string | null>;
+}
+
+export interface SupervisorQueueOptions {
+  supervisor: AutonomySupervisor;
+  ci?: SupervisorQueueCiObserver;
+  controlRepo?: string;
+  worktreeRoot?: string;
+  pollIntervalMs?: number;
+  dispatchTask?: (task: SelfHostTask, workerId: string) => Promise<SupervisorQueueTaskResult>;
+  onEvent?: (eventType: string, payload: any) => void;
+}
+
+export class SupervisorContinuousQueue {
+  readonly supervisor: AutonomySupervisor;
+  readonly store: AutonomyStore;
+  readonly maxWorkers: number;
+  readonly controlRepo: string;
+  readonly worktreeRoot: string;
+  readonly ci?: SupervisorQueueCiObserver;
+  private readonly options: SupervisorQueueOptions;
+  private readonly activeTasks = new Map<string, Promise<void>>();
+  private readonly activeWorkers = new Map<string, string>();
+
+  constructor(options: SupervisorQueueOptions) {
+    this.options = options;
+    this.supervisor = options.supervisor;
+    this.store = options.supervisor.store;
+    this.maxWorkers = options.supervisor.maxWorkers;
+    this.controlRepo = path.resolve(options.controlRepo ?? options.supervisor.controlRepo);
+    this.worktreeRoot = path.resolve(options.worktreeRoot ?? options.supervisor.worktreeRoot);
+    this.ci = options.ci;
+  }
+
+  getActiveTaskCount(): number {
+    return this.activeTasks.size;
+  }
+
+  getActiveTaskIds(): string[] {
+    return Array.from(this.activeTasks.keys());
+  }
+
+  getActiveWorkerIds(): string[] {
+    return Array.from(this.activeWorkers.values());
+  }
+
+  allocateWorkerIdentity(): string | null {
+    if (this.activeTasks.size >= this.maxWorkers) return null;
+    const inFlightWorkers = new Set(this.activeWorkers.values());
+    for (let i = 1; i <= this.maxWorkers; i++) {
+      const candidate = `agy-${String(i).padStart(2, '0')}`;
+      if (!inFlightWorkers.has(candidate)) {
+        return candidate;
+      }
+    }
+    return null;
+  }
+
+  async step(): Promise<{ dispatched: string | null; workerId: string | null; observations: any[] }> {
+    let dispatched: string | null = null;
+    let assignedWorker: string | null = null;
+
+    if (!this.store.shouldStop() && this.activeTasks.size < this.maxWorkers) {
+      const workerId = this.allocateWorkerIdentity();
+      if (workerId) {
+        const task = this.store.claimNext();
+        if (task) {
+          dispatched = task.task_id;
+          assignedWorker = workerId;
+          this.activeWorkers.set(task.task_id, workerId);
+
+          const taskPromise = (async () => {
+            try {
+              const result = this.options.dispatchTask
+                ? await this.options.dispatchTask(task, workerId)
+                : await this.defaultDispatch(task, workerId);
+
+              this.store.event(task.task_id, 'TASK_SETTLED', {
+                accepted: result.accepted ?? false,
+                state: result.state,
+                worktree: result.worktree,
+                branch: result.branch,
+                error: result.error,
+              });
+              this.options.onEvent?.('TASK_SETTLED', {
+                task: task.task_id,
+                workerId,
+                accepted: result.accepted ?? false,
+                state: result.state,
+                publishedHead: result.publishedHead ?? null,
+              });
+            } catch (error) {
+              const errorMessage = error instanceof Error ? error.message : String(error);
+              this.store.event(task.task_id, 'TASK_BLOCKED', { error: errorMessage });
+              this.options.onEvent?.('TASK_BLOCKED', { task: task.task_id, workerId, error: errorMessage });
+            } finally {
+              this.activeTasks.delete(task.task_id);
+              this.activeWorkers.delete(task.task_id);
+            }
+          })();
+
+          this.activeTasks.set(task.task_id, taskPromise);
+        }
+      }
+    }
+
+    let observations: any[] = [];
+    if (this.ci) {
+      try {
+        observations = await this.ci.observeDue();
+        for (const obs of observations) {
+          this.options.onEvent?.('CI_OBSERVATION', obs);
+        }
+      } catch (error) {
+        this.options.onEvent?.('CI_RETRY_DEFERRED', { error: String(error) });
+      }
+    }
+
+    return { dispatched, workerId: assignedWorker, observations };
+  }
+
+  async waitForAllActive(): Promise<void> {
+    while (this.activeTasks.size > 0) {
+      await Promise.all(Array.from(this.activeTasks.values()));
+    }
+  }
+
+  async run(): Promise<number> {
+    while (!this.store.shouldStop()) {
+      const { dispatched } = await this.step();
+      if (!dispatched && this.activeTasks.size === 0) {
+        await new Promise((resolve) => setTimeout(resolve, this.options.pollIntervalMs ?? 1000));
+      } else if (!dispatched) {
+        await new Promise((resolve) => setTimeout(resolve, Math.min(this.options.pollIntervalMs ?? 1000, 200)));
+      }
+    }
+    await this.waitForAllActive();
+    return 0;
+  }
+
+  private async defaultDispatch(task: SelfHostTask, workerId: string): Promise<SupervisorQueueTaskResult> {
+    if (this.store.isProductTask(task.task_id)) {
+      const db = this.store.getDatabase();
+      const authRow = db.prepare(
+        "SELECT * FROM execution_authorizations WHERE task_id = ? AND status IN ('AUTHORIZED','DISPATCHED') ORDER BY created_at DESC LIMIT 1"
+      ).get(task.task_id) as ExecutionAuthorization | undefined;
+
+      if (!authRow) {
+        return {
+          accepted: false,
+          state: 'BLOCKED',
+          error: 'PRODUCT_TASK_REQUIRES_EXECUTION_AUTHORIZATION: product tasks must have durable ExecutionAuthorization and cannot execute through legacy autonomy state',
+        };
+      }
+
+      const productTask = db.prepare('SELECT * FROM tasks WHERE id = ?').get(task.task_id) as Task | undefined;
+      if (!productTask) {
+        return {
+          accepted: false,
+          state: 'BLOCKED',
+          error: `TASK_NOT_FOUND: Task "${task.task_id}" was not found.`,
+        };
+      }
+
+      // Validate the active durable ExecutionAuthorization before constructing any runtime specification
+      const authorityValidation = this.supervisor.productAdapter.validateAuthority({
+        authorizationId: authRow.id,
+        currentHeadSha: authRow.repository_head_sha,
+      });
+
+      if (!authorityValidation.valid || !authorityValidation.authority) {
+        return {
+          accepted: false,
+          state: 'BLOCKED',
+          error: `${authorityValidation.code}: ${authorityValidation.error}`,
+        };
+      }
+
+      const { task: validatedTask, authorization, assignment } = authorityValidation.authority;
+      if (!authorization.canonical_payload_json) {
+        return {
+          accepted: false,
+          state: 'BLOCKED',
+          error: 'CANONICAL_PAYLOAD_MISSING: ExecutionAuthorization has no canonical payload.',
+        };
+      }
+
+      let canonicalPayload: CanonicalExecutionPayload;
+      try {
+        canonicalPayload = CanonicalExecutionPayloadSchema.parse(JSON.parse(authorization.canonical_payload_json));
+      } catch (error) {
+        return {
+          accepted: false,
+          state: 'BLOCKED',
+          error: `CANONICAL_PAYLOAD_INVALID: ${error instanceof Error ? error.message : String(error)}`,
+        };
+      }
+
+      if (!canonicalPayload.executionScope) {
+        return {
+          accepted: false,
+          state: 'BLOCKED',
+          error: 'EXECUTION_SCOPE_MISSING: ExecutionAuthorization canonical payload is missing required executionScope.',
+        };
+      }
+
+      const authorizedScope = canonicalPayload.executionScope;
+      if (!path.isAbsolute(authorizedScope.worktree) && !path.win32.isAbsolute(authorizedScope.worktree) && !path.posix.isAbsolute(authorizedScope.worktree)) {
+        return {
+          accepted: false,
+          state: 'BLOCKED',
+          error: 'WORKTREE_MUST_BE_ABSOLUTE: Authorized executionScope worktree must be an absolute path.',
+        };
+      }
+
+      if (!authorizedScope.allowedPaths || authorizedScope.allowedPaths.length === 0) {
+        return {
+          accepted: false,
+          state: 'BLOCKED',
+          error: 'ALLOWED_PATHS_REQUIRED: Authorized executionScope allowedPaths must contain at least one path.',
+        };
+      }
+
+      const attempt = assignment.attempt_id
+        ? (db.prepare('SELECT attempt_number FROM task_attempts WHERE id = ?').get(assignment.attempt_id) as { attempt_number: number } | undefined)
+        : null;
+
+      const requiredTests = Object.values(canonicalPayload.verificationCommands)
+        .filter((command): command is { executable: string; args: string[] } => command !== null)
+        .map(renderCommand);
+
+      const spec: AutonomousTaskSpec = {
+        taskId: validatedTask.id,
+        issueNumber: null,
+        workerId,
+        objective: validatedTask.description ?? validatedTask.title,
+        baseSha: authorization.base_sha,
+        branch: authorizedScope.branch,
+        worktree: authorizedScope.worktree,
+        dependencies: (task as { dependencies?: string[] }).dependencies ?? [],
+        allowedPaths: [...authorizedScope.allowedPaths],
+        forbiddenPaths: [...authorizedScope.forbiddenPaths],
+        acceptanceCriteria: [...canonicalPayload.acceptanceCriteria],
+        requiredTests: requiredTests.length > 0 ? requiredTests : task.required_tests,
+        contextFiles: [...canonicalPayload.contextFiles],
+        constraints: [...canonicalPayload.constraints, ...canonicalPayload.instructions],
+        attempt: attempt?.attempt_number ?? validatedTask.revision_count + 1,
+        leaseEpoch: validatedTask.ownership_epoch ?? 1,
+      };
+
+      const runResult = await this.supervisor.runProductTask(spec);
+      return {
+        accepted: runResult.accepted ?? false,
+        state: runResult.state,
+        worktree: spec.worktree,
+        branch: spec.branch,
+        error: runResult.error,
+      };
+    }
+
+    fs.mkdirSync(this.worktreeRoot, { recursive: true });
+    const gitExec = (process.env.Path ?? process.env.PATH ?? '').split(path.delimiter).map((dir) => path.join(dir, process.platform === 'win32' ? 'git.exe' : 'git')).find((file) => fs.existsSync(file)) || (process.platform === 'win32' ? 'git.exe' : 'git');
+    const id = crypto.randomUUID().slice(0, 8);
+    const branch = `agent/${workerId}/${task.task_id.toLowerCase()}-${id}`;
+    const worktrees = new GitWorktreeService({ gitExecutable: gitExec, repositoryRoot: this.controlRepo, managedRoot: this.worktreeRoot });
+    const head = spawnSync(gitExec, ['rev-parse', '--verify', task.base_sha ?? 'HEAD'], { cwd: this.controlRepo, encoding: 'utf8', windowsHide: true, shell: false });
+    const headSha = String(head.stdout ?? '').trim();
+    if (head.status !== 0 || !/^[0-9a-f]{40}$/i.test(headSha)) {
+      throw new Error(`SELF_HOST_BASE_SHA_FAILED: ${head.stderr || head.stdout}`);
+    }
+    const tuple = { projectId: 'AGENT-FORGE', taskId: task.task_id, assignmentId: id, workerSlotId: workerId, baseSha: headSha };
+    this.supervisor.store.event(tuple.taskId, 'WORKTREE_INTENT', tuple);
+    const added = await worktrees.createWorktree(tuple);
+    if (added.status !== 'CREATED') throw new Error(`SELF_HOST_WORKTREE_CREATE_FAILED: ${added.error}`);
+    const worktree = added.worktreePath;
+    this.supervisor.store.event(tuple.taskId, 'WORKTREE_CREATED', { worktree, branch, baseSha: headSha });
+    const branchResult = spawnSync(gitExec, ['switch', '-c', branch], { cwd: worktree, encoding: 'utf8', windowsHide: true, shell: false });
+    if (branchResult.status !== 0) throw new Error(`SELF_HOST_BRANCH_CREATE_FAILED: ${String(branchResult.stderr || branchResult.stdout).trim()}`);
+
+    const seed: AutonomousTaskSpec = {
+      taskId: task.task_id,
+      issueNumber: null,
+      workerId,
+      objective: task.objective,
+      baseSha: headSha,
+      branch,
+      worktree,
+      allowedPaths: task.allowed_paths,
+      forbiddenPaths: ['.git', this.controlRepo, 'main'],
+      acceptanceCriteria: task.acceptance_criteria,
+      requiredTests: task.required_tests,
+      contextFiles: task.context_files ?? [],
+      constraints: ['Do not push or merge.', 'Do not modify files outside the allowed path.', ...(task.constraints ?? [])],
+    };
+
+    const authorized = this.supervisor.store.getDatabase().prepare("SELECT id FROM autonomy_events WHERE work_order_id=? AND event_type='TASK_MANAGER_AUTHORIZED'").get(task.task_id);
+    const planned = authorized ? {
+      workOrder: createWorkOrder(seed),
+      run: { status: 'SUCCESSFUL_PROCESS_EXIT' as const, exitCode: 0, executionId: '', stdout: '', stderr: '', durationMs: 0, error: undefined },
+      resource_id: 'authorized',
+      attempts: [],
+    } : await this.supervisor.managerPool.plan({
+      task_id: seed.taskId, worker_id: seed.workerId, objective: seed.objective,
+      base_sha: seed.baseSha, branch: seed.branch, worktree: seed.worktree,
+      acceptance_criteria: seed.acceptanceCriteria,
+      required_tests: seed.requiredTests,
+      allowed_paths: seed.allowedPaths,
+      forbidden_paths: seed.forbiddenPaths,
+      constraints: seed.constraints,
+    });
+    this.supervisor.store.event(seed.taskId, 'MANAGER_PLAN', planned);
+    if (!planned.workOrder) throw new Error(`SELF_HOST_MANAGER_PLAN_FAILED: ${planned.run.error || planned.run.stderr}`);
+
+    const runResult = await this.supervisor.run({
+      taskId: planned.workOrder.task_id,
+      issueNumber: planned.workOrder.issue_number,
+      workerId: planned.workOrder.worker_id,
+      objective: planned.workOrder.objective,
+      baseSha: planned.workOrder.base_sha,
+      branch: planned.workOrder.branch,
+      worktree: planned.workOrder.worktree,
+      dependencies: planned.workOrder.dependencies,
+      allowedPaths: planned.workOrder.allowed_paths,
+      forbiddenPaths: planned.workOrder.forbidden_paths,
+      acceptanceCriteria: planned.workOrder.acceptance_criteria,
+      requiredTests: planned.workOrder.required_tests,
+      contextFiles: planned.workOrder.context_files,
+      constraints: planned.workOrder.constraints,
+      attempt: planned.workOrder.attempt,
+      leaseEpoch: planned.workOrder.lease_epoch,
+    });
+
+    let publishedHead: string | null = null;
+    if (runResult.accepted && this.ci?.publishAcceptedRepair) {
+      publishedHead = await this.ci.publishAcceptedRepair(task.task_id, worktree, branch);
+    }
+    return {
+      accepted: runResult.accepted ?? false,
+      state: runResult.state,
+      worktree,
+      branch,
+      error: runResult.error,
+      publishedHead,
+    };
   }
 }
