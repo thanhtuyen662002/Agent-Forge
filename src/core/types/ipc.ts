@@ -1,4 +1,5 @@
 import { z } from 'zod';
+import { CanonicalExecutionScopeSchema } from '../services/ExecutionAuthorizationService';
 
 // Strict Zod schemas for all IPC channels across the main process security boundary
 
@@ -148,6 +149,7 @@ export const AuthorizeRoutedTaskIpcSchema = z
     attemptId: z.string().nullable().optional(),
     routingDecisionId: z.string().min(1, 'Routing decision ID is required'),
     contextFiles: z.array(z.string()).optional().default([]),
+    executionScope: CanonicalExecutionScopeSchema.optional(),
   })
   .strict();
 export type AuthorizeRoutedTaskIpc = z.infer<typeof AuthorizeRoutedTaskIpcSchema>;

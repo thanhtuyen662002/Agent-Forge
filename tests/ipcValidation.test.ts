@@ -20,6 +20,7 @@ import {
   ResumeAdmittedSubmissionIpcSchema,
   AcknowledgeRecoveryFencedIpcSchema,
 } from '../src/core/types/ipc';
+import { CanonicalExecutionScopeSchema } from '../src/core/services/ExecutionAuthorizationService';
 import { PolicyService } from '../src/core/services/PolicyService';
 
 describe('IPC Validation & Security Gates', () => {
@@ -198,6 +199,44 @@ describe('IPC Validation & Security Gates', () => {
       prompt: 'do something else', // forbidden
     });
     expect(invalidPrompt.success).toBe(false);
+  });
+
+  it('accepts canonical execution scope while preserving legacy authorization payloads', () => {
+    const base = { projectId: 'PROJ-1', taskId: 'TASK-1', routingDecisionId: 'DEC-123' };
+    expect(AuthorizeRoutedTaskIpcSchema.safeParse(base).success).toBe(true);
+
+    const executionScope = {
+      branch: 'agent/agy-01/task-1',
+      worktree: 'D:/worktrees/task-1',
+      allowedPaths: ['src/core'],
+      forbiddenPaths: ['.git', 'main'],
+    };
+    const result = AuthorizeRoutedTaskIpcSchema.safeParse({ ...base, executionScope });
+    expect(result.success).toBe(true);
+    if (result.success) expect(result.data.executionScope).toEqual(executionScope);
+  });
+
+  it('reuses strict canonical execution-scope validation at the IPC boundary', () => {
+    const base = { projectId: 'PROJ-1', taskId: 'TASK-1', routingDecisionId: 'DEC-123' };
+    const validScope = {
+      branch: 'agent/agy-01/task-1',
+      worktree: 'D:/worktrees/task-1',
+      allowedPaths: ['src'],
+      forbiddenPaths: ['.git'],
+    };
+    expect(CanonicalExecutionScopeSchema.safeParse(validScope).success).toBe(true);
+
+    const invalidScopes = [
+      { ...validScope, worktree: 'relative/worktree' },
+      { ...validScope, branch: '' },
+      { ...validScope, extraField: 'not-authorized' },
+      { branch: validScope.branch, worktree: validScope.worktree, allowedPaths: validScope.allowedPaths },
+      null,
+      'not-an-object',
+    ];
+    for (const executionScope of invalidScopes) {
+      expect(AuthorizeRoutedTaskIpcSchema.safeParse({ ...base, executionScope }).success).toBe(false);
+    }
   });
 
   it('should validate dispatch IPC schema and strictly accept authorizationId only', () => {
