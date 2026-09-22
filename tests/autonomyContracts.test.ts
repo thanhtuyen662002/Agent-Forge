@@ -183,4 +183,24 @@ describe('autonomy durable contracts', () => {
     expect(AutonomySupervisor.isSafeWorktree(control, path.join(control, 'child'))).toBe(false);
     fs.rmSync(root, { recursive: true, force: true }); fs.rmSync(control, { recursive: true, force: true });
   });
+
+  it('enforces consolidation hard cap MAX_AGY_WORKERS=1 and rejects higher values', () => {
+    const db = new Database(':memory:'); MigrationRunner.run(db);
+    const store = new AutonomyStore(db);
+    expect(() => new AutonomySupervisor({ store, maxWorkers: 2 })).toThrow(/CONSOLIDATION_REQUIRES_MAX_AGY_WORKERS_1/);
+    const prevEnv = process.env.MAX_AGY_WORKERS;
+    try {
+      process.env.MAX_AGY_WORKERS = '3';
+      expect(() => new AutonomySupervisor({ store })).toThrow(/CONSOLIDATION_REQUIRES_MAX_AGY_WORKERS_1/);
+    } finally {
+      if (prevEnv !== undefined) {
+        process.env.MAX_AGY_WORKERS = prevEnv;
+      } else {
+        delete process.env.MAX_AGY_WORKERS;
+      }
+    }
+    const supervisor = new AutonomySupervisor({ store, maxWorkers: 1 });
+    expect(supervisor).toBeDefined();
+    db.close();
+  });
 });

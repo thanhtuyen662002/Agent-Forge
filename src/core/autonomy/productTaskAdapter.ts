@@ -14,6 +14,7 @@ import {
 import { TaskStateMachine, TaskTrigger } from '../state/taskStateMachine';
 import { AgentAssignment, ExecutionAuthorization, ProcessRun, Task, TestRun } from '../types/domain';
 import { AutonomousTaskSpec, ManagerReview, WorkOrder, createWorkOrder } from './contracts';
+import { EvidenceCollector } from './evidence';
 import {
   BuildManagerContextParams,
   ManagerContextPackage,
@@ -67,6 +68,7 @@ export interface ProductTaskAutonomyAdapterOptions {
   autonomyStore?: AutonomyStore;
   taskService?: TaskService;
   maxWorkers?: number;
+  evidenceCollector?: Pick<EvidenceCollector, 'collect'>;
 }
 
 export interface AuthorizedWorkOrderInput {
@@ -82,9 +84,10 @@ export interface AuthorizedWorkOrderInput {
 
 export interface ExecuteProductTaskParams extends AuthorizedWorkOrderInput {
   runCoder: (workOrder: WorkOrder) => Promise<{ success: boolean; currentHeadSha: string; error?: string }>;
-  runVerification: (authority: ProductTaskAuthority) => Promise<TestRun>;
+  runVerification: (authority: ProductTaskAuthority, workOrder?: WorkOrder) => Promise<TestRun>;
   conductReview: (context: ManagerContextPackage) => Promise<ManagerReview>;
   managerContext?: Omit<BuildManagerContextParams, 'workOrder' | 'currentHead'>;
+  evidenceCollector?: Pick<EvidenceCollector, 'collect'>;
 }
 
 export interface ExecuteProductTaskResult {
@@ -97,6 +100,8 @@ export interface ExecuteProductTaskResult {
   review?: ManagerReview;
   staleReview?: boolean;
   error?: string;
+  observedHeadSha?: string;
+  observedSnapshotSha?: string;
 }
 
 function fail(code: string, error: string): AuthorityValidationResult {
@@ -116,6 +121,7 @@ export class ProductTaskAutonomyAdapter {
   private readonly leaseService: WorkerSlotLeaseService;
   private readonly taskService: TaskService;
   public readonly maxWorkers: number;
+  public readonly evidenceCollector?: Pick<EvidenceCollector, 'collect'>;
 
   constructor(private readonly options: ProductTaskAutonomyAdapterOptions) {
     this.leaseService = options.leaseService ?? new WorkerSlotLeaseService(options.repo);
@@ -124,6 +130,7 @@ export class ProductTaskAutonomyAdapter {
     if (this.maxWorkers !== MAX_AGY_WORKERS) {
       throw new Error('PRODUCT_TASK_CONSOLIDATION_REQUIRES_MAX_AGY_WORKERS_1');
     }
+    this.evidenceCollector = options.evidenceCollector;
   }
 
   private get repo(): Repository {
@@ -366,9 +373,17 @@ export class ProductTaskAutonomyAdapter {
     };
   }
 
-  public validateReviewFreshness(review: ManagerReview, currentHeadSha: string): { fresh: boolean; error?: string } {
-    if (review.reviewed_head_sha !== currentHeadSha) {
+  public validateReviewFreshness(
+    review: ManagerReview,
+    currentHeadSha: string,
+    evidenceSnapshotSha?: string,
+    currentSnapshotSha?: string,
+  ): { fresh: boolean; error?: string } {
+    if (review.reviewed_head_sha.toLowerCase() !== currentHeadSha.toLowerCase()) {
       return { fresh: false, error: `EXACT_HEAD_FENCING_VIOLATION: reviewed ${review.reviewed_head_sha}, observed ${currentHeadSha}.` };
+    }
+    if (evidenceSnapshotSha !== undefined && currentSnapshotSha !== undefined && evidenceSnapshotSha !== currentSnapshotSha) {
+      return { fresh: false, error: `WORKING_TREE_SNAPSHOT_FENCING_VIOLATION: reviewed snapshot ${evidenceSnapshotSha}, observed ${currentSnapshotSha}.` };
     }
     return { fresh: true };
   }
@@ -417,6 +432,8 @@ export class ProductTaskAutonomyAdapter {
       return { success: false, finalTaskState: validated.authority.task.state, leaseAcquired: false, leaseReleased: false, workOrder, error: acquired.error };
     }
 
+    const evidenceCollector = input.evidenceCollector ?? this.evidenceCollector ?? new EvidenceCollector();
+
     let result: ExecuteProductTaskResult;
     try {
       let task = this.repo.getTask(validated.authority.task.id)!;
@@ -426,32 +443,155 @@ export class ProductTaskAutonomyAdapter {
 
       const coder = await input.runCoder(workOrder);
       if (!coder.success) throw new Error(coder.error ?? 'CODER_EXECUTION_FAILED');
-      this.repo.updateTaskShas(task.id, undefined, coder.currentHeadSha);
+
+      // Independently observe Git HEAD and working-tree snapshot before review, never trusting only runCoder claims
+      const preReviewEvidence = await evidenceCollector.collect(workOrder, []);
+      if (coder.currentHeadSha && coder.currentHeadSha.toLowerCase() !== preReviewEvidence.headSha.toLowerCase()) {
+        throw new Error(`CODER_HEAD_MISMATCH: coder claimed ${coder.currentHeadSha}, observed ${preReviewEvidence.headSha}`);
+      }
+      this.repo.updateTaskShas(task.id, undefined, preReviewEvidence.headSha);
       task = this.transitionTask(task.id, 'SUBMIT_REPORT');
 
-      await input.runVerification(validated.authority);
+      // Verification acceptance strictly requires a newly persisted TestRun
+      // and its process/evidence lineage from this authorization attempt.
+      const priorTestRunIds = new Set(this.repo.getTestRunsByTaskId(task.id).map((run) => run.id));
+      const currentTestRun = await input.runVerification(validated.authority, workOrder);
       const verificationReport = this.getTruthfulVerificationReport(task.id);
-      if (!verificationReport.latestAttemptPassed) {
+      const persistedCurrentRun = currentTestRun ? this.repo.getTestRun(currentTestRun.id) : null;
+      const currentEvidence = persistedCurrentRun?.evidence_id
+        ? this.repo.getEvidence(persistedCurrentRun.evidence_id)
+        : null;
+      const currentProcess = persistedCurrentRun?.evidence_id
+        ? this.repo.getProcessRunsByTask(task.id).find((run) =>
+          run.stdout_evidence_id === persistedCurrentRun.evidence_id ||
+          run.stderr_evidence_id === persistedCurrentRun.evidence_id)
+        : null;
+      const currentRunBound = Boolean(
+        currentTestRun &&
+        persistedCurrentRun &&
+        !priorTestRunIds.has(currentTestRun.id) &&
+        persistedCurrentRun.task_id === validated.authority.task.id &&
+        persistedCurrentRun.evidence_id === currentTestRun.evidence_id &&
+        currentEvidence?.project_id === validated.authority.task.project_id &&
+        currentEvidence?.task_id === validated.authority.task.id &&
+        currentEvidence?.attempt_id === validated.authority.authorization.attempt_id &&
+        currentProcess?.project_id === validated.authority.task.project_id &&
+        currentProcess?.task_id === validated.authority.task.id &&
+        currentProcess?.attempt_id === validated.authority.authorization.attempt_id &&
+        currentProcess?.working_directory === workOrder.worktree
+      );
+      const currentTestRunPassed = Boolean(
+        currentRunBound &&
+        persistedCurrentRun!.exit_code === 0 &&
+        persistedCurrentRun!.failed_count === 0 &&
+        currentProcess?.status === 'COMPLETED' &&
+        currentProcess.exit_code === 0
+      );
+
+      if (!currentTestRunPassed) {
         task = this.transitionTask(task.id, 'TESTS_FAILED');
-        result = { success: false, finalTaskState: task.state, leaseAcquired: true, leaseReleased: false, workOrder, verificationReport, error: 'VERIFICATION_FAILED' };
+        const verificationError = !currentTestRun
+          ? 'CURRENT_VERIFICATION_TEST_RUN_MISSING'
+          : !currentRunBound
+            ? 'CURRENT_VERIFICATION_AUTHORITY_BINDING_INVALID'
+            : 'VERIFICATION_FAILED';
+        result = {
+          success: false,
+          finalTaskState: task.state,
+          leaseAcquired: true,
+          leaseReleased: false,
+          workOrder,
+          verificationReport,
+          error: verificationError,
+        };
       } else {
         task = this.transitionTask(task.id, 'EVIDENCE_GATHERED');
         task = this.transitionTask(task.id, 'START_REVIEW');
-        const context = this.buildManagerContext(workOrder, coder.currentHeadSha, input.managerContext);
+        const context = this.buildManagerContext(workOrder, preReviewEvidence.headSha, {
+          ...input.managerContext,
+          actualDiff: input.managerContext?.actualDiff ?? preReviewEvidence.diff,
+          changedFiles: input.managerContext?.changedFiles ?? preReviewEvidence.changedFiles,
+        });
         const review = await input.conductReview(context);
-        const freshness = this.validateReviewFreshness(review, coder.currentHeadSha);
+
+        // Independently observe a fresh Git HEAD and working-tree snapshot after manager review
+        const postReviewEvidence = await evidenceCollector.collect(workOrder, []);
+        const freshness = this.validateReviewFreshness(
+          review,
+          postReviewEvidence.headSha,
+          preReviewEvidence.snapshotSha,
+          postReviewEvidence.snapshotSha,
+        );
+        const refreshedAuthority = this.validateAuthority({
+          authorizationId: input.authorizationId,
+          currentHeadSha: postReviewEvidence.headSha,
+        });
         if (!freshness.fresh) {
-          result = { success: false, finalTaskState: task.state, leaseAcquired: true, leaseReleased: false, workOrder, verificationReport, review, staleReview: true, error: freshness.error };
+          result = {
+            success: false,
+            finalTaskState: task.state,
+            leaseAcquired: true,
+            leaseReleased: false,
+            workOrder,
+            verificationReport,
+            review,
+            staleReview: true,
+            observedHeadSha: postReviewEvidence.headSha,
+            observedSnapshotSha: postReviewEvidence.snapshotSha,
+            error: freshness.error,
+          };
+        } else if (!refreshedAuthority.valid) {
+          result = {
+            success: false,
+            finalTaskState: task.state,
+            leaseAcquired: true,
+            leaseReleased: false,
+            workOrder,
+            verificationReport,
+            review,
+            staleReview: true,
+            observedHeadSha: postReviewEvidence.headSha,
+            observedSnapshotSha: postReviewEvidence.snapshotSha,
+            error: `AUTHORITY_FENCED_DURING_EXECUTION: ${refreshedAuthority.code}: ${refreshedAuthority.error}`,
+          };
         } else if (review.verdict !== 'PASS') {
           task = this.transitionTask(task.id, review.verdict === 'REPAIR' ? 'FIX_VERDICT' : 'MAX_REVISIONS_EXCEEDED');
-          result = { success: false, finalTaskState: task.state, leaseAcquired: true, leaseReleased: false, workOrder, verificationReport, review, error: `MANAGER_${review.verdict}` };
+          result = {
+            success: false,
+            finalTaskState: task.state,
+            leaseAcquired: true,
+            leaseReleased: false,
+            workOrder,
+            verificationReport,
+            review,
+            observedHeadSha: postReviewEvidence.headSha,
+            observedSnapshotSha: postReviewEvidence.snapshotSha,
+            error: `MANAGER_${review.verdict}`,
+          };
         } else {
           task = this.transitionTask(task.id, 'PASS_VERDICT');
-          result = { success: true, finalTaskState: task.state, leaseAcquired: true, leaseReleased: false, workOrder, verificationReport, review };
+          result = {
+            success: true,
+            finalTaskState: task.state,
+            leaseAcquired: true,
+            leaseReleased: false,
+            workOrder,
+            verificationReport,
+            review,
+            observedHeadSha: postReviewEvidence.headSha,
+            observedSnapshotSha: postReviewEvidence.snapshotSha,
+          };
         }
       }
     } catch (error) {
-      result = { success: false, finalTaskState: this.repo.getTask(validated.authority.task.id)?.state ?? 'UNKNOWN', leaseAcquired: true, leaseReleased: false, workOrder, error: error instanceof Error ? error.message : String(error) };
+      result = {
+        success: false,
+        finalTaskState: this.repo.getTask(validated.authority.task.id)?.state ?? 'UNKNOWN',
+        leaseAcquired: true,
+        leaseReleased: false,
+        workOrder,
+        error: error instanceof Error ? error.message : String(error),
+      };
     }
 
     const released = this.releaseWorkerSlotLease(acquired.lease.id, acquired.lease.lease_token);

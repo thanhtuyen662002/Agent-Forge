@@ -470,4 +470,63 @@ describe('manager provider pool', () => {
     expect(store.getManagerResourceHealth('empty')?.state).toBe('CONTRACT_INVALID');
     db.close();
   });
+
+  it('persists planning context and resumes via planStored across provider switch', async () => {
+    const { db, store } = setup();
+    const seed = makeOrder();
+    const first = new ManagerProviderPool(store, [{
+      id: 'codex-chatgpt-primary',
+      priority: 100,
+      enabled: true,
+      review: async () => ({ run: run('', 0) }),
+      plan: async () => ({ run: run('workspace credits exhausted') }),
+    }]);
+
+    const unavailable = await first.plan(seed);
+    expect(unavailable.run.stderr).toBe('ALL_MANAGER_RESOURCES_UNAVAILABLE');
+    expect(unavailable.context_sha).toBeDefined();
+
+    // Verify context was persisted in store
+    const storedContext = store.getManagerContext(unavailable.context_sha);
+    expect(storedContext).toBeDefined();
+    const parsed = JSON.parse(storedContext!);
+    expect(parsed.task_id).toBe(seed.task_id);
+    expect(parsed.base_sha).toBe(seed.base_sha);
+
+    // Resumed pool with fallback provider
+    let fallbackSeedReceived: any = null;
+    const resumed = new ManagerProviderPool(store, [{
+      id: 'codex-api-fallback',
+      priority: 50,
+      enabled: true,
+      review: async () => ({ run: run('', 0) }),
+      plan: async (s) => {
+        fallbackSeedReceived = s;
+        return {
+          run: run('', 0),
+          workOrder: createWorkOrder({
+            taskId: s.task_id,
+            workerId: s.worker_id,
+            objective: s.objective,
+            baseSha: s.base_sha,
+            branch: s.branch,
+            worktree: s.worktree,
+            acceptanceCriteria: s.acceptance_criteria,
+            allowedPaths: s.allowed_paths,
+            requiredTests: s.required_tests,
+            constraints: s.constraints,
+          }),
+        };
+      },
+    }]);
+
+    const result = await resumed.planStored(unavailable.context_sha, seed.base_sha);
+    expect(result.resource_id).toBe('codex-api-fallback');
+    expect(result.workOrder?.task_id).toBe(seed.task_id);
+    expect(fallbackSeedReceived?.task_id).toBe(seed.task_id);
+
+    // Mismatched expectedBaseSha should reject
+    await expect(resumed.planStored(unavailable.context_sha, 'b'.repeat(40))).rejects.toThrow('STALE_MANAGER_PLAN_BASE_SHA');
+    db.close();
+  });
 });

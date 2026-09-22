@@ -97,6 +97,11 @@ async function doctorOmniRoute(): Promise<number> {
 }
 
 async function main(): Promise<number> {
+  const rawMaxWorkers = process.env.MAX_AGY_WORKERS !== undefined ? Number(process.env.MAX_AGY_WORKERS) : 1;
+  if (rawMaxWorkers > 1 || rawMaxWorkers < 1 || Number.isNaN(rawMaxWorkers)) {
+    process.stderr.write('CONSOLIDATION_REQUIRES_MAX_AGY_WORKERS_1: Autonomy CLI rejects MAX_AGY_WORKERS > 1 while consolidation is active\n');
+    return 1;
+  }
   const command = process.argv[2] ?? 'status';
   if (command === 'doctor') return doctor();
   if (command === 'doctor-omniroute') return doctorOmniRoute();

@@ -17,8 +17,13 @@ It does not merge, replace the running supervisor, or automatically resume R5L1.
 6. Capture status, tracked diff, untracked content, SHA-256 snapshot, HEAD,
    test exit codes, timing, and sanitized logs.
 7. Ask the selected Reviewer resource for managerreview.v1.
-8. Accept PASS only when every test passed and both HEAD and the working-file
-   snapshot are unchanged. Record LOCAL_ACCEPTED; this is not a PR or merge.
+8. Accept PASS only when every test passed in the current TestRun returned by
+   runVerification, bound to the active task and attempt. Historical passing runs
+   cannot satisfy or mask missing or failing runs; truthful rerun history is
+   preserved. ProductTaskAutonomyAdapter independently observes a fresh Git HEAD
+   and working-tree snapshot after manager review and fences PASS against the
+   exact evidence package (WORKING_TREE_SNAPSHOT_FENCING_VIOLATION,
+   CODER_HEAD_MISMATCH). Record LOCAL_ACCEPTED; this is not a PR or merge.
 9. REPAIR persists findings in a new attempt/epoch in the same worktree.
    Stop after three repair loops. BLOCKED affects only that task.
 
@@ -32,10 +37,17 @@ thread ID. Reviews always receive fresh evidence.
 New product-task execution is adapted from the existing `tasks`, TaskService,
 ExecutionAuthorization, AgentAssignment, ProviderResource, ContextManifest,
 WorkerSlotLeaseService, process_runs, evidence, and test_runs authorities.
-The product task state machine remains the sole lifecycle authority. Legacy
-`autonomy_*` rows are inventoried and retained as compatibility/audit evidence;
-they are not silently discarded or authoritative for new product tasks. The
-consolidated path remains fenced to `MAX_AGY_WORKERS=1`.
+The product task state machine remains the sole lifecycle authority. The
+operational self-host dispatcher routes product tasks strictly through
+ProductTaskAutonomyAdapter with durable ExecutionAuthorization, failing closed
+(PRODUCT_TASK_REQUIRES_EXECUTION_AUTHORIZATION) if unauthenticated and rejecting
+any attempt to execute product tasks through legacy autonomy state
+(PRODUCT_TASK_CANNOT_USE_LEGACY_AUTONOMY_LIFECYCLE). Legacy `autonomy_*` rows
+are inventoried and retained as compatibility/audit evidence; they are not
+silently discarded or authoritative for new product tasks. The consolidated path
+strictly enforces a hard cap of `MAX_AGY_WORKERS=1` in both AutonomySupervisor
+and autonomyCli, throwing `CONSOLIDATION_REQUIRES_MAX_AGY_WORKERS_1` on any higher
+configured value.
 
 SQLite lives at RUNTIME_ROOT/state/agent-forge.sqlite. Provider logs, prompts,
 review/session events, and evidence live in that database. Operator files belong
@@ -128,8 +140,11 @@ Active cooldowns and known unavailable resources are skipped without invoking th
 Every review receives the durable `managercontext.v1` package, including task identity,
 immutable WorkOrder, acceptance criteria, exact base SHA, fresh current HEAD, actual diff/evidence,
 deterministic tests, previous manager decisions, repair history, PR state, CI state, and policy context.
-The package is stored by content hash and can be resumed by a newly configured provider only while
+The package is stored by content hash and can be resumed via `reviewStored` by a newly configured provider only while
 its recorded current HEAD still matches a fresh Supervisor observation.
+Similarly, manager planning requests persist an immutable planning context by content hash and can be
+resumed via `planStored(planSha, expectedBaseSha)` across provider restarts or failovers, rejecting stale
+base SHAs.
 Planning and review fail over across eligible providers upon capacity, rate limits, or contract failures.
 Provider switching strictly preserves exact-head review fencing, leases, authorization, deterministic
 test gates, and audit trails. ChatGPT workspace capacity and OpenAI API quota/billing state

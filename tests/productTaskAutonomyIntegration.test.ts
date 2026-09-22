@@ -23,6 +23,7 @@ import {
 } from '../src/core/autonomy/managerPool';
 import { ExecutionAuthorization, Task } from '../src/core/types/domain';
 import { ManagerReview, createWorkOrder } from '../src/core/autonomy/contracts';
+import { AutonomySupervisor } from '../src/core/autonomy/supervisor';
 
 const BASE_SHA = '0123456789abcdef0123456789abcdef01234567';
 const OTHER_SHA = 'abcdef0123456789abcdef0123456789abcdef01';
@@ -415,7 +416,17 @@ describe('product-task autonomy consolidation', () => {
     const result = await adapter.executeProductTask({
       ...input,
       runCoder: async () => ({ success: true, currentHeadSha: BASE_SHA }),
-      runVerification: async (authority) => adapter.recordVerificationObservation({
+      evidenceCollector: {
+        collect: async () => ({
+          headSha: BASE_SHA,
+          snapshotSha: 'snapshot-initial',
+          status: '',
+          changedFiles: ['src'],
+          diff: 'diff-initial',
+          tests: [],
+        }),
+      },
+      runVerification: async (authority, workOrder) => adapter.recordVerificationObservation({
         projectId: authority.task.project_id,
         taskId: authority.task.id,
         attemptId: authority.authorization.attempt_id,
@@ -426,7 +437,7 @@ describe('product-task autonomy consolidation', () => {
         failedCount: 0,
         durationMs: 1,
         stdout: process.version,
-        workingDirectory: root,
+        workingDirectory: workOrder!.worktree,
       }),
       conductReview: async (context) => ({
         protocol_version: 'managerreview.v1',
@@ -441,6 +452,336 @@ describe('product-task autonomy consolidation', () => {
     expect(result).toMatchObject({ success: true, finalTaskState: 'DONE', leaseAcquired: true, leaseReleased: true });
     expect(repo.getTask(fixture.task.id)?.state).toBe('DONE');
     expect(repo.getWorkerSlot(fixture.slotId)?.status).toBe('IDLE');
+    expect(store.listAll()).toHaveLength(0);
+  });
+
+  it('fences PASS if post-review working-tree snapshot changes after manager review', async () => {
+    const fixture = seed('task-snapshot-fencing');
+    const input = workOrderInput(fixture);
+    let collectCount = 0;
+    const result = await adapter.executeProductTask({
+      ...input,
+      runCoder: async () => ({ success: true, currentHeadSha: BASE_SHA }),
+      evidenceCollector: {
+        collect: async () => {
+          collectCount++;
+          return {
+            headSha: BASE_SHA,
+            snapshotSha: collectCount === 1 ? 'snapshot-pre-review' : 'snapshot-post-review-MODIFIED',
+            status: '',
+            changedFiles: ['src'],
+            diff: 'diff',
+            tests: [],
+          };
+        },
+      },
+      runVerification: async (authority, workOrder) => adapter.recordVerificationObservation({
+        projectId: authority.task.project_id,
+        taskId: authority.task.id,
+        attemptId: authority.authorization.attempt_id,
+        command: 'node --version',
+        status: 'COMPLETED',
+        exitCode: 0,
+        passedCount: 1,
+        failedCount: 0,
+        durationMs: 1,
+        stdout: process.version,
+        workingDirectory: workOrder!.worktree,
+      }),
+      conductReview: async (context) => ({
+        protocol_version: 'managerreview.v1',
+        verdict: 'PASS',
+        reviewed_head_sha: context.current_head,
+        findings: [],
+        required_actions: [],
+        risk: 'LOW',
+        notes: 'review ok',
+      }),
+    });
+    expect(result.success).toBe(false);
+    expect(result.staleReview).toBe(true);
+    expect(result.error).toContain('WORKING_TREE_SNAPSHOT_FENCING_VIOLATION');
+    expect(repo.getTask(fixture.task.id)?.state).not.toBe('DONE');
+  });
+
+  it('fences PASS if post-review HEAD changes after manager review', async () => {
+    const fixture = seed('task-head-fencing');
+    const input = workOrderInput(fixture);
+    let collectCount = 0;
+    const result = await adapter.executeProductTask({
+      ...input,
+      runCoder: async () => ({ success: true, currentHeadSha: BASE_SHA }),
+      evidenceCollector: {
+        collect: async () => {
+          collectCount++;
+          return {
+            headSha: collectCount === 1 ? BASE_SHA : OTHER_SHA,
+            snapshotSha: 'snapshot-fixed',
+            status: '',
+            changedFiles: ['src'],
+            diff: 'diff',
+            tests: [],
+          };
+        },
+      },
+      runVerification: async (authority, workOrder) => adapter.recordVerificationObservation({
+        projectId: authority.task.project_id,
+        taskId: authority.task.id,
+        attemptId: authority.authorization.attempt_id,
+        command: 'node --version',
+        status: 'COMPLETED',
+        exitCode: 0,
+        passedCount: 1,
+        failedCount: 0,
+        durationMs: 1,
+        stdout: process.version,
+        workingDirectory: workOrder!.worktree,
+      }),
+      conductReview: async (context) => ({
+        protocol_version: 'managerreview.v1',
+        verdict: 'PASS',
+        reviewed_head_sha: context.current_head,
+        findings: [],
+        required_actions: [],
+        risk: 'LOW',
+        notes: 'review ok',
+      }),
+    });
+    expect(result.success).toBe(false);
+    expect(result.staleReview).toBe(true);
+    expect(result.error).toContain('EXACT_HEAD_FENCING_VIOLATION');
+    expect(repo.getTask(fixture.task.id)?.state).not.toBe('DONE');
+  });
+
+  it('rejects execution if runCoder claims a HEAD that mismatches independently observed HEAD', async () => {
+    const fixture = seed('task-coder-mismatch');
+    const input = workOrderInput(fixture);
+    const result = await adapter.executeProductTask({
+      ...input,
+      runCoder: async () => ({ success: true, currentHeadSha: OTHER_SHA }),
+      evidenceCollector: {
+        collect: async () => ({
+          headSha: BASE_SHA,
+          snapshotSha: 'snapshot-fixed',
+          status: '',
+          changedFiles: ['src'],
+          diff: 'diff',
+          tests: [],
+        }),
+      },
+      runVerification: async () => { throw new Error('should not reach verification'); },
+      conductReview: async () => { throw new Error('should not reach review'); },
+    });
+    expect(result.success).toBe(false);
+    expect(result.error).toContain('CODER_HEAD_MISMATCH');
+  });
+
+  it('historical passing TestRun cannot satisfy when the current runVerification returns a failing TestRun', async () => {
+    const fixture = seed('task-verif-fail');
+    const input = workOrderInput(fixture);
+    // Record an earlier historical passing test run
+    adapter.recordVerificationObservation({
+      projectId: fixture.task.project_id,
+      taskId: fixture.task.id,
+      attemptId: null,
+      command: 'historical-pass',
+      status: 'COMPLETED',
+      exitCode: 0,
+      passedCount: 42,
+      failedCount: 0,
+      durationMs: 100,
+      stdout: 'all passed',
+      workingDirectory: root,
+    });
+    expect(adapter.getTruthfulVerificationReport(fixture.task.id).latestAttemptPassed).toBe(true);
+
+    // Current execution verification returns a failing run
+    const result = await adapter.executeProductTask({
+      ...input,
+      runCoder: async () => ({ success: true, currentHeadSha: BASE_SHA }),
+      evidenceCollector: {
+        collect: async () => ({
+          headSha: BASE_SHA,
+          snapshotSha: 'snapshot-fixed',
+          status: '',
+          changedFiles: ['src'],
+          diff: 'diff',
+          tests: [],
+        }),
+      },
+      runVerification: async (authority, workOrder) => adapter.recordVerificationObservation({
+        projectId: authority.task.project_id,
+        taskId: authority.task.id,
+        attemptId: authority.authorization.attempt_id,
+        command: 'current-fail',
+        status: 'FAILED',
+        exitCode: 1,
+        passedCount: 0,
+        failedCount: 1,
+        durationMs: 50,
+        stdout: '',
+        stderr: 'assertion failed',
+        workingDirectory: workOrder!.worktree,
+      }),
+      conductReview: async () => { throw new Error('should not reach review'); },
+    });
+
+    expect(result.success).toBe(false);
+    expect(result.error).toBe('VERIFICATION_FAILED');
+    expect(result.finalTaskState).toBe('CODING');
+    expect(repo.getTask(fixture.task.id)?.state).toBe('CODING');
+  });
+
+  it('historical passing TestRun cannot satisfy when the current runVerification returns null', async () => {
+    const fixture = seed('task-verif-null');
+    const input = workOrderInput(fixture);
+    // Record historical pass
+    adapter.recordVerificationObservation({
+      projectId: fixture.task.project_id,
+      taskId: fixture.task.id,
+      attemptId: null,
+      command: 'historical-pass',
+      status: 'COMPLETED',
+      exitCode: 0,
+      passedCount: 10,
+      failedCount: 0,
+      durationMs: 10,
+      stdout: 'pass',
+      workingDirectory: root,
+    });
+
+    const result = await adapter.executeProductTask({
+      ...input,
+      runCoder: async () => ({ success: true, currentHeadSha: BASE_SHA }),
+      evidenceCollector: {
+        collect: async () => ({
+          headSha: BASE_SHA,
+          snapshotSha: 'snapshot-fixed',
+          status: '',
+          changedFiles: ['src'],
+          diff: 'diff',
+          tests: [],
+        }),
+      },
+      runVerification: async () => null as any,
+      conductReview: async () => { throw new Error('should not reach review'); },
+    });
+
+    expect(result.success).toBe(false);
+    expect(result.error).toBe('CURRENT_VERIFICATION_TEST_RUN_MISSING');
+    expect(result.finalTaskState).toBe('CODING');
+  });
+
+  it('fails closed if attempting to execute a product task via legacy autonomy state', () => {
+    const fixture = seed('task-legacy-fence');
+    const order = createWorkOrder({
+      taskId: fixture.task.id,
+      workerId: 'agy-01',
+      objective: 'legacy attempt on product task',
+      baseSha: BASE_SHA,
+      branch: 'agent/agy-01/test',
+      worktree: path.join(root, 'worktrees', 'legacy'),
+      allowedPaths: ['src'],
+      acceptanceCriteria: ['legacy product task execution is rejected'],
+      requiredTests: ['npm test'],
+    });
+    expect(() => store.createWorkOrder(order)).toThrow('PRODUCT_TASK_CANNOT_USE_LEGACY_AUTONOMY_LIFECYCLE');
+  });
+
+  it('operational supervisor dispatches product task via ProductTaskAutonomyAdapter when ExecutionAuthorization exists', async () => {
+    const fixture = seed('task-op-dispatch');
+    const supervisor = new AutonomySupervisor({
+      store,
+      productAdapter: adapter,
+      worktreeRoot: path.join(root, 'worktrees'),
+      evidence: {
+        collect: async () => ({
+          headSha: BASE_SHA,
+          snapshotSha: 'snapshot-ok',
+          status: '',
+          changedFiles: ['src'],
+          diff: 'diff-ok',
+          tests: [{ command: 'node --version', exitCode: 0, stdout: 'v22.0.0', stderr: '', durationMs: 1 }],
+        }),
+      },
+      agy: {
+        execute: async () => ({
+          status: 'SUCCESSFUL_PROCESS_EXIT' as const,
+          exitCode: 0,
+          executionId: 'exec-1',
+          stdout: '',
+          stderr: '',
+          durationMs: 1,
+        }),
+      } as any,
+      managerPool: {
+        review: async () => ({
+          run: { status: 'SUCCESSFUL_PROCESS_EXIT' as const, exitCode: 0, executionId: '', stdout: '', stderr: '', durationMs: 1 },
+          review: {
+            protocol_version: 'managerreview.v1' as const,
+            verdict: 'PASS' as const,
+            reviewed_head_sha: BASE_SHA,
+            findings: [],
+            required_actions: [],
+            risk: 'LOW' as const,
+            notes: 'product task passed review',
+          },
+          resource_id: 'manager-test',
+          context_sha: 'sha-test',
+          attempts: ['manager-test'],
+        }),
+      } as any,
+    });
+
+    const spec = {
+      taskId: fixture.task.id,
+      workerId: 'agy-01',
+      objective: fixture.task.description ?? fixture.task.title,
+      baseSha: BASE_SHA,
+      branch: `agent/agy-01/${fixture.task.id}`,
+      worktree: path.join(root, 'worktrees', fixture.task.id),
+      allowedPaths: ['src'],
+      acceptanceCriteria: ['product task completes through product authority'],
+      requiredTests: ['node --version'],
+    };
+    fs.mkdirSync(spec.worktree, { recursive: true });
+
+    const result = await supervisor.run(spec);
+    expect(result.accepted).toBe(true);
+    expect(result.state).toBe('DONE');
+    expect(repo.getTask(fixture.task.id)?.state).toBe('DONE');
+    // Critical: zero legacy autonomy work order rows were created
+    expect(store.listAll()).toHaveLength(0);
+  });
+
+  it('operational supervisor fails closed when product task has no ExecutionAuthorization', async () => {
+    const fixture = seed('task-no-auth');
+    // Delete execution authorization to simulate an unauthorized product task
+    store.getDatabase().prepare('DELETE FROM execution_authorizations WHERE task_id=?').run(fixture.task.id);
+
+    const supervisor = new AutonomySupervisor({
+      store,
+      productAdapter: adapter,
+      worktreeRoot: path.join(root, 'worktrees'),
+    });
+
+    const spec = {
+      taskId: fixture.task.id,
+      workerId: 'agy-01',
+      objective: 'unauthorized product task',
+      baseSha: BASE_SHA,
+      branch: `agent/agy-01/${fixture.task.id}`,
+      worktree: path.join(root, 'worktrees', fixture.task.id),
+      allowedPaths: ['src'],
+      acceptanceCriteria: ['unauthorized product task fails closed'],
+      requiredTests: ['node --version'],
+    };
+    fs.mkdirSync(spec.worktree, { recursive: true });
+
+    const result = await supervisor.run(spec);
+    expect(result.accepted).toBeFalsy();
+    expect(result.state).toBe('BLOCKED');
+    expect(result.error).toContain('PRODUCT_TASK_REQUIRES_EXECUTION_AUTHORIZATION');
     expect(store.listAll()).toHaveLength(0);
   });
 

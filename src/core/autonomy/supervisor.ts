@@ -6,8 +6,9 @@ import { AutonomyState, AutonomousTaskSpec, ManagerReview, WorkOrder, createWork
 import { AutonomyStore } from './store';
 import { Repository } from '../database/repositories';
 import { ProcessRunner } from '../services/ProcessRunner';
-import { assertPathContained } from '../services/ArtifactStore';
+import { assertPathContained, ArtifactStore } from '../services/ArtifactStore';
 import { ManagerProviderPool, buildManagerContextPackage } from './managerPool';
+import { ProductTaskAutonomyAdapter } from './productTaskAdapter';
 
 export type AutonomyMode = 'SHADOW' | 'PILOT' | 'AUTONOMOUS';
 
@@ -23,6 +24,7 @@ export interface SupervisorConfig {
   store?: AutonomyStore;
   controlRepo?: string;
   worktreeRoot?: string;
+  productAdapter?: ProductTaskAutonomyAdapter;
 }
 
 export interface SupervisorRunResult {
@@ -47,20 +49,33 @@ export class AutonomySupervisor {
   readonly evidence: Pick<EvidenceCollector, 'collect'>;
   readonly controlRepo: string;
   readonly worktreeRoot: string;
+  readonly productAdapter: ProductTaskAutonomyAdapter;
 
   constructor(config: SupervisorConfig = {}) {
     this.mode = config.mode ?? ((process.env.AGENT_FORGE_MODE as AutonomyMode | undefined) ?? 'PILOT');
-    this.maxWorkers = config.maxWorkers ?? Number(process.env.MAX_AGY_WORKERS ?? 1);
+    const rawWorkers = config.maxWorkers ?? (process.env.MAX_AGY_WORKERS !== undefined ? Number(process.env.MAX_AGY_WORKERS) : 1);
+    if (rawWorkers > 1 || rawWorkers < 1 || Number.isNaN(rawWorkers)) {
+      throw new Error('CONSOLIDATION_REQUIRES_MAX_AGY_WORKERS_1: AutonomySupervisor rejects MAX_AGY_WORKERS > 1 while consolidation is active');
+    }
+    this.maxWorkers = 1;
     this.maxRepairLoops = config.maxRepairLoops ?? Number(process.env.MAX_REPAIR_LOOPS ?? 3);
     this.controlRepo = path.resolve(config.controlRepo ?? process.env.AGENT_FORGE_CONTROL_REPO ?? process.cwd());
     this.worktreeRoot = path.resolve(config.worktreeRoot ?? process.env.AGENT_FORGE_WORKTREE_ROOT ?? path.join(this.controlRepo, '..', 'AI', 'Agent-Forge-Worktrees'));
-    this.store = config.store ?? AutonomyStore.open(config.runtimeRoot ?? (process.env.AGENT_FORGE_RUNTIME_ROOT ?? path.join(this.controlRepo, '..', 'AI', 'Agent-Forge-Runtime'))).store;
+    const runtimeRoot = config.runtimeRoot ?? (process.env.AGENT_FORGE_RUNTIME_ROOT ?? path.join(this.controlRepo, '..', 'AI', 'Agent-Forge-Runtime'));
+    this.store = config.store ?? AutonomyStore.open(runtimeRoot).store;
     const repo = new Repository(this.store.getDatabase());
     const runner: typeof ProcessRunner.execute = (options) => ProcessRunner.execute({ ...options, repo });
     this.agy = config.agy ?? new AntigravityAdapter({ runner });
     this.manager = config.manager ?? new CodexManagerAdapter({ runner });
     this.managerPool = config.managerPool ?? ManagerProviderPool.fromEnvironment(this.store, this.manager);
     this.evidence = config.evidence ?? new EvidenceCollector({ execute: runner });
+    this.productAdapter = config.productAdapter ?? new ProductTaskAutonomyAdapter({
+      repo,
+      autonomyStore: this.store,
+      artifactStore: new ArtifactStore(path.join(runtimeRoot, 'artifacts')),
+      evidenceCollector: this.evidence,
+      maxWorkers: this.maxWorkers,
+    });
     this.store.ensureSlots(this.maxWorkers);
   }
 
@@ -78,6 +93,9 @@ export class AutonomySupervisor {
   }
 
   async run(spec: AutonomousTaskSpec): Promise<SupervisorRunResult> {
+    if (this.store.isProductTask(spec.taskId)) {
+      return this.runProductTask(spec);
+    }
     let order = this.createWorkOrder(spec);
     if (this.mode === 'SHADOW') return { workOrder: order, state: 'READY', repairLoops: 0 };
     let row;
@@ -199,6 +217,83 @@ export class AutonomySupervisor {
       try { this.store.releaseSlot(slot.slotId, slot.workOrderId, slot.leaseEpoch); releasedSlots += 1; } catch { fencedOrders += 1; }
     }
     return { releasedSlots, fencedOrders };
+  }
+
+  async runProductTask(spec: AutonomousTaskSpec): Promise<SupervisorRunResult> {
+    const order = this.createWorkOrder(spec);
+    if (this.mode === 'SHADOW') return { workOrder: order, state: 'READY', repairLoops: 0 };
+
+    const db = this.store.getDatabase();
+    const authRow = db.prepare(
+      "SELECT id FROM execution_authorizations WHERE task_id = ? AND status IN ('AUTHORIZED','DISPATCHED') ORDER BY created_at DESC LIMIT 1"
+    ).get(spec.taskId) as { id: string } | undefined;
+
+    if (!authRow) {
+      return {
+        workOrder: order,
+        state: 'BLOCKED',
+        repairLoops: 0,
+        error: 'PRODUCT_TASK_REQUIRES_EXECUTION_AUTHORIZATION: product tasks must have durable ExecutionAuthorization and cannot execute through legacy autonomy state',
+      };
+    }
+
+    const executionResult = await this.productAdapter.executeProductTask({
+      authorizationId: authRow.id,
+      currentHeadSha: (await this.evidence.collect(order, [])).headSha,
+      workerId: spec.workerId,
+      branch: spec.branch,
+      worktree: spec.worktree,
+      allowedPaths: spec.allowedPaths ?? [],
+      forbiddenPaths: spec.forbiddenPaths,
+      dependencies: spec.dependencies,
+      runCoder: async (wo) => {
+        const provider = await this.agy.execute(wo);
+        if (provider.status !== 'SUCCESSFUL_PROCESS_EXIT') {
+          return { success: false, currentHeadSha: spec.baseSha, error: provider.error ?? provider.stderr };
+        }
+        const ev = await this.evidence.collect(wo, []);
+        return { success: true, currentHeadSha: ev.headSha };
+      },
+      runVerification: async (authority, wo) => {
+        const targetOrder = wo ?? order;
+        const ev = await this.evidence.collect(targetOrder, targetOrder.required_tests);
+        const passed = ev.tests.length === targetOrder.required_tests.length && ev.tests.length > 0 && ev.tests.every((t) => t.exitCode === 0);
+        const firstTest = ev.tests[0];
+        return this.productAdapter.recordVerificationObservation({
+          projectId: authority.task.project_id,
+          taskId: authority.task.id,
+          attemptId: authority.authorization.attempt_id,
+          command: targetOrder.required_tests.join(' && '),
+          status: passed ? 'COMPLETED' : 'FAILED',
+          exitCode: passed ? 0 : (firstTest?.exitCode ?? 1),
+          passedCount: ev.tests.filter((t) => t.exitCode === 0).length,
+          failedCount: ev.tests.filter((t) => t.exitCode !== 0).length,
+          durationMs: ev.tests.reduce((acc, t) => acc + t.durationMs, 0),
+          stdout: ev.tests.map((t) => t.stdout).join('\n'),
+          stderr: ev.tests.map((t) => t.stderr).join('\n'),
+          workingDirectory: targetOrder.worktree,
+        });
+      },
+      conductReview: async (context) => {
+        const reviewResult = await this.managerPool.review(context);
+        if (!reviewResult.review) {
+          throw new Error(reviewResult.run.error ?? reviewResult.run.stderr ?? 'MANAGER_REVIEW_FAILED');
+        }
+        return reviewResult.review;
+      },
+      evidenceCollector: this.evidence,
+    });
+
+    const isAccepted = executionResult.success;
+    return {
+      workOrder: executionResult.workOrder ?? order,
+      state: (executionResult.finalTaskState as AutonomyState) || (isAccepted ? 'MANAGER_REVIEW' : 'FAILED'),
+      accepted: isAccepted,
+      review: executionResult.review,
+      headSha: executionResult.observedHeadSha,
+      repairLoops: 0,
+      error: executionResult.error,
+    };
   }
 
   static isSafeWorktree(controlRepo: string, worktree: string): boolean {

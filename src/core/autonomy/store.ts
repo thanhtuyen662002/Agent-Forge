@@ -162,6 +162,9 @@ export class AutonomyStore {
   }
 
   private insertWorkOrder(order: WorkOrder): AutonomyWorkOrderRow {
+    if (this.isProductTask(order.task_id)) {
+      throw new Error(`PRODUCT_TASK_CANNOT_USE_LEGACY_AUTONOMY_LIFECYCLE: task ${order.task_id} is a product task and must execute via ProductTaskAutonomyAdapter`);
+    }
     const now = new Date().toISOString();
     const row: AutonomyWorkOrderRow = {
       id: crypto.randomUUID(), task_id: order.task_id, attempt: order.attempt, lease_epoch: order.lease_epoch,

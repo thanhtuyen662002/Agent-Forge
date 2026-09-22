@@ -81,10 +81,33 @@ export function buildManagerContextPackage(params: BuildManagerContextParams): M
 export type ManagerPlanSeed = Pick<WorkOrder, 'task_id' | 'worker_id' | 'base_sha' | 'branch' | 'worktree' | 'objective' | 'acceptance_criteria'> &
   Partial<Pick<WorkOrder, 'required_tests' | 'constraints' | 'allowed_paths' | 'forbidden_paths'>>;
 
+export const ManagerPlanContextSchema = z.object({
+  protocol_version: z.literal('workorder.v1'),
+  task_id: z.string().min(1),
+  worker_id: z.string().min(1),
+  base_sha: z.string().regex(/^[0-9a-f]{40}$/i),
+  branch: z.string().min(1),
+  worktree: z.string().min(1),
+  objective: z.string().min(1),
+  acceptance_criteria: z.array(z.string()),
+  issue_number: z.number().nullable().optional(),
+  dependencies: z.array(z.string()).default([]),
+  allowed_paths: z.array(z.string()).default([]),
+  forbidden_paths: z.array(z.string()).default([]),
+  required_tests: z.array(z.string()).default([]),
+  context_files: z.array(z.string()).default([]),
+  constraints: z.array(z.string()).default([]),
+  attempt: z.number().int().positive().default(1),
+  lease_epoch: z.number().int().positive().default(1),
+});
+
+export type ManagerPlanContext = z.infer<typeof ManagerPlanContextSchema>;
+
 export interface ManagerPlanResult {
   run: ProviderRun;
   workOrder?: WorkOrder;
   resource_id: string;
+  context_sha: string;
   attempts: string[];
 }
 
@@ -491,8 +514,14 @@ export class ManagerProviderPool {
 
   async plan(seed: ManagerPlanSeed): Promise<ManagerPlanResult> {
     const planInput = {
-      protocol_version: 'workorder.v1',
-      ...seed,
+      protocol_version: 'workorder.v1' as const,
+      task_id: seed.task_id,
+      worker_id: seed.worker_id,
+      base_sha: seed.base_sha,
+      branch: seed.branch,
+      worktree: seed.worktree,
+      objective: seed.objective,
+      acceptance_criteria: seed.acceptance_criteria,
       issue_number: null,
       dependencies: [],
       allowed_paths: seed.allowed_paths ?? [],
@@ -503,8 +532,10 @@ export class ManagerProviderPool {
       attempt: 1,
       lease_epoch: 1,
     };
-    const planJson = JSON.stringify(planInput);
+    const validatedPlan = ManagerPlanContextSchema.parse(planInput);
+    const planJson = JSON.stringify(validatedPlan);
     const planSha = crypto.createHash('sha256').update(planJson).digest('hex');
+    this.store.recordManagerContext(planSha, planJson);
     const attempts: string[] = [];
     const candidates = [...this.resources].filter((r) => r.enabled).sort((a, b) => b.priority - a.priority);
 
@@ -555,13 +586,13 @@ export class ManagerProviderPool {
       if (result.workOrder) {
         try {
           const workOrder = WorkOrderSchema.parse(result.workOrder);
-          for (const [key, value] of Object.entries(seed)) {
+          for (const [key, value] of Object.entries(validatedPlan)) {
             if (JSON.stringify(workOrder[key as keyof WorkOrder]) !== JSON.stringify(value)) {
-              throw new Error(`CONTRACT_INVALID: manager changed authorized ${key}`);
+              throw new Error(`CONTRACT_INVALID: manager changed immutable planning field ${key}`);
             }
           }
           this.store.recordManagerAttempt(seed.task_id, resource.id, planSha, 'PLANNED');
-          return { ...result, workOrder, resource_id: resource.id, attempts };
+          return { ...result, workOrder, resource_id: resource.id, context_sha: planSha, attempts };
         } catch (err) {
           const errMsg = err instanceof Error ? err.message : String(err);
           this.recordResourceHealth(resource.id, 'CONTRACT_INVALID', sanitizeAutonomyText(errMsg), null);
@@ -575,6 +606,7 @@ export class ManagerProviderPool {
 
     return {
       resource_id: attempts.at(-1) ?? 'none',
+      context_sha: planSha,
       attempts,
       run: {
         status: 'QUOTA_OR_RATE_LIMIT',
@@ -585,6 +617,16 @@ export class ManagerProviderPool {
         durationMs: 0,
       },
     };
+  }
+
+  async planStored(planSha: string, expectedBaseSha?: string): Promise<ManagerPlanResult> {
+    const payload = this.store.getManagerContext(planSha);
+    if (!payload) throw new Error('MANAGER_PLAN_CONTEXT_NOT_FOUND');
+    const parsed = ManagerPlanContextSchema.parse(JSON.parse(payload));
+    if (expectedBaseSha && parsed.base_sha !== expectedBaseSha) {
+      throw new Error('STALE_MANAGER_PLAN_BASE_SHA');
+    }
+    return this.plan(parsed);
   }
 }
 
