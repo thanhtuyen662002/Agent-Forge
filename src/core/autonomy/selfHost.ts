@@ -71,7 +71,7 @@ export async function runDisposableSelfHostProof(options: SelfHostProofOptions):
   const authorized = supervisor.store.getDatabase().prepare("SELECT id FROM autonomy_events WHERE work_order_id=? AND event_type='TASK_MANAGER_AUTHORIZED'").get(taskId);
   const planned = authorized ? {
     workOrder: createWorkOrder(seed),
-    run: { status: 'SUCCESSFUL_PROCESS_EXIT' as const, exitCode: 0, executionId: '', stdout: '', stderr: '', durationMs: 0 },
+    run: { status: 'SUCCESSFUL_PROCESS_EXIT' as const, exitCode: 0, executionId: '', stdout: '', stderr: '', durationMs: 0, error: undefined },
     resource_id: 'authorized',
     attempts: [],
   } : await managerPool.plan({

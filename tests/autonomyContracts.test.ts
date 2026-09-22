@@ -62,6 +62,16 @@ describe('autonomy durable contracts', () => {
     expect((await timeout.execute(order(worktree()))).status).toBe('TIMEOUT');
     const missing = new AntigravityAdapter({ executable: 'fake', runner: async () => { throw new Error('spawn ENOENT'); } });
     expect((await missing.execute(order(worktree()))).status).toBe('PROCESS_NOT_FOUND');
+    const successfulAuthDiscussion = new AntigravityAdapter({
+      executable: 'fake',
+      runner: async () => processResult({ stdout: 'Completed the unauthorized-execution guard and authorization tests.' }) as any,
+    });
+    expect((await successfulAuthDiscussion.execute(order(worktree()))).status).toBe('SUCCESSFUL_PROCESS_EXIT');
+    const authFailure = new AntigravityAdapter({
+      executable: 'fake',
+      runner: async () => processResult({ exitCode: 1, stderr: 'Authentication required: invalid token' }) as any,
+    });
+    expect((await authFailure.execute(order(worktree()))).status).toBe('AUTH_ERROR');
   });
 
   it('fences leases, slots, duplicate dispatch, and releases CI_WAIT capacity', () => {

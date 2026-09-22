@@ -29,7 +29,9 @@ function classifyProcess(result: ProcessRunResult): ProviderFailure {
   if (result.errorCode === 'CANCELLED' || result.cancelled) return 'CANCELLED';
   if (/no output produced|headless mode cannot prompt|auto-denied/.test(output)) return 'CONTRACT_INVALID';
   if (result.errorCode === 'PROCESS_LAUNCH_FAILED' || result.processStart === 'NOT_STARTED_PROVEN') return 'PROCESS_NOT_FOUND';
-  if (/not authenticated|authentication required|not logged in|unauthorized|invalid token|login required/i.test(output)) return 'AUTH_ERROR';
+  // Successful structured output may legitimately discuss authentication or
+  // unauthorized behavior. Text heuristics classify only failed processes.
+  if (result.exitCode !== 0 && /not authenticated|authentication required|not logged in|unauthorized|invalid token|login required/i.test(output)) return 'AUTH_ERROR';
   if (result.exitCode !== 0 && /quota|rate limit|resource exhausted|usage limit|at capacity/i.test(output)) return 'QUOTA_OR_RATE_LIMIT';
   return result.exitCode === 0 ? 'SUCCESSFUL_PROCESS_EXIT' : 'FAILED_PROCESS_EXIT';
 }
