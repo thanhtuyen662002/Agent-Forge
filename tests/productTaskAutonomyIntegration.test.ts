@@ -267,6 +267,79 @@ describe('product-task autonomy consolidation', () => {
     };
   }
 
+  function createRetryAuthorization(fixture: Fixture, revision: number): string {
+    const now = new Date().toISOString();
+    const retryContext = new ContextBuilderService(repo).buildContextSnapshot({
+      projectId: fixture.task.project_id,
+      taskId: fixture.task.id,
+      assignmentId: fixture.assignmentId,
+      purpose: 'EXECUTION',
+      includeProjectMemory: false,
+      includeTaskMemory: false,
+      includeLatestCheckpoint: false,
+      includeLatestHandoff: false,
+    });
+    const retryPayload: CanonicalExecutionPayload = {
+      projectId: fixture.task.project_id,
+      taskId: fixture.task.id,
+      attemptId: null,
+      taskTitle: fixture.task.title,
+      taskDescription: fixture.task.description,
+      acceptanceCriteria: fixture.task.acceptance_criteria,
+      constraints: fixture.task.constraints,
+      instructions: [`Resumed execution revision ${revision}`],
+      contextFiles: [],
+      verificationCommands: {
+        TEST: { executable: process.execPath, args: ['--version'] },
+        LINT: null,
+        BUILD: null,
+      },
+      managerMessageId: `manager-retry-${fixture.task.id}-rev${revision}`,
+      managerPayloadHash: crypto.createHash('sha256').update(`retry-${fixture.task.id}-rev${revision}`).digest('hex'),
+    };
+    repo.recordProtocolMessage(
+      retryPayload.managerMessageId,
+      `external-${retryPayload.managerMessageId}`,
+      'manager.v1',
+      fixture.task.project_id,
+      fixture.task.id,
+      'CODING',
+      revision,
+      retryPayload.managerPayloadHash,
+      JSON.stringify({ decision: 'EXECUTE', taskId: fixture.task.id }),
+      'APPLIED',
+    );
+    const retryAuthId = `authorization-${fixture.task.id}-rev${revision}`;
+    repo.createExecutionAuthorization({
+      id: retryAuthId,
+      project_id: fixture.task.project_id,
+      task_id: fixture.task.id,
+      attempt_id: null,
+      task_revision: revision,
+      base_sha: BASE_SHA,
+      repository_head_sha: BASE_SHA,
+      manager_message_id: retryPayload.managerMessageId,
+      manager_payload_hash: retryPayload.managerPayloadHash,
+      routing_decision_id: `route-retry-${fixture.task.id}-rev${revision}`,
+      selected_account_id: 'account-agy',
+      selected_resource_id: 'resource-agy',
+      selected_provider_id: 'provider-agy',
+      instruction_payload_hash: computePayloadHash(retryPayload),
+      context_manifest_hash: retryContext.manifest.manifest_hash,
+      canonical_instructions_json: JSON.stringify(retryPayload.instructions),
+      context_files_json: '[]',
+      canonical_payload_json: JSON.stringify(retryPayload),
+      expected_task_revision: revision,
+      status: 'AUTHORIZED',
+      created_at: now,
+      dispatched_at: null,
+      task_ownership_epoch: 1,
+      assignment_id: fixture.assignmentId,
+      lifecycle_version: 1,
+    });
+    return retryAuthId;
+  }
+
   it('validates task, authorization, routing, epoch, exact head, and ContextManifest as one authority', () => {
     const fixture = seed();
     const result = adapter.validateAuthority(workOrderInput(fixture));
@@ -1110,5 +1183,449 @@ describe('product-task autonomy consolidation', () => {
     expect(result.success).toBe(false);
     expect(result.error).toContain('OWNERSHIP_EPOCH_MISMATCH');
     expect(result.leaseReleased).toBe(true);
+  });
+
+  const reviewFailureCases = [
+    {
+      category: 'capacity',
+      error: new Error('ALL_MANAGER_RESOURCES_UNAVAILABLE'),
+      expectedSubstring: 'ALL_MANAGER_RESOURCES_UNAVAILABLE',
+    },
+    {
+      category: 'capacity',
+      error: new Error('ROUTE_CAPACITY_EXHAUSTED: no manager capacity currently available'),
+      expectedSubstring: 'ROUTE_CAPACITY_EXHAUSTED',
+    },
+    {
+      category: 'auth',
+      error: new Error('AUTH_ERROR: provider credential invalid or unauthorized'),
+      expectedSubstring: 'AUTH_ERROR',
+    },
+    {
+      category: 'rate-limit',
+      error: new Error('RATE_LIMITED: 429 too many requests'),
+      expectedSubstring: 'RATE_LIMITED',
+    },
+    {
+      category: 'timeout',
+      error: new Error('TIMEOUT: manager request timed out after 120000ms'),
+      expectedSubstring: 'TIMEOUT',
+    },
+    {
+      category: 'offline',
+      error: new Error('OFFLINE: manager endpoint connection refused or process not found'),
+      expectedSubstring: 'OFFLINE',
+    },
+    {
+      category: 'contract-invalid',
+      error: new Error('CONTRACT_INVALID: malformed review response payload'),
+      expectedSubstring: 'CONTRACT_INVALID',
+    },
+  ];
+
+  for (const { category, error, expectedSubstring } of reviewFailureCases) {
+    it(`recovers ${category} review exception (${expectedSubstring}) to CODING, releases lease, and fences stale authority`, async () => {
+      const taskId = `task-review-${category}-${crypto.randomBytes(4).toString('hex')}`;
+      const fixture = seed(taskId);
+      const input = workOrderInput(fixture);
+
+      const result = await adapter.executeProductTask({
+        ...input,
+        runCoder: async () => ({ success: true, currentHeadSha: BASE_SHA }),
+        evidenceCollector: {
+          collect: async () => ({
+            headSha: BASE_SHA,
+            snapshotSha: 'snapshot-fixed',
+            status: '',
+            changedFiles: ['src'],
+            diff: 'diff-clean',
+            tests: [],
+          }),
+        },
+        runVerification: async (authority, workOrder) => adapter.recordVerificationObservation({
+          projectId: authority.task.project_id,
+          taskId: authority.task.id,
+          attemptId: authority.authorization.attempt_id,
+          command: 'node --version',
+          status: 'COMPLETED',
+          exitCode: 0,
+          passedCount: 1,
+          failedCount: 0,
+          durationMs: 1,
+          stdout: process.version,
+          workingDirectory: workOrder!.worktree,
+        }),
+        conductReview: async () => {
+          throw error;
+        },
+      });
+
+      // 1. Result assertions: never stranded in REVIEWING, never reached DONE
+      expect(result.success).toBe(false);
+      expect(result.finalTaskState).toBe('CODING');
+      expect(result.finalTaskState).not.toBe('REVIEWING');
+      expect(result.finalTaskState).not.toBe('DONE');
+      expect(result.leaseAcquired).toBe(true);
+      expect(result.leaseReleased).toBe(true);
+      expect(result.error).toContain(expectedSubstring);
+
+      // 2. Database state assertions
+      const updatedTask = repo.getTask(fixture.task.id)!;
+      expect(updatedTask.state).toBe('CODING');
+      expect(updatedTask.state).not.toBe('REVIEWING');
+      expect(updatedTask.state).not.toBe('DONE');
+      expect(updatedTask.revision_count).toBe(1);
+
+      const slot = repo.getWorkerSlot(fixture.slotId)!;
+      expect(slot.status).toBe('IDLE');
+
+      // 3. Stale authority is fenced by the revision bump
+      const staleAuthCheck = adapter.validateAuthority({
+        authorizationId: fixture.authorization.id,
+        currentHeadSha: BASE_SHA,
+      });
+      expect(staleAuthCheck.valid).toBe(false);
+      expect(staleAuthCheck.code).toBe('TASK_REVISION_MISMATCH');
+    });
+  }
+
+  it('recovers contract-invalid review object returning malformed contract to CODING, releases lease, and fences stale authority', async () => {
+    const fixture = seed('task-review-invalid-contract-obj');
+    const input = workOrderInput(fixture);
+
+    const result = await adapter.executeProductTask({
+      ...input,
+      runCoder: async () => ({ success: true, currentHeadSha: BASE_SHA }),
+      evidenceCollector: {
+        collect: async () => ({
+          headSha: BASE_SHA,
+          snapshotSha: 'snapshot-fixed',
+          status: '',
+          changedFiles: ['src'],
+          diff: 'diff-clean',
+          tests: [],
+        }),
+      },
+      runVerification: async (authority, workOrder) => adapter.recordVerificationObservation({
+        projectId: authority.task.project_id,
+        taskId: authority.task.id,
+        attemptId: authority.authorization.attempt_id,
+        command: 'node --version',
+        status: 'COMPLETED',
+        exitCode: 0,
+        passedCount: 1,
+        failedCount: 0,
+        durationMs: 1,
+        stdout: process.version,
+        workingDirectory: workOrder!.worktree,
+      }),
+      conductReview: async () => ({
+        // Missing protocol_version, reviewed_head_sha, etc.
+        invalid: true,
+      } as any),
+    });
+
+    expect(result.success).toBe(false);
+    expect(result.finalTaskState).toBe('CODING');
+    expect(result.finalTaskState).not.toBe('REVIEWING');
+    expect(result.finalTaskState).not.toBe('DONE');
+    expect(result.leaseAcquired).toBe(true);
+    expect(result.leaseReleased).toBe(true);
+    expect(result.error).toContain('CONTRACT_INVALID');
+
+    const updatedTask = repo.getTask(fixture.task.id)!;
+    expect(updatedTask.state).toBe('CODING');
+    expect(updatedTask.state).not.toBe('DONE');
+    expect(updatedTask.revision_count).toBe(1);
+    expect(repo.getWorkerSlot(fixture.slotId)?.status).toBe('IDLE');
+
+    const staleAuthCheck = adapter.validateAuthority({
+      authorizationId: fixture.authorization.id,
+      currentHeadSha: BASE_SHA,
+    });
+    expect(staleAuthCheck.valid).toBe(false);
+    expect(staleAuthCheck.code).toBe('TASK_REVISION_MISMATCH');
+  });
+
+  it('preserves ownership epoch fencing when task ownership epoch changes during manager review exception recovery', async () => {
+    const fixture = seed('task-epoch-fence-review-ex');
+    const input = workOrderInput(fixture);
+
+    const result = await adapter.executeProductTask({
+      ...input,
+      runCoder: async () => ({ success: true, currentHeadSha: BASE_SHA }),
+      evidenceCollector: {
+        collect: async () => ({
+          headSha: BASE_SHA,
+          snapshotSha: 'snapshot-fixed',
+          status: '',
+          changedFiles: ['src'],
+          diff: 'diff-clean',
+          tests: [],
+        }),
+      },
+      runVerification: async (authority, workOrder) => adapter.recordVerificationObservation({
+        projectId: authority.task.project_id,
+        taskId: authority.task.id,
+        attemptId: authority.authorization.attempt_id,
+        command: 'node --version',
+        status: 'COMPLETED',
+        exitCode: 0,
+        passedCount: 1,
+        failedCount: 0,
+        durationMs: 1,
+        stdout: process.version,
+        workingDirectory: workOrder!.worktree,
+      }),
+      conductReview: async () => {
+        // Task reassignment bumps epoch while manager review fails
+        repo.bumpTaskOwnershipEpoch(fixture.task.id, 1);
+        throw new Error('ALL_MANAGER_RESOURCES_UNAVAILABLE');
+      },
+    });
+
+    expect(result.success).toBe(false);
+    expect(result.error).toContain('OWNERSHIP_EPOCH_MISMATCH');
+    expect(result.leaseReleased).toBe(true);
+
+    // Database task epoch is 2, and revision was NOT mutated by stale worker
+    const taskInDb = repo.getTask(fixture.task.id)!;
+    expect(taskInDb.ownership_epoch).toBe(2);
+    expect(taskInDb.revision_count).toBe(0);
+    expect(repo.getWorkerSlot(fixture.slotId)?.status).toBe('IDLE');
+  });
+
+  it('proves a subsequent reauthorized retry can complete end-to-end after a manager review outage while preserving exact-head and verification gates', async () => {
+    const fixture = seed('task-review-outage-retry');
+    const input = workOrderInput(fixture);
+
+    // --- Attempt 1: Manager capacity outage occurs during review ---
+    const initialResult = await adapter.executeProductTask({
+      ...input,
+      runCoder: async () => ({ success: true, currentHeadSha: BASE_SHA }),
+      evidenceCollector: {
+        collect: async () => ({
+          headSha: BASE_SHA,
+          snapshotSha: 'snapshot-initial',
+          status: '',
+          changedFiles: ['src'],
+          diff: 'diff-clean',
+          tests: [],
+        }),
+      },
+      runVerification: async (authority, workOrder) => adapter.recordVerificationObservation({
+        projectId: authority.task.project_id,
+        taskId: authority.task.id,
+        attemptId: authority.authorization.attempt_id,
+        command: 'node --version',
+        status: 'COMPLETED',
+        exitCode: 0,
+        passedCount: 1,
+        failedCount: 0,
+        durationMs: 1,
+        stdout: process.version,
+        workingDirectory: workOrder!.worktree,
+      }),
+      conductReview: async () => {
+        throw new Error('ALL_MANAGER_RESOURCES_UNAVAILABLE');
+      },
+    });
+
+    expect(initialResult.success).toBe(false);
+    expect(initialResult.finalTaskState).toBe('CODING');
+    expect(initialResult.finalTaskState).not.toBe('REVIEWING');
+    expect(initialResult.finalTaskState).not.toBe('DONE');
+    expect(initialResult.leaseReleased).toBe(true);
+    expect(initialResult.error).toContain('ALL_MANAGER_RESOURCES_UNAVAILABLE');
+
+    const taskAfterOutage = repo.getTask(fixture.task.id)!;
+    expect(taskAfterOutage.state).toBe('CODING');
+    expect(taskAfterOutage.revision_count).toBe(1);
+    expect(repo.getWorkerSlot(fixture.slotId)?.status).toBe('IDLE');
+
+    // Prove stale authority is fenced
+    const staleValidation = adapter.validateAuthority({
+      authorizationId: fixture.authorization.id,
+      currentHeadSha: BASE_SHA,
+    });
+    expect(staleValidation.valid).toBe(false);
+    expect(staleValidation.code).toBe('TASK_REVISION_MISMATCH');
+
+    // Create durable reauthorized execution authorization for revision 1
+    const retryAuthId = createRetryAuthorization(fixture, 1);
+
+    // --- Gate verification 1: Exact-head gate still applies on retry ---
+    const headMismatchResult = await adapter.executeProductTask({
+      ...input,
+      authorizationId: retryAuthId,
+      runCoder: async () => ({ success: true, currentHeadSha: OTHER_SHA }),
+      evidenceCollector: {
+        collect: async () => ({
+          headSha: BASE_SHA,
+          snapshotSha: 'snapshot-retry',
+          status: '',
+          changedFiles: ['src'],
+          diff: 'diff-retry',
+          tests: [],
+        }),
+      },
+      runVerification: async () => { throw new Error('should not reach verification'); },
+      conductReview: async () => { throw new Error('should not reach review'); },
+    });
+    expect(headMismatchResult.success).toBe(false);
+    expect(headMismatchResult.error).toContain('CODER_HEAD_MISMATCH');
+    expect(headMismatchResult.leaseReleased).toBe(true);
+
+    // --- Gate verification 2: Current-verification lineage gate still applies on retry ---
+    const verifFailResult = await adapter.executeProductTask({
+      ...input,
+      authorizationId: retryAuthId,
+      runCoder: async () => ({ success: true, currentHeadSha: BASE_SHA }),
+      evidenceCollector: {
+        collect: async () => ({
+          headSha: BASE_SHA,
+          snapshotSha: 'snapshot-retry',
+          status: '',
+          changedFiles: ['src'],
+          diff: 'diff-retry',
+          tests: [],
+        }),
+      },
+      runVerification: async (authority, workOrder) => adapter.recordVerificationObservation({
+        projectId: authority.task.project_id,
+        taskId: authority.task.id,
+        attemptId: authority.authorization.attempt_id,
+        command: 'node --version',
+        status: 'FAILED',
+        exitCode: 1,
+        passedCount: 0,
+        failedCount: 1,
+        durationMs: 1,
+        stdout: '',
+        stderr: 'test failed',
+        workingDirectory: workOrder!.worktree,
+      }),
+      conductReview: async () => { throw new Error('should not reach review'); },
+    });
+    expect(verifFailResult.success).toBe(false);
+    expect(verifFailResult.error).toBe('VERIFICATION_FAILED');
+    expect(verifFailResult.leaseReleased).toBe(true);
+
+    // The failed current verification incremented the authoritative task revision,
+    // so the next attempt must use a fresh authorization for that exact revision.
+    expect(repo.getTask(fixture.task.id)?.revision_count).toBe(2);
+    const finalRetryAuthId = createRetryAuthorization(fixture, 2);
+
+    // --- Attempt 2: Reauthorized retry with passing verification and restored manager completes to DONE ---
+    const retrySuccessResult = await adapter.executeProductTask({
+      ...input,
+      authorizationId: finalRetryAuthId,
+      runCoder: async () => ({ success: true, currentHeadSha: BASE_SHA }),
+      evidenceCollector: {
+        collect: async () => ({
+          headSha: BASE_SHA,
+          snapshotSha: 'snapshot-retry-success',
+          status: '',
+          changedFiles: ['src'],
+          diff: 'diff-retry-success',
+          tests: [],
+        }),
+      },
+      runVerification: async (authority, workOrder) => adapter.recordVerificationObservation({
+        projectId: authority.task.project_id,
+        taskId: authority.task.id,
+        attemptId: authority.authorization.attempt_id,
+        command: 'node --version',
+        status: 'COMPLETED',
+        exitCode: 0,
+        passedCount: 1,
+        failedCount: 0,
+        durationMs: 1,
+        stdout: process.version,
+        workingDirectory: workOrder!.worktree,
+      }),
+      conductReview: async (context) => ({
+        protocol_version: 'managerreview.v1',
+        verdict: 'PASS',
+        reviewed_head_sha: context.current_head,
+        findings: [],
+        required_actions: [],
+        risk: 'LOW',
+        notes: 'reauthorized retry passed after manager outage recovered',
+      }),
+    });
+
+    expect(retrySuccessResult.success).toBe(true);
+    expect(retrySuccessResult.finalTaskState).toBe('DONE');
+    expect(retrySuccessResult.leaseAcquired).toBe(true);
+    expect(retrySuccessResult.leaseReleased).toBe(true);
+    expect(repo.getTask(fixture.task.id)?.state).toBe('DONE');
+    expect(repo.getWorkerSlot(fixture.slotId)?.status).toBe('IDLE');
+  });
+
+  it('operational supervisor handles manager review outage on product task, leaves task in CODING and releases slot', async () => {
+    const fixture = seed('task-op-review-outage');
+    const supervisor = new AutonomySupervisor({
+      store,
+      productAdapter: adapter,
+      worktreeRoot: path.join(root, 'worktrees'),
+      evidence: {
+        collect: async () => ({
+          headSha: BASE_SHA,
+          snapshotSha: 'snapshot-op-outage',
+          status: '',
+          changedFiles: ['src'],
+          diff: 'diff-op-outage',
+          tests: [{ command: 'node --version', exitCode: 0, stdout: 'v22.0.0', stderr: '', durationMs: 1 }],
+        }),
+      },
+      agy: {
+        execute: async () => ({
+          status: 'SUCCESSFUL_PROCESS_EXIT' as const,
+          exitCode: 0,
+          executionId: 'exec-op-outage',
+          stdout: '',
+          stderr: '',
+          durationMs: 1,
+        }),
+      } as any,
+      managerPool: {
+        review: async () => ({
+          run: {
+            status: 'QUOTA_OR_RATE_LIMIT' as const,
+            exitCode: 1,
+            executionId: '',
+            stdout: '',
+            stderr: 'ALL_MANAGER_RESOURCES_UNAVAILABLE',
+            durationMs: 0,
+          },
+          resource_id: 'none',
+          context_sha: 'sha-outage',
+          attempts: ['primary'],
+        }),
+      } as any,
+    });
+
+    const spec = {
+      taskId: fixture.task.id,
+      workerId: 'agy-01',
+      objective: fixture.task.description ?? fixture.task.title,
+      baseSha: BASE_SHA,
+      branch: `agent/agy-01/${fixture.task.id}`,
+      worktree: path.join(root, 'worktrees', fixture.task.id),
+      allowedPaths: ['src'],
+      acceptanceCriteria: ['product task survives manager review outage'],
+      requiredTests: ['node --version'],
+    };
+    fs.mkdirSync(spec.worktree, { recursive: true });
+
+    const result = await supervisor.run(spec);
+    expect(result.accepted).toBe(false);
+    expect(result.state).toBe('CODING');
+    expect(result.error).toContain('ALL_MANAGER_RESOURCES_UNAVAILABLE');
+    expect(repo.getTask(fixture.task.id)?.state).toBe('CODING');
+    expect(repo.getTask(fixture.task.id)?.state).not.toBe('REVIEWING');
+    expect(repo.getWorkerSlot(fixture.slotId)?.status).toBe('IDLE');
+    expect(store.listAll()).toHaveLength(0);
   });
 });

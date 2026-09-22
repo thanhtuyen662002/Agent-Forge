@@ -13,7 +13,7 @@ import {
 } from '../services/WorkerSlotLeaseService';
 import { TaskStateMachine, TaskTrigger } from '../state/taskStateMachine';
 import { AgentAssignment, ExecutionAuthorization, ProcessRun, Task, TestRun } from '../types/domain';
-import { AutonomousTaskSpec, ManagerReview, WorkOrder, createWorkOrder } from './contracts';
+import { AutonomousTaskSpec, ManagerReview, ManagerReviewSchema, WorkOrder, createWorkOrder } from './contracts';
 import { EvidenceCollector } from './evidence';
 import {
   BuildManagerContextParams,
@@ -548,7 +548,12 @@ export class ProductTaskAutonomyAdapter {
           actualDiff: input.managerContext?.actualDiff ?? preReviewEvidence.diff,
           changedFiles: input.managerContext?.changedFiles ?? preReviewEvidence.changedFiles,
         });
-        const review = await input.conductReview(context);
+        const rawReview = await input.conductReview(context);
+        const parsedReview = ManagerReviewSchema.safeParse(rawReview);
+        if (!parsedReview.success) {
+          throw new Error(`CONTRACT_INVALID: conductReview returned invalid review contract: ${parsedReview.error.message}`);
+        }
+        const review: ManagerReview = parsedReview.data;
 
         // Independently observe a fresh Git HEAD and working-tree snapshot after manager review
         const postReviewEvidence = await evidenceCollector.collect(workOrder, []);
@@ -579,11 +584,7 @@ export class ProductTaskAutonomyAdapter {
           };
         } else if (!refreshedAuthority.valid) {
           if (refreshedAuthority.code !== 'OWNERSHIP_EPOCH_MISMATCH') {
-            try {
-              task = this.transitionTask(task.id, 'FIX_VERDICT', authorityEpoch);
-            } catch {
-              // Fenced mutation retains current task state
-            }
+            task = this.transitionTask(task.id, 'FIX_VERDICT', authorityEpoch);
           }
           result = {
             success: false,
@@ -628,13 +629,35 @@ export class ProductTaskAutonomyAdapter {
         }
       }
     } catch (error) {
+      const currentTask = this.repo.getTask(validated.authority.task.id);
+      let finalTaskState = currentTask?.state ?? 'UNKNOWN';
+      const authorityEpoch = validated.authority.task.ownership_epoch ?? 1;
+      const executionError = error instanceof Error ? error.message : String(error);
+      let reportedError = executionError;
+      if (currentTask && currentTask.state === 'REVIEWING') {
+        const currentEpoch = currentTask.ownership_epoch ?? authorityEpoch;
+        if (currentEpoch === authorityEpoch) {
+          try {
+            const recovered = this.transitionTask(currentTask.id, 'FIX_VERDICT', authorityEpoch);
+            finalTaskState = recovered.state;
+          } catch (recoveryError) {
+            finalTaskState = this.repo.getTask(currentTask.id)?.state ?? currentTask.state;
+            const recoveryMessage = recoveryError instanceof Error ? recoveryError.message : String(recoveryError);
+            reportedError = recoveryMessage.includes('OWNERSHIP_EPOCH_MISMATCH')
+              ? `AUTHORITY_FENCED_DURING_EXECUTION: ${recoveryMessage}`
+              : `REVIEW_RESUME_FAILED: ${recoveryMessage}; original error: ${executionError}`;
+          }
+        } else {
+          reportedError = `AUTHORITY_FENCED_DURING_EXECUTION: OWNERSHIP_EPOCH_MISMATCH: expected ${authorityEpoch}, current ${String(currentEpoch)}.`;
+        }
+      }
       result = {
         success: false,
-        finalTaskState: this.repo.getTask(validated.authority.task.id)?.state ?? 'UNKNOWN',
+        finalTaskState,
         leaseAcquired: true,
         leaseReleased: false,
         workOrder,
-        error: error instanceof Error ? error.message : String(error),
+        error: reportedError,
       };
     }
 

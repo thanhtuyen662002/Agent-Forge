@@ -45,11 +45,14 @@ any attempt to execute product tasks through legacy autonomy state
 (PRODUCT_TASK_CANNOT_USE_LEGACY_AUTONOMY_LIFECYCLE). ProductTaskAutonomyAdapter
 independently observes Git evidence and enforces path boundaries before verification
 or review: any changed file outside workOrder.allowed_paths or inside
-workOrder.forbidden_paths fails closed with WORKER_PATH_VIOLATION. When a post-review
-HEAD or working-tree snapshot freshness violation occurs, the adapter transitions the
-authoritative task via TaskService using FIX_VERDICT into the durable resumable repair
-state (CODING) while strictly fencing against the active task ownership epoch, ensuring
-the task is never wedged and can be resumed with a new revision authorization. Legacy
+workOrder.forbidden_paths fails closed with WORKER_PATH_VIOLATION. When a manager
+review exception occurs (such as provider capacity, auth, rate-limit, timeout, offline,
+or contract-invalid failures) or a post-review HEAD or working-tree snapshot freshness
+violation occurs, the adapter transitions the authoritative task via TaskService using
+FIX_VERDICT into the durable resumable repair state (CODING) while strictly fencing against
+the active task ownership epoch, ensuring the task is never stranded in REVIEWING and can be
+resumed with a new revision authorization while releasing the worker slot lease and preserving
+exact-head and verification lineage gates. Legacy
 `autonomy_*` rows are inventoried and retained as compatibility/audit evidence; they are not
 silently discarded or authoritative for new product tasks. The consolidated path
 strictly enforces a hard cap of `MAX_AGY_WORKERS=1` in both AutonomySupervisor
