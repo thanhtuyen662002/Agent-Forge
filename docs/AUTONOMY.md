@@ -46,6 +46,15 @@ any attempt to execute product tasks through legacy autonomy state
 ExecutionAuthorizationService authenticates execution scope (`branch`, absolute
 `worktree`, `allowedPaths`, and `forbiddenPaths`) within the durable
 CanonicalExecutionPayload and verifies it in `instruction_payload_hash`.
+In the continuous queue dispatcher (`SupervisorContinuousQueue.defaultDispatch`),
+product task dispatch resolves and validates the active durable ExecutionAuthorization
+before constructing any runtime specification, deriving the exact authorized branch,
+absolute worktree, allowed paths, forbidden paths, base SHA, task revision, and
+ownership epoch directly from the authenticated canonical execution payload and
+authoritative product task data, never inventing branch, worktree, paths, base SHA,
+revision, or epoch, and never relying on synthesized task/worker naming conventions.
+Runtime product dispatch uses the exact authorized absolute worktree and branch even
+when they differ from synthesized conventions.
 ProductTaskAutonomyAdapter requires this authenticated executionScope, builds its
 WorkOrder strictly from the authorized scope values, and validates that runtime
 scope does not differ in any way. Any missing scope (EXECUTION_SCOPE_MISSING,
@@ -68,9 +77,9 @@ resumed with a new revision authorization while releasing the worker slot lease 
 exact-head and verification lineage gates. Legacy
 `autonomy_*` rows are inventoried and retained as compatibility/audit evidence; they are not
 silently discarded or authoritative for new product tasks. The consolidated path
-strictly enforces a hard cap of `MAX_AGY_WORKERS=1` in both AutonomySupervisor
-and autonomyCli, throwing `CONSOLIDATION_REQUIRES_MAX_AGY_WORKERS_1` on any higher
-configured value.
+enforces an explicitly configured maximum of `MAX_AGY_WORKERS=2` (accepting integers
+from 1 through 2) in both AutonomySupervisor and autonomyCli, failing closed with
+`CONSOLIDATION_REQUIRES_MAX_AGY_WORKERS_BOUNDS` on any value below 1, above 2, or non-integer.
 
 SQLite lives at RUNTIME_ROOT/state/agent-forge.sqlite. Provider logs, prompts,
 review/session events, and evidence live in that database. Operator files belong
@@ -98,8 +107,8 @@ npm.cmd run autonomy:register-ci <runtime-watch-json>
 Doctor exercises live provider contracts and disposable worktree creation/removal.
 Normal tests use fakes and require no live accounts. SHADOW currently exercises
 recovery only; manager planning is exercised by PILOT. PILOT runs a disposable
-file-edit/verification/review proof. START is a continuous single-worker queue
-pump, gated on a recorded local PASS. STOP requests cancellation through SQLite
+file-edit/verification/review proof. START is a continuous queue pump running up to `MAX_AGY_WORKERS` (1 or 2)
+concurrent tasks with distinct worker identities, gated on a recorded local PASS. STOP requests cancellation through SQLite
 so it reaches the actual owner process. STATUS reads durable attempts.
 
 Enqueue a JSON task request from a file under the runtime root:
@@ -221,8 +230,8 @@ bounded observation between durable task dispatches; it does not busy-poll.
 
 Integrate existing product task/authorization/lease services, manager-selected
 dependencies, cooldowns, process recovery proofs, provider failover, and
-supervised self-update. Multi-worker scheduling and automatic integration
-remain disabled. Keep the running version fixed and implement self-development
+supervised self-update. Multi-worker scheduling is graduated to an explicitly configured two-worker maximum (`MAX_AGY_WORKERS=1` or `2`),
+denying a third active worker while automatic integration remains disabled. Keep the running version fixed and implement self-development
 in worktrees before reviewing and updating it.
 
 The all-target fast-pr.yml supplements main-target CI. Windows/Ubuntu checks,

@@ -1143,7 +1143,7 @@ describe('product-task autonomy consolidation', () => {
       repo,
       artifactStore: new ArtifactStore(path.join(root, 'other-artifacts')),
       maxWorkers: MAX_AGY_WORKERS + 1,
-    })).toThrow('PRODUCT_TASK_CONSOLIDATION_REQUIRES_MAX_AGY_WORKERS_1');
+    })).toThrow(/PRODUCT_TASK_CONSOLIDATION_REQUIRES_MAX_AGY_WORKERS/);
   });
 
   it('fails closed before verification or review if independently collected changedFiles include paths outside allowed_paths', async () => {
