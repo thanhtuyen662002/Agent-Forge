@@ -2,8 +2,9 @@ import fs from 'fs';
 import os from 'os';
 import path from 'path';
 import Database from 'better-sqlite3';
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import { MigrationRunner } from '../src/core/database/migrations';
+import { main } from '../src/electron/autonomyCli';
 import {
   ManagerReviewSchema,
   WorkerResultSchema,
@@ -221,5 +222,129 @@ describe('autonomy durable contracts', () => {
     expect(supervisor2).toBeDefined();
     expect(supervisor2.maxWorkers).toBe(2);
     db.close();
+  });
+
+  it('awaits ContinuousQueue.run before finally cleanup so database stays open for the queue lifetime (TSK-TWO-WORKER-QUEUE-LIFETIME)', async () => {
+    const runtime = fs.mkdtempSync(path.join(os.tmpdir(), 'agentforge-cli-start-'));
+    const control = fs.mkdtempSync(path.join(os.tmpdir(), 'agentforge-cli-control-'));
+    const worktree = fs.mkdtempSync(path.join(os.tmpdir(), 'agentforge-cli-worktree-'));
+    const prevEnv = {
+      AGENT_FORGE_RUNTIME_ROOT: process.env.AGENT_FORGE_RUNTIME_ROOT,
+      AGENT_FORGE_CONTROL_REPO: process.env.AGENT_FORGE_CONTROL_REPO,
+      AGENT_FORGE_WORKTREE_ROOT: process.env.AGENT_FORGE_WORKTREE_ROOT,
+      MAX_AGY_WORKERS: process.env.MAX_AGY_WORKERS,
+      AGENT_FORGE_POLL_INTERVAL_MS: process.env.AGENT_FORGE_POLL_INTERVAL_MS,
+    };
+    try {
+      process.env.AGENT_FORGE_RUNTIME_ROOT = runtime;
+      process.env.AGENT_FORGE_CONTROL_REPO = control;
+      process.env.AGENT_FORGE_WORKTREE_ROOT = worktree;
+      process.env.MAX_AGY_WORKERS = '2';
+      process.env.AGENT_FORGE_POLL_INTERVAL_MS = '10';
+
+      const seed = AutonomyStore.open(runtime);
+      seed.store.event('pilot-proof', 'LOCAL_ACCEPTED', { headSha: 'a'.repeat(40) });
+      seed.engine.close();
+
+      let dbOpenDuringRun = false;
+      let dbStillOpenAfterTick = false;
+      let ownerHeldDuringRun = false;
+      let observedWorkers = 0;
+
+      const originalCreate = AutonomySupervisor.prototype.createContinuousQueue;
+      const spy = vi.spyOn(AutonomySupervisor.prototype, 'createContinuousQueue').mockImplementation(function (this: AutonomySupervisor, options: any) {
+        observedWorkers = this.maxWorkers;
+        const queue = originalCreate.call(this, options);
+        const originalRun = queue.run.bind(queue);
+        queue.run = async () => {
+          const db = queue.store.getDatabase();
+          dbOpenDuringRun = db.open;
+          // Yield execution to the event loop. If main() did not await queue.run(),
+          // main's finally block would run immediately, closing the DB and releasing the owner.
+          await new Promise((resolve) => setTimeout(resolve, 25));
+          dbStillOpenAfterTick = db.open;
+          ownerHeldDuringRun = !queue.store.shouldStop();
+          queue.store.requestStop();
+          return originalRun();
+        };
+        return queue;
+      });
+
+      try {
+        const exitCode = await main(['node', 'autonomyCli.ts', 'start']);
+        expect(exitCode).toBe(0);
+        expect(observedWorkers).toBe(2);
+        expect(dbOpenDuringRun).toBe(true);
+        expect(dbStillOpenAfterTick).toBe(true);
+        expect(ownerHeldDuringRun).toBe(true);
+      } finally {
+        spy.mockRestore();
+      }
+    } finally {
+      for (const [key, val] of Object.entries(prevEnv)) {
+        if (val !== undefined) process.env[key] = val;
+        else delete process.env[key];
+      }
+      fs.rmSync(runtime, { recursive: true, force: true });
+      fs.rmSync(control, { recursive: true, force: true });
+      fs.rmSync(worktree, { recursive: true, force: true });
+    }
+  });
+
+  it('fails deterministically with database closed error if queue promise escapes try/finally early', async () => {
+    const runtime = fs.mkdtempSync(path.join(os.tmpdir(), 'agentforge-cli-regression-'));
+    try {
+      const opened = AutonomyStore.open(runtime);
+      const db = opened.engine.getDb();
+      let cleanupExecuted = false;
+
+      // Demonstrates the unawaited try/finally escape bug:
+      // JavaScript executes finally immediately upon return, closing SQLite while the queue is pending
+      const queuePromise = (async () => {
+        await new Promise((resolve) => setTimeout(resolve, 10));
+        // Queue attempt to access database after tick throws because database was closed in finally
+        return opened.store.shouldStop();
+      })();
+      const rejectionExpectation = expect(queuePromise).rejects.toThrow(/database connection is not open/i);
+
+      const unawaitedEscapePath = () => {
+        try {
+          return queuePromise;
+        } finally {
+          cleanupExecuted = true;
+          opened.engine.close();
+        }
+      };
+
+      const escapePromise = unawaitedEscapePath();
+      expect(cleanupExecuted).toBe(true);
+      expect(db.open).toBe(false);
+      await rejectionExpectation;
+
+      // Contrast with the repaired start path (awaiting before finally cleanup):
+      const opened2 = AutonomyStore.open(runtime);
+      const db2 = opened2.engine.getDb();
+      let cleanupExecuted2 = false;
+      const awaitedStartPath = async () => {
+        try {
+          return await (async () => {
+            await new Promise((resolve) => setTimeout(resolve, 10));
+            return opened2.store.shouldStop();
+          })();
+        } finally {
+          cleanupExecuted2 = true;
+          opened2.engine.close();
+        }
+      };
+
+      const awaitedPromise = awaitedStartPath();
+      expect(cleanupExecuted2).toBe(false);
+      expect(db2.open).toBe(true);
+      await expect(awaitedPromise).resolves.toBe(false);
+      expect(cleanupExecuted2).toBe(true);
+      expect(db2.open).toBe(false);
+    } finally {
+      fs.rmSync(runtime, { recursive: true, force: true });
+    }
   });
 });

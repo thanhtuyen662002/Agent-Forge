@@ -96,24 +96,27 @@ async function doctorOmniRoute(): Promise<number> {
   return managerContract.compatible && reviewerContract.compatible ? 0 : 1;
 }
 
-async function main(): Promise<number> {
+export async function main(argv: string[] = process.argv): Promise<number> {
   const rawMaxWorkers = process.env.MAX_AGY_WORKERS !== undefined ? Number(process.env.MAX_AGY_WORKERS) : 1;
   if (!Number.isInteger(rawMaxWorkers) || rawMaxWorkers < 1 || rawMaxWorkers > 2) {
     process.stderr.write('CONSOLIDATION_REQUIRES_MAX_AGY_WORKERS_BOUNDS: Autonomy CLI accepts only MAX_AGY_WORKERS integers from 1 through 2\n');
     return 1;
   }
-  const command = process.argv[2] ?? 'status';
+  const command = argv[2] ?? 'status';
   if (command === 'doctor') return doctor();
   if (command === 'doctor-omniroute') return doctorOmniRoute();
-  const store = AutonomyStore.open(runtimeRoot);
-  const supervisor = new AutonomySupervisor({ store: store.store, mode: command === 'shadow' ? 'SHADOW' : 'PILOT', runtimeRoot, controlRepo, worktreeRoot, maxWorkers: rawMaxWorkers });
-  const ci = new GithubCiObserver(store.store, controlRepo, supervisor.managerPool);
-  if (command === 'status') { process.stdout.write(`${JSON.stringify({ mode: supervisor.mode, maxWorkers: supervisor.maxWorkers, orders: supervisor.store.listAll(), activeSlots: supervisor.store.listActiveSlots(), runtimeRoot, legacyInventory: supervisor.store.inventoryLegacyState() })}\n`); return 0; }
+  const effectiveControlRepo = process.env.AGENT_FORGE_CONTROL_REPO ?? controlRepo;
+  const effectiveWorktreeRoot = process.env.AGENT_FORGE_WORKTREE_ROOT ?? path.resolve(effectiveControlRepo, '..', 'AI', 'Agent-Forge-Worktrees');
+  const effectiveRuntimeRoot = process.env.AGENT_FORGE_RUNTIME_ROOT ?? path.resolve(effectiveControlRepo, '..', 'AI', 'Agent-Forge-Runtime');
+  const store = AutonomyStore.open(effectiveRuntimeRoot);
+  const supervisor = new AutonomySupervisor({ store: store.store, mode: command === 'shadow' ? 'SHADOW' : 'PILOT', runtimeRoot: effectiveRuntimeRoot, controlRepo: effectiveControlRepo, worktreeRoot: effectiveWorktreeRoot, maxWorkers: rawMaxWorkers });
+  const ci = new GithubCiObserver(store.store, effectiveControlRepo, supervisor.managerPool);
+  if (command === 'status') { process.stdout.write(`${JSON.stringify({ mode: supervisor.mode, maxWorkers: supervisor.maxWorkers, orders: supervisor.store.listAll(), activeSlots: supervisor.store.listActiveSlots(), runtimeRoot: effectiveRuntimeRoot, legacyInventory: supervisor.store.inventoryLegacyState() })}\n`); return 0; }
   if (command === 'inventory-legacy') { process.stdout.write(`${JSON.stringify(supervisor.store.inventoryLegacyState(), null, 2)}\n`); return 0; }
   if (command === 'stop') { store.store.requestStop(); process.stdout.write('Stop requested in durable state.\n'); return 0; }
   if (command === 'enqueue' || command === 'enqueue-authorized') {
-    const file = path.resolve(process.argv[3] ?? '');
-    assertPathContained(file, runtimeRoot);
+    const file = path.resolve(argv[3] ?? '');
+    assertPathContained(file, effectiveRuntimeRoot);
     const task = SelfHostTaskSchema.parse(JSON.parse(fs.readFileSync(file, 'utf8')));
     store.store.getDatabase().transaction(() => {
       store.store.enqueue(task);
@@ -122,8 +125,8 @@ async function main(): Promise<number> {
     process.stdout.write('Task enqueued in SQLite.\n'); return 0;
   }
   if (command === 'register-ci') {
-    const file = path.resolve(process.argv[3] ?? '');
-    assertPathContained(file, runtimeRoot);
+    const file = path.resolve(argv[3] ?? '');
+    assertPathContained(file, effectiveRuntimeRoot);
     const input = JSON.parse(fs.readFileSync(file, 'utf8')) as { task_id: string; work_order_id?: string | null; repository: string; pr_number: number; branch: string; expected_head_sha: string };
     const watch = ci.register({ taskId: input.task_id, workOrderId: input.work_order_id, repository: input.repository, prNumber: input.pr_number, branch: input.branch, expectedHeadSha: input.expected_head_sha });
     process.stdout.write(`${JSON.stringify(watch)}\n`); return 0;
@@ -138,7 +141,7 @@ async function main(): Promise<number> {
   supervisor.recover();
   if (command === 'recover') { process.stdout.write('Recovery completed; retained worktrees and fenced attempts remain in durable state.\n'); return 0; }
   if (command === 'pilot') {
-    const proof = await runDisposableSelfHostProof({ controlRepo, worktreeRoot, supervisor });
+    const proof = await runDisposableSelfHostProof({ controlRepo: effectiveControlRepo, worktreeRoot: effectiveWorktreeRoot, supervisor });
     process.stdout.write(`${JSON.stringify({ mode: supervisor.mode, accepted: proof.result.accepted ?? false, state: proof.result.state, verdict: proof.result.review?.verdict, error: proof.result.error, worktree: proof.worktree, branch: proof.branch, baseSha: proof.baseSha })}\n`);
     return proof.result.accepted ? 0 : 1;
   }
@@ -148,10 +151,14 @@ async function main(): Promise<number> {
     if (!proven) throw new Error('PILOT_PROOF_REQUIRED');
     const workerDescription = supervisor.maxWorkers === 1 ? 'one worker' : 'two workers';
     process.stdout.write(`Agent Forge PILOT supervisor started (${workerDescription}; no push or merge).\n`);
+    const pollIntervalMs = process.env.AGENT_FORGE_POLL_INTERVAL_MS !== undefined
+      ? Number(process.env.AGENT_FORGE_POLL_INTERVAL_MS)
+      : undefined;
     const queue = supervisor.createContinuousQueue({
       ci,
-      controlRepo,
-      worktreeRoot,
+      controlRepo: effectiveControlRepo,
+      worktreeRoot: effectiveWorktreeRoot,
+      ...(pollIntervalMs !== undefined && !Number.isNaN(pollIntervalMs) ? { pollIntervalMs } : {}),
       onEvent: (type, payload) => {
         if (type === 'TASK_SETTLED') {
           process.stdout.write(`${JSON.stringify({ task: payload.task, accepted: payload.accepted, state: payload.state, publishedHead: payload.publishedHead })}\n`);
@@ -164,10 +171,20 @@ async function main(): Promise<number> {
         }
       },
     });
-    return queue.run();
+    return await queue.run();
   }
   process.stderr.write(`Unknown autonomy command: ${command}\n`); return 2;
   } finally { clearInterval(cancellation); store.store.releaseOwner(owner); store.engine.close(); }
 }
 
-main().then((code) => process.exit(code)).catch((error) => { process.stderr.write(`${redact(error instanceof Error ? error.message : String(error))}\n`); process.exit(1); });
+const isDirectCliExecution = (): boolean => {
+  if (process.env.VITEST || process.env.NODE_ENV === 'test') {
+    return false;
+  }
+  const entry = process.argv[1];
+  return Boolean(entry && /autonomyCli(\.[cm]?[jt]s)?$/i.test(entry));
+};
+
+if (isDirectCliExecution()) {
+  main().then((code) => process.exit(code)).catch((error) => { process.stderr.write(`${redact(error instanceof Error ? error.message : String(error))}\n`); process.exit(1); });
+}
