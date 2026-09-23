@@ -300,6 +300,44 @@ describe('CI Identity Reconciliation Semantics (TSK-CI-IDENTITY-RECONCILIATION)'
       expect(result.isValid).toBe(false);
       expect(result.failsClosed).toBe(true);
     });
+
+    it('fails closed when main push checks only contain pull_request check-runs (not push)', () => {
+      const result = evaluateCiReconciliation({
+        repository: repo,
+        prNumber: prNum,
+        expectedPrHeadSha: shaA,
+        prHeadEvent: 'pull_request',
+        prHeadChecks: [{ name: 'test', status: 'COMPLETED', conclusion: 'SUCCESS' }],
+        mergedMainSha: shaB,
+        mainPushEvent: 'push',
+        mainPushChecks: [
+          { name: 'pr-check', status: 'COMPLETED', conclusion: 'SUCCESS', event: 'pull_request' },
+        ],
+      });
+
+      expect(result.classification).toBe('MISSING_POST_MERGE_CI');
+      expect(result.isValid).toBe(false);
+      expect(result.failsClosed).toBe(true);
+    });
+
+    it('fails closed when main push checks contain checks with mismatched SHA', () => {
+      const result = evaluateCiReconciliation({
+        repository: repo,
+        prNumber: prNum,
+        expectedPrHeadSha: shaA,
+        prHeadEvent: 'pull_request',
+        prHeadChecks: [{ name: 'test', status: 'COMPLETED', conclusion: 'SUCCESS' }],
+        mergedMainSha: shaB,
+        mainPushEvent: 'push',
+        mainPushChecks: [
+          { name: 'wrong-sha-run', status: 'COMPLETED', conclusion: 'SUCCESS', event: 'push', headSha: shaC },
+        ],
+      });
+
+      expect(result.classification).toBe('MISSING_POST_MERGE_CI');
+      expect(result.isValid).toBe(false);
+      expect(result.failsClosed).toBe(true);
+    });
   });
 
   describe('7. Fail-closed: Stale PR-head evidence', () => {
@@ -342,6 +380,38 @@ describe('CI Identity Reconciliation Semantics (TSK-CI-IDENTITY-RECONCILIATION)'
         expectedPrHeadSha: shaA,
         prHeadEvent: 'push', // Invalid event for PR_HEAD_CI
         prHeadChecks: [{ name: 'test', status: 'COMPLETED', conclusion: 'SUCCESS' }],
+      });
+
+      expect(result.classification).toBe('STALE_PR_HEAD_CI');
+      expect(result.isValid).toBe(false);
+      expect(result.failsClosed).toBe(true);
+    });
+
+    it('fails closed when PR head checks contain non-pull_request event', () => {
+      const result = evaluateCiReconciliation({
+        repository: repo,
+        prNumber: prNum,
+        expectedPrHeadSha: shaA,
+        prHeadEvent: 'pull_request',
+        prHeadChecks: [
+          { name: 'push-check-on-pr', status: 'COMPLETED', conclusion: 'SUCCESS', event: 'push' },
+        ],
+      });
+
+      expect(result.classification).toBe('STALE_PR_HEAD_CI');
+      expect(result.isValid).toBe(false);
+      expect(result.failsClosed).toBe(true);
+    });
+
+    it('fails closed when PR head checks contain mismatched head SHA', () => {
+      const result = evaluateCiReconciliation({
+        repository: repo,
+        prNumber: prNum,
+        expectedPrHeadSha: shaA,
+        prHeadEvent: 'pull_request',
+        prHeadChecks: [
+          { name: 'wrong-sha-check', status: 'COMPLETED', conclusion: 'SUCCESS', event: 'pull_request', headSha: shaB },
+        ],
       });
 
       expect(result.classification).toBe('STALE_PR_HEAD_CI');
@@ -483,6 +553,153 @@ describe('CI Identity Reconciliation Semantics (TSK-CI-IDENTITY-RECONCILIATION)'
       expect(stored?.merged_main_sha).toBe(shaB);
       expect(stored?.reconciliation_classification).toBe('DIFFERENT_MERGE_SHA_PUSH_SUCCESS');
       expect(stored?.merge_identity_type).toBe('SQUASH');
+    });
+
+    it('fails closed in observer when post-merge commit has NO push workflow run (provenance gap repaired)', async () => {
+      const store = createTestStore();
+      const observer = new GithubCiObserver(store, 'C:\\dummy-repo', undefined, async (exec, args) => {
+        if (exec === 'gh' && args[0] === 'pr' && args[1] === 'view') {
+          return {
+            status: 0,
+            stdout: JSON.stringify({
+              number: prNum,
+              isDraft: false,
+              headRefName: 'feature-branch',
+              headRefOid: shaA,
+              mergedAt: '2026-09-23T10:00:00Z',
+              mergeCommit: { oid: shaB },
+              statusCheckRollup: [{ name: 'pr-test', status: 'COMPLETED', conclusion: 'SUCCESS' }],
+            }),
+            stderr: '',
+          };
+        }
+        if (exec === 'gh' && args[0] === 'api' && args[1].includes('actions/runs')) {
+          // GitHub Actions API query for event=push returns empty array (no push workflow ran)
+          return {
+            status: 0,
+            stdout: JSON.stringify([]),
+            stderr: '',
+          };
+        }
+        return { status: 1, stdout: '', stderr: 'unknown command' };
+      });
+
+      const result = await observer.observeAndReconcileMergedPr({
+        repository: repo,
+        prNumber: prNum,
+        expectedPrHeadSha: shaA,
+        mergedMainSha: shaB,
+      });
+
+      expect(result.classification).toBe('MISSING_POST_MERGE_CI');
+      expect(result.isValid).toBe(false);
+      expect(result.failsClosed).toBe(true);
+      expect(result.mainPostMergeConclusion).toBeNull();
+      // PR head CI is NOT classified as missing because PR head CI succeeded
+      expect(isPrHeadCiMissing(result)).toBe(false);
+    });
+
+    it('fails closed in observer when Actions runs API returns runs for non-push event', async () => {
+      const store = createTestStore();
+      const observer = new GithubCiObserver(store, 'C:\\dummy-repo', undefined, async (exec, args) => {
+        if (exec === 'gh' && args[0] === 'pr' && args[1] === 'view') {
+          return {
+            status: 0,
+            stdout: JSON.stringify({
+              number: prNum,
+              isDraft: false,
+              headRefName: 'feature-branch',
+              headRefOid: shaA,
+              mergedAt: '2026-09-23T10:00:00Z',
+              mergeCommit: { oid: shaB },
+              statusCheckRollup: [{ name: 'pr-test', status: 'COMPLETED', conclusion: 'SUCCESS' }],
+            }),
+            stderr: '',
+          };
+        }
+        if (exec === 'gh' && args[0] === 'api' && args[1].includes('actions/runs')) {
+          return {
+            status: 0,
+            stdout: JSON.stringify([
+              {
+                id: 102,
+                name: 'pr-check-on-commit',
+                head_sha: shaB,
+                event: 'pull_request', // Non-push run must be rejected
+                status: 'completed',
+                conclusion: 'success',
+              },
+            ]),
+            stderr: '',
+          };
+        }
+        return { status: 1, stdout: '', stderr: 'unknown command' };
+      });
+
+      const result = await observer.observeAndReconcileMergedPr({
+        repository: repo,
+        prNumber: prNum,
+        expectedPrHeadSha: shaA,
+        mergedMainSha: shaB,
+      });
+
+      expect(result.classification).toBe('MISSING_POST_MERGE_CI');
+      expect(result.isValid).toBe(false);
+      expect(result.failsClosed).toBe(true);
+    });
+
+    it('handles full GitHub Actions API payload with workflow_runs wrapper and event=push', async () => {
+      const store = createTestStore();
+      const observer = new GithubCiObserver(store, 'C:\\dummy-repo', undefined, async (exec, args) => {
+        if (exec === 'gh' && args[0] === 'pr' && args[1] === 'view') {
+          return {
+            status: 0,
+            stdout: JSON.stringify({
+              number: prNum,
+              isDraft: false,
+              headRefName: 'feature-branch',
+              headRefOid: shaA,
+              mergedAt: '2026-09-23T10:00:00Z',
+              mergeCommit: { oid: shaB },
+              statusCheckRollup: [{ name: 'pr-test', status: 'COMPLETED', conclusion: 'SUCCESS' }],
+            }),
+            stderr: '',
+          };
+        }
+        if (exec === 'gh' && args[0] === 'api' && args[1].includes('actions/runs')) {
+          return {
+            status: 0,
+            stdout: JSON.stringify({
+              total_count: 1,
+              workflow_runs: [
+                {
+                  id: 999,
+                  name: 'ci-pipeline',
+                  head_sha: shaB,
+                  event: 'push',
+                  status: 'completed',
+                  conclusion: 'success',
+                  html_url: 'https://github.com/owner/repo/actions/runs/999',
+                },
+              ],
+            }),
+            stderr: '',
+          };
+        }
+        return { status: 1, stdout: '', stderr: 'unknown command' };
+      });
+
+      const result = await observer.observeAndReconcileMergedPr({
+        repository: repo,
+        prNumber: prNum,
+        expectedPrHeadSha: shaA,
+        mergedMainSha: shaB,
+      });
+
+      expect(result.classification).toBe('DIFFERENT_MERGE_SHA_PUSH_SUCCESS');
+      expect(result.isValid).toBe(true);
+      expect(result.failsClosed).toBe(false);
+      expect(result.mainPostMergeConclusion).toBe('SUCCESS');
     });
   });
 });

@@ -30,6 +30,8 @@ export interface GithubCheck {
   conclusion?: string | null;
   detailsUrl?: string | null;
   databaseId?: number | null;
+  event?: string | null;
+  headSha?: string | null;
 }
 
 export interface GithubPullRequest {
@@ -196,6 +198,48 @@ export function evaluateCiReconciliation(params: CiReconciliationParams): CiReco
       isValid: false,
       failsClosed: true,
       reason: `PR_HEAD_CI invalid event: expected "pull_request", observed "${prHeadEvent}"`,
+    };
+  }
+
+  // Rule 1b: PR head checks must be for pull_request event
+  if (params.prHeadChecks?.some((c) => c.event && c.event !== 'pull_request')) {
+    return {
+      repository: params.repository,
+      prNumber: params.prNumber,
+      prHeadSha,
+      mergedMainSha,
+      prHeadCiIdentity: prHeadIdentity,
+      prHeadEvent: 'pull_request',
+      prHeadConclusion: 'FAILURE',
+      mainPostMergeCiIdentity: mainPostMergeIdentity,
+      mainPostMergeEvent: 'push',
+      mainPostMergeConclusion: null,
+      classification: 'STALE_PR_HEAD_CI',
+      mergeIdentityType,
+      isValid: false,
+      failsClosed: true,
+      reason: 'PR head CI contains checks from non-pull_request event',
+    };
+  }
+
+  // Rule 1c: PR head checks must match exact expected head SHA
+  if (params.prHeadChecks?.some((c) => c.headSha && c.headSha.toLowerCase() !== prHeadSha)) {
+    return {
+      repository: params.repository,
+      prNumber: params.prNumber,
+      prHeadSha,
+      mergedMainSha,
+      prHeadCiIdentity: prHeadIdentity,
+      prHeadEvent: 'pull_request',
+      prHeadConclusion: 'FAILURE',
+      mainPostMergeCiIdentity: mainPostMergeIdentity,
+      mainPostMergeEvent: 'push',
+      mainPostMergeConclusion: null,
+      classification: 'STALE_PR_HEAD_CI',
+      mergeIdentityType,
+      isValid: false,
+      failsClosed: true,
+      reason: 'PR head CI contains checks for mismatched head SHA',
     };
   }
 
@@ -370,12 +414,19 @@ export function evaluateCiReconciliation(params: CiReconciliationParams): CiReco
     };
   }
 
-  // Case C: Actual missing post-merge CI
-  const hasPushChecks = params.mainPushChecks !== null &&
-    params.mainPushChecks !== undefined &&
-    params.mainPushChecks.length > 0;
+  // Do not accept pull_request check-runs or mismatched-SHA checks as post-merge main push evidence
+  const validPushChecks = params.mainPushChecks?.filter((check) => {
+    if (check.event && check.event !== 'push') return false;
+    if (check.headSha && mergedMainSha && check.headSha.toLowerCase() !== mergedMainSha) return false;
+    return true;
+  });
 
-  if (!hasPushChecks && params.mainPushConclusion === undefined) {
+  // Case C: Actual missing post-merge CI
+  const hasPushChecks = validPushChecks !== null &&
+    validPushChecks !== undefined &&
+    validPushChecks.length > 0;
+
+  if (!hasPushChecks && (params.mainPushConclusion === undefined || params.mainPushConclusion === null)) {
     return {
       repository: params.repository,
       prNumber: params.prNumber,
@@ -395,7 +446,7 @@ export function evaluateCiReconciliation(params: CiReconciliationParams): CiReco
     };
   }
 
-  const mainPushConclusion = params.mainPushConclusion ?? (params.mainPushChecks ? classifyChecks(params.mainPushChecks) : 'PENDING');
+  const mainPushConclusion = params.mainPushConclusion ?? (validPushChecks ? classifyChecks(validPushChecks) : 'PENDING');
 
   if (mainPushConclusion === 'FAILURE') {
     return {
@@ -688,15 +739,52 @@ export class GithubCiObserver {
 
     if (isMerged && mergedMainSha) {
       try {
-        const commitChecksResult = await this.command('gh', ['api', `repos/${params.repository}/commits/${mergedMainSha}/check-runs`, '--jq', '.check_runs'], this.controlRepo);
-        if (commitChecksResult.status === 0 && commitChecksResult.stdout.trim()) {
-          const rawRuns = parseJson<Array<{ name?: string; status?: string; conclusion?: string; html_url?: string }>>(commitChecksResult.stdout);
-          mainPushChecks = rawRuns.map((r) => ({
-            name: r.name,
-            status: r.status ? r.status.toUpperCase() : null,
-            conclusion: r.conclusion ? r.conclusion.toUpperCase() : null,
-            detailsUrl: r.html_url,
-          }));
+        const runsResult = await this.command(
+          'gh',
+          ['api', `repos/${params.repository}/actions/runs?head_sha=${mergedMainSha}&event=push`, '--jq', '.workflow_runs'],
+          this.controlRepo
+        );
+        if (runsResult.status === 0 && runsResult.stdout.trim()) {
+          const parsed = parseJson<unknown>(runsResult.stdout);
+          let rawRuns: Array<{
+            id?: number | null;
+            name?: string;
+            head_sha?: string;
+            headSha?: string;
+            event?: string;
+            status?: string | null;
+            conclusion?: string | null;
+            html_url?: string | null;
+            url?: string | null;
+          }> = [];
+          if (Array.isArray(parsed)) {
+            rawRuns = parsed;
+          } else if (parsed && typeof parsed === 'object' && Array.isArray((parsed as { workflow_runs?: unknown[] }).workflow_runs)) {
+            rawRuns = (parsed as { workflow_runs: typeof rawRuns }).workflow_runs;
+          }
+
+          // Exact-SHA push run evidence: require event=push and exact merged main SHA
+          const pushRuns = rawRuns.filter((r) => {
+            const event = r.event ?? 'push';
+            if (event !== 'push') return false;
+            const sha = (r.head_sha || r.headSha)?.toLowerCase();
+            if (sha && sha !== mergedMainSha.toLowerCase()) return false;
+            return true;
+          });
+
+          if (pushRuns.length > 0) {
+            mainPushChecks = pushRuns.map((r) => ({
+              name: r.name,
+              status: r.status ? r.status.toUpperCase() : null,
+              conclusion: r.conclusion ? r.conclusion.toUpperCase() : null,
+              detailsUrl: r.html_url ?? r.url ?? null,
+              databaseId: r.id ?? null,
+              event: 'push',
+              headSha: (r.head_sha || r.headSha)?.toLowerCase() ?? mergedMainSha.toLowerCase(),
+            }));
+          } else {
+            mainPushChecks = null;
+          }
         } else {
           mainPushChecks = null;
         }
