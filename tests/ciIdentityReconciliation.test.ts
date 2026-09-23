@@ -434,6 +434,45 @@ describe('CI Identity Reconciliation Semantics (TSK-CI-IDENTITY-RECONCILIATION)'
       expect(result.classification).toBe('SUPERSEDED_HEAD');
       expect(result.isValid).toBe(false);
       expect(result.failsClosed).toBe(true);
+      expect(result.prHeadConclusion).toBe('SUCCESS');
+    });
+
+    it('fails closed and derives PR_HEAD_CI conclusion FAILURE when head is superseded and supplied SUCCESS conflicts with qualifying FAILURE observation', () => {
+      const result = evaluateCiReconciliation({
+        repository: repo,
+        prNumber: prNum,
+        expectedPrHeadSha: shaA,
+        currentPrHeadOid: shaC, // PR branch has newer commit shaC
+        prHeadEvent: 'pull_request',
+        prHeadConclusion: 'SUCCESS', // Supplied SUCCESS must not override observed FAILURE
+        prHeadChecks: [
+          { name: 'test-failure', status: 'COMPLETED', conclusion: 'FAILURE', event: 'pull_request', headSha: shaA },
+        ],
+      });
+
+      expect(result.classification).toBe('SUPERSEDED_HEAD');
+      expect(result.isValid).toBe(false);
+      expect(result.failsClosed).toBe(true);
+      expect(result.prHeadConclusion).toBe('FAILURE');
+    });
+
+    it('fails closed and derives PR_HEAD_CI conclusion PENDING when head is superseded and supplied SUCCESS conflicts with qualifying PENDING observation', () => {
+      const result = evaluateCiReconciliation({
+        repository: repo,
+        prNumber: prNum,
+        expectedPrHeadSha: shaA,
+        currentPrHeadOid: shaC, // PR branch has newer commit shaC
+        prHeadEvent: 'pull_request',
+        prHeadConclusion: 'SUCCESS', // Supplied SUCCESS must not override observed PENDING
+        prHeadChecks: [
+          { name: 'test-pending', status: 'IN_PROGRESS', conclusion: null, event: 'pull_request', headSha: shaA },
+        ],
+      });
+
+      expect(result.classification).toBe('SUPERSEDED_HEAD');
+      expect(result.isValid).toBe(false);
+      expect(result.failsClosed).toBe(true);
+      expect(result.prHeadConclusion).toBe('PENDING');
     });
   });
 
@@ -1100,6 +1139,44 @@ describe('CI Identity Reconciliation Semantics (TSK-CI-IDENTITY-RECONCILIATION)'
 
       expect(result.prHeadConclusion).toBe('PENDING');
       expect(result.classification).toBe('PR_HEAD_FAILURE');
+      expect(result.isValid).toBe(false);
+      expect(result.failsClosed).toBe(true);
+    });
+
+    it('PR_HEAD_CI on superseded head: supplied SUCCESS does not override observed FAILURE evidence', () => {
+      const result = evaluateCiReconciliation({
+        repository: repo,
+        prNumber: prNum,
+        expectedPrHeadSha: shaA,
+        currentPrHeadOid: shaC,
+        prHeadEvent: 'pull_request',
+        prHeadConclusion: 'SUCCESS', // Contradictory supplied conclusion
+        prHeadChecks: [
+          { name: 'unit-test', status: 'COMPLETED', conclusion: 'FAILURE', event: 'pull_request', headSha: shaA },
+        ],
+      });
+
+      expect(result.prHeadConclusion).toBe('FAILURE');
+      expect(result.classification).toBe('SUPERSEDED_HEAD');
+      expect(result.isValid).toBe(false);
+      expect(result.failsClosed).toBe(true);
+    });
+
+    it('PR_HEAD_CI on superseded head: supplied SUCCESS does not override observed PENDING evidence', () => {
+      const result = evaluateCiReconciliation({
+        repository: repo,
+        prNumber: prNum,
+        expectedPrHeadSha: shaA,
+        currentPrHeadOid: shaC,
+        prHeadEvent: 'pull_request',
+        prHeadConclusion: 'SUCCESS', // Contradictory supplied conclusion
+        prHeadChecks: [
+          { name: 'build-job', status: 'IN_PROGRESS', conclusion: null, event: 'pull_request', headSha: shaA },
+        ],
+      });
+
+      expect(result.prHeadConclusion).toBe('PENDING');
+      expect(result.classification).toBe('SUPERSEDED_HEAD');
       expect(result.isValid).toBe(false);
       expect(result.failsClosed).toBe(true);
     });

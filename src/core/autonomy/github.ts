@@ -256,9 +256,34 @@ export function evaluateCiReconciliation(params: CiReconciliationParams): CiReco
     };
   }
 
+  // Qualifying PR-head runs require explicit event and exact SHA fields.
+  // Do not synthesize missing event or SHA provenance.
+  const qualifyingPrHeadChecks = params.prHeadChecks?.filter((check) =>
+    isQualifyingPrHeadCheck(check, prHeadSha)
+  ) ?? [];
+
+  // Derive PR_HEAD_CI conclusion from qualifying exact-event, exact-SHA runs;
+  // supplied conclusions must never override contradictory FAILURE or PENDING evidence.
+  let prHeadConclusion: CiConclusion | null = null;
+  if (qualifyingPrHeadChecks.length > 0) {
+    const observedPrHeadConclusion = classifyChecks(qualifyingPrHeadChecks);
+    if (observedPrHeadConclusion === 'FAILURE') {
+      prHeadConclusion = 'FAILURE';
+    } else if (observedPrHeadConclusion === 'PENDING') {
+      prHeadConclusion = params.prHeadConclusion === 'FAILURE' ? 'FAILURE' : 'PENDING';
+    } else if (params.prHeadConclusion === 'FAILURE' || params.prHeadConclusion === 'PENDING') {
+      prHeadConclusion = params.prHeadConclusion;
+    } else {
+      prHeadConclusion = observedPrHeadConclusion;
+    }
+  } else if (params.prHeadConclusion === 'FAILURE' || params.prHeadConclusion === 'PENDING') {
+    prHeadConclusion = params.prHeadConclusion;
+  } else {
+    prHeadConclusion = null;
+  }
+
   // Rule 2: Superseded head: if PR current head OID has moved beyond expected head SHA
   if (params.currentPrHeadOid && params.currentPrHeadOid.toLowerCase() !== prHeadSha) {
-    const prConclusion = params.prHeadConclusion ?? (params.prHeadChecks ? classifyChecks(params.prHeadChecks) : null);
     return {
       repository: params.repository,
       prNumber: params.prNumber,
@@ -266,7 +291,7 @@ export function evaluateCiReconciliation(params: CiReconciliationParams): CiReco
       mergedMainSha,
       prHeadCiIdentity: prHeadIdentity,
       prHeadEvent: 'pull_request',
-      prHeadConclusion: prConclusion,
+      prHeadConclusion,
       mainPostMergeCiIdentity: mainPostMergeIdentity,
       mainPostMergeEvent: 'push',
       mainPostMergeConclusion: null,
@@ -320,12 +345,6 @@ export function evaluateCiReconciliation(params: CiReconciliationParams): CiReco
     };
   }
 
-  // Qualifying PR-head runs require explicit event and exact SHA fields.
-  // Do not synthesize missing event or SHA provenance.
-  const qualifyingPrHeadChecks = params.prHeadChecks?.filter((check) =>
-    isQualifyingPrHeadCheck(check, prHeadSha)
-  ) ?? [];
-
   // A successful conclusion without at least one qualifying observed run must fail closed.
   if (qualifyingPrHeadChecks.length === 0) {
     return {
@@ -345,19 +364,6 @@ export function evaluateCiReconciliation(params: CiReconciliationParams): CiReco
       failsClosed: true,
       reason: 'PR head CI lacks qualifying Actions run evidence: explicit event "pull_request" and exact head SHA required; successful conclusion without qualifying observed run fails closed',
     };
-  }
-
-  // Classify PR-head checks from qualifying observed runs; supplied conclusions must never override contradictory FAILURE or PENDING evidence
-  const observedPrHeadConclusion = classifyChecks(qualifyingPrHeadChecks);
-  let prHeadConclusion: CiConclusion = observedPrHeadConclusion;
-  if (observedPrHeadConclusion === 'FAILURE') {
-    prHeadConclusion = 'FAILURE';
-  } else if (observedPrHeadConclusion === 'PENDING') {
-    prHeadConclusion = params.prHeadConclusion === 'FAILURE' ? 'FAILURE' : 'PENDING';
-  } else if (params.prHeadConclusion === 'FAILURE' || params.prHeadConclusion === 'PENDING') {
-    prHeadConclusion = params.prHeadConclusion;
-  } else {
-    prHeadConclusion = observedPrHeadConclusion;
   }
 
   if (prHeadConclusion === 'FAILURE') {
