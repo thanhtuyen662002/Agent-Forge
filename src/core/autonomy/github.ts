@@ -140,6 +140,7 @@ export interface CiReconciliationParams {
   prHeadChecks?: GithubCheck[];
   prHeadConclusion?: CiConclusion | null;
   mergedMainSha?: string | null;
+  observedMergedMainSha?: string | null;
   mainPushEvent?: string;
   mainPushChecks?: GithubCheck[] | null;
   mainPushConclusion?: CiConclusion | null;
@@ -346,8 +347,18 @@ export function evaluateCiReconciliation(params: CiReconciliationParams): CiReco
     };
   }
 
-  // Classify PR-head checks from qualifying observed runs
-  const prHeadConclusion = params.prHeadConclusion ?? classifyChecks(qualifyingPrHeadChecks);
+  // Classify PR-head checks from qualifying observed runs; supplied conclusions must never override contradictory FAILURE or PENDING evidence
+  const observedPrHeadConclusion = classifyChecks(qualifyingPrHeadChecks);
+  let prHeadConclusion: CiConclusion = observedPrHeadConclusion;
+  if (observedPrHeadConclusion === 'FAILURE') {
+    prHeadConclusion = 'FAILURE';
+  } else if (observedPrHeadConclusion === 'PENDING') {
+    prHeadConclusion = params.prHeadConclusion === 'FAILURE' ? 'FAILURE' : 'PENDING';
+  } else if (params.prHeadConclusion === 'FAILURE' || params.prHeadConclusion === 'PENDING') {
+    prHeadConclusion = params.prHeadConclusion;
+  } else {
+    prHeadConclusion = observedPrHeadConclusion;
+  }
 
   if (prHeadConclusion === 'FAILURE') {
     return {
@@ -429,6 +440,27 @@ export function evaluateCiReconciliation(params: CiReconciliationParams): CiReco
       isValid: false,
       failsClosed: true,
       reason: 'PR marked as merged but no merged main SHA available',
+    };
+  }
+
+  const observedMergedMainSha = params.observedMergedMainSha ? params.observedMergedMainSha.toLowerCase() : null;
+  if (mergedMainSha && observedMergedMainSha && mergedMainSha !== observedMergedMainSha) {
+    return {
+      repository: params.repository,
+      prNumber: params.prNumber,
+      prHeadSha,
+      mergedMainSha,
+      prHeadCiIdentity: prHeadIdentity,
+      prHeadEvent: 'pull_request',
+      prHeadConclusion,
+      mainPostMergeCiIdentity: mainPostMergeIdentity,
+      mainPostMergeEvent: 'push',
+      mainPostMergeConclusion: null,
+      classification: 'MISSING_POST_MERGE_CI',
+      mergeIdentityType,
+      isValid: false,
+      failsClosed: true,
+      reason: `Supplied mergedMainSha (${mergedMainSha}) does not match observed mergeCommit.oid (${observedMergedMainSha})`,
     };
   }
 
@@ -521,7 +553,18 @@ export function evaluateCiReconciliation(params: CiReconciliationParams): CiReco
     };
   }
 
-  const mainPushConclusion = params.mainPushConclusion ?? classifyChecks(qualifyingPushChecks);
+  // Classify post-merge main push checks from qualifying observed runs; supplied conclusions must never override contradictory FAILURE or PENDING evidence
+  const observedPushConclusion = classifyChecks(qualifyingPushChecks);
+  let mainPushConclusion: CiConclusion = observedPushConclusion;
+  if (observedPushConclusion === 'FAILURE') {
+    mainPushConclusion = 'FAILURE';
+  } else if (observedPushConclusion === 'PENDING') {
+    mainPushConclusion = params.mainPushConclusion === 'FAILURE' ? 'FAILURE' : 'PENDING';
+  } else if (params.mainPushConclusion === 'FAILURE' || params.mainPushConclusion === 'PENDING') {
+    mainPushConclusion = params.mainPushConclusion;
+  } else {
+    mainPushConclusion = observedPushConclusion;
+  }
 
   if (mainPushConclusion === 'FAILURE') {
     return {
@@ -857,6 +900,41 @@ export class GithubCiObserver {
     if (prResult.status !== 0) throw new Error(`GITHUB_PR_OBSERVE_FAILED: ${sanitizeAutonomyText(prResult.stderr || prResult.stdout)}`);
     const pr = parseJson<GithubPullRequest & { mergedAt?: string | null; mergeCommit?: { oid?: string } | null }>(prResult.stdout);
 
+    const observedMergeCommitOid = pr.mergeCommit?.oid ? pr.mergeCommit.oid.toLowerCase() : null;
+    const suppliedMergedMainSha = params.mergedMainSha ? params.mergedMainSha.toLowerCase() : null;
+
+    // Fence a supplied mergedMainSha against GitHub mergeCommit.oid:
+    // Fail closed before querying or persisting when both do not match.
+    if (suppliedMergedMainSha && observedMergeCommitOid && suppliedMergedMainSha !== observedMergeCommitOid) {
+      const prHeadSha = params.expectedPrHeadSha.toLowerCase();
+      const prHeadIdentity = buildPrHeadCiIdentity(params.repository, params.prNumber, prHeadSha);
+      const mainPostMergeIdentity = buildMainPostMergeCiIdentity(params.repository, suppliedMergedMainSha);
+      const mergeIdentityType = determineMergeIdentityType(prHeadSha, suppliedMergedMainSha);
+
+      const qualifyingPrRollup = (pr.statusCheckRollup ?? []).filter((c) =>
+        isQualifyingPrHeadCheck(c, params.expectedPrHeadSha)
+      );
+      const prHeadConclusion = qualifyingPrRollup.length > 0 ? classifyChecks(qualifyingPrRollup) : null;
+
+      return {
+        repository: params.repository,
+        prNumber: params.prNumber,
+        prHeadSha,
+        mergedMainSha: suppliedMergedMainSha,
+        prHeadCiIdentity: prHeadIdentity,
+        prHeadEvent: 'pull_request',
+        prHeadConclusion,
+        mainPostMergeCiIdentity: mainPostMergeIdentity,
+        mainPostMergeEvent: 'push',
+        mainPostMergeConclusion: null,
+        classification: 'MISSING_POST_MERGE_CI',
+        mergeIdentityType,
+        isValid: false,
+        failsClosed: true,
+        reason: `Supplied mergedMainSha (${suppliedMergedMainSha}) does not match GitHub mergeCommit.oid (${observedMergeCommitOid})`,
+      };
+    }
+
     const isMerged = Boolean(pr.mergedAt || params.mergedMainSha || pr.mergeCommit?.oid);
     const mergedMainSha = params.mergedMainSha ?? pr.mergeCommit?.oid ?? null;
 
@@ -910,6 +988,7 @@ export class GithubCiObserver {
       prHeadEvent: 'pull_request',
       prHeadChecks,
       mergedMainSha,
+      observedMergedMainSha: pr.mergeCommit?.oid ?? null,
       mainPushEvent: 'push',
       mainPushChecks,
       mainPushConclusion,
