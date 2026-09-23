@@ -1065,4 +1065,190 @@ describe('CI Identity Reconciliation Semantics (TSK-CI-IDENTITY-RECONCILIATION)'
       expect(result.mainPostMergeConclusion).toBe('SUCCESS');
     });
   });
+
+  describe('12. Contradiction tests: supplied SUCCESS must never override observed FAILURE or PENDING evidence', () => {
+    // Identity 1: PR_HEAD_CI
+    it('PR_HEAD_CI: supplied SUCCESS does not override observed FAILURE evidence', () => {
+      const result = evaluateCiReconciliation({
+        repository: repo,
+        prNumber: prNum,
+        expectedPrHeadSha: shaA,
+        prHeadEvent: 'pull_request',
+        prHeadConclusion: 'SUCCESS', // Contradictory supplied conclusion
+        prHeadChecks: [
+          { name: 'unit-test', status: 'COMPLETED', conclusion: 'FAILURE', event: 'pull_request', headSha: shaA },
+        ],
+      });
+
+      expect(result.prHeadConclusion).toBe('FAILURE');
+      expect(result.classification).toBe('PR_HEAD_FAILURE');
+      expect(result.isValid).toBe(false);
+      expect(result.failsClosed).toBe(true);
+    });
+
+    it('PR_HEAD_CI: supplied SUCCESS does not override observed PENDING evidence', () => {
+      const result = evaluateCiReconciliation({
+        repository: repo,
+        prNumber: prNum,
+        expectedPrHeadSha: shaA,
+        prHeadEvent: 'pull_request',
+        prHeadConclusion: 'SUCCESS', // Contradictory supplied conclusion
+        prHeadChecks: [
+          { name: 'build-job', status: 'IN_PROGRESS', conclusion: null, event: 'pull_request', headSha: shaA },
+        ],
+      });
+
+      expect(result.prHeadConclusion).toBe('PENDING');
+      expect(result.classification).toBe('PR_HEAD_FAILURE');
+      expect(result.isValid).toBe(false);
+      expect(result.failsClosed).toBe(true);
+    });
+
+    // Identity 2: MAIN_POST_MERGE_CI
+    it('MAIN_POST_MERGE_CI: supplied SUCCESS does not override observed FAILURE evidence', () => {
+      const result = evaluateCiReconciliation({
+        repository: repo,
+        prNumber: prNum,
+        expectedPrHeadSha: shaA,
+        prHeadEvent: 'pull_request',
+        prHeadChecks: [
+          { name: 'pr-test', status: 'COMPLETED', conclusion: 'SUCCESS', event: 'pull_request', headSha: shaA },
+        ],
+        mergedMainSha: shaB,
+        mainPushEvent: 'push',
+        mainPushConclusion: 'SUCCESS', // Contradictory supplied conclusion
+        mainPushChecks: [
+          { name: 'main-integration', status: 'COMPLETED', conclusion: 'FAILURE', event: 'push', headSha: shaB },
+        ],
+      });
+
+      expect(result.prHeadConclusion).toBe('SUCCESS');
+      expect(result.mainPostMergeConclusion).toBe('FAILURE');
+      expect(result.classification).toBe('POST_MERGE_PUSH_FAILURE');
+      expect(result.isValid).toBe(false);
+      expect(result.failsClosed).toBe(true);
+    });
+
+    it('MAIN_POST_MERGE_CI: supplied SUCCESS does not override observed PENDING evidence', () => {
+      const result = evaluateCiReconciliation({
+        repository: repo,
+        prNumber: prNum,
+        expectedPrHeadSha: shaA,
+        prHeadEvent: 'pull_request',
+        prHeadChecks: [
+          { name: 'pr-test', status: 'COMPLETED', conclusion: 'SUCCESS', event: 'pull_request', headSha: shaA },
+        ],
+        mergedMainSha: shaB,
+        mainPushEvent: 'push',
+        mainPushConclusion: 'SUCCESS', // Contradictory supplied conclusion
+        mainPushChecks: [
+          { name: 'main-integration', status: 'IN_PROGRESS', conclusion: null, event: 'push', headSha: shaB },
+        ],
+      });
+
+      expect(result.prHeadConclusion).toBe('SUCCESS');
+      expect(result.mainPostMergeConclusion).toBe('PENDING');
+      expect(result.classification).toBe('POST_MERGE_PUSH_PENDING');
+      expect(result.isValid).toBe(false);
+      expect(result.failsClosed).toBe(true);
+    });
+  });
+
+  describe('13. Fencing: supplied-versus-observed merge SHA mismatch fails closed before querying or persisting', () => {
+    function createTestStore(): AutonomyStore {
+      const db = new Database(':memory:');
+      return new AutonomyStore(db);
+    }
+
+    it('fails closed in observer before querying Actions runs or persisting to store when supplied mergedMainSha differs from GitHub mergeCommit.oid', async () => {
+      const store = createTestStore();
+      const commandCalls: Array<{ exec: string; args: string[] }> = [];
+
+      const observer = new GithubCiObserver(store, 'C:\\dummy-repo', undefined, async (exec, args) => {
+        commandCalls.push({ exec, args });
+        if (exec === 'gh' && args[0] === 'pr' && args[1] === 'view') {
+          return {
+            status: 0,
+            stdout: JSON.stringify({
+              number: prNum,
+              isDraft: false,
+              headRefName: 'feature-branch',
+              headRefOid: shaA,
+              mergedAt: '2026-09-23T10:00:00Z',
+              mergeCommit: { oid: shaB }, // GitHub observed merge commit is shaB
+              statusCheckRollup: [
+                { name: 'pr-test', status: 'COMPLETED', conclusion: 'SUCCESS', event: 'pull_request', headSha: shaA },
+              ],
+            }),
+            stderr: '',
+          };
+        }
+        if (exec === 'gh' && args[0] === 'api' && args[1].includes('actions/runs')) {
+          // Should NOT be reached if fenced before querying!
+          return {
+            status: 0,
+            stdout: JSON.stringify([
+              { id: 301, name: 'run', event: 'push', head_sha: shaC, status: 'completed', conclusion: 'success' },
+            ]),
+            stderr: '',
+          };
+        }
+        return { status: 1, stdout: '', stderr: 'unknown command' };
+      });
+
+      // Pass shaC as supplied mergedMainSha, which does NOT match GitHub mergeCommit.oid (shaB)
+      const result = await observer.observeAndReconcileMergedPr({
+        repository: repo,
+        prNumber: prNum,
+        expectedPrHeadSha: shaA,
+        mergedMainSha: shaC,
+      });
+
+      // 1. Result fails closed
+      expect(result.isValid).toBe(false);
+      expect(result.failsClosed).toBe(true);
+      expect(result.classification).toBe('MISSING_POST_MERGE_CI');
+      expect(result.reason).toContain('does not match GitHub mergeCommit.oid');
+      expect(result.reason).toContain(shaC);
+      expect(result.reason).toContain(shaB);
+
+      // 2. Fails closed BEFORE querying: no actions/runs API calls were executed
+      const actionsRunQueries = commandCalls.filter((c) => c.args.some((a) => a.includes('actions/runs')));
+      expect(actionsRunQueries.length).toBe(0);
+
+      // 3. Fails closed BEFORE persisting: nothing was persisted to AutonomyStore
+      const persistedByPr = store.getCiReconciliationByPr(repo, prNum);
+      expect(persistedByPr).toBeNull();
+
+      const persistedByHead = store.findCiReconciliationsByHeadSha(shaA);
+      expect(persistedByHead.length).toBe(0);
+
+      const persistedByMain = store.findCiReconciliationsByMainSha(shaC);
+      expect(persistedByMain.length).toBe(0);
+    });
+
+    it('fails closed in evaluateCiReconciliation when observedMergedMainSha differs from mergedMainSha', () => {
+      const result = evaluateCiReconciliation({
+        repository: repo,
+        prNumber: prNum,
+        expectedPrHeadSha: shaA,
+        prHeadEvent: 'pull_request',
+        prHeadChecks: [
+          { name: 'pr-test', status: 'COMPLETED', conclusion: 'SUCCESS', event: 'pull_request', headSha: shaA },
+        ],
+        mergedMainSha: shaB,
+        observedMergedMainSha: shaC, // Mismatch with mergedMainSha
+        mainPushEvent: 'push',
+        mainPushChecks: [
+          { name: 'push-test', status: 'COMPLETED', conclusion: 'SUCCESS', event: 'push', headSha: shaB },
+        ],
+      });
+
+      expect(result.isValid).toBe(false);
+      expect(result.failsClosed).toBe(true);
+      expect(result.classification).toBe('MISSING_POST_MERGE_CI');
+      expect(result.reason).toContain('does not match observed mergeCommit.oid');
+    });
+  });
 });
+
