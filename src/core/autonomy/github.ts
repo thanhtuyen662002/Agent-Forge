@@ -164,6 +164,18 @@ export interface CiReconciliationResult {
   reason?: string;
 }
 
+export function isQualifyingPrHeadCheck(check: GithubCheck, expectedPrHeadSha: string): boolean {
+  if (!check.event || check.event !== 'pull_request') return false;
+  if (!check.headSha || check.headSha.toLowerCase() !== expectedPrHeadSha.toLowerCase()) return false;
+  return true;
+}
+
+export function isQualifyingMainPushCheck(check: GithubCheck, mergedMainSha: string): boolean {
+  if (!check.event || check.event !== 'push') return false;
+  if (!check.headSha || check.headSha.toLowerCase() !== mergedMainSha.toLowerCase()) return false;
+  return true;
+}
+
 export function evaluateCiReconciliation(params: CiReconciliationParams): CiReconciliationResult {
   const prHeadSha = params.expectedPrHeadSha.toLowerCase();
   const prHeadEvent = params.prHeadEvent ?? 'pull_request';
@@ -307,8 +319,35 @@ export function evaluateCiReconciliation(params: CiReconciliationParams): CiReco
     };
   }
 
-  // Classify PR-head checks
-  const prHeadConclusion = params.prHeadConclusion ?? (params.prHeadChecks ? classifyChecks(params.prHeadChecks) : 'PENDING');
+  // Qualifying PR-head runs require explicit event and exact SHA fields.
+  // Do not synthesize missing event or SHA provenance.
+  const qualifyingPrHeadChecks = params.prHeadChecks?.filter((check) =>
+    isQualifyingPrHeadCheck(check, prHeadSha)
+  ) ?? [];
+
+  // A successful conclusion without at least one qualifying observed run must fail closed.
+  if (qualifyingPrHeadChecks.length === 0) {
+    return {
+      repository: params.repository,
+      prNumber: params.prNumber,
+      prHeadSha,
+      mergedMainSha,
+      prHeadCiIdentity: prHeadIdentity,
+      prHeadEvent: 'pull_request',
+      prHeadConclusion: null,
+      mainPostMergeCiIdentity: mainPostMergeIdentity,
+      mainPostMergeEvent: 'push',
+      mainPostMergeConclusion: null,
+      classification: 'STALE_PR_HEAD_CI',
+      mergeIdentityType,
+      isValid: false,
+      failsClosed: true,
+      reason: 'PR head CI lacks qualifying Actions run evidence: explicit event "pull_request" and exact head SHA required; successful conclusion without qualifying observed run fails closed',
+    };
+  }
+
+  // Classify PR-head checks from qualifying observed runs
+  const prHeadConclusion = params.prHeadConclusion ?? classifyChecks(qualifyingPrHeadChecks);
 
   if (prHeadConclusion === 'FAILURE') {
     return {
@@ -414,19 +453,8 @@ export function evaluateCiReconciliation(params: CiReconciliationParams): CiReco
     };
   }
 
-  // Do not accept pull_request check-runs or mismatched-SHA checks as post-merge main push evidence
-  const validPushChecks = params.mainPushChecks?.filter((check) => {
-    if (check.event && check.event !== 'push') return false;
-    if (check.headSha && mergedMainSha && check.headSha.toLowerCase() !== mergedMainSha) return false;
-    return true;
-  });
-
-  // Case C: Actual missing post-merge CI
-  const hasPushChecks = validPushChecks !== null &&
-    validPushChecks !== undefined &&
-    validPushChecks.length > 0;
-
-  if (!hasPushChecks && (params.mainPushConclusion === undefined || params.mainPushConclusion === null)) {
+  // Do not accept non-push checks or mismatched-SHA checks as post-merge main push evidence
+  if (params.mainPushChecks?.some((c) => c.event && c.event !== 'push')) {
     return {
       repository: params.repository,
       prNumber: params.prNumber,
@@ -442,11 +470,58 @@ export function evaluateCiReconciliation(params: CiReconciliationParams): CiReco
       mergeIdentityType,
       isValid: false,
       failsClosed: true,
-      reason: `Missing post-merge CI for push event at main SHA ${mergedMainSha}`,
+      reason: 'Post-merge main push CI contains checks from non-push event',
     };
   }
 
-  const mainPushConclusion = params.mainPushConclusion ?? (validPushChecks ? classifyChecks(validPushChecks) : 'PENDING');
+  if (params.mainPushChecks?.some((c) => c.headSha && c.headSha.toLowerCase() !== mergedMainSha)) {
+    return {
+      repository: params.repository,
+      prNumber: params.prNumber,
+      prHeadSha,
+      mergedMainSha,
+      prHeadCiIdentity: prHeadIdentity,
+      prHeadEvent: 'pull_request',
+      prHeadConclusion: 'SUCCESS',
+      mainPostMergeCiIdentity: mainPostMergeIdentity,
+      mainPostMergeEvent: 'push',
+      mainPostMergeConclusion: null,
+      classification: 'MISSING_POST_MERGE_CI',
+      mergeIdentityType,
+      isValid: false,
+      failsClosed: true,
+      reason: `Post-merge main push CI contains checks for mismatched SHA (expected ${mergedMainSha})`,
+    };
+  }
+
+  // Qualifying main post-merge push runs require explicit event and exact SHA fields.
+  // Do not synthesize missing event or SHA provenance.
+  const qualifyingPushChecks = params.mainPushChecks?.filter((check) =>
+    isQualifyingMainPushCheck(check, mergedMainSha)
+  ) ?? [];
+
+  // A successful conclusion without at least one qualifying observed run must fail closed.
+  if (qualifyingPushChecks.length === 0) {
+    return {
+      repository: params.repository,
+      prNumber: params.prNumber,
+      prHeadSha,
+      mergedMainSha,
+      prHeadCiIdentity: prHeadIdentity,
+      prHeadEvent: 'pull_request',
+      prHeadConclusion: 'SUCCESS',
+      mainPostMergeCiIdentity: mainPostMergeIdentity,
+      mainPostMergeEvent: 'push',
+      mainPostMergeConclusion: null,
+      classification: 'MISSING_POST_MERGE_CI',
+      mergeIdentityType,
+      isValid: false,
+      failsClosed: true,
+      reason: `Missing qualifying post-merge CI for push event at main SHA ${mergedMainSha}: explicit event "push" and exact main SHA required; successful conclusion without qualifying observed run fails closed`,
+    };
+  }
+
+  const mainPushConclusion = params.mainPushConclusion ?? classifyChecks(qualifyingPushChecks);
 
   if (mainPushConclusion === 'FAILURE') {
     return {
@@ -721,6 +796,57 @@ export class GithubCiObserver {
     return result;
   }
 
+  async queryActionsRuns(
+    repository: string,
+    headSha: string,
+    event: 'pull_request' | 'push'
+  ): Promise<GithubCheck[]> {
+    const runsResult = await this.command(
+      'gh',
+      ['api', `repos/${repository}/actions/runs?head_sha=${headSha}&event=${event}`, '--jq', '.workflow_runs'],
+      this.controlRepo
+    );
+    if (runsResult.status !== 0 || !runsResult.stdout.trim()) {
+      return [];
+    }
+    const parsed = parseJson<unknown>(runsResult.stdout);
+    let rawRuns: Array<{
+      id?: number | null;
+      name?: string;
+      head_sha?: string;
+      headSha?: string;
+      event?: string;
+      status?: string | null;
+      conclusion?: string | null;
+      html_url?: string | null;
+      url?: string | null;
+    }> = [];
+    if (Array.isArray(parsed)) {
+      rawRuns = parsed;
+    } else if (parsed && typeof parsed === 'object' && Array.isArray((parsed as { workflow_runs?: unknown[] }).workflow_runs)) {
+      rawRuns = (parsed as { workflow_runs: typeof rawRuns }).workflow_runs;
+    }
+
+    // Require explicit event and exact SHA fields for both PR-head and post-merge Actions run evidence.
+    // Do not synthesize missing event or SHA provenance.
+    const qualifying = rawRuns.filter((r) => {
+      if (!r.event || r.event !== event) return false;
+      const sha = (r.head_sha || r.headSha)?.toLowerCase();
+      if (!sha || sha !== headSha.toLowerCase()) return false;
+      return true;
+    });
+
+    return qualifying.map((r) => ({
+      name: r.name,
+      status: r.status ? r.status.toUpperCase() : null,
+      conclusion: r.conclusion ? r.conclusion.toUpperCase() : null,
+      detailsUrl: r.html_url ?? r.url ?? null,
+      databaseId: r.id ?? null,
+      event: r.event!,
+      headSha: (r.head_sha || r.headSha)!.toLowerCase(),
+    }));
+  }
+
   async observeAndReconcileMergedPr(params: {
     repository: string;
     prNumber: number;
@@ -734,59 +860,41 @@ export class GithubCiObserver {
     const isMerged = Boolean(pr.mergedAt || params.mergedMainSha || pr.mergeCommit?.oid);
     const mergedMainSha = params.mergedMainSha ?? pr.mergeCommit?.oid ?? null;
 
+    // Obtain PR-head Actions run evidence:
+    // Check if statusCheckRollup already contains qualifying PR-head runs
+    let prHeadChecks: GithubCheck[] = [];
+    const qualifyingPrRollup = (pr.statusCheckRollup ?? []).filter((c) =>
+      isQualifyingPrHeadCheck(c, params.expectedPrHeadSha)
+    );
+
+    if (qualifyingPrRollup.length > 0) {
+      prHeadChecks = qualifyingPrRollup;
+    } else {
+      // Query exact-SHA GitHub Actions evidence where needed; do not synthesize missing event or SHA provenance
+      try {
+        const prRuns = await this.queryActionsRuns(params.repository, params.expectedPrHeadSha, 'pull_request');
+        if (prRuns.length > 0) {
+          prHeadChecks = prRuns;
+        } else {
+          prHeadChecks = pr.statusCheckRollup ?? [];
+        }
+      } catch {
+        prHeadChecks = pr.statusCheckRollup ?? [];
+      }
+    }
+
     let mainPushChecks: GithubCheck[] | null = null;
     let mainPushConclusion: CiConclusion | null = null;
 
     if (isMerged && mergedMainSha) {
       try {
-        const runsResult = await this.command(
-          'gh',
-          ['api', `repos/${params.repository}/actions/runs?head_sha=${mergedMainSha}&event=push`, '--jq', '.workflow_runs'],
-          this.controlRepo
-        );
-        if (runsResult.status === 0 && runsResult.stdout.trim()) {
-          const parsed = parseJson<unknown>(runsResult.stdout);
-          let rawRuns: Array<{
-            id?: number | null;
-            name?: string;
-            head_sha?: string;
-            headSha?: string;
-            event?: string;
-            status?: string | null;
-            conclusion?: string | null;
-            html_url?: string | null;
-            url?: string | null;
-          }> = [];
-          if (Array.isArray(parsed)) {
-            rawRuns = parsed;
-          } else if (parsed && typeof parsed === 'object' && Array.isArray((parsed as { workflow_runs?: unknown[] }).workflow_runs)) {
-            rawRuns = (parsed as { workflow_runs: typeof rawRuns }).workflow_runs;
-          }
-
-          // Exact-SHA push run evidence: require event=push and exact merged main SHA
-          const pushRuns = rawRuns.filter((r) => {
-            const event = r.event ?? 'push';
-            if (event !== 'push') return false;
-            const sha = (r.head_sha || r.headSha)?.toLowerCase();
-            if (sha && sha !== mergedMainSha.toLowerCase()) return false;
-            return true;
-          });
-
-          if (pushRuns.length > 0) {
-            mainPushChecks = pushRuns.map((r) => ({
-              name: r.name,
-              status: r.status ? r.status.toUpperCase() : null,
-              conclusion: r.conclusion ? r.conclusion.toUpperCase() : null,
-              detailsUrl: r.html_url ?? r.url ?? null,
-              databaseId: r.id ?? null,
-              event: 'push',
-              headSha: (r.head_sha || r.headSha)?.toLowerCase() ?? mergedMainSha.toLowerCase(),
-            }));
-          } else {
-            mainPushChecks = null;
-          }
+        const pushRuns = await this.queryActionsRuns(params.repository, mergedMainSha, 'push');
+        if (pushRuns.length > 0) {
+          mainPushChecks = pushRuns;
         } else {
-          mainPushChecks = null;
+          // If query returned no qualifying runs (e.g. non-push, wrong SHA, or missing provenance),
+          // do NOT synthesize missing event or SHA provenance. An empty list ensures fail-closed.
+          mainPushChecks = [];
         }
       } catch {
         mainPushChecks = null;
@@ -800,7 +908,7 @@ export class GithubCiObserver {
       observedPrHeadSha: pr.headRefOid,
       currentPrHeadOid: pr.headRefOid,
       prHeadEvent: 'pull_request',
-      prHeadChecks: pr.statusCheckRollup ?? [],
+      prHeadChecks,
       mergedMainSha,
       mainPushEvent: 'push',
       mainPushChecks,
