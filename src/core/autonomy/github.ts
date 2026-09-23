@@ -1,10 +1,26 @@
 import path from 'path';
 import { ManagerReview, SelfHostTask, WorkOrder, sanitizeAutonomyText } from './contracts';
-import { AutonomyCiWatch, AutonomyStore } from './store';
+import {
+  AutonomyCiReconciliation,
+  AutonomyCiWatch,
+  AutonomyStore,
+  CiIdentityType,
+  CiReconciliationClassification,
+  MergeIdentityType,
+  RecordCiReconciliationInput,
+} from './store';
 import { CodexManagerAdapter, ProviderRun } from './providers';
 import { ProcessRunner } from '../services/ProcessRunner';
 import { Repository } from '../database/repositories';
 import { ManagerProviderPool, buildManagerContextPackage } from './managerPool';
+
+export type {
+  CiIdentityType,
+  MergeIdentityType,
+  CiReconciliationClassification,
+  AutonomyCiReconciliation,
+  RecordCiReconciliationInput,
+};
 
 export type CiConclusion = 'PENDING' | 'SUCCESS' | 'FAILURE';
 
@@ -54,7 +70,7 @@ function nextPoll(attempt: number): string {
   return new Date(Date.now() + seconds * 1000).toISOString();
 }
 
-function classifyChecks(checks: GithubCheck[] | undefined): CiConclusion {
+export function classifyChecks(checks: GithubCheck[] | undefined): CiConclusion {
   if (!checks?.length) return 'PENDING';
   if (checks.some((check) => check.status !== 'COMPLETED' && check.conclusion !== 'SUCCESS')) return 'PENDING';
   if (checks.some((check) => failureConclusions.has(String(check.conclusion ?? '').toUpperCase()))) return 'FAILURE';
@@ -67,6 +83,401 @@ export function extractWorkflowRunId(url: string | null | undefined): string | n
 }
 
 export const runId = extractWorkflowRunId;
+
+export function buildPrHeadCiIdentity(repository: string, prNumber: number, prHeadSha: string): string {
+  if (!/^[0-9a-f]{40}$/i.test(prHeadSha)) {
+    throw new Error('CONTRACT_INVALID: expected PR head must be a Git SHA');
+  }
+  return `PR_HEAD_CI:${repository}#${prNumber}@${prHeadSha.toLowerCase()}`;
+}
+
+export function buildMainPostMergeCiIdentity(repository: string, mergedMainSha: string): string {
+  if (!/^[0-9a-f]{40}$/i.test(mergedMainSha)) {
+    throw new Error('CONTRACT_INVALID: merged main SHA must be a Git SHA');
+  }
+  return `MAIN_POST_MERGE_CI:${repository}@${mergedMainSha.toLowerCase()}`;
+}
+
+export function isValidPrHeadCiEvent(event: string): boolean {
+  return event === 'pull_request';
+}
+
+export function isValidMainPostMergeCiEvent(event: string): boolean {
+  return event === 'push';
+}
+
+export function determineMergeIdentityType(prHeadSha: string, mergedMainSha: string): 'SQUASH' | 'LINEAR_HISTORY' {
+  return prHeadSha.toLowerCase() === mergedMainSha.toLowerCase() ? 'LINEAR_HISTORY' : 'SQUASH';
+}
+
+export function isPrHeadCiMissing(reconciliation: {
+  reconciliation_classification?: string;
+  classification?: string;
+  pr_head_conclusion?: string | null;
+  prHeadConclusion?: string | null;
+}): boolean {
+  const classification = reconciliation.reconciliation_classification ?? reconciliation.classification;
+  if (
+    classification === 'DIFFERENT_MERGE_SHA_PUSH_SUCCESS' ||
+    classification === 'LINEAR_HISTORY_MERGE_PUSH_SUCCESS' ||
+    classification === 'PR_HEAD_SUCCESS'
+  ) {
+    return false;
+  }
+  const conclusion = reconciliation.pr_head_conclusion ?? reconciliation.prHeadConclusion;
+  return conclusion === null || conclusion === undefined;
+}
+
+export interface CiReconciliationParams {
+  repository: string;
+  prNumber: number;
+  expectedPrHeadSha: string;
+  observedPrHeadSha?: string;
+  currentPrHeadOid?: string;
+  prHeadEvent?: string;
+  prHeadChecks?: GithubCheck[];
+  prHeadConclusion?: CiConclusion | null;
+  mergedMainSha?: string | null;
+  mainPushEvent?: string;
+  mainPushChecks?: GithubCheck[] | null;
+  mainPushConclusion?: CiConclusion | null;
+  isMerged?: boolean;
+}
+
+export interface CiReconciliationResult {
+  repository: string;
+  prNumber: number;
+  prHeadSha: string;
+  mergedMainSha: string | null;
+  prHeadCiIdentity: string;
+  prHeadEvent: 'pull_request';
+  prHeadConclusion: CiConclusion | null;
+  mainPostMergeCiIdentity: string | null;
+  mainPostMergeEvent: 'push';
+  mainPostMergeConclusion: CiConclusion | null;
+  classification: CiReconciliationClassification;
+  mergeIdentityType: MergeIdentityType;
+  isValid: boolean;
+  failsClosed: boolean;
+  reason?: string;
+}
+
+export function evaluateCiReconciliation(params: CiReconciliationParams): CiReconciliationResult {
+  const prHeadSha = params.expectedPrHeadSha.toLowerCase();
+  const prHeadEvent = params.prHeadEvent ?? 'pull_request';
+  const mainPushEvent = params.mainPushEvent ?? 'push';
+  const prHeadIdentity = buildPrHeadCiIdentity(params.repository, params.prNumber, prHeadSha);
+
+  const mergedMainSha = params.mergedMainSha ? params.mergedMainSha.toLowerCase() : null;
+  const mainPostMergeIdentity = mergedMainSha
+    ? buildMainPostMergeCiIdentity(params.repository, mergedMainSha)
+    : null;
+
+  const isMerged = Boolean(params.isMerged || mergedMainSha);
+  const mergeIdentityType: MergeIdentityType = mergedMainSha
+    ? determineMergeIdentityType(prHeadSha, mergedMainSha)
+    : 'NONE';
+
+  // Rule 1: PR_HEAD_CI is valid only for event pull_request at exact PR head SHA
+  if (prHeadEvent !== 'pull_request') {
+    return {
+      repository: params.repository,
+      prNumber: params.prNumber,
+      prHeadSha,
+      mergedMainSha,
+      prHeadCiIdentity: prHeadIdentity,
+      prHeadEvent: 'pull_request',
+      prHeadConclusion: 'FAILURE',
+      mainPostMergeCiIdentity: mainPostMergeIdentity,
+      mainPostMergeEvent: 'push',
+      mainPostMergeConclusion: null,
+      classification: 'STALE_PR_HEAD_CI',
+      mergeIdentityType,
+      isValid: false,
+      failsClosed: true,
+      reason: `PR_HEAD_CI invalid event: expected "pull_request", observed "${prHeadEvent}"`,
+    };
+  }
+
+  // Rule 2: Superseded head: if PR current head OID has moved beyond expected head SHA
+  if (params.currentPrHeadOid && params.currentPrHeadOid.toLowerCase() !== prHeadSha) {
+    const prConclusion = params.prHeadConclusion ?? (params.prHeadChecks ? classifyChecks(params.prHeadChecks) : null);
+    return {
+      repository: params.repository,
+      prNumber: params.prNumber,
+      prHeadSha,
+      mergedMainSha,
+      prHeadCiIdentity: prHeadIdentity,
+      prHeadEvent: 'pull_request',
+      prHeadConclusion: prConclusion,
+      mainPostMergeCiIdentity: mainPostMergeIdentity,
+      mainPostMergeEvent: 'push',
+      mainPostMergeConclusion: null,
+      classification: 'SUPERSEDED_HEAD',
+      mergeIdentityType,
+      isValid: false,
+      failsClosed: true,
+      reason: `PR head superseded: expected ${prHeadSha}, current PR head is ${params.currentPrHeadOid.toLowerCase()}`,
+    };
+  }
+
+  // Rule 3: Stale PR-head evidence: if observed PR head SHA differs from expected head SHA
+  if (params.observedPrHeadSha && params.observedPrHeadSha.toLowerCase() !== prHeadSha) {
+    return {
+      repository: params.repository,
+      prNumber: params.prNumber,
+      prHeadSha,
+      mergedMainSha,
+      prHeadCiIdentity: prHeadIdentity,
+      prHeadEvent: 'pull_request',
+      prHeadConclusion: 'FAILURE',
+      mainPostMergeCiIdentity: mainPostMergeIdentity,
+      mainPostMergeEvent: 'push',
+      mainPostMergeConclusion: null,
+      classification: 'STALE_PR_HEAD_CI',
+      mergeIdentityType,
+      isValid: false,
+      failsClosed: true,
+      reason: `PR head SHA mismatch: expected ${prHeadSha}, observed ${params.observedPrHeadSha.toLowerCase()}`,
+    };
+  }
+
+  // Rule 4: Stale check checks: check if any check conclusion is STALE
+  if (params.prHeadChecks?.some((c) => String(c.conclusion ?? '').toUpperCase() === 'STALE')) {
+    return {
+      repository: params.repository,
+      prNumber: params.prNumber,
+      prHeadSha,
+      mergedMainSha,
+      prHeadCiIdentity: prHeadIdentity,
+      prHeadEvent: 'pull_request',
+      prHeadConclusion: 'FAILURE',
+      mainPostMergeCiIdentity: mainPostMergeIdentity,
+      mainPostMergeEvent: 'push',
+      mainPostMergeConclusion: null,
+      classification: 'STALE_PR_HEAD_CI',
+      mergeIdentityType,
+      isValid: false,
+      failsClosed: true,
+      reason: 'PR head CI contains stale checks',
+    };
+  }
+
+  // Classify PR-head checks
+  const prHeadConclusion = params.prHeadConclusion ?? (params.prHeadChecks ? classifyChecks(params.prHeadChecks) : 'PENDING');
+
+  if (prHeadConclusion === 'FAILURE') {
+    return {
+      repository: params.repository,
+      prNumber: params.prNumber,
+      prHeadSha,
+      mergedMainSha,
+      prHeadCiIdentity: prHeadIdentity,
+      prHeadEvent: 'pull_request',
+      prHeadConclusion,
+      mainPostMergeCiIdentity: mainPostMergeIdentity,
+      mainPostMergeEvent: 'push',
+      mainPostMergeConclusion: null,
+      classification: 'PR_HEAD_FAILURE',
+      mergeIdentityType,
+      isValid: false,
+      failsClosed: true,
+      reason: 'PR head CI failed',
+    };
+  }
+
+  if (prHeadConclusion === 'PENDING') {
+    return {
+      repository: params.repository,
+      prNumber: params.prNumber,
+      prHeadSha,
+      mergedMainSha,
+      prHeadCiIdentity: prHeadIdentity,
+      prHeadEvent: 'pull_request',
+      prHeadConclusion,
+      mainPostMergeCiIdentity: mainPostMergeIdentity,
+      mainPostMergeEvent: 'push',
+      mainPostMergeConclusion: null,
+      classification: 'PR_HEAD_FAILURE',
+      mergeIdentityType,
+      isValid: false,
+      failsClosed: true,
+      reason: 'PR head CI is pending',
+    };
+  }
+
+  // At this point, PR-head CI succeeded!
+  // Case A: Not merged yet
+  if (!isMerged) {
+    return {
+      repository: params.repository,
+      prNumber: params.prNumber,
+      prHeadSha,
+      mergedMainSha: null,
+      prHeadCiIdentity: prHeadIdentity,
+      prHeadEvent: 'pull_request',
+      prHeadConclusion: 'SUCCESS',
+      mainPostMergeCiIdentity: null,
+      mainPostMergeEvent: 'push',
+      mainPostMergeConclusion: null,
+      classification: 'PR_HEAD_SUCCESS',
+      mergeIdentityType: 'NONE',
+      isValid: true,
+      failsClosed: false,
+      reason: 'PR head CI succeeded for pull_request event at exact head SHA',
+    };
+  }
+
+  // Case B: Merged, but merged main SHA is missing
+  if (!mergedMainSha) {
+    return {
+      repository: params.repository,
+      prNumber: params.prNumber,
+      prHeadSha,
+      mergedMainSha: null,
+      prHeadCiIdentity: prHeadIdentity,
+      prHeadEvent: 'pull_request',
+      prHeadConclusion: 'SUCCESS',
+      mainPostMergeCiIdentity: null,
+      mainPostMergeEvent: 'push',
+      mainPostMergeConclusion: null,
+      classification: 'MISSING_POST_MERGE_CI',
+      mergeIdentityType: 'NONE',
+      isValid: false,
+      failsClosed: true,
+      reason: 'PR marked as merged but no merged main SHA available',
+    };
+  }
+
+  // Rule 5: MAIN_POST_MERGE_CI is valid only for event push at the exact resulting main SHA
+  if (mainPushEvent !== 'push') {
+    return {
+      repository: params.repository,
+      prNumber: params.prNumber,
+      prHeadSha,
+      mergedMainSha,
+      prHeadCiIdentity: prHeadIdentity,
+      prHeadEvent: 'pull_request',
+      prHeadConclusion: 'SUCCESS',
+      mainPostMergeCiIdentity: mainPostMergeIdentity,
+      mainPostMergeEvent: 'push',
+      mainPostMergeConclusion: null,
+      classification: 'MISSING_POST_MERGE_CI',
+      mergeIdentityType,
+      isValid: false,
+      failsClosed: true,
+      reason: `MAIN_POST_MERGE_CI invalid event: expected "push", observed "${mainPushEvent}"`,
+    };
+  }
+
+  // Case C: Actual missing post-merge CI
+  const hasPushChecks = params.mainPushChecks !== null &&
+    params.mainPushChecks !== undefined &&
+    params.mainPushChecks.length > 0;
+
+  if (!hasPushChecks && params.mainPushConclusion === undefined) {
+    return {
+      repository: params.repository,
+      prNumber: params.prNumber,
+      prHeadSha,
+      mergedMainSha,
+      prHeadCiIdentity: prHeadIdentity,
+      prHeadEvent: 'pull_request',
+      prHeadConclusion: 'SUCCESS',
+      mainPostMergeCiIdentity: mainPostMergeIdentity,
+      mainPostMergeEvent: 'push',
+      mainPostMergeConclusion: null,
+      classification: 'MISSING_POST_MERGE_CI',
+      mergeIdentityType,
+      isValid: false,
+      failsClosed: true,
+      reason: `Missing post-merge CI for push event at main SHA ${mergedMainSha}`,
+    };
+  }
+
+  const mainPushConclusion = params.mainPushConclusion ?? (params.mainPushChecks ? classifyChecks(params.mainPushChecks) : 'PENDING');
+
+  if (mainPushConclusion === 'FAILURE') {
+    return {
+      repository: params.repository,
+      prNumber: params.prNumber,
+      prHeadSha,
+      mergedMainSha,
+      prHeadCiIdentity: prHeadIdentity,
+      prHeadEvent: 'pull_request',
+      prHeadConclusion: 'SUCCESS',
+      mainPostMergeCiIdentity: mainPostMergeIdentity,
+      mainPostMergeEvent: 'push',
+      mainPostMergeConclusion: 'FAILURE',
+      classification: 'POST_MERGE_PUSH_FAILURE',
+      mergeIdentityType,
+      isValid: false,
+      failsClosed: true,
+      reason: `Post-merge main push CI failed at ${mergedMainSha}`,
+    };
+  }
+
+  if (mainPushConclusion === 'PENDING') {
+    return {
+      repository: params.repository,
+      prNumber: params.prNumber,
+      prHeadSha,
+      mergedMainSha,
+      prHeadCiIdentity: prHeadIdentity,
+      prHeadEvent: 'pull_request',
+      prHeadConclusion: 'SUCCESS',
+      mainPostMergeCiIdentity: mainPostMergeIdentity,
+      mainPostMergeEvent: 'push',
+      mainPostMergeConclusion: 'PENDING',
+      classification: 'POST_MERGE_PUSH_PENDING',
+      mergeIdentityType,
+      isValid: false,
+      failsClosed: true,
+      reason: `Post-merge main push CI pending at ${mergedMainSha}`,
+    };
+  }
+
+  // Post-merge push CI SUCCEEDED!
+  // Case D: Squash or linear-history merge
+  if (mergeIdentityType === 'SQUASH') {
+    return {
+      repository: params.repository,
+      prNumber: params.prNumber,
+      prHeadSha,
+      mergedMainSha,
+      prHeadCiIdentity: prHeadIdentity,
+      prHeadEvent: 'pull_request',
+      prHeadConclusion: 'SUCCESS',
+      mainPostMergeCiIdentity: mainPostMergeIdentity,
+      mainPostMergeEvent: 'push',
+      mainPostMergeConclusion: 'SUCCESS',
+      classification: 'DIFFERENT_MERGE_SHA_PUSH_SUCCESS',
+      mergeIdentityType: 'SQUASH',
+      isValid: true,
+      failsClosed: false,
+      reason: `Squash merge produced distinct main SHA ${mergedMainSha} with successful push CI; PR-head CI preserved at ${prHeadSha}`,
+    };
+  }
+
+  // Linear history merge
+  return {
+    repository: params.repository,
+    prNumber: params.prNumber,
+    prHeadSha,
+    mergedMainSha,
+    prHeadCiIdentity: prHeadIdentity,
+    prHeadEvent: 'pull_request',
+    prHeadConclusion: 'SUCCESS',
+    mainPostMergeCiIdentity: mainPostMergeIdentity,
+    mainPostMergeEvent: 'push',
+    mainPostMergeConclusion: 'SUCCESS',
+    classification: 'LINEAR_HISTORY_MERGE_PUSH_SUCCESS',
+    mergeIdentityType: 'LINEAR_HISTORY',
+    isValid: true,
+    failsClosed: false,
+    reason: `Linear-history merge preserved head SHA ${prHeadSha} on main with successful push CI; PR_HEAD_CI and MAIN_POST_MERGE_CI are distinct durable identities`,
+  };
+}
 
 export class GithubCiObserver {
   private readonly managerPool?: ManagerProviderPool;
@@ -233,5 +644,80 @@ export class GithubCiObserver {
     this.store.updateState(row.id, 'CI_WAIT', row.lease_epoch);
     this.store.event(row.id, 'CI_REPAIR_PUSHED', { headSha: newHead, branch: watch.branch });
     return newHead;
+  }
+
+  reconcileCiIdentities(params: CiReconciliationParams): CiReconciliationResult {
+    const result = evaluateCiReconciliation(params);
+    this.store.recordCiReconciliation({
+      repository: result.repository,
+      prNumber: result.prNumber,
+      prHeadSha: result.prHeadSha,
+      mergedMainSha: result.mergedMainSha,
+      prHeadCiIdentity: result.prHeadCiIdentity,
+      prHeadEvent: 'pull_request',
+      prHeadConclusion: result.prHeadConclusion,
+      mainPostMergeCiIdentity: result.mainPostMergeCiIdentity,
+      mainPostMergeEvent: 'push',
+      mainPostMergeConclusion: result.mainPostMergeConclusion,
+      reconciliationClassification: result.classification,
+      mergeIdentityType: result.mergeIdentityType,
+      details: {
+        isValid: result.isValid,
+        failsClosed: result.failsClosed,
+        reason: result.reason,
+      },
+    });
+    return result;
+  }
+
+  async observeAndReconcileMergedPr(params: {
+    repository: string;
+    prNumber: number;
+    expectedPrHeadSha: string;
+    mergedMainSha?: string;
+  }): Promise<CiReconciliationResult> {
+    const prResult = await this.command('gh', ['pr', 'view', String(params.prNumber), '--repo', params.repository, '--json', 'number,isDraft,headRefName,headRefOid,mergedAt,mergeCommit,statusCheckRollup'], this.controlRepo);
+    if (prResult.status !== 0) throw new Error(`GITHUB_PR_OBSERVE_FAILED: ${sanitizeAutonomyText(prResult.stderr || prResult.stdout)}`);
+    const pr = parseJson<GithubPullRequest & { mergedAt?: string | null; mergeCommit?: { oid?: string } | null }>(prResult.stdout);
+
+    const isMerged = Boolean(pr.mergedAt || params.mergedMainSha || pr.mergeCommit?.oid);
+    const mergedMainSha = params.mergedMainSha ?? pr.mergeCommit?.oid ?? null;
+
+    let mainPushChecks: GithubCheck[] | null = null;
+    let mainPushConclusion: CiConclusion | null = null;
+
+    if (isMerged && mergedMainSha) {
+      try {
+        const commitChecksResult = await this.command('gh', ['api', `repos/${params.repository}/commits/${mergedMainSha}/check-runs`, '--jq', '.check_runs'], this.controlRepo);
+        if (commitChecksResult.status === 0 && commitChecksResult.stdout.trim()) {
+          const rawRuns = parseJson<Array<{ name?: string; status?: string; conclusion?: string; html_url?: string }>>(commitChecksResult.stdout);
+          mainPushChecks = rawRuns.map((r) => ({
+            name: r.name,
+            status: r.status ? r.status.toUpperCase() : null,
+            conclusion: r.conclusion ? r.conclusion.toUpperCase() : null,
+            detailsUrl: r.html_url,
+          }));
+        } else {
+          mainPushChecks = null;
+        }
+      } catch {
+        mainPushChecks = null;
+      }
+    }
+
+    return this.reconcileCiIdentities({
+      repository: params.repository,
+      prNumber: params.prNumber,
+      expectedPrHeadSha: params.expectedPrHeadSha,
+      observedPrHeadSha: pr.headRefOid,
+      currentPrHeadOid: pr.headRefOid,
+      prHeadEvent: 'pull_request',
+      prHeadChecks: pr.statusCheckRollup ?? [],
+      mergedMainSha,
+      mainPushEvent: 'push',
+      mainPushChecks,
+      mainPushConclusion,
+      isMerged,
+    });
   }
 }
