@@ -178,8 +178,8 @@ describe('CI Identity Reconciliation Semantics (TSK-CI-IDENTITY-RECONCILIATION)'
         expectedPrHeadSha: shaA,
         prHeadEvent: 'pull_request',
         prHeadChecks: [
-          { name: 'test', status: 'COMPLETED', conclusion: 'SUCCESS' },
-          { name: 'build', status: 'COMPLETED', conclusion: 'SUCCESS' },
+          { name: 'test', status: 'COMPLETED', conclusion: 'SUCCESS', event: 'pull_request', headSha: shaA },
+          { name: 'build', status: 'COMPLETED', conclusion: 'SUCCESS', event: 'pull_request', headSha: shaA },
         ],
       });
 
@@ -197,10 +197,10 @@ describe('CI Identity Reconciliation Semantics (TSK-CI-IDENTITY-RECONCILIATION)'
   describe('4. Evaluation: A different merged SHA with successful push CI (Squash merge)', () => {
     it('reconciles squash merge without classifying PR-head CI as missing', () => {
       const prChecks: GithubCheck[] = [
-        { name: 'pr-test', status: 'COMPLETED', conclusion: 'SUCCESS' },
+        { name: 'pr-test', status: 'COMPLETED', conclusion: 'SUCCESS', event: 'pull_request', headSha: shaA },
       ];
       const mainChecks: GithubCheck[] = [
-        { name: 'main-build', status: 'COMPLETED', conclusion: 'SUCCESS' },
+        { name: 'main-build', status: 'COMPLETED', conclusion: 'SUCCESS', event: 'push', headSha: shaB },
       ];
 
       const result = evaluateCiReconciliation({
@@ -231,10 +231,10 @@ describe('CI Identity Reconciliation Semantics (TSK-CI-IDENTITY-RECONCILIATION)'
   describe('5. Evaluation: Linear-history merge with successful push CI', () => {
     it('reconciles linear history merge preserving distinct identities for PR and main', () => {
       const prChecks: GithubCheck[] = [
-        { name: 'ci/unit', status: 'COMPLETED', conclusion: 'SUCCESS' },
+        { name: 'ci/unit', status: 'COMPLETED', conclusion: 'SUCCESS', event: 'pull_request', headSha: shaA },
       ];
       const mainChecks: GithubCheck[] = [
-        { name: 'ci/deploy-check', status: 'COMPLETED', conclusion: 'SUCCESS' },
+        { name: 'ci/deploy-check', status: 'COMPLETED', conclusion: 'SUCCESS', event: 'push', headSha: shaA },
       ];
 
       const result = evaluateCiReconciliation({
@@ -268,7 +268,7 @@ describe('CI Identity Reconciliation Semantics (TSK-CI-IDENTITY-RECONCILIATION)'
         prNumber: prNum,
         expectedPrHeadSha: shaA,
         prHeadEvent: 'pull_request',
-        prHeadChecks: [{ name: 'test', status: 'COMPLETED', conclusion: 'SUCCESS' }],
+        prHeadChecks: [{ name: 'test', status: 'COMPLETED', conclusion: 'SUCCESS', event: 'pull_request', headSha: shaA }],
         mergedMainSha: shaB,
         mainPushEvent: 'push',
         mainPushChecks: null, // No post-merge push checks found
@@ -290,10 +290,10 @@ describe('CI Identity Reconciliation Semantics (TSK-CI-IDENTITY-RECONCILIATION)'
         prNumber: prNum,
         expectedPrHeadSha: shaA,
         prHeadEvent: 'pull_request',
-        prHeadChecks: [{ name: 'test', status: 'COMPLETED', conclusion: 'SUCCESS' }],
+        prHeadChecks: [{ name: 'test', status: 'COMPLETED', conclusion: 'SUCCESS', event: 'pull_request', headSha: shaA }],
         mergedMainSha: shaB,
         mainPushEvent: 'pull_request', // Invalid for post-merge main CI
-        mainPushChecks: [{ name: 'test', status: 'COMPLETED', conclusion: 'SUCCESS' }],
+        mainPushChecks: [{ name: 'test', status: 'COMPLETED', conclusion: 'SUCCESS', event: 'push', headSha: shaB }],
       });
 
       expect(result.classification).toBe('MISSING_POST_MERGE_CI');
@@ -307,11 +307,11 @@ describe('CI Identity Reconciliation Semantics (TSK-CI-IDENTITY-RECONCILIATION)'
         prNumber: prNum,
         expectedPrHeadSha: shaA,
         prHeadEvent: 'pull_request',
-        prHeadChecks: [{ name: 'test', status: 'COMPLETED', conclusion: 'SUCCESS' }],
+        prHeadChecks: [{ name: 'test', status: 'COMPLETED', conclusion: 'SUCCESS', event: 'pull_request', headSha: shaA }],
         mergedMainSha: shaB,
         mainPushEvent: 'push',
         mainPushChecks: [
-          { name: 'pr-check', status: 'COMPLETED', conclusion: 'SUCCESS', event: 'pull_request' },
+          { name: 'pr-check', status: 'COMPLETED', conclusion: 'SUCCESS', event: 'pull_request', headSha: shaB },
         ],
       });
 
@@ -326,7 +326,7 @@ describe('CI Identity Reconciliation Semantics (TSK-CI-IDENTITY-RECONCILIATION)'
         prNumber: prNum,
         expectedPrHeadSha: shaA,
         prHeadEvent: 'pull_request',
-        prHeadChecks: [{ name: 'test', status: 'COMPLETED', conclusion: 'SUCCESS' }],
+        prHeadChecks: [{ name: 'test', status: 'COMPLETED', conclusion: 'SUCCESS', event: 'pull_request', headSha: shaA }],
         mergedMainSha: shaB,
         mainPushEvent: 'push',
         mainPushChecks: [
@@ -348,7 +348,7 @@ describe('CI Identity Reconciliation Semantics (TSK-CI-IDENTITY-RECONCILIATION)'
         expectedPrHeadSha: shaA,
         observedPrHeadSha: shaB, // Stale/mismatched observed head
         prHeadEvent: 'pull_request',
-        prHeadChecks: [{ name: 'test', status: 'COMPLETED', conclusion: 'SUCCESS' }],
+        prHeadChecks: [{ name: 'test', status: 'COMPLETED', conclusion: 'SUCCESS', event: 'pull_request', headSha: shaA }],
       });
 
       expect(result.classification).toBe('STALE_PR_HEAD_CI');
@@ -363,8 +363,8 @@ describe('CI Identity Reconciliation Semantics (TSK-CI-IDENTITY-RECONCILIATION)'
         expectedPrHeadSha: shaA,
         prHeadEvent: 'pull_request',
         prHeadChecks: [
-          { name: 'unit', status: 'COMPLETED', conclusion: 'SUCCESS' },
-          { name: 'lint', status: 'COMPLETED', conclusion: 'STALE' },
+          { name: 'unit', status: 'COMPLETED', conclusion: 'SUCCESS', event: 'pull_request', headSha: shaA },
+          { name: 'lint', status: 'COMPLETED', conclusion: 'STALE', event: 'pull_request', headSha: shaA },
         ],
       });
 
@@ -379,7 +379,7 @@ describe('CI Identity Reconciliation Semantics (TSK-CI-IDENTITY-RECONCILIATION)'
         prNumber: prNum,
         expectedPrHeadSha: shaA,
         prHeadEvent: 'push', // Invalid event for PR_HEAD_CI
-        prHeadChecks: [{ name: 'test', status: 'COMPLETED', conclusion: 'SUCCESS' }],
+        prHeadChecks: [{ name: 'test', status: 'COMPLETED', conclusion: 'SUCCESS', event: 'pull_request', headSha: shaA }],
       });
 
       expect(result.classification).toBe('STALE_PR_HEAD_CI');
@@ -394,7 +394,7 @@ describe('CI Identity Reconciliation Semantics (TSK-CI-IDENTITY-RECONCILIATION)'
         expectedPrHeadSha: shaA,
         prHeadEvent: 'pull_request',
         prHeadChecks: [
-          { name: 'push-check-on-pr', status: 'COMPLETED', conclusion: 'SUCCESS', event: 'push' },
+          { name: 'push-check-on-pr', status: 'COMPLETED', conclusion: 'SUCCESS', event: 'push', headSha: shaA },
         ],
       });
 
@@ -428,7 +428,7 @@ describe('CI Identity Reconciliation Semantics (TSK-CI-IDENTITY-RECONCILIATION)'
         expectedPrHeadSha: shaA,
         currentPrHeadOid: shaC, // PR branch has newer commit shaC
         prHeadEvent: 'pull_request',
-        prHeadChecks: [{ name: 'test', status: 'COMPLETED', conclusion: 'SUCCESS' }],
+        prHeadChecks: [{ name: 'test', status: 'COMPLETED', conclusion: 'SUCCESS', event: 'pull_request', headSha: shaA }],
       });
 
       expect(result.classification).toBe('SUPERSEDED_HEAD');
@@ -516,7 +516,7 @@ describe('CI Identity Reconciliation Semantics (TSK-CI-IDENTITY-RECONCILIATION)'
               headRefOid: shaA,
               mergedAt: '2026-09-23T10:00:00Z',
               mergeCommit: { oid: shaB },
-              statusCheckRollup: [{ name: 'pr-test', status: 'COMPLETED', conclusion: 'SUCCESS' }],
+              statusCheckRollup: [{ name: 'pr-test', status: 'COMPLETED', conclusion: 'SUCCESS', event: 'pull_request', headSha: shaA }],
             }),
             stderr: '',
           };
@@ -525,7 +525,7 @@ describe('CI Identity Reconciliation Semantics (TSK-CI-IDENTITY-RECONCILIATION)'
           return {
             status: 0,
             stdout: JSON.stringify([
-              { name: 'main-push-test', status: 'completed', conclusion: 'success', html_url: 'https://ci.example/1' },
+              { name: 'main-push-test', status: 'completed', conclusion: 'success', html_url: 'https://ci.example/1', event: 'push', head_sha: shaB },
             ]),
             stderr: '',
           };
@@ -568,7 +568,7 @@ describe('CI Identity Reconciliation Semantics (TSK-CI-IDENTITY-RECONCILIATION)'
               headRefOid: shaA,
               mergedAt: '2026-09-23T10:00:00Z',
               mergeCommit: { oid: shaB },
-              statusCheckRollup: [{ name: 'pr-test', status: 'COMPLETED', conclusion: 'SUCCESS' }],
+              statusCheckRollup: [{ name: 'pr-test', status: 'COMPLETED', conclusion: 'SUCCESS', event: 'pull_request', headSha: shaA }],
             }),
             stderr: '',
           };
@@ -612,7 +612,7 @@ describe('CI Identity Reconciliation Semantics (TSK-CI-IDENTITY-RECONCILIATION)'
               headRefOid: shaA,
               mergedAt: '2026-09-23T10:00:00Z',
               mergeCommit: { oid: shaB },
-              statusCheckRollup: [{ name: 'pr-test', status: 'COMPLETED', conclusion: 'SUCCESS' }],
+              statusCheckRollup: [{ name: 'pr-test', status: 'COMPLETED', conclusion: 'SUCCESS', event: 'pull_request', headSha: shaA }],
             }),
             stderr: '',
           };
@@ -661,7 +661,7 @@ describe('CI Identity Reconciliation Semantics (TSK-CI-IDENTITY-RECONCILIATION)'
               headRefOid: shaA,
               mergedAt: '2026-09-23T10:00:00Z',
               mergeCommit: { oid: shaB },
-              statusCheckRollup: [{ name: 'pr-test', status: 'COMPLETED', conclusion: 'SUCCESS' }],
+              statusCheckRollup: [{ name: 'pr-test', status: 'COMPLETED', conclusion: 'SUCCESS', event: 'pull_request', headSha: shaA }],
             }),
             stderr: '',
           };
@@ -699,6 +699,369 @@ describe('CI Identity Reconciliation Semantics (TSK-CI-IDENTITY-RECONCILIATION)'
       expect(result.classification).toBe('DIFFERENT_MERGE_SHA_PUSH_SUCCESS');
       expect(result.isValid).toBe(true);
       expect(result.failsClosed).toBe(false);
+      expect(result.mainPostMergeConclusion).toBe('SUCCESS');
+    });
+  });
+
+  describe('10. Fail-closed provenance enforcement: missing event, missing SHA, both missing, conclusion-only', () => {
+    // A. PR-head checks
+    it('fails closed on PR-head when event is missing from check', () => {
+      const result = evaluateCiReconciliation({
+        repository: repo,
+        prNumber: prNum,
+        expectedPrHeadSha: shaA,
+        prHeadEvent: 'pull_request',
+        prHeadChecks: [{ name: 'test', status: 'COMPLETED', conclusion: 'SUCCESS', headSha: shaA }], // missing event
+      });
+
+      expect(result.classification).toBe('STALE_PR_HEAD_CI');
+      expect(result.isValid).toBe(false);
+      expect(result.failsClosed).toBe(true);
+      expect(result.prHeadConclusion).toBeNull();
+    });
+
+    it('fails closed on PR-head when head SHA is missing from check', () => {
+      const result = evaluateCiReconciliation({
+        repository: repo,
+        prNumber: prNum,
+        expectedPrHeadSha: shaA,
+        prHeadEvent: 'pull_request',
+        prHeadChecks: [{ name: 'test', status: 'COMPLETED', conclusion: 'SUCCESS', event: 'pull_request' }], // missing headSha
+      });
+
+      expect(result.classification).toBe('STALE_PR_HEAD_CI');
+      expect(result.isValid).toBe(false);
+      expect(result.failsClosed).toBe(true);
+      expect(result.prHeadConclusion).toBeNull();
+    });
+
+    it('fails closed on PR-head when both event and head SHA are missing from check', () => {
+      const result = evaluateCiReconciliation({
+        repository: repo,
+        prNumber: prNum,
+        expectedPrHeadSha: shaA,
+        prHeadEvent: 'pull_request',
+        prHeadChecks: [{ name: 'test', status: 'COMPLETED', conclusion: 'SUCCESS' }], // both missing
+      });
+
+      expect(result.classification).toBe('STALE_PR_HEAD_CI');
+      expect(result.isValid).toBe(false);
+      expect(result.failsClosed).toBe(true);
+      expect(result.prHeadConclusion).toBeNull();
+    });
+
+    it('fails closed when PR-head has conclusion-only success without qualifying observed runs', () => {
+      const result = evaluateCiReconciliation({
+        repository: repo,
+        prNumber: prNum,
+        expectedPrHeadSha: shaA,
+        prHeadEvent: 'pull_request',
+        prHeadConclusion: 'SUCCESS', // Conclusion-only success
+        prHeadChecks: [], // No qualifying runs
+      });
+
+      expect(result.classification).toBe('STALE_PR_HEAD_CI');
+      expect(result.isValid).toBe(false);
+      expect(result.failsClosed).toBe(true);
+      expect(result.prHeadConclusion).toBeNull();
+    });
+
+    // B. Post-merge main push checks
+    it('fails closed on post-merge when event is missing from push check', () => {
+      const result = evaluateCiReconciliation({
+        repository: repo,
+        prNumber: prNum,
+        expectedPrHeadSha: shaA,
+        prHeadEvent: 'pull_request',
+        prHeadChecks: [{ name: 'test', status: 'COMPLETED', conclusion: 'SUCCESS', event: 'pull_request', headSha: shaA }],
+        mergedMainSha: shaB,
+        mainPushEvent: 'push',
+        mainPushChecks: [{ name: 'push-test', status: 'COMPLETED', conclusion: 'SUCCESS', headSha: shaB }], // missing event
+      });
+
+      expect(result.classification).toBe('MISSING_POST_MERGE_CI');
+      expect(result.isValid).toBe(false);
+      expect(result.failsClosed).toBe(true);
+      expect(result.mainPostMergeConclusion).toBeNull();
+      expect(isPrHeadCiMissing(result)).toBe(false);
+    });
+
+    it('fails closed on post-merge when head SHA is missing from push check', () => {
+      const result = evaluateCiReconciliation({
+        repository: repo,
+        prNumber: prNum,
+        expectedPrHeadSha: shaA,
+        prHeadEvent: 'pull_request',
+        prHeadChecks: [{ name: 'test', status: 'COMPLETED', conclusion: 'SUCCESS', event: 'pull_request', headSha: shaA }],
+        mergedMainSha: shaB,
+        mainPushEvent: 'push',
+        mainPushChecks: [{ name: 'push-test', status: 'COMPLETED', conclusion: 'SUCCESS', event: 'push' }], // missing headSha
+      });
+
+      expect(result.classification).toBe('MISSING_POST_MERGE_CI');
+      expect(result.isValid).toBe(false);
+      expect(result.failsClosed).toBe(true);
+      expect(result.mainPostMergeConclusion).toBeNull();
+      expect(isPrHeadCiMissing(result)).toBe(false);
+    });
+
+    it('fails closed on post-merge when both event and head SHA are missing from push check', () => {
+      const result = evaluateCiReconciliation({
+        repository: repo,
+        prNumber: prNum,
+        expectedPrHeadSha: shaA,
+        prHeadEvent: 'pull_request',
+        prHeadChecks: [{ name: 'test', status: 'COMPLETED', conclusion: 'SUCCESS', event: 'pull_request', headSha: shaA }],
+        mergedMainSha: shaB,
+        mainPushEvent: 'push',
+        mainPushChecks: [{ name: 'push-test', status: 'COMPLETED', conclusion: 'SUCCESS' }], // both missing
+      });
+
+      expect(result.classification).toBe('MISSING_POST_MERGE_CI');
+      expect(result.isValid).toBe(false);
+      expect(result.failsClosed).toBe(true);
+      expect(result.mainPostMergeConclusion).toBeNull();
+      expect(isPrHeadCiMissing(result)).toBe(false);
+    });
+
+    it('fails closed when post-merge has conclusion-only success without qualifying observed runs', () => {
+      const result = evaluateCiReconciliation({
+        repository: repo,
+        prNumber: prNum,
+        expectedPrHeadSha: shaA,
+        prHeadEvent: 'pull_request',
+        prHeadChecks: [{ name: 'test', status: 'COMPLETED', conclusion: 'SUCCESS', event: 'pull_request', headSha: shaA }],
+        mergedMainSha: shaB,
+        mainPushEvent: 'push',
+        mainPushConclusion: 'SUCCESS', // Conclusion-only success
+        mainPushChecks: [], // No qualifying runs
+      });
+
+      expect(result.classification).toBe('MISSING_POST_MERGE_CI');
+      expect(result.isValid).toBe(false);
+      expect(result.failsClosed).toBe(true);
+      expect(result.mainPostMergeConclusion).toBeNull();
+      expect(isPrHeadCiMissing(result)).toBe(false);
+    });
+  });
+
+  describe('11. Fail-closed in GithubCiObserver: Provenance enforcement in Actions API queries', () => {
+    function createTestStore(): AutonomyStore {
+      const db = new Database(':memory:');
+      return new AutonomyStore(db);
+    }
+
+    it('fails closed in observer when post-merge Actions run is missing event (no synthesis)', async () => {
+      const store = createTestStore();
+      const observer = new GithubCiObserver(store, 'C:\\dummy-repo', undefined, async (exec, args) => {
+        if (exec === 'gh' && args[0] === 'pr' && args[1] === 'view') {
+          return {
+            status: 0,
+            stdout: JSON.stringify({
+              number: prNum,
+              isDraft: false,
+              headRefName: 'feature-branch',
+              headRefOid: shaA,
+              mergedAt: '2026-09-23T10:00:00Z',
+              mergeCommit: { oid: shaB },
+              statusCheckRollup: [{ name: 'pr-test', status: 'COMPLETED', conclusion: 'SUCCESS', event: 'pull_request', headSha: shaA }],
+            }),
+            stderr: '',
+          };
+        }
+        if (exec === 'gh' && args[0] === 'api' && args[1].includes('actions/runs')) {
+          return {
+            status: 0,
+            stdout: JSON.stringify([
+              {
+                id: 101,
+                name: 'push-run-missing-event',
+                head_sha: shaB,
+                status: 'completed',
+                conclusion: 'success',
+                // event is intentionally absent!
+              },
+            ]),
+            stderr: '',
+          };
+        }
+        return { status: 1, stdout: '', stderr: 'unknown command' };
+      });
+
+      const result = await observer.observeAndReconcileMergedPr({
+        repository: repo,
+        prNumber: prNum,
+        expectedPrHeadSha: shaA,
+        mergedMainSha: shaB,
+      });
+
+      expect(result.classification).toBe('MISSING_POST_MERGE_CI');
+      expect(result.isValid).toBe(false);
+      expect(result.failsClosed).toBe(true);
+    });
+
+    it('fails closed in observer when post-merge Actions run is missing head SHA (no synthesis)', async () => {
+      const store = createTestStore();
+      const observer = new GithubCiObserver(store, 'C:\\dummy-repo', undefined, async (exec, args) => {
+        if (exec === 'gh' && args[0] === 'pr' && args[1] === 'view') {
+          return {
+            status: 0,
+            stdout: JSON.stringify({
+              number: prNum,
+              isDraft: false,
+              headRefName: 'feature-branch',
+              headRefOid: shaA,
+              mergedAt: '2026-09-23T10:00:00Z',
+              mergeCommit: { oid: shaB },
+              statusCheckRollup: [{ name: 'pr-test', status: 'COMPLETED', conclusion: 'SUCCESS', event: 'pull_request', headSha: shaA }],
+            }),
+            stderr: '',
+          };
+        }
+        if (exec === 'gh' && args[0] === 'api' && args[1].includes('actions/runs')) {
+          return {
+            status: 0,
+            stdout: JSON.stringify([
+              {
+                id: 102,
+                name: 'push-run-missing-sha',
+                event: 'push',
+                status: 'completed',
+                conclusion: 'success',
+                // head_sha is intentionally absent!
+              },
+            ]),
+            stderr: '',
+          };
+        }
+        return { status: 1, stdout: '', stderr: 'unknown command' };
+      });
+
+      const result = await observer.observeAndReconcileMergedPr({
+        repository: repo,
+        prNumber: prNum,
+        expectedPrHeadSha: shaA,
+        mergedMainSha: shaB,
+      });
+
+      expect(result.classification).toBe('MISSING_POST_MERGE_CI');
+      expect(result.isValid).toBe(false);
+      expect(result.failsClosed).toBe(true);
+    });
+
+    it('fails closed in observer when post-merge Actions run has both event and head SHA missing', async () => {
+      const store = createTestStore();
+      const observer = new GithubCiObserver(store, 'C:\\dummy-repo', undefined, async (exec, args) => {
+        if (exec === 'gh' && args[0] === 'pr' && args[1] === 'view') {
+          return {
+            status: 0,
+            stdout: JSON.stringify({
+              number: prNum,
+              isDraft: false,
+              headRefName: 'feature-branch',
+              headRefOid: shaA,
+              mergedAt: '2026-09-23T10:00:00Z',
+              mergeCommit: { oid: shaB },
+              statusCheckRollup: [{ name: 'pr-test', status: 'COMPLETED', conclusion: 'SUCCESS', event: 'pull_request', headSha: shaA }],
+            }),
+            stderr: '',
+          };
+        }
+        if (exec === 'gh' && args[0] === 'api' && args[1].includes('actions/runs')) {
+          return {
+            status: 0,
+            stdout: JSON.stringify([
+              {
+                id: 103,
+                name: 'push-run-both-missing',
+                status: 'completed',
+                conclusion: 'success',
+              },
+            ]),
+            stderr: '',
+          };
+        }
+        return { status: 1, stdout: '', stderr: 'unknown command' };
+      });
+
+      const result = await observer.observeAndReconcileMergedPr({
+        repository: repo,
+        prNumber: prNum,
+        expectedPrHeadSha: shaA,
+        mergedMainSha: shaB,
+      });
+
+      expect(result.classification).toBe('MISSING_POST_MERGE_CI');
+      expect(result.isValid).toBe(false);
+      expect(result.failsClosed).toBe(true);
+    });
+
+    it('queries exact-SHA PR-head Actions runs when statusCheckRollup lacks provenance and reconciles successfully', async () => {
+      const store = createTestStore();
+      const observer = new GithubCiObserver(store, 'C:\\dummy-repo', undefined, async (exec, args) => {
+        if (exec === 'gh' && args[0] === 'pr' && args[1] === 'view') {
+          return {
+            status: 0,
+            stdout: JSON.stringify({
+              number: prNum,
+              isDraft: false,
+              headRefName: 'feature-branch',
+              headRefOid: shaA,
+              mergedAt: '2026-09-23T10:00:00Z',
+              mergeCommit: { oid: shaB },
+              statusCheckRollup: [], // statusCheckRollup is empty or lacks provenance
+            }),
+            stderr: '',
+          };
+        }
+        if (exec === 'gh' && args[0] === 'api' && args[1].includes(shaA)) {
+          // PR-head exact-SHA query
+          return {
+            status: 0,
+            stdout: JSON.stringify([
+              {
+                id: 201,
+                name: 'pr-exact-sha-run',
+                event: 'pull_request',
+                head_sha: shaA,
+                status: 'completed',
+                conclusion: 'success',
+              },
+            ]),
+            stderr: '',
+          };
+        }
+        if (exec === 'gh' && args[0] === 'api' && args[1].includes(shaB)) {
+          // Post-merge exact-SHA query
+          return {
+            status: 0,
+            stdout: JSON.stringify([
+              {
+                id: 202,
+                name: 'main-exact-sha-push',
+                event: 'push',
+                head_sha: shaB,
+                status: 'completed',
+                conclusion: 'success',
+              },
+            ]),
+            stderr: '',
+          };
+        }
+        return { status: 1, stdout: '', stderr: 'unknown command' };
+      });
+
+      const result = await observer.observeAndReconcileMergedPr({
+        repository: repo,
+        prNumber: prNum,
+        expectedPrHeadSha: shaA,
+        mergedMainSha: shaB,
+      });
+
+      expect(result.classification).toBe('DIFFERENT_MERGE_SHA_PUSH_SUCCESS');
+      expect(result.isValid).toBe(true);
+      expect(result.failsClosed).toBe(false);
+      expect(result.prHeadConclusion).toBe('SUCCESS');
       expect(result.mainPostMergeConclusion).toBe('SUCCESS');
     });
   });
