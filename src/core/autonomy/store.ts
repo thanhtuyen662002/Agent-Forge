@@ -475,7 +475,7 @@ export class AutonomyStore {
   }
 
   getCiReconciliationByPr(repository: string, prNumber: number): AutonomyCiReconciliation | null {
-    return (this.db.prepare('SELECT * FROM autonomy_ci_reconciliations WHERE repository = ? AND pr_number = ? ORDER BY created_at DESC LIMIT 1').get(repository, prNumber) as AutonomyCiReconciliation | undefined) ?? null;
+    return (this.db.prepare('SELECT * FROM autonomy_ci_reconciliations WHERE repository = ? AND pr_number = ? ORDER BY updated_at DESC, created_at DESC LIMIT 1').get(repository, prNumber) as AutonomyCiReconciliation | undefined) ?? null;
   }
 
   getCiReconciliationByPrAndHead(repository: string, prNumber: number, prHeadSha: string): AutonomyCiReconciliation | null {
@@ -483,24 +483,24 @@ export class AutonomyStore {
   }
 
   findCiReconciliationsByHeadSha(headSha: string): AutonomyCiReconciliation[] {
-    return this.db.prepare('SELECT * FROM autonomy_ci_reconciliations WHERE lower(pr_head_sha) = lower(?) ORDER BY created_at DESC').all(headSha) as AutonomyCiReconciliation[];
+    return this.db.prepare('SELECT * FROM autonomy_ci_reconciliations WHERE lower(pr_head_sha) = lower(?) ORDER BY updated_at DESC, created_at DESC').all(headSha) as AutonomyCiReconciliation[];
   }
 
   findCiReconciliationsByMainSha(mainSha: string): AutonomyCiReconciliation[] {
-    return this.db.prepare('SELECT * FROM autonomy_ci_reconciliations WHERE lower(merged_main_sha) = lower(?) ORDER BY created_at DESC').all(mainSha) as AutonomyCiReconciliation[];
+    return this.db.prepare('SELECT * FROM autonomy_ci_reconciliations WHERE lower(merged_main_sha) = lower(?) ORDER BY updated_at DESC, created_at DESC').all(mainSha) as AutonomyCiReconciliation[];
   }
 
   listCiReconciliations(filter?: { repository?: string; classification?: CiReconciliationClassification }): AutonomyCiReconciliation[] {
     if (filter?.repository && filter?.classification) {
-      return this.db.prepare('SELECT * FROM autonomy_ci_reconciliations WHERE repository = ? AND reconciliation_classification = ? ORDER BY created_at DESC').all(filter.repository, filter.classification) as AutonomyCiReconciliation[];
+      return this.db.prepare('SELECT * FROM autonomy_ci_reconciliations WHERE repository = ? AND reconciliation_classification = ? ORDER BY updated_at DESC, created_at DESC').all(filter.repository, filter.classification) as AutonomyCiReconciliation[];
     }
     if (filter?.repository) {
-      return this.db.prepare('SELECT * FROM autonomy_ci_reconciliations WHERE repository = ? ORDER BY created_at DESC').all(filter.repository) as AutonomyCiReconciliation[];
+      return this.db.prepare('SELECT * FROM autonomy_ci_reconciliations WHERE repository = ? ORDER BY updated_at DESC, created_at DESC').all(filter.repository) as AutonomyCiReconciliation[];
     }
     if (filter?.classification) {
-      return this.db.prepare('SELECT * FROM autonomy_ci_reconciliations WHERE reconciliation_classification = ? ORDER BY created_at DESC').all(filter.classification) as AutonomyCiReconciliation[];
+      return this.db.prepare('SELECT * FROM autonomy_ci_reconciliations WHERE reconciliation_classification = ? ORDER BY updated_at DESC, created_at DESC').all(filter.classification) as AutonomyCiReconciliation[];
     }
-    return this.db.prepare('SELECT * FROM autonomy_ci_reconciliations ORDER BY created_at DESC').all() as AutonomyCiReconciliation[];
+    return this.db.prepare('SELECT * FROM autonomy_ci_reconciliations ORDER BY updated_at DESC, created_at DESC').all() as AutonomyCiReconciliation[];
   }
 
   findLatestWorkOrderByTask(taskId: string): AutonomyWorkOrderRow | null {
