@@ -7,6 +7,7 @@ import {
   managerResourceFromEndpoint,
   parseProviderEndpointConfig,
 } from '../src/core/autonomy/providerEndpoint';
+import { ResponsesCoderEndpointTransport } from '../src/core/autonomy/responsesCoderEndpoint';
 
 const managerEndpoint: ProviderEndpointConfig = {
   resource_id: 'manager-omniroute',
@@ -86,5 +87,31 @@ describe('configured provider endpoints', () => {
     const result = await adapter.execute({ taskId: 'task-1', projectId: 'project-1', instructions: [], contextFiles: [] });
     expect(result.status).toBe('COMPLETED');
     expect(invokedRoute).toBe('coder-production:task-1');
+  });
+
+  it('connects ConfiguredCoderEndpointAdapter with ResponsesCoderEndpointTransport', async () => {
+    const endpoint: ProviderEndpointConfig = {
+      ...managerEndpoint,
+      resource_id: 'coder-omniroute',
+      role: 'CODER',
+      model_or_route: 'coder-production',
+      capabilities: ['CODING'],
+    };
+    const transport = new ResponsesCoderEndpointTransport({
+      environment: { AGENT_FORGE_OMNIROUTE_TOKEN: 'secret-token' },
+      fetch: async () => new Response(JSON.stringify({
+        id: 'resp-test',
+        output_text: 'worker execution result',
+      }), { status: 200 }),
+    });
+    const adapter = new ConfiguredCoderEndpointAdapter(endpoint, transport);
+    const result = await adapter.execute({
+      taskId: 'task-test',
+      projectId: 'proj-test',
+      instructions: ['write code'],
+      contextFiles: [],
+    });
+    expect(result.status).toBe('COMPLETED');
+    expect(result.rawResponse).toBe('worker execution result');
   });
 });

@@ -26,22 +26,48 @@ export interface EndpointContractResult {
   compatible: boolean;
 }
 
-function endpointUrl(baseUrl: string): string {
+export function endpointUrl(baseUrl: string): string {
   const normalized = baseUrl.replace(/\/+$/, '');
   return normalized.endsWith('/responses') ? normalized : `${normalized}/responses`;
 }
 
-function referencedEnvironmentName(authSource: string | null): string | null {
+export function referencedEnvironmentName(authSource: string | null): string | null {
   if (!authSource?.startsWith('env://')) return null;
   return authSource.slice('env://'.length);
 }
 
-function redactValue(text: string, value: string | undefined): string {
-  if (!value) return sanitizeAutonomyText(text);
-  return sanitizeAutonomyText(text.split(value).join('[REDACTED_SECRET]'));
+export function redactEndpointDiagnostics(
+  text: string,
+  authValue?: string,
+  baseUrl?: string | null,
+): string {
+  let safe = text;
+  if (authValue) {
+    safe = safe.split(authValue).join('[REDACTED_SECRET]');
+  }
+  if (baseUrl) {
+    safe = safe.split(endpointUrl(baseUrl)).join('[REDACTED_URL]');
+    safe = safe.split(baseUrl).join('[REDACTED_URL]');
+    try {
+      const u = new URL(baseUrl);
+      if (u.host) {
+        safe = safe.split(u.host).join('[REDACTED_URL]');
+      }
+      if (u.origin) {
+        safe = safe.split(u.origin).join('[REDACTED_URL]');
+      }
+    } catch {
+      // not a valid URL or relative
+    }
+  }
+  return sanitizeAutonomyText(safe);
 }
 
-function outputText(payload: unknown): string | null {
+export function redactValue(text: string, value: string | undefined, baseUrl?: string | null): string {
+  return redactEndpointDiagnostics(text, value, baseUrl);
+}
+
+export function outputText(payload: unknown): string | null {
   if (!payload || typeof payload !== 'object') return null;
   const record = payload as Record<string, unknown>;
   if (typeof record.output_text === 'string') return record.output_text;
@@ -60,13 +86,13 @@ function outputText(payload: unknown): string | null {
   return pieces.length ? pieces.join('\n') : null;
 }
 
-function responseId(payload: unknown): string {
+export function responseId(payload: unknown): string {
   if (!payload || typeof payload !== 'object') return '';
   const id = (payload as Record<string, unknown>).id;
   return typeof id === 'string' ? id : '';
 }
 
-function failedRun(status: ProviderRun['status'], stderr: string, started: number): ProviderRun {
+export function failedRun(status: ProviderRun['status'], stderr: string, started: number): ProviderRun {
   return {
     status,
     exitCode: 1,
@@ -181,7 +207,7 @@ export class ResponsesManagerEndpointTransport implements ManagerEndpointTranspo
         signal: controller.signal,
       });
       const raw = await response.text();
-      const safeRaw = redactValue(raw, authValue);
+      const safeRaw = redactValue(raw, authValue, config.base_url);
       if (response.status === 401 || response.status === 403) {
         return { run: failedRun('AUTH_ERROR', `ROUTE_AUTH_ERROR HTTP ${response.status}: ${safeRaw}`, started) };
       }
@@ -205,7 +231,7 @@ export class ResponsesManagerEndpointTransport implements ManagerEndpointTranspo
       }
       const text = outputText(payload);
       if (!text) return { run: failedRun('CONTRACT_INVALID', 'ROUTE_CONTRACT_INVALID: no Responses output text', started) };
-      const safeText = redactValue(text, authValue);
+      const safeText = redactValue(text, authValue, config.base_url);
       return {
         text: safeText,
         run: {
@@ -224,7 +250,7 @@ export class ResponsesManagerEndpointTransport implements ManagerEndpointTranspo
       return {
         run: failedRun(
           'PROCESS_NOT_FOUND',
-          `ROUTE_OFFLINE: ${redactValue(error instanceof Error ? error.message : String(error), authValue)}`,
+          `ROUTE_OFFLINE: ${redactValue(error instanceof Error ? error.message : String(error), authValue, config.base_url)}`,
           started,
         ),
       };
@@ -261,7 +287,7 @@ export function loadOmniRouteEndpointFromEnvironment(
     health_state: 'AVAILABLE',
     cooldown_state: { active: false, until: null, reason: null },
     capabilities: role === 'CODER'
-      ? ['CODING', 'FILESYSTEM_EDIT', 'TEST_EXECUTION']
+      ? ['CODING']
       : role === 'MANAGER'
         ? ['PLANNING', 'REVIEW']
         : ['REVIEW'],

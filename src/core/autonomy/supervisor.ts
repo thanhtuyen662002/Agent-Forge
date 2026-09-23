@@ -14,6 +14,16 @@ import { ProductTaskAutonomyAdapter, renderCommand } from './productTaskAdapter'
 import { GitWorktreeService } from '../services/GitWorktreeService';
 import { AgentAssignment, ExecutionAuthorization, Task } from '../types/domain';
 import { CanonicalExecutionPayload, CanonicalExecutionPayloadSchema } from '../services/ExecutionAuthorizationService';
+import { ProviderEndpointConfig } from './providerEndpoint';
+import { loadOmniRouteEndpointFromEnvironment } from './responsesEndpoint';
+import {
+  ResponsesCoderEndpointTransport,
+  applyCoderEditBundle,
+  isOmniRouteAuthorization,
+  isAgyAuthorization,
+  isOmniRouteCoder,
+  resolveCoderProvider,
+} from './responsesCoderEndpoint';
 
 export type AutonomyMode = 'SHADOW' | 'PILOT' | 'AUTONOMOUS';
 
@@ -30,6 +40,8 @@ export interface SupervisorConfig {
   controlRepo?: string;
   worktreeRoot?: string;
   productAdapter?: ProductTaskAutonomyAdapter;
+  coderTransport?: ResponsesCoderEndpointTransport;
+  coderEndpoint?: ProviderEndpointConfig | null;
 }
 
 export interface SupervisorRunResult {
@@ -55,6 +67,8 @@ export class AutonomySupervisor {
   readonly controlRepo: string;
   readonly worktreeRoot: string;
   readonly productAdapter: ProductTaskAutonomyAdapter;
+  readonly coderTransport: ResponsesCoderEndpointTransport;
+  readonly coderEndpoint: ProviderEndpointConfig | null;
 
   constructor(config: SupervisorConfig = {}) {
     this.mode = config.mode ?? ((process.env.AGENT_FORGE_MODE as AutonomyMode | undefined) ?? 'PILOT');
@@ -81,6 +95,10 @@ export class AutonomySupervisor {
       evidenceCollector: this.evidence,
       maxWorkers: this.maxWorkers,
     });
+    this.coderEndpoint = config.coderEndpoint !== undefined
+      ? config.coderEndpoint
+      : loadOmniRouteEndpointFromEnvironment('CODER');
+    this.coderTransport = config.coderTransport ?? new ResponsesCoderEndpointTransport();
     this.store.ensureSlots(this.maxWorkers);
   }
 
@@ -124,8 +142,75 @@ export class AutonomySupervisor {
       const initial = await this.evidence.collect(order, []);
       if (initial.headSha !== order.base_sha || initial.status.trim()) throw new Error('WORKTREE_BASE_OR_CLEANLINESS_MISMATCH');
       while (true) {
-        const provider = await this.agy.execute(order);
-        this.store.recordRun(row.id, 'antigravity', provider);
+        let provider: ProviderRun;
+        const db = this.store.getDatabase();
+        const authRow = db.prepare(
+          "SELECT * FROM execution_authorizations WHERE task_id = ? AND status IN ('AUTHORIZED','DISPATCHED') ORDER BY created_at DESC LIMIT 1"
+        ).get(order.task_id) as ExecutionAuthorization | undefined;
+
+        const selection = resolveCoderProvider(authRow);
+        if (selection.provider === 'NONE') {
+          provider = {
+            status: 'AUTH_ERROR',
+            exitCode: 1,
+            executionId: '',
+            stdout: '',
+            stderr: selection.error,
+            durationMs: 0,
+          };
+        } else if (selection.provider === 'OMNIROUTE') {
+          const endpoint = this.coderEndpoint ?? loadOmniRouteEndpointFromEnvironment('CODER');
+          if (!endpoint) {
+            provider = {
+              status: 'AUTH_ERROR',
+              exitCode: 1,
+              executionId: '',
+              stdout: '',
+              stderr: 'OMNIROUTE_CODER_NOT_CONFIGURED: OmniRoute coder endpoint configuration missing',
+              durationMs: 0,
+            };
+          } else {
+            const executed = await this.coderTransport.executeWorkOrder(endpoint, order, authRow!.id);
+            this.store.recordRun(row.id, 'omniroute-coder', executed.run);
+            provider = executed.run;
+            if (executed.run.status === 'SUCCESSFUL_PROCESS_EXIT' && executed.bundle) {
+              try {
+                const preEvidence = await this.evidence.collect(order, []);
+                if (preEvidence.headSha !== executed.bundle.source_head.toLowerCase()) {
+                  throw new Error(`STALE_SOURCE_HEAD: Worktree HEAD changed in flight: expected ${executed.bundle.source_head}, observed ${preEvidence.headSha}`);
+                }
+                applyCoderEditBundle(order.worktree, executed.bundle, {
+                  taskId: order.task_id,
+                  authorizationId: authRow!.id,
+                  sourceHead: preEvidence.headSha,
+                  allowedPaths: order.allowed_paths,
+                  forbiddenPaths: order.forbidden_paths,
+                });
+              } catch (applyErr) {
+                provider = {
+                  status: 'CONTRACT_INVALID',
+                  exitCode: 1,
+                  executionId: executed.run.executionId,
+                  stdout: executed.run.stdout,
+                  stderr: applyErr instanceof Error ? applyErr.message : String(applyErr),
+                  durationMs: executed.run.durationMs,
+                };
+              }
+            }
+          }
+        } else if (selection.provider === 'AGY') {
+          provider = await this.agy.execute(order);
+          this.store.recordRun(row.id, 'antigravity', provider);
+        } else {
+          provider = {
+            status: 'AUTH_ERROR',
+            exitCode: 1,
+            executionId: '',
+            stdout: '',
+            stderr: 'UNRECOGNIZED_CODER_PROVIDER',
+            durationMs: 0,
+          };
+        }
         if (provider.status !== 'SUCCESSFUL_PROCESS_EXIT') {
           const failedState: AutonomyState = provider.status === 'AUTH_ERROR' || provider.status === 'QUOTA_OR_RATE_LIMIT' ? 'BLOCKED' : 'FAILED';
           this.store.updateState(row.id, failedState, order.lease_epoch);
@@ -232,15 +317,25 @@ export class AutonomySupervisor {
 
     const db = this.store.getDatabase();
     const authRow = db.prepare(
-      "SELECT id FROM execution_authorizations WHERE task_id = ? AND status IN ('AUTHORIZED','DISPATCHED') ORDER BY created_at DESC LIMIT 1"
-    ).get(spec.taskId) as { id: string } | undefined;
+      "SELECT * FROM execution_authorizations WHERE task_id = ? AND status IN ('AUTHORIZED','DISPATCHED') ORDER BY created_at DESC LIMIT 1"
+    ).get(spec.taskId) as ExecutionAuthorization | undefined;
 
     if (!authRow) {
       return {
         workOrder: order,
         state: 'BLOCKED',
         repairLoops: 0,
-        error: 'PRODUCT_TASK_REQUIRES_EXECUTION_AUTHORIZATION: product tasks must have durable ExecutionAuthorization and cannot execute through legacy autonomy state',
+        error: 'AUTHORIZATION_MISSING: PRODUCT_TASK_REQUIRES_EXECUTION_AUTHORIZATION: product tasks must have durable ExecutionAuthorization and cannot execute through legacy autonomy state',
+      };
+    }
+
+    const selection = resolveCoderProvider(authRow);
+    if (selection.provider === 'NONE') {
+      return {
+        workOrder: order,
+        state: 'BLOCKED',
+        repairLoops: 0,
+        error: selection.error,
       };
     }
 
@@ -254,12 +349,85 @@ export class AutonomySupervisor {
       forbiddenPaths: spec.forbiddenPaths,
       dependencies: spec.dependencies,
       runCoder: async (wo) => {
-        const provider = await this.agy.execute(wo);
-        if (provider.status !== 'SUCCESSFUL_PROCESS_EXIT') {
-          return { success: false, currentHeadSha: spec.baseSha, error: provider.error ?? provider.stderr };
+        const selection = resolveCoderProvider(authRow);
+        if (selection.provider === 'NONE') {
+          return {
+            success: false,
+            currentHeadSha: spec.baseSha,
+            error: selection.error,
+          };
         }
-        const ev = await this.evidence.collect(wo, []);
-        return { success: true, currentHeadSha: ev.headSha };
+
+        if (selection.provider === 'OMNIROUTE') {
+          const endpoint = this.coderEndpoint ?? loadOmniRouteEndpointFromEnvironment('CODER');
+          if (!endpoint) {
+            return {
+              success: false,
+              currentHeadSha: spec.baseSha,
+              error: 'OMNIROUTE_CODER_NOT_CONFIGURED: OmniRoute coder endpoint configuration missing',
+            };
+          }
+          const executed = await this.coderTransport.executeWorkOrder(endpoint, wo, authRow.id);
+          // Product tasks do not own a legacy autonomy_work_orders row, so a
+          // legacy autonomy_runs foreign-key write would fail here. Preserve
+          // secret-safe provider evidence as an audit event instead.
+          this.store.event(authRow.task_id, 'PRODUCT_CODER_PROVIDER_RUN', {
+            provider: 'omniroute-coder',
+            selectedProviderId: authRow.selected_provider_id,
+            selectedResourceId: authRow.selected_resource_id,
+            status: executed.run.status,
+            exitCode: executed.run.exitCode,
+            executionId: executed.run.executionId,
+            durationMs: executed.run.durationMs,
+          });
+          if (executed.run.status !== 'SUCCESSFUL_PROCESS_EXIT' || !executed.bundle) {
+            return {
+              success: false,
+              currentHeadSha: spec.baseSha,
+              error: executed.run.error ?? executed.run.stderr ?? 'OMNIROUTE_CODER_FAILED',
+            };
+          }
+          try {
+            const preEvidence = await this.evidence.collect(wo, []);
+            if (preEvidence.headSha !== executed.bundle.source_head.toLowerCase()) {
+              return {
+                success: false,
+                currentHeadSha: preEvidence.headSha,
+                error: `STALE_SOURCE_HEAD: Worktree HEAD changed in flight: expected ${executed.bundle.source_head}, observed ${preEvidence.headSha}`,
+              };
+            }
+            applyCoderEditBundle(wo.worktree, executed.bundle, {
+              taskId: wo.task_id,
+              authorizationId: authRow.id,
+              sourceHead: preEvidence.headSha,
+              allowedPaths: wo.allowed_paths,
+              forbiddenPaths: wo.forbidden_paths,
+            });
+          } catch (applyErr) {
+            return {
+              success: false,
+              currentHeadSha: spec.baseSha,
+              error: applyErr instanceof Error ? applyErr.message : String(applyErr),
+            };
+          }
+          const ev = await this.evidence.collect(wo, []);
+          return { success: true, currentHeadSha: ev.headSha };
+        }
+
+        if (selection.provider === 'AGY') {
+          const provider = await this.agy.execute(wo);
+          if (provider.status !== 'SUCCESSFUL_PROCESS_EXIT') {
+            return { success: false, currentHeadSha: spec.baseSha, error: provider.error ?? provider.stderr };
+          }
+          const ev = await this.evidence.collect(wo, []);
+          return { success: true, currentHeadSha: ev.headSha };
+        }
+
+        return {
+          success: false,
+          currentHeadSha: spec.baseSha,
+          error: 'UNRECOGNIZED_CODER_PROVIDER',
+        };
       },
       runVerification: async (authority, wo) => {
         const targetOrder = wo ?? order;
