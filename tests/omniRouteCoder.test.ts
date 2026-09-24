@@ -1837,6 +1837,37 @@ describe('OmniRoute Coder Transport & Structured Edits', () => {
   });
 
   describe('7. Secret redaction', () => {
+    it('redacts credentials and endpoint values from post-response contract diagnostics', async () => {
+      const transport = new ResponsesCoderEndpointTransport({
+        environment: { TEST_CODER_AUTH: secretToken },
+        fetch: async () => new Response(responsePayload(JSON.stringify({
+          protocol_version: 'coderbundle.v1',
+          task_id: `wrong-${secretToken}-router.example.test`,
+          authorization_id: 'auth-699',
+          source_head: shaA,
+          allowed_paths: ['src/app.ts'],
+          proposed_edits: [{ path: 'src/app.ts', content: 'safe' }],
+        })), { status: 200 }),
+      });
+      const order = createWorkOrder({
+        taskId: 'TSK-699',
+        workerId: 'coder-omniroute',
+        objective: 'redact contract diagnostics',
+        baseSha: shaA,
+        branch: 'test',
+        worktree: worktreeDir,
+        allowedPaths: ['src/app.ts'],
+        acceptanceCriteria: ['pass'],
+        requiredTests: ['test'],
+      });
+      const result = await transport.executeWorkOrder(coderEndpointConfig(), order, 'auth-699');
+      expect(result.run.status).toBe('CONTRACT_INVALID');
+      expect(result.run.error).not.toContain(secretToken);
+      expect(result.run.error).not.toContain('router.example.test');
+      expect(result.run.error).toContain('[REDACTED_SECRET]');
+      expect(result.run.error).toContain('[REDACTED_URL]');
+    });
+
     it('redacts router credentials from 401 error responses', async () => {
       const transport = new ResponsesCoderEndpointTransport({
         environment: { TEST_CODER_AUTH: secretToken },
@@ -1931,6 +1962,40 @@ describe('OmniRoute Coder Transport & Structured Edits', () => {
 
       // Verify no probe file was created on filesystem
       expect(fs.existsSync(path.join(worktreeDir, 'doctor-probe.txt'))).toBe(false);
+    });
+
+    it.each([
+      {
+        name: 'mismatched allowed_paths',
+        allowed_paths: ['other.txt'],
+        proposed_edits: [{ path: 'other.txt', content: 'CODER_OK' }],
+      },
+      {
+        name: 'unauthorized edit path',
+        allowed_paths: ['doctor-probe.txt'],
+        proposed_edits: [{ path: 'other.txt', content: 'CODER_OK' }],
+      },
+      {
+        name: 'traversal edit path',
+        allowed_paths: ['doctor-probe.txt'],
+        proposed_edits: [{ path: '../outside.txt', content: 'CODER_OK' }],
+      },
+    ])('rejects a path-unbound doctor response: $name', async ({ allowed_paths, proposed_edits }) => {
+      const transport = new ResponsesCoderEndpointTransport({
+        environment: { TEST_CODER_AUTH: secretToken },
+        fetch: async () => new Response(responsePayload(JSON.stringify({
+          protocol_version: 'coderbundle.v1',
+          task_id: 'doctor-probe',
+          authorization_id: 'auth-doctor-probe',
+          source_head: '0'.repeat(40),
+          allowed_paths,
+          proposed_edits,
+        })), { status: 200 }),
+      });
+      const result = await transport.contract(coderEndpointConfig());
+      expect(result.compatible).toBe(false);
+      expect(result.healthState).toBe('CONTRACT_INVALID');
+      expect(result.run.status).toBe('CONTRACT_INVALID');
     });
 
     it('CLI doctorOmniRouteCoder passes when endpoint is configured and compatible', async () => {

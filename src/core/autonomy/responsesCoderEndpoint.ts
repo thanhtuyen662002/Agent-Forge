@@ -452,6 +452,17 @@ export class ResponsesCoderEndpointTransport implements CoderEndpointTransport {
     this.environment = options.environment ?? process.env;
   }
 
+  private redactContractDiagnostic(configInput: ProviderEndpointConfig, error: unknown): string {
+    const config = parseProviderEndpointConfig(configInput);
+    const envName = referencedEnvironmentName(config.auth_source);
+    const authValue = envName ? this.environment[envName] : undefined;
+    return redactEndpointDiagnostics(
+      error instanceof Error ? error.message : String(error),
+      authValue,
+      config.base_url,
+    );
+  }
+
   async getHealth(config: ProviderEndpointConfig): Promise<ProviderEndpointHealthState> {
     const probe = await this.contract(config);
     return probe.healthState;
@@ -540,7 +551,7 @@ export class ResponsesCoderEndpointTransport implements CoderEndpointTransport {
       });
       return { run: result.run, bundle };
     } catch (error) {
-      const msg = sanitizeAutonomyText(error instanceof Error ? error.message : String(error));
+      const msg = this.redactContractDiagnostic(configInput, error);
       return {
         run: {
           ...result.run,
@@ -581,20 +592,14 @@ export class ResponsesCoderEndpointTransport implements CoderEndpointTransport {
 
     try {
       const bundle = parseCoderEditBundle(result.text);
-      if (
-        bundle.task_id !== dummyTask ||
-        bundle.authorization_id !== dummyAuth ||
-        bundle.source_head !== dummySha ||
-        !Array.isArray(bundle.proposed_edits) ||
-        bundle.proposed_edits.length === 0
-      ) {
-        return {
-          run: { ...result.run, status: 'CONTRACT_INVALID', stderr: 'ROUTE_CONTRACT_INVALID: probe identity mismatch' },
-          compatible: false,
-          healthState: 'CONTRACT_INVALID',
-          error: 'Probe response failed identity bindings',
-        };
-      }
+      validateCoderEditBundle(bundle, {
+        taskId: dummyTask,
+        authorizationId: dummyAuth,
+        sourceHead: dummySha,
+        allowedPaths: ['doctor-probe.txt'],
+        forbiddenPaths: ['.git'],
+      });
+      if (bundle.proposed_edits.length === 0) throw new Error('ROUTE_CONTRACT_INVALID: probe returned no proposed edits');
       return {
         run: result.run,
         compatible: true,
@@ -602,7 +607,7 @@ export class ResponsesCoderEndpointTransport implements CoderEndpointTransport {
         bundle,
       };
     } catch (error) {
-      const msg = sanitizeAutonomyText(error instanceof Error ? error.message : String(error));
+      const msg = this.redactContractDiagnostic(configInput, error);
       return {
         run: {
           ...result.run,
