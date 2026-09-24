@@ -491,6 +491,44 @@ describe('OmniRoute Coder Transport & Structured Edits', () => {
       expect(observedInput).toContain('authorized_source_files');
       expect(observedInput).toContain('export const answer = 41;');
     });
+
+    it('executeWorkOrder succeeds when proposed edit content contains triple-backtick markdown', async () => {
+      const targetPath = path.join(worktreeDir, 'README.md');
+      fs.writeFileSync(targetPath, '# Initial\n', 'utf8');
+
+      const markdownContent = '# Documentation\n\n```typescript\nexport const answer = 42;\n```\n';
+      const bundle: CoderEditBundle = {
+        protocol_version: 'coderbundle.v1',
+        task_id: 'TSK-304-MD',
+        authorization_id: 'auth-304-md',
+        source_head: shaA,
+        allowed_paths: ['README.md'],
+        proposed_edits: [{ path: 'README.md', content: markdownContent }],
+        summary: 'Update documentation with code block',
+      };
+
+      const transport = new ResponsesCoderEndpointTransport({
+        environment: { TEST_CODER_AUTH: secretToken },
+        fetch: async () => new Response(responsePayload(JSON.stringify(bundle)), { status: 200 }),
+      });
+
+      const order = createWorkOrder({
+        taskId: 'TSK-304-MD',
+        workerId: 'coder-omniroute',
+        objective: 'support markdown in file content',
+        baseSha: shaA,
+        branch: 'test',
+        worktree: worktreeDir,
+        allowedPaths: ['README.md'],
+        acceptanceCriteria: ['tests pass'],
+        requiredTests: ['test'],
+      });
+
+      const result = await transport.executeWorkOrder(coderEndpointConfig(), order, 'auth-304-md');
+      expect(result.run.status).toBe('SUCCESSFUL_PROCESS_EXIT');
+      expect(result.bundle).toEqual(bundle);
+      expect(result.bundle?.proposed_edits[0].content).toBe(markdownContent);
+    });
   });
 
   describe('4. Malformed response rejection', () => {
@@ -504,6 +542,52 @@ describe('OmniRoute Coder Transport & Structured Edits', () => {
         proposed_edits: [{ path: 'src/app.ts', content: 'hello' }],
       }) + '\n```';
       expect(() => parseCoderEditBundle(wrapped)).toThrow(/CONTRACT_INVALID/i);
+    });
+
+    it('accepts strict coderbundle.v1 when proposed edit content contains triple-backtick markdown', () => {
+      const markdown = '# Setup Guide\n\n```typescript\nexport const x: number = 42;\n```\n';
+      const bundle = {
+        protocol_version: 'coderbundle.v1' as const,
+        task_id: 'TSK-400-MD',
+        authorization_id: 'auth-400-md',
+        source_head: shaA,
+        allowed_paths: ['docs/guide.md'],
+        proposed_edits: [{ path: 'docs/guide.md', content: markdown }],
+        summary: 'Update setup guide with code fences',
+      };
+      const parsed = parseCoderEditBundle(JSON.stringify(bundle));
+      expect(parsed).toEqual(bundle);
+      expect(parsed.proposed_edits[0].content).toBe(markdown);
+    });
+
+    it('rejects outer markdown code fences even when proposed edit content contains triple-backtick markdown', () => {
+      const markdown = '# Setup Guide\n\n```typescript\nexport const x: number = 42;\n```\n';
+      const wrapped = '```json\n' + JSON.stringify({
+        protocol_version: 'coderbundle.v1',
+        task_id: 'TSK-400-OUTER-MD',
+        authorization_id: 'auth-400-outer-md',
+        source_head: shaA,
+        allowed_paths: ['docs/guide.md'],
+        proposed_edits: [{ path: 'docs/guide.md', content: markdown }],
+      }) + '\n```';
+      expect(() => parseCoderEditBundle(wrapped)).toThrow(/CONTRACT_INVALID/i);
+    });
+
+    it('never extracts a JSON substring from leading or trailing prose', () => {
+      const bundle = {
+        protocol_version: 'coderbundle.v1',
+        task_id: 'TSK-400-PROSE',
+        authorization_id: 'auth-400-prose',
+        source_head: shaA,
+        allowed_paths: ['src/app.ts'],
+        proposed_edits: [{ path: 'src/app.ts', content: '```bash\necho 1\n```' }],
+      };
+      const leading = 'Here is the response:\n' + JSON.stringify(bundle);
+      expect(() => parseCoderEditBundle(leading)).toThrow(/CONTRACT_INVALID/i);
+      const trailing = JSON.stringify(bundle) + '\nHope this helps!';
+      expect(() => parseCoderEditBundle(trailing)).toThrow(/CONTRACT_INVALID/i);
+      const both = 'Prefix\n' + JSON.stringify(bundle) + '\nSuffix';
+      expect(() => parseCoderEditBundle(both)).toThrow(/CONTRACT_INVALID/i);
     });
 
     it('rejects unknown fields in coderbundle.v1', () => {

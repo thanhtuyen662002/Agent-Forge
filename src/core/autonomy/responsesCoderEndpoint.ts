@@ -111,9 +111,6 @@ export const CODER_BUNDLE_JSON_SCHEMA = CoderBundleJsonSchema;
 
 export function parseCoderEditBundle(raw: string): CoderEditBundle {
   const trimmed = raw.trim();
-  if (trimmed.startsWith('```') || /```/.test(trimmed)) {
-    throw new Error('CONTRACT_INVALID: markdown fences are forbidden in coderbundle.v1');
-  }
 
   let parsed: unknown;
   try {
