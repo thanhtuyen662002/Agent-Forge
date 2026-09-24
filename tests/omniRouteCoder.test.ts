@@ -1,6 +1,7 @@
 import fs from 'fs';
 import path from 'path';
 import os from 'os';
+import { execFileSync } from 'child_process';
 import Database from 'better-sqlite3';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { MigrationRunner } from '../src/core/database/migrations';
@@ -35,7 +36,7 @@ import {
 } from '../src/core/services/ExecutionAuthorizationService';
 import { renderCommand } from '../src/core/autonomy/productTaskAdapter';
 
-const shaA = 'a'.repeat(40);
+let shaA = 'a'.repeat(40);
 const shaB = 'b'.repeat(40);
 const secretToken = 'sk-router-secret-token-9876543210';
 
@@ -65,6 +66,27 @@ function responsePayload(text: string): string {
   });
 }
 
+function coderBinding(
+  providerId: string,
+  resourceId: string,
+  adapterType: 'LOCAL_CLI' | 'API' | 'MOCK',
+  providerAccountId: string | null = null,
+) {
+  return {
+    providerId,
+    resourceId,
+    providerAccountId,
+    adapterType,
+    providerEnabled: true,
+    resourceEnabled: true,
+    resourceHealth: 'AVAILABLE',
+    capabilities: ['CODING'],
+    accountEnabled: providerAccountId ? true : null,
+    accountHealth: providerAccountId ? 'AVAILABLE' : null,
+    accountCooldownUntil: null,
+  };
+}
+
 describe('OmniRoute Coder Transport & Structured Edits', () => {
   let tempDir: string;
   let worktreeDir: string;
@@ -76,6 +98,11 @@ describe('OmniRoute Coder Transport & Structured Edits', () => {
     fs.mkdirSync(controlDir, { recursive: true });
     worktreeDir = path.join(tempDir, 'worktree');
     fs.mkdirSync(worktreeDir, { recursive: true });
+    execFileSync('git', ['init'], { cwd: worktreeDir, windowsHide: true });
+    execFileSync('git', ['config', 'user.email', 'agent-forge-tests@example.invalid'], { cwd: worktreeDir, windowsHide: true });
+    execFileSync('git', ['config', 'user.name', 'Agent Forge Tests'], { cwd: worktreeDir, windowsHide: true });
+    execFileSync('git', ['commit', '--allow-empty', '-m', 'test base'], { cwd: worktreeDir, windowsHide: true });
+    shaA = execFileSync('git', ['rev-parse', 'HEAD'], { cwd: worktreeDir, encoding: 'utf8', windowsHide: true }).trim();
   });
 
   afterEach(() => {
@@ -386,6 +413,62 @@ describe('OmniRoute Coder Transport & Structured Edits', () => {
       expect(result.run.error).toContain('STALE_SOURCE_HEAD');
       expect(result.bundle).toBeUndefined();
     });
+
+    it('fails closed before writing when the worktree Git HEAD cannot be established', () => {
+      const nonRepository = path.join(tempDir, 'not-a-repository');
+      fs.mkdirSync(nonRepository, { recursive: true });
+      const bundle: CoderEditBundle = {
+        protocol_version: 'coderbundle.v1',
+        task_id: 'TSK-302',
+        authorization_id: 'auth-302',
+        source_head: shaA,
+        allowed_paths: ['src/app.ts'],
+        proposed_edits: [{ path: 'src/app.ts', content: 'forbidden write' }],
+      };
+      expect(() => applyCoderEditBundle(nonRepository, bundle, {
+        taskId: 'TSK-302',
+        authorizationId: 'auth-302',
+        sourceHead: shaA,
+        allowedPaths: ['src/app.ts'],
+      })).toThrow(/SOURCE_HEAD_UNVERIFIED/);
+      expect(fs.existsSync(path.join(nonRepository, 'src', 'app.ts'))).toBe(false);
+    });
+
+    it('supplies bounded authorized source contents to the routed coder', async () => {
+      const sourcePath = path.join(worktreeDir, 'src', 'app.ts');
+      fs.mkdirSync(path.dirname(sourcePath), { recursive: true });
+      fs.writeFileSync(sourcePath, 'export const answer = 41;\n', 'utf8');
+      let observedInput = '';
+      const transport = new ResponsesCoderEndpointTransport({
+        environment: { TEST_CODER_AUTH: secretToken },
+        fetch: async (_url, init) => {
+          observedInput = String(JSON.parse(String(init?.body)).input);
+          return new Response(responsePayload(JSON.stringify({
+            protocol_version: 'coderbundle.v1',
+            task_id: 'TSK-303',
+            authorization_id: 'auth-303',
+            source_head: shaA,
+            allowed_paths: ['src/app.ts'],
+            proposed_edits: [{ path: 'src/app.ts', content: 'export const answer = 42;\n' }],
+          })), { status: 200 });
+        },
+      });
+      const order = createWorkOrder({
+        taskId: 'TSK-303',
+        workerId: 'coder-omniroute',
+        objective: 'use authorized source context',
+        baseSha: shaA,
+        branch: 'test',
+        worktree: worktreeDir,
+        allowedPaths: ['src/app.ts'],
+        acceptanceCriteria: ['updates answer'],
+        requiredTests: ['test'],
+      });
+      const result = await transport.executeWorkOrder(coderEndpointConfig(), order, 'auth-303');
+      expect(result.run.status).toBe('SUCCESSFUL_PROCESS_EXIT');
+      expect(observedInput).toContain('authorized_source_files');
+      expect(observedInput).toContain('export const answer = 41;');
+    });
   });
 
   describe('4. Malformed response rejection', () => {
@@ -511,11 +594,33 @@ describe('OmniRoute Coder Transport & Structured Edits', () => {
         selected_resource_id: 'agy-01',
       } as ExecutionAuthorization;
 
-      expect(isOmniRouteAuthorization(omniAuth)).toBe(true);
-      expect(isAgyAuthorization(omniAuth)).toBe(false);
+      const omniBinding = coderBinding('omniroute', 'coder-omniroute', 'API');
+      const agyBinding = coderBinding('antigravity-cli', 'agy-01', 'LOCAL_CLI');
+      expect(isOmniRouteAuthorization(omniAuth, omniBinding, coderEndpointConfig())).toBe(true);
+      expect(isAgyAuthorization(omniAuth, omniBinding)).toBe(false);
 
-      expect(isOmniRouteAuthorization(agyAuth)).toBe(false);
-      expect(isAgyAuthorization(agyAuth)).toBe(true);
+      expect(isOmniRouteAuthorization(agyAuth, agyBinding, coderEndpointConfig())).toBe(false);
+      expect(isAgyAuthorization(agyAuth, agyBinding)).toBe(true);
+    });
+
+    it('does not select an authorized OmniRoute endpoint during cooldown', () => {
+      const auth = {
+        selected_provider_id: 'provider-omniroute',
+        selected_resource_id: 'coder-omniroute',
+      } as ExecutionAuthorization;
+      const endpoint = coderEndpointConfig();
+      endpoint.cooldown_state = {
+        active: true,
+        until: new Date(Date.now() + 60_000).toISOString(),
+        reason: 'rate limited',
+      };
+      const selection = resolveCoderProvider(
+        auth,
+        coderBinding('provider-omniroute', 'coder-omniroute', 'API'),
+        endpoint,
+      );
+      expect(selection.provider).toBe('NONE');
+      expect(selection.error).toContain('AUTHORIZED_CODER_UNAVAILABLE');
     });
 
     it('fails closed when OmniRoute fails and does not silently fall back to AGY under old authorization', async () => {
@@ -884,10 +989,9 @@ describe('OmniRoute Coder Transport & Structured Edits', () => {
       const selection = resolveCoderProvider({
         selected_provider_id: 'unknown-vendor-provider',
         selected_resource_id: 'unknown-vendor-coder',
-      } as ExecutionAuthorization);
+      } as ExecutionAuthorization, coderBinding('unknown-vendor-provider', 'unknown-vendor-coder', 'MOCK'), coderEndpointConfig());
       expect(selection.provider).toBe('NONE');
       expect(selection.error).toContain('AUTHORIZATION_UNKNOWN_PROVIDER');
-      if (selection.provider === 'NONE') return;
 
       const db = new Database(':memory:');
       MigrationRunner.run(db);
@@ -923,6 +1027,36 @@ describe('OmniRoute Coder Transport & Structured Edits', () => {
         created_at: now,
         updated_at: now,
       });
+
+      repo.createProvider({ id: 'unknown-vendor-provider', name: 'Unsupported coder', adapter_type: 'MOCK', enabled: true, created_at: now });
+      repo.createProviderResource({
+        id: 'unknown-vendor-coder',
+        provider_id: 'unknown-vendor-provider',
+        provider_account_id: null,
+        model_name: 'unsupported',
+        health_status: 'AVAILABLE',
+        capabilities: ['CODING'],
+        enabled: true,
+        total_quota: null,
+        remaining_quota: null,
+        quota_unit: 'REQUESTS',
+        quota_reset_at: null,
+        quota_source: 'UNKNOWN',
+        quota_confidence: 0,
+        last_health_check: now,
+      });
+      repo.recordProtocolMessage(
+        'msg-unk',
+        'ext-msg-unk',
+        'manager.v1',
+        'PROJ-UNK',
+        'TSK-UNK-AUTH',
+        'APPROVED',
+        0,
+        'hash-unk',
+        JSON.stringify({ decision: 'EXECUTE', taskId: 'TSK-UNK-AUTH' }),
+        'APPLIED',
+      );
 
       repo.createExecutionAuthorization({
         id: 'AUTH-UNK-1',
@@ -1008,11 +1142,10 @@ describe('OmniRoute Coder Transport & Structured Edits', () => {
     it('fails closed when ExecutionAuthorization is ambiguous/conflicting and never invokes AGY or OmniRoute', async () => {
       const selection = resolveCoderProvider({
         selected_provider_id: 'provider-omniroute',
-        selected_resource_id: 'agy-01',
-      } as ExecutionAuthorization);
+        selected_resource_id: 'coder-omniroute',
+      } as ExecutionAuthorization, coderBinding('provider-omniroute', 'coder-omniroute', 'LOCAL_CLI'), coderEndpointConfig());
       expect(selection.provider).toBe('NONE');
       expect(selection.error).toContain('AUTHORIZATION_AMBIGUOUS');
-      if (selection.provider === 'NONE') return;
 
       const db = new Database(':memory:');
       MigrationRunner.run(db);
@@ -1049,7 +1182,37 @@ describe('OmniRoute Coder Transport & Structured Edits', () => {
         updated_at: now,
       });
 
-      // Conflicting provider: selected_provider_id is omniroute, but selected_resource_id is agy-01
+      repo.createProvider({ id: 'provider-omniroute', name: 'Conflicting local provider', adapter_type: 'LOCAL_CLI', enabled: true, created_at: now });
+      repo.createProviderResource({
+        id: 'coder-omniroute',
+        provider_id: 'provider-omniroute',
+        provider_account_id: null,
+        model_name: 'conflicting-local-coder',
+        health_status: 'AVAILABLE',
+        capabilities: ['CODING'],
+        enabled: true,
+        total_quota: null,
+        remaining_quota: null,
+        quota_unit: 'REQUESTS',
+        quota_reset_at: null,
+        quota_source: 'UNKNOWN',
+        quota_confidence: 0,
+        last_health_check: now,
+      });
+      repo.recordProtocolMessage(
+        'msg-amb',
+        'ext-msg-amb',
+        'manager.v1',
+        'PROJ-AMB',
+        'TSK-AMB-AUTH',
+        'APPROVED',
+        0,
+        'hash-amb',
+        JSON.stringify({ decision: 'EXECUTE', taskId: 'TSK-AMB-AUTH' }),
+        'APPLIED',
+      );
+
+      // The configured endpoint and registered adapter disagree about the same resource.
       repo.createExecutionAuthorization({
         id: 'AUTH-AMB-1',
         project_id: 'PROJ-AMB',
@@ -1061,8 +1224,8 @@ describe('OmniRoute Coder Transport & Structured Edits', () => {
         manager_message_id: 'msg-amb',
         manager_payload_hash: 'hash-amb',
         routing_decision_id: 'route-amb',
-        selected_provider_id: 'omniroute',
-        selected_resource_id: 'agy-01',
+        selected_provider_id: 'provider-omniroute',
+        selected_resource_id: 'coder-omniroute',
         instruction_payload_hash: 'hash-amb-2',
         context_manifest_hash: 'hash-amb-3',
         canonical_instructions_json: '[]',
@@ -1119,6 +1282,7 @@ describe('OmniRoute Coder Transport & Structured Edits', () => {
         branch: order.branch,
         worktree: order.worktree,
         allowedPaths: order.allowed_paths,
+        forbiddenPaths: ['.git'],
         acceptanceCriteria: order.acceptance_criteria,
         requiredTests: order.required_tests,
         workerId: order.worker_id,
@@ -1137,9 +1301,8 @@ describe('OmniRoute Coder Transport & Structured Edits', () => {
       const selection = resolveCoderProvider({
         selected_provider_id: 'antigravity-cli',
         selected_resource_id: 'agy-01',
-      } as ExecutionAuthorization);
+      } as ExecutionAuthorization, coderBinding('antigravity-cli', 'agy-01', 'LOCAL_CLI'), coderEndpointConfig());
       expect(selection.provider).toBe('AGY');
-      if (selection.provider === 'AGY') return;
 
       const db = new Database(':memory:');
       MigrationRunner.run(db);
@@ -1394,20 +1557,21 @@ describe('OmniRoute Coder Transport & Structured Edits', () => {
         context_sha: 'test-context-sha',
       });
 
-      await supervisor.run({
+      const execution = await supervisor.run({
         taskId: order.task_id,
         objective: order.objective,
         baseSha: order.base_sha,
         branch: order.branch,
         worktree: order.worktree,
         allowedPaths: order.allowed_paths,
+        forbiddenPaths: ['.git'],
         acceptanceCriteria: order.acceptance_criteria,
         requiredTests: order.required_tests,
         workerId: order.worker_id,
       });
 
       // AGY was correctly invoked under fresh AGY authorization
-      expect(agyExecuteCalls).toBe(1);
+      expect(agyExecuteCalls, JSON.stringify(execution)).toBe(1);
       db.close();
     });
 
