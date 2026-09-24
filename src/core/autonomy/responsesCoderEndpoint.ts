@@ -7,7 +7,6 @@ import {
   AgentExecutionRequest,
   AgentExecutionResult,
   QuotaSnapshotInfo,
-  RuntimeErrorCode,
 } from '../adapters/ProviderAdapter';
 import { ExecutionAuthorization } from '../types/domain';
 import { assertPathContained } from '../services/ArtifactStore';
@@ -342,8 +341,21 @@ export function isOmniRouteAuthorization(
   return !!endpoint && endpoint.resource_id === auth.selected_resource_id && bindingMatches(auth, binding);
 }
 
-export function isAgyAuthorization(auth: ExecutionAuthorization, binding?: CoderResourceBinding | null): boolean {
-  return bindingMatches(auth, binding) && binding?.adapterType === 'LOCAL_CLI';
+export interface AgyCoderIdentity {
+  providerId: string;
+  resourceId: string;
+}
+
+export function isAgyAuthorization(
+  auth: ExecutionAuthorization,
+  binding?: CoderResourceBinding | null,
+  identity?: AgyCoderIdentity | null,
+): boolean {
+  return !!identity &&
+    auth.selected_provider_id === identity.providerId &&
+    auth.selected_resource_id === identity.resourceId &&
+    bindingMatches(auth, binding) &&
+    binding?.adapterType === 'LOCAL_CLI';
 }
 
 export type CoderProviderSelection =
@@ -355,12 +367,13 @@ export function resolveCoderProvider(
   auth?: ExecutionAuthorization | null,
   binding?: CoderResourceBinding | null,
   endpoint?: ProviderEndpointConfig | null,
+  agyIdentity?: AgyCoderIdentity | null,
 ): CoderProviderSelection {
   if (!auth) {
     return { provider: 'NONE', error: 'AUTHORIZATION_MISSING: ExecutionAuthorization required for coder execution' };
   }
   const isOmni = isOmniRouteAuthorization(auth, binding, endpoint);
-  const isAgy = isAgyAuthorization(auth, binding);
+  const isAgy = isAgyAuthorization(auth, binding, agyIdentity);
   if (isOmni && isAgy) {
     return {
       provider: 'NONE',
@@ -459,18 +472,6 @@ export interface CoderDoctorResult {
   error?: string;
 }
 
-function mapStatusToErrorCode(status: ProviderRun['status']): RuntimeErrorCode {
-  switch (status) {
-    case 'AUTH_ERROR': return 'AUTH_ERROR';
-    case 'QUOTA_OR_RATE_LIMIT': return 'QUOTA_EXHAUSTED';
-    case 'TIMEOUT': return 'TIMEOUT';
-    case 'CANCELLED': return 'CANCELLED';
-    case 'PROCESS_NOT_FOUND': return 'RESOURCE_UNAVAILABLE';
-    case 'CONTRACT_INVALID': return 'PROTOCOL_INVALID';
-    default: return 'EXECUTION_FAILED';
-  }
-}
-
 export class ResponsesCoderEndpointTransport implements CoderEndpointTransport {
   private readonly fetchImpl: FetchLike;
   private readonly environment: NodeJS.ProcessEnv;
@@ -512,21 +513,17 @@ export class ResponsesCoderEndpointTransport implements CoderEndpointTransport {
   }
 
   async execute(config: ProviderEndpointConfig, request: AgentExecutionRequest): Promise<AgentExecutionResult> {
-    const prompt = request.instructions.join('\n');
-    const result = await this.request(config, prompt);
-    if (result.run.status !== 'SUCCESSFUL_PROCESS_EXIT' || !result.text) {
-      return {
-        executionId: result.run.executionId || crypto.randomUUID(),
-        status: 'FAILED',
-        error: result.run.error ?? result.run.stderr,
-        errorCode: mapStatusToErrorCode(result.run.status),
-      };
-    }
+    void config;
+    void request;
+    // Generic ProviderAdapter execution does not carry the durable task,
+    // authorization, source HEAD, and path scope needed for coderbundle.v1.
+    // Routed coding is therefore available only through executeWorkOrder,
+    // where the Supervisor validates and applies the proposal.
     return {
-      executionId: result.run.executionId || crypto.randomUUID(),
-      status: 'COMPLETED',
-      outputProtocol: 'workerresult.v1',
-      rawResponse: result.text,
+      executionId: crypto.randomUUID(),
+      status: 'FAILED',
+      error: 'STRUCTURED_WORK_ORDER_REQUIRED: routed coder execution requires durable coderbundle.v1 authority',
+      errorCode: 'PROTOCOL_INVALID',
     };
   }
 

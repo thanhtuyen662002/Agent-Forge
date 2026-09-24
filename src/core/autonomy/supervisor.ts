@@ -40,6 +40,8 @@ export interface SupervisorConfig {
   productAdapter?: ProductTaskAutonomyAdapter;
   coderTransport?: ResponsesCoderEndpointTransport;
   coderEndpoint?: ProviderEndpointConfig | null;
+  agyProviderId?: string;
+  agyResourceId?: string;
 }
 
 export interface SupervisorRunResult {
@@ -67,6 +69,8 @@ export class AutonomySupervisor {
   readonly productAdapter: ProductTaskAutonomyAdapter;
   readonly coderTransport: ResponsesCoderEndpointTransport;
   readonly coderEndpoint: ProviderEndpointConfig | null;
+  readonly agyProviderId: string;
+  readonly agyResourceId: string;
 
   constructor(config: SupervisorConfig = {}) {
     this.mode = config.mode ?? ((process.env.AGENT_FORGE_MODE as AutonomyMode | undefined) ?? 'PILOT');
@@ -96,6 +100,8 @@ export class AutonomySupervisor {
     this.coderEndpoint = config.coderEndpoint !== undefined
       ? config.coderEndpoint
       : loadOmniRouteEndpointFromEnvironment('CODER');
+    this.agyProviderId = config.agyProviderId ?? process.env.AGENT_FORGE_AGY_PROVIDER_ID ?? 'prov-antigravity-cli';
+    this.agyResourceId = config.agyResourceId ?? process.env.AGENT_FORGE_AGY_RESOURCE_ID ?? 'res-antigravity-cli-coder';
     this.coderTransport = config.coderTransport ?? new ResponsesCoderEndpointTransport();
     if (this.coderEndpoint && !repo.getProviderResource(this.coderEndpoint.resource_id)) {
       const providerId = 'provider-external-router';
@@ -166,7 +172,10 @@ export class AutonomySupervisor {
       accountHealth: row.account_health ? String(row.account_health) : null,
       accountCooldownUntil: row.account_cooldown_until ? String(row.account_cooldown_until) : null,
     } : null;
-    return resolveCoderProvider(auth, binding, this.coderEndpoint);
+    return resolveCoderProvider(auth, binding, this.coderEndpoint, {
+      providerId: this.agyProviderId,
+      resourceId: this.agyResourceId,
+    });
   }
 
   createWorkOrder(spec: AutonomousTaskSpec): WorkOrder {

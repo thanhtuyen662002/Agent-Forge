@@ -1044,6 +1044,8 @@ describe('product-task autonomy consolidation', () => {
     const fixture = seed('task-op-dispatch');
     const supervisor = new AutonomySupervisor({
       store,
+      agyProviderId: 'provider-agy',
+      agyResourceId: 'resource-agy',
       productAdapter: adapter,
       worktreeRoot: path.join(root, 'worktrees'),
       evidence: {
@@ -1114,6 +1116,8 @@ describe('product-task autonomy consolidation', () => {
 
     const supervisor = new AutonomySupervisor({
       store,
+      agyProviderId: 'provider-agy',
+      agyResourceId: 'resource-agy',
       productAdapter: adapter,
       worktreeRoot: path.join(root, 'worktrees'),
     });
@@ -1849,6 +1853,8 @@ describe('product-task autonomy consolidation', () => {
     const fixture = seed('task-op-review-outage');
     const supervisor = new AutonomySupervisor({
       store,
+      agyProviderId: 'provider-agy',
+      agyResourceId: 'resource-agy',
       productAdapter: adapter,
       worktreeRoot: path.join(root, 'worktrees'),
       evidence: {

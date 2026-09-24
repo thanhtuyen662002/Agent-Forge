@@ -617,11 +617,12 @@ describe('OmniRoute Coder Transport & Structured Edits', () => {
 
       const omniBinding = coderBinding('omniroute', 'coder-omniroute', 'API');
       const agyBinding = coderBinding('antigravity-cli', 'agy-01', 'LOCAL_CLI');
+      const agyIdentity = { providerId: 'antigravity-cli', resourceId: 'agy-01' };
       expect(isOmniRouteAuthorization(omniAuth, omniBinding, coderEndpointConfig())).toBe(true);
-      expect(isAgyAuthorization(omniAuth, omniBinding)).toBe(false);
+      expect(isAgyAuthorization(omniAuth, omniBinding, agyIdentity)).toBe(false);
 
       expect(isOmniRouteAuthorization(agyAuth, agyBinding, coderEndpointConfig())).toBe(false);
-      expect(isAgyAuthorization(agyAuth, agyBinding)).toBe(true);
+      expect(isAgyAuthorization(agyAuth, agyBinding, agyIdentity)).toBe(true);
     });
 
     it('does not select an authorized OmniRoute endpoint during cooldown', () => {
@@ -656,6 +657,20 @@ describe('OmniRoute Coder Transport & Structured Edits', () => {
       );
       expect(selection.provider).toBe('NONE');
       expect(selection.error).toContain('AUTHORIZATION_RESOURCE_BINDING_INVALID');
+    });
+
+    it('does not treat an unrelated LOCAL_CLI resource as the registered AGY fallback', () => {
+      const selection = resolveCoderProvider(
+        {
+          selected_provider_id: 'provider-unrelated-cli',
+          selected_resource_id: 'resource-unrelated-cli',
+        } as ExecutionAuthorization,
+        coderBinding('provider-unrelated-cli', 'resource-unrelated-cli', 'LOCAL_CLI'),
+        coderEndpointConfig(),
+        { providerId: 'prov-antigravity-cli', resourceId: 'res-antigravity-cli-coder' },
+      );
+      expect(selection.provider).toBe('NONE');
+      expect(selection.error).toContain('AUTHORIZATION_UNKNOWN_PROVIDER');
     });
 
     it('fails closed when OmniRoute fails and does not silently fall back to AGY under old authorization', async () => {
@@ -1175,12 +1190,15 @@ describe('OmniRoute Coder Transport & Structured Edits', () => {
     });
 
     it('fails closed when ExecutionAuthorization is ambiguous/conflicting and never invokes AGY or OmniRoute', async () => {
-      const selection = resolveCoderProvider({
+      const conflictingSelection = resolveCoderProvider({
         selected_provider_id: 'provider-omniroute',
         selected_resource_id: 'coder-omniroute',
-      } as ExecutionAuthorization, coderBinding('provider-omniroute', 'coder-omniroute', 'LOCAL_CLI'), coderEndpointConfig());
-      expect(selection.provider).toBe('NONE');
-      expect(selection.error).toContain('AUTHORIZATION_AMBIGUOUS');
+      } as ExecutionAuthorization, coderBinding('provider-omniroute', 'coder-omniroute', 'LOCAL_CLI'), coderEndpointConfig(), {
+        providerId: 'provider-omniroute',
+        resourceId: 'coder-omniroute',
+      });
+      expect(conflictingSelection.provider).toBe('NONE');
+      expect(conflictingSelection.error).toContain('AUTHORIZATION_AMBIGUOUS');
 
       const db = new Database(':memory:');
       MigrationRunner.run(db);
@@ -1285,6 +1303,8 @@ describe('OmniRoute Coder Transport & Structured Edits', () => {
         controlRepo: controlDir,
         worktreeRoot: tempDir,
         agy: fakeAgy,
+        agyProviderId: 'provider-omniroute',
+        agyResourceId: 'coder-omniroute',
         coderEndpoint: coderEndpointConfig(),
         coderTransport: fakeOmni,
         evidence: {
@@ -1336,7 +1356,10 @@ describe('OmniRoute Coder Transport & Structured Edits', () => {
       const selection = resolveCoderProvider({
         selected_provider_id: 'antigravity-cli',
         selected_resource_id: 'agy-01',
-      } as ExecutionAuthorization, coderBinding('antigravity-cli', 'agy-01', 'LOCAL_CLI'), coderEndpointConfig());
+      } as ExecutionAuthorization, coderBinding('antigravity-cli', 'agy-01', 'LOCAL_CLI'), coderEndpointConfig(), {
+        providerId: 'antigravity-cli',
+        resourceId: 'agy-01',
+      });
       expect(selection.provider).toBe('AGY');
 
       const db = new Database(':memory:');
@@ -1551,6 +1574,8 @@ describe('OmniRoute Coder Transport & Structured Edits', () => {
         controlRepo: controlDir,
         worktreeRoot: tempDir,
         agy: fakeAgy,
+        agyProviderId: 'provider-agy',
+        agyResourceId: 'resource-agy',
         coderEndpoint: coderEndpointConfig(),
         evidence: {
           collect: async () => ({
@@ -1823,6 +1848,8 @@ describe('OmniRoute Coder Transport & Structured Edits', () => {
         controlRepo: controlDir,
         worktreeRoot: tempDir,
         agy: fakeAgy,
+        agyProviderId: 'provider-agy',
+        agyResourceId: 'resource-agy',
         coderEndpoint: coderEndpointConfig(),
         evidence: {
           collect: async () => ({
@@ -1872,6 +1899,29 @@ describe('OmniRoute Coder Transport & Structured Edits', () => {
   });
 
   describe('7. Secret redaction', () => {
+    it('disables generic adapter execution before any raw routed output can be returned', async () => {
+      let fetchCalls = 0;
+      const transport = new ResponsesCoderEndpointTransport({
+        environment: { TEST_CODER_AUTH: secretToken },
+        fetch: async () => {
+          fetchCalls++;
+          return new Response(responsePayload(`${secretToken} https://router.example.test/v1`), { status: 200 });
+        },
+      });
+      const result = await transport.execute(coderEndpointConfig(), {
+        taskId: 'TSK-GENERIC-DISABLED',
+        projectId: 'PROJ-GENERIC-DISABLED',
+        instructions: ['return raw output'],
+        contextFiles: [],
+      });
+      expect(fetchCalls).toBe(0);
+      expect(result.status).toBe('FAILED');
+      expect(result.errorCode).toBe('PROTOCOL_INVALID');
+      expect(result.rawResponse).toBeUndefined();
+      expect(result.error).not.toContain(secretToken);
+      expect(result.error).not.toContain('router.example.test');
+    });
+
     it('redacts credentials and endpoint values from post-response contract diagnostics', async () => {
       const transport = new ResponsesCoderEndpointTransport({
         environment: { TEST_CODER_AUTH: secretToken },
