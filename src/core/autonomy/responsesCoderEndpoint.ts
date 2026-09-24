@@ -84,6 +84,38 @@ export interface CoderValidationContext {
   worktree?: string;
 }
 
+function canonicalRelativePath(rawPath: string, field: string): string {
+  const slashPath = rawPath.replace(/\\/g, '/');
+  if (path.posix.isAbsolute(slashPath) || path.win32.isAbsolute(rawPath) || /^[a-zA-Z]:/.test(rawPath)) {
+    throw new Error(`PATH_TRAVERSAL: Absolute paths are forbidden in ${field}: ${rawPath}`);
+  }
+  if (slashPath === '..' || slashPath.startsWith('../') || slashPath.includes('/../')) {
+    throw new Error(`PATH_TRAVERSAL: Path traversal is forbidden in ${field}: ${rawPath}`);
+  }
+  const canonical = path.posix.normalize(slashPath);
+  if (
+    canonical !== slashPath ||
+    canonical === '.' ||
+    canonical === '..'
+  ) {
+    throw new Error(`NON_CANONICAL_PATH: ${field} must use one canonical relative path: ${rawPath}`);
+  }
+  return canonical;
+}
+
+function canonicalBoundaryPath(rawPath: string, field: string): string {
+  const slashPath = rawPath.replace(/\\/g, '/').replace(/\/+$/, '');
+  const canonical = path.posix.normalize(slashPath);
+  if (canonical !== slashPath || canonical === '.' || canonical.includes('/../')) {
+    throw new Error(`NON_CANONICAL_PATH: ${field} must use one canonical path: ${rawPath}`);
+  }
+  return canonical;
+}
+
+function filesystemPathKey(value: string): string {
+  return process.platform === 'win32' ? value.toLowerCase() : value;
+}
+
 export function validateCoderEditBundle(
   bundle: CoderEditBundle,
   context: CoderValidationContext,
@@ -99,21 +131,24 @@ export function validateCoderEditBundle(
   }
 
   // Require allowed_paths to match the authorized list exactly
-  const contextAllowed = context.allowedPaths.map((p) => p.replace(/\\/g, '/').replace(/^\.\//, ''));
-  const bundleAllowed = bundle.allowed_paths.map((p) => p.replace(/\\/g, '/').replace(/^\.\//, ''));
+  const contextAllowed = context.allowedPaths.map((p) => canonicalRelativePath(p, 'authorized allowed_paths'));
+  const bundleAllowed = bundle.allowed_paths.map((p) => canonicalRelativePath(p, 'bundle allowed_paths'));
 
-  if (new Set(bundleAllowed).size !== bundleAllowed.length) {
+  if (new Set(bundleAllowed.map(filesystemPathKey)).size !== bundleAllowed.length) {
     throw new Error('CONTRACT_INVALID: Coder edit bundle contains duplicate allowed_paths');
+  }
+  if (new Set(contextAllowed.map(filesystemPathKey)).size !== contextAllowed.length) {
+    throw new Error('CONTRACT_INVALID: Authorized context contains duplicate allowed_paths');
   }
 
   if (
     bundleAllowed.length !== contextAllowed.length ||
-    bundleAllowed.some((entry, idx) => entry !== contextAllowed[idx])
+    bundleAllowed.some((entry, idx) => filesystemPathKey(entry) !== filesystemPathKey(contextAllowed[idx]))
   ) {
     throw new Error(`UNAUTHORIZED_PATH: Coder edit bundle declared allowed_paths does not match authorized paths exactly`);
   }
 
-  const forbidden = context.forbiddenPaths ?? ['.git'];
+  const forbidden = (context.forbiddenPaths ?? ['.git']).map((entry) => canonicalBoundaryPath(entry, 'forbidden_paths'));
   const seenEditPaths = new Set<string>();
 
   for (const edit of bundle.proposed_edits) {
@@ -121,21 +156,14 @@ export function validateCoderEditBundle(
       throw new Error(`CONTRACT_INVALID: Proposed edit content must be a string: ${edit.path}`);
     }
 
-    const normPath = edit.path.replace(/\\/g, '/').replace(/^\.\//, '');
+    const normPath = canonicalRelativePath(edit.path, 'proposed_edits.path');
+    const editKey = filesystemPathKey(normPath);
 
     // Reject duplicate edit paths
-    if (seenEditPaths.has(normPath)) {
+    if (seenEditPaths.has(editKey)) {
       throw new Error(`CONTRACT_INVALID: Duplicate edit path in proposed_edits: ${edit.path}`);
     }
-    seenEditPaths.add(normPath);
-
-    // Check for absolute path or path traversal attempts
-    if (path.isAbsolute(edit.path) || path.win32.isAbsolute(edit.path) || normPath.startsWith('/') || /^[a-zA-Z]:/.test(edit.path)) {
-      throw new Error(`PATH_TRAVERSAL: Absolute paths are forbidden: ${edit.path}`);
-    }
-    if (normPath === '..' || normPath.startsWith('../') || normPath.includes('/../')) {
-      throw new Error(`PATH_TRAVERSAL: Path traversal outside worktree is forbidden: ${edit.path}`);
-    }
+    seenEditPaths.add(editKey);
 
     // Check forbidden paths FIRST so explicitly forbidden paths like .git are classified as FORBIDDEN_PATH
     const isForbidden = forbidden.some((entry) => isPathContainedInBoundary(normPath, entry));
@@ -144,7 +172,7 @@ export function validateCoderEditBundle(
     }
 
     // Check containment in allowed paths
-    const isAllowed = context.allowedPaths.some((entry) => isPathContainedInBoundary(normPath, entry));
+    const isAllowed = contextAllowed.some((entry) => isPathContainedInBoundary(normPath, entry));
     if (!isAllowed) {
       throw new Error(`UNAUTHORIZED_PATH: Proposed edit path is not in allowed paths: ${edit.path}`);
     }
@@ -205,7 +233,7 @@ export function applyCoderEditBundle(
 
   // Complete security preflight across all proposed edits before modifying filesystem
   for (const edit of bundle.proposed_edits) {
-    const normPath = edit.path.replace(/\\/g, '/').replace(/^\.\//, '');
+    const normPath = canonicalRelativePath(edit.path, 'proposed_edits.path');
     const dest = path.resolve(resolvedWorktree, normPath);
     try {
       assertPathContained(dest, resolvedWorktree);
@@ -255,7 +283,7 @@ export function applyCoderEditBundle(
   // Preflight passed cleanly for all proposed edits. Apply edits to filesystem.
   const changedFiles: string[] = [];
   for (const edit of bundle.proposed_edits) {
-    const normPath = edit.path.replace(/\\/g, '/').replace(/^\.\//, '');
+    const normPath = canonicalRelativePath(edit.path, 'proposed_edits.path');
     const dest = path.resolve(resolvedWorktree, normPath);
 
     fs.mkdirSync(path.dirname(dest), { recursive: true });
@@ -292,7 +320,7 @@ export interface CoderResourceBinding {
 function bindingMatches(auth: ExecutionAuthorization, binding?: CoderResourceBinding | null): boolean {
   if (!binding) return false;
   if (binding.resourceId !== auth.selected_resource_id || binding.providerId !== auth.selected_provider_id) return false;
-  if (binding.providerAccountId && binding.providerAccountId !== auth.selected_account_id) return false;
+  if (binding.providerAccountId !== (auth.selected_account_id ?? null)) return false;
   return true;
 }
 

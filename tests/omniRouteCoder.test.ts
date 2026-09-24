@@ -360,6 +360,27 @@ describe('OmniRoute Coder Transport & Structured Edits', () => {
         });
       }).toThrow(/CONTRACT_INVALID/i);
     });
+
+    it('rejects aliased edit paths that resolve to the same destination before writing', () => {
+      const bundle: CoderEditBundle = {
+        protocol_version: 'coderbundle.v1',
+        task_id: 'TSK-206',
+        authorization_id: 'auth-206',
+        source_head: shaA,
+        allowed_paths: ['src/a.ts'],
+        proposed_edits: [
+          { path: 'src/a.ts', content: 'version 1' },
+          { path: 'src//a.ts', content: 'version 2' },
+        ],
+      };
+      expect(() => applyCoderEditBundle(worktreeDir, bundle, {
+        taskId: 'TSK-206',
+        authorizationId: 'auth-206',
+        sourceHead: shaA,
+        allowedPaths: ['src/a.ts'],
+      })).toThrow(/NON_CANONICAL_PATH|Duplicate edit path/i);
+      expect(fs.existsSync(path.join(worktreeDir, 'src', 'a.ts'))).toBe(false);
+    });
   });
 
   describe('3. Stale source HEAD rejection', () => {
@@ -621,6 +642,20 @@ describe('OmniRoute Coder Transport & Structured Edits', () => {
       );
       expect(selection.provider).toBe('NONE');
       expect(selection.error).toContain('AUTHORIZED_CODER_UNAVAILABLE');
+    });
+
+    it('rejects an account mismatch before either coder can be selected', () => {
+      const selection = resolveCoderProvider(
+        {
+          selected_provider_id: 'provider-omniroute',
+          selected_resource_id: 'coder-omniroute',
+          selected_account_id: 'account-wrong',
+        } as ExecutionAuthorization,
+        coderBinding('provider-omniroute', 'coder-omniroute', 'API', 'account-authorized'),
+        coderEndpointConfig(),
+      );
+      expect(selection.provider).toBe('NONE');
+      expect(selection.error).toContain('AUTHORIZATION_RESOURCE_BINDING_INVALID');
     });
 
     it('fails closed when OmniRoute fails and does not silently fall back to AGY under old authorization', async () => {
