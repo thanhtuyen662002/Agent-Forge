@@ -215,9 +215,12 @@ OmniRoute configuration distinguishes the Manager/Reviewer doctor from the coder
 `autonomy:doctor:omniroute` performs an explicit live Responses contract probe for the
 Manager and Reviewer roles (`AGENT_FORGE_MANAGER_MODEL` and `AGENT_FORGE_REVIEWER_MODEL`)
 and reports only compatibility/state and configured model names. In contrast,
-`autonomy:doctor:omniroute-coder` exercises the live coder contract (`AGENT_FORGE_CODER_MODEL`).
-The coder doctor is documented as non-mutating and as reporting availability without exposing
-endpoint or authorization values. Normal unit tests use fake endpoints.
+`autonomy:doctor:omniroute-coder` exercises the live coder contract (`AGENT_FORGE_CODER_MODEL`)
+by sending a bounded synthetic WorkOrder with fixed task, authorization, source HEAD,
+and allowed-path identities. It validates the returned `coderbundle.v1` bindings but
+does not apply proposed edits or write repository files. Its output reports only
+compatibility/status and the configured model, without endpoint or authorization values.
+Normal unit tests use fake endpoints.
 
 Coder routing already uses the product ProviderAdapter/role-aware resource path. A
 configured external-router coder adapter is available for Phase C, but AGY CLI remains
