@@ -116,7 +116,9 @@ export class ResponsesManagerEndpointTransport implements ManagerEndpointTranspo
   async review(config: ProviderEndpointConfig, input: ManagerEvidence) {
     const prompt = [
       'You are the Agent Forge reviewer. Use only the durable context package below.',
-      'Return exactly one JSON object matching managerreview.v1 and no markdown.',
+      'Return exactly this JSON shape and no markdown:',
+      '{"protocol_version":"managerreview.v1","verdict":"PASS|REPAIR|BLOCKED","reviewed_head_sha":"40 character lowercase git SHA","findings":[{"severity":"LOW|MEDIUM|HIGH|CRITICAL","title":"nonempty string","description":"nonempty string","file_path":null,"line_number":null}],"required_actions":["nonempty string"],"risk":"LOW|MEDIUM|HIGH|CRITICAL","notes":"string"}',
+      'Use empty findings and required_actions arrays when there are no findings or actions.',
       'PASS is valid only for the supplied current HEAD and deterministic evidence.',
       input.evidence,
     ].join('\n');

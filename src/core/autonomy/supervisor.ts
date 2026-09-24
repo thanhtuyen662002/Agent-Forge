@@ -17,11 +17,9 @@ import { CanonicalExecutionPayload, CanonicalExecutionPayloadSchema } from '../s
 import { ProviderEndpointConfig } from './providerEndpoint';
 import { loadOmniRouteEndpointFromEnvironment } from './responsesEndpoint';
 import {
+  CoderResourceBinding,
   ResponsesCoderEndpointTransport,
   applyCoderEditBundle,
-  isOmniRouteAuthorization,
-  isAgyAuthorization,
-  isOmniRouteCoder,
   resolveCoderProvider,
 } from './responsesCoderEndpoint';
 
@@ -99,7 +97,76 @@ export class AutonomySupervisor {
       ? config.coderEndpoint
       : loadOmniRouteEndpointFromEnvironment('CODER');
     this.coderTransport = config.coderTransport ?? new ResponsesCoderEndpointTransport();
+    if (this.coderEndpoint && !repo.getProviderResource(this.coderEndpoint.resource_id)) {
+      const providerId = 'provider-external-router';
+      if (!repo.getProvider(providerId)) {
+        repo.createProvider({
+          id: providerId,
+          name: 'Configured external router',
+          adapter_type: 'API',
+          enabled: true,
+          created_at: new Date().toISOString(),
+        });
+      }
+      repo.createProviderResource({
+        id: this.coderEndpoint.resource_id,
+        provider_id: providerId,
+        provider_account_id: null,
+        model_name: this.coderEndpoint.model_or_route,
+        health_status: this.coderEndpoint.health_state === 'DEGRADED'
+          ? 'LOW_QUOTA'
+          : this.coderEndpoint.health_state === 'CAPACITY_EXHAUSTED'
+            ? 'QUOTA_EXHAUSTED'
+            : this.coderEndpoint.health_state === 'CONTRACT_INVALID'
+              ? 'UNHEALTHY'
+              : this.coderEndpoint.health_state,
+        capabilities: [...this.coderEndpoint.capabilities],
+        enabled: this.coderEndpoint.enabled,
+        total_quota: null,
+        remaining_quota: null,
+        quota_unit: 'ROUTE_REQUESTS',
+        quota_reset_at: null,
+        quota_source: 'UNKNOWN',
+        quota_confidence: 0,
+        last_health_check: null,
+      });
+    }
     this.store.ensureSlots(this.maxWorkers);
+  }
+
+  private resolveAuthorizedCoder(auth: ExecutionAuthorization) {
+    const row = this.store.getDatabase().prepare(`
+      SELECT
+        r.id AS resource_id,
+        r.provider_id,
+        r.provider_account_id,
+        r.enabled AS resource_enabled,
+        r.health_status AS resource_health,
+        r.capabilities_json,
+        p.adapter_type,
+        p.enabled AS provider_enabled,
+        a.enabled AS account_enabled,
+        a.health_status AS account_health,
+        a.cooldown_until AS account_cooldown_until
+      FROM provider_resources r
+      JOIN providers p ON p.id = r.provider_id
+      LEFT JOIN provider_accounts a ON a.id = r.provider_account_id
+      WHERE r.id = ?
+    `).get(auth.selected_resource_id) as Record<string, unknown> | undefined;
+    const binding: CoderResourceBinding | null = row ? {
+      resourceId: String(row.resource_id),
+      providerId: String(row.provider_id),
+      providerAccountId: row.provider_account_id ? String(row.provider_account_id) : null,
+      adapterType: row.adapter_type as CoderResourceBinding['adapterType'],
+      providerEnabled: Boolean(row.provider_enabled),
+      resourceEnabled: Boolean(row.resource_enabled),
+      resourceHealth: String(row.resource_health),
+      capabilities: row.capabilities_json ? JSON.parse(String(row.capabilities_json)) : [],
+      accountEnabled: row.provider_account_id ? Boolean(row.account_enabled) : null,
+      accountHealth: row.account_health ? String(row.account_health) : null,
+      accountCooldownUntil: row.account_cooldown_until ? String(row.account_cooldown_until) : null,
+    } : null;
+    return resolveCoderProvider(auth, binding, this.coderEndpoint);
   }
 
   createWorkOrder(spec: AutonomousTaskSpec): WorkOrder {
@@ -148,7 +215,7 @@ export class AutonomySupervisor {
           "SELECT * FROM execution_authorizations WHERE task_id = ? AND status IN ('AUTHORIZED','DISPATCHED') ORDER BY created_at DESC LIMIT 1"
         ).get(order.task_id) as ExecutionAuthorization | undefined;
 
-        const selection = resolveCoderProvider(authRow);
+        const selection = authRow ? this.resolveAuthorizedCoder(authRow) : resolveCoderProvider(authRow);
         if (selection.provider === 'NONE') {
           provider = {
             status: 'AUTH_ERROR',
@@ -329,7 +396,7 @@ export class AutonomySupervisor {
       };
     }
 
-    const selection = resolveCoderProvider(authRow);
+    const selection = this.resolveAuthorizedCoder(authRow);
     if (selection.provider === 'NONE') {
       return {
         workOrder: order,
@@ -349,7 +416,7 @@ export class AutonomySupervisor {
       forbiddenPaths: spec.forbiddenPaths,
       dependencies: spec.dependencies,
       runCoder: async (wo) => {
-        const selection = resolveCoderProvider(authRow);
+        const selection = this.resolveAuthorizedCoder(authRow);
         if (selection.provider === 'NONE') {
           return {
             success: false,

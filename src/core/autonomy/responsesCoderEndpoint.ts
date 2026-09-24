@@ -19,6 +19,7 @@ import {
   CoderEndpointTransport,
   ProviderEndpointConfig,
   ProviderEndpointHealthState,
+  isEndpointEligible,
   parseProviderEndpointConfig,
 } from './providerEndpoint';
 import type { ProviderRun } from './providers';
@@ -172,19 +173,24 @@ export function applyCoderEditBundle(
     throw new Error(`WORKTREE_NOT_FOUND: Authorized worktree does not exist: ${worktree}`);
   }
 
-  // Independently verify that authorized worktree's Git HEAD matches bundle.source_head if in a git repository
-  try {
-    const gitHead = spawnSync('git', ['rev-parse', 'HEAD'], { cwd: resolvedWorktree, encoding: 'utf8', windowsHide: true, shell: false });
-    if (gitHead.status === 0) {
-      const currentHead = gitHead.stdout.trim().toLowerCase();
-      if (/^[0-9a-f]{40}$/i.test(currentHead) && currentHead !== bundle.source_head.toLowerCase()) {
-        throw new Error(`STALE_SOURCE_HEAD: Current Git HEAD (${currentHead}) does not match bundle source HEAD (${bundle.source_head})`);
-      }
-    }
-  } catch (err) {
-    if (err instanceof Error && err.message.startsWith('STALE_SOURCE_HEAD')) {
-      throw err;
-    }
+  // A routed edit is writable only after Git independently proves the exact
+  // source HEAD. Missing Git, a non-repository worktree, malformed output, and
+  // process errors all fail closed before filesystem mutation.
+  const gitHead = spawnSync('git', ['rev-parse', 'HEAD'], {
+    cwd: resolvedWorktree,
+    encoding: 'utf8',
+    windowsHide: true,
+    shell: false,
+  });
+  if (gitHead.error || gitHead.status !== 0) {
+    throw new Error('SOURCE_HEAD_UNVERIFIED: Unable to establish the authorized worktree Git HEAD');
+  }
+  const currentHead = gitHead.stdout.trim().toLowerCase();
+  if (!/^[0-9a-f]{40}$/.test(currentHead)) {
+    throw new Error('SOURCE_HEAD_UNVERIFIED: Git returned an invalid HEAD');
+  }
+  if (currentHead !== bundle.source_head.toLowerCase()) {
+    throw new Error(`STALE_SOURCE_HEAD: Current Git HEAD (${currentHead}) does not match bundle source HEAD (${bundle.source_head})`);
   }
 
   if (context) {
@@ -269,22 +275,47 @@ export function applyCoderEditBundle(
   return { changedFiles };
 }
 
-export function isOmniRouteCoder(resourceOrProviderId: string): boolean {
-  const norm = resourceOrProviderId.toLowerCase();
-  return norm.includes('omniroute') || norm === 'external_router' || norm === 'coder-omniroute';
+export interface CoderResourceBinding {
+  resourceId: string;
+  providerId: string;
+  providerAccountId: string | null;
+  adapterType: 'MANUAL_BRIDGE' | 'LOCAL_CLI' | 'API' | 'MOCK';
+  providerEnabled: boolean;
+  resourceEnabled: boolean;
+  resourceHealth: string;
+  capabilities: string[];
+  accountEnabled?: boolean | null;
+  accountHealth?: string | null;
+  accountCooldownUntil?: string | null;
 }
 
-export function isAgyCoder(resourceOrProviderId: string): boolean {
-  const norm = resourceOrProviderId.toLowerCase();
-  return norm.includes('antigravity') || norm.includes('agy') || norm === 'local_cli';
+function bindingMatches(auth: ExecutionAuthorization, binding?: CoderResourceBinding | null): boolean {
+  if (!binding) return false;
+  if (binding.resourceId !== auth.selected_resource_id || binding.providerId !== auth.selected_provider_id) return false;
+  if (binding.providerAccountId && binding.providerAccountId !== auth.selected_account_id) return false;
+  return true;
 }
 
-export function isOmniRouteAuthorization(auth: ExecutionAuthorization): boolean {
-  return isOmniRouteCoder(auth.selected_resource_id) || isOmniRouteCoder(auth.selected_provider_id);
+function bindingIsAvailable(binding: CoderResourceBinding): boolean {
+  if (!binding.providerEnabled || !binding.resourceEnabled) return false;
+  if (!binding.capabilities.includes('CODING')) return false;
+  if (!['AVAILABLE', 'LOW_QUOTA'].includes(binding.resourceHealth)) return false;
+  if (binding.accountEnabled === false) return false;
+  if (binding.accountHealth && !['AVAILABLE', 'LOW_QUOTA'].includes(binding.accountHealth)) return false;
+  if (binding.accountCooldownUntil && Date.parse(binding.accountCooldownUntil) > Date.now()) return false;
+  return true;
 }
 
-export function isAgyAuthorization(auth: ExecutionAuthorization): boolean {
-  return isAgyCoder(auth.selected_resource_id) || isAgyCoder(auth.selected_provider_id);
+export function isOmniRouteAuthorization(
+  auth: ExecutionAuthorization,
+  binding?: CoderResourceBinding | null,
+  endpoint?: ProviderEndpointConfig | null,
+): boolean {
+  return !!endpoint && endpoint.resource_id === auth.selected_resource_id && bindingMatches(auth, binding);
+}
+
+export function isAgyAuthorization(auth: ExecutionAuthorization, binding?: CoderResourceBinding | null): boolean {
+  return bindingMatches(auth, binding) && binding?.adapterType === 'LOCAL_CLI';
 }
 
 export type CoderProviderSelection =
@@ -292,19 +323,47 @@ export type CoderProviderSelection =
   | { provider: 'AGY'; error?: never }
   | { provider: 'NONE'; error: string };
 
-export function resolveCoderProvider(auth?: ExecutionAuthorization | null): CoderProviderSelection {
+export function resolveCoderProvider(
+  auth?: ExecutionAuthorization | null,
+  binding?: CoderResourceBinding | null,
+  endpoint?: ProviderEndpointConfig | null,
+): CoderProviderSelection {
   if (!auth) {
     return { provider: 'NONE', error: 'AUTHORIZATION_MISSING: ExecutionAuthorization required for coder execution' };
   }
-  const isOmni = isOmniRouteAuthorization(auth);
-  const isAgy = isAgyAuthorization(auth);
+  const isOmni = isOmniRouteAuthorization(auth, binding, endpoint);
+  const isAgy = isAgyAuthorization(auth, binding);
   if (isOmni && isAgy) {
     return {
       provider: 'NONE',
       error: `AUTHORIZATION_AMBIGUOUS: ExecutionAuthorization has conflicting provider selection (${auth.selected_provider_id}/${auth.selected_resource_id})`,
     };
   }
+  if (!bindingMatches(auth, binding)) {
+    return {
+      provider: 'NONE',
+      error: `AUTHORIZATION_RESOURCE_BINDING_INVALID: ExecutionAuthorization does not match a registered provider resource (${auth.selected_provider_id}/${auth.selected_resource_id})`,
+    };
+  }
+  if (!bindingIsAvailable(binding!)) {
+    return {
+      provider: 'NONE',
+      error: `AUTHORIZED_CODER_UNAVAILABLE: Selected coder resource is disabled, unhealthy, cooled down, or lacks CODING capability (${auth.selected_provider_id}/${auth.selected_resource_id})`,
+    };
+  }
   if (isOmni) {
+    if (binding!.adapterType !== 'API') {
+      return {
+        provider: 'NONE',
+        error: `AUTHORIZATION_RESOURCE_BINDING_INVALID: Selected OmniRoute resource is not registered to the API adapter (${auth.selected_resource_id})`,
+      };
+    }
+    if (!endpoint || !isEndpointEligible(endpoint)) {
+      return {
+        provider: 'NONE',
+        error: `AUTHORIZED_CODER_UNAVAILABLE: Selected OmniRoute endpoint is unavailable or under cooldown (${auth.selected_resource_id})`,
+      };
+    }
     return { provider: 'OMNIROUTE' };
   }
   if (isAgy) {
@@ -314,6 +373,54 @@ export function resolveCoderProvider(auth?: ExecutionAuthorization | null): Code
     provider: 'NONE',
     error: `AUTHORIZATION_UNKNOWN_PROVIDER: ExecutionAuthorization selects unrecognized coder provider (${auth.selected_provider_id}/${auth.selected_resource_id})`,
   };
+}
+
+interface AuthorizedSourceFile {
+  path: string;
+  content: string;
+}
+
+function collectAuthorizedSourceContext(order: WorkOrder): AuthorizedSourceFile[] {
+  const worktree = path.resolve(order.worktree);
+  const forbidden = order.forbidden_paths;
+  const candidates = [...new Set([...order.context_files, ...order.allowed_paths])];
+  const files: string[] = [];
+  const add = (absolute: string) => {
+    const relative = path.relative(worktree, absolute).replace(/\\/g, '/');
+    if (!relative || relative.startsWith('../') || path.isAbsolute(relative)) {
+      throw new Error('SOURCE_CONTEXT_PATH_INVALID: authorized source escaped the worktree');
+    }
+    if (forbidden.some((entry) => isPathContainedInBoundary(relative, entry))) return;
+    const stat = fs.lstatSync(absolute);
+    if (stat.isSymbolicLink()) throw new Error(`SOURCE_CONTEXT_PATH_INVALID: symlink source is forbidden: ${relative}`);
+    if (stat.isDirectory()) {
+      for (const child of fs.readdirSync(absolute).sort()) add(path.join(absolute, child));
+    } else if (stat.isFile()) {
+      files.push(relative);
+    }
+  };
+
+  for (const candidate of candidates) {
+    const relative = candidate.replace(/\\/g, '/').replace(/^\.\//, '');
+    if (!relative || relative === '..' || relative.startsWith('../') || path.isAbsolute(candidate) || path.win32.isAbsolute(candidate)) {
+      throw new Error(`SOURCE_CONTEXT_PATH_INVALID: ${candidate}`);
+    }
+    const absolute = path.resolve(worktree, relative);
+    assertPathContained(absolute, worktree);
+    if (fs.existsSync(absolute)) add(absolute);
+  }
+
+  const unique = [...new Set(files)].sort();
+  if (unique.length > 64) throw new Error('SOURCE_CONTEXT_LIMIT_EXCEEDED: more than 64 authorized source files');
+  let totalBytes = 0;
+  return unique.map((relative) => {
+    const absolute = path.resolve(worktree, relative);
+    const buffer = fs.readFileSync(absolute);
+    totalBytes += buffer.byteLength;
+    if (totalBytes > 512 * 1024) throw new Error('SOURCE_CONTEXT_LIMIT_EXCEEDED: authorized source exceeds 512 KiB');
+    if (buffer.includes(0)) throw new Error(`SOURCE_CONTEXT_BINARY_UNSUPPORTED: ${relative}`);
+    return { path: relative, content: buffer.toString('utf8') };
+  });
 }
 
 export interface CoderDoctorResult {
@@ -389,6 +496,13 @@ export class ResponsesCoderEndpointTransport implements CoderEndpointTransport {
     order: WorkOrder,
     authorizationId: string,
   ): Promise<{ run: ProviderRun; bundle?: CoderEditBundle }> {
+    let sourceFiles: AuthorizedSourceFile[];
+    try {
+      sourceFiles = collectAuthorizedSourceContext(order);
+    } catch (error) {
+      const message = sanitizeAutonomyText(error instanceof Error ? error.message : String(error));
+      return { run: failedRun('CONTRACT_INVALID', message, Date.now()) };
+    }
     const prompt = [
       'You are the Agent Forge routed coder. You return proposed edits only; you do not execute tests or edit Git.',
       'Return exactly one JSON object matching coderbundle.v1 and no markdown.',
@@ -404,6 +518,7 @@ export class ResponsesCoderEndpointTransport implements CoderEndpointTransport {
         objective: order.objective,
         acceptance_criteria: order.acceptance_criteria,
         context_files: order.context_files,
+        authorized_source_files: sourceFiles,
         constraints: order.constraints,
       }),
     ].join('\n');
