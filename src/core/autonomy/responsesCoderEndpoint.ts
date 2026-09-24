@@ -53,6 +53,62 @@ export const CoderEditBundleSchema = z.object({
 }).strict();
 export type CoderEditBundle = z.infer<typeof CoderEditBundleSchema>;
 
+export const CoderBundleJsonSchema = {
+  type: 'object',
+  additionalProperties: false,
+  required: [
+    'protocol_version',
+    'task_id',
+    'authorization_id',
+    'source_head',
+    'allowed_paths',
+    'proposed_edits',
+    'summary',
+  ],
+  properties: {
+    protocol_version: {
+      type: 'string',
+      enum: ['coderbundle.v1'],
+    },
+    task_id: {
+      type: 'string',
+    },
+    authorization_id: {
+      type: 'string',
+    },
+    source_head: {
+      type: 'string',
+    },
+    allowed_paths: {
+      type: 'array',
+      items: {
+        type: 'string',
+      },
+    },
+    proposed_edits: {
+      type: 'array',
+      items: {
+        type: 'object',
+        additionalProperties: false,
+        required: ['path', 'content'],
+        properties: {
+          path: {
+            type: 'string',
+          },
+          content: {
+            type: 'string',
+          },
+        },
+      },
+    },
+    summary: {
+      type: 'string',
+    },
+  },
+} as const;
+
+export const CODER_BUNDLE_JSON_SCHEMA = CoderBundleJsonSchema;
+
 export function parseCoderEditBundle(raw: string): CoderEditBundle {
   const trimmed = raw.trim();
   if (trimmed.startsWith('```') || /```/.test(trimmed)) {
@@ -683,7 +739,19 @@ export class ResponsesCoderEndpointTransport implements CoderEndpointTransport {
           'Content-Type': 'application/json',
           [config.auth_header_name]: authValue,
         },
-        body: JSON.stringify({ model: config.model_or_route, input: prompt, store: false }),
+        body: JSON.stringify({
+          model: config.model_or_route,
+          input: prompt,
+          text: {
+            format: {
+              type: 'json_schema',
+              name: 'coder_edit_bundle',
+              strict: true,
+              schema: CoderBundleJsonSchema,
+            },
+          },
+          store: false,
+        }),
         signal: controller.signal,
       });
 

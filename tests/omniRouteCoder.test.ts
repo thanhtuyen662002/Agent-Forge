@@ -17,6 +17,7 @@ import {
   loadOmniRouteEndpointFromEnvironment,
 } from '../src/core/autonomy/responsesEndpoint';
 import {
+  CoderBundleJsonSchema,
   CoderEditBundle,
   ResponsesCoderEndpointTransport,
   applyCoderEditBundle,
@@ -2248,6 +2249,162 @@ describe('OmniRoute Coder Transport & Structured Edits', () => {
       expect(result.compatible).toBe(true);
       expect(result.healthState).toBe('AVAILABLE');
       expect(result.run.status).toBe('SUCCESSFUL_PROCESS_EXIT');
+    });
+  });
+
+  describe('11. Structured Outputs / Responses API text.format schema enforcement', () => {
+    it('requests strict Structured Outputs schema in Responses API text.format for live WorkOrder execution', async () => {
+      let capturedBody: any = null;
+      const targetPath = path.join(worktreeDir, 'src', 'solution.ts');
+      fs.mkdirSync(path.dirname(targetPath), { recursive: true });
+      fs.writeFileSync(targetPath, 'export const initial = true;\n', 'utf8');
+
+      const expectedBundle: CoderEditBundle = {
+        protocol_version: 'coderbundle.v1',
+        task_id: 'TSK-STRUCTURED-001',
+        authorization_id: 'auth-structured-001',
+        source_head: shaA,
+        allowed_paths: ['src/solution.ts'],
+        proposed_edits: [
+          {
+            path: 'src/solution.ts',
+            content: 'export const initial = false;\nexport const updated = true;\n',
+          },
+        ],
+        summary: 'Updated solution with strict structured outputs',
+      };
+
+      const transport = new ResponsesCoderEndpointTransport({
+        environment: { TEST_CODER_AUTH: secretToken },
+        fetch: async (_url, init) => {
+          capturedBody = JSON.parse(String(init?.body));
+          return new Response(responsePayload(JSON.stringify(expectedBundle)), { status: 200 });
+        },
+      });
+
+      const order = createWorkOrder({
+        taskId: 'TSK-STRUCTURED-001',
+        workerId: 'coder-omniroute',
+        objective: 'verify structured outputs schema on outgoing request',
+        baseSha: shaA,
+        branch: 'test-structured',
+        worktree: worktreeDir,
+        allowedPaths: ['src/solution.ts'],
+        acceptanceCriteria: ['outgoing request includes strict json_schema'],
+        requiredTests: ['test'],
+      });
+
+      const result = await transport.executeWorkOrder(coderEndpointConfig(), order, 'auth-structured-001');
+
+      expect(result.run.status).toBe('SUCCESSFUL_PROCESS_EXIT');
+      expect(result.bundle).toEqual(expectedBundle);
+
+      // Verify outgoing request body contains text.format with strict JSON Schema
+      expect(capturedBody).toBeDefined();
+      expect(capturedBody.text).toBeDefined();
+      expect(capturedBody.text.format).toEqual({
+        type: 'json_schema',
+        name: 'coder_edit_bundle',
+        strict: true,
+        schema: CoderBundleJsonSchema,
+      });
+
+      // Assert exact schema properties and restrictions
+      expect(capturedBody.text.format.schema).toEqual({
+        type: 'object',
+        additionalProperties: false,
+        required: [
+          'protocol_version',
+          'task_id',
+          'authorization_id',
+          'source_head',
+          'allowed_paths',
+          'proposed_edits',
+          'summary',
+        ],
+        properties: {
+          protocol_version: {
+            type: 'string',
+            enum: ['coderbundle.v1'],
+          },
+          task_id: {
+            type: 'string',
+          },
+          authorization_id: {
+            type: 'string',
+          },
+          source_head: {
+            type: 'string',
+          },
+          allowed_paths: {
+            type: 'array',
+            items: {
+              type: 'string',
+            },
+          },
+          proposed_edits: {
+            type: 'array',
+            items: {
+              type: 'object',
+              additionalProperties: false,
+              required: ['path', 'content'],
+              properties: {
+                path: {
+                  type: 'string',
+                },
+                content: {
+                  type: 'string',
+                },
+              },
+            },
+          },
+          summary: {
+            type: 'string',
+          },
+        },
+      });
+
+      // Explicitly prove closed objects and rejection of extra properties
+      expect(capturedBody.text.format.schema.additionalProperties).toBe(false);
+      expect(capturedBody.text.format.schema.properties.proposed_edits.items.additionalProperties).toBe(false);
+      expect(capturedBody.text.format.schema.required).toEqual([
+        'protocol_version',
+        'task_id',
+        'authorization_id',
+        'source_head',
+        'allowed_paths',
+        'proposed_edits',
+        'summary',
+      ]);
+      expect(capturedBody.text.format.schema.properties.proposed_edits.items.required).toEqual(['path', 'content']);
+    });
+
+    it('requests strict Structured Outputs schema in Responses API text.format for contract probe', async () => {
+      let capturedBody: any = null;
+      const transport = new ResponsesCoderEndpointTransport({
+        environment: { TEST_CODER_AUTH: secretToken },
+        fetch: async (_url, init) => {
+          capturedBody = JSON.parse(String(init?.body));
+          return new Response(responsePayload(JSON.stringify({
+            protocol_version: 'coderbundle.v1',
+            task_id: 'doctor-probe',
+            authorization_id: 'auth-doctor-probe',
+            source_head: '0'.repeat(40),
+            allowed_paths: ['doctor-probe.txt'],
+            proposed_edits: [{ path: 'doctor-probe.txt', content: 'CODER_OK' }],
+            summary: 'probe ok',
+          })), { status: 200 });
+        },
+      });
+
+      const result = await transport.contract(coderEndpointConfig());
+      expect(result.compatible).toBe(true);
+      expect(capturedBody.text.format).toEqual({
+        type: 'json_schema',
+        name: 'coder_edit_bundle',
+        strict: true,
+        schema: CoderBundleJsonSchema,
+      });
     });
   });
 });
