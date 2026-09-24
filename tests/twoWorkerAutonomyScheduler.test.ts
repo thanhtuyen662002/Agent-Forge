@@ -944,6 +944,8 @@ describe('Two-Worker Autonomy Scheduler (TSK-TWO-WORKER-ENABLEMENT)', () => {
         maxWorkers: 2,
         controlRepo,
         worktreeRoot: path.join(root, 'standard-worktrees'),
+        agyProviderId: 'prov-agy-scope',
+        agyResourceId: 'res-agy-scope',
         evidence: {
           collect: async () => ({
             headSha: fixture.baseSha,
@@ -1055,6 +1057,8 @@ describe('Two-Worker Autonomy Scheduler (TSK-TWO-WORKER-ENABLEMENT)', () => {
         maxWorkers: 2,
         controlRepo,
         worktreeRoot: path.join(root, 'standard-worktrees'),
+        agyProviderId: 'prov-agy-scope',
+        agyResourceId: 'res-agy-scope',
         agy: {
           execute: async () => {
             coderCalled = true;
