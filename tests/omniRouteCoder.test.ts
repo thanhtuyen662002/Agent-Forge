@@ -2138,4 +2138,116 @@ describe('OmniRoute Coder Transport & Structured Edits', () => {
       expect(endpoint?.capabilities).not.toContain('REVIEW');
     });
   });
+
+  describe('10. Quota and capacity error classification fencing', () => {
+    it('does not misclassify valid HTTP 200 responses containing failure-state vocabulary in proposed edits or summary', async () => {
+      const codeWithVocabulary = [
+        '// Handle insufficient quota and capacity exhausted errors',
+        'export function checkSpend(limit: number): boolean {',
+        '  // ensure spend limit is not breached',
+        '  return limit > 0;',
+        '}',
+      ].join('\n');
+
+      const bundle: CoderEditBundle = {
+        protocol_version: 'coderbundle.v1',
+        task_id: 'TSK-QUOTA-VOCAB',
+        authorization_id: 'auth-quota-vocab',
+        source_head: shaA,
+        allowed_paths: ['src/quotaHelper.ts'],
+        proposed_edits: [
+          {
+            path: 'src/quotaHelper.ts',
+            content: codeWithVocabulary,
+          },
+        ],
+        summary: 'Add error handling for insufficient_quota, capacity exhausted, and spend limit conditions',
+      };
+
+      const transport = new ResponsesCoderEndpointTransport({
+        environment: { TEST_CODER_AUTH: secretToken },
+        fetch: async () => new Response(responsePayload(JSON.stringify(bundle)), { status: 200 }),
+      });
+
+      const order = createWorkOrder({
+        taskId: 'TSK-QUOTA-VOCAB',
+        workerId: 'coder-omniroute',
+        objective: 'test failure-state vocabulary in valid HTTP 200 response',
+        baseSha: shaA,
+        branch: 'test',
+        worktree: worktreeDir,
+        allowedPaths: ['src/quotaHelper.ts'],
+        acceptanceCriteria: ['pass'],
+        requiredTests: ['test'],
+      });
+
+      const result = await transport.executeWorkOrder(coderEndpointConfig(), order, 'auth-quota-vocab');
+      expect(result.run.status).toBe('SUCCESSFUL_PROCESS_EXIT');
+      expect(result.bundle).toBeDefined();
+      expect(result.bundle?.proposed_edits[0].content).toContain('insufficient quota');
+      expect(result.bundle?.summary).toContain('spend limit');
+    });
+
+    it('classifies explicit HTTP 402 and generic HTTP 429 as fail-closed rate/quota limits', async () => {
+      const paymentRequiredTransport = new ResponsesCoderEndpointTransport({
+        environment: { TEST_CODER_AUTH: secretToken },
+        fetch: async () => new Response('Payment Required', { status: 402 }),
+      });
+
+      const order = createWorkOrder({
+        taskId: 'TSK-402',
+        workerId: 'coder-omniroute',
+        objective: 'test HTTP 402',
+        baseSha: shaA,
+        branch: 'test',
+        worktree: worktreeDir,
+        allowedPaths: ['src/app.ts'],
+        acceptanceCriteria: ['pass'],
+        requiredTests: ['test'],
+      });
+
+      const prResult = await paymentRequiredTransport.executeWorkOrder(coderEndpointConfig(), order, 'auth-402');
+      expect(prResult.run.status).toBe('QUOTA_OR_RATE_LIMIT');
+      expect(prResult.run.stderr).toContain('ROUTE_CAPACITY_EXHAUSTED HTTP 402');
+      expect(prResult.bundle).toBeUndefined();
+
+      const doctorPr = await paymentRequiredTransport.contract(coderEndpointConfig());
+      expect(doctorPr.compatible).toBe(false);
+      expect(doctorPr.healthState).toBe('CAPACITY_EXHAUSTED');
+
+      const rateLimitedTransport = new ResponsesCoderEndpointTransport({
+        environment: { TEST_CODER_AUTH: secretToken },
+        fetch: async () => new Response('Too Many Requests', { status: 429 }),
+      });
+
+      const rlResult = await rateLimitedTransport.executeWorkOrder(coderEndpointConfig(), order, 'auth-429');
+      expect(rlResult.run.status).toBe('QUOTA_OR_RATE_LIMIT');
+      expect(rlResult.run.stderr).toContain('ROUTE_RATE_LIMITED HTTP 429');
+      expect(rlResult.bundle).toBeUndefined();
+
+      const doctorRl = await rateLimitedTransport.contract(coderEndpointConfig());
+      expect(doctorRl.compatible).toBe(false);
+      expect(doctorRl.healthState).toBe('RATE_LIMITED');
+    });
+
+    it('doctor contract probe succeeds when probe payload contains failure-state vocabulary at HTTP 200', async () => {
+      const transport = new ResponsesCoderEndpointTransport({
+        environment: { TEST_CODER_AUTH: secretToken },
+        fetch: async () => new Response(responsePayload(JSON.stringify({
+          protocol_version: 'coderbundle.v1',
+          task_id: 'doctor-probe',
+          authorization_id: 'auth-doctor-probe',
+          source_head: '0'.repeat(40),
+          allowed_paths: ['doctor-probe.txt'],
+          proposed_edits: [{ path: 'doctor-probe.txt', content: '// insufficient quota test\nCODER_OK' }],
+          summary: 'capacity exhausted test probe',
+        })), { status: 200 }),
+      });
+
+      const result = await transport.contract(coderEndpointConfig());
+      expect(result.compatible).toBe(true);
+      expect(result.healthState).toBe('AVAILABLE');
+      expect(result.run.status).toBe('SUCCESSFUL_PROCESS_EXIT');
+    });
+  });
 });

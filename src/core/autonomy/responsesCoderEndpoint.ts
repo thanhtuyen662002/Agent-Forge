@@ -696,7 +696,7 @@ export class ResponsesCoderEndpointTransport implements CoderEndpointTransport {
           healthState: 'AUTH_ERROR',
         };
       }
-      if (response.status === 402 || /insufficient[_ -]?quota|capacity.*exhaust|spend.?limit/i.test(safeRaw)) {
+      if (response.status === 402 || (!response.ok && /insufficient[_ -]?quota|capacity.*exhaust|spend.?limit/i.test(safeRaw))) {
         return {
           run: failedRun('QUOTA_OR_RATE_LIMIT', `ROUTE_CAPACITY_EXHAUSTED HTTP ${response.status}: ${safeRaw}`, started),
           healthState: 'CAPACITY_EXHAUSTED',

@@ -216,7 +216,7 @@ export class ResponsesManagerEndpointTransport implements ManagerEndpointTranspo
       // Capacity/quota exhaustion can arrive as HTTP 429 from Responses-compatible
       // providers. Classify its explicit error body before the generic 429 path so
       // a spend/quota failure fails closed instead of being retried after cooldown.
-      if (response.status === 402 || /insufficient[_ -]?quota|capacity.*exhaust|spend.?limit/i.test(safeRaw)) {
+      if (response.status === 402 || (!response.ok && /insufficient[_ -]?quota|capacity.*exhaust|spend.?limit/i.test(safeRaw))) {
         return { run: failedRun('QUOTA_OR_RATE_LIMIT', `ROUTE_CAPACITY_EXHAUSTED HTTP ${response.status}: ${safeRaw}`, started) };
       }
       if (response.status === 429) {

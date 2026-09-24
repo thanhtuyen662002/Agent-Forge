@@ -211,6 +211,58 @@ describe('Responses-compatible routed manager transport', () => {
     expect(result.run.stderr).not.toContain('ROUTE_RATE_LIMITED');
   });
 
+  it('classifies explicit HTTP 402 and generic HTTP 429 as fail-closed rate/quota limits', async () => {
+    const paymentRequired = new ResponsesManagerEndpointTransport({
+      environment: { TEST_ROUTER_AUTH: secret },
+      fetch: async () => new Response('Payment Required', { status: 402 }),
+    });
+    const prResult = await paymentRequired.review(endpoint(), { workOrder: order(), evidence: '{}' });
+    expect(prResult.run.status).toBe('QUOTA_OR_RATE_LIMIT');
+    expect(prResult.run.stderr).toContain('ROUTE_CAPACITY_EXHAUSTED HTTP 402');
+
+    const rateLimited = new ResponsesManagerEndpointTransport({
+      environment: { TEST_ROUTER_AUTH: secret },
+      fetch: async () => new Response('Too Many Requests', { status: 429 }),
+    });
+    const rlResult = await rateLimited.review(endpoint(), { workOrder: order(), evidence: '{}' });
+    expect(rlResult.run.status).toBe('QUOTA_OR_RATE_LIMIT');
+    expect(rlResult.run.stderr).toContain('ROUTE_RATE_LIMITED HTTP 429');
+  });
+
+  it('does not misclassify valid HTTP 200 responses containing failure-state vocabulary in normal output', async () => {
+    const reviewWithVocabulary: ManagerReview = {
+      ...review(),
+      notes: 'Ensure proper handling when insufficient quota, capacity exhausted, or spend limit errors occur.',
+      findings: [{
+        severity: 'LOW',
+        title: 'Document spend limit handling',
+        description: 'Verify behavior when capacity is exhausted or insufficient_quota is encountered.',
+        file_path: null,
+        line_number: null,
+      }],
+    };
+
+    const planOrder = order();
+    planOrder.objective = 'Implement graceful fallback when insufficient quota or capacity exhausted is reported';
+    planOrder.constraints = ['Monitor spend limit during execution'];
+
+    let calls = 0;
+    const transport = new ResponsesManagerEndpointTransport({
+      environment: { TEST_ROUTER_AUTH: secret },
+      fetch: async () => new Response(responsePayload(JSON.stringify(++calls === 1 ? planOrder : reviewWithVocabulary)), { status: 200 }),
+    });
+    const manager = managerResourceFromEndpoint(endpoint('MANAGER'), transport);
+
+    const planResult = await manager.plan!(planOrder);
+    expect(planResult.run.status).toBe('SUCCESSFUL_PROCESS_EXIT');
+    expect(planResult.workOrder?.objective).toContain('insufficient quota');
+
+    const reviewResult = await manager.review({ workOrder: planOrder, evidence: '{}' });
+    expect(reviewResult.run.status).toBe('SUCCESSFUL_PROCESS_EXIT');
+    expect(reviewResult.review?.verdict).toBe('PASS');
+    expect(reviewResult.review?.notes).toContain('spend limit');
+  });
+
   it('fails over from a routed server failure while preserving context and exact-head fencing', async () => {
     const db = new Database(':memory:');
     MigrationRunner.run(db);
