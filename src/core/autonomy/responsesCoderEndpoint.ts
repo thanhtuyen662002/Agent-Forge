@@ -33,6 +33,7 @@ import {
   ResponsesEndpointTransportOptions,
 } from './responsesEndpoint';
 import { isPathContainedInBoundary } from './productTaskAdapter';
+import type { RepairContextPackage } from './repairContext';
 
 type FetchLike = typeof fetch;
 
@@ -50,6 +51,11 @@ export const CoderEditBundleSchema = z.object({
   allowed_paths: z.array(z.string().trim().min(1)),
   proposed_edits: z.array(CoderEditFileSchema),
   summary: z.string().optional(),
+  addressed_finding_ids: z.array(z.string().trim().min(1)).optional(),
+  unresolved_finding_ids: z.array(z.string().trim().min(1)).optional(),
+  implementation_summary: z.string().optional(),
+  changed_files: z.array(z.string().trim().min(1)).optional(),
+  known_risks: z.array(z.string().trim().min(1)).optional(),
 }).strict();
 export type CoderEditBundle = z.infer<typeof CoderEditBundleSchema>;
 
@@ -103,6 +109,50 @@ export const CoderBundleJsonSchema = {
     },
     summary: {
       type: 'string',
+    },
+  },
+} as const;
+
+export const RepairCoderBundleJsonSchema = {
+  type: 'object',
+  additionalProperties: false,
+  required: [
+    'protocol_version',
+    'task_id',
+    'authorization_id',
+    'source_head',
+    'allowed_paths',
+    'proposed_edits',
+    'summary',
+  ],
+  properties: {
+    ...CoderBundleJsonSchema.properties,
+    addressed_finding_ids: {
+      type: 'array',
+      items: {
+        type: 'string',
+      },
+    },
+    unresolved_finding_ids: {
+      type: 'array',
+      items: {
+        type: 'string',
+      },
+    },
+    implementation_summary: {
+      type: 'string',
+    },
+    changed_files: {
+      type: 'array',
+      items: {
+        type: 'string',
+      },
+    },
+    known_risks: {
+      type: 'array',
+      items: {
+        type: 'string',
+      },
     },
   },
 } as const;
@@ -236,6 +286,20 @@ export function validateCoderEditBundle(
       } catch (err) {
         const msg = err instanceof Error ? err.message : String(err);
         throw new Error(`PATH_TRAVERSAL: ${msg}`);
+      }
+    }
+  }
+
+  if (bundle.changed_files) {
+    for (const f of bundle.changed_files) {
+      const normPath = canonicalRelativePath(f, 'changed_files');
+      const isForbidden = forbidden.some((entry) => isPathContainedInBoundary(normPath, entry));
+      if (isForbidden) {
+        throw new Error(`FORBIDDEN_PATH: Declared changed_files path is in forbidden paths: ${f}`);
+      }
+      const isAllowed = contextAllowed.some((entry) => isPathContainedInBoundary(normPath, entry));
+      if (!isAllowed) {
+        throw new Error(`UNAUTHORIZED_PATH: Declared changed_files path is not in allowed paths: ${f}`);
       }
     }
   }
@@ -389,9 +453,13 @@ function bindingIsAvailable(binding: CoderResourceBinding): boolean {
 export function isOmniRouteAuthorization(
   auth: ExecutionAuthorization,
   binding?: CoderResourceBinding | null,
-  endpoint?: ProviderEndpointConfig | null,
+  endpoint?: ProviderEndpointConfig | ProviderEndpointConfig[] | null,
 ): boolean {
-  return !!endpoint && endpoint.resource_id === auth.selected_resource_id && bindingMatches(auth, binding);
+  if (!endpoint) return false;
+  const matched = Array.isArray(endpoint)
+    ? endpoint.find((ep) => ep.resource_id === auth.selected_resource_id)
+    : (endpoint.resource_id === auth.selected_resource_id ? endpoint : null);
+  return !!matched && bindingMatches(auth, binding);
 }
 
 export interface AgyCoderIdentity {
@@ -419,7 +487,7 @@ export type CoderProviderSelection =
 export function resolveCoderProvider(
   auth?: ExecutionAuthorization | null,
   binding?: CoderResourceBinding | null,
-  endpoint?: ProviderEndpointConfig | null,
+  endpoint?: ProviderEndpointConfig | ProviderEndpointConfig[] | null,
   agyIdentity?: AgyCoderIdentity | null,
 ): CoderProviderSelection {
   if (!auth) {
@@ -452,7 +520,10 @@ export function resolveCoderProvider(
         error: `AUTHORIZATION_RESOURCE_BINDING_INVALID: Selected OmniRoute resource is not registered to the API adapter (${auth.selected_resource_id})`,
       };
     }
-    if (!endpoint || !isEndpointEligible(endpoint)) {
+    const targetEndpoint = Array.isArray(endpoint)
+      ? endpoint.find((ep) => ep.resource_id === auth.selected_resource_id)
+      : endpoint;
+    if (!targetEndpoint || !isEndpointEligible(targetEndpoint)) {
       return {
         provider: 'NONE',
         error: `AUTHORIZED_CODER_UNAVAILABLE: Selected OmniRoute endpoint is unavailable or under cooldown (${auth.selected_resource_id})`,
@@ -584,6 +655,7 @@ export class ResponsesCoderEndpointTransport implements CoderEndpointTransport {
     configInput: ProviderEndpointConfig,
     order: WorkOrder,
     authorizationId: string,
+    repairContext?: RepairContextPackage,
   ): Promise<{ run: ProviderRun; bundle?: CoderEditBundle }> {
     let sourceFiles: AuthorizedSourceFile[];
     try {
@@ -592,11 +664,19 @@ export class ResponsesCoderEndpointTransport implements CoderEndpointTransport {
       const message = sanitizeAutonomyText(error instanceof Error ? error.message : String(error));
       return { run: failedRun('CONTRACT_INVALID', message, Date.now()) };
     }
+    const activeRepairContext = repairContext ?? order.repair_context;
+    const isRepair = !!activeRepairContext;
     const prompt = [
-      'You are the Agent Forge routed coder. You return proposed edits only; you do not execute tests or edit Git.',
+      isRepair
+        ? 'You are the Agent Forge routed repair coder. You return proposed edits to resolve reviewer findings only; you do not execute tests or edit Git.'
+        : 'You are the Agent Forge routed coder. You return proposed edits only; you do not execute tests or edit Git.',
       'Return exactly one JSON object matching coderbundle.v1 and no markdown.',
       'Every proposed edit must specify a relative path within allowed_paths and complete replacement file contents.',
       'Preserve task_id, authorization_id, source_head, and allowed_paths exactly as specified below.',
+      ...(isRepair ? [
+        'Report addressed_finding_ids, unresolved_finding_ids, implementation_summary, changed_files, and known_risks.',
+        'Do not repeat known failed approaches.',
+      ] : []),
       JSON.stringify({
         protocol_version: 'coderbundle.v1',
         task_id: order.task_id,
@@ -609,10 +689,15 @@ export class ResponsesCoderEndpointTransport implements CoderEndpointTransport {
         context_files: order.context_files,
         authorized_source_files: sourceFiles,
         constraints: order.constraints,
+        ...(isRepair ? { repair_context: activeRepairContext } : {}),
       }),
     ].join('\n');
 
-    const result = await this.request(configInput, prompt);
+    const result = await this.request(
+      configInput,
+      prompt,
+      isRepair ? RepairCoderBundleJsonSchema : CoderBundleJsonSchema,
+    );
     if (result.run.status !== 'SUCCESSFUL_PROCESS_EXIT' || !result.text) {
       return { run: result.run };
     }
@@ -703,6 +788,7 @@ export class ResponsesCoderEndpointTransport implements CoderEndpointTransport {
   private async request(
     configInput: ProviderEndpointConfig,
     prompt: string,
+    schema: Record<string, unknown> = CoderBundleJsonSchema,
   ): Promise<{ run: ProviderRun; text?: string; healthState: ProviderEndpointHealthState }> {
     const started = Date.now();
     const config = parseProviderEndpointConfig(configInput);
@@ -744,7 +830,7 @@ export class ResponsesCoderEndpointTransport implements CoderEndpointTransport {
               type: 'json_schema',
               name: 'coder_edit_bundle',
               strict: true,
-              schema: CoderBundleJsonSchema,
+              schema,
             },
           },
           store: false,

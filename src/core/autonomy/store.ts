@@ -5,6 +5,16 @@ import Database from 'better-sqlite3';
 import { DatabaseEngine } from '../database/db';
 import { MigrationRunner } from '../database/migrations';
 import { AutonomyState, ManagerReview, WorkOrder, SelfHostTask } from './contracts';
+import type {
+  RepairContextPackage,
+  RepairOutcome,
+  NoProgressEvaluation,
+  RepairLineage,
+} from './repairContext';
+import {
+  canonicalSerializeRepairContext,
+  parseRepairContextPackage,
+} from './repairContext';
 
 export interface AutonomyWorkOrderRow {
   id: string;
@@ -544,6 +554,78 @@ export class AutonomyStore {
   event(workOrderId: string, eventType: string, payload: unknown): void {
     this.db.prepare('INSERT INTO autonomy_events (id,work_order_id,event_type,payload_json,created_at) VALUES (?,?,?,?,?)')
       .run(crypto.randomUUID(), workOrderId, eventType, JSON.stringify(payload), new Date().toISOString());
+  }
+
+  recordRepairContext(pkg: RepairContextPackage): void;
+  recordRepairContext(taskId: string, pkg: RepairContextPackage): void;
+  recordRepairContext(first: string | RepairContextPackage, second?: RepairContextPackage): void {
+    const pkg = typeof first === 'string' ? second! : first;
+    const taskId = typeof first === 'string' ? first : first.task_id;
+    this.event(taskId, 'REPAIR_CONTEXT_RECORDED', JSON.parse(canonicalSerializeRepairContext(pkg)));
+  }
+
+  getLatestRepairContext(taskId: string): RepairContextPackage | null {
+    const row = this.db.prepare(
+      "SELECT payload_json FROM autonomy_events WHERE work_order_id = ? AND event_type = 'REPAIR_CONTEXT_RECORDED' ORDER BY created_at DESC LIMIT 1"
+    ).get(taskId) as { payload_json: string } | undefined;
+    if (!row) return null;
+    return parseRepairContextPackage(row.payload_json);
+  }
+
+  listRepairContexts(taskId: string): RepairContextPackage[] {
+    const rows = this.db.prepare(
+      "SELECT payload_json FROM autonomy_events WHERE work_order_id = ? AND event_type = 'REPAIR_CONTEXT_RECORDED' ORDER BY created_at ASC"
+    ).all(taskId) as Array<{ payload_json: string }>;
+    return rows.map((r) => parseRepairContextPackage(r.payload_json));
+  }
+
+  recordRepairOutcome(outcome: RepairOutcome): void;
+  recordRepairOutcome(taskId: string, outcome: RepairOutcome): void;
+  recordRepairOutcome(first: string | RepairOutcome, second?: RepairOutcome): void {
+    const outcome = typeof first === 'string' ? second! : first;
+    const taskId = typeof first === 'string' ? first : first.task_id;
+    this.event(taskId, 'REPAIR_OUTCOME_RECORDED', outcome);
+  }
+
+  recordRepairNoProgress(taskId: string, evaluation: NoProgressEvaluation): void {
+    this.event(taskId, 'REPAIR_NO_PROGRESS', evaluation);
+  }
+
+  rebuildRepairLineage(taskId: string): RepairLineage {
+    const packages = this.listRepairContexts(taskId);
+    const outcomeRows = this.db.prepare(
+      "SELECT payload_json FROM autonomy_events WHERE work_order_id = ? AND event_type = 'REPAIR_OUTCOME_RECORDED' ORDER BY created_at ASC"
+    ).all(taskId) as Array<{ payload_json: string }>;
+    const outcomes: RepairOutcome[] = outcomeRows.map((r) => JSON.parse(r.payload_json));
+
+    const latestPkg = packages.at(-1);
+
+    const findings = latestPkg?.previous_reviewer_findings ?? [];
+    const resolvedFindingIds = latestPkg?.resolved_finding_ids ?? [];
+    const unresolvedFindingIds = latestPkg?.unresolved_finding_ids ?? [];
+    const previousCoderActions = latestPkg?.previous_coder_actions ?? [];
+    const knownFailedApproaches = latestPkg?.known_failed_approaches ?? [];
+    const nonRegressionConstraints = latestPkg?.non_regression_constraints ?? [];
+
+    return {
+      taskId,
+      authorizationId: latestPkg?.authorization_id ?? '',
+      ownershipEpoch: latestPkg?.ownership_epoch ?? 1,
+      latestAttempt: latestPkg?.attempt ?? (packages.length > 0 ? packages.length : 1),
+      baseSha: latestPkg?.base_sha ?? '',
+      currentHeadSha: latestPkg?.current_head_sha ?? '',
+      currentSnapshotSha: latestPkg?.current_snapshot_sha ?? '',
+      findings,
+      resolvedFindingIds,
+      unresolvedFindingIds,
+      previousCoderActions,
+      knownFailedApproaches,
+      nonRegressionConstraints,
+      selectedResourceId: latestPkg?.selected_resource_id ?? null,
+      selectedProviderId: latestPkg?.selected_provider_id ?? null,
+      packages,
+      outcomes,
+    };
   }
 
   isProductTask(taskId: string): boolean {

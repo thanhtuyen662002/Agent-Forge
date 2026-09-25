@@ -252,3 +252,37 @@ On the bootstrap host, Antigravity required the documented read-only rule
 `read_file(D:/Projects/AI/Agent-Forge-Worktrees)` in its global CLI settings to
 read linked worktree files. No command, outside-write, or wildcard grant was added.
 Reference: https://antigravity.google/docs/permissions/
+
+## Repair Convergence Contract (`repaircontext.v1`)
+
+The bounded repair convergence subsystem ensures that iterative repair attempts converge deterministically toward acceptable solutions or cleanly escalate without repeating failed strategies.
+
+### 1. Versioned Schema & Deterministic Hash
+- **Protocol**: `repaircontext.v1` validates strict input parameters including task authority, ownership epoch, attempt number, base SHA, exact Git HEAD, working-tree snapshot SHA, immutable acceptance criteria, allowed/forbidden paths, required tests, reviewer findings, unresolved/resolved finding IDs, prior coder actions, known failed approaches, non-regression constraints, and escalation stage.
+- **Canonical Serialization**: Canonical JSON key sorting produces deterministic SHA-256 digests (`computeRepairContextHash`) across processes and restarts.
+
+### 2. Durable SQLite Lineage & Reconstruction
+- Every `RepairContextPackage`, `RepairOutcome`, and `REPAIR_NO_PROGRESS` event is durably written to `autonomy_events` in the SQLite state store.
+- On process crash or daemon restart, `rebuildRepairLineage(taskId)` restores complete lineage without losing authorization, epoch, findings, failed approaches, coder resource, snapshot, or exact Git HEAD identity.
+
+### 3. Stable Deterministic Reviewer Finding IDs
+- Reviewer findings report `finding_id`, `severity`, `title`, `description`, `file_path`, `line_number`, `evidence`, `required_action`, and `acceptance_evidence`.
+- Explicit IDs are preserved; legacy findings lacking explicit IDs derive deterministic IDs via `deriveFindingId` from normalized title, description, file path, line number, and required action, guaranteeing identity stability across revisions.
+
+### 4. Whole-Response Coder Bundle & Independent Reconciliation
+- `coderbundle.v1` accepts `addressed_finding_ids`, `unresolved_finding_ids`, `implementation_summary`, `changed_files`, and `known_risks` as native JSON parsed as a whole response.
+- Coder claims are **never** treated as proof; Supervisor independently reconciles closure via `reconcileFindingClosure` using diff modified files, deterministic test results, post-review snapshots, and manager review verdicts.
+
+### 5. Semantic No-Progress Detection (`REPAIR_NO_PROGRESS`)
+Supervisor detects and durably records non-progress across 6 categories:
+1. `NO_OP_WITH_UNRESOLVED_ACTIONS`: Coder proposed no edits while unresolved findings remain.
+2. `UNCHANGED_SNAPSHOT_OR_DIFF`: Working tree snapshot or diff is identical to the prior attempt.
+3. `REPEATED_FAILING_TEST_SIGNATURES`: Exact normalized test failure signatures match a prior recorded attempt.
+4. `UNCHANGED_UNRESOLVED_FINDINGS`: Set of unresolved finding IDs after review is unchanged.
+5. `SEMANTICALLY_EQUIVALENT_REPEATED_PATCH`: Patch content normalizes to an identical hash as a prior attempt.
+6. `REGRESSION_OR_REVERSION_OF_EARLIER_VALID_FIX`: A finding closed in an earlier attempt regressed or was reverted.
+
+### 6. Three-Attempt Escalation Policy (`MAX_REPAIR_LOOPS=3`)
+- **Attempt 1 (`NORMAL_CODER`)**: Dispatches the normally authorized coder with the full repair context package.
+- **Attempt 2 (`EXPLICIT_EVIDENCE`)**: Refreshes evidence and explicitly highlights unresolved finding IDs and prior failed approaches.
+- **Attempt 3 (`SPECIALIST_OR_FALLBACK`)**: Requires fresh explicit ExecutionAuthorization specifically bound to either the configured repair specialist (`AGENT_FORGE_REPAIR_CODER_MODEL`) or AGY fallback (`res-antigravity-cli-coder`). Normal coder authorizations fail closed. Zero silent fallback across models or resources is permitted.

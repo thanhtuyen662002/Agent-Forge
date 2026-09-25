@@ -295,3 +295,28 @@ export function loadOmniRouteEndpointFromEnvironment(
         : ['REVIEW'],
   });
 }
+
+export function loadOmniRouteRepairCoderEndpointFromEnvironment(
+  environment: NodeJS.ProcessEnv = process.env,
+): ProviderEndpointConfig | null {
+  const baseUrl = environment.AGENT_FORGE_OMNIROUTE_BASE_URL;
+  const repairCoderModel = environment.AGENT_FORGE_REPAIR_CODER_MODEL;
+  if (!baseUrl || !repairCoderModel || environment.AGENT_FORGE_OMNIROUTE_ENABLED !== '1') return null;
+  const authEnv = environment.AGENT_FORGE_OMNIROUTE_AUTH_ENV ?? 'OMNIROUTE_AUTH_HEADER';
+  return parseProviderEndpointConfig({
+    resource_id: 'repair-coder-omniroute',
+    role: 'CODER',
+    adapter_type: 'EXTERNAL_ROUTER',
+    base_url: baseUrl,
+    allow_insecure_http: environment.AGENT_FORGE_OMNIROUTE_ALLOW_HTTP === '1',
+    model_or_route: repairCoderModel,
+    auth_source: `env://${authEnv}`,
+    auth_header_name: environment.AGENT_FORGE_OMNIROUTE_AUTH_HEADER_NAME ?? 'Authorization',
+    priority: 285,
+    timeout_ms: Number(environment.AGENT_FORGE_OMNIROUTE_TIMEOUT_MS ?? 120_000),
+    enabled: true,
+    health_state: 'AVAILABLE',
+    cooldown_state: { active: false, until: null, reason: null },
+    capabilities: ['CODING'],
+  });
+}
