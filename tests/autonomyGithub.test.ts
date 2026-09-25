@@ -195,4 +195,80 @@ describe('durable GitHub CI observation', () => {
     expect(evidence).toContain('Missing URL: no details URL');
     db.close();
   });
+
+  it('ignores an older cancelled duplicate when a newer same-name Actions run succeeded on the exact head', async () => {
+    const { db, store, row } = setup();
+    const observer = new GithubCiObserver(store, process.cwd(), undefined, async () => ({
+      status: 0,
+      stderr: '',
+      stdout: JSON.stringify({
+        number: 67,
+        isDraft: true,
+        headRefName: row.branch,
+        headRefOid: sha,
+        statusCheckRollup: [
+          {
+            name: 'AgentForge Fast PR Validation',
+            status: 'COMPLETED',
+            conclusion: 'CANCELLED',
+            detailsUrl: 'https://github.com/owner/repo/actions/runs/36026993766',
+          },
+          {
+            name: 'AgentForge Fast PR Validation',
+            status: 'COMPLETED',
+            conclusion: 'SUCCESS',
+            detailsUrl: 'https://github.com/owner/repo/actions/runs/36027204367',
+          },
+          {
+            name: 'AgentForge CI',
+            status: 'COMPLETED',
+            conclusion: 'SUCCESS',
+            detailsUrl: 'https://github.com/owner/repo/actions/runs/36027204419',
+          },
+        ],
+      }),
+    }));
+    const watch = observer.register({ taskId: row.task_id, workOrderId: row.id, repository: 'owner/repo', prNumber: 67, branch: row.branch, expectedHeadSha: sha });
+    const result = await observer.observe(watch);
+    expect(result.conclusion).toBe('SUCCESS');
+    expect(store.getWorkOrder(row.id)?.state).toBe('MERGE_READY');
+    expect(store.getDatabase().prepare('SELECT state FROM autonomy_ci_watches WHERE id=?').get(watch.id)).toMatchObject({ state: 'CI_SUCCESS' });
+    db.close();
+  });
+
+  it('does not hide a newer cancelled duplicate behind an older successful run', async () => {
+    const { db, store, row } = setup();
+    const observer = new GithubCiObserver(store, process.cwd(), undefined, async (_exe, args) => ({
+      status: 0,
+      stderr: '',
+      stdout: args[0] === 'pr'
+        ? JSON.stringify({
+            number: 68,
+            isDraft: true,
+            headRefName: row.branch,
+            headRefOid: sha,
+            statusCheckRollup: [
+              {
+                name: 'AgentForge Fast PR Validation',
+                status: 'COMPLETED',
+                conclusion: 'SUCCESS',
+                detailsUrl: 'https://github.com/owner/repo/actions/runs/100',
+              },
+              {
+                name: 'AgentForge Fast PR Validation',
+                status: 'COMPLETED',
+                conclusion: 'CANCELLED',
+                detailsUrl: 'https://github.com/owner/repo/actions/runs/200',
+              },
+            ],
+          })
+        : 'cancelled run evidence',
+    }));
+    const watch = observer.register({ taskId: row.task_id, workOrderId: row.id, repository: 'owner/repo', prNumber: 68, branch: row.branch, expectedHeadSha: sha });
+    const result = await observer.observe(watch);
+    expect(result.conclusion).toBe('FAILURE');
+    expect(store.getDatabase().prepare('SELECT state FROM autonomy_ci_watches WHERE id=?').get(watch.id)).toMatchObject({ state: 'CI_FAILURE' });
+    db.close();
+  });
+
 });

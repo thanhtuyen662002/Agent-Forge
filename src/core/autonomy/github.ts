@@ -54,11 +54,32 @@ function nextPoll(attempt: number): string {
   return new Date(Date.now() + seconds * 1000).toISOString();
 }
 
+function workflowRunOrdinal(check: GithubCheck): bigint | null {
+  const runId = extractWorkflowRunId(check.detailsUrl);
+  return runId ? BigInt(runId) : null;
+}
+
+export function effectiveChecks(checks: GithubCheck[] | undefined): GithubCheck[] {
+  if (!checks?.length) return [];
+  return checks.filter((check) => {
+    if (String(check.conclusion ?? '').toUpperCase() !== 'CANCELLED') return true;
+    const cancelledRun = workflowRunOrdinal(check);
+    if (cancelledRun === null || !check.name) return true;
+    return !checks.some((candidate) => {
+      if (candidate === check || candidate.name !== check.name) return false;
+      if (String(candidate.conclusion ?? '').toUpperCase() !== 'SUCCESS') return false;
+      const successfulRun = workflowRunOrdinal(candidate);
+      return successfulRun !== null && successfulRun > cancelledRun;
+    });
+  });
+}
+
 function classifyChecks(checks: GithubCheck[] | undefined): CiConclusion {
-  if (!checks?.length) return 'PENDING';
-  if (checks.some((check) => check.status !== 'COMPLETED' && check.conclusion !== 'SUCCESS')) return 'PENDING';
-  if (checks.some((check) => failureConclusions.has(String(check.conclusion ?? '').toUpperCase()))) return 'FAILURE';
-  return checks.every((check) => successConclusions.has(String(check.conclusion ?? '').toUpperCase())) ? 'SUCCESS' : 'PENDING';
+  const currentChecks = effectiveChecks(checks);
+  if (!currentChecks.length) return 'PENDING';
+  if (currentChecks.some((check) => check.status !== 'COMPLETED' && check.conclusion !== 'SUCCESS')) return 'PENDING';
+  if (currentChecks.some((check) => failureConclusions.has(String(check.conclusion ?? '').toUpperCase()))) return 'FAILURE';
+  return currentChecks.every((check) => successConclusions.has(String(check.conclusion ?? '').toUpperCase())) ? 'SUCCESS' : 'PENDING';
 }
 
 export function extractWorkflowRunId(url: string | null | undefined): string | null {
@@ -120,11 +141,12 @@ export class GithubCiObserver {
       this.store.event(watch.work_order_id ?? watch.task_id, 'CI_HEAD_MISMATCH', { expected: watch.expected_head_sha, observed: headSha });
       return { watch, conclusion: 'FAILURE', headSha };
     }
-    const conclusion = classifyChecks(pr.statusCheckRollup);
+    const checks = effectiveChecks(pr.statusCheckRollup);
+    const conclusion = classifyChecks(checks);
     const observedAt = new Date().toISOString();
     if (conclusion === 'PENDING') {
       this.store.updateCiWatch(watch.id, { state: 'CI_WAIT', poll_attempt: watch.poll_attempt + 1, next_poll_at: nextPoll(watch.poll_attempt), last_observed_at: observedAt });
-      this.store.event(watch.work_order_id ?? watch.task_id, 'CI_OBSERVED', { conclusion, headSha, checks: pr.statusCheckRollup ?? [] });
+      this.store.event(watch.work_order_id ?? watch.task_id, 'CI_OBSERVED', { conclusion, headSha, checks, raw_checks: pr.statusCheckRollup ?? [] });
       return { watch, conclusion, headSha };
     }
     if (conclusion === 'SUCCESS') {
@@ -135,12 +157,12 @@ export class GithubCiObserver {
         const repair = this.store.findLatestWorkOrderByTask(watch.repair_task_id);
         if (repair && ['CI_WAIT', 'PR_OPEN'].includes(repair.state)) this.store.updateState(repair.id, 'MERGE_READY', repair.lease_epoch);
       }
-      this.store.event(watch.work_order_id ?? watch.task_id, 'CI_SUCCESS', { headSha, checks: pr.statusCheckRollup ?? [] });
+      this.store.event(watch.work_order_id ?? watch.task_id, 'CI_SUCCESS', { headSha, checks, raw_checks: pr.statusCheckRollup ?? [] });
       return { watch, conclusion, headSha };
     }
-    const evidence = await this.failureEvidence(watch.repository, pr.statusCheckRollup ?? []);
+    const evidence = await this.failureEvidence(watch.repository, checks);
     this.store.updateCiWatch(watch.id, { state: 'CI_FAILURE', poll_attempt: watch.poll_attempt + 1, next_poll_at: nextPoll(watch.poll_attempt), last_observed_at: observedAt });
-    this.store.event(watch.work_order_id ?? watch.task_id, 'CI_FAILURE_EVIDENCE', { headSha, evidence, checks: pr.statusCheckRollup ?? [] });
+    this.store.event(watch.work_order_id ?? watch.task_id, 'CI_FAILURE_EVIDENCE', { headSha, evidence, checks, raw_checks: pr.statusCheckRollup ?? [] });
     const row = watch.work_order_id ? this.store.getWorkOrder(watch.work_order_id) : null;
     if (!row || !this.managerPool) return { watch, conclusion, headSha, evidence };
     const order = JSON.parse(row.payload_json) as WorkOrder;
@@ -149,7 +171,7 @@ export class GithubCiObserver {
       currentHead: headSha,
       actualDiff: evidence,
       changedFiles: order.allowed_paths,
-      deterministicTests: pr.statusCheckRollup ?? [],
+      deterministicTests: checks,
       previousManagerDecisions: this.store.getDatabase().prepare('SELECT payload_json FROM autonomy_reviews WHERE work_order_id=? ORDER BY created_at').all(row.id),
       repairHistory: this.store.getDatabase().prepare("SELECT payload_json FROM autonomy_events WHERE work_order_id=? AND event_type IN ('REPAIR_REQUIRED','CI_REPAIR_QUEUED') ORDER BY created_at").all(row.id),
       prState: pr,
@@ -159,7 +181,7 @@ export class GithubCiObserver {
         pr_number: watch.pr_number,
         branch: watch.branch,
         expected_head_sha: watch.expected_head_sha,
-        status_checks: pr.statusCheckRollup ?? [],
+        status_checks: checks,
         failure_evidence: evidence,
       },
       architecturePolicyContext: [
