@@ -33,7 +33,10 @@
     "autonomy:stop": "node dist-electron/electron/autonomyCli.js stop",
     "autonomy:recover": "node dist-electron/electron/autonomyCli.js recover",
     "autonomy:observe": "node dist-electron/electron/autonomyCli.js observe",
-    "autonomy:register-ci": "node dist-electron/electron/autonomyCli.js register-ci"
+    "autonomy:register-ci": "node dist-electron/electron/autonomyCli.js register-ci",
+    "autonomy:register-review-wait": "node dist-electron/electron/autonomyCli.js register-review-wait",
+    "autonomy:review-waits": "node dist-electron/electron/autonomyCli.js review-waits",
+    "autonomy:observe-review-capacity": "node dist-electron/electron/autonomyCli.js observe-review-capacity"
   },
   "dependencies": {
     "@modelcontextprotocol/server": "2.0.0",
