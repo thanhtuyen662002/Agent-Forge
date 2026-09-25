@@ -112,7 +112,7 @@ describe('durable review-capacity resume', () => {
       baseBackoffMs: 100,
       maxBackoffMs: 1000,
     });
-    watcher.register(contextSha, head);
+    watcher.register(contextSha, head, new Date(nowMs).toISOString());
 
     const first = await watcher.observeDue();
     expect(first).toHaveLength(1);
