@@ -1,5 +1,8 @@
 # Agent-Forge: Local AI Engineering Orchestrator
 
+> **Engineering control plane:** Agent Forge is now developed web-first through GitHub Issues, Draft PR leases, protected `main`, and GitHub Actions. The local Supervisor described below remains product/runtime code under test; it is not required to coordinate repository development. See [Web Autonomy](docs/WEB_AUTONOMY.md) and [Issue Execution Protocol](docs/ISSUE_EXECUTION_PROTOCOL.md).
+
+
 **Agent-Forge** is a local desktop control plane and orchestration system for coordinating multiple AI managers, coding agents, reviewers, test runners, Git repositories, quota-aware model routing, checkpoints, handoffs, evidence, and human owner supervision.
 
 ---
@@ -168,3 +171,7 @@ npm run package:win
 - [Threat Model & Security Boundary](docs/THREAT_MODEL.md)
 - [Security & Process Execution Policy](docs/SECURITY.md)
 - [Autonomous Engineering Loop](docs/AUTONOMY.md)
+- [Web-first Autonomous Engineering](docs/WEB_AUTONOMY.md)
+- [Issue / PR Execution Protocol](docs/ISSUE_EXECUTION_PROTOCOL.md)
+- [Web Agent Roles & Watchdog](docs/WEB_AGENT_ROLES.md)
+- [Autonomous Engineering Audit — 2026-09-26](docs/AUTONOMOUS_ENGINEERING_AUDIT_2026-09-26.md)
