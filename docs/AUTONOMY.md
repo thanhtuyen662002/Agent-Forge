@@ -70,14 +70,14 @@ CanonicalExecutionPayloadSchema, but product autonomy strictly fails closed when
 absent. ProductTaskAutonomyAdapter independently observes Git evidence and
 enforces path boundaries before verification or review: any changed file outside
 workOrder.allowed_paths or inside workOrder.forbidden_paths fails closed with
-WORKER_PATH_VIOLATION. When a manager
-review exception occurs (such as provider capacity, auth, rate-limit, timeout, offline,
-or contract-invalid failures) or a post-review HEAD or working-tree snapshot freshness
-violation occurs, the adapter transitions the authoritative task via TaskService using
-FIX_VERDICT into the durable resumable repair state (CODING) while strictly fencing against
-the active task ownership epoch, ensuring the task is never stranded in REVIEWING and can be
-resumed with a new revision authorization while releasing the worker slot lease and preserving
-exact-head and verification lineage gates. Legacy
+WORKER_PATH_VIOLATION. When a manager review transport/resource failure occurs (provider capacity,
+auth, rate-limit, timeout, offline, cooldown, or contract-invalid response), the adapter
+transitions the authoritative task through TaskService using REVIEW_RETRY back to CODING
+without incrementing the semantic revision budget. The same durable authority remains
+eligible when its exact task revision/head/scope are still valid. Explicit semantic REPAIR
+verdicts, failed verification, or post-review HEAD/working-tree freshness violations still
+use FIX_VERDICT and consume revision budget. Ownership-epoch fencing remains authoritative
+for both paths, the worker slot is released, and no task is stranded in REVIEWING. Legacy
 `autonomy_*` rows are inventoried and retained as compatibility/audit evidence; they are not
 silently discarded or authoritative for new product tasks. The consolidated path
 enforces an explicitly configured maximum of `MAX_AGY_WORKERS=2` (accepting integers
@@ -97,6 +97,7 @@ commands use that fixed build and never rebuild a running controller.
 ```powershell
 npm.cmd run autonomy:doctor
 npm.cmd run autonomy:doctor:omniroute
+npm.cmd run autonomy:doctor:omniroute-coder
 npm.cmd run autonomy:shadow
 npm.cmd run autonomy:pilot
 npm.cmd run autonomy:start
@@ -211,9 +212,18 @@ closed.
 
 The auth source stores only an `env://...` reference. The secret value is read at
 dispatch time and is never included in a WorkOrder, ManagerContextPackage, SQLite
-evidence, diagnostics, or logs. `autonomy:doctor:omniroute` performs an explicit live
-Responses contract probe and reports only compatibility/state and configured model
-names. Normal unit tests use fake endpoints.
+evidence, diagnostics, or logs.
+
+OmniRoute configuration distinguishes the Manager/Reviewer doctor from the coder doctor:
+`autonomy:doctor:omniroute` performs an explicit live Responses contract probe for the
+Manager and Reviewer roles (`AGENT_FORGE_MANAGER_MODEL` and `AGENT_FORGE_REVIEWER_MODEL`)
+and reports only compatibility/state and configured model names. In contrast,
+`autonomy:doctor:omniroute-coder` exercises the live coder contract (`AGENT_FORGE_CODER_MODEL`)
+by sending a bounded synthetic WorkOrder with fixed task, authorization, source HEAD,
+and allowed-path identities. It validates the returned `coderbundle.v1` bindings but
+does not apply proposed edits or write repository files. Its output reports only
+compatibility/status and the configured model, without endpoint or authorization values.
+Normal unit tests use fake endpoints.
 
 Coder routing already uses the product ProviderAdapter/role-aware resource path. A
 configured external-router coder adapter is available for Phase C, but AGY CLI remains

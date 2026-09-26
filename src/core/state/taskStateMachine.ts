@@ -12,6 +12,7 @@ export type TaskTrigger =
   | 'START_REVIEW'
   | 'PASS_VERDICT'
   | 'FIX_VERDICT'
+  | 'REVIEW_RETRY'
   | 'MAX_REVISIONS_EXCEEDED'
   | 'QUOTA_EXHAUSTED'
   | 'HANDOFF_SUBMITTED'
@@ -130,6 +131,7 @@ export class TaskStateMachine {
 
       case 'REVIEWING':
         if (trigger === 'PASS_VERDICT') return { nextState: 'DONE', pausedFromState: null, incrementRevision: false };
+        if (trigger === 'REVIEW_RETRY') return { nextState: 'CODING', pausedFromState: null, incrementRevision: false };
         if (trigger === 'FIX_VERDICT') {
           if (revisionCount + 1 >= maxRevisions) {
             return { nextState: 'NEEDS_HUMAN', pausedFromState: null, incrementRevision: true };

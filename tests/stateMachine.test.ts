@@ -76,6 +76,15 @@ describe('TaskStateMachine', () => {
     expect(resumeRes.pausedFromState).toBeNull();
   });
 
+  it('retries a reviewer transport/provider failure without consuming revision budget', () => {
+    const res = TaskStateMachine.transition('REVIEWING', 'REVIEW_RETRY', {
+      revisionCount: 2,
+      maxRevisions: 3,
+    });
+    expect(res.nextState).toBe('CODING');
+    expect(res.incrementRevision).toBe(false);
+  });
+
   it('should escalate to NEEDS_HUMAN when max revisions exceeded', () => {
     // 1st revision (count: 0 -> 1)
     let res = TaskStateMachine.transition('REVIEWING', 'FIX_VERDICT', { revisionCount: 0, maxRevisions: 3 });

@@ -7,6 +7,7 @@ import {
   managerResourceFromEndpoint,
   parseProviderEndpointConfig,
 } from '../src/core/autonomy/providerEndpoint';
+import { ResponsesCoderEndpointTransport } from '../src/core/autonomy/responsesCoderEndpoint';
 
 const managerEndpoint: ProviderEndpointConfig = {
   resource_id: 'manager-omniroute',
@@ -86,5 +87,29 @@ describe('configured provider endpoints', () => {
     const result = await adapter.execute({ taskId: 'task-1', projectId: 'project-1', instructions: [], contextFiles: [] });
     expect(result.status).toBe('COMPLETED');
     expect(invokedRoute).toBe('coder-production:task-1');
+  });
+
+  it('fails closed when generic adapter execution lacks coderbundle authority', async () => {
+    const endpoint: ProviderEndpointConfig = {
+      ...managerEndpoint,
+      resource_id: 'coder-omniroute',
+      role: 'CODER',
+      model_or_route: 'coder-production',
+      capabilities: ['CODING'],
+    };
+    const transport = new ResponsesCoderEndpointTransport({
+      environment: { AGENT_FORGE_OMNIROUTE_TOKEN: 'secret-token' },
+      fetch: async () => { throw new Error('generic execution must not contact the route'); },
+    });
+    const adapter = new ConfiguredCoderEndpointAdapter(endpoint, transport);
+    const result = await adapter.execute({
+      taskId: 'task-test',
+      projectId: 'proj-test',
+      instructions: ['write code'],
+      contextFiles: [],
+    });
+    expect(result.status).toBe('FAILED');
+    expect(result.errorCode).toBe('PROTOCOL_INVALID');
+    expect(result.rawResponse).toBeUndefined();
   });
 });

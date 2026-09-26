@@ -1044,6 +1044,8 @@ describe('product-task autonomy consolidation', () => {
     const fixture = seed('task-op-dispatch');
     const supervisor = new AutonomySupervisor({
       store,
+      agyProviderId: 'provider-agy',
+      agyResourceId: 'resource-agy',
       productAdapter: adapter,
       worktreeRoot: path.join(root, 'worktrees'),
       evidence: {
@@ -1114,6 +1116,8 @@ describe('product-task autonomy consolidation', () => {
 
     const supervisor = new AutonomySupervisor({
       store,
+      agyProviderId: 'provider-agy',
+      agyResourceId: 'resource-agy',
       productAdapter: adapter,
       worktreeRoot: path.join(root, 'worktrees'),
     });
@@ -1506,7 +1510,7 @@ describe('product-task autonomy consolidation', () => {
   ];
 
   for (const { category, error, expectedSubstring } of reviewFailureCases) {
-    it(`recovers ${category} review exception (${expectedSubstring}) to CODING, releases lease, and fences stale authority`, async () => {
+    it(`recovers ${category} review exception (${expectedSubstring}) to CODING without consuming semantic repair budget`, async () => {
       const taskId = `task-review-${category}-${crypto.randomBytes(4).toString('hex')}`;
       const fixture = seed(taskId);
       const input = workOrderInput(fixture);
@@ -1556,22 +1560,22 @@ describe('product-task autonomy consolidation', () => {
       expect(updatedTask.state).toBe('CODING');
       expect(updatedTask.state).not.toBe('REVIEWING');
       expect(updatedTask.state).not.toBe('DONE');
-      expect(updatedTask.revision_count).toBe(1);
+      expect(updatedTask.revision_count).toBe(0);
 
       const slot = repo.getWorkerSlot(fixture.slotId)!;
       expect(slot.status).toBe('IDLE');
 
-      // 3. Stale authority is fenced by the revision bump
-      const staleAuthCheck = adapter.validateAuthority({
+      // 3. Provider/transport failure is not a semantic repair, so the same
+      // durable authority remains valid for a later retry.
+      const retryAuthority = adapter.validateAuthority({
         authorizationId: fixture.authorization.id,
         currentHeadSha: BASE_SHA,
       });
-      expect(staleAuthCheck.valid).toBe(false);
-      expect(staleAuthCheck.code).toBe('TASK_REVISION_MISMATCH');
+      expect(retryAuthority.valid).toBe(true);
     });
   }
 
-  it('recovers contract-invalid review object returning malformed contract to CODING, releases lease, and fences stale authority', async () => {
+  it('recovers contract-invalid review object to CODING without consuming semantic repair budget', async () => {
     const fixture = seed('task-review-invalid-contract-obj');
     const input = workOrderInput(fixture);
 
@@ -1618,15 +1622,14 @@ describe('product-task autonomy consolidation', () => {
     const updatedTask = repo.getTask(fixture.task.id)!;
     expect(updatedTask.state).toBe('CODING');
     expect(updatedTask.state).not.toBe('DONE');
-    expect(updatedTask.revision_count).toBe(1);
+    expect(updatedTask.revision_count).toBe(0);
     expect(repo.getWorkerSlot(fixture.slotId)?.status).toBe('IDLE');
 
-    const staleAuthCheck = adapter.validateAuthority({
+    const retryAuthority = adapter.validateAuthority({
       authorizationId: fixture.authorization.id,
       currentHeadSha: BASE_SHA,
     });
-    expect(staleAuthCheck.valid).toBe(false);
-    expect(staleAuthCheck.code).toBe('TASK_REVISION_MISMATCH');
+    expect(retryAuthority.valid).toBe(true);
   });
 
   it('preserves ownership epoch fencing when task ownership epoch changes during manager review exception recovery', async () => {
@@ -1677,7 +1680,7 @@ describe('product-task autonomy consolidation', () => {
     expect(repo.getWorkerSlot(fixture.slotId)?.status).toBe('IDLE');
   });
 
-  it('proves a subsequent reauthorized retry can complete end-to-end after a manager review outage while preserving exact-head and verification gates', async () => {
+  it('proves retry after manager review outage preserves repair budget, exact-head and verification gates', async () => {
     const fixture = seed('task-review-outage-retry');
     const input = workOrderInput(fixture);
 
@@ -1722,19 +1725,17 @@ describe('product-task autonomy consolidation', () => {
 
     const taskAfterOutage = repo.getTask(fixture.task.id)!;
     expect(taskAfterOutage.state).toBe('CODING');
-    expect(taskAfterOutage.revision_count).toBe(1);
+    expect(taskAfterOutage.revision_count).toBe(0);
     expect(repo.getWorkerSlot(fixture.slotId)?.status).toBe('IDLE');
 
-    // Prove stale authority is fenced
-    const staleValidation = adapter.validateAuthority({
+    // Provider capacity did not consume semantic revision budget, so the same
+    // exact durable authority remains usable after recovery.
+    const retryValidation = adapter.validateAuthority({
       authorizationId: fixture.authorization.id,
       currentHeadSha: BASE_SHA,
     });
-    expect(staleValidation.valid).toBe(false);
-    expect(staleValidation.code).toBe('TASK_REVISION_MISMATCH');
-
-    // Create durable reauthorized execution authorization for revision 1
-    const retryAuthId = createRetryAuthorization(fixture, 1);
+    expect(retryValidation.valid).toBe(true);
+    const retryAuthId = fixture.authorization.id;
 
     // --- Gate verification 1: Exact-head gate still applies on retry ---
     const headMismatchResult = await adapter.executeProductTask({
@@ -1793,10 +1794,10 @@ describe('product-task autonomy consolidation', () => {
     expect(verifFailResult.error).toBe('VERIFICATION_FAILED');
     expect(verifFailResult.leaseReleased).toBe(true);
 
-    // The failed current verification incremented the authoritative task revision,
-    // so the next attempt must use a fresh authorization for that exact revision.
-    expect(repo.getTask(fixture.task.id)?.revision_count).toBe(2);
-    const finalRetryAuthId = createRetryAuthorization(fixture, 2);
+    // A real verification failure is semantic execution evidence and still
+    // consumes one revision, requiring fresh authority for revision 1.
+    expect(repo.getTask(fixture.task.id)?.revision_count).toBe(1);
+    const finalRetryAuthId = createRetryAuthorization(fixture, 1);
 
     // --- Attempt 2: Reauthorized retry with passing verification and restored manager completes to DONE ---
     const retrySuccessResult = await adapter.executeProductTask({
@@ -1849,6 +1850,8 @@ describe('product-task autonomy consolidation', () => {
     const fixture = seed('task-op-review-outage');
     const supervisor = new AutonomySupervisor({
       store,
+      agyProviderId: 'provider-agy',
+      agyResourceId: 'resource-agy',
       productAdapter: adapter,
       worktreeRoot: path.join(root, 'worktrees'),
       evidence: {
@@ -1908,7 +1911,116 @@ describe('product-task autonomy consolidation', () => {
     expect(result.error).toContain('ALL_MANAGER_RESOURCES_UNAVAILABLE');
     expect(repo.getTask(fixture.task.id)?.state).toBe('CODING');
     expect(repo.getTask(fixture.task.id)?.state).not.toBe('REVIEWING');
+    expect(repo.getTask(fixture.task.id)?.revision_count).toBe(0);
     expect(repo.getWorkerSlot(fixture.slotId)?.status).toBe('IDLE');
     expect(store.listAll()).toHaveLength(0);
   });
+
+  it('recovers product repair history after restart and stops repeated semantic REPAIR without consuming another revision', async () => {
+    const fixture = seed('task-product-repair-convergence');
+    const input = workOrderInput(fixture);
+    const reviewFinding = {
+      severity: 'HIGH' as const,
+      title: 'Missing verification evidence',
+      description: 'First review wording',
+      file_path: 'src/example.ts',
+      line_number: 10,
+    };
+
+    const evidenceCollector = {
+      collect: async () => ({
+        headSha: BASE_SHA,
+        snapshotSha: 'snapshot-stable-repair',
+        status: '',
+        changedFiles: ['src/example.ts'],
+        diff: 'diff-stable-repair',
+        tests: [],
+      }),
+    };
+
+    const runVerification = async (authority: any, workOrder?: any) => adapter.recordVerificationObservation({
+      projectId: authority.task.project_id,
+      taskId: authority.task.id,
+      attemptId: authority.authorization.attempt_id,
+      command: process.execPath + ' --version',
+      status: 'COMPLETED' as const,
+      exitCode: 0,
+      passedCount: 1,
+      failedCount: 0,
+      durationMs: 1,
+      stdout: process.version,
+      workingDirectory: workOrder!.worktree,
+    });
+
+    const first = await adapter.executeProductTask({
+      ...input,
+      runCoder: async () => ({ success: true, currentHeadSha: BASE_SHA }),
+      evidenceCollector,
+      runVerification,
+      conductReview: async (context) => ({
+        protocol_version: 'managerreview.v1',
+        verdict: 'REPAIR',
+        reviewed_head_sha: context.current_head,
+        findings: [reviewFinding],
+        required_actions: ['Add verification evidence'],
+        risk: 'HIGH',
+        notes: 'first semantic repair',
+      }),
+    });
+
+    expect(first.success).toBe(false);
+    expect(first.finalTaskState).toBe('CODING');
+    expect(first.error).toBe('MANAGER_REPAIR');
+    expect(repo.getTask(fixture.task.id)?.revision_count).toBe(1);
+    expect(store.getDatabase().prepare(
+      "SELECT COUNT(*) AS count FROM autonomy_events WHERE work_order_id=? AND event_type='PRODUCT_REPAIR_REQUIRED'"
+    ).get(fixture.task.id)).toMatchObject({ count: 1 });
+
+    opened.engine.close();
+    opened = AutonomyStore.open(root);
+    store = opened.store;
+    repo = new Repository(store.getDatabase());
+    adapter = new ProductTaskAutonomyAdapter({
+      repo,
+      leaseService: new WorkerSlotLeaseService(repo),
+      artifactStore: new ArtifactStore(path.join(root, 'artifacts-after-restart')),
+      autonomyStore: store,
+      maxWorkers: 1,
+    });
+
+    const retryAuthorizationId = createRetryAuthorization(fixture, 1);
+    const second = await adapter.executeProductTask({
+      ...workOrderInput(fixture),
+      authorizationId: retryAuthorizationId,
+      runCoder: async () => ({ success: true, currentHeadSha: BASE_SHA }),
+      evidenceCollector,
+      runVerification,
+      conductReview: async (context) => ({
+        protocol_version: 'managerreview.v1',
+        verdict: 'REPAIR',
+        reviewed_head_sha: context.current_head,
+        findings: [{
+          ...reviewFinding,
+          description: 'Different generated wording must not hide repeated semantics',
+          line_number: 99,
+        }],
+        required_actions: ['Add verification evidence'],
+        risk: 'HIGH',
+        notes: 'same semantic repair after restart',
+      }),
+    });
+
+    expect(second.success).toBe(false);
+    expect(second.finalTaskState).toBe('NEEDS_HUMAN');
+    expect(second.error).toBe('SEMANTIC_NO_PROGRESS');
+    expect(repo.getTask(fixture.task.id)?.revision_count).toBe(1);
+    expect(repo.getWorkerSlot(fixture.slotId)?.status).toBe('IDLE');
+    expect(store.getDatabase().prepare(
+      "SELECT COUNT(*) AS count FROM autonomy_events WHERE work_order_id=? AND event_type='PRODUCT_REPAIR_REQUIRED'"
+    ).get(fixture.task.id)).toMatchObject({ count: 1 });
+    expect(store.getDatabase().prepare(
+      "SELECT COUNT(*) AS count FROM autonomy_events WHERE work_order_id=? AND event_type='PRODUCT_SEMANTIC_NO_PROGRESS'"
+    ).get(fixture.task.id)).toMatchObject({ count: 1 });
+  });
+
 });

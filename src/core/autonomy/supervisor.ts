@@ -14,6 +14,15 @@ import { ProductTaskAutonomyAdapter, renderCommand } from './productTaskAdapter'
 import { GitWorktreeService } from '../services/GitWorktreeService';
 import { AgentAssignment, ExecutionAuthorization, Task } from '../types/domain';
 import { CanonicalExecutionPayload, CanonicalExecutionPayloadSchema } from '../services/ExecutionAuthorizationService';
+import { ProviderEndpointConfig } from './providerEndpoint';
+import { loadOmniRouteEndpointFromEnvironment } from './responsesEndpoint';
+import { evaluateRepairConvergence, recoverRepairConvergence, stableFindingSignature } from './repairConvergence';
+import {
+  CoderResourceBinding,
+  ResponsesCoderEndpointTransport,
+  applyCoderEditBundle,
+  resolveCoderProvider,
+} from './responsesCoderEndpoint';
 
 export type AutonomyMode = 'SHADOW' | 'PILOT' | 'AUTONOMOUS';
 
@@ -30,6 +39,10 @@ export interface SupervisorConfig {
   controlRepo?: string;
   worktreeRoot?: string;
   productAdapter?: ProductTaskAutonomyAdapter;
+  coderTransport?: ResponsesCoderEndpointTransport;
+  coderEndpoint?: ProviderEndpointConfig | null;
+  agyProviderId?: string;
+  agyResourceId?: string;
 }
 
 export interface SupervisorRunResult {
@@ -55,6 +68,10 @@ export class AutonomySupervisor {
   readonly controlRepo: string;
   readonly worktreeRoot: string;
   readonly productAdapter: ProductTaskAutonomyAdapter;
+  readonly coderTransport: ResponsesCoderEndpointTransport;
+  readonly coderEndpoint: ProviderEndpointConfig | null;
+  readonly agyProviderId: string;
+  readonly agyResourceId: string;
 
   constructor(config: SupervisorConfig = {}) {
     this.mode = config.mode ?? ((process.env.AGENT_FORGE_MODE as AutonomyMode | undefined) ?? 'PILOT');
@@ -81,7 +98,85 @@ export class AutonomySupervisor {
       evidenceCollector: this.evidence,
       maxWorkers: this.maxWorkers,
     });
+    this.coderEndpoint = config.coderEndpoint !== undefined
+      ? config.coderEndpoint
+      : loadOmniRouteEndpointFromEnvironment('CODER');
+    this.agyProviderId = config.agyProviderId ?? process.env.AGENT_FORGE_AGY_PROVIDER_ID ?? 'prov-antigravity-cli';
+    this.agyResourceId = config.agyResourceId ?? process.env.AGENT_FORGE_AGY_RESOURCE_ID ?? 'res-antigravity-cli-coder';
+    this.coderTransport = config.coderTransport ?? new ResponsesCoderEndpointTransport();
+    if (this.coderEndpoint && !repo.getProviderResource(this.coderEndpoint.resource_id)) {
+      const providerId = 'provider-external-router';
+      if (!repo.getProvider(providerId)) {
+        repo.createProvider({
+          id: providerId,
+          name: 'Configured external router',
+          adapter_type: 'API',
+          enabled: true,
+          created_at: new Date().toISOString(),
+        });
+      }
+      repo.createProviderResource({
+        id: this.coderEndpoint.resource_id,
+        provider_id: providerId,
+        provider_account_id: null,
+        model_name: this.coderEndpoint.model_or_route,
+        health_status: this.coderEndpoint.health_state === 'DEGRADED'
+          ? 'LOW_QUOTA'
+          : this.coderEndpoint.health_state === 'CAPACITY_EXHAUSTED'
+            ? 'QUOTA_EXHAUSTED'
+            : this.coderEndpoint.health_state === 'CONTRACT_INVALID'
+              ? 'UNHEALTHY'
+              : this.coderEndpoint.health_state,
+        capabilities: [...this.coderEndpoint.capabilities],
+        enabled: this.coderEndpoint.enabled,
+        total_quota: null,
+        remaining_quota: null,
+        quota_unit: 'ROUTE_REQUESTS',
+        quota_reset_at: null,
+        quota_source: 'UNKNOWN',
+        quota_confidence: 0,
+        last_health_check: null,
+      });
+    }
     this.store.ensureSlots(this.maxWorkers);
+  }
+
+  private resolveAuthorizedCoder(auth: ExecutionAuthorization) {
+    const row = this.store.getDatabase().prepare(`
+      SELECT
+        r.id AS resource_id,
+        r.provider_id,
+        r.provider_account_id,
+        r.enabled AS resource_enabled,
+        r.health_status AS resource_health,
+        r.capabilities_json,
+        p.adapter_type,
+        p.enabled AS provider_enabled,
+        a.enabled AS account_enabled,
+        a.health_status AS account_health,
+        a.cooldown_until AS account_cooldown_until
+      FROM provider_resources r
+      JOIN providers p ON p.id = r.provider_id
+      LEFT JOIN provider_accounts a ON a.id = r.provider_account_id
+      WHERE r.id = ?
+    `).get(auth.selected_resource_id) as Record<string, unknown> | undefined;
+    const binding: CoderResourceBinding | null = row ? {
+      resourceId: String(row.resource_id),
+      providerId: String(row.provider_id),
+      providerAccountId: row.provider_account_id ? String(row.provider_account_id) : null,
+      adapterType: row.adapter_type as CoderResourceBinding['adapterType'],
+      providerEnabled: Boolean(row.provider_enabled),
+      resourceEnabled: Boolean(row.resource_enabled),
+      resourceHealth: String(row.resource_health),
+      capabilities: row.capabilities_json ? JSON.parse(String(row.capabilities_json)) : [],
+      accountEnabled: row.provider_account_id ? Boolean(row.account_enabled) : null,
+      accountHealth: row.account_health ? String(row.account_health) : null,
+      accountCooldownUntil: row.account_cooldown_until ? String(row.account_cooldown_until) : null,
+    } : null;
+    return resolveCoderProvider(auth, binding, this.coderEndpoint, {
+      providerId: this.agyProviderId,
+      resourceId: this.agyResourceId,
+    });
   }
 
   createWorkOrder(spec: AutonomousTaskSpec): WorkOrder {
@@ -119,13 +214,88 @@ export class AutonomySupervisor {
       return { workOrder: order, state: 'READY', repairLoops: 0, error: error instanceof Error ? error.message : String(error) };
     }
 
-    let repairLoops = 0;
+    const repairHistory = this.store.getDatabase().prepare(`
+      SELECT e.payload_json FROM autonomy_events e
+      JOIN autonomy_work_orders w ON w.id=e.work_order_id
+      WHERE w.task_id=? AND w.branch=? AND w.base_sha=? AND e.event_type='REPAIR_REQUIRED'
+      ORDER BY w.attempt, e.created_at
+    `).all(order.task_id, order.branch, order.base_sha) as Array<{ payload_json: string }>;
+    let { repairLoops, previousRepair } = recoverRepairConvergence(
+      repairHistory.map((item) => item.payload_json),
+    );
     try {
       const initial = await this.evidence.collect(order, []);
       if (initial.headSha !== order.base_sha || initial.status.trim()) throw new Error('WORKTREE_BASE_OR_CLEANLINESS_MISMATCH');
       while (true) {
-        const provider = await this.agy.execute(order);
-        this.store.recordRun(row.id, 'antigravity', provider);
+        let provider: ProviderRun;
+        const db = this.store.getDatabase();
+        const authRow = db.prepare(
+          "SELECT * FROM execution_authorizations WHERE task_id = ? AND status IN ('AUTHORIZED','DISPATCHED') ORDER BY created_at DESC LIMIT 1"
+        ).get(order.task_id) as ExecutionAuthorization | undefined;
+
+        const selection = authRow ? this.resolveAuthorizedCoder(authRow) : resolveCoderProvider(authRow);
+        if (selection.provider === 'NONE') {
+          provider = {
+            status: 'AUTH_ERROR',
+            exitCode: 1,
+            executionId: '',
+            stdout: '',
+            stderr: selection.error,
+            durationMs: 0,
+          };
+        } else if (selection.provider === 'OMNIROUTE') {
+          const endpoint = this.coderEndpoint ?? loadOmniRouteEndpointFromEnvironment('CODER');
+          if (!endpoint) {
+            provider = {
+              status: 'AUTH_ERROR',
+              exitCode: 1,
+              executionId: '',
+              stdout: '',
+              stderr: 'OMNIROUTE_CODER_NOT_CONFIGURED: OmniRoute coder endpoint configuration missing',
+              durationMs: 0,
+            };
+          } else {
+            const executed = await this.coderTransport.executeWorkOrder(endpoint, order, authRow!.id);
+            this.store.recordRun(row.id, 'omniroute-coder', executed.run);
+            provider = executed.run;
+            if (executed.run.status === 'SUCCESSFUL_PROCESS_EXIT' && executed.bundle) {
+              try {
+                const preEvidence = await this.evidence.collect(order, []);
+                if (preEvidence.headSha !== executed.bundle.source_head.toLowerCase()) {
+                  throw new Error(`STALE_SOURCE_HEAD: Worktree HEAD changed in flight: expected ${executed.bundle.source_head}, observed ${preEvidence.headSha}`);
+                }
+                applyCoderEditBundle(order.worktree, executed.bundle, {
+                  taskId: order.task_id,
+                  authorizationId: authRow!.id,
+                  sourceHead: preEvidence.headSha,
+                  allowedPaths: order.allowed_paths,
+                  forbiddenPaths: order.forbidden_paths,
+                });
+              } catch (applyErr) {
+                provider = {
+                  status: 'CONTRACT_INVALID',
+                  exitCode: 1,
+                  executionId: executed.run.executionId,
+                  stdout: executed.run.stdout,
+                  stderr: applyErr instanceof Error ? applyErr.message : String(applyErr),
+                  durationMs: executed.run.durationMs,
+                };
+              }
+            }
+          }
+        } else if (selection.provider === 'AGY') {
+          provider = await this.agy.execute(order);
+          this.store.recordRun(row.id, 'antigravity', provider);
+        } else {
+          provider = {
+            status: 'AUTH_ERROR',
+            exitCode: 1,
+            executionId: '',
+            stdout: '',
+            stderr: 'UNRECOGNIZED_CODER_PROVIDER',
+            durationMs: 0,
+          };
+        }
         if (provider.status !== 'SUCCESSFUL_PROCESS_EXIT') {
           const failedState: AutonomyState = provider.status === 'AUTH_ERROR' || provider.status === 'QUOTA_OR_RATE_LIMIT' ? 'BLOCKED' : 'FAILED';
           this.store.updateState(row.id, failedState, order.lease_epoch);
@@ -145,7 +315,7 @@ export class AutonomySupervisor {
           changedFiles: evidence.changedFiles,
           deterministicTests: evidence.tests,
           previousManagerDecisions: this.store.getDatabase().prepare('SELECT payload_json FROM autonomy_reviews WHERE work_order_id=? ORDER BY created_at').all(row.id),
-          repairHistory: this.store.getDatabase().prepare("SELECT payload_json FROM autonomy_events WHERE work_order_id=? AND event_type='REPAIR_REQUIRED' ORDER BY created_at").all(row.id),
+          repairHistory,
           prState: this.store.getDatabase().prepare('SELECT * FROM autonomy_claims WHERE work_order_id=?').all(row.id),
           ciState: this.store.getDatabase().prepare('SELECT * FROM autonomy_ci_watches WHERE work_order_id=?').all(row.id),
           architecturePolicyContext: ['Supervisor owns leases, worktrees, GitHub, and verification.', 'PASS requires a fresh exact HEAD match.'],
@@ -175,12 +345,27 @@ export class AutonomySupervisor {
           this.store.updateState(row.id, 'BLOCKED', order.lease_epoch);
           return { workOrder: order, state: 'BLOCKED', provider, review, headSha: currentEvidence.headSha, repairLoops };
         }
-        repairLoops += 1;
-        if (repairLoops > this.maxRepairLoops) {
+        const observation = { signature: stableFindingSignature(review, verified, fresh), snapshotSha: currentEvidence.snapshotSha ?? '' };
+        const convergence = evaluateRepairConvergence(
+          previousRepair,
+          observation,
+          repairLoops,
+          this.maxRepairLoops,
+        );
+        if (convergence.outcome === 'SEMANTIC_NO_PROGRESS') {
+          this.store.event(row.id, 'SEMANTIC_NO_PROGRESS', { signature: observation.signature, snapshotSha: observation.snapshotSha });
+          this.store.updateState(row.id, 'BLOCKED', order.lease_epoch);
+          return { workOrder: order, state: 'BLOCKED', provider, review, headSha: currentEvidence.headSha, repairLoops, error: 'SEMANTIC_NO_PROGRESS' };
+        }
+        repairLoops = convergence.nextRepairLoops;
+        if (convergence.outcome === 'MAX_REPAIR_LOOPS_EXCEEDED') {
           this.store.updateState(row.id, 'BLOCKED', order.lease_epoch);
           return { workOrder: order, state: 'BLOCKED', provider, review, headSha: currentEvidence.headSha, repairLoops, error: 'MAX_REPAIR_LOOPS_EXCEEDED' };
         }
-        this.store.event(row.id, 'REPAIR_REQUIRED', { review, verified, fresh });
+        const repairEvent = { review, verified, fresh, ...observation };
+        this.store.event(row.id, 'REPAIR_REQUIRED', repairEvent);
+        repairHistory.push({ payload_json: JSON.stringify(repairEvent) });
+        previousRepair = observation;
         this.store.releaseSlot(slot.slotId, row.id, order.lease_epoch);
         this.store.updateState(row.id, 'FAILED', order.lease_epoch);
         order = { ...order, attempt: order.attempt + 1, lease_epoch: order.lease_epoch + 1, constraints: [...order.constraints, `Repair findings: ${JSON.stringify(review.findings)}. Required actions: ${JSON.stringify(review.required_actions)}. Tests passed: ${verified}. Review fresh: ${fresh}.`] };
@@ -232,15 +417,25 @@ export class AutonomySupervisor {
 
     const db = this.store.getDatabase();
     const authRow = db.prepare(
-      "SELECT id FROM execution_authorizations WHERE task_id = ? AND status IN ('AUTHORIZED','DISPATCHED') ORDER BY created_at DESC LIMIT 1"
-    ).get(spec.taskId) as { id: string } | undefined;
+      "SELECT * FROM execution_authorizations WHERE task_id = ? AND status IN ('AUTHORIZED','DISPATCHED') ORDER BY created_at DESC LIMIT 1"
+    ).get(spec.taskId) as ExecutionAuthorization | undefined;
 
     if (!authRow) {
       return {
         workOrder: order,
         state: 'BLOCKED',
         repairLoops: 0,
-        error: 'PRODUCT_TASK_REQUIRES_EXECUTION_AUTHORIZATION: product tasks must have durable ExecutionAuthorization and cannot execute through legacy autonomy state',
+        error: 'AUTHORIZATION_MISSING: PRODUCT_TASK_REQUIRES_EXECUTION_AUTHORIZATION: product tasks must have durable ExecutionAuthorization and cannot execute through legacy autonomy state',
+      };
+    }
+
+    const selection = this.resolveAuthorizedCoder(authRow);
+    if (selection.provider === 'NONE') {
+      return {
+        workOrder: order,
+        state: 'BLOCKED',
+        repairLoops: 0,
+        error: selection.error,
       };
     }
 
@@ -254,12 +449,85 @@ export class AutonomySupervisor {
       forbiddenPaths: spec.forbiddenPaths,
       dependencies: spec.dependencies,
       runCoder: async (wo) => {
-        const provider = await this.agy.execute(wo);
-        if (provider.status !== 'SUCCESSFUL_PROCESS_EXIT') {
-          return { success: false, currentHeadSha: spec.baseSha, error: provider.error ?? provider.stderr };
+        const selection = this.resolveAuthorizedCoder(authRow);
+        if (selection.provider === 'NONE') {
+          return {
+            success: false,
+            currentHeadSha: spec.baseSha,
+            error: selection.error,
+          };
         }
-        const ev = await this.evidence.collect(wo, []);
-        return { success: true, currentHeadSha: ev.headSha };
+
+        if (selection.provider === 'OMNIROUTE') {
+          const endpoint = this.coderEndpoint ?? loadOmniRouteEndpointFromEnvironment('CODER');
+          if (!endpoint) {
+            return {
+              success: false,
+              currentHeadSha: spec.baseSha,
+              error: 'OMNIROUTE_CODER_NOT_CONFIGURED: OmniRoute coder endpoint configuration missing',
+            };
+          }
+          const executed = await this.coderTransport.executeWorkOrder(endpoint, wo, authRow.id);
+          // Product tasks do not own a legacy autonomy_work_orders row, so a
+          // legacy autonomy_runs foreign-key write would fail here. Preserve
+          // secret-safe provider evidence as an audit event instead.
+          this.store.event(authRow.task_id, 'PRODUCT_CODER_PROVIDER_RUN', {
+            provider: 'omniroute-coder',
+            selectedProviderId: authRow.selected_provider_id,
+            selectedResourceId: authRow.selected_resource_id,
+            status: executed.run.status,
+            exitCode: executed.run.exitCode,
+            executionId: executed.run.executionId,
+            durationMs: executed.run.durationMs,
+          });
+          if (executed.run.status !== 'SUCCESSFUL_PROCESS_EXIT' || !executed.bundle) {
+            return {
+              success: false,
+              currentHeadSha: spec.baseSha,
+              error: executed.run.error ?? executed.run.stderr ?? 'OMNIROUTE_CODER_FAILED',
+            };
+          }
+          try {
+            const preEvidence = await this.evidence.collect(wo, []);
+            if (preEvidence.headSha !== executed.bundle.source_head.toLowerCase()) {
+              return {
+                success: false,
+                currentHeadSha: preEvidence.headSha,
+                error: `STALE_SOURCE_HEAD: Worktree HEAD changed in flight: expected ${executed.bundle.source_head}, observed ${preEvidence.headSha}`,
+              };
+            }
+            applyCoderEditBundle(wo.worktree, executed.bundle, {
+              taskId: wo.task_id,
+              authorizationId: authRow.id,
+              sourceHead: preEvidence.headSha,
+              allowedPaths: wo.allowed_paths,
+              forbiddenPaths: wo.forbidden_paths,
+            });
+          } catch (applyErr) {
+            return {
+              success: false,
+              currentHeadSha: spec.baseSha,
+              error: applyErr instanceof Error ? applyErr.message : String(applyErr),
+            };
+          }
+          const ev = await this.evidence.collect(wo, []);
+          return { success: true, currentHeadSha: ev.headSha };
+        }
+
+        if (selection.provider === 'AGY') {
+          const provider = await this.agy.execute(wo);
+          if (provider.status !== 'SUCCESSFUL_PROCESS_EXIT') {
+            return { success: false, currentHeadSha: spec.baseSha, error: provider.error ?? provider.stderr };
+          }
+          const ev = await this.evidence.collect(wo, []);
+          return { success: true, currentHeadSha: ev.headSha };
+        }
+
+        return {
+          success: false,
+          currentHeadSha: spec.baseSha,
+          error: 'UNRECOGNIZED_CODER_PROVIDER',
+        };
       },
       runVerification: async (authority, wo) => {
         const targetOrder = wo ?? order;

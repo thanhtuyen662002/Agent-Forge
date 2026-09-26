@@ -24,6 +24,11 @@ import {
   buildManagerContextPackage,
 } from './managerPool';
 import { AutonomyStore, LegacyAutonomyInventoryReport } from './store';
+import {
+  evaluateRepairConvergence,
+  recoverRepairConvergence,
+  stableFindingSignature,
+} from './repairConvergence';
 
 /** Consolidation supports an explicitly configured two-worker maximum (1 or 2). */
 export const MAX_AGY_WORKERS = 2;
@@ -155,6 +160,32 @@ export function validateChangedFilesBoundaries(
     }
   }
   return { valid: true };
+}
+
+const RETRYABLE_REVIEW_FAILURE_MARKERS = [
+  'ALL_MANAGER_RESOURCES_UNAVAILABLE',
+  'ROUTE_CAPACITY_EXHAUSTED',
+  'CAPACITY_EXHAUSTED',
+  'CREDITS_EXHAUSTED',
+  'QUOTA_OR_RATE_LIMIT',
+  'RATE_LIMITED',
+  'AUTH_ERROR',
+  'TIMEOUT',
+  'OFFLINE',
+  'COOLDOWN',
+  'CONTRACT_INVALID',
+  'MANAGER_REVIEW_FAILED',
+] as const;
+
+/**
+ * Reviewer transport/resource failures are execution availability failures, not
+ * semantic findings. They may retry from CODING without consuming task
+ * revision budget. Exact-head/snapshot violations and explicit REPAIR verdicts
+ * are intentionally excluded and continue through FIX_VERDICT.
+ */
+export function isRetryableReviewProviderFailure(error: string): boolean {
+  const normalized = error.toUpperCase();
+  return RETRYABLE_REVIEW_FAILURE_MARKERS.some((marker) => normalized.includes(marker));
 }
 
 /**
@@ -688,7 +719,63 @@ export class ProductTaskAutonomyAdapter {
             error: `AUTHORITY_FENCED_DURING_EXECUTION: ${refreshedAuthority.code}: ${refreshedAuthority.error}`,
           };
         } else if (review.verdict !== 'PASS') {
-          task = this.transitionTask(task.id, review.verdict === 'REPAIR' ? 'FIX_VERDICT' : 'MAX_REVISIONS_EXCEEDED', authorityEpoch);
+          let repairError = `MANAGER_${review.verdict}`;
+          if (review.verdict === 'REPAIR' && this.options.autonomyStore) {
+            const repairRows = this.options.autonomyStore.getDatabase().prepare(`
+              SELECT payload_json
+              FROM autonomy_events
+              WHERE work_order_id=? AND event_type='PRODUCT_REPAIR_REQUIRED'
+              ORDER BY created_at,id
+            `).all(task.id) as Array<{ payload_json: string }>;
+            const recovered = recoverRepairConvergence(repairRows.map((row) => row.payload_json));
+            const observation = {
+              signature: stableFindingSignature(
+                review,
+                verificationReport.latestAttemptPassed,
+                freshness.fresh,
+              ),
+              snapshotSha: postReviewEvidence.snapshotSha ?? '',
+            };
+            const convergence = evaluateRepairConvergence(
+              recovered.previousRepair,
+              observation,
+              recovered.repairLoops,
+              task.max_revisions,
+            );
+
+            if (convergence.outcome === 'SEMANTIC_NO_PROGRESS') {
+              this.options.autonomyStore.event(task.id, 'PRODUCT_SEMANTIC_NO_PROGRESS', {
+                review,
+                verified: verificationReport.latestAttemptPassed,
+                fresh: freshness.fresh,
+                ...observation,
+                repairLoops: recovered.repairLoops,
+              });
+              task = this.transitionTask(task.id, 'MAX_REVISIONS_EXCEEDED', authorityEpoch);
+              repairError = 'SEMANTIC_NO_PROGRESS';
+            } else if (convergence.outcome === 'MAX_REPAIR_LOOPS_EXCEEDED') {
+              this.options.autonomyStore.event(task.id, 'PRODUCT_MAX_REPAIR_LOOPS_EXCEEDED', {
+                review,
+                verified: verificationReport.latestAttemptPassed,
+                fresh: freshness.fresh,
+                ...observation,
+                repairLoops: convergence.nextRepairLoops,
+              });
+              task = this.transitionTask(task.id, 'MAX_REVISIONS_EXCEEDED', authorityEpoch);
+              repairError = 'MAX_REPAIR_LOOPS_EXCEEDED';
+            } else {
+              this.options.autonomyStore.event(task.id, 'PRODUCT_REPAIR_REQUIRED', {
+                review,
+                verified: verificationReport.latestAttemptPassed,
+                fresh: freshness.fresh,
+                ...observation,
+                repairLoops: convergence.nextRepairLoops,
+              });
+              task = this.transitionTask(task.id, 'FIX_VERDICT', authorityEpoch);
+            }
+          } else {
+            task = this.transitionTask(task.id, review.verdict === 'REPAIR' ? 'FIX_VERDICT' : 'MAX_REVISIONS_EXCEEDED', authorityEpoch);
+          }
           result = {
             success: false,
             finalTaskState: task.state,
@@ -699,7 +786,7 @@ export class ProductTaskAutonomyAdapter {
             review,
             observedHeadSha: postReviewEvidence.headSha,
             observedSnapshotSha: postReviewEvidence.snapshotSha,
-            error: `MANAGER_${review.verdict}`,
+            error: repairError,
           };
         } else {
           task = this.transitionTask(task.id, 'PASS_VERDICT', authorityEpoch);
@@ -726,7 +813,12 @@ export class ProductTaskAutonomyAdapter {
         const currentEpoch = currentTask.ownership_epoch ?? authorityEpoch;
         if (currentEpoch === authorityEpoch) {
           try {
-            const recovered = this.transitionTask(currentTask.id, 'FIX_VERDICT', authorityEpoch);
+            const retryableProviderFailure = isRetryableReviewProviderFailure(executionError);
+            const recovered = this.transitionTask(
+              currentTask.id,
+              retryableProviderFailure ? 'REVIEW_RETRY' : 'FIX_VERDICT',
+              authorityEpoch,
+            );
             finalTaskState = recovered.state;
           } catch (recoveryError) {
             finalTaskState = this.repo.getTask(currentTask.id)?.state ?? currentTask.state;
