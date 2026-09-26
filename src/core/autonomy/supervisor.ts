@@ -16,6 +16,7 @@ import { AgentAssignment, ExecutionAuthorization, Task } from '../types/domain';
 import { CanonicalExecutionPayload, CanonicalExecutionPayloadSchema } from '../services/ExecutionAuthorizationService';
 import { ProviderEndpointConfig } from './providerEndpoint';
 import { loadOmniRouteEndpointFromEnvironment } from './responsesEndpoint';
+import { hasSemanticProgress, RepairObservation, stableFindingSignature } from './repairConvergence';
 import {
   CoderResourceBinding,
   ResponsesCoderEndpointTransport,
@@ -213,7 +214,20 @@ export class AutonomySupervisor {
       return { workOrder: order, state: 'READY', repairLoops: 0, error: error instanceof Error ? error.message : String(error) };
     }
 
-    let repairLoops = 0;
+    const repairHistory = this.store.getDatabase().prepare(`
+      SELECT e.payload_json FROM autonomy_events e
+      JOIN autonomy_work_orders w ON w.id=e.work_order_id
+      WHERE w.task_id=? AND w.branch=? AND w.base_sha=? AND e.event_type='REPAIR_REQUIRED'
+      ORDER BY w.attempt, e.created_at
+    `).all(order.task_id, order.branch, order.base_sha) as Array<{ payload_json: string }>;
+    let repairLoops = repairHistory.length;
+    let previousRepair: RepairObservation | null = null;
+    for (const item of repairHistory) {
+      const payload = JSON.parse(item.payload_json) as { review?: ManagerReview; verified?: boolean; fresh?: boolean; signature?: string; snapshotSha?: string };
+      previousRepair = payload.review && payload.snapshotSha
+        ? { signature: payload.signature ?? stableFindingSignature(payload.review, !!payload.verified, !!payload.fresh), snapshotSha: payload.snapshotSha }
+        : null;
+    }
     try {
       const initial = await this.evidence.collect(order, []);
       if (initial.headSha !== order.base_sha || initial.status.trim()) throw new Error('WORKTREE_BASE_OR_CLEANLINESS_MISMATCH');
@@ -306,7 +320,7 @@ export class AutonomySupervisor {
           changedFiles: evidence.changedFiles,
           deterministicTests: evidence.tests,
           previousManagerDecisions: this.store.getDatabase().prepare('SELECT payload_json FROM autonomy_reviews WHERE work_order_id=? ORDER BY created_at').all(row.id),
-          repairHistory: this.store.getDatabase().prepare("SELECT payload_json FROM autonomy_events WHERE work_order_id=? AND event_type='REPAIR_REQUIRED' ORDER BY created_at").all(row.id),
+          repairHistory,
           prState: this.store.getDatabase().prepare('SELECT * FROM autonomy_claims WHERE work_order_id=?').all(row.id),
           ciState: this.store.getDatabase().prepare('SELECT * FROM autonomy_ci_watches WHERE work_order_id=?').all(row.id),
           architecturePolicyContext: ['Supervisor owns leases, worktrees, GitHub, and verification.', 'PASS requires a fresh exact HEAD match.'],
@@ -336,12 +350,21 @@ export class AutonomySupervisor {
           this.store.updateState(row.id, 'BLOCKED', order.lease_epoch);
           return { workOrder: order, state: 'BLOCKED', provider, review, headSha: currentEvidence.headSha, repairLoops };
         }
+        const observation = { signature: stableFindingSignature(review, verified, fresh), snapshotSha: currentEvidence.snapshotSha ?? '' };
+        if (!hasSemanticProgress(previousRepair, observation)) {
+          this.store.event(row.id, 'SEMANTIC_NO_PROGRESS', { signature: observation.signature, snapshotSha: observation.snapshotSha });
+          this.store.updateState(row.id, 'BLOCKED', order.lease_epoch);
+          return { workOrder: order, state: 'BLOCKED', provider, review, headSha: currentEvidence.headSha, repairLoops, error: 'SEMANTIC_NO_PROGRESS' };
+        }
         repairLoops += 1;
         if (repairLoops > this.maxRepairLoops) {
           this.store.updateState(row.id, 'BLOCKED', order.lease_epoch);
           return { workOrder: order, state: 'BLOCKED', provider, review, headSha: currentEvidence.headSha, repairLoops, error: 'MAX_REPAIR_LOOPS_EXCEEDED' };
         }
-        this.store.event(row.id, 'REPAIR_REQUIRED', { review, verified, fresh });
+        const repairEvent = { review, verified, fresh, ...observation };
+        this.store.event(row.id, 'REPAIR_REQUIRED', repairEvent);
+        repairHistory.push({ payload_json: JSON.stringify(repairEvent) });
+        previousRepair = observation;
         this.store.releaseSlot(slot.slotId, row.id, order.lease_epoch);
         this.store.updateState(row.id, 'FAILED', order.lease_epoch);
         order = { ...order, attempt: order.attempt + 1, lease_epoch: order.lease_epoch + 1, constraints: [...order.constraints, `Repair findings: ${JSON.stringify(review.findings)}. Required actions: ${JSON.stringify(review.required_actions)}. Tests passed: ${verified}. Review fresh: ${fresh}.`] };
@@ -591,9 +614,14 @@ export interface SupervisorQueueCiObserver {
   publishAcceptedRepair?: (taskId: string, worktree: string, branch: string) => Promise<string | null>;
 }
 
+export interface SupervisorQueueReviewCapacityObserver {
+  observeDue: () => Promise<any[]>;
+}
+
 export interface SupervisorQueueOptions {
   supervisor: AutonomySupervisor;
   ci?: SupervisorQueueCiObserver;
+  reviewCapacity?: SupervisorQueueReviewCapacityObserver;
   controlRepo?: string;
   worktreeRoot?: string;
   pollIntervalMs?: number;
@@ -608,6 +636,7 @@ export class SupervisorContinuousQueue {
   readonly controlRepo: string;
   readonly worktreeRoot: string;
   readonly ci?: SupervisorQueueCiObserver;
+  readonly reviewCapacity?: SupervisorQueueReviewCapacityObserver;
   private readonly options: SupervisorQueueOptions;
   private readonly activeTasks = new Map<string, Promise<void>>();
   private readonly activeWorkers = new Map<string, string>();
@@ -620,6 +649,7 @@ export class SupervisorContinuousQueue {
     this.controlRepo = path.resolve(options.controlRepo ?? options.supervisor.controlRepo);
     this.worktreeRoot = path.resolve(options.worktreeRoot ?? options.supervisor.worktreeRoot);
     this.ci = options.ci;
+    this.reviewCapacity = options.reviewCapacity;
   }
 
   getActiveTaskCount(): number {
@@ -646,7 +676,7 @@ export class SupervisorContinuousQueue {
     return null;
   }
 
-  async step(): Promise<{ dispatched: string | null; workerId: string | null; observations: any[] }> {
+  async step(): Promise<{ dispatched: string | null; workerId: string | null; observations: any[]; reviewObservations: any[] }> {
     let dispatched: string | null = null;
     let assignedWorker: string | null = null;
 
@@ -706,7 +736,22 @@ export class SupervisorContinuousQueue {
       }
     }
 
-    return { dispatched, workerId: assignedWorker, observations };
+    let reviewObservations: any[] = [];
+    if (this.reviewCapacity) {
+      try {
+        reviewObservations = await this.reviewCapacity.observeDue();
+        for (const obs of reviewObservations) {
+          this.options.onEvent?.(
+            obs.status === 'WAITING_CAPACITY' ? 'REVIEW_CAPACITY_DEFERRED' : 'REVIEW_CAPACITY_RESULT',
+            obs,
+          );
+        }
+      } catch (error) {
+        this.options.onEvent?.('REVIEW_CAPACITY_RETRY_DEFERRED', { error: String(error) });
+      }
+    }
+
+    return { dispatched, workerId: assignedWorker, observations, reviewObservations };
   }
 
   async waitForAllActive(): Promise<void> {

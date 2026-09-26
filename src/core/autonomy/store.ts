@@ -45,6 +45,22 @@ export interface AutonomyCiWatch {
   updated_at: string;
 }
 
+export interface AutonomyReviewCapacityWait {
+  id: string;
+  task_id: string;
+  context_sha: string;
+  expected_head_sha: string;
+  state: 'WAITING' | 'PASS' | 'REPAIR' | 'BLOCKED';
+  attempt_count: number;
+  next_attempt_at: string;
+  last_attempt_at: string | null;
+  last_error: string | null;
+  selected_resource: string | null;
+  verdict: 'PASS' | 'REPAIR' | 'BLOCKED' | null;
+  created_at: string;
+  updated_at: string;
+}
+
 export type ManagerResourceState =
   | 'AVAILABLE'
   | 'DEGRADED'
@@ -191,6 +207,23 @@ export const AUTONOMY_SCHEMA_SQL = `
   CREATE TABLE IF NOT EXISTS autonomy_manager_contexts (
     context_sha TEXT PRIMARY KEY, context_json TEXT NOT NULL, created_at TEXT NOT NULL
   );
+  CREATE TABLE IF NOT EXISTS autonomy_review_capacity_waits (
+    id TEXT PRIMARY KEY,
+    task_id TEXT NOT NULL,
+    context_sha TEXT NOT NULL REFERENCES autonomy_manager_contexts(context_sha),
+    expected_head_sha TEXT NOT NULL,
+    state TEXT NOT NULL CHECK(state IN ('WAITING','PASS','REPAIR','BLOCKED')),
+    attempt_count INTEGER NOT NULL DEFAULT 0,
+    next_attempt_at TEXT NOT NULL,
+    last_attempt_at TEXT,
+    last_error TEXT,
+    selected_resource TEXT,
+    verdict TEXT CHECK(verdict IS NULL OR verdict IN ('PASS','REPAIR','BLOCKED')),
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    UNIQUE(context_sha, expected_head_sha)
+  );
+  CREATE INDEX IF NOT EXISTS idx_autonomy_review_capacity_due ON autonomy_review_capacity_waits(state, next_attempt_at);
   CREATE TABLE IF NOT EXISTS autonomy_owner (id INTEGER PRIMARY KEY CHECK(id=1), pid INTEGER NOT NULL, token TEXT NOT NULL, stop_requested INTEGER NOT NULL DEFAULT 0);
   CREATE TABLE IF NOT EXISTS autonomy_compatibility_inventory (
     table_name TEXT PRIMARY KEY,
@@ -536,6 +569,85 @@ export class AutonomyStore {
     return row?.context_json ?? null;
   }
 
+  registerReviewCapacityWait(input: {
+    taskId: string;
+    contextSha: string;
+    expectedHeadSha: string;
+    nextAttemptAt?: string;
+  }): AutonomyReviewCapacityWait {
+    if (!/^[0-9a-f]{64}$/i.test(input.contextSha)) throw new Error('REVIEW_WAIT_CONTEXT_SHA_INVALID');
+    if (!/^[0-9a-f]{40}$/i.test(input.expectedHeadSha)) throw new Error('REVIEW_WAIT_HEAD_SHA_INVALID');
+    if (!this.getManagerContext(input.contextSha)) throw new Error('MANAGER_CONTEXT_NOT_FOUND');
+    return this.db.transaction(() => {
+      const now = new Date().toISOString();
+      const nextAttemptAt = input.nextAttemptAt ?? now;
+      const existing = this.db.prepare(
+        'SELECT * FROM autonomy_review_capacity_waits WHERE context_sha=? AND expected_head_sha=?'
+      ).get(input.contextSha.toLowerCase(), input.expectedHeadSha.toLowerCase()) as AutonomyReviewCapacityWait | undefined;
+      if (existing) {
+        if (existing.task_id !== input.taskId) throw new Error('REVIEW_WAIT_TASK_MISMATCH');
+        this.db.prepare(
+          "UPDATE autonomy_review_capacity_waits SET state='WAITING',next_attempt_at=?,last_error=NULL,selected_resource=NULL,verdict=NULL,updated_at=? WHERE id=?"
+        ).run(nextAttemptAt, now, existing.id);
+        const row = this.db.prepare('SELECT * FROM autonomy_review_capacity_waits WHERE id=?').get(existing.id) as AutonomyReviewCapacityWait;
+        this.event(input.taskId, 'WAITING_REVIEW_CAPACITY', row);
+        return row;
+      }
+      const row: AutonomyReviewCapacityWait = {
+        id: crypto.randomUUID(),
+        task_id: input.taskId,
+        context_sha: input.contextSha.toLowerCase(),
+        expected_head_sha: input.expectedHeadSha.toLowerCase(),
+        state: 'WAITING',
+        attempt_count: 0,
+        next_attempt_at: nextAttemptAt,
+        last_attempt_at: null,
+        last_error: null,
+        selected_resource: null,
+        verdict: null,
+        created_at: now,
+        updated_at: now,
+      };
+      this.db.prepare(
+        `INSERT INTO autonomy_review_capacity_waits
+        (id,task_id,context_sha,expected_head_sha,state,attempt_count,next_attempt_at,last_attempt_at,last_error,selected_resource,verdict,created_at,updated_at)
+        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)`
+      ).run(
+        row.id,row.task_id,row.context_sha,row.expected_head_sha,row.state,row.attempt_count,row.next_attempt_at,
+        row.last_attempt_at,row.last_error,row.selected_resource,row.verdict,row.created_at,row.updated_at
+      );
+      this.event(input.taskId, 'WAITING_REVIEW_CAPACITY', row);
+      return row;
+    })();
+  }
+
+  listReviewCapacityWaits(): AutonomyReviewCapacityWait[] {
+    return this.db.prepare('SELECT * FROM autonomy_review_capacity_waits ORDER BY created_at').all() as AutonomyReviewCapacityWait[];
+  }
+
+  listDueReviewCapacityWaits(now = new Date().toISOString()): AutonomyReviewCapacityWait[] {
+    return this.db.prepare(
+      "SELECT * FROM autonomy_review_capacity_waits WHERE state='WAITING' AND next_attempt_at<=? ORDER BY next_attempt_at,created_at"
+    ).all(now) as AutonomyReviewCapacityWait[];
+  }
+
+  updateReviewCapacityWait(
+    id: string,
+    changes: Partial<Pick<AutonomyReviewCapacityWait,
+      'state' | 'attempt_count' | 'next_attempt_at' | 'last_attempt_at' | 'last_error' | 'selected_resource' | 'verdict'
+    >>,
+  ): void {
+    const entries = Object.entries(changes);
+    if (!entries.length) return;
+    const allowed = new Set(['state','attempt_count','next_attempt_at','last_attempt_at','last_error','selected_resource','verdict']);
+    if (entries.some(([key]) => !allowed.has(key))) throw new Error('REVIEW_WAIT_UPDATE_INVALID');
+    const fields = entries.map(([key]) => `${key}=?`).join(',');
+    const result = this.db.prepare(
+      `UPDATE autonomy_review_capacity_waits SET ${fields},updated_at=? WHERE id=?`
+    ).run(...entries.map(([, value]) => value), new Date().toISOString(), id);
+    if (result.changes !== 1) throw new Error('REVIEW_WAIT_NOT_FOUND');
+  }
+
   listActiveSlots(): AutonomySlot[] {
     return (this.db.prepare('SELECT slot_id,worker_id,work_order_id,lease_epoch FROM autonomy_slots WHERE released_at IS NULL AND work_order_id IS NOT NULL').all() as Array<Record<string, unknown>>)
       .map((row) => ({ slotId: String(row.slot_id), workerId: String(row.worker_id), workOrderId: String(row.work_order_id), leaseEpoch: Number(row.lease_epoch) }));
@@ -666,6 +778,14 @@ export class AutonomyStore {
         isAuthoritative: false,
         notes: 'Manager context snapshots retained',
       },
+      {
+        tableName: 'autonomy_review_capacity_waits',
+        totalRows: countTable('autonomy_review_capacity_waits'),
+        activeRows: countTable('autonomy_review_capacity_waits', "state='WAITING'"),
+        retainedStatus: 'RETAINED_REVIEW_CAPACITY_WAITS',
+        isAuthoritative: false,
+        notes: 'Durable review-capacity waits retained across Supervisor restarts without consuming worker slots',
+      },
     ];
 
     try {
@@ -711,7 +831,8 @@ export type LegacyRetainedStatus =
   | 'RETAINED_AUDIT_LOGS'
   | 'RETAINED_MANAGER_RESOURCES'
   | 'RETAINED_MANAGER_ATTEMPTS'
-  | 'RETAINED_MANAGER_CONTEXTS';
+  | 'RETAINED_MANAGER_CONTEXTS'
+  | 'RETAINED_REVIEW_CAPACITY_WAITS';
 
 export interface LegacyTableInventory {
   tableName: string;
