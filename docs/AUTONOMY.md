@@ -70,14 +70,14 @@ CanonicalExecutionPayloadSchema, but product autonomy strictly fails closed when
 absent. ProductTaskAutonomyAdapter independently observes Git evidence and
 enforces path boundaries before verification or review: any changed file outside
 workOrder.allowed_paths or inside workOrder.forbidden_paths fails closed with
-WORKER_PATH_VIOLATION. When a manager
-review exception occurs (such as provider capacity, auth, rate-limit, timeout, offline,
-or contract-invalid failures) or a post-review HEAD or working-tree snapshot freshness
-violation occurs, the adapter transitions the authoritative task via TaskService using
-FIX_VERDICT into the durable resumable repair state (CODING) while strictly fencing against
-the active task ownership epoch, ensuring the task is never stranded in REVIEWING and can be
-resumed with a new revision authorization while releasing the worker slot lease and preserving
-exact-head and verification lineage gates. Legacy
+WORKER_PATH_VIOLATION. When a manager review transport/resource failure occurs (provider capacity,
+auth, rate-limit, timeout, offline, cooldown, or contract-invalid response), the adapter
+transitions the authoritative task through TaskService using REVIEW_RETRY back to CODING
+without incrementing the semantic revision budget. The same durable authority remains
+eligible when its exact task revision/head/scope are still valid. Explicit semantic REPAIR
+verdicts, failed verification, or post-review HEAD/working-tree freshness violations still
+use FIX_VERDICT and consume revision budget. Ownership-epoch fencing remains authoritative
+for both paths, the worker slot is released, and no task is stranded in REVIEWING. Legacy
 `autonomy_*` rows are inventoried and retained as compatibility/audit evidence; they are not
 silently discarded or authoritative for new product tasks. The consolidated path
 enforces an explicitly configured maximum of `MAX_AGY_WORKERS=2` (accepting integers
