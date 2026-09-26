@@ -16,7 +16,7 @@ import { AgentAssignment, ExecutionAuthorization, Task } from '../types/domain';
 import { CanonicalExecutionPayload, CanonicalExecutionPayloadSchema } from '../services/ExecutionAuthorizationService';
 import { ProviderEndpointConfig } from './providerEndpoint';
 import { loadOmniRouteEndpointFromEnvironment } from './responsesEndpoint';
-import { hasSemanticProgress, RepairObservation, stableFindingSignature } from './repairConvergence';
+import { evaluateRepairConvergence, recoverRepairConvergence, stableFindingSignature } from './repairConvergence';
 import {
   CoderResourceBinding,
   ResponsesCoderEndpointTransport,
@@ -220,14 +220,9 @@ export class AutonomySupervisor {
       WHERE w.task_id=? AND w.branch=? AND w.base_sha=? AND e.event_type='REPAIR_REQUIRED'
       ORDER BY w.attempt, e.created_at
     `).all(order.task_id, order.branch, order.base_sha) as Array<{ payload_json: string }>;
-    let repairLoops = repairHistory.length;
-    let previousRepair: RepairObservation | null = null;
-    for (const item of repairHistory) {
-      const payload = JSON.parse(item.payload_json) as { review?: ManagerReview; verified?: boolean; fresh?: boolean; signature?: string; snapshotSha?: string };
-      previousRepair = payload.review && payload.snapshotSha
-        ? { signature: payload.signature ?? stableFindingSignature(payload.review, !!payload.verified, !!payload.fresh), snapshotSha: payload.snapshotSha }
-        : null;
-    }
+    let { repairLoops, previousRepair } = recoverRepairConvergence(
+      repairHistory.map((item) => item.payload_json),
+    );
     try {
       const initial = await this.evidence.collect(order, []);
       if (initial.headSha !== order.base_sha || initial.status.trim()) throw new Error('WORKTREE_BASE_OR_CLEANLINESS_MISMATCH');
@@ -351,13 +346,19 @@ export class AutonomySupervisor {
           return { workOrder: order, state: 'BLOCKED', provider, review, headSha: currentEvidence.headSha, repairLoops };
         }
         const observation = { signature: stableFindingSignature(review, verified, fresh), snapshotSha: currentEvidence.snapshotSha ?? '' };
-        if (!hasSemanticProgress(previousRepair, observation)) {
+        const convergence = evaluateRepairConvergence(
+          previousRepair,
+          observation,
+          repairLoops,
+          this.maxRepairLoops,
+        );
+        if (convergence.outcome === 'SEMANTIC_NO_PROGRESS') {
           this.store.event(row.id, 'SEMANTIC_NO_PROGRESS', { signature: observation.signature, snapshotSha: observation.snapshotSha });
           this.store.updateState(row.id, 'BLOCKED', order.lease_epoch);
           return { workOrder: order, state: 'BLOCKED', provider, review, headSha: currentEvidence.headSha, repairLoops, error: 'SEMANTIC_NO_PROGRESS' };
         }
-        repairLoops += 1;
-        if (repairLoops > this.maxRepairLoops) {
+        repairLoops = convergence.nextRepairLoops;
+        if (convergence.outcome === 'MAX_REPAIR_LOOPS_EXCEEDED') {
           this.store.updateState(row.id, 'BLOCKED', order.lease_epoch);
           return { workOrder: order, state: 'BLOCKED', provider, review, headSha: currentEvidence.headSha, repairLoops, error: 'MAX_REPAIR_LOOPS_EXCEEDED' };
         }
