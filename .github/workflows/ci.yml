@@ -17,8 +17,30 @@ permissions:
   contents: read
 
 jobs:
+  classify:
+    name: Classify PR scope
+    runs-on: ubuntu-latest
+    outputs:
+      package_required: ${{ steps.paths.outputs.package_required }}
+    steps:
+      - name: Checkout exact source
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Classify exact-head paths
+        id: paths
+        shell: bash
+        run: |
+          EXPECTED_SHA="${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}"
+          test "$(git rev-parse HEAD)" = "$EXPECTED_SHA"
+          GITHUB_EVENT_NAME="${{ github.event_name }}" node scripts/ci-change-classifier.cjs \
+            "${{ github.event.pull_request.base.sha }}" "$EXPECTED_SHA" >> "$GITHUB_OUTPUT"
+
   validate:
     name: Validate (${{ matrix.os }}, Node ${{ matrix.node-version }})
+    needs: classify
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -55,23 +77,26 @@ jobs:
           git status --short
 
       - name: Setup Node.js ${{ matrix.node-version }}
+        if: needs.classify.outputs.package_required == 'true'
         uses: actions/setup-node@v4
         with:
           node-version: ${{ matrix.node-version }}
           cache: 'npm'
 
       - name: Install dependencies
+        if: needs.classify.outputs.package_required == 'true'
         run: npm ci
 
       - name: Run test suite (Ubuntu)
-        if: runner.os != 'Windows'
+        if: needs.classify.outputs.package_required == 'true' && runner.os != 'Windows'
         run: npm test
 
       - name: Run test suite (Windows)
-        if: runner.os == 'Windows'
+        if: needs.classify.outputs.package_required == 'true' && runner.os == 'Windows'
         run: npm test -- --maxWorkers=1
 
       - name: Build application
+        if: needs.classify.outputs.package_required == 'true'
         run: npm run build
 
       - name: Validate PR diff hygiene
@@ -90,13 +115,22 @@ jobs:
           echo "- **Node Version**: \`${{ matrix.node-version }}\`" >> $GITHUB_STEP_SUMMARY
           echo "- **Exact Tested Commit**: \`$(git rev-parse HEAD)\`" >> $GITHUB_STEP_SUMMARY
           echo "- **Event**: \`${{ github.event_name }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "- **Full runtime evidence required**: \`${{ needs.classify.outputs.package_required }}\`" >> $GITHUB_STEP_SUMMARY
           echo "- **Result**: \`${{ job.status }}\`" >> $GITHUB_STEP_SUMMARY
 
   package-windows:
     name: Package Windows (windows-latest, Node 22.x)
-    needs: validate
+    needs: [classify, validate]
+    if: always()
     runs-on: windows-latest
     steps:
+      - name: Require upstream gates
+        shell: bash
+        run: |
+          test '${{ needs.classify.result }}' = 'success'
+          test '${{ needs.validate.result }}' = 'success'
+          test '${{ needs.classify.outputs.package_required }}' = 'true' -o '${{ needs.classify.outputs.package_required }}' = 'false'
+
       - name: Checkout exact source
         uses: actions/checkout@v4
         with:
@@ -122,21 +156,22 @@ jobs:
           git status --short
 
       - name: Setup Node.js 22.x
+        if: needs.classify.outputs.package_required == 'true'
         uses: actions/setup-node@v4
         with:
           node-version: '22.x'
           cache: 'npm'
 
       - name: Install dependencies
+        if: needs.classify.outputs.package_required == 'true'
         run: npm ci
 
-      - name: Run test suite
-        run: npm test -- --maxWorkers=1
-
-      - name: Build application
-        run: npm run build
+      - name: Generate Windows NSIS installer and unpacked package
+        if: needs.classify.outputs.package_required == 'true'
+        run: npm run package:win
 
       - name: Verify generated relative asset base
+        if: needs.classify.outputs.package_required == 'true'
         shell: pwsh
         run: |
           $html = Get-Content -Path "dist\index.html" -Raw
@@ -146,31 +181,32 @@ jobs:
           }
           Write-Host "dist\index.html relative asset path check: PASS"
 
-      - name: Generate Windows NSIS installer and unpacked package
-        run: npm run package:win
-
       - name: Run packaged process runtime smoke
+        if: needs.classify.outputs.package_required == 'true'
         shell: pwsh
         run: |
           npm run smoke:packaged:win -- -Headless
 
       - name: Run real Windows installed application update integration test
+        if: needs.classify.outputs.package_required == 'true'
         shell: pwsh
         run: |
           npm run test:installed:win -- -Headless
 
       - name: Run real production installed application smoke
+        if: needs.classify.outputs.package_required == 'true'
         shell: pwsh
         run: |
           powershell -ExecutionPolicy Bypass -File scripts/smoke-installed-production-win.ps1 -Headless
 
       - name: Run Windows Release Candidate verification gate
+        if: needs.classify.outputs.package_required == 'true'
         shell: pwsh
         run: |
           powershell -ExecutionPolicy Bypass -File scripts/verify-demo-rc-win.ps1
 
       - name: Upload Windows Installed Update Test Diagnostics
-        if: always()
+        if: always() && needs.classify.outputs.package_required == 'true'
         uses: actions/upload-artifact@v4
         with:
           name: agentforge-installed-update-diagnostics-${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
@@ -179,6 +215,7 @@ jobs:
           retention-days: 7
 
       - name: Verify installer and generate metadata
+        if: needs.classify.outputs.package_required == 'true'
         shell: pwsh
         run: |
           $pkg = Get-Content "package.json" -Raw | ConvertFrom-Json
@@ -222,6 +259,7 @@ jobs:
           Set-Content -Path "release\installer-metadata.txt" -Value $metadataContent
 
       - name: Upload Windows Installer Artifact
+        if: needs.classify.outputs.package_required == 'true'
         uses: actions/upload-artifact@v4
         with:
           name: agentforge-windows-installer-${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
@@ -238,6 +276,7 @@ jobs:
         run: |
           echo "### AgentForge Windows Packaging Summary" >> $GITHUB_STEP_SUMMARY
           echo "- **Exact Tested Commit**: \`$(git rev-parse HEAD)\`" >> $GITHUB_STEP_SUMMARY
+          echo "- **Full runtime evidence required**: \`${{ needs.classify.outputs.package_required }}\`" >> $GITHUB_STEP_SUMMARY
           echo "- **Packaging Status**: \`${{ job.status }}\`" >> $GITHUB_STEP_SUMMARY
           if [ -f "release/installer-metadata.txt" ]; then
             echo '```text' >> $GITHUB_STEP_SUMMARY
