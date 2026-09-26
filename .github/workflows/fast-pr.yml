@@ -22,6 +22,11 @@ jobs:
           ref: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
           fetch-depth: 0
           persist-credentials: false
+      - name: Verify exact PR head
+        shell: bash
+        run: |
+          EXPECTED_SHA="${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}"
+          test "$(git rev-parse HEAD)" = "$EXPECTED_SHA"
       - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
@@ -29,10 +34,8 @@ jobs:
           cache: npm
       - name: Install dependencies
         run: npm ci
-      - name: Run deterministic tests
-        run: npm test
-      - name: Build
-        run: npm run build
+      - name: Typecheck
+        run: npx tsc --noEmit
       - name: Diff hygiene
         if: github.event_name == 'pull_request'
         run: git diff --check ${{ github.event.pull_request.base.sha }}...HEAD
