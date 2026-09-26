@@ -157,6 +157,32 @@ export function validateChangedFilesBoundaries(
   return { valid: true };
 }
 
+const RETRYABLE_REVIEW_FAILURE_MARKERS = [
+  'ALL_MANAGER_RESOURCES_UNAVAILABLE',
+  'ROUTE_CAPACITY_EXHAUSTED',
+  'CAPACITY_EXHAUSTED',
+  'CREDITS_EXHAUSTED',
+  'QUOTA_OR_RATE_LIMIT',
+  'RATE_LIMITED',
+  'AUTH_ERROR',
+  'TIMEOUT',
+  'OFFLINE',
+  'COOLDOWN',
+  'CONTRACT_INVALID',
+  'MANAGER_REVIEW_FAILED',
+] as const;
+
+/**
+ * Reviewer transport/resource failures are execution availability failures, not
+ * semantic findings. They may retry from CODING without consuming task
+ * revision budget. Exact-head/snapshot violations and explicit REPAIR verdicts
+ * are intentionally excluded and continue through FIX_VERDICT.
+ */
+export function isRetryableReviewProviderFailure(error: string): boolean {
+  const normalized = error.toUpperCase();
+  return RETRYABLE_REVIEW_FAILURE_MARKERS.some((marker) => normalized.includes(marker));
+}
+
 /**
  * Adapter from the proven self-host executor into existing product authority.
  * It owns no task lifecycle table: transitions target `tasks`, while capacity
@@ -726,7 +752,12 @@ export class ProductTaskAutonomyAdapter {
         const currentEpoch = currentTask.ownership_epoch ?? authorityEpoch;
         if (currentEpoch === authorityEpoch) {
           try {
-            const recovered = this.transitionTask(currentTask.id, 'FIX_VERDICT', authorityEpoch);
+            const retryableProviderFailure = isRetryableReviewProviderFailure(executionError);
+            const recovered = this.transitionTask(
+              currentTask.id,
+              retryableProviderFailure ? 'REVIEW_RETRY' : 'FIX_VERDICT',
+              authorityEpoch,
+            );
             finalTaskState = recovered.state;
           } catch (recoveryError) {
             finalTaskState = this.repo.getTask(currentTask.id)?.state ?? currentTask.state;
