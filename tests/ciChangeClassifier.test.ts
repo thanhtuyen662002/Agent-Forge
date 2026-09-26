@@ -57,6 +57,7 @@ describe('exact-head CI path classification', () => {
     expect(ci).toContain('npm run test:installed:win');
     expect(ci).not.toContain('      - name: Run test suite\n        run: npm test -- --maxWorkers=1');
     expect(fast).toContain('npx tsc --noEmit');
+    expect(fast).toContain('test "$(git rev-parse HEAD)" = "$EXPECTED_SHA"');
     expect(fast).not.toContain('run: npm test');
     expect(fast).not.toContain('run: npm run build');
   });
