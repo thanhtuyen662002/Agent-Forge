@@ -24,6 +24,11 @@ import {
   buildManagerContextPackage,
 } from './managerPool';
 import { AutonomyStore, LegacyAutonomyInventoryReport } from './store';
+import {
+  evaluateRepairConvergence,
+  recoverRepairConvergence,
+  stableFindingSignature,
+} from './repairConvergence';
 
 /** Consolidation supports an explicitly configured two-worker maximum (1 or 2). */
 export const MAX_AGY_WORKERS = 2;
@@ -714,7 +719,63 @@ export class ProductTaskAutonomyAdapter {
             error: `AUTHORITY_FENCED_DURING_EXECUTION: ${refreshedAuthority.code}: ${refreshedAuthority.error}`,
           };
         } else if (review.verdict !== 'PASS') {
-          task = this.transitionTask(task.id, review.verdict === 'REPAIR' ? 'FIX_VERDICT' : 'MAX_REVISIONS_EXCEEDED', authorityEpoch);
+          let repairError = `MANAGER_${review.verdict}`;
+          if (review.verdict === 'REPAIR' && this.options.autonomyStore) {
+            const repairRows = this.options.autonomyStore.getDatabase().prepare(`
+              SELECT payload_json
+              FROM autonomy_events
+              WHERE work_order_id=? AND event_type='PRODUCT_REPAIR_REQUIRED'
+              ORDER BY created_at,id
+            `).all(task.id) as Array<{ payload_json: string }>;
+            const recovered = recoverRepairConvergence(repairRows.map((row) => row.payload_json));
+            const observation = {
+              signature: stableFindingSignature(
+                review,
+                verificationReport.latestAttemptPassed,
+                freshness.fresh,
+              ),
+              snapshotSha: postReviewEvidence.snapshotSha ?? '',
+            };
+            const convergence = evaluateRepairConvergence(
+              recovered.previousRepair,
+              observation,
+              recovered.repairLoops,
+              task.max_revisions,
+            );
+
+            if (convergence.outcome === 'SEMANTIC_NO_PROGRESS') {
+              this.options.autonomyStore.event(task.id, 'PRODUCT_SEMANTIC_NO_PROGRESS', {
+                review,
+                verified: verificationReport.latestAttemptPassed,
+                fresh: freshness.fresh,
+                ...observation,
+                repairLoops: recovered.repairLoops,
+              });
+              task = this.transitionTask(task.id, 'MAX_REVISIONS_EXCEEDED', authorityEpoch);
+              repairError = 'SEMANTIC_NO_PROGRESS';
+            } else if (convergence.outcome === 'MAX_REPAIR_LOOPS_EXCEEDED') {
+              this.options.autonomyStore.event(task.id, 'PRODUCT_MAX_REPAIR_LOOPS_EXCEEDED', {
+                review,
+                verified: verificationReport.latestAttemptPassed,
+                fresh: freshness.fresh,
+                ...observation,
+                repairLoops: convergence.nextRepairLoops,
+              });
+              task = this.transitionTask(task.id, 'MAX_REVISIONS_EXCEEDED', authorityEpoch);
+              repairError = 'MAX_REPAIR_LOOPS_EXCEEDED';
+            } else {
+              this.options.autonomyStore.event(task.id, 'PRODUCT_REPAIR_REQUIRED', {
+                review,
+                verified: verificationReport.latestAttemptPassed,
+                fresh: freshness.fresh,
+                ...observation,
+                repairLoops: convergence.nextRepairLoops,
+              });
+              task = this.transitionTask(task.id, 'FIX_VERDICT', authorityEpoch);
+            }
+          } else {
+            task = this.transitionTask(task.id, review.verdict === 'REPAIR' ? 'FIX_VERDICT' : 'MAX_REVISIONS_EXCEEDED', authorityEpoch);
+          }
           result = {
             success: false,
             finalTaskState: task.state,
@@ -725,7 +786,7 @@ export class ProductTaskAutonomyAdapter {
             review,
             observedHeadSha: postReviewEvidence.headSha,
             observedSnapshotSha: postReviewEvidence.snapshotSha,
-            error: `MANAGER_${review.verdict}`,
+            error: repairError,
           };
         } else {
           task = this.transitionTask(task.id, 'PASS_VERDICT', authorityEpoch);
