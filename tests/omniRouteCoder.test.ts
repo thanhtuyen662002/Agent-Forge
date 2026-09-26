@@ -1021,6 +1021,7 @@ describe('OmniRoute Coder Transport & Structured Edits', () => {
       expect(runResult.accepted).toBe(false);
       expect(runResult.state, runResult.error).toBe('CODING');
       expect(runResult.error).toContain('ROUTE_SERVER_FAILURE');
+      expect(repo.getTask('TSK-OMNI-FAIL')?.revision_count).toBe(0);
       expect(agyExecuteCalls).toBe(0); // AGY was NEVER silently invoked!
       db.close();
     });
