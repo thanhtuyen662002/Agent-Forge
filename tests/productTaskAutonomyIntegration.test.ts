@@ -1510,7 +1510,7 @@ describe('product-task autonomy consolidation', () => {
   ];
 
   for (const { category, error, expectedSubstring } of reviewFailureCases) {
-    it(`recovers ${category} review exception (${expectedSubstring}) to CODING, releases lease, and fences stale authority`, async () => {
+    it(`recovers ${category} review exception (${expectedSubstring}) to CODING without consuming semantic repair budget`, async () => {
       const taskId = `task-review-${category}-${crypto.randomBytes(4).toString('hex')}`;
       const fixture = seed(taskId);
       const input = workOrderInput(fixture);
@@ -1560,22 +1560,22 @@ describe('product-task autonomy consolidation', () => {
       expect(updatedTask.state).toBe('CODING');
       expect(updatedTask.state).not.toBe('REVIEWING');
       expect(updatedTask.state).not.toBe('DONE');
-      expect(updatedTask.revision_count).toBe(1);
+      expect(updatedTask.revision_count).toBe(0);
 
       const slot = repo.getWorkerSlot(fixture.slotId)!;
       expect(slot.status).toBe('IDLE');
 
-      // 3. Stale authority is fenced by the revision bump
-      const staleAuthCheck = adapter.validateAuthority({
+      // 3. Provider/transport failure is not a semantic repair, so the same
+      // durable authority remains valid for a later retry.
+      const retryAuthority = adapter.validateAuthority({
         authorizationId: fixture.authorization.id,
         currentHeadSha: BASE_SHA,
       });
-      expect(staleAuthCheck.valid).toBe(false);
-      expect(staleAuthCheck.code).toBe('TASK_REVISION_MISMATCH');
+      expect(retryAuthority.valid).toBe(true);
     });
   }
 
-  it('recovers contract-invalid review object returning malformed contract to CODING, releases lease, and fences stale authority', async () => {
+  it('recovers contract-invalid review object to CODING without consuming semantic repair budget', async () => {
     const fixture = seed('task-review-invalid-contract-obj');
     const input = workOrderInput(fixture);
 
@@ -1622,15 +1622,14 @@ describe('product-task autonomy consolidation', () => {
     const updatedTask = repo.getTask(fixture.task.id)!;
     expect(updatedTask.state).toBe('CODING');
     expect(updatedTask.state).not.toBe('DONE');
-    expect(updatedTask.revision_count).toBe(1);
+    expect(updatedTask.revision_count).toBe(0);
     expect(repo.getWorkerSlot(fixture.slotId)?.status).toBe('IDLE');
 
-    const staleAuthCheck = adapter.validateAuthority({
+    const retryAuthority = adapter.validateAuthority({
       authorizationId: fixture.authorization.id,
       currentHeadSha: BASE_SHA,
     });
-    expect(staleAuthCheck.valid).toBe(false);
-    expect(staleAuthCheck.code).toBe('TASK_REVISION_MISMATCH');
+    expect(retryAuthority.valid).toBe(true);
   });
 
   it('preserves ownership epoch fencing when task ownership epoch changes during manager review exception recovery', async () => {
@@ -1681,7 +1680,7 @@ describe('product-task autonomy consolidation', () => {
     expect(repo.getWorkerSlot(fixture.slotId)?.status).toBe('IDLE');
   });
 
-  it('proves a subsequent reauthorized retry can complete end-to-end after a manager review outage while preserving exact-head and verification gates', async () => {
+  it('proves retry after manager review outage preserves repair budget, exact-head and verification gates', async () => {
     const fixture = seed('task-review-outage-retry');
     const input = workOrderInput(fixture);
 
@@ -1726,19 +1725,17 @@ describe('product-task autonomy consolidation', () => {
 
     const taskAfterOutage = repo.getTask(fixture.task.id)!;
     expect(taskAfterOutage.state).toBe('CODING');
-    expect(taskAfterOutage.revision_count).toBe(1);
+    expect(taskAfterOutage.revision_count).toBe(0);
     expect(repo.getWorkerSlot(fixture.slotId)?.status).toBe('IDLE');
 
-    // Prove stale authority is fenced
-    const staleValidation = adapter.validateAuthority({
+    // Provider capacity did not consume semantic revision budget, so the same
+    // exact durable authority remains usable after recovery.
+    const retryValidation = adapter.validateAuthority({
       authorizationId: fixture.authorization.id,
       currentHeadSha: BASE_SHA,
     });
-    expect(staleValidation.valid).toBe(false);
-    expect(staleValidation.code).toBe('TASK_REVISION_MISMATCH');
-
-    // Create durable reauthorized execution authorization for revision 1
-    const retryAuthId = createRetryAuthorization(fixture, 1);
+    expect(retryValidation.valid).toBe(true);
+    const retryAuthId = fixture.authorization.id;
 
     // --- Gate verification 1: Exact-head gate still applies on retry ---
     const headMismatchResult = await adapter.executeProductTask({
@@ -1797,10 +1794,10 @@ describe('product-task autonomy consolidation', () => {
     expect(verifFailResult.error).toBe('VERIFICATION_FAILED');
     expect(verifFailResult.leaseReleased).toBe(true);
 
-    // The failed current verification incremented the authoritative task revision,
-    // so the next attempt must use a fresh authorization for that exact revision.
-    expect(repo.getTask(fixture.task.id)?.revision_count).toBe(2);
-    const finalRetryAuthId = createRetryAuthorization(fixture, 2);
+    // A real verification failure is semantic execution evidence and still
+    // consumes one revision, requiring fresh authority for revision 1.
+    expect(repo.getTask(fixture.task.id)?.revision_count).toBe(1);
+    const finalRetryAuthId = createRetryAuthorization(fixture, 1);
 
     // --- Attempt 2: Reauthorized retry with passing verification and restored manager completes to DONE ---
     const retrySuccessResult = await adapter.executeProductTask({
@@ -1914,6 +1911,7 @@ describe('product-task autonomy consolidation', () => {
     expect(result.error).toContain('ALL_MANAGER_RESOURCES_UNAVAILABLE');
     expect(repo.getTask(fixture.task.id)?.state).toBe('CODING');
     expect(repo.getTask(fixture.task.id)?.state).not.toBe('REVIEWING');
+    expect(repo.getTask(fixture.task.id)?.revision_count).toBe(0);
     expect(repo.getWorkerSlot(fixture.slotId)?.status).toBe('IDLE');
     expect(store.listAll()).toHaveLength(0);
   });
