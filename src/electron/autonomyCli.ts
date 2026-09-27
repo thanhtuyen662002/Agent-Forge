@@ -23,6 +23,10 @@ import {
   verifyRedactedTrialLogCollectionFile,
 } from '../core/autonomy/trialLogCollector';
 import type { CollectRedactedTrialLogsOptions } from '../core/autonomy/trialLogCollector';
+import {
+  evaluateTrialReadiness,
+} from '../core/autonomy/trialReadiness';
+import type { TrialReadinessInput } from '../core/autonomy/trialReadiness';
 
 const controlRepo = process.env.AGENT_FORGE_CONTROL_REPO ?? process.cwd();
 const worktreeRoot = process.env.AGENT_FORGE_WORKTREE_ROOT ?? path.resolve(controlRepo, '..', 'AI', 'Agent-Forge-Worktrees');
@@ -151,6 +155,17 @@ export async function main(argv: string[] = process.argv): Promise<number> {
     const result = parseAndVerifyTrialEvidenceManifest(fs.readFileSync(manifestPath, 'utf8'), expectedSha256);
     process.stdout.write(`${JSON.stringify({ filePath: manifestPath, trialId: result.manifest.trialId, phase: result.manifest.phase, outcome: result.manifest.outcome, sha256: result.sha256 })}\n`);
     return 0;
+  }
+  if (command === 'trial-readiness') {
+    const manifestPath = path.resolve(argv[3] ?? '');
+    const inputPath = path.resolve(argv[4] ?? '');
+    assertPathContained(manifestPath, effectiveRuntimeRoot);
+    assertPathContained(inputPath, effectiveRuntimeRoot);
+    const parsedManifest = parseAndVerifyTrialEvidenceManifest(fs.readFileSync(manifestPath, 'utf8'));
+    const input = JSON.parse(fs.readFileSync(inputPath, 'utf8')) as TrialReadinessInput;
+    const result = evaluateTrialReadiness(parsedManifest.manifest, input);
+    process.stdout.write(`${JSON.stringify(result)}\n`);
+    return result.status === 'READY' ? 0 : 1;
   }
   if (command === 'trial-log-collect') {
     const inputPath = path.resolve(argv[3] ?? '');

@@ -290,6 +290,7 @@ manifest SHA-256. The CLI exposes:
 ```text
 npm run autonomy:trial-manifest -- <runtime-input.json> [relative-output.json]
 npm run autonomy:verify-trial-manifest -- <manifest.json> [expected-sha256]
+npm run autonomy:trial-readiness -- <manifest.json> <readiness-input.json>
 ```
 
 Both commands require files beneath `AGENT_FORGE_RUNTIME_ROOT`; traversal,
@@ -306,6 +307,18 @@ atomically created collection with per-file and bundle SHA-256 hashes. Input
 and output byte/file limits are enforced before and after redaction;
 `trial-log-verify` rechecks canonical ordering, hashes, redaction, and limits.
 The collector is local only and never uploads or discovers credentials.
+
+`trial-readiness` is a read-only, fail-closed preflight gate. It independently
+compares the manifest source commit/tree with approved and observed source
+identity, requires a clean worktree and passing CI, binds designated operator
+and approver identities, and applies the phase-specific R5L0--R5L4 checklist
+(backups, package hashes, fixture/live account separation, authorizations,
+failure-injection coverage, and retention designation). Missing or malformed
+inputs return `HOLD` with machine-readable blocking checks; the command never
+resolves credentials, contacts providers, changes SQLite, or grants phase
+authorization. A `READY` result means only that the supplied local evidence
+passed this preflight contract; manager/executive approvals and live trial
+execution remain external controls.
 
 The all-target fast-pr.yml supplements main-target CI. Windows/Ubuntu checks,
 Windows packaging, installed-app verification, and RC verification remain.
