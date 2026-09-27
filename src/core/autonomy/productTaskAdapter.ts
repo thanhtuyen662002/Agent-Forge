@@ -24,6 +24,19 @@ import {
   buildManagerContextPackage,
 } from './managerPool';
 import { AutonomyStore, LegacyAutonomyInventoryReport } from './store';
+import {
+  RepairContextPackage,
+  RepairOutcome,
+  buildRepairContextPackage,
+  computeNormalizedPatchHash,
+  deriveFindingId,
+  detectNoProgress,
+  extractFailingTestSignatures,
+  getEscalationStage,
+  normalizeReviewerFindings,
+  reconcileFindingClosure,
+} from './repairContext';
+import type { CoderEditBundle } from './responsesCoderEndpoint';
 
 /** Consolidation supports an explicitly configured two-worker maximum (1 or 2). */
 export const MAX_AGY_WORKERS = 2;
@@ -106,7 +119,7 @@ export function areStringArraysIdentical(a?: string[], b?: string[]): boolean {
 }
 
 export interface ExecuteProductTaskParams extends AuthorizedWorkOrderInput {
-  runCoder: (workOrder: WorkOrder) => Promise<{ success: boolean; currentHeadSha: string; error?: string }>;
+  runCoder: (workOrder: WorkOrder) => Promise<{ success: boolean; currentHeadSha: string; error?: string; bundle?: CoderEditBundle }>;
   runVerification: (authority: ProductTaskAuthority, workOrder?: WorkOrder) => Promise<TestRun>;
   conductReview: (context: ManagerContextPackage) => Promise<ManagerReview>;
   managerContext?: Omit<BuildManagerContextParams, 'workOrder' | 'currentHead'>;
@@ -136,10 +149,17 @@ export function renderCommand(command: { executable: string; args: string[] }): 
 }
 
 export function isPathContainedInBoundary(filePath: string, boundaryPath: string): boolean {
-  const normFile = filePath.replace(/\\/g, '/').replace(/^\.\//, '');
-  const normBoundary = boundaryPath.replace(/\\/g, '/').replace(/^\.\//, '').replace(/\/+$/, '');
+  const normalize = (value: string): string => {
+    const normalized = path.posix.normalize(value.replace(/\\/g, '/'));
+    return normalized.replace(/\/+$/, '');
+  };
+  const normFile = normalize(filePath);
+  const normBoundary = normalize(boundaryPath);
   if (normBoundary === '' || normBoundary === '.') return true;
-  return normFile === normBoundary || normFile.startsWith(`${normBoundary}/`);
+  if (normFile === '..' || normFile.startsWith('../') || normBoundary === '..' || normBoundary.startsWith('../')) return false;
+  const fileKey = process.platform === 'win32' ? normFile.toLowerCase() : normFile;
+  const boundaryKey = process.platform === 'win32' ? normBoundary.toLowerCase() : normBoundary;
+  return fileKey === boundaryKey || fileKey.startsWith(`${boundaryKey}/`);
 }
 
 export function validateChangedFilesBoundaries(
@@ -340,6 +360,17 @@ export class ProductTaskAutonomyAdapter {
       .map(renderCommand);
     if (!requiredTests.length) throw new Error('DETERMINISTIC_TESTS_REQUIRED');
     const attempt = assignment.attempt_id ? this.repo.getTaskAttempt(assignment.attempt_id) : null;
+    // Repair context is executable input. Reuse it only when every durable
+    // identity still belongs to this exact authorization attempt; selecting by
+    // task alone could replay stale findings, snapshots, or provider routing.
+    const repairContext = this.options.autonomyStore?.getLatestRepairContext(task.id, {
+      authorizationId: authorization.id,
+      ownershipEpoch: authorization.task_ownership_epoch ?? task.ownership_epoch ?? 1,
+      baseSha: authorization.base_sha,
+      currentHeadSha: authorization.repository_head_sha,
+      selectedProviderId: authorization.selected_provider_id,
+      selectedResourceId: authorization.selected_resource_id,
+    }) ?? undefined;
 
     const spec: AutonomousTaskSpec = {
       taskId: task.id,
@@ -357,6 +388,7 @@ export class ProductTaskAutonomyAdapter {
       constraints: [...payload.constraints, ...payload.instructions],
       attempt: attempt?.attempt_number ?? task.revision_count + 1,
       leaseEpoch: task.ownership_epoch ?? 1,
+      repairContext,
     };
     return createWorkOrder(spec);
   }
@@ -494,6 +526,31 @@ export class ProductTaskAutonomyAdapter {
     return { fresh: true };
   }
 
+  private mapAttemptsToGitEvidenceTests(
+    attempts: Array<{ command: string; exitCode: number; durationMs?: number; evidenceId?: string | null }>
+  ): Array<{ command: string; exitCode: number; stdout: string; stderr: string; durationMs: number }> {
+    return attempts.map((a) => {
+      let stdout = '';
+      let stderr = '';
+      if (a.evidenceId) {
+        const ev = this.repo.getEvidence(a.evidenceId);
+        if (ev?.raw_payload) {
+          const stdoutMatch = ev.raw_payload.match(/=== STDOUT ===\n([\s\S]*?)(?:\n=== STDERR ===|$)/);
+          if (stdoutMatch) stdout = stdoutMatch[1];
+          const stderrMatch = ev.raw_payload.match(/=== STDERR ===\n([\s\S]*)$/);
+          if (stderrMatch) stderr = stderrMatch[1];
+        }
+      }
+      return {
+        command: a.command,
+        exitCode: a.exitCode,
+        stdout,
+        stderr,
+        durationMs: a.durationMs ?? 0,
+      };
+    });
+  }
+
   public buildManagerContext(
     workOrder: WorkOrder,
     currentHead: string,
@@ -614,6 +671,102 @@ export class ProductTaskAutonomyAdapter {
           : !currentRunBound
             ? 'CURRENT_VERIFICATION_AUTHORITY_BINDING_INVALID'
             : 'VERIFICATION_FAILED';
+
+        const failingSignatures = extractFailingTestSignatures(
+          this.mapAttemptsToGitEvidenceTests(verificationReport.attempts)
+        );
+
+        let noProgress = undefined;
+        if (workOrder.repair_context) {
+          noProgress = detectNoProgress({
+            repairContext: workOrder.repair_context,
+            currentEvidence: {
+              ...preReviewEvidence,
+              tests: this.mapAttemptsToGitEvidenceTests(verificationReport.attempts),
+            },
+            coderBundle: coder.bundle,
+          });
+        }
+
+        if (this.options.autonomyStore) {
+          if (noProgress?.hasNoProgress) {
+            this.options.autonomyStore.recordRepairNoProgress(task.id, noProgress);
+          }
+          this.options.autonomyStore.recordRepairOutcome(task.id, {
+            protocol_version: 'repairoutcome.v1',
+            task_id: task.id,
+            attempt: workOrder.attempt,
+            status: noProgress?.hasNoProgress ? 'NO_PROGRESS' : 'FAILED',
+            resolved_finding_ids: workOrder.repair_context?.resolved_finding_ids ?? [],
+            unresolved_finding_ids: workOrder.repair_context?.unresolved_finding_ids ?? [],
+            no_progress_category: noProgress?.category ?? null,
+            escalation_stage: getEscalationStage(workOrder.attempt),
+            summary: noProgress?.hasNoProgress
+              ? `REPAIR_NO_PROGRESS: ${noProgress.category}: ${noProgress.reason}`
+              : `Verification tests failed in attempt ${workOrder.attempt}`,
+            head_sha: preReviewEvidence.headSha,
+            snapshot_sha: preReviewEvidence.snapshotSha ?? '0'.repeat(40),
+            created_at: new Date().toISOString(),
+          });
+
+          const nextAttempt = workOrder.attempt + 1;
+          const nextPackage = buildRepairContextPackage({
+            taskId: task.id,
+            authorizationId: validated.authority.authorization.id,
+            ownershipEpoch: authorityEpoch,
+            attempt: nextAttempt,
+            baseSha: workOrder.base_sha,
+            currentHeadSha: preReviewEvidence.headSha,
+            currentSnapshotSha: preReviewEvidence.snapshotSha ?? '0'.repeat(40),
+            originalObjective: workOrder.objective,
+            acceptanceCriteria: workOrder.acceptance_criteria,
+            allowedPaths: workOrder.allowed_paths,
+            forbiddenPaths: workOrder.forbidden_paths,
+            requiredTests: workOrder.required_tests,
+            reviewerFindings: workOrder.repair_context?.previous_reviewer_findings ?? [],
+            requiredActions: workOrder.repair_context?.required_actions ?? [],
+            previousResolvedFindingIds: workOrder.repair_context?.resolved_finding_ids ?? [],
+            previousCoderActions: [
+              ...(workOrder.repair_context?.previous_coder_actions ?? []),
+              {
+                attempt: workOrder.attempt,
+                changed_files: coder.bundle?.changed_files ?? preReviewEvidence.changedFiles,
+                diff_summary: preReviewEvidence.diff,
+                test_results: verificationReport.attempts.map((a) => ({
+                  command: a.command,
+                  exitCode: a.exitCode,
+                  passed: a.success,
+                  durationMs: a.durationMs,
+                })),
+                addressed_finding_ids: coder.bundle?.addressed_finding_ids ?? [],
+                unresolved_finding_ids: coder.bundle?.unresolved_finding_ids ?? [],
+                implementation_summary: coder.bundle?.implementation_summary,
+                known_risks: coder.bundle?.known_risks ?? [],
+                snapshot_sha: preReviewEvidence.snapshotSha,
+                head_sha: preReviewEvidence.headSha,
+                patch_hash: computeNormalizedPatchHash(preReviewEvidence.diff),
+              },
+            ],
+            knownFailedApproaches: [
+              ...(workOrder.repair_context?.known_failed_approaches ?? []),
+              {
+                attempt: workOrder.attempt,
+                description: `Verification tests failed in attempt ${workOrder.attempt}`,
+                test_failure_signatures: failingSignatures,
+              },
+              ...(noProgress?.hasNoProgress ? [{
+                attempt: workOrder.attempt,
+                description: `No-progress detected (${noProgress.category}): ${noProgress.reason}`,
+                test_failure_signatures: [],
+                category: noProgress.category,
+              }] : []),
+            ],
+            selectedResourceId: validated.authority.authorization.selected_resource_id,
+            selectedProviderId: validated.authority.authorization.selected_provider_id,
+          });
+          this.options.autonomyStore.recordRepairContext(task.id, nextPackage);
+        }
+
         result = {
           success: false,
           finalTaskState: task.state,
@@ -621,7 +774,7 @@ export class ProductTaskAutonomyAdapter {
           leaseReleased: false,
           workOrder,
           verificationReport,
-          error: verificationError,
+          error: noProgress?.hasNoProgress ? `REPAIR_NO_PROGRESS: ${noProgress.category}: ${noProgress.reason}` : verificationError,
         };
       } else {
         task = this.transitionTask(task.id, 'EVIDENCE_GATHERED', authorityEpoch);
@@ -637,6 +790,36 @@ export class ProductTaskAutonomyAdapter {
           throw new Error(`CONTRACT_INVALID: conductReview returned invalid review contract: ${parsedReview.error.message}`);
         }
         const review: ManagerReview = parsedReview.data;
+
+        let reconciledClosure = undefined;
+        let noProgress = undefined;
+        if (workOrder.repair_context) {
+          const mappedRepairTests = this.mapAttemptsToGitEvidenceTests(verificationReport.attempts);
+          reconciledClosure = reconcileFindingClosure({
+            repairContext: workOrder.repair_context,
+            coderBundle: coder.bundle,
+            observedEvidence: {
+              ...preReviewEvidence,
+              tests: mappedRepairTests,
+            },
+            latestReview: review,
+          });
+
+          noProgress = detectNoProgress({
+            repairContext: workOrder.repair_context,
+            currentEvidence: {
+              ...preReviewEvidence,
+              tests: mappedRepairTests,
+            },
+            coderBundle: coder.bundle,
+            reconciledClosure,
+            latestReview: review,
+          });
+
+          if (noProgress.hasNoProgress && this.options.autonomyStore) {
+            this.options.autonomyStore.recordRepairNoProgress(task.id, noProgress);
+          }
+        }
 
         // Independently observe a fresh Git HEAD and working-tree snapshot after manager review
         const postReviewEvidence = await evidenceCollector.collect(workOrder, []);
@@ -688,6 +871,76 @@ export class ProductTaskAutonomyAdapter {
             error: `AUTHORITY_FENCED_DURING_EXECUTION: ${refreshedAuthority.code}: ${refreshedAuthority.error}`,
           };
         } else if (review.verdict !== 'PASS') {
+          const isNoProgress = noProgress?.hasNoProgress;
+          if (this.options.autonomyStore) {
+            this.options.autonomyStore.recordRepairOutcome(task.id, {
+              protocol_version: 'repairoutcome.v1',
+              task_id: task.id,
+              attempt: workOrder.attempt,
+              status: isNoProgress ? 'NO_PROGRESS' : (workOrder.attempt >= 3 ? 'BLOCKED' : 'ESCALATED'),
+              resolved_finding_ids: reconciledClosure?.resolvedFindingIds ?? [],
+              unresolved_finding_ids: reconciledClosure?.unresolvedFindingIds ?? normalizeReviewerFindings(review.findings).map((f) => f.finding_id),
+              no_progress_category: noProgress?.category ?? null,
+              escalation_stage: getEscalationStage(workOrder.attempt),
+              summary: isNoProgress ? `REPAIR_NO_PROGRESS: ${noProgress?.category}: ${noProgress?.reason}` : `Repair attempt ${workOrder.attempt} requires further iteration (verdict=${review.verdict}).`,
+              head_sha: postReviewEvidence.headSha,
+              snapshot_sha: postReviewEvidence.snapshotSha ?? preReviewEvidence.snapshotSha ?? '0'.repeat(40),
+              created_at: new Date().toISOString(),
+            });
+
+            const nextAttempt = workOrder.attempt + 1;
+            const nextPackage = buildRepairContextPackage({
+              taskId: task.id,
+              authorizationId: validated.authority.authorization.id,
+              ownershipEpoch: authorityEpoch,
+              attempt: nextAttempt,
+              baseSha: workOrder.base_sha,
+              currentHeadSha: postReviewEvidence.headSha,
+              currentSnapshotSha: postReviewEvidence.snapshotSha ?? preReviewEvidence.snapshotSha ?? '0'.repeat(40),
+              originalObjective: workOrder.objective,
+              acceptanceCriteria: workOrder.acceptance_criteria,
+              allowedPaths: workOrder.allowed_paths,
+              forbiddenPaths: workOrder.forbidden_paths,
+              requiredTests: workOrder.required_tests,
+              reviewerFindings: review.findings,
+              requiredActions: review.required_actions,
+              previousResolvedFindingIds: reconciledClosure?.resolvedFindingIds ?? [],
+              previousCoderActions: [
+                ...(workOrder.repair_context?.previous_coder_actions ?? []),
+                {
+                  attempt: workOrder.attempt,
+                  changed_files: coder.bundle?.changed_files ?? preReviewEvidence.changedFiles,
+                  diff_summary: preReviewEvidence.diff,
+                  test_results: verificationReport.attempts.map((a) => ({
+                    command: a.command,
+                    exitCode: a.exitCode,
+                    passed: a.success,
+                    durationMs: a.durationMs,
+                  })),
+                  addressed_finding_ids: coder.bundle?.addressed_finding_ids ?? [],
+                  unresolved_finding_ids: coder.bundle?.unresolved_finding_ids ?? [],
+                  implementation_summary: coder.bundle?.implementation_summary,
+                  known_risks: coder.bundle?.known_risks ?? [],
+                  snapshot_sha: preReviewEvidence.snapshotSha,
+                  head_sha: preReviewEvidence.headSha,
+                  patch_hash: computeNormalizedPatchHash(preReviewEvidence.diff),
+                },
+              ],
+              knownFailedApproaches: [
+                ...(workOrder.repair_context?.known_failed_approaches ?? []),
+                ...(isNoProgress ? [{
+                  attempt: workOrder.attempt,
+                  description: `No-progress detected (${noProgress?.category}): ${noProgress?.reason}`,
+                  test_failure_signatures: [],
+                  category: noProgress?.category,
+                }] : []),
+              ],
+              selectedResourceId: validated.authority.authorization.selected_resource_id,
+              selectedProviderId: validated.authority.authorization.selected_provider_id,
+            });
+            this.options.autonomyStore.recordRepairContext(task.id, nextPackage);
+          }
+
           task = this.transitionTask(task.id, review.verdict === 'REPAIR' ? 'FIX_VERDICT' : 'MAX_REVISIONS_EXCEEDED', authorityEpoch);
           result = {
             success: false,
@@ -699,9 +952,24 @@ export class ProductTaskAutonomyAdapter {
             review,
             observedHeadSha: postReviewEvidence.headSha,
             observedSnapshotSha: postReviewEvidence.snapshotSha,
-            error: `MANAGER_${review.verdict}`,
+            error: isNoProgress ? `REPAIR_NO_PROGRESS: ${noProgress?.category}: ${noProgress?.reason}` : `MANAGER_${review.verdict}`,
           };
         } else {
+          if (this.options.autonomyStore) {
+            this.options.autonomyStore.recordRepairOutcome(task.id, {
+              protocol_version: 'repairoutcome.v1',
+              task_id: task.id,
+              attempt: workOrder.attempt,
+              status: 'CONVERGED',
+              resolved_finding_ids: reconciledClosure?.resolvedFindingIds ?? normalizeReviewerFindings(workOrder.repair_context?.previous_reviewer_findings ?? []).map((f) => f.finding_id),
+              unresolved_finding_ids: [],
+              escalation_stage: getEscalationStage(workOrder.attempt),
+              summary: `Repair converged successfully at attempt ${workOrder.attempt}`,
+              head_sha: postReviewEvidence.headSha,
+              snapshot_sha: postReviewEvidence.snapshotSha ?? preReviewEvidence.snapshotSha ?? '0'.repeat(40),
+              created_at: new Date().toISOString(),
+            });
+          }
           task = this.transitionTask(task.id, 'PASS_VERDICT', authorityEpoch);
           result = {
             success: true,

@@ -10,11 +10,12 @@ import {
   WorkerResultSchema,
   createWorkOrder,
   parseManagerReview,
+  sanitizeAutonomyText,
 } from '../src/core/autonomy/contracts';
 import { AntigravityAdapter, CodexManagerAdapter } from '../src/core/autonomy/providers';
 import { AutonomyStore } from '../src/core/autonomy/store';
 import { AutonomySupervisor } from '../src/core/autonomy/supervisor';
-import { ManagerProviderPool, ManagerContextPackageSchema } from '../src/core/autonomy/managerPool';
+import { ManagerContextPackageSchema } from '../src/core/autonomy/managerPool';
 import { EvidenceCollector } from '../src/core/autonomy/evidence';
 import { execFileSync } from 'child_process';
 
@@ -54,6 +55,24 @@ describe('autonomy durable contracts', () => {
     expect(ManagerReviewSchema.safeParse({ verdict: 'PASS' }).success).toBe(false);
   });
 
+  it('redacts cloud, JWT, key-value, URL, and private-key secrets consistently', () => {
+    const raw = [
+      'AKIAABCDEFGHIJKLMNOP',
+      'github_pat_abcdefghijklmnopqrstuvwxyz1234567890',
+      'Bearer opaque-provider-token',
+      'api_key=abcdefghijklmnop',
+      'password: "abcdefghijklmnop"',
+      'https://user:abcdefghijklmnop@example.invalid/path',
+      'eyJabcdefghijk.abcdefghijkl.abcdefghijkl',
+      '-----BEGIN PRIVATE KEY-----\\nsecret\\n-----END PRIVATE KEY-----',
+    ].join(' | ');
+    const redacted = sanitizeAutonomyText(raw);
+    expect(redacted).not.toContain('AKIAABCDEFGHIJKLMNOP');
+    expect(redacted).not.toContain('opaque-provider-token');
+    expect(redacted).not.toContain('abcdefghijklmnop');
+    expect(redacted).toContain('[REDACTED_SECRET]');
+  });
+
   it('classifies fake Antigravity process outcomes and sanitizes logs', async () => {
     const success = new AntigravityAdapter({ executable: 'fake', runner: async () => processResult({ stdout: 'ghp_abcdefghijklmnopqrstuvwxyz1234567890' }) as any });
     const result = await success.execute(order(worktree()));
@@ -86,6 +105,14 @@ describe('autonomy durable contracts', () => {
     const second = store.createWorkOrder(order(path.join(os.tmpdir(), 'agentforge-worktree-2'), 'task-2'));
     expect(store.acquireSlot(second.id, 'agy-01', 1).workerId).toBe('agy-01');
     db.close();
+  });
+
+  it('fails closed when the product-task authority cannot be read', () => {
+    const db = new Database(':memory:');
+    MigrationRunner.run(db);
+    const store = new AutonomyStore(db);
+    db.close();
+    expect(() => store.isProductTask('closed-db-task')).toThrow(/closed|database/i);
   });
 
   it('keeps SHADOW side-effect free and rejects the control repository worktree', () => {
@@ -154,20 +181,20 @@ describe('autonomy durable contracts', () => {
     }
   });
 
-  it('keeps a task resumable when all manager providers are capacity-unavailable', async () => {
+  it('fails closed deterministically when ExecutionAuthorization is missing and releases capacity', async () => {
     const root = worktree(); const child = path.join(root, 'child'); fs.mkdirSync(child);
     const db = new Database(':memory:'); MigrationRunner.run(db);
     const store = new AutonomyStore(db);
-    const managerPool = new ManagerProviderPool(store, [{ id: 'primary', priority: 1, enabled: true, review: async () => ({ run: { status: 'QUOTA_OR_RATE_LIMIT', exitCode: 1, executionId: '', stdout: '', stderr: 'ALL_MANAGER_RESOURCES_UNAVAILABLE', durationMs: 1 } }) }]);
-    const supervisor = new AutonomySupervisor({ store, worktreeRoot: root, managerPool,
-      agy: new AntigravityAdapter({ executable: 'fake', runner: async () => processResult() }),
+    const supervisor = new AutonomySupervisor({
+      store,
+      worktreeRoot: root,
       evidence: { collect: async () => ({ headSha: 'a'.repeat(40), snapshotSha: 'clean', status: '', changedFiles: [], diff: '', tests: [{ command: 'test', exitCode: 0, stdout: '', stderr: '', durationMs: 1 }] }) },
     });
     const result = await supervisor.run({ taskId: 'manager-capacity', workerId: 'agy-01', objective: 'wait for manager', baseSha: 'a'.repeat(40), branch: 'agent/manager-capacity', worktree: child, acceptanceCriteria: ['wait'], allowedPaths: ['src'], requiredTests: ['test'] });
-    expect(result.state).toBe('MANAGER_REVIEW');
-    expect(result.error).toBe('MANAGER_CAPACITY_UNAVAILABLE');
+    expect(result.state).toBe('BLOCKED');
+    expect(result.error).toContain('AUTHORIZATION_MISSING');
     expect(store.listActiveSlots()).toHaveLength(0);
-    expect(store.getDatabase().prepare("SELECT state FROM autonomy_work_orders WHERE task_id='manager-capacity'").pluck().get()).toBe('MANAGER_REVIEW');
+    expect(store.getDatabase().prepare("SELECT state FROM autonomy_work_orders WHERE task_id='manager-capacity'").pluck().get()).toBe('BLOCKED');
     db.close();
   });
 

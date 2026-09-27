@@ -824,6 +824,20 @@ export class Repository {
       const existing = this.db.prepare('SELECT * FROM task_leases WHERE task_id = ?').get(taskId) as Record<string, unknown> | undefined;
 
       if (!existing || existing.released_at !== null || new Date(String(existing.expires_at)) < now) {
+        // An expired legacy lease is not reusable while a persisted process
+        // for the same task remains RUNNING. Startup recovery intentionally
+        // leaves such rows fenced because direct-PID liveness cannot prove
+        // that the entire process tree has terminated.
+        const unresolvedProcess = this.db
+          .prepare(`
+            SELECT 1
+            FROM process_runs
+            WHERE task_id = ? AND status = 'RUNNING'
+            LIMIT 1
+          `)
+          .get(taskId);
+        if (unresolvedProcess) return false;
+
         // Lease is available or expired
         this.db
           .prepare(`
@@ -10679,6 +10693,33 @@ export class Repository {
     const rows = this.db
       .prepare('SELECT * FROM provider_health_observations WHERE account_id = ? ORDER BY account_order ASC NULLS FIRST, observed_at ASC LIMIT ?')
       .all(accountId, limit) as Record<string, unknown>[];
+    return rows.map((r) => this.mapProviderHealthObservation(r));
+  }
+
+  /**
+   * Returns every ordered provider-health observation in replay order.
+   *
+   * Health application is deliberately separate from ingestion. A dispatch may
+   * persist an observation and then lose the process before its account mutation
+   * commits. Startup recovery therefore needs a durable, complete view of the
+   * observation stream. Rows are grouped by account and newest-first so the
+   * application layer can converge directly on each account's newest effective
+   * action; the application transaction still re-checks all ordering and
+   * watermark invariants before writing.
+   *
+   * Legacy unordered observations are excluded because they have no temporal
+   * authority and must remain visible through the account-scoped read API for
+   * explicit audit, but can never be replayed as an inferred mutation.
+   */
+  public getProviderHealthObservationsForReplay(): ProviderHealthObservationRecord[] {
+    const rows = this.db
+      .prepare(`
+        SELECT *
+        FROM provider_health_observations
+        WHERE account_order IS NOT NULL
+        ORDER BY account_id ASC, account_order DESC, authorization_id ASC
+      `)
+      .all() as Record<string, unknown>[];
     return rows.map((r) => this.mapProviderHealthObservation(r));
   }
 

@@ -8,6 +8,7 @@ import { AccountHealthService } from '../src/core/services/AccountHealthService'
 import { RoleAwareRoutingService } from '../src/core/services/RoleAwareRoutingService';
 import { ProviderRegistry } from '../src/core/adapters/ProviderRegistry';
 import { EventService } from '../src/core/services/EventService';
+import { CrashRecoveryService } from '../src/core/services/CrashRecoveryService';
 import {
   Provider,
   ProviderAccount,
@@ -1285,6 +1286,79 @@ describe('R5H4 Ordered Provider Health Application & Idempotency Contract Tests'
     const res = service.applyDurableObservation('non-existent-auth');
     expect(res.status).toBe('REJECTED');
     expect(res.reason).toContain('OBSERVATION_NOT_FOUND');
+  });
+
+  it('54. durable replay applies a pending observation and restart replay is idempotent', () => {
+    seedDurableGraph({
+      initialHealthStatus: 'RATE_LIMITED',
+      initialCooldownUntil: new Date(Date.now() + 60_000).toISOString(),
+    });
+    const item = createCoherentObservation({
+      authId: 'auth-replay',
+      execId: 'exec-replay',
+      msgId: 'msg-replay',
+      category: 'SUCCESS',
+    });
+    repo.claimProviderHealthObservation(item.obs, item.result);
+
+    const before = repo.getProviderAccount(ACCOUNT_ID)!;
+    expect(before.last_applied_action_authorization_id).toBeNull();
+
+    const firstReplay = service.replayProviderHealthObservations();
+    expect(firstReplay.scannedCount).toBe(1);
+    expect(firstReplay.appliedCount).toBe(1);
+    expect(firstReplay.errorCount).toBe(0);
+
+    const afterFirst = repo.getProviderAccount(ACCOUNT_ID)!;
+    expect(afterFirst.health_status).toBe('AVAILABLE');
+    expect(afterFirst.cooldown_until).toBeNull();
+    expect(afterFirst.last_applied_action_account_order).toBe(1);
+    expect(afterFirst.last_applied_action_authorization_id).toBe('auth-replay');
+
+    // Re-instantiating the service models a restart: the persisted watermark
+    // must turn the same durable row into ALREADY_APPLIED without another write.
+    const restartService = new AccountHealthService(new Repository(db));
+    const secondReplay = restartService.replayProviderHealthObservations();
+    expect(secondReplay.scannedCount).toBe(1);
+    expect(secondReplay.alreadyAppliedCount).toBe(1);
+    expect(secondReplay.appliedCount).toBe(0);
+    expect(secondReplay.errorCount).toBe(0);
+
+    const afterSecond = repo.getProviderAccount(ACCOUNT_ID)!;
+    expect(afterSecond.updated_at).toBe(afterFirst.updated_at);
+    expect(afterSecond.last_success_at).toBe(afterFirst.last_success_at);
+    expect(afterSecond.last_applied_action_authorization_id).toBe('auth-replay');
+  });
+
+  it('55. startup recovery replays pending health and remains idempotent across restarts', () => {
+    seedDurableGraph({ initialHealthStatus: 'RATE_LIMITED' });
+    const item = createCoherentObservation({
+      authId: 'auth-startup-replay',
+      execId: 'exec-startup-replay',
+      msgId: 'msg-startup-replay',
+      category: 'SUCCESS',
+    });
+    repo.claimProviderHealthObservation(item.obs, item.result);
+
+    const recovery = new CrashRecoveryService(db, repo, new EventService(repo));
+    const first = recovery.performStartupRecovery();
+    expect(first.providerHealthReplay?.scannedCount).toBe(1);
+    expect(first.providerHealthReplay?.appliedCount).toBe(1);
+    expect(first.providerHealthReplay?.errorCount).toBe(0);
+
+    const afterFirst = repo.getProviderAccount(ACCOUNT_ID)!;
+    expect(afterFirst.health_status).toBe('AVAILABLE');
+    expect(afterFirst.last_applied_action_authorization_id).toBe('auth-startup-replay');
+
+    const second = recovery.performStartupRecovery();
+    expect(second.providerHealthReplay?.scannedCount).toBe(1);
+    expect(second.providerHealthReplay?.alreadyAppliedCount).toBe(1);
+    expect(second.providerHealthReplay?.appliedCount).toBe(0);
+    expect(second.providerHealthReplay?.errorCount).toBe(0);
+
+    const afterSecond = repo.getProviderAccount(ACCOUNT_ID)!;
+    expect(afterSecond.updated_at).toBe(afterFirst.updated_at);
+    expect(afterSecond.last_applied_action_authorization_id).toBe('auth-startup-replay');
   });
 
   it('54. Missing provider account in database returns REJECTED', () => {

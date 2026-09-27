@@ -7,11 +7,28 @@ import { AntigravityAdapter, CodexManagerAdapter } from '../core/autonomy/provid
 import { AutonomySupervisor } from '../core/autonomy/supervisor';
 import { runDisposableSelfHostProof } from '../core/autonomy/selfHost';
 import { ProcessRunner } from '../core/services/ProcessRunner';
-import { SelfHostTaskSchema } from '../core/autonomy/contracts';
+import { SelfHostTaskSchema, sanitizeAutonomyText } from '../core/autonomy/contracts';
 import { assertPathContained } from '../core/services/ArtifactStore';
 import crypto from 'crypto';
 import { GithubCiObserver } from '../core/autonomy/github';
 import { loadOmniRouteEndpointFromEnvironment, ResponsesManagerEndpointTransport } from '../core/autonomy/responsesEndpoint';
+import { ResponsesCoderEndpointTransport } from '../core/autonomy/responsesCoderEndpoint';
+import {
+  buildTrialEvidenceManifest,
+  parseAndVerifyTrialEvidenceManifest,
+  writeTrialEvidenceManifest,
+} from '../core/autonomy/trialEvidence';
+import {
+  collectRedactedTrialLogs,
+  verifyRedactedTrialLogCollectionFile,
+} from '../core/autonomy/trialLogCollector';
+import type { CollectRedactedTrialLogsOptions } from '../core/autonomy/trialLogCollector';
+import {
+  evaluateTrialReadiness,
+} from '../core/autonomy/trialReadiness';
+import type { TrialReadinessInput } from '../core/autonomy/trialReadiness';
+import { TrialRunRegistry } from '../core/autonomy/trialRegistry';
+import type { ProductionTrialOutcome } from '../core/autonomy/trialEvidence';
 import { ReviewCapacityWatcher } from '../core/autonomy/reviewCapacity';
 
 const controlRepo = process.env.AGENT_FORGE_CONTROL_REPO ?? process.cwd();
@@ -27,7 +44,7 @@ function run(command: string, args: string[], cwd = controlRepo, timeout = 30_00
 }
 
 function redact(text: string): string {
-  return text.replace(/(?:gh[pousr]_[A-Za-z0-9_\-]{20,})/g, '[REDACTED_SECRET]').replace(/Bearer\s+\S+/gi, 'Bearer [REDACTED_SECRET]');
+  return sanitizeAutonomyText(text);
 }
 
 let failedChecks = 0;
@@ -97,6 +114,20 @@ async function doctorOmniRoute(): Promise<number> {
   return managerContract.compatible && reviewerContract.compatible ? 0 : 1;
 }
 
+export async function doctorOmniRouteCoder(): Promise<number> {
+  const coder = loadOmniRouteEndpointFromEnvironment('CODER');
+  if (!coder) {
+    check('OmniRoute coder configuration', false, 'Set AGENT_FORGE_OMNIROUTE_ENABLED=1, base URL, auth env reference, and AGENT_FORGE_CODER_MODEL');
+    return 1;
+  }
+  check('OmniRoute coder configuration', true, 'external route and auth reference loaded');
+  check('OmniRoute coder model', true, coder.model_or_route);
+  const transport = new ResponsesCoderEndpointTransport();
+  const coderContract = await transport.contract(coder);
+  check('OmniRoute coder Responses contract', coderContract.compatible, coderContract.run.status);
+  return coderContract.compatible ? 0 : 1;
+}
+
 export async function main(argv: string[] = process.argv): Promise<number> {
   const rawMaxWorkers = process.env.MAX_AGY_WORKERS !== undefined ? Number(process.env.MAX_AGY_WORKERS) : 1;
   if (!Number.isInteger(rawMaxWorkers) || rawMaxWorkers < 1 || rawMaxWorkers > 2) {
@@ -106,9 +137,108 @@ export async function main(argv: string[] = process.argv): Promise<number> {
   const command = argv[2] ?? 'status';
   if (command === 'doctor') return doctor();
   if (command === 'doctor-omniroute') return doctorOmniRoute();
+  if (command === 'doctor-coder' || command === 'doctor-omniroute-coder') return doctorOmniRouteCoder();
   const effectiveControlRepo = process.env.AGENT_FORGE_CONTROL_REPO ?? controlRepo;
   const effectiveWorktreeRoot = process.env.AGENT_FORGE_WORKTREE_ROOT ?? path.resolve(effectiveControlRepo, '..', 'AI', 'Agent-Forge-Worktrees');
   const effectiveRuntimeRoot = process.env.AGENT_FORGE_RUNTIME_ROOT ?? path.resolve(effectiveControlRepo, '..', 'AI', 'Agent-Forge-Runtime');
+  if (command === 'trial-manifest') {
+    const inputPath = path.resolve(argv[3] ?? '');
+    assertPathContained(inputPath, effectiveRuntimeRoot);
+    const outputRelativePath = argv[4] ?? 'trial-evidence/manifest.json';
+    const input = JSON.parse(fs.readFileSync(inputPath, 'utf8')) as Parameters<typeof buildTrialEvidenceManifest>[0];
+    const result = buildTrialEvidenceManifest(input);
+    const written = writeTrialEvidenceManifest(effectiveRuntimeRoot, outputRelativePath, result);
+    process.stdout.write(`${JSON.stringify({ filePath: written.filePath, sha256: written.sha256 })}\n`);
+    return 0;
+  }
+  if (command === 'verify-trial-manifest') {
+    const manifestPath = path.resolve(argv[3] ?? '');
+    assertPathContained(manifestPath, effectiveRuntimeRoot);
+    const expectedSha256 = argv[4];
+    const result = parseAndVerifyTrialEvidenceManifest(fs.readFileSync(manifestPath, 'utf8'), expectedSha256);
+    process.stdout.write(`${JSON.stringify({ filePath: manifestPath, trialId: result.manifest.trialId, phase: result.manifest.phase, outcome: result.manifest.outcome, sha256: result.sha256 })}\n`);
+    return 0;
+  }
+  if (command === 'trial-readiness') {
+    const manifestPath = path.resolve(argv[3] ?? '');
+    const inputPath = path.resolve(argv[4] ?? '');
+    assertPathContained(manifestPath, effectiveRuntimeRoot);
+    assertPathContained(inputPath, effectiveRuntimeRoot);
+    const parsedManifest = parseAndVerifyTrialEvidenceManifest(fs.readFileSync(manifestPath, 'utf8'));
+    const input = JSON.parse(fs.readFileSync(inputPath, 'utf8')) as TrialReadinessInput;
+    const result = evaluateTrialReadiness(parsedManifest.manifest, input);
+    process.stdout.write(`${JSON.stringify(result)}\n`);
+    return result.status === 'READY' ? 0 : 1;
+  }
+  if (command === 'trial-run-register') {
+    const manifestPath = path.resolve(argv[3] ?? '');
+    assertPathContained(manifestPath, effectiveRuntimeRoot);
+    const parsedManifest = parseAndVerifyTrialEvidenceManifest(fs.readFileSync(manifestPath, 'utf8'));
+    const opened = AutonomyStore.open(effectiveRuntimeRoot);
+    try {
+      const registry = new TrialRunRegistry(opened.store.getDatabase());
+      const record = registry.register(parsedManifest.manifest, parsedManifest.sha256, argv[4]);
+      process.stdout.write(`${JSON.stringify(record)}\n`);
+      return 0;
+    } finally {
+      opened.engine.close();
+    }
+  }
+  if (command === 'trial-run-start') {
+    const trialId = argv[3] ?? '';
+    const runId = argv[4] ?? '';
+    const opened = AutonomyStore.open(effectiveRuntimeRoot);
+    try {
+      const record = new TrialRunRegistry(opened.store.getDatabase()).start(trialId, runId);
+      process.stdout.write(`${JSON.stringify(record)}\n`);
+      return 0;
+    } finally {
+      opened.engine.close();
+    }
+  }
+  if (command === 'trial-run-complete') {
+    const trialId = argv[3] ?? '';
+    const runId = argv[4] ?? '';
+    const outcome = argv[5] as ProductionTrialOutcome;
+    const opened = AutonomyStore.open(effectiveRuntimeRoot);
+    try {
+      const record = new TrialRunRegistry(opened.store.getDatabase()).complete(trialId, runId, outcome);
+      process.stdout.write(`${JSON.stringify(record)}\n`);
+      return 0;
+    } finally {
+      opened.engine.close();
+    }
+  }
+  if (command === 'trial-run-list') {
+    const opened = AutonomyStore.open(effectiveRuntimeRoot);
+    try {
+      const registry = new TrialRunRegistry(opened.store.getDatabase());
+      process.stdout.write(`${JSON.stringify(registry.list(argv[3]))}\n`);
+      return 0;
+    } finally {
+      opened.engine.close();
+    }
+  }
+  if (command === 'trial-log-collect') {
+    const inputPath = path.resolve(argv[3] ?? '');
+    assertPathContained(inputPath, effectiveRuntimeRoot);
+    const parsed = JSON.parse(fs.readFileSync(inputPath, 'utf8')) as Partial<CollectRedactedTrialLogsOptions>;
+    const outputRelativePath = argv[4] ?? parsed.outputRelativePath ?? 'trial-evidence/redacted-logs.json';
+    const result = collectRedactedTrialLogs({
+      ...(parsed as CollectRedactedTrialLogsOptions),
+      rootDir: effectiveRuntimeRoot,
+      outputRelativePath,
+    });
+    process.stdout.write(`${JSON.stringify({ filePath: result.filePath, sha256: result.sha256, byteSize: result.byteSize, files: result.collection.files.length })}\n`);
+    return 0;
+  }
+  if (command === 'trial-log-verify') {
+    const collectionPath = path.resolve(argv[3] ?? '');
+    assertPathContained(collectionPath, effectiveRuntimeRoot);
+    const result = verifyRedactedTrialLogCollectionFile(collectionPath, effectiveRuntimeRoot);
+    process.stdout.write(`${JSON.stringify({ filePath: collectionPath, sha256: result.sha256, byteSize: result.byteSize, files: result.collection.files.length })}\n`);
+    return 0;
+  }
   const store = AutonomyStore.open(effectiveRuntimeRoot);
   const supervisor = new AutonomySupervisor({ store: store.store, mode: command === 'shadow' ? 'SHADOW' : 'PILOT', runtimeRoot: effectiveRuntimeRoot, controlRepo: effectiveControlRepo, worktreeRoot: effectiveWorktreeRoot, maxWorkers: rawMaxWorkers });
   const ci = new GithubCiObserver(store.store, effectiveControlRepo, supervisor.managerPool);
@@ -158,8 +288,8 @@ export async function main(argv: string[] = process.argv): Promise<number> {
   const owner = store.store.acquireOwner();
   const cancellation = setInterval(() => { if (store.store.shouldStop()) void ProcessRunner.terminateAllProcesses(); }, 1000);
   try {
-  supervisor.recover();
-  if (command === 'recover') { process.stdout.write('Recovery completed; retained worktrees and fenced attempts remain in durable state.\n'); return 0; }
+  const recovery = supervisor.recover();
+  if (command === 'recover') { process.stdout.write(`${JSON.stringify(recovery, null, 2)}\n`); return 0; }
   if (command === 'pilot') {
     const proof = await runDisposableSelfHostProof({ controlRepo: effectiveControlRepo, worktreeRoot: effectiveWorktreeRoot, supervisor });
     process.stdout.write(`${JSON.stringify({ mode: supervisor.mode, accepted: proof.result.accepted ?? false, state: proof.result.state, verdict: proof.result.review?.verdict, error: proof.result.error, worktree: proof.worktree, branch: proof.branch, baseSha: proof.baseSha })}\n`);

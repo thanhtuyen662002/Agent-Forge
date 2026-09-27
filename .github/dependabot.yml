@@ -1,0 +1,38 @@
+version: 2
+updates:
+  # Runtime packages and development/tooling packages are grouped separately so
+  # reviewers can apply the appropriate compatibility and security checks.
+  - package-ecosystem: npm
+    directory: "/"
+    schedule:
+      interval: weekly
+      day: monday
+      time: "04:00"
+      timezone: "Asia/Ho_Chi_Minh"
+    open-pull-requests-limit: 2
+    groups:
+      runtime-dependencies:
+        dependency-type: production
+      dev-tooling:
+        dependency-type: development
+    labels:
+      - dependencies
+      - automated-update
+
+  # Action pins are reviewed independently from npm updates and are deliberately
+  # rate-limited because every workflow change can invoke expensive Windows CI.
+  - package-ecosystem: github-actions
+    directory: "/"
+    schedule:
+      interval: monthly
+      day: "1"
+      time: "04:00"
+      timezone: "Asia/Ho_Chi_Minh"
+    open-pull-requests-limit: 1
+    groups:
+      github-actions:
+        patterns:
+          - "*"
+    labels:
+      - dependencies
+      - github-actions

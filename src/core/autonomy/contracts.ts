@@ -1,4 +1,6 @@
 import { z } from 'zod';
+import { RepairContextPackageSchema } from './repairContext';
+import type { RepairContextPackage } from './repairContext';
 
 const ShaSchema = z.string().regex(/^[0-9a-f]{40}$/i, 'must be a 40-character Git SHA');
 const NonEmptyString = z.string().trim().min(1);
@@ -21,6 +23,7 @@ export const WorkOrderSchema = z.object({
   constraints: z.array(NonEmptyString),
   attempt: z.number().int().positive(),
   lease_epoch: z.number().int().positive(),
+  repair_context: RepairContextPackageSchema.optional(),
 });
 
 export type WorkOrder = z.infer<typeof WorkOrderSchema>;
@@ -74,17 +77,24 @@ export const WorkerResultSchema = z.object({
 
 export type WorkerResult = z.infer<typeof WorkerResultSchema>;
 
+export const ManagerReviewFindingSchema = z.object({
+  finding_id: NonEmptyString.optional(),
+  severity: z.enum(['LOW', 'MEDIUM', 'HIGH', 'CRITICAL']),
+  title: NonEmptyString,
+  description: NonEmptyString,
+  file_path: NonEmptyString.nullable().optional(),
+  line_number: z.number().int().positive().nullable().optional(),
+  evidence: z.string().optional(),
+  required_action: z.string().optional(),
+  acceptance_evidence: z.string().optional(),
+});
+export type ManagerReviewFinding = z.infer<typeof ManagerReviewFindingSchema>;
+
 export const ManagerReviewSchema = z.object({
   protocol_version: z.literal('managerreview.v1'),
   verdict: z.enum(['PASS', 'REPAIR', 'BLOCKED']),
   reviewed_head_sha: ShaSchema,
-  findings: z.array(z.object({
-    severity: z.enum(['LOW', 'MEDIUM', 'HIGH', 'CRITICAL']),
-    title: NonEmptyString,
-    description: NonEmptyString,
-    file_path: NonEmptyString.nullable().optional(),
-    line_number: z.number().int().positive().nullable().optional(),
-  })),
+  findings: z.array(ManagerReviewFindingSchema),
   required_actions: z.array(NonEmptyString),
   risk: z.enum(['LOW', 'MEDIUM', 'HIGH', 'CRITICAL']),
   notes: z.string().default(''),
@@ -121,6 +131,7 @@ export interface AutonomousTaskSpec {
   workerId: string;
   attempt?: number;
   leaseEpoch?: number;
+  repairContext?: RepairContextPackage;
 }
 
 export interface GitEvidence {
@@ -151,6 +162,7 @@ export function createWorkOrder(spec: AutonomousTaskSpec): WorkOrder {
     constraints: spec.constraints ?? [],
     attempt: spec.attempt ?? 1,
     lease_epoch: spec.leaseEpoch ?? 1,
+    ...(spec.repairContext ? { repair_context: spec.repairContext } : {}),
   });
 }
 
@@ -191,10 +203,21 @@ export function parseManagerReview(raw: string): ManagerReview {
 
 export function sanitizeAutonomyText(text: string, maxBytes = 2 * 1024 * 1024): string {
   const sanitized = String(text ?? '')
+    // Provider/GitHub tokens, cloud access keys, JWTs, and private keys can
+    // appear in provider errors or process output.  Keep this list central so
+    // every durable evidence sink and CLI diagnostic has the same boundary.
     .replace(/(?:gh[pousr]_[A-Za-z0-9_\-]{20,})/g, '[REDACTED_SECRET]')
-    .replace(/Bearer\s+[A-Za-z0-9._\-]+/gi, 'Bearer [REDACTED_SECRET]')
+    .replace(/(?:github_pat_[A-Za-z0-9_\-]{20,})/g, '[REDACTED_SECRET]')
+    .replace(/\b(?:AKIA|ASIA)[0-9A-Z]{16}\b/g, '[REDACTED_SECRET]')
+    .replace(/\beyJ[A-Za-z0-9_\-]{10,}\.[A-Za-z0-9_\-]{10,}\.[A-Za-z0-9_\-]{10,}\b/g, '[REDACTED_SECRET]')
+    .replace(/Bearer\s+\S+/gi, 'Bearer [REDACTED_SECRET]')
+    .replace(/\b[a-z][a-z0-9+.-]*:\/\/[^\s/@:]+:[^\s/@]+@/gi, '[REDACTED_SECRET]')
+    .replace(/(?:["']?(?:api[_-]?key|access[_-]?token|refresh[_-]?token|client[_-]?secret|oauth[_-]?token|password|secret|token)["']?\s*[:=]\s*["']?)[^\s"',;}]{8,}["']?/gi, '[REDACTED_SECRET]')
     .replace(/-----BEGIN [^-]+-----[\s\S]*?-----END [^-]+-----/g, '[REDACTED_SECRET]');
   return Buffer.byteLength(sanitized, 'utf8') <= maxBytes
     ? sanitized
     : `${Buffer.from(sanitized, 'utf8').subarray(0, maxBytes).toString('utf8')}\n[TRUNCATED]`;
 }
+
+export { RepairContextPackageSchema } from './repairContext';
+export type { RepairContextPackage, ReviewerRepairFinding, ReviewerRepairFinding as RepairFinding } from './repairContext';

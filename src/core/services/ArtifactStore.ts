@@ -22,6 +22,21 @@ export function assertPathContained(targetPath: string, rootDir: string): string
   const rootParsed = path.parse(absRoot);
   const targetParsed = path.parse(absTarget);
 
+  // The root itself is a trust boundary. Checking only child components is
+  // insufficient when a caller supplies a symlink/junction as the root and
+  // then creates a new target beneath it (there is no existing target for the
+  // real-path check to inspect yet).
+  if (fs.existsSync(absRoot)) {
+    try {
+      if (fs.lstatSync(absRoot).isSymbolicLink()) {
+        throw new Error('[ArtifactStore] Security violation: Evidence root is a symbolic link or junction (SYMLINK_NOT_PERMITTED)');
+      }
+    } catch (err: unknown) {
+      if (err instanceof Error && err.message.includes('Security violation')) throw err;
+      throw new Error('[ArtifactStore] Security violation: Cannot verify evidence root');
+    }
+  }
+
   // 1. Root / Drive / UNC change check
   const rootDrive = isWin ? rootParsed.root.toLowerCase() : rootParsed.root;
   const targetDrive = isWin ? targetParsed.root.toLowerCase() : targetParsed.root;

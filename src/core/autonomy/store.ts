@@ -5,6 +5,16 @@ import Database from 'better-sqlite3';
 import { DatabaseEngine } from '../database/db';
 import { MigrationRunner } from '../database/migrations';
 import { AutonomyState, ManagerReview, WorkOrder, SelfHostTask } from './contracts';
+import type {
+  RepairContextPackage,
+  RepairOutcome,
+  NoProgressEvaluation,
+  RepairLineage,
+} from './repairContext';
+import {
+  canonicalSerializeRepairContext,
+  parseRepairContextPackage,
+} from './repairContext';
 
 export interface AutonomyWorkOrderRow {
   id: string;
@@ -26,6 +36,33 @@ export interface AutonomySlot {
   workerId: string;
   workOrderId: string;
   leaseEpoch: number;
+}
+
+/** Durable external ownership claim observed by the Supervisor. */
+export interface AutonomyExternalClaim {
+  claim_key: string;
+  source: string;
+  external_id: string;
+  work_order_id: string | null;
+  head_sha: string | null;
+  state: string;
+  observed_at: string;
+}
+
+/**
+ * Durable identity that a repair context must match before it can be reused.
+ *
+ * Repair context is task-scoped audit data, but it is also an execution input.
+ * Selecting it by task alone would allow a newly authorized attempt to replay
+ * findings, provider selection, or snapshots from a stale authorization.
+ */
+export interface RepairContextBinding {
+  authorizationId: string;
+  ownershipEpoch: number;
+  baseSha: string;
+  currentHeadSha: string;
+  selectedProviderId: string;
+  selectedResourceId: string;
 }
 
 export interface AutonomyCiWatch {
@@ -73,6 +110,57 @@ export type ManagerResourceState =
   | 'OFFLINE'
   | 'CONTRACT_INVALID';
 export interface ManagerResourceHealth { resource_id: string; state: ManagerResourceState; cooldown_until: string | null; last_error: string | null; updated_at: string; }
+
+export type CiIdentityType = 'PR_HEAD_CI' | 'MAIN_POST_MERGE_CI';
+
+export type MergeIdentityType = 'SQUASH' | 'LINEAR_HISTORY' | 'NONE';
+
+export type CiReconciliationClassification =
+  | 'PR_HEAD_SUCCESS'
+  | 'DIFFERENT_MERGE_SHA_PUSH_SUCCESS'
+  | 'LINEAR_HISTORY_MERGE_PUSH_SUCCESS'
+  | 'MISSING_POST_MERGE_CI'
+  | 'STALE_PR_HEAD_CI'
+  | 'SUPERSEDED_HEAD'
+  | 'PR_HEAD_FAILURE'
+  | 'POST_MERGE_PUSH_FAILURE'
+  | 'POST_MERGE_PUSH_PENDING';
+
+export interface AutonomyCiReconciliation {
+  id: string;
+  repository: string;
+  pr_number: number;
+  pr_head_sha: string;
+  merged_main_sha: string | null;
+  pr_head_ci_identity: string;
+  pr_head_event: 'pull_request';
+  pr_head_conclusion: string | null;
+  main_post_merge_ci_identity: string | null;
+  main_post_merge_event: 'push';
+  main_post_merge_conclusion: string | null;
+  reconciliation_classification: CiReconciliationClassification;
+  merge_identity_type: MergeIdentityType;
+  details_json: string;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface RecordCiReconciliationInput {
+  id?: string;
+  repository: string;
+  prNumber: number;
+  prHeadSha: string;
+  mergedMainSha?: string | null;
+  prHeadCiIdentity?: string;
+  prHeadEvent?: 'pull_request';
+  prHeadConclusion?: string | null;
+  mainPostMergeCiIdentity?: string | null;
+  mainPostMergeEvent?: 'push';
+  mainPostMergeConclusion?: string | null;
+  reconciliationClassification: CiReconciliationClassification;
+  mergeIdentityType?: MergeIdentityType;
+  details?: Record<string, unknown> | string;
+}
 
 /**
  * Autonomy state is an extension owned by the supervisor. The product migration
@@ -124,6 +212,29 @@ export const AUTONOMY_SCHEMA_SQL = `
     UNIQUE(repository, pr_number)
   );
   CREATE INDEX IF NOT EXISTS idx_autonomy_ci_watches_due ON autonomy_ci_watches(state, next_poll_at);
+  CREATE TABLE IF NOT EXISTS autonomy_ci_reconciliations (
+    id TEXT PRIMARY KEY,
+    repository TEXT NOT NULL,
+    pr_number INTEGER NOT NULL,
+    pr_head_sha TEXT NOT NULL,
+    merged_main_sha TEXT,
+    pr_head_ci_identity TEXT NOT NULL,
+    pr_head_event TEXT NOT NULL DEFAULT 'pull_request',
+    pr_head_conclusion TEXT,
+    main_post_merge_ci_identity TEXT,
+    main_post_merge_event TEXT NOT NULL DEFAULT 'push',
+    main_post_merge_conclusion TEXT,
+    reconciliation_classification TEXT NOT NULL,
+    merge_identity_type TEXT NOT NULL DEFAULT 'NONE',
+    details_json TEXT NOT NULL DEFAULT '{}',
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    UNIQUE(repository, pr_number, pr_head_sha)
+  );
+  CREATE INDEX IF NOT EXISTS idx_autonomy_ci_recon_repo_pr ON autonomy_ci_reconciliations(repository, pr_number);
+  CREATE INDEX IF NOT EXISTS idx_autonomy_ci_recon_pr_head ON autonomy_ci_reconciliations(pr_head_sha);
+  CREATE INDEX IF NOT EXISTS idx_autonomy_ci_recon_main ON autonomy_ci_reconciliations(merged_main_sha);
+  CREATE INDEX IF NOT EXISTS idx_autonomy_ci_recon_classification ON autonomy_ci_reconciliations(reconciliation_classification);
   CREATE TABLE IF NOT EXISTS autonomy_manager_resources (
     resource_id TEXT PRIMARY KEY, state TEXT NOT NULL, cooldown_until TEXT, last_error TEXT, updated_at TEXT NOT NULL
   );
@@ -133,6 +244,35 @@ export const AUTONOMY_SCHEMA_SQL = `
   CREATE TABLE IF NOT EXISTS autonomy_manager_contexts (
     context_sha TEXT PRIMARY KEY, context_json TEXT NOT NULL, created_at TEXT NOT NULL
   );
+  CREATE TABLE IF NOT EXISTS autonomy_trial_runs (
+    trial_id TEXT NOT NULL,
+    run_id TEXT NOT NULL,
+    phase TEXT NOT NULL CHECK(phase IN ('R5L0','R5L1','R5L2','R5L3','R5L4')),
+    state TEXT NOT NULL CHECK(state IN ('REGISTERED','RUNNING','PASS','HOLD','FAIL')),
+    manifest_sha256 TEXT NOT NULL,
+    source_commit_sha TEXT NOT NULL,
+    source_tree_sha TEXT NOT NULL,
+    database_projection_sha256 TEXT,
+    created_at TEXT NOT NULL,
+    started_at TEXT,
+    finished_at TEXT,
+    updated_at TEXT NOT NULL,
+    PRIMARY KEY(trial_id, run_id)
+  );
+  CREATE INDEX IF NOT EXISTS idx_autonomy_trial_runs_trial ON autonomy_trial_runs(trial_id, created_at);
+  CREATE TABLE IF NOT EXISTS autonomy_trial_run_events (
+    id TEXT PRIMARY KEY,
+    trial_id TEXT NOT NULL,
+    run_id TEXT NOT NULL,
+    sequence INTEGER NOT NULL,
+    event_type TEXT NOT NULL CHECK(event_type IN ('TRIAL_RUN_REGISTERED','TRIAL_RUN_STARTED','TRIAL_RUN_COMPLETED')),
+    state TEXT NOT NULL CHECK(state IN ('REGISTERED','RUNNING','PASS','HOLD','FAIL')),
+    payload_json TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    UNIQUE(trial_id, run_id, sequence)
+  );
+  CREATE INDEX IF NOT EXISTS idx_autonomy_trial_run_events_run
+    ON autonomy_trial_run_events(trial_id, run_id, sequence);
   CREATE TABLE IF NOT EXISTS autonomy_review_capacity_waits (
     id TEXT PRIMARY KEY,
     task_id TEXT NOT NULL,
@@ -179,6 +319,23 @@ export class AutonomyStore {
   }
 
   getDatabase(): Database.Database { return this.db; }
+
+  /**
+   * Read one external claim without changing its observation timestamp or
+   * state.  Remote observations must pass their source-specific reconciliation
+   * contract before callers invoke reconcileExternalClaim().
+   */
+  getExternalClaim(source: string, externalId: string): AutonomyExternalClaim | null {
+    return (this.db.prepare('SELECT claim_key,source,external_id,work_order_id,head_sha,state,observed_at FROM autonomy_claims WHERE source=? AND external_id=?').get(source, externalId) as AutonomyExternalClaim | undefined) ?? null;
+  }
+
+  /** Return durable external claims in deterministic key order for recovery/audit. */
+  listExternalClaims(source?: string): AutonomyExternalClaim[] {
+    if (source !== undefined) {
+      return this.db.prepare('SELECT claim_key,source,external_id,work_order_id,head_sha,state,observed_at FROM autonomy_claims WHERE source=? ORDER BY source,external_id,claim_key').all(source) as AutonomyExternalClaim[];
+    }
+    return this.db.prepare('SELECT claim_key,source,external_id,work_order_id,head_sha,state,observed_at FROM autonomy_claims ORDER BY source,external_id,claim_key').all() as AutonomyExternalClaim[];
+  }
 
   ensureSchema(): void {
     this.db.transaction(() => this.db.exec(AUTONOMY_SCHEMA_SQL))();
@@ -318,9 +475,28 @@ export class AutonomyStore {
     }
   }
 
-  reconcileExternalClaim(source: string, externalId: string, workOrderId: string, headSha: string, state: string): 'CREATED' | 'MATCHED' {
+  reconcileExternalClaim(
+    source: string,
+    externalId: string,
+    workOrderId: string,
+    headSha: string,
+    state: string,
+    expectedExistingClaim?: Pick<AutonomyExternalClaim, 'work_order_id' | 'head_sha'> | null,
+  ): 'CREATED' | 'MATCHED' {
     return this.db.transaction(() => {
       const existing = this.db.prepare('SELECT work_order_id,head_sha FROM autonomy_claims WHERE source=? AND external_id=?').get(source, externalId) as { work_order_id: string; head_sha: string } | undefined;
+      if (expectedExistingClaim !== undefined) {
+        const expectedPresent = expectedExistingClaim !== null;
+        const actualPresent = existing !== undefined;
+        const sameHead = (left: string | null | undefined, right: string | null | undefined): boolean =>
+          (left ?? null)?.toLowerCase() === (right ?? null)?.toLowerCase();
+        if (expectedPresent !== actualPresent || (expectedPresent && existing && (
+          existing.work_order_id !== expectedExistingClaim.work_order_id
+          || !sameHead(existing.head_sha, expectedExistingClaim.head_sha)
+        ))) {
+          throw new Error('EXTERNAL_CLAIM_CHANGED');
+        }
+      }
       if (existing) {
         if (existing.work_order_id !== workOrderId) throw new Error('DUPLICATE_GITHUB_CLAIM');
         this.db.prepare('UPDATE autonomy_claims SET head_sha=?,state=?,observed_at=? WHERE source=? AND external_id=?').run(headSha, state, new Date().toISOString(), source, externalId);
@@ -329,7 +505,7 @@ export class AutonomyStore {
       this.db.prepare('INSERT INTO autonomy_claims (claim_key,source,external_id,work_order_id,head_sha,state,observed_at) VALUES (?,?,?,?,?,?,?)')
         .run(`${source}:${externalId}`, source, externalId, workOrderId, headSha, state, new Date().toISOString());
       return 'CREATED';
-    })();
+    }).immediate();
   }
 
   registerCiWatch(input: { taskId: string; workOrderId?: string | null; repository: string; prNumber: number; branch: string; expectedHeadSha: string }): AutonomyCiWatch {
@@ -372,6 +548,94 @@ export class AutonomyStore {
     const fields = entries.map(([key]) => `${key}=?`).join(',');
     const result = this.db.prepare(`UPDATE autonomy_ci_watches SET ${fields},updated_at=? WHERE id=?`).run(...entries.map(([, value]) => value), new Date().toISOString(), id);
     if (result.changes !== 1) throw new Error('CI_WATCH_NOT_FOUND');
+  }
+
+  recordCiReconciliation(input: RecordCiReconciliationInput): AutonomyCiReconciliation {
+    const id = input.id ?? crypto.randomUUID();
+    const now = new Date().toISOString();
+    const prHeadSha = input.prHeadSha.toLowerCase();
+    const mergedMainSha = input.mergedMainSha ? input.mergedMainSha.toLowerCase() : null;
+    const prHeadEvent = input.prHeadEvent ?? 'pull_request';
+    const mainPostMergeEvent = input.mainPostMergeEvent ?? 'push';
+    const prHeadIdentity = input.prHeadCiIdentity ?? `PR_HEAD_CI:${input.repository}#${input.prNumber}@${prHeadSha}`;
+    const mainPostMergeIdentity = input.mainPostMergeCiIdentity ?? (mergedMainSha ? `MAIN_POST_MERGE_CI:${input.repository}@${mergedMainSha}` : null);
+
+    let mergeType: MergeIdentityType = input.mergeIdentityType ?? 'NONE';
+    if (!input.mergeIdentityType && mergedMainSha) {
+      mergeType = prHeadSha === mergedMainSha ? 'LINEAR_HISTORY' : 'SQUASH';
+    }
+
+    const detailsJson = typeof input.details === 'string'
+      ? input.details
+      : JSON.stringify(input.details ?? {});
+
+    return this.db.transaction(() => {
+      this.db.prepare(`
+        INSERT INTO autonomy_ci_reconciliations (
+          id, repository, pr_number, pr_head_sha, merged_main_sha,
+          pr_head_ci_identity, pr_head_event, pr_head_conclusion,
+          main_post_merge_ci_identity, main_post_merge_event, main_post_merge_conclusion,
+          reconciliation_classification, merge_identity_type, details_json, created_at, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(repository, pr_number, pr_head_sha) DO UPDATE SET
+          merged_main_sha = excluded.merged_main_sha,
+          pr_head_ci_identity = excluded.pr_head_ci_identity,
+          pr_head_event = excluded.pr_head_event,
+          pr_head_conclusion = excluded.pr_head_conclusion,
+          main_post_merge_ci_identity = excluded.main_post_merge_ci_identity,
+          main_post_merge_event = excluded.main_post_merge_event,
+          main_post_merge_conclusion = excluded.main_post_merge_conclusion,
+          reconciliation_classification = excluded.reconciliation_classification,
+          merge_identity_type = excluded.merge_identity_type,
+          details_json = excluded.details_json,
+          updated_at = excluded.updated_at
+      `).run(
+        id, input.repository, input.prNumber, prHeadSha, mergedMainSha,
+        prHeadIdentity, prHeadEvent, input.prHeadConclusion ?? null,
+        mainPostMergeIdentity, mainPostMergeEvent, input.mainPostMergeConclusion ?? null,
+        input.reconciliationClassification, mergeType, detailsJson, now, now
+      );
+
+      const row = this.db.prepare(
+        'SELECT * FROM autonomy_ci_reconciliations WHERE repository = ? AND pr_number = ? AND pr_head_sha = ?'
+      ).get(input.repository, input.prNumber, prHeadSha) as AutonomyCiReconciliation;
+
+      this.event(`${input.repository}#${input.prNumber}`, 'CI_RECONCILIATION_RECORDED', row);
+      return row;
+    })();
+  }
+
+  getCiReconciliation(id: string): AutonomyCiReconciliation | null {
+    return (this.db.prepare('SELECT * FROM autonomy_ci_reconciliations WHERE id = ?').get(id) as AutonomyCiReconciliation | undefined) ?? null;
+  }
+
+  getCiReconciliationByPr(repository: string, prNumber: number): AutonomyCiReconciliation | null {
+    return (this.db.prepare('SELECT * FROM autonomy_ci_reconciliations WHERE repository = ? AND pr_number = ? ORDER BY updated_at DESC, created_at DESC LIMIT 1').get(repository, prNumber) as AutonomyCiReconciliation | undefined) ?? null;
+  }
+
+  getCiReconciliationByPrAndHead(repository: string, prNumber: number, prHeadSha: string): AutonomyCiReconciliation | null {
+    return (this.db.prepare('SELECT * FROM autonomy_ci_reconciliations WHERE repository = ? AND pr_number = ? AND lower(pr_head_sha) = lower(?)').get(repository, prNumber, prHeadSha) as AutonomyCiReconciliation | undefined) ?? null;
+  }
+
+  findCiReconciliationsByHeadSha(headSha: string): AutonomyCiReconciliation[] {
+    return this.db.prepare('SELECT * FROM autonomy_ci_reconciliations WHERE lower(pr_head_sha) = lower(?) ORDER BY updated_at DESC, created_at DESC').all(headSha) as AutonomyCiReconciliation[];
+  }
+
+  findCiReconciliationsByMainSha(mainSha: string): AutonomyCiReconciliation[] {
+    return this.db.prepare('SELECT * FROM autonomy_ci_reconciliations WHERE lower(merged_main_sha) = lower(?) ORDER BY updated_at DESC, created_at DESC').all(mainSha) as AutonomyCiReconciliation[];
+  }
+
+  listCiReconciliations(filter?: { repository?: string; classification?: CiReconciliationClassification }): AutonomyCiReconciliation[] {
+    if (filter?.repository && filter?.classification) {
+      return this.db.prepare('SELECT * FROM autonomy_ci_reconciliations WHERE repository = ? AND reconciliation_classification = ? ORDER BY updated_at DESC, created_at DESC').all(filter.repository, filter.classification) as AutonomyCiReconciliation[];
+    }
+    if (filter?.repository) {
+      return this.db.prepare('SELECT * FROM autonomy_ci_reconciliations WHERE repository = ? ORDER BY updated_at DESC, created_at DESC').all(filter.repository) as AutonomyCiReconciliation[];
+    }
+    if (filter?.classification) {
+      return this.db.prepare('SELECT * FROM autonomy_ci_reconciliations WHERE reconciliation_classification = ? ORDER BY updated_at DESC, created_at DESC').all(filter.classification) as AutonomyCiReconciliation[];
+    }
+    return this.db.prepare('SELECT * FROM autonomy_ci_reconciliations ORDER BY updated_at DESC, created_at DESC').all() as AutonomyCiReconciliation[];
   }
 
   findLatestWorkOrderByTask(taskId: string): AutonomyWorkOrderRow | null {
@@ -496,15 +760,99 @@ export class AutonomyStore {
       .run(crypto.randomUUID(), workOrderId, eventType, JSON.stringify(payload), new Date().toISOString());
   }
 
+  recordRepairContext(pkg: RepairContextPackage): void;
+  recordRepairContext(taskId: string, pkg: RepairContextPackage): void;
+  recordRepairContext(first: string | RepairContextPackage, second?: RepairContextPackage): void {
+    const pkg = typeof first === 'string' ? second! : first;
+    const taskId = typeof first === 'string' ? first : first.task_id;
+    this.event(taskId, 'REPAIR_CONTEXT_RECORDED', JSON.parse(canonicalSerializeRepairContext(pkg)));
+  }
+
+  getLatestRepairContext(taskId: string, binding?: RepairContextBinding): RepairContextPackage | null {
+    const row = this.db.prepare(
+      "SELECT payload_json FROM autonomy_events WHERE work_order_id = ? AND event_type = 'REPAIR_CONTEXT_RECORDED' ORDER BY created_at DESC"
+    ).all(taskId) as Array<{ payload_json: string }>;
+    if (!row.length) return null;
+
+    const packages = row.map((entry) => parseRepairContextPackage(entry.payload_json));
+    if (!binding) return packages[0] ?? null;
+
+    const expectedBaseSha = binding.baseSha.toLowerCase();
+    const expectedHeadSha = binding.currentHeadSha.toLowerCase();
+    return packages.find((pkg) =>
+      pkg.authorization_id === binding.authorizationId &&
+      pkg.ownership_epoch === binding.ownershipEpoch &&
+      pkg.base_sha.toLowerCase() === expectedBaseSha &&
+      pkg.current_head_sha.toLowerCase() === expectedHeadSha &&
+      pkg.selected_provider_id === binding.selectedProviderId &&
+      pkg.selected_resource_id === binding.selectedResourceId
+    ) ?? null;
+  }
+
+  listRepairContexts(taskId: string): RepairContextPackage[] {
+    const rows = this.db.prepare(
+      "SELECT payload_json FROM autonomy_events WHERE work_order_id = ? AND event_type = 'REPAIR_CONTEXT_RECORDED' ORDER BY created_at ASC"
+    ).all(taskId) as Array<{ payload_json: string }>;
+    return rows.map((r) => parseRepairContextPackage(r.payload_json));
+  }
+
+  recordRepairOutcome(outcome: RepairOutcome): void;
+  recordRepairOutcome(taskId: string, outcome: RepairOutcome): void;
+  recordRepairOutcome(first: string | RepairOutcome, second?: RepairOutcome): void {
+    const outcome = typeof first === 'string' ? second! : first;
+    const taskId = typeof first === 'string' ? first : first.task_id;
+    this.event(taskId, 'REPAIR_OUTCOME_RECORDED', outcome);
+  }
+
+  recordRepairNoProgress(taskId: string, evaluation: NoProgressEvaluation): void {
+    this.event(taskId, 'REPAIR_NO_PROGRESS', evaluation);
+  }
+
+  rebuildRepairLineage(taskId: string): RepairLineage {
+    const packages = this.listRepairContexts(taskId);
+    const outcomeRows = this.db.prepare(
+      "SELECT payload_json FROM autonomy_events WHERE work_order_id = ? AND event_type = 'REPAIR_OUTCOME_RECORDED' ORDER BY created_at ASC"
+    ).all(taskId) as Array<{ payload_json: string }>;
+    const outcomes: RepairOutcome[] = outcomeRows.map((r) => JSON.parse(r.payload_json));
+
+    const latestPkg = packages.at(-1);
+
+    const findings = latestPkg?.previous_reviewer_findings ?? [];
+    const resolvedFindingIds = latestPkg?.resolved_finding_ids ?? [];
+    const unresolvedFindingIds = latestPkg?.unresolved_finding_ids ?? [];
+    const previousCoderActions = latestPkg?.previous_coder_actions ?? [];
+    const knownFailedApproaches = latestPkg?.known_failed_approaches ?? [];
+    const nonRegressionConstraints = latestPkg?.non_regression_constraints ?? [];
+
+    return {
+      taskId,
+      authorizationId: latestPkg?.authorization_id ?? '',
+      ownershipEpoch: latestPkg?.ownership_epoch ?? 1,
+      latestAttempt: latestPkg?.attempt ?? (packages.length > 0 ? packages.length : 1),
+      baseSha: latestPkg?.base_sha ?? '',
+      currentHeadSha: latestPkg?.current_head_sha ?? '',
+      currentSnapshotSha: latestPkg?.current_snapshot_sha ?? '',
+      findings,
+      resolvedFindingIds,
+      unresolvedFindingIds,
+      previousCoderActions,
+      knownFailedApproaches,
+      nonRegressionConstraints,
+      selectedResourceId: latestPkg?.selected_resource_id ?? null,
+      selectedProviderId: latestPkg?.selected_provider_id ?? null,
+      packages,
+      outcomes,
+    };
+  }
+
   isProductTask(taskId: string): boolean {
-    try {
-      const hasTasks = this.db.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='tasks'").get();
-      if (!hasTasks) return false;
-      const row = this.db.prepare('SELECT 1 FROM tasks WHERE id = ?').get(taskId);
-      return !!row;
-    } catch {
-      return false;
-    }
+    const hasTasks = this.db.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='tasks'").get();
+    if (!hasTasks) return false;
+    // Any error after the table has been observed is an authority failure. Do
+    // not fall through to the legacy autonomy lifecycle when SQLite is closed,
+    // locked, or otherwise unable to answer the product-task lookup.
+    const row = this.db.prepare('SELECT 1 FROM tasks WHERE id = ?').get(taskId);
+    return !!row;
   }
 
   isLegacyTableAuthoritative(tableName: string): boolean {
@@ -569,6 +917,14 @@ export class AutonomyStore {
         notes: 'Active CI watches retained and continuously monitored',
       },
       {
+        tableName: 'autonomy_ci_reconciliations',
+        totalRows: countTable('autonomy_ci_reconciliations'),
+        activeRows: countTable('autonomy_ci_reconciliations'),
+        retainedStatus: 'RETAINED_ACTIVE_WATCHES',
+        isAuthoritative: false,
+        notes: 'Durable CI identity reconciliations relating PR head and post-merge main CI',
+      },
+      {
         tableName: 'autonomy_claims',
         totalRows: countTable('autonomy_claims'),
         activeRows: countTable('autonomy_claims'),
@@ -607,6 +963,22 @@ export class AutonomyStore {
         retainedStatus: 'RETAINED_MANAGER_CONTEXTS',
         isAuthoritative: false,
         notes: 'Manager context snapshots retained',
+      },
+      {
+        tableName: 'autonomy_trial_runs',
+        totalRows: countTable('autonomy_trial_runs'),
+        activeRows: countTable('autonomy_trial_runs', "state IN ('REGISTERED','RUNNING','HOLD')"),
+        retainedStatus: 'RETAINED_TRIAL_RUNS',
+        isAuthoritative: false,
+        notes: 'Manifest-bound local trial identities and fail-closed lifecycle state retained for evidence',
+      },
+      {
+        tableName: 'autonomy_trial_run_events',
+        totalRows: countTable('autonomy_trial_run_events'),
+        activeRows: countTable('autonomy_trial_run_events'),
+        retainedStatus: 'RETAINED_TRIAL_RUN_EVENTS',
+        isAuthoritative: false,
+        notes: 'Ordered trial run transition audit events retained',
       },
       {
         tableName: 'autonomy_review_capacity_waits',
@@ -662,6 +1034,8 @@ export type LegacyRetainedStatus =
   | 'RETAINED_MANAGER_RESOURCES'
   | 'RETAINED_MANAGER_ATTEMPTS'
   | 'RETAINED_MANAGER_CONTEXTS'
+  | 'RETAINED_TRIAL_RUNS'
+  | 'RETAINED_TRIAL_RUN_EVENTS'
   | 'RETAINED_REVIEW_CAPACITY_WAITS';
 
 export interface LegacyTableInventory {
