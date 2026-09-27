@@ -253,6 +253,40 @@ disabled; repository protections and the exact observed head stay the final
 authority. Keep the running version fixed and implement self-development in
 worktrees before reviewing and updating it.
 
+### Recovery, health replay, and trial evidence contracts
+
+Startup recovery now performs a read-only process-run reconciliation before the
+execution and adjudication scanners. A persisted `RUNNING` process row is never
+changed to `CANCELLED` merely because the supervisor restarted: direct-PID
+liveness cannot prove that detached descendants are gone. The scanner records a
+stable process identity hash, classifies live/dead/missing/unknown PID evidence,
+and keeps every unresolved row fenced. Expired task leases remain fenced while
+an associated process row is still `RUNNING`.
+
+Provider health observations are ingested and applied through the single
+`AccountHealthService` writer. Application is a separate durable step from
+observation ingestion, so a crash between the two steps is recovered by
+ordered, idempotent startup replay. Unknown or malformed authority remains
+unresolved and cannot invent account health state.
+
+Production-trial evidence is represented by the strict, canonical manifest
+contract in `src/core/autonomy/trialEvidence.ts`. It binds phase, trial ID,
+source commit/tree SHA, CI run, package/projection hashes, lifecycle IDs,
+context hashes, redacted evidence entries, approvals, retention location, and a
+manifest SHA-256. The CLI exposes:
+
+```text
+npm run autonomy:trial-manifest -- <runtime-input.json> [relative-output.json]
+npm run autonomy:verify-trial-manifest -- <manifest.json> [expected-sha256]
+```
+
+Both commands require files beneath `AGENT_FORGE_RUNTIME_ROOT`; traversal,
+symlinks, malformed hashes, duplicate evidence IDs, and secret-like values are
+rejected. `src/core/autonomy/failureInjection.ts` provides deterministic
+FI-01..FI-15 checkpoints for safe rehearsal fixtures. The harness is
+side-effect-free by itself: a production trial must still connect each
+checkpoint to an approved fixture and retain evidence for every FI scenario.
+
 The all-target fast-pr.yml supplements main-target CI. Windows/Ubuntu checks,
 Windows packaging, installed-app verification, and RC verification remain.
 Repository protection is unchanged.

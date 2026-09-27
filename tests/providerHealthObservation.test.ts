@@ -323,6 +323,19 @@ function createHierarchy(repo: Repository, repoDir: string, baseSha: string, cus
       score: 100,
       status: 'SELECTED',
       reason: 'Initial assignment',
+      failoverPolicyAuthoritySnapshot: {
+        version: 1,
+        status: 'VALID',
+        policy: {
+          version: 1,
+          enabled: true,
+          max_failover_attempts: 3,
+          same_account_retries: 1,
+          allow_cross_account: true,
+          allow_cross_provider: false,
+          cooldown_duration_ms: 60_000,
+        },
+      },
     }
   );
 
@@ -935,6 +948,12 @@ describe('R5H4 Durable Provider Health Observation Contract', () => {
     expect(obs).not.toBeNull();
     expect(obs?.classified_category).toBe('SUCCESS');
     expect(obs?.execution_id).toBe(res.executionId);
+
+    // Dispatch application is a second durable step: the observation row and
+    // account watermark must agree before the result is returned.
+    const account = repo.getProviderAccount(hierarchy.accountId);
+    expect(account?.last_applied_action_account_order).toBe(obs?.account_order);
+    expect(account?.last_applied_action_authorization_id).toBe(hierarchy.authId);
   });
 
   // 32. Real dispatch provider failure writes classified observation
@@ -959,6 +978,10 @@ describe('R5H4 Durable Provider Health Observation Contract', () => {
     const obs = repo.getProviderHealthObservation(hierarchy.authId);
     expect(obs).not.toBeNull();
     expect(obs?.classified_category).toBe('RATE_LIMITED');
+    const account = repo.getProviderAccount(hierarchy.accountId);
+    expect(account?.health_status).toBe('RATE_LIMITED');
+    expect(account?.cooldown_until).toBeTruthy();
+    expect(account?.last_applied_action_authorization_id).toBe(hierarchy.authId);
   });
 
   // 33. Pre-adapter dispatch rejection writes no observation
@@ -1042,6 +1065,31 @@ describe('R5H4 Durable Provider Health Observation Contract', () => {
     expect(res.status).toBe('COMPLETED');
     expect(res.providerExecutionProvenance).toBeDefined();
     expect(res.providerExecutionProvenance?.authorizationId).toBe(hierarchy.authId);
+  });
+
+  // 35b. Application failure leaves the provider result valid and the durable
+  // observation available for startup replay.
+  it('35b. health application failure preserves provider result and observation', async () => {
+    const registry = new ProviderRegistry();
+    const adapter = new MockAdapter('prov-test-obs', 'Obs Provider');
+    registry.register(adapter);
+
+    const hierarchy = createHierarchy(repo, repoDir, baseSha);
+    db.prepare("UPDATE execution_authorizations SET status = 'AUTHORIZED' WHERE id = ?").run(hierarchy.authId);
+
+    const dispatch = new ProviderDispatchService(registry, repo);
+    const healthService = (dispatch as any).accountHealthService;
+    healthService.applyObservation = () => {
+      throw new Error('SIMULATED_HEALTH_APPLICATION_FAILURE');
+    };
+
+    const res = await dispatch.dispatch(hierarchy.authId);
+    expect(res.status).toBe('COMPLETED');
+    expect(res.providerExecutionProvenance?.authorizationId).toBe(hierarchy.authId);
+    expect(repo.getProviderHealthObservation(hierarchy.authId)).not.toBeNull();
+
+    const account = repo.getProviderAccount(hierarchy.accountId);
+    expect(account?.last_applied_action_authorization_id).toBeNull();
   });
 
   // 36. Source scan proves no AccountHealthService/policy/failover imports

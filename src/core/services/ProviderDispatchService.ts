@@ -30,6 +30,7 @@ import {
 } from './ExecutionAuthorizationService';
 import { sanitizeContextFiles, canonicalJsonStringify, verifyContextManifestIntegrity } from '../context/ContextIntegrity';
 import { ProviderHealthObservationService } from './ProviderHealthObservationService';
+import { AccountHealthService } from './AccountHealthService';
 
 export type ScheduledCancellationStatus =
   | 'CANCEL_REQUESTED'
@@ -78,6 +79,7 @@ interface ScheduledDispatchControl {
 export class ProviderDispatchService {
   private activeDispatches = new Map<string, ScheduledDispatchControl>();
   private readonly observationService: ProviderHealthObservationService;
+  private readonly accountHealthService: AccountHealthService;
 
   constructor(
     private providerRegistry: ProviderRegistry,
@@ -86,6 +88,7 @@ export class ProviderDispatchService {
     private gitWorktreeService?: GitWorktreeService
   ) {
     this.observationService = new ProviderHealthObservationService(this.repo);
+    this.accountHealthService = new AccountHealthService(this.repo);
   }
 
   public setGitWorktreeService(service: GitWorktreeService): void {
@@ -1424,11 +1427,28 @@ export class ProviderDispatchService {
       }
     }
 
-    // 16b. Record durable provider health observation for trusted execution results
+    // 16b. Record and apply durable provider health observation for trusted
+    // execution results. Ingestion and account mutation are intentionally two
+    // transactions: a failed application leaves a durable row for startup
+    // replay and never changes the provider execution result returned to the
+    // caller.
     try {
-      this.observationService.recordObservation(result);
+      const ingestion = this.observationService.recordObservation(result);
+      if (ingestion.status === 'RECORDED' || ingestion.status === 'ALREADY_RECORDED') {
+        try {
+          this.accountHealthService.applyObservation(auth.id);
+        } catch (healthError) {
+          // Non-fatal to provider result: the durable observation remains
+          // available for CrashRecoveryService replay.
+          console.error(
+            `[ProviderDispatchService] Durable provider health application deferred for ${auth.id}:`,
+            healthError
+          );
+        }
+      }
     } catch (_err) {
-      // Non-fatal to provider result: observation recording failure must not mutate or invalidate the actual provider execution result
+      // Non-fatal to provider result: observation recording failure must not
+      // mutate or invalidate the actual provider execution result.
     }
 
     // 17. Emit PROVIDER_RUNTIME_EXECUTION_RESULT event

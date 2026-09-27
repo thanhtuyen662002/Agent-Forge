@@ -12,6 +12,13 @@ export type ProcessTerminationTruth =
   | 'PROCESS_TREE_TERMINATED_PROVEN'
   | 'TERMINATION_UNRESOLVED';
 
+/**
+ * Best-effort observation of a persisted direct PID.  This is deliberately
+ * weaker than process-tree termination truth: a DEAD direct PID may still have
+ * detached descendants, and UNKNOWN must never be treated as dead.
+ */
+export type ProcessLivenessObservation = 'LIVE' | 'DEAD' | 'UNKNOWN';
+
 export interface ProcessRunResult {
   executionId: string;
   pid: number | null;
@@ -111,6 +118,23 @@ export class ProcessRunner {
 
   public static getPersistenceFencedCount(): number {
     return this.persistenceFencedEntries.size;
+  }
+
+  /**
+   * Probe a persisted PID without sending a signal that changes process state.
+   * Permission errors and all non-ESRCH failures are intentionally UNKNOWN;
+   * recovery must not infer termination from an inconclusive operating-system
+   * response.
+   */
+  public static observeProcessLiveness(pid: number): ProcessLivenessObservation {
+    if (!Number.isSafeInteger(pid) || pid <= 0) return 'UNKNOWN';
+    try {
+      process.kill(pid, 0);
+      return 'LIVE';
+    } catch (err: unknown) {
+      const code = err && typeof err === 'object' && 'code' in err ? String((err as { code?: unknown }).code) : '';
+      return code === 'ESRCH' ? 'DEAD' : 'UNKNOWN';
+    }
   }
 
   private static retryPromises = new Map<string, Promise<ProcessRunResult>>();

@@ -13,6 +13,11 @@ import crypto from 'crypto';
 import { GithubCiObserver } from '../core/autonomy/github';
 import { loadOmniRouteEndpointFromEnvironment, ResponsesManagerEndpointTransport } from '../core/autonomy/responsesEndpoint';
 import { ResponsesCoderEndpointTransport } from '../core/autonomy/responsesCoderEndpoint';
+import {
+  buildTrialEvidenceManifest,
+  parseAndVerifyTrialEvidenceManifest,
+  writeTrialEvidenceManifest,
+} from '../core/autonomy/trialEvidence';
 
 const controlRepo = process.env.AGENT_FORGE_CONTROL_REPO ?? process.cwd();
 const worktreeRoot = process.env.AGENT_FORGE_WORKTREE_ROOT ?? path.resolve(controlRepo, '..', 'AI', 'Agent-Forge-Worktrees');
@@ -124,6 +129,24 @@ export async function main(argv: string[] = process.argv): Promise<number> {
   const effectiveControlRepo = process.env.AGENT_FORGE_CONTROL_REPO ?? controlRepo;
   const effectiveWorktreeRoot = process.env.AGENT_FORGE_WORKTREE_ROOT ?? path.resolve(effectiveControlRepo, '..', 'AI', 'Agent-Forge-Worktrees');
   const effectiveRuntimeRoot = process.env.AGENT_FORGE_RUNTIME_ROOT ?? path.resolve(effectiveControlRepo, '..', 'AI', 'Agent-Forge-Runtime');
+  if (command === 'trial-manifest') {
+    const inputPath = path.resolve(argv[3] ?? '');
+    assertPathContained(inputPath, effectiveRuntimeRoot);
+    const outputRelativePath = argv[4] ?? 'trial-evidence/manifest.json';
+    const input = JSON.parse(fs.readFileSync(inputPath, 'utf8')) as Parameters<typeof buildTrialEvidenceManifest>[0];
+    const result = buildTrialEvidenceManifest(input);
+    const written = writeTrialEvidenceManifest(effectiveRuntimeRoot, outputRelativePath, result);
+    process.stdout.write(`${JSON.stringify({ filePath: written.filePath, sha256: written.sha256 })}\n`);
+    return 0;
+  }
+  if (command === 'verify-trial-manifest') {
+    const manifestPath = path.resolve(argv[3] ?? '');
+    assertPathContained(manifestPath, effectiveRuntimeRoot);
+    const expectedSha256 = argv[4];
+    const result = parseAndVerifyTrialEvidenceManifest(fs.readFileSync(manifestPath, 'utf8'), expectedSha256);
+    process.stdout.write(`${JSON.stringify({ filePath: manifestPath, trialId: result.manifest.trialId, phase: result.manifest.phase, outcome: result.manifest.outcome, sha256: result.sha256 })}\n`);
+    return 0;
+  }
   const store = AutonomyStore.open(effectiveRuntimeRoot);
   const supervisor = new AutonomySupervisor({ store: store.store, mode: command === 'shadow' ? 'SHADOW' : 'PILOT', runtimeRoot: effectiveRuntimeRoot, controlRepo: effectiveControlRepo, worktreeRoot: effectiveWorktreeRoot, maxWorkers: rawMaxWorkers });
   const ci = new GithubCiObserver(store.store, effectiveControlRepo, supervisor.managerPool);

@@ -21,7 +21,7 @@ Agent-Forge guarantees that the durable source of truth resides entirely in:
 
 ## Current Status: `AUTONOMY_BOOTSTRAP_PILOT`
 
-The experimental PILOT kernel runs Codex planning/review and Antigravity file edits in isolated worktrees, captures independent Git/test evidence, and persists attempts in SQLite. The current bounded runtime supports one or two explicitly configured workers, product-task authorization, routed OmniRoute coder bundles, durable repair convergence, and fenced GitHub CI observation. Complete orphan/process reconciliation and automatic merge/integration remain bounded follow-up work; see [the implemented boundaries](docs/AUTONOMY.md).
+The experimental PILOT kernel runs Codex planning/review and Antigravity file edits in isolated worktrees, captures independent Git/test evidence, and persists attempts in SQLite. The current bounded runtime supports one or two explicitly configured workers, product-task authorization, routed OmniRoute coder bundles, durable repair convergence, fenced GitHub CI observation, process-run recovery fencing, ordered provider-health replay, and canonical R5L trial-evidence manifests. Complete descendant/worktree/PR reconciliation, production failure-injection execution, live trial closure, and automatic merge/integration remain bounded follow-up work; see [the implemented boundaries](docs/AUTONOMY.md).
 
 - **Core Foundation & Database Migrations (PR #1)**: **IMPLEMENTED & VERIFIED** (SQLite WAL mode, strict foreign keys, state machine, Git ground truth).
 - **Continuous Integration Pipeline (PR #2)**: **IMPLEMENTED & VERIFIED** (Multi-platform Windows & Ubuntu CI with diff hygiene).
