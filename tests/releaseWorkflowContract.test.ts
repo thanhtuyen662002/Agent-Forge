@@ -25,6 +25,8 @@ describe('PR #19 — Production Release Pipeline Hardening Contract Tests', () =
     expect(config).toMatch(/open-pull-requests-limit:\s*1/);
     expect(config).toMatch(/interval:\s*weekly/);
     expect(config).toMatch(/interval:\s*monthly/);
+    expect(config).toMatch(/package-ecosystem:\s*github-actions[\s\S]*?interval:\s*monthly[\s\S]*?day:\s*(?:monday|tuesday|wednesday|thursday|friday|saturday|sunday)\b/);
+    expect(config).not.toMatch(/package-ecosystem:\s*github-actions[\s\S]*?interval:\s*monthly[\s\S]*?day:\s*["']?\d/);
   });
 
   it('pins every third-party GitHub Action to a full commit SHA with a readable version comment', () => {
