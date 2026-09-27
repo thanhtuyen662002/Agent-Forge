@@ -13,6 +13,37 @@ describe('PR #19 — Production Release Pipeline Hardening Contract Tests', () =
   const packageJsonPath = path.join(projectRoot, 'package.json');
   const packageLockJsonPath = path.join(projectRoot, 'package-lock.json');
 
+  it('defines a bounded Dependabot policy for runtime, tooling, and GitHub Action updates', () => {
+    const dependabotPath = path.join(projectRoot, '.github/dependabot.yml');
+    const config = fs.readFileSync(dependabotPath, 'utf8');
+    expect(config).toMatch(/^version:\s*2\s*$/m);
+    expect(config).toMatch(/package-ecosystem:\s*npm/);
+    expect(config).toMatch(/package-ecosystem:\s*github-actions/);
+    expect(config).toMatch(/dependency-type:\s*production/);
+    expect(config).toMatch(/dependency-type:\s*development/);
+    expect(config).toMatch(/open-pull-requests-limit:\s*2/);
+    expect(config).toMatch(/open-pull-requests-limit:\s*1/);
+    expect(config).toMatch(/interval:\s*weekly/);
+    expect(config).toMatch(/interval:\s*monthly/);
+  });
+
+  it('pins every third-party GitHub Action to a full commit SHA with a readable version comment', () => {
+    const workflowDir = path.join(projectRoot, '.github/workflows');
+    const workflowFiles = fs.readdirSync(workflowDir).filter((name) => name.endsWith('.yml') || name.endsWith('.yaml'));
+    expect(workflowFiles.length).toBeGreaterThan(0);
+    const actionUses: Array<{ file: string; line: string }> = [];
+    for (const file of workflowFiles) {
+      const lines = fs.readFileSync(path.join(workflowDir, file), 'utf8').split(/\r?\n/);
+      for (const line of lines) {
+        if (/\buses:\s*[^\s]+/.test(line) && !/\buses:\s*\.\//.test(line)) actionUses.push({ file, line });
+      }
+    }
+    expect(actionUses.length).toBeGreaterThan(0);
+    for (const { file, line } of actionUses) {
+      expect(line, `${file}: ${line}`).toMatch(/@[0-9a-f]{40}\s+#\s+v\d+\.\d+\.\d+/i);
+    }
+  });
+
   it('1. package.json and package-lock.json preserve current production version 0.1.0', () => {
     const pkg = JSON.parse(fs.readFileSync(packageJsonPath, 'utf8'));
     const pkgLock = JSON.parse(fs.readFileSync(packageLockJsonPath, 'utf8'));
