@@ -77,6 +77,10 @@ describe('production trial evidence manifest', () => {
     const redacted = redactTrialEvidenceText('Bearer abcdefghijklmnop and ghp_123456789012345678901234567890123456');
     expect(redacted).toContain('[REDACTED_SECRET]');
     expect(() => buildTrialEvidenceManifest({ ...baseManifest(), notes: 'api_key=super-secret-value' })).not.toThrow();
+    const tokenRedacted = buildTrialEvidenceManifest({ ...baseManifest(), notes: 'token: super-secret-value' });
+    expect(tokenRedacted.manifest.notes).toBe('[REDACTED_SECRET]');
+    const secretRedacted = buildTrialEvidenceManifest({ ...baseManifest(), notes: 'secret=super-secret-value' });
+    expect(secretRedacted.manifest.notes).toBe('[REDACTED_SECRET]');
     const raw = JSON.stringify({ ...baseManifest(), notes: 'api_key=super-secret-value', schemaVersion: 1, createdAt: new Date().toISOString() });
     const built = buildTrialEvidenceManifest(baseManifest());
     expect(() => parseAndVerifyTrialEvidenceManifest(raw, built.sha256)).toThrow(/TRIAL_EVIDENCE_INVALID/);

@@ -40,6 +40,7 @@ const SECRET_PATTERNS: RegExp[] = [
   /\b(?:AKIA|ASIA)[0-9A-Z]{16}\b/g,
   /\bBearer\s+[A-Za-z0-9._\-+/=]{16,}/gi,
   /-----BEGIN [^-]+-----[\s\S]*?-----END [^-]+-----/g,
+  /\b(?:api[_-]?key|access[_-]?token|refresh[_-]?token|client[_-]?secret|oauth[_-]?token|password|secret|token)\s*[:=]\s*[^\s,;}]{8,}/gi,
 ];
 
 function fail(message: string): never {
