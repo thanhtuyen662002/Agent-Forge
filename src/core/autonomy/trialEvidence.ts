@@ -60,9 +60,10 @@ const SAFE_ID = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/;
 const SAFE_CONTENT_TYPE = /^[A-Za-z0-9!#$&^_.+\-]+\/[A-Za-z0-9!#$&^_.+\-]+(?:;[A-Za-z0-9=._+\-]+)*$/;
 const SECRET_PATTERNS: RegExp[] = [
   /(?:gh[pousr]_[A-Za-z0-9_\-]{20,})/g,
+  /(?:github_pat_[A-Za-z0-9_\-]{20,})/g,
   /\b(?:AKIA|ASIA)[0-9A-Z]{16}\b/g,
   /\bBearer\s+[A-Za-z0-9._\-+/=]{16,}/gi,
-  /-----BEGIN (?:RSA |EC |OPENSSH )?PRIVATE KEY-----[\s\S]*?-----END (?:RSA |EC |OPENSSH )?PRIVATE KEY-----/g,
+  /-----BEGIN [^-]+-----[\s\S]*?-----END [^-]+-----/g,
   /\b(?:api[_-]?key|access[_-]?token|refresh[_-]?token|client[_-]?secret|password)\s*[:=]\s*[^\s,;]{8,}/gi,
 ];
 
@@ -203,6 +204,10 @@ function normalizeManifest(raw: unknown, sanitizeText: boolean): ProductionTrial
   if (normalizedNotes !== null) assertNoSecrets(normalizedNotes, 'notes');
   const lifecycleIds = normalizeStringArray(row.lifecycleIds, 'lifecycleIds');
   lifecycleIds.forEach((id) => assertNoSecrets(id, 'lifecycleIds'));
+  const operatorIds = normalizeStringArray(approvals.operatorIds, 'approvals.operatorIds', 64);
+  const approverIds = normalizeStringArray(approvals.approverIds, 'approvals.approverIds', 64);
+  operatorIds.forEach((id) => assertNoSecrets(id, 'approvals.operatorIds'));
+  approverIds.forEach((id) => assertNoSecrets(id, 'approvals.approverIds'));
   const contextHashes = normalizeContextHashes(row.contextHashes);
   const evidence = normalizeEvidence(row.evidence);
   const location = normalizeRelativePath(retention.location, 'retention.location');
@@ -235,8 +240,8 @@ function normalizeManifest(raw: unknown, sanitizeText: boolean): ProductionTrial
     outcome: row.outcome as ProductionTrialOutcome,
     evidence,
     approvals: {
-      operatorIds: normalizeStringArray(approvals.operatorIds, 'approvals.operatorIds', 64),
-      approverIds: normalizeStringArray(approvals.approverIds, 'approvals.approverIds', 64),
+      operatorIds,
+      approverIds,
     },
     retention: { location, retentionClass },
     notes: normalizedNotes,
@@ -287,6 +292,23 @@ export function parseAndVerifyTrialEvidenceManifest(rawJson: string, expectedSha
 }
 
 export function writeTrialEvidenceManifest(rootDir: string, relativePath: string, result: TrialEvidenceManifestResult): { filePath: string; sha256: string } {
+  // Validate and recompute the supplied result before touching the filesystem.
+  // A caller may deserialize or construct this object from untrusted JSON;
+  // trusting its canonicalJson/sha256 fields would allow a malformed receipt
+  // to poison a previously empty evidence location.
+  let canonicalJson: string;
+  let sha256: string;
+  try {
+    canonicalJson = canonicalizeTrialEvidenceManifest((result as unknown as { manifest: ProductionTrialEvidenceManifest }).manifest);
+    sha256 = crypto.createHash('sha256').update(canonicalJson, 'utf8').digest('hex');
+  } catch (error) {
+    if (error instanceof Error && error.message.startsWith('TRIAL_EVIDENCE_INVALID:')) throw error;
+    fail('manifest result is malformed');
+  }
+  const supplied = result as unknown as { canonicalJson?: unknown; sha256?: unknown };
+  if (supplied.canonicalJson !== canonicalJson || supplied.sha256 !== sha256) {
+    fail('manifest result canonical JSON or SHA-256 does not match its manifest');
+  }
   const safeRelativePath = normalizeRelativePath(relativePath, 'manifest output path');
   const absoluteRoot = path.resolve(rootDir);
   fs.mkdirSync(absoluteRoot, { recursive: true });
@@ -296,14 +318,14 @@ export function writeTrialEvidenceManifest(rootDir: string, relativePath: string
   if (fs.existsSync(filePath)) {
     if (fs.lstatSync(filePath).isSymbolicLink()) fail('manifest output path is a symbolic link');
     const existing = parseAndVerifyTrialEvidenceManifest(fs.readFileSync(filePath, 'utf8'));
-    if (existing.sha256 !== result.sha256) fail('manifest output already exists with a different digest');
-    return { filePath, sha256: result.sha256 };
+    if (existing.sha256 !== sha256) fail('manifest output already exists with a different digest');
+    return { filePath, sha256 };
   }
   const tempPath = `${filePath}.tmp-${crypto.randomUUID()}`;
   assertPathContained(tempPath, absoluteRoot);
   const fd = fs.openSync(tempPath, 'wx');
   try {
-    fs.writeFileSync(fd, `${result.canonicalJson}\n`, 'utf8');
+    fs.writeFileSync(fd, `${canonicalJson}\n`, 'utf8');
     fs.fsyncSync(fd);
   } finally {
     fs.closeSync(fd);
@@ -314,6 +336,6 @@ export function writeTrialEvidenceManifest(rootDir: string, relativePath: string
     try { if (fs.existsSync(tempPath)) fs.unlinkSync(tempPath); } catch { /* preserve original failure */ }
     throw new Error(`TRIAL_EVIDENCE_WRITE_FAILED: ${error instanceof Error ? error.message : 'atomic rename failed'}`);
   }
-  const written = parseAndVerifyTrialEvidenceManifest(fs.readFileSync(filePath, 'utf8'), result.sha256);
+  const written = parseAndVerifyTrialEvidenceManifest(fs.readFileSync(filePath, 'utf8'), sha256);
   return { filePath, sha256: written.sha256 };
 }

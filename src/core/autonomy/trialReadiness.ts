@@ -24,6 +24,7 @@ export interface TrialReadinessInput {
   approvedSource?: { commitSha?: unknown; treeSha?: unknown };
   observedSource?: { commitSha?: unknown; treeSha?: unknown; cleanWorktree?: unknown };
   ciPassed?: unknown;
+  observedCiRunId?: unknown;
   buildPassed?: unknown;
   reviewerBuilt?: unknown;
   observedArtifacts?: {
@@ -31,6 +32,16 @@ export interface TrialReadinessInput {
     appSha256?: unknown;
     databaseProjectionSha256?: unknown;
   };
+  /**
+   * Production readiness requires an independently collected Authenticode
+   * attestation.  These fields intentionally live in the untrusted input
+   * envelope rather than the evidence manifest: the operator must supply a
+   * fresh signature observation for the exact installer being released.
+   */
+  installerCodeSigned?: unknown;
+  installerSignatureSha256?: unknown;
+  installerSignerThumbprint?: unknown;
+  installerSignedArtifactSha256?: unknown;
   databaseBackupSha256?: unknown;
   syntheticProviderAccountIds?: unknown;
   liveProviderAccountIds?: unknown;
@@ -74,6 +85,7 @@ export interface TrialReadinessResult {
 }
 
 const SHA256 = /^[0-9a-f]{64}$/;
+const HEX_DIGEST = /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/i;
 const GIT_SHA = /^[0-9a-f]{40}$/i;
 const SAFE_ID = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/;
 const PHASE_ORDER: readonly ProductionTrialPhase[] = ['R5L0', 'R5L1', 'R5L2', 'R5L3', 'R5L4'];
@@ -85,6 +97,10 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 
 function sha(value: unknown): value is string {
   return typeof value === 'string' && SHA256.test(value);
+}
+
+function hexDigest(value: unknown): value is string {
+  return typeof value === 'string' && HEX_DIGEST.test(value);
 }
 
 function gitSha(value: unknown): value is string {
@@ -161,6 +177,14 @@ function addSourceChecks(
     observed && booleanTrue(input.observedSource!.cleanWorktree),
     booleanTrue(input.observedSource?.cleanWorktree) ? 'observed worktree is clean' : 'current worktree cleanliness was not independently confirmed',
   );
+  const observedCiRunId = input.observedCiRunId;
+  const ciRunBound = boundedText(observedCiRunId) && observedCiRunId === manifest.source.ciRunId;
+  check(
+    checks,
+    'ci.observed_run_binding',
+    ciRunBound,
+    ciRunBound ? 'observed CI run ID matches the manifest source' : 'an observed CI run ID matching the manifest source is required',
+  );
   check(
     checks,
     'ci.required_pass',
@@ -236,6 +260,44 @@ function addObservedArtifactCheck(
     ok
       ? `${field} observed digest matches the manifest`
       : `${field} observed digest is required and must exactly match the manifest`,
+  );
+}
+
+function addInstallerSigningChecks(
+  manifest: ProductionTrialEvidenceManifest,
+  input: TrialReadinessInput,
+  checks: TrialReadinessCheck[],
+): void {
+  const signed = booleanTrue(input.installerCodeSigned);
+  const signatureDigest = sha(input.installerSignatureSha256);
+  const signerThumbprint = hexDigest(input.installerSignerThumbprint);
+  const signedArtifactDigest = input.installerSignedArtifactSha256;
+  const signedArtifact = sha(signedArtifactDigest);
+  const manifestInstaller = manifest.artifacts.installerSha256;
+  check(
+    checks,
+    'release.installer_code_signed',
+    signed,
+    signed ? 'installer Authenticode status is independently verified as signed' : 'installer Authenticode signing must be independently verified',
+  );
+  check(
+    checks,
+    'release.installer_signature_digest',
+    signatureDigest,
+    signatureDigest ? 'installer signature digest is recorded' : 'a valid installer signature SHA-256 is required',
+  );
+  check(
+    checks,
+    'release.installer_signer_binding',
+    signerThumbprint,
+    signerThumbprint ? 'installer signer certificate thumbprint is recorded' : 'a valid installer signer certificate thumbprint is required',
+  );
+  const exactArtifact = manifestInstaller !== null && signedArtifact && signedArtifactDigest === manifestInstaller;
+  check(
+    checks,
+    'release.installer_signature_artifact_binding',
+    exactArtifact,
+    exactArtifact ? 'signature attestation is bound to the manifest installer digest' : 'signature attestation must name the exact manifest installer digest',
   );
 }
 
@@ -345,6 +407,7 @@ export function evaluateTrialReadiness(
       addObservedArtifactCheck(normalized, input ?? {}, checks, 'installerSha256', 'artifacts.installer_observed');
       addObservedArtifactCheck(normalized, input ?? {}, checks, 'appSha256', 'artifacts.application_observed');
       addObservedArtifactCheck(normalized, input ?? {}, checks, 'databaseProjectionSha256', 'artifacts.database_projection_observed');
+      addInstallerSigningChecks(normalized, input ?? {}, checks);
       addProviderCheck(input ?? {}, checks, 'liveProviderAccountIds', 'providers.live_separation', 'live provider');
       check(checks, 'credentials.resolution', booleanTrue(input?.credentialResolutionVerified), booleanTrue(input?.credentialResolutionVerified) ? 'credential handles resolved without plaintext output' : 'credential handle resolution must be verified');
       check(checks, 'host.disk_space', typeof input?.diskFreeGb === 'number' && Number.isFinite(input.diskFreeGb) && input.diskFreeGb >= 5, typeof input?.diskFreeGb === 'number' && input.diskFreeGb >= 5 ? 'at least 5 GB free disk space is verified' : 'at least 5 GB free disk space is required');
@@ -366,6 +429,7 @@ export function evaluateTrialReadiness(
       addObservedArtifactCheck(normalized, input ?? {}, checks, 'installerSha256', 'artifacts.installer_observed');
       addObservedArtifactCheck(normalized, input ?? {}, checks, 'appSha256', 'artifacts.application_observed');
       addObservedArtifactCheck(normalized, input ?? {}, checks, 'databaseProjectionSha256', 'artifacts.database_projection_observed');
+      addInstallerSigningChecks(normalized, input ?? {}, checks);
       check(checks, 'evidence.bundle', normalized.evidence.length > 0, normalized.evidence.length > 0 ? 'evidence entries are present' : 'at least one verified evidence entry is required');
       addRetentionDesignationCheck(normalized, input ?? {}, checks);
       break;

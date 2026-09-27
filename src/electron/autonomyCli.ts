@@ -7,7 +7,7 @@ import { AntigravityAdapter, CodexManagerAdapter } from '../core/autonomy/provid
 import { AutonomySupervisor } from '../core/autonomy/supervisor';
 import { runDisposableSelfHostProof } from '../core/autonomy/selfHost';
 import { ProcessRunner } from '../core/services/ProcessRunner';
-import { SelfHostTaskSchema } from '../core/autonomy/contracts';
+import { SelfHostTaskSchema, sanitizeAutonomyText } from '../core/autonomy/contracts';
 import { assertPathContained } from '../core/services/ArtifactStore';
 import crypto from 'crypto';
 import { GithubCiObserver } from '../core/autonomy/github';
@@ -44,7 +44,7 @@ function run(command: string, args: string[], cwd = controlRepo, timeout = 30_00
 }
 
 function redact(text: string): string {
-  return text.replace(/(?:gh[pousr]_[A-Za-z0-9_\-]{20,})/g, '[REDACTED_SECRET]').replace(/Bearer\s+\S+/gi, 'Bearer [REDACTED_SECRET]');
+  return sanitizeAutonomyText(text);
 }
 
 let failedChecks = 0;

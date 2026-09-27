@@ -66,6 +66,7 @@ function sourceInput(overrides: Partial<TrialReadinessInput> = {}): TrialReadine
     approvedSource: { commitSha: 'a'.repeat(40), treeSha: 'b'.repeat(40) },
     observedSource: { commitSha: 'a'.repeat(40), treeSha: 'b'.repeat(40), cleanWorktree: true },
     ciPassed: true,
+    observedCiRunId: 'ci-readiness',
     designatedOperatorIds: ['operator-readiness'],
     designatedApproverIds: ['approver-readiness'],
     ...overrides,
@@ -110,6 +111,10 @@ describe('trial readiness preflight', () => {
       executiveAuthorized: true,
       databaseBackupSha256: '2'.repeat(64),
       observedArtifacts: { installerSha256: 'c'.repeat(64), appSha256: 'd'.repeat(64), databaseProjectionSha256: 'e'.repeat(64) },
+      installerCodeSigned: true,
+      installerSignatureSha256: '6'.repeat(64),
+      installerSignerThumbprint: '7'.repeat(40),
+      installerSignedArtifactSha256: 'c'.repeat(64),
       liveProviderAccountIds: ['live-one'],
       credentialResolutionVerified: true,
       diskFreeGb: 8,
@@ -126,6 +131,10 @@ describe('trial readiness preflight', () => {
       executiveAuthorized: true,
       databaseBackupSha256: '2'.repeat(64),
       observedArtifacts: { installerSha256: 'c'.repeat(64), appSha256: 'd'.repeat(64), databaseProjectionSha256: 'e'.repeat(64) },
+      installerCodeSigned: true,
+      installerSignatureSha256: '6'.repeat(64),
+      installerSignerThumbprint: '7'.repeat(40),
+      installerSignedArtifactSha256: 'c'.repeat(64),
       liveProviderAccountIds: ['live-coder', 'live-reviewer'],
       credentialResolutionVerified: true,
       diskFreeGb: 8,
@@ -142,6 +151,10 @@ describe('trial readiness preflight', () => {
       executiveAuthorized: true,
       databaseBackupSha256: '2'.repeat(64),
       observedArtifacts: { installerSha256: 'c'.repeat(64), appSha256: '0'.repeat(64), databaseProjectionSha256: 'e'.repeat(64) },
+      installerCodeSigned: true,
+      installerSignatureSha256: '6'.repeat(64),
+      installerSignerThumbprint: '7'.repeat(40),
+      installerSignedArtifactSha256: 'c'.repeat(64),
       liveProviderAccountIds: ['live-coder', 'live-reviewer'],
       credentialResolutionVerified: true,
       diskFreeGb: 8,
@@ -170,6 +183,10 @@ describe('trial readiness preflight', () => {
       executiveAuthorized: true,
       databaseBackupSha256: '2'.repeat(64),
       observedArtifacts: { installerSha256: 'c'.repeat(64), appSha256: 'd'.repeat(64), databaseProjectionSha256: 'e'.repeat(64) },
+      installerCodeSigned: true,
+      installerSignatureSha256: '6'.repeat(64),
+      installerSignerThumbprint: '7'.repeat(40),
+      installerSignedArtifactSha256: 'c'.repeat(64),
       liveProviderAccountIds: ['live-coder', 'live-reviewer'],
       credentialResolutionVerified: true,
       diskFreeGb: 8,
@@ -215,6 +232,10 @@ describe('trial readiness preflight', () => {
       retentionLocationDesignated: true,
       retentionDesignation: retentionDesignation(manifest),
       observedArtifacts: { installerSha256: 'c'.repeat(64), appSha256: 'd'.repeat(64), databaseProjectionSha256: 'e'.repeat(64) },
+      installerCodeSigned: true,
+      installerSignatureSha256: '6'.repeat(64),
+      installerSignerThumbprint: '7'.repeat(40),
+      installerSignedArtifactSha256: 'c'.repeat(64),
       previousPhaseOutcomes: { R5L0: 'PASS', R5L1: 'PASS', R5L2: 'PASS', R5L3: 'HOLD' },
     }));
     expect(result.status).toBe('HOLD');
@@ -225,9 +246,53 @@ describe('trial readiness preflight', () => {
       retentionLocationDesignated: true,
       retentionDesignation: retentionDesignation(manifest),
       observedArtifacts: { installerSha256: 'c'.repeat(64), appSha256: 'd'.repeat(64), databaseProjectionSha256: 'e'.repeat(64) },
+      installerCodeSigned: true,
+      installerSignatureSha256: '6'.repeat(64),
+      installerSignerThumbprint: '7'.repeat(40),
+      installerSignedArtifactSha256: 'c'.repeat(64),
       previousPhaseOutcomes: { R5L0: 'PASS', R5L1: 'PASS', R5L2: 'PASS', R5L3: 'PASS' },
     }));
     expect(complete.status).toBe('READY');
+  });
+
+  it('holds R5L2 when signing attestation is absent or bound to another installer', () => {
+    const manifest = baseManifest('R5L2');
+    const input = sourceInput({
+      executiveAuthorized: true,
+      databaseBackupSha256: '2'.repeat(64),
+      observedArtifacts: { installerSha256: 'c'.repeat(64), appSha256: 'd'.repeat(64), databaseProjectionSha256: 'e'.repeat(64) },
+      liveProviderAccountIds: ['live-coder', 'live-reviewer'],
+      credentialResolutionVerified: true,
+      diskFreeGb: 8,
+      redactionActive: true,
+      networkStable: true,
+      quotaSufficient: true,
+      retentionLocationDesignated: true,
+      retentionDesignation: retentionDesignation(manifest),
+      previousPhaseOutcomes: { R5L0: 'PASS', R5L1: 'PASS' },
+    });
+    const missing = evaluateTrialReadiness(manifest, input);
+    expect(missing.status).toBe('HOLD');
+    expect(missing.blockingReasons.some((reason) => reason.startsWith('release.installer_code_signed:'))).toBe(true);
+    const mismatched = evaluateTrialReadiness(manifest, {
+      ...input,
+      installerCodeSigned: true,
+      installerSignatureSha256: '6'.repeat(64),
+      installerSignerThumbprint: '7'.repeat(40),
+      installerSignedArtifactSha256: '0'.repeat(64),
+    });
+    expect(mismatched.status).toBe('HOLD');
+    expect(mismatched.blockingReasons.some((reason) => reason.startsWith('release.installer_signature_artifact_binding:'))).toBe(true);
+  });
+
+  it('requires observed CI provenance to match the manifest run ID', () => {
+    const manifest = baseManifest('R5L1');
+    const missing = evaluateTrialReadiness(manifest, sourceInput({ managerAuthorized: true }));
+    expect(missing.status).toBe('HOLD');
+    expect(missing.blockingReasons.some((reason) => reason.startsWith('ci.observed_run_binding:'))).toBe(false);
+    const mismatched = evaluateTrialReadiness(manifest, sourceInput({ managerAuthorized: true, observedCiRunId: 'different-ci-run' }));
+    expect(mismatched.status).toBe('HOLD');
+    expect(mismatched.blockingReasons.some((reason) => reason.startsWith('ci.observed_run_binding:'))).toBe(true);
   });
 
   it('revalidates a manifest instead of trusting a structurally similar object', () => {

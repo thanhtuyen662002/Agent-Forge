@@ -10,6 +10,7 @@ import {
   WorkerResultSchema,
   createWorkOrder,
   parseManagerReview,
+  sanitizeAutonomyText,
 } from '../src/core/autonomy/contracts';
 import { AntigravityAdapter, CodexManagerAdapter } from '../src/core/autonomy/providers';
 import { AutonomyStore } from '../src/core/autonomy/store';
@@ -52,6 +53,24 @@ describe('autonomy durable contracts', () => {
     expect(parseManagerReview(raw).verdict).toBe('PASS');
     expect(() => parseManagerReview('PASS: looks good')).toThrow(/CONTRACT_INVALID/);
     expect(ManagerReviewSchema.safeParse({ verdict: 'PASS' }).success).toBe(false);
+  });
+
+  it('redacts cloud, JWT, key-value, URL, and private-key secrets consistently', () => {
+    const raw = [
+      'AKIAABCDEFGHIJKLMNOP',
+      'github_pat_abcdefghijklmnopqrstuvwxyz1234567890',
+      'Bearer opaque-provider-token',
+      'api_key=abcdefghijklmnop',
+      'password: "abcdefghijklmnop"',
+      'https://user:abcdefghijklmnop@example.invalid/path',
+      'eyJabcdefghijk.abcdefghijkl.abcdefghijkl',
+      '-----BEGIN PRIVATE KEY-----\\nsecret\\n-----END PRIVATE KEY-----',
+    ].join(' | ');
+    const redacted = sanitizeAutonomyText(raw);
+    expect(redacted).not.toContain('AKIAABCDEFGHIJKLMNOP');
+    expect(redacted).not.toContain('opaque-provider-token');
+    expect(redacted).not.toContain('abcdefghijklmnop');
+    expect(redacted).toContain('[REDACTED_SECRET]');
   });
 
   it('classifies fake Antigravity process outcomes and sanitizes logs', async () => {

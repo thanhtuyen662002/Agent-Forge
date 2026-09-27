@@ -53,6 +53,18 @@ describe('trial evidence retention designation', () => {
     }
   });
 
+  it('rejects a tampered result before creating a retention file', () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'agent-forge-retention-tampered-'));
+    try {
+      const result = buildTrialRetentionDesignation(baseDesignation());
+      const tampered = { ...result, canonicalJson: '{}', sha256: '0'.repeat(64) };
+      expect(() => writeTrialRetentionDesignation(root, 'trial-evidence/retention.json', tampered)).toThrow(/canonical JSON or SHA-256/);
+      expect(fs.existsSync(path.join(root, 'trial-evidence'))).toBe(false);
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+
   it('binds a designation to the exact trial manifest digest and location', () => {
     const manifest = buildTrialEvidenceManifest({
       trialId: baseDesignation().trialId,

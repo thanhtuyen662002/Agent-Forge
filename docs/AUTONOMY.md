@@ -329,7 +329,8 @@ The collector is local only and never uploads or discovers credentials.
 
 `trial-readiness` is a read-only, fail-closed preflight gate. It independently
 compares the manifest source commit/tree with approved and observed source
-identity, requires a clean worktree and passing CI, binds designated operator
+identity, requires a clean worktree and a passing CI run ID bound to the
+manifest, binds designated operator
 and approver identities, and applies the phase-specific R5L0--R5L4 checklist
 (backups, package hashes, fixture/live account separation, authorizations,
 failure-injection coverage, and retention designation). Missing or malformed
@@ -337,7 +338,11 @@ inputs return `HOLD` with machine-readable blocking checks; the command never
 resolves credentials, contacts providers, changes SQLite, or grants phase
 authorization. A `READY` result means only that the supplied local evidence
 passed this preflight contract; manager/executive approvals and live trial
-execution remain external controls.
+execution remain external controls. R5L2 and R5L4 additionally require a
+fresh Authenticode attestation: signed status, signature digest, signer
+certificate thumbprint, and an exact binding to the manifest installer digest.
+The attestation is still operator-supplied evidence and does not create a
+certificate, approval, or production credential.
 
 `TrialRunRegistry` supplies the local identity/run-tracking contract for
 GAP-05 without changing the product migration ledger. The autonomy extension

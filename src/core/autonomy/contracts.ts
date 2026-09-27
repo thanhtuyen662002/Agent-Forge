@@ -203,8 +203,16 @@ export function parseManagerReview(raw: string): ManagerReview {
 
 export function sanitizeAutonomyText(text: string, maxBytes = 2 * 1024 * 1024): string {
   const sanitized = String(text ?? '')
+    // Provider/GitHub tokens, cloud access keys, JWTs, and private keys can
+    // appear in provider errors or process output.  Keep this list central so
+    // every durable evidence sink and CLI diagnostic has the same boundary.
     .replace(/(?:gh[pousr]_[A-Za-z0-9_\-]{20,})/g, '[REDACTED_SECRET]')
-    .replace(/Bearer\s+[A-Za-z0-9._\-]+/gi, 'Bearer [REDACTED_SECRET]')
+    .replace(/(?:github_pat_[A-Za-z0-9_\-]{20,})/g, '[REDACTED_SECRET]')
+    .replace(/\b(?:AKIA|ASIA)[0-9A-Z]{16}\b/g, '[REDACTED_SECRET]')
+    .replace(/\beyJ[A-Za-z0-9_\-]{10,}\.[A-Za-z0-9_\-]{10,}\.[A-Za-z0-9_\-]{10,}\b/g, '[REDACTED_SECRET]')
+    .replace(/Bearer\s+\S+/gi, 'Bearer [REDACTED_SECRET]')
+    .replace(/\b[a-z][a-z0-9+.-]*:\/\/[^\s/@:]+:[^\s/@]+@/gi, '[REDACTED_SECRET]')
+    .replace(/(?:["']?(?:api[_-]?key|access[_-]?token|refresh[_-]?token|client[_-]?secret|oauth[_-]?token|password|secret|token)["']?\s*[:=]\s*["']?)[^\s"',;}]{8,}["']?/gi, '[REDACTED_SECRET]')
     .replace(/-----BEGIN [^-]+-----[\s\S]*?-----END [^-]+-----/g, '[REDACTED_SECRET]');
   return Buffer.byteLength(sanitized, 'utf8') <= maxBytes
     ? sanitized

@@ -80,6 +80,10 @@ describe('production trial evidence manifest', () => {
     const raw = JSON.stringify({ ...baseManifest(), notes: 'api_key=super-secret-value', schemaVersion: 1, createdAt: new Date().toISOString() });
     const built = buildTrialEvidenceManifest(baseManifest());
     expect(() => parseAndVerifyTrialEvidenceManifest(raw, built.sha256)).toThrow(/TRIAL_EVIDENCE_INVALID/);
+    expect(() => buildTrialEvidenceManifest({
+      ...baseManifest(),
+      approvals: { operatorIds: ['AKIAABCDEFGHIJKLMNOP'], approverIds: ['approver-1'] },
+    })).toThrow(/secret-like/);
   });
 
   it('rejects traversal and malformed hashes', () => {
@@ -98,6 +102,18 @@ describe('production trial evidence manifest', () => {
       expect(writeTrialEvidenceManifest(root, 'r5l1/manifest.json', result).sha256).toBe(result.sha256);
       const changed = buildTrialEvidenceManifest({ ...baseManifest(), outcome: 'HOLD' as const, createdAt: result.manifest.createdAt });
       expect(() => writeTrialEvidenceManifest(root, 'r5l1/manifest.json', changed)).toThrow(/different digest/);
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it('rejects a tampered result before creating an evidence file', () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'agent-forge-trial-evidence-tampered-'));
+    try {
+      const result = buildTrialEvidenceManifest(baseManifest());
+      const tampered = { ...result, canonicalJson: '{}', sha256: '0'.repeat(64) };
+      expect(() => writeTrialEvidenceManifest(root, 'r5l1/manifest.json', tampered)).toThrow(/canonical JSON or SHA-256/);
+      expect(fs.existsSync(path.join(root, 'r5l1'))).toBe(false);
     } finally {
       fs.rmSync(root, { recursive: true, force: true });
     }

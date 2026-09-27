@@ -36,8 +36,10 @@ const SHA256 = /^[0-9a-f]{64}$/;
 const SAFE_ID = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/;
 const SECRET_PATTERNS: RegExp[] = [
   /(?:gh[pousr]_[A-Za-z0-9_-]{20,})/g,
+  /(?:github_pat_[A-Za-z0-9_-]{20,})/g,
   /\b(?:AKIA|ASIA)[0-9A-Z]{16}\b/g,
   /\bBearer\s+[A-Za-z0-9._\-+/=]{16,}/gi,
+  /-----BEGIN [^-]+-----[\s\S]*?-----END [^-]+-----/g,
 ];
 
 function fail(message: string): never {
@@ -192,6 +194,22 @@ export function writeTrialRetentionDesignation(
   relativePath: string,
   result: TrialRetentionDesignationResult,
 ): { filePath: string; sha256: string } {
+  // Validate and recompute before any directory or file mutation. Retention
+  // receipts are durable authority and must never trust caller-supplied hash
+  // fields independently of their canonical designation.
+  let canonicalJson: string;
+  let sha256: string;
+  try {
+    canonicalJson = canonicalizeTrialRetentionDesignation((result as unknown as { designation: TrialRetentionDesignation }).designation);
+    sha256 = digest(canonicalJson);
+  } catch (error) {
+    if (error instanceof Error && error.message.startsWith('TRIAL_RETENTION_INVALID:')) throw error;
+    fail('designation result is malformed');
+  }
+  const supplied = result as unknown as { canonicalJson?: unknown; sha256?: unknown };
+  if (supplied.canonicalJson !== canonicalJson || supplied.sha256 !== sha256) {
+    fail('designation result canonical JSON or SHA-256 does not match its designation');
+  }
   const safeRelativePath = normalizeRelativePath(relativePath, 'designation output path');
   const absoluteRoot = path.resolve(rootDir);
   fs.mkdirSync(absoluteRoot, { recursive: true });
@@ -201,14 +219,14 @@ export function writeTrialRetentionDesignation(
   if (fs.existsSync(filePath)) {
     if (fs.lstatSync(filePath).isSymbolicLink()) fail('designation output path is a symbolic link');
     const existing = parseAndVerifyTrialRetentionDesignation(fs.readFileSync(filePath, 'utf8'));
-    if (existing.sha256 !== result.sha256) fail('designation output already exists with a different digest');
-    return { filePath, sha256: result.sha256 };
+    if (existing.sha256 !== sha256) fail('designation output already exists with a different digest');
+    return { filePath, sha256 };
   }
   const tempPath = `${filePath}.tmp-${crypto.randomUUID()}`;
   assertPathContained(tempPath, absoluteRoot);
   const fd = fs.openSync(tempPath, 'wx');
   try {
-    fs.writeFileSync(fd, `${result.canonicalJson}\n`, 'utf8');
+    fs.writeFileSync(fd, `${canonicalJson}\n`, 'utf8');
     fs.fsyncSync(fd);
   } finally {
     fs.closeSync(fd);
@@ -219,6 +237,6 @@ export function writeTrialRetentionDesignation(
     try { if (fs.existsSync(tempPath)) fs.unlinkSync(tempPath); } catch { /* preserve original failure */ }
     throw new Error(`TRIAL_RETENTION_WRITE_FAILED: ${error instanceof Error ? error.message : 'atomic rename failed'}`);
   }
-  const written = parseAndVerifyTrialRetentionDesignation(fs.readFileSync(filePath, 'utf8'), result.sha256);
+  const written = parseAndVerifyTrialRetentionDesignation(fs.readFileSync(filePath, 'utf8'), sha256);
   return { filePath, sha256: written.sha256 };
 }
