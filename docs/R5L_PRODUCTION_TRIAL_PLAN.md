@@ -544,8 +544,11 @@ The current source now provides the first local implementation slice for the
 previously proposed recovery/evidence work: startup process-run reconciliation
 keeps unresolved rows fenced; ordered provider-health observations replay
 idempotently; canonical trial manifests bind source/package/projection hashes;
-and a deterministic FI-01..FI-15 checkpoint harness is available for fixtures.
-These are implementation contracts, not live-trial evidence. R5L1--R5L4
+the deterministic FI-01..FI-15 checkpoint harness is available for fixtures;
+the redacted-log collector is bounded and verifiable; exact Draft-PR claims
+are reconciled before persistence; and the phase-specific `trial-readiness`
+preflight is fail-closed. These are implementation contracts, not live-trial
+evidence. R5L1--R5L4
 remain HOLD until the operator manifests, approvals, provider accounts,
 failure-injection artifacts, and exact release hashes described below exist for
 an approved source tree.

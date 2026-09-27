@@ -1,7 +1,7 @@
 import fs from 'fs';
 import os from 'os';
 import path from 'path';
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import {
   buildTrialEvidenceManifest,
   type ProductionTrialEvidenceManifest,
@@ -191,6 +191,7 @@ describe('trial readiness preflight', () => {
   it('runs the manifest, verification, and readiness CLI commands without mutating external state', async () => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), 'agent-forge-readiness-cli-'));
     const previousRuntimeRoot = process.env.AGENT_FORGE_RUNTIME_ROOT;
+    const stdoutWrite = vi.spyOn(process.stdout, 'write').mockImplementation(() => true);
     try {
       process.env.AGENT_FORGE_RUNTIME_ROOT = root;
       const inputPath = path.join(root, 'manifest-input.json');
@@ -201,6 +202,7 @@ describe('trial readiness preflight', () => {
         buildPassed: true,
         reviewerBuilt: true,
         databaseBackupSha256: '2'.repeat(64),
+        observedArtifacts: { databaseProjectionSha256: 'e'.repeat(64) },
         syntheticProviderAccountIds: ['synthetic-coder', 'synthetic-reviewer'],
         separationPolicy: 'REQUIRE_DIFFERENT',
         fixtureRepository: 'fixture-repository',
@@ -215,6 +217,7 @@ describe('trial readiness preflight', () => {
     } finally {
       if (previousRuntimeRoot === undefined) delete process.env.AGENT_FORGE_RUNTIME_ROOT;
       else process.env.AGENT_FORGE_RUNTIME_ROOT = previousRuntimeRoot;
+      stdoutWrite.mockRestore();
       fs.rmSync(root, { recursive: true, force: true });
     }
   });

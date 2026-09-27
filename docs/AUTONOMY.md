@@ -160,9 +160,13 @@ worktrees. Interrupted attempts, ambiguous worktrees, and orphans are retained;
 no recovery path deletes, unlocks, repairs, or reuses them. Clean `CI_WAIT` and
 `PR_OPEN` rows release their implementation slot only after the worktree matches
 the durable identity. Dangling slots and mismatches remain fenced for an explicit
-operator decision. External GitHub PR metadata and remote-claim reconciliation
-remain a separate bounded follow-up because they require authoritative remote
-observation.
+operator decision. External GitHub PR claims now pass through a pure,
+fail-closed evaluator before `autonomy_claims` is created or updated. It binds
+the repository/PR identity, Draft status, branch, exact head SHA, and existing
+claim owner; malformed or conflicting observations block the CI watch without
+overwriting the prior claim. The evaluator still requires an authenticated
+remote observation supplied by the GitHub CLI, so absence of that observation
+remains a live-operations hold.
 
 Reviews survive restart. No remote branch or PR is inferred from local PASS.
 CI_WAIT releases the Antigravity slot. The GitHub observer now binds a Draft PR
@@ -254,11 +258,11 @@ bounded observation between durable task dispatches; it does not busy-poll.
 
 ## Next work through the self-host supervisor
 
-Complete authoritative external PR-claim reconciliation, provider-failover edge
-proofs, and supervised self-update while preserving the product
-task/authorization/lease authorities already used by the consolidated path.
-Local process and managed-worktree reconciliation is implemented above; the
-remaining PR claim step requires an authenticated remote observation. Multi-worker
+Run the authenticated remote observation and collect provider-failover edge
+proofs while preserving the product task/authorization/lease authorities
+already used by the consolidated path. Local process, managed-worktree, and
+PR-claim reconciliation contracts are implemented above; the remaining remote
+claim step requires the GitHub CLI to return authoritative metadata. Multi-worker
 scheduling is graduated to an explicitly configured two-worker maximum
 (`MAX_AGY_WORKERS=1` or `2`), denying a third active worker. Automatic
 merge/integration remains disabled; repository protections and the exact observed

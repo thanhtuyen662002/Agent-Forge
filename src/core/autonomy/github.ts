@@ -13,6 +13,7 @@ import { CodexManagerAdapter, ProviderRun } from './providers';
 import { ProcessRunner } from '../services/ProcessRunner';
 import { Repository } from '../database/repositories';
 import { ManagerProviderPool, buildManagerContextPackage } from './managerPool';
+import { reconcileGithubPullRequestClaim } from './externalClaimReconciliation';
 
 export type {
   CiIdentityType,
@@ -710,13 +711,37 @@ export class GithubCiObserver {
     const prResult = await this.command('gh', ['pr', 'view', String(watch.pr_number), '--repo', watch.repository, '--json', 'number,isDraft,headRefName,headRefOid,statusCheckRollup'], this.controlRepo);
     if (prResult.status !== 0) throw new Error(`GITHUB_PR_OBSERVE_FAILED: ${sanitizeAutonomyText(prResult.stderr || prResult.stdout)}`);
     const pr = parseJson<GithubPullRequest>(prResult.stdout);
-    if (!pr.isDraft || pr.headRefName !== watch.branch) {
+    const externalId = `${watch.repository}#${watch.pr_number}`;
+    const claimCheck = reconcileGithubPullRequestClaim(
+      watch,
+      pr,
+      this.store.getExternalClaim('github-pr', externalId),
+    );
+    if (!claimCheck.valid) {
       this.store.updateCiWatch(watch.id, { state: 'BLOCKED', last_observed_at: new Date().toISOString() });
-      this.store.event(watch.work_order_id ?? watch.task_id, 'CI_CLAIM_REJECTED', { reason: 'DRAFT_OR_BRANCH_MISMATCH', pr });
-      return { watch, conclusion: 'FAILURE', headSha: pr.headRefOid };
+      this.store.event(watch.work_order_id ?? watch.task_id, 'CI_CLAIM_REJECTED', {
+        reason: claimCheck.classification,
+        details: claimCheck.reason,
+        externalId: claimCheck.externalId,
+        expectedHeadSha: claimCheck.expectedHeadSha,
+        observedHeadSha: claimCheck.observedHeadSha,
+      });
+      return { watch, conclusion: 'FAILURE', ...(claimCheck.observedHeadSha ? { headSha: claimCheck.observedHeadSha } : {}) };
     }
-    const headSha = pr.headRefOid.toLowerCase();
-    try { this.store.reconcileExternalClaim('github-pr', `${watch.repository}#${watch.pr_number}`, watch.work_order_id ?? watch.task_id, headSha, 'OBSERVED'); }
+    // Persist only after the pure evaluator has accepted every ownership and
+    // exact-head invariant.  A rejected remote observation therefore cannot
+    // overwrite a prior claim with a mismatched head or owner.
+    const headSha = claimCheck.observedHeadSha!;
+    try {
+      this.store.reconcileExternalClaim(
+        'github-pr',
+        externalId,
+        watch.work_order_id ?? watch.task_id,
+        headSha,
+        'OBSERVED',
+        this.store.getExternalClaim('github-pr', externalId),
+      );
+    }
     catch (error) {
       this.store.updateCiWatch(watch.id, { state: 'BLOCKED', last_observed_at: new Date().toISOString() });
       this.store.event(watch.work_order_id ?? watch.task_id, 'CI_CLAIM_REJECTED', { reason: String(error), headSha });

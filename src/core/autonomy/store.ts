@@ -38,6 +38,17 @@ export interface AutonomySlot {
   leaseEpoch: number;
 }
 
+/** Durable external ownership claim observed by the Supervisor. */
+export interface AutonomyExternalClaim {
+  claim_key: string;
+  source: string;
+  external_id: string;
+  work_order_id: string | null;
+  head_sha: string | null;
+  state: string;
+  observed_at: string;
+}
+
 /**
  * Durable identity that a repair context must match before it can be reused.
  *
@@ -247,6 +258,23 @@ export class AutonomyStore {
 
   getDatabase(): Database.Database { return this.db; }
 
+  /**
+   * Read one external claim without changing its observation timestamp or
+   * state.  Remote observations must pass their source-specific reconciliation
+   * contract before callers invoke reconcileExternalClaim().
+   */
+  getExternalClaim(source: string, externalId: string): AutonomyExternalClaim | null {
+    return (this.db.prepare('SELECT claim_key,source,external_id,work_order_id,head_sha,state,observed_at FROM autonomy_claims WHERE source=? AND external_id=?').get(source, externalId) as AutonomyExternalClaim | undefined) ?? null;
+  }
+
+  /** Return durable external claims in deterministic key order for recovery/audit. */
+  listExternalClaims(source?: string): AutonomyExternalClaim[] {
+    if (source !== undefined) {
+      return this.db.prepare('SELECT claim_key,source,external_id,work_order_id,head_sha,state,observed_at FROM autonomy_claims WHERE source=? ORDER BY source,external_id,claim_key').all(source) as AutonomyExternalClaim[];
+    }
+    return this.db.prepare('SELECT claim_key,source,external_id,work_order_id,head_sha,state,observed_at FROM autonomy_claims ORDER BY source,external_id,claim_key').all() as AutonomyExternalClaim[];
+  }
+
   ensureSchema(): void {
     this.db.transaction(() => this.db.exec(AUTONOMY_SCHEMA_SQL))();
   }
@@ -385,9 +413,28 @@ export class AutonomyStore {
     }
   }
 
-  reconcileExternalClaim(source: string, externalId: string, workOrderId: string, headSha: string, state: string): 'CREATED' | 'MATCHED' {
+  reconcileExternalClaim(
+    source: string,
+    externalId: string,
+    workOrderId: string,
+    headSha: string,
+    state: string,
+    expectedExistingClaim?: Pick<AutonomyExternalClaim, 'work_order_id' | 'head_sha'> | null,
+  ): 'CREATED' | 'MATCHED' {
     return this.db.transaction(() => {
       const existing = this.db.prepare('SELECT work_order_id,head_sha FROM autonomy_claims WHERE source=? AND external_id=?').get(source, externalId) as { work_order_id: string; head_sha: string } | undefined;
+      if (expectedExistingClaim !== undefined) {
+        const expectedPresent = expectedExistingClaim !== null;
+        const actualPresent = existing !== undefined;
+        const sameHead = (left: string | null | undefined, right: string | null | undefined): boolean =>
+          (left ?? null)?.toLowerCase() === (right ?? null)?.toLowerCase();
+        if (expectedPresent !== actualPresent || (expectedPresent && existing && (
+          existing.work_order_id !== expectedExistingClaim.work_order_id
+          || !sameHead(existing.head_sha, expectedExistingClaim.head_sha)
+        ))) {
+          throw new Error('EXTERNAL_CLAIM_CHANGED');
+        }
+      }
       if (existing) {
         if (existing.work_order_id !== workOrderId) throw new Error('DUPLICATE_GITHUB_CLAIM');
         this.db.prepare('UPDATE autonomy_claims SET head_sha=?,state=?,observed_at=? WHERE source=? AND external_id=?').run(headSha, state, new Date().toISOString(), source, externalId);
@@ -396,7 +443,7 @@ export class AutonomyStore {
       this.db.prepare('INSERT INTO autonomy_claims (claim_key,source,external_id,work_order_id,head_sha,state,observed_at) VALUES (?,?,?,?,?,?,?)')
         .run(`${source}:${externalId}`, source, externalId, workOrderId, headSha, state, new Date().toISOString());
       return 'CREATED';
-    })();
+    }).immediate();
   }
 
   registerCiWatch(input: { taskId: string; workOrderId?: string | null; repository: string; prNumber: number; branch: string; expectedHeadSha: string }): AutonomyCiWatch {
