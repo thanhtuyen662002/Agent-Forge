@@ -38,6 +38,10 @@
     "autonomy:trial-manifest": "node dist-electron/electron/autonomyCli.js trial-manifest",
     "autonomy:verify-trial-manifest": "node dist-electron/electron/autonomyCli.js verify-trial-manifest",
     "autonomy:trial-readiness": "node dist-electron/electron/autonomyCli.js trial-readiness",
+    "autonomy:trial-run-register": "node dist-electron/electron/autonomyCli.js trial-run-register",
+    "autonomy:trial-run-start": "node dist-electron/electron/autonomyCli.js trial-run-start",
+    "autonomy:trial-run-complete": "node dist-electron/electron/autonomyCli.js trial-run-complete",
+    "autonomy:trial-run-list": "node dist-electron/electron/autonomyCli.js trial-run-list",
     "autonomy:trial-log-collect": "node dist-electron/electron/autonomyCli.js trial-log-collect",
     "autonomy:trial-log-verify": "node dist-electron/electron/autonomyCli.js trial-log-verify"
   },

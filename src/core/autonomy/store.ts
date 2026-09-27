@@ -228,6 +228,35 @@ export const AUTONOMY_SCHEMA_SQL = `
   CREATE TABLE IF NOT EXISTS autonomy_manager_contexts (
     context_sha TEXT PRIMARY KEY, context_json TEXT NOT NULL, created_at TEXT NOT NULL
   );
+  CREATE TABLE IF NOT EXISTS autonomy_trial_runs (
+    trial_id TEXT NOT NULL,
+    run_id TEXT NOT NULL,
+    phase TEXT NOT NULL CHECK(phase IN ('R5L0','R5L1','R5L2','R5L3','R5L4')),
+    state TEXT NOT NULL CHECK(state IN ('REGISTERED','RUNNING','PASS','HOLD','FAIL')),
+    manifest_sha256 TEXT NOT NULL,
+    source_commit_sha TEXT NOT NULL,
+    source_tree_sha TEXT NOT NULL,
+    database_projection_sha256 TEXT,
+    created_at TEXT NOT NULL,
+    started_at TEXT,
+    finished_at TEXT,
+    updated_at TEXT NOT NULL,
+    PRIMARY KEY(trial_id, run_id)
+  );
+  CREATE INDEX IF NOT EXISTS idx_autonomy_trial_runs_trial ON autonomy_trial_runs(trial_id, created_at);
+  CREATE TABLE IF NOT EXISTS autonomy_trial_run_events (
+    id TEXT PRIMARY KEY,
+    trial_id TEXT NOT NULL,
+    run_id TEXT NOT NULL,
+    sequence INTEGER NOT NULL,
+    event_type TEXT NOT NULL CHECK(event_type IN ('TRIAL_RUN_REGISTERED','TRIAL_RUN_STARTED','TRIAL_RUN_COMPLETED')),
+    state TEXT NOT NULL CHECK(state IN ('REGISTERED','RUNNING','PASS','HOLD','FAIL')),
+    payload_json TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    UNIQUE(trial_id, run_id, sequence)
+  );
+  CREATE INDEX IF NOT EXISTS idx_autonomy_trial_run_events_run
+    ON autonomy_trial_run_events(trial_id, run_id, sequence);
   CREATE TABLE IF NOT EXISTS autonomy_owner (id INTEGER PRIMARY KEY CHECK(id=1), pid INTEGER NOT NULL, token TEXT NOT NULL, stop_requested INTEGER NOT NULL DEFAULT 0);
   CREATE TABLE IF NOT EXISTS autonomy_compatibility_inventory (
     table_name TEXT PRIMARY KEY,
@@ -823,6 +852,22 @@ export class AutonomyStore {
         isAuthoritative: false,
         notes: 'Manager context snapshots retained',
       },
+      {
+        tableName: 'autonomy_trial_runs',
+        totalRows: countTable('autonomy_trial_runs'),
+        activeRows: countTable('autonomy_trial_runs', "state IN ('REGISTERED','RUNNING','HOLD')"),
+        retainedStatus: 'RETAINED_TRIAL_RUNS',
+        isAuthoritative: false,
+        notes: 'Manifest-bound local trial identities and fail-closed lifecycle state retained for evidence',
+      },
+      {
+        tableName: 'autonomy_trial_run_events',
+        totalRows: countTable('autonomy_trial_run_events'),
+        activeRows: countTable('autonomy_trial_run_events'),
+        retainedStatus: 'RETAINED_TRIAL_RUN_EVENTS',
+        isAuthoritative: false,
+        notes: 'Ordered trial run transition audit events retained',
+      },
     ];
 
     try {
@@ -868,7 +913,9 @@ export type LegacyRetainedStatus =
   | 'RETAINED_AUDIT_LOGS'
   | 'RETAINED_MANAGER_RESOURCES'
   | 'RETAINED_MANAGER_ATTEMPTS'
-  | 'RETAINED_MANAGER_CONTEXTS';
+  | 'RETAINED_MANAGER_CONTEXTS'
+  | 'RETAINED_TRIAL_RUNS'
+  | 'RETAINED_TRIAL_RUN_EVENTS';
 
 export interface LegacyTableInventory {
   tableName: string;

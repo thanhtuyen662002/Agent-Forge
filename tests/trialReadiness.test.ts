@@ -4,8 +4,10 @@ import path from 'path';
 import { describe, expect, it, vi } from 'vitest';
 import {
   buildTrialEvidenceManifest,
+  computeTrialEvidenceManifestSha256,
   type ProductionTrialEvidenceManifest,
 } from '../src/core/autonomy/trialEvidence';
+import { buildTrialRetentionDesignation } from '../src/core/autonomy/trialRetention';
 import {
   evaluateTrialReadiness,
   type TrialReadinessInput,
@@ -45,6 +47,18 @@ function baseManifest(phase: ProductionTrialEvidenceManifest['phase'] = 'R5L1'):
     notes: null,
   } satisfies TrialManifestInput);
   return result.manifest;
+}
+
+function retentionDesignation(manifest: ProductionTrialEvidenceManifest) {
+  return buildTrialRetentionDesignation({
+    trialId: manifest.trialId,
+    phase: manifest.phase,
+    manifestSha256: computeTrialEvidenceManifestSha256(manifest),
+    location: manifest.retention.location,
+    retentionClass: manifest.retention.retentionClass,
+    designatedBy: ['security-lead'],
+    designatedAt: '2026-09-27T00:00:00.000Z',
+  }).designation;
 }
 
 function sourceInput(overrides: Partial<TrialReadinessInput> = {}): TrialReadinessInput {
@@ -119,6 +133,7 @@ describe('trial readiness preflight', () => {
       networkStable: true,
       quotaSufficient: true,
       retentionLocationDesignated: true,
+      retentionDesignation: retentionDesignation(manifest),
       previousPhaseOutcomes: { R5L0: 'PASS', R5L1: 'PASS' },
     }));
     expect(complete.status).toBe('READY');
@@ -138,6 +153,36 @@ describe('trial readiness preflight', () => {
     }));
     expect(mismatchedArtifact.status).toBe('HOLD');
     expect(mismatchedArtifact.blockingReasons.some((reason) => reason.startsWith('artifacts.application_observed:'))).toBe(true);
+  });
+
+  it('requires a durable retention designation bound to the exact manifest', () => {
+    const manifest = baseManifest('R5L2');
+    const designation = buildTrialRetentionDesignation({
+      trialId: manifest.trialId,
+      phase: manifest.phase,
+      manifestSha256: computeTrialEvidenceManifestSha256(manifest),
+      location: manifest.retention.location,
+      retentionClass: manifest.retention.retentionClass,
+      designatedBy: ['security-lead'],
+      designatedAt: '2026-09-27T00:00:00.000Z',
+    }).designation;
+    const completeInput: TrialReadinessInput = sourceInput({
+      executiveAuthorized: true,
+      databaseBackupSha256: '2'.repeat(64),
+      observedArtifacts: { installerSha256: 'c'.repeat(64), appSha256: 'd'.repeat(64), databaseProjectionSha256: 'e'.repeat(64) },
+      liveProviderAccountIds: ['live-coder', 'live-reviewer'],
+      credentialResolutionVerified: true,
+      diskFreeGb: 8,
+      redactionActive: true,
+      networkStable: true,
+      quotaSufficient: true,
+      retentionLocationDesignated: true,
+      retentionDesignation: designation,
+      previousPhaseOutcomes: { R5L0: 'PASS', R5L1: 'PASS' },
+    });
+    expect(evaluateTrialReadiness(manifest, completeInput).status).toBe('READY');
+    expect(evaluateTrialReadiness(manifest, { ...completeInput, retentionDesignation: undefined }).blockingReasons.some((reason) => reason.startsWith('retention.designated:'))).toBe(true);
+    expect(evaluateTrialReadiness(manifest, { ...completeInput, retentionDesignation: { ...designation, location: 'other' } }).blockingReasons.some((reason) => reason.startsWith('retention.designated:'))).toBe(true);
   });
 
   it('requires FI-01 through FI-15 evidence or explicit waivers for R5L3', () => {
@@ -168,6 +213,7 @@ describe('trial readiness preflight', () => {
     const result = evaluateTrialReadiness(manifest, sourceInput({
       releaseApproved: true,
       retentionLocationDesignated: true,
+      retentionDesignation: retentionDesignation(manifest),
       observedArtifacts: { installerSha256: 'c'.repeat(64), appSha256: 'd'.repeat(64), databaseProjectionSha256: 'e'.repeat(64) },
       previousPhaseOutcomes: { R5L0: 'PASS', R5L1: 'PASS', R5L2: 'PASS', R5L3: 'HOLD' },
     }));
@@ -177,6 +223,7 @@ describe('trial readiness preflight', () => {
     const complete = evaluateTrialReadiness(manifest, sourceInput({
       releaseApproved: true,
       retentionLocationDesignated: true,
+      retentionDesignation: retentionDesignation(manifest),
       observedArtifacts: { installerSha256: 'c'.repeat(64), appSha256: 'd'.repeat(64), databaseProjectionSha256: 'e'.repeat(64) },
       previousPhaseOutcomes: { R5L0: 'PASS', R5L1: 'PASS', R5L2: 'PASS', R5L3: 'PASS' },
     }));

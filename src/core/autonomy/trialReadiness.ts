@@ -8,6 +8,7 @@ import {
   type ProductionTrialOutcome,
   type ProductionTrialPhase,
 } from './trialEvidence';
+import { isTrialRetentionDesignationBound } from './trialRetention';
 
 /**
  * Inputs observed by an operator or a fixture runner before a trial phase is
@@ -51,6 +52,7 @@ export interface TrialReadinessInput {
   failureInjectionWaivers?: unknown;
   previousPhaseOutcomes?: unknown;
   retentionLocationDesignated?: unknown;
+  retentionDesignation?: unknown;
 }
 
 export type TrialReadinessCheckStatus = 'PASS' | 'HOLD';
@@ -278,6 +280,23 @@ function addFailureInjectionCoverageCheck(input: TrialReadinessInput, checks: Tr
   );
 }
 
+function addRetentionDesignationCheck(
+  manifest: ProductionTrialEvidenceManifest,
+  input: TrialReadinessInput,
+  checks: TrialReadinessCheck[],
+): void {
+  const independentlyDesignated = booleanTrue(input.retentionLocationDesignated);
+  const exactBinding = isTrialRetentionDesignationBound(manifest, input.retentionDesignation);
+  check(
+    checks,
+    'retention.designated',
+    independentlyDesignated && exactBinding,
+    independentlyDesignated && exactBinding
+      ? 'secure evidence retention location designation is durable and bound to the exact manifest'
+      : 'a durable retention designation bound to the exact manifest is required',
+  );
+}
+
 /**
  * Evaluate a phase without performing any external operation.  The result is
  * READY only when every check passes.  Missing, malformed, or contradictory
@@ -332,7 +351,7 @@ export function evaluateTrialReadiness(
       check(checks, 'logging.redaction', booleanTrue(input?.redactionActive), booleanTrue(input?.redactionActive) ? 'redaction is active' : 'redaction must be verified before live execution');
       check(checks, 'network.stable', booleanTrue(input?.networkStable), booleanTrue(input?.networkStable) ? 'network stability is verified' : 'network stability must be verified');
       check(checks, 'provider.quota', booleanTrue(input?.quotaSufficient), booleanTrue(input?.quotaSufficient) ? 'provider quota is sufficient' : 'provider quota must be verified');
-      check(checks, 'retention.designated', booleanTrue(input?.retentionLocationDesignated), booleanTrue(input?.retentionLocationDesignated) ? 'secure evidence retention location is designated' : 'secure evidence retention location must be designated');
+      addRetentionDesignationCheck(normalized, input ?? {}, checks);
       break;
     case 'R5L3':
       check(checks, 'authorization.injection', booleanTrue(input?.injectionAuthorized), booleanTrue(input?.injectionAuthorized) ? 'failure-injection authorization recorded' : 'failure-injection authorization is required for R5L3');
@@ -348,7 +367,7 @@ export function evaluateTrialReadiness(
       addObservedArtifactCheck(normalized, input ?? {}, checks, 'appSha256', 'artifacts.application_observed');
       addObservedArtifactCheck(normalized, input ?? {}, checks, 'databaseProjectionSha256', 'artifacts.database_projection_observed');
       check(checks, 'evidence.bundle', normalized.evidence.length > 0, normalized.evidence.length > 0 ? 'evidence entries are present' : 'at least one verified evidence entry is required');
-      check(checks, 'retention.designated', booleanTrue(input?.retentionLocationDesignated), booleanTrue(input?.retentionLocationDesignated) ? 'secure evidence retention location is designated' : 'secure evidence retention location must be designated');
+      addRetentionDesignationCheck(normalized, input ?? {}, checks);
       break;
     default:
       // The manifest normalizer already rejects unsupported phases.  Keep a

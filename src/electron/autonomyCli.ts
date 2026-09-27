@@ -27,6 +27,8 @@ import {
   evaluateTrialReadiness,
 } from '../core/autonomy/trialReadiness';
 import type { TrialReadinessInput } from '../core/autonomy/trialReadiness';
+import { TrialRunRegistry } from '../core/autonomy/trialRegistry';
+import type { ProductionTrialOutcome } from '../core/autonomy/trialEvidence';
 
 const controlRepo = process.env.AGENT_FORGE_CONTROL_REPO ?? process.cwd();
 const worktreeRoot = process.env.AGENT_FORGE_WORKTREE_ROOT ?? path.resolve(controlRepo, '..', 'AI', 'Agent-Forge-Worktrees');
@@ -166,6 +168,55 @@ export async function main(argv: string[] = process.argv): Promise<number> {
     const result = evaluateTrialReadiness(parsedManifest.manifest, input);
     process.stdout.write(`${JSON.stringify(result)}\n`);
     return result.status === 'READY' ? 0 : 1;
+  }
+  if (command === 'trial-run-register') {
+    const manifestPath = path.resolve(argv[3] ?? '');
+    assertPathContained(manifestPath, effectiveRuntimeRoot);
+    const parsedManifest = parseAndVerifyTrialEvidenceManifest(fs.readFileSync(manifestPath, 'utf8'));
+    const opened = AutonomyStore.open(effectiveRuntimeRoot);
+    try {
+      const registry = new TrialRunRegistry(opened.store.getDatabase());
+      const record = registry.register(parsedManifest.manifest, parsedManifest.sha256, argv[4]);
+      process.stdout.write(`${JSON.stringify(record)}\n`);
+      return 0;
+    } finally {
+      opened.engine.close();
+    }
+  }
+  if (command === 'trial-run-start') {
+    const trialId = argv[3] ?? '';
+    const runId = argv[4] ?? '';
+    const opened = AutonomyStore.open(effectiveRuntimeRoot);
+    try {
+      const record = new TrialRunRegistry(opened.store.getDatabase()).start(trialId, runId);
+      process.stdout.write(`${JSON.stringify(record)}\n`);
+      return 0;
+    } finally {
+      opened.engine.close();
+    }
+  }
+  if (command === 'trial-run-complete') {
+    const trialId = argv[3] ?? '';
+    const runId = argv[4] ?? '';
+    const outcome = argv[5] as ProductionTrialOutcome;
+    const opened = AutonomyStore.open(effectiveRuntimeRoot);
+    try {
+      const record = new TrialRunRegistry(opened.store.getDatabase()).complete(trialId, runId, outcome);
+      process.stdout.write(`${JSON.stringify(record)}\n`);
+      return 0;
+    } finally {
+      opened.engine.close();
+    }
+  }
+  if (command === 'trial-run-list') {
+    const opened = AutonomyStore.open(effectiveRuntimeRoot);
+    try {
+      const registry = new TrialRunRegistry(opened.store.getDatabase());
+      process.stdout.write(`${JSON.stringify(registry.list(argv[3]))}\n`);
+      return 0;
+    } finally {
+      opened.engine.close();
+    }
   }
   if (command === 'trial-log-collect') {
     const inputPath = path.resolve(argv[3] ?? '');

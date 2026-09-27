@@ -295,9 +295,21 @@ manifest SHA-256. The CLI exposes:
 npm run autonomy:trial-manifest -- <runtime-input.json> [relative-output.json]
 npm run autonomy:verify-trial-manifest -- <manifest.json> [expected-sha256]
 npm run autonomy:trial-readiness -- <manifest.json> <readiness-input.json>
+npm run autonomy:trial-run-register -- <manifest.json> [run-id]
+npm run autonomy:trial-run-start -- <trial-id> <run-id>
+npm run autonomy:trial-run-complete -- <trial-id> <run-id> <PASS|HOLD|FAIL>
+npm run autonomy:trial-run-list -- [trial-id]
 ```
 
-Both commands require files beneath `AGENT_FORGE_RUNTIME_ROOT`; traversal,
+`src/core/autonomy/trialRetention.ts` adds a canonical retention-designation
+receipt. It binds the trial and phase to the exact manifest SHA, retention
+location, retention class, and designated security identity; writes are atomic
+and contained beneath `AGENT_FORGE_RUNTIME_ROOT`. R5L2 and R5L4 readiness
+requires this receipt together with the independent designation flag. The
+security lead must still choose and approve the durable production storage
+location before a live trial.
+
+All CLI commands that read or write runtime evidence require files beneath `AGENT_FORGE_RUNTIME_ROOT`; traversal,
 symlinks, malformed hashes, duplicate evidence IDs, and secret-like values are
 rejected. `src/core/autonomy/failureInjection.ts` provides deterministic
 FI-01..FI-15 checkpoints for safe rehearsal fixtures. The harness is
@@ -323,6 +335,17 @@ resolves credentials, contacts providers, changes SQLite, or grants phase
 authorization. A `READY` result means only that the supplied local evidence
 passed this preflight contract; manager/executive approvals and live trial
 execution remain external controls.
+
+`TrialRunRegistry` supplies the local identity/run-tracking contract for
+GAP-05 without changing the product migration ledger. The autonomy extension
+schema stores an immutable `(trialId, runId)` binding to the canonical manifest
+SHA, source commit/tree, phase, and database projection hash, plus an ordered
+audit event stream. Registration is idempotent for the same identity and
+rejects any attempt to rebind it. Lifecycle transitions are monotonic
+`REGISTERED -> RUNNING -> PASS|HOLD|FAIL`; unknown runs and contradictory
+transitions remain fail-closed. These local records do not authorize a trial,
+resolve credentials, or prove that a live SQLite backup matches the manifest;
+operators must still capture and verify those external artifacts.
 
 The all-target fast-pr.yml supplements main-target CI. Windows/Ubuntu checks,
 Windows packaging, installed-app verification, and RC verification remain.
