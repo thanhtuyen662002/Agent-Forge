@@ -85,6 +85,12 @@ Before reclaiming:
 4. create a replacement claim from current `main` if needed;
 5. never discard useful work without preserving it in GitHub.
 
+## Watchdog health report
+
+`.github/workflows/watchdog-health.yml` runs hourly and on manual dispatch. It collects a bounded, read-only GitHub snapshot and writes a Markdown summary plus a short-lived artifact for the next web agent. `scripts/watchdog-health-report.cjs` reports stale Draft PR lease candidates, exact-head check state, `AF_TASK_V1` READY counts, duplicate Issue claims, CI stalls, and obvious changed-file path conflicts.
+
+The workflow grants read permissions only. It does not run application tests, builds, or packaging, and it never closes, edits, labels, merges, or creates GitHub objects. Check records are bound to the current PR head SHA; a cancelled record superseded by a newer exact-head record is recorded as superseded and is excluded from current failures.
+
 ## Priority and selection
 
 Priority order is `P0 > P1 > P2 > P3`.
