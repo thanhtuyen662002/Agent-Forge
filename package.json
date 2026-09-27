@@ -43,7 +43,10 @@
     "autonomy:trial-run-complete": "node dist-electron/electron/autonomyCli.js trial-run-complete",
     "autonomy:trial-run-list": "node dist-electron/electron/autonomyCli.js trial-run-list",
     "autonomy:trial-log-collect": "node dist-electron/electron/autonomyCli.js trial-log-collect",
-    "autonomy:trial-log-verify": "node dist-electron/electron/autonomyCli.js trial-log-verify"
+    "autonomy:trial-log-verify": "node dist-electron/electron/autonomyCli.js trial-log-verify",
+    "autonomy:register-review-wait": "node dist-electron/electron/autonomyCli.js register-review-wait",
+    "autonomy:review-waits": "node dist-electron/electron/autonomyCli.js review-waits",
+    "autonomy:observe-review-capacity": "node dist-electron/electron/autonomyCli.js observe-review-capacity"
   },
   "dependencies": {
     "@modelcontextprotocol/server": "2.0.0",

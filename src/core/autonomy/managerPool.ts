@@ -132,6 +132,15 @@ export interface ManagerPoolResult {
   attempts: string[];
 }
 
+export interface ManagerReviewOptions {
+  /**
+   * Used only by the durable capacity watcher after its own backoff expires.
+   * It may re-probe capacity/rate/offline states, but never AUTH_ERROR or
+   * CONTRACT_INVALID resources.
+   */
+  probeUnavailable?: boolean;
+}
+
 function ensureProductEndpointResource(store: AutonomyStore, endpoint: ProviderEndpointConfig): void {
   const repo = new Repository(store.getDatabase());
   const providerId = 'provider-external-router';
@@ -364,6 +373,18 @@ export class ManagerProviderPool {
     return { configured: true, eligible: true };
   }
 
+  private canProbeUnavailableResource(resourceId: string): boolean {
+    const product = this.store.getDatabase().prepare(
+      'SELECT enabled,health_status FROM provider_resources WHERE id=?'
+    ).get(resourceId) as { enabled: number; health_status: string } | undefined;
+    if (product) {
+      if (!product.enabled) return false;
+      return !['AUTH_ERROR','UNHEALTHY','DISABLED','BUSY'].includes(product.health_status);
+    }
+    const legacy = this.store.getManagerResourceHealth(resourceId);
+    return !legacy || !['AUTH_ERROR','CONTRACT_INVALID'].includes(legacy.state);
+  }
+
   private recordResourceHealth(
     resourceId: string,
     classifiedState: ManagerResourceState,
@@ -398,7 +419,7 @@ export class ManagerProviderPool {
     return true;
   }
 
-  async review(context: ManagerContextPackage): Promise<ManagerPoolResult> {
+  async review(context: ManagerContextPackage, options: ManagerReviewOptions = {}): Promise<ManagerPoolResult> {
     const validatedContext = ManagerContextPackageSchema.parse(context);
     const evidence = JSON.stringify(validatedContext);
     const contextSha = crypto.createHash('sha256').update(evidence).digest('hex');
@@ -409,8 +430,12 @@ export class ManagerProviderPool {
     for (const resource of candidates) {
       const health = this.store.getManagerResourceHealth(resource.id);
       const productHealth = this.checkProductResourceHealth(resource.id);
-      if (!productHealth.configured && !isEligible(health?.state, health?.cooldown_until)) continue;
-      if (!productHealth.eligible) continue;
+      if (options.probeUnavailable) {
+        if (!this.canProbeUnavailableResource(resource.id)) continue;
+      } else {
+        if (!productHealth.configured && !isEligible(health?.state, health?.cooldown_until)) continue;
+        if (!productHealth.eligible) continue;
+      }
 
       attempts.push(resource.id);
       this.store.recordManagerAttempt(validatedContext.work_order.task_id, resource.id, contextSha, 'STARTED');
@@ -504,12 +529,16 @@ export class ManagerProviderPool {
     };
   }
 
-  async reviewStored(contextSha: string, currentHead: string): Promise<ManagerPoolResult> {
+  async reviewStored(
+    contextSha: string,
+    currentHead: string,
+    options: ManagerReviewOptions = {},
+  ): Promise<ManagerPoolResult> {
     const evidence = this.store.getManagerContext(contextSha);
     if (!evidence) throw new Error('MANAGER_CONTEXT_NOT_FOUND');
     const context = ManagerContextPackageSchema.parse(JSON.parse(evidence));
     if (context.current_head !== currentHead) throw new Error('STALE_MANAGER_CONTEXT_HEAD');
-    return this.review(context);
+    return this.review(context, options);
   }
 
   async plan(seed: ManagerPlanSeed): Promise<ManagerPlanResult> {

@@ -896,9 +896,14 @@ export interface SupervisorQueueCiObserver {
   publishAcceptedRepair?: (taskId: string, worktree: string, branch: string) => Promise<string | null>;
 }
 
+export interface SupervisorQueueReviewCapacityObserver {
+  observeDue: () => Promise<any[]>;
+}
+
 export interface SupervisorQueueOptions {
   supervisor: AutonomySupervisor;
   ci?: SupervisorQueueCiObserver;
+  reviewCapacity?: SupervisorQueueReviewCapacityObserver;
   controlRepo?: string;
   worktreeRoot?: string;
   pollIntervalMs?: number;
@@ -913,6 +918,7 @@ export class SupervisorContinuousQueue {
   readonly controlRepo: string;
   readonly worktreeRoot: string;
   readonly ci?: SupervisorQueueCiObserver;
+  readonly reviewCapacity?: SupervisorQueueReviewCapacityObserver;
   private readonly options: SupervisorQueueOptions;
   private readonly activeTasks = new Map<string, Promise<void>>();
   private readonly activeWorkers = new Map<string, string>();
@@ -925,6 +931,7 @@ export class SupervisorContinuousQueue {
     this.controlRepo = path.resolve(options.controlRepo ?? options.supervisor.controlRepo);
     this.worktreeRoot = path.resolve(options.worktreeRoot ?? options.supervisor.worktreeRoot);
     this.ci = options.ci;
+    this.reviewCapacity = options.reviewCapacity;
   }
 
   getActiveTaskCount(): number {
@@ -951,7 +958,7 @@ export class SupervisorContinuousQueue {
     return null;
   }
 
-  async step(): Promise<{ dispatched: string | null; workerId: string | null; observations: any[] }> {
+  async step(): Promise<{ dispatched: string | null; workerId: string | null; observations: any[]; reviewObservations: any[] }> {
     let dispatched: string | null = null;
     let assignedWorker: string | null = null;
 
@@ -1011,7 +1018,22 @@ export class SupervisorContinuousQueue {
       }
     }
 
-    return { dispatched, workerId: assignedWorker, observations };
+    let reviewObservations: any[] = [];
+    if (this.reviewCapacity) {
+      try {
+        reviewObservations = await this.reviewCapacity.observeDue();
+        for (const obs of reviewObservations) {
+          this.options.onEvent?.(
+            obs.status === 'WAITING_CAPACITY' ? 'REVIEW_CAPACITY_DEFERRED' : 'REVIEW_CAPACITY_RESULT',
+            obs,
+          );
+        }
+      } catch (error) {
+        this.options.onEvent?.('REVIEW_CAPACITY_RETRY_DEFERRED', { error: String(error) });
+      }
+    }
+
+    return { dispatched, workerId: assignedWorker, observations, reviewObservations };
   }
 
   async waitForAllActive(): Promise<void> {

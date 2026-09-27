@@ -1,5 +1,8 @@
 # Local self-host bootstrap
 
+> This document describes the **Agent Forge product's local self-host/runtime bootstrap**. Repository engineering is now coordinated web-first through GitHub. For engineering queue/lease/merge policy, read [WEB_AUTONOMY.md](WEB_AUTONOMY.md), [ISSUE_EXECUTION_PROTOCOL.md](ISSUE_EXECUTION_PROTOCOL.md), and the root [AGENTS.md](../AGENTS.md).
+
+
 The bootstrap is a bounded PILOT inside Agent Forge, in `src/core/autonomy`.
 It runs one or two explicitly configured file-editing workers and a manager/reviewer
 provider pool. Product-task authorization, routed OmniRoute coder execution,

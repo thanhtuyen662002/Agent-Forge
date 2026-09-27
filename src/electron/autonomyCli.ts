@@ -29,6 +29,7 @@ import {
 import type { TrialReadinessInput } from '../core/autonomy/trialReadiness';
 import { TrialRunRegistry } from '../core/autonomy/trialRegistry';
 import type { ProductionTrialOutcome } from '../core/autonomy/trialEvidence';
+import { ReviewCapacityWatcher } from '../core/autonomy/reviewCapacity';
 
 const controlRepo = process.env.AGENT_FORGE_CONTROL_REPO ?? process.cwd();
 const worktreeRoot = process.env.AGENT_FORGE_WORKTREE_ROOT ?? path.resolve(controlRepo, '..', 'AI', 'Agent-Forge-Worktrees');
@@ -241,7 +242,12 @@ export async function main(argv: string[] = process.argv): Promise<number> {
   const store = AutonomyStore.open(effectiveRuntimeRoot);
   const supervisor = new AutonomySupervisor({ store: store.store, mode: command === 'shadow' ? 'SHADOW' : 'PILOT', runtimeRoot: effectiveRuntimeRoot, controlRepo: effectiveControlRepo, worktreeRoot: effectiveWorktreeRoot, maxWorkers: rawMaxWorkers });
   const ci = new GithubCiObserver(store.store, effectiveControlRepo, supervisor.managerPool);
-  if (command === 'status') { process.stdout.write(`${JSON.stringify({ mode: supervisor.mode, maxWorkers: supervisor.maxWorkers, orders: supervisor.store.listAll(), activeSlots: supervisor.store.listActiveSlots(), runtimeRoot: effectiveRuntimeRoot, legacyInventory: supervisor.store.inventoryLegacyState() })}\n`); return 0; }
+  const reviewCapacity = new ReviewCapacityWatcher({
+    store: store.store,
+    managerPool: supervisor.managerPool,
+    evidence: supervisor.evidence,
+  });
+  if (command === 'status') { process.stdout.write(`${JSON.stringify({ mode: supervisor.mode, maxWorkers: supervisor.maxWorkers, orders: supervisor.store.listAll(), activeSlots: supervisor.store.listActiveSlots(), reviewCapacityWaits: supervisor.store.listReviewCapacityWaits(), runtimeRoot: effectiveRuntimeRoot, legacyInventory: supervisor.store.inventoryLegacyState() })}\n`); return 0; }
   if (command === 'inventory-legacy') { process.stdout.write(`${JSON.stringify(supervisor.store.inventoryLegacyState(), null, 2)}\n`); return 0; }
   if (command === 'stop') { store.store.requestStop(); process.stdout.write('Stop requested in durable state.\n'); return 0; }
   if (command === 'enqueue' || command === 'enqueue-authorized') {
@@ -260,6 +266,20 @@ export async function main(argv: string[] = process.argv): Promise<number> {
     const input = JSON.parse(fs.readFileSync(file, 'utf8')) as { task_id: string; work_order_id?: string | null; repository: string; pr_number: number; branch: string; expected_head_sha: string };
     const watch = ci.register({ taskId: input.task_id, workOrderId: input.work_order_id, repository: input.repository, prNumber: input.pr_number, branch: input.branch, expectedHeadSha: input.expected_head_sha });
     process.stdout.write(`${JSON.stringify(watch)}\n`); return 0;
+  }
+  if (command === 'register-review-wait') {
+    const contextSha = String(argv[3] ?? '').trim().toLowerCase();
+    const expectedHeadSha = String(argv[4] ?? '').trim().toLowerCase();
+    const nextAttemptAt = argv[5] ? String(argv[5]) : undefined;
+    const wait = reviewCapacity.register(contextSha, expectedHeadSha, nextAttemptAt);
+    process.stdout.write(`${JSON.stringify(wait)}\n`); return 0;
+  }
+  if (command === 'review-waits') {
+    process.stdout.write(`${JSON.stringify(store.store.listReviewCapacityWaits(), null, 2)}\n`); return 0;
+  }
+  if (command === 'observe-review-capacity') {
+    const observations = await reviewCapacity.observeDue();
+    process.stdout.write(`${JSON.stringify(observations)}\n`); return 0;
   }
   if (command === 'observe') {
     const observations = await ci.observeDue();
@@ -286,6 +306,7 @@ export async function main(argv: string[] = process.argv): Promise<number> {
       : undefined;
     const queue = supervisor.createContinuousQueue({
       ci,
+      reviewCapacity,
       controlRepo: effectiveControlRepo,
       worktreeRoot: effectiveWorktreeRoot,
       ...(pollIntervalMs !== undefined && !Number.isNaN(pollIntervalMs) ? { pollIntervalMs } : {}),
@@ -298,6 +319,12 @@ export async function main(argv: string[] = process.argv): Promise<number> {
           process.stdout.write(`${JSON.stringify({ ci: payload.watch.pr_number, conclusion: payload.conclusion, headSha: payload.headSha, repairTaskId: payload.repairTaskId })}\n`);
         } else if (type === 'CI_RETRY_DEFERRED') {
           process.stdout.write(`CI observer retry deferred: ${redact(payload.error)}\n`);
+        } else if (type === 'REVIEW_CAPACITY_DEFERRED') {
+          process.stdout.write(`${JSON.stringify({ reviewCapacity: payload.wait?.task_id, status: payload.status, nextAttemptAt: payload.wait?.next_attempt_at, error: redact(payload.error ?? "") })}\n`);
+        } else if (type === 'REVIEW_CAPACITY_RESULT') {
+          process.stdout.write(`${JSON.stringify({ reviewCapacity: payload.wait?.task_id, status: payload.status, verdict: payload.review?.verdict, reviewedHead: payload.review?.reviewed_head_sha, resource: payload.selectedResource })}\n`);
+        } else if (type === 'REVIEW_CAPACITY_RETRY_DEFERRED') {
+          process.stdout.write(`Review capacity watcher retry deferred: ${redact(payload.error)}\n`);
         }
       },
     });
