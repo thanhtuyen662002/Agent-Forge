@@ -30,7 +30,7 @@ import {
 } from './ExecutionAuthorizationService';
 import { sanitizeContextFiles, canonicalJsonStringify, verifyContextManifestIntegrity } from '../context/ContextIntegrity';
 import { ProviderHealthObservationService } from './ProviderHealthObservationService';
-import { AccountHealthService } from './AccountHealthService';
+import { applyProviderHealthObservation } from './ProviderHealthApplication';
 
 export type ScheduledCancellationStatus =
   | 'CANCEL_REQUESTED'
@@ -79,7 +79,7 @@ interface ScheduledDispatchControl {
 export class ProviderDispatchService {
   private activeDispatches = new Map<string, ScheduledDispatchControl>();
   private readonly observationService: ProviderHealthObservationService;
-  private readonly accountHealthService: AccountHealthService;
+  private readonly accountHealthService: { applyObservation: (authorizationId: string) => unknown };
 
   constructor(
     private providerRegistry: ProviderRegistry,
@@ -88,7 +88,11 @@ export class ProviderDispatchService {
     private gitWorktreeService?: GitWorktreeService
   ) {
     this.observationService = new ProviderHealthObservationService(this.repo);
-    this.accountHealthService = new AccountHealthService(this.repo);
+    // Keep this compatibility-shaped property for the focused failure test
+    // seam while routing the actual write through the single health facade.
+    this.accountHealthService = {
+      applyObservation: (authorizationId) => applyProviderHealthObservation(this.repo, authorizationId),
+    };
   }
 
   public setGitWorktreeService(service: GitWorktreeService): void {
@@ -1437,12 +1441,13 @@ export class ProviderDispatchService {
       if (ingestion.status === 'RECORDED' || ingestion.status === 'ALREADY_RECORDED') {
         try {
           this.accountHealthService.applyObservation(auth.id);
-        } catch (healthError) {
+        } catch {
           // Non-fatal to provider result: the durable observation remains
           // available for CrashRecoveryService replay.
+          // Keep provider/account error details out of logs; the durable row
+          // and replay report carry the auditable failure boundary.
           console.error(
-            `[ProviderDispatchService] Durable provider health application deferred for ${auth.id}:`,
-            healthError
+            `[ProviderDispatchService] Durable provider health application deferred for ${auth.id}: HEALTH_APPLICATION_DEFERRED`
           );
         }
       }

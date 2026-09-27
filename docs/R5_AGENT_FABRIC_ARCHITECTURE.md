@@ -284,9 +284,9 @@ The R5 milestone sequence is governed by the authoritative R5-v1.1 roadmap. All 
 - **Non-Precedence Signals**: External provider completion time, adapter completion/start time, execution authorization creation/claim time, dispatch entry, lease acquisition, and agent assignment creation are not health precedence authorities.
 - **Legacy Observations**: Pre-migration observations remain with `account_order = NULL` and are not retroactively backfilled or automatically applied.
 - **Boundaries & Open Areas**:
-  - This ordering authority contract establishes durable observation ordering only and does NOT authorize automatic health status mutation.
+  - This ordering authority contract establishes durable observation ordering. Application is performed separately through the single health writer and never by the observation row itself.
   - Manual / administrative / non-execution health precedence remains unresolved.
-  - Cooldown replay and absolute `cooldownUntil` timestamp authority remain unresolved.
+  - Modern rate-limit observations carry an authoritative ingestion-time anchor for deterministic replay; legacy rows without an anchor remain unresolved and are not auto-applied.
 
 ---
 
@@ -298,10 +298,10 @@ The R5 milestone sequence is governed by the authoritative R5-v1.1 roadmap. All 
 - **Configuration Containment**: Generic configuration updates via `Repository.updateProviderAccount` are restricted strictly to configuration fields (`label`, `auth_mode`, `credential_ref`, `profile_ref`, `enabled`, `priority`, `concurrency_limit`) and can never write or clobber health fields (`health_status`, `cooldown_until`, `last_success_at`, `last_failure_at`, `last_failure_code`).
 - **Control Plane Separation**: The administrative `enabled` field remains independent from health telemetry and status signals. Health mutations cannot modify `enabled`, and configuration updates cannot modify health signals.
 - **Initialization Boundary**: Account creation via `Repository.createProviderAccount` may set initial health state upon creation, but all subsequent existing-account health updates must flow exclusively through the single health authority.
-- **Manual Precedence & Future Application**:
+- **Manual Precedence & Application Boundary**:
   - No live manual health override exists in the shipped runtime.
   - Future manual/admin health features require a separate durable precedence contract.
-  - Future automatic observation application must extend this single write authority model with durable `account_order` CAS / idempotency.
+  - Automatic application uses this single write authority with durable `account_order` CAS / idempotency. Provider dispatch applies the newly recorded observation, and startup recovery replays unapplied observations in account order.
 
 ---
 
@@ -359,8 +359,8 @@ The R5 milestone sequence is governed by the authoritative R5-v1.1 roadmap. All 
 
 ### 5. Single-Writer & Application Boundaries
 - **Single Semantic Writer**: `AccountHealthService` remains the sole semantic authority for health state mutations.
-- **Historical Replay API Gap**: The current `AccountHealthService.recordRateLimited()` requires strictly future cooldowns; historical replay and atomic CAS application remain separate future gates.
-- **No Ingestion Mutations**: Ingestion of observations and cooldown anchors performs zero health state mutations.
+- **Historical Replay**: Modern anchored rate-limit observations, including already-expired cooldowns, are applied deterministically from the durable anchor. Legacy rate-limit observations without an anchor remain fail-closed until an explicit authority is supplied.
+- **Application Boundary**: Observation ingestion and health application remain separate durable steps; provider dispatch and startup recovery are the production orchestration points.
 
 ## 13. Ordered Provider Health Application & Idempotency Architecture (R5H4)
 
@@ -397,7 +397,7 @@ When evaluating a candidate observation against the account ledger:
 
 ### 6. Semantic Boundary & Production Wiring Scope
 - **Single Semantic Entrypoint**: `AccountHealthService.applyDurableObservation(authorizationId)` is the sole public facade.
-- **No Production Mutation Wiring**: Ingestion does not trigger synchronous application, and startup recovery does not execute health reconciliation in this contract phase. All production orchestration remains deferred to subsequent gates.
+- **Production Mutation Wiring**: Provider dispatch records the observation and invokes `AccountHealthService` through the health application facade. Startup crash recovery replays observations in account order and reports deferred/unknown authority without inventing state. Both paths are idempotent and preserve the durable ledger as the audit authority.
 
 ---
 

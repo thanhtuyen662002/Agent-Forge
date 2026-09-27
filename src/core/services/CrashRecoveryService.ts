@@ -6,7 +6,8 @@ import { ExecutionRecoveryScanner } from './ExecutionRecoveryScanner';
 import { ExecutionRecoveryScanReport } from '../types/domain';
 import { CoderSubmissionAdjudicationRecoveryScanner } from './CoderSubmissionAdjudicationRecoveryScanner';
 import { AdjudicationRecoveryScanReport } from '../types/adjudication';
-import { AccountHealthService, ProviderHealthObservationReplayReport } from './AccountHealthService';
+import { ProviderHealthObservationReplayReport } from './AccountHealthService';
+import { replayProviderHealthObservations } from './ProviderHealthApplication';
 import { ProcessRunRecoveryScanner, ProcessRunRecoveryScanReport } from './ProcessRunRecoveryScanner';
 
 export interface RecoveryReport {
@@ -54,8 +55,7 @@ export class CrashRecoveryService {
     // have reconciled their execution graph. Observation ingestion and account
     // mutation are separate transactions, so this closes the crash window
     // without inventing health state for unordered or unknown-authority rows.
-    const accountHealthService = new AccountHealthService(this.repo);
-    const providerHealthReplay = accountHealthService.replayProviderHealthObservations();
+    const providerHealthReplay = replayProviderHealthObservations(this.repo);
 
     // 4. Do not terminalize unfinished process runs here. RUNNING rows are
     // durable recovery fences; marking them CANCELLED would claim a process

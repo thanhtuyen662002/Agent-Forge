@@ -123,7 +123,7 @@ graph TD
 - **Exit Criteria**: Successful automated verification, independent reviewer evaluation, and durable settlement.
 - **Approval Required**: Project Lead and Executive Sponsor.
 
-### 4. Phase R5L3 — Failure Injection, Recovery, and Continuity Proof `[UNAUTHORIZED — HARNESS NOT IMPLEMENTED]`
+### 4. Phase R5L3 — Failure Injection, Recovery, and Continuity Proof `[UNAUTHORIZED — FIXTURE EVIDENCE REQUIRED]`
 - **Nature of Actions**:
   - *Automated Product Action*: Recovery scanner execution (`CoderSubmissionAdjudicationRecoveryScanner`, `CrashRecoveryService`); health observation ordering; cooldown backoff.
   - *Explicit Human / Operator Action*: Injecting supported fault scenarios via public service APIs; inspecting recovery audit events; resolving `NEEDS_HUMAN` fallback states.
@@ -559,7 +559,7 @@ The following operational and technical gaps are formally tracked. They represen
 | **GAP-03** | **Deterministic Failure-Injection Harness** | Phase R5L3 | A side-effect-free deterministic FI-01..FI-15 checkpoint harness now exists. Each scenario still requires an approved fixture, empirical evidence, or an explicit manager waiver; the harness alone does not close R5L3. | Test Lead | `IMPLEMENTED LOCALLY — FIXTURE EVIDENCE REQUIRED` |
 | **GAP-04** | **Phase-Specific Exact-Head & Installer Binding Mechanism** | Phase R5L1 & R5L2 | The trial manifest now records exact source commit/tree SHA, CI run, installer hash, application hash, and projection hash. The phase protocol and release approval must still be adopted for each actual trial. | Release Eng | `IMPLEMENTED LOCALLY — PROTOCOL APPROVAL REQUIRED` |
 | **GAP-05** | **Trial Identity & Run Tracking Model** | Phase R5L1 & R5L2 | SQLite contains tables for projects, tasks, submissions, and adjudications, but no `trials` table exists. Trial identity is tracked in the operator-produced JSON manifest bound to the SQLite database file hash. No schema migration is required. | Architect | `UNRESOLVED READINESS INPUT` |
-| **GAP-06** | **Redacted Log Collector** | Phase R5L2 | An automated tool to extract and sanitize application logs for inclusion in the trial evidence bundle is not yet implemented. | Security Lead | `PROPOSED — REQUIRES IMPLEMENTATION` |
+| **GAP-06** | **Redacted Log Collector** | Phase R5L2 | `autonomy:trial-log-collect` extracts explicitly selected runtime files, rejects traversal/symlink paths, applies bounded secret redaction, writes an atomic canonical collection, and `autonomy:trial-log-verify` verifies its hashes and schema. Live trial operators must still select the approved inputs and retain the resulting artifact. | Security Lead | `IMPLEMENTED LOCALLY — LIVE EVIDENCE REQUIRED` |
 | **GAP-07** | **Trial Evidence Retention Location** | Phase R5L2 | Secure, durable storage location for archiving trial evidence bundles must be formally designated. | Security Lead | `UNRESOLVED READINESS INPUT` |
 | **GAP-08** | **Live Provider Accounts & Credentials** | Phase R5L2 | Provisioning and configuration of at least two distinct, funded provider accounts on the trial host machine. Required for R5L2 live trial only; synthetic fixtures used for R5L1. | Trial Operator | `UNRESOLVED READINESS INPUT` |
 | **GAP-09** | **Designated Operator & Approval Identities** | Phase R5L1 & R5L2 | Named human operators and auditors must be assigned responsibility for trial monitoring, manual bridge steps, and sign-offs. | Management | `UNRESOLVED READINESS INPUT` |

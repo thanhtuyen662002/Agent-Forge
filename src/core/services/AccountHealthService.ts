@@ -52,6 +52,15 @@ export interface ProviderHealthObservationReplayReport {
 export class AccountHealthService {
   private readonly now: () => Date;
 
+  /**
+   * Keep construction behind the health service boundary.  Runtime callers
+   * use the provider-health application facade so production dispatch code
+   * cannot accidentally grow a second health writer or bypass this service.
+   */
+  public static create(repo: Repository, clock?: () => Date): AccountHealthService {
+    return new this(repo, clock);
+  }
+
   constructor(
     private readonly repo: Repository,
     clock?: () => Date

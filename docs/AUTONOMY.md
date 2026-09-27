@@ -5,8 +5,9 @@ It runs one or two explicitly configured file-editing workers and a manager/revi
 provider pool. Product-task authorization, routed OmniRoute coder execution,
 durable repair convergence, and supervised GitHub CI observation are implemented
 behind the same exact-head and lease fences. It does not merge or replace the
-running supervisor, and complete orphan/process reconciliation remains bounded
-follow-up work.
+running supervisor. Startup now performs read-only process-run and managed
+worktree reconciliation; ambiguous state is retained and fenced for an explicit
+operator decision.
 
 ## Implemented loop
 
@@ -109,6 +110,8 @@ npm.cmd run autonomy:stop
 npm.cmd run autonomy:recover
 npm.cmd run autonomy:observe
 npm.cmd run autonomy:register-ci <runtime-watch-json>
+npm.cmd run autonomy:trial-log-collect <runtime-log-input.json> [relative-output.json]
+npm.cmd run autonomy:trial-log-verify <relative-collection.json>
 ```
 
 Doctor exercises live provider contracts and disposable worktree creation/removal.
@@ -148,11 +151,18 @@ owned by the installed CLIs; credentials are never copied into Git.
 ## Recovery
 
 A live owner prevents a second supervisor. Any unsettled process record fences
-dispatch: a dead direct PID alone cannot prove descendants exited. Interrupted
-attempts with settled processes become BLOCKED and release capacity. Ambiguous
-attempts and orphaned worktrees are retained. Do not delete process/owner rows to
-bypass a fence. Inspect PIDs, registration, branch, HEAD, and diff before a new
-authorized attempt. Full automatic orphan/process reconciliation remains backlog.
+dispatch: a dead direct PID alone cannot prove descendants exited. The process
+recovery scanner records stable identity and classifies live, dead, missing, and
+unknown PID evidence without terminalizing a `RUNNING` row. The autonomy recovery
+scanner also inventories managed Git worktrees, checks path containment,
+registration, top-level, branch, exact HEAD, and dirty state, and reports orphaned
+worktrees. Interrupted attempts, ambiguous worktrees, and orphans are retained;
+no recovery path deletes, unlocks, repairs, or reuses them. Clean `CI_WAIT` and
+`PR_OPEN` rows release their implementation slot only after the worktree matches
+the durable identity. Dangling slots and mismatches remain fenced for an explicit
+operator decision. External GitHub PR metadata and remote-claim reconciliation
+remain a separate bounded follow-up because they require authoritative remote
+observation.
 
 Reviews survive restart. No remote branch or PR is inferred from local PASS.
 CI_WAIT releases the Antigravity slot. The GitHub observer now binds a Draft PR
@@ -244,14 +254,16 @@ bounded observation between durable task dispatches; it does not busy-poll.
 
 ## Next work through the self-host supervisor
 
-Complete orphan/process reconciliation, provider-failover edge proofs, and
-supervised self-update while preserving the product task/authorization/lease
-authorities already used by the consolidated path. Multi-worker scheduling is
-graduated to an explicitly configured two-worker maximum (`MAX_AGY_WORKERS=1`
-or `2`), denying a third active worker. Automatic merge/integration remains
-disabled; repository protections and the exact observed head stay the final
-authority. Keep the running version fixed and implement self-development in
-worktrees before reviewing and updating it.
+Complete authoritative external PR-claim reconciliation, provider-failover edge
+proofs, and supervised self-update while preserving the product
+task/authorization/lease authorities already used by the consolidated path.
+Local process and managed-worktree reconciliation is implemented above; the
+remaining PR claim step requires an authenticated remote observation. Multi-worker
+scheduling is graduated to an explicitly configured two-worker maximum
+(`MAX_AGY_WORKERS=1` or `2`), denying a third active worker. Automatic
+merge/integration remains disabled; repository protections and the exact observed
+head stay the final authority. Keep the running version fixed and implement
+self-development in worktrees before reviewing and updating it.
 
 ### Recovery, health replay, and trial evidence contracts
 
@@ -286,6 +298,14 @@ rejected. `src/core/autonomy/failureInjection.ts` provides deterministic
 FI-01..FI-15 checkpoints for safe rehearsal fixtures. The harness is
 side-effect-free by itself: a production trial must still connect each
 checkpoint to an approved fixture and retain evidence for every FI scenario.
+
+`trial-log-collect` reads explicitly selected text files or directories below
+the runtime root, rejects symlink/junction and traversal paths, applies the
+same bounded secret redaction before persistence, and writes a canonical,
+atomically created collection with per-file and bundle SHA-256 hashes. Input
+and output byte/file limits are enforced before and after redaction;
+`trial-log-verify` rechecks canonical ordering, hashes, redaction, and limits.
+The collector is local only and never uploads or discovers credentials.
 
 The all-target fast-pr.yml supplements main-target CI. Windows/Ubuntu checks,
 Windows packaging, installed-app verification, and RC verification remain.

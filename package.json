@@ -36,7 +36,9 @@
     "autonomy:observe": "node dist-electron/electron/autonomyCli.js observe",
     "autonomy:register-ci": "node dist-electron/electron/autonomyCli.js register-ci",
     "autonomy:trial-manifest": "node dist-electron/electron/autonomyCli.js trial-manifest",
-    "autonomy:verify-trial-manifest": "node dist-electron/electron/autonomyCli.js verify-trial-manifest"
+    "autonomy:verify-trial-manifest": "node dist-electron/electron/autonomyCli.js verify-trial-manifest",
+    "autonomy:trial-log-collect": "node dist-electron/electron/autonomyCli.js trial-log-collect",
+    "autonomy:trial-log-verify": "node dist-electron/electron/autonomyCli.js trial-log-verify"
   },
   "dependencies": {
     "@modelcontextprotocol/server": "2.0.0",

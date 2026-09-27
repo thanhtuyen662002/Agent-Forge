@@ -44,6 +44,13 @@ export interface RoleAwareRoutingRequest {
   preferredResourceId?: string | null;
   preferredMetadata?: Record<string, unknown> | null;
   persistAssignment?: boolean;
+  /**
+   * In automatic handoff discovery, prefer an account which has not already
+   * served a different task when all other policy scores tie.  This is a
+   * soft load-isolation preference; explicit candidate/required constraints
+   * and account priority remain authoritative.
+   */
+  preferUnusedAccounts?: boolean;
   excludedCandidateIds?: string[];
   excludedAccountIds?: string[];
   excludedProviderIds?: string[];
@@ -211,6 +218,16 @@ export class RoleAwareRoutingService {
     const excludedCandidateSet = new Set(excludedCandidateIds);
     const excludedAccountSet = new Set(excludedAccountIds);
     const excludedProviderSet = new Set(excludedProviderIds);
+
+    const accountsUsedByOtherTasks = request.preferUnusedAccounts
+      ? new Set(
+          this.repo
+            .getAllAgentAssignments()
+            .filter((assignment) => assignment.task_id !== request.taskId)
+            .map((assignment) => assignment.selected_account_id)
+            .filter((accountId): accountId is string => typeof accountId === 'string' && accountId.length > 0),
+        )
+      : null;
 
     // 1. Validate Scope: Project & Task
     const project = this.repo.getProject(request.projectId);
@@ -847,6 +864,15 @@ export class RoleAwareRoutingService {
         if (request.preferredResourceId && resource.id === request.preferredResourceId) {
           preferenceScore += 100;
           preferenceDetails.preferredResourceMatch = 100;
+        }
+
+        // Automatic successor routing should avoid reusing an account already
+        // associated with another task when policy scores otherwise tie.  It
+        // remains a soft preference so explicit priority, provider/resource
+        // preferences, and hard constraints retain their authority.
+        if (accountsUsedByOtherTasks && !accountsUsedByOtherTasks.has(account.id)) {
+          preferenceScore += 1;
+          preferenceDetails.preferUnusedAccount = 1;
         }
 
         // Soft Diversity Preferences from SeparationPolicy

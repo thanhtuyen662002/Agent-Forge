@@ -18,6 +18,11 @@ import {
   parseAndVerifyTrialEvidenceManifest,
   writeTrialEvidenceManifest,
 } from '../core/autonomy/trialEvidence';
+import {
+  collectRedactedTrialLogs,
+  verifyRedactedTrialLogCollectionFile,
+} from '../core/autonomy/trialLogCollector';
+import type { CollectRedactedTrialLogsOptions } from '../core/autonomy/trialLogCollector';
 
 const controlRepo = process.env.AGENT_FORGE_CONTROL_REPO ?? process.cwd();
 const worktreeRoot = process.env.AGENT_FORGE_WORKTREE_ROOT ?? path.resolve(controlRepo, '..', 'AI', 'Agent-Forge-Worktrees');
@@ -147,6 +152,26 @@ export async function main(argv: string[] = process.argv): Promise<number> {
     process.stdout.write(`${JSON.stringify({ filePath: manifestPath, trialId: result.manifest.trialId, phase: result.manifest.phase, outcome: result.manifest.outcome, sha256: result.sha256 })}\n`);
     return 0;
   }
+  if (command === 'trial-log-collect') {
+    const inputPath = path.resolve(argv[3] ?? '');
+    assertPathContained(inputPath, effectiveRuntimeRoot);
+    const parsed = JSON.parse(fs.readFileSync(inputPath, 'utf8')) as Partial<CollectRedactedTrialLogsOptions>;
+    const outputRelativePath = argv[4] ?? parsed.outputRelativePath ?? 'trial-evidence/redacted-logs.json';
+    const result = collectRedactedTrialLogs({
+      ...(parsed as CollectRedactedTrialLogsOptions),
+      rootDir: effectiveRuntimeRoot,
+      outputRelativePath,
+    });
+    process.stdout.write(`${JSON.stringify({ filePath: result.filePath, sha256: result.sha256, byteSize: result.byteSize, files: result.collection.files.length })}\n`);
+    return 0;
+  }
+  if (command === 'trial-log-verify') {
+    const collectionPath = path.resolve(argv[3] ?? '');
+    assertPathContained(collectionPath, effectiveRuntimeRoot);
+    const result = verifyRedactedTrialLogCollectionFile(collectionPath, effectiveRuntimeRoot);
+    process.stdout.write(`${JSON.stringify({ filePath: collectionPath, sha256: result.sha256, byteSize: result.byteSize, files: result.collection.files.length })}\n`);
+    return 0;
+  }
   const store = AutonomyStore.open(effectiveRuntimeRoot);
   const supervisor = new AutonomySupervisor({ store: store.store, mode: command === 'shadow' ? 'SHADOW' : 'PILOT', runtimeRoot: effectiveRuntimeRoot, controlRepo: effectiveControlRepo, worktreeRoot: effectiveWorktreeRoot, maxWorkers: rawMaxWorkers });
   const ci = new GithubCiObserver(store.store, effectiveControlRepo, supervisor.managerPool);
@@ -177,8 +202,8 @@ export async function main(argv: string[] = process.argv): Promise<number> {
   const owner = store.store.acquireOwner();
   const cancellation = setInterval(() => { if (store.store.shouldStop()) void ProcessRunner.terminateAllProcesses(); }, 1000);
   try {
-  supervisor.recover();
-  if (command === 'recover') { process.stdout.write('Recovery completed; retained worktrees and fenced attempts remain in durable state.\n'); return 0; }
+  const recovery = supervisor.recover();
+  if (command === 'recover') { process.stdout.write(`${JSON.stringify(recovery, null, 2)}\n`); return 0; }
   if (command === 'pilot') {
     const proof = await runDisposableSelfHostProof({ controlRepo: effectiveControlRepo, worktreeRoot: effectiveWorktreeRoot, supervisor });
     process.stdout.write(`${JSON.stringify({ mode: supervisor.mode, accepted: proof.result.accepted ?? false, state: proof.result.state, verdict: proof.result.review?.verdict, error: proof.result.error, worktree: proof.worktree, branch: proof.branch, baseSha: proof.baseSha })}\n`);

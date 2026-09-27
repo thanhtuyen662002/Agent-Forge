@@ -35,6 +35,7 @@ import {
   getEscalationStage,
   reconcileFindingClosure,
 } from './repairContext';
+import { AutonomyRecoveryReport, AutonomyRecoveryScanner } from './recovery';
 
 export type AutonomyMode = 'SHADOW' | 'PILOT' | 'AUTONOMOUS';
 
@@ -536,7 +537,21 @@ export class AutonomySupervisor {
     }
   }
 
-  recover(): { releasedSlots: number; fencedOrders: number } {
+  /**
+   * Return a read-only reconciliation report for durable autonomy rows and
+   * managed Git worktrees.  The report intentionally has no cleanup/reuse
+   * side effects; callers can inspect it before deciding whether to release a
+   * slot or fence an interrupted attempt.
+   */
+  inspectRecovery(): AutonomyRecoveryReport {
+    return new AutonomyRecoveryScanner(this.store, {
+      controlRepo: this.controlRepo,
+      worktreeRoot: this.worktreeRoot,
+    }).inspect();
+  }
+
+  recover(): { releasedSlots: number; fencedOrders: number; report: AutonomyRecoveryReport } {
+    const report = this.inspectRecovery();
     let releasedSlots = 0;
     let fencedOrders = 0;
     const uncertain = this.store.getDatabase().prepare("SELECT id,pid FROM process_runs WHERE status='RUNNING'").all() as Array<{id:string;pid:number|null}>;
@@ -545,16 +560,118 @@ export class AutonomySupervisor {
       // Retain all leases until process-tree termination is proven.
       throw new Error(`RECOVERY_PROCESS_FENCED: ${uncertain.length} unsettled process records; no dispatch permitted`);
     }
+
+    const inspections = new Map(
+      report.inspections
+        .filter((inspection) => inspection.workOrderId !== null)
+        .map((inspection) => [inspection.workOrderId as string, inspection]),
+    );
+    const activeSlotRows = this.store.listActiveSlots();
+    const activeSlotOrderIds = new Set(activeSlotRows.map((slot) => slot.workOrderId));
+    const activeOrders = this.store.listAll().filter((order) =>
+      !['MERGED', 'BLOCKED', 'FAILED'].includes(order.state) || activeSlotOrderIds.has(order.id),
+    );
+    const activeSlots = new Map(activeSlotRows.map((slot) => [slot.workOrderId, slot]));
+
+    // A worktree disagreement is a hard fence.  The scanner is read-only and
+    // recovery never tries to fix Git state.  It may release a slot only for a
+    // path which was never inside the managed root; retaining a slot for a
+    // managed mismatch prevents another attempt from reusing an ambiguous
+    // worktree before an operator has explicitly reconciled it.
+    for (const order of activeOrders) {
+      const inspection = inspections.get(order.id);
+      const mismatch = inspection?.fenced ?? false;
+      const interrupted = !['READY', 'REPAIR', 'CI_WAIT', 'PR_OPEN'].includes(order.state);
+      if (mismatch || (interrupted && activeSlots.has(order.id))) {
+        const transitioned = this.fenceRecoveryOrder(order.id, order.lease_epoch, {
+          reason: mismatch ? 'WORKTREE_RECONCILIATION_MISMATCH' : 'INTERRUPTED_ATTEMPT',
+          classification: inspection?.classification ?? 'GIT_INSPECTION_FAILED',
+          worktree: order.worktree,
+          expected_branch: inspection?.expectedBranch ?? order.branch,
+          observed_branch: inspection?.branch ?? null,
+          expected_head_sha: inspection?.expectedHeadSha ?? order.base_sha,
+          observed_head_sha: inspection?.headSha ?? null,
+          exists: inspection?.exists ?? false,
+          registered: inspection?.registered ?? false,
+          dirty: inspection?.dirty ?? null,
+        });
+        if (transitioned) fencedOrders += 1;
+      }
+    }
+
     for (const slot of this.store.listActiveSlots()) {
       const order = this.store.getWorkOrder(slot.workOrderId);
-      if (order && !['CI_WAIT', 'PR_OPEN', 'MERGED', 'BLOCKED', 'FAILED'].includes(order.state)) {
-        this.store.updateState(order.id, 'BLOCKED', order.lease_epoch);
-        this.store.event(order.id, 'RECOVERY_FENCED', { reason: 'Interrupted attempt retained; requires a new authorized attempt' });
-        fencedOrders += 1;
+      const inspection = inspections.get(slot.workOrderId);
+      if (!order) {
+        const inserted = this.recordRecoveryFenceEvent(slot.workOrderId, {
+          reason: 'SLOT_WORKORDER_MISSING',
+          classification: 'GIT_INSPECTION_FAILED',
+          slot_id: slot.slotId,
+          worker_id: slot.workerId,
+          recovery_fence_version: 1,
+        });
+        if (inserted) fencedOrders += 1;
+        // Without a durable WorkOrder there is no safe epoch with which to
+        // release this slot.  Retain it until an operator reconciles the
+        // orphaned slot explicitly.
+        continue;
       }
-      try { this.store.releaseSlot(slot.slotId, slot.workOrderId, slot.leaseEpoch); releasedSlots += 1; } catch { fencedOrders += 1; }
+      const managedMismatch = !!inspection?.fenced && inspection.pathContained;
+      // Keep a slot held when a managed worktree is ambiguous.  This prevents
+      // capacity reuse from racing an operator's reconciliation.  A malformed
+      // legacy path outside the configured root is already fenced and can
+      // release capacity safely because it was never a managed worktree.
+      if (managedMismatch) continue;
+      try {
+        this.store.releaseSlot(slot.slotId, slot.workOrderId, slot.leaseEpoch);
+        releasedSlots += 1;
+      } catch {
+        // An epoch/ownership mismatch is itself a fence.  Do not retry or
+        // force-release the slot; the next recovery report will retain it.
+        if (order) {
+          const transitioned = this.fenceRecoveryOrder(order.id, order.lease_epoch, {
+            reason: 'SLOT_RELEASE_MISMATCH',
+            classification: inspection?.classification ?? 'GIT_INSPECTION_FAILED',
+            worktree: order.worktree,
+          });
+          if (transitioned) fencedOrders += 1;
+        }
+      }
     }
-    return { releasedSlots, fencedOrders };
+    return { releasedSlots, fencedOrders, report };
+  }
+
+  private fenceRecoveryOrder(workOrderId: string, leaseEpoch: number, payload: Record<string, unknown>): boolean {
+    const order = this.store.getWorkOrder(workOrderId);
+    if (!order) return false;
+
+    let transitioned = false;
+    if (!['BLOCKED', 'FAILED', 'MERGED'].includes(order.state)) {
+      try {
+        this.store.updateState(workOrderId, 'BLOCKED', leaseEpoch);
+        transitioned = true;
+      } catch {
+        // Keep the row fenced by the durable event below.  A concurrent epoch
+        // owner is not safe to mutate from startup recovery.
+      }
+    }
+
+    const eventPayload = {
+      ...payload,
+      recovery_fence_version: 1,
+    };
+    if (this.recordRecoveryFenceEvent(workOrderId, eventPayload)) return transitioned;
+    return transitioned;
+  }
+
+  private recordRecoveryFenceEvent(workOrderId: string, eventPayload: Record<string, unknown>): boolean {
+    const serialized = JSON.stringify(eventPayload);
+    const existing = this.store.getDatabase().prepare(
+      "SELECT 1 FROM autonomy_events WHERE work_order_id = ? AND event_type = 'RECOVERY_FENCED' AND payload_json = ? LIMIT 1",
+    ).get(workOrderId, serialized);
+    if (existing) return false;
+    this.store.event(workOrderId, 'RECOVERY_FENCED', eventPayload);
+    return true;
   }
 
   async runProductTask(spec: AutonomousTaskSpec): Promise<SupervisorRunResult> {
