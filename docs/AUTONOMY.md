@@ -12,6 +12,24 @@ running supervisor. Startup now performs read-only process-run and managed
 worktree reconciliation; ambiguous state is retained and fenced for an explicit
 operator decision.
 
+## Current boundary and source of truth
+
+This page documents the local product/runtime bootstrap. Repository engineering
+is governed by GitHub Issues, Draft PR claims, exact-head GitHub Actions, and the
+protected `main` ruleset described in [WEB_AUTONOMY.md](WEB_AUTONOMY.md) and
+[ISSUE_EXECUTION_PROTOCOL.md](ISSUE_EXECUTION_PROTOCOL.md). `autonomy:start` and
+the local Supervisor do not replace that web control plane, merge pull requests,
+or invent remote queue state.
+
+The product task lifecycle is authoritative through `TaskService`, durable task
+rows, `ExecutionAuthorization`, assignments, leases, evidence, and test runs.
+Legacy `autonomy_*` rows remain available for compatibility and audit/recovery
+evidence; they are not a second authority for new product work. The supported
+local worker bound is explicitly `MAX_AGY_WORKERS=1` or `2`. Live provider
+accounts, production trial closure, signed release publication, and automatic
+merge/integration remain separately gated boundaries and must not be described as
+completed by a local PILOT run.
+
 ## Implemented loop
 
 1. Claim the SQLite supervisor owner record and reconcile unfinished processes.
