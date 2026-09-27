@@ -1796,12 +1796,12 @@ export class HandoffTransferService {
       preferredProviderId: params.preferredProviderId ?? null,
       preferredAccountId: params.preferredAccountId ?? null,
       preferredResourceId: params.preferredResourceId ?? null,
+      preferUnusedAccounts: !params.candidateRefs || params.candidateRefs.length === 0,
       persistAssignment: false,
       excludedCandidateIds: canonicalSpec.effective_excluded_candidate_ids,
       excludedAccountIds: canonicalSpec.effective_excluded_account_ids,
       excludedProviderIds: canonicalSpec.effective_excluded_provider_ids, // includes sourceProviderId
     });
-
     if (decision.outcome !== 'SELECTED') {
       return {
         success: false,

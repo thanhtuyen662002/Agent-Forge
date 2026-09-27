@@ -4,8 +4,13 @@
 
 
 The bootstrap is a bounded PILOT inside Agent Forge, in `src/core/autonomy`.
-It runs one file-editing Antigravity worker and a read-only manager provider pool.
-It does not merge, replace the running supervisor, or automatically resume R5L1.
+It runs one or two explicitly configured file-editing workers and a manager/reviewer
+provider pool. Product-task authorization, routed OmniRoute coder execution,
+durable repair convergence, and supervised GitHub CI observation are implemented
+behind the same exact-head and lease fences. It does not merge or replace the
+running supervisor. Startup now performs read-only process-run and managed
+worktree reconciliation; ambiguous state is retained and fenced for an explicit
+operator decision.
 
 ## Implemented loop
 
@@ -27,8 +32,10 @@ It does not merge, replace the running supervisor, or automatically resume R5L1.
    and working-tree snapshot after manager review and fences PASS against the
    exact evidence package (WORKING_TREE_SNAPSHOT_FENCING_VIOLATION,
    CODER_HEAD_MISMATCH). Record LOCAL_ACCEPTED; this is not a PR or merge.
-9. REPAIR persists findings in a new attempt/epoch in the same worktree.
-   Stop after three repair loops. BLOCKED affects only that task.
+9. REPAIR persists findings in a new attempt/epoch in the same worktree, carries
+   a binding to authorization, ownership epoch, base/current HEAD, and selected
+   provider/resource, and records no-progress/escalation evidence. Stop after
+   three repair loops. BLOCKED affects only that task.
 
 WorkerResult is informational. A zero process exit is insufficient; headless
 permission denial is a contract failure. No permission-bypass flags are used.
@@ -97,6 +104,7 @@ commands use that fixed build and never rebuild a running controller.
 ```powershell
 npm.cmd run autonomy:doctor
 npm.cmd run autonomy:doctor:omniroute
+npm.cmd run autonomy:doctor:omniroute-coder
 npm.cmd run autonomy:shadow
 npm.cmd run autonomy:pilot
 npm.cmd run autonomy:start
@@ -105,6 +113,8 @@ npm.cmd run autonomy:stop
 npm.cmd run autonomy:recover
 npm.cmd run autonomy:observe
 npm.cmd run autonomy:register-ci <runtime-watch-json>
+npm.cmd run autonomy:trial-log-collect <runtime-log-input.json> [relative-output.json]
+npm.cmd run autonomy:trial-log-verify <relative-collection.json>
 ```
 
 Doctor exercises live provider contracts and disposable worktree creation/removal.
@@ -144,11 +154,22 @@ owned by the installed CLIs; credentials are never copied into Git.
 ## Recovery
 
 A live owner prevents a second supervisor. Any unsettled process record fences
-dispatch: a dead direct PID alone cannot prove descendants exited. Interrupted
-attempts with settled processes become BLOCKED and release capacity. Ambiguous
-attempts and orphaned worktrees are retained. Do not delete process/owner rows to
-bypass a fence. Inspect PIDs, registration, branch, HEAD, and diff before a new
-authorized attempt. Full automatic orphan/process reconciliation remains backlog.
+dispatch: a dead direct PID alone cannot prove descendants exited. The process
+recovery scanner records stable identity and classifies live, dead, missing, and
+unknown PID evidence without terminalizing a `RUNNING` row. The autonomy recovery
+scanner also inventories managed Git worktrees, checks path containment,
+registration, top-level, branch, exact HEAD, and dirty state, and reports orphaned
+worktrees. Interrupted attempts, ambiguous worktrees, and orphans are retained;
+no recovery path deletes, unlocks, repairs, or reuses them. Clean `CI_WAIT` and
+`PR_OPEN` rows release their implementation slot only after the worktree matches
+the durable identity. Dangling slots and mismatches remain fenced for an explicit
+operator decision. External GitHub PR claims now pass through a pure,
+fail-closed evaluator before `autonomy_claims` is created or updated. It binds
+the repository/PR identity, Draft status, branch, exact head SHA, and existing
+claim owner; malformed or conflicting observations block the CI watch without
+overwriting the prior claim. The evaluator still requires an authenticated
+remote observation supplied by the GitHub CLI, so absence of that observation
+remains a live-operations hold.
 
 Reviews survive restart. No remote branch or PR is inferred from local PASS.
 CI_WAIT releases the Antigravity slot. The GitHub observer now binds a Draft PR
@@ -211,9 +232,18 @@ closed.
 
 The auth source stores only an `env://...` reference. The secret value is read at
 dispatch time and is never included in a WorkOrder, ManagerContextPackage, SQLite
-evidence, diagnostics, or logs. `autonomy:doctor:omniroute` performs an explicit live
-Responses contract probe and reports only compatibility/state and configured model
-names. Normal unit tests use fake endpoints.
+evidence, diagnostics, or logs.
+
+OmniRoute configuration distinguishes the Manager/Reviewer doctor from the coder doctor:
+`autonomy:doctor:omniroute` performs an explicit live Responses contract probe for the
+Manager and Reviewer roles (`AGENT_FORGE_MANAGER_MODEL` and `AGENT_FORGE_REVIEWER_MODEL`)
+and reports only compatibility/state and configured model names. In contrast,
+`autonomy:doctor:omniroute-coder` exercises the live coder contract (`AGENT_FORGE_CODER_MODEL`)
+by sending a bounded synthetic WorkOrder with fixed task, authorization, source HEAD,
+and allowed-path identities. It validates the returned `coderbundle.v1` bindings but
+does not apply proposed edits or write repository files. Its output reports only
+compatibility/status and the configured model, without endpoint or authorization values.
+Normal unit tests use fake endpoints.
 
 Coder routing already uses the product ProviderAdapter/role-aware resource path. A
 configured external-router coder adapter is available for Phase C, but AGY CLI remains
@@ -231,11 +261,99 @@ bounded observation between durable task dispatches; it does not busy-poll.
 
 ## Next work through the self-host supervisor
 
-Integrate existing product task/authorization/lease services, manager-selected
-dependencies, cooldowns, process recovery proofs, provider failover, and
-supervised self-update. Multi-worker scheduling is graduated to an explicitly configured two-worker maximum (`MAX_AGY_WORKERS=1` or `2`),
-denying a third active worker while automatic integration remains disabled. Keep the running version fixed and implement self-development
-in worktrees before reviewing and updating it.
+Run the authenticated remote observation and collect provider-failover edge
+proofs while preserving the product task/authorization/lease authorities
+already used by the consolidated path. Local process, managed-worktree, and
+PR-claim reconciliation contracts are implemented above; the remaining remote
+claim step requires the GitHub CLI to return authoritative metadata. Multi-worker
+scheduling is graduated to an explicitly configured two-worker maximum
+(`MAX_AGY_WORKERS=1` or `2`), denying a third active worker. Automatic
+merge/integration remains disabled; repository protections and the exact observed
+head stay the final authority. Keep the running version fixed and implement
+self-development in worktrees before reviewing and updating it.
+
+### Recovery, health replay, and trial evidence contracts
+
+Startup recovery now performs a read-only process-run reconciliation before the
+execution and adjudication scanners. A persisted `RUNNING` process row is never
+changed to `CANCELLED` merely because the supervisor restarted: direct-PID
+liveness cannot prove that detached descendants are gone. The scanner records a
+stable process identity hash, classifies live/dead/missing/unknown PID evidence,
+and keeps every unresolved row fenced. Expired task leases remain fenced while
+an associated process row is still `RUNNING`.
+
+Provider health observations are ingested and applied through the single
+`AccountHealthService` writer. Application is a separate durable step from
+observation ingestion, so a crash between the two steps is recovered by
+ordered, idempotent startup replay. Unknown or malformed authority remains
+unresolved and cannot invent account health state.
+
+Production-trial evidence is represented by the strict, canonical manifest
+contract in `src/core/autonomy/trialEvidence.ts`. It binds phase, trial ID,
+source commit/tree SHA, CI run, package/projection hashes, lifecycle IDs,
+context hashes, redacted evidence entries, approvals, retention location, and a
+manifest SHA-256. The CLI exposes:
+
+```text
+npm run autonomy:trial-manifest -- <runtime-input.json> [relative-output.json]
+npm run autonomy:verify-trial-manifest -- <manifest.json> [expected-sha256]
+npm run autonomy:trial-readiness -- <manifest.json> <readiness-input.json>
+npm run autonomy:trial-run-register -- <manifest.json> [run-id]
+npm run autonomy:trial-run-start -- <trial-id> <run-id>
+npm run autonomy:trial-run-complete -- <trial-id> <run-id> <PASS|HOLD|FAIL>
+npm run autonomy:trial-run-list -- [trial-id]
+```
+
+`src/core/autonomy/trialRetention.ts` adds a canonical retention-designation
+receipt. It binds the trial and phase to the exact manifest SHA, retention
+location, retention class, and designated security identity; writes are atomic
+and contained beneath `AGENT_FORGE_RUNTIME_ROOT`. R5L2 and R5L4 readiness
+requires this receipt together with the independent designation flag. The
+security lead must still choose and approve the durable production storage
+location before a live trial.
+
+All CLI commands that read or write runtime evidence require files beneath `AGENT_FORGE_RUNTIME_ROOT`; traversal,
+symlinks, malformed hashes, duplicate evidence IDs, and secret-like values are
+rejected. `src/core/autonomy/failureInjection.ts` provides deterministic
+FI-01..FI-15 checkpoints for safe rehearsal fixtures. The harness is
+side-effect-free by itself: a production trial must still connect each
+checkpoint to an approved fixture and retain evidence for every FI scenario.
+
+`trial-log-collect` reads explicitly selected text files or directories below
+the runtime root, rejects symlink/junction and traversal paths, applies the
+same bounded secret redaction before persistence, and writes a canonical,
+atomically created collection with per-file and bundle SHA-256 hashes. Input
+and output byte/file limits are enforced before and after redaction;
+`trial-log-verify` rechecks canonical ordering, hashes, redaction, and limits.
+The collector is local only and never uploads or discovers credentials.
+
+`trial-readiness` is a read-only, fail-closed preflight gate. It independently
+compares the manifest source commit/tree with approved and observed source
+identity, requires a clean worktree and a passing CI run ID bound to the
+manifest, binds designated operator
+and approver identities, and applies the phase-specific R5L0--R5L4 checklist
+(backups, package hashes, fixture/live account separation, authorizations,
+failure-injection coverage, and retention designation). Missing or malformed
+inputs return `HOLD` with machine-readable blocking checks; the command never
+resolves credentials, contacts providers, changes SQLite, or grants phase
+authorization. A `READY` result means only that the supplied local evidence
+passed this preflight contract; manager/executive approvals and live trial
+execution remain external controls. R5L2 and R5L4 additionally require a
+fresh Authenticode attestation: signed status, signature digest, signer
+certificate thumbprint, and an exact binding to the manifest installer digest.
+The attestation is still operator-supplied evidence and does not create a
+certificate, approval, or production credential.
+
+`TrialRunRegistry` supplies the local identity/run-tracking contract for
+GAP-05 without changing the product migration ledger. The autonomy extension
+schema stores an immutable `(trialId, runId)` binding to the canonical manifest
+SHA, source commit/tree, phase, and database projection hash, plus an ordered
+audit event stream. Registration is idempotent for the same identity and
+rejects any attempt to rebind it. Lifecycle transitions are monotonic
+`REGISTERED -> RUNNING -> PASS|HOLD|FAIL`; unknown runs and contradictory
+transitions remain fail-closed. These local records do not authorize a trial,
+resolve credentials, or prove that a live SQLite backup matches the manifest;
+operators must still capture and verify those external artifacts.
 
 The all-target fast-pr.yml supplements main-target CI. Windows/Ubuntu checks,
 Windows packaging, installed-app verification, and RC verification remain.
@@ -245,3 +363,37 @@ On the bootstrap host, Antigravity required the documented read-only rule
 `read_file(D:/Projects/AI/Agent-Forge-Worktrees)` in its global CLI settings to
 read linked worktree files. No command, outside-write, or wildcard grant was added.
 Reference: https://antigravity.google/docs/permissions/
+
+## Repair Convergence Contract (`repaircontext.v1`)
+
+The bounded repair convergence subsystem ensures that iterative repair attempts converge deterministically toward acceptable solutions or cleanly escalate without repeating failed strategies.
+
+### 1. Versioned Schema & Deterministic Hash
+- **Protocol**: `repaircontext.v1` validates strict input parameters including task authority, ownership epoch, attempt number, base SHA, exact Git HEAD, working-tree snapshot SHA, immutable acceptance criteria, allowed/forbidden paths, required tests, reviewer findings, unresolved/resolved finding IDs, prior coder actions, known failed approaches, non-regression constraints, and escalation stage.
+- **Canonical Serialization**: Canonical JSON key sorting produces deterministic SHA-256 digests (`computeRepairContextHash`) across processes and restarts.
+
+### 2. Durable SQLite Lineage & Reconstruction
+- Every `RepairContextPackage`, `RepairOutcome`, and `REPAIR_NO_PROGRESS` event is durably written to `autonomy_events` in the SQLite state store.
+- On process crash or daemon restart, `rebuildRepairLineage(taskId)` restores complete lineage without losing authorization, epoch, findings, failed approaches, coder resource, snapshot, or exact Git HEAD identity.
+
+### 3. Stable Deterministic Reviewer Finding IDs
+- Reviewer findings report `finding_id`, `severity`, `title`, `description`, `file_path`, `line_number`, `evidence`, `required_action`, and `acceptance_evidence`.
+- Explicit IDs are preserved; legacy findings lacking explicit IDs derive deterministic IDs via `deriveFindingId` from normalized title, description, file path, line number, and required action, guaranteeing identity stability across revisions.
+
+### 4. Whole-Response Coder Bundle & Independent Reconciliation
+- `coderbundle.v1` accepts `addressed_finding_ids`, `unresolved_finding_ids`, `implementation_summary`, `changed_files`, and `known_risks` as native JSON parsed as a whole response.
+- Coder claims are **never** treated as proof; Supervisor independently reconciles closure via `reconcileFindingClosure` using diff modified files, deterministic test results, post-review snapshots, and manager review verdicts.
+
+### 5. Semantic No-Progress Detection (`REPAIR_NO_PROGRESS`)
+Supervisor detects and durably records non-progress across 6 categories:
+1. `NO_OP_WITH_UNRESOLVED_ACTIONS`: Coder proposed no edits while unresolved findings remain.
+2. `UNCHANGED_SNAPSHOT_OR_DIFF`: Working tree snapshot or diff is identical to the prior attempt.
+3. `REPEATED_FAILING_TEST_SIGNATURES`: Exact normalized test failure signatures match a prior recorded attempt.
+4. `UNCHANGED_UNRESOLVED_FINDINGS`: Set of unresolved finding IDs after review is unchanged.
+5. `SEMANTICALLY_EQUIVALENT_REPEATED_PATCH`: Patch content normalizes to an identical hash as a prior attempt.
+6. `REGRESSION_OR_REVERSION_OF_EARLIER_VALID_FIX`: A finding closed in an earlier attempt regressed or was reverted.
+
+### 6. Three-Attempt Escalation Policy (`MAX_REPAIR_LOOPS=3`)
+- **Attempt 1 (`NORMAL_CODER`)**: Dispatches the normally authorized coder with the full repair context package.
+- **Attempt 2 (`EXPLICIT_EVIDENCE`)**: Refreshes evidence and explicitly highlights unresolved finding IDs and prior failed approaches.
+- **Attempt 3 (`SPECIALIST_OR_FALLBACK`)**: Requires fresh explicit ExecutionAuthorization specifically bound to either the configured repair specialist (`AGENT_FORGE_REPAIR_CODER_MODEL`) or AGY fallback (`res-antigravity-cli-coder`). Normal coder authorizations fail closed. Zero silent fallback across models or resources is permitted.

@@ -7397,6 +7397,23 @@ describe('R5J5 Quarantined Submission Adjudication and Verification Admission Su
       }
     });
 
+    it('236b. ArtifactStore.assertPathContained rejects a symlinked evidence root', () => {
+      const realRoot = path.join(fixtures.quarantineDir, 'real_root');
+      const linkedRoot = path.join(fixtures.quarantineDir, 'linked_root');
+      fs.mkdirSync(realRoot, { recursive: true });
+      try {
+        fs.symlinkSync(realRoot, linkedRoot, process.platform === 'win32' ? 'junction' : 'dir');
+        expect(() => {
+          ArtifactStore.assertPathContained(path.join(linkedRoot, 'new.txt'), linkedRoot);
+        }).toThrow(/root|SYMLINK_NOT_PERMITTED/i);
+      } catch (err: any) {
+        if (err.code !== 'EPERM' && err.code !== 'EACCES') throw err;
+      } finally {
+        if (fs.existsSync(linkedRoot)) fs.unlinkSync(linkedRoot);
+        fs.rmSync(realRoot, { recursive: true, force: true });
+      }
+    });
+
     it('237. ArtifactStore.assertPathContained normalizes Windows drive case correctly', () => {
       const allowedRoot = fixtures.quarantineDir;
       const mixedCasePath = process.platform === 'win32'

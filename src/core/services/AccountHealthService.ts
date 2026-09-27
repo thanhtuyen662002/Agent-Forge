@@ -1,5 +1,9 @@
 import { Repository } from '../database/repositories';
-import { ProviderHealthStatus, ProviderHealthObservationApplicationResult } from '../types/domain';
+import {
+  ProviderHealthStatus,
+  ProviderHealthObservationApplicationResult,
+  ProviderHealthObservationApplicationStatus,
+} from '../types/domain';
 import { ProviderFailureCategory } from './ExecutionFailureClassifier';
 
 export interface RateLimitedHealthUpdateOptions {
@@ -27,8 +31,35 @@ export interface GeneralFailureHealthUpdateOptions {
   cooldownUntil?: string | Date | null;
 }
 
+/**
+ * Durable health replay is best-effort per observation: an unknown or malformed
+ * authority must remain fenced while independent accounts can still converge.
+ * Counts are intentionally aggregate so recovery logs never copy provider
+ * payloads or credentials into the event stream.
+ */
+export interface ProviderHealthObservationReplayReport {
+  scannedCount: number;
+  appliedCount: number;
+  alreadyAppliedCount: number;
+  noMutationCount: number;
+  staleCount: number;
+  deferredCount: number;
+  unresolvedCount: number;
+  rejectedCount: number;
+  errorCount: number;
+}
+
 export class AccountHealthService {
   private readonly now: () => Date;
+
+  /**
+   * Keep construction behind the health service boundary.  Runtime callers
+   * use the provider-health application facade so production dispatch code
+   * cannot accidentally grow a second health writer or bypass this service.
+   */
+  public static create(repo: Repository, clock?: () => Date): AccountHealthService {
+    return new this(repo, clock);
+  }
 
   constructor(
     private readonly repo: Repository,
@@ -218,5 +249,92 @@ export class AccountHealthService {
       );
     }
     return this.repo.applyDurableProviderHealthObservation(authorizationId.trim());
+  }
+
+  /**
+   * Applies a durable observation after dispatch has persisted it. Keeping this
+   * writer behind AccountHealthService makes the two-phase dispatch path
+   * explicit: ingestion can succeed even if application is interrupted, and a
+   * later recovery replay can safely retry the same authorization.
+   */
+  public applyObservation(
+    authorizationId: string
+  ): ProviderHealthObservationApplicationResult {
+    return this.applyDurableObservation(authorizationId);
+  }
+
+  /**
+   * Replays all temporally ordered provider-health observations. The repository
+   * application transaction owns ordering, watermark and idempotency checks;
+   * this method only schedules each durable row and aggregates the outcome.
+   * One malformed row must not prevent unrelated accounts from recovering.
+   */
+  public replayProviderHealthObservations(): ProviderHealthObservationReplayReport {
+    const report: ProviderHealthObservationReplayReport = {
+      scannedCount: 0,
+      appliedCount: 0,
+      alreadyAppliedCount: 0,
+      noMutationCount: 0,
+      staleCount: 0,
+      deferredCount: 0,
+      unresolvedCount: 0,
+      rejectedCount: 0,
+      errorCount: 0,
+    };
+
+    const observations = this.repo.getProviderHealthObservationsForReplay();
+    report.scannedCount = observations.length;
+
+    for (const observation of observations) {
+      let application: ProviderHealthObservationApplicationResult;
+      try {
+        application = this.applyObservation(observation.authorization_id);
+      } catch (_error) {
+        // A failed row remains durable and fenced for a future operator/recovery
+        // attempt; never abort recovery for another account because of it.
+        report.errorCount += 1;
+        continue;
+      }
+
+      this.recordReplayOutcome(report, application.status);
+    }
+
+    return report;
+  }
+
+  private recordReplayOutcome(
+    report: ProviderHealthObservationReplayReport,
+    status: ProviderHealthObservationApplicationStatus
+  ): void {
+    switch (status) {
+      case 'APPLIED':
+        report.appliedCount += 1;
+        return;
+      case 'ALREADY_APPLIED':
+        report.alreadyAppliedCount += 1;
+        return;
+      case 'NO_MUTATION':
+        report.noMutationCount += 1;
+        return;
+      case 'STALE':
+        report.staleCount += 1;
+        return;
+      case 'DEFERRED_BY_NEWER_UNKNOWN_AUTHORITY':
+        report.deferredCount += 1;
+        report.unresolvedCount += 1;
+        return;
+      case 'LEGACY_UNORDERED':
+      case 'ACTION_AUTHORITY_UNKNOWN':
+      case 'TEMPORAL_AUTHORITY_UNKNOWN':
+        report.unresolvedCount += 1;
+        return;
+      case 'REJECTED':
+        report.rejectedCount += 1;
+        return;
+      default:
+        // Keep the aggregate fail-closed if a future status is added without
+        // extending this replay categorization first.
+        report.unresolvedCount += 1;
+    }
   }
 }
