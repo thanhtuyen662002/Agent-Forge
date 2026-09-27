@@ -107,6 +107,15 @@ describe('autonomous contract validator', () => {
     expect(result).toMatchObject({ ok: true, status: 'VALID' });
   });
 
+  it('allows an empty Issue path scope for an EXTERNAL operations contract', () => {
+    const external = issueBody
+      .replace('  status: READY', '  status: EXTERNAL')
+      .replace('  execution: WEB', '  execution: EXTERNAL')
+      .replace('  paths:\n    - scripts/example.cjs\n    - tests/example.test.ts', '  paths: []');
+    const result = validator.validateIssueContract(external, { createdAt: '2026-09-28T00:00:00Z' });
+    expect(result).toMatchObject({ ok: true, status: 'VALID' });
+  });
+
   it('rejects malformed task enums, traversal paths, and missing required sections with field names', () => {
     const malformed = issueBody
       .replace('status: READY', 'status: MAYBE')

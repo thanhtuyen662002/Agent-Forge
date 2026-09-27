@@ -313,7 +313,11 @@ function validateTaskContract(body, context = {}) {
   }
   if (own(block.values, 'blocked_by')) errors.push(...validateIssueNumberList(block.values.blocked_by, 'blocked_by', 'AF_TASK_V1'));
   if (own(block.values, 'conflicts_with')) errors.push(...validateIssueNumberList(block.values.conflicts_with, 'conflicts_with', 'AF_TASK_V1'));
-  if (own(block.values, 'paths')) errors.push(...validatePathList(block.values.paths, 'paths', 'AF_TASK_V1', true));
+  // External/operations Issues may intentionally have no repository paths
+  // (for example, an account-capacity action). The field remains required by
+  // the schema, but an empty list is valid for the Issue contract. PR scopes
+  // remain non-empty because a PR must declare changed files.
+  if (own(block.values, 'paths')) errors.push(...validatePathList(block.values.paths, 'paths', 'AF_TASK_V1', false));
   if (own(block.values, 'forbidden_paths')) errors.push(...validatePathList(block.values.forbidden_paths, 'forbidden_paths', 'AF_TASK_V1', false));
   if (typeof body === 'string') {
     for (const heading of TASK_REQUIRED_SECTIONS) {
