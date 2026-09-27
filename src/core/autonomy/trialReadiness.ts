@@ -25,6 +25,11 @@ export interface TrialReadinessInput {
   ciPassed?: unknown;
   buildPassed?: unknown;
   reviewerBuilt?: unknown;
+  observedArtifacts?: {
+    installerSha256?: unknown;
+    appSha256?: unknown;
+    databaseProjectionSha256?: unknown;
+  };
   databaseBackupSha256?: unknown;
   syntheticProviderAccountIds?: unknown;
   liveProviderAccountIds?: unknown;
@@ -212,6 +217,26 @@ function addArtifactCheck(
   check(checks, id, value !== null && sha(value), value !== null ? `${field} is a valid SHA-256 digest` : `${field} artifact hash is required`);
 }
 
+function addObservedArtifactCheck(
+  manifest: ProductionTrialEvidenceManifest,
+  input: TrialReadinessInput,
+  checks: TrialReadinessCheck[],
+  field: 'installerSha256' | 'appSha256' | 'databaseProjectionSha256',
+  id: string,
+): void {
+  const observed = isRecord(input.observedArtifacts) ? input.observedArtifacts[field] : undefined;
+  const expected = manifest.artifacts[field];
+  const ok = expected !== null && sha(expected) && sha(observed) && expected === observed;
+  check(
+    checks,
+    id,
+    ok,
+    ok
+      ? `${field} observed digest matches the manifest`
+      : `${field} observed digest is required and must exactly match the manifest`,
+  );
+}
+
 function addProviderCheck(
   input: TrialReadinessInput,
   checks: TrialReadinessCheck[],
@@ -285,6 +310,7 @@ export function evaluateTrialReadiness(
       check(checks, 'authorization.manager', booleanTrue(input?.managerAuthorized), booleanTrue(input?.managerAuthorized) ? 'manager authorization recorded' : 'manager authorization is required for R5L1');
       addDatabaseBackupCheck(input ?? {}, checks, 'database.synthetic_backup');
       addArtifactCheck(normalized, checks, 'databaseProjectionSha256', 'artifacts.database_projection');
+      addObservedArtifactCheck(normalized, input ?? {}, checks, 'databaseProjectionSha256', 'artifacts.database_projection_observed');
       addProviderCheck(input ?? {}, checks, 'syntheticProviderAccountIds', 'providers.synthetic_separation', 'synthetic provider fixture');
       check(checks, 'providers.separation_policy', input?.separationPolicy === 'REQUIRE_DIFFERENT', input?.separationPolicy === 'REQUIRE_DIFFERENT' ? 'REQUIRE_DIFFERENT separation policy is active' : 'REQUIRE_DIFFERENT separation policy is required');
       check(checks, 'fixtures.repository', boundedText(input?.fixtureRepository), boundedText(input?.fixtureRepository) ? 'isolated synthetic fixture repository is designated' : 'an isolated synthetic fixture repository is required');
@@ -297,6 +323,9 @@ export function evaluateTrialReadiness(
       addArtifactCheck(normalized, checks, 'installerSha256', 'artifacts.installer');
       addArtifactCheck(normalized, checks, 'appSha256', 'artifacts.application');
       addArtifactCheck(normalized, checks, 'databaseProjectionSha256', 'artifacts.database_projection');
+      addObservedArtifactCheck(normalized, input ?? {}, checks, 'installerSha256', 'artifacts.installer_observed');
+      addObservedArtifactCheck(normalized, input ?? {}, checks, 'appSha256', 'artifacts.application_observed');
+      addObservedArtifactCheck(normalized, input ?? {}, checks, 'databaseProjectionSha256', 'artifacts.database_projection_observed');
       addProviderCheck(input ?? {}, checks, 'liveProviderAccountIds', 'providers.live_separation', 'live provider');
       check(checks, 'credentials.resolution', booleanTrue(input?.credentialResolutionVerified), booleanTrue(input?.credentialResolutionVerified) ? 'credential handles resolved without plaintext output' : 'credential handle resolution must be verified');
       check(checks, 'host.disk_space', typeof input?.diskFreeGb === 'number' && Number.isFinite(input.diskFreeGb) && input.diskFreeGb >= 5, typeof input?.diskFreeGb === 'number' && input.diskFreeGb >= 5 ? 'at least 5 GB free disk space is verified' : 'at least 5 GB free disk space is required');
@@ -315,6 +344,9 @@ export function evaluateTrialReadiness(
       addArtifactCheck(normalized, checks, 'installerSha256', 'artifacts.installer');
       addArtifactCheck(normalized, checks, 'appSha256', 'artifacts.application');
       addArtifactCheck(normalized, checks, 'databaseProjectionSha256', 'artifacts.database_projection');
+      addObservedArtifactCheck(normalized, input ?? {}, checks, 'installerSha256', 'artifacts.installer_observed');
+      addObservedArtifactCheck(normalized, input ?? {}, checks, 'appSha256', 'artifacts.application_observed');
+      addObservedArtifactCheck(normalized, input ?? {}, checks, 'databaseProjectionSha256', 'artifacts.database_projection_observed');
       check(checks, 'evidence.bundle', normalized.evidence.length > 0, normalized.evidence.length > 0 ? 'evidence entries are present' : 'at least one verified evidence entry is required');
       check(checks, 'retention.designated', booleanTrue(input?.retentionLocationDesignated), booleanTrue(input?.retentionLocationDesignated) ? 'secure evidence retention location is designated' : 'secure evidence retention location must be designated');
       break;

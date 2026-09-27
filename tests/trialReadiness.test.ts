@@ -1,3 +1,6 @@
+import fs from 'fs';
+import os from 'os';
+import path from 'path';
 import { describe, expect, it } from 'vitest';
 import {
   buildTrialEvidenceManifest,
@@ -8,6 +11,7 @@ import {
   type TrialReadinessInput,
 } from '../src/core/autonomy/trialReadiness';
 import { FAILURE_INJECTION_IDS } from '../src/core/autonomy/failureInjection';
+import { main as autonomyCliMain } from '../src/electron/autonomyCli';
 
 type TrialManifestInput = Omit<ProductionTrialEvidenceManifest, 'schemaVersion' | 'createdAt'> & { createdAt?: string };
 
@@ -61,6 +65,7 @@ describe('trial readiness preflight', () => {
       buildPassed: true,
       reviewerBuilt: true,
       databaseBackupSha256: '2'.repeat(64),
+      observedArtifacts: { databaseProjectionSha256: 'e'.repeat(64) },
       syntheticProviderAccountIds: ['synthetic-coder', 'synthetic-reviewer'],
       separationPolicy: 'REQUIRE_DIFFERENT',
       fixtureRepository: 'fixture-repository',
@@ -90,6 +95,7 @@ describe('trial readiness preflight', () => {
     const incomplete = evaluateTrialReadiness(manifest, sourceInput({
       executiveAuthorized: true,
       databaseBackupSha256: '2'.repeat(64),
+      observedArtifacts: { installerSha256: 'c'.repeat(64), appSha256: 'd'.repeat(64), databaseProjectionSha256: 'e'.repeat(64) },
       liveProviderAccountIds: ['live-one'],
       credentialResolutionVerified: true,
       diskFreeGb: 8,
@@ -105,6 +111,7 @@ describe('trial readiness preflight', () => {
     const complete = evaluateTrialReadiness(manifest, sourceInput({
       executiveAuthorized: true,
       databaseBackupSha256: '2'.repeat(64),
+      observedArtifacts: { installerSha256: 'c'.repeat(64), appSha256: 'd'.repeat(64), databaseProjectionSha256: 'e'.repeat(64) },
       liveProviderAccountIds: ['live-coder', 'live-reviewer'],
       credentialResolutionVerified: true,
       diskFreeGb: 8,
@@ -115,6 +122,22 @@ describe('trial readiness preflight', () => {
       previousPhaseOutcomes: { R5L0: 'PASS', R5L1: 'PASS' },
     }));
     expect(complete.status).toBe('READY');
+
+    const mismatchedArtifact = evaluateTrialReadiness(manifest, sourceInput({
+      executiveAuthorized: true,
+      databaseBackupSha256: '2'.repeat(64),
+      observedArtifacts: { installerSha256: 'c'.repeat(64), appSha256: '0'.repeat(64), databaseProjectionSha256: 'e'.repeat(64) },
+      liveProviderAccountIds: ['live-coder', 'live-reviewer'],
+      credentialResolutionVerified: true,
+      diskFreeGb: 8,
+      redactionActive: true,
+      networkStable: true,
+      quotaSufficient: true,
+      retentionLocationDesignated: true,
+      previousPhaseOutcomes: { R5L0: 'PASS', R5L1: 'PASS' },
+    }));
+    expect(mismatchedArtifact.status).toBe('HOLD');
+    expect(mismatchedArtifact.blockingReasons.some((reason) => reason.startsWith('artifacts.application_observed:'))).toBe(true);
   });
 
   it('requires FI-01 through FI-15 evidence or explicit waivers for R5L3', () => {
@@ -145,6 +168,7 @@ describe('trial readiness preflight', () => {
     const result = evaluateTrialReadiness(manifest, sourceInput({
       releaseApproved: true,
       retentionLocationDesignated: true,
+      observedArtifacts: { installerSha256: 'c'.repeat(64), appSha256: 'd'.repeat(64), databaseProjectionSha256: 'e'.repeat(64) },
       previousPhaseOutcomes: { R5L0: 'PASS', R5L1: 'PASS', R5L2: 'PASS', R5L3: 'HOLD' },
     }));
     expect(result.status).toBe('HOLD');
@@ -153,6 +177,7 @@ describe('trial readiness preflight', () => {
     const complete = evaluateTrialReadiness(manifest, sourceInput({
       releaseApproved: true,
       retentionLocationDesignated: true,
+      observedArtifacts: { installerSha256: 'c'.repeat(64), appSha256: 'd'.repeat(64), databaseProjectionSha256: 'e'.repeat(64) },
       previousPhaseOutcomes: { R5L0: 'PASS', R5L1: 'PASS', R5L2: 'PASS', R5L3: 'PASS' },
     }));
     expect(complete.status).toBe('READY');
@@ -161,5 +186,36 @@ describe('trial readiness preflight', () => {
   it('revalidates a manifest instead of trusting a structurally similar object', () => {
     const malformed = { ...baseManifest('R5L0'), source: { ...baseManifest('R5L0').source, commitSha: 'not-a-sha' } } as ProductionTrialEvidenceManifest;
     expect(() => evaluateTrialReadiness(malformed, sourceInput({ managerAuthorized: true }))).toThrow(/TRIAL_EVIDENCE_INVALID/);
+  });
+
+  it('runs the manifest, verification, and readiness CLI commands without mutating external state', async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'agent-forge-readiness-cli-'));
+    const previousRuntimeRoot = process.env.AGENT_FORGE_RUNTIME_ROOT;
+    try {
+      process.env.AGENT_FORGE_RUNTIME_ROOT = root;
+      const inputPath = path.join(root, 'manifest-input.json');
+      const readinessPath = path.join(root, 'readiness-input.json');
+      fs.writeFileSync(inputPath, JSON.stringify(baseManifest('R5L1')));
+      fs.writeFileSync(readinessPath, JSON.stringify(sourceInput({
+        managerAuthorized: true,
+        buildPassed: true,
+        reviewerBuilt: true,
+        databaseBackupSha256: '2'.repeat(64),
+        syntheticProviderAccountIds: ['synthetic-coder', 'synthetic-reviewer'],
+        separationPolicy: 'REQUIRE_DIFFERENT',
+        fixtureRepository: 'fixture-repository',
+        previousPhaseOutcomes: { R5L0: 'PASS' },
+      })));
+
+      expect(await autonomyCliMain(['node', 'autonomyCli.ts', 'trial-manifest', inputPath, 'trial/manifest.json'])).toBe(0);
+      const manifestPath = path.join(root, 'trial', 'manifest.json');
+      expect(await autonomyCliMain(['node', 'autonomyCli.ts', 'verify-trial-manifest', manifestPath])).toBe(0);
+      expect(await autonomyCliMain(['node', 'autonomyCli.ts', 'trial-readiness', manifestPath, readinessPath])).toBe(0);
+      expect(fs.existsSync(path.join(root, 'trial', 'manifest.json'))).toBe(true);
+    } finally {
+      if (previousRuntimeRoot === undefined) delete process.env.AGENT_FORGE_RUNTIME_ROOT;
+      else process.env.AGENT_FORGE_RUNTIME_ROOT = previousRuntimeRoot;
+      fs.rmSync(root, { recursive: true, force: true });
+    }
   });
 });
