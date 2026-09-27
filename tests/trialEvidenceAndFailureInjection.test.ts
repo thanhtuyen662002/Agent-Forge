@@ -81,6 +81,12 @@ describe('production trial evidence manifest', () => {
     expect(tokenRedacted.manifest.notes).toBe('[REDACTED_SECRET]');
     const secretRedacted = buildTrialEvidenceManifest({ ...baseManifest(), notes: 'secret=super-secret-value' });
     expect(secretRedacted.manifest.notes).toBe('[REDACTED_SECRET]');
+    const compositeRedacted = buildTrialEvidenceManifest({
+      ...baseManifest(),
+      notes: 'secretToken: super-secret-value | eyJabcdefghijk.abcdefghijkl.abcdefghijkl | https://user:super-secret-value@example.invalid/path',
+    });
+    expect(compositeRedacted.manifest.notes).not.toContain('super-secret-value');
+    expect(compositeRedacted.manifest.notes).not.toContain('eyJabcdefghijk');
     const raw = JSON.stringify({ ...baseManifest(), notes: 'api_key=super-secret-value', schemaVersion: 1, createdAt: new Date().toISOString() });
     const built = buildTrialEvidenceManifest(baseManifest());
     expect(() => parseAndVerifyTrialEvidenceManifest(raw, built.sha256)).toThrow(/TRIAL_EVIDENCE_INVALID/);

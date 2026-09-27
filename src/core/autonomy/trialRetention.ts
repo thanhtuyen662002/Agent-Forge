@@ -39,8 +39,10 @@ const SECRET_PATTERNS: RegExp[] = [
   /(?:github_pat_[A-Za-z0-9_-]{20,})/g,
   /\b(?:AKIA|ASIA)[0-9A-Z]{16}\b/g,
   /\bBearer\s+[A-Za-z0-9._\-+/=]{16,}/gi,
+  /\beyJ[A-Za-z0-9_\-]{10,}\.[A-Za-z0-9_\-]{10,}\.[A-Za-z0-9_\-]{10,}\b/g,
+  /\b[a-z][a-z0-9+.-]*:\/\/[^\s/@:]+:[^\s/@]+@/gi,
   /-----BEGIN [^-]+-----[\s\S]*?-----END [^-]+-----/g,
-  /\b(?:api[_-]?key|access[_-]?token|refresh[_-]?token|client[_-]?secret|oauth[_-]?token|password|secret|token)\s*[:=]\s*[^\s,;}]{8,}/gi,
+  /\b(?:api[_-]?key|access[_-]?token|refresh[_-]?token|client[_-]?secret|oauth[_-]?token|secret[_-]?token|password|secret|token)\s*[:=]\s*[^\s,;}]{8,}/gi,
 ];
 
 function fail(message: string): never {
