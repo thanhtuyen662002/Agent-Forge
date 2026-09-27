@@ -550,6 +550,17 @@ remain HOLD until the operator manifests, approvals, provider accounts,
 failure-injection artifacts, and exact release hashes described below exist for
 an approved source tree.
 
+The local `npm run autonomy:trial-readiness -- <manifest.json>
+<readiness-input.json>` command is the fail-closed preflight implementation of
+these checklists. It independently compares approved and observed source
+identity, requires a clean worktree and passing CI, binds designated identities,
+and validates the phase-specific artifact, backup, account-separation,
+authorization, failure-injection, and retention inputs. It returns `HOLD` for
+missing or contradictory input and never grants external approval, resolves
+credentials, contacts providers, or mutates production state. A `READY`
+result therefore means only that the supplied local inputs satisfy the
+preflight contract; the live trial and managerial decisions remain required.
+
 The following operational and technical gaps are formally tracked. They represent unresolved inputs or missing trial infrastructure:
 
 | Gap ID | Readiness Gap Description | Blocking Phase | Required Resolution | Authority Owner | Source Classification |
@@ -563,6 +574,7 @@ The following operational and technical gaps are formally tracked. They represen
 | **GAP-07** | **Trial Evidence Retention Location** | Phase R5L2 | Secure, durable storage location for archiving trial evidence bundles must be formally designated. | Security Lead | `UNRESOLVED READINESS INPUT` |
 | **GAP-08** | **Live Provider Accounts & Credentials** | Phase R5L2 | Provisioning and configuration of at least two distinct, funded provider accounts on the trial host machine. Required for R5L2 live trial only; synthetic fixtures used for R5L1. | Trial Operator | `UNRESOLVED READINESS INPUT` |
 | **GAP-09** | **Designated Operator & Approval Identities** | Phase R5L1 & R5L2 | Named human operators and auditors must be assigned responsibility for trial monitoring, manual bridge steps, and sign-offs. | Management | `UNRESOLVED READINESS INPUT` |
+| **GAP-10** | **Authoritative External PR Claim Observation** | Phase R5L1 & R5L2 | A pure fail-closed evaluator now binds repository/PR identity, Draft status, branch, exact head SHA, and durable claim owner before persistence. The Supervisor still requires an authenticated `gh` observation to produce live evidence; missing remote metadata keeps the watch fenced. | Supervisor / Release Eng | `IMPLEMENTED LOCALLY — REMOTE EVIDENCE REQUIRED` |
 
 ---
 
