@@ -159,4 +159,3 @@ describe('ProcessRunRecoveryScanner', () => {
     db.close();
   });
 });
-

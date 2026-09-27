@@ -29,7 +29,6 @@ export interface ProcessRunRecoveryItem {
   classification: ProcessRunRecoveryClassification;
   disposition: ProcessRunRecoveryDisposition;
 }
-
 export interface ProcessRunRecoveryScanReport {
   scannedCount: number;
   unresolvedCount: number;
@@ -179,4 +178,3 @@ export class ProcessRunRecoveryScanner {
     };
   }
 }
-
