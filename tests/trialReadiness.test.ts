@@ -287,9 +287,9 @@ describe('trial readiness preflight', () => {
 
   it('requires observed CI provenance to match the manifest run ID', () => {
     const manifest = baseManifest('R5L1');
-    const missing = evaluateTrialReadiness(manifest, sourceInput({ managerAuthorized: true }));
+    const missing = evaluateTrialReadiness(manifest, sourceInput({ managerAuthorized: true, observedCiRunId: undefined }));
     expect(missing.status).toBe('HOLD');
-    expect(missing.blockingReasons.some((reason) => reason.startsWith('ci.observed_run_binding:'))).toBe(false);
+    expect(missing.blockingReasons.some((reason) => reason.startsWith('ci.observed_run_binding:'))).toBe(true);
     const mismatched = evaluateTrialReadiness(manifest, sourceInput({ managerAuthorized: true, observedCiRunId: 'different-ci-run' }));
     expect(mismatched.status).toBe('HOLD');
     expect(mismatched.blockingReasons.some((reason) => reason.startsWith('ci.observed_run_binding:'))).toBe(true);
