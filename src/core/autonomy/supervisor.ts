@@ -14,6 +14,27 @@ import { ProductTaskAutonomyAdapter, renderCommand } from './productTaskAdapter'
 import { GitWorktreeService } from '../services/GitWorktreeService';
 import { AgentAssignment, ExecutionAuthorization, Task } from '../types/domain';
 import { CanonicalExecutionPayload, CanonicalExecutionPayloadSchema } from '../services/ExecutionAuthorizationService';
+import { ProviderEndpointConfig } from './providerEndpoint';
+import {
+  loadOmniRouteEndpointFromEnvironment,
+  loadOmniRouteRepairCoderEndpointFromEnvironment,
+} from './responsesEndpoint';
+import {
+  CoderResourceBinding,
+  ResponsesCoderEndpointTransport,
+  applyCoderEditBundle,
+  resolveCoderProvider,
+} from './responsesCoderEndpoint';
+import {
+  RepairContextPackage,
+  buildRepairContextPackage,
+  computeNormalizedPatchHash,
+  deriveFindingId,
+  detectNoProgress,
+  extractFailingTestSignatures,
+  getEscalationStage,
+  reconcileFindingClosure,
+} from './repairContext';
 
 export type AutonomyMode = 'SHADOW' | 'PILOT' | 'AUTONOMOUS';
 
@@ -30,6 +51,11 @@ export interface SupervisorConfig {
   controlRepo?: string;
   worktreeRoot?: string;
   productAdapter?: ProductTaskAutonomyAdapter;
+  coderTransport?: ResponsesCoderEndpointTransport;
+  coderEndpoint?: ProviderEndpointConfig | null;
+  repairCoderEndpoint?: ProviderEndpointConfig | null;
+  agyProviderId?: string;
+  agyResourceId?: string;
 }
 
 export interface SupervisorRunResult {
@@ -55,6 +81,11 @@ export class AutonomySupervisor {
   readonly controlRepo: string;
   readonly worktreeRoot: string;
   readonly productAdapter: ProductTaskAutonomyAdapter;
+  readonly coderTransport: ResponsesCoderEndpointTransport;
+  readonly coderEndpoint: ProviderEndpointConfig | null;
+  readonly repairCoderEndpoint: ProviderEndpointConfig | null;
+  readonly agyProviderId: string;
+  readonly agyResourceId: string;
 
   constructor(config: SupervisorConfig = {}) {
     this.mode = config.mode ?? ((process.env.AGENT_FORGE_MODE as AutonomyMode | undefined) ?? 'PILOT');
@@ -81,7 +112,107 @@ export class AutonomySupervisor {
       evidenceCollector: this.evidence,
       maxWorkers: this.maxWorkers,
     });
+    this.coderEndpoint = config.coderEndpoint !== undefined
+      ? config.coderEndpoint
+      : loadOmniRouteEndpointFromEnvironment('CODER');
+    this.repairCoderEndpoint = config.repairCoderEndpoint !== undefined
+      ? config.repairCoderEndpoint
+      : loadOmniRouteRepairCoderEndpointFromEnvironment();
+    this.agyProviderId = config.agyProviderId ?? process.env.AGENT_FORGE_AGY_PROVIDER_ID ?? 'prov-antigravity-cli';
+    this.agyResourceId = config.agyResourceId ?? process.env.AGENT_FORGE_AGY_RESOURCE_ID ?? 'res-antigravity-cli-coder';
+    this.coderTransport = config.coderTransport ?? new ResponsesCoderEndpointTransport();
+
+    const registerOmniResource = (endpoint: ProviderEndpointConfig | null) => {
+      if (endpoint && !repo.getProviderResource(endpoint.resource_id)) {
+        const providerId = 'provider-external-router';
+        if (!repo.getProvider(providerId)) {
+          repo.createProvider({
+            id: providerId,
+            name: 'Configured external router',
+            adapter_type: 'API',
+            enabled: true,
+            created_at: new Date().toISOString(),
+          });
+        }
+        repo.createProviderResource({
+          id: endpoint.resource_id,
+          provider_id: providerId,
+          provider_account_id: null,
+          model_name: endpoint.model_or_route,
+          health_status: endpoint.health_state === 'DEGRADED'
+            ? 'LOW_QUOTA'
+            : endpoint.health_state === 'CAPACITY_EXHAUSTED'
+              ? 'QUOTA_EXHAUSTED'
+              : endpoint.health_state === 'CONTRACT_INVALID'
+                ? 'UNHEALTHY'
+                : endpoint.health_state,
+          capabilities: [...endpoint.capabilities],
+          enabled: endpoint.enabled,
+          total_quota: null,
+          remaining_quota: null,
+          quota_unit: 'ROUTE_REQUESTS',
+          quota_reset_at: null,
+          quota_source: 'UNKNOWN',
+          quota_confidence: 0,
+          last_health_check: null,
+        });
+      }
+    };
+    registerOmniResource(this.coderEndpoint);
+    registerOmniResource(this.repairCoderEndpoint);
+
     this.store.ensureSlots(this.maxWorkers);
+  }
+
+  private resolveAuthorizedCoder(auth: ExecutionAuthorization) {
+    const row = this.store.getDatabase().prepare(`
+      SELECT
+        r.id AS resource_id,
+        r.provider_id,
+        r.provider_account_id,
+        r.enabled AS resource_enabled,
+        r.health_status AS resource_health,
+        r.capabilities_json,
+        p.adapter_type,
+        p.enabled AS provider_enabled,
+        a.enabled AS account_enabled,
+        a.health_status AS account_health,
+        a.cooldown_until AS account_cooldown_until
+      FROM provider_resources r
+      JOIN providers p ON p.id = r.provider_id
+      LEFT JOIN provider_accounts a ON a.id = r.provider_account_id
+      WHERE r.id = ?
+    `).get(auth.selected_resource_id) as Record<string, unknown> | undefined;
+    const binding: CoderResourceBinding | null = row ? {
+      resourceId: String(row.resource_id),
+      providerId: String(row.provider_id),
+      providerAccountId: row.provider_account_id ? String(row.provider_account_id) : null,
+      adapterType: row.adapter_type as CoderResourceBinding['adapterType'],
+      providerEnabled: Boolean(row.provider_enabled),
+      resourceEnabled: Boolean(row.resource_enabled),
+      resourceHealth: String(row.resource_health),
+      capabilities: row.capabilities_json ? JSON.parse(String(row.capabilities_json)) : [],
+      accountEnabled: row.provider_account_id ? Boolean(row.account_enabled) : null,
+      accountHealth: row.account_health ? String(row.account_health) : null,
+      accountCooldownUntil: row.account_cooldown_until ? String(row.account_cooldown_until) : null,
+    } : null;
+    const candidateEndpoints = [this.coderEndpoint, this.repairCoderEndpoint].filter(
+      (ep): ep is ProviderEndpointConfig => ep !== null && ep !== undefined
+    );
+    return resolveCoderProvider(auth, binding, candidateEndpoints, {
+      providerId: this.agyProviderId,
+      resourceId: this.agyResourceId,
+    });
+  }
+
+  private getTargetCoderEndpoint(selectedResourceId?: string | null): ProviderEndpointConfig | null {
+    if (this.repairCoderEndpoint && selectedResourceId === this.repairCoderEndpoint.resource_id) {
+      return this.repairCoderEndpoint;
+    }
+    if (this.coderEndpoint && selectedResourceId === this.coderEndpoint.resource_id) {
+      return this.coderEndpoint;
+    }
+    return this.coderEndpoint ?? loadOmniRouteEndpointFromEnvironment('CODER');
   }
 
   createWorkOrder(spec: AutonomousTaskSpec): WorkOrder {
@@ -124,8 +255,77 @@ export class AutonomySupervisor {
       const initial = await this.evidence.collect(order, []);
       if (initial.headSha !== order.base_sha || initial.status.trim()) throw new Error('WORKTREE_BASE_OR_CLEANLINESS_MISMATCH');
       while (true) {
-        const provider = await this.agy.execute(order);
-        this.store.recordRun(row.id, 'antigravity', provider);
+        let provider: ProviderRun;
+        let executedBundle: import('./responsesCoderEndpoint').CoderEditBundle | undefined = undefined;
+        const db = this.store.getDatabase();
+        const authRow = db.prepare(
+          "SELECT * FROM execution_authorizations WHERE task_id = ? AND status IN ('AUTHORIZED','DISPATCHED') ORDER BY created_at DESC LIMIT 1"
+        ).get(order.task_id) as ExecutionAuthorization | undefined;
+
+        const selection = authRow ? this.resolveAuthorizedCoder(authRow) : resolveCoderProvider(authRow);
+        if (selection.provider === 'NONE') {
+          provider = {
+            status: 'AUTH_ERROR',
+            exitCode: 1,
+            executionId: '',
+            stdout: '',
+            stderr: selection.error,
+            durationMs: 0,
+          };
+        } else if (selection.provider === 'OMNIROUTE') {
+          const endpoint = this.getTargetCoderEndpoint(authRow?.selected_resource_id);
+          if (!endpoint) {
+            provider = {
+              status: 'AUTH_ERROR',
+              exitCode: 1,
+              executionId: '',
+              stdout: '',
+              stderr: 'OMNIROUTE_CODER_NOT_CONFIGURED: OmniRoute coder endpoint configuration missing',
+              durationMs: 0,
+            };
+          } else {
+            const executed = await this.coderTransport.executeWorkOrder(endpoint, order, authRow?.id ?? 'legacy-auth', order.repair_context);
+            this.store.recordRun(row.id, 'omniroute-coder', executed.run);
+            provider = executed.run;
+            executedBundle = executed.bundle;
+            if (executed.run.status === 'SUCCESSFUL_PROCESS_EXIT' && executed.bundle) {
+              try {
+                const preEvidence = await this.evidence.collect(order, []);
+                if (preEvidence.headSha !== executed.bundle.source_head.toLowerCase()) {
+                  throw new Error(`STALE_SOURCE_HEAD: Worktree HEAD changed in flight: expected ${executed.bundle.source_head}, observed ${preEvidence.headSha}`);
+                }
+                applyCoderEditBundle(order.worktree, executed.bundle, {
+                  taskId: order.task_id,
+                  authorizationId: authRow?.id ?? 'legacy-auth',
+                  sourceHead: preEvidence.headSha,
+                  allowedPaths: order.allowed_paths,
+                  forbiddenPaths: order.forbidden_paths,
+                });
+              } catch (applyErr) {
+                provider = {
+                  status: 'CONTRACT_INVALID',
+                  exitCode: 1,
+                  executionId: executed.run.executionId,
+                  stdout: executed.run.stdout,
+                  stderr: applyErr instanceof Error ? applyErr.message : String(applyErr),
+                  durationMs: executed.run.durationMs,
+                };
+              }
+            }
+          }
+        } else if (selection.provider === 'AGY') {
+          provider = await this.agy.execute(order);
+          this.store.recordRun(row.id, 'antigravity', provider);
+        } else {
+          provider = {
+            status: 'AUTH_ERROR',
+            exitCode: 1,
+            executionId: '',
+            stdout: '',
+            stderr: 'UNRECOGNIZED_CODER_PROVIDER',
+            durationMs: 0,
+          };
+        }
         if (provider.status !== 'SUCCESSFUL_PROCESS_EXIT') {
           const failedState: AutonomyState = provider.status === 'AUTH_ERROR' || provider.status === 'QUOTA_OR_RATE_LIMIT' ? 'BLOCKED' : 'FAILED';
           this.store.updateState(row.id, failedState, order.lease_epoch);
@@ -168,6 +368,19 @@ export class AutonomySupervisor {
         const verified = evidence.tests.length === order.required_tests.length && evidence.tests.length > 0 && evidence.tests.every((test) => test.exitCode === 0);
         const fresh = review.reviewed_head_sha === currentEvidence.headSha && evidence.snapshotSha !== undefined && evidence.snapshotSha === currentEvidence.snapshotSha;
         if (review.verdict === 'PASS' && fresh && verified) {
+          this.store.recordRepairOutcome(order.task_id, {
+            protocol_version: 'repairoutcome.v1',
+            task_id: order.task_id,
+            attempt: order.attempt,
+            status: 'CONVERGED',
+            resolved_finding_ids: order.repair_context?.previous_reviewer_findings.map((f) => f.finding_id) ?? [],
+            unresolved_finding_ids: [],
+            escalation_stage: getEscalationStage(order.attempt),
+            summary: `Repair converged successfully at attempt ${order.attempt}`,
+            head_sha: currentEvidence.headSha,
+            snapshot_sha: currentEvidence.snapshotSha ?? '0'.repeat(40),
+            created_at: new Date().toISOString(),
+          });
           this.store.event(row.id, 'LOCAL_ACCEPTED', { headSha: currentEvidence.headSha, snapshotSha: currentEvidence.snapshotSha });
           return { workOrder: order, state: 'MANAGER_REVIEW', accepted: true, provider, review, headSha: currentEvidence.headSha, repairLoops };
         }
@@ -175,15 +388,133 @@ export class AutonomySupervisor {
           this.store.updateState(row.id, 'BLOCKED', order.lease_epoch);
           return { workOrder: order, state: 'BLOCKED', provider, review, headSha: currentEvidence.headSha, repairLoops };
         }
+
+        const currentAttempt = order.attempt;
+        const nextAttempt = currentAttempt + 1;
         repairLoops += 1;
-        if (repairLoops > this.maxRepairLoops) {
+        if (repairLoops > this.maxRepairLoops || nextAttempt > this.maxRepairLoops) {
           this.store.updateState(row.id, 'BLOCKED', order.lease_epoch);
           return { workOrder: order, state: 'BLOCKED', provider, review, headSha: currentEvidence.headSha, repairLoops, error: 'MAX_REPAIR_LOOPS_EXCEEDED' };
         }
+
+        const fallbackPackage = buildRepairContextPackage({
+          taskId: order.task_id,
+          authorizationId: authRow?.id ?? 'legacy-auth',
+          ownershipEpoch: order.lease_epoch,
+          attempt: currentAttempt,
+          baseSha: order.base_sha,
+          currentHeadSha: currentEvidence.headSha,
+          currentSnapshotSha: currentEvidence.snapshotSha ?? '0'.repeat(40),
+          originalObjective: order.objective,
+          acceptanceCriteria: order.acceptance_criteria,
+          allowedPaths: order.allowed_paths,
+          forbiddenPaths: order.forbidden_paths,
+          requiredTests: order.required_tests,
+          reviewerFindings: review.findings,
+          requiredActions: review.required_actions,
+        });
+
+        const activeRepairContext = order.repair_context ?? fallbackPackage;
+
+        const reconciledClosure = reconcileFindingClosure({
+          repairContext: activeRepairContext,
+          coderBundle: executedBundle,
+          observedEvidence: evidence,
+          latestReview: review,
+        });
+
+        const noProgress = detectNoProgress({
+          repairContext: activeRepairContext,
+          currentEvidence: evidence,
+          coderBundle: executedBundle,
+          reconciledClosure,
+          latestReview: review,
+        });
+
+        if (noProgress.hasNoProgress) {
+          this.store.recordRepairNoProgress(order.task_id, noProgress);
+          this.store.recordRepairOutcome(order.task_id, {
+            protocol_version: 'repairoutcome.v1',
+            task_id: order.task_id,
+            attempt: currentAttempt,
+            status: 'NO_PROGRESS',
+            resolved_finding_ids: reconciledClosure.resolvedFindingIds,
+            unresolved_finding_ids: reconciledClosure.unresolvedFindingIds,
+            no_progress_category: noProgress.category,
+            escalation_stage: getEscalationStage(currentAttempt),
+            summary: `REPAIR_NO_PROGRESS: ${noProgress.category}: ${noProgress.reason}`,
+            head_sha: currentEvidence.headSha,
+            snapshot_sha: currentEvidence.snapshotSha ?? '0'.repeat(40),
+            created_at: new Date().toISOString(),
+          });
+        }
+
+        const nextRepairContext = buildRepairContextPackage({
+          taskId: order.task_id,
+          authorizationId: authRow?.id ?? 'legacy-auth',
+          ownershipEpoch: order.lease_epoch + 1,
+          attempt: nextAttempt,
+          baseSha: order.base_sha,
+          currentHeadSha: currentEvidence.headSha,
+          currentSnapshotSha: currentEvidence.snapshotSha ?? '0'.repeat(40),
+          originalObjective: order.objective,
+          acceptanceCriteria: order.acceptance_criteria,
+          allowedPaths: order.allowed_paths,
+          forbiddenPaths: order.forbidden_paths,
+          requiredTests: order.required_tests,
+          reviewerFindings: review.findings,
+          requiredActions: review.required_actions,
+          previousResolvedFindingIds: reconciledClosure.resolvedFindingIds,
+          previousCoderActions: [
+            ...(order.repair_context?.previous_coder_actions ?? []),
+            {
+              attempt: currentAttempt,
+              changed_files: executedBundle?.changed_files ?? evidence.changedFiles,
+              diff_summary: evidence.diff,
+              test_results: evidence.tests.map((t) => ({
+                command: t.command,
+                exitCode: t.exitCode,
+                passed: t.exitCode === 0,
+                durationMs: t.durationMs,
+              })),
+              addressed_finding_ids: executedBundle?.addressed_finding_ids ?? [],
+              unresolved_finding_ids: executedBundle?.unresolved_finding_ids ?? [],
+              implementation_summary: executedBundle?.implementation_summary,
+              known_risks: executedBundle?.known_risks ?? [],
+              snapshot_sha: evidence.snapshotSha,
+              head_sha: evidence.headSha,
+              patch_hash: computeNormalizedPatchHash(evidence.diff),
+            },
+          ],
+          knownFailedApproaches: [
+            ...(order.repair_context?.known_failed_approaches ?? []),
+            ...(!verified ? [{
+              attempt: currentAttempt,
+              description: `Verification tests failed in attempt ${currentAttempt}`,
+              test_failure_signatures: extractFailingTestSignatures(evidence.tests),
+            }] : []),
+            ...(noProgress.hasNoProgress ? [{
+              attempt: currentAttempt,
+              description: `No-progress detected (${noProgress.category}): ${noProgress.reason}`,
+              test_failure_signatures: [],
+              category: noProgress.category,
+            }] : []),
+          ],
+          selectedResourceId: authRow?.selected_resource_id ?? null,
+          selectedProviderId: authRow?.selected_provider_id ?? null,
+        });
+        this.store.recordRepairContext(order.task_id, nextRepairContext);
+
         this.store.event(row.id, 'REPAIR_REQUIRED', { review, verified, fresh });
         this.store.releaseSlot(slot.slotId, row.id, order.lease_epoch);
         this.store.updateState(row.id, 'FAILED', order.lease_epoch);
-        order = { ...order, attempt: order.attempt + 1, lease_epoch: order.lease_epoch + 1, constraints: [...order.constraints, `Repair findings: ${JSON.stringify(review.findings)}. Required actions: ${JSON.stringify(review.required_actions)}. Tests passed: ${verified}. Review fresh: ${fresh}.`] };
+        order = {
+          ...order,
+          attempt: nextAttempt,
+          lease_epoch: order.lease_epoch + 1,
+          repair_context: nextRepairContext,
+          constraints: [...order.constraints, `Repair findings: ${JSON.stringify(review.findings)}. Required actions: ${JSON.stringify(review.required_actions)}. Tests passed: ${verified}. Review fresh: ${fresh}.`],
+        };
         row = this.store.createWorkOrder(order);
         slot = this.store.acquireSlot(row.id, order.worker_id, order.lease_epoch);
         this.store.updateState(row.id, 'IMPLEMENTING', order.lease_epoch);
@@ -230,17 +561,45 @@ export class AutonomySupervisor {
     const order = this.createWorkOrder(spec);
     if (this.mode === 'SHADOW') return { workOrder: order, state: 'READY', repairLoops: 0 };
 
+    const validatedAttempt = (typeof spec.attempt === 'number' && spec.attempt > 0)
+      ? spec.attempt
+      : (order.attempt ?? 1);
+
     const db = this.store.getDatabase();
     const authRow = db.prepare(
-      "SELECT id FROM execution_authorizations WHERE task_id = ? AND status IN ('AUTHORIZED','DISPATCHED') ORDER BY created_at DESC LIMIT 1"
-    ).get(spec.taskId) as { id: string } | undefined;
+      "SELECT * FROM execution_authorizations WHERE task_id = ? AND status IN ('AUTHORIZED','DISPATCHED') ORDER BY created_at DESC LIMIT 1"
+    ).get(spec.taskId) as ExecutionAuthorization | undefined;
 
     if (!authRow) {
       return {
         workOrder: order,
         state: 'BLOCKED',
         repairLoops: 0,
-        error: 'PRODUCT_TASK_REQUIRES_EXECUTION_AUTHORIZATION: product tasks must have durable ExecutionAuthorization and cannot execute through legacy autonomy state',
+        error: 'AUTHORIZATION_MISSING: PRODUCT_TASK_REQUIRES_EXECUTION_AUTHORIZATION: product tasks must have durable ExecutionAuthorization and cannot execute through legacy autonomy state',
+      };
+    }
+
+    if (validatedAttempt >= 3) {
+      const repairResourceId = this.repairCoderEndpoint?.resource_id ?? 'repair-coder-omniroute';
+      const isRepairSpecialist = authRow.selected_resource_id === repairResourceId;
+      const isAgyFallback = authRow.selected_resource_id === this.agyResourceId;
+      if (!isRepairSpecialist && !isAgyFallback) {
+        return {
+          workOrder: order,
+          state: 'BLOCKED',
+          repairLoops: validatedAttempt - 1,
+          error: `ATTEMPT_3_REQUIRES_REPAIR_SPECIALIST_OR_AGY_FALLBACK: Attempt ${validatedAttempt} requires fresh explicit authorization for either the configured repair specialist (${repairResourceId}) or AGY fallback (${this.agyResourceId}); observed "${authRow.selected_resource_id}".`,
+        };
+      }
+    }
+
+    const selection = this.resolveAuthorizedCoder(authRow);
+    if (selection.provider === 'NONE') {
+      return {
+        workOrder: order,
+        state: 'BLOCKED',
+        repairLoops: 0,
+        error: selection.error,
       };
     }
 
@@ -254,12 +613,85 @@ export class AutonomySupervisor {
       forbiddenPaths: spec.forbiddenPaths,
       dependencies: spec.dependencies,
       runCoder: async (wo) => {
-        const provider = await this.agy.execute(wo);
-        if (provider.status !== 'SUCCESSFUL_PROCESS_EXIT') {
-          return { success: false, currentHeadSha: spec.baseSha, error: provider.error ?? provider.stderr };
+        const selection = this.resolveAuthorizedCoder(authRow);
+        if (selection.provider === 'NONE') {
+          return {
+            success: false,
+            currentHeadSha: spec.baseSha,
+            error: selection.error,
+          };
         }
-        const ev = await this.evidence.collect(wo, []);
-        return { success: true, currentHeadSha: ev.headSha };
+
+        if (selection.provider === 'OMNIROUTE') {
+          const endpoint = this.getTargetCoderEndpoint(authRow.selected_resource_id);
+          if (!endpoint) {
+            return {
+              success: false,
+              currentHeadSha: spec.baseSha,
+              error: 'OMNIROUTE_CODER_NOT_CONFIGURED: OmniRoute coder endpoint configuration missing',
+            };
+          }
+          const executed = await this.coderTransport.executeWorkOrder(endpoint, wo, authRow.id, wo.repair_context);
+          // Product tasks do not own a legacy autonomy_work_orders row, so a
+          // legacy autonomy_runs foreign-key write would fail here. Preserve
+          // secret-safe provider evidence as an audit event instead.
+          this.store.event(authRow.task_id, 'PRODUCT_CODER_PROVIDER_RUN', {
+            provider: 'omniroute-coder',
+            selectedProviderId: authRow.selected_provider_id,
+            selectedResourceId: authRow.selected_resource_id,
+            status: executed.run.status,
+            exitCode: executed.run.exitCode,
+            executionId: executed.run.executionId,
+            durationMs: executed.run.durationMs,
+          });
+          if (executed.run.status !== 'SUCCESSFUL_PROCESS_EXIT' || !executed.bundle) {
+            return {
+              success: false,
+              currentHeadSha: spec.baseSha,
+              error: executed.run.error ?? executed.run.stderr ?? 'OMNIROUTE_CODER_FAILED',
+            };
+          }
+          try {
+            const preEvidence = await this.evidence.collect(wo, []);
+            if (preEvidence.headSha !== executed.bundle.source_head.toLowerCase()) {
+              return {
+                success: false,
+                currentHeadSha: preEvidence.headSha,
+                error: `STALE_SOURCE_HEAD: Worktree HEAD changed in flight: expected ${executed.bundle.source_head}, observed ${preEvidence.headSha}`,
+              };
+            }
+            applyCoderEditBundle(wo.worktree, executed.bundle, {
+              taskId: wo.task_id,
+              authorizationId: authRow.id,
+              sourceHead: preEvidence.headSha,
+              allowedPaths: wo.allowed_paths,
+              forbiddenPaths: wo.forbidden_paths,
+            });
+          } catch (applyErr) {
+            return {
+              success: false,
+              currentHeadSha: spec.baseSha,
+              error: applyErr instanceof Error ? applyErr.message : String(applyErr),
+            };
+          }
+          const ev = await this.evidence.collect(wo, []);
+          return { success: true, currentHeadSha: ev.headSha, bundle: executed.bundle };
+        }
+
+        if (selection.provider === 'AGY') {
+          const provider = await this.agy.execute(wo);
+          if (provider.status !== 'SUCCESSFUL_PROCESS_EXIT') {
+            return { success: false, currentHeadSha: spec.baseSha, error: provider.error ?? provider.stderr };
+          }
+          const ev = await this.evidence.collect(wo, []);
+          return { success: true, currentHeadSha: ev.headSha };
+        }
+
+        return {
+          success: false,
+          currentHeadSha: spec.baseSha,
+          error: 'UNRECOGNIZED_CODER_PROVIDER',
+        };
       },
       runVerification: async (authority, wo) => {
         const targetOrder = wo ?? order;
@@ -592,6 +1024,7 @@ export class SupervisorContinuousQueue {
         constraints: [...canonicalPayload.constraints, ...canonicalPayload.instructions],
         attempt: attempt?.attempt_number ?? validatedTask.revision_count + 1,
         leaseEpoch: validatedTask.ownership_epoch ?? 1,
+        repairContext: this.supervisor.store.getLatestRepairContext(validatedTask.id) ?? undefined,
       };
 
       const runResult = await this.supervisor.runProductTask(spec);

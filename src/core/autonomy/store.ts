@@ -5,6 +5,16 @@ import Database from 'better-sqlite3';
 import { DatabaseEngine } from '../database/db';
 import { MigrationRunner } from '../database/migrations';
 import { AutonomyState, ManagerReview, WorkOrder, SelfHostTask } from './contracts';
+import type {
+  RepairContextPackage,
+  RepairOutcome,
+  NoProgressEvaluation,
+  RepairLineage,
+} from './repairContext';
+import {
+  canonicalSerializeRepairContext,
+  parseRepairContextPackage,
+} from './repairContext';
 
 export interface AutonomyWorkOrderRow {
   id: string;
@@ -58,6 +68,57 @@ export type ManagerResourceState =
   | 'CONTRACT_INVALID';
 export interface ManagerResourceHealth { resource_id: string; state: ManagerResourceState; cooldown_until: string | null; last_error: string | null; updated_at: string; }
 
+export type CiIdentityType = 'PR_HEAD_CI' | 'MAIN_POST_MERGE_CI';
+
+export type MergeIdentityType = 'SQUASH' | 'LINEAR_HISTORY' | 'NONE';
+
+export type CiReconciliationClassification =
+  | 'PR_HEAD_SUCCESS'
+  | 'DIFFERENT_MERGE_SHA_PUSH_SUCCESS'
+  | 'LINEAR_HISTORY_MERGE_PUSH_SUCCESS'
+  | 'MISSING_POST_MERGE_CI'
+  | 'STALE_PR_HEAD_CI'
+  | 'SUPERSEDED_HEAD'
+  | 'PR_HEAD_FAILURE'
+  | 'POST_MERGE_PUSH_FAILURE'
+  | 'POST_MERGE_PUSH_PENDING';
+
+export interface AutonomyCiReconciliation {
+  id: string;
+  repository: string;
+  pr_number: number;
+  pr_head_sha: string;
+  merged_main_sha: string | null;
+  pr_head_ci_identity: string;
+  pr_head_event: 'pull_request';
+  pr_head_conclusion: string | null;
+  main_post_merge_ci_identity: string | null;
+  main_post_merge_event: 'push';
+  main_post_merge_conclusion: string | null;
+  reconciliation_classification: CiReconciliationClassification;
+  merge_identity_type: MergeIdentityType;
+  details_json: string;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface RecordCiReconciliationInput {
+  id?: string;
+  repository: string;
+  prNumber: number;
+  prHeadSha: string;
+  mergedMainSha?: string | null;
+  prHeadCiIdentity?: string;
+  prHeadEvent?: 'pull_request';
+  prHeadConclusion?: string | null;
+  mainPostMergeCiIdentity?: string | null;
+  mainPostMergeEvent?: 'push';
+  mainPostMergeConclusion?: string | null;
+  reconciliationClassification: CiReconciliationClassification;
+  mergeIdentityType?: MergeIdentityType;
+  details?: Record<string, unknown> | string;
+}
+
 /**
  * Autonomy state is an extension owned by the supervisor. The product migration
  * ledger is intentionally immutable at v24; this initializer is idempotent and
@@ -108,6 +169,29 @@ export const AUTONOMY_SCHEMA_SQL = `
     UNIQUE(repository, pr_number)
   );
   CREATE INDEX IF NOT EXISTS idx_autonomy_ci_watches_due ON autonomy_ci_watches(state, next_poll_at);
+  CREATE TABLE IF NOT EXISTS autonomy_ci_reconciliations (
+    id TEXT PRIMARY KEY,
+    repository TEXT NOT NULL,
+    pr_number INTEGER NOT NULL,
+    pr_head_sha TEXT NOT NULL,
+    merged_main_sha TEXT,
+    pr_head_ci_identity TEXT NOT NULL,
+    pr_head_event TEXT NOT NULL DEFAULT 'pull_request',
+    pr_head_conclusion TEXT,
+    main_post_merge_ci_identity TEXT,
+    main_post_merge_event TEXT NOT NULL DEFAULT 'push',
+    main_post_merge_conclusion TEXT,
+    reconciliation_classification TEXT NOT NULL,
+    merge_identity_type TEXT NOT NULL DEFAULT 'NONE',
+    details_json TEXT NOT NULL DEFAULT '{}',
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    UNIQUE(repository, pr_number, pr_head_sha)
+  );
+  CREATE INDEX IF NOT EXISTS idx_autonomy_ci_recon_repo_pr ON autonomy_ci_reconciliations(repository, pr_number);
+  CREATE INDEX IF NOT EXISTS idx_autonomy_ci_recon_pr_head ON autonomy_ci_reconciliations(pr_head_sha);
+  CREATE INDEX IF NOT EXISTS idx_autonomy_ci_recon_main ON autonomy_ci_reconciliations(merged_main_sha);
+  CREATE INDEX IF NOT EXISTS idx_autonomy_ci_recon_classification ON autonomy_ci_reconciliations(reconciliation_classification);
   CREATE TABLE IF NOT EXISTS autonomy_manager_resources (
     resource_id TEXT PRIMARY KEY, state TEXT NOT NULL, cooldown_until TEXT, last_error TEXT, updated_at TEXT NOT NULL
   );
@@ -341,6 +425,94 @@ export class AutonomyStore {
     if (result.changes !== 1) throw new Error('CI_WATCH_NOT_FOUND');
   }
 
+  recordCiReconciliation(input: RecordCiReconciliationInput): AutonomyCiReconciliation {
+    const id = input.id ?? crypto.randomUUID();
+    const now = new Date().toISOString();
+    const prHeadSha = input.prHeadSha.toLowerCase();
+    const mergedMainSha = input.mergedMainSha ? input.mergedMainSha.toLowerCase() : null;
+    const prHeadEvent = input.prHeadEvent ?? 'pull_request';
+    const mainPostMergeEvent = input.mainPostMergeEvent ?? 'push';
+    const prHeadIdentity = input.prHeadCiIdentity ?? `PR_HEAD_CI:${input.repository}#${input.prNumber}@${prHeadSha}`;
+    const mainPostMergeIdentity = input.mainPostMergeCiIdentity ?? (mergedMainSha ? `MAIN_POST_MERGE_CI:${input.repository}@${mergedMainSha}` : null);
+
+    let mergeType: MergeIdentityType = input.mergeIdentityType ?? 'NONE';
+    if (!input.mergeIdentityType && mergedMainSha) {
+      mergeType = prHeadSha === mergedMainSha ? 'LINEAR_HISTORY' : 'SQUASH';
+    }
+
+    const detailsJson = typeof input.details === 'string'
+      ? input.details
+      : JSON.stringify(input.details ?? {});
+
+    return this.db.transaction(() => {
+      this.db.prepare(`
+        INSERT INTO autonomy_ci_reconciliations (
+          id, repository, pr_number, pr_head_sha, merged_main_sha,
+          pr_head_ci_identity, pr_head_event, pr_head_conclusion,
+          main_post_merge_ci_identity, main_post_merge_event, main_post_merge_conclusion,
+          reconciliation_classification, merge_identity_type, details_json, created_at, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(repository, pr_number, pr_head_sha) DO UPDATE SET
+          merged_main_sha = excluded.merged_main_sha,
+          pr_head_ci_identity = excluded.pr_head_ci_identity,
+          pr_head_event = excluded.pr_head_event,
+          pr_head_conclusion = excluded.pr_head_conclusion,
+          main_post_merge_ci_identity = excluded.main_post_merge_ci_identity,
+          main_post_merge_event = excluded.main_post_merge_event,
+          main_post_merge_conclusion = excluded.main_post_merge_conclusion,
+          reconciliation_classification = excluded.reconciliation_classification,
+          merge_identity_type = excluded.merge_identity_type,
+          details_json = excluded.details_json,
+          updated_at = excluded.updated_at
+      `).run(
+        id, input.repository, input.prNumber, prHeadSha, mergedMainSha,
+        prHeadIdentity, prHeadEvent, input.prHeadConclusion ?? null,
+        mainPostMergeIdentity, mainPostMergeEvent, input.mainPostMergeConclusion ?? null,
+        input.reconciliationClassification, mergeType, detailsJson, now, now
+      );
+
+      const row = this.db.prepare(
+        'SELECT * FROM autonomy_ci_reconciliations WHERE repository = ? AND pr_number = ? AND pr_head_sha = ?'
+      ).get(input.repository, input.prNumber, prHeadSha) as AutonomyCiReconciliation;
+
+      this.event(`${input.repository}#${input.prNumber}`, 'CI_RECONCILIATION_RECORDED', row);
+      return row;
+    })();
+  }
+
+  getCiReconciliation(id: string): AutonomyCiReconciliation | null {
+    return (this.db.prepare('SELECT * FROM autonomy_ci_reconciliations WHERE id = ?').get(id) as AutonomyCiReconciliation | undefined) ?? null;
+  }
+
+  getCiReconciliationByPr(repository: string, prNumber: number): AutonomyCiReconciliation | null {
+    return (this.db.prepare('SELECT * FROM autonomy_ci_reconciliations WHERE repository = ? AND pr_number = ? ORDER BY updated_at DESC, created_at DESC LIMIT 1').get(repository, prNumber) as AutonomyCiReconciliation | undefined) ?? null;
+  }
+
+  getCiReconciliationByPrAndHead(repository: string, prNumber: number, prHeadSha: string): AutonomyCiReconciliation | null {
+    return (this.db.prepare('SELECT * FROM autonomy_ci_reconciliations WHERE repository = ? AND pr_number = ? AND lower(pr_head_sha) = lower(?)').get(repository, prNumber, prHeadSha) as AutonomyCiReconciliation | undefined) ?? null;
+  }
+
+  findCiReconciliationsByHeadSha(headSha: string): AutonomyCiReconciliation[] {
+    return this.db.prepare('SELECT * FROM autonomy_ci_reconciliations WHERE lower(pr_head_sha) = lower(?) ORDER BY updated_at DESC, created_at DESC').all(headSha) as AutonomyCiReconciliation[];
+  }
+
+  findCiReconciliationsByMainSha(mainSha: string): AutonomyCiReconciliation[] {
+    return this.db.prepare('SELECT * FROM autonomy_ci_reconciliations WHERE lower(merged_main_sha) = lower(?) ORDER BY updated_at DESC, created_at DESC').all(mainSha) as AutonomyCiReconciliation[];
+  }
+
+  listCiReconciliations(filter?: { repository?: string; classification?: CiReconciliationClassification }): AutonomyCiReconciliation[] {
+    if (filter?.repository && filter?.classification) {
+      return this.db.prepare('SELECT * FROM autonomy_ci_reconciliations WHERE repository = ? AND reconciliation_classification = ? ORDER BY updated_at DESC, created_at DESC').all(filter.repository, filter.classification) as AutonomyCiReconciliation[];
+    }
+    if (filter?.repository) {
+      return this.db.prepare('SELECT * FROM autonomy_ci_reconciliations WHERE repository = ? ORDER BY updated_at DESC, created_at DESC').all(filter.repository) as AutonomyCiReconciliation[];
+    }
+    if (filter?.classification) {
+      return this.db.prepare('SELECT * FROM autonomy_ci_reconciliations WHERE reconciliation_classification = ? ORDER BY updated_at DESC, created_at DESC').all(filter.classification) as AutonomyCiReconciliation[];
+    }
+    return this.db.prepare('SELECT * FROM autonomy_ci_reconciliations ORDER BY updated_at DESC, created_at DESC').all() as AutonomyCiReconciliation[];
+  }
+
   findLatestWorkOrderByTask(taskId: string): AutonomyWorkOrderRow | null {
     return (this.db.prepare('SELECT * FROM autonomy_work_orders WHERE task_id=? ORDER BY attempt DESC LIMIT 1').get(taskId) as AutonomyWorkOrderRow | undefined) ?? null;
   }
@@ -382,6 +554,78 @@ export class AutonomyStore {
   event(workOrderId: string, eventType: string, payload: unknown): void {
     this.db.prepare('INSERT INTO autonomy_events (id,work_order_id,event_type,payload_json,created_at) VALUES (?,?,?,?,?)')
       .run(crypto.randomUUID(), workOrderId, eventType, JSON.stringify(payload), new Date().toISOString());
+  }
+
+  recordRepairContext(pkg: RepairContextPackage): void;
+  recordRepairContext(taskId: string, pkg: RepairContextPackage): void;
+  recordRepairContext(first: string | RepairContextPackage, second?: RepairContextPackage): void {
+    const pkg = typeof first === 'string' ? second! : first;
+    const taskId = typeof first === 'string' ? first : first.task_id;
+    this.event(taskId, 'REPAIR_CONTEXT_RECORDED', JSON.parse(canonicalSerializeRepairContext(pkg)));
+  }
+
+  getLatestRepairContext(taskId: string): RepairContextPackage | null {
+    const row = this.db.prepare(
+      "SELECT payload_json FROM autonomy_events WHERE work_order_id = ? AND event_type = 'REPAIR_CONTEXT_RECORDED' ORDER BY created_at DESC LIMIT 1"
+    ).get(taskId) as { payload_json: string } | undefined;
+    if (!row) return null;
+    return parseRepairContextPackage(row.payload_json);
+  }
+
+  listRepairContexts(taskId: string): RepairContextPackage[] {
+    const rows = this.db.prepare(
+      "SELECT payload_json FROM autonomy_events WHERE work_order_id = ? AND event_type = 'REPAIR_CONTEXT_RECORDED' ORDER BY created_at ASC"
+    ).all(taskId) as Array<{ payload_json: string }>;
+    return rows.map((r) => parseRepairContextPackage(r.payload_json));
+  }
+
+  recordRepairOutcome(outcome: RepairOutcome): void;
+  recordRepairOutcome(taskId: string, outcome: RepairOutcome): void;
+  recordRepairOutcome(first: string | RepairOutcome, second?: RepairOutcome): void {
+    const outcome = typeof first === 'string' ? second! : first;
+    const taskId = typeof first === 'string' ? first : first.task_id;
+    this.event(taskId, 'REPAIR_OUTCOME_RECORDED', outcome);
+  }
+
+  recordRepairNoProgress(taskId: string, evaluation: NoProgressEvaluation): void {
+    this.event(taskId, 'REPAIR_NO_PROGRESS', evaluation);
+  }
+
+  rebuildRepairLineage(taskId: string): RepairLineage {
+    const packages = this.listRepairContexts(taskId);
+    const outcomeRows = this.db.prepare(
+      "SELECT payload_json FROM autonomy_events WHERE work_order_id = ? AND event_type = 'REPAIR_OUTCOME_RECORDED' ORDER BY created_at ASC"
+    ).all(taskId) as Array<{ payload_json: string }>;
+    const outcomes: RepairOutcome[] = outcomeRows.map((r) => JSON.parse(r.payload_json));
+
+    const latestPkg = packages.at(-1);
+
+    const findings = latestPkg?.previous_reviewer_findings ?? [];
+    const resolvedFindingIds = latestPkg?.resolved_finding_ids ?? [];
+    const unresolvedFindingIds = latestPkg?.unresolved_finding_ids ?? [];
+    const previousCoderActions = latestPkg?.previous_coder_actions ?? [];
+    const knownFailedApproaches = latestPkg?.known_failed_approaches ?? [];
+    const nonRegressionConstraints = latestPkg?.non_regression_constraints ?? [];
+
+    return {
+      taskId,
+      authorizationId: latestPkg?.authorization_id ?? '',
+      ownershipEpoch: latestPkg?.ownership_epoch ?? 1,
+      latestAttempt: latestPkg?.attempt ?? (packages.length > 0 ? packages.length : 1),
+      baseSha: latestPkg?.base_sha ?? '',
+      currentHeadSha: latestPkg?.current_head_sha ?? '',
+      currentSnapshotSha: latestPkg?.current_snapshot_sha ?? '',
+      findings,
+      resolvedFindingIds,
+      unresolvedFindingIds,
+      previousCoderActions,
+      knownFailedApproaches,
+      nonRegressionConstraints,
+      selectedResourceId: latestPkg?.selected_resource_id ?? null,
+      selectedProviderId: latestPkg?.selected_provider_id ?? null,
+      packages,
+      outcomes,
+    };
   }
 
   isProductTask(taskId: string): boolean {
@@ -455,6 +699,14 @@ export class AutonomyStore {
         retainedStatus: 'RETAINED_ACTIVE_WATCHES',
         isAuthoritative: false,
         notes: 'Active CI watches retained and continuously monitored',
+      },
+      {
+        tableName: 'autonomy_ci_reconciliations',
+        totalRows: countTable('autonomy_ci_reconciliations'),
+        activeRows: countTable('autonomy_ci_reconciliations'),
+        retainedStatus: 'RETAINED_ACTIVE_WATCHES',
+        isAuthoritative: false,
+        notes: 'Durable CI identity reconciliations relating PR head and post-merge main CI',
       },
       {
         tableName: 'autonomy_claims',

@@ -12,6 +12,7 @@ import { assertPathContained } from '../core/services/ArtifactStore';
 import crypto from 'crypto';
 import { GithubCiObserver } from '../core/autonomy/github';
 import { loadOmniRouteEndpointFromEnvironment, ResponsesManagerEndpointTransport } from '../core/autonomy/responsesEndpoint';
+import { ResponsesCoderEndpointTransport } from '../core/autonomy/responsesCoderEndpoint';
 
 const controlRepo = process.env.AGENT_FORGE_CONTROL_REPO ?? process.cwd();
 const worktreeRoot = process.env.AGENT_FORGE_WORKTREE_ROOT ?? path.resolve(controlRepo, '..', 'AI', 'Agent-Forge-Worktrees');
@@ -96,6 +97,20 @@ async function doctorOmniRoute(): Promise<number> {
   return managerContract.compatible && reviewerContract.compatible ? 0 : 1;
 }
 
+export async function doctorOmniRouteCoder(): Promise<number> {
+  const coder = loadOmniRouteEndpointFromEnvironment('CODER');
+  if (!coder) {
+    check('OmniRoute coder configuration', false, 'Set AGENT_FORGE_OMNIROUTE_ENABLED=1, base URL, auth env reference, and AGENT_FORGE_CODER_MODEL');
+    return 1;
+  }
+  check('OmniRoute coder configuration', true, 'external route and auth reference loaded');
+  check('OmniRoute coder model', true, coder.model_or_route);
+  const transport = new ResponsesCoderEndpointTransport();
+  const coderContract = await transport.contract(coder);
+  check('OmniRoute coder Responses contract', coderContract.compatible, coderContract.run.status);
+  return coderContract.compatible ? 0 : 1;
+}
+
 export async function main(argv: string[] = process.argv): Promise<number> {
   const rawMaxWorkers = process.env.MAX_AGY_WORKERS !== undefined ? Number(process.env.MAX_AGY_WORKERS) : 1;
   if (!Number.isInteger(rawMaxWorkers) || rawMaxWorkers < 1 || rawMaxWorkers > 2) {
@@ -105,6 +120,7 @@ export async function main(argv: string[] = process.argv): Promise<number> {
   const command = argv[2] ?? 'status';
   if (command === 'doctor') return doctor();
   if (command === 'doctor-omniroute') return doctorOmniRoute();
+  if (command === 'doctor-coder' || command === 'doctor-omniroute-coder') return doctorOmniRouteCoder();
   const effectiveControlRepo = process.env.AGENT_FORGE_CONTROL_REPO ?? controlRepo;
   const effectiveWorktreeRoot = process.env.AGENT_FORGE_WORKTREE_ROOT ?? path.resolve(effectiveControlRepo, '..', 'AI', 'Agent-Forge-Worktrees');
   const effectiveRuntimeRoot = process.env.AGENT_FORGE_RUNTIME_ROOT ?? path.resolve(effectiveControlRepo, '..', 'AI', 'Agent-Forge-Runtime');
