@@ -35,7 +35,7 @@ import {
   CanonicalExecutionPayload,
   computePayloadHash,
 } from '../src/core/services/ExecutionAuthorizationService';
-import { renderCommand } from '../src/core/autonomy/productTaskAdapter';
+import { isPathContainedInBoundary, renderCommand } from '../src/core/autonomy/productTaskAdapter';
 
 let shaA = 'a'.repeat(40);
 const shaB = 'b'.repeat(40);
@@ -216,6 +216,14 @@ describe('OmniRoute Coder Transport & Structured Edits', () => {
   });
 
   describe('2. Traversal and unauthorized path rejection', () => {
+    it('normalizes path boundaries and never treats traversal aliases as contained', () => {
+      expect(isPathContainedInBoundary('src/lib/file.ts', 'src')).toBe(true);
+      expect(isPathContainedInBoundary('src/../outside.ts', 'src')).toBe(false);
+      expect(isPathContainedInBoundary('../src/file.ts', 'src')).toBe(false);
+      expect(isPathContainedInBoundary('src-file.ts', 'src')).toBe(false);
+      expect(isPathContainedInBoundary('SRC/file.ts', 'src')).toBe(process.platform === 'win32');
+    });
+
     it('rejects relative path traversal escaping worktree', () => {
       const bundle: CoderEditBundle = {
         protocol_version: 'coderbundle.v1',
@@ -728,6 +736,33 @@ describe('OmniRoute Coder Transport & Structured Edits', () => {
       );
       expect(selection.provider).toBe('NONE');
       expect(selection.error).toContain('AUTHORIZED_CODER_UNAVAILABLE');
+    });
+
+    it('fails closed for malformed account cooldown state', () => {
+      const selection = resolveCoderProvider(
+        {
+          selected_provider_id: 'provider-omniroute',
+          selected_resource_id: 'coder-omniroute',
+        } as ExecutionAuthorization,
+        { ...coderBinding('provider-omniroute', 'coder-omniroute', 'API'), accountCooldownUntil: 'not-a-timestamp' },
+        coderEndpointConfig(),
+      );
+      expect(selection.provider).toBe('NONE');
+      expect(selection.error).toContain('AUTHORIZED_CODER_UNAVAILABLE');
+    });
+
+    it('requires a CODER external-router endpoint before selecting OmniRoute', () => {
+      const auth = {
+        selected_provider_id: 'provider-omniroute',
+        selected_resource_id: 'coder-omniroute',
+      } as ExecutionAuthorization;
+      const endpoint = { ...coderEndpointConfig(), role: 'MANAGER' as const };
+      expect(isOmniRouteAuthorization(auth, coderBinding('provider-omniroute', 'coder-omniroute', 'API'), endpoint)).toBe(false);
+      expect(resolveCoderProvider(
+        auth,
+        coderBinding('provider-omniroute', 'coder-omniroute', 'API'),
+        endpoint,
+      ).provider).toBe('NONE');
     });
 
     it('rejects an account mismatch before either coder can be selected', () => {

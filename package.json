@@ -26,6 +26,7 @@
     "mcp:reviewer-admin": "node dist-electron/mcp/reviewerAdmin.js",
     "autonomy:doctor": "node dist-electron/electron/autonomyCli.js doctor",
     "autonomy:doctor:omniroute": "node dist-electron/electron/autonomyCli.js doctor-omniroute",
+    "autonomy:doctor:omniroute-coder": "node dist-electron/electron/autonomyCli.js doctor-omniroute-coder",
     "autonomy:shadow": "node dist-electron/electron/autonomyCli.js shadow",
     "autonomy:pilot": "node dist-electron/electron/autonomyCli.js pilot",
     "autonomy:start": "node dist-electron/electron/autonomyCli.js start",

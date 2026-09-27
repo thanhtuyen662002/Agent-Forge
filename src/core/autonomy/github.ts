@@ -92,7 +92,7 @@ export function effectiveChecks(checks: GithubCheck[] | undefined): GithubCheck[
   });
 }
 
-function classifyChecks(checks: GithubCheck[] | undefined): CiConclusion {
+export function classifyChecks(checks: GithubCheck[] | undefined): CiConclusion {
   const currentChecks = effectiveChecks(checks);
   if (!currentChecks.length) return 'PENDING';
   if (currentChecks.some((check) => check.status !== 'COMPLETED' && check.conclusion !== 'SUCCESS')) return 'PENDING';

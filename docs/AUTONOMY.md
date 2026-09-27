@@ -1,8 +1,12 @@
 # Local self-host bootstrap
 
 The bootstrap is a bounded PILOT inside Agent Forge, in `src/core/autonomy`.
-It runs one file-editing Antigravity worker and a read-only manager provider pool.
-It does not merge, replace the running supervisor, or automatically resume R5L1.
+It runs one or two explicitly configured file-editing workers and a manager/reviewer
+provider pool. Product-task authorization, routed OmniRoute coder execution,
+durable repair convergence, and supervised GitHub CI observation are implemented
+behind the same exact-head and lease fences. It does not merge or replace the
+running supervisor, and complete orphan/process reconciliation remains bounded
+follow-up work.
 
 ## Implemented loop
 
@@ -24,8 +28,10 @@ It does not merge, replace the running supervisor, or automatically resume R5L1.
    and working-tree snapshot after manager review and fences PASS against the
    exact evidence package (WORKING_TREE_SNAPSHOT_FENCING_VIOLATION,
    CODER_HEAD_MISMATCH). Record LOCAL_ACCEPTED; this is not a PR or merge.
-9. REPAIR persists findings in a new attempt/epoch in the same worktree.
-   Stop after three repair loops. BLOCKED affects only that task.
+9. REPAIR persists findings in a new attempt/epoch in the same worktree, carries
+   a binding to authorization, ownership epoch, base/current HEAD, and selected
+   provider/resource, and records no-progress/escalation evidence. Stop after
+   three repair loops. BLOCKED affects only that task.
 
 WorkerResult is informational. A zero process exit is insufficient; headless
 permission denial is a contract failure. No permission-bypass flags are used.
@@ -238,11 +244,14 @@ bounded observation between durable task dispatches; it does not busy-poll.
 
 ## Next work through the self-host supervisor
 
-Integrate existing product task/authorization/lease services, manager-selected
-dependencies, cooldowns, process recovery proofs, provider failover, and
-supervised self-update. Multi-worker scheduling is graduated to an explicitly configured two-worker maximum (`MAX_AGY_WORKERS=1` or `2`),
-denying a third active worker while automatic integration remains disabled. Keep the running version fixed and implement self-development
-in worktrees before reviewing and updating it.
+Complete orphan/process reconciliation, provider-failover edge proofs, and
+supervised self-update while preserving the product task/authorization/lease
+authorities already used by the consolidated path. Multi-worker scheduling is
+graduated to an explicitly configured two-worker maximum (`MAX_AGY_WORKERS=1`
+or `2`), denying a third active worker. Automatic merge/integration remains
+disabled; repository protections and the exact observed head stay the final
+authority. Keep the running version fixed and implement self-development in
+worktrees before reviewing and updating it.
 
 The all-target fast-pr.yml supplements main-target CI. Windows/Ubuntu checks,
 Windows packaging, installed-app verification, and RC verification remain.

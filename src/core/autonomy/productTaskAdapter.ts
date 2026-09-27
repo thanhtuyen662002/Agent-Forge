@@ -149,10 +149,17 @@ export function renderCommand(command: { executable: string; args: string[] }): 
 }
 
 export function isPathContainedInBoundary(filePath: string, boundaryPath: string): boolean {
-  const normFile = filePath.replace(/\\/g, '/').replace(/^\.\//, '');
-  const normBoundary = boundaryPath.replace(/\\/g, '/').replace(/^\.\//, '').replace(/\/+$/, '');
+  const normalize = (value: string): string => {
+    const normalized = path.posix.normalize(value.replace(/\\/g, '/'));
+    return normalized.replace(/\/+$/, '');
+  };
+  const normFile = normalize(filePath);
+  const normBoundary = normalize(boundaryPath);
   if (normBoundary === '' || normBoundary === '.') return true;
-  return normFile === normBoundary || normFile.startsWith(`${normBoundary}/`);
+  if (normFile === '..' || normFile.startsWith('../') || normBoundary === '..' || normBoundary.startsWith('../')) return false;
+  const fileKey = process.platform === 'win32' ? normFile.toLowerCase() : normFile;
+  const boundaryKey = process.platform === 'win32' ? normBoundary.toLowerCase() : normBoundary;
+  return fileKey === boundaryKey || fileKey.startsWith(`${boundaryKey}/`);
 }
 
 export function validateChangedFilesBoundaries(
@@ -353,7 +360,17 @@ export class ProductTaskAutonomyAdapter {
       .map(renderCommand);
     if (!requiredTests.length) throw new Error('DETERMINISTIC_TESTS_REQUIRED');
     const attempt = assignment.attempt_id ? this.repo.getTaskAttempt(assignment.attempt_id) : null;
-    const repairContext = this.options.autonomyStore?.getLatestRepairContext(task.id) ?? undefined;
+    // Repair context is executable input. Reuse it only when every durable
+    // identity still belongs to this exact authorization attempt; selecting by
+    // task alone could replay stale findings, snapshots, or provider routing.
+    const repairContext = this.options.autonomyStore?.getLatestRepairContext(task.id, {
+      authorizationId: authorization.id,
+      ownershipEpoch: authorization.task_ownership_epoch ?? task.ownership_epoch ?? 1,
+      baseSha: authorization.base_sha,
+      currentHeadSha: authorization.repository_head_sha,
+      selectedProviderId: authorization.selected_provider_id,
+      selectedResourceId: authorization.selected_resource_id,
+    }) ?? undefined;
 
     const spec: AutonomousTaskSpec = {
       taskId: task.id,

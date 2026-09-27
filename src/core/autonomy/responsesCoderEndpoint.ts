@@ -446,7 +446,13 @@ function bindingIsAvailable(binding: CoderResourceBinding): boolean {
   if (!['AVAILABLE', 'LOW_QUOTA'].includes(binding.resourceHealth)) return false;
   if (binding.accountEnabled === false) return false;
   if (binding.accountHealth && !['AVAILABLE', 'LOW_QUOTA'].includes(binding.accountHealth)) return false;
-  if (binding.accountCooldownUntil && Date.parse(binding.accountCooldownUntil) > Date.now()) return false;
+  if (binding.accountCooldownUntil) {
+    const cooldownUntil = Date.parse(binding.accountCooldownUntil);
+    // A malformed cooldown is an unavailable account state. Treating an
+    // invalid timestamp as expired would silently route work around the
+    // durable capacity decision that produced the binding.
+    if (!Number.isFinite(cooldownUntil) || cooldownUntil > Date.now()) return false;
+  }
   return true;
 }
 
@@ -457,8 +463,14 @@ export function isOmniRouteAuthorization(
 ): boolean {
   if (!endpoint) return false;
   const matched = Array.isArray(endpoint)
-    ? endpoint.find((ep) => ep.resource_id === auth.selected_resource_id)
-    : (endpoint.resource_id === auth.selected_resource_id ? endpoint : null);
+    ? endpoint.find((ep) =>
+      ep.resource_id === auth.selected_resource_id &&
+      ep.role === 'CODER' &&
+      ep.adapter_type === 'EXTERNAL_ROUTER'
+    )
+    : (endpoint.resource_id === auth.selected_resource_id &&
+      endpoint.role === 'CODER' &&
+      endpoint.adapter_type === 'EXTERNAL_ROUTER' ? endpoint : null);
   return !!matched && bindingMatches(auth, binding);
 }
 

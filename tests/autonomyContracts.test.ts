@@ -88,6 +88,14 @@ describe('autonomy durable contracts', () => {
     db.close();
   });
 
+  it('fails closed when the product-task authority cannot be read', () => {
+    const db = new Database(':memory:');
+    MigrationRunner.run(db);
+    const store = new AutonomyStore(db);
+    db.close();
+    expect(() => store.isProductTask('closed-db-task')).toThrow(/closed|database/i);
+  });
+
   it('keeps SHADOW side-effect free and rejects the control repository worktree', () => {
     const runtime = fs.mkdtempSync(path.join(os.tmpdir(), 'agentforge-runtime-'));
     const store = AutonomyStore.open(runtime).store;

@@ -21,7 +21,7 @@ Agent-Forge guarantees that the durable source of truth resides entirely in:
 
 ## Current Status: `AUTONOMY_BOOTSTRAP_PILOT`
 
-The experimental PILOT kernel runs Codex planning/review and Antigravity file edits in isolated worktrees, captures independent Git/test evidence, and persists attempts in SQLite. It starts with one worker. Product task/authorization integration, complete crash reconciliation, automatic GitHub/CI handling, and multi-worker operation remain backlog work; see [the implemented boundaries](docs/AUTONOMY.md).
+The experimental PILOT kernel runs Codex planning/review and Antigravity file edits in isolated worktrees, captures independent Git/test evidence, and persists attempts in SQLite. The current bounded runtime supports one or two explicitly configured workers, product-task authorization, routed OmniRoute coder bundles, durable repair convergence, and fenced GitHub CI observation. Complete orphan/process reconciliation and automatic merge/integration remain bounded follow-up work; see [the implemented boundaries](docs/AUTONOMY.md).
 
 - **Core Foundation & Database Migrations (PR #1)**: **IMPLEMENTED & VERIFIED** (SQLite WAL mode, strict foreign keys, state machine, Git ground truth).
 - **Continuous Integration Pipeline (PR #2)**: **IMPLEMENTED & VERIFIED** (Multi-platform Windows & Ubuntu CI with diff hygiene).
@@ -70,7 +70,7 @@ The desktop manual bridge remains available. The experimental PILOT Supervisor r
 3. Generate a versioned WorkOrder and run `agy -p` only inside that worktree.
 4. Recompute Git status/diff/changed files and deterministic test outcomes independently of worker claims.
 5. Ask structured Codex for PASS, REPAIR, or BLOCKED; reject stale reviewed HEADs and repair in the same fenced worktree.
-6. Persist local acceptance and release the implementation slot. Automatic Draft PR publication and CI monitoring are future self-host tasks.
+6. Persist local acceptance and release the implementation slot. The supervised GitHub observer can bind Draft PR claims, persist exact CI identities, diagnose failures, and queue a fenced repair; it never bypasses repository protections or automatic merge policy.
 
 The manual bridge remains available for explicit owner-controlled execution:
 1. Owner pastes **ChatGPT Manager** responses into the **Manager Inbox** to record and apply `EXECUTE` / `FIX_REQUIRED` protocol decisions.
@@ -131,7 +131,7 @@ npm run dev
 # Run development Electron window smoke test against Vite dev server
 npm run smoke:dev:electron
 
-# Run full automated test suite (22 test suites, 85 tests)
+# Run the full automated test suite
 npm test
 
 # Build production bundle (frontend + electron main & preload)
@@ -145,6 +145,9 @@ npm run smoke:packaged:win
 
 # Generate Windows NSIS installer (release/AgentForge Setup 0.1.0.exe)
 npm run package:win
+
+# Probe the configured OmniRoute coder contract without applying edits
+npm run autonomy:doctor:omniroute-coder
 ```
 
 ### Native Modules & ABI Handling

@@ -38,6 +38,22 @@ export interface AutonomySlot {
   leaseEpoch: number;
 }
 
+/**
+ * Durable identity that a repair context must match before it can be reused.
+ *
+ * Repair context is task-scoped audit data, but it is also an execution input.
+ * Selecting it by task alone would allow a newly authorized attempt to replay
+ * findings, provider selection, or snapshots from a stale authorization.
+ */
+export interface RepairContextBinding {
+  authorizationId: string;
+  ownershipEpoch: number;
+  baseSha: string;
+  currentHeadSha: string;
+  selectedProviderId: string;
+  selectedResourceId: string;
+}
+
 export interface AutonomyCiWatch {
   id: string;
   task_id: string;
@@ -564,12 +580,25 @@ export class AutonomyStore {
     this.event(taskId, 'REPAIR_CONTEXT_RECORDED', JSON.parse(canonicalSerializeRepairContext(pkg)));
   }
 
-  getLatestRepairContext(taskId: string): RepairContextPackage | null {
+  getLatestRepairContext(taskId: string, binding?: RepairContextBinding): RepairContextPackage | null {
     const row = this.db.prepare(
-      "SELECT payload_json FROM autonomy_events WHERE work_order_id = ? AND event_type = 'REPAIR_CONTEXT_RECORDED' ORDER BY created_at DESC LIMIT 1"
-    ).get(taskId) as { payload_json: string } | undefined;
-    if (!row) return null;
-    return parseRepairContextPackage(row.payload_json);
+      "SELECT payload_json FROM autonomy_events WHERE work_order_id = ? AND event_type = 'REPAIR_CONTEXT_RECORDED' ORDER BY created_at DESC"
+    ).all(taskId) as Array<{ payload_json: string }>;
+    if (!row.length) return null;
+
+    const packages = row.map((entry) => parseRepairContextPackage(entry.payload_json));
+    if (!binding) return packages[0] ?? null;
+
+    const expectedBaseSha = binding.baseSha.toLowerCase();
+    const expectedHeadSha = binding.currentHeadSha.toLowerCase();
+    return packages.find((pkg) =>
+      pkg.authorization_id === binding.authorizationId &&
+      pkg.ownership_epoch === binding.ownershipEpoch &&
+      pkg.base_sha.toLowerCase() === expectedBaseSha &&
+      pkg.current_head_sha.toLowerCase() === expectedHeadSha &&
+      pkg.selected_provider_id === binding.selectedProviderId &&
+      pkg.selected_resource_id === binding.selectedResourceId
+    ) ?? null;
   }
 
   listRepairContexts(taskId: string): RepairContextPackage[] {
@@ -629,14 +658,13 @@ export class AutonomyStore {
   }
 
   isProductTask(taskId: string): boolean {
-    try {
-      const hasTasks = this.db.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='tasks'").get();
-      if (!hasTasks) return false;
-      const row = this.db.prepare('SELECT 1 FROM tasks WHERE id = ?').get(taskId);
-      return !!row;
-    } catch {
-      return false;
-    }
+    const hasTasks = this.db.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='tasks'").get();
+    if (!hasTasks) return false;
+    // Any error after the table has been observed is an authority failure. Do
+    // not fall through to the legacy autonomy lifecycle when SQLite is closed,
+    // locked, or otherwise unable to answer the product-task lookup.
+    const row = this.db.prepare('SELECT 1 FROM tasks WHERE id = ?').get(taskId);
+    return !!row;
   }
 
   isLegacyTableAuthoritative(tableName: string): boolean {

@@ -1024,7 +1024,14 @@ export class SupervisorContinuousQueue {
         constraints: [...canonicalPayload.constraints, ...canonicalPayload.instructions],
         attempt: attempt?.attempt_number ?? validatedTask.revision_count + 1,
         leaseEpoch: validatedTask.ownership_epoch ?? 1,
-        repairContext: this.supervisor.store.getLatestRepairContext(validatedTask.id) ?? undefined,
+        repairContext: this.supervisor.store.getLatestRepairContext(validatedTask.id, {
+          authorizationId: authorization.id,
+          ownershipEpoch: authorization.task_ownership_epoch ?? validatedTask.ownership_epoch ?? 1,
+          baseSha: authorization.base_sha,
+          currentHeadSha: authorization.repository_head_sha,
+          selectedProviderId: authorization.selected_provider_id,
+          selectedResourceId: authorization.selected_resource_id,
+        }) ?? undefined,
       };
 
       const runResult = await this.supervisor.runProductTask(spec);

@@ -997,5 +997,48 @@ describe('Repair Convergence Contract (repaircontext.v1)', () => {
       expect(lineage.outcomes[0].status).toBe('NO_PROGRESS');
       expect(lineage.outcomes[0].no_progress_category).toBe('NO_OP_WITH_UNRESOLVED_ACTIONS');
     });
+
+    it('reuses a repair context only when authorization, epoch, head, and routing all match', () => {
+      const taskId = 'TSK-BINDING-008';
+      const stale = sampleRepairPackage({
+        taskId,
+        authorizationId: 'auth-old',
+        ownershipEpoch: 1,
+        baseSha: shaA,
+        currentHeadSha: shaA,
+        selectedProviderId: 'provider-old',
+        selectedResourceId: 'resource-old',
+      });
+      const current = sampleRepairPackage({
+        taskId,
+        attempt: 2,
+        authorizationId: 'auth-current',
+        ownershipEpoch: 2,
+        baseSha: shaA,
+        currentHeadSha: shaB,
+        selectedProviderId: 'provider-current',
+        selectedResourceId: 'resource-current',
+      });
+      store.recordRepairContext(stale);
+      store.recordRepairContext(current);
+
+      expect(store.getLatestRepairContext(taskId, {
+        authorizationId: 'auth-current',
+        ownershipEpoch: 2,
+        baseSha: shaA,
+        currentHeadSha: shaB,
+        selectedProviderId: 'provider-current',
+        selectedResourceId: 'resource-current',
+      })).toEqual(current);
+
+      expect(store.getLatestRepairContext(taskId, {
+        authorizationId: 'auth-current',
+        ownershipEpoch: 2,
+        baseSha: shaA,
+        currentHeadSha: shaB,
+        selectedProviderId: 'provider-old',
+        selectedResourceId: 'resource-old',
+      })).toBeNull();
+    });
   });
 });
