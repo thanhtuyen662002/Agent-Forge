@@ -24,7 +24,7 @@ jobs:
       package_required: ${{ steps.paths.outputs.package_required }}
     steps:
       - name: Checkout exact source
-        uses: actions/checkout@v4
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
           ref: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
           fetch-depth: 0
@@ -53,7 +53,7 @@ jobs:
 
     steps:
       - name: Checkout exact source
-        uses: actions/checkout@v4
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
           ref: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
           fetch-depth: 0
@@ -78,7 +78,7 @@ jobs:
 
       - name: Setup Node.js ${{ matrix.node-version }}
         if: needs.classify.outputs.package_required == 'true'
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
         with:
           node-version: ${{ matrix.node-version }}
           cache: 'npm'
@@ -132,7 +132,7 @@ jobs:
           test '${{ needs.classify.outputs.package_required }}' = 'true' -o '${{ needs.classify.outputs.package_required }}' = 'false'
 
       - name: Checkout exact source
-        uses: actions/checkout@v4
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
           ref: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
           fetch-depth: 0
@@ -157,7 +157,7 @@ jobs:
 
       - name: Setup Node.js 22.x
         if: needs.classify.outputs.package_required == 'true'
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
         with:
           node-version: '22.x'
           cache: 'npm'
@@ -207,7 +207,7 @@ jobs:
 
       - name: Upload Windows Installed Update Test Diagnostics
         if: always() && needs.classify.outputs.package_required == 'true'
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: agentforge-installed-update-diagnostics-${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
           path: release/installed-update-test/diagnostics/
@@ -260,7 +260,7 @@ jobs:
 
       - name: Upload Windows Installer Artifact
         if: needs.classify.outputs.package_required == 'true'
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: agentforge-windows-installer-${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
           path: |
