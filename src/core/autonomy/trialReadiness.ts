@@ -66,7 +66,7 @@ export interface TrialReadinessResult {
   blockingReasons: string[];
 }
 
-const SHA256 = /^[0-9a-f]{64}$/i;
+const SHA256 = /^[0-9a-f]{64}$/;
 const GIT_SHA = /^[0-9a-f]{40}$/i;
 const SAFE_ID = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/;
 const PHASE_ORDER: readonly ProductionTrialPhase[] = ['R5L0', 'R5L1', 'R5L2', 'R5L3', 'R5L4'];
