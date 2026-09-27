@@ -109,6 +109,39 @@ enforces an explicitly configured maximum of `MAX_AGY_WORKERS=2` (accepting inte
 from 1 through 2) in both AutonomySupervisor and autonomyCli, failing closed with
 `CONSOLIDATION_REQUIRES_MAX_AGY_WORKERS_BOUNDS` on any value below 1, above 2, or non-integer.
 
+### Legacy lifecycle inventory and recovery contract
+
+The `AutonomyStore.inventoryLegacyState()` report is the read-only inventory
+boundary for the provisional `autonomy_*` schema. Every row below has
+`isAuthoritative: false`; the compatibility inventory table records the same
+decision durably. Product work is never selected, dispatched, authorized, or
+recovered from these rows. The product authorities are `tasks`/`TaskService`,
+`ExecutionAuthorization`, `WorkerSlotLeaseService`, `process_runs`, evidence,
+and `test_runs`.
+
+| Legacy table | Classification | Writers | Readers and recovery use | Retention contract |
+| --- | --- | --- | --- | --- |
+| `autonomy_work_orders` | Compatibility lifecycle projection | `AutonomyStore` work-order/lease methods and legacy Supervisor paths | Legacy Supervisor context and recovery only; product dispatch rejects this authority | Retain for audit and compatibility; never promote to product authority |
+| `autonomy_slots` | Compatibility lease projection | Legacy Supervisor slot acquisition/release | Legacy scheduler/recovery reconciliation | Retain active lease evidence; product leases use `WorkerSlotLeaseService` |
+| `autonomy_runs` | Execution evidence | Supervisor run recording | Manager context and recovery evidence | Append/retain evidence; no product state transitions |
+| `autonomy_reviews` | Review evidence | Manager review recording | Supervisor and manager context reconstruction | Retain review lineage; exact product reviews use product task records |
+| `autonomy_ci_watches` | CI observation state | GitHub CI observer/watch registration | CI poller and restart recovery | Retain active watches and reconcile by exact PR head SHA |
+| `autonomy_ci_reconciliations` | CI identity evidence | GitHub CI reconciliation writer | Post-merge/PR-head recovery and audit queries | Retain immutable identity evidence; cancelled superseded checks are not current truth |
+| `autonomy_claims` | External claim projection | GitHub claim reconciliation | Supervisor claim fencing and recovery | Retain external ownership evidence; never infer local authority from it |
+| `autonomy_events` | Append-only audit log | Supervisor and autonomy services | Recovery, repair lineage, and operator evidence | Retain ordered events; do not rewrite or use as product lifecycle authority |
+| `autonomy_manager_resources` | Manager resource health | Manager provider pool | Capacity selection and restart recovery | Retain health/cooldown state; no task ownership authority |
+| `autonomy_manager_attempts` | Manager invocation evidence | Manager provider pool | Capacity/retry accounting and context reconstruction | Retain attempts and outcomes for audit |
+| `autonomy_manager_contexts` | Manager context snapshots | Manager provider pool | Deterministic context reuse after restart | Retain content-addressed snapshots; authorization still comes from product state |
+| `autonomy_trial_runs` | Trial evidence registry | Trial-run registry commands | Trial readiness and evidence recovery | Retain manifest-bound trial identity; independent of product task lifecycle |
+| `autonomy_trial_run_events` | Trial transition audit | Trial-run registry commands | Trial recovery and ordered evidence | Retain ordered transitions; never dispatch work |
+| `autonomy_review_capacity_waits` | Review capacity wait state | Review-capacity watcher | Restart-safe manager capacity polling | Retain waits without consuming worker slots or changing product state |
+
+The inventory is intentionally explicit rather than inferred from row counts.
+Recovery may reconcile, fence, or retain a legacy row, but it may not silently
+delete historical evidence or make a legacy row authoritative. Any future
+retirement must add a dedicated migration and restart/recovery proof before a
+table or compatibility writer is removed.
+
 SQLite lives at RUNTIME_ROOT/state/agent-forge.sqlite. Provider logs, prompts,
 review/session events, and evidence live in that database. Operator files belong
 in runtime logs, prompts, and evidence subdirectories.
