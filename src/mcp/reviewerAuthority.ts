@@ -279,7 +279,13 @@ export class ReviewerAuthorityService {
   public issueReviewerSession(input: ReviewerSessionIssuanceInput): ReviewerSessionIssuanceResult {
     // 1. Duration bounds
     const duration = input.duration_seconds ?? SESSION_DURATION_DEFAULT_SECONDS;
-    if (typeof duration !== 'number' || duration < SESSION_DURATION_MIN_SECONDS || duration > SESSION_DURATION_MAX_SECONDS) {
+    if (
+      typeof duration !== 'number' ||
+      !Number.isFinite(duration) ||
+      !Number.isSafeInteger(duration) ||
+      duration < SESSION_DURATION_MIN_SECONDS ||
+      duration > SESSION_DURATION_MAX_SECONDS
+    ) {
       throw new ReviewerAuthorityError(
         'SESSION_DURATION_INVALID',
         `Session duration must be between ${SESSION_DURATION_MIN_SECONDS} and ${SESSION_DURATION_MAX_SECONDS} seconds`
