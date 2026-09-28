@@ -69,15 +69,29 @@ $receiptLines.Add("PRODUCTION_VERSION=$expectedVersion")
 Write-Host "[A] Production Version ($expectedVersion): $(if ($expectedVersion -match '^\d+\.\d+\.\d+') {'PASS'} else {'FAIL'})"
 
 # Assertion B: Database migration count == 24 (Prior baseline: Expected exactly 23 migrations)
-$migrationsPath = Join-Path $ProjectRoot "src\core\database\migrations.ts"
+# Historical migrations are now one module per version. Read the version declarations
+# from that registry directory instead of assuming the compatibility facade contains
+# every definition; fail closed for missing, duplicate, or out-of-range versions.
+$migrationsDir = Join-Path $ProjectRoot "src\core\database\migrations"
 $migrationCount = 0
-if (-not (Test-Path $migrationsPath)) {
-  $failures.Add("B_MIGRATIONS_FILE_MISSING: migrations.ts not found at $migrationsPath")
+if (-not (Test-Path $migrationsDir)) {
+  $failures.Add("B_MIGRATIONS_DIRECTORY_MISSING: migration registry directory not found at $migrationsDir")
 } else {
-  $migrationMatches = Select-String -Path $migrationsPath -Pattern "version:\s*(\d+)"
-  $migrationCount = $migrationMatches.Count
-  if ($migrationCount -ne 24) {
-    $failures.Add("B_MIGRATION_COUNT_INVALID: Expected exactly 24 migrations, found $migrationCount")
+  $migrationFiles = @(Get-ChildItem -LiteralPath $migrationsDir -Filter "migration*.ts" -File | Sort-Object Name)
+  $migrationVersions = [System.Collections.Generic.List[int]]::new()
+  foreach ($migrationFile in $migrationFiles) {
+    $migrationMatch = Select-String -LiteralPath $migrationFile.FullName -Pattern "version:\s*(\d+)" | Select-Object -First 1
+    if ($null -eq $migrationMatch -or $migrationMatch.Matches.Count -eq 0) {
+      $failures.Add("B_MIGRATION_VERSION_MISSING: No version declaration found in $($migrationFile.Name)")
+      continue
+    }
+    $migrationVersions.Add([int]$migrationMatch.Matches[0].Groups[1].Value)
+  }
+  $migrationCount = $migrationVersions.Count
+  $expectedMigrationVersions = (1..24) -join ","
+  $actualMigrationVersions = ($migrationVersions | Sort-Object) -join ","
+  if ($migrationCount -ne 24 -or $actualMigrationVersions -ne $expectedMigrationVersions) {
+    $failures.Add("B_MIGRATION_COUNT_INVALID: Expected exactly versions 1..24, found $actualMigrationVersions")
   }
 }
 $receiptLines.Add("MIGRATION_COUNT=$migrationCount")
