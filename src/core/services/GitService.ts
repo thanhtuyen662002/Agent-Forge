@@ -34,7 +34,7 @@ export class GitRevisionValidationError extends Error {
  */
 export function validateGitRevision(revision: unknown): string | null {
   if (revision === undefined || revision === null) return null;
-  if (typeof revision !== 'string' || !/^[0-9a-fA-F]{40}$/.test(revision)) {
+  if (typeof revision !== 'string' || revision.length !== 40 || !/^[0-9a-fA-F]{40}$/.test(revision)) {
     throw new GitRevisionValidationError();
   }
   return revision.toLowerCase();
