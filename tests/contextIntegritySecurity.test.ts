@@ -44,4 +44,17 @@ describe('context file trust boundary', () => {
       fs.rmSync(root, { recursive: true, force: true });
     }
   });
+
+  it('retains lexical metadata behavior for a wholly missing virtual repository root', () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'agent-forge-context-virtual-root-'));
+    fs.rmSync(root, { recursive: true, force: true });
+    try {
+      expect(fs.existsSync(root)).toBe(false);
+      expect(sanitizeContextFiles(['src/specA.ts'], root)).toEqual({
+        validFiles: ['src/specA.ts'],
+      });
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
 });

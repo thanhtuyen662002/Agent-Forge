@@ -71,6 +71,15 @@ export class PolicyService {
     }
   }
 
+  private static isMissingPathError(error: unknown): boolean {
+    return (
+      typeof error === 'object' &&
+      error !== null &&
+      'code' in error &&
+      (error as NodeJS.ErrnoException).code === 'ENOENT'
+    );
+  }
+
   private static PROHIBITED_SHELLS = new Set([
     'bash',
     'bash.exe',
@@ -160,6 +169,25 @@ export class PolicyService {
 
     const canonicalRoot = path.normalize(path.resolve(repositoryRoot));
     const canonicalTarget = path.normalize(path.resolve(targetPath));
+
+    // Context manifests may be built from a virtual or not-yet-created
+    // repository root (for example, durable metadata tests). There is no
+    // filesystem identity to resolve in that case, so retain the lexical
+    // containment and sensitive-name decision. Once the root exists, every
+    // existing component still goes through the realpath checks below; a
+    // broken symlink/junction or any other resolution error remains fail
+    // closed.
+    try {
+      fs.lstatSync(canonicalRoot);
+    } catch (error: unknown) {
+      if (this.isMissingPathError(error)) return lexical;
+      return {
+        allowed: false,
+        decision: 'DENY',
+        reason: `Unable to inspect repository root for "${repositoryRoot}" safely.`,
+      };
+    }
+
     try {
       const realRoot = path.normalize(fs.realpathSync.native(canonicalRoot));
       const existingAncestor = this.findExistingAncestor(canonicalTarget);
