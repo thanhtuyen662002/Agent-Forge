@@ -1194,6 +1194,10 @@ export class ProcessRunner {
       if (child.pid && options.repo) {
         try {
           options.repo.updateProcessRunPid(executionId, child.pid);
+          const persisted = options.repo.getProcessRun(executionId);
+          if (!persisted || persisted.pid !== child.pid) {
+            throw new Error('PROCESS_RUN_PID_STATE_MISMATCH');
+          }
         } catch (pidErr: unknown) {
           settleOnce('ERROR', null, pidErr instanceof Error ? pidErr : new Error('PROCESS_PID_PERSISTENCE_FAILED')).catch(
             (err) => {
