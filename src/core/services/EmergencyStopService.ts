@@ -90,7 +90,10 @@ export class EmergencyStopService {
 
   public resumeProject(projectId: string, expectedEpoch?: number): boolean {
     const result = this.stopFence.resumeProject(projectId, expectedEpoch);
-    return result.status === 'RESUMED' || result.status === 'ALREADY_RESUMED';
+    // Preserve the historical boolean API for an ordinary RUNNING project
+    // while treating a repeated resume of a previously emergency-stopped
+    // epoch as the idempotent success it is.
+    return result.status === 'RESUMED' || (result.status === 'ALREADY_RESUMED' && (result.previousEpoch ?? 0) > 0);
   }
 
   public getStopFence(projectId: string) {

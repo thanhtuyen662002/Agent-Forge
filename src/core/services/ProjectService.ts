@@ -59,11 +59,14 @@ export class ProjectService {
     const project = this.repo.getProject(projectId);
     if (!project) throw new Error(`Project ${projectId} not found.`);
 
-    if (trigger === 'START_PROJECT') {
-      this.stopFence.assertProjectStartAllowed(projectId);
-    }
-
     const nextStatus = ProjectStateMachine.transition(project.status, trigger);
+    // Every state-machine path that enters RUNNING must honor the durable
+    // emergency latch. In particular, BLOCKER_RESOLVED, CAPACITY_RESTORED,
+    // OWNER_APPROVED, FINAL_FIX_REQUIRED, and RESUME must not bypass the
+    // owner-controlled CAS resume operation.
+    if (nextStatus === 'RUNNING') {
+      this.stopFence.assertProjectRunningAllowed(projectId);
+    }
     const startedAt = trigger === 'START_PROJECT' ? new Date().toISOString() : undefined;
     const completedAt = trigger === 'FINAL_PASS' ? new Date().toISOString() : undefined;
 

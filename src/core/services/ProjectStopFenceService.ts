@@ -1,6 +1,6 @@
 import crypto from 'crypto';
 import Database from 'better-sqlite3';
-import { Repository } from '../database/repositories';
+import type { Repository } from '../database/repositories';
 
 /**
  * Durable project admission fence used by emergency stop, authorization, and
@@ -188,12 +188,12 @@ export class ProjectStopFenceService {
   }
 
   /**
-   * Lifecycle admission used by ProjectService before a project is started.
-   * A non-emergency pause is represented by the normal project state and is
-   * therefore allowed to follow its ordinary state-machine transition; the
-   * durable latch always wins.
+   * Lifecycle admission used by ProjectService before any transition enters
+   * RUNNING. A non-emergency pause is represented by the normal project state
+   * and is therefore allowed to follow its ordinary state-machine transition;
+   * the durable emergency latch always wins.
    */
-  public assertProjectStartAllowed(projectId: string): void {
+  public assertProjectRunningAllowed(projectId: string): void {
     const fence = this.getFence(projectId);
     if (!fence) throw new Error(`PROJECT_NOT_FOUND: Project "${projectId}" was not found.`);
     if (fence.latched) {

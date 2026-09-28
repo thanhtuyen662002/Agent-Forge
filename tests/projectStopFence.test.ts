@@ -4,6 +4,7 @@ import { MigrationRunner } from '../src/core/database/migrations';
 import { Repository } from '../src/core/database/repositories';
 import { EventService } from '../src/core/services/EventService';
 import { EmergencyStopService } from '../src/core/services/EmergencyStopService';
+import { ProjectService } from '../src/core/services/ProjectService';
 import {
   ProjectStopFenceService,
   sanitizeProjectStopReason,
@@ -113,6 +114,29 @@ describe('ProjectStopFenceService', () => {
     expect(resumed).toMatchObject({ status: 'RESUMED', previousEpoch: 1, epoch: 2 });
     expect(repo.getTask('TASK-STOP-A')).toMatchObject({ state: 'CODING', paused_from_state: null });
     expect(fence.resumeProject('PROJ-STOP-A', 2).status).toBe('ALREADY_RESUMED');
+    expect(new EmergencyStopService(repo, new EventService(repo)).resumeProject('PROJ-STOP-B')).toBe(false);
+  });
+
+  it('does not let the normal project state machine bypass an emergency latch', () => {
+    const projectService = new ProjectService(repo, new EventService(repo));
+    fence.requestStopForProject('PROJ-STOP-A', 'owner stop');
+
+    expect(() => projectService.transitionStatus('PROJ-STOP-A', 'RESUME')).toThrow('PROJECT_EMERGENCY_STOP_LATCHED');
+    expect(fence.getFence('PROJ-STOP-A')).toMatchObject({ epoch: 1, latched: true, projectStatus: 'PAUSED' });
+
+    const baseProject = repo.getProject('PROJ-STOP-B')!;
+    const runningTransitions = [
+      ['PROJ-STOP-BLOCKED', 'BLOCKED', 'BLOCKER_RESOLVED'],
+      ['PROJ-STOP-CAPACITY', 'WAITING_FOR_CAPACITY', 'CAPACITY_RESTORED'],
+      ['PROJ-STOP-OWNER', 'WAITING_FOR_OWNER', 'OWNER_APPROVED'],
+      ['PROJ-STOP-REVIEW', 'FINAL_REVIEW', 'FINAL_FIX_REQUIRED'],
+    ] as const;
+    for (const [projectId, status, trigger] of runningTransitions) {
+      repo.createProject({ ...baseProject, id: projectId, name: projectId, status, updated_at: now() });
+      fence.requestStopForProject(projectId, 'owner stop');
+      expect(() => projectService.transitionStatus(projectId, trigger)).toThrow('PROJECT_EMERGENCY_STOP_LATCHED');
+      expect(repo.getProject(projectId)?.status).toBe(status);
+    }
   });
 
   it('does not widen an explicitly scoped stop when target ids are empty or invalid', () => {
