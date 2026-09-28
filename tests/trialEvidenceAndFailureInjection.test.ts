@@ -1,3 +1,4 @@
+import crypto from 'crypto';
 import fs from 'fs';
 import os from 'os';
 import path from 'path';
@@ -50,6 +51,34 @@ function baseManifest(): TrialManifestInput {
   };
 }
 
+describe('ArtifactStore containment hardening', () => {
+  it('preserves valid content-addressed round trips while preparing the race boundary', () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'agent-forge-artifact-store-'));
+    try {
+      const store = new ArtifactStore(root, 0);
+      const payload = 'stable artifact payload';
+      const hash = crypto.createHash('sha256').update(payload, 'utf8').digest('hex');
+      const materialized = store.materializeContentAddressedFile(payload, hash);
+      expect(store.read({
+        id: 'artifact-round-trip',
+        project_id: 'project-1',
+        task_id: null,
+        attempt_id: null,
+        evidence_type: 'TEST_RESULT',
+        storage_type: 'FILE',
+        file_path: materialized.filePath,
+        hash,
+        byte_size: Buffer.byteLength(payload, 'utf8'),
+        content_type: 'text/plain',
+        summary: 'round trip',
+        raw_payload: null,
+        created_at: new Date().toISOString(),
+      })).toBe(payload);
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+});
 describe('production trial evidence manifest', () => {
   it('builds deterministic canonical JSON and hash', () => {
     const first = buildTrialEvidenceManifest(baseManifest(),);
