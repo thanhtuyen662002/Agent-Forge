@@ -123,6 +123,7 @@ describe('ProjectStopFenceService', () => {
 
     expect(() => projectService.transitionStatus('PROJ-STOP-A', 'RESUME')).toThrow('PROJECT_EMERGENCY_STOP_LATCHED');
     expect(fence.getFence('PROJ-STOP-A')).toMatchObject({ epoch: 1, latched: true, projectStatus: 'PAUSED' });
+    expect(() => repo.updateProjectStatus('PROJ-STOP-A', 'RUNNING')).toThrow('PROJECT_STOP_FENCE_REJECTED');
 
     const baseProject = repo.getProject('PROJ-STOP-B')!;
     const runningTransitions = [

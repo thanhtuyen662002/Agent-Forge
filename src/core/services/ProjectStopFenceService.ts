@@ -135,6 +135,15 @@ export class ProjectStopFenceService {
         CREATE INDEX IF NOT EXISTS idx_project_stop_admissions_project
           ON project_stop_admissions(project_id, stop_epoch);
 
+        CREATE TRIGGER IF NOT EXISTS trg_project_stop_running_state
+        BEFORE UPDATE OF status ON projects
+        WHEN NEW.status = 'RUNNING'
+          AND OLD.emergency_stop_latched = 1
+          AND NEW.emergency_stop_latched = 1
+        BEGIN
+          SELECT RAISE(ABORT, 'PROJECT_STOP_FENCE_REJECTED');
+        END;
+
         CREATE TRIGGER IF NOT EXISTS trg_project_stop_dispatch_admission
         BEFORE UPDATE OF status ON execution_authorizations
         WHEN NEW.status = 'DISPATCHED' AND OLD.status = 'AUTHORIZED'
