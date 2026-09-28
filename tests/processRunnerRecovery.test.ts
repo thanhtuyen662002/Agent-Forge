@@ -89,6 +89,31 @@ describe('ProcessRunner startup and timeout recovery', () => {
     expect(ProcessRunner.getPersistenceFencedEntry(executionId)).toBeUndefined();
   });
 
+  it('settles and terminates the child when PID persistence fails during startup', async () => {
+    const executionId = crypto.randomUUID();
+    const scriptPath = path.join(tempDir, 'pid-persistence-failure.js');
+    fs.writeFileSync(scriptPath, 'setTimeout(() => {}, 10000);', 'utf8');
+
+    const originalUpdatePid = repo.updateProcessRunPid.bind(repo);
+    repo.updateProcessRunPid = (() => {
+      throw new Error('simulated PID persistence outage');
+    }) as Repository['updateProcessRunPid'];
+
+    const result = await ProcessRunner.execute({
+      executionId,
+      executable: process.execPath,
+      args: [scriptPath],
+      cwd: tempDir,
+      repo,
+    });
+
+    repo.updateProcessRunPid = originalUpdatePid;
+    expect(result.errorCode).toBe('PROCESS_LAUNCH_FAILED');
+    expect(result.processStart).toBe('START_AMBIGUOUS');
+    expect(repo.getProcessRun(executionId)?.status).toBe('FAILED');
+    expect(ProcessRunner.getActiveProcessCount()).toBe(0);
+  });
+
   it.each([
     ['zero', 0],
     ['negative', -1],

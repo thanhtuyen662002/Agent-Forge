@@ -867,10 +867,6 @@ export class ProcessRunner {
         return;
       }
 
-      if (child.pid && options.repo) {
-        options.repo.updateProcessRunPid(executionId, child.pid);
-      }
-
       let isTimedOut = false;
       let isOutputLimitExceeded = false;
       let isStdinFailed = false;
@@ -1179,6 +1175,23 @@ export class ProcessRunner {
           }
         });
       });
+
+      // PID persistence is part of startup truth.  Keep it inside the same
+      // settled lifecycle as spawn so a database failure cannot orphan a
+      // child while leaving its durable row RUNNING.
+      if (child.pid && options.repo) {
+        try {
+          options.repo.updateProcessRunPid(executionId, child.pid);
+        } catch (pidErr: unknown) {
+          settleOnce('ERROR', null, pidErr instanceof Error ? pidErr : new Error('PROCESS_PID_PERSISTENCE_FAILED')).catch(
+            (err) => {
+              if (err) {
+                // Handled by settlementPromise rejection
+              }
+            }
+          );
+        }
+      }
     });
   }
 
