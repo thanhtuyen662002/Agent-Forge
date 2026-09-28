@@ -91,7 +91,7 @@ if (-not (Test-Path $migrationsDir)) {
   $expectedMigrationVersions = (1..24) -join ","
   $actualMigrationVersions = ($migrationVersions | Sort-Object) -join ","
   if ($migrationCount -ne 24 -or $actualMigrationVersions -ne $expectedMigrationVersions) {
-    $failures.Add("B_MIGRATION_COUNT_INVALID: Expected exactly versions 1..24, found $actualMigrationVersions")
+    $failures.Add("B_MIGRATION_COUNT_INVALID: Expected exactly 24 migrations with versions 1..24, found $actualMigrationVersions")
   }
 }
 $receiptLines.Add("MIGRATION_COUNT=$migrationCount")
