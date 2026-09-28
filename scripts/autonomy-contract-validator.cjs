@@ -339,7 +339,21 @@ function closingIssueNumbers(body) {
 
 function validatePullRequestContract(body, context = {}) {
   const block = extractContractBlock(body, 'AF_PR_V1', PR_LIST_FIELDS);
-  if (!block.found) return grandfathered('AF_PR_V1', body, context.createdAt, block);
+  if (!block.found) {
+    // Dependabot update PRs are trusted automation and do not emit an
+    // autonomous work contract. Keep the exemption narrowly scoped to the
+    // exact GitHub bot login and only when the body is entirely unmarked;
+    // malformed/partial AF_PR_V1 blocks must still fail validation.
+    if (!block.markerPresent && context.authorLogin === 'dependabot[bot]') {
+      return {
+        ok: true,
+        status: 'TRUSTED_AUTOMATION',
+        errors: [],
+        warnings: ['AF_PR_V1: Dependabot automation without autonomous contract accepted'],
+      };
+    }
+    return grandfathered('AF_PR_V1', body, context.createdAt, block);
+  }
 
   const errors = [...block.errors, ...validateShape(block.values, 'AF_PR_V1', PR_FIELDS, PR_OPTIONAL_FIELDS)];
   errors.push(...validateEnums(block.values, 'AF_PR_V1', PR_ENUMS));
@@ -432,6 +446,7 @@ async function validateEvent(event, options = {}) {
     }
     return validatePullRequestContract(body, {
       createdAt: pullRequest.created_at,
+      authorLogin: pullRequest.user && pullRequest.user.login,
       headSha: pullRequest.head && pullRequest.head.sha,
       baseSha: pullRequest.base && pullRequest.base.sha,
       baseRef: pullRequest.base && pullRequest.base.ref,

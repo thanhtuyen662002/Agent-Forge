@@ -20,6 +20,7 @@ const validator = require('../scripts/autonomy-contract-validator.cjs') as {
   };
   validatePullRequestContract(body: string, context?: {
     createdAt?: string;
+    authorLogin?: string;
     headSha?: string;
     baseSha?: string;
     baseRef?: string;
@@ -28,6 +29,7 @@ const validator = require('../scripts/autonomy-contract-validator.cjs') as {
     ok: boolean;
     status: string;
     errors: string[];
+    warnings: string[];
   };
 };
 
@@ -196,6 +198,30 @@ describe('autonomous contract validator', () => {
     expect(result).toMatchObject({ ok: true, status: 'VALID' });
   });
 
+  it('propagates the exact Dependabot author identity through pull_request events', async () => {
+    const bot = await validator.validateEvent({
+      pull_request: {
+        body: 'Dependabot update',
+        user: { login: 'dependabot[bot]' },
+        created_at: '2026-09-28T05:10:03Z',
+        base: { ref: 'main', sha: SHA },
+        head: { sha: SHA },
+      },
+    }, { eventName: 'pull_request_target' });
+    expect(bot).toMatchObject({ ok: true, status: 'TRUSTED_AUTOMATION' });
+
+    const human = await validator.validateEvent({
+      pull_request: {
+        body: 'Human PR without a contract',
+        user: { login: 'octocat' },
+        created_at: '2026-09-28T05:10:03Z',
+        base: { ref: 'main', sha: SHA },
+        head: { sha: SHA },
+      },
+    }, { eventName: 'pull_request_target' });
+    expect(human).toMatchObject({ ok: false, status: 'INVALID' });
+  });
+
   it('reports exact PR field failures for bad SHA, branch, closing reference, and linked Issue', () => {
     const malformed = prBody
       .replace(`base_sha: ${SHA}`, 'base_sha: not-a-sha')
@@ -221,6 +247,49 @@ describe('autonomous contract validator', () => {
       baseRef: 'main',
     });
     expect(result).toMatchObject({ ok: true, status: 'GRANDFATHERED' });
+  });
+
+  it('accepts an unmarked Dependabot PR as trusted automation while rejecting an unmarked human PR', () => {
+    const bot = validator.validatePullRequestContract('Dependabot update', {
+      createdAt: '2026-09-28T05:10:03Z',
+      authorLogin: 'dependabot[bot]',
+      baseSha: SHA,
+      baseRef: 'main',
+    });
+    expect(bot).toMatchObject({ ok: true, status: 'TRUSTED_AUTOMATION' });
+    expect(bot.errors).toEqual([]);
+    expect(bot.warnings).toEqual(['AF_PR_V1: Dependabot automation without autonomous contract accepted']);
+
+    const human = validator.validatePullRequestContract('Human PR without a contract', {
+      createdAt: '2026-09-28T05:10:03Z',
+      authorLogin: 'octocat',
+      baseSha: SHA,
+      baseRef: 'main',
+    });
+    expect(human.ok).toBe(false);
+    expect(human.status).toBe('INVALID');
+    expect(human.errors).toContain('AF_PR_V1: fenced contract block is required');
+  });
+
+  it('still validates a marked Dependabot contract instead of applying the trusted exemption', () => {
+    const malformed = `
+\`\`\`yaml
+AF_PR_V1:
+  issue: 73
+\`\`\`
+`;
+    const result = validator.validatePullRequestContract(malformed, {
+      createdAt: '2026-09-28T05:10:03Z',
+      authorLogin: 'dependabot[bot]',
+      baseSha: SHA,
+      baseRef: 'main',
+    });
+    expect(result.ok).toBe(false);
+    expect(result.status).toBe('INVALID');
+    expect(result.errors).toEqual(expect.arrayContaining([
+      expect.stringContaining('AF_PR_V1.phase'),
+      expect.stringContaining('AF_PR_V1.base_sha'),
+    ]));
   });
 
   it('parses supported closing keywords without accepting a mismatched issue reference', () => {
