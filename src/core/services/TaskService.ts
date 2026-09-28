@@ -154,7 +154,8 @@ export class TaskService {
   ): Promise<ApplyProtocolResult> {
     const computedHash = crypto.createHash('sha256').update(rawPayload, 'utf8').digest('hex');
 
-    // 1. Idempotency Check
+    // Preserve the inexpensive replay fast path while repeating the check in
+    // the transaction below to close the preflight race.
     const existingMsg = this.repo.getProtocolMessageById(managerMsg.message_id);
     if (existingMsg) {
       return {
@@ -167,21 +168,37 @@ export class TaskService {
     if (!managerMsg.task_id) {
       return { success: false, error: 'Protocol message is missing required task_id.' };
     }
+    const taskId = managerMsg.task_id;
 
-    const task = this.repo.getTask(managerMsg.task_id);
-    if (!task) {
+    // Keep this lookup outside the transaction only for fast validation and to
+    // resolve the repository path before the asynchronous Git check.  The
+    // authoritative task snapshot is always re-read after the transaction
+    // acquires its write lock below.
+    const taskForGit = this.repo.getTask(managerMsg.task_id);
+    if (!taskForGit) {
       return { success: false, error: `Task "${managerMsg.task_id}" does not exist.` };
     }
 
-    // 2. Cross-Project Guard
-    if (managerMsg.project_id !== task.project_id) {
-      const reason = `Cross-project conflict: Protocol targets project "${managerMsg.project_id}", but task belongs to "${task.project_id}".`;
+    // Preserve fail-closed preflight behavior for guards that do not require
+    // Git.  The same checks are repeated inside the immediate transaction so
+    // a matching preflight can never authorize a stale post-Git mutation.
+    const rejectBeforeGit = (reason: string): ApplyProtocolResult => this.repo.runInImmediateTransaction(() => {
+      const existing = this.repo.getProtocolMessageById(managerMsg.message_id);
+      if (existing) {
+        return {
+          success: true,
+          isDuplicate: true,
+          message: `Manager decision "${managerMsg.message_id}" was already processed.`,
+        };
+      }
+      const current = this.repo.getTask(taskId);
+      if (!current) return { success: false, error: `Task "${taskId}" does not exist.` };
       this.repo.recordProtocolMessage(
         crypto.randomUUID(),
         managerMsg.message_id,
         'manager.v1',
-        task.project_id,
-        task.id,
+        current.project_id,
+        current.id,
         managerMsg.expected_task_state ?? null,
         managerMsg.expected_revision ?? null,
         computedHash,
@@ -190,50 +207,23 @@ export class TaskService {
         reason
       );
       return { success: false, error: reason };
+    });
+    if (managerMsg.project_id !== taskForGit.project_id) {
+      return rejectBeforeGit(`Cross-project conflict: Protocol targets project "${managerMsg.project_id}", but task belongs to "${taskForGit.project_id}".`);
     }
-
-    // 3. Stale State & Revision Guard
-    if (managerMsg.expected_task_state && managerMsg.expected_task_state !== task.state) {
-      const reason = `Stale state conflict: Manager expected state "${managerMsg.expected_task_state}", but task is in "${task.state}".`;
-      this.repo.recordProtocolMessage(
-        crypto.randomUUID(),
-        managerMsg.message_id,
-        'manager.v1',
-        task.project_id,
-        task.id,
-        managerMsg.expected_task_state,
-        managerMsg.expected_revision ?? null,
-        computedHash,
-        rawPayload,
-        'REJECTED',
-        reason
-      );
-      return { success: false, error: reason };
+    if (managerMsg.expected_task_state && managerMsg.expected_task_state !== taskForGit.state) {
+      return rejectBeforeGit(`Stale state conflict: Manager expected state "${managerMsg.expected_task_state}", but task is in "${taskForGit.state}".`);
     }
-
     if (
       managerMsg.expected_revision !== null &&
       managerMsg.expected_revision !== undefined &&
-      managerMsg.expected_revision !== task.revision_count
+      managerMsg.expected_revision !== taskForGit.revision_count
     ) {
-      const reason = `Stale revision conflict: Manager expected revision ${managerMsg.expected_revision}, but task revision is ${task.revision_count}.`;
-      this.repo.recordProtocolMessage(
-        crypto.randomUUID(),
-        managerMsg.message_id,
-        'manager.v1',
-        task.project_id,
-        task.id,
-        managerMsg.expected_task_state ?? null,
-        managerMsg.expected_revision,
-        computedHash,
-        rawPayload,
-        'REJECTED',
-        reason
-      );
-      return { success: false, error: reason };
+      return rejectBeforeGit(`Stale revision conflict: Manager expected revision ${managerMsg.expected_revision}, but task revision is ${taskForGit.revision_count}.`);
     }
 
-    // 4. Map decision to trigger
+    // Map the protocol decision before entering the transaction.  This is a
+    // pure operation and keeps unsupported messages from creating ledger rows.
     let trigger: TaskTrigger;
     switch (managerMsg.decision) {
       case 'EXECUTE':
@@ -258,18 +248,45 @@ export class TaskService {
         return { success: false, error: `Unsupported decision: ${(managerMsg as any).decision}` };
     }
 
-    // 5. Authoritative Git Base SHA Resolution on EXECUTE
-    let boundBaseSha: string | null = task.base_sha;
+    // Resolve the authoritative Git base SHA before acquiring SQLite's write
+    // lock.  The resulting value is only a candidate: the transaction below
+    // re-reads the task and keeps a base SHA that another winner may already
+    // have bound.
+    let resolvedBaseSha: string | null = taskForGit.base_sha;
     if (managerMsg.decision === 'EXECUTE') {
-      if (!boundBaseSha) {
-        const project = this.repo.getProject(task.project_id);
+      if (!resolvedBaseSha) {
+        const project = this.repo.getProject(taskForGit.project_id);
         if (!project) {
-          return { success: false, error: `Project "${task.project_id}" not found.` };
+          return { success: false, error: `Project "${taskForGit.project_id}" not found.` };
         }
 
         const headShaRes = await GitService.getHeadSha(project.repository_path);
         if (headShaRes.status !== 'SUCCESS' || !headShaRes.sha) {
           const reason = `Cannot begin coding: Git repository HEAD SHA could not be authoritatively resolved (${headShaRes.errorMessage || 'git rev-parse HEAD failed'}).`;
+          return rejectBeforeGit(reason);
+        }
+        resolvedBaseSha = headShaRes.sha;
+      }
+    }
+
+    try {
+      return this.repo.runInImmediateTransaction(() => {
+        // The idempotency check must be repeated after acquiring the write
+        // lock.  A concurrent caller may have inserted this message while the
+        // Git lookup above was in flight.
+        const existing = this.repo.getProtocolMessageById(managerMsg.message_id);
+        if (existing) {
+          return {
+            success: true,
+            isDuplicate: true,
+            message: `Manager decision "${managerMsg.message_id}" was already processed.`,
+          };
+        }
+
+        const task = this.repo.getTask(taskId);
+        if (!task) return { success: false, error: `Task "${taskId}" does not exist.` };
+
+        const reject = (reason: string): ApplyProtocolResult => {
           this.repo.recordProtocolMessage(
             crypto.randomUUID(),
             managerMsg.message_id,
@@ -284,125 +301,115 @@ export class TaskService {
             reason
           );
           return { success: false, error: reason };
+        };
+
+        if (managerMsg.project_id !== task.project_id) {
+          return reject(`Cross-project conflict: Protocol targets project "${managerMsg.project_id}", but task belongs to "${task.project_id}".`);
         }
-        boundBaseSha = headShaRes.sha;
-      }
-    }
+        if (managerMsg.expected_task_state && managerMsg.expected_task_state !== task.state) {
+          return reject(`Stale state conflict: Manager expected state "${managerMsg.expected_task_state}", but task is in "${task.state}".`);
+        }
+        if (
+          managerMsg.expected_revision !== null &&
+          managerMsg.expected_revision !== undefined &&
+          managerMsg.expected_revision !== task.revision_count
+        ) {
+          return reject(`Stale revision conflict: Manager expected revision ${managerMsg.expected_revision}, but task revision is ${task.revision_count}.`);
+        }
 
-    // 6. Evaluate state machine transition
-    let transitionRes;
-    try {
-      transitionRes = TaskStateMachine.transition(task.state, trigger, {
-        revisionCount: task.revision_count,
-        maxRevisions: task.max_revisions,
-        pausedFromState: task.paused_from_state,
-      });
-    } catch (err: any) {
-      const reason = `State Machine Error: ${err.message}`;
-      this.repo.recordProtocolMessage(
-        crypto.randomUUID(),
-        managerMsg.message_id,
-        'manager.v1',
-        task.project_id,
-        task.id,
-        managerMsg.expected_task_state ?? null,
-        managerMsg.expected_revision ?? null,
-        computedHash,
-        rawPayload,
-        'REJECTED',
-        reason
-      );
-      return { success: false, error: reason };
-    }
+        let transitionRes;
+        try {
+          transitionRes = TaskStateMachine.transition(task.state, trigger, {
+            revisionCount: task.revision_count,
+            maxRevisions: task.max_revisions,
+            pausedFromState: task.paused_from_state,
+          });
+        } catch (err: any) {
+          return reject(`State Machine Error: ${err.message}`);
+        }
 
-    // 7. Execute atomic database transaction
-    const mutate = () => {
-      this.repo.updateTaskState(
-        task.id,
-        transitionRes.nextState,
-        transitionRes.pausedFromState,
-        transitionRes.incrementRevision
-      );
+        // This CAS is deliberately keyed by the snapshot read inside the
+        // immediate transaction.  It protects against any writer that changed
+        // the task between a caller's preflight and this mutation, while the
+        // transaction keeps the state change and APPLIED ledger row atomic.
+        if (!this.repo.compareAndSwapTaskState(
+          task.id,
+          task.state,
+          task.revision_count,
+          transitionRes.nextState,
+          transitionRes.pausedFromState,
+          transitionRes.incrementRevision
+        )) {
+          return reject(`Stale task conflict: Manager decision could not commit because task "${task.id}" changed concurrently.`);
+        }
 
-      // Immutably bind base commit SHA if determined
-      if (boundBaseSha && boundBaseSha !== task.base_sha) {
-        this.repo.updateTaskShas(task.id, boundBaseSha, task.current_sha);
-      }
+        const boundBaseSha = task.base_sha ?? resolvedBaseSha;
+        if (boundBaseSha && boundBaseSha !== task.base_sha) {
+          this.repo.updateTaskShas(task.id, boundBaseSha, task.current_sha);
+        }
 
-      // Record review entity if this was a review decision
-      if (managerMsg.decision === 'PASS' || managerMsg.decision === 'FIX_REQUIRED') {
-        const reviewId = crypto.randomUUID();
-        this.repo.createReview({
-          id: reviewId,
-          task_id: task.id,
-          attempt_id: null,
-          reviewer_agent_id: null,
-          verdict: managerMsg.decision === 'PASS' ? 'PASS' : 'FIX_REQUIRED',
-          summary: managerMsg.instructions.join('\n') || `Manager decision: ${managerMsg.decision}`,
-          issues: (managerMsg.review_issues || []).map((iss) => ({
-            id: crypto.randomUUID(),
-            review_id: reviewId,
-            severity: iss.severity,
-            file_path: iss.file_path || null,
-            line_number: iss.line_number || null,
-            title: iss.title,
-            description: iss.description,
-            resolved: false,
-          })),
-          created_at: new Date().toISOString(),
+        if (managerMsg.decision === 'PASS' || managerMsg.decision === 'FIX_REQUIRED') {
+          const reviewId = crypto.randomUUID();
+          this.repo.createReview({
+            id: reviewId,
+            task_id: task.id,
+            attempt_id: null,
+            reviewer_agent_id: null,
+            verdict: managerMsg.decision === 'PASS' ? 'PASS' : 'FIX_REQUIRED',
+            summary: managerMsg.instructions.join('\n') || `Manager decision: ${managerMsg.decision}`,
+            issues: (managerMsg.review_issues || []).map((iss) => ({
+              id: crypto.randomUUID(),
+              review_id: reviewId,
+              severity: iss.severity,
+              file_path: iss.file_path || null,
+              line_number: iss.line_number || null,
+              title: iss.title,
+              description: iss.description,
+              resolved: false,
+            })),
+            created_at: new Date().toISOString(),
+          });
+        }
+
+        const updatedTask = this.repo.getTask(task.id)!;
+        const latestTest = this.repo.getLatestTestRun(task.id);
+        const latestDiffEv = this.repo.getLatestEvidence(task.id, 'GIT_DIFF');
+        const verifCmds = this.repo.getVerificationCommandsByProject(task.project_id);
+        const hasLintConfig = verifCmds.some((c) => c.command_type === 'LINT' && c.enabled);
+        const progress = ProgressService.calculateTaskProgress(updatedTask, {
+          hasGitDiff: Boolean(latestDiffEv) || updatedTask.current_sha !== null,
+          testsPassed: latestTest?.exit_code === 0,
+          hasEvidence: Boolean(latestDiffEv),
+          excludeUnconfiguredLint: !hasLintConfig,
+          lintPassed: false,
         });
-      }
-
-      // Update derived progress
-      const updatedTask = this.repo.getTask(task.id)!;
-      const latestTest = this.repo.getLatestTestRun(task.id);
-      const latestDiffEv = this.repo.getLatestEvidence(task.id, 'GIT_DIFF');
-      const verifCmds = this.repo.getVerificationCommandsByProject(task.project_id);
-      const hasLintConfig = verifCmds.some((c) => c.command_type === 'LINT' && c.enabled);
-
-      const progress = ProgressService.calculateTaskProgress(updatedTask, {
-        hasGitDiff: Boolean(latestDiffEv) || updatedTask.current_sha !== null,
-        testsPassed: latestTest?.exit_code === 0,
-        hasEvidence: Boolean(latestDiffEv),
-        excludeUnconfiguredLint: !hasLintConfig,
-        lintPassed: false,
+        this.repo.updateTaskProgressCache(task.id, progress.percent);
+        this.repo.invalidateAuthorizedExecutionAuthorizationsForTask(task.id);
+        this.repo.recordProtocolMessage(
+          crypto.randomUUID(),
+          managerMsg.message_id,
+          'manager.v1',
+          managerMsg.project_id,
+          task.id,
+          managerMsg.expected_task_state ?? null,
+          managerMsg.expected_revision ?? null,
+          computedHash,
+          rawPayload,
+          'APPLIED'
+        );
+        this.eventService.record(
+          managerMsg.project_id,
+          'MANAGER_DECISION_APPLIED',
+          `Manager decision "${managerMsg.decision}" applied to task ${task.id} (${task.state} -> ${transitionRes.nextState}).`,
+          { decision: managerMsg.decision, fromState: task.state, toState: transitionRes.nextState, baseSha: boundBaseSha },
+          task.id
+        );
+        return {
+          success: true,
+          message: `Task ${task.id} transitioned to ${transitionRes.nextState}.`,
+          task: this.repo.getTask(task.id)!,
+        };
       });
-      this.repo.updateTaskProgressCache(task.id, progress.percent);
-
-      // Invalidate all previous still-AUTHORIZED execution authorizations for this task (same transaction)
-      this.repo.invalidateAuthorizedExecutionAuthorizationsForTask(task.id);
-
-      // Record in protocol messages ledger
-      this.repo.recordProtocolMessage(
-        crypto.randomUUID(),
-        managerMsg.message_id,
-        'manager.v1',
-        managerMsg.project_id,
-        task.id,
-        managerMsg.expected_task_state ?? null,
-        managerMsg.expected_revision ?? null,
-        computedHash,
-        rawPayload,
-        'APPLIED'
-      );
-
-      this.eventService.record(
-        managerMsg.project_id,
-        'MANAGER_DECISION_APPLIED',
-        `Manager decision "${managerMsg.decision}" applied to task ${task.id} (${task.state} -> ${transitionRes.nextState}).`,
-        { decision: managerMsg.decision, fromState: task.state, toState: transitionRes.nextState, baseSha: boundBaseSha },
-        task.id
-      );
-
-      return {
-        success: true,
-        message: `Task ${task.id} transitioned to ${transitionRes.nextState}.`,
-        task: this.repo.getTask(task.id)!,
-      };
-    };
-
-    try {
-      return this.repo.runInTransaction(mutate);
     } catch (err: any) {
       return { success: false, error: err.message };
     }
@@ -414,7 +421,8 @@ export class TaskService {
   ): ApplyProtocolResult {
     const computedHash = crypto.createHash('sha256').update(rawPayload, 'utf8').digest('hex');
 
-    // 1. Idempotency Check
+    // Preserve the inexpensive replay fast path while repeating the check in
+    // the transaction below to close the preflight race.
     const existingMsg = this.repo.getProtocolMessageById(coderMsg.message_id);
     if (existingMsg) {
       return {
@@ -424,72 +432,7 @@ export class TaskService {
       };
     }
 
-    const task = this.repo.getTask(coderMsg.task_id);
-    if (!task) {
-      return { success: false, error: `Task "${coderMsg.task_id}" does not exist.` };
-    }
-
-    // 2. Cross-Project Guard
-    if (coderMsg.project_id !== task.project_id) {
-      const reason = `Cross-project conflict: Protocol targets project "${coderMsg.project_id}", but task belongs to "${task.project_id}".`;
-      this.repo.recordProtocolMessage(
-        crypto.randomUUID(),
-        coderMsg.message_id,
-        'coder.v1',
-        task.project_id,
-        task.id,
-        coderMsg.expected_task_state ?? null,
-        coderMsg.expected_revision ?? null,
-        computedHash,
-        rawPayload,
-        'REJECTED',
-        reason
-      );
-      return { success: false, error: reason };
-    }
-
-    // 3. Stale State & Revision Guard
-    if (coderMsg.expected_task_state && coderMsg.expected_task_state !== task.state) {
-      const reason = `Stale state conflict: Coder expected state "${coderMsg.expected_task_state}", but task is in "${task.state}".`;
-      this.repo.recordProtocolMessage(
-        crypto.randomUUID(),
-        coderMsg.message_id,
-        'coder.v1',
-        task.project_id,
-        task.id,
-        coderMsg.expected_task_state,
-        coderMsg.expected_revision ?? null,
-        computedHash,
-        rawPayload,
-        'REJECTED',
-        reason
-      );
-      return { success: false, error: reason };
-    }
-
-    if (
-      coderMsg.expected_revision !== null &&
-      coderMsg.expected_revision !== undefined &&
-      coderMsg.expected_revision !== task.revision_count
-    ) {
-      const reason = `Stale revision conflict: Coder expected revision ${coderMsg.expected_revision}, but task revision is ${task.revision_count}.`;
-      this.repo.recordProtocolMessage(
-        crypto.randomUUID(),
-        coderMsg.message_id,
-        'coder.v1',
-        task.project_id,
-        task.id,
-        coderMsg.expected_task_state ?? null,
-        coderMsg.expected_revision,
-        computedHash,
-        rawPayload,
-        'REJECTED',
-        reason
-      );
-      return { success: false, error: reason };
-    }
-
-    // 4. Determine state machine trigger based on discrete coder status
+    // Determine the state-machine trigger before opening the transaction.
     let trigger: TaskTrigger;
     if (coderMsg.status === 'COMPLETED') {
       if (coderMsg.review_requested) {
@@ -507,70 +450,98 @@ export class TaskService {
       trigger = 'SUBMIT_REPORT';
     }
 
-    let transitionRes;
     try {
-      transitionRes = TaskStateMachine.transition(task.state, trigger, {
-        revisionCount: task.revision_count,
-        maxRevisions: task.max_revisions,
-        pausedFromState: task.paused_from_state,
+      return this.repo.runInImmediateTransaction(() => {
+        const existing = this.repo.getProtocolMessageById(coderMsg.message_id);
+        if (existing) {
+          return {
+            success: true,
+            isDuplicate: true,
+            message: `Coder report "${coderMsg.message_id}" was already processed.`,
+          };
+        }
+
+        const task = this.repo.getTask(coderMsg.task_id);
+        if (!task) return { success: false, error: `Task "${coderMsg.task_id}" does not exist.` };
+
+        const reject = (reason: string): ApplyProtocolResult => {
+          this.repo.recordProtocolMessage(
+            crypto.randomUUID(),
+            coderMsg.message_id,
+            'coder.v1',
+            task.project_id,
+            task.id,
+            coderMsg.expected_task_state ?? null,
+            coderMsg.expected_revision ?? null,
+            computedHash,
+            rawPayload,
+            'REJECTED',
+            reason
+          );
+          return { success: false, error: reason };
+        };
+
+        if (coderMsg.project_id !== task.project_id) {
+          return reject(`Cross-project conflict: Protocol targets project "${coderMsg.project_id}", but task belongs to "${task.project_id}".`);
+        }
+        if (coderMsg.expected_task_state && coderMsg.expected_task_state !== task.state) {
+          return reject(`Stale state conflict: Coder expected state "${coderMsg.expected_task_state}", but task is in "${task.state}".`);
+        }
+        if (
+          coderMsg.expected_revision !== null &&
+          coderMsg.expected_revision !== undefined &&
+          coderMsg.expected_revision !== task.revision_count
+        ) {
+          return reject(`Stale revision conflict: Coder expected revision ${coderMsg.expected_revision}, but task revision is ${task.revision_count}.`);
+        }
+
+        let transitionRes;
+        try {
+          transitionRes = TaskStateMachine.transition(task.state, trigger, {
+            revisionCount: task.revision_count,
+            maxRevisions: task.max_revisions,
+            pausedFromState: task.paused_from_state,
+          });
+        } catch (err: any) {
+          return reject(`State Machine Error: ${err.message}`);
+        }
+
+        if (!this.repo.compareAndSwapTaskState(
+          task.id,
+          task.state,
+          task.revision_count,
+          transitionRes.nextState,
+          transitionRes.pausedFromState,
+          transitionRes.incrementRevision
+        )) {
+          return reject(`Stale task conflict: Coder report could not commit because task "${task.id}" changed concurrently.`);
+        }
+
+        this.repo.recordProtocolMessage(
+          crypto.randomUUID(),
+          coderMsg.message_id,
+          'coder.v1',
+          coderMsg.project_id,
+          task.id,
+          coderMsg.expected_task_state ?? null,
+          coderMsg.expected_revision ?? null,
+          computedHash,
+          rawPayload,
+          'APPLIED'
+        );
+        this.eventService.record(
+          coderMsg.project_id,
+          'CODER_REPORT_APPLIED',
+          `Coder report applied to task ${task.id} (${task.state} -> ${transitionRes.nextState}). Status: ${coderMsg.status}.`,
+          { status: coderMsg.status, fromState: task.state, toState: transitionRes.nextState },
+          task.id
+        );
+        return {
+          success: true,
+          message: `Task ${task.id} transitioned to ${transitionRes.nextState}.`,
+          task: this.repo.getTask(task.id)!,
+        };
       });
-    } catch (err: any) {
-      const reason = `State Machine Error: ${err.message}`;
-      this.repo.recordProtocolMessage(
-        crypto.randomUUID(),
-        coderMsg.message_id,
-        'coder.v1',
-        task.project_id,
-        task.id,
-        coderMsg.expected_task_state ?? null,
-        coderMsg.expected_revision ?? null,
-        computedHash,
-        rawPayload,
-        'REJECTED',
-        reason
-      );
-      return { success: false, error: reason };
-    }
-
-    const mutate = () => {
-      this.repo.updateTaskState(
-        task.id,
-        transitionRes.nextState,
-        transitionRes.pausedFromState,
-        transitionRes.incrementRevision
-      );
-
-      // Record in protocol ledger
-      this.repo.recordProtocolMessage(
-        crypto.randomUUID(),
-        coderMsg.message_id,
-        'coder.v1',
-        coderMsg.project_id,
-        task.id,
-        coderMsg.expected_task_state ?? null,
-        coderMsg.expected_revision ?? null,
-        computedHash,
-        rawPayload,
-        'APPLIED'
-      );
-
-      this.eventService.record(
-        coderMsg.project_id,
-        'CODER_REPORT_APPLIED',
-        `Coder report applied to task ${task.id} (${task.state} -> ${transitionRes.nextState}). Status: ${coderMsg.status}.`,
-        { status: coderMsg.status, fromState: task.state, toState: transitionRes.nextState },
-        task.id
-      );
-
-      return {
-        success: true,
-        message: `Task ${task.id} transitioned to ${transitionRes.nextState}.`,
-        task: this.repo.getTask(task.id)!,
-      };
-    };
-
-    try {
-      return this.repo.runInTransaction(mutate);
     } catch (err: any) {
       return { success: false, error: err.message };
     }

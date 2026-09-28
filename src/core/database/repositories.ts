@@ -359,6 +359,32 @@ export class Repository {
     }
   }
 
+  /**
+   * Atomically transitions a task only when the caller still owns the exact
+   * state/revision snapshot it validated.  Protocol handlers use this inside
+   * an IMMEDIATE transaction so a concurrent decision cannot overwrite the
+   * winner after doing its own preflight work.
+   */
+  public compareAndSwapTaskState(
+    id: string,
+    expectedState: TaskState,
+    expectedRevision: number,
+    state: TaskState,
+    pausedFromState: string | null = null,
+    incrementRevision: boolean = false
+  ): boolean {
+    const now = new Date().toISOString();
+    const revisionClause = incrementRevision ? 'revision_count = revision_count + 1,' : '';
+    const info = this.db
+      .prepare(`
+        UPDATE tasks
+        SET state = ?, paused_from_state = ?, ${revisionClause} updated_at = ?
+        WHERE id = ? AND state = ? AND revision_count = ?
+      `)
+      .run(state, pausedFromState, now, id, expectedState, expectedRevision);
+    return info.changes === 1;
+  }
+
   public updateTaskShas(id: string, baseSha?: string | null, currentSha?: string | null): void {
     const now = new Date().toISOString();
     this.db

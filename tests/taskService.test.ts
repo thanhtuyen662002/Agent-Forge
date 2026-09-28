@@ -315,4 +315,76 @@ describe('TaskService & Protocol Idempotency', () => {
     // Planning (10) + ManagerReview (10) = 20 points earned out of 85 applicable = 24%
     expect(taskDone.progress_cache_percent).toBe(24);
   });
+
+  it('atomically fences concurrent Manager decisions with the same state and revision', async () => {
+    const managerMessages: ManagerProtocol[] = ['msg-manager-race-a', 'msg-manager-race-b'].map((message_id) => ({
+      protocol: 'manager.v1',
+      message_id,
+      project_id: 'PROJ-TEST',
+      task_id: 'TSK-001',
+      decision: 'EXECUTE',
+      priority: 'HIGH',
+      risk: 'MEDIUM',
+      instructions: [],
+      acceptance_criteria: [],
+      constraints: [],
+      review_issues: [],
+      expected_task_state: 'PLANNED',
+      expected_revision: 0,
+    }));
+
+    const results = await Promise.all(
+      managerMessages.map((message) => taskService.applyManagerDecision(message, JSON.stringify(message)))
+    );
+
+    expect(results.filter((result) => result.success)).toHaveLength(1);
+    expect(results.filter((result) => !result.success)).toHaveLength(1);
+    expect(results.find((result) => !result.success)?.error).toMatch(/Stale (state|task) conflict/);
+
+    const task = repo.getTask('TSK-001')!;
+    expect(task.state).toBe('CODING');
+    expect(task.revision_count).toBe(0);
+
+    const ledger = repo.getProtocolMessagesByTask('TSK-001');
+    expect(ledger).toHaveLength(2);
+    expect(ledger.filter((message) => message.status === 'APPLIED')).toHaveLength(1);
+    expect(ledger.filter((message) => message.status === 'REJECTED')).toHaveLength(1);
+  });
+
+  it('atomically fences concurrent Coder reports with the same state and revision', async () => {
+    repo.updateTaskState('TSK-001', 'CODING');
+    const coderMessages: CoderProtocol[] = ['msg-coder-race-a', 'msg-coder-race-b'].map((message_id) => ({
+      protocol: 'coder.v1',
+      message_id,
+      project_id: 'PROJ-TEST',
+      task_id: 'TSK-001',
+      attempt: 1,
+      status: 'COMPLETED',
+      completed: ['Done'],
+      remaining: [],
+      files_claimed_changed: ['auth.ts'],
+      tests_claimed: ['npm test'],
+      blockers: [],
+      review_requested: true,
+      expected_task_state: 'CODING',
+      expected_revision: 0,
+    }));
+
+    const results = await Promise.all(
+      coderMessages.map((message) => Promise.resolve().then(() => taskService.applyCoderReport(message, JSON.stringify(message))))
+    );
+
+    expect(results.filter((result) => result.success)).toHaveLength(1);
+    expect(results.filter((result) => !result.success)).toHaveLength(1);
+    expect(results.find((result) => !result.success)?.error).toMatch(/Stale (state|task) conflict/);
+
+    const task = repo.getTask('TSK-001')!;
+    expect(task.state).toBe('VALIDATING');
+    expect(task.revision_count).toBe(0);
+
+    const ledger = repo.getProtocolMessagesByTask('TSK-001');
+    expect(ledger).toHaveLength(2);
+    expect(ledger.filter((message) => message.status === 'APPLIED')).toHaveLength(1);
+    expect(ledger.filter((message) => message.status === 'REJECTED')).toHaveLength(1);
+  });
 });
