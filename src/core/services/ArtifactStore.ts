@@ -66,10 +66,11 @@ const POSIX_DESCRIPTOR_ANCHOR =
  * so all artifact operations can stay attached to the directory that was
  * checked.  Node's portable Windows API does not expose the Win32
  * FILE_FLAG_OPEN_REPARSE_POINT/handle-relative calls needed for the same
- * guarantee.  Windows therefore uses lstat/realpath identity fences and
- * rejects every observed root, parent, leaf, or atomic-publish change with a
- * typed integrity error; the limitation is deliberately explicit so a caller
- * cannot mistake the fallback for an absolute no-reparse guarantee.
+ * guarantee (and other non-Linux platforms may lack `/proc/self/fd`).  Those
+ * fallbacks use lstat/realpath identity fences and reject every observed
+ * root, parent, leaf, or atomic-publish change with a typed integrity error;
+ * the limitation is deliberately explicit so a caller cannot mistake the
+ * fallback for an absolute no-reparse guarantee.
  */
 
 function isErrno(error: unknown, code: string): boolean {
