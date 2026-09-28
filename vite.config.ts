@@ -21,5 +21,6 @@ export default defineConfig({
   test: {
     testTimeout: 30000,
     hookTimeout: 60000,
+    setupFiles: ['./tests/testOutputSanitizer.ts'],
   },
 });
