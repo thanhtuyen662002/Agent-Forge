@@ -166,6 +166,18 @@ export class ProcessRunner {
     return { value: timeoutMs };
   }
 
+  private static normalizeInternalTimeout(timeoutMs: unknown, fallbackMs: number, maxMs: number): number {
+    if (
+      typeof timeoutMs !== 'number' ||
+      !Number.isFinite(timeoutMs) ||
+      !Number.isSafeInteger(timeoutMs) ||
+      timeoutMs <= 0
+    ) {
+      return fallbackMs;
+    }
+    return Math.min(timeoutMs, maxMs);
+  }
+
   /**
    * Keep OS/process-launch diagnostics useful without copying arbitrary
    * exception messages (which can contain paths, arguments, or secrets) into
@@ -1304,6 +1316,7 @@ export class ProcessRunner {
   ): Promise<ProcessTerminationTruth> {
     if (!child.pid) return Promise.resolve('NOT_APPLICABLE');
     const pid = child.pid;
+    const effectiveTimeoutMs = this.normalizeInternalTimeout(timeoutMs, 5000, this.MAX_TIMEOUT_MS);
     const existing = this.terminationPromises.get(pid);
     if (existing) {
       return existing;
@@ -1331,7 +1344,7 @@ export class ProcessRunner {
                 }
               }
               resolve(null);
-            }, timeoutMs);
+            }, effectiveTimeoutMs);
             tk.on('error', () => {
               clearTimeout(timer);
               resolve(null);
@@ -1343,7 +1356,7 @@ export class ProcessRunner {
           });
 
           // Explicit bounded post-kill liveness verification
-          const isDead = await ProcessRunner.verifyProcessDeadWithDeadline(pid, timeoutMs);
+          const isDead = await ProcessRunner.verifyProcessDeadWithDeadline(pid, effectiveTimeoutMs);
 
           if (isDead && (taskkillExitCode === 0 || taskkillExitCode === 128)) {
             return 'PROCESS_TREE_TERMINATED_PROVEN';
@@ -1362,7 +1375,7 @@ export class ProcessRunner {
               }
             }
           }
-          const isDead = await ProcessRunner.verifyProcessDeadWithDeadline(pid, timeoutMs);
+          const isDead = await ProcessRunner.verifyProcessDeadWithDeadline(pid, effectiveTimeoutMs);
           return isDead ? 'PROCESS_TREE_TERMINATED_PROVEN' : 'TERMINATION_UNRESOLVED';
         }
       } catch (termErr: unknown) {
@@ -1377,7 +1390,8 @@ export class ProcessRunner {
   }
 
   public static async verifyProcessDeadWithDeadline(pid: number, timeoutMs = 2000): Promise<boolean> {
-    const deadline = Date.now() + Math.min(timeoutMs, 2000);
+    const effectiveTimeoutMs = this.normalizeInternalTimeout(timeoutMs, 2000, 2000);
+    const deadline = Date.now() + effectiveTimeoutMs;
     while (Date.now() <= deadline) {
       try {
         process.kill(pid, 0);
