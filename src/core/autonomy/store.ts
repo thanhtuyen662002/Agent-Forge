@@ -290,7 +290,14 @@ export const AUTONOMY_SCHEMA_SQL = `
     UNIQUE(context_sha, expected_head_sha)
   );
   CREATE INDEX IF NOT EXISTS idx_autonomy_review_capacity_due ON autonomy_review_capacity_waits(state, next_attempt_at);
-  CREATE TABLE IF NOT EXISTS autonomy_owner (id INTEGER PRIMARY KEY CHECK(id=1), pid INTEGER NOT NULL, token TEXT NOT NULL, stop_requested INTEGER NOT NULL DEFAULT 0);
+  CREATE TABLE IF NOT EXISTS autonomy_owner (
+    id INTEGER PRIMARY KEY CHECK(id=1),
+    pid INTEGER NOT NULL,
+    token TEXT NOT NULL,
+    owner_epoch INTEGER NOT NULL DEFAULT 0,
+    heartbeat_at TEXT NOT NULL DEFAULT '',
+    stop_requested INTEGER NOT NULL DEFAULT 0
+  );
   CREATE TABLE IF NOT EXISTS autonomy_compatibility_inventory (
     table_name TEXT PRIMARY KEY,
     total_rows INTEGER NOT NULL,
@@ -303,6 +310,12 @@ export const AUTONOMY_SCHEMA_SQL = `
 `;
 
 export class AutonomyStore {
+  /** A supervisor must refresh its durable owner claim before this interval expires. */
+  static readonly OWNER_HEARTBEAT_TTL_MS = 30_000;
+
+  /** Token acquired by this store instance; used to fence stale local work. */
+  private activeOwnerToken: string | null = null;
+
   constructor(private readonly db: Database.Database) { this.ensureSchema(); }
 
   static open(runtimeRoot: string): { store: AutonomyStore; engine: DatabaseEngine; dbPath: string } {
@@ -338,7 +351,16 @@ export class AutonomyStore {
   }
 
   ensureSchema(): void {
-    this.db.transaction(() => this.db.exec(AUTONOMY_SCHEMA_SQL))();
+    this.db.transaction(() => {
+      this.db.exec(AUTONOMY_SCHEMA_SQL);
+      // AUTONOMY_SCHEMA_SQL is intentionally idempotent, but CREATE TABLE IF
+      // NOT EXISTS does not add columns to databases created by an older
+      // build. Keep the owner fence backward compatible without relying on a
+      // product migration version bump.
+      const columns = new Set((this.db.prepare('PRAGMA table_info(autonomy_owner)').all() as Array<{ name: string }>).map((column) => column.name));
+      if (!columns.has('owner_epoch')) this.db.exec("ALTER TABLE autonomy_owner ADD COLUMN owner_epoch INTEGER NOT NULL DEFAULT 0");
+      if (!columns.has('heartbeat_at')) this.db.exec("ALTER TABLE autonomy_owner ADD COLUMN heartbeat_at TEXT NOT NULL DEFAULT ''");
+    }).immediate();
   }
 
   ensureSlots(maxWorkers: number): void {
@@ -397,18 +419,72 @@ export class AutonomyStore {
   }
 
   acquireOwner(): string {
-    return this.db.transaction(() => {
-      const owner = this.db.prepare('SELECT pid FROM autonomy_owner WHERE id=1').get() as { pid: number } | undefined;
-      if (owner && AutonomyStore.isAlive(owner.pid)) throw new Error('SUPERVISOR_ALREADY_RUNNING');
-      const token = crypto.randomUUID();
-      this.db.prepare('INSERT OR REPLACE INTO autonomy_owner(id,pid,token,stop_requested) VALUES(1,?,?,0)').run(process.pid, token);
-      return token;
-    })();
+    const token = this.db.transaction(() => {
+      const owner = this.db.prepare('SELECT pid,token,owner_epoch,heartbeat_at FROM autonomy_owner WHERE id=1').get() as {
+        pid: number;
+        token: string;
+        owner_epoch: number;
+        heartbeat_at: string;
+      } | undefined;
+      if (owner && AutonomyStore.isAlive(owner.pid)) {
+        // A legacy row has no heartbeat. Treat a live PID as active until the
+        // first owner heartbeat is written; this prevents an upgrade from
+        // stealing a running supervisor's claim.
+        const heartbeatMs = owner.heartbeat_at ? Date.parse(owner.heartbeat_at) : Date.now();
+        const heartbeatFresh = Number.isFinite(heartbeatMs)
+          && Date.now() - heartbeatMs <= AutonomyStore.OWNER_HEARTBEAT_TTL_MS;
+        if (heartbeatFresh) throw new Error('SUPERVISOR_ALREADY_RUNNING');
+      }
+      const previousEpoch = owner?.owner_epoch ?? 0;
+      if (!Number.isSafeInteger(previousEpoch) || previousEpoch >= Number.MAX_SAFE_INTEGER) {
+        throw new Error('SUPERVISOR_OWNER_EPOCH_EXHAUSTED');
+      }
+      const nextEpoch = previousEpoch + 1;
+      const now = new Date().toISOString();
+      const nextToken = crypto.randomUUID();
+      this.db.prepare(
+        `INSERT INTO autonomy_owner(id,pid,token,owner_epoch,heartbeat_at,stop_requested)
+         VALUES(1,?,?,?,?,0)
+         ON CONFLICT(id) DO UPDATE SET
+           pid=excluded.pid,
+           token=excluded.token,
+           owner_epoch=excluded.owner_epoch,
+           heartbeat_at=excluded.heartbeat_at,
+           stop_requested=0`,
+      ).run(process.pid, nextToken, nextEpoch, now);
+      return nextToken;
+    }).immediate();
+    this.activeOwnerToken = token;
+    return token;
   }
 
-  releaseOwner(token: string): void { this.db.prepare('DELETE FROM autonomy_owner WHERE id=1 AND token=?').run(token); }
-  requestStop(): void { this.db.prepare('UPDATE autonomy_owner SET stop_requested=1 WHERE id=1').run(); }
-  shouldStop(): boolean { return !!(this.db.prepare('SELECT stop_requested FROM autonomy_owner WHERE id=1').get() as {stop_requested:number}|undefined)?.stop_requested; }
+  /** Refresh the claim only when this exact token still owns the row. */
+  heartbeatOwner(token: string = this.activeOwnerToken ?? ''): boolean {
+    if (!token) return false;
+    const result = this.db.prepare('UPDATE autonomy_owner SET heartbeat_at=? WHERE id=1 AND token=?').run(new Date().toISOString(), token);
+    return result.changes === 1;
+  }
+
+  /** Release is token-fenced; a stale owner cannot delete a replacement claim. */
+  releaseOwner(token: string): void {
+    this.db.prepare('DELETE FROM autonomy_owner WHERE id=1 AND token=?').run(token);
+    if (this.activeOwnerToken === token) this.activeOwnerToken = null;
+  }
+
+  /** An operator may request a stop globally; an owner may scope it to its token. */
+  requestStop(token?: string): void {
+    if (token) this.db.prepare('UPDATE autonomy_owner SET stop_requested=1 WHERE id=1 AND token=?').run(token);
+    else this.db.prepare('UPDATE autonomy_owner SET stop_requested=1 WHERE id=1').run();
+  }
+
+  /** A fenced local owner observes replacement/loss as a stop condition. */
+  shouldStop(token: string = this.activeOwnerToken ?? ''): boolean {
+    if (token) {
+      const owner = this.db.prepare('SELECT stop_requested FROM autonomy_owner WHERE id=1 AND token=?').get(token) as { stop_requested: number } | undefined;
+      return !owner || owner.stop_requested === 1;
+    }
+    return !!(this.db.prepare('SELECT stop_requested FROM autonomy_owner WHERE id=1').get() as {stop_requested:number}|undefined)?.stop_requested;
+  }
   static isAlive(pid: number): boolean { try { process.kill(pid, 0); return true; } catch (error) { return (error as NodeJS.ErrnoException).code !== 'ESRCH'; } }
 
   listReady(): AutonomyWorkOrderRow[] {
