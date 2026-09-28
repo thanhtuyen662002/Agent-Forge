@@ -179,6 +179,49 @@ export class TaskService {
       return { success: false, error: `Task "${managerMsg.task_id}" does not exist.` };
     }
 
+    // Preserve fail-closed preflight behavior for guards that do not require
+    // Git.  The same checks are repeated inside the immediate transaction so
+    // a matching preflight can never authorize a stale post-Git mutation.
+    const rejectBeforeGit = (reason: string): ApplyProtocolResult => this.repo.runInImmediateTransaction(() => {
+      const existing = this.repo.getProtocolMessageById(managerMsg.message_id);
+      if (existing) {
+        return {
+          success: true,
+          isDuplicate: true,
+          message: `Manager decision "${managerMsg.message_id}" was already processed.`,
+        };
+      }
+      const current = this.repo.getTask(taskId);
+      if (!current) return { success: false, error: `Task "${taskId}" does not exist.` };
+      this.repo.recordProtocolMessage(
+        crypto.randomUUID(),
+        managerMsg.message_id,
+        'manager.v1',
+        current.project_id,
+        current.id,
+        managerMsg.expected_task_state ?? null,
+        managerMsg.expected_revision ?? null,
+        computedHash,
+        rawPayload,
+        'REJECTED',
+        reason
+      );
+      return { success: false, error: reason };
+    });
+    if (managerMsg.project_id !== taskForGit.project_id) {
+      return rejectBeforeGit(`Cross-project conflict: Protocol targets project "${managerMsg.project_id}", but task belongs to "${taskForGit.project_id}".`);
+    }
+    if (managerMsg.expected_task_state && managerMsg.expected_task_state !== taskForGit.state) {
+      return rejectBeforeGit(`Stale state conflict: Manager expected state "${managerMsg.expected_task_state}", but task is in "${taskForGit.state}".`);
+    }
+    if (
+      managerMsg.expected_revision !== null &&
+      managerMsg.expected_revision !== undefined &&
+      managerMsg.expected_revision !== taskForGit.revision_count
+    ) {
+      return rejectBeforeGit(`Stale revision conflict: Manager expected revision ${managerMsg.expected_revision}, but task revision is ${taskForGit.revision_count}.`);
+    }
+
     // Map the protocol decision before entering the transaction.  This is a
     // pure operation and keeps unsupported messages from creating ledger rows.
     let trigger: TaskTrigger;
@@ -220,32 +263,7 @@ export class TaskService {
         const headShaRes = await GitService.getHeadSha(project.repository_path);
         if (headShaRes.status !== 'SUCCESS' || !headShaRes.sha) {
           const reason = `Cannot begin coding: Git repository HEAD SHA could not be authoritatively resolved (${headShaRes.errorMessage || 'git rev-parse HEAD failed'}).`;
-          return this.repo.runInImmediateTransaction(() => {
-            const existing = this.repo.getProtocolMessageById(managerMsg.message_id);
-            if (existing) {
-              return {
-                success: true,
-                isDuplicate: true,
-                message: `Manager decision "${managerMsg.message_id}" was already processed.`,
-              };
-            }
-            const current = this.repo.getTask(taskId);
-            if (!current) return { success: false, error: `Task "${taskId}" does not exist.` };
-            this.repo.recordProtocolMessage(
-              crypto.randomUUID(),
-              managerMsg.message_id,
-              'manager.v1',
-              current.project_id,
-              current.id,
-              managerMsg.expected_task_state ?? null,
-              managerMsg.expected_revision ?? null,
-              computedHash,
-              rawPayload,
-              'REJECTED',
-              reason
-            );
-            return { success: false, error: reason };
-          });
+          return rejectBeforeGit(reason);
         }
         resolvedBaseSha = headShaRes.sha;
       }
