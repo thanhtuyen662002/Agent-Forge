@@ -96,7 +96,10 @@ jobs:
 
       - name: Run test suite (Windows)
         if: needs.classify.outputs.package_required == 'true' && runner.os == 'Windows'
-        run: npm test
+        # Windows file/process handles are more sensitive to unrelated Vitest
+        # workers. Keep both runner phases bounded to one worker on this OS;
+        # Ubuntu still exercises the broad parallel phase.
+        run: npm test -- --maxWorkers=1
 
       - name: Build application
         if: needs.classify.outputs.package_required == 'true'
