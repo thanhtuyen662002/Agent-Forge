@@ -87,13 +87,16 @@ jobs:
         if: needs.classify.outputs.package_required == 'true'
         run: npm ci
 
+      # The suite exercises real SQLite databases and child processes. Keep a
+      # single Vitest worker on every OS so temporary fixtures cannot be
+      # cleaned up while a sibling worker still holds a file or process handle.
       - name: Run test suite (Ubuntu)
         if: needs.classify.outputs.package_required == 'true' && runner.os != 'Windows'
         run: npm test
 
       - name: Run test suite (Windows)
         if: needs.classify.outputs.package_required == 'true' && runner.os == 'Windows'
-        run: npm test -- --maxWorkers=1
+        run: npm test
 
       - name: Build application
         if: needs.classify.outputs.package_required == 'true'

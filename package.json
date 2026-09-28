@@ -16,7 +16,7 @@
     "smoke:packaged:win": "powershell -ExecutionPolicy Bypass -File scripts/smoke-packaged-win.ps1",
     "smoke:dev:electron": "powershell -ExecutionPolicy Bypass -File scripts/smoke-dev-electron.ps1",
     "test:installed:win": "powershell -ExecutionPolicy Bypass -File scripts/test-installed-update-win.ps1",
-    "test": "vitest run",
+    "test": "node scripts/run-test-suite.cjs",
     "test:watch": "vitest",
     "mcp:stdio": "node dist-electron/mcp/stdio.js",
     "mcp:session-admin": "node dist-electron/mcp/sessionAdmin.js",
