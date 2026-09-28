@@ -1,6 +1,8 @@
 import { describe, it, expect, vi, afterEach } from 'vitest';
-import { GitService } from '../src/core/services/GitService';
+import { GitRevisionValidationError, GitService } from '../src/core/services/GitService';
 import { ProcessRunner } from '../src/core/services/ProcessRunner';
+import { EvidenceCollector } from '../src/core/autonomy/evidence';
+import { createWorkOrder, WorkOrder } from '../src/core/autonomy/contracts';
 import path from 'path';
 import fs from 'fs';
 import os from 'os';
@@ -139,6 +141,32 @@ describe('GitService Fail-Closed Behavior', () => {
       const result = await GitService.getDiff(fixture.root, 42 as unknown as string);
       expect(result.status).toBe('ERROR');
       expect(result.errorCode).toBe('INVALID_GIT_REVISION');
+      expect(execute).not.toHaveBeenCalled();
+    } finally {
+      fs.rmSync(fixture.root, { recursive: true, force: true });
+    }
+  });
+
+  it('fences the autonomy evidence collector before its first Git command', async () => {
+    const fixture = createGitFixture();
+    const execute = vi.fn();
+    const collector = new EvidenceCollector({ execute });
+    const order = createWorkOrder({
+      taskId: 'revision-boundary',
+      objective: 'collect evidence',
+      baseSha: fixture.baseSha,
+      branch: 'agent/revision-boundary',
+      worktree: fixture.root,
+      acceptanceCriteria: ['evidence is truthful'],
+      workerId: 'test-worker',
+    });
+    const invalidRevisions = ['--stat', `C:\\repo\\base`, `${fixture.baseSha}\n`];
+
+    try {
+      for (const revision of invalidRevisions) {
+        const forgedOrder = { ...order, base_sha: revision } as WorkOrder;
+        await expect(collector.collect(forgedOrder)).rejects.toBeInstanceOf(GitRevisionValidationError);
+      }
       expect(execute).not.toHaveBeenCalled();
     } finally {
       fs.rmSync(fixture.root, { recursive: true, force: true });
