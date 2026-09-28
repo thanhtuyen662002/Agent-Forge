@@ -65,8 +65,14 @@ const serialFiles = [
 
 const runParallel = () => runVitest('parallel', broadExclusions);
 const runSerialized = () => runVitest('serialized MCP/adjudication', ['--maxWorkers=1', ...serialFiles]);
+const runSingleWorker = () => runVitest('single deterministic worker', ['--maxWorkers=1']);
 
-if (process.env.AGENTFORGE_TEST_PHASE === 'parallel') {
+if (process.env.AGENTFORGE_TEST_SINGLE_RUN === '1') {
+  // Windows CI historically ran the entire suite in one Vitest process. Keep
+  // that mode available because splitting the process can retain native file
+  // handles between phases even when every phase uses one worker.
+  process.exitCode = runSingleWorker();
+} else if (process.env.AGENTFORGE_TEST_PHASE === 'parallel') {
   process.exitCode = runParallel();
 } else if (process.env.AGENTFORGE_TEST_PHASE === 'serialized') {
   process.exitCode = runSerialized();

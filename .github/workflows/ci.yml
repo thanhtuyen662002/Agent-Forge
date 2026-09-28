@@ -96,10 +96,12 @@ jobs:
 
       - name: Run test suite (Windows)
         if: needs.classify.outputs.package_required == 'true' && runner.os == 'Windows'
-        # Windows file/process handles are more sensitive to unrelated Vitest
-        # workers. Keep both runner phases bounded to one worker on this OS;
-        # Ubuntu still exercises the broad parallel phase.
-        run: npm test -- --maxWorkers=1
+        # Windows file/process handles are more sensitive to phase boundaries;
+        # keep the historical single Vitest process while retaining the
+        # two-phase runner for Ubuntu and local diagnostics.
+        env:
+          AGENTFORGE_TEST_SINGLE_RUN: '1'
+        run: npm test
 
       - name: Build application
         if: needs.classify.outputs.package_required == 'true'
