@@ -4,7 +4,7 @@ import os from 'os';
 import crypto from 'crypto';
 import child_process from 'child_process';
 import Database from 'better-sqlite3';
-import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach, beforeAll, afterAll, vi } from 'vitest';
 import { Client, InMemoryTransport } from '@modelcontextprotocol/client';
 import {
   MIGRATIONS,
@@ -75,6 +75,11 @@ import {
 } from '../src/mcp/clientBridge';
 import { ExecutionAuthorization, TaskStateEnum } from '../src/core/types/domain';
 import { AUTHORITY_SNAPSHOT_KEYS } from '../src/core/types/adjudication';
+import {
+  captureMcpCliOutput,
+  installMcpCliOutputGuard,
+  MCP_CLI_REDACTED_TOKEN,
+} from './helpers/mcpCliOutputGuard';
 
 interface FullSubmissionFixtures {
   projectId: string;
@@ -463,6 +468,11 @@ describe('R5J4 Durable Coder Submission Authority Comprehensive Suite', () => {
   let db: Database.Database;
   let dbPath: string;
   let fixtures: FullSubmissionFixtures;
+  let restoreMcpCliOutputGuard: (() => void) | undefined;
+
+  beforeAll(() => {
+    restoreMcpCliOutputGuard = installMcpCliOutputGuard();
+  });
 
   beforeEach(() => {
     tempDir = path.join(os.tmpdir(), `af-sub-test-${Date.now()}-${crypto.randomUUID().slice(0, 8)}`);
@@ -489,6 +499,11 @@ describe('R5J4 Durable Coder Submission Authority Comprehensive Suite', () => {
       }
     }
   }, 120000);
+
+  afterAll(() => {
+    restoreMcpCliOutputGuard?.();
+    restoreMcpCliOutputGuard = undefined;
+  });
 
   // =========================================================================
   // Group 1: Wire Protocol, Discriminated Schemas, and Argument Bounds
@@ -1739,6 +1754,35 @@ describe('R5J4 Durable Coder Submission Authority Comprehensive Suite', () => {
       expect(session).toBeDefined();
       expect(session?.scope).toBe('CODER_SUBMISSION');
       expect(session?.issuer_identity).toBe('OWNER_LOCAL_CLI');
+    });
+
+    it('79a. Admin CLI diagnostics redact submission tokens in JSON and human output', () => {
+      const jsonCapture = captureMcpCliOutput(() => runSubmissionAdmin([
+        'issue',
+        '--db',
+        dbPath,
+        '--auth',
+        fixtures.authorizationId,
+        '--json',
+      ]));
+      expect(jsonCapture.result).toBe(0);
+      expect(jsonCapture.stderr).toBe('');
+      const jsonOutput = JSON.parse(jsonCapture.stdout) as { plaintext_token?: string };
+      expect(jsonOutput.plaintext_token).toBe(MCP_CLI_REDACTED_TOKEN);
+      expect(jsonCapture.stdout).not.toMatch(/af-sub-[A-Za-z0-9_-]{43}/);
+
+      const humanCapture = captureMcpCliOutput(() => runSubmissionAdmin([
+        'issue',
+        '--db',
+        dbPath,
+        '--auth',
+        fixtures.authorizationId,
+      ]));
+      expect(humanCapture.result).toBe(0);
+      expect(humanCapture.stderr).toBe('');
+      expect(humanCapture.stdout).toContain('Plaintext Token:');
+      expect(humanCapture.stdout).toContain(MCP_CLI_REDACTED_TOKEN);
+      expect(humanCapture.stdout).toMatch(/Plaintext\s+Token:\s+\[REDACTED_TOKEN\]/i);
     });
 
     it('80. Admin CLI issue command atomically supersedes previous unrevoked session', () => {
