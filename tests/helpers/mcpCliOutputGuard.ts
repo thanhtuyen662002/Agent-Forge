@@ -35,7 +35,8 @@ type Writable = typeof process.stdout.write;
 
 function textFromChunk(chunk: unknown, encoding?: unknown): string {
   if (Buffer.isBuffer(chunk)) {
-    return chunk.toString(typeof encoding === 'string' ? encoding : undefined);
+    const bufferEncoding = typeof encoding === 'string' ? encoding as BufferEncoding : undefined;
+    return chunk.toString(bufferEncoding);
   }
   return String(chunk);
 }
@@ -47,9 +48,12 @@ function createRedactingWriter(original: Writable, stream: NodeJS.WritableStream
     if (typeof encodingOrCallback === 'function') {
       return boundOriginal(safeText, encodingOrCallback as () => void);
     }
+    const bufferEncoding = typeof encodingOrCallback === 'string'
+      ? encodingOrCallback as BufferEncoding
+      : undefined;
     return boundOriginal(
       safeText,
-      typeof encodingOrCallback === 'string' ? encodingOrCallback : undefined,
+      bufferEncoding,
       typeof callback === 'function' ? callback as () => void : undefined
     );
   }) as Writable;
