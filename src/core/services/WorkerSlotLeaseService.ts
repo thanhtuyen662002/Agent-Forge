@@ -3,6 +3,7 @@ import { Repository } from '../database/repositories';
 import {
   AccountLease,
   AgentAssignment,
+  TaskState,
   WorkerSlot,
 } from '../types/domain';
 
@@ -24,6 +25,9 @@ export type SlotLeaseErrorCode =
   | 'LEASE_NOT_FOUND'
   | 'LEASE_TOKEN_MISMATCH'
   | 'LEASE_EXPIRED'
+  | 'LEASE_NOT_EXPIRED'
+  | 'RECOVERY_TASK_STATE_CHANGED'
+  | 'LEASE_RELEASE_FAILED'
   | 'SLOT_STATE_MISMATCH'
   | 'DURABLE_BINDING_INVARIANT_FAILURE'
   | 'CLAIM_CONTENTION'
@@ -449,9 +453,36 @@ export class WorkerSlotLeaseService {
    * Retains the historical assignment.selected_worker_slot_id binding.
    */
   public release(leaseId: string, leaseToken: string): ReleaseLeaseResult {
+    return this.releaseInternal(leaseId, leaseToken, false);
+  }
+
+  /**
+   * Releases an expired lease during restart recovery. The expiry and owner
+   * token are checked inside the same immediate transaction as the lease and
+   * slot updates. This prevents a recovery scan that observed an old owner
+   * from releasing a lease after that owner has renewed it, and prevents a
+   * stale token from touching a newer lease generation.
+   */
+  public recoverExpiredLease(
+    leaseId: string,
+    leaseToken: string,
+    recoveredAt?: Date,
+    options?: { expectedTaskStates?: readonly TaskState[] },
+  ): ReleaseLeaseResult {
+    return this.releaseInternal(leaseId, leaseToken, true, recoveredAt, options?.expectedTaskStates);
+  }
+
+  private releaseInternal(
+    leaseId: string,
+    leaseToken: string,
+    requireExpired: boolean,
+    recoveredAt?: Date,
+    expectedTaskStates?: readonly TaskState[],
+  ): ReleaseLeaseResult {
     return this.repo.runInImmediateTransaction<ReleaseLeaseResult>(() => {
       const now = this.clock();
       const nowIso = now.toISOString();
+      const nowMs = now.getTime();
 
       const lease = this.repo.getAccountLease(leaseId);
       if (!lease || lease.released_at !== null) {
@@ -467,6 +498,14 @@ export class WorkerSlotLeaseService {
           status: 'FAILED',
           code: 'LEASE_TOKEN_MISMATCH',
           error: `LEASE_TOKEN_MISMATCH: Provided token does not match lease "${leaseId}".`,
+        };
+      }
+
+      if (requireExpired && new Date(lease.expires_at).getTime() > nowMs) {
+        return {
+          status: 'FAILED',
+          code: 'LEASE_NOT_EXPIRED',
+          error: `LEASE_NOT_EXPIRED: Lease "${leaseId}" expires at "${lease.expires_at}" and cannot be recovered before expiry.`,
         };
       }
 
@@ -488,7 +527,19 @@ export class WorkerSlotLeaseService {
         };
       }
 
-      const released = this.repo.releaseAccountLeaseWithToken(lease.id, leaseToken, nowIso);
+      if (requireExpired && expectedTaskStates) {
+        const task = this.repo.getTask(assignment.task_id);
+        if (!task || !expectedTaskStates.includes(task.state)) {
+          return {
+            status: 'FAILED',
+            code: 'RECOVERY_TASK_STATE_CHANGED',
+            error: `RECOVERY_TASK_STATE_CHANGED: Task "${assignment.task_id}" is not in an approved recovery state for lease "${leaseId}".`,
+          };
+        }
+      }
+
+      const releaseAt = recoveredAt?.toISOString() ?? nowIso;
+      const released = this.repo.releaseAccountLeaseWithToken(lease.id, leaseToken, releaseAt);
       if (!released) {
         return {
           status: 'FAILED',
