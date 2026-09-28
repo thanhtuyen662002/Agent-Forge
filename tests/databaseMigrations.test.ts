@@ -1,5 +1,8 @@
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import Database from 'better-sqlite3';
+import fs from 'fs';
+import os from 'os';
+import path from 'path';
 import { MigrationRunner, MIGRATIONS } from '../src/core/database/migrations';
 
 describe('Database Migrations & Upgrade Integrity', () => {
@@ -92,6 +95,31 @@ describe('Database Migrations & Upgrade Integrity', () => {
     MigrationRunner.run(db);
     const appliedAgain = db.prepare('SELECT COUNT(*) as count FROM schema_migrations').get() as { count: number };
     expect(appliedAgain.count).toBe(MIGRATIONS.length);
+  });
+
+  it('fails with a bounded deterministic diagnostic when another process holds the startup lock', () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'agent-forge-migration-lock-'));
+    const dbPath = path.join(root, 'state.sqlite');
+    const first = new Database(dbPath);
+    const second = new Database(dbPath);
+    first.pragma('busy_timeout = 1000');
+    second.pragma('busy_timeout = 25');
+    first.exec(`
+      CREATE TABLE schema_migrations (
+        version INTEGER PRIMARY KEY,
+        name TEXT NOT NULL,
+        applied_at TEXT NOT NULL
+      );
+      BEGIN IMMEDIATE;
+    `);
+    try {
+      expect(() => MigrationRunner.run(second, 1)).toThrow('[Migrations] SQLITE_BUSY while acquiring the schema startup lock');
+    } finally {
+      first.exec('ROLLBACK');
+      first.close();
+      second.close();
+      fs.rmSync(root, { recursive: true, force: true });
+    }
   });
 
   it('should cleanly upgrade an existing database through historical path (v1 -> v2 -> original v3 -> v4 -> v5 -> v6 -> v7 -> v8 -> v9 -> v10 -> v11 -> v12 -> v13) and repair default agent links', () => {
