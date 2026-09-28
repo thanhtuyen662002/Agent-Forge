@@ -93,7 +93,7 @@ export function sanitizeContextFiles(
     }
 
     // Check against PolicyService
-    const policyResult = PolicyService.evaluatePathAccess(resolvedPath, normalizedRepo, false);
+    const policyResult = PolicyService.evaluateRealPathAccess(resolvedPath, normalizedRepo, false);
     if (!policyResult.allowed) {
       return {
         validFiles: [],

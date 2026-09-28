@@ -1,3 +1,4 @@
+import fs from 'fs';
 import path from 'path';
 
 export type PolicyDecision = 'ALLOW' | 'DENY' | 'REQUIRES_OWNER_APPROVAL';
@@ -21,6 +22,54 @@ export class PolicyService {
     'etc',
     'var',
   ];
+
+  private static SENSITIVE_FILE_NAMES = new Set([
+    '.npmrc',
+    '.pypirc',
+    '.netrc',
+    '.dockerconfigjson',
+    'credentials',
+    'credentials.json',
+    'credential.json',
+    'secrets',
+    'secrets.json',
+    'secret.json',
+    'id_rsa',
+    'id_dsa',
+    'id_ecdsa',
+    'id_ed25519',
+  ]);
+
+  private static isSensitivePathPart(part: string): boolean {
+    const lower = part.toLowerCase();
+    if (this.SENSITIVE_DIRS.includes(lower) || this.SENSITIVE_FILE_NAMES.has(lower)) {
+      return true;
+    }
+    // Environment files commonly use suffixes such as .local, .production,
+    // and .development; matching only the literal `.env` is insufficient.
+    if (/^\.env(?:$|[._-])/.test(lower)) return true;
+    // Treat credential-bearing file extensions and conventional secret names as
+    // sensitive even when they are nested under an otherwise ordinary folder.
+    if (/(?:^|[._-])(secret|secrets|credential|credentials|password|passwd|token|api[_-]?key)(?:[._-]|$)/.test(lower)) {
+      return true;
+    }
+    if (/\.(?:pem|key|p12|pfx|kdbx|jks)$/i.test(lower)) return true;
+    return false;
+  }
+
+  private static findExistingAncestor(targetPath: string): string {
+    let current = targetPath;
+    while (true) {
+      try {
+        fs.lstatSync(current);
+        return current;
+      } catch {
+        const parent = path.dirname(current);
+        if (parent === current) return current;
+        current = parent;
+      }
+    }
+  }
 
   private static PROHIBITED_SHELLS = new Set([
     'bash',
@@ -52,19 +101,11 @@ export class PolicyService {
     const canonicalTarget = path.normalize(path.resolve(targetPath));
     const canonicalRoot = path.normalize(path.resolve(repositoryRoot));
 
-    // 1. Sensitive credential directory check across full target path
+    // 1. Strict path containment using path.relative() to avoid prefix confusion
+    // (for example, repo vs repo-evil). Containment is checked before file-name
+    // classification so an outside path is reported as an outside path even if
+    // its basename happens to look secret-bearing.
     const normalizedLower = canonicalTarget.toLowerCase();
-    for (const part of normalizedLower.split(/[\\/]/)) {
-      if (['.ssh', '.aws', '.gnupg', '.env'].includes(part)) {
-        return {
-          allowed: false,
-          decision: 'DENY',
-          reason: `Access to sensitive credential path element "${part}" is blocked by security policy.`,
-        };
-      }
-    }
-
-    // 2. Strict path containment using path.relative() to avoid prefix confusion (e.g. repo vs repo-evil)
     const relPath = path.relative(canonicalRoot, canonicalTarget);
     if (
       relPath === '..' ||
@@ -73,22 +114,21 @@ export class PolicyService {
       relPath.startsWith('..\\') ||
       path.isAbsolute(relPath)
     ) {
+      const sensitivePart = normalizedLower.split(/[\\/]/).find((part) => this.isSensitivePathPart(part));
       return {
         allowed: false,
         decision: 'DENY',
-        reason: `Target path "${targetPath}" is outside the authorized project root "${repositoryRoot}".`,
+        reason: sensitivePart
+          ? `Target path "${targetPath}" is outside the authorized project root "${repositoryRoot}"; sensitive credential path element "${sensitivePart}" is also blocked.`
+          : `Target path "${targetPath}" is outside the authorized project root "${repositoryRoot}".`,
       };
     }
 
-    // 3. Sensitive directory check within repository root
+    // 2. Sensitive credential/file check within repository root
     const pathParts = relPath.toLowerCase().split(path.sep);
 
     for (const part of pathParts) {
-      if (this.SENSITIVE_DIRS.includes(part)) {
-        // Allow read on .git for internal git operations, but deny arbitrary direct file write
-        if (part === '.git' && !isWrite) {
-          continue;
-        }
+      if (this.isSensitivePathPart(part)) {
         return {
           allowed: false,
           decision: 'DENY',
@@ -102,6 +142,88 @@ export class PolicyService {
       decision: 'ALLOW',
       reason: 'Path access conforms to security policy.',
     };
+  }
+
+  /**
+   * Evaluate a path after resolving every existing component through the OS.
+   * The lexical check above is still required because context manifests may
+   * contain a not-yet-created file, but the realpath check prevents an
+   * existing symlink or junction from escaping the real repository root.
+   */
+  public static evaluateRealPathAccess(
+    targetPath: string,
+    repositoryRoot: string,
+    isWrite: boolean = false,
+  ): PolicyEvaluationResult {
+    const lexical = this.evaluatePathAccess(targetPath, repositoryRoot, isWrite);
+    if (!lexical.allowed) return lexical;
+
+    const canonicalRoot = path.normalize(path.resolve(repositoryRoot));
+    const canonicalTarget = path.normalize(path.resolve(targetPath));
+    try {
+      const realRoot = path.normalize(fs.realpathSync.native(canonicalRoot));
+      const existingAncestor = this.findExistingAncestor(canonicalTarget);
+      const realAncestor = path.normalize(fs.realpathSync.native(existingAncestor));
+      const ancestorRelative = path.relative(realRoot, realAncestor);
+      if (
+        ancestorRelative === '..' ||
+        ancestorRelative.startsWith('..' + path.sep) ||
+        ancestorRelative.startsWith('../') ||
+        ancestorRelative.startsWith('..\\') ||
+        path.isAbsolute(ancestorRelative)
+      ) {
+        return {
+          allowed: false,
+          decision: 'DENY',
+          reason: `Resolved path component for "${targetPath}" is outside the authorized project root.`,
+        };
+      }
+
+      // If the requested path itself exists, resolve it too. This catches a
+      // final symlink whose parent remains inside the repository.
+      let realTarget = realAncestor;
+      try {
+        fs.lstatSync(canonicalTarget);
+        realTarget = path.normalize(fs.realpathSync.native(canonicalTarget));
+      } catch (err: unknown) {
+        // A missing final file is allowed for manifest metadata, but a broken
+        // symlink is not an admissible context target.
+        try {
+          if (fs.lstatSync(canonicalTarget).isSymbolicLink()) {
+            return {
+              allowed: false,
+              decision: 'DENY',
+              reason: `Context path "${targetPath}" is a broken symbolic link.`,
+            };
+          }
+        } catch {
+          // The path genuinely does not exist; retain the ancestor check.
+        }
+      }
+
+      const targetRelative = path.relative(realRoot, realTarget);
+      if (
+        targetRelative === '..' ||
+        targetRelative.startsWith('..' + path.sep) ||
+        targetRelative.startsWith('../') ||
+        targetRelative.startsWith('..\\') ||
+        path.isAbsolute(targetRelative)
+      ) {
+        return {
+          allowed: false,
+          decision: 'DENY',
+          reason: `Resolved path "${targetPath}" is outside the authorized project root.`,
+        };
+      }
+
+      return this.evaluatePathAccess(realTarget, realRoot, isWrite);
+    } catch {
+      return {
+        allowed: false,
+        decision: 'DENY',
+        reason: `Unable to resolve real path for "${targetPath}" safely.`,
+      };
+    }
   }
 
   public static evaluateGitCommand(args: string[]): PolicyEvaluationResult {
