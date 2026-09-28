@@ -103,6 +103,12 @@ export class ProjectStopFenceService {
       if (!projectTable) {
         throw new Error('PROJECT_STOP_SCHEMA_MISSING: projects table is required before initializing the stop fence.');
       }
+      const eventsTable = this.db
+        .prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'events'")
+        .get() as { name?: string } | undefined;
+      if (!eventsTable) {
+        throw new Error('PROJECT_STOP_SCHEMA_MISSING: events table is required for durable stop audit evidence.');
+      }
 
       const columns = new Set(
         (this.db.pragma('table_info(projects)') as Array<{ name: string }>).map((column) => column.name)
@@ -124,6 +130,29 @@ export class ProjectStopFenceService {
         this.db.exec('ALTER TABLE projects ADD COLUMN emergency_stop_requested_at TEXT NULL');
       }
 
+      // The project-side trigger is safe to install on pre-authorization
+      // schemas. Authorization/adaptor triggers are installed only after the
+      // corresponding table/columns exist, so opening a legacy database does
+      // not fail before migrations can add those tables.
+      this.db.exec(`
+        CREATE TRIGGER IF NOT EXISTS trg_project_stop_running_state
+        BEFORE UPDATE OF status ON projects
+        WHEN NEW.status = 'RUNNING'
+          AND OLD.emergency_stop_latched = 1
+          AND NEW.emergency_stop_latched = 1
+        BEGIN
+          SELECT RAISE(ABORT, 'PROJECT_STOP_FENCE_REJECTED');
+        END;
+      `);
+
+      const authorizationTable = this.db
+        .prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'execution_authorizations'")
+        .get() as { name?: string } | undefined;
+      if (!authorizationTable) return;
+
+      const authorizationColumns = new Set(
+        (this.db.pragma('table_info(execution_authorizations)') as Array<{ name: string }>).map((column) => column.name)
+      );
       this.db.exec(`
         CREATE TABLE IF NOT EXISTS project_stop_admissions (
           authorization_id TEXT PRIMARY KEY REFERENCES execution_authorizations(id) ON DELETE CASCADE,
@@ -134,15 +163,6 @@ export class ProjectStopFenceService {
         );
         CREATE INDEX IF NOT EXISTS idx_project_stop_admissions_project
           ON project_stop_admissions(project_id, stop_epoch);
-
-        CREATE TRIGGER IF NOT EXISTS trg_project_stop_running_state
-        BEFORE UPDATE OF status ON projects
-        WHEN NEW.status = 'RUNNING'
-          AND OLD.emergency_stop_latched = 1
-          AND NEW.emergency_stop_latched = 1
-        BEGIN
-          SELECT RAISE(ABORT, 'PROJECT_STOP_FENCE_REJECTED');
-        END;
 
         CREATE TRIGGER IF NOT EXISTS trg_project_stop_dispatch_admission
         BEFORE UPDATE OF status ON execution_authorizations
@@ -161,25 +181,28 @@ export class ProjectStopFenceService {
         BEGIN
           SELECT RAISE(ABORT, 'PROJECT_STOP_FENCE_REJECTED');
         END;
-
-        CREATE TRIGGER IF NOT EXISTS trg_project_stop_adapter_start_admission
-        BEFORE UPDATE OF adapter_started_at, execution_id ON execution_authorizations
-        WHEN NEW.adapter_started_at IS NOT NULL AND OLD.adapter_started_at IS NULL
-          AND EXISTS (
-            SELECT 1
-              FROM projects p
-              LEFT JOIN project_stop_admissions a ON a.authorization_id = OLD.id
-             WHERE p.id = OLD.project_id
-               AND (
-                 p.emergency_stop_latched = 1 OR
-                 p.status = 'PAUSED' OR
-                 p.emergency_stop_epoch <> COALESCE(a.stop_epoch, 0)
-               )
-          )
-        BEGIN
-          SELECT RAISE(ABORT, 'PROJECT_STOP_FENCE_REJECTED');
-        END;
       `);
+      if (authorizationColumns.has('adapter_started_at') && authorizationColumns.has('execution_id')) {
+        this.db.exec(`
+          CREATE TRIGGER IF NOT EXISTS trg_project_stop_adapter_start_admission
+          BEFORE UPDATE OF adapter_started_at, execution_id ON execution_authorizations
+          WHEN NEW.adapter_started_at IS NOT NULL AND OLD.adapter_started_at IS NULL
+            AND EXISTS (
+              SELECT 1
+                FROM projects p
+                LEFT JOIN project_stop_admissions a ON a.authorization_id = OLD.id
+               WHERE p.id = OLD.project_id
+                 AND (
+                   p.emergency_stop_latched = 1 OR
+                   p.status = 'PAUSED' OR
+                   p.emergency_stop_epoch <> COALESCE(a.stop_epoch, 0)
+                 )
+            )
+          BEGIN
+            SELECT RAISE(ABORT, 'PROJECT_STOP_FENCE_REJECTED');
+          END;
+        `);
+      }
     });
     tx.immediate();
   }

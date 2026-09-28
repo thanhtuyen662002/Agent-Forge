@@ -97,6 +97,32 @@ describe('ProjectStopFenceService', () => {
     terminate.mockRestore();
   });
 
+  it('opens a pre-authorization database and defers auth triggers until its table exists', () => {
+    for (const [version, expectedTriggers] of [
+      [5, ['trg_project_stop_running_state']],
+      [15, ['trg_project_stop_dispatch_admission', 'trg_project_stop_running_state']],
+    ] as const) {
+      const legacyDb = new Database(':memory:');
+      MigrationRunner.run(legacyDb, version);
+      const legacyRepo = new Repository(legacyDb);
+
+      expect(() => new ProjectStopFenceService(legacyRepo)).not.toThrow();
+      const triggerNames = (legacyDb
+        .prepare("SELECT name FROM sqlite_master WHERE type = 'trigger' AND name LIKE 'trg_project_stop_%' ORDER BY name")
+        .all() as Array<{ name: string }>).map((row) => row.name);
+      expect(triggerNames).toEqual(expectedTriggers);
+      legacyDb.close();
+    }
+  });
+
+  it('fails closed when the audit events table is missing', () => {
+    const incompleteDb = new Database(':memory:');
+    MigrationRunner.run(incompleteDb);
+    incompleteDb.exec('DROP TABLE events');
+    expect(() => new ProjectStopFenceService(new Repository(incompleteDb))).toThrow('PROJECT_STOP_SCHEMA_MISSING');
+    incompleteDb.close();
+  });
+
   it('is idempotent, fences stale resume, advances epoch on resume, and isolates projects', () => {
     const first = fence.requestStopForProject('PROJ-STOP-A', 'stop A');
     expect(first.projects[0]).toMatchObject({ status: 'STOPPED', previousEpoch: 0, epoch: 1 });
