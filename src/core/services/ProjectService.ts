@@ -3,12 +3,17 @@ import { Repository } from '../database/repositories';
 import { EventService } from './EventService';
 import { ProjectStateMachine, ProjectTrigger } from '../state/projectStateMachine';
 import { Project, ProjectContract, ProjectStatus } from '../types/domain';
+import { ProjectStopFenceService } from './ProjectStopFenceService';
 
 export class ProjectService {
+  private readonly stopFence: ProjectStopFenceService;
+
   constructor(
     private repo: Repository,
     private eventService: EventService
-  ) {}
+  ) {
+    this.stopFence = new ProjectStopFenceService(repo);
+  }
 
   public createProject(name: string, description: string, repositoryPath: string, defaultBranch: string = 'main'): Project {
     const now = new Date().toISOString();
@@ -53,6 +58,10 @@ export class ProjectService {
   public transitionStatus(projectId: string, trigger: ProjectTrigger): ProjectStatus {
     const project = this.repo.getProject(projectId);
     if (!project) throw new Error(`Project ${projectId} not found.`);
+
+    if (trigger === 'START_PROJECT') {
+      this.stopFence.assertProjectStartAllowed(projectId);
+    }
 
     const nextStatus = ProjectStateMachine.transition(project.status, trigger);
     const startedAt = trigger === 'START_PROJECT' ? new Date().toISOString() : undefined;
