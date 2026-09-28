@@ -64,7 +64,10 @@ function canonicalManagerPayload(managerMsg: ManagerProtocol): Record<string, un
     })),
     expected_task_state: managerMsg.expected_task_state ?? null,
     expected_revision: managerMsg.expected_revision ?? null,
-    created_at: managerMsg.created_at ?? null,
+    // `created_at` is optional but the protocol schema intentionally does
+    // not allow a JSON null.  Omit it when absent so the replay hash matches
+    // the canonical persisted payload accepted by the protocol parser.
+    ...(managerMsg.created_at === undefined ? {} : { created_at: managerMsg.created_at }),
   };
 }
 
@@ -84,7 +87,9 @@ function canonicalCoderPayload(coderMsg: CoderProtocol): Record<string, unknown>
     review_requested: coderMsg.review_requested ?? true,
     expected_task_state: coderMsg.expected_task_state ?? null,
     expected_revision: coderMsg.expected_revision ?? null,
-    created_at: coderMsg.created_at ?? null,
+    // See the manager payload above: absent optional timestamps remain
+    // absent in the canonical representation rather than becoming null.
+    ...(coderMsg.created_at === undefined ? {} : { created_at: coderMsg.created_at }),
   };
 }
 

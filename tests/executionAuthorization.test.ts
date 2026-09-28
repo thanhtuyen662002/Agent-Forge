@@ -33,6 +33,7 @@ import {
 } from '../src/core/services/ExecutionAuthorizationService';
 import { ContextBuilderService } from '../src/core/services/ContextBuilderService';
 import { ProductTaskAutonomyAdapter } from '../src/core/autonomy/productTaskAdapter';
+import { canonicalJsonStringify } from '../src/core/context/ContextIntegrity';
 
 class MockExecutionAdapter implements ProviderAdapter {
   public executionCount = 0;
@@ -222,16 +223,24 @@ describe('PR #7 — Durable Execution Authorization & Orchestration Binding', ()
     const nowTimestamp = new Date(Date.now() + messageSequence * 1000).toISOString();
     const msgId = params.messageId ?? `msg-mgr-${String(messageSequence).padStart(6, '0')}-${crypto.randomUUID().slice(0, 8)}`;
     const recId = params.recordId ?? `rec-mgr-${String(messageSequence).padStart(6, '0')}-${crypto.randomUUID().slice(0, 8)}`;
-    const rawPayload = JSON.stringify({
+    // Protocol replay bindings are persisted from the same canonical
+    // representation that TaskService hashes.  Keeping this fixture
+    // canonical ensures a legitimate duplicate remains idempotent while a
+    // changed transport envelope is still covered by replay-conflict tests.
+    const rawPayload = canonicalJsonStringify({
       protocol: 'manager.v1',
       message_id: msgId,
       project_id: projectId,
       task_id: taskId,
       decision: params.decision,
+      priority: 'MEDIUM',
+      risk: 'MEDIUM',
       expected_revision: params.expected_revision ?? 0,
       instructions: params.instructions ?? ['Manager instruction line 1', 'Manager instruction line 2'],
       acceptance_criteria: ['AC 1'],
       constraints: ['Constraint 1'],
+      review_issues: [],
+      expected_task_state: null,
     });
     const payloadHash = crypto.createHash('sha256').update(rawPayload, 'utf8').digest('hex');
     repo.recordProtocolMessage(
@@ -240,7 +249,7 @@ describe('PR #7 — Durable Execution Authorization & Orchestration Binding', ()
       'manager.v1',
       projectId,
       taskId,
-      'APPROVED',
+      null,
       params.expected_revision ?? 0,
       payloadHash,
       rawPayload,
@@ -585,13 +594,12 @@ describe('PR #7 — Durable Execution Authorization & Orchestration Binding', ()
       project_id: 'PROJ-AUTH',
       task_id: 'TSK-AUTH-001',
       decision: 'EXECUTE' as const,
-      priority: 'HIGH' as const,
+      priority: 'MEDIUM' as const,
       risk: 'MEDIUM' as const,
-      instructions: ['Duplicate'],
-      acceptance_criteria: [],
-      constraints: [],
+      instructions: ['Implement feature according to spec'],
+      acceptance_criteria: ['AC 1'],
+      constraints: ['Constraint 1'],
       review_issues: [],
-      expected_task_state: 'CODING' as const,
       expected_revision: 0,
     };
     const res = await taskService.applyManagerDecision(dupPayload, JSON.stringify(dupPayload));
