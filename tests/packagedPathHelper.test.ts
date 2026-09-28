@@ -1,6 +1,6 @@
 import { describe, it, expect } from 'vitest';
 import path from 'path';
-import { resolveRendererTarget } from '../src/electron/pathHelper';
+import { isAllowedRendererNavigation, resolveRendererTarget } from '../src/electron/pathHelper';
 
 describe('Renderer Path Resolution Helper (Strict Precedence & Fail-Closed)', () => {
   it('should ignore VITE_DEV_SERVER_URL in packaged mode and return canonical appPath file target', () => {
@@ -50,5 +50,27 @@ describe('Renderer Path Resolution Helper (Strict Precedence & Fail-Closed)', ()
       type: 'url',
       target: 'http://localhost:5173',
     });
+  });
+
+  it('allows only the exact configured development origin, including safe paths', () => {
+    const options = { isPackaged: false, devServerUrl: 'http://localhost:5173' };
+    expect(isAllowedRendererNavigation('http://localhost:5173/tasks', options)).toBe(true);
+    expect(isAllowedRendererNavigation('http://localhost:51730/tasks', options)).toBe(false);
+    expect(isAllowedRendererNavigation('http://localhost:5173.evil/tasks', options)).toBe(false);
+    expect(isAllowedRendererNavigation('http://user:pass@localhost:5173/tasks', options)).toBe(false);
+    expect(isAllowedRendererNavigation('https://localhost:5173/tasks', options)).toBe(false);
+    expect(isAllowedRendererNavigation('not a URL', options)).toBe(false);
+  });
+
+  it('allows only the canonical packaged renderer file', () => {
+    const rendererFilePath = path.join('C:\\Program Files\\AgentForge', 'dist', 'index.html');
+    const canonical = 'file:///C:/Program%20Files/AgentForge/dist/index.html';
+    const options = { isPackaged: true, rendererFilePath };
+
+    expect(isAllowedRendererNavigation(canonical, options)).toBe(true);
+    expect(isAllowedRendererNavigation(`${canonical}#task`, options)).toBe(true);
+    expect(isAllowedRendererNavigation('file:///C:/Program%20Files/AgentForge/dist/other.html', options)).toBe(false);
+    expect(isAllowedRendererNavigation('file:///C:/Users/Public/other.html', options)).toBe(false);
+    expect(isAllowedRendererNavigation('https://localhost:5173', options)).toBe(false);
   });
 });
