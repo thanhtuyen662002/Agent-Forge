@@ -88,7 +88,9 @@ export function providerEndpointUrlError(
   if (parsed.username || parsed.password) {
     return 'Provider endpoint URL must not contain credentials';
   }
-  if (parsed.search || parsed.hash) {
+  // URL#search normalize bare delimiters to empty strings, so inspect the
+  // original spelling as well as parsed fields to reject `?` and `#` forms.
+  if (baseUrl.includes('?') || baseUrl.includes('#') || parsed.search || parsed.hash) {
     return 'Provider endpoint URL must not contain a query or fragment';
   }
   return null;

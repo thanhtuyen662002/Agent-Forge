@@ -53,7 +53,9 @@ describe('provider endpoint transport security boundary', () => {
     ['ftp://router.example.test/v1', true],
     ['https://user:password@router.example.test/v1', false],
     ['https://router.example.test/v1?token=secret', false],
+    ['https://router.example.test/v1?', false],
     ['https://router.example.test/v1#fragment', false],
+    ['https://router.example.test/v1#', false],
     ['http://router.example.test/v1', false],
     ['https://router.example.test\\v1', false],
   ])('rejects unsafe base URL %s (allowHttp=%s)', (baseUrl, allowInsecureHttp) => {
