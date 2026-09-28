@@ -93,10 +93,13 @@ function canonicalRealPath(targetPath: string): string {
 }
 
 function identityKey(stat: fs.Stats): string {
-  // dev/ino are stable on POSIX and available on NTFS in Node 22.  The mode
-  // component prevents a replaced directory/file from comparing equal on a
-  // filesystem that reports a reused inode quickly.
-  return `${String(stat.dev)}:${String(stat.ino)}:${String(stat.mode & 0o170000)}`;
+  // dev/ino are stable on POSIX and NTFS exposes a stable file index as ino.
+  // Windows reports different dev values for lstat and fstat, so the device
+  // component is intentionally omitted there; the file index plus type still
+  // fences replacement while allowing a path identity to be compared with an
+  // opened descriptor.
+  const device = process.platform === 'win32' ? 'win32' : String(stat.dev);
+  return `${device}:${String(stat.ino)}:${String(stat.mode & 0o170000)}`;
 }
 
 function sameIdentity(left: ArtifactPathIdentity, right: ArtifactPathIdentity): boolean {
@@ -299,9 +302,31 @@ function openArtifactFile(filePath: string, flags: number, mode?: number): numbe
   }
 }
 
-function readArtifactBytes(anchor: ArtifactRootAnchor, absolutePath: string): Buffer {
-  const descriptor = openArtifactFile(anchoredPath(anchor, absolutePath), fs.constants.O_RDONLY);
+function readArtifactBytes(anchor: ArtifactRootAnchor, absolutePath: string, expectedIdentity?: ArtifactPathIdentity): Buffer {
+  const openedPath = anchoredPath(anchor, absolutePath);
+  let preOpenIdentity: ArtifactPathIdentity;
   try {
+    const preOpenStat = fs.lstatSync(openedPath);
+    if (preOpenStat.isSymbolicLink()) {
+      throw new ArtifactIntegrityError('ARTIFACT_REPARSE_POINT', 'artifact leaf became a symbolic link before opening', absolutePath);
+    }
+    preOpenIdentity = { key: identityKey(preOpenStat), realPath: canonicalRealPath(absolutePath) };
+    if (!isContainedRealPath(preOpenIdentity.realPath, anchor.rootIdentity.realPath)) {
+      throw new ArtifactIntegrityError('ARTIFACT_REPARSE_POINT', 'artifact leaf resolves outside the configured root before opening', absolutePath);
+    }
+  } catch (error) {
+    if (error instanceof ArtifactIntegrityError) throw error;
+    if (isErrno(error, 'ENOENT')) throw error;
+    throw new ArtifactIntegrityError('ARTIFACT_PATH_UNVERIFIED', 'artifact leaf cannot be inspected before opening', absolutePath);
+  }
+
+  const descriptor = openArtifactFile(openedPath, fs.constants.O_RDONLY);
+  try {
+    const openedIdentity = identityKey(fs.fstatSync(descriptor));
+    const expectedKey = expectedIdentity?.key ?? preOpenIdentity.key;
+    if (openedIdentity !== expectedKey) {
+      throw new ArtifactIntegrityError('ARTIFACT_PATH_UNVERIFIED', 'artifact leaf identity changed before bytes were read', absolutePath);
+    }
     return fs.readFileSync(descriptor);
   } finally {
     fs.closeSync(descriptor);
@@ -744,7 +769,7 @@ export class ArtifactStore {
     const finalPath = path.join(baseDir, `${hash}.bin`);
 
     const buf = Buffer.from(payload, 'utf8');
-    this.withRootAnchor([stagedPath, finalPath], (anchor) => {
+    this.withRootAnchor([stagedPath, finalPath], (anchor, snapshots) => {
       let descriptor: number | null = null;
       let stageErr: Error | null = null;
       try {
@@ -795,12 +820,12 @@ export class ArtifactStore {
   }
 
   public finalizeStagedFile(stagedPath: string, finalPath: string, expectedHash: string): void {
-    this.withRootAnchor([stagedPath, finalPath], (anchor) => {
+    this.withRootAnchor([stagedPath, finalPath], (anchor, snapshots) => {
       const stagedAnchored = anchoredPath(anchor, path.resolve(stagedPath));
       const finalAnchored = anchoredPath(anchor, path.resolve(finalPath));
       if (!fs.existsSync(stagedAnchored)) {
         if (fs.existsSync(finalAnchored)) {
-          const existingContent = readArtifactBytes(anchor, path.resolve(finalPath));
+          const existingContent = readArtifactBytes(anchor, path.resolve(finalPath), snapshots[1]?.leafIdentity);
           const existingHash = crypto.createHash('sha256').update(existingContent).digest('hex');
           if (existingHash === expectedHash) return;
           throw new Error('[ArtifactStore] Finalized artifact hash mismatch');
@@ -810,7 +835,7 @@ export class ArtifactStore {
 
       const outcome = publishArtifactNoReplace(anchor, path.resolve(stagedPath), path.resolve(finalPath));
       if (outcome === 'EXISTS') {
-        const existingContent = readArtifactBytes(anchor, path.resolve(finalPath));
+        const existingContent = readArtifactBytes(anchor, path.resolve(finalPath), snapshots[1]?.leafIdentity);
         const existingHash = crypto.createHash('sha256').update(existingContent).digest('hex');
         if (existingHash === expectedHash) {
           try {
@@ -887,14 +912,14 @@ export class ArtifactStore {
    * evidence paths directly.
    */
   public readBuffer(filePath: string): Buffer {
-    return this.withRootAnchor([filePath], (anchor) => {
+    return this.withRootAnchor([filePath], (anchor, snapshots) => {
       const absolutePath = path.resolve(filePath);
       const anchored = anchoredPath(anchor, absolutePath);
       if (!fs.existsSync(anchored)) {
         throw new Error('[ArtifactStore] Evidence file missing on disk.');
       }
       try {
-        return readArtifactBytes(anchor, absolutePath);
+        return readArtifactBytes(anchor, absolutePath, snapshots[0]?.leafIdentity);
       } catch (error) {
         if (isErrno(error, 'ENOENT')) throw new Error('[ArtifactStore] Evidence file missing on disk.');
         throw error;
@@ -917,10 +942,10 @@ export class ArtifactStore {
     const tempName = `.tmp_${crypto.randomUUID()}_${hash}.bin`;
     const tempPath = path.join(baseDir, tempName);
 
-    return this.withRootAnchor([finalPath, tempPath], (anchor) => {
+    return this.withRootAnchor([finalPath, tempPath], (anchor, snapshots) => {
       const finalAnchored = anchoredPath(anchor, finalPath);
       if (fs.existsSync(finalAnchored)) {
-        const existing = readArtifactBytes(anchor, finalPath);
+        const existing = readArtifactBytes(anchor, finalPath, snapshots[0]?.leafIdentity);
         const existingHash = crypto.createHash('sha256').update(existing).digest('hex').toLowerCase();
         if (existingHash !== hash || existing.byteLength !== buf.byteLength || !existing.equals(buf)) {
           throw new Error('[ArtifactStore] Content conflict: existing content-addressed artifact does not match bytes or hash (HASH_COLLISION_MISMATCH)');
