@@ -8,6 +8,7 @@ import {
   GitWorktreeServiceConfig,
   WorktreeOwnershipTuple,
   IProcessExecutor,
+  DefaultProcessExecutor,
 } from '../src/core/services/GitWorktreeService';
 
 function findGitExecutable(): string {
@@ -634,5 +635,146 @@ describe('R5G2A — GitWorktreeService Contract & Invariant Suite', () => {
     const t = makeTuple();
     const derived = service.deriveWorktreePath(t);
     expect(derived.worktreePath.toLowerCase().startsWith(service.getManagedRoot().toLowerCase())).toBe(true);
+  });
+
+  it('39. Pre-existing target symlink is rejected without touching its outside target', async () => {
+    const tuple = makeTuple({ assignmentId: 'symlink-target' });
+    const target = service.deriveWorktreePath(tuple).worktreePath;
+    const outside = path.join(testBaseDir, 'outside-target');
+    fs.mkdirSync(outside, { recursive: true });
+    const marker = path.join(outside, 'must-survive.txt');
+    fs.writeFileSync(marker, 'keep');
+
+    try {
+      fs.symlinkSync(outside, target, process.platform === 'win32' ? 'junction' : 'dir');
+      const result = await service.createWorktree(tuple);
+      expect(result.status).toBe('FAILED');
+      if (result.status === 'FAILED') expect(result.code).toBe('PATH_CONTAINMENT_DENIED');
+      expect(fs.readFileSync(marker, 'utf8')).toBe('keep');
+    } finally {
+      try { fs.unlinkSync(target); } catch {}
+    }
+  });
+
+  it('40. Target replacement with a symlink is fenced before removal and cannot delete outside files', async () => {
+    const tuple = makeTuple({ assignmentId: 'remove-race' });
+    const created = await service.createWorktree(tuple);
+    expect(created.status).toBe('CREATED');
+    if (created.status !== 'CREATED') return;
+
+    const outside = path.join(testBaseDir, 'outside-remove-target');
+    fs.mkdirSync(outside, { recursive: true });
+    const marker = path.join(outside, 'must-survive.txt');
+    fs.writeFileSync(marker, 'keep');
+    const orphan = `${created.worktreePath}-orphan`;
+
+    try {
+      fs.renameSync(created.worktreePath, orphan);
+      fs.symlinkSync(outside, created.worktreePath, process.platform === 'win32' ? 'junction' : 'dir');
+      const result = await service.removeWorktree(tuple);
+      expect(result.status).toBe('FAILED');
+      if (result.status === 'FAILED') expect(result.code).toBe('PATH_CONTAINMENT_DENIED');
+      expect(fs.readFileSync(marker, 'utf8')).toBe('keep');
+    } finally {
+      try { fs.unlinkSync(created.worktreePath); } catch {}
+      try { execSync(`"${gitExe}" worktree unlock "${created.worktreePath}"`, { cwd: repoDir, stdio: 'ignore' }); } catch {}
+      try { execSync(`"${gitExe}" worktree remove --force "${created.worktreePath}"`, { cwd: repoDir, stdio: 'ignore' }); } catch {}
+      try { fs.rmSync(orphan, { recursive: true, force: true }); } catch {}
+    }
+  });
+
+  it('41. A target symlink inserted between preflight and git add fails closed', async () => {
+    const tuple = makeTuple({ assignmentId: 'add-race' });
+    const target = service.deriveWorktreePath(tuple).worktreePath;
+    const outside = path.join(testBaseDir, 'outside-add-target');
+    fs.mkdirSync(outside, { recursive: true });
+    const marker = path.join(outside, 'must-survive.txt');
+    fs.writeFileSync(marker, 'keep');
+    let raced = false;
+    const delegate = new DefaultProcessExecutor();
+    const raceExecutor: IProcessExecutor = {
+      async execute(command, args, options) {
+        if (!raced && args[0] === 'worktree' && args[1] === 'add') {
+          raced = true;
+          fs.symlinkSync(outside, target, process.platform === 'win32' ? 'junction' : 'dir');
+        }
+        return delegate.execute(command, args, options);
+      },
+    };
+    const racedService = new GitWorktreeService(
+      { gitExecutable: gitExe, repositoryRoot: repoDir, managedRoot: managedDir },
+      raceExecutor,
+    );
+
+    try {
+      const result = await racedService.createWorktree(tuple);
+      expect(result.status).toBe('FAILED');
+      if (result.status === 'FAILED') expect(['GIT_ADD_FAILED', 'PATH_CONTAINMENT_DENIED', 'PATH_IDENTITY_CHANGED']).toContain(result.code);
+      expect(fs.readFileSync(marker, 'utf8')).toBe('keep');
+    } finally {
+      try { fs.unlinkSync(target); } catch {}
+    }
+  });
+
+  it('42. Concurrent creates serialize through the managed-root lock without cross-target interference', async () => {
+    const first = makeTuple({ assignmentId: 'concurrent-a', workerSlotId: 'slot-a' });
+    const second = makeTuple({ assignmentId: 'concurrent-b', workerSlotId: 'slot-b' });
+    const [firstResult, secondResult] = await Promise.all([
+      service.createWorktree(first),
+      service.createWorktree(second),
+    ]);
+    expect(firstResult.status).toBe('CREATED');
+    expect(secondResult.status).toBe('CREATED');
+    if (firstResult.status === 'CREATED' && secondResult.status === 'CREATED') {
+      expect(firstResult.worktreePath).not.toBe(secondResult.worktreePath);
+    }
+  });
+
+  it('43. A stale operation lock is recovered without weakening the root identity fence', async () => {
+    const tuple = makeTuple({ assignmentId: 'stale-lock-recovery' });
+    const lockPath = path.join(managedDir, '.agent-forge-worktree-operation.lock');
+    fs.writeFileSync(lockPath, JSON.stringify({ pid: 999999999, createdAt: Date.now() }), 'utf8');
+
+    const result = await service.createWorktree(tuple);
+    expect(result.status).toBe('CREATED');
+    expect(fs.existsSync(lockPath)).toBe(false);
+  });
+
+  it('44. A live owner lock is never broken solely because its age exceeds the recovery threshold', () => {
+    const lockPath = path.join(managedDir, '.agent-forge-worktree-operation.lock');
+    fs.writeFileSync(
+      lockPath,
+      JSON.stringify({ pid: process.pid, createdAt: Date.now() - 10 * 60 * 1000 }),
+      'utf8',
+    );
+
+    try {
+      const recovered = (service as any).tryBreakStaleManagedRootLock(lockPath);
+      expect(recovered).toBe(false);
+      expect(fs.existsSync(lockPath)).toBe(true);
+    } finally {
+      try { fs.unlinkSync(lockPath); } catch {}
+    }
+  });
+
+  it('45. Managed-root replacement is rejected before Git and cannot affect the replacement target', async () => {
+    const tuple = makeTuple({ assignmentId: 'root-replacement' });
+    const outside = path.join(testBaseDir, 'outside-managed-root');
+    const backup = `${managedDir}-original`;
+    fs.mkdirSync(outside, { recursive: true });
+    const marker = path.join(outside, 'must-survive.txt');
+    fs.writeFileSync(marker, 'keep');
+
+    try {
+      fs.renameSync(managedDir, backup);
+      fs.symlinkSync(outside, managedDir, process.platform === 'win32' ? 'junction' : 'dir');
+      const result = await service.createWorktree(tuple);
+      expect(result.status).toBe('FAILED');
+      if (result.status === 'FAILED') expect(['PATH_IDENTITY_CHANGED', 'PATH_CONTAINMENT_DENIED']).toContain(result.code);
+      expect(fs.readFileSync(marker, 'utf8')).toBe('keep');
+    } finally {
+      try { fs.unlinkSync(managedDir); } catch {}
+      try { fs.renameSync(backup, managedDir); } catch {}
+    }
   });
 });

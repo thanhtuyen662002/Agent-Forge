@@ -57,6 +57,7 @@ export type WorktreeErrorCode =
   | 'WORKTREE_ALREADY_EXISTS'
   | 'WORKTREE_ALREADY_REGISTERED'
   | 'PATH_CONTAINMENT_DENIED'
+  | 'PATH_IDENTITY_CHANGED'
   | 'GIT_ADD_FAILED'
   | 'HEAD_BINDING_MISMATCH'
   | 'WORKTREE_REGISTRATION_MISMATCH'
@@ -121,6 +122,28 @@ export interface PorcelainWorktreeEntry {
   isPrunable: boolean;
 }
 
+interface DirectoryIdentity {
+  realPath: string;
+  dev: number;
+  ino: number;
+  birthtimeMs: number;
+}
+
+interface ManagedRootLock {
+  token: string;
+  path: string;
+}
+
+class PathIdentityError extends Error {
+  public readonly code: 'PATH_CONTAINMENT_DENIED' | 'PATH_IDENTITY_CHANGED';
+
+  constructor(code: 'PATH_CONTAINMENT_DENIED' | 'PATH_IDENTITY_CHANGED', message: string) {
+    super(message);
+    this.name = 'PathIdentityError';
+    this.code = code;
+  }
+}
+
 function canonicalizePath(p: string): string {
   try {
     if (fs.existsSync(p)) {
@@ -144,10 +167,32 @@ function isPathWithinRoot(childPath: string, rootPath: string): boolean {
   return !rel.startsWith('..') && !path.isAbsolute(rel);
 }
 
+function sameDirectoryIdentity(left: DirectoryIdentity, right: DirectoryIdentity): boolean {
+  if (normalizePathForComparison(left.realPath) !== normalizePathForComparison(right.realPath)) return false;
+  // Device/inode is the strongest identity available on POSIX and on modern
+  // Windows Node builds. Some Windows filesystems report zero for one or both
+  // values, so birth time plus canonical realpath remains the fallback.
+  if (left.dev !== 0 || right.dev !== 0 || left.ino !== 0 || right.ino !== 0) {
+    return left.dev === right.dev && left.ino === right.ino && left.birthtimeMs === right.birthtimeMs;
+  }
+  return left.birthtimeMs === right.birthtimeMs;
+}
+
+function isMissingFsError(error: unknown): boolean {
+  return typeof error === 'object' && error !== null && 'code' in error && (error as NodeJS.ErrnoException).code === 'ENOENT';
+}
+
 export class GitWorktreeService {
+  private static readonly OPERATION_LOCK_FILE = '.agent-forge-worktree-operation.lock';
+  private static readonly OPERATION_LOCK_TIMEOUT_MS = 30_000;
+  private static readonly OPERATION_LOCK_RETRY_MS = 25;
+  private static readonly STALE_LOCK_AFTER_MS = 5 * 60 * 1000;
+
   private gitExecutable: string;
   private canonicalRepoRoot: string;
   private canonicalManagedRoot: string;
+  private repositoryRootIdentity: DirectoryIdentity;
+  private managedRootIdentity: DirectoryIdentity;
   private executor: IProcessExecutor;
 
   constructor(config: GitWorktreeServiceConfig, executor?: IProcessExecutor) {
@@ -187,6 +232,7 @@ export class GitWorktreeService {
       throw new Error(`INVALID_REPOSITORY_ROOT: repositoryRoot "${config.repositoryRoot}" is not an existing directory.`);
     }
     this.canonicalRepoRoot = fs.realpathSync.native ? fs.realpathSync.native(config.repositoryRoot) : fs.realpathSync(config.repositoryRoot);
+    this.repositoryRootIdentity = this.captureDirectoryIdentity(this.canonicalRepoRoot, 'repository root');
 
     // 3. Validate Managed Root
     if (!config.managedRoot || typeof config.managedRoot !== 'string') {
@@ -207,6 +253,7 @@ export class GitWorktreeService {
       fs.mkdirSync(config.managedRoot, { recursive: true });
     }
     this.canonicalManagedRoot = fs.realpathSync.native ? fs.realpathSync.native(config.managedRoot) : fs.realpathSync(config.managedRoot);
+    this.managedRootIdentity = this.captureDirectoryIdentity(this.canonicalManagedRoot, 'managed root');
 
     // 4. Validate Disjointness of Roots
     const normRepo = normalizePathForComparison(this.canonicalRepoRoot);
@@ -221,6 +268,308 @@ export class GitWorktreeService {
     if (isPathWithinRoot(this.canonicalRepoRoot, this.canonicalManagedRoot)) {
       throw new Error('INVALID_REPOSITORY_ROOT: repositoryRoot cannot reside inside managedRoot.');
     }
+  }
+
+  private captureDirectoryIdentity(candidate: string, label: string): DirectoryIdentity {
+    let stat: fs.Stats;
+    try {
+      stat = fs.lstatSync(candidate);
+    } catch (error) {
+      throw new Error(`INVALID_${label === 'managed root' ? 'MANAGED_ROOT' : 'REPOSITORY_ROOT'}: Unable to inspect ${label} "${candidate}": ${error instanceof Error ? error.message : String(error)}`);
+    }
+    if (!stat.isDirectory() || stat.isSymbolicLink()) {
+      throw new Error(`INVALID_${label === 'managed root' ? 'MANAGED_ROOT' : 'REPOSITORY_ROOT'}: ${label} "${candidate}" must be a real directory.`);
+    }
+
+    let realPath: string;
+    try {
+      realPath = path.resolve(fs.realpathSync.native ? fs.realpathSync.native(candidate) : fs.realpathSync(candidate));
+    } catch (error) {
+      throw new Error(`INVALID_${label === 'managed root' ? 'MANAGED_ROOT' : 'REPOSITORY_ROOT'}: Unable to resolve ${label} "${candidate}": ${error instanceof Error ? error.message : String(error)}`);
+    }
+
+    if (normalizePathForComparison(realPath) !== normalizePathForComparison(candidate)) {
+      throw new Error(`INVALID_${label === 'managed root' ? 'MANAGED_ROOT' : 'REPOSITORY_ROOT'}: ${label} "${candidate}" resolves through an alias or junction.`);
+    }
+    return {
+      realPath,
+      dev: stat.dev,
+      ino: stat.ino,
+      birthtimeMs: stat.birthtimeMs,
+    };
+  }
+
+  private assertRepositoryRootIdentity(): void {
+    let current: DirectoryIdentity;
+    try {
+      current = this.captureDirectoryIdentity(this.canonicalRepoRoot, 'repository root');
+    } catch {
+      throw new PathIdentityError('PATH_IDENTITY_CHANGED', 'PATH_IDENTITY_CHANGED: Repository root can no longer be resolved safely.');
+    }
+    if (!sameDirectoryIdentity(this.repositoryRootIdentity, current)) {
+      throw new PathIdentityError(
+        'PATH_IDENTITY_CHANGED',
+        `PATH_IDENTITY_CHANGED: Repository root identity changed from "${this.repositoryRootIdentity.realPath}".`,
+      );
+    }
+  }
+
+  private assertManagedRootIdentity(): void {
+    let current: DirectoryIdentity;
+    try {
+      current = this.captureDirectoryIdentity(this.canonicalManagedRoot, 'managed root');
+    } catch {
+      throw new PathIdentityError('PATH_IDENTITY_CHANGED', 'PATH_IDENTITY_CHANGED: Managed root can no longer be resolved safely.');
+    }
+    if (!sameDirectoryIdentity(this.managedRootIdentity, current)) {
+      throw new PathIdentityError(
+        'PATH_IDENTITY_CHANGED',
+        `PATH_IDENTITY_CHANGED: Managed root identity changed from "${this.managedRootIdentity.realPath}".`,
+      );
+    }
+  }
+
+  private assertRootIdentities(): void {
+    this.assertRepositoryRootIdentity();
+    this.assertManagedRootIdentity();
+  }
+
+  private captureTargetIdentity(targetPath: string, required: boolean): DirectoryIdentity | null {
+    let stat: fs.Stats;
+    try {
+      stat = fs.lstatSync(targetPath);
+    } catch (error) {
+      if (!required && isMissingFsError(error)) return null;
+      if (isMissingFsError(error)) {
+        throw new PathIdentityError('PATH_IDENTITY_CHANGED', `PATH_IDENTITY_CHANGED: Target "${targetPath}" disappeared.`);
+      }
+      throw new PathIdentityError(
+        'PATH_CONTAINMENT_DENIED',
+        `PATH_CONTAINMENT_DENIED: Unable to inspect target "${targetPath}" safely.`,
+      );
+    }
+
+    if (stat.isSymbolicLink()) {
+      throw new PathIdentityError(
+        'PATH_CONTAINMENT_DENIED',
+        `PATH_CONTAINMENT_DENIED: Target "${targetPath}" is a symbolic link or junction.`,
+      );
+    }
+    if (!stat.isDirectory()) {
+      throw new PathIdentityError(
+        'PATH_CONTAINMENT_DENIED',
+        `PATH_CONTAINMENT_DENIED: Target "${targetPath}" is not a directory.`,
+      );
+    }
+
+    let realPath: string;
+    try {
+      realPath = path.resolve(fs.realpathSync.native ? fs.realpathSync.native(targetPath) : fs.realpathSync(targetPath));
+    } catch {
+      throw new PathIdentityError(
+        'PATH_CONTAINMENT_DENIED',
+        `PATH_CONTAINMENT_DENIED: Unable to resolve target "${targetPath}" safely.`,
+      );
+    }
+    if (
+      normalizePathForComparison(realPath) !== normalizePathForComparison(targetPath) ||
+      !isPathWithinRoot(realPath, this.canonicalManagedRoot)
+    ) {
+      throw new PathIdentityError(
+        'PATH_CONTAINMENT_DENIED',
+        `PATH_CONTAINMENT_DENIED: Target "${targetPath}" does not resolve to the checked managed-root identity.`,
+      );
+    }
+
+    return {
+      realPath,
+      dev: stat.dev,
+      ino: stat.ino,
+      birthtimeMs: stat.birthtimeMs,
+    };
+  }
+
+  private assertTargetIdentity(
+    targetPath: string,
+    expected: DirectoryIdentity | null,
+    requirePresent: boolean,
+  ): DirectoryIdentity | null {
+    const current = this.captureTargetIdentity(targetPath, requirePresent);
+    if (!current) {
+      if (!requirePresent && expected) return null;
+      if (!expected) return null;
+      throw new PathIdentityError(
+        'PATH_IDENTITY_CHANGED',
+        `PATH_IDENTITY_CHANGED: Target "${targetPath}" identity changed during the managed operation.`,
+      );
+    }
+    if (!expected || !sameDirectoryIdentity(expected, current)) {
+      throw new PathIdentityError(
+        'PATH_IDENTITY_CHANGED',
+        `PATH_IDENTITY_CHANGED: Target "${targetPath}" identity changed during the managed operation.`,
+      );
+    }
+    return current;
+  }
+
+  private assertOperationBoundary(targetPath: string, expectedTarget: DirectoryIdentity | null, requireTarget: boolean): void {
+    this.assertRootIdentities();
+    this.assertTargetIdentity(targetPath, expectedTarget, requireTarget);
+  }
+
+  private async delay(milliseconds: number): Promise<void> {
+    await new Promise<void>((resolve) => setTimeout(resolve, milliseconds));
+  }
+
+  private isProcessAlive(pid: number): boolean {
+    if (!Number.isInteger(pid) || pid <= 0) return false;
+    try {
+      process.kill(pid, 0);
+      return true;
+    } catch (error) {
+      return (error as NodeJS.ErrnoException).code === 'EPERM';
+    }
+  }
+
+  private tryBreakStaleManagedRootLock(lockPath: string): boolean | null {
+    let stat: fs.Stats;
+    try {
+      stat = fs.lstatSync(lockPath);
+    } catch (error) {
+      if (isMissingFsError(error)) return false;
+      return null;
+    }
+    if (stat.isSymbolicLink() || !stat.isFile()) return null;
+
+    let metadata: { pid?: number; createdAt?: number } = {};
+    try {
+      metadata = JSON.parse(fs.readFileSync(lockPath, 'utf8')) as { pid?: number; createdAt?: number };
+    } catch {
+      // A process may have crashed between creating the file and writing its
+      // metadata. The mtime age below still gives deterministic recovery.
+    }
+    const createdAt = typeof metadata.createdAt === 'number' ? metadata.createdAt : stat.mtimeMs;
+    const staleByAge = Date.now() - createdAt > GitWorktreeService.STALE_LOCK_AFTER_MS;
+    const ownerPid = typeof metadata.pid === 'number' && Number.isInteger(metadata.pid) && metadata.pid > 0
+      ? metadata.pid
+      : null;
+    // Never break a lock solely because it is old while its owner is still
+    // alive. A long-running Git operation may legitimately hold the lock for
+    // longer than the recovery threshold; age only makes a lock with missing
+    // owner metadata eligible for recovery.
+    const ownerDead = ownerPid !== null && !this.isProcessAlive(ownerPid);
+    if (!ownerDead && !(ownerPid === null && staleByAge)) return false;
+
+    this.assertManagedRootIdentity();
+    try {
+      fs.unlinkSync(lockPath);
+      return true;
+    } catch (error) {
+      return isMissingFsError(error);
+    }
+  }
+
+  private async acquireManagedRootLock(): Promise<ManagedRootLock | null> {
+    this.assertRootIdentities();
+    const lockPath = path.join(this.canonicalManagedRoot, GitWorktreeService.OPERATION_LOCK_FILE);
+    const deadline = Date.now() + GitWorktreeService.OPERATION_LOCK_TIMEOUT_MS;
+    const token = crypto.randomUUID();
+
+    while (Date.now() < deadline) {
+      this.assertRootIdentities();
+      let fd: number | null = null;
+      try {
+        fd = fs.openSync(lockPath, 'wx', 0o600);
+        fs.writeFileSync(fd, JSON.stringify({ pid: process.pid, createdAt: Date.now(), token }), 'utf8');
+        fs.closeSync(fd);
+        fd = null;
+        this.assertRootIdentities();
+        return { token, path: lockPath };
+      } catch (error) {
+        if (fd !== null) {
+          try { fs.closeSync(fd); } catch {}
+        }
+        if (error instanceof PathIdentityError) throw error;
+        if ((error as NodeJS.ErrnoException).code !== 'EEXIST') return null;
+        const stale = this.tryBreakStaleManagedRootLock(lockPath);
+        if (stale === null) return null;
+        if (!stale) await this.delay(GitWorktreeService.OPERATION_LOCK_RETRY_MS);
+      }
+    }
+    return null;
+  }
+
+  private releaseManagedRootLock(lock: ManagedRootLock): void {
+    try {
+      this.assertManagedRootIdentity();
+      const metadata = JSON.parse(fs.readFileSync(lock.path, 'utf8')) as { token?: string };
+      if (metadata.token === lock.token) fs.unlinkSync(lock.path);
+    } catch {
+      // Never unlink through an identity that is no longer trusted. A stale
+      // lock is recoverable by the next operation after its owner disappears.
+    }
+  }
+
+  private async withManagedRootLock<T>(onUnavailable: () => T, operation: () => Promise<T>): Promise<T> {
+    let lock: ManagedRootLock | null = null;
+    try {
+      lock = await this.acquireManagedRootLock();
+    } catch (error) {
+      if (error instanceof PathIdentityError) {
+        return onUnavailable();
+      }
+      return onUnavailable();
+    }
+    if (!lock) return onUnavailable();
+    try {
+      return await operation();
+    } finally {
+      this.releaseManagedRootLock(lock);
+    }
+  }
+
+  private async executeGitAtRepository(
+    args: string[],
+  ): Promise<{ exitCode: number; stdout: string; stderr: string }> {
+    this.assertRootIdentities();
+    const result = await this.executor.execute(this.gitExecutable, args, { cwd: this.canonicalRepoRoot });
+    this.assertRootIdentities();
+    return result;
+  }
+
+  private async executeGitWithTargetBoundary(
+    args: string[],
+    targetPath: string,
+    targetIdentity: DirectoryIdentity,
+    allowTargetMissingAfter = false,
+  ): Promise<{ exitCode: number; stdout: string; stderr: string }> {
+    this.assertOperationBoundary(targetPath, targetIdentity, true);
+    const result = await this.executor.execute(this.gitExecutable, args, {
+      cwd: args[0] === 'worktree' && (args[1] === 'unlock' || args[1] === 'lock' || args[1] === 'remove')
+        ? this.canonicalRepoRoot
+        : targetPath,
+    });
+    this.assertRootIdentities();
+    this.assertTargetIdentity(targetPath, targetIdentity, !allowTargetMissingAfter);
+    return result;
+  }
+
+  /**
+   * Runs the repository-side `worktree add` only while the derived target is
+   * still absent and both roots retain their captured filesystem identities.
+   * The caller performs the required post-add target capture; when Git fails
+   * or the target cannot be captured safely, no cleanup is attempted through
+   * an unverified path.
+   */
+  private async executeGitForAbsentTarget(
+    args: string[],
+    targetPath: string,
+  ): Promise<{ exitCode: number; stdout: string; stderr: string }> {
+    this.assertRootIdentities();
+    this.assertTargetIdentity(targetPath, null, false);
+    const result = await this.executor.execute(this.gitExecutable, args, { cwd: this.canonicalRepoRoot });
+    this.assertRootIdentities();
+    return result;
   }
 
   public getRepositoryRoot(): string {
@@ -239,6 +588,7 @@ export class GitWorktreeService {
    * Derives a deterministic ownership digest and isolated filesystem path from an ownership tuple.
    */
   public deriveWorktreePath(tuple: WorktreeOwnershipTuple): { worktreePath: string; digest: string } {
+    this.assertManagedRootIdentity();
     const canonicalJson = JSON.stringify({
       projectId: tuple.projectId,
       taskId: tuple.taskId,
@@ -262,6 +612,17 @@ export class GitWorktreeService {
    * Asynchronously creates an isolated, detached, locked Git worktree for an assignment.
    */
   public async createWorktree(tuple: WorktreeOwnershipTuple): Promise<WorktreeCreateResult> {
+    return this.withManagedRootLock<WorktreeCreateResult>(
+      () => ({
+        status: 'FAILED',
+        code: 'PATH_CONTAINMENT_DENIED',
+        error: 'PATH_CONTAINMENT_DENIED: Managed-root operation lock could not be acquired safely.',
+      }),
+      () => this.createWorktreeUnlocked(tuple),
+    );
+  }
+
+  private async createWorktreeUnlocked(tuple: WorktreeOwnershipTuple): Promise<WorktreeCreateResult> {
     // 1. Validate Base SHA syntax
     if (!tuple.baseSha || typeof tuple.baseSha !== 'string' || !/^[0-9a-fA-F]{40}$/.test(tuple.baseSha)) {
       return {
@@ -272,12 +633,31 @@ export class GitWorktreeService {
     }
     const expectedSha = tuple.baseSha.toLowerCase();
 
+    try {
+      this.assertRootIdentities();
+    } catch (error) {
+      const code = error instanceof PathIdentityError ? error.code : 'PATH_IDENTITY_CHANGED';
+      return {
+        status: 'FAILED',
+        code,
+        error: error instanceof Error ? error.message : 'PATH_IDENTITY_CHANGED: Filesystem root identity could not be verified.',
+      };
+    }
+
     // 2. Prove exact source commit exists in repository
-    const commitCheck = await this.executor.execute(
-      this.gitExecutable,
-      ['rev-parse', '--verify', '--quiet', `${expectedSha}^{commit}`],
-      { cwd: this.canonicalRepoRoot }
-    );
+    let commitCheck: { exitCode: number; stdout: string; stderr: string };
+    try {
+      commitCheck = await this.executeGitAtRepository([
+        'rev-parse', '--verify', '--quiet', `${expectedSha}^{commit}`,
+      ]);
+    } catch (error) {
+      const code = error instanceof PathIdentityError ? error.code : 'PATH_IDENTITY_CHANGED';
+      return {
+        status: 'FAILED',
+        code,
+        error: error instanceof Error ? error.message : 'PATH_IDENTITY_CHANGED: Repository identity changed during source verification.',
+      };
+    }
     if (commitCheck.exitCode !== 0) {
       return {
         status: 'FAILED',
@@ -289,6 +669,7 @@ export class GitWorktreeService {
     // 3. Derive deterministic target path
     let targetPath: string;
     let digest: string;
+    let targetIdentity: DirectoryIdentity | null = null;
     try {
       const derived = this.deriveWorktreePath(tuple);
       targetPath = derived.worktreePath;
@@ -301,8 +682,21 @@ export class GitWorktreeService {
       };
     }
 
-    // 4. Verify path does not exist on filesystem
-    if (fs.existsSync(targetPath)) {
+    // 4. Verify the managed-root identity and prove that the target is absent.
+    // lstat is intentional: a broken symlink must not be treated as absent.
+    try {
+      this.assertRootIdentities();
+      targetIdentity = this.captureTargetIdentity(targetPath, false);
+    } catch (error) {
+      const code = error instanceof PathIdentityError ? error.code : 'PATH_IDENTITY_CHANGED';
+      return {
+        status: 'FAILED',
+        code,
+        error: error instanceof Error ? error.message : 'PATH_IDENTITY_CHANGED: Target identity could not be verified.',
+        worktreePath: targetPath,
+      };
+    }
+    if (targetIdentity) {
       return {
         status: 'FAILED',
         code: 'WORKTREE_ALREADY_EXISTS',
@@ -312,7 +706,20 @@ export class GitWorktreeService {
     }
 
     // 5. Verify path is not already registered in git worktree list
-    const porcelainList = await this.listPorcelain();
+    let porcelainList: PorcelainWorktreeEntry[];
+    try {
+      this.assertRootIdentities();
+      porcelainList = await this.listPorcelain();
+      this.assertRootIdentities();
+    } catch (error) {
+      const code = error instanceof PathIdentityError ? error.code : 'PATH_IDENTITY_CHANGED';
+      return {
+        status: 'FAILED',
+        code,
+        error: error instanceof Error ? error.message : 'PATH_IDENTITY_CHANGED: Worktree registration could not be verified safely.',
+        worktreePath: targetPath,
+      };
+    }
     const isRegistered = porcelainList.some(
       (entry) => normalizePathForComparison(entry.worktreePath) === normalizePathForComparison(targetPath)
     );
@@ -326,11 +733,24 @@ export class GitWorktreeService {
     }
 
     // 6. Run git worktree add --detach <targetPath> <baseSha>
-    const addResult = await this.executor.execute(
-      this.gitExecutable,
-      ['worktree', 'add', '--detach', targetPath, expectedSha],
-      { cwd: this.canonicalRepoRoot }
-    );
+    let addResult: { exitCode: number; stdout: string; stderr: string };
+    try {
+      addResult = await this.executeGitForAbsentTarget(
+        ['worktree', 'add', '--detach', targetPath, expectedSha],
+        targetPath,
+      );
+      if (addResult.exitCode === 0) {
+        targetIdentity = this.captureTargetIdentity(targetPath, true);
+      }
+    } catch (error) {
+      const code = error instanceof PathIdentityError ? error.code : 'PATH_IDENTITY_CHANGED';
+      return {
+        status: 'FAILED',
+        code,
+        error: error instanceof Error ? error.message : 'PATH_IDENTITY_CHANGED: Target identity changed during worktree creation.',
+        worktreePath: targetPath,
+      };
+    }
     if (addResult.exitCode !== 0) {
       return {
         status: 'FAILED',
@@ -347,11 +767,7 @@ export class GitWorktreeService {
 
     try {
       // Verify HEAD equals expected baseSha
-      const headCheck = await this.executor.execute(
-        this.gitExecutable,
-        ['rev-parse', 'HEAD'],
-        { cwd: targetPath }
-      );
+      const headCheck = await this.executeGitWithTargetBoundary(['rev-parse', 'HEAD'], targetPath, targetIdentity!);
       if (headCheck.exitCode !== 0 || headCheck.stdout.trim().toLowerCase() !== expectedSha) {
         rollbackNeeded = true;
         failureCode = 'HEAD_BINDING_MISMATCH';
@@ -360,10 +776,10 @@ export class GitWorktreeService {
 
       // Verify detached state
       if (!rollbackNeeded) {
-        const branchCheck = await this.executor.execute(
-          this.gitExecutable,
+        const branchCheck = await this.executeGitWithTargetBoundary(
           ['branch', '--show-current'],
-          { cwd: targetPath }
+          targetPath,
+          targetIdentity!,
         );
         if (branchCheck.exitCode !== 0 || branchCheck.stdout.trim() !== '') {
           rollbackNeeded = true;
@@ -374,10 +790,10 @@ export class GitWorktreeService {
 
       // Verify toplevel matches targetPath
       if (!rollbackNeeded) {
-        const toplevelCheck = await this.executor.execute(
-          this.gitExecutable,
+        const toplevelCheck = await this.executeGitWithTargetBoundary(
           ['rev-parse', '--show-toplevel'],
-          { cwd: targetPath }
+          targetPath,
+          targetIdentity!,
         );
         if (
           toplevelCheck.exitCode !== 0 ||
@@ -391,7 +807,9 @@ export class GitWorktreeService {
 
       // Verify registration in primary repository porcelain list
       if (!rollbackNeeded) {
+        this.assertOperationBoundary(targetPath, targetIdentity!, true);
         const postPorcelain = await this.listPorcelain();
+        this.assertOperationBoundary(targetPath, targetIdentity!, true);
         const matching = postPorcelain.filter(
           (entry) => normalizePathForComparison(entry.worktreePath) === normalizePathForComparison(targetPath)
         );
@@ -409,10 +827,10 @@ export class GitWorktreeService {
       // Lock worktree
       if (!rollbackNeeded) {
         const lockReason = `AgentForge managed assignment ${digest.substring(0, 16)}`;
-        const lockResult = await this.executor.execute(
-          this.gitExecutable,
+        const lockResult = await this.executeGitWithTargetBoundary(
           ['worktree', 'lock', '--reason', lockReason, targetPath],
-          { cwd: this.canonicalRepoRoot }
+          targetPath,
+          targetIdentity!,
         );
         if (lockResult.exitCode !== 0) {
           rollbackNeeded = true;
@@ -423,7 +841,9 @@ export class GitWorktreeService {
 
       // Verify locked state in porcelain list
       if (!rollbackNeeded) {
+        this.assertOperationBoundary(targetPath, targetIdentity!, true);
         const postLockPorcelain = await this.listPorcelain();
+        this.assertOperationBoundary(targetPath, targetIdentity!, true);
         const matchingLocked = postLockPorcelain.find(
           (entry) => normalizePathForComparison(entry.worktreePath) === normalizePathForComparison(targetPath)
         );
@@ -435,13 +855,15 @@ export class GitWorktreeService {
       }
     } catch (err: any) {
       rollbackNeeded = true;
-      failureCode = 'GIT_ADD_FAILED';
-      failureMessage = `GIT_ADD_FAILED: Post-creation verification threw exception: ${err.message}`;
+      failureCode = err instanceof PathIdentityError ? err.code : 'GIT_ADD_FAILED';
+      failureMessage = err instanceof PathIdentityError
+        ? err.message
+        : `GIT_ADD_FAILED: Post-creation verification threw exception: ${err.message}`;
     }
 
     // 8. Execute rollback if verification or lock failed
     if (rollbackNeeded) {
-      const rollbackSuccess = await this.attemptRollback(targetPath);
+      const rollbackSuccess = await this.attemptRollback(targetPath, targetIdentity);
       if (!rollbackSuccess) {
         return {
           status: 'FAILED',
@@ -470,6 +892,17 @@ export class GitWorktreeService {
    * Inspects a managed worktree without mutating any filesystem or Git state.
    */
   public async inspectWorktree(tuple: WorktreeOwnershipTuple): Promise<WorktreeInspectResult> {
+    return this.withManagedRootLock<WorktreeInspectResult>(
+      () => ({
+        status: 'FAILED',
+        code: 'PATH_CONTAINMENT_DENIED',
+        error: 'PATH_CONTAINMENT_DENIED: Managed-root operation lock could not be acquired safely.',
+      }),
+      () => this.inspectWorktreeUnlocked(tuple),
+    );
+  }
+
+  private async inspectWorktreeUnlocked(tuple: WorktreeOwnershipTuple): Promise<WorktreeInspectResult> {
     let targetPath: string;
     let digest: string;
     try {
@@ -484,8 +917,36 @@ export class GitWorktreeService {
       };
     }
 
-    const exists = fs.existsSync(targetPath);
-    const porcelainList = await this.listPorcelain();
+    let targetIdentity: DirectoryIdentity | null;
+    try {
+      this.assertRootIdentities();
+      targetIdentity = this.captureTargetIdentity(targetPath, false);
+    } catch (error) {
+      const code = error instanceof PathIdentityError ? error.code : 'PATH_IDENTITY_CHANGED';
+      return {
+        status: 'FAILED',
+        code,
+        error: error instanceof Error ? error.message : 'PATH_IDENTITY_CHANGED: Target identity could not be inspected safely.',
+        worktreePath: targetPath,
+      };
+    }
+
+    const exists = targetIdentity !== null;
+    let porcelainList: PorcelainWorktreeEntry[];
+    try {
+      this.assertRootIdentities();
+      porcelainList = await this.listPorcelain();
+      this.assertRootIdentities();
+      if (targetIdentity) this.assertTargetIdentity(targetPath, targetIdentity, true);
+    } catch (error) {
+      const code = error instanceof PathIdentityError ? error.code : 'INSPECTION_FAILED';
+      return {
+        status: 'FAILED',
+        code,
+        error: error instanceof Error ? error.message : 'INSPECTION_FAILED: Worktree identity changed during inspection.',
+        worktreePath: targetPath,
+      };
+    }
     const entry = porcelainList.find(
       (e) => normalizePathForComparison(e.worktreePath) === normalizePathForComparison(targetPath)
     );
@@ -499,23 +960,35 @@ export class GitWorktreeService {
 
     if (exists && registered) {
       try {
-        const headCheck = await this.executor.execute(this.gitExecutable, ['rev-parse', 'HEAD'], { cwd: targetPath });
+        const headCheck = await this.executeGitWithTargetBoundary(['rev-parse', 'HEAD'], targetPath, targetIdentity!);
         if (headCheck.exitCode === 0) {
           headSha = headCheck.stdout.trim().toLowerCase();
         }
-        const branchCheck = await this.executor.execute(this.gitExecutable, ['branch', '--show-current'], { cwd: targetPath });
+        const branchCheck = await this.executeGitWithTargetBoundary(
+          ['branch', '--show-current'],
+          targetPath,
+          targetIdentity!,
+        );
         if (branchCheck.exitCode === 0) {
           detached = branchCheck.stdout.trim() === '';
         }
-        const statusCheck = await this.executor.execute(
-          this.gitExecutable,
+        const statusCheck = await this.executeGitWithTargetBoundary(
           ['status', '--porcelain', '-uall'],
-          { cwd: targetPath }
+          targetPath,
+          targetIdentity!,
         );
         if (statusCheck.exitCode === 0) {
           clean = statusCheck.stdout.trim() === '';
         }
-      } catch {
+      } catch (error) {
+        if (error instanceof PathIdentityError) {
+          return {
+            status: 'FAILED',
+            code: error.code,
+            error: error.message,
+            worktreePath: targetPath,
+          };
+        }
         clean = false;
       }
     }
@@ -542,6 +1015,17 @@ export class GitWorktreeService {
    * Safely removes an un-modified, clean, detached managed Git worktree.
    */
   public async removeWorktree(tuple: WorktreeOwnershipTuple): Promise<WorktreeRemoveResult> {
+    return this.withManagedRootLock<WorktreeRemoveResult>(
+      () => ({
+        status: 'FAILED',
+        code: 'PATH_CONTAINMENT_DENIED',
+        error: 'PATH_CONTAINMENT_DENIED: Managed-root operation lock could not be acquired safely.',
+      }),
+      () => this.removeWorktreeUnlocked(tuple),
+    );
+  }
+
+  private async removeWorktreeUnlocked(tuple: WorktreeOwnershipTuple): Promise<WorktreeRemoveResult> {
     let targetPath: string;
     let digest: string;
     try {
@@ -566,8 +1050,22 @@ export class GitWorktreeService {
       };
     }
 
-    // Check directory existence
-    if (!fs.existsSync(targetPath)) {
+    // Check directory existence and retain its filesystem identity for every
+    // subsequent Git operation. A path string alone is not an owner fence.
+    let targetIdentity: DirectoryIdentity | null;
+    try {
+      this.assertRootIdentities();
+      targetIdentity = this.captureTargetIdentity(targetPath, false);
+    } catch (error) {
+      const code = error instanceof PathIdentityError ? error.code : 'PATH_IDENTITY_CHANGED';
+      return {
+        status: 'FAILED',
+        code,
+        error: error instanceof Error ? error.message : 'PATH_IDENTITY_CHANGED: Target identity could not be verified safely.',
+        worktreePath: targetPath,
+      };
+    }
+    if (!targetIdentity) {
       return {
         status: 'FAILED',
         code: 'UNMANAGED_WORKTREE',
@@ -577,7 +1075,20 @@ export class GitWorktreeService {
     }
 
     // Check registration in porcelain list
-    const porcelainList = await this.listPorcelain();
+    let porcelainList: PorcelainWorktreeEntry[];
+    try {
+      this.assertOperationBoundary(targetPath, targetIdentity, true);
+      porcelainList = await this.listPorcelain();
+      this.assertOperationBoundary(targetPath, targetIdentity, true);
+    } catch (error) {
+      const code = error instanceof PathIdentityError ? error.code : 'PATH_IDENTITY_CHANGED';
+      return {
+        status: 'FAILED',
+        code,
+        error: error instanceof Error ? error.message : 'PATH_IDENTITY_CHANGED: Worktree registration could not be verified safely.',
+        worktreePath: targetPath,
+      };
+    }
     const entry = porcelainList.find(
       (e) => normalizePathForComparison(e.worktreePath) === normalizePathForComparison(targetPath)
     );
@@ -590,8 +1101,29 @@ export class GitWorktreeService {
       };
     }
 
+    const expectedLockReason = `AgentForge managed assignment ${digest.substring(0, 16)}`;
+    if (entry.isLocked && entry.lockReason !== expectedLockReason) {
+      return {
+        status: 'FAILED',
+        code: 'UNMANAGED_WORKTREE',
+        error: `UNMANAGED_WORKTREE: Worktree "${targetPath}" is locked by a different ownership identity. Removal denied.`,
+        worktreePath: targetPath,
+      };
+    }
+
     // Check HEAD matches expected baseSha
-    const headCheck = await this.executor.execute(this.gitExecutable, ['rev-parse', 'HEAD'], { cwd: targetPath });
+    let headCheck: { exitCode: number; stdout: string; stderr: string };
+    try {
+      headCheck = await this.executeGitWithTargetBoundary(['rev-parse', 'HEAD'], targetPath, targetIdentity);
+    } catch (error) {
+      const code = error instanceof PathIdentityError ? error.code : 'HEAD_CHANGED';
+      return {
+        status: 'FAILED',
+        code,
+        error: error instanceof Error ? error.message : 'PATH_IDENTITY_CHANGED: Worktree identity changed before HEAD verification.',
+        worktreePath: targetPath,
+      };
+    }
     const expectedSha = tuple.baseSha.toLowerCase();
     if (headCheck.exitCode !== 0 || headCheck.stdout.trim().toLowerCase() !== expectedSha) {
       return {
@@ -603,11 +1135,22 @@ export class GitWorktreeService {
     }
 
     // Check working directory clean status
-    const statusCheck = await this.executor.execute(
-      this.gitExecutable,
-      ['status', '--porcelain', '-uall'],
-      { cwd: targetPath }
-    );
+    let statusCheck: { exitCode: number; stdout: string; stderr: string };
+    try {
+      statusCheck = await this.executeGitWithTargetBoundary(
+        ['status', '--porcelain', '-uall'],
+        targetPath,
+        targetIdentity,
+      );
+    } catch (error) {
+      const code = error instanceof PathIdentityError ? error.code : 'PATH_IDENTITY_CHANGED';
+      return {
+        status: 'FAILED',
+        code,
+        error: error instanceof Error ? error.message : 'PATH_IDENTITY_CHANGED: Worktree identity changed before clean-state verification.',
+        worktreePath: targetPath,
+      };
+    }
     if (statusCheck.exitCode !== 0 || statusCheck.stdout.trim() !== '') {
       return {
         status: 'FAILED',
@@ -619,11 +1162,22 @@ export class GitWorktreeService {
 
     // 1. Unlock worktree if locked
     if (entry.isLocked) {
-      const unlockResult = await this.executor.execute(
-        this.gitExecutable,
-        ['worktree', 'unlock', targetPath],
-        { cwd: this.canonicalRepoRoot }
-      );
+      let unlockResult: { exitCode: number; stdout: string; stderr: string };
+      try {
+        unlockResult = await this.executeGitWithTargetBoundary(
+          ['worktree', 'unlock', targetPath],
+          targetPath,
+          targetIdentity,
+        );
+      } catch (error) {
+        const code = error instanceof PathIdentityError ? error.code : 'REMOVE_FAILED';
+        return {
+          status: 'FAILED',
+          code,
+          error: error instanceof Error ? error.message : 'PATH_IDENTITY_CHANGED: Worktree identity changed during unlock.',
+          worktreePath: targetPath,
+        };
+      }
       if (unlockResult.exitCode !== 0) {
         return {
           status: 'FAILED',
@@ -635,19 +1189,33 @@ export class GitWorktreeService {
     }
 
     // 2. Remove worktree (WITHOUT --force)
-    const removeResult = await this.executor.execute(
-      this.gitExecutable,
-      ['worktree', 'remove', targetPath],
-      { cwd: this.canonicalRepoRoot }
-    );
+    let removeResult: { exitCode: number; stdout: string; stderr: string };
+    try {
+      removeResult = await this.executeGitWithTargetBoundary(
+        ['worktree', 'remove', targetPath],
+        targetPath,
+        targetIdentity,
+        true,
+      );
+    } catch (error) {
+      const code = error instanceof PathIdentityError ? error.code : 'REMOVE_FAILED';
+      return {
+        status: 'FAILED',
+        code,
+        error: error instanceof Error ? error.message : 'PATH_IDENTITY_CHANGED: Worktree identity changed during removal.',
+        worktreePath: targetPath,
+      };
+    }
     if (removeResult.exitCode !== 0) {
       // Attempt to re-lock on remove failure to protect worktree
       try {
-        await this.executor.execute(
-          this.gitExecutable,
-          ['worktree', 'lock', '--reason', `AgentForge managed assignment ${digest.substring(0, 16)}`, targetPath],
-          { cwd: this.canonicalRepoRoot }
-        );
+        if (this.captureTargetIdentity(targetPath, false)) {
+          await this.executeGitWithTargetBoundary(
+            ['worktree', 'lock', '--reason', `AgentForge managed assignment ${digest.substring(0, 16)}`, targetPath],
+            targetPath,
+            targetIdentity,
+          );
+        }
       } catch {
         // ignore re-lock failure in error handler
       }
@@ -660,11 +1228,25 @@ export class GitWorktreeService {
     }
 
     // 3. Verify path is no longer registered
-    const postRemovePorcelain = await this.listPorcelain();
+    let postRemovePorcelain: PorcelainWorktreeEntry[];
+    let remainingTarget: DirectoryIdentity | null;
+    try {
+      postRemovePorcelain = await this.listPorcelain();
+      this.assertRootIdentities();
+      remainingTarget = this.captureTargetIdentity(targetPath, false);
+    } catch (error) {
+      const code = error instanceof PathIdentityError ? error.code : 'REMOVE_FAILED';
+      return {
+        status: 'FAILED',
+        code,
+        error: error instanceof Error ? error.message : 'PATH_IDENTITY_CHANGED: Worktree identity could not be verified after removal.',
+        worktreePath: targetPath,
+      };
+    }
     const stillRegistered = postRemovePorcelain.some(
       (e) => normalizePathForComparison(e.worktreePath) === normalizePathForComparison(targetPath)
     );
-    if (stillRegistered || fs.existsSync(targetPath)) {
+    if (stillRegistered || remainingTarget) {
       return {
         status: 'FAILED',
         code: 'REMOVE_FAILED',
@@ -683,22 +1265,26 @@ export class GitWorktreeService {
   /**
    * Internal rollback helper for failed creation attempts.
    */
-  private async attemptRollback(worktreePath: string): Promise<boolean> {
+  private async attemptRollback(worktreePath: string, targetIdentity: DirectoryIdentity | null): Promise<boolean> {
     try {
-      await this.executor.execute(this.gitExecutable, ['worktree', 'unlock', worktreePath], {
-        cwd: this.canonicalRepoRoot,
-      });
-      const removeResult = await this.executor.execute(
-        this.gitExecutable,
+      if (!targetIdentity) return false;
+      this.assertOperationBoundary(worktreePath, targetIdentity, true);
+      await this.executeGitWithTargetBoundary(['worktree', 'unlock', worktreePath], worktreePath, targetIdentity);
+      const removeResult = await this.executeGitWithTargetBoundary(
         ['worktree', 'remove', worktreePath],
-        { cwd: this.canonicalRepoRoot }
+        worktreePath,
+        targetIdentity,
+        true,
       );
       if (removeResult.exitCode !== 0) return false;
       const list = await this.listPorcelain();
+      this.assertRootIdentities();
+      const currentTarget = this.captureTargetIdentity(worktreePath, false);
+      if (currentTarget) return false;
       const stillRegistered = list.some(
         (e) => normalizePathForComparison(e.worktreePath) === normalizePathForComparison(worktreePath)
       );
-      return !stillRegistered && !fs.existsSync(worktreePath);
+      return !stillRegistered;
     } catch {
       return false;
     }
@@ -708,11 +1294,7 @@ export class GitWorktreeService {
    * Parses git worktree list --porcelain from repository root.
    */
   public async listPorcelain(): Promise<PorcelainWorktreeEntry[]> {
-    const res = await this.executor.execute(
-      this.gitExecutable,
-      ['worktree', 'list', '--porcelain'],
-      { cwd: this.canonicalRepoRoot }
-    );
+    const res = await this.executeGitAtRepository(['worktree', 'list', '--porcelain']);
     if (res.exitCode !== 0) {
       throw new Error(`Failed to list git worktrees: ${res.stderr.trim()}`);
     }
