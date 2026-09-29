@@ -378,8 +378,17 @@ export const OrchestratorProvider: React.FC<{ children: React.ReactNode }> = ({ 
     source: string,
     confidence: number
   ) => {
-    if (!orchestrator) return;
-    await orchestrator.updateResourceQuota({ id, remaining, total, source, confidence });
+    if (!orchestrator) throw new Error('Desktop IPC unavailable.');
+    const result = await orchestrator.updateResourceQuota({ id, remaining, total, source, confidence });
+    if (
+      result === false ||
+      (result && typeof result === 'object' && 'success' in result && result.success === false)
+    ) {
+      const message = result && typeof result === 'object' && 'error' in result
+        ? String(result.error || 'Failed to save quota snapshot.')
+        : 'Failed to save quota snapshot.';
+      throw new Error(message);
+    }
     await refreshData();
   };
 
