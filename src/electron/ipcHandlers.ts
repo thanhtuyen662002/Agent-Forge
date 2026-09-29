@@ -28,6 +28,7 @@ import {
   UpdateResourceQuotaIpcSchema,
   ProjectScopedIpcSchema,
   TaskScopedIpcSchema,
+  StartReviewIpcSchema,
   RunVerificationIpcSchema,
   EmergencyStopIpcSchema,
   ResumeProjectIpcSchema,
@@ -232,11 +233,16 @@ export function registerIpcHandlers(
   });
 
   ipcMain.handle('task:startReview', async (_, payload: unknown) => {
-    const parsed = TaskScopedIpcSchema.safeParse(payload);
+    const parsed = StartReviewIpcSchema.safeParse(payload);
     if (!parsed.success) {
       return { success: false, error: parsed.error.issues.map((i) => i.message).join(', ') };
     }
-    return taskService.startReview(parsed.data.taskId);
+    return taskService.startReview(parsed.data.taskId, parsed.data.expectedProjectId, {
+      expectedRevision: parsed.data.expectedRevision,
+      expectedOwnershipEpoch: parsed.data.expectedOwnershipEpoch,
+      expectedState: parsed.data.expectedState,
+      executionId: parsed.data.executionId,
+    });
   });
 
   // ==========================================
@@ -572,7 +578,17 @@ export function registerIpcHandlers(
       return { success: false, error: parsed.error.issues.map((i) => i.message).join(', ') };
     }
 
-    return taskService.executeValidationFlow(parsed.data.taskId, parsed.data.commandConfigId);
+    return taskService.executeValidationFlow(
+      parsed.data.taskId,
+      parsed.data.commandConfigId,
+      parsed.data.expectedProjectId,
+      {
+        expectedRevision: parsed.data.expectedRevision,
+        expectedOwnershipEpoch: parsed.data.expectedOwnershipEpoch,
+        expectedState: parsed.data.expectedState,
+        executionId: parsed.data.executionId,
+      },
+    );
   });
 
   ipcMain.handle('verification:getCommands', async (_, payload: unknown) => {

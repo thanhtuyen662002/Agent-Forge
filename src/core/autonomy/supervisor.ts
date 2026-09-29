@@ -13,7 +13,7 @@ import { ManagerProviderPool, buildManagerContextPackage } from './managerPool';
 import { ProductTaskAutonomyAdapter, renderCommand } from './productTaskAdapter';
 import { GitWorktreeService } from '../services/GitWorktreeService';
 import { buildTrustedEnvironment, resolveTrustedExecutable } from '../services/ExecutableResolver';
-import { AgentAssignment, ExecutionAuthorization, Task } from '../types/domain';
+import { AgentAssignment, ExecutionAuthorization, Task, TaskMutationBinding } from '../types/domain';
 import { CanonicalExecutionPayload, CanonicalExecutionPayloadSchema } from '../services/ExecutionAuthorizationService';
 import { ProviderEndpointConfig } from './providerEndpoint';
 import {
@@ -811,7 +811,7 @@ export class AutonomySupervisor {
           error: 'UNRECOGNIZED_CODER_PROVIDER',
         };
       },
-      runVerification: async (authority, wo) => {
+      runVerification: async (authority, wo, binding?: TaskMutationBinding) => {
         const targetOrder = wo ?? order;
         const ev = await this.evidence.collect(targetOrder, targetOrder.required_tests);
         const passed = ev.tests.length === targetOrder.required_tests.length && ev.tests.length > 0 && ev.tests.every((t) => t.exitCode === 0);
@@ -829,6 +829,10 @@ export class AutonomySupervisor {
           stdout: ev.tests.map((t) => t.stdout).join('\n'),
           stderr: ev.tests.map((t) => t.stderr).join('\n'),
           workingDirectory: targetOrder.worktree,
+          expectedRevision: binding?.expectedRevision,
+          expectedOwnershipEpoch: binding?.expectedOwnershipEpoch,
+          expectedState: binding?.expectedState,
+          executionId: binding?.executionId,
         });
       },
       conductReview: async (context) => {

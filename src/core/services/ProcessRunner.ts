@@ -42,6 +42,9 @@ export interface ProcessRunResult {
   stderrEvidenceId?: string | null;
   processStart: ProcessStartTruth;
   processTermination: ProcessTerminationTruth;
+  /** Wall-clock lifecycle timestamps for callers that defer persistence. */
+  startTime?: string;
+  endTime?: string;
 }
 
 export interface StructuredProcessOptions {
@@ -61,6 +64,8 @@ export interface StructuredProcessOptions {
   attemptId?: string | null;
   stdin?: string;
   executionId?: string;
+  /** Run and observe the child without creating or updating durable rows. */
+  deferPersistence?: boolean;
 }
 
 interface ResolvedInvocation {
@@ -631,6 +636,7 @@ export class ProcessRunner {
     const timeoutMs = timeoutValidation.value as number;
     const startTime = Date.now();
     const startIso = new Date(startTime).toISOString();
+    const shouldPersist = Boolean(options.repo && !options.deferPersistence);
 
     const maxStdout =
       options.maxStdoutBytes !== undefined && options.maxStdoutBytes > 0
@@ -649,9 +655,9 @@ export class ProcessRunner {
     );
 
     if (!policy.allowed) {
-      if (options.repo) {
+      if (shouldPersist) {
         try {
-          options.repo.createProcessRun({
+          options.repo!.createProcessRun({
             id: executionId,
             pid: null,
             project_id: options.projectId ?? null,
@@ -662,7 +668,7 @@ export class ProcessRunner {
             status: 'FAILED',
             start_time: startIso,
           });
-          options.repo.updateProcessRun(executionId, 'FAILED', -1, new Date().toISOString(), null, null);
+          options.repo!.updateProcessRun(executionId, 'FAILED', -1, new Date().toISOString(), null, null);
         } catch (dbErr: unknown) {
           return {
             executionId,
@@ -705,9 +711,9 @@ export class ProcessRunner {
     // 2. Custom Environment Allowlist Validation Gate
     const envValidationError = this.validateCustomEnv(options.env, options.allowedEnvKeys);
     if (envValidationError) {
-      if (options.repo) {
+      if (shouldPersist) {
         try {
-          options.repo.createProcessRun({
+          options.repo!.createProcessRun({
             id: executionId,
             pid: null,
             project_id: options.projectId ?? null,
@@ -718,7 +724,7 @@ export class ProcessRunner {
             status: 'FAILED',
             start_time: startIso,
           });
-          options.repo.updateProcessRun(executionId, 'FAILED', -1, new Date().toISOString(), null, null);
+          options.repo!.updateProcessRun(executionId, 'FAILED', -1, new Date().toISOString(), null, null);
         } catch (dbErr: unknown) {
           return {
             executionId,
@@ -782,8 +788,8 @@ export class ProcessRunner {
     const invocation = this.resolvePlatformInvocation(options.executable, options.args, minimalEnv);
 
     if (invocation.error) {
-      if (options.repo) {
-        options.repo.createProcessRun({
+      if (shouldPersist) {
+        options.repo!.createProcessRun({
           id: executionId,
           pid: null,
           project_id: options.projectId ?? null,
@@ -794,7 +800,7 @@ export class ProcessRunner {
           status: 'FAILED',
           start_time: startIso,
         });
-        options.repo.updateProcessRun(executionId, 'FAILED', -1, new Date().toISOString(), null, null);
+        options.repo!.updateProcessRun(executionId, 'FAILED', -1, new Date().toISOString(), null, null);
       }
 
       return {
@@ -816,9 +822,9 @@ export class ProcessRunner {
     }
 
     // Persist RUNNING process run in database if repository provided
-    if (options.repo) {
+    if (shouldPersist) {
       try {
-        options.repo.createProcessRun({
+        options.repo!.createProcessRun({
           id: executionId,
           pid: null,
           project_id: options.projectId ?? null,
@@ -878,7 +884,7 @@ export class ProcessRunner {
         );
         const endIso = new Date().toISOString();
 
-        const durableError = ProcessRunner.persistLaunchFailure(options, result, endIso);
+        const durableError = shouldPersist ? ProcessRunner.persistLaunchFailure(options, result, endIso) : null;
         if (durableError) {
           ProcessRunner.registerPersistenceFence(result, durableError, endIso);
           reject(durableError);
@@ -989,7 +995,7 @@ export class ProcessRunner {
           let stdoutEvidenceId: string | null = null;
           let stderrEvidenceId: string | null = null;
 
-          if (options.artifactStore && options.repo && options.projectId) {
+          if (shouldPersist && options.artifactStore && options.repo && options.projectId) {
             if (finalStdout.trim().length > 0) {
               const ev = options.artifactStore.store(
                 crypto.randomUUID(),
@@ -1022,7 +1028,7 @@ export class ProcessRunner {
 
           let durableUpdateError: Error | null = null;
           let terminalResult: ProcessRunResult | null = null;
-          if (options.repo) {
+          if (shouldPersist && options.repo) {
             try {
               options.repo.updateProcessRun(
                 executionId,
@@ -1054,6 +1060,8 @@ export class ProcessRunner {
             stderrEvidenceId,
             processStart: startTruth,
             processTermination: termTruth,
+            startTime: startIso,
+            endTime: endIso,
           };
 
           try {
@@ -1076,7 +1084,7 @@ export class ProcessRunner {
         process: child,
         command: commandStr,
         isCancelled: false,
-        repo: options.repo,
+        repo: shouldPersist ? options.repo : undefined,
         settle: settleOnce,
       };
       this.activeProcesses.set(executionId, procEntry);
@@ -1201,7 +1209,7 @@ export class ProcessRunner {
       // PID persistence is part of startup truth.  Keep it inside the same
       // settled lifecycle as spawn so a database failure cannot orphan a
       // child while leaving its durable row RUNNING.
-      if (child.pid && options.repo) {
+      if (child.pid && shouldPersist && options.repo) {
         try {
           options.repo.updateProcessRunPid(executionId, child.pid);
           const persisted = options.repo.getProcessRun(executionId);

@@ -1,6 +1,13 @@
 import { contextBridge, ipcRenderer } from 'electron';
 import type { CanonicalExecutionScope } from '../core/services/ExecutionAuthorizationService';
 
+export interface TaskMutationBindingInput {
+  expectedRevision?: number;
+  expectedOwnershipEpoch?: number;
+  expectedState?: string;
+  executionId?: string;
+}
+
 export interface OrchestratorApi {
   // Repository Dialog
   selectRepositoryDirectory: () => Promise<{
@@ -33,7 +40,7 @@ export interface OrchestratorApi {
     acceptanceCriteria?: string[];
     constraints?: string[];
   }) => Promise<any>;
-  startReview: (taskId: string) => Promise<any>;
+  startReview: (taskId: string, binding?: TaskMutationBindingInput) => Promise<any>;
 
   // Protocols & Manual Bridge
   parseProtocol: (rawInput: string) => Promise<any>;
@@ -44,7 +51,11 @@ export interface OrchestratorApi {
   // Git & Verification
   getGitStatus: (projectId: string) => Promise<any>;
   getGitDiff: (taskId: string) => Promise<any>;
-  runVerificationTests: (taskId: string, commandConfigId?: string) => Promise<any>;
+  runVerificationTests: (
+    taskId: string,
+    commandConfigId?: string,
+    binding?: TaskMutationBindingInput & { expectedProjectId?: string },
+  ) => Promise<any>;
 
   // Agents & Resources
   getAgents: () => Promise<any[]>;
@@ -136,7 +147,8 @@ const api: OrchestratorApi = {
   getTasks: (projectId: string) => ipcRenderer.invoke('task:list', { projectId }),
   getTask: (taskId: string) => ipcRenderer.invoke('task:get', { taskId }),
   createTask: (data) => ipcRenderer.invoke('task:create', data),
-  startReview: (taskId: string) => ipcRenderer.invoke('task:startReview', { taskId }),
+  startReview: (taskId: string, binding?: TaskMutationBindingInput) =>
+    ipcRenderer.invoke('task:startReview', { taskId, ...(binding ?? {}) }),
 
   parseProtocol: (rawInput: string) => ipcRenderer.invoke('protocol:parse', { rawInput }),
   applyProtocol: (rawInput: string) => ipcRenderer.invoke('protocol:apply', { rawInput }),
@@ -145,8 +157,11 @@ const api: OrchestratorApi = {
 
   getGitStatus: (projectId: string) => ipcRenderer.invoke('git:getStatus', { projectId }),
   getGitDiff: (taskId: string) => ipcRenderer.invoke('git:getDiff', { taskId }),
-  runVerificationTests: (taskId: string, commandConfigId?: string) =>
-    ipcRenderer.invoke('verification:runTests', { taskId, commandConfigId }),
+  runVerificationTests: (
+    taskId: string,
+    commandConfigId?: string,
+    binding?: TaskMutationBindingInput & { expectedProjectId?: string },
+  ) => ipcRenderer.invoke('verification:runTests', { taskId, commandConfigId, ...(binding ?? {}) }),
 
   getAgents: () => ipcRenderer.invoke('agents:list'),
   getProviderResources: () => ipcRenderer.invoke('providers:listResources'),
