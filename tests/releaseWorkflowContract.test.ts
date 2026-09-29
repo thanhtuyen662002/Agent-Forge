@@ -90,7 +90,7 @@ describe('PR #19 — Production Release Pipeline Hardening Contract Tests', () =
     expect(workflow).toMatch(/refs\/tags\/\$canonicalTag/);
     expect(workflow).toMatch(/refs\/tags\/\$normalizedVersion/);
     // Queries paginated releases list with --slurp capable of inspecting drafts
-    expect(workflow).toMatch(/gh api --paginate --slurp ["']\/repos\/\$\{\{\s*github\.repository\s*\}\}\/releases["']/);
+    expect(workflow).toMatch(/gh api --paginate --slurp ["']\/repos\/\$env:GITHUB_REPOSITORY\/releases["']/);
     expect(workflow).toMatch(/ConvertFrom-Json.*-NoEnumerate/);
     expect(workflow).toMatch(/RELEASE_PAGE_COUNT/);
     expect(workflow).toMatch(/RELEASE_RECORD_COUNT/);
@@ -150,7 +150,7 @@ describe('PR #19 — Production Release Pipeline Hardening Contract Tests', () =
     expect(workflow).toMatch(/--notes-file \$metadataPath/);
     expect(workflow).toMatch(/release\\publish-assets/);
     expect(workflow).toMatch(/gh release view \$canonicalTag --json id,databaseId,isDraft,isPrerelease,tagName,targetCommitish,assets/);
-    expect(workflow).toMatch(/gh api --paginate ["']\/repos\/\$\{\{\s*github\.repository\s*\}\}\/releases\/\$releaseId\/assets["']/);
+    expect(workflow).toMatch(/gh api --paginate ["']\/repos\/\$env:GITHUB_REPOSITORY\/releases\/\$releaseId\/assets["']/);
 
     // Verifies all 5 assets are explicitly listed
     expect(workflow).toMatch(/PUBLISHED_INSTALLER_FILENAME/);
@@ -209,7 +209,7 @@ describe('PR #19 — Production Release Pipeline Hardening Contract Tests', () =
     expect(workflow).not.toMatch(/\$LASTEXITCODE:/);
 
     // Safely delimited exit-code check in collision guard
-    expect(workflow).toMatch(/gh api --paginate --slurp ["']\/repos\/\$\{\{\s*github\.repository\s*\}\}\/releases["']/);
+    expect(workflow).toMatch(/gh api --paginate --slurp ["']\/repos\/\$env:GITHUB_REPOSITORY\/releases["']/);
     expect(workflow).toMatch(/if\s*\(\$LASTEXITCODE\s*-ne\s*0\)/);
     expect(workflow).toMatch(/Write-Error ["'].*COLLISION GUARD LOOKUP FAILURE FAIL-CLOSED.*\$(\(\$LASTEXITCODE\)|\{LASTEXITCODE\}).*\$releasesJson["']/);
   });
@@ -248,7 +248,10 @@ describe('PR #19 — Production Release Pipeline Hardening Contract Tests', () =
       expect(fs.existsSync(fixtureScriptPath)).toBe(true);
 
       const psExe = process.platform === 'win32' ? 'powershell.exe' : 'pwsh';
-      const fixtureTimeoutMs = process.platform === 'win32' ? 60000 : 20000;
+      // PowerShell startup can exceed 20s on a loaded Ubuntu runner while the
+      // full suite is running in parallel. Keep the fixture bounded without
+      // turning normal runner contention into a false CI failure.
+      const fixtureTimeoutMs = 60000;
       const result = spawnSync(
         psExe,
         ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File', fixtureScriptPath],
@@ -270,6 +273,48 @@ describe('PR #19 — Production Release Pipeline Hardening Contract Tests', () =
       expect(output).toMatch(/PASS:\s*CASE N - EMPTY TAG_NAME/);
       expect(output).toMatch(/PASS:\s*CASE O - NULL NAME IS VALID/);
     },
-    process.platform === 'win32' ? 75000 : 30000
+    75000
   );
+
+  it('14. release tag input crosses only a validated environment boundary', () => {
+    const workflow = fs.readFileSync(releaseWorkflowPath, 'utf8');
+    const inputExpression = /\$\{\{\s*inputs\.release_tag\s*\}\}/g;
+    const occurrences = workflow.match(inputExpression) ?? [];
+
+    // The raw dispatch input is allowed exactly once, as an environment value;
+    // it must never be embedded in a shell command or PowerShell string.
+    expect(occurrences).toHaveLength(1);
+    expect(workflow).toMatch(/RELEASE_TAG_INPUT:\s*\$\{\{\s*inputs\.release_tag\s*\}\}/);
+    expect(workflow).not.toMatch(/['"]\$\{\{\s*inputs\.release_tag\s*\}\}['"]/);
+    expect(workflow).not.toMatch(/\$rawTag\s*=\s*['"][^\r\n]*inputs\.release_tag/);
+
+    const validationPosition = workflow.indexOf('$tagPattern =');
+    const canonicalPersistencePosition = workflow.indexOf('RELEASE_CANONICAL_TAG=');
+    const checkoutPosition = workflow.indexOf('- name: Checkout repository');
+    expect(validationPosition).toBeGreaterThan(0);
+    expect(canonicalPersistencePosition).toBeGreaterThan(validationPosition);
+    expect(checkoutPosition).toBeGreaterThan(canonicalPersistencePosition);
+    expect(workflow).toMatch(/\$rawTag\s*=\s*\[string\]\$env:RELEASE_TAG_INPUT/);
+    expect(workflow).toMatch(/\$rawTag\.Length\s*-gt\s*64/);
+    expect(workflow).toMatch(/\$rawTag\s*-notmatch\s*\$tagPattern/);
+    expect(workflow).toMatch(/\[string\]\$env:RELEASE_CANONICAL_TAG/);
+
+    const grammar = /^v?(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)$/u;
+    const accepted = ['0.1.0', 'v1.2.3', '10.20.30'];
+    const rejected = [
+      '',
+      ' v1.2.3',
+      'v1.2.3 ',
+      'v1.2.3\nWrite-Host hacked',
+      'v1.2.3\r\nWrite-Host hacked',
+      'v1.2.3; Write-Host hacked',
+      'v1.2.3|Write-Host hacked',
+      'v1.2.3/evil',
+      '-v1.2.3',
+      'v01.2.3',
+      'v1.2',
+    ];
+    for (const tag of accepted) expect(tag.length <= 64 && grammar.test(tag)).toBe(true);
+    for (const tag of rejected) expect(tag.length <= 64 && grammar.test(tag) && !/[\r\n]/.test(tag)).toBe(false);
+  });
 });

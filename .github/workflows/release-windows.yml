@@ -22,19 +22,24 @@ jobs:
     steps:
       - name: Verify release trigger authorization and canonical tag normalization
         shell: pwsh
+        env:
+          RELEASE_TAG_INPUT: ${{ inputs.release_tag }}
         run: |
-          if ('${{ github.event_name }}' -ne 'workflow_dispatch') {
+          if ($env:GITHUB_EVENT_NAME -ne 'workflow_dispatch') {
             Write-Error "Release workflow must ONLY be triggered via manual workflow_dispatch."
             exit 1
           }
-          $rawTag = '${{ inputs.release_tag }}'.Trim()
-          if (-not $rawTag -or $rawTag -notmatch '^v?[0-9]+\.[0-9]+\.[0-9]+') {
-            Write-Error "Invalid release tag format: '$rawTag'. Expected format: 'vX.Y.Z' or 'X.Y.Z'."
+          $rawTag = [string]$env:RELEASE_TAG_INPUT
+          $tagPattern = '\Av?(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)\z'
+          if ($rawTag.Length -gt 64 -or $rawTag -notmatch $tagPattern) {
+            Write-Error "Invalid release tag format. Expected exactly 'vX.Y.Z' or 'X.Y.Z' with non-negative decimal components."
             exit 1
           }
           $normalizedVersion = $rawTag.TrimStart('v')
           $canonicalTag = "v$normalizedVersion"
-          Write-Host "Authorized workflow_dispatch release trigger for input '$rawTag' -> Canonical Tag: '$canonicalTag'"
+          "RELEASE_NORMALIZED_VERSION=$normalizedVersion" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          "RELEASE_CANONICAL_TAG=$canonicalTag" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          Write-Host "Authorized workflow_dispatch release trigger. Canonical tag: '$canonicalTag'"
 
       - name: Checkout repository
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
@@ -63,13 +68,11 @@ jobs:
         run: |
           $pkgJson = Get-Content -Path "package.json" -Raw | ConvertFrom-Json
           $pkgVersion = $pkgJson.version.Trim()
-          $rawTag = '${{ inputs.release_tag }}'.Trim()
-          $normalizedTag = $rawTag.TrimStart('v')
-          $canonicalTag = "v$normalizedTag"
+          $normalizedTag = [string]$env:RELEASE_NORMALIZED_VERSION
+          $canonicalTag = [string]$env:RELEASE_CANONICAL_TAG
 
           Write-Host "Package version: $pkgVersion"
-          Write-Host "Input release tag: $rawTag"
-          Write-Host "Canonical release tag: $canonicalTag"
+          Write-Host "Validated canonical release tag: $canonicalTag"
 
           if ($pkgVersion -ne $normalizedTag) {
             Write-Error "VERSION MISMATCH FAIL-CLOSED: package.json version ($pkgVersion) does not match normalized release tag ($normalizedTag)."
@@ -82,9 +85,8 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          $rawTag = '${{ inputs.release_tag }}'.Trim()
-          $normalizedVersion = $rawTag.TrimStart('v')
-          $canonicalTag = "v$normalizedVersion"
+          $normalizedVersion = [string]$env:RELEASE_NORMALIZED_VERSION
+          $canonicalTag = [string]$env:RELEASE_CANONICAL_TAG
 
           Write-Host "=== Exhaustive Release Collision Guard ==="
           Write-Host "Target Canonical Tag: $canonicalTag"
@@ -109,7 +111,7 @@ jobs:
 
           # 2. Exhaustive Paginated GitHub Releases & Drafts Query
           Write-Host "Querying all GitHub releases and drafts via paginated REST API..."
-          $releasesJson = (gh api --paginate --slurp "/repos/${{ github.repository }}/releases" 2>&1) -join "`n"
+          $releasesJson = (gh api --paginate --slurp "/repos/$env:GITHUB_REPOSITORY/releases" 2>&1) -join "`n"
           if ($LASTEXITCODE -ne 0) {
             Write-Error "COLLISION GUARD LOOKUP FAILURE FAIL-CLOSED: gh api --paginate failed with exit code $($LASTEXITCODE): $releasesJson"
             exit 1
@@ -258,8 +260,7 @@ jobs:
         run: |
           $pkgJson = Get-Content -Path "package.json" -Raw | ConvertFrom-Json
           $ver = $pkgJson.version.Trim()
-          $rawTag = '${{ inputs.release_tag }}'.Trim()
-          $canonicalTag = "v$($rawTag.TrimStart('v'))"
+          $canonicalTag = [string]$env:RELEASE_CANONICAL_TAG
           $sha = (git rev-parse HEAD).Trim()
           powershell -ExecutionPolicy Bypass -File scripts/prepare-release-assets-win.ps1 `
             -ExpectedVersion $ver `
@@ -322,8 +323,7 @@ jobs:
         run: |
           $pkgJson = Get-Content -Path "package.json" -Raw | ConvertFrom-Json
           $ver = $pkgJson.version.Trim()
-          $rawTag = '${{ inputs.release_tag }}'.Trim()
-          $canonicalTag = "v$($rawTag.TrimStart('v'))"
+          $canonicalTag = [string]$env:RELEASE_CANONICAL_TAG
           $sha = (git rev-parse HEAD).Trim()
 
           Write-Host "=== Final Pre-Release Frozen Asset Verification ==="
@@ -339,8 +339,7 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          $rawTag = '${{ inputs.release_tag }}'.Trim()
-          $canonicalTag = "v$($rawTag.TrimStart('v'))"
+          $canonicalTag = [string]$env:RELEASE_CANONICAL_TAG
           $sha = (git rev-parse HEAD).Trim()
           $stagedDir = "release\publish-assets"
           $metadataPath = Join-Path $stagedDir "release-metadata.txt"
@@ -369,8 +368,7 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          $rawTag = '${{ inputs.release_tag }}'.Trim()
-          $canonicalTag = "v$($rawTag.TrimStart('v'))"
+          $canonicalTag = [string]$env:RELEASE_CANONICAL_TAG
           $sha = (git rev-parse HEAD).Trim()
 
           Write-Host "=== Verifying Created DRAFT Release via GitHub API ==="
@@ -400,7 +398,7 @@ jobs:
           Write-Host "Release ID: $releaseId (Draft: $($releaseInfo.isDraft), Target: $($releaseInfo.targetCommitish))"
 
           # Query remote assets with pagination via REST API
-          $remoteAssetsJson = gh api --paginate "/repos/${{ github.repository }}/releases/$releaseId/assets" 2>&1
+          $remoteAssetsJson = gh api --paginate "/repos/$env:GITHUB_REPOSITORY/releases/$releaseId/assets" 2>&1
           if ($LASTEXITCODE -ne 0) {
             Write-Error "POST-DRAFT VERIFICATION FAIL-CLOSED: Failed to fetch release assets: $remoteAssetsJson"
             exit 1
@@ -490,8 +488,7 @@ jobs:
         run: |
           echo "### AgentForge Windows Release Summary (DRAFT ONLY)" >> $GITHUB_STEP_SUMMARY
           echo "- **Exact Published Commit**: \`$(git rev-parse HEAD)\`" >> $GITHUB_STEP_SUMMARY
-          echo "- **Input Tag**: \`${{ inputs.release_tag }}\`" >> $GITHUB_STEP_SUMMARY
-          echo "- **Canonical Release Tag**: \`v$(echo '${{ inputs.release_tag }}' | sed 's/^v//')\`" >> $GITHUB_STEP_SUMMARY
+          echo "- **Validated Canonical Release Tag**: \`$RELEASE_CANONICAL_TAG\`" >> $GITHUB_STEP_SUMMARY
           echo "- **Release State**: \`DRAFT (Awaiting Owner Review & Publication Approval)\`" >> $GITHUB_STEP_SUMMARY
           echo "- **Publish Status**: \`${{ job.status }}\`" >> $GITHUB_STEP_SUMMARY
           if [ -f "release/publish-assets/release-metadata.txt" ]; then
