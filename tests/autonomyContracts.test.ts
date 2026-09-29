@@ -107,6 +107,63 @@ describe('autonomy durable contracts', () => {
     db.close();
   });
 
+  it('atomically fences concurrent Supervisor ownership and stale takeover', () => {
+    const db = new Database(':memory:');
+    db.pragma('journal_mode = WAL');
+    const firstStore = new AutonomyStore(db);
+    const secondStore = new AutonomyStore(db);
+    const firstToken = firstStore.acquireOwner();
+    const isAlive = vi.spyOn(AutonomyStore, 'isAlive').mockImplementation((pid) => pid === process.pid);
+
+    try {
+      // Both stores share the same SQLite connection in this in-process proof;
+      // the immediate transaction still makes the live-owner decision and the
+      // replacement write one indivisible operation. A second live claim cannot
+      // observe the row and then overwrite it.
+      expect(() => secondStore.acquireOwner()).toThrow('SUPERVISOR_ALREADY_RUNNING');
+      expect(firstStore.heartbeatOwner(firstToken)).toBe(true);
+      expect(secondStore.heartbeatOwner(firstToken)).toBe(true);
+
+      const owner = db.prepare('SELECT owner_epoch FROM autonomy_owner WHERE id=1').get() as { owner_epoch: number };
+      expect(owner.owner_epoch).toBe(1);
+
+      // Simulate a crashed owner whose PID is no longer alive and whose
+      // heartbeat is outside the lease window. The replacement gets a new
+      // epoch/token, while the stale token can no longer heartbeat or release.
+      db.prepare('UPDATE autonomy_owner SET pid=?, heartbeat_at=? WHERE id=1')
+        .run(987654321, new Date(Date.now() - AutonomyStore.OWNER_HEARTBEAT_TTL_MS - 1).toISOString());
+      const replacementToken = secondStore.acquireOwner();
+      expect(replacementToken).not.toBe(firstToken);
+      expect((db.prepare('SELECT owner_epoch FROM autonomy_owner WHERE id=1').get() as { owner_epoch: number }).owner_epoch).toBe(2);
+      expect(firstStore.heartbeatOwner(firstToken)).toBe(false);
+      firstStore.releaseOwner(firstToken);
+      expect((db.prepare('SELECT token FROM autonomy_owner WHERE id=1').get() as { token: string }).token).toBe(replacementToken);
+
+      // Stop requests are token-scoped when a token is supplied; a stale owner
+      // cannot stop the replacement Supervisor.
+      secondStore.requestStop(firstToken);
+      expect(secondStore.shouldStop(replacementToken)).toBe(false);
+      secondStore.requestStop(replacementToken);
+      expect(secondStore.shouldStop(replacementToken)).toBe(true);
+      secondStore.releaseOwner(replacementToken);
+    } finally {
+      isAlive.mockRestore();
+      db.close();
+    }
+  });
+
+  it('upgrades an existing owner table without dropping its claim', () => {
+    const db = new Database(':memory:');
+    db.exec('CREATE TABLE autonomy_owner (id INTEGER PRIMARY KEY CHECK(id=1), pid INTEGER NOT NULL, token TEXT NOT NULL, stop_requested INTEGER NOT NULL DEFAULT 0)');
+    db.prepare('INSERT INTO autonomy_owner(id,pid,token,stop_requested) VALUES(1,?,?,0)').run(Number.MAX_SAFE_INTEGER, 'legacy-token');
+    const store = new AutonomyStore(db);
+    const columns = (db.prepare('PRAGMA table_info(autonomy_owner)').all() as Array<{ name: string }>).map((column) => column.name);
+    expect(columns).toEqual(expect.arrayContaining(['owner_epoch', 'heartbeat_at']));
+    expect((db.prepare('SELECT token FROM autonomy_owner WHERE id=1').get() as { token: string }).token).toBe('legacy-token');
+    db.close();
+    void store;
+  });
+
   it('fails closed when the product-task authority cannot be read', () => {
     const db = new Database(':memory:');
     MigrationRunner.run(db);

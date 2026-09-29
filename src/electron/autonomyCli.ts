@@ -286,7 +286,13 @@ export async function main(argv: string[] = process.argv): Promise<number> {
     process.stdout.write(`${JSON.stringify(observations)}\n`); return 0;
   }
   const owner = store.store.acquireOwner();
-  const cancellation = setInterval(() => { if (store.store.shouldStop()) void ProcessRunner.terminateAllProcesses(); }, 1000);
+  // Keep the process-wide Supervisor lease fresh. The token-fenced heartbeat
+  // also lets an older process observe that another Supervisor took over and
+  // stop its child processes instead of continuing under a stale claim.
+  const cancellation = setInterval(() => {
+    const heartbeatValid = store.store.heartbeatOwner(owner);
+    if (!heartbeatValid || store.store.shouldStop(owner)) void ProcessRunner.terminateAllProcesses();
+  }, 1000);
   try {
   const recovery = supervisor.recover();
   if (command === 'recover') { process.stdout.write(`${JSON.stringify(recovery, null, 2)}\n`); return 0; }
