@@ -8,6 +8,7 @@ import { Repository } from '../database/repositories';
 import { ProviderRegistry } from '../adapters/ProviderRegistry';
 import { EventService } from './EventService';
 import { QuotaSnapshotInfo } from '../adapters/ProviderAdapter';
+import { MAX_PROVIDER_CANDIDATES } from '../protocol/limits';
 
 export interface RoutingRequest {
   projectId: string;
@@ -147,8 +148,10 @@ export class ProviderRoutingService {
       }
     }
 
-    // 2. Validate candidate list presence
-    if (!request.candidateResourceIds || request.candidateResourceIds.length === 0) {
+    // 2. Validate candidate list presence and bound work before probing the
+    // repository or provider registry. IPC normally enforces this too, but
+    // the service is also called directly by recovery and test tooling.
+    if (!request.candidateResourceIds || request.candidateResourceIds.length === 0 || request.candidateResourceIds.length > MAX_PROVIDER_CANDIDATES) {
       const decision: RoutingDecision = {
         decisionId,
         projectId: request.projectId,
@@ -159,7 +162,10 @@ export class ProviderRoutingService {
         selectedProviderId: null,
         adapterType: null,
         candidateEvaluations: [],
-        reason: 'No candidate resources provided in routing request.',
+        reason:
+          request.candidateResourceIds && request.candidateResourceIds.length > MAX_PROVIDER_CANDIDATES
+            ? `Candidate resource list exceeds the ${MAX_PROVIDER_CANDIDATES}-item limit.`
+            : 'No candidate resources provided in routing request.',
         createdAt,
       };
       this.recordDecisionEvent(request, decision);
