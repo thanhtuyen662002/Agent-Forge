@@ -40,7 +40,10 @@ function getOrMaterializeTestRuntime(): string {
   );
   fs.mkdirSync(tempRuntimeDir, { recursive: true });
 
-  const tscBin = require.resolve('typescript/bin/tsc');
+  // TypeScript 7 no longer exports the historical `typescript/bin/tsc`
+  // subpath. Resolve the package manifest (which remains public) and invoke
+  // the installed CLI by its stable on-disk path.
+  const tscBin = path.join(path.dirname(require.resolve('typescript/package.json')), 'bin', 'tsc');
   execFileSync(
     process.execPath,
     [tscBin, '-p', 'tsconfig.node.json', '--outDir', tempRuntimeDir],
