@@ -1,11 +1,49 @@
-import { spawn } from 'child_process';
+import { spawn, ChildProcess } from 'child_process';
 import { CredentialRef, parseCredentialRef } from './CredentialRef';
 import { SecretValue, safeFormatDiagnostic } from './SecretValue';
+import { buildTrustedEnvironment, resolveTrustedExecutable } from '../services/ExecutableResolver';
 
 /**
  * Microsoft documented maximum credential blob size for generic credentials (5 * 512 bytes).
  */
 export const CRED_MAX_CREDENTIAL_BLOB_SIZE = 2560;
+
+/** Maximum time and output a credential operation may consume. */
+export const CREDENTIAL_OPERATION_DEFAULT_TIMEOUT_MS = 15_000;
+export const CREDENTIAL_OPERATION_MAX_TIMEOUT_MS = 60_000;
+export const CREDENTIAL_OPERATION_DEFAULT_MAX_OUTPUT_BYTES = 64 * 1024;
+export const CREDENTIAL_OPERATION_MAX_OUTPUT_BYTES = 1024 * 1024;
+
+export type CredentialStoreErrorCode =
+  | 'UNSUPPORTED_PLATFORM'
+  | 'INVALID_OPERATION_OPTIONS'
+  | 'EXECUTABLE_NOT_FOUND'
+  | 'SPAWN_FAILED'
+  | 'PROCESS_FAILED'
+  | 'TIMEOUT'
+  | 'CANCELLED'
+  | 'OUTPUT_LIMIT_EXCEEDED'
+  | 'STDIN_WRITE_FAILED';
+
+/** Stable, recoverable error returned by the Windows credential process boundary. */
+export class CredentialStoreError extends Error {
+  public readonly code: CredentialStoreErrorCode;
+
+  public constructor(code: CredentialStoreErrorCode, message: string, options?: { cause?: unknown }) {
+    super(`[WindowsCredentialStore] ${code}: ${message}`, options);
+    this.name = 'CredentialStoreError';
+    this.code = code;
+  }
+}
+
+export interface CredentialOperationOptions {
+  /** Abort a pending operation and terminate its child process. */
+  signal?: AbortSignal;
+  /** Positive bounded deadline for the child process. */
+  timeoutMs?: number;
+  /** Maximum combined stdout/stderr bytes retained from the child. */
+  maxOutputBytes?: number;
+}
 
 /**
  * Provider-neutral interface for secure local credential storage.
@@ -13,13 +51,45 @@ export const CRED_MAX_CREDENTIAL_BLOB_SIZE = 2560;
  * indexed by opaque CredentialRef references.
  */
 export interface CredentialStore {
-  put(ref: CredentialRef, secret: SecretValue): Promise<void>;
-  get(ref: CredentialRef): Promise<SecretValue | null>;
-  delete(ref: CredentialRef): Promise<boolean>;
-  exists(ref: CredentialRef): Promise<boolean>;
+  put(ref: CredentialRef, secret: SecretValue, options?: CredentialOperationOptions): Promise<void>;
+  get(ref: CredentialRef, options?: CredentialOperationOptions): Promise<SecretValue | null>;
+  delete(ref: CredentialRef, options?: CredentialOperationOptions): Promise<boolean>;
+  exists(ref: CredentialRef, options?: CredentialOperationOptions): Promise<boolean>;
 }
 
-export type PowerShellExecutor = (script: string, stdinInput: string) => Promise<string>;
+export interface PowerShellExecutorOptions extends CredentialOperationOptions {
+  /** Secret values are used only to redact diagnostics; never logged. */
+  knownSecrets?: readonly string[];
+}
+
+export type PowerShellExecutor = (
+  script: string,
+  stdinInput: string,
+  options?: PowerShellExecutorOptions
+) => Promise<string>;
+
+function validateOperationOptions(options: CredentialOperationOptions | undefined): Required<Pick<CredentialOperationOptions, 'timeoutMs' | 'maxOutputBytes'>> & Pick<CredentialOperationOptions, 'signal'> {
+  const timeoutMs = options?.timeoutMs ?? CREDENTIAL_OPERATION_DEFAULT_TIMEOUT_MS;
+  const maxOutputBytes = options?.maxOutputBytes ?? CREDENTIAL_OPERATION_DEFAULT_MAX_OUTPUT_BYTES;
+  if (
+    !Number.isSafeInteger(timeoutMs) ||
+    timeoutMs <= 0 ||
+    timeoutMs > CREDENTIAL_OPERATION_MAX_TIMEOUT_MS ||
+    !Number.isSafeInteger(maxOutputBytes) ||
+    maxOutputBytes <= 0 ||
+    maxOutputBytes > CREDENTIAL_OPERATION_MAX_OUTPUT_BYTES
+  ) {
+    throw new CredentialStoreError(
+      'INVALID_OPERATION_OPTIONS',
+      `timeoutMs must be 1-${CREDENTIAL_OPERATION_MAX_TIMEOUT_MS} and maxOutputBytes must be 1-${CREDENTIAL_OPERATION_MAX_OUTPUT_BYTES}.`
+    );
+  }
+  return { timeoutMs, maxOutputBytes, signal: options?.signal };
+}
+
+function byteLength(value: string): number {
+  return Buffer.byteLength(value, 'utf8');
+}
 
 /**
  * In-memory CredentialStore fake for test environments and non-Windows CI.
@@ -89,8 +159,9 @@ export class WindowsCredentialStore implements CredentialStore {
 
   private assertWindowsPlatform(): void {
     if (this.#platform !== 'win32') {
-      throw new Error(
-        `UNSUPPORTED_PLATFORM: WindowsCredentialStore is only supported on Windows (win32). Current platform: "${this.#platform}".`
+      throw new CredentialStoreError(
+        'UNSUPPORTED_PLATFORM',
+        `WindowsCredentialStore is only supported on Windows (win32). Current platform: "${this.#platform}".`
       );
     }
   }
@@ -109,8 +180,9 @@ export class WindowsCredentialStore implements CredentialStore {
     return canonicalRef.getWindowsTargetName();
   }
 
-  public async put(ref: CredentialRef, secret: SecretValue): Promise<void> {
+  public async put(ref: CredentialRef, secret: SecretValue, options?: CredentialOperationOptions): Promise<void> {
     this.assertWindowsPlatform();
+    const operation = validateOperationOptions(options);
     const targetName = this.getCanonicalTargetName(ref);
     const secretContent = secret.exposeSecret();
 
@@ -179,11 +251,15 @@ if (-not $success) {
 Write-Output "OK"
 `;
 
-    await this.#executor(psScript, `${targetName}\n${secretContent}`);
+    await this.#executePowerShell(psScript, `${targetName}\n${secretContent}`, {
+      ...operation,
+      knownSecrets: [secretContent],
+    });
   }
 
-  public async get(ref: CredentialRef): Promise<SecretValue | null> {
+  public async get(ref: CredentialRef, options?: CredentialOperationOptions): Promise<SecretValue | null> {
     this.assertWindowsPlatform();
+    const operation = validateOperationOptions(options);
     const targetName = this.getCanonicalTargetName(ref);
 
     const psScript = `
@@ -241,15 +317,16 @@ try {
 }
 `;
 
-    const output = await this.#executor(psScript, `${targetName}\n`);
+    const output = await this.#executePowerShell(psScript, `${targetName}\n`, operation);
     if (!output || output.length === 0) {
       return null;
     }
     return new SecretValue(output);
   }
 
-  public async delete(ref: CredentialRef): Promise<boolean> {
+  public async delete(ref: CredentialRef, options?: CredentialOperationOptions): Promise<boolean> {
     this.assertWindowsPlatform();
+    const operation = validateOperationOptions(options);
     const targetName = this.getCanonicalTargetName(ref);
 
     const psScript = `
@@ -278,7 +355,7 @@ if ($success) {
 }
 `;
 
-    const output = await this.#executor(psScript, `${targetName}\n`);
+    const output = await this.#executePowerShell(psScript, `${targetName}\n`, operation);
     return output.trim() === 'DELETED';
   }
 
@@ -286,8 +363,9 @@ if ($success) {
    * Least-privilege existence check. Verifies credential presence without
    * reading, copying, or outputting the secret payload.
    */
-  public async exists(ref: CredentialRef): Promise<boolean> {
+  public async exists(ref: CredentialRef, options?: CredentialOperationOptions): Promise<boolean> {
     this.assertWindowsPlatform();
+    const operation = validateOperationOptions(options);
     const targetName = this.getCanonicalTargetName(ref);
 
     const psScript = `
@@ -324,60 +402,190 @@ if ($success) {
 }
 `;
 
-    const output = await this.#executor(psScript, `${targetName}\n`);
+    const output = await this.#executePowerShell(psScript, `${targetName}\n`, operation);
     return output.trim() === 'EXISTS';
   }
 
   /**
-   * Spawns PowerShell asynchronously with piped stdin and buffered stdout.
+   * Apply the same deadline, cancellation, and output contract to the injected
+   * test seam and to the production child-process implementation. The injected
+   * seam cannot be force-killed, but its result is still bounded and callers get
+   * the same deterministic timeout/cancellation errors.
+   */
+  #executePowerShell(script: string, stdinInput: string, options: PowerShellExecutorOptions): Promise<string> {
+    let execution: Promise<string>;
+    try {
+      execution = this.#executor(script, stdinInput, options);
+    } catch (error: unknown) {
+      return Promise.reject(new CredentialStoreError('SPAWN_FAILED', 'PowerShell could not be started.', { cause: error }));
+    }
+    return new Promise<string>((resolve, reject) => {
+      let settled = false;
+      const finish = (callback: () => void): void => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        options.signal?.removeEventListener('abort', onAbort);
+        callback();
+      };
+      const onAbort = (): void => {
+        finish(() => reject(new CredentialStoreError('CANCELLED', 'Credential operation was cancelled.')));
+      };
+      const timer = setTimeout(() => {
+        finish(() => reject(new CredentialStoreError('TIMEOUT', `PowerShell exceeded ${options.timeoutMs}ms.`)));
+      }, options.timeoutMs);
+      if (options.signal?.aborted) {
+        onAbort();
+        return;
+      }
+      options.signal?.addEventListener('abort', onAbort, { once: true });
+      execution.then(
+        (output) => {
+          if (byteLength(output) > options.maxOutputBytes!) {
+            finish(() => reject(new CredentialStoreError('OUTPUT_LIMIT_EXCEEDED', 'PowerShell output exceeded the bounded limit.')));
+            return;
+          }
+          finish(() => resolve(output));
+        },
+        (error: unknown) => {
+          if (error instanceof CredentialStoreError) {
+            finish(() => reject(error));
+            return;
+          }
+          const diagnostic = safeFormatDiagnostic(error, options.knownSecrets?.map((secret) => secret) ?? []);
+          finish(() => reject(new CredentialStoreError('PROCESS_FAILED', diagnostic || 'PowerShell execution failed.')));
+        }
+      );
+    });
+  }
+
+  /**
+   * Spawns PowerShell asynchronously with piped stdin and bounded output.
    * PowerShell command source is supplied as a command argument (-Command <script>).
    * Credential targets and secret payloads are supplied strictly via stdin.
    */
-  #defaultPowerShellExecutor(script: string, stdinInput: string): Promise<string> {
+  #defaultPowerShellExecutor(script: string, stdinInput: string, options: PowerShellExecutorOptions = {}): Promise<string> {
     return new Promise((resolve, reject) => {
-      const child = spawn(
-        'powershell.exe',
-        ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-Command', script],
-        {
-          stdio: ['pipe', 'pipe', 'pipe'],
-          windowsHide: true,
-        }
-      );
+      const operation = validateOperationOptions(options);
+      const executable = resolveTrustedExecutable('powershell', 'powershell', {
+        platform: 'win32',
+        env: process.env,
+      });
+      if (!executable) {
+        reject(new CredentialStoreError('EXECUTABLE_NOT_FOUND', 'No trusted PowerShell installation was found.'));
+        return;
+      }
+
+      let child: ChildProcess;
+      try {
+        child = spawn(
+          executable,
+          ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-Command', script],
+          {
+            stdio: ['pipe', 'pipe', 'pipe'],
+            windowsHide: true,
+            shell: false,
+            env: buildTrustedEnvironment({ platform: 'win32', env: process.env }),
+          }
+        );
+      } catch (error: unknown) {
+        reject(new CredentialStoreError('SPAWN_FAILED', 'PowerShell could not be started.', { cause: error }));
+        return;
+      }
 
       let stdout = '';
       let stderr = '';
+      let outputBytes = 0;
+      let settled = false;
+      let timer: ReturnType<typeof setTimeout> | undefined;
 
-      child.stdout.on('data', (data) => {
-        stdout += data.toString('utf8');
+      const cleanup = (): void => {
+        if (timer) clearTimeout(timer);
+        operation.signal?.removeEventListener('abort', onAbort);
+      };
+      const terminate = (): void => {
+        try {
+          child.stdin?.destroy();
+          child.stdout?.destroy();
+          child.stderr?.destroy();
+          if (child.exitCode === null && child.signalCode === null) {
+            if (!child.kill()) child.kill('SIGKILL');
+          }
+        } catch {
+          // The typed timeout/cancellation result is the authoritative outcome.
+        }
+      };
+      const finish = (callback: () => void): void => {
+        if (settled) return;
+        settled = true;
+        cleanup();
+        callback();
+      };
+      const failAndTerminate = (error: CredentialStoreError): void => {
+        terminate();
+        finish(() => reject(error));
+      };
+      const onAbort = (): void => {
+        failAndTerminate(new CredentialStoreError('CANCELLED', 'Credential operation was cancelled.'));
+      };
+
+      child.stdout?.on('data', (data) => {
+        const chunk = Buffer.isBuffer(data) ? data : Buffer.from(String(data));
+        outputBytes += chunk.byteLength;
+        if (outputBytes > operation.maxOutputBytes) {
+          failAndTerminate(new CredentialStoreError('OUTPUT_LIMIT_EXCEEDED', 'PowerShell output exceeded the bounded limit.'));
+          return;
+        }
+        stdout += chunk.toString('utf8');
       });
 
-      child.stderr.on('data', (data) => {
-        stderr += data.toString('utf8');
+      child.stderr?.on('data', (data) => {
+        const chunk = Buffer.isBuffer(data) ? data : Buffer.from(String(data));
+        outputBytes += chunk.byteLength;
+        if (outputBytes > operation.maxOutputBytes) {
+          failAndTerminate(new CredentialStoreError('OUTPUT_LIMIT_EXCEEDED', 'PowerShell output exceeded the bounded limit.'));
+          return;
+        }
+        stderr += chunk.toString('utf8');
       });
 
       child.on('error', (err) => {
-        reject(new Error(`[WindowsCredentialStore] Failed to spawn PowerShell: ${err.message}`));
+        finish(() => reject(new CredentialStoreError('SPAWN_FAILED', 'PowerShell could not be started.', { cause: err })));
       });
 
       child.on('close', (code) => {
+        if (settled) return;
         if (code !== 0) {
-          // Never output stdout in error message which might contain secret payloads
-          const sanitizedStderr = safeFormatDiagnostic(stderr.trim());
-          reject(
-            new Error(
-              `[WindowsCredentialStore] PowerShell execution failed (exit code ${code}): ${sanitizedStderr || 'Unknown error'}`
+          const sanitizedStderr = safeFormatDiagnostic(stderr.trim(), options.knownSecrets?.map((secret) => secret) ?? []);
+          finish(() =>
+            reject(
+              new CredentialStoreError(
+                'PROCESS_FAILED',
+                `PowerShell execution failed (exit code ${code}): ${sanitizedStderr || 'Unknown error'}`
+              )
             )
           );
         } else {
-          resolve(stdout);
+          finish(() => resolve(stdout));
         }
       });
 
-      // Write ONLY credential data to stdin
-      if (stdinInput) {
-        child.stdin.write(stdinInput);
+      timer = setTimeout(() => {
+        failAndTerminate(new CredentialStoreError('TIMEOUT', `PowerShell exceeded ${operation.timeoutMs}ms.`));
+      }, operation.timeoutMs);
+      if (operation.signal?.aborted) {
+        onAbort();
+        return;
       }
-      child.stdin.end();
+      operation.signal?.addEventListener('abort', onAbort, { once: true });
+
+      // Write ONLY credential data to stdin
+      try {
+        if (stdinInput) child.stdin?.write(stdinInput);
+        child.stdin?.end();
+      } catch (error: unknown) {
+        failAndTerminate(new CredentialStoreError('STDIN_WRITE_FAILED', 'PowerShell stdin could not be written.', { cause: error }));
+      }
     });
   }
 }

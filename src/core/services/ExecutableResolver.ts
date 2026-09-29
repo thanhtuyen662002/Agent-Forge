@@ -2,7 +2,17 @@ import fs from 'fs';
 import path from 'path';
 
 /** Executables which cross a repository, recovery, or process-control boundary. */
-export type TrustedExecutableKind = 'git' | 'taskkill' | 'cmd' | 'node' | 'npm' | 'codex' | 'agy' | 'gh' | 'generic';
+export type TrustedExecutableKind =
+  | 'git'
+  | 'taskkill'
+  | 'cmd'
+  | 'powershell'
+  | 'node'
+  | 'npm'
+  | 'codex'
+  | 'agy'
+  | 'gh'
+  | 'generic';
 
 export interface ExecutableResolverOptions {
   /** Override the host platform in deterministic resolver tests. */
@@ -132,6 +142,7 @@ function expectedBasenames(kind: TrustedExecutableKind, platform: NodeJS.Platfor
     git: ['git'],
     taskkill: ['taskkill'],
     cmd: ['cmd'],
+    powershell: ['powershell'],
     node: ['node'],
     npm: ['npm'],
     codex: ['codex'],
@@ -163,6 +174,13 @@ function trustedInstallationRoots(platform: NodeJS.Platform, env: NodeJS.Process
     const systemRoot = envValue(env, 'SystemRoot', platform) ?? envValue(env, 'SYSTEMROOT', platform) ?? 'C:\\Windows';
     const system32 = api.join(systemRoot, 'System32');
     if (kind === 'taskkill' || kind === 'cmd') add(system32);
+
+    if (kind === 'powershell') {
+      add(api.join(systemRoot, 'System32', 'WindowsPowerShell', 'v1.0'));
+      for (const programFiles of [envValue(env, 'ProgramFiles', platform), envValue(env, 'ProgramFiles(x86)', platform)]) {
+        if (programFiles) add(api.join(programFiles, 'PowerShell', '7'));
+      }
+    }
 
     if (kind === 'git') {
       for (const programFiles of [envValue(env, 'ProgramFiles', platform), envValue(env, 'ProgramFiles(x86)', platform)]) {
@@ -295,6 +313,7 @@ export function buildTrustedEnvironment(options: TrustedEnvironmentOptions = {})
       ...trustedInstallationRoots(platform, source, 'git'),
       ...trustedInstallationRoots(platform, source, 'node'),
       ...trustedInstallationRoots(platform, source, 'cmd'),
+      ...trustedInstallationRoots(platform, source, 'powershell'),
       ...trustedInstallationRoots(platform, source, 'gh'),
       ...trustedPathEntries(options, 'generic'),
     ]),
@@ -328,6 +347,6 @@ export function buildTrustedEnvironment(options: TrustedEnvironmentOptions = {})
 export function isProtectedExecutableName(requested: string): TrustedExecutableKind | null {
   if (typeof requested !== 'string') return null;
   const normalized = requested.replace(/\\/g, '/').split('/').pop()!.toLowerCase().replace(/\.(?:exe|com|cmd|bat)$/i, '');
-  const match: TrustedExecutableKind[] = ['git', 'taskkill', 'cmd', 'node', 'npm', 'codex', 'agy', 'gh'];
+  const match: TrustedExecutableKind[] = ['git', 'taskkill', 'cmd', 'powershell', 'node', 'npm', 'codex', 'agy', 'gh'];
   return match.includes(normalized as TrustedExecutableKind) ? normalized as TrustedExecutableKind : null;
 }
