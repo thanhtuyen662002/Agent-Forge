@@ -413,7 +413,12 @@ if ($success) {
    * the same deterministic timeout/cancellation errors.
    */
   #executePowerShell(script: string, stdinInput: string, options: PowerShellExecutorOptions): Promise<string> {
-    const execution = this.#executor(script, stdinInput, options);
+    let execution: Promise<string>;
+    try {
+      execution = this.#executor(script, stdinInput, options);
+    } catch (error: unknown) {
+      return Promise.reject(new CredentialStoreError('SPAWN_FAILED', 'PowerShell could not be started.', { cause: error }));
+    }
     return new Promise<string>((resolve, reject) => {
       let settled = false;
       const finish = (callback: () => void): void => {
@@ -442,7 +447,14 @@ if ($success) {
           }
           finish(() => resolve(output));
         },
-        (error: unknown) => finish(() => reject(error))
+        (error: unknown) => {
+          if (error instanceof CredentialStoreError) {
+            finish(() => reject(error));
+            return;
+          }
+          const diagnostic = safeFormatDiagnostic(error, options.knownSecrets?.map((secret) => secret) ?? []);
+          finish(() => reject(new CredentialStoreError('PROCESS_FAILED', diagnostic || 'PowerShell execution failed.')));
+        }
       );
     });
   }
