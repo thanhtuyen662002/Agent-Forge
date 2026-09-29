@@ -64,6 +64,35 @@ export class McpSubmissionAuthorityService {
   ) {}
 
   /**
+   * Read the repository head through the shared trusted Git boundary. This
+   * helper is deliberately synchronous because callers invoke it while the
+   * repository's immediate transaction is holding the SQLite writer lock.
+   * Diagnostics are intentionally discarded so Git paths and stderr cannot
+   * enter the durable submission result.
+   */
+  private observeRepositoryHead(repositoryPath: string): string {
+    try {
+      const gitExecutable = resolveTrustedExecutable('git', 'git');
+      if (!gitExecutable) throw new Error('GIT_EXECUTABLE_NOT_FOUND');
+      const gitOutput = child_process.execFileSync(gitExecutable, ['rev-parse', 'HEAD'], {
+        cwd: repositoryPath,
+        timeout: 5000,
+        stdio: ['ignore', 'pipe', 'pipe'],
+        encoding: 'utf8',
+        env: buildTrustedEnvironment({ env: process.env }),
+      });
+      const observedHeadSha = gitOutput.trim().toLowerCase();
+      if (!/^[0-9a-f]{40}$/.test(observedHeadSha)) throw new Error('MALFORMED_GIT_HEAD');
+      return observedHeadSha;
+    } catch {
+      throw new McpSubmissionAuthorityError(
+        'MCP_AUTHORITY_FENCED',
+        'Synchronous git rev-parse HEAD inspection failed'
+      );
+    }
+  }
+
+  /**
    * Authoritative entrypoint for coder claim submission.
    * Executes the 11-step linearized algorithm from Section 7.
    */
@@ -147,9 +176,10 @@ export class McpSubmissionAuthorityService {
       // If so, NEVER spawn Git per Section 5.6
       const preliminaryExisting = this.repo.getCoderSubmissionById(input.submission_id);
 
-      let observedHeadSha = '';
       if (!preliminaryExisting) {
-        // Preliminary authorization binding check before spawning Git
+        // Preliminary authorization binding check without spawning Git. The
+        // authoritative Git observation occurs inside the immediate transaction
+        // immediately before durable submission insertion.
         const preflightAuth = this.repo.getExecutionAuthorization(session.authorization_id);
         if (!preflightAuth) {
           return {
@@ -170,29 +200,6 @@ export class McpSubmissionAuthorityService {
           };
         }
 
-        // 5. Synchronously inspect git rev-parse HEAD with bounded timeout and closed stdio
-        try {
-          const gitExecutable = resolveTrustedExecutable('git', 'git');
-          if (!gitExecutable) throw new Error('GIT_EXECUTABLE_NOT_FOUND');
-          const gitOutput = child_process.execFileSync(gitExecutable, ['rev-parse', 'HEAD'], {
-            cwd: preflightProject.repository_path,
-            timeout: 5000,
-            stdio: ['ignore', 'pipe', 'pipe'],
-            encoding: 'utf8',
-            env: buildTrustedEnvironment({ env: process.env }),
-          });
-          observedHeadSha = gitOutput.trim().toLowerCase();
-          if (!/^[0-9a-f]{40}$/.test(observedHeadSha)) {
-            throw new Error('Malformed git rev-parse HEAD output');
-          }
-        } catch (err: unknown) {
-          return {
-            accepted: false,
-            error_code: 'MCP_AUTHORITY_FENCED',
-            message: 'Synchronous git rev-parse HEAD inspection failed',
-            retryable: false,
-          };
-        }
       }
 
       // 6. Enter Repository.runInImmediateTransaction (strictly synchronous callback)
@@ -232,21 +239,12 @@ export class McpSubmissionAuthorityService {
           }
           return replayResult;
         } else {
-          // If we had no preliminaryExisting, observedHeadSha was computed.
-          // If we somehow missed it, fail closed.
-          if (!observedHeadSha) {
-            throw new McpSubmissionAuthorityError(
-              'INTERNAL_SUBMISSION_ERROR',
-              'Observed Git HEAD missing for new submission'
-            );
-          }
           // ===================================================================
           // 7.1 NEW SUBMISSION PATH
           // ===================================================================
           return this.executeNewSubmissionPath(
             input,
             currentSession,
-            observedHeadSha,
             transactionNowIso,
             canonicalBytes
           );
@@ -689,7 +687,6 @@ export class McpSubmissionAuthorityService {
   private executeNewSubmissionPath(
     input: CoderSubmissionInput,
     session: McpSubmissionSession,
-    observedHeadSha: string,
     transactionNowIso: string,
     canonicalBytes: number
   ): SubmissionResult {
@@ -915,7 +912,10 @@ export class McpSubmissionAuthorityService {
       throw new McpSubmissionAuthorityError('MCP_AUTHORITY_FENCED', 'Manager payload expected_revision mismatch');
     }
 
-    // 7. Base and Head Git SHAs
+    // 7. Base and Head Git SHAs. The first observation happens after all
+    // durable authority checks and while the immediate transaction is held,
+    // eliminating the old preflight-to-transaction race window.
+    const observedHeadSha = this.observeRepositoryHead(project.repository_path);
     if (observedHeadSha !== auth.repository_head_sha.toLowerCase()) {
       throw new McpSubmissionAuthorityError('REPOSITORY_HEAD_DRIFT_DETECTED', 'Synchronously observed Git HEAD does not match authorization repository_head_sha');
     }
@@ -994,6 +994,17 @@ export class McpSubmissionAuthorityService {
       task_ownership_epoch: taskEpoch,
       task_revision: auth.task_revision,
     });
+
+    // Re-observe immediately before the first durable write. A checkout/reset
+    // during the validation work is a deterministic drift failure and the
+    // enclosing transaction rolls back without partial submission rows.
+    const finalObservedHeadSha = this.observeRepositoryHead(project.repository_path);
+    if (finalObservedHeadSha !== observedHeadSha || finalObservedHeadSha !== auth.repository_head_sha.toLowerCase()) {
+      throw new McpSubmissionAuthorityError(
+        'REPOSITORY_HEAD_DRIFT_DETECTED',
+        'Repository HEAD changed during submission admission'
+      );
+    }
 
     // 10. Single linearization point: insert all three durable records
     // 10.1 Insert coder_submissions (36 columns)
