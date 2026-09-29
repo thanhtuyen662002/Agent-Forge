@@ -12,6 +12,7 @@ import { assertPathContained, ArtifactStore } from '../services/ArtifactStore';
 import { ManagerProviderPool, buildManagerContextPackage } from './managerPool';
 import { ProductTaskAutonomyAdapter, renderCommand } from './productTaskAdapter';
 import { GitWorktreeService } from '../services/GitWorktreeService';
+import { buildTrustedEnvironment, resolveTrustedExecutable } from '../services/ExecutableResolver';
 import { AgentAssignment, ExecutionAuthorization, Task } from '../types/domain';
 import { CanonicalExecutionPayload, CanonicalExecutionPayloadSchema } from '../services/ExecutionAuthorizationService';
 import { ProviderEndpointConfig } from './providerEndpoint';
@@ -1184,11 +1185,13 @@ export class SupervisorContinuousQueue {
     }
 
     fs.mkdirSync(this.worktreeRoot, { recursive: true });
-    const gitExec = (process.env.Path ?? process.env.PATH ?? '').split(path.delimiter).map((dir) => path.join(dir, process.platform === 'win32' ? 'git.exe' : 'git')).find((file) => fs.existsSync(file)) || (process.platform === 'win32' ? 'git.exe' : 'git');
+    const gitExec = resolveTrustedExecutable('git', 'git');
+    if (!gitExec) throw new Error('SELF_HOST_GIT_EXECUTABLE_NOT_FOUND');
+    const trustedGitEnv = buildTrustedEnvironment({ env: process.env });
     const id = crypto.randomUUID().slice(0, 8);
     const branch = `agent/${workerId}/${task.task_id.toLowerCase()}-${id}`;
     const worktrees = new GitWorktreeService({ gitExecutable: gitExec, repositoryRoot: this.controlRepo, managedRoot: this.worktreeRoot });
-    const head = spawnSync(gitExec, ['rev-parse', '--verify', task.base_sha ?? 'HEAD'], { cwd: this.controlRepo, encoding: 'utf8', windowsHide: true, shell: false });
+    const head = spawnSync(gitExec, ['rev-parse', '--verify', task.base_sha ?? 'HEAD'], { cwd: this.controlRepo, encoding: 'utf8', windowsHide: true, shell: false, env: trustedGitEnv });
     const headSha = String(head.stdout ?? '').trim();
     if (head.status !== 0 || !/^[0-9a-f]{40}$/i.test(headSha)) {
       throw new Error(`SELF_HOST_BASE_SHA_FAILED: ${head.stderr || head.stdout}`);
@@ -1199,7 +1202,7 @@ export class SupervisorContinuousQueue {
     if (added.status !== 'CREATED') throw new Error(`SELF_HOST_WORKTREE_CREATE_FAILED: ${added.error}`);
     const worktree = added.worktreePath;
     this.supervisor.store.event(tuple.taskId, 'WORKTREE_CREATED', { worktree, branch, baseSha: headSha });
-    const branchResult = spawnSync(gitExec, ['switch', '-c', branch], { cwd: worktree, encoding: 'utf8', windowsHide: true, shell: false });
+    const branchResult = spawnSync(gitExec, ['switch', '-c', branch], { cwd: worktree, encoding: 'utf8', windowsHide: true, shell: false, env: trustedGitEnv });
     if (branchResult.status !== 0) throw new Error(`SELF_HOST_BRANCH_CREATE_FAILED: ${String(branchResult.stderr || branchResult.stdout).trim()}`);
 
     const seed: AutonomousTaskSpec = {
