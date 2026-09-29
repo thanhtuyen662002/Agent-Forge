@@ -1,5 +1,5 @@
-import React, { useState, useEffect, useCallback } from 'react';
-import { useOrchestrator } from '../context/OrchestratorContext';
+import React, { useState, useEffect, useCallback, useRef } from 'react';
+import { isAsyncResponseCurrent, reconcileSelectedId, useOrchestrator } from '../context/OrchestratorContext';
 import { useI18n } from '../context/I18nContext';
 import {
   ArrowLeftRight,
@@ -36,6 +36,7 @@ export const ManualBridgeView: React.FC = () => {
     tasks,
     activeProject,
     resources,
+    refreshError,
     generateWorkOrder,
     generateReviewPackage,
     runVerificationTests,
@@ -67,6 +68,9 @@ export const ManualBridgeView: React.FC = () => {
   const [selectedHandoffTaskId, setSelectedHandoffTaskId] = useState<string>(tasks[0]?.id || '');
   const [snapshot, setSnapshot] = useState<any>(null);
   const [loadingSnapshot, setLoadingSnapshot] = useState<boolean>(false);
+  const [snapshotError, setSnapshotError] = useState<string | null>(null);
+  const snapshotRequestRef = useRef(0);
+  const activeProjectIdRef = useRef<string | null>(activeProject?.id ?? null);
   const [candidateIds, setCandidateIds] = useState<string[]>([]);
   const [allowManualBridge, setAllowManualBridge] = useState<boolean>(false);
 
@@ -98,9 +102,16 @@ export const ManualBridgeView: React.FC = () => {
   // ==========================================
   const [quarantinedSubmissions, setQuarantinedSubmissions] = useState<QuarantinedSubmissionSummary[]>([]);
   const [loadingSubmissions, setLoadingSubmissions] = useState<boolean>(false);
+  const [submissionsError, setSubmissionsError] = useState<string | null>(null);
+  const submissionsRequestRef = useRef(0);
   const [selectedSubmissionId, setSelectedSubmissionId] = useState<string | null>(null);
   const [submissionDetail, setSubmissionDetail] = useState<QuarantinedSubmissionInspection | null>(null);
   const [loadingDetail, setLoadingDetail] = useState<boolean>(false);
+  const detailRequestRef = useRef(0);
+
+  useEffect(() => {
+    activeProjectIdRef.current = activeProject?.id ?? null;
+  }, [activeProject?.id]);
 
   const [confirmModalAction, setConfirmModalAction] = useState<
     'ADMIT' | 'REJECT' | 'SUPERSEDE' | 'RESUME' | 'ACKNOWLEDGE' | null
@@ -129,25 +140,44 @@ export const ManualBridgeView: React.FC = () => {
 
   // Load Handoff Snapshot from SQLite
   const loadSnapshot = useCallback(async () => {
-    if (!selectedHandoffTaskId) return;
+    const taskId = selectedHandoffTaskId;
+    const requestId = ++snapshotRequestRef.current;
+    if (!taskId) {
+      setSnapshot(null);
+      setSnapshotError(null);
+      setLoadingSnapshot(false);
+      return;
+    }
     setLoadingSnapshot(true);
+    setSnapshotError(null);
     try {
-      const res = await getOwnerHandoffSnapshot(selectedHandoffTaskId);
+      const res = await getOwnerHandoffSnapshot(taskId);
+      if (!isAsyncResponseCurrent(requestId, snapshotRequestRef.current, taskId, selectedHandoffTaskId)) return;
       if (res && res.success && res.snapshot) {
         setSnapshot(res.snapshot);
+        setSnapshotError(null);
         if (res.snapshot.latestAuthorization) {
           setAuthorization(res.snapshot.latestAuthorization);
         }
         if (res.snapshot.latestRoutingDecision) {
           setRoutingDecision(res.snapshot.latestRoutingDecision);
         }
+      } else {
+        setSnapshot(null);
+        setSnapshotError(res?.error || t('common.error'));
       }
     } catch (err: any) {
-      console.error('[ManualBridgeView] Failed to load snapshot:', err);
+      if (isAsyncResponseCurrent(requestId, snapshotRequestRef.current, taskId, selectedHandoffTaskId)) {
+        setSnapshot(null);
+        setSnapshotError(err?.message || t('common.error'));
+        console.error('[ManualBridgeView] Failed to load snapshot:', err);
+      }
     } finally {
-      setLoadingSnapshot(false);
+      if (isAsyncResponseCurrent(requestId, snapshotRequestRef.current, taskId, selectedHandoffTaskId)) {
+        setLoadingSnapshot(false);
+      }
     }
-  }, [selectedHandoffTaskId, getOwnerHandoffSnapshot]);
+  }, [selectedHandoffTaskId, getOwnerHandoffSnapshot, t]);
 
   useEffect(() => {
     loadSnapshot();
@@ -165,7 +195,10 @@ export const ManualBridgeView: React.FC = () => {
   // Reset task-scoped state on task change
   const handleTaskChange = (newTaskId: string) => {
     if (newTaskId === selectedHandoffTaskId) return;
+    snapshotRequestRef.current += 1;
     setSelectedHandoffTaskId(newTaskId);
+    setSnapshot(null);
+    setSnapshotError(null);
     setCandidateIds([]);
     setAllowManualBridge(false);
     setRoutingDecision(null);
@@ -378,23 +411,31 @@ export const ManualBridgeView: React.FC = () => {
   // R5J5 Quarantined Submissions Queue Handlers
   // ==========================================
   const loadSubmissions = useCallback(async () => {
+    const requestId = ++submissionsRequestRef.current;
+    const projectId = activeProject?.id ?? null;
     setLoadingSubmissions(true);
+    setSubmissionsError(null);
     try {
       const res = await listQuarantinedSubmissions({
-        projectId: activeProject?.id,
+        projectId: projectId ?? undefined,
       });
-      if (res && res.items) {
+      if (!isAsyncResponseCurrent(requestId, submissionsRequestRef.current, projectId, activeProjectIdRef.current)) return;
+      if (res && res.success !== false && Array.isArray(res.items)) {
         setQuarantinedSubmissions(res.items);
-        if (res.items.length > 0 && !selectedSubmissionId) {
-          setSelectedSubmissionId(res.items[0].id);
-        }
+        setSelectedSubmissionId((current) => reconcileSelectedId(current, res.items));
+      } else {
+        setSubmissionsError(res?.error || t('common.error'));
       }
-    } catch {
-      // ignore
+    } catch (err: any) {
+      if (isAsyncResponseCurrent(requestId, submissionsRequestRef.current, projectId, activeProjectIdRef.current)) {
+        setSubmissionsError(err?.message || t('common.error'));
+      }
     } finally {
-      setLoadingSubmissions(false);
+      if (isAsyncResponseCurrent(requestId, submissionsRequestRef.current, projectId, activeProjectIdRef.current)) {
+        setLoadingSubmissions(false);
+      }
     }
-  }, [activeProject, listQuarantinedSubmissions, selectedSubmissionId]);
+  }, [activeProject?.id, listQuarantinedSubmissions, t]);
 
   useEffect(() => {
     if (activeTab === 'quarantined-queue') {
@@ -405,21 +446,26 @@ export const ManualBridgeView: React.FC = () => {
   useEffect(() => {
     if (!selectedSubmissionId) {
       setSubmissionDetail(null);
+      detailRequestRef.current += 1;
       return;
     }
+    const requestId = ++detailRequestRef.current;
+    const submissionId = selectedSubmissionId;
     let cancelled = false;
     setLoadingDetail(true);
-    inspectQuarantinedSubmission(selectedSubmissionId)
+    inspectQuarantinedSubmission(submissionId)
       .then((res) => {
-        if (!cancelled && res && res.detail) {
+        if (!cancelled && isAsyncResponseCurrent(requestId, detailRequestRef.current, submissionId, selectedSubmissionId) && res && res.detail) {
           setSubmissionDetail(res.detail);
+        } else if (!cancelled && requestId === detailRequestRef.current) {
+          setSubmissionDetail(null);
         }
       })
       .catch(() => {
-        if (!cancelled) setSubmissionDetail(null);
+        if (!cancelled && requestId === detailRequestRef.current) setSubmissionDetail(null);
       })
       .finally(() => {
-        if (!cancelled) setLoadingDetail(false);
+        if (!cancelled && requestId === detailRequestRef.current) setLoadingDetail(false);
       });
     return () => {
       cancelled = true;
@@ -553,6 +599,15 @@ export const ManualBridgeView: React.FC = () => {
 
   return (
     <div className="p-8 space-y-6 max-w-7xl mx-auto overflow-y-auto">
+      {refreshError && (
+        <div className="p-3 bg-rose-500/10 border border-rose-500/30 rounded-lg text-xs font-mono text-rose-300 flex items-start space-x-2.5">
+          <AlertCircle className="w-4 h-4 shrink-0 mt-0.5" />
+          <div>
+            <strong className="block">{t('common.error')}</strong>
+            <span>{refreshError}</span>
+          </div>
+        </div>
+      )}
       {/* Top Banner */}
       <div className="flex flex-col md:flex-row md:items-center justify-between gap-4 bg-surface-card border border-surface-border rounded-xl p-6 shadow-lg">
         <div className="space-y-1">
@@ -652,6 +707,13 @@ export const ManualBridgeView: React.FC = () => {
                   <RefreshCw className="w-3.5 h-3.5 text-slate-400 animate-spin" />
                 )}
               </div>
+
+              {snapshotError && (
+                <div className="p-3 bg-rose-950/20 border border-rose-800/30 rounded-lg text-xs font-mono text-rose-300 flex items-start space-x-2">
+                  <AlertCircle className="w-4 h-4 shrink-0 mt-0.5" />
+                  <span>{snapshotError}</span>
+                </div>
+              )}
 
               <div>
                 <label className="block text-xs font-mono text-slate-400 mb-1.5">{t('manualBridge.selectTargetTaskLabel')}:</label>
@@ -1309,7 +1371,20 @@ export const ManualBridgeView: React.FC = () => {
               </button>
             </div>
 
-            {quarantinedSubmissions.length === 0 ? (
+            {submissionsError ? (
+              <div className="h-72 flex flex-col items-center justify-center text-rose-300 space-y-2 border border-dashed border-rose-800/50 rounded-lg p-6 text-center">
+                <AlertCircle className="w-8 h-8 text-rose-400" />
+                <span className="text-xs font-mono">{submissionsError}</span>
+                <button
+                  type="button"
+                  onClick={loadSubmissions}
+                  disabled={loadingSubmissions}
+                  className="px-3 py-1.5 rounded border border-rose-700/60 text-xs font-mono hover:bg-rose-950/40 disabled:opacity-50"
+                >
+                  {t('common.retry')}
+                </button>
+              </div>
+            ) : quarantinedSubmissions.length === 0 ? (
               <div className="h-72 flex flex-col items-center justify-center text-slate-500 space-y-2 border border-dashed border-surface-border rounded-lg p-6 text-center">
                 <FileCheck className="w-8 h-8 text-slate-600" />
                 <span className="text-xs font-mono">{t('quarantinedQueue.noSubmissions')}</span>

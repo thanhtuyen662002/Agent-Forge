@@ -83,6 +83,22 @@ interface OrchestratorContextType {
 
 const OrchestratorContext = createContext<OrchestratorContextType | null>(null);
 
+/** Shared identity fence for UI requests that may resolve out of order. */
+export function isAsyncResponseCurrent<T>(
+  requestId: number,
+  currentRequestId: number,
+  requestedKey: T,
+  currentKey: T
+): boolean {
+  return requestId === currentRequestId && requestedKey === currentKey;
+}
+
+/** Keep the current selection only when it still exists in the newest list. */
+export function reconcileSelectedId<T extends { id: string }>(selectedId: string | null, items: T[]): string | null {
+  if (selectedId && items.some((item) => item.id === selectedId)) return selectedId;
+  return items[0]?.id ?? null;
+}
+
 export const OrchestratorProvider: React.FC<{ children: React.ReactNode }> = ({ children }) => {
   const [projects, setProjects] = useState<Project[]>([]);
   const [activeProject, setActiveProject] = useState<Project | null>(null);
@@ -97,112 +113,143 @@ export const OrchestratorProvider: React.FC<{ children: React.ReactNode }> = ({ 
   const [selectedTaskId, setSelectedTaskId] = useState<string | null>(null);
   const [loading, setLoading] = useState<boolean>(false);
   const [refreshError, setRefreshError] = useState<string | null>(null);
+  const activeProjectRef = useRef<Project | null>(activeProject);
+  const refreshRequestRef = useRef(0);
+  const refreshInFlightRef = useRef(false);
+  const refreshPendingRef = useRef(false);
+
+  useEffect(() => {
+    activeProjectRef.current = activeProject;
+  }, [activeProject]);
 
   const refreshData = useCallback(async () => {
-    if (!orchestrator) {
-      // Browser preview fallback with unmeasured initial values
-      const mockProj: Project = {
-        id: 'PROJ-DEMO',
-        name: 'Agent-Forge Core Engine',
-        description: 'Local AI engineering orchestrator desktop platform',
-        repository_path: 'd:\\Projects\\Agent-Forge',
-        default_branch: 'main',
-        status: 'READY',
-        contract: null,
-        created_at: new Date().toISOString(),
-        updated_at: new Date().toISOString(),
-        started_at: null,
-        completed_at: null,
-      };
-      setProjects([mockProj]);
-      setActiveProject((prev) => prev || mockProj);
-
-      setTasks([
-        {
-          id: 'AUTH-014',
-          project_id: 'PROJ-DEMO',
-          milestone_id: null,
-          title: 'Implement JWT Validation and Verification Middleware',
-          description: 'Add token signature verification, claims validation, and test suite.',
-          state: 'PLANNED',
-          paused_from_state: null,
-          priority: 'HIGH',
-          risk: 'MEDIUM',
-          assigned_agent_id: 'agent-gemini-coder',
-          revision_count: 0,
-          max_revisions: 3,
-          base_sha: 'HEAD',
-          current_sha: null,
-          progress_cache_percent: 0,
-          progress_computed_at: new Date().toISOString(),
-          acceptance_criteria: ['Returns 401 on expired token', 'All unit tests pass'],
-          constraints: ['Do not modify user schema'],
-          created_at: new Date().toISOString(),
-          updated_at: new Date().toISOString(),
-        },
-      ]);
-
-      setAgents([
-        {
-          id: 'agent-primary-manager',
-          display_name: 'ChatGPT Manager (Manual)',
-          role: 'PRIMARY_MANAGER',
-          provider_resource_id: 'res-chatgpt-manager',
-          status: 'ACTIVE',
-          current_task_id: null,
-          last_seen_at: new Date().toISOString(),
-        },
-        {
-          id: 'agent-gemini-coder',
-          display_name: 'Gemini Coder (Manual)',
-          role: 'CODER',
-          provider_resource_id: 'res-gemini-coder',
-          status: 'IDLE',
-          current_task_id: null,
-          last_seen_at: new Date().toISOString(),
-        },
-      ]);
-
-      setResources([
-        {
-          id: 'res-chatgpt-manager',
-          provider_id: 'prov-manual-bridge',
-          model_name: 'ChatGPT Manager',
-          health_status: 'UNKNOWN',
-          capabilities: ['PLANNING', 'REVIEW', 'SECURITY_REVIEW', 'LARGE_CONTEXT'],
-          enabled: true,
-          total_quota: null,
-          remaining_quota: null,
-          quota_unit: 'REQUESTS',
-          quota_reset_at: null,
-          quota_source: 'UNKNOWN',
-          quota_confidence: 0.0,
-          last_health_check: null,
-        },
-        {
-          id: 'res-gemini-coder',
-          provider_id: 'prov-manual-bridge',
-          model_name: 'Gemini Coder',
-          health_status: 'UNKNOWN',
-          capabilities: ['CODING', 'FILESYSTEM_EDIT', 'TEST_EXECUTION', 'LARGE_CONTEXT'],
-          enabled: true,
-          total_quota: null,
-          remaining_quota: null,
-          quota_unit: 'REQUESTS',
-          quota_reset_at: null,
-          quota_source: 'UNKNOWN',
-          quota_confidence: 0.0,
-          last_health_check: null,
-        },
-      ]);
+    if (refreshInFlightRef.current) {
+      // A mutation-triggered refresh must not overlap the polling request. Queue
+      // one follow-up so the durable write is still reflected promptly.
+      refreshPendingRef.current = true;
       return;
     }
 
-    try {
-      const projList = await orchestrator.getProjects();
-      setProjects(projList);
+    const requestId = ++refreshRequestRef.current;
+    const requestedProjectId = activeProjectRef.current?.id ?? null;
+    refreshInFlightRef.current = true;
+    setLoading(true);
+    setRefreshError(null);
 
-      const currentProj = activeProject || projList[0] || null;
+    const isCurrentRequest = () => requestId === refreshRequestRef.current;
+    const selectionUnchanged = () => isAsyncResponseCurrent(
+      requestId,
+      refreshRequestRef.current,
+      requestedProjectId,
+      activeProjectRef.current?.id ?? null
+    );
+
+    try {
+      if (!orchestrator) {
+        // Browser preview fallback with deterministic initial values.
+        const now = new Date().toISOString();
+        const mockProj: Project = {
+          id: 'PROJ-DEMO',
+          name: 'Agent-Forge Core Engine',
+          description: 'Local AI engineering orchestrator desktop platform',
+          repository_path: 'd:\\Projects\\Agent-Forge',
+          default_branch: 'main',
+          status: 'READY',
+          contract: null,
+          created_at: now,
+          updated_at: now,
+          started_at: null,
+          completed_at: null,
+        };
+        if (!isCurrentRequest()) return;
+        setProjects([mockProj]);
+        setActiveProject((prev) => prev || mockProj);
+        setTasks([
+          {
+            id: 'AUTH-014',
+            project_id: 'PROJ-DEMO',
+            milestone_id: null,
+            title: 'Implement JWT Validation and Verification Middleware',
+            description: 'Add token signature verification, claims validation, and test suite.',
+            state: 'PLANNED',
+            paused_from_state: null,
+            priority: 'HIGH',
+            risk: 'MEDIUM',
+            assigned_agent_id: 'agent-gemini-coder',
+            revision_count: 0,
+            max_revisions: 3,
+            base_sha: 'HEAD',
+            current_sha: null,
+            progress_cache_percent: 0,
+            progress_computed_at: now,
+            acceptance_criteria: ['Returns 401 on expired token', 'All unit tests pass'],
+            constraints: ['Do not modify user schema'],
+            created_at: now,
+            updated_at: now,
+          },
+        ]);
+        setAgents([
+          {
+            id: 'agent-primary-manager',
+            display_name: 'ChatGPT Manager (Manual)',
+            role: 'PRIMARY_MANAGER',
+            provider_resource_id: 'res-chatgpt-manager',
+            status: 'ACTIVE',
+            current_task_id: null,
+            last_seen_at: now,
+          },
+          {
+            id: 'agent-gemini-coder',
+            display_name: 'Gemini Coder (Manual)',
+            role: 'CODER',
+            provider_resource_id: 'res-gemini-coder',
+            status: 'IDLE',
+            current_task_id: null,
+            last_seen_at: now,
+          },
+        ]);
+        setResources([
+          {
+            id: 'res-chatgpt-manager',
+            provider_id: 'prov-manual-bridge',
+            model_name: 'ChatGPT Manager',
+            health_status: 'UNKNOWN',
+            capabilities: ['PLANNING', 'REVIEW', 'SECURITY_REVIEW', 'LARGE_CONTEXT'],
+            enabled: true,
+            total_quota: null,
+            remaining_quota: null,
+            quota_unit: 'REQUESTS',
+            quota_reset_at: null,
+            quota_source: 'UNKNOWN',
+            quota_confidence: 0.0,
+            last_health_check: null,
+          },
+          {
+            id: 'res-gemini-coder',
+            provider_id: 'prov-manual-bridge',
+            model_name: 'Gemini Coder',
+            health_status: 'UNKNOWN',
+            capabilities: ['CODING', 'FILESYSTEM_EDIT', 'TEST_EXECUTION', 'LARGE_CONTEXT'],
+            enabled: true,
+            total_quota: null,
+            remaining_quota: null,
+            quota_unit: 'REQUESTS',
+            quota_reset_at: null,
+            quota_source: 'UNKNOWN',
+            quota_confidence: 0.0,
+            last_health_check: null,
+          },
+        ]);
+        return;
+      }
+
+      const projList = await orchestrator.getProjects();
+      if (!isCurrentRequest() || !selectionUnchanged()) return;
+
+      const currentProj = (requestedProjectId
+        ? projList.find((project: Project) => project.id === requestedProjectId)
+        : projList[0]) || null;
+      setProjects(projList);
       setActiveProject(currentProj);
 
       if (currentProj) {
@@ -211,22 +258,41 @@ export const OrchestratorProvider: React.FC<{ children: React.ReactNode }> = ({ 
           orchestrator.getEvents(currentProj.id),
           orchestrator.getEvidence(currentProj.id),
         ]);
+        if (!isCurrentRequest() || !selectionUnchanged()) return;
         setTasks(taskList);
         setEvents(eventList);
         setEvidence(evidenceList);
+      } else {
+        setTasks([]);
+        setEvents([]);
+        setEvidence([]);
       }
 
-      // Load real DB-backed agents and resources
+      // Load real DB-backed agents and resources.
       const [resList, agentList] = await Promise.all([
         orchestrator.getProviderResources(),
         orchestrator.getAgents(),
       ]);
+      if (!isCurrentRequest() || !selectionUnchanged()) return;
       setResources(resList);
       setAgents(agentList);
     } catch (err) {
-      console.error('[OrchestratorContext] Error refreshing data:', err);
+      if (isCurrentRequest()) {
+        const message = err instanceof Error ? err.message : 'Unable to refresh desktop data.';
+        setRefreshError(message);
+        console.error('[OrchestratorContext] Error refreshing data:', err);
+      }
+    } finally {
+      if (isCurrentRequest()) {
+        refreshInFlightRef.current = false;
+        setLoading(false);
+        if (refreshPendingRef.current) {
+          refreshPendingRef.current = false;
+          void refreshData();
+        }
+      }
     }
-  }, [activeProject]);
+  }, []);
 
   useEffect(() => {
     refreshData();
