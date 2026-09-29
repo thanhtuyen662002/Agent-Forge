@@ -3,6 +3,7 @@ import { CanonicalExecutionScopeSchema } from '../services/ExecutionAuthorizatio
 import { TaskStateEnum } from './domain';
 import {
   boundedArray,
+  boundedRefinedString,
   boundedString,
   MAX_CONTEXT_FILES,
   MAX_PROTOCOL_ARRAY_ITEMS,
@@ -14,6 +15,23 @@ import {
 const ipcString = () => boundedString(z.string(), MAX_PROTOCOL_STRING_BYTES);
 const requiredIpcString = () => boundedString(z.string().min(1), MAX_PROTOCOL_STRING_BYTES);
 const ipcStringArray = () => boundedArray(z.array(ipcString()), MAX_PROTOCOL_ARRAY_ITEMS);
+
+// Preserve the canonical path/shape refinements while applying the same byte
+// and collection ceilings at the renderer boundary.  The canonical schema is
+// also used for durable payload validation, so keep these limits local to IPC
+// rather than changing the persisted wire format here.
+const boundedExecutionScopeSchema = z
+  .object({
+    branch: boundedString(z.string().min(1)),
+    worktree: boundedRefinedString(
+      CanonicalExecutionScopeSchema.shape.worktree,
+      MAX_PROTOCOL_STRING_BYTES,
+      'Worktree'
+    ),
+    allowedPaths: ipcStringArray(),
+    forbiddenPaths: ipcStringArray(),
+  })
+  .strict();
 
 // Strict Zod schemas for all IPC channels across the main process security boundary
 
@@ -184,7 +202,7 @@ export const AuthorizeRoutedTaskIpcSchema = z
     attemptId: ipcString().nullable().optional(),
     routingDecisionId: requiredIpcString(),
     contextFiles: boundedArray(ipcStringArray(), MAX_CONTEXT_FILES).optional().default([]),
-    executionScope: CanonicalExecutionScopeSchema.optional(),
+    executionScope: boundedExecutionScopeSchema.optional(),
   })
   .strict();
 export type AuthorizeRoutedTaskIpc = z.infer<typeof AuthorizeRoutedTaskIpcSchema>;

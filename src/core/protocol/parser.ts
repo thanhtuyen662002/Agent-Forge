@@ -75,7 +75,7 @@ export class ProtocolParser {
   }
 
   public static parse(input: string): ParseResult {
-    if (!input || input.trim().length === 0) {
+    if (typeof input !== 'string' || input.trim().length === 0) {
       return { success: false, error: 'Empty protocol input.' };
     }
 

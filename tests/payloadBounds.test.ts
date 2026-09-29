@@ -10,7 +10,7 @@ import {
   stringifyBoundedJson,
 } from '../src/core/protocol/limits';
 import { ProtocolParser } from '../src/core/protocol/parser';
-import { ParseProtocolIpcSchema, RouteTaskIpcSchema } from '../src/core/types/ipc';
+import { AuthorizeRoutedTaskIpcSchema, ParseProtocolIpcSchema, RouteTaskIpcSchema } from '../src/core/types/ipc';
 import { ManagerProtocolSchema } from '../src/core/types/protocols';
 
 describe('bounded protocol payloads', () => {
@@ -57,5 +57,36 @@ describe('bounded protocol payloads', () => {
       }).success
     ).toBe(false);
     expect(() => stringifyBoundedJson('x'.repeat(MAX_DURABLE_JSON_BYTES + 1))).toThrow(/limit|bytes/i);
+  });
+
+  it('bounds nested execution-scope strings and collections at the IPC boundary', () => {
+    const base = { projectId: 'project-1', taskId: 'task-1', routingDecisionId: 'decision-1' };
+    const validScope = {
+      branch: 'agent/task-1',
+      worktree: 'D:/worktrees/task-1',
+      allowedPaths: ['src'],
+      forbiddenPaths: ['.git'],
+    };
+    expect(AuthorizeRoutedTaskIpcSchema.safeParse({ ...base, executionScope: validScope }).success).toBe(true);
+    expect(
+      AuthorizeRoutedTaskIpcSchema.safeParse({
+        ...base,
+        executionScope: { ...validScope, branch: 'x'.repeat(MAX_PROTOCOL_STRING_BYTES + 1) },
+      }).success
+    ).toBe(false);
+    expect(
+      AuthorizeRoutedTaskIpcSchema.safeParse({
+        ...base,
+        executionScope: {
+          ...validScope,
+          allowedPaths: Array.from({ length: MAX_PROTOCOL_ARRAY_ITEMS + 1 }, (_, index) => `src/${index}`),
+        },
+      }).success
+    ).toBe(false);
+  });
+
+  it('fails closed for non-string parser input', () => {
+    expect(ProtocolParser.parse(null as unknown as string).success).toBe(false);
+    expect(ProtocolParser.parse({} as unknown as string).success).toBe(false);
   });
 });

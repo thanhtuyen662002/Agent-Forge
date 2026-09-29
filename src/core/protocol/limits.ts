@@ -52,6 +52,29 @@ export function boundedString(schema: z.ZodString, maxBytes = MAX_PROTOCOL_STRIN
   });
 }
 
+/**
+ * Add the same UTF-8 ceiling to an already refined string schema.  Some
+ * canonical schemas carry path/format refinements that cannot be rebuilt from
+ * a plain `z.string()` without accidentally dropping those invariants.
+ */
+export function boundedRefinedString<T extends z.ZodTypeAny>(
+  schema: T,
+  maxBytes = MAX_PROTOCOL_STRING_BYTES,
+  label = 'String'
+): z.ZodEffects<T> {
+  return schema.superRefine((value, ctx) => {
+    if (typeof value === 'string' && !isWithinByteLimit(value, maxBytes)) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.too_big,
+        type: 'string',
+        inclusive: true,
+        maximum: maxBytes,
+        message: `${label} exceeds the ${maxBytes}-byte limit.`,
+      });
+    }
+  });
+}
+
 export function boundedArray<T extends z.ZodTypeAny>(schema: z.ZodArray<T>, maxItems: number): z.ZodArray<T> {
   return schema.max(maxItems, `Array cannot contain more than ${maxItems} items.`);
 }
