@@ -476,8 +476,13 @@ export function writeTrialFileAtomic(root: TrialFilesystemRoot, outputPath: stri
       trialSafeUnlink(root, temporaryPath, temporaryKey);
       return;
     }
-    if (handle.descriptor !== null) {
-      try { fs.fsyncSync(handle.descriptor); } catch {
+    // A nested directory handle can be synced directly.  For files directly
+    // below the anchored root, the root descriptor is the directory handle;
+    // keep it open for the lifetime of the operation and sync it here instead
+    // of closing it through `trialCloseDirectory`.
+    const directoryDescriptor = handle.descriptor ?? root.descriptor;
+    if (directoryDescriptor !== null) {
+      try { fs.fsyncSync(directoryDescriptor); } catch {
         throw new ArtifactIntegrityError('ARTIFACT_ATOMIC_PUBLISH_UNAVAILABLE', `${field} directory metadata could not be synchronized`, absolute);
       }
     }
