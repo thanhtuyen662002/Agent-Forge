@@ -107,6 +107,13 @@ export class ProcessRunner {
 
   public static readonly DEFAULT_MAX_OUTPUT_BYTES = 8 * 1024 * 1024; // 8 MiB default
   public static readonly MAX_ALLOWED_OUTPUT_BYTES = 32 * 1024 * 1024; // 32 MiB hard cap
+  /**
+   * The default and hard upper bound for a child-process deadline.  The upper
+   * bound matches Node's maximum reliable delay for setTimeout (2^31 - 1 ms),
+   * so a caller can never silently receive the platform's overflow behavior.
+   */
+  public static readonly DEFAULT_TIMEOUT_MS = 60_000;
+  public static readonly MAX_TIMEOUT_MS = 2_147_483_647;
 
   public static getPersistenceFencedEntries(): PersistenceFencedEntry[] {
     return Array.from(this.persistenceFencedEntries.values());
@@ -138,6 +145,119 @@ export class ProcessRunner {
   }
 
   private static retryPromises = new Map<string, Promise<ProcessRunResult>>();
+
+  private static validateTimeout(timeoutMs: unknown): { value?: number; error?: string } {
+    if (timeoutMs === undefined) {
+      return { value: this.DEFAULT_TIMEOUT_MS };
+    }
+
+    if (
+      typeof timeoutMs !== 'number' ||
+      !Number.isFinite(timeoutMs) ||
+      !Number.isSafeInteger(timeoutMs) ||
+      timeoutMs <= 0 ||
+      timeoutMs > this.MAX_TIMEOUT_MS
+    ) {
+      return {
+        error: `INVALID_TIMEOUT_MS: timeoutMs must be a finite positive safe integer no greater than ${this.MAX_TIMEOUT_MS}.`,
+      };
+    }
+
+    return { value: timeoutMs };
+  }
+
+  private static normalizeInternalTimeout(timeoutMs: unknown, fallbackMs: number, maxMs: number): number {
+    if (
+      typeof timeoutMs !== 'number' ||
+      !Number.isFinite(timeoutMs) ||
+      !Number.isSafeInteger(timeoutMs) ||
+      timeoutMs <= 0
+    ) {
+      return fallbackMs;
+    }
+    return Math.min(timeoutMs, maxMs);
+  }
+
+  /**
+   * Keep OS/process-launch diagnostics useful without copying arbitrary
+   * exception messages (which can contain paths, arguments, or secrets) into
+   * durable process evidence.
+   */
+  private static sanitizeLaunchError(err: unknown): string {
+    const code =
+      err && typeof err === 'object' && 'code' in err
+        ? String((err as { code?: unknown }).code ?? '')
+        : '';
+    if (/^[A-Z][A-Z0-9_]*$/.test(code)) {
+      return `PROCESS_SPAWN_FAILED (${code})`;
+    }
+    return 'PROCESS_SPAWN_FAILED';
+  }
+
+  private static createLaunchFailureResult(
+    executionId: string,
+    options: StructuredProcessOptions,
+    stderr: string
+  ): ProcessRunResult {
+    const commandStr = [options.executable, ...options.args].join(' ');
+    return {
+      executionId,
+      pid: null,
+      command: this.scrubSecrets(commandStr),
+      cwd: options.cwd,
+      exitCode: -1,
+      stdout: '',
+      stderr: this.scrubSecrets(stderr),
+      durationMs: 0,
+      timedOut: false,
+      cancelled: false,
+      outputLimitExceeded: false,
+      errorCode: 'PROCESS_LAUNCH_FAILED',
+      processStart: 'NOT_STARTED_PROVEN',
+      processTermination: 'NOT_APPLICABLE',
+    };
+  }
+
+  private static registerPersistenceFence(
+    result: ProcessRunResult,
+    durableError: Error,
+    timestamp: string
+  ): void {
+    this.persistenceFencedEntries.set(result.executionId, {
+      executionId: result.executionId,
+      status: 'PERSISTENCE_FENCED',
+      error: durableError.message,
+      durableError,
+      result,
+      timestamp,
+    });
+  }
+
+  private static persistLaunchFailure(
+    options: StructuredProcessOptions,
+    result: ProcessRunResult,
+    endIso: string
+  ): Error | null {
+    if (!options.repo) return null;
+
+    try {
+      options.repo.updateProcessRun(result.executionId, 'FAILED', result.exitCode, endIso, null, null);
+      const persisted = options.repo.getProcessRun(result.executionId);
+      if (
+        !persisted ||
+        persisted.status !== 'FAILED' ||
+        persisted.exit_code !== result.exitCode ||
+        persisted.end_time !== endIso
+      ) {
+        throw new Error('PROCESS_RUN_TERMINAL_STATE_MISMATCH');
+      }
+      return null;
+    } catch (dbErr: unknown) {
+      return new Error(
+        `DURABLE_TERMINAL_UPDATE_FAILED: Failed to update process run ${result.executionId}: DATABASE_PERSISTENCE_ERROR`
+      );
+    }
+  }
 
   public static async retryPersistenceFenced(executionId: string, repo: Repository): Promise<ProcessRunResult> {
     const inFlight = this.retryPromises.get(executionId);
@@ -506,7 +626,11 @@ export class ProcessRunner {
       executionId = crypto.randomUUID();
     }
 
-    const timeoutMs = options.timeoutMs ?? 60000;
+    const timeoutValidation = this.validateTimeout(options.timeoutMs);
+    if (timeoutValidation.error) {
+      return this.createLaunchFailureResult(executionId, options, timeoutValidation.error);
+    }
+    const timeoutMs = timeoutValidation.value as number;
     const startTime = Date.now();
     const startIso = new Date(startTime).toISOString();
 
@@ -723,17 +847,36 @@ export class ProcessRunner {
       let stdoutByteCount = 0;
       let stderrByteCount = 0;
 
-      // Spawn child process directly with minimal sanitized environment
-      const child = spawn(invocation.executable, invocation.args, {
-        cwd: options.cwd,
-        shell: options.allowShell ?? false,
-        env: minimalEnv,
-        windowsHide: true,
-        windowsVerbatimArguments: invocation.windowsVerbatimArguments ?? false,
-      });
+      // Spawn child process directly with minimal sanitized environment.  Some
+      // invalid cwd/options values throw synchronously before Node can emit its
+      // normal `error` event.  The RUNNING row has already been written, so
+      // terminalize (or fence) that row before resolving/rejecting this call.
+      let child: ChildProcess;
+      try {
+        child = spawn(invocation.executable, invocation.args, {
+          cwd: options.cwd,
+          shell: options.allowShell ?? false,
+          env: minimalEnv,
+          windowsHide: true,
+          windowsVerbatimArguments: invocation.windowsVerbatimArguments ?? false,
+        });
+      } catch (spawnErr: unknown) {
+        const result = ProcessRunner.createLaunchFailureResult(
+          executionId,
+          options,
+          `Failed to start process: ${ProcessRunner.sanitizeLaunchError(spawnErr)}`
+        );
+        const endIso = new Date().toISOString();
 
-      if (child.pid && options.repo) {
-        options.repo.updateProcessRunPid(executionId, child.pid);
+        const durableError = ProcessRunner.persistLaunchFailure(options, result, endIso);
+        if (durableError) {
+          ProcessRunner.registerPersistenceFence(result, durableError, endIso);
+          reject(durableError);
+          return;
+        }
+
+        resolve(result);
+        return;
       }
 
       let isTimedOut = false;
@@ -827,7 +970,7 @@ export class ProcessRunner {
           } else if (isStdinFailed && stdinErrorMessage) {
             finalStderr = `${stderrAcc}\n[${stdinErrorMessage}]`.trim();
           } else if (trigger === 'ERROR' && err) {
-            finalStderr = `Failed to start process: ${err.message}`;
+            finalStderr = `Failed to start process: ${ProcessRunner.sanitizeLaunchError(err)}`;
           }
 
           finalStderr = ProcessRunner.scrubSecrets(finalStderr);
@@ -905,14 +1048,7 @@ export class ProcessRunner {
 
           try {
             if (durableUpdateError) {
-              ProcessRunner.persistenceFencedEntries.set(executionId, {
-                executionId,
-                status: 'PERSISTENCE_FENCED',
-                error: durableUpdateError.message,
-                durableError: durableUpdateError,
-                result: terminalResult,
-                timestamp: endIso,
-              });
+              ProcessRunner.registerPersistenceFence(terminalResult, durableUpdateError, endIso);
               throw durableUpdateError;
             }
 
@@ -1051,6 +1187,27 @@ export class ProcessRunner {
           }
         });
       });
+
+      // PID persistence is part of startup truth.  Keep it inside the same
+      // settled lifecycle as spawn so a database failure cannot orphan a
+      // child while leaving its durable row RUNNING.
+      if (child.pid && options.repo) {
+        try {
+          options.repo.updateProcessRunPid(executionId, child.pid);
+          const persisted = options.repo.getProcessRun(executionId);
+          if (!persisted || persisted.pid !== child.pid) {
+            throw new Error('PROCESS_RUN_PID_STATE_MISMATCH');
+          }
+        } catch (pidErr: unknown) {
+          settleOnce('ERROR', null, pidErr instanceof Error ? pidErr : new Error('PROCESS_PID_PERSISTENCE_FAILED')).catch(
+            (err) => {
+              if (err) {
+                // Handled by settlementPromise rejection
+              }
+            }
+          );
+        }
+      }
     });
   }
 
@@ -1163,6 +1320,7 @@ export class ProcessRunner {
   ): Promise<ProcessTerminationTruth> {
     if (!child.pid) return Promise.resolve('NOT_APPLICABLE');
     const pid = child.pid;
+    const effectiveTimeoutMs = this.normalizeInternalTimeout(timeoutMs, 5000, this.MAX_TIMEOUT_MS);
     const existing = this.terminationPromises.get(pid);
     if (existing) {
       return existing;
@@ -1190,7 +1348,7 @@ export class ProcessRunner {
                 }
               }
               resolve(null);
-            }, timeoutMs);
+            }, effectiveTimeoutMs);
             tk.on('error', () => {
               clearTimeout(timer);
               resolve(null);
@@ -1202,7 +1360,7 @@ export class ProcessRunner {
           });
 
           // Explicit bounded post-kill liveness verification
-          const isDead = await ProcessRunner.verifyProcessDeadWithDeadline(pid, timeoutMs);
+          const isDead = await ProcessRunner.verifyProcessDeadWithDeadline(pid, effectiveTimeoutMs);
 
           if (isDead && (taskkillExitCode === 0 || taskkillExitCode === 128)) {
             return 'PROCESS_TREE_TERMINATED_PROVEN';
@@ -1221,7 +1379,7 @@ export class ProcessRunner {
               }
             }
           }
-          const isDead = await ProcessRunner.verifyProcessDeadWithDeadline(pid, timeoutMs);
+          const isDead = await ProcessRunner.verifyProcessDeadWithDeadline(pid, effectiveTimeoutMs);
           return isDead ? 'PROCESS_TREE_TERMINATED_PROVEN' : 'TERMINATION_UNRESOLVED';
         }
       } catch (termErr: unknown) {
@@ -1236,7 +1394,8 @@ export class ProcessRunner {
   }
 
   public static async verifyProcessDeadWithDeadline(pid: number, timeoutMs = 2000): Promise<boolean> {
-    const deadline = Date.now() + Math.min(timeoutMs, 2000);
+    const effectiveTimeoutMs = this.normalizeInternalTimeout(timeoutMs, 2000, 2000);
+    const deadline = Date.now() + effectiveTimeoutMs;
     while (Date.now() <= deadline) {
       try {
         process.kill(pid, 0);
