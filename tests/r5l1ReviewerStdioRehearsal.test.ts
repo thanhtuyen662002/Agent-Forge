@@ -17,7 +17,10 @@ beforeAll(() => {
   // Isolated output avoids racing other suites that compile dist-electron.
   compiled = fs.mkdtempSync(path.join(root, '.r5l1-stdio-'));
   try {
-    execFileSync(process.execPath, [path.join(root, 'node_modules/typescript/bin/tsc'), '-p',
+    // TypeScript 7 no longer exports the historical `typescript/bin/tsc`
+    // subpath. Resolve the package manifest and invoke its stable CLI path.
+    const tscBin = path.join(path.dirname(require.resolve('typescript/package.json')), 'bin', 'tsc');
+    execFileSync(process.execPath, [tscBin, '-p',
       path.join(root, 'tsconfig.node.json'), '--outDir', compiled], { cwd: root, stdio: 'pipe', timeout: 120000 });
     fs.writeFileSync(path.join(compiled, 'package.json'), '{"type":"commonjs"}');
     entry = path.join(compiled, 'mcp/stdio-review.js');
