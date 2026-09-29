@@ -93,15 +93,19 @@ describe('trusted executable resolution', () => {
       customEnv: {
         ProgramFiles: 'C:\\attacker',
         SystemRoot: 'C:\\attacker',
+        path: 'C:\\attacker',
+        comspec: 'C:\\attacker\\cmd.exe',
         API_TOKEN: 'allowed-secret',
       },
-      allowedEnvKeys: ['ProgramFiles', 'SystemRoot', 'API_TOKEN'],
+      allowedEnvKeys: ['ProgramFiles', 'SystemRoot', 'path', 'comspec', 'API_TOKEN'],
       fileExists: (candidate: string) => candidate.toLowerCase().endsWith('\\cmd.exe'),
       fileIsRegularFile: (candidate: string) => candidate.toLowerCase().endsWith('\\cmd.exe'),
     });
 
     expect(env.ProgramFiles).toBe('C:\\Program Files');
     expect(env.SystemRoot).toBe('C:\\Windows');
+    expect(env.PATH?.toLowerCase()).not.toContain('attacker');
+    expect(env.COMSPEC?.toLowerCase()).not.toContain('attacker');
     expect(env.API_TOKEN).toBe('allowed-secret');
   });
 

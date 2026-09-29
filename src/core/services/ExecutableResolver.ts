@@ -90,6 +90,15 @@ function envValue(env: NodeJS.ProcessEnv, key: string, platform: NodeJS.Platform
   return undefined;
 }
 
+function containsEnvironmentKey(keys: Set<string>, key: string, platform: NodeJS.Platform): boolean {
+  if (platform !== 'win32') return keys.has(key);
+  const normalized = key.toLowerCase();
+  for (const candidate of keys) {
+    if (candidate.toLowerCase() === normalized) return true;
+  }
+  return false;
+}
+
 function pathDelimiter(platform: NodeJS.Platform): string {
   return platform === 'win32' ? ';' : ':';
 }
@@ -308,8 +317,8 @@ export function buildTrustedEnvironment(options: TrustedEnvironmentOptions = {})
   const customEnv = options.customEnv ?? options.env ?? {};
   for (const [key, value] of Object.entries(customEnv)) {
     if (!allowed.has(key) || value === undefined) continue;
-    if (PATH_OVERRIDE_KEYS.has(key) && !options.preserveAllowedPathOverride) continue;
-    if (INSTALLATION_ROOT_KEYS.has(key)) continue;
+    if (containsEnvironmentKey(PATH_OVERRIDE_KEYS, key, platform) && !options.preserveAllowedPathOverride) continue;
+    if (containsEnvironmentKey(INSTALLATION_ROOT_KEYS, key, platform)) continue;
     if (hasControlCharacters(key) || hasControlCharacters(value)) continue;
     result[key] = value;
   }
