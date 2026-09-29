@@ -456,6 +456,9 @@ export class ReviewerAuthorityService {
         if (err instanceof ArtifactIntegrityError && /not valid UTF-8/i.test(message)) {
           throw new ReviewerAuthorityError('INVALID_UTF8_ENCODING', 'Git status evidence contains invalid UTF-8 byte sequences');
         }
+        if (err instanceof ArtifactIntegrityError && /ARTIFACT_(PATH_UNVERIFIED|REPARSE_POINT|ROOT_CHANGED|PARENT_MISSING|PARENT_CHANGED)/.test(message)) {
+          throw new ReviewerAuthorityError('INTEGRITY_CONFLICT', `Git status evidence path escape: ${message}`);
+        }
         if (/hash|byte size|bounded read|SIZE_EXCEEDED/i.test(message)) {
           throw new ReviewerAuthorityError('PROJECTION_HASH_MISMATCH', 'Git status evidence content hash or size mismatch');
         }
@@ -520,6 +523,9 @@ export class ReviewerAuthorityService {
         }
         if (err instanceof ArtifactIntegrityError && /not valid UTF-8/i.test(message)) {
           throw new ReviewerAuthorityError('INVALID_UTF8_ENCODING', 'Git diff evidence contains invalid UTF-8 byte sequences');
+        }
+        if (err instanceof ArtifactIntegrityError && /ARTIFACT_(PATH_UNVERIFIED|REPARSE_POINT|ROOT_CHANGED|PARENT_MISSING|PARENT_CHANGED)/.test(message)) {
+          throw new ReviewerAuthorityError('INTEGRITY_CONFLICT', `Git diff evidence path escape: ${message}`);
         }
         if (/hash|byte size|bounded read|SIZE_EXCEEDED/i.test(message)) {
           throw new ReviewerAuthorityError('PROJECTION_HASH_MISMATCH', 'Git diff evidence content hash or size mismatch');
