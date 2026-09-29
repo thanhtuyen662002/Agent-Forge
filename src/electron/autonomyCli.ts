@@ -7,6 +7,11 @@ import { AntigravityAdapter, CodexManagerAdapter } from '../core/autonomy/provid
 import { AutonomySupervisor } from '../core/autonomy/supervisor';
 import { runDisposableSelfHostProof } from '../core/autonomy/selfHost';
 import { ProcessRunner } from '../core/services/ProcessRunner';
+import {
+  buildTrustedEnvironment,
+  isProtectedExecutableName,
+  resolveTrustedExecutable,
+} from '../core/services/ExecutableResolver';
 import { SelfHostTaskSchema, sanitizeAutonomyText } from '../core/autonomy/contracts';
 import { assertPathContained } from '../core/services/ArtifactStore';
 import crypto from 'crypto';
@@ -37,9 +42,17 @@ const runtimeRoot = process.env.AGENT_FORGE_RUNTIME_ROOT ?? path.resolve(control
 const codexExecutable = process.env.CODEX_EXECUTABLE ?? (process.platform === 'win32' ? path.join(process.env.LOCALAPPDATA ?? '', 'Programs', 'OpenAI', 'Codex', 'bin', 'codex.exe') : 'codex');
 
 function run(command: string, args: string[], cwd = controlRepo, timeout = 30_000): { ok: boolean; stdout: string; stderr: string } {
-  const result = spawnSync(command, args, { cwd, encoding: 'utf8', timeout, windowsHide: true, shell: false });
+  const env = buildTrustedEnvironment({ env: process.env });
+  const protectedKind = isProtectedExecutableName(command);
+  const executable = protectedKind
+    ? resolveTrustedExecutable(command, protectedKind, { env })
+    : resolveTrustedExecutable(command, 'generic', { env, allowExplicitAbsolute: true }) ?? command;
+  if (!executable) {
+    return { ok: false, stdout: '', stderr: `TRUSTED_EXECUTABLE_NOT_FOUND: ${protectedKind ?? command}` };
+  }
+  const result = spawnSync(executable, args, { cwd, encoding: 'utf8', timeout, windowsHide: true, shell: false, env });
   const stdout = String(result.stdout ?? '');
-  const stderr = String(result.stderr ?? '');
+  const stderr = String(result.stderr ?? (result.error ? result.error.message : ''));
   return { ok: result.status === 0, stdout, stderr };
 }
 

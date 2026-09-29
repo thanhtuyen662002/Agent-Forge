@@ -5,6 +5,11 @@ import fs from 'fs';
 import { PolicyService } from './PolicyService';
 import { Repository } from '../database/repositories';
 import { ArtifactStore } from './ArtifactStore';
+import {
+  buildTrustedEnvironment,
+  isProtectedExecutableName,
+  resolveTrustedExecutable,
+} from './ExecutableResolver';
 
 export type ProcessStartTruth = 'NOT_STARTED_PROVEN' | 'STARTED_PROVEN' | 'START_AMBIGUOUS';
 export type ProcessTerminationTruth =
@@ -400,34 +405,10 @@ export class ProcessRunner {
    * and contains no control characters, quotes, or metacharacters.
    */
   private static resolveTrustedCmdExe(): string | null {
-    const candidates: (string | undefined)[] = [
-      process.env.ComSpec,
-      process.env.COMSPEC,
-      path.join(process.env.SystemRoot || process.env.SYSTEMROOT || 'C:\\Windows', 'System32', 'cmd.exe'),
-    ];
-
-    for (const candidate of candidates) {
-      if (!candidate || typeof candidate !== 'string') continue;
-      const trimmed = candidate.trim();
-      if (!path.isAbsolute(trimmed)) continue;
-      if (path.basename(trimmed).toLowerCase() !== 'cmd.exe') continue;
-      if (/[\x00\r\n"&|<>^%!()]/.test(trimmed)) continue;
-
-      try {
-        if (fs.existsSync(trimmed)) {
-          const stat = fs.statSync(trimmed);
-          if (stat.isFile()) {
-            return path.resolve(trimmed);
-          }
-        }
-      } catch (statErr: unknown) {
-        if (statErr) {
-          // Candidate path stat inaccessible
-        }
-      }
-    }
-
-    return null;
+    // Never accept an arbitrary process.env.ComSpec path. A compromised
+    // environment can point it at a lookalike cmd.exe outside System32;
+    // the shared resolver admits only the trusted OS installation root.
+    return resolveTrustedExecutable('cmd', 'cmd', { env: process.env });
   }
 
   /**
@@ -441,6 +422,19 @@ export class ProcessRunner {
     args: string[],
     env: NodeJS.ProcessEnv
   ): ResolvedInvocation {
+    const protectedKind = isProtectedExecutableName(executable);
+    if (protectedKind) {
+      const resolved = resolveTrustedExecutable(executable, protectedKind, { env });
+      if (!resolved) {
+        return {
+          executable,
+          args,
+          error: `Trusted executable is unavailable or outside an approved installation location: ${protectedKind}`,
+        };
+      }
+      executable = resolved;
+    }
+
     if (process.platform !== 'win32') {
       return { executable, args, windowsVerbatimArguments: false };
     }
@@ -761,7 +755,18 @@ export class ProcessRunner {
     }
 
     // 3. Resolve safe platform invocation (Windows shim vs direct binary)
-    const minimalEnv = this.buildMinimalEnv(options.env, options.allowedEnvKeys);
+    let minimalEnv = this.buildMinimalEnv(options.env, options.allowedEnvKeys);
+    const protectedKind = isProtectedExecutableName(options.executable);
+    if (protectedKind) {
+      // Protected tools receive a filtered PATH even when a caller explicitly
+      // supplied PATH for an ordinary provider command. Credentials and other
+      // explicitly allowlisted non-PATH values remain available.
+      minimalEnv = buildTrustedEnvironment({
+        env: { ...process.env, ...(options.env ?? {}) },
+        allowedEnvKeys: options.allowedEnvKeys,
+        preserveAllowedPathOverride: false,
+      });
+    }
     if (process.platform === 'win32') {
       const trustedCmd = this.resolveTrustedCmdExe();
       if (trustedCmd) {
@@ -1329,12 +1334,17 @@ export class ProcessRunner {
     const promise = (async (): Promise<ProcessTerminationTruth> => {
       try {
         if (process.platform === 'win32') {
+          const trustedTaskkill = resolveTrustedExecutable('taskkill', 'taskkill', {
+            env: buildTrustedEnvironment({ env: process.env }),
+          });
+          if (!trustedTaskkill) return 'TERMINATION_UNRESOLVED';
           const taskkillExitCode = await new Promise<number | null>((resolve) => {
             let tk: ChildProcess;
             try {
-              tk = spawn('taskkill', ['/F', '/T', '/PID', pid.toString()], {
+              tk = spawn(trustedTaskkill, ['/F', '/T', '/PID', pid.toString()], {
                 windowsHide: true,
                 stdio: 'ignore',
+                env: buildTrustedEnvironment({ env: process.env }),
               });
             } catch (spawnErr: unknown) {
               return resolve(null);

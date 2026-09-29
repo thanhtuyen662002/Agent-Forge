@@ -34,6 +34,7 @@ import {
 } from './responsesEndpoint';
 import { isPathContainedInBoundary } from './productTaskAdapter';
 import type { RepairContextPackage } from './repairContext';
+import { buildTrustedEnvironment, resolveTrustedExecutable } from '../services/ExecutableResolver';
 
 type FetchLike = typeof fetch;
 
@@ -320,11 +321,16 @@ export function applyCoderEditBundle(
   // A routed edit is writable only after Git independently proves the exact
   // source HEAD. Missing Git, a non-repository worktree, malformed output, and
   // process errors all fail closed before filesystem mutation.
-  const gitHead = spawnSync('git', ['rev-parse', 'HEAD'], {
+  const gitExecutable = resolveTrustedExecutable('git', 'git');
+  if (!gitExecutable) {
+    throw new Error('SOURCE_HEAD_UNVERIFIED: Trusted Git executable is unavailable');
+  }
+  const gitHead = spawnSync(gitExecutable, ['rev-parse', 'HEAD'], {
     cwd: resolvedWorktree,
     encoding: 'utf8',
     windowsHide: true,
     shell: false,
+    env: buildTrustedEnvironment({ env: process.env }),
   });
   if (gitHead.error || gitHead.status !== 0) {
     throw new Error('SOURCE_HEAD_UNVERIFIED: Unable to establish the authorized worktree Git HEAD');

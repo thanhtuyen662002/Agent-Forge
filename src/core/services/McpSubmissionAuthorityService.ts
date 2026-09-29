@@ -33,6 +33,7 @@ import {
 import { TestRun, TaskStateEnum, Project, Task, ExecutionAuthorization } from '../types/domain';
 import { AUTHORITY_SNAPSHOT_KEYS, CoderSubmissionAdjudication } from '../types/adjudication';
 import { validateAndParseCanonicalResultEnvelope } from './CoderSubmissionAdjudicationService';
+import { buildTrustedEnvironment, resolveTrustedExecutable } from './ExecutableResolver';
 
 export class McpSubmissionAuthorityError extends Error {
   constructor(
@@ -171,11 +172,14 @@ export class McpSubmissionAuthorityService {
 
         // 5. Synchronously inspect git rev-parse HEAD with bounded timeout and closed stdio
         try {
-          const gitOutput = child_process.execFileSync('git', ['rev-parse', 'HEAD'], {
+          const gitExecutable = resolveTrustedExecutable('git', 'git');
+          if (!gitExecutable) throw new Error('GIT_EXECUTABLE_NOT_FOUND');
+          const gitOutput = child_process.execFileSync(gitExecutable, ['rev-parse', 'HEAD'], {
             cwd: preflightProject.repository_path,
             timeout: 5000,
             stdio: ['ignore', 'pipe', 'pipe'],
             encoding: 'utf8',
+            env: buildTrustedEnvironment({ env: process.env }),
           });
           observedHeadSha = gitOutput.trim().toLowerCase();
           if (!/^[0-9a-f]{40}$/.test(observedHeadSha)) {

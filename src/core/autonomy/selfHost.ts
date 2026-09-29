@@ -1,12 +1,12 @@
 import crypto from 'crypto';
 import fs from 'fs';
-import path from 'path';
 import { spawnSync } from 'child_process';
 import { CodexManagerAdapter } from './providers';
 import { AutonomousTaskSpec, SelfHostTask, createWorkOrder } from './contracts';
 import { AutonomySupervisor, SupervisorRunResult } from './supervisor';
 import { GitWorktreeService } from '../services/GitWorktreeService';
 import { ManagerProviderPool } from './managerPool';
+import { buildTrustedEnvironment, resolveTrustedExecutable } from '../services/ExecutableResolver';
 
 export interface SelfHostProofOptions {
   controlRepo: string;
@@ -25,21 +25,27 @@ export interface SelfHostProofResult {
   cleanupRequired: boolean;
 }
 
-function git(args: string[], cwd: string): { ok: boolean; stdout: string; stderr: string } {
-  const result = spawnSync('git', args, { cwd, encoding: 'utf8', windowsHide: true, shell: false });
+function git(gitExecutable: string, args: string[], cwd: string): { ok: boolean; stdout: string; stderr: string } {
+  const result = spawnSync(gitExecutable, args, {
+    cwd,
+    encoding: 'utf8',
+    windowsHide: true,
+    shell: false,
+    env: buildTrustedEnvironment({ env: process.env }),
+  });
   return { ok: result.status === 0, stdout: String(result.stdout ?? '').trim(), stderr: String(result.stderr ?? '').trim() };
 }
 
 export async function runDisposableSelfHostProof(options: SelfHostProofOptions): Promise<SelfHostProofResult> {
   const { controlRepo, worktreeRoot, supervisor } = options;
   fs.mkdirSync(worktreeRoot, { recursive: true });
-  const head = git(['rev-parse', '--verify', options.task?.base_sha ?? 'HEAD'], controlRepo);
+  const gitExecutable = resolveTrustedExecutable('git', 'git');
+  if (!gitExecutable) throw new Error('GIT_EXECUTABLE_NOT_FOUND');
+  const head = git(gitExecutable, ['rev-parse', '--verify', options.task?.base_sha ?? 'HEAD'], controlRepo);
   if (!head.ok || !/^[0-9a-f]{40}$/i.test(head.stdout)) throw new Error(`SELF_HOST_BASE_SHA_FAILED: ${head.stderr || head.stdout}`);
   const id = crypto.randomUUID().slice(0, 8);
   const taskId = options.task?.task_id ?? `SELF-HOST-${id}`;
   const branch = `agent/agy-01/${taskId.toLowerCase()}-${id}`;
-  const gitExecutable = (process.env.Path ?? process.env.PATH ?? '').split(path.delimiter).map((dir) => path.join(dir, process.platform === 'win32' ? 'git.exe' : 'git')).find((file) => fs.existsSync(file));
-  if (!gitExecutable) throw new Error('GIT_EXECUTABLE_NOT_FOUND');
   const worktrees = new GitWorktreeService({ gitExecutable, repositoryRoot: controlRepo, managedRoot: worktreeRoot });
   const tuple = { projectId: 'AGENT-FORGE', taskId, assignmentId: id, workerSlotId: 'agy-01', baseSha: head.stdout };
   supervisor.store.event(tuple.taskId, 'WORKTREE_INTENT', tuple);
@@ -47,7 +53,7 @@ export async function runDisposableSelfHostProof(options: SelfHostProofOptions):
   if (added.status !== 'CREATED') throw new Error(`SELF_HOST_WORKTREE_CREATE_FAILED: ${added.error}`);
   const worktree = added.worktreePath;
   supervisor.store.event(tuple.taskId, 'WORKTREE_CREATED', { worktree, branch, baseSha: head.stdout });
-  const branchResult = git(['switch', '-c', branch], worktree);
+  const branchResult = git(gitExecutable, ['switch', '-c', branch], worktree);
   if (!branchResult.ok) throw new Error(`SELF_HOST_BRANCH_CREATE_FAILED: ${branchResult.stderr || branchResult.stdout}`);
 
   const managerPool = options.managerPool ?? (options.manager ? ManagerProviderPool.fromPrimary(supervisor.store, options.manager) : supervisor.managerPool);

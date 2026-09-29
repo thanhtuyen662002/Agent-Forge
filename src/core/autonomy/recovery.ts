@@ -3,6 +3,7 @@ import path from 'path';
 import { spawnSync } from 'child_process';
 import type { AutonomyState } from './contracts';
 import type { AutonomyStore, AutonomyWorkOrderRow } from './store';
+import { buildTrustedEnvironment, resolveTrustedExecutable } from '../services/ExecutableResolver';
 
 /**
  * The recovery scanner deliberately has no write capability.  It reads the
@@ -151,13 +152,18 @@ export class AutonomyRecoveryScanner {
     this.store = store;
     this.controlRepo = path.resolve(config.controlRepo);
     this.worktreeRoot = path.resolve(config.worktreeRoot);
-    this.gitExecutable = config.gitExecutable ?? process.env.GIT_EXECUTABLE ?? 'git';
+    const requestedGit = config.gitExecutable ?? process.env.GIT_EXECUTABLE ?? 'git';
+    this.gitExecutable = resolveTrustedExecutable(requestedGit, 'git') ?? '';
     this.runGit = config.runGit ?? ((args, cwd) => {
+      if (!this.gitExecutable) {
+        return { exitCode: 1, stdout: '', stderr: 'GIT_EXECUTABLE_NOT_FOUND' };
+      }
       const result = spawnSync(this.gitExecutable, args, {
         cwd,
         encoding: 'utf8',
         windowsHide: true,
         shell: false,
+        env: buildTrustedEnvironment({ env: process.env }),
       });
       return {
         exitCode: result.status === null ? 1 : result.status,
