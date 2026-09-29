@@ -49,6 +49,20 @@ describe('trusted executable resolution', () => {
     expect(resolveTrustedExecutable(fakePath, 'git', options)).toBeNull();
   });
 
+  it('keeps explicit custom provider paths opt-in without weakening Git boundary checks', () => {
+    const customProvider = 'C:\\agent-tools\\agy.exe';
+    const options = {
+      platform: 'win32' as const,
+      env: { SystemRoot: 'C:\\Windows', ProgramFiles: 'C:\\Program Files' },
+      fileExists: (candidate: string) => candidate === customProvider,
+      fileIsRegularFile: (candidate: string) => candidate === customProvider,
+    };
+
+    expect(resolveTrustedExecutable(customProvider, 'agy', options)).toBeNull();
+    expect(resolveTrustedExecutable(customProvider, 'agy', { ...options, allowExplicitAbsoluteForProtected: true })).toBe(customProvider);
+    expect(resolveTrustedExecutable('C:\\agent-tools\\git.exe', 'git', { ...options, allowExplicitAbsoluteForProtected: true })).toBeNull();
+  });
+
   it('builds a minimal environment and drops PATH/control-shell overrides by default', () => {
     const env = buildTrustedEnvironment({
       env: {

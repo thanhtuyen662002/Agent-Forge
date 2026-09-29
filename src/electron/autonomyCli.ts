@@ -45,7 +45,10 @@ function run(command: string, args: string[], cwd = controlRepo, timeout = 30_00
   const env = buildTrustedEnvironment({ env: process.env });
   const protectedKind = isProtectedExecutableName(command);
   const executable = protectedKind
-    ? resolveTrustedExecutable(command, protectedKind, { env })
+    ? resolveTrustedExecutable(command, protectedKind, {
+      env,
+      allowExplicitAbsoluteForProtected: (protectedKind === 'agy' || protectedKind === 'codex' || protectedKind === 'gh') && path.isAbsolute(command),
+    })
     : resolveTrustedExecutable(command, 'generic', { env, allowExplicitAbsolute: true });
   if (!executable) {
     return { ok: false, stdout: '', stderr: `TRUSTED_EXECUTABLE_NOT_FOUND: ${protectedKind ?? command}` };

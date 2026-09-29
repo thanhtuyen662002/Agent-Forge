@@ -15,6 +15,8 @@ export interface ExecutableResolverOptions {
   fileIsRegularFile?: (candidate: string) => boolean;
   /** Allow an explicitly configured absolute path for a non-protected provider executable. */
   allowExplicitAbsolute?: boolean;
+  /** Preserve an explicitly configured absolute provider path outside standard roots. */
+  allowExplicitAbsoluteForProtected?: boolean;
 }
 
 export interface TrustedEnvironmentOptions extends ExecutableResolverOptions {
@@ -239,7 +241,11 @@ export function resolveTrustedExecutable(requested: string, kind: TrustedExecuta
   const explicitAbsolute = api.isAbsolute(requested);
   if (explicitAbsolute) {
     if (kind !== 'generic' && !expected.includes(requestedBase)) return null;
-    if (kind !== 'generic' && !trustedInstallationRoots(platform, env, kind).some((root) => isWithinDirectory(requested, root, platform))) {
+    if (
+      kind !== 'generic' &&
+      !trustedInstallationRoots(platform, env, kind).some((root) => isWithinDirectory(requested, root, platform)) &&
+      !options.allowExplicitAbsoluteForProtected
+    ) {
       return null;
     }
     if (!isRegular(requested)) return null;

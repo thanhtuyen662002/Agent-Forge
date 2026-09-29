@@ -424,7 +424,11 @@ export class ProcessRunner {
   ): ResolvedInvocation {
     const protectedKind = isProtectedExecutableName(executable);
     if (protectedKind) {
-      const resolved = resolveTrustedExecutable(executable, protectedKind, { env });
+      const allowConfiguredProviderPath = (protectedKind === 'agy' || protectedKind === 'codex' || protectedKind === 'gh') && path.isAbsolute(executable);
+      const resolved = resolveTrustedExecutable(executable, protectedKind, {
+        env,
+        allowExplicitAbsoluteForProtected: allowConfiguredProviderPath,
+      });
       if (!resolved) {
         return {
           executable,
