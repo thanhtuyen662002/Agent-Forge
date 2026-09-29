@@ -762,7 +762,8 @@ export class ProcessRunner {
       // supplied PATH for an ordinary provider command. Credentials and other
       // explicitly allowlisted non-PATH values remain available.
       minimalEnv = buildTrustedEnvironment({
-        env: { ...process.env, ...(options.env ?? {}) },
+        env: process.env,
+        customEnv: options.env,
         allowedEnvKeys: options.allowedEnvKeys,
         preserveAllowedPathOverride: false,
       });

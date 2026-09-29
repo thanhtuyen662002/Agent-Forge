@@ -69,6 +69,28 @@ describe('trusted executable resolution', () => {
     expect(env.COMSPEC?.toLowerCase()).not.toContain('attacker');
   });
 
+  it('does not let caller environment overrides replace trusted installation roots', () => {
+    const env = buildTrustedEnvironment({
+      platform: 'win32',
+      env: {
+        SystemRoot: 'C:\\Windows',
+        ProgramFiles: 'C:\\Program Files',
+      },
+      customEnv: {
+        ProgramFiles: 'C:\\attacker',
+        SystemRoot: 'C:\\attacker',
+        API_TOKEN: 'allowed-secret',
+      },
+      allowedEnvKeys: ['ProgramFiles', 'SystemRoot', 'API_TOKEN'],
+      fileExists: (candidate: string) => candidate.toLowerCase().endsWith('\\cmd.exe'),
+      fileIsRegularFile: (candidate: string) => candidate.toLowerCase().endsWith('\\cmd.exe'),
+    });
+
+    expect(env.ProgramFiles).toBe('C:\\Program Files');
+    expect(env.SystemRoot).toBe('C:\\Windows');
+    expect(env.API_TOKEN).toBe('allowed-secret');
+  });
+
   it('classifies protected names independently of their extension or absolute spelling', () => {
     expect(isProtectedExecutableName('git')).toBe('git');
     expect(isProtectedExecutableName('git.exe')).toBe('git');

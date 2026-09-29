@@ -46,7 +46,7 @@ function run(command: string, args: string[], cwd = controlRepo, timeout = 30_00
   const protectedKind = isProtectedExecutableName(command);
   const executable = protectedKind
     ? resolveTrustedExecutable(command, protectedKind, { env })
-    : resolveTrustedExecutable(command, 'generic', { env, allowExplicitAbsolute: true }) ?? command;
+    : resolveTrustedExecutable(command, 'generic', { env, allowExplicitAbsolute: true });
   if (!executable) {
     return { ok: false, stdout: '', stderr: `TRUSTED_EXECUTABLE_NOT_FOUND: ${protectedKind ?? command}` };
   }

@@ -19,6 +19,8 @@ export interface ExecutableResolverOptions {
 
 export interface TrustedEnvironmentOptions extends ExecutableResolverOptions {
   allowedEnvKeys?: readonly string[];
+  /** Caller-provided values copied only when explicitly allowlisted. */
+  customEnv?: NodeJS.ProcessEnv;
   /** Preserve a caller-authorized PATH override for legacy provider shims. */
   preserveAllowedPathOverride?: boolean;
 }
@@ -46,6 +48,16 @@ const SAFE_INHERITED_ENV_KEYS = [
 ] as const;
 
 const PATH_OVERRIDE_KEYS = new Set(['PATH', 'Path', 'PATHEXT', 'ComSpec', 'COMSPEC']);
+const INSTALLATION_ROOT_KEYS = new Set([
+  'SystemRoot',
+  'SYSTEMROOT',
+  'ProgramFiles',
+  'PROGRAMFILES',
+  'ProgramFiles(x86)',
+  'PROGRAMFILES(X86)',
+  'ProgramW6432',
+  'PROGRAMW6432',
+]);
 
 function platformOf(options: ExecutableResolverOptions): NodeJS.Platform {
   return options.platform ?? process.platform;
@@ -287,9 +299,11 @@ export function buildTrustedEnvironment(options: TrustedEnvironmentOptions = {})
   }
 
   const allowed = new Set(options.allowedEnvKeys ?? []);
-  for (const [key, value] of Object.entries(options.env ?? {})) {
+  const customEnv = options.customEnv ?? options.env ?? {};
+  for (const [key, value] of Object.entries(customEnv)) {
     if (!allowed.has(key) || value === undefined) continue;
     if (PATH_OVERRIDE_KEYS.has(key) && !options.preserveAllowedPathOverride) continue;
+    if (INSTALLATION_ROOT_KEYS.has(key)) continue;
     if (hasControlCharacters(key) || hasControlCharacters(value)) continue;
     result[key] = value;
   }
