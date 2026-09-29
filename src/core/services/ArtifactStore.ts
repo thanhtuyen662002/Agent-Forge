@@ -16,6 +16,7 @@ export type ArtifactIntegrityErrorCode =
   | 'ARTIFACT_PARENT_CHANGED'
   | 'ARTIFACT_REPARSE_POINT'
   | 'ARTIFACT_PATH_UNVERIFIED'
+  | 'ARTIFACT_SIZE_EXCEEDED'
   | 'ARTIFACT_NOFOLLOW_UNAVAILABLE'
   | 'ARTIFACT_ATOMIC_PUBLISH_UNAVAILABLE'
   | 'ARTIFACT_BASE_DIRECTORY_REQUIRED';
@@ -60,6 +61,9 @@ const POSIX_DESCRIPTOR_ANCHOR =
   typeof fs.constants.O_DIRECTORY === 'number' &&
   typeof fs.constants.O_NOFOLLOW === 'number' &&
   fs.existsSync('/proc/self/fd');
+
+/** Hard ceiling for every artifact read, including reads requested by callers. */
+export const ARTIFACT_MAX_READ_BYTES = 32 * 1024 * 1024;
 
 /**
  * Linux exposes a descriptor-relative `/proc/self/fd` path plus O_NOFOLLOW,
@@ -302,7 +306,12 @@ function openArtifactFile(filePath: string, flags: number, mode?: number): numbe
   }
 }
 
-function readArtifactBytes(anchor: ArtifactRootAnchor, absolutePath: string, expectedIdentity?: ArtifactPathIdentity): Buffer {
+function readArtifactBytes(
+  anchor: ArtifactRootAnchor,
+  absolutePath: string,
+  expectedIdentity?: ArtifactPathIdentity,
+  maxBytes = ARTIFACT_MAX_READ_BYTES
+): Buffer {
   const openedPath = anchoredPath(anchor, absolutePath);
   let preOpenIdentity: ArtifactPathIdentity;
   try {
@@ -327,7 +336,36 @@ function readArtifactBytes(anchor: ArtifactRootAnchor, absolutePath: string, exp
     if (openedIdentity !== expectedKey) {
       throw new ArtifactIntegrityError('ARTIFACT_PATH_UNVERIFIED', 'artifact leaf identity changed before bytes were read', absolutePath);
     }
-    return fs.readFileSync(descriptor);
+    const size = fs.fstatSync(descriptor).size;
+    if (Number.isSafeInteger(size) && size > maxBytes) {
+      throw new ArtifactIntegrityError(
+        'ARTIFACT_SIZE_EXCEEDED',
+        `artifact exceeds bounded read limit of ${maxBytes} bytes`,
+        absolutePath
+      );
+    }
+
+    const chunks: Buffer[] = [];
+    let total = 0;
+    while (true) {
+      const remaining = maxBytes - total;
+      // Read one byte beyond the limit so a file that grows after fstat is
+      // rejected instead of being silently truncated.
+      const chunkSize = Math.min(64 * 1024, remaining + 1);
+      const chunk = Buffer.allocUnsafe(chunkSize);
+      const bytesRead = fs.readSync(descriptor, chunk, 0, chunkSize, null);
+      if (bytesRead === 0) break;
+      total += bytesRead;
+      if (total > maxBytes) {
+        throw new ArtifactIntegrityError(
+          'ARTIFACT_SIZE_EXCEEDED',
+          `artifact exceeds bounded read limit of ${maxBytes} bytes`,
+          absolutePath
+        );
+      }
+      chunks.push(chunk.subarray(0, bytesRead));
+    }
+    return Buffer.concat(chunks, total);
   } finally {
     fs.closeSync(descriptor);
   }
@@ -881,19 +919,35 @@ export class ArtifactStore {
     });
   }
 
-  public read(evidence: Evidence): string {
+  private readBytes(evidence: Evidence, maxBytes = ARTIFACT_MAX_READ_BYTES): Buffer {
+    const boundedMaxBytes = Math.min(
+      ARTIFACT_MAX_READ_BYTES,
+      Number.isSafeInteger(maxBytes) && maxBytes > 0 ? maxBytes : ARTIFACT_MAX_READ_BYTES
+    );
     if (evidence.storage_type === 'INLINE') {
       if (evidence.raw_payload === null) {
         throw new Error(`[ArtifactStore] Evidence ${evidence.id} is marked INLINE but has null payload.`);
       }
-      return evidence.raw_payload;
+      const inlineBytes = Buffer.from(evidence.raw_payload, 'utf8');
+      if (inlineBytes.length > boundedMaxBytes) {
+        throw new ArtifactIntegrityError(
+          'ARTIFACT_SIZE_EXCEEDED',
+          `inline evidence exceeds bounded read limit of ${boundedMaxBytes} bytes`,
+          evidence.id
+        );
+      }
+      const computedHash = crypto.createHash('sha256').update(inlineBytes).digest('hex');
+      if (computedHash !== evidence.hash || inlineBytes.byteLength !== evidence.byte_size) {
+        throw new Error(`[ArtifactStore] Integrity violation: inline evidence "${evidence.id}" hash or byte size mismatch.`);
+      }
+      return inlineBytes;
     }
 
     if (!evidence.file_path) {
       throw new Error(`[ArtifactStore] Evidence file path is missing.`);
     }
 
-    const content = this.readBuffer(evidence.file_path);
+    const content = this.readBuffer(evidence.file_path, boundedMaxBytes);
     const computedHash = crypto.createHash('sha256').update(content).digest('hex');
 
     if (computedHash !== evidence.hash) {
@@ -902,7 +956,28 @@ export class ArtifactStore {
       );
     }
 
-    return content.toString('utf8');
+    if (content.byteLength !== evidence.byte_size) {
+      throw new Error(`[ArtifactStore] Integrity violation: byte size mismatch for artifact "${evidence.id}".`);
+    }
+    return content;
+  }
+
+  public read(evidence: Evidence, maxBytes = ARTIFACT_MAX_READ_BYTES): string {
+    return this.readBytes(evidence, maxBytes).toString('utf8');
+  }
+
+  /** Read textual evidence with a fatal UTF-8 decoder. */
+  public readText(evidence: Evidence, maxBytes = ARTIFACT_MAX_READ_BYTES): string {
+    const content = this.readBytes(evidence, maxBytes);
+    try {
+      return new TextDecoder('utf-8', { fatal: true }).decode(content);
+    } catch {
+      throw new ArtifactIntegrityError(
+        'ARTIFACT_PATH_UNVERIFIED',
+        `artifact "${evidence.id}" is not valid UTF-8`,
+        evidence.file_path ?? evidence.id
+      );
+    }
   }
 
   /**
@@ -911,7 +986,11 @@ export class ArtifactStore {
    * that need byte-accurate hashes should use this method instead of opening
    * evidence paths directly.
    */
-  public readBuffer(filePath: string): Buffer {
+  public readBuffer(filePath: string, maxBytes = ARTIFACT_MAX_READ_BYTES): Buffer {
+    const boundedMaxBytes = Math.min(
+      ARTIFACT_MAX_READ_BYTES,
+      Number.isSafeInteger(maxBytes) && maxBytes > 0 ? maxBytes : ARTIFACT_MAX_READ_BYTES
+    );
     return this.withRootAnchor([filePath], (anchor, snapshots) => {
       const absolutePath = path.resolve(filePath);
       const anchored = anchoredPath(anchor, absolutePath);
@@ -919,7 +998,7 @@ export class ArtifactStore {
         throw new Error('[ArtifactStore] Evidence file missing on disk.');
       }
       try {
-        return readArtifactBytes(anchor, absolutePath, snapshots[0]?.leafIdentity);
+        return readArtifactBytes(anchor, absolutePath, snapshots[0]?.leafIdentity, boundedMaxBytes);
       } catch (error) {
         if (isErrno(error, 'ENOENT')) throw new Error('[ArtifactStore] Evidence file missing on disk.');
         throw error;
@@ -1130,6 +1209,9 @@ export function verifyEvidenceIntegrity(
         return { valid: false, reason: `FILE evidence ${evidence.id} byte size mismatch: expected ${evidence.byte_size}, got ${fileBytes.length}` };
       }
     } catch (readErr: unknown) {
+      if (readErr instanceof ArtifactIntegrityError && readErr.code === 'ARTIFACT_SIZE_EXCEEDED') {
+        return { valid: false, reason: `FILE evidence ${evidence.id} exceeds the bounded read limit: FILE_TOO_LARGE` };
+      }
       if (readErr instanceof ArtifactIntegrityError || (readErr instanceof Error && /ILLEGAL_PATH_TRAVERSAL|Evidence file path is missing/.test(readErr.message))) {
         return { valid: false, reason: `FILE evidence ${evidence.id} path escapes base directory: ILLEGAL_PATH_TRAVERSAL` };
       }

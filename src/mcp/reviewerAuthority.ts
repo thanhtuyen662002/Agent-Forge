@@ -1,8 +1,7 @@
 import crypto from 'crypto';
-import fs from 'fs';
 import path from 'path';
 import { Repository } from '../core/database/repositories';
-import { ArtifactStore, defaultArtifactStore, assertPathContained } from '../core/services/ArtifactStore';
+import { ArtifactStore, ArtifactIntegrityError, defaultArtifactStore } from '../core/services/ArtifactStore';
 import { scrubAdjudicationDiagnostics } from '../core/services/CoderSubmissionAdjudicationService';
 import { computeSha256 } from './submissionProtocol';
 import {
@@ -447,28 +446,20 @@ export class ReviewerAuthorityService {
     }
     let rawStatusPayload: string;
     if (statusEv.storage_type === 'FILE') {
-      if (!statusEv.file_path) {
-        throw new ReviewerAuthorityError('INTEGRITY_CONFLICT', 'Git status evidence file path missing');
-      }
       try {
-        assertPathContained(statusEv.file_path, this.artifactStore.getBaseDir());
+        rawStatusPayload = this.artifactStore.readText(statusEv);
       } catch (err: unknown) {
-        throw new ReviewerAuthorityError('INTEGRITY_CONFLICT', `Git status evidence path escape: ${err instanceof Error ? err.message : String(err)}`);
-      }
-      if (!fs.existsSync(statusEv.file_path)) {
-        throw new ReviewerAuthorityError('NOT_FOUND', 'Git status evidence file missing on disk');
-      }
-      const rawBytes = fs.readFileSync(statusEv.file_path);
-      // Hash & byte size check
-      const computedHash = crypto.createHash('sha256').update(rawBytes).digest('hex');
-      if (computedHash !== statusEv.hash || rawBytes.length !== statusEv.byte_size) {
-        throw new ReviewerAuthorityError('PROJECTION_HASH_MISMATCH', 'Git status evidence content hash or size mismatch');
-      }
-      // Strict fatal UTF-8 decode
-      try {
-        rawStatusPayload = new TextDecoder('utf-8', { fatal: true }).decode(rawBytes);
-      } catch {
-        throw new ReviewerAuthorityError('INVALID_UTF8_ENCODING', 'Git status evidence contains invalid UTF-8 byte sequences');
+        const message = err instanceof Error ? err.message : String(err);
+        if (/file missing on disk|file path is missing/i.test(message)) {
+          throw new ReviewerAuthorityError('NOT_FOUND', 'Git status evidence file missing on disk');
+        }
+        if (err instanceof ArtifactIntegrityError && /not valid UTF-8/i.test(message)) {
+          throw new ReviewerAuthorityError('INVALID_UTF8_ENCODING', 'Git status evidence contains invalid UTF-8 byte sequences');
+        }
+        if (/hash|byte size|bounded read|SIZE_EXCEEDED/i.test(message)) {
+          throw new ReviewerAuthorityError('PROJECTION_HASH_MISMATCH', 'Git status evidence content hash or size mismatch');
+        }
+        throw new ReviewerAuthorityError('INTEGRITY_CONFLICT', `Git status evidence safe read failed: ${message}`);
       }
     } else {
       if (typeof statusEv.raw_payload !== 'string') {
@@ -520,28 +511,20 @@ export class ReviewerAuthorityService {
 
     let rawDiffPayload: string;
     if (diffEv.storage_type === 'FILE') {
-      if (!diffEv.file_path) {
-        throw new ReviewerAuthorityError('INTEGRITY_CONFLICT', 'Git diff evidence file path missing');
-      }
       try {
-        assertPathContained(diffEv.file_path, this.artifactStore.getBaseDir());
+        rawDiffPayload = this.artifactStore.readText(diffEv);
       } catch (err: unknown) {
-        throw new ReviewerAuthorityError('INTEGRITY_CONFLICT', `Git diff evidence path escape: ${err instanceof Error ? err.message : String(err)}`);
-      }
-      if (!fs.existsSync(diffEv.file_path)) {
-        throw new ReviewerAuthorityError('NOT_FOUND', 'Git diff evidence file missing on disk');
-      }
-      const rawBytes = fs.readFileSync(diffEv.file_path);
-      // Hash & byte size check
-      const computedHash = crypto.createHash('sha256').update(rawBytes).digest('hex');
-      if (computedHash !== diffEv.hash || rawBytes.length !== diffEv.byte_size) {
-        throw new ReviewerAuthorityError('PROJECTION_HASH_MISMATCH', 'Git diff evidence content hash or size mismatch');
-      }
-      // Strict fatal UTF-8 decode
-      try {
-        rawDiffPayload = new TextDecoder('utf-8', { fatal: true }).decode(rawBytes);
-      } catch {
-        throw new ReviewerAuthorityError('INVALID_UTF8_ENCODING', 'Git diff evidence contains invalid UTF-8 byte sequences');
+        const message = err instanceof Error ? err.message : String(err);
+        if (/file missing on disk|file path is missing/i.test(message)) {
+          throw new ReviewerAuthorityError('NOT_FOUND', 'Git diff evidence file missing on disk');
+        }
+        if (err instanceof ArtifactIntegrityError && /not valid UTF-8/i.test(message)) {
+          throw new ReviewerAuthorityError('INVALID_UTF8_ENCODING', 'Git diff evidence contains invalid UTF-8 byte sequences');
+        }
+        if (/hash|byte size|bounded read|SIZE_EXCEEDED/i.test(message)) {
+          throw new ReviewerAuthorityError('PROJECTION_HASH_MISMATCH', 'Git diff evidence content hash or size mismatch');
+        }
+        throw new ReviewerAuthorityError('INTEGRITY_CONFLICT', `Git diff evidence safe read failed: ${message}`);
       }
     } else {
       if (typeof diffEv.raw_payload !== 'string') {
