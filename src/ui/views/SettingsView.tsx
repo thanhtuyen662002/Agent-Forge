@@ -60,6 +60,10 @@ export const SettingsView: React.FC = () => {
   });
   const [isActionLoading, setIsActionLoading] = useState<boolean>(false);
   const [updateError, setUpdateError] = useState<string | null>(null);
+  const fetchStateInFlightRef = useRef(false);
+  const fetchStateRequestRef = useRef(0);
+  const actionInFlightRef = useRef(false);
+  const saveInFlightRef = useRef(false);
 
   const applyCanonicalCommands = (commands: any[]) => {
     const testRow = commands.find((c: any) => c.command_type === 'TEST' && c.enabled);
@@ -110,19 +114,32 @@ export const SettingsView: React.FC = () => {
   }, [activeProject?.id]);
 
   const fetchState = async () => {
+    if (fetchStateInFlightRef.current || actionInFlightRef.current) return;
+    const requestId = ++fetchStateRequestRef.current;
+    fetchStateInFlightRef.current = true;
     try {
-      if ((window as any).orchestrator) {
-        const infoRes = await (window as any).orchestrator.getAppInfo();
-        if (infoRes?.success && infoRes.info) {
-          setAppInfo(infoRes.info);
-        }
-        const updateRes = await (window as any).orchestrator.getUpdateState();
-        if (updateRes?.success && updateRes.summary) {
-          setUpdateSummary(updateRes.summary);
-        }
+      const desktopOrchestrator = (window as any).orchestrator;
+      if (!desktopOrchestrator) return;
+      const [infoRes, updateRes] = await Promise.all([
+        desktopOrchestrator.getAppInfo(),
+        desktopOrchestrator.getUpdateState(),
+      ]);
+      if (requestId !== fetchStateRequestRef.current) return;
+      if (infoRes?.success && infoRes.info) {
+        setAppInfo(infoRes.info);
+      }
+      if (updateRes?.success && updateRes.summary) {
+        setUpdateSummary(updateRes.summary);
       }
     } catch (err: any) {
-      console.warn('Failed to fetch update/app state:', err);
+      if (requestId === fetchStateRequestRef.current) {
+        setUpdateError(err?.message || 'Failed to fetch update/app state');
+        console.warn('Failed to fetch update/app state:', err);
+      }
+    } finally {
+      if (requestId === fetchStateRequestRef.current) {
+        fetchStateInFlightRef.current = false;
+      }
     }
   };
 
@@ -133,6 +150,8 @@ export const SettingsView: React.FC = () => {
   }, []);
 
   const handleCheckForUpdates = async () => {
+    if (actionInFlightRef.current) return;
+    actionInFlightRef.current = true;
     setIsActionLoading(true);
     setUpdateError(null);
     try {
@@ -147,11 +166,15 @@ export const SettingsView: React.FC = () => {
     } catch (err: any) {
       setUpdateError(err.message || 'Failed to check for updates');
     } finally {
+      actionInFlightRef.current = false;
       setIsActionLoading(false);
+      void fetchState();
     }
   };
 
   const handleDownloadUpdate = async () => {
+    if (actionInFlightRef.current) return;
+    actionInFlightRef.current = true;
     setIsActionLoading(true);
     setUpdateError(null);
     try {
@@ -166,11 +189,15 @@ export const SettingsView: React.FC = () => {
     } catch (err: any) {
       setUpdateError(err.message || 'Failed to download update');
     } finally {
+      actionInFlightRef.current = false;
       setIsActionLoading(false);
+      void fetchState();
     }
   };
 
   const handleInstallAndRestart = async () => {
+    if (actionInFlightRef.current) return;
+    actionInFlightRef.current = true;
     setIsActionLoading(true);
     setUpdateError(null);
     try {
@@ -183,16 +210,19 @@ export const SettingsView: React.FC = () => {
     } catch (err: any) {
       setUpdateError(err.message || 'Failed to trigger install and restart');
     } finally {
+      actionInFlightRef.current = false;
       setIsActionLoading(false);
     }
   };
 
   const handleSave = async () => {
+    if (saveInFlightRef.current) return;
     if (!activeProject?.id) {
       setSaveError(t('settings.noActiveProject'));
       return;
     }
 
+    saveInFlightRef.current = true;
     const savedProjectId = activeProject.id;
     setSaveError(null);
     setSaved(false);
@@ -225,6 +255,8 @@ export const SettingsView: React.FC = () => {
       if (activeProjectIdRef.current === savedProjectId) {
         setSaveError(err?.message || t('settings.saveFailed'));
       }
+    } finally {
+      saveInFlightRef.current = false;
     }
   };
 
