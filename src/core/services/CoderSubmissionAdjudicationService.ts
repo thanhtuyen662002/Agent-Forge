@@ -1311,12 +1311,22 @@ export function evaluateCanonicalSettlementDecision(
 
   // Retrieve and validate dedicated workspace snapshot after file content
   let afterContent: string | null = null;
+  let afterReadIntegrityFailure: string | null = null;
   if (matchingAfterEvidence.raw_payload) {
     afterContent = matchingAfterEvidence.raw_payload;
   } else if (input.artifactStore) {
     try {
       afterContent = input.artifactStore.readText(matchingAfterEvidence);
-    } catch {
+    } catch (error) {
+      // Preserve the canonical integrity diagnosis for tampered durable
+      // evidence.  The safe-read boundary deliberately rejects a changed
+      // hash/size before returning bytes; collapsing that result into
+      // "content missing" would hide the reason for a recovery fence and
+      // make callers lose the distinction between absence and corruption.
+      const message = error instanceof Error ? error.message : '';
+      if (/hash mismatch|byte size mismatch/i.test(message)) {
+        afterReadIntegrityFailure = 'workspace_snapshot_after hash mismatch';
+      }
       afterContent = null;
     }
   }
@@ -1332,7 +1342,7 @@ export function evaluateCanonicalSettlementDecision(
       dispositionReason: 'RECOVERY_FENCED',
       failureCode: 'INTEGRITY_MISMATCH',
       failureDetail: 'Workspace snapshot after evidence file content could not be retrieved',
-      contradictionReason: 'workspace_snapshot_after content missing',
+      contradictionReason: afterReadIntegrityFailure ?? 'workspace_snapshot_after content missing',
     };
   }
 
