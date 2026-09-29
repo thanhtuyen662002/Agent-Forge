@@ -78,7 +78,7 @@ describe('CredentialStore PowerShell security boundary', () => {
 
   it('returns typed bounded timeout, cancellation, output, and option errors', async () => {
     const never = new WindowsCredentialStore('win32', () => new Promise<string>(() => undefined));
-    await expect(never.get(REF, { timeoutMs: 10 })).rejects.toMatchObject<Partial<CredentialStoreError>>({
+    await expect(never.get(REF, { timeoutMs: 10 })).rejects.toMatchObject({
       code: 'TIMEOUT',
     });
 
@@ -86,13 +86,13 @@ describe('CredentialStore PowerShell security boundary', () => {
     const pending = new WindowsCredentialStore('win32', () => new Promise<string>((resolve) => setTimeout(() => resolve('late'), 100)));
     const cancelled = pending.get(REF, { signal: controller.signal, timeoutMs: 1_000 });
     controller.abort();
-    await expect(cancelled).rejects.toMatchObject<Partial<CredentialStoreError>>({ code: 'CANCELLED' });
+    await expect(cancelled).rejects.toMatchObject({ code: 'CANCELLED' });
 
     const noisy = new WindowsCredentialStore('win32', async () => 'x'.repeat(100));
-    await expect(noisy.get(REF, { maxOutputBytes: 10 })).rejects.toMatchObject<Partial<CredentialStoreError>>({
+    await expect(noisy.get(REF, { maxOutputBytes: 10 })).rejects.toMatchObject({
       code: 'OUTPUT_LIMIT_EXCEEDED',
     });
-    await expect(noisy.get(REF, { timeoutMs: 0 })).rejects.toMatchObject<Partial<CredentialStoreError>>({
+    await expect(noisy.get(REF, { timeoutMs: 0 })).rejects.toMatchObject({
       code: 'INVALID_OPERATION_OPTIONS',
     });
   });
@@ -120,7 +120,7 @@ describe('CredentialStore PowerShell security boundary', () => {
       return 'OK';
     });
 
-    await expect(store.exists(REF)).rejects.toMatchObject<Partial<CredentialStoreError>>({
+    await expect(store.exists(REF)).rejects.toMatchObject({
       code: 'UNSUPPORTED_PLATFORM',
     });
     expect(invoked).toBe(false);
