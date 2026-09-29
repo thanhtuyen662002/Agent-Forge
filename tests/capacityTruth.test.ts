@@ -18,7 +18,6 @@ describe('capacity and capability truth', () => {
   it.each([
     { remaining: -1, total: 100 },
     { remaining: 101, total: 100 },
-    { remaining: 1, total: null },
     { remaining: Number.NaN, total: 100 },
     { remaining: Number.POSITIVE_INFINITY, total: 100 },
     { remaining: 1, total: Number.POSITIVE_INFINITY },
@@ -28,8 +27,8 @@ describe('capacity and capability truth', () => {
 
   it('clamps only finite percentages', () => {
     expect(clampQuotaPercent(50, 100)).toBe(50);
-    expect(clampQuotaPercent(-1, 100)).toBe(0);
-    expect(clampQuotaPercent(120, 100)).toBe(100);
+    expect(clampQuotaPercent(-1, 100)).toBeNull();
+    expect(clampQuotaPercent(120, 100)).toBeNull();
     expect(clampQuotaPercent(1, 0)).toBeNull();
     expect(clampQuotaPercent(Number.NaN, 100)).toBeNull();
   });

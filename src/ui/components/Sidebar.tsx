@@ -1,6 +1,7 @@
 import React from 'react';
 import { useOrchestrator } from '../context/OrchestratorContext';
 import { useI18n } from '../context/I18nContext';
+import { deriveConnectivityState } from '../capacityTruth';
 import {
   LayoutDashboard,
   ArrowLeftRight,
@@ -16,8 +17,9 @@ import {
 } from 'lucide-react';
 
 export const Sidebar: React.FC = () => {
-  const { activeView, setActiveView, tasks, densityMode } = useOrchestrator();
+  const { activeView, setActiveView, tasks, densityMode, isElectron, loading } = useOrchestrator();
   const { t } = useI18n();
+  const connectivity = deriveConnectivityState({ isElectron, loading });
 
   const pendingBridgeTasks = tasks.filter(
     (t) => t.state === 'CODING' || t.state === 'REVIEW_READY' || t.state === 'PLANNED'
@@ -96,9 +98,31 @@ export const Sidebar: React.FC = () => {
       <div className="p-4 border-t border-surface-border bg-surface-card/40">
         <div className="flex items-center justify-between text-[11px] font-mono text-slate-400">
           <span>{t('sidebar.mode')}: <strong className="text-slate-200">{getModeLabel(densityMode)}</strong></span>
-          <span className="text-emerald-400 flex items-center space-x-1">
-            <span className="w-1.5 h-1.5 rounded-full bg-emerald-400"></span>
-            <span>{t('sidebar.online')}</span>
+          <span
+            className={`flex items-center space-x-1 ${
+              connectivity === 'ONLINE'
+                ? 'text-emerald-400'
+                : connectivity === 'CONNECTING'
+                ? 'text-amber-400'
+                : connectivity === 'ERROR'
+                ? 'text-rose-400'
+                : 'text-slate-400'
+            }`}
+            role="status"
+            aria-live="polite"
+          >
+            <span
+              className={`w-1.5 h-1.5 rounded-full ${
+                connectivity === 'ONLINE'
+                  ? 'bg-emerald-400'
+                  : connectivity === 'CONNECTING'
+                  ? 'bg-amber-400 animate-pulse'
+                  : connectivity === 'ERROR'
+                  ? 'bg-rose-400'
+                  : 'bg-slate-400'
+              }`}
+            ></span>
+            <span>{t(`sidebar.${connectivity === 'ONLINE' ? 'online' : connectivity === 'CONNECTING' ? 'connecting' : connectivity === 'ERROR' ? 'error' : 'browserPreview'}`)}</span>
           </span>
         </div>
         <div className="text-[10px] text-slate-500 mt-1 truncate">

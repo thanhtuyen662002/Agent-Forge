@@ -75,6 +75,9 @@ export const viVN: TranslationDictionary = {
     orchestration: 'Điều phối',
     mode: 'Chế độ',
     online: 'TRỰC TUYẾN',
+    connecting: 'ĐANG KẾT NỐI',
+    browserPreview: 'BẢN XEM TRƯỚC TRÌNH DUYỆT',
+    error: 'NGOẠI TUYẾN / LỖI',
     offlineTag: 'SQLite Ngoại tuyến • Ưu tiên Cục bộ',
   },
   dashboard: {
@@ -197,11 +200,16 @@ export const viVN: TranslationDictionary = {
     totalUnits: 'Tổng Đơn vị Phân bổ',
     cancel: 'Hủy',
     saveSnapshot: 'Lưu Ảnh chụp Hạn ngạch',
+    invalidNumber: 'Nhập số hữu hạn, không âm hoặc để trống giá trị.',
+    nonNegative: 'Giá trị hạn ngạch không được âm.',
+    remainingExceedsTotal: 'Hạn ngạch còn lại không thể lớn hơn tổng phân bổ.',
+    saveError: 'Không thể lưu ảnh chụp hạn ngạch. Hãy kiểm tra kết nối desktop và thử lại.',
   },
   quota: {
     unknown: 'HẠN NGẠCH CHƯA RÕ',
     manual: 'THỦ CÔNG',
     measured: 'ĐÃ ĐO LƯỜNG',
+    providerReported: 'NHÀ CUNG CẤP BÁO CÁO',
     estimated: 'ƯỚC TÍNH',
   },
   timeline: {

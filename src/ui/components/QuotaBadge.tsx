@@ -1,6 +1,7 @@
 import React from 'react';
 import { QuotaSource } from '../../core/types/domain';
 import { useI18n } from '../context/I18nContext';
+import { clampQuotaPercent, quotaSourceLabel, validateQuotaSnapshot } from '../capacityTruth';
 
 interface QuotaBadgeProps {
   remaining: number | null;
@@ -18,8 +19,9 @@ export const QuotaBadge: React.FC<QuotaBadgeProps> = ({
   confidence = 1.0,
 }) => {
   const { t } = useI18n();
+  const validation = validateQuotaSnapshot({ remaining, total });
 
-  if (remaining === null || source === 'UNKNOWN') {
+  if (!validation.valid || remaining === null || source === 'UNKNOWN') {
     return (
       <div className="inline-flex items-center space-x-1.5 px-2 py-0.5 rounded bg-slate-800 border border-slate-700 text-[11px] font-mono text-slate-400">
         <span className="w-1.5 h-1.5 rounded-full bg-slate-500"></span>
@@ -28,7 +30,7 @@ export const QuotaBadge: React.FC<QuotaBadgeProps> = ({
     );
   }
 
-  const percent = total && total > 0 ? Math.round((remaining / total) * 100) : null;
+  const percent = clampQuotaPercent(remaining, total);
 
   let colorClass = 'bg-emerald-500/15 text-emerald-400 border-emerald-500/30';
   let dotClass = 'bg-emerald-400';
@@ -43,19 +45,14 @@ export const QuotaBadge: React.FC<QuotaBadgeProps> = ({
     }
   }
 
-  const sourceLabel =
-    source === 'MANUAL'
-      ? t('quota.manual')
-      : source === 'MEASURED'
-      ? t('quota.measured')
-      : t('quota.estimated');
+  const sourceLabel = t(`quota.${quotaSourceLabel(source)}`);
 
   return (
     <div className={`inline-flex items-center space-x-2 px-2.5 py-1 rounded-md border text-xs font-mono font-medium ${colorClass}`}>
       <span className={`w-1.5 h-1.5 rounded-full ${dotClass}`}></span>
       <span>
-        {remaining}
-        {total ? `/${total}` : ''} {unit}
+        {remaining ?? t('common.unknown')}
+        {total !== null ? `/${total}` : ''} {unit}
         {percent !== null ? ` (${percent}%)` : ''}
       </span>
       <span className="text-[9px] uppercase px-1 py-0.2 rounded bg-surface/50 border border-surface-border text-slate-400">
