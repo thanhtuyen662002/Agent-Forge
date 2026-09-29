@@ -1,6 +1,7 @@
 import crypto from 'crypto';
 import fs from 'fs';
 import path from 'path';
+import { ArtifactIntegrityError, assertPathContained } from '../services/ArtifactStore';
 import { redactTrialEvidenceText } from './trialEvidence';
 import { sanitizeAutonomyText } from './contracts';
 
@@ -65,6 +66,434 @@ interface BoundedLimits {
   maxFiles: number;
   maxBytesPerFile: number;
   maxTotalBytes: number;
+}
+
+/**
+ * A root anchor kept open for the complete trial filesystem operation.  Linux
+ * uses descriptor-relative `/proc/self/fd` paths plus O_NOFOLLOW.  Windows
+ * does not expose an equivalent portable Node API, so it uses identity fences
+ * and fails closed whenever an observed root/parent identity changes.
+ */
+export interface TrialFilesystemRoot {
+  readonly baseDir: string;
+  readonly rootIdentity: TrialPathIdentity;
+  readonly descriptor: number | null;
+  readonly descriptorPath: string | null;
+}
+
+interface TrialPathIdentity {
+  readonly key: string;
+  readonly realPath: string;
+}
+
+interface TrialParentSnapshot {
+  readonly path: string;
+  readonly identity: TrialPathIdentity;
+}
+
+const TRIAL_POSIX_DESCRIPTOR_ANCHOR =
+  process.platform === 'linux' &&
+  typeof fs.constants.O_DIRECTORY === 'number' &&
+  typeof fs.constants.O_NOFOLLOW === 'number' &&
+  fs.existsSync('/proc/self/fd');
+
+function trialErrnoCode(error: unknown): string | undefined {
+  return error && typeof error === 'object' && 'code' in error && typeof (error as { code?: unknown }).code === 'string'
+    ? String((error as { code: string }).code)
+    : undefined;
+}
+
+function trialIdentityKey(stat: fs.Stats): string {
+  const device = process.platform === 'win32' ? 'win32' : String(stat.dev);
+  return `${device}:${String(stat.ino)}:${String(stat.mode & 0o170000)}`;
+}
+
+function trialRealPath(target: string): string {
+  try {
+    const realpath = fs.realpathSync.native ?? fs.realpathSync;
+    return realpath(target);
+  } catch {
+    throw new ArtifactIntegrityError('ARTIFACT_PATH_UNVERIFIED', 'trial path real path could not be resolved', target);
+  }
+}
+
+function trialSameIdentity(left: TrialPathIdentity, right: TrialPathIdentity): boolean {
+  const normalize = (value: string) => process.platform === 'win32' ? value.toLowerCase() : value;
+  return left.key === right.key && normalize(left.realPath) === normalize(right.realPath);
+}
+
+function trialContained(root: string, target: string): boolean {
+  const normalize = (value: string) => process.platform === 'win32' ? value.toLowerCase() : value;
+  const relative = path.relative(normalize(root), normalize(target));
+  return relative !== '' && !relative.startsWith('..') && !path.isAbsolute(relative);
+}
+
+function trialCaptureIdentity(target: string, code: 'ARTIFACT_ROOT_INVALID' | 'ARTIFACT_ROOT_CHANGED' | 'ARTIFACT_PARENT_CHANGED' | 'ARTIFACT_PATH_UNVERIFIED' = 'ARTIFACT_PATH_UNVERIFIED'): TrialPathIdentity {
+  let stat: fs.Stats;
+  try {
+    stat = fs.lstatSync(target);
+  } catch (error) {
+    throw new ArtifactIntegrityError(code, `trial path cannot be inspected (${trialErrnoCode(error) ?? 'IO_ERROR'})`, target);
+  }
+  if (stat.isSymbolicLink()) {
+    throw new ArtifactIntegrityError('ARTIFACT_REPARSE_POINT', 'trial path contains a symbolic link or junction', target);
+  }
+  return { key: trialIdentityKey(stat), realPath: trialRealPath(target) };
+}
+
+function trialOpenRoot(rootDir: string): TrialFilesystemRoot {
+  if (typeof rootDir !== 'string' || rootDir.length === 0) {
+    throw new ArtifactIntegrityError('ARTIFACT_ROOT_INVALID', 'trial root must be a non-empty path', rootDir);
+  }
+  const baseDir = path.resolve(rootDir);
+  let stat: fs.Stats;
+  try {
+    stat = fs.lstatSync(baseDir);
+  } catch (error) {
+    throw new ArtifactIntegrityError('ARTIFACT_ROOT_INVALID', `trial root cannot be inspected (${trialErrnoCode(error) ?? 'IO_ERROR'})`, baseDir);
+  }
+  if (!stat.isDirectory() || stat.isSymbolicLink()) {
+    throw new ArtifactIntegrityError('ARTIFACT_REPARSE_POINT', 'trial root must be a real directory', baseDir);
+  }
+  const rootIdentity = { key: trialIdentityKey(stat), realPath: trialRealPath(baseDir) };
+  let descriptor: number | null = null;
+  let descriptorPath: string | null = null;
+  if (TRIAL_POSIX_DESCRIPTOR_ANCHOR) {
+    try {
+      descriptor = fs.openSync(baseDir, fs.constants.O_RDONLY | fs.constants.O_DIRECTORY | fs.constants.O_NOFOLLOW);
+      descriptorPath = `/proc/self/fd/${descriptor}`;
+      if (trialIdentityKey(fs.fstatSync(descriptor)) !== rootIdentity.key) {
+        throw new ArtifactIntegrityError('ARTIFACT_ROOT_CHANGED', 'trial root changed while opening its descriptor', baseDir);
+      }
+    } catch (error) {
+      if (descriptor !== null) {
+        try { fs.closeSync(descriptor); } catch { /* preserve integrity failure */ }
+      }
+      descriptor = null;
+      descriptorPath = null;
+      if (error instanceof ArtifactIntegrityError) throw error;
+      throw new ArtifactIntegrityError('ARTIFACT_NOFOLLOW_UNAVAILABLE', 'descriptor-relative trial access is unavailable', baseDir);
+    }
+  } else if (process.platform !== 'win32' && typeof fs.constants.O_NOFOLLOW !== 'number') {
+    throw new ArtifactIntegrityError('ARTIFACT_NOFOLLOW_UNAVAILABLE', 'the platform cannot guarantee no-follow trial access', baseDir);
+  }
+  return { baseDir, rootIdentity, descriptor, descriptorPath };
+}
+
+export function openTrialFilesystemRoot(rootDir: string, create = false): TrialFilesystemRoot {
+  if (create) {
+    try { fs.mkdirSync(path.resolve(rootDir), { recursive: true }); } catch (error) {
+      throw new ArtifactIntegrityError('ARTIFACT_ROOT_INVALID', `trial root cannot be created (${trialErrnoCode(error) ?? 'IO_ERROR'})`, rootDir);
+    }
+  }
+  return trialOpenRoot(rootDir);
+}
+
+export function closeTrialFilesystemRoot(root: TrialFilesystemRoot): void {
+  if (root.descriptor !== null) {
+    try { fs.closeSync(root.descriptor); } catch { /* best effort */ }
+  }
+}
+
+function trialRelativeSegments(root: TrialFilesystemRoot, target: string): string[] {
+  const absolute = path.resolve(target);
+  try { assertPathContained(absolute, root.baseDir); } catch (error) {
+    throw new ArtifactIntegrityError('ARTIFACT_PATH_UNVERIFIED', error instanceof Error ? error.message : 'trial path escapes root', target);
+  }
+  const relative = path.relative(root.baseDir, absolute);
+  if (!relative || relative.startsWith('..') || path.isAbsolute(relative)) {
+    throw new ArtifactIntegrityError('ARTIFACT_PATH_UNVERIFIED', 'trial path is not a non-empty root child', target);
+  }
+  return relative.split(/[\\/]+/).filter(Boolean);
+}
+
+function trialCaptureParents(root: TrialFilesystemRoot, target: string): TrialParentSnapshot[] {
+  const segments = trialRelativeSegments(root, target);
+  const snapshots: TrialParentSnapshot[] = [];
+  let current = root.baseDir;
+  snapshots.push({ path: current, identity: root.rootIdentity });
+  for (let index = 0; index < segments.length - 1; index += 1) {
+    current = path.join(current, segments[index]);
+    let stat: fs.Stats;
+    try { stat = fs.lstatSync(current); } catch (error) {
+      throw new ArtifactIntegrityError('ARTIFACT_PARENT_MISSING', `trial parent cannot be inspected (${trialErrnoCode(error) ?? 'IO_ERROR'})`, current);
+    }
+    if (!stat.isDirectory() || stat.isSymbolicLink()) {
+      throw new ArtifactIntegrityError('ARTIFACT_REPARSE_POINT', 'trial parent is not a real directory', current);
+    }
+    const identity = { key: trialIdentityKey(stat), realPath: trialRealPath(current) };
+    if (!trialContained(root.rootIdentity.realPath, identity.realPath)) {
+      throw new ArtifactIntegrityError('ARTIFACT_REPARSE_POINT', 'trial parent resolves outside the configured root', current);
+    }
+    snapshots.push({ path: current, identity });
+  }
+  return snapshots;
+}
+
+function trialVerifyParents(root: TrialFilesystemRoot, snapshots: readonly TrialParentSnapshot[]): void {
+  const currentRoot = trialCaptureIdentity(root.baseDir, 'ARTIFACT_ROOT_CHANGED');
+  if (!trialSameIdentity(currentRoot, root.rootIdentity)) {
+    throw new ArtifactIntegrityError('ARTIFACT_ROOT_CHANGED', 'trial root identity changed during the operation', root.baseDir);
+  }
+  for (const snapshot of snapshots) {
+    const current = trialCaptureIdentity(snapshot.path, 'ARTIFACT_PARENT_CHANGED');
+    if (!trialSameIdentity(current, snapshot.identity)) {
+      throw new ArtifactIntegrityError('ARTIFACT_PARENT_CHANGED', 'trial parent identity changed during the operation', snapshot.path);
+    }
+  }
+}
+
+interface TrialDirectoryHandle {
+  readonly path: string;
+  readonly descriptor: number | null;
+  readonly snapshots: readonly TrialParentSnapshot[];
+}
+
+function trialOpenDirectory(root: TrialFilesystemRoot, directory: string, createMissing: boolean): TrialDirectoryHandle {
+  const absolute = path.resolve(directory);
+  if (absolute === path.resolve(root.baseDir)) {
+    return {
+      path: root.descriptorPath ?? root.baseDir,
+      descriptor: null,
+      snapshots: [{ path: root.baseDir, identity: root.rootIdentity }],
+    };
+  }
+  const segments = trialRelativeSegments(root, absolute);
+  if (!root.descriptorPath || root.descriptor === null) {
+    if (createMissing) {
+      let current = root.baseDir;
+      for (const segment of segments) {
+        current = path.join(current, segment);
+        try { fs.mkdirSync(current); } catch (error) {
+          if (trialErrnoCode(error) !== 'EEXIST') throw error;
+        }
+      }
+    }
+    const parentSnapshots = [
+      ...trialCaptureParents(root, absolute),
+      { path: absolute, identity: trialCaptureIdentity(absolute, 'ARTIFACT_PARENT_CHANGED') },
+    ];
+    const identity = trialCaptureIdentity(absolute, 'ARTIFACT_PARENT_CHANGED');
+    if (!trialContained(root.rootIdentity.realPath, identity.realPath)) {
+      throw new ArtifactIntegrityError('ARTIFACT_REPARSE_POINT', 'trial directory resolves outside the configured root', absolute);
+    }
+    return { path: absolute, descriptor: null, snapshots: parentSnapshots };
+  }
+
+  let currentFd = root.descriptor;
+  let currentPath = root.descriptorPath;
+  for (const segment of segments) {
+    const candidate = path.posix.join(currentPath, segment);
+    const previousFd = currentFd;
+    try {
+      currentFd = fs.openSync(candidate, fs.constants.O_RDONLY | fs.constants.O_DIRECTORY | fs.constants.O_NOFOLLOW);
+    } catch (error) {
+      if (createMissing && trialErrnoCode(error) === 'ENOENT') {
+        try { fs.mkdirSync(candidate); } catch (mkdirError) {
+          if (trialErrnoCode(mkdirError) !== 'EEXIST') throw mkdirError;
+        }
+        currentFd = fs.openSync(candidate, fs.constants.O_RDONLY | fs.constants.O_DIRECTORY | fs.constants.O_NOFOLLOW);
+      } else if (trialErrnoCode(error) === 'ELOOP') {
+        throw new ArtifactIntegrityError('ARTIFACT_REPARSE_POINT', 'trial directory became a symbolic link or junction', absolute);
+      } else {
+        throw new ArtifactIntegrityError('ARTIFACT_PARENT_CHANGED', 'trial directory could not be opened safely', absolute);
+      }
+    }
+    if (previousFd !== root.descriptor && previousFd !== currentFd) {
+      try { fs.closeSync(previousFd); } catch { /* preserve the newly opened directory */ }
+    }
+    if (currentFd !== root.descriptor) {
+      currentPath = `/proc/self/fd/${currentFd}`;
+    }
+  }
+  const parentSnapshots = [
+    ...trialCaptureParents(root, absolute),
+    { path: absolute, identity: trialCaptureIdentity(absolute, 'ARTIFACT_PARENT_CHANGED') },
+  ];
+  return { path: currentPath, descriptor: currentFd === root.descriptor ? null : currentFd, snapshots: parentSnapshots };
+}
+
+function trialCloseDirectory(handle: TrialDirectoryHandle): void {
+  if (handle.descriptor !== null) {
+    try { fs.closeSync(handle.descriptor); } catch { /* preserve operation result */ }
+  }
+}
+
+function trialBufferToUtf8(buffer: Buffer, field: string): string {
+  try { return new TextDecoder('utf-8', { fatal: true }).decode(buffer); } catch {
+    fail(`${field} is not valid UTF-8`);
+  }
+}
+
+export function readTrialFileBounded(root: TrialFilesystemRoot, filePath: string, maximumBytes: number, field: string): { bytes: Buffer; text: string; byteSize: number } {
+  if (!Number.isSafeInteger(maximumBytes) || maximumBytes < 1) fail(`${field} has an invalid byte limit`);
+  const absolute = path.resolve(filePath);
+  const parent = path.dirname(absolute);
+  const snapshots = trialCaptureParents(root, absolute);
+  const handle = trialOpenDirectory(root, parent, false);
+  let fd: number | undefined;
+  try {
+    const leaf = root.descriptorPath && handle.path.startsWith('/proc/self/fd/')
+      ? path.posix.join(handle.path, path.basename(absolute))
+      : absolute;
+    const stat = fs.lstatSync(leaf);
+    if (stat.isSymbolicLink() || !stat.isFile()) {
+      throw new ArtifactIntegrityError('ARTIFACT_REPARSE_POINT', `${field} is not a regular file`, absolute);
+    }
+    if (stat.size > maximumBytes) fail(`${field} exceeds the configured byte limit`);
+    const noFollow = typeof fs.constants.O_NOFOLLOW === 'number' ? fs.constants.O_NOFOLLOW : 0;
+    fd = fs.openSync(leaf, fs.constants.O_RDONLY | noFollow);
+    const opened = fs.fstatSync(fd);
+    if (trialIdentityKey(opened) !== trialIdentityKey(stat)) {
+      throw new ArtifactIntegrityError('ARTIFACT_PATH_UNVERIFIED', `${field} identity changed before opening`, absolute);
+    }
+    const chunks: Buffer[] = [];
+    let total = 0;
+    const chunkSize = Math.min(64 * 1024, maximumBytes + 1);
+    while (total <= maximumBytes) {
+      const buffer = Buffer.allocUnsafe(Math.min(chunkSize, maximumBytes + 1 - total));
+      const count = fs.readSync(fd, buffer, 0, buffer.length, null);
+      if (count === 0) break;
+      chunks.push(buffer.subarray(0, count));
+      total += count;
+      if (total > maximumBytes) fail(`${field} exceeds the configured byte limit`);
+    }
+    const bytes = Buffer.concat(chunks, total);
+    trialVerifyParents(root, snapshots);
+    return { bytes, text: trialBufferToUtf8(bytes, field), byteSize: total };
+  } catch (error: unknown) {
+    if (error instanceof ArtifactIntegrityError || (error instanceof Error && error.message.startsWith('TRIAL_LOG_COLLECTION_INVALID:'))) throw error;
+    if (trialErrnoCode(error) === 'ENOENT') throw new ArtifactIntegrityError('ARTIFACT_PATH_UNVERIFIED', `${field} is missing`, absolute);
+    throw new ArtifactIntegrityError('ARTIFACT_PATH_UNVERIFIED', `${field} could not be read safely`, absolute);
+  } finally {
+    if (fd !== undefined) {
+      try { fs.closeSync(fd); } catch { /* preserve read result */ }
+    }
+    trialCloseDirectory(handle);
+  }
+}
+
+function trialWriteAll(fd: number, payload: Buffer): void {
+  let offset = 0;
+  while (offset < payload.length) {
+    const written = fs.writeSync(fd, payload, offset, payload.length - offset);
+    if (written <= 0) throw new Error('WRITE_NO_PROGRESS');
+    offset += written;
+  }
+}
+
+function trialSafeUnlink(root: TrialFilesystemRoot, target: string, expectedKey?: string): void {
+  const absolute = path.resolve(target);
+  const parent = path.dirname(absolute);
+  const handle = trialOpenDirectory(root, parent, false);
+  try {
+    const leaf = root.descriptorPath && handle.path.startsWith('/proc/self/fd/')
+      ? path.posix.join(handle.path, path.basename(absolute))
+      : absolute;
+    let stat: fs.Stats;
+    try { stat = fs.lstatSync(leaf); } catch (error) {
+      if (trialErrnoCode(error) === 'ENOENT') return;
+      throw error;
+    }
+    if (stat.isSymbolicLink() || !stat.isFile() || (expectedKey && trialIdentityKey(stat) !== expectedKey)) {
+      throw new ArtifactIntegrityError('ARTIFACT_PATH_UNVERIFIED', 'temporary trial file identity changed before cleanup', absolute);
+    }
+    fs.unlinkSync(leaf);
+    trialVerifyParents(root, handle.snapshots);
+  } finally {
+    trialCloseDirectory(handle);
+  }
+}
+
+export function ensureTrialDirectory(root: TrialFilesystemRoot, directory: string): void {
+  const handle = trialOpenDirectory(root, path.resolve(directory), true);
+  try { trialVerifyParents(root, handle.snapshots); } finally { trialCloseDirectory(handle); }
+}
+
+export function writeTrialFileAtomic(root: TrialFilesystemRoot, outputPath: string, payload: Buffer, maximumBytes: number, field: string): void {
+  if (payload.byteLength > maximumBytes) fail(`${field} exceeds the configured byte limit`);
+  const absolute = path.resolve(outputPath);
+  const parent = path.dirname(absolute);
+  ensureTrialDirectory(root, parent);
+  const before = (() => {
+    try { return readTrialFileBounded(root, absolute, maximumBytes, field); } catch (error) {
+      if (error instanceof ArtifactIntegrityError && /missing/i.test(error.message)) return undefined;
+      if (error instanceof ArtifactIntegrityError && error.code === 'ARTIFACT_PATH_UNVERIFIED' && /missing/i.test(error.message)) return undefined;
+      throw error;
+    }
+  })();
+  if (before) {
+    if (!before.bytes.equals(payload)) fail(`${field} already exists with a different digest`);
+    return;
+  }
+
+  const temporaryPath = `${absolute}.tmp-${crypto.randomUUID()}`;
+  const handle = trialOpenDirectory(root, parent, false);
+  let fd: number | undefined;
+  let temporaryKey: string | undefined;
+  try {
+    const leaf = root.descriptorPath && handle.path.startsWith('/proc/self/fd/')
+      ? path.posix.join(handle.path, path.basename(temporaryPath))
+      : temporaryPath;
+    const noFollow = typeof fs.constants.O_NOFOLLOW === 'number' ? fs.constants.O_NOFOLLOW : 0;
+    fd = fs.openSync(leaf, fs.constants.O_WRONLY | fs.constants.O_CREAT | fs.constants.O_EXCL | noFollow, 0o600);
+    temporaryKey = trialIdentityKey(fs.fstatSync(fd));
+    trialWriteAll(fd, payload);
+    fs.fsyncSync(fd);
+  } catch (error: unknown) {
+    if (fd !== undefined) {
+      try { fs.closeSync(fd); } catch { /* preserve original failure */ }
+      fd = undefined;
+    }
+    try { if (temporaryKey) trialSafeUnlink(root, temporaryPath, temporaryKey); } catch { /* preserve original failure */ }
+    if (error instanceof ArtifactIntegrityError) throw error;
+    throw new ArtifactIntegrityError('ARTIFACT_ATOMIC_PUBLISH_UNAVAILABLE', `${field} temporary file could not be created safely`, temporaryPath);
+  } finally {
+    if (fd !== undefined) {
+      try { fs.closeSync(fd); } catch { /* preserve write result */ }
+    }
+  }
+
+  try {
+    const temporaryLeaf = root.descriptorPath && handle.path.startsWith('/proc/self/fd/')
+      ? path.posix.join(handle.path, path.basename(temporaryPath))
+      : temporaryPath;
+    const finalLeaf = root.descriptorPath && handle.path.startsWith('/proc/self/fd/')
+      ? path.posix.join(handle.path, path.basename(absolute))
+      : absolute;
+    try {
+      fs.linkSync(temporaryLeaf, finalLeaf);
+    } catch (error: unknown) {
+      if (trialErrnoCode(error) !== 'EEXIST') {
+        const code = trialErrnoCode(error);
+        if (code === 'ENOSYS' || code === 'EOPNOTSUPP' || code === 'EXDEV' || code === 'EPERM') {
+          throw new ArtifactIntegrityError('ARTIFACT_ATOMIC_PUBLISH_UNAVAILABLE', `${field} atomic no-replace publication is unavailable`, absolute);
+        }
+        throw error;
+      }
+      const existing = readTrialFileBounded(root, absolute, maximumBytes, field);
+      if (!existing.bytes.equals(payload)) fail(`${field} already exists with a different digest`);
+      trialSafeUnlink(root, temporaryPath, temporaryKey);
+      return;
+    }
+    if (handle.descriptor !== null) {
+      try { fs.fsyncSync(handle.descriptor); } catch {
+        throw new ArtifactIntegrityError('ARTIFACT_ATOMIC_PUBLISH_UNAVAILABLE', `${field} directory metadata could not be synchronized`, absolute);
+      }
+    }
+    trialSafeUnlink(root, temporaryPath, temporaryKey);
+    trialVerifyParents(root, handle.snapshots);
+    const written = readTrialFileBounded(root, absolute, maximumBytes, field);
+    if (!written.bytes.equals(payload)) {
+      throw new ArtifactIntegrityError('ARTIFACT_PATH_UNVERIFIED', `${field} changed after atomic publication`, absolute);
+    }
+  } catch (error: unknown) {
+    try { trialSafeUnlink(root, temporaryPath, temporaryKey); } catch { /* preserve original integrity failure */ }
+    if (error instanceof ArtifactIntegrityError || (error instanceof Error && error.message.startsWith('TRIAL_LOG_COLLECTION_INVALID:'))) throw error;
+    throw new ArtifactIntegrityError('ARTIFACT_ATOMIC_PUBLISH_UNAVAILABLE', `${field} atomic publication failed`, absolute);
+  } finally {
+    trialCloseDirectory(handle);
+  }
 }
 
 function fail(message: string): never {
@@ -135,130 +564,85 @@ function validateLimits(options: CollectRedactedTrialLogsOptions): BoundedLimits
   return { maxFiles, maxBytesPerFile, maxTotalBytes };
 }
 
-function ensureRootDirectory(rootDir: string): string {
-  if (typeof rootDir !== 'string' || rootDir.length === 0) fail('rootDir must be a non-empty path');
-  const absoluteRoot = path.resolve(rootDir);
-  let rootStat: fs.Stats;
-  try {
-    rootStat = fs.lstatSync(absoluteRoot);
-  } catch {
-    fail('rootDir must already exist');
+function ensureOutputPath(root: TrialFilesystemRoot, relativePath: string): string {
+  const outputPath = path.resolve(root.baseDir, relativePath);
+  try { assertPathContained(outputPath, root.baseDir); } catch {
+    fail('output path escapes runtime root');
   }
-  if (rootStat.isSymbolicLink()) fail('rootDir may not be a symbolic link or junction');
-  if (!rootStat.isDirectory()) fail('rootDir must be a directory');
-  return fs.realpathSync(absoluteRoot);
-}
-
-/**
- * Checks lexical and real path containment, rejecting every existing symlink
- * component. Missing components are accepted only for output parents.
- */
-function ensurePathBelowRoot(root: string, target: string, allowMissing: boolean, field: string): string {
-  const absoluteTarget = path.resolve(target);
-  if (!isContained(root, absoluteTarget)) fail(`${field} escapes runtime root`);
-  const relative = path.relative(root, absoluteTarget);
-  let current = root;
-  const segments = relative.split(path.sep).filter(Boolean);
-  for (let index = 0; index < segments.length; index += 1) {
-    current = path.join(current, segments[index]);
-    let stat: fs.Stats;
-    try {
-      stat = fs.lstatSync(current);
-    } catch (error: unknown) {
-      if (allowMissing && (error as NodeJS.ErrnoException).code === 'ENOENT') continue;
-      fail(`${field} cannot be inspected`);
-    }
-    if (stat.isSymbolicLink()) fail(`${field} contains a symbolic link or junction`);
-    if (index < segments.length - 1 && !stat.isDirectory()) fail(`${field} has a non-directory parent`);
-    if (index === segments.length - 1 && !allowMissing && !stat.isFile() && !stat.isDirectory()) {
-      fail(`${field} is not a regular file or directory`);
-    }
-  }
-  if (fs.existsSync(absoluteTarget)) {
-    let realTarget: string;
-    try {
-      realTarget = fs.realpathSync(absoluteTarget);
-    } catch {
-      fail(`${field} real path cannot be verified`);
-    }
-    if (!isContained(root, realTarget)) fail(`${field} resolves outside runtime root`);
-  }
-  return absoluteTarget;
-}
-
-function ensureOutputPath(root: string, relativePath: string): string {
-  const outputPath = ensurePathBelowRoot(root, path.join(root, relativePath), true, 'output path');
   if (fs.existsSync(outputPath)) {
     const stat = fs.lstatSync(outputPath);
     if (stat.isSymbolicLink()) fail('output path is a symbolic link or junction');
     if (!stat.isFile()) fail('output path must be a regular file');
   }
-  let parent = path.dirname(outputPath);
-  if (parent !== root && !isContained(root, parent)) fail('output parent escapes runtime root');
-  while (parent !== root) {
-    if (fs.existsSync(parent)) {
-      const stat = fs.lstatSync(parent);
-      if (stat.isSymbolicLink()) fail('output parent contains a symbolic link or junction');
-      if (!stat.isDirectory()) fail('output parent is not a directory');
-    }
-    parent = path.dirname(parent);
-  }
   return outputPath;
 }
 
-function readBoundedUtf8(filePath: string, maximumBytes: number, field: string): { text: string; byteSize: number } {
-  let fd: number | undefined;
+function secureDirectoryEntries(root: TrialFilesystemRoot, directory: string, field: string): fs.Dirent[] {
+  const handle = trialOpenDirectory(root, directory, false);
   try {
-    fd = fs.openSync(filePath, 'r');
-    const chunks: Buffer[] = [];
-    let total = 0;
-    const chunkSize = Math.min(64 * 1024, maximumBytes + 1);
-    while (total <= maximumBytes) {
-      const buffer = Buffer.allocUnsafe(Math.min(chunkSize, maximumBytes + 1 - total));
-      const count = fs.readSync(fd, buffer, 0, buffer.length, null);
-      if (count === 0) break;
-      chunks.push(buffer.subarray(0, count));
-      total += count;
-      if (total > maximumBytes) fail(`${field} exceeds the configured byte limit`);
-    }
-    const content = Buffer.concat(chunks, total).toString('utf8');
-    return { text: content, byteSize: total };
+    const entries = fs.readdirSync(handle.path, { withFileTypes: true });
+    trialVerifyParents(root, handle.snapshots);
+    return entries.sort((left, right) => left.name.localeCompare(right.name));
   } catch (error: unknown) {
-    if (error instanceof Error && error.message.startsWith('TRIAL_LOG_COLLECTION_INVALID:')) throw error;
-    return fail(`${field} could not be read`);
+    if (error instanceof ArtifactIntegrityError) throw error;
+    throw new ArtifactIntegrityError('ARTIFACT_PATH_UNVERIFIED', field + ' could not be enumerated safely', directory);
   } finally {
-    if (fd !== undefined) {
-      try { fs.closeSync(fd); } catch { /* preserve read failure */ }
-    }
+    trialCloseDirectory(handle);
   }
 }
 
-function enumerateFiles(root: string, relativePath: string, outputPath: string, limits: BoundedLimits, files: string[]): void {
-  const absolutePath = ensurePathBelowRoot(root, path.join(root, relativePath), false, `input path ${relativePath}`);
-  const stat = fs.lstatSync(absolutePath);
-  if (stat.isSymbolicLink()) fail(`input path ${relativePath} is a symbolic link or junction`);
-  if (stat.isFile()) {
+function securePathType(root: TrialFilesystemRoot, target: string, field: string): 'file' | 'directory' {
+  const absolute = path.resolve(target);
+  const parent = path.dirname(absolute);
+  const snapshots = trialCaptureParents(root, absolute);
+  const handle = trialOpenDirectory(root, parent, false);
+  try {
+    const leaf = root.descriptorPath && handle.path.startsWith('/proc/self/fd/')
+      ? path.posix.join(handle.path, path.basename(absolute))
+      : absolute;
+    const stat = fs.lstatSync(leaf);
+    if (stat.isSymbolicLink()) fail(field + ' is a symbolic link or junction');
+    if (stat.isFile()) {
+      trialVerifyParents(root, snapshots);
+      return 'file';
+    }
+    if (stat.isDirectory()) {
+      trialVerifyParents(root, snapshots);
+      return 'directory';
+    }
+    fail(field + ' is not a regular file or directory');
+  } catch (error: unknown) {
+    if (error instanceof ArtifactIntegrityError || (error instanceof Error && error.message.startsWith('TRIAL_LOG_COLLECTION_INVALID:'))) throw error;
+    throw new ArtifactIntegrityError('ARTIFACT_PATH_UNVERIFIED', field + ' cannot be inspected safely', absolute);
+  } finally {
+    trialCloseDirectory(handle);
+  }
+}
+
+function enumerateFiles(root: TrialFilesystemRoot, relativePath: string, outputPath: string, limits: BoundedLimits, files: string[]): void {
+  const absolutePath = path.join(root.baseDir, relativePath);
+  const kind = securePathType(root, absolutePath, 'input path ' + relativePath);
+  if (kind === 'file') {
     if (path.resolve(absolutePath) === path.resolve(outputPath)) fail('output path cannot also be an input log');
     files.push(relativePath);
-    if (files.length > limits.maxFiles) fail(`input contains more than ${limits.maxFiles} files`);
+    if (files.length > limits.maxFiles) fail('input contains more than ' + limits.maxFiles + ' files');
     return;
   }
-  if (!stat.isDirectory()) fail(`input path ${relativePath} is not a regular file or directory`);
   if (isContained(absolutePath, outputPath)) fail('output path cannot be inside an input directory');
-  const entries = fs.readdirSync(absolutePath, { withFileTypes: true }).sort((left, right) => left.name.localeCompare(right.name));
+  const entries = secureDirectoryEntries(root, absolutePath, 'input path ' + relativePath);
   for (const entry of entries) {
-    const childRelative = `${relativePath}/${entry.name}`;
-    const childAbsolute = path.join(root, childRelative);
-    if (entry.isSymbolicLink()) fail(`input path ${childRelative} is a symbolic link or junction`);
+    const childRelative = relativePath + '/' + entry.name;
+    const childAbsolute = path.join(root.baseDir, childRelative);
+    if (entry.isSymbolicLink()) fail('input path ' + childRelative + ' is a symbolic link or junction');
     if (entry.isDirectory()) {
       enumerateFiles(root, childRelative, outputPath, limits, files);
     } else if (entry.isFile()) {
-      ensurePathBelowRoot(root, childAbsolute, false, `input path ${childRelative}`);
+      securePathType(root, childAbsolute, 'input path ' + childRelative);
       if (path.resolve(childAbsolute) === path.resolve(outputPath)) fail('output path cannot also be an input log');
       files.push(childRelative);
-      if (files.length > limits.maxFiles) fail(`input contains more than ${limits.maxFiles} files`);
+      if (files.length > limits.maxFiles) fail('input contains more than ' + limits.maxFiles + ' files');
     } else {
-      fail(`input path ${childRelative} is not a regular file`);
+      fail('input path ' + childRelative + ' is not a regular file');
     }
   }
 }
@@ -283,49 +667,6 @@ function hashBytes(value: string | Buffer): string {
   return crypto.createHash('sha256').update(value).digest('hex');
 }
 
-function writeAtomic(outputPath: string, payload: Buffer, expectedSha256: string, root: string): void {
-  ensurePathBelowRoot(root, outputPath, true, 'output path');
-  const parent = path.dirname(outputPath);
-  fs.mkdirSync(parent, { recursive: true });
-  ensurePathBelowRoot(root, outputPath, true, 'output path');
-  if (fs.existsSync(outputPath)) {
-    if (fs.lstatSync(outputPath).isSymbolicLink()) fail('output path is a symbolic link or junction');
-    const existing = readBoundedUtf8(outputPath, REDACTED_LOG_MAX_OUTPUT_BYTES, 'existing output');
-    if (hashBytes(Buffer.from(existing.text, 'utf8')) !== expectedSha256 || existing.byteSize !== payload.byteLength || existing.text !== payload.toString('utf8')) {
-      fail('output path already exists with a different digest');
-    }
-    return;
-  }
-  const temporaryPath = `${outputPath}.tmp-${crypto.randomUUID()}`;
-  ensurePathBelowRoot(root, temporaryPath, true, 'temporary output path');
-  let fd: number | undefined;
-  try {
-    fd = fs.openSync(temporaryPath, 'wx');
-    let offset = 0;
-    while (offset < payload.length) {
-      offset += fs.writeSync(fd, payload, offset, payload.length - offset);
-    }
-    fs.fsyncSync(fd);
-  } catch (error: unknown) {
-    try { if (fs.existsSync(temporaryPath)) fs.unlinkSync(temporaryPath); } catch { /* preserve original failure */ }
-    throw new Error(`TRIAL_LOG_COLLECTION_WRITE_FAILED: ${error instanceof Error ? error.message : 'temporary write failed'}`);
-  } finally {
-    if (fd !== undefined) {
-      try { fs.closeSync(fd); } catch { /* preserve original write result */ }
-    }
-  }
-  try {
-    fs.renameSync(temporaryPath, outputPath);
-  } catch (error: unknown) {
-    try { if (fs.existsSync(temporaryPath)) fs.unlinkSync(temporaryPath); } catch { /* preserve original failure */ }
-    throw new Error(`TRIAL_LOG_COLLECTION_WRITE_FAILED: ${error instanceof Error ? error.message : 'atomic rename failed'}`);
-  }
-  const written = fs.readFileSync(outputPath);
-  if (hashBytes(written) !== expectedSha256 || !written.equals(payload)) {
-    fail('atomic output verification failed');
-  }
-}
-
 /**
  * Collects and atomically writes redacted logs beneath `rootDir`.
  *
@@ -334,28 +675,27 @@ function writeAtomic(outputPath: string, payload: Buffer, expectedSha256: string
  * deterministic ordering auditable.
  */
 export function collectRedactedTrialLogs(options: CollectRedactedTrialLogsOptions): RedactedTrialLogCollectionResult {
-  const root = ensureRootDirectory(options.rootDir);
+  const secureRoot = openTrialFilesystemRoot(options.rootDir);
+  const root = secureRoot.baseDir;
+  try {
   const limits = validateLimits(options);
   if (!Array.isArray(options.inputRelativePaths) || options.inputRelativePaths.length === 0 || options.inputRelativePaths.length > limits.maxFiles) {
     fail(`inputRelativePaths must contain between 1 and ${limits.maxFiles} entries`);
   }
   const inputPaths = [...new Set(options.inputRelativePaths.map((value, index) => normalizeRelativePath(value, `inputRelativePaths[${index}]`)))].sort();
   const outputRelativePath = normalizeRelativePath(options.outputRelativePath, 'outputRelativePath');
-  const outputPath = ensureOutputPath(root, outputRelativePath);
+  const outputPath = ensureOutputPath(secureRoot, outputRelativePath);
   const files: string[] = [];
-  for (const relativePath of inputPaths) enumerateFiles(root, relativePath, outputPath, limits, files);
+  for (const relativePath of inputPaths) enumerateFiles(secureRoot, relativePath, outputPath, limits, files);
   const uniqueFiles = [...new Set(files)].sort();
   if (uniqueFiles.length > limits.maxFiles) fail(`input contains more than ${limits.maxFiles} files`);
 
   let totalSourceBytes = 0;
   const entries: RedactedTrialLogEntry[] = [];
   for (const relativePath of uniqueFiles) {
-    const absolutePath = ensurePathBelowRoot(root, path.join(root, relativePath), false, `input path ${relativePath}`);
-    const stat = fs.lstatSync(absolutePath);
-    if (!stat.isFile() || stat.isSymbolicLink()) fail(`input path ${relativePath} is not a safe regular file`);
-    if (stat.size > limits.maxBytesPerFile) fail(`input path ${relativePath} exceeds the configured byte limit`);
-    if (totalSourceBytes > limits.maxTotalBytes - stat.size) fail(`input logs exceed the configured total byte limit`);
-    const raw = readBoundedUtf8(absolutePath, limits.maxBytesPerFile, `input path ${relativePath}`);
+    const absolutePath = path.join(root, relativePath);
+    const raw = readTrialFileBounded(secureRoot, absolutePath, limits.maxBytesPerFile, `input path ${relativePath}`);
+    if (totalSourceBytes > limits.maxTotalBytes - raw.byteSize) fail('input logs exceed the configured total byte limit');
     totalSourceBytes += raw.byteSize;
     const sanitized = redactTrialEvidenceText(sanitizeAutonomyText(raw.text, limits.maxBytesPerFile));
     const sanitizedByteSize = Buffer.byteLength(sanitized, 'utf8');
@@ -379,17 +719,18 @@ export function collectRedactedTrialLogs(options: CollectRedactedTrialLogsOption
   const payload = Buffer.from(`${canonicalJson}\n`, 'utf8');
   if (payload.byteLength > REDACTED_LOG_MAX_OUTPUT_BYTES) fail(`collection output exceeds ${REDACTED_LOG_MAX_OUTPUT_BYTES} bytes`);
   const sha256 = hashBytes(payload);
-  writeAtomic(outputPath, payload, sha256, root);
+  writeTrialFileAtomic(secureRoot, outputPath, payload, REDACTED_LOG_MAX_OUTPUT_BYTES, 'collection output');
   return { collection, canonicalJson, filePath: outputPath, sha256, byteSize: payload.byteLength };
+  } finally {
+    closeTrialFilesystemRoot(secureRoot);
+  }
 }
 
 /** Strictly validates a collector result read from disk and returns its digest. */
 export function verifyRedactedTrialLogCollectionFile(filePath: string, rootDir: string): { collection: RedactedTrialLogCollection; sha256: string; byteSize: number } {
-  const root = ensureRootDirectory(rootDir);
-  const absolutePath = ensurePathBelowRoot(root, filePath, false, 'collection path');
-  const stat = fs.lstatSync(absolutePath);
-  if (stat.isSymbolicLink() || !stat.isFile()) fail('collection path must be a regular file');
-  const raw = readBoundedUtf8(absolutePath, REDACTED_LOG_MAX_OUTPUT_BYTES, 'collection output');
+  const secureRoot = openTrialFilesystemRoot(rootDir);
+  try {
+  const raw = readTrialFileBounded(secureRoot, path.resolve(filePath), REDACTED_LOG_MAX_OUTPUT_BYTES, 'collection output');
   let parsed: unknown;
   try { parsed = JSON.parse(raw.text); } catch { fail('collection output is not valid JSON'); }
   if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) fail('collection output must be an object');
@@ -414,5 +755,8 @@ export function verifyRedactedTrialLogCollectionFile(filePath: string, rootDir: 
   }
   if (totalByteSize !== collection.totalByteSize) fail('collection totalByteSize does not match entries');
   if (totalByteSize > REDACTED_LOG_MAX_TOTAL_BYTES) fail('collection exceeds the configured total byte limit');
-  return { collection, sha256: hashBytes(Buffer.from(raw.text, 'utf8')), byteSize: raw.byteSize };
+  return { collection, sha256: hashBytes(raw.bytes), byteSize: raw.byteSize };
+  } finally {
+    closeTrialFilesystemRoot(secureRoot);
+  }
 }

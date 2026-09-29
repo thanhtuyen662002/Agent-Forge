@@ -87,4 +87,37 @@ describe('trial evidence retention designation', () => {
     expect(isTrialRetentionDesignationBound(manifest.manifest, designation)).toBe(true);
     expect(isTrialRetentionDesignationBound(manifest.manifest, { ...designation, location: 'other' })).toBe(false);
   });
+
+  it('fails closed when the designation path is replaced by a link', () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'agent-forge-retention-link-'));
+    const outside = fs.mkdtempSync(path.join(os.tmpdir(), 'agent-forge-retention-outside-'));
+    try {
+      const result = buildTrialRetentionDesignation(baseDesignation());
+      const destination = path.join(root, 'trial-evidence');
+      try {
+        fs.symlinkSync(outside, destination, process.platform === 'win32' ? 'junction' : 'dir');
+      } catch (error) {
+        if (error && typeof error === 'object' && 'code' in error && ['EPERM', 'EACCES'].includes(String((error as { code: unknown }).code))) return;
+        throw error;
+      }
+      expect(() => writeTrialRetentionDesignation(root, 'trial-evidence/retention.json', result)).toThrow(/reparse|symbolic|junction|path/i);
+      expect(fs.readdirSync(outside)).toEqual([]);
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true });
+      fs.rmSync(outside, { recursive: true, force: true });
+    }
+  });
+
+  it('does not read an oversized existing designation into memory', () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'agent-forge-retention-large-'));
+    try {
+      const result = buildTrialRetentionDesignation(baseDesignation());
+      const destination = path.join(root, 'trial-evidence');
+      fs.mkdirSync(destination, { recursive: true });
+      fs.writeFileSync(path.join(destination, 'retention.json'), Buffer.alloc(1024 * 1024 + 1, 0x41));
+      expect(() => writeTrialRetentionDesignation(root, 'trial-evidence/retention.json', result)).toThrow(/byte limit|too large|configured/i);
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
 });
