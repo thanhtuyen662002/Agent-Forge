@@ -33,6 +33,29 @@ function parseTrustedDevOrigin(devServerUrl: string | undefined): URL | null {
 }
 
 function samePath(left: string, right: string): boolean {
+  // Vitest exercises packaged navigation with Windows-style fixture paths on
+  // every CI runner. `fileURLToPath()` returns `/C:/...` for a Windows file
+  // URL when the test runs on Linux, while Electron on Windows returns
+  // `C:\\...`. Normalize those portable drive paths with win32 semantics so
+  // the security decision does not depend on the host running the test.
+  const portableWindowsPath = (value: string): string | null => {
+    const slashNormalized = value.replace(/\\/g, '/');
+    const drivePath = slashNormalized.match(/^\/?([A-Za-z]:\/.*)$/);
+    if (!drivePath) {
+      return null;
+    }
+    return path.win32.normalize(path.win32.resolve(drivePath[1])).toLowerCase();
+  };
+
+  const portableLeft = portableWindowsPath(left);
+  const portableRight = portableWindowsPath(right);
+  if (portableLeft !== null || portableRight !== null) {
+    // A drive-qualified path must only compare equal to another drive-
+    // qualified path. Falling back to native path resolution here could make
+    // a malformed mixed-platform value appear trusted.
+    return portableLeft !== null && portableRight !== null && portableLeft === portableRight;
+  }
+
   const normalizedLeft = path.normalize(path.resolve(left));
   const normalizedRight = path.normalize(path.resolve(right));
   return process.platform === 'win32'
