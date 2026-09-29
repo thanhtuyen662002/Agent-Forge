@@ -1,13 +1,17 @@
 import crypto from 'crypto';
-import fs from 'fs';
 import path from 'path';
-import { assertPathContained } from '../services/ArtifactStore';
 import {
   computeTrialEvidenceManifestSha256,
   PRODUCTION_TRIAL_PHASES,
   type ProductionTrialEvidenceManifest,
   type ProductionTrialPhase,
 } from './trialEvidence';
+import {
+  closeTrialFilesystemRoot,
+  openTrialFilesystemRoot,
+  readTrialFileBounded,
+  writeTrialFileAtomic,
+} from './trialLogCollector';
 
 /**
  * A durable, local receipt that names the location approved for a trial's
@@ -214,32 +218,23 @@ export function writeTrialRetentionDesignation(
     fail('designation result canonical JSON or SHA-256 does not match its designation');
   }
   const safeRelativePath = normalizeRelativePath(relativePath, 'designation output path');
-  const absoluteRoot = path.resolve(rootDir);
-  fs.mkdirSync(absoluteRoot, { recursive: true });
-  const filePath = assertPathContained(path.join(absoluteRoot, safeRelativePath), absoluteRoot);
-  const parent = path.dirname(filePath);
-  fs.mkdirSync(parent, { recursive: true });
-  if (fs.existsSync(filePath)) {
-    if (fs.lstatSync(filePath).isSymbolicLink()) fail('designation output path is a symbolic link');
-    const existing = parseAndVerifyTrialRetentionDesignation(fs.readFileSync(filePath, 'utf8'));
-    if (existing.sha256 !== sha256) fail('designation output already exists with a different digest');
-    return { filePath, sha256 };
-  }
-  const tempPath = `${filePath}.tmp-${crypto.randomUUID()}`;
-  assertPathContained(tempPath, absoluteRoot);
-  const fd = fs.openSync(tempPath, 'wx');
+  const root = openTrialFilesystemRoot(rootDir, true);
+  const filePath = path.resolve(root.baseDir, safeRelativePath);
+  const payload = Buffer.from(`${canonicalJson}\n`, 'utf8');
   try {
-    fs.writeFileSync(fd, `${canonicalJson}\n`, 'utf8');
-    fs.fsyncSync(fd);
+    try {
+      const existing = readTrialFileBounded(root, filePath, 1024 * 1024, 'designation output');
+      const parsed = parseAndVerifyTrialRetentionDesignation(existing.text);
+      if (parsed.sha256 !== sha256) fail('designation output already exists with a different digest');
+      return { filePath, sha256 };
+    } catch (error) {
+      if (!(error instanceof Error) || !/missing/i.test(error.message)) throw error;
+    }
+    writeTrialFileAtomic(root, filePath, payload, 1024 * 1024, 'designation output');
+    const written = readTrialFileBounded(root, filePath, 1024 * 1024, 'designation output');
+    const parsed = parseAndVerifyTrialRetentionDesignation(written.text, sha256);
+    return { filePath, sha256: parsed.sha256 };
   } finally {
-    fs.closeSync(fd);
+    closeTrialFilesystemRoot(root);
   }
-  try {
-    fs.renameSync(tempPath, filePath);
-  } catch (error) {
-    try { if (fs.existsSync(tempPath)) fs.unlinkSync(tempPath); } catch { /* preserve original failure */ }
-    throw new Error(`TRIAL_RETENTION_WRITE_FAILED: ${error instanceof Error ? error.message : 'atomic rename failed'}`);
-  }
-  const written = parseAndVerifyTrialRetentionDesignation(fs.readFileSync(filePath, 'utf8'), sha256);
-  return { filePath, sha256: written.sha256 };
 }

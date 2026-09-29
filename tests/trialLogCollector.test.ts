@@ -133,4 +133,45 @@ describe('redacted trial log collector', () => {
       fs.rmSync(root, { recursive: true, force: true });
     }
   });
+
+  it('fails closed on malformed UTF-8 instead of replacing bytes during hashing', () => {
+    const root = fixture();
+    try {
+      fs.mkdirSync(path.join(root, 'logs'), { recursive: true });
+      fs.writeFileSync(path.join(root, 'logs', 'invalid.log'), Buffer.from([0xc3, 0x28]));
+      expect(() => collectRedactedTrialLogs({
+        rootDir: root,
+        inputRelativePaths: ['logs/invalid.log'],
+        outputRelativePath: 'evidence/out.json',
+        collectedAt: '2026-09-27T00:00:00.000Z',
+      })).toThrow(/UTF-8|TRIAL_LOG_COLLECTION_INVALID|ARTIFACT_PATH_UNVERIFIED/i);
+      expect(fs.existsSync(path.join(root, 'evidence', 'out.json'))).toBe(false);
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it('keeps concurrent idempotent collectors on one committed byte sequence', async () => {
+    const root = fixture();
+    try {
+      fs.mkdirSync(path.join(root, 'logs'), { recursive: true });
+      fs.writeFileSync(path.join(root, 'logs', 'one.log'), 'stable diagnostic\n');
+      const options = {
+        rootDir: root,
+        inputRelativePaths: ['logs/one.log'],
+        outputRelativePath: 'evidence/out.json',
+        collectedAt: '2026-09-27T00:00:00.000Z',
+      };
+      const results = await Promise.all([
+        Promise.resolve().then(() => collectRedactedTrialLogs(options)),
+        Promise.resolve().then(() => collectRedactedTrialLogs(options)),
+        Promise.resolve().then(() => collectRedactedTrialLogs(options)),
+      ]);
+      expect(new Set(results.map((result) => result.sha256)).size).toBe(1);
+      expect(fs.readdirSync(path.join(root, 'evidence')).filter((name) => name.includes('.tmp-'))).toEqual([]);
+      expect(verifyRedactedTrialLogCollectionFile(results[0].filePath, root).sha256).toBe(results[0].sha256);
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
 });
