@@ -270,6 +270,186 @@ describe('TaskService & Protocol Idempotency', () => {
     expect(repo.getTask('TSK-001')!.state).toBe('REVIEWING');
   });
 
+  it('serializes concurrent review starts into one authoritative transition and event', () => {
+    repo.updateTaskState('TSK-001', 'REVIEW_READY');
+    const task = repo.getTask('TSK-001')!;
+    const binding = {
+      expectedRevision: task.revision_count,
+      expectedOwnershipEpoch: task.ownership_epoch ?? 1,
+      expectedState: task.state,
+      executionId: 'review-execution-1',
+    };
+
+    const first = taskService.startReview(task.id, task.project_id, binding);
+    const second = taskService.startReview(task.id, task.project_id, {
+      ...binding,
+      executionId: 'review-execution-2',
+    });
+
+    expect(first.success).toBe(true);
+    expect(second.success).toBe(true);
+    expect(second.task?.state).toBe('REVIEWING');
+    expect(repo.getEvents(task.project_id, 100).filter((event) => event.type === 'REVIEW_STARTED')).toHaveLength(1);
+  });
+
+  it('discards a validation result after ownership reassignment without writing evidence or TestRun', async () => {
+    repo.updateTaskState('TSK-001', 'VALIDATING');
+    vi.spyOn(GitService, 'getStatus').mockResolvedValue({
+      status: 'SUCCESS',
+      branch: 'main',
+      isClean: true,
+      modifiedFiles: [],
+      untrackedFiles: [],
+      aheadCount: 0,
+      behindCount: 0,
+    });
+    vi.spyOn(GitService, 'getDiff').mockResolvedValue({
+      status: 'SUCCESS',
+      diffStat: '',
+      diffContent: '',
+      filesChanged: [],
+      insertions: 0,
+      deletions: 0,
+    });
+
+    let releaseTestRun!: () => void;
+    let entered!: () => void;
+    const testStarted = new Promise<void>((resolve) => { entered = resolve; });
+    const testRelease = new Promise<void>((resolve) => { releaseTestRun = resolve; });
+    const verificationService = {
+      getArtifactStore: () => undefined,
+      runTests: vi.fn(async () => {
+        entered();
+        await testRelease;
+        return {
+          id: 'stale-test-run',
+          task_id: 'TSK-001',
+          command: 'npm test',
+          passed_count: 1,
+          failed_count: 0,
+          skipped_count: 0,
+          duration_ms: 1,
+          exit_code: 0,
+          evidence_id: 'stale-test-evidence',
+          created_at: new Date().toISOString(),
+          pending_evidence: {
+            id: 'stale-test-evidence',
+            project_id: 'PROJ-TEST',
+            task_id: 'TSK-001',
+            attempt_id: null,
+            evidence_type: 'TEST_RESULT',
+            storage_type: 'INLINE',
+            file_path: null,
+            hash: 'stale-hash',
+            byte_size: 0,
+            content_type: 'text/plain',
+            summary: 'stale',
+            raw_payload: '',
+            created_at: new Date().toISOString(),
+          },
+        };
+      }),
+    };
+    const fencedTaskService = new TaskService(repo, eventService, verificationService as any);
+    const task = repo.getTask('TSK-001')!;
+    const validation = fencedTaskService.executeValidationFlow(task.id, undefined, task.project_id, {
+      expectedRevision: task.revision_count,
+      expectedOwnershipEpoch: task.ownership_epoch ?? 1,
+      expectedState: task.state,
+      executionId: 'validation-execution-stale',
+    });
+
+    await testStarted;
+    expect(repo.bumpTaskOwnershipEpoch(task.id, task.ownership_epoch ?? 1).success).toBe(true);
+    releaseTestRun();
+    const result = await validation;
+
+    expect(result).toMatchObject({
+      success: false,
+      stale: true,
+      executionId: 'validation-execution-stale',
+      error: 'STALE_VALIDATION_RESULT',
+    });
+    expect(repo.getTask(task.id)?.state).toBe('VALIDATING');
+    expect(repo.getLatestTestRun(task.id)).toBeNull();
+    expect(repo.getEvidenceByTask(task.id)).toHaveLength(0);
+    expect(repo.getEvents(task.project_id, 100).some((event) => event.type === 'VALIDATION_STALE_RESULT')).toBe(true);
+  });
+
+  it('discards validation evidence when repository HEAD changes during test execution', async () => {
+    repo.updateTaskState('TSK-001', 'VALIDATING');
+    vi.spyOn(GitService, 'getStatus').mockResolvedValue({
+      status: 'SUCCESS',
+      branch: 'main',
+      isClean: false,
+      modifiedFiles: ['feature.ts'],
+      untrackedFiles: [],
+      aheadCount: 0,
+      behindCount: 0,
+    });
+    vi.spyOn(GitService, 'getDiff').mockResolvedValue({
+      status: 'SUCCESS',
+      diffStat: '1 file changed',
+      diffContent: 'diff --git a/feature.ts b/feature.ts',
+      filesChanged: ['feature.ts'],
+      insertions: 1,
+      deletions: 0,
+    });
+    vi.mocked(GitService.getHeadSha)
+      .mockResolvedValueOnce({ status: 'SUCCESS', sha: 'sha-before-tests' })
+      .mockResolvedValueOnce({ status: 'SUCCESS', sha: 'sha-after-tests' });
+
+    const verificationService = {
+      getArtifactStore: () => undefined,
+      runTests: vi.fn(async () => ({
+        id: 'head-drift-test-run',
+        task_id: 'TSK-001',
+        command: 'npm test',
+        passed_count: 1,
+        failed_count: 0,
+        skipped_count: 0,
+        duration_ms: 1,
+        exit_code: 0,
+        evidence_id: 'head-drift-test-evidence',
+        created_at: new Date().toISOString(),
+        pending_evidence: {
+          id: 'head-drift-test-evidence',
+          project_id: 'PROJ-TEST',
+          task_id: 'TSK-001',
+          attempt_id: null,
+          evidence_type: 'TEST_RESULT',
+          storage_type: 'INLINE',
+          file_path: null,
+          hash: 'head-drift-hash',
+          byte_size: 0,
+          content_type: 'text/plain',
+          summary: 'head drift',
+          raw_payload: '',
+          created_at: new Date().toISOString(),
+        },
+      })),
+    };
+    const fencedTaskService = new TaskService(repo, eventService, verificationService as any);
+    const task = repo.getTask('TSK-001')!;
+    const result = await fencedTaskService.executeValidationFlow(task.id, undefined, task.project_id, {
+      expectedRevision: task.revision_count,
+      expectedOwnershipEpoch: task.ownership_epoch ?? 1,
+      expectedState: task.state,
+      executionId: 'head-drift-execution',
+    });
+
+    expect(result).toMatchObject({
+      success: false,
+      stale: true,
+      executionId: 'head-drift-execution',
+      error: 'STALE_VALIDATION_RESULT',
+    });
+    expect(repo.getTask(task.id)?.state).toBe('VALIDATING');
+    expect(repo.getLatestTestRun(task.id)).toBeNull();
+    expect(repo.getEvidenceByTask(task.id)).toHaveLength(0);
+    expect(repo.getEvents(task.project_id, 100).some((event) => event.type === 'VALIDATION_STALE_RESULT')).toBe(true);
+  });
+
   it('should NOT award test progress or fake lint pass when Manager PASS is applied without passing TestRun evidence', async () => {
     repo.updateTaskState('TSK-001', 'REVIEWING');
 

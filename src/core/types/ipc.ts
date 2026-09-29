@@ -1,5 +1,6 @@
 import { z } from 'zod';
 import { CanonicalExecutionScopeSchema } from '../services/ExecutionAuthorizationService';
+import { TaskStateEnum } from './domain';
 
 // Strict Zod schemas for all IPC channels across the main process security boundary
 
@@ -95,10 +96,30 @@ export const TaskScopedIpcSchema = z.object({
   taskId: z.string().min(1),
 });
 
-export const RunVerificationIpcSchema = z.object({
-  taskId: z.string().min(1),
-  commandConfigId: z.string().optional(),
-});
+const TaskMutationBindingIpcFields = {
+  expectedRevision: z.number().int().min(0).max(1_000_000).optional(),
+  expectedOwnershipEpoch: z.number().int().min(1).max(1_000_000_000).optional(),
+  expectedState: TaskStateEnum.optional(),
+  executionId: z.string().uuid('A valid validation execution ID is required').optional(),
+};
+
+export const StartReviewIpcSchema = z
+  .object({
+    taskId: z.string().min(1),
+    expectedProjectId: z.string().min(1).max(200).optional(),
+    ...TaskMutationBindingIpcFields,
+  })
+  .strict();
+export type StartReviewIpc = z.infer<typeof StartReviewIpcSchema>;
+
+export const RunVerificationIpcSchema = z
+  .object({
+    taskId: z.string().min(1),
+    commandConfigId: z.string().optional(),
+    expectedProjectId: z.string().min(1).max(200).optional(),
+    ...TaskMutationBindingIpcFields,
+  })
+  .strict();
 export type RunVerificationIpc = z.infer<typeof RunVerificationIpcSchema>;
 
 export const UpdateResourceQuotaIpcSchema = z.object({

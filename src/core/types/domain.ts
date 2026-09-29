@@ -256,6 +256,18 @@ export interface Task {
   updated_at: string;
 }
 
+/**
+ * Caller-supplied fence for work that may outlive the initial task read.
+ * Omitting a field asks the service to capture the current value atomically;
+ * supplying it requires the exact value at the commit fence.
+ */
+export interface TaskMutationBinding {
+  expectedRevision?: number;
+  expectedOwnershipEpoch?: number;
+  expectedState?: TaskState;
+  executionId?: string;
+}
+
 export interface TaskLease {
   task_id: string;
   agent_id: string;
@@ -376,6 +388,29 @@ export interface TestRun {
   exit_code: number;
   evidence_id: string | null;
   created_at: string;
+  /** Transient evidence carried by a fenced validation before durable commit. */
+  pending_evidence?: Evidence;
+  /** Transient process-log evidence carried by a fenced validation. */
+  pending_process_evidence?: Evidence[];
+  /** Transient process lifecycle data carried by a fenced validation. */
+  pending_process_run?: PendingProcessRun;
+}
+
+/**
+ * ProcessRunner output intentionally kept out of the database until the
+ * owning task's revision and ownership fence has been revalidated.
+ */
+export interface PendingProcessRun {
+  id: string;
+  pid: number | null;
+  command: string;
+  working_directory: string;
+  status: 'RUNNING' | 'COMPLETED' | 'FAILED' | 'CANCELLED' | 'TIMED_OUT';
+  start_time: string;
+  end_time: string;
+  exit_code: number;
+  stdout_evidence_id: string | null;
+  stderr_evidence_id: string | null;
 }
 
 export interface ProcessRun {

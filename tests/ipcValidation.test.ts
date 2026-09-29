@@ -19,11 +19,29 @@ import {
   AdmitQuarantinedSubmissionIpcSchema,
   ResumeAdmittedSubmissionIpcSchema,
   AcknowledgeRecoveryFencedIpcSchema,
+  StartReviewIpcSchema,
+  RunVerificationIpcSchema,
 } from '../src/core/types/ipc';
 import { CanonicalExecutionScopeSchema } from '../src/core/services/ExecutionAuthorizationService';
 import { PolicyService } from '../src/core/services/PolicyService';
 
 describe('IPC Validation & Security Gates', () => {
+  it('requires strict revision and ownership bindings for review and verification mutations', () => {
+    const binding = {
+      taskId: 'TSK-1',
+      expectedProjectId: 'PROJ-1',
+      expectedRevision: 2,
+      expectedOwnershipEpoch: 7,
+      expectedState: 'VALIDATING',
+      executionId: '00000000-0000-4000-8000-000000000001',
+    };
+    expect(StartReviewIpcSchema.safeParse({ ...binding, expectedState: 'REVIEW_READY' }).success).toBe(true);
+    expect(RunVerificationIpcSchema.safeParse({ ...binding, commandConfigId: 'cmd-1' }).success).toBe(true);
+    expect(RunVerificationIpcSchema.safeParse({ ...binding, unknownMutation: true }).success).toBe(false);
+    expect(RunVerificationIpcSchema.safeParse({ ...binding, expectedRevision: -1 }).success).toBe(false);
+    expect(RunVerificationIpcSchema.safeParse({ ...binding, executionId: 'not-a-uuid' }).success).toBe(false);
+  });
+
   it('should validate project creation payloads and reject raw repository paths', () => {
     const invalidEmpty = CreateProjectIpcSchema.safeParse({});
     expect(invalidEmpty.success).toBe(false);

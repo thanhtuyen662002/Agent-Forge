@@ -696,6 +696,33 @@ describe('product-task autonomy consolidation', () => {
     ]);
   });
 
+  it('rejects and does not persist a verification observation after the ownership epoch changes', () => {
+    const fixture = seed('task-stale-observation');
+    const captured = repo.getTask(fixture.task.id)!;
+    expect(repo.bumpTaskOwnershipEpoch(fixture.task.id, captured.ownership_epoch ?? 1).success).toBe(true);
+
+    expect(() => adapter.recordVerificationObservation({
+      projectId: captured.project_id,
+      taskId: captured.id,
+      attemptId: fixture.authorization.attempt_id,
+      command: 'node --version',
+      status: 'COMPLETED',
+      exitCode: 0,
+      passedCount: 1,
+      failedCount: 0,
+      durationMs: 1,
+      stdout: 'v22',
+      workingDirectory: root,
+      expectedRevision: captured.revision_count,
+      expectedOwnershipEpoch: captured.ownership_epoch ?? 1,
+      executionId: 'stale-observation-execution',
+    })).toThrow('STALE_VALIDATION_RESULT');
+
+    expect(repo.getLatestTestRun(captured.id)).toBeNull();
+    expect(repo.getEvidenceByTask(captured.id)).toHaveLength(0);
+    expect(repo.getProcessRunsByTask(captured.id)).toHaveLength(0);
+  });
+
   it('rejects a stale PASS after a manager provider switch', () => {
     const stale: ManagerReview = {
       protocol_version: 'managerreview.v1',

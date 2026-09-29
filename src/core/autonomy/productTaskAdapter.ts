@@ -15,7 +15,7 @@ import {
   WorkerSlotLeaseService,
 } from '../services/WorkerSlotLeaseService';
 import { TaskStateMachine, TaskTrigger } from '../state/taskStateMachine';
-import { AgentAssignment, ExecutionAuthorization, ProcessRun, Task, TestRun } from '../types/domain';
+import { AgentAssignment, ExecutionAuthorization, ProcessRun, Task, TaskMutationBinding, TestRun } from '../types/domain';
 import { AutonomousTaskSpec, ManagerReview, ManagerReviewSchema, WorkOrder, createWorkOrder } from './contracts';
 import { EvidenceCollector } from './evidence';
 import {
@@ -120,7 +120,11 @@ export function areStringArraysIdentical(a?: string[], b?: string[]): boolean {
 
 export interface ExecuteProductTaskParams extends AuthorizedWorkOrderInput {
   runCoder: (workOrder: WorkOrder) => Promise<{ success: boolean; currentHeadSha: string; error?: string; bundle?: CoderEditBundle }>;
-  runVerification: (authority: ProductTaskAuthority, workOrder?: WorkOrder) => Promise<TestRun>;
+  runVerification: (
+    authority: ProductTaskAuthority,
+    workOrder?: WorkOrder,
+    binding?: TaskMutationBinding,
+  ) => Promise<TestRun>;
   conductReview: (context: ManagerContextPackage) => Promise<ManagerReview>;
   managerContext?: Omit<BuildManagerContextParams, 'workOrder' | 'currentHead'>;
   evidenceCollector?: Pick<EvidenceCollector, 'collect'>;
@@ -436,7 +440,17 @@ export class ProductTaskAutonomyAdapter {
     stdout?: string;
     stderr?: string;
     workingDirectory: string;
+    expectedRevision?: number;
+    expectedOwnershipEpoch?: number;
+    expectedState?: Task['state'];
+    executionId?: string;
   }): TestRun {
+    const currentTask = this.repo.getTask(input.taskId);
+    if (!currentTask) throw new Error(`TASK_NOT_FOUND: ${input.taskId}`);
+    const expectedRevision = input.expectedRevision ?? currentTask.revision_count;
+    const expectedOwnershipEpoch = input.expectedOwnershipEpoch ?? (currentTask.ownership_epoch ?? 1);
+    const expectedState = input.expectedState ?? currentTask.state;
+    const executionId = input.executionId ?? crypto.randomUUID();
     const startedAt = new Date(Date.now() - input.durationMs).toISOString();
     const finishedAt = new Date().toISOString();
     const evidenceId = crypto.randomUUID();
@@ -449,8 +463,6 @@ export class ProductTaskAutonomyAdapter {
       `Verification attempt ${input.status}: ${input.command}`,
       `status=${input.status}\nexitCode=${String(input.exitCode)}\n=== STDOUT ===\n${input.stdout ?? ''}\n=== STDERR ===\n${input.stderr ?? ''}`,
     );
-    this.repo.createEvidence(evidence);
-
     const processRunId = crypto.randomUUID();
     const processRun: Pick<ProcessRun, 'id' | 'pid' | 'command' | 'working_directory' | 'status' | 'start_time'> & {
       project_id: string;
@@ -467,9 +479,6 @@ export class ProductTaskAutonomyAdapter {
       status: 'RUNNING',
       start_time: startedAt,
     };
-    this.repo.createProcessRun(processRun);
-    this.repo.updateProcessRun(processRunId, input.status, input.exitCode, finishedAt, evidenceId, null);
-
     const run: TestRun = {
       id: crypto.randomUUID(),
       task_id: input.taskId,
@@ -482,7 +491,35 @@ export class ProductTaskAutonomyAdapter {
       evidence_id: evidenceId,
       created_at: finishedAt,
     };
-    this.repo.createTestRun(run);
+    try {
+      this.repo.runInImmediateTransaction(() => {
+        const liveTask = this.repo.getTask(input.taskId);
+        const liveEpoch = liveTask?.ownership_epoch ?? 1;
+        if (
+          !liveTask ||
+          liveTask.project_id !== input.projectId ||
+          liveTask.revision_count !== expectedRevision ||
+          liveEpoch !== expectedOwnershipEpoch ||
+          liveTask.state !== expectedState
+        ) {
+          throw new Error(
+            `STALE_VALIDATION_RESULT: execution ${executionId} no longer owns task ${input.taskId}.`,
+          );
+        }
+        this.repo.createEvidence(evidence);
+        this.repo.createProcessRun(processRun);
+        this.repo.updateProcessRun(processRunId, input.status, input.exitCode, finishedAt, evidenceId, null);
+        this.repo.createTestRun(run);
+      });
+    } catch (error) {
+      if (evidence.file_path) {
+        this.options.artifactStore.cleanupRollbackFiles(
+          [evidence.file_path],
+          (filePath) => this.repo.isEvidenceFilePathReferenced(filePath),
+        );
+      }
+      throw error;
+    }
     return run;
   }
 
@@ -631,7 +668,25 @@ export class ProductTaskAutonomyAdapter {
       // Verification acceptance strictly requires a newly persisted TestRun
       // and its process/evidence lineage from this authorization attempt.
       const priorTestRunIds = new Set(this.repo.getTestRunsByTaskId(task.id).map((run) => run.id));
-      const currentTestRun = await input.runVerification(validated.authority, workOrder);
+      const verificationBinding: TaskMutationBinding = {
+        expectedRevision: task.revision_count,
+        expectedOwnershipEpoch: authorityEpoch,
+        expectedState: task.state,
+        executionId: validated.authority.authorization.execution_id ?? validated.authority.authorization.id,
+      };
+      const currentTestRun = await input.runVerification(validated.authority, workOrder, verificationBinding);
+      const afterVerificationTask = this.repo.getTask(task.id);
+      const afterVerificationEpoch = afterVerificationTask?.ownership_epoch ?? authorityEpoch;
+      if (
+        !afterVerificationTask ||
+        afterVerificationTask.revision_count !== verificationBinding.expectedRevision ||
+        afterVerificationEpoch !== authorityEpoch ||
+        afterVerificationTask.state !== verificationBinding.expectedState
+      ) {
+        throw new Error(
+          `STALE_VALIDATION_RESULT: execution ${verificationBinding.executionId} completed after task reassignment or revision change.`,
+        );
+      }
       const verificationReport = this.getTruthfulVerificationReport(task.id);
       const persistedCurrentRun = currentTestRun ? this.repo.getTestRun(currentTestRun.id) : null;
       const currentEvidence = persistedCurrentRun?.evidence_id

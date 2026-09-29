@@ -3,7 +3,7 @@ import { ProcessRunner } from './ProcessRunner';
 import { ArtifactStore } from './ArtifactStore';
 import { PolicyService } from './PolicyService';
 import { Repository } from '../database/repositories';
-import { TestRun } from '../types/domain';
+import { Evidence, PendingProcessRun, TestRun } from '../types/domain';
 import {
   SealedVerificationExecutionInput,
   SealedVerificationResult,
@@ -18,6 +18,24 @@ export interface ParsedTestMetrics {
   failedCount: number;
   skippedCount: number;
 }
+
+/**
+ * A validation caller can defer database persistence until it has revalidated
+ * the task revision/ownership fence.  Process output is still captured and
+ * bounded, but no evidence, process, or TestRun row is written by this method
+ * while deferred persistence is enabled.
+ */
+export interface VerificationRunOptions {
+  deferPersistence?: boolean;
+  /** Bind the child process to the caller's durable execution identity. */
+  executionId?: string;
+}
+
+export type DeferredTestRun = TestRun & {
+  pending_evidence?: Evidence;
+  pending_process_evidence?: Evidence[];
+  pending_process_run?: PendingProcessRun;
+};
 
 export function parseTestMetrics(stdout: string, exitCode: number): ParsedTestMetrics {
   if (!stdout || typeof stdout !== 'string') {
@@ -99,8 +117,10 @@ export class VerificationService {
     taskId: string,
     attemptId: string | null,
     repoPath: string,
-    commandConfigId?: string
+    commandConfigId?: string,
+    options: VerificationRunOptions = {}
   ): Promise<TestRun> {
+    const deferPersistence = options.deferPersistence === true;
     // 1. Resolve configured command with strict fail-closed validation
     let executable: string;
     let args: string[];
@@ -115,7 +135,8 @@ export class VerificationService {
           taskId,
           attemptId,
           `Config ID: ${commandConfigId}`,
-          `VERIFICATION_CONFIG_NOT_FOUND: Configured verification command "${commandConfigId}" does not exist.`
+          `VERIFICATION_CONFIG_NOT_FOUND: Configured verification command "${commandConfigId}" does not exist.`,
+          deferPersistence
         );
       }
       if (cfg.project_id !== projectId) {
@@ -124,7 +145,8 @@ export class VerificationService {
           taskId,
           attemptId,
           cfg.name,
-          `VERIFICATION_CROSS_PROJECT_MISMATCH: Verification command "${commandConfigId}" belongs to project "${cfg.project_id}", not "${projectId}".`
+          `VERIFICATION_CROSS_PROJECT_MISMATCH: Verification command "${commandConfigId}" belongs to project "${cfg.project_id}", not "${projectId}".`,
+          deferPersistence
         );
       }
       if (!cfg.enabled) {
@@ -133,7 +155,8 @@ export class VerificationService {
           taskId,
           attemptId,
           cfg.name,
-          `VERIFICATION_CONFIG_DISABLED: Verification command "${cfg.name}" is disabled.`
+          `VERIFICATION_CONFIG_DISABLED: Verification command "${cfg.name}" is disabled.`,
+          deferPersistence
         );
       }
       if (cfg.command_type !== 'TEST') {
@@ -142,7 +165,8 @@ export class VerificationService {
           taskId,
           attemptId,
           cfg.name,
-          `VERIFICATION_TYPE_MISMATCH: Verification command "${cfg.name}" has type "${cfg.command_type}", expected "TEST".`
+          `VERIFICATION_TYPE_MISMATCH: Verification command "${cfg.name}" has type "${cfg.command_type}", expected "TEST".`,
+          deferPersistence
         );
       }
 
@@ -160,7 +184,8 @@ export class VerificationService {
           taskId,
           attemptId,
           'Unconfigured Test Suite',
-          `VERIFICATION_NOT_CONFIGURED: No enabled TEST verification command is configured for project "${projectId}".`
+          `VERIFICATION_NOT_CONFIGURED: No enabled TEST verification command is configured for project "${projectId}".`,
+          deferPersistence
         );
       }
 
@@ -180,20 +205,29 @@ export class VerificationService {
         taskId,
         attemptId,
         fullCommandStr,
-        `Verification denied by PolicyService: ${policy.reason} (${policy.decision})`
+        `Verification denied by PolicyService: ${policy.reason} (${policy.decision})`,
+        deferPersistence
       );
     }
 
-    // 3. Execute with ProcessRunner, persisting process output evidence
+    // 3. Execute with ProcessRunner.  A fenced validation observes the child
+    // without durable writes; TaskService commits the staged lifecycle and
+    // log evidence only after its final revision/ownership check.
     const result = await ProcessRunner.execute({
       executable,
       args,
       cwd: repoPath,
       timeoutMs,
-      repo: this.repo,
-      artifactStore: this.artifactStore,
-      projectId,
-      taskId,
+      executionId: options.executionId,
+      deferPersistence,
+      ...(deferPersistence
+        ? {}
+        : {
+            repo: this.repo,
+            artifactStore: this.artifactStore,
+            projectId,
+            taskId,
+          }),
     });
 
     // 4. Parse test results & metrics
@@ -212,11 +246,13 @@ export class VerificationService {
       combinedOutput,
       'text/plain'
     );
-    this.repo.createEvidence(evidence);
+    if (!deferPersistence) {
+      this.repo.createEvidence(evidence);
+    }
 
     const metrics = parseTestMetrics(stdout, result.exitCode);
 
-    const testRun: TestRun = {
+    const testRun: DeferredTestRun = {
       id: crypto.randomUUID(),
       task_id: taskId,
       command: fullCommandStr,
@@ -229,7 +265,65 @@ export class VerificationService {
       created_at: new Date().toISOString(),
     };
 
-    this.repo.createTestRun(testRun);
+    if (deferPersistence) {
+      testRun.pending_evidence = evidence;
+
+      const processEvidence: Evidence[] = [];
+      let stdoutEvidenceId: string | null = null;
+      let stderrEvidenceId: string | null = null;
+      if (stdout.trim().length > 0) {
+        const stdoutEvidence = this.artifactStore.store(
+          crypto.randomUUID(),
+          projectId,
+          taskId,
+          attemptId,
+          'PROCESS_LOG',
+          `Stdout for ${commandName}`,
+          stdout,
+          'text/plain',
+        );
+        processEvidence.push(stdoutEvidence);
+        stdoutEvidenceId = stdoutEvidence.id;
+      }
+      if (stderr.trim().length > 0) {
+        const stderrEvidence = this.artifactStore.store(
+          crypto.randomUUID(),
+          projectId,
+          taskId,
+          attemptId,
+          'PROCESS_LOG',
+          `Stderr for ${commandName}`,
+          stderr,
+          'text/plain',
+        );
+        processEvidence.push(stderrEvidence);
+        stderrEvidenceId = stderrEvidence.id;
+      }
+      testRun.pending_process_evidence = processEvidence;
+      const processStatus = result.cancelled
+        ? 'CANCELLED'
+        : result.timedOut
+        ? 'TIMED_OUT'
+        : result.exitCode === 0
+        ? 'COMPLETED'
+        : 'FAILED';
+      const endTime = result.endTime ?? new Date().toISOString();
+      const startTime = result.startTime ?? new Date(Date.parse(endTime) - result.durationMs).toISOString();
+      testRun.pending_process_run = {
+        id: result.executionId,
+        pid: result.pid,
+        command: result.command,
+        working_directory: result.cwd,
+        status: processStatus,
+        start_time: startTime,
+        end_time: endTime,
+        exit_code: result.exitCode,
+        stdout_evidence_id: stdoutEvidenceId,
+        stderr_evidence_id: stderrEvidenceId,
+      };
+    } else {
+      this.repo.createTestRun(testRun);
+    }
     return testRun;
   }
 
@@ -771,7 +865,8 @@ export class VerificationService {
     taskId: string,
     attemptId: string | null,
     commandStr: string,
-    errorMessage: string
+    errorMessage: string,
+    deferPersistence = false
   ): TestRun {
     const evidenceId = crypto.randomUUID();
     const evidence = this.artifactStore.store(
@@ -784,9 +879,11 @@ export class VerificationService {
       errorMessage,
       'text/plain'
     );
-    this.repo.createEvidence(evidence);
+    if (!deferPersistence) {
+      this.repo.createEvidence(evidence);
+    }
 
-    const failedRun: TestRun = {
+    const failedRun: DeferredTestRun = {
       id: crypto.randomUUID(),
       task_id: taskId,
       command: commandStr,
@@ -798,7 +895,11 @@ export class VerificationService {
       evidence_id: evidenceId,
       created_at: new Date().toISOString(),
     };
-    this.repo.createTestRun(failedRun);
+    if (deferPersistence) {
+      failedRun.pending_evidence = evidence;
+    } else {
+      this.repo.createTestRun(failedRun);
+    }
     return failedRun;
   }
 }

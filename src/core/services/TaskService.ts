@@ -7,7 +7,7 @@ import { GitService } from './GitService';
 import { ProgressService } from './ProgressService';
 import { TaskStateMachine, TaskTrigger } from '../state/taskStateMachine';
 import { ManagerProtocol, CoderProtocol } from '../types/protocols';
-import { Task, TestRun, GitStatusSummary, GitDiffSummary } from '../types/domain';
+import { Evidence, Task, TaskMutationBinding, TestRun, GitStatusSummary, GitDiffSummary } from '../types/domain';
 
 export interface TaskCreationSpec {
   projectId: string;
@@ -32,10 +32,19 @@ export interface ApplyProtocolResult {
 export interface ValidationFlowResult {
   success: boolean;
   taskId: string;
+  executionId: string;
   testRun: TestRun;
   gitStatus: GitStatusSummary;
   gitDiff: GitDiffSummary;
   finalTaskState: string;
+  stale?: boolean;
+  error?: string;
+}
+
+export interface ReviewStartResult {
+  success: boolean;
+  task?: Task;
+  executionId?: string;
   error?: string;
 }
 
@@ -547,70 +556,135 @@ export class TaskService {
     }
   }
 
-  public startReview(taskId: string, expectedProjectId?: string): { success: boolean; task?: Task; error?: string } {
-    const task = this.repo.getTask(taskId);
-    if (!task) {
-      return { success: false, error: `Task ${taskId} not found.` };
-    }
-
-    // Cross-project guard
-    if (expectedProjectId && task.project_id !== expectedProjectId) {
-      return {
-        success: false,
-        error: `Cross-project guard: Task ${taskId} belongs to "${task.project_id}", not "${expectedProjectId}".`,
-      };
-    }
-
-    if (task.state === 'REVIEWING') {
-      return { success: true, task };
-    }
-
-    if (task.state !== 'REVIEW_READY') {
-      return {
-        success: false,
-        error: `Cannot start review: Task is in state "${task.state}", expected "REVIEW_READY".`,
-      };
-    }
-
-    const trans = TaskStateMachine.transition(task.state, 'START_REVIEW', {
-      revisionCount: task.revision_count,
-      maxRevisions: task.max_revisions,
-    });
-
-    const mutate = () => {
-      this.repo.updateTaskState(task.id, trans.nextState);
-      this.eventService.record(
-        task.project_id,
-        'REVIEW_STARTED',
-        `Review started for task ${task.id}. State: REVIEWING.`,
-        { fromState: task.state, toState: trans.nextState },
-        task.id
-      );
-      return { success: true, task: this.repo.getTask(task.id)! };
-    };
+  public startReview(
+    taskId: string,
+    expectedProjectId?: string,
+    binding: TaskMutationBinding = {},
+  ): ReviewStartResult {
+    const executionId = binding.executionId ?? crypto.randomUUID();
 
     try {
-      return this.repo.runInTransaction(mutate);
+      return this.repo.runInImmediateTransaction(() => {
+        const task = this.repo.getTask(taskId);
+        if (!task) {
+          return { success: false, executionId, error: `Task ${taskId} not found.` };
+        }
+
+        if (expectedProjectId && task.project_id !== expectedProjectId) {
+          return {
+            success: false,
+            executionId,
+            error: `Cross-project guard: Task ${taskId} belongs to "${task.project_id}", not "${expectedProjectId}".`,
+          };
+        }
+
+        const currentEpoch = task.ownership_epoch ?? 1;
+        if (
+          (binding.expectedRevision !== undefined && binding.expectedRevision !== task.revision_count) ||
+          (binding.expectedOwnershipEpoch !== undefined && binding.expectedOwnershipEpoch !== currentEpoch)
+        ) {
+          return {
+            success: false,
+            executionId,
+            error: `TASK_BINDING_STALE: review start binding does not match task ${task.id} (revision=${task.revision_count}, ownership_epoch=${currentEpoch}, state=${task.state}).`,
+          };
+        }
+
+        // A concurrent caller that observed the same revision receives the
+        // already-authoritative result without emitting a duplicate event.
+        if (
+          task.state === 'REVIEWING' &&
+          (binding.expectedState === undefined ||
+            binding.expectedState === 'REVIEW_READY' ||
+            binding.expectedState === 'REVIEWING')
+        ) {
+          return { success: true, task, executionId };
+        }
+
+        if (binding.expectedState !== undefined && binding.expectedState !== task.state) {
+          return {
+            success: false,
+            executionId,
+            error: `TASK_BINDING_STALE: review start binding does not match task ${task.id} (revision=${task.revision_count}, ownership_epoch=${currentEpoch}, state=${task.state}).`,
+          };
+        }
+
+        if (task.state !== 'REVIEW_READY') {
+          return {
+            success: false,
+            executionId,
+            error: `Cannot start review: Task is in state "${task.state}", expected "REVIEW_READY".`,
+          };
+        }
+
+        const trans = TaskStateMachine.transition(task.state, 'START_REVIEW', {
+          revisionCount: task.revision_count,
+          maxRevisions: task.max_revisions,
+        });
+        if (!this.repo.compareAndSwapTaskState(
+          task.id,
+          task.state,
+          task.revision_count,
+          trans.nextState,
+          trans.pausedFromState,
+          trans.incrementRevision,
+        )) {
+          return {
+            success: false,
+            executionId,
+            error: `TASK_BINDING_STALE: review start lost the task revision race for ${task.id}.`,
+          };
+        }
+
+        this.eventService.record(
+          task.project_id,
+          'REVIEW_STARTED',
+          `Review started for task ${task.id}. State: REVIEWING.`,
+          {
+            fromState: task.state,
+            toState: trans.nextState,
+            executionId,
+            taskRevision: task.revision_count,
+            ownershipEpoch: currentEpoch,
+          },
+          task.id,
+        );
+        return { success: true, task: this.repo.getTask(task.id)!, executionId };
+      });
     } catch (err: any) {
-      return { success: false, error: err.message };
+      return { success: false, executionId, error: err.message };
     }
   }
 
   public async executeValidationFlow(
     taskId: string,
     commandConfigId?: string,
-    expectedProjectId?: string
+    expectedProjectId?: string,
+    binding: TaskMutationBinding = {},
   ): Promise<ValidationFlowResult> {
     const task = this.repo.getTask(taskId);
     if (!task) {
       throw new Error(`Task ${taskId} not found.`);
     }
 
+    const executionId = binding.executionId ?? crypto.randomUUID();
+    const expectedRevision = binding.expectedRevision ?? task.revision_count;
+    const expectedOwnershipEpoch = binding.expectedOwnershipEpoch ?? (task.ownership_epoch ?? 1);
+    const expectedState = binding.expectedState ?? task.state;
+
     // Cross-project guard
     if (expectedProjectId && task.project_id !== expectedProjectId) {
       throw new Error(
         `Cross-project guard: Task ${taskId} belongs to "${task.project_id}", not "${expectedProjectId}".`
       );
+    }
+
+    if (
+      (binding.expectedRevision !== undefined && binding.expectedRevision !== task.revision_count) ||
+      (binding.expectedOwnershipEpoch !== undefined && binding.expectedOwnershipEpoch !== (task.ownership_epoch ?? 1)) ||
+      (binding.expectedState !== undefined && binding.expectedState !== task.state)
+    ) {
+      throw new Error(`TASK_BINDING_STALE: validation start binding does not match task ${task.id}.`);
     }
 
     const project = this.repo.getProject(task.project_id);
@@ -620,41 +694,35 @@ export class TaskService {
 
     const repoPath = project.repository_path;
 
+    // Record the execution identity before long-running Git/tests work.  The
+    // same binding is required again at the final write fence.
+    this.repo.runInImmediateTransaction(() => {
+      const current = this.repo.getTask(task.id);
+      if (!current) throw new Error(`Task ${task.id} not found.`);
+      const currentEpoch = current.ownership_epoch ?? 1;
+      if (
+        current.project_id !== task.project_id ||
+        current.revision_count !== expectedRevision ||
+        currentEpoch !== expectedOwnershipEpoch ||
+        current.state !== expectedState ||
+        current.base_sha !== task.base_sha
+      ) {
+        throw new Error(`TASK_BINDING_STALE: validation ${executionId} could not start for the captured task revision.`);
+      }
+      this.eventService.record(
+        task.project_id,
+        'VALIDATION_STARTED',
+        `Validation ${executionId} started for task ${task.id}.`,
+        { executionId, taskRevision: expectedRevision, ownershipEpoch: expectedOwnershipEpoch, expectedState },
+        task.id,
+      );
+    });
+
     // 1. Gather authoritative Git status & diff
     const gitStatus = await GitService.getStatus(repoPath);
     const gitDiff = await GitService.getDiff(repoPath, task.base_sha);
     const headShaRes = await GitService.getHeadSha(repoPath);
     const currentSha = headShaRes.status === 'SUCCESS' ? headShaRes.sha : null;
-
-    if (this.artifactStore) {
-      if (gitStatus.status === 'SUCCESS') {
-        const ev = this.artifactStore.store(
-          crypto.randomUUID(),
-          project.id,
-          task.id,
-          null,
-          'GIT_STATUS',
-          `Git Status: ${gitStatus.isClean ? 'Clean' : 'Modified'} on ${gitStatus.branch}`,
-          JSON.stringify(gitStatus, null, 2),
-          'application/json'
-        );
-        this.repo.createEvidence(ev);
-      }
-
-      if (gitDiff.status === 'SUCCESS' && gitDiff.diffContent) {
-        const ev = this.artifactStore.store(
-          crypto.randomUUID(),
-          project.id,
-          task.id,
-          null,
-          'GIT_DIFF',
-          `Git Diff: ${gitDiff.filesChanged.length} files changed`,
-          gitDiff.diffContent,
-          'text/x-diff'
-        );
-        this.repo.createEvidence(ev);
-      }
-    }
 
     // 2. Execute configured test verification suite
     if (!this.verificationService) {
@@ -666,88 +734,247 @@ export class TaskService {
       task.id,
       null,
       repoPath,
-      commandConfigId
+      commandConfigId,
+      { deferPersistence: true, executionId },
     );
+
+    // Re-read HEAD after the potentially long-running test process.  A
+    // commit created by another actor during verification invalidates the
+    // captured SHA and must lose the write fence instead of being recorded as
+    // evidence for the newer workspace.
+    const finalHeadShaRes = await GitService.getHeadSha(repoPath);
+    const finalCurrentSha = finalHeadShaRes.status === 'SUCCESS' ? finalHeadShaRes.sha : null;
+    const workspaceHeadDrifted =
+      headShaRes.status === 'SUCCESS' &&
+      finalHeadShaRes.status === 'SUCCESS' &&
+      currentSha !== finalCurrentSha;
+
+    const pendingEvidence: Evidence[] = [];
+    if (testRun.pending_evidence) pendingEvidence.push(testRun.pending_evidence);
+    if (testRun.pending_process_evidence) pendingEvidence.push(...testRun.pending_process_evidence);
+    if (this.artifactStore) {
+      if (gitStatus.status === 'SUCCESS') {
+        pendingEvidence.push(this.artifactStore.store(
+          crypto.randomUUID(),
+          project.id,
+          task.id,
+          null,
+          'GIT_STATUS',
+          `Git Status: ${gitStatus.isClean ? 'Clean' : 'Modified'} on ${gitStatus.branch}`,
+          JSON.stringify(gitStatus, null, 2),
+          'application/json',
+        ));
+      }
+
+      if (gitDiff.status === 'SUCCESS' && gitDiff.diffContent) {
+        pendingEvidence.push(this.artifactStore.store(
+          crypto.randomUUID(),
+          project.id,
+          task.id,
+          null,
+          'GIT_DIFF',
+          `Git Diff: ${gitDiff.filesChanged.length} files changed`,
+          gitDiff.diffContent,
+          'text/x-diff',
+        ));
+      }
+    }
 
     // 3. Authoritative Evidence Gate: Require Git Success AND Test Exit Code 0
     const gitEvidenceSuccess =
       gitStatus.status === 'SUCCESS' &&
       gitDiff.status === 'SUCCESS' &&
-      headShaRes.status === 'SUCCESS';
+      headShaRes.status === 'SUCCESS' &&
+      finalHeadShaRes.status === 'SUCCESS' &&
+      !workspaceHeadDrifted;
 
     const verificationPassed = gitEvidenceSuccess && testRun.exit_code === 0;
 
-    const currentTask = this.repo.getTask(task.id)!;
-    let nextState = currentTask.state;
+    const cleanupPendingEvidence = () => {
+      const filePaths = pendingEvidence
+        .map((evidence) => evidence.file_path)
+        .filter((filePath): filePath is string => Boolean(filePath));
+      const store = this.artifactStore ?? this.verificationService?.getArtifactStore();
+      return store && filePaths.length > 0
+        ? store.cleanupRollbackFiles(filePaths, (filePath) => this.repo.isEvidenceFilePathReferenced(filePath))
+        : { cleanedCount: 0, failures: [] as Array<{ path: string; error: string }> };
+    };
 
-    if (verificationPassed) {
-      // Verification & Git Evidence Passed -> Advance to REVIEW_READY
-      const trans = TaskStateMachine.transition(currentTask.state, 'EVIDENCE_GATHERED', {
-        revisionCount: currentTask.revision_count,
-        maxRevisions: currentTask.max_revisions,
-      });
-      this.repo.updateTaskState(task.id, trans.nextState);
-      if (currentSha) {
-        this.repo.updateTaskShas(task.id, task.base_sha, currentSha);
+    const commitResult = (() => {
+      try {
+        return this.repo.runInImmediateTransaction(() => {
+          const currentTask = this.repo.getTask(task.id);
+          if (!currentTask) throw new Error(`Task ${task.id} not found.`);
+          const currentEpoch = currentTask.ownership_epoch ?? 1;
+          const bindingMismatch =
+            currentTask.project_id !== task.project_id ||
+            currentTask.revision_count !== expectedRevision ||
+            currentEpoch !== expectedOwnershipEpoch ||
+            currentTask.state !== expectedState ||
+            currentTask.base_sha !== task.base_sha;
+
+          if (bindingMismatch) {
+            this.eventService.record(
+              project.id,
+              'VALIDATION_STALE_RESULT',
+              `Validation ${executionId} completed against a stale task binding and was discarded.`,
+              {
+                executionId,
+                expectedRevision,
+                expectedOwnershipEpoch,
+                expectedState,
+                currentRevision: currentTask.revision_count,
+                currentOwnershipEpoch: currentEpoch,
+                currentState: currentTask.state,
+              },
+              task.id,
+            );
+            return { stale: true, success: false, task: currentTask, nextState: currentTask.state };
+          }
+
+          if (workspaceHeadDrifted) {
+            this.eventService.record(
+              project.id,
+              'VALIDATION_STALE_RESULT',
+              `Validation ${executionId} observed a different repository HEAD after tests and was discarded.`,
+              {
+                executionId,
+                expectedHeadSha: currentSha,
+                observedHeadSha: finalCurrentSha,
+              },
+              task.id,
+            );
+            return { stale: true, success: false, task: currentTask, nextState: currentTask.state };
+          }
+
+          const trigger = verificationPassed ? 'EVIDENCE_GATHERED' : 'TESTS_FAILED';
+          const trans = TaskStateMachine.transition(currentTask.state, trigger, {
+            revisionCount: currentTask.revision_count,
+            maxRevisions: currentTask.max_revisions,
+          });
+          if (!this.repo.compareAndSwapTaskState(
+            currentTask.id,
+            currentTask.state,
+            currentTask.revision_count,
+            trans.nextState,
+            trans.pausedFromState,
+            trans.incrementRevision,
+          )) {
+            this.eventService.record(
+              project.id,
+              'VALIDATION_STALE_RESULT',
+              `Validation ${executionId} lost the task revision race and was discarded.`,
+              { executionId, expectedRevision, expectedOwnershipEpoch },
+              task.id,
+            );
+            return { stale: true, success: false, task: this.repo.getTask(task.id)!, nextState: currentTask.state };
+          }
+
+          for (const evidence of pendingEvidence) this.repo.createEvidence(evidence);
+          if (testRun.pending_process_run) {
+            const processRun = testRun.pending_process_run;
+            const terminalStatus =
+              processRun.status === 'RUNNING'
+                ? processRun.exit_code === 0
+                  ? 'COMPLETED'
+                  : 'FAILED'
+                : processRun.status;
+            this.repo.createProcessRun({
+              id: processRun.id,
+              pid: processRun.pid,
+              project_id: project.id,
+              task_id: task.id,
+              attempt_id: null,
+              command: processRun.command,
+              working_directory: processRun.working_directory,
+              status: 'RUNNING',
+              start_time: processRun.start_time,
+            });
+            this.repo.updateProcessRun(
+              processRun.id,
+              terminalStatus,
+              processRun.exit_code,
+              processRun.end_time,
+              processRun.stdout_evidence_id,
+              processRun.stderr_evidence_id,
+            );
+          }
+          this.repo.createTestRun(testRun);
+          if (verificationPassed && finalCurrentSha) this.repo.updateTaskShas(task.id, task.base_sha, finalCurrentSha);
+
+          const finalTask = this.repo.getTask(task.id)!;
+          const verifCmds = this.repo.getVerificationCommandsByProject(project.id);
+          const hasLintConfig = verifCmds.some((c) => c.command_type === 'LINT' && c.enabled);
+          const progress = ProgressService.calculateTaskProgress(finalTask, {
+            hasGitDiff: gitDiff.status === 'SUCCESS' && gitDiff.filesChanged.length > 0,
+            hasEvidence: gitEvidenceSuccess && (gitDiff.filesChanged.length > 0 || gitStatus.isClean),
+            testsPassed: testRun.exit_code === 0,
+            excludeUnconfiguredLint: !hasLintConfig,
+            lintPassed: false,
+          });
+          this.repo.updateTaskProgressCache(task.id, progress.percent);
+
+          if (verificationPassed) {
+            this.eventService.record(
+              project.id,
+              'VERIFICATION_PASSED',
+              `Task ${task.id} verification tests passed (${testRun.passed_count} passed). Transitioned to REVIEW_READY.`,
+              { executionId, passed: testRun.passed_count, exitCode: testRun.exit_code, sha: finalCurrentSha },
+              task.id,
+            );
+          } else {
+            const failureReason = !gitEvidenceSuccess
+              ? `Authoritative Git evidence failed (Status: ${gitStatus.status}, Diff: ${gitDiff.status}, initial SHA: ${headShaRes.status}, final SHA: ${finalHeadShaRes.status}).`
+              : `Verification tests failed (exit code ${testRun.exit_code}, ${testRun.failed_count} failures).`;
+            this.eventService.record(
+              project.id,
+              'VERIFICATION_FAILED',
+              `Task ${task.id} verification failed: ${failureReason}. Returned to ${trans.nextState}.`,
+              {
+                executionId,
+                gitStatus: gitStatus.status,
+                gitDiff: gitDiff.status,
+                testExitCode: testRun.exit_code,
+                failedCount: testRun.failed_count,
+              },
+              task.id,
+            );
+          }
+          return { stale: false, success: verificationPassed, task: this.repo.getTask(task.id)!, nextState: trans.nextState };
+        });
+      } catch (error) {
+        cleanupPendingEvidence();
+        throw error;
       }
-      nextState = trans.nextState;
+    })();
 
-      this.eventService.record(
-        project.id,
-        'VERIFICATION_PASSED',
-        `Task ${task.id} verification tests passed (${testRun.passed_count} passed). Transitioned to REVIEW_READY.`,
-        { passed: testRun.passed_count, exitCode: testRun.exit_code, sha: currentSha },
-        task.id
-      );
-    } else {
-      // Verification or Git Evidence Failed -> Do NOT advance to REVIEW_READY
-      const trans = TaskStateMachine.transition(currentTask.state, 'TESTS_FAILED', {
-        revisionCount: currentTask.revision_count,
-        maxRevisions: currentTask.max_revisions,
-      });
-      this.repo.updateTaskState(task.id, trans.nextState, null, trans.incrementRevision);
-      nextState = trans.nextState;
-
-      const failureReason = !gitEvidenceSuccess
-        ? `Authoritative Git evidence failed (Status: ${gitStatus.status}, Diff: ${gitDiff.status}, SHA: ${headShaRes.status}).`
-        : `Verification tests failed (exit code ${testRun.exit_code}, ${testRun.failed_count} failures).`;
-
-      this.eventService.record(
-        project.id,
-        'VERIFICATION_FAILED',
-        `Task ${task.id} verification failed: ${failureReason}. Returned to ${trans.nextState}.`,
-        {
-          gitStatus: gitStatus.status,
-          gitDiff: gitDiff.status,
-          testExitCode: testRun.exit_code,
-          failedCount: testRun.failed_count,
-        },
-        task.id
-      );
+    delete testRun.pending_evidence;
+    delete testRun.pending_process_evidence;
+    delete testRun.pending_process_run;
+    if (commitResult.stale) {
+      cleanupPendingEvidence();
+      return {
+        success: false,
+        stale: true,
+        executionId,
+        taskId,
+        testRun,
+        gitStatus,
+        gitDiff,
+        finalTaskState: commitResult.nextState,
+        error: 'STALE_VALIDATION_RESULT',
+      };
     }
 
-    // Update derived progress strictly from verified evidence
-    const finalTask = this.repo.getTask(task.id)!;
-    const verifCmds = this.repo.getVerificationCommandsByProject(project.id);
-    const hasLintConfig = verifCmds.some((c) => c.command_type === 'LINT' && c.enabled);
-
-    const progress = ProgressService.calculateTaskProgress(finalTask, {
-      hasGitDiff: gitDiff.status === 'SUCCESS' && gitDiff.filesChanged.length > 0,
-      hasEvidence: gitEvidenceSuccess && (gitDiff.filesChanged.length > 0 || gitStatus.isClean),
-      testsPassed: testRun.exit_code === 0,
-      excludeUnconfiguredLint: !hasLintConfig,
-      lintPassed: false,
-    });
-    this.repo.updateTaskProgressCache(task.id, progress.percent);
-
     return {
-      success: verificationPassed,
-      taskId: task.id,
+      success: commitResult.success,
+      executionId,
+      taskId,
       testRun,
       gitStatus,
       gitDiff,
-      finalTaskState: nextState,
-      error: !verificationPassed
+      finalTaskState: commitResult.nextState,
+      error: !commitResult.success
         ? !gitEvidenceSuccess
           ? 'Git evidence collection failed.'
           : 'Verification tests failed.'
