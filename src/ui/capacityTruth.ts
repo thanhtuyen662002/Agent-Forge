@@ -48,6 +48,12 @@ export function clampQuotaPercent(remaining: number | null, total: number | null
   return Math.min(100, Math.max(0, Math.round((remaining / total) * 100)));
 }
 
+/** Keep task progress safe for progress bars and aggregate dashboard KPIs. */
+export function clampProgressPercent(value: number): number {
+  if (!Number.isFinite(value)) return 0;
+  return Math.min(100, Math.max(0, Math.round(value)));
+}
+
 export type ConnectivityState = 'ONLINE' | 'CONNECTING' | 'BROWSER_PREVIEW' | 'ERROR';
 
 export function deriveConnectivityState(input: {

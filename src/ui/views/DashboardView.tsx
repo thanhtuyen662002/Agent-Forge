@@ -3,7 +3,7 @@ import { useOrchestrator } from '../context/OrchestratorContext';
 import { useI18n } from '../context/I18nContext';
 import { AgentCard } from '../components/AgentCard';
 import { ProgressIndicator } from '../components/ProgressIndicator';
-import { validateQuotaSnapshot } from '../capacityTruth';
+import { clampProgressPercent, validateQuotaSnapshot } from '../capacityTruth';
 import {
   Activity,
   CheckCircle2,
@@ -34,7 +34,9 @@ export const DashboardView: React.FC = () => {
   const blockedTasks = tasks.filter((t) => t.state === 'BLOCKED' || t.state === 'NEEDS_HUMAN').length;
 
   const totalProgress = tasks.length > 0
-    ? Math.round(tasks.reduce((sum, t) => sum + t.progress_cache_percent, 0) / tasks.length)
+    ? clampProgressPercent(
+        tasks.reduce((sum, task) => sum + clampProgressPercent(task.progress_cache_percent), 0) / tasks.length
+      )
     : 0;
 
   // Real capacity risk computation based on observable resource quotas

@@ -1,6 +1,7 @@
 ﻿import { describe, expect, it } from 'vitest';
 import {
   clampQuotaPercent,
+  clampProgressPercent,
   deriveConnectivityState,
   quotaSourceLabel,
   validateQuotaSnapshot,
@@ -31,6 +32,14 @@ describe('capacity and capability truth', () => {
     expect(clampQuotaPercent(120, 100)).toBeNull();
     expect(clampQuotaPercent(1, 0)).toBeNull();
     expect(clampQuotaPercent(Number.NaN, 100)).toBeNull();
+  });
+
+  it('clamps invalid task progress deterministically', () => {
+    expect(clampProgressPercent(42.4)).toBe(42);
+    expect(clampProgressPercent(-10)).toBe(0);
+    expect(clampProgressPercent(150)).toBe(100);
+    expect(clampProgressPercent(Number.NaN)).toBe(0);
+    expect(clampProgressPercent(Number.POSITIVE_INFINITY)).toBe(0);
   });
 
   it('preserves every quota source label', () => {
