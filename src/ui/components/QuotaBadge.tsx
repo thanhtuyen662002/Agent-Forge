@@ -20,12 +20,16 @@ export const QuotaBadge: React.FC<QuotaBadgeProps> = ({
 }) => {
   const { t } = useI18n();
   const validation = validateQuotaSnapshot({ remaining, total });
+  const sourceLabel = t(`quota.${quotaSourceLabel(source)}`);
 
   if (!validation.valid || remaining === null || source === 'UNKNOWN') {
     return (
       <div className="inline-flex items-center space-x-1.5 px-2 py-0.5 rounded bg-slate-800 border border-slate-700 text-[11px] font-mono text-slate-400">
         <span className="w-1.5 h-1.5 rounded-full bg-slate-500"></span>
         <span>{t('quota.unknown')}</span>
+        <span className="text-[9px] uppercase px-1 py-0.2 rounded bg-surface/50 border border-surface-border text-slate-400">
+          {sourceLabel}
+        </span>
       </div>
     );
   }
@@ -44,8 +48,6 @@ export const QuotaBadge: React.FC<QuotaBadgeProps> = ({
       dotClass = 'bg-amber-400';
     }
   }
-
-  const sourceLabel = t(`quota.${quotaSourceLabel(source)}`);
 
   return (
     <div className={`inline-flex items-center space-x-2 px-2.5 py-1 rounded-md border text-xs font-mono font-medium ${colorClass}`}>
