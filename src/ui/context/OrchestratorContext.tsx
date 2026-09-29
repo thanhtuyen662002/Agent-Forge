@@ -1,4 +1,4 @@
-import React, { createContext, useContext, useState, useEffect, useCallback } from 'react';
+import React, { createContext, useContext, useState, useEffect, useCallback, useRef } from 'react';
 import { Project, Task, Agent, ProviderResource, EventRecord, Evidence, UIDensityMode } from '../../core/types/domain';
 import type { CanonicalExecutionScope } from '../../core/services/ExecutionAuthorizationService';
 
@@ -20,6 +20,7 @@ interface OrchestratorContextType {
   activeView: string;
   selectedTaskId: string | null;
   loading: boolean;
+  refreshError: string | null;
   setDensityMode: (mode: UIDensityMode) => void;
   setActiveProject: (project: Project | null) => void;
   setActiveView: (view: string) => void;
@@ -95,6 +96,7 @@ export const OrchestratorProvider: React.FC<{ children: React.ReactNode }> = ({ 
   const [activeView, setActiveView] = useState<string>('dashboard');
   const [selectedTaskId, setSelectedTaskId] = useState<string | null>(null);
   const [loading, setLoading] = useState<boolean>(false);
+  const [refreshError, setRefreshError] = useState<string | null>(null);
 
   const refreshData = useCallback(async () => {
     if (!orchestrator) {
@@ -492,6 +494,7 @@ export const OrchestratorProvider: React.FC<{ children: React.ReactNode }> = ({ 
         activeView,
         selectedTaskId,
         loading,
+        refreshError,
         setDensityMode,
         setActiveProject,
         setActiveView,
