@@ -1,30 +1,61 @@
 import { z } from 'zod';
 import { CanonicalExecutionScopeSchema } from '../services/ExecutionAuthorizationService';
 import { TaskStateEnum } from './domain';
+import {
+  boundedArray,
+  boundedRefinedString,
+  boundedString,
+  MAX_CONTEXT_FILES,
+  MAX_PROTOCOL_ARRAY_ITEMS,
+  MAX_PROTOCOL_INPUT_BYTES,
+  MAX_PROTOCOL_STRING_BYTES,
+  MAX_PROVIDER_CANDIDATES,
+} from '../protocol/limits';
+
+const ipcString = () => boundedString(z.string(), MAX_PROTOCOL_STRING_BYTES);
+const requiredIpcString = () => boundedString(z.string().min(1), MAX_PROTOCOL_STRING_BYTES);
+const ipcStringArray = () => boundedArray(z.array(ipcString()), MAX_PROTOCOL_ARRAY_ITEMS);
+
+// Preserve the canonical path/shape refinements while applying the same byte
+// and collection ceilings at the renderer boundary.  The canonical schema is
+// also used for durable payload validation, so keep these limits local to IPC
+// rather than changing the persisted wire format here.
+const boundedExecutionScopeSchema = z
+  .object({
+    branch: boundedString(z.string().min(1)),
+    worktree: boundedRefinedString(
+      CanonicalExecutionScopeSchema.shape.worktree,
+      MAX_PROTOCOL_STRING_BYTES,
+      'Worktree'
+    ),
+    allowedPaths: ipcStringArray(),
+    forbiddenPaths: ipcStringArray(),
+  })
+  .strict();
 
 // Strict Zod schemas for all IPC channels across the main process security boundary
 
 export const CreateProjectIpcSchema = z.object({
-  name: z.string().min(1, 'Project name is required').max(100),
-  description: z.string().max(500).optional().default(''),
-  repositorySelectionId: z.string().uuid('A valid native repository selection token is required'),
-  defaultBranch: z.string().optional().default('main'),
+  name: boundedString(z.string().min(1, 'Project name is required').max(100)),
+  description: boundedString(z.string().max(500)).optional().default(''),
+  repositorySelectionId: boundedString(z.string().uuid('A valid native repository selection token is required')),
+  defaultBranch: ipcString().optional().default('main'),
 });
 export type CreateProjectIpc = z.infer<typeof CreateProjectIpcSchema>;
 
 export const ImportContractIpcSchema = z.object({
-  projectId: z.string().min(1),
+  projectId: requiredIpcString(),
   contract: z.object({
-    goal: z.string().min(1),
-    business_context: z.string().optional(),
-    architecture_constraints: z.array(z.string()).default([]),
-    technical_constraints: z.array(z.string()).default([]),
-    security_requirements: z.array(z.string()).default([]),
-    acceptance_criteria: z.array(z.string()).default([]),
-    non_goals: z.array(z.string()).default([]),
-    definition_of_done: z.array(z.string()).default([]),
-    testing_requirements: z.array(z.string()).default([]),
-    owner_policies: z.array(z.string()).default([]),
+    goal: requiredIpcString(),
+    business_context: ipcString().optional(),
+    architecture_constraints: ipcStringArray().default([]),
+    technical_constraints: ipcStringArray().default([]),
+    security_requirements: ipcStringArray().default([]),
+    acceptance_criteria: ipcStringArray().default([]),
+    non_goals: ipcStringArray().default([]),
+    definition_of_done: ipcStringArray().default([]),
+    testing_requirements: ipcStringArray().default([]),
+    owner_policies: ipcStringArray().default([]),
   }),
 });
 export type ImportContractIpc = z.infer<typeof ImportContractIpcSchema>;
@@ -50,63 +81,63 @@ export const ProjectTriggerSchema = z.enum([
 export type ProjectTriggerType = z.infer<typeof ProjectTriggerSchema>;
 
 export const TransitionProjectIpcSchema = z.object({
-  projectId: z.string().min(1, 'Project ID is required'),
+  projectId: requiredIpcString(),
   trigger: ProjectTriggerSchema,
 });
 export type TransitionProjectIpc = z.infer<typeof TransitionProjectIpcSchema>;
 
 export const CreateTaskIpcSchema = z.object({
-  projectId: z.string().min(1, 'Project ID is required'),
-  id: z.string().optional(),
-  milestoneId: z.string().nullable().optional(),
-  title: z.string().min(1, 'Task title is required').max(200),
-  description: z.string().nullable().optional(),
+  projectId: requiredIpcString(),
+  id: ipcString().optional(),
+  milestoneId: ipcString().nullable().optional(),
+  title: boundedString(z.string().min(1, 'Task title is required').max(200)),
+  description: ipcString().nullable().optional(),
   priority: z.enum(['LOW', 'MEDIUM', 'HIGH', 'CRITICAL']).default('MEDIUM'),
   risk: z.enum(['LOW', 'MEDIUM', 'HIGH', 'CRITICAL']).default('MEDIUM'),
-  acceptanceCriteria: z.array(z.string()).default([]),
-  constraints: z.array(z.string()).default([]),
+  acceptanceCriteria: ipcStringArray().default([]),
+  constraints: ipcStringArray().default([]),
 });
 export type CreateTaskIpc = z.infer<typeof CreateTaskIpcSchema>;
 
 export const ParseProtocolIpcSchema = z.object({
-  rawInput: z.string().min(1, 'Protocol input text is required'),
+  rawInput: boundedString(z.string().min(1, 'Protocol input text is required'), MAX_PROTOCOL_INPUT_BYTES),
 });
 export type ParseProtocolIpc = z.infer<typeof ParseProtocolIpcSchema>;
 
 export const ApplyProtocolIpcSchema = z.object({
-  rawInput: z.string().min(1, 'Raw protocol input is required'),
+  rawInput: boundedString(z.string().min(1, 'Raw protocol input is required'), MAX_PROTOCOL_INPUT_BYTES),
 });
 export type ApplyProtocolIpc = z.infer<typeof ApplyProtocolIpcSchema>;
 
 export const GenerateWorkOrderIpcSchema = z.object({
-  projectId: z.string().min(1),
-  taskId: z.string().min(1),
+  projectId: requiredIpcString(),
+  taskId: requiredIpcString(),
 });
 
 export const GenerateReviewPackageIpcSchema = z.object({
-  projectId: z.string().min(1),
-  taskId: z.string().min(1),
+  projectId: requiredIpcString(),
+  taskId: requiredIpcString(),
 });
 
 export const ProjectScopedIpcSchema = z.object({
-  projectId: z.string().min(1),
+  projectId: requiredIpcString(),
 });
 
 export const TaskScopedIpcSchema = z.object({
-  taskId: z.string().min(1),
+  taskId: requiredIpcString(),
 });
 
 const TaskMutationBindingIpcFields = {
   expectedRevision: z.number().int().min(0).max(1_000_000).optional(),
   expectedOwnershipEpoch: z.number().int().min(1).max(1_000_000_000).optional(),
   expectedState: TaskStateEnum.optional(),
-  executionId: z.string().uuid('A valid validation execution ID is required').optional(),
+  executionId: boundedString(z.string().uuid('A valid validation execution ID is required')).optional(),
 };
 
 export const StartReviewIpcSchema = z
   .object({
-    taskId: z.string().min(1),
-    expectedProjectId: z.string().min(1).max(200).optional(),
+    taskId: requiredIpcString(),
+    expectedProjectId: boundedString(z.string().min(1).max(200)).optional(),
     ...TaskMutationBindingIpcFields,
   })
   .strict();
@@ -114,16 +145,16 @@ export type StartReviewIpc = z.infer<typeof StartReviewIpcSchema>;
 
 export const RunVerificationIpcSchema = z
   .object({
-    taskId: z.string().min(1),
-    commandConfigId: z.string().optional(),
-    expectedProjectId: z.string().min(1).max(200).optional(),
+    taskId: requiredIpcString(),
+    commandConfigId: ipcString().optional(),
+    expectedProjectId: boundedString(z.string().min(1).max(200)).optional(),
     ...TaskMutationBindingIpcFields,
   })
   .strict();
 export type RunVerificationIpc = z.infer<typeof RunVerificationIpcSchema>;
 
 export const UpdateResourceQuotaIpcSchema = z.object({
-  id: z.string().min(1),
+  id: requiredIpcString(),
   remaining: z.number().nullable(),
   total: z.number().nullable(),
   source: z.enum(['MEASURED', 'PROVIDER_REPORTED', 'MANUAL', 'ESTIMATED', 'UNKNOWN']),
@@ -137,12 +168,12 @@ export type UpdateResourceQuotaIpc = z.infer<typeof UpdateResourceQuotaIpcSchema
  * it safely defaults to 'Manual Owner Emergency Stop' rather than rejecting the safety action.
  */
 export const EmergencyStopIpcSchema = z.object({
-  reason: z.string().optional().default('Manual Owner Emergency Stop'),
+  reason: ipcString().optional().default('Manual Owner Emergency Stop'),
 });
 export type EmergencyStopIpc = z.infer<typeof EmergencyStopIpcSchema>;
 
 export const ResumeProjectIpcSchema = z.object({
-  projectId: z.string().min(1),
+  projectId: requiredIpcString(),
 });
 export type ResumeProjectIpc = z.infer<typeof ResumeProjectIpcSchema>;
 
@@ -152,12 +183,13 @@ export type ResumeProjectIpc = z.infer<typeof ResumeProjectIpcSchema>;
 
 export const RouteTaskIpcSchema = z
   .object({
-    projectId: z.string().min(1, 'Project ID is required'),
-    taskId: z.string().min(1, 'Task ID is required'),
-    attemptId: z.string().nullable().optional(),
-    candidateResourceIds: z
-      .array(z.string().min(1, 'Candidate resource ID cannot be empty'))
-      .min(1, 'At least one candidate resource is required'),
+    projectId: requiredIpcString(),
+    taskId: requiredIpcString(),
+    attemptId: ipcString().nullable().optional(),
+    candidateResourceIds: boundedArray(
+      z.array(boundedString(z.string().min(1, 'Candidate resource ID cannot be empty'))),
+      MAX_PROVIDER_CANDIDATES
+    ).min(1, 'At least one candidate resource is required'),
     allowManualBridge: z.boolean().default(false),
   })
   .strict();
@@ -165,33 +197,33 @@ export type RouteTaskIpc = z.infer<typeof RouteTaskIpcSchema>;
 
 export const AuthorizeRoutedTaskIpcSchema = z
   .object({
-    projectId: z.string().min(1, 'Project ID is required'),
-    taskId: z.string().min(1, 'Task ID is required'),
-    attemptId: z.string().nullable().optional(),
-    routingDecisionId: z.string().min(1, 'Routing decision ID is required'),
-    contextFiles: z.array(z.string()).optional().default([]),
-    executionScope: CanonicalExecutionScopeSchema.optional(),
+    projectId: requiredIpcString(),
+    taskId: requiredIpcString(),
+    attemptId: ipcString().nullable().optional(),
+    routingDecisionId: requiredIpcString(),
+    contextFiles: boundedArray(ipcStringArray(), MAX_CONTEXT_FILES).optional().default([]),
+    executionScope: boundedExecutionScopeSchema.optional(),
   })
   .strict();
 export type AuthorizeRoutedTaskIpc = z.infer<typeof AuthorizeRoutedTaskIpcSchema>;
 
 export const DispatchAuthorizationIpcSchema = z
   .object({
-    authorizationId: z.string().min(1, 'Authorization ID is required'),
+    authorizationId: requiredIpcString(),
   })
   .strict();
 export type DispatchAuthorizationIpc = z.infer<typeof DispatchAuthorizationIpcSchema>;
 
 export const GetOwnerHandoffSnapshotIpcSchema = z
   .object({
-    taskId: z.string().min(1, 'Task ID is required'),
+    taskId: requiredIpcString(),
   })
   .strict();
 export type GetOwnerHandoffSnapshotIpc = z.infer<typeof GetOwnerHandoffSnapshotIpcSchema>;
 
 export const GenerateAuthorizedWorkOrderIpcSchema = z
   .object({
-    authorizationId: z.string().min(1, 'Authorization ID is required'),
+    authorizationId: requiredIpcString(),
   })
   .strict();
 export type GenerateAuthorizedWorkOrderIpc = z.infer<typeof GenerateAuthorizedWorkOrderIpcSchema>;
@@ -221,19 +253,19 @@ export type GetAppInfoIpc = z.infer<typeof GetAppInfoIpcSchema>;
 
 export const GetVerificationCommandsIpcSchema = z
   .object({
-    projectId: z.string().min(1, 'Project ID is required'),
+    projectId: requiredIpcString(),
   })
   .strict();
 export type GetVerificationCommandsIpc = z.infer<typeof GetVerificationCommandsIpcSchema>;
 
 export const SaveVerificationCommandsIpcSchema = z
   .object({
-    projectId: z.string().min(1, 'Project ID is required'),
+    projectId: requiredIpcString(),
     commands: z
       .object({
-        TEST: z.string().max(1000).optional().nullable(),
-        LINT: z.string().max(1000).optional().nullable(),
-        BUILD: z.string().max(1000).optional().nullable(),
+        TEST: boundedString(z.string().max(1000)).optional().nullable(),
+        LINT: boundedString(z.string().max(1000)).optional().nullable(),
+        BUILD: boundedString(z.string().max(1000)).optional().nullable(),
       })
       .strict(),
   })
@@ -246,8 +278,8 @@ export type SaveVerificationCommandsIpc = z.infer<typeof SaveVerificationCommand
 
 export const ListQuarantinedSubmissionsIpcSchema = z
   .object({
-    projectId: z.string().min(1).optional(),
-    taskId: z.string().min(1).optional(),
+    projectId: boundedString(z.string().min(1)).optional(),
+    taskId: boundedString(z.string().min(1)).optional(),
     limit: z.number().int().min(1).max(100).optional().default(50),
     offset: z.number().int().min(0).optional().default(0),
     reverse: z.boolean().optional().default(false),
@@ -257,15 +289,15 @@ export type ListQuarantinedSubmissionsIpc = z.infer<typeof ListQuarantinedSubmis
 
 export const InspectQuarantinedSubmissionIpcSchema = z
   .object({
-    submissionId: z.string().uuid('A valid UUID submission ID is required'),
+    submissionId: boundedString(z.string().uuid('A valid UUID submission ID is required')),
   })
   .strict();
 export type InspectQuarantinedSubmissionIpc = z.infer<typeof InspectQuarantinedSubmissionIpcSchema>;
 
 export const AdmitQuarantinedSubmissionIpcSchema = z
   .object({
-    requestId: z.string().uuid('A valid UUID request ID is required'),
-    submissionId: z.string().uuid('A valid UUID submission ID is required'),
+    requestId: boundedString(z.string().uuid('A valid UUID request ID is required')),
+    submissionId: boundedString(z.string().uuid('A valid UUID submission ID is required')),
     expectedLifecycleVersion: z.number().int().nonnegative('Expected lifecycle version must be non-negative').optional(),
   })
   .strict();
@@ -273,30 +305,30 @@ export type AdmitQuarantinedSubmissionIpc = z.infer<typeof AdmitQuarantinedSubmi
 
 export const RejectQuarantinedSubmissionIpcSchema = z
   .object({
-    requestId: z.string().uuid('A valid UUID request ID is required'),
-    submissionId: z.string().uuid('A valid UUID submission ID is required'),
+    requestId: boundedString(z.string().uuid('A valid UUID request ID is required')),
+    submissionId: boundedString(z.string().uuid('A valid UUID submission ID is required')),
     expectedLifecycleVersion: z.number().int().nonnegative('Expected lifecycle version must be non-negative'),
-    reason: z.string().min(1, 'Reason is required').max(1000),
+    reason: boundedString(z.string().min(1, 'Reason is required').max(1000)),
   })
   .strict();
 export type RejectQuarantinedSubmissionIpc = z.infer<typeof RejectQuarantinedSubmissionIpcSchema>;
 
 export const SupersedeQuarantinedSubmissionIpcSchema = z
   .object({
-    requestId: z.string().uuid('A valid UUID request ID is required'),
-    submissionId: z.string().uuid('A valid UUID submission ID is required'),
+    requestId: boundedString(z.string().uuid('A valid UUID request ID is required')),
+    submissionId: boundedString(z.string().uuid('A valid UUID submission ID is required')),
     expectedLifecycleVersion: z.number().int().nonnegative('Expected lifecycle version must be non-negative'),
-    replacementSubmissionId: z.string().uuid('A valid UUID replacement submission ID is required'),
-    reason: z.string().min(1, 'Reason is required').max(1000),
+    replacementSubmissionId: boundedString(z.string().uuid('A valid UUID replacement submission ID is required')),
+    reason: boundedString(z.string().min(1, 'Reason is required').max(1000)),
   })
   .strict();
 export type SupersedeQuarantinedSubmissionIpc = z.infer<typeof SupersedeQuarantinedSubmissionIpcSchema>;
 
 export const ResumeAdmittedSubmissionIpcSchema = z
   .object({
-    requestId: z.string().uuid('A valid UUID request ID is required'),
-    submissionId: z.string().uuid('A valid UUID submission ID is required'),
-    adjudicationId: z.string().min(1, 'Adjudication ID is required'),
+    requestId: boundedString(z.string().uuid('A valid UUID request ID is required')),
+    submissionId: boundedString(z.string().uuid('A valid UUID submission ID is required')),
+    adjudicationId: requiredIpcString(),
     expectedLifecycleVersion: z.number().int().positive('Expected lifecycle version must be a positive integer'),
   })
   .strict();
@@ -304,9 +336,9 @@ export type ResumeAdmittedSubmissionIpc = z.infer<typeof ResumeAdmittedSubmissio
 
 export const AcknowledgeRecoveryFencedIpcSchema = z
   .object({
-    requestId: z.string().uuid('A valid UUID request ID is required'),
-    submissionId: z.string().uuid('A valid UUID submission ID is required'),
-    adjudicationId: z.string().min(1, 'Adjudication ID is required'),
+    requestId: boundedString(z.string().uuid('A valid UUID request ID is required')),
+    submissionId: boundedString(z.string().uuid('A valid UUID submission ID is required')),
+    adjudicationId: requiredIpcString(),
     expectedLifecycleVersion: z.number().int().positive('Expected lifecycle version must be a positive integer'),
     decision: z.enum(['ACKNOWLEDGE', 'CANCEL']),
   })

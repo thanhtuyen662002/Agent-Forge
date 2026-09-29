@@ -14,6 +14,7 @@ import {
 } from "./McpProtocolSchemas";
 import { McpAuthorityContext, getDefaultAuthorityContext } from "./McpAuthorityContext";
 import { McpAuthorityError, McpExtendedErrorCode } from "../core/services/McpSessionAuthorityService";
+import { stringifyBoundedJson } from "../core/protocol/limits";
 
 export function getCanonicalPublicErrorMessage(category: McpExtendedErrorCode): string {
   switch (category) {
@@ -101,7 +102,7 @@ export function registerAgentForgeCapabilities(
     async () => {
       try {
         const result = authorityContext.resolveAuthorizedContext();
-        const serialized = JSON.stringify(result);
+        const serialized = stringifyBoundedJson(result, undefined, 'Authorized context response');
         return {
           content: [
             {
@@ -137,7 +138,7 @@ export function registerAgentForgeCapabilities(
       const uriString = typeof uri === "string" ? uri : (uri as { href: string }).href;
       try {
         const result = authorityContext.resolveAuthorizedContext();
-        const serialized = JSON.stringify(result);
+        const serialized = stringifyBoundedJson(result, undefined, 'Authorized context resource');
         return {
           contents: [
             {

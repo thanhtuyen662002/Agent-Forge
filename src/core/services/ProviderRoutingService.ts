@@ -8,6 +8,7 @@ import { Repository } from '../database/repositories';
 import { ProviderRegistry } from '../adapters/ProviderRegistry';
 import { EventService } from './EventService';
 import { QuotaSnapshotInfo } from '../adapters/ProviderAdapter';
+import { isWithinByteLimit, MAX_PROTOCOL_ARRAY_ITEMS, MAX_PROTOCOL_STRING_BYTES, MAX_PROVIDER_CANDIDATES } from '../protocol/limits';
 
 export interface RoutingRequest {
   projectId: string;
@@ -68,6 +69,38 @@ export class ProviderRoutingService {
     const decisionId = crypto.randomUUID();
     const createdAt = new Date().toISOString();
     const normalizedAttemptId = request.attemptId ?? null;
+
+    // Reject malformed or oversized caller-controlled collections before any
+    // repository/provider work or durable routing event can be attempted.
+    const candidateIds = request.candidateResourceIds;
+    const invalidCandidateList =
+      !Array.isArray(candidateIds) ||
+      candidateIds.length === 0 ||
+      candidateIds.length > MAX_PROVIDER_CANDIDATES ||
+      candidateIds.some((resourceId) => typeof resourceId !== 'string' || !isWithinByteLimit(resourceId, MAX_PROTOCOL_STRING_BYTES));
+    const invalidCapabilityList =
+      !Array.isArray(request.requiredCapabilities) || request.requiredCapabilities.length > MAX_PROTOCOL_ARRAY_ITEMS;
+    if (invalidCandidateList || invalidCapabilityList) {
+      return {
+        decisionId,
+        projectId: request.projectId,
+        taskId: request.taskId,
+        attemptId: normalizedAttemptId,
+        outcome: 'NO_ELIGIBLE_PROVIDER',
+        selectedResourceId: null,
+        selectedProviderId: null,
+        adapterType: null,
+        candidateEvaluations: [],
+        reason: invalidCapabilityList
+          ? `Required capability list exceeds the ${MAX_PROTOCOL_ARRAY_ITEMS}-item limit.`
+          : !Array.isArray(candidateIds) || candidateIds.length === 0
+            ? 'No candidate resources provided in routing request.'
+            : candidateIds.length > MAX_PROVIDER_CANDIDATES
+              ? `Candidate resource list exceeds the ${MAX_PROVIDER_CANDIDATES}-item limit.`
+              : 'Candidate resource list contains an oversized or invalid resource ID.',
+        createdAt,
+      };
+    }
 
     // 1. Validate Scope: Project, Task, and Attempt ownership
     const project = this.repo.getProject(request.projectId);
@@ -147,8 +180,10 @@ export class ProviderRoutingService {
       }
     }
 
-    // 2. Validate candidate list presence
-    if (!request.candidateResourceIds || request.candidateResourceIds.length === 0) {
+    // 2. Validate candidate list presence and bound work before probing the
+    // repository or provider registry. IPC normally enforces this too, but
+    // the service is also called directly by recovery and test tooling.
+    if (!request.candidateResourceIds || request.candidateResourceIds.length === 0 || request.candidateResourceIds.length > MAX_PROVIDER_CANDIDATES) {
       const decision: RoutingDecision = {
         decisionId,
         projectId: request.projectId,
@@ -159,7 +194,10 @@ export class ProviderRoutingService {
         selectedProviderId: null,
         adapterType: null,
         candidateEvaluations: [],
-        reason: 'No candidate resources provided in routing request.',
+        reason:
+          request.candidateResourceIds && request.candidateResourceIds.length > MAX_PROVIDER_CANDIDATES
+            ? `Candidate resource list exceeds the ${MAX_PROVIDER_CANDIDATES}-item limit.`
+            : 'No candidate resources provided in routing request.',
         createdAt,
       };
       this.recordDecisionEvent(request, decision);

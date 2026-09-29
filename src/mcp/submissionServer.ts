@@ -17,6 +17,7 @@ import {
   canonicalJsonStringify,
 } from './submissionProtocol';
 import { McpSubmissionAuthorityService } from '../core/services/McpSubmissionAuthorityService';
+import { stringifyBoundedJson } from '../core/protocol/limits';
 
 export const SUBMISSION_SERVER_NAME = 'agentforge-submit';
 export const SUBMISSION_SERVER_VERSION = '0.1.0';
@@ -168,6 +169,15 @@ export function registerSubmissionCapabilities(
       const token = context.getSubmissionToken();
       const result: SubmissionResult = service.submitCoderClaim(rawArgs, token);
 
+      try {
+        stringifyBoundedJson(result, undefined, 'Coder submission response');
+      } catch {
+        return {
+          isError: true,
+          content: [{ type: 'text' as const, text: '[PAYLOAD_LIMIT_EXCEEDED] Coder submission response is too large.' }],
+        };
+      }
+
       const explanation = result.accepted
         ? `[QUARANTINED] Coder claim ${result.submission_id} accepted and quarantined. Duplicate: ${result.is_duplicate}. Envelope: ${result.canonical_envelope_hash}.`
         : `[${result.error_code}] ${result.message}`;
@@ -220,6 +230,15 @@ export function registerSubmissionCapabilities(
 
       const token = context.getSubmissionToken();
       const result: SubmissionStatusResult = service.getSubmissionStatus(rawArgs, token);
+
+      try {
+        stringifyBoundedJson(result, undefined, 'Coder submission status response');
+      } catch {
+        return {
+          isError: true,
+          content: [{ type: 'text' as const, text: '[PAYLOAD_LIMIT_EXCEEDED] Coder submission status response is too large.' }],
+        };
+      }
 
       const explanation = result.ok
         ? `[${result.lifecycle_status}] Submission ${result.submission_id}: lifecycle=${result.lifecycle_status}, terminal=${result.terminal_outcome ?? 'none'}, task_state=${result.task_state}.`

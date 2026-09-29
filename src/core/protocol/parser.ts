@@ -9,6 +9,7 @@ import {
   CoderReportProtocol,
   CoderReportProtocolSchema,
 } from '../types/protocols';
+import { MAX_PROTOCOL_INPUT_BYTES, isWithinByteLimit } from './limits';
 
 export type ParsedProtocolData =
   | { type: 'manager.v1'; data: ManagerProtocol }
@@ -27,6 +28,9 @@ export interface ParseResult {
 
 export class ProtocolParser {
   public static extractJsonString(rawInput: string): string | null {
+    if (typeof rawInput !== 'string' || !isWithinByteLimit(rawInput, MAX_PROTOCOL_INPUT_BYTES)) {
+      return null;
+    }
     const trimmed = rawInput.trim();
 
     // 1. Direct JSON Check
@@ -71,8 +75,17 @@ export class ProtocolParser {
   }
 
   public static parse(input: string): ParseResult {
-    if (!input || input.trim().length === 0) {
+    if (typeof input !== 'string' || input.trim().length === 0) {
       return { success: false, error: 'Empty protocol input.' };
+    }
+
+    // Reject before extraction/JSON.parse so hostile input cannot force a
+    // large intermediate string or a quadratic brace scan.
+    if (!isWithinByteLimit(input, MAX_PROTOCOL_INPUT_BYTES)) {
+      return {
+        success: false,
+        error: `Protocol input exceeds the ${MAX_PROTOCOL_INPUT_BYTES}-byte limit.`,
+      };
     }
 
     const jsonString = this.extractJsonString(input);

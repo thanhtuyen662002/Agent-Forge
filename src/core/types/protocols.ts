@@ -6,6 +6,11 @@ import {
   TaskStateEnum,
   HandoffReasonEnum
 } from './domain';
+import { boundedArray, boundedString, MAX_PROTOCOL_ARRAY_ITEMS, MAX_PROTOCOL_STRING_BYTES } from '../protocol/limits';
+
+const protocolString = () => boundedString(z.string(), MAX_PROTOCOL_STRING_BYTES);
+const requiredProtocolString = () => boundedString(z.string().min(1), MAX_PROTOCOL_STRING_BYTES);
+const protocolStringArray = () => boundedArray(z.array(protocolString()), MAX_PROTOCOL_ARRAY_ITEMS);
 
 // ==========================================
 // 1. Manager Protocol Schema (manager.v1)
@@ -25,28 +30,28 @@ export type ManagerDecision = z.infer<typeof ManagerDecisionEnum>;
 
 export const ReviewIssueSchema = z.object({
   severity: ReviewIssueSeverityEnum,
-  title: z.string().min(1),
-  file_path: z.string().nullable().optional(),
+  title: requiredProtocolString(),
+  file_path: protocolString().nullable().optional(),
   line_number: z.number().int().nullable().optional(),
-  description: z.string().min(1),
+  description: requiredProtocolString(),
 });
 export type ReviewIssuePayload = z.infer<typeof ReviewIssueSchema>;
 
 export const ManagerProtocolSchema = z.object({
   protocol: z.literal('manager.v1'),
-  message_id: z.string().min(1),
-  project_id: z.string().min(1),
-  task_id: z.string().nullable().optional(),
+  message_id: requiredProtocolString(),
+  project_id: requiredProtocolString(),
+  task_id: protocolString().nullable().optional(),
   decision: ManagerDecisionEnum,
   priority: PriorityEnum.optional().default('MEDIUM'),
   risk: RiskLevelEnum.optional().default('MEDIUM'),
-  instructions: z.array(z.string()).optional().default([]),
-  acceptance_criteria: z.array(z.string()).optional().default([]),
-  constraints: z.array(z.string()).optional().default([]),
-  review_issues: z.array(ReviewIssueSchema).optional().default([]),
+  instructions: protocolStringArray().optional().default([]),
+  acceptance_criteria: protocolStringArray().optional().default([]),
+  constraints: protocolStringArray().optional().default([]),
+  review_issues: boundedArray(z.array(ReviewIssueSchema), MAX_PROTOCOL_ARRAY_ITEMS).optional().default([]),
   expected_task_state: TaskStateEnum.nullable().optional(),
   expected_revision: z.number().int().nonnegative().nullable().optional(),
-  created_at: z.string().optional(),
+  created_at: protocolString().optional(),
 });
 export type ManagerProtocol = z.infer<typeof ManagerProtocolSchema>;
 
@@ -64,20 +69,20 @@ export type CoderStatus = z.infer<typeof CoderStatusEnum>;
 
 export const CoderProtocolSchema = z.object({
   protocol: z.literal('coder.v1'),
-  message_id: z.string().min(1),
-  project_id: z.string().min(1),
-  task_id: z.string().min(1),
+  message_id: requiredProtocolString(),
+  project_id: requiredProtocolString(),
+  task_id: requiredProtocolString(),
   attempt: z.number().int().positive().optional().default(1),
   status: CoderStatusEnum,
-  completed: z.array(z.string()).optional().default([]),
-  remaining: z.array(z.string()).optional().default([]),
-  files_claimed_changed: z.array(z.string()).optional().default([]),
-  tests_claimed: z.array(z.string()).optional().default([]),
-  blockers: z.array(z.string()).optional().default([]),
+  completed: protocolStringArray().optional().default([]),
+  remaining: protocolStringArray().optional().default([]),
+  files_claimed_changed: protocolStringArray().optional().default([]),
+  tests_claimed: protocolStringArray().optional().default([]),
+  blockers: protocolStringArray().optional().default([]),
   review_requested: z.boolean().optional().default(true),
   expected_task_state: TaskStateEnum.nullable().optional(),
   expected_revision: z.number().int().nonnegative().nullable().optional(),
-  created_at: z.string().optional(),
+  created_at: protocolString().optional(),
 });
 export type CoderProtocol = z.infer<typeof CoderProtocolSchema>;
 
@@ -87,19 +92,19 @@ export type CoderProtocol = z.infer<typeof CoderProtocolSchema>;
 
 export const HandoffProtocolSchema = z.object({
   protocol: z.literal('handoff.v1'),
-  message_id: z.string().min(1),
-  task_id: z.string().min(1),
+  message_id: requiredProtocolString(),
+  task_id: requiredProtocolString(),
   attempt: z.number().int().positive(),
-  previous_agent: z.string().min(1),
+  previous_agent: requiredProtocolString(),
   reason: HandoffReasonEnum,
-  completed: z.array(z.string()).default([]),
-  remaining: z.array(z.string()).default([]),
-  known_failures: z.array(z.string()).default([]),
-  base_sha: z.string().default(''),
-  current_sha: z.string().default(''),
-  relevant_files: z.array(z.string()).default([]),
-  next_action: z.string().min(1),
-  created_at: z.string().optional(),
+  completed: protocolStringArray().default([]),
+  remaining: protocolStringArray().default([]),
+  known_failures: protocolStringArray().default([]),
+  base_sha: protocolString().default(''),
+  current_sha: protocolString().default(''),
+  relevant_files: protocolStringArray().default([]),
+  next_action: requiredProtocolString(),
+  created_at: protocolString().optional(),
 });
 export type HandoffProtocol = z.infer<typeof HandoffProtocolSchema>;
 
@@ -109,19 +114,19 @@ export type HandoffProtocol = z.infer<typeof HandoffProtocolSchema>;
 
 export const CoderReportProtocolSchema = z.object({
   protocol: z.literal('coder-report.v1'),
-  message_id: z.string().min(1),
-  phase: z.string().min(1),
+  message_id: requiredProtocolString(),
+  phase: requiredProtocolString(),
   status: z.enum(['COMPLETED', 'IN_PROGRESS', 'BLOCKED', 'FAILED']),
-  summary: z.string().min(1),
-  files_changed: z.array(z.string()).default([]),
-  tests_run: z.array(z.string()).default([]),
-  tests_passed: z.array(z.string()).default([]),
-  tests_failed: z.array(z.string()).default([]),
-  known_issues: z.array(z.string()).default([]),
-  security_notes: z.array(z.string()).default([]),
-  next_phase: z.string().default(''),
+  summary: requiredProtocolString(),
+  files_changed: protocolStringArray().default([]),
+  tests_run: protocolStringArray().default([]),
+  tests_passed: protocolStringArray().default([]),
+  tests_failed: protocolStringArray().default([]),
+  known_issues: protocolStringArray().default([]),
+  security_notes: protocolStringArray().default([]),
+  next_phase: protocolString().default(''),
   requires_manager_review: z.boolean().default(true),
-  created_at: z.string().optional(),
+  created_at: protocolString().optional(),
 });
 export type CoderReportProtocol = z.infer<typeof CoderReportProtocolSchema>;
 
