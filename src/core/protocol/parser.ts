@@ -28,6 +28,9 @@ export interface ParseResult {
 
 export class ProtocolParser {
   public static extractJsonString(rawInput: string): string | null {
+    if (typeof rawInput !== 'string' || !isWithinByteLimit(rawInput, MAX_PROTOCOL_INPUT_BYTES)) {
+      return null;
+    }
     const trimmed = rawInput.trim();
 
     // 1. Direct JSON Check
