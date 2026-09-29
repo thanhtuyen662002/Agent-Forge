@@ -93,9 +93,11 @@ export class ProviderRoutingService {
         candidateEvaluations: [],
         reason: invalidCapabilityList
           ? `Required capability list exceeds the ${MAX_PROTOCOL_ARRAY_ITEMS}-item limit.`
-          : candidateIds && candidateIds.length > MAX_PROVIDER_CANDIDATES
-            ? `Candidate resource list exceeds the ${MAX_PROVIDER_CANDIDATES}-item limit.`
-            : 'Candidate resource list is missing, empty, or contains an oversized resource ID.',
+          : !Array.isArray(candidateIds) || candidateIds.length === 0
+            ? 'No candidate resources provided in routing request.'
+            : candidateIds.length > MAX_PROVIDER_CANDIDATES
+              ? `Candidate resource list exceeds the ${MAX_PROVIDER_CANDIDATES}-item limit.`
+              : 'Candidate resource list contains an oversized or invalid resource ID.',
         createdAt,
       };
     }
