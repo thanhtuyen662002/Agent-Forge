@@ -32,6 +32,7 @@ const boundedExecutionScopeSchema = z
     forbiddenPaths: ipcStringArray(),
   })
   .strict();
+import { MAX_MAX_REVISIONS, MIN_MAX_REVISIONS } from '../../shared/revisionPolicy';
 
 // Strict Zod schemas for all IPC channels across the main process security boundary
 
@@ -271,6 +272,28 @@ export const SaveVerificationCommandsIpcSchema = z
   })
   .strict();
 export type SaveVerificationCommandsIpc = z.infer<typeof SaveVerificationCommandsIpcSchema>;
+
+// Project-scoped loop protection policy. Keep the range identical to the
+// persistence and task-creation boundaries so invalid renderer input cannot
+// reach SQLite or create an unsafe task policy.
+export const GetMaxRevisionsIpcSchema = z
+  .object({
+    projectId: z.string().min(1, 'Project ID is required'),
+  })
+  .strict();
+export type GetMaxRevisionsIpc = z.infer<typeof GetMaxRevisionsIpcSchema>;
+
+export const SaveMaxRevisionsIpcSchema = z
+  .object({
+    projectId: z.string().min(1, 'Project ID is required'),
+    maxRevisions: z
+      .number()
+      .int('Max revisions must be a whole number')
+      .min(MIN_MAX_REVISIONS, 'Max revisions must be at least 1')
+      .max(MAX_MAX_REVISIONS, `Max revisions must be at most ${MAX_MAX_REVISIONS}`),
+  })
+  .strict();
+export type SaveMaxRevisionsIpc = z.infer<typeof SaveMaxRevisionsIpcSchema>;
 
 // ==========================================
 // R5J5: Quarantined Submission Adjudication Schemas

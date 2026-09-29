@@ -12,6 +12,7 @@ import { TaskStateMachine, TaskTrigger } from '../state/taskStateMachine';
 import { ManagerProtocol, CoderProtocol } from '../types/protocols';
 import { Evidence, Task, TaskMutationBinding, TestRun, GitStatusSummary, GitDiffSummary } from '../types/domain';
 import { canonicalJsonStringify, computeSha256 } from '../context/ContextIntegrity';
+import { DEFAULT_MAX_REVISIONS } from '../../shared/revisionPolicy';
 
 export interface TaskCreationSpec {
   projectId: string;
@@ -231,7 +232,7 @@ export class TaskService {
       risk: spec.risk ?? 'MEDIUM',
       assigned_agent_id: null,
       revision_count: 0,
-      max_revisions: 3,
+      max_revisions: this.repo.getProjectMaxRevisions(spec.projectId) || DEFAULT_MAX_REVISIONS,
       base_sha: null,
       current_sha: null,
       progress_cache_percent: 0,
