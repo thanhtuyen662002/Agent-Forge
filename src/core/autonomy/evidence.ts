@@ -2,6 +2,7 @@ import fs from 'fs';
 import path from 'path';
 import crypto from 'crypto';
 import { ProcessRunner } from '../services/ProcessRunner';
+import { GitRevisionValidationError, validateGitRevision } from '../services/GitService';
 import { GitEvidence, WorkOrder, sanitizeAutonomyText } from './contracts';
 
 export interface EvidenceRunner {
@@ -31,6 +32,16 @@ export class EvidenceCollector {
   async collect(order: WorkOrder, testCommands: string[] = []): Promise<GitEvidence> {
     const cwd = path.resolve(order.worktree);
     if (!fs.existsSync(cwd)) throw new Error(`WORKTREE_NOT_FOUND: ${cwd}`);
+    // WorkOrder schema validation normally checks this field, but callers can
+    // still pass a forged object at runtime. Validate again at the process
+    // boundary so malformed revisions never reach Git (or mutate evidence).
+    const baseSha = validateGitRevision(order.base_sha);
+    if (!baseSha) {
+      // Evidence collection always requires a baseline revision. The helper
+      // uses null/undefined for GitService's working-tree-diff API, so turn
+      // that otherwise valid sentinel into the same typed fail-closed error.
+      throw new GitRevisionValidationError();
+    }
     const runGit = async (args: string[]) => {
       const result = await this.runner.execute({ executable: 'git', args, cwd, timeoutMs: 60_000, allowShell: false });
       if (result.exitCode !== 0) throw new Error(`GIT_EVIDENCE_FAILED: ${sanitizeAutonomyText(result.stderr)}`);
@@ -41,8 +52,8 @@ export class EvidenceCollector {
       throw new Error(`HEAD_RESOLUTION_FAILED: ${sanitizeAutonomyText(head.stderr || head.stdout)}`);
     }
     const status = await runGit(['status', '--porcelain=v1', '-uall']);
-    const names = await runGit(['diff', '--name-only', '-z', order.base_sha]);
-    const diff = await runGit(['diff', '--no-ext-diff', '--no-textconv', '--binary', order.base_sha]);
+    const names = await runGit(['diff', '--name-only', '-z', '--end-of-options', baseSha, '--']);
+    const diff = await runGit(['diff', '--no-ext-diff', '--no-textconv', '--binary', '--end-of-options', baseSha, '--']);
     const untracked = await runGit(['ls-files', '--others', '--exclude-standard', '-z']);
     const changedFiles = [...new Set([...names.stdout.split('\0'), ...untracked.stdout.split('\0')].filter(Boolean))].sort();
     const snapshots = changedFiles.map((name) => {

@@ -2,6 +2,48 @@ import { ProcessRunner } from './ProcessRunner';
 import { PolicyService } from './PolicyService';
 import { GitStatusSummary, GitDiffSummary } from '../types/domain';
 
+/**
+ * Error codes returned when an evidence/review revision fails validation.
+ *
+ * Git evidence is consumed as an authoritative record, so a malformed
+ * revision must be rejected before ProcessRunner is reached.  Keep the code
+ * stable and do not echo the supplied value: callers may have passed an
+ * option, path, or control sequence that must never reach a log.
+ */
+export type GitDiffErrorCode = 'INVALID_GIT_REVISION';
+
+/** Typed validation failure for an untrusted Git revision. */
+export class GitRevisionValidationError extends Error {
+  public readonly code: GitDiffErrorCode = 'INVALID_GIT_REVISION';
+
+  public constructor() {
+    super('INVALID_GIT_REVISION: revision must be an exact 40-character hexadecimal commit SHA.');
+    this.name = 'GitRevisionValidationError';
+    Object.setPrototypeOf(this, new.target.prototype);
+  }
+}
+
+/**
+ * Validate and normalize a revision supplied by a task/evidence boundary.
+ *
+ * `undefined` and `null` deliberately mean "working tree diff" for the
+ * existing GitService API.  Once a revision is supplied, however, it must be
+ * exactly a full commit SHA.  This excludes abbreviated refs, option-like
+ * values, paths (including Windows paths), whitespace, control characters,
+ * and Unicode look-alikes before any Git process can be started.
+ */
+export function validateGitRevision(revision: unknown): string | null {
+  if (revision === undefined || revision === null) return null;
+  if (typeof revision !== 'string' || revision.length !== 40 || !/^[0-9a-fA-F]{40}$/.test(revision)) {
+    throw new GitRevisionValidationError();
+  }
+  return revision.toLowerCase();
+}
+
+export type GitDiffResult = GitDiffSummary & {
+  errorCode?: GitDiffErrorCode;
+};
+
 export interface GitShaResult {
   status: 'SUCCESS' | 'ERROR' | 'UNKNOWN';
   sha: string | null;
@@ -140,7 +182,26 @@ export class GitService {
     };
   }
 
-  public static async getDiff(repoPath: string, baseSha?: string | null): Promise<GitDiffSummary> {
+  public static async getDiff(repoPath: string, baseSha?: string | null): Promise<GitDiffResult> {
+    let validatedBaseSha: string | null;
+    try {
+      validatedBaseSha = validateGitRevision(baseSha);
+    } catch (error: unknown) {
+      if (error instanceof GitRevisionValidationError) {
+        return {
+          status: 'ERROR',
+          diffStat: '',
+          diffContent: '',
+          filesChanged: [],
+          insertions: 0,
+          deletions: 0,
+          errorCode: error.code,
+          errorMessage: error.message,
+        };
+      }
+      throw error;
+    }
+
     const policy = PolicyService.evaluatePathAccess(repoPath, repoPath, false);
     if (!policy.allowed) {
       return {
@@ -154,7 +215,14 @@ export class GitService {
       };
     }
 
-    const args = baseSha ? ['diff', baseSha] : ['diff'];
+    // Keep command options before the revision and terminate the revision
+    // list before any path arguments.  Exact SHA validation above means the
+    // revision itself cannot be an option, while --end-of-options makes this
+    // invariant explicit for Git's revision parser and the trailing -- keeps
+    // future path additions from being interpreted as options.
+    const args = validatedBaseSha
+      ? ['diff', '--end-of-options', validatedBaseSha, '--']
+      : ['diff'];
 
     // 1. Get raw diff
     const diffRes = await ProcessRunner.execute({
@@ -179,7 +247,9 @@ export class GitService {
     // 2. Get diff stat
     const statRes = await ProcessRunner.execute({
       executable: 'git',
-      args: [...args, '--stat'],
+      args: validatedBaseSha
+        ? ['diff', '--stat', '--end-of-options', validatedBaseSha, '--']
+        : ['diff', '--stat'],
       cwd: repoPath,
       timeoutMs: 20000,
     });
@@ -199,7 +269,9 @@ export class GitService {
     // 3. Get list of changed files
     const nameRes = await ProcessRunner.execute({
       executable: 'git',
-      args: [...args, '--name-only'],
+      args: validatedBaseSha
+        ? ['diff', '--name-only', '--end-of-options', validatedBaseSha, '--']
+        : ['diff', '--name-only'],
       cwd: repoPath,
       timeoutMs: 20000,
     });
