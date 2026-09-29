@@ -198,7 +198,11 @@ export function closeTrialFilesystemRoot(root: TrialFilesystemRoot): void {
 function trialRelativeSegments(root: TrialFilesystemRoot, target: string): string[] {
   const absolute = path.resolve(target);
   try { assertPathContained(absolute, root.baseDir); } catch (error) {
-    throw new ArtifactIntegrityError('ARTIFACT_PATH_UNVERIFIED', error instanceof Error ? error.message : 'trial path escapes root', target);
+    const message = error instanceof Error ? error.message : 'trial path escapes root';
+    if (/symbolic link|junction|reparse|SYMLINK_NOT_PERMITTED/i.test(message)) {
+      throw new ArtifactIntegrityError('ARTIFACT_REPARSE_POINT', message, target);
+    }
+    throw new ArtifactIntegrityError('ARTIFACT_PATH_UNVERIFIED', message, target);
   }
   const relative = path.relative(root.baseDir, absolute);
   if (!relative || relative.startsWith('..') || path.isAbsolute(relative)) {
