@@ -1203,6 +1203,25 @@ describe('R5J7 MCP Reviewer Authority & Invariants (Cases 1–70, 124–131, 135
     }).toThrowError(/SESSION_DURATION_INVALID/);
   });
 
+  it.each([
+    ['NaN', Number.NaN],
+    ['positive infinity', Number.POSITIVE_INFINITY],
+    ['negative infinity', Number.NEGATIVE_INFINITY],
+    ['fractional', 60.5],
+    ['unsafe integer', Number.MAX_SAFE_INTEGER + 1],
+  ])('68a. Rejects non-finite or non-integer session duration: %s', (_label, duration) => {
+    expect(() => {
+      fixtures.service.issueReviewerSession({
+        adjudication_id: fixtures.adjudicationId,
+        reviewer_agent_id: fixtures.reviewerAgentId,
+        reviewer_provider_id: fixtures.reviewerProviderId,
+        reviewer_account_id: fixtures.reviewerAccountId,
+        reviewer_resource_id: fixtures.reviewerResourceId,
+        duration_seconds: duration,
+      });
+    }).toThrowError(/SESSION_DURATION_INVALID/);
+  });
+
   it('69. Explicit session revocation API with mandatory reason', () => {
     const res = fixtures.service.issueReviewerSession({
       adjudication_id: fixtures.adjudicationId,
