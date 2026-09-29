@@ -1311,14 +1311,22 @@ export function evaluateCanonicalSettlementDecision(
 
   // Retrieve and validate dedicated workspace snapshot after file content
   let afterContent: string | null = null;
+  let afterReadIntegrityFailure: string | null = null;
   if (matchingAfterEvidence.raw_payload) {
     afterContent = matchingAfterEvidence.raw_payload;
-  } else if (matchingAfterEvidence.file_path && fs.existsSync(matchingAfterEvidence.file_path)) {
-    afterContent = fs.readFileSync(matchingAfterEvidence.file_path, 'utf8');
   } else if (input.artifactStore) {
     try {
-      afterContent = input.artifactStore.read(matchingAfterEvidence);
-    } catch {
+      afterContent = input.artifactStore.readText(matchingAfterEvidence);
+    } catch (error) {
+      // Preserve the canonical integrity diagnosis for tampered durable
+      // evidence.  The safe-read boundary deliberately rejects a changed
+      // hash/size before returning bytes; collapsing that result into
+      // "content missing" would hide the reason for a recovery fence and
+      // make callers lose the distinction between absence and corruption.
+      const message = error instanceof Error ? error.message : '';
+      if (/hash mismatch|byte size mismatch/i.test(message)) {
+        afterReadIntegrityFailure = 'workspace_snapshot_after hash mismatch';
+      }
       afterContent = null;
     }
   }
@@ -1334,7 +1342,7 @@ export function evaluateCanonicalSettlementDecision(
       dispositionReason: 'RECOVERY_FENCED',
       failureCode: 'INTEGRITY_MISMATCH',
       failureDetail: 'Workspace snapshot after evidence file content could not be retrieved',
-      contradictionReason: 'workspace_snapshot_after content missing',
+      contradictionReason: afterReadIntegrityFailure ?? 'workspace_snapshot_after content missing',
     };
   }
 
@@ -3340,11 +3348,9 @@ export class CoderSubmissionAdjudicationService {
               );
             }
             let content = wsEv.raw_payload;
-            if (!content && wsEv.file_path && fs.existsSync(wsEv.file_path)) {
-              content = fs.readFileSync(wsEv.file_path, 'utf8');
-            } else if (!content && this.artifactStore) {
+            if (!content && this.artifactStore) {
               try {
-                content = this.artifactStore.read(wsEv);
+                content = this.artifactStore.readText(wsEv);
               } catch {
                 content = null;
               }
@@ -5191,13 +5197,14 @@ export class CoderSubmissionAdjudicationService {
     if (adj.git_status_evidence_id) {
       const statusEv = this.repo.getEvidence(adj.git_status_evidence_id);
       if (statusEv) {
-        const evValid = verifyEvidenceIntegrity(statusEv, this.artifactStore);
-        if (!evValid.valid) {
-          throw new CoderSubmissionAdjudicationError('INTEGRITY_CONFLICT', `Git status evidence integrity failed: ${evValid.reason}`);
-        }
-        let payloadStr = statusEv.raw_payload ?? '';
-        if (statusEv.storage_type === 'FILE' && statusEv.file_path) {
-          payloadStr = fs.readFileSync(path.resolve(this.artifactStore.getBaseDir(), statusEv.file_path), 'utf8');
+        let payloadStr: string;
+        try {
+          payloadStr = this.artifactStore.readText(statusEv);
+        } catch (readErr: unknown) {
+          throw new CoderSubmissionAdjudicationError(
+            'INTEGRITY_CONFLICT',
+            `Git status evidence integrity failed: ${readErr instanceof Error ? readErr.message : String(readErr)}`
+          );
         }
         let parsedPayload: Record<string, unknown>;
         try {
@@ -5253,13 +5260,14 @@ export class CoderSubmissionAdjudicationService {
     if (adj.git_diff_evidence_id) {
       const diffEv = this.repo.getEvidence(adj.git_diff_evidence_id);
       if (diffEv) {
-        const evValid = verifyEvidenceIntegrity(diffEv, this.artifactStore);
-        if (!evValid.valid) {
-          throw new CoderSubmissionAdjudicationError('INTEGRITY_CONFLICT', `Git diff evidence integrity failed: ${evValid.reason}`);
-        }
-        let diffContent = diffEv.raw_payload ?? '';
-        if (diffEv.storage_type === 'FILE' && diffEv.file_path) {
-          diffContent = fs.readFileSync(path.resolve(this.artifactStore.getBaseDir(), diffEv.file_path), 'utf8');
+        let diffContent: string;
+        try {
+          diffContent = this.artifactStore.readText(diffEv);
+        } catch (readErr: unknown) {
+          throw new CoderSubmissionAdjudicationError(
+            'INTEGRITY_CONFLICT',
+            `Git diff evidence integrity failed: ${readErr instanceof Error ? readErr.message : String(readErr)}`
+          );
         }
         authoritative_git_diff = {
           evidence_id: diffEv.id,

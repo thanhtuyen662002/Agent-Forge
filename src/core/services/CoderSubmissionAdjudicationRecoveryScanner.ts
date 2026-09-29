@@ -1,5 +1,4 @@
 import crypto from 'crypto';
-import fs from 'fs';
 import Database from 'better-sqlite3';
 import { Repository, CoderSubmission } from '../database/repositories';
 import { TestRun } from '../types/domain';
@@ -854,10 +853,10 @@ export class CoderSubmissionAdjudicationRecoveryScanner {
             settlementError = `Workspace snapshot after evidence must have type FILE_SNAPSHOT, got ${wsAfterEv.evidence_type}`;
           } else {
             let afterContent = wsAfterEv.raw_payload;
-            if (!afterContent && wsAfterEv.file_path) {
+            if (!afterContent) {
               try {
-                afterContent = fs.readFileSync(wsAfterEv.file_path, 'utf8');
-              } catch {
+                afterContent = this.adjudicationService.getArtifactStore().readText(wsAfterEv);
+              } catch (readErr: unknown) {
                 settlementError = 'Workspace snapshot after evidence file content unreadable';
               }
             }
