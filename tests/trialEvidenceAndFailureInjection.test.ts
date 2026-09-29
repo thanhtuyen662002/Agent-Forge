@@ -1,3 +1,4 @@
+import crypto from 'crypto';
 import fs from 'fs';
 import os from 'os';
 import path from 'path';
@@ -11,6 +12,7 @@ import {
   writeTrialEvidenceManifest,
   ProductionTrialEvidenceManifest,
 } from '../src/core/autonomy/trialEvidence';
+import { ArtifactIntegrityError, ArtifactStore } from '../src/core/services/ArtifactStore';
 import {
   DeterministicFailureInjectionError,
   DeterministicFailureInjectionHarness,
@@ -50,6 +52,134 @@ function baseManifest(): TrialManifestInput {
   };
 }
 
+describe('ArtifactStore containment hardening', () => {
+  it('preserves valid content-addressed round trips while preparing the race boundary', () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'agent-forge-artifact-store-'));
+    try {
+      const store = new ArtifactStore(root, 0);
+      const payload = 'stable artifact payload';
+      const hash = crypto.createHash('sha256').update(payload, 'utf8').digest('hex');
+      const materialized = store.materializeContentAddressedFile(payload, hash);
+      expect(store.read({
+        id: 'artifact-round-trip',
+        project_id: 'project-1',
+        task_id: null,
+        attempt_id: null,
+        evidence_type: 'TEST_RESULT',
+        storage_type: 'FILE',
+        file_path: materialized.filePath,
+        hash,
+        byte_size: Buffer.byteLength(payload, 'utf8'),
+        content_type: 'text/plain',
+        summary: 'round trip',
+        raw_payload: null,
+        created_at: new Date().toISOString(),
+      })).toBe(payload);
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it('fails closed when an artifact parent is missing instead of recreating it implicitly', () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'agent-forge-artifact-missing-parent-'));
+    try {
+      const store = new ArtifactStore(root, 0);
+      expect(() => store.readBuffer(path.join(root, 'missing-parent', 'artifact.bin'))).toThrowError(
+        expect.objectContaining({ code: 'ARTIFACT_PARENT_MISSING' })
+      );
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it('rejects a parent replaced by a symlink or junction before a read can escape', () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'agent-forge-artifact-reparse-'));
+    const outside = fs.mkdtempSync(path.join(os.tmpdir(), 'agent-forge-artifact-outside-'));
+    try {
+      const parent = path.join(root, 'nested');
+      const outsideFile = path.join(outside, 'artifact.bin');
+      fs.mkdirSync(parent, { recursive: true });
+      fs.writeFileSync(outsideFile, 'outside', 'utf8');
+      const target = path.join(parent, 'artifact.bin');
+      fs.writeFileSync(target, 'inside', 'utf8');
+      fs.rmSync(parent, { recursive: true, force: true });
+      try {
+        fs.symlinkSync(outside, parent, process.platform === 'win32' ? 'junction' : 'dir');
+      } catch (error) {
+        if (error && typeof error === 'object' && 'code' in error && ['EPERM', 'EACCES'].includes(String((error as { code: unknown }).code))) return;
+        throw error;
+      }
+      const store = new ArtifactStore(root, 0);
+      expect(() => store.readBuffer(target)).toThrowError(
+        expect.objectContaining({ code: expect.stringMatching(/ARTIFACT_REPARSE_POINT|ARTIFACT_PATH_UNVERIFIED/) })
+      );
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true });
+      fs.rmSync(outside, { recursive: true, force: true });
+    }
+  });
+
+  it('keeps case-folded Windows paths bound to the same artifact identity', () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'agent-forge-artifact-case-'));
+    try {
+      const store = new ArtifactStore(root, 0);
+      const payload = 'case-folded artifact';
+      const hash = crypto.createHash('sha256').update(payload, 'utf8').digest('hex');
+      const filePath = store.materializeContentAddressedFile(payload, hash).filePath;
+      const equivalentPath = process.platform === 'win32' ? filePath.toUpperCase() : filePath;
+      expect(store.readBuffer(equivalentPath).toString('utf8')).toBe(payload);
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it('makes concurrent staged cleanup idempotent and leaves no staged file', async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'agent-forge-artifact-cleanup-'));
+    try {
+      const store = new ArtifactStore(root, 0);
+      const staged = store.stage('concurrent-cleanup', 'project-1', null, null, 'TEST_RESULT', 'cleanup', 'cleanup payload');
+      await Promise.all([
+        Promise.resolve().then(() => store.cleanupStagedFile(staged.stagedPath!)),
+        Promise.resolve().then(() => store.cleanupStagedFile(staged.stagedPath!)),
+      ]);
+      expect(fs.existsSync(staged.stagedPath!)).toBe(false);
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it('exposes typed integrity failures to evidence verification instead of treating boundary races as provider I/O', () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'agent-forge-artifact-integrity-'));
+    try {
+      const store = new ArtifactStore(root, 0);
+      const evidence = {
+        id: 'missing-parent',
+        project_id: 'project-1',
+        task_id: null,
+        attempt_id: null,
+        evidence_type: 'TEST_RESULT' as const,
+        storage_type: 'FILE' as const,
+        file_path: path.join(root, 'missing', 'artifact.bin'),
+        hash: '0'.repeat(64),
+        byte_size: 0,
+        content_type: 'text/plain',
+        summary: 'integrity',
+        raw_payload: null,
+        created_at: new Date().toISOString(),
+      };
+      let error: unknown;
+      try {
+        store.readBuffer(evidence.file_path);
+      } catch (caught) {
+        error = caught;
+      }
+      expect(error).toBeInstanceOf(ArtifactIntegrityError);
+      expect((error as ArtifactIntegrityError).code).toBe('ARTIFACT_PARENT_MISSING');
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+});
 describe('production trial evidence manifest', () => {
   it('builds deterministic canonical JSON and hash', () => {
     const first = buildTrialEvidenceManifest(baseManifest(),);
