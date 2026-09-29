@@ -107,6 +107,8 @@ export interface OrchestratorApi {
       BUILD?: string | null;
     };
   }) => Promise<any>;
+  getMaxRevisions: (projectId: string) => Promise<any>;
+  saveMaxRevisions: (data: { projectId: string; maxRevisions: number }) => Promise<any>;
 
   // R5J5: Quarantined Submissions Adjudication
   listQuarantinedSubmissions: (data?: {
@@ -192,6 +194,10 @@ const api: OrchestratorApi = {
     ipcRenderer.invoke('verification:getCommands', { projectId }),
   saveVerificationCommands: (data) =>
     ipcRenderer.invoke('verification:saveCommands', data),
+  getMaxRevisions: (projectId: string) =>
+    ipcRenderer.invoke('settings:getMaxRevisions', { projectId }),
+  saveMaxRevisions: (data) =>
+    ipcRenderer.invoke('settings:saveMaxRevisions', data),
 
   listQuarantinedSubmissions: (data) => ipcRenderer.invoke('submissions:list', data),
   inspectQuarantinedSubmission: (data) => ipcRenderer.invoke('submissions:inspect', data),

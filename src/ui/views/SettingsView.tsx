@@ -22,6 +22,7 @@ import {
 } from 'lucide-react';
 import { UpdateStateSummary } from '../../core/types/domain';
 import { CommandParser } from '../../core/services/CommandParser';
+import { DEFAULT_MAX_REVISIONS, parseMaxRevisions } from '../../shared/revisionPolicy';
 
 export const SettingsView: React.FC = () => {
   const { locale, setLocale, t } = useI18n();
@@ -36,7 +37,7 @@ export const SettingsView: React.FC = () => {
   const [testCmd, setTestCmd] = useState<string>('');
   const [lintCmd, setLintCmd] = useState<string>('');
   const [buildCmd, setBuildCmd] = useState<string>('');
-  const [maxRevisions, setMaxRevisions] = useState<number>(3);
+  const [maxRevisionsInput, setMaxRevisionsInput] = useState<string>(String(DEFAULT_MAX_REVISIONS));
   const [saved, setSaved] = useState<boolean>(false);
   const [saveError, setSaveError] = useState<string | null>(null);
 
@@ -88,6 +89,7 @@ export const SettingsView: React.FC = () => {
           setTestCmd('');
           setLintCmd('');
           setBuildCmd('');
+          setMaxRevisionsInput(String(DEFAULT_MAX_REVISIONS));
         }
         return;
       }
@@ -101,6 +103,15 @@ export const SettingsView: React.FC = () => {
           Array.isArray(res.commands)
         ) {
           applyCanonicalCommands(res.commands);
+        }
+
+        if (isMounted && activeProjectIdRef.current === currentProjectId) {
+          const maxRes = await (window as any).orchestrator.getMaxRevisions?.(currentProjectId);
+          if (maxRes?.success && parseMaxRevisions(maxRes.maxRevisions) !== null) {
+            setMaxRevisionsInput(String(maxRes.maxRevisions));
+          } else if (maxRes && !maxRes.success) {
+            setSaveError(maxRes.error || t('settings.saveFailed'));
+          }
         }
       } catch (err) {
         console.warn('Failed to load verification commands for project:', err);
@@ -224,32 +235,56 @@ export const SettingsView: React.FC = () => {
 
     saveInFlightRef.current = true;
     const savedProjectId = activeProject.id;
+    const parsedMaxRevisions = parseMaxRevisions(maxRevisionsInput);
+    if (parsedMaxRevisions === null) {
+      setSaveError(t('settings.loopProtection.invalidMaxRevisions'));
+      setSaved(false);
+      return;
+    }
+
     setSaveError(null);
     setSaved(false);
 
     try {
-      if ((window as any).orchestrator?.saveVerificationCommands) {
-        const res = await (window as any).orchestrator.saveVerificationCommands({
-          projectId: savedProjectId,
-          commands: {
-            TEST: testCmd,
-            LINT: lintCmd,
-            BUILD: buildCmd,
-          },
-        });
+      if (!(window as any).orchestrator?.saveVerificationCommands || !(window as any).orchestrator?.saveMaxRevisions) {
+        setSaveError(t('settings.saveFailed'));
+        return;
+      }
 
-        // Ignore stale async response if active project switched while save was in flight
-        if (activeProjectIdRef.current !== savedProjectId) {
-          return;
-        }
+      const commandRes = await (window as any).orchestrator.saveVerificationCommands({
+        projectId: savedProjectId,
+        commands: {
+          TEST: testCmd,
+          LINT: lintCmd,
+          BUILD: buildCmd,
+        },
+      });
 
-        if (res?.success && Array.isArray(res.commands)) {
-          applyCanonicalCommands(res.commands);
-          setSaved(true);
-          setTimeout(() => setSaved(false), 2000);
-        } else {
-          setSaveError(res?.error || t('settings.saveFailed'));
-        }
+      // Ignore stale async response if active project switched while save was in flight
+      if (activeProjectIdRef.current !== savedProjectId) {
+        return;
+      }
+
+      if (!commandRes?.success || !Array.isArray(commandRes.commands)) {
+        setSaveError(commandRes?.error || t('settings.saveFailed'));
+        return;
+      }
+
+      const maxRes = await (window as any).orchestrator.saveMaxRevisions({
+        projectId: savedProjectId,
+        maxRevisions: parsedMaxRevisions,
+      });
+      if (activeProjectIdRef.current !== savedProjectId) {
+        return;
+      }
+
+      if (maxRes?.success && parseMaxRevisions(maxRes.maxRevisions) !== null) {
+        applyCanonicalCommands(commandRes.commands);
+        setMaxRevisionsInput(String(maxRes.maxRevisions));
+        setSaved(true);
+        setTimeout(() => setSaved(false), 2000);
+      } else {
+        setSaveError(maxRes?.error || t('settings.saveFailed'));
       }
     } catch (err: any) {
       if (activeProjectIdRef.current === savedProjectId) {
@@ -597,8 +632,13 @@ export const SettingsView: React.FC = () => {
               type="number"
               min={1}
               max={10}
-              value={maxRevisions}
-              onChange={(e) => setMaxRevisions(Number(e.target.value))}
+              step={1}
+              value={maxRevisionsInput}
+              onChange={(e) => {
+                setMaxRevisionsInput(e.target.value);
+                setSaved(false);
+                setSaveError(null);
+              }}
               className="w-full bg-surface border border-surface-border rounded-lg px-3 py-2 text-white focus:outline-none focus:border-forge-cyan"
             />
             <p className="text-[10px] text-slate-500 mt-1">

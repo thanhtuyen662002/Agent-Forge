@@ -124,6 +124,10 @@ import {
   parseNativeProfileRef,
 } from '../credentials';
 import { ProjectRepository } from './repositories/ProjectRepository';
+import {
+  DEFAULT_MAX_REVISIONS,
+  isValidMaxRevisions,
+} from '../../shared/revisionPolicy';
 export { ProjectRepository } from './repositories/ProjectRepository';
 
 function isValidIsoTimestamp(ts: any): boolean {
@@ -243,6 +247,49 @@ export class Repository {
 
   public updateProjectContract(id: string, contract: ProjectContract): void {
     this.projectRepository.updateProjectContract(id, contract);
+  }
+
+  /**
+   * Returns the project-scoped revision ceiling used for newly-created tasks.
+   * Missing or malformed legacy settings fail closed to the product default;
+   * the write boundary below never permits malformed values to be stored.
+   */
+  public getProjectMaxRevisions(projectId: string): number {
+    const row = this.db
+      .prepare('SELECT value_json FROM project_settings WHERE project_id = ? AND key = ?')
+      .get(projectId, 'max_revisions') as { value_json?: unknown } | undefined;
+    if (!row || typeof row.value_json !== 'string') return DEFAULT_MAX_REVISIONS;
+
+    try {
+      const value: unknown = JSON.parse(row.value_json);
+      return isValidMaxRevisions(value) ? value : DEFAULT_MAX_REVISIONS;
+    } catch {
+      return DEFAULT_MAX_REVISIONS;
+    }
+  }
+
+  /**
+   * Persists the project-scoped revision ceiling atomically and only after
+   * validating its bounded integer domain.
+   */
+  public setProjectMaxRevisions(projectId: string, maxRevisions: number): number {
+    if (!isValidMaxRevisions(maxRevisions)) {
+      throw new Error('MAX_REVISIONS_INVALID: value must be an integer from 1 through 10.');
+    }
+    if (!this.getProject(projectId)) {
+      throw new Error(`Project "${projectId}" not found.`);
+    }
+
+    this.runInImmediateTransaction(() => {
+      this.db
+        .prepare(`
+          INSERT INTO project_settings (project_id, key, value_json)
+          VALUES (?, 'max_revisions', ?)
+          ON CONFLICT(project_id, key) DO UPDATE SET value_json = excluded.value_json
+        `)
+        .run(projectId, JSON.stringify(maxRevisions));
+    });
+    return maxRevisions;
   }
 
   // ==========================================

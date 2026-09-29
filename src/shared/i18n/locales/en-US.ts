@@ -293,7 +293,8 @@ export const enUS: TranslationDictionary = {
     loopProtection: {
       title: 'Loop Protection & Revision Limits',
       maxRevisionsLabel: 'Max Revisions Before Escalation',
-      helpText: 'Tasks exceeding this limit transition to NEEDS_HUMAN to halt AI ping-pong.',
+      helpText: 'Stored per project and applied to new tasks. Tasks exceeding this limit transition to NEEDS_HUMAN to halt AI ping-pong.',
+      invalidMaxRevisions: 'Max revisions must be a whole number from 1 through 10.',
     },
     saveConfigButton: 'SAVE CONFIGURATION',
     settingsSavedButton: 'SETTINGS SAVED',

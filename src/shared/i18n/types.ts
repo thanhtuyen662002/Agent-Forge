@@ -297,6 +297,7 @@ export interface TranslationDictionary {
       title: string;
       maxRevisionsLabel: string;
       helpText: string;
+      invalidMaxRevisions: string;
     };
     saveConfigButton: string;
     settingsSavedButton: string;

@@ -44,6 +44,8 @@ import {
   GetAppInfoIpcSchema,
   GetVerificationCommandsIpcSchema,
   SaveVerificationCommandsIpcSchema,
+  GetMaxRevisionsIpcSchema,
+  SaveMaxRevisionsIpcSchema,
   ListQuarantinedSubmissionsIpcSchema,
   InspectQuarantinedSubmissionIpcSchema,
   AdmitQuarantinedSubmissionIpcSchema,
@@ -656,6 +658,39 @@ export function registerIpcHandlers(
       return { success: true, commands: updatedCommands };
     } catch (err: any) {
       return { success: false, error: err.message || 'Failed to save verification commands.' };
+    }
+  });
+
+  ipcMain.handle('settings:getMaxRevisions', async (_, payload: unknown) => {
+    const parsed = GetMaxRevisionsIpcSchema.safeParse(payload);
+    if (!parsed.success) {
+      return { success: false, error: parsed.error.issues.map((i) => i.message).join(', ') };
+    }
+
+    const project = repo.getProject(parsed.data.projectId);
+    if (!project) {
+      return { success: false, error: `Project "${parsed.data.projectId}" not found.` };
+    }
+
+    return { success: true, maxRevisions: repo.getProjectMaxRevisions(project.id) };
+  });
+
+  ipcMain.handle('settings:saveMaxRevisions', async (_, payload: unknown) => {
+    const parsed = SaveMaxRevisionsIpcSchema.safeParse(payload);
+    if (!parsed.success) {
+      return { success: false, error: parsed.error.issues.map((i) => i.message).join(', ') };
+    }
+
+    const project = repo.getProject(parsed.data.projectId);
+    if (!project) {
+      return { success: false, error: `Project "${parsed.data.projectId}" not found.` };
+    }
+
+    try {
+      const maxRevisions = repo.setProjectMaxRevisions(project.id, parsed.data.maxRevisions);
+      return { success: true, maxRevisions };
+    } catch (err: any) {
+      return { success: false, error: err?.message || 'Failed to save max revisions.' };
     }
   });
 
