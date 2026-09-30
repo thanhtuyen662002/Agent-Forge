@@ -126,8 +126,22 @@ export interface TranslationDictionary {
       planned: string;
       coding: string;
       validating: string;
+      handoff: string;
+      waiting: string;
       blocked: string;
       completed: string;
+      failed: string;
+      cancelled: string;
+      unknown: string;
+    };
+    laneActions: {
+      automated: string;
+      owner: string;
+      wait: string;
+      inspect: string;
+      retry: string;
+      none: string;
+      integrity: string;
     };
     emptyLane: string;
     revLabel: string;
