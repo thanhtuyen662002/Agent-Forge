@@ -14,7 +14,9 @@ root and every context path. Absolute paths, traversal, sensitive names
 Windows junction/reparse points are rejected. A directory context is walked
 with the same policy for every child; denied children are omitted, while an
 explicitly denied path fails the execution. Reads are descriptor based and
-bounded to 4 MiB per file, 256 files, and 16 MiB per workspace.
+bounded to 4 MiB per file, 256 files, and 16 MiB per workspace. Directory
+enumeration is bounded to 128 manifest paths, 512 traversed entries, and 128
+directory levels before any workspace file is materialized.
 
 Each execution receives a random workspace directory and a sibling marker that
 contains the execution ID, owner token, ownership digest, creation time, state,
