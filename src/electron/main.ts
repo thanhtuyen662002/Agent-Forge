@@ -3,7 +3,7 @@ import path from 'path';
 import fs from 'fs';
 import { BootstrapService, BootstrapResult } from '../core/services/BootstrapService';
 import { registerIpcHandlers } from './ipcHandlers';
-import { resolveRendererTarget } from './pathHelper';
+import { isAllowedRendererNavigation, resolveRendererTarget } from './pathHelper';
 import { UpdateService } from '../core/services/UpdateService';
 import { ElectronUpdaterAdapter } from './updaterAdapter';
 
@@ -93,13 +93,33 @@ function createWindow(userDataDir: string): void {
     });
   }
 
+  const rendererTarget = resolveRendererTarget({
+    isPackaged: app.isPackaged,
+    appPath: app.getAppPath(),
+    devServerUrl: process.env.VITE_DEV_SERVER_URL,
+  });
+
+  const navigationPolicy = {
+    isPackaged: app.isPackaged,
+    rendererFilePath: rendererTarget.type === 'file' ? rendererTarget.target : undefined,
+    devServerUrl: rendererTarget.type === 'url' ? rendererTarget.target : undefined,
+  };
+
   // Strict Navigation Guard: Block uncontrolled external navigation
   mainWindow.webContents.on('will-navigate', (event, url) => {
-    const isDev = !app.isPackaged && url.startsWith('http://localhost:5173');
-    const isLocalFile = url.startsWith('file://');
-    if (!isDev && !isLocalFile) {
+    if (!isAllowedRendererNavigation(url, navigationPolicy)) {
       event.preventDefault();
       console.warn(`[Security] Blocked unauthorized window navigation to: ${url}`);
+    }
+  });
+
+  // Redirects do not necessarily emit will-navigate. Apply the same exact
+  // origin/file policy so a trusted page cannot redirect the privileged window
+  // to an external or lookalike renderer.
+  mainWindow.webContents.on('will-redirect', (event, url) => {
+    if (!isAllowedRendererNavigation(url, navigationPolicy)) {
+      event.preventDefault();
+      console.warn(`[Security] Blocked unauthorized window redirect to: ${url}`);
     }
   });
 
@@ -107,12 +127,6 @@ function createWindow(userDataDir: string): void {
   mainWindow.webContents.setWindowOpenHandler(({ url }) => {
     console.warn(`[Security] Blocked unauthorized window open request to: ${url}`);
     return { action: 'deny' };
-  });
-
-  const rendererTarget = resolveRendererTarget({
-    isPackaged: app.isPackaged,
-    appPath: app.getAppPath(),
-    devServerUrl: process.env.VITE_DEV_SERVER_URL,
   });
 
   if (rendererTarget.type === 'url') {
