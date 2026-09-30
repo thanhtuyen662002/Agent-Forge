@@ -636,6 +636,7 @@ function localCliSynchronizeWorkspace(lease: LocalCliWorkspaceLease): void {
     entry: LocalCliWorkspaceEntry;
     sourceBuffer: Buffer;
     sourceHash: string;
+    sourceMode: number;
     workspaceBuffer: Buffer;
     workspaceHash: string;
   }> = [];
@@ -657,6 +658,7 @@ function localCliSynchronizeWorkspace(lease: LocalCliWorkspaceLease): void {
       entry,
       sourceBuffer: current.buffer,
       sourceHash: entry.sourceHash,
+      sourceMode: current.mode,
       workspaceBuffer: workspace.buffer,
       workspaceHash,
     });
@@ -692,6 +694,9 @@ function localCliSynchronizeWorkspace(lease: LocalCliWorkspaceLease): void {
         if (!localCliSameIdentity(appliedIdentity, current.identity)) {
           throw new LocalCliWorkspaceError('WORKSPACE_SYNC_ROLLBACK_CONFLICT', `authorized source identity changed during rollback: ${item.entry.relativePath}`);
         }
+        if ((current.mode & 0o7777) !== (item.sourceMode & 0o7777)) {
+          throw new LocalCliWorkspaceError('WORKSPACE_SYNC_ROLLBACK_CONFLICT', `authorized source mode changed during rollback: ${item.entry.relativePath}`);
+        }
         // A concurrent writer owns the file once its content no longer matches
         // the provider result. Never overwrite that newer content while trying
         // to restore an earlier entry.
@@ -699,7 +704,7 @@ function localCliSynchronizeWorkspace(lease: LocalCliWorkspaceLease): void {
         if (currentHash !== item.workspaceHash) {
           throw new LocalCliWorkspaceError('WORKSPACE_SYNC_ROLLBACK_CONFLICT', `authorized source changed during rollback: ${item.entry.relativePath}`);
         }
-        localCliAtomicWrite(item.entry.sourcePath, item.sourceBuffer, sourceRoot, item.entry.sourceMode, appliedIdentity);
+        localCliAtomicWrite(item.entry.sourcePath, item.sourceBuffer, sourceRoot, item.sourceMode, appliedIdentity);
         const restored = localCliReadStableFile(item.entry.sourcePath, sourceRoot);
         if (crypto.createHash('sha256').update(restored.buffer).digest('hex') !== item.sourceHash) {
           throw new LocalCliWorkspaceError('WORKSPACE_SYNC_ROLLBACK_FAILED', `authorized source could not be restored: ${item.entry.relativePath}`);
