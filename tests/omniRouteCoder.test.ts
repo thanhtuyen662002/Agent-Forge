@@ -500,6 +500,260 @@ describe('OmniRoute Coder Transport & Structured Edits', () => {
       expect(observedInput).toContain('export const answer = 41;');
     });
 
+    it('rejects a direct sensitive context candidate through the centralized filename policy', async () => {
+      fs.writeFileSync(path.join(worktreeDir, '.env.local'), 'ROUTER_SECRET=should-never-leave\n', 'utf8');
+      let fetchCalls = 0;
+      const transport = new ResponsesCoderEndpointTransport({
+        environment: { TEST_CODER_AUTH: secretToken },
+        fetch: async () => {
+          fetchCalls += 1;
+          return new Response(responsePayload('{}'), { status: 200 });
+        },
+      });
+      const order = createWorkOrder({
+        taskId: 'TSK-SENSITIVE-DIRECT',
+        workerId: 'coder-omniroute',
+        objective: 'must not disclose credentials',
+        baseSha: shaA,
+        branch: 'test',
+        worktree: worktreeDir,
+        allowedPaths: ['src/app.ts'],
+        contextFiles: ['.env.local'],
+        acceptanceCriteria: ['secret-free context'],
+      });
+
+      const result = await transport.executeWorkOrder(coderEndpointConfig(), order, 'auth-sensitive-direct');
+      expect(result.run.status).toBe('CONTRACT_INVALID');
+      expect(result.run.stderr).toMatch(/CODER_PATH_POLICY_DENIED|secret/i);
+      expect(fetchCalls).toBe(0);
+    });
+
+    it('walks directory context without admitting environment, credential, key, or Git metadata files', async () => {
+      const contextRoot = path.join(worktreeDir, 'context');
+      fs.mkdirSync(contextRoot, { recursive: true });
+      fs.writeFileSync(path.join(contextRoot, 'safe.ts'), 'export const safe = true;\n', 'utf8');
+      fs.writeFileSync(path.join(contextRoot, '.env.production'), 'TOKEN=directory-secret\n', 'utf8');
+      fs.writeFileSync(path.join(contextRoot, '.npmrc'), '//registry.example/:_authToken=secret\n', 'utf8');
+      fs.writeFileSync(path.join(contextRoot, 'credentials.json'), '{"token":"secret"}\n', 'utf8');
+      fs.writeFileSync(path.join(contextRoot, 'private.pem'), '-----BEGIN PRIVATE KEY-----\nsecret\n-----END PRIVATE KEY-----\n', 'utf8');
+      const gitMetadata = path.join(contextRoot, '.git');
+      fs.mkdirSync(gitMetadata, { recursive: true });
+      fs.writeFileSync(path.join(gitMetadata, 'config'), '[remote "origin"]\nurl=https://example.invalid\n', 'utf8');
+
+      let observedInput = '';
+      const transport = new ResponsesCoderEndpointTransport({
+        environment: { TEST_CODER_AUTH: secretToken },
+        fetch: async (_url, init) => {
+          observedInput = String(JSON.parse(String(init?.body)).input);
+          return new Response(responsePayload(JSON.stringify({
+            protocol_version: 'coderbundle.v1',
+            task_id: 'TSK-SENSITIVE-DIRECTORY',
+            authorization_id: 'auth-sensitive-directory',
+            source_head: shaA,
+            allowed_paths: ['src/app.ts'],
+            proposed_edits: [{ path: 'src/app.ts', content: 'safe\n' }],
+          })), { status: 200 });
+        },
+      });
+      const order = createWorkOrder({
+        taskId: 'TSK-SENSITIVE-DIRECTORY',
+        workerId: 'coder-omniroute',
+        objective: 'walk only safe context',
+        baseSha: shaA,
+        branch: 'test',
+        worktree: worktreeDir,
+        allowedPaths: ['src/app.ts'],
+        contextFiles: ['context'],
+        acceptanceCriteria: ['secret-free context'],
+      });
+
+      const result = await transport.executeWorkOrder(coderEndpointConfig(), order, 'auth-sensitive-directory');
+      expect(result.run.status).toBe('SUCCESSFUL_PROCESS_EXIT');
+      expect(observedInput).toContain('safe.ts');
+      expect(observedInput).not.toContain('directory-secret');
+      expect(observedInput).not.toContain('credentials.json');
+      expect(observedInput).not.toContain('private.pem');
+      expect(observedInput).not.toContain('.npmrc');
+      expect(observedInput).not.toContain('context/.git');
+    });
+
+    it('preflights every edit before mutation so a later invalid target cannot leave a partial bundle', () => {
+      const first = path.join(worktreeDir, 'src', 'first.ts');
+      const secondDirectory = path.join(worktreeDir, 'src', 'second');
+      fs.mkdirSync(secondDirectory, { recursive: true });
+      fs.writeFileSync(first, 'original\n', 'utf8');
+      const bundle: CoderEditBundle = {
+        protocol_version: 'coderbundle.v1',
+        task_id: 'TSK-ATOMIC-PREFLIGHT',
+        authorization_id: 'auth-atomic-preflight',
+        source_head: shaA,
+        allowed_paths: ['src/first.ts', 'src/second'],
+        proposed_edits: [
+          { path: 'src/first.ts', content: 'would-be-new\n' },
+          { path: 'src/second', content: 'directory-target\n' },
+        ],
+      };
+
+      expect(() => applyCoderEditBundle(worktreeDir, bundle, {
+        taskId: 'TSK-ATOMIC-PREFLIGHT',
+        authorizationId: 'auth-atomic-preflight',
+        sourceHead: shaA,
+        allowedPaths: ['src/first.ts', 'src/second'],
+      })).toThrow(/directory|regular file/i);
+      expect(fs.readFileSync(first, 'utf8')).toBe('original\n');
+    });
+
+    it('rejects secret edit targets and oversized replacement content before writing', () => {
+      const secretBundle: CoderEditBundle = {
+        protocol_version: 'coderbundle.v1',
+        task_id: 'TSK-EDIT-POLICY',
+        authorization_id: 'auth-edit-policy',
+        source_head: shaA,
+        allowed_paths: ['.env'],
+        proposed_edits: [{ path: '.env', content: 'TOKEN=blocked\n' }],
+      };
+      expect(() => applyCoderEditBundle(worktreeDir, secretBundle, {
+        taskId: 'TSK-EDIT-POLICY',
+        authorizationId: 'auth-edit-policy',
+        sourceHead: shaA,
+        allowedPaths: ['.env'],
+      })).toThrow(/POLICY|sensitive|forbidden/i);
+      expect(fs.existsSync(path.join(worktreeDir, '.env'))).toBe(false);
+
+      const oversizedBundle: CoderEditBundle = {
+        protocol_version: 'coderbundle.v1',
+        task_id: 'TSK-EDIT-LIMIT',
+        authorization_id: 'auth-edit-limit',
+        source_head: shaA,
+        allowed_paths: ['src/oversized.ts'],
+        proposed_edits: [{ path: 'src/oversized.ts', content: 'x'.repeat(1024 * 1024 + 1) }],
+      };
+      expect(() => applyCoderEditBundle(worktreeDir, oversizedBundle, {
+        taskId: 'TSK-EDIT-LIMIT',
+        authorizationId: 'auth-edit-limit',
+        sourceHead: shaA,
+        allowedPaths: ['src/oversized.ts'],
+      })).toThrow(/CODER_EDIT_LIMIT_EXCEEDED/i);
+      expect(fs.existsSync(path.join(worktreeDir, 'src', 'oversized.ts'))).toBe(false);
+    });
+
+    it('rejects Windows alternate data streams and trimmed path aliases on every platform', () => {
+      const makeBundle = (editPath: string): CoderEditBundle => ({
+        protocol_version: 'coderbundle.v1',
+        task_id: 'TSK-PORTABLE-PATH',
+        authorization_id: 'auth-portable-path',
+        source_head: shaA,
+        allowed_paths: [editPath],
+        proposed_edits: [{ path: editPath, content: 'blocked\n' }],
+      });
+
+      expect(() => validateCoderEditBundle(makeBundle('src/app.ts:secret'), {
+        taskId: 'TSK-PORTABLE-PATH',
+        authorizationId: 'auth-portable-path',
+        sourceHead: shaA,
+        allowedPaths: ['src/app.ts:secret'],
+      })).toThrow(/PATH_TRAVERSAL|alternate data stream/i);
+      expect(() => validateCoderEditBundle(makeBundle('src/app.ts.'), {
+        taskId: 'TSK-PORTABLE-PATH',
+        authorizationId: 'auth-portable-path',
+        sourceHead: shaA,
+        allowedPaths: ['src/app.ts.'],
+      })).toThrow(/NON_CANONICAL_PATH|trimmed/i);
+    });
+
+    it('bounds recursive context enumeration before materializing an oversized directory', async () => {
+      const contextRoot = path.join(worktreeDir, 'large-context');
+      fs.mkdirSync(contextRoot, { recursive: true });
+      for (let index = 0; index < 65; index += 1) {
+        fs.writeFileSync(path.join(contextRoot, `file-${String(index).padStart(2, '0')}.ts`), `export const value${index} = ${index};\n`, 'utf8');
+      }
+      let fetchCalls = 0;
+      const transport = new ResponsesCoderEndpointTransport({
+        environment: { TEST_CODER_AUTH: secretToken },
+        fetch: async () => {
+          fetchCalls += 1;
+          return new Response(responsePayload('{}'), { status: 200 });
+        },
+      });
+      const order = createWorkOrder({
+        taskId: 'TSK-CONTEXT-BOUND',
+        workerId: 'coder-omniroute',
+        objective: 'bound context traversal',
+        baseSha: shaA,
+        branch: 'test',
+        worktree: worktreeDir,
+        allowedPaths: ['src/app.ts'],
+        contextFiles: ['large-context'],
+        acceptanceCriteria: ['bounded context'],
+      });
+
+      const result = await transport.executeWorkOrder(coderEndpointConfig(), order, 'auth-context-bound');
+      expect(result.run.status).toBe('CONTRACT_INVALID');
+      expect(result.run.stderr).toMatch(/SOURCE_CONTEXT_LIMIT_EXCEEDED/i);
+      expect(fetchCalls).toBe(0);
+    });
+
+    it('rejects non-regular context sources instead of opening FIFOs or devices', async () => {
+      if (process.platform === 'win32') return;
+      const fifo = path.join(worktreeDir, 'context.fifo');
+      execFileSync('mkfifo', [fifo], { windowsHide: true });
+      let fetchCalls = 0;
+      const transport = new ResponsesCoderEndpointTransport({
+        environment: { TEST_CODER_AUTH: secretToken },
+        fetch: async () => {
+          fetchCalls += 1;
+          return new Response(responsePayload('{}'), { status: 200 });
+        },
+      });
+      const order = createWorkOrder({
+        taskId: 'TSK-CONTEXT-FIFO',
+        workerId: 'coder-omniroute',
+        objective: 'reject special files',
+        baseSha: shaA,
+        branch: 'test',
+        worktree: worktreeDir,
+        allowedPaths: ['src/app.ts'],
+        contextFiles: ['context.fifo'],
+        acceptanceCriteria: ['regular files only'],
+      });
+
+      const result = await transport.executeWorkOrder(coderEndpointConfig(), order, 'auth-context-fifo');
+      expect(result.run.status).toBe('CONTRACT_INVALID');
+      expect(result.run.stderr).toMatch(/regular file/i);
+      expect(fetchCalls).toBe(0);
+    });
+
+    it('does not clobber a concurrent replacement during failed atomic edit rollback', () => {
+      const target = path.join(worktreeDir, 'src', 'concurrent.ts');
+      fs.mkdirSync(path.dirname(target), { recursive: true });
+      fs.writeFileSync(target, 'original\n', 'utf8');
+      const originalRename = fs.renameSync;
+      const renameSpy = vi.spyOn(fs, 'renameSync').mockImplementation((source, destination) => {
+        originalRename(source, destination);
+        if (String(destination) === target) {
+          fs.unlinkSync(target);
+          fs.writeFileSync(target, 'concurrent-user-edit\n', 'utf8');
+        }
+      });
+
+      const bundle: CoderEditBundle = {
+        protocol_version: 'coderbundle.v1',
+        task_id: 'TSK-CONCURRENT-ROLLBACK',
+        authorization_id: 'auth-concurrent-rollback',
+        source_head: shaA,
+        allowed_paths: ['src/concurrent.ts'],
+        proposed_edits: [{ path: 'src/concurrent.ts', content: 'coder-edit\n' }],
+      };
+      expect(() => applyCoderEditBundle(worktreeDir, bundle, {
+        taskId: 'TSK-CONCURRENT-ROLLBACK',
+        authorizationId: 'auth-concurrent-rollback',
+        sourceHead: shaA,
+        allowedPaths: ['src/concurrent.ts'],
+      })).toThrow(/CODER_EDIT_ROLLBACK_FAILED|concurrent/i);
+      expect(fs.readFileSync(target, 'utf8')).toBe('concurrent-user-edit\n');
+      renameSpy.mockRestore();
+    });
+
     it('executeWorkOrder succeeds when proposed edit content contains triple-backtick markdown', async () => {
       const targetPath = path.join(worktreeDir, 'README.md');
       fs.writeFileSync(targetPath, '# Initial\n', 'utf8');
