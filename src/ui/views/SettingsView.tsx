@@ -76,12 +76,20 @@ export const SettingsView: React.FC = () => {
     setBuildCmd(CommandParser.format(buildRow));
   };
 
+  const markSettingsDirty = () => {
+    setSaved(false);
+    setSaveError(null);
+  };
+
   // Load project-scoped verification commands from SQLite whenever activeProject changes
   useEffect(() => {
     const currentProjectId = activeProject?.id;
     let isMounted = true;
     setSaveError(null);
     setSaved(false);
+    // Reset project-scoped controls immediately so a project switch cannot
+    // briefly display or accidentally save the previous project's policy.
+    setMaxRevisionsInput(String(DEFAULT_MAX_REVISIONS));
 
     const loadVerificationCommands = async () => {
       if (!currentProjectId || !(window as any).orchestrator?.getVerificationCommands) {
@@ -279,9 +287,10 @@ export const SettingsView: React.FC = () => {
         return;
       }
 
-      if (maxRes?.success && parseMaxRevisions(maxRes.maxRevisions) !== null) {
+      const persistedMaxRevisions = parseMaxRevisions(maxRes?.maxRevisions);
+      if (maxRes?.success && persistedMaxRevisions === parsedMaxRevisions) {
         applyCanonicalCommands(commandRes.commands);
-        setMaxRevisionsInput(String(maxRes.maxRevisions));
+        setMaxRevisionsInput(String(persistedMaxRevisions));
         setSaved(true);
         setTimeout(() => setSaved(false), 2000);
       } else {
@@ -592,7 +601,10 @@ export const SettingsView: React.FC = () => {
                 type="text"
                 value={testCmd}
                 placeholder={t('settings.verificationCommands.testCmdPlaceholder')}
-                onChange={(e) => setTestCmd(e.target.value)}
+                onChange={(e) => {
+                  setTestCmd(e.target.value);
+                  markSettingsDirty();
+                }}
                 className="w-full bg-surface border border-surface-border rounded-lg px-3 py-2 text-white focus:outline-none focus:border-forge-cyan placeholder:text-slate-600"
               />
             </div>
@@ -603,7 +615,10 @@ export const SettingsView: React.FC = () => {
                 type="text"
                 value={lintCmd}
                 placeholder={t('settings.verificationCommands.lintCmdPlaceholder')}
-                onChange={(e) => setLintCmd(e.target.value)}
+                onChange={(e) => {
+                  setLintCmd(e.target.value);
+                  markSettingsDirty();
+                }}
                 className="w-full bg-surface border border-surface-border rounded-lg px-3 py-2 text-white focus:outline-none focus:border-forge-cyan placeholder:text-slate-600"
               />
             </div>
@@ -614,7 +629,10 @@ export const SettingsView: React.FC = () => {
                 type="text"
                 value={buildCmd}
                 placeholder={t('settings.verificationCommands.buildCmdPlaceholder')}
-                onChange={(e) => setBuildCmd(e.target.value)}
+                onChange={(e) => {
+                  setBuildCmd(e.target.value);
+                  markSettingsDirty();
+                }}
                 className="w-full bg-surface border border-surface-border rounded-lg px-3 py-2 text-white focus:outline-none focus:border-forge-cyan placeholder:text-slate-600"
               />
             </div>
@@ -637,8 +655,7 @@ export const SettingsView: React.FC = () => {
               value={maxRevisionsInput}
               onChange={(e) => {
                 setMaxRevisionsInput(e.target.value);
-                setSaved(false);
-                setSaveError(null);
+                markSettingsDirty();
               }}
               className="w-full bg-surface border border-surface-border rounded-lg px-3 py-2 text-white focus:outline-none focus:border-forge-cyan"
             />

@@ -687,7 +687,7 @@ export function registerIpcHandlers(
     }
   });
 
-  ipcMain.handle('settings:getMaxRevisions', async (_, payload: unknown) => {
+  registerPrivilegedHandler('settings:getMaxRevisions', async (_, payload: unknown) => {
     const parsed = GetMaxRevisionsIpcSchema.safeParse(payload);
     if (!parsed.success) {
       return { success: false, error: parsed.error.issues.map((i) => i.message).join(', ') };
@@ -701,7 +701,7 @@ export function registerIpcHandlers(
     return { success: true, maxRevisions: repo.getProjectMaxRevisions(project.id) };
   });
 
-  ipcMain.handle('settings:saveMaxRevisions', async (_, payload: unknown) => {
+  registerPrivilegedHandler('settings:saveMaxRevisions', async (_, payload: unknown) => {
     const parsed = SaveMaxRevisionsIpcSchema.safeParse(payload);
     if (!parsed.success) {
       return { success: false, error: parsed.error.issues.map((i) => i.message).join(', ') };

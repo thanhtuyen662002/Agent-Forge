@@ -65,4 +65,14 @@ describe('privileged IPC sender trust boundary', () => {
     ).resolves.toEqual([]);
     expect(repo.getAllProjects).toHaveBeenCalledTimes(1);
   });
+
+  it('protects project revision policy handlers with the same sender boundary', async () => {
+    for (const channel of ['settings:getMaxRevisions', 'settings:saveMaxRevisions']) {
+      const handler = handlers.get(channel);
+      expect(handler).toBeDefined();
+      await expect(
+        handler!({ senderFrame: { url: 'https://remote.example/' } }, { projectId: 'p1', maxRevisions: 1 }),
+      ).rejects.toMatchObject({ code: 'IPC_SENDER_UNTRUSTED' });
+    }
+  });
 });
