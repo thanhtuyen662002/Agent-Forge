@@ -253,6 +253,18 @@ describe('Local CLI provider workspace isolation', () => {
     expect(probes()).toHaveLength(0);
   });
 
+  it('bounds the number of context roots before filesystem traversal', async () => {
+    const result = await adapter.execute({
+      ...request([]),
+      contextFiles: Array.from({ length: 129 }, () => 'src/allowed.ts'),
+    });
+
+    expect(result.status).toBe('FAILED');
+    expect(result.errorCode).toBe('POLICY_DENIAL');
+    expect(result.error).toContain('CONTEXT_LIMIT_EXCEEDED');
+    expect(probes()).toHaveLength(0);
+  });
+
   it('does not synchronize provider edits when the protocol is invalid', async () => {
     const invalidRunnerPath = path.join(tmpDir, 'invalid-provider.js');
     fs.writeFileSync(invalidRunnerPath, `

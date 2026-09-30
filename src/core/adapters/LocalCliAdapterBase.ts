@@ -28,6 +28,7 @@ const LOCAL_CLI_FILE_MAX_BYTES = 4 * 1024 * 1024;
 // workspace files so a hostile tree cannot exhaust memory or recursion depth.
 const LOCAL_CLI_WORKSPACE_MAX_TRAVERSAL_ENTRIES = 512;
 const LOCAL_CLI_WORKSPACE_MAX_TRAVERSAL_DEPTH = 128;
+const LOCAL_CLI_WORKSPACE_MAX_CONTEXT_PATHS = 128;
 
 interface LocalCliFileIdentity {
   readonly key: string;
@@ -484,6 +485,9 @@ function localCliCleanupWorkspace(lease: LocalCliWorkspaceLease): void {
 }
 
 function localCliCollectContextFiles(sourceRoot: string, contextFiles: string[]): LocalCliWorkspaceEntry[] {
+  if (contextFiles.length > LOCAL_CLI_WORKSPACE_MAX_CONTEXT_PATHS) {
+    throw new LocalCliWorkspaceError('CONTEXT_LIMIT_EXCEEDED', 'authorized context contains too many paths');
+  }
   const realRoot = localCliRealpath(sourceRoot);
   const discovered = new Map<string, LocalCliWorkspaceEntry>();
   let discoveredBytes = 0;
