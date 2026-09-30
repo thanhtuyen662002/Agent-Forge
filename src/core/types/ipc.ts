@@ -153,13 +153,23 @@ export const RunVerificationIpcSchema = z
   .strict();
 export type RunVerificationIpc = z.infer<typeof RunVerificationIpcSchema>;
 
-export const UpdateResourceQuotaIpcSchema = z.object({
-  id: requiredIpcString(),
-  remaining: z.number().nullable(),
-  total: z.number().nullable(),
-  source: z.enum(['MEASURED', 'PROVIDER_REPORTED', 'MANUAL', 'ESTIMATED', 'UNKNOWN']),
-  confidence: z.number().min(0).max(1),
-});
+export const UpdateResourceQuotaIpcSchema = z
+  .object({
+    id: requiredIpcString(),
+    remaining: z.number().finite().nonnegative().nullable(),
+    total: z.number().finite().nonnegative().nullable(),
+    source: z.enum(['MEASURED', 'PROVIDER_REPORTED', 'MANUAL', 'ESTIMATED', 'UNKNOWN']),
+    confidence: z.number().finite().min(0).max(1),
+  })
+  .superRefine((value, ctx) => {
+    if (value.remaining !== null && value.total !== null && value.remaining > value.total) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ['remaining'],
+        message: 'Remaining quota cannot exceed total quota',
+      });
+    }
+  });
 export type UpdateResourceQuotaIpc = z.infer<typeof UpdateResourceQuotaIpcSchema>;
 
 /**
