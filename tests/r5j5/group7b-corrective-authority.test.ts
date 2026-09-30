@@ -1247,7 +1247,7 @@ describe('R5J5 Quarantined Submission Adjudication and Verification Suite', () =
       try {
         const handler = ipcChannelHandlers.get('submissions:inspect');
         expect(handler).toBeDefined();
-        const response = (await handler!(null, { submissionId: crypto.randomUUID() })) as {
+        const response = (await handler!({ senderFrame: { url: 'http://localhost:5173/' } }, { submissionId: crypto.randomUUID() })) as {
           success: boolean;
           error: string;
           message: string;

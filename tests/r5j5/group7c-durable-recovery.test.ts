@@ -1668,7 +1668,7 @@ describe('R5J5 Quarantined Submission Adjudication and Verification Suite', () =
       };
 
       try {
-        const res = (await handler!(null, { submissionId: crypto.randomUUID() })) as {
+        const res = (await handler!({ senderFrame: { url: 'http://localhost:5173/' } }, { submissionId: crypto.randomUUID() })) as {
           success: boolean;
           error: string;
           message: string;

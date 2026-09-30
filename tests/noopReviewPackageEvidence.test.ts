@@ -124,7 +124,7 @@ describe('No-Op Review Package Evidence Hardening (Fail-Closed & Clean Fallback)
   const invokeGenerateReviewPackage = async (pId = projectId, tId = taskId) => {
     const handler = ipcHandlers.get('protocol:generateReviewPackage');
     if (!handler) throw new Error('protocol:generateReviewPackage handler not registered');
-    return await handler(null, { projectId: pId, taskId: tId });
+    return await handler({ senderFrame: { url: 'http://localhost:5173/' } }, { projectId: pId, taskId: tId });
   };
 
   it('CASE A: Standard diff path succeeds when durable GIT_DIFF exists', async () => {
