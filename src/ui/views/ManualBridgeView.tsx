@@ -294,6 +294,7 @@ export const ManualBridgeView: React.FC = () => {
         taskId: selectedHandoffTaskId,
         routingDecisionId: routingDecision.decisionId,
         contextFiles: [],
+        executionMode: 'MANUAL_BRIDGE',
       });
 
       if (res && res.success && res.authorization) {
@@ -329,7 +330,7 @@ export const ManualBridgeView: React.FC = () => {
     setIsDispatching(true);
     setDispatchError(null);
     try {
-      const res = await dispatchAuthorization(authorization.id);
+      const res = await dispatchAuthorization(authorization.id, 'MANUAL_BRIDGE');
       if (res && res.success && res.result) {
         setDispatchResult(res.result);
       } else {

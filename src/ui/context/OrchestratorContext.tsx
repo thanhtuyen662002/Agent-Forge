@@ -1,6 +1,7 @@
 import React, { createContext, useContext, useState, useEffect, useCallback, useRef } from 'react';
 import { Project, Task, Agent, ProviderResource, EventRecord, Evidence, UIDensityMode } from '../../core/types/domain';
 import type { CanonicalExecutionScope } from '../../core/services/ExecutionAuthorizationService';
+import type { RendererAuthorizationMode } from '../../core/types/ipc';
 
 // Check if Electron IPC is available
 const isElectron = typeof window !== 'undefined' && Boolean((window as any).orchestrator);
@@ -52,9 +53,13 @@ interface OrchestratorContextType {
     attemptId?: string | null;
     routingDecisionId: string;
     contextFiles?: string[];
+    executionMode: RendererAuthorizationMode;
+    assignmentId?: string;
+    taskOwnershipEpoch?: number;
+    contextManifestId?: string;
     executionScope?: CanonicalExecutionScope;
   }) => Promise<any>;
-  dispatchAuthorization: (authorizationId: string) => Promise<any>;
+  dispatchAuthorization: (authorizationId: string, executionMode: RendererAuthorizationMode) => Promise<any>;
   getOwnerHandoffSnapshot: (taskId: string) => Promise<any>;
   generateAuthorizedWorkOrder: (authorizationId: string) => Promise<any>;
   getVerificationCommands: (projectId: string) => Promise<any>;
@@ -415,6 +420,10 @@ export const OrchestratorProvider: React.FC<{ children: React.ReactNode }> = ({ 
     attemptId?: string | null;
     routingDecisionId: string;
     contextFiles?: string[];
+    executionMode: RendererAuthorizationMode;
+    assignmentId?: string;
+    taskOwnershipEpoch?: number;
+    contextManifestId?: string;
     executionScope?: CanonicalExecutionScope;
   }) => {
     if (!orchestrator) return { success: false, error: 'Desktop required.' };
@@ -423,9 +432,9 @@ export const OrchestratorProvider: React.FC<{ children: React.ReactNode }> = ({ 
     return res;
   };
 
-  const dispatchAuthorization = async (authorizationId: string) => {
+  const dispatchAuthorization = async (authorizationId: string, executionMode: RendererAuthorizationMode) => {
     if (!orchestrator) return { success: false, error: 'Desktop required.' };
-    const res = await orchestrator.dispatchAuthorization(authorizationId);
+    const res = await orchestrator.dispatchAuthorization(authorizationId, executionMode);
     await refreshData();
     return res;
   };
