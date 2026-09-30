@@ -31,6 +31,7 @@ import {
 import { sanitizeContextFiles, canonicalJsonStringify, verifyContextManifestIntegrity } from '../context/ContextIntegrity';
 import { ProviderHealthObservationService } from './ProviderHealthObservationService';
 import { applyProviderHealthObservation } from './ProviderHealthApplication';
+import { ProjectStopFenceService } from './ProjectStopFenceService';
 
 export type ScheduledCancellationStatus =
   | 'CANCEL_REQUESTED'
@@ -80,6 +81,7 @@ export class ProviderDispatchService {
   private activeDispatches = new Map<string, ScheduledDispatchControl>();
   private readonly observationService: ProviderHealthObservationService;
   private readonly accountHealthService: { applyObservation: (authorizationId: string) => unknown };
+  private readonly stopFence: ProjectStopFenceService;
 
   constructor(
     private providerRegistry: ProviderRegistry,
@@ -93,6 +95,7 @@ export class ProviderDispatchService {
     this.accountHealthService = {
       applyObservation: (authorizationId) => applyProviderHealthObservation(this.repo, authorizationId),
     };
+    this.stopFence = new ProjectStopFenceService(this.repo);
   }
 
   public setGitWorktreeService(service: GitWorktreeService): void {
@@ -1156,7 +1159,29 @@ export class ProviderDispatchService {
     }
 
     // 12. ATOMIC CLAIM: Consume authorization before execution
-    const claimed = this.repo.claimExecutionAuthorization(authorizationId, nowIso);
+    const admission = this.stopFence.assertDispatchAdmission(authorizationId);
+    if (!admission.admitted) {
+      const reason = `EXECUTION_AUTHORIZATION_STOP_FENCE_REJECTED: ${admission.reason ?? 'project admission fence rejected dispatch.'}`;
+      this.recordRejectionEvent(auth, reason);
+      return {
+        executionId,
+        status: 'FAILED',
+        errorCode: 'RECOVERY_FENCED',
+        error: reason,
+      };
+    }
+
+    // Keep the repository CAS as the compatibility hook used by existing
+    // scheduler tests. ProjectStopFenceService installs a SQLite trigger on
+    // this exact update, so a stop that wins the race aborts the CAS even when
+    // the hook is replaced by a caller.
+    let claimed = false;
+    let claimError: string | undefined;
+    try {
+      claimed = this.repo.claimExecutionAuthorization(authorizationId, nowIso);
+    } catch (err: unknown) {
+      claimError = err instanceof Error ? err.message : 'PROJECT_STOP_FENCE_REJECTED';
+    }
     if (!claimed) {
       // Re-read current status to explain why claim failed
       const currentAuth = this.repo.getExecutionAuthorization(authorizationId);
@@ -1172,7 +1197,7 @@ export class ProviderDispatchService {
         executionId,
         status: 'FAILED',
         errorCode: 'RECOVERY_FENCED',
-        error: `EXECUTION_AUTHORIZATION_CLAIM_FAILED: Could not claim authorization "${authorizationId}" (status: ${currentAuth.status}).`,
+          error: `EXECUTION_AUTHORIZATION_CLAIM_FAILED: Could not claim authorization "${authorizationId}" (status: ${currentAuth.status}; ${claimError ?? 'CAS rejected'}).`,
       };
     }
 
@@ -1280,6 +1305,21 @@ export class ProviderDispatchService {
         status: 'CANCELLED',
         errorCode: 'CANCELLED',
         error: 'Execution was cancelled before adapter execution.',
+      };
+    }
+
+    // A stop can be requested after the dispatch CAS and before adapter start.
+    // Re-check the durable epoch immediately before any adapter-side work; the
+    // adapter-start SQLite trigger closes the remaining update race.
+    const preAdapterAdmission = this.stopFence.assertDispatchAdmission(auth.id);
+    if (!preAdapterAdmission.admitted) {
+      const reason = `EXECUTION_AUTHORIZATION_STOP_FENCE_REJECTED: ${preAdapterAdmission.reason ?? 'project admission fence changed before adapter start.'}`;
+      this.recordRejectionEvent(auth, reason);
+      return {
+        executionId,
+        status: 'FAILED',
+        errorCode: 'RECOVERY_FENCED',
+        error: reason,
       };
     }
 

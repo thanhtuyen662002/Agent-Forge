@@ -3,12 +3,17 @@ import { Repository } from '../database/repositories';
 import { EventService } from './EventService';
 import { ProjectStateMachine, ProjectTrigger } from '../state/projectStateMachine';
 import { Project, ProjectContract, ProjectStatus } from '../types/domain';
+import { ProjectStopFenceService } from './ProjectStopFenceService';
 
 export class ProjectService {
+  private readonly stopFence: ProjectStopFenceService;
+
   constructor(
     private repo: Repository,
     private eventService: EventService
-  ) {}
+  ) {
+    this.stopFence = new ProjectStopFenceService(repo);
+  }
 
   public createProject(name: string, description: string, repositoryPath: string, defaultBranch: string = 'main'): Project {
     const now = new Date().toISOString();
@@ -55,6 +60,13 @@ export class ProjectService {
     if (!project) throw new Error(`Project ${projectId} not found.`);
 
     const nextStatus = ProjectStateMachine.transition(project.status, trigger);
+    // Every state-machine path that enters RUNNING must honor the durable
+    // emergency latch. In particular, BLOCKER_RESOLVED, CAPACITY_RESTORED,
+    // OWNER_APPROVED, FINAL_FIX_REQUIRED, and RESUME must not bypass the
+    // owner-controlled CAS resume operation.
+    if (nextStatus === 'RUNNING') {
+      this.stopFence.assertProjectRunningAllowed(projectId);
+    }
     const startedAt = trigger === 'START_PROJECT' ? new Date().toISOString() : undefined;
     const completedAt = trigger === 'FINAL_PASS' ? new Date().toISOString() : undefined;
 

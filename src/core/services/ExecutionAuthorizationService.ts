@@ -14,6 +14,7 @@ import {
 import { ManagerProtocol } from '../types/protocols';
 import { sanitizeContextFiles, verifyContextManifestIntegrity } from '../context/ContextIntegrity';
 import { canonicalJsonStringify } from './ContextBuilderService';
+import { ProjectStopFenceService } from './ProjectStopFenceService';
 
 export interface CreateAuthorizationParams {
   projectId: string;
@@ -350,10 +351,14 @@ export function computeContextManifestHash(contextFiles: string[]): string {
 export { sanitizeContextFiles } from '../context/ContextIntegrity';
 
 export class ExecutionAuthorizationService {
+  private readonly stopFence: ProjectStopFenceService;
+
   constructor(
     private repo: Repository,
     private eventService?: EventService
-  ) {}
+  ) {
+    this.stopFence = new ProjectStopFenceService(repo);
+  }
 
   /**
    * Creates an immutable, durable ExecutionAuthorization bound to Manager protocol authority,
@@ -402,6 +407,19 @@ export class ExecutionAuthorizationService {
       this.recordRejectionEvent(params, `Project "${params.projectId}" not found in database.`);
       throw new Error(`EXECUTION_AUTHORIZATION_FAILED: Project "${params.projectId}" not found.`);
     }
+
+    const initialStopFence = this.stopFence.getFence(params.projectId);
+    if (!initialStopFence) {
+      const reason = `EXECUTION_AUTHORIZATION_PROJECT_NOT_FOUND: Project "${params.projectId}" has no durable admission fence.`;
+      this.recordRejectionEvent(params, reason);
+      throw new Error(`EXECUTION_AUTHORIZATION_FAILED: ${reason}`);
+    }
+    if (initialStopFence.latched || initialStopFence.projectStatus === 'PAUSED') {
+      const reason = `EXECUTION_AUTHORIZATION_PROJECT_STOPPED: Project "${params.projectId}" is paused or emergency-stopped at epoch ${initialStopFence.epoch}.`;
+      this.recordRejectionEvent(params, reason);
+      throw new Error(`EXECUTION_AUTHORIZATION_FAILED: ${reason}`);
+    }
+    const authorizationStopEpoch = initialStopFence.epoch;
 
     const task = this.repo.getTask(params.taskId);
     if (!task) {
@@ -809,6 +827,22 @@ export class ExecutionAuthorizationService {
 
     this.repo.createExecutionAuthorization(authorization);
 
+    // Bind the authorization to the exact project epoch after asynchronous
+    // validation. The immediate transaction either records this immutable
+    // fence or invalidates the new authorization if an emergency stop won the
+    // race while Git/context checks were running.
+    const admission = this.stopFence.bindAuthorization(
+      authorization.id,
+      authorization.project_id,
+      authorizationStopEpoch,
+      createdAt
+    );
+    if (!admission.admitted) {
+      const reason = `EXECUTION_AUTHORIZATION_PROJECT_STOPPED: ${admission.reason ?? 'project admission fence changed while authorizing.'}`;
+      this.recordRejectionEvent(params, reason);
+      throw new Error(`EXECUTION_AUTHORIZATION_FAILED: ${reason}`);
+    }
+
     // 10. Persist Audit Event
     if (this.eventService) {
       this.eventService.record(
@@ -830,6 +864,7 @@ export class ExecutionAuthorizationService {
           selectedProviderId,
           instructionPayloadHash,
           contextManifestHash,
+          projectStopEpoch: authorizationStopEpoch,
           contextFileCount: canonicalContextFiles.length,
           status: 'AUTHORIZED',
           ...(isProductBindingRequested && boundAssignment && boundAccount
