@@ -1,0 +1,55 @@
+# Local provider execution workspaces
+
+Local CLI providers execute from a short-lived, per-execution workspace. The
+workspace is created below the operating system temporary directory and is
+owned by the Agent Forge process. It contains only the regular files named by
+the durable execution context manifest; the project repository is never used
+as the provider's current working directory.
+
+## Boundary and data flow
+
+Before spawning a provider, `LocalCliAdapterBase` canonicalizes the project
+root and every context path. Absolute paths, traversal, sensitive names
+(`.env*`, `.git`, credentials, private keys, and similar names), symlinks, and
+Windows junction/reparse points are rejected. A directory context is walked
+with the same policy for every child; denied children are omitted, while an
+explicitly denied path fails the execution. Reads are descriptor based and
+bounded to 4 MiB per file, 256 files, and 16 MiB per workspace.
+
+Each execution receives a random workspace directory and a sibling marker that
+contains the execution ID, owner token, ownership digest, creation time, and
+state. Marker names are validated before they are used as filesystem paths.
+The provider sees this directory as its `cwd`; it does not receive the source
+repository path through the prompt or environment. Workspace parents are
+created as real directories and the workspace identity is fenced throughout
+cleanup.
+
+Only an existing, authorized context file can be synchronized back. A valid
+`coder.v1` protocol is required before synchronization. The source file's
+identity and SHA-256 hash are checked again, the replacement is written through
+a flushed temporary file, and the parent directory and target identity are
+revalidated before an atomic rename. Provider failures, invalid protocols, or
+conflicts never write changes back to the project.
+
+Cleanup verifies the marker owner, ownership digest, and workspace identity
+before removing the directory. A cleanup failure leaves a typed
+`CLEANUP_FAILED` marker and causes the execution to fail. On the next
+preparation, markers older than the six-hour stale threshold are recovered only
+when they are well formed and point at a real directory. Active executions are
+never recovered by another process in the same runtime.
+
+## Platform limitations
+
+This mechanism is a sanitized working-directory boundary, not a kernel-level
+sandbox. The provider process still runs as the Agent Forge user and could
+attempt an absolute path, inspect unrelated temporary files, or leave a
+detached child process. Windows does not expose a portable Node.js
+`O_NOFOLLOW` equivalent, so Windows relies on `lstat`/realpath identity checks
+and reparse-point rejection; a hostile process with the same user privileges
+can still race filesystem operations. POSIX systems require `O_NOFOLLOW` for
+descriptor reads, and platforms that cannot provide it fail closed.
+
+Deployments that execute an intentionally hostile or multi-tenant provider
+must add an OS/container sandbox with filesystem, process, and network policy.
+The local workspace remains the application-level least-privilege boundary and
+the durable evidence/cleanup fence even when such a stronger sandbox is used.
