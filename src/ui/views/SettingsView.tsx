@@ -233,14 +233,15 @@ export const SettingsView: React.FC = () => {
       return;
     }
 
-    saveInFlightRef.current = true;
-    const savedProjectId = activeProject.id;
     const parsedMaxRevisions = parseMaxRevisions(maxRevisionsInput);
     if (parsedMaxRevisions === null) {
       setSaveError(t('settings.loopProtection.invalidMaxRevisions'));
       setSaved(false);
       return;
     }
+
+    saveInFlightRef.current = true;
+    const savedProjectId = activeProject.id;
 
     setSaveError(null);
     setSaved(false);
