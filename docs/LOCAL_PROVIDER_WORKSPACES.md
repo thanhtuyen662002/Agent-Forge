@@ -31,9 +31,13 @@ Only an existing, authorized context file can be synchronized back. A valid
 workspace entries are preflighted before the first write; the source file's
 identity and SHA-256 hash are checked again, the replacement is written through
 a flushed temporary file, and the parent directory and target identity are
-revalidated before an atomic rename. Provider failures, invalid protocols, or
-conflicts never write changes back to the project. Windows alternate data
-stream paths are rejected as context paths.
+revalidated before an atomic rename. If a later entry conflicts after an
+earlier entry was written, earlier writes are rolled back in reverse order only
+while their identity and provider-result hash still match. A concurrent
+replacement is never overwritten during rollback and is reported as a rollback
+failure. Provider failures, invalid protocols, or conflicts therefore never
+silently become task success. Windows alternate data stream paths are rejected
+as context paths.
 
 Cleanup verifies the marker owner, ownership digest, and workspace identity
 before removing the directory. A cleanup failure leaves a typed
