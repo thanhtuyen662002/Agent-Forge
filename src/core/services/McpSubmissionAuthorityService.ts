@@ -122,7 +122,7 @@ export class McpSubmissionAuthorityService {
       return {
         accepted: false,
         error_code: 'SCHEMA_VALIDATION_FAILED',
-        message: `Schema validation failed: ${parseResult.error.errors.map((e) => e.message).join('; ')}`,
+        message: `Schema validation failed: ${parseResult.error.issues.map((e) => e.message).join('; ')}`,
         retryable: false,
       };
     }
@@ -1146,7 +1146,7 @@ export class McpSubmissionAuthorityService {
         return {
           ok: false,
           error_code: 'SCHEMA_VALIDATION_FAILED',
-          message: `Schema validation failed: ${parseResult.error.errors.map((e) => e.message).join('; ')}`,
+          message: `Schema validation failed: ${parseResult.error.issues.map((e) => e.message).join('; ')}`,
           retryable: false,
         };
       }

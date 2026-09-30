@@ -162,7 +162,7 @@ export const StrictFrozenProjectionSchema = z.object({
     }),
     skipped_count: z.number().int().nonnegative().optional(),
     duration_ms: z.number().int().nonnegative().optional(),
-    envelope: z.record(z.unknown()).refine((obj) => obj !== null && typeof obj === 'object' && !Array.isArray(obj), {
+    envelope: z.record(z.string(), z.unknown()).refine((obj) => obj !== null && typeof obj === 'object' && !Array.isArray(obj), {
       message: 'envelope must be a non-null plain object',
     }),
   }).strict(),
