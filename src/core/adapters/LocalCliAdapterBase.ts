@@ -78,6 +78,7 @@ export class LocalCliWorkspaceError extends Error {
 }
 
 const activeLocalCliWorkspaces = new Set<string>();
+const recoveringLocalCliMarkers = new Set<string>();
 
 function localCliErrno(error: unknown): string | undefined {
   return error && typeof error === 'object' && 'code' in error && typeof (error as { code?: unknown }).code === 'string'
@@ -389,6 +390,12 @@ export function recoverOrphanedLocalCliWorkspaces(
   const result: LocalCliWorkspaceRecoveryResult = { recovered: [], skipped: [], failed: [] };
   try { localCliEnsureBase(basePath); } catch { return result; }
   for (const markerName of fs.readdirSync(basePath).filter((name) => name.endsWith(LOCAL_CLI_WORKSPACE_MARKER_SUFFIX))) {
+    if (recoveringLocalCliMarkers.has(markerName)) {
+      result.skipped.push(markerName);
+      continue;
+    }
+    recoveringLocalCliMarkers.add(markerName);
+    try {
     const markerPath = path.join(basePath, markerName);
     const marker = localCliReadMarker(markerPath);
     if (!marker || activeLocalCliWorkspaces.has(marker.executionId)) {
@@ -428,9 +435,19 @@ export function recoverOrphanedLocalCliWorkspaces(
       fs.rmSync(workspacePath, { recursive: true, force: true });
       fs.unlinkSync(markerPath);
       result.recovered.push(marker.workspaceName);
-    } catch {
+    } catch (error) {
+      // Another recovery process may have completed the same cleanup between
+      // the identity check and unlink. Treat that idempotent outcome as
+      // success instead of recreating a misleading failure marker.
+      if (localCliIsMissing(error)) {
+        result.recovered.push(marker.workspaceName);
+        continue;
+      }
       try { localCliWriteMarker(markerPath, { ...marker, state: 'CLEANUP_FAILED' }); } catch { /* preserve the recovery failure */ }
       result.failed.push(marker.workspaceName);
+    }
+    } finally {
+      recoveringLocalCliMarkers.delete(markerName);
     }
   }
   return result;
