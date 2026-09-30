@@ -14,6 +14,8 @@ export interface RendererNavigationPolicyOptions {
   devServerUrl?: string;
 }
 
+const TRUSTED_DEV_HOSTS = new Set(['localhost', '127.0.0.1', '[::1]']);
+
 function parseTrustedDevOrigin(devServerUrl: string | undefined): URL | null {
   if (!devServerUrl || typeof devServerUrl !== 'string' || devServerUrl.trim() === '') {
     return null;
@@ -21,9 +23,16 @@ function parseTrustedDevOrigin(devServerUrl: string | undefined): URL | null {
 
   try {
     const parsed = new URL(devServerUrl);
-    // Development renderers must stay on a local HTTP(S) origin. Credentials are
-    // never meaningful for the renderer and make origin comparisons deceptive.
-    if (!['http:', 'https:'].includes(parsed.protocol) || parsed.username || parsed.password) {
+    // Development renderers must stay on an explicitly loopback HTTP(S) origin.
+    // Credentials are never meaningful for the renderer and make origin
+    // comparisons deceptive. Checking the parsed hostname (rather than a
+    // string prefix) rejects lookalikes such as localhost.evil.example.
+    if (
+      !['http:', 'https:'].includes(parsed.protocol)
+      || !TRUSTED_DEV_HOSTS.has(parsed.hostname)
+      || parsed.username
+      || parsed.password
+    ) {
       return null;
     }
     return parsed;
@@ -107,6 +116,47 @@ export function isAllowedRendererNavigation(
     && candidate.port === trustedOrigin.port;
 }
 
+/**
+ * Return the navigation policy used by both the BrowserWindow navigation guard
+ * and privileged IPC sender checks. Keeping one derived policy prevents the
+ * renderer and IPC boundaries from disagreeing after a configuration change.
+ */
+export function resolveRendererNavigationPolicy(options: {
+  isPackaged: boolean;
+  appPath?: string;
+  devServerUrl?: string;
+}): RendererNavigationPolicyOptions {
+  const target = resolveRendererTarget(options);
+  return {
+    isPackaged: options.isPackaged,
+    rendererFilePath: target.type === 'file' ? target.target : undefined,
+    devServerUrl: target.type === 'url' ? target.target : undefined,
+  };
+}
+
+export interface IpcSenderFrameLike {
+  url?: unknown;
+}
+
+export interface IpcInvokeEventLike {
+  senderFrame?: IpcSenderFrameLike | null;
+}
+
+/**
+ * Validate the frame that invoked a privileged IPC handler. Electron exposes
+ * senderFrame for the actual invoking frame; requiring it avoids trusting a
+ * stale or missing WebContents URL and also rejects synthetic/malformed events.
+ */
+export function isTrustedIpcSender(
+  event: unknown,
+  options: RendererNavigationPolicyOptions,
+): boolean {
+  if (!event || typeof event !== 'object') return false;
+  const frame = (event as IpcInvokeEventLike).senderFrame;
+  if (!frame || typeof frame !== 'object' || typeof frame.url !== 'string') return false;
+  return isAllowedRendererNavigation(frame.url, options);
+}
+
 export function resolveRendererTarget(options: {
   isPackaged: boolean;
   appPath?: string;
@@ -123,6 +173,11 @@ export function resolveRendererTarget(options: {
   }
 
   if (options.devServerUrl && typeof options.devServerUrl === 'string' && options.devServerUrl.trim() !== '') {
+    if (!parseTrustedDevOrigin(options.devServerUrl)) {
+      throw new Error(
+        '[Security/Path] VITE_DEV_SERVER_URL must use an HTTP(S) loopback origin (localhost, 127.0.0.1, or [::1]) without credentials.'
+      );
+    }
     return {
       type: 'url',
       target: options.devServerUrl,

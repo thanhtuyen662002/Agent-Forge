@@ -3,7 +3,12 @@ import path from 'path';
 import fs from 'fs';
 import { BootstrapService, BootstrapResult } from '../core/services/BootstrapService';
 import { registerIpcHandlers } from './ipcHandlers';
-import { isAllowedRendererNavigation, resolveRendererTarget } from './pathHelper';
+import {
+  isAllowedRendererNavigation,
+  RendererNavigationPolicyOptions,
+  RendererTarget,
+  resolveRendererTarget,
+} from './pathHelper';
 import { UpdateService } from '../core/services/UpdateService';
 import { ElectronUpdaterAdapter } from './updaterAdapter';
 
@@ -11,7 +16,11 @@ let mainWindow: BrowserWindow | null = null;
 let bootstrapInstance: BootstrapResult | null = null;
 let updateServiceInstance: UpdateService | null = null;
 
-function createWindow(userDataDir: string): void {
+function createWindow(
+  userDataDir: string,
+  rendererTarget: RendererTarget,
+  navigationPolicy: RendererNavigationPolicyOptions,
+): void {
   mainWindow = new BrowserWindow({
     width: 1400,
     height: 900,
@@ -93,18 +102,6 @@ function createWindow(userDataDir: string): void {
     });
   }
 
-  const rendererTarget = resolveRendererTarget({
-    isPackaged: app.isPackaged,
-    appPath: app.getAppPath(),
-    devServerUrl: process.env.VITE_DEV_SERVER_URL,
-  });
-
-  const navigationPolicy = {
-    isPackaged: app.isPackaged,
-    rendererFilePath: rendererTarget.type === 'file' ? rendererTarget.target : undefined,
-    devServerUrl: rendererTarget.type === 'url' ? rendererTarget.target : undefined,
-  };
-
   // Strict Navigation Guard: Block uncontrolled external navigation
   mainWindow.webContents.on('will-navigate', (event, url) => {
     if (!isAllowedRendererNavigation(url, navigationPolicy)) {
@@ -142,6 +139,16 @@ function createWindow(userDataDir: string): void {
 
 app.whenReady().then(() => {
   const userDataDir = process.env.AGENT_FORGE_DATA_DIR || app.getPath('userData');
+  const rendererTarget = resolveRendererTarget({
+    isPackaged: app.isPackaged,
+    appPath: app.getAppPath(),
+    devServerUrl: process.env.VITE_DEV_SERVER_URL,
+  });
+  const navigationPolicy: RendererNavigationPolicyOptions = {
+    isPackaged: app.isPackaged,
+    rendererFilePath: rendererTarget.type === 'file' ? rendererTarget.target : undefined,
+    devServerUrl: rendererTarget.type === 'url' ? rendererTarget.target : undefined,
+  };
   bootstrapInstance = BootstrapService.initialize(userDataDir);
 
   // Initialize UpdateService with packaged/unsigned configuration
@@ -164,15 +171,17 @@ app.whenReady().then(() => {
     bootstrapInstance.providerRoutingService,
     bootstrapInstance.executionAuthorizationService,
     bootstrapInstance.providerDispatchService,
-    updateServiceInstance
+    updateServiceInstance,
+    undefined,
+    navigationPolicy,
   );
 
   // Create Desktop Window
-  createWindow(userDataDir);
+  createWindow(userDataDir, rendererTarget, navigationPolicy);
 
   app.on('activate', () => {
     if (BrowserWindow.getAllWindows().length === 0) {
-      createWindow(userDataDir);
+      createWindow(userDataDir, rendererTarget, navigationPolicy);
     }
   });
 });
