@@ -483,8 +483,15 @@ function readCoderFile(
   assertCoderSnapshotUnchanged(snapshot, anchor);
   let descriptor: number | undefined;
   try {
-    descriptor = openCoderFile(snapshot.absolutePath, fs.constants.O_RDONLY);
+    // O_NONBLOCK keeps a replacement FIFO/device from stalling the main
+    // process before its non-regular-file identity can be rejected.  It is a
+    // no-op for regular files and is unavailable on a few platforms.
+    const nonBlocking = typeof fs.constants.O_NONBLOCK === 'number' ? fs.constants.O_NONBLOCK : 0;
+    descriptor = openCoderFile(snapshot.absolutePath, fs.constants.O_RDONLY | nonBlocking);
     const openedStat = fs.fstatSync(descriptor);
+    if (!openedStat.isFile()) {
+      throw new Error('CODER_PATH_CHANGED: source file became a non-regular file before it was read');
+    }
     const openedIdentity: CoderPathIdentity = {
       key: coderIdentityKey(openedStat),
       realPath: coderRealpath(snapshot.absolutePath),
