@@ -222,6 +222,37 @@ describe('Local CLI provider workspace isolation', () => {
     expect(probes()).toHaveLength(0);
   });
 
+  it('bounds directory context traversal depth before spawning the provider', async () => {
+    let deepDirectory = path.join(projectRoot, 'deep-context');
+    fs.mkdirSync(deepDirectory);
+    for (let index = 0; index < 129; index += 1) {
+      deepDirectory = path.join(deepDirectory, `level-${index}`);
+      fs.mkdirSync(deepDirectory);
+    }
+
+    const result = await adapter.execute({ ...request([]), contextFiles: ['deep-context'] });
+
+    expect(result.status).toBe('FAILED');
+    expect(result.errorCode).toBe('POLICY_DENIAL');
+    expect(result.error).toContain('CONTEXT_LIMIT_EXCEEDED');
+    expect(probes()).toHaveLength(0);
+  });
+
+  it('bounds directory entry enumeration before materializing a large tree', async () => {
+    const fanoutDirectory = path.join(projectRoot, 'fanout-context');
+    fs.mkdirSync(fanoutDirectory);
+    for (let index = 0; index < 513; index += 1) {
+      fs.mkdirSync(path.join(fanoutDirectory, `entry-${index}`));
+    }
+
+    const result = await adapter.execute({ ...request([]), contextFiles: ['fanout-context'] });
+
+    expect(result.status).toBe('FAILED');
+    expect(result.errorCode).toBe('POLICY_DENIAL');
+    expect(result.error).toContain('CONTEXT_LIMIT_EXCEEDED');
+    expect(probes()).toHaveLength(0);
+  });
+
   it('does not synchronize provider edits when the protocol is invalid', async () => {
     const invalidRunnerPath = path.join(tmpDir, 'invalid-provider.js');
     fs.writeFileSync(invalidRunnerPath, `

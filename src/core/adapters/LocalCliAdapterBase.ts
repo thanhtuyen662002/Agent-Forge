@@ -23,6 +23,11 @@ const LOCAL_CLI_WORKSPACE_STALE_AFTER_MS = 6 * 60 * 60 * 1000;
 const LOCAL_CLI_WORKSPACE_MAX_FILES = 256;
 const LOCAL_CLI_WORKSPACE_MAX_BYTES = 16 * 1024 * 1024;
 const LOCAL_CLI_FILE_MAX_BYTES = 4 * 1024 * 1024;
+// Directory context is provider-controlled input. Bound both the number of
+// directory entries inspected and the nesting depth before materializing any
+// workspace files so a hostile tree cannot exhaust memory or recursion depth.
+const LOCAL_CLI_WORKSPACE_MAX_TRAVERSAL_ENTRIES = 512;
+const LOCAL_CLI_WORKSPACE_MAX_TRAVERSAL_DEPTH = 128;
 
 interface LocalCliFileIdentity {
   readonly key: string;
@@ -482,7 +487,11 @@ function localCliCollectContextFiles(sourceRoot: string, contextFiles: string[])
   const realRoot = localCliRealpath(sourceRoot);
   const discovered = new Map<string, LocalCliWorkspaceEntry>();
   let discoveredBytes = 0;
-  const add = (absolutePath: string, explicit: boolean): void => {
+  let traversalEntries = 0;
+  const add = (absolutePath: string, explicit: boolean, depth: number): void => {
+    if (depth > LOCAL_CLI_WORKSPACE_MAX_TRAVERSAL_DEPTH) {
+      throw new LocalCliWorkspaceError('CONTEXT_LIMIT_EXCEEDED', 'authorized context exceeds the directory nesting limit');
+    }
     const relative = path.relative(sourceRoot, absolutePath).replace(/\\/g, '/');
     if (!relative || relative.startsWith('../') || path.isAbsolute(relative)) throw new LocalCliWorkspaceError('CONTEXT_PATH_INVALID', 'context escaped the source root');
     let stat: fs.Stats;
@@ -495,7 +504,22 @@ function localCliCollectContextFiles(sourceRoot: string, contextFiles: string[])
     const resolved = localCliRealpath(absolutePath);
     if (!localCliContained(resolved, realRoot)) throw new LocalCliWorkspaceError('CONTEXT_REPARSE_POINT', `context escaped the source root: ${relative}`);
     if (stat.isDirectory()) {
-      for (const child of fs.readdirSync(absolutePath).sort()) add(path.join(absolutePath, child), false);
+      const children: string[] = [];
+      const directory = fs.opendirSync(absolutePath);
+      try {
+        while (true) {
+          const entry = directory.readSync();
+          if (entry === null) break;
+          traversalEntries += 1;
+          if (traversalEntries > LOCAL_CLI_WORKSPACE_MAX_TRAVERSAL_ENTRIES) {
+            throw new LocalCliWorkspaceError('CONTEXT_LIMIT_EXCEEDED', 'authorized context exceeds the directory entry limit');
+          }
+          children.push(entry.name);
+        }
+      } finally {
+        directory.closeSync();
+      }
+      for (const child of children.sort()) add(path.join(absolutePath, child), false, depth + 1);
       return;
     }
     if (!stat.isFile()) return;
@@ -526,7 +550,7 @@ function localCliCollectContextFiles(sourceRoot: string, contextFiles: string[])
     if (!localCliContained(absolute, sourceRoot)) throw new LocalCliWorkspaceError('CONTEXT_PATH_INVALID', `context escaped the source root: ${relative}`);
     localCliPolicyOrThrow(absolute, realRoot, relative, false);
     try { fs.lstatSync(absolute); } catch (error) { if (localCliIsMissing(error)) continue; throw error; }
-    add(absolute, true);
+    add(absolute, true, relative.split('/').filter(Boolean).length);
   }
   return [...discovered.values()].sort((left, right) => left.relativePath.localeCompare(right.relativePath));
 }
