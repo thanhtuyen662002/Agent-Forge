@@ -17,19 +17,23 @@ explicitly denied path fails the execution. Reads are descriptor based and
 bounded to 4 MiB per file, 256 files, and 16 MiB per workspace.
 
 Each execution receives a random workspace directory and a sibling marker that
-contains the execution ID, owner token, ownership digest, creation time, and
-state. Marker names are validated before they are used as filesystem paths.
-The provider sees this directory as its `cwd`; it does not receive the source
-repository path through the prompt or environment. Workspace parents are
-created as real directories and the workspace identity is fenced throughout
-cleanup.
+contains the execution ID, owner token, ownership digest, creation time, state,
+and the workspace identity (filesystem key plus canonical path). Marker names
+are bound to their filenames before recovery targets are resolved, and a
+replacement workspace with a different identity is retained for manual
+recovery. The provider sees this directory as its `cwd`; it does not receive
+the source repository path through the prompt or environment. Version probes
+also run from a disposable temporary directory. Workspace parents are created
+as real directories and the workspace identity is fenced throughout cleanup.
 
 Only an existing, authorized context file can be synchronized back. A valid
-`coder.v1` protocol is required before synchronization. The source file's
+`coder.v1` protocol is required before synchronization. All source and
+workspace entries are preflighted before the first write; the source file's
 identity and SHA-256 hash are checked again, the replacement is written through
 a flushed temporary file, and the parent directory and target identity are
 revalidated before an atomic rename. Provider failures, invalid protocols, or
-conflicts never write changes back to the project.
+conflicts never write changes back to the project. Windows alternate data
+stream paths are rejected as context paths.
 
 Cleanup verifies the marker owner, ownership digest, and workspace identity
 before removing the directory. A cleanup failure leaves a typed

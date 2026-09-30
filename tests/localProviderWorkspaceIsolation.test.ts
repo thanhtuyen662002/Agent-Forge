@@ -209,6 +209,16 @@ describe('Local CLI provider workspace isolation', () => {
     expect(probes()).toHaveLength(0);
   });
 
+  it('rejects Windows alternate data stream context paths', async () => {
+    if (process.platform !== 'win32') return;
+
+    const result = await adapter.execute({ ...request([]), contextFiles: ['src/allowed.ts:secret'] });
+
+    expect(result.status).toBe('FAILED');
+    expect(result.error).toContain('CONTEXT_PATH_INVALID');
+    expect(probes()).toHaveLength(0);
+  });
+
   it('does not synchronize provider edits when the protocol is invalid', async () => {
     const invalidRunnerPath = path.join(tmpDir, 'invalid-provider.js');
     fs.writeFileSync(invalidRunnerPath, `
@@ -266,11 +276,14 @@ describe('Local CLI provider workspace isolation', () => {
     const workspacePath = path.join(basePath, workspaceName);
     fs.mkdirSync(workspacePath, { recursive: true });
     fs.writeFileSync(path.join(workspacePath, 'payload.txt'), 'orphan', 'utf8');
+    const workspaceStat = fs.lstatSync(workspacePath);
     fs.writeFileSync(path.join(basePath, `${workspaceName}.workspace.json`), JSON.stringify({
       version: 1,
       executionId: 'orphan-execution',
       ownerToken: 'orphan-owner',
       workspaceName,
+      workspaceIdentityKey: `${process.platform === 'win32' ? 'win32' : String(workspaceStat.dev)}:${String(workspaceStat.ino)}:${String(workspaceStat.mode & 0o170000)}`,
+      workspaceIdentityRealPath: fs.realpathSync(workspacePath),
       ownershipDigest: 'epoch-1',
       createdAt: new Date(0).toISOString(),
       state: 'ACTIVE',
@@ -283,5 +296,65 @@ describe('Local CLI provider workspace isolation', () => {
     expect(result.skipped).toContain('malformed.workspace.json');
     expect(fs.existsSync(workspacePath)).toBe(false);
     expect(fs.existsSync(path.join(basePath, `${workspaceName}.workspace.json`))).toBe(false);
+  });
+
+  it('never lets a stale marker redirect recovery to another workspace', () => {
+    const basePath = path.join(tmpDir, 'workspace-base-redirection');
+    const victimName = 'live-victim';
+    const victimPath = path.join(basePath, victimName);
+    fs.mkdirSync(victimPath, { recursive: true });
+    fs.writeFileSync(path.join(victimPath, 'payload.txt'), 'must survive', 'utf8');
+    const victimStat = fs.lstatSync(victimPath);
+    const victimIdentity = {
+      key: `${process.platform === 'win32' ? 'win32' : String(victimStat.dev)}:${String(victimStat.ino)}:${String(victimStat.mode & 0o170000)}`,
+      realPath: fs.realpathSync(victimPath),
+    };
+
+    // The filename says "unbound" while the payload tries to target victim.
+    fs.writeFileSync(path.join(basePath, 'unbound.workspace.json'), JSON.stringify({
+      version: 1,
+      executionId: 'forged-execution',
+      ownerToken: 'forged-owner',
+      workspaceName: victimName,
+      ...victimIdentity,
+      ownershipDigest: 'forged-epoch',
+      createdAt: new Date(0).toISOString(),
+      state: 'ACTIVE',
+    }), 'utf8');
+
+    const result = recoverOrphanedLocalCliWorkspaces(basePath, Date.now(), 1000);
+
+    expect(result.skipped).toContain('unbound.workspace.json');
+    expect(fs.existsSync(victimPath)).toBe(true);
+    expect(fs.readFileSync(path.join(victimPath, 'payload.txt'), 'utf8')).toBe('must survive');
+    expect(fs.existsSync(path.join(basePath, 'unbound.workspace.json'))).toBe(true);
+  });
+
+  it('retains a correctly named marker when its workspace identity no longer matches', () => {
+    const basePath = path.join(tmpDir, 'workspace-base-identity');
+    const victimName = 'replaced-workspace';
+    const victimPath = path.join(basePath, victimName);
+    const otherPath = path.join(basePath, 'other-workspace');
+    fs.mkdirSync(victimPath, { recursive: true });
+    fs.mkdirSync(otherPath, { recursive: true });
+    fs.writeFileSync(path.join(victimPath, 'payload.txt'), 'new workspace', 'utf8');
+    const otherStat = fs.lstatSync(otherPath);
+    fs.writeFileSync(path.join(basePath, `${victimName}.workspace.json`), JSON.stringify({
+      version: 1,
+      executionId: 'replaced-execution',
+      ownerToken: 'replaced-owner',
+      workspaceName: victimName,
+      workspaceIdentityKey: `${process.platform === 'win32' ? 'win32' : String(otherStat.dev)}:${String(otherStat.ino)}:${String(otherStat.mode & 0o170000)}`,
+      workspaceIdentityRealPath: fs.realpathSync(otherPath),
+      ownershipDigest: 'old-epoch',
+      createdAt: new Date(0).toISOString(),
+      state: 'ACTIVE',
+    }), 'utf8');
+
+    const result = recoverOrphanedLocalCliWorkspaces(basePath, Date.now(), 1000);
+
+    expect(result.skipped).toContain(`${victimName}.workspace.json`);
+    expect(fs.existsSync(victimPath)).toBe(true);
+    expect(fs.existsSync(path.join(basePath, `${victimName}.workspace.json`))).toBe(true);
   });
 });
