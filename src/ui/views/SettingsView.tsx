@@ -67,6 +67,8 @@ export const SettingsView: React.FC = () => {
   const actionInFlightRef = useRef(false);
   const saveInFlightRef = useRef(false);
   const settingsDraftVersionRef = useRef(0);
+  const commandsDirtyRef = useRef(false);
+  const maxRevisionsDirtyRef = useRef(false);
   const settingsLoadedProjectIdRef = useRef<string | undefined>(undefined);
 
   const applyCanonicalCommands = (commands: any[]) => {
@@ -79,8 +81,10 @@ export const SettingsView: React.FC = () => {
     setBuildCmd(CommandParser.format(buildRow));
   };
 
-  const markSettingsDirty = () => {
+  const markSettingsDirty = (scope: 'commands' | 'maxRevisions') => {
     settingsDraftVersionRef.current += 1;
+    if (scope === 'commands') commandsDirtyRef.current = true;
+    if (scope === 'maxRevisions') maxRevisionsDirtyRef.current = true;
     setSaved(false);
     setSaveError(null);
   };
@@ -90,9 +94,10 @@ export const SettingsView: React.FC = () => {
     const currentProjectId = activeProject?.id;
     let isMounted = true;
     settingsDraftVersionRef.current += 1;
+    commandsDirtyRef.current = false;
+    maxRevisionsDirtyRef.current = false;
     settingsLoadedProjectIdRef.current = undefined;
     setSettingsLoading(Boolean(currentProjectId));
-    const loadDraftVersion = settingsDraftVersionRef.current;
     setSaveError(null);
     setSaved(false);
     // Reset project-scoped controls immediately so a project switch cannot
@@ -120,7 +125,7 @@ export const SettingsView: React.FC = () => {
         ) {
           return;
         }
-        const canApplyCommands = settingsDraftVersionRef.current === loadDraftVersion;
+        const canApplyCommands = !commandsDirtyRef.current;
         if (
           res?.success &&
           Array.isArray(res.commands)
@@ -151,7 +156,7 @@ export const SettingsView: React.FC = () => {
           setSettingsLoading(false);
           return;
         }
-        if (settingsDraftVersionRef.current === loadDraftVersion) {
+        if (!maxRevisionsDirtyRef.current) {
           setMaxRevisionsInput(String(loadedMaxRevisions));
         }
         settingsLoadedProjectIdRef.current = currentProjectId;
@@ -649,11 +654,12 @@ export const SettingsView: React.FC = () => {
               <label className="block text-slate-400 mb-1">{t('settings.verificationCommands.testCmdLabel')}:</label>
               <input
                 type="text"
+                disabled={settingsLoading}
                 value={testCmd}
                 placeholder={t('settings.verificationCommands.testCmdPlaceholder')}
                 onChange={(e) => {
                   setTestCmd(e.target.value);
-                  markSettingsDirty();
+                  markSettingsDirty('commands');
                 }}
                 className="w-full bg-surface border border-surface-border rounded-lg px-3 py-2 text-white focus:outline-none focus:border-forge-cyan placeholder:text-slate-600"
               />
@@ -663,11 +669,12 @@ export const SettingsView: React.FC = () => {
               <label className="block text-slate-400 mb-1">{t('settings.verificationCommands.lintCmdLabel')}:</label>
               <input
                 type="text"
+                disabled={settingsLoading}
                 value={lintCmd}
                 placeholder={t('settings.verificationCommands.lintCmdPlaceholder')}
                 onChange={(e) => {
                   setLintCmd(e.target.value);
-                  markSettingsDirty();
+                  markSettingsDirty('commands');
                 }}
                 className="w-full bg-surface border border-surface-border rounded-lg px-3 py-2 text-white focus:outline-none focus:border-forge-cyan placeholder:text-slate-600"
               />
@@ -677,11 +684,12 @@ export const SettingsView: React.FC = () => {
               <label className="block text-slate-400 mb-1">{t('settings.verificationCommands.buildCmdLabel')}:</label>
               <input
                 type="text"
+                disabled={settingsLoading}
                 value={buildCmd}
                 placeholder={t('settings.verificationCommands.buildCmdPlaceholder')}
                 onChange={(e) => {
                   setBuildCmd(e.target.value);
-                  markSettingsDirty();
+                  markSettingsDirty('commands');
                 }}
                 className="w-full bg-surface border border-surface-border rounded-lg px-3 py-2 text-white focus:outline-none focus:border-forge-cyan placeholder:text-slate-600"
               />
@@ -699,13 +707,14 @@ export const SettingsView: React.FC = () => {
             <label className="block text-slate-400 mb-1">{t('settings.loopProtection.maxRevisionsLabel')}:</label>
             <input
               type="number"
+              disabled={settingsLoading}
               min={1}
               max={10}
               step={1}
               value={maxRevisionsInput}
               onChange={(e) => {
                 setMaxRevisionsInput(e.target.value);
-                markSettingsDirty();
+                markSettingsDirty('maxRevisions');
               }}
               className="w-full bg-surface border border-surface-border rounded-lg px-3 py-2 text-white focus:outline-none focus:border-forge-cyan"
             />
