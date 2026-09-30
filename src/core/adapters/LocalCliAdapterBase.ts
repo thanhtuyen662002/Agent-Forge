@@ -296,7 +296,7 @@ export abstract class LocalCliAdapterBase implements ProviderAdapter {
       }
 
       // 3. Mandatory PolicyService Evaluation Gate for Working Directory Access
-      const workingDirPolicy = PolicyService.evaluatePathAccess(executionRoot, executionRoot, false);
+      const workingDirPolicy = PolicyService.evaluateRealPathAccess(executionRoot, executionRoot, false);
       if (!workingDirPolicy.allowed) {
         return {
           executionId,
@@ -308,7 +308,7 @@ export abstract class LocalCliAdapterBase implements ProviderAdapter {
       // 4. Validate Context Files (must be strictly inside executionRoot, no path traversal)
       for (const contextFile of request.contextFiles) {
         const canonicalTarget = path.normalize(path.resolve(executionRoot, contextFile));
-        const filePolicy = PolicyService.evaluatePathAccess(canonicalTarget, executionRoot, false);
+        const filePolicy = PolicyService.evaluateRealPathAccess(canonicalTarget, executionRoot, false);
         if (!filePolicy.allowed) {
           return {
             executionId,

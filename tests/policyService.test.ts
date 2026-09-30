@@ -1,4 +1,7 @@
 import { describe, it, expect } from 'vitest';
+import fs from 'fs';
+import os from 'os';
+import path from 'path';
 import { PolicyService } from '../src/core/services/PolicyService';
 
 describe('PolicyService', () => {
@@ -49,6 +52,33 @@ describe('PolicyService', () => {
     expect(res.allowed).toBe(false);
     expect(res.decision).toBe('DENY');
     expect(res.reason).toContain('sensitive credential path');
+  });
+
+  it.each(['.env.local', '.env.production', '.npmrc', '.git/config', 'credentials.json', 'src/private.pem', 'src/api_key.txt'])
+    ('should deny secret-bearing file variants: %s', (relativePath) => {
+      const root = 'd:/Projects/Agent-Forge';
+      const res = PolicyService.evaluatePathAccess(`${root}/${relativePath}`, root, false);
+      expect(res.allowed).toBe(false);
+      expect(res.decision).toBe('DENY');
+    });
+
+  it('should reject an existing symlink or junction that escapes the real repository root', () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'agent-forge-policy-root-'));
+    const outside = fs.mkdtempSync(path.join(os.tmpdir(), 'agent-forge-policy-outside-'));
+    const link = path.join(root, 'src');
+    fs.mkdirSync(path.join(root, 'src-parent'), { recursive: true });
+    fs.writeFileSync(path.join(outside, 'payload.txt'), 'sensitive', 'utf8');
+    fs.symlinkSync(outside, link, process.platform === 'win32' ? 'junction' : 'dir');
+
+    try {
+      const result = PolicyService.evaluateRealPathAccess(path.join(link, 'payload.txt'), root, false);
+      expect(result.allowed).toBe(false);
+      expect(result.decision).toBe('DENY');
+      expect(result.reason).toContain('outside');
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true });
+      fs.rmSync(outside, { recursive: true, force: true });
+    }
   });
 
   it('should deny force pushing git branches and destructive git operations', () => {
