@@ -662,7 +662,7 @@ function localCliSynchronizeWorkspace(lease: LocalCliWorkspaceLease): void {
     });
   }
 
-  const applied: typeof pending = [];
+  const applied: Array<{ item: typeof pending[number]; appliedIdentity: LocalCliFileIdentity }> = [];
   try {
     for (const item of pending) {
       const { entry } = item;
@@ -672,7 +672,11 @@ function localCliSynchronizeWorkspace(lease: LocalCliWorkspaceLease): void {
         throw new LocalCliWorkspaceError('WORKSPACE_SYNC_CONFLICT', `authorized source changed during execution: ${entry.relativePath}`);
       }
       localCliAtomicWrite(entry.sourcePath, item.workspaceBuffer, sourceRoot, entry.sourceMode, entry.sourceIdentity);
-      applied.push(item);
+      // Atomic replacement intentionally creates a new file identity. Keep
+      // that identity so rollback can fence against a concurrent replacement
+      // without incorrectly comparing it to the pre-execution inode.
+      const appliedIdentity = localCliCaptureIdentity(entry.sourcePath);
+      applied.push({ item, appliedIdentity });
       const verified = localCliReadStableFile(entry.sourcePath, sourceRoot);
       if (crypto.createHash('sha256').update(verified.buffer).digest('hex') !== item.workspaceHash) {
         throw new LocalCliWorkspaceError('WORKSPACE_SYNC_FAILED', `authorized source could not be verified after synchronization: ${entry.relativePath}`);
@@ -680,12 +684,12 @@ function localCliSynchronizeWorkspace(lease: LocalCliWorkspaceLease): void {
     }
   } catch (error) {
     const rollbackFailures: string[] = [];
-    for (const item of [...applied].reverse()) {
+    for (const { item, appliedIdentity } of [...applied].reverse()) {
       try {
         const sourceRoot = localCliRealpath(lease.sourceRoot);
         const current = localCliReadStableFile(item.entry.sourcePath, sourceRoot);
         const currentHash = crypto.createHash('sha256').update(current.buffer).digest('hex');
-        if (!localCliSameIdentity(item.entry.sourceIdentity, current.identity)) {
+        if (!localCliSameIdentity(appliedIdentity, current.identity)) {
           throw new LocalCliWorkspaceError('WORKSPACE_SYNC_ROLLBACK_CONFLICT', `authorized source identity changed during rollback: ${item.entry.relativePath}`);
         }
         // A concurrent writer owns the file once its content no longer matches
@@ -695,7 +699,7 @@ function localCliSynchronizeWorkspace(lease: LocalCliWorkspaceLease): void {
         if (currentHash !== item.workspaceHash) {
           throw new LocalCliWorkspaceError('WORKSPACE_SYNC_ROLLBACK_CONFLICT', `authorized source changed during rollback: ${item.entry.relativePath}`);
         }
-        localCliAtomicWrite(item.entry.sourcePath, item.sourceBuffer, sourceRoot, item.entry.sourceMode, item.entry.sourceIdentity);
+        localCliAtomicWrite(item.entry.sourcePath, item.sourceBuffer, sourceRoot, item.entry.sourceMode, appliedIdentity);
         const restored = localCliReadStableFile(item.entry.sourcePath, sourceRoot);
         if (crypto.createHash('sha256').update(restored.buffer).digest('hex') !== item.sourceHash) {
           throw new LocalCliWorkspaceError('WORKSPACE_SYNC_ROLLBACK_FAILED', `authorized source could not be restored: ${item.entry.relativePath}`);
