@@ -2076,4 +2076,39 @@ describe('product-task autonomy consolidation', () => {
     ).get() as { count: number };
     expect(markerCount.count).toBe(1);
   });
+
+  it('startup scanner does not treat future SQLite-format timestamps as expired', () => {
+    const fixture = seed('task-lease-recovery-future-timestamp');
+    const acquired = adapter.acquireWorkerSlotLease(fixture.assignmentId);
+    expect(acquired.status).toBe('ACQUIRED');
+    if (acquired.status !== 'ACQUIRED') return;
+
+    const recoveredAt = new Date('2026-09-30T12:00:00.000Z');
+    // SQLite's datetime() format intentionally differs from the ISO format
+    // used by the runtime. The scanner must compare parsed instants, not text.
+    repo.getDatabase().prepare('UPDATE account_leases SET expires_at = ? WHERE id = ?')
+      .run('2026-10-01 12:00:00', acquired.lease.id);
+
+    const report = new ProductLeaseRecoveryScanner(repo.getDatabase(), repo, { clock: () => recoveredAt }).scanAndReconcile();
+    expect(report.scannedCount).toBe(0);
+    expect(repo.getAccountLease(acquired.lease.id)?.released_at).toBeNull();
+    expect(repo.getWorkerSlot(fixture.slotId)?.status).toBe('LEASED');
+  });
+
+  it('startup scanner quarantines an invalid expiration instead of releasing it', () => {
+    const fixture = seed('task-lease-recovery-invalid-timestamp');
+    const acquired = adapter.acquireWorkerSlotLease(fixture.assignmentId);
+    expect(acquired.status).toBe('ACQUIRED');
+    if (acquired.status !== 'ACQUIRED') return;
+
+    const recoveredAt = new Date('2026-09-30T12:00:00.000Z');
+    repo.getDatabase().prepare('UPDATE account_leases SET expires_at = ? WHERE id = ?')
+      .run('not-a-timestamp', acquired.lease.id);
+
+    const report = new ProductLeaseRecoveryScanner(repo.getDatabase(), repo, { clock: () => recoveredAt }).scanAndReconcile();
+    expect(report).toMatchObject({ scannedCount: 1, releasedCount: 0, quarantinedCount: 1 });
+    expect(report.items[0]?.reason).toContain('invalid');
+    expect(repo.getAccountLease(acquired.lease.id)?.released_at).toBeNull();
+    expect(repo.getWorkerSlot(fixture.slotId)?.status).toBe('LEASED');
+  });
 });

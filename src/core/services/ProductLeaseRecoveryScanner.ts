@@ -170,9 +170,12 @@ interface CandidateLeaseRow {
   worker_slot_id: string;
   expires_at: string;
   task_id: string | null;
+  assignment_project_id: string | null;
+  assignment_account_id: string | null;
   project_id: string | null;
   task_state: TaskState | null;
   slot_status: string | null;
+  slot_account_id: string | null;
   slot_assignment_id: string | null;
   slot_execution_id: string | null;
 }
@@ -212,9 +215,12 @@ export class ProductLeaseRecoveryScanner {
           l.worker_slot_id,
           l.expires_at,
           a.task_id,
+          a.project_id AS assignment_project_id,
+          a.selected_account_id AS assignment_account_id,
           t.project_id,
           t.state AS task_state,
           s.status AS slot_status,
+          s.provider_account_id AS slot_account_id,
           s.current_assignment_id AS slot_assignment_id,
           s.current_execution_id AS slot_execution_id
         FROM account_leases l
@@ -222,12 +228,20 @@ export class ProductLeaseRecoveryScanner {
         LEFT JOIN tasks t ON t.id = a.task_id
         LEFT JOIN worker_slots s ON s.id = l.worker_slot_id
         WHERE l.released_at IS NULL
-          AND l.expires_at <= ?
         ORDER BY l.expires_at ASC, l.id ASC
       `)
-      .all(nowIso) as CandidateLeaseRow[];
+      .all() as CandidateLeaseRow[];
 
-    const items = rows.map((row) => this.reconcileCandidate(row, now));
+    // Timestamps are persisted as ISO strings, but legacy fixtures and
+    // operator repair tools may use SQLite's space-separated format or an
+    // invalid value. Do the temporal comparison in JavaScript so lexical SQL
+    // ordering cannot classify a future/non-UTC row as expired. Invalid
+    // timestamps remain candidates and are quarantined explicitly below.
+    const candidates = rows.filter((row) => {
+      const expiresMs = new Date(row.expires_at).getTime();
+      return !Number.isFinite(expiresMs) || expiresMs <= now.getTime();
+    });
+    const items = candidates.map((row) => this.reconcileCandidate(row, now));
     return {
       scannedCount: items.length,
       releasedCount: items.filter((item) => item.disposition === 'RELEASED').length,
@@ -251,25 +265,44 @@ export class ProductLeaseRecoveryScanner {
       disposition: 'FAILED',
     };
 
+    const expiresMs = new Date(row.expires_at).getTime();
+    if (!Number.isFinite(expiresMs)) {
+      const reason = `Lease expiration "${row.expires_at}" is invalid; manual owner resolution is required.`;
+      base.disposition = 'QUARANTINED';
+      base.reason = reason;
+      base.markerEventId = this.persistMarker(row, 'QUARANTINED', 'LEASE_EXPIRY_INVALID', reason, now);
+      return base;
+    }
+
     const activeProcess = row.task_id
       ? this.repo.getProcessRunsByTask(String(row.task_id)).some((process) => process.status === 'RUNNING')
       : false;
     const taskState = row.task_state ?? null;
-    const bindingIncomplete = !row.task_id || !row.project_id || !taskState || !row.slot_status || !row.slot_assignment_id;
+    const bindingIncomplete = !row.task_id || !row.project_id || !row.assignment_project_id || !row.assignment_account_id || !taskState || !row.slot_status || !row.slot_account_id || !row.slot_assignment_id;
+    const bindingMismatch = !bindingIncomplete && (
+      row.assignment_project_id !== row.project_id ||
+      row.assignment_account_id !== row.provider_account_id ||
+      row.slot_account_id !== row.provider_account_id ||
+      row.slot_assignment_id !== row.assignment_id
+    );
     const activeTask = taskState !== null && PRODUCT_LEASE_ACTIVE_TASK_STATES.has(taskState);
     const slotBusy = row.slot_status === 'RUNNING' || row.slot_execution_id !== null;
 
-    if (bindingIncomplete || activeProcess || activeTask || slotBusy) {
+    if (bindingIncomplete || bindingMismatch || activeProcess || activeTask || slotBusy) {
       const reasonCode = bindingIncomplete
         ? 'BINDING_INCOMPLETE'
-        : activeProcess
+        : bindingMismatch
+          ? 'BINDING_MISMATCH'
+          : activeProcess
           ? 'PROCESS_STILL_RUNNING'
           : activeTask
             ? 'TASK_STATE_ACTIVE'
             : 'SLOT_EXECUTION_ACTIVE';
       const reason = bindingIncomplete
         ? 'Lease binding graph is incomplete; manual owner resolution is required.'
-        : activeProcess
+        : bindingMismatch
+          ? 'Lease, assignment, task, and worker-slot account/project bindings disagree; manual owner resolution is required.'
+          : activeProcess
           ? `A RUNNING process remains for task "${row.task_id}"; capacity is fenced.`
           : activeTask
             ? `Task "${row.task_id}" remains in active state "${taskState}"; capacity is fenced.`
