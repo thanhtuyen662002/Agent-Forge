@@ -5,8 +5,6 @@ import {
   ManagerReviewSchema,
   WorkOrder,
   WorkOrderSchema,
-  parseManagerReview,
-  parseWorkOrder,
   sanitizeAutonomyText,
 } from './contracts';
 import { AutonomyStore, ManagerResourceState } from './store';
@@ -659,104 +657,39 @@ export class ManagerProviderPool {
   }
 }
 
+/**
+ * Build the opt-in direct OpenAI route as a normal provider endpoint.  The
+ * shared Responses transport validates this object before any network call,
+ * rejects unsafe URL forms, sends `store: false`, rejects redirects/origin
+ * drift, and bounds the response body.  Keep HTTP disabled for this direct
+ * fallback; an owner can still opt into a reviewed router through the normal
+ * endpoint configuration path.
+ */
+export function directOpenAiFallbackConfig(
+  environment: NodeJS.ProcessEnv = process.env,
+): ProviderEndpointConfig {
+  return {
+    resource_id: 'codex-api-fallback',
+    role: 'MANAGER',
+    adapter_type: 'DIRECT_PROVIDER',
+    base_url: environment.OPENAI_API_BASE_URL ?? 'https://api.openai.com/v1/responses',
+    allow_insecure_http: false,
+    model_or_route: environment.CODEX_MANAGER_API_MODEL ?? 'gpt-4.1-mini',
+    auth_source: 'env://OPENAI_API_KEY',
+    auth_header_name: 'Authorization',
+    priority: 50,
+    timeout_ms: 120_000,
+    enabled: true,
+    health_state: 'AVAILABLE',
+    cooldown_state: { active: false, until: null, reason: null },
+    capabilities: ['PLANNING', 'REVIEW'],
+  };
+}
+
 async function openAiApiReview(input: ManagerEvidence): Promise<{ run: ProviderRun; review?: ManagerReview }> {
-  const started = Date.now();
-  const key = process.env.OPENAI_API_KEY;
-  if (!key) return { run: { status: 'PROCESS_NOT_FOUND', exitCode: 1, executionId: '', stdout: '', stderr: 'OPENAI_API_KEY_NOT_CONFIGURED', durationMs: 0 } };
-  try {
-    const response = await fetch(process.env.OPENAI_API_BASE_URL ?? 'https://api.openai.com/v1/responses', {
-      method: 'POST',
-      headers: { authorization: `Bearer ${key}`, 'content-type': 'application/json' },
-      signal: AbortSignal.timeout(120_000),
-      body: JSON.stringify({
-        model: process.env.CODEX_MANAGER_API_MODEL ?? 'gpt-4.1-mini',
-        input: `Return exactly one managerreview.v1 JSON object. A PASS requires reviewed_head_sha equal to current evidence HEAD.\n${JSON.stringify(input)}`,
-        max_output_tokens: 4000,
-      }),
-    });
-    const body = await response.text();
-    const run: ProviderRun = {
-      status: response.ok ? 'SUCCESSFUL_PROCESS_EXIT' : 'FAILED_PROCESS_EXIT',
-      exitCode: response.ok ? 0 : response.status,
-      executionId: '',
-      stdout: sanitizeAutonomyText(body),
-      stderr: response.ok ? '' : sanitizeAutonomyText(body),
-      durationMs: Date.now() - started,
-    };
-    if (!response.ok) return { run };
-    const parsed = JSON.parse(body) as { output_text?: string; output?: Array<{ content?: Array<{ text?: string }> }> };
-    const text = parsed.output_text ?? parsed.output?.flatMap((item) => item.content ?? []).map((part) => part.text ?? '').join('') ?? '';
-    return { run, review: ManagerReviewSchema.parse(parseManagerReview(text)) };
-  } catch (error) {
-    return {
-      run: {
-        status: 'CONTRACT_INVALID',
-        exitCode: 1,
-        executionId: '',
-        stdout: '',
-        stderr: sanitizeAutonomyText(String(error)),
-        durationMs: Date.now() - started,
-      },
-    };
-  }
+  return new ResponsesManagerEndpointTransport().review(directOpenAiFallbackConfig(), input);
 }
 
 async function openAiApiPlan(seed: ManagerPlanSeed): Promise<{ run: ProviderRun; workOrder?: WorkOrder }> {
-  const started = Date.now();
-  const key = process.env.OPENAI_API_KEY;
-  if (!key) return { run: { status: 'PROCESS_NOT_FOUND', exitCode: 1, executionId: '', stdout: '', stderr: 'OPENAI_API_KEY_NOT_CONFIGURED', durationMs: 0 } };
-  try {
-    const response = await fetch(process.env.OPENAI_API_BASE_URL ?? 'https://api.openai.com/v1/responses', {
-      method: 'POST',
-      headers: { authorization: `Bearer ${key}`, 'content-type': 'application/json' },
-      signal: AbortSignal.timeout(120_000),
-      body: JSON.stringify({
-        model: process.env.CODEX_MANAGER_API_MODEL ?? 'gpt-4.1-mini',
-        input: `You are a deterministic Agent Forge manager. Return exactly one workorder.v1 JSON object preserving every seeded identity and path.\n${JSON.stringify({
-          protocol_version: 'workorder.v1',
-          ...seed,
-          issue_number: null,
-          dependencies: [],
-          allowed_paths: seed.allowed_paths ?? [],
-          forbidden_paths: seed.forbidden_paths ?? ['.git', 'main', 'D:/Projects/Agent-Forge'],
-          required_tests: seed.required_tests ?? [],
-          context_files: [],
-          constraints: seed.constraints ?? [],
-          attempt: 1,
-          lease_epoch: 1,
-        })}`,
-        max_output_tokens: 4000,
-      }),
-    });
-    const body = await response.text();
-    const run: ProviderRun = {
-      status: response.ok ? 'SUCCESSFUL_PROCESS_EXIT' : 'FAILED_PROCESS_EXIT',
-      exitCode: response.ok ? 0 : response.status,
-      executionId: '',
-      stdout: sanitizeAutonomyText(body),
-      stderr: response.ok ? '' : sanitizeAutonomyText(body),
-      durationMs: Date.now() - started,
-    };
-    if (!response.ok) return { run };
-    const parsed = JSON.parse(body) as { output_text?: string; output?: Array<{ content?: Array<{ text?: string }> }> };
-    const text = parsed.output_text ?? parsed.output?.flatMap((item) => item.content ?? []).map((part) => part.text ?? '').join('') ?? '';
-    const workOrder = parseWorkOrder(text);
-    for (const [key, value] of Object.entries(seed)) {
-      if (JSON.stringify(workOrder[key as keyof WorkOrder]) !== JSON.stringify(value)) {
-        throw new Error(`CONTRACT_INVALID: manager changed authorized ${key}`);
-      }
-    }
-    return { run, workOrder };
-  } catch (error) {
-    return {
-      run: {
-        status: 'CONTRACT_INVALID',
-        exitCode: 1,
-        executionId: '',
-        stdout: '',
-        stderr: sanitizeAutonomyText(String(error)),
-        durationMs: Date.now() - started,
-      },
-    };
-  }
+  return new ResponsesManagerEndpointTransport().plan!(directOpenAiFallbackConfig(), seed);
 }

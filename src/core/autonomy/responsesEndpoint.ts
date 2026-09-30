@@ -253,7 +253,9 @@ export class ResponsesManagerEndpointTransport implements ManagerEndpointTranspo
         issue_number: null,
         dependencies: [],
         allowed_paths: seed.allowed_paths ?? [],
-        forbidden_paths: seed.forbidden_paths ?? ['.git'],
+        // Match the ManagerProviderPool/Codex manager safety defaults when a
+        // caller omits optional path constraints from the seed.
+        forbidden_paths: seed.forbidden_paths ?? ['.git', 'main', 'D:/Projects/Agent-Forge'],
         required_tests: seed.required_tests ?? [],
         context_files: [],
         constraints: seed.constraints ?? [],
@@ -303,6 +305,9 @@ export class ResponsesManagerEndpointTransport implements ManagerEndpointTranspo
     if (!envName) return { run: failedRun('AUTH_ERROR', 'PROVIDER_ENDPOINT_AUTH_SOURCE_UNSUPPORTED', started) };
     const authValue = this.environment[envName];
     if (!authValue) return { run: failedRun('AUTH_ERROR', `PROVIDER_ENDPOINT_AUTH_ENV_MISSING: ${envName}`, started) };
+    const headerValue = config.adapter_type === 'DIRECT_PROVIDER' && config.auth_header_name === 'Authorization'
+      ? (/^Bearer\s/i.test(authValue) ? authValue : `Bearer ${authValue}`)
+      : authValue;
 
     const controller = new AbortController();
     const timeout = setTimeout(() => controller.abort(), config.timeout_ms);
@@ -311,7 +316,7 @@ export class ResponsesManagerEndpointTransport implements ManagerEndpointTranspo
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
-          [config.auth_header_name]: authValue,
+          [config.auth_header_name]: headerValue,
         },
         credentials: 'omit',
         redirect: 'error',
