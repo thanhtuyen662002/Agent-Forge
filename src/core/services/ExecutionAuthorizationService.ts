@@ -390,7 +390,12 @@ export class ExecutionAuthorizationService {
       (params.assignmentId !== undefined && params.assignmentId !== null) ||
       (params.taskOwnershipEpoch !== undefined && params.taskOwnershipEpoch !== null) ||
       (params.executionScope !== undefined && params.executionScope !== null) ||
-      (params.contextManifestId !== undefined && params.contextManifestId !== null)
+      // An explicit renderer Manual Bridge request may not carry a manifest
+      // binding.  Older in-process context-authority callers may still pass
+      // a manifest identifier without requesting product lifecycle binding;
+      // keep that compatibility path internal-only while rejecting it at the
+      // renderer mode boundary above.
+      (executionMode === 'MANUAL_BRIDGE' && params.contextManifestId !== undefined && params.contextManifestId !== null)
     );
 
     if (executionMode === 'MANUAL_BRIDGE' && isProductBindingRequested) {
