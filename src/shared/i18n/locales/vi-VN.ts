@@ -293,7 +293,8 @@ export const viVN: TranslationDictionary = {
     loopProtection: {
       title: 'Bảo vệ Vòng lặp & Giới hạn Bản sửa đổi',
       maxRevisionsLabel: 'Số Bản sửa đổi Tối đa Trước khi Leo thang',
-      helpText: 'Nhiệm vụ vượt quá giới hạn này sẽ chuyển sang NEEDS_HUMAN để ngăn chặn việc AI luẩn quẩn.',
+      helpText: 'Giá trị được lưu theo từng dự án và áp dụng cho nhiệm vụ mới. Nhiệm vụ vượt quá giới hạn này sẽ chuyển sang NEEDS_HUMAN để ngăn chặn việc AI luẩn quẩn.',
+      invalidMaxRevisions: 'Số bản sửa đổi phải là số nguyên từ 1 đến 10.',
     },
     saveConfigButton: 'LƯU CẤU HÌNH',
     settingsSavedButton: 'ĐÃ LƯU CÀI ĐẶT',
