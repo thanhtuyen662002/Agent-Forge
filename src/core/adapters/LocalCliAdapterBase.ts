@@ -350,6 +350,11 @@ function localCliReadMarker(markerPath: string): LocalCliWorkspaceMarker | null 
       typeof parsed.executionId !== 'string' ||
       typeof parsed.ownerToken !== 'string' ||
       typeof parsed.workspaceName !== 'string' ||
+      ((parsed.workspaceIdentityKey !== undefined || parsed.workspaceIdentityRealPath !== undefined) &&
+        (typeof parsed.workspaceIdentityKey !== 'string' ||
+          parsed.workspaceIdentityKey.length === 0 ||
+          typeof parsed.workspaceIdentityRealPath !== 'string' ||
+          parsed.workspaceIdentityRealPath.length === 0)) ||
       typeof parsed.ownershipDigest !== 'string' ||
       typeof parsed.createdAt !== 'string' ||
       !['ACTIVE', 'CLEANING', 'CLEANUP_FAILED'].includes(String(parsed.state)) ||
@@ -365,6 +370,15 @@ function localCliEnsureBase(basePath: string): void {
   fs.mkdirSync(basePath, { recursive: true, mode: 0o700 });
   const stat = fs.lstatSync(basePath);
   if (!stat.isDirectory() || stat.isSymbolicLink()) throw new LocalCliWorkspaceError('WORKSPACE_BOUNDARY_INVALID', 'workspace base is not a real directory');
+  if (process.platform !== 'win32') {
+    try { fs.chmodSync(basePath, 0o700); } catch {
+      throw new LocalCliWorkspaceError('WORKSPACE_BOUNDARY_INVALID', 'workspace base permissions could not be restricted');
+    }
+    const restricted = fs.lstatSync(basePath);
+    if ((restricted.mode & 0o077) !== 0 || (typeof process.getuid === 'function' && restricted.uid !== process.getuid())) {
+      throw new LocalCliWorkspaceError('WORKSPACE_BOUNDARY_INVALID', 'workspace base is not private to the Agent Forge user');
+    }
+  }
 }
 
 export function recoverOrphanedLocalCliWorkspaces(
@@ -564,9 +578,10 @@ function localCliPrepareWorkspace(
         cleanupFailed = true;
       }
     } else {
-      // If identity capture itself failed, retain a marker when removal also
-      // fails so the orphan remains visible for manual recovery.
-      try { fs.rmSync(workspaceRoot, { recursive: true, force: true }); } catch { cleanupFailed = true; }
+      // If identity capture itself failed, do not remove by path alone. Keep
+      // a cleanup-failed marker so recovery can be reviewed manually without
+      // risking deletion of a replacement directory.
+      cleanupFailed = true;
     }
     if (!cleanupFailed) {
       try {
