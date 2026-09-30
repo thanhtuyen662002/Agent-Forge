@@ -116,15 +116,16 @@ export const SettingsView: React.FC = () => {
         if (
           !isMounted ||
           activeProjectIdRef.current !== currentProjectId ||
-          settingsDraftVersionRef.current !== loadDraftVersion
+          !currentProjectId
         ) {
           return;
         }
+        const canApplyCommands = settingsDraftVersionRef.current === loadDraftVersion;
         if (
           res?.success &&
           Array.isArray(res.commands)
         ) {
-          applyCanonicalCommands(res.commands);
+          if (canApplyCommands) applyCanonicalCommands(res.commands);
         } else {
           setSaveError(res?.error || t('settings.saveFailed'));
           setSettingsLoading(false);
@@ -140,8 +141,7 @@ export const SettingsView: React.FC = () => {
         const maxRes = await getMaxRevisions(currentProjectId);
         if (
           !isMounted ||
-          activeProjectIdRef.current !== currentProjectId ||
-          settingsDraftVersionRef.current !== loadDraftVersion
+          activeProjectIdRef.current !== currentProjectId
         ) {
           return;
         }
@@ -151,7 +151,9 @@ export const SettingsView: React.FC = () => {
           setSettingsLoading(false);
           return;
         }
-        setMaxRevisionsInput(String(loadedMaxRevisions));
+        if (settingsDraftVersionRef.current === loadDraftVersion) {
+          setMaxRevisionsInput(String(loadedMaxRevisions));
+        }
         settingsLoadedProjectIdRef.current = currentProjectId;
         setSettingsLoading(false);
       } catch (err) {
