@@ -93,8 +93,20 @@ function createRedactingWriter(original: Writable, stream: NodeJS.WritableStream
       ? encodingOrCallback as () => void
       : typeof callback === 'function' ? callback as () => void : undefined;
     if (!safeText) {
-      done?.();
-      return true;
+      // Preserve Node's normal callback/backpressure behavior even while the
+      // line buffer is waiting for a newline. An empty write is observable to
+      // callers that depend on the callback timing and return value.
+      const bufferEncoding = typeof encodingOrCallback === 'string'
+        ? encodingOrCallback as BufferEncoding
+        : undefined;
+      if (typeof encodingOrCallback === 'function') {
+        return boundOriginal('', encodingOrCallback as () => void);
+      }
+      return boundOriginal(
+        '',
+        bufferEncoding,
+        done,
+      );
     }
     if (typeof encodingOrCallback === 'function') {
       return boundOriginal(safeText, encodingOrCallback as () => void);
