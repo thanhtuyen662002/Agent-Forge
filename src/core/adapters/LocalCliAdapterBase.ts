@@ -389,6 +389,7 @@ export function recoverOrphanedLocalCliWorkspaces(
       fs.unlinkSync(markerPath);
       result.recovered.push(marker.workspaceName);
     } catch {
+      try { localCliWriteMarker(markerPath, { ...marker, state: 'CLEANUP_FAILED' }); } catch { /* preserve the recovery failure */ }
       result.failed.push(marker.workspaceName);
     }
   }
