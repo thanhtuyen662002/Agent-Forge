@@ -24,8 +24,12 @@ import {
 import type { ProviderRun } from './providers';
 import {
   endpointUrl,
+  assertProviderResponseOrigin,
   failedRun,
   outputText,
+  ProviderResponseBoundaryError,
+  ProviderResponseTooLargeError,
+  readResponseTextBounded,
   redactValue,
   redactEndpointDiagnostics,
   referencedEnvironmentName,
@@ -809,7 +813,15 @@ export class ResponsesCoderEndpointTransport implements CoderEndpointTransport {
     schema: Record<string, unknown> = CoderBundleJsonSchema,
   ): Promise<{ run: ProviderRun; text?: string; healthState: ProviderEndpointHealthState }> {
     const started = Date.now();
-    const config = parseProviderEndpointConfig(configInput);
+    let config: ProviderEndpointConfig;
+    try {
+      config = parseProviderEndpointConfig(configInput);
+    } catch {
+      return {
+        run: failedRun('CONTRACT_INVALID', 'PROVIDER_ENDPOINT_CONFIG_INVALID', started),
+        healthState: 'CONTRACT_INVALID',
+      };
+    }
     if (!config.base_url) {
       return {
         run: failedRun('CONTRACT_INVALID', 'PROVIDER_ENDPOINT_BASE_URL_MISSING', started),
@@ -840,6 +852,8 @@ export class ResponsesCoderEndpointTransport implements CoderEndpointTransport {
           'Content-Type': 'application/json',
           [config.auth_header_name]: authValue,
         },
+        credentials: 'omit',
+        redirect: 'error',
         body: JSON.stringify({
           model: config.model_or_route,
           input: prompt,
@@ -856,7 +870,8 @@ export class ResponsesCoderEndpointTransport implements CoderEndpointTransport {
         signal: controller.signal,
       });
 
-      const raw = await response.text();
+      assertProviderResponseOrigin(response, endpointUrl(config.base_url));
+      const raw = await readResponseTextBounded(response);
       const safeRaw = redactValue(raw, authValue, config.base_url);
 
       if (response.status === 401 || response.status === 403) {
@@ -916,6 +931,12 @@ export class ResponsesCoderEndpointTransport implements CoderEndpointTransport {
         },
       };
     } catch (error) {
+      if (error instanceof ProviderResponseBoundaryError || error instanceof ProviderResponseTooLargeError) {
+        return {
+          run: failedRun('CONTRACT_INVALID', error.message, started),
+          healthState: 'CONTRACT_INVALID',
+        };
+      }
       if (error instanceof Error && error.name === 'AbortError') {
         return {
           run: failedRun('TIMEOUT', 'ROUTE_TIMEOUT', started),

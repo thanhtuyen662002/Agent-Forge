@@ -35,6 +35,67 @@ export const ProviderEndpointHealthStateSchema = z.enum([
 ]);
 export type ProviderEndpointHealthState = z.infer<typeof ProviderEndpointHealthStateSchema>;
 
+/**
+ * Responses-compatible providers are contacted by the desktop runtime with
+ * task context and an authentication value. Keep the transport contract
+ * deliberately small: custom header names must be known credential headers,
+ * rather than arbitrary hop-by-hop or cookie headers.
+ */
+export const APPROVED_PROVIDER_AUTH_HEADERS = Object.freeze([
+  'authorization',
+  'x-api-key',
+  'x-api-token',
+  'x-auth-token',
+  'x-company-auth',
+] as const);
+
+/** Maximum response body read by a provider transport. */
+export const PROVIDER_RESPONSE_MAX_BYTES = 8 * 1024 * 1024;
+
+export function isApprovedProviderAuthHeaderName(name: string): boolean {
+  return (APPROVED_PROVIDER_AUTH_HEADERS as readonly string[]).includes(name.trim().toLowerCase());
+}
+
+/**
+ * Returns a stable validation message for endpoint URLs, or null when the
+ * URL is safe to pass to the Responses transport. URL credentials, query
+ * strings, and fragments are intentionally forbidden because they are easy
+ * to persist or leak through diagnostics and redirect handling.
+ */
+export function providerEndpointUrlError(
+  baseUrl: string,
+  allowInsecureHttp: boolean,
+): string | null {
+  if (baseUrl.trim() !== baseUrl || /[\u0000-\u001f\u007f]/.test(baseUrl) || baseUrl.includes('\\')) {
+    return 'Provider endpoint URL is malformed';
+  }
+  let parsed: URL;
+  try {
+    parsed = new URL(baseUrl);
+  } catch {
+    return 'Provider endpoint URL is malformed';
+  }
+
+  if (parsed.protocol !== 'https:' && parsed.protocol !== 'http:') {
+    return 'Provider endpoint URL must use HTTPS or explicitly authorized HTTP';
+  }
+  if (parsed.protocol === 'http:' && !allowInsecureHttp) {
+    return 'Provider endpoint URLs must use HTTPS unless insecure HTTP is explicitly authorized';
+  }
+  if (!parsed.hostname) {
+    return 'Provider endpoint URL must include a host';
+  }
+  if (parsed.username || parsed.password) {
+    return 'Provider endpoint URL must not contain credentials';
+  }
+  // URL#search normalize bare delimiters to empty strings, so inspect the
+  // original spelling as well as parsed fields to reject `?` and `#` forms.
+  if (baseUrl.includes('?') || baseUrl.includes('#') || parsed.search || parsed.hash) {
+    return 'Provider endpoint URL must not contain a query or fragment';
+  }
+  return null;
+}
+
 export const ProviderEndpointConfigSchema = z.object({
   resource_id: z.string().min(1),
   role: ProviderEndpointRoleSchema,
@@ -64,11 +125,21 @@ export const ProviderEndpointConfigSchema = z.object({
       message: `${value.adapter_type} requires an HTTPS endpoint URL`,
     });
   }
-  if (value.base_url && !value.base_url.startsWith('https://') && !value.allow_insecure_http) {
+  if (value.base_url) {
+    const urlError = providerEndpointUrlError(value.base_url, value.allow_insecure_http);
+    if (urlError) {
+      context.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ['base_url'],
+        message: urlError,
+      });
+    }
+  }
+  if (!isApprovedProviderAuthHeaderName(value.auth_header_name)) {
     context.addIssue({
       code: z.ZodIssueCode.custom,
-      path: ['base_url'],
-      message: 'Provider endpoint URLs must use HTTPS unless insecure HTTP is explicitly authorized',
+      path: ['auth_header_name'],
+      message: 'Provider authentication header is not approved',
     });
   }
   if (value.adapter_type !== 'DIRECT_PROVIDER' && !value.auth_source) {

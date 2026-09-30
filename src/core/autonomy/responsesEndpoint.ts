@@ -10,6 +10,7 @@ import {
   ManagerEndpointTransport,
   ProviderEndpointConfig,
   ProviderEndpointRole,
+  PROVIDER_RESPONSE_MAX_BYTES,
   parseProviderEndpointConfig,
 } from './providerEndpoint';
 import type { ManagerEvidence, ProviderRun } from './providers';
@@ -24,6 +25,110 @@ export interface ResponsesEndpointTransportOptions {
 export interface EndpointContractResult {
   run: ProviderRun;
   compatible: boolean;
+}
+
+const REDIRECT_STATUS_CODES = new Set([301, 302, 303, 307, 308]);
+
+export class ProviderResponseBoundaryError extends Error {
+  readonly code: 'ROUTE_REDIRECT_BLOCKED' | 'ROUTE_RESPONSE_URL_INVALID';
+
+  constructor(code: 'ROUTE_REDIRECT_BLOCKED' | 'ROUTE_RESPONSE_URL_INVALID', message: string) {
+    super(message);
+    this.name = 'ProviderResponseBoundaryError';
+    this.code = code;
+  }
+}
+
+export class ProviderResponseTooLargeError extends Error {
+  readonly code = 'ROUTE_RESPONSE_TOO_LARGE';
+
+  constructor() {
+    super('ROUTE_RESPONSE_TOO_LARGE');
+    this.name = 'ProviderResponseTooLargeError';
+  }
+}
+
+/**
+ * Reject redirects and unexpected final origins before consuming a response.
+ * Native fetch is configured with redirect:error below; the explicit checks
+ * also protect injected/test transports that do not honor that option.
+ */
+export function assertProviderResponseOrigin(response: Response, requestUrl: string): void {
+  if (response.redirected || REDIRECT_STATUS_CODES.has(response.status)) {
+    throw new ProviderResponseBoundaryError('ROUTE_REDIRECT_BLOCKED', 'ROUTE_REDIRECT_BLOCKED');
+  }
+
+  const responseUrl = typeof response.url === 'string' ? response.url.trim() : '';
+  if (!responseUrl) return;
+
+  let expectedOrigin: string;
+  let actualOrigin: string;
+  try {
+    expectedOrigin = new URL(requestUrl).origin;
+    actualOrigin = new URL(responseUrl).origin;
+  } catch {
+    throw new ProviderResponseBoundaryError('ROUTE_RESPONSE_URL_INVALID', 'ROUTE_RESPONSE_URL_INVALID');
+  }
+  if (expectedOrigin !== actualOrigin) {
+    throw new ProviderResponseBoundaryError('ROUTE_REDIRECT_BLOCKED', 'ROUTE_REDIRECT_BLOCKED');
+  }
+}
+
+/**
+ * Reads a provider response without allowing an unbounded body allocation.
+ * Fetch implementations normally expose a byte stream; the text fallback is
+ * retained for test/custom transports and is checked immediately after read.
+ */
+export async function readResponseTextBounded(
+  response: Response,
+  maxBytes: number = PROVIDER_RESPONSE_MAX_BYTES,
+): Promise<string> {
+  if (!Number.isSafeInteger(maxBytes) || maxBytes <= 0) {
+    throw new RangeError('Provider response byte limit must be a positive safe integer');
+  }
+
+  const contentLength = response.headers.get('content-length');
+  if (contentLength) {
+    const declaredBytes = Number(contentLength);
+    if (Number.isSafeInteger(declaredBytes) && declaredBytes > maxBytes) {
+      throw new ProviderResponseTooLargeError();
+    }
+  }
+
+  const stream = response.body;
+  if (!stream) {
+    const raw = await response.text();
+    if (Buffer.byteLength(raw, 'utf8') > maxBytes) {
+      throw new ProviderResponseTooLargeError();
+    }
+    return raw;
+  }
+
+  const reader = stream.getReader();
+  const chunks: Uint8Array[] = [];
+  let totalBytes = 0;
+  try {
+    while (true) {
+      const next = await reader.read();
+      if (next.done) break;
+      const chunk = next.value instanceof Uint8Array ? next.value : new Uint8Array(next.value);
+      totalBytes += chunk.byteLength;
+      if (totalBytes > maxBytes) {
+        try {
+          await reader.cancel();
+        } catch {
+          // The size violation remains the authoritative failure.
+        }
+        throw new ProviderResponseTooLargeError();
+      }
+      chunks.push(chunk);
+    }
+  } finally {
+    reader.releaseLock();
+  }
+
+  const bytes = Buffer.concat(chunks.map((chunk) => Buffer.from(chunk)));
+  return bytes.toString('utf8');
 }
 
 export function endpointUrl(baseUrl: string): string {
@@ -187,7 +292,12 @@ export class ResponsesManagerEndpointTransport implements ManagerEndpointTranspo
 
   private async request(configInput: ProviderEndpointConfig, prompt: string): Promise<{ run: ProviderRun; text?: string }> {
     const started = Date.now();
-    const config = parseProviderEndpointConfig(configInput);
+    let config: ProviderEndpointConfig;
+    try {
+      config = parseProviderEndpointConfig(configInput);
+    } catch {
+      return { run: failedRun('CONTRACT_INVALID', 'PROVIDER_ENDPOINT_CONFIG_INVALID', started) };
+    }
     if (!config.base_url) return { run: failedRun('CONTRACT_INVALID', 'PROVIDER_ENDPOINT_BASE_URL_MISSING', started) };
     const envName = referencedEnvironmentName(config.auth_source);
     if (!envName) return { run: failedRun('AUTH_ERROR', 'PROVIDER_ENDPOINT_AUTH_SOURCE_UNSUPPORTED', started) };
@@ -203,12 +313,15 @@ export class ResponsesManagerEndpointTransport implements ManagerEndpointTranspo
           'Content-Type': 'application/json',
           [config.auth_header_name]: authValue,
         },
+        credentials: 'omit',
+        redirect: 'error',
         // The durable context remains in Agent Forge. Avoid creating an
         // upstream conversation or stored response as an implicit authority.
         body: JSON.stringify({ model: config.model_or_route, input: prompt, store: false }),
         signal: controller.signal,
       });
-      const raw = await response.text();
+      assertProviderResponseOrigin(response, endpointUrl(config.base_url));
+      const raw = await readResponseTextBounded(response);
       const safeRaw = redactValue(raw, authValue, config.base_url);
       if (response.status === 401 || response.status === 403) {
         return { run: failedRun('AUTH_ERROR', `ROUTE_AUTH_ERROR HTTP ${response.status}: ${safeRaw}`, started) };
@@ -246,6 +359,9 @@ export class ResponsesManagerEndpointTransport implements ManagerEndpointTranspo
         },
       };
     } catch (error) {
+      if (error instanceof ProviderResponseBoundaryError || error instanceof ProviderResponseTooLargeError) {
+        return { run: failedRun('CONTRACT_INVALID', error.message, started) };
+      }
       if (error instanceof Error && error.name === 'AbortError') {
         return { run: failedRun('TIMEOUT', 'ROUTE_TIMEOUT', started) };
       }
