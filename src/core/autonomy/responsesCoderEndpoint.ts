@@ -200,6 +200,18 @@ function canonicalRelativePath(rawPath: string, field: string): string {
   if (slashPath === '..' || slashPath.startsWith('../') || slashPath.includes('/../')) {
     throw new Error(`PATH_TRAVERSAL: Path traversal is forbidden in ${field}: ${rawPath}`);
   }
+  // A colon in a Windows path component denotes an alternate data stream
+  // (for example, `source.ts:secret`).  Reject it on every platform so a
+  // bundle accepted on POSIX cannot become an out-of-policy write on Windows.
+  // Windows also strips trailing dots and spaces from path components, which
+  // would make two distinct protocol paths address the same native file.
+  const components = slashPath.split('/');
+  if (components.some((component) => component.includes(':'))) {
+    throw new Error(`PATH_TRAVERSAL: Alternate data streams are forbidden in ${field}: ${rawPath}`);
+  }
+  if (components.some((component) => /[ .]$/.test(component))) {
+    throw new Error(`NON_CANONICAL_PATH: Windows-trimmed path components are forbidden in ${field}: ${rawPath}`);
+  }
   const canonical = path.posix.normalize(slashPath);
   if (
     canonical !== slashPath ||
@@ -226,6 +238,12 @@ function filesystemPathKey(value: string): string {
 
 const CODER_CONTEXT_MAX_FILES = 64;
 const CODER_CONTEXT_MAX_BYTES = 512 * 1024;
+// Stop directory enumeration before an oversized authorized tree can be
+// materialized in memory.  The file and byte limits below remain the
+// protocol-facing limits; this bound only caps traversal work for rejected
+// requests.
+const CODER_CONTEXT_MAX_ENTRIES = CODER_CONTEXT_MAX_FILES * 8;
+const CODER_CONTEXT_MAX_DEPTH = 128;
 const CODER_EDIT_MAX_BYTES = 1024 * 1024;
 const CODER_EDIT_TOTAL_MAX_BYTES = 8 * 1024 * 1024;
 
@@ -239,6 +257,7 @@ interface CoderPathSnapshot {
   readonly parentIdentities: ReadonlyArray<{ path: string; identity: CoderPathIdentity }>;
   readonly leafIdentity?: CoderPathIdentity;
   readonly leafIsDirectory?: boolean;
+  readonly leafIsFile?: boolean;
   readonly leafMode?: number;
 }
 
@@ -400,6 +419,7 @@ function captureCoderPathSnapshot(
 
   let leafIdentity: CoderPathIdentity | undefined;
   let leafIsDirectory: boolean | undefined;
+  let leafIsFile: boolean | undefined;
   let leafMode: number | undefined;
   try {
     const leafStat = fs.lstatSync(absolute);
@@ -411,6 +431,7 @@ function captureCoderPathSnapshot(
     coderPolicyOrThrow(absolute, anchor.realPath, relative, 'read');
     leafIdentity = { key: coderIdentityKey(leafStat), realPath: leafRealPath };
     leafIsDirectory = leafStat.isDirectory();
+    leafIsFile = leafStat.isFile();
     leafMode = leafStat.mode;
     if (options.requireFile && !leafStat.isFile()) {
       throw new Error(`CODER_PATH_INVALID: edit target is not a regular file: ${relative}`);
@@ -420,7 +441,7 @@ function captureCoderPathSnapshot(
     if (!options.allowMissingLeaf) throw new Error(`CODER_PATH_INVALID: target disappeared: ${relative}`);
   }
 
-  return { absolutePath: absolute, parentIdentities, leafIdentity, leafIsDirectory, leafMode };
+  return { absolutePath: absolute, parentIdentities, leafIdentity, leafIsDirectory, leafIsFile, leafMode };
 }
 
 function assertCoderSnapshotUnchanged(snapshot: CoderPathSnapshot, anchor: CoderWorktreeAnchor): void {
@@ -456,7 +477,7 @@ function readCoderFile(
   anchor: CoderWorktreeAnchor,
   maxBytes: number,
 ): Buffer {
-  if (!snapshot.leafIdentity || snapshot.leafIsDirectory) {
+  if (!snapshot.leafIdentity || !snapshot.leafIsFile) {
     throw new Error(`SOURCE_CONTEXT_PATH_INVALID: source is not a regular file: ${coderRelativePath(anchor, snapshot.absolutePath)}`);
   }
   assertCoderSnapshotUnchanged(snapshot, anchor);
@@ -541,6 +562,23 @@ interface CoderEditOriginal {
   readonly absolutePath: string;
   readonly content?: Buffer;
   readonly snapshot: CoderPathSnapshot;
+  /** Identity/content produced by this bundle, once its replacement commits. */
+  writtenIdentity?: CoderPathIdentity;
+  writtenContent?: Buffer;
+}
+
+interface CoderAtomicWriteFailure extends Error {
+  readonly replacementIdentity?: CoderPathIdentity;
+}
+
+function coderReplacementIdentity(error: unknown): CoderPathIdentity | undefined {
+  if (!error || typeof error !== 'object' || !('replacementIdentity' in error)) return undefined;
+  const candidate = (error as { replacementIdentity?: unknown }).replacementIdentity;
+  if (!candidate || typeof candidate !== 'object') return undefined;
+  const identity = candidate as Partial<CoderPathIdentity>;
+  return typeof identity.key === 'string' && typeof identity.realPath === 'string'
+    ? { key: identity.key, realPath: identity.realPath }
+    : undefined;
 }
 
 function createCoderTempFile(parent: string, content: Buffer, anchor: CoderWorktreeAnchor): string {
@@ -573,7 +611,7 @@ function writeCoderFileAtomically(
   original: CoderEditOriginal,
   content: Buffer,
   anchor: CoderWorktreeAnchor,
-): void {
+): CoderPathIdentity {
   ensureCoderParentDirectories(path.dirname(original.absolutePath), anchor);
   const current = captureCoderPathSnapshot(original.absolutePath, anchor, { allowMissingLeaf: true });
   if (Boolean(original.snapshot.leafIdentity) !== Boolean(current.leafIdentity) ||
@@ -583,6 +621,7 @@ function writeCoderFileAtomically(
   assertCoderSnapshotUnchanged(current, anchor);
   const tempPath = createCoderTempFile(path.dirname(original.absolutePath), content, anchor);
   let renamed = false;
+  let replacementIdentity: CoderPathIdentity | undefined;
   try {
     if (original.snapshot.leafIdentity && original.snapshot.leafMode !== undefined) {
       // Replacement should retain the existing executable/read-only mode;
@@ -593,27 +632,52 @@ function writeCoderFileAtomically(
     fs.renameSync(tempPath, original.absolutePath);
     renamed = true;
     const post = captureCoderPathSnapshot(original.absolutePath, anchor, { allowMissingLeaf: false, requireFile: true });
+    replacementIdentity = post.leafIdentity;
+    if (!replacementIdentity) throw new Error(`CODER_EDIT_POSTCONDITION_FAILED: replacement identity was not available: ${original.path}`);
     const verified = readCoderFile(post, anchor, CODER_EDIT_MAX_BYTES);
     if (!verified.equals(content)) throw new Error(`CODER_EDIT_POSTCONDITION_FAILED: replacement content was not verified: ${original.path}`);
+    return replacementIdentity;
   } catch (error) {
     if (!renamed) {
       try { removeCoderTempFile(tempPath); } catch { /* preserve primary failure */ }
     }
-    throw error;
+    // A post-rename failure must carry the identity we observed immediately
+    // after replacement.  Rollback can then refuse to overwrite a concurrent
+    // replacement instead of guessing which file it is allowed to restore.
+    if (renamed && replacementIdentity && error && typeof error === 'object') {
+      Object.defineProperty(error, 'replacementIdentity', {
+        configurable: true,
+        enumerable: false,
+        value: replacementIdentity,
+      });
+    }
+    throw error as CoderAtomicWriteFailure;
   }
 }
 
 function rollbackCoderEdit(original: CoderEditOriginal, anchor: CoderWorktreeAnchor): void {
+  // If the replacement never committed, there is nothing this rollback owns.
+  // In particular, never delete a target that appeared after a failed create.
+  if (!original.writtenIdentity) return;
   const current = captureCoderPathSnapshot(original.absolutePath, anchor, { allowMissingLeaf: true });
+  if (!current.leafIdentity || !coderSameIdentity(original.writtenIdentity, current.leafIdentity)) {
+    throw new Error(`CODER_EDIT_ROLLBACK_FAILED: target was replaced concurrently: ${original.path}`);
+  }
+  if (!original.writtenContent) {
+    throw new Error(`CODER_EDIT_ROLLBACK_FAILED: replacement content was not retained: ${original.path}`);
+  }
+  const currentContent = readCoderFile(current, anchor, CODER_EDIT_MAX_BYTES);
+  if (!currentContent.equals(original.writtenContent)) {
+    throw new Error(`CODER_EDIT_ROLLBACK_FAILED: target content changed concurrently: ${original.path}`);
+  }
   if (!original.content) {
-    if (!current.leafIdentity) return;
-    if (current.leafIsDirectory) throw new Error(`CODER_EDIT_ROLLBACK_FAILED: target became a directory: ${original.path}`);
+    if (!current.leafIsFile) throw new Error(`CODER_EDIT_ROLLBACK_FAILED: target became a non-regular file: ${original.path}`);
     fs.unlinkSync(original.absolutePath);
     const after = captureCoderPathSnapshot(original.absolutePath, anchor, { allowMissingLeaf: true });
     if (after.leafIdentity) throw new Error(`CODER_EDIT_ROLLBACK_FAILED: new target could not be removed: ${original.path}`);
     return;
   }
-  writeCoderFileAtomically({ ...original, snapshot: current }, original.content, anchor);
+  writeCoderFileAtomically({ ...original, snapshot: current, writtenIdentity: undefined, writtenContent: undefined }, original.content, anchor);
 }
 
 export function validateCoderEditBundle(
@@ -771,7 +835,7 @@ export function applyCoderEditBundle(
     const snapshot = captureCoderPathSnapshot(dest, anchor, { allowMissingLeaf: true });
     let previous: Buffer | undefined;
     if (snapshot.leafIdentity) {
-      if (snapshot.leafIsDirectory) throw new Error(`CODER_PATH_INVALID: edit target is a directory: ${normPath}`);
+      if (!snapshot.leafIsFile) throw new Error(`CODER_PATH_INVALID: edit target is not a regular file: ${normPath}`);
       previous = readCoderFile(snapshot, anchor, CODER_EDIT_MAX_BYTES);
     }
     originals.push({ path: normPath, absolutePath: dest, content: previous, snapshot });
@@ -782,7 +846,18 @@ export function applyCoderEditBundle(
     for (let index = 0; index < originals.length; index += 1) {
       const original = originals[index];
       attempted.push(original);
-      writeCoderFileAtomically(original, Buffer.from(bundle.proposed_edits[index].content, 'utf8'), anchor);
+      const replacement = Buffer.from(bundle.proposed_edits[index].content, 'utf8');
+      try {
+        original.writtenIdentity = writeCoderFileAtomically(original, replacement, anchor);
+        original.writtenContent = replacement;
+      } catch (error) {
+        const replacementIdentity = coderReplacementIdentity(error);
+        if (replacementIdentity) {
+          original.writtenIdentity = replacementIdentity;
+          original.writtenContent = replacement;
+        }
+        throw error;
+      }
     }
   } catch (error) {
     const rollbackErrors: string[] = [];
@@ -946,7 +1021,15 @@ function collectAuthorizedSourceContext(order: WorkOrder): AuthorizedSourceFile[
   const forbidden = order.forbidden_paths;
   const candidates = [...new Set([...order.context_files, ...order.allowed_paths])];
   const files = new Map<string, string>();
-  const add = (absolute: string, explicitCandidate: boolean) => {
+  let visitedEntries = 0;
+  const add = (absolute: string, explicitCandidate: boolean, depth = 0) => {
+    visitedEntries += 1;
+    if (visitedEntries > CODER_CONTEXT_MAX_ENTRIES) {
+      throw new Error(`SOURCE_CONTEXT_LIMIT_EXCEEDED: authorized context exceeds ${CODER_CONTEXT_MAX_ENTRIES} traversed entries`);
+    }
+    if (depth > CODER_CONTEXT_MAX_DEPTH) {
+      throw new Error(`SOURCE_CONTEXT_LIMIT_EXCEEDED: authorized context exceeds ${CODER_CONTEXT_MAX_DEPTH} directory levels`);
+    }
     assertCoderAnchorStable(anchor);
     const relative = coderRelativePath(anchor, absolute);
     let snapshot: CoderPathSnapshot;
@@ -971,22 +1054,42 @@ function collectAuthorizedSourceContext(order: WorkOrder): AuthorizedSourceFile[
       // replaced directory therefore fails closed instead of following the
       // replacement into another tree.
       assertCoderSnapshotUnchanged(snapshot, anchor);
-      let children: string[];
+      const children: string[] = [];
+      let directory: fs.Dir | undefined;
       try {
-        children = fs.readdirSync(absolute).sort();
-      } catch {
+        directory = fs.opendirSync(absolute);
+        while (true) {
+          const entry = directory.readSync();
+          if (!entry) break;
+          children.push(entry.name);
+          if (visitedEntries + children.length > CODER_CONTEXT_MAX_ENTRIES) {
+            throw new Error(`SOURCE_CONTEXT_LIMIT_EXCEEDED: authorized context exceeds ${CODER_CONTEXT_MAX_ENTRIES} traversed entries`);
+          }
+        }
+      } catch (error) {
+        if (error instanceof Error && error.message.startsWith('SOURCE_CONTEXT_LIMIT_EXCEEDED:')) throw error;
         throw new Error(`SOURCE_CONTEXT_PATH_INVALID: directory could not be read: ${relative}`);
+      } finally {
+        try { directory?.closeSync(); } catch { /* preserve the original read failure */ }
       }
       assertCoderSnapshotUnchanged(snapshot, anchor);
-      for (const child of children) add(path.join(absolute, child), false);
+      for (const child of children.sort()) add(path.join(absolute, child), false, depth + 1);
     } else {
+      if (!snapshot.leafIsFile) {
+        throw new Error(`SOURCE_CONTEXT_PATH_INVALID: source is not a regular file: ${relative}`);
+      }
       const key = filesystemPathKey(relative);
-      if (!files.has(key)) files.set(key, relative);
+      if (!files.has(key)) {
+        if (files.size >= CODER_CONTEXT_MAX_FILES) {
+          throw new Error(`SOURCE_CONTEXT_LIMIT_EXCEEDED: more than ${CODER_CONTEXT_MAX_FILES} authorized source files`);
+        }
+        files.set(key, relative);
+      }
     }
   };
 
   for (const candidate of candidates) {
-    const relative = candidate.replace(/\\/g, '/').replace(/^\.\//, '');
+    const relative = canonicalRelativePath(candidate.replace(/^\.\//, ''), 'context_files');
     if (!relative || relative === '..' || relative.startsWith('../') || path.isAbsolute(candidate) || path.win32.isAbsolute(candidate)) {
       throw new Error(`SOURCE_CONTEXT_PATH_INVALID: ${candidate}`);
     }

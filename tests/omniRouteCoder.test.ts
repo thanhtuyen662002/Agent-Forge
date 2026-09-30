@@ -637,6 +637,123 @@ describe('OmniRoute Coder Transport & Structured Edits', () => {
       expect(fs.existsSync(path.join(worktreeDir, 'src', 'oversized.ts'))).toBe(false);
     });
 
+    it('rejects Windows alternate data streams and trimmed path aliases on every platform', () => {
+      const makeBundle = (editPath: string): CoderEditBundle => ({
+        protocol_version: 'coderbundle.v1',
+        task_id: 'TSK-PORTABLE-PATH',
+        authorization_id: 'auth-portable-path',
+        source_head: shaA,
+        allowed_paths: [editPath],
+        proposed_edits: [{ path: editPath, content: 'blocked\n' }],
+      });
+
+      expect(() => validateCoderEditBundle(makeBundle('src/app.ts:secret'), {
+        taskId: 'TSK-PORTABLE-PATH',
+        authorizationId: 'auth-portable-path',
+        sourceHead: shaA,
+        allowedPaths: ['src/app.ts:secret'],
+      })).toThrow(/PATH_TRAVERSAL|alternate data stream/i);
+      expect(() => validateCoderEditBundle(makeBundle('src/app.ts.'), {
+        taskId: 'TSK-PORTABLE-PATH',
+        authorizationId: 'auth-portable-path',
+        sourceHead: shaA,
+        allowedPaths: ['src/app.ts.'],
+      })).toThrow(/NON_CANONICAL_PATH|trimmed/i);
+    });
+
+    it('bounds recursive context enumeration before materializing an oversized directory', async () => {
+      const contextRoot = path.join(worktreeDir, 'large-context');
+      fs.mkdirSync(contextRoot, { recursive: true });
+      for (let index = 0; index < 65; index += 1) {
+        fs.writeFileSync(path.join(contextRoot, `file-${String(index).padStart(2, '0')}.ts`), `export const value${index} = ${index};\n`, 'utf8');
+      }
+      let fetchCalls = 0;
+      const transport = new ResponsesCoderEndpointTransport({
+        environment: { TEST_CODER_AUTH: secretToken },
+        fetch: async () => {
+          fetchCalls += 1;
+          return new Response(responsePayload('{}'), { status: 200 });
+        },
+      });
+      const order = createWorkOrder({
+        taskId: 'TSK-CONTEXT-BOUND',
+        workerId: 'coder-omniroute',
+        objective: 'bound context traversal',
+        baseSha: shaA,
+        branch: 'test',
+        worktree: worktreeDir,
+        allowedPaths: ['src/app.ts'],
+        contextFiles: ['large-context'],
+        acceptanceCriteria: ['bounded context'],
+      });
+
+      const result = await transport.executeWorkOrder(coderEndpointConfig(), order, 'auth-context-bound');
+      expect(result.run.status).toBe('CONTRACT_INVALID');
+      expect(result.run.stderr).toMatch(/SOURCE_CONTEXT_LIMIT_EXCEEDED/i);
+      expect(fetchCalls).toBe(0);
+    });
+
+    it('rejects non-regular context sources instead of opening FIFOs or devices', async () => {
+      if (process.platform === 'win32') return;
+      const fifo = path.join(worktreeDir, 'context.fifo');
+      execFileSync('mkfifo', [fifo], { windowsHide: true });
+      let fetchCalls = 0;
+      const transport = new ResponsesCoderEndpointTransport({
+        environment: { TEST_CODER_AUTH: secretToken },
+        fetch: async () => {
+          fetchCalls += 1;
+          return new Response(responsePayload('{}'), { status: 200 });
+        },
+      });
+      const order = createWorkOrder({
+        taskId: 'TSK-CONTEXT-FIFO',
+        workerId: 'coder-omniroute',
+        objective: 'reject special files',
+        baseSha: shaA,
+        branch: 'test',
+        worktree: worktreeDir,
+        allowedPaths: ['src/app.ts'],
+        contextFiles: ['context.fifo'],
+        acceptanceCriteria: ['regular files only'],
+      });
+
+      const result = await transport.executeWorkOrder(coderEndpointConfig(), order, 'auth-context-fifo');
+      expect(result.run.status).toBe('CONTRACT_INVALID');
+      expect(result.run.stderr).toMatch(/regular file/i);
+      expect(fetchCalls).toBe(0);
+    });
+
+    it('does not clobber a concurrent replacement during failed atomic edit rollback', () => {
+      const target = path.join(worktreeDir, 'src', 'concurrent.ts');
+      fs.mkdirSync(path.dirname(target), { recursive: true });
+      fs.writeFileSync(target, 'original\n', 'utf8');
+      const originalRename = fs.renameSync;
+      const renameSpy = vi.spyOn(fs, 'renameSync').mockImplementation((source, destination) => {
+        originalRename(source, destination);
+        if (String(destination) === target) {
+          fs.unlinkSync(target);
+          fs.writeFileSync(target, 'concurrent-user-edit\n', 'utf8');
+        }
+      });
+
+      const bundle: CoderEditBundle = {
+        protocol_version: 'coderbundle.v1',
+        task_id: 'TSK-CONCURRENT-ROLLBACK',
+        authorization_id: 'auth-concurrent-rollback',
+        source_head: shaA,
+        allowed_paths: ['src/concurrent.ts'],
+        proposed_edits: [{ path: 'src/concurrent.ts', content: 'coder-edit\n' }],
+      };
+      expect(() => applyCoderEditBundle(worktreeDir, bundle, {
+        taskId: 'TSK-CONCURRENT-ROLLBACK',
+        authorizationId: 'auth-concurrent-rollback',
+        sourceHead: shaA,
+        allowedPaths: ['src/concurrent.ts'],
+      })).toThrow(/CODER_EDIT_ROLLBACK_FAILED|concurrent/i);
+      expect(fs.readFileSync(target, 'utf8')).toBe('concurrent-user-edit\n');
+      renameSpy.mockRestore();
+    });
+
     it('executeWorkOrder succeeds when proposed edit content contains triple-backtick markdown', async () => {
       const targetPath = path.join(worktreeDir, 'README.md');
       fs.writeFileSync(targetPath, '# Initial\n', 'utf8');
