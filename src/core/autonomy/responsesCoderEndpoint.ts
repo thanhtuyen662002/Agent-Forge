@@ -366,12 +366,12 @@ function assertCoderAnchorStable(anchor: CoderWorktreeAnchor): void {
   }
 }
 
-function coderRelativePath(anchor: CoderWorktreeAnchor, absolutePath: string): string {
+function coderRelativePath(anchor: CoderWorktreeAnchor, absolutePath: string, allowRoot = false): string {
   const relative = path.relative(anchor.path, absolutePath).replace(/\\/g, '/');
-  if (!relative || relative === '..' || relative.startsWith('../') || path.isAbsolute(relative)) {
+  if ((!allowRoot && !relative) || relative === '..' || relative.startsWith('../') || path.isAbsolute(relative)) {
     throw new Error('CODER_PATH_INVALID: path escaped the authorized worktree');
   }
-  return relative;
+  return relative || '.';
 }
 
 function captureCoderPathSnapshot(
@@ -380,7 +380,7 @@ function captureCoderPathSnapshot(
   options: { allowMissingLeaf?: boolean; requireFile?: boolean } = {},
 ): CoderPathSnapshot {
   const absolute = path.resolve(targetPath);
-  const relative = coderRelativePath(anchor, absolute);
+  const relative = coderRelativePath(anchor, absolute, true);
   try {
     assertPathContained(absolute, anchor.path);
   } catch {
@@ -590,14 +590,27 @@ function coderReplacementIdentity(error: unknown): CoderPathIdentity | undefined
 
 function createCoderTempFile(parent: string, content: Buffer, anchor: CoderWorktreeAnchor): string {
   const tempPath = path.join(parent, `.agent-forge-coder-${crypto.randomUUID()}.tmp`);
+  const parentSnapshot = captureCoderPathSnapshot(parent, anchor, { allowMissingLeaf: false });
+  if (!parentSnapshot.leafIsDirectory) {
+    throw new Error('CODER_PATH_INVALID: atomic replacement parent is not a regular directory');
+  }
+  assertCoderSnapshotUnchanged(parentSnapshot, anchor);
   const relative = coderRelativePath(anchor, tempPath);
   coderPolicyOrThrow(tempPath, anchor.realPath, relative, 'write');
   let descriptor: number | undefined;
   let complete = false;
   try {
     descriptor = openCoderFile(tempPath, fs.constants.O_WRONLY | fs.constants.O_CREAT | fs.constants.O_EXCL, 0o600);
+    const opened = fs.fstatSync(descriptor);
+    if (!opened.isFile()) throw new Error('CODER_PATH_INVALID: temporary replacement is not a regular file');
+    const openedRealPath = coderRealpath(tempPath);
+    if (!coderContainedRealPath(openedRealPath, anchor.realPath)) {
+      throw new Error('CODER_PATH_INVALID: temporary replacement escaped the authorized worktree');
+    }
+    assertCoderSnapshotUnchanged(parentSnapshot, anchor);
     writeCoderAll(descriptor, content);
     fs.fsyncSync(descriptor);
+    assertCoderSnapshotUnchanged(parentSnapshot, anchor);
     complete = true;
     return tempPath;
   } finally {
@@ -679,6 +692,7 @@ function rollbackCoderEdit(original: CoderEditOriginal, anchor: CoderWorktreeAnc
   }
   if (!original.content) {
     if (!current.leafIsFile) throw new Error(`CODER_EDIT_ROLLBACK_FAILED: target became a non-regular file: ${original.path}`);
+    assertCoderSnapshotUnchanged(current, anchor);
     fs.unlinkSync(original.absolutePath);
     const after = captureCoderPathSnapshot(original.absolutePath, anchor, { allowMissingLeaf: true });
     if (after.leafIdentity) throw new Error(`CODER_EDIT_ROLLBACK_FAILED: new target could not be removed: ${original.path}`);
