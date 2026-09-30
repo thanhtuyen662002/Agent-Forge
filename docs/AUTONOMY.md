@@ -260,6 +260,19 @@ remain separate. A manager outage leaves the affected task resumable and does no
 GitHub CI observation, or unrelated executable work. Stale reviewed HEADs force a `REPAIR` verdict,
 malformed provider contracts fail closed, and ChatGPT accounts are never rotated automatically.
 
+### Direct OpenAI API fallback
+
+The direct OpenAI manager fallback is disabled unless the owner explicitly sets
+AGENT_FORGE_ENABLE_OPENAI_API_FALLBACK=1. It reads OPENAI_API_KEY only through
+the environment reference env://OPENAI_API_KEY and routes review and planning
+through the same bounded Responses transport used by configured routes. Each
+request sends store=false, rejects URL credentials, query or fragment changes,
+redirects, origin drift, and response bodies above the provider limit. Provider
+responses are sanitized before they enter run evidence; API keys, endpoint
+credentials, and raw response bodies are never persisted in WorkOrders,
+ManagerContextPackage records, diagnostics, or logs. The fallback remains an
+owner-controlled opt-in and does not change the primary local or OmniRoute
+selection policy.
 ### OmniRoute configuration
 
 The company URL, authorization value, and model aliases stay outside Git. Agent Forge
