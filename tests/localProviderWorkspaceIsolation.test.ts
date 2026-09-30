@@ -2,7 +2,7 @@ import Database from 'better-sqlite3';
 import fs from 'fs';
 import os from 'os';
 import path from 'path';
-import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { MigrationRunner } from '../src/core/database/migrations';
 import { Repository } from '../src/core/database/repositories';
 import { ArtifactStore } from '../src/core/services/ArtifactStore';
@@ -95,6 +95,9 @@ describe('Local CLI provider workspace isolation', () => {
       if (prompt.includes('MODIFY_ALLOWED')) {
         fs.appendFileSync(path.join(cwd, 'src', 'allowed.ts'), '\\nexport const providerChange = true;\\n');
       }
+      if (prompt.includes('MODIFY_SECOND')) {
+        fs.appendFileSync(path.join(cwd, 'src', 'second.ts'), '\\nexport const secondProviderChange = true;\\n');
+      }
       const probe = path.join(probeDirectory, 'probe-' + process.pid + '-' + Date.now() + '-' + Math.random().toString(36).slice(2) + '.json');
       fs.writeFileSync(probe, JSON.stringify(result), 'utf8');
       const finish = () => {
@@ -156,12 +159,12 @@ describe('Local CLI provider workspace isolation', () => {
     fs.rmSync(tmpDir, { recursive: true, force: true });
   });
 
-  function request(instructions: string[] = ['MODIFY_ALLOWED']): AgentExecutionRequest {
+  function request(instructions: string[] = ['MODIFY_ALLOWED'], contextFiles: string[] = ['src/allowed.ts']): AgentExecutionRequest {
     return {
       taskId: 'TSK-WORKSPACE-TEST',
       projectId: 'PROJ-WORKSPACE-TEST',
       instructions,
-      contextFiles: ['src/allowed.ts'],
+        contextFiles,
       runtimeBinding: {
         authorizationId: 'auth-workspace-test',
         routingDecisionId: 'decision-workspace-test',
@@ -235,6 +238,36 @@ describe('Local CLI provider workspace isolation', () => {
     expect(result.status).toBe('FAILED');
     expect(result.errorCode).toBe('PROTOCOL_INVALID');
     expect(fs.readFileSync(path.join(projectRoot, 'src', 'allowed.ts'), 'utf8')).not.toContain('invalid provider change');
+  });
+
+  it('rolls back an earlier synchronized file when a later source conflicts', async () => {
+    const secondPath = path.join(projectRoot, 'src', 'second.ts');
+    fs.writeFileSync(secondPath, 'export const second = 1;\n', 'utf8');
+    const allowedPath = path.join(projectRoot, 'src', 'allowed.ts');
+    const originalAllowed = fs.readFileSync(allowedPath, 'utf8');
+    const originalRename = fs.renameSync.bind(fs);
+    let firstWriteObserved = false;
+    const renameSpy = vi.spyOn(fs, 'renameSync').mockImplementation(((source, target) => {
+      const result = originalRename(source, target);
+      if (target === allowedPath && !firstWriteObserved) {
+        firstWriteObserved = true;
+        fs.writeFileSync(secondPath, 'external concurrent update\n', 'utf8');
+      }
+      return result;
+    }) as typeof fs.renameSync);
+
+    try {
+      const result = await adapter.execute(
+        request(['MODIFY_ALLOWED', 'MODIFY_SECOND'], ['src/allowed.ts', 'src/second.ts']),
+      );
+
+      expect(result.status).toBe('FAILED');
+      expect(result.error).toContain('WORKSPACE_SYNC_CONFLICT');
+      expect(fs.readFileSync(allowedPath, 'utf8')).toBe(originalAllowed);
+      expect(fs.readFileSync(secondPath, 'utf8')).toBe('external concurrent update\n');
+    } finally {
+      renameSpy.mockRestore();
+    }
   });
 
   it('gives concurrent executions distinct workspaces and cleans both leases', async () => {
