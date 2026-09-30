@@ -662,14 +662,14 @@ describe('R5C Local Account & Credential Fabric Test Suite', () => {
   // -------------------------------------------------------------
   // 24. normal Windows npm test does NOT touch real Credential Manager
   // -------------------------------------------------------------
-  it('24. normal Windows npm test does NOT touch real Credential Manager', () => {
+  it('24. normal Windows npm test does NOT touch real Credential Manager', async () => {
     // InMemoryCredentialStore is fully isolated
     const memStore = new InMemoryCredentialStore();
     const ref = parseCredentialRef('wincred://agentforge/test/mem-key');
     const secret = new SecretValue('test-secret');
 
     memStore.put(ref, secret);
-    expect(memStore.exists(ref)).resolves.toBe(true);
+    await expect(memStore.exists(ref)).resolves.toBe(true);
   });
 
   // -------------------------------------------------------------
