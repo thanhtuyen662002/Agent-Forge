@@ -40,6 +40,7 @@ export const SettingsView: React.FC = () => {
   const [maxRevisionsInput, setMaxRevisionsInput] = useState<string>(String(DEFAULT_MAX_REVISIONS));
   const [saved, setSaved] = useState<boolean>(false);
   const [saveError, setSaveError] = useState<string | null>(null);
+  const [settingsLoading, setSettingsLoading] = useState<boolean>(true);
 
   // App & Update State
   const [appInfo, setAppInfo] = useState<{ version: string; isPackaged: boolean; platform: string; arch: string }>({
@@ -65,6 +66,8 @@ export const SettingsView: React.FC = () => {
   const fetchStateRequestRef = useRef(0);
   const actionInFlightRef = useRef(false);
   const saveInFlightRef = useRef(false);
+  const settingsDraftVersionRef = useRef(0);
+  const settingsLoadedProjectIdRef = useRef<string | undefined>(undefined);
 
   const applyCanonicalCommands = (commands: any[]) => {
     const testRow = commands.find((c: any) => c.command_type === 'TEST' && c.enabled);
@@ -77,6 +80,7 @@ export const SettingsView: React.FC = () => {
   };
 
   const markSettingsDirty = () => {
+    settingsDraftVersionRef.current += 1;
     setSaved(false);
     setSaveError(null);
   };
@@ -85,19 +89,24 @@ export const SettingsView: React.FC = () => {
   useEffect(() => {
     const currentProjectId = activeProject?.id;
     let isMounted = true;
+    settingsDraftVersionRef.current += 1;
+    settingsLoadedProjectIdRef.current = undefined;
+    setSettingsLoading(Boolean(currentProjectId));
+    const loadDraftVersion = settingsDraftVersionRef.current;
     setSaveError(null);
     setSaved(false);
     // Reset project-scoped controls immediately so a project switch cannot
     // briefly display or accidentally save the previous project's policy.
+    setTestCmd('');
+    setLintCmd('');
+    setBuildCmd('');
     setMaxRevisionsInput(String(DEFAULT_MAX_REVISIONS));
 
     const loadVerificationCommands = async () => {
       if (!currentProjectId || !(window as any).orchestrator?.getVerificationCommands) {
         if (isMounted) {
-          setTestCmd('');
-          setLintCmd('');
-          setBuildCmd('');
           setMaxRevisionsInput(String(DEFAULT_MAX_REVISIONS));
+          setSettingsLoading(false);
         }
         return;
       }
@@ -105,24 +114,52 @@ export const SettingsView: React.FC = () => {
       try {
         const res = await (window as any).orchestrator.getVerificationCommands(currentProjectId);
         if (
-          isMounted &&
-          activeProjectIdRef.current === currentProjectId &&
+          !isMounted ||
+          activeProjectIdRef.current !== currentProjectId ||
+          settingsDraftVersionRef.current !== loadDraftVersion
+        ) {
+          return;
+        }
+        if (
           res?.success &&
           Array.isArray(res.commands)
         ) {
           applyCanonicalCommands(res.commands);
+        } else {
+          setSaveError(res?.error || t('settings.saveFailed'));
+          setSettingsLoading(false);
+          return;
         }
 
-        if (isMounted && activeProjectIdRef.current === currentProjectId) {
-          const maxRes = await (window as any).orchestrator.getMaxRevisions?.(currentProjectId);
-          if (maxRes?.success && parseMaxRevisions(maxRes.maxRevisions) !== null) {
-            setMaxRevisionsInput(String(maxRes.maxRevisions));
-          } else if (maxRes && !maxRes.success) {
-            setSaveError(maxRes.error || t('settings.saveFailed'));
-          }
+        const getMaxRevisions = (window as any).orchestrator.getMaxRevisions;
+        if (typeof getMaxRevisions !== 'function') {
+          setSaveError(t('settings.saveFailed'));
+          setSettingsLoading(false);
+          return;
         }
+        const maxRes = await getMaxRevisions(currentProjectId);
+        if (
+          !isMounted ||
+          activeProjectIdRef.current !== currentProjectId ||
+          settingsDraftVersionRef.current !== loadDraftVersion
+        ) {
+          return;
+        }
+        const loadedMaxRevisions = parseMaxRevisions(maxRes?.maxRevisions);
+        if (!maxRes?.success || loadedMaxRevisions === null) {
+          setSaveError(maxRes?.error || t('settings.saveFailed'));
+          setSettingsLoading(false);
+          return;
+        }
+        setMaxRevisionsInput(String(loadedMaxRevisions));
+        settingsLoadedProjectIdRef.current = currentProjectId;
+        setSettingsLoading(false);
       } catch (err) {
         console.warn('Failed to load verification commands for project:', err);
+        if (isMounted && activeProjectIdRef.current === currentProjectId) {
+          setSaveError(t('settings.saveFailed'));
+          setSettingsLoading(false);
+        }
       }
     };
 
@@ -240,6 +277,10 @@ export const SettingsView: React.FC = () => {
       setSaveError(t('settings.noActiveProject'));
       return;
     }
+    if (settingsLoading || settingsLoadedProjectIdRef.current !== activeProject.id) {
+      setSaveError(t('settings.saveFailed'));
+      return;
+    }
 
     const parsedMaxRevisions = parseMaxRevisions(maxRevisionsInput);
     if (parsedMaxRevisions === null) {
@@ -250,6 +291,7 @@ export const SettingsView: React.FC = () => {
 
     saveInFlightRef.current = true;
     const savedProjectId = activeProject.id;
+    const savedDraftVersion = settingsDraftVersionRef.current;
 
     setSaveError(null);
     setSaved(false);
@@ -270,7 +312,10 @@ export const SettingsView: React.FC = () => {
       });
 
       // Ignore stale async response if active project switched while save was in flight
-      if (activeProjectIdRef.current !== savedProjectId) {
+      if (
+        activeProjectIdRef.current !== savedProjectId ||
+        settingsDraftVersionRef.current !== savedDraftVersion
+      ) {
         return;
       }
 
@@ -283,7 +328,10 @@ export const SettingsView: React.FC = () => {
         projectId: savedProjectId,
         maxRevisions: parsedMaxRevisions,
       });
-      if (activeProjectIdRef.current !== savedProjectId) {
+      if (
+        activeProjectIdRef.current !== savedProjectId ||
+        settingsDraftVersionRef.current !== savedDraftVersion
+      ) {
         return;
       }
 
@@ -668,7 +716,9 @@ export const SettingsView: React.FC = () => {
         <div className="flex justify-end pt-4 border-t border-surface-border">
           <button
             onClick={handleSave}
-            className="px-5 py-2 bg-forge-cyan hover:bg-cyan-600 text-slate-950 font-mono font-bold text-xs rounded-lg shadow flex items-center space-x-2 transition"
+            disabled={settingsLoading || !activeProject}
+            aria-busy={settingsLoading}
+            className="px-5 py-2 bg-forge-cyan hover:bg-cyan-600 disabled:opacity-50 disabled:cursor-not-allowed text-slate-950 font-mono font-bold text-xs rounded-lg shadow flex items-center space-x-2 transition"
           >
             {saved ? <Check className="w-4 h-4" /> : <Save className="w-4 h-4" />}
             <span>{saved ? t('settings.settingsSavedButton') : t('settings.saveConfigButton')}</span>
