@@ -130,6 +130,48 @@ describe('direct OpenAI fallback transport', () => {
     oversizedSetup.db.close();
   });
 
+  it.each([
+    ['review', async (resource: NonNullable<ReturnType<typeof setupPool>['fallback']>) => resource.review({ workOrder: order(), evidence: '{}' })],
+    ['plan', async (resource: NonNullable<ReturnType<typeof setupPool>['fallback']>) => resource.plan!(order())],
+  ] as const)('classifies malformed provider output as a contract failure for %s', async (_operation, invoke) => {
+    vi.stubEnv('AGENT_FORGE_ENABLE_OPENAI_API_FALLBACK', '1');
+    vi.stubEnv('OPENAI_API_KEY', secret);
+    vi.stubGlobal('fetch', async () => new Response('{not-json', { status: 200 }));
+
+    const { db, fallback } = setupPool();
+    expect((await invoke(fallback)).run.status).toBe('CONTRACT_INVALID');
+    db.close();
+  });
+
+  it.each([
+    ['review', async (resource: NonNullable<ReturnType<typeof setupPool>['fallback']>) => resource.review({ workOrder: order(), evidence: '{}' })],
+    ['plan', async (resource: NonNullable<ReturnType<typeof setupPool>['fallback']>) => resource.plan!(order())],
+  ] as const)('classifies provider timeouts as TIMEOUT for %s', async (_operation, invoke) => {
+    vi.stubEnv('AGENT_FORGE_ENABLE_OPENAI_API_FALLBACK', '1');
+    vi.stubEnv('OPENAI_API_KEY', secret);
+    vi.stubGlobal('fetch', async () => { throw new DOMException('request timed out', 'AbortError'); });
+
+    const { db, fallback } = setupPool();
+    expect((await invoke(fallback)).run.status).toBe('TIMEOUT');
+    db.close();
+  });
+
+  it.each([
+    ['review', async (resource: NonNullable<ReturnType<typeof setupPool>['fallback']>) => resource.review({ workOrder: order(), evidence: '{}' })],
+    ['plan', async (resource: NonNullable<ReturnType<typeof setupPool>['fallback']>) => resource.plan!(order())],
+  ] as const)('preserves provider failures for %s without treating them as success', async (_operation, invoke) => {
+    vi.stubEnv('AGENT_FORGE_ENABLE_OPENAI_API_FALLBACK', '1');
+    vi.stubEnv('OPENAI_API_KEY', secret);
+    vi.stubGlobal('fetch', async () => new Response(`provider unavailable ${secret}`, { status: 503 }));
+
+    const { db, fallback } = setupPool();
+    const result = await invoke(fallback);
+    expect(result.run.status).toBe('FAILED_PROCESS_EXIT');
+    expect(result.run.stdout).toBe('');
+    expect(result.run.stderr).not.toContain(secret);
+    db.close();
+  });
+
   it('builds a direct manager config with HTTPS and an external API-key reference', () => {
     const config = directOpenAiFallbackConfig({
       OPENAI_API_BASE_URL: 'https://api.openai.com/v1/responses',
