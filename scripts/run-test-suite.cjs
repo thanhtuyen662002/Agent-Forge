@@ -14,6 +14,7 @@
 
 const path = require('node:path');
 const { spawnSync } = require('node:child_process');
+const { sanitizeCapturedOutput } = require('./test-output-sanitizer.cjs');
 
 const repositoryRoot = path.resolve(__dirname, '..');
 const vitestEntry = path.join(repositoryRoot, 'node_modules', 'vitest', 'vitest.mjs');
@@ -23,9 +24,17 @@ const runVitest = (label, args) => {
   process.stdout.write(`\n=== Agent Forge ${label} test phase ===\n`);
   const result = spawnSync(process.execPath, [vitestEntry, 'run', ...args, ...reporterArgs], {
     cwd: repositoryRoot,
-    stdio: 'inherit',
+    // Capture the Vitest parent process so reporter assertion summaries pass
+    // through the same fail-closed credential boundary as worker output.
+    stdio: ['inherit', 'pipe', 'pipe'],
+    encoding: 'utf8',
+    maxBuffer: 64 * 1024 * 1024,
     windowsHide: true,
   });
+
+  const safeOutput = sanitizeCapturedOutput(result);
+  if (safeOutput.stdout) process.stdout.write(safeOutput.stdout);
+  if (safeOutput.stderr) process.stderr.write(safeOutput.stderr);
 
   if (result.error) {
     process.stderr.write(`${label} test phase failed to start: ${result.error.message}\n`);

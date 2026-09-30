@@ -17,6 +17,13 @@ const SESSION_TOKEN_PATTERN = /(?<![A-Za-z0-9_-])[A-Za-z0-9_-]{43}(?![A-Za-z0-9_
 const SUBMISSION_TOKEN_PATTERN = /(?<![A-Za-z0-9_-])af-sub-[A-Za-z0-9_-]{43}(?![A-Za-z0-9_-])/gi;
 const REVIEWER_TOKEN_PATTERN = /(?<![A-Za-z0-9_-])af-rev-[0-9a-f-]{36}(?![A-Za-z0-9_-])/gi;
 
+// Keep an incomplete line until its terminating newline (or an explicit
+// flush). A credential can be split over arbitrary stream writes, and
+// redacting each chunk independently would allow the concatenated token to
+// reach the diagnostic sink. The cap is a fail-closed guard for a test that
+// writes an unterminated, unbounded diagnostic line.
+const MAX_PENDING_LINE_BYTES = 64 * 1024;
+
 /**
  * Redacts credentials from text that is about to be written to a diagnostic
  * sink. The explicit field matcher handles future token formats as long as a
@@ -41,10 +48,54 @@ function textFromChunk(chunk: unknown, encoding?: unknown): string {
   return String(chunk);
 }
 
-function createRedactingWriter(original: Writable, stream: NodeJS.WritableStream): Writable {
+class StreamingMcpCliRedactor {
+  private pending = '';
+
+  public push(text: string): string {
+    this.pending += text;
+    let safeOutput = '';
+    let newlineIndex = this.pending.indexOf('\n');
+    while (newlineIndex >= 0) {
+      const line = this.pending.slice(0, newlineIndex + 1);
+      this.pending = this.pending.slice(newlineIndex + 1);
+      safeOutput += redactMcpCliOutput(line);
+      newlineIndex = this.pending.indexOf('\n');
+    }
+
+    if (Buffer.byteLength(this.pending, 'utf8') > MAX_PENDING_LINE_BYTES) {
+      // A line without a boundary cannot be safely streamed indefinitely.
+      // Preserve the security invariant by emitting only a generic marker;
+      // ordinary bounded diagnostics continue through the normal redactor.
+      safeOutput += `${REDACTED_TOKEN}\n`;
+      this.pending = '';
+    }
+    return safeOutput;
+  }
+
+  public flush(): string {
+    const safeOutput = redactMcpCliOutput(this.pending);
+    this.pending = '';
+    return safeOutput;
+  }
+}
+
+interface RedactingWriter {
+  write: Writable;
+  flush: () => string;
+}
+
+function createRedactingWriter(original: Writable, stream: NodeJS.WritableStream): RedactingWriter {
   const boundOriginal = original.bind(stream);
-  return ((chunk: unknown, encodingOrCallback?: unknown, callback?: unknown) => {
-    const safeText = redactMcpCliOutput(textFromChunk(chunk, encodingOrCallback));
+  const redactor = new StreamingMcpCliRedactor();
+  const write = ((chunk: unknown, encodingOrCallback?: unknown, callback?: unknown) => {
+    const safeText = redactor.push(textFromChunk(chunk, encodingOrCallback));
+    const done = typeof encodingOrCallback === 'function'
+      ? encodingOrCallback as () => void
+      : typeof callback === 'function' ? callback as () => void : undefined;
+    if (!safeText) {
+      done?.();
+      return true;
+    }
     if (typeof encodingOrCallback === 'function') {
       return boundOriginal(safeText, encodingOrCallback as () => void);
     }
@@ -57,6 +108,15 @@ function createRedactingWriter(original: Writable, stream: NodeJS.WritableStream
       typeof callback === 'function' ? callback as () => void : undefined
     );
   }) as Writable;
+
+  return {
+    write,
+    flush: () => {
+      const safeText = redactor.flush();
+      if (safeText) boundOriginal(safeText);
+      return safeText;
+    },
+  };
 }
 
 /**
@@ -69,17 +129,22 @@ function createRedactingWriter(original: Writable, stream: NodeJS.WritableStream
 export function installMcpCliOutputGuard(): () => void {
   const originalStdoutWrite = process.stdout.write;
   const originalStderrWrite = process.stderr.write;
-  const guardedStdoutWrite = createRedactingWriter(originalStdoutWrite, process.stdout);
-  const guardedStderrWrite = createRedactingWriter(originalStderrWrite, process.stderr);
+  const guardedStdout = createRedactingWriter(originalStdoutWrite, process.stdout);
+  const guardedStderr = createRedactingWriter(originalStderrWrite, process.stderr);
 
-  process.stdout.write = guardedStdoutWrite;
-  process.stderr.write = guardedStderrWrite;
+  process.stdout.write = guardedStdout.write;
+  process.stderr.write = guardedStderr.write;
 
   return () => {
-    if (process.stdout.write === guardedStdoutWrite) {
+    // Flush after any test temporarily replaced the public writer, but use
+    // the original bound sink so a partial line cannot remain buffered or be
+    // restored without sanitization.
+    guardedStdout.flush();
+    guardedStderr.flush();
+    if (process.stdout.write === guardedStdout.write) {
       process.stdout.write = originalStdoutWrite;
     }
-    if (process.stderr.write === guardedStderrWrite) {
+    if (process.stderr.write === guardedStderr.write) {
       process.stderr.write = originalStderrWrite;
     }
   };
@@ -99,24 +164,38 @@ export interface CapturedMcpCliOutput<T> {
 export function captureMcpCliOutput<T>(fn: () => T): CapturedMcpCliOutput<T> {
   const originalStdoutWrite = process.stdout.write;
   const originalStderrWrite = process.stderr.write;
+  const stdoutRedactor = new StreamingMcpCliRedactor();
+  const stderrRedactor = new StreamingMcpCliRedactor();
   let stdout = '';
   let stderr = '';
 
-  process.stdout.write = ((chunk: unknown) => {
-    stdout += redactMcpCliOutput(textFromChunk(chunk));
+  process.stdout.write = ((chunk: unknown, encodingOrCallback?: unknown, callback?: unknown) => {
+    stdout += stdoutRedactor.push(textFromChunk(chunk, encodingOrCallback));
+    const done = typeof encodingOrCallback === 'function'
+      ? encodingOrCallback as () => void
+      : typeof callback === 'function' ? callback as () => void : undefined;
+    done?.();
     return true;
   }) as Writable;
-  process.stderr.write = ((chunk: unknown) => {
-    stderr += redactMcpCliOutput(textFromChunk(chunk));
+  process.stderr.write = ((chunk: unknown, encodingOrCallback?: unknown, callback?: unknown) => {
+    stderr += stderrRedactor.push(textFromChunk(chunk, encodingOrCallback));
+    const done = typeof encodingOrCallback === 'function'
+      ? encodingOrCallback as () => void
+      : typeof callback === 'function' ? callback as () => void : undefined;
+    done?.();
     return true;
   }) as Writable;
 
+  let result!: T;
   try {
-    return { result: fn(), stdout, stderr };
+    result = fn();
   } finally {
+    stdout += stdoutRedactor.flush();
+    stderr += stderrRedactor.flush();
     process.stdout.write = originalStdoutWrite;
     process.stderr.write = originalStderrWrite;
   }
+  return { result, stdout, stderr };
 }
 
 export const MCP_CLI_REDACTED_TOKEN = REDACTED_TOKEN;
