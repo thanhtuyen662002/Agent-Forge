@@ -14,8 +14,8 @@ root and every context path through the shared
 lexical and bounded (4,096 characters, 128 components, and 255 characters per
 component), so it runs before `path.resolve`, policy checks, `lstat`, or
 `realpath`. Absolute, drive, UNC, extended-length, ADS/colon, traversal,
-mixed/repeated-separator, dot-component, trailing dot/space, Unicode alias,
-and reserved-device-name (`CON`, `NUL`, `COM1`, and similar) forms are rejected
+mixed/repeated-separator, interior dot-component, trailing dot/space, Unicode
+alias, and reserved-device-name (`CON`, `NUL`, `COM1`, and similar) forms are rejected
 with stable typed error codes. Case-colliding aliases are rejected on
 case-insensitive hosts. Sensitive names (`.env*`, `.git`, credentials, private
 keys, and similar names), symlinks, and Windows junction/reparse points are

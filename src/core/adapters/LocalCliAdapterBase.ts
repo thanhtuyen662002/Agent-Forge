@@ -1084,6 +1084,7 @@ export abstract class LocalCliAdapterBase implements ProviderAdapter {
       }
 
       // 4. Validate Context Files (must be strictly inside executionRoot, no path traversal)
+      const canonicalContextFiles: string[] = [];
       for (const contextFile of request.contextFiles) {
         let canonicalContextFile: string;
         try {
@@ -1104,6 +1105,7 @@ export abstract class LocalCliAdapterBase implements ProviderAdapter {
             error: `${workspaceError}${compatibilityDetail}`,
           };
         }
+        canonicalContextFiles.push(canonicalContextFile);
         const canonicalTarget = path.normalize(path.resolve(executionRoot, canonicalContextFile));
         const filePolicy = PolicyService.evaluateRealPathAccess(canonicalTarget, executionRoot, false);
         if (!filePolicy.allowed) {
@@ -1117,10 +1119,17 @@ export abstract class LocalCliAdapterBase implements ProviderAdapter {
       }
 
       // 5. Build prompt and CLI arguments
-      const prompt = this.buildPrompt(request);
-      const args = this.buildExecutionArgs(request, prompt);
-      const executionEnv = this.resolveExecutionEnvironment(request);
-      const allowedEnvKeys = this.getAllowedEnvironmentOverrideKeys(request);
+      // Use the exact validated spelling for both provider instructions and
+      // workspace preparation.  This avoids showing the provider an alias
+      // that resolves differently from the files actually copied into cwd.
+      const canonicalRequest: AgentExecutionRequest = {
+        ...request,
+        contextFiles: canonicalContextFiles,
+      };
+      const prompt = this.buildPrompt(canonicalRequest);
+      const args = this.buildExecutionArgs(canonicalRequest, prompt);
+      const executionEnv = this.resolveExecutionEnvironment(canonicalRequest);
+      const allowedEnvKeys = this.getAllowedEnvironmentOverrideKeys(canonicalRequest);
 
       // 5b. Pre-spawn cancellation check
       const control = isScheduled ? this.activeExecutions.get(executionId) : undefined;
@@ -1137,7 +1146,7 @@ export abstract class LocalCliAdapterBase implements ProviderAdapter {
       try {
         localWorkspace = localCliPrepareWorkspace(
           executionRoot,
-          request.contextFiles,
+          canonicalContextFiles,
           executionId,
           request.runtimeBinding?.workspace?.ownershipDigest ?? '',
         );
