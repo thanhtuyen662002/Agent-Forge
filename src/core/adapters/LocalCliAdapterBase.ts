@@ -17,6 +17,7 @@ import { PolicyService } from '../services/PolicyService';
 import { ProtocolParser } from '../protocol/parser';
 import {
   canonicalizePortableRelativePath,
+  canonicalizePortableRelativePathList,
   ContextPathError,
 } from '../context/ContextIntegrity';
 
@@ -1084,28 +1085,37 @@ export abstract class LocalCliAdapterBase implements ProviderAdapter {
       }
 
       // 4. Validate Context Files (must be strictly inside executionRoot, no path traversal)
-      const canonicalContextFiles: string[] = [];
-      for (const contextFile of request.contextFiles) {
-        let canonicalContextFile: string;
-        try {
-          // Keep this lexical gate ahead of path.resolve and PolicyService so
-          // ADS/alias/device forms cannot trigger a filesystem lookup first.
-          canonicalContextFile = localCliCanonicalRelative(contextFile);
-        } catch (error) {
-          const workspaceError = error instanceof LocalCliWorkspaceError
-            ? error.message
-            : 'CONTEXT_PATH_INVALID: context path could not be canonicalized safely';
-          const compatibilityDetail = error instanceof LocalCliWorkspaceError && error.code === 'CONTEXT_PATH_TRAVERSAL'
-            ? ' SECURITY_POLICY_VIOLATION: Context file violates security policy because it is outside the authorized project root.'
-            : '';
-          return {
-            executionId,
-            status: 'FAILED',
-            errorCode: 'POLICY_DENIAL',
-            error: `${workspaceError}${compatibilityDetail}`,
-          };
-        }
-        canonicalContextFiles.push(canonicalContextFile);
+      if (request.contextFiles.length > LOCAL_CLI_WORKSPACE_MAX_CONTEXT_PATHS) {
+        return {
+          executionId,
+          status: 'FAILED',
+          errorCode: 'POLICY_DENIAL',
+          error: 'CONTEXT_LIMIT_EXCEEDED: authorized context contains too many paths',
+        };
+      }
+      let canonicalContextFiles: string[];
+      try {
+        // Canonicalize the complete list before path.resolve or PolicyService
+        // can inspect even the first entry.  This also rejects case aliases
+        // before any filesystem operation on case-insensitive hosts.
+        canonicalContextFiles = canonicalizePortableRelativePathList(request.contextFiles);
+      } catch (error) {
+        const contextError = error instanceof ContextPathError
+          ? new LocalCliWorkspaceError(error.code, error.message.slice(error.code.length + 2))
+          : error instanceof LocalCliWorkspaceError
+            ? error
+            : new LocalCliWorkspaceError('CONTEXT_PATH_INVALID', 'context path could not be canonicalized safely');
+        const compatibilityDetail = contextError.code === 'CONTEXT_PATH_TRAVERSAL'
+          ? ' SECURITY_POLICY_VIOLATION: Context file violates security policy because it is outside the authorized project root.'
+          : '';
+        return {
+          executionId,
+          status: 'FAILED',
+          errorCode: 'POLICY_DENIAL',
+          error: `${contextError.message}${compatibilityDetail}`,
+        };
+      }
+      for (const canonicalContextFile of canonicalContextFiles) {
         const canonicalTarget = path.normalize(path.resolve(executionRoot, canonicalContextFile));
         const filePolicy = PolicyService.evaluateRealPathAccess(canonicalTarget, executionRoot, false);
         if (!filePolicy.allowed) {

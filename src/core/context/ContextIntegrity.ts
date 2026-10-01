@@ -202,6 +202,39 @@ export function canonicalizePortableRelativePath(rawPath: unknown): string {
 }
 
 /**
+ * Canonicalize a complete manifest path list before any filesystem policy
+ * lookup.  Exact duplicates retain the historical deduplication behavior;
+ * case-colliding spellings are rejected on case-insensitive hosts because
+ * silently choosing one would make the authorized object order-dependent.
+ */
+export function canonicalizePortableRelativePathList(contextFiles: readonly unknown[]): string[] {
+  const seen = new Set<string>();
+  const seenCaseInsensitive = new Map<string, string>();
+  const canonicalFiles: string[] = [];
+
+  for (const rawPath of contextFiles) {
+    const canonical = canonicalizePortableRelativePath(rawPath);
+    if (process.platform === 'win32' || process.platform === 'darwin') {
+      const folded = canonical.toLocaleLowerCase('en-US');
+      const prior = seenCaseInsensitive.get(folded);
+      if (prior !== undefined && prior !== canonical) {
+        throw new ContextPathError(
+          'CONTEXT_PATH_ALIAS',
+          'case-colliding context path aliases are not allowed on this filesystem',
+        );
+      }
+      seenCaseInsensitive.set(folded, canonical);
+    }
+    if (!seen.has(canonical)) {
+      seen.add(canonical);
+      canonicalFiles.push(canonical);
+    }
+  }
+
+  return canonicalFiles;
+}
+
+/**
  * Single authoritative context file path sanitizer.
  * Enforces repository-relative paths only, rejects absolute paths, directory traversal,
  * validates against PolicyService, canonicalizes separators, and sorts deterministically.
@@ -210,26 +243,20 @@ export function sanitizeContextFiles(
   contextFiles: string[] = [],
   repositoryRoot: string
 ): { validFiles: string[]; error?: string } {
-  const seen = new Set<string>();
-  // A Windows/macOS case-insensitive volume can resolve two spellings to one
-  // file.  Reject those aliases instead of silently deduplicating one of them;
-  // POSIX keeps its normal case-sensitive semantics.
-  const seenCaseInsensitive = new Map<string, string>();
-  const validFiles: string[] = [];
-
-  for (const rawPath of contextFiles) {
-    let canonicalRel: string;
-    try {
-      // This must remain the first operation involving the user-controlled
-      // path.  In particular, do not call path.resolve, lstat, or realpath
-      // before the portable lexical checks have completed.
-      canonicalRel = canonicalizePortableRelativePath(rawPath);
-    } catch (error) {
-      if (error instanceof ContextPathError) {
-        return { validFiles: [], error: error.message };
-      }
-      return { validFiles: [], error: 'CONTEXT_PATH_INVALID: context path could not be canonicalized safely' };
+  let canonicalFiles: string[];
+  try {
+    // Canonicalize the entire untrusted list before path.resolve, policy,
+    // lstat, or realpath can inspect even the first entry.
+    canonicalFiles = canonicalizePortableRelativePathList(contextFiles);
+  } catch (error) {
+    if (error instanceof ContextPathError) {
+      return { validFiles: [], error: error.message };
     }
+    return { validFiles: [], error: 'CONTEXT_PATH_INVALID: context path could not be canonicalized safely' };
+  }
+
+  const validFiles: string[] = [];
+  for (const canonicalRel of canonicalFiles) {
 
     // Ensure resolved path does not escape repository root
     const normalizedRepo = path.resolve(repositoryRoot);
@@ -250,21 +277,7 @@ export function sanitizeContextFiles(
       };
     }
 
-    if (process.platform === 'win32' || process.platform === 'darwin') {
-      const folded = canonicalRel.toLocaleLowerCase('en-US');
-      const prior = seenCaseInsensitive.get(folded);
-      if (prior !== undefined && prior !== canonicalRel) {
-        return {
-          validFiles: [],
-          error: 'CONTEXT_PATH_ALIAS: case-colliding context path aliases are not allowed on this filesystem',
-        };
-      }
-      seenCaseInsensitive.set(folded, canonicalRel);
-    }
-    if (!seen.has(canonicalRel)) {
-      seen.add(canonicalRel);
-      validFiles.push(canonicalRel);
-    }
+    validFiles.push(canonicalRel);
   }
 
   validFiles.sort(codeUnitCompare);

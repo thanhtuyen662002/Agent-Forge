@@ -4,6 +4,7 @@ import path from 'path';
 import { describe, expect, it, vi } from 'vitest';
 import {
   canonicalizePortableRelativePath,
+  canonicalizePortableRelativePathList,
   ContextPathError,
   PORTABLE_CONTEXT_PATH_MAX_COMPONENTS,
   PORTABLE_CONTEXT_PATH_MAX_LENGTH,
@@ -84,6 +85,13 @@ describe('portable context path canonicalization', () => {
     }) as typeof fs.lstatSync);
     try {
       expectRejected('src/file.ts:secret', 'CONTEXT_PATH_INVALID');
+      expect(() => canonicalizePortableRelativePathList(['src/file.ts:secret', 'src/other.ts']))
+        .toThrowError(/CONTEXT_PATH_INVALID/);
+      const sanitizeResult = sanitizeContextFiles(
+        ['src/file.ts:secret', 'src/other.ts'],
+        path.join(os.tmpdir(), 'agent-forge-nonexistent-context-root'),
+      );
+      expect(sanitizeResult.error).toContain('CONTEXT_PATH_INVALID');
       expect(calls).toBe(0);
     } finally {
       lstatSpy.mockRestore();
