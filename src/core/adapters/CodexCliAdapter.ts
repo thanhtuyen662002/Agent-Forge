@@ -44,13 +44,10 @@ export class CodexCliAdapter extends LocalCliAdapterBase {
 
   public override async getHealth(): Promise<ProviderHealthStatus> {
     try {
-      const res = await ProcessRunner.execute({
-        executable: this.executable,
-        args: ['--version'],
-        cwd: process.cwd(),
-        timeoutMs: 5000,
-        allowShell: false,
-      });
+      const res = await this.executeHealthProbe(
+        this.resolveExecutionEnvironment(),
+        this.getAllowedEnvironmentOverrideKeys(),
+      );
 
       if (res.cancelled) {
         return 'UNHEALTHY';

@@ -822,7 +822,7 @@ describe('R5F0D1 — Production Gemini CLI Adapter Contract Suite', () => {
       }
     });
 
-    it('12. Working directory matches target project repository directory', async () => {
+    it('12. Working directory is an isolated provider workspace', async () => {
       const adapter = new GeminiCliAdapter({
         executable: fakeGeminiExecutable,
         repo,
@@ -834,7 +834,8 @@ describe('R5F0D1 — Production Gemini CLI Adapter Contract Suite', () => {
 
       const logs = getLogs();
       expect(logs.length).toBe(1);
-      expect(path.resolve(logs[0].cwd)).toBe(path.resolve(projectRepoDir));
+      expect(path.resolve(logs[0].cwd)).not.toBe(path.resolve(projectRepoDir));
+      expect(path.resolve(logs[0].cwd)).toMatch(/agent-forge-local-cli-workspaces/i);
     });
   });
 

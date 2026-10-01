@@ -1,6 +1,7 @@
 import fs from 'fs';
 import path from 'path';
 import crypto from 'crypto';
+import os from 'os';
 import {
   ProviderAdapter,
   QuotaSnapshotInfo,
@@ -14,6 +15,741 @@ import { ArtifactStore } from '../services/ArtifactStore';
 import { ProcessRunner, ProcessRunResult } from '../services/ProcessRunner';
 import { PolicyService } from '../services/PolicyService';
 import { ProtocolParser } from '../protocol/parser';
+
+const LOCAL_CLI_WORKSPACE_VERSION = 1;
+const LOCAL_CLI_WORKSPACE_BASE = path.join(os.tmpdir(), 'agent-forge-local-cli-workspaces');
+const LOCAL_CLI_WORKSPACE_MARKER_SUFFIX = '.workspace.json';
+const LOCAL_CLI_WORKSPACE_STALE_AFTER_MS = 6 * 60 * 60 * 1000;
+const LOCAL_CLI_WORKSPACE_MAX_FILES = 256;
+const LOCAL_CLI_WORKSPACE_MAX_BYTES = 16 * 1024 * 1024;
+const LOCAL_CLI_FILE_MAX_BYTES = 4 * 1024 * 1024;
+// Directory context is provider-controlled input. Bound both the number of
+// directory entries inspected and the nesting depth before materializing any
+// workspace files so a hostile tree cannot exhaust memory or recursion depth.
+const LOCAL_CLI_WORKSPACE_MAX_TRAVERSAL_ENTRIES = 512;
+const LOCAL_CLI_WORKSPACE_MAX_TRAVERSAL_DEPTH = 128;
+const LOCAL_CLI_WORKSPACE_MAX_CONTEXT_PATHS = 128;
+
+interface LocalCliFileIdentity {
+  readonly key: string;
+  readonly realPath: string;
+}
+
+interface LocalCliWorkspaceEntry {
+  readonly relativePath: string;
+  readonly sourcePath: string;
+  readonly sourceIdentity: LocalCliFileIdentity;
+  readonly sourceMode: number;
+  readonly sourceHash: string;
+  readonly byteSize: number;
+}
+
+interface LocalCliWorkspaceLease {
+  readonly executionId: string;
+  readonly ownerToken: string;
+  readonly ownershipDigest: string;
+  readonly sourceRoot: string;
+  readonly workspaceRoot: string;
+  readonly workspaceIdentity: LocalCliFileIdentity;
+  readonly markerPath: string;
+  readonly entries: ReadonlyArray<LocalCliWorkspaceEntry>;
+}
+
+interface LocalCliWorkspaceMarker {
+  version: number;
+  executionId: string;
+  ownerToken: string;
+  workspaceName: string;
+  workspaceIdentityKey?: string;
+  workspaceIdentityRealPath?: string;
+  ownershipDigest: string;
+  createdAt: string;
+  state: 'ACTIVE' | 'CLEANING' | 'CLEANUP_FAILED';
+}
+
+export interface LocalCliWorkspaceRecoveryResult {
+  recovered: string[];
+  skipped: string[];
+  failed: string[];
+}
+
+export class LocalCliWorkspaceError extends Error {
+  public readonly code: string;
+
+  public constructor(code: string, message: string) {
+    super(`${code}: ${message}`);
+    this.name = 'LocalCliWorkspaceError';
+    this.code = code;
+  }
+}
+
+const activeLocalCliWorkspaces = new Set<string>();
+const recoveringLocalCliMarkers = new Set<string>();
+
+function localCliErrno(error: unknown): string | undefined {
+  return error && typeof error === 'object' && 'code' in error && typeof (error as { code?: unknown }).code === 'string'
+    ? String((error as { code: string }).code)
+    : undefined;
+}
+
+function localCliIsMissing(error: unknown): boolean {
+  return localCliErrno(error) === 'ENOENT';
+}
+
+function localCliRealpath(targetPath: string): string {
+  // `realpathSync.native` can mix long and 8.3 spellings on Windows when a
+  // newly-created descendant is resolved through a short parent.  The
+  // portable resolver gives us one stable spelling for containment checks.
+  return fs.realpathSync(targetPath);
+}
+
+function localCliIdentityKey(stat: fs.Stats): string {
+  const device = process.platform === 'win32' ? 'win32' : String(stat.dev);
+  return `${device}:${String(stat.ino)}:${String(stat.mode & 0o170000)}`;
+}
+
+function localCliSameIdentity(left: LocalCliFileIdentity, right: LocalCliFileIdentity): boolean {
+  const normalize = (value: string) => process.platform === 'win32' ? value.toLowerCase() : value;
+  return left.key === right.key && normalize(left.realPath) === normalize(right.realPath);
+}
+
+function localCliCaptureIdentity(targetPath: string): LocalCliFileIdentity {
+  const stat = fs.lstatSync(targetPath);
+  return {
+    key: localCliIdentityKey(stat),
+    realPath: localCliRealpath(targetPath),
+  };
+}
+
+function localCliValidWorkspaceName(workspaceName: string): boolean {
+  return workspaceName.length > 0
+    && workspaceName !== '.'
+    && workspaceName !== '..'
+    && path.basename(workspaceName) === workspaceName
+    && !workspaceName.includes('/')
+    && !workspaceName.includes('\\')
+    && /^[a-zA-Z0-9_-]+$/.test(workspaceName);
+}
+
+function localCliContained(targetPath: string, rootPath: string, allowRoot = true): boolean {
+  const normalize = (value: string) => process.platform === 'win32' ? value.toLowerCase() : value;
+  const relative = path.relative(normalize(rootPath), normalize(targetPath));
+  return (allowRoot && relative === '') || (
+    relative !== '' &&
+    relative !== '..' &&
+    !relative.startsWith(`..${path.sep}`) &&
+    !relative.startsWith('../') &&
+    !relative.startsWith('..\\') &&
+    !path.isAbsolute(relative)
+  );
+}
+
+function localCliCanonicalRelative(rawPath: string): string {
+  const slash = rawPath.trim().replace(/\\/g, '/');
+  if (!slash || path.posix.isAbsolute(slash) || path.win32.isAbsolute(rawPath) || /^[a-zA-Z]:/.test(rawPath)) {
+    throw new LocalCliWorkspaceError('CONTEXT_PATH_INVALID', 'context paths must be non-empty repository-relative paths');
+  }
+  if (process.platform === 'win32' && slash.split('/').some((segment) => segment.includes(':'))) {
+    throw new LocalCliWorkspaceError('CONTEXT_PATH_INVALID', 'Windows alternate data stream paths are not allowed');
+  }
+  const normalized = path.posix.normalize(slash.replace(/^\.\//, ''));
+  if (normalized === '.' || normalized === '..' || normalized.startsWith('../') || normalized.includes('/../')) {
+    throw new LocalCliWorkspaceError('CONTEXT_PATH_INVALID', `context path is not safely relative: ${rawPath}`);
+  }
+  return normalized;
+}
+
+function localCliPolicyOrThrow(targetPath: string, rootPath: string, relativePath: string, isWrite: boolean): void {
+  let policyRoot = rootPath;
+  try {
+    policyRoot = localCliRealpath(rootPath);
+  } catch {
+    // A missing root is still covered by the lexical policy.
+  }
+  let policyTarget = path.resolve(policyRoot, relativePath);
+  try {
+    policyTarget = localCliRealpath(targetPath);
+  } catch {
+    // Missing final paths remain covered by the lexical policy.
+  }
+  const decision = PolicyService.evaluateRealPathAccess(policyTarget, policyRoot, isWrite);
+  if (!decision.allowed) {
+    throw new LocalCliWorkspaceError('CONTEXT_PATH_DENIED', `policy denied ${relativePath}`);
+  }
+}
+
+function localCliReadStableFile(filePath: string, rootPath: string): { buffer: Buffer; identity: LocalCliFileIdentity; mode: number } {
+  const relative = path.relative(rootPath, filePath).replace(/\\/g, '/');
+  localCliPolicyOrThrow(filePath, rootPath, relative, false);
+  let stat: fs.Stats;
+  try {
+    stat = fs.lstatSync(filePath);
+  } catch {
+    throw new LocalCliWorkspaceError('CONTEXT_PATH_INVALID', `context file disappeared: ${relative}`);
+  }
+  if (!stat.isFile() || stat.isSymbolicLink()) {
+    throw new LocalCliWorkspaceError('CONTEXT_REPARSE_POINT', `context file is not a regular file: ${relative}`);
+  }
+  const realPath = localCliRealpath(filePath);
+  if (!localCliContained(realPath, rootPath)) {
+    throw new LocalCliWorkspaceError('CONTEXT_REPARSE_POINT', `context file escaped the authorized root: ${relative}`);
+  }
+  const identity = { key: localCliIdentityKey(stat), realPath };
+  const noFollow = typeof fs.constants.O_NOFOLLOW === 'number' ? fs.constants.O_NOFOLLOW : 0;
+  if (process.platform !== 'win32' && noFollow === 0) {
+    throw new LocalCliWorkspaceError('WORKSPACE_BOUNDARY_UNAVAILABLE', 'platform cannot guarantee no-follow context reads');
+  }
+  let descriptor: number | undefined;
+  try {
+    descriptor = fs.openSync(filePath, fs.constants.O_RDONLY | noFollow);
+    const opened = fs.fstatSync(descriptor);
+    if (localCliIdentityKey(opened) !== identity.key || opened.size > LOCAL_CLI_FILE_MAX_BYTES) {
+      throw new LocalCliWorkspaceError('CONTEXT_FILE_CHANGED', `context file changed or exceeds the bounded read limit: ${relative}`);
+    }
+    const chunks: Buffer[] = [];
+    let total = 0;
+    while (true) {
+      const chunk = Buffer.allocUnsafe(Math.min(64 * 1024, LOCAL_CLI_FILE_MAX_BYTES - total + 1));
+      const read = fs.readSync(descriptor, chunk, 0, chunk.length, null);
+      if (read === 0) break;
+      total += read;
+      if (total > LOCAL_CLI_FILE_MAX_BYTES) {
+        throw new LocalCliWorkspaceError('CONTEXT_LIMIT_EXCEEDED', `context file exceeds ${LOCAL_CLI_FILE_MAX_BYTES} bytes: ${relative}`);
+      }
+      chunks.push(chunk.subarray(0, read));
+    }
+    const after = fs.fstatSync(descriptor);
+    if (localCliIdentityKey(after) !== identity.key || after.size !== opened.size) {
+      throw new LocalCliWorkspaceError('CONTEXT_FILE_CHANGED', `context file changed while being copied: ${relative}`);
+    }
+    return { buffer: Buffer.concat(chunks, total), identity, mode: stat.mode };
+  } finally {
+    if (descriptor !== undefined) {
+      try { fs.closeSync(descriptor); } catch { /* preserve the primary failure */ }
+    }
+  }
+}
+
+function localCliEnsureWorkspaceParent(parentPath: string, workspaceRoot: string): void {
+  const relative = path.relative(workspaceRoot, parentPath);
+  if (!relative || relative === '.') return;
+  let current = workspaceRoot;
+  for (const segment of relative.split(path.sep).filter(Boolean)) {
+    const next = path.join(current, segment);
+    try {
+      const stat = fs.lstatSync(next);
+      if (!stat.isDirectory() || stat.isSymbolicLink()) throw new LocalCliWorkspaceError('WORKSPACE_REPARSE_POINT', `workspace parent is not a real directory: ${segment}`);
+    } catch (error) {
+      if (!localCliIsMissing(error)) throw error;
+      fs.mkdirSync(next);
+      const created = fs.lstatSync(next);
+      if (!created.isDirectory() || created.isSymbolicLink()) throw new LocalCliWorkspaceError('WORKSPACE_REPARSE_POINT', `workspace parent creation was unsafe: ${segment}`);
+    }
+    current = next;
+  }
+}
+
+function localCliAtomicWrite(
+  filePath: string,
+  content: Buffer,
+  rootPath: string,
+  mode?: number,
+  expectedIdentity?: LocalCliFileIdentity,
+): void {
+  const relative = path.relative(rootPath, filePath).replace(/\\/g, '/');
+  localCliPolicyOrThrow(filePath, rootPath, relative, true);
+  const parent = path.dirname(filePath);
+  localCliEnsureWorkspaceParent(parent, rootPath);
+  const parentIdentity = localCliCaptureIdentity(parent);
+  const tempPath = path.join(parent, `.agent-forge-write-${crypto.randomUUID()}.tmp`);
+  let descriptor: number | undefined;
+  let complete = false;
+  try {
+    descriptor = fs.openSync(tempPath, fs.constants.O_WRONLY | fs.constants.O_CREAT | fs.constants.O_EXCL, 0o600);
+    let offset = 0;
+    while (offset < content.length) {
+      const written = fs.writeSync(descriptor, content, offset, content.length - offset);
+      if (written <= 0) throw new LocalCliWorkspaceError('WORKSPACE_WRITE_FAILED', `no progress while writing ${relative}`);
+      offset += written;
+    }
+    fs.fsyncSync(descriptor);
+    if (mode !== undefined) fs.fchmodSync(descriptor, mode & 0o7777);
+    complete = true;
+  } finally {
+    if (descriptor !== undefined) {
+      try { fs.closeSync(descriptor); } catch { /* preserve primary failure */ }
+    }
+    if (!complete) {
+      try { fs.unlinkSync(tempPath); } catch (error) { if (!localCliIsMissing(error)) { /* preserve primary failure */ } }
+    }
+  }
+  try {
+    const currentParent = localCliCaptureIdentity(parent);
+    if (!localCliSameIdentity(parentIdentity, currentParent)) {
+      throw new LocalCliWorkspaceError('WORKSPACE_PARENT_CHANGED', `parent directory changed during atomic write: ${relative}`);
+    }
+    let targetExists = true;
+    let currentTarget: LocalCliFileIdentity | undefined;
+    try {
+      currentTarget = localCliCaptureIdentity(filePath);
+    } catch (error) {
+      if (!localCliIsMissing(error)) throw error;
+      targetExists = false;
+    }
+    if (expectedIdentity) {
+      if (!targetExists || !currentTarget || !localCliSameIdentity(expectedIdentity, currentTarget)) {
+        throw new LocalCliWorkspaceError('WORKSPACE_TARGET_CHANGED', `target changed during atomic write: ${relative}`);
+      }
+    } else if (targetExists) {
+      throw new LocalCliWorkspaceError('WORKSPACE_TARGET_EXISTS', `unexpected target already exists: ${relative}`);
+    }
+    fs.renameSync(tempPath, filePath);
+  } catch (error) {
+    try { fs.unlinkSync(tempPath); } catch (cleanupError) { if (!localCliIsMissing(cleanupError)) { /* preserve rename failure */ } }
+    if (error instanceof LocalCliWorkspaceError) throw error;
+    throw new LocalCliWorkspaceError('WORKSPACE_ATOMIC_RENAME_FAILED', `atomic replacement failed for ${relative}`);
+  }
+}
+
+function localCliMarkerPath(basePath: string, workspaceName: string): string {
+  return path.join(basePath, `${workspaceName}${LOCAL_CLI_WORKSPACE_MARKER_SUFFIX}`);
+}
+
+function localCliWriteMarker(markerPath: string, marker: LocalCliWorkspaceMarker): void {
+  const parent = path.dirname(markerPath);
+  const tempPath = path.join(parent, `.agent-forge-marker-${crypto.randomUUID()}.tmp`);
+  const content = Buffer.from(JSON.stringify(marker), 'utf8');
+  let descriptor: number | undefined;
+  let complete = false;
+  try {
+    descriptor = fs.openSync(tempPath, fs.constants.O_WRONLY | fs.constants.O_CREAT | fs.constants.O_EXCL, 0o600);
+    let offset = 0;
+    while (offset < content.length) {
+      const written = fs.writeSync(descriptor, content, offset, content.length - offset);
+      if (written <= 0) throw new LocalCliWorkspaceError('WORKSPACE_MARKER_WRITE_FAILED', 'marker write made no progress');
+      offset += written;
+    }
+    fs.fsyncSync(descriptor);
+    complete = true;
+  } finally {
+    if (descriptor !== undefined) {
+      try { fs.closeSync(descriptor); } catch { /* preserve the primary failure */ }
+    }
+    if (!complete) {
+      try { fs.unlinkSync(tempPath); } catch (error) { if (!localCliIsMissing(error)) { /* preserve primary failure */ } }
+    }
+  }
+  try {
+    fs.renameSync(tempPath, markerPath);
+  } catch (error) {
+    try { fs.unlinkSync(tempPath); } catch (cleanupError) { if (!localCliIsMissing(cleanupError)) { /* preserve rename failure */ } }
+    throw error;
+  }
+}
+
+function localCliReadMarker(markerPath: string): LocalCliWorkspaceMarker | null {
+  try {
+    const stat = fs.lstatSync(markerPath);
+    if (!stat.isFile() || stat.isSymbolicLink()) return null;
+    const parsed = JSON.parse(fs.readFileSync(markerPath, 'utf8')) as Partial<LocalCliWorkspaceMarker>;
+    if (
+      parsed.version !== LOCAL_CLI_WORKSPACE_VERSION ||
+      typeof parsed.executionId !== 'string' ||
+      typeof parsed.ownerToken !== 'string' ||
+      typeof parsed.workspaceName !== 'string' ||
+      ((parsed.workspaceIdentityKey !== undefined || parsed.workspaceIdentityRealPath !== undefined) &&
+        (typeof parsed.workspaceIdentityKey !== 'string' ||
+          parsed.workspaceIdentityKey.length === 0 ||
+          typeof parsed.workspaceIdentityRealPath !== 'string' ||
+          parsed.workspaceIdentityRealPath.length === 0)) ||
+      typeof parsed.ownershipDigest !== 'string' ||
+      typeof parsed.createdAt !== 'string' ||
+      !['ACTIVE', 'CLEANING', 'CLEANUP_FAILED'].includes(String(parsed.state)) ||
+      !localCliValidWorkspaceName(parsed.workspaceName)
+    ) return null;
+    return parsed as LocalCliWorkspaceMarker;
+  } catch {
+    return null;
+  }
+}
+
+function localCliEnsureBase(basePath: string): void {
+  fs.mkdirSync(basePath, { recursive: true, mode: 0o700 });
+  const stat = fs.lstatSync(basePath);
+  if (!stat.isDirectory() || stat.isSymbolicLink()) throw new LocalCliWorkspaceError('WORKSPACE_BOUNDARY_INVALID', 'workspace base is not a real directory');
+  if (process.platform !== 'win32') {
+    try { fs.chmodSync(basePath, 0o700); } catch {
+      throw new LocalCliWorkspaceError('WORKSPACE_BOUNDARY_INVALID', 'workspace base permissions could not be restricted');
+    }
+    const restricted = fs.lstatSync(basePath);
+    if ((restricted.mode & 0o077) !== 0 || (typeof process.getuid === 'function' && restricted.uid !== process.getuid())) {
+      throw new LocalCliWorkspaceError('WORKSPACE_BOUNDARY_INVALID', 'workspace base is not private to the Agent Forge user');
+    }
+  }
+}
+
+export function recoverOrphanedLocalCliWorkspaces(
+  basePath: string = LOCAL_CLI_WORKSPACE_BASE,
+  now: number = Date.now(),
+  staleAfterMs: number = LOCAL_CLI_WORKSPACE_STALE_AFTER_MS,
+): LocalCliWorkspaceRecoveryResult {
+  const result: LocalCliWorkspaceRecoveryResult = { recovered: [], skipped: [], failed: [] };
+  try { localCliEnsureBase(basePath); } catch { return result; }
+  for (const markerName of fs.readdirSync(basePath).filter((name) => name.endsWith(LOCAL_CLI_WORKSPACE_MARKER_SUFFIX))) {
+    if (recoveringLocalCliMarkers.has(markerName)) {
+      result.skipped.push(markerName);
+      continue;
+    }
+    recoveringLocalCliMarkers.add(markerName);
+    try {
+    const markerPath = path.join(basePath, markerName);
+    const marker = localCliReadMarker(markerPath);
+    if (!marker || activeLocalCliWorkspaces.has(marker.executionId)) {
+      result.skipped.push(markerName);
+      continue;
+    }
+    // Bind the marker filename to the workspace named by its contents before
+    // resolving any cleanup target. A forged marker must never redirect
+    // recovery to a different live workspace.
+    if (markerName !== path.basename(localCliMarkerPath(basePath, marker.workspaceName))) {
+      result.skipped.push(markerName);
+      continue;
+    }
+    const age = now - Date.parse(marker.createdAt);
+    if (!Number.isFinite(age) || age < staleAfterMs) {
+      result.skipped.push(markerName);
+      continue;
+    }
+    const workspacePath = path.join(basePath, marker.workspaceName);
+    try {
+      // Markers written before identity fencing was introduced are retained
+      // for manual recovery rather than being allowed to delete blindly.
+      if (!marker.workspaceIdentityKey || !marker.workspaceIdentityRealPath) {
+        result.skipped.push(markerName);
+        continue;
+      }
+      const workspaceStat = fs.lstatSync(workspacePath);
+      if (!workspaceStat.isDirectory() || workspaceStat.isSymbolicLink()) throw new Error('workspace is not a real directory');
+      const currentIdentity = localCliCaptureIdentity(workspacePath);
+      if (!localCliSameIdentity(
+        { key: marker.workspaceIdentityKey, realPath: marker.workspaceIdentityRealPath },
+        currentIdentity,
+      )) {
+        result.skipped.push(markerName);
+        continue;
+      }
+      fs.rmSync(workspacePath, { recursive: true, force: true });
+      fs.unlinkSync(markerPath);
+      result.recovered.push(marker.workspaceName);
+    } catch (error) {
+      // Another recovery process may have completed the same cleanup between
+      // the identity check and unlink. Treat that idempotent outcome as
+      // success instead of recreating a misleading failure marker.
+      if (localCliIsMissing(error)) {
+        result.recovered.push(marker.workspaceName);
+        continue;
+      }
+      try { localCliWriteMarker(markerPath, { ...marker, state: 'CLEANUP_FAILED' }); } catch { /* preserve the recovery failure */ }
+      result.failed.push(marker.workspaceName);
+    }
+    } finally {
+      recoveringLocalCliMarkers.delete(markerName);
+    }
+  }
+  return result;
+}
+
+function localCliCleanupWorkspace(lease: LocalCliWorkspaceLease): void {
+  try {
+    const marker = localCliReadMarker(lease.markerPath);
+    if (!marker || marker.executionId !== lease.executionId || marker.ownerToken !== lease.ownerToken || marker.ownershipDigest !== lease.ownershipDigest || marker.workspaceName !== path.basename(lease.workspaceRoot)) {
+      throw new LocalCliWorkspaceError('WORKSPACE_OWNERSHIP_MISMATCH', 'workspace cleanup marker did not match the active owner');
+    }
+    localCliWriteMarker(lease.markerPath, { ...marker, state: 'CLEANING' });
+    const currentIdentity = localCliCaptureIdentity(lease.workspaceRoot);
+    const stat = fs.lstatSync(lease.workspaceRoot);
+    if (!stat.isDirectory() || stat.isSymbolicLink() || !localCliSameIdentity(lease.workspaceIdentity, currentIdentity)) throw new LocalCliWorkspaceError('WORKSPACE_REPARSE_POINT', 'workspace changed or became a reparse point before cleanup');
+    fs.rmSync(lease.workspaceRoot, { recursive: true, force: true });
+    fs.unlinkSync(lease.markerPath);
+  } catch (error) {
+    try {
+      const marker = localCliReadMarker(lease.markerPath);
+      if (marker) localCliWriteMarker(lease.markerPath, { ...marker, state: 'CLEANUP_FAILED' });
+    } catch { /* the marker itself may be unavailable; preserve primary failure */ }
+    throw error instanceof LocalCliWorkspaceError
+      ? error
+      : new LocalCliWorkspaceError('WORKSPACE_CLEANUP_FAILED', 'workspace cleanup failed');
+  } finally {
+    activeLocalCliWorkspaces.delete(lease.executionId);
+  }
+}
+
+function localCliCollectContextFiles(sourceRoot: string, contextFiles: string[]): LocalCliWorkspaceEntry[] {
+  if (contextFiles.length > LOCAL_CLI_WORKSPACE_MAX_CONTEXT_PATHS) {
+    throw new LocalCliWorkspaceError('CONTEXT_LIMIT_EXCEEDED', 'authorized context contains too many paths');
+  }
+  const realRoot = localCliRealpath(sourceRoot);
+  const discovered = new Map<string, LocalCliWorkspaceEntry>();
+  let discoveredBytes = 0;
+  let traversalEntries = 0;
+  const add = (absolutePath: string, explicit: boolean, depth: number): void => {
+    if (depth > LOCAL_CLI_WORKSPACE_MAX_TRAVERSAL_DEPTH) {
+      throw new LocalCliWorkspaceError('CONTEXT_LIMIT_EXCEEDED', 'authorized context exceeds the directory nesting limit');
+    }
+    const relative = path.relative(sourceRoot, absolutePath).replace(/\\/g, '/');
+    if (!relative || relative.startsWith('../') || path.isAbsolute(relative)) throw new LocalCliWorkspaceError('CONTEXT_PATH_INVALID', 'context escaped the source root');
+    let stat: fs.Stats;
+    try { stat = fs.lstatSync(absolutePath); } catch (error) { if (localCliIsMissing(error)) return; throw error; }
+    if (stat.isSymbolicLink()) throw new LocalCliWorkspaceError('CONTEXT_REPARSE_POINT', `symbolic link context is forbidden: ${relative}`);
+    try { localCliPolicyOrThrow(absolutePath, realRoot, relative, false); } catch (error) {
+      if (!explicit && error instanceof LocalCliWorkspaceError && error.code === 'CONTEXT_PATH_DENIED') return;
+      throw error;
+    }
+    const resolved = localCliRealpath(absolutePath);
+    if (!localCliContained(resolved, realRoot)) throw new LocalCliWorkspaceError('CONTEXT_REPARSE_POINT', `context escaped the source root: ${relative}`);
+    if (stat.isDirectory()) {
+      const children: string[] = [];
+      const directory = fs.opendirSync(absolutePath);
+      try {
+        while (true) {
+          const entry = directory.readSync();
+          if (entry === null) break;
+          traversalEntries += 1;
+          if (traversalEntries > LOCAL_CLI_WORKSPACE_MAX_TRAVERSAL_ENTRIES) {
+            throw new LocalCliWorkspaceError('CONTEXT_LIMIT_EXCEEDED', 'authorized context exceeds the directory entry limit');
+          }
+          children.push(entry.name);
+        }
+      } finally {
+        directory.closeSync();
+      }
+      for (const child of children.sort()) add(path.join(absolutePath, child), false, depth + 1);
+      return;
+    }
+    if (!stat.isFile()) return;
+    const file = localCliReadStableFile(absolutePath, realRoot);
+    const key = process.platform === 'win32' ? relative.toLowerCase() : relative;
+    if (!discovered.has(key)) {
+      if (
+        discovered.size >= LOCAL_CLI_WORKSPACE_MAX_FILES ||
+        discoveredBytes + file.buffer.byteLength > LOCAL_CLI_WORKSPACE_MAX_BYTES
+      ) {
+        throw new LocalCliWorkspaceError('CONTEXT_LIMIT_EXCEEDED', 'authorized context exceeds the bounded workspace limit');
+      }
+      discoveredBytes += file.buffer.byteLength;
+      discovered.set(key, {
+        relativePath: relative,
+        sourcePath: absolutePath,
+        sourceIdentity: file.identity,
+        sourceMode: file.mode,
+        sourceHash: crypto.createHash('sha256').update(file.buffer).digest('hex'),
+        byteSize: file.buffer.byteLength,
+      });
+    }
+  };
+
+  for (const rawPath of contextFiles) {
+    const relative = localCliCanonicalRelative(rawPath);
+    const absolute = path.resolve(sourceRoot, relative);
+    if (!localCliContained(absolute, sourceRoot)) throw new LocalCliWorkspaceError('CONTEXT_PATH_INVALID', `context escaped the source root: ${relative}`);
+    localCliPolicyOrThrow(absolute, realRoot, relative, false);
+    try { fs.lstatSync(absolute); } catch (error) { if (localCliIsMissing(error)) continue; throw error; }
+    add(absolute, true, relative.split('/').filter(Boolean).length);
+  }
+  return [...discovered.values()].sort((left, right) => left.relativePath.localeCompare(right.relativePath));
+}
+
+function localCliPrepareWorkspace(
+  sourceRoot: string,
+  contextFiles: string[],
+  executionId: string,
+  ownershipDigest: string,
+): LocalCliWorkspaceLease {
+  const absoluteSourceRoot = path.resolve(sourceRoot);
+  const sourceStat = fs.lstatSync(absoluteSourceRoot);
+  if (!sourceStat.isDirectory() || sourceStat.isSymbolicLink()) throw new LocalCliWorkspaceError('WORKSPACE_BOUNDARY_INVALID', 'source root is not a real directory');
+  const sourceRealRoot = localCliRealpath(absoluteSourceRoot);
+  localCliPolicyOrThrow(sourceRealRoot, sourceRealRoot, '.', false);
+  const entries = localCliCollectContextFiles(sourceRealRoot, contextFiles);
+  const totalBytes = entries.reduce((sum, entry) => sum + entry.byteSize, 0);
+  if (totalBytes > LOCAL_CLI_WORKSPACE_MAX_BYTES) throw new LocalCliWorkspaceError('CONTEXT_LIMIT_EXCEEDED', `authorized context exceeds ${LOCAL_CLI_WORKSPACE_MAX_BYTES} bytes`);
+  localCliEnsureBase(LOCAL_CLI_WORKSPACE_BASE);
+  recoverOrphanedLocalCliWorkspaces();
+  const ownerToken = crypto.randomUUID();
+  const safeExecutionId = executionId.replace(/[^a-zA-Z0-9_-]/g, '_');
+  const workspaceName = `${safeExecutionId}-${crypto.randomUUID()}`;
+  const workspaceRoot = path.join(LOCAL_CLI_WORKSPACE_BASE, workspaceName);
+  const markerPath = localCliMarkerPath(LOCAL_CLI_WORKSPACE_BASE, workspaceName);
+  let workspaceIdentity: LocalCliFileIdentity | undefined;
+  try {
+    fs.mkdirSync(workspaceRoot, { recursive: false, mode: 0o700 });
+    workspaceIdentity = localCliCaptureIdentity(workspaceRoot);
+    const marker: LocalCliWorkspaceMarker = {
+      version: LOCAL_CLI_WORKSPACE_VERSION,
+      executionId,
+      ownerToken,
+      workspaceName,
+      workspaceIdentityKey: workspaceIdentity.key,
+      workspaceIdentityRealPath: workspaceIdentity.realPath,
+      ownershipDigest,
+      createdAt: new Date().toISOString(),
+      state: 'ACTIVE',
+    };
+    localCliWriteMarker(markerPath, marker);
+    activeLocalCliWorkspaces.add(executionId);
+    let copiedBytes = 0;
+    for (const entry of entries) {
+      const source = localCliReadStableFile(entry.sourcePath, sourceRealRoot);
+      copiedBytes += source.buffer.byteLength;
+      if (copiedBytes > LOCAL_CLI_WORKSPACE_MAX_BYTES) {
+        throw new LocalCliWorkspaceError('CONTEXT_LIMIT_EXCEEDED', `authorized context exceeds ${LOCAL_CLI_WORKSPACE_MAX_BYTES} bytes while being copied`);
+      }
+      const target = path.join(workspaceRoot, entry.relativePath);
+      localCliEnsureWorkspaceParent(path.dirname(target), workspaceRoot);
+      localCliAtomicWrite(target, source.buffer, workspaceRoot, entry.sourceMode);
+    }
+    return { executionId, ownerToken, ownershipDigest, sourceRoot: sourceRealRoot, workspaceRoot, workspaceIdentity, markerPath, entries };
+  } catch (error) {
+    activeLocalCliWorkspaces.delete(executionId);
+    let cleanupFailed = false;
+    if (workspaceIdentity) {
+      try {
+        const currentIdentity = localCliCaptureIdentity(workspaceRoot);
+        if (!localCliSameIdentity(workspaceIdentity, currentIdentity)) {
+          throw new LocalCliWorkspaceError('WORKSPACE_REPARSE_POINT', 'workspace changed during preparation cleanup');
+        }
+        fs.rmSync(workspaceRoot, { recursive: true, force: true });
+      } catch {
+        cleanupFailed = true;
+      }
+    } else {
+      // If identity capture itself failed, do not remove by path alone. Keep
+      // a cleanup-failed marker so recovery can be reviewed manually without
+      // risking deletion of a replacement directory.
+      cleanupFailed = true;
+    }
+    if (!cleanupFailed) {
+      try {
+        fs.unlinkSync(markerPath);
+      } catch (cleanupError) {
+        if (!localCliIsMissing(cleanupError)) cleanupFailed = true;
+      }
+    }
+    if (cleanupFailed) {
+      try {
+        const marker = localCliReadMarker(markerPath);
+        if (marker) {
+          localCliWriteMarker(markerPath, { ...marker, state: 'CLEANUP_FAILED' });
+        } else if (fs.existsSync(workspaceRoot)) {
+          localCliWriteMarker(markerPath, {
+            version: LOCAL_CLI_WORKSPACE_VERSION,
+            executionId,
+            ownerToken,
+            workspaceName,
+            workspaceIdentityKey: workspaceIdentity?.key,
+            workspaceIdentityRealPath: workspaceIdentity?.realPath,
+            ownershipDigest,
+            createdAt: new Date().toISOString(),
+            state: 'CLEANUP_FAILED',
+          });
+        }
+      } catch { /* preserve the original preparation failure */ }
+    }
+    throw error instanceof LocalCliWorkspaceError ? error : new LocalCliWorkspaceError('WORKSPACE_PREPARE_FAILED', 'could not prepare isolated workspace');
+  }
+}
+
+function localCliSynchronizeWorkspace(lease: LocalCliWorkspaceLease): void {
+  const pending: Array<{
+    entry: LocalCliWorkspaceEntry;
+    sourceBuffer: Buffer;
+    sourceHash: string;
+    sourceMode: number;
+    workspaceBuffer: Buffer;
+    workspaceHash: string;
+  }> = [];
+
+  // Preflight every authorized source and workspace entry before writing any
+  // source file. A later conflict must not leave an earlier entry partially
+  // synchronized when the overall execution is rejected.
+  for (const entry of lease.entries) {
+    const sourceRoot = localCliRealpath(lease.sourceRoot);
+    const current = localCliReadStableFile(entry.sourcePath, sourceRoot);
+    if (!localCliSameIdentity(entry.sourceIdentity, current.identity) || crypto.createHash('sha256').update(current.buffer).digest('hex') !== entry.sourceHash) {
+      throw new LocalCliWorkspaceError('WORKSPACE_SYNC_CONFLICT', `authorized source changed during execution: ${entry.relativePath}`);
+    }
+    const workspacePath = path.join(lease.workspaceRoot, entry.relativePath);
+    const workspace = localCliReadStableFile(workspacePath, lease.workspaceRoot);
+    const workspaceHash = crypto.createHash('sha256').update(workspace.buffer).digest('hex');
+    if (workspaceHash === entry.sourceHash) continue;
+    pending.push({
+      entry,
+      sourceBuffer: current.buffer,
+      sourceHash: entry.sourceHash,
+      sourceMode: current.mode,
+      workspaceBuffer: workspace.buffer,
+      workspaceHash,
+    });
+  }
+
+  const applied: Array<{ item: typeof pending[number]; appliedIdentity: LocalCliFileIdentity }> = [];
+  try {
+    for (const item of pending) {
+      const { entry } = item;
+      const sourceRoot = localCliRealpath(lease.sourceRoot);
+      const current = localCliReadStableFile(entry.sourcePath, sourceRoot);
+      if (!localCliSameIdentity(entry.sourceIdentity, current.identity) || crypto.createHash('sha256').update(current.buffer).digest('hex') !== entry.sourceHash) {
+        throw new LocalCliWorkspaceError('WORKSPACE_SYNC_CONFLICT', `authorized source changed during execution: ${entry.relativePath}`);
+      }
+      localCliAtomicWrite(entry.sourcePath, item.workspaceBuffer, sourceRoot, entry.sourceMode, entry.sourceIdentity);
+      // Atomic replacement intentionally creates a new file identity. Keep
+      // that identity so rollback can fence against a concurrent replacement
+      // without incorrectly comparing it to the pre-execution inode.
+      const appliedIdentity = localCliCaptureIdentity(entry.sourcePath);
+      applied.push({ item, appliedIdentity });
+      const verified = localCliReadStableFile(entry.sourcePath, sourceRoot);
+      if (crypto.createHash('sha256').update(verified.buffer).digest('hex') !== item.workspaceHash) {
+        throw new LocalCliWorkspaceError('WORKSPACE_SYNC_FAILED', `authorized source could not be verified after synchronization: ${entry.relativePath}`);
+      }
+    }
+  } catch (error) {
+    const rollbackFailures: string[] = [];
+    for (const { item, appliedIdentity } of [...applied].reverse()) {
+      try {
+        const sourceRoot = localCliRealpath(lease.sourceRoot);
+        const current = localCliReadStableFile(item.entry.sourcePath, sourceRoot);
+        const currentHash = crypto.createHash('sha256').update(current.buffer).digest('hex');
+        if (!localCliSameIdentity(appliedIdentity, current.identity)) {
+          throw new LocalCliWorkspaceError('WORKSPACE_SYNC_ROLLBACK_CONFLICT', `authorized source identity changed during rollback: ${item.entry.relativePath}`);
+        }
+        if ((current.mode & 0o7777) !== (item.sourceMode & 0o7777)) {
+          throw new LocalCliWorkspaceError('WORKSPACE_SYNC_ROLLBACK_CONFLICT', `authorized source mode changed during rollback: ${item.entry.relativePath}`);
+        }
+        // A concurrent writer owns the file once its content no longer matches
+        // the provider result. Never overwrite that newer content while trying
+        // to restore an earlier entry.
+        if (currentHash === item.sourceHash) continue;
+        if (currentHash !== item.workspaceHash) {
+          throw new LocalCliWorkspaceError('WORKSPACE_SYNC_ROLLBACK_CONFLICT', `authorized source changed during rollback: ${item.entry.relativePath}`);
+        }
+        localCliAtomicWrite(item.entry.sourcePath, item.sourceBuffer, sourceRoot, item.sourceMode, appliedIdentity);
+        const restored = localCliReadStableFile(item.entry.sourcePath, sourceRoot);
+        if (crypto.createHash('sha256').update(restored.buffer).digest('hex') !== item.sourceHash) {
+          throw new LocalCliWorkspaceError('WORKSPACE_SYNC_ROLLBACK_FAILED', `authorized source could not be restored: ${item.entry.relativePath}`);
+        }
+      } catch {
+        rollbackFailures.push(item.entry.relativePath);
+      }
+    }
+    if (rollbackFailures.length > 0) {
+      throw new LocalCliWorkspaceError(
+        'WORKSPACE_SYNC_ROLLBACK_FAILED',
+        `authorized synchronization failed and could not be rolled back: ${rollbackFailures.join(', ')}`,
+      );
+    }
+    throw error;
+  }
+}
 
 export interface LocalCliAdapterOptions {
   executable?: string;
@@ -92,18 +828,31 @@ export abstract class LocalCliAdapterBase implements ProviderAdapter {
     };
   }
 
+  /** Run a version probe from a disposable directory, never the application cwd. */
+  protected async executeHealthProbe(
+    env?: Record<string, string>,
+    allowedEnvKeys: string[] = [],
+  ): Promise<ProcessRunResult> {
+    const healthWorkspace = fs.mkdtempSync(path.join(os.tmpdir(), 'agent-forge-local-cli-health-'));
+    try {
+      return await ProcessRunner.execute({
+        executable: this.executable,
+        args: ['--version'],
+        cwd: healthWorkspace,
+        timeoutMs: 5000,
+        allowShell: false,
+        env,
+        allowedEnvKeys,
+      });
+    } finally {
+      try { fs.rmSync(healthWorkspace, { recursive: true, force: true }); } catch { /* health is best effort */ }
+    }
+  }
+
   public async getHealth(): Promise<ProviderHealthStatus> {
     try {
       // Execute a non-destructive version probe
-      const res = await ProcessRunner.execute({
-        executable: this.executable,
-        args: ['--version'],
-        cwd: process.cwd(),
-        timeoutMs: 5000,
-        allowShell: false,
-        env: this.env,
-        allowedEnvKeys: this.getAllowedEnvironmentOverrideKeys(),
-      });
+      const res = await this.executeHealthProbe(this.env, this.getAllowedEnvironmentOverrideKeys());
 
       if (res.cancelled) {
         return 'UNHEALTHY';
@@ -301,6 +1050,7 @@ export abstract class LocalCliAdapterBase implements ProviderAdapter {
         return {
           executionId,
           status: 'FAILED',
+          errorCode: 'POLICY_DENIAL',
           error: `SECURITY_POLICY_VIOLATION: Execution root directory access denied: ${workingDirPolicy.reason} (${workingDirPolicy.decision})`,
         };
       }
@@ -313,6 +1063,7 @@ export abstract class LocalCliAdapterBase implements ProviderAdapter {
           return {
             executionId,
             status: 'FAILED',
+            errorCode: 'POLICY_DENIAL',
             error: `SECURITY_POLICY_VIOLATION: Context file "${contextFile}" violates security policy: ${filePolicy.reason} (${filePolicy.decision})`,
           };
         }
@@ -335,27 +1086,56 @@ export abstract class LocalCliAdapterBase implements ProviderAdapter {
         };
       }
 
-      if (control) {
-        control.processStarted = true;
+      let localWorkspace: LocalCliWorkspaceLease;
+      try {
+        localWorkspace = localCliPrepareWorkspace(
+          executionRoot,
+          request.contextFiles,
+          executionId,
+          request.runtimeBinding?.workspace?.ownershipDigest ?? '',
+        );
+      } catch (error) {
+        const workspaceError = error instanceof LocalCliWorkspaceError ? error.message : 'WORKSPACE_PREPARE_FAILED: isolated provider workspace could not be prepared';
+        return {
+          executionId,
+          status: 'FAILED',
+          errorCode: 'POLICY_DENIAL',
+          error: workspaceError,
+        };
       }
 
-      // 6. Execute through ProcessRunner with durable ownership and safe minimal environment
-      const processResult = await ProcessRunner.execute({
-        executable: this.executable,
-        args,
-        cwd: executionRoot,
-        timeoutMs: this.timeoutMs,
-        env: executionEnv,
-        allowedEnvKeys,
-        allowShell: false,
-        repo: this.repo,
-        artifactStore: this.artifactStore,
-        projectId: request.projectId,
-        taskId: request.taskId,
-        attemptId: request.attemptId ?? null,
-        stdin: this.useStdin ? prompt : undefined,
-        executionId: isScheduled ? executionId : undefined,
-      });
+      try {
+        if (control?.cancelRequested) {
+          return {
+            executionId,
+            status: 'CANCELLED',
+            errorCode: 'CANCELLED',
+            error: 'Execution was cancelled before process spawn.',
+          };
+        }
+        if (control) {
+          control.processStarted = true;
+        }
+
+        // 6. Execute through ProcessRunner with durable ownership and safe minimal environment.
+        // The child sees only the isolated workspace; the source worktree is
+        // synchronized back only after a valid coder.v1 protocol is returned.
+        const processResult = await ProcessRunner.execute({
+          executable: this.executable,
+          args,
+          cwd: localWorkspace.workspaceRoot,
+          timeoutMs: this.timeoutMs,
+          env: executionEnv,
+          allowedEnvKeys,
+          allowShell: false,
+          repo: this.repo,
+          artifactStore: this.artifactStore,
+          projectId: request.projectId,
+          taskId: request.taskId,
+          attemptId: request.attemptId ?? null,
+          stdin: this.useStdin ? prompt : undefined,
+          executionId: isScheduled ? executionId : undefined,
+        });
 
       // 7. Map cancellation truthfully
       if (processResult.cancelled || processResult.errorCode === 'CANCELLED') {
@@ -450,6 +1230,20 @@ export abstract class LocalCliAdapterBase implements ProviderAdapter {
       const parseResult = ProtocolParser.parse(protocolText);
 
       if (parseResult.success && parseResult.data?.type === 'coder.v1') {
+        try {
+          localCliSynchronizeWorkspace(localWorkspace);
+        } catch (error) {
+          const syncError = error instanceof LocalCliWorkspaceError ? error.message : 'WORKSPACE_SYNC_FAILED: authorized workspace changes could not be verified';
+          return {
+            executionId: processResult.executionId,
+            status: 'FAILED',
+            errorCode: 'EXECUTION_FAILED',
+            rawResponse: processResult.stdout,
+            error: syncError,
+            stdoutEvidenceId: processResult.stdoutEvidenceId,
+            stderrEvidenceId: processResult.stderrEvidenceId,
+          };
+        }
         return {
           executionId: processResult.executionId,
           status: 'COMPLETED',
@@ -470,6 +1264,21 @@ export abstract class LocalCliAdapterBase implements ProviderAdapter {
         stdoutEvidenceId: processResult.stdoutEvidenceId,
         stderrEvidenceId: processResult.stderrEvidenceId,
       };
+      } finally {
+        try {
+          localCliCleanupWorkspace(localWorkspace);
+        } catch {
+          // A provider result cannot be reported as success when cleanup
+          // ownership was not proven.  Returning from finally intentionally
+          // overrides every earlier branch with a typed failure.
+          return {
+            executionId,
+            status: 'FAILED',
+            errorCode: 'EXECUTION_FAILED',
+            error: 'WORKSPACE_CLEANUP_FAILED: isolated provider workspace cleanup was not verified.',
+          };
+        }
+      }
     } finally {
       if (isScheduled) {
         this.activeExecutions.delete(executionId);

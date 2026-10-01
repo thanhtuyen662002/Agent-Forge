@@ -770,8 +770,10 @@ describe('R5F0C3 — Production Codex CLI Adapter Contract Suite', () => {
       expect(log.stdin).toContain('INSTRUCTIONS:');
       expect(log.stdin).toContain('- Implement task xyz');
 
-      // Cwd equals durable repository path
-      expect(path.normalize(log.cwd)).toBe(path.normalize(projectRepoDir));
+      // The provider receives a per-execution sanitized workspace, never the
+      // durable repository directory that contains unlisted project files.
+      expect(path.normalize(log.cwd)).not.toBe(path.normalize(projectRepoDir));
+      expect(path.normalize(log.cwd)).toMatch(/agent-forge-local-cli-workspaces/i);
     });
   });
 
