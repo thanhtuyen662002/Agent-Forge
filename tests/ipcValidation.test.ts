@@ -199,6 +199,7 @@ describe('IPC Validation & Security Gates', () => {
       taskId: 'TASK-1',
       routingDecisionId: 'DEC-123',
       contextFiles: ['src/core/router.ts'],
+      executionMode: 'MANUAL_BRIDGE',
     });
     expect(validAuth.success).toBe(true);
 
@@ -206,6 +207,7 @@ describe('IPC Validation & Security Gates', () => {
       projectId: 'PROJ-1',
       taskId: 'TASK-1',
       routingDecisionId: 'DEC-123',
+      executionMode: 'MANUAL_BRIDGE',
       instructions: ['do something else'], // forbidden
     });
     expect(invalidInstructions.success).toBe(false);
@@ -214,14 +216,23 @@ describe('IPC Validation & Security Gates', () => {
       projectId: 'PROJ-1',
       taskId: 'TASK-1',
       routingDecisionId: 'DEC-123',
+      executionMode: 'MANUAL_BRIDGE',
       prompt: 'do something else', // forbidden
     });
     expect(invalidPrompt.success).toBe(false);
   });
 
-  it('accepts canonical execution scope while preserving legacy authorization payloads', () => {
-    const base = { projectId: 'PROJ-1', taskId: 'TASK-1', routingDecisionId: 'DEC-123' };
-    expect(AuthorizeRoutedTaskIpcSchema.safeParse(base).success).toBe(true);
+  it('requires an explicit mode and accepts a complete product-bound execution scope', () => {
+    const base = {
+      projectId: 'PROJ-1',
+      taskId: 'TASK-1',
+      routingDecisionId: 'DEC-123',
+      executionMode: 'PRODUCT_BOUND' as const,
+      assignmentId: 'ASSIGN-1',
+      taskOwnershipEpoch: 1,
+      contextManifestId: 'MANIFEST-1',
+    };
+    expect(AuthorizeRoutedTaskIpcSchema.safeParse({ projectId: 'PROJ-1', taskId: 'TASK-1', routingDecisionId: 'DEC-123' }).success).toBe(false);
 
     const executionScope = {
       branch: 'agent/agy-01/task-1',
@@ -231,11 +242,19 @@ describe('IPC Validation & Security Gates', () => {
     };
     const result = AuthorizeRoutedTaskIpcSchema.safeParse({ ...base, executionScope });
     expect(result.success).toBe(true);
-    if (result.success) expect(result.data.executionScope).toEqual(executionScope);
+    if (result.success && 'executionScope' in result.data) expect(result.data.executionScope).toEqual(executionScope);
   });
 
   it('reuses strict canonical execution-scope validation at the IPC boundary', () => {
-    const base = { projectId: 'PROJ-1', taskId: 'TASK-1', routingDecisionId: 'DEC-123' };
+    const base = {
+      projectId: 'PROJ-1',
+      taskId: 'TASK-1',
+      routingDecisionId: 'DEC-123',
+      executionMode: 'PRODUCT_BOUND' as const,
+      assignmentId: 'ASSIGN-1',
+      taskOwnershipEpoch: 1,
+      contextManifestId: 'MANIFEST-1',
+    };
     const validScope = {
       branch: 'agent/agy-01/task-1',
       worktree: 'D:/worktrees/task-1',
@@ -260,6 +279,7 @@ describe('IPC Validation & Security Gates', () => {
   it('should validate dispatch IPC schema and strictly accept authorizationId only', () => {
     const validDispatch = DispatchAuthorizationIpcSchema.safeParse({
       authorizationId: 'AUTH-123',
+      executionMode: 'MANUAL_BRIDGE',
     });
     expect(validDispatch.success).toBe(true);
 
@@ -268,6 +288,7 @@ describe('IPC Validation & Security Gates', () => {
 
     const invalidExtra = DispatchAuthorizationIpcSchema.safeParse({
       authorizationId: 'AUTH-123',
+      executionMode: 'MANUAL_BRIDGE',
       requestOverride: { taskId: 'TASK-2' }, // forbidden
       decisionOverride: { selectedProviderId: 'prov-evil' }, // forbidden
     });

@@ -60,7 +60,15 @@ describe('bounded protocol payloads', () => {
   });
 
   it('bounds nested execution-scope strings and collections at the IPC boundary', () => {
-    const base = { projectId: 'project-1', taskId: 'task-1', routingDecisionId: 'decision-1' };
+    const base = {
+      projectId: 'project-1',
+      taskId: 'task-1',
+      routingDecisionId: 'decision-1',
+      executionMode: 'PRODUCT_BOUND' as const,
+      assignmentId: 'assignment-1',
+      taskOwnershipEpoch: 1,
+      contextManifestId: 'manifest-1',
+    };
     const validScope = {
       branch: 'agent/task-1',
       worktree: 'D:/worktrees/task-1',

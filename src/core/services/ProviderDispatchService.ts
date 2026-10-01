@@ -155,7 +155,26 @@ export class ProviderDispatchService {
    * Derives all execution instructions internally from approved durable state.
    */
   public async dispatch(authorizationId: string): Promise<ProviderDispatchExecutionResult> {
-    return this.dispatchInternal(authorizationId, 'LEGACY');
+    return this.dispatchInternal(authorizationId, 'LEGACY', 'INTERNAL_LEGACY');
+  }
+
+  /**
+   * Renderer Manual Bridge admission.  This is intentionally separate from
+   * the historical dispatch() compatibility method so an IPC caller cannot
+   * accidentally turn a product-bound or automated authorization into a
+   * legacy provider execution.
+   */
+  public async dispatchManualBridge(authorizationId: string): Promise<ProviderDispatchExecutionResult> {
+    return this.dispatchInternal(authorizationId, 'LEGACY', 'MANUAL_BRIDGE');
+  }
+
+  /**
+   * Renderer product-bound admission.  Lifecycle-v1 validation and the
+   * adapter-start CAS fence verify account, worker-slot, and task epoch before
+   * any provider process is invoked.
+   */
+  public async dispatchProductBound(authorizationId: string): Promise<ProviderDispatchExecutionResult> {
+    return this.dispatchInternal(authorizationId, 'LEGACY', 'PRODUCT_BOUND');
   }
 
   /**
@@ -164,12 +183,19 @@ export class ProviderDispatchService {
    * Populates RuntimeExecutionBinding with verified workspace metadata for adapter execution.
    */
   public async dispatchScheduled(authorizationId: string): Promise<ProviderDispatchExecutionResult> {
-    return this.dispatchInternal(authorizationId, 'SCHEDULED');
+    // Scheduled execution is an internal scheduler boundary.  It already
+    // performs the lifecycle-v1 assignment/account/worker-slot checks below
+    // and must retain the pre-existing cancellation/recovery semantics for
+    // internal legacy authorizations.  Renderer-originated automated work
+    // uses dispatchProductBound(), which applies the stricter explicit
+    // product-bound admission gate.
+    return this.dispatchInternal(authorizationId, 'SCHEDULED', 'INTERNAL_LEGACY');
   }
 
   private async dispatchInternal(
     authorizationId: string,
-    mode: 'LEGACY' | 'SCHEDULED'
+    mode: 'LEGACY' | 'SCHEDULED',
+    admissionMode: 'INTERNAL_LEGACY' | 'MANUAL_BRIDGE' | 'PRODUCT_BOUND' = 'INTERNAL_LEGACY'
   ): Promise<ProviderDispatchExecutionResult> {
     const executionId = crypto.randomUUID();
     const nowIso = new Date().toISOString();
@@ -948,6 +974,43 @@ export class ProviderDispatchService {
       };
     }
 
+    if (admissionMode === 'MANUAL_BRIDGE') {
+      if (
+        mode !== 'LEGACY' ||
+        routingOutcome !== 'MANUAL_HANDOFF_REQUIRED' ||
+        adapter.adapterType !== 'MANUAL_BRIDGE' ||
+        auth.lifecycle_version === 1 ||
+        auth.assignment_id
+      ) {
+        return {
+          executionId,
+          status: 'FAILED',
+          errorCode: 'RECOVERY_FENCED',
+          error:
+            'MANUAL_BRIDGE_ADMISSION_REJECTED: Manual Bridge dispatch requires an unbound authorization and a MANUAL_HANDOFF_REQUIRED decision.',
+        };
+      }
+    } else if (admissionMode === 'PRODUCT_BOUND') {
+      if (
+        routingOutcome !== 'SELECTED' ||
+        adapter.adapterType === 'MANUAL_BRIDGE' ||
+        auth.lifecycle_version !== 1 ||
+        !auth.assignment_id ||
+        !auth.selected_account_id ||
+        auth.task_ownership_epoch === undefined ||
+        auth.task_ownership_epoch === null ||
+        auth.task_ownership_epoch <= 0
+      ) {
+        return {
+          executionId,
+          status: 'FAILED',
+          errorCode: 'RECOVERY_FENCED',
+          error:
+            'PRODUCT_BOUND_ADMISSION_REJECTED: Product dispatch requires lifecycle-v1 assignment, account, and ownership-epoch bindings with an automated SELECTED decision.',
+        };
+      }
+    }
+
     // 11. Strict Canonical Payload Schema Validation and Integrity of Canonical Hashes
     if (!auth.canonical_payload_json || auth.canonical_payload_json.trim() === '') {
       this.repo.invalidateExecutionAuthorization(auth.id);
@@ -1258,6 +1321,7 @@ export class ProviderDispatchService {
           routingDecisionId: auth.routing_decision_id,
           selectedResourceId: auth.selected_resource_id,
           selectedProviderId: auth.selected_provider_id,
+          executionMode: admissionMode,
           instructionPayloadHash: auth.instruction_payload_hash,
           contextManifestHash: auth.context_manifest_hash,
           status: 'DISPATCHED',

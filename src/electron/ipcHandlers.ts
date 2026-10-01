@@ -842,7 +842,10 @@ export function registerIpcHandlers(
     }
 
     try {
-      const result = await providerDispatchService.dispatch(parsed.data.authorizationId);
+      const result =
+        parsed.data.executionMode === 'MANUAL_BRIDGE'
+          ? await providerDispatchService.dispatchManualBridge(parsed.data.authorizationId)
+          : await providerDispatchService.dispatchProductBound(parsed.data.authorizationId);
       return { success: true, result };
     } catch (err: any) {
       return { success: false, error: err.message || 'Dispatch failed.' };
