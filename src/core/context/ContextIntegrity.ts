@@ -68,6 +68,7 @@ export class ContextPathError extends Error {
 export const PORTABLE_CONTEXT_PATH_MAX_LENGTH = 4096;
 export const PORTABLE_CONTEXT_PATH_MAX_COMPONENTS = 128;
 export const PORTABLE_CONTEXT_PATH_MAX_COMPONENT_LENGTH = 255;
+export const PORTABLE_CONTEXT_PATH_MAX_ENTRIES = 128;
 
 const PORTABLE_RESERVED_DEVICE_NAMES = new Set([
   'AUX',
@@ -208,6 +209,9 @@ export function canonicalizePortableRelativePath(rawPath: unknown): string {
  * silently choosing one would make the authorized object order-dependent.
  */
 export function canonicalizePortableRelativePathList(contextFiles: readonly unknown[]): string[] {
+  if (contextFiles.length > PORTABLE_CONTEXT_PATH_MAX_ENTRIES) {
+    throw new ContextPathError('CONTEXT_PATH_LIMIT_EXCEEDED', 'context manifest contains too many paths');
+  }
   const seen = new Set<string>();
   const seenCaseInsensitive = new Map<string, string>();
   const canonicalFiles: string[] = [];
