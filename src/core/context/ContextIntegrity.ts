@@ -141,12 +141,18 @@ export function canonicalizePortableRelativePath(rawPath: unknown): string {
     rawPath.startsWith('//?/') ||
     rawPath.startsWith('//./')
   ) {
-    throw new ContextPathError('CONTEXT_PATH_INVALID', 'absolute, UNC, or extended-length paths are not allowed');
+    throw new ContextPathError(
+      'CONTEXT_PATH_INVALID',
+      'must be relative to repository root; absolute, UNC, or extended-length paths are not allowed',
+    );
   }
   // A colon anywhere is either a drive/drive-relative path or an alternate
   // data stream component.  Neither form is a portable regular file path.
   if (rawPath.includes(':')) {
-    throw new ContextPathError('CONTEXT_PATH_INVALID', 'drive and alternate data stream paths are not allowed');
+    throw new ContextPathError(
+      'CONTEXT_PATH_INVALID',
+      'must be relative to repository root; drive and alternate data stream paths are not allowed',
+    );
   }
 
   let canonical = rawPath.replace(/\\/g, '/');
@@ -173,7 +179,7 @@ export function canonicalizePortableRelativePath(rawPath: unknown): string {
       throw new ContextPathError('CONTEXT_PATH_AMBIGUOUS', 'dot components are not portable aliases');
     }
     if (component === '..') {
-      throw new ContextPathError('CONTEXT_PATH_TRAVERSAL', 'parent traversal is not allowed');
+      throw new ContextPathError('CONTEXT_PATH_TRAVERSAL', 'violates path containment; parent traversal is not allowed');
     }
     if (component.length > PORTABLE_CONTEXT_PATH_MAX_COMPONENT_LENGTH) {
       throw new ContextPathError('CONTEXT_PATH_LIMIT_EXCEEDED', 'a context path component exceeds the portable length limit');
@@ -231,7 +237,7 @@ export function sanitizeContextFiles(
     if (!resolvedPath.startsWith(normalizedRepo + path.sep) && resolvedPath !== normalizedRepo) {
       return {
         validFiles: [],
-        error: 'CONTEXT_PATH_TRAVERSAL: context path resolves outside repository root',
+        error: 'CONTEXT_PATH_TRAVERSAL: violates path containment; context path resolves outside repository root',
       };
     }
 
