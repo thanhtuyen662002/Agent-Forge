@@ -7,7 +7,7 @@ import { Worker } from 'worker_threads';
 import { EventEmitter } from 'events';
 import { PassThrough } from 'stream';
 import Database from 'better-sqlite3';
-import { describe, it, expect, beforeEach, afterEach, afterAll, vi } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach, beforeAll, afterAll, vi } from 'vitest';
 import { Client, InMemoryTransport } from '@modelcontextprotocol/client';
 import { StdioClientTransport } from '@modelcontextprotocol/client/stdio';
 import { MIGRATIONS, MigrationRunner, verifyMigration21SchemaAuthority } from '../src/core/database/migrations';
@@ -43,6 +43,11 @@ import {
 import { parseCliArgs, runSessionAdmin } from '../src/mcp/sessionAdmin';
 import { runStdioServer } from '../src/mcp/stdio';
 import { ExecutionAuthorization } from '../src/core/types/domain';
+import {
+  captureMcpCliOutput,
+  installMcpCliOutputGuard,
+  MCP_CLI_REDACTED_TOKEN,
+} from './helpers/mcpCliOutputGuard';
 
 let sharedTestRuntimeDir: string | null = null;
 
@@ -1120,6 +1125,11 @@ function setupFullGraph(db: Database.Database): FullGraphFixtures {
 
 describe('R5J2 MCP Session Authority and Scoped Context Read Truth Suite', () => {
   let tempDir: string;
+  let restoreMcpCliOutputGuard: (() => void) | undefined;
+
+  beforeAll(() => {
+    restoreMcpCliOutputGuard = installMcpCliOutputGuard();
+  });
 
   beforeEach(() => {
     tempDir = path.join(process.cwd(), 'temp', `r5j2-test-${Date.now()}-${crypto.randomUUID().slice(0, 8)}`);
@@ -1139,6 +1149,8 @@ describe('R5J2 MCP Session Authority and Scoped Context Read Truth Suite', () =>
       sharedTestRuntimeDir = null;
       safeRemoveDir(dirToClean);
     }
+    restoreMcpCliOutputGuard?.();
+    restoreMcpCliOutputGuard = undefined;
   });
 
   // =========================================================================
@@ -2187,6 +2199,52 @@ describe('R5J2 MCP Session Authority and Scoped Context Read Truth Suite', () =>
       } finally {
         process.stdout.write = originalStdoutWrite;
       }
+    } finally {
+      db.close();
+    }
+  });
+
+  it('57a. CLI diagnostics redact session tokens in JSON and human output while preserving delivery to explicit captures', () => {
+    const { db, dbPath } = createTestDatabase(tempDir, 'cli_output_guard.db');
+    try {
+      const fixtures = setupFullGraph(db);
+
+      const jsonCapture = captureMcpCliOutput(() => runSessionAdmin([
+        'issue',
+        '--db',
+        dbPath,
+        '--auth',
+        fixtures.authorizationId,
+        '--json',
+      ]));
+      expect(jsonCapture.result).toBe(0);
+      expect(jsonCapture.stderr).toBe('');
+      const jsonOutput = JSON.parse(jsonCapture.stdout) as { plaintext_token?: string };
+      expect(jsonOutput.plaintext_token).toBe(MCP_CLI_REDACTED_TOKEN);
+      expect(jsonCapture.stdout).not.toMatch(/[A-Za-z0-9_-]{43}/);
+
+      // Authorized-context session issuance is intentionally single-active;
+      // revoke the JSON-issued session before exercising human output.
+      expect(runSessionAdmin([
+        'revoke',
+        '--db',
+        dbPath,
+        '--auth',
+        fixtures.authorizationId,
+      ])).toBe(0);
+
+      const humanCapture = captureMcpCliOutput(() => runSessionAdmin([
+        'issue',
+        '--db',
+        dbPath,
+        '--auth',
+        fixtures.authorizationId,
+      ]));
+      expect(humanCapture.result).toBe(0);
+      expect(humanCapture.stderr).toBe('');
+      expect(humanCapture.stdout).toContain('Plaintext Token:');
+      expect(humanCapture.stdout).toContain(MCP_CLI_REDACTED_TOKEN);
+      expect(humanCapture.stdout).toMatch(/Plaintext\s+Token:\s+\[REDACTED_TOKEN\]/i);
     } finally {
       db.close();
     }
