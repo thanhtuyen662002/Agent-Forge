@@ -80,6 +80,21 @@ describe('Vitest credential output sanitizer', () => {
     expect(combined).toContain('PARENT_FAILURE_CONTEXT');
   });
 
+  it('preserves UTF-8 diagnostics split across Buffer writes', () => {
+    const diagnostic = 'MCP_DIAGNOSTIC: ✓ request rejected';
+    const bytes = Buffer.from(`${diagnostic}\n`, 'utf8');
+    const checkmarkStart = Buffer.from('MCP_DIAGNOSTIC: ', 'utf8').length;
+
+    const captured = captureMcpCliOutput(() => {
+      process.stdout.write(bytes.subarray(0, checkmarkStart + 1));
+      process.stdout.write(bytes.subarray(checkmarkStart + 1, checkmarkStart + 2));
+      process.stdout.write(bytes.subarray(checkmarkStart + 2));
+    });
+
+    expect(captured.stdout).toBe(`${diagnostic}\n`);
+    expect(captured.stdout).not.toContain('�');
+  });
+
   it('keeps ordinary diagnostic text unchanged in both streaming boundaries', () => {
     const diagnostic = 'MCP_AUTHORITY_FENCED: request rejected';
     expect(redactMcpCliOutput(diagnostic)).toBe(diagnostic);

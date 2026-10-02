@@ -8,6 +8,8 @@
  * the runner's real streams.
  */
 
+import { StringDecoder } from 'node:string_decoder';
+
 const REDACTED_TOKEN = '[REDACTED_TOKEN]';
 
 // Session tokens are unpadded base64url encodings of 32 bytes. Submission
@@ -40,16 +42,22 @@ export function redactMcpCliOutput(text: string): string {
 
 type Writable = typeof process.stdout.write;
 
-function textFromChunk(chunk: unknown, encoding?: unknown): string {
-  if (Buffer.isBuffer(chunk)) {
-    const bufferEncoding = typeof encoding === 'string' ? encoding as BufferEncoding : undefined;
-    return chunk.toString(bufferEncoding);
-  }
-  return String(chunk);
-}
-
 class StreamingMcpCliRedactor {
   private pending = '';
+  private decoder = new StringDecoder('utf8');
+
+  public pushChunk(chunk: unknown): string {
+    if (Buffer.isBuffer(chunk)) {
+      return this.push(this.decoder.write(chunk));
+    }
+
+    // A decoded string cannot complete a partial UTF-8 byte sequence from a
+    // previous Buffer write. End that byte stream before appending the string
+    // so diagnostics are neither silently dropped nor combined incorrectly.
+    const pendingBytes = this.decoder.end();
+    this.decoder = new StringDecoder('utf8');
+    return this.push(`${pendingBytes}${String(chunk)}`);
+  }
 
   public push(text: string): string {
     this.pending += text;
@@ -73,6 +81,8 @@ class StreamingMcpCliRedactor {
   }
 
   public flush(): string {
+    this.pending += this.decoder.end();
+    this.decoder = new StringDecoder('utf8');
     const safeOutput = redactMcpCliOutput(this.pending);
     this.pending = '';
     return safeOutput;
@@ -88,7 +98,7 @@ function createRedactingWriter(original: Writable, stream: NodeJS.WritableStream
   const boundOriginal = original.bind(stream);
   const redactor = new StreamingMcpCliRedactor();
   const write = ((chunk: unknown, encodingOrCallback?: unknown, callback?: unknown) => {
-    const safeText = redactor.push(textFromChunk(chunk, encodingOrCallback));
+    const safeText = redactor.pushChunk(chunk);
     const done = typeof encodingOrCallback === 'function'
       ? encodingOrCallback as () => void
       : typeof callback === 'function' ? callback as () => void : undefined;
@@ -182,7 +192,7 @@ export function captureMcpCliOutput<T>(fn: () => T): CapturedMcpCliOutput<T> {
   let stderr = '';
 
   process.stdout.write = ((chunk: unknown, encodingOrCallback?: unknown, callback?: unknown) => {
-    stdout += stdoutRedactor.push(textFromChunk(chunk, encodingOrCallback));
+    stdout += stdoutRedactor.pushChunk(chunk);
     const done = typeof encodingOrCallback === 'function'
       ? encodingOrCallback as () => void
       : typeof callback === 'function' ? callback as () => void : undefined;
@@ -190,7 +200,7 @@ export function captureMcpCliOutput<T>(fn: () => T): CapturedMcpCliOutput<T> {
     return true;
   }) as Writable;
   process.stderr.write = ((chunk: unknown, encodingOrCallback?: unknown, callback?: unknown) => {
-    stderr += stderrRedactor.push(textFromChunk(chunk, encodingOrCallback));
+    stderr += stderrRedactor.pushChunk(chunk);
     const done = typeof encodingOrCallback === 'function'
       ? encodingOrCallback as () => void
       : typeof callback === 'function' ? callback as () => void : undefined;
