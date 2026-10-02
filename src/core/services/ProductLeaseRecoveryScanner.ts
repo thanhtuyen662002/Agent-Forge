@@ -314,10 +314,28 @@ export class ProductLeaseRecoveryScanner {
     }
 
     let recovered: ReleaseLeaseResult;
+    let resolvedMarkerEventId: string | null = null;
     try {
-      recovered = this.leaseService.recoverExpiredLease(row.lease_id, row.lease_token, now, {
-        expectedTaskStates: PRODUCT_LEASE_RECOVERABLE_TASK_STATES,
+      // The scanner only revisits unreleased leases. Commit release and its
+      // existing recovery marker's closure together, so an evidence failure
+      // cannot strand a marker on a lease that future scans will skip. The
+      // lease service's nested transaction remains owner/task-state fenced.
+      const recovery = this.repo.runInImmediateTransaction(() => {
+        const result = this.leaseService.recoverExpiredLease(row.lease_id, row.lease_token, now, {
+          expectedTaskStates: PRODUCT_LEASE_RECOVERABLE_TASK_STATES,
+        });
+        let markerEventId: string | null = null;
+        if (result.status === 'RELEASED') {
+          const existingMarkerId = this.markerIdFor(row);
+          if (this.hasEvent(existingMarkerId)) {
+            this.persistResolvedMarker(row, existingMarkerId, now);
+            markerEventId = existingMarkerId;
+          }
+        }
+        return { result, markerEventId };
       });
+      recovered = recovery.result;
+      resolvedMarkerEventId = recovery.markerEventId;
     } catch (error) {
       const reason = error instanceof Error ? error.message : String(error);
       base.disposition = 'DEFERRED';
@@ -329,11 +347,7 @@ export class ProductLeaseRecoveryScanner {
     if (recovered.status === 'RELEASED') {
       base.disposition = 'RELEASED';
       base.reason = 'Expired product lease released with owner-token and task-state fencing.';
-      const markerEventId = this.markerIdFor(row);
-      if (this.hasEvent(markerEventId)) {
-        base.markerEventId = markerEventId;
-        this.persistResolvedMarker(row, markerEventId, now);
-      }
+      if (resolvedMarkerEventId !== null) base.markerEventId = resolvedMarkerEventId;
       return base;
     }
 
@@ -403,7 +417,7 @@ export class ProductLeaseRecoveryScanner {
   }
 
   private persistResolvedMarker(row: CandidateLeaseRow, markerEventId: string, now: Date): void {
-    if (!row.project_id) return;
+    if (!row.project_id) throw new Error('PRODUCT_LEASE_RECOVERY_PROJECT_MISSING');
     const resolved = createProductLeaseRecoveryResolvedEvent({
       leaseId: row.lease_id,
       assignmentId: row.assignment_id,
@@ -415,12 +429,9 @@ export class ProductLeaseRecoveryScanner {
       markerEventId,
       observedAt: now.toISOString(),
     });
-    try {
-      this.repo.createDeterministicGenericEvent(resolved);
-    } catch {
-      // The lease transaction has already committed. A later scan can retry
-      // the resolution evidence without risking a second lease settlement.
-    }
+    // Let persistence errors reach the enclosing recovery transaction. Its
+    // rollback keeps both the lease and slot discoverable for a later retry.
+    this.repo.createDeterministicGenericEvent(resolved);
   }
 
   private hasEvent(id: string): boolean {
