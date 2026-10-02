@@ -273,7 +273,7 @@ Owner Explicitly Opts-In: `Allow Manual Bridge Fallback` (Default: disabled)
                    ↓
 `routing:dispatchAuthorization` IPC → `ProviderDispatchService.dispatch(authorizationId)`
                    ↓
-If `MANUAL_HANDOFF_REQUIRED`: Status becomes `AWAITING_OWNER` / `DISPATCHED`
+If `MANUAL_HANDOFF_REQUIRED`: Manual Bridge returns `AWAITING_OWNER`; the authorization becomes `DISPATCHED` while the durable task state remains `CODING` or `HANDOFF_REQUIRED`
 If `SELECTED`: Status becomes `DISPATCHED TO AUTHORIZED PROVIDER` / `DISPATCHED`
                    ↓
 Owner clicks `GENERATE AUTHORIZED WORKORDER` (`routing:generateAuthorizedWorkOrder`)
@@ -307,7 +307,7 @@ Owner pastes Gemini report into Coder Inbox → Protocol validation & Verificati
   - Task mutable field changes after authorization do not alter the frozen instructions or break verification.
 - **Direct Durable Latest Task Route Query**: `routing:getHandoffSnapshot` uses `Repository.getLatestRoutingDecisionEventByTask(projectId, taskId)` with direct SQLite indexing (`WHERE project_id = ? AND task_id = ? AND type = 'PROVIDER_ROUTING_DECISION' ORDER BY timestamp DESC, rowid DESC LIMIT 1`), ensuring durable lookup irrespective of intervening project event volume.
 - **Distinct Routing Concepts**: `routing:getHandoffSnapshot` distinctly exposes `latestRoutingDecision` (newest routing candidate for a new authorization) and `authorizationRoutingDecision` (the exact durable route bound to the existing authorization via `routing_decision_id`), preventing route cross-wiring.
-- **Awaiting Owner Semantics**: `AWAITING_OWNER` is derived strictly when `authorization.status === 'DISPATCHED' && authorizationRoutingDecision.outcome === 'MANUAL_HANDOFF_REQUIRED'`. Automated provider dispatches (`outcome === 'SELECTED'`) display `DISPATCHED TO AUTHORIZED PROVIDER` and do not show Manual Bridge relay.
+- **Awaiting Owner Semantics**: `AWAITING_OWNER` is the Manual Bridge provider-result/UI relay status, not a value in `TaskStateEnum`. The handoff UI derives its awaiting-owner panel strictly when `authorization.status === 'DISPATCHED' && authorizationRoutingDecision.outcome === 'MANUAL_HANDOFF_REQUIRED'`. The durable task state remains `CODING` or `HANDOFF_REQUIRED` and is never rewritten to `AWAITING_OWNER`; automated provider dispatches (`outcome === 'SELECTED'`) display `DISPATCHED TO AUTHORIZED PROVIDER` and do not show Manual Bridge relay.
 - **Explicit Candidate Selection & Manual Bridge Opt-In**: The candidate list is initially empty and never auto-populates enabled resources on page load or task switch. Manual Bridge permission defaults to `false` and requires explicit Owner opt-in.
 - **Durable Snapshot Reconstruction**: The UI does not maintain ephemeral React state as ground truth. `routing:getHandoffSnapshot` reloads task status, Manager authority ledger records, Git repository HEAD SHA, provider resources, latest routing decisions, and execution authorizations directly from SQLite.
 - **Truthful UI Quota Semantics**: Provider resources with `quota_source = 'UNKNOWN'` or `remaining_quota = null` render truthfully as `UNKNOWN (conf: 0.0)` in the UI and are never falsified as `0`, `unlimited`, or `healthy`.
@@ -318,7 +318,7 @@ Owner pastes Gemini report into Coder Inbox → Protocol validation & Verificati
 
 ## 10. Internationalization (i18n) & Installed-App Update Foundation (PR #9)
 
-AgentForge PR #9 establishes the demo readiness baseline, bilingual Vietnamese/English user experience, and a secure installed-app software update foundation.
+AgentForge PR #9 establishes the demo readiness baseline, bilingual Vietnamese/English user experience, and a secure installed-app software update foundation. The foundation is tested and owner-controlled; it is not a claim of signed production publication or unattended updating.
 
 ### Bilingual Translation Subsystem
 - **Supported Locales**: Vietnamese (`vi-VN`) and English (`en-US`).
@@ -370,7 +370,7 @@ Renderer Process                  Electron Main Process (Node.js)
    - Renderer cannot supply update URLs, executable paths, authorization tokens, or shell commands.
 7. **Secret Sanitization**: Error messages from update operations sanitize GitHub Personal Access Tokens (`ghp_*`), Bearer tokens, passwords, and URL embedded credentials before recording or returning to renderer.
 8. **Separation from Authorization Core**: The updater subsystem has zero authority to create, dispatch, or modify `ExecutionAuthorization` records or bypass security policies.
-9. **Installed-App Integration Verification**: `scripts/test-installed-update-win.ps1` provides automated Windows integration proof by installing the real NSIS vA package, spinning up a local loopback update feed serving real `electron-builder` generated vB artifacts (`latest.yml`, `.exe`, `.blockmap`), launching the installed app, and verifying update discovery, download, and the `DOWNLOADED` (canInstall = true) gate.
+9. **Installed-App Integration Test Scope**: `scripts/test-installed-update-win.ps1` provides an isolated Windows test harness. It builds and installs a test-only NSIS vA package, spins up a local loopback update feed serving real `electron-builder` generated vB artifacts (`latest.yml`, `.exe`, `.blockmap`), launches the installed app, and verifies update discovery, download, and the `DOWNLOADED` (`canInstall = true`) gate. This evidence does not publish a release, sign an installer, or prove final production binary replacement; the final install/restart gate remains owner-controlled.
 
 ---
 
