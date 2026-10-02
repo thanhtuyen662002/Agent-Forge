@@ -37,6 +37,11 @@ import {
   reconcileFindingClosure,
 } from './repairContext';
 import type { CoderEditBundle } from './responsesCoderEndpoint';
+import {
+  createProductLeaseRecoveryMarkerEvent,
+  ProductLeaseRecoveryMarkerInput,
+  productLeaseOwnerFingerprint,
+} from '../services/ProductLeaseRecoveryScanner';
 
 /** Consolidation supports an explicitly configured two-worker maximum (1 or 2). */
 export const MAX_AGY_WORKERS = 2;
@@ -142,6 +147,17 @@ export interface ExecuteProductTaskResult {
   error?: string;
   observedHeadSha?: string;
   observedSnapshotSha?: string;
+  /** Execution outcome remains in `success`; cleanup is reported separately. */
+  leaseCleanup?: ProductLeaseCleanupResult;
+}
+
+export interface ProductLeaseCleanupResult {
+  status: 'RELEASED' | 'RECOVERY_REQUIRED';
+  leaseId: string;
+  markerEventId?: string | null;
+  code?: string;
+  error?: string;
+  ownerTokenSha256?: string;
 }
 
 function fail(code: string, error: string): AuthorityValidationResult {
@@ -407,6 +423,44 @@ export class ProductTaskAutonomyAdapter {
 
   public releaseWorkerSlotLease(leaseId: string, leaseToken: string): ReleaseLeaseResult {
     return this.leaseService.release(leaseId, leaseToken);
+  }
+
+  private recordLeaseCleanupFailure(
+    authority: ProductTaskAuthority,
+    lease: Extract<AcquireSlotLeaseResult, { status: 'ACQUIRED' }>['lease'],
+    code: string,
+    error: string,
+  ): ProductLeaseCleanupResult {
+    const markerInput: ProductLeaseRecoveryMarkerInput = {
+      leaseId: lease.id,
+      assignmentId: lease.assignment_id,
+      taskId: authority.task.id,
+      projectId: authority.task.project_id,
+      accountId: lease.provider_account_id,
+      workerSlotId: lease.worker_slot_id,
+      leaseToken: lease.lease_token,
+      reasonCode: code,
+      reason: error,
+      observedAt: new Date().toISOString(),
+    };
+    const marker = createProductLeaseRecoveryMarkerEvent(markerInput);
+    let markerEventId: string | null = null;
+    try {
+      this.repo.createDeterministicGenericEvent(marker);
+      markerEventId = marker.id;
+    } catch {
+      // The release may have failed because SQLite is busy or closing. The
+      // adapter still returns a typed recovery result; startup scanning will
+      // rediscover the unreleased row and retry without losing the outcome.
+    }
+    return {
+      status: 'RECOVERY_REQUIRED',
+      leaseId: lease.id,
+      markerEventId,
+      code,
+      error,
+      ownerTokenSha256: productLeaseOwnerFingerprint(lease.lease_token),
+    };
   }
 
   public transitionTask(taskId: string, trigger: TaskTrigger, expectedOwnershipEpoch?: number): Task {
@@ -1072,9 +1126,32 @@ export class ProductTaskAutonomyAdapter {
       };
     }
 
-    const released = this.releaseWorkerSlotLease(acquired.lease.id, acquired.lease.lease_token);
+    let released: ReleaseLeaseResult;
+    try {
+      released = this.releaseWorkerSlotLease(acquired.lease.id, acquired.lease.lease_token);
+    } catch (error) {
+      const cleanupError = error instanceof Error ? error.message : String(error);
+      released = {
+        status: 'FAILED',
+        code: 'LEASE_RELEASE_FAILED',
+        error: `LEASE_RELEASE_FAILED: ${cleanupError}`,
+      };
+    }
+
     result.leaseReleased = released.status === 'RELEASED';
-    if (released.status === 'FAILED' && !result.error) result.error = released.error;
+    if (released.status === 'RELEASED') {
+      result.leaseCleanup = {
+        status: 'RELEASED',
+        leaseId: acquired.lease.id,
+      };
+    } else {
+      result.leaseCleanup = this.recordLeaseCleanupFailure(
+        validated.authority,
+        acquired.lease,
+        released.code,
+        released.error,
+      );
+    }
     return result;
   }
 }

@@ -3,6 +3,7 @@ import { Repository } from '../database/repositories';
 import {
   AccountLease,
   AgentAssignment,
+  TaskState,
   WorkerSlot,
 } from '../types/domain';
 
@@ -24,6 +25,11 @@ export type SlotLeaseErrorCode =
   | 'LEASE_NOT_FOUND'
   | 'LEASE_TOKEN_MISMATCH'
   | 'LEASE_EXPIRED'
+  | 'LEASE_NOT_EXPIRED'
+  | 'LEASE_EXPIRY_INVALID'
+  | 'RECOVERY_TASK_STATE_CHANGED'
+  | 'RECOVERY_PROCESS_STILL_RUNNING'
+  | 'LEASE_RELEASE_FAILED'
   | 'SLOT_STATE_MISMATCH'
   | 'DURABLE_BINDING_INVARIANT_FAILURE'
   | 'CLAIM_CONTENTION'
@@ -449,9 +455,36 @@ export class WorkerSlotLeaseService {
    * Retains the historical assignment.selected_worker_slot_id binding.
    */
   public release(leaseId: string, leaseToken: string): ReleaseLeaseResult {
+    return this.releaseInternal(leaseId, leaseToken, false);
+  }
+
+  /**
+   * Releases an expired lease during restart recovery. The expiry and owner
+   * token are checked inside the same immediate transaction as the lease and
+   * slot updates. This prevents a recovery scan that observed an old owner
+   * from releasing a lease after that owner has renewed it, and prevents a
+   * stale token from touching a newer lease generation.
+   */
+  public recoverExpiredLease(
+    leaseId: string,
+    leaseToken: string,
+    recoveredAt?: Date,
+    options?: { expectedTaskStates?: readonly TaskState[] },
+  ): ReleaseLeaseResult {
+    return this.releaseInternal(leaseId, leaseToken, true, recoveredAt, options?.expectedTaskStates);
+  }
+
+  private releaseInternal(
+    leaseId: string,
+    leaseToken: string,
+    requireExpired: boolean,
+    recoveredAt?: Date,
+    expectedTaskStates?: readonly TaskState[],
+  ): ReleaseLeaseResult {
     return this.repo.runInImmediateTransaction<ReleaseLeaseResult>(() => {
       const now = this.clock();
       const nowIso = now.toISOString();
+      const nowMs = now.getTime();
 
       const lease = this.repo.getAccountLease(leaseId);
       if (!lease || lease.released_at !== null) {
@@ -468,6 +501,24 @@ export class WorkerSlotLeaseService {
           code: 'LEASE_TOKEN_MISMATCH',
           error: `LEASE_TOKEN_MISMATCH: Provided token does not match lease "${leaseId}".`,
         };
+      }
+
+      if (requireExpired) {
+        const expiresMs = new Date(lease.expires_at).getTime();
+        if (!Number.isFinite(expiresMs)) {
+          return {
+            status: 'FAILED',
+            code: 'LEASE_EXPIRY_INVALID',
+            error: `LEASE_EXPIRY_INVALID: Lease "${leaseId}" has an invalid expiration timestamp and cannot be recovered automatically.`,
+          };
+        }
+        if (expiresMs > nowMs) {
+          return {
+            status: 'FAILED',
+            code: 'LEASE_NOT_EXPIRED',
+            error: `LEASE_NOT_EXPIRED: Lease "${leaseId}" expires at "${lease.expires_at}" and cannot be recovered before expiry.`,
+          };
+        }
       }
 
       const slot = this.repo.getWorkerSlot(lease.worker_slot_id);
@@ -488,7 +539,49 @@ export class WorkerSlotLeaseService {
         };
       }
 
-      const released = this.repo.releaseAccountLeaseWithToken(lease.id, leaseToken, nowIso);
+      // Account and slot bindings are part of the lease owner identity. A
+      // tampered or partially migrated row must never be released merely
+      // because its id and token still match.
+      if (slot.provider_account_id !== lease.provider_account_id || assignment.selected_account_id !== lease.provider_account_id) {
+        return {
+          status: 'FAILED',
+          code: 'DURABLE_BINDING_INVARIANT_FAILURE',
+          error: `DURABLE_BINDING_INVARIANT_FAILURE: Account binding mismatch for lease "${leaseId}".`,
+        };
+      }
+
+      if (requireExpired) {
+        const task = this.repo.getTask(assignment.task_id);
+        if (!task || task.project_id !== assignment.project_id) {
+          return {
+            status: 'FAILED',
+            code: 'DURABLE_BINDING_INVARIANT_FAILURE',
+            error: `DURABLE_BINDING_INVARIANT_FAILURE: Assignment/task project binding mismatch for lease "${leaseId}".`,
+          };
+        }
+        if (expectedTaskStates && !expectedTaskStates.includes(task.state)) {
+          return {
+            status: 'FAILED',
+            code: 'RECOVERY_TASK_STATE_CHANGED',
+            error: `RECOVERY_TASK_STATE_CHANGED: Task "${assignment.task_id}" is not in an approved recovery state for lease "${leaseId}".`,
+          };
+        }
+
+        // The scanner also performs this check before calling us, but repeat
+        // it inside the same immediate transaction as the lease/slot CAS. A
+        // provider process can start between the scanner's observation and
+        // this release otherwise, leaving an active owner without a fence.
+        if (this.repo.getProcessRunsByTask(assignment.task_id).some((process) => process.status === 'RUNNING')) {
+          return {
+            status: 'FAILED',
+            code: 'RECOVERY_PROCESS_STILL_RUNNING',
+            error: `RECOVERY_PROCESS_STILL_RUNNING: A RUNNING process remains for task "${assignment.task_id}"; lease recovery is quarantined.`,
+          };
+        }
+      }
+
+      const releaseAt = recoveredAt?.toISOString() ?? nowIso;
+      const released = this.repo.releaseAccountLeaseWithToken(lease.id, leaseToken, releaseAt);
       if (!released) {
         return {
           status: 'FAILED',

@@ -9,6 +9,7 @@ import { AdjudicationRecoveryScanReport } from '../types/adjudication';
 import { ProviderHealthObservationReplayReport } from './AccountHealthService';
 import { replayProviderHealthObservations } from './ProviderHealthApplication';
 import { ProcessRunRecoveryScanner, ProcessRunRecoveryScanReport } from './ProcessRunRecoveryScanner';
+import { ProductLeaseRecoveryScanReport, ProductLeaseRecoveryScanner } from './ProductLeaseRecoveryScanner';
 
 export interface RecoveryReport {
   migrationsApplied: boolean;
@@ -20,6 +21,7 @@ export interface RecoveryReport {
   processRecovery: ProcessRunRecoveryScanReport;
   executionRecovery?: ExecutionRecoveryScanReport;
   adjudicationRecovery?: AdjudicationRecoveryScanReport;
+  productLeaseRecovery?: ProductLeaseRecoveryScanReport;
   providerHealthReplay?: ProviderHealthObservationReplayReport;
 }
 
@@ -50,6 +52,14 @@ export class CrashRecoveryService {
     // 3b. Focused R5J5 Coder Submission Adjudication Recovery Scanner
     const adjudicationScanner = new CoderSubmissionAdjudicationRecoveryScanner(this.db, this.repo, this.eventService);
     const adjudicationRecoveryReport = adjudicationScanner.scanAndReconcile();
+
+    // Reconcile expired product account/worker leases after lifecycle
+    // scanners have fenced uncertain process ownership and before dispatch
+    // services are constructed. The product scanner uses owner-token and
+    // task-state CAS checks, so a stale startup observation cannot clear a
+    // renewed lease or an active provider execution.
+    const productLeaseScanner = new ProductLeaseRecoveryScanner(this.db, this.repo);
+    const productLeaseRecoveryReport = productLeaseScanner.scanAndReconcile();
 
     // 2c. Replay durable provider-health observations after lifecycle scanners
     // have reconciled their execution graph. Observation ingestion and account
@@ -104,6 +114,7 @@ export class CrashRecoveryService {
       processRecovery,
       executionRecovery: executionRecoveryReport,
       adjudicationRecovery: adjudicationRecoveryReport,
+      productLeaseRecovery: productLeaseRecoveryReport,
       providerHealthReplay,
     };
 
@@ -112,7 +123,7 @@ export class CrashRecoveryService {
       this.eventService.record(
         proj.id,
         'SYSTEM_STARTUP_RECOVERY',
-        `Startup recovery complete. Kept ${report.processRecovery.unresolvedCount} process runs recovery-fenced, released ${report.staleLeasesCleared} stale leases (${report.staleLeasesDeferred} deferred), scanned ${executionRecoveryReport.scannedCount} execution authorizations (${executionRecoveryReport.reconciledCount} reconciled, ${executionRecoveryReport.unresolvedCount} unresolved, ${executionRecoveryReport.rejectedCount} rejected, ${executionRecoveryReport.noOpCount} no-op), and replayed ${providerHealthReplay.scannedCount} provider health observations (${providerHealthReplay.appliedCount} applied, ${providerHealthReplay.alreadyAppliedCount} already applied, ${providerHealthReplay.unresolvedCount} unresolved, ${providerHealthReplay.errorCount} errors).`,
+        `Startup recovery complete. Kept ${report.processRecovery.unresolvedCount} process runs recovery-fenced, released ${report.staleLeasesCleared} stale leases (${report.staleLeasesDeferred} deferred), recovered ${productLeaseRecoveryReport.releasedCount} product leases (${productLeaseRecoveryReport.quarantinedCount} quarantined, ${productLeaseRecoveryReport.deferredCount} deferred), scanned ${executionRecoveryReport.scannedCount} execution authorizations (${executionRecoveryReport.reconciledCount} reconciled, ${executionRecoveryReport.unresolvedCount} unresolved, ${executionRecoveryReport.rejectedCount} rejected, ${executionRecoveryReport.noOpCount} no-op), and replayed ${providerHealthReplay.scannedCount} provider health observations (${providerHealthReplay.appliedCount} applied, ${providerHealthReplay.alreadyAppliedCount} already applied, ${providerHealthReplay.unresolvedCount} unresolved, ${providerHealthReplay.errorCount} errors).`,
         report as unknown as Record<string, unknown>
       );
     }
