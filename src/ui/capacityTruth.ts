@@ -60,10 +60,11 @@ export function deriveConnectivityState(input: {
   isElectron: boolean;
   loading?: boolean;
   refreshError?: string | null;
+  hasRefreshed?: boolean;
 }): ConnectivityState {
   if (!input.isElectron) return 'BROWSER_PREVIEW';
   if (input.refreshError) return 'ERROR';
-  if (input.loading) return 'CONNECTING';
+  if (input.loading || input.hasRefreshed !== true) return 'CONNECTING';
   return 'ONLINE';
 }
 

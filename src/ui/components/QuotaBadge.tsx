@@ -22,7 +22,7 @@ export const QuotaBadge: React.FC<QuotaBadgeProps> = ({
   const validation = validateQuotaSnapshot({ remaining, total });
   const sourceLabel = t(`quota.${quotaSourceLabel(source)}`);
 
-  if (!validation.valid || remaining === null || source === 'UNKNOWN') {
+  if (!validation.valid || remaining === null || quotaSourceLabel(source) === 'unknown') {
     return (
       <div className="inline-flex items-center space-x-1.5 px-2 py-0.5 rounded bg-slate-800 border border-slate-700 text-[11px] font-mono text-slate-400">
         <span className="w-1.5 h-1.5 rounded-full bg-slate-500"></span>

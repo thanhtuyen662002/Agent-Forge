@@ -86,16 +86,17 @@ export function resolveQuotaSnapshot(
 export const resolveQuotaUpdate = resolveQuotaSnapshot;
 
 export const CapacityView: React.FC = () => {
-  const { resources, updateResourceQuota } = useOrchestrator();
+  const { resources, updateResourceQuota, isElectron, pendingActions } = useOrchestrator();
   const { t } = useI18n();
   const [editingResource, setEditingResource] = useState<ProviderResource | null>(null);
   const [editRemaining, setEditRemaining] = useState<string>('');
   const [editTotal, setEditTotal] = useState<string>('');
   const [editError, setEditError] = useState<string | null>(null);
   const [saving, setSaving] = useState(false);
+  const quotaPending = saving || pendingActions.includes('updateQuota');
 
   const handleSaveQuota = async () => {
-    if (!editingResource || saving) return;
+    if (!editingResource || quotaPending || !isElectron) return;
     setEditError(null);
 
     if (!isQuotaInputValid(editRemaining) || !isQuotaInputValid(editTotal)) {
@@ -118,18 +119,21 @@ export const CapacityView: React.FC = () => {
 
     setSaving(true);
     try {
-      await updateResourceQuota(
+      const result = await updateResourceQuota(
         editingResource.id,
         snapshot.remaining,
         snapshot.total,
         snapshot.source,
         snapshot.confidence
       );
+      if (!result.success) {
+        if (result.code !== 'ACTION_PENDING') setEditError(t('capacity.saveError'));
+        return;
+      }
       setEditingResource(null);
       setEditRemaining('');
       setEditTotal('');
-    } catch (error) {
-      console.error('[CapacityView] Failed to save quota snapshot:', error);
+    } catch {
       setEditError(t('capacity.saveError'));
     } finally {
       setSaving(false);
@@ -188,6 +192,7 @@ export const CapacityView: React.FC = () => {
               </div>
 
               <button
+                disabled={!isElectron || quotaPending}
                 onClick={() => {
                   setEditingResource(res);
                   setEditRemaining(formatQuotaInput(res.remaining_quota));
@@ -221,6 +226,7 @@ export const CapacityView: React.FC = () => {
                   id="quota-remaining"
                   type="number"
                   min="0"
+                  disabled={quotaPending}
                   value={editRemaining}
                   onChange={(e) => setEditRemaining(e.target.value)}
                   placeholder={t('common.unknown')}
@@ -234,6 +240,7 @@ export const CapacityView: React.FC = () => {
                   id="quota-total"
                   type="number"
                   min="0"
+                  disabled={quotaPending}
                   value={editTotal}
                   onChange={(e) => setEditTotal(e.target.value)}
                   placeholder={t('common.unknown')}
@@ -250,6 +257,7 @@ export const CapacityView: React.FC = () => {
 
             <div className="flex justify-end space-x-3 pt-3 border-t border-surface-border">
               <button
+                disabled={quotaPending}
                 onClick={() => {
                   setEditingResource(null);
                   setEditRemaining('');
@@ -261,10 +269,11 @@ export const CapacityView: React.FC = () => {
               </button>
               <button
                 onClick={handleSaveQuota}
-                disabled={saving}
+                disabled={!isElectron || quotaPending}
+                aria-busy={quotaPending}
                 className="px-5 py-2 bg-forge-emerald hover:bg-emerald-600 disabled:opacity-50 disabled:cursor-not-allowed text-slate-950 font-mono font-bold rounded-lg text-xs shadow"
               >
-                {saving ? t('common.loading') : t('capacity.saveSnapshot')}
+                {quotaPending ? t('common.loading') : t('capacity.saveSnapshot')}
               </button>
             </div>
           </div>

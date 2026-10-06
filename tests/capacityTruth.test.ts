@@ -1,4 +1,6 @@
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
+import React from 'react';
+import { renderToStaticMarkup } from 'react-dom/server';
 import {
   clampQuotaPercent,
   clampProgressPercent,
@@ -7,7 +9,43 @@ import {
   validateQuotaSnapshot,
 } from '../src/ui/capacityTruth';
 
+const fixture = vi.hoisted(() => ({ context: {} as Record<string, unknown> }));
+vi.mock('../src/ui/context/OrchestratorContext', () => ({ useOrchestrator: () => fixture.context }));
+vi.mock('../src/ui/context/I18nContext', () => ({ useI18n: () => ({ t: (key: string) => key }) }));
+import { Sidebar } from '../src/ui/components/Sidebar';
+import { QuotaBadge } from '../src/ui/components/QuotaBadge';
+
+function sidebar(overrides: Record<string, unknown>) {
+  fixture.context = { activeView: 'dashboard', setActiveView: () => {}, tasks: [], densityMode: 'OWNER', isElectron: true, loading: false, refreshError: null, hasRefreshed: false, ...overrides };
+  return renderToStaticMarkup(React.createElement(Sidebar));
+}
+
 describe('capacity and capability truth', () => {
+  it('renders connectivity from confirmed IPC refresh and exposes preview/error without echoing errors', () => {
+    expect(sidebar({})).toContain('sidebar.connecting');
+    expect(sidebar({})).not.toContain('sidebar.online');
+    expect(sidebar({ hasRefreshed: true })).toContain('sidebar.online');
+    expect(sidebar({ isElectron: false, hasRefreshed: true })).toContain('sidebar.browserPreview');
+    const failed = sidebar({ hasRefreshed: true, refreshError: 'private-provider-error' });
+    expect(failed).toContain('sidebar.error');
+    expect(failed).not.toContain('sidebar.online');
+    expect(failed).not.toContain('private-provider-error');
+  });
+
+  it.each(['MANUAL', 'MEASURED', 'PROVIDER_REPORTED', 'ESTIMATED', 'UNKNOWN'] as const)('renders the explicit %s quota provenance', (source) => {
+    const markup = renderToStaticMarkup(React.createElement(QuotaBadge, { remaining: 50, total: 100, unit: 'REQUESTS', source }));
+    expect(markup).toContain(`quota.${quotaSourceLabel(source)}`);
+    if (source === 'PROVIDER_REPORTED') expect(markup).not.toContain('quota.estimated');
+  });
+
+  it('preserves zero totals and refuses a percentage for malformed or unknown quota', () => {
+    const render = (remaining: number, total: number, source: any = 'MANUAL') => renderToStaticMarkup(React.createElement(QuotaBadge, { remaining, total, unit: 'REQUESTS', source }));
+    expect(render(0, 0)).toContain('0/0');
+    for (const markup of [render(-1, 100), render(101, 100), render(Number.NaN, 100), render(50, 100, 'UNRECOGNIZED')]) {
+      expect(markup).toContain('quota.unknown');
+      expect(markup).not.toContain('%');
+    }
+  });
   it.each([
     [{ remaining: 25, total: 100 }, { valid: true, remaining: 25, total: 100 }],
     [{ remaining: 0, total: 0 }, { valid: true, remaining: 0, total: 0 }],
@@ -53,6 +91,8 @@ describe('capacity and capability truth', () => {
   it('derives offline/error states before online', () => {
     expect(deriveConnectivityState({ isElectron: false, refreshError: null })).toBe('BROWSER_PREVIEW');
     expect(deriveConnectivityState({ isElectron: true, refreshError: 'offline' })).toBe('ERROR');
-    expect(deriveConnectivityState({ isElectron: true, refreshError: null })).toBe('ONLINE');
+    expect(deriveConnectivityState({ isElectron: true, refreshError: null })).toBe('CONNECTING');
+    expect(deriveConnectivityState({ isElectron: true, refreshError: null, hasRefreshed: true })).toBe('ONLINE');
+    expect(deriveConnectivityState({ isElectron: true, loading: true, hasRefreshed: true })).toBe('CONNECTING');
   });
 });

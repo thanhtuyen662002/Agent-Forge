@@ -17,9 +17,9 @@ import {
 } from 'lucide-react';
 
 export const Sidebar: React.FC = () => {
-  const { activeView, setActiveView, tasks, densityMode, isElectron, loading, refreshError } = useOrchestrator();
+  const { activeView, setActiveView, tasks, densityMode, isElectron, loading, refreshError, hasRefreshed } = useOrchestrator();
   const { t } = useI18n();
-  const connectivity = deriveConnectivityState({ isElectron, loading, refreshError });
+  const connectivity = deriveConnectivityState({ isElectron, loading, refreshError, hasRefreshed });
 
   const pendingBridgeTasks = tasks.filter(
     (t) => t.state === 'CODING' || t.state === 'REVIEW_READY' || t.state === 'PLANNED'
