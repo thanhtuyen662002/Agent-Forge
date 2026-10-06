@@ -38,6 +38,55 @@ jobs:
           GITHUB_EVENT_NAME="${{ github.event_name }}" node scripts/ci-change-classifier.cjs \
             "${{ github.event.pull_request.base.sha }}" "$EXPECTED_SHA" >> "$GITHUB_OUTPUT"
 
+  windows-test-shards:
+    name: Windows test shard ${{ matrix.shard }}/4
+    needs: classify
+    if: needs.classify.outputs.package_required == 'true'
+    runs-on: windows-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [1, 2, 3, 4]
+    steps:
+      - name: Checkout exact source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Verify shard source identity
+        shell: bash
+        run: |
+          EXPECTED_SHA="${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}"
+          test "$(git rev-parse HEAD)" = "$EXPECTED_SHA"
+
+      - name: Setup Node.js 22.x
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: '22.x'
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      # Each machine owns its fixtures. Keep one worker and the existing
+      # parent/worker output sanitizers within each complete-suite shard.
+      - name: Run complete suite shard
+        env:
+          AGENTFORGE_TEST_SINGLE_RUN: '1'
+          AGENTFORGE_TEST_FILES: ''
+          AGENTFORGE_TEST_PHASE: ''
+        run: npm test -- --shard=${{ matrix.shard }}/4
+
+      - name: Write shard summary
+        if: always()
+        shell: bash
+        run: |
+          echo "### Windows full-suite shard ${{ matrix.shard }}/4" >> "$GITHUB_STEP_SUMMARY"
+          echo "- Exact source: $(git rev-parse HEAD)" >> "$GITHUB_STEP_SUMMARY"
+          echo "- Result: ${{ job.status }}" >> "$GITHUB_STEP_SUMMARY"
+
   validate:
     name: Validate (${{ matrix.os }}, Node ${{ matrix.node-version }})
     needs: classify
@@ -46,7 +95,6 @@ jobs:
       fail-fast: false
       matrix:
         os:
-          - windows-latest
           - ubuntu-latest
         node-version:
           - '22.x'
@@ -87,20 +135,8 @@ jobs:
         if: needs.classify.outputs.package_required == 'true'
         run: npm ci
 
-      # The suite exercises real SQLite databases and child processes. Keep a
-      # single Vitest worker on every OS so temporary fixtures cannot be
-      # cleaned up while a sibling worker still holds a file or process handle.
       - name: Run test suite (Ubuntu)
         if: needs.classify.outputs.package_required == 'true' && runner.os != 'Windows'
-        run: npm test
-
-      - name: Run test suite (Windows)
-        if: needs.classify.outputs.package_required == 'true' && runner.os == 'Windows'
-        # Windows file/process handles are more sensitive to phase boundaries;
-        # keep the historical single Vitest process while retaining the
-        # two-phase runner for Ubuntu and local diagnostics.
-        env:
-          AGENTFORGE_TEST_SINGLE_RUN: '1'
         run: npm test
 
       - name: Build application
@@ -126,9 +162,64 @@ jobs:
           echo "- **Full runtime evidence required**: \`${{ needs.classify.outputs.package_required }}\`" >> $GITHUB_STEP_SUMMARY
           echo "- **Result**: \`${{ job.status }}\`" >> $GITHUB_STEP_SUMMARY
 
+  validate-windows:
+    name: Validate (windows-latest, Node 22.x)
+    needs: [classify, windows-test-shards]
+    if: always()
+    runs-on: windows-latest
+    steps:
+      - name: Checkout exact source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Verify aggregate source identity
+        shell: bash
+        run: |
+          EXPECTED_SHA="${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}"
+          test "$(git rev-parse HEAD)" = "$EXPECTED_SHA"
+
+      - name: Require complete Windows suite
+        env:
+          CI_CLASSIFY_RESULT: ${{ needs.classify.result }}
+          CI_PACKAGE_REQUIRED: ${{ needs.classify.outputs.package_required }}
+          CI_WINDOWS_SHARDS_RESULT: ${{ needs.windows-test-shards.result }}
+        run: node scripts/ci-windows-test-gate.cjs
+
+      - name: Setup Node.js 22.x
+        if: needs.classify.outputs.package_required == 'true'
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: '22.x'
+          cache: 'npm'
+
+      - name: Install dependencies
+        if: needs.classify.outputs.package_required == 'true'
+        run: npm ci
+
+      - name: Build application
+        if: needs.classify.outputs.package_required == 'true'
+        run: npm run build
+
+      - name: Validate PR diff hygiene
+        if: github.event_name == 'pull_request'
+        shell: bash
+        run: git diff --check ${{ github.event.pull_request.base.sha }}...HEAD
+
+      - name: Write Windows aggregate summary
+        if: always()
+        shell: bash
+        run: |
+          echo "### Required Windows validation" >> "$GITHUB_STEP_SUMMARY"
+          echo "- Exact source: $(git rev-parse HEAD)" >> "$GITHUB_STEP_SUMMARY"
+          echo "- Complete shard matrix: ${{ needs.windows-test-shards.result }}" >> "$GITHUB_STEP_SUMMARY"
+          echo "- Build and aggregate result: ${{ job.status }}" >> "$GITHUB_STEP_SUMMARY"
+
   package-windows:
     name: Package Windows (windows-latest, Node 22.x)
-    needs: [classify, validate]
+    needs: [classify, validate, validate-windows]
     if: always()
     runs-on: windows-latest
     steps:
@@ -137,6 +228,7 @@ jobs:
         run: |
           test '${{ needs.classify.result }}' = 'success'
           test '${{ needs.validate.result }}' = 'success'
+          test '${{ needs.validate-windows.result }}' = 'success'
           test '${{ needs.classify.outputs.package_required }}' = 'true' -o '${{ needs.classify.outputs.package_required }}' = 'false'
 
       - name: Checkout exact source
