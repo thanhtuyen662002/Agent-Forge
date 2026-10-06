@@ -3,6 +3,7 @@ import { useOrchestrator } from '../context/OrchestratorContext';
 import { useI18n } from '../context/I18nContext';
 import { UIDensityMode } from '../../core/types/domain';
 import { ShieldAlert, Play, Pause, FolderGit2, Activity, Cpu, Languages } from 'lucide-react';
+import { uiActionFailureKey } from '../actionState';
 
 export const Header: React.FC = () => {
   const {
@@ -17,9 +18,17 @@ export const Header: React.FC = () => {
     resumeProject,
     tasks,
     agents,
+    isElectron,
+    pendingActions,
+    actionResults,
   } = useOrchestrator();
 
   const { locale, setLocale, t } = useI18n();
+  const actionPending = pendingActions.includes('projectTransition');
+  const actionResult = actionResults.projectTransition;
+  const actionNotice = actionPending ? t('actions.pending') : actionResult
+    ? actionResult.success ? t('actions.success') : t(uiActionFailureKey(actionResult.code))
+    : null;
 
   const doneTasks = tasks.filter((t) => t.state === 'DONE').length;
   const activeAgents = agents.filter((a) => a.status === 'ACTIVE' || a.status === 'BUSY').length;
@@ -79,7 +88,7 @@ export const Header: React.FC = () => {
           </div>
           <div>
             <h1 className="text-sm font-semibold text-white tracking-wide uppercase font-mono">{t('app.title')}</h1>
-            <span className="text-xs text-slate-400 block -mt-0.5">{t('app.modeDesktop')}</span>
+            <span className="text-xs text-slate-400 block -mt-0.5">{t(isElectron ? 'app.modeDesktop' : 'actions.previewReadOnly')}</span>
           </div>
         </div>
 
@@ -90,6 +99,7 @@ export const Header: React.FC = () => {
             <>
               <select
                 value={activeProject?.id || ''}
+                disabled={pendingActions.length > 0}
                 onChange={(e) => {
                   const selected = projects.find((p) => p.id === e.target.value);
                   setActiveProject(selected || null);
@@ -140,6 +150,7 @@ export const Header: React.FC = () => {
 
       {/* Right: UI Density Mode, Language Selector & Controls */}
       <div className="flex items-center space-x-3">
+        {actionNotice && <span role={actionResult && !actionResult.success && !actionPending ? 'alert' : 'status'} className="max-w-48 text-[10px] leading-tight text-slate-200">{actionNotice}</span>}
         {/* Language Selector */}
         <div className="flex items-center bg-surface-card border border-surface-border rounded-lg p-1 text-xs font-mono">
           <button
@@ -173,36 +184,47 @@ export const Header: React.FC = () => {
         {activeProject?.status === 'READY' && (
           <button
             onClick={() => transitionProject('START_PROJECT')}
+            disabled={!isElectron || actionPending}
+            aria-busy={actionPending}
+            title={!isElectron ? t('actions.desktopRequired') : undefined}
             className="px-3 py-1.5 bg-forge-emerald hover:bg-emerald-600 text-slate-950 font-semibold text-xs rounded-md flex items-center space-x-1.5 shadow-md shadow-emerald-950/40 transition"
           >
             <Play className="w-3.5 h-3.5 fill-current" />
-            <span>{t('header.startProject')}</span>
+            <span>{actionPending ? t('actions.pending') : t('header.startProject')}</span>
           </button>
         )}
 
         {activeProject?.status === 'RUNNING' && (
           <button
             onClick={() => transitionProject('PAUSE')}
+            disabled={!isElectron || actionPending}
+            aria-busy={actionPending}
+            title={!isElectron ? t('actions.desktopRequired') : undefined}
             className="px-3 py-1.5 bg-amber-500/20 border border-amber-500/40 hover:bg-amber-500/30 text-amber-300 font-semibold text-xs rounded-md flex items-center space-x-1.5 transition"
           >
             <Pause className="w-3.5 h-3.5" />
-            <span>{t('header.pause')}</span>
+            <span>{actionPending ? t('actions.pending') : t('header.pause')}</span>
           </button>
         )}
 
         {activeProject?.status === 'PAUSED' && (
           <button
             onClick={resumeProject}
+            disabled={!isElectron || actionPending}
+            aria-busy={actionPending}
+            title={!isElectron ? t('actions.desktopRequired') : undefined}
             className="px-3 py-1.5 bg-emerald-500/20 border border-emerald-500/40 hover:bg-emerald-500/30 text-emerald-300 font-semibold text-xs rounded-md flex items-center space-x-1.5 transition"
           >
             <Play className="w-3.5 h-3.5 fill-current" />
-            <span>{t('header.resume')}</span>
+            <span>{actionPending ? t('actions.pending') : t('header.resume')}</span>
           </button>
         )}
 
         {/* Emergency Stop Button */}
         <button
           onClick={() => setIsEmergencyStopOpen(true)}
+          disabled={!isElectron}
+          title={!isElectron ? t('actions.desktopRequired') : undefined}
           className="px-3.5 py-1.5 bg-rose-600 hover:bg-rose-700 text-white font-mono font-bold text-xs rounded-md flex items-center space-x-2 shadow-lg shadow-rose-950/60 glow-rose transition"
         >
           <ShieldAlert className="w-4 h-4" />

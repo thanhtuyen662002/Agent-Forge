@@ -2,9 +2,10 @@ import React, { useState } from 'react';
 import { useOrchestrator } from '../context/OrchestratorContext';
 import { useI18n } from '../context/I18nContext';
 import { FolderGit2, Plus, FileCode, FolderOpen } from 'lucide-react';
+import { uiActionFailureKey } from '../actionState';
 
 export const ProjectsView: React.FC = () => {
-  const { projects, activeProject, createProject, importContract } = useOrchestrator();
+  const { projects, activeProject, createProject, importContract, isElectron, pendingActions } = useOrchestrator();
   const { t } = useI18n();
   const [isCreateOpen, setIsCreateOpen] = useState<boolean>(false);
   const [name, setName] = useState<string>('');
@@ -14,6 +15,9 @@ export const ProjectsView: React.FC = () => {
   const [contractJson, setContractJson] = useState<string>('');
   const [importStatus, setImportStatus] = useState<string | null>(null);
   const [errorStatus, setErrorStatus] = useState<string | null>(null);
+  const [importSucceeded, setImportSucceeded] = useState(false);
+  const creating = pendingActions.includes('createProject');
+  const importing = pendingActions.includes('importContract');
 
   const handleSelectDirectory = async () => {
     setErrorStatus(null);
@@ -49,29 +53,40 @@ export const ProjectsView: React.FC = () => {
     if (!name.trim() || !selectionId.trim()) return;
     setErrorStatus(null);
     try {
-      await createProject({
+      const result = await createProject({
         name: name.trim(),
         description: desc.trim(),
         repositorySelectionId: selectionId,
       });
+      if (!result.success) {
+        setErrorStatus(t(uiActionFailureKey(result.code)));
+        return;
+      }
       setName('');
       setDesc('');
       setSelectionId('');
       setDisplayPath('');
       setIsCreateOpen(false);
     } catch (err: any) {
-      setErrorStatus(`${t('common.error')}: ${err.message}`);
+      setErrorStatus(t('actions.requestRejected'));
     }
   };
 
   const handleImportContract = async () => {
     if (!contractJson.trim()) return;
+    setImportStatus(null);
+    setImportSucceeded(false);
     try {
       const parsed = JSON.parse(contractJson);
-      await importContract(parsed);
+      const result = await importContract(parsed);
+      if (!result.success) {
+        setImportStatus(t(uiActionFailureKey(result.code)));
+        return;
+      }
+      setImportSucceeded(true);
       setImportStatus(t('projects.importSuccess'));
     } catch (err: any) {
-      setImportStatus(t('projects.importError', { error: err.message }));
+      setImportStatus(t('actions.invalidResponse'));
     }
   };
 
@@ -89,6 +104,8 @@ export const ProjectsView: React.FC = () => {
         </div>
 
         <button
+          disabled={!isElectron || creating}
+          title={!isElectron ? t('actions.desktopRequired') : undefined}
           onClick={() => {
             setIsCreateOpen(true);
             setErrorStatus(null);
@@ -111,6 +128,7 @@ export const ProjectsView: React.FC = () => {
         </p>
 
         <textarea
+          disabled={importing}
           value={contractJson}
           onChange={(e) => setContractJson(e.target.value)}
           placeholder={`{
@@ -123,7 +141,7 @@ export const ProjectsView: React.FC = () => {
         />
 
         {importStatus && (
-          <div className="p-3 bg-emerald-950/30 border border-emerald-800/40 text-emerald-300 rounded-lg text-xs font-mono">
+          <div role={importSucceeded ? 'status' : 'alert'} className={`p-3 border rounded-lg text-xs font-mono ${importSucceeded ? 'bg-emerald-950/30 border-emerald-800/40 text-emerald-300' : 'bg-rose-950/30 border-rose-800/40 text-rose-300'}`}>
             {importStatus}
           </div>
         )}
@@ -131,9 +149,12 @@ export const ProjectsView: React.FC = () => {
         <div className="flex justify-end">
           <button
             onClick={handleImportContract}
+            disabled={!isElectron || !activeProject || importing || !contractJson.trim()}
+            aria-busy={importing}
+            title={!isElectron ? t('actions.desktopRequired') : undefined}
             className="px-5 py-2 bg-forge-purple hover:bg-purple-600 text-white font-mono font-bold text-xs rounded-lg shadow transition"
           >
-            {t('projects.importButton')}
+            {importing ? t('actions.pending') : t('projects.importButton')}
           </button>
         </div>
       </div>
@@ -173,6 +194,7 @@ export const ProjectsView: React.FC = () => {
                     <button
                       type="button"
                       onClick={handleSelectDirectory}
+                      disabled={!isElectron || creating}
                       className="px-3 py-2 bg-surface-border hover:bg-slate-700 text-slate-200 rounded-lg flex items-center space-x-1.5 transition font-semibold"
                     >
                       <FolderOpen className="w-3.5 h-3.5 text-forge-cyan" />
@@ -194,7 +216,7 @@ export const ProjectsView: React.FC = () => {
               </div>
 
               {errorStatus && (
-                <div className="p-2.5 bg-rose-950/40 border border-rose-800/50 text-rose-300 rounded-lg text-xs font-mono">
+                <div role="alert" className="p-2.5 bg-rose-950/40 border border-rose-800/50 text-rose-300 rounded-lg text-xs font-mono">
                   {errorStatus}
                 </div>
               )}
@@ -203,16 +225,18 @@ export const ProjectsView: React.FC = () => {
                 <button
                   type="button"
                   onClick={() => setIsCreateOpen(false)}
+                  disabled={creating}
                   className="px-4 py-2 bg-surface-card hover:bg-surface-border text-slate-300 rounded-lg text-xs"
                 >
                   {t('projects.createModal.cancelButton')}
                 </button>
                 <button
                   type="submit"
-                  disabled={!selectionId}
+                  disabled={!isElectron || creating || !selectionId || !name.trim()}
+                  aria-busy={creating}
                   className="px-5 py-2 bg-forge-cyan hover:bg-cyan-600 disabled:opacity-40 disabled:cursor-not-allowed text-slate-950 font-bold rounded-lg text-xs shadow"
                 >
-                  {t('projects.createModal.initButton')}
+                  {creating ? t('actions.pending') : t('projects.createModal.initButton')}
                 </button>
               </div>
             </form>
