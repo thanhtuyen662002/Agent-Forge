@@ -69,7 +69,8 @@ Owner Selects Candidate Resource (e.g. Gemini Coder / Manual Bridge)
        ↓
 Execution Authorization Created (Status: AUTHORIZED, Revision-bound, Manager-bound)
        ↓
-One-Time Dispatch -> Executes Manual Bridge -> Task moves to AWAITING_OWNER
+One-Time Dispatch -> Manual Bridge returns provider result AWAITING_OWNER
+                    -> Durable task state remains CODING or HANDOFF_REQUIRED
                     -> Authorization durable status in SQLite becomes DISPATCHED
        ↓
 Generate Cryptographic Authorized WorkOrder (PackageGenerator.generateAuthorizedManualWorkOrder)
@@ -100,7 +101,7 @@ Review Ready (Task moves to REVIEW_READY) -> Generate Review Package with author
 
 ## 6. Restart Recovery Verification
 
-1. With a task in `AWAITING_OWNER` or `REVIEW_READY`, close the application.
+1. With a dispatched Manual Bridge authorization (`AWAITING_OWNER`) bound to a task in `CODING` or `HANDOFF_REQUIRED`, or with a task in `REVIEW_READY`, close the application.
 2. Relaunch `AgentForge.exe`.
 3. Verify:
    - SQLite state is preserved (Project, Task, Protocol Messages, Events, Authorizations).
@@ -123,6 +124,7 @@ Review Ready (Task moves to REVIEW_READY) -> Generate Review Package with author
   - The installed production application (`AgentForge.exe`) strictly connects to GitHub Releases (`thanhtuyen662002/Agent-Forge`).
 - **Update Final Gate Evaluation**:
   - Download and SHA-512 blockmap verification are automated and verified.
+  - The installed-update test uses isolated test NSIS artifacts and a local generic feed to verify discovery/download and the `DOWNLOADED` (`canInstall=true`) gate. This does not represent a published or signed production release.
   - Final Windows binary replacement and elevation restart requires interactive elevation approval (`FULL_UPDATE_INSTALL_RESTART_TEST=MANUAL_FINAL_GATE_REQUIRED`).
 
 ---
