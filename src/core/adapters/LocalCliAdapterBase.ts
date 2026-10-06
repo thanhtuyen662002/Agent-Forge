@@ -15,6 +15,11 @@ import { ArtifactStore } from '../services/ArtifactStore';
 import { ProcessRunner, ProcessRunResult } from '../services/ProcessRunner';
 import { PolicyService } from '../services/PolicyService';
 import { ProtocolParser } from '../protocol/parser';
+import {
+  canonicalizePortableRelativePath,
+  canonicalizePortableRelativePathList,
+  ContextPathError,
+} from '../context/ContextIntegrity';
 
 const LOCAL_CLI_WORKSPACE_VERSION = 1;
 const LOCAL_CLI_WORKSPACE_BASE = path.join(os.tmpdir(), 'agent-forge-local-cli-workspaces');
@@ -145,18 +150,14 @@ function localCliContained(targetPath: string, rootPath: string, allowRoot = tru
 }
 
 function localCliCanonicalRelative(rawPath: string): string {
-  const slash = rawPath.trim().replace(/\\/g, '/');
-  if (!slash || path.posix.isAbsolute(slash) || path.win32.isAbsolute(rawPath) || /^[a-zA-Z]:/.test(rawPath)) {
-    throw new LocalCliWorkspaceError('CONTEXT_PATH_INVALID', 'context paths must be non-empty repository-relative paths');
+  try {
+    return canonicalizePortableRelativePath(rawPath);
+  } catch (error) {
+    if (error instanceof ContextPathError) {
+      throw new LocalCliWorkspaceError(error.code, error.message.slice(error.code.length + 2));
+    }
+    throw new LocalCliWorkspaceError('CONTEXT_PATH_INVALID', 'context path could not be canonicalized safely');
   }
-  if (process.platform === 'win32' && slash.split('/').some((segment) => segment.includes(':'))) {
-    throw new LocalCliWorkspaceError('CONTEXT_PATH_INVALID', 'Windows alternate data stream paths are not allowed');
-  }
-  const normalized = path.posix.normalize(slash.replace(/^\.\//, ''));
-  if (normalized === '.' || normalized === '..' || normalized.startsWith('../') || normalized.includes('/../')) {
-    throw new LocalCliWorkspaceError('CONTEXT_PATH_INVALID', `context path is not safely relative: ${rawPath}`);
-  }
-  return normalized;
 }
 
 function localCliPolicyOrThrow(targetPath: string, rootPath: string, relativePath: string, isWrite: boolean): void {
@@ -179,7 +180,15 @@ function localCliPolicyOrThrow(targetPath: string, rootPath: string, relativePat
 }
 
 function localCliReadStableFile(filePath: string, rootPath: string): { buffer: Buffer; identity: LocalCliFileIdentity; mode: number } {
-  const relative = path.relative(rootPath, filePath).replace(/\\/g, '/');
+  let relative: string;
+  try {
+    relative = canonicalizePortableRelativePath(path.relative(rootPath, filePath));
+  } catch (error) {
+    if (error instanceof ContextPathError) {
+      throw new LocalCliWorkspaceError(error.code, error.message.slice(error.code.length + 2));
+    }
+    throw new LocalCliWorkspaceError('CONTEXT_PATH_INVALID', 'context path could not be canonicalized safely');
+  }
   localCliPolicyOrThrow(filePath, rootPath, relative, false);
   let stat: fs.Stats;
   try {
@@ -496,8 +505,19 @@ function localCliCollectContextFiles(sourceRoot: string, contextFiles: string[])
     if (depth > LOCAL_CLI_WORKSPACE_MAX_TRAVERSAL_DEPTH) {
       throw new LocalCliWorkspaceError('CONTEXT_LIMIT_EXCEEDED', 'authorized context exceeds the directory nesting limit');
     }
-    const relative = path.relative(sourceRoot, absolutePath).replace(/\\/g, '/');
-    if (!relative || relative.startsWith('../') || path.isAbsolute(relative)) throw new LocalCliWorkspaceError('CONTEXT_PATH_INVALID', 'context escaped the source root');
+    let relative: string;
+    try {
+      // Canonicalize before lstat/realpath/policy work for this entry.  The
+      // directory name came from the filesystem, but it still crosses the
+      // manifest boundary and must obey exactly the same portable rules as an
+      // explicitly supplied path.
+      relative = canonicalizePortableRelativePath(path.relative(sourceRoot, absolutePath));
+    } catch (error) {
+      if (error instanceof ContextPathError) {
+        throw new LocalCliWorkspaceError(error.code, error.message.slice(error.code.length + 2));
+      }
+      throw new LocalCliWorkspaceError('CONTEXT_PATH_INVALID', 'context path could not be canonicalized safely');
+    }
     let stat: fs.Stats;
     try { stat = fs.lstatSync(absolutePath); } catch (error) { if (localCliIsMissing(error)) return; throw error; }
     if (stat.isSymbolicLink()) throw new LocalCliWorkspaceError('CONTEXT_REPARSE_POINT', `symbolic link context is forbidden: ${relative}`);
@@ -548,8 +568,17 @@ function localCliCollectContextFiles(sourceRoot: string, contextFiles: string[])
     }
   };
 
+  const caseInsensitivePaths = new Map<string, string>();
   for (const rawPath of contextFiles) {
     const relative = localCliCanonicalRelative(rawPath);
+    if (process.platform === 'win32' || process.platform === 'darwin') {
+      const folded = relative.toLocaleLowerCase('en-US');
+      const prior = caseInsensitivePaths.get(folded);
+      if (prior !== undefined && prior !== relative) {
+        throw new LocalCliWorkspaceError('CONTEXT_PATH_ALIAS', 'case-colliding context path aliases are not allowed on this filesystem');
+      }
+      caseInsensitivePaths.set(folded, relative);
+    }
     const absolute = path.resolve(sourceRoot, relative);
     if (!localCliContained(absolute, sourceRoot)) throw new LocalCliWorkspaceError('CONTEXT_PATH_INVALID', `context escaped the source root: ${relative}`);
     localCliPolicyOrThrow(absolute, realRoot, relative, false);
@@ -1056,24 +1085,61 @@ export abstract class LocalCliAdapterBase implements ProviderAdapter {
       }
 
       // 4. Validate Context Files (must be strictly inside executionRoot, no path traversal)
-      for (const contextFile of request.contextFiles) {
-        const canonicalTarget = path.normalize(path.resolve(executionRoot, contextFile));
+      if (request.contextFiles.length > LOCAL_CLI_WORKSPACE_MAX_CONTEXT_PATHS) {
+        return {
+          executionId,
+          status: 'FAILED',
+          errorCode: 'POLICY_DENIAL',
+          error: 'CONTEXT_LIMIT_EXCEEDED: authorized context contains too many paths',
+        };
+      }
+      let canonicalContextFiles: string[];
+      try {
+        // Canonicalize the complete list before path.resolve or PolicyService
+        // can inspect even the first entry.  This also rejects case aliases
+        // before any filesystem operation on case-insensitive hosts.
+        canonicalContextFiles = canonicalizePortableRelativePathList(request.contextFiles);
+      } catch (error) {
+        const contextError = error instanceof ContextPathError
+          ? new LocalCliWorkspaceError(error.code, error.message.slice(error.code.length + 2))
+          : error instanceof LocalCliWorkspaceError
+            ? error
+            : new LocalCliWorkspaceError('CONTEXT_PATH_INVALID', 'context path could not be canonicalized safely');
+        const compatibilityDetail = contextError.code === 'CONTEXT_PATH_TRAVERSAL'
+          ? ' SECURITY_POLICY_VIOLATION: Context file violates security policy because it is outside the authorized project root.'
+          : '';
+        return {
+          executionId,
+          status: 'FAILED',
+          errorCode: 'POLICY_DENIAL',
+          error: `${contextError.message}${compatibilityDetail}`,
+        };
+      }
+      for (const canonicalContextFile of canonicalContextFiles) {
+        const canonicalTarget = path.normalize(path.resolve(executionRoot, canonicalContextFile));
         const filePolicy = PolicyService.evaluateRealPathAccess(canonicalTarget, executionRoot, false);
         if (!filePolicy.allowed) {
           return {
             executionId,
             status: 'FAILED',
             errorCode: 'POLICY_DENIAL',
-            error: `SECURITY_POLICY_VIOLATION: Context file "${contextFile}" violates security policy: ${filePolicy.reason} (${filePolicy.decision})`,
+            error: `SECURITY_POLICY_VIOLATION: Context file violates security policy: ${filePolicy.reason} (${filePolicy.decision})`,
           };
         }
       }
 
       // 5. Build prompt and CLI arguments
-      const prompt = this.buildPrompt(request);
-      const args = this.buildExecutionArgs(request, prompt);
-      const executionEnv = this.resolveExecutionEnvironment(request);
-      const allowedEnvKeys = this.getAllowedEnvironmentOverrideKeys(request);
+      // Use the exact validated spelling for both provider instructions and
+      // workspace preparation.  This avoids showing the provider an alias
+      // that resolves differently from the files actually copied into cwd.
+      const canonicalRequest: AgentExecutionRequest = {
+        ...request,
+        contextFiles: canonicalContextFiles,
+      };
+      const prompt = this.buildPrompt(canonicalRequest);
+      const args = this.buildExecutionArgs(canonicalRequest, prompt);
+      const executionEnv = this.resolveExecutionEnvironment(canonicalRequest);
+      const allowedEnvKeys = this.getAllowedEnvironmentOverrideKeys(canonicalRequest);
 
       // 5b. Pre-spawn cancellation check
       const control = isScheduled ? this.activeExecutions.get(executionId) : undefined;
@@ -1090,7 +1156,7 @@ export abstract class LocalCliAdapterBase implements ProviderAdapter {
       try {
         localWorkspace = localCliPrepareWorkspace(
           executionRoot,
-          request.contextFiles,
+          canonicalContextFiles,
           executionId,
           request.runtimeBinding?.workspace?.ownershipDigest ?? '',
         );
