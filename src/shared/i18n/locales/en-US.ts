@@ -86,6 +86,9 @@ export const enUS: TranslationDictionary = {
     orchestration: 'Orchestration',
     mode: 'Mode',
     online: 'ONLINE',
+    connecting: 'CONNECTING',
+    browserPreview: 'BROWSER PREVIEW',
+    error: 'OFFLINE / ERROR',
     offlineTag: 'Offline SQLite • Local-First',
   },
   dashboard: {
@@ -222,11 +225,16 @@ export const enUS: TranslationDictionary = {
     totalUnits: 'Total Allocated Units',
     cancel: 'Cancel',
     saveSnapshot: 'Save Quota Snapshot',
+    invalidNumber: 'Enter finite, non-negative numbers or leave a value empty.',
+    nonNegative: 'Quota values cannot be negative.',
+    remainingExceedsTotal: 'Remaining quota cannot exceed the total allocation.',
+    saveError: 'The quota snapshot could not be saved. Check the desktop connection and retry.',
   },
   quota: {
     unknown: 'QUOTA UNKNOWN',
     manual: 'MANUAL',
     measured: 'MEASURED',
+    providerReported: 'PROVIDER REPORTED',
     estimated: 'ESTIMATED',
   },
   timeline: {

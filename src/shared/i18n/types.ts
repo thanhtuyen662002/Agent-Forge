@@ -89,6 +89,9 @@ export interface TranslationDictionary {
     orchestration: string;
     mode: string;
     online: string;
+    connecting: string;
+    browserPreview: string;
+    error: string;
     offlineTag: string;
   };
   dashboard: {
@@ -225,11 +228,16 @@ export interface TranslationDictionary {
     totalUnits: string;
     cancel: string;
     saveSnapshot: string;
+    invalidNumber: string;
+    nonNegative: string;
+    remainingExceedsTotal: string;
+    saveError: string;
   };
   quota: {
     unknown: string;
     manual: string;
     measured: string;
+    providerReported: string;
     estimated: string;
   };
   timeline: {

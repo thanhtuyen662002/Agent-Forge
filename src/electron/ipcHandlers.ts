@@ -737,13 +737,18 @@ export function registerIpcHandlers(
       return { success: false, error: parsed.error.issues.map((i) => i.message).join(', ') };
     }
 
-    repo.updateProviderResourceQuota(
-      parsed.data.id,
-      parsed.data.remaining,
-      parsed.data.total,
-      parsed.data.source,
-      parsed.data.confidence
-    );
+    const updated = repo.runInImmediateTransaction(() => {
+      if (!repo.getProviderResource(parsed.data.id)) return false;
+      repo.updateProviderResourceQuota(
+        parsed.data.id,
+        parsed.data.remaining,
+        parsed.data.total,
+        parsed.data.source,
+        parsed.data.confidence
+      );
+      return true;
+    });
+    if (!updated) return { success: false, error: 'RESOURCE_NOT_FOUND' };
     return { success: true };
   });
 

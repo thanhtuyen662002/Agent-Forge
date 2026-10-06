@@ -23,6 +23,7 @@ interface OrchestratorContextType {
   selectedTaskId: string | null;
   loading: boolean;
   refreshError: string | null;
+  hasRefreshed: boolean;
   pendingActions: UiActionName[];
   actionResults: Partial<Record<UiActionName, UiActionResult<unknown>>>;
   setDensityMode: (mode: UIDensityMode) => void;
@@ -40,7 +41,7 @@ interface OrchestratorContextType {
   generateWorkOrder: (taskId: string) => Promise<string>;
   generateReviewPackage: (taskId: string) => Promise<string>;
   runVerificationTests: (taskId: string, commandConfigId?: string) => Promise<any>;
-  updateResourceQuota: (id: string, remaining: number | null, total: number | null, source: string, confidence: number) => Promise<void>;
+  updateResourceQuota: (id: string, remaining: number | null, total: number | null, source: string, confidence: number) => Promise<UiActionResult>;
   triggerEmergencyStop: (reason?: string) => Promise<any>;
   resumeProject: () => Promise<UiActionResult>;
   routeTask: (data: {
@@ -121,6 +122,7 @@ export const OrchestratorProvider: React.FC<{ children: React.ReactNode }> = ({ 
   const [selectedTaskId, setSelectedTaskId] = useState<string | null>(null);
   const [loading, setLoading] = useState<boolean>(false);
   const [refreshError, setRefreshError] = useState<string | null>(null);
+  const [hasRefreshed, setHasRefreshed] = useState(false);
   const [pendingActions, setPendingActions] = useState<UiActionName[]>([]);
   const [actionResults, setActionResults] = useState<Partial<Record<UiActionName, UiActionResult<unknown>>>>({});
   const actionRunnerRef = useRef<UiActionRunner | null>(null);
@@ -256,6 +258,7 @@ export const OrchestratorProvider: React.FC<{ children: React.ReactNode }> = ({ 
       }
 
       const projList = await orchestrator.getProjects();
+      if (!Array.isArray(projList)) throw new Error('INVALID_REFRESH_RESPONSE');
       if (!isCurrentRequest() || !selectionUnchanged()) return;
 
       const currentProj = (requestedProjectId
@@ -271,6 +274,7 @@ export const OrchestratorProvider: React.FC<{ children: React.ReactNode }> = ({ 
           orchestrator.getEvidence(currentProj.id),
         ]);
         if (!isCurrentRequest() || !selectionUnchanged()) return;
+        if (![taskList, eventList, evidenceList].every(Array.isArray)) throw new Error('INVALID_REFRESH_RESPONSE');
         setTasks(taskList);
         setEvents(eventList);
         setEvidence(evidenceList);
@@ -286,8 +290,10 @@ export const OrchestratorProvider: React.FC<{ children: React.ReactNode }> = ({ 
         orchestrator.getAgents(),
       ]);
       if (!isCurrentRequest() || !selectionUnchanged()) return;
+      if (![resList, agentList].every(Array.isArray)) throw new Error('INVALID_REFRESH_RESPONSE');
       setResources(resList);
       setAgents(agentList);
+      setHasRefreshed(true);
     } catch (err) {
       if (isCurrentRequest()) {
         const message = err instanceof Error ? err.message : 'Unable to refresh desktop data.';
@@ -400,9 +406,7 @@ export const OrchestratorProvider: React.FC<{ children: React.ReactNode }> = ({ 
     source: string,
     confidence: number
   ) => {
-    if (!orchestrator) return;
-    await orchestrator.updateResourceQuota({ id, remaining, total, source, confidence });
-    await refreshData();
+    return runUiAction<void>('updateQuota', () => orchestrator.updateResourceQuota({ id, remaining, total, source, confidence }));
   };
 
   const triggerEmergencyStop = async (reason?: string) => {
@@ -587,6 +591,7 @@ export const OrchestratorProvider: React.FC<{ children: React.ReactNode }> = ({ 
         selectedTaskId,
         loading,
         refreshError,
+        hasRefreshed,
         pendingActions,
         actionResults,
         setDensityMode,
