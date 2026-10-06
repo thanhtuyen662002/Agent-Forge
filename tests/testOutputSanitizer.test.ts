@@ -170,6 +170,48 @@ describe('Vitest credential output sanitizer', () => {
     });
   });
 
+  it('preserves ordinary long URL-safe diagnostics while redacting parser-framed sessions', () => {
+    const sessionToken = 'Y'.repeat(43);
+    const migration = 'Applying migration 23: add_execution_authorization_and_verification_admission';
+    const longIdentifier = `diagnostic_${'a'.repeat(80)}_suffix`;
+    const input = `${migration}\n${longIdentifier}\n--${sessionToken}\n`;
+
+    const workerOutput = redactMcpCliOutput(input);
+    const parentOutput = testRunnerSanitizer.sanitizeCapturedOutput({ stdout: input }).stdout;
+    const capturedOutput = captureMcpCliOutput(() => {
+      process.stdout.write(`${migration}\n${longIdentifier}\n--${sessionToken.slice(0, 19)}`);
+      process.stdout.write(`${sessionToken.slice(19)}\n`);
+    }).stdout;
+
+    const evidence = [workerOutput, parentOutput, capturedOutput].map((output) => ({
+      preservesMigration: output.includes(migration),
+      preservesIdentifier: output.includes(longIdentifier),
+      leaksFramedSession: output.includes(sessionToken),
+      hasRedaction: output.includes(MCP_CLI_REDACTED_TOKEN),
+    }));
+
+    expect(evidence).toEqual([
+      {
+        preservesMigration: true,
+        preservesIdentifier: true,
+        leaksFramedSession: false,
+        hasRedaction: true,
+      },
+      {
+        preservesMigration: true,
+        preservesIdentifier: true,
+        leaksFramedSession: false,
+        hasRedaction: true,
+      },
+      {
+        preservesMigration: true,
+        preservesIdentifier: true,
+        leaksFramedSession: false,
+        hasRedaction: true,
+      },
+    ]);
+  });
+
   it('guards installed stdout/stderr sinks across split UTF-8 writes, final flush, callbacks, backpressure, and exception cleanup', () => {
     const sessionToken = 'T'.repeat(43);
     const submissionToken = `af-sub-${'X'.repeat(43)}`;

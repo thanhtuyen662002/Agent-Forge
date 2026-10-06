@@ -15,12 +15,11 @@ const REDACTED_TOKEN = '[REDACTED_TOKEN]';
 // Session tokens are unpadded base64url encodings of 32 bytes. Submission
 // tokens add a stable `af-sub-` prefix. Reviewer tokens are included because
 // the same test process can exercise the reviewer administration CLI.
-// Do not require token boundaries here. CLI/parser diagnostics can attach
-// URL-safe framing directly to a credential (for example `--<token>`), and
-// a boundary-sensitive matcher would retain the full secret. This is a
-// test/CI diagnostic sink, so fail closed even if adjacent URL-safe text is
-// consumed together with the credential.
-const SESSION_TOKEN_PATTERN = /[A-Za-z0-9_-]{43}/g;
+// Bare session tokens must be bounded so long URL-safe diagnostics are not
+// mistaken for credentials. Parser diagnostics can still frame a real token as
+// an unknown `--<token>` argument, so keep a narrow matcher for that form.
+const SESSION_TOKEN_PATTERN = /(^|[^A-Za-z0-9_-])([A-Za-z0-9_-]{43})(?=$|[^A-Za-z0-9_-])/g;
+const PARSER_FRAMED_SESSION_TOKEN_PATTERN = /(^|[^A-Za-z0-9_-])(--)([A-Za-z0-9_-]{43})(?=$|[^A-Za-z0-9_-])/g;
 const SUBMISSION_TOKEN_PATTERN = /af-sub-[A-Za-z0-9_-]{43}/gi;
 const REVIEWER_TOKEN_PATTERN = /af-rev-[0-9a-f-]{36}/gi;
 
@@ -42,7 +41,8 @@ export function redactMcpCliOutput(text: string): string {
     .replace(/(Plaintext\s+Token\s*:\s*)([^\s\r\n]+)/gi, `$1${REDACTED_TOKEN}`)
     .replace(SUBMISSION_TOKEN_PATTERN, REDACTED_TOKEN)
     .replace(REVIEWER_TOKEN_PATTERN, REDACTED_TOKEN)
-    .replace(SESSION_TOKEN_PATTERN, REDACTED_TOKEN);
+    .replace(PARSER_FRAMED_SESSION_TOKEN_PATTERN, `$1$2${REDACTED_TOKEN}`)
+    .replace(SESSION_TOKEN_PATTERN, `$1${REDACTED_TOKEN}`);
 }
 
 type Writable = typeof process.stdout.write;

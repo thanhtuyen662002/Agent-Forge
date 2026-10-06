@@ -9,14 +9,23 @@ as the provider's current working directory.
 ## Boundary and data flow
 
 Before spawning a provider, `LocalCliAdapterBase` canonicalizes the project
-root and every context path. Absolute paths, traversal, sensitive names
-(`.env*`, `.git`, credentials, private keys, and similar names), symlinks, and
-Windows junction/reparse points are rejected. A directory context is walked
-with the same policy for every child; denied children are omitted, while an
-explicitly denied path fails the execution. Reads are descriptor based and
-bounded to 4 MiB per file, 256 files, and 16 MiB per workspace. Directory
-enumeration is bounded to 128 manifest paths, 512 traversed entries, and 128
-directory levels before any workspace file is materialized.
+root and every context path through the shared
+`canonicalizePortableRelativePath` helper in `ContextIntegrity`. The helper is
+lexical and bounded (4,096 characters, 128 components, and 255 characters per
+component), so it runs before `path.resolve`, policy checks, `lstat`, or
+`realpath`. Absolute, drive, UNC, extended-length, ADS/colon, traversal,
+mixed/repeated-separator, interior dot-component, trailing dot/space, Unicode
+alias, and reserved-device-name (`CON`, `NUL`, `COM1`, and similar) forms are rejected
+with stable typed error codes. Case-colliding aliases are rejected on
+case-insensitive hosts. Sensitive names (`.env*`, `.git`, credentials, private
+keys, and similar names), symlinks, and Windows junction/reparse points are
+then rejected by the existing policy and identity fences. A directory context
+is walked with the same canonicalization and policy for every child; denied
+children are omitted, while an explicitly denied path fails the execution.
+Reads are descriptor based and bounded to 4 MiB per file, 256 files, and 16
+MiB per workspace. Directory enumeration is bounded to 128 manifest paths, 512
+traversed entries, and 128 directory levels before any workspace file is
+materialized.
 
 Each execution receives a random workspace directory and a sibling marker that
 contains the execution ID, owner token, ownership digest, creation time, state,
@@ -39,7 +48,10 @@ while their identity and provider-result hash still match. A concurrent
 replacement is never overwritten during rollback and is reported as a rollback
 failure. Provider failures, invalid protocols, or conflicts therefore never
 silently become task success. Windows alternate data stream paths are rejected
-as context paths.
+as context paths. The canonicalizer is shared by the manifest builder and
+local provider workspace, so a path cannot be accepted under one spelling and
+reinterpreted under another separator, device, or case alias during provider
+dispatch.
 
 Cleanup verifies the marker owner, ownership digest, and workspace identity
 before removing the directory. A cleanup failure leaves a typed
