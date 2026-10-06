@@ -455,6 +455,26 @@ export class Repository {
     return info.changes === 1;
   }
 
+  /** Product transitions fence project and ownership as well as state/revision. */
+  public compareAndSwapAuthorizedTaskState(
+    binding: import('../types/domain').AuthorizedTaskTransitionBinding,
+    state: TaskState,
+    pausedFromState: string | null,
+    incrementRevision: boolean,
+  ): boolean {
+    const info = this.db.prepare(`
+      UPDATE tasks
+      SET state = ?, paused_from_state = ?, revision_count = revision_count + ?, updated_at = ?
+      WHERE id = ? AND project_id = ? AND state = ? AND revision_count = ?
+        AND ownership_epoch = ? AND paused_from_state IS ? AND max_revisions = ?
+    `).run(
+      state, pausedFromState, incrementRevision ? 1 : 0, new Date().toISOString(),
+      binding.taskId, binding.projectId, binding.expectedState, binding.expectedRevision,
+      binding.expectedOwnershipEpoch, binding.expectedPausedFromState, binding.expectedMaxRevisions,
+    );
+    return info.changes === 1;
+  }
+
   public updateTaskShas(id: string, baseSha?: string | null, currentSha?: string | null): void {
     const now = new Date().toISOString();
     this.db

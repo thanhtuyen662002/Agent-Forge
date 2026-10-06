@@ -3,7 +3,7 @@ import Database from 'better-sqlite3';
 import { MigrationRunner } from '../src/core/database/migrations';
 import { Repository } from '../src/core/database/repositories';
 import { EventService } from '../src/core/services/EventService';
-import { TaskService } from '../src/core/services/TaskService';
+import { TaskService, captureAuthorizedTaskTransitionBinding } from '../src/core/services/TaskService';
 import { GitService } from '../src/core/services/GitService';
 import { ProgressService } from '../src/core/services/ProgressService';
 import { ManagerProtocol, CoderProtocol } from '../src/core/types/protocols';
@@ -69,6 +69,109 @@ describe('TaskService & Protocol Idempotency', () => {
   afterEach(() => {
     vi.restoreAllMocks();
     db.close();
+  });
+
+  it('commits one authorized transition and replays only its still-current exact result', () => {
+    const binding = captureAuthorizedTaskTransitionBinding(repo.getTask('TSK-001')!);
+    const first = taskService.transitionAuthorizedTask(binding.taskId, 'START_CODING', binding);
+    expect(first.success).toBe(true);
+    const committed = repo.getTask(binding.taskId)!;
+    expect(committed.state).toBe('CODING');
+    expect(taskService.transitionAuthorizedTask(binding.taskId, 'START_CODING', binding)).toMatchObject({
+      success: true, isDuplicate: true, task: committed,
+    });
+    expect(repo.getEvents(binding.projectId).filter((e) => e.type === 'AUTHORIZED_AUTONOMY_TASK_TRANSITION')).toHaveLength(1);
+    const current = captureAuthorizedTaskTransitionBinding(committed);
+    expect(taskService.transitionAuthorizedTask(current.taskId, 'SUBMIT_REPORT', current).success).toBe(true);
+    const after = repo.getTask(binding.taskId);
+    expect(taskService.transitionAuthorizedTask(binding.taskId, 'START_CODING', binding)).toMatchObject({
+      success: false, errorCode: 'STALE_TASK_TRANSITION',
+    });
+    expect(repo.getTask(binding.taskId)).toEqual(after);
+  });
+
+  it('allows one winner for two same-epoch conflicting callers without duplicate events', async () => {
+    const binding = captureAuthorizedTaskTransitionBinding(repo.getTask('TSK-001')!);
+    const results = await Promise.all([
+      Promise.resolve().then(() => taskService.transitionAuthorizedTask(binding.taskId, 'START_CODING', binding)),
+      Promise.resolve().then(() => taskService.transitionAuthorizedTask(binding.taskId, 'APPROVE', binding)),
+    ]);
+    expect(results.map((r) => r.success)).toEqual([true, false]);
+    expect(results[1].errorCode).toBe('STALE_TASK_TRANSITION');
+    expect(repo.getTask(binding.taskId)?.state).toBe('CODING');
+    expect(repo.getEvents(binding.projectId).filter((e) => e.type === 'AUTHORIZED_AUTONOMY_TASK_TRANSITION')).toHaveLength(1);
+  });
+
+  it.each(['project', 'revision', 'state', 'epoch', 'policy', 'paused'])(
+    'rejects stale %s binding without task or event writes', (field) => {
+      const binding = captureAuthorizedTaskTransitionBinding(repo.getTask('TSK-001')!);
+      const stale = { ...binding };
+      if (field === 'project') stale.projectId = 'different-project';
+      if (field === 'revision') stale.expectedRevision += 1;
+      if (field === 'state') stale.expectedState = 'APPROVED';
+      if (field === 'epoch') stale.expectedOwnershipEpoch += 1;
+      if (field === 'policy') stale.expectedMaxRevisions += 1;
+      if (field === 'paused') stale.expectedPausedFromState = 'CODING';
+      const before = repo.getTask(binding.taskId);
+      const events = repo.getEvents(binding.projectId);
+      expect(taskService.transitionAuthorizedTask(binding.taskId, 'START_CODING', stale)).toMatchObject({
+        success: false, errorCode: 'STALE_TASK_TRANSITION',
+      });
+      expect(repo.getTask(binding.taskId)).toEqual(before);
+      expect(repo.getEvents(binding.projectId)).toEqual(events);
+    },
+  );
+
+  it('rejects ID-only and cross-task bindings before any mutation', () => {
+    const binding = captureAuthorizedTaskTransitionBinding(repo.getTask('TSK-001')!);
+    const before = repo.getTask(binding.taskId);
+    for (const invalid of [1, null, {}, { ...binding, taskId: 'another-task' }, { ...binding, expectedRevision: Number.NaN }]) {
+      expect(taskService.transitionAuthorizedTask(binding.taskId, 'START_CODING', invalid as typeof binding)).toMatchObject({
+        success: false, errorCode: 'INVALID_TASK_TRANSITION_BINDING',
+      });
+    }
+    expect(repo.getTask(binding.taskId)).toEqual(before);
+    expect(repo.getEvents(binding.projectId)).toHaveLength(0);
+    expect(Object.isFrozen(binding)).toBe(true);
+  });
+
+  it('rolls task state and revision back if transition event persistence fails', () => {
+    repo.updateTaskState('TSK-001', 'CODING');
+    const binding = captureAuthorizedTaskTransitionBinding(repo.getTask('TSK-001')!);
+    const before = repo.getTask(binding.taskId);
+    vi.spyOn(repo, 'createDeterministicGenericEvent').mockImplementationOnce(() => { throw new Error('injected event failure'); });
+    expect(taskService.transitionAuthorizedTask(binding.taskId, 'TESTS_FAILED', binding)).toMatchObject({
+      success: false, errorCode: 'TASK_TRANSITION_FAILED',
+    });
+    expect(repo.getTask(binding.taskId)).toEqual(before);
+    expect(repo.getEvents(binding.projectId)).toHaveLength(0);
+    expect(taskService.transitionAuthorizedTask(binding.taskId, 'TESTS_FAILED', binding)).toMatchObject({
+      success: true, task: expect.objectContaining({ state: 'CODING', revision_count: 1 }),
+    });
+  });
+
+  it('keeps a no-op START_CODING repeat idempotent with exactly one event', () => {
+    repo.updateTaskState('TSK-001', 'CODING');
+    const binding = captureAuthorizedTaskTransitionBinding(repo.getTask('TSK-001')!);
+    expect(taskService.transitionAuthorizedTask(binding.taskId, 'START_CODING', binding).success).toBe(true);
+    const before = repo.getTask(binding.taskId);
+    expect(taskService.transitionAuthorizedTask(binding.taskId, 'START_CODING', binding).isDuplicate).toBe(true);
+    expect(repo.getTask(binding.taskId)).toEqual(before);
+    expect(repo.getEvents(binding.projectId)).toHaveLength(1);
+  });
+
+  it('enforces every binding field in the repository SQL CAS boundary', () => {
+    const binding = captureAuthorizedTaskTransitionBinding(repo.getTask('TSK-001')!);
+    for (const invalid of [
+      { ...binding, projectId: 'different-project' },
+      { ...binding, expectedOwnershipEpoch: 2 },
+      { ...binding, expectedRevision: 1 },
+      { ...binding, expectedState: 'CODING' as const },
+      { ...binding, expectedPausedFromState: 'CODING' as const },
+      { ...binding, expectedMaxRevisions: 4 },
+    ]) expect(repo.compareAndSwapAuthorizedTaskState(invalid, 'APPROVED', null, false)).toBe(false);
+    expect(repo.getTask(binding.taskId)?.state).toBe('PLANNED');
+    expect(repo.compareAndSwapAuthorizedTaskState(binding, 'APPROVED', null, false)).toBe(true);
   });
 
   it('should apply manager EXECUTE decision, bind HEAD SHA, and transition task to CODING', async () => {
