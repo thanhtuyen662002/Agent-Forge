@@ -256,6 +256,17 @@ export interface Task {
   updated_at: string;
 }
 
+/** Immutable task identity captured before an asynchronous product operation. */
+export interface AuthorizedTaskTransitionBinding {
+  readonly taskId: string;
+  readonly projectId: string;
+  readonly expectedState: TaskState;
+  readonly expectedRevision: number;
+  readonly expectedOwnershipEpoch: number;
+  readonly expectedPausedFromState: TaskPausedFromState | null;
+  readonly expectedMaxRevisions: number;
+}
+
 /**
  * Caller-supplied fence for work that may outlive the initial task read.
  * Omitting a field asks the service to capture the current value atomically;

@@ -1,6 +1,17 @@
 import { TranslationDictionary } from '../types';
 
 export const viVN: TranslationDictionary = {
+  actions: {
+    pending: 'Đang xử lý…',
+    success: 'Thao tác đã hoàn tất.',
+    failed: 'Thao tác thất bại. Kiểm tra dữ liệu và thử lại.',
+    desktopRequired: 'Mở ứng dụng desktop để thực hiện thao tác này.',
+    previewReadOnly: 'Bản xem trước trên trình duyệt chỉ đọc',
+    requestRejected: 'Yêu cầu tới ứng dụng desktop bị từ chối. Vui lòng thử lại.',
+    invalidResponse: 'Ứng dụng desktop trả về dữ liệu chưa đầy đủ. Vui lòng thử lại.',
+    noProject: 'Chọn dự án trước khi thực hiện thao tác.',
+    alreadyPending: 'Thao tác này đang được xử lý.',
+  },
   app: {
     title: 'Agent-Forge',
     subtitle: 'Trung tâm Điều khiển Kỹ nghệ AI Cục bộ',
@@ -75,6 +86,9 @@ export const viVN: TranslationDictionary = {
     orchestration: 'Điều phối',
     mode: 'Chế độ',
     online: 'TRỰC TUYẾN',
+    connecting: 'ĐANG KẾT NỐI',
+    browserPreview: 'BẢN XEM TRƯỚC TRÌNH DUYỆT',
+    error: 'NGOẠI TUYẾN / LỖI',
     offlineTag: 'SQLite Ngoại tuyến • Ưu tiên Cục bộ',
   },
   dashboard: {
@@ -211,11 +225,16 @@ export const viVN: TranslationDictionary = {
     totalUnits: 'Tổng Đơn vị Phân bổ',
     cancel: 'Hủy',
     saveSnapshot: 'Lưu Ảnh chụp Hạn ngạch',
+    invalidNumber: 'Nhập số hữu hạn, không âm hoặc để trống giá trị.',
+    nonNegative: 'Giá trị hạn ngạch không được âm.',
+    remainingExceedsTotal: 'Hạn ngạch còn lại không thể lớn hơn tổng phân bổ.',
+    saveError: 'Không thể lưu ảnh chụp hạn ngạch. Hãy kiểm tra kết nối desktop và thử lại.',
   },
   quota: {
     unknown: 'HẠN NGẠCH CHƯA RÕ',
     manual: 'THỦ CÔNG',
     measured: 'ĐÃ ĐO LƯỜNG',
+    providerReported: 'NHÀ CUNG CẤP BÁO CÁO',
     estimated: 'ƯỚC TÍNH',
   },
   timeline: {

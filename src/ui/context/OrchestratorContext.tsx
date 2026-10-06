@@ -2,6 +2,7 @@ import React, { createContext, useContext, useState, useEffect, useCallback, use
 import { Project, Task, Agent, ProviderResource, EventRecord, Evidence, UIDensityMode } from '../../core/types/domain';
 import type { CanonicalExecutionScope } from '../../core/services/ExecutionAuthorizationService';
 import type { RendererAuthorizationMode } from '../../core/types/ipc';
+import { UiActionName, UiActionResult, UiActionRunner, uiActionFailure } from '../actionState';
 
 // Check if Electron IPC is available
 const isElectron = typeof window !== 'undefined' && Boolean((window as any).orchestrator);
@@ -22,24 +23,27 @@ interface OrchestratorContextType {
   selectedTaskId: string | null;
   loading: boolean;
   refreshError: string | null;
+  hasRefreshed: boolean;
+  pendingActions: UiActionName[];
+  actionResults: Partial<Record<UiActionName, UiActionResult<unknown>>>;
   setDensityMode: (mode: UIDensityMode) => void;
   setActiveProject: (project: Project | null) => void;
   setActiveView: (view: string) => void;
   setSelectedTaskId: (taskId: string | null) => void;
   setIsEmergencyStopOpen: (open: boolean) => void;
   refreshData: () => Promise<void>;
-  createProject: (data: { name: string; description?: string; repositorySelectionId: string; defaultBranch?: string }) => Promise<Project>;
-  importContract: (contract: any) => Promise<boolean>;
-  transitionProject: (trigger: string) => Promise<void>;
-  createTask: (spec: { title: string; description?: string | null; priority?: 'LOW' | 'MEDIUM' | 'HIGH' | 'CRITICAL'; risk?: 'LOW' | 'MEDIUM' | 'HIGH' | 'CRITICAL'; acceptanceCriteria?: string[]; constraints?: string[] }) => Promise<void>;
+  createProject: (data: { name: string; description?: string; repositorySelectionId: string; defaultBranch?: string }) => Promise<UiActionResult<Project>>;
+  importContract: (contract: any) => Promise<UiActionResult>;
+  transitionProject: (trigger: string) => Promise<UiActionResult>;
+  createTask: (spec: { title: string; description?: string | null; priority?: 'LOW' | 'MEDIUM' | 'HIGH' | 'CRITICAL'; risk?: 'LOW' | 'MEDIUM' | 'HIGH' | 'CRITICAL'; acceptanceCriteria?: string[]; constraints?: string[] }) => Promise<UiActionResult<Task>>;
   parseProtocol: (input: string) => Promise<any>;
   applyProtocol: (rawInput: string) => Promise<any>;
   generateWorkOrder: (taskId: string) => Promise<string>;
   generateReviewPackage: (taskId: string) => Promise<string>;
   runVerificationTests: (taskId: string, commandConfigId?: string) => Promise<any>;
-  updateResourceQuota: (id: string, remaining: number | null, total: number | null, source: string, confidence: number) => Promise<void>;
+  updateResourceQuota: (id: string, remaining: number | null, total: number | null, source: string, confidence: number) => Promise<UiActionResult>;
   triggerEmergencyStop: (reason?: string) => Promise<any>;
-  resumeProject: () => Promise<void>;
+  resumeProject: () => Promise<UiActionResult>;
   routeTask: (data: {
     projectId: string;
     taskId: string;
@@ -118,6 +122,11 @@ export const OrchestratorProvider: React.FC<{ children: React.ReactNode }> = ({ 
   const [selectedTaskId, setSelectedTaskId] = useState<string | null>(null);
   const [loading, setLoading] = useState<boolean>(false);
   const [refreshError, setRefreshError] = useState<string | null>(null);
+  const [hasRefreshed, setHasRefreshed] = useState(false);
+  const [pendingActions, setPendingActions] = useState<UiActionName[]>([]);
+  const [actionResults, setActionResults] = useState<Partial<Record<UiActionName, UiActionResult<unknown>>>>({});
+  const actionRunnerRef = useRef<UiActionRunner | null>(null);
+  if (!actionRunnerRef.current) actionRunnerRef.current = new UiActionRunner(isElectron, setPendingActions);
   const activeProjectRef = useRef<Project | null>(activeProject);
   const refreshRequestRef = useRef(0);
   const refreshInFlightRef = useRef(false);
@@ -249,6 +258,7 @@ export const OrchestratorProvider: React.FC<{ children: React.ReactNode }> = ({ 
       }
 
       const projList = await orchestrator.getProjects();
+      if (!Array.isArray(projList)) throw new Error('INVALID_REFRESH_RESPONSE');
       if (!isCurrentRequest() || !selectionUnchanged()) return;
 
       const currentProj = (requestedProjectId
@@ -264,6 +274,7 @@ export const OrchestratorProvider: React.FC<{ children: React.ReactNode }> = ({ 
           orchestrator.getEvidence(currentProj.id),
         ]);
         if (!isCurrentRequest() || !selectionUnchanged()) return;
+        if (![taskList, eventList, evidenceList].every(Array.isArray)) throw new Error('INVALID_REFRESH_RESPONSE');
         setTasks(taskList);
         setEvents(eventList);
         setEvidence(evidenceList);
@@ -279,8 +290,10 @@ export const OrchestratorProvider: React.FC<{ children: React.ReactNode }> = ({ 
         orchestrator.getAgents(),
       ]);
       if (!isCurrentRequest() || !selectionUnchanged()) return;
+      if (![resList, agentList].every(Array.isArray)) throw new Error('INVALID_REFRESH_RESPONSE');
       setResources(resList);
       setAgents(agentList);
+      setHasRefreshed(true);
     } catch (err) {
       if (isCurrentRequest()) {
         const message = err instanceof Error ? err.message : 'Unable to refresh desktop data.';
@@ -305,42 +318,52 @@ export const OrchestratorProvider: React.FC<{ children: React.ReactNode }> = ({ 
     return () => clearInterval(interval);
   }, [refreshData]);
 
+  const runUiAction = async <T,>(name: UiActionName, invoke: () => Promise<unknown>, payloadField?: 'project' | 'task', accept?: (data: T) => void): Promise<UiActionResult<T>> => {
+    const result = await actionRunnerRef.current!.run<T>(name, invoke, payloadField, async (data) => {
+      accept?.(data);
+      await refreshData();
+    });
+    if (result.success || result.code !== 'ACTION_PENDING') setActionResults((previous) => ({ ...previous, [name]: result }));
+    return result;
+  };
+
+  const noProject = (name: UiActionName) => {
+    const result = uiActionFailure(orchestrator ? 'NO_PROJECT' : 'DESKTOP_REQUIRED');
+    setActionResults((previous) => ({ ...previous, [name]: result }));
+    return result;
+  };
+
   const createProject = async (data: { name: string; description?: string; repositorySelectionId: string; defaultBranch?: string }) => {
-    if (!orchestrator) throw new Error('Desktop IPC unavailable.');
-    const res = await orchestrator.createProject(data);
-    await refreshData();
-    if (res && res.project) {
-      setActiveProject(res.project);
-      return res.project;
-    }
-    return res;
+    return runUiAction<Project>('createProject', () => orchestrator.createProject(data), 'project', (project) => {
+      activeProjectRef.current = project;
+      setActiveProject(project);
+    });
   };
 
   const importContract = async (contract: any) => {
-    if (!orchestrator || !activeProject) return false;
-    const ok = await orchestrator.importContract({ projectId: activeProject.id, contract });
-    await refreshData();
-    return ok;
+    const project = activeProjectRef.current;
+    if (!project) return noProject('importContract');
+    return runUiAction<void>('importContract', () => orchestrator.importContract({ projectId: project.id, contract }));
   };
 
   const transitionProject = async (trigger: string) => {
-    if (!orchestrator || !activeProject) return;
-    await orchestrator.transitionProject({ projectId: activeProject.id, trigger });
-    await refreshData();
+    const project = activeProjectRef.current;
+    if (!project) return noProject('projectTransition');
+    return runUiAction<void>('projectTransition', () => orchestrator.transitionProject({ projectId: project.id, trigger }));
   };
 
   const createTask = async (spec: { title: string; description?: string | null; priority?: 'LOW' | 'MEDIUM' | 'HIGH' | 'CRITICAL'; risk?: 'LOW' | 'MEDIUM' | 'HIGH' | 'CRITICAL'; acceptanceCriteria?: string[]; constraints?: string[] }) => {
-    if (!orchestrator || !activeProject) return;
-    await orchestrator.createTask({
-      projectId: activeProject.id,
+    const project = activeProjectRef.current;
+    if (!project) return noProject('createTask');
+    return runUiAction<Task>('createTask', () => orchestrator.createTask({
+      projectId: project.id,
       title: spec.title,
       description: spec.description,
       priority: spec.priority || 'MEDIUM',
       risk: spec.risk || 'MEDIUM',
       acceptanceCriteria: spec.acceptanceCriteria || [],
       constraints: spec.constraints || [],
-    });
-    await refreshData();
+    }), 'task');
   };
 
   const parseProtocol = async (input: string) => {
@@ -383,9 +406,7 @@ export const OrchestratorProvider: React.FC<{ children: React.ReactNode }> = ({ 
     source: string,
     confidence: number
   ) => {
-    if (!orchestrator) return;
-    await orchestrator.updateResourceQuota({ id, remaining, total, source, confidence });
-    await refreshData();
+    return runUiAction<void>('updateQuota', () => orchestrator.updateResourceQuota({ id, remaining, total, source, confidence }));
   };
 
   const triggerEmergencyStop = async (reason?: string) => {
@@ -396,9 +417,9 @@ export const OrchestratorProvider: React.FC<{ children: React.ReactNode }> = ({ 
   };
 
   const resumeProject = async () => {
-    if (!orchestrator || !activeProject) return;
-    await orchestrator.resumeProject(activeProject.id);
-    await refreshData();
+    const project = activeProjectRef.current;
+    if (!project) return noProject('projectTransition');
+    return runUiAction<void>('projectTransition', () => orchestrator.resumeProject(project.id));
   };
 
   const routeTask = async (data: {
@@ -570,6 +591,9 @@ export const OrchestratorProvider: React.FC<{ children: React.ReactNode }> = ({ 
         selectedTaskId,
         loading,
         refreshError,
+        hasRefreshed,
+        pendingActions,
+        actionResults,
         setDensityMode,
         setActiveProject,
         setActiveView,

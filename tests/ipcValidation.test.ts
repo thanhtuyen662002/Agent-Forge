@@ -115,7 +115,25 @@ describe('IPC Validation & Security Gates', () => {
     expect(ResumeProjectIpcSchema.safeParse({ projectId: 'PROJ-1' }).success).toBe(true);
   });
 
-  it('should reject invalid quota updates with confidence out of bounds', () => {
+  it('should enforce finite, nonnegative, ordered quota values at the IPC boundary', () => {
+    const valid = UpdateResourceQuotaIpcSchema.safeParse({
+      id: 'res-1',
+      remaining: 10,
+      total: 100,
+      source: 'MANUAL',
+      confidence: 1,
+    });
+    expect(valid.success).toBe(true);
+
+    const validUnknown = UpdateResourceQuotaIpcSchema.safeParse({
+      id: 'res-1',
+      remaining: null,
+      total: null,
+      source: 'UNKNOWN',
+      confidence: 0,
+    });
+    expect(validUnknown.success).toBe(true);
+
     const invalidConf = UpdateResourceQuotaIpcSchema.safeParse({
       id: 'res-1',
       remaining: 10,
@@ -124,6 +142,39 @@ describe('IPC Validation & Security Gates', () => {
       confidence: 1.5, // > 1.0
     });
     expect(invalidConf.success).toBe(false);
+
+    for (const value of [Number.NaN, Number.POSITIVE_INFINITY, Number.NEGATIVE_INFINITY, -1]) {
+      expect(
+        UpdateResourceQuotaIpcSchema.safeParse({
+          id: 'res-1',
+          remaining: value,
+          total: 100,
+          source: 'MANUAL',
+          confidence: 1,
+        }).success
+      ).toBe(false);
+      expect(
+        UpdateResourceQuotaIpcSchema.safeParse({
+          id: 'res-1',
+          remaining: 10,
+          total: value,
+          source: 'MANUAL',
+          confidence: 1,
+        }).success
+      ).toBe(false);
+    }
+
+    const exceedsTotal = UpdateResourceQuotaIpcSchema.safeParse({
+      id: 'res-1',
+      remaining: 101,
+      total: 100,
+      source: 'MANUAL',
+      confidence: 1,
+    });
+    expect(exceedsTotal.success).toBe(false);
+    if (!exceedsTotal.success) {
+      expect(exceedsTotal.error.issues.some((issue) => issue.path.join('.') === 'remaining')).toBe(true);
+    }
   });
 
   it('should reject inline code-evaluation flags across runtimes without owner approval', () => {

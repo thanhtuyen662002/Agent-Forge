@@ -23,6 +23,9 @@ describe('privileged IPC sender trust boundary', () => {
     getProject: vi.fn((id: string) => ({ id })),
     getProjectMaxRevisions: vi.fn(() => 3),
     setProjectMaxRevisions: vi.fn((_: string, value: number) => value),
+    getProviderResource: vi.fn((id: string) => id === 'res-1' ? { id } : null),
+    updateProviderResourceQuota: vi.fn(),
+    runInImmediateTransaction: vi.fn((fn: () => unknown) => fn()),
   };
 
   beforeEach(() => {
@@ -68,6 +71,35 @@ describe('privileged IPC sender trust boundary', () => {
       handler!({ senderFrame: { url: 'http://localhost:5173/tasks' } }, undefined),
     ).resolves.toEqual([]);
     expect(repo.getAllProjects).toHaveBeenCalledTimes(1);
+  });
+
+  it('confirms quota mutation only for an existing resource inside the immediate transaction', async () => {
+    const handler = handlers.get('providers:updateResourceQuota')!;
+    const event = { senderFrame: { url: 'http://localhost:5173/capacity' } };
+    const payload = { id: 'res-1', remaining: 50, total: 100, source: 'MANUAL', confidence: 1 };
+    await expect(handler(event, { ...payload, id: 'missing' })).resolves.toEqual({ success: false, error: 'RESOURCE_NOT_FOUND' });
+    expect(repo.updateProviderResourceQuota).not.toHaveBeenCalled();
+    await expect(handler(event, payload)).resolves.toEqual({ success: true });
+    expect(repo.updateProviderResourceQuota).toHaveBeenCalledWith('res-1', 50, 100, 'MANUAL', 1);
+    expect(repo.runInImmediateTransaction).toHaveBeenCalledTimes(2);
+  });
+
+  it('rejects invalid quota and untrusted senders before opening a mutation transaction', async () => {
+    const handler = handlers.get('providers:updateResourceQuota')!;
+    const payload = { id: 'res-1', remaining: -1, total: 100, source: 'MANUAL', confidence: 1 };
+    const result = await handler({ senderFrame: { url: 'http://localhost:5173/capacity' } }, payload);
+    expect(result).toMatchObject({ success: false });
+    await expect(handler({ senderFrame: { url: 'https://remote.example/' } }, payload)).rejects.toBeInstanceOf(IpcSenderTrustError);
+    expect(repo.runInImmediateTransaction).not.toHaveBeenCalled();
+    expect(repo.updateProviderResourceQuota).not.toHaveBeenCalled();
+  });
+
+  it('propagates quota persistence failure without acknowledging success', async () => {
+    const handler = handlers.get('providers:updateResourceQuota')!;
+    repo.updateProviderResourceQuota.mockImplementationOnce(() => { throw new Error('injected storage failure'); });
+    await expect(handler({ senderFrame: { url: 'http://localhost:5173/capacity' } }, {
+      id: 'res-1', remaining: 50, total: 100, source: 'MANUAL', confidence: 1,
+    })).rejects.toThrow('injected storage failure');
   });
 
   it('protects project revision policy handlers with the same sender boundary', async () => {

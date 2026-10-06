@@ -1,6 +1,17 @@
 import { TranslationDictionary } from '../types';
 
 export const enUS: TranslationDictionary = {
+  actions: {
+    pending: 'Working…',
+    success: 'Action completed.',
+    failed: 'Action failed. Review the input and try again.',
+    desktopRequired: 'Open the desktop app to perform this action.',
+    previewReadOnly: 'Read-only browser preview',
+    requestRejected: 'The desktop request was rejected. Try again.',
+    invalidResponse: 'The desktop returned an incomplete response. Try again.',
+    noProject: 'Select a project before performing this action.',
+    alreadyPending: 'This action is already in progress.',
+  },
   app: {
     title: 'Agent-Forge',
     subtitle: 'Local AI Engineering Control Plane',
@@ -75,6 +86,9 @@ export const enUS: TranslationDictionary = {
     orchestration: 'Orchestration',
     mode: 'Mode',
     online: 'ONLINE',
+    connecting: 'CONNECTING',
+    browserPreview: 'BROWSER PREVIEW',
+    error: 'OFFLINE / ERROR',
     offlineTag: 'Offline SQLite • Local-First',
   },
   dashboard: {
@@ -211,11 +225,16 @@ export const enUS: TranslationDictionary = {
     totalUnits: 'Total Allocated Units',
     cancel: 'Cancel',
     saveSnapshot: 'Save Quota Snapshot',
+    invalidNumber: 'Enter finite, non-negative numbers or leave a value empty.',
+    nonNegative: 'Quota values cannot be negative.',
+    remainingExceedsTotal: 'Remaining quota cannot exceed the total allocation.',
+    saveError: 'The quota snapshot could not be saved. Check the desktop connection and retry.',
   },
   quota: {
     unknown: 'QUOTA UNKNOWN',
     manual: 'MANUAL',
     measured: 'MEASURED',
+    providerReported: 'PROVIDER REPORTED',
     estimated: 'ESTIMATED',
   },
   timeline: {

@@ -3,6 +3,7 @@ import { useOrchestrator } from '../context/OrchestratorContext';
 import { useI18n } from '../context/I18nContext';
 import { AgentCard } from '../components/AgentCard';
 import { ProgressIndicator } from '../components/ProgressIndicator';
+import { clampProgressPercent, validateQuotaSnapshot, quotaSourceLabel } from '../capacityTruth';
 import { getTaskStateCounts } from '../taskStatePresentation';
 import {
   Activity,
@@ -40,17 +41,24 @@ export const DashboardView: React.FC = () => {
   const unknownTasks = taskStateCounts.UNKNOWN;
 
   const totalProgress = tasks.length > 0
-    ? Math.round(tasks.reduce((sum, t) => sum + t.progress_cache_percent, 0) / tasks.length)
+    ? clampProgressPercent(
+        tasks.reduce((sum, task) => sum + clampProgressPercent(task.progress_cache_percent), 0) / tasks.length
+      )
     : 0;
 
   // Real capacity risk computation based on observable resource quotas
-  const measuredResources = resources.filter((r) => r.remaining_quota !== null && r.total_quota !== null && r.total_quota > 0);
+  const measuredResources = resources.filter((r) => {
+    const validation = validateQuotaSnapshot({ remaining: r.remaining_quota, total: r.total_quota });
+    return validation.valid && quotaSourceLabel(r.quota_source) !== 'unknown' && r.remaining_quota !== null && r.total_quota !== null && r.total_quota > 0;
+  });
   let capacityRiskLabel = t('dashboard.capacityUnknown');
   let capacityRiskSubtext = t('dashboard.capacityUnknownSubtext');
   let capacityRiskType: 'LOW' | 'MODERATE' | 'HIGH' | 'UNKNOWN' = 'UNKNOWN';
 
   if (measuredResources.length > 0) {
-    const minPercent = Math.min(...measuredResources.map((r) => (r.remaining_quota! / r.total_quota!) * 100));
+    const minPercent = Math.min(
+      ...measuredResources.map((r) => Math.min(100, Math.max(0, (r.remaining_quota! / r.total_quota!) * 100)))
+    );
     if (minPercent < 15) {
       capacityRiskType = 'HIGH';
       capacityRiskLabel = t('dashboard.capacityHigh');
