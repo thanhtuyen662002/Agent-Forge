@@ -10,7 +10,7 @@ import { GitService } from './GitService';
 import { ProgressService } from './ProgressService';
 import { TaskStateMachine, TaskTrigger } from '../state/taskStateMachine';
 import { ManagerProtocol, CoderProtocol } from '../types/protocols';
-import { Evidence, Task, TaskMutationBinding, TestRun, GitStatusSummary, GitDiffSummary } from '../types/domain';
+import { AuthorizedTaskTransitionBinding, Evidence, Task, TaskStateEnum, TaskMutationBinding, TestRun, GitStatusSummary, GitDiffSummary } from '../types/domain';
 import { canonicalJsonStringify, computeSha256 } from '../context/ContextIntegrity';
 import { DEFAULT_MAX_REVISIONS } from '../../shared/revisionPolicy';
 
@@ -120,7 +120,28 @@ export interface ReviewStartResult {
 export interface AuthorizedTaskTransitionResult {
   success: boolean;
   task?: Task;
+  isDuplicate?: boolean;
+  errorCode?: 'INVALID_TASK_TRANSITION_BINDING' | 'STALE_TASK_TRANSITION' | 'TASK_TRANSITION_FAILED';
   error?: string;
+}
+
+export function captureAuthorizedTaskTransitionBinding(task: Task): AuthorizedTaskTransitionBinding {
+  return Object.freeze({
+    taskId: task.id,
+    projectId: task.project_id,
+    expectedState: task.state,
+    expectedRevision: task.revision_count,
+    expectedOwnershipEpoch: task.ownership_epoch ?? 1,
+    expectedPausedFromState: task.paused_from_state,
+    expectedMaxRevisions: task.max_revisions,
+  });
+}
+
+class StaleTaskTransitionError extends Error {
+  public readonly code = 'STALE_TASK_TRANSITION' as const;
+  constructor(detail: string) {
+    super(`STALE_TASK_TRANSITION: ${detail}`);
+  }
 }
 
 export class TaskService {
@@ -162,51 +183,88 @@ export class TaskService {
 
   /**
    * Product-authoritative transition used by the consolidated self-host path.
-   * The ownership epoch is checked in the same immediate transaction as the
-   * TaskStateMachine transition so an old worker cannot advance a reassigned task.
+   * The caller supplies its original snapshot, never a freshly borrowed task
+   * identity. State, revision, project, epoch and event commit atomically.
    */
   public transitionAuthorizedTask(
     taskId: string,
     trigger: TaskTrigger,
-    expectedOwnershipEpoch: number,
+    expected: AuthorizedTaskTransitionBinding,
   ): AuthorizedTaskTransitionResult {
+    if (
+      !expected || typeof expected !== 'object' || expected.taskId !== taskId ||
+      typeof expected.projectId !== 'string' || !expected.projectId ||
+      !TaskStateEnum.safeParse(expected.expectedState).success ||
+      !Number.isSafeInteger(expected.expectedRevision) || expected.expectedRevision < 0 ||
+      !Number.isSafeInteger(expected.expectedOwnershipEpoch) || expected.expectedOwnershipEpoch < 1 ||
+      !Number.isSafeInteger(expected.expectedMaxRevisions) || expected.expectedMaxRevisions < 1 ||
+      !(expected.expectedPausedFromState === null ||
+        ['DISPATCHED', 'CODING', 'VALIDATING', 'REVIEWING'].includes(expected.expectedPausedFromState))
+    ) {
+      return { success: false, errorCode: 'INVALID_TASK_TRANSITION_BINDING', error: 'INVALID_TASK_TRANSITION_BINDING: An immutable complete task binding is required.' };
+    }
+    // Copy all primitives before entering the mutation boundary.
+    const binding: AuthorizedTaskTransitionBinding = Object.freeze({
+      taskId: expected.taskId, projectId: expected.projectId,
+      expectedState: expected.expectedState, expectedRevision: expected.expectedRevision,
+      expectedOwnershipEpoch: expected.expectedOwnershipEpoch,
+      expectedPausedFromState: expected.expectedPausedFromState,
+      expectedMaxRevisions: expected.expectedMaxRevisions,
+    });
     try {
+      const transition = TaskStateMachine.transition(binding.expectedState, trigger, {
+        pausedFromState: binding.expectedPausedFromState,
+        revisionCount: binding.expectedRevision,
+        maxRevisions: binding.expectedMaxRevisions,
+      });
+      const nextRevision = binding.expectedRevision + (transition.incrementRevision ? 1 : 0);
+      const eventId = `authorized-transition-${computeSha256(canonicalJsonStringify({ binding, trigger }))}`;
+      const payload = {
+        binding, trigger, fromState: binding.expectedState, toState: transition.nextState,
+        ownershipEpoch: binding.expectedOwnershipEpoch, nextRevision,
+        pausedFromState: transition.pausedFromState,
+      };
       return this.repo.runInImmediateTransaction(() => {
         const task = this.repo.getTask(taskId);
-        if (!task) return { success: false, error: `Task "${taskId}" not found.` };
-        if (task.ownership_epoch !== expectedOwnershipEpoch) {
-          return {
-            success: false,
-            error: `OWNERSHIP_EPOCH_MISMATCH: expected ${expectedOwnershipEpoch}, current ${String(task.ownership_epoch)}.`,
-          };
+        if (!task || task.project_id !== binding.projectId) {
+          throw new StaleTaskTransitionError('Task/project identity differs from the captured binding.');
         }
-        const transition = TaskStateMachine.transition(task.state, trigger, {
-          pausedFromState: task.paused_from_state,
-          revisionCount: task.revision_count,
-          maxRevisions: task.max_revisions,
-        });
-        this.repo.updateTaskState(
-          task.id,
+        if (task.ownership_epoch !== binding.expectedOwnershipEpoch) {
+          throw new StaleTaskTransitionError('OWNERSHIP_EPOCH_MISMATCH: Task ownership changed after capture.');
+        }
+        const previous = this.repo.getEvent(eventId);
+        if (previous) {
+          // Replay is valid only while the exact committed result still exists.
+          // A later task transition cannot be attributed to this old request.
+          if (
+            previous.type !== 'AUTHORIZED_AUTONOMY_TASK_TRANSITION' ||
+            previous.project_id !== binding.projectId || previous.task_id !== taskId ||
+            canonicalJsonStringify(previous.structured_payload) !== canonicalJsonStringify(payload) ||
+            task.state !== transition.nextState || task.revision_count !== nextRevision ||
+            task.paused_from_state !== transition.pausedFromState || task.max_revisions !== binding.expectedMaxRevisions
+          ) throw new StaleTaskTransitionError('Prior transition result is no longer current.');
+          return { success: true, task, isDuplicate: true };
+        }
+        if (!this.repo.compareAndSwapAuthorizedTaskState(
+          binding,
           transition.nextState,
           transition.pausedFromState,
           transition.incrementRevision,
-        );
-        this.eventService.record(
-          task.project_id,
-          'AUTHORIZED_AUTONOMY_TASK_TRANSITION',
-          `Authorized autonomy transition ${trigger} moved task ${task.id} from ${task.state} to ${transition.nextState}.`,
-          {
-            trigger,
-            fromState: task.state,
-            toState: transition.nextState,
-            ownershipEpoch: expectedOwnershipEpoch,
-          },
-          task.id,
-        );
+        )) throw new StaleTaskTransitionError('Task state, revision or policy changed after capture.');
+        this.repo.createDeterministicGenericEvent({
+          id: eventId, project_id: binding.projectId, task_id: taskId, agent_id: null,
+          type: 'AUTHORIZED_AUTONOMY_TASK_TRANSITION',
+          summary: `Authorized autonomy transition ${trigger} moved task ${taskId} from ${binding.expectedState} to ${transition.nextState}.`,
+          structured_payload: payload, timestamp: new Date().toISOString(),
+        });
         return { success: true, task: this.repo.getTask(task.id)! };
       });
     } catch (error) {
-      return { success: false, error: error instanceof Error ? error.message : String(error) };
+      return {
+        success: false,
+        errorCode: error instanceof StaleTaskTransitionError ? error.code : 'TASK_TRANSITION_FAILED',
+        error: error instanceof Error ? error.message : String(error),
+      };
     }
   }
 

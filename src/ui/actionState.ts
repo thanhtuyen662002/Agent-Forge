@@ -1,4 +1,4 @@
-export type UiActionName = 'createProject' | 'createTask' | 'importContract' | 'projectTransition';
+export type UiActionName = 'createProject' | 'createTask' | 'importContract' | 'projectTransition' | 'updateQuota';
 export type UiActionFailure = 'DESKTOP_REQUIRED' | 'NO_PROJECT' | 'IPC_REJECTED' | 'IPC_FAILED' | 'INVALID_RESPONSE' | 'ACTION_PENDING';
 export type UiActionResult<T = void> = { readonly success: true; readonly data: T } | { readonly success: false; readonly code: UiActionFailure };
 

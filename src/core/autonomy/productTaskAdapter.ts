@@ -8,13 +8,13 @@ import {
 } from '../services/ExecutionAuthorizationService';
 import { ArtifactStore } from '../services/ArtifactStore';
 import { EventService } from '../services/EventService';
-import { TaskService } from '../services/TaskService';
+import { TaskService, captureAuthorizedTaskTransitionBinding } from '../services/TaskService';
 import {
   AcquireSlotLeaseResult,
   ReleaseLeaseResult,
   WorkerSlotLeaseService,
 } from '../services/WorkerSlotLeaseService';
-import { TaskStateMachine, TaskTrigger } from '../state/taskStateMachine';
+import { TaskTrigger } from '../state/taskStateMachine';
 import { AgentAssignment, ExecutionAuthorization, ProcessRun, Task, TaskMutationBinding, TestRun } from '../types/domain';
 import { AutonomousTaskSpec, ManagerReview, ManagerReviewSchema, WorkOrder, createWorkOrder } from './contracts';
 import { EvidenceCollector } from './evidence';
@@ -463,18 +463,9 @@ export class ProductTaskAutonomyAdapter {
     };
   }
 
-  public transitionTask(taskId: string, trigger: TaskTrigger, expectedOwnershipEpoch?: number): Task {
-    const task = this.repo.getTask(taskId);
-    if (!task) throw new Error(`TASK_NOT_FOUND: ${taskId}`);
-    // Validate the transition locally for a deterministic error, then let
-    // TaskService perform the epoch-fenced authoritative mutation.
-    TaskStateMachine.transition(task.state, trigger, {
-      pausedFromState: task.paused_from_state,
-      revisionCount: task.revision_count,
-      maxRevisions: task.max_revisions,
-    });
-    const epoch = expectedOwnershipEpoch ?? task.ownership_epoch ?? 1;
-    const result = this.taskService.transitionAuthorizedTask(task.id, trigger, epoch);
+  public transitionTask(task: Task, trigger: TaskTrigger): Task {
+    if (!task || typeof task !== 'object') throw new Error('INVALID_TASK_TRANSITION_BINDING');
+    const result = this.taskService.transitionAuthorizedTask(task.id, trigger, captureAuthorizedTaskTransitionBinding(task));
     if (!result.success || !result.task) throw new Error(result.error ?? 'AUTHORIZED_TASK_TRANSITION_FAILED');
     return result.task;
   }
@@ -689,11 +680,11 @@ export class ProductTaskAutonomyAdapter {
     const evidenceCollector = input.evidenceCollector ?? this.evidenceCollector ?? new EvidenceCollector();
 
     let result: ExecuteProductTaskResult;
+    const authorityEpoch = validated.authority.task.ownership_epoch ?? 1;
+    let task = { ...validated.authority.task };
     try {
-      const authorityEpoch = validated.authority.task.ownership_epoch ?? 1;
-      let task = this.repo.getTask(validated.authority.task.id)!;
-      if (task.state === 'APPROVED' || task.state === 'QUEUED') task = this.transitionTask(task.id, 'DISPATCH', authorityEpoch);
-      if (task.state === 'DISPATCHED' || task.state === 'FIX_REQUIRED') task = this.transitionTask(task.id, 'START_CODING', authorityEpoch);
+      if (task.state === 'APPROVED' || task.state === 'QUEUED') task = this.transitionTask(task, 'DISPATCH');
+      if (task.state === 'DISPATCHED' || task.state === 'FIX_REQUIRED') task = this.transitionTask(task, 'START_CODING');
       if (task.state !== 'CODING') throw new Error(`PRODUCT_TASK_NOT_CODING: ${task.state}`);
 
       const coder = await input.runCoder(workOrder);
@@ -716,8 +707,11 @@ export class ProductTaskAutonomyAdapter {
         throw new Error('WORKER_PATH_VIOLATION');
       }
 
-      this.repo.updateTaskShas(task.id, undefined, preReviewEvidence.headSha);
-      task = this.transitionTask(task.id, 'SUBMIT_REPORT', authorityEpoch);
+      task = this.repo.runInImmediateTransaction(() => {
+        const transitioned = this.transitionTask(task, 'SUBMIT_REPORT');
+        this.repo.updateTaskShas(transitioned.id, undefined, preReviewEvidence.headSha);
+        return this.repo.getTask(transitioned.id)!;
+      });
 
       // Verification acceptance strictly requires a newly persisted TestRun
       // and its process/evidence lineage from this authorization attempt.
@@ -774,7 +768,7 @@ export class ProductTaskAutonomyAdapter {
       );
 
       if (!currentTestRunPassed) {
-        task = this.transitionTask(task.id, 'TESTS_FAILED', authorityEpoch);
+        task = this.transitionTask(task, 'TESTS_FAILED');
         const verificationError = !currentTestRun
           ? 'CURRENT_VERIFICATION_TEST_RUN_MISSING'
           : !currentRunBound
@@ -886,8 +880,8 @@ export class ProductTaskAutonomyAdapter {
           error: noProgress?.hasNoProgress ? `REPAIR_NO_PROGRESS: ${noProgress.category}: ${noProgress.reason}` : verificationError,
         };
       } else {
-        task = this.transitionTask(task.id, 'EVIDENCE_GATHERED', authorityEpoch);
-        task = this.transitionTask(task.id, 'START_REVIEW', authorityEpoch);
+        task = this.transitionTask(task, 'EVIDENCE_GATHERED');
+        task = this.transitionTask(task, 'START_REVIEW');
         const context = this.buildManagerContext(workOrder, preReviewEvidence.headSha, {
           ...input.managerContext,
           actualDiff: input.managerContext?.actualDiff ?? preReviewEvidence.diff,
@@ -948,7 +942,7 @@ export class ProductTaskAutonomyAdapter {
           requireScopeMatch: true,
         });
         if (!freshness.fresh) {
-          task = this.transitionTask(task.id, 'FIX_VERDICT', authorityEpoch);
+          task = this.transitionTask(task, 'FIX_VERDICT');
           result = {
             success: false,
             finalTaskState: task.state,
@@ -964,7 +958,7 @@ export class ProductTaskAutonomyAdapter {
           };
         } else if (!refreshedAuthority.valid) {
           if (refreshedAuthority.code !== 'OWNERSHIP_EPOCH_MISMATCH') {
-            task = this.transitionTask(task.id, 'FIX_VERDICT', authorityEpoch);
+            task = this.transitionTask(task, 'FIX_VERDICT');
           }
           result = {
             success: false,
@@ -1050,7 +1044,7 @@ export class ProductTaskAutonomyAdapter {
             this.options.autonomyStore.recordRepairContext(task.id, nextPackage);
           }
 
-          task = this.transitionTask(task.id, review.verdict === 'REPAIR' ? 'FIX_VERDICT' : 'MAX_REVISIONS_EXCEEDED', authorityEpoch);
+          task = this.transitionTask(task, review.verdict === 'REPAIR' ? 'FIX_VERDICT' : 'MAX_REVISIONS_EXCEEDED');
           result = {
             success: false,
             finalTaskState: task.state,
@@ -1079,7 +1073,7 @@ export class ProductTaskAutonomyAdapter {
               created_at: new Date().toISOString(),
             });
           }
-          task = this.transitionTask(task.id, 'PASS_VERDICT', authorityEpoch);
+          task = this.transitionTask(task, 'PASS_VERDICT');
           result = {
             success: true,
             finalTaskState: task.state,
@@ -1096,19 +1090,18 @@ export class ProductTaskAutonomyAdapter {
     } catch (error) {
       const currentTask = this.repo.getTask(validated.authority.task.id);
       let finalTaskState = currentTask?.state ?? 'UNKNOWN';
-      const authorityEpoch = validated.authority.task.ownership_epoch ?? 1;
       const executionError = error instanceof Error ? error.message : String(error);
       let reportedError = executionError;
-      if (currentTask && currentTask.state === 'REVIEWING') {
+      if (currentTask && task.state === 'REVIEWING') {
         const currentEpoch = currentTask.ownership_epoch ?? authorityEpoch;
         if (currentEpoch === authorityEpoch) {
           try {
-            const recovered = this.transitionTask(currentTask.id, 'FIX_VERDICT', authorityEpoch);
+            const recovered = this.transitionTask(task, 'FIX_VERDICT');
             finalTaskState = recovered.state;
           } catch (recoveryError) {
             finalTaskState = this.repo.getTask(currentTask.id)?.state ?? currentTask.state;
             const recoveryMessage = recoveryError instanceof Error ? recoveryError.message : String(recoveryError);
-            reportedError = recoveryMessage.includes('OWNERSHIP_EPOCH_MISMATCH')
+            reportedError = recoveryMessage.includes('OWNERSHIP_EPOCH_MISMATCH') || recoveryMessage.includes('STALE_TASK_TRANSITION')
               ? `AUTHORITY_FENCED_DURING_EXECUTION: ${recoveryMessage}`
               : `REVIEW_RESUME_FAILED: ${recoveryMessage}; original error: ${executionError}`;
           }

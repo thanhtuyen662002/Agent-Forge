@@ -4,6 +4,7 @@ import { useI18n } from '../context/I18nContext';
 import { QuotaBadge } from '../components/QuotaBadge';
 import { ProviderResource, QuotaSource } from '../../core/types/domain';
 import { Cpu, Edit2 } from 'lucide-react';
+import { isQuotaInputValid, validateQuotaSnapshot } from '../capacityTruth';
 
 export interface QuotaSnapshotResolution {
   remaining: number | null;
@@ -85,25 +86,58 @@ export function resolveQuotaSnapshot(
 export const resolveQuotaUpdate = resolveQuotaSnapshot;
 
 export const CapacityView: React.FC = () => {
-  const { resources, updateResourceQuota } = useOrchestrator();
+  const { resources, updateResourceQuota, isElectron, pendingActions } = useOrchestrator();
   const { t } = useI18n();
   const [editingResource, setEditingResource] = useState<ProviderResource | null>(null);
   const [editRemaining, setEditRemaining] = useState<string>('');
   const [editTotal, setEditTotal] = useState<string>('');
+  const [editError, setEditError] = useState<string | null>(null);
+  const [saving, setSaving] = useState(false);
+  const quotaPending = saving || pendingActions.includes('updateQuota');
 
   const handleSaveQuota = async () => {
-    if (!editingResource) return;
+    if (!editingResource || quotaPending || !isElectron) return;
+    setEditError(null);
+
+    if (!isQuotaInputValid(editRemaining) || !isQuotaInputValid(editTotal)) {
+      setEditError(t('capacity.invalidNumber'));
+      return;
+    }
+
     const snapshot = resolveQuotaSnapshot(editRemaining, editTotal);
-    await updateResourceQuota(
-      editingResource.id,
-      snapshot.remaining,
-      snapshot.total,
-      snapshot.source,
-      snapshot.confidence
-    );
-    setEditingResource(null);
-    setEditRemaining('');
-    setEditTotal('');
+    const validation = validateQuotaSnapshot({ remaining: snapshot.remaining, total: snapshot.total });
+    if (!validation.valid) {
+      setEditError(
+        validation.error === 'REMAINING_EXCEEDS_TOTAL'
+          ? t('capacity.remainingExceedsTotal')
+          : validation.error === 'NEGATIVE'
+          ? t('capacity.nonNegative')
+          : t('capacity.invalidNumber')
+      );
+      return;
+    }
+
+    setSaving(true);
+    try {
+      const result = await updateResourceQuota(
+        editingResource.id,
+        snapshot.remaining,
+        snapshot.total,
+        snapshot.source,
+        snapshot.confidence
+      );
+      if (!result.success) {
+        if (result.code !== 'ACTION_PENDING') setEditError(t('capacity.saveError'));
+        return;
+      }
+      setEditingResource(null);
+      setEditRemaining('');
+      setEditTotal('');
+    } catch {
+      setEditError(t('capacity.saveError'));
+    } finally {
+      setSaving(false);
+    }
   };
 
   return (
@@ -158,10 +192,12 @@ export const CapacityView: React.FC = () => {
               </div>
 
               <button
+                disabled={!isElectron || quotaPending}
                 onClick={() => {
                   setEditingResource(res);
                   setEditRemaining(formatQuotaInput(res.remaining_quota));
                   setEditTotal(formatQuotaInput(res.total_quota));
+                  setEditError(null);
                 }}
                 className="w-full py-1.5 bg-surface hover:bg-surface-hover text-slate-300 rounded-lg border border-surface-border text-xs font-mono flex items-center justify-center space-x-1.5 transition"
               >
@@ -183,11 +219,14 @@ export const CapacityView: React.FC = () => {
 
             <div className="space-y-3 text-xs font-mono">
               <div>
-                <label className="block text-slate-400 mb-1">
+                <label htmlFor="quota-remaining" className="block text-slate-400 mb-1">
                   {t('capacity.remainingUnits', { unit: editingResource.quota_unit })}:
                 </label>
                 <input
+                  id="quota-remaining"
                   type="number"
+                  min="0"
+                  disabled={quotaPending}
                   value={editRemaining}
                   onChange={(e) => setEditRemaining(e.target.value)}
                   placeholder={t('common.unknown')}
@@ -196,9 +235,12 @@ export const CapacityView: React.FC = () => {
               </div>
 
               <div>
-                <label className="block text-slate-400 mb-1">{t('capacity.totalUnits')}:</label>
+                <label htmlFor="quota-total" className="block text-slate-400 mb-1">{t('capacity.totalUnits')}:</label>
                 <input
+                  id="quota-total"
                   type="number"
+                  min="0"
+                  disabled={quotaPending}
                   value={editTotal}
                   onChange={(e) => setEditTotal(e.target.value)}
                   placeholder={t('common.unknown')}
@@ -207,8 +249,15 @@ export const CapacityView: React.FC = () => {
               </div>
             </div>
 
+            {editError && (
+              <div role="alert" className="rounded-lg border border-rose-500/30 bg-rose-950/30 px-3 py-2 text-xs text-rose-300">
+                {editError}
+              </div>
+            )}
+
             <div className="flex justify-end space-x-3 pt-3 border-t border-surface-border">
               <button
+                disabled={quotaPending}
                 onClick={() => {
                   setEditingResource(null);
                   setEditRemaining('');
@@ -220,9 +269,11 @@ export const CapacityView: React.FC = () => {
               </button>
               <button
                 onClick={handleSaveQuota}
-                className="px-5 py-2 bg-forge-emerald hover:bg-emerald-600 text-slate-950 font-mono font-bold rounded-lg text-xs shadow"
+                disabled={!isElectron || quotaPending}
+                aria-busy={quotaPending}
+                className="px-5 py-2 bg-forge-emerald hover:bg-emerald-600 disabled:opacity-50 disabled:cursor-not-allowed text-slate-950 font-mono font-bold rounded-lg text-xs shadow"
               >
-                {t('capacity.saveSnapshot')}
+                {quotaPending ? t('common.loading') : t('capacity.saveSnapshot')}
               </button>
             </div>
           </div>

@@ -1445,6 +1445,67 @@ describe('product-task autonomy consolidation', () => {
     expect(repo.getWorkerSlot(fixture.slotId)?.status).toBe('IDLE');
   });
 
+  it('rejects ID-only and stale same-epoch adapter transitions without borrowing current state', () => {
+    const fixture = seed('task-cas-adapter');
+    const before = repo.getTask(fixture.task.id)!;
+    expect(() => adapter.transitionTask(fixture.task.id as unknown as Task, 'DISPATCH')).toThrow('INVALID_TASK_TRANSITION_BINDING');
+    const dispatched = adapter.transitionTask(before, 'DISPATCH');
+    repo.getDatabase().prepare('UPDATE tasks SET revision_count = revision_count + 1 WHERE id = ?').run(before.id);
+    const newer = repo.getTask(before.id)!;
+    const eventCount = repo.getEvents(before.project_id).length;
+    expect(() => adapter.transitionTask(dispatched, 'START_CODING')).toThrow('STALE_TASK_TRANSITION');
+    expect(repo.getTask(before.id)).toEqual(newer);
+    expect(repo.getEvents(before.project_id)).toHaveLength(eventCount);
+  });
+
+  it('fences a coder result after same-epoch revision drift before writing its SHA or verification', async () => {
+    const fixture = seed('task-cas-late-coder');
+    const runVerification = vi.fn();
+    const conductReview = vi.fn();
+    const result = await adapter.executeProductTask({
+      ...workOrderInput(fixture),
+      runCoder: async () => {
+        repo.getDatabase().prepare('UPDATE tasks SET revision_count = revision_count + 1, current_sha = ? WHERE id = ?').run(OTHER_SHA, fixture.task.id);
+        return { success: true, currentHeadSha: BASE_SHA };
+      },
+      evidenceCollector: { collect: async () => ({ headSha: BASE_SHA, snapshotSha: 'snapshot-cas', status: '', changedFiles: ['src'], diff: 'diff', tests: [] }) },
+      runVerification,
+      conductReview,
+    });
+    expect(result.success).toBe(false);
+    expect(result.error).toContain('STALE_TASK_TRANSITION');
+    expect(result.leaseReleased).toBe(true);
+    expect(repo.getTask(fixture.task.id)).toMatchObject({ state: 'CODING', revision_count: 1, current_sha: OTHER_SHA, ownership_epoch: 1 });
+    expect(runVerification).not.toHaveBeenCalled();
+    expect(conductReview).not.toHaveBeenCalled();
+    expect(repo.getEvents(fixture.task.project_id).filter((e) => e.type === 'AUTHORIZED_AUTONOMY_TASK_TRANSITION' && e.structured_payload?.trigger === 'SUBMIT_REPORT')).toHaveLength(0);
+  });
+
+  it.each(['PASS', 'THROW'] as const)('fences late %s review and recovery after same-epoch revision drift', async (verdict) => {
+    const fixture = seed(`task-cas-late-review-${verdict}`);
+    const result = await adapter.executeProductTask({
+      ...workOrderInput(fixture),
+      runCoder: async () => ({ success: true, currentHeadSha: BASE_SHA }),
+      evidenceCollector: { collect: async () => ({ headSha: BASE_SHA, snapshotSha: 'snapshot-cas', status: '', changedFiles: ['src'], diff: 'diff', tests: [] }) },
+      runVerification: async (authority, workOrder) => adapter.recordVerificationObservation({
+        projectId: authority.task.project_id, taskId: authority.task.id,
+        attemptId: authority.authorization.attempt_id, command: 'node --version',
+        status: 'COMPLETED', exitCode: 0, passedCount: 1, failedCount: 0,
+        durationMs: 1, stdout: process.version, workingDirectory: workOrder!.worktree,
+      }),
+      conductReview: async (context) => {
+        repo.getDatabase().prepare('UPDATE tasks SET revision_count = revision_count + 1 WHERE id = ?').run(fixture.task.id);
+        if (verdict === 'THROW') throw new Error('ALL_MANAGER_RESOURCES_UNAVAILABLE');
+        return { protocol_version: 'managerreview.v1', verdict: 'PASS', reviewed_head_sha: context.current_head, findings: [], required_actions: [], risk: 'LOW', notes: 'old revision' };
+      },
+    });
+    expect(result.success).toBe(false);
+    expect(result.error).toContain('STALE_TASK_TRANSITION');
+    expect(result.leaseReleased).toBe(true);
+    expect(repo.getTask(fixture.task.id)).toMatchObject({ state: 'REVIEWING', revision_count: 1, ownership_epoch: 1 });
+    expect(repo.getEvents(fixture.task.project_id).filter((e) => e.type === 'AUTHORIZED_AUTONOMY_TASK_TRANSITION' && ['PASS_VERDICT', 'FIX_VERDICT'].includes(String(e.structured_payload?.trigger)))).toHaveLength(0);
+  });
+
   it('preserves ownership epoch fencing when task ownership epoch changes during stale review handling', async () => {
     const fixture = seed('task-epoch-fence-stale');
     const input = workOrderInput(fixture);
