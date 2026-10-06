@@ -1,6 +1,17 @@
 import { TranslationDictionary } from '../types';
 
 export const enUS: TranslationDictionary = {
+  actions: {
+    pending: 'Working…',
+    success: 'Action completed.',
+    failed: 'Action failed. Review the input and try again.',
+    desktopRequired: 'Open the desktop app to perform this action.',
+    previewReadOnly: 'Read-only browser preview',
+    requestRejected: 'The desktop request was rejected. Try again.',
+    invalidResponse: 'The desktop returned an incomplete response. Try again.',
+    noProject: 'Select a project before performing this action.',
+    alreadyPending: 'This action is already in progress.',
+  },
   app: {
     title: 'Agent-Forge',
     subtitle: 'Local AI Engineering Control Plane',

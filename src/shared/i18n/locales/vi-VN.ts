@@ -1,6 +1,17 @@
 import { TranslationDictionary } from '../types';
 
 export const viVN: TranslationDictionary = {
+  actions: {
+    pending: 'Đang xử lý…',
+    success: 'Thao tác đã hoàn tất.',
+    failed: 'Thao tác thất bại. Kiểm tra dữ liệu và thử lại.',
+    desktopRequired: 'Mở ứng dụng desktop để thực hiện thao tác này.',
+    previewReadOnly: 'Bản xem trước trên trình duyệt chỉ đọc',
+    requestRejected: 'Yêu cầu tới ứng dụng desktop bị từ chối. Vui lòng thử lại.',
+    invalidResponse: 'Ứng dụng desktop trả về dữ liệu chưa đầy đủ. Vui lòng thử lại.',
+    noProject: 'Chọn dự án trước khi thực hiện thao tác.',
+    alreadyPending: 'Thao tác này đang được xử lý.',
+  },
   app: {
     title: 'Agent-Forge',
     subtitle: 'Trung tâm Điều khiển Kỹ nghệ AI Cục bộ',
