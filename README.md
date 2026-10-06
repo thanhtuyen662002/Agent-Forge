@@ -35,7 +35,7 @@ The authoritative boundaries are deliberately split. GitHub Issues, Draft PRs, e
 - **Deterministic Quota-Aware Routing (PR #6)**: **IMPLEMENTED & VERIFIED** (Pre-dispatch failover, tier-based eligibility, AUTH_ERROR hard stop, durable routing decision events).
 - **Durable Execution Authorization (PR #7)**: **IMPLEMENTED & VERIFIED** (Immutable `ExecutionAuthorization` binding exact approved work payloads, canonical payload hashes, context manifest containment, and atomic one-time dispatch claims).
 - **Owner Routing & Manual Bridge UI Loop (PR #8)**: **IMPLEMENTED & VERIFIED** (Human-in-the-Loop routing controller, explicit candidate reordering, truthful UNKNOWN quota rendering, typed single-argument dispatch IPC, 1-click WorkOrder copy, and durable restart reconstruction).
-- **Demo Readiness, Bilingual i18n & Installed-App Updates (PR #9)**: **IMPLEMENTED & VERIFIED** (Vietnamese `vi-VN` and English `en-US` typed translation dictionaries with 100% key parity, durable locale persistence, visible versioning, installed-app update foundation with `electron-updater`, live progress, Owner-controlled restart/install, and safe restart guards).
+- **Demo Readiness, Bilingual i18n & Installed-App Update Foundation (PR #9)**: **IMPLEMENTED & VERIFIED IN TESTS** (Vietnamese `vi-VN` and English `en-US` typed translation dictionaries with 100% key parity, durable locale persistence, visible versioning, an `electron-updater` check/download lifecycle, live progress, Owner-controlled install/restart, and safe restart guards). The test evidence does not imply that a signed production release has been published.
 - **Cross-Provider Handoff & Crash Recovery Closure (R5I1–R5I7)**: **IMPLEMENTED & VERIFIED** (Atomic multi-provider handoff lifecycle across discrete roles/accounts/slots, monotonic `ownership_epoch` fencing, SHA-256 context manifest binding, guarded worker slot leasing, crash recovery scanner with fenced reconciliation, and 20-point end-to-end integration proof matrix).
 - **Experimental PILOT Providers**: Separate CLI adapters support Codex manager/reviewer and Antigravity file editing. Existing desktop provider routing remains unchanged. Live contracts and a disposable proof are required before self-development.
 - **Code Signing Status**: **UNSIGNED DESKTOP FOUNDATION** (`CODE_SIGNED=NO`; Windows executable is unsigned; explicitly noted in About and Update UI).
@@ -54,7 +54,7 @@ Language selection is preserved across reloads and application restarts. Protoco
 
 ## Installed-App Update Architecture
 
-Agent-Forge incorporates a secure, human-in-the-loop update foundation:
+Agent-Forge includes a secure, human-in-the-loop update foundation. It describes the packaged application's available controls; it does not claim that a signed production release is currently published:
 - **Production Provider**: Configured with GitHub provider (`thanhtuyen662002/Agent-Forge`) in `electron-builder.yml` without embedded secrets.
 - **Publish Invariant**: Normal packaging (`package:win`, `package:win:dir`) and CI runs strictly enforce `--publish never`. Releases are published exclusively via manual `.github/workflows/release-windows.yml`.
 - **Zero Stealth Installs**: `autoDownload` and `autoInstallOnAppQuit` are disabled. The Owner decides when to check, download, and install.
@@ -62,7 +62,7 @@ Agent-Forge incorporates a secure, human-in-the-loop update foundation:
 - **Active Work Guard**: The update service verifies SQLite state and blocks restart if any task is actively running (`CODING`, `VALIDATING`, `DISPATCHED`).
 - **Strict IPC Security**: No renderer-supplied URLs, executable paths, authorization tokens, or shell commands.
 - **Secret Redaction**: Error logs sanitize GitHub tokens, passwords, Bearer tokens, and credentials before presentation.
-- **Installed Integration Proof**: Real Windows NSIS installed application update verified via `npm run test:installed:win` with local feed detection and download completion.
+- **Installed Integration Test Scope**: `npm run test:installed:win` builds isolated test-only Windows NSIS artifacts, serves a local generic feed, and verifies update discovery, download, and the `DOWNLOADED`/`canInstall` gate. It does not publish a release, sign an installer, or replace an owner-installed production binary.
 
 ---
 
@@ -82,7 +82,7 @@ The manual bridge remains available for explicit owner-controlled execution:
 2. In the **Owner Routing / Handoff** view, the Owner reviews task authority, explicitly selects and orders candidate `ProviderResource` instances (starts empty; no implicit provider auto-selection), and explicitly opts into Manual Bridge fallback.
 3. The Owner triggers deterministic routing (`ProviderRoutingService.route`) and generates an immutable `ExecutionAuthorization` bound to durable Manager authority and Git repository HEAD.
 4. The Owner dispatches the execution, consuming the authorization (`DISPATCHED`) with atomic replay protection.
-5. If the outcome is `MANUAL_HANDOFF_REQUIRED`, the task enters `AWAITING_OWNER`. The Owner clicks **Generate Authorized WorkOrder** to construct the canonical prompt derived strictly from the immutable execution authorization instructions, then clicks **1-Click Copy WorkOrder** to copy the prompt to clipboard.
+5. If the outcome is `MANUAL_HANDOFF_REQUIRED`, the Manual Bridge adapter returns the provider result `AWAITING_OWNER`. The durable task state remains `CODING` or `HANDOFF_REQUIRED` as appropriate; `AWAITING_OWNER` is the Owner-relay status shown by the handoff UI, not a `TaskState` value. The Owner clicks **Generate Authorized WorkOrder** to construct the canonical prompt derived strictly from the immutable execution authorization instructions, then clicks **1-Click Copy WorkOrder** to copy the prompt to clipboard.
 6. The Owner manually pastes the prompt into **Gemini Coder**.
 7. The Owner pastes Gemini's `coder.v1` response into the **Coder Inbox** to execute verification tests and capture authoritative Git diff evidence.
 
@@ -160,10 +160,11 @@ npm run autonomy:doctor:omniroute-coder
 - During Windows packaging (`npm run package:win:dir` / `npm run package:win`), `electron-builder` automatically rebuilds `better-sqlite3` native binaries for the Electron runtime (`NODE_MODULE_VERSION 132` / Electron 34) and places them in `release/win-unpacked/resources/app.asar.unpacked/`.
 - If switching between dev Electron and local Node test runs, `npm rebuild better-sqlite3` restores Node runtime ABI.
 
-### Packaging Limitations & Code Signing
+### Packaging Limits, Update Scope & Code Signing
 - **Code Signing**: `CODE_SIGNED=NO`. The generated NSIS installer is unsigned in this milestone foundation. Standard Windows SmartScreen / unknown publisher prompts are expected.
 - **Application Icon**: The default Electron executable icon is currently used pending custom asset design.
-- **Auto-Update**: Intentionally deferred; not enabled in this packaging milestone.
+- **Update Controls**: The packaged application can check for and download a configured update, then install it only after the Owner explicitly requests a restart and the active-work guard passes. Background download and quit-time installation remain disabled (`autoDownload=false`, `autoInstallOnAppQuit=false`).
+- **Release and Production Limits**: Normal packaging never publishes (`--publish never`); the manual release workflow is the only publisher. The installed-update integration test uses an isolated local feed and does not establish signed production publication or unattended installation.
 
 ---
 

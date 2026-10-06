@@ -1,6 +1,17 @@
 import { TranslationDictionary } from '../types';
 
 export const enUS: TranslationDictionary = {
+  actions: {
+    pending: 'Working…',
+    success: 'Action completed.',
+    failed: 'Action failed. Review the input and try again.',
+    desktopRequired: 'Open the desktop app to perform this action.',
+    previewReadOnly: 'Read-only browser preview',
+    requestRejected: 'The desktop request was rejected. Try again.',
+    invalidResponse: 'The desktop returned an incomplete response. Try again.',
+    noProject: 'Select a project before performing this action.',
+    alreadyPending: 'This action is already in progress.',
+  },
   app: {
     title: 'Agent-Forge',
     subtitle: 'Local AI Engineering Control Plane',
@@ -126,8 +137,22 @@ export const enUS: TranslationDictionary = {
       planned: 'PLANNED',
       coding: 'CODING',
       validating: 'VALIDATING & REVIEW',
+      handoff: 'OWNER HANDOFF',
+      waiting: 'WAITING',
       blocked: 'BLOCKED / ESCALATED',
       completed: 'COMPLETED',
+      failed: 'FAILED',
+      cancelled: 'CANCELLED',
+      unknown: 'UNKNOWN STATE',
+    },
+    laneActions: {
+      automated: 'AUTOMATED',
+      owner: 'OWNER ACTION',
+      wait: 'WAITING FOR CAPACITY/AUTHORITY',
+      inspect: 'INSPECT / ESCALATE',
+      retry: 'RETRY AVAILABLE',
+      none: 'NO ACTION',
+      integrity: 'INTEGRITY WARNING',
     },
     emptyLane: 'No tasks in this lane',
     revLabel: 'Rev',
@@ -301,7 +326,8 @@ export const enUS: TranslationDictionary = {
     loopProtection: {
       title: 'Loop Protection & Revision Limits',
       maxRevisionsLabel: 'Max Revisions Before Escalation',
-      helpText: 'Tasks exceeding this limit transition to NEEDS_HUMAN to halt AI ping-pong.',
+      helpText: 'Stored per project and applied to new tasks. Tasks exceeding this limit transition to NEEDS_HUMAN to halt AI ping-pong.',
+      invalidMaxRevisions: 'Max revisions must be a whole number from 1 through 10.',
     },
     saveConfigButton: 'SAVE CONFIGURATION',
     settingsSavedButton: 'SETTINGS SAVED',

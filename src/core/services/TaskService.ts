@@ -1,5 +1,8 @@
 import crypto from 'crypto';
-import { Repository } from '../database/repositories';
+import {
+  Repository,
+  ProtocolMessageReplayBinding,
+} from '../database/repositories';
 import { EventService } from './EventService';
 import { VerificationService } from './VerificationService';
 import { ArtifactStore } from './ArtifactStore';
@@ -8,6 +11,8 @@ import { ProgressService } from './ProgressService';
 import { TaskStateMachine, TaskTrigger } from '../state/taskStateMachine';
 import { ManagerProtocol, CoderProtocol } from '../types/protocols';
 import { Evidence, Task, TaskMutationBinding, TestRun, GitStatusSummary, GitDiffSummary } from '../types/domain';
+import { canonicalJsonStringify, computeSha256 } from '../context/ContextIntegrity';
+import { DEFAULT_MAX_REVISIONS } from '../../shared/revisionPolicy';
 
 export interface TaskCreationSpec {
   projectId: string;
@@ -26,7 +31,71 @@ export interface ApplyProtocolResult {
   isDuplicate?: boolean;
   message?: string;
   task?: Task;
+  errorCode?: 'PROTOCOL_REPLAY_CONFLICT';
   error?: string;
+}
+
+export class ProtocolReplayConflictError extends Error {
+  public readonly code = 'PROTOCOL_REPLAY_CONFLICT' as const;
+
+  constructor(public readonly conflictingFields: readonly string[]) {
+    super(`PROTOCOL_REPLAY_CONFLICT: Immutable protocol binding differs for ${conflictingFields.join(', ')}.`);
+    this.name = 'ProtocolReplayConflictError';
+  }
+}
+
+function canonicalManagerPayload(managerMsg: ManagerProtocol): Record<string, unknown> {
+  return {
+    protocol: managerMsg.protocol,
+    message_id: managerMsg.message_id,
+    project_id: managerMsg.project_id,
+    task_id: managerMsg.task_id ?? null,
+    decision: managerMsg.decision,
+    priority: managerMsg.priority ?? 'MEDIUM',
+    risk: managerMsg.risk ?? 'MEDIUM',
+    instructions: managerMsg.instructions ?? [],
+    acceptance_criteria: managerMsg.acceptance_criteria ?? [],
+    constraints: managerMsg.constraints ?? [],
+    review_issues: (managerMsg.review_issues ?? []).map((issue) => ({
+      severity: issue.severity,
+      title: issue.title,
+      file_path: issue.file_path ?? null,
+      line_number: issue.line_number ?? null,
+      description: issue.description,
+    })),
+    expected_task_state: managerMsg.expected_task_state ?? null,
+    expected_revision: managerMsg.expected_revision ?? null,
+    // `created_at` is optional but the protocol schema intentionally does
+    // not allow a JSON null.  Omit it when absent so the replay hash matches
+    // the canonical persisted payload accepted by the protocol parser.
+    ...(managerMsg.created_at === undefined ? {} : { created_at: managerMsg.created_at }),
+  };
+}
+
+function canonicalCoderPayload(coderMsg: CoderProtocol): Record<string, unknown> {
+  return {
+    protocol: coderMsg.protocol,
+    message_id: coderMsg.message_id,
+    project_id: coderMsg.project_id,
+    task_id: coderMsg.task_id,
+    attempt: coderMsg.attempt ?? 1,
+    status: coderMsg.status,
+    completed: coderMsg.completed ?? [],
+    remaining: coderMsg.remaining ?? [],
+    files_claimed_changed: coderMsg.files_claimed_changed ?? [],
+    tests_claimed: coderMsg.tests_claimed ?? [],
+    blockers: coderMsg.blockers ?? [],
+    review_requested: coderMsg.review_requested ?? true,
+    expected_task_state: coderMsg.expected_task_state ?? null,
+    expected_revision: coderMsg.expected_revision ?? null,
+    // See the manager payload above: absent optional timestamps remain
+    // absent in the canonical representation rather than becoming null.
+    ...(coderMsg.created_at === undefined ? {} : { created_at: coderMsg.created_at }),
+  };
+}
+
+function canonicalProtocolHash(payload: Record<string, unknown>): string {
+  return computeSha256(canonicalJsonStringify(payload));
 }
 
 export interface ValidationFlowResult {
@@ -61,6 +130,35 @@ export class TaskService {
     private verificationService?: VerificationService,
     private artifactStore?: ArtifactStore
   ) {}
+
+  /**
+   * Resolves the message-id replay before any task lookup or mutation.  A
+   * matching row keeps the existing idempotent success behavior; a row whose
+   * immutable binding differs is a typed conflict and must not be recorded as
+   * another ledger entry.
+   */
+  private protocolReplayResult(
+    messageId: string,
+    binding: ProtocolMessageReplayBinding,
+    duplicateMessage: string,
+  ): ApplyProtocolResult | null {
+    const comparison = this.repo.compareProtocolMessageReplay(messageId, binding);
+    if (comparison.status === 'ABSENT') return null;
+    if (comparison.status === 'MATCH') {
+      return {
+        success: true,
+        isDuplicate: true,
+        message: duplicateMessage,
+      };
+    }
+
+    const conflict = new ProtocolReplayConflictError(comparison.conflictingFields);
+    return {
+      success: false,
+      errorCode: conflict.code,
+      error: conflict.message,
+    };
+  }
 
   /**
    * Product-authoritative transition used by the consolidated self-host path.
@@ -134,7 +232,7 @@ export class TaskService {
       risk: spec.risk ?? 'MEDIUM',
       assigned_agent_id: null,
       revision_count: 0,
-      max_revisions: 3,
+      max_revisions: this.repo.getProjectMaxRevisions(spec.projectId) || DEFAULT_MAX_REVISIONS,
       base_sha: null,
       current_sha: null,
       progress_cache_percent: 0,
@@ -161,17 +259,29 @@ export class TaskService {
     managerMsg: ManagerProtocol,
     rawPayload: string
   ): Promise<ApplyProtocolResult> {
-    const computedHash = crypto.createHash('sha256').update(rawPayload, 'utf8').digest('hex');
+    const computedHash = canonicalProtocolHash(canonicalManagerPayload(managerMsg));
+    const replayBinding: ProtocolMessageReplayBinding = {
+      protocol: managerMsg.protocol,
+      projectId: managerMsg.project_id,
+      taskId: managerMsg.task_id ?? null,
+      expectedTaskState: managerMsg.expected_task_state ?? null,
+      expectedRevision: managerMsg.expected_revision ?? null,
+      payloadHash: computedHash,
+    };
 
-    // Preserve the inexpensive replay fast path while repeating the check in
-    // the transaction below to close the preflight race.
-    const existingMsg = this.repo.getProtocolMessageById(managerMsg.message_id);
-    if (existingMsg) {
-      return {
-        success: true,
-        isDuplicate: true,
-        message: `Manager decision "${managerMsg.message_id}" was already processed.`,
-      };
+    // Preserve the inexpensive replay fast path while repeating the same
+    // comparison in the transaction below to close the preflight race.
+    const replay = this.protocolReplayResult(
+      managerMsg.message_id,
+      replayBinding,
+      `Manager decision "${managerMsg.message_id}" was already processed.`,
+    );
+    if (replay) {
+      return replay;
+    }
+
+    if (managerMsg.protocol !== 'manager.v1') {
+      return { success: false, error: 'Unsupported manager protocol.' };
     }
 
     if (!managerMsg.task_id) {
@@ -192,13 +302,13 @@ export class TaskService {
     // Git.  The same checks are repeated inside the immediate transaction so
     // a matching preflight can never authorize a stale post-Git mutation.
     const rejectBeforeGit = (reason: string): ApplyProtocolResult => this.repo.runInImmediateTransaction(() => {
-      const existing = this.repo.getProtocolMessageById(managerMsg.message_id);
-      if (existing) {
-        return {
-          success: true,
-          isDuplicate: true,
-          message: `Manager decision "${managerMsg.message_id}" was already processed.`,
-        };
+      const replay = this.protocolReplayResult(
+        managerMsg.message_id,
+        replayBinding,
+        `Manager decision "${managerMsg.message_id}" was already processed.`,
+      );
+      if (replay) {
+        return replay;
       }
       const current = this.repo.getTask(taskId);
       if (!current) return { success: false, error: `Task "${taskId}" does not exist.` };
@@ -280,16 +390,16 @@ export class TaskService {
 
     try {
       return this.repo.runInImmediateTransaction(() => {
-        // The idempotency check must be repeated after acquiring the write
-        // lock.  A concurrent caller may have inserted this message while the
+        // Repeat the full immutable-binding comparison after acquiring the
+        // write lock. A concurrent caller may have inserted this ID while the
         // Git lookup above was in flight.
-        const existing = this.repo.getProtocolMessageById(managerMsg.message_id);
-        if (existing) {
-          return {
-            success: true,
-            isDuplicate: true,
-            message: `Manager decision "${managerMsg.message_id}" was already processed.`,
-          };
+        const replay = this.protocolReplayResult(
+          managerMsg.message_id,
+          replayBinding,
+          `Manager decision "${managerMsg.message_id}" was already processed.`,
+        );
+        if (replay) {
+          return replay;
         }
 
         const task = this.repo.getTask(taskId);
@@ -428,17 +538,29 @@ export class TaskService {
     coderMsg: CoderProtocol,
     rawPayload: string
   ): ApplyProtocolResult {
-    const computedHash = crypto.createHash('sha256').update(rawPayload, 'utf8').digest('hex');
+    const computedHash = canonicalProtocolHash(canonicalCoderPayload(coderMsg));
+    const replayBinding: ProtocolMessageReplayBinding = {
+      protocol: coderMsg.protocol,
+      projectId: coderMsg.project_id,
+      taskId: coderMsg.task_id,
+      expectedTaskState: coderMsg.expected_task_state ?? null,
+      expectedRevision: coderMsg.expected_revision ?? null,
+      payloadHash: computedHash,
+    };
 
-    // Preserve the inexpensive replay fast path while repeating the check in
-    // the transaction below to close the preflight race.
-    const existingMsg = this.repo.getProtocolMessageById(coderMsg.message_id);
-    if (existingMsg) {
-      return {
-        success: true,
-        isDuplicate: true,
-        message: `Coder report "${coderMsg.message_id}" was already processed.`,
-      };
+    // Preserve the inexpensive replay fast path while repeating the same
+    // comparison in the transaction below to close the preflight race.
+    const replay = this.protocolReplayResult(
+      coderMsg.message_id,
+      replayBinding,
+      `Coder report "${coderMsg.message_id}" was already processed.`,
+    );
+    if (replay) {
+      return replay;
+    }
+
+    if (coderMsg.protocol !== 'coder.v1') {
+      return { success: false, error: 'Unsupported coder protocol.' };
     }
 
     // Determine the state-machine trigger before opening the transaction.
@@ -461,13 +583,13 @@ export class TaskService {
 
     try {
       return this.repo.runInImmediateTransaction(() => {
-        const existing = this.repo.getProtocolMessageById(coderMsg.message_id);
-        if (existing) {
-          return {
-            success: true,
-            isDuplicate: true,
-            message: `Coder report "${coderMsg.message_id}" was already processed.`,
-          };
+        const replay = this.protocolReplayResult(
+          coderMsg.message_id,
+          replayBinding,
+          `Coder report "${coderMsg.message_id}" was already processed.`,
+        );
+        if (replay) {
+          return replay;
         }
 
         const task = this.repo.getTask(coderMsg.task_id);

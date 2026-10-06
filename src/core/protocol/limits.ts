@@ -38,14 +38,14 @@ export function assertByteLimit(value: string, maxBytes: number, label: string):
 }
 
 /** Apply a byte limit while retaining the normal Zod string APIs. */
-export function boundedString(schema: z.ZodString, maxBytes = MAX_PROTOCOL_STRING_BYTES): z.ZodEffects<z.ZodString> {
+export function boundedString(schema: z.ZodString, maxBytes = MAX_PROTOCOL_STRING_BYTES) {
   return schema.superRefine((value, ctx) => {
     if (!isWithinByteLimit(value, maxBytes)) {
       ctx.addIssue({
-        code: z.ZodIssueCode.too_big,
-        type: 'string',
-        inclusive: true,
-        maximum: maxBytes,
+        // Keep the issue shape valid across the Zod 3 and Zod 4 type APIs.
+        // The stable contract is the rejection and message, not an internal
+        // issue subtype that changed between major versions.
+        code: z.ZodIssueCode.custom,
         message: `String exceeds the ${maxBytes}-byte limit.`,
       });
     }
@@ -57,18 +57,15 @@ export function boundedString(schema: z.ZodString, maxBytes = MAX_PROTOCOL_STRIN
  * canonical schemas carry path/format refinements that cannot be rebuilt from
  * a plain `z.string()` without accidentally dropping those invariants.
  */
-export function boundedRefinedString<T extends z.ZodTypeAny>(
+export function boundedRefinedString<T extends z.ZodType>(
   schema: T,
   maxBytes = MAX_PROTOCOL_STRING_BYTES,
   label = 'String'
-): z.ZodEffects<T> {
+) {
   return schema.superRefine((value, ctx) => {
     if (typeof value === 'string' && !isWithinByteLimit(value, maxBytes)) {
       ctx.addIssue({
-        code: z.ZodIssueCode.too_big,
-        type: 'string',
-        inclusive: true,
-        maximum: maxBytes,
+        code: z.ZodIssueCode.custom,
         message: `${label} exceeds the ${maxBytes}-byte limit.`,
       });
     }

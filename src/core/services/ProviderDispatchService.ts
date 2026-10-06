@@ -31,6 +31,7 @@ import {
 import { sanitizeContextFiles, canonicalJsonStringify, verifyContextManifestIntegrity } from '../context/ContextIntegrity';
 import { ProviderHealthObservationService } from './ProviderHealthObservationService';
 import { applyProviderHealthObservation } from './ProviderHealthApplication';
+import { ProjectStopFenceService } from './ProjectStopFenceService';
 
 export type ScheduledCancellationStatus =
   | 'CANCEL_REQUESTED'
@@ -80,6 +81,7 @@ export class ProviderDispatchService {
   private activeDispatches = new Map<string, ScheduledDispatchControl>();
   private readonly observationService: ProviderHealthObservationService;
   private readonly accountHealthService: { applyObservation: (authorizationId: string) => unknown };
+  private readonly stopFence: ProjectStopFenceService;
 
   constructor(
     private providerRegistry: ProviderRegistry,
@@ -93,6 +95,7 @@ export class ProviderDispatchService {
     this.accountHealthService = {
       applyObservation: (authorizationId) => applyProviderHealthObservation(this.repo, authorizationId),
     };
+    this.stopFence = new ProjectStopFenceService(this.repo);
   }
 
   public setGitWorktreeService(service: GitWorktreeService): void {
@@ -152,7 +155,26 @@ export class ProviderDispatchService {
    * Derives all execution instructions internally from approved durable state.
    */
   public async dispatch(authorizationId: string): Promise<ProviderDispatchExecutionResult> {
-    return this.dispatchInternal(authorizationId, 'LEGACY');
+    return this.dispatchInternal(authorizationId, 'LEGACY', 'INTERNAL_LEGACY');
+  }
+
+  /**
+   * Renderer Manual Bridge admission.  This is intentionally separate from
+   * the historical dispatch() compatibility method so an IPC caller cannot
+   * accidentally turn a product-bound or automated authorization into a
+   * legacy provider execution.
+   */
+  public async dispatchManualBridge(authorizationId: string): Promise<ProviderDispatchExecutionResult> {
+    return this.dispatchInternal(authorizationId, 'LEGACY', 'MANUAL_BRIDGE');
+  }
+
+  /**
+   * Renderer product-bound admission.  Lifecycle-v1 validation and the
+   * adapter-start CAS fence verify account, worker-slot, and task epoch before
+   * any provider process is invoked.
+   */
+  public async dispatchProductBound(authorizationId: string): Promise<ProviderDispatchExecutionResult> {
+    return this.dispatchInternal(authorizationId, 'LEGACY', 'PRODUCT_BOUND');
   }
 
   /**
@@ -161,12 +183,19 @@ export class ProviderDispatchService {
    * Populates RuntimeExecutionBinding with verified workspace metadata for adapter execution.
    */
   public async dispatchScheduled(authorizationId: string): Promise<ProviderDispatchExecutionResult> {
-    return this.dispatchInternal(authorizationId, 'SCHEDULED');
+    // Scheduled execution is an internal scheduler boundary.  It already
+    // performs the lifecycle-v1 assignment/account/worker-slot checks below
+    // and must retain the pre-existing cancellation/recovery semantics for
+    // internal legacy authorizations.  Renderer-originated automated work
+    // uses dispatchProductBound(), which applies the stricter explicit
+    // product-bound admission gate.
+    return this.dispatchInternal(authorizationId, 'SCHEDULED', 'INTERNAL_LEGACY');
   }
 
   private async dispatchInternal(
     authorizationId: string,
-    mode: 'LEGACY' | 'SCHEDULED'
+    mode: 'LEGACY' | 'SCHEDULED',
+    admissionMode: 'INTERNAL_LEGACY' | 'MANUAL_BRIDGE' | 'PRODUCT_BOUND' = 'INTERNAL_LEGACY'
   ): Promise<ProviderDispatchExecutionResult> {
     const executionId = crypto.randomUUID();
     const nowIso = new Date().toISOString();
@@ -945,6 +974,43 @@ export class ProviderDispatchService {
       };
     }
 
+    if (admissionMode === 'MANUAL_BRIDGE') {
+      if (
+        mode !== 'LEGACY' ||
+        routingOutcome !== 'MANUAL_HANDOFF_REQUIRED' ||
+        adapter.adapterType !== 'MANUAL_BRIDGE' ||
+        auth.lifecycle_version === 1 ||
+        auth.assignment_id
+      ) {
+        return {
+          executionId,
+          status: 'FAILED',
+          errorCode: 'RECOVERY_FENCED',
+          error:
+            'MANUAL_BRIDGE_ADMISSION_REJECTED: Manual Bridge dispatch requires an unbound authorization and a MANUAL_HANDOFF_REQUIRED decision.',
+        };
+      }
+    } else if (admissionMode === 'PRODUCT_BOUND') {
+      if (
+        routingOutcome !== 'SELECTED' ||
+        adapter.adapterType === 'MANUAL_BRIDGE' ||
+        auth.lifecycle_version !== 1 ||
+        !auth.assignment_id ||
+        !auth.selected_account_id ||
+        auth.task_ownership_epoch === undefined ||
+        auth.task_ownership_epoch === null ||
+        auth.task_ownership_epoch <= 0
+      ) {
+        return {
+          executionId,
+          status: 'FAILED',
+          errorCode: 'RECOVERY_FENCED',
+          error:
+            'PRODUCT_BOUND_ADMISSION_REJECTED: Product dispatch requires lifecycle-v1 assignment, account, and ownership-epoch bindings with an automated SELECTED decision.',
+        };
+      }
+    }
+
     // 11. Strict Canonical Payload Schema Validation and Integrity of Canonical Hashes
     if (!auth.canonical_payload_json || auth.canonical_payload_json.trim() === '') {
       this.repo.invalidateExecutionAuthorization(auth.id);
@@ -1156,7 +1222,29 @@ export class ProviderDispatchService {
     }
 
     // 12. ATOMIC CLAIM: Consume authorization before execution
-    const claimed = this.repo.claimExecutionAuthorization(authorizationId, nowIso);
+    const admission = this.stopFence.assertDispatchAdmission(authorizationId);
+    if (!admission.admitted) {
+      const reason = `EXECUTION_AUTHORIZATION_STOP_FENCE_REJECTED: ${admission.reason ?? 'project admission fence rejected dispatch.'}`;
+      this.recordRejectionEvent(auth, reason);
+      return {
+        executionId,
+        status: 'FAILED',
+        errorCode: 'RECOVERY_FENCED',
+        error: reason,
+      };
+    }
+
+    // Keep the repository CAS as the compatibility hook used by existing
+    // scheduler tests. ProjectStopFenceService installs a SQLite trigger on
+    // this exact update, so a stop that wins the race aborts the CAS even when
+    // the hook is replaced by a caller.
+    let claimed = false;
+    let claimError: string | undefined;
+    try {
+      claimed = this.repo.claimExecutionAuthorization(authorizationId, nowIso);
+    } catch (err: unknown) {
+      claimError = err instanceof Error ? err.message : 'PROJECT_STOP_FENCE_REJECTED';
+    }
     if (!claimed) {
       // Re-read current status to explain why claim failed
       const currentAuth = this.repo.getExecutionAuthorization(authorizationId);
@@ -1172,7 +1260,7 @@ export class ProviderDispatchService {
         executionId,
         status: 'FAILED',
         errorCode: 'RECOVERY_FENCED',
-        error: `EXECUTION_AUTHORIZATION_CLAIM_FAILED: Could not claim authorization "${authorizationId}" (status: ${currentAuth.status}).`,
+          error: `EXECUTION_AUTHORIZATION_CLAIM_FAILED: Could not claim authorization "${authorizationId}" (status: ${currentAuth.status}; ${claimError ?? 'CAS rejected'}).`,
       };
     }
 
@@ -1233,6 +1321,7 @@ export class ProviderDispatchService {
           routingDecisionId: auth.routing_decision_id,
           selectedResourceId: auth.selected_resource_id,
           selectedProviderId: auth.selected_provider_id,
+          executionMode: admissionMode,
           instructionPayloadHash: auth.instruction_payload_hash,
           contextManifestHash: auth.context_manifest_hash,
           status: 'DISPATCHED',
@@ -1280,6 +1369,21 @@ export class ProviderDispatchService {
         status: 'CANCELLED',
         errorCode: 'CANCELLED',
         error: 'Execution was cancelled before adapter execution.',
+      };
+    }
+
+    // A stop can be requested after the dispatch CAS and before adapter start.
+    // Re-check the durable epoch immediately before any adapter-side work; the
+    // adapter-start SQLite trigger closes the remaining update race.
+    const preAdapterAdmission = this.stopFence.assertDispatchAdmission(auth.id);
+    if (!preAdapterAdmission.admitted) {
+      const reason = `EXECUTION_AUTHORIZATION_STOP_FENCE_REJECTED: ${preAdapterAdmission.reason ?? 'project admission fence changed before adapter start.'}`;
+      this.recordRejectionEvent(auth, reason);
+      return {
+        executionId,
+        status: 'FAILED',
+        errorCode: 'RECOVERY_FENCED',
+        error: reason,
       };
     }
 

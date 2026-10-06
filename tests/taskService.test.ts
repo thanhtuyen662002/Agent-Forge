@@ -123,6 +123,139 @@ describe('TaskService & Protocol Idempotency', () => {
     expect(res2.isDuplicate).toBe(true);
   });
 
+  it('should compare the canonical manager binding before accepting a duplicate', async () => {
+    const managerMsg: ManagerProtocol = {
+      protocol: 'manager.v1',
+      message_id: 'msg-manager-replay-binding',
+      project_id: 'PROJ-TEST',
+      task_id: 'TSK-001',
+      decision: 'EXECUTE',
+      priority: 'HIGH',
+      risk: 'MEDIUM',
+      instructions: ['Implement code'],
+      acceptance_criteria: ['JWT verified'],
+      constraints: [],
+      review_issues: [],
+      expected_task_state: 'PLANNED',
+      expected_revision: 0,
+    };
+
+    await taskService.applyManagerDecision(managerMsg, JSON.stringify(managerMsg));
+    const taskBeforeConflicts = repo.getTask('TSK-001')!;
+    const ledgerBeforeConflicts = repo.getProtocolMessagesByTask('TSK-001');
+
+    taskService.createTask({ projectId: 'PROJ-TEST', id: 'TSK-002', title: 'Other task' });
+    const conflictVariants: Array<[string, ManagerProtocol]> = [
+      ['payload', { ...managerMsg, instructions: ['replace the approved instructions'] }],
+      ['protocol', { ...managerMsg, protocol: 'coder.v1' as 'manager.v1' }],
+      ['project', { ...managerMsg, project_id: 'PROJ-OTHER' }],
+      ['task', { ...managerMsg, task_id: 'TSK-002' }],
+      ['state binding', { ...managerMsg, expected_task_state: 'CODING' }],
+      ['revision binding', { ...managerMsg, expected_revision: 1 }],
+    ];
+
+    for (const [field, conflictingMessage] of conflictVariants) {
+      const result = await taskService.applyManagerDecision(
+        conflictingMessage,
+        JSON.stringify(conflictingMessage),
+      );
+      expect(result.success, field).toBe(false);
+      expect(result.errorCode, field).toBe('PROTOCOL_REPLAY_CONFLICT');
+      expect(result.error, field).toContain('PROTOCOL_REPLAY_CONFLICT');
+      expect(repo.getTask('TSK-001'), field).toEqual(taskBeforeConflicts);
+      expect(repo.getProtocolMessagesByTask('TSK-001'), field).toEqual(ledgerBeforeConflicts);
+    }
+
+    // The payload hash is canonicalized from the validated protocol object,
+    // so JSON key order/whitespace in the transport envelope is irrelevant.
+    const reorderedRawPayload = JSON.stringify({
+      expected_revision: managerMsg.expected_revision,
+      expected_task_state: managerMsg.expected_task_state,
+      ...managerMsg,
+    });
+    const duplicate = await taskService.applyManagerDecision(managerMsg, reorderedRawPayload);
+    expect(duplicate).toMatchObject({ success: true, isDuplicate: true });
+    expect(repo.getProtocolMessagesByTask('TSK-001')).toEqual(ledgerBeforeConflicts);
+  });
+
+  it('should compare the canonical coder binding before accepting a duplicate', () => {
+    repo.updateTaskState('TSK-001', 'CODING');
+    const coderMsg: CoderProtocol = {
+      protocol: 'coder.v1',
+      message_id: 'msg-coder-replay-binding',
+      project_id: 'PROJ-TEST',
+      task_id: 'TSK-001',
+      attempt: 1,
+      status: 'COMPLETED',
+      completed: ['Done'],
+      remaining: [],
+      files_claimed_changed: ['auth.ts'],
+      tests_claimed: ['npm test'],
+      blockers: [],
+      review_requested: true,
+      expected_task_state: 'CODING',
+      expected_revision: 0,
+    };
+
+    taskService.applyCoderReport(coderMsg, JSON.stringify(coderMsg));
+    const taskBeforeConflicts = repo.getTask('TSK-001')!;
+    const ledgerBeforeConflicts = repo.getProtocolMessagesByTask('TSK-001');
+
+    taskService.createTask({ projectId: 'PROJ-TEST', id: 'TSK-002', title: 'Other task' });
+    repo.updateTaskState('TSK-002', 'CODING');
+    const conflictVariants: Array<[string, CoderProtocol]> = [
+      ['payload', { ...coderMsg, completed: ['tampered completion'] }],
+      ['protocol', { ...coderMsg, protocol: 'manager.v1' as 'coder.v1' }],
+      ['project', { ...coderMsg, project_id: 'PROJ-OTHER' }],
+      ['task', { ...coderMsg, task_id: 'TSK-002' }],
+      ['state binding', { ...coderMsg, expected_task_state: 'VALIDATING' }],
+      ['revision binding', { ...coderMsg, expected_revision: 1 }],
+    ];
+
+    for (const [field, conflictingMessage] of conflictVariants) {
+      const result = taskService.applyCoderReport(
+        conflictingMessage,
+        JSON.stringify(conflictingMessage),
+      );
+      expect(result.success, field).toBe(false);
+      expect(result.errorCode, field).toBe('PROTOCOL_REPLAY_CONFLICT');
+      expect(result.error, field).toContain('PROTOCOL_REPLAY_CONFLICT');
+      expect(repo.getTask('TSK-001'), field).toEqual(taskBeforeConflicts);
+      expect(repo.getProtocolMessagesByTask('TSK-001'), field).toEqual(ledgerBeforeConflicts);
+    }
+  });
+
+  it('should allow only one winner when concurrent manager replays disagree', async () => {
+    const original: ManagerProtocol = {
+      protocol: 'manager.v1',
+      message_id: 'msg-manager-concurrent-replay',
+      project_id: 'PROJ-TEST',
+      task_id: 'TSK-001',
+      decision: 'EXECUTE',
+      priority: 'HIGH',
+      risk: 'MEDIUM',
+      instructions: ['approved'],
+      acceptance_criteria: [],
+      constraints: [],
+      review_issues: [],
+      expected_task_state: 'PLANNED',
+      expected_revision: 0,
+    };
+    const conflicting = { ...original, instructions: ['attacker payload'] };
+
+    const results = await Promise.all([
+      taskService.applyManagerDecision(original, JSON.stringify(original)),
+      taskService.applyManagerDecision(conflicting, JSON.stringify(conflicting)),
+    ]);
+
+    expect(results.filter((result) => result.success)).toHaveLength(1);
+    expect(results.filter((result) => result.errorCode === 'PROTOCOL_REPLAY_CONFLICT')).toHaveLength(1);
+    expect(repo.getTask('TSK-001')!.state).toBe('CODING');
+    const ledger = repo.getProtocolMessagesByTask('TSK-001');
+    expect(ledger).toHaveLength(1);
+    expect(ledger[0].status).toBe('APPLIED');
+  });
+
   it('should reject stale Manager decision targeting obsolete task state', async () => {
     const managerMsg: ManagerProtocol = {
       protocol: 'manager.v1',

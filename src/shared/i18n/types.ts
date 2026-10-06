@@ -4,6 +4,17 @@ export const SUPPORTED_LOCALES: SupportedLocale[] = ['en-US', 'vi-VN'];
 export const DEFAULT_LOCALE: SupportedLocale = 'en-US';
 
 export interface TranslationDictionary {
+  actions: {
+    pending: string;
+    success: string;
+    failed: string;
+    desktopRequired: string;
+    previewReadOnly: string;
+    requestRejected: string;
+    invalidResponse: string;
+    noProject: string;
+    alreadyPending: string;
+  };
   app: {
     title: string;
     subtitle: string;
@@ -129,8 +140,22 @@ export interface TranslationDictionary {
       planned: string;
       coding: string;
       validating: string;
+      handoff: string;
+      waiting: string;
       blocked: string;
       completed: string;
+      failed: string;
+      cancelled: string;
+      unknown: string;
+    };
+    laneActions: {
+      automated: string;
+      owner: string;
+      wait: string;
+      inspect: string;
+      retry: string;
+      none: string;
+      integrity: string;
     };
     emptyLane: string;
     revLabel: string;
@@ -305,6 +330,7 @@ export interface TranslationDictionary {
       title: string;
       maxRevisionsLabel: string;
       helpText: string;
+      invalidMaxRevisions: string;
     };
     saveConfigButton: string;
     settingsSavedButton: string;

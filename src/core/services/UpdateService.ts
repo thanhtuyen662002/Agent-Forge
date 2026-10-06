@@ -32,6 +32,11 @@ export interface UpdateServiceOptions {
   repository?: Repository;
 }
 
+type AdapterListener = {
+  event: string;
+  listener: (...args: any[]) => void;
+};
+
 /**
  * UpdateService manages the installed application update lifecycle.
  * Maintains strict separation from task execution and provider dispatch authority.
@@ -46,6 +51,8 @@ export class UpdateService extends EventEmitter {
   private error: string | null = null;
   private lastCheckedAt: string | null = null;
   private adapter: IUpdateAdapter | null = null;
+  private adapterGeneration = 0;
+  private adapterListeners: AdapterListener[] = [];
   private repository: Repository | null = null;
 
   constructor(options: UpdateServiceOptions) {
@@ -67,20 +74,43 @@ export class UpdateService extends EventEmitter {
   }
 
   public setAdapter(adapter: IUpdateAdapter): void {
+    if (this.adapter === adapter) return;
+    const replacingAdapter = this.adapter !== null;
+    this.detachAdapterListeners();
     this.adapter = adapter;
-    this.setupAdapterListeners();
+    const generation = ++this.adapterGeneration;
+    this.setupAdapterListeners(adapter, generation);
+    if (replacingAdapter) {
+      // State from an old provider is not evidence that the replacement has
+      // checked or downloaded anything. Clear it so the UI cannot offer a
+      // stale install action after an adapter swap.
+      this.state = this.isPackaged ? 'IDLE' : 'DISABLED';
+      this.updateInfo = null;
+      this.progress = null;
+      this.error = null;
+      this.lastCheckedAt = null;
+      this.emitStateChanged();
+    }
   }
 
-  private setupAdapterListeners(): void {
-    if (!this.adapter) return;
+  private setupAdapterListeners(adapter: IUpdateAdapter, generation: number): void {
+    const guarded = (handler: (...args: any[]) => void): ((...args: any[]) => void) => (...args: any[]) => {
+      if (this.adapter !== adapter || this.adapterGeneration !== generation) return;
+      handler(...args);
+    };
+    const add = (event: string, handler: (...args: any[]) => void): void => {
+      const listener = guarded(handler);
+      adapter.on(event, listener);
+      this.adapterListeners.push({ event, listener });
+    };
 
-    this.adapter.on('checking-for-update', () => {
+    add('checking-for-update', () => {
       this.state = 'CHECKING';
       this.error = null;
       this.emitStateChanged();
     });
 
-    this.adapter.on('update-available', (info: any) => {
+    add('update-available', (info: any) => {
       this.state = 'UPDATE_AVAILABLE';
       this.lastCheckedAt = new Date().toISOString();
       this.updateInfo = {
@@ -93,7 +123,7 @@ export class UpdateService extends EventEmitter {
       this.emitStateChanged();
     });
 
-    this.adapter.on('update-not-available', () => {
+    add('update-not-available', () => {
       this.state = 'NO_UPDATE_AVAILABLE';
       this.lastCheckedAt = new Date().toISOString();
       this.updateInfo = null;
@@ -101,7 +131,7 @@ export class UpdateService extends EventEmitter {
       this.emitStateChanged();
     });
 
-    this.adapter.on('download-progress', (progressObj: any) => {
+    add('download-progress', (progressObj: any) => {
       this.state = 'DOWNLOADING';
       this.progress = {
         percent: Math.min(100, Math.max(0, Math.round(Number(progressObj?.percent || 0)))),
@@ -112,7 +142,7 @@ export class UpdateService extends EventEmitter {
       this.emitStateChanged();
     });
 
-    this.adapter.on('update-downloaded', (info: any) => {
+    add('update-downloaded', (info: any) => {
       this.state = 'DOWNLOADED';
       this.progress = { percent: 100 };
       if (info?.version) {
@@ -126,11 +156,29 @@ export class UpdateService extends EventEmitter {
       this.emitStateChanged();
     });
 
-    this.adapter.on('error', (err: any) => {
+    add('error', (err: any) => {
       this.state = 'ERROR';
       this.error = this.sanitizeErrorMessage(err?.message || String(err || 'Unknown updater error'));
       this.emitStateChanged();
     });
+  }
+
+  private detachAdapterListeners(): void {
+    const adapter = this.adapter;
+    if (!adapter) {
+      this.adapterListeners = [];
+      return;
+    }
+    for (const { event, listener } of this.adapterListeners) {
+      try {
+        adapter.off(event, listener);
+      } catch {
+        // Generation fencing below still makes a non-conforming adapter's
+        // stale callbacks harmless. Do not let a cleanup failure prevent a
+        // replacement adapter from being installed.
+      }
+    }
+    this.adapterListeners = [];
   }
 
   public getState(): UpdateStateSummary {
@@ -164,7 +212,12 @@ export class UpdateService extends EventEmitter {
     this.error = null;
     this.emitStateChanged();
 
-    if (!this.adapter) {
+    const adapter = this.adapter;
+    const generation = this.adapterGeneration;
+    // The adapter cannot disappear synchronously between the guard above and
+    // this capture, but retain the defensive branch for embedders that mutate
+    // the service from an event listener.
+    if (!adapter) {
       this.state = 'ERROR';
       this.error = 'No update provider adapter configured.';
       this.emitStateChanged();
@@ -172,7 +225,8 @@ export class UpdateService extends EventEmitter {
     }
 
     try {
-      const result = await this.adapter.checkForUpdates();
+      const result = await adapter.checkForUpdates();
+      if (this.adapter !== adapter || this.adapterGeneration !== generation) return this.getState();
       if (!result || !result.updateInfo) {
         if (this.state === 'CHECKING') {
           this.state = 'NO_UPDATE_AVAILABLE';
@@ -180,6 +234,7 @@ export class UpdateService extends EventEmitter {
         }
       }
     } catch (err: any) {
+      if (this.adapter !== adapter || this.adapterGeneration !== generation) return this.getState();
       this.state = 'ERROR';
       this.error = this.sanitizeErrorMessage(err?.message || 'Failed to check for updates.');
     }
@@ -208,9 +263,19 @@ export class UpdateService extends EventEmitter {
     this.error = null;
     this.emitStateChanged();
 
+    const adapter = this.adapter;
+    const generation = this.adapterGeneration;
+    if (!adapter) {
+      this.state = 'ERROR';
+      this.error = 'No update provider adapter configured.';
+      this.emitStateChanged();
+      return this.getState();
+    }
+
     try {
-      await this.adapter.downloadUpdate();
+      await adapter.downloadUpdate();
     } catch (err: any) {
+      if (this.adapter !== adapter || this.adapterGeneration !== generation) return this.getState();
       this.state = 'ERROR';
       this.error = this.sanitizeErrorMessage(err?.message || 'Failed to download update.');
       this.emitStateChanged();
@@ -240,8 +305,19 @@ export class UpdateService extends EventEmitter {
     this.state = 'INSTALLING';
     this.emitStateChanged();
 
-    // Call adapter quitAndInstall
-    this.adapter.quitAndInstall();
+    // Call adapter quitAndInstall. Some electron-updater versions throw
+    // synchronously when the downloaded artifact is missing or invalid; keep
+    // that failure visible and retryable instead of leaving INSTALLING stuck.
+    const adapter = this.adapter;
+    const generation = this.adapterGeneration;
+    try {
+      adapter.quitAndInstall();
+    } catch (err: any) {
+      if (this.adapter !== adapter || this.adapterGeneration !== generation) return;
+      this.state = 'ERROR';
+      this.error = this.sanitizeErrorMessage(err?.message || 'Failed to install update.');
+      this.emitStateChanged();
+    }
   }
 
   public canSafelyRestart(): { safe: boolean; reason?: string } {

@@ -1,5 +1,6 @@
 import { contextBridge, ipcRenderer } from 'electron';
 import type { CanonicalExecutionScope } from '../core/services/ExecutionAuthorizationService';
+import type { RendererAuthorizationMode } from '../core/types/ipc';
 
 export interface TaskMutationBindingInput {
   expectedRevision?: number;
@@ -84,9 +85,13 @@ export interface OrchestratorApi {
     attemptId?: string | null;
     routingDecisionId: string;
     contextFiles?: string[];
+    executionMode: RendererAuthorizationMode;
+    assignmentId?: string;
+    taskOwnershipEpoch?: number;
+    contextManifestId?: string;
     executionScope?: CanonicalExecutionScope;
   }) => Promise<any>;
-  dispatchAuthorization: (authorizationId: string) => Promise<any>;
+  dispatchAuthorization: (authorizationId: string, executionMode: RendererAuthorizationMode) => Promise<any>;
   getOwnerHandoffSnapshot: (taskId: string) => Promise<any>;
   generateAuthorizedWorkOrder: (authorizationId: string) => Promise<any>;
 
@@ -107,6 +112,8 @@ export interface OrchestratorApi {
       BUILD?: string | null;
     };
   }) => Promise<any>;
+  getMaxRevisions: (projectId: string) => Promise<any>;
+  saveMaxRevisions: (data: { projectId: string; maxRevisions: number }) => Promise<any>;
 
   // R5J5: Quarantined Submissions Adjudication
   listQuarantinedSubmissions: (data?: {
@@ -175,8 +182,8 @@ const api: OrchestratorApi = {
 
   routeTask: (data) => ipcRenderer.invoke('routing:routeTask', data),
   authorizeRoutedTask: (data) => ipcRenderer.invoke('routing:authorizeTask', data),
-  dispatchAuthorization: (authorizationId: string) =>
-    ipcRenderer.invoke('routing:dispatchAuthorization', { authorizationId }),
+  dispatchAuthorization: (authorizationId: string, executionMode: RendererAuthorizationMode) =>
+    ipcRenderer.invoke('routing:dispatchAuthorization', { authorizationId, executionMode }),
   getOwnerHandoffSnapshot: (taskId: string) =>
     ipcRenderer.invoke('routing:getHandoffSnapshot', { taskId }),
   generateAuthorizedWorkOrder: (authorizationId: string) =>
@@ -192,6 +199,10 @@ const api: OrchestratorApi = {
     ipcRenderer.invoke('verification:getCommands', { projectId }),
   saveVerificationCommands: (data) =>
     ipcRenderer.invoke('verification:saveCommands', data),
+  getMaxRevisions: (projectId: string) =>
+    ipcRenderer.invoke('settings:getMaxRevisions', { projectId }),
+  saveMaxRevisions: (data) =>
+    ipcRenderer.invoke('settings:saveMaxRevisions', data),
 
   listQuarantinedSubmissions: (data) => ipcRenderer.invoke('submissions:list', data),
   inspectQuarantinedSubmission: (data) => ipcRenderer.invoke('submissions:inspect', data),

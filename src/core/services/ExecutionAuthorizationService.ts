@@ -14,6 +14,7 @@ import {
 import { ManagerProtocol } from '../types/protocols';
 import { sanitizeContextFiles, verifyContextManifestIntegrity } from '../context/ContextIntegrity';
 import { canonicalJsonStringify } from './ContextBuilderService';
+import { ProjectStopFenceService } from './ProjectStopFenceService';
 
 export interface CreateAuthorizationParams {
   projectId: string;
@@ -25,7 +26,15 @@ export interface CreateAuthorizationParams {
   assignmentId?: string | null;
   taskOwnershipEpoch?: number;
   executionScope?: CanonicalExecutionScope;
+  /**
+   * Renderer callers must choose an explicit admission mode. INTERNAL_LEGACY
+   * remains available only for older in-process recovery/test callers while
+   * those call sites migrate; the IPC boundary never accepts it.
+   */
+  executionMode?: AuthorizationExecutionMode;
 }
+
+export type AuthorizationExecutionMode = 'MANUAL_BRIDGE' | 'PRODUCT_BOUND' | 'INTERNAL_LEGACY';
 
 export interface HandoffSuccessorExecutionAuthorityV1 {
   version: 1;
@@ -350,10 +359,14 @@ export function computeContextManifestHash(contextFiles: string[]): string {
 export { sanitizeContextFiles } from '../context/ContextIntegrity';
 
 export class ExecutionAuthorizationService {
+  private readonly stopFence: ProjectStopFenceService;
+
   constructor(
     private repo: Repository,
     private eventService?: EventService
-  ) {}
+  ) {
+    this.stopFence = new ProjectStopFenceService(repo);
+  }
 
   /**
    * Creates an immutable, durable ExecutionAuthorization bound to Manager protocol authority,
@@ -363,13 +376,34 @@ export class ExecutionAuthorizationService {
     const authorizationId = crypto.randomUUID();
     const createdAt = new Date().toISOString();
     const normalizedAttemptId = params.attemptId ?? null;
+    const executionMode = params.executionMode ?? 'INTERNAL_LEGACY';
+
+    if (!['MANUAL_BRIDGE', 'PRODUCT_BOUND', 'INTERNAL_LEGACY'].includes(executionMode)) {
+      const reason = `EXECUTION_AUTHORIZATION_MODE_INVALID: Unsupported execution mode "${String(executionMode)}".`;
+      this.recordRejectionEvent(params, reason);
+      throw new Error(`EXECUTION_AUTHORIZATION_FAILED: ${reason}`);
+    }
 
     // Determine if product execution binding is requested
     const isProductBindingRequested = Boolean(
+      executionMode === 'PRODUCT_BOUND' ||
       (params.assignmentId !== undefined && params.assignmentId !== null) ||
       (params.taskOwnershipEpoch !== undefined && params.taskOwnershipEpoch !== null) ||
-      (params.executionScope !== undefined && params.executionScope !== null)
+      (params.executionScope !== undefined && params.executionScope !== null) ||
+      // An explicit renderer Manual Bridge request may not carry a manifest
+      // binding.  Older in-process context-authority callers may still pass
+      // a manifest identifier without requesting product lifecycle binding;
+      // keep that compatibility path internal-only while rejecting it at the
+      // renderer mode boundary above.
+      (executionMode === 'MANUAL_BRIDGE' && params.contextManifestId !== undefined && params.contextManifestId !== null)
     );
+
+    if (executionMode === 'MANUAL_BRIDGE' && isProductBindingRequested) {
+      const reason =
+        'EXECUTION_AUTHORIZATION_MODE_CONFLICT: MANUAL_BRIDGE cannot carry automated assignment, epoch, scope, or manifest binding.';
+      this.recordRejectionEvent(params, reason);
+      throw new Error(`EXECUTION_AUTHORIZATION_FAILED: ${reason}`);
+    }
 
     // If product execution bindings are requested, fail closed unless assignmentId, taskOwnershipEpoch, contextManifestId, and executionScope are all present
     if (isProductBindingRequested) {
@@ -402,6 +436,19 @@ export class ExecutionAuthorizationService {
       this.recordRejectionEvent(params, `Project "${params.projectId}" not found in database.`);
       throw new Error(`EXECUTION_AUTHORIZATION_FAILED: Project "${params.projectId}" not found.`);
     }
+
+    const initialStopFence = this.stopFence.getFence(params.projectId);
+    if (!initialStopFence) {
+      const reason = `EXECUTION_AUTHORIZATION_PROJECT_NOT_FOUND: Project "${params.projectId}" has no durable admission fence.`;
+      this.recordRejectionEvent(params, reason);
+      throw new Error(`EXECUTION_AUTHORIZATION_FAILED: ${reason}`);
+    }
+    if (initialStopFence.latched || initialStopFence.projectStatus === 'PAUSED') {
+      const reason = `EXECUTION_AUTHORIZATION_PROJECT_STOPPED: Project "${params.projectId}" is paused or emergency-stopped at epoch ${initialStopFence.epoch}.`;
+      this.recordRejectionEvent(params, reason);
+      throw new Error(`EXECUTION_AUTHORIZATION_FAILED: ${reason}`);
+    }
+    const authorizationStopEpoch = initialStopFence.epoch;
 
     const task = this.repo.getTask(params.taskId);
     if (!task) {
@@ -524,6 +571,22 @@ export class ExecutionAuthorizationService {
       const reason = `Routing outcome "${routingOutcome}" cannot produce execution authorization (${routingPayload.reason ?? 'ineligible'}).`;
       this.recordRejectionEvent(params, reason);
       throw new Error(`EXECUTION_AUTHORIZATION_FAILED: ${reason}`);
+    }
+
+    if (executionMode === 'MANUAL_BRIDGE') {
+      if (routingOutcome !== 'MANUAL_HANDOFF_REQUIRED' || routingPayload.adapterType !== 'MANUAL_BRIDGE') {
+        const reason =
+          'EXECUTION_AUTHORIZATION_MANUAL_BRIDGE_MISMATCH: MANUAL_BRIDGE authorization requires a MANUAL_HANDOFF_REQUIRED routing decision backed by the MANUAL_BRIDGE adapter.';
+        this.recordRejectionEvent(params, reason);
+        throw new Error(`EXECUTION_AUTHORIZATION_FAILED: ${reason}`);
+      }
+    } else if (executionMode === 'PRODUCT_BOUND') {
+      if (routingOutcome !== 'SELECTED' || routingPayload.adapterType === 'MANUAL_BRIDGE') {
+        const reason =
+          'EXECUTION_AUTHORIZATION_PRODUCT_MODE_MISMATCH: PRODUCT_BOUND authorization requires an automated SELECTED routing decision.';
+        this.recordRejectionEvent(params, reason);
+        throw new Error(`EXECUTION_AUTHORIZATION_FAILED: ${reason}`);
+      }
     }
 
     const selectedResourceId = routingPayload.selectedResourceId as string | undefined;
@@ -809,6 +872,22 @@ export class ExecutionAuthorizationService {
 
     this.repo.createExecutionAuthorization(authorization);
 
+    // Bind the authorization to the exact project epoch after asynchronous
+    // validation. The immediate transaction either records this immutable
+    // fence or invalidates the new authorization if an emergency stop won the
+    // race while Git/context checks were running.
+    const admission = this.stopFence.bindAuthorization(
+      authorization.id,
+      authorization.project_id,
+      authorizationStopEpoch,
+      createdAt
+    );
+    if (!admission.admitted) {
+      const reason = `EXECUTION_AUTHORIZATION_PROJECT_STOPPED: ${admission.reason ?? 'project admission fence changed while authorizing.'}`;
+      this.recordRejectionEvent(params, reason);
+      throw new Error(`EXECUTION_AUTHORIZATION_FAILED: ${reason}`);
+    }
+
     // 10. Persist Audit Event
     if (this.eventService) {
       this.eventService.record(
@@ -830,7 +909,9 @@ export class ExecutionAuthorizationService {
           selectedProviderId,
           instructionPayloadHash,
           contextManifestHash,
+          projectStopEpoch: authorizationStopEpoch,
           contextFileCount: canonicalContextFiles.length,
+          executionMode,
           status: 'AUTHORIZED',
           ...(isProductBindingRequested && boundAssignment && boundAccount
             ? {

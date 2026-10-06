@@ -1348,88 +1348,114 @@ export class MigrationRunner {
   public static run(db: Database.Database, maxVersion?: number): void {
     const limit = maxVersion ?? MIGRATIONS.length;
 
-    // 1. Ensure migrations ledger exists
-    db.exec(`
-      CREATE TABLE IF NOT EXISTS schema_migrations (
-        version INTEGER PRIMARY KEY,
-        name TEXT NOT NULL,
-        applied_at TEXT NOT NULL
-      );
-    `);
-
-    const appliedRows = db.prepare('SELECT version FROM schema_migrations ORDER BY version ASC').all() as { version: number }[];
-    const appliedVersions = new Set(appliedRows.map((r) => r.version));
+    // 1. Ensure the ledger exists under a write lock. A deferred CREATE plus a
+    // later read allows two desktop processes to both believe they own
+    // migration startup before either writer commits.
+    try {
+      db.transaction(() => {
+        db.exec(`
+          CREATE TABLE IF NOT EXISTS schema_migrations (
+            version INTEGER PRIMARY KEY,
+            name TEXT NOT NULL,
+            applied_at TEXT NOT NULL
+          );
+        `);
+      }).immediate();
+    } catch (error) {
+      if (MigrationRunner.isBusyError(error)) {
+        throw new Error('[Migrations] SQLITE_BUSY while acquiring the schema startup lock');
+      }
+      throw error;
+    }
 
     for (const migration of MIGRATIONS) {
       if (migration.version > limit) {
         break;
       }
-      if (!appliedVersions.has(migration.version)) {
-        console.log(`[Migrations] Applying migration ${migration.version}: ${migration.name}...`);
+      // Keep this pre-check as a fast path. The authoritative check is repeated
+      // inside the immediate transaction below after the SQLite writer lock is
+      // held, so a concurrent runner that applied the version first is skipped.
+      const alreadyApplied = db.prepare('SELECT 1 FROM schema_migrations WHERE version=?').get(migration.version);
+      if (alreadyApplied) continue;
 
-        if (migration.foreignKeyMode === 'DISABLED_FOR_REBUILD') {
-          // Explicit rebuild mode: Capture original FK state and disable FKs BEFORE beginning transaction
-          const originalFkState = db.pragma('foreign_keys', { simple: true }) as number;
-          db.pragma('foreign_keys = OFF');
-          const disabledFkState = db.pragma('foreign_keys', { simple: true }) as number;
-          if (disabledFkState !== 0) {
-            throw new Error(`[Migrations] Failed to disable foreign keys before migration ${migration.version}`);
-          }
+      console.log(`[Migrations] Applying migration ${migration.version}: ${migration.name}...`);
 
-          try {
-            const runTx = db.transaction(() => {
-              migration.up(db);
-
-              // Validate foreign keys before commit
-              const fkViolations = db.pragma('foreign_key_check') as unknown[];
-              if (fkViolations.length > 0) {
-                throw new Error(
-                  `[Migrations] Foreign key integrity check failed inside migration ${migration.version} with ${fkViolations.length} violation(s): ${JSON.stringify(fkViolations)}`
-                );
-              }
-
-              db.prepare('INSERT INTO schema_migrations (version, name, applied_at) VALUES (?, ?, ?)').run(
-                migration.version,
-                migration.name,
-                new Date().toISOString()
-              );
-            });
-            runTx();
-          } finally {
-            // Restore original foreign keys state
-            db.pragma(`foreign_keys = ${originalFkState === 1 ? 'ON' : 'OFF'}`);
-            const restoredFkState = db.pragma('foreign_keys', { simple: true }) as number;
-            if (restoredFkState !== originalFkState) {
-              throw new Error(
-                `[Migrations] Failed to restore foreign_keys pragma state after migration ${migration.version}. Expected ${originalFkState}, got ${restoredFkState}`
-              );
-            }
-          }
-
-          // Final post-migration foreign key verification when restored ON
-          if (originalFkState === 1) {
-            const postFkViolations = db.pragma('foreign_key_check') as unknown[];
-            if (postFkViolations.length > 0) {
-              throw new Error(
-                `[Migrations] Post-migration foreign key check failed after migration ${migration.version} with ${postFkViolations.length} violation(s)`
-              );
-            }
-          }
-        } else {
-          // Standard migration mode: FK enforcement remains completely untouched (ON by default)
-          const runTx = db.transaction(() => {
-            migration.up(db);
-            db.prepare('INSERT INTO schema_migrations (version, name, applied_at) VALUES (?, ?, ?)').run(
-              migration.version,
-              migration.name,
-              new Date().toISOString()
-            );
-          });
-          runTx();
+      let applied = false;
+      if (migration.foreignKeyMode === 'DISABLED_FOR_REBUILD') {
+        // Explicit rebuild mode: Capture original FK state and disable FKs
+        // before beginning the immediate transaction.
+        const originalFkState = db.pragma('foreign_keys', { simple: true }) as number;
+        db.pragma('foreign_keys = OFF');
+        const disabledFkState = db.pragma('foreign_keys', { simple: true }) as number;
+        if (disabledFkState !== 0) {
+          throw new Error(`[Migrations] Failed to disable foreign keys before migration ${migration.version}`);
         }
 
+        try {
+          applied = MigrationRunner.runMigrationTransaction(db, migration);
+        } finally {
+          // Restore original foreign keys state even when migration.up throws.
+          db.pragma(`foreign_keys = ${originalFkState === 1 ? 'ON' : 'OFF'}`);
+          const restoredFkState = db.pragma('foreign_keys', { simple: true }) as number;
+          if (restoredFkState !== originalFkState) {
+            throw new Error(
+              `[Migrations] Failed to restore foreign_keys pragma state after migration ${migration.version}. Expected ${originalFkState}, got ${restoredFkState}`
+            );
+          }
+        }
+
+        if (originalFkState === 1) {
+          const postFkViolations = db.pragma('foreign_key_check') as unknown[];
+          if (postFkViolations.length > 0) {
+            throw new Error(
+              `[Migrations] Post-migration foreign key check failed after migration ${migration.version} with ${postFkViolations.length} violation(s)`
+            );
+          }
+        }
+      } else {
+        // Standard migration mode: FK enforcement remains untouched. The
+        // immediate transaction is the per-version startup lock and contains
+        // both migration.up and its ledger insert.
+        applied = MigrationRunner.runMigrationTransaction(db, migration);
+      }
+
+      if (applied) {
         console.log(`[Migrations] Successfully applied migration ${migration.version}`);
       }
     }
+  }
+
+  private static runMigrationTransaction(db: Database.Database, migration: (typeof MIGRATIONS)[number]): boolean {
+    try {
+      return db.transaction(() => {
+        const existing = db.prepare('SELECT 1 FROM schema_migrations WHERE version=?').get(migration.version);
+        if (existing) return false;
+        migration.up(db);
+        db.prepare('INSERT INTO schema_migrations (version, name, applied_at) VALUES (?, ?, ?)').run(
+          migration.version,
+          migration.name,
+          new Date().toISOString(),
+        );
+        if (migration.foreignKeyMode === 'DISABLED_FOR_REBUILD') {
+          const fkViolations = db.pragma('foreign_key_check') as unknown[];
+          if (fkViolations.length > 0) {
+            throw new Error(
+              `[Migrations] Foreign key integrity check failed inside migration ${migration.version} with ${fkViolations.length} violation(s): ${JSON.stringify(fkViolations)}`
+            );
+          }
+        }
+        return true;
+      }).immediate();
+    } catch (error) {
+      if (MigrationRunner.isBusyError(error)) {
+        throw new Error(`[Migrations] SQLITE_BUSY while acquiring migration ${migration.version} startup lock`);
+      }
+      throw error;
+    }
+  }
+
+  private static isBusyError(error: unknown): boolean {
+    const code = (error as { code?: unknown } | null)?.code;
+    return code === 'SQLITE_BUSY' || code === 'SQLITE_LOCKED' || /SQLITE_BUSY|SQLITE_LOCKED|database is locked/i.test(String(error));
   }
 }

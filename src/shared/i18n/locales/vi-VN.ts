@@ -1,6 +1,17 @@
 import { TranslationDictionary } from '../types';
 
 export const viVN: TranslationDictionary = {
+  actions: {
+    pending: 'Đang xử lý…',
+    success: 'Thao tác đã hoàn tất.',
+    failed: 'Thao tác thất bại. Kiểm tra dữ liệu và thử lại.',
+    desktopRequired: 'Mở ứng dụng desktop để thực hiện thao tác này.',
+    previewReadOnly: 'Bản xem trước trên trình duyệt chỉ đọc',
+    requestRejected: 'Yêu cầu tới ứng dụng desktop bị từ chối. Vui lòng thử lại.',
+    invalidResponse: 'Ứng dụng desktop trả về dữ liệu chưa đầy đủ. Vui lòng thử lại.',
+    noProject: 'Chọn dự án trước khi thực hiện thao tác.',
+    alreadyPending: 'Thao tác này đang được xử lý.',
+  },
   app: {
     title: 'Agent-Forge',
     subtitle: 'Trung tâm Điều khiển Kỹ nghệ AI Cục bộ',
@@ -126,8 +137,22 @@ export const viVN: TranslationDictionary = {
       planned: 'ĐÃ LÊN KẾ HOẠCH',
       coding: 'ĐANG LẬP TRÌNH',
       validating: 'KIỂM TRA & ĐÁNH GIÁ',
+      handoff: 'CHỜ CHỦ XỬ LÝ',
+      waiting: 'ĐANG CHỜ',
       blocked: 'BỊ CHẶN / LEO THANG',
       completed: 'ĐÃ HOÀN THÀNH',
+      failed: 'THẤT BẠI',
+      cancelled: 'ĐÃ HỦY',
+      unknown: 'TRẠNG THÁI KHÔNG XÁC ĐỊNH',
+    },
+    laneActions: {
+      automated: 'TỰ ĐỘNG',
+      owner: 'CHỦ CẦN XỬ LÝ',
+      wait: 'CHỜ NĂNG LỰC/QUYỀN HẠN',
+      inspect: 'KIỂM TRA / LEO THANG',
+      retry: 'CÓ THỂ THỬ LẠI',
+      none: 'KHÔNG CÓ HÀNH ĐỘNG',
+      integrity: 'CẢNH BÁO TOÀN VẸN',
     },
     emptyLane: 'Không có nhiệm vụ trong luồng này',
     revLabel: 'Bản',
@@ -301,7 +326,8 @@ export const viVN: TranslationDictionary = {
     loopProtection: {
       title: 'Bảo vệ Vòng lặp & Giới hạn Bản sửa đổi',
       maxRevisionsLabel: 'Số Bản sửa đổi Tối đa Trước khi Leo thang',
-      helpText: 'Nhiệm vụ vượt quá giới hạn này sẽ chuyển sang NEEDS_HUMAN để ngăn chặn việc AI luẩn quẩn.',
+      helpText: 'Giá trị được lưu theo từng dự án và áp dụng cho nhiệm vụ mới. Nhiệm vụ vượt quá giới hạn này sẽ chuyển sang NEEDS_HUMAN để ngăn chặn việc AI luẩn quẩn.',
+      invalidMaxRevisions: 'Số bản sửa đổi phải là số nguyên từ 1 đến 10.',
     },
     saveConfigButton: 'LƯU CẤU HÌNH',
     settingsSavedButton: 'ĐÃ LƯU CÀI ĐẶT',

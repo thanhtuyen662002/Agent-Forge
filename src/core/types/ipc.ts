@@ -32,6 +32,7 @@ const boundedExecutionScopeSchema = z
     forbiddenPaths: ipcStringArray(),
   })
   .strict();
+import { MAX_MAX_REVISIONS, MIN_MAX_REVISIONS } from '../../shared/revisionPolicy';
 
 // Strict Zod schemas for all IPC channels across the main process security boundary
 
@@ -205,23 +206,58 @@ export const RouteTaskIpcSchema = z
   .strict();
 export type RouteTaskIpc = z.infer<typeof RouteTaskIpcSchema>;
 
-export const AuthorizeRoutedTaskIpcSchema = z
-  .object({
-    projectId: requiredIpcString(),
-    taskId: requiredIpcString(),
-    attemptId: ipcString().nullable().optional(),
-    routingDecisionId: requiredIpcString(),
-    contextFiles: boundedArray(ipcStringArray(), MAX_CONTEXT_FILES).optional().default([]),
-    executionScope: boundedExecutionScopeSchema.optional(),
-  })
-  .strict();
+/**
+ * Renderer authorization is deliberately a discriminated protocol.  The old
+ * shape was ambiguous: omitting the lifecycle binding silently created a
+ * legacy authorization which the renderer could dispatch.  A renderer must
+ * now state whether it is requesting an owner-mediated Manual Bridge relay or
+ * a product-bound automated execution, and each mode has a closed schema.
+ */
+const authorizationIpcCommon = {
+  projectId: requiredIpcString(),
+  taskId: requiredIpcString(),
+  attemptId: ipcString().nullable().optional(),
+  routingDecisionId: requiredIpcString(),
+  contextFiles: boundedArray(ipcStringArray(), MAX_CONTEXT_FILES).optional().default([]),
+};
+
+export const RendererAuthorizationModeSchema = z.enum(['MANUAL_BRIDGE', 'PRODUCT_BOUND']);
+export type RendererAuthorizationMode = z.infer<typeof RendererAuthorizationModeSchema>;
+
+export const AuthorizeRoutedTaskIpcSchema = z.discriminatedUnion('executionMode', [
+  z
+    .object({
+      ...authorizationIpcCommon,
+      executionMode: z.literal('MANUAL_BRIDGE'),
+    })
+    .strict(),
+  z
+    .object({
+      ...authorizationIpcCommon,
+      executionMode: z.literal('PRODUCT_BOUND'),
+      assignmentId: requiredIpcString(),
+      taskOwnershipEpoch: z.number().int().positive(),
+      contextManifestId: requiredIpcString(),
+      executionScope: boundedExecutionScopeSchema,
+    })
+    .strict(),
+]);
 export type AuthorizeRoutedTaskIpc = z.infer<typeof AuthorizeRoutedTaskIpcSchema>;
 
-export const DispatchAuthorizationIpcSchema = z
-  .object({
-    authorizationId: requiredIpcString(),
-  })
-  .strict();
+export const DispatchAuthorizationIpcSchema = z.discriminatedUnion('executionMode', [
+  z
+    .object({
+      authorizationId: requiredIpcString(),
+      executionMode: z.literal('MANUAL_BRIDGE'),
+    })
+    .strict(),
+  z
+    .object({
+      authorizationId: requiredIpcString(),
+      executionMode: z.literal('PRODUCT_BOUND'),
+    })
+    .strict(),
+]);
 export type DispatchAuthorizationIpc = z.infer<typeof DispatchAuthorizationIpcSchema>;
 
 export const GetOwnerHandoffSnapshotIpcSchema = z
@@ -281,6 +317,28 @@ export const SaveVerificationCommandsIpcSchema = z
   })
   .strict();
 export type SaveVerificationCommandsIpc = z.infer<typeof SaveVerificationCommandsIpcSchema>;
+
+// Project-scoped loop protection policy. Keep the range identical to the
+// persistence and task-creation boundaries so invalid renderer input cannot
+// reach SQLite or create an unsafe task policy.
+export const GetMaxRevisionsIpcSchema = z
+  .object({
+    projectId: z.string().min(1, 'Project ID is required'),
+  })
+  .strict();
+export type GetMaxRevisionsIpc = z.infer<typeof GetMaxRevisionsIpcSchema>;
+
+export const SaveMaxRevisionsIpcSchema = z
+  .object({
+    projectId: z.string().min(1, 'Project ID is required'),
+    maxRevisions: z
+      .number()
+      .int('Max revisions must be a whole number')
+      .min(MIN_MAX_REVISIONS, 'Max revisions must be at least 1')
+      .max(MAX_MAX_REVISIONS, `Max revisions must be at most ${MAX_MAX_REVISIONS}`),
+  })
+  .strict();
+export type SaveMaxRevisionsIpc = z.infer<typeof SaveMaxRevisionsIpcSchema>;
 
 // ==========================================
 // R5J5: Quarantined Submission Adjudication Schemas

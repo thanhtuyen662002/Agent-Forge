@@ -654,21 +654,159 @@ describe('R5G1A — WorkerSlotLeaseService Contract & Invariant Suite', () => {
     expect(() => repo.createAccountLease(lease2)).toThrow(/UNIQUE constraint failed/);
   });
 
-  it('28. ProviderDispatchService is not called / not imported in WorkerSlotLeaseService', async () => {
+  it('28. Expired recovery is owner-token fenced and idempotent across a newer lease', () => {
+    createSlot('slot-1', 'acc-1', 0);
+    const firstAssignment = createAssignment('asgn-recovery-1');
+    const acquired = service.acquireForAssignment(firstAssignment.id, MIN_LEASE_TTL_MS);
+    expect(acquired.status).toBe('ACQUIRED');
+    if (acquired.status !== 'ACQUIRED') return;
+
+    currentTime = new Date(currentTime.getTime() + MIN_LEASE_TTL_MS + 1);
+    const recovered = service.recoverExpiredLease(acquired.lease.id, acquired.lease.lease_token, currentTime, {
+      expectedTaskStates: ['APPROVED'],
+    });
+    expect(recovered.status).toBe('RELEASED');
+    expect(repo.getWorkerSlot('slot-1')?.status).toBe('IDLE');
+
+    const secondAssignment = createAssignment('asgn-recovery-2');
+    const newer = service.acquireForAssignment(secondAssignment.id, MIN_LEASE_TTL_MS);
+    expect(newer.status).toBe('ACQUIRED');
+    if (newer.status !== 'ACQUIRED') return;
+
+    // Replaying the old owner token cannot settle the newer lease or slot.
+    const replay = service.recoverExpiredLease(acquired.lease.id, acquired.lease.lease_token, currentTime, {
+      expectedTaskStates: ['APPROVED'],
+    });
+    expect(replay.status).toBe('FAILED');
+    if (replay.status === 'FAILED') expect(replay.code).toBe('LEASE_NOT_FOUND');
+    expect(repo.getAccountLease(newer.lease.id)?.released_at).toBeNull();
+    expect(repo.getWorkerSlot('slot-1')?.current_assignment_id).toBe(secondAssignment.id);
+  });
+
+  it('29. Recovery refuses an unexpired lease and a task that changed into an active state', () => {
+    createSlot('slot-1', 'acc-1', 0);
+    const assignment = createAssignment('asgn-recovery-state');
+    const acquired = service.acquireForAssignment(assignment.id, MIN_LEASE_TTL_MS);
+    expect(acquired.status).toBe('ACQUIRED');
+    if (acquired.status !== 'ACQUIRED') return;
+
+    const beforeExpiry = service.recoverExpiredLease(acquired.lease.id, acquired.lease.lease_token, currentTime, {
+      expectedTaskStates: ['APPROVED'],
+    });
+    expect(beforeExpiry.status).toBe('FAILED');
+    if (beforeExpiry.status === 'FAILED') expect(beforeExpiry.code).toBe('LEASE_NOT_EXPIRED');
+
+    currentTime = new Date(currentTime.getTime() + MIN_LEASE_TTL_MS + 1);
+    repo.updateTaskState('task-1', 'CODING');
+    const activeTask = service.recoverExpiredLease(acquired.lease.id, acquired.lease.lease_token, currentTime, {
+      expectedTaskStates: ['APPROVED', 'DONE'],
+    });
+    expect(activeTask.status).toBe('FAILED');
+    if (activeTask.status === 'FAILED') expect(activeTask.code).toBe('RECOVERY_TASK_STATE_CHANGED');
+    expect(repo.getAccountLease(acquired.lease.id)?.released_at).toBeNull();
+    expect(repo.getWorkerSlot('slot-1')?.status).toBe('LEASED');
+  });
+
+  it('30. Recovery fails closed for malformed expiration timestamps', () => {
+    createSlot('slot-1', 'acc-1', 0);
+    const assignment = createAssignment('asgn-recovery-invalid-expiry');
+    const acquired = service.acquireForAssignment(assignment.id, MIN_LEASE_TTL_MS);
+    expect(acquired.status).toBe('ACQUIRED');
+    if (acquired.status !== 'ACQUIRED') return;
+
+    db.prepare('UPDATE account_leases SET expires_at = ? WHERE id = ?').run('not-a-timestamp', acquired.lease.id);
+    currentTime = new Date(currentTime.getTime() + MIN_LEASE_TTL_MS + 1);
+    const result = service.recoverExpiredLease(acquired.lease.id, acquired.lease.lease_token, currentTime, {
+      expectedTaskStates: ['APPROVED'],
+    });
+
+    expect(result.status).toBe('FAILED');
+    if (result.status === 'FAILED') expect(result.code).toBe('LEASE_EXPIRY_INVALID');
+    expect(repo.getAccountLease(acquired.lease.id)?.released_at).toBeNull();
+    expect(repo.getWorkerSlot('slot-1')?.status).toBe('LEASED');
+  });
+
+  it('31. Recovery keeps an expired lease fenced while a process is still RUNNING', () => {
+    createSlot('slot-1', 'acc-1', 0);
+    const assignment = createAssignment('asgn-recovery-running-process');
+    const acquired = service.acquireForAssignment(assignment.id, MIN_LEASE_TTL_MS);
+    expect(acquired.status).toBe('ACQUIRED');
+    if (acquired.status !== 'ACQUIRED') return;
+
+    repo.createProcessRun({
+      id: 'process-recovery-running',
+      pid: null,
+      project_id: 'proj-1',
+      task_id: 'task-1',
+      attempt_id: null,
+      command: 'provider --execute',
+      working_directory: '/repo/test',
+      status: 'RUNNING',
+      start_time: currentTime.toISOString(),
+    });
+    currentTime = new Date(currentTime.getTime() + MIN_LEASE_TTL_MS + 1);
+    const result = service.recoverExpiredLease(acquired.lease.id, acquired.lease.lease_token, currentTime, {
+      expectedTaskStates: ['APPROVED'],
+    });
+
+    expect(result.status).toBe('FAILED');
+    if (result.status === 'FAILED') expect(result.code).toBe('RECOVERY_PROCESS_STILL_RUNNING');
+    expect(repo.getAccountLease(acquired.lease.id)?.released_at).toBeNull();
+    expect(repo.getWorkerSlot('slot-1')?.status).toBe('LEASED');
+  });
+
+  it('32. Recovery fails closed when lease and account bindings disagree', () => {
+    createSlot('slot-1', 'acc-1', 0);
+    const assignment = createAssignment('asgn-recovery-account-mismatch');
+    const acquired = service.acquireForAssignment(assignment.id, MIN_LEASE_TTL_MS);
+    expect(acquired.status).toBe('ACQUIRED');
+    if (acquired.status !== 'ACQUIRED') return;
+
+    repo.createProviderAccount({
+      id: 'acc-2',
+      provider_id: 'prov-mock',
+      label: 'Account 2',
+      auth_mode: 'NATIVE_PROFILE',
+      credential_ref: null,
+      profile_ref: 'native-profile://mock/p2',
+      health_status: 'AVAILABLE',
+      priority: 1,
+      cooldown_until: null,
+      concurrency_limit: 1,
+      last_success_at: null,
+      last_failure_at: null,
+      last_failure_code: null,
+      enabled: true,
+      created_at: currentTime.toISOString(),
+      updated_at: currentTime.toISOString(),
+    });
+    db.prepare('UPDATE account_leases SET provider_account_id = ? WHERE id = ?').run('acc-2', acquired.lease.id);
+    currentTime = new Date(currentTime.getTime() + MIN_LEASE_TTL_MS + 1);
+    const result = service.recoverExpiredLease(acquired.lease.id, acquired.lease.lease_token, currentTime, {
+      expectedTaskStates: ['APPROVED'],
+    });
+
+    expect(result.status).toBe('FAILED');
+    if (result.status === 'FAILED') expect(result.code).toBe('DURABLE_BINDING_INVARIANT_FAILURE');
+    expect(repo.getAccountLease(acquired.lease.id)?.released_at).toBeNull();
+    expect(repo.getWorkerSlot('slot-1')?.status).toBe('LEASED');
+  });
+
+  it('33. ProviderDispatchService is not called / not imported in WorkerSlotLeaseService', async () => {
     const fs = await import('fs');
     const serviceSource = fs.readFileSync('src/core/services/WorkerSlotLeaseService.ts', 'utf8');
     expect(serviceSource).not.toContain('ProviderDispatchService');
     expect(serviceSource).not.toContain('dispatch');
   });
 
-  it('29. No git worktree is created during slot lease lifecycle', async () => {
+  it('34. No git worktree is created during slot lease lifecycle', async () => {
     const fs = await import('fs');
     const serviceSource = fs.readFileSync('src/core/services/WorkerSlotLeaseService.ts', 'utf8');
     expect(serviceSource).not.toContain('worktree');
     expect(serviceSource).not.toContain('git');
   });
 
-  it('30. No provider-specific selection logic exists (agnostic slot leasing)', () => {
+  it('35. No provider-specific selection logic exists (agnostic slot leasing)', () => {
     // Test with a second provider type (API/MOCK)
     const providerApi: Provider = {
       id: 'prov-api',

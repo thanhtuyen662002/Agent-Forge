@@ -3,7 +3,8 @@ import { useOrchestrator } from '../context/OrchestratorContext';
 import { useI18n } from '../context/I18nContext';
 import { AgentCard } from '../components/AgentCard';
 import { ProgressIndicator } from '../components/ProgressIndicator';
-import { clampProgressPercent, validateQuotaSnapshot } from '../capacityTruth';
+import { clampProgressPercent, validateQuotaSnapshot, quotaSourceLabel } from '../capacityTruth';
+import { getTaskStateCounts } from '../taskStatePresentation';
 import {
   Activity,
   CheckCircle2,
@@ -29,9 +30,15 @@ export const DashboardView: React.FC = () => {
 
   const { t } = useI18n();
 
-  const completedTasks = tasks.filter((t) => t.state === 'DONE').length;
+  const taskStateCounts = getTaskStateCounts(tasks);
+  const completedTasks = taskStateCounts.DONE;
   const activeTasks = tasks.filter((t) => ['CODING', 'VALIDATING', 'REVIEWING', 'DISPATCHED'].includes(t.state)).length;
-  const blockedTasks = tasks.filter((t) => t.state === 'BLOCKED' || t.state === 'NEEDS_HUMAN').length;
+  const handoffTasks = taskStateCounts.HANDOFF_REQUIRED;
+  const waitingTasks = taskStateCounts.WAITING_FOR_CAPACITY + taskStateCounts.WAITING_FOR_AUTHORITY;
+  const blockedTasks = taskStateCounts.BLOCKED + taskStateCounts.NEEDS_HUMAN + handoffTasks + waitingTasks;
+  const failedTasks = taskStateCounts.FAILED;
+  const cancelledTasks = taskStateCounts.CANCELLED;
+  const unknownTasks = taskStateCounts.UNKNOWN;
 
   const totalProgress = tasks.length > 0
     ? clampProgressPercent(
@@ -42,7 +49,7 @@ export const DashboardView: React.FC = () => {
   // Real capacity risk computation based on observable resource quotas
   const measuredResources = resources.filter((r) => {
     const validation = validateQuotaSnapshot({ remaining: r.remaining_quota, total: r.total_quota });
-    return validation.valid && r.remaining_quota !== null && r.total_quota !== null && r.total_quota > 0;
+    return validation.valid && quotaSourceLabel(r.quota_source) !== 'unknown' && r.remaining_quota !== null && r.total_quota !== null && r.total_quota > 0;
   });
   let capacityRiskLabel = t('dashboard.capacityUnknown');
   let capacityRiskSubtext = t('dashboard.capacityUnknownSubtext');
@@ -166,6 +173,30 @@ export const DashboardView: React.FC = () => {
             {capacityRiskLabel}
           </div>
           <div className="text-xs text-slate-400">{capacityRiskSubtext}</div>
+        </div>
+      </div>
+
+      {/* Keep non-happy-path work visible even when the owner attention card is collapsed. */}
+      <div className="grid grid-cols-2 md:grid-cols-5 gap-3 text-xs font-mono">
+        <div className="bg-surface-card border border-amber-500/30 rounded-lg px-3 py-2 text-amber-300">
+          <div className="text-[10px] uppercase text-slate-500">{t('taskBoard.lanes.handoff')}</div>
+          <strong>{handoffTasks}</strong>
+        </div>
+        <div className="bg-surface-card border border-amber-500/20 rounded-lg px-3 py-2 text-amber-200">
+          <div className="text-[10px] uppercase text-slate-500">{t('taskBoard.lanes.waiting')}</div>
+          <strong>{waitingTasks}</strong>
+        </div>
+        <div className="bg-surface-card border border-red-500/30 rounded-lg px-3 py-2 text-red-300">
+          <div className="text-[10px] uppercase text-slate-500">{t('taskBoard.lanes.failed')}</div>
+          <strong>{failedTasks}</strong>
+        </div>
+        <div className="bg-surface-card border border-slate-500/30 rounded-lg px-3 py-2 text-slate-300">
+          <div className="text-[10px] uppercase text-slate-500">{t('taskBoard.lanes.cancelled')}</div>
+          <strong>{cancelledTasks}</strong>
+        </div>
+        <div className={`bg-surface-card border rounded-lg px-3 py-2 ${unknownTasks > 0 ? 'border-yellow-300/60 text-yellow-200' : 'border-surface-border text-slate-500'}`}>
+          <div className="text-[10px] uppercase text-slate-500">{t('taskBoard.lanes.unknown')}</div>
+          <strong>{unknownTasks}</strong>
         </div>
       </div>
 

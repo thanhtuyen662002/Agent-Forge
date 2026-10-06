@@ -297,8 +297,8 @@ describe('PR #5 — Provider Integration Foundation', () => {
     expect(finalRunCount).toBe(initialRunCount);
   });
 
-  // 10, 11, 12, 13, 14. Project repository cwd, shell=false, ownership, stdout + stderr evidence with secret scrubbing
-  it('10-14. Local CLI enforces exact project cwd, shell=false, project/task/attempt ownership, and persisted stdout + stderr evidence with secret redaction', async () => {
+  // 10, 11, 12, 13, 14. Isolated provider cwd, shell=false, ownership, stdout + stderr evidence with secret scrubbing
+  it('10-14. Local CLI enforces an isolated cwd, shell=false, project/task/attempt ownership, and persisted stdout + stderr evidence with secret redaction', async () => {
     const fakeCliScript = path.join(tmpDir, 'fake_cli_evidence.js');
     const validCoderPayload = JSON.stringify({
       protocol: 'coder.v1',
@@ -322,8 +322,9 @@ describe('PR #5 — Provider Integration Foundation', () => {
       `
       const fs = require('fs');
       const path = require('path');
-      // 10. Write cwd confirmation file into repository directory
-      fs.writeFileSync(path.join(process.cwd(), 'executed_cwd.txt'), process.cwd(), 'utf8');
+      // 10. Write cwd confirmation outside the provider workspace. The
+      // source repository is intentionally not writable through this cwd.
+      fs.writeFileSync(${JSON.stringify(path.join(tmpDir, 'executed_cwd.txt'))}, process.cwd(), 'utf8');
 
       // 14. Emit diagnostic text with secret into stderr
       console.error("[DIAGNOSTIC] Harmless build info. Secret token: AKIAIOSFODNN7EXAMPLE");
@@ -365,10 +366,13 @@ describe('PR #5 — Provider Integration Foundation', () => {
     expect(result.status).toBe('COMPLETED');
     expect(result.outputProtocol).toBeDefined();
 
-    // 10. Verify cwd was exact project repository directory
-    const cwdFile = path.join(repoDir, 'executed_cwd.txt');
+    // 10. Verify cwd is a per-execution isolated workspace, not the project
+    // repository that contains unlisted files.
+    const cwdFile = path.join(tmpDir, 'executed_cwd.txt');
     expect(fs.existsSync(cwdFile)).toBe(true);
-    expect(path.normalize(fs.readFileSync(cwdFile, 'utf8'))).toBe(path.normalize(repoDir));
+    const providerCwd = path.normalize(fs.readFileSync(cwdFile, 'utf8'));
+    expect(providerCwd).not.toBe(path.normalize(repoDir));
+    expect(providerCwd).toMatch(/agent-forge-local-cli-workspaces/i);
 
     // 11 & 12. Verify direct ownership in SQLite process_runs
     const runRecord = repo.getProcessRun(result.executionId);
@@ -376,7 +380,7 @@ describe('PR #5 — Provider Integration Foundation', () => {
     expect(runRecord.project_id).toBe('PROJ-TEST');
     expect(runRecord.task_id).toBe('TSK-TEST-001');
     expect(runRecord.attempt_id).toBe('ATTEMPT-001');
-    expect(runRecord.working_directory).toBe(path.normalize(repoDir));
+    expect(path.normalize(runRecord.working_directory)).toBe(providerCwd);
     expect(runRecord.status).toBe('COMPLETED');
 
     // 13. Verify stdout evidence persisted in SQLite and ArtifactStore

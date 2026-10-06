@@ -124,6 +124,10 @@ import {
   parseNativeProfileRef,
 } from '../credentials';
 import { ProjectRepository } from './repositories/ProjectRepository';
+import {
+  DEFAULT_MAX_REVISIONS,
+  isValidMaxRevisions,
+} from '../../shared/revisionPolicy';
 export { ProjectRepository } from './repositories/ProjectRepository';
 
 function isValidIsoTimestamp(ts: any): boolean {
@@ -196,6 +200,29 @@ export interface CoderSubmissionDisposition {
   created_at: string;
 }
 
+/**
+ * Immutable fields that bind a protocol message to its authority scope.
+ *
+ * These values are stored in separate ledger columns as well as inside the
+ * canonical payload hash.  Comparing both representations prevents a reused
+ * message id from being treated as an idempotent replay after any binding
+ * field changes.
+ */
+export interface ProtocolMessageReplayBinding {
+  protocol: string;
+  projectId: string;
+  taskId: string | null;
+  expectedTaskState: string | null;
+  expectedRevision: number | null;
+  payloadHash: string;
+}
+
+export interface ProtocolMessageReplayComparison {
+  status: 'ABSENT' | 'MATCH' | 'CONFLICT';
+  existing: Record<string, unknown> | null;
+  conflictingFields: string[];
+}
+
 export class Repository {
   private readonly projectRepository: ProjectRepository;
 
@@ -243,6 +270,49 @@ export class Repository {
 
   public updateProjectContract(id: string, contract: ProjectContract): void {
     this.projectRepository.updateProjectContract(id, contract);
+  }
+
+  /**
+   * Returns the project-scoped revision ceiling used for newly-created tasks.
+   * Missing or malformed legacy settings fail closed to the product default;
+   * the write boundary below never permits malformed values to be stored.
+   */
+  public getProjectMaxRevisions(projectId: string): number {
+    const row = this.db
+      .prepare('SELECT value_json FROM project_settings WHERE project_id = ? AND key = ?')
+      .get(projectId, 'max_revisions') as { value_json?: unknown } | undefined;
+    if (!row || typeof row.value_json !== 'string') return DEFAULT_MAX_REVISIONS;
+
+    try {
+      const value: unknown = JSON.parse(row.value_json);
+      return isValidMaxRevisions(value) ? value : DEFAULT_MAX_REVISIONS;
+    } catch {
+      return DEFAULT_MAX_REVISIONS;
+    }
+  }
+
+  /**
+   * Persists the project-scoped revision ceiling atomically and only after
+   * validating its bounded integer domain.
+   */
+  public setProjectMaxRevisions(projectId: string, maxRevisions: number): number {
+    if (!isValidMaxRevisions(maxRevisions)) {
+      throw new Error('MAX_REVISIONS_INVALID: value must be an integer from 1 through 10.');
+    }
+    if (!this.getProject(projectId)) {
+      throw new Error(`Project "${projectId}" not found.`);
+    }
+
+    this.runInImmediateTransaction(() => {
+      this.db
+        .prepare(`
+          INSERT INTO project_settings (project_id, key, value_json)
+          VALUES (?, 'max_revisions', ?)
+          ON CONFLICT(project_id, key) DO UPDATE SET value_json = excluded.value_json
+        `)
+        .run(projectId, JSON.stringify(maxRevisions));
+    });
+    return maxRevisions;
   }
 
   // ==========================================
@@ -919,6 +989,45 @@ export class Repository {
   public getProtocolMessageById(messageId: string): Record<string, unknown> | null {
     const row = this.db.prepare('SELECT * FROM protocol_messages WHERE message_id = ?').get(messageId) as Record<string, unknown> | undefined;
     return row ?? null;
+  }
+
+  /**
+   * Compares an incoming protocol message against the immutable ledger row
+   * selected by message_id.  The comparison is deliberately performed inside
+   * the caller's transaction so the result and any subsequent state mutation
+   * share one SQLite write lock.
+   */
+  public compareProtocolMessageReplay(
+    messageId: string,
+    binding: ProtocolMessageReplayBinding,
+  ): ProtocolMessageReplayComparison {
+    const existing = this.getProtocolMessageById(messageId);
+    if (!existing) {
+      return { status: 'ABSENT', existing: null, conflictingFields: [] };
+    }
+
+    const nullableString = (value: unknown): string | null =>
+      value === null || value === undefined ? null : String(value);
+    const nullableRevision = (value: unknown): number | null =>
+      value === null || value === undefined ? null : Number(value);
+
+    const values: Array<[string, unknown, unknown]> = [
+      ['protocol', nullableString(existing.protocol), binding.protocol],
+      ['project_id', nullableString(existing.project_id), binding.projectId],
+      ['task_id', nullableString(existing.task_id), binding.taskId],
+      ['expected_task_state', nullableString(existing.expected_task_state), binding.expectedTaskState],
+      ['expected_revision', nullableRevision(existing.expected_revision), binding.expectedRevision],
+      ['payload_hash', nullableString(existing.payload_hash), binding.payloadHash],
+    ];
+    const conflictingFields = values
+      .filter(([, stored, incoming]) => stored !== incoming)
+      .map(([field]) => field);
+
+    return {
+      status: conflictingFields.length === 0 ? 'MATCH' : 'CONFLICT',
+      existing,
+      conflictingFields,
+    };
   }
 
   public getProtocolMessageByRecordId(id: string): Record<string, unknown> | null {

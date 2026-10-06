@@ -13,6 +13,7 @@ import { GitService } from '../src/core/services/GitService';
 import { EventService } from '../src/core/services/EventService';
 import { ArtifactStore } from '../src/core/services/ArtifactStore';
 import { WorkerSlotLeaseService } from '../src/core/services/WorkerSlotLeaseService';
+import { ProductLeaseRecoveryScanner } from '../src/core/services/ProductLeaseRecoveryScanner';
 import { Repository } from '../src/core/database/repositories';
 import {
   MAX_AGY_WORKERS,
@@ -1943,5 +1944,171 @@ describe('product-task autonomy consolidation', () => {
     expect(repo.getTask(fixture.task.id)?.state).not.toBe('REVIEWING');
     expect(repo.getWorkerSlot(fixture.slotId)?.status).toBe('IDLE');
     expect(store.listAll()).toHaveLength(0);
+  });
+
+  it('returns the original execution outcome with a typed durable cleanup marker when lease release throws', async () => {
+    const fixture = seed('task-lease-release-failure');
+    const leaseService = (adapter as any).leaseService as WorkerSlotLeaseService;
+    const releaseSpy = vi.spyOn(leaseService, 'release').mockImplementation(() => {
+      throw new Error('SQLITE_BUSY: simulated release transaction failure');
+    });
+    try {
+      const result = await adapter.executeProductTask({
+        ...workOrderInput(fixture),
+        runCoder: async () => ({ success: true, currentHeadSha: BASE_SHA }),
+        evidenceCollector: {
+          collect: async () => ({
+            headSha: BASE_SHA,
+            snapshotSha: 'snapshot-release-failure',
+            status: '',
+            changedFiles: ['src'],
+            diff: 'diff-release-failure',
+            tests: [],
+          }),
+        },
+        runVerification: async (authority, workOrder) => adapter.recordVerificationObservation({
+          projectId: authority.task.project_id,
+          taskId: authority.task.id,
+          attemptId: authority.authorization.attempt_id,
+          command: 'node --version',
+          status: 'COMPLETED',
+          exitCode: 0,
+          passedCount: 1,
+          failedCount: 0,
+          durationMs: 1,
+          stdout: process.version,
+          workingDirectory: workOrder!.worktree,
+        }),
+        conductReview: async (context) => ({
+          protocol_version: 'managerreview.v1',
+          verdict: 'PASS',
+          reviewed_head_sha: context.current_head,
+          findings: [],
+          required_actions: [],
+          risk: 'LOW',
+          notes: 'release failure recovery proof',
+        }),
+      });
+
+      expect(result.success).toBe(true);
+      expect(result.finalTaskState).toBe('DONE');
+      expect(result.leaseReleased).toBe(false);
+      expect(result.leaseCleanup).toMatchObject({
+        status: 'RECOVERY_REQUIRED',
+        code: 'LEASE_RELEASE_FAILED',
+      });
+      expect(result.error).toBeUndefined();
+      expect(repo.getWorkerSlot(fixture.slotId)?.status).toBe('LEASED');
+      const marker = repo.getDatabase().prepare(
+        "SELECT type, task_id, structured_payload_json FROM events WHERE type = 'PRODUCT_LEASE_RECOVERY_REQUIRED'",
+      ).get() as { type: string; task_id: string; structured_payload_json: string } | undefined;
+      expect(marker?.type).toBe('PRODUCT_LEASE_RECOVERY_REQUIRED');
+      expect(marker?.task_id).toBe(fixture.task.id);
+      expect(marker?.structured_payload_json).toContain('simulated release transaction failure');
+      expect(marker?.structured_payload_json).toContain('owner_token_sha256');
+      expect(marker?.structured_payload_json).not.toContain((repo.getActiveLeaseForAssignment(fixture.assignmentId)?.lease_token) ?? '');
+
+      const recoveryAt = new Date(Date.now() + 10_000);
+      repo.getDatabase().prepare('UPDATE account_leases SET expires_at = ? WHERE id = ?')
+        .run(new Date(recoveryAt.getTime() - 1).toISOString(), repo.getActiveLeaseForAssignment(fixture.assignmentId)!.id);
+      const recovery = new ProductLeaseRecoveryScanner(repo.getDatabase(), repo, { clock: () => recoveryAt }).scanAndReconcile();
+      expect(recovery.releasedCount).toBe(1);
+      expect(repo.getWorkerSlot(fixture.slotId)?.status).toBe('IDLE');
+      expect(repo.getDatabase().prepare(
+        "SELECT COUNT(*) AS count FROM events WHERE type = 'PRODUCT_LEASE_RECOVERY_RESOLVED'",
+      ).get()).toEqual({ count: 1 });
+    } finally {
+      releaseSpy.mockRestore();
+    }
+  });
+
+  it('startup scanner releases an expired terminal product lease and is idempotent', () => {
+    const fixture = seed('task-lease-recovery-terminal');
+    const acquired = adapter.acquireWorkerSlotLease(fixture.assignmentId);
+    expect(acquired.status).toBe('ACQUIRED');
+    if (acquired.status !== 'ACQUIRED') return;
+
+    const recoveredAt = new Date(Date.now() + 10_000);
+    repo.getDatabase().prepare('UPDATE account_leases SET expires_at = ? WHERE id = ?')
+      .run(new Date(recoveredAt.getTime() - 1).toISOString(), acquired.lease.id);
+    repo.updateTaskState(fixture.task.id, 'DONE');
+
+    const scanner = new ProductLeaseRecoveryScanner(repo.getDatabase(), repo, { clock: () => recoveredAt });
+    const first = scanner.scanAndReconcile();
+    expect(first).toMatchObject({ scannedCount: 1, releasedCount: 1, quarantinedCount: 0, deferredCount: 0 });
+    expect(repo.getAccountLease(acquired.lease.id)?.released_at).not.toBeNull();
+    expect(repo.getWorkerSlot(fixture.slotId)?.status).toBe('IDLE');
+
+    const second = scanner.scanAndReconcile();
+    expect(second).toMatchObject({ scannedCount: 0, releasedCount: 0 });
+  });
+
+  it('startup scanner quarantines an expired lease while task/process ownership remains active', () => {
+    const fixture = seed('task-lease-recovery-quarantine');
+    const acquired = adapter.acquireWorkerSlotLease(fixture.assignmentId);
+    expect(acquired.status).toBe('ACQUIRED');
+    if (acquired.status !== 'ACQUIRED') return;
+
+    const recoveredAt = new Date(Date.now() + 10_000);
+    repo.getDatabase().prepare('UPDATE account_leases SET expires_at = ? WHERE id = ?')
+      .run(new Date(recoveredAt.getTime() - 1).toISOString(), acquired.lease.id);
+    repo.updateTaskState(fixture.task.id, 'CODING');
+    repo.createProcessRun({
+      id: 'process-lease-recovery-active',
+      pid: null,
+      project_id: fixture.task.project_id,
+      task_id: fixture.task.id,
+      attempt_id: null,
+      command: 'provider --execute',
+      working_directory: root,
+      status: 'RUNNING',
+      start_time: new Date(recoveredAt.getTime() - 1000).toISOString(),
+    });
+
+    const scanner = new ProductLeaseRecoveryScanner(repo.getDatabase(), repo, { clock: () => recoveredAt });
+    const report = scanner.scanAndReconcile();
+    expect(report).toMatchObject({ scannedCount: 1, releasedCount: 0, quarantinedCount: 1 });
+    expect(report.items[0]?.reason).toContain('RUNNING process');
+    expect(repo.getAccountLease(acquired.lease.id)?.released_at).toBeNull();
+    expect(repo.getWorkerSlot(fixture.slotId)?.status).toBe('LEASED');
+    const markerCount = repo.getDatabase().prepare(
+      "SELECT COUNT(*) AS count FROM events WHERE type = 'PRODUCT_LEASE_RECOVERY_REQUIRED'",
+    ).get() as { count: number };
+    expect(markerCount.count).toBe(1);
+  });
+
+  it('startup scanner does not treat future SQLite-format timestamps as expired', () => {
+    const fixture = seed('task-lease-recovery-future-timestamp');
+    const acquired = adapter.acquireWorkerSlotLease(fixture.assignmentId);
+    expect(acquired.status).toBe('ACQUIRED');
+    if (acquired.status !== 'ACQUIRED') return;
+
+    const recoveredAt = new Date('2026-09-30T12:00:00.000Z');
+    // SQLite's datetime() format intentionally differs from the ISO format
+    // used by the runtime. The scanner must compare parsed instants, not text.
+    repo.getDatabase().prepare('UPDATE account_leases SET expires_at = ? WHERE id = ?')
+      .run('2026-10-01 12:00:00', acquired.lease.id);
+
+    const report = new ProductLeaseRecoveryScanner(repo.getDatabase(), repo, { clock: () => recoveredAt }).scanAndReconcile();
+    expect(report.scannedCount).toBe(0);
+    expect(repo.getAccountLease(acquired.lease.id)?.released_at).toBeNull();
+    expect(repo.getWorkerSlot(fixture.slotId)?.status).toBe('LEASED');
+  });
+
+  it('startup scanner quarantines an invalid expiration instead of releasing it', () => {
+    const fixture = seed('task-lease-recovery-invalid-timestamp');
+    const acquired = adapter.acquireWorkerSlotLease(fixture.assignmentId);
+    expect(acquired.status).toBe('ACQUIRED');
+    if (acquired.status !== 'ACQUIRED') return;
+
+    const recoveredAt = new Date('2026-09-30T12:00:00.000Z');
+    repo.getDatabase().prepare('UPDATE account_leases SET expires_at = ? WHERE id = ?')
+      .run('not-a-timestamp', acquired.lease.id);
+
+    const report = new ProductLeaseRecoveryScanner(repo.getDatabase(), repo, { clock: () => recoveredAt }).scanAndReconcile();
+    expect(report).toMatchObject({ scannedCount: 1, releasedCount: 0, quarantinedCount: 1 });
+    expect(report.items[0]?.reason).toContain('invalid');
+    expect(repo.getAccountLease(acquired.lease.id)?.released_at).toBeNull();
+    expect(repo.getWorkerSlot(fixture.slotId)?.status).toBe('LEASED');
   });
 });

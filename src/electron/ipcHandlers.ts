@@ -44,6 +44,8 @@ import {
   GetAppInfoIpcSchema,
   GetVerificationCommandsIpcSchema,
   SaveVerificationCommandsIpcSchema,
+  GetMaxRevisionsIpcSchema,
+  SaveMaxRevisionsIpcSchema,
   ListQuarantinedSubmissionsIpcSchema,
   InspectQuarantinedSubmissionIpcSchema,
   AdmitQuarantinedSubmissionIpcSchema,
@@ -57,6 +59,22 @@ import {
   scrubAdjudicationDiagnostics,
 } from '../core/services/CoderSubmissionAdjudicationService';
 import { CoderSubmissionAdjudicationError } from '../core/types/adjudication';
+import {
+  isTrustedIpcSender,
+  RendererNavigationPolicyOptions,
+  resolveRendererNavigationPolicy,
+} from './pathHelper';
+
+export class IpcSenderTrustError extends Error {
+  readonly code = 'IPC_SENDER_UNTRUSTED' as const;
+
+  constructor() {
+    super('IPC_SENDER_UNTRUSTED: privileged IPC requires a trusted renderer frame.');
+    this.name = 'IpcSenderTrustError';
+  }
+}
+
+type PrivilegedIpcHandler = (event: unknown, payload: unknown) => unknown | Promise<unknown>;
 
 export function scrubAdjudicationError(err: unknown): { code: string; message: string } {
   if (err instanceof CoderSubmissionAdjudicationError) {
@@ -85,15 +103,25 @@ export function registerIpcHandlers(
   executionAuthorizationService?: ExecutionAuthorizationService,
   providerDispatchService?: ProviderDispatchService,
   updateService?: UpdateService,
-  coderSubmissionAdjudicationService?: CoderSubmissionAdjudicationService
+  coderSubmissionAdjudicationService?: CoderSubmissionAdjudicationService,
+  rendererPolicy: RendererNavigationPolicyOptions = resolveRendererNavigationPolicy({ isPackaged: false }),
 ): void {
   const adjService =
     coderSubmissionAdjudicationService ||
     new CoderSubmissionAdjudicationService(repo, repo.getDatabase(), verificationService);
+
+  const registerPrivilegedHandler = (channel: string, handler: PrivilegedIpcHandler): void => {
+    ipcMain.handle(channel, async (event, payload) => {
+      if (!isTrustedIpcSender(event, rendererPolicy)) {
+        throw new IpcSenderTrustError();
+      }
+      return handler(event, payload);
+    });
+  };
   // ==========================================
   // Trusted Repository Selection Dialog
   // ==========================================
-  ipcMain.handle('dialog:selectRepository', async () => {
+  registerPrivilegedHandler('dialog:selectRepository', async () => {
     const { canceled, filePaths } = await dialog.showOpenDialog({
       properties: ['openDirectory'],
     });
@@ -140,7 +168,7 @@ export function registerIpcHandlers(
   // ==========================================
   // Projects
   // ==========================================
-  ipcMain.handle('project:create', async (_, payload: unknown) => {
+  registerPrivilegedHandler('project:create', async (_, payload: unknown) => {
     const parsed = CreateProjectIpcSchema.safeParse(payload);
     if (!parsed.success) {
       return { success: false, error: parsed.error.issues.map((i) => i.message).join(', ') };
@@ -178,17 +206,17 @@ export function registerIpcHandlers(
     return { success: true, project };
   });
 
-  ipcMain.handle('project:get', async (_, payload: unknown) => {
+  registerPrivilegedHandler('project:get', async (_, payload: unknown) => {
     const parsed = ProjectScopedIpcSchema.safeParse(payload);
     if (!parsed.success) return null;
     return repo.getProject(parsed.data.projectId);
   });
 
-  ipcMain.handle('project:list', async () => {
+  registerPrivilegedHandler('project:list', async () => {
     return repo.getAllProjects();
   });
 
-  ipcMain.handle('project:importContract', async (_, payload: unknown) => {
+  registerPrivilegedHandler('project:importContract', async (_, payload: unknown) => {
     const parsed = ImportContractIpcSchema.safeParse(payload);
     if (!parsed.success) {
       return { success: false, error: parsed.error.issues.map((i) => i.message).join(', ') };
@@ -196,7 +224,7 @@ export function registerIpcHandlers(
     return projectService.importContract(parsed.data.projectId, parsed.data.contract as any);
   });
 
-  ipcMain.handle('project:transition', async (_, payload: unknown) => {
+  registerPrivilegedHandler('project:transition', async (_, payload: unknown) => {
     const parsed = TransitionProjectIpcSchema.safeParse(payload);
     if (!parsed.success) {
       return { success: false, error: parsed.error.issues.map((i) => i.message).join(', ') };
@@ -207,7 +235,7 @@ export function registerIpcHandlers(
   // ==========================================
   // Tasks
   // ==========================================
-  ipcMain.handle('task:create', async (_, payload: unknown) => {
+  registerPrivilegedHandler('task:create', async (_, payload: unknown) => {
     const parsed = CreateTaskIpcSchema.safeParse(payload);
     if (!parsed.success) {
       return { success: false, error: parsed.error.issues.map((i) => i.message).join(', ') };
@@ -220,19 +248,19 @@ export function registerIpcHandlers(
     }
   });
 
-  ipcMain.handle('task:get', async (_, payload: unknown) => {
+  registerPrivilegedHandler('task:get', async (_, payload: unknown) => {
     const parsed = TaskScopedIpcSchema.safeParse(payload);
     if (!parsed.success) return null;
     return repo.getTask(parsed.data.taskId);
   });
 
-  ipcMain.handle('task:list', async (_, payload: unknown) => {
+  registerPrivilegedHandler('task:list', async (_, payload: unknown) => {
     const parsed = ProjectScopedIpcSchema.safeParse(payload);
     if (!parsed.success) return [];
     return repo.getTasksByProject(parsed.data.projectId);
   });
 
-  ipcMain.handle('task:startReview', async (_, payload: unknown) => {
+  registerPrivilegedHandler('task:startReview', async (_, payload: unknown) => {
     const parsed = StartReviewIpcSchema.safeParse(payload);
     if (!parsed.success) {
       return { success: false, error: parsed.error.issues.map((i) => i.message).join(', ') };
@@ -248,7 +276,7 @@ export function registerIpcHandlers(
   // ==========================================
   // Protocols & Package Generation
   // ==========================================
-  ipcMain.handle('protocol:parse', async (_, payload: unknown) => {
+  registerPrivilegedHandler('protocol:parse', async (_, payload: unknown) => {
     const parsed = ParseProtocolIpcSchema.safeParse(payload);
     if (!parsed.success) {
       return { success: false, error: parsed.error.issues.map((i) => i.message).join(', ') };
@@ -256,7 +284,7 @@ export function registerIpcHandlers(
     return ProtocolParser.parse(parsed.data.rawInput);
   });
 
-  ipcMain.handle('protocol:apply', async (_, payload: unknown) => {
+  registerPrivilegedHandler('protocol:apply', async (_, payload: unknown) => {
     const parsed = ApplyProtocolIpcSchema.safeParse(payload);
     if (!parsed.success) {
       return { success: false, error: parsed.error.issues.map((i) => i.message).join(', ') };
@@ -276,7 +304,7 @@ export function registerIpcHandlers(
     return { success: false, error: 'Unrecognized protocol payload type.' };
   });
 
-  ipcMain.handle('protocol:generateWorkOrder', async (_, payload: unknown) => {
+  registerPrivilegedHandler('protocol:generateWorkOrder', async (_, payload: unknown) => {
     const parsed = GenerateWorkOrderIpcSchema.safeParse(payload);
     if (!parsed.success) {
       return { success: false, error: parsed.error.issues.map((i) => i.message).join(', ') };
@@ -300,7 +328,7 @@ export function registerIpcHandlers(
     return { success: true, workOrder };
   });
 
-  ipcMain.handle('protocol:generateReviewPackage', async (_, payload: unknown) => {
+  registerPrivilegedHandler('protocol:generateReviewPackage', async (_, payload: unknown) => {
     const parsed = GenerateReviewPackageIpcSchema.safeParse(payload);
     if (!parsed.success) {
       return { success: false, error: parsed.error.issues.map((i) => i.message).join(', ') };
@@ -497,7 +525,7 @@ export function registerIpcHandlers(
   // ==========================================
   // Git & Verification (Derives path securely from SQLite)
   // ==========================================
-  ipcMain.handle('git:getStatus', async (_, payload: unknown) => {
+  registerPrivilegedHandler('git:getStatus', async (_, payload: unknown) => {
     const parsed = ProjectScopedIpcSchema.safeParse(payload);
     if (!parsed.success) {
       return {
@@ -529,7 +557,7 @@ export function registerIpcHandlers(
     return GitService.getStatus(project.repository_path);
   });
 
-  ipcMain.handle('git:getDiff', async (_, payload: unknown) => {
+  registerPrivilegedHandler('git:getDiff', async (_, payload: unknown) => {
     const parsed = TaskScopedIpcSchema.safeParse(payload);
     if (!parsed.success) {
       return {
@@ -572,7 +600,7 @@ export function registerIpcHandlers(
     return GitService.getDiff(project.repository_path, task.base_sha);
   });
 
-  ipcMain.handle('verification:runTests', async (_, payload: unknown) => {
+  registerPrivilegedHandler('verification:runTests', async (_, payload: unknown) => {
     const parsed = RunVerificationIpcSchema.safeParse(payload);
     if (!parsed.success) {
       return { success: false, error: parsed.error.issues.map((i) => i.message).join(', ') };
@@ -591,7 +619,7 @@ export function registerIpcHandlers(
     );
   });
 
-  ipcMain.handle('verification:getCommands', async (_, payload: unknown) => {
+  registerPrivilegedHandler('verification:getCommands', async (_, payload: unknown) => {
     const parsed = GetVerificationCommandsIpcSchema.safeParse(payload);
     if (!parsed.success) {
       return { success: false, error: parsed.error.issues.map((i) => i.message).join(', ') };
@@ -606,7 +634,7 @@ export function registerIpcHandlers(
     return { success: true, commands };
   });
 
-  ipcMain.handle('verification:saveCommands', async (_, payload: unknown) => {
+  registerPrivilegedHandler('verification:saveCommands', async (_, payload: unknown) => {
     const parsed = SaveVerificationCommandsIpcSchema.safeParse(payload);
     if (!parsed.success) {
       return { success: false, error: parsed.error.issues.map((i) => i.message).join(', ') };
@@ -659,18 +687,51 @@ export function registerIpcHandlers(
     }
   });
 
+  registerPrivilegedHandler('settings:getMaxRevisions', async (_, payload: unknown) => {
+    const parsed = GetMaxRevisionsIpcSchema.safeParse(payload);
+    if (!parsed.success) {
+      return { success: false, error: parsed.error.issues.map((i) => i.message).join(', ') };
+    }
+
+    const project = repo.getProject(parsed.data.projectId);
+    if (!project) {
+      return { success: false, error: `Project "${parsed.data.projectId}" not found.` };
+    }
+
+    return { success: true, maxRevisions: repo.getProjectMaxRevisions(project.id) };
+  });
+
+  registerPrivilegedHandler('settings:saveMaxRevisions', async (_, payload: unknown) => {
+    const parsed = SaveMaxRevisionsIpcSchema.safeParse(payload);
+    if (!parsed.success) {
+      return { success: false, error: parsed.error.issues.map((i) => i.message).join(', ') };
+    }
+
+    const project = repo.getProject(parsed.data.projectId);
+    if (!project) {
+      return { success: false, error: `Project "${parsed.data.projectId}" not found.` };
+    }
+
+    try {
+      const maxRevisions = repo.setProjectMaxRevisions(project.id, parsed.data.maxRevisions);
+      return { success: true, maxRevisions };
+    } catch (err: any) {
+      return { success: false, error: err?.message || 'Failed to save max revisions.' };
+    }
+  });
+
   // ==========================================
   // Providers & Agents
   // ==========================================
-  ipcMain.handle('providers:listResources', async () => {
+  registerPrivilegedHandler('providers:listResources', async () => {
     return repo.getAllProviderResources();
   });
 
-  ipcMain.handle('agents:list', async () => {
+  registerPrivilegedHandler('agents:list', async () => {
     return repo.getAllAgents();
   });
 
-  ipcMain.handle('providers:updateResourceQuota', async (_, payload: unknown) => {
+  registerPrivilegedHandler('providers:updateResourceQuota', async (_, payload: unknown) => {
     const parsed = UpdateResourceQuotaIpcSchema.safeParse(payload);
     if (!parsed.success) {
       return { success: false, error: parsed.error.issues.map((i) => i.message).join(', ') };
@@ -689,13 +750,13 @@ export function registerIpcHandlers(
   // ==========================================
   // Events & Evidence Queries
   // ==========================================
-  ipcMain.handle('events:list', async (_, payload: unknown) => {
+  registerPrivilegedHandler('events:list', async (_, payload: unknown) => {
     const parsed = ProjectScopedIpcSchema.safeParse(payload);
     if (!parsed.success) return [];
     return repo.getEventsByProject(parsed.data.projectId);
   });
 
-  ipcMain.handle('evidence:list', async (_, payload: unknown) => {
+  registerPrivilegedHandler('evidence:list', async (_, payload: unknown) => {
     const parsed = ProjectScopedIpcSchema.safeParse(payload);
     if (!parsed.success) return [];
     return repo.getEvidenceByProject(parsed.data.projectId);
@@ -704,13 +765,13 @@ export function registerIpcHandlers(
   // ==========================================
   // Emergency Controls
   // ==========================================
-  ipcMain.handle('control:emergencyStop', async (_, payload: unknown) => {
+  registerPrivilegedHandler('control:emergencyStop', async (_, payload: unknown) => {
     const parsed = EmergencyStopIpcSchema.safeParse(payload || {});
     const reason = parsed.success ? parsed.data.reason : 'Manual Owner Emergency Stop';
     return emergencyStopService.triggerEmergencyStop(reason);
   });
 
-  ipcMain.handle('control:resume', async (_, payload: unknown) => {
+  registerPrivilegedHandler('control:resume', async (_, payload: unknown) => {
     const parsed = ResumeProjectIpcSchema.safeParse(payload);
     if (!parsed.success) {
       return false;
@@ -722,7 +783,7 @@ export function registerIpcHandlers(
   // PR #8: Owner Routing & Manual Bridge Handoff
   // ==========================================
 
-  ipcMain.handle('routing:routeTask', async (_, payload: unknown) => {
+  registerPrivilegedHandler('routing:routeTask', async (_, payload: unknown) => {
     if (!providerRoutingService) {
       return { success: false, error: 'ProviderRoutingService unavailable.' };
     }
@@ -754,7 +815,7 @@ export function registerIpcHandlers(
     }
   });
 
-  ipcMain.handle('routing:authorizeTask', async (_, payload: unknown) => {
+  registerPrivilegedHandler('routing:authorizeTask', async (_, payload: unknown) => {
     if (!executionAuthorizationService) {
       return { success: false, error: 'ExecutionAuthorizationService unavailable.' };
     }
@@ -771,7 +832,7 @@ export function registerIpcHandlers(
     }
   });
 
-  ipcMain.handle('routing:dispatchAuthorization', async (_, payload: unknown) => {
+  registerPrivilegedHandler('routing:dispatchAuthorization', async (_, payload: unknown) => {
     if (!providerDispatchService) {
       return { success: false, error: 'ProviderDispatchService unavailable.' };
     }
@@ -781,14 +842,17 @@ export function registerIpcHandlers(
     }
 
     try {
-      const result = await providerDispatchService.dispatch(parsed.data.authorizationId);
+      const result =
+        parsed.data.executionMode === 'MANUAL_BRIDGE'
+          ? await providerDispatchService.dispatchManualBridge(parsed.data.authorizationId)
+          : await providerDispatchService.dispatchProductBound(parsed.data.authorizationId);
       return { success: true, result };
     } catch (err: any) {
       return { success: false, error: err.message || 'Dispatch failed.' };
     }
   });
 
-  ipcMain.handle('routing:getHandoffSnapshot', async (_, payload: unknown) => {
+  registerPrivilegedHandler('routing:getHandoffSnapshot', async (_, payload: unknown) => {
     const parsed = GetOwnerHandoffSnapshotIpcSchema.safeParse(payload);
     if (!parsed.success) {
       return { success: false, error: parsed.error.issues.map((i) => i.message).join(', ') };
@@ -895,7 +959,7 @@ export function registerIpcHandlers(
     };
   });
 
-  ipcMain.handle('routing:generateAuthorizedWorkOrder', async (_, payload: unknown) => {
+  registerPrivilegedHandler('routing:generateAuthorizedWorkOrder', async (_, payload: unknown) => {
     const parsed = GenerateAuthorizedWorkOrderIpcSchema.safeParse(payload);
     if (!parsed.success) {
       return { success: false, error: parsed.error.issues.map((i) => i.message).join(', ') };
@@ -913,7 +977,7 @@ export function registerIpcHandlers(
   // PR #9: App Info & Update Lifecycle Handlers
   // ==========================================
 
-  ipcMain.handle('app:getInfo', async (_, payload: unknown) => {
+  registerPrivilegedHandler('app:getInfo', async (_, payload: unknown) => {
     const parsed = GetAppInfoIpcSchema.safeParse(payload || {});
     if (!parsed.success) {
       return { success: false, error: parsed.error.issues.map((i) => i.message).join(', ') };
@@ -929,7 +993,7 @@ export function registerIpcHandlers(
     };
   });
 
-  ipcMain.handle('update:getState', async (_, payload: unknown) => {
+  registerPrivilegedHandler('update:getState', async (_, payload: unknown) => {
     const parsed = UpdateGetStateIpcSchema.safeParse(payload || {});
     if (!parsed.success) {
       return { success: false, error: parsed.error.issues.map((i) => i.message).join(', ') };
@@ -953,7 +1017,7 @@ export function registerIpcHandlers(
     return { success: true, summary: updateService.getState() };
   });
 
-  ipcMain.handle('update:check', async (_, payload: unknown) => {
+  registerPrivilegedHandler('update:check', async (_, payload: unknown) => {
     const parsed = UpdateCheckIpcSchema.safeParse(payload || {});
     if (!parsed.success) {
       return { success: false, error: parsed.error.issues.map((i) => i.message).join(', ') };
@@ -969,7 +1033,7 @@ export function registerIpcHandlers(
     }
   });
 
-  ipcMain.handle('update:download', async (_, payload: unknown) => {
+  registerPrivilegedHandler('update:download', async (_, payload: unknown) => {
     const parsed = UpdateDownloadIpcSchema.safeParse(payload || {});
     if (!parsed.success) {
       return { success: false, error: parsed.error.issues.map((i) => i.message).join(', ') };
@@ -985,7 +1049,7 @@ export function registerIpcHandlers(
     }
   });
 
-  ipcMain.handle('update:installAndRestart', async (_, payload: unknown) => {
+  registerPrivilegedHandler('update:installAndRestart', async (_, payload: unknown) => {
     const parsed = UpdateInstallAndRestartIpcSchema.safeParse(payload || {});
     if (!parsed.success) {
       return { success: false, error: parsed.error.issues.map((i) => i.message).join(', ') };
@@ -1004,7 +1068,7 @@ export function registerIpcHandlers(
   // ==========================================
   // R5J5: Quarantined Submission Adjudication
   // ==========================================
-  ipcMain.handle('submissions:list', async (_, payload: unknown) => {
+  registerPrivilegedHandler('submissions:list', async (_, payload: unknown) => {
     const parsed = ListQuarantinedSubmissionsIpcSchema.safeParse(payload || {});
     if (!parsed.success) {
       return { success: false, error: 'INVALID_ARGUMENTS', message: parsed.error.issues.map((i) => i.message).join(', ') };
@@ -1018,7 +1082,7 @@ export function registerIpcHandlers(
     }
   });
 
-  ipcMain.handle('submissions:inspect', async (_, payload: unknown) => {
+  registerPrivilegedHandler('submissions:inspect', async (_, payload: unknown) => {
     const parsed = InspectQuarantinedSubmissionIpcSchema.safeParse(payload);
     if (!parsed.success) {
       return { success: false, error: 'INVALID_ARGUMENTS', message: parsed.error.issues.map((i) => i.message).join(', ') };
@@ -1032,7 +1096,7 @@ export function registerIpcHandlers(
     }
   });
 
-  ipcMain.handle('submissions:admit', async (_, payload: unknown) => {
+  registerPrivilegedHandler('submissions:admit', async (_, payload: unknown) => {
     const parsed = AdmitQuarantinedSubmissionIpcSchema.safeParse(payload);
     if (!parsed.success) {
       return { success: false, error: 'INVALID_ARGUMENTS', message: parsed.error.issues.map((i) => i.message).join(', ') };
@@ -1046,7 +1110,7 @@ export function registerIpcHandlers(
     }
   });
 
-  ipcMain.handle('submissions:reject', async (_, payload: unknown) => {
+  registerPrivilegedHandler('submissions:reject', async (_, payload: unknown) => {
     const parsed = RejectQuarantinedSubmissionIpcSchema.safeParse(payload);
     if (!parsed.success) {
       return { success: false, error: 'INVALID_ARGUMENTS', message: parsed.error.issues.map((i) => i.message).join(', ') };
@@ -1060,7 +1124,7 @@ export function registerIpcHandlers(
     }
   });
 
-  ipcMain.handle('submissions:supersede', async (_, payload: unknown) => {
+  registerPrivilegedHandler('submissions:supersede', async (_, payload: unknown) => {
     const parsed = SupersedeQuarantinedSubmissionIpcSchema.safeParse(payload);
     if (!parsed.success) {
       return { success: false, error: 'INVALID_ARGUMENTS', message: parsed.error.issues.map((i) => i.message).join(', ') };
@@ -1074,7 +1138,7 @@ export function registerIpcHandlers(
     }
   });
 
-  ipcMain.handle('submissions:resume', async (_, payload: unknown) => {
+  registerPrivilegedHandler('submissions:resume', async (_, payload: unknown) => {
     const parsed = ResumeAdmittedSubmissionIpcSchema.safeParse(payload);
     if (!parsed.success) {
       return { success: false, error: 'INVALID_ARGUMENTS', message: parsed.error.issues.map((i) => i.message).join(', ') };
@@ -1088,7 +1152,7 @@ export function registerIpcHandlers(
     }
   });
 
-  ipcMain.handle('submissions:acknowledgeFenced', async (_, payload: unknown) => {
+  registerPrivilegedHandler('submissions:acknowledgeFenced', async (_, payload: unknown) => {
     const parsed = AcknowledgeRecoveryFencedIpcSchema.safeParse(payload);
     if (!parsed.success) {
       return { success: false, error: 'INVALID_ARGUMENTS', message: parsed.error.issues.map((i) => i.message).join(', ') };
