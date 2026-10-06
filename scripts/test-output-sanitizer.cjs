@@ -5,9 +5,13 @@
 // runner can sanitize assertion summaries and reporter output that never pass
 // through a Vitest worker's setup file.
 const REDACTED_TOKEN = '[REDACTED_TOKEN]';
-const SESSION_TOKEN_PATTERN = /(?<![A-Za-z0-9_-])[A-Za-z0-9_-]{43}(?![A-Za-z0-9_-])/g;
-const SUBMISSION_TOKEN_PATTERN = /(?<![A-Za-z0-9_-])af-sub-[A-Za-z0-9_-]{43}(?![A-Za-z0-9_-])/gi;
-const REVIEWER_TOKEN_PATTERN = /(?<![A-Za-z0-9_-])af-rev-[0-9a-f-]{36}(?![A-Za-z0-9_-])/gi;
+// Intentionally do not require base64url boundaries. Test/CI diagnostics can
+// concatenate credentials with URL-safe framing (for example an unknown
+// `--<token>` argument). These sinks are fail-closed: consuming adjacent
+// URL-safe characters is preferable to retaining a plaintext credential.
+const SESSION_TOKEN_PATTERN = /[A-Za-z0-9_-]{43}/g;
+const SUBMISSION_TOKEN_PATTERN = /af-sub-[A-Za-z0-9_-]{43}/gi;
+const REVIEWER_TOKEN_PATTERN = /af-rev-[0-9a-f-]{36}/gi;
 
 function redactMcpCliOutput(text) {
   return String(text)

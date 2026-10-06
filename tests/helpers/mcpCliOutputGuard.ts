@@ -15,9 +15,14 @@ const REDACTED_TOKEN = '[REDACTED_TOKEN]';
 // Session tokens are unpadded base64url encodings of 32 bytes. Submission
 // tokens add a stable `af-sub-` prefix. Reviewer tokens are included because
 // the same test process can exercise the reviewer administration CLI.
-const SESSION_TOKEN_PATTERN = /(?<![A-Za-z0-9_-])[A-Za-z0-9_-]{43}(?![A-Za-z0-9_-])/g;
-const SUBMISSION_TOKEN_PATTERN = /(?<![A-Za-z0-9_-])af-sub-[A-Za-z0-9_-]{43}(?![A-Za-z0-9_-])/gi;
-const REVIEWER_TOKEN_PATTERN = /(?<![A-Za-z0-9_-])af-rev-[0-9a-f-]{36}(?![A-Za-z0-9_-])/gi;
+// Do not require token boundaries here. CLI/parser diagnostics can attach
+// URL-safe framing directly to a credential (for example `--<token>`), and
+// a boundary-sensitive matcher would retain the full secret. This is a
+// test/CI diagnostic sink, so fail closed even if adjacent URL-safe text is
+// consumed together with the credential.
+const SESSION_TOKEN_PATTERN = /[A-Za-z0-9_-]{43}/g;
+const SUBMISSION_TOKEN_PATTERN = /af-sub-[A-Za-z0-9_-]{43}/gi;
+const REVIEWER_TOKEN_PATTERN = /af-rev-[0-9a-f-]{36}/gi;
 
 // Keep an incomplete line until its terminating newline (or an explicit
 // flush). A credential can be split over arbitrary stream writes, and

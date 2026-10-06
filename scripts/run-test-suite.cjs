@@ -19,6 +19,10 @@ const { sanitizeCapturedOutput } = require('./test-output-sanitizer.cjs');
 const repositoryRoot = path.resolve(__dirname, '..');
 const vitestEntry = path.join(repositoryRoot, 'node_modules', 'vitest', 'vitest.mjs');
 const reporterArgs = process.argv.slice(2);
+const focusedFiles = String(process.env.AGENTFORGE_TEST_FILES || '')
+  .split(',')
+  .map((value) => value.trim())
+  .filter(Boolean);
 
 const runVitest = (label, args) => {
   process.stdout.write(`\n=== Agent Forge ${label} test phase ===\n`);
@@ -75,8 +79,14 @@ const serialFiles = [
 const runParallel = () => runVitest('parallel', broadExclusions);
 const runSerialized = () => runVitest('serialized MCP/adjudication', ['--maxWorkers=1', ...serialFiles]);
 const runSingleWorker = () => runVitest('single deterministic worker', ['--maxWorkers=1']);
+const runFocused = () => runVitest('focused protected', ['--maxWorkers=1', ...focusedFiles]);
 
-if (process.env.AGENTFORGE_TEST_SINGLE_RUN === '1') {
+if (focusedFiles.length > 0) {
+  // Focused execution must still cross the parent-process sanitizer. Use
+  // AGENTFORGE_TEST_FILES rather than invoking Vitest directly when a test
+  // can render MCP credentials in reporter diagnostics.
+  process.exitCode = runFocused();
+} else if (process.env.AGENTFORGE_TEST_SINGLE_RUN === '1') {
   // Windows CI historically ran the entire suite in one Vitest process. Keep
   // that mode available because splitting the process can retain native file
   // handles between phases even when every phase uses one worker.
