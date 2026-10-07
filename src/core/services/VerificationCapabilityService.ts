@@ -4,9 +4,11 @@ import os from 'node:os';
 import path from 'node:path';
 import { execFileSync } from 'node:child_process';
 import type { Repository } from '../database/repositories';
+import { CanonicalExecutionPayload, CanonicalExecutionPayloadSchema, computePayloadHash } from './ExecutionAuthorizationService';
 import { canonicalJsonStringify } from '../context/ContextIntegrity';
 import { PolicyService } from './PolicyService';
 import { resolveTrustedExecutable } from './ExecutableResolver';
+import { CommandParser } from './CommandParser';
 import {
   VerificationCapabilityError, VerificationCapabilityPayload, VerificationCapabilityPayloadSchema,
   VerificationCapabilityRecord, VerificationCapabilityReference, VerificationCapabilityReferenceSchema,
@@ -105,27 +107,61 @@ export class VerificationCapabilityService {
 
   public propose(projectId: string, executable: string, args: string[], projectRoot: string): VerificationCapabilityPayload {
     try {
-      const candidate = PolicyService.classifyVerificationCommandCandidate(executable, args, false);
-      if (candidate.decision === 'DENY') throw new VerificationCapabilityError('INVALID_VERIFICATION_CAPABILITY');
       const root = canonicalPath(projectRoot, true);
       const project = this.repo.getProject(projectId);
       if (!project || !samePath(canonicalPath(project.repository_path, true).path, root.path)) {
         throw new VerificationCapabilityError('CAPABILITY_BINDING_MISMATCH');
       }
-      const resolved = resolveTrustedExecutable(executable, 'generic', { allowExplicitAbsolute: true });
+      // A simple npm script can be approved as its direct invocation. npm,
+      // lifecycle hooks, shell composition and package execution never run.
+      // The owner approves the resulting exact command displayed by the UI;
+      // later package.json edits cannot retarget that captured invocation.
+      if (/^npm(?:\.cmd|\.exe)?$/i.test(path.basename(executable))) {
+        const scriptName = args[0] === 'test' ? 'test' : args[0] === 'run' ? args[1] : undefined;
+        const consumed = args[0] === 'test' ? 1 : 2;
+        if (!scriptName || !/^[a-zA-Z0-9:_-]{1,100}$/.test(scriptName) ||
+            (args.length > consumed && args[consumed] !== '--')) throw new VerificationCapabilityError('INVALID_VERIFICATION_CAPABILITY');
+        const manifest = bindFile(path.join(root.path, 'package.json'));
+        const bytes = fs.readFileSync(manifest.path);
+        if (bytes.length > 1048576 || sha256(bytes) !== manifest.sha256) throw new VerificationCapabilityError('CONTENT_HASH_CHANGED');
+        const scripts = JSON.parse(bytes.toString('utf8')).scripts;
+        if (!scripts || typeof scripts[scriptName] !== 'string' || scripts[`pre${scriptName}`] || scripts[`post${scriptName}`]) {
+          throw new VerificationCapabilityError('INVALID_VERIFICATION_CAPABILITY');
+        }
+        const direct = CommandParser.parse(scripts[scriptName]);
+        if (!direct) throw new VerificationCapabilityError('INVALID_VERIFICATION_CAPABILITY');
+        executable = direct.executable;
+        args = [...direct.args, ...args.slice(consumed + 1)];
+      }
+      const candidate = PolicyService.classifyVerificationCommandCandidate(executable, args, false);
+      if (candidate.decision === 'DENY') throw new VerificationCapabilityError('INVALID_VERIFICATION_CAPABILITY');
+      // Resolve Windows bare names as real executables; never use PATHEXT
+      // shell shims or an inherited arbitrary PATH for verification approval.
+      const requested = process.platform === 'win32' && !path.extname(executable) ? `${executable}.exe` : executable;
+      const resolved = resolveTrustedExecutable(requested, 'generic', { allowExplicitAbsolute: true });
       if (!resolved) throw new VerificationCapabilityError('INVALID_VERIFICATION_CAPABILITY');
       // Installation aliases such as NVM are resolved before owner approval;
       // execution receives the physical identity displayed in that approval.
       const canonicalExecutable = fs.realpathSync.native(resolved);
+      if (PolicyService.classifyVerificationCommandCandidate(canonicalExecutable, args, false).decision === 'DENY') {
+        throw new VerificationCapabilityError('INVALID_VERIFICATION_CAPABILITY');
+      }
       const scripts: VerificationCapabilityPayload['scripts'] = [];
-      const base = path.basename(resolved).toLowerCase().replace(/\.exe$/, '');
-      if (/^(node|python(?:\d+(?:\.\d+)?)?)$/.test(base)) {
+      const base = path.basename(canonicalExecutable).toLowerCase().replace(/\.exe$/, '');
+      if (/^(node|nodejs|python(?:\d+(?:\.\d+)?)?)$/.test(base)) {
         const index = args.findIndex((arg) => !arg.startsWith('-'));
-        if (index >= 0) {
-          const script = path.resolve(root.path, args[index]);
+        const indices = /^(node|nodejs)$/.test(base) && args.includes('--test')
+          ? args.map((argument, position) => argument.startsWith('-') ? -1 : position).filter((position) => position >= 0)
+          : index >= 0 ? [index] : [];
+        if (!indices.length && !(args.length === 1 && ['--version', '-v', '-V', '--help', '-h'].includes(args[0]))) {
+          throw new VerificationCapabilityError('INVALID_VERIFICATION_CAPABILITY');
+        }
+        if (args.includes('-')) throw new VerificationCapabilityError('INVALID_VERIFICATION_CAPABILITY');
+        for (const argumentIndex of indices) {
+          const script = canonicalPath(path.resolve(root.path, args[argumentIndex]), false).path;
           const relative = path.relative(root.path, script);
           if (!relative || relative.startsWith('..') || path.isAbsolute(relative)) throw new VerificationCapabilityError('CAPABILITY_PATH_ESCAPE');
-          scripts.push({ argument_index: index, relative_path: relative, binding: bindFile(script) });
+          scripts.push({ argument_index: argumentIndex, relative_path: relative, binding: bindFile(script) });
         }
       }
       return VerificationCapabilityPayloadSchema.parse({
@@ -155,7 +191,7 @@ export class VerificationCapabilityService {
     const payloadHash = sha256(payloadJson);
     this.repo.runInImmediateTransaction(() => {
       const project = this.repo.getProject(payload.project_id);
-      if (!project || !samePath(project.repository_path, payload.project_root)) throw new VerificationCapabilityError('CAPABILITY_BINDING_MISMATCH');
+      if (!project || !samePath(canonicalPath(project.repository_path, true).path, payload.project_root)) throw new VerificationCapabilityError('CAPABILITY_BINDING_MISMATCH');
       this.repo.getDatabase().prepare(`INSERT INTO verification_capabilities
         (id,project_id,owner_principal,version,state,payload_json,payload_hash,approval_id,approval_json,created_at)
         VALUES (?,?,?,1,'ACTIVE',?,?,?,?,?)`).run(id, payload.project_id, currentOwner, payloadJson, payloadHash, approvalId,
@@ -165,7 +201,7 @@ export class VerificationCapabilityService {
   }
 
   public validate(reference: VerificationCapabilityReference, projectId: string, executable: string, args: string[], runtimeRoot: string,
-    authorizedWorktree?: string): VerificationCapabilityPayload {
+    authorizationId?: string): VerificationCapabilityPayload {
     const ref = VerificationCapabilityReferenceSchema.safeParse(reference);
     if (!ref.success) throw new VerificationCapabilityError('OWNER_APPROVAL_REQUIRED');
     const row = this.repo.getDatabase().prepare('SELECT * FROM verification_capabilities WHERE id=?').get(ref.data.id) as VerificationCapabilityRecord | undefined;
@@ -174,15 +210,34 @@ export class VerificationCapabilityService {
     if (row.version !== ref.data.version) throw new VerificationCapabilityError('CAPABILITY_VERSION_MISMATCH');
     if (row.owner_principal !== this.ownerPrincipal() || row.owner_principal !== ref.data.owner_principal) throw new VerificationCapabilityError('CAPABILITY_OWNER_MISMATCH');
     const payload = VerificationCapabilityPayloadSchema.parse(JSON.parse(row.payload_json));
+    let approval: Record<string, unknown>;
+    try { approval = JSON.parse(row.approval_json); } catch { throw new VerificationCapabilityError('INVALID_VERIFICATION_CAPABILITY'); }
+    if (!approval || approval.method !== 'OS_AUTHENTICATED_NATIVE_CONFIRMATION' ||
+        approval.approval_id !== row.approval_id || approval.owner_principal !== row.owner_principal || approval.payload_hash !== row.payload_hash) {
+      throw new VerificationCapabilityError('INVALID_VERIFICATION_CAPABILITY');
+    }
     if (row.project_id !== projectId || payload.project_id !== projectId || payload.owner_principal !== row.owner_principal ||
       row.payload_hash !== ref.data.payload_hash || sha256(canonicalJsonStringify(payload)) !== row.payload_hash ||
       !samePath(payload.executable.path, executable) || canonicalJsonStringify(payload.args) !== canonicalJsonStringify(args)) {
       throw new VerificationCapabilityError('CAPABILITY_BINDING_MISMATCH');
     }
-    if (!samePath(runtimeRoot, payload.project_root) && (!authorizedWorktree || !samePath(runtimeRoot, authorizedWorktree))) {
-      throw new VerificationCapabilityError('CAPABILITY_PATH_ESCAPE');
+    const project = this.repo.getProject(projectId);
+    if (!project || !samePath(canonicalPath(project.repository_path, true).path, payload.project_root)) {
+      throw new VerificationCapabilityError('CAPABILITY_BINDING_MISMATCH');
     }
-    this.assertPayloadFiles(payload, runtimeRoot, samePath(runtimeRoot, payload.project_root));
+    const authorized = authorizationId ? this.loadAuthorizationPayload(projectId, authorizationId) : undefined;
+    if (authorized && !Object.values(authorized.verificationCommands).some((command) => command &&
+        canonicalJsonStringify(command.capability) === canonicalJsonStringify(ref.data) &&
+        samePath(command.executable, executable) && canonicalJsonStringify(command.args) === canonicalJsonStringify(args))) {
+      throw new VerificationCapabilityError('CAPABILITY_BINDING_MISMATCH');
+    }
+    const runtimePath = canonicalPath(runtimeRoot, true).path;
+    if (!samePath(runtimePath, payload.project_root)) {
+      if (!authorized?.executionScope || !samePath(runtimePath, canonicalPath(authorized.executionScope.worktree, true).path)) {
+        throw new VerificationCapabilityError('CAPABILITY_PATH_ESCAPE');
+      }
+    }
+    this.assertPayloadFiles(payload, runtimePath, samePath(runtimePath, payload.project_root));
     return payload;
   }
 
@@ -195,11 +250,12 @@ export class VerificationCapabilityService {
   }
 
   public createProcessBoundary(reference: VerificationCapabilityReference, projectId: string, executable: string,
-    args: string[], runtimeRoot: string, authorizedWorktree?: string): VerificationProcessBoundary {
+    args: string[], runtimeRoot: string, authorizationId?: string): VerificationProcessBoundary {
     const captured = VerificationCapabilityReferenceSchema.parse(JSON.parse(JSON.stringify(reference)));
     const capturedArgs = [...args];
-    const root = canonicalPath(runtimeRoot, true).path;
-    this.validate(captured, projectId, executable, capturedArgs, root, authorizedWorktree);
+    const runtime = canonicalPath(runtimeRoot, true);
+    const root = runtime.path;
+    this.validate(captured, projectId, executable, capturedArgs, root, authorizationId);
     // Windows process creation fills an omitted USERPROFILE from the host.
     // Explicit empty values prevent ambient profile/config inheritance.
     const environment: Record<string, string> = {
@@ -218,9 +274,52 @@ export class VerificationCapabilityService {
       environment.PATH = '/usr/bin:/bin';
     }
     return issueVerificationProcessBoundary(environment, (actualExecutable, actualArgs, cwd) => {
-      if (!samePath(cwd, root)) throw new VerificationCapabilityError('CAPABILITY_BINDING_MISMATCH');
-      this.validate(captured, projectId, actualExecutable, actualArgs, cwd, authorizedWorktree);
+      if (!samePath(canonicalPath(cwd, true).path, root)) throw new VerificationCapabilityError('CAPABILITY_BINDING_MISMATCH');
+      if (canonicalPath(cwd, true).identity !== runtime.identity) throw new VerificationCapabilityError('PATH_IDENTITY_CHANGED');
+      this.validate(captured, projectId, actualExecutable, actualArgs, cwd, authorizationId);
     });
+  }
+
+  /** Every enabled snapshot command must retain a live, owner-bound grant. */
+  public validateSnapshot(projectId: string, snapshot: unknown, runtimeRoot: string, authorizationId?: string): void {
+    if (!snapshot || typeof snapshot !== 'object' || Array.isArray(snapshot)) {
+      throw new VerificationCapabilityError('INVALID_VERIFICATION_CAPABILITY');
+    }
+    if (authorizationId) {
+      const payload = this.loadAuthorizationPayload(projectId, authorizationId);
+      if (canonicalJsonStringify(snapshot) !== canonicalJsonStringify(payload.verificationCommands)) {
+        throw new VerificationCapabilityError('CAPABILITY_BINDING_MISMATCH');
+      }
+    }
+    for (const type of ['TEST', 'LINT', 'BUILD']) {
+      const command = (snapshot as Record<string, unknown>)[type];
+      if (command === null || command === undefined) continue;
+      if (!command || typeof command !== 'object' || Array.isArray(command)) {
+        throw new VerificationCapabilityError('INVALID_VERIFICATION_CAPABILITY');
+      }
+      const value = command as Record<string, unknown>;
+      if (typeof value.executable !== 'string' || !Array.isArray(value.args) ||
+          !value.args.every((argument) => typeof argument === 'string')) {
+        throw new VerificationCapabilityError('INVALID_VERIFICATION_CAPABILITY');
+      }
+      this.validate(value.capability as VerificationCapabilityReference, projectId, value.executable, value.args, runtimeRoot, authorizationId);
+    }
+  }
+
+  private loadAuthorizationPayload(projectId: string, authorizationId: string): CanonicalExecutionPayload {
+    const authorization = this.repo.getExecutionAuthorization(authorizationId);
+    if (!authorization || authorization.project_id !== projectId || !authorization.canonical_payload_json ||
+        authorization.status === 'INVALIDATED') throw new VerificationCapabilityError('CAPABILITY_BINDING_MISMATCH');
+    try {
+      const payload = CanonicalExecutionPayloadSchema.parse(JSON.parse(authorization.canonical_payload_json));
+      const task = this.repo.getTask(authorization.task_id);
+      if (!task || task.project_id !== projectId || payload.projectId !== projectId || payload.taskId !== task.id ||
+          computePayloadHash(payload) !== authorization.instruction_payload_hash ||
+          (authorization.task_ownership_epoch != null && authorization.task_ownership_epoch !== (task.ownership_epoch ?? 1))) {
+        throw new Error('AUTHORIZATION_BINDING_MISMATCH');
+      }
+      return payload;
+    } catch { throw new VerificationCapabilityError('CAPABILITY_BINDING_MISMATCH'); }
   }
 
   private assertPayloadFiles(payload: VerificationCapabilityPayload, runtimeRoot: string, original: boolean): void {

@@ -1,4 +1,6 @@
 import crypto from 'crypto';
+import { VerificationCapabilityReference } from '../types/verificationCapability';
+import { VerificationCapabilityService } from '../services/VerificationCapabilityService';
 import Database from 'better-sqlite3';
 import {
   Project,
@@ -7970,6 +7972,7 @@ export class Repository {
       const effectiveConstraints = [...(task.constraints ?? []), ...(managerData.constraints ?? [])];
       const durableVerifCommands = this.getVerificationCommandsByProject(project.id);
       const verificationSnapshot = buildVerificationCommandsSnapshot(durableVerifCommands);
+      new VerificationCapabilityService(this).validateSnapshot(project.id, verificationSnapshot, project.repository_path);
 
       const canonicalPayload = computeCanonicalPayload({
         projectId: task.project_id,
@@ -8642,11 +8645,16 @@ export class Repository {
     args: string[];
     timeout_ms?: number;
     enabled?: boolean;
+    capability?: VerificationCapabilityReference | null;
   }): void {
+    if (cmd.capability) {
+      const project = this.getProject(cmd.project_id);
+      new VerificationCapabilityService(this).validate(cmd.capability, cmd.project_id, cmd.executable, cmd.args, project?.repository_path ?? '');
+    }
     this.db
       .prepare(`
-        INSERT INTO verification_commands (id, project_id, name, command_type, executable, args_json, timeout_ms, enabled)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        INSERT INTO verification_commands (id, project_id, name, command_type, executable, args_json, timeout_ms, enabled, capability_id, capability_version)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       `)
       .run(
         cmd.id,
@@ -8656,7 +8664,9 @@ export class Repository {
         cmd.executable,
         JSON.stringify(cmd.args),
         cmd.timeout_ms ?? 60000,
-        cmd.enabled !== false ? 1 : 0
+        cmd.enabled !== false ? 1 : 0,
+        cmd.capability?.id ?? null,
+        cmd.capability?.version ?? null
       );
   }
 
@@ -8673,6 +8683,7 @@ export class Repository {
       args: r.args_json ? JSON.parse(String(r.args_json)) : [],
       timeout_ms: Number(r.timeout_ms),
       enabled: Boolean(r.enabled),
+      capability: this.getVerificationCapabilityReference(r.capability_id, r.capability_version),
     }));
   }
 
@@ -8688,23 +8699,39 @@ export class Repository {
       args: row.args_json ? JSON.parse(String(row.args_json)) : [],
       timeout_ms: Number(row.timeout_ms),
       enabled: Boolean(row.enabled),
+      capability: this.getVerificationCapabilityReference(row.capability_id, row.capability_version),
     };
+  }
+
+  private getVerificationCapabilityReference(id: unknown, version: unknown): VerificationCapabilityReference | null {
+    if (typeof id !== 'string' || typeof version !== 'number') return null;
+    const row = this.db.prepare('SELECT owner_principal, payload_hash FROM verification_capabilities WHERE id=?').get(id) as
+      { owner_principal: string; payload_hash: string } | undefined;
+    return row ? { id, version, owner_principal: row.owner_principal, payload_hash: row.payload_hash } : null;
   }
 
   public setProjectVerificationCommands(
     projectId: string,
     commands: {
-      TEST?: { executable: string; args: string[] } | null;
-      LINT?: { executable: string; args: string[] } | null;
-      BUILD?: { executable: string; args: string[] } | null;
+      TEST?: { executable: string; args: string[]; capability?: VerificationCapabilityReference | null } | null;
+      LINT?: { executable: string; args: string[]; capability?: VerificationCapabilityReference | null } | null;
+      BUILD?: { executable: string; args: string[]; capability?: VerificationCapabilityReference | null } | null;
     }
   ): any[] {
-    return this.runInTransaction(() => {
+    return this.runInImmediateTransaction(() => {
       const managedTypes: Array<'TEST' | 'LINT' | 'BUILD'> = ['TEST', 'LINT', 'BUILD'];
 
       for (const type of managedTypes) {
         if (type in commands) {
           const cmdData = commands[type];
+          if (cmdData?.capability) {
+            const project = this.getProject(projectId);
+            new VerificationCapabilityService(this).validate(cmdData.capability, projectId, cmdData.executable, cmdData.args, project?.repository_path ?? '');
+          }
+          // Replacing/deleting a command fences all previously sealed references.
+          this.db.prepare(`UPDATE verification_capabilities SET state='REVOKED', version=version+1, revoked_at=?
+            WHERE state='ACTIVE' AND id IN (SELECT capability_id FROM verification_commands WHERE project_id=? AND command_type=?)
+            AND id != ?`).run(new Date().toISOString(), projectId, type, cmdData?.capability?.id ?? '');
           if (cmdData) {
             const existing = this.db
               .prepare('SELECT id FROM verification_commands WHERE project_id = ? AND command_type = ?')
@@ -8714,19 +8741,19 @@ export class Repository {
               this.db
                 .prepare(`
                   UPDATE verification_commands
-                  SET executable = ?, args_json = ?, timeout_ms = 120000, enabled = 1
+                  SET executable = ?, args_json = ?, timeout_ms = 120000, enabled = 1, capability_id = ?, capability_version = ?
                   WHERE id = ?
                 `)
-                .run(cmdData.executable, JSON.stringify(cmdData.args), existing.id);
+                .run(cmdData.executable, JSON.stringify(cmdData.args), cmdData.capability?.id ?? null, cmdData.capability?.version ?? null, existing.id);
             } else {
               const id = `vc-${crypto.randomUUID().substring(0, 8)}`;
               const typeName = `${type.charAt(0) + type.slice(1).toLowerCase()} Suite`;
               this.db
                 .prepare(`
-                  INSERT INTO verification_commands (id, project_id, name, command_type, executable, args_json, timeout_ms, enabled)
-                  VALUES (?, ?, ?, ?, ?, ?, 120000, 1)
+                  INSERT INTO verification_commands (id, project_id, name, command_type, executable, args_json, timeout_ms, enabled, capability_id, capability_version)
+                  VALUES (?, ?, ?, ?, ?, ?, 120000, 1, ?, ?)
                 `)
-                .run(id, projectId, typeName, type, cmdData.executable, JSON.stringify(cmdData.args));
+                .run(id, projectId, typeName, type, cmdData.executable, JSON.stringify(cmdData.args), cmdData.capability?.id ?? null, cmdData.capability?.version ?? null);
             }
           } else {
             this.db

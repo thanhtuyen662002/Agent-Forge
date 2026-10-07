@@ -12,6 +12,7 @@ import { ArtifactStore } from '../src/core/services/ArtifactStore';
 import { VerificationService, shouldRunCoderVerification } from '../src/core/services/VerificationService';
 import { CoderProtocol } from '../src/core/types/protocols';
 import { Project, Task } from '../src/core/types/domain';
+import { approveFixtureCommand } from './helpers/verificationCapabilityFixture';
 
 describe('Coder Auto-Verification State Gate (PR18)', () => {
   let db: Database.Database;
@@ -26,7 +27,7 @@ describe('Coder Auto-Verification State Gate (PR18)', () => {
   let testTask: Task;
   let baseCommitSha: string;
 
-  beforeEach(() => {
+  beforeEach(async () => {
     tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'agentforge-coder-verif-test-'));
     execSync('git init -b main', { cwd: tempDir });
     execSync('git config user.email "test@agentforge.test"', { cwd: tempDir });
@@ -98,8 +99,7 @@ describe('Coder Auto-Verification State Gate (PR18)', () => {
       project_id: 'PROJ-VERIF-GATE',
       name: 'Node Verify',
       command_type: 'TEST',
-      executable: 'node',
-      args: ['verify.js'],
+      ...await approveFixtureCommand(repo, testProject.id, ['verify.js']),
       timeout_ms: 60000,
       enabled: true,
     });

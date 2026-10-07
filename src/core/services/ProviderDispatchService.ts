@@ -1,6 +1,7 @@
 import crypto from 'crypto';
 import { ProviderRegistry } from '../adapters/ProviderRegistry';
 import { Repository } from '../database/repositories';
+import { VerificationCapabilityService } from './VerificationCapabilityService';
 import { EventService } from './EventService';
 import { GitService } from './GitService';
 import { ProtocolParser } from '../protocol/parser';
@@ -1049,6 +1050,16 @@ export class ProviderDispatchService {
       };
     }
 
+    try {
+      const capabilityProject = this.repo.getProject(auth.project_id);
+      if (!capabilityProject) throw new Error('CAPABILITY_PROJECT_MISSING');
+      new VerificationCapabilityService(this.repo).validateSnapshot(auth.project_id,
+        parsedCanonicalPayload.verificationCommands, capabilityProject.repository_path);
+    } catch {
+      this.repo.invalidateExecutionAuthorization(auth.id);
+      this.recordRejectionEvent(auth, 'OWNER_APPROVAL_REQUIRED: Verification capability rejected.');
+      return { executionId, status: 'FAILED', errorCode: 'POLICY_DENIAL', error: 'OWNER_APPROVAL_REQUIRED: Verification capability is missing, stale or revoked.' };
+    }
     const recomputedContextHash = computeContextManifestHash(parsedContextFiles);
     if (recomputedContextHash !== auth.context_manifest_hash) {
       this.repo.invalidateExecutionAuthorization(auth.id);
@@ -1405,6 +1416,18 @@ export class ProviderDispatchService {
           error: reason,
         };
       }
+    }
+
+    // Revocation and file changes after asynchronous dispatch admission must
+    // prevent the final adapter-start claim as well.
+    try {
+      const currentProject = this.repo.getProject(auth.project_id);
+      if (!currentProject) throw new Error('CAPABILITY_PROJECT_MISSING');
+      new VerificationCapabilityService(this.repo).validateSnapshot(auth.project_id,
+        parsedCanonicalPayload.verificationCommands, currentProject.repository_path);
+    } catch {
+      this.recordRejectionEvent(auth, 'OWNER_APPROVAL_REQUIRED: Verification capability rejected before adapter start.');
+      return { executionId, status: 'FAILED', errorCode: 'POLICY_DENIAL', error: 'OWNER_APPROVAL_REQUIRED: Verification capability is missing, stale or revoked.' };
     }
 
     // 15d. Atomic adapter-start claim linearization point (R5I6)

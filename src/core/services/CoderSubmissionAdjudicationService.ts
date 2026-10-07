@@ -2,6 +2,7 @@ import crypto from 'crypto';
 import fs from 'fs';
 import path from 'path';
 import Database from 'better-sqlite3';
+import { VerificationCapabilityService } from './VerificationCapabilityService';
 import {
   Repository,
   CoderSubmission,
@@ -3563,6 +3564,11 @@ export class CoderSubmissionAdjudicationService {
 
     const verificationCommandsJson = canonicalJsonStringify(frozenCommands);
     const verificationCommandsHash = computeSha256(verificationCommandsJson);
+    try {
+      new VerificationCapabilityService(this.repo).validateSnapshot(project.id, frozenCommands, project.repository_path);
+    } catch {
+      throw new CoderSubmissionAdjudicationError('COMMAND_SNAPSHOT_INVALID', 'OWNER_APPROVAL_REQUIRED: Frozen verification capability is missing, stale or revoked.');
+    }
 
     // 4. Pre-transaction external Git reads
     if (!project.repository_path) {
@@ -4498,6 +4504,7 @@ export class CoderSubmissionAdjudicationService {
         if (!currentSub) {
           throw new Error(`Submission ${sub.id} missing during settlement`);
         }
+        new VerificationCapabilityService(this.repo).validateSnapshot(project.id, frozenCommands, project.repository_path, auth.id);
         const liveIntegrity = this.validateSubmissionAndAuthorityIntegrity(currentSub);
         if (!liveIntegrity.valid) {
           throw new CoderSubmissionAdjudicationError(

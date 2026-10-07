@@ -68,7 +68,7 @@ if (-not (Test-Path $packageJsonPath)) {
 $receiptLines.Add("PRODUCTION_VERSION=$expectedVersion")
 Write-Host "[A] Production Version ($expectedVersion): $(if ($expectedVersion -match '^\d+\.\d+\.\d+') {'PASS'} else {'FAIL'})"
 
-# Assertion B: Database migration count == 24 (Prior baseline: Expected exactly 23 migrations)
+# Assertion B: Database migration count == 25
 # Historical migrations are now one module per version. Read the version declarations
 # from that registry directory instead of assuming the compatibility facade contains
 # every definition; fail closed for missing, duplicate, or out-of-range versions.

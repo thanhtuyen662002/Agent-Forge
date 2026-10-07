@@ -813,7 +813,8 @@ export class AutonomySupervisor {
       },
       runVerification: async (authority, wo, binding?: TaskMutationBinding) => {
         const targetOrder = wo ?? order;
-        const ev = await this.evidence.collect(targetOrder, targetOrder.required_tests);
+        const invocations = this.productAdapter.createVerificationInvocations(authority, targetOrder);
+        const ev = await this.evidence.collect(targetOrder, targetOrder.required_tests, invocations);
         const passed = ev.tests.length === targetOrder.required_tests.length && ev.tests.length > 0 && ev.tests.every((t) => t.exitCode === 0);
         const firstTest = ev.tests[0];
         return this.productAdapter.recordVerificationObservation({

@@ -7,6 +7,7 @@ import {
   computePayloadHash,
 } from '../services/ExecutionAuthorizationService';
 import { ArtifactStore } from '../services/ArtifactStore';
+import { VerificationCapabilityService } from '../services/VerificationCapabilityService';
 import { EventService } from '../services/EventService';
 import { TaskService, captureAuthorizedTaskTransitionBinding } from '../services/TaskService';
 import {
@@ -17,7 +18,8 @@ import {
 import { TaskTrigger } from '../state/taskStateMachine';
 import { AgentAssignment, ExecutionAuthorization, ProcessRun, Task, TaskMutationBinding, TestRun } from '../types/domain';
 import { AutonomousTaskSpec, ManagerReview, ManagerReviewSchema, WorkOrder, createWorkOrder } from './contracts';
-import { EvidenceCollector } from './evidence';
+import { ApprovedVerificationInvocation, EvidenceCollector } from './evidence';
+import { VerificationCapabilityReference } from '../types/verificationCapability';
 import {
   BuildManagerContextParams,
   ManagerContextPackage,
@@ -280,6 +282,14 @@ export class ProductTaskAutonomyAdapter {
     if (computePayloadHash(canonicalPayload) !== authorization.instruction_payload_hash) {
       return fail('CANONICAL_PAYLOAD_HASH_MISMATCH', 'ExecutionAuthorization canonical payload failed hash verification.');
     }
+    try {
+      const project = this.repo.getProject(task.project_id);
+      if (!project) throw new Error('CAPABILITY_PROJECT_MISSING');
+      new VerificationCapabilityService(this.repo).validateSnapshot(task.project_id,
+        canonicalPayload.verificationCommands, project.repository_path);
+    } catch {
+      return fail('VERIFICATION_CAPABILITY_REJECTED', 'Verification capability is missing, stale or revoked.');
+    }
     if (
       canonicalPayload.projectId !== task.project_id ||
       canonicalPayload.taskId !== task.id ||
@@ -411,6 +421,28 @@ export class ProductTaskAutonomyAdapter {
       repairContext,
     };
     return createWorkOrder(spec);
+  }
+
+  public createVerificationInvocations(authority: ProductTaskAuthority, order: WorkOrder): ApprovedVerificationInvocation[] {
+    const authorization = this.repo.getExecutionAuthorization(authority.authorization.id);
+    if (!authorization || authorization.status === 'INVALIDATED' || authorization.task_id !== order.task_id ||
+        authorization.project_id !== authority.task.project_id || !authorization.canonical_payload_json) {
+      throw new Error('VERIFICATION_AUTHORIZATION_REJECTED');
+    }
+    const payload = CanonicalExecutionPayloadSchema.parse(JSON.parse(authorization.canonical_payload_json));
+    if (computePayloadHash(payload) !== authorization.instruction_payload_hash ||
+        !payload.executionScope || payload.executionScope.worktree !== order.worktree) {
+      throw new Error('VERIFICATION_SCOPE_REJECTED');
+    }
+    const commands = Object.values(payload.verificationCommands).filter((command) => command !== null);
+    if (!areStringArraysIdentical(commands.map(renderCommand), order.required_tests)) throw new Error('VERIFICATION_COMMAND_SNAPSHOT_MISMATCH');
+    const capabilities = new VerificationCapabilityService(this.repo);
+    capabilities.validateSnapshot(authorization.project_id, payload.verificationCommands, order.worktree, authorization.id);
+    return commands.map((command) => ({
+      command: renderCommand(command), executable: command.executable, args: [...command.args], timeoutMs: command.timeout_ms ?? 120000,
+      verificationBoundary: capabilities.createProcessBoundary(command.capability as VerificationCapabilityReference,
+        authorization.project_id, command.executable, command.args, order.worktree, authorization.id),
+    }));
   }
 
   public acquireWorkerSlotLease(assignmentId: string): AcquireSlotLeaseResult {
@@ -722,6 +754,12 @@ export class ProductTaskAutonomyAdapter {
         expectedState: task.state,
         executionId: validated.authority.authorization.execution_id ?? validated.authority.authorization.id,
       };
+      const verificationProject = this.repo.getProject(task.project_id);
+      if (!verificationProject) throw new Error('VERIFICATION_CAPABILITY_PROJECT_MISSING');
+      const verificationPayload = CanonicalExecutionPayloadSchema.parse(JSON.parse(validated.authority.authorization.canonical_payload_json!));
+      const capabilities = new VerificationCapabilityService(this.repo);
+      capabilities.validateSnapshot(task.project_id, verificationPayload.verificationCommands,
+        verificationProject.repository_path, validated.authority.authorization.id);
       const currentTestRun = await input.runVerification(validated.authority, workOrder, verificationBinding);
       const afterVerificationTask = this.repo.getTask(task.id);
       const afterVerificationEpoch = afterVerificationTask?.ownership_epoch ?? authorityEpoch;
@@ -735,6 +773,8 @@ export class ProductTaskAutonomyAdapter {
           `STALE_VALIDATION_RESULT: execution ${verificationBinding.executionId} completed after task reassignment or revision change.`,
         );
       }
+      capabilities.validateSnapshot(task.project_id, verificationPayload.verificationCommands,
+        verificationProject.repository_path, validated.authority.authorization.id);
       const verificationReport = this.getTruthfulVerificationReport(task.id);
       const persistedCurrentRun = currentTestRun ? this.repo.getTestRun(currentTestRun.id) : null;
       const currentEvidence = persistedCurrentRun?.evidence_id
