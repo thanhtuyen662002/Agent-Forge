@@ -33,25 +33,27 @@ export const EvidenceView: React.FC = () => {
             </div>
           ) : (
             evidence.map((ev) => (
-              <div
+              <button
+                type="button"
                 key={ev.id}
                 onClick={() => setSelectedEvidence(ev)}
-                className={`p-3 rounded-lg border text-xs font-mono cursor-pointer transition space-y-1.5 ${
+                aria-pressed={selectedEvidence?.id === ev.id}
+                className={`block w-full text-left p-3 rounded-lg border text-xs font-mono cursor-pointer transition space-y-1.5 ${
                   selectedEvidence?.id === ev.id
                     ? 'bg-forge-cyan/15 border-forge-cyan/40 text-white'
                     : 'bg-surface border-surface-border text-slate-300 hover:border-slate-600'
                 }`}
               >
-                <div className="flex items-center justify-between">
+                <span className="flex items-center justify-between">
                   <span className="font-bold text-forge-cyan">{ev.evidence_type}</span>
                   <span className="text-[10px] text-slate-500">{ev.storage_type}</span>
-                </div>
-                <div className="text-[11px] text-slate-300 truncate font-sans">{ev.summary}</div>
-                <div className="text-[10px] text-slate-500 font-mono flex items-center justify-between">
+                </span>
+                <span className="block text-[11px] text-slate-300 truncate font-sans">{ev.summary}</span>
+                <span className="text-[10px] text-slate-500 font-mono flex items-center justify-between">
                   <span>{t('evidence.shaPrefix')}: {ev.hash.substring(0, 8)}...</span>
                   <span>{ev.byte_size} {t('common.bytes')}</span>
-                </div>
-              </div>
+                </span>
+              </button>
             ))
           )}
         </div>

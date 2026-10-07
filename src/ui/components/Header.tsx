@@ -98,6 +98,7 @@ export const Header: React.FC = () => {
           {projects.length > 0 ? (
             <>
               <select
+                aria-label={t('header.projectSelectorLabel')}
                 value={activeProject?.id || ''}
                 disabled={pendingActions.length > 0}
                 onChange={(e) => {
@@ -155,6 +156,7 @@ export const Header: React.FC = () => {
         <div className="flex items-center bg-surface-card border border-surface-border rounded-lg p-1 text-xs font-mono">
           <button
             onClick={() => setLocale(locale === 'vi-VN' ? 'en-US' : 'vi-VN')}
+            aria-label={t('language.selectorLabel')}
             title={t('language.selectorLabel')}
             className="px-2 py-1 rounded flex items-center space-x-1.5 text-slate-300 hover:text-white transition"
           >
@@ -168,6 +170,7 @@ export const Header: React.FC = () => {
           {(['OWNER', 'ENGINEER', 'DEBUG'] as UIDensityMode[]).map((mode) => (
             <button
               key={mode}
+              aria-pressed={densityMode === mode}
               onClick={() => setDensityMode(mode)}
               className={`px-2.5 py-1 rounded transition-all ${
                 densityMode === mode

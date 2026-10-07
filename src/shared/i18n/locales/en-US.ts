@@ -66,6 +66,7 @@ export const enUS: TranslationDictionary = {
     vi: 'Tiếng Việt',
   },
   header: {
+    projectSelectorLabel: 'Active project',
     tasksDone: 'Done',
     agentsActive: 'Active',
     startProject: 'START PROJECT',
@@ -238,6 +239,7 @@ export const enUS: TranslationDictionary = {
     estimated: 'ESTIMATED',
   },
   timeline: {
+    filterLabel: 'Filter audit events by type',
     title: 'Immutable Timeline & Audit Log',
     subtitle: 'Append-only event stream recording all task dispatches, state transitions, protocol verifications, and safety actions.',
     searchPlaceholder: 'Search audit events...',

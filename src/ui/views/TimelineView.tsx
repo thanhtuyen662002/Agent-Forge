@@ -41,6 +41,7 @@ export const TimelineView: React.FC = () => {
           <div className="relative">
             <Search className="w-3.5 h-3.5 text-slate-400 absolute left-3 top-2.5" />
             <input
+              aria-label={t('timeline.searchPlaceholder')}
               type="text"
               value={searchQuery}
               onChange={(e) => setSearchQuery(e.target.value)}
@@ -50,6 +51,7 @@ export const TimelineView: React.FC = () => {
           </div>
 
           <select
+            aria-label={t('timeline.filterLabel')}
             value={filterType}
             onChange={(e) => setFilterType(e.target.value)}
             className="bg-surface-card border border-surface-border rounded-lg px-3 py-1.5 text-white focus:outline-none focus:border-forge-cyan"
@@ -77,14 +79,17 @@ export const TimelineView: React.FC = () => {
                 key={ev.id}
                 className="bg-surface-card border border-surface-border rounded-xl p-4 space-y-3 hover:border-surface-hover transition"
               >
-                <div
+                <button
+                  type="button"
                   onClick={() => setExpandedEventId(isExpanded ? null : ev.id)}
-                  className="flex items-start justify-between cursor-pointer"
+                  aria-expanded={isExpanded}
+                  aria-controls={`event-payload-${ev.id}`}
+                  className="w-full text-left flex items-start justify-between cursor-pointer"
                 >
-                  <div className="flex items-start space-x-3">
-                    <div className="w-2 h-2 rounded-full bg-forge-cyan mt-1.5 shrink-0"></div>
-                    <div className="space-y-0.5">
-                      <div className="flex items-center space-x-3 text-xs font-mono">
+                  <span className="flex items-start space-x-3">
+                    <span className="w-2 h-2 rounded-full bg-forge-cyan mt-1.5 shrink-0"></span>
+                    <span className="block space-y-0.5">
+                      <span className="flex items-center space-x-3 text-xs font-mono">
                         <span className="font-bold text-white">{ev.type}</span>
                         {ev.task_id && (
                           <span className="px-1.5 py-0.2 rounded bg-surface text-forge-cyan border border-surface-border text-[10px]">
@@ -92,18 +97,18 @@ export const TimelineView: React.FC = () => {
                           </span>
                         )}
                         <span className="text-[10px] text-slate-500">{new Date(ev.timestamp).toLocaleString()}</span>
-                      </div>
-                      <p className="text-xs text-slate-300 font-sans">{ev.summary}</p>
-                    </div>
-                  </div>
+                      </span>
+                      <span className="block text-xs text-slate-300 font-sans">{ev.summary}</span>
+                    </span>
+                  </span>
 
-                  <div className="text-slate-400 p-1">
+                  <span className="text-slate-400 p-1">
                     {isExpanded ? <ChevronDown className="w-4 h-4" /> : <ChevronRight className="w-4 h-4" />}
-                  </div>
-                </div>
+                  </span>
+                </button>
 
                 {isExpanded && (
-                  <div className="pt-3 border-t border-surface-border font-mono text-xs">
+                  <div id={`event-payload-${ev.id}`} className="pt-3 border-t border-surface-border font-mono text-xs">
                     <div className="text-[10px] text-slate-400 mb-1">{t('timeline.structuredPayloadLabel')}:</div>
                     <pre className="p-3 bg-surface rounded-lg border border-surface-border text-slate-200 overflow-x-auto text-[11px]">
                       {JSON.stringify(ev.structured_payload, null, 2)}

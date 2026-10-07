@@ -66,6 +66,7 @@ export const viVN: TranslationDictionary = {
     vi: 'Tiếng Việt',
   },
   header: {
+    projectSelectorLabel: 'Dự án đang chọn',
     tasksDone: 'Hoàn thành',
     agentsActive: 'Hoạt động',
     startProject: 'BẮT ĐẦU DỰ ÁN',
@@ -238,6 +239,7 @@ export const viVN: TranslationDictionary = {
     estimated: 'ƯỚC TÍNH',
   },
   timeline: {
+    filterLabel: 'Lọc sự kiện kiểm toán theo loại',
     title: 'Dòng thời gian & Nhật ký Kiểm toán Bất biến',
     subtitle: 'Luồng sự kiện chỉ ghi thêm lưu vết toàn bộ việc điều phối nhiệm vụ, chuyển trạng thái, xác minh giao thức và tác vụ an toàn.',
     searchPlaceholder: 'Tìm kiếm sự kiện kiểm toán...',

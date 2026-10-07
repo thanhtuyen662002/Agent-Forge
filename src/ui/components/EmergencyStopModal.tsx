@@ -2,6 +2,7 @@ import React, { useState } from 'react';
 import { useOrchestrator } from '../context/OrchestratorContext';
 import { useI18n } from '../context/I18nContext';
 import { ShieldAlert, AlertTriangle, X, Check } from 'lucide-react';
+import { AccessibleDialog } from './AccessibleDialog';
 
 export const EmergencyStopModal: React.FC = () => {
   const { isEmergencyStopOpen, setIsEmergencyStopOpen, triggerEmergencyStop } = useOrchestrator();
@@ -25,20 +26,24 @@ export const EmergencyStopModal: React.FC = () => {
   };
 
   const handleClose = () => {
+    if (isProcessing) return;
     setStopResult(null);
     setIsEmergencyStopOpen(false);
   };
 
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/80 backdrop-blur-sm p-4">
-      <div className="bg-surface border-2 border-rose-600/80 rounded-xl shadow-2xl max-w-lg w-full overflow-hidden glow-rose">
+      <AccessibleDialog onDismiss={handleClose} dismissible={!isProcessing} aria-labelledby="emergency-stop-title" className="bg-surface border-2 border-rose-600/80 rounded-xl shadow-2xl max-w-lg w-full overflow-hidden glow-rose">
         {/* Modal Header */}
         <div className="bg-rose-950/40 border-b border-rose-800/40 px-6 py-4 flex items-center justify-between">
           <div className="flex items-center space-x-3 text-rose-400">
             <ShieldAlert className="w-6 h-6 shrink-0" />
-            <h2 className="font-mono font-bold text-lg tracking-wide uppercase">{t('emergencyStop.modalTitle')}</h2>
+            <h2 id="emergency-stop-title" className="font-mono font-bold text-lg tracking-wide uppercase">{t('emergencyStop.modalTitle')}</h2>
           </div>
           <button
+            type="button"
+            aria-label={t('common.close')}
+            disabled={isProcessing}
             onClick={handleClose}
             className="text-slate-400 hover:text-white p-1 rounded-md transition"
           >
@@ -58,8 +63,10 @@ export const EmergencyStopModal: React.FC = () => {
               </div>
 
               <div>
-                <label className="block text-xs font-mono text-slate-400 mb-1.5">{t('emergencyStop.reasonLabel')}:</label>
+                <label htmlFor="emergency-stop-reason" className="block text-xs font-mono text-slate-400 mb-1.5">{t('emergencyStop.reasonLabel')}:</label>
                 <input
+                  id="emergency-stop-reason"
+                  disabled={isProcessing}
                   type="text"
                   value={reason}
                   onChange={(e) => setReason(e.target.value)}
@@ -77,6 +84,8 @@ export const EmergencyStopModal: React.FC = () => {
               {/* Action Buttons */}
               <div className="flex items-center justify-end space-x-3 pt-4 border-t border-surface-border">
                 <button
+                  data-dialog-initial-focus
+                  type="button"
                   onClick={handleClose}
                   disabled={isProcessing}
                   className="px-4 py-2 bg-surface-card hover:bg-surface-border text-slate-300 text-xs font-semibold rounded-lg transition"
@@ -118,7 +127,7 @@ export const EmergencyStopModal: React.FC = () => {
             </div>
           )}
         </div>
-      </div>
+      </AccessibleDialog>
     </div>
   );
 };

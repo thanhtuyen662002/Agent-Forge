@@ -651,8 +651,9 @@ export const SettingsView: React.FC = () => {
 
           <div className="grid grid-cols-1 md:grid-cols-3 gap-4 text-xs font-mono">
             <div>
-              <label className="block text-slate-400 mb-1">{t('settings.verificationCommands.testCmdLabel')}:</label>
+              <label htmlFor="settings-test-command" className="block text-slate-400 mb-1">{t('settings.verificationCommands.testCmdLabel')}:</label>
               <input
+                id="settings-test-command"
                 type="text"
                 disabled={settingsLoading}
                 value={testCmd}
@@ -666,8 +667,9 @@ export const SettingsView: React.FC = () => {
             </div>
 
             <div>
-              <label className="block text-slate-400 mb-1">{t('settings.verificationCommands.lintCmdLabel')}:</label>
+              <label htmlFor="settings-lint-command" className="block text-slate-400 mb-1">{t('settings.verificationCommands.lintCmdLabel')}:</label>
               <input
+                id="settings-lint-command"
                 type="text"
                 disabled={settingsLoading}
                 value={lintCmd}
@@ -681,8 +683,9 @@ export const SettingsView: React.FC = () => {
             </div>
 
             <div>
-              <label className="block text-slate-400 mb-1">{t('settings.verificationCommands.buildCmdLabel')}:</label>
+              <label htmlFor="settings-build-command" className="block text-slate-400 mb-1">{t('settings.verificationCommands.buildCmdLabel')}:</label>
               <input
+                id="settings-build-command"
                 type="text"
                 disabled={settingsLoading}
                 value={buildCmd}
@@ -704,8 +707,9 @@ export const SettingsView: React.FC = () => {
           </h3>
 
           <div className="max-w-xs text-xs font-mono">
-            <label className="block text-slate-400 mb-1">{t('settings.loopProtection.maxRevisionsLabel')}:</label>
+            <label htmlFor="settings-max-revisions" className="block text-slate-400 mb-1">{t('settings.loopProtection.maxRevisionsLabel')}:</label>
             <input
+              id="settings-max-revisions"
               type="number"
               disabled={settingsLoading}
               min={1}

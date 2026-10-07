@@ -5,6 +5,7 @@ import { QuotaBadge } from '../components/QuotaBadge';
 import { ProviderResource, QuotaSource } from '../../core/types/domain';
 import { Cpu, Edit2 } from 'lucide-react';
 import { isQuotaInputValid, validateQuotaSnapshot } from '../capacityTruth';
+import { AccessibleDialog } from '../components/AccessibleDialog';
 
 export interface QuotaSnapshotResolution {
   remaining: number | null;
@@ -94,6 +95,12 @@ export const CapacityView: React.FC = () => {
   const [editError, setEditError] = useState<string | null>(null);
   const [saving, setSaving] = useState(false);
   const quotaPending = saving || pendingActions.includes('updateQuota');
+  const closeQuotaEditor = () => {
+    if (quotaPending) return;
+    setEditingResource(null);
+    setEditRemaining('');
+    setEditTotal('');
+  };
 
   const handleSaveQuota = async () => {
     if (!editingResource || quotaPending || !isElectron) return;
@@ -212,8 +219,8 @@ export const CapacityView: React.FC = () => {
       {/* Edit Quota Modal */}
       {editingResource && (
         <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/80 backdrop-blur-sm p-4">
-          <div className="bg-surface border border-surface-border rounded-xl shadow-2xl max-w-md w-full p-6 space-y-4">
-            <h3 className="text-sm font-mono font-bold text-white uppercase tracking-wider">
+          <AccessibleDialog onDismiss={closeQuotaEditor} dismissible={!quotaPending} aria-labelledby="quota-editor-title" className="bg-surface border border-surface-border rounded-xl shadow-2xl max-w-md w-full p-6 space-y-4">
+            <h3 id="quota-editor-title" className="text-sm font-mono font-bold text-white uppercase tracking-wider">
               {t('capacity.adjustTitle', { modelName: editingResource.model_name })}
             </h3>
 
@@ -257,12 +264,10 @@ export const CapacityView: React.FC = () => {
 
             <div className="flex justify-end space-x-3 pt-3 border-t border-surface-border">
               <button
+                data-dialog-initial-focus
+                type="button"
                 disabled={quotaPending}
-                onClick={() => {
-                  setEditingResource(null);
-                  setEditRemaining('');
-                  setEditTotal('');
-                }}
+                onClick={closeQuotaEditor}
                 className="px-4 py-2 bg-surface-card hover:bg-surface-border text-slate-300 rounded-lg text-xs"
               >
                 {t('capacity.cancel')}
@@ -276,7 +281,7 @@ export const CapacityView: React.FC = () => {
                 {quotaPending ? t('common.loading') : t('capacity.saveSnapshot')}
               </button>
             </div>
-          </div>
+          </AccessibleDialog>
         </div>
       )}
     </div>
