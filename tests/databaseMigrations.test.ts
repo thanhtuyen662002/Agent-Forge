@@ -3,7 +3,7 @@ import Database from 'better-sqlite3';
 import fs from 'fs';
 import os from 'os';
 import path from 'path';
-import { MigrationRunner, MIGRATIONS } from '../src/core/database/migrations';
+import { MigrationRunner, MIGRATIONS, verifyMigration21SchemaAuthority, verifyMigration22SchemaAuthority } from '../src/core/database/migrations';
 
 describe('Database Migrations & Upgrade Integrity', () => {
   let db: Database.Database;
@@ -15,6 +15,20 @@ describe('Database Migrations & Upgrade Integrity', () => {
 
   afterEach(() => {
     db.close();
+  });
+
+  it('retains MCP authority at schema 25 and rejects unknown or renamed capability migrations', () => {
+    MigrationRunner.run(db);
+    expect(db.prepare('SELECT MAX(version) AS version FROM schema_migrations').get()).toEqual({ version: 25 });
+    for (const verify of [verifyMigration21SchemaAuthority, verifyMigration22SchemaAuthority]) {
+      expect(() => verify(db)).not.toThrow();
+      db.prepare("UPDATE schema_migrations SET name='untrusted-capability-schema' WHERE version=25").run();
+      expect(() => verify(db)).toThrow(/SCHEMA_AUTHORITY_INVALID/);
+      db.prepare("UPDATE schema_migrations SET name=? WHERE version=25").run(MIGRATIONS[24].name);
+      db.prepare("INSERT INTO schema_migrations(version,name,applied_at) VALUES(26,'unknown',?)").run(new Date().toISOString());
+      expect(() => verify(db)).toThrow(/SCHEMA_AUTHORITY_INVALID/);
+      db.prepare('DELETE FROM schema_migrations WHERE version=26').run();
+    }
   });
 
   it('should run all migrations cleanly and create all tables (v1 through v12)', () => {

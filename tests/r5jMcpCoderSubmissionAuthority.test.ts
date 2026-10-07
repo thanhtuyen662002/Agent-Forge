@@ -2073,8 +2073,8 @@ describe('R5J4 Durable Coder Submission Authority Comprehensive Suite', () => {
   // Group 9: Section 6.1 — Production Determinism and Migration Compatibility
   // =========================================================================
   describe('Group 9: Section 6.1 — Production Determinism and Migration Compatibility', () => {
-    it('111. MIGRATIONS is exactly 24 in every caller/process/test filename', () => {
-      expect(MIGRATIONS).toHaveLength(24);
+    it('111. MIGRATIONS is exactly 25 in every caller/process/test filename', () => {
+      expect(MIGRATIONS).toHaveLength(25);
       expect(MIGRATIONS[21].version).toBe(22);
       expect(MIGRATIONS[21].name).toBe('022_r5j_coder_submission_authority');
     });
@@ -2085,7 +2085,7 @@ describe('R5J4 Durable Coder Submission Authority Comprehensive Suite', () => {
       try {
         process.argv.push('--file=ContextRead.test.ts');
         process.env.TEST_NAME = 'CrashRecovery';
-        expect(MIGRATIONS).toHaveLength(24);
+        expect(MIGRATIONS).toHaveLength(25);
       } finally {
         process.argv = originalArgv;
         process.env.TEST_NAME = originalEnv;
@@ -4226,11 +4226,11 @@ SELECT * FROM users WHERE id = 1;`;
       expect(typeof fixtures.service.getSubmissionStatus).toBe('function');
     });
 
-    it('39. Migration count remains exactly 24', () => {
-      expect(MIGRATIONS).toHaveLength(24);
-      expect(MIGRATIONS[MIGRATIONS.length - 1].version).toBe(24);
+    it('39. Migration count remains exactly 25', () => {
+      expect(MIGRATIONS).toHaveLength(25);
+      expect(MIGRATIONS[MIGRATIONS.length - 1].version).toBe(25);
       expect(MIGRATIONS[MIGRATIONS.length - 1].name).toBe(
-        '024_r5j_reviewer_session_authority'
+        'durable_owner_verification_capabilities'
       );
     });
 
@@ -5355,7 +5355,7 @@ SELECT * FROM users WHERE id = 1;`;
     });
 
     it('H34. Existing R5J1-R5J5 suites remain unchanged and pass', () => {
-      expect(MIGRATIONS).toHaveLength(24);
+      expect(MIGRATIONS).toHaveLength(25);
       expect(MIGRATIONS[22].version).toBe(23);
       expect(typeof verifyMigration23SchemaAuthority).toBe('function');
     });

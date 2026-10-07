@@ -173,8 +173,8 @@ describe('R5J5 Quarantined Submission Adjudication and Verification Suite', () =
       testDb.close();
     });
 
-    it('3. MIGRATIONS array contains exactly 24 migrations with 023_r5j_quarantined_submission_adjudication_and_verification_admission', () => {
-      expect(MIGRATIONS).toHaveLength(24);
+    it('3. MIGRATIONS array contains exactly 25 migrations with 023_r5j_quarantined_submission_adjudication_and_verification_admission', () => {
+      expect(MIGRATIONS).toHaveLength(25);
       expect(MIGRATIONS[22].version).toBe(23);
       expect(MIGRATIONS[22].name).toBe('023_r5j_quarantined_submission_adjudication_and_verification_admission');
     });

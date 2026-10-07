@@ -293,16 +293,11 @@ export function verifyMigration21SchemaAuthority(db: Database.Database): void {
     .prepare('SELECT version, name FROM schema_migrations ORDER BY version ASC')
     .all() as { version: number; name: string }[];
 
-  if (ledgerRows.length !== 21) {
-    const isCanonical22 = ledgerRows.length === 22 && ledgerRows[21]?.version === 22 && ledgerRows[21]?.name === '022_r5j_coder_submission_authority';
-    const isCanonical23 = ledgerRows.length === 23 && ledgerRows[21]?.version === 22 && ledgerRows[21]?.name === '022_r5j_coder_submission_authority' && ledgerRows[22]?.version === 23 && ledgerRows[22]?.name === '023_r5j_quarantined_submission_adjudication_and_verification_admission';
-    const isCanonical24 = ledgerRows.length === 24 && ledgerRows[21]?.version === 22 && ledgerRows[21]?.name === '022_r5j_coder_submission_authority' && ledgerRows[22]?.version === 23 && ledgerRows[22]?.name === '023_r5j_quarantined_submission_adjudication_and_verification_admission' && ledgerRows[23]?.version === 24 && ledgerRows[23]?.name === '024_r5j_reviewer_session_authority';
-    if (!isCanonical22 && !isCanonical23 && !isCanonical24) {
-      throw new Error(`[MCP_SCHEMA_AUTHORITY_INVALID] Database schema migrations ledger must contain exactly 21 migrations (found ${ledgerRows.length})`);
-    }
+  if (ledgerRows.length < 21 || ledgerRows.length > MIGRATIONS.length) {
+    throw new Error(`[MCP_SCHEMA_AUTHORITY_INVALID] Database schema migrations ledger must contain a registered version from 21 through ${MIGRATIONS.length} (found ${ledgerRows.length})`);
   }
 
-  const checkCount = Math.min(ledgerRows.length, 21);
+  const checkCount = ledgerRows.length;
   for (let i = 0; i < checkCount; i++) {
     const expectedVersion = i + 1;
     const expectedMigration = MIGRATIONS[i];
@@ -336,12 +331,8 @@ export function verifyMigration22SchemaAuthority(db: Database.Database): void {
     .prepare('SELECT version, name FROM schema_migrations ORDER BY version ASC')
     .all() as { version: number; name: string }[];
 
-  if (ledgerRows.length !== 22) {
-    const isCanonical23 = ledgerRows.length === 23 && ledgerRows[22]?.version === 23 && ledgerRows[22]?.name === '023_r5j_quarantined_submission_adjudication_and_verification_admission';
-    const isCanonical24 = ledgerRows.length === 24 && ledgerRows[22]?.version === 23 && ledgerRows[22]?.name === '023_r5j_quarantined_submission_adjudication_and_verification_admission' && ledgerRows[23]?.version === 24 && ledgerRows[23]?.name === '024_r5j_reviewer_session_authority';
-    if (!isCanonical23 && !isCanonical24) {
-      throw new Error(`[MCP_SCHEMA_AUTHORITY_INVALID] Database schema migrations ledger must contain exactly 22 migrations (found ${ledgerRows.length})`);
-    }
+  if (ledgerRows.length < 22 || ledgerRows.length > MIGRATIONS.length) {
+    throw new Error(`[MCP_SCHEMA_AUTHORITY_INVALID] Database schema migrations ledger must contain a registered version from 22 through ${MIGRATIONS.length} (found ${ledgerRows.length})`);
   }
 
   for (let i = 0; i < ledgerRows.length; i++) {

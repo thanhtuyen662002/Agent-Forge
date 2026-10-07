@@ -88,14 +88,14 @@ if (-not (Test-Path $migrationsDir)) {
     $migrationVersions.Add([int]$migrationMatch.Matches[0].Groups[1].Value)
   }
   $migrationCount = $migrationVersions.Count
-  $expectedMigrationVersions = (1..24) -join ","
+  $expectedMigrationVersions = (1..25) -join ","
   $actualMigrationVersions = ($migrationVersions | Sort-Object) -join ","
-  if ($migrationCount -ne 24 -or $actualMigrationVersions -ne $expectedMigrationVersions) {
-    $failures.Add("B_MIGRATION_COUNT_INVALID: Expected exactly 24 migrations with versions 1..24, found $actualMigrationVersions")
+  if ($migrationCount -ne 25 -or $actualMigrationVersions -ne $expectedMigrationVersions) {
+    $failures.Add("B_MIGRATION_COUNT_INVALID: Expected exactly 25 migrations with versions 1..25, found $actualMigrationVersions")
   }
 }
 $receiptLines.Add("MIGRATION_COUNT=$migrationCount")
-Write-Host "[B] Database Migration Count ($migrationCount): $(if ($migrationCount -eq 24) {'PASS'} else {'FAIL'})"
+Write-Host "[B] Database Migration Count ($migrationCount): $(if ($migrationCount -eq 25) {'PASS'} else {'FAIL'})"
 
 # Assertion C & D: electron-builder.yml provider & credentials check
 $builderConfigPath = Join-Path $ProjectRoot "electron-builder.yml"
