@@ -3,6 +3,7 @@ import { useOrchestrator } from '../context/OrchestratorContext';
 import { useI18n } from '../context/I18nContext';
 import { UiActionFailure, uiActionFailureKey } from '../actionState';
 import { ProgressIndicator } from '../components/ProgressIndicator';
+import { AccessibleDialog } from '../components/AccessibleDialog';
 import {
   getTaskLaneId,
   TASK_LANE_STATE_GROUPS,
@@ -128,7 +129,7 @@ export const TaskBoardView: React.FC = () => {
       </div>
 
       {/* Kanban Board Columns Grid */}
-      <div className="grid grid-cols-1 md:grid-cols-3 xl:grid-cols-5 gap-4 flex-1 overflow-x-auto pb-4">
+      <div className="grid grid-cols-1 md:grid-cols-[repeat(3,minmax(240px,1fr))] xl:grid-cols-[repeat(5,minmax(240px,1fr))] gap-4 flex-1 overflow-x-auto pb-4">
         {columns.map((col) => {
           const colTasks = tasks.filter((task) => getTaskLaneId(task.state) === col.id);
           return (
@@ -154,15 +155,16 @@ export const TaskBoardView: React.FC = () => {
                   </div>
                 ) : (
                   colTasks.map((task) => (
-                    <div
+                    <button
+                      type="button"
                       key={task.id}
                       onClick={() => {
                         setSelectedTaskId(task.id);
                         setActiveView('task-detail');
                       }}
-                      className="bg-surface/80 hover:bg-surface border border-surface-border hover:border-forge-cyan/40 rounded-lg p-3.5 space-y-3 shadow transition cursor-pointer group"
+                      className="block w-full text-left bg-surface/80 hover:bg-surface border border-surface-border hover:border-forge-cyan/40 rounded-lg p-3.5 space-y-3 shadow transition cursor-pointer group"
                     >
-                      <div className="flex items-center justify-between text-[10px] font-mono">
+                      <span className="flex items-center justify-between text-[10px] font-mono">
                         <span className="text-forge-cyan font-bold">{task.id}</span>
                         <span
                           className={`px-1.5 py-0.5 rounded ${
@@ -175,19 +177,19 @@ export const TaskBoardView: React.FC = () => {
                         >
                           {task.priority}
                         </span>
-                      </div>
+                      </span>
 
-                      <h4 className="text-xs font-semibold text-white group-hover:text-forge-cyan transition line-clamp-2">
+                      <span className="block text-xs font-semibold text-white group-hover:text-forge-cyan transition line-clamp-2">
                         {task.title}
-                      </h4>
+                      </span>
 
                       <ProgressIndicator percent={task.progress_cache_percent} size="sm" />
 
-                      <div className="flex items-center justify-between text-[10px] font-mono text-slate-400 pt-1 border-t border-surface-border/50">
+                      <span className="flex items-center justify-between text-[10px] font-mono text-slate-400 pt-1 border-t border-surface-border/50">
                         <span>{t('taskBoard.revLabel')}: {task.revision_count}/{task.max_revisions}</span>
                         <span className="text-slate-300 font-medium">{task.state}</span>
-                      </div>
-                    </div>
+                      </span>
+                    </button>
                   ))
                 )}
               </div>
@@ -199,12 +201,13 @@ export const TaskBoardView: React.FC = () => {
       {/* New Task Modal */}
       {isCreateModalOpen && (
         <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/80 backdrop-blur-sm p-4">
-          <div className="bg-surface border border-surface-border rounded-xl shadow-2xl max-w-lg w-full p-6 space-y-4">
-            <h3 className="text-base font-bold text-white font-mono uppercase tracking-wide">{t('taskBoard.createModal.title')}</h3>
+          <AccessibleDialog onDismiss={() => setIsCreateModalOpen(false)} dismissible={!creating} aria-labelledby="create-task-title" className="bg-surface border border-surface-border rounded-xl shadow-2xl max-w-lg w-full p-6 space-y-4">
+            <h3 id="create-task-title" className="text-base font-bold text-white font-mono uppercase tracking-wide">{t('taskBoard.createModal.title')}</h3>
             <form onSubmit={handleCreateTask} className="space-y-4 text-xs font-mono">
               <div>
-                <label className="block text-slate-400 mb-1">{t('taskBoard.createModal.taskTitleLabel')}:</label>
+                <label htmlFor="create-task-name" className="block text-slate-400 mb-1">{t('taskBoard.createModal.taskTitleLabel')}:</label>
                 <input
+                  id="create-task-name"
                   type="text"
                   required
                   value={newTitle}
@@ -215,8 +218,9 @@ export const TaskBoardView: React.FC = () => {
               </div>
 
               <div>
-                <label className="block text-slate-400 mb-1">{t('taskBoard.createModal.descLabel')}:</label>
+                <label htmlFor="create-task-description" className="block text-slate-400 mb-1">{t('taskBoard.createModal.descLabel')}:</label>
                 <textarea
+                  id="create-task-description"
                   value={newDesc}
                   onChange={(e) => setNewDesc(e.target.value)}
                   placeholder={t('taskBoard.createModal.descPlaceholder')}
@@ -226,8 +230,9 @@ export const TaskBoardView: React.FC = () => {
 
               <div className="grid grid-cols-2 gap-4">
                 <div>
-                  <label className="block text-slate-400 mb-1">{t('taskBoard.createModal.priorityLabel')}:</label>
+                  <label htmlFor="create-task-priority" className="block text-slate-400 mb-1">{t('taskBoard.createModal.priorityLabel')}:</label>
                   <select
+                    id="create-task-priority"
                     value={newPriority}
                     onChange={(e) => setNewPriority(e.target.value as any)}
                     className="w-full bg-surface-card border border-surface-border rounded-lg px-3 py-2 text-white focus:outline-none focus:border-forge-cyan"
@@ -239,8 +244,9 @@ export const TaskBoardView: React.FC = () => {
                   </select>
                 </div>
                 <div>
-                  <label className="block text-slate-400 mb-1">{t('taskBoard.createModal.riskLabel')}:</label>
+                  <label htmlFor="create-task-risk" className="block text-slate-400 mb-1">{t('taskBoard.createModal.riskLabel')}:</label>
                   <select
+                    id="create-task-risk"
                     value={newRisk}
                     onChange={(e) => setNewRisk(e.target.value as any)}
                     className="w-full bg-surface-card border border-surface-border rounded-lg px-3 py-2 text-white focus:outline-none focus:border-forge-cyan"
@@ -254,8 +260,9 @@ export const TaskBoardView: React.FC = () => {
               </div>
 
               <div>
-                <label className="block text-slate-400 mb-1">{t('taskBoard.createModal.criteriaLabel')}:</label>
+                <label htmlFor="create-task-criteria" className="block text-slate-400 mb-1">{t('taskBoard.createModal.criteriaLabel')}:</label>
                 <textarea
+                  id="create-task-criteria"
                   value={newCriteria}
                   onChange={(e) => setNewCriteria(e.target.value)}
                   placeholder={t('taskBoard.createModal.criteriaPlaceholder')}
@@ -266,6 +273,7 @@ export const TaskBoardView: React.FC = () => {
               {createError && <div role="alert" className="text-rose-300">{t(uiActionFailureKey(createError))}</div>}
               <div className="flex justify-end space-x-3 pt-3 border-t border-surface-border">
                 <button
+                  data-dialog-initial-focus
                   type="button"
                   onClick={() => setIsCreateModalOpen(false)}
                   disabled={creating}
@@ -283,7 +291,7 @@ export const TaskBoardView: React.FC = () => {
                 </button>
               </div>
             </form>
-          </div>
+          </AccessibleDialog>
         </div>
       )}
     </div>

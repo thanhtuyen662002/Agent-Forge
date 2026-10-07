@@ -1,6 +1,7 @@
 import React, { useState, useEffect, useCallback, useRef } from 'react';
 import { isAsyncResponseCurrent, reconcileSelectedId, useOrchestrator } from '../context/OrchestratorContext';
 import { useI18n } from '../context/I18nContext';
+import { AccessibleDialog } from '../components/AccessibleDialog';
 import {
   ArrowLeftRight,
   Clipboard,
@@ -121,6 +122,12 @@ export const ManualBridgeView: React.FC = () => {
   const [isAdjudicating, setIsAdjudicating] = useState<boolean>(false);
   const [adjudicationFeedback, setAdjudicationFeedback] = useState<string | null>(null);
   const [adjudicationError, setAdjudicationError] = useState<string | null>(null);
+  const closeAdjudicationDialog = () => {
+    if (isAdjudicating) return;
+    setConfirmModalAction(null);
+    setAdjudicationReason('');
+    setReplacementSubId('');
+  };
 
   // ==========================================
   // Outbox State
@@ -717,8 +724,9 @@ export const ManualBridgeView: React.FC = () => {
               )}
 
               <div>
-                <label className="block text-xs font-mono text-slate-400 mb-1.5">{t('manualBridge.selectTargetTaskLabel')}:</label>
+                <label htmlFor="handoff-task" className="block text-xs font-mono text-slate-400 mb-1.5">{t('manualBridge.selectTargetTaskLabel')}:</label>
                 <select
+                  id="handoff-task"
                   value={selectedHandoffTaskId}
                   onChange={(e) => handleTaskChange(e.target.value)}
                   className="w-full bg-surface border border-surface-border rounded-lg px-3 py-2 text-xs text-white focus:outline-none focus:border-forge-amber font-mono"
@@ -757,9 +765,9 @@ export const ManualBridgeView: React.FC = () => {
 
               {/* Manager Authority Status Box */}
               <div className="space-y-2">
-                <label className="block text-[11px] font-mono font-semibold text-slate-400 uppercase">
+                <p className="block text-[11px] font-mono font-semibold text-slate-400 uppercase">
                   {t('manualBridge.managerAuthorityStatusLabel')}
-                </label>
+                </p>
                 {managerAuth?.hasAuthority ? (
                   <div
                     className={`p-3.5 rounded-lg border text-xs font-mono space-y-2 ${
@@ -868,16 +876,17 @@ export const ManualBridgeView: React.FC = () => {
                       <div className="flex items-center justify-between gap-2">
                         <div className="flex items-center space-x-2.5">
                           <input
+                            id={`candidate-${res.id}`}
                             type="checkbox"
                             checked={isSelected}
                             onChange={() => toggleCandidate(res.id)}
                             className="rounded border-surface-border text-forge-amber focus:ring-0 cursor-pointer"
                           />
                           <div>
-                            <div className="font-bold text-white flex items-center space-x-1.5">
+                            <label htmlFor={`candidate-${res.id}`} className="font-bold text-white flex items-center space-x-1.5">
                               <span>{res.model_name}</span>
                               <span className="text-[10px] text-slate-400">({res.id})</span>
-                            </div>
+                            </label>
                             <div className="text-[10px] text-slate-400">
                               {t('manualBridge.providerLabel')}: <strong className="text-slate-300">{res.provider_id}</strong>
                             </div>
@@ -895,6 +904,7 @@ export const ManualBridgeView: React.FC = () => {
                               disabled={candidateOrder <= 0}
                               className="p-1 rounded bg-surface-card hover:bg-slate-700 text-slate-300 disabled:opacity-30"
                               title={t('manualBridge.moveUpTitle')}
+                              aria-label={`${t('manualBridge.moveUpTitle')}: ${res.model_name}`}
                             >
                               <ArrowUp className="w-3 h-3" />
                             </button>
@@ -903,6 +913,7 @@ export const ManualBridgeView: React.FC = () => {
                               disabled={candidateOrder >= candidateIds.length - 1}
                               className="p-1 rounded bg-surface-card hover:bg-slate-700 text-slate-300 disabled:opacity-30"
                               title={t('manualBridge.moveDownTitle')}
+                              aria-label={`${t('manualBridge.moveDownTitle')}: ${res.model_name}`}
                             >
                               <ArrowDown className="w-3 h-3" />
                             </button>
@@ -946,12 +957,13 @@ export const ManualBridgeView: React.FC = () => {
               {/* Manual Bridge Permission Toggle */}
               <div className="p-3 bg-surface rounded-lg border border-surface-border text-xs font-mono flex items-center justify-between">
                 <div>
-                  <div className="font-semibold text-white">{t('manualBridge.explicitManualBridgeTitle')}</div>
+                  <label htmlFor="allow-manual-bridge" className="block font-semibold text-white">{t('manualBridge.explicitManualBridgeTitle')}</label>
                   <div className="text-[11px] text-slate-400">
                     {t('manualBridge.explicitManualBridgeDesc')}
                   </div>
                 </div>
                 <input
+                  id="allow-manual-bridge"
                   type="checkbox"
                   checked={allowManualBridge}
                   onChange={(e) => setAllowManualBridge(e.target.checked)}
@@ -1214,6 +1226,7 @@ export const ManualBridgeView: React.FC = () => {
               {handoffWorkOrder ? (
                 <div className="space-y-4">
                   <textarea
+                    aria-label={t('manualBridge.step5WorkOrderRelayTitle')}
                     readOnly
                     value={handoffWorkOrder}
                     className="w-full h-80 bg-surface border border-surface-border rounded-lg p-4 text-xs text-slate-100 font-mono focus:outline-none resize-none"
@@ -1257,13 +1270,14 @@ export const ManualBridgeView: React.FC = () => {
           <div className="bg-surface-card border border-surface-border rounded-xl p-5 shadow space-y-4 flex flex-col justify-between">
             <div className="space-y-2">
               <div className="flex items-center justify-between">
-                <label className="text-xs font-mono font-semibold text-slate-300 flex items-center space-x-2">
+                <label htmlFor="manager-protocol-input" className="text-xs font-mono font-semibold text-slate-300 flex items-center space-x-2">
                   <Shield className="w-4 h-4 text-forge-purple" />
                   <span>{t('managerInbox.pasteLabel')}</span>
                 </label>
                 <span className="text-[11px] text-slate-500 font-mono">{t('managerInbox.formatHint')}</span>
               </div>
               <textarea
+                id="manager-protocol-input"
                 value={managerInput}
                 onChange={(e) => setManagerInput(e.target.value)}
                 placeholder={t('managerInbox.placeholder')}
@@ -1434,25 +1448,27 @@ export const ManualBridgeView: React.FC = () => {
                   }
 
                   return (
-                    <div
+                    <button
+                      type="button"
                       key={sub.id}
                       onClick={() => setSelectedSubmissionId(sub.id)}
-                      className={`p-3 rounded-lg border text-xs font-mono cursor-pointer transition ${
+                      aria-pressed={isSelected}
+                      className={`block w-full text-left p-3 rounded-lg border text-xs font-mono cursor-pointer transition ${
                         isSelected
                           ? 'bg-surface border-forge-cyan shadow-sm'
                           : 'bg-surface/50 border-surface-border hover:border-slate-600'
                       }`}
                     >
-                      <div className="flex items-center justify-between mb-1">
+                      <span className="flex items-center justify-between mb-1">
                         <span className="font-bold text-slate-200">
                           {sub.id.substring(0, 8)}...
                         </span>
                         {statusBadge}
-                      </div>
-                      <div className="text-[11px] text-slate-400 mb-1">
+                      </span>
+                      <span className="block text-[11px] text-slate-400 mb-1">
                         Task: <strong className="text-forge-cyan">{sub.task_id}</strong>
-                      </div>
-                      <div className="flex items-center justify-between text-[10px]">
+                      </span>
+                      <span className="flex items-center justify-between text-[10px]">
                         <span className="text-slate-500">{new Date(sub.submitted_at).toLocaleTimeString()}</span>
                         {isFenced ? (
                           <span className="text-rose-400 font-semibold flex items-center space-x-1">
@@ -1465,8 +1481,8 @@ export const ManualBridgeView: React.FC = () => {
                             <span>{t('quarantinedQueue.integrityValid')}</span>
                           </span>
                         )}
-                      </div>
-                    </div>
+                      </span>
+                    </button>
                   );
                 })}
               </div>
@@ -1637,10 +1653,10 @@ export const ManualBridgeView: React.FC = () => {
 
                 {/* Explicit Confirmation Modal */}
                 {confirmModalAction && (
-                  <div className="p-4 bg-surface rounded-lg border border-forge-amber/60 shadow-lg space-y-3">
+                  <AccessibleDialog onDismiss={closeAdjudicationDialog} dismissible={!isAdjudicating} aria-labelledby="adjudication-confirm-title" aria-describedby="adjudication-confirm-description" className="p-4 bg-surface rounded-lg border border-forge-amber/60 shadow-lg space-y-3">
                     <div className="flex items-center space-x-2 text-forge-amber font-bold text-xs">
                       <AlertTriangle className="w-4 h-4" />
-                      <span>
+                      <span id="adjudication-confirm-title">
                         {confirmModalAction === 'ADMIT' && t('quarantinedQueue.confirmAdmitTitle')}
                         {confirmModalAction === 'REJECT' && t('quarantinedQueue.confirmRejectTitle')}
                         {confirmModalAction === 'SUPERSEDE' && t('quarantinedQueue.confirmSupersedeTitle')}
@@ -1649,7 +1665,7 @@ export const ManualBridgeView: React.FC = () => {
                       </span>
                     </div>
 
-                    <p className="text-slate-300 text-[11px]">
+                    <p id="adjudication-confirm-description" className="text-slate-300 text-[11px]">
                       {confirmModalAction === 'ADMIT' && t('quarantinedQueue.confirmAdmitMessage')}
                       {confirmModalAction === 'REJECT' && t('quarantinedQueue.confirmRejectMessage')}
                       {confirmModalAction === 'SUPERSEDE' && t('quarantinedQueue.confirmSupersedeMessage')}
@@ -1659,10 +1675,12 @@ export const ManualBridgeView: React.FC = () => {
 
                     {(confirmModalAction === 'REJECT' || confirmModalAction === 'SUPERSEDE') && (
                       <div className="space-y-1">
-                        <label className="text-[10px] text-slate-400">
+                        <label htmlFor="adjudication-reason" className="text-[10px] text-slate-400">
                           {confirmModalAction === 'REJECT' ? t('quarantinedQueue.rejectReasonLabel') : t('quarantinedQueue.supersedeReasonLabel')}
                         </label>
                         <input
+                          id="adjudication-reason"
+                          disabled={isAdjudicating}
                           type="text"
                           value={adjudicationReason}
                           onChange={(e) => setAdjudicationReason(e.target.value)}
@@ -1674,10 +1692,12 @@ export const ManualBridgeView: React.FC = () => {
 
                     {confirmModalAction === 'SUPERSEDE' && (
                       <div className="space-y-1">
-                        <label className="text-[10px] text-slate-400">
+                        <label htmlFor="adjudication-replacement" className="text-[10px] text-slate-400">
                           {t('quarantinedQueue.replacementSubmissionIdLabel')}
                         </label>
                         <input
+                          id="adjudication-replacement"
+                          disabled={isAdjudicating}
                           type="text"
                           value={replacementSubId}
                           onChange={(e) => setReplacementSubId(e.target.value)}
@@ -1689,11 +1709,9 @@ export const ManualBridgeView: React.FC = () => {
 
                     <div className="flex items-center justify-end space-x-2 pt-1">
                       <button
-                        onClick={() => {
-                          setConfirmModalAction(null);
-                          setAdjudicationReason('');
-                          setReplacementSubId('');
-                        }}
+                        type="button"
+                        data-dialog-initial-focus
+                        onClick={closeAdjudicationDialog}
                         disabled={isAdjudicating}
                         className="px-3 py-1.5 bg-surface hover:bg-surface-border text-slate-400 rounded text-xs transition"
                       >
@@ -1707,7 +1725,7 @@ export const ManualBridgeView: React.FC = () => {
                         {isAdjudicating ? t('common.loading') : t('common.confirm')}
                       </button>
                     </div>
-                  </div>
+                  </AccessibleDialog>
                 )}
               </div>
             )}
@@ -1731,8 +1749,9 @@ export const ManualBridgeView: React.FC = () => {
             </h3>
 
             <div>
-              <label className="block text-xs font-mono text-slate-400 mb-1.5">{t('manualBridge.selectTargetTaskLabel')}:</label>
+              <label htmlFor="outbox-task" className="block text-xs font-mono text-slate-400 mb-1.5">{t('manualBridge.selectTargetTaskLabel')}:</label>
               <select
+                id="outbox-task"
                 value={selectedOutboxTaskId}
                 onChange={(e) => setSelectedOutboxTaskId(e.target.value)}
                 className="w-full bg-surface border border-surface-border rounded-lg px-3 py-2 text-xs text-white focus:outline-none focus:border-forge-emerald font-mono"
@@ -1745,8 +1764,8 @@ export const ManualBridgeView: React.FC = () => {
               </select>
             </div>
 
-            <div>
-              <label className="block text-xs font-mono text-slate-400 mb-1.5">{t('manualBridge.packageTypeLabel')}:</label>
+            <fieldset>
+              <legend className="block text-xs font-mono text-slate-400 mb-1.5">{t('manualBridge.packageTypeLabel')}:</legend>
               <div className="space-y-2">
                 <label className="flex items-center space-x-2.5 p-3 rounded-lg border border-surface-border bg-surface cursor-pointer">
                   <input
@@ -1776,7 +1795,7 @@ export const ManualBridgeView: React.FC = () => {
                   </div>
                 </label>
               </div>
-            </div>
+            </fieldset>
 
             <button
               onClick={handleGenerateOutbox}
@@ -1810,6 +1829,7 @@ export const ManualBridgeView: React.FC = () => {
             </div>
 
             <textarea
+              aria-label={t('manualBridge.generatedMarkdownPackageTitle')}
               readOnly
               value={outboxContent}
               placeholder={t('manualBridge.outboxPlaceholder')}

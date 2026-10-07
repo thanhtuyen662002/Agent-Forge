@@ -69,6 +69,7 @@ export interface TranslationDictionary {
     vi: string;
   };
   header: {
+    projectSelectorLabel: string;
     tasksDone: string;
     agentsActive: string;
     startProject: string;
@@ -241,6 +242,7 @@ export interface TranslationDictionary {
     estimated: string;
   };
   timeline: {
+    filterLabel: string;
     title: string;
     subtitle: string;
     searchPlaceholder: string;

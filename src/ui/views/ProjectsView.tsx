@@ -3,6 +3,7 @@ import { useOrchestrator } from '../context/OrchestratorContext';
 import { useI18n } from '../context/I18nContext';
 import { FolderGit2, Plus, FileCode, FolderOpen } from 'lucide-react';
 import { uiActionFailureKey } from '../actionState';
+import { AccessibleDialog } from '../components/AccessibleDialog';
 
 export const ProjectsView: React.FC = () => {
   const { projects, activeProject, createProject, importContract, isElectron, pendingActions } = useOrchestrator();
@@ -119,7 +120,7 @@ export const ProjectsView: React.FC = () => {
 
       {/* Contract Editor / Importer */}
       <div className="bg-surface-card border border-surface-border rounded-xl p-6 shadow-lg space-y-4">
-        <h3 className="text-sm font-semibold text-white font-mono uppercase tracking-wider flex items-center space-x-2">
+        <h3 id="project-contract-label" className="text-sm font-semibold text-white font-mono uppercase tracking-wider flex items-center space-x-2">
           <FileCode className="w-4 h-4 text-forge-purple" />
           <span>{t('projects.importerTitle')}</span>
         </h3>
@@ -128,6 +129,7 @@ export const ProjectsView: React.FC = () => {
         </p>
 
         <textarea
+          aria-labelledby="project-contract-label"
           disabled={importing}
           value={contractJson}
           onChange={(e) => setContractJson(e.target.value)}
@@ -162,12 +164,13 @@ export const ProjectsView: React.FC = () => {
       {/* New Project Modal */}
       {isCreateOpen && (
         <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/80 backdrop-blur-sm p-4">
-          <div className="bg-surface border border-surface-border rounded-xl shadow-2xl max-w-md w-full p-6 space-y-4">
-            <h3 className="text-sm font-mono font-bold text-white uppercase tracking-wider">{t('projects.createModal.title')}</h3>
+          <AccessibleDialog onDismiss={() => setIsCreateOpen(false)} dismissible={!creating} aria-labelledby="create-project-title" className="bg-surface border border-surface-border rounded-xl shadow-2xl max-w-md w-full p-6 space-y-4">
+            <h3 id="create-project-title" className="text-sm font-mono font-bold text-white uppercase tracking-wider">{t('projects.createModal.title')}</h3>
             <form onSubmit={handleCreate} className="space-y-4 text-xs font-mono">
               <div>
-                <label className="block text-slate-400 mb-1">{t('projects.createModal.nameLabel')}:</label>
+                <label htmlFor="create-project-name" className="block text-slate-400 mb-1">{t('projects.createModal.nameLabel')}:</label>
                 <input
+                  id="create-project-name"
                   type="text"
                   required
                   value={name}
@@ -178,8 +181,9 @@ export const ProjectsView: React.FC = () => {
               </div>
 
               <div>
-                <label className="block text-slate-400 mb-1">{t('projects.createModal.descLabel')}:</label>
+                <label htmlFor="create-project-description" className="block text-slate-400 mb-1">{t('projects.createModal.descLabel')}:</label>
                 <textarea
+                  id="create-project-description"
                   value={desc}
                   onChange={(e) => setDesc(e.target.value)}
                   placeholder={t('projects.createModal.descPlaceholder')}
@@ -188,7 +192,7 @@ export const ProjectsView: React.FC = () => {
               </div>
 
               <div>
-                <label className="block text-slate-400 mb-1">{t('projects.createModal.gitRepoLabel')}:</label>
+                <label htmlFor="create-project-repository" className="block text-slate-400 mb-1">{t('projects.createModal.gitRepoLabel')}:</label>
                 <div className="space-y-2">
                   <div className="flex items-center space-x-2">
                     <button
@@ -206,6 +210,7 @@ export const ProjectsView: React.FC = () => {
                   </div>
 
                   <input
+                    id="create-project-repository"
                     type="text"
                     readOnly
                     value={displayPath}
@@ -223,6 +228,7 @@ export const ProjectsView: React.FC = () => {
 
               <div className="flex justify-end space-x-3 pt-3 border-t border-surface-border">
                 <button
+                  data-dialog-initial-focus
                   type="button"
                   onClick={() => setIsCreateOpen(false)}
                   disabled={creating}
@@ -240,7 +246,7 @@ export const ProjectsView: React.FC = () => {
                 </button>
               </div>
             </form>
-          </div>
+          </AccessibleDialog>
         </div>
       )}
     </div>
