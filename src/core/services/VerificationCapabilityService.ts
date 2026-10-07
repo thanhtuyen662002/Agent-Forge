@@ -7,7 +7,7 @@ import type { Repository } from '../database/repositories';
 import { CanonicalExecutionPayload, CanonicalExecutionPayloadSchema, computePayloadHash } from './ExecutionAuthorizationService';
 import { canonicalJsonStringify } from '../context/ContextIntegrity';
 import { PolicyService } from './PolicyService';
-import { resolveTrustedExecutable } from './ExecutableResolver';
+import { isProtectedExecutableName, resolveTrustedExecutable } from './ExecutableResolver';
 import { CommandParser } from './CommandParser';
 import {
   VerificationCapabilityError, VerificationCapabilityPayload, VerificationCapabilityPayloadSchema,
@@ -138,7 +138,9 @@ export class VerificationCapabilityService {
       // Resolve Windows bare names as real executables; never use PATHEXT
       // shell shims or an inherited arbitrary PATH for verification approval.
       const requested = process.platform === 'win32' && !path.extname(executable) ? `${executable}.exe` : executable;
-      const resolved = resolveTrustedExecutable(requested, 'generic', { allowExplicitAbsolute: true });
+      const resolved = resolveTrustedExecutable(requested, isProtectedExecutableName(requested) ?? 'generic', {
+        allowExplicitAbsolute: true, allowExplicitAbsoluteForProtected: true,
+      });
       if (!resolved) throw new VerificationCapabilityError('INVALID_VERIFICATION_CAPABILITY');
       // Installation aliases such as NVM are resolved before owner approval;
       // execution receives the physical identity displayed in that approval.

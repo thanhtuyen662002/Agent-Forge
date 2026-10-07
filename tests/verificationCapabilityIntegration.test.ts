@@ -263,6 +263,18 @@ describe('issued capability process boundary', () => {
     expect(boundary.environment).not.toHaveProperty('NODE_OPTIONS');
   });
 
+  it('resolves bare trusted Git from its standard installation and executes its approved physical identity', async () => {
+    const payload = service.propose('P', 'git', ['--version'], root);
+    const reference = await service.approve(payload, async () => true);
+    const boundary = service.createProcessBoundary(reference, 'P', payload.executable.path, payload.args, root);
+    expect(path.isAbsolute(payload.executable.path)).toBe(true);
+    expect(path.basename(payload.executable.path).toLowerCase()).toMatch(/^git(?:\.exe)?$/);
+    const result = await ProcessRunner.execute({ executable: payload.executable.path, args: payload.args, cwd: root, timeoutMs: 10000,
+      verificationBoundary: boundary });
+    expect(result).toMatchObject({ exitCode: 0, processStart: 'STARTED_PROVEN' });
+    expect(result.stdout).toMatch(/^git version /);
+  });
+
   it('revalidates revocation immediately before spawn', async () => {
     const { payload, reference, boundary } = await approve(['--version']);
     service.revoke(reference);
