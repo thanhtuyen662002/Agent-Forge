@@ -5,6 +5,7 @@ import fs from 'fs';
 import { PolicyService } from './PolicyService';
 import { Repository } from '../database/repositories';
 import { ArtifactStore } from './ArtifactStore';
+import { isIssuedVerificationProcessBoundary, VerificationProcessBoundary } from '../types/verificationCapability';
 import {
   buildTrustedEnvironment,
   isProtectedExecutableName,
@@ -66,6 +67,8 @@ export interface StructuredProcessOptions {
   executionId?: string;
   /** Run and observe the child without creating or updating durable rows. */
   deferPersistence?: boolean;
+  /** Only an issued backend capability boundary can select exact invocation/environment. */
+  verificationBoundary?: VerificationProcessBoundary;
 }
 
 interface ResolvedInvocation {
@@ -630,6 +633,11 @@ export class ProcessRunner {
     }
 
     const timeoutValidation = this.validateTimeout(options.timeoutMs);
+    const verificationBoundary = options.verificationBoundary;
+    if (verificationBoundary !== undefined &&
+      (!isIssuedVerificationProcessBoundary(verificationBoundary) || options.allowShell === true)) {
+      return this.createLaunchFailureResult(executionId, options, 'INVALID_VERIFICATION_BOUNDARY');
+    }
     if (timeoutValidation.error) {
       return this.createLaunchFailureResult(executionId, options, timeoutValidation.error);
     }
@@ -765,9 +773,9 @@ export class ProcessRunner {
     }
 
     // 3. Resolve safe platform invocation (Windows shim vs direct binary)
-    let minimalEnv = this.buildMinimalEnv(options.env, options.allowedEnvKeys);
+    let minimalEnv = verificationBoundary ? { ...verificationBoundary.environment } : this.buildMinimalEnv(options.env, options.allowedEnvKeys);
     const protectedKind = isProtectedExecutableName(options.executable);
-    if (protectedKind) {
+    if (protectedKind && !verificationBoundary) {
       // Protected tools receive a filtered PATH even when a caller explicitly
       // supplied PATH for an ordinary provider command. Credentials and other
       // explicitly allowlisted non-PATH values remain available.
@@ -778,14 +786,16 @@ export class ProcessRunner {
         preserveAllowedPathOverride: false,
       });
     }
-    if (process.platform === 'win32') {
+    if (process.platform === 'win32' && !verificationBoundary) {
       const trustedCmd = this.resolveTrustedCmdExe();
       if (trustedCmd) {
         minimalEnv.COMSPEC = trustedCmd;
         minimalEnv.ComSpec = trustedCmd;
       }
     }
-    const invocation = this.resolvePlatformInvocation(options.executable, options.args, minimalEnv);
+    const invocation: ResolvedInvocation = verificationBoundary
+      ? { executable: options.executable, args: [...options.args], windowsVerbatimArguments: false }
+      : this.resolvePlatformInvocation(options.executable, options.args, minimalEnv);
 
     if (invocation.error) {
       if (shouldPersist) {
@@ -869,6 +879,7 @@ export class ProcessRunner {
       // terminalize (or fence) that row before resolving/rejecting this call.
       let child: ChildProcess;
       try {
+        verificationBoundary?.assertInvocation(invocation.executable, invocation.args, options.cwd);
         child = spawn(invocation.executable, invocation.args, {
           cwd: options.cwd,
           shell: options.allowShell ?? false,

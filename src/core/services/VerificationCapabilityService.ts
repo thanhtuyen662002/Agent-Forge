@@ -11,6 +11,7 @@ import {
   VerificationCapabilityError, VerificationCapabilityPayload, VerificationCapabilityPayloadSchema,
   VerificationCapabilityRecord, VerificationCapabilityReference, VerificationCapabilityReferenceSchema,
   VerificationFileBindingSchema,
+  issueVerificationProcessBoundary, VerificationProcessBoundary,
 } from '../types/verificationCapability';
 
 const sha256 = (value: string | Buffer) => crypto.createHash('sha256').update(value).digest('hex');
@@ -191,6 +192,35 @@ export class VerificationCapabilityService {
     const result = this.repo.getDatabase().prepare(`UPDATE verification_capabilities SET state='REVOKED', version=version+1, revoked_at=?
       WHERE id=? AND owner_principal=? AND version=? AND state='ACTIVE'`).run(new Date().toISOString(), ref.id, ref.owner_principal, ref.version);
     if (result.changes !== 1) throw new VerificationCapabilityError('CAPABILITY_VERSION_MISMATCH');
+  }
+
+  public createProcessBoundary(reference: VerificationCapabilityReference, projectId: string, executable: string,
+    args: string[], runtimeRoot: string, authorizedWorktree?: string): VerificationProcessBoundary {
+    const captured = VerificationCapabilityReferenceSchema.parse(JSON.parse(JSON.stringify(reference)));
+    const capturedArgs = [...args];
+    const root = canonicalPath(runtimeRoot, true).path;
+    this.validate(captured, projectId, executable, capturedArgs, root, authorizedWorktree);
+    // Windows process creation fills an omitted USERPROFILE from the host.
+    // Explicit empty values prevent ambient profile/config inheritance.
+    const environment: Record<string, string> = {
+      LANG: 'C.UTF-8', LC_ALL: 'C.UTF-8',
+      USERPROFILE: '', HOME: '', APPDATA: '', LOCALAPPDATA: '',
+    };
+    const temp = fs.realpathSync.native(os.tmpdir());
+    environment.TEMP = temp;
+    environment.TMP = temp;
+    if (process.platform === 'win32') {
+      const systemRoot = fs.realpathSync.native(process.env.SystemRoot ?? 'C:\\Windows');
+      environment.SystemRoot = systemRoot;
+      environment.WINDIR = systemRoot;
+      environment.PATH = path.join(systemRoot, 'System32');
+    } else {
+      environment.PATH = '/usr/bin:/bin';
+    }
+    return issueVerificationProcessBoundary(environment, (actualExecutable, actualArgs, cwd) => {
+      if (!samePath(cwd, root)) throw new VerificationCapabilityError('CAPABILITY_BINDING_MISMATCH');
+      this.validate(captured, projectId, actualExecutable, actualArgs, cwd, authorizedWorktree);
+    });
   }
 
   private assertPayloadFiles(payload: VerificationCapabilityPayload, runtimeRoot: string, original: boolean): void {
