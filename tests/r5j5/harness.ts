@@ -1,5 +1,6 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import Database from 'better-sqlite3';
+import { approveFixtureCommand } from '../helpers/verificationCapabilityFixture';
 import path from 'path';
 import fs from 'fs';
 import os from 'os';
@@ -153,10 +154,14 @@ export function createTestDatabase(dir: string, name: string): { db: Database.Da
   return { db, dbPath };
 }
 
-export function setupFullSubmissionGraph(db: Database.Database, projectRepoPath?: string, artifactsPath?: string): FullAdjudicationFixtures {
+export async function setupFullSubmissionGraph(db: Database.Database, projectRepoPath?: string, artifactsPath?: string): Promise<FullAdjudicationFixtures> {
+  // Runnable fixtures use current owner authority; historical schema tests
+  // still construct migration23 databases independently.
+  MigrationRunner.run(db);
   const repo = new Repository(db);
   const eventService = new EventService(repo);
   const resolvedRepoPath = projectRepoPath ?? path.resolve(__dirname, '../..');
+  fs.mkdirSync(path.join(resolvedRepoPath, 'temp-artifacts'), { recursive: true });
   const resolvedArtifactsPath = artifactsPath ?? path.join(path.dirname(resolvedRepoPath), 'temp-artifacts');
   const artifactStore = new ArtifactStore(resolvedArtifactsPath);
   const verificationService = new VerificationService(repo, artifactStore);
@@ -361,6 +366,7 @@ export function setupFullSubmissionGraph(db: Database.Database, projectRepoPath?
   const canonicalInstructionsJson = JSON.stringify(instructions);
   const contextFiles = ['src/core/services/CoderSubmissionAdjudicationService.ts'];
   const contextFilesJson = JSON.stringify(contextFiles);
+  const verificationCommand = { ...await approveFixtureCommand(repo, projectId, ['-v']), timeout_ms: 120000 };
   const canonicalPayload = {
     projectId,
     taskId,
@@ -372,7 +378,7 @@ export function setupFullSubmissionGraph(db: Database.Database, projectRepoPath?
     instructions,
     contextFiles,
     verificationCommands: {
-      TEST: { executable: process.execPath, args: ['-v'], timeout_ms: 120000 },
+      TEST: verificationCommand,
       LINT: null,
       BUILD: null,
     },
@@ -445,7 +451,7 @@ export function setupFullSubmissionGraph(db: Database.Database, projectRepoPath?
     quarantineDir: resolvedArtifactsPath,
     authSnapshot: {
       verification_commands: {
-        TEST: { executable: process.execPath, args: ['-v'], timeout_ms: 120000 },
+        TEST: verificationCommand,
         LINT: null,
         BUILD: null,
       },

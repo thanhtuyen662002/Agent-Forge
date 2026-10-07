@@ -1,4 +1,5 @@
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
+import { approveFixtureCommand } from './helpers/verificationCapabilityFixture';
 import Database from 'better-sqlite3';
 import path from 'path';
 import fs from 'fs';
@@ -110,8 +111,7 @@ describe('Real End-to-End Orchestration Integration Lifecycle', () => {
       project_id: project.id,
       name: 'E2E Test Runner',
       command_type: 'TEST',
-      executable: 'node',
-      args: [path.join(gitRepoDir, 'run_tests.js')],
+      ...await approveFixtureCommand(repo, project.id, [path.join(gitRepoDir, 'run_tests.js')]),
       timeout_ms: 30000,
       enabled: true,
     });
@@ -312,7 +312,7 @@ describe('Real End-to-End Orchestration Integration Lifecycle', () => {
     repo.createTask(task);
 
     // Configure test command pointing to safe script
-    const safeScript = path.join(tmpDataDir, 'always_pass.js');
+    const safeScript = path.join(nonGitDir, 'always_pass.js');
     fs.writeFileSync(safeScript, 'process.exit(0);', 'utf8');
 
     const testCmdId = 'cmd-pass-1';
@@ -321,8 +321,7 @@ describe('Real End-to-End Orchestration Integration Lifecycle', () => {
       project_id: project.id,
       name: 'Always Pass Test',
       command_type: 'TEST',
-      executable: 'node',
-      args: [safeScript],
+      ...await approveFixtureCommand(repo, project.id, [safeScript]),
       timeout_ms: 10000,
       enabled: true,
     });

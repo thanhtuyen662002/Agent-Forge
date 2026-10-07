@@ -3,6 +3,7 @@ import Database from 'better-sqlite3';
 import path from 'path';
 import fs from 'fs';
 import os from 'os';
+import { approveFixtureCommand } from '../helpers/verificationCapabilityFixture';
 import crypto from 'crypto';
 import child_process from 'child_process';
 import {
@@ -105,7 +106,7 @@ describe('R5J5 Quarantined Submission Adjudication and Verification Suite', () =
   let dbPath: string;
   let fixtures: FullAdjudicationFixtures;
 
-  beforeEach(() => {
+  beforeEach(async () => {
     tempDir = path.join(os.tmpdir(), 'af-adj-test-' + Date.now() + '-' + crypto.randomUUID().slice(0, 8));
     fs.mkdirSync(tempDir, { recursive: true });
 
@@ -125,7 +126,7 @@ describe('R5J5 Quarantined Submission Adjudication and Verification Suite', () =
     const created = createTestDatabase(tempDir, 'adjudication-test.db');
     db = created.db;
     dbPath = created.dbPath;
-    fixtures = setupFullSubmissionGraph(db, repoDir, artifactsDir);
+    fixtures = await setupFullSubmissionGraph(db, repoDir, artifactsDir);
   }, 120000);
 
   afterEach(() => {
@@ -284,17 +285,15 @@ describe('R5J5 Quarantined Submission Adjudication and Verification Suite', () =
       fixtures.mcpService.submitCoderClaim(createValidSubmissionPayload(fixtures, subId), plaintextToken);
 
       // Configure a failing verification command (node fail_test.js)
-      const failScript = path.join(os.tmpdir(), 'fail_test_' + crypto.randomUUID() + '.js');
+      const scriptDirectory = path.join(fixtures.projectRoot, 'temp-artifacts');
+      fs.mkdirSync(scriptDirectory, { recursive: true });
+      const failScript = path.join(scriptDirectory, 'fail_test_' + crypto.randomUUID() + '.js');
       fs.writeFileSync(failScript, 'process.exit(1);');
 
       try {
         const auth = fixtures.repo.getExecutionAuthorization(fixtures.authorizationId)!;
         const payload = JSON.parse(auth.canonical_payload_json!);
-        payload.verificationCommands.TEST = {
-          executable: process.execPath,
-          args: [failScript],
-          timeout_ms: 120000,
-        };
+        payload.verificationCommands.TEST = { ...await approveFixtureCommand(fixtures.repo, fixtures.projectId, [failScript]), timeout_ms: 120000 };
         const newHash = computePayloadHash(payload);
         const newJson = JSON.stringify(payload);
         db.prepare('UPDATE execution_authorizations SET canonical_payload_json = ?, instruction_payload_hash = ? WHERE id = ?')
@@ -314,31 +313,28 @@ describe('R5J5 Quarantined Submission Adjudication and Verification Suite', () =
       }
     });
 
-    it('79. Process start failure (invalid executable) transitions to VERIFICATION_FAILED with PROCESS_START_FAILED', async () => {
+    it('79. Process start failure after capability admission transitions to VERIFICATION_FAILED with PROCESS_START_FAILED', async () => {
       const { plaintextToken } = issueSubmissionSessionHelper(fixtures.repo, fixtures.authorizationId);
       const subId = crypto.randomUUID();
       fixtures.mcpService.submitCoderClaim(createValidSubmissionPayload(fixtures, subId), plaintextToken);
 
-      // Configure non-existent executable
-      const auth = fixtures.repo.getExecutionAuthorization(fixtures.authorizationId)!;
-      const payload = JSON.parse(auth.canonical_payload_json!);
-      payload.verificationCommands.TEST = {
-        executable: 'non-existent-executable-12345',
-        args: [],
-        timeout_ms: 120000,
-      };
-      const newHash = computePayloadHash(payload);
-      const newJson = JSON.stringify(payload);
-      db.prepare('UPDATE execution_authorizations SET canonical_payload_json = ?, instruction_payload_hash = ? WHERE id = ?')
-        .run(newJson, newHash, fixtures.authorizationId);
-
-      const res = await fixtures.adjudicationService.admitSubmissionForVerification({
-        requestId: crypto.randomUUID(),
-        submissionId: subId,
+      // Launch failure is distinct from an unapproved command, which must be
+      // rejected before admission. Preserve the live fixture capability.
+      const originalExecute = ProcessRunner.execute.bind(ProcessRunner);
+      const execute = vi.spyOn(ProcessRunner, 'execute').mockImplementation(async (options) => {
+        if (!options.verificationBoundary) return originalExecute(options);
+        return { executionId: options.executionId ?? crypto.randomUUID(), pid: null,
+          command: `${options.executable} ${options.args.join(' ')}`, cwd: options.cwd,
+          exitCode: -1, stdout: '', stderr: 'Injected executable launch failure', durationMs: 0,
+          processStart: 'NOT_STARTED_PROVEN', processTermination: 'NOT_APPLICABLE',
+          timedOut: false, cancelled: false, errorCode: 'PROCESS_LAUNCH_FAILED' };
       });
-
-      expect(res.adjudication.status).toBe('VERIFICATION_FAILED');
-      expect(res.adjudication.failure_code).toBe('PROCESS_START_FAILED');
+      try {
+        const res = await fixtures.adjudicationService.admitSubmissionForVerification({ requestId: crypto.randomUUID(), submissionId: subId });
+        expect(execute.mock.calls.filter(([options]) => options.verificationBoundary)).toHaveLength(1);
+        expect(res.adjudication.status).toBe('VERIFICATION_FAILED');
+        expect(res.adjudication.failure_code).toBe('PROCESS_START_FAILED');
+      } finally { execute.mockRestore(); }
     });
 
     it('80. Ambiguous start (process spawned but unrecorded outcome) transitions to RECOVERY_FENCED', () => {
@@ -389,7 +385,7 @@ describe('R5J5 Quarantined Submission Adjudication and Verification Suite', () =
       });
 
       const frozenCmds = JSON.parse(res.adjudication.verification_commands_json!);
-      expect(frozenCmds.TEST.executable).toBe(process.execPath);
+      expect(frozenCmds.TEST.executable).toBe(fs.realpathSync.native(process.execPath));
       expect(frozenCmds.TEST.args).toEqual(['-v']);
     });
 
@@ -416,7 +412,7 @@ describe('R5J5 Quarantined Submission Adjudication and Verification Suite', () =
       });
 
       const cmds = JSON.parse(res.adjudication.verification_commands_json!);
-      expect(cmds.TEST.executable).toBe(process.execPath);
+      expect(cmds.TEST.executable).toBe(fs.realpathSync.native(process.execPath));
     });
 
     it('83. Pre-execution workspace snapshot records branch, head sha, and clean status', async () => {

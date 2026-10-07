@@ -5,6 +5,7 @@ import {
 } from '../database/repositories';
 import { EventService } from './EventService';
 import { VerificationService } from './VerificationService';
+import { VerificationCapabilityService } from './VerificationCapabilityService';
 import { ArtifactStore } from './ArtifactStore';
 import { GitService } from './GitService';
 import { ProgressService } from './ProgressService';
@@ -909,6 +910,12 @@ export class TaskService {
       throw new Error('VerificationService not wired into TaskService.');
     }
 
+    // Capture the same configured grant the synchronous verification entry
+    // reads. Replacing it while Git/tests await must not approve an old result.
+    const verificationConfig = commandConfigId
+      ? this.repo.getVerificationCommandById(commandConfigId)
+      : this.repo.getVerificationCommandsByProject(project.id).find((command) => command.command_type === 'TEST' && command.enabled);
+    const verificationSnapshot = verificationConfig ? JSON.parse(JSON.stringify(verificationConfig)) as typeof verificationConfig : null;
     const testRun = await this.verificationService.runTests(
       project.id,
       task.id,
@@ -968,7 +975,8 @@ export class TaskService {
       finalHeadShaRes.status === 'SUCCESS' &&
       !workspaceHeadDrifted;
 
-    const verificationPassed = gitEvidenceSuccess && testRun.exit_code === 0;
+    let verificationPassed = gitEvidenceSuccess && testRun.exit_code === 0;
+    let verificationPolicyRejected = false;
 
     const cleanupPendingEvidence = () => {
       const filePaths = pendingEvidence
@@ -1025,6 +1033,23 @@ export class TaskService {
               task.id,
             );
             return { stale: true, success: false, task: currentTask, nextState: currentTask.state };
+          }
+
+          // The task fence and the capability fence settle together. Keep the
+          // observed child exit intact even when its grant is withdrawn.
+          if (testRun.exit_code === 0) {
+            try {
+              if (!verificationSnapshot || verificationSnapshot.project_id !== project.id ||
+                  !verificationSnapshot.enabled || verificationSnapshot.command_type !== 'TEST' ||
+                  testRun.command !== `${verificationSnapshot.executable} ${verificationSnapshot.args.join(' ')}`) {
+                throw new Error('COMMAND_POLICY_REJECTED');
+              }
+              new VerificationCapabilityService(this.repo).validate(verificationSnapshot.capability!, project.id,
+                verificationSnapshot.executable, verificationSnapshot.args, repoPath);
+            } catch {
+              verificationPolicyRejected = true;
+              verificationPassed = false;
+            }
           }
 
           const trigger = verificationPassed ? 'EVIDENCE_GATHERED' : 'TESTS_FAILED';
@@ -1088,7 +1113,7 @@ export class TaskService {
           const progress = ProgressService.calculateTaskProgress(finalTask, {
             hasGitDiff: gitDiff.status === 'SUCCESS' && gitDiff.filesChanged.length > 0,
             hasEvidence: gitEvidenceSuccess && (gitDiff.filesChanged.length > 0 || gitStatus.isClean),
-            testsPassed: testRun.exit_code === 0,
+            testsPassed: testRun.exit_code === 0 && !verificationPolicyRejected,
             excludeUnconfiguredLint: !hasLintConfig,
             lintPassed: false,
           });
@@ -1105,6 +1130,8 @@ export class TaskService {
           } else {
             const failureReason = !gitEvidenceSuccess
               ? `Authoritative Git evidence failed (Status: ${gitStatus.status}, Diff: ${gitDiff.status}, initial SHA: ${headShaRes.status}, final SHA: ${finalHeadShaRes.status}).`
+              : verificationPolicyRejected
+              ? 'COMMAND_POLICY_REJECTED: The captured verification capability is no longer valid.'
               : `Verification tests failed (exit code ${testRun.exit_code}, ${testRun.failed_count} failures).`;
             this.eventService.record(
               project.id,
@@ -1116,6 +1143,7 @@ export class TaskService {
                 gitDiff: gitDiff.status,
                 testExitCode: testRun.exit_code,
                 failedCount: testRun.failed_count,
+                ...(verificationPolicyRejected ? { failureCode: 'COMMAND_POLICY_REJECTED' } : {}),
               },
               task.id,
             );
@@ -1157,6 +1185,8 @@ export class TaskService {
       error: !commitResult.success
         ? !gitEvidenceSuccess
           ? 'Git evidence collection failed.'
+          : verificationPolicyRejected
+          ? 'COMMAND_POLICY_REJECTED'
           : 'Verification tests failed.'
         : undefined,
     };

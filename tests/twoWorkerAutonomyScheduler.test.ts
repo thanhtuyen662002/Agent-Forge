@@ -4,6 +4,7 @@ import os from 'os';
 import path from 'path';
 import Database from 'better-sqlite3';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import { approveFixtureCommand } from './helpers/verificationCapabilityFixture';
 import { MigrationRunner } from '../src/core/database/migrations';
 import { Repository } from '../src/core/database/repositories';
 import { AutonomyStore } from '../src/core/autonomy/store';
@@ -781,7 +782,7 @@ describe('Two-Worker Autonomy Scheduler (TSK-TWO-WORKER-ENABLEMENT)', () => {
       }
     }
 
-    function seedAuthorizedProductTask(options: SeedAuthOptions = {}) {
+    async function seedAuthorizedProductTask(options: SeedAuthOptions = {}) {
       const now = new Date().toISOString();
       const projectId = 'proj-auth-scope';
       const taskId = options.taskId ?? 'task-auth-scope-nonconv';
@@ -864,7 +865,7 @@ describe('Two-Worker Autonomy Scheduler (TSK-TWO-WORKER-ENABLEMENT)', () => {
         instructions: ['implement authorized scope'],
         contextFiles: [],
         verificationCommands: {
-          TEST: { executable: process.execPath, args: ['--version'] },
+          TEST: { ...await approveFixtureCommand(repo, projectId, ['--version']), timeout_ms: 120000 },
           LINT: null,
           BUILD: null,
         },
@@ -927,7 +928,7 @@ describe('Two-Worker Autonomy Scheduler (TSK-TWO-WORKER-ENABLEMENT)', () => {
     it('dispatches product task with deliberately nonconventional authorized branch and worktree using product lease and zero legacy rows', async () => {
       const nonconventionalBranch = 'feature/deliberately-nonconventional-branch-xyz';
       const nonconventionalWorktree = path.join(root, 'nonconventional-worktree-dir');
-      const fixture = seedAuthorizedProductTask({
+      const fixture = await seedAuthorizedProductTask({
         branch: nonconventionalBranch,
         worktree: nonconventionalWorktree,
         allowedPaths: ['src'],
@@ -1106,7 +1107,7 @@ describe('Two-Worker Autonomy Scheduler (TSK-TWO-WORKER-ENABLEMENT)', () => {
 
       // Case B: Stale task revision
       coderCalled = false;
-      const fixRev = seedAuthorizedProductTask({ taskId: 'task-stale-rev', taskRevision: 0 });
+      const fixRev = await seedAuthorizedProductTask({ taskId: 'task-stale-rev', taskRevision: 0 });
       db.prepare('UPDATE tasks SET revision_count = 1 WHERE id = ?').run(fixRev.taskId);
       store.enqueue(makeSelfHostTask(fixRev.taskId));
       await queue.step();
@@ -1121,7 +1122,7 @@ describe('Two-Worker Autonomy Scheduler (TSK-TWO-WORKER-ENABLEMENT)', () => {
 
       // Case C: Stale ownership epoch
       coderCalled = false;
-      const fixEpoch = seedAuthorizedProductTask({ taskId: 'task-stale-epoch', taskOwnershipEpoch: 1 });
+      const fixEpoch = await seedAuthorizedProductTask({ taskId: 'task-stale-epoch', taskOwnershipEpoch: 1 });
       db.prepare('UPDATE tasks SET ownership_epoch = 2 WHERE id = ?').run(fixEpoch.taskId);
       store.enqueue(makeSelfHostTask(fixEpoch.taskId));
       await queue.step();
@@ -1136,7 +1137,7 @@ describe('Two-Worker Autonomy Scheduler (TSK-TWO-WORKER-ENABLEMENT)', () => {
 
       // Case D: Base SHA mismatch
       coderCalled = false;
-      const fixSha = seedAuthorizedProductTask({ taskId: 'task-mismatch-sha', baseSha: '1'.repeat(40) });
+      const fixSha = await seedAuthorizedProductTask({ taskId: 'task-mismatch-sha', baseSha: '1'.repeat(40) });
       db.prepare('UPDATE tasks SET base_sha = ? WHERE id = ?').run('2'.repeat(40), fixSha.taskId);
       store.enqueue(makeSelfHostTask(fixSha.taskId));
       await queue.step();

@@ -105,7 +105,7 @@ describe('R5J5 Quarantined Submission Adjudication and Verification Suite', () =
   let dbPath: string;
   let fixtures: FullAdjudicationFixtures;
 
-  beforeEach(() => {
+  beforeEach(async () => {
     tempDir = path.join(os.tmpdir(), 'af-adj-test-' + Date.now() + '-' + crypto.randomUUID().slice(0, 8));
     fs.mkdirSync(tempDir, { recursive: true });
 
@@ -125,7 +125,7 @@ describe('R5J5 Quarantined Submission Adjudication and Verification Suite', () =
     const created = createTestDatabase(tempDir, 'adjudication-test.db');
     db = created.db;
     dbPath = created.dbPath;
-    fixtures = setupFullSubmissionGraph(db, repoDir, artifactsDir);
+    fixtures = await setupFullSubmissionGraph(db, repoDir, artifactsDir);
   }, 120000);
 
   afterEach(() => {
@@ -719,7 +719,7 @@ describe('R5J5 Quarantined Submission Adjudication and Verification Suite', () =
     });
 
     it('141. mutable command configuration cannot alter execution', async () => {
-      const originalCommands = { TEST: { executable: process.execPath, args: ['-v'] } };
+      const originalCommands = JSON.parse(fixtures.repo.getExecutionAuthorization(fixtures.authorizationId)!.canonical_payload_json!).verificationCommands;
       const frozenJson = canonicalJsonStringify(originalCommands);
       const frozenHash = computeSha256(frozenJson);
 
@@ -794,7 +794,7 @@ describe('R5J5 Quarantined Submission Adjudication and Verification Suite', () =
       expect(resOver.outcome).toBe('COMMAND_POLICY_REJECTED');
     });
 
-    it('143. synchronous pre-spawn failure classified exactly', async () => {
+    it('143. unapproved nonexistent executable is rejected before process start', async () => {
       const badCommands = { TEST: { executable: 'invalid_nonexistent_executable_12345', args: [] } };
       const frozenJson = canonicalJsonStringify(badCommands);
       const frozenHash = computeSha256(frozenJson);
@@ -822,7 +822,8 @@ describe('R5J5 Quarantined Submission Adjudication and Verification Suite', () =
       };
 
       const result = await fixtures.verificationService.executeSealedVerification(input);
-      expect(result.outcome).toBe('PROCESS_START_FAILED');
+      expect(result.outcome).toBe('COMMAND_POLICY_REJECTED');
+      expect(result.process_start).toBe('NOT_STARTED_PROVEN');
     });
 
     it('144. ambiguous process start becomes recovery-fenced', () => {

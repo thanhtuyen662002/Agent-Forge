@@ -4,6 +4,7 @@ import os from 'os';
 import { execFileSync } from 'child_process';
 import Database from 'better-sqlite3';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { approveFixtureCommand } from './helpers/verificationCapabilityFixture';
 import { MigrationRunner } from '../src/core/database/migrations';
 import { Repository } from '../src/core/database/repositories';
 import { AutonomyStore } from '../src/core/autonomy/store';
@@ -1172,7 +1173,8 @@ describe('OmniRoute Coder Transport & Structured Edits', () => {
         includeLatestHandoff: false,
       });
 
-      const testCommand = renderCommand({ executable: 'npm', args: ['test'] });
+      const verificationCommand = await approveFixtureCommand(repo, 'PROJ-OMNI', ['--version']);
+      const testCommand = renderCommand(verificationCommand);
       const canonicalPayload: CanonicalExecutionPayload = {
         projectId: 'PROJ-OMNI',
         taskId: 'TSK-OMNI-FAIL',
@@ -1184,7 +1186,7 @@ describe('OmniRoute Coder Transport & Structured Edits', () => {
         instructions: ['Implement'],
         contextFiles: [],
         verificationCommands: {
-          TEST: { executable: 'npm', args: ['test'] },
+          TEST: { ...verificationCommand, timeout_ms: 120000 },
           LINT: null,
           BUILD: null,
         },
@@ -1860,6 +1862,7 @@ describe('OmniRoute Coder Transport & Structured Edits', () => {
         includeLatestHandoff: false,
       });
 
+      const verificationCommand = await approveFixtureCommand(repo, 'PROJ-AGY', ['--version']);
       const canonicalPayload: CanonicalExecutionPayload = {
         projectId: 'PROJ-AGY',
         taskId: 'TSK-AGY-SELECT',
@@ -1871,7 +1874,7 @@ describe('OmniRoute Coder Transport & Structured Edits', () => {
         instructions: ['Implement'],
         contextFiles: [],
         verificationCommands: {
-          TEST: { executable: 'npm', args: ['test'] },
+          TEST: { ...verificationCommand, timeout_ms: 120000 },
           LINT: null,
           BUILD: null,
         },
@@ -2134,7 +2137,8 @@ describe('OmniRoute Coder Transport & Structured Edits', () => {
         includeLatestHandoff: false,
       });
 
-      const testCommand = renderCommand({ executable: process.execPath, args: ['--version'] });
+      const verificationCommand = await approveFixtureCommand(repo, 'PROJ-PROD-AGY', ['--version']);
+      const testCommand = renderCommand(verificationCommand);
       const canonicalPayload: CanonicalExecutionPayload = {
         projectId: 'PROJ-PROD-AGY',
         taskId: 'TSK-PROD-AGY-1',
@@ -2146,7 +2150,7 @@ describe('OmniRoute Coder Transport & Structured Edits', () => {
         instructions: ['Implement'],
         contextFiles: [],
         verificationCommands: {
-          TEST: { executable: process.execPath, args: ['--version'] },
+          TEST: { ...verificationCommand, timeout_ms: 120000 },
           LINT: null,
           BUILD: null,
         },

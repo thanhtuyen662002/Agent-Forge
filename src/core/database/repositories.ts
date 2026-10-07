@@ -7972,7 +7972,6 @@ export class Repository {
       const effectiveConstraints = [...(task.constraints ?? []), ...(managerData.constraints ?? [])];
       const durableVerifCommands = this.getVerificationCommandsByProject(project.id);
       const verificationSnapshot = buildVerificationCommandsSnapshot(durableVerifCommands);
-      new VerificationCapabilityService(this).validateSnapshot(project.id, verificationSnapshot, project.repository_path);
 
       const canonicalPayload = computeCanonicalPayload({
         projectId: task.project_id,
@@ -8098,15 +8097,22 @@ export class Repository {
               };
             }
             if (policyRes.decision === 'REQUIRES_OWNER_APPROVAL') {
-              return {
-                success: false,
-                transfer,
-                errorCode: 'NEEDS_OWNER',
-                error: `Verification command "${cmd.name}" requires owner approval: ${policyRes.reason}`,
-              };
+              try {
+                new VerificationCapabilityService(this).validate(cmd.capability, project.id, cmd.executable, cmd.args, project.repository_path);
+              } catch {
+                return { success: false, transfer, errorCode: 'NEEDS_OWNER',
+                  error: 'OWNER_APPROVAL_REQUIRED: Verification capability is missing, stale or revoked.' };
+              }
             }
           }
         }
+      }
+
+      try {
+        new VerificationCapabilityService(this).validateSnapshot(project.id, verificationSnapshot, project.repository_path);
+      } catch {
+        return { success: false, transfer, errorCode: 'NEEDS_OWNER',
+          error: 'OWNER_APPROVAL_REQUIRED: Verification capabilities are missing, stale or revoked.' };
       }
 
       // Recompute deterministic authorization ID

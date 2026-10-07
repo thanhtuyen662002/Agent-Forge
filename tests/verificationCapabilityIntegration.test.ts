@@ -17,6 +17,9 @@ import { computeSha256 } from '../src/mcp/submissionProtocol';
 import { EvidenceCollector } from '../src/core/autonomy/evidence';
 import { ProductTaskAutonomyAdapter, renderCommand } from '../src/core/autonomy/productTaskAdapter';
 import { WorkOrderSchema } from '../src/core/autonomy/contracts';
+import { TaskService } from '../src/core/services/TaskService';
+import { EventService } from '../src/core/services/EventService';
+import { GitService } from '../src/core/services/GitService';
 
 describe('issued capability process boundary', () => {
   let root: string;
@@ -111,6 +114,34 @@ describe('issued capability process boundary', () => {
       .toMatchObject({ outcome: 'COMMAND_POLICY_REJECTED', process_start: 'NOT_STARTED_PROVEN' });
     new VerificationCapabilityService(repo).revoke(command.capability);
     expect(await verification.executeSealedVerification(original)).toMatchObject({ outcome: 'COMMAND_POLICY_REJECTED', process_start: 'NOT_STARTED_PROVEN' });
+  });
+
+  it.each(['active', 'revoked'] as const)('settles manual validation with the captured %s grant after the final Git await', async (state) => {
+    const { command, verification } = await configured();
+    // Isolate only Git observations; verification uses the real child runner.
+    vi.spyOn(GitService, 'getStatus').mockResolvedValue({ status: 'SUCCESS', branch: 'main', isClean: true,
+      modifiedFiles: [], untrackedFiles: [], aheadCount: 0, behindCount: 0 });
+    vi.spyOn(GitService, 'getDiff').mockResolvedValue({ status: 'SUCCESS', diffStat: '', diffContent: '',
+      filesChanged: [], insertions: 0, deletions: 0 });
+    let headReads = 0;
+    vi.spyOn(GitService, 'getHeadSha').mockImplementation(async () => {
+      if (++headReads === 2 && state === 'revoked') new VerificationCapabilityService(repo).revoke(command.capability);
+      return { status: 'SUCCESS', sha: 'a'.repeat(40) };
+    });
+    const tasks = new TaskService(repo, new EventService(repo), verification, verification.getArtifactStore());
+    const result = await tasks.executeValidationFlow('T');
+    expect(result.testRun?.exit_code).toBe(0);
+    expect(repo.getLatestTestRun('T')?.exit_code).toBe(0);
+    expect(repo.getProcessRunsByTask('T')[0]).toMatchObject({ status: 'COMPLETED', exit_code: 0 });
+    if (state === 'active') {
+      expect(result).toMatchObject({ success: true, finalTaskState: 'REVIEW_READY' });
+    } else {
+      expect(result).toMatchObject({ success: false, error: 'COMMAND_POLICY_REJECTED' });
+      expect(repo.getTask('T')?.state).not.toBe('REVIEW_READY');
+      const events = repo.getEvents('P', 100);
+      expect(events.some((event) => event.type === 'VERIFICATION_PASSED')).toBe(false);
+      expect(events.find((event) => event.type === 'VERIFICATION_FAILED')?.structured_payload).toMatchObject({ failureCode: 'COMMAND_POLICY_REJECTED' });
+    }
   });
 
   it('refuses unapproved configured interpreters and sealed snapshots without durable authorization', async () => {

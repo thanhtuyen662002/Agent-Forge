@@ -1240,11 +1240,6 @@ export class ExecutionAuthorizationService {
 
     // 9. Owner Policy evaluation on verification commands
     const durableVerifCommands = this.repo.getVerificationCommandsByProject(project.id);
-    try {
-      new VerificationCapabilityService(this.repo).validateSnapshot(project.id, buildVerificationCommandsSnapshot(durableVerifCommands), project.repository_path);
-    } catch {
-      return { success: false, errorCode: 'NEEDS_OWNER', error: 'OWNER_APPROVAL_REQUIRED: Verification capabilities are missing, stale or revoked.' };
-    }
     for (const cmd of durableVerifCommands) {
       if (cmd.enabled === undefined || cmd.enabled) {
         if (cmd.executable && cmd.executable.trim().length > 0) {
@@ -1256,8 +1251,21 @@ export class ExecutionAuthorizationService {
               error: `POLICY_DENIED: Verification command "${cmd.name}" (${cmd.executable}) denied by policy: ${policyRes.reason}`,
             };
           }
+          if (policyRes.decision === 'REQUIRES_OWNER_APPROVAL') {
+            try {
+              new VerificationCapabilityService(this.repo).validate(cmd.capability, project.id, cmd.executable, cmd.args, project.repository_path);
+            } catch {
+              return { success: false, errorCode: 'NEEDS_OWNER', error: 'OWNER_APPROVAL_REQUIRED: Verification capability is missing, stale or revoked.' };
+            }
+          }
         }
       }
+    }
+
+    try {
+      new VerificationCapabilityService(this.repo).validateSnapshot(project.id, buildVerificationCommandsSnapshot(durableVerifCommands), project.repository_path);
+    } catch {
+      return { success: false, errorCode: 'NEEDS_OWNER', error: 'OWNER_APPROVAL_REQUIRED: Verification capabilities are missing, stale or revoked.' };
     }
 
     // 10. Git HEAD resolution
