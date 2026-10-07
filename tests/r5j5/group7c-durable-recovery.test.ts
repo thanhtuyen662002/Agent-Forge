@@ -1011,8 +1011,8 @@ describe('R5J5 Quarantined Submission Adjudication and Verification Suite', () =
       const subId = crypto.randomUUID();
       fixtures.mcpService.submitCoderClaim(createValidSubmissionPayload(fixtures, subId), plaintextToken);
 
-      const origRunInTx = fixtures.repo.runInTransaction.bind(fixtures.repo);
-      fixtures.repo.runInTransaction = function <T>(fn: () => T): T {
+      const origRunInTx = fixtures.repo.runInImmediateTransaction.bind(fixtures.repo);
+      fixtures.repo.runInImmediateTransaction = function <T>(fn: () => T): T {
         return origRunInTx(() => {
           db.prepare("UPDATE tasks SET state = 'DONE' WHERE id = ?").run(fixtures.taskId);
           return fn();
@@ -1032,7 +1032,7 @@ describe('R5J5 Quarantined Submission Adjudication and Verification Suite', () =
         const adjs = fixtures.repo.getCoderSubmissionAdjudicationsBySubmission(subId);
         expect(adjs.every((a) => a.status !== 'VERIFIED')).toBe(true);
       } finally {
-        fixtures.repo.runInTransaction = origRunInTx;
+        fixtures.repo.runInImmediateTransaction = origRunInTx;
       }
     });
 
@@ -2422,14 +2422,18 @@ describe('R5J5 Quarantined Submission Adjudication and Verification Suite', () =
         const wrapped = origTransaction((...args: any[]) => {
           return fn(...args);
         });
-        return (...args: any[]) => {
-          const res = wrapped(...args);
+        const observeCommit = (res: any) => {
           const adj = fixtures.db.prepare("SELECT status FROM coder_submission_adjudications WHERE submission_id = ?").get(subId) as any;
           if (adj && (adj.status === 'VERIFIED' || adj.status === 'VERIFICATION_FAILED')) {
             settlementTxCommitted = true;
           }
           return res;
         };
+        const observed: any = (...args: any[]) => observeCommit(wrapped(...args));
+        for (const mode of ['deferred', 'immediate', 'exclusive'] as const) {
+          observed[mode] = (...args: any[]) => observeCommit(wrapped[mode](...args));
+        }
+        return observed;
       });
 
       try {

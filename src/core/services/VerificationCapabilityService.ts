@@ -336,6 +336,13 @@ export class VerificationCapabilityService {
       const binding = bindFile(candidate);
       if (original && (!samePath(binding.path, script.binding.path) || binding.identity !== script.binding.identity)) throw new VerificationCapabilityError('PATH_IDENTITY_CHANGED');
       if (binding.sha256 !== script.binding.sha256) throw new VerificationCapabilityError('CONTENT_HASH_CHANGED');
+      // Validate what the exact argv resolves to, including path aliases.
+      // Absolute argv keeps its original binding when cwd is a worktree.
+      const argument = path.resolve(runtime.path, payload.args[script.argument_index]);
+      const actual = samePath(argument, candidate) ? binding : bindFile(argument);
+      const expected = original || path.isAbsolute(payload.args[script.argument_index]) ? script.binding : binding;
+      if (!samePath(actual.path, expected.path) || actual.identity !== expected.identity) throw new VerificationCapabilityError('PATH_IDENTITY_CHANGED');
+      if (actual.sha256 !== script.binding.sha256) throw new VerificationCapabilityError('CONTENT_HASH_CHANGED');
     }
   }
 }

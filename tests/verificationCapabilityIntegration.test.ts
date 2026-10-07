@@ -192,6 +192,39 @@ describe('issued capability process boundary', () => {
       .toMatchObject({ pid: null, processStart: 'NOT_STARTED_PROVEN', errorCode: 'PROCESS_LAUNCH_FAILED' });
   });
 
+  it.each(['content', 'identity'] as const)('fences %s drift of the actual absolute script when verification uses an authorized worktree', async (drift) => {
+    const script = path.join(root, 'verify.js');
+    const source = 'process.stdout.write("approved");';
+    fs.writeFileSync(script, source);
+    const worktree = path.join(root, 'owned-worktree');
+    fs.mkdirSync(worktree);
+    fs.writeFileSync(path.join(worktree, 'verify.js'), source);
+    const command = await approveFixtureCommand(repo, 'P', [script]);
+    const snapshot = { TEST: { ...command, timeout_ms: 10000 }, LINT: null, BUILD: null };
+    authorize(snapshot, worktree);
+    const capabilities = new VerificationCapabilityService(repo);
+    const boundary = capabilities.createProcessBoundary(command.capability, 'P', command.executable, command.args, worktree, 'AUTH');
+    expect(await ProcessRunner.execute({ ...command, cwd: worktree, timeoutMs: 10000, verificationBoundary: boundary }))
+      .toMatchObject({ exitCode: 0, stdout: 'approved', processStart: 'STARTED_PROVEN' });
+    if (drift === 'identity') fs.renameSync(script, path.join(root, 'old-verify.js'));
+    fs.writeFileSync(script, drift === 'identity' ? source : 'process.stdout.write("changed");');
+    expect(await ProcessRunner.execute({ ...command, cwd: worktree, timeoutMs: 10000, verificationBoundary: boundary }))
+      .toMatchObject({ pid: null, processStart: 'NOT_STARTED_PROVEN', errorCode: 'PROCESS_LAUNCH_FAILED' });
+  });
+
+  it('checks the actual relative script in the authorized worktree after the original script changes', async () => {
+    fs.writeFileSync(path.join(root, 'verify.js'), 'process.stdout.write("approved");');
+    const worktree = path.join(root, 'owned-worktree');
+    fs.mkdirSync(worktree);
+    fs.copyFileSync(path.join(root, 'verify.js'), path.join(worktree, 'verify.js'));
+    const command = await approveFixtureCommand(repo, 'P', ['verify.js']);
+    authorize({ TEST: { ...command, timeout_ms: 10000 }, LINT: null, BUILD: null }, worktree);
+    fs.writeFileSync(path.join(root, 'verify.js'), 'process.stdout.write("changed");');
+    const boundary = new VerificationCapabilityService(repo).createProcessBoundary(command.capability, 'P', command.executable, command.args, worktree, 'AUTH');
+    expect(await ProcessRunner.execute({ ...command, cwd: worktree, timeoutMs: 10000, verificationBoundary: boundary }))
+      .toMatchObject({ exitCode: 0, stdout: 'approved', processStart: 'STARTED_PROVEN' });
+  });
+
   it('executes Supervisor evidence tests only with the exact frozen capability boundary', async () => {
     const { command, snapshot } = await configured();
     const payload = authorize(snapshot);
