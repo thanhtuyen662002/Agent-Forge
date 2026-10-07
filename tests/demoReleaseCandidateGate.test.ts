@@ -1,4 +1,5 @@
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
+import { approveFixtureCommand } from './helpers/verificationCapabilityFixture';
 import Database from 'better-sqlite3';
 import fs from 'fs';
 import path from 'path';
@@ -291,8 +292,7 @@ describe('PR #10 — AgentForge Demo & Release Candidate Gate Contract Tests', (
       project_id: testProjectId,
       name: 'Test runner check',
       command_type: 'TEST',
-      executable: 'node',
-      args: ['run_tests.js'],
+      ...await approveFixtureCommand(repo, testProjectId, ['run_tests.js']),
       enabled: true,
     });
 

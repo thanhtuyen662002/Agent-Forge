@@ -1253,7 +1253,7 @@ describe('R5J7 MCP Reviewer Authority & Invariants (Cases 1–70, 124–131, 135
   // 124. Migration 24 embedded DDL inventory, foreign key graph, and canonical SQL integrity verification
   it('124. Migration 24 embedded DDL inventory, foreign key graph, and canonical SQL integrity verification', () => {
     verifyMigration24SchemaAuthority(fixtures.db);
-    expect(MIGRATIONS).toHaveLength(24);
+    expect(MIGRATIONS).toHaveLength(25);
     const mig24 = MIGRATIONS[23];
     expect(mig24.version).toBe(24);
     expect(mig24.name).toBe('024_r5j_reviewer_session_authority');

@@ -34,7 +34,7 @@ describe('R5L1 Rehearsal Synthetic Pipeline Suite', () => {
   // =========================================================================
   it('1. Full synthetic pipeline: quarantined submission -> admission -> verification -> settlement -> reviewer read (zero-write)', async () => {
     const PROJECTION_CONFIDENTIAL_MARKER = 'FROZEN_PROJECTION_SECRET_MARKER_' + crypto.randomUUID();
-    env = setupSyntheticRehearsalEnv({ failVerification: false, taskTitleMarker: PROJECTION_CONFIDENTIAL_MARKER });
+    env = await setupSyntheticRehearsalEnv({ failVerification: false, taskTitleMarker: PROJECTION_CONFIDENTIAL_MARKER });
     const { repo, db, mcpService, adjudicationService, reviewerService } = env;
 
     // --- STEP 1: Quarantined Submission ---
@@ -205,7 +205,7 @@ describe('R5L1 Rehearsal Synthetic Pipeline Suite', () => {
   // Non-zero exit code -> VERIFICATION_FAILED -> Task stays fail-closed -> Lease released
   // =========================================================================
   it('2. Verification failure branch: non-zero exit classification transitions to VERIFICATION_FAILED and releases lease', async () => {
-    env = setupSyntheticRehearsalEnv({ failVerification: true });
+    env = await setupSyntheticRehearsalEnv({ failVerification: true });
     const { repo, mcpService, adjudicationService } = env;
 
     const { plaintextToken } = issueSubmissionSession(repo, env.authorizationId);
@@ -268,7 +268,7 @@ describe('R5L1 Rehearsal Synthetic Pipeline Suite', () => {
   // =========================================================================
   it('3. Reviewer read rejection branches: expired token, revoked session, cross-adjudication, and task-state drift', async () => {
     const REJECTION_PROJECTION_MARKER = 'FROZEN_REJECTION_PROJECTION_MARKER_' + crypto.randomUUID();
-    env = setupSyntheticRehearsalEnv({ failVerification: false, taskTitleMarker: REJECTION_PROJECTION_MARKER });
+    env = await setupSyntheticRehearsalEnv({ failVerification: false, taskTitleMarker: REJECTION_PROJECTION_MARKER });
     const { repo, db, mcpService, adjudicationService, reviewerService } = env;
 
     const { plaintextToken } = issueSubmissionSession(repo, env.authorizationId);
@@ -542,7 +542,7 @@ describe('R5L1 Rehearsal Synthetic Pipeline Suite', () => {
   // =========================================================================
   it('4. Teardown audit: process termination receipt, worktree pruning, connection closing, and clean directory deletion', async () => {
     // Dedicated isolated environment for teardown verification
-    const testEnv = setupSyntheticRehearsalEnv({ failVerification: false });
+    const testEnv = await setupSyntheticRehearsalEnv({ failVerification: false });
     let client: Client | null = null;
     let server: any | null = null;
     let tempDirCleaned = false;

@@ -5,6 +5,8 @@ import { ProjectService } from '../core/services/ProjectService';
 import { TaskService } from '../core/services/TaskService';
 import { GitService } from '../core/services/GitService';
 import { VerificationService } from '../core/services/VerificationService';
+import { VerificationCapabilityService } from '../core/services/VerificationCapabilityService';
+import { VerificationCapabilityError, VerificationCapabilityPayload, VerificationCapabilityReference } from '../core/types/verificationCapability';
 import { ProtocolParser } from '../core/protocol/parser';
 import { PackageGenerator } from '../core/protocol/packageGenerator';
 import { defaultArtifactStore } from '../core/services/ArtifactStore';
@@ -118,6 +120,7 @@ export function registerIpcHandlers(
       return handler(event, payload);
     });
   };
+  const capabilityApprovalsInProgress = new Set<string>();
   // ==========================================
   // Trusted Repository Selection Dialog
   // ==========================================
@@ -645,45 +648,64 @@ export function registerIpcHandlers(
       return { success: false, error: `Project "${parsed.data.projectId}" not found.` };
     }
 
-    const parsedCommands: {
-      TEST?: { executable: string; args: string[] } | null;
-      LINT?: { executable: string; args: string[] } | null;
-      BUILD?: { executable: string; args: string[] } | null;
-    } = {};
-
+    if (capabilityApprovalsInProgress.has(project.id)) {
+      return { success: false, error: 'CAPABILITY_APPROVAL_IN_PROGRESS' };
+    }
+    capabilityApprovalsInProgress.add(project.id);
+    const capabilities = new VerificationCapabilityService(repo);
+    const approved: VerificationCapabilityReference[] = [];
+    const before = JSON.stringify(repo.getVerificationCommandsByProject(project.id));
+    const parsedCommands: Partial<Record<'TEST' | 'LINT' | 'BUILD', {
+      executable: string; args: string[]; capability: VerificationCapabilityReference;
+    } | null>> = {};
+    const proposals: Partial<Record<'TEST' | 'LINT' | 'BUILD', VerificationCapabilityPayload>> = {};
     const types: Array<'TEST' | 'LINT' | 'BUILD'> = ['TEST', 'LINT', 'BUILD'];
-    for (const type of types) {
-      const rawCmd = parsed.data.commands[type];
-      if (rawCmd != null && rawCmd.trim().length > 0) {
-        let parsedCmd;
-        try {
-          parsedCmd = CommandParser.parse(rawCmd);
-        } catch (err: any) {
-          return { success: false, error: `Invalid ${type} command: ${err.message}` };
-        }
-
-        if (parsedCmd) {
-          const policy = PolicyService.evaluateProcessExecution(parsedCmd.executable, parsedCmd.args, false);
-          if (!policy.allowed) {
-            return {
-              success: false,
-              error: `Security policy rejected ${type} command "${rawCmd}": ${policy.reason} (${policy.decision})`,
-            };
-          }
-          parsedCommands[type] = parsedCmd;
+    try {
+      for (const type of types) {
+        if (!(type in parsed.data.commands)) continue;
+        const rawCmd = parsed.data.commands[type];
+        const command = rawCmd?.trim() ? CommandParser.parse(rawCmd) : null;
+        if (command) {
+          proposals[type] = capabilities.propose(project.id, command.executable, command.args, project.repository_path);
         } else {
           parsedCommands[type] = null;
         }
-      } else {
-        parsedCommands[type] = null;
       }
-    }
-
-    try {
-      const updatedCommands = repo.setProjectVerificationCommands(project.id, parsedCommands);
+      // Only a native backend dialog can grant approval. Renderer fields never
+      // authorize a command, even when the sender frame is trusted.
+      const decision = await dialog.showMessageBox({
+        type: 'warning', title: 'Approve verification capabilities',
+        message: `Save verification commands for ${project.name}?`,
+        detail: `These commands run with your OS permissions. Approval binds the displayed executable, files and exact arguments.\n\n${JSON.stringify({
+          project_root: project.repository_path,
+          commands: Object.fromEntries(types.filter((type) => type in parsed.data.commands).map((type) => [type, proposals[type] ?? null])),
+        }, null, 2)}`,
+        buttons: ['Approve', 'Cancel'], defaultId: 1, cancelId: 1, noLink: true,
+      });
+      if (decision.response !== 0) throw new VerificationCapabilityError('OWNER_APPROVAL_REQUIRED');
+      for (const type of types) {
+        const proposal = proposals[type];
+        if (!proposal) continue;
+        const capability = await capabilities.approve(proposal, async () => true);
+        approved.push(capability);
+        parsedCommands[type] = { executable: proposal.executable.path, args: [...proposal.args], capability };
+      }
+      const updatedCommands = repo.runInImmediateTransaction(() => {
+        const current = repo.getProject(project.id);
+        if (!current || current.repository_path !== project.repository_path ||
+            JSON.stringify(repo.getVerificationCommandsByProject(project.id)) !== before) {
+          throw new VerificationCapabilityError('CAPABILITY_BINDING_MISMATCH');
+        }
+        return repo.setProjectVerificationCommands(project.id, parsedCommands);
+      });
       return { success: true, commands: updatedCommands };
-    } catch (err: any) {
-      return { success: false, error: err.message || 'Failed to save verification commands.' };
+    } catch (error) {
+      for (const reference of approved) {
+        try { capabilities.revoke(reference); } catch { /* A replaced/revoked grant is already fenced. */ }
+      }
+      return { success: false, error: error instanceof VerificationCapabilityError ? error.code : 'INVALID_VERIFICATION_CAPABILITY' };
+    } finally {
+      capabilityApprovalsInProgress.delete(project.id);
     }
   });
 

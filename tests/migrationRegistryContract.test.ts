@@ -27,6 +27,7 @@ const EXPECTED_MIGRATION_NAMES = [
   '022_r5j_coder_submission_authority',
   '023_r5j_quarantined_submission_adjudication_and_verification_admission',
   '024_r5j_reviewer_session_authority',
+  'durable_owner_verification_capabilities',
 ] as const;
 
 describe('migration registry contract', () => {

@@ -352,8 +352,9 @@ const migrationsPath = path.join(asarPath, 'dist-electron', 'core', 'database', 
 const repoPath = path.join(asarPath, 'dist-electron', 'core', 'database', 'repositories.js');
 const authorityServicePath = path.join(asarPath, 'dist-electron', 'core', 'services', 'McpSessionAuthorityService.js');
 const authServicePath = path.join(asarPath, 'dist-electron', 'core', 'services', 'ExecutionAuthorizationService.js');
+const capabilityServicePath = path.join(asarPath, 'dist-electron', 'core', 'services', 'VerificationCapabilityService.js');
 
-if (!fs.existsSync(migrationsPath) || !fs.existsSync(repoPath) || !fs.existsSync(authorityServicePath) || !fs.existsSync(authServicePath)) {
+if (!fs.existsSync(migrationsPath) || !fs.existsSync(repoPath) || !fs.existsSync(authorityServicePath) || !fs.existsSync(authServicePath) || !fs.existsSync(capabilityServicePath)) {
   console.error("FAIL: Packaged modules missing in app.asar");
   process.exit(1);
 }
@@ -399,15 +400,16 @@ if (nativeBindingPath.toLowerCase().includes('temp\\node_modules')) {
 const { MigrationRunner } = require(migrationsPath);
 const { Repository } = require(repoPath);
 const { McpSessionAuthorityService } = require(authorityServicePath);
-const { computeCanonicalPayload, computePayloadHash, computeContextManifestHash } = require(authServicePath);
+const { computeCanonicalPayload, computePayloadHash, computeContextManifestHash, buildVerificationCommandsSnapshot } = require(authServicePath);
+const { VerificationCapabilityService } = require(capabilityServicePath);
 
 MigrationRunner.run(db);
 
 const appliedMigrationCount = db.prepare("SELECT COUNT(*) as c FROM schema_migrations").get().c;
-if (appliedMigrationCount !== 24) {
-  throw new Error("Expected migration count 24, got " + appliedMigrationCount);
+if (appliedMigrationCount !== 25) {
+  throw new Error("Expected migration count 25, got " + appliedMigrationCount);
 }
-console.log("R5J7_MIGRATION_COUNT_24=PASS");
+console.log("OWNER_CAPABILITY_MIGRATION_COUNT_25=PASS");
 
 const repo = new Repository(db);
 const service = new McpSessionAuthorityService(repo, db);
@@ -584,6 +586,17 @@ const canonicalInstructionsJson = JSON.stringify(instructions);
 const contextFiles = ['src/mcp/stdio.ts'];
 const contextFilesJson = JSON.stringify(contextFiles);
 
+let child;
+(async () => {
+  try {
+// Explicit headless test confirmation; this is not a human production approval.
+// Exercise the installed service and real OS owner against this isolated DB.
+const capabilities = new VerificationCapabilityService(repo);
+const proposal = capabilities.propose(projectId, 'git', ['--version'], projectRoot);
+const capability = await capabilities.approve(proposal, async () => true);
+repo.createVerificationCommand({ id: crypto.randomUUID(), project_id: projectId, name: 'Approved smoke Git version',
+  command_type: 'TEST', executable: proposal.executable.path, args: proposal.args, capability, timeout_ms: 30000, enabled: true });
+
 const canonicalPayload = computeCanonicalPayload({
   projectId,
   taskId,
@@ -594,7 +607,7 @@ const canonicalPayload = computeCanonicalPayload({
   constraints: ['None'],
   instructions,
   contextFiles,
-  verificationCommands: { TEST: { executable: 'git', args: ['--version'] }, LINT: null, BUILD: null },
+  verificationCommands: buildVerificationCommandsSnapshot(repo.getVerificationCommandsByProject(projectId)),
   managerMessageId: managerRecordId,
   managerPayloadHash,
 });
@@ -654,7 +667,7 @@ const childEnv = Object.assign({}, process.env, {
 });
 
 const startTime = Date.now();
-const child = spawn(process.execPath, [stdioScript], {
+child = spawn(process.execPath, [stdioScript], {
   env: childEnv,
   stdio: ['pipe', 'pipe', 'pipe'],
 });
@@ -805,8 +818,6 @@ class McpRpcHarness {
 
 const harness = new McpRpcHarness(child);
 
-(async () => {
-  try {
     const initRes = await harness.sendRequest({
       jsonrpc: '2.0',
       id: 1,
@@ -1338,19 +1349,6 @@ const harness = new McpRpcHarness(child);
     const adjDb = new Database(dbPath);
     adjDb.pragma('foreign_keys = ON');
 
-    // Attach bounded verification command timeout to authorization snapshot for adjudication
-    const rawAuth = adjDb.prepare("SELECT * FROM execution_authorizations WHERE id = ?").get(authorizationId);
-    if (rawAuth && rawAuth.canonical_payload_json) {
-      const parsedPayload = JSON.parse(rawAuth.canonical_payload_json);
-      if (parsedPayload.verificationCommands && parsedPayload.verificationCommands.TEST) {
-        parsedPayload.verificationCommands.TEST.timeout_ms = 30000;
-        const updatedPayloadJson = JSON.stringify(parsedPayload);
-        const updatedHash = computePayloadHash(parsedPayload);
-        adjDb.prepare("UPDATE execution_authorizations SET canonical_payload_json = ?, instruction_payload_hash = ? WHERE id = ?")
-          .run(updatedPayloadJson, updatedHash, authorizationId);
-      }
-    }
-
     const adjRepo = new Repository(adjDb);
     const adjArtifactStore = new ArtifactStore(path.join(path.dirname(dbPath), 'artifacts'));
     const adjVerService = new VerificationService(adjRepo, adjArtifactStore);
@@ -1783,14 +1781,14 @@ const harness = new McpRpcHarness(child);
   Write-Host "Installed MCP Proof Output:"
   Write-Host $mcpStdout
 
-  if ($mcpProc.ExitCode -ne 0 -or -not ($mcpStdout -match "R5J3_INSTALLED_MCP_BRIDGE_PROOF=PASS") -or -not ($mcpStdout -match "R5J4_INSTALLED_MCP_SUBMISSION_PROOF=PASS") -or -not ($mcpStdout -match "R5J5_INSTALLED_OWNER_ADJUDICATION_PROOF=PASS") -or -not ($mcpStdout -match "R5J6_SUBMISSION_OBSERVABILITY_PROOF=PASS") -or -not ($mcpStdout -match "R5J7_MIGRATION_COUNT_24=PASS")) {
+  if ($mcpProc.ExitCode -ne 0 -or -not ($mcpStdout -match "R5J3_INSTALLED_MCP_BRIDGE_PROOF=PASS") -or -not ($mcpStdout -match "R5J4_INSTALLED_MCP_SUBMISSION_PROOF=PASS") -or -not ($mcpStdout -match "R5J5_INSTALLED_OWNER_ADJUDICATION_PROOF=PASS") -or -not ($mcpStdout -match "R5J6_SUBMISSION_OBSERVABILITY_PROOF=PASS") -or -not ($mcpStdout -match "OWNER_CAPABILITY_MIGRATION_COUNT_25=PASS")) {
     throw "Installed MCP bridge verification failed (exit code $($mcpProc.ExitCode)): $mcpStderr"
   }
 
   Write-Host "[8/8] Installed MCP Client Bridge & Node-Mode Stdio Proof: PASS" -ForegroundColor Green
   Write-Host "R5J5_INSTALLED_OWNER_ADJUDICATION_PROOF=PASS" -ForegroundColor Green
   Write-Host "R5J6_SUBMISSION_OBSERVABILITY_PROOF=PASS" -ForegroundColor Green
-  Write-Host "R5J7_MIGRATION_COUNT_24=PASS" -ForegroundColor Green
+  Write-Host "OWNER_CAPABILITY_MIGRATION_COUNT_25=PASS" -ForegroundColor Green
 
   # Verify no surviving processes in install dir
   $surviving = Get-Process -Name "AgentForge" -ErrorAction SilentlyContinue | Where-Object {

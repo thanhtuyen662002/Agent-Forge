@@ -105,7 +105,7 @@ describe('R5J5 Quarantined Submission Adjudication and Verification Suite', () =
   let dbPath: string;
   let fixtures: FullAdjudicationFixtures;
 
-  beforeEach(() => {
+  beforeEach(async () => {
     tempDir = path.join(os.tmpdir(), 'af-adj-test-' + Date.now() + '-' + crypto.randomUUID().slice(0, 8));
     fs.mkdirSync(tempDir, { recursive: true });
 
@@ -125,7 +125,7 @@ describe('R5J5 Quarantined Submission Adjudication and Verification Suite', () =
     const created = createTestDatabase(tempDir, 'adjudication-test.db');
     db = created.db;
     dbPath = created.dbPath;
-    fixtures = setupFullSubmissionGraph(db, repoDir, artifactsDir);
+    fixtures = await setupFullSubmissionGraph(db, repoDir, artifactsDir);
   }, 120000);
 
   afterEach(() => {
@@ -173,8 +173,8 @@ describe('R5J5 Quarantined Submission Adjudication and Verification Suite', () =
       testDb.close();
     });
 
-    it('3. MIGRATIONS array contains exactly 24 migrations with 023_r5j_quarantined_submission_adjudication_and_verification_admission', () => {
-      expect(MIGRATIONS).toHaveLength(24);
+    it('3. MIGRATIONS array contains exactly 25 migrations with 023_r5j_quarantined_submission_adjudication_and_verification_admission', () => {
+      expect(MIGRATIONS).toHaveLength(25);
       expect(MIGRATIONS[22].version).toBe(23);
       expect(MIGRATIONS[22].name).toBe('023_r5j_quarantined_submission_adjudication_and_verification_admission');
     });

@@ -3,6 +3,7 @@ import Database from 'better-sqlite3';
 import path from 'path';
 import fs from 'fs';
 import os from 'os';
+import { approveFixtureCommand, freezeFixtureVerificationCommand } from '../helpers/verificationCapabilityFixture';
 import crypto from 'crypto';
 import child_process from 'child_process';
 import {
@@ -105,7 +106,7 @@ describe('R5J5 Quarantined Submission Adjudication and Verification Suite', () =
   let dbPath: string;
   let fixtures: FullAdjudicationFixtures;
 
-  beforeEach(() => {
+  beforeEach(async () => {
     tempDir = path.join(os.tmpdir(), 'af-adj-test-' + Date.now() + '-' + crypto.randomUUID().slice(0, 8));
     fs.mkdirSync(tempDir, { recursive: true });
 
@@ -125,7 +126,7 @@ describe('R5J5 Quarantined Submission Adjudication and Verification Suite', () =
     const created = createTestDatabase(tempDir, 'adjudication-test.db');
     db = created.db;
     dbPath = created.dbPath;
-    fixtures = setupFullSubmissionGraph(db, repoDir, artifactsDir);
+    fixtures = await setupFullSubmissionGraph(db, repoDir, artifactsDir);
   }, 120000);
 
   afterEach(() => {
@@ -793,7 +794,7 @@ describe('R5J5 Quarantined Submission Adjudication and Verification Suite', () =
       }
     });
 
-     it('170. proven no-process launch failure maps to PROCESS_START_FAILED', async () => {
+     it('170. unapproved nonexistent executable is rejected with proven no process', async () => {
       const nonExistentCmd = JSON.stringify({
         TEST: {
           executable: 'non_existent_executable_' + crypto.randomUUID(),
@@ -828,7 +829,8 @@ describe('R5J5 Quarantined Submission Adjudication and Verification Suite', () =
       };
 
       const result = await fixtures.verificationService.executeSealedVerification(input);
-      expect(result.outcome).toBe('PROCESS_START_FAILED');
+      expect(result.outcome).toBe('COMMAND_POLICY_REJECTED');
+      expect(result.process_start).toBe('NOT_STARTED_PROVEN');
     });
 
     it('171. ambiguous process-runner throw maps to RECOVERY_FENCED', async () => {
@@ -840,13 +842,7 @@ describe('R5J5 Quarantined Submission Adjudication and Verification Suite', () =
       };
 
       try {
-        const cmd = JSON.stringify({
-          TEST: {
-            executable: process.execPath,
-            args: ['-v'],
-            timeout_ms: 120000,
-          },
-        });
+        const cmd = JSON.stringify(JSON.parse(fixtures.repo.getExecutionAuthorization(fixtures.authorizationId)!.canonical_payload_json!).verificationCommands);
         const cmdHash = computeSha256(cmd);
         const wsSnap = canonicalJsonStringify({ head_sha: fixtures.repoHeadSha, status_lines: [] });
         const wsHash = computeSha256(wsSnap);
@@ -886,17 +882,12 @@ describe('R5J5 Quarantined Submission Adjudication and Verification Suite', () =
     });
 
     it('172. timeout without termination proof remains fenced', async () => {
-      const timeoutScript = path.join(os.tmpdir(), 'timeout_' + crypto.randomUUID() + '.js');
+      const timeoutScript = path.join(fixtures.projectRoot, 'temp-artifacts', 'timeout_' + crypto.randomUUID() + '.js');
       fs.writeFileSync(timeoutScript, 'setInterval(() => {}, 1000);');
 
       try {
-        const cmd = JSON.stringify({
-          TEST: {
-            executable: process.execPath,
-            args: [timeoutScript],
-            timeout_ms: 200,
-          },
-        });
+        const cmd = JSON.stringify(freezeFixtureVerificationCommand(fixtures.repo, fixtures.authorizationId,
+          { ...await approveFixtureCommand(fixtures.repo, fixtures.projectId, [timeoutScript]), timeout_ms: 200 }));
         const cmdHash = computeSha256(cmd);
         const wsSnap = canonicalJsonStringify({ head_sha: fixtures.repoHeadSha, status_lines: [] });
         const wsHash = computeSha256(wsSnap);
@@ -935,7 +926,7 @@ describe('R5J5 Quarantined Submission Adjudication and Verification Suite', () =
       const subId = crypto.randomUUID();
       fixtures.mcpService.submitCoderClaim(createValidSubmissionPayload(fixtures, subId), plaintextToken);
 
-      const secretScript = path.join(os.tmpdir(), 'secret_err_' + crypto.randomUUID() + '.js');
+      const secretScript = path.join(fixtures.projectRoot, 'temp-artifacts', 'secret_err_' + crypto.randomUUID() + '.js');
       fs.writeFileSync(
         secretScript,
         'console.error("CRITICAL_ERR: SELECT * FROM tokens WHERE secret=\'af-tok-sensitive-9988\' in C:\\\\Users\\\\Admin\\\\vault"); process.exit(1);'
@@ -944,11 +935,7 @@ describe('R5J5 Quarantined Submission Adjudication and Verification Suite', () =
       try {
         const auth = fixtures.repo.getExecutionAuthorization(fixtures.authorizationId)!;
         const payload = JSON.parse(auth.canonical_payload_json!);
-        payload.verificationCommands.TEST = {
-          executable: process.execPath,
-          args: [secretScript],
-          timeout_ms: 120000,
-        };
+        payload.verificationCommands.TEST = { ...await approveFixtureCommand(fixtures.repo, fixtures.projectId, [secretScript]), timeout_ms: 120000 };
         const newHash = computePayloadHash(payload);
         const newJson = JSON.stringify(payload);
         db.prepare('UPDATE execution_authorizations SET canonical_payload_json = ?, instruction_payload_hash = ? WHERE id = ?')
@@ -1024,8 +1011,8 @@ describe('R5J5 Quarantined Submission Adjudication and Verification Suite', () =
       const subId = crypto.randomUUID();
       fixtures.mcpService.submitCoderClaim(createValidSubmissionPayload(fixtures, subId), plaintextToken);
 
-      const origRunInTx = fixtures.repo.runInTransaction.bind(fixtures.repo);
-      fixtures.repo.runInTransaction = function <T>(fn: () => T): T {
+      const origRunInTx = fixtures.repo.runInImmediateTransaction.bind(fixtures.repo);
+      fixtures.repo.runInImmediateTransaction = function <T>(fn: () => T): T {
         return origRunInTx(() => {
           db.prepare("UPDATE tasks SET state = 'DONE' WHERE id = ?").run(fixtures.taskId);
           return fn();
@@ -1045,7 +1032,7 @@ describe('R5J5 Quarantined Submission Adjudication and Verification Suite', () =
         const adjs = fixtures.repo.getCoderSubmissionAdjudicationsBySubmission(subId);
         expect(adjs.every((a) => a.status !== 'VERIFIED')).toBe(true);
       } finally {
-        fixtures.repo.runInTransaction = origRunInTx;
+        fixtures.repo.runInImmediateTransaction = origRunInTx;
       }
     });
 
@@ -2141,13 +2128,7 @@ describe('R5J5 Quarantined Submission Adjudication and Verification Suite', () =
       const verifService = fixtures.verificationService;
       const dbChangesBefore = db.prepare('SELECT (SELECT COUNT(*) FROM evidence) as ev, (SELECT COUNT(*) FROM test_runs) as tr, (SELECT COUNT(*) FROM coder_submission_adjudications) as adj').get() as { ev: number; tr: number; adj: number };
 
-      const cmdObj = {
-        TEST: {
-          executable: process.execPath,
-          args: ['-v'],
-          timeout_ms: 10000,
-        },
-      };
+      const cmdObj = JSON.parse(fixtures.repo.getExecutionAuthorization(fixtures.authorizationId)!.canonical_payload_json!).verificationCommands;
       const cmdJson = JSON.stringify(cmdObj);
       const cmdHash = computeSha256(cmdJson);
 
@@ -2441,14 +2422,18 @@ describe('R5J5 Quarantined Submission Adjudication and Verification Suite', () =
         const wrapped = origTransaction((...args: any[]) => {
           return fn(...args);
         });
-        return (...args: any[]) => {
-          const res = wrapped(...args);
+        const observeCommit = (res: any) => {
           const adj = fixtures.db.prepare("SELECT status FROM coder_submission_adjudications WHERE submission_id = ?").get(subId) as any;
           if (adj && (adj.status === 'VERIFIED' || adj.status === 'VERIFICATION_FAILED')) {
             settlementTxCommitted = true;
           }
           return res;
         };
+        const observed: any = (...args: any[]) => observeCommit(wrapped(...args));
+        for (const mode of ['deferred', 'immediate', 'exclusive'] as const) {
+          observed[mode] = (...args: any[]) => observeCommit(wrapped[mode](...args));
+        }
+        return observed;
       });
 
       try {

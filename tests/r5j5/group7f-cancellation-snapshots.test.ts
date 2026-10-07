@@ -105,7 +105,7 @@ describe('R5J5 Quarantined Submission Adjudication and Verification Suite', () =
   let dbPath: string;
   let fixtures: FullAdjudicationFixtures;
 
-  beforeEach(() => {
+  beforeEach(async () => {
     tempDir = path.join(os.tmpdir(), 'af-adj-test-' + Date.now() + '-' + crypto.randomUUID().slice(0, 8));
     fs.mkdirSync(tempDir, { recursive: true });
 
@@ -125,7 +125,7 @@ describe('R5J5 Quarantined Submission Adjudication and Verification Suite', () =
     const created = createTestDatabase(tempDir, 'adjudication-test.db');
     db = created.db;
     dbPath = created.dbPath;
-    fixtures = setupFullSubmissionGraph(db, repoDir, artifactsDir);
+    fixtures = await setupFullSubmissionGraph(db, repoDir, artifactsDir);
   }, 120000);
 
   afterEach(() => {
@@ -2455,8 +2455,8 @@ describe('R5J5 Quarantined Submission Adjudication and Verification Suite', () =
       expect(decReuse.failureCode).toBe('INTEGRITY_MISMATCH');
     });
 
-    it('344. VERIFICATION_FAILED recovery rejects missing, duplicate, extra, wrong-ID, wrong-actor, wrong-metadata, SETTLED dispositions with zero mutation', () => {
-      function createFreshFixtures(): FullAdjudicationFixtures {
+    it('344. VERIFICATION_FAILED recovery rejects missing, duplicate, extra, wrong-ID, wrong-actor, wrong-metadata, SETTLED dispositions with zero mutation', async () => {
+      async function createFreshFixtures(): Promise<FullAdjudicationFixtures> {
         const dir = path.join(os.tmpdir(), 'af-fresh-' + Date.now() + '-' + crypto.randomUUID().slice(0, 8));
         fs.mkdirSync(dir, { recursive: true });
         const repoDir = path.join(dir, 'repo');
@@ -2698,7 +2698,7 @@ describe('R5J5 Quarantined Submission Adjudication and Verification Suite', () =
       }
 
       // Probe 1: Missing disposition
-      const fx1 = createFreshFixtures();
+      const fx1 = await createFreshFixtures();
       const setup1 = setupFailedAdjudication(fx1);
       const adj1 = fx1.repo.getCoderSubmissionAdjudicationById(setup1.adjId)!;
       const rMissing = fx1.recoveryScanner.reconcileSingleAdjudication(adj1);
@@ -2706,7 +2706,7 @@ describe('R5J5 Quarantined Submission Adjudication and Verification Suite', () =
       expect(rMissing.error).toContain('Expected exactly one terminal disposition for VERIFICATION_FAILED');
 
       // Probe 2: Duplicate disposition
-      const fx2 = createFreshFixtures();
+      const fx2 = await createFreshFixtures();
       const setup2 = setupFailedAdjudication(fx2);
       const expectedDispId2 = deriveDeterministicDispositionId(setup2.subId, setup2.adjId, 3);
       fx2.repo.createCoderSubmissionDisposition({
@@ -2735,7 +2735,7 @@ describe('R5J5 Quarantined Submission Adjudication and Verification Suite', () =
       expect(rDup.error).toContain('Expected exactly one terminal disposition for VERIFICATION_FAILED submission, found 2');
 
       // Probe 3: Wrong deterministic ID
-      const fx3 = createFreshFixtures();
+      const fx3 = await createFreshFixtures();
       const setup3 = setupFailedAdjudication(fx3);
       fx3.repo.createCoderSubmissionDisposition({
         id: crypto.randomUUID(),
@@ -2753,7 +2753,7 @@ describe('R5J5 Quarantined Submission Adjudication and Verification Suite', () =
       expect(rWrongId.error).toContain('Deterministic disposition ID mismatch');
 
       // Probe 4: Wrong actor_type
-      const fx4 = createFreshFixtures();
+      const fx4 = await createFreshFixtures();
       const setup4 = setupFailedAdjudication(fx4);
       fx4.db.prepare('INSERT INTO coder_submission_dispositions (id, submission_id, disposition_event, disposition_reason, actor_type, actor_id, disposition_metadata_json, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)').run(
         deriveDeterministicDispositionId(setup4.subId, setup4.adjId, 3),
@@ -2771,7 +2771,7 @@ describe('R5J5 Quarantined Submission Adjudication and Verification Suite', () =
       expect(rWrongActor.error).toContain('Terminal disposition actor_type for VERIFICATION_FAILED must be SYSTEM');
 
       // Probe 5: Wrong metadata
-      const fx5 = createFreshFixtures();
+      const fx5 = await createFreshFixtures();
       const setup5 = setupFailedAdjudication(fx5);
       fx5.repo.createCoderSubmissionDisposition({
         id: deriveDeterministicDispositionId(setup5.subId, setup5.adjId, 3),
@@ -2789,7 +2789,7 @@ describe('R5J5 Quarantined Submission Adjudication and Verification Suite', () =
       expect(rWrongMeta.error).toContain('Terminal disposition metadata mismatch');
 
       // Probe 6: Contradictory SETTLED disposition
-      const fx6 = createFreshFixtures();
+      const fx6 = await createFreshFixtures();
       const setup6 = setupFailedAdjudication(fx6);
       fx6.repo.createCoderSubmissionDisposition({
         id: deriveDeterministicDispositionId(setup6.subId, setup6.adjId, 3),
@@ -2807,8 +2807,8 @@ describe('R5J5 Quarantined Submission Adjudication and Verification Suite', () =
       expect(rSettled.error).toContain('contradictory SETTLED disposition');
     });
 
-    it('345. RECOVERY_FENCED recovery performs the same disposition matrix for pre-result and result-bearing cases', () => {
-      function createFreshFixtures(): FullAdjudicationFixtures {
+    it('345. RECOVERY_FENCED recovery performs the same disposition matrix for pre-result and result-bearing cases', async () => {
+      async function createFreshFixtures(): Promise<FullAdjudicationFixtures> {
         const dir = path.join(os.tmpdir(), 'af-fresh-' + Date.now() + '-' + crypto.randomUUID().slice(0, 8));
         fs.mkdirSync(dir, { recursive: true });
         const repoDir = path.join(dir, 'repo');
@@ -2919,7 +2919,7 @@ describe('R5J5 Quarantined Submission Adjudication and Verification Suite', () =
       }
 
       // 1a. Missing disposition fails closed
-      const fx1 = createFreshFixtures();
+      const fx1 = await createFreshFixtures();
       const setup1 = setupPreResult(fx1);
       const adj1 = fx1.repo.getCoderSubmissionAdjudicationById(setup1.adjId)!;
       const rPreMissing = fx1.recoveryScanner.reconcileSingleAdjudication(adj1);
@@ -2927,7 +2927,7 @@ describe('R5J5 Quarantined Submission Adjudication and Verification Suite', () =
       expect(rPreMissing.error).toContain('Expected exactly one terminal disposition for pre-result RECOVERY_FENCED');
 
       // 1b. Duplicate dispositions fail closed
-      const fx1b = createFreshFixtures();
+      const fx1b = await createFreshFixtures();
       const setup1b = setupPreResult(fx1b);
       const expectedDispId1b = deriveDeterministicDispositionId(setup1b.subId, setup1b.adjId, 3);
       fx1b.repo.createCoderSubmissionDisposition({
@@ -2956,7 +2956,7 @@ describe('R5J5 Quarantined Submission Adjudication and Verification Suite', () =
       expect(rPreDup.error).toContain('Expected exactly one terminal disposition for pre-result RECOVERY_FENCED, found 2');
 
       // 1c. Contradictory SETTLED disposition fails closed
-      const fx1c = createFreshFixtures();
+      const fx1c = await createFreshFixtures();
       const setup1c = setupPreResult(fx1c);
       fx1c.repo.createCoderSubmissionDisposition({
         id: deriveDeterministicDispositionId(setup1c.subId, setup1c.adjId, 3),
@@ -3072,8 +3072,8 @@ describe('R5J5 Quarantined Submission Adjudication and Verification Suite', () =
       expect(recon.error).toContain('Deterministic event payload hash mismatch');
     });
 
-    it('347. Terminal event rejects duplicate sequence, wrong deterministic ID, wrong canonical bytes, wrong type, wrong project/task/attempt, extra event rows', () => {
-      function createFreshFixtures(): FullAdjudicationFixtures {
+    it('347. Terminal event rejects duplicate sequence, wrong deterministic ID, wrong canonical bytes, wrong type, wrong project/task/attempt, extra event rows', async () => {
+      async function createFreshFixtures(): Promise<FullAdjudicationFixtures> {
         const dir = path.join(os.tmpdir(), 'af-fresh-' + Date.now() + '-' + crypto.randomUUID().slice(0, 8));
         fs.mkdirSync(dir, { recursive: true });
         const repoDir = path.join(dir, 'repo');
@@ -3174,7 +3174,7 @@ describe('R5J5 Quarantined Submission Adjudication and Verification Suite', () =
       }
 
       // Probe 1: Wrong deterministic ID
-      const fx1 = createFreshFixtures();
+      const fx1 = await createFreshFixtures();
       const setup1 = setupPreResultEventTest(fx1);
       const wrongId = crypto.randomUUID();
       fx1.repo.createCoderSubmissionAdjudicationEvent({
@@ -3192,7 +3192,7 @@ describe('R5J5 Quarantined Submission Adjudication and Verification Suite', () =
       expect(rWrongId.error).toContain('Deterministic event ID mismatch');
 
       // Probe 2: Wrong event_type
-      const fx2 = createFreshFixtures();
+      const fx2 = await createFreshFixtures();
       const setup2 = setupPreResultEventTest(fx2);
       const rightId2 = deriveDeterministicAdjudicationEventId(setup2.adjId, 3, 'RECOVERY_FENCED', setup2.expectedHash);
       fx2.repo.createCoderSubmissionAdjudicationEvent({
@@ -3210,7 +3210,7 @@ describe('R5J5 Quarantined Submission Adjudication and Verification Suite', () =
       expect(rWrongType.error).toContain('must have type RECOVERY_FENCED');
 
       // Probe 3: Extra event rows
-      const fx3 = createFreshFixtures();
+      const fx3 = await createFreshFixtures();
       const setup3 = setupPreResultEventTest(fx3);
       const rightId3 = deriveDeterministicAdjudicationEventId(setup3.adjId, 3, 'RECOVERY_FENCED', setup3.expectedHash);
       fx3.repo.createCoderSubmissionAdjudicationEvent({
@@ -3720,7 +3720,7 @@ describe('R5J5 Quarantined Submission Adjudication and Verification Suite', () =
 
       // Subcase 2: Contradictory terminal disposition
       {
-        const fx2 = setupFullSubmissionGraph(fixtures.db, fixtures.projectRoot, fixtures.artifactStore.getBaseDir());
+        const fx2 = await setupFullSubmissionGraph(fixtures.db, fixtures.projectRoot, fixtures.artifactStore.getBaseDir());
         const { plaintextToken } = issueSubmissionSessionHelper(fx2.repo, fx2.authorizationId);
         const subId = crypto.randomUUID();
         fx2.mcpService.submitCoderClaim(createValidSubmissionPayload(fx2, subId), plaintextToken);
@@ -3753,7 +3753,7 @@ describe('R5J5 Quarantined Submission Adjudication and Verification Suite', () =
 
       // Subcase 3: Missing deterministic terminal event
       {
-        const fx3 = setupFullSubmissionGraph(fixtures.db, fixtures.projectRoot, fixtures.artifactStore.getBaseDir());
+        const fx3 = await setupFullSubmissionGraph(fixtures.db, fixtures.projectRoot, fixtures.artifactStore.getBaseDir());
         const { plaintextToken } = issueSubmissionSessionHelper(fx3.repo, fx3.authorizationId);
         const subId = crypto.randomUUID();
         fx3.mcpService.submitCoderClaim(createValidSubmissionPayload(fx3, subId), plaintextToken);
@@ -3781,7 +3781,7 @@ describe('R5J5 Quarantined Submission Adjudication and Verification Suite', () =
 
       // Subcase 4: Contradictory event sequence
       {
-        const fx4 = setupFullSubmissionGraph(fixtures.db, fixtures.projectRoot, fixtures.artifactStore.getBaseDir());
+        const fx4 = await setupFullSubmissionGraph(fixtures.db, fixtures.projectRoot, fixtures.artifactStore.getBaseDir());
         const { plaintextToken } = issueSubmissionSessionHelper(fx4.repo, fx4.authorizationId);
         const subId = crypto.randomUUID();
         fx4.mcpService.submitCoderClaim(createValidSubmissionPayload(fx4, subId), plaintextToken);

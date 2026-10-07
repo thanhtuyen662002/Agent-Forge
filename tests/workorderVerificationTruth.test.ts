@@ -1,4 +1,5 @@
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
+import { approveFixtureCommand } from './helpers/verificationCapabilityFixture';
 import { execSync } from 'child_process';
 import Database from 'better-sqlite3';
 import fs from 'fs';
@@ -45,12 +46,21 @@ describe('WorkOrder Verification Guidance Truthfulness & Immutability Hardening'
 
   let tempDir: string;
 
+  const physicalExecutable = fs.realpathSync.native(process.execPath);
+  const expectedExecutable = /\s/.test(physicalExecutable) ? `"${physicalExecutable}"` : physicalExecutable;
+  const expectedCommand = (argumentText: string) => `${expectedExecutable} ${argumentText}`;
+
   beforeEach(async () => {
     tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'agentforge-workorder-truth-test-'));
     execSync('git init', { cwd: tempDir });
     execSync('git config user.email "test@agentforge.test"', { cwd: tempDir });
     execSync('git config user.name "Tester"', { cwd: tempDir });
     fs.writeFileSync(path.join(tempDir, 'README.md'), '# Initial README\n');
+    for (const name of ['verify.js', 'run_tests.js', 'lint.js', 'build.js', 'test suite/integration spec.js']) {
+      const scriptPath = path.join(tempDir, name);
+      fs.mkdirSync(path.dirname(scriptPath), { recursive: true });
+      fs.writeFileSync(scriptPath, 'process.exit(0);\n');
+    }
     execSync('git add . && git commit -m "initial commit"', { cwd: tempDir });
 
     db = new Database(':memory:');
@@ -172,16 +182,16 @@ describe('WorkOrder Verification Guidance Truthfulness & Immutability Hardening'
   // PR15 RETENTION TESTS
   // =========================================================================
 
-  it('PR15-1. Legacy WorkOrder uses durable project verification truth without invented npm defaults', () => {
+  it('PR15-1. Legacy WorkOrder uses durable project verification truth without invented npm defaults', async () => {
     repo.setProjectVerificationCommands(testProjectId, {
-      TEST: { executable: 'node', args: ['verify.js'] },
+      TEST: await approveFixtureCommand(repo, testProjectId, ['verify.js']),
       LINT: null,
       BUILD: null,
     });
 
     const workOrder = PackageGenerator.generateWorkOrder(testProject, testTask, repo);
 
-    expect(workOrder).toContain('- **Test**: `node verify.js`');
+    expect(workOrder).toContain('- **Test**: `' + expectedCommand('verify.js') + '`');
     expect(workOrder).toContain('- **Lint**: Not configured');
     expect(workOrder).toContain('- **Build**: Not configured');
     expect(workOrder).not.toContain('`npm test`');
@@ -189,9 +199,9 @@ describe('WorkOrder Verification Guidance Truthfulness & Immutability Hardening'
     expect(workOrder).not.toContain('`npm run build`');
   });
 
-  it('PR15-2. Legacy WorkOrder cross-project isolation: Project A command never leaks to Project B', () => {
+  it('PR15-2. Legacy WorkOrder cross-project isolation: Project A command never leaks to Project B', async () => {
     repo.setProjectVerificationCommands(testProjectId, {
-      TEST: { executable: 'node', args: ['verify.js'] },
+      TEST: await approveFixtureCommand(repo, testProjectId, ['verify.js']),
     });
 
     const projBId = 'PROJ-TEST-002';
@@ -221,16 +231,16 @@ describe('WorkOrder Verification Guidance Truthfulness & Immutability Hardening'
     });
 
     repo.setProjectVerificationCommands(projBId, {
-      TEST: { executable: 'python', args: ['run_tests.py'] },
+      TEST: await approveFixtureCommand(repo, projBId, ['run_tests.js']),
     });
 
     const woA = PackageGenerator.generateWorkOrder(testProject, testTask, repo);
     const woB = PackageGenerator.generateWorkOrder(projB, taskB, repo);
 
-    expect(woA).toContain('- **Test**: `node verify.js`');
-    expect(woA).not.toContain('run_tests.py');
+    expect(woA).toContain('- **Test**: `' + expectedCommand('verify.js') + '`');
+    expect(woA).not.toContain('run_tests.js');
 
-    expect(woB).toContain('- **Test**: `python run_tests.py`');
+    expect(woB).toContain('- **Test**: `' + expectedCommand('run_tests.js') + '`');
     expect(woB).not.toContain('verify.js');
   });
 
@@ -261,33 +271,33 @@ describe('WorkOrder Verification Guidance Truthfulness & Immutability Hardening'
     expect(authWO).toContain('- **Build**: Not configured');
   });
 
-  it('PR15-5. Caller-supplied verification override remains impossible: generateWorkOrder requires Repository', () => {
+  it('PR15-5. Caller-supplied verification override remains impossible: generateWorkOrder requires Repository', async () => {
     repo.setProjectVerificationCommands(testProjectId, {
-      TEST: { executable: 'node', args: ['verify.js'] },
+      TEST: await approveFixtureCommand(repo, testProjectId, ['verify.js']),
     });
 
     // Passing repository renders durable SQLite truth
     const workOrder = PackageGenerator.generateWorkOrder(testProject, testTask, repo);
-    expect(workOrder).toContain('- **Test**: `node verify.js`');
+    expect(workOrder).toContain('- **Test**: `' + expectedCommand('verify.js') + '`');
   });
 
   it('PR15-6. Complex and quoted arguments rendering for TEST, LINT, and BUILD across both paths', async () => {
     repo.setProjectVerificationCommands(testProjectId, {
-      TEST: { executable: 'node', args: ['--test', 'test suite/integration spec.js', '--filter="all tests"'] },
-      LINT: { executable: 'eslint', args: ['--rule', '{"semi": "error"}', 'src/'] },
-      BUILD: { executable: 'bash', args: ['-c', 'npm run build --prefix "app frontend"'] },
+      TEST: await approveFixtureCommand(repo, testProjectId, ['--test', 'test suite/integration spec.js', '--test-name-pattern=all tests']),
+      LINT: await approveFixtureCommand(repo, testProjectId, ['lint.js', '--rule', '{"semi": "error"}', 'src/']),
+      BUILD: await approveFixtureCommand(repo, testProjectId, ['build.js', '--prefix', 'app frontend']),
     });
 
     const legacyWO = PackageGenerator.generateWorkOrder(testProject, testTask, repo);
-    expect(legacyWO).toContain('- **Test**: `node --test "test suite/integration spec.js" \'--filter="all tests"\'`');
-    expect(legacyWO).toContain('- **Lint**: `eslint --rule \'{"semi": "error"}\' src/`');
-    expect(legacyWO).toContain('- **Build**: `bash -c \'npm run build --prefix "app frontend"\'`');
+    expect(legacyWO).toContain('- **Test**: `' + expectedCommand('--test "test suite/integration spec.js" "--test-name-pattern=all tests"') + '`');
+    expect(legacyWO).toContain('- **Lint**: `' + expectedCommand("lint.js --rule '{\"semi\": \"error\"}' src/") + '`');
+    expect(legacyWO).toContain('- **Build**: `' + expectedCommand('build.js --prefix "app frontend"') + '`');
 
     const authId = await createAndDispatchManualHandoff(testProjectId, testTaskId);
     const authWO = PackageGenerator.generateAuthorizedManualWorkOrder(authId, repo);
-    expect(authWO).toContain('- **Test**: `node --test "test suite/integration spec.js" \'--filter="all tests"\'`');
-    expect(authWO).toContain('- **Lint**: `eslint --rule \'{"semi": "error"}\' src/`');
-    expect(authWO).toContain('- **Build**: `bash -c \'npm run build --prefix "app frontend"\'`');
+    expect(authWO).toContain('- **Test**: `' + expectedCommand('--test "test suite/integration spec.js" "--test-name-pattern=all tests"') + '`');
+    expect(authWO).toContain('- **Lint**: `' + expectedCommand("lint.js --rule '{\"semi\": \"error\"}' src/") + '`');
+    expect(authWO).toContain('- **Build**: `' + expectedCommand('build.js --prefix "app frontend"') + '`');
   });
 
   // =========================================================================
@@ -296,20 +306,20 @@ describe('WorkOrder Verification Guidance Truthfulness & Immutability Hardening'
 
   it('CASE A: Authorized WorkOrder reflects durable TEST=node verify.js and unconfigured LINT/BUILD', async () => {
     repo.setProjectVerificationCommands(testProjectId, {
-      TEST: { executable: 'node', args: ['verify.js'] },
+      TEST: await approveFixtureCommand(repo, testProjectId, ['verify.js']),
     });
 
     const authId = await createAndDispatchManualHandoff(testProjectId, testTaskId);
     const workOrder = PackageGenerator.generateAuthorizedManualWorkOrder(authId, repo);
 
-    expect(workOrder).toContain('- **Test**: `node verify.js`');
+    expect(workOrder).toContain('- **Test**: `' + expectedCommand('verify.js') + '`');
     expect(workOrder).toContain('- **Lint**: Not configured');
     expect(workOrder).toContain('- **Build**: Not configured');
   });
 
   it('CASE B: Settings mutation after authorization does not alter Authorized WorkOrder (frozen snapshot immutability)', async () => {
     repo.setProjectVerificationCommands(testProjectId, {
-      TEST: { executable: 'node', args: ['verify.js'] },
+      TEST: await approveFixtureCommand(repo, testProjectId, ['verify.js']),
     });
 
     const authId = await createAndDispatchManualHandoff(testProjectId, testTaskId);
@@ -323,7 +333,7 @@ describe('WorkOrder Verification Guidance Truthfulness & Immutability Hardening'
     const workOrder = PackageGenerator.generateAuthorizedManualWorkOrder(authId, repo);
 
     // Must STILL render frozen node verify.js
-    expect(workOrder).toContain('- **Test**: `node verify.js`');
+    expect(workOrder).toContain('- **Test**: `' + expectedCommand('verify.js') + '`');
     expect(workOrder).not.toContain('pytest');
     expect(workOrder).not.toContain('test_mutated.py');
     expect(workOrder).toContain('- **Lint**: Not configured');
@@ -332,7 +342,7 @@ describe('WorkOrder Verification Guidance Truthfulness & Immutability Hardening'
 
   it('CASE C: Multiple generations of Authorized WorkOrder from the same authorization are byte-for-byte identical', async () => {
     repo.setProjectVerificationCommands(testProjectId, {
-      TEST: { executable: 'node', args: ['verify.js'] },
+      TEST: await approveFixtureCommand(repo, testProjectId, ['verify.js']),
     });
 
     const authId = await createAndDispatchManualHandoff(testProjectId, testTaskId);
@@ -372,7 +382,7 @@ describe('WorkOrder Verification Guidance Truthfulness & Immutability Hardening'
 
   it('CASE G: Tampered verification snapshot inside canonical_payload_json fails closed', async () => {
     repo.setProjectVerificationCommands(testProjectId, {
-      TEST: { executable: 'node', args: ['verify.js'] },
+      TEST: await approveFixtureCommand(repo, testProjectId, ['verify.js']),
     });
 
     const authId = await createAndDispatchManualHandoff(testProjectId, testTaskId);
@@ -393,7 +403,7 @@ describe('WorkOrder Verification Guidance Truthfulness & Immutability Hardening'
 
   it('CASE H: Cross-project isolation ensures Project A verification command is never leaked into Project B WorkOrder', async () => {
     repo.setProjectVerificationCommands(testProjectId, {
-      TEST: { executable: 'node', args: ['verify.js'] },
+      TEST: await approveFixtureCommand(repo, testProjectId, ['verify.js']),
     });
 
     const projBId = 'PROJ-TEST-002';
@@ -423,7 +433,7 @@ describe('WorkOrder Verification Guidance Truthfulness & Immutability Hardening'
     });
 
     repo.setProjectVerificationCommands(projBId, {
-      TEST: { executable: 'python', args: ['run_tests.py'] },
+      TEST: await approveFixtureCommand(repo, projBId, ['run_tests.js']),
     });
 
     const authAId = await createAndDispatchManualHandoff(testProjectId, testTaskId);
@@ -432,10 +442,10 @@ describe('WorkOrder Verification Guidance Truthfulness & Immutability Hardening'
     const workOrderA = PackageGenerator.generateAuthorizedManualWorkOrder(authAId, repo);
     const workOrderB = PackageGenerator.generateAuthorizedManualWorkOrder(authBId, repo);
 
-    expect(workOrderA).toContain('- **Test**: `node verify.js`');
-    expect(workOrderA).not.toContain('run_tests.py');
+    expect(workOrderA).toContain('- **Test**: `' + expectedCommand('verify.js') + '`');
+    expect(workOrderA).not.toContain('run_tests.js');
 
-    expect(workOrderB).toContain('- **Test**: `python run_tests.py`');
+    expect(workOrderB).toContain('- **Test**: `' + expectedCommand('run_tests.js') + '`');
     expect(workOrderB).not.toContain('verify.js');
   });
 
@@ -475,7 +485,7 @@ describe('WorkOrder Verification Guidance Truthfulness & Immutability Hardening'
 
   it('CASE K: Legacy WorkOrder response template has no fabricated claims and is deterministic', async () => {
     repo.setProjectVerificationCommands(testProjectId, {
-      TEST: { executable: 'node', args: ['verify.js'] },
+      TEST: await approveFixtureCommand(repo, testProjectId, ['verify.js']),
     });
 
     const legacyWO1 = PackageGenerator.generateWorkOrder(testProject, testTask, repo);
@@ -493,13 +503,13 @@ describe('WorkOrder Verification Guidance Truthfulness & Immutability Hardening'
 
   it('CASE L: Arguments needing quoting are rendered deterministically and unambiguously', async () => {
     repo.setProjectVerificationCommands(testProjectId, {
-      TEST: { executable: 'node', args: ['--test', 'test suite/integration spec.js', '--filter="all tests"'] },
+      TEST: await approveFixtureCommand(repo, testProjectId, ['--test', 'test suite/integration spec.js', '--test-name-pattern=all tests']),
     });
 
     const authId = await createAndDispatchManualHandoff(testProjectId, testTaskId);
     const authWorkOrder = PackageGenerator.generateAuthorizedManualWorkOrder(authId, repo);
 
-    expect(authWorkOrder).toContain('- **Test**: `node --test "test suite/integration spec.js" \'--filter="all tests"\'`');
+    expect(authWorkOrder).toContain('- **Test**: `' + expectedCommand('--test "test suite/integration spec.js" "--test-name-pattern=all tests"') + '`');
   });
 
   // =========================================================================
@@ -508,7 +518,7 @@ describe('WorkOrder Verification Guidance Truthfulness & Immutability Hardening'
 
   it('CASE M: Nested TEST unknown field causes Authorized WorkOrder generation to fail strict schema validation', async () => {
     repo.setProjectVerificationCommands(testProjectId, {
-      TEST: { executable: 'node', args: ['verify.js'] },
+      TEST: await approveFixtureCommand(repo, testProjectId, ['verify.js']),
     });
 
     const authId = await createAndDispatchManualHandoff(testProjectId, testTaskId);
@@ -529,7 +539,7 @@ describe('WorkOrder Verification Guidance Truthfulness & Immutability Hardening'
 
   it('CASE N: Unknown verification command key causes Authorized WorkOrder generation to fail strict schema validation', async () => {
     repo.setProjectVerificationCommands(testProjectId, {
-      TEST: { executable: 'node', args: ['verify.js'] },
+      TEST: await approveFixtureCommand(repo, testProjectId, ['verify.js']),
     });
 
     const authId = await createAndDispatchManualHandoff(testProjectId, testTaskId);
@@ -677,7 +687,7 @@ describe('WorkOrder Verification Guidance Truthfulness & Immutability Hardening'
 
   it('CASE S: Tampered surrounding whitespace in verificationCommands.TEST.executable fails closed for Authorized WorkOrder generation', async () => {
     repo.setProjectVerificationCommands(testProjectId, {
-      TEST: { executable: 'node', args: ['verify.js'] },
+      TEST: await approveFixtureCommand(repo, testProjectId, ['verify.js']),
     });
 
     const authId = await createAndDispatchManualHandoff(testProjectId, testTaskId);
@@ -747,13 +757,13 @@ describe('WorkOrder Verification Guidance Truthfulness & Immutability Hardening'
 
   it('CASE U: Canonical valid executable ("node") with args (["verify.js"]) passes authorization, dispatch, and deterministic WorkOrder generation', async () => {
     repo.setProjectVerificationCommands(testProjectId, {
-      TEST: { executable: 'node', args: ['verify.js'] },
+      TEST: await approveFixtureCommand(repo, testProjectId, ['verify.js']),
     });
 
     const authId = await createAndDispatchManualHandoff(testProjectId, testTaskId);
     const workOrder = PackageGenerator.generateAuthorizedManualWorkOrder(authId, repo);
 
-    expect(workOrder).toContain('- **Test**: `node verify.js`');
+    expect(workOrder).toContain('- **Test**: `' + expectedCommand('verify.js') + '`');
   });
 
   it('CASE V: Whitespace-only or empty executable cannot pass VerificationCommandSnapshotSchema', () => {

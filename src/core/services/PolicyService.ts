@@ -9,7 +9,102 @@ export interface PolicyEvaluationResult {
   reason: string;
 }
 
+export type VerificationCandidateReason =
+  | 'INVALID_CANDIDATE'
+  | 'CANDIDATE_LIMIT_EXCEEDED'
+  | 'SHELL_OR_ENV_INDIRECTION'
+  | 'PACKAGE_MANAGER_INDIRECTION'
+  | 'SCRIPT_HOST_INDIRECTION'
+  | 'INLINE_EVALUATION'
+  | 'RUNTIME_HOOK'
+  | 'SHELL_SYNTAX'
+  | 'PATH_TRAVERSAL'
+  | 'NETWORK_EXECUTABLE'
+  | 'INTERPRETER_IDENTITY_REQUIRED'
+  | 'CANONICAL_IDENTITY_REQUIRED';
+
+export interface VerificationCandidateClassification {
+  readonly decision: 'DENY' | 'CAPABILITY_REQUIRED';
+  readonly reasonCode: VerificationCandidateReason;
+}
+
+const VERIFICATION_SHELL_STEMS = new Set(['bash', 'sh', 'dash', 'ash', 'zsh', 'ksh', 'csh', 'tcsh', 'fish', 'cmd', 'command', 'powershell', 'pwsh', 'env', 'busybox']);
+const VERIFICATION_PACKAGE_STEMS = new Set(['npm', 'npx', 'pnpm', 'pnpx', 'yarn', 'yarnpkg', 'corepack', 'bunx', 'pip', 'pip3', 'pipx', 'uv', 'composer', 'gem']);
+const VERIFICATION_SCRIPT_HOST_STEMS = new Set(['mshta', 'wscript', 'cscript', 'rundll32', 'regsvr32']);
+const VERIFICATION_INTERPRETER_STEMS = /^(?:node|nodejs|python(?:w|\d+(?:\.\d+)*)?|py|pypy(?:\d+)?|bun|deno|perl|ruby|jruby|lua(?:\d+(?:\.\d+)*)?|php|java|dotnet|mono)$/;
+
+const VERIFICATION_CANDIDATE_MAX_EXECUTABLE = 4096;
+const VERIFICATION_CANDIDATE_MAX_ARGUMENTS = 128;
+const VERIFICATION_CANDIDATE_MAX_ARGUMENT = 4096;
+const VERIFICATION_CANDIDATE_MAX_TOTAL_ARGUMENTS = 16384;
+
 export class PolicyService {
+  /**
+   * Pure preparation for the verification capability boundary. This classifier
+   * never authorizes execution and does not alter general process policy.
+   * Filesystem identity, owner approval and pre-spawn fencing are separate gates.
+   */
+  public static classifyVerificationCommandCandidate(
+    executable: unknown,
+    args: unknown,
+    allowShell: unknown = false,
+  ): VerificationCandidateClassification {
+    const deny = (reasonCode: VerificationCandidateReason): VerificationCandidateClassification =>
+      Object.freeze({ decision: 'DENY', reasonCode });
+    const requireCapability = (reasonCode: VerificationCandidateReason): VerificationCandidateClassification =>
+      Object.freeze({ decision: 'CAPABILITY_REQUIRED', reasonCode });
+    try {
+      if (typeof executable !== 'string' || executable.length === 0 || executable !== executable.trim() ||
+          !Array.isArray(args) || typeof allowShell !== 'boolean') return deny('INVALID_CANDIDATE');
+      const count = args.length;
+      if (!Number.isSafeInteger(count) || count < 0) return deny('INVALID_CANDIDATE');
+      if (executable.length > VERIFICATION_CANDIDATE_MAX_EXECUTABLE || count > VERIFICATION_CANDIDATE_MAX_ARGUMENTS) {
+        return deny('CANDIDATE_LIMIT_EXCEEDED');
+      }
+      const controls = /[\u0000-\u001f\u007f-\u009f\u2028\u2029]/;
+      const shellSyntax = /[;&|<>`$]/;
+      if (controls.test(executable)) return deny('INVALID_CANDIDATE');
+      if (allowShell) return deny('SHELL_OR_ENV_INDIRECTION');
+      if (shellSyntax.test(executable) || /["'*?]/.test(executable)) return deny('SHELL_SYNTAX');
+      if (/^(?:\\\\|\/\/)/.test(executable)) return deny('NETWORK_EXECUTABLE');
+      const portable = executable.replace(/\\/g, '/');
+      if (portable.split('/').includes('..')) return deny('PATH_TRAVERSAL');
+      const basename = portable.split('/').pop()!.toLowerCase();
+      if (!basename || basename === '.') return deny('INVALID_CANDIDATE');
+      // Repeated Windows suffixes cannot hide a known host behind e.g. npm.cmd.exe.
+      const stem = basename.replace(/(?:\.(?:exe|cmd|bat|com))+$/, '');
+      let total = 0;
+      const normalizedArguments: string[] = [];
+      for (let index = 0; index < count; index += 1) {
+        const argument = args[index];
+        if (typeof argument !== 'string' || controls.test(argument)) return deny('INVALID_CANDIDATE');
+        total += argument.length;
+        if (argument.length > VERIFICATION_CANDIDATE_MAX_ARGUMENT || total > VERIFICATION_CANDIDATE_MAX_TOTAL_ARGUMENTS) {
+          return deny('CANDIDATE_LIMIT_EXCEEDED');
+        }
+        if (shellSyntax.test(argument)) return deny('SHELL_SYNTAX');
+        normalizedArguments.push(argument.toLowerCase());
+      }
+      if (VERIFICATION_SHELL_STEMS.has(stem)) return deny('SHELL_OR_ENV_INDIRECTION');
+      if (VERIFICATION_PACKAGE_STEMS.has(stem)) return deny('PACKAGE_MANAGER_INDIRECTION');
+      if (VERIFICATION_SCRIPT_HOST_STEMS.has(stem) || /\.(?:ps1|vbs|vbe|wsf|wsh|hta)$/.test(basename)) {
+        return deny('SCRIPT_HOST_INDIRECTION');
+      }
+      if (VERIFICATION_INTERPRETER_STEMS.test(stem)) {
+        if (normalizedArguments.some((argument) => /^-[ecp]|^--(?:eval|print)(?:=|$)/.test(argument) ||
+            (stem === 'deno' && argument === 'eval'))) return deny('INLINE_EVALUATION');
+        if (normalizedArguments.some((argument) => /^-r|^--(?:require|import|loader|experimental-loader)(?:=|$)/.test(argument))) {
+          return deny('RUNTIME_HOOK');
+        }
+        return requireCapability('INTERPRETER_IDENTITY_REQUIRED');
+      }
+      return requireCapability('CANONICAL_IDENTITY_REQUIRED');
+    } catch {
+      // Getter/proxy failures are untrusted input, not diagnostic authority.
+      return deny('INVALID_CANDIDATE');
+    }
+  }
+
   private static SENSITIVE_DIRS = [
     '.git',
     '.ssh',

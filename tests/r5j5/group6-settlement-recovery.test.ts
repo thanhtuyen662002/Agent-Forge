@@ -3,6 +3,7 @@ import Database from 'better-sqlite3';
 import path from 'path';
 import fs from 'fs';
 import os from 'os';
+import { approveFixtureScript } from '../helpers/verificationCapabilityFixture';
 import crypto from 'crypto';
 import child_process from 'child_process';
 import {
@@ -105,7 +106,7 @@ describe('R5J5 Quarantined Submission Adjudication and Verification Suite', () =
   let dbPath: string;
   let fixtures: FullAdjudicationFixtures;
 
-  beforeEach(() => {
+  beforeEach(async () => {
     tempDir = path.join(os.tmpdir(), 'af-adj-test-' + Date.now() + '-' + crypto.randomUUID().slice(0, 8));
     fs.mkdirSync(tempDir, { recursive: true });
 
@@ -125,7 +126,7 @@ describe('R5J5 Quarantined Submission Adjudication and Verification Suite', () =
     const created = createTestDatabase(tempDir, 'adjudication-test.db');
     db = created.db;
     dbPath = created.dbPath;
-    fixtures = setupFullSubmissionGraph(db, repoDir, artifactsDir);
+    fixtures = await setupFullSubmissionGraph(db, repoDir, artifactsDir);
   }, 120000);
 
   afterEach(() => {
@@ -205,7 +206,7 @@ describe('R5J5 Quarantined Submission Adjudication and Verification Suite', () =
       // Force failure command
       const auth = fixtures.repo.getExecutionAuthorization(fixtures.authorizationId)!;
       const payload = JSON.parse(auth.canonical_payload_json!);
-      payload.verificationCommands.TEST = { executable: process.execPath, args: ['-e', 'process.exit(1)'], timeout_ms: 120000 };
+      payload.verificationCommands.TEST = { ...await approveFixtureScript(fixtures.repo, fixtures.projectId, 'process.exit(1);'), timeout_ms: 120000 };
       const newHash = computePayloadHash(payload);
       const newJson = JSON.stringify(payload);
       db.prepare('UPDATE execution_authorizations SET canonical_payload_json = ?, instruction_payload_hash = ? WHERE id = ?')
@@ -226,7 +227,7 @@ describe('R5J5 Quarantined Submission Adjudication and Verification Suite', () =
 
       const auth = fixtures.repo.getExecutionAuthorization(fixtures.authorizationId)!;
       const payload = JSON.parse(auth.canonical_payload_json!);
-      payload.verificationCommands.TEST = { executable: process.execPath, args: ['-e', 'process.exit(1)'], timeout_ms: 120000 };
+      payload.verificationCommands.TEST = { ...await approveFixtureScript(fixtures.repo, fixtures.projectId, 'process.exit(1);'), timeout_ms: 120000 };
       const newHash = computePayloadHash(payload);
       const newJson = JSON.stringify(payload);
       db.prepare('UPDATE execution_authorizations SET canonical_payload_json = ?, instruction_payload_hash = ? WHERE id = ?')
@@ -248,7 +249,7 @@ describe('R5J5 Quarantined Submission Adjudication and Verification Suite', () =
 
       const auth = fixtures.repo.getExecutionAuthorization(fixtures.authorizationId)!;
       const payload = JSON.parse(auth.canonical_payload_json!);
-      payload.verificationCommands.TEST = { executable: process.execPath, args: ['-e', 'process.exit(1)'], timeout_ms: 120000 };
+      payload.verificationCommands.TEST = { ...await approveFixtureScript(fixtures.repo, fixtures.projectId, 'process.exit(1);'), timeout_ms: 120000 };
       const newHash = computePayloadHash(payload);
       const newJson = JSON.stringify(payload);
       db.prepare('UPDATE execution_authorizations SET canonical_payload_json = ?, instruction_payload_hash = ? WHERE id = ?')

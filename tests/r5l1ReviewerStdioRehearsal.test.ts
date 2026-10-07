@@ -75,7 +75,7 @@ function assertExited(pid: number) {
 describe('R5L1 reviewer over real stdio subprocess', () => {
   it('reads frozen packages and rejects foreign, stale and revoked access with child-connection zero writes', async () => {
     const marker = 'STDIO_PRIVATE_' + crypto.randomUUID();
-    const env = setupSyntheticRehearsalEnv({ taskTitleMarker: marker });
+    const env = await setupSyntheticRehearsalEnv({ taskTitleMarker: marker });
     let client: Client | undefined;
     let transport: StdioClientTransport | undefined;
     let pid: number | null = null;
@@ -163,13 +163,13 @@ describe('R5L1 reviewer over real stdio subprocess', () => {
     expect(fs.existsSync(env.tempDir)).toBe(false);
   }, 60000);
 
-  it('closes SQLite and removes partial fixture if setup fails before returning env', () => {
+  it('closes SQLite and removes partial fixture if setup fails before returning env', async () => {
     let partial: { tempDir: string; db: import('better-sqlite3').Database } | undefined;
     const failure = new Error('injected setup failure after database open');
-    expect(() => setupSyntheticRehearsalEnv({ afterDatabaseOpened(resources) {
+    await expect(setupSyntheticRehearsalEnv({ afterDatabaseOpened(resources) {
       partial = resources;
       throw failure;
-    } })).toThrow(failure);
+    } })).rejects.toThrow(failure);
     expect(partial).toBeDefined();
     expect(partial!.db.open).toBe(false);
     expect(fs.existsSync(partial!.tempDir)).toBe(false);

@@ -10,6 +10,8 @@ import {
   VerificationExecutionObservation,
 } from '../types/adjudication';
 import { computeSha256 } from '../../mcp/submissionProtocol';
+import { VerificationCapabilityService } from './VerificationCapabilityService';
+import { VerificationCapabilityReference, VerificationProcessBoundary } from '../types/verificationCapability';
 
 export { shouldRunCoderVerification } from '../state/taskStateMachine';
 
@@ -29,6 +31,7 @@ export interface VerificationRunOptions {
   deferPersistence?: boolean;
   /** Bind the child process to the caller's durable execution identity. */
   executionId?: string;
+  authorizationId?: string;
 }
 
 export type DeferredTestRun = TestRun & {
@@ -126,6 +129,7 @@ export class VerificationService {
     let args: string[];
     let timeoutMs: number;
     let commandName: string;
+    let capability: VerificationCapabilityReference | null | undefined;
 
     if (commandConfigId) {
       const cfg = this.repo.getVerificationCommandById(commandConfigId);
@@ -174,6 +178,7 @@ export class VerificationService {
       args = cfg.args;
       timeoutMs = cfg.timeout_ms || 120000;
       commandName = cfg.name;
+      capability = cfg.capability;
     } else {
       // Look up enabled default TEST command for project
       const cmds = this.repo.getVerificationCommandsByProject(projectId);
@@ -193,9 +198,17 @@ export class VerificationService {
       args = testCmd.args;
       timeoutMs = testCmd.timeout_ms || 120000;
       commandName = testCmd.name;
+      capability = testCmd.capability;
     }
 
     const fullCommandStr = `${executable} ${args.join(' ')}`;
+    let verificationBoundary: VerificationProcessBoundary;
+    try {
+      verificationBoundary = new VerificationCapabilityService(this.repo).createProcessBoundary(
+        capability as VerificationCapabilityReference, projectId, executable, args, repoPath, options.authorizationId);
+    } catch {
+      return this.recordFailure(projectId, taskId, attemptId, fullCommandStr, 'OWNER_APPROVAL_REQUIRED: Verification capability is missing, stale or revoked.', deferPersistence);
+    }
 
     // 2. PolicyService execution gate
     const policy = PolicyService.evaluateProcessExecution(executable, args, false);
@@ -218,6 +231,7 @@ export class VerificationService {
       args,
       cwd: repoPath,
       timeoutMs,
+      verificationBoundary,
       executionId: options.executionId,
       deferPersistence,
       ...(deferPersistence
@@ -556,6 +570,22 @@ export class VerificationService {
 
     const commandName = typeof testCmdObj.name === 'string' ? testCmdObj.name : 'Frozen Authorization Test Suite';
     const fullCommandStr = `${executable} ${args.join(' ')}`;
+    let verificationBoundary: VerificationProcessBoundary;
+    try {
+      const capabilities = new VerificationCapabilityService(this.repo);
+      capabilities.validateSnapshot(input.project_id, commandsObj, input.repo_path, input.authorization_id);
+      verificationBoundary = capabilities.createProcessBoundary(testCmdObj.capability as VerificationCapabilityReference,
+        input.project_id, executable, args, input.repo_path, input.authorization_id);
+    } catch {
+      return {
+        outcome: 'COMMAND_POLICY_REJECTED', failure_code: 'COMMAND_POLICY_REJECTED',
+        reason: 'OWNER_APPROVAL_REQUIRED: Frozen verification capability is missing, stale or revoked.',
+        command: fullCommandStr, repo_path: input.repo_path, started_at: startedAtIso, finished_at: new Date().toISOString(),
+        exit_code: -1, duration_ms: 0, stdout: '', stderr: 'Verification capability rejected',
+        stdout_bytes: 0, stderr_bytes: 0, combined_output: '', metrics: { passedCount: 0, failedCount: 0, skippedCount: 0 },
+        process_start: 'NOT_STARTED_PROVEN', process_termination: 'NOT_APPLICABLE', timed_out: false, cancelled: false,
+      };
+    }
 
     // 3. PolicyService execution gate
     const policy = PolicyService.evaluateProcessExecution(executable, args, false);
@@ -590,6 +620,7 @@ export class VerificationService {
       result = await runner.execute({
         executable,
         args,
+        verificationBoundary,
         cwd: input.repo_path,
         timeoutMs,
         maxStdoutBytes: input.policy?.max_stdout_bytes,
@@ -744,6 +775,19 @@ export class VerificationService {
       };
     }
 
+    // Approval must still authorize the observed result after the child exits.
+    // Preserve actual process/exit observations if permission was withdrawn.
+    try {
+      verificationBoundary.assertInvocation(executable, args, input.repo_path);
+    } catch {
+      return {
+        outcome: 'COMMAND_POLICY_REJECTED', failure_code: 'COMMAND_POLICY_REJECTED',
+        reason: 'Verification capability changed while the child was running.', command: fullCommandStr, repo_path: input.repo_path,
+        started_at: startedAtIso, finished_at: finishedAtIso, exit_code: result.exitCode, duration_ms: result.durationMs,
+        stdout, stderr, stdout_bytes: stdoutBytes, stderr_bytes: stderrBytes, combined_output: combinedOutput, metrics,
+        process_start: result.processStart, process_termination: result.processTermination, timed_out: result.timedOut, cancelled: result.cancelled,
+      };
+    }
     // - Authoritative 0 exit (Success)
     return {
       outcome: 'SUCCESS',
@@ -777,6 +821,8 @@ export class VerificationService {
       args: string[];
       timeout_ms?: number;
       name?: string;
+      capability?: VerificationCapabilityReference | null;
+      authorization_id?: string;
     }
   ): Promise<TestRun> {
     const executable = frozenCommand.executable;
@@ -798,6 +844,13 @@ export class VerificationService {
     }
     const commandName = frozenCommand.name || 'Frozen Authorization Test Suite';
     const fullCommandStr = `${executable} ${args.join(' ')}`;
+    let verificationBoundary: VerificationProcessBoundary;
+    try {
+      verificationBoundary = new VerificationCapabilityService(this.repo).createProcessBoundary(frozenCommand.capability as VerificationCapabilityReference,
+        projectId, executable, args, repoPath, frozenCommand.authorization_id);
+    } catch {
+      return this.recordFailure(projectId, taskId, attemptId, fullCommandStr, 'OWNER_APPROVAL_REQUIRED: Frozen verification capability is missing, stale or revoked.');
+    }
 
     // 1. PolicyService execution gate
     const policy = PolicyService.evaluateProcessExecution(executable, args, false);
@@ -817,6 +870,7 @@ export class VerificationService {
       args,
       cwd: repoPath,
       timeoutMs,
+      verificationBoundary,
       repo: this.repo,
       artifactStore: this.artifactStore,
       projectId,

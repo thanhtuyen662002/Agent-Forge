@@ -2,11 +2,13 @@ import fs from 'fs';
 import path from 'path';
 import crypto from 'crypto';
 import { ProcessRunner } from '../services/ProcessRunner';
+import { isIssuedVerificationProcessBoundary, VerificationProcessBoundary } from '../types/verificationCapability';
 import { GitRevisionValidationError, validateGitRevision } from '../services/GitService';
 import { GitEvidence, WorkOrder, sanitizeAutonomyText } from './contracts';
 
 export interface EvidenceRunner {
-  execute(options: { executable: string; args: string[]; cwd: string; timeoutMs?: number; allowShell?: boolean }): Promise<{
+  execute(options: { executable: string; args: string[]; cwd: string; timeoutMs?: number; allowShell?: boolean;
+    verificationBoundary?: VerificationProcessBoundary }): Promise<{
     exitCode: number; stdout: string; stderr: string; durationMs: number;
   }>;
 }
@@ -19,17 +21,18 @@ function parseNames(output: string): string[] {
   return output.split(/\r?\n/).map((line) => line.trim()).filter(Boolean);
 }
 
-function splitCommand(command: string): string[] {
-  // Required tests are operator-authored strings, not shell scripts. Preserve
-  // quoted `node -e`/PowerShell arguments without invoking a shell.
-  return (command.match(/"(?:[^"\\]|\\.)*"|'(?:[^'\\]|\\.)*'|\S+/g) ?? [])
-    .map((part) => part.length >= 2 && ((part.startsWith('"') && part.endsWith('"')) || (part.startsWith("'") && part.endsWith("'"))) ? part.slice(1, -1) : part);
+export interface ApprovedVerificationInvocation {
+  command: string;
+  executable: string;
+  args: string[];
+  timeoutMs: number;
+  verificationBoundary: VerificationProcessBoundary;
 }
 
 export class EvidenceCollector {
   constructor(private readonly runner: EvidenceRunner = defaultRunner) {}
 
-  async collect(order: WorkOrder, testCommands: string[] = []): Promise<GitEvidence> {
+  async collect(order: WorkOrder, testCommands: string[] = [], approvedCommands?: ApprovedVerificationInvocation[]): Promise<GitEvidence> {
     const cwd = path.resolve(order.worktree);
     if (!fs.existsSync(cwd)) throw new Error(`WORKTREE_NOT_FOUND: ${cwd}`);
     // WorkOrder schema validation normally checks this field, but callers can
@@ -69,15 +72,15 @@ export class EvidenceCollector {
     const rawDiff = `${diff.stdout}\nWorking file snapshots (includes untracked):\n${JSON.stringify(snapshots)}`;
     const snapshotSha = crypto.createHash('sha256').update(JSON.stringify({ head: head.stdout.trim(), status: status.stdout, diff: rawDiff })).digest('hex');
     const tests = [];
-    for (const command of testCommands) {
-      const [executable, ...args] = command === 'agentforge:proof'
-        ? [process.execPath, path.resolve(__dirname, '../../electron/proofVerifier.js')]
-        : splitCommand(command.trim());
-      if (!executable) {
-        tests.push({ command, exitCode: -1, stdout: '', stderr: 'EMPTY_TEST_COMMAND', durationMs: 0 });
+    for (const [index, command] of testCommands.entries()) {
+      const approved = approvedCommands?.[index];
+      if (!approved || approvedCommands?.length !== testCommands.length || approved.command !== command ||
+          !isIssuedVerificationProcessBoundary(approved.verificationBoundary)) {
+        tests.push({ command, exitCode: -1, stdout: '', stderr: 'OWNER_APPROVAL_REQUIRED', durationMs: 0 });
         continue;
       }
-      const test = await this.runner.execute({ executable, args, cwd, timeoutMs: 20 * 60_000, allowShell: false });
+      const test = await this.runner.execute({ executable: approved.executable, args: [...approved.args], cwd,
+        timeoutMs: approved.timeoutMs, allowShell: false, verificationBoundary: approved.verificationBoundary });
       tests.push({ command, exitCode: test.exitCode, stdout: sanitizeAutonomyText(test.stdout), stderr: sanitizeAutonomyText(test.stderr), durationMs: test.durationMs });
     }
     return {

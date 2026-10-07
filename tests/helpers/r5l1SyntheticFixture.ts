@@ -1,4 +1,5 @@
 import { vi } from 'vitest';
+import { approveFixtureCommand } from './verificationCapabilityFixture';
 import Database from 'better-sqlite3';
 import path from 'path';
 import fs from 'fs';
@@ -63,11 +64,11 @@ export interface SyntheticRehearsalEnv {
   instructions: string[];
 }
 
-export function setupSyntheticRehearsalEnv(options?: {
+export async function setupSyntheticRehearsalEnv(options?: {
   failVerification?: boolean;
   taskTitleMarker?: string;
   afterDatabaseOpened?: (resources: { tempDir: string; db: Database.Database }) => void;
-}): SyntheticRehearsalEnv {
+}): Promise<SyntheticRehearsalEnv> {
   const taskTitle = options?.taskTitleMarker
     ? `Synthetic Task with marker ${options.taskTitleMarker}`
     : 'Synthetic Task 1';
@@ -321,15 +322,13 @@ export function setupSyntheticRehearsalEnv(options?: {
     );
 
     // 7. Canonical Execution Payload and Verification Commands
-    const verificationCommandExecutable = process.execPath;
     const verificationCommandArgs = options?.failVerification
       ? ['test_fail.js']
       : ['test_pass.js'];
 
     const verificationCommands = {
       TEST: {
-        executable: verificationCommandExecutable,
-        args: verificationCommandArgs,
+        ...await approveFixtureCommand(repo, projectId, verificationCommandArgs),
         timeout_ms: 60000,
       },
       LINT: null,

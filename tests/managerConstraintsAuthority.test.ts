@@ -1,4 +1,5 @@
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
+import { approveFixtureCommand } from './helpers/verificationCapabilityFixture';
 import { execSync } from 'child_process';
 import Database from 'better-sqlite3';
 import fs from 'fs';
@@ -49,6 +50,7 @@ describe('Manager Constraints Authority Binding to ExecutionAuthorization and Wo
     execSync('git config user.email "test@agentforge.test"', { cwd: tempDir });
     execSync('git config user.name "Tester"', { cwd: tempDir });
     fs.writeFileSync(path.join(tempDir, 'README.md'), '# Initial README\n');
+    fs.writeFileSync(path.join(tempDir, 'verify.js'), 'process.exit(0);\n');
     execSync('git add . && git commit -m "initial commit"', { cwd: tempDir });
 
     db = new Database(':memory:');
@@ -299,7 +301,7 @@ describe('Manager Constraints Authority Binding to ExecutionAuthorization and Wo
 
   it('CASE F: Tampered constraints inside canonical_payload_json fail closed for both WorkOrder generation and dispatch', async () => {
     repo.setProjectVerificationCommands(testProjectId, {
-      TEST: { executable: 'node', args: ['verify.js'] },
+      TEST: await approveFixtureCommand(repo, testProjectId, ['verify.js']),
     });
 
     repo.updateTaskState(testTaskId, 'PLANNED');
@@ -386,7 +388,7 @@ describe('Manager Constraints Authority Binding to ExecutionAuthorization and Wo
 
   it('CASE H: Exact B2 regression with 4 Manager constraints and verification snapshot', async () => {
     repo.setProjectVerificationCommands(testProjectId, {
-      TEST: { executable: 'node', args: ['verify.js'] },
+      TEST: await approveFixtureCommand(repo, testProjectId, ['verify.js']),
       LINT: null,
       BUILD: null,
     });
@@ -415,7 +417,9 @@ describe('Manager Constraints Authority Binding to ExecutionAuthorization and Wo
     expect(workOrder).toContain('- Do not rewrite Git history or alter the frozen baseline commit.');
 
     // Verification guidance reflects truthful durable SQLite commands
-    expect(workOrder).toContain('- **Test**: `node verify.js`');
+    const physicalExecutable = fs.realpathSync.native(process.execPath);
+    const displayedExecutable = /\s/.test(physicalExecutable) ? `"${physicalExecutable}"` : physicalExecutable;
+    expect(workOrder).toContain(`- **Test**: \`${displayedExecutable} verify.js\``);
     expect(workOrder).toContain('- **Lint**: Not configured');
     expect(workOrder).toContain('- **Build**: Not configured');
   });

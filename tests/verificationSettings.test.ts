@@ -14,6 +14,7 @@ import { Project, Task } from '../src/core/types/domain';
 import path from 'path';
 import fs from 'fs';
 import os from 'os';
+import { approveFixtureCommand } from './helpers/verificationCapabilityFixture';
 
 describe('PR #14: Verification Settings Persistence, Parser, & Formatter', () => {
   describe('1. Command Parser & Windows Path Handling', () => {
@@ -612,7 +613,7 @@ describe('PR #14: Verification Settings Persistence, Parser, & Formatter', () =>
       fs.writeFileSync(scriptPath, 'process.exit(0);', 'utf-8');
 
       repo.setProjectVerificationCommands(project.id, {
-        TEST: { executable: 'node', args: [scriptPath] },
+        TEST: await approveFixtureCommand(repo, project.id, [scriptPath]),
       });
 
       const res = await verificationService.runTests(

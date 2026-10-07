@@ -2,6 +2,7 @@ import crypto from 'crypto';
 import fs from 'fs';
 import path from 'path';
 import Database from 'better-sqlite3';
+import { VerificationCapabilityService } from './VerificationCapabilityService';
 import {
   Repository,
   CoderSubmission,
@@ -767,10 +768,12 @@ export function validateAndParseCanonicalResultEnvelope(
   }
 
   if (obj.exit_classification === 'EXIT_ZERO') {
-    if (obj.failure_code !== null) {
+    // A real child exit zero does not authorize settlement after withdrawal.
+    // Only this explicit policy outcome may coexist with observed exit zero.
+    if (obj.failure_code !== null && obj.failure_code !== 'COMMAND_POLICY_REJECTED') {
       return { valid: false, envelope: null, error: 'failure_code must be null when exit_classification is EXIT_ZERO' };
     }
-    if (obj.failure_payload !== null) {
+    if (obj.failure_code === null && obj.failure_payload !== null) {
       return { valid: false, envelope: null, error: 'failure_payload must be null when failure_code is null' };
     }
   } else {
@@ -1019,7 +1022,7 @@ export function evaluateCanonicalSettlementDecision(
 
   // Internal envelope contradiction checks
   if (envelope.exit_classification === 'EXIT_ZERO') {
-    if (envelope.failure_code !== null) {
+    if (envelope.failure_code !== null && envelope.failure_code !== 'COMMAND_POLICY_REJECTED') {
       return {
         valid: false,
         isSuccess: false,
@@ -1817,7 +1820,7 @@ export function evaluateCanonicalSettlementDecision(
 
   // Internal envelope contradiction checks
   if (envelope.exit_classification === 'EXIT_ZERO') {
-    if (envelope.failure_code !== null) {
+    if (envelope.failure_code !== null && envelope.failure_code !== 'COMMAND_POLICY_REJECTED') {
       return {
         valid: false,
         isSuccess: false,
@@ -2012,7 +2015,7 @@ export function evaluateNonAuthoritativeSettlementDecisionForTests(
 
   // Internal envelope contradiction checks
   if (envelope.exit_classification === 'EXIT_ZERO') {
-    if (envelope.failure_code !== null) {
+    if (envelope.failure_code !== null && envelope.failure_code !== 'COMMAND_POLICY_REJECTED') {
       return {
         valid: false,
         isSuccess: false,
@@ -2667,7 +2670,7 @@ export function evaluateNonAuthoritativeSettlementDecisionForTests(
   }
 
   if (envelope.exit_classification === 'EXIT_ZERO') {
-    if (envelope.failure_code !== null) {
+    if (envelope.failure_code !== null && envelope.failure_code !== 'COMMAND_POLICY_REJECTED') {
       return {
         valid: false,
         isSuccess: false,
@@ -3563,6 +3566,11 @@ export class CoderSubmissionAdjudicationService {
 
     const verificationCommandsJson = canonicalJsonStringify(frozenCommands);
     const verificationCommandsHash = computeSha256(verificationCommandsJson);
+    try {
+      new VerificationCapabilityService(this.repo).validateSnapshot(project.id, frozenCommands, project.repository_path);
+    } catch {
+      throw new CoderSubmissionAdjudicationError('COMMAND_SNAPSHOT_INVALID', 'OWNER_APPROVAL_REQUIRED: Frozen verification capability is missing, stale or revoked.');
+    }
 
     // 4. Pre-transaction external Git reads
     if (!project.repository_path) {
@@ -4401,7 +4409,7 @@ export class CoderSubmissionAdjudicationService {
       failureDetail = `Test execution timed out after ${verificationResult.duration_ms}ms`;
     } else if (verificationResult.outcome === 'COMMAND_POLICY_REJECTED') {
       targetStatus = 'VERIFICATION_FAILED';
-      failureCode = 'POLICY_VIOLATION';
+      failureCode = verificationResult.exit_code === 0 ? 'COMMAND_POLICY_REJECTED' : 'POLICY_VIOLATION';
       failureDetail = verificationResult.reason || 'Command policy rejected';
     } else if (verificationResult.outcome === 'PROCESS_START_FAILED') {
       targetStatus = 'VERIFICATION_FAILED';
@@ -4413,7 +4421,7 @@ export class CoderSubmissionAdjudicationService {
       failureDetail = `Unexpected verification outcome: ${verificationResult.outcome}`;
     }
 
-    const scrubbedFailureDetail = failureDetail ? scrubAdjudicationDiagnostics(failureDetail) : null;
+    let scrubbedFailureDetail = failureDetail ? scrubAdjudicationDiagnostics(failureDetail) : null;
 
     const exitClassification =
       verificationResult.exit_code === 0
@@ -4484,8 +4492,8 @@ export class CoderSubmissionAdjudicationService {
       workspace_snapshot_after_hash: workspaceAfterHash,
       workspace_snapshot_before_hash: workspaceSnapshotHash,
     };
-    const resultEnvelopeJson = canonicalJsonStringify(resultEnvelope);
-    const resultEnvelopeHash = computeSha256(resultEnvelopeJson);
+    let resultEnvelopeJson = canonicalJsonStringify(resultEnvelope);
+    let resultEnvelopeHash = computeSha256(resultEnvelopeJson);
 
     // =========================================================================
     // PHASE C: SETTLEMENT TRANSACTION (Single Atomic BEGIN IMMEDIATE)
@@ -4493,10 +4501,23 @@ export class CoderSubmissionAdjudicationService {
     let finalAdjudication: CoderSubmissionAdjudication | null = null;
 
     try {
-      this.repo.runInTransaction(() => {
+      this.repo.runInImmediateTransaction(() => {
         const currentSub = this.repo.getCoderSubmissionById(sub.id);
         if (!currentSub) {
           throw new Error(`Submission ${sub.id} missing during settlement`);
+        }
+        try {
+          new VerificationCapabilityService(this.repo).validateSnapshot(project.id, frozenCommands, project.repository_path, auth.id);
+        } catch {
+          // Preserve actual process truth and settle a durable policy failure.
+          // Ambiguous process/workspace outcomes retain their stronger fences.
+          if (!isAmbiguous && !driftDetected) {
+            scrubbedFailureDetail = 'COMMAND_POLICY_REJECTED: Verification capability is missing, stale or revoked at settlement.';
+            resultEnvelope.failure_code = 'COMMAND_POLICY_REJECTED';
+            resultEnvelope.failure_payload = { error: scrubbedFailureDetail };
+            resultEnvelopeJson = canonicalJsonStringify(resultEnvelope);
+            resultEnvelopeHash = computeSha256(resultEnvelopeJson);
+          }
         }
         const liveIntegrity = this.validateSubmissionAndAuthorityIntegrity(currentSub);
         if (!liveIntegrity.valid) {

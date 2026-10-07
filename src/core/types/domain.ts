@@ -483,6 +483,7 @@ export interface VerificationCommandConfig {
   args: string[];
   timeout_ms: number;
   enabled: boolean;
+  capability?: import('./verificationCapability').VerificationCapabilityReference | null;
 }
 
 export interface GitStatusSummary {

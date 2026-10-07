@@ -15,6 +15,8 @@ import { ManagerProtocol } from '../types/protocols';
 import { sanitizeContextFiles, verifyContextManifestIntegrity } from '../context/ContextIntegrity';
 import { canonicalJsonStringify } from './ContextBuilderService';
 import { ProjectStopFenceService } from './ProjectStopFenceService';
+import { VerificationCapabilityService } from './VerificationCapabilityService';
+import { VerificationCapabilityReference, VerificationCapabilityReferenceSchema } from '../types/verificationCapability';
 
 export interface CreateAuthorizationParams {
   projectId: string;
@@ -171,6 +173,8 @@ export const VerificationCommandSnapshotSchema = z
   .object({
     executable: CanonicalExecutableSchema,
     args: z.array(z.string()),
+    capability: VerificationCapabilityReferenceSchema.nullable().optional(),
+    timeout_ms: z.number().int().positive().max(600000).optional(),
   })
   .strict();
 
@@ -223,7 +227,8 @@ export const CanonicalExecutionPayloadSchema = z
 export type CanonicalExecutionPayload = z.infer<typeof CanonicalExecutionPayloadSchema>;
 
 export function buildVerificationCommandsSnapshot(
-  commands: Array<{ command_type: string; executable: string; args: string[]; enabled?: boolean }>
+  commands: Array<{ command_type: string; executable: string; args: string[]; enabled?: boolean;
+    capability?: VerificationCapabilityReference | null; timeout_ms?: number }>
 ): VerificationCommandsSnapshot {
   const getCmd = (type: 'TEST' | 'LINT' | 'BUILD'): VerificationCommandSnapshot | null => {
     const cmd = commands.find((c) => c.command_type === type && (c.enabled === undefined || c.enabled));
@@ -234,6 +239,8 @@ export function buildVerificationCommandsSnapshot(
       // Creation-time canonicalization: trim executable once before storing in payload
       executable: cmd.executable.trim(),
       args: [...cmd.args],
+      ...(cmd.capability ? { capability: { ...cmd.capability } } : {}),
+      timeout_ms: cmd.timeout_ms ?? 120000,
     };
   };
 
@@ -299,15 +306,9 @@ export function computeCanonicalPayload(params: {
     instructions: [...params.instructions],
     contextFiles: [...params.contextFiles],
     verificationCommands: {
-      TEST: params.verificationCommands.TEST
-        ? { executable: params.verificationCommands.TEST.executable, args: [...params.verificationCommands.TEST.args] }
-        : null,
-      LINT: params.verificationCommands.LINT
-        ? { executable: params.verificationCommands.LINT.executable, args: [...params.verificationCommands.LINT.args] }
-        : null,
-      BUILD: params.verificationCommands.BUILD
-        ? { executable: params.verificationCommands.BUILD.executable, args: [...params.verificationCommands.BUILD.args] }
-        : null,
+      TEST: params.verificationCommands.TEST ? VerificationCommandSnapshotSchema.parse(params.verificationCommands.TEST) : null,
+      LINT: params.verificationCommands.LINT ? VerificationCommandSnapshotSchema.parse(params.verificationCommands.LINT) : null,
+      BUILD: params.verificationCommands.BUILD ? VerificationCommandSnapshotSchema.parse(params.verificationCommands.BUILD) : null,
     },
     managerMessageId: params.managerMessageId,
     managerPayloadHash: params.managerPayloadHash,
@@ -818,6 +819,7 @@ export class ExecutionAuthorizationService {
     const canonicalInstructions = buildCanonicalInstructions(task, managerData);
     const durableVerifCommands = this.repo.getVerificationCommandsByProject(params.projectId);
     const verificationSnapshot = buildVerificationCommandsSnapshot(durableVerifCommands);
+    new VerificationCapabilityService(this.repo).validateSnapshot(params.projectId, verificationSnapshot, project.repository_path);
 
     const effectiveConstraints: string[] = [
       ...(task.constraints ?? []),
@@ -1250,14 +1252,20 @@ export class ExecutionAuthorizationService {
             };
           }
           if (policyRes.decision === 'REQUIRES_OWNER_APPROVAL') {
-            return {
-              success: false,
-              errorCode: 'NEEDS_OWNER',
-              error: `NEEDS_OWNER: Verification command "${cmd.name}" (${cmd.executable}) requires owner approval: ${policyRes.reason}`,
-            };
+            try {
+              new VerificationCapabilityService(this.repo).validate(cmd.capability, project.id, cmd.executable, cmd.args, project.repository_path);
+            } catch {
+              return { success: false, errorCode: 'NEEDS_OWNER', error: 'OWNER_APPROVAL_REQUIRED: Verification capability is missing, stale or revoked.' };
+            }
           }
         }
       }
+    }
+
+    try {
+      new VerificationCapabilityService(this.repo).validateSnapshot(project.id, buildVerificationCommandsSnapshot(durableVerifCommands), project.repository_path);
+    } catch {
+      return { success: false, errorCode: 'NEEDS_OWNER', error: 'OWNER_APPROVAL_REQUIRED: Verification capabilities are missing, stale or revoked.' };
     }
 
     // 10. Git HEAD resolution

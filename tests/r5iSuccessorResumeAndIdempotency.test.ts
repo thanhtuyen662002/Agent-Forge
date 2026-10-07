@@ -1,4 +1,5 @@
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
+import { approveFixtureCommand } from './helpers/verificationCapabilityFixture';
 import Database from 'better-sqlite3';
 import fs from 'fs';
 import path from 'path';
@@ -424,8 +425,7 @@ describe('R5I5 Successor Resume, Linearization, and Idempotency Authority', () =
       project_id: projectId,
       name: 'Unit Tests',
       command_type: 'TEST',
-      executable: 'npm',
-      args: ['test'],
+      ...await approveFixtureCommand(repo, projectId, ['--version']),
       enabled: true,
     });
 
@@ -1143,8 +1143,7 @@ describe('R5I5 Successor Resume, Linearization, and Idempotency Authority', () =
       project_id: projectId,
       name: 'Lint Command',
       command_type: 'LINT',
-      executable: 'npm',
-      args: ['run', 'lint'],
+      ...await approveFixtureCommand(repo, projectId, ['--help']),
       enabled: true,
     });
     const res = repo.resumeHandoffSuccessorAuthorization({

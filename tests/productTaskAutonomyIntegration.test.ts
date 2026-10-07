@@ -4,6 +4,7 @@ import os from 'os';
 import path from 'path';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { ContextBuilderService } from '../src/core/services/ContextBuilderService';
+import { approveFixtureCommand } from './helpers/verificationCapabilityFixture';
 import {
   CanonicalExecutionPayload,
   ExecutionAuthorizationService,
@@ -65,11 +66,11 @@ describe('product-task autonomy consolidation', () => {
     fs.rmSync(root, { recursive: true, force: true });
   });
 
-  function seed(
+  async function seed(
     taskId = 'task-product-1',
     includeExecutionScope = true,
     executionScopeOverrides: Partial<NonNullable<CanonicalExecutionPayload['executionScope']>> = {},
-  ): Fixture {
+  ): Promise<Fixture> {
     const now = new Date().toISOString();
     const projectId = 'project-product';
     if (!repo.getProject(projectId)) {
@@ -136,6 +137,10 @@ describe('product-task autonomy consolidation', () => {
       });
     }
 
+    if (!repo.getVerificationCommandsByProject(projectId).length) {
+      repo.setProjectVerificationCommands(projectId, { TEST: await approveFixtureCommand(repo, projectId, ['--version']) });
+    }
+    const verificationCommand = repo.getVerificationCommandsByProject(projectId)[0];
     const task: Task = {
       id: taskId,
       project_id: projectId,
@@ -214,7 +219,7 @@ describe('product-task autonomy consolidation', () => {
       instructions: ['Implement only the authorized product task.'],
       contextFiles: [],
       verificationCommands: {
-        TEST: { executable: process.execPath, args: ['--version'] },
+        TEST: { executable: verificationCommand.executable, args: [...verificationCommand.args], capability: verificationCommand.capability, timeout_ms: verificationCommand.timeout_ms },
         LINT: null,
         BUILD: null,
       },
@@ -287,6 +292,7 @@ describe('product-task autonomy consolidation', () => {
 
   function createRetryAuthorization(fixture: Fixture, revision: number): string {
     const now = new Date().toISOString();
+    const verificationCommand = repo.getVerificationCommandsByProject(fixture.task.project_id)[0];
     const retryContext = new ContextBuilderService(repo).buildContextSnapshot({
       projectId: fixture.task.project_id,
       taskId: fixture.task.id,
@@ -308,7 +314,7 @@ describe('product-task autonomy consolidation', () => {
       instructions: [`Resumed execution revision ${revision}`],
       contextFiles: [],
       verificationCommands: {
-        TEST: { executable: process.execPath, args: ['--version'] },
+        TEST: { executable: verificationCommand.executable, args: [...verificationCommand.args], capability: verificationCommand.capability, timeout_ms: verificationCommand.timeout_ms },
         LINT: null,
         BUILD: null,
       },
@@ -364,15 +370,15 @@ describe('product-task autonomy consolidation', () => {
     return retryAuthId;
   }
 
-  it('validates task, authorization, routing, epoch, exact head, and ContextManifest as one authority', () => {
-    const fixture = seed();
+  it('validates task, authorization, routing, epoch, exact head, and ContextManifest as one authority', async () => {
+    const fixture = await seed();
     const result = adapter.validateAuthority(workOrderInput(fixture));
     expect(result.valid).toBe(true);
     expect(result.authority?.task.id).toBe(fixture.task.id);
   });
 
   it('validates an authorization created by the real ExecutionAuthorizationService without tests manually fabricating the authorization record', async () => {
-    seed(); // ensure project, provider, account, resource, role profile are seeded
+    await seed(); // ensure project, provider, account, resource, role profile are seeded
 
     const gitSpy = vi.spyOn(GitService, 'getHeadSha').mockResolvedValue({ status: 'SUCCESS', sha: BASE_SHA });
     try {
@@ -541,7 +547,7 @@ describe('product-task autonomy consolidation', () => {
   });
 
   it('fails closed when a product authorization omits durable execution scope', async () => {
-    const fixture = seed('task-scope-missing', false);
+    const fixture = await seed('task-scope-missing', false);
     let coderCalled = false;
     const result = await adapter.executeProductTask({
       ...workOrderInput(fixture),
@@ -560,8 +566,8 @@ describe('product-task autonomy consolidation', () => {
     expect(repo.getWorkerSlot(fixture.slotId)?.status).toBe('IDLE');
   });
 
-  it('detects durable execution-scope tampering through instruction_payload_hash', () => {
-    const fixture = seed('task-scope-hash-tamper');
+  it('detects durable execution-scope tampering through instruction_payload_hash', async () => {
+    const fixture = await seed('task-scope-hash-tamper');
     const payload = JSON.parse(fixture.authorization.canonical_payload_json!) as CanonicalExecutionPayload;
     payload.executionScope!.allowedPaths = ['src', 'docs'];
     store.getDatabase().prepare(
@@ -603,7 +609,7 @@ describe('product-task autonomy consolidation', () => {
 
   for (const scopeCase of executionScopeMismatchCases) {
     it(`rejects ${scopeCase.name} before lease acquisition or coder execution`, async () => {
-      const fixture = seed(`task-scope-${scopeCase.name.replace(/\s+/g, '-')}`);
+      const fixture = await seed(`task-scope-${scopeCase.name.replace(/\s+/g, '-')}`);
       let coderCalled = false;
       const result = await adapter.executeProductTask({
         ...scopeCase.mutate(workOrderInput(fixture)),
@@ -623,8 +629,8 @@ describe('product-task autonomy consolidation', () => {
     });
   }
 
-  it('fences a stale authorization after ownership epoch changes', () => {
-    const fixture = seed();
+  it('fences a stale authorization after ownership epoch changes', async () => {
+    const fixture = await seed();
     expect(repo.bumpTaskOwnershipEpoch(fixture.task.id, 1).success).toBe(true);
     expect(adapter.validateAuthority(workOrderInput(fixture))).toMatchObject({
       valid: false,
@@ -632,18 +638,18 @@ describe('product-task autonomy consolidation', () => {
     });
   });
 
-  it('derives WorkOrder only from durable product authority without creating an autonomy lifecycle row', () => {
-    const fixture = seed();
+  it('derives WorkOrder only from durable product authority without creating an autonomy lifecycle row', async () => {
+    const fixture = await seed();
     const order = adapter.buildAuthorizedWorkOrder(workOrderInput(fixture));
     expect(order.task_id).toBe(fixture.task.id);
     expect(order.lease_epoch).toBe(1);
-    expect(order.required_tests[0]).toContain(JSON.stringify(process.execPath));
+    expect(order.required_tests[0]).toContain(JSON.stringify(repo.getVerificationCommandsByProject(fixture.task.project_id)[0].executable));
     expect(store.listAll()).toHaveLength(0);
   });
 
-  it('uses WorkerSlotLeaseService and enforces the one-worker consolidation fence', () => {
-    const first = seed();
-    const second = seed('task-product-2');
+  it('uses WorkerSlotLeaseService and enforces the one-worker consolidation fence', async () => {
+    const first = await seed();
+    const second = await seed('task-product-2');
     const acquired = adapter.acquireWorkerSlotLease(first.assignmentId);
     expect(acquired.status).toBe('ACQUIRED');
     expect(adapter.acquireWorkerSlotLease(second.assignmentId)).toMatchObject({
@@ -655,7 +661,7 @@ describe('product-task autonomy consolidation', () => {
     }
   });
 
-  it('retains and inventories provisional work orders, leases, evidence, reviews, and CI watches', () => {
+  it('retains and inventories provisional work orders, leases, evidence, reviews, and CI watches', async () => {
     const now = new Date().toISOString();
     store.getDatabase().prepare(`INSERT INTO autonomy_work_orders
       (id,task_id,attempt,lease_epoch,worker_id,state,payload_json,base_sha,branch,worktree,created_at,updated_at)
@@ -673,8 +679,8 @@ describe('product-task autonomy consolidation', () => {
     expect(store.getDatabase().prepare('SELECT COUNT(*) count FROM autonomy_work_orders').get()).toEqual({ count: 1 });
   });
 
-  it('keeps timeout then passing rerun as two truthful verification attempts', () => {
-    const fixture = seed();
+  it('keeps timeout then passing rerun as two truthful verification attempts', async () => {
+    const fixture = await seed();
     const common = {
       projectId: fixture.task.project_id,
       taskId: fixture.task.id,
@@ -697,8 +703,8 @@ describe('product-task autonomy consolidation', () => {
     ]);
   });
 
-  it('rejects and does not persist a verification observation after the ownership epoch changes', () => {
-    const fixture = seed('task-stale-observation');
+  it('rejects and does not persist a verification observation after the ownership epoch changes', async () => {
+    const fixture = await seed('task-stale-observation');
     const captured = repo.getTask(fixture.task.id)!;
     expect(repo.bumpTaskOwnershipEpoch(fixture.task.id, captured.ownership_epoch ?? 1).success).toBe(true);
 
@@ -724,7 +730,7 @@ describe('product-task autonomy consolidation', () => {
     expect(repo.getProcessRunsByTask(captured.id)).toHaveLength(0);
   });
 
-  it('rejects a stale PASS after a manager provider switch', () => {
+  it('rejects a stale PASS after a manager provider switch', async () => {
     const stale: ManagerReview = {
       protocol_version: 'managerreview.v1',
       verdict: 'PASS',
@@ -787,7 +793,7 @@ describe('product-task autonomy consolidation', () => {
   });
 
   it('completes one real product task end-to-end and releases its product lease', async () => {
-    const fixture = seed();
+    const fixture = await seed();
     const input = workOrderInput(fixture);
     const result = await adapter.executeProductTask({
       ...input,
@@ -832,7 +838,7 @@ describe('product-task autonomy consolidation', () => {
   });
 
   it('fences PASS if post-review working-tree snapshot changes after manager review', async () => {
-    const fixture = seed('task-snapshot-fencing');
+    const fixture = await seed('task-snapshot-fencing');
     const input = workOrderInput(fixture);
     let collectCount = 0;
     const result = await adapter.executeProductTask({
@@ -883,7 +889,7 @@ describe('product-task autonomy consolidation', () => {
   });
 
   it('fences PASS if post-review HEAD changes after manager review', async () => {
-    const fixture = seed('task-head-fencing');
+    const fixture = await seed('task-head-fencing');
     const input = workOrderInput(fixture);
     let collectCount = 0;
     const result = await adapter.executeProductTask({
@@ -934,7 +940,7 @@ describe('product-task autonomy consolidation', () => {
   });
 
   it('rejects execution if runCoder claims a HEAD that mismatches independently observed HEAD', async () => {
-    const fixture = seed('task-coder-mismatch');
+    const fixture = await seed('task-coder-mismatch');
     const input = workOrderInput(fixture);
     const result = await adapter.executeProductTask({
       ...input,
@@ -957,7 +963,7 @@ describe('product-task autonomy consolidation', () => {
   });
 
   it('historical passing TestRun cannot satisfy when the current runVerification returns a failing TestRun', async () => {
-    const fixture = seed('task-verif-fail');
+    const fixture = await seed('task-verif-fail');
     const input = workOrderInput(fixture);
     // Record an earlier historical passing test run
     adapter.recordVerificationObservation({
@@ -1013,7 +1019,7 @@ describe('product-task autonomy consolidation', () => {
   });
 
   it('historical passing TestRun cannot satisfy when the current runVerification returns null', async () => {
-    const fixture = seed('task-verif-null');
+    const fixture = await seed('task-verif-null');
     const input = workOrderInput(fixture);
     // Record historical pass
     adapter.recordVerificationObservation({
@@ -1052,8 +1058,8 @@ describe('product-task autonomy consolidation', () => {
     expect(result.finalTaskState).toBe('CODING');
   });
 
-  it('fails closed if attempting to execute a product task via legacy autonomy state', () => {
-    const fixture = seed('task-legacy-fence');
+  it('fails closed if attempting to execute a product task via legacy autonomy state', async () => {
+    const fixture = await seed('task-legacy-fence');
     const order = createWorkOrder({
       taskId: fixture.task.id,
       workerId: 'agy-01',
@@ -1069,7 +1075,7 @@ describe('product-task autonomy consolidation', () => {
   });
 
   it('operational supervisor dispatches product task via ProductTaskAutonomyAdapter when ExecutionAuthorization exists', async () => {
-    const fixture = seed('task-op-dispatch');
+    const fixture = await seed('task-op-dispatch');
     const supervisor = new AutonomySupervisor({
       store,
       agyProviderId: 'provider-agy',
@@ -1138,7 +1144,7 @@ describe('product-task autonomy consolidation', () => {
   });
 
   it('operational supervisor fails closed when product task has no ExecutionAuthorization', async () => {
-    const fixture = seed('task-no-auth');
+    const fixture = await seed('task-no-auth');
     // Delete execution authorization to simulate an unauthorized product task
     store.getDatabase().prepare('DELETE FROM execution_authorizations WHERE task_id=?').run(fixture.task.id);
 
@@ -1170,7 +1176,7 @@ describe('product-task autonomy consolidation', () => {
     expect(store.listAll()).toHaveLength(0);
   });
 
-  it('fails closed if concurrency is increased before the product proof gate is lifted', () => {
+  it('fails closed if concurrency is increased before the product proof gate is lifted', async () => {
     expect(() => new ProductTaskAutonomyAdapter({
       repo,
       artifactStore: new ArtifactStore(path.join(root, 'other-artifacts')),
@@ -1179,7 +1185,7 @@ describe('product-task autonomy consolidation', () => {
   });
 
   it('fails closed before verification or review if independently collected changedFiles include paths outside allowed_paths', async () => {
-    const fixture = seed('task-out-of-scope-edit', true, { allowedPaths: ['src/core'] });
+    const fixture = await seed('task-out-of-scope-edit', true, { allowedPaths: ['src/core'] });
     const input = workOrderInput(fixture);
     let verificationCalled = false;
     let reviewCalled = false;
@@ -1217,7 +1223,7 @@ describe('product-task autonomy consolidation', () => {
   });
 
   it('fails closed before verification or review if independently collected changedFiles include paths inside forbidden_paths', async () => {
-    const fixture = seed('task-forbidden-edit', true, { forbiddenPaths: ['.git', 'src/forbidden'] });
+    const fixture = await seed('task-forbidden-edit', true, { forbiddenPaths: ['.git', 'src/forbidden'] });
     const input = workOrderInput(fixture);
     let verificationCalled = false;
     let reviewCalled = false;
@@ -1256,7 +1262,7 @@ describe('product-task autonomy consolidation', () => {
   });
 
   it('transitions stale post-review HEAD or snapshot to durable CODING repair state and proves task is resumable and not wedged', async () => {
-    const fixture = seed('task-stale-resumption');
+    const fixture = await seed('task-stale-resumption');
     const input = workOrderInput(fixture);
     let collectCount = 0;
 
@@ -1344,7 +1350,7 @@ describe('product-task autonomy consolidation', () => {
       instructions: ['Resumed repair execution'],
       contextFiles: [],
       verificationCommands: {
-        TEST: { executable: process.execPath, args: ['--version'] },
+        TEST: JSON.parse(fixture.authorization.canonical_payload_json!).verificationCommands.TEST,
         LINT: null,
         BUILD: null,
       },
@@ -1445,8 +1451,8 @@ describe('product-task autonomy consolidation', () => {
     expect(repo.getWorkerSlot(fixture.slotId)?.status).toBe('IDLE');
   });
 
-  it('rejects ID-only and stale same-epoch adapter transitions without borrowing current state', () => {
-    const fixture = seed('task-cas-adapter');
+  it('rejects ID-only and stale same-epoch adapter transitions without borrowing current state', async () => {
+    const fixture = await seed('task-cas-adapter');
     const before = repo.getTask(fixture.task.id)!;
     expect(() => adapter.transitionTask(fixture.task.id as unknown as Task, 'DISPATCH')).toThrow('INVALID_TASK_TRANSITION_BINDING');
     const dispatched = adapter.transitionTask(before, 'DISPATCH');
@@ -1459,7 +1465,7 @@ describe('product-task autonomy consolidation', () => {
   });
 
   it('fences a coder result after same-epoch revision drift before writing its SHA or verification', async () => {
-    const fixture = seed('task-cas-late-coder');
+    const fixture = await seed('task-cas-late-coder');
     const runVerification = vi.fn();
     const conductReview = vi.fn();
     const result = await adapter.executeProductTask({
@@ -1482,7 +1488,7 @@ describe('product-task autonomy consolidation', () => {
   });
 
   it.each(['PASS', 'THROW'] as const)('fences late %s review and recovery after same-epoch revision drift', async (verdict) => {
-    const fixture = seed(`task-cas-late-review-${verdict}`);
+    const fixture = await seed(`task-cas-late-review-${verdict}`);
     const result = await adapter.executeProductTask({
       ...workOrderInput(fixture),
       runCoder: async () => ({ success: true, currentHeadSha: BASE_SHA }),
@@ -1507,7 +1513,7 @@ describe('product-task autonomy consolidation', () => {
   });
 
   it('preserves ownership epoch fencing when task ownership epoch changes during stale review handling', async () => {
-    const fixture = seed('task-epoch-fence-stale');
+    const fixture = await seed('task-epoch-fence-stale');
     const input = workOrderInput(fixture);
     let collectCount = 0;
 
@@ -1601,7 +1607,7 @@ describe('product-task autonomy consolidation', () => {
   for (const { category, error, expectedSubstring } of reviewFailureCases) {
     it(`recovers ${category} review exception (${expectedSubstring}) to CODING, releases lease, and fences stale authority`, async () => {
       const taskId = `task-review-${category}-${crypto.randomBytes(4).toString('hex')}`;
-      const fixture = seed(taskId);
+      const fixture = await seed(taskId);
       const input = workOrderInput(fixture);
 
       const result = await adapter.executeProductTask({
@@ -1665,7 +1671,7 @@ describe('product-task autonomy consolidation', () => {
   }
 
   it('recovers contract-invalid review object returning malformed contract to CODING, releases lease, and fences stale authority', async () => {
-    const fixture = seed('task-review-invalid-contract-obj');
+    const fixture = await seed('task-review-invalid-contract-obj');
     const input = workOrderInput(fixture);
 
     const result = await adapter.executeProductTask({
@@ -1723,7 +1729,7 @@ describe('product-task autonomy consolidation', () => {
   });
 
   it('preserves ownership epoch fencing when task ownership epoch changes during manager review exception recovery', async () => {
-    const fixture = seed('task-epoch-fence-review-ex');
+    const fixture = await seed('task-epoch-fence-review-ex');
     const input = workOrderInput(fixture);
 
     const result = await adapter.executeProductTask({
@@ -1771,7 +1777,7 @@ describe('product-task autonomy consolidation', () => {
   });
 
   it('proves a subsequent reauthorized retry can complete end-to-end after a manager review outage while preserving exact-head and verification gates', async () => {
-    const fixture = seed('task-review-outage-retry');
+    const fixture = await seed('task-review-outage-retry');
     const input = workOrderInput(fixture);
 
     // --- Attempt 1: Manager capacity outage occurs during review ---
@@ -1939,7 +1945,7 @@ describe('product-task autonomy consolidation', () => {
   });
 
   it('operational supervisor handles manager review outage on product task, leaves task in CODING and releases slot', async () => {
-    const fixture = seed('task-op-review-outage');
+    const fixture = await seed('task-op-review-outage');
     const supervisor = new AutonomySupervisor({
       store,
       agyProviderId: 'provider-agy',
@@ -2008,7 +2014,7 @@ describe('product-task autonomy consolidation', () => {
   });
 
   it('returns the original execution outcome with a typed durable cleanup marker when lease release throws', async () => {
-    const fixture = seed('task-lease-release-failure');
+    const fixture = await seed('task-lease-release-failure');
     const leaseService = (adapter as any).leaseService as WorkerSlotLeaseService;
     const releaseSpy = vi.spyOn(leaseService, 'release').mockImplementation(() => {
       throw new Error('SQLITE_BUSY: simulated release transaction failure');
@@ -2083,8 +2089,8 @@ describe('product-task autonomy consolidation', () => {
     }
   });
 
-  it('startup scanner releases an expired terminal product lease and is idempotent', () => {
-    const fixture = seed('task-lease-recovery-terminal');
+  it('startup scanner releases an expired terminal product lease and is idempotent', async () => {
+    const fixture = await seed('task-lease-recovery-terminal');
     const acquired = adapter.acquireWorkerSlotLease(fixture.assignmentId);
     expect(acquired.status).toBe('ACQUIRED');
     if (acquired.status !== 'ACQUIRED') return;
@@ -2104,8 +2110,8 @@ describe('product-task autonomy consolidation', () => {
     expect(second).toMatchObject({ scannedCount: 0, releasedCount: 0 });
   });
 
-  it('startup scanner quarantines an expired lease while task/process ownership remains active', () => {
-    const fixture = seed('task-lease-recovery-quarantine');
+  it('startup scanner quarantines an expired lease while task/process ownership remains active', async () => {
+    const fixture = await seed('task-lease-recovery-quarantine');
     const acquired = adapter.acquireWorkerSlotLease(fixture.assignmentId);
     expect(acquired.status).toBe('ACQUIRED');
     if (acquired.status !== 'ACQUIRED') return;
@@ -2138,8 +2144,8 @@ describe('product-task autonomy consolidation', () => {
     expect(markerCount.count).toBe(1);
   });
 
-  it('startup scanner does not treat future SQLite-format timestamps as expired', () => {
-    const fixture = seed('task-lease-recovery-future-timestamp');
+  it('startup scanner does not treat future SQLite-format timestamps as expired', async () => {
+    const fixture = await seed('task-lease-recovery-future-timestamp');
     const acquired = adapter.acquireWorkerSlotLease(fixture.assignmentId);
     expect(acquired.status).toBe('ACQUIRED');
     if (acquired.status !== 'ACQUIRED') return;
@@ -2156,8 +2162,8 @@ describe('product-task autonomy consolidation', () => {
     expect(repo.getWorkerSlot(fixture.slotId)?.status).toBe('LEASED');
   });
 
-  it('startup scanner quarantines an invalid expiration instead of releasing it', () => {
-    const fixture = seed('task-lease-recovery-invalid-timestamp');
+  it('startup scanner quarantines an invalid expiration instead of releasing it', async () => {
+    const fixture = await seed('task-lease-recovery-invalid-timestamp');
     const acquired = adapter.acquireWorkerSlotLease(fixture.assignmentId);
     expect(acquired.status).toBe('ACQUIRED');
     if (acquired.status !== 'ACQUIRED') return;
