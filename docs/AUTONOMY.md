@@ -360,6 +360,12 @@ under the SQLite writer lock. Losing the task epoch, stop admission, capability
 or deadline fence prevents stale provider changes from reaching project files
 while retaining the actual child exit evidence.
 
+Pre-adapter cancellation and post-claim admission rejection retain the consumed
+`DISPATCHED` authorization and positive claim receipt for safe restart recovery.
+An actual pending provider return is recorded without terminal settlement;
+that status does not grant manual routing or task authority. Only the explicit
+`MANUAL_HANDOFF_REQUIRED` routing decision exposes the owner relay UI.
+
 Startup execution recovery inventories historical unversioned `DISPATCHED`
 authorizations and the new immutable receipts. A positive new claim receipt
 with no adapter start can invalidate only that unstarted authorization. Old

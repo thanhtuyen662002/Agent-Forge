@@ -212,7 +212,6 @@ export class ProviderDispatchService {
 
     let control: ScheduledDispatchControl | undefined;
     let nonHandoffClaim: NonHandoffClaim | undefined;
-    let nonHandoffClaimed = false;
     if (mode === 'SCHEDULED') {
       if (this.activeDispatches.has(authorizationId)) {
         const currentAuth = this.repo.getExecutionAuthorization(authorizationId);
@@ -1271,7 +1270,6 @@ export class ProviderDispatchService {
       claimed = nonHandoffClaim
         ? this.nonHandoffLifecycle.claim(auth, nonHandoffClaim, new Date().toISOString())
         : this.repo.claimExecutionAuthorization(authorizationId, nowIso);
-      nonHandoffClaimed = !!nonHandoffClaim && claimed;
     } catch (err: unknown) {
       claimError = err instanceof Error ? err.message : 'PROJECT_STOP_FENCE_REJECTED';
     }
@@ -1577,8 +1575,7 @@ export class ProviderDispatchService {
 
     // Durably settle execution lifecycle and outcome (R5I6)
     if (nonHandoffClaim && !timedOut) {
-      const settled = this.nonHandoffLifecycle.finish(auth, nonHandoffClaim, result, adapterOutcome,
-        adapter.adapterType === 'MANUAL_BRIDGE' && routingOutcome === 'MANUAL_HANDOFF_REQUIRED');
+      const settled = this.nonHandoffLifecycle.finish(auth, nonHandoffClaim, result, adapterOutcome);
       if (!settled) {
         return { executionId, status: 'FAILED', errorCode: 'SETTLEMENT_FAILED',
           error: 'NON_HANDOFF_SETTLEMENT_FENCED: Actual provider observation retained; task ownership or durable claim changed.',
@@ -1667,10 +1664,6 @@ export class ProviderDispatchService {
 
     return result;
     } finally {
-      if (nonHandoffClaimed) {
-        const claimed = this.repo.getExecutionAuthorization(authorizationId);
-        if (claimed && !claimed.adapter_started_at) this.nonHandoffLifecycle.reconcile(claimed);
-      }
       if (mode === 'SCHEDULED') {
         this.activeDispatches.delete(authorizationId);
       }

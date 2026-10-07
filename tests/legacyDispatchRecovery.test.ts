@@ -136,12 +136,29 @@ describe('complete compatibility dispatch / recovery boundary', () => {
     expect(repo.getTask('T')?.state).toBe('CODING');
   });
 
+  it('preserves an actual pending provider return without promoting routing or settling the task', async () => {
+    execute.mockResolvedValue({ executionId: 'provider-pending', status: 'AWAITING_OWNER' });
+    const auth = await authorize();
+    const routing = repo.getEvents('P', 100).find(event => event.type === 'PROVIDER_ROUTING_DECISION');
+    expect(routing!.structured_payload).toMatchObject({ outcome: 'SELECTED' });
+    const result = await dispatcher().dispatch(auth.id);
+    expect(result).toMatchObject({ status: 'AWAITING_OWNER', providerExecutionProvenance: { adapterInvocation: 'RETURNED' } });
+    expect(repo.getExecutionAuthorization(auth.id)).toMatchObject({ status: 'DISPATCHED', execution_id: result.executionId,
+      adapter_outcome: 'RETURNED', settlement_status: null, settled_at: null });
+    expect(reopen().scanAndReconcile().items[0]).toMatchObject({ classification: 'ALREADY_RECONCILED',
+      mutatedTerminalState: false, mutatedResources: false });
+    expect(repo.getEvents('P', 100).find(event => event.id === routing!.id)).toEqual(routing);
+    expect(repo.getTask('T')?.state).toBe('CODING');
+    expect(execute).toHaveBeenCalledTimes(1);
+  });
+
   it('binds a real Local CLI child process to the durable backend execution identity', async () => {
     const script = path.join(root, 'fixture-cli.cjs');
     const protocol = { protocol: 'coder.v1', message_id: 'fixture-child', project_id: 'P', task_id: 'T', attempt: 1,
       status: 'COMPLETED', completed: ['Fixture child exited'], remaining: [], files_claimed_changed: [], tests_claimed: [],
       blockers: [], review_requested: false, expected_task_state: 'CODING', expected_revision: 0 };
-    fs.writeFileSync(script, `process.stdout.write(${JSON.stringify(JSON.stringify(protocol))});`, 'utf8');
+    fs.writeFileSync(script, `process.stdin.resume(); process.stdin.on('end', () => {
+      process.stdout.write(${JSON.stringify(JSON.stringify(protocol))}); });`, 'utf8');
     adapter = new RecoveryFixtureCli(script, repo, new ArtifactStore(path.join(root, 'artifacts')));
     const auth = await authorize();
     const result = await dispatcher().dispatch(auth.id);
@@ -189,17 +206,20 @@ describe('complete compatibility dispatch / recovery boundary', () => {
     const protocol = { protocol: 'coder.v1', message_id: 'fixture-stale-child', project_id: 'P', task_id: 'T', attempt: 1,
       status: 'COMPLETED', completed: ['Fixture child exited'], remaining: [], files_claimed_changed: ['src/allowed.ts'],
       tests_claimed: [], blockers: [], review_requested: false, expected_task_state: 'CODING', expected_revision: 0 };
-    fs.writeFileSync(script, `require('fs').appendFileSync('src/allowed.ts', '// stale provider write\\n');
-      process.stdout.write(${JSON.stringify(JSON.stringify(protocol))});`, 'utf8');
+    fs.writeFileSync(script, `process.stdin.resume(); process.stdin.on('end', () => {
+      require('fs').appendFileSync('src/allowed.ts', '// stale provider write\\n');
+      process.stdout.write(${JSON.stringify(JSON.stringify(protocol))}); });`, 'utf8');
     adapter = new RecoveryFixtureCli(script, repo, new ArtifactStore(path.join(root, 'artifacts')));
     const run = adapter.execute.bind(adapter);
-    vi.spyOn(adapter, 'execute').mockImplementation(request => {
+    const called = vi.spyOn(adapter, 'execute').mockImplementation(request => {
       const actual = run(request);
       expect(repo.bumpTaskOwnershipEpoch('T', 1).success).toBe(true);
       return actual;
     });
     const auth = await authorize(false, ['src/allowed.ts']);
     expect(await dispatcher().dispatch(auth.id)).toMatchObject({ status: 'FAILED', errorCode: 'SETTLEMENT_FAILED' });
+    expect(await called.mock.results[0].value).toMatchObject({ status: 'FAILED', errorCode: 'RECOVERY_FENCED',
+      rawResponse: JSON.stringify(protocol) });
     expect(repo.getProcessRunsByTask('T')[0]).toMatchObject({ status: 'COMPLETED', exit_code: 0 });
     expect(fs.readFileSync(source, 'utf8')).toBe(original);
     expect(repo.getExecutionAuthorization(auth.id)?.settled_at).toBeNull();

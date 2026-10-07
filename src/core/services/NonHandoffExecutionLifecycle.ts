@@ -78,7 +78,7 @@ export class NonHandoffExecutionLifecycle {
   }
 
   finish(auth: ExecutionAuthorization, captured: NonHandoffClaim, result: AgentExecutionResult,
-    outcome: AdapterOutcome, allowManualRelay: boolean): boolean {
+    outcome: AdapterOutcome): boolean {
     return this.repo.runInImmediateTransaction(() => {
       if (!this.matchesClaim(auth.id, captured)) return false;
       const current = this.repo.getExecutionAuthorization(auth.id);
@@ -91,10 +91,12 @@ export class NonHandoffExecutionLifecycle {
       // Keep the actual observation even when a newer owner has fenced settlement.
       this.write(RESULT_EVENT, auth, observed, 'result');
       if (!this.isCurrent(auth.id, captured) || !this.hasCapabilities(auth) || current.status !== 'DISPATCHED' || current.adapter_finished_at ||
-        current.termination_status === 'UNRESOLVED' || (result.status === 'AWAITING_OWNER' && !allowManualRelay)) return false;
+        current.termination_status === 'UNRESOLVED') return false;
       const finishedAt = new Date().toISOString();
       if (result.status === 'AWAITING_OWNER') {
-        // Relay preparation is complete; human work remains pending. No COMPLETED settlement is invented.
+        // Preserve an actual pending return without granting manual routing or
+        // task authority. No terminal settlement is invented; only an explicit
+        // MANUAL_HANDOFF_REQUIRED decision may expose the owner relay UI.
         return this.repo.getDatabase().prepare(`UPDATE execution_authorizations
           SET adapter_finished_at = ?, adapter_outcome = ?
           WHERE id = ? AND execution_id = ? AND status = 'DISPATCHED' AND adapter_finished_at IS NULL`)
