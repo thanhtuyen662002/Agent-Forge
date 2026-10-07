@@ -585,6 +585,7 @@ export class ProviderRoutingService {
         candidateResourceIds: request.candidateResourceIds,
         selectedResourceId: decision.selectedResourceId,
         selectedProviderId: decision.selectedProviderId,
+        adapterType: decision.adapterType,
         outcome: decision.outcome,
         reason: decision.reason,
         candidateEvaluations: decision.candidateEvaluations,

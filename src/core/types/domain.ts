@@ -632,7 +632,7 @@ export interface ExecutionRecoveryState {
 
 export interface ExecutionRecoveryScanItemResult {
   authorizationId: string;
-  transferId: string;
+  transferId: string | null;
   executionId: string | null;
   lifecycleVersion: number | null;
   classification: ExecutionRecoveryClassification;

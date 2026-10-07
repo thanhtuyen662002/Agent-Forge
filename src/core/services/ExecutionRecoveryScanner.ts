@@ -13,6 +13,7 @@ import {
   SettlementStatus,
 } from '../types/domain';
 import { canonicalJsonStringify, computeSha256 } from '../context/ContextIntegrity';
+import { NonHandoffExecutionLifecycle, NON_HANDOFF_CLAIM_EVENT } from './NonHandoffExecutionLifecycle';
 
 function isValidIsoTimestamp(ts: any): boolean {
   if (typeof ts !== 'string' || ts.trim().length < 10) return false;
@@ -31,16 +32,20 @@ export class ExecutionRecoveryScanner {
   public scanAndReconcile(): ExecutionRecoveryScanReport {
     const nowIso = new Date().toISOString();
 
-    // Query candidate execution authorizations bound to handoff transfers in deterministic order
+    // Inventory direct and compatibility authorizations as well as handoff successors.
     const rows = this.db
       .prepare(`
         SELECT ea.id as authorization_id
         FROM execution_authorizations ea
         LEFT JOIN handoff_transfers ht ON ht.successor_authorization_id = ea.id
         WHERE ea.lifecycle_version = 1 OR ht.id IS NOT NULL
+          OR (ea.lifecycle_version IS NULL AND ea.status = 'DISPATCHED')
+          OR EXISTS (SELECT 1 FROM events e WHERE e.type = ?
+            AND CASE WHEN json_valid(e.structured_payload_json)
+              THEN json_extract(e.structured_payload_json, '$.authorizationId') END = ea.id)
         ORDER BY ea.created_at ASC, ea.id ASC
       `)
-      .all() as Array<{ authorization_id: string }>;
+      .all(NON_HANDOFF_CLAIM_EVENT) as Array<{ authorization_id: string }>;
 
     const items: ExecutionRecoveryScanItemResult[] = [];
     let reconciledCount = 0;
@@ -130,7 +135,16 @@ export class ExecutionRecoveryScanner {
 
       const transfer = this.repo.getHandoffTransferBySuccessorAuthId(auth.id);
       if (!transfer) {
-        throw new Error(`HandoffTransfer for successor authorization "${auth.id}" not found.`);
+        const assignment = auth.assignment_id ? this.repo.getAgentAssignment(auth.assignment_id) : null;
+        const metadata = assignment?.preferred_metadata;
+        // A direct product authorization has no transfer. A handoff successor
+        // whose transfer disappeared is still a corrupt binding graph.
+        if (auth.id.startsWith('auth-handoff-') || (metadata &&
+          ['handoff_route_spec', 'handoff_route_spec_hash', 'handoff_route_spec_version']
+            .some(key => Object.prototype.hasOwnProperty.call(metadata, key)))) {
+          throw new Error(`HandoffTransfer for successor authorization "${auth.id}" not found.`);
+        }
+        return new NonHandoffExecutionLifecycle(this.repo).reconcile(auth);
       }
 
       const project = this.repo.getProject(auth.project_id);

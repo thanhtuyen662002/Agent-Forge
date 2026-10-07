@@ -346,6 +346,40 @@ stable process identity hash, classifies live/dead/missing/unknown PID evidence,
 and keeps every unresolved row fenced. Expired task leases remain fenced while
 an associated process row is still `RUNNING`.
 
+Compatibility provider dispatch also records a backend execution ID and an
+immutable claim receipt in the same SQLite transaction as authorization
+consumption. Local CLI process records and cancellation use that ID. Start,
+observed result and settlement are bound to the authorization, task snapshot,
+ownership epoch, stop admission and verification capabilities. A returned or
+thrown failure is retained as failure; these receipts cannot complete the task
+or release another owner's leases. A malformed provider return is a protocol
+failure. The renderer still requires explicit `PRODUCT_BOUND` or `MANUAL_BRIDGE`
+admission; the internal compatibility API does not confer product authority.
+Compatibility Local CLI copy-back also requires current execution authority
+under the SQLite writer lock. Losing the task epoch, stop admission, capability
+or deadline fence prevents stale provider changes from reaching project files
+while retaining the actual child exit evidence.
+
+Startup execution recovery inventories historical unversioned `DISPATCHED`
+authorizations and the new immutable receipts. A positive new claim receipt
+with no adapter start can invalidate only that unstarted authorization. Old
+rows without such proof and started executions without a verified result stay
+explicitly fenced with deterministic recovery evidence. Absence of a timestamp
+never proves that an old provider did not run. Pending direct lifecycle-v1
+authorizations are preserved for product recovery; a handoff successor whose
+transfer disappeared still fails its existing corruption check.
+
+Compatibility dispatch has a five-minute deadline, configurable internally up
+to ten minutes. On expiration it returns `FAILED` / `TIMEOUT`, records an
+unresolved termination fence and requests cancellation without waiting for its
+acknowledgement. Late provider completion cannot settle the authorization.
+Cancellation alone cannot prove that descendants exited or release capacity.
+Explicit Manual Bridge relay preparation records `AWAITING_OWNER`; owner work
+is still pending and no `COMPLETED` settlement is fabricated. Claim, result and
+recovery receipts contain canonical hashes and identifiers rather than raw
+provider output. Existing handoff settlement and process recovery remain the
+authority for their respective resource and termination evidence.
+
 Provider health observations are ingested and applied through the single
 `AccountHealthService` writer. Application is a separate durable step from
 observation ingestion, so a crash between the two steps is recovered by

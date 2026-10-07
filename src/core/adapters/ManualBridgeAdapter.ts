@@ -37,7 +37,7 @@ export class ManualBridgeAdapter implements ProviderAdapter {
   public async execute(request: AgentExecutionRequest): Promise<AgentExecutionResult> {
     // In manual bridge mode, execution is performed via Owner clipboard copy/paste
     return {
-      executionId: `manual-exec-${Date.now()}`,
+      executionId: request.runtimeBinding?.executionId ?? request.executionId ?? `manual-exec-${Date.now()}`,
       status: 'AWAITING_OWNER',
       outputProtocol: 'Awaiting Owner Manual Relay via Manual Bridge',
       rawResponse: 'Awaiting Owner Manual Relay via Manual Bridge',
