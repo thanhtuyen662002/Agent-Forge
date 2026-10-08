@@ -7,6 +7,7 @@ import path from 'path';
 import fs from 'fs';
 import os from 'os';
 import { execFileSync } from 'child_process';
+import { captureRepositoryRoot } from '../src/core/services/RepositoryRootIdentity';
 
 function runGit(cwd: string, args: string[]): string {
   return execFileSync('git', args, {
@@ -17,7 +18,7 @@ function runGit(cwd: string, args: string[]): string {
 }
 
 function createGitFixture(): { root: string; baseSha: string } {
-  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'git-revision-boundary-'));
+  const root = fs.realpathSync.native(fs.mkdtempSync(path.join(os.tmpdir(), 'git-revision-boundary-')));
   runGit(root, ['init', '-q']);
   runGit(root, ['config', 'user.email', 'agent-forge-tests@example.invalid']);
   runGit(root, ['config', 'user.name', 'Agent Forge Tests']);
@@ -42,7 +43,7 @@ describe('GitService Fail-Closed Behavior', () => {
   });
 
   it('should return status ERROR for non-git directory', async () => {
-    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'non-git-dir-'));
+    const tmp = fs.realpathSync.native(fs.mkdtempSync(path.join(os.tmpdir(), 'non-git-dir-')));
     try {
       const statusRes = await GitService.getStatus(tmp);
       expect(statusRes.status).toBe('ERROR');
@@ -71,11 +72,15 @@ describe('GitService Fail-Closed Behavior', () => {
       expect(result.diffContent).toContain('-before');
       expect(result.diffContent).toContain('+after');
       expect(execute).toHaveBeenCalledTimes(3);
-      expect(execute.mock.calls.map(([options]) => options.args)).toEqual([
+      expect(execute.mock.calls.map(([options]) => options.args.slice(4))).toEqual([
         ['diff', '--end-of-options', fixture.baseSha, '--'],
         ['diff', '--stat', '--end-of-options', fixture.baseSha, '--'],
         ['diff', '--name-only', '--end-of-options', fixture.baseSha, '--'],
       ]);
+      for (const [options] of execute.mock.calls) {
+        expect(options.args.slice(0, 4)).toEqual(['-c', 'core.fsmonitor=false', '-c', 'core.untrackedCache=false']);
+        expect(options.env).toEqual({ GIT_OPTIONAL_LOCKS: '0' });
+      }
     } finally {
       fs.rmSync(fixture.root, { recursive: true, force: true });
     }
@@ -170,6 +175,68 @@ describe('GitService Fail-Closed Behavior', () => {
       expect(execute).not.toHaveBeenCalled();
     } finally {
       fs.rmSync(fixture.root, { recursive: true, force: true });
+    }
+  });
+
+  it('rejects a real repository junction or symlink before any Git process', async () => {
+    const selected = createGitFixture();
+    const unrelated = createGitFixture();
+    const alias = path.join(selected.root, 'alias');
+    const execute = vi.spyOn(ProcessRunner, 'execute');
+    try {
+      fs.symlinkSync(unrelated.root, alias, process.platform === 'win32' ? 'junction' : 'dir');
+      for (const result of [await GitService.getStatus(alias), await GitService.getHeadSha(alias),
+        await GitService.getCurrentBranch(alias), await GitService.getDiff(alias, unrelated.baseSha)]) {
+        expect(result).toMatchObject({ status: 'ERROR', errorCode: 'REPOSITORY_ROOT_ALIAS' });
+      }
+      expect(execute).not.toHaveBeenCalled();
+      expect(runGit(unrelated.root, ['rev-parse', 'HEAD'])).toBe(unrelated.baseSha);
+      expect(fs.readFileSync(path.join(unrelated.root, 'tracked.txt'), 'utf8')).toBe('after\n');
+    } finally {
+      fs.rmSync(selected.root, { recursive: true, force: true });
+      fs.rmSync(unrelated.root, { recursive: true, force: true });
+    }
+  });
+
+  it('rejects a changed selected identity before invoking Git on the replacement', async () => {
+    const fixture = createGitFixture();
+    const identity = captureRepositoryRoot(fixture.root);
+    const original = fixture.root + '-original';
+    const execute = vi.spyOn(ProcessRunner, 'execute');
+    try {
+      fs.renameSync(fixture.root, original); fs.mkdirSync(fixture.root);
+      expect(await GitService.getStatus(fixture.root, identity))
+        .toMatchObject({ status: 'ERROR', isClean: false, errorCode: 'REPOSITORY_ROOT_IDENTITY_CHANGED' });
+      expect(await GitService.getHeadSha(fixture.root, identity))
+        .toMatchObject({ status: 'ERROR', sha: null, errorCode: 'REPOSITORY_ROOT_IDENTITY_CHANGED' });
+      expect(execute).not.toHaveBeenCalled();
+      expect(fs.readFileSync(path.join(original, 'tracked.txt'), 'utf8')).toBe('after\n');
+    } finally {
+      fs.rmSync(fixture.root, { recursive: true, force: true });
+      fs.rmSync(original, { recursive: true, force: true });
+    }
+  });
+
+  it('discards a completed branch observation when the root changes before status collection', async () => {
+    const fixture = createGitFixture();
+    const original = fixture.root + '-original';
+    const actual = ProcessRunner.execute.bind(ProcessRunner);
+    const execute = vi.spyOn(ProcessRunner, 'execute').mockImplementationOnce(async options => {
+      const result = await actual(options);
+      fs.renameSync(fixture.root, original); fs.mkdirSync(fixture.root);
+      fs.writeFileSync(path.join(fixture.root, 'sentinel'), 'replacement-owner');
+      return result;
+    });
+    try {
+      const result = await GitService.getStatus(fixture.root);
+      expect(result).toMatchObject({ status: 'ERROR', branch: 'UNKNOWN', isClean: false,
+        errorCode: 'REPOSITORY_ROOT_IDENTITY_CHANGED', modifiedFiles: [], untrackedFiles: [] });
+      expect(execute).toHaveBeenCalledTimes(1);
+      expect(fs.readFileSync(path.join(original, 'tracked.txt'), 'utf8')).toBe('after\n');
+      expect(fs.readFileSync(path.join(fixture.root, 'sentinel'), 'utf8')).toBe('replacement-owner');
+    } finally {
+      fs.rmSync(fixture.root, { recursive: true, force: true });
+      fs.rmSync(original, { recursive: true, force: true });
     }
   });
 });

@@ -1,5 +1,4 @@
 import { ipcMain, dialog, app } from 'electron';
-import path from 'path';
 import { Repository } from '../core/database/repositories';
 import { ProjectService } from '../core/services/ProjectService';
 import { TaskService } from '../core/services/TaskService';
@@ -13,6 +12,7 @@ import { defaultArtifactStore } from '../core/services/ArtifactStore';
 import { EmergencyStopService } from '../core/services/EmergencyStopService';
 import { PolicyService } from '../core/services/PolicyService';
 import { RepositorySelectionService } from '../core/services/RepositorySelectionService';
+import { assertRepositoryRootIdentity, captureRepositoryRoot, RepositoryRootError } from '../core/services/RepositoryRootIdentity';
 import { ProviderRoutingService } from '../core/services/ProviderRoutingService';
 import { ExecutionAuthorizationService } from '../core/services/ExecutionAuthorizationService';
 import { ProviderDispatchService } from '../core/services/ProviderDispatchService';
@@ -133,39 +133,45 @@ export function registerIpcHandlers(
       return { success: false, cancelled: true };
     }
 
-    const selectedPath = path.normalize(path.resolve(filePaths[0]));
+    try {
+      const rootIdentity = captureRepositoryRoot(filePaths[0]);
+      const selectedPath = rootIdentity.canonicalPath;
 
-    // Validate path against security policy
-    const policy = PolicyService.evaluatePathAccess(selectedPath, selectedPath, false);
-    if (!policy.allowed) {
+      // Validate path against security policy
+      const policy = PolicyService.evaluatePathAccess(selectedPath, selectedPath, false);
+      if (!policy.allowed) {
+        return {
+          success: false,
+          errorCode: 'INVALID_REPOSITORY_LOCATION',
+          errorDetail: policy.reason,
+          error: `Invalid repository location: ${policy.reason}`,
+        };
+      }
+
+      // Verify directory is a genuine Git working tree
+      const gitStatus = await GitService.getStatus(selectedPath, rootIdentity);
+      if (gitStatus.status !== 'SUCCESS') {
+        const errorDetail = gitStatus.errorMessage || 'git status failed';
+        return {
+          success: false,
+          errorCode: gitStatus.errorCode ?? 'NOT_GIT_REPOSITORY',
+          errorDetail,
+          error: `Selected directory is not a valid Git repository (${errorDetail}).`,
+        };
+      }
+
+      // Issue short-lived, single-use selection token
+      const token = RepositorySelectionService.issueToken(filePaths[0], rootIdentity);
+
       return {
-        success: false,
-        errorCode: 'INVALID_REPOSITORY_LOCATION',
-        errorDetail: policy.reason,
-        error: `Invalid repository location: ${policy.reason}`,
+        success: true,
+        selectionId: token.selectionId,
+        displayPath: token.displayPath,
       };
+    } catch (error) {
+      if (!(error instanceof RepositoryRootError)) throw error;
+      return { success: false, errorCode: error.code, errorDetail: error.message, error: error.message };
     }
-
-    // Verify directory is a genuine Git working tree
-    const gitStatus = await GitService.getStatus(selectedPath);
-    if (gitStatus.status !== 'SUCCESS') {
-      const errorDetail = gitStatus.errorMessage || 'git status failed';
-      return {
-        success: false,
-        errorCode: 'NOT_GIT_REPOSITORY',
-        errorDetail,
-        error: `Selected directory is not a valid Git repository (${errorDetail}).`,
-      };
-    }
-
-    // Issue short-lived, single-use selection token
-    const token = RepositorySelectionService.issueToken(selectedPath);
-
-    return {
-      success: true,
-      selectionId: token.selectionId,
-      displayPath: token.displayPath,
-    };
   });
 
   // ==========================================
@@ -179,34 +185,41 @@ export function registerIpcHandlers(
 
     // Consume native selection token
     const tokenRes = RepositorySelectionService.consumeToken(parsed.data.repositorySelectionId);
-    if (!tokenRes.success || !tokenRes.canonicalPath) {
-      return { success: false, error: tokenRes.error || 'Invalid repository selection token.' };
+    if (!tokenRes.success || !tokenRes.canonicalPath || !tokenRes.rootIdentity) {
+      return { success: false, errorCode: tokenRes.errorCode, error: tokenRes.error || 'Invalid repository selection token.' };
     }
 
-    const canonicalRepoPath = tokenRes.canonicalPath;
+    try {
+      const canonicalRepoPath = tokenRes.canonicalPath;
 
-    // Validate path security and Git repository validity
-    const policy = PolicyService.evaluatePathAccess(canonicalRepoPath, canonicalRepoPath, false);
-    if (!policy.allowed) {
-      return { success: false, error: `Unauthorized repository path: ${policy.reason}` };
+      // Validate path security and Git repository validity
+      const policy = PolicyService.evaluatePathAccess(canonicalRepoPath, canonicalRepoPath, false);
+      if (!policy.allowed) {
+        return { success: false, error: `Unauthorized repository path: ${policy.reason}` };
+      }
+
+      const gitStatus = await GitService.getStatus(canonicalRepoPath, tokenRes.rootIdentity);
+      if (gitStatus.status !== 'SUCCESS') {
+        return {
+          success: false,
+          errorCode: gitStatus.errorCode,
+          error: `Repository path is not a valid Git repository: ${gitStatus.errorMessage || 'git status failed'}`,
+        };
+      }
+
+      assertRepositoryRootIdentity(tokenRes.rootIdentity);
+      const project = projectService.createProject(
+        parsed.data.name,
+        parsed.data.description,
+        canonicalRepoPath,
+        parsed.data.defaultBranch
+      );
+
+      return { success: true, project };
+    } catch (error) {
+      if (!(error instanceof RepositoryRootError)) throw error;
+      return { success: false, errorCode: error.code, error: error.message };
     }
-
-    const gitStatus = await GitService.getStatus(canonicalRepoPath);
-    if (gitStatus.status !== 'SUCCESS') {
-      return {
-        success: false,
-        error: `Repository path is not a valid Git repository: ${gitStatus.errorMessage || 'git status failed'}`,
-      };
-    }
-
-    const project = projectService.createProject(
-      parsed.data.name,
-      parsed.data.description,
-      canonicalRepoPath,
-      parsed.data.defaultBranch
-    );
-
-    return { success: true, project };
   });
 
   registerPrivilegedHandler('project:get', async (_, payload: unknown) => {

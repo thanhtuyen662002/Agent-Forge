@@ -1,6 +1,7 @@
 import { ProcessRunner } from './ProcessRunner';
 import { PolicyService } from './PolicyService';
 import { GitStatusSummary, GitDiffSummary } from '../types/domain';
+import { assertRepositoryRootIdentity, captureRepositoryRoot, RepositoryRootError, RepositoryRootErrorCode, RepositoryRootIdentity } from './RepositoryRootIdentity';
 
 /**
  * Error codes returned when an evidence/review revision fails validation.
@@ -10,7 +11,7 @@ import { GitStatusSummary, GitDiffSummary } from '../types/domain';
  * stable and do not echo the supplied value: callers may have passed an
  * option, path, or control sequence that must never reach a log.
  */
-export type GitDiffErrorCode = 'INVALID_GIT_REVISION';
+export type GitDiffErrorCode = 'INVALID_GIT_REVISION' | RepositoryRootErrorCode;
 
 /** Typed validation failure for an untrusted Git revision. */
 export class GitRevisionValidationError extends Error {
@@ -48,16 +49,59 @@ export interface GitShaResult {
   status: 'SUCCESS' | 'ERROR' | 'UNKNOWN';
   sha: string | null;
   errorMessage?: string;
+  errorCode?: RepositoryRootErrorCode;
 }
 
 export interface GitBranchResult {
   status: 'SUCCESS' | 'ERROR' | 'UNKNOWN';
   branch: string | null;
   errorMessage?: string;
+  errorCode?: RepositoryRootErrorCode;
 }
 
+export type GitStatusResult = GitStatusSummary & { errorCode?: RepositoryRootErrorCode };
+
 export class GitService {
-  public static async getHeadSha(repoPath: string): Promise<GitShaResult> {
+  private static observeRoot(repoPath: string, expected?: RepositoryRootIdentity): { identity?: RepositoryRootIdentity; errorCode?: RepositoryRootErrorCode; errorMessage?: string } {
+    try {
+      const current = captureRepositoryRoot(repoPath);
+      if (expected) {
+        assertRepositoryRootIdentity(expected);
+        if (JSON.stringify(current) !== JSON.stringify(expected)) throw new RepositoryRootError('REPOSITORY_ROOT_IDENTITY_CHANGED');
+      }
+      return { identity: expected ?? current };
+    } catch (error) {
+      const failure = error instanceof RepositoryRootError ? error : new RepositoryRootError('REPOSITORY_ROOT_IDENTITY_UNAVAILABLE');
+      return { errorCode: failure.code, errorMessage: failure.message };
+    }
+  }
+
+  private static async read(identity: RepositoryRootIdentity, args: string[], timeoutMs: number): Promise<{
+    exitCode: number; stdout: string; stderr: string; errorCode?: RepositoryRootErrorCode;
+  }> {
+    try {
+      assertRepositoryRootIdentity(identity);
+      const result = await ProcessRunner.execute({
+        executable: 'git',
+        args: ['-c', 'core.fsmonitor=false', '-c', 'core.untrackedCache=false', ...args],
+        cwd: identity.canonicalPath,
+        timeoutMs,
+        env: { GIT_OPTIONAL_LOCKS: '0' },
+        allowedEnvKeys: ['GIT_OPTIONAL_LOCKS'],
+      });
+      // Discard every observation from a changed root. A path snapshot is not
+      // an atomic kernel lease and must not authorize subsequent mutations.
+      assertRepositoryRootIdentity(identity);
+      return { exitCode: result.exitCode, stdout: result.stdout, stderr: result.stderr };
+    } catch (error) {
+      if (!(error instanceof RepositoryRootError)) throw error;
+      return { exitCode: -1, stdout: '', stderr: error.message, errorCode: error.code };
+    }
+  }
+
+  public static async getHeadSha(repoPath: string, expectedRoot?: RepositoryRootIdentity): Promise<GitShaResult> {
+    const root = this.observeRoot(repoPath, expectedRoot);
+    if (!root.identity) return { status: 'ERROR', sha: null, errorCode: root.errorCode, errorMessage: root.errorMessage };
     const policy = PolicyService.evaluatePathAccess(repoPath, repoPath, false);
     if (!policy.allowed) {
       return {
@@ -67,17 +111,13 @@ export class GitService {
       };
     }
 
-    const res = await ProcessRunner.execute({
-      executable: 'git',
-      args: ['rev-parse', 'HEAD'],
-      cwd: repoPath,
-      timeoutMs: 10000,
-    });
+    const res = await this.read(root.identity, ['rev-parse', 'HEAD'], 10000);
 
     if (res.exitCode !== 0 || !res.stdout.trim()) {
       return {
         status: 'ERROR',
         sha: null,
+        errorCode: res.errorCode,
         errorMessage: res.stderr.trim() || 'Failed to resolve HEAD SHA (not a git repository or no commits)',
       };
     }
@@ -88,7 +128,9 @@ export class GitService {
     };
   }
 
-  public static async getCurrentBranch(repoPath: string): Promise<GitBranchResult> {
+  public static async getCurrentBranch(repoPath: string, expectedRoot?: RepositoryRootIdentity): Promise<GitBranchResult> {
+    const root = this.observeRoot(repoPath, expectedRoot);
+    if (!root.identity) return { status: 'ERROR', branch: null, errorCode: root.errorCode, errorMessage: root.errorMessage };
     const policy = PolicyService.evaluatePathAccess(repoPath, repoPath, false);
     if (!policy.allowed) {
       return {
@@ -98,17 +140,13 @@ export class GitService {
       };
     }
 
-    const res = await ProcessRunner.execute({
-      executable: 'git',
-      args: ['branch', '--show-current'],
-      cwd: repoPath,
-      timeoutMs: 10000,
-    });
+    const res = await this.read(root.identity, ['branch', '--show-current'], 10000);
 
     if (res.exitCode !== 0) {
       return {
         status: 'ERROR',
         branch: null,
+        errorCode: res.errorCode,
         errorMessage: res.stderr.trim() || 'Failed to determine current branch',
       };
     }
@@ -119,7 +157,11 @@ export class GitService {
     };
   }
 
-  public static async getStatus(repoPath: string): Promise<GitStatusSummary> {
+  public static async getStatus(repoPath: string, expectedRoot?: RepositoryRootIdentity): Promise<GitStatusResult> {
+    const root = this.observeRoot(repoPath, expectedRoot);
+    if (!root.identity) return { status: 'ERROR', branch: 'UNKNOWN', isClean: false,
+      modifiedFiles: [], untrackedFiles: [], aheadCount: 0, behindCount: 0,
+      errorCode: root.errorCode, errorMessage: root.errorMessage };
     const policy = PolicyService.evaluatePathAccess(repoPath, repoPath, false);
     if (!policy.allowed) {
       return {
@@ -134,15 +176,13 @@ export class GitService {
       };
     }
 
-    const branchRes = await this.getCurrentBranch(repoPath);
+    const branchRes = await this.getCurrentBranch(repoPath, root.identity);
+    if (branchRes.errorCode) return { status: 'ERROR', branch: 'UNKNOWN', isClean: false,
+      modifiedFiles: [], untrackedFiles: [], aheadCount: 0, behindCount: 0,
+      errorCode: branchRes.errorCode, errorMessage: branchRes.errorMessage };
     const branchName = branchRes.status === 'SUCCESS' && branchRes.branch ? branchRes.branch : 'UNKNOWN';
 
-    const res = await ProcessRunner.execute({
-      executable: 'git',
-      args: ['status', '--porcelain'],
-      cwd: repoPath,
-      timeoutMs: 15000,
-    });
+    const res = await this.read(root.identity, ['status', '--porcelain'], 15000);
 
     if (res.exitCode !== 0) {
       return {
@@ -153,6 +193,7 @@ export class GitService {
         untrackedFiles: [],
         aheadCount: 0,
         behindCount: 0,
+        errorCode: res.errorCode,
         errorMessage: res.stderr.trim() || 'Git status command failed',
       };
     }
@@ -182,7 +223,7 @@ export class GitService {
     };
   }
 
-  public static async getDiff(repoPath: string, baseSha?: string | null): Promise<GitDiffResult> {
+  public static async getDiff(repoPath: string, baseSha?: string | null, expectedRoot?: RepositoryRootIdentity): Promise<GitDiffResult> {
     let validatedBaseSha: string | null;
     try {
       validatedBaseSha = validateGitRevision(baseSha);
@@ -202,6 +243,9 @@ export class GitService {
       throw error;
     }
 
+    const root = this.observeRoot(repoPath, expectedRoot);
+    if (!root.identity) return { status: 'ERROR', diffStat: '', diffContent: '', filesChanged: [],
+      insertions: 0, deletions: 0, errorCode: root.errorCode, errorMessage: root.errorMessage };
     const policy = PolicyService.evaluatePathAccess(repoPath, repoPath, false);
     if (!policy.allowed) {
       return {
@@ -225,12 +269,7 @@ export class GitService {
       : ['diff'];
 
     // 1. Get raw diff
-    const diffRes = await ProcessRunner.execute({
-      executable: 'git',
-      args,
-      cwd: repoPath,
-      timeoutMs: 20000,
-    });
+    const diffRes = await this.read(root.identity, args, 20000);
 
     if (diffRes.exitCode !== 0) {
       return {
@@ -240,19 +279,15 @@ export class GitService {
         filesChanged: [],
         insertions: 0,
         deletions: 0,
+        errorCode: diffRes.errorCode,
         errorMessage: diffRes.stderr.trim() || 'Git diff command failed',
       };
     }
 
     // 2. Get diff stat
-    const statRes = await ProcessRunner.execute({
-      executable: 'git',
-      args: validatedBaseSha
+    const statRes = await this.read(root.identity, validatedBaseSha
         ? ['diff', '--stat', '--end-of-options', validatedBaseSha, '--']
-        : ['diff', '--stat'],
-      cwd: repoPath,
-      timeoutMs: 20000,
-    });
+        : ['diff', '--stat'], 20000);
 
     if (statRes.exitCode !== 0) {
       return {
@@ -262,19 +297,15 @@ export class GitService {
         filesChanged: [],
         insertions: 0,
         deletions: 0,
+        errorCode: statRes.errorCode,
         errorMessage: statRes.stderr.trim() || 'Git diff --stat command failed',
       };
     }
 
     // 3. Get list of changed files
-    const nameRes = await ProcessRunner.execute({
-      executable: 'git',
-      args: validatedBaseSha
+    const nameRes = await this.read(root.identity, validatedBaseSha
         ? ['diff', '--name-only', '--end-of-options', validatedBaseSha, '--']
-        : ['diff', '--name-only'],
-      cwd: repoPath,
-      timeoutMs: 20000,
-    });
+        : ['diff', '--name-only'], 20000);
 
     if (nameRes.exitCode !== 0) {
       return {
@@ -284,6 +315,7 @@ export class GitService {
         filesChanged: [],
         insertions: 0,
         deletions: 0,
+        errorCode: nameRes.errorCode,
         errorMessage: nameRes.stderr.trim() || 'Git diff --name-only command failed',
       };
     }
