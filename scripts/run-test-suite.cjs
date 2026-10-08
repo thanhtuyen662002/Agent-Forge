@@ -13,12 +13,28 @@
  */
 
 const path = require('node:path');
+const fs = require('node:fs');
+const os = require('node:os');
 const { spawnSync } = require('node:child_process');
 const { sanitizeCapturedOutput } = require('./test-output-sanitizer.cjs');
 
 const repositoryRoot = path.resolve(__dirname, '..');
 const vitestEntry = path.join(repositoryRoot, 'node_modules', 'vitest', 'vitest.mjs');
 const reporterArgs = process.argv.slice(2);
+// Windows runner TEMP commonly uses a DOS short-name alias. Ordinary fixtures
+// must start at a canonical root; production selection still rejects aliases.
+// Set this before any fixture exists and preserve the sanitizer around Vitest.
+const testTemporaryRoot = fs.realpathSync.native(os.tmpdir());
+const testEnvironment = { ...process.env };
+if (process.platform === 'win32') {
+  for (const key of Object.keys(testEnvironment)) {
+    if (/^(TEMP|TMP)$/i.test(key)) delete testEnvironment[key];
+  }
+  testEnvironment.TEMP = testTemporaryRoot;
+  testEnvironment.TMP = testTemporaryRoot;
+} else {
+  testEnvironment.TMPDIR = testTemporaryRoot;
+}
 const focusedFiles = String(process.env.AGENTFORGE_TEST_FILES || '')
   .split(',')
   .map((value) => value.trim())
@@ -28,6 +44,7 @@ const runVitest = (label, args) => {
   process.stdout.write(`\n=== Agent Forge ${label} test phase ===\n`);
   const result = spawnSync(process.execPath, [vitestEntry, 'run', ...args, ...reporterArgs], {
     cwd: repositoryRoot,
+    env: testEnvironment,
     // Capture the Vitest parent process so reporter assertion summaries pass
     // through the same fail-closed credential boundary as worker output.
     stdio: ['inherit', 'pipe', 'pipe'],

@@ -599,11 +599,11 @@ describe('R5I6 Crash Recovery, Execution Lifecycle Linearization, and Durable Au
     testDb.close();
   });
 
-  // 4. RC verifier requires exactly 25 migrations
-  it('4. should require exactly 25 migrations in static contract count', () => {
-    expect(MIGRATIONS.length).toBe(25);
+  // 4. RC verifier requires exactly 26 migrations
+  it('4. should require exactly 26 migrations in static contract count', () => {
+    expect(MIGRATIONS.length).toBe(26);
     const verifierScript = fs.readFileSync(path.join(process.cwd(), 'scripts/verify-demo-rc-win.ps1'), 'utf-8');
-    expect(verifierScript).toContain('Expected exactly 25 migrations');
+    expect(verifierScript).toContain('Expected exactly 26 migrations');
     expect(verifierScript).not.toContain('Expected exactly 20 migrations');
   });
 
