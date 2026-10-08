@@ -2,6 +2,8 @@ import crypto from 'crypto';
 import fs from 'fs';
 import path from 'path';
 import { ProcessRunner } from './ProcessRunner';
+import { WorktreeMutationBoundary } from './WorktreeMutationBoundary';
+import { ManagedGitWorktreeMutation } from './ManagedGitWorktreeMutation';
 
 export interface GitWorktreeServiceConfig {
   gitExecutable: string;
@@ -30,6 +32,7 @@ export class DefaultProcessExecutor implements IProcessExecutor {
       timeoutMs: options?.timeoutMs ?? 30000,
       allowShell: false,
       env: options?.env,
+      allowedEnvKeys: ['GIT_OPTIONAL_LOCKS'],
     });
     return {
       exitCode: res.exitCode,
@@ -66,6 +69,8 @@ export type WorktreeErrorCode =
   | 'UNMANAGED_WORKTREE'
   | 'DIRTY_WORKTREE'
   | 'HEAD_CHANGED'
+  | 'UNSUPPORTED_MUTATION_BOUNDARY'
+  | 'UNSUPPORTED_CHECKOUT_ENTRY'
   | 'REMOVE_FAILED'
   | 'INSPECTION_FAILED';
 
@@ -124,9 +129,9 @@ export interface PorcelainWorktreeEntry {
 
 interface DirectoryIdentity {
   realPath: string;
-  dev: number;
-  ino: number;
-  birthtimeMs: number;
+  dev: bigint;
+  ino: bigint;
+  birthtimeNs: bigint;
 }
 
 interface ManagedRootLock {
@@ -169,13 +174,9 @@ function isPathWithinRoot(childPath: string, rootPath: string): boolean {
 
 function sameDirectoryIdentity(left: DirectoryIdentity, right: DirectoryIdentity): boolean {
   if (normalizePathForComparison(left.realPath) !== normalizePathForComparison(right.realPath)) return false;
-  // Device/inode is the strongest identity available on POSIX and on modern
-  // Windows Node builds. Some Windows filesystems report zero for one or both
-  // values, so birth time plus canonical realpath remains the fallback.
-  if (left.dev !== 0 || right.dev !== 0 || left.ino !== 0 || right.ino !== 0) {
-    return left.dev === right.dev && left.ino === right.ino && left.birthtimeMs === right.birthtimeMs;
-  }
-  return left.birthtimeMs === right.birthtimeMs;
+  // Preserve exact IDs. Windows st_dev can be zero; native mutation separately
+  // anchors a nonzero kernel volume. A missing inode never becomes a fallback.
+  return left.ino !== 0n && right.ino !== 0n && left.dev === right.dev && left.ino === right.ino && left.birthtimeNs === right.birthtimeNs;
 }
 
 function isMissingFsError(error: unknown): boolean {
@@ -249,11 +250,25 @@ export class GitWorktreeService {
       throw new Error(`INVALID_MANAGED_ROOT: managedRoot "${config.managedRoot}" targets a sensitive path.`);
     }
 
-    if (!fs.existsSync(config.managedRoot)) {
-      fs.mkdirSync(config.managedRoot, { recursive: true });
+    this.canonicalManagedRoot = path.resolve(config.managedRoot);
+    if (process.platform === 'win32' && fs.existsSync(this.canonicalManagedRoot)) {
+      // Windows TEMP may contain a genuine 8.3 spelling. Expand that spelling
+      // only when every ordinary parent and the exact BigInt leaf identity
+      // agree. Junctions are denied, and this read-only normalization performs
+      // no filesystem mutation. Native guards capture the canonical objects.
+      const original = fs.lstatSync(this.canonicalManagedRoot, { bigint: true });
+      let current = path.parse(this.canonicalManagedRoot).root;
+      for (const segment of this.canonicalManagedRoot.slice(current.length).split(path.sep)) {
+        current = path.join(current, segment);
+        const parent = fs.lstatSync(current, { bigint: true });
+        if (!parent.isDirectory() || parent.isSymbolicLink()) throw new Error('INVALID_MANAGED_ROOT: Reparse parent or alias is denied.');
+      }
+      const canonical = fs.realpathSync.native(this.canonicalManagedRoot);
+      const captured = fs.lstatSync(canonical, { bigint: true });
+      if (!original.isDirectory() || original.isSymbolicLink() || original.ino === 0n || original.ino !== captured.ino ||
+          original.dev !== captured.dev || original.birthtimeNs !== captured.birthtimeNs) throw new Error('INVALID_MANAGED_ROOT: Alias identity changed.');
+      this.canonicalManagedRoot = canonical;
     }
-    this.canonicalManagedRoot = fs.realpathSync.native ? fs.realpathSync.native(config.managedRoot) : fs.realpathSync(config.managedRoot);
-    this.managedRootIdentity = this.captureDirectoryIdentity(this.canonicalManagedRoot, 'managed root');
 
     // 4. Validate Disjointness of Roots
     const normRepo = normalizePathForComparison(this.canonicalRepoRoot);
@@ -268,12 +283,23 @@ export class GitWorktreeService {
     if (isPathWithinRoot(this.canonicalRepoRoot, this.canonicalManagedRoot)) {
       throw new Error('INVALID_REPOSITORY_ROOT: repositoryRoot cannot reside inside managedRoot.');
     }
+    if (!fs.existsSync(config.managedRoot)) {
+      if (process.platform === 'win32') {
+        try { WorktreeMutationBoundary.initializeSync(config.managedRoot); }
+        catch { throw new Error('INVALID_MANAGED_ROOT: Captured parent initialization was denied.'); }
+      } else {
+        // POSIX mutation enforcement remains an explicit unfinished gate in
+        // #163. This legacy branch must not satisfy the Issue's acceptance.
+        fs.mkdirSync(config.managedRoot, { recursive: true });
+      }
+    }
+    this.managedRootIdentity = this.captureDirectoryIdentity(this.canonicalManagedRoot, 'managed root');
   }
 
   private captureDirectoryIdentity(candidate: string, label: string): DirectoryIdentity {
-    let stat: fs.Stats;
+    let stat: fs.BigIntStats;
     try {
-      stat = fs.lstatSync(candidate);
+      stat = fs.lstatSync(candidate, { bigint: true });
     } catch (error) {
       throw new Error(`INVALID_${label === 'managed root' ? 'MANAGED_ROOT' : 'REPOSITORY_ROOT'}: Unable to inspect ${label} "${candidate}": ${error instanceof Error ? error.message : String(error)}`);
     }
@@ -288,14 +314,15 @@ export class GitWorktreeService {
       throw new Error(`INVALID_${label === 'managed root' ? 'MANAGED_ROOT' : 'REPOSITORY_ROOT'}: Unable to resolve ${label} "${candidate}": ${error instanceof Error ? error.message : String(error)}`);
     }
 
-    if (normalizePathForComparison(realPath) !== normalizePathForComparison(candidate)) {
+    const lexical = path.resolve(candidate);
+    if ((process.platform === 'win32' ? realPath.toLowerCase() !== lexical.toLowerCase() : realPath !== lexical)) {
       throw new Error(`INVALID_${label === 'managed root' ? 'MANAGED_ROOT' : 'REPOSITORY_ROOT'}: ${label} "${candidate}" resolves through an alias or junction.`);
     }
     return {
       realPath,
       dev: stat.dev,
       ino: stat.ino,
-      birthtimeMs: stat.birthtimeMs,
+      birthtimeNs: stat.birthtimeNs,
     };
   }
 
@@ -335,9 +362,9 @@ export class GitWorktreeService {
   }
 
   private captureTargetIdentity(targetPath: string, required: boolean): DirectoryIdentity | null {
-    let stat: fs.Stats;
+    let stat: fs.BigIntStats;
     try {
-      stat = fs.lstatSync(targetPath);
+      stat = fs.lstatSync(targetPath, { bigint: true });
     } catch (error) {
       if (!required && isMissingFsError(error)) return null;
       if (isMissingFsError(error)) {
@@ -385,7 +412,7 @@ export class GitWorktreeService {
       realPath,
       dev: stat.dev,
       ino: stat.ino,
-      birthtimeMs: stat.birthtimeMs,
+      birthtimeNs: stat.birthtimeNs,
     };
   }
 
@@ -511,6 +538,23 @@ export class GitWorktreeService {
   }
 
   private async withManagedRootLock<T>(onUnavailable: () => T, operation: () => Promise<T>): Promise<T> {
+    if (process.platform === 'win32') {
+      let boundary: WorktreeMutationBoundary | null = null;
+      try {
+        this.assertRootIdentities();
+        boundary = await WorktreeMutationBoundary.acquire(this.canonicalManagedRoot);
+        this.assertRootIdentities();
+        const owner = { pid: process.pid, token: crypto.randomUUID(), createdAt: Date.now() };
+        const deadline = Date.now() + GitWorktreeService.OPERATION_LOCK_TIMEOUT_MS;
+        while (!await boundary.acquireOperationLock(owner)) {
+          if (Date.now() >= deadline) return onUnavailable();
+          await this.delay(GitWorktreeService.OPERATION_LOCK_RETRY_MS);
+        }
+        this.assertRootIdentities();
+        return await operation();
+      } catch { return onUnavailable(); }
+      finally { await boundary?.close(); }
+    }
     let lock: ManagedRootLock | null = null;
     try {
       lock = await this.acquireManagedRootLock();
@@ -532,7 +576,7 @@ export class GitWorktreeService {
     args: string[],
   ): Promise<{ exitCode: number; stdout: string; stderr: string }> {
     this.assertRootIdentities();
-    const result = await this.executor.execute(this.gitExecutable, args, { cwd: this.canonicalRepoRoot });
+    const result = await this.executor.execute(this.gitExecutable, args, { cwd: this.canonicalRepoRoot, env: { GIT_OPTIONAL_LOCKS: '0' } });
     this.assertRootIdentities();
     return result;
   }
@@ -548,6 +592,7 @@ export class GitWorktreeService {
       cwd: args[0] === 'worktree' && (args[1] === 'unlock' || args[1] === 'lock' || args[1] === 'remove')
         ? this.canonicalRepoRoot
         : targetPath,
+      env: { GIT_OPTIONAL_LOCKS: '0' },
     });
     this.assertRootIdentities();
     this.assertTargetIdentity(targetPath, targetIdentity, !allowTargetMissingAfter);
@@ -732,6 +777,8 @@ export class GitWorktreeService {
       };
     }
 
+    if (process.platform === 'win32') return this.createCapturedWorktree(tuple, targetPath, digest);
+
     // 6. Run git worktree add --detach <targetPath> <baseSha>
     let addResult: { exitCode: number; stdout: string; stderr: string };
     try {
@@ -888,6 +935,56 @@ export class GitWorktreeService {
     };
   }
 
+  private capturedFailure(error: unknown): { code: WorktreeErrorCode; error: string } {
+    const detail = error instanceof Error ? error.message : '';
+    const code: WorktreeErrorCode = detail.includes('UNSUPPORTED_MUTATION_BOUNDARY') ? 'UNSUPPORTED_MUTATION_BOUNDARY'
+      : /WORKTREE_(TREE_ENTRY_UNSUPPORTED|CHECKOUT_NAME_UNSUPPORTED|CHECKOUT_ALIAS_COLLISION|CHECKOUT_LIMIT|BLOB_LIMIT|TREE_LIMIT)/.test(detail) ? 'UNSUPPORTED_CHECKOUT_ENTRY'
+      : detail.includes('WORKTREE_DIRTY') ? 'DIRTY_WORKTREE'
+      : detail.includes('WORKTREE_HEAD_CHANGED') ? 'HEAD_CHANGED'
+      : /OWNER_RECEIPT|GIT_POINTER|GIT_ADMIN|NOT_ADMITTED/.test(detail) ? 'UNMANAGED_WORKTREE'
+      : /BOUNDARY_|IDENTITY_CHANGED/.test(detail) ? 'PATH_IDENTITY_CHANGED' : 'GIT_ADD_FAILED';
+    return { code, error: `${code}: Captured worktree mutation was denied; retain fenced state for recovery.` };
+  }
+
+  private async createCapturedWorktree(tuple: WorktreeOwnershipTuple, targetPath: string, digest: string): Promise<WorktreeCreateResult> {
+    let mutation: ManagedGitWorktreeMutation | null = null;
+    let failure: { code: WorktreeErrorCode; error: string } = { code: 'GIT_ADD_FAILED', error: 'GIT_ADD_FAILED: Captured checkout failed.' };
+    try {
+      mutation = await ManagedGitWorktreeMutation.prepare({ gitExecutable: this.gitExecutable,
+        repositoryRoot: this.canonicalRepoRoot, managedRoot: this.canonicalManagedRoot }, path.basename(targetPath));
+      await mutation.create(tuple.baseSha.toLowerCase(), digest);
+      const identity = this.captureTargetIdentity(targetPath, true)!;
+      const head = await this.executeGitWithTargetBoundary(['rev-parse', 'HEAD'], targetPath, identity);
+      const branch = await this.executeGitWithTargetBoundary(['branch', '--show-current'], targetPath, identity);
+      const top = await this.executeGitWithTargetBoundary(['rev-parse', '--show-toplevel'], targetPath, identity);
+      if (head.exitCode !== 0 || head.stdout.trim().toLowerCase() !== tuple.baseSha.toLowerCase() ||
+          branch.exitCode !== 0 || branch.stdout.trim() !== '' || top.exitCode !== 0 ||
+          normalizePathForComparison(top.stdout.trim()) !== normalizePathForComparison(targetPath)) {
+        failure = { code: 'HEAD_BINDING_MISMATCH', error: 'HEAD_BINDING_MISMATCH: Captured checkout source/branch/root could not be verified.' };
+      } else {
+        const entries = await this.listPorcelain();
+        const matching = entries.filter(entry => normalizePathForComparison(entry.worktreePath) === normalizePathForComparison(targetPath));
+        if (matching.length !== 1 || !matching[0].isDetached || matching[0].headSha.toLowerCase() !== tuple.baseSha.toLowerCase()) {
+          failure = { code: 'WORKTREE_REGISTRATION_MISMATCH', error: 'WORKTREE_REGISTRATION_MISMATCH: Captured checkout registration could not be verified.' };
+        } else if (!matching[0].isLocked || matching[0].lockReason !== `AgentForge managed assignment ${digest.slice(0, 16)}`) {
+          failure = { code: 'WORKTREE_LOCK_FAILED', error: 'WORKTREE_LOCK_FAILED: Captured worktree lock could not be verified.' };
+        } else {
+          const clean = await this.executeGitWithTargetBoundary(['status', '--porcelain', '-uall'], targetPath, identity);
+          if (clean.exitCode === 0 && clean.stdout.trim() === '') {
+            this.assertOperationBoundary(targetPath, identity, true);
+            await mutation.close(); mutation = null;
+            return { status: 'CREATED', worktreePath: targetPath, baseSha: tuple.baseSha.toLowerCase(), ownershipDigest: digest };
+          }
+          failure = { code: 'HEAD_BINDING_MISMATCH', error: 'HEAD_BINDING_MISMATCH: Exact checkout content did not pass independent clean-state verification.' };
+        }
+      }
+    } catch (error) { failure = this.capturedFailure(error); }
+    try { await mutation?.rollbackCreated(); }
+    catch { failure = { code: 'CREATE_ROLLBACK_FAILED', error: 'CREATE_ROLLBACK_FAILED: Captured setup could not be rolled back; retain owned filesystem and administrative evidence.' }; }
+    finally { await mutation?.close(); }
+    return { status: 'FAILED', ...failure, worktreePath: targetPath };
+  }
+
   /**
    * Inspects a managed worktree without mutating any filesystem or Git state.
    */
@@ -959,7 +1056,14 @@ export class GitWorktreeService {
     const expectedSha = tuple.baseSha.toLowerCase();
 
     if (exists && registered) {
+      let inspectionBoundary: ManagedGitWorktreeMutation | null = null;
       try {
+        if (process.platform === 'win32') {
+          inspectionBoundary = await ManagedGitWorktreeMutation.prepare({ gitExecutable: this.gitExecutable,
+            repositoryRoot: this.canonicalRepoRoot, managedRoot: this.canonicalManagedRoot }, path.basename(targetPath), false);
+          await inspectionBoundary.captureOwned(expectedSha, digest, true);
+          this.assertTargetIdentity(targetPath, targetIdentity, true);
+        }
         const headCheck = await this.executeGitWithTargetBoundary(['rev-parse', 'HEAD'], targetPath, targetIdentity!);
         if (headCheck.exitCode === 0) {
           headSha = headCheck.stdout.trim().toLowerCase();
@@ -989,8 +1093,9 @@ export class GitWorktreeService {
             worktreePath: targetPath,
           };
         }
+        if (process.platform === 'win32') return { status: 'FAILED', ...this.capturedFailure(error), worktreePath: targetPath };
         clean = false;
-      }
+      } finally { await inspectionBoundary?.close(); }
     }
 
     const sourceMatch = headSha === expectedSha;
@@ -1158,6 +1263,23 @@ export class GitWorktreeService {
         error: `DIRTY_WORKTREE: Worktree "${targetPath}" has uncommitted or untracked changes. Removal denied.`,
         worktreePath: targetPath,
       };
+    }
+
+    if (process.platform === 'win32') {
+      let mutation: ManagedGitWorktreeMutation | null = null;
+      try {
+        mutation = await ManagedGitWorktreeMutation.prepare({ gitExecutable: this.gitExecutable,
+          repositoryRoot: this.canonicalRepoRoot, managedRoot: this.canonicalManagedRoot }, path.basename(targetPath), false);
+        await mutation.captureOwned(expectedSha, digest);
+        this.assertOperationBoundary(targetPath, targetIdentity, true);
+        await mutation.removeOwned();
+        const remaining = await this.listPorcelain();
+        if (this.captureTargetIdentity(targetPath, false) || remaining.some(item => normalizePathForComparison(item.worktreePath) === normalizePathForComparison(targetPath))) {
+          return { status: 'FAILED', code: 'REMOVE_FAILED', error: 'REMOVE_FAILED: Captured worktree remains present or registered.', worktreePath: targetPath };
+        }
+        return { status: 'REMOVED', worktreePath: targetPath, ownershipDigest: digest };
+      } catch (error) { return { status: 'FAILED', ...this.capturedFailure(error), worktreePath: targetPath }; }
+      finally { await mutation?.close(); }
     }
 
     // 1. Unlock worktree if locked

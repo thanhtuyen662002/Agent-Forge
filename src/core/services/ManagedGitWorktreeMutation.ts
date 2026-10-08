@@ -213,7 +213,9 @@ export class ManagedGitWorktreeMutation {
     }) + '\n'));
     await this.metadata.writeNewFile(this.childName, 'HEAD', Buffer.from(baseSha + '\n'));
     await this.metadata.writeNewFile(this.childName, 'commondir', Buffer.from('../..\n'));
-    await this.metadata.writeNewFile(this.childName, 'gitdir', Buffer.from(path.join(target, '.git') + '\n'));
+    // Git's worktree discovery removes the final component using '/'. Use
+    // Git's portable metadata spelling even on Windows, not path.join's '\\'.
+    await this.metadata.writeNewFile(this.childName, 'gitdir', Buffer.from(path.join(target, '.git').replace(/\\/g, '/') + '\n'));
     await this.metadata.writeNewFile(this.childName, 'locked', Buffer.from(`AgentForge managed assignment ${ownershipDigest.slice(0, 16)}\n`));
     const directories = new Set<string>();
     const blobs = new BinaryGitReader(this.config.gitExecutable, ['cat-file', '--batch'], this.config.repositoryRoot, MAX_BLOB_BYTES + 129);
@@ -236,7 +238,7 @@ export class ManagedGitWorktreeMutation {
     return target;
   }
 
-  async captureOwned(baseSha: string, ownershipDigest: string): Promise<string> {
+  async captureOwned(baseSha: string, ownershipDigest: string, inspectionOnly = false): Promise<string> {
     if (!/^[a-f0-9]{40}$/.test(baseSha) || !/^[a-f0-9]{64}$/.test(ownershipDigest) ||
         this.childName !== `afw-${ownershipDigest.slice(0, 32)}` || !this.checkout || !this.metadata || !this.adminRoot) {
       throw new Error('WORKTREE_MUTATION_OWNER_DENIED');
@@ -255,11 +257,12 @@ export class ManagedGitWorktreeMutation {
     const pointer = (await this.checkout.readCapturedFile(this.childName, '.git')).toString('utf8').trim();
     if (pointer !== `gitdir: ${path.join(this.adminRoot, this.childName).replace(/\\/g, '/')}`) throw new Error('WORKTREE_GIT_POINTER_MISMATCH');
     const readAdmin = async (file: string) => (await this.metadata!.readCapturedFile(this.childName, file)).toString('utf8').trim();
-    if (await readAdmin('HEAD') !== baseSha || await readAdmin('commondir') !== '../..' ||
-        await readAdmin('gitdir') !== path.join(target, '.git') ||
-        await readAdmin('locked') !== `AgentForge managed assignment ${ownershipDigest.slice(0, 16)}`) throw new Error('WORKTREE_GIT_ADMIN_MISMATCH');
-    this.ownedExisting = true;
-    this.ownedSha = baseSha;
+    if (await readAdmin('commondir') !== '../..' || await readAdmin('gitdir') !== path.join(target, '.git').replace(/\\/g, '/')) throw new Error('WORKTREE_GIT_ADMIN_MISMATCH');
+    if (!inspectionOnly) {
+      if (await readAdmin('HEAD') !== baseSha || await readAdmin('locked') !== `AgentForge managed assignment ${ownershipDigest.slice(0, 16)}`) throw new Error('WORKTREE_GIT_ADMIN_MISMATCH');
+      this.ownedExisting = true;
+      this.ownedSha = baseSha;
+    }
     return target;
   }
 

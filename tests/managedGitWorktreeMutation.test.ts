@@ -67,6 +67,7 @@ describe.skipIf(process.platform !== 'win32')('real captured checkout and Git ad
     expect(run(['status', '--porcelain', '-uall'], target).trim()).toBe('');
     expect(run(['ls-files', '--stage'], target)).toContain('nested/binary.bin');
     const entries = run(['worktree', 'list', '--porcelain']);
+    expect(entries).toContain(`worktree ${target.replace(/\\/g, '/')}\nHEAD ${sha}\ndetached\n`);
     expect(entries).toContain('locked AgentForge managed assignment ' + digest.slice(0, 16));
     expect(fs.readFileSync(path.join(target, 'nested', 'binary.bin'))).toEqual(bytes);
     expect(fs.readFileSync(path.join(target, 'substitute.txt'), 'utf8')).toBe('$Format:%H$\n');

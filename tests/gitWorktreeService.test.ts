@@ -3,6 +3,7 @@ import fs from 'fs';
 import path from 'path';
 import os from 'os';
 import { execSync } from 'child_process';
+import { WorktreeMutationBoundary } from '../src/core/services/WorktreeMutationBoundary';
 import {
   GitWorktreeService,
   GitWorktreeServiceConfig,
@@ -236,7 +237,7 @@ describe('R5G2A — GitWorktreeService Contract & Invariant Suite', () => {
   it('13. Creation makes detached worktree at exact SHA', async () => {
     const t = makeTuple({ baseSha: baseCommitSha });
     const res = await service.createWorktree(t);
-    expect(res.status).toBe('CREATED');
+    expect(res.status, JSON.stringify(res)).toBe('CREATED');
     if (res.status === 'CREATED') {
       expect(fs.existsSync(res.worktreePath)).toBe(true);
       expect(res.baseSha).toBe(baseCommitSha);
@@ -489,16 +490,22 @@ describe('R5G2A — GitWorktreeService Contract & Invariant Suite', () => {
   // 8. Rollback & Structural Invariants
   // =========================================================================
 
-  it('32. Lock failure after add triggers safe rollback', async () => {
+  it('32. Lock verification failure after checkout triggers safe owned rollback', async () => {
     const executedCommands: { command: string; args: string[] }[] = [];
+    let lists = 0;
     const customExecutor: IProcessExecutor = {
       async execute(command, args, options) {
         executedCommands.push({ command, args });
         // Fail when running worktree lock
-        if (args[0] === 'worktree' && args[1] === 'lock') {
+        if (process.platform !== 'win32' && args[0] === 'worktree' && args[1] === 'lock') {
           return { exitCode: 1, stdout: '', stderr: 'Simulated lock failure' };
         }
-        return service['executor'].execute(command, args, options);
+        const result = await service['executor'].execute(command, args, options);
+        if (process.platform === 'win32' && args[0] === 'worktree' && args[1] === 'list' && ++lists === 2) {
+          expect(result.stdout).toContain('locked AgentForge');
+          return { ...result, stdout: result.stdout.replace(/^locked .*$/gm, '') };
+        }
+        return result;
       },
     };
 
@@ -522,17 +529,27 @@ describe('R5G2A — GitWorktreeService Contract & Invariant Suite', () => {
   });
 
   it('33. Failed rollback is surfaced distinctly as CREATE_ROLLBACK_FAILED', async () => {
+    let lists = 0;
+    let busyFd: number | null = null;
     const customExecutor: IProcessExecutor = {
       async execute(command, args, options) {
         // Fail when running worktree lock
-        if (args[0] === 'worktree' && args[1] === 'lock') {
+        if (process.platform !== 'win32' && args[0] === 'worktree' && args[1] === 'lock') {
           return { exitCode: 1, stdout: '', stderr: 'Simulated lock failure' };
         }
         // Also fail rollback remove
-        if (args[0] === 'worktree' && args[1] === 'remove') {
+        if (process.platform !== 'win32' && args[0] === 'worktree' && args[1] === 'remove') {
           return { exitCode: 1, stdout: '', stderr: 'Simulated remove failure during rollback' };
         }
-        return service['executor'].execute(command, args, options);
+        const result = await service['executor'].execute(command, args, options);
+        if (process.platform === 'win32' && args[0] === 'worktree' && args[1] === 'list' && ++lists === 2) {
+          // A real active writer prevents captured rollback acquisition. All
+          // previously captured files/metadata must be retained, not forced.
+          busyFd = fs.openSync(path.join(service.deriveWorktreePath(makeTuple()).worktreePath, 'active-writer'), 'wx');
+          fs.writeSync(busyFd, 'retain');
+          return { ...result, stdout: result.stdout.replace(/^locked .*$/gm, '') };
+        }
+        return result;
       },
     };
 
@@ -546,11 +563,17 @@ describe('R5G2A — GitWorktreeService Contract & Invariant Suite', () => {
     );
 
     const t = makeTuple();
-    const res = await failingService.createWorktree(t);
-    expect(res.status).toBe('FAILED');
-    if (res.status === 'FAILED') {
-      expect(res.code).toBe('CREATE_ROLLBACK_FAILED');
-    }
+    try {
+      const res = await failingService.createWorktree(t);
+      expect(res.status).toBe('FAILED');
+      if (res.status === 'FAILED') {
+        expect(res.code).toBe('CREATE_ROLLBACK_FAILED');
+        if (process.platform === 'win32') {
+          expect(fs.readFileSync(path.join(res.worktreePath!, 'active-writer'), 'utf8')).toBe('retain');
+          expect(fs.existsSync(path.join(res.worktreePath!, '.git'))).toBe(true);
+        }
+      }
+    } finally { if (busyFd !== null) fs.closeSync(busyFd); }
   });
 
   it('34. No --force worktree remove command is generated', async () => {
@@ -683,7 +706,7 @@ describe('R5G2A — GitWorktreeService Contract & Invariant Suite', () => {
     }
   });
 
-  it('41. A target symlink inserted between preflight and git add fails closed', async () => {
+  it('41. A target symlink inserted after checked absence and before reservation fails closed', async () => {
     const tuple = makeTuple({ assignmentId: 'add-race' });
     const target = service.deriveWorktreePath(tuple).worktreePath;
     const outside = path.join(testBaseDir, 'outside-add-target');
@@ -694,7 +717,7 @@ describe('R5G2A — GitWorktreeService Contract & Invariant Suite', () => {
     const delegate = new DefaultProcessExecutor();
     const raceExecutor: IProcessExecutor = {
       async execute(command, args, options) {
-        if (!raced && args[0] === 'worktree' && args[1] === 'add') {
+        if (!raced && args[0] === 'worktree' && args[1] === (process.platform === 'win32' ? 'list' : 'add')) {
           raced = true;
           fs.symlinkSync(outside, target, process.platform === 'win32' ? 'junction' : 'dir');
         }
@@ -776,5 +799,87 @@ describe('R5G2A — GitWorktreeService Contract & Invariant Suite', () => {
       try { fs.unlinkSync(managedDir); } catch {}
       try { fs.renameSync(backup, managedDir); } catch {}
     }
+  });
+
+  it.skipIf(process.platform !== 'win32')('46. Read-only source proof remains available while native operation ownership is held', async () => {
+    const executor = new DefaultProcessExecutor();
+    const args = ['rev-parse', '--verify', '--quiet', `${baseCommitSha}^{commit}`];
+    const cwd = service.getRepositoryRoot();
+    const initial = await executor.execute(gitExe, args, { cwd, env: { GIT_OPTIONAL_LOCKS: '0' } });
+    expect(initial.exitCode, JSON.stringify(initial)).toBe(0);
+    const boundary = await WorktreeMutationBoundary.acquire(service.getManagedRoot());
+    try {
+      expect(await boundary.acquireOperationLock({ pid: process.pid, token: 'fixture', createdAt: Date.now() })).toBe(true);
+      const result = await executor.execute(gitExe, args, { cwd, env: { GIT_OPTIONAL_LOCKS: '0' } });
+      expect(result.exitCode, JSON.stringify(result)).toBe(0);
+      expect(result.stdout.trim().toLowerCase()).toBe(baseCommitSha);
+    } finally { await boundary.close(); }
+  });
+
+  it.skipIf(process.platform !== 'win32')('47. Captured registration is independently parsed with exact native path and SHA', async () => {
+    const { ManagedGitWorktreeMutation } = await import('../src/core/services/ManagedGitWorktreeMutation');
+    const tuple = makeTuple(); const { worktreePath, digest } = service.deriveWorktreePath(tuple);
+    const mutation = await ManagedGitWorktreeMutation.prepare({ gitExecutable: gitExe, repositoryRoot: service.getRepositoryRoot(), managedRoot: service.getManagedRoot() }, path.basename(worktreePath));
+    try {
+      await mutation.create(baseCommitSha, digest);
+      const result = await new DefaultProcessExecutor().execute(gitExe, ['worktree', 'list', '--porcelain'], { cwd: service.getRepositoryRoot(), env: { GIT_OPTIONAL_LOCKS: '0' } });
+      const entries = await service.listPorcelain();
+      expect(entries.some(entry => path.resolve(entry.worktreePath).toLowerCase() === worktreePath.toLowerCase() && entry.headSha === baseCommitSha && entry.isDetached), JSON.stringify({ result, entries })).toBe(true);
+    } finally { await mutation.rollbackCreated(); await mutation.close(); }
+  });
+
+  it.skipIf(process.platform !== 'win32')('48. A service cleanup race after the last precheck cannot retarget Git deletion outside its root', async () => {
+    const tuple = makeTuple({ assignmentId: 'last-precheck-remove' });
+    const created = await service.createWorktree(tuple);
+    expect(created.status).toBe('CREATED'); if (created.status !== 'CREATED') return;
+    const outside = path.join(fs.realpathSync.native(testBaseDir), 'outside-registered');
+    execSync(`"${gitExe}" worktree add --detach "${outside}" ${baseCommitSha}`, { cwd: repoDir, stdio: 'ignore' });
+    const outsideTrackedBefore = fs.readFileSync(path.join(outside, 'README.md'));
+    fs.writeFileSync(path.join(outside, 'ignored-sentinel'), 'keep');
+    fs.appendFileSync(path.join(repoDir, '.git', 'info', 'exclude'), '\nignored-sentinel\n');
+    let attempted = false;
+    const executor: IProcessExecutor = { async execute(command, args, options) {
+      if (!attempted && args[0] === 'status') {
+        attempted = true;
+        // This is inside the admitted executor, after the service's last
+        // identity check. The kernel guard must reject the first rename.
+        expect(() => fs.renameSync(service.getManagedRoot(), service.getManagedRoot() + '-moved')).toThrow();
+        expect(() => fs.renameSync(created.worktreePath, created.worktreePath + '-moved')).toThrow();
+      }
+      return new DefaultProcessExecutor().execute(command, args, options);
+    } };
+    const raced = new GitWorktreeService({ gitExecutable: gitExe, repositoryRoot: repoDir, managedRoot: managedDir }, executor);
+    const result = await raced.removeWorktree(tuple);
+    expect(attempted).toBe(true);
+    expect(result.status, JSON.stringify(result)).toBe('REMOVED');
+    expect(fs.readFileSync(path.join(outside, 'README.md'))).toEqual(outsideTrackedBefore);
+    expect(fs.readFileSync(path.join(outside, 'ignored-sentinel'), 'utf8')).toBe('keep');
+    expect(execSync(`"${gitExe}" rev-parse HEAD`, { cwd: outside, encoding: 'utf8' }).trim()).toBe(baseCommitSha);
+  });
+
+  it.skipIf(process.platform !== 'win32')('49. A replacement with a copied Git pointer cannot be removed by the stale service owner', async () => {
+    const tuple = makeTuple({ assignmentId: 'copied-owner-remove' });
+    const created = await service.createWorktree(tuple);
+    expect(created.status).toBe('CREATED'); if (created.status !== 'CREATED') return;
+    const former = created.worktreePath + '-former';
+    fs.renameSync(created.worktreePath, former);
+    fs.mkdirSync(created.worktreePath);
+    fs.copyFileSync(path.join(former, '.git'), path.join(created.worktreePath, '.git'));
+    fs.copyFileSync(path.join(former, 'README.md'), path.join(created.worktreePath, 'README.md'));
+    fs.writeFileSync(path.join(created.worktreePath, 'new-owner-sentinel'), 'keep');
+    fs.appendFileSync(path.join(repoDir, '.git', 'info', 'exclude'), '\nnew-owner-sentinel\n');
+    const result = await service.removeWorktree(tuple);
+    expect(result.status).toBe('FAILED');
+    if (result.status === 'FAILED') expect(result.code).toBe('UNMANAGED_WORKTREE');
+    expect(fs.readFileSync(path.join(created.worktreePath, 'new-owner-sentinel'), 'utf8')).toBe('keep');
+    expect(fs.readFileSync(path.join(former, 'README.md'), 'utf8')).toBe('# Initial Repository\n');
+  });
+
+  it.skipIf(process.platform !== 'win32')('50. Missing managed parents are initialized through captured objects before valid create and remove', async () => {
+    const missing = path.join(fs.realpathSync.native(testBaseDir), 'missing-parent', 'missing-root');
+    const fresh = new GitWorktreeService({ gitExecutable: gitExe, repositoryRoot: repoDir, managedRoot: missing });
+    const result = await fresh.createWorktree(makeTuple());
+    expect(result.status, JSON.stringify(result)).toBe('CREATED');
+    expect((await fresh.removeWorktree(makeTuple())).status).toBe('REMOVED');
   });
 });

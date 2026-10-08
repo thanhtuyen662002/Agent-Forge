@@ -51,6 +51,7 @@ public sealed class AgentForgeDirectoryPins : IDisposable {
   [DllImport("kernel32.dll", SetLastError=true)]
   static extern bool SetFilePointerEx(SafeFileHandle handle, long distance, out long position, uint method);
   [DllImport("kernel32.dll", SetLastError=true)] static extern bool FlushFileBuffers(SafeFileHandle handle);
+  [DllImport("kernel32.dll", SetLastError=true)] static extern bool SetEndOfFile(SafeFileHandle handle);
 
   readonly Dictionary<string, SafeFileHandle> ancestors = new Dictionary<string, SafeFileHandle>(StringComparer.OrdinalIgnoreCase);
   readonly Dictionary<string, SafeFileHandle> children = new Dictionary<string, SafeFileHandle>(StringComparer.Ordinal);
@@ -63,6 +64,7 @@ public sealed class AgentForgeDirectoryPins : IDisposable {
   }
   readonly Dictionary<string, Node> nodes = new Dictionary<string, Node>(StringComparer.OrdinalIgnoreCase);
   readonly HashSet<string> sealedTrees = new HashSet<string>(StringComparer.Ordinal);
+  SafeFileHandle operationLock;
   const int MaxNodes = 65536;
   readonly string root;
   public AgentForgeDirectoryPins(string managedRoot, bool initialize) {
@@ -196,7 +198,8 @@ public sealed class AgentForgeDirectoryPins : IDisposable {
     return a.Volume == b.Volume && a.IndexHigh == b.IndexHigh && a.IndexLow == b.IndexLow &&
       a.Created.Low == b.Created.Low && a.Created.High == b.Created.High;
   }
-  static SafeFileHandle Relative(SafeFileHandle parent, string name, bool directory, bool create, bool deleting, bool writable) {
+  static SafeFileHandle Relative(SafeFileHandle parent, string name, bool directory, bool create, bool deleting, bool writable,
+      uint share = 1, bool openIf = false) {
     Segment(name);
     IntPtr buffer = IntPtr.Zero, unicode = IntPtr.Zero;
     SafeFileHandle handle = null;
@@ -209,7 +212,7 @@ public sealed class AgentForgeDirectoryPins : IDisposable {
       IoStatus status;
       uint access = 0x100081u | (deleting ? 0x10000u : 0u) | (writable ? 0x2u : 0u);
       int result = NtCreateFile(out handle, access, ref attributes, out status, IntPtr.Zero,
-        directory ? 0x10u : 0x80u, 1, create ? 2u : 1u, 0x200020u | (directory ? 1u : 0x40u), IntPtr.Zero, 0);
+        directory ? 0x10u : 0x80u, share, openIf ? 3u : create ? 2u : 1u, 0x200020u | (directory ? 1u : 0x40u), IntPtr.Zero, 0);
       if (result < 0 || handle == null || handle.IsInvalid) throw new IOException("BOUNDARY_OBJECT_OPEN_DENIED");
       ObjectInfo(handle, directory);
       SafeFileHandle answer = handle; handle = null; return answer;
@@ -342,6 +345,35 @@ public sealed class AgentForgeDirectoryPins : IDisposable {
     if (!Same(info, ObjectInfo(node.Handle, false))) throw new IOException("BOUNDARY_READ_IDENTITY_CHANGED");
     return Convert.ToBase64String(data);
   }
+  public string AcquireOperationLock() {
+    RootIdentity();
+    if (operationLock != null) throw new IOException("BOUNDARY_OPERATION_ALREADY_HELD");
+    operationLock = Relative(ancestors[root], ".agent-forge-worktree-operation.lock", false, false, true, true, 0, true);
+    try {
+      FileInfo info = ObjectInfo(operationLock, false);
+      if (info.Links != 1 || info.SizeHigh != 0 || info.SizeLow > 8192) throw new IOException("BOUNDARY_OPERATION_METADATA_DENIED");
+      byte[] data = new byte[info.SizeLow]; uint read;
+      if (!ReadFile(operationLock, data, info.SizeLow, out read, IntPtr.Zero) || read != info.SizeLow)
+        throw new IOException("BOUNDARY_OPERATION_METADATA_DENIED");
+      return Convert.ToBase64String(data);
+    } catch { operationLock.Dispose(); operationLock = null; throw; }
+  }
+  public void ClaimOperationLock(string encoded) {
+    RootIdentity();
+    if (operationLock == null || encoded == null || encoded.Length > 4096) throw new IOException("BOUNDARY_OPERATION_NOT_HELD");
+    FileInfo info = ObjectInfo(operationLock, false);
+    if (info.Links != 1) throw new IOException("BOUNDARY_OPERATION_METADATA_DENIED");
+    byte[] data = Convert.FromBase64String(encoded); uint written; long position;
+    if (!SetFilePointerEx(operationLock, 0, out position, 0) ||
+        !WriteFile(operationLock, data, (uint)data.Length, out written, IntPtr.Zero) || written != data.Length ||
+        !SetEndOfFile(operationLock) || !FlushFileBuffers(operationLock) ||
+        !SetFileInformationByHandle(operationLock, 4, new byte[] { 1 }, 1)) throw new IOException("BOUNDARY_OPERATION_CLAIM_DENIED");
+    // The captured exclusive handle is the actual lease. Delete-on-close
+    // releases it on normal exit or crash; age never breaks a live owner.
+  }
+  public void ReleaseOperationLock() {
+    if (operationLock != null) { operationLock.Dispose(); operationLock = null; }
+  }
   public void DeleteTree(string child) {
     Node top = Top(child);
     if (!sealedTrees.Contains(child)) throw new IOException("BOUNDARY_TREE_NOT_SEALED");
@@ -383,6 +415,7 @@ public sealed class AgentForgeDirectoryPins : IDisposable {
     sealedTrees.Remove(child);
   }
   public void Dispose() {
+    ReleaseOperationLock();
     foreach (Node node in nodes.Values) if (node.Handle != null) node.Handle.Dispose(); nodes.Clear(); children.Clear();
     List<SafeFileHandle> values = new List<SafeFileHandle>(ancestors.Values);
     for (int i=values.Count-1;i>=0;i--) values[i].Dispose(); ancestors.Clear();
@@ -409,6 +442,9 @@ try {
       elseif ($request.op -eq 'seal') { $pins.SealTree([string]$request.name); $identity = $null }
       elseif ($request.op -eq 'delete-tree') { $pins.DeleteTree([string]$request.name); $identity = $null }
       elseif ($request.op -eq 'read') { $data = $pins.ReadCaptured([string]$request.name, [string]$request.path); $identity = $null }
+      elseif ($request.op -eq 'operation-acquire') { $data = $pins.AcquireOperationLock(); $identity = $null }
+      elseif ($request.op -eq 'operation-claim') { $pins.ClaimOperationLock([string]$request.data); $identity = $null }
+      elseif ($request.op -eq 'operation-release') { $pins.ReleaseOperationLock(); $identity = $null }
       else { throw 'BOUNDARY_COMMAND_DENIED' }
       @{ ok = $true; identity = $identity; data = $data } | ConvertTo-Json -Compress -Depth 5
     } catch { @{ ok = $false; error = 'BOUNDARY_OPERATION_DENIED' } | ConvertTo-Json -Compress }

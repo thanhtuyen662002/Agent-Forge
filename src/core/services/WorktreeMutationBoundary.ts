@@ -1,4 +1,4 @@
-import { spawn, type ChildProcessWithoutNullStreams } from 'node:child_process';
+import { spawn, spawnSync, type ChildProcessWithoutNullStreams } from 'node:child_process';
 import fs from 'node:fs';
 import path from 'node:path';
 import { WINDOWS_DIRECTORY_BOOTSTRAP, WINDOWS_DIRECTORY_BOUNDARY } from './worktreeBoundaryScripts';
@@ -41,6 +41,24 @@ export class WorktreeMutationBoundary {
     child.on('error', () => this.abort('BOUNDARY_HELPER_FAILED'));
     child.on('exit', () => this.abort('BOUNDARY_HELPER_EXITED'));
     child.stdin.on('error', () => this.abort('BOUNDARY_HELPER_FAILED'));
+  }
+
+  public static initializeSync(managedRoot: string): NativeIdentity {
+    if (process.platform !== 'win32') throw new Error('UNSUPPORTED_MUTATION_BOUNDARY');
+    const root = path.resolve(managedRoot);
+    const executable = path.join(process.env.SystemRoot ?? 'C:\\Windows', 'System32', 'WindowsPowerShell', 'v1.0', 'powershell.exe');
+    const result = spawnSync(executable, ['-NoLogo', '-NoProfile', '-NonInteractive', '-EncodedCommand',
+      Buffer.from(WINDOWS_DIRECTORY_BOOTSTRAP, 'utf16le').toString('base64')], { windowsHide: true, encoding: 'utf8', timeout: 15_000,
+      maxBuffer: 65_536, input: JSON.stringify(WINDOWS_DIRECTORY_BOUNDARY) + '\n' + JSON.stringify({ root, initialize: '1' }) + '\n' + JSON.stringify({ op: 'close' }) + '\n' });
+    if (result.status !== 0 || result.error) throw new Error('BOUNDARY_INITIALIZATION_DENIED');
+    let response: Response;
+    try { response = JSON.parse(result.stdout.trim()) as Response; } catch { throw new Error('BOUNDARY_INITIALIZATION_DENIED'); }
+    const identity = response.identity;
+    const stat = fs.lstatSync(root, { bigint: true });
+    if (!response.ok || !identity || !stat.isDirectory() || stat.isSymbolicLink() ||
+        fs.realpathSync.native(root).toLowerCase() !== root.toLowerCase() || identity.fileId !== stat.ino.toString() ||
+        !/^[1-9]\d*$/.test(identity.volume) || !/^[1-9]\d*$/.test(identity.created)) throw new Error('BOUNDARY_INITIALIZATION_DENIED');
+    return identity;
   }
 
   public static async acquire(managedRoot: string, initialize = false): Promise<WorktreeMutationBoundary> {
@@ -166,6 +184,25 @@ export class WorktreeMutationBoundary {
       throw new Error('BOUNDARY_CAPTURED_READ_INVALID');
     }
     return Buffer.from(response.data, 'base64');
+  }
+
+  /** Kernel exclusivity fences current helpers; legacy PID metadata is honored. */
+  public async acquireOperationLock(owner: { pid: number; token: string; createdAt: number }): Promise<boolean> {
+    let response: Response;
+    try { response = await this.request({ op: 'operation-acquire' }); } catch { return false; }
+    try {
+      const previous = Buffer.from(response.data ?? '', 'base64').toString('utf8');
+      if (previous) {
+        let legacy: { pid?: number; createdAt?: number };
+        try { legacy = JSON.parse(previous) as typeof legacy; } catch { throw new Error('BOUNDARY_OPERATION_METADATA_DENIED'); }
+        if (!Number.isInteger(legacy.pid) || (legacy.pid ?? 0) <= 0) throw new Error('BOUNDARY_OPERATION_METADATA_DENIED');
+        let alive = true;
+        try { process.kill(legacy.pid!, 0); } catch (error) { alive = (error as NodeJS.ErrnoException).code !== 'ESRCH'; }
+        if (alive) { await this.request({ op: 'operation-release' }); return false; }
+      }
+      await this.request({ op: 'operation-claim', data: Buffer.from(JSON.stringify(owner)).toString('base64') });
+      return true;
+    } catch (error) { await this.request({ op: 'operation-release' }); throw error; }
   }
 
   /** Requires a sealed tree; never falls back to Git or recursive path removal. */

@@ -3,6 +3,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { execFileSync, spawn, spawnSync } from 'node:child_process';
 import { createInterface } from 'node:readline';
+import crypto from 'node:crypto';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { WorktreeMutationBoundary } from '../src/core/services/WorktreeMutationBoundary';
 import { WINDOWS_DIRECTORY_BOOTSTRAP, WINDOWS_DIRECTORY_BOUNDARY } from '../src/core/services/worktreeBoundaryScripts';
@@ -111,6 +112,40 @@ describe('kernel worktree directory primitives (not complete service acceptance)
       expect(() => fs.renameSync(managed, managed + '-moved')).toThrow();
       expect(() => fs.renameSync(root, root + '-moved')).toThrow();
       expect(fs.existsSync(managed)).toBe(true);
+    });
+
+    it('serializes helpers through a captured exclusive operation handle and releases it on helper exit', async () => {
+      const owner = { pid: process.pid, token: crypto.randomUUID(), createdAt: Date.now() };
+      expect(await boundary!.acquireOperationLock(owner)).toBe(true);
+      const contender = await WorktreeMutationBoundary.acquire(managed);
+      try {
+        expect(await contender.acquireOperationLock({ ...owner, token: crypto.randomUUID() })).toBe(false);
+        await boundary!.close(); boundary = undefined;
+        expect(await contender.acquireOperationLock({ ...owner, token: crypto.randomUUID() })).toBe(true);
+      } finally { await contender.close(); }
+      expect(fs.existsSync(path.join(managed, '.agent-forge-worktree-operation.lock'))).toBe(false);
+    });
+
+    it('recovers a dead legacy owner but retains a live legacy owner regardless of age', async () => {
+      const lock = path.join(managed, '.agent-forge-worktree-operation.lock');
+      const owner = { pid: process.pid, token: crypto.randomUUID(), createdAt: Date.now() };
+      fs.writeFileSync(lock, JSON.stringify({ pid: process.pid, createdAt: Date.now() - 10 * 60_000 }));
+      expect(await boundary!.acquireOperationLock(owner)).toBe(false);
+      expect(JSON.parse(fs.readFileSync(lock, 'utf8')).pid).toBe(process.pid);
+      fs.writeFileSync(lock, JSON.stringify({ pid: 999999999, createdAt: Date.now() }));
+      expect(await boundary!.acquireOperationLock(owner)).toBe(true);
+      await boundary!.close(); boundary = undefined;
+      expect(fs.existsSync(lock)).toBe(false);
+    });
+
+    it('denies a hardlinked legacy operation file without overwriting the outside sentinel', async () => {
+      await boundary!.close(); boundary = undefined;
+      const outside = path.join(root, 'outside-lock'); fs.writeFileSync(outside, JSON.stringify({ pid: 999999999 }));
+      const lock = path.join(managed, '.agent-forge-worktree-operation.lock'); fs.linkSync(outside, lock);
+      boundary = await WorktreeMutationBoundary.acquire(managed);
+      expect(await boundary!.acquireOperationLock({ pid: process.pid, token: crypto.randomUUID(), createdAt: Date.now() })).toBe(false);
+      expect(JSON.parse(fs.readFileSync(outside, 'utf8')).pid).toBe(999999999);
+      expect(fs.statSync(outside).nlink).toBe(2);
     });
 
     it('keeps a relative create contained when an empty parent becomes a junction after the last check', async () => {
