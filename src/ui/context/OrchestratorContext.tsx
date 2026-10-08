@@ -2,11 +2,7 @@ import React, { createContext, useContext, useState, useEffect, useCallback, use
 import { Project, Task, Agent, ProviderResource, EventRecord, Evidence, UIDensityMode } from '../../core/types/domain';
 import type { CanonicalExecutionScope } from '../../core/services/ExecutionAuthorizationService';
 import type { RendererAuthorizationMode } from '../../core/types/ipc';
-import { UiActionName, UiActionResult, UiActionRunner, uiActionFailure } from '../actionState';
-
-// Check if Electron IPC is available
-const isElectron = typeof window !== 'undefined' && Boolean((window as any).orchestrator);
-const orchestrator = isElectron ? (window as any).orchestrator : null;
+import { UiActionName, UiActionResult, UiActionRunner, uiActionFailure, normalizeVerificationReply, normalizeEmergencyReply, UiVerificationObservation, UiEmergencyObservation } from '../actionState';
 
 interface OrchestratorContextType {
   isElectron: boolean;
@@ -40,9 +36,9 @@ interface OrchestratorContextType {
   applyProtocol: (rawInput: string) => Promise<any>;
   generateWorkOrder: (taskId: string) => Promise<string>;
   generateReviewPackage: (taskId: string) => Promise<string>;
-  runVerificationTests: (taskId: string, commandConfigId?: string) => Promise<any>;
+  runVerificationTests: (taskId: string, commandConfigId?: string) => Promise<UiActionResult<UiVerificationObservation>>;
   updateResourceQuota: (id: string, remaining: number | null, total: number | null, source: string, confidence: number) => Promise<UiActionResult>;
-  triggerEmergencyStop: (reason?: string) => Promise<any>;
+  triggerEmergencyStop: (reason?: string) => Promise<UiActionResult<UiEmergencyObservation>>;
   resumeProject: () => Promise<UiActionResult>;
   routeTask: (data: {
     projectId: string;
@@ -109,6 +105,8 @@ export function reconcileSelectedId<T extends { id: string }>(selectedId: string
 }
 
 export const OrchestratorProvider: React.FC<{ children: React.ReactNode }> = ({ children }) => {
+  const orchestrator = useRef(typeof window !== 'undefined' ? (window as any).orchestrator ?? null : null).current;
+  const isElectron = Boolean(orchestrator);
   const [projects, setProjects] = useState<Project[]>([]);
   const [activeProject, setActiveProject] = useState<Project | null>(null);
   const [tasks, setTasks] = useState<Task[]>([]);
@@ -128,6 +126,9 @@ export const OrchestratorProvider: React.FC<{ children: React.ReactNode }> = ({ 
   const actionRunnerRef = useRef<UiActionRunner | null>(null);
   if (!actionRunnerRef.current) actionRunnerRef.current = new UiActionRunner(isElectron, setPendingActions);
   const activeProjectRef = useRef<Project | null>(activeProject);
+  const projectSelectionRef = useRef(0);
+  const tasksRef = useRef(tasks);
+  tasksRef.current = tasks;
   const refreshRequestRef = useRef(0);
   const refreshInFlightRef = useRef(false);
   const refreshPendingRef = useRef(false);
@@ -393,10 +394,24 @@ export const OrchestratorProvider: React.FC<{ children: React.ReactNode }> = ({ 
   };
 
   const runVerificationTests = async (taskId: string, commandConfigId?: string) => {
-    if (!orchestrator) throw new Error('Desktop IPC unavailable.');
-    const res = await orchestrator.runVerificationTests(taskId, commandConfigId);
-    await refreshData();
-    return res;
+    if (!orchestrator) return uiActionFailure('DESKTOP_REQUIRED');
+    const project = activeProjectRef.current;
+    if (!project) return uiActionFailure('NO_PROJECT');
+    const task = tasksRef.current.find(item => item.id === taskId && item.project_id === project.id);
+    if (!task) return uiActionFailure('TASK_UNAVAILABLE');
+    const selection = projectSelectionRef.current;
+    const executionId = crypto.randomUUID();
+    const result = await actionRunnerRef.current!.runObserved('runVerification',
+      () => orchestrator.runVerificationTests(task.id, commandConfigId, {
+        expectedProjectId: project.id, expectedRevision: task.revision_count,
+        expectedOwnershipEpoch: task.ownership_epoch ?? 1, expectedState: task.state, executionId,
+      }),
+      reply => selection === projectSelectionRef.current && activeProjectRef.current?.id === project.id
+        ? normalizeVerificationReply(reply, project.id, task.id, executionId) : uiActionFailure('STALE_CONTEXT'),
+      async () => { await refreshData(); });
+    if (selection !== projectSelectionRef.current || activeProjectRef.current?.id !== project.id) return uiActionFailure('STALE_CONTEXT');
+    if (result.success || result.code !== 'ACTION_PENDING') setActionResults(previous => ({ ...previous, runVerification: result }));
+    return result;
   };
 
   const updateResourceQuota = async (
@@ -410,10 +425,11 @@ export const OrchestratorProvider: React.FC<{ children: React.ReactNode }> = ({ 
   };
 
   const triggerEmergencyStop = async (reason?: string) => {
-    if (!orchestrator) return;
-    const res = await orchestrator.triggerEmergencyStop(reason);
-    await refreshData();
-    return res;
+    const result = await actionRunnerRef.current!.runObserved('emergencyStop',
+      () => orchestrator.triggerEmergencyStop(reason), normalizeEmergencyReply,
+      async () => { await refreshData(); });
+    if (result.success || result.code !== 'ACTION_PENDING') setActionResults(previous => ({ ...previous, emergencyStop: result }));
+    return result;
   };
 
   const resumeProject = async () => {
@@ -595,7 +611,11 @@ export const OrchestratorProvider: React.FC<{ children: React.ReactNode }> = ({ 
         pendingActions,
         actionResults,
         setDensityMode,
-        setActiveProject,
+        setActiveProject: (project) => {
+          if (activeProjectRef.current?.id !== project?.id) projectSelectionRef.current += 1;
+          activeProjectRef.current = project;
+          setActiveProject(project);
+        },
         setActiveView,
         setSelectedTaskId,
         setIsEmergencyStopOpen,

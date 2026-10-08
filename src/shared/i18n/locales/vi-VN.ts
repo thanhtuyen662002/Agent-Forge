@@ -2,6 +2,9 @@ import { TranslationDictionary } from '../types';
 
 export const viVN: TranslationDictionary = {
   actions: {
+    selectionChanged: 'Lựa chọn đã thay đổi. Chạy xác minh lại cho nhiệm vụ hiện tại.',
+    taskUnavailable: 'Nhiệm vụ không có trong dự án đã chọn. Tải lại và chọn nhiệm vụ.',
+    verificationRejected: 'Xác minh chưa được cấp quyền. Kiểm tra phê duyệt lệnh trong Cài đặt.',
     pending: 'Đang xử lý…',
     success: 'Thao tác đã hoàn tất.',
     failed: 'Thao tác thất bại. Kiểm tra dữ liệu và thử lại.',
@@ -193,6 +196,7 @@ export const viVN: TranslationDictionary = {
     runningTestsButton: 'ĐANG CHẠY BỘ KIỂM THỬ...',
     noTaskSelected: 'Chưa chọn nhiệm vụ nào. Quay lại Bảng Nhiệm vụ.',
     testsComplete: 'Kiểm thử Hoàn tất: {passed} Đạt, {failed} Thất bại (Mã thoát {exitCode}).',
+    testsFailed: 'Xác minh thất bại: {passed} Đạt, {failed} Thất bại (Mã thoát {exitCode}).',
   },
   agentCenter: {
     title: 'Trung tâm Tác tử',
@@ -616,7 +620,9 @@ export const viVN: TranslationDictionary = {
     bulletPreserveDb: 'Trạng thái cơ sở dữ liệu, thay đổi kho mã và các điểm kiểm tra được bảo toàn nguyên vẹn.',
     bulletResume: 'Dự án và nhiệm vụ có thể được chủ sở hữu tiếp tục lại một cách tất định.',
     terminating: 'ĐANG DỪNG HỆ THỐNG...',
-    successNotice: 'Dừng Khẩn cấp đã được thực thi thành công. Hệ thống an toàn.',
+    successNotice: 'Đã ghi nhận dừng khẩn cấp. Việc dừng tiến trình đã được xác nhận.',
+    unconfirmedNotice: 'Đã ghi nhận dừng khẩn cấp. Việc dừng tiến trình chưa được xác nhận đầy đủ ({count} chưa chứng minh). Giữ thực thi tạm dừng và kiểm tra bằng chứng khôi phục.',
+    unprovenProcesses: 'Tiến trình Chưa Xác nhận Dừng',
     processesTerminated: 'Số Tiến trình Đã dừng',
     tasksPaused: 'Số Nhiệm vụ Đã tạm dừng An toàn',
     projectsPaused: 'Số Dự án Đã tạm dừng',
