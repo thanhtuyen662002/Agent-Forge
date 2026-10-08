@@ -297,7 +297,10 @@ export class ConcurrentExecutionScheduler {
       assignmentId: assignment.id,
       workerSlotId: workerSlotId,
       baseSha: auth.repository_head_sha,
-      ownershipEpoch: auth.task_ownership_epoch ?? null,
+      // Legacy rows backfill epoch 1 without versioned ownership authority.
+      // Keep their historical namespace; versioned product work uses the
+      // exact epoch already checked by the durable authorization fence.
+      ownershipEpoch: auth.lifecycle_version === 1 ? auth.task_ownership_epoch : null,
     };
 
     if (supervisor.isLeaseLost()) {

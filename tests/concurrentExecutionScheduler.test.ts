@@ -1496,4 +1496,18 @@ describe('ConcurrentExecutionScheduler (R5G3D1)', () => {
     const slot = repo.getWorkerSlot(slotId);
     expect(slot?.status).toBe('LEASED');
   });
+
+  it('68. Legacy authorization backfill does not silently rename its durable worktree namespace', async () => {
+    const authorization = repo.getExecutionAuthorization(authId)!;
+    expect(authorization.lifecycle_version).not.toBe(1);
+    expect(authorization.task_ownership_epoch).toBe(1);
+    const result = await scheduler.execute(authId);
+    expect(result.status).toBe('COMPLETED');
+    const legacy = { projectId, taskId, attemptId, assignmentId, workerSlotId: slotId, baseSha };
+    const inspected = await worktreeService.inspectWorktree(legacy);
+    expect(inspected.status).toBe('INSPECTED');
+    if (inspected.status === 'INSPECTED') expect(inspected.inspection.exists).toBe(true);
+    expect(fs.existsSync(worktreeService.deriveWorktreePath({ ...legacy, ownershipEpoch: 1 }).worktreePath)).toBe(false);
+    expect(adapter.executeCallCount).toBe(1);
+  });
 });

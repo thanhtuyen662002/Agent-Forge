@@ -822,7 +822,7 @@ export class ProviderDispatchService {
         assignmentId: assignment.id,
         workerSlotId: assignment.selected_worker_slot_id,
         baseSha: auth.repository_head_sha,
-        ownershipEpoch: auth.task_ownership_epoch ?? null,
+        ownershipEpoch: auth.lifecycle_version === 1 ? auth.task_ownership_epoch : null,
       };
 
       const inspectResult = await this.gitWorktreeService.inspectWorktree(ownershipTuple);
