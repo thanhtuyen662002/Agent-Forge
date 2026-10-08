@@ -763,18 +763,25 @@ describe('R5G2A — GitWorktreeService Contract & Invariant Suite', () => {
     expect(fs.existsSync(lockPath)).toBe(false);
   });
 
-  it('44. A live owner lock is never broken solely because its age exceeds the recovery threshold', () => {
+  it('44. A live owner lock is never broken solely because its age exceeds the recovery threshold', async () => {
     const lockPath = path.join(managedDir, '.agent-forge-worktree-operation.lock');
-    fs.writeFileSync(
-      lockPath,
-      JSON.stringify({ pid: process.pid, createdAt: Date.now() - 10 * 60 * 1000 }),
-      'utf8',
-    );
+    const original = JSON.stringify({ pid: process.pid, createdAt: Date.now() - 10 * 60 * 1000 });
+    fs.writeFileSync(lockPath, original, 'utf8');
 
     try {
-      const recovered = (service as any).tryBreakStaleManagedRootLock(lockPath);
-      expect(recovered).toBe(false);
-      expect(fs.existsSync(lockPath)).toBe(true);
+      if (process.platform === 'win32') {
+        const boundary = await WorktreeMutationBoundary.acquire(managedDir);
+        try {
+          expect(await boundary.acquireOperationLock({
+            pid: process.pid, token: 'live-owner-regression', createdAt: Date.now(),
+          })).toBe(false);
+        } finally { await boundary.close(); }
+      } else {
+        expect(await service.createWorktree(makeTuple({ assignmentId: 'live-owner-regression' }))).toMatchObject({
+          status: 'FAILED', code: 'UNSUPPORTED_MUTATION_BOUNDARY',
+        });
+      }
+      expect(fs.readFileSync(lockPath, 'utf8')).toBe(original);
     } finally {
       try { fs.unlinkSync(lockPath); } catch {}
     }
