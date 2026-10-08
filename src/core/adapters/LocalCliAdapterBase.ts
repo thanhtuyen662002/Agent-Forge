@@ -15,6 +15,7 @@ import { ArtifactStore } from '../services/ArtifactStore';
 import { ProcessRunner, ProcessRunResult } from '../services/ProcessRunner';
 import { PolicyService } from '../services/PolicyService';
 import { ProtocolParser } from '../protocol/parser';
+import { NonHandoffExecutionLifecycle } from '../services/NonHandoffExecutionLifecycle';
 import {
   canonicalizePortableRelativePath,
   canonicalizePortableRelativePathList,
@@ -938,8 +939,8 @@ export abstract class LocalCliAdapterBase implements ProviderAdapter {
   }
 
   public async execute(request: AgentExecutionRequest): Promise<AgentExecutionResult> {
-    const isScheduled = !!request.runtimeBinding?.executionId;
-    const executionId = request.runtimeBinding?.executionId ?? crypto.randomUUID();
+    const isScheduled = !!(request.runtimeBinding?.executionId ?? request.executionId);
+    const executionId = request.runtimeBinding?.executionId ?? request.executionId ?? crypto.randomUUID();
 
     if (isScheduled) {
       if (this.activeExecutions.has(executionId)) {
@@ -1296,8 +1297,23 @@ export abstract class LocalCliAdapterBase implements ProviderAdapter {
       const parseResult = ProtocolParser.parse(protocolText);
 
       if (parseResult.success && parseResult.data?.type === 'coder.v1') {
+        if (control?.cancelRequested) {
+          return { executionId: processResult.executionId, status: 'CANCELLED', errorCode: 'CANCELLED',
+            error: 'Execution was cancelled before workspace publication.', rawResponse: processResult.stdout,
+            stdoutEvidenceId: processResult.stdoutEvidenceId, stderrEvidenceId: processResult.stderrEvidenceId };
+        }
         try {
-          localCliSynchronizeWorkspace(localWorkspace);
+          const publish = () => localCliSynchronizeWorkspace(localWorkspace);
+          if (request.executionId) {
+            if (!new NonHandoffExecutionLifecycle(this.repo).publishIfCurrent(processResult.executionId, publish)) {
+              return { executionId: processResult.executionId, status: 'FAILED', errorCode: 'RECOVERY_FENCED',
+                error: 'NON_HANDOFF_PUBLICATION_FENCED: Durable execution authority changed before workspace publication.',
+                rawResponse: processResult.stdout, stdoutEvidenceId: processResult.stdoutEvidenceId,
+                stderrEvidenceId: processResult.stderrEvidenceId };
+            }
+          } else {
+            publish();
+          }
         } catch (error) {
           const syncError = error instanceof LocalCliWorkspaceError ? error.message : 'WORKSPACE_SYNC_FAILED: authorized workspace changes could not be verified';
           return {

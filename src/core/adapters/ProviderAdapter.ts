@@ -51,6 +51,8 @@ export interface RuntimeExecutionBinding {
 export interface AgentExecutionRequest {
   taskId: string;
   projectId: string;
+  /** Backend process identity; it does not confer product assignment authority. */
+  executionId?: string;
   instructions: string[];
   contextFiles: string[];
   attemptId?: string | null;

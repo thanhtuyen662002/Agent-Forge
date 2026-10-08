@@ -33,6 +33,7 @@ import { sanitizeContextFiles, canonicalJsonStringify, verifyContextManifestInte
 import { ProviderHealthObservationService } from './ProviderHealthObservationService';
 import { applyProviderHealthObservation } from './ProviderHealthApplication';
 import { ProjectStopFenceService } from './ProjectStopFenceService';
+import { NonHandoffExecutionLifecycle, NonHandoffClaim } from './NonHandoffExecutionLifecycle';
 
 export type ScheduledCancellationStatus =
   | 'CANCEL_REQUESTED'
@@ -47,7 +48,7 @@ export interface ScheduledCancellationResult {
   error?: string;
 }
 
-export type ProviderAdapterInvocationOutcome = 'RETURNED' | 'THREW';
+export type ProviderAdapterInvocationOutcome = 'RETURNED' | 'THREW' | 'TIMED_OUT';
 
 export interface ProviderExecutionProvenanceV1 {
   version: 1;
@@ -83,12 +84,15 @@ export class ProviderDispatchService {
   private readonly observationService: ProviderHealthObservationService;
   private readonly accountHealthService: { applyObservation: (authorizationId: string) => unknown };
   private readonly stopFence: ProjectStopFenceService;
+  private readonly nonHandoffLifecycle: NonHandoffExecutionLifecycle;
+  private readonly nonHandoffTimeoutMs: number;
 
   constructor(
     private providerRegistry: ProviderRegistry,
     private repo: Repository,
     private eventService?: EventService,
-    private gitWorktreeService?: GitWorktreeService
+    private gitWorktreeService?: GitWorktreeService,
+    options: { nonHandoffTimeoutMs?: number } = {}
   ) {
     this.observationService = new ProviderHealthObservationService(this.repo);
     // Keep this compatibility-shaped property for the focused failure test
@@ -97,6 +101,11 @@ export class ProviderDispatchService {
       applyObservation: (authorizationId) => applyProviderHealthObservation(this.repo, authorizationId),
     };
     this.stopFence = new ProjectStopFenceService(this.repo);
+    this.nonHandoffLifecycle = new NonHandoffExecutionLifecycle(this.repo);
+    this.nonHandoffTimeoutMs = options.nonHandoffTimeoutMs ?? 300_000;
+    if (!Number.isSafeInteger(this.nonHandoffTimeoutMs) || this.nonHandoffTimeoutMs < 1 || this.nonHandoffTimeoutMs > 600_000) {
+      throw new Error('NON_HANDOFF_TIMEOUT_INVALID');
+    }
   }
 
   public setGitWorktreeService(service: GitWorktreeService): void {
@@ -202,6 +211,7 @@ export class ProviderDispatchService {
     const nowIso = new Date().toISOString();
 
     let control: ScheduledDispatchControl | undefined;
+    let nonHandoffClaim: NonHandoffClaim | undefined;
     if (mode === 'SCHEDULED') {
       if (this.activeDispatches.has(authorizationId)) {
         const currentAuth = this.repo.getExecutionAuthorization(authorizationId);
@@ -307,6 +317,11 @@ export class ProviderDispatchService {
         status: 'FAILED',
         error: `EXECUTION_AUTHORIZATION_TASK_NOT_FOUND: Task "${auth.task_id}" not found.`,
       };
+    }
+
+    // Capture owner/task identity before the first external Git/provider await.
+    if (auth.lifecycle_version == null) {
+      nonHandoffClaim = this.nonHandoffLifecycle.capture(auth, executionId, this.nonHandoffTimeoutMs);
     }
 
     if (task.revision_count !== auth.task_revision) {
@@ -1252,7 +1267,9 @@ export class ProviderDispatchService {
     let claimed = false;
     let claimError: string | undefined;
     try {
-      claimed = this.repo.claimExecutionAuthorization(authorizationId, nowIso);
+      claimed = nonHandoffClaim
+        ? this.nonHandoffLifecycle.claim(auth, nonHandoffClaim, new Date().toISOString())
+        : this.repo.claimExecutionAuthorization(authorizationId, nowIso);
     } catch (err: unknown) {
       claimError = err instanceof Error ? err.message : 'PROJECT_STOP_FENCE_REJECTED';
     }
@@ -1291,8 +1308,8 @@ export class ProviderDispatchService {
         profileRef: account.profile_ref ?? null,
       };
 
+      runtimeBinding.executionId = executionId;
       if (mode === 'SCHEDULED') {
-        runtimeBinding.executionId = executionId;
         if (inspectedWorkspace && assignment.selected_worker_slot_id) {
           runtimeBinding.workspace = {
             workerSlotId: assignment.selected_worker_slot_id,
@@ -1307,6 +1324,7 @@ export class ProviderDispatchService {
     const request: AgentExecutionRequest = {
       projectId: auth.project_id,
       taskId: auth.task_id,
+      executionId,
       attemptId: auth.attempt_id ?? undefined,
       instructions: parsedInstructions,
       contextFiles: parsedContextFiles,
@@ -1458,15 +1476,14 @@ export class ProviderDispatchService {
         };
       }
     } else {
-      // Legacy execution path (lifecycle_version IS NULL): retain epoch verification
-      const expectedEpoch = auth.task_ownership_epoch ?? this.repo.getTaskOwnershipEpoch(auth.task_id);
-      const currentTaskEpoch = this.repo.getTaskOwnershipEpoch(auth.task_id);
-      if (currentTaskEpoch !== expectedEpoch) {
+      // Unversioned compatibility execution has its own durable claim/start receipt.
+      // It remains separate from product authority; a newer owner cannot adopt it.
+      if (!nonHandoffClaim || !this.nonHandoffLifecycle.start(auth, nonHandoffClaim)) {
         return {
           executionId,
           status: 'FAILED',
-          errorCode: 'RESOURCE_UNAVAILABLE',
-          error: `OWNERSHIP_EPOCH_MISMATCH: expected ${expectedEpoch}, current ${currentTaskEpoch}`,
+          errorCode: 'RECOVERY_FENCED',
+          error: 'NON_HANDOFF_ADAPTER_START_REJECTED: Durable claim or task ownership changed.',
         };
       }
     }
@@ -1478,23 +1495,56 @@ export class ProviderDispatchService {
     let adapterInvocation: ProviderAdapterInvocationOutcome;
     let adapterOutcome: AdapterOutcome;
     let adapterErrorJson: string | null = null;
+    let deadline: ReturnType<typeof setTimeout> | undefined;
+    let timedOut = false;
+    const deadlineExpired = Symbol('non-handoff deadline');
     try {
-      rawResult = await adapter.execute(request);
-      adapterInvocation = 'RETURNED';
-      adapterOutcome = rawResult.status === 'COMPLETED' ? 'RETURNED' : rawResult.status === 'CANCELLED' ? 'CANCELLED' : 'RETURNED';
-    } catch (err: any) {
+      const invocation = adapter.execute(request);
+      if (nonHandoffClaim) {
+        const expired = new Promise<typeof deadlineExpired>((resolve) => {
+          deadline = setTimeout(() => resolve(deadlineExpired), nonHandoffClaim!.timeoutMs);
+        });
+        const observed = await Promise.race([invocation, expired]);
+        if (observed === deadlineExpired) {
+          timedOut = true;
+          this.nonHandoffLifecycle.recordUnresolvedTimeout(auth, nonHandoffClaim);
+          // Cancellation acknowledgement does not prove termination and must not extend the deadline.
+          void Promise.resolve().then(() => adapter.cancel(executionId)).catch(() => {});
+          rawResult = { executionId, status: 'FAILED', errorCode: 'TIMEOUT',
+            error: 'NON_HANDOFF_EXECUTION_TIMEOUT: Provider termination remains unresolved; recovery is fenced.' };
+        } else {
+          rawResult = observed;
+        }
+      } else {
+        rawResult = await invocation;
+      }
+      if (nonHandoffClaim && !timedOut && !this.isValidCompatibilityResult(rawResult)) {
+        rawResult = { executionId, status: 'FAILED', errorCode: 'PROTOCOL_INVALID',
+          error: 'NON_HANDOFF_RESULT_INVALID: Provider returned a malformed result.' };
+      }
+      if (timedOut) {
+        adapterInvocation = 'TIMED_OUT';
+        adapterOutcome = 'TIMED_OUT';
+      } else {
+        adapterInvocation = 'RETURNED';
+        adapterOutcome = rawResult.status === 'CANCELLED' ? 'CANCELLED' : 'RETURNED';
+      }
+    } catch (err: unknown) {
+      const message = err instanceof Error ? err.message : 'Provider rejected without an Error value.';
       rawResult = {
         executionId,
         status: 'FAILED',
         errorCode: 'EXECUTION_FAILED',
-        error: `ADAPTER_EXECUTION_THREW: ${err.message}`,
+        error: `ADAPTER_EXECUTION_THREW: ${message}`,
       };
       adapterInvocation = 'THREW';
       adapterOutcome = 'THREW';
-      adapterErrorJson = JSON.stringify({ message: err.message, stack: err.stack });
+      adapterErrorJson = JSON.stringify({ message, stack: err instanceof Error ? err.stack : undefined });
+    } finally {
+      if (deadline) clearTimeout(deadline);
     }
 
-    const finalExecutionId = mode === 'SCHEDULED' ? executionId : (rawResult.executionId || executionId);
+    const finalExecutionId = executionId;
 
     // Build trusted provenance stamped strictly by ProviderDispatchService
     const provenance: ProviderExecutionProvenanceV1 = {
@@ -1524,7 +1574,14 @@ export class ProviderDispatchService {
     };
 
     // Durably settle execution lifecycle and outcome (R5I6)
-    if (isR5ILifecycle) {
+    if (nonHandoffClaim && !timedOut) {
+      const settled = this.nonHandoffLifecycle.finish(auth, nonHandoffClaim, result, adapterOutcome);
+      if (!settled) {
+        return { executionId, status: 'FAILED', errorCode: 'SETTLEMENT_FAILED',
+          error: 'NON_HANDOFF_SETTLEMENT_FENCED: Actual provider observation retained; task ownership or durable claim changed.',
+          providerExecutionProvenance: provenance };
+      }
+    } else if (isR5ILifecycle) {
       const finishTimestamp = new Date().toISOString();
       try {
         const settleRes = this.repo.settleExecutionResult({
@@ -1611,6 +1668,18 @@ export class ProviderDispatchService {
         this.activeDispatches.delete(authorizationId);
       }
     }
+  }
+
+  private isValidCompatibilityResult(value: unknown): value is AgentExecutionResult {
+    if (!value || typeof value !== 'object' || Array.isArray(value)) return false;
+    const result = value as Record<string, unknown>;
+    if (typeof result.status !== 'string' || !['COMPLETED', 'FAILED', 'CANCELLED', 'AWAITING_OWNER'].includes(result.status)) return false;
+    if (['outputProtocol', 'rawResponse', 'error'].some(key => result[key] !== undefined && typeof result[key] !== 'string')) return false;
+    if (['stdoutEvidenceId', 'stderrEvidenceId'].some(key => result[key] != null && typeof result[key] !== 'string')) return false;
+    return result.errorCode == null || (typeof result.errorCode === 'string' && ['AUTH_ERROR', 'QUOTA_EXHAUSTED', 'TIMEOUT', 'CANCELLED',
+      'PROCESS_LAUNCH_FAILED', 'NONZERO_EXIT', 'PROTOCOL_INVALID', 'UNSUPPORTED_CLIENT', 'RESOURCE_UNAVAILABLE',
+      'OUTPUT_LIMIT_EXCEEDED', 'POLICY_DENIAL', 'EXECUTION_FAILED', 'SETTLEMENT_FAILED', 'RECOVERY_FENCED', 'UNKNOWN']
+      .includes(result.errorCode));
   }
 
   private recordRejectionEvent(auth: ExecutionAuthorization, reason: string): void {
