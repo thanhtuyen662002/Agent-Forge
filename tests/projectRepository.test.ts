@@ -1,16 +1,45 @@
 import Database from 'better-sqlite3';
-import { afterEach, describe, expect, it } from 'vitest';
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import { MigrationRunner } from '../src/core/database/migrations';
 import { Repository, ProjectRepository } from '../src/core/database/repositories';
 import { Project, ProjectContract } from '../src/core/types/domain';
+import { captureRepositoryRoot } from '../src/core/services/RepositoryRootIdentity';
+import { ProjectService } from '../src/core/services/ProjectService';
+import { EventService } from '../src/core/services/EventService';
+import { EmergencyStopService } from '../src/core/services/EmergencyStopService';
+import { ProcessRunner } from '../src/core/services/ProcessRunner';
 
 describe('ProjectRepository extraction contract', () => {
   let db: Database.Database | undefined;
+  const fixtures: string[] = [];
 
   afterEach(() => {
     db?.close();
     db = undefined;
+    vi.restoreAllMocks();
+    for (const fixture of fixtures.splice(0)) {
+      if (fs.realpathSync.native(fixture) !== fixture || !path.basename(fixture).startsWith('af-project-root-')) throw new Error('FIXTURE_BOUNDARY_CHANGED');
+      fs.rmSync(fixture, { recursive: true, force: true });
+    }
   });
+
+  function fixtureRoot(): { fixture: string; root: string } {
+    const fixture = fs.realpathSync.native(fs.mkdtempSync(path.join(os.tmpdir(), 'af-project-root-')));
+    fixtures.push(fixture);
+    const root = path.join(fixture, 'repository'); fs.mkdirSync(root);
+    fs.writeFileSync(path.join(root, 'sentinel'), 'selected-owner');
+    return { fixture, root };
+  }
+
+  function services(databasePath = ':memory:') {
+    db = new Database(databasePath); db.pragma('foreign_keys = ON'); MigrationRunner.run(db);
+    const repository = new Repository(db);
+    const events = new EventService(repository);
+    return { repository, events, projects: new ProjectService(repository, events) };
+  }
 
   it('preserves project CRUD mapping, ordering, JSON contract, and status timestamps', () => {
     db = new Database(':memory:');
@@ -96,5 +125,96 @@ describe('ProjectRepository extraction contract', () => {
     const replacementContract = { ...contract, goal: 'updated goal' };
     facade.updateProjectContract(newer.id, replacementContract);
     expect(extracted.getProject(newer.id)!.contract).toEqual(replacementContract);
+  });
+
+  it('persists the selected component identities atomically and validates them after database restart', () => {
+    const { fixture, root } = fixtureRoot();
+    const databasePath = path.join(fixture, 'project.sqlite');
+    const identity = captureRepositoryRoot(root);
+    const first = services(databasePath);
+    const project = first.projects.createProject('Selected repository', 'Identity fixture', root, 'main', identity);
+    expect(first.repository.getProjectRepositoryIdentity(project.id)).toEqual(identity);
+    expect(first.repository.getEvents(project.id).map(event => event.type)).toContain('PROJECT_CREATED');
+    db!.close(); db = undefined;
+    const restarted = services(databasePath);
+    expect(restarted.repository.getProject(project.id)).toEqual(project);
+    expect(restarted.repository.getProjectRepositoryIdentity(project.id)).toEqual(identity);
+    expect(db!.prepare('SELECT COUNT(*) AS count FROM project_repository_identities').get()).toEqual({ count: 1 });
+  });
+
+  it('retains a stale bound project for display but rejects its replacement root after restart', () => {
+    const { fixture, root } = fixtureRoot();
+    const databasePath = path.join(fixture, 'project.sqlite');
+    const first = services(databasePath);
+    const project = first.projects.createProject('Selected repository', 'Identity fixture', root, 'main', captureRepositoryRoot(root));
+    db!.close(); db = undefined;
+    fs.renameSync(root, root + '-original'); fs.mkdirSync(root);
+    fs.writeFileSync(path.join(root, 'sentinel'), 'replacement-owner');
+    const restarted = services(databasePath);
+    expect(() => restarted.repository.getProject(project.id)).toThrow('REPOSITORY_ROOT_IDENTITY_CHANGED');
+    expect(() => restarted.repository.getProjectRepositoryIdentity(project.id)).toThrow('REPOSITORY_ROOT_IDENTITY_CHANGED');
+    expect(restarted.repository.getAllProjects()).toEqual([project]);
+    expect(fs.readFileSync(path.join(root + '-original', 'sentinel'), 'utf8')).toBe('selected-owner');
+    expect(fs.readFileSync(path.join(root, 'sentinel'), 'utf8')).toBe('replacement-owner');
+  });
+
+  it('does not persist a project, root receipt or creation event from a stale native selection', () => {
+    const { root } = fixtureRoot();
+    const identity = captureRepositoryRoot(root);
+    fs.renameSync(root, root + '-original'); fs.mkdirSync(root);
+    const current = services();
+    expect(() => current.projects.createProject('Stale selected root', '', root, 'main', identity)).toThrow('REPOSITORY_ROOT_IDENTITY_CHANGED');
+    for (const table of ['projects', 'project_repository_identities', 'events']) {
+      expect(db!.prepare(`SELECT COUNT(*) AS count FROM ${table}`).get()).toEqual({ count: 0 });
+    }
+    expect(fs.readFileSync(path.join(root + '-original', 'sentinel'), 'utf8')).toBe('selected-owner');
+  });
+
+  it('rolls the bound project and receipt back when its durable creation event fails', () => {
+    const { root } = fixtureRoot();
+    const current = services();
+    vi.spyOn(current.events, 'record').mockImplementationOnce(() => { throw new Error('INJECTED_EVENT_FAILURE'); });
+    expect(() => current.projects.createProject('Failed event', '', root, 'main', captureRepositoryRoot(root))).toThrow('INJECTED_EVENT_FAILURE');
+    for (const table of ['projects', 'project_repository_identities', 'events']) {
+      expect(db!.prepare(`SELECT COUNT(*) AS count FROM ${table}`).get()).toEqual({ count: 0 });
+    }
+  });
+
+  it('does not adopt a historical metadata path without a selected identity', () => {
+    const { root } = fixtureRoot();
+    const current = services();
+    const metadata = current.projects.createProject('Unbound metadata', 'Metadata fixture', root);
+    expect(current.repository.getProject(metadata.id)).toEqual(metadata);
+    expect(() => current.repository.getProjectRepositoryIdentity(metadata.id)).toThrow('REPOSITORY_ROOT_UNBOUND');
+    expect(db!.prepare('SELECT COUNT(*) AS count FROM project_repository_identities').get()).toEqual({ count: 0 });
+  });
+
+  it('rejects corrupted durable root evidence instead of acquiring the current path', () => {
+    const { root } = fixtureRoot();
+    const current = services();
+    const project = current.projects.createProject('Bound evidence', '', root, 'main', captureRepositoryRoot(root));
+    db!.prepare('UPDATE project_repository_identities SET identity_json=? WHERE project_id=?').run('{broken', project.id);
+    expect(() => current.repository.getProject(project.id)).toThrow('REPOSITORY_ROOT_IDENTITY_UNAVAILABLE');
+    expect(() => current.repository.getProjectRepositoryIdentity(project.id)).toThrow('REPOSITORY_ROOT_IDENTITY_UNAVAILABLE');
+    expect(fs.readFileSync(path.join(root, 'sentinel'), 'utf8')).toBe('selected-owner');
+  });
+
+  it('keeps the real durable Emergency Stop latch and audit available after a bound root replacement', async () => {
+    const { root } = fixtureRoot();
+    const current = services();
+    const project = current.projects.createProject('Stale root stop', 'Stop fixture', root, 'main', captureRepositoryRoot(root));
+    current.repository.updateProjectStatus(project.id, 'RUNNING');
+    fs.renameSync(root, root + '-original'); fs.mkdirSync(root);
+    expect(() => current.repository.getProject(project.id)).toThrow('REPOSITORY_ROOT_IDENTITY_CHANGED');
+    // Isolate the fixture from unrelated host processes. Durable stop and audit
+    // use the actual services/SQLite; no process-termination proof is inferred.
+    vi.spyOn(ProcessRunner, 'terminateAllProcesses').mockResolvedValue({ count: 0, unproven: 0, allTerminatedProven: true });
+    const stop = new EmergencyStopService(current.repository, current.events);
+    const result = await stop.triggerEmergencyStop('Stale root fixture stop');
+    expect(result.projectsPaused).toContain(project.id);
+    expect(stop.getStopFence(project.id)).toMatchObject({ latched: true, epoch: 1, projectStatus: 'PAUSED' });
+    expect(current.repository.getProjectMetadata(project.id)?.status).toBe('PAUSED');
+    expect(current.repository.getEvents(project.id).map(event => event.type)).toContain('EMERGENCY_STOP');
+    expect(() => current.repository.getProjectRepositoryIdentity(project.id)).toThrow('REPOSITORY_ROOT_IDENTITY_CHANGED');
   });
 });

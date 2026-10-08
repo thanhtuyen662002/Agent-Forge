@@ -6,6 +6,7 @@ import { beforeEach, afterEach, describe, expect, it, vi } from 'vitest';
 import { dialog } from 'electron';
 import { GitService } from '../src/core/services/GitService';
 import { RepositorySelectionService } from '../src/core/services/RepositorySelectionService';
+import { captureRepositoryRoot, RepositoryRootError } from '../src/core/services/RepositoryRootIdentity';
 import { registerIpcHandlers, IpcSenderTrustError } from '../src/electron/ipcHandlers';
 
 const handlers = new Map<string, (event: unknown, payload: unknown) => Promise<unknown>>();
@@ -30,6 +31,7 @@ describe('privileged IPC sender trust boundary', () => {
   const repo = {
     getAllProjects: vi.fn(() => []),
     getProject: vi.fn((id: string) => ({ id })),
+    getProjectRepositoryIdentity: vi.fn(() => { throw new RepositoryRootError('REPOSITORY_ROOT_UNBOUND'); }),
     getProjectMaxRevisions: vi.fn(() => 3),
     setProjectMaxRevisions: vi.fn((_: string, value: number) => value),
     getProviderResource: vi.fn((id: string) => id === 'res-1' ? { id } : null),
@@ -156,6 +158,34 @@ describe('privileged IPC sender trust boundary', () => {
     })).toMatchObject({ success: false, errorCode: 'REPOSITORY_ROOT_IDENTITY_CHANGED' });
     expect(projectService.createProject).not.toHaveBeenCalled();
     expect(RepositorySelectionService.consumeToken(token.selectionId).success).toBe(false);
+  });
+
+  it('denies unbound historical project Git reads with a typed actionable result', async () => {
+    const { root } = repositoryFixture();
+    repo.getProject.mockReturnValueOnce({ id: 'historical', repository_path: root } as any);
+    const status = vi.spyOn(GitService, 'getStatus');
+    expect(await handlers.get('git:getStatus')!({ senderFrame: { url: 'http://localhost:5173/' } }, { projectId: 'historical' }))
+      .toMatchObject({ status: 'ERROR', isClean: false, errorCode: 'REPOSITORY_ROOT_UNBOUND' });
+    expect(status).not.toHaveBeenCalled();
+  });
+
+  it('returns typed root-load failures without invoking Git or reporting a clean project', async () => {
+    repo.getProject.mockImplementationOnce(() => { throw new RepositoryRootError('REPOSITORY_ROOT_IDENTITY_CHANGED'); });
+    const status = vi.spyOn(GitService, 'getStatus');
+    expect(await handlers.get('git:getStatus')!({ senderFrame: { url: 'http://localhost:5173/' } }, { projectId: 'changed' }))
+      .toMatchObject({ status: 'ERROR', isClean: false, errorCode: 'REPOSITORY_ROOT_IDENTITY_CHANGED' });
+    expect(status).not.toHaveBeenCalled();
+  });
+
+  it('passes the persisted project identity into actual Git status collection', async () => {
+    const { root } = repositoryFixture();
+    const identity = captureRepositoryRoot(root);
+    repo.getProject.mockReturnValueOnce({ id: 'bound', repository_path: root } as any);
+    repo.getProjectRepositoryIdentity.mockReturnValueOnce(identity as never);
+    const status = vi.spyOn(GitService, 'getStatus');
+    expect(await handlers.get('git:getStatus')!({ senderFrame: { url: 'http://localhost:5173/' } }, { projectId: 'bound' }))
+      .toMatchObject({ status: 'SUCCESS', isClean: true });
+    expect(status).toHaveBeenCalledWith(root, identity);
   });
 
   it('confirms quota mutation only for an existing resource inside the immediate transaction', async () => {

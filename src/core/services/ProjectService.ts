@@ -4,6 +4,7 @@ import { EventService } from './EventService';
 import { ProjectStateMachine, ProjectTrigger } from '../state/projectStateMachine';
 import { Project, ProjectContract, ProjectStatus } from '../types/domain';
 import { ProjectStopFenceService } from './ProjectStopFenceService';
+import { assertRepositoryRootIdentity, RepositoryRootIdentity } from './RepositoryRootIdentity';
 
 export class ProjectService {
   private readonly stopFence: ProjectStopFenceService;
@@ -15,7 +16,7 @@ export class ProjectService {
     this.stopFence = new ProjectStopFenceService(repo);
   }
 
-  public createProject(name: string, description: string, repositoryPath: string, defaultBranch: string = 'main'): Project {
+  public createProject(name: string, description: string, repositoryPath: string, defaultBranch: string = 'main', rootIdentity?: RepositoryRootIdentity): Project {
     const now = new Date().toISOString();
     const project: Project = {
       id: `PROJ-${crypto.randomUUID().substring(0, 8).toUpperCase()}`,
@@ -31,8 +32,11 @@ export class ProjectService {
       completed_at: null,
     };
 
-    this.repo.createProject(project);
-    this.eventService.record(project.id, 'PROJECT_CREATED', `Project "${name}" initialized in DRAFT state.`);
+    this.repo.runInImmediateTransaction(() => {
+      this.repo.createProject(project, rootIdentity);
+      this.eventService.record(project.id, 'PROJECT_CREATED', `Project "${name}" initialized in DRAFT state.`);
+      if (rootIdentity) assertRepositoryRootIdentity(rootIdentity);
+    });
     return project;
   }
 

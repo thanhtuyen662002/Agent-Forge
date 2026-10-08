@@ -2,6 +2,7 @@ import crypto from 'crypto';
 import { VerificationCapabilityReference } from '../types/verificationCapability';
 import { VerificationCapabilityService } from '../services/VerificationCapabilityService';
 import Database from 'better-sqlite3';
+import { RepositoryRootError, RepositoryRootIdentity } from '../services/RepositoryRootIdentity';
 import {
   Project,
   Task,
@@ -254,12 +255,22 @@ export class Repository {
   // ==========================================
   // Projects
   // ==========================================
-  public createProject(project: Project): void {
-    this.projectRepository.createProject(project);
+  public createProject(project: Project, rootIdentity?: RepositoryRootIdentity): void {
+    this.projectRepository.createProject(project, rootIdentity);
+  }
+
+  public getProjectRepositoryIdentity(projectId: string): RepositoryRootIdentity {
+    const identity = this.projectRepository.getRepositoryIdentity(projectId);
+    if (!identity) throw new RepositoryRootError('REPOSITORY_ROOT_UNBOUND');
+    return identity;
   }
 
   public getProject(id: string): Project | null {
     return this.projectRepository.getProject(id);
+  }
+
+  public getProjectMetadata(id: string): Project | null {
+    return this.projectRepository.getProjectMetadata(id);
   }
 
   public getAllProjects(): Project[] {

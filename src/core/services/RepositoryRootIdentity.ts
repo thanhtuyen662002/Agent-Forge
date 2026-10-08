@@ -7,7 +7,8 @@ export type RepositoryRootErrorCode =
   | 'REPOSITORY_ROOT_NOT_DIRECTORY'
   | 'REPOSITORY_ROOT_ALIAS'
   | 'REPOSITORY_ROOT_IDENTITY_UNAVAILABLE'
-  | 'REPOSITORY_ROOT_IDENTITY_CHANGED';
+  | 'REPOSITORY_ROOT_IDENTITY_CHANGED'
+  | 'REPOSITORY_ROOT_UNBOUND';
 
 const reasons: Record<RepositoryRootErrorCode, string> = {
   REPOSITORY_ROOT_INVALID_PATH: 'Select an absolute local repository directory without portable or device aliases.',
@@ -16,6 +17,7 @@ const reasons: Record<RepositoryRootErrorCode, string> = {
   REPOSITORY_ROOT_ALIAS: 'Select the real repository directory; symlink, junction and path aliases are not allowed.',
   REPOSITORY_ROOT_IDENTITY_UNAVAILABLE: 'The repository directory identity could not be verified safely.',
   REPOSITORY_ROOT_IDENTITY_CHANGED: 'The selected repository or a parent changed. Select the repository again.',
+  REPOSITORY_ROOT_UNBOUND: 'This project has no verified repository selection. Select its repository before repository operations.',
 };
 
 export class RepositoryRootError extends Error {

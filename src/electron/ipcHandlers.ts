@@ -212,7 +212,8 @@ export function registerIpcHandlers(
         parsed.data.name,
         parsed.data.description,
         canonicalRepoPath,
-        parsed.data.defaultBranch
+        parsed.data.defaultBranch,
+        tokenRes.rootIdentity,
       );
 
       return { success: true, project };
@@ -556,21 +557,28 @@ export function registerIpcHandlers(
       };
     }
 
-    const project = repo.getProject(parsed.data.projectId);
-    if (!project) {
-      return {
-        status: 'ERROR',
-        branch: 'UNKNOWN',
-        isClean: false,
-        modifiedFiles: [],
-        untrackedFiles: [],
-        aheadCount: 0,
-        behindCount: 0,
-        errorMessage: 'Project not found',
-      };
-    }
+    try {
+      const project = repo.getProject(parsed.data.projectId);
+      if (!project) {
+        return {
+          status: 'ERROR',
+          branch: 'UNKNOWN',
+          isClean: false,
+          modifiedFiles: [],
+          untrackedFiles: [],
+          aheadCount: 0,
+          behindCount: 0,
+          errorMessage: 'Project not found',
+        };
+      }
 
-    return GitService.getStatus(project.repository_path);
+      const rootIdentity = repo.getProjectRepositoryIdentity(project.id);
+      return await GitService.getStatus(project.repository_path, rootIdentity);
+    } catch (error) {
+      if (!(error instanceof RepositoryRootError)) throw error;
+      return { status: 'ERROR', branch: 'UNKNOWN', isClean: false, modifiedFiles: [], untrackedFiles: [],
+        aheadCount: 0, behindCount: 0, errorCode: error.code, errorMessage: error.message };
+    }
   });
 
   registerPrivilegedHandler('git:getDiff', async (_, payload: unknown) => {
@@ -600,20 +608,27 @@ export function registerIpcHandlers(
       };
     }
 
-    const project = repo.getProject(task.project_id);
-    if (!project) {
-      return {
-        status: 'ERROR',
-        diffStat: '',
-        diffContent: '',
-        filesChanged: [],
-        insertions: 0,
-        deletions: 0,
-        errorMessage: 'Project not found',
-      };
-    }
+    try {
+      const project = repo.getProject(task.project_id);
+      if (!project) {
+        return {
+          status: 'ERROR',
+          diffStat: '',
+          diffContent: '',
+          filesChanged: [],
+          insertions: 0,
+          deletions: 0,
+          errorMessage: 'Project not found',
+        };
+      }
 
-    return GitService.getDiff(project.repository_path, task.base_sha);
+      const rootIdentity = repo.getProjectRepositoryIdentity(project.id);
+      return await GitService.getDiff(project.repository_path, task.base_sha, rootIdentity);
+    } catch (error) {
+      if (!(error instanceof RepositoryRootError)) throw error;
+      return { status: 'ERROR', diffStat: '', diffContent: '', filesChanged: [], insertions: 0, deletions: 0,
+        errorCode: error.code, errorMessage: error.message };
+    }
   });
 
   registerPrivilegedHandler('verification:runTests', async (_, payload: unknown) => {
