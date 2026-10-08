@@ -4,6 +4,9 @@
 // ownership before admitting a complete worktree mutation.
 export const WINDOWS_DIRECTORY_BOOTSTRAP = String.raw`
 $ErrorActionPreference = 'Stop'
+[Console]::InputEncoding = [System.Text.UTF8Encoding]::new($false, $true)
+[Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false)
+$OutputEncoding = [System.Text.UTF8Encoding]::new($false)
 $source = [Console]::ReadLine() | ConvertFrom-Json
 & ([scriptblock]::Create([string]$source))
 `;
@@ -370,6 +373,47 @@ public sealed class AgentForgeDirectoryPins : IDisposable {
     if (!Same(info, ObjectInfo(node.Handle, false))) throw new IOException("BOUNDARY_READ_IDENTITY_CHANGED");
     return Convert.ToBase64String(data);
   }
+  public string HashCaptured(string child, string relative) {
+    string key = Key(child, relative); Node node;
+    if (!sealedTrees.Contains(child) || !nodes.TryGetValue(key, out node) || node.Directory || node.Writable)
+      throw new IOException("BOUNDARY_HASH_NOT_CAPTURED");
+    FileInfo info = ObjectInfo(node.Handle, false);
+    if (!Same(node.Captured, info) || info.SizeHigh != 0 || info.SizeLow > 67108864)
+      throw new IOException("BOUNDARY_HASH_LIMIT_OR_IDENTITY");
+    long position;
+    if (!SetFilePointerEx(node.Handle, 0, out position, 0)) throw new IOException("BOUNDARY_HASH_READ_DENIED");
+    using (var hash = System.Security.Cryptography.SHA256.Create()) {
+      byte[] buffer = new byte[8192]; uint remaining = info.SizeLow;
+      while (remaining > 0) {
+        uint amount = Math.Min(remaining, (uint)buffer.Length), read;
+        if (!ReadFile(node.Handle, buffer, amount, out read, IntPtr.Zero) || read != amount)
+          throw new IOException("BOUNDARY_HASH_READ_DENIED");
+        hash.TransformBlock(buffer, 0, (int)read, buffer, 0); remaining -= read;
+      }
+      hash.TransformFinalBlock(new byte[0], 0, 0);
+      FileInfo after = ObjectInfo(node.Handle, false);
+      if (!Same(info, after) || after.SizeHigh != info.SizeHigh || after.SizeLow != info.SizeLow)
+        throw new IOException("BOUNDARY_HASH_IDENTITY_CHANGED");
+      return BitConverter.ToString(hash.Hash).Replace("-", "").ToLowerInvariant();
+    }
+  }
+  public string ShapeCaptured(string child) {
+    Top(child);
+    if (!sealedTrees.Contains(child)) throw new IOException("BOUNDARY_SHAPE_NOT_SEALED");
+    string prefix = child + "/";
+    List<string> shape = new List<string>();
+    foreach (Node node in nodes.Values) {
+      if (!node.Key.StartsWith(prefix, StringComparison.Ordinal)) continue;
+      if (!Same(node.Captured, ObjectInfo(node.Handle, node.Directory)) || node.Writable)
+        throw new IOException("BOUNDARY_SHAPE_IDENTITY_CHANGED");
+      shape.Add((node.Directory ? "D:" : "F:") + node.Key.Substring(prefix.Length));
+    }
+    shape.Sort(StringComparer.Ordinal);
+    using (var hash = System.Security.Cryptography.SHA256.Create()) {
+      byte[] data = Encoding.UTF8.GetBytes(String.Join(((char)0).ToString(), shape) + (char)0);
+      return BitConverter.ToString(hash.ComputeHash(data)).Replace("-", "").ToLowerInvariant();
+    }
+  }
   public string AcquireOperationLock() {
     RootIdentity();
     if (operationLock != null) throw new IOException("BOUNDARY_OPERATION_ALREADY_HELD");
@@ -467,6 +511,8 @@ try {
       elseif ($request.op -eq 'seal') { $pins.SealTree([string]$request.name); $identity = $null }
       elseif ($request.op -eq 'delete-tree') { $pins.DeleteTree([string]$request.name); $identity = $null }
       elseif ($request.op -eq 'read') { $data = $pins.ReadCaptured([string]$request.name, [string]$request.path); $identity = $null }
+      elseif ($request.op -eq 'hash') { $data = $pins.HashCaptured([string]$request.name, [string]$request.path); $identity = $null }
+      elseif ($request.op -eq 'shape') { $data = $pins.ShapeCaptured([string]$request.name); $identity = $null }
       elseif ($request.op -eq 'operation-acquire') { $data = $pins.AcquireOperationLock(); $identity = $null }
       elseif ($request.op -eq 'operation-claim') { $pins.ClaimOperationLock([string]$request.data); $identity = $null }
       elseif ($request.op -eq 'operation-release') { $pins.ReleaseOperationLock(); $identity = $null }

@@ -200,6 +200,20 @@ export class WorktreeMutationBoundary {
     return Buffer.from(response.data, 'base64');
   }
 
+  public async hashCapturedFile(name: string, relative: string): Promise<string> {
+    this.name(name); this.relative(relative);
+    const response = await this.request({ op: 'hash', name, path: relative });
+    if (typeof response.data !== 'string' || !/^[a-f0-9]{64}$/.test(response.data)) throw new Error('BOUNDARY_CAPTURED_HASH_INVALID');
+    return response.data;
+  }
+
+  public async capturedTreeShape(name: string): Promise<string> {
+    this.name(name);
+    const response = await this.request({ op: 'shape', name });
+    if (typeof response.data !== 'string' || !/^[a-f0-9]{64}$/.test(response.data)) throw new Error('BOUNDARY_CAPTURED_SHAPE_INVALID');
+    return response.data;
+  }
+
   /** Kernel exclusivity fences current helpers; legacy PID metadata is honored. */
   public async acquireOperationLock(owner: { pid: number; token: string; createdAt: number }): Promise<boolean> {
     let response: Response;

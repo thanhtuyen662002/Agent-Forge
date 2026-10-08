@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeEach, afterEach } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import fs from 'fs';
 import path from 'path';
 import os from 'os';
@@ -845,11 +845,13 @@ setInterval(() => {
 
     const dispatchPromise = customDispatch.dispatchScheduled(authId);
 
-    let count = 0;
-    while (repo.getProcessRunsByTask(taskId).length === 0 && count < 30) {
-      await new Promise((r) => setTimeout(r, 50));
-      count++;
-    }
+    // Assert the observed process phase; native inspection may still be
+    // preparing after a fixed delay, which tests pre-spawn cancellation.
+    await vi.waitFor(() => {
+      const started = repo.getProcessRunsByTask(taskId);
+      expect(started).toHaveLength(1);
+      expect(started[0].status).toBe('RUNNING');
+    }, { interval: 25, timeout: 15_000 });
 
     const cancelRes = await customDispatch.cancelScheduled(authId);
     expect(cancelRes.status).toBe('CANCEL_REQUESTED');
@@ -942,11 +944,13 @@ setInterval(() => {
     const customDispatch = new ProviderDispatchService(customRegistry, repo, eventService, worktreeService);
 
     const dispatchPromise = customDispatch.dispatchScheduled(authId);
-    let count = 0;
-    while (repo.getProcessRunsByTask(taskId).length === 0 && count < 30) {
-      await new Promise((r) => setTimeout(r, 50));
-      count++;
-    }
+    // Assert the observed process phase; native inspection may still be
+    // preparing after a fixed delay, which tests pre-spawn cancellation.
+    await vi.waitFor(() => {
+      const started = repo.getProcessRunsByTask(taskId);
+      expect(started).toHaveLength(1);
+      expect(started[0].status).toBe('RUNNING');
+    }, { interval: 25, timeout: 15_000 });
 
     await customDispatch.cancelScheduled(authId);
     const res = await dispatchPromise;
@@ -966,11 +970,13 @@ setInterval(() => {
     const customDispatch = new ProviderDispatchService(customRegistry, repo, eventService, worktreeService);
 
     const dispatchPromise = customDispatch.dispatchScheduled(authId);
-    let count = 0;
-    while (repo.getProcessRunsByTask(taskId).length === 0 && count < 30) {
-      await new Promise((r) => setTimeout(r, 50));
-      count++;
-    }
+    // Assert the observed process phase; native inspection may still be
+    // preparing after a fixed delay, which tests pre-spawn cancellation.
+    await vi.waitFor(() => {
+      const started = repo.getProcessRunsByTask(taskId);
+      expect(started).toHaveLength(1);
+      expect(started[0].status).toBe('RUNNING');
+    }, { interval: 25, timeout: 15_000 });
 
     await customDispatch.cancelScheduled(authId);
     const res = await dispatchPromise;
@@ -1056,11 +1062,13 @@ setInterval(() => {
     const customDispatch = new ProviderDispatchService(customRegistry, repo, eventService, worktreeService);
 
     const dispatchPromise = customDispatch.dispatchScheduled(authId);
-    let count = 0;
-    while (repo.getProcessRunsByTask(taskId).length === 0 && count < 30) {
-      await new Promise((r) => setTimeout(r, 50));
-      count++;
-    }
+    // Assert the observed process phase; native inspection may still be
+    // preparing after a fixed delay, which tests pre-spawn cancellation.
+    await vi.waitFor(() => {
+      const started = repo.getProcessRunsByTask(taskId);
+      expect(started).toHaveLength(1);
+      expect(started[0].status).toBe('RUNNING');
+    }, { interval: 25, timeout: 15_000 });
 
     await customDispatch.cancelScheduled(authId);
     await dispatchPromise;

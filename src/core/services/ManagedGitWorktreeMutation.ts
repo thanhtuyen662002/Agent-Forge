@@ -159,11 +159,13 @@ export function encodeCheckoutIndex(entries: CheckoutEntry[]): Buffer {
 export class ManagedGitWorktreeMutation {
   private checkout: WorktreeMutationBoundary | null = null;
   private metadata: WorktreeMutationBoundary | null = null;
+  private administrationAnchor: WorktreeMutationBoundary | null = null;
   private adminRoot: string | null = null;
   private checkoutReserved = false;
   private metadataReserved = false;
   private ownedExisting = false;
   private ownedSha: string | null = null;
+  private capturedSha: string | null = null;
   private constructor(private readonly config: ManagedWorktreeMutationConfig, public readonly childName: string) {}
 
   static async prepare(config: ManagedWorktreeMutationConfig, childName: string, initialize = true): Promise<ManagedGitWorktreeMutation> {
@@ -172,18 +174,36 @@ export class ManagedGitWorktreeMutation {
     const mutation = new ManagedGitWorktreeMutation(config, childName);
     const sourceIdentity = fs.lstatSync(config.repositoryRoot, { bigint: true });
     try {
+      // Only primary administration has a source-root authority here. A .git
+      // pointer or redirected commondir must not select another repository for
+      // mutation. Unsupported layouts remain read-only and explicitly fenced.
+      const primaryAdmin = path.join(config.repositoryRoot, '.git');
+      let expectedAdmin: fs.BigIntStats;
+      try { expectedAdmin = fs.lstatSync(primaryAdmin, { bigint: true }); }
+      catch { throw new Error('WORKTREE_GIT_LAYOUT_UNSUPPORTED'); }
+      if (!sourceIdentity.isDirectory() || sourceIdentity.isSymbolicLink() ||
+          !expectedAdmin.isDirectory() || expectedAdmin.isSymbolicLink()) throw new Error('WORKTREE_GIT_LAYOUT_UNSUPPORTED');
       mutation.checkout = await WorktreeMutationBoundary.acquire(config.managedRoot, initialize);
-      // Use Git's own repository identity, then capture every ordinary parent
-      // before opening its admin subtree. No metadata path is accepted from a
-      // provider or from the worktree's mutable .git pointer.
+      mutation.administrationAnchor = await WorktreeMutationBoundary.acquire(primaryAdmin);
+      const checkedAdmin = fs.lstatSync(primaryAdmin, { bigint: true });
+      if (expectedAdmin.dev !== checkedAdmin.dev || expectedAdmin.ino !== checkedAdmin.ino ||
+          expectedAdmin.birthtimeNs !== checkedAdmin.birthtimeNs) throw new Error('WORKTREE_SOURCE_IDENTITY_CHANGED');
+      // Match Git's read-only observation against the independently captured
+      // primary admin root before initializing any administrative parent.
       const gitdir = await mutation.read(['rev-parse', '--path-format=absolute', '--git-common-dir'], 32_768);
       const commonRoot = gitdir.toString('utf8').trim();
-      if (!path.isAbsolute(commonRoot) || /[\0\r\n]/.test(commonRoot) || !fs.statSync(commonRoot).isDirectory()) throw new Error('WORKTREE_GIT_ADMIN_DENIED');
-      mutation.adminRoot = path.join(commonRoot, 'worktrees');
-      mutation.metadata = await WorktreeMutationBoundary.acquire(mutation.adminRoot, initialize);
+      if (!path.isAbsolute(commonRoot) || /[\0\r\n]/.test(commonRoot) ||
+          fs.realpathSync.native(commonRoot).toLowerCase() !== mutation.administrationAnchor.managedRoot.toLowerCase()) {
+        throw new Error('WORKTREE_GIT_LAYOUT_UNSUPPORTED');
+      }
       const sourceNow = fs.lstatSync(config.repositoryRoot, { bigint: true });
-      if (!sourceIdentity.isDirectory() || sourceIdentity.isSymbolicLink() || sourceIdentity.ino !== sourceNow.ino ||
+      const adminNow = fs.lstatSync(primaryAdmin, { bigint: true });
+      if (!sourceNow.isDirectory() || sourceNow.isSymbolicLink() || sourceIdentity.ino !== sourceNow.ino ||
           sourceIdentity.dev !== sourceNow.dev || sourceIdentity.birthtimeNs !== sourceNow.birthtimeNs) throw new Error('WORKTREE_SOURCE_IDENTITY_CHANGED');
+      if (!adminNow.isDirectory() || adminNow.isSymbolicLink() || expectedAdmin.dev !== adminNow.dev ||
+          expectedAdmin.ino !== adminNow.ino || expectedAdmin.birthtimeNs !== adminNow.birthtimeNs) throw new Error('WORKTREE_SOURCE_IDENTITY_CHANGED');
+      mutation.adminRoot = path.join(mutation.administrationAnchor.managedRoot, 'worktrees');
+      mutation.metadata = await WorktreeMutationBoundary.acquire(mutation.adminRoot, initialize);
       return mutation;
     } catch (error) { await mutation.close(); throw error; }
   }
@@ -235,10 +255,17 @@ export class ManagedGitWorktreeMutation {
     } finally { await blobs.close(); }
     await this.metadata.writeNewFile(this.childName, 'index', encodeCheckoutIndex(entries));
     await this.checkout.writeNewFile(this.childName, '.git', Buffer.from(`gitdir: ${admin.replace(/\\/g, '/')}\n`));
+    // A separate immutable, flushed receipt closes materialization. An
+    // interrupted checkout is never inferred complete from HEAD or Git status.
+    await this.metadata.writeNewFile(this.childName, 'agent-forge-complete.json', Buffer.from(JSON.stringify({
+      version: 1, ownershipDigest, baseSha, targetIdentity,
+      adminIdentity: this.metadata.capturedIdentity(this.childName), phase: 'MATERIALIZED',
+    }) + '\n'));
     return target;
   }
 
   async captureOwned(baseSha: string, ownershipDigest: string, inspectionOnly = false): Promise<string> {
+    this.ownedExisting = false; this.ownedSha = null; this.capturedSha = null;
     if (!/^[a-f0-9]{40}$/.test(baseSha) || !/^[a-f0-9]{64}$/.test(ownershipDigest) ||
         this.childName !== `afw-${ownershipDigest.slice(0, 32)}` || !this.checkout || !this.metadata || !this.adminRoot) {
       throw new Error('WORKTREE_MUTATION_OWNER_DENIED');
@@ -248,12 +275,19 @@ export class ManagedGitWorktreeMutation {
     await this.checkout.sealTree(this.childName);
     await this.metadata.sealTree(this.childName);
     const receipt = JSON.parse((await this.metadata.readCapturedFile(this.childName, 'agent-forge-owner.json')).toString('utf8')) as {
-      version: number; ownershipDigest: string; baseSha: string; targetIdentity: NativeIdentity; adminIdentity: NativeIdentity;
+      version: number; ownershipDigest: string; baseSha: string; targetIdentity: NativeIdentity; adminIdentity: NativeIdentity; phase: string;
     };
     const same = (a: NativeIdentity | undefined, b: NativeIdentity) => !!a && a.volume === b.volume && a.fileId === b.fileId && a.created === b.created;
-    if (receipt.version !== 1 || receipt.ownershipDigest !== ownershipDigest || receipt.baseSha !== baseSha ||
+    if (receipt.version !== 1 || receipt.phase !== 'CREATING' || receipt.ownershipDigest !== ownershipDigest || receipt.baseSha !== baseSha ||
         !same(receipt.targetIdentity, this.checkout.capturedIdentity(this.childName)) ||
         !same(receipt.adminIdentity, this.metadata.capturedIdentity(this.childName))) throw new Error('WORKTREE_OWNER_RECEIPT_MISMATCH');
+    let completion: typeof receipt;
+    try { completion = JSON.parse((await this.metadata.readCapturedFile(this.childName, 'agent-forge-complete.json')).toString('utf8')); }
+    catch { throw new Error('WORKTREE_PARTIAL_SETUP_RETAINED'); }
+    if (!completion || completion.phase !== 'MATERIALIZED') throw new Error('WORKTREE_PARTIAL_SETUP_RETAINED');
+    if (completion.version !== 1 || completion.ownershipDigest !== ownershipDigest || completion.baseSha !== baseSha ||
+        !same(completion.targetIdentity, this.checkout.capturedIdentity(this.childName)) ||
+        !same(completion.adminIdentity, this.metadata.capturedIdentity(this.childName))) throw new Error('WORKTREE_OWNER_RECEIPT_MISMATCH');
     const pointer = (await this.checkout.readCapturedFile(this.childName, '.git')).toString('utf8').trim();
     if (pointer !== `gitdir: ${path.join(this.adminRoot, this.childName).replace(/\\/g, '/')}`) throw new Error('WORKTREE_GIT_POINTER_MISMATCH');
     const readAdmin = async (file: string) => (await this.metadata!.readCapturedFile(this.childName, file)).toString('utf8').trim();
@@ -263,7 +297,34 @@ export class ManagedGitWorktreeMutation {
       this.ownedExisting = true;
       this.ownedSha = baseSha;
     }
+    this.capturedSha = baseSha;
     return target;
+  }
+
+  /** Git's mutable index can hide dirty files; compare the captured bytes too. */
+  async isExactCheckout(): Promise<boolean> {
+    if (!this.capturedSha || !this.checkout) throw new Error('WORKTREE_CLEAN_CHECK_NOT_ADMITTED');
+    const entries = parseCheckoutTree(await this.read(['ls-tree', '--full-tree', '-r', '-z', this.capturedSha], MAX_TREE_BYTES));
+    const directories = new Set<string>();
+    for (const entry of entries) {
+      const parts = entry.name.split('/');
+      for (let i = 1; i < parts.length; i++) directories.add(parts.slice(0, i).join('/'));
+    }
+    const shape = [...entries.map(entry => `F:${entry.name}`), 'F:.git', ...Array.from(directories, name => `D:${name}`)].sort();
+    const expectedShape = crypto.createHash('sha256').update(shape.join('\0') + '\0').digest('hex');
+    if (await this.checkout.capturedTreeShape(this.childName) !== expectedShape) return false;
+    const reader = new BinaryGitReader(this.config.gitExecutable, ['cat-file', '--batch'], this.config.repositoryRoot, MAX_BLOB_BYTES + 129);
+    let total = 0;
+    try {
+      for (const entry of entries) {
+        const contents = await reader.blob(entry.oid);
+        total += contents.length;
+        if (total > MAX_CHECKOUT_BYTES) throw new Error('WORKTREE_CHECKOUT_LIMIT');
+        const expected = crypto.createHash('sha256').update(contents).digest('hex');
+        if (await this.checkout.hashCapturedFile(this.childName, entry.name) !== expected) return false;
+      }
+      return true;
+    } finally { await reader.close(); }
   }
 
   /** Captured owner plus fresh independent Git state is required for cleanup. */
@@ -274,7 +335,7 @@ export class ManagedGitWorktreeMutation {
     const branch = (await this.read(['branch', '--show-current'], 8192, target)).toString('utf8').trim();
     if (head !== this.ownedSha || branch !== '') throw new Error('WORKTREE_HEAD_CHANGED');
     const status = await this.read(['status', '--porcelain', '-z', '-uall'], MAX_TREE_BYTES, target);
-    if (status.length !== 0) throw new Error('WORKTREE_DIRTY');
+    if (status.length !== 0 || !await this.isExactCheckout()) throw new Error('WORKTREE_DIRTY');
     await this.checkout.deleteCapturedTree(this.childName);
     await this.metadata.deleteCapturedTree(this.childName);
     this.ownedExisting = false;
@@ -297,6 +358,7 @@ export class ManagedGitWorktreeMutation {
 
   async close(): Promise<void> {
     await this.metadata?.close(); this.metadata = null;
+    await this.administrationAnchor?.close(); this.administrationAnchor = null;
     await this.checkout?.close(); this.checkout = null;
   }
 }

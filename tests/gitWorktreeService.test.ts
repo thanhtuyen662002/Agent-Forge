@@ -942,4 +942,35 @@ $request=[Console]::ReadLine()|ConvertFrom-Json
       expect(service.deriveWorktreePath(makeTuple({ ownershipEpoch: null }))).toEqual(service.deriveWorktreePath(makeTuple()));
     } finally { acquire.mockRestore(); execute.mockRestore(); }
   });
+
+  it.skipIf(process.platform !== 'win32')('54. Native inspection and cleanup retain dirty bytes hidden by Git index flags', async () => {
+    const tuple = makeTuple();
+    const created = await service.createWorktree(tuple);
+    expect(created.status).toBe('CREATED'); if (created.status !== 'CREATED') return;
+    const changed = path.join(created.worktreePath, 'README.md');
+    fs.writeFileSync(changed, 'hidden-worker-change\n');
+    execSync(`"${gitExe}" update-index --assume-unchanged README.md`, { cwd: created.worktreePath });
+    expect(execSync(`"${gitExe}" status --porcelain -uall`, { cwd: created.worktreePath, encoding: 'utf8' }).trim()).toBe('');
+    const inspected = await service.inspectWorktree(tuple);
+    expect(inspected.status).toBe('INSPECTED');
+    if (inspected.status === 'INSPECTED') expect(inspected.inspection).toMatchObject({ exists: true, registered: true, sourceMatch: true, clean: false });
+    expect(await service.removeWorktree(tuple)).toMatchObject({ status: 'FAILED', code: 'DIRTY_WORKTREE' });
+    expect(fs.readFileSync(changed, 'utf8')).toBe('hidden-worker-change\n');
+    expect(fs.existsSync(path.join(repoDir, '.git', 'worktrees', path.basename(created.worktreePath), 'agent-forge-complete.json'))).toBe(true);
+  });
+
+  it.skipIf(process.platform !== 'win32')('55. Missing completion evidence fences otherwise valid Git data before reuse or cleanup', async () => {
+    const tuple = makeTuple();
+    const created = await service.createWorktree(tuple);
+    expect(created.status).toBe('CREATED'); if (created.status !== 'CREATED') return;
+    const admin = path.join(repoDir, '.git', 'worktrees', path.basename(created.worktreePath));
+    const owner = fs.readFileSync(path.join(admin, 'agent-forge-owner.json'), 'utf8');
+    const content = fs.readFileSync(path.join(created.worktreePath, 'README.md'));
+    fs.unlinkSync(path.join(admin, 'agent-forge-complete.json'));
+    expect(await service.inspectWorktree(tuple)).toMatchObject({ status: 'FAILED', code: 'PARTIAL_WORKTREE_SETUP' });
+    expect(await service.removeWorktree(tuple)).toMatchObject({ status: 'FAILED', code: 'PARTIAL_WORKTREE_SETUP' });
+    expect(await service.createWorktree(tuple)).toMatchObject({ status: 'FAILED', code: 'WORKTREE_ALREADY_EXISTS' });
+    expect(fs.readFileSync(path.join(created.worktreePath, 'README.md'))).toEqual(content);
+    expect(fs.readFileSync(path.join(admin, 'agent-forge-owner.json'), 'utf8')).toBe(owner);
+  });
 });

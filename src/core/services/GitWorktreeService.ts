@@ -72,6 +72,8 @@ export type WorktreeErrorCode =
   | 'DIRTY_WORKTREE'
   | 'HEAD_CHANGED'
   | 'UNSUPPORTED_MUTATION_BOUNDARY'
+  | 'UNSUPPORTED_GIT_LAYOUT'
+  | 'PARTIAL_WORKTREE_SETUP'
   | 'UNSUPPORTED_CHECKOUT_ENTRY'
   | 'REMOVE_FAILED'
   | 'INSPECTION_FAILED';
@@ -960,6 +962,8 @@ export class GitWorktreeService {
   private capturedFailure(error: unknown): { code: WorktreeErrorCode; error: string } {
     const detail = error instanceof Error ? error.message : '';
     const code: WorktreeErrorCode = detail.includes('UNSUPPORTED_MUTATION_BOUNDARY') ? 'UNSUPPORTED_MUTATION_BOUNDARY'
+      : detail.includes('WORKTREE_GIT_LAYOUT_UNSUPPORTED') ? 'UNSUPPORTED_GIT_LAYOUT'
+      : detail.includes('WORKTREE_PARTIAL_SETUP_RETAINED') ? 'PARTIAL_WORKTREE_SETUP'
       : /WORKTREE_(TREE_ENTRY_UNSUPPORTED|CHECKOUT_NAME_UNSUPPORTED|CHECKOUT_ALIAS_COLLISION|CHECKOUT_LIMIT|BLOB_LIMIT|TREE_LIMIT)/.test(detail) ? 'UNSUPPORTED_CHECKOUT_ENTRY'
       : detail.includes('WORKTREE_DIRTY') ? 'DIRTY_WORKTREE'
       : detail.includes('WORKTREE_HEAD_CHANGED') ? 'HEAD_CHANGED'
@@ -1106,7 +1110,7 @@ export class GitWorktreeService {
           targetIdentity!,
         );
         if (statusCheck.exitCode === 0) {
-          clean = statusCheck.stdout.trim() === '';
+          clean = statusCheck.stdout.trim() === '' && (!inspectionBoundary || await inspectionBoundary.isExactCheckout());
         }
       } catch (error) {
         if (error instanceof PathIdentityError) {

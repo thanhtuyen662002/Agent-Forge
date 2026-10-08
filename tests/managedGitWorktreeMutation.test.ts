@@ -3,8 +3,9 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { execFileSync } from 'node:child_process';
-import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { encodeCheckoutIndex, ManagedGitWorktreeMutation, parseCheckoutTree } from '../src/core/services/ManagedGitWorktreeMutation';
+import { WorktreeMutationBoundary } from '../src/core/services/WorktreeMutationBoundary';
 
 describe('immutable checkout tree admission', () => {
   const oid = 'a'.repeat(40);
@@ -32,10 +33,10 @@ describe.skipIf(process.platform !== 'win32')('real captured checkout and Git ad
   let root: string, repo: string, managed: string, git: string, sha: string;
   let mutation: ManagedGitWorktreeMutation | undefined;
   const digest = '1'.repeat(64), child = `afw-${digest.slice(0, 32)}`;
-  const bytes = Buffer.from([0, 10, 13, 255, 254, 192, 128, 0, 34, 36, 96]);
+  const bytes = Buffer.from(Array.from({ length: 20_003 }, (_, i) => (i * 37) % 256));
   let run: (args: string[], cwd?: string) => string;
   beforeEach(() => {
-    root = fs.realpathSync.native(fs.mkdtempSync(path.join(os.tmpdir(), 'af-captured-git-')));
+    root = fs.realpathSync.native(fs.mkdtempSync(path.join(os.tmpdir(), 'af-captured-git-À-🚀-')));
     repo = path.join(root, 'repo'); managed = path.join(root, 'managed');
     fs.mkdirSync(repo); fs.mkdirSync(managed);
     git = execFileSync('where.exe', ['git.exe'], { encoding: 'utf8', windowsHide: true }).trim().split(/\r?\n/)[0];
@@ -47,6 +48,7 @@ describe.skipIf(process.platform !== 'win32')('real captured checkout and Git ad
     fs.writeFileSync(path.join(repo, '.gitattributes'), 'nested/binary.bin export-ignore\nsubstitute.txt export-subst\n');
     fs.writeFileSync(path.join(repo, 'substitute.txt'), '$Format:%H$\n');
     fs.writeFileSync(path.join(repo, 'empty'), '');
+    fs.writeFileSync(path.join(repo, 'À-🚀.txt'), 'unicode fixture\n');
     run(['add', '.']); run(['-c', 'user.name=Fixture', '-c', 'user.email=fixture@example.invalid', 'commit', '--quiet', '-m', 'Fixture']);
     sha = run(['rev-parse', 'HEAD']).trim();
     // Fixture-only initialization. Production initialization is a pending
@@ -54,6 +56,7 @@ describe.skipIf(process.platform !== 'win32')('real captured checkout and Git ad
     fs.mkdirSync(path.join(repo, '.git', 'worktrees'));
   });
   afterEach(async () => {
+    vi.restoreAllMocks();
     await mutation?.close(); mutation = undefined;
     if (fs.realpathSync.native(root) !== root || !path.basename(root).startsWith('af-captured-git-')) throw new Error('FIXTURE_BOUNDARY_CHANGED');
     fs.rmSync(root, { recursive: true, force: true });
@@ -76,6 +79,9 @@ describe.skipIf(process.platform !== 'win32')('real captured checkout and Git ad
     expect(owner.ownershipDigest).toBe(digest);
     expect(owner.targetIdentity.fileId).toBe(fs.lstatSync(target, { bigint: true }).ino.toString());
     expect(owner.targetIdentity.volume).not.toBe('0');
+    const completed = JSON.parse(fs.readFileSync(path.join(repo, '.git', 'worktrees', child, 'agent-forge-complete.json'), 'utf8'));
+    expect(completed).toMatchObject({ version: 1, phase: 'MATERIALIZED', ownershipDigest: digest, baseSha: sha,
+      targetIdentity: owner.targetIdentity, adminIdentity: owner.adminIdentity });
     await mutation.rollbackCreated();
     expect(fs.existsSync(target)).toBe(false);
     expect(fs.existsSync(path.join(repo, '.git', 'worktrees', child))).toBe(false);
@@ -112,6 +118,61 @@ describe.skipIf(process.platform !== 'win32')('real captured checkout and Git ad
     await mutation.rollbackCreated();
   });
 
+  it('pins source identity before a replacement can select an unrelated Git administrative root', async () => {
+    const unrelated = path.join(root, 'unrelated-repository'); fs.mkdirSync(unrelated);
+    run(['init', '--quiet'], unrelated);
+    fs.writeFileSync(path.join(unrelated, 'sentinel'), 'unrelated-owner');
+    const acquire = WorktreeMutationBoundary.acquire.bind(WorktreeMutationBoundary);
+    let attempted = false, replacementDenied = false;
+    vi.spyOn(WorktreeMutationBoundary, 'acquire').mockImplementation(async (candidate, initialize) => {
+      const boundary = await acquire(candidate, initialize);
+      if (candidate === managed && !attempted) {
+        attempted = true;
+        try { fs.renameSync(repo, repo + '-original'); }
+        catch { replacementDenied = true; return boundary; }
+        fs.mkdirSync(repo);
+        fs.writeFileSync(path.join(repo, '.git'), `gitdir: ${path.join(unrelated, '.git').replace(/\\/g, '/')}\n`);
+      }
+      return boundary;
+    });
+    let denied: Error | null = null;
+    try { mutation = await ManagedGitWorktreeMutation.prepare({ gitExecutable: git, repositoryRoot: repo, managedRoot: managed }, child); }
+    catch (error) { denied = error as Error; }
+    expect(attempted).toBe(true);
+    if (!replacementDenied) expect(denied?.message).toBe('WORKTREE_SOURCE_IDENTITY_CHANGED');
+    expect(fs.existsSync(path.join(unrelated, '.git', 'worktrees'))).toBe(false);
+    expect(fs.readFileSync(path.join(unrelated, 'sentinel'), 'utf8')).toBe('unrelated-owner');
+    expect(fs.readFileSync(path.join(replacementDenied ? repo : repo + '-original', 'nested', 'binary.bin'))).toEqual(bytes);
+  });
+
+  it('does not initialize unrelated administration after a source commondir redirect', async () => {
+    const unrelated = path.join(root, 'unrelated-common-directory'); fs.mkdirSync(unrelated);
+    run(['init', '--quiet'], unrelated);
+    fs.writeFileSync(path.join(unrelated, 'sentinel'), 'unrelated-owner');
+    const acquire = WorktreeMutationBoundary.acquire.bind(WorktreeMutationBoundary);
+    vi.spyOn(WorktreeMutationBoundary, 'acquire').mockImplementation(async (candidate, initialize) => {
+      const boundary = await acquire(candidate, initialize);
+      if (candidate === managed) fs.writeFileSync(path.join(repo, '.git', 'commondir'), path.join(unrelated, '.git') + '\n');
+      return boundary;
+    });
+    try { mutation = await ManagedGitWorktreeMutation.prepare({ gitExecutable: git, repositoryRoot: repo, managedRoot: managed }, child); }
+    catch { /* Rejection is allowed; unrelated state must remain unchanged. */ }
+    expect(fs.existsSync(path.join(unrelated, '.git', 'worktrees'))).toBe(false);
+    expect(fs.readFileSync(path.join(unrelated, 'sentinel'), 'utf8')).toBe('unrelated-owner');
+    expect(fs.existsSync(path.join(managed, child))).toBe(false);
+  });
+
+  it('rejects a linked source Git pointer before mutation with typed unsupported layout', async () => {
+    const linked = path.join(root, 'linked-source');
+    run(['worktree', 'add', '--detach', linked, sha]);
+    const inventory = run(['worktree', 'list', '--porcelain']);
+    await expect(ManagedGitWorktreeMutation.prepare({ gitExecutable: git, repositoryRoot: linked, managedRoot: managed }, child))
+      .rejects.toThrow('WORKTREE_GIT_LAYOUT_UNSUPPORTED');
+    expect(fs.existsSync(path.join(managed, child))).toBe(false);
+    expect(run(['worktree', 'list', '--porcelain'])).toBe(inventory);
+    expect(run(['status', '--porcelain', '-uall'], linked).trim()).toBe('');
+  });
+
   it('captures both persisted native owner identities before independent Git checks and removes only those trees', async () => {
     mutation = await ManagedGitWorktreeMutation.prepare({ gitExecutable: git, repositoryRoot: repo, managedRoot: managed }, child);
     const target = await mutation.create(sha, digest);
@@ -120,6 +181,7 @@ describe.skipIf(process.platform !== 'win32')('real captured checkout and Git ad
     mutation = await ManagedGitWorktreeMutation.prepare({ gitExecutable: git, repositoryRoot: repo, managedRoot: managed }, child, false);
     await expect(mutation.removeOwned()).rejects.toThrow('NOT_ADMITTED');
     expect(await mutation.captureOwned(sha, digest)).toBe(target);
+    expect(await mutation.isExactCheckout()).toBe(true);
     expect(run(['rev-parse', 'HEAD'], target).trim()).toBe(sha);
     expect(run(['branch', '--show-current'], target).trim()).toBe('');
     expect(run(['status', '--porcelain', '-uall'], target).trim()).toBe('');
@@ -169,5 +231,39 @@ describe.skipIf(process.platform !== 'win32')('real captured checkout and Git ad
     await expect(mutation.removeOwned()).rejects.toThrow('WORKTREE_DIRTY');
     expect(fs.readFileSync(path.join(target, 'empty'), 'utf8')).toBe('dirty');
     expect(fs.existsSync(path.join(repo, '.git', 'worktrees', child, 'HEAD'))).toBe(true);
+  });
+
+  it('retains interrupted setup after helper exit with typed recovery evidence and no owner adoption', async () => {
+    mutation = await ManagedGitWorktreeMutation.prepare({ gitExecutable: git, repositoryRoot: repo, managedRoot: managed }, child);
+    const write = WorktreeMutationBoundary.prototype.writeNewFile;
+    vi.spyOn(WorktreeMutationBoundary.prototype, 'writeNewFile').mockImplementation(async function(this: WorktreeMutationBoundary, name, relative, contents) {
+      if (relative === '.git') throw new Error('SIMULATED_PRE_POINTER_EXIT');
+      return write.call(this, name, relative, contents);
+    });
+    await expect(mutation.create(sha, digest)).rejects.toThrow('SIMULATED_PRE_POINTER_EXIT');
+    await mutation.close(); vi.restoreAllMocks();
+    const target = path.join(managed, child);
+    const receiptPath = path.join(repo, '.git', 'worktrees', child, 'agent-forge-owner.json');
+    const receipt = fs.readFileSync(receiptPath, 'utf8');
+    mutation = await ManagedGitWorktreeMutation.prepare({ gitExecutable: git, repositoryRoot: repo, managedRoot: managed }, child, false);
+    await expect(mutation.captureOwned(sha, digest)).rejects.toThrow('WORKTREE_PARTIAL_SETUP_RETAINED');
+    await expect(mutation.removeOwned()).rejects.toThrow('NOT_ADMITTED');
+    expect(fs.readFileSync(path.join(target, 'nested', 'binary.bin'))).toEqual(bytes);
+    expect(fs.readFileSync(receiptPath, 'utf8')).toBe(receipt);
+    expect(fs.existsSync(path.join(target, '.git'))).toBe(false);
+  });
+
+  it('retains real dirty bytes hidden by provider-controlled Git index flags', async () => {
+    mutation = await ManagedGitWorktreeMutation.prepare({ gitExecutable: git, repositoryRoot: repo, managedRoot: managed }, child);
+    const target = await mutation.create(sha, digest); await mutation.close();
+    fs.writeFileSync(path.join(target, 'empty'), 'hidden-provider-change');
+    run(['update-index', '--assume-unchanged', 'empty'], target);
+    expect(run(['status', '--porcelain', '-uall'], target).trim()).toBe('');
+    mutation = await ManagedGitWorktreeMutation.prepare({ gitExecutable: git, repositoryRoot: repo, managedRoot: managed }, child, false);
+    await mutation.captureOwned(sha, digest);
+    expect(await mutation.isExactCheckout()).toBe(false);
+    await expect(mutation.removeOwned()).rejects.toThrow('WORKTREE_DIRTY');
+    expect(fs.readFileSync(path.join(target, 'empty'), 'utf8')).toBe('hidden-provider-change');
+    expect(fs.readFileSync(path.join(repo, '.git', 'worktrees', child, 'HEAD'), 'utf8').trim()).toBe(sha);
   });
 });
