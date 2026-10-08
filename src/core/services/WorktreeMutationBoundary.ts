@@ -1,16 +1,17 @@
 import { spawn, type ChildProcessWithoutNullStreams } from 'node:child_process';
 import fs from 'node:fs';
 import path from 'node:path';
-import { WINDOWS_DIRECTORY_BOUNDARY } from './worktreeBoundaryScripts';
+import { WINDOWS_DIRECTORY_BOOTSTRAP, WINDOWS_DIRECTORY_BOUNDARY } from './worktreeBoundaryScripts';
 
-interface NativeIdentity { volume: string; fileId: string }
-interface Response { ok: boolean; identity?: NativeIdentity; error?: string }
+export interface NativeIdentity { volume: string; fileId: string; created: string }
+interface Response { ok: boolean; identity?: NativeIdentity; error?: string; data?: string }
 
 /** Windows kernel primitives, awaiting complete Git/ownership integration. */
 export class WorktreeMutationBoundary {
   private buffer = '';
   private closed = false;
   private volume: string | null = null;
+  private readonly captured = new Map<string, NativeIdentity>();
   private pending: { resolve: (value: Response) => void; reject: (error: Error) => void; timer: NodeJS.Timeout } | null = null;
 
   private constructor(private readonly child: ChildProcessWithoutNullStreams, public readonly managedRoot: string) {
@@ -42,23 +43,30 @@ export class WorktreeMutationBoundary {
     child.stdin.on('error', () => this.abort('BOUNDARY_HELPER_FAILED'));
   }
 
-  public static async acquire(managedRoot: string): Promise<WorktreeMutationBoundary> {
+  public static async acquire(managedRoot: string, initialize = false): Promise<WorktreeMutationBoundary> {
     if (process.platform !== 'win32') throw new Error('UNSUPPORTED_MUTATION_BOUNDARY');
-    const root = fs.realpathSync.native(managedRoot);
-    if (root.toLowerCase() !== path.resolve(managedRoot).toLowerCase() || fs.lstatSync(managedRoot).isSymbolicLink()) {
+    const root = path.resolve(managedRoot);
+    if (!/^[a-z]:\\/i.test(root) || root.startsWith('\\\\')) throw new Error('UNSUPPORTED_MUTATION_BOUNDARY');
+    let anchor = root;
+    while (initialize && !fs.existsSync(anchor) && path.dirname(anchor) !== anchor) anchor = path.dirname(anchor);
+    if (fs.realpathSync.native(anchor).toLowerCase() !== anchor.toLowerCase() || fs.lstatSync(anchor).isSymbolicLink()) {
       throw new Error('BOUNDARY_ROOT_ALIAS_DENIED');
     }
-    const expected = fs.lstatSync(root, { bigint: true });
+    const expected = fs.lstatSync(anchor, { bigint: true });
     if (!expected.isDirectory() || expected.isSymbolicLink()) throw new Error('BOUNDARY_ROOT_DENIED');
     const executable = path.join(process.env.SystemRoot ?? 'C:\\Windows', 'System32', 'WindowsPowerShell', 'v1.0', 'powershell.exe');
     const child = spawn(executable, ['-NoLogo', '-NoProfile', '-NonInteractive', '-EncodedCommand',
-      Buffer.from(WINDOWS_DIRECTORY_BOUNDARY, 'utf16le').toString('base64')], { windowsHide: true, stdio: 'pipe' });
+      Buffer.from(WINDOWS_DIRECTORY_BOOTSTRAP, 'utf16le').toString('base64')], { windowsHide: true, stdio: 'pipe' });
     const boundary = new WorktreeMutationBoundary(child, root);
     try {
-      const response = await boundary.request({ root });
+      // A short trusted bootstrap avoids the Windows command-line size limit.
+      // The only executable source is this repository constant; later records
+      // are parsed as data by that source, never interpreted as shell text.
+      child.stdin.write(JSON.stringify(WINDOWS_DIRECTORY_BOUNDARY) + '\n');
+      const response = await boundary.request({ root, initialize: initialize ? '1' : '0' });
       boundary.verify(response.identity, root);
       boundary.volume = response.identity!.volume;
-      const actual = fs.lstatSync(root, { bigint: true });
+      const actual = fs.lstatSync(anchor, { bigint: true });
       if (expected.dev !== actual.dev || expected.ino !== actual.ino || expected.birthtimeNs !== actual.birthtimeNs) throw new Error('BOUNDARY_ROOT_IDENTITY_CHANGED');
       return boundary;
     } catch (error) { await boundary.close(); throw error; }
@@ -71,7 +79,7 @@ export class WorktreeMutationBoundary {
     // nonzero native volume serial and compare every child with that anchor;
     // independently match the exact BigInt file ID, never a rounded number.
     if (!actual.isDirectory() || actual.isSymbolicLink() || actual.ino === 0n ||
-        !/^\d+$/.test(identity.volume) || identity.volume === '0' ||
+        !/^\d+$/.test(identity.volume) || identity.volume === '0' || !/^\d+$/.test(identity.created) || identity.created === '0' ||
         (this.volume !== null && identity.volume !== this.volume) || identity.fileId !== actual.ino.toString()) {
       throw new Error('BOUNDARY_NATIVE_IDENTITY_MISMATCH');
     }
@@ -95,6 +103,7 @@ export class WorktreeMutationBoundary {
     const candidate = this.name(name);
     const result = await this.request({ op: 'reserve', name });
     this.verify(result.identity, candidate);
+    this.captured.set(name, result.identity!);
     return candidate;
   }
 
@@ -105,12 +114,65 @@ export class WorktreeMutationBoundary {
     this.verify(result.identity, candidate);
     const current = fs.lstatSync(candidate, { bigint: true });
     if (expected.dev !== current.dev || expected.ino !== current.ino) throw new Error('BOUNDARY_CHILD_IDENTITY_CHANGED');
+    this.captured.set(name, result.identity!);
     return candidate;
   }
 
   public async deleteEmptyChild(name: string): Promise<void> {
     this.name(name);
     await this.request({ op: 'delete-empty', name });
+    this.captured.delete(name);
+  }
+
+  public capturedIdentity(name: string): NativeIdentity {
+    this.name(name);
+    const identity = this.captured.get(name);
+    if (!identity || this.closed) throw new Error('BOUNDARY_CHILD_NOT_CAPTURED');
+    return { ...identity };
+  }
+
+  private relative(relative: string): void {
+    if (!relative || relative.length > 30_000 || relative.split('/').some(segment =>
+      !segment || segment === '.' || segment === '..' || /[\\:\x00-\x1f\x7f*?"<>|]/.test(segment) || /[. ]$/.test(segment))) {
+      throw new Error('BOUNDARY_SEGMENT_DENIED');
+    }
+  }
+
+  public async createDirectory(name: string, relative: string): Promise<void> {
+    this.name(name); this.relative(relative);
+    await this.request({ op: 'mkdir', name, path: relative });
+  }
+
+  public async writeNewFile(name: string, relative: string, contents: Uint8Array): Promise<void> {
+    this.name(name); this.relative(relative);
+    await this.request({ op: 'file', name, path: relative });
+    for (let offset = 0; offset < contents.byteLength; offset += 8192) {
+      await this.request({ op: 'append', name, path: relative,
+        data: Buffer.from(contents.subarray(offset, offset + 8192)).toString('base64') });
+    }
+    await this.request({ op: 'finish', name, path: relative, length: String(contents.byteLength) });
+  }
+
+  /** Freeze existing ordinary objects before independent owner/clean checks. */
+  public async sealTree(name: string): Promise<void> {
+    this.name(name);
+    await this.request({ op: 'seal', name });
+  }
+
+  public async readCapturedFile(name: string, relative: string): Promise<Buffer> {
+    this.name(name); this.relative(relative);
+    const response = await this.request({ op: 'read', name, path: relative });
+    if (typeof response.data !== 'string' || response.data.length > 10_924 || !/^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/.test(response.data)) {
+      throw new Error('BOUNDARY_CAPTURED_READ_INVALID');
+    }
+    return Buffer.from(response.data, 'base64');
+  }
+
+  /** Requires a sealed tree; never falls back to Git or recursive path removal. */
+  public async deleteCapturedTree(name: string): Promise<void> {
+    this.name(name);
+    await this.request({ op: 'delete-tree', name });
+    this.captured.delete(name);
   }
 
   private abort(code: string): void {
@@ -124,7 +186,9 @@ export class WorktreeMutationBoundary {
     const alreadyClosed = this.closed;
     this.closed = true;
     await new Promise<void>(resolve => {
-      const timeout = setTimeout(() => { this.child.kill(); resolve(); }, 5_000);
+      // A timeout requests termination; it is never evidence that admitted
+      // native mutation has stopped. Release only after the actual exit.
+      const timeout = setTimeout(() => { this.child.kill(); }, 5_000);
       this.child.once('exit', () => { clearTimeout(timeout); resolve(); });
       if (alreadyClosed) this.child.kill();
       else this.child.stdin.end(JSON.stringify({ op: 'close' }) + '\n');

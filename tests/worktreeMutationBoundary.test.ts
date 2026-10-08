@@ -1,9 +1,83 @@
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { execFileSync, spawnSync } from 'node:child_process';
+import { execFileSync, spawn, spawnSync } from 'node:child_process';
+import { createInterface } from 'node:readline';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { WorktreeMutationBoundary } from '../src/core/services/WorktreeMutationBoundary';
+import { WINDOWS_DIRECTORY_BOOTSTRAP, WINDOWS_DIRECTORY_BOUNDARY } from '../src/core/services/worktreeBoundaryScripts';
+
+const reparseProgram = String.raw`
+$ErrorActionPreference='Stop'
+try {
+Add-Type -TypeDefinition @'
+using System; using System.Runtime.InteropServices; using System.Text; using Microsoft.Win32.SafeHandles;
+public static class ReparseAttack {
+ [DllImport("kernel32.dll",CharSet=CharSet.Unicode,SetLastError=true)] static extern SafeFileHandle CreateFileW(string p,uint access,uint share,IntPtr security,uint disposition,uint flags,IntPtr template);
+ [DllImport("kernel32.dll",SetLastError=true)] static extern bool DeviceIoControl(SafeFileHandle h,uint code,byte[] input,int length,IntPtr output,int size,out int returned,IntPtr overlapped);
+ public static bool Try(string root,string outside,uint access) {
+  using(SafeFileHandle h=CreateFileW(root,access,7,IntPtr.Zero,3,0x02200000,IntPtr.Zero)) {
+   if(h.IsInvalid) return false;
+   string substitute="\\??\\"+outside;
+   byte[] paths=Encoding.Unicode.GetBytes(substitute+"\0"+outside+"\0");
+   byte[] bytes=new byte[16+paths.Length];
+   Array.Copy(BitConverter.GetBytes(0xa0000003u),0,bytes,0,4);
+   Array.Copy(BitConverter.GetBytes((ushort)(8+paths.Length)),0,bytes,4,2);
+   Array.Copy(BitConverter.GetBytes((ushort)(substitute.Length*2)),0,bytes,10,2);
+   Array.Copy(BitConverter.GetBytes((ushort)((substitute.Length+1)*2)),0,bytes,12,2);
+   Array.Copy(BitConverter.GetBytes((ushort)(outside.Length*2)),0,bytes,14,2);
+   Array.Copy(paths,0,bytes,16,paths.Length);
+   int returned; return DeviceIoControl(h,0x000900a4,bytes,bytes.Length,IntPtr.Zero,0,out returned,IntPtr.Zero);
+  }
+ }
+}
+'@
+$request=[Console]::ReadLine()|ConvertFrom-Json
+@{ writeData=[ReparseAttack]::Try($request.root,$request.outside,0x40000000); attributes=[ReparseAttack]::Try($request.root,$request.outside,0x100) }|ConvertTo-Json -Compress
+} catch { @{fixtureError='REPARSE_FIXTURE_FAILED'}|ConvertTo-Json -Compress }
+`;
+
+function convertReparse(target: string, outside: string): { writeData: boolean; attributes: boolean } {
+  const result = spawnSync(path.join(process.env.SystemRoot!, 'System32/WindowsPowerShell/v1.0/powershell.exe'),
+    ['-NoProfile', '-NonInteractive', '-EncodedCommand', Buffer.from(reparseProgram, 'utf16le').toString('base64')],
+    { windowsHide: true, encoding: 'utf8', input: JSON.stringify({ root: target, outside }) + '\n' });
+  if (result.status !== 0) throw new Error('REPARSE_FIXTURE_FAILED');
+  const observed = JSON.parse(result.stdout) as { writeData: boolean; attributes: boolean };
+  expect(observed.writeData).toBe(false);
+  expect(observed.attributes).toBe(true);
+  return observed;
+}
+
+async function nativeHarness(source: string, managed: string) {
+  const child = spawn(path.join(process.env.SystemRoot!, 'System32/WindowsPowerShell/v1.0/powershell.exe'),
+    ['-NoProfile', '-NonInteractive', '-EncodedCommand', Buffer.from(WINDOWS_DIRECTORY_BOOTSTRAP, 'utf16le').toString('base64')],
+    { windowsHide: true, stdio: 'pipe' });
+  child.stderr.resume();
+  const lines = createInterface({ input: child.stdout });
+  const request = (data: Record<string, string>) => new Promise<{ ok: boolean }>((resolve, reject) => {
+    const timer = setTimeout(() => { child.kill(); reject(new Error('NATIVE_FIXTURE_TIMEOUT')); }, 15_000);
+    lines.once('line', line => { clearTimeout(timer); resolve(JSON.parse(line)); });
+    child.stdin.write(JSON.stringify(data) + '\n');
+  });
+  child.stdin.write(JSON.stringify(source) + '\n');
+  expect((await request({ root: managed })).ok).toBe(true);
+  return { request, close: async () => {
+    if (child.exitCode !== null) return;
+    await new Promise<void>(resolve => {
+      const timer = setTimeout(() => child.kill(), 2000);
+      child.once('close', () => { clearTimeout(timer); lines.close(); resolve(); });
+      child.stdin.end(JSON.stringify({ op: 'close' }) + '\n');
+    });
+  } };
+}
+
+async function waitForFile(file: string): Promise<void> {
+  const deadline = Date.now() + 5000;
+  while (!fs.existsSync(file)) {
+    if (Date.now() > deadline) throw new Error('NATIVE_BARRIER_NOT_REACHED');
+    await new Promise(resolve => setTimeout(resolve, 10));
+  }
+}
 
 const childName = 'afw-' + '1'.repeat(32);
 describe('kernel worktree directory primitives (not complete service acceptance)', () => {
@@ -39,44 +113,70 @@ describe('kernel worktree directory primitives (not complete service acceptance)
       expect(fs.existsSync(managed)).toBe(true);
     });
 
+    it('keeps a relative create contained when an empty parent becomes a junction after the last check', async () => {
+      const marker = path.join(root, 'native-entered'), release = path.join(root, 'native-release');
+      const syscall = 'int result = NtCreateFile(out handle, access, ref attributes';
+      expect(WINDOWS_DIRECTORY_BOUNDARY.split(syscall)).toHaveLength(2);
+      const source = WINDOWS_DIRECTORY_BOUNDARY.replace(syscall,
+        `if (name == "escape" && create) { File.WriteAllText(${JSON.stringify(marker)}, "entered"); while (!File.Exists(${JSON.stringify(release)})) System.Threading.Thread.Sleep(5); }\n      ${syscall}`);
+      const outside = path.join(root, 'outside'); fs.mkdirSync(outside); fs.writeFileSync(path.join(outside, 'sentinel'), 'keep');
+      const harness = await nativeHarness(source, managed);
+      try {
+        expect((await harness.request({ op: 'reserve', name: childName })).ok).toBe(true);
+        expect((await harness.request({ op: 'mkdir', name: childName, path: 'nested' })).ok).toBe(true);
+        const creating = harness.request({ op: 'file', name: childName, path: 'nested/escape' });
+        await waitForFile(marker);
+        convertReparse(path.join(managed, childName, 'nested'), outside);
+        fs.writeFileSync(release, 'continue');
+        await creating;
+        expect(fs.readdirSync(outside)).toEqual(['sentinel']);
+        expect(fs.readFileSync(path.join(outside, 'sentinel'), 'utf8')).toBe('keep');
+      } finally {
+        fs.writeFileSync(release, 'continue'); await harness.close();
+      }
+    });
+
+    it('deletes only the captured empty object when it becomes a junction immediately before disposition', async () => {
+      const marker = path.join(root, 'native-entered'), release = path.join(root, 'native-release');
+      const syscall = 'if (!SetFileInformationByHandle(node.Handle, 21,';
+      expect(WINDOWS_DIRECTORY_BOUNDARY.split(syscall)).toHaveLength(2);
+      const source = WINDOWS_DIRECTORY_BOUNDARY.replace(syscall,
+        `File.WriteAllText(${JSON.stringify(marker)}, "entered"); while (!File.Exists(${JSON.stringify(release)})) System.Threading.Thread.Sleep(5);\n      ${syscall}`);
+      const outside = path.join(root, 'outside'); fs.mkdirSync(outside); fs.writeFileSync(path.join(outside, 'sentinel'), 'keep');
+      const harness = await nativeHarness(source, managed);
+      try {
+        expect((await harness.request({ op: 'reserve', name: childName })).ok).toBe(true);
+        expect((await harness.request({ op: 'seal', name: childName })).ok).toBe(true);
+        const deleting = harness.request({ op: 'delete-tree', name: childName });
+        await waitForFile(marker);
+        convertReparse(path.join(managed, childName), outside);
+        fs.writeFileSync(release, 'continue');
+        await deleting;
+        expect(fs.readdirSync(outside)).toEqual(['sentinel']);
+        expect(fs.readFileSync(path.join(outside, 'sentinel'), 'utf8')).toBe('keep');
+      } finally { fs.writeFileSync(release, 'continue'); await harness.close(); }
+    });
+
+    it('initializes missing parent segments through ordinary captured ancestors and rejects an alias in the chain', async () => {
+      await boundary!.close(); boundary = undefined;
+      const missing = path.join(root, 'new-parent', 'new-root');
+      const initialized = await WorktreeMutationBoundary.acquire(missing, true);
+      try {
+        expect(fs.lstatSync(missing).isDirectory()).toBe(true);
+        expect(() => fs.renameSync(path.dirname(missing), path.dirname(missing) + '-moved')).toThrow();
+      } finally { await initialized.close(); }
+      const outside = path.join(root, 'outside'); fs.mkdirSync(outside); fs.writeFileSync(path.join(outside, 'sentinel'), 'keep');
+      const alias = path.join(root, 'alias'); fs.symlinkSync(outside, alias, 'junction');
+      try {
+        await expect(WorktreeMutationBoundary.acquire(path.join(alias, 'new-root'), true)).rejects.toThrow();
+        expect(fs.readdirSync(outside)).toEqual(['sentinel']);
+      } finally { fs.unlinkSync(alias); }
+    });
+
     it('fences relative mutation after attributes-only reparse conversion, which sharing pins cannot prevent', async () => {
       const outside = path.join(root, 'outside'); fs.mkdirSync(outside);
       fs.writeFileSync(path.join(outside, 'sentinel'), 'keep');
-      const program = String.raw`
-$ErrorActionPreference='Stop'
-try {
-Add-Type -TypeDefinition @'
-using System; using System.Runtime.InteropServices; using System.Text; using Microsoft.Win32.SafeHandles;
-public static class ReparseAttack {
- [DllImport("kernel32.dll",CharSet=CharSet.Unicode,SetLastError=true)] static extern SafeFileHandle CreateFileW(string p,uint access,uint share,IntPtr security,uint disposition,uint flags,IntPtr template);
- [DllImport("kernel32.dll",SetLastError=true)] static extern bool DeviceIoControl(SafeFileHandle h,uint code,byte[] input,int length,IntPtr output,int size,out int returned,IntPtr overlapped);
- public static bool Try(string root,string outside,uint access) {
-  using(SafeFileHandle h=CreateFileW(root,access,7,IntPtr.Zero,3,0x02200000,IntPtr.Zero)) {
-   if(h.IsInvalid) return false;
-   string substitute="\\??\\"+outside;
-   byte[] paths=Encoding.Unicode.GetBytes(substitute+"\0"+outside+"\0");
-   byte[] bytes=new byte[16+paths.Length];
-   Array.Copy(BitConverter.GetBytes(0xa0000003u),0,bytes,0,4);
-   Array.Copy(BitConverter.GetBytes((ushort)(8+paths.Length)),0,bytes,4,2);
-   Array.Copy(BitConverter.GetBytes((ushort)(substitute.Length*2)),0,bytes,10,2);
-   Array.Copy(BitConverter.GetBytes((ushort)((substitute.Length+1)*2)),0,bytes,12,2);
-   Array.Copy(BitConverter.GetBytes((ushort)(outside.Length*2)),0,bytes,14,2);
-   Array.Copy(paths,0,bytes,16,paths.Length);
-   int returned; return DeviceIoControl(h,0x000900a4,bytes,bytes.Length,IntPtr.Zero,0,out returned,IntPtr.Zero);
-  }
- }
-}
-'@
-$request=[Console]::ReadLine()|ConvertFrom-Json
-@{ writeData=[ReparseAttack]::Try($request.root,$request.outside,0x40000000); attributes=[ReparseAttack]::Try($request.root,$request.outside,0x100) }|ConvertTo-Json -Compress
-} catch { @{fixtureError=$_.Exception.Message}|ConvertTo-Json -Compress }
-`;
-      const result = spawnSync(path.join(process.env.SystemRoot!, 'System32/WindowsPowerShell/v1.0/powershell.exe'),
-        ['-NoProfile', '-NonInteractive', '-EncodedCommand', Buffer.from(program, 'utf16le').toString('base64')],
-        { windowsHide: true, encoding: 'utf8', input: JSON.stringify({ root: managed, outside }) + '\n' });
-      if (result.status !== 0) throw new Error('REPARSE_FIXTURE_FAILED: ' + String(result.stderr).replace(/<[^>]*>|#< CLIXML/g, '').slice(0, 1200));
-      const observed = JSON.parse(result.stdout) as { writeData: boolean; attributes: boolean };
-      expect(observed.writeData).toBe(false);
+      const observed = convertReparse(managed, outside);
       if (observed.attributes) {
         expect(fs.lstatSync(managed).isSymbolicLink()).toBe(true);
         await expect(boundary!.reserveChild(childName)).rejects.toThrow();
@@ -116,6 +216,71 @@ $request=[Console]::ReadLine()|ConvertFrom-Json
       expect(() => fs.renameSync(candidate, candidate + '-moved')).toThrow();
       await boundary!.deleteEmptyChild(childName);
       expect(fs.existsSync(candidate)).toBe(false);
+    });
+
+    it('writes binary and empty files through captured parents, then removes a sealed tree by handle', async () => {
+      const candidate = await boundary!.reserveChild(childName);
+      await boundary!.createDirectory(childName, 'nested');
+      await boundary!.createDirectory(childName, 'nested/deeper');
+      const bytes = Buffer.alloc(24_577);
+      for (let i = 0; i < bytes.length; i++) bytes[i] = i % 256;
+      await boundary!.writeNewFile(childName, 'nested/deeper/binary.bin', bytes);
+      await boundary!.writeNewFile(childName, 'empty', Buffer.alloc(0));
+      expect(fs.readFileSync(path.join(candidate, 'nested/deeper/binary.bin'))).toEqual(bytes);
+      expect(fs.statSync(path.join(candidate, 'empty')).size).toBe(0);
+      expect(() => fs.renameSync(path.join(candidate, 'nested'), path.join(candidate, 'moved'))).toThrow();
+      expect(() => fs.writeFileSync(path.join(candidate, 'empty'), 'changed')).toThrow();
+      await expect(boundary!.deleteCapturedTree(childName)).rejects.toThrow();
+      expect(fs.existsSync(candidate)).toBe(true);
+      await boundary!.sealTree(childName);
+      await expect(boundary!.writeNewFile(childName, 'late', Buffer.from('late'))).rejects.toThrow();
+      await boundary!.deleteCapturedTree(childName);
+      expect(fs.existsSync(candidate)).toBe(false);
+      expect(fs.existsSync(managed)).toBe(true);
+    });
+
+    it('captures existing nested files before deletion and preserves an outside read-only hardlink', async () => {
+      const candidate = path.join(managed, childName); fs.mkdirSync(candidate);
+      const outside = path.join(root, 'outside-sentinel'); fs.writeFileSync(outside, 'keep');
+      fs.mkdirSync(path.join(candidate, 'nested'));
+      fs.linkSync(outside, path.join(candidate, 'nested', 'linked'));
+      fs.chmodSync(outside, 0o444);
+      try {
+        await boundary!.captureChild(childName);
+        await boundary!.sealTree(childName);
+        expect(() => fs.writeFileSync(path.join(candidate, 'nested', 'linked'), 'changed')).toThrow();
+        expect(() => fs.renameSync(path.join(candidate, 'nested'), path.join(candidate, 'moved'))).toThrow();
+        await boundary!.deleteCapturedTree(childName);
+        expect(fs.existsSync(candidate)).toBe(false);
+        expect(fs.readFileSync(outside, 'utf8')).toBe('keep');
+        expect(fs.statSync(outside).nlink).toBe(1);
+        expect(fs.statSync(outside).mode & 0o200).toBe(0);
+      } finally { fs.chmodSync(outside, 0o666); }
+    });
+
+    it('denies nested reparse traversal before any captured tree deletion', async () => {
+      const candidate = path.join(managed, childName); fs.mkdirSync(candidate);
+      const outside = path.join(root, 'outside'); fs.mkdirSync(outside);
+      fs.writeFileSync(path.join(outside, 'sentinel'), 'keep');
+      fs.writeFileSync(path.join(candidate, 'owned'), 'owned');
+      fs.symlinkSync(outside, path.join(candidate, 'nested'), 'junction');
+      try {
+        await boundary!.captureChild(childName);
+        await expect(boundary!.sealTree(childName)).rejects.toThrow();
+        await expect(boundary!.deleteCapturedTree(childName)).rejects.toThrow();
+        expect(fs.readFileSync(path.join(candidate, 'owned'), 'utf8')).toBe('owned');
+        expect(fs.readFileSync(path.join(outside, 'sentinel'), 'utf8')).toBe('keep');
+      } finally { await boundary!.close(); fs.unlinkSync(path.join(candidate, 'nested')); }
+    });
+
+    it('rejects nested alias names and existing-file writes without overwriting an owned sentinel', async () => {
+      const candidate = await boundary!.reserveChild(childName);
+      await boundary!.writeNewFile(childName, 'sentinel', Buffer.from('keep'));
+      for (const relative of ['../outside', 'nested/../outside', 'C:/outside', 'nested\\outside', 'NUL', 'file:stream', 'trail.', 'trail ']) {
+        await expect(boundary!.writeNewFile(childName, relative, Buffer.from('changed'))).rejects.toThrow();
+      }
+      await expect(boundary!.writeNewFile(childName, 'sentinel', Buffer.from('changed'))).rejects.toThrow();
+      expect(fs.readFileSync(path.join(candidate, 'sentinel'), 'utf8')).toBe('keep');
     });
 
     it('rejects an existing junction without touching its outside sentinel', async () => {

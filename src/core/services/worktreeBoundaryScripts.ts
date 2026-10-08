@@ -2,6 +2,12 @@
 // Paths and commands arrive as JSON on stdin, never as executable shell text.
 // These are kernel primitives; the service must also fence Git metadata and
 // ownership before admitting a complete worktree mutation.
+export const WINDOWS_DIRECTORY_BOOTSTRAP = String.raw`
+$ErrorActionPreference = 'Stop'
+$source = [Console]::ReadLine() | ConvertFrom-Json
+& ([scriptblock]::Create([string]$source))
+`;
+
 export const WINDOWS_DIRECTORY_BOUNDARY = String.raw`
 $ErrorActionPreference = 'Stop'
 $ProgressPreference = 'SilentlyContinue'
@@ -34,11 +40,32 @@ public sealed class AgentForgeDirectoryPins : IDisposable {
   [DllImport("ntdll.dll")]
   static extern int NtCreateFile(out SafeFileHandle handle, uint access, ref ObjectAttributes attributes, out IoStatus status,
     IntPtr allocation, uint fileAttributes, uint share, uint disposition, uint options, IntPtr ea, uint eaLength);
+  [DllImport("ntdll.dll")]
+  static extern int NtQueryDirectoryFile(SafeFileHandle handle, IntPtr evt, IntPtr apc, IntPtr context,
+    out IoStatus status, IntPtr data, uint length, int kind, [MarshalAs(UnmanagedType.U1)] bool single,
+    IntPtr filter, [MarshalAs(UnmanagedType.U1)] bool restart);
+  [DllImport("kernel32.dll", SetLastError=true)]
+  static extern bool WriteFile(SafeFileHandle handle, byte[] data, uint length, out uint written, IntPtr overlapped);
+  [DllImport("kernel32.dll", SetLastError=true)]
+  static extern bool ReadFile(SafeFileHandle handle, byte[] data, uint length, out uint read, IntPtr overlapped);
+  [DllImport("kernel32.dll", SetLastError=true)]
+  static extern bool SetFilePointerEx(SafeFileHandle handle, long distance, out long position, uint method);
+  [DllImport("kernel32.dll", SetLastError=true)] static extern bool FlushFileBuffers(SafeFileHandle handle);
 
   readonly Dictionary<string, SafeFileHandle> ancestors = new Dictionary<string, SafeFileHandle>(StringComparer.OrdinalIgnoreCase);
   readonly Dictionary<string, SafeFileHandle> children = new Dictionary<string, SafeFileHandle>(StringComparer.Ordinal);
+  sealed class Node {
+    public SafeFileHandle Handle;
+    public FileInfo Captured;
+    public string Key, Name, Parent;
+    public bool Directory, Writable;
+    public long Written;
+  }
+  readonly Dictionary<string, Node> nodes = new Dictionary<string, Node>(StringComparer.OrdinalIgnoreCase);
+  readonly HashSet<string> sealedTrees = new HashSet<string>(StringComparer.Ordinal);
+  const int MaxNodes = 65536;
   readonly string root;
-  public AgentForgeDirectoryPins(string managedRoot) {
+  public AgentForgeDirectoryPins(string managedRoot, bool initialize) {
     root = Path.GetFullPath(managedRoot).TrimEnd('\\');
     if (root.Length < 4 || root[1] != ':' || root.StartsWith("\\\\") || root.IndexOf(':',2) >= 0)
       throw new IOException("UNSUPPORTED_MUTATION_BOUNDARY");
@@ -46,8 +73,15 @@ public sealed class AgentForgeDirectoryPins : IDisposable {
       string current = Path.GetPathRoot(root);
       PinAncestor(current);
       foreach (string part in root.Substring(current.Length).Split('\\')) {
-        current = Path.Combine(current, part);
-        PinAncestor(current);
+        SafeFileHandle parent = ancestors[current];
+        string next = Path.Combine(current, part);
+        SafeFileHandle handle = null;
+        try {
+          try { handle = Relative(parent, part, true, false, false, false); }
+          catch { if (!initialize) throw; handle = Relative(parent, part, true, true, false, false); }
+          Identity(handle, next); ancestors.Add(next, handle); handle = null;
+        } finally { if (handle != null) handle.Dispose(); }
+        current = next;
       }
     } catch { Dispose(); throw; }
   }
@@ -78,7 +112,8 @@ public sealed class AgentForgeDirectoryPins : IDisposable {
     if (final.StartsWith("\\\\?\\")) final = final.Substring(4);
     if (!String.Equals(final.TrimEnd('\\'), Path.GetFullPath(expected).TrimEnd('\\'), StringComparison.OrdinalIgnoreCase))
       throw new IOException("BOUNDARY_PATH_IDENTITY_CHANGED");
-    return new { volume = info.Volume.ToString(), fileId = (((ulong)info.IndexHigh << 32) | info.IndexLow).ToString() };
+    return new { volume = info.Volume.ToString(), fileId = (((ulong)info.IndexHigh << 32) | info.IndexLow).ToString(),
+      created = (((ulong)info.Created.High << 32) | info.Created.Low).ToString() };
   }
   public object RootIdentity() { return Identity(ancestors[root], root); }
   static void Name(string name) {
@@ -106,6 +141,7 @@ public sealed class AgentForgeDirectoryPins : IDisposable {
       if (result < 0 || handle == null || handle.IsInvalid) throw new IOException("BOUNDARY_CHILD_OPEN_DENIED");
       object identity = Identity(handle, Path.Combine(root, name));
       children.Add(name, handle); handle = null;
+      nodes.Add(name, new Node { Handle = children[name], Captured = Check(children[name]), Key = name, Name = name, Directory = true });
       return identity;
     } finally {
       if (handle != null) handle.Dispose();
@@ -125,6 +161,7 @@ public sealed class AgentForgeDirectoryPins : IDisposable {
     // reacquires DELETE access and matches the original native identity before
     // any destructive call. An intervening replacement is never deleted.
     children.Remove(name); handle.Dispose();
+    nodes.Remove(name);
     OpenChild(name, false, true);
     handle = children[name];
     FileInfo current = Check(handle);
@@ -135,9 +172,218 @@ public sealed class AgentForgeDirectoryPins : IDisposable {
     // nonempty directory; no recursive/path-based fallback is permitted.
     if (!SetFileInformationByHandle(handle, 4, new byte[] { 1 }, 1)) throw new IOException("BOUNDARY_CHILD_DELETE_DENIED");
     children.Remove(name); handle.Dispose();
+    nodes.Remove(name);
+  }
+
+  static void Segment(string value) {
+    if (String.IsNullOrEmpty(value) || value.Length > 255 || value == "." || value == ".." ||
+        value.EndsWith(".") || value.EndsWith(" ") || value.IndexOfAny(new char[] {'\\','/',':','*','?','"','<','>','|'}) >= 0)
+      throw new IOException("BOUNDARY_SEGMENT_DENIED");
+    foreach (char c in value) if (c < 32 || c == 127) throw new IOException("BOUNDARY_SEGMENT_DENIED");
+    string stem = value.Split('.')[0].ToUpperInvariant();
+    if (stem == "CON" || stem == "PRN" || stem == "AUX" || stem == "NUL" ||
+        System.Text.RegularExpressions.Regex.IsMatch(stem, "\\A(COM|LPT)[0-9¹²³]\\z"))
+      throw new IOException("BOUNDARY_SEGMENT_DENIED");
+  }
+  static FileInfo ObjectInfo(SafeFileHandle handle, bool directory) {
+    FileInfo info;
+    if (!GetFileInformationByHandle(handle, out info) || (info.Attributes & 0x400) != 0 ||
+        ((info.Attributes & 0x10) != 0) != directory || info.Volume == 0 || (info.IndexHigh == 0 && info.IndexLow == 0))
+      throw new IOException("BOUNDARY_REPARSE_OR_IDENTITY_DENIED");
+    return info;
+  }
+  static bool Same(FileInfo a, FileInfo b) {
+    return a.Volume == b.Volume && a.IndexHigh == b.IndexHigh && a.IndexLow == b.IndexLow &&
+      a.Created.Low == b.Created.Low && a.Created.High == b.Created.High;
+  }
+  static SafeFileHandle Relative(SafeFileHandle parent, string name, bool directory, bool create, bool deleting, bool writable) {
+    Segment(name);
+    IntPtr buffer = IntPtr.Zero, unicode = IntPtr.Zero;
+    SafeFileHandle handle = null;
+    try {
+      buffer = Marshal.StringToHGlobalUni(name);
+      UnicodeString value = new UnicodeString { Length = checked((ushort)(name.Length*2)), MaximumLength = checked((ushort)((name.Length+1)*2)), Buffer = buffer };
+      unicode = Marshal.AllocHGlobal(Marshal.SizeOf(typeof(UnicodeString)));
+      Marshal.StructureToPtr(value, unicode, false);
+      ObjectAttributes attributes = new ObjectAttributes { Length = Marshal.SizeOf(typeof(ObjectAttributes)), Root = parent.DangerousGetHandle(), Name = unicode, Attributes = 0x40 };
+      IoStatus status;
+      uint access = 0x100081u | (deleting ? 0x10000u : 0u) | (writable ? 0x2u : 0u);
+      int result = NtCreateFile(out handle, access, ref attributes, out status, IntPtr.Zero,
+        directory ? 0x10u : 0x80u, 1, create ? 2u : 1u, 0x200020u | (directory ? 1u : 0x40u), IntPtr.Zero, 0);
+      if (result < 0 || handle == null || handle.IsInvalid) throw new IOException("BOUNDARY_OBJECT_OPEN_DENIED");
+      ObjectInfo(handle, directory);
+      SafeFileHandle answer = handle; handle = null; return answer;
+    } finally {
+      if (handle != null) handle.Dispose();
+      if (unicode != IntPtr.Zero) Marshal.FreeHGlobal(unicode);
+      if (buffer != IntPtr.Zero) Marshal.FreeHGlobal(buffer);
+    }
+  }
+  Node Top(string child) {
+    Name(child); RootIdentity();
+    Node top;
+    if (!nodes.TryGetValue(child, out top) || !children.ContainsKey(child)) throw new IOException("BOUNDARY_CHILD_NOT_CAPTURED");
+    if (!Same(top.Captured, ObjectInfo(top.Handle, true))) throw new IOException("BOUNDARY_CHILD_IDENTITY_CHANGED");
+    return top;
+  }
+  string Key(string child, string relative) {
+    Top(child);
+    if (String.IsNullOrEmpty(relative) || relative.Length > 30000) throw new IOException("BOUNDARY_SEGMENT_DENIED");
+    foreach (string part in relative.Split('/')) Segment(part);
+    return child + "/" + relative;
+  }
+  Node Parent(string key) {
+    int split = key.LastIndexOf('/');
+    Node parent;
+    if (split < 0 || !nodes.TryGetValue(key.Substring(0, split), out parent) || !parent.Directory ||
+        !Same(parent.Captured, ObjectInfo(parent.Handle, true))) throw new IOException("BOUNDARY_PARENT_NOT_CAPTURED");
+    return parent;
+  }
+  Node Add(string key, Node parent, string name, bool directory, bool create) {
+    if (nodes.Count >= MaxNodes || nodes.ContainsKey(key)) throw new IOException("BOUNDARY_OBJECT_ALREADY_CAPTURED_OR_LIMIT");
+    SafeFileHandle handle = Relative(parent.Handle, name, directory, create, false, create && !directory);
+    try {
+      Node node = new Node { Handle = handle, Captured = ObjectInfo(handle, directory), Key = key,
+        Parent = parent.Key, Name = name, Directory = directory, Writable = create && !directory };
+      if (node.Captured.Volume != parent.Captured.Volume) throw new IOException("BOUNDARY_VOLUME_CHANGED");
+      nodes.Add(key, node); handle = null; return node;
+    } finally { if (handle != null) handle.Dispose(); }
+  }
+  public void CreateObject(string child, string relative, bool directory) {
+    string key = Key(child, relative);
+    if (sealedTrees.Contains(child)) throw new IOException("BOUNDARY_TREE_SEALED");
+    Node parent = Parent(key);
+    Add(key, parent, key.Substring(key.LastIndexOf('/')+1), directory, true);
+  }
+  public void Append(string child, string relative, string encoded) {
+    string key = Key(child, relative); Node node;
+    if (!nodes.TryGetValue(key, out node) || node.Directory || !node.Writable || sealedTrees.Contains(child))
+      throw new IOException("BOUNDARY_FILE_NOT_CREATED");
+    ObjectInfo(node.Handle, false);
+    if (encoded == null || encoded.Length > 12000) throw new IOException("BOUNDARY_WRITE_LIMIT");
+    byte[] data = Convert.FromBase64String(encoded);
+    uint written;
+    if (data.Length > 8192 || !WriteFile(node.Handle, data, (uint)data.Length, out written, IntPtr.Zero) || written != data.Length)
+      throw new IOException("BOUNDARY_FILE_WRITE_DENIED");
+    node.Written += data.Length;
+  }
+  public void Finish(string child, string relative, long expected) {
+    string key = Key(child, relative); Node node;
+    if (!nodes.TryGetValue(key, out node) || !node.Writable || node.Written != expected || !FlushFileBuffers(node.Handle))
+      throw new IOException("BOUNDARY_FILE_INCOMPLETE");
+    FileInfo captured = ObjectInfo(node.Handle, false);
+    node.Handle.Dispose(); node.Handle = null;
+    node.Handle = Relative(nodes[node.Parent].Handle, node.Name, false, false, false, false);
+    if (!Same(captured, ObjectInfo(node.Handle, false))) throw new IOException("BOUNDARY_FILE_IDENTITY_CHANGED");
+    node.Writable = false;
+  }
+  List<string> Names(SafeFileHandle handle) {
+    List<string> names = new List<string>();
+    IntPtr buffer = Marshal.AllocHGlobal(65536);
+    try {
+      bool restart = true;
+      for (;;) {
+        IoStatus status;
+        // FileDirectoryInformation: filename length at byte 60, UTF-16 name
+        // at byte 64. This enumerates the captured object, never a path alias.
+        int result = NtQueryDirectoryFile(handle, IntPtr.Zero, IntPtr.Zero, IntPtr.Zero, out status,
+          buffer, 65536, 1, false, IntPtr.Zero, restart);
+        restart = false;
+        if (result == unchecked((int)0x80000006)) break;
+        long bytes = status.Information.ToInt64();
+        if (result < 0 || bytes < 64 || bytes > 65536) throw new IOException("BOUNDARY_ENUMERATION_DENIED");
+        int offset = 0;
+        for (;;) {
+          if (offset < 0 || offset+64 > bytes) throw new IOException("BOUNDARY_ENUMERATION_INVALID");
+          int next = Marshal.ReadInt32(buffer, offset), length = Marshal.ReadInt32(buffer, offset+60);
+          if (length < 0 || length > 510 || (length & 1) != 0 || offset+64+length > bytes)
+            throw new IOException("BOUNDARY_ENUMERATION_INVALID");
+          string name = Marshal.PtrToStringUni(IntPtr.Add(buffer, offset+64), length/2);
+          if (name != "." && name != "..") { Segment(name); names.Add(name); }
+          if (names.Count > MaxNodes) throw new IOException("BOUNDARY_TREE_LIMIT");
+          if (next == 0) break;
+          if (next < 64 || offset+next >= bytes) throw new IOException("BOUNDARY_ENUMERATION_INVALID");
+          offset += next;
+        }
+      }
+      return names;
+    } finally { Marshal.FreeHGlobal(buffer); }
+  }
+  void CaptureDescendants(Node parent, int depth) {
+    if (depth > 256) throw new IOException("BOUNDARY_DEPTH_LIMIT");
+    foreach (string name in Names(parent.Handle)) {
+      string key = parent.Key + "/" + name; Node node;
+      if (!nodes.TryGetValue(key, out node)) {
+        // Determine type with a no-follow handle. A failed directory open may
+        // be a regular file, but neither attempt follows a reparse point.
+        try { node = Add(key, parent, name, true, false); }
+        catch { node = Add(key, parent, name, false, false); }
+      }
+      if (!Same(node.Captured, ObjectInfo(node.Handle, node.Directory)) || node.Writable)
+        throw new IOException("BOUNDARY_OBJECT_IDENTITY_CHANGED");
+      if (node.Directory) CaptureDescendants(node, depth+1);
+    }
+  }
+  public void SealTree(string child) {
+    Node top = Top(child);
+    CaptureDescendants(top, 0);
+    sealedTrees.Add(child);
+  }
+  public string ReadCaptured(string child, string relative) {
+    string key = Key(child, relative); Node node;
+    if (!sealedTrees.Contains(child) || !nodes.TryGetValue(key, out node) || node.Directory || node.Writable)
+      throw new IOException("BOUNDARY_READ_NOT_CAPTURED");
+    FileInfo info = ObjectInfo(node.Handle, false);
+    if (!Same(node.Captured, info) || info.SizeHigh != 0 || info.SizeLow > 8192) throw new IOException("BOUNDARY_READ_LIMIT_OR_IDENTITY");
+    byte[] data = new byte[info.SizeLow]; uint read; long position;
+    if (!SetFilePointerEx(node.Handle, 0, out position, 0) ||
+        !ReadFile(node.Handle, data, info.SizeLow, out read, IntPtr.Zero) || read != info.SizeLow)
+      throw new IOException("BOUNDARY_CAPTURED_READ_DENIED");
+    if (!Same(info, ObjectInfo(node.Handle, false))) throw new IOException("BOUNDARY_READ_IDENTITY_CHANGED");
+    return Convert.ToBase64String(data);
+  }
+  public void DeleteTree(string child) {
+    Node top = Top(child);
+    if (!sealedTrees.Contains(child)) throw new IOException("BOUNDARY_TREE_NOT_SEALED");
+    List<Node> tree = new List<Node>();
+    foreach (Node node in nodes.Values) if (node.Key == child || node.Key.StartsWith(child + "/", StringComparison.OrdinalIgnoreCase)) tree.Add(node);
+    tree.Sort((a,b) => a.Key.Length.CompareTo(b.Key.Length));
+    Dictionary<string, HashSet<string>> membership = new Dictionary<string, HashSet<string>>(StringComparer.OrdinalIgnoreCase);
+    foreach (Node node in tree) if (node.Directory) membership.Add(node.Key, new HashSet<string>(StringComparer.OrdinalIgnoreCase));
+    foreach (Node node in tree) if (node.Parent != null) membership[node.Parent].Add(node.Name);
+    Action checkMembership = () => {
+      foreach (Node node in tree) if (node.Directory) {
+        if (!membership[node.Key].SetEquals(Names(node.Handle))) throw new IOException("BOUNDARY_TREE_MEMBERSHIP_CHANGED");
+      }
+    };
+    checkMembership();
+    // Acquire and compare every DELETE handle before deleting any object.
+    // Failure leaves a fenced tree; replacements are never deleted.
+    foreach (Node node in tree) {
+      FileInfo expected = ObjectInfo(node.Handle, node.Directory);
+      node.Handle.Dispose(); node.Handle = null;
+      SafeFileHandle parent = node.Parent == null ? ancestors[root] : nodes[node.Parent].Handle;
+      node.Handle = Relative(parent, node.Name, node.Directory, false, true, false);
+      if (node.Parent == null) children[child] = node.Handle;
+      if (!Same(expected, ObjectInfo(node.Handle, node.Directory)) || !Same(node.Captured, expected))
+        throw new IOException("BOUNDARY_DELETE_IDENTITY_CHANGED");
+    }
+    foreach (Node node in tree) ObjectInfo(node.Handle, node.Directory);
+    checkMembership();
+    // Child-first captured-handle disposition cannot follow even a reparse
+    // conversion occurring after the final check. New children cause the
+    // directory disposition to fail, never a recursive path fallback.
+    for (int i=tree.Count-1;i>=0;i--) {
+      Node node = tree[i];
+      if (!SetFileInformationByHandle(node.Handle, 21, BitConverter.GetBytes(0x11u), 4))
+        throw new IOException("BOUNDARY_CAPTURED_DELETE_DENIED");
+      node.Handle.Dispose(); nodes.Remove(node.Key);
+      if (node.Parent == null) children.Remove(child);
+    }
+    sealedTrees.Remove(child);
   }
   public void Dispose() {
-    foreach (SafeFileHandle handle in children.Values) handle.Dispose(); children.Clear();
+    foreach (Node node in nodes.Values) if (node.Handle != null) node.Handle.Dispose(); nodes.Clear(); children.Clear();
     List<SafeFileHandle> values = new List<SafeFileHandle>(ancestors.Values);
     for (int i=values.Count-1;i>=0;i--) values[i].Dispose(); ancestors.Clear();
   }
@@ -146,17 +392,25 @@ public sealed class AgentForgeDirectoryPins : IDisposable {
 $pins = $null
 try {
   $first = [Console]::ReadLine() | ConvertFrom-Json
-  $pins = [AgentForgeDirectoryPins]::new([string]$first.root)
+  $pins = [AgentForgeDirectoryPins]::new([string]$first.root, ($first.initialize -eq '1'))
   @{ ok = $true; identity = $pins.RootIdentity() } | ConvertTo-Json -Compress -Depth 5
   while ($null -ne ($line = [Console]::ReadLine())) {
     try {
       $request = $line | ConvertFrom-Json
+      $data = $null
       if ($request.op -eq 'close') { break }
       if ($request.op -eq 'reserve') { $identity = $pins.Child([string]$request.name, $true) }
       elseif ($request.op -eq 'capture') { $identity = $pins.Child([string]$request.name, $false) }
       elseif ($request.op -eq 'delete-empty') { $pins.DeleteEmptyChild([string]$request.name); $identity = $null }
+      elseif ($request.op -eq 'mkdir') { $pins.CreateObject([string]$request.name, [string]$request.path, $true); $identity = $null }
+      elseif ($request.op -eq 'file') { $pins.CreateObject([string]$request.name, [string]$request.path, $false); $identity = $null }
+      elseif ($request.op -eq 'append') { $pins.Append([string]$request.name, [string]$request.path, [string]$request.data); $identity = $null }
+      elseif ($request.op -eq 'finish') { $pins.Finish([string]$request.name, [string]$request.path, [long]$request.length); $identity = $null }
+      elseif ($request.op -eq 'seal') { $pins.SealTree([string]$request.name); $identity = $null }
+      elseif ($request.op -eq 'delete-tree') { $pins.DeleteTree([string]$request.name); $identity = $null }
+      elseif ($request.op -eq 'read') { $data = $pins.ReadCaptured([string]$request.name, [string]$request.path); $identity = $null }
       else { throw 'BOUNDARY_COMMAND_DENIED' }
-      @{ ok = $true; identity = $identity } | ConvertTo-Json -Compress -Depth 5
+      @{ ok = $true; identity = $identity; data = $data } | ConvertTo-Json -Compress -Depth 5
     } catch { @{ ok = $false; error = 'BOUNDARY_OPERATION_DENIED' } | ConvertTo-Json -Compress }
   }
 } catch { @{ ok = $false; error = 'BOUNDARY_ACQUIRE_DENIED' } | ConvertTo-Json -Compress }
