@@ -325,6 +325,15 @@ console.log("R5J3_FACT_ASAR_PATH=" + asarPath);
 const pkgRequire = require('module').createRequire(path.join(asarPath, 'package.json'));
 const jsEntryPath = pkgRequire.resolve('better-sqlite3');
 console.log("R5J3_FACT_JS_ENTRY_PATH=" + jsEntryPath);
+const sourceRoot = workspaceRoot || projectRoot;
+if (!sourceRoot) throw new Error('DEPENDENCY_SOURCE_IDENTITY_MISSING');
+const sourceLock = JSON.parse(fs.readFileSync(path.join(sourceRoot, 'package-lock.json'), 'utf8'));
+const sqlitePackageVersion = pkgRequire('better-sqlite3/package.json').version;
+if (process.versions.electron !== sourceLock.packages['node_modules/electron'].version ||
+    sqlitePackageVersion !== sourceLock.packages['node_modules/better-sqlite3'].version) {
+  throw new Error('PACKAGED_DEPENDENCY_VERSION_MISMATCH');
+}
+console.log("R5J3_FACT_SQLITE_PACKAGE_VERSION=" + sqlitePackageVersion);
 
 const Database = pkgRequire('better-sqlite3');
 
@@ -350,13 +359,19 @@ const db = new Database(dbPath);
 db.pragma('foreign_keys = ON');
 
 const loadedNodeKeys = Object.keys(require.cache).filter((k) => k.endsWith('.node'));
-const betterSqliteKey = loadedNodeKeys.find((k) => k.toLowerCase().includes('better_sqlite3'));
-if (!betterSqliteKey) {
-  console.error("FAIL: better_sqlite3.node was not loaded into require.cache");
+const physicalNativePath = (file) => path.resolve(file.replace(/app\.asar(?!\.unpacked)/i, 'app.asar.unpacked'));
+const sqlitePackageRoot = path.dirname(pkgRequire.resolve('better-sqlite3/package.json'));
+const expectedBindings = [path.join(sqlitePackageRoot, 'prebuilds', `${process.platform}-${process.arch}.node`),
+  path.join(sqlitePackageRoot, 'build', 'Release', 'better_sqlite3.node')]
+  .map((file) => physicalNativePath(file).toLowerCase());
+const matchedBindings = loadedNodeKeys.map(physicalNativePath)
+  .filter((file) => expectedBindings.includes(file.toLowerCase()));
+if (matchedBindings.length !== 1) {
+  console.error("FAIL: Exactly one package-rooted SQLite native binding must be loaded");
   process.exit(1);
 }
 
-const nativeBindingPath = betterSqliteKey.replace(/app\.asar/i, 'app.asar.unpacked');
+const nativeBindingPath = matchedBindings[0];
 if (!fs.existsSync(nativeBindingPath)) {
   console.error("FAIL: Physical native binding not found on disk at: " + nativeBindingPath);
   process.exit(1);

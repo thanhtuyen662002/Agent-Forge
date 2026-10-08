@@ -28,6 +28,13 @@ export default {
         mono: ['JetBrains Mono', 'Fira Code', 'monospace'],
         sans: ['Inter', 'system-ui', '-apple-system', 'sans-serif'],
       },
+      // Preserve the v3 utility sizes used by the existing owner interface.
+      boxShadow: {
+        sm: '0 1px 2px 0 rgb(0 0 0 / 0.05)',
+      },
+      backdropBlur: {
+        sm: '4px',
+      },
     },
   },
   plugins: [],
