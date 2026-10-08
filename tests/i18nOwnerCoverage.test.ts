@@ -366,7 +366,8 @@ describe('Owner Vietnamese I18n Coverage Contract (PR #11)', () => {
     const ipcContent = fs.readFileSync(ipcHandlersPath, 'utf-8');
 
     // 1. Assert ipcHandlers returns structured error codes
-    expect(ipcContent.includes("errorCode: 'NOT_GIT_REPOSITORY'")).toBe(true);
+    expect(ipcContent).toMatch(/errorCode:\s*(?:gitStatus\.errorCode\s*\?\?\s*)?'NOT_GIT_REPOSITORY'/);
+    expect(ipcContent.includes('errorCode: error.code')).toBe(true);
     expect(ipcContent.includes("errorCode: 'INVALID_REPOSITORY_LOCATION'")).toBe(true);
 
     // 2. Assert hardcoded English dialog title is removed
@@ -375,7 +376,7 @@ describe('Owner Vietnamese I18n Coverage Contract (PR #11)', () => {
     // 3. Assert preload type includes errorCode
     const preloadPath = path.resolve(__dirname, '..', 'src/electron/preload.ts');
     const preloadContent = fs.readFileSync(preloadPath, 'utf-8');
-    expect(preloadContent.includes("errorCode?: 'NOT_GIT_REPOSITORY' | 'INVALID_REPOSITORY_LOCATION' | 'UNKNOWN_ERROR'")).toBe(true);
+    expect(preloadContent.includes("errorCode?: 'NOT_GIT_REPOSITORY' | 'INVALID_REPOSITORY_LOCATION' | 'UNKNOWN_ERROR' | RepositoryRootErrorCode")).toBe(true);
 
     // 4. Assert ProjectsView does NOT directly render raw res.error
     const projectsViewPath = path.resolve(__dirname, '..', 'src/ui/views/ProjectsView.tsx');
@@ -387,6 +388,9 @@ describe('Owner Vietnamese I18n Coverage Contract (PR #11)', () => {
     expect(projectsViewContent.includes("t('projects.createModal.repositoryErrors.notGitRepository')")).toBe(true);
     expect(projectsViewContent.includes("t('projects.createModal.repositoryErrors.invalidLocation')")).toBe(true);
     expect(projectsViewContent.includes("t('projects.createModal.repositoryErrors.unknown')")).toBe(true);
+    expect(projectsViewContent.includes("t('projects.createModal.repositoryErrors.alias')")).toBe(true);
+    expect(projectsViewContent.includes("t('projects.createModal.repositoryErrors.changed')")).toBe(true);
+    expect(projectsViewContent.includes('res.errorDetail && !rootFailure')).toBe(true);
     expect(projectsViewContent.includes("t('projects.createModal.repositoryErrors.technicalDetails'")).toBe(true);
   });
 

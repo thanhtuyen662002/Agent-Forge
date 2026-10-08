@@ -1,6 +1,7 @@
 import { contextBridge, ipcRenderer } from 'electron';
 import type { CanonicalExecutionScope } from '../core/services/ExecutionAuthorizationService';
 import type { RendererAuthorizationMode } from '../core/types/ipc';
+import type { RepositoryRootErrorCode } from '../core/services/RepositoryRootIdentity';
 
 export interface TaskMutationBindingInput {
   expectedRevision?: number;
@@ -15,7 +16,7 @@ export interface OrchestratorApi {
     success: boolean;
     selectionId?: string;
     displayPath?: string;
-    errorCode?: 'NOT_GIT_REPOSITORY' | 'INVALID_REPOSITORY_LOCATION' | 'UNKNOWN_ERROR';
+    errorCode?: 'NOT_GIT_REPOSITORY' | 'INVALID_REPOSITORY_LOCATION' | 'UNKNOWN_ERROR' | RepositoryRootErrorCode;
     errorDetail?: string;
     error?: string;
     cancelled?: boolean;

@@ -30,13 +30,24 @@ export const ProjectsView: React.FC = () => {
           setDisplayPath(res.displayPath || '');
         } else if (!res.cancelled && (res.errorCode || res.error)) {
           let primaryMsg = t('projects.createModal.repositoryErrors.unknown');
+          const rootFailure = [
+            'REPOSITORY_ROOT_INVALID_PATH', 'REPOSITORY_ROOT_MISSING', 'REPOSITORY_ROOT_NOT_DIRECTORY',
+            'REPOSITORY_ROOT_ALIAS', 'REPOSITORY_ROOT_IDENTITY_UNAVAILABLE', 'REPOSITORY_ROOT_IDENTITY_CHANGED',
+            'REPOSITORY_ROOT_UNBOUND',
+          ].includes(res.errorCode);
           if (res.errorCode === 'NOT_GIT_REPOSITORY') {
             primaryMsg = t('projects.createModal.repositoryErrors.notGitRepository');
           } else if (res.errorCode === 'INVALID_REPOSITORY_LOCATION') {
             primaryMsg = t('projects.createModal.repositoryErrors.invalidLocation');
+          } else if (res.errorCode === 'REPOSITORY_ROOT_ALIAS') {
+            primaryMsg = t('projects.createModal.repositoryErrors.alias');
+          } else if (res.errorCode === 'REPOSITORY_ROOT_IDENTITY_CHANGED' || res.errorCode === 'REPOSITORY_ROOT_UNBOUND') {
+            primaryMsg = t('projects.createModal.repositoryErrors.changed');
+          } else if (rootFailure) {
+            primaryMsg = t('projects.createModal.repositoryErrors.invalidLocation');
           }
 
-          if (res.errorDetail) {
+          if (res.errorDetail && !rootFailure) {
             setErrorStatus(`${primaryMsg} (${t('projects.createModal.repositoryErrors.technicalDetails', { error: res.errorDetail })})`);
           } else {
             setErrorStatus(primaryMsg);

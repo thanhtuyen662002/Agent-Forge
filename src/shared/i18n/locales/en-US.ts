@@ -312,6 +312,8 @@ export const enUS: TranslationDictionary = {
       repositoryErrors: {
         notGitRepository: 'The selected directory is not a valid Git repository. Choose the root directory of a Git repository.',
         invalidLocation: 'Invalid repository location. Directory path is not accessible or allowed.',
+        alias: 'Choose the actual repository folder. Linked folders and path aliases cannot be used.',
+        changed: 'The repository folder changed or has not been verified. Choose it again before continuing.',
         unknown: 'An unknown error occurred while selecting the repository.',
         technicalDetails: 'Technical details: {error}',
       },

@@ -315,6 +315,8 @@ export interface TranslationDictionary {
       repositoryErrors: {
         notGitRepository: string;
         invalidLocation: string;
+        alias: string;
+        changed: string;
         unknown: string;
         technicalDetails: string;
       };

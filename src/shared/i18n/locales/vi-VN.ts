@@ -312,6 +312,8 @@ export const viVN: TranslationDictionary = {
       repositoryErrors: {
         notGitRepository: 'Thư mục đã chọn không phải là kho mã Git hợp lệ. Hãy chọn thư mục gốc của một kho Git.',
         invalidLocation: 'Vị trí kho mã không hợp lệ. Đường dẫn thư mục không thể truy cập hoặc không được phép.',
+        alias: 'Hãy chọn thư mục gốc thực tế của kho mã. Không thể dùng thư mục liên kết hoặc đường dẫn thay thế.',
+        changed: 'Thư mục kho mã đã thay đổi hoặc chưa được xác minh. Hãy chọn lại thư mục trước khi tiếp tục.',
         unknown: 'Đã xảy ra lỗi không xác định khi chọn kho mã.',
         technicalDetails: 'Chi tiết kỹ thuật: {error}',
       },
