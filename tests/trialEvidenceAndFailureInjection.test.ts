@@ -2,7 +2,12 @@ import crypto from 'crypto';
 import fs from 'fs';
 import os from 'os';
 import path from 'path';
-import { describe, expect, it } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import Database from 'better-sqlite3';
+import { MigrationRunner } from '../src/core/database/migrations';
+import { Repository } from '../src/core/database/repositories';
+import { ProductTaskAutonomyAdapter, VERIFICATION_REPORT_MAX_ATTEMPTS, VERIFICATION_REPORT_MAX_READ_BYTES,
+  VERIFICATION_REPORT_MAX_OUTPUT_CHARACTERS } from '../src/core/autonomy/productTaskAdapter';
 import {
   buildTrialEvidenceManifest,
   canonicalizeTrialEvidenceManifest,
@@ -20,6 +25,179 @@ import {
 } from '../src/core/autonomy/failureInjection';
 
 type TrialManifestInput = Omit<ProductionTrialEvidenceManifest, 'schemaVersion' | 'createdAt'> & { createdAt?: string };
+
+describe('bounded truthful verification evidence reports', () => {
+  let root: string, db: Database.Database, repo: Repository, artifactStore: ArtifactStore;
+  let adapter: ProductTaskAutonomyAdapter;
+  beforeEach(() => {
+    root = fs.realpathSync.native(fs.mkdtempSync(path.join(os.tmpdir(), 'af-report-evidence-')));
+    db = new Database(':memory:'); db.pragma('foreign_keys=ON'); MigrationRunner.run(db);
+    repo = new Repository(db);
+    const now = new Date().toISOString();
+    for (const id of ['report-project', 'foreign-project']) repo.createProject({
+      id, name: id, description: null, repository_path: root, default_branch: 'main', status: 'RUNNING', contract: null,
+      created_at: now, updated_at: now, started_at: null, completed_at: null,
+    });
+    db.prepare(`INSERT INTO role_profiles(id,role,display_name,required_capabilities_json,preferred_capabilities_json,
+      permissions_json,enabled,created_at,updated_at) VALUES('report-role','CODER','Report Fixture','[]','[]','[]',1,?,?)`).run(now, now);
+    db.prepare(`INSERT INTO agent_profiles(id,role_profile_id,name,enabled,created_at,updated_at)
+      VALUES('report-agent','report-role','Report Fixture',1,?,?)`).run(now, now);
+    for (const [id, project] of [['report-task', 'report-project'], ['foreign-task', 'foreign-project']]) {
+      db.prepare(`INSERT INTO tasks(id,project_id,title,state,priority,risk,revision_count,max_revisions,
+        progress_cache_percent,ownership_epoch,created_at,updated_at) VALUES(?,?,?,'VALIDATING','LOW','LOW',0,3,0,1,?,?)`)
+        .run(id, project, id, now, now);
+      repo.createTaskAttempt({ id: `${id}-attempt`, task_id: id, attempt_number: 1, agent_id: null, agent_profile_id: 'report-agent',
+        status: 'RUNNING', started_at: now, ended_at: null, summary: null });
+    }
+    useThreshold(32 * 1024);
+  });
+  afterEach(() => {
+    vi.restoreAllMocks(); db?.close();
+    if (!path.isAbsolute(root) || fs.realpathSync.native(root) !== root || !path.basename(root).startsWith('af-report-evidence-')) {
+      throw new Error('REPORT_FIXTURE_CLEANUP_DENIED');
+    }
+    fs.rmSync(root, { recursive: true, force: true });
+  });
+  function useThreshold(threshold: number) {
+    artifactStore = new ArtifactStore(path.join(root, 'artifacts'), threshold);
+    adapter = new ProductTaskAutonomyAdapter({ repo, artifactStore });
+  }
+  function record(stdout = 'actual pass', stderr = '', exitCode = 0) {
+    return adapter.recordVerificationObservation({ projectId: 'report-project', taskId: 'report-task',
+      attemptId: 'report-task-attempt', command: 'test-command', status: exitCode === 0 ? 'COMPLETED' : 'FAILED',
+      exitCode, passedCount: exitCode === 0 ? 1 : 0, failedCount: exitCode === 0 ? 0 : 1,
+      durationMs: 1, stdout, stderr, workingDirectory: root });
+  }
+  function report() { return adapter.getTruthfulVerificationReport('report-task'); }
+
+  it('preserves identical diagnostics across inline/file storage and the unchanged 32 KiB threshold', () => {
+    const overhead = Buffer.byteLength('status=COMPLETED\nexitCode=0\n=== STDOUT ===\n\n=== STDERR ===\n');
+    for (const bytes of [32767, 32768, 32769]) {
+      const stdout = 'x'.repeat(bytes - overhead);
+      const run = record(stdout);
+      const evidence = repo.getEvidence(run.evidence_id!)!;
+      expect(evidence.byte_size).toBe(bytes);
+      expect(evidence.storage_type).toBe(bytes < 32768 ? 'INLINE' : 'FILE');
+      expect(report().attempts.at(-1)).toMatchObject({ stdout, stderr: '', evidenceStatus: 'VERIFIED', success: true, outputTruncated: false });
+    }
+    const same = 'diagnostic across modes';
+    useThreshold(100000); record(same, 'error line', 1);
+    const inline = report().attempts.at(-1)!;
+    useThreshold(0); record(same, 'error line', 1);
+    const file = report().attempts.at(-1)!;
+    expect([file.stdout, file.stderr, file.evidenceStatus, file.success]).toEqual([inline.stdout, inline.stderr, inline.evidenceStatus, inline.success]);
+  });
+
+  it.each(['missing', 'corrupt', 'reparse'] as const)('returns typed incomplete %s file evidence and preserves task/process state', kind => {
+    useThreshold(0); const run = record('owned diagnostic'); const evidence = repo.getEvidence(run.evidence_id!)!;
+    const beforeTask = repo.getTask('report-task');
+    const beforeRuns = db.prepare('SELECT * FROM process_runs').all();
+    let backup: string | undefined;
+    if (kind === 'missing') fs.unlinkSync(evidence.file_path!);
+    if (kind === 'corrupt') fs.writeFileSync(evidence.file_path!, 'unrelated replacement bytes');
+    if (kind === 'reparse') {
+      backup = path.join(root, 'original-artifacts'); fs.renameSync(path.join(root, 'artifacts'), backup);
+      const outside = path.join(root, 'outside'); fs.mkdirSync(outside);
+      fs.copyFileSync(path.join(backup, path.basename(evidence.file_path!)), path.join(outside, path.basename(evidence.file_path!)));
+      fs.symlinkSync(outside, path.join(root, 'artifacts'), process.platform === 'win32' ? 'junction' : 'dir');
+    }
+    try {
+      expect(report()).toMatchObject({ evidenceStatus: 'INCOMPLETE', evidenceErrorCode: 'VERIFICATION_EVIDENCE_READ_FAILED', latestAttemptPassed: false });
+      expect(report().attempts[0]).toMatchObject({ stdout: '', stderr: 'VERIFICATION_EVIDENCE_READ_FAILED', success: false, exitCode: 0 });
+      expect(repo.getTask('report-task')).toEqual(beforeTask);
+      expect(db.prepare('SELECT * FROM process_runs').all()).toEqual(beforeRuns);
+      if (kind === 'reparse') expect(fs.readdirSync(path.join(root, 'outside'))).toEqual([path.basename(evidence.file_path!)]);
+    } finally {
+      if (backup) { fs.unlinkSync(path.join(root, 'artifacts')); fs.renameSync(backup, path.join(root, 'artifacts')); }
+    }
+  });
+
+  it.each(['project', 'task', 'attempt', 'process'] as const)('rejects %s substitution before reading its output', kind => {
+    useThreshold(0); const run = record('must not disclose');
+    if (kind === 'project') db.prepare("UPDATE evidence SET project_id='foreign-project' WHERE id=?").run(run.evidence_id);
+    if (kind === 'task') db.prepare("UPDATE evidence SET task_id='foreign-task' WHERE id=?").run(run.evidence_id);
+    if (kind === 'attempt') db.prepare("UPDATE evidence SET attempt_id='foreign-task-attempt' WHERE id=?").run(run.evidence_id);
+    if (kind === 'process') db.prepare("UPDATE process_runs SET project_id='foreign-project' WHERE stdout_evidence_id=?").run(run.evidence_id);
+    const read = vi.spyOn(artifactStore, 'readText');
+    expect(report()).toMatchObject({ evidenceStatus: 'INCOMPLETE', latestAttemptPassed: false });
+    expect(report().attempts[0].stdout).toBe(''); expect(read).not.toHaveBeenCalled();
+  });
+
+  it('discards a read if its task ownership epoch changes during the artifact observation', () => {
+    record('old owner output'); const originalRead = artifactStore.readText.bind(artifactStore);
+    vi.spyOn(artifactStore, 'readText').mockImplementation((evidence, max) => {
+      const text = originalRead(evidence, max);
+      expect(repo.bumpTaskOwnershipEpoch('report-task', 1).success).toBe(true); return text;
+    });
+    expect(report()).toMatchObject({ evidenceStatus: 'INCOMPLETE', evidenceErrorCode: 'VERIFICATION_EVIDENCE_SCOPE_CHANGED', latestAttemptPassed: false,
+      attempts: [{ stdout: '', success: false, evidenceErrorCode: 'VERIFICATION_EVIDENCE_SCOPE_CHANGED' }] });
+  });
+
+  it('rejects oversized declared and actual inline payloads without trusting their metadata', () => {
+    useThreshold(10000000); const run = record('bounded');
+    db.prepare('UPDATE evidence SET byte_size=? WHERE id=?').run(VERIFICATION_REPORT_MAX_READ_BYTES + 1, run.evidence_id);
+    const read = vi.spyOn(artifactStore, 'readText');
+    expect(report().evidenceErrorCode).toBe('VERIFICATION_EVIDENCE_LIMIT_EXCEEDED'); expect(read).not.toHaveBeenCalled();
+    db.prepare('UPDATE evidence SET byte_size=1,raw_payload=? WHERE id=?').run('x'.repeat(VERIFICATION_REPORT_MAX_READ_BYTES + 1), run.evidence_id);
+    expect(report().evidenceErrorCode).toBe('VERIFICATION_EVIDENCE_READ_FAILED');
+  });
+
+  it('bounds report history and exposes a typed limit rather than dropping attempts silently', () => {
+    for (let i = 0; i <= VERIFICATION_REPORT_MAX_ATTEMPTS; i++) record(`attempt ${i}`);
+    const read = vi.spyOn(artifactStore, 'readText');
+    expect(report()).toMatchObject({ totalAttempts: 65, evidenceStatus: 'INCOMPLETE', evidenceErrorCode: 'VERIFICATION_EVIDENCE_LIMIT_EXCEEDED', latestAttemptPassed: false });
+    expect(report().attempts).toHaveLength(64); expect(read).not.toHaveBeenCalled();
+  });
+
+  it('enforces the cumulative read budget across individually bounded file-backed attempts', () => {
+    useThreshold(0);
+    for (let i = 0; i < 9; i++) record('x'.repeat(VERIFICATION_REPORT_MAX_READ_BYTES - 100));
+    const read = vi.spyOn(artifactStore, 'readText');
+    const observed = report();
+    expect(observed.evidenceErrorCode).toBe('VERIFICATION_EVIDENCE_LIMIT_EXCEEDED');
+    expect(observed.latestAttemptPassed).toBe(false); expect(read).toHaveBeenCalledTimes(8);
+    expect(observed.attempts[8].evidenceStatus).toBe('INCOMPLETE');
+  });
+
+  it('rejects missing evidence references and ambiguous stdout/stderr framing', () => {
+    const first = record(); db.prepare('UPDATE test_runs SET evidence_id=NULL WHERE id=?').run(first.id);
+    expect(report().attempts[0].evidenceErrorCode).toBe('VERIFICATION_EVIDENCE_MISSING');
+    record('literal === STDOUT ===\nambiguous output');
+    expect(report().attempts[1].evidenceErrorCode).toBe('VERIFICATION_EVIDENCE_FORMAT_INVALID');
+    expect(report().latestAttemptPassed).toBe(false);
+  });
+
+  it('rejects hash-valid binary bytes that cannot be decoded as UTF-8', () => {
+    useThreshold(0); const run = record('text');
+    const binary = Buffer.from([0xff, 0xfe]);
+    const hash = crypto.createHash('sha256').update(binary).digest('hex');
+    const file = artifactStore.materializeContentAddressedFile(binary, hash);
+    db.prepare('UPDATE evidence SET file_path=?,hash=?,byte_size=? WHERE id=?').run(file.filePath, hash, binary.length, run.evidence_id);
+    expect(report()).toMatchObject({ latestAttemptPassed: false, evidenceStatus: 'INCOMPLETE', evidenceErrorCode: 'VERIFICATION_EVIDENCE_READ_FAILED' });
+  });
+
+  it('redacts before explicit output truncation for both storage modes', () => {
+    const secret = 'ghp_' + 'a'.repeat(28);
+    const stdout = `diagnostic password=supersecretvalue ${secret}\n` + 'x'.repeat(50000);
+    useThreshold(100000); record(stdout); const inline = report().attempts[0];
+    useThreshold(0); record(stdout); const file = report().attempts[1];
+    expect(file.stdout).toBe(inline.stdout); expect(file.outputTruncated).toBe(true);
+    expect(file.stdout.length).toBeLessThanOrEqual(VERIFICATION_REPORT_MAX_OUTPUT_CHARACTERS);
+    expect(file.stdout).toContain('VERIFICATION_REPORT_OUTPUT_TRUNCATED');
+    expect(file.stdout).not.toContain(secret); expect(file.stdout).not.toContain('supersecretvalue');
+    expect(file.stdout).toContain('[REDACTED_SECRET]');
+  });
+
+  it('retains failed reruns and recovers a cleaned-up content-addressed artifact only from verified identical bytes', () => {
+    useThreshold(0); record('failure diagnostic', 'FAIL actual-case', 1); const run = record('real rerun passed');
+    const evidence = repo.getEvidence(run.evidence_id!)!; const payload = artifactStore.readText(evidence);
+    fs.unlinkSync(evidence.file_path!);
+    expect(report().latestAttemptPassed).toBe(false);
+    artifactStore.materializeContentAddressedFile(payload, evidence.hash);
+    expect(report()).toMatchObject({ totalAttempts: 2, evidenceStatus: 'COMPLETE', latestAttemptPassed: true, isFirstPassSuccess: false, hadPriorFailure: true });
+    expect(report().attempts[0].stderr).toBe('FAIL actual-case');
+  });
+});
 
 function baseManifest(): TrialManifestInput {
   return {
