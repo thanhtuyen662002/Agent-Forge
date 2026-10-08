@@ -297,6 +297,7 @@ export class ConcurrentExecutionScheduler {
       assignmentId: assignment.id,
       workerSlotId: workerSlotId,
       baseSha: auth.repository_head_sha,
+      ownershipEpoch: auth.task_ownership_epoch ?? null,
     };
 
     if (supervisor.isLeaseLost()) {

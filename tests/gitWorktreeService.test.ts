@@ -1,8 +1,8 @@
-import { describe, it, expect, beforeEach, afterEach } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import fs from 'fs';
 import path from 'path';
 import os from 'os';
-import { execSync } from 'child_process';
+import { execSync, spawnSync } from 'child_process';
 import { WorktreeMutationBoundary } from '../src/core/services/WorktreeMutationBoundary';
 import {
   GitWorktreeService,
@@ -881,5 +881,65 @@ describe('R5G2A — GitWorktreeService Contract & Invariant Suite', () => {
     const result = await fresh.createWorktree(makeTuple());
     expect(result.status, JSON.stringify(result)).toBe('CREATED');
     expect((await fresh.removeWorktree(makeTuple())).status).toBe('REMOVED');
+  });
+
+  it.skipIf(process.platform !== 'win32')('51. A missing managed root under a short repository alias is rejected before filesystem mutation', () => {
+    const program = String.raw`
+Add-Type -TypeDefinition @'
+using System; using System.Runtime.InteropServices; using System.Text;
+public static class ShortRepositoryFixture {
+ [DllImport("kernel32.dll",CharSet=CharSet.Unicode,SetLastError=true)] static extern uint GetShortPathNameW(string p,StringBuilder result,uint size);
+ public static string Get(string p) { var result=new StringBuilder(32768); uint size=GetShortPathNameW(p,result,(uint)result.Capacity); if(size==0||size>=result.Capacity)throw new Exception("SHORT_PATH_UNAVAILABLE"); return result.ToString(); }
+}
+'@
+$request=[Console]::ReadLine()|ConvertFrom-Json
+[ShortRepositoryFixture]::Get([string]$request.path)
+`;
+    const result = spawnSync(path.join(process.env.SystemRoot!, 'System32/WindowsPowerShell/v1.0/powershell.exe'),
+      ['-NoProfile', '-NonInteractive', '-EncodedCommand', Buffer.from(program, 'utf16le').toString('base64')],
+      { windowsHide: true, encoding: 'utf8', input: JSON.stringify({ path: repoDir }) + '\n' });
+    expect(result.status).toBe(0);
+    const short = result.stdout.trim();
+    const childrenBefore = fs.readdirSync(repoDir);
+    expect(() => new GitWorktreeService({ gitExecutable: gitExe, repositoryRoot: repoDir,
+      managedRoot: path.join(short, 'forbidden-new-parent', 'managed') })).toThrow('INVALID_MANAGED_ROOT');
+    expect(fs.readdirSync(repoDir)).toEqual(childrenBefore);
+    expect(fs.existsSync(path.join(repoDir, 'forbidden-new-parent'))).toBe(false);
+  });
+
+  it('52. Cleanup from an earlier epoch cannot address a newer worktree with otherwise identical ownership', async () => {
+    const previous = makeTuple({ ownershipEpoch: 1 });
+    const current = makeTuple({ ownershipEpoch: 2 });
+    const old = await service.createWorktree(previous);
+    expect(old.status).toBe('CREATED'); if (old.status !== 'CREATED') return;
+    expect((await service.removeWorktree(previous)).status).toBe('REMOVED');
+    const fresh = await service.createWorktree(current);
+    expect(fresh.status).toBe('CREATED'); if (fresh.status !== 'CREATED') return;
+    expect(fresh.worktreePath).not.toBe(old.worktreePath);
+    const bytesBefore = fs.readFileSync(path.join(fresh.worktreePath, 'README.md'));
+    expect((await service.removeWorktree(previous)).status).toBe('FAILED');
+    expect((await service.removeWorktree(makeTuple())).status).toBe('FAILED');
+    expect(fs.readFileSync(path.join(fresh.worktreePath, 'README.md'))).toEqual(bytesBefore);
+    expect((await service.inspectWorktree(current)).status).toBe('INSPECTED');
+    expect((await service.removeWorktree(current)).status).toBe('REMOVED');
+  });
+
+  it('53. Malformed epochs cannot acquire a mutation helper, reach Git or collide with the legacy namespace', async () => {
+    const acquire = vi.spyOn(WorktreeMutationBoundary, 'acquire');
+    const execute = vi.spyOn(DefaultProcessExecutor.prototype, 'execute');
+    const children = fs.readdirSync(service.getManagedRoot());
+    try {
+      for (const epoch of [0, -1, NaN, Infinity, 1.5, Number.MAX_SAFE_INTEGER + 1, '1']) {
+        const tuple = makeTuple({ ownershipEpoch: epoch as number });
+        expect(() => service.deriveWorktreePath(tuple)).toThrow('INVALID_OWNERSHIP_EPOCH');
+        for (const result of [await service.createWorktree(tuple), await service.inspectWorktree(tuple), await service.removeWorktree(tuple)]) {
+          expect(result).toMatchObject({ status: 'FAILED', code: 'INVALID_OWNERSHIP_EPOCH' });
+        }
+      }
+      expect(acquire).not.toHaveBeenCalled();
+      expect(execute).not.toHaveBeenCalled();
+      expect(fs.readdirSync(service.getManagedRoot())).toEqual(children);
+      expect(service.deriveWorktreePath(makeTuple({ ownershipEpoch: null }))).toEqual(service.deriveWorktreePath(makeTuple()));
+    } finally { acquire.mockRestore(); execute.mockRestore(); }
   });
 });

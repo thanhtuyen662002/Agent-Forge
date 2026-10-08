@@ -1464,6 +1464,10 @@ describe('ConcurrentExecutionScheduler (R5G3D1)', () => {
     expect(res.errorCode).toBe('RECOVERY_FENCED');
     expect(timer.pendingCount).toBe(0);
 
+    const epochOwner = { projectId, taskId, attemptId, assignmentId, workerSlotId: slotId, baseSha, ownershipEpoch: 1 };
+    expect(fs.existsSync(worktreeService.deriveWorktreePath(epochOwner).worktreePath)).toBe(true);
+    expect(fs.existsSync(worktreeService.deriveWorktreePath({ ...epochOwner, ownershipEpoch: null }).worktreePath)).toBe(false);
+
     const lease = repo.getActiveLeaseForAssignment(assignmentId);
     expect(lease).not.toBeNull();
     const slot = repo.getWorkerSlot(slotId);

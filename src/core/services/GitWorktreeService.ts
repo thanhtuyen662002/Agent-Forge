@@ -49,6 +49,7 @@ export interface WorktreeOwnershipTuple {
   assignmentId: string;
   workerSlotId: string;
   baseSha: string;
+  ownershipEpoch?: number | null;
 }
 
 export type WorktreeErrorCode =
@@ -56,6 +57,7 @@ export type WorktreeErrorCode =
   | 'INVALID_REPOSITORY_ROOT'
   | 'INVALID_MANAGED_ROOT'
   | 'INVALID_SOURCE_SHA'
+  | 'INVALID_OWNERSHIP_EPOCH'
   | 'SOURCE_COMMIT_NOT_FOUND'
   | 'WORKTREE_ALREADY_EXISTS'
   | 'WORKTREE_ALREADY_REGISTERED'
@@ -251,23 +253,28 @@ export class GitWorktreeService {
     }
 
     this.canonicalManagedRoot = path.resolve(config.managedRoot);
-    if (process.platform === 'win32' && fs.existsSync(this.canonicalManagedRoot)) {
+    if (process.platform === 'win32') {
       // Windows TEMP may contain a genuine 8.3 spelling. Expand that spelling
       // only when every ordinary parent and the exact BigInt leaf identity
       // agree. Junctions are denied, and this read-only normalization performs
       // no filesystem mutation. Native guards capture the canonical objects.
-      const original = fs.lstatSync(this.canonicalManagedRoot, { bigint: true });
-      let current = path.parse(this.canonicalManagedRoot).root;
-      for (const segment of this.canonicalManagedRoot.slice(current.length).split(path.sep)) {
+      let anchor = this.canonicalManagedRoot;
+      while (!fs.existsSync(anchor) && path.dirname(anchor) !== anchor) anchor = path.dirname(anchor);
+      const original = fs.lstatSync(anchor, { bigint: true });
+      let current = path.parse(anchor).root;
+      for (const segment of anchor.slice(current.length).split(path.sep).filter(Boolean)) {
         current = path.join(current, segment);
         const parent = fs.lstatSync(current, { bigint: true });
         if (!parent.isDirectory() || parent.isSymbolicLink()) throw new Error('INVALID_MANAGED_ROOT: Reparse parent or alias is denied.');
       }
-      const canonical = fs.realpathSync.native(this.canonicalManagedRoot);
+      const canonical = fs.realpathSync.native(anchor);
       const captured = fs.lstatSync(canonical, { bigint: true });
       if (!original.isDirectory() || original.isSymbolicLink() || original.ino === 0n || original.ino !== captured.ino ||
           original.dev !== captured.dev || original.birthtimeNs !== captured.birthtimeNs) throw new Error('INVALID_MANAGED_ROOT: Alias identity changed.');
-      this.canonicalManagedRoot = canonical;
+      this.canonicalManagedRoot = path.join(canonical, path.relative(anchor, this.canonicalManagedRoot));
+      if (this.canonicalManagedRoot.split(/[/\\]+/).some(segment => sensitiveBases.includes(segment.toLowerCase()))) {
+        throw new Error('INVALID_MANAGED_ROOT: Canonical managed root targets a sensitive path.');
+      }
     }
 
     // 4. Validate Disjointness of Roots
@@ -283,9 +290,9 @@ export class GitWorktreeService {
     if (isPathWithinRoot(this.canonicalRepoRoot, this.canonicalManagedRoot)) {
       throw new Error('INVALID_REPOSITORY_ROOT: repositoryRoot cannot reside inside managedRoot.');
     }
-    if (!fs.existsSync(config.managedRoot)) {
+    if (!fs.existsSync(this.canonicalManagedRoot)) {
       if (process.platform === 'win32') {
-        try { this.canonicalManagedRoot = WorktreeMutationBoundary.initializeSync(config.managedRoot).root; }
+        try { this.canonicalManagedRoot = WorktreeMutationBoundary.initializeSync(this.canonicalManagedRoot).root; }
         catch { throw new Error('INVALID_MANAGED_ROOT: Captured parent initialization was denied.'); }
       } else {
         // POSIX mutation enforcement remains an explicit unfinished gate in
@@ -633,6 +640,8 @@ export class GitWorktreeService {
    * Derives a deterministic ownership digest and isolated filesystem path from an ownership tuple.
    */
   public deriveWorktreePath(tuple: WorktreeOwnershipTuple): { worktreePath: string; digest: string } {
+    const invalidEpoch = this.validateOwnershipEpoch(tuple);
+    if (invalidEpoch) throw new Error(invalidEpoch.error);
     this.assertManagedRootIdentity();
     const canonicalJson = JSON.stringify({
       projectId: tuple.projectId,
@@ -641,6 +650,9 @@ export class GitWorktreeService {
       assignmentId: tuple.assignmentId,
       workerSlotId: tuple.workerSlotId,
       baseSha: tuple.baseSha.toLowerCase(),
+      // Preserve the legacy unversioned namespace; it cannot address a
+      // product worktree whose positive durable epoch is included here.
+      ...(tuple.ownershipEpoch != null ? { ownershipEpoch: tuple.ownershipEpoch } : {}),
     });
     const digest = crypto.createHash('sha256').update(canonicalJson).digest('hex');
     const worktreeDirName = `afw-${digest.substring(0, 32)}`;
@@ -653,10 +665,20 @@ export class GitWorktreeService {
     return { worktreePath: derivedPath, digest };
   }
 
+  private validateOwnershipEpoch(tuple: WorktreeOwnershipTuple): WorktreeFailure | null {
+    if (tuple.ownershipEpoch != null && (!Number.isSafeInteger(tuple.ownershipEpoch) || tuple.ownershipEpoch <= 0)) {
+      return { status: 'FAILED', code: 'INVALID_OWNERSHIP_EPOCH',
+        error: 'INVALID_OWNERSHIP_EPOCH: A supplied ownership epoch must be a positive safe integer.' };
+    }
+    return null;
+  }
+
   /**
    * Asynchronously creates an isolated, detached, locked Git worktree for an assignment.
    */
   public async createWorktree(tuple: WorktreeOwnershipTuple): Promise<WorktreeCreateResult> {
+    const invalidEpoch = this.validateOwnershipEpoch(tuple);
+    if (invalidEpoch) return invalidEpoch;
     return this.withManagedRootLock<WorktreeCreateResult>(
       () => ({
         status: 'FAILED',
@@ -989,6 +1011,8 @@ export class GitWorktreeService {
    * Inspects a managed worktree without mutating any filesystem or Git state.
    */
   public async inspectWorktree(tuple: WorktreeOwnershipTuple): Promise<WorktreeInspectResult> {
+    const invalidEpoch = this.validateOwnershipEpoch(tuple);
+    if (invalidEpoch) return invalidEpoch;
     return this.withManagedRootLock<WorktreeInspectResult>(
       () => ({
         status: 'FAILED',
@@ -1120,6 +1144,8 @@ export class GitWorktreeService {
    * Safely removes an un-modified, clean, detached managed Git worktree.
    */
   public async removeWorktree(tuple: WorktreeOwnershipTuple): Promise<WorktreeRemoveResult> {
+    const invalidEpoch = this.validateOwnershipEpoch(tuple);
+    if (invalidEpoch) return invalidEpoch;
     return this.withManagedRootLock<WorktreeRemoveResult>(
       () => ({
         status: 'FAILED',

@@ -75,7 +75,7 @@ export class WorktreeMutationBoundary {
     const stat = fs.lstatSync(root, { bigint: true });
     if (!response.ok || !identity || !stat.isDirectory() || stat.isSymbolicLink() ||
         fs.realpathSync.native(root).toLowerCase() !== root.toLowerCase() || identity.fileId !== stat.ino.toString() ||
-        !/^[1-9]\d*$/.test(identity.volume) || !/^[1-9]\d*$/.test(identity.created)) throw new Error('BOUNDARY_INITIALIZATION_DENIED');
+        !/^[1-9]\d*$/.test(identity.volume) || identity.created !== (stat.birthtimeNs / 100n + 116444736000000000n).toString()) throw new Error('BOUNDARY_INITIALIZATION_DENIED');
     return { ...identity, root };
   }
 
@@ -111,7 +111,8 @@ export class WorktreeMutationBoundary {
     // independently match the exact BigInt file ID, never a rounded number.
     if (!actual.isDirectory() || actual.isSymbolicLink() || actual.ino === 0n ||
         !/^\d+$/.test(identity.volume) || identity.volume === '0' || !/^\d+$/.test(identity.created) || identity.created === '0' ||
-        (this.volume !== null && identity.volume !== this.volume) || identity.fileId !== actual.ino.toString()) {
+        (this.volume !== null && identity.volume !== this.volume) || identity.fileId !== actual.ino.toString() ||
+        identity.created !== (actual.birthtimeNs / 100n + 116444736000000000n).toString()) {
       throw new Error('BOUNDARY_NATIVE_IDENTITY_MISMATCH');
     }
   }
