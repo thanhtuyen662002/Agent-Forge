@@ -285,7 +285,7 @@ export class GitWorktreeService {
     }
     if (!fs.existsSync(config.managedRoot)) {
       if (process.platform === 'win32') {
-        try { WorktreeMutationBoundary.initializeSync(config.managedRoot); }
+        try { this.canonicalManagedRoot = WorktreeMutationBoundary.initializeSync(config.managedRoot).root; }
         catch { throw new Error('INVALID_MANAGED_ROOT: Captured parent initialization was denied.'); }
       } else {
         // POSIX mutation enforcement remains an explicit unfinished gate in

@@ -67,24 +67,44 @@ public sealed class AgentForgeDirectoryPins : IDisposable {
   SafeFileHandle operationLock;
   const int MaxNodes = 65536;
   readonly string root;
-  public AgentForgeDirectoryPins(string managedRoot, bool initialize) {
-    root = Path.GetFullPath(managedRoot).TrimEnd('\\');
-    if (root.Length < 4 || root[1] != ':' || root.StartsWith("\\\\") || root.IndexOf(':',2) >= 0)
+  public AgentForgeDirectoryPins(string managedRoot, bool initialize, string anchor, string anchorId, string anchorCreated) {
+    // .NET Framework GetFullPath expands existing DOS short names. Preserve
+    // the raw segments so the checked anchor is matched at its captured
+    // handle before any missing child is created; normalize from handles.
+    root = (managedRoot ?? "").TrimEnd('\\');
+    if (root.Length < 4 || root.Length > 2048 || !Char.IsLetter(root[0]) || root[1] != ':' || root[2] != '\\' ||
+        root.StartsWith("\\\\") || root.IndexOf(':',2) >= 0 || root.IndexOf('/') >= 0)
       throw new IOException("UNSUPPORTED_MUTATION_BOUNDARY");
     try {
       string current = Path.GetPathRoot(root);
+      string requested = root, raw = current;
+      bool anchorMatched = false;
       PinAncestor(current);
-      foreach (string part in root.Substring(current.Length).Split('\\')) {
+      Action<string, SafeFileHandle> matchAnchor = (candidate, handle) => {
+        if (String.Equals(candidate.TrimEnd('\\'), (anchor ?? "").TrimEnd('\\'), StringComparison.OrdinalIgnoreCase)) {
+          FileInfo info = Check(handle);
+          if ((((ulong)info.IndexHigh << 32) | info.IndexLow).ToString() != anchorId ||
+              (((ulong)info.Created.High << 32) | info.Created.Low).ToString() != anchorCreated)
+            throw new IOException("BOUNDARY_ANCHOR_IDENTITY_CHANGED");
+          anchorMatched = true;
+        }
+      };
+      matchAnchor(raw, ancestors[current]);
+      foreach (string part in requested.Substring(current.Length).Split('\\')) {
         SafeFileHandle parent = ancestors[current];
-        string next = Path.Combine(current, part);
+        raw = Path.Combine(raw, part);
         SafeFileHandle handle = null;
         try {
           try { handle = Relative(parent, part, true, false, false, false); }
-          catch { if (!initialize) throw; handle = Relative(parent, part, true, true, false, false); }
+          catch { if (!initialize || !anchorMatched) throw; handle = Relative(parent, part, true, true, false, false); }
+          string next = FinalPath(handle);
           Identity(handle, next); ancestors.Add(next, handle); handle = null;
+          matchAnchor(raw, ancestors[next]);
+          current = next;
         } finally { if (handle != null) handle.Dispose(); }
-        current = next;
       }
+      if (initialize && !anchorMatched) throw new IOException("BOUNDARY_ANCHOR_IDENTITY_MISSING");
+      root = current;
     } catch { Dispose(); throw; }
   }
   void PinAncestor(string candidate) {
@@ -105,19 +125,24 @@ public sealed class AgentForgeDirectoryPins : IDisposable {
       throw new IOException("BOUNDARY_REPARSE_OR_IDENTITY_DENIED");
     return info;
   }
-  public static object Identity(SafeFileHandle handle, string expected) {
-    FileInfo info = Check(handle);
+  static string FinalPath(SafeFileHandle handle) {
     StringBuilder text = new StringBuilder(32768);
     uint length = GetFinalPathNameByHandleW(handle, text, (uint)text.Capacity, 0);
     if (length == 0 || length >= text.Capacity) throw new IOException("BOUNDARY_IDENTITY_UNAVAILABLE");
     string final = text.ToString();
     if (final.StartsWith("\\\\?\\")) final = final.Substring(4);
+    return final.TrimEnd('\\');
+  }
+  public static object Identity(SafeFileHandle handle, string expected) {
+    FileInfo info = Check(handle);
+    string final = FinalPath(handle);
     if (!String.Equals(final.TrimEnd('\\'), Path.GetFullPath(expected).TrimEnd('\\'), StringComparison.OrdinalIgnoreCase))
       throw new IOException("BOUNDARY_PATH_IDENTITY_CHANGED");
     return new { volume = info.Volume.ToString(), fileId = (((ulong)info.IndexHigh << 32) | info.IndexLow).ToString(),
       created = (((ulong)info.Created.High << 32) | info.Created.Low).ToString() };
   }
   public object RootIdentity() { return Identity(ancestors[root], root); }
+  public string RootPath { get { return root; } }
   static void Name(string name) {
     if (name == null || !System.Text.RegularExpressions.Regex.IsMatch(name, "\\Aafw-[0-9a-f]{32}\\z"))
       throw new IOException("BOUNDARY_CHILD_NAME_DENIED");
@@ -213,7 +238,7 @@ public sealed class AgentForgeDirectoryPins : IDisposable {
       uint access = 0x100081u | (deleting ? 0x10000u : 0u) | (writable ? 0x2u : 0u);
       int result = NtCreateFile(out handle, access, ref attributes, out status, IntPtr.Zero,
         directory ? 0x10u : 0x80u, share, openIf ? 3u : create ? 2u : 1u, 0x200020u | (directory ? 1u : 0x40u), IntPtr.Zero, 0);
-      if (result < 0 || handle == null || handle.IsInvalid) throw new IOException("BOUNDARY_OBJECT_OPEN_DENIED");
+      if (result < 0 || handle == null || handle.IsInvalid) throw new IOException("BOUNDARY_OBJECT_OPEN_DENIED_" + unchecked((uint)result).ToString("X8"));
       ObjectInfo(handle, directory);
       SafeFileHandle answer = handle; handle = null; return answer;
     } finally {
@@ -425,8 +450,8 @@ public sealed class AgentForgeDirectoryPins : IDisposable {
 $pins = $null
 try {
   $first = [Console]::ReadLine() | ConvertFrom-Json
-  $pins = [AgentForgeDirectoryPins]::new([string]$first.root, ($first.initialize -eq '1'))
-  @{ ok = $true; identity = $pins.RootIdentity() } | ConvertTo-Json -Compress -Depth 5
+  $pins = [AgentForgeDirectoryPins]::new([string]$first.root, ($first.initialize -eq '1'), [string]$first.anchor, [string]$first.anchorId, [string]$first.anchorCreated)
+  @{ ok = $true; identity = $pins.RootIdentity(); root = $pins.RootPath } | ConvertTo-Json -Compress -Depth 5
   while ($null -ne ($line = [Console]::ReadLine())) {
     try {
       $request = $line | ConvertFrom-Json
@@ -447,8 +472,16 @@ try {
       elseif ($request.op -eq 'operation-release') { $pins.ReleaseOperationLock(); $identity = $null }
       else { throw 'BOUNDARY_COMMAND_DENIED' }
       @{ ok = $true; identity = $identity; data = $data } | ConvertTo-Json -Compress -Depth 5
-    } catch { @{ ok = $false; error = 'BOUNDARY_OPERATION_DENIED' } | ConvertTo-Json -Compress }
+    } catch {
+      $reason = $_.Exception.GetBaseException().Message
+      if ($reason -notmatch '^BOUNDARY_[A-Z0-9_]{1,80}$' -and $reason -ne 'UNSUPPORTED_MUTATION_BOUNDARY') { $reason = 'BOUNDARY_OPERATION_DENIED' }
+      @{ ok = $false; error = $reason } | ConvertTo-Json -Compress
+    }
   }
-} catch { @{ ok = $false; error = 'BOUNDARY_ACQUIRE_DENIED' } | ConvertTo-Json -Compress }
+} catch {
+  $reason = $_.Exception.GetBaseException().Message
+  if ($reason -notmatch '^BOUNDARY_[A-Z0-9_]{1,80}$' -and $reason -ne 'UNSUPPORTED_MUTATION_BOUNDARY') { $reason = 'BOUNDARY_ACQUIRE_DENIED' }
+  @{ ok = $false; error = $reason } | ConvertTo-Json -Compress
+}
 finally { if ($null -ne $pins) { $pins.Dispose() } }
 `;

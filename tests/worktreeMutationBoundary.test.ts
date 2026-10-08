@@ -49,7 +49,7 @@ function convertReparse(target: string, outside: string): { writeData: boolean; 
   return observed;
 }
 
-async function nativeHarness(source: string, managed: string) {
+async function nativeHarness(source: string, managed: string, initial: Record<string, string> = {}, expectedAcquisition = true) {
   const child = spawn(path.join(process.env.SystemRoot!, 'System32/WindowsPowerShell/v1.0/powershell.exe'),
     ['-NoProfile', '-NonInteractive', '-EncodedCommand', Buffer.from(WINDOWS_DIRECTORY_BOOTSTRAP, 'utf16le').toString('base64')],
     { windowsHide: true, stdio: 'pipe' });
@@ -61,7 +61,7 @@ async function nativeHarness(source: string, managed: string) {
     child.stdin.write(JSON.stringify(data) + '\n');
   });
   child.stdin.write(JSON.stringify(source) + '\n');
-  expect((await request({ root: managed })).ok).toBe(true);
+  expect((await request({ root: managed, ...initial })).ok).toBe(expectedAcquisition);
   return { request, close: async () => {
     if (child.exitCode !== null) return;
     await new Promise<void>(resolve => {
@@ -206,6 +206,49 @@ describe('kernel worktree directory primitives (not complete service acceptance)
         await expect(WorktreeMutationBoundary.acquire(path.join(alias, 'new-root'), true)).rejects.toThrow();
         expect(fs.readdirSync(outside)).toEqual(['sentinel']);
       } finally { fs.unlinkSync(alias); }
+    });
+
+    it('refuses missing-parent creation when the checked existing anchor was replaced before native acquisition', async () => {
+      const expected = fs.lstatSync(managed, { bigint: true });
+      await boundary!.close(); boundary = undefined;
+      const original = managed + '-old'; fs.renameSync(managed, original); fs.mkdirSync(managed);
+      fs.writeFileSync(path.join(managed, 'new-owner-sentinel'), 'keep');
+      const requested = path.join(managed, 'new-parent', 'new-root');
+      const harness = await nativeHarness(WINDOWS_DIRECTORY_BOUNDARY, requested, { initialize: '1', anchor: managed,
+        anchorId: expected.ino.toString(), anchorCreated: (expected.birthtimeNs / 100n + 116444736000000000n).toString() }, false);
+      await harness.close();
+      expect(fs.readdirSync(managed)).toEqual(['new-owner-sentinel']);
+      expect(fs.readFileSync(path.join(managed, 'new-owner-sentinel'), 'utf8')).toBe('keep');
+      expect(fs.readdirSync(original)).toEqual([]);
+    });
+
+    it('resolves a genuine Windows short spelling through no-follow captured segments during missing-root initialization', async () => {
+      const program = String.raw`
+Add-Type -TypeDefinition @'
+using System; using System.Runtime.InteropServices; using System.Text;
+public static class ShortFixture {
+ [DllImport("kernel32.dll",CharSet=CharSet.Unicode,SetLastError=true)] static extern uint GetShortPathNameW(string p,StringBuilder result,uint size);
+ public static string Get(string p) { var result=new StringBuilder(32768); uint size=GetShortPathNameW(p,result,(uint)result.Capacity); if(size==0||size>=result.Capacity)throw new Exception("SHORT_PATH_UNAVAILABLE"); return result.ToString(); }
+}
+'@
+$request=[Console]::ReadLine()|ConvertFrom-Json
+[ShortFixture]::Get([string]$request.path)
+`;
+      const result = spawnSync(path.join(process.env.SystemRoot!, 'System32/WindowsPowerShell/v1.0/powershell.exe'),
+        ['-NoProfile', '-NonInteractive', '-EncodedCommand', Buffer.from(program, 'utf16le').toString('base64')],
+        { windowsHide: true, encoding: 'utf8', input: JSON.stringify({ path: managed }) + '\n' });
+      expect(result.status).toBe(0);
+      // Filesystems with 8.3 naming disabled return the full spelling. Both
+      // supported spellings are exercised without enabling volume settings.
+      const short = result.stdout.trim();
+      const missing = path.join(short, 'alias-parent', 'alias-root');
+      const initialized = await WorktreeMutationBoundary.acquire(missing, true);
+      try {
+        expect(initialized.managedRoot).toBe(fs.realpathSync.native(missing));
+        const candidate = await initialized.reserveChild(childName);
+        expect(candidate).toBe(path.join(fs.realpathSync.native(missing), childName));
+        await initialized.deleteEmptyChild(childName);
+      } finally { await initialized.close(); }
     });
 
     it('fences relative mutation after attributes-only reparse conversion, which sharing pins cannot prevent', async () => {

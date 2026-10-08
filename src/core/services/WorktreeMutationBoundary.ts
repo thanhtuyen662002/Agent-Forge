@@ -4,7 +4,7 @@ import path from 'node:path';
 import { WINDOWS_DIRECTORY_BOOTSTRAP, WINDOWS_DIRECTORY_BOUNDARY } from './worktreeBoundaryScripts';
 
 export interface NativeIdentity { volume: string; fileId: string; created: string }
-interface Response { ok: boolean; identity?: NativeIdentity; error?: string; data?: string }
+interface Response { ok: boolean; identity?: NativeIdentity; error?: string; data?: string; root?: string }
 
 /** Windows kernel primitives, awaiting complete Git/ownership integration. */
 export class WorktreeMutationBoundary {
@@ -14,7 +14,7 @@ export class WorktreeMutationBoundary {
   private readonly captured = new Map<string, NativeIdentity>();
   private pending: { resolve: (value: Response) => void; reject: (error: Error) => void; timer: NodeJS.Timeout } | null = null;
 
-  private constructor(private readonly child: ChildProcessWithoutNullStreams, public readonly managedRoot: string) {
+  private constructor(private readonly child: ChildProcessWithoutNullStreams, private root: string) {
     child.stdout.setEncoding('utf8');
     child.stdout.on('data', (data: string) => {
       this.buffer += data;
@@ -43,35 +43,46 @@ export class WorktreeMutationBoundary {
     child.stdin.on('error', () => this.abort('BOUNDARY_HELPER_FAILED'));
   }
 
-  public static initializeSync(managedRoot: string): NativeIdentity {
-    if (process.platform !== 'win32') throw new Error('UNSUPPORTED_MUTATION_BOUNDARY');
+  public get managedRoot(): string { return this.root; }
+
+  private static parameters(managedRoot: string, initialize: boolean) {
     const root = path.resolve(managedRoot);
+    if (!/^[a-z]:\\/i.test(root) || root.startsWith('\\\\') || root.length > 2048) throw new Error('UNSUPPORTED_MUTATION_BOUNDARY');
+    let anchor = root;
+    while (initialize && !fs.existsSync(anchor) && path.dirname(anchor) !== anchor) anchor = path.dirname(anchor);
+    const expected = fs.lstatSync(anchor, { bigint: true });
+    if (!expected.isDirectory() || expected.isSymbolicLink() || expected.ino === 0n) throw new Error('BOUNDARY_ROOT_ALIAS_DENIED');
+    // The native helper walks every raw segment relative to captured parents,
+    // allowing a genuine 8.3 spelling without ever following a reparse. Before
+    // creating a missing segment it must match this checked existing anchor.
+    return { payload: { root, initialize: initialize ? '1' : '0', anchor, anchorId: expected.ino.toString(),
+      anchorCreated: (expected.birthtimeNs / 100n + 116444736000000000n).toString() }, expected, anchor };
+  }
+
+  public static initializeSync(managedRoot: string): NativeIdentity & { root: string } {
+    if (process.platform !== 'win32') throw new Error('UNSUPPORTED_MUTATION_BOUNDARY');
+    const { payload } = this.parameters(managedRoot, true);
     const executable = path.join(process.env.SystemRoot ?? 'C:\\Windows', 'System32', 'WindowsPowerShell', 'v1.0', 'powershell.exe');
     const result = spawnSync(executable, ['-NoLogo', '-NoProfile', '-NonInteractive', '-EncodedCommand',
       Buffer.from(WINDOWS_DIRECTORY_BOOTSTRAP, 'utf16le').toString('base64')], { windowsHide: true, encoding: 'utf8', timeout: 15_000,
-      maxBuffer: 65_536, input: JSON.stringify(WINDOWS_DIRECTORY_BOUNDARY) + '\n' + JSON.stringify({ root, initialize: '1' }) + '\n' + JSON.stringify({ op: 'close' }) + '\n' });
+      maxBuffer: 65_536, input: JSON.stringify(WINDOWS_DIRECTORY_BOUNDARY) + '\n' + JSON.stringify(payload) + '\n' + JSON.stringify({ op: 'close' }) + '\n' });
     if (result.status !== 0 || result.error) throw new Error('BOUNDARY_INITIALIZATION_DENIED');
     let response: Response;
     try { response = JSON.parse(result.stdout.trim()) as Response; } catch { throw new Error('BOUNDARY_INITIALIZATION_DENIED'); }
     const identity = response.identity;
+    const root = response.root;
+    if (!root || !path.isAbsolute(root)) throw new Error('BOUNDARY_INITIALIZATION_DENIED');
     const stat = fs.lstatSync(root, { bigint: true });
     if (!response.ok || !identity || !stat.isDirectory() || stat.isSymbolicLink() ||
         fs.realpathSync.native(root).toLowerCase() !== root.toLowerCase() || identity.fileId !== stat.ino.toString() ||
         !/^[1-9]\d*$/.test(identity.volume) || !/^[1-9]\d*$/.test(identity.created)) throw new Error('BOUNDARY_INITIALIZATION_DENIED');
-    return identity;
+    return { ...identity, root };
   }
 
   public static async acquire(managedRoot: string, initialize = false): Promise<WorktreeMutationBoundary> {
     if (process.platform !== 'win32') throw new Error('UNSUPPORTED_MUTATION_BOUNDARY');
-    const root = path.resolve(managedRoot);
-    if (!/^[a-z]:\\/i.test(root) || root.startsWith('\\\\')) throw new Error('UNSUPPORTED_MUTATION_BOUNDARY');
-    let anchor = root;
-    while (initialize && !fs.existsSync(anchor) && path.dirname(anchor) !== anchor) anchor = path.dirname(anchor);
-    if (fs.realpathSync.native(anchor).toLowerCase() !== anchor.toLowerCase() || fs.lstatSync(anchor).isSymbolicLink()) {
-      throw new Error('BOUNDARY_ROOT_ALIAS_DENIED');
-    }
-    const expected = fs.lstatSync(anchor, { bigint: true });
-    if (!expected.isDirectory() || expected.isSymbolicLink()) throw new Error('BOUNDARY_ROOT_DENIED');
+    const { payload, expected, anchor } = this.parameters(managedRoot, initialize);
+    const root = payload.root;
     const executable = path.join(process.env.SystemRoot ?? 'C:\\Windows', 'System32', 'WindowsPowerShell', 'v1.0', 'powershell.exe');
     const child = spawn(executable, ['-NoLogo', '-NoProfile', '-NonInteractive', '-EncodedCommand',
       Buffer.from(WINDOWS_DIRECTORY_BOOTSTRAP, 'utf16le').toString('base64')], { windowsHide: true, stdio: 'pipe' });
@@ -81,8 +92,10 @@ export class WorktreeMutationBoundary {
       // The only executable source is this repository constant; later records
       // are parsed as data by that source, never interpreted as shell text.
       child.stdin.write(JSON.stringify(WINDOWS_DIRECTORY_BOUNDARY) + '\n');
-      const response = await boundary.request({ root, initialize: initialize ? '1' : '0' });
-      boundary.verify(response.identity, root);
+      const response = await boundary.request(payload);
+      if (!response.root || !path.isAbsolute(response.root)) throw new Error('BOUNDARY_ROOT_IDENTITY_CHANGED');
+      boundary.root = response.root;
+      boundary.verify(response.identity, boundary.root);
       boundary.volume = response.identity!.volume;
       const actual = fs.lstatSync(anchor, { bigint: true });
       if (expected.dev !== actual.dev || expected.ino !== actual.ino || expected.birthtimeNs !== actual.birthtimeNs) throw new Error('BOUNDARY_ROOT_IDENTITY_CHANGED');
