@@ -64,7 +64,7 @@ beforeEach(() => {
   fixture.context = {
     isElectron: true, pendingActions: [], activeProject: { id: 'P' }, projects: [], tasks: [], resources: [],
     createTask: vi.fn(), createProject: vi.fn(), importContract: vi.fn(), updateResourceQuota: vi.fn(),
-    triggerEmergencyStop: vi.fn().mockResolvedValue({ processesTerminated: 1, tasksPaused: [], projectsPaused: [], timestamp: '2026-10-07T00:00:00Z' }),
+    triggerEmergencyStop: vi.fn().mockResolvedValue({ success: true, data: { processesTerminated: 1, tasksPaused: 0, projectsPaused: 0, timestamp: '2026-10-07T00:00:00Z', unprovenProcesses: 0, allTerminatedProven: true } }),
     getOwnerHandoffSnapshot: vi.fn().mockResolvedValue({ success: true, snapshot: {} }),
     listQuarantinedSubmissions: vi.fn().mockResolvedValue({ items: [] }),
   };
@@ -236,7 +236,7 @@ describe('production modal callers', () => {
     await act(async () => { close.click(); });
     expect(dialog()).not.toBeNull();
     expect(fixture.context.triggerEmergencyStop).toHaveBeenCalledTimes(1);
-    await act(async () => { resolve({ processesTerminated: 2, tasksPaused: [], projectsPaused: [], timestamp: 'now' }); });
+    await act(async () => { resolve({ success: true, data: { processesTerminated: 2, tasksPaused: 0, projectsPaused: 0, timestamp: '2026-10-07T00:00:00Z', unprovenProcesses: 0, allTerminatedProven: true } }); });
     expect(container.textContent).toContain('emergencyStop.successNotice');
     expect(dialog().contains(document.activeElement)).toBe(true);
     await key('Escape');

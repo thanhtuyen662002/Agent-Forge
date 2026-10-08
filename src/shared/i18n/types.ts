@@ -14,6 +14,9 @@ export interface TranslationDictionary {
     invalidResponse: string;
     noProject: string;
     alreadyPending: string;
+    selectionChanged: string;
+    taskUnavailable: string;
+    verificationRejected: string;
   };
   app: {
     title: string;
@@ -196,6 +199,7 @@ export interface TranslationDictionary {
     runningTestsButton: string;
     noTaskSelected: string;
     testsComplete: string;
+    testsFailed: string;
   };
   agentCenter: {
     title: string;
@@ -620,6 +624,8 @@ export interface TranslationDictionary {
     bulletResume: string;
     terminating: string;
     successNotice: string;
+    unconfirmedNotice: string;
+    unprovenProcesses: string;
     processesTerminated: string;
     tasksPaused: string;
     projectsPaused: string;

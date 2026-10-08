@@ -2,6 +2,9 @@ import { TranslationDictionary } from '../types';
 
 export const enUS: TranslationDictionary = {
   actions: {
+    selectionChanged: 'Selection changed. Run verification again for the current task.',
+    taskUnavailable: 'This task is unavailable in the selected project. Refresh and select the task again.',
+    verificationRejected: 'Verification was not authorized. Review the command approval in Settings.',
     pending: 'Working…',
     success: 'Action completed.',
     failed: 'Action failed. Review the input and try again.',
@@ -193,6 +196,7 @@ export const enUS: TranslationDictionary = {
     runningTestsButton: 'RUNNING TEST SUITE...',
     noTaskSelected: 'No task selected. Return to Task Board.',
     testsComplete: 'Tests Complete: {passed} Passed, {failed} Failed (Exit Code {exitCode}).',
+    testsFailed: 'Verification failed: {passed} Passed, {failed} Failed (Exit Code {exitCode}).',
   },
   agentCenter: {
     title: 'Agent Center',
@@ -616,7 +620,9 @@ export const enUS: TranslationDictionary = {
     bulletPreserveDb: 'Database state, repository changes, and checkpoints are fully preserved.',
     bulletResume: 'Projects and tasks can be deterministically resumed by the owner.',
     terminating: 'TERMINATING...',
-    successNotice: 'Emergency Stop executed successfully. System is safe.',
+    successNotice: 'Emergency stop recorded. Process termination is confirmed.',
+    unconfirmedNotice: 'Emergency stop recorded. Process termination is not fully confirmed ({count} unproven). Keep execution paused and review recovery evidence.',
+    unprovenProcesses: 'Processes with Unconfirmed Termination',
     processesTerminated: 'Processes Terminated',
     tasksPaused: 'Tasks Safely Paused',
     projectsPaused: 'Projects Paused',

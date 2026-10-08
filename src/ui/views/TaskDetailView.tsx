@@ -1,7 +1,8 @@
-import React, { useState } from 'react';
+import React, { useState, useRef, useEffect } from 'react';
 import { useOrchestrator } from '../context/OrchestratorContext';
 import { useI18n } from '../context/I18nContext';
 import { ProgressIndicator } from '../components/ProgressIndicator';
+import { UiActionResult, UiVerificationObservation, normalizeObservationResult, isVerificationObservation, uiActionFailure, uiActionFailureKey } from '../actionState';
 import {
   ArrowLeft,
   Shield,
@@ -23,14 +24,31 @@ export const TaskDetailView: React.FC = () => {
     runVerificationTests,
     generateWorkOrder,
     generateReviewPackage,
+    activeProject,
+    isElectron,
+    pendingActions,
   } = useOrchestrator();
 
   const { t } = useI18n();
 
   const [isRunningTests, setIsRunningTests] = useState<boolean>(false);
-  const [testResultMsg, setTestResultMsg] = useState<string | null>(null);
+  const [testResult, setTestResult] = useState<{ generation: number; result: UiActionResult<UiVerificationObservation> } | null>(null);
+  const inFlight = useRef(false);
+  const mounted = useRef(true);
+  useEffect(() => { mounted.current = true; return () => { mounted.current = false; }; }, []);
 
-  const task = tasks.find((t) => t.id === selectedTaskId) || tasks[0];
+  const task = selectedTaskId ? tasks.find(item => item.id === selectedTaskId) : tasks[0];
+  const scope = JSON.stringify([activeProject?.id ?? null, task?.id ?? null]);
+  const currentScope = useRef({ scope, generation: 0 });
+  if (currentScope.current.scope !== scope) currentScope.current = { scope, generation: currentScope.current.generation + 1 };
+  const generation = currentScope.current.generation;
+  const result = testResult?.generation === generation ? testResult.result : null;
+  const running = isRunningTests || (pendingActions ?? []).includes('runVerification');
+  const validTask = !!task && activeProject?.id === task.project_id;
+  const testResultMsg = result ? result.success
+    ? t(result.data.verificationPassed ? 'taskDetail.testsComplete' : 'taskDetail.testsFailed', {
+      passed: result.data.testRun.passed_count, failed: result.data.testRun.failed_count, exitCode: result.data.testRun.exit_code,
+    }) : t(uiActionFailureKey(result.code)) : null;
 
   if (!task) {
     return (
@@ -44,23 +62,25 @@ export const TaskDetailView: React.FC = () => {
   }
 
   const handleRunTests = async () => {
+    if (inFlight.current || running) return;
+    if (!isElectron || !validTask) {
+      setTestResult({ generation, result: uiActionFailure(!isElectron ? 'DESKTOP_REQUIRED' : 'TASK_UNAVAILABLE') });
+      return;
+    }
+    inFlight.current = true;
     setIsRunningTests(true);
-    setTestResultMsg(null);
+    setTestResult(null);
     try {
-      const res = await runVerificationTests(task.id);
-      if (res) {
-        setTestResultMsg(
-          t('taskDetail.testsComplete', {
-            passed: res.passed_count.toString(),
-            failed: res.failed_count.toString(),
-            exitCode: res.exit_code.toString(),
-          })
-        );
+      const observed = normalizeObservationResult(await runVerificationTests(task.id),
+        (value): value is UiVerificationObservation => isVerificationObservation(value, task.project_id, task.id));
+      if (mounted.current && currentScope.current.generation === generation) {
+        setTestResult({ generation, result: observed });
       }
-    } catch (err: any) {
-      setTestResultMsg(`${t('common.error')}: ${err.message}`);
+    } catch {
+      if (mounted.current && currentScope.current.generation === generation) setTestResult({ generation, result: uiActionFailure('IPC_REJECTED') });
     } finally {
-      setIsRunningTests(false);
+      inFlight.current = false;
+      if (mounted.current) setIsRunningTests(false);
     }
   };
 
@@ -177,18 +197,23 @@ export const TaskDetailView: React.FC = () => {
               </div>
 
               {testResultMsg && (
-                <div className="p-3 bg-surface-card border border-surface-border rounded-lg text-xs font-mono text-slate-200">
+                <div role={result?.success && result.data.verificationPassed ? 'status' : 'alert'} className="p-3 bg-surface-card border border-surface-border rounded-lg text-xs font-mono text-slate-200">
                   {testResultMsg}
                 </div>
               )}
+              {!isElectron && <p id="verification-availability" className="text-xs text-slate-400">{t('actions.desktopRequired')}</p>}
+              {isElectron && !validTask && <p id="verification-availability" role="alert" className="text-xs text-slate-400">{t('actions.taskUnavailable')}</p>}
 
               <button
                 onClick={handleRunTests}
-                disabled={isRunningTests}
+                type="button"
+                disabled={running || !isElectron || !validTask}
+                aria-busy={running}
+                aria-describedby={!isElectron || !validTask ? 'verification-availability' : undefined}
                 className="w-full py-2.5 bg-forge-cyan hover:bg-cyan-500 text-slate-950 font-mono font-bold text-xs rounded-lg shadow-lg flex items-center justify-center space-x-2 transition"
               >
                 <Play className="w-4 h-4 fill-current" />
-                <span>{isRunningTests ? t('taskDetail.runningTestsButton') : t('taskDetail.runTestsButton')}</span>
+                <span>{running ? t('taskDetail.runningTestsButton') : t('taskDetail.runTestsButton')}</span>
               </button>
             </div>
           </div>
