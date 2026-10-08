@@ -973,4 +973,41 @@ $request=[Console]::ReadLine()|ConvertFrom-Json
     expect(fs.readFileSync(path.join(created.worktreePath, 'README.md'))).toEqual(content);
     expect(fs.readFileSync(path.join(admin, 'agent-forge-owner.json'), 'utf8')).toBe(owner);
   });
+
+  it('56. Unsupported native platforms reject public create, inspection and cleanup before Git or any lock write', async () => {
+    const actualPlatform = Object.getOwnPropertyDescriptor(process, 'platform')!;
+    const inventory = fs.readdirSync(managedDir);
+    const source = execSync(`"${gitExe}" worktree list --porcelain`, { cwd: repoDir, encoding: 'utf8' });
+    const execute = vi.spyOn(DefaultProcessExecutor.prototype, 'execute');
+    const acquire = vi.spyOn(WorktreeMutationBoundary, 'acquire');
+    try {
+      // Exercise the real public platform gate on Windows as well. The actual
+      // Ubuntu suite exercises this same gate without overriding its platform.
+      Object.defineProperty(process, 'platform', { ...actualPlatform, value: 'linux' });
+      for (const result of [await service.createWorktree(makeTuple()), await service.inspectWorktree(makeTuple()), await service.removeWorktree(makeTuple())]) {
+        expect(result).toMatchObject({ status: 'FAILED', code: 'UNSUPPORTED_MUTATION_BOUNDARY' });
+      }
+      expect(execute).not.toHaveBeenCalled(); expect(acquire).not.toHaveBeenCalled();
+      expect(fs.readdirSync(managedDir)).toEqual(inventory);
+    } finally {
+      Object.defineProperty(process, 'platform', actualPlatform);
+      execute.mockRestore(); acquire.mockRestore();
+    }
+    expect(execSync(`"${gitExe}" worktree list --porcelain`, { cwd: repoDir, encoding: 'utf8' })).toBe(source);
+  });
+
+  it('57. Unsupported managed-parent initialization rejects before creating a missing parent', () => {
+    const actualPlatform = Object.getOwnPropertyDescriptor(process, 'platform')!;
+    const missing = path.join(testBaseDir, 'never-created', 'managed');
+    const initialize = vi.spyOn(WorktreeMutationBoundary, 'initializeSync');
+    try {
+      Object.defineProperty(process, 'platform', { ...actualPlatform, value: 'linux' });
+      expect(() => new GitWorktreeService({ gitExecutable: gitExe, repositoryRoot: repoDir, managedRoot: missing }))
+        .toThrow('UNSUPPORTED_MUTATION_BOUNDARY');
+      expect(fs.existsSync(path.dirname(missing))).toBe(false);
+      expect(initialize).not.toHaveBeenCalled();
+    } finally {
+      Object.defineProperty(process, 'platform', actualPlatform); initialize.mockRestore();
+    }
+  });
 });

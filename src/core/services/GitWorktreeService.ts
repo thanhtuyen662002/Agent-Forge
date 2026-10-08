@@ -138,11 +138,6 @@ interface DirectoryIdentity {
   birthtimeNs: bigint;
 }
 
-interface ManagedRootLock {
-  token: string;
-  path: string;
-}
-
 class PathIdentityError extends Error {
   public readonly code: 'PATH_CONTAINMENT_DENIED' | 'PATH_IDENTITY_CHANGED';
 
@@ -188,10 +183,8 @@ function isMissingFsError(error: unknown): boolean {
 }
 
 export class GitWorktreeService {
-  private static readonly OPERATION_LOCK_FILE = '.agent-forge-worktree-operation.lock';
   private static readonly OPERATION_LOCK_TIMEOUT_MS = 30_000;
   private static readonly OPERATION_LOCK_RETRY_MS = 25;
-  private static readonly STALE_LOCK_AFTER_MS = 5 * 60 * 1000;
 
   private gitExecutable: string;
   private canonicalRepoRoot: string;
@@ -297,9 +290,7 @@ export class GitWorktreeService {
         try { this.canonicalManagedRoot = WorktreeMutationBoundary.initializeSync(this.canonicalManagedRoot).root; }
         catch { throw new Error('INVALID_MANAGED_ROOT: Captured parent initialization was denied.'); }
       } else {
-        // POSIX mutation enforcement remains an explicit unfinished gate in
-        // #163. This legacy branch must not satisfy the Issue's acceptance.
-        fs.mkdirSync(config.managedRoot, { recursive: true });
+        throw new Error('UNSUPPORTED_MUTATION_BOUNDARY: Managed-parent initialization requires the captured Windows boundary.');
       }
     }
     this.managedRootIdentity = this.captureDirectoryIdentity(this.canonicalManagedRoot, 'managed root');
@@ -457,128 +448,23 @@ export class GitWorktreeService {
     await new Promise<void>((resolve) => setTimeout(resolve, milliseconds));
   }
 
-  private isProcessAlive(pid: number): boolean {
-    if (!Number.isInteger(pid) || pid <= 0) return false;
-    try {
-      process.kill(pid, 0);
-      return true;
-    } catch (error) {
-      return (error as NodeJS.ErrnoException).code === 'EPERM';
-    }
-  }
-
-  private tryBreakStaleManagedRootLock(lockPath: string): boolean | null {
-    let stat: fs.Stats;
-    try {
-      stat = fs.lstatSync(lockPath);
-    } catch (error) {
-      if (isMissingFsError(error)) return false;
-      return null;
-    }
-    if (stat.isSymbolicLink() || !stat.isFile()) return null;
-
-    let metadata: { pid?: number; createdAt?: number } = {};
-    try {
-      metadata = JSON.parse(fs.readFileSync(lockPath, 'utf8')) as { pid?: number; createdAt?: number };
-    } catch {
-      // A process may have crashed between creating the file and writing its
-      // metadata. The mtime age below still gives deterministic recovery.
-    }
-    const createdAt = typeof metadata.createdAt === 'number' ? metadata.createdAt : stat.mtimeMs;
-    const staleByAge = Date.now() - createdAt > GitWorktreeService.STALE_LOCK_AFTER_MS;
-    const ownerPid = typeof metadata.pid === 'number' && Number.isInteger(metadata.pid) && metadata.pid > 0
-      ? metadata.pid
-      : null;
-    // Never break a lock solely because it is old while its owner is still
-    // alive. A long-running Git operation may legitimately hold the lock for
-    // longer than the recovery threshold; age only makes a lock with missing
-    // owner metadata eligible for recovery.
-    const ownerDead = ownerPid !== null && !this.isProcessAlive(ownerPid);
-    if (!ownerDead && !(ownerPid === null && staleByAge)) return false;
-
-    this.assertManagedRootIdentity();
-    try {
-      fs.unlinkSync(lockPath);
-      return true;
-    } catch (error) {
-      return isMissingFsError(error);
-    }
-  }
-
-  private async acquireManagedRootLock(): Promise<ManagedRootLock | null> {
-    this.assertRootIdentities();
-    const lockPath = path.join(this.canonicalManagedRoot, GitWorktreeService.OPERATION_LOCK_FILE);
-    const deadline = Date.now() + GitWorktreeService.OPERATION_LOCK_TIMEOUT_MS;
-    const token = crypto.randomUUID();
-
-    while (Date.now() < deadline) {
-      this.assertRootIdentities();
-      let fd: number | null = null;
-      try {
-        fd = fs.openSync(lockPath, 'wx', 0o600);
-        fs.writeFileSync(fd, JSON.stringify({ pid: process.pid, createdAt: Date.now(), token }), 'utf8');
-        fs.closeSync(fd);
-        fd = null;
-        this.assertRootIdentities();
-        return { token, path: lockPath };
-      } catch (error) {
-        if (fd !== null) {
-          try { fs.closeSync(fd); } catch {}
-        }
-        if (error instanceof PathIdentityError) throw error;
-        if ((error as NodeJS.ErrnoException).code !== 'EEXIST') return null;
-        const stale = this.tryBreakStaleManagedRootLock(lockPath);
-        if (stale === null) return null;
-        if (!stale) await this.delay(GitWorktreeService.OPERATION_LOCK_RETRY_MS);
-      }
-    }
-    return null;
-  }
-
-  private releaseManagedRootLock(lock: ManagedRootLock): void {
-    try {
-      this.assertManagedRootIdentity();
-      const metadata = JSON.parse(fs.readFileSync(lock.path, 'utf8')) as { token?: string };
-      if (metadata.token === lock.token) fs.unlinkSync(lock.path);
-    } catch {
-      // Never unlink through an identity that is no longer trusted. A stale
-      // lock is recoverable by the next operation after its owner disappears.
-    }
-  }
-
   private async withManagedRootLock<T>(onUnavailable: () => T, operation: () => Promise<T>): Promise<T> {
-    if (process.platform === 'win32') {
-      let boundary: WorktreeMutationBoundary | null = null;
-      try {
-        this.assertRootIdentities();
-        boundary = await WorktreeMutationBoundary.acquire(this.canonicalManagedRoot);
-        this.assertRootIdentities();
-        const owner = { pid: process.pid, token: crypto.randomUUID(), createdAt: Date.now() };
-        const deadline = Date.now() + GitWorktreeService.OPERATION_LOCK_TIMEOUT_MS;
-        while (!await boundary.acquireOperationLock(owner)) {
-          if (Date.now() >= deadline) return onUnavailable();
-          await this.delay(GitWorktreeService.OPERATION_LOCK_RETRY_MS);
-        }
-        this.assertRootIdentities();
-        return await operation();
-      } catch { return onUnavailable(); }
-      finally { await boundary?.close(); }
-    }
-    let lock: ManagedRootLock | null = null;
+    if (process.platform !== 'win32') return onUnavailable();
+    let boundary: WorktreeMutationBoundary | null = null;
     try {
-      lock = await this.acquireManagedRootLock();
-    } catch (error) {
-      if (error instanceof PathIdentityError) {
-        return onUnavailable();
+      this.assertRootIdentities();
+      boundary = await WorktreeMutationBoundary.acquire(this.canonicalManagedRoot);
+      this.assertRootIdentities();
+      const owner = { pid: process.pid, token: crypto.randomUUID(), createdAt: Date.now() };
+      const deadline = Date.now() + GitWorktreeService.OPERATION_LOCK_TIMEOUT_MS;
+      while (!await boundary.acquireOperationLock(owner)) {
+        if (Date.now() >= deadline) return onUnavailable();
+        await this.delay(GitWorktreeService.OPERATION_LOCK_RETRY_MS);
       }
-      return onUnavailable();
-    }
-    if (!lock) return onUnavailable();
-    try {
+      this.assertRootIdentities();
       return await operation();
-    } finally {
-      this.releaseManagedRootLock(lock);
-    }
+    } catch { return onUnavailable(); }
+    finally { await boundary?.close(); }
   }
 
   private async executeGitAtRepository(
@@ -594,35 +480,14 @@ export class GitWorktreeService {
     args: string[],
     targetPath: string,
     targetIdentity: DirectoryIdentity,
-    allowTargetMissingAfter = false,
   ): Promise<{ exitCode: number; stdout: string; stderr: string }> {
     this.assertOperationBoundary(targetPath, targetIdentity, true);
     const result = await this.executor.execute(this.gitExecutable, args, {
-      cwd: args[0] === 'worktree' && (args[1] === 'unlock' || args[1] === 'lock' || args[1] === 'remove')
-        ? this.canonicalRepoRoot
-        : targetPath,
+      cwd: targetPath,
       env: { GIT_OPTIONAL_LOCKS: '0' },
     });
     this.assertRootIdentities();
-    this.assertTargetIdentity(targetPath, targetIdentity, !allowTargetMissingAfter);
-    return result;
-  }
-
-  /**
-   * Runs the repository-side `worktree add` only while the derived target is
-   * still absent and both roots retain their captured filesystem identities.
-   * The caller performs the required post-add target capture; when Git fails
-   * or the target cannot be captured safely, no cleanup is attempted through
-   * an unverified path.
-   */
-  private async executeGitForAbsentTarget(
-    args: string[],
-    targetPath: string,
-  ): Promise<{ exitCode: number; stdout: string; stderr: string }> {
-    this.assertRootIdentities();
-    this.assertTargetIdentity(targetPath, null, false);
-    const result = await this.executor.execute(this.gitExecutable, args, { cwd: this.canonicalRepoRoot });
-    this.assertRootIdentities();
+    this.assertTargetIdentity(targetPath, targetIdentity, true);
     return result;
   }
 
@@ -667,6 +532,13 @@ export class GitWorktreeService {
     return { worktreePath: derivedPath, digest };
   }
 
+  private unsupportedMutationBoundary(): WorktreeFailure | null {
+    return process.platform === 'win32' ? null : {
+      status: 'FAILED', code: 'UNSUPPORTED_MUTATION_BOUNDARY',
+      error: 'UNSUPPORTED_MUTATION_BOUNDARY: Managed worktree operations require the captured Windows boundary.',
+    };
+  }
+
   private validateOwnershipEpoch(tuple: WorktreeOwnershipTuple): WorktreeFailure | null {
     if (tuple.ownershipEpoch != null && (!Number.isSafeInteger(tuple.ownershipEpoch) || tuple.ownershipEpoch <= 0)) {
       return { status: 'FAILED', code: 'INVALID_OWNERSHIP_EPOCH',
@@ -681,6 +553,8 @@ export class GitWorktreeService {
   public async createWorktree(tuple: WorktreeOwnershipTuple): Promise<WorktreeCreateResult> {
     const invalidEpoch = this.validateOwnershipEpoch(tuple);
     if (invalidEpoch) return invalidEpoch;
+    const unsupported = this.unsupportedMutationBoundary();
+    if (unsupported) return unsupported;
     return this.withManagedRootLock<WorktreeCreateResult>(
       () => ({
         status: 'FAILED',
@@ -801,162 +675,7 @@ export class GitWorktreeService {
       };
     }
 
-    if (process.platform === 'win32') return this.createCapturedWorktree(tuple, targetPath, digest);
-
-    // 6. Run git worktree add --detach <targetPath> <baseSha>
-    let addResult: { exitCode: number; stdout: string; stderr: string };
-    try {
-      addResult = await this.executeGitForAbsentTarget(
-        ['worktree', 'add', '--detach', targetPath, expectedSha],
-        targetPath,
-      );
-      if (addResult.exitCode === 0) {
-        targetIdentity = this.captureTargetIdentity(targetPath, true);
-      }
-    } catch (error) {
-      const code = error instanceof PathIdentityError ? error.code : 'PATH_IDENTITY_CHANGED';
-      return {
-        status: 'FAILED',
-        code,
-        error: error instanceof Error ? error.message : 'PATH_IDENTITY_CHANGED: Target identity changed during worktree creation.',
-        worktreePath: targetPath,
-      };
-    }
-    if (addResult.exitCode !== 0) {
-      return {
-        status: 'FAILED',
-        code: 'GIT_ADD_FAILED',
-        error: `GIT_ADD_FAILED: "git worktree add" exited with code ${addResult.exitCode}: ${addResult.stderr.trim() || addResult.stdout.trim()}`,
-        worktreePath: targetPath,
-      };
-    }
-
-    // 7. Post-Create Verification inside new worktree
-    let rollbackNeeded = false;
-    let failureCode: WorktreeErrorCode = 'HEAD_BINDING_MISMATCH';
-    let failureMessage = '';
-
-    try {
-      // Verify HEAD equals expected baseSha
-      const headCheck = await this.executeGitWithTargetBoundary(['rev-parse', 'HEAD'], targetPath, targetIdentity!);
-      if (headCheck.exitCode !== 0 || headCheck.stdout.trim().toLowerCase() !== expectedSha) {
-        rollbackNeeded = true;
-        failureCode = 'HEAD_BINDING_MISMATCH';
-        failureMessage = `HEAD_BINDING_MISMATCH: Checked out HEAD "${headCheck.stdout.trim()}" does not match expected "${expectedSha}".`;
-      }
-
-      // Verify detached state
-      if (!rollbackNeeded) {
-        const branchCheck = await this.executeGitWithTargetBoundary(
-          ['branch', '--show-current'],
-          targetPath,
-          targetIdentity!,
-        );
-        if (branchCheck.exitCode !== 0 || branchCheck.stdout.trim() !== '') {
-          rollbackNeeded = true;
-          failureCode = 'HEAD_BINDING_MISMATCH';
-          failureMessage = `HEAD_BINDING_MISMATCH: Worktree is attached to branch "${branchCheck.stdout.trim()}", expected detached HEAD.`;
-        }
-      }
-
-      // Verify toplevel matches targetPath
-      if (!rollbackNeeded) {
-        const toplevelCheck = await this.executeGitWithTargetBoundary(
-          ['rev-parse', '--show-toplevel'],
-          targetPath,
-          targetIdentity!,
-        );
-        if (
-          toplevelCheck.exitCode !== 0 ||
-          normalizePathForComparison(toplevelCheck.stdout.trim()) !== normalizePathForComparison(targetPath)
-        ) {
-          rollbackNeeded = true;
-          failureCode = 'HEAD_BINDING_MISMATCH';
-          failureMessage = `HEAD_BINDING_MISMATCH: Show toplevel "${toplevelCheck.stdout.trim()}" does not match "${targetPath}".`;
-        }
-      }
-
-      // Verify registration in primary repository porcelain list
-      if (!rollbackNeeded) {
-        this.assertOperationBoundary(targetPath, targetIdentity!, true);
-        const postPorcelain = await this.listPorcelain();
-        this.assertOperationBoundary(targetPath, targetIdentity!, true);
-        const matching = postPorcelain.filter(
-          (entry) => normalizePathForComparison(entry.worktreePath) === normalizePathForComparison(targetPath)
-        );
-        if (
-          matching.length !== 1 ||
-          matching[0].headSha.toLowerCase() !== expectedSha ||
-          !matching[0].isDetached
-        ) {
-          rollbackNeeded = true;
-          failureCode = 'WORKTREE_REGISTRATION_MISMATCH';
-          failureMessage = `WORKTREE_REGISTRATION_MISMATCH: Registration verification failed in git porcelain list.`;
-        }
-      }
-
-      // Lock worktree
-      if (!rollbackNeeded) {
-        const lockReason = `AgentForge managed assignment ${digest.substring(0, 16)}`;
-        const lockResult = await this.executeGitWithTargetBoundary(
-          ['worktree', 'lock', '--reason', lockReason, targetPath],
-          targetPath,
-          targetIdentity!,
-        );
-        if (lockResult.exitCode !== 0) {
-          rollbackNeeded = true;
-          failureCode = 'WORKTREE_LOCK_FAILED';
-          failureMessage = `WORKTREE_LOCK_FAILED: "git worktree lock" exited with code ${lockResult.exitCode}: ${lockResult.stderr.trim()}`;
-        }
-      }
-
-      // Verify locked state in porcelain list
-      if (!rollbackNeeded) {
-        this.assertOperationBoundary(targetPath, targetIdentity!, true);
-        const postLockPorcelain = await this.listPorcelain();
-        this.assertOperationBoundary(targetPath, targetIdentity!, true);
-        const matchingLocked = postLockPorcelain.find(
-          (entry) => normalizePathForComparison(entry.worktreePath) === normalizePathForComparison(targetPath)
-        );
-        if (!matchingLocked || !matchingLocked.isLocked) {
-          rollbackNeeded = true;
-          failureCode = 'WORKTREE_LOCK_FAILED';
-          failureMessage = `WORKTREE_LOCK_FAILED: Worktree does not appear locked in porcelain list after locking.`;
-        }
-      }
-    } catch (err: any) {
-      rollbackNeeded = true;
-      failureCode = err instanceof PathIdentityError ? err.code : 'GIT_ADD_FAILED';
-      failureMessage = err instanceof PathIdentityError
-        ? err.message
-        : `GIT_ADD_FAILED: Post-creation verification threw exception: ${err.message}`;
-    }
-
-    // 8. Execute rollback if verification or lock failed
-    if (rollbackNeeded) {
-      const rollbackSuccess = await this.attemptRollback(targetPath, targetIdentity);
-      if (!rollbackSuccess) {
-        return {
-          status: 'FAILED',
-          code: 'CREATE_ROLLBACK_FAILED',
-          error: `CREATE_ROLLBACK_FAILED: Initial failure (${failureCode}: ${failureMessage}) was followed by a failed rollback of "${targetPath}". Manual recovery required.`,
-          worktreePath: targetPath,
-        };
-      }
-      return {
-        status: 'FAILED',
-        code: failureCode,
-        error: failureMessage,
-        worktreePath: targetPath,
-      };
-    }
-
-    return {
-      status: 'CREATED',
-      worktreePath: targetPath,
-      baseSha: expectedSha,
-      ownershipDigest: digest,
-    };
+    return this.createCapturedWorktree(tuple, targetPath, digest);
   }
 
   private capturedFailure(error: unknown): { code: WorktreeErrorCode; error: string } {
@@ -1017,6 +736,8 @@ export class GitWorktreeService {
   public async inspectWorktree(tuple: WorktreeOwnershipTuple): Promise<WorktreeInspectResult> {
     const invalidEpoch = this.validateOwnershipEpoch(tuple);
     if (invalidEpoch) return invalidEpoch;
+    const unsupported = this.unsupportedMutationBoundary();
+    if (unsupported) return unsupported;
     return this.withManagedRootLock<WorktreeInspectResult>(
       () => ({
         status: 'FAILED',
@@ -1150,6 +871,8 @@ export class GitWorktreeService {
   public async removeWorktree(tuple: WorktreeOwnershipTuple): Promise<WorktreeRemoveResult> {
     const invalidEpoch = this.validateOwnershipEpoch(tuple);
     if (invalidEpoch) return invalidEpoch;
+    const unsupported = this.unsupportedMutationBoundary();
+    if (unsupported) return unsupported;
     return this.withManagedRootLock<WorktreeRemoveResult>(
       () => ({
         status: 'FAILED',
@@ -1295,156 +1018,23 @@ export class GitWorktreeService {
       };
     }
 
-    if (process.platform === 'win32') {
-      let mutation: ManagedGitWorktreeMutation | null = null;
-      try {
-        mutation = await ManagedGitWorktreeMutation.prepare({ gitExecutable: this.gitExecutable,
-          repositoryRoot: this.canonicalRepoRoot, managedRoot: this.canonicalManagedRoot }, path.basename(targetPath), false);
-        await mutation.captureOwned(expectedSha, digest);
-        this.assertOperationBoundary(targetPath, targetIdentity, true);
-        await mutation.removeOwned();
-        const remaining = await this.listPorcelain();
-        if (this.captureTargetIdentity(targetPath, false) || remaining.some(item => normalizePathForComparison(item.worktreePath) === normalizePathForComparison(targetPath))) {
-          return { status: 'FAILED', code: 'REMOVE_FAILED', error: 'REMOVE_FAILED: Captured worktree remains present or registered.', worktreePath: targetPath };
-        }
-        return { status: 'REMOVED', worktreePath: targetPath, ownershipDigest: digest };
-      } catch (error) { return { status: 'FAILED', ...this.capturedFailure(error), worktreePath: targetPath }; }
-      finally { await mutation?.close(); }
-    }
-
-    // 1. Unlock worktree if locked
-    if (entry.isLocked) {
-      let unlockResult: { exitCode: number; stdout: string; stderr: string };
-      try {
-        unlockResult = await this.executeGitWithTargetBoundary(
-          ['worktree', 'unlock', targetPath],
-          targetPath,
-          targetIdentity,
-        );
-      } catch (error) {
-        const code = error instanceof PathIdentityError ? error.code : 'REMOVE_FAILED';
-        return {
-          status: 'FAILED',
-          code,
-          error: error instanceof Error ? error.message : 'PATH_IDENTITY_CHANGED: Worktree identity changed during unlock.',
-          worktreePath: targetPath,
-        };
-      }
-      if (unlockResult.exitCode !== 0) {
-        return {
-          status: 'FAILED',
-          code: 'REMOVE_FAILED',
-          error: `REMOVE_FAILED: Failed to unlock worktree "${targetPath}": ${unlockResult.stderr.trim()}`,
-          worktreePath: targetPath,
-        };
-      }
-    }
-
-    // 2. Remove worktree (WITHOUT --force)
-    let removeResult: { exitCode: number; stdout: string; stderr: string };
+    let mutation: ManagedGitWorktreeMutation | null = null;
     try {
-      removeResult = await this.executeGitWithTargetBoundary(
-        ['worktree', 'remove', targetPath],
-        targetPath,
-        targetIdentity,
-        true,
-      );
-    } catch (error) {
-      const code = error instanceof PathIdentityError ? error.code : 'REMOVE_FAILED';
-      return {
-        status: 'FAILED',
-        code,
-        error: error instanceof Error ? error.message : 'PATH_IDENTITY_CHANGED: Worktree identity changed during removal.',
-        worktreePath: targetPath,
-      };
-    }
-    if (removeResult.exitCode !== 0) {
-      // Attempt to re-lock on remove failure to protect worktree
-      try {
-        if (this.captureTargetIdentity(targetPath, false)) {
-          await this.executeGitWithTargetBoundary(
-            ['worktree', 'lock', '--reason', `AgentForge managed assignment ${digest.substring(0, 16)}`, targetPath],
-            targetPath,
-            targetIdentity,
-          );
-        }
-      } catch {
-        // ignore re-lock failure in error handler
+      mutation = await ManagedGitWorktreeMutation.prepare({ gitExecutable: this.gitExecutable,
+        repositoryRoot: this.canonicalRepoRoot, managedRoot: this.canonicalManagedRoot }, path.basename(targetPath), false);
+      await mutation.captureOwned(expectedSha, digest);
+      this.assertOperationBoundary(targetPath, targetIdentity, true);
+      await mutation.removeOwned();
+      const remaining = await this.listPorcelain();
+      if (this.captureTargetIdentity(targetPath, false) || remaining.some(item => normalizePathForComparison(item.worktreePath) === normalizePathForComparison(targetPath))) {
+        return { status: 'FAILED', code: 'REMOVE_FAILED', error: 'REMOVE_FAILED: Captured worktree remains present or registered.', worktreePath: targetPath };
       }
-      return {
-        status: 'FAILED',
-        code: 'REMOVE_FAILED',
-        error: `REMOVE_FAILED: "git worktree remove" exited with code ${removeResult.exitCode}: ${removeResult.stderr.trim()}`,
-        worktreePath: targetPath,
-      };
-    }
-
-    // 3. Verify path is no longer registered
-    let postRemovePorcelain: PorcelainWorktreeEntry[];
-    let remainingTarget: DirectoryIdentity | null;
-    try {
-      postRemovePorcelain = await this.listPorcelain();
-      this.assertRootIdentities();
-      remainingTarget = this.captureTargetIdentity(targetPath, false);
-    } catch (error) {
-      const code = error instanceof PathIdentityError ? error.code : 'REMOVE_FAILED';
-      return {
-        status: 'FAILED',
-        code,
-        error: error instanceof Error ? error.message : 'PATH_IDENTITY_CHANGED: Worktree identity could not be verified after removal.',
-        worktreePath: targetPath,
-      };
-    }
-    const stillRegistered = postRemovePorcelain.some(
-      (e) => normalizePathForComparison(e.worktreePath) === normalizePathForComparison(targetPath)
-    );
-    if (stillRegistered || remainingTarget) {
-      return {
-        status: 'FAILED',
-        code: 'REMOVE_FAILED',
-        error: `REMOVE_FAILED: Worktree "${targetPath}" remains registered or present after removal.`,
-        worktreePath: targetPath,
-      };
-    }
-
-    return {
-      status: 'REMOVED',
-      worktreePath: targetPath,
-      ownershipDigest: digest,
-    };
+      return { status: 'REMOVED', worktreePath: targetPath, ownershipDigest: digest };
+    } catch (error) { return { status: 'FAILED', ...this.capturedFailure(error), worktreePath: targetPath }; }
+    finally { await mutation?.close(); }
   }
 
-  /**
-   * Internal rollback helper for failed creation attempts.
-   */
-  private async attemptRollback(worktreePath: string, targetIdentity: DirectoryIdentity | null): Promise<boolean> {
-    try {
-      if (!targetIdentity) return false;
-      this.assertOperationBoundary(worktreePath, targetIdentity, true);
-      await this.executeGitWithTargetBoundary(['worktree', 'unlock', worktreePath], worktreePath, targetIdentity);
-      const removeResult = await this.executeGitWithTargetBoundary(
-        ['worktree', 'remove', worktreePath],
-        worktreePath,
-        targetIdentity,
-        true,
-      );
-      if (removeResult.exitCode !== 0) return false;
-      const list = await this.listPorcelain();
-      this.assertRootIdentities();
-      const currentTarget = this.captureTargetIdentity(worktreePath, false);
-      if (currentTarget) return false;
-      const stillRegistered = list.some(
-        (e) => normalizePathForComparison(e.worktreePath) === normalizePathForComparison(worktreePath)
-      );
-      return !stillRegistered;
-    } catch {
-      return false;
-    }
-  }
-
-  /**
-   * Parses git worktree list --porcelain from repository root.
-   */
+  /** Parses read-only Git worktree registration observations. */
   public async listPorcelain(): Promise<PorcelainWorktreeEntry[]> {
     const res = await this.executeGitAtRepository(['worktree', 'list', '--porcelain']);
     if (res.exitCode !== 0) {
