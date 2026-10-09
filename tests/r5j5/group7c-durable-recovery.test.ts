@@ -969,6 +969,40 @@ describe('R5J5 Quarantined Submission Adjudication and Verification Suite', () =
       }
     });
 
+    it.each([0, 1])('sanitizes real child diagnostics before adjudication hash/manifest settlement with exit %s', async exitCode => {
+      const { plaintextToken } = issueSubmissionSessionHelper(fixtures.repo, fixtures.authorizationId);
+      const subId = crypto.randomUUID();
+      fixtures.mcpService.submitCoderClaim(createValidSubmissionPayload(fixtures, subId), plaintextToken);
+      const fixtureSecret = 'AF_TEST_ONLY_ADJ_VALUE';
+      const fixtureScript = path.join(fixtures.projectRoot, 'temp-artifacts', 'output_fixture_' + crypto.randomUUID() + '.js');
+      fs.writeFileSync(fixtureScript, [
+        'console.log("ordinary-fixture-output");',
+        'console.log(JSON.stringify({api_key:"AF_TEST_ONLY_ADJ_VALUE"}));',
+        'console.error("password=AF_TEST_ONLY_ADJ_VALUE");',
+        `process.exit(${exitCode});`,
+      ].join('\n'));
+      try {
+        const auth = fixtures.repo.getExecutionAuthorization(fixtures.authorizationId)!;
+        const payload = JSON.parse(auth.canonical_payload_json!);
+        payload.verificationCommands.TEST = { ...await approveFixtureCommand(fixtures.repo, fixtures.projectId, [fixtureScript]), timeout_ms: 120000 };
+        db.prepare('UPDATE execution_authorizations SET canonical_payload_json = ?, instruction_payload_hash = ? WHERE id = ?')
+          .run(JSON.stringify(payload), computePayloadHash(payload), fixtures.authorizationId);
+        const result = await fixtures.adjudicationService.admitSubmissionForVerification({ requestId: crypto.randomUUID(), submissionId: subId });
+        expect(result.adjudication.status).toBe(exitCode === 0 ? 'VERIFIED' : 'VERIFICATION_FAILED');
+        const testRun = fixtures.repo.getTestRun(result.adjudication.test_run_id!)!;
+        const evidence = fixtures.repo.getEvidence(testRun.evidence_id!)!;
+        const observed = fixtures.artifactStore.read(evidence);
+        expect(observed.includes(fixtureSecret)).toBe(false);
+        expect(observed.includes('ordinary-fixture-output')).toBe(true);
+        expect(evidence.hash).toBe(computeSha256(observed));
+        expect(evidence.byte_size).toBe(Buffer.byteLength(observed, 'utf8'));
+        expect(JSON.parse(observed).exit_code).toBe(exitCode);
+        expect(testRun.exit_code).toBe(exitCode);
+        const envelope = JSON.parse(result.adjudication.verification_result_envelope_json!);
+        expect(envelope.test_result_evidence_hash).toBe(evidence.hash);
+      } finally { if (fs.existsSync(fixtureScript)) fs.unlinkSync(fixtureScript); }
+    });
+
     it('174. Phase C CAS failure cleans up staged artifacts', async () => {
       const stagedFiles: string[] = [];
       const origMat = fixtures.artifactStore.materializeContentAddressedFile;

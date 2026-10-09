@@ -4,7 +4,8 @@ import path from 'path';
 import Database from 'better-sqlite3';
 import { DatabaseEngine } from '../database/db';
 import { MigrationRunner } from '../database/migrations';
-import { AutonomyState, ManagerReview, WorkOrder, SelfHostTask } from './contracts';
+import { AutonomyState, ManagerReview, ManagerReviewSchema, WorkOrder, SelfHostTask } from './contracts';
+import { OutputSanitizationError, redactSensitiveText, sanitizeOutputValue } from '../../shared/security/secretRedaction';
 import type {
   RepairContextPackage,
   RepairOutcome,
@@ -527,17 +528,28 @@ export class AutonomyStore {
   }
 
   recordRun(workOrderId: string, provider: string, run: { status: string; exitCode: number; stdout: string; stderr: string; durationMs: number }): string {
+    const safe = sanitizeOutputValue(run) as typeof run;
+    if (!safe || typeof safe.status !== 'string' || !safe.status || typeof safe.stdout !== 'string' || typeof safe.stderr !== 'string' ||
+        !Number.isInteger(safe.exitCode) || !Number.isFinite(safe.durationMs) || safe.durationMs < 0) {
+      throw new OutputSanitizationError('OUTPUT_TYPE_INVALID');
+    }
+    const safeProvider = redactSensitiveText(provider);
     const id = crypto.randomUUID();
     const now = new Date().toISOString();
     this.db.prepare('INSERT INTO autonomy_runs (id,work_order_id,provider,status,exit_code,stdout,stderr,duration_ms,started_at,finished_at) VALUES (?,?,?,?,?,?,?,?,?,?)')
-      .run(id, workOrderId, provider, run.status, run.exitCode, run.stdout, run.stderr, run.durationMs, now, now);
+      .run(id, workOrderId, safeProvider, safe.status, safe.exitCode, safe.stdout, safe.stderr, safe.durationMs, now, now);
     return id;
   }
 
   recordReview(workOrderId: string, review: ManagerReview): void {
-    this.db.prepare('INSERT INTO autonomy_reviews (id,work_order_id,reviewed_head_sha,verdict,payload_json,created_at) VALUES (?,?,?,?,?,?)')
-      .run(crypto.randomUUID(), workOrderId, review.reviewed_head_sha, review.verdict, JSON.stringify(review), new Date().toISOString());
-    this.event(workOrderId, 'MANAGER_REVIEWED', review);
+    const parsed = ManagerReviewSchema.safeParse(sanitizeOutputValue(review));
+    if (!parsed.success) throw new OutputSanitizationError('OUTPUT_TYPE_INVALID');
+    const safe = parsed.data;
+    this.db.transaction(() => {
+      this.db.prepare('INSERT INTO autonomy_reviews (id,work_order_id,reviewed_head_sha,verdict,payload_json,created_at) VALUES (?,?,?,?,?,?)')
+        .run(crypto.randomUUID(), workOrderId, safe.reviewed_head_sha, safe.verdict, JSON.stringify(safe), new Date().toISOString());
+      this.event(workOrderId, 'MANAGER_REVIEWED', safe);
+    }).immediate();
   }
 
   claimExternal(source: string, externalId: string, workOrderId: string, headSha: string, state: string): boolean {
@@ -832,8 +844,9 @@ export class AutonomyStore {
   }
 
   event(workOrderId: string, eventType: string, payload: unknown): void {
+    const safe = sanitizeOutputValue(payload);
     this.db.prepare('INSERT INTO autonomy_events (id,work_order_id,event_type,payload_json,created_at) VALUES (?,?,?,?,?)')
-      .run(crypto.randomUUID(), workOrderId, eventType, JSON.stringify(payload), new Date().toISOString());
+      .run(crypto.randomUUID(), workOrderId, eventType, JSON.stringify(safe), new Date().toISOString());
   }
 
   recordRepairContext(pkg: RepairContextPackage): void;

@@ -2,6 +2,7 @@ import crypto from 'crypto';
 import fs from 'fs';
 import path from 'path';
 import Database from 'better-sqlite3';
+import { redactSensitiveText, sanitizeOutputValue } from '../../shared/security/secretRedaction';
 import { VerificationCapabilityService } from './VerificationCapabilityService';
 import { captureRepositoryRoot, RepositoryRootError, RepositoryRootIdentity } from './RepositoryRootIdentity';
 import { RepositoryRootLease } from './RepositoryRootLease';
@@ -4144,7 +4145,7 @@ export class CoderSubmissionAdjudicationService {
     let materializedStatusPath = '';
     if (postGitStatus) {
       statusEvId = crypto.randomUUID();
-      const statusContent = JSON.stringify(postGitStatus, null, 2);
+      const statusContent = JSON.stringify(sanitizeOutputValue(postGitStatus), null, 2);
       statusHash = computeSha256(statusContent);
       statusByteSize = Buffer.byteLength(statusContent, 'utf8');
       const mat = this.artifactStore.materializeContentAddressedFile(statusContent, statusHash);
@@ -4156,7 +4157,7 @@ export class CoderSubmissionAdjudicationService {
         task_id: sub.task_id,
         attempt_id: snapshot.attempt_id,
         evidence_type: 'GIT_STATUS',
-        summary: `Git Status: ${postGitStatus.isClean ? 'Clean' : 'Modified'} on ${postGitStatus.branch ?? 'main'}`,
+        summary: redactSensitiveText(`Git Status: ${postGitStatus.isClean ? 'Clean' : 'Modified'} on ${postGitStatus.branch ?? 'main'}`),
         content_type: 'application/json',
         hash: statusHash,
         byte_size: statusByteSize,
@@ -4175,7 +4176,7 @@ export class CoderSubmissionAdjudicationService {
     let materializedDiffPath = '';
     if (postGitDiff) {
       diffEvId = crypto.randomUUID();
-      const diffContent = postGitDiff.diffContent ?? '';
+      const diffContent = redactSensitiveText(postGitDiff.diffContent ?? '');
       diffHash = computeSha256(diffContent);
       diffByteSize = Buffer.byteLength(diffContent, 'utf8');
       const mat = this.artifactStore.materializeContentAddressedFile(diffContent, diffHash);
@@ -4200,14 +4201,16 @@ export class CoderSubmissionAdjudicationService {
 
     // 3. Test Result Evidence
     const testResultEvId = crypto.randomUUID();
-    const testResultPayload = canonicalJsonStringify({
+    // Clone/redact diagnostic values before canonical serialization. The hash,
+    // byte size, manifest and terminal envelope all bind these stored bytes.
+    const testResultPayload = canonicalJsonStringify(sanitizeOutputValue({
       outcome: verificationResult.outcome,
       exit_code: verificationResult.exit_code,
       duration_ms: verificationResult.duration_ms,
       metrics: verificationResult.metrics,
       stdout: verificationResult.stdout,
       stderr: verificationResult.stderr,
-    });
+    }));
     const testResultHash = computeSha256(testResultPayload);
     const testResultByteSize = Buffer.byteLength(testResultPayload, 'utf8');
     const matTest = this.artifactStore.materializeContentAddressedFile(testResultPayload, testResultHash);
