@@ -31,6 +31,7 @@ const testEnvironment = { ...process.env };
 // by tests. The reporter uses its bounded input file, not inherited flags.
 delete testEnvironment.AGENTFORGE_WINDOWS_TEST_PROFILE;
 delete testEnvironment.AGENTFORGE_PROFILE_SOURCE_SHA;
+delete testEnvironment.AGENTFORGE_WINDOWS_PROFILE_SEQUENCE;
 if (process.platform === 'win32') {
   for (const key of Object.keys(testEnvironment)) {
     if (/^(TEMP|TMP)$/i.test(key)) delete testEnvironment[key];
@@ -55,7 +56,7 @@ const runVitest = (label, args) => {
   const profileArgs = profile ? ['--reporter=default', '--reporter=./scripts/windows-test-profile.cjs'] : [];
   const result = spawnSync(process.execPath, [vitestEntry, 'run', ...args, ...reporterArgs, ...profileArgs], {
     cwd: repositoryRoot,
-    env: testEnvironment,
+    env: profile ? { ...testEnvironment, AGENTFORGE_WINDOWS_PROFILE_SEQUENCE: '1' } : testEnvironment,
     // Capture the Vitest parent process so reporter assertion summaries pass
     // through the same fail-closed credential boundary as worker output.
     stdio: ['inherit', 'pipe', 'pipe'],

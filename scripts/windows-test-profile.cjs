@@ -13,6 +13,7 @@ const MAX_BYTES = 2 * 1024 * 1024;
 const MAX_FILES = 4096;
 const MAX_RECEIPTS = 40;
 const ALGORITHM = 'vitest-default-sha1-four-shards-v1';
+const WEIGHTED_ALGORITHM = 'vitest-max-observed-lpt-four-shards-v1';
 // Vitest module/setup/collection measurements are recorded separately. They
 // are not CI job wall time and must not be presented as a latency guarantee.
 const TIMINGS = ['durationMs', 'prepareMs', 'collectMs', 'setupMs', 'environmentMs'];
@@ -52,6 +53,21 @@ function partition(files) {
     return result;
   });
 }
+// Positive integral costs avoid zero-duration files accumulating in one shard.
+// History supplies weights only; configured discovery supplies the executable set.
+function balancedPartition(files, weights) {
+  const configured = inventory(files);
+  keys(weights, configured);
+  check(configured.every(file => Number.isInteger(weights[file]) && weights[file] >= 1 && weights[file] <= 6 * 60 * 60 * 1000));
+  const groups = [0, 1, 2, 3].map(index => ({ index, load: 0, files: [] }));
+  const ordered = [...configured].sort((a, b) => weights[b] - weights[a] || (a < b ? -1 : a > b ? 1 : 0));
+  for (const file of ordered) {
+    const group = [...groups].sort((a, b) => a.load - b.load || a.index - b.index)[0];
+    group.files.push(file); group.load += weights[file];
+  }
+  check(groups.every(group => group.files.length > 0));
+  return groups.map(group => group.files.sort());
+}
 function parse(text) {
   try { check(typeof text === 'string' && Buffer.byteLength(text) <= MAX_BYTES); return JSON.parse(text); }
   catch { fail(); }
@@ -89,8 +105,9 @@ function discover(root) {
   return files;
 }
 function context(value) {
-  keys(value, ['schemaVersion', 'algorithm', 'vitestVersion', 'source', 'run', 'platform', 'inventory']);
-  check(value.schemaVersion === 1 && value.algorithm === ALGORITHM && value.platform === 'win32');
+  const weighted = value?.algorithm === WEIGHTED_ALGORITHM;
+  keys(value, ['schemaVersion', 'algorithm', 'vitestVersion', 'source', 'run', 'platform', 'inventory', ...(weighted ? ['plan'] : [])]);
+  check(value.schemaVersion === 1 && (value.algorithm === ALGORITHM || weighted) && value.platform === 'win32');
   check(typeof value.vitestVersion === 'string' && value.vitestVersion.length <= 32 && /^\d+\.\d+\.\d+$/.test(value.vitestVersion));
   keys(value.source, ['commitSha', 'treeSha']);
   check(typeof value.source.commitSha === 'string' && typeof value.source.treeSha === 'string' &&
@@ -100,13 +117,63 @@ function context(value) {
   check(Number.isInteger(value.run.attempt) && value.run.attempt >= 1 && value.run.attempt <= 1000);
   const files = inventory(value.inventory);
   check(same(files, value.inventory));
+  if (weighted) {
+    keys(value.plan, ['profileSha256', 'weights']);
+    check(typeof value.plan.profileSha256 === 'string' && /^[0-9a-f]{64}$/.test(value.plan.profileSha256));
+    balancedPartition(files, value.plan.weights);
+  }
   return value;
 }
+function assignedFiles(metadata) {
+  context(metadata);
+  return metadata.algorithm === ALGORITHM ? partition(metadata.inventory) : balancedPartition(metadata.inventory, metadata.plan.weights);
+}
+function timingProfile(value) {
+  try {
+    keys(value, ['schemaVersion', 'observations']);
+    check(value.schemaVersion === 2 && Array.isArray(value.observations) && value.observations.length >= 2 && value.observations.length <= 8);
+    const runs = new Set(); const jobs = new Set(); const artifacts = new Set();
+    const weights = {};
+    for (const observation of value.observations) {
+      keys(observation, ['receipt', 'jobs', 'artifact', 'conclusion']);
+      check(observation.conclusion === 'SUCCESS');
+      keys(observation.receipt, ['schemaVersion', 'algorithm', 'vitestVersion', 'source', 'run', 'platform', 'inventory', 'shards']);
+      const { shards, ...metadata } = observation.receipt;
+      check(metadata.algorithm === ALGORITHM);
+      check(same(aggregate(shards, metadata), observation.receipt));
+      check(!runs.has(metadata.run.id)); runs.add(metadata.run.id);
+      keys(observation.artifact, ['id', 'receiptSha256']);
+      check(typeof observation.artifact.id === 'string' && /^[1-9][0-9]{0,19}$/.test(observation.artifact.id));
+      check(typeof observation.artifact.receiptSha256 === 'string' && /^[0-9a-f]{64}$/.test(observation.artifact.receiptSha256));
+      check(!artifacts.has(observation.artifact.id)); artifacts.add(observation.artifact.id);
+      check(Array.isArray(observation.jobs) && observation.jobs.length === 4);
+      observation.jobs.forEach((job, index) => {
+        keys(job, ['shard', 'jobId', 'durationSeconds']);
+        check(job.shard === index + 1 && typeof job.jobId === 'string' && /^[1-9][0-9]{0,19}$/.test(job.jobId));
+        check(Number.isInteger(job.durationSeconds) && job.durationSeconds > 0 && job.durationSeconds <= 6 * 60 * 60);
+        check(!jobs.has(job.jobId)); jobs.add(job.jobId);
+      });
+      for (const shard of shards) for (const row of shard.modules) weights[row.file] = Math.max(weights[row.file] || 1, Math.ceil(row.durationMs));
+    }
+    inventory(Object.keys(weights));
+    return { value, weights };
+  } catch { fail(); }
+}
+function timingPlan(value, files) {
+  const profile = timingProfile(value);
+  const fallback = Math.max(...Object.values(profile.weights));
+  return {
+    profileSha256: crypto.createHash('sha256').update(JSON.stringify(profile.value)).digest('hex'),
+    weights: Object.fromEntries(inventory(files).map(file => [file, profile.weights[file] ?? fallback])),
+  };
+}
 function currentContext(root, env) {
-  const result = context({ schemaVersion: 1, algorithm: ALGORITHM,
+  const files = discover(root);
+  const result = context({ schemaVersion: 1, algorithm: WEIGHTED_ALGORITHM,
     vitestVersion: require(path.join(root, 'node_modules/vitest/package.json')).version,
     source: source(root), run: { id: env.GITHUB_RUN_ID, attempt: Number(env.GITHUB_RUN_ATTEMPT) },
-    platform: process.platform, inventory: discover(root),
+    platform: process.platform, inventory: files,
+    plan: timingPlan(read(path.join(root, 'scripts/windows-test-profile.json')), files),
   });
   check(result.source.commitSha === env.AGENTFORGE_PROFILE_SOURCE_SHA);
   return result;
@@ -117,13 +184,13 @@ function shardArgument(args, env) {
   return Number(args[0][8]);
 }
 function validate(receipt, expected, shard) {
-  keys(receipt, ['schemaVersion', 'algorithm', 'vitestVersion', 'source', 'run', 'platform', 'inventory', 'shard', 'modules']);
+  keys(receipt, ['schemaVersion', 'algorithm', 'vitestVersion', 'source', 'run', 'platform', 'inventory', 'shard', 'modules', ...(expected?.algorithm === WEIGHTED_ALGORITHM ? ['plan'] : [])]);
   const { modules, shard: actualShard, ...metadata } = receipt;
   context(metadata); context(expected);
   check(actualShard === shard && Number.isInteger(shard) && shard >= 1 && shard <= 4);
   check(metadata.run.id === expected.run.id && metadata.run.attempt <= expected.run.attempt);
   check(same({ ...metadata, run: expected.run }, expected));
-  const assigned = partition(expected.inventory)[shard - 1];
+  const assigned = assignedFiles(expected)[shard - 1];
   check(Array.isArray(modules) && modules.length === assigned.length);
   const safeModules = modules.map(row => {
     keys(row, ['file', 'state', ...TIMINGS]);
@@ -209,7 +276,7 @@ class WindowsTestProfileReporter {
   }
 }
 module.exports = WindowsTestProfileReporter;
-Object.assign(module.exports, { PROFILE_DIR, MAX_BYTES, inventory, partition, parse, context, validate, aggregate, shardArgument, prepare, finish, discover });
+Object.assign(module.exports, { PROFILE_DIR, MAX_BYTES, inventory, partition, balancedPartition, assignedFiles, timingProfile, timingPlan, publicId, read, parse, context, validate, aggregate, shardArgument, prepare, finish, discover });
 
 if (require.main === module) {
   try {

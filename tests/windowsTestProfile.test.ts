@@ -13,6 +13,13 @@ const metadata = () => ({ schemaVersion: 1, algorithm: 'vitest-default-sha1-four
   source: { commitSha: 'a'.repeat(40), treeSha: 'b'.repeat(40) }, run: { id: '123', attempt: 1 }, platform: 'win32', inventory: [...files].sort() });
 const receipts = () => profile.partition(files).map((assigned: string[], index: number) => ({ ...metadata(), shard: index + 1,
   modules: assigned.map(file => ({ file, state: 'passed', durationMs: 12, prepareMs: 3, collectMs: 2, setupMs: 1, environmentMs: 0 })) }));
+const fixtureProfile = () => ({ schemaVersion: 2, observations: [1, 2].map(index => {
+  const input = receipts();
+  for (const receipt of input) receipt.run.id = String(122 + index);
+  return { receipt: profile.aggregate(input, { ...metadata(), run: { id: String(122 + index), attempt: 1 } }),
+    jobs: [1, 2, 3, 4].map(shard => ({ shard, jobId: String(index * 1000 + shard), durationSeconds: 1 })),
+    artifact: { id: String(index), receiptSha256: String(index).repeat(64) }, conclusion: 'SUCCESS' };
+}) });
 
 describe('bounded public Windows timing evidence', () => {
   it('covers every discovered file once, including new files, deterministically without timing history', () => {
@@ -21,6 +28,50 @@ describe('bounded public Windows timing evidence', () => {
     expect(assignment.every((shard: string[]) => shard.length > 0)).toBe(true);
     expect(profile.partition([...files].reverse())).toEqual(assignment);
     expect(profile.aggregate(receipts(), metadata()).shards.flatMap((shard: any) => shard.modules.map((row: any) => row.file)).sort()).toEqual([...files].sort());
+  });
+
+  it('balances measured bottlenecks with complete deterministic assignment and conservative new/renamed-file costs', () => {
+    const original = profile.partition(files);
+    const weights = Object.fromEntries(files.map(file => [file, original[0].includes(file) ? 120000 : 1000]));
+    const balanced = profile.balancedPartition(files, weights);
+    const load = (groups: string[][]) => Math.max(...groups.map(group => group.reduce((sum, file) => sum + weights[file], 0)));
+    expect(load(balanced)).toBeLessThan(load(original));
+    expect(balanced.flat().sort()).toEqual([...files].sort());
+    expect(profile.balancedPartition([...files].reverse(), weights)).toEqual(balanced);
+    const current = [...files.filter(file => file !== 'tests/new.test.ts'), 'tests/renamed.test.ts', 'tests/unprofiled.test.ts'];
+    const plan = profile.timingPlan(fixtureProfile(), current);
+    expect(plan.weights['tests/renamed.test.ts']).toBe(12);
+    expect(plan.weights['tests/unprofiled.test.ts']).toBe(12);
+    const assignment = profile.balancedPartition(current, plan.weights);
+    expect(assignment.flat().sort()).toEqual([...current].sort());
+    expect(assignment.every((group: string[]) => group.length > 0)).toBe(true);
+    expect(plan.weights['tests/new.test.ts']).toBeUndefined();
+  });
+
+  it.each(['one-observation', 'failed', 'duplicate-run', 'duplicate-job', 'unknown-file', 'wrong-source', 'bad-artifact', 'raw-diagnostic'])('rejects %s historical profile evidence', variant => {
+    const input = fixtureProfile();
+    if (variant === 'one-observation') input.observations.pop();
+    if (variant === 'failed') input.observations[0].conclusion = 'FAILURE';
+    if (variant === 'duplicate-run') input.observations[1] = structuredClone(input.observations[0]);
+    if (variant === 'duplicate-job') input.observations[1].jobs[0].jobId = input.observations[0].jobs[0].jobId;
+    if (variant === 'unknown-file') input.observations[0].receipt.shards[0].modules[0].file = 'tests/unknown.test.ts';
+    if (variant === 'wrong-source') input.observations[0].receipt.shards[0].source.commitSha = 'c'.repeat(40);
+    if (variant === 'bad-artifact') input.observations[0].artifact.receiptSha256 = 'malformed';
+    if (variant === 'raw-diagnostic') (input.observations[0] as any).diagnostics = 'AF_TEST_ONLY_PRIVATE_DIAGNOSTIC';
+    expect(() => profile.timingPlan(input, files)).toThrow('CI_WINDOWS_PROFILE_INVALID');
+  });
+
+  it.each(['zero-cost', 'oversized-cost', 'extra-file', 'changed-profile', 'changed-plan', 'old-algorithm'])('rejects %s weighted receipts rather than manufacturing a complete aggregate', variant => {
+    const expected = { ...metadata(), algorithm: 'vitest-max-observed-lpt-four-shards-v1', plan: profile.timingPlan(fixtureProfile(), files) };
+    const input = profile.assignedFiles(expected).map((assigned: string[], index: number) => ({ ...structuredClone(expected), shard: index + 1,
+      modules: assigned.map(file => ({ file, state: 'passed', durationMs: 12, prepareMs: 3, collectMs: 2, setupMs: 1, environmentMs: 0 })) }));
+    if (variant === 'zero-cost') input[0].plan.weights[files[0]] = 0;
+    if (variant === 'oversized-cost') input[0].plan.weights[files[0]] = 6 * 60 * 60 * 1000 + 1;
+    if (variant === 'extra-file') input[0].plan.weights['tests/unknown.test.ts'] = 1;
+    if (variant === 'changed-profile') input[0].plan.profileSha256 = 'c'.repeat(64);
+    if (variant === 'changed-plan') input[0].plan.weights[files[0]]++;
+    if (variant === 'old-algorithm') { input[0].algorithm = 'vitest-default-sha1-four-shards-v1'; delete input[0].plan; }
+    expect(() => profile.aggregate(input, expected)).toThrow('CI_WINDOWS_PROFILE_INVALID');
   });
 
   it.each([
@@ -86,10 +137,14 @@ describe('bounded public Windows timing evidence', () => {
       fs.mkdirSync(path.join(root, 'node_modules'), { recursive: true });
       fs.symlinkSync(path.join(repository, 'node_modules', 'vitest'), vitestLink, 'junction');
       fs.mkdirSync(path.join(root, 'tests')); fs.mkdirSync(path.join(root, 'scripts'));
-      for (const name of ['run-test-suite.cjs', 'test-output-sanitizer.cjs', 'windows-test-profile.cjs']) fs.copyFileSync(path.join(repository, 'scripts', name), path.join(root, 'scripts', name));
+      for (const name of ['run-test-suite.cjs', 'test-output-sanitizer.cjs', 'windows-test-profile.cjs', 'windows-test-sequencer.mjs', 'windows-test-profile.json']) fs.copyFileSync(path.join(repository, 'scripts', name), path.join(root, 'scripts', name));
       fs.writeFileSync(path.join(root, '.gitignore'), 'node_modules/\n');
       const hook = path.join(repository, 'tests/testOutputSanitizer.ts').replace(/\\/g, '/');
-      fs.writeFileSync(path.join(root, 'vite.config.mjs'), `export default { test: { setupFiles: [${JSON.stringify(hook)}] } };`);
+      fs.writeFileSync(path.join(root, 'vite.config.mjs'), [
+        "import WindowsTestSequencer from './scripts/windows-test-sequencer.mjs';",
+        "const enabled = process.env.AGENTFORGE_WINDOWS_PROFILE_SEQUENCE === '1'; delete process.env.AGENTFORGE_WINDOWS_PROFILE_SEQUENCE;",
+        `export default { test: { setupFiles: [${JSON.stringify(hook)}], ...(enabled ? { sequence: { sequencer: WindowsTestSequencer } } : {}) } };`,
+      ].join('\n'));
       for (const letter of ['a', 'b', 'c', 'd']) fs.writeFileSync(path.join(root, 'tests', `${letter}.test.ts`), "import { it, expect } from 'vitest'; it('AF_TEST_ONLY_PRIVATE_DIAGNOSTIC', () => expect(true).toBe(true));\n");
       fs.writeFileSync(path.join(root, 'tests/a.test.ts'), [
         "import { it, expect } from 'vitest'; import { spawnSync } from 'node:child_process';",
