@@ -6,7 +6,7 @@
 > **Baseline Git Tree SHA**: `e6afe8d9bcd84f15638a54e442bd196c89db29b1`
 > **Historical Verification Evidence**: Workflow Run [35180140476](https://github.com/thanhtuyen662002/Agent-Forge/actions/runs/35180140476)
 > **Trial Branch**: `docs/r5l0-production-trial-readiness`
-> **Pull Request**: [#56](https://github.com/thanhtuyen662002/Agent-Forge/pull/56) (Draft)
+> **Planning Pull Request**: [#56](https://github.com/thanhtuyen662002/Agent-Forge/pull/56) (merged; planning approval does not authorize a live trial)
 
 ---
 
