@@ -127,6 +127,15 @@ describe('durable output sanitization boundaries', () => {
     expect(fs.readdirSync(root)).toEqual(entries);
   });
 
+  it.each([
+    JSON.stringify({ api_key: { first: 'AF_TEST_ONLY_FIRST', second: secret } }),
+    'password=[REDACTED_SECRET]' + secret,
+  ])('rejects compound or incomplete-marker credential text before publication %#', payload => {
+    const artifacts = new ArtifactStore(root);
+    expect(() => artifacts.store('evidence', 'P', 'T', null, 'CUSTOM', 'fixture diagnostic', payload)).toThrow('OUTPUT_REDACTION_UNSAFE');
+    expect(fs.readdirSync(root)).toEqual([]);
+  });
+
   it('binds structured redaction to safe JSON artifact bytes with nullable credential fields', () => {
     const input = { password: null, api_key: '', nested: [{ sessionToken: null }], token_count: 0, note: 'ordinary fixture diagnostic' };
     const safe = sanitizeOutputValue(input);

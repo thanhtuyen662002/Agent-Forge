@@ -54,6 +54,25 @@ describe('bounded shared output sanitizer', () => {
     expect(sanitizeOutputValue(value)).toEqual(value);
   });
 
+  it('preserves complete replacement markers at real assignment boundaries', () => {
+    for (const text of [
+      'password=' + REDACTED_SECRET,
+      'password=' + REDACTED_SECRET + ' \t; ordinary diagnostic',
+      'password=' + REDACTED_SECRET + '\nordinary diagnostic',
+      JSON.stringify({ password: REDACTED_SECRET, apiKey: REDACTED_SECRET }),
+      JSON.stringify({ stdout: 'password=' + REDACTED_SECRET + '\n', stderr: JSON.stringify({ api_key: REDACTED_SECRET }) }),
+      JSON.stringify(JSON.stringify({ stderr: 'password=' + REDACTED_SECRET + '\n' })),
+    ]) expect(redactSensitiveText(text)).toBe(text);
+  });
+
+  it.each([
+    'password=[' + opaque + ',"second-fixture"]',
+    'password=' + REDACTED_SECRET + ' ' + opaque,
+    '%70%61%73%73%77%6f%72%64%3d%5bREDACTED_SECRET%5d' + opaque,
+  ])('rejects unbounded credential members or an incomplete marker %# with a fixed error', text => {
+    expect(() => redactSensitiveText(text)).toThrow('OUTPUT_REDACTION_UNSAFE: Durable output could not be sanitized safely.');
+  });
+
   it('redacts sensitive structured keys including encoded/camel-case names without mutating input', () => {
     const input = { apiKey: opaque, OPENAI_API_KEY: opaque, nested: [{ 'private-key': opaque }, { 'api\\u005fkey': opaque }], password: null, empty: '' };
     const safe = sanitizeOutputValue(input);

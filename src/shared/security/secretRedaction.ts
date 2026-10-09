@@ -30,8 +30,16 @@ const keyName = '(?:api[_ -]?key|password|passwd|pwd|secret|token|access[_ -]?to
 // while leaving *_id, *_hash and token_count metadata unchanged.
 const credentialName = '(?:[a-z][a-z0-9]{0,31}[_-]){0,4}' + keyName;
 const credentialKey = new RegExp('^' + credentialName + '$', 'i');
-const assignment = new RegExp('(\\b' + credentialName + '\\b["\']?\\s*[:=]\\s*)' +
-  String.raw`(\[REDACTED_SECRET\]|"(?:\\(?:[\s\S]|$)|[^"\\])*(?:"|$)|'(?:\\(?:[\s\S]|$)|[^'\\])*(?:'|$)|[^\r\n,;}\]]+)`, 'gi');
+const assignmentPrefix = '(\\b' + credentialName + '\\b["\']?\\s*[:=]\\s*)';
+// A diagnostic may be embedded in JSON text. Accept quotes/newlines escaped
+// through at most four JSON layers, still requiring a complete value boundary.
+const markerEnd = String.raw`(?=[ \t]*(?:$|[\r\n,;}\]"']|\\{1,15}[nr"']))`;
+// Text has no trustworthy structure for a compound credential value. Reject
+// it rather than replacing only its first member, or trusting a marker prefix.
+const unsafeCompoundAssignment = new RegExp(assignmentPrefix +
+  String.raw`(?:\{|\[(?!REDACTED_SECRET\]` + markerEnd + '))', 'i');
+const assignment = new RegExp(assignmentPrefix +
+  String.raw`(\[REDACTED_SECRET\]` + markerEnd + String.raw`|"(?:\\(?:[\s\S]|$)|[^"\\])*(?:"|$)|'(?:\\(?:[\s\S]|$)|[^'\\])*(?:'|$)|[^\r\n,;}\]]+)`, 'gi');
 const patterns = [
   /\bsk-(?:[A-Za-z0-9_-]{10,})/g,
   /\bAIza[A-Za-z0-9_-]{20,}/g,
@@ -47,6 +55,7 @@ const patterns = [
 ];
 
 function redactPlainText(text: string, omitAssignmentLabels = false): string {
+  if (unsafeCompoundAssignment.test(text)) throw new OutputSanitizationError('OUTPUT_REDACTION_UNSAFE');
   let result = text;
   for (const pattern of patterns) result = result.replace(pattern, REDACTED_SECRET);
   // Userinfo can contain a token without a literal ':' (including percent
