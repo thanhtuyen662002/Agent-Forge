@@ -61,7 +61,17 @@ describe('complete Windows suite aggregation', () => {
     expect(run.env.AGENTFORGE_TEST_SINGLE_RUN).toBe('1');
     expect(run.env.AGENTFORGE_TEST_FILES).toBe('');
     expect(run.env.AGENTFORGE_TEST_PHASE).toBe('');
-    expect(shards.steps.some((step: any) => step.uses?.startsWith('actions/upload-artifact@'))).toBe(false);
+    expect(run.env.AGENTFORGE_WINDOWS_TEST_PROFILE).toBe('1');
+    expect(run.env.AGENTFORGE_PROFILE_SOURCE_SHA).toBe("${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}");
+    const uploads = shards.steps.filter((step: any) => step.uses?.startsWith('actions/upload-artifact@'));
+    expect(uploads).toHaveLength(1);
+    expect(uploads[0].with).toEqual({
+      name: 'agentforge-windows-profile-${{ github.run_id }}-${{ github.run_attempt }}-${{ matrix.shard }}',
+      path: 'node_modules/.cache/agentforge-windows-profile/shard-${{ matrix.shard }}.json',
+      'include-hidden-files': true, 'if-no-files-found': 'error', 'retention-days': 7,
+    });
+    expect(uploads[0].if).toBeUndefined();
+    expect(uploads[0]['continue-on-error']).toBeUndefined();
   });
 
   it('preserves required contexts, independent Ubuntu and fail-closed package dependencies', () => {
@@ -82,6 +92,21 @@ describe('complete Windows suite aggregation', () => {
       CI_WINDOWS_SHARDS_RESULT: '${{ needs.windows-test-shards.result }}',
     });
     expect(windows.steps.some((step: any) => step.run === 'npm run build')).toBe(true);
+    const download = windows.steps.find((step: any) => step.name === 'Download public shard timing');
+    expect(download.with).toEqual({
+      pattern: 'agentforge-windows-profile-${{ github.run_id }}-*',
+      path: 'node_modules/.cache/agentforge-windows-profile/incoming', 'merge-multiple': false,
+    });
+    const profileGate = windows.steps.find((step: any) => step.name === 'Require exact-source complete timing inventory');
+    expect(profileGate.run).toBe('node scripts/windows-test-profile.cjs aggregate');
+    expect(profileGate.if).toBe("needs.classify.outputs.package_required == 'true'");
+    expect(profileGate['continue-on-error']).toBeUndefined();
+    expect(windows.steps.indexOf(profileGate)).toBeLessThan(windows.steps.findIndex((step: any) => step.run === 'npm run build'));
+    const timingUpload = windows.steps.find((step: any) => step.name === 'Upload complete public timing profile');
+    expect(timingUpload.with.path).toBe('node_modules/.cache/agentforge-windows-profile/combined.json');
+    expect(timingUpload.with['include-hidden-files']).toBe(true);
+    expect(timingUpload.with['if-no-files-found']).toBe('error');
+    expect(timingUpload.if).toBe("needs.classify.outputs.package_required == 'true'");
     expect(jobs['package-windows'].name).toBe('Package Windows (windows-latest, Node 22.x)');
     expect(jobs['package-windows'].needs).toEqual(['classify', 'validate', 'validate-windows']);
     const upstream = jobs['package-windows'].steps.find((step: any) => step.name === 'Require upstream gates');

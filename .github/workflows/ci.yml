@@ -77,7 +77,18 @@ jobs:
           AGENTFORGE_TEST_SINGLE_RUN: '1'
           AGENTFORGE_TEST_FILES: ''
           AGENTFORGE_TEST_PHASE: ''
+          AGENTFORGE_WINDOWS_TEST_PROFILE: '1'
+          AGENTFORGE_PROFILE_SOURCE_SHA: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
         run: npm test -- --shard=${{ matrix.shard }}/4
+
+      - name: Upload bounded public shard timing
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: agentforge-windows-profile-${{ github.run_id }}-${{ github.run_attempt }}-${{ matrix.shard }}
+          path: node_modules/.cache/agentforge-windows-profile/shard-${{ matrix.shard }}.json
+          include-hidden-files: true
+          if-no-files-found: error
+          retention-days: 7
 
       - name: Write shard summary
         if: always()
@@ -199,9 +210,33 @@ jobs:
         if: needs.classify.outputs.package_required == 'true'
         run: npm ci
 
+      - name: Download public shard timing
+        if: needs.classify.outputs.package_required == 'true'
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
+        with:
+          pattern: agentforge-windows-profile-${{ github.run_id }}-*
+          path: node_modules/.cache/agentforge-windows-profile/incoming
+          merge-multiple: false
+
+      - name: Require exact-source complete timing inventory
+        if: needs.classify.outputs.package_required == 'true'
+        env:
+          AGENTFORGE_PROFILE_SOURCE_SHA: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
+        run: node scripts/windows-test-profile.cjs aggregate
+
       - name: Build application
         if: needs.classify.outputs.package_required == 'true'
         run: npm run build
+
+      - name: Upload complete public timing profile
+        if: needs.classify.outputs.package_required == 'true'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: agentforge-windows-timing-${{ github.run_id }}-${{ github.run_attempt }}
+          path: node_modules/.cache/agentforge-windows-profile/combined.json
+          include-hidden-files: true
+          if-no-files-found: error
+          retention-days: 7
 
       - name: Validate PR diff hygiene
         if: github.event_name == 'pull_request'

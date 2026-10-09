@@ -17,6 +17,7 @@ const fs = require('node:fs');
 const os = require('node:os');
 const { spawnSync } = require('node:child_process');
 const { sanitizeCapturedOutput } = require('./test-output-sanitizer.cjs');
+const windowsProfile = require('./windows-test-profile.cjs');
 
 const repositoryRoot = path.resolve(__dirname, '..');
 const vitestEntry = path.join(repositoryRoot, 'node_modules', 'vitest', 'vitest.mjs');
@@ -41,8 +42,14 @@ const focusedFiles = String(process.env.AGENTFORGE_TEST_FILES || '')
   .filter(Boolean);
 
 const runVitest = (label, args) => {
+  let profile;
+  if (process.env.AGENTFORGE_WINDOWS_TEST_PROFILE === '1') {
+    try { profile = windowsProfile.prepare(repositoryRoot, process.env, reporterArgs); }
+    catch { process.stderr.write('CI_WINDOWS_PROFILE_INVALID\n'); return 1; }
+  }
   process.stdout.write(`\n=== Agent Forge ${label} test phase ===\n`);
-  const result = spawnSync(process.execPath, [vitestEntry, 'run', ...args, ...reporterArgs], {
+  const profileArgs = profile ? ['--reporter=default', '--reporter=./scripts/windows-test-profile.cjs'] : [];
+  const result = spawnSync(process.execPath, [vitestEntry, 'run', ...args, ...reporterArgs, ...profileArgs], {
     cwd: repositoryRoot,
     env: testEnvironment,
     // Capture the Vitest parent process so reporter assertion summaries pass
@@ -61,7 +68,13 @@ const runVitest = (label, args) => {
     process.stderr.write(`${label} test phase failed to start: ${result.error.message}\n`);
     return 1;
   }
-  if (typeof result.status === 'number') return result.status;
+  if (typeof result.status === 'number') {
+    if (result.status === 0 && profile) {
+      try { windowsProfile.finish(repositoryRoot, profile); }
+      catch { process.stderr.write('CI_WINDOWS_PROFILE_INVALID\n'); return 1; }
+    }
+    return result.status;
+  }
   if (result.signal) {
     process.stderr.write(`${label} test phase terminated by ${result.signal}\n`);
     return 1;
