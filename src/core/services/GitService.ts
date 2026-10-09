@@ -2,6 +2,7 @@ import { ProcessRunner } from './ProcessRunner';
 import { PolicyService } from './PolicyService';
 import { GitStatusSummary, GitDiffSummary } from '../types/domain';
 import { assertRepositoryRootIdentity, captureRepositoryRoot, RepositoryRootError, RepositoryRootErrorCode, RepositoryRootIdentity } from './RepositoryRootIdentity';
+import { RepositoryRootLease } from './RepositoryRootLease';
 
 /**
  * Error codes returned when an evidence/review revision fails validation.
@@ -79,24 +80,25 @@ export class GitService {
   private static async read(identity: RepositoryRootIdentity, args: string[], timeoutMs: number): Promise<{
     exitCode: number; stdout: string; stderr: string; errorCode?: RepositoryRootErrorCode;
   }> {
+    let lease: RepositoryRootLease | undefined;
     try {
-      assertRepositoryRootIdentity(identity);
+      lease = RepositoryRootLease.acquire(identity);
       const result = await ProcessRunner.execute({
         executable: 'git',
         args: ['-c', 'core.fsmonitor=false', '-c', 'core.untrackedCache=false', ...args],
-        cwd: identity.canonicalPath,
+        cwd: lease.cwd,
         timeoutMs,
         env: { GIT_OPTIONAL_LOCKS: '0' },
         allowedEnvKeys: ['GIT_OPTIONAL_LOCKS'],
       });
-      // Discard every observation from a changed root. A path snapshot is not
-      // an atomic kernel lease and must not authorize subsequent mutations.
-      assertRepositoryRootIdentity(identity);
+      // Windows keeps the selected name pinned; Linux Git uses the held root
+      // descriptor even if its pathname is swapped. Discard stale observations.
+      lease.assertActive();
       return { exitCode: result.exitCode, stdout: result.stdout, stderr: result.stderr };
     } catch (error) {
       if (!(error instanceof RepositoryRootError)) throw error;
       return { exitCode: -1, stdout: '', stderr: error.message, errorCode: error.code };
-    }
+    } finally { lease?.close(); }
   }
 
   public static async getHeadSha(repoPath: string, expectedRoot?: RepositoryRootIdentity): Promise<GitShaResult> {
@@ -187,7 +189,7 @@ export class GitService {
     if (res.exitCode !== 0) {
       return {
         status: 'ERROR',
-        branch: branchName,
+        branch: res.errorCode ? 'UNKNOWN' : branchName,
         isClean: false,
         modifiedFiles: [],
         untrackedFiles: [],

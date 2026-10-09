@@ -8,6 +8,7 @@ import fs from 'fs';
 import os from 'os';
 import { execFileSync } from 'child_process';
 import { captureRepositoryRoot } from '../src/core/services/RepositoryRootIdentity';
+import { RepositoryRootLease } from '../src/core/services/RepositoryRootLease';
 
 function runGit(cwd: string, args: string[]): string {
   return execFileSync('git', args, {
@@ -220,12 +221,12 @@ describe('GitService Fail-Closed Behavior', () => {
   it('discards a completed branch observation when the root changes before status collection', async () => {
     const fixture = createGitFixture();
     const original = fixture.root + '-original';
-    const actual = ProcessRunner.execute.bind(ProcessRunner);
-    const execute = vi.spyOn(ProcessRunner, 'execute').mockImplementationOnce(async options => {
-      const result = await actual(options);
+    const execute = vi.spyOn(ProcessRunner, 'execute');
+    const originalClose = RepositoryRootLease.prototype.close;
+    vi.spyOn(RepositoryRootLease.prototype, 'close').mockImplementationOnce(function (this: RepositoryRootLease) {
+      originalClose.call(this);
       fs.renameSync(fixture.root, original); fs.mkdirSync(fixture.root);
       fs.writeFileSync(path.join(fixture.root, 'sentinel'), 'replacement-owner');
-      return result;
     });
     try {
       const result = await GitService.getStatus(fixture.root);
@@ -237,6 +238,38 @@ describe('GitService Fail-Closed Behavior', () => {
     } finally {
       fs.rmSync(fixture.root, { recursive: true, force: true });
       fs.rmSync(original, { recursive: true, force: true });
+    }
+  });
+
+  it('holds the original root across the final ProcessRunner invocation boundary', async () => {
+    const fixture = createGitFixture();
+    const original = fixture.root + '-original';
+    const actual = ProcessRunner.execute.bind(ProcessRunner);
+    let replacementBlocked = false;
+    vi.spyOn(ProcessRunner, 'execute').mockImplementationOnce(async options => {
+      if (process.platform === 'win32') {
+        expect(() => fs.renameSync(fixture.root, original)).toThrow();
+        replacementBlocked = true;
+      } else {
+        fs.renameSync(fixture.root, original); fs.mkdirSync(fixture.root);
+        fs.writeFileSync(path.join(fixture.root, 'sentinel'), 'replacement-owner');
+      }
+      return actual(options);
+    });
+    try {
+      const result = await GitService.getHeadSha(fixture.root);
+      if (process.platform === 'win32') {
+        expect(replacementBlocked).toBe(true);
+        expect(result).toMatchObject({ status: 'SUCCESS', sha: fixture.baseSha });
+        expect(fs.readFileSync(path.join(fixture.root, 'tracked.txt'), 'utf8')).toBe('after\n');
+      } else {
+        expect(result).toMatchObject({ status: 'ERROR', sha: null, errorCode: 'REPOSITORY_ROOT_IDENTITY_CHANGED' });
+        expect(fs.readdirSync(fixture.root)).toEqual(['sentinel']);
+        expect(fs.readFileSync(path.join(original, 'tracked.txt'), 'utf8')).toBe('after\n');
+      }
+    } finally {
+      fs.rmSync(fixture.root, { recursive: true, force: true });
+      if (fs.existsSync(original)) fs.rmSync(original, { recursive: true, force: true });
     }
   });
 });

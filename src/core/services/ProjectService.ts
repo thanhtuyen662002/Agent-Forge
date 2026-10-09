@@ -5,6 +5,7 @@ import { ProjectStateMachine, ProjectTrigger } from '../state/projectStateMachin
 import { Project, ProjectContract, ProjectStatus } from '../types/domain';
 import { ProjectStopFenceService } from './ProjectStopFenceService';
 import { assertRepositoryRootIdentity, RepositoryRootIdentity } from './RepositoryRootIdentity';
+import { RepositoryRootLease } from './RepositoryRootLease';
 
 export class ProjectService {
   private readonly stopFence: ProjectStopFenceService;
@@ -32,11 +33,12 @@ export class ProjectService {
       completed_at: null,
     };
 
-    this.repo.runInImmediateTransaction(() => {
+    const lease = rootIdentity ? RepositoryRootLease.acquire(rootIdentity) : undefined;
+    try { this.repo.runInImmediateTransaction(() => {
       this.repo.createProject(project, rootIdentity);
       this.eventService.record(project.id, 'PROJECT_CREATED', `Project "${name}" initialized in DRAFT state.`);
       if (rootIdentity) assertRepositoryRootIdentity(rootIdentity);
-    });
+    }); } finally { lease?.close(); }
     return project;
   }
 

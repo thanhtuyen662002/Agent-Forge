@@ -1,5 +1,6 @@
 import Database from 'better-sqlite3';
 import fs from 'node:fs';
+import { execFileSync } from 'node:child_process';
 import os from 'node:os';
 import path from 'node:path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
@@ -30,6 +31,7 @@ describe('ProjectRepository extraction contract', () => {
     const fixture = fs.realpathSync.native(fs.mkdtempSync(path.join(os.tmpdir(), 'af-project-root-')));
     fixtures.push(fixture);
     const root = path.join(fixture, 'repository'); fs.mkdirSync(root);
+    execFileSync('git', ['init', '-q'], { cwd: root, stdio: 'ignore', windowsHide: true });
     fs.writeFileSync(path.join(root, 'sentinel'), 'selected-owner');
     return { fixture, root };
   }
@@ -178,6 +180,33 @@ describe('ProjectRepository extraction contract', () => {
     for (const table of ['projects', 'project_repository_identities', 'events']) {
       expect(db!.prepare(`SELECT COUNT(*) AS count FROM ${table}`).get()).toEqual({ count: 0 });
     }
+  });
+
+  it('holds selected root authority through the real project, receipt and event transaction', () => {
+    const { root } = fixtureRoot();
+    const current = services();
+    const record = current.events.record.bind(current.events);
+    let reached = false;
+    vi.spyOn(current.events, 'record').mockImplementationOnce((...args) => {
+      reached = true;
+      if (process.platform === 'win32') expect(() => fs.renameSync(root, root + '-original')).toThrow();
+      else { fs.renameSync(root, root + '-original'); fs.mkdirSync(root); }
+      return record(...args);
+    });
+    const create = () => current.projects.createProject('Pinned transaction', 'Authority fixture', root, 'main', captureRepositoryRoot(root));
+    if (process.platform === 'win32') {
+      const project = create();
+      expect(current.repository.getProjectRepositoryIdentity(project.id).canonicalPath).toBe(root);
+      expect(current.repository.getEvents(project.id).map(event => event.type)).toContain('PROJECT_CREATED');
+      fs.renameSync(root, root + '-original');
+      expect(fs.readFileSync(path.join(root + '-original', 'sentinel'), 'utf8')).toBe('selected-owner');
+    } else {
+      expect(create).toThrow('REPOSITORY_ROOT_IDENTITY_CHANGED');
+      for (const table of ['projects', 'project_repository_identities', 'events']) {
+        expect(db!.prepare(`SELECT COUNT(*) AS count FROM ${table}`).get()).toEqual({ count: 0 });
+      }
+    }
+    expect(reached).toBe(true);
   });
 
   it('does not adopt a historical metadata path without a selected identity', () => {

@@ -1,6 +1,7 @@
 import Database from 'better-sqlite3';
 import { Project, ProjectContract, ProjectStatus } from '../../types/domain';
 import { assertRepositoryRootIdentity, RepositoryRootError, RepositoryRootIdentity } from '../../services/RepositoryRootIdentity';
+import { RepositoryRootLease } from '../../services/RepositoryRootLease';
 
 /**
  * Project persistence boundary extracted from the compatibility Repository
@@ -14,7 +15,8 @@ export class ProjectRepository {
     if (rootIdentity && project.repository_path !== rootIdentity.canonicalPath) throw new RepositoryRootError('REPOSITORY_ROOT_IDENTITY_CHANGED');
     const receipt = rootIdentity ? JSON.stringify(rootIdentity) : null;
     if (receipt && Buffer.byteLength(receipt) > 262_144) throw new RepositoryRootError('REPOSITORY_ROOT_IDENTITY_UNAVAILABLE');
-    this.db.transaction(() => {
+    const lease = rootIdentity ? RepositoryRootLease.acquire(rootIdentity) : undefined;
+    try { this.db.transaction(() => {
       if (rootIdentity) assertRepositoryRootIdentity(rootIdentity);
       this.db
         .prepare(`
@@ -41,7 +43,7 @@ export class ProjectRepository {
           VALUES (?, ?, ?, ?)`).run(project.id, rootIdentity.canonicalPath, receipt, project.created_at);
         assertRepositoryRootIdentity(rootIdentity);
       }
-    }).immediate();
+    }).immediate(); } finally { lease?.close(); }
   }
 
   public getProject(id: string): Project | null {
