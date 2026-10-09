@@ -703,6 +703,58 @@ describe('product-task autonomy consolidation', () => {
     ]);
   });
 
+  it('includes verified file-backed failure diagnostics in the real manager repair context', async () => {
+    adapter = new ProductTaskAutonomyAdapter({ repo, autonomyStore: store,
+      artifactStore: new ArtifactStore(path.join(root, 'artifacts'), 0) });
+    const fixture = await seed('task-file-repair-context');
+    const stdout = 'FAIL actual-evidence-case\n' + 'diagnostic '.repeat(3100);
+    const run = adapter.recordVerificationObservation({ projectId: fixture.task.project_id, taskId: fixture.task.id,
+      attemptId: fixture.authorization.attempt_id, command: 'test failure', status: 'FAILED', exitCode: 1, passedCount: 0,
+      failedCount: 1, durationMs: 1, stdout, stderr: 'actual stderr', workingDirectory: root });
+    expect(repo.getEvidence(run.evidence_id!)?.storage_type).toBe('FILE');
+    const taskBefore = repo.getTask(fixture.task.id);
+    const workOrder = adapter.buildAuthorizedWorkOrder(workOrderInput(fixture));
+    const context = adapter.buildManagerContext(workOrder, BASE_SHA);
+    expect(context.deterministic_tests).toMatchObject([{ stdout: expect.stringContaining('FAIL actual-evidence-case'),
+      stderr: 'actual stderr', evidenceStatus: 'VERIFIED', success: false }]);
+    expect(repo.getTask(fixture.task.id)).toEqual(taskBefore);
+  });
+
+  it.each(['removed', 'corrupt', 'changed-during-review'] as const)('cannot complete a product task with %s current artifact evidence', async mode => {
+    adapter = new ProductTaskAutonomyAdapter({ repo, autonomyStore: store,
+      artifactStore: new ArtifactStore(path.join(root, 'artifacts'), 0) });
+    const fixture = await seed(`task-current-artifact-${mode}`);
+    let currentArtifact: string | undefined;
+    const conductReview = vi.fn(async (context: { current_head: string }) => {
+      if (mode === 'changed-during-review') fs.unlinkSync(currentArtifact!);
+      return { protocol_version: 'managerreview.v1' as const, verdict: 'PASS' as const,
+        reviewed_head_sha: context.current_head, findings: [], required_actions: [], risk: 'LOW' as const, notes: 'review completed' };
+    });
+    const result = await adapter.executeProductTask({ ...workOrderInput(fixture),
+      runCoder: async () => ({ success: true, currentHeadSha: BASE_SHA }),
+      evidenceCollector: { collect: async () => ({ headSha: BASE_SHA, snapshotSha: 'stable-snapshot', status: '',
+        changedFiles: ['src'], diff: 'actual diff', tests: [] }) },
+      runVerification: async (authority, workOrder, binding) => {
+        const run = adapter.recordVerificationObservation({ projectId: authority.task.project_id, taskId: authority.task.id,
+          attemptId: authority.authorization.attempt_id, command: 'node --version', status: 'COMPLETED', exitCode: 0,
+          passedCount: 1, failedCount: 0, durationMs: 1, stdout: process.version, workingDirectory: workOrder!.worktree,
+          expectedRevision: binding!.expectedRevision, expectedOwnershipEpoch: binding!.expectedOwnershipEpoch,
+          expectedState: binding!.expectedState, executionId: binding!.executionId });
+        const evidence = repo.getEvidence(run.evidence_id!)!;
+        currentArtifact = evidence.file_path!;
+        expect(evidence.raw_payload).toBeNull(); expect(evidence.storage_type).toBe('FILE');
+        if (mode === 'removed') fs.unlinkSync(evidence.file_path!);
+        else if (mode === 'corrupt') fs.writeFileSync(evidence.file_path!, 'corrupt replacement');
+        return run;
+      }, conductReview,
+    });
+    expect(result.success).toBe(false); expect(result.error).toBe('VERIFICATION_EVIDENCE_READ_FAILED');
+    expect(result.verificationReport?.evidenceStatus).toBe('INCOMPLETE');
+    expect(repo.getTask(fixture.task.id)?.state).toBe('CODING');
+    expect(conductReview).toHaveBeenCalledTimes(mode === 'changed-during-review' ? 1 : 0);
+    expect(repo.getAllWorkerSlots().every(slot => slot.status === 'IDLE')).toBe(true);
+  });
+
   it('rejects and does not persist a verification observation after the ownership epoch changes', async () => {
     const fixture = await seed('task-stale-observation');
     const captured = repo.getTask(fixture.task.id)!;

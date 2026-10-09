@@ -7,6 +7,8 @@ import {
   computePayloadHash,
 } from '../services/ExecutionAuthorizationService';
 import { ArtifactStore } from '../services/ArtifactStore';
+import { ProcessRunner } from '../services/ProcessRunner';
+import { redactTrialEvidenceText } from './trialEvidence';
 import { VerificationCapabilityService } from '../services/VerificationCapabilityService';
 import { EventService } from '../services/EventService';
 import { TaskService, captureAuthorizedTaskTransitionBinding } from '../services/TaskService';
@@ -47,6 +49,20 @@ import {
 
 /** Consolidation supports an explicitly configured two-worker maximum (1 or 2). */
 export const MAX_AGY_WORKERS = 2;
+export const VERIFICATION_REPORT_MAX_ATTEMPTS = 64;
+export const VERIFICATION_REPORT_MAX_READ_BYTES = 1024 * 1024;
+export const VERIFICATION_REPORT_MAX_TOTAL_READ_BYTES = 8 * 1024 * 1024;
+export const VERIFICATION_REPORT_MAX_OUTPUT_CHARACTERS = 32 * 1024;
+
+export type VerificationEvidenceErrorCode =
+  | 'VERIFICATION_EVIDENCE_MISSING'
+  | 'VERIFICATION_EVIDENCE_SCOPE_INVALID'
+  | 'VERIFICATION_EVIDENCE_SCOPE_CHANGED'
+  | 'VERIFICATION_EVIDENCE_PROCESS_INVALID'
+  | 'VERIFICATION_EVIDENCE_METADATA_INVALID'
+  | 'VERIFICATION_EVIDENCE_LIMIT_EXCEEDED'
+  | 'VERIFICATION_EVIDENCE_READ_FAILED'
+  | 'VERIFICATION_EVIDENCE_FORMAT_INVALID';
 
 export interface ProductTaskAuthority {
   task: Task;
@@ -73,6 +89,11 @@ export interface VerificationAttemptSummary {
   evidenceId: string | null;
   createdAt: string;
   success: boolean;
+  stdout: string;
+  stderr: string;
+  evidenceStatus: 'VERIFIED' | 'INCOMPLETE';
+  evidenceErrorCode?: VerificationEvidenceErrorCode;
+  outputTruncated: boolean;
 }
 
 export interface TruthfulVerificationReport {
@@ -82,6 +103,8 @@ export interface TruthfulVerificationReport {
   latestAttemptPassed: boolean;
   hadPriorFailure: boolean;
   attempts: VerificationAttemptSummary[];
+  evidenceStatus: 'COMPLETE' | 'INCOMPLETE';
+  evidenceErrorCode?: VerificationEvidenceErrorCode;
 }
 
 export interface ProductTaskAutonomyAdapterOptions {
@@ -601,27 +624,116 @@ export class ProductTaskAutonomyAdapter {
   }
 
   public getTruthfulVerificationReport(taskId: string): TruthfulVerificationReport {
-    const attempts = this.repo.getTestRunsByTaskId(taskId).map((run, index) => ({
-      attemptNumber: index + 1,
-      testRunId: run.id,
-      command: run.command,
-      passedCount: run.passed_count,
-      failedCount: run.failed_count,
-      skippedCount: run.skipped_count,
-      durationMs: run.duration_ms,
-      exitCode: run.exit_code,
-      evidenceId: run.evidence_id,
-      createdAt: run.created_at,
-      success: run.exit_code === 0 && run.failed_count === 0,
-    }));
-    const latestAttemptPassed = attempts.at(-1)?.success ?? false;
+    const task = this.repo.getTask(taskId);
+    const db = this.repo.getDatabase();
+    const totalAttempts = (db.prepare('SELECT COUNT(*) AS count FROM test_runs WHERE task_id=?').get(taskId) as { count: number }).count;
+    const runs = db.prepare(`SELECT * FROM test_runs WHERE task_id=? ORDER BY created_at ASC, rowid ASC LIMIT ?`)
+      .all(taskId, VERIFICATION_REPORT_MAX_ATTEMPTS) as TestRun[];
+    let remainingReadBytes = VERIFICATION_REPORT_MAX_TOTAL_READ_BYTES;
+    let reportError: VerificationEvidenceErrorCode | undefined = !task ? 'VERIFICATION_EVIDENCE_SCOPE_INVALID'
+      : totalAttempts > VERIFICATION_REPORT_MAX_ATTEMPTS ? 'VERIFICATION_EVIDENCE_LIMIT_EXCEEDED' : undefined;
+    const attempts: VerificationAttemptSummary[] = runs.map((run, index) => {
+      let stdout = '', stderr = '';
+      let evidenceErrorCode: VerificationEvidenceErrorCode | undefined = reportError;
+      let outputTruncated = false;
+      const reject = (code: VerificationEvidenceErrorCode): never => { throw new Error(code); };
+      try {
+        if (evidenceErrorCode) reject(evidenceErrorCode);
+        if (!run.evidence_id) reject('VERIFICATION_EVIDENCE_MISSING');
+        const evidence = this.repo.getEvidence(run.evidence_id!);
+        if (!evidence) reject('VERIFICATION_EVIDENCE_MISSING');
+        if (evidence!.project_id !== task!.project_id || evidence!.task_id !== taskId ||
+            (evidence!.attempt_id !== null && this.repo.getTaskAttempt(evidence!.attempt_id)?.task_id !== taskId)) {
+          reject('VERIFICATION_EVIDENCE_SCOPE_INVALID');
+        }
+        if (evidence!.evidence_type !== 'TEST_RESULT' || evidence!.content_type !== 'text/plain' ||
+            !['INLINE', 'FILE'].includes(evidence!.storage_type) || !/^[a-f0-9]{64}$/.test(evidence!.hash) ||
+            !Number.isSafeInteger(evidence!.byte_size) || evidence!.byte_size < 0) reject('VERIFICATION_EVIDENCE_METADATA_INVALID');
+        // A positive I/O bound also covers empty/corrupt size metadata without
+        // triggering ArtifactStore's default-bound fallback. Charge failed
+        // reads too; their bytes cannot disappear from the cumulative budget.
+        const readLimit = Math.max(1, evidence!.byte_size);
+        if (readLimit > Math.min(VERIFICATION_REPORT_MAX_READ_BYTES, remainingReadBytes)) {
+          reject('VERIFICATION_EVIDENCE_LIMIT_EXCEEDED');
+        }
+        const processes = db.prepare(`SELECT project_id,task_id,attempt_id,status,exit_code FROM process_runs
+          WHERE stdout_evidence_id=? OR stderr_evidence_id=? LIMIT 2`).all(evidence!.id, evidence!.id) as Array<{
+          project_id: string; task_id: string; attempt_id: string | null; status: string; exit_code: number | null;
+        }>;
+        if (processes.length > 1 || processes.some(process => process.project_id !== task!.project_id ||
+            process.task_id !== taskId || process.attempt_id !== evidence!.attempt_id) ||
+            (run.exit_code === 0 && (processes.length !== 1 || processes[0].status !== 'COMPLETED' || processes[0].exit_code !== 0))) {
+          reject('VERIFICATION_EVIDENCE_PROCESS_INVALID');
+        }
+        let payload: string;
+        remainingReadBytes -= readLimit;
+        try { payload = this.options.artifactStore.readText(evidence!, readLimit); }
+        catch { reject('VERIFICATION_EVIDENCE_READ_FAILED'); }
+        const stdoutMarker = '=== STDOUT ===\n', stderrMarker = '\n=== STDERR ===\n';
+        const start = payload!.indexOf(stdoutMarker);
+        const separator = payload!.indexOf(stderrMarker, start + stdoutMarker.length);
+        if (start < 0) {
+          if (run.exit_code === 0) reject('VERIFICATION_EVIDENCE_FORMAT_INVALID');
+          // Configuration failures have a verified plain diagnostic, not a
+          // process stdout/stderr envelope. Preserve it as failed stderr.
+          stderr = payload!;
+        } else {
+          if (separator < 0 || payload!.indexOf(stdoutMarker, start + stdoutMarker.length) >= 0 ||
+              payload!.indexOf(stderrMarker, separator + stderrMarker.length) >= 0) reject('VERIFICATION_EVIDENCE_FORMAT_INVALID');
+          stdout = payload!.slice(start + stdoutMarker.length, separator);
+          stderr = payload!.slice(separator + stderrMarker.length);
+        }
+        const bound = (value: string): string => {
+          const safe = redactTrialEvidenceText(ProcessRunner.scrubSecrets(value));
+          if (safe.length <= VERIFICATION_REPORT_MAX_OUTPUT_CHARACTERS) return safe;
+          outputTruncated = true;
+          const marker = '\n[VERIFICATION_REPORT_OUTPUT_TRUNCATED]';
+          return safe.slice(0, VERIFICATION_REPORT_MAX_OUTPUT_CHARACTERS - marker.length) + marker;
+        };
+        stdout = bound(stdout); stderr = bound(stderr);
+      } catch (error) {
+        const known: VerificationEvidenceErrorCode[] = [
+          'VERIFICATION_EVIDENCE_MISSING', 'VERIFICATION_EVIDENCE_SCOPE_INVALID', 'VERIFICATION_EVIDENCE_SCOPE_CHANGED',
+          'VERIFICATION_EVIDENCE_PROCESS_INVALID', 'VERIFICATION_EVIDENCE_METADATA_INVALID', 'VERIFICATION_EVIDENCE_LIMIT_EXCEEDED',
+          'VERIFICATION_EVIDENCE_READ_FAILED', 'VERIFICATION_EVIDENCE_FORMAT_INVALID',
+        ];
+        evidenceErrorCode = error instanceof Error && known.includes(error.message as VerificationEvidenceErrorCode)
+          ? error.message as VerificationEvidenceErrorCode : 'VERIFICATION_EVIDENCE_READ_FAILED';
+        stdout = ''; stderr = evidenceErrorCode;
+      }
+      return {
+        attemptNumber: index + 1,
+        testRunId: run.id,
+        command: redactTrialEvidenceText(ProcessRunner.scrubSecrets(run.command)).slice(0, 4096),
+        passedCount: run.passed_count,
+        failedCount: run.failed_count,
+        skippedCount: run.skipped_count,
+        durationMs: run.duration_ms,
+        exitCode: run.exit_code,
+        evidenceId: run.evidence_id,
+        createdAt: run.created_at,
+        success: !evidenceErrorCode && run.exit_code === 0 && run.failed_count === 0,
+        stdout, stderr, outputTruncated,
+        evidenceStatus: evidenceErrorCode ? 'INCOMPLETE' : 'VERIFIED', evidenceErrorCode,
+      };
+    });
+    const liveTask = this.repo.getTask(taskId);
+    if (task && (!liveTask || liveTask.project_id !== task.project_id || liveTask.revision_count !== task.revision_count ||
+        (liveTask.ownership_epoch ?? 1) !== (task.ownership_epoch ?? 1))) {
+      reportError = 'VERIFICATION_EVIDENCE_SCOPE_CHANGED';
+      for (const attempt of attempts) Object.assign(attempt, { stdout: '', stderr: reportError, success: false,
+        evidenceStatus: 'INCOMPLETE', evidenceErrorCode: reportError, outputTruncated: false });
+    }
+    reportError ??= attempts.find(attempt => attempt.evidenceErrorCode)?.evidenceErrorCode;
+    const latestAttemptPassed = !reportError && (attempts.at(-1)?.success ?? false);
     return {
       taskId,
-      totalAttempts: attempts.length,
+      totalAttempts,
       isFirstPassSuccess: attempts.length === 1 && latestAttemptPassed,
       latestAttemptPassed,
-      hadPriorFailure: attempts.slice(0, -1).some((attempt) => !attempt.success),
+      hadPriorFailure: attempts.slice(0, -1).some((attempt) => attempt.exitCode !== 0 || attempt.failedCount > 0),
       attempts,
+      evidenceStatus: reportError ? 'INCOMPLETE' : 'COMPLETE', evidenceErrorCode: reportError,
     };
   }
 
@@ -641,28 +753,15 @@ export class ProductTaskAutonomyAdapter {
   }
 
   private mapAttemptsToGitEvidenceTests(
-    attempts: Array<{ command: string; exitCode: number; durationMs?: number; evidenceId?: string | null }>
+    attempts: VerificationAttemptSummary[]
   ): Array<{ command: string; exitCode: number; stdout: string; stderr: string; durationMs: number }> {
-    return attempts.map((a) => {
-      let stdout = '';
-      let stderr = '';
-      if (a.evidenceId) {
-        const ev = this.repo.getEvidence(a.evidenceId);
-        if (ev?.raw_payload) {
-          const stdoutMatch = ev.raw_payload.match(/=== STDOUT ===\n([\s\S]*?)(?:\n=== STDERR ===|$)/);
-          if (stdoutMatch) stdout = stdoutMatch[1];
-          const stderrMatch = ev.raw_payload.match(/=== STDERR ===\n([\s\S]*)$/);
-          if (stderrMatch) stderr = stderrMatch[1];
-        }
-      }
-      return {
-        command: a.command,
-        exitCode: a.exitCode,
-        stdout,
-        stderr,
-        durationMs: a.durationMs ?? 0,
-      };
-    });
+    return attempts.map((attempt) => ({
+      command: attempt.command,
+      exitCode: attempt.exitCode,
+      stdout: attempt.stdout,
+      stderr: attempt.stderr,
+      durationMs: attempt.durationMs,
+    }));
   }
 
   public buildManagerContext(
@@ -712,6 +811,7 @@ export class ProductTaskAutonomyAdapter {
     const evidenceCollector = input.evidenceCollector ?? this.evidenceCollector ?? new EvidenceCollector();
 
     let result: ExecuteProductTaskResult;
+    let observedVerificationReport: TruthfulVerificationReport | undefined;
     const authorityEpoch = validated.authority.task.ownership_epoch ?? 1;
     let task = { ...validated.authority.task };
     try {
@@ -776,6 +876,7 @@ export class ProductTaskAutonomyAdapter {
       capabilities.validateSnapshot(task.project_id, verificationPayload.verificationCommands,
         verificationProject.repository_path, validated.authority.authorization.id);
       const verificationReport = this.getTruthfulVerificationReport(task.id);
+      observedVerificationReport = verificationReport;
       const persistedCurrentRun = currentTestRun ? this.repo.getTestRun(currentTestRun.id) : null;
       const currentEvidence = persistedCurrentRun?.evidence_id
         ? this.repo.getEvidence(persistedCurrentRun.evidence_id)
@@ -800,6 +901,7 @@ export class ProductTaskAutonomyAdapter {
         currentProcess?.working_directory === workOrder.worktree
       );
       const currentTestRunPassed = Boolean(
+        verificationReport.evidenceStatus === 'COMPLETE' &&
         currentRunBound &&
         persistedCurrentRun!.exit_code === 0 &&
         persistedCurrentRun!.failed_count === 0 &&
@@ -809,7 +911,9 @@ export class ProductTaskAutonomyAdapter {
 
       if (!currentTestRunPassed) {
         task = this.transitionTask(task, 'TESTS_FAILED');
-        const verificationError = !currentTestRun
+        const verificationError = verificationReport.evidenceStatus !== 'COMPLETE'
+          ? verificationReport.evidenceErrorCode ?? 'VERIFICATION_EVIDENCE_READ_FAILED'
+          : !currentTestRun
           ? 'CURRENT_VERIFICATION_TEST_RUN_MISSING'
           : !currentRunBound
             ? 'CURRENT_VERIFICATION_AUTHORITY_BINDING_INVALID'
@@ -820,7 +924,8 @@ export class ProductTaskAutonomyAdapter {
         );
 
         let noProgress = undefined;
-        if (workOrder.repair_context) {
+        if (workOrder.repair_context && verificationReport.evidenceStatus === 'COMPLETE' &&
+            !verificationReport.attempts.some(attempt => attempt.outputTruncated)) {
           noProgress = detectNoProgress({
             repairContext: workOrder.repair_context,
             currentEvidence: {
@@ -936,7 +1041,7 @@ export class ProductTaskAutonomyAdapter {
 
         let reconciledClosure = undefined;
         let noProgress = undefined;
-        if (workOrder.repair_context) {
+        if (workOrder.repair_context && !verificationReport.attempts.some(attempt => attempt.outputTruncated)) {
           const mappedRepairTests = this.mapAttemptsToGitEvidenceTests(verificationReport.attempts);
           reconciledClosure = reconcileFindingClosure({
             repairContext: workOrder.repair_context,
@@ -1098,6 +1203,11 @@ export class ProductTaskAutonomyAdapter {
             error: isNoProgress ? `REPAIR_NO_PROGRESS: ${noProgress?.category}: ${noProgress?.reason}` : `MANAGER_${review.verdict}`,
           };
         } else {
+          observedVerificationReport = this.getTruthfulVerificationReport(task.id);
+          if (observedVerificationReport.evidenceStatus !== 'COMPLETE' ||
+              !observedVerificationReport.attempts.find(attempt => attempt.testRunId === persistedCurrentRun!.id)?.success) {
+            throw new Error(observedVerificationReport.evidenceErrorCode ?? 'VERIFICATION_EVIDENCE_PROCESS_INVALID');
+          }
           if (this.options.autonomyStore) {
             this.options.autonomyStore.recordRepairOutcome(task.id, {
               protocol_version: 'repairoutcome.v1',
@@ -1155,6 +1265,7 @@ export class ProductTaskAutonomyAdapter {
         leaseAcquired: true,
         leaseReleased: false,
         workOrder,
+        verificationReport: observedVerificationReport,
         error: reportedError,
       };
     }

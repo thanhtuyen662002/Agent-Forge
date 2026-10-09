@@ -925,8 +925,13 @@ export class ArtifactStore {
       Number.isSafeInteger(maxBytes) && maxBytes > 0 ? maxBytes : ARTIFACT_MAX_READ_BYTES
     );
     if (evidence.storage_type === 'INLINE') {
-      if (evidence.raw_payload === null) {
+      if (typeof evidence.raw_payload !== 'string') {
         throw new Error(`[ArtifactStore] Evidence ${evidence.id} is marked INLINE but has null payload.`);
+      }
+      // Reject impossible text size before allocating its UTF-8 buffer. The
+      // declared metadata may be corrupt and is not an allocation authority.
+      if (evidence.raw_payload.length > boundedMaxBytes) {
+        throw new ArtifactIntegrityError('ARTIFACT_SIZE_EXCEEDED', 'inline evidence exceeds bounded read limit', evidence.id);
       }
       const inlineBytes = Buffer.from(evidence.raw_payload, 'utf8');
       if (inlineBytes.length > boundedMaxBytes) {
