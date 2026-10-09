@@ -139,11 +139,11 @@ export function registerIpcHandlers(
       const selectedPath = rootIdentity.canonicalPath;
 
       // Validate path against security policy
-      const policy = PolicyService.evaluatePathAccess(selectedPath, selectedPath, false);
+      const policy = PolicyService.evaluateRepositoryPathAccess(selectedPath, rootIdentity, false);
       if (!policy.allowed) {
         return {
           success: false,
-          errorCode: 'INVALID_REPOSITORY_LOCATION',
+          errorCode: policy.reasonCode ?? 'INVALID_REPOSITORY_LOCATION',
           errorDetail: policy.reason,
           error: `Invalid repository location: ${policy.reason}`,
         };
@@ -194,9 +194,9 @@ export function registerIpcHandlers(
       const canonicalRepoPath = tokenRes.canonicalPath;
 
       // Validate path security and Git repository validity
-      const policy = PolicyService.evaluatePathAccess(canonicalRepoPath, canonicalRepoPath, false);
+      const policy = PolicyService.evaluateRepositoryPathAccess(canonicalRepoPath, tokenRes.rootIdentity, false);
       if (!policy.allowed) {
-        return { success: false, error: `Unauthorized repository path: ${policy.reason}` };
+        return { success: false, errorCode: policy.reasonCode ?? 'INVALID_REPOSITORY_LOCATION', error: policy.reason };
       }
 
       const gitStatus = await GitService.getStatus(canonicalRepoPath, tokenRes.rootIdentity);
@@ -234,8 +234,8 @@ export function registerIpcHandlers(
     try {
       const metadata = repo.getProjectMetadata(parsed.data.projectId);
       if (!metadata || metadata.repository_path !== selected.canonicalPath) throw new RepositoryRootError('REPOSITORY_ROOT_IDENTITY_CHANGED');
-      const policy = PolicyService.evaluatePathAccess(selected.canonicalPath, selected.canonicalPath, false);
-      if (!policy.allowed) return { success: false, errorCode: 'INVALID_REPOSITORY_LOCATION', error: 'The configured repository location is not allowed.' };
+      const policy = PolicyService.evaluateRepositoryPathAccess(selected.canonicalPath, selected.rootIdentity, false);
+      if (!policy.allowed) return { success: false, errorCode: policy.reasonCode ?? 'INVALID_REPOSITORY_LOCATION', error: policy.reason };
       const status = await GitService.getStatus(selected.canonicalPath, selected.rootIdentity);
       if (status.status !== 'SUCCESS') return { success: false, errorCode: status.errorCode ?? 'NOT_GIT_REPOSITORY', error: 'The configured repository could not be verified.' };
       assertRepositoryRootIdentity(selected.rootIdentity);

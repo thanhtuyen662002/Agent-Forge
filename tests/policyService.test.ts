@@ -1,11 +1,72 @@
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, vi } from 'vitest';
 import fs from 'fs';
 import os from 'os';
 import path from 'path';
 import { PolicyService } from '../src/core/services/PolicyService';
+import { captureRepositoryRoot } from '../src/core/services/RepositoryRootIdentity';
 
 describe('PolicyService', () => {
   const projectRoot = 'd:/Projects/Agent-Forge';
+
+  function selectedFixture(): { fixture: string; root: string } {
+    const fixture = fs.realpathSync.native(fs.mkdtempSync(path.join(os.tmpdir(), 'af-policy-root-')));
+    const root = path.join(fixture, 'repository'); fs.mkdirSync(root);
+    return { fixture, root };
+  }
+  function cleanupFixture(fixture: string) {
+    if (!path.basename(fixture).startsWith('af-policy-root-') || fs.realpathSync.native(fixture) !== fixture) throw new Error('FIXTURE_BOUNDARY_CHANGED');
+    fs.rmSync(fixture, { recursive: true, force: true });
+  }
+
+  it('classifies only the selected ordinary root while preserving outside and sensitive path rejection', () => {
+    const { fixture, root } = selectedFixture();
+    try {
+      const identity = captureRepositoryRoot(root);
+      expect(PolicyService.evaluateRepositoryPathAccess(path.join(root, 'src', 'new.ts'), identity).allowed).toBe(true);
+      expect(PolicyService.evaluateRepositoryPathAccess(path.join(root, '.env.local'), identity).allowed).toBe(false);
+      expect(PolicyService.evaluateRepositoryPathAccess(path.join(fixture, 'outside.ts'), identity).allowed).toBe(false);
+    } finally { cleanupFixture(fixture); }
+  });
+
+  it('rejects root replacement instead of classifying the replacement as the selected authority', () => {
+    const { fixture, root } = selectedFixture();
+    try {
+      const identity = captureRepositoryRoot(root);
+      fs.renameSync(root, root + '-original'); fs.mkdirSync(root);
+      expect(PolicyService.evaluateRepositoryPathAccess(root, identity)).toMatchObject({
+        allowed: false, decision: 'DENY', reasonCode: 'REPOSITORY_ROOT_IDENTITY_CHANGED',
+      });
+    } finally { cleanupFixture(fixture); }
+  });
+
+  it('rejects a parent junction or symlink that appears after selection', () => {
+    const { fixture, root } = selectedFixture();
+    try {
+      const identity = captureRepositoryRoot(root);
+      fs.renameSync(root, root + '-original');
+      fs.symlinkSync(root + '-original', root, process.platform === 'win32' ? 'junction' : 'dir');
+      expect(PolicyService.evaluateRepositoryPathAccess(root, identity)).toMatchObject({
+        allowed: false, decision: 'DENY', reasonCode: 'REPOSITORY_ROOT_IDENTITY_CHANGED',
+      });
+      fs.unlinkSync(root);
+    } finally { cleanupFixture(fixture); }
+  });
+
+  it('discards a real allowed classification if the selected root changes before return', () => {
+    const { fixture, root } = selectedFixture();
+    const realEvaluate = PolicyService.evaluateRealPathAccess.bind(PolicyService);
+    try {
+      const identity = captureRepositoryRoot(root);
+      vi.spyOn(PolicyService, 'evaluateRealPathAccess').mockImplementationOnce((...args) => {
+        const result = realEvaluate(...args); expect(result.allowed).toBe(true);
+        fs.renameSync(root, root + '-original'); fs.mkdirSync(root);
+        return result;
+      });
+      expect(PolicyService.evaluateRepositoryPathAccess(root, identity)).toMatchObject({
+        allowed: false, decision: 'DENY', reasonCode: 'REPOSITORY_ROOT_IDENTITY_CHANGED',
+      });
+    } finally { vi.restoreAllMocks(); cleanupFixture(fixture); }
+  });
 
   it('should allow file access within project root', () => {
     const res = PolicyService.evaluatePathAccess('d:/Projects/Agent-Forge/src/main.ts', projectRoot, true);

@@ -88,8 +88,10 @@ export class GitService {
         args: ['-c', 'core.fsmonitor=false', '-c', 'core.untrackedCache=false', ...args],
         cwd: lease.cwd,
         timeoutMs,
-        env: { GIT_OPTIONAL_LOCKS: '0' },
-        allowedEnvKeys: ['GIT_OPTIONAL_LOCKS'],
+        // core.worktree in local config must never select another directory.
+        // Linux names the captured descriptor here, not its replaceable path.
+        env: { GIT_OPTIONAL_LOCKS: '0', GIT_WORK_TREE: lease.cwd },
+        allowedEnvKeys: ['GIT_OPTIONAL_LOCKS', 'GIT_WORK_TREE'],
       });
       // Windows keeps the selected name pinned; Linux Git uses the held root
       // descriptor even if its pathname is swapped. Discard stale observations.
@@ -267,8 +269,8 @@ export class GitService {
     // invariant explicit for Git's revision parser and the trailing -- keeps
     // future path additions from being interpreted as options.
     const args = validatedBaseSha
-      ? ['diff', '--end-of-options', validatedBaseSha, '--']
-      : ['diff'];
+      ? ['diff', '--no-ext-diff', '--no-textconv', '--end-of-options', validatedBaseSha, '--']
+      : ['diff', '--no-ext-diff', '--no-textconv'];
 
     // 1. Get raw diff
     const diffRes = await this.read(root.identity, args, 20000);
@@ -288,8 +290,8 @@ export class GitService {
 
     // 2. Get diff stat
     const statRes = await this.read(root.identity, validatedBaseSha
-        ? ['diff', '--stat', '--end-of-options', validatedBaseSha, '--']
-        : ['diff', '--stat'], 20000);
+        ? ['diff', '--no-ext-diff', '--no-textconv', '--stat', '--end-of-options', validatedBaseSha, '--']
+        : ['diff', '--no-ext-diff', '--no-textconv', '--stat'], 20000);
 
     if (statRes.exitCode !== 0) {
       return {
@@ -306,8 +308,8 @@ export class GitService {
 
     // 3. Get list of changed files
     const nameRes = await this.read(root.identity, validatedBaseSha
-        ? ['diff', '--name-only', '--end-of-options', validatedBaseSha, '--']
-        : ['diff', '--name-only'], 20000);
+        ? ['diff', '--no-ext-diff', '--no-textconv', '--name-only', '--end-of-options', validatedBaseSha, '--']
+        : ['diff', '--no-ext-diff', '--no-textconv', '--name-only'], 20000);
 
     if (nameRes.exitCode !== 0) {
       return {

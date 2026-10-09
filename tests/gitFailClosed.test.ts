@@ -74,13 +74,13 @@ describe('GitService Fail-Closed Behavior', () => {
       expect(result.diffContent).toContain('+after');
       expect(execute).toHaveBeenCalledTimes(3);
       expect(execute.mock.calls.map(([options]) => options.args.slice(4))).toEqual([
-        ['diff', '--end-of-options', fixture.baseSha, '--'],
-        ['diff', '--stat', '--end-of-options', fixture.baseSha, '--'],
-        ['diff', '--name-only', '--end-of-options', fixture.baseSha, '--'],
+        ['diff', '--no-ext-diff', '--no-textconv', '--end-of-options', fixture.baseSha, '--'],
+        ['diff', '--no-ext-diff', '--no-textconv', '--stat', '--end-of-options', fixture.baseSha, '--'],
+        ['diff', '--no-ext-diff', '--no-textconv', '--name-only', '--end-of-options', fixture.baseSha, '--'],
       ]);
       for (const [options] of execute.mock.calls) {
         expect(options.args.slice(0, 4)).toEqual(['-c', 'core.fsmonitor=false', '-c', 'core.untrackedCache=false']);
-        expect(options.env).toEqual({ GIT_OPTIONAL_LOCKS: '0' });
+        expect(options.env).toEqual({ GIT_OPTIONAL_LOCKS: '0', GIT_WORK_TREE: options.cwd });
       }
     } finally {
       fs.rmSync(fixture.root, { recursive: true, force: true });
@@ -239,6 +239,46 @@ describe('GitService Fail-Closed Behavior', () => {
       fs.rmSync(fixture.root, { recursive: true, force: true });
       fs.rmSync(original, { recursive: true, force: true });
     }
+  });
+
+  it('reads only the captured selected working tree when local Git config redirects core.worktree outside it', async () => {
+    const fixture = createGitFixture();
+    const outside = fixture.root + '-outside';
+    fs.mkdirSync(outside); fs.writeFileSync(path.join(outside, 'tracked.txt'), 'outside-owner-fixture\n');
+    try {
+      runGit(fixture.root, ['config', 'core.worktree', outside]);
+      const receipt = captureRepositoryRoot(fixture.root);
+      const diff = await GitService.getDiff(fixture.root, fixture.baseSha, receipt);
+      expect(diff.status).toBe('SUCCESS');
+      expect(diff.diffContent).toContain('+after');
+      expect(diff.diffContent).not.toContain('outside-owner-fixture');
+      expect(fs.readFileSync(path.join(outside, 'tracked.txt'), 'utf8')).toBe('outside-owner-fixture\n');
+    } finally {
+      if (fs.realpathSync.native(outside) !== outside || !path.basename(outside).startsWith('git-revision-boundary-')) throw new Error('FIXTURE_BOUNDARY_CHANGED');
+      fs.rmSync(outside, { recursive: true, force: true });
+      fs.rmSync(fixture.root, { recursive: true, force: true });
+    }
+  });
+
+  it.each(['external', 'textconv'])('does not execute a repository-controlled %s diff driver while collecting selected-root evidence', async driver => {
+    const fixture = createGitFixture();
+    const script = path.join(fixture.root, '.git', 'diff-driver.cjs');
+    const marker = path.join(fixture.root, '.git', 'diff-driver-ran');
+    fs.writeFileSync(script, "require('node:fs').writeFileSync(require('node:path').join(__dirname,'diff-driver-ran'),'executed');console.log('forged-driver-fixture');");
+    const quote = (value: string) => "'" + value.replace(/'/g, "'\\''") + "'";
+    const command = quote(process.execPath.replace(/\\/g, '/')) + ' ' + quote(script.replace(/\\/g, '/'));
+    try {
+      if (driver === 'external') runGit(fixture.root, ['config', 'diff.external', command]);
+      else {
+        runGit(fixture.root, ['config', 'diff.fixture.textconv', command]);
+        fs.writeFileSync(path.join(fixture.root, '.gitattributes'), '*.txt diff=fixture\n');
+      }
+      const result = await GitService.getDiff(fixture.root, fixture.baseSha, captureRepositoryRoot(fixture.root));
+      expect(fs.existsSync(marker)).toBe(false);
+      expect(result.status).toBe('SUCCESS');
+      expect(result.diffContent).toContain('+after');
+      expect(result.diffContent).not.toContain('forged-driver-fixture');
+    } finally { fs.rmSync(fixture.root, { recursive: true, force: true }); }
   });
 
   it('holds the original root across the final ProcessRunner invocation boundary', async () => {
