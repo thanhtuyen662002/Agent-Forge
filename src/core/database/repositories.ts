@@ -1492,6 +1492,27 @@ export class Repository {
   // Reviews & Issues
   // ==========================================
   public createReview(review: Review): void {
+    // Validate the entire bounded observation before the first INSERT, so an
+    // unsafe later issue cannot leave a partial review or evaluate a getter.
+    const safe = sanitizeOutputValue(review) as Review;
+    if (!safe || typeof safe !== 'object' || Array.isArray(safe) || typeof safe.summary !== 'string' ||
+      (safe.issues !== undefined && !Array.isArray(safe.issues))) {
+      throw new OutputSanitizationError('OUTPUT_TYPE_INVALID');
+    }
+    for (const key of ['id', 'task_id', 'attempt_id', 'reviewer_agent_id', 'verdict', 'created_at'] as const) {
+      if (safe[key] !== review[key]) throw new OutputSanitizationError('OUTPUT_REDACTION_UNSAFE');
+    }
+    for (let index = 0; index < (safe.issues?.length ?? 0); index++) {
+      const issue = safe.issues![index];
+      if (!issue || typeof issue !== 'object' || Array.isArray(issue) ||
+        typeof issue.title !== 'string' || typeof issue.description !== 'string') {
+        throw new OutputSanitizationError('OUTPUT_TYPE_INVALID');
+      }
+      for (const key of ['id', 'review_id', 'severity', 'file_path', 'line_number', 'resolved'] as const) {
+        if (issue[key] !== review.issues![index][key]) throw new OutputSanitizationError('OUTPUT_REDACTION_UNSAFE');
+      }
+    }
+    review = safe;
     this.db
       .prepare(`
         INSERT INTO reviews (id, task_id, attempt_id, reviewer_agent_id, verdict, summary, created_at)

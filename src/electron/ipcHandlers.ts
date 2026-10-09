@@ -422,8 +422,8 @@ export function registerIpcHandlers(
     let diffStat = '';
 
     if (gitDiffEv) {
-      safeEvidenceOutput(gitDiffEv);
-      diffStat = gitDiffEv.summary || 'Git Diff recorded.';
+      const safeDiff = safeEvidenceOutput(gitDiffEv);
+      diffStat = safeDiff.summary || 'Git Diff recorded.';
       try {
         diffContent = defaultArtifactStore.read(gitDiffEv);
       } catch {
@@ -556,8 +556,9 @@ export function registerIpcHandlers(
       try {
         const projection = adjService.buildVerifiedAdjudicationReviewProjection(activeOrLatestAdj.id);
         const reviewPackage = PackageGenerator.renderVerifiedAdjudicationReviewProjection(projection);
-        return { success: true, reviewPackage };
-      } catch {
+        return { success: true, reviewPackage: redactSensitiveText(reviewPackage) };
+      } catch (error) {
+        if (error instanceof OutputSanitizationError) throw error;
         const adjTestRun = activeOrLatestAdj.test_run_id ? repo.getTestRun(activeOrLatestAdj.test_run_id) : null;
         const gitStatusEv = activeOrLatestAdj.git_status_evidence_id
           ? repo.getEvidence(activeOrLatestAdj.git_status_evidence_id)
@@ -588,7 +589,7 @@ export function registerIpcHandlers(
       adjudicationLinkage
     );
 
-    return { success: true, reviewPackage };
+    return { success: true, reviewPackage: redactSensitiveText(reviewPackage) };
   });
 
   // ==========================================
