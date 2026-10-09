@@ -142,7 +142,9 @@ export function sanitizeOutputValue(value: unknown): unknown {
         // Visit even a fully redacted credential field to enforce shape/work
         // bounds; a secret key must not hide a cyclic or unbounded value.
         const safeValue = visit(descriptor.value, depth + 1);
-        result[safeKey] = sensitive && safeValue !== null && safeValue !== '' ? REDACTED_SECRET : safeValue;
+        // Credential nulls use the same fixed marker as the text policy, so a
+        // sanitized JSON value stays unchanged at a later text/artifact sink.
+        result[safeKey] = sensitive && safeValue !== '' ? REDACTED_SECRET : safeValue;
       }
       return result;
     } finally { active.delete(input); }

@@ -9,7 +9,7 @@ import { AutonomyStore } from '../src/core/autonomy/store';
 import { createWorkOrder, ManagerReview } from '../src/core/autonomy/contracts';
 import { buildTrialEvidenceManifest, parseAndVerifyTrialEvidenceManifest, ProductionTrialEvidenceManifest,
   redactTrialEvidenceText } from '../src/core/autonomy/trialEvidence';
-import { OUTPUT_MAX_TEXT_CHARACTERS } from '../src/shared/security/secretRedaction';
+import { OUTPUT_MAX_TEXT_CHARACTERS, sanitizeOutputValue } from '../src/shared/security/secretRedaction';
 
 // Deliberately synthetic and unusable. Assert booleans/hashes so a failing
 // persistence regression never echoes the credential-shaped fixture.
@@ -125,6 +125,22 @@ describe('durable output sanitization boundaries', () => {
     const entries = fs.readdirSync(root);
     expect(() => artifacts.materializeContentAddressedFile(untrusted, hash(untrusted))).toThrow('OUTPUT_REDACTION_UNSAFE');
     expect(fs.readdirSync(root)).toEqual(entries);
+  });
+
+  it('binds structured redaction to safe JSON artifact bytes with nullable credential fields', () => {
+    const input = { password: null, api_key: '', nested: [{ sessionToken: null }], token_count: 0, note: 'ordinary fixture diagnostic' };
+    const safe = sanitizeOutputValue(input);
+    const payload = JSON.stringify(safe);
+    const artifacts = new ArtifactStore(root);
+    const result = artifacts.materializeContentAddressedFile(payload, hash(payload));
+    const observed = fs.readFileSync(result.filePath, 'utf8');
+    expect(observed).toBe(payload);
+    expect(JSON.parse(observed)).toEqual(safe);
+    expect(result.hash).toBe(hash(observed));
+    expect(result.byteSize).toBe(Buffer.byteLength(observed, 'utf8'));
+    expect(sanitizeOutputValue(safe)).toEqual(safe);
+    expect(input.password).toBeNull();
+    expect(JSON.parse(observed).token_count).toBe(0);
   });
 
   it('preserves ordinary binary bytes but rejects credential-shaped UTF8/UTF16 buffers before publication', () => {
