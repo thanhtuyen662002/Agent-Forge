@@ -132,6 +132,44 @@ describe('captured repository read lease', () => {
     expect(fs.readdirSync(empty + '-moved')).toEqual([]);
   });
 
+  it('keeps repository services loadable when the native package cannot load and fences Windows acquisition with a fixed reason', () => {
+    const program = String.raw`
+const Module = require('node:module');
+const fs = require('node:fs');
+const ts = require('typescript');
+Module._extensions['.ts'] = (module, filename) => module._compile(ts.transpileModule(fs.readFileSync(filename, 'utf8'),
+  { compilerOptions: { module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2022, esModuleInterop: true } }).outputText, filename);
+const load = Module._load;
+Module._load = function(request, ...args) {
+  if (request === 'koffi') throw new Error('INJECTED_NATIVE_PACKAGE_UNAVAILABLE');
+  return load.call(this, request, ...args);
+};
+try {
+  const { RepositoryRootLease } = require(process.argv[1]);
+  const { captureRepositoryRoot } = require(process.argv[2]);
+  process.stdout.write('REPOSITORY_MODULE_LOAD=PASS\n');
+  try {
+    const lease = RepositoryRootLease.acquire(captureRepositoryRoot(process.argv[3]));
+    lease.close();
+    if (process.platform === 'win32') throw new Error('UNFENCED_NATIVE_ACQUISITION');
+    process.stdout.write('DESCRIPTOR_WITHOUT_WINDOWS_NATIVE=PASS\n');
+  } catch (error) {
+    if (process.platform !== 'win32' || error.code !== 'REPOSITORY_ROOT_IDENTITY_UNAVAILABLE' ||
+        error.message.includes('INJECTED_NATIVE_PACKAGE_UNAVAILABLE')) throw error;
+    process.stdout.write('TYPED_NATIVE_FAILURE=PASS\n');
+  }
+} catch { process.stdout.write('REPOSITORY_NATIVE_LOAD_BOUNDARY=FAIL\n'); process.exitCode = 1; }
+`;
+    const observed = spawnSync(process.execPath, ['-e', program,
+      path.resolve(__dirname, '../src/core/services/RepositoryRootLease.ts'),
+      path.resolve(__dirname, '../src/core/services/RepositoryRootIdentity.ts'), repository],
+      { cwd: path.resolve(__dirname, '..'), encoding: 'utf8', windowsHide: true, timeout: 15000, maxBuffer: 16384 });
+    expect(observed.status).toBe(0);
+    expect(observed.stdout).toContain('REPOSITORY_MODULE_LOAD=PASS');
+    expect(observed.stdout).toContain(process.platform === 'win32' ? 'TYPED_NATIVE_FAILURE=PASS' : 'DESCRIPTOR_WITHOUT_WINDOWS_NATIVE=PASS');
+    expect(observed.stdout + observed.stderr).not.toContain('INJECTED_NATIVE_PACKAGE_UNAVAILABLE');
+  });
+
   it.runIf(process.platform === 'win32')('denies attributes-only conversion of the pinned Git directory after an attacker tries to empty it', () => {
     const gitMetadata = path.join(repository, '.git');
     const outside = path.join(fixture, 'outside-admin');

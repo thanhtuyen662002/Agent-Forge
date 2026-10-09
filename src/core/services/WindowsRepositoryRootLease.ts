@@ -1,6 +1,6 @@
 import fs from 'node:fs';
 import path from 'node:path';
-import * as koffi from 'koffi';
+import type * as Koffi from 'koffi';
 import { assertRepositoryRootIdentity, RepositoryRootError, RepositoryRootIdentity } from './RepositoryRootIdentity';
 
 interface FileTime { low: number; high: number }
@@ -15,6 +15,7 @@ function changed(): never { throw new RepositoryRootError('REPOSITORY_ROOT_IDENT
 // No callbacks or unmanaged-memory views. The repository process owns every
 // handle, so loss of a separate helper cannot release a live invocation's pins.
 function loadNative() {
+  const koffi: typeof Koffi = require('koffi');
   const kernel = koffi.load('kernel32.dll');
   const nt = koffi.load('ntdll.dll');
   const time = koffi.struct({ low: 'uint32', high: 'uint32' });
