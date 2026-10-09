@@ -1,6 +1,7 @@
 import crypto from 'crypto';
 import fs from 'fs';
 import path from 'path';
+import { redactSensitiveText } from '../../shared/security/secretRedaction';
 import { assertPathContained } from '../services/ArtifactStore';
 
 export const PRODUCTION_TRIAL_PHASES = ['R5L0', 'R5L1', 'R5L2', 'R5L3', 'R5L4'] as const;
@@ -58,16 +59,6 @@ const SHA256 = /^[0-9a-f]{64}$/;
 const GIT_SHA = /^[0-9a-f]{40}$/i;
 const SAFE_ID = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/;
 const SAFE_CONTENT_TYPE = /^[A-Za-z0-9!#$&^_.+\-]+\/[A-Za-z0-9!#$&^_.+\-]+(?:;[A-Za-z0-9=._+\-]+)*$/;
-const SECRET_PATTERNS: RegExp[] = [
-  /(?:gh[pousr]_[A-Za-z0-9_\-]{20,})/g,
-  /(?:github_pat_[A-Za-z0-9_\-]{20,})/g,
-  /\b(?:AKIA|ASIA)[0-9A-Z]{16}\b/g,
-  /\bBearer\s+[A-Za-z0-9._\-+/=]{16,}/gi,
-  /\beyJ[A-Za-z0-9_\-]{10,}\.[A-Za-z0-9_\-]{10,}\.[A-Za-z0-9_\-]{10,}\b/g,
-  /\b[a-z][a-z0-9+.-]*:\/\/[^\s/@:]+:[^\s/@]+@/gi,
-  /-----BEGIN [^-]+-----[\s\S]*?-----END [^-]+-----/g,
-  /\b(?:api[_-]?key|access[_-]?token|refresh[_-]?token|client[_-]?secret|oauth[_-]?token|secret[_-]?token|password|secret|token)\s*[:=]\s*[^\s,;}]{8,}/gi,
-];
 
 function fail(message: string): never {
   throw new Error(`TRIAL_EVIDENCE_INVALID: ${message}`);
@@ -83,6 +74,7 @@ function requireBoundedString(value: unknown, field: string, max = 512): string 
 function requireSafeId(value: unknown, field: string): string {
   const id = requireBoundedString(value, field, 128);
   if (!SAFE_ID.test(id)) fail(`${field} contains unsupported characters`);
+  assertNoSecrets(id, field);
   return id;
 }
 
@@ -112,10 +104,7 @@ function requireExactKeys(value: unknown, expected: readonly string[], field: st
 }
 
 function assertNoSecrets(value: string, field: string): void {
-  for (const pattern of SECRET_PATTERNS) {
-    pattern.lastIndex = 0;
-    if (pattern.test(value)) fail(`${field} contains a secret-like value; redact it before persisting evidence`);
-  }
+  if (redactSensitiveText(value) !== value) fail(`${field} contains a secret-like value; redact it before persisting evidence`);
 }
 
 /**
@@ -124,12 +113,9 @@ function assertNoSecrets(value: string, field: string): void {
  * use this helper to silently bless malformed evidence.
  */
 export function redactTrialEvidenceText(value: string): string {
-  let redacted = value;
-  for (const pattern of SECRET_PATTERNS) {
-    pattern.lastIndex = 0;
-    redacted = redacted.replace(pattern, '[REDACTED_SECRET]');
-  }
-  return redacted;
+  // Retain the established canonical trial-note replacement shape while
+  // sharing the complete detection/decoding policy with every durable sink.
+  return redactSensitiveText(value, { assignmentLabels: 'omit' });
 }
 
 function normalizeRelativePath(value: unknown, field: string): string {

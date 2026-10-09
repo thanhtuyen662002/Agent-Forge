@@ -1,6 +1,7 @@
 import crypto from 'crypto';
 import fs from 'fs';
 import path from 'path';
+import { OutputSanitizationError, redactSensitiveText } from '../../shared/security/secretRedaction';
 import { Evidence, EvidenceType, EvidenceStorageType } from '../types/domain';
 import {
   ArtifactManifest,
@@ -64,6 +65,25 @@ const POSIX_DESCRIPTOR_ANCHOR =
 
 /** Hard ceiling for every artifact read, including reads requested by callers. */
 export const ARTIFACT_MAX_READ_BYTES = 32 * 1024 * 1024;
+
+function sanitizeArtifactBytes(content: string | Buffer): { bytes: Buffer; redacted: boolean } {
+  if (typeof content === 'string') {
+    const safe = redactSensitiveText(content);
+    if (Buffer.byteLength(safe, 'utf8') > ARTIFACT_MAX_READ_BYTES) throw new OutputSanitizationError('OUTPUT_SIZE_EXCEEDED');
+    return { bytes: Buffer.from(safe, 'utf8'), redacted: safe !== content };
+  }
+  if (!Buffer.isBuffer(content)) throw new OutputSanitizationError('OUTPUT_TYPE_INVALID');
+  if (content.length > ARTIFACT_MAX_READ_BYTES) throw new OutputSanitizationError('OUTPUT_SIZE_EXCEEDED');
+  // Preserve ordinary opaque bytes exactly. A buffer with credential-shaped
+  // text cannot be rewritten while claiming its original byte identity.
+  const views = [content.toString('utf8'), content.toString('latin1')];
+  for (const offset of [0, 1]) {
+    views.push(new TextDecoder('utf-16le').decode(content.subarray(offset)));
+    views.push(new TextDecoder('utf-16be').decode(content.subarray(offset)));
+  }
+  if (views.some(view => redactSensitiveText(view) !== view)) throw new OutputSanitizationError('OUTPUT_REDACTION_UNSAFE');
+  return { bytes: content, redacted: false };
+}
 
 /**
  * Linux exposes a descriptor-relative `/proc/self/fd` path plus O_NOFOLLOW,
@@ -739,6 +759,9 @@ export class ArtifactStore {
     payload: string,
     contentType: string = 'text/plain'
   ): Evidence {
+    payload = redactSensitiveText(payload);
+    summary = redactSensitiveText(summary);
+    if (Buffer.byteLength(payload, 'utf8') > ARTIFACT_MAX_READ_BYTES) throw new OutputSanitizationError('OUTPUT_SIZE_EXCEEDED');
     const hash = crypto.createHash('sha256').update(payload, 'utf8').digest('hex');
     const byteSize = Buffer.byteLength(payload, 'utf8');
     const now = new Date().toISOString();
@@ -798,6 +821,9 @@ export class ArtifactStore {
     finalPath: string | null;
     isStagedFile: boolean;
   } {
+    payload = redactSensitiveText(payload);
+    summary = redactSensitiveText(summary);
+    if (Buffer.byteLength(payload, 'utf8') > ARTIFACT_MAX_READ_BYTES) throw new OutputSanitizationError('OUTPUT_SIZE_EXCEEDED');
     const hash = crypto.createHash('sha256').update(payload, 'utf8').digest('hex');
     const byteSize = Buffer.byteLength(payload, 'utf8');
     const now = new Date().toISOString();
@@ -1015,12 +1041,15 @@ export class ArtifactStore {
     content: string | Buffer,
     expectedHash?: string
   ): { filePath: string; hash: string; byteSize: number; newlyCreated: boolean } {
-    const baseDir = this.getBaseDir();
-    const buf = Buffer.isBuffer(content) ? content : Buffer.from(content, 'utf8');
+    if (expectedHash !== undefined && typeof expectedHash !== 'string') throw new OutputSanitizationError('OUTPUT_TYPE_INVALID');
+    const sanitized = sanitizeArtifactBytes(content);
+    const buf = sanitized.bytes;
     const hash = crypto.createHash('sha256').update(buf).digest('hex').toLowerCase();
     if (expectedHash && hash !== expectedHash.toLowerCase()) {
+      if (sanitized.redacted) throw new OutputSanitizationError('OUTPUT_REDACTION_UNSAFE');
       throw new Error('[ArtifactStore] Hash mismatch before materialization');
     }
+    const baseDir = this.getBaseDir();
 
     const finalPath = path.join(baseDir, `${hash}.bin`);
     const tempName = `.tmp_${crypto.randomUUID()}_${hash}.bin`;
