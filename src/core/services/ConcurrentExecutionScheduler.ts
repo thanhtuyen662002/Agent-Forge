@@ -1,4 +1,6 @@
 import { Repository } from '../database/repositories';
+import { RepositoryRootError } from './RepositoryRootIdentity';
+import { RepositoryRootLease } from './RepositoryRootLease';
 import { AgentAssignment } from '../types/domain';
 import {
   WorkerSlotLeaseService,
@@ -178,6 +180,13 @@ export class ConcurrentExecutionScheduler {
     }
 
     // 2. Durable Routing Authority & Assignment Reconstruction
+    let rootLease: RepositoryRootLease;
+    try { rootLease = RepositoryRootLease.acquire(this.repo.getProjectRepositoryIdentity(auth.project_id)); }
+    catch (error) {
+      if (!(error instanceof RepositoryRootError)) throw error;
+      return { status: 'PREPARATION_FAILED', authorizationId, errorCode: error.code, error: error.message };
+    }
+    try {
     const routingEvent = this.repo.getRoutingDecisionEvent(auth.routing_decision_id);
     if (!routingEvent) {
       return {
@@ -590,6 +599,7 @@ export class ConcurrentExecutionScheduler {
       error: providerResult.error,
       errorCode: providerResult.errorCode,
     };
+    } finally { rootLease.close(); }
   }
 
   private createHeartbeatSupervisor(

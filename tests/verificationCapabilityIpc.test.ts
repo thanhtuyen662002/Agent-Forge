@@ -1,3 +1,5 @@
+import { captureRepositoryRoot } from '../src/core/services/RepositoryRootIdentity';
+import { execFileSync as initializeFixtureGit } from 'node:child_process';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import fs from 'node:fs';
 import path from 'node:path';
@@ -34,8 +36,9 @@ describe('native owner verification capability IPC', () => {
     MigrationRunner.run(database);
     repo = new Repository(database);
     const now = new Date().toISOString();
+    if (!fs.existsSync(path.join(root, '.git'))) initializeFixtureGit('git', ['init', '-q', '--template=', '--initial-branch=main'], { cwd: root, stdio: 'ignore', windowsHide: true });
     repo.createProject({ id: 'P', name: 'Owned test project', repository_path: root, default_branch: 'main',
-      description: null, status: 'READY', contract: null, created_at: now, updated_at: now, started_at: null, completed_at: null });
+      description: null, status: 'READY', contract: null, created_at: now, updated_at: now, started_at: null, completed_at: null }, captureRepositoryRoot(root));
     registerIpcHandlers(repo, {} as any, {} as any, {} as any, {} as any, undefined, undefined, undefined, undefined, {} as any);
   });
   afterEach(() => {

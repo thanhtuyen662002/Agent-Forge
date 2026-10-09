@@ -420,11 +420,44 @@ const { VerificationCapabilityService } = require(capabilityServicePath);
 
 MigrationRunner.run(db);
 
-const appliedMigrationCount = db.prepare("SELECT COUNT(*) as c FROM schema_migrations").get().c;
-if (appliedMigrationCount !== 25) {
-  throw new Error("Expected migration count 25, got " + appliedMigrationCount);
+const appliedMigrations = db.prepare("SELECT version,name FROM schema_migrations ORDER BY version ASC").all();
+if (appliedMigrations.length !== 26 || appliedMigrations.some((migration, index) => migration.version !== index + 1) ||
+    appliedMigrations[24]?.name !== 'durable_owner_verification_capabilities' ||
+    appliedMigrations[25]?.name !== 'selected_project_repository_identities') {
+  throw new Error("Expected exact migration inventory 1..26 with owner-capability and selected-root identities");
 }
-console.log("OWNER_CAPABILITY_MIGRATION_COUNT_25=PASS");
+console.log("MIGRATION_REGISTRY_26=PASS");
+console.log("OWNER_CAPABILITY_MIGRATION_25=PASS");
+console.log("SELECTED_ROOT_IDENTITY_MIGRATION_26=PASS");
+
+// Exercise the shipped lease and native addon, never a workspace dependency.
+const { captureRepositoryRoot } = require(path.join(asarPath, 'dist-electron', 'core', 'services', 'RepositoryRootIdentity.js'));
+const { RepositoryRootLease } = require(path.join(asarPath, 'dist-electron', 'core', 'services', 'RepositoryRootLease.js'));
+if (pkgRequire('koffi').version !== sourceLock.packages['node_modules/koffi']?.version) throw new Error('PACKAGED_KOFFI_VERSION_MISMATCH');
+const expectedKoffiRoot = path.join(path.dirname(asarPath), 'app.asar.unpacked', 'node_modules', '@koromix', `koffi-${process.platform}-${process.arch}`);
+const koffiBindings = Object.keys(require.cache).filter(file => file.endsWith('koffi.node')).map(physicalNativePath);
+if (koffiBindings.length !== 1 || !koffiBindings[0].toLowerCase().startsWith(expectedKoffiRoot.toLowerCase() + path.sep) ||
+    !fs.existsSync(koffiBindings[0])) throw new Error('PACKAGED_KOFFI_NATIVE_ORIGIN_MISMATCH');
+console.log('KOFFI_NATIVE_PACKAGE_BOUND=PASS');
+const leaseFixture = fs.realpathSync.native(fs.mkdtempSync(path.join(path.dirname(dbPath), 'selected-root-')));
+const leaseGit = args => require('node:child_process').execFileSync('git', args, { cwd: leaseFixture,
+  windowsHide: true, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'],
+  env: { ...process.env, GIT_CONFIG_NOSYSTEM: '1', GIT_CONFIG_GLOBAL: 'NUL', GIT_OPTIONAL_LOCKS: '0' } }).trim();
+leaseGit(['init', '-q', '--template=', '--initial-branch=main']);
+leaseGit(['-c', 'user.name=Fixture', '-c', 'user.email=fixture@example.invalid', '-c', 'commit.gpgSign=false', 'commit', '--allow-empty', '-qm', 'native fixture']);
+const leaseHead = leaseGit(['rev-parse', 'HEAD']);
+const rootLease = RepositoryRootLease.acquire(captureRepositoryRoot(leaseFixture));
+try {
+  let rootBlocked = false; let childBlocked = false;
+  try { fs.renameSync(leaseFixture, leaseFixture + '-moved'); } catch { rootBlocked = true; }
+  try { fs.renameSync(path.join(leaseFixture, '.git'), path.join(leaseFixture, '.git-moved')); } catch { childBlocked = true; }
+  if (!rootBlocked || !childBlocked || leaseGit(['rev-parse', 'HEAD']) !== leaseHead) throw new Error('PACKAGED_ROOT_LEASE_FENCE_FAILED');
+  rootLease.assertActive();
+} finally { rootLease.close(); }
+fs.renameSync(path.join(leaseFixture, '.git'), path.join(leaseFixture, '.git-released'));
+fs.renameSync(path.join(leaseFixture, '.git-released'), path.join(leaseFixture, '.git'));
+fs.renameSync(leaseFixture, leaseFixture + '-released');
+console.log('SELECTED_ROOT_NATIVE_LEASE=PASS');
 
 const repo = new Repository(db);
 const service = new McpSessionAuthorityService(repo, db);
@@ -454,7 +487,7 @@ repo.createProject({
   updated_at: now,
   started_at: null,
   completed_at: null,
-});
+}, captureRepositoryRoot(projectRoot));
 
 db.prepare(`
   INSERT INTO tasks (id, project_id, title, state, priority, risk, revision_count, max_revisions, progress_cache_percent, base_sha, ownership_epoch, created_at, updated_at)
@@ -1796,14 +1829,16 @@ const harness = new McpRpcHarness(child);
   Write-Host "Installed MCP Proof Output:"
   Write-Host $mcpStdout
 
-  if ($mcpProc.ExitCode -ne 0 -or -not ($mcpStdout -match "R5J3_INSTALLED_MCP_BRIDGE_PROOF=PASS") -or -not ($mcpStdout -match "R5J4_INSTALLED_MCP_SUBMISSION_PROOF=PASS") -or -not ($mcpStdout -match "R5J5_INSTALLED_OWNER_ADJUDICATION_PROOF=PASS") -or -not ($mcpStdout -match "R5J6_SUBMISSION_OBSERVABILITY_PROOF=PASS") -or -not ($mcpStdout -match "OWNER_CAPABILITY_MIGRATION_COUNT_25=PASS")) {
+  if ($mcpProc.ExitCode -ne 0 -or -not ($mcpStdout -match "R5J3_INSTALLED_MCP_BRIDGE_PROOF=PASS") -or -not ($mcpStdout -match "R5J4_INSTALLED_MCP_SUBMISSION_PROOF=PASS") -or -not ($mcpStdout -match "R5J5_INSTALLED_OWNER_ADJUDICATION_PROOF=PASS") -or -not ($mcpStdout -match "R5J6_SUBMISSION_OBSERVABILITY_PROOF=PASS") -or -not ($mcpStdout -match "MIGRATION_REGISTRY_26=PASS") -or -not ($mcpStdout -match "OWNER_CAPABILITY_MIGRATION_25=PASS") -or -not ($mcpStdout -match "SELECTED_ROOT_IDENTITY_MIGRATION_26=PASS") -or -not ($mcpStdout -match "KOFFI_NATIVE_PACKAGE_BOUND=PASS") -or -not ($mcpStdout -match "SELECTED_ROOT_NATIVE_LEASE=PASS")) {
     throw "Installed MCP bridge verification failed (exit code $($mcpProc.ExitCode)): $mcpStderr"
   }
 
   Write-Host "[8/8] Installed MCP Client Bridge & Node-Mode Stdio Proof: PASS" -ForegroundColor Green
   Write-Host "R5J5_INSTALLED_OWNER_ADJUDICATION_PROOF=PASS" -ForegroundColor Green
   Write-Host "R5J6_SUBMISSION_OBSERVABILITY_PROOF=PASS" -ForegroundColor Green
-  Write-Host "OWNER_CAPABILITY_MIGRATION_COUNT_25=PASS" -ForegroundColor Green
+  Write-Host "MIGRATION_REGISTRY_26=PASS" -ForegroundColor Green
+  Write-Host "OWNER_CAPABILITY_MIGRATION_25=PASS" -ForegroundColor Green
+  Write-Host "SELECTED_ROOT_IDENTITY_MIGRATION_26=PASS" -ForegroundColor Green
 
   # Verify no surviving processes in install dir
   $surviving = Get-Process -Name "AgentForge" -ErrorAction SilentlyContinue | Where-Object {

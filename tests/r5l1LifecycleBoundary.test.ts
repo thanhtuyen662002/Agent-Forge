@@ -1,3 +1,5 @@
+import { captureRepositoryRoot } from '../src/core/services/RepositoryRootIdentity';
+import { execFileSync as initializeFixtureGit } from 'node:child_process';
 import { expect, it } from 'vitest';
 import fs from 'node:fs';
 import os from 'node:os';
@@ -71,6 +73,7 @@ it('exercises real lifecycle setup and records the truthful context-hash dispatc
     const roleId = `role-${crypto.randomUUID()}`;
     const workerSlotId = `slot-${crypto.randomUUID()}`;
 
+    if (!fs.existsSync(path.join(repoDir, '.git'))) initializeFixtureGit('git', ['init', '-q', '--template=', '--initial-branch=main'], { cwd: repoDir, stdio: 'ignore', windowsHide: true });
     repo.createProject({
       id: projectId,
       name: 'Synthetic lifecycle project',
@@ -83,7 +86,7 @@ it('exercises real lifecycle setup and records the truthful context-hash dispatc
       updated_at: now,
       started_at: now,
       completed_at: null,
-    });
+    }, captureRepositoryRoot(repoDir));
     repo.createProvider({
       id: providerId,
       name: 'Synthetic provider',

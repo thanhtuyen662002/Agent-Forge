@@ -7,6 +7,8 @@ import type { Repository } from '../database/repositories';
 import { CanonicalExecutionPayload, CanonicalExecutionPayloadSchema, computePayloadHash } from './ExecutionAuthorizationService';
 import { canonicalJsonStringify } from '../context/ContextIntegrity';
 import { PolicyService } from './PolicyService';
+import { captureRepositoryRoot, RepositoryRootError } from './RepositoryRootIdentity';
+import { RepositoryRootLease } from './RepositoryRootLease';
 import { isProtectedExecutableName, resolveTrustedExecutable } from './ExecutableResolver';
 import { CommandParser } from './CommandParser';
 import {
@@ -106,9 +108,18 @@ export class VerificationCapabilityService {
   constructor(private readonly repo: Repository, private readonly ownerPrincipal = getVerificationOwnerPrincipal) {}
 
   public propose(projectId: string, executable: string, args: string[], projectRoot: string): VerificationCapabilityPayload {
+    const lease = RepositoryRootLease.acquire(this.repo.getProjectRepositoryIdentity(projectId));
+    try {
+      const proposal = this.proposeWithRepositoryLease(projectId, executable, args, projectRoot);
+      lease.assertActive();
+      return proposal;
+    } finally { lease.close(); }
+  }
+
+  private proposeWithRepositoryLease(projectId: string, executable: string, args: string[], projectRoot: string): VerificationCapabilityPayload {
     try {
       const root = canonicalPath(projectRoot, true);
-      const project = this.repo.getProject(projectId);
+      const project = this.repo.getProjectForRepositoryUse(projectId);
       if (!project || !samePath(canonicalPath(project.repository_path, true).path, root.path)) {
         throw new VerificationCapabilityError('CAPABILITY_BINDING_MISMATCH');
       }
@@ -171,7 +182,7 @@ export class VerificationCapabilityService {
         project_root_identity: root.identity, executable: bindFile(canonicalExecutable), args: [...args], scripts,
       });
     } catch (error) {
-      if (error instanceof VerificationCapabilityError) throw error;
+      if (error instanceof VerificationCapabilityError || error instanceof RepositoryRootError) throw error;
       throw new VerificationCapabilityError('INVALID_VERIFICATION_CAPABILITY');
     }
   }
@@ -184,6 +195,8 @@ export class VerificationCapabilityService {
     if (canonicalJsonStringify(refreshed) !== payloadJson) throw new VerificationCapabilityError('CAPABILITY_BINDING_MISMATCH');
     const display = JSON.parse(payloadJson) as VerificationCapabilityPayload;
     if (!(await confirmOwner(display))) throw new VerificationCapabilityError('OWNER_APPROVAL_REQUIRED');
+    const lease = RepositoryRootLease.acquire(this.repo.getProjectRepositoryIdentity(payload.project_id));
+    try {
     if (payload.owner_principal !== this.ownerPrincipal()) throw new VerificationCapabilityError('CAPABILITY_OWNER_MISMATCH');
     this.assertPayloadFiles(payload, payload.project_root, true);
     const currentOwner = this.ownerPrincipal();
@@ -192,14 +205,16 @@ export class VerificationCapabilityService {
     const approvalId = crypto.randomUUID();
     const payloadHash = sha256(payloadJson);
     this.repo.runInImmediateTransaction(() => {
-      const project = this.repo.getProject(payload.project_id);
+      const project = this.repo.getProjectForRepositoryUse(payload.project_id);
       if (!project || !samePath(canonicalPath(project.repository_path, true).path, payload.project_root)) throw new VerificationCapabilityError('CAPABILITY_BINDING_MISMATCH');
       this.repo.getDatabase().prepare(`INSERT INTO verification_capabilities
         (id,project_id,owner_principal,version,state,payload_json,payload_hash,approval_id,approval_json,created_at)
         VALUES (?,?,?,1,'ACTIVE',?,?,?,?,?)`).run(id, payload.project_id, currentOwner, payloadJson, payloadHash, approvalId,
         canonicalJsonStringify({ method: 'OS_AUTHENTICATED_NATIVE_CONFIRMATION', owner_principal: currentOwner, approval_id: approvalId, payload_hash: payloadHash }), new Date().toISOString());
+      lease.assertActive();
     });
     return { id, version: 1, owner_principal: currentOwner, payload_hash: payloadHash };
+    } finally { lease.close(); }
   }
 
   public validate(reference: VerificationCapabilityReference, projectId: string, executable: string, args: string[], runtimeRoot: string,
@@ -223,7 +238,7 @@ export class VerificationCapabilityService {
       !samePath(payload.executable.path, executable) || canonicalJsonStringify(payload.args) !== canonicalJsonStringify(args)) {
       throw new VerificationCapabilityError('CAPABILITY_BINDING_MISMATCH');
     }
-    const project = this.repo.getProject(projectId);
+    const project = this.repo.getProjectForRepositoryUse(projectId);
     if (!project || !samePath(canonicalPath(project.repository_path, true).path, payload.project_root)) {
       throw new VerificationCapabilityError('CAPABILITY_BINDING_MISMATCH');
     }
@@ -257,6 +272,8 @@ export class VerificationCapabilityService {
     const capturedArgs = [...args];
     const runtime = canonicalPath(runtimeRoot, true);
     const root = runtime.path;
+    const selectedIdentity = this.repo.getProjectRepositoryIdentity(projectId);
+    const runtimeIdentity = samePath(root, selectedIdentity.canonicalPath) ? selectedIdentity : captureRepositoryRoot(root);
     this.validate(captured, projectId, executable, capturedArgs, root, authorizationId);
     // Windows process creation fills an omitted USERPROFILE from the host.
     // Explicit empty values prevent ambient profile/config inheritance.
@@ -275,10 +292,26 @@ export class VerificationCapabilityService {
     } else {
       environment.PATH = '/usr/bin:/bin';
     }
-    return issueVerificationProcessBoundary(environment, (actualExecutable, actualArgs, cwd) => {
+    const assertInvocation = (actualExecutable: string, actualArgs: string[], cwd: string) => {
       if (!samePath(canonicalPath(cwd, true).path, root)) throw new VerificationCapabilityError('CAPABILITY_BINDING_MISMATCH');
       if (canonicalPath(cwd, true).identity !== runtime.identity) throw new VerificationCapabilityError('PATH_IDENTITY_CHANGED');
       this.validate(captured, projectId, actualExecutable, actualArgs, cwd, authorizationId);
+    };
+    return issueVerificationProcessBoundary(environment, assertInvocation, (actualExecutable, actualArgs, cwd) => {
+      const selected = RepositoryRootLease.acquire(selectedIdentity);
+      let runtimeLease: RepositoryRootLease | undefined;
+      try {
+        runtimeLease = runtimeIdentity === selectedIdentity ? selected : RepositoryRootLease.acquire(runtimeIdentity);
+        assertInvocation(actualExecutable, actualArgs, cwd);
+        selected.assertActive();
+        runtimeLease.assertActive();
+        const invocation = runtimeLease;
+        return { cwd: invocation.cwd,
+          assertActive: () => { selected.assertActive(); invocation.assertActive(); },
+          close: () => { invocation.close(); selected.close(); } };
+      } catch (error) {
+        runtimeLease?.close(); selected.close(); throw error;
+      }
     });
   }
 

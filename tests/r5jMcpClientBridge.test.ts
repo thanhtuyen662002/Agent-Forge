@@ -1,3 +1,4 @@
+import { captureRepositoryRoot } from '../src/core/services/RepositoryRootIdentity';
 import fs from 'fs';
 import path from 'path';
 import os from 'os';
@@ -313,7 +314,7 @@ function setupTestAuthorityDatabase(dbPath: string): {
     id: projectId,
     name: 'Test Project',
     description: 'Testing',
-    repository_path: 'D:/fake/repo',
+    repository_path: fs.realpathSync.native(path.resolve(__dirname, '..')),
     default_branch: 'main',
     status: 'RUNNING',
     contract: null,
@@ -321,7 +322,7 @@ function setupTestAuthorityDatabase(dbPath: string): {
     updated_at: now,
     started_at: null,
     completed_at: null,
-  });
+  }, captureRepositoryRoot(fs.realpathSync.native(path.resolve(__dirname, '..'))));
 
   const baseSha = 'b'.repeat(40);
   db.prepare(`
@@ -1071,11 +1072,14 @@ describe('R5J3 Reproducible External-Client Bridge Verification Suite', () => {
     const resourceId2 = `res-2-${crypto.randomUUID()}`;
 
     const repo = new Repository(db);
+    const secondRoot = path.join(testTempDir, 'repository2');
+    fs.mkdirSync(secondRoot);
+    execFileSync('git', ['init', '-q', '--template=', '--initial-branch=main'], { cwd: secondRoot, windowsHide: true, stdio: 'ignore' });
     repo.createProject({
       id: projectId2,
       name: 'Project 2',
       description: 'Second',
-      repository_path: 'D:/fake/repo2',
+      repository_path: secondRoot,
       default_branch: 'main',
       status: 'RUNNING',
       contract: null,
@@ -1083,7 +1087,7 @@ describe('R5J3 Reproducible External-Client Bridge Verification Suite', () => {
       updated_at: now,
       started_at: null,
       completed_at: null,
-    });
+    }, captureRepositoryRoot(secondRoot));
 
     db.prepare(`
       INSERT INTO tasks (id, project_id, title, state, priority, risk, revision_count, max_revisions, progress_cache_percent, base_sha, ownership_epoch, created_at, updated_at)

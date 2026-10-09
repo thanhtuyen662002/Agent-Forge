@@ -68,7 +68,7 @@ if (-not (Test-Path $packageJsonPath)) {
 $receiptLines.Add("PRODUCTION_VERSION=$expectedVersion")
 Write-Host "[A] Production Version ($expectedVersion): $(if ($expectedVersion -match '^\d+\.\d+\.\d+') {'PASS'} else {'FAIL'})"
 
-# Assertion B: Database migration count == 25
+# Assertion B: Database migration count == 26
 # Historical migrations are now one module per version. Read the version declarations
 # from that registry directory instead of assuming the compatibility facade contains
 # every definition; fail closed for missing, duplicate, or out-of-range versions.
@@ -88,14 +88,14 @@ if (-not (Test-Path $migrationsDir)) {
     $migrationVersions.Add([int]$migrationMatch.Matches[0].Groups[1].Value)
   }
   $migrationCount = $migrationVersions.Count
-  $expectedMigrationVersions = (1..25) -join ","
+  $expectedMigrationVersions = (1..26) -join ","
   $actualMigrationVersions = ($migrationVersions | Sort-Object) -join ","
-  if ($migrationCount -ne 25 -or $actualMigrationVersions -ne $expectedMigrationVersions) {
-    $failures.Add("B_MIGRATION_COUNT_INVALID: Expected exactly 25 migrations with versions 1..25, found $actualMigrationVersions")
+  if ($migrationCount -ne 26 -or $actualMigrationVersions -ne $expectedMigrationVersions) {
+    $failures.Add("B_MIGRATION_COUNT_INVALID: Expected exactly 26 migrations with versions 1..26, found $actualMigrationVersions")
   }
 }
 $receiptLines.Add("MIGRATION_COUNT=$migrationCount")
-Write-Host "[B] Database Migration Count ($migrationCount): $(if ($migrationCount -eq 25) {'PASS'} else {'FAIL'})"
+Write-Host "[B] Database Migration Count ($migrationCount): $(if ($migrationCount -eq 26) {'PASS'} else {'FAIL'})"
 
 # Assertion C & D: electron-builder.yml provider & credentials check
 $builderConfigPath = Join-Path $ProjectRoot "electron-builder.yml"

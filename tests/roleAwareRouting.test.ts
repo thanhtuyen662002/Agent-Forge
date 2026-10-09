@@ -1,3 +1,6 @@
+import fs from 'node:fs';
+import path from 'node:path';
+import { captureRepositoryRoot } from '../src/core/services/RepositoryRootIdentity';
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import Database from 'better-sqlite3';
 import { MigrationRunner } from '../src/core/database/migrations';
@@ -99,7 +102,7 @@ describe('R5E — Role-Aware Router & Separation / Diversity Policy', () => {
       id: projectId,
       name: 'R5E Test Project',
       description: 'Project for testing role-aware routing',
-      repository_path: 'D:/Projects/Agent-Forge',
+      repository_path: fs.realpathSync.native(path.resolve(__dirname, '..')),
       default_branch: 'main',
       status: 'RUNNING',
       contract: null,
@@ -108,7 +111,7 @@ describe('R5E — Role-Aware Router & Separation / Diversity Policy', () => {
       started_at: now,
       completed_at: null,
     };
-    repo.createProject(project);
+    repo.createProject(project, captureRepositoryRoot(project.repository_path));
 
     const task: Task = {
       id: taskId,

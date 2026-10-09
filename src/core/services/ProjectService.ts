@@ -4,6 +4,8 @@ import { EventService } from './EventService';
 import { ProjectStateMachine, ProjectTrigger } from '../state/projectStateMachine';
 import { Project, ProjectContract, ProjectStatus } from '../types/domain';
 import { ProjectStopFenceService } from './ProjectStopFenceService';
+import { assertRepositoryRootIdentity, RepositoryRootError, RepositoryRootIdentity } from './RepositoryRootIdentity';
+import { RepositoryRootLease } from './RepositoryRootLease';
 
 export class ProjectService {
   private readonly stopFence: ProjectStopFenceService;
@@ -15,7 +17,7 @@ export class ProjectService {
     this.stopFence = new ProjectStopFenceService(repo);
   }
 
-  public createProject(name: string, description: string, repositoryPath: string, defaultBranch: string = 'main'): Project {
+  public createProject(name: string, description: string, repositoryPath: string, defaultBranch: string = 'main', rootIdentity?: RepositoryRootIdentity): Project {
     const now = new Date().toISOString();
     const project: Project = {
       id: `PROJ-${crypto.randomUUID().substring(0, 8).toUpperCase()}`,
@@ -31,13 +33,31 @@ export class ProjectService {
       completed_at: null,
     };
 
-    this.repo.createProject(project);
-    this.eventService.record(project.id, 'PROJECT_CREATED', `Project "${name}" initialized in DRAFT state.`);
+    const lease = rootIdentity ? RepositoryRootLease.acquire(rootIdentity) : undefined;
+    try { this.repo.runInImmediateTransaction(() => {
+      this.repo.createProject(project, rootIdentity);
+      this.eventService.record(project.id, 'PROJECT_CREATED', `Project "${name}" initialized in DRAFT state.`);
+      if (rootIdentity) assertRepositoryRootIdentity(rootIdentity);
+    }); } finally { lease?.close(); }
     return project;
   }
 
+  public bindRepository(projectId: string, identity: RepositoryRootIdentity): Project {
+    const lease = RepositoryRootLease.acquire(identity);
+    try {
+      return this.repo.runInImmediateTransaction(() => {
+        const created = this.repo.bindProjectRepositoryIdentity(projectId, identity);
+        if (created) this.eventService.record(projectId, 'PROJECT_REPOSITORY_BOUND', 'Native repository selection confirmed for the configured project folder.');
+        lease.assertActive();
+        const project = this.repo.getProjectMetadata(projectId);
+        if (!project) throw new RepositoryRootError('REPOSITORY_ROOT_IDENTITY_CHANGED');
+        return project;
+      });
+    } finally { lease.close(); }
+  }
+
   public importContract(projectId: string, contract: ProjectContract): boolean {
-    const project = this.repo.getProject(projectId);
+    const project = this.repo.getProjectMetadata(projectId);
     if (!project) return false;
 
     this.repo.updateProjectContract(projectId, contract);
@@ -56,7 +76,7 @@ export class ProjectService {
   }
 
   public transitionStatus(projectId: string, trigger: ProjectTrigger): ProjectStatus {
-    const project = this.repo.getProject(projectId);
+    const project = this.repo.getProjectMetadata(projectId);
     if (!project) throw new Error(`Project ${projectId} not found.`);
 
     const nextStatus = ProjectStateMachine.transition(project.status, trigger);
@@ -66,6 +86,7 @@ export class ProjectService {
     // owner-controlled CAS resume operation.
     if (nextStatus === 'RUNNING') {
       this.stopFence.assertProjectRunningAllowed(projectId);
+      this.repo.getProjectRepositoryIdentity(projectId);
     }
     const startedAt = trigger === 'START_PROJECT' ? new Date().toISOString() : undefined;
     const completedAt = trigger === 'FINAL_PASS' ? new Date().toISOString() : undefined;

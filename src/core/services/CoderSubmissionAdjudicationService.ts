@@ -3,6 +3,8 @@ import fs from 'fs';
 import path from 'path';
 import Database from 'better-sqlite3';
 import { VerificationCapabilityService } from './VerificationCapabilityService';
+import { captureRepositoryRoot, RepositoryRootError, RepositoryRootIdentity } from './RepositoryRootIdentity';
+import { RepositoryRootLease } from './RepositoryRootLease';
 import {
   Repository,
   CoderSubmission,
@@ -34,7 +36,7 @@ import {
   CANONICAL_WORKSPACE_SNAPSHOT_AFTER_KEYS,
   CanonicalWorkspaceSnapshotAfterPayload,
 } from '../types/adjudication';
-import { Evidence, EvidenceType, GitStatusSummary, GitDiffSummary, TestRun } from '../types/domain';
+import { Evidence, EvidenceType, GitStatusSummary, GitDiffSummary, Project, TestRun } from '../types/domain';
 import {
   ArtifactStore,
   defaultArtifactStore,
@@ -3330,6 +3332,24 @@ export class CoderSubmissionAdjudicationService {
     submissionId: string;
     resumeAdjudicationId?: string;
   }): Promise<{ adjudication: CoderSubmissionAdjudication; status: AdjudicationStatus }> {
+    const selectedSubmission = this.repo.getCoderSubmissionById(params.submissionId);
+    let rootLease: RepositoryRootLease | undefined;
+    try {
+      if (selectedSubmission) rootLease = RepositoryRootLease.acquire(this.repo.getProjectRepositoryIdentity(selectedSubmission.project_id));
+      const result = await this.admitWithRepositoryLease(params);
+      rootLease?.assertActive();
+      return result;
+    } catch (error) {
+      if (!(error instanceof RepositoryRootError)) throw error;
+      throw new CoderSubmissionAdjudicationError('PRECONDITION_FENCED', error.code);
+    } finally { rootLease?.close(); }
+  }
+
+  private async admitWithRepositoryLease(params: {
+    requestId: string;
+    submissionId: string;
+    resumeAdjudicationId?: string;
+  }): Promise<{ adjudication: CoderSubmissionAdjudication; status: AdjudicationStatus }> {
     // 1. Check idempotency by request_id
     const existingAdj = this.repo.getCoderSubmissionAdjudicationByRequestId(params.requestId);
     if (existingAdj) {
@@ -3436,7 +3456,7 @@ export class CoderSubmissionAdjudicationService {
     }
 
     // 3. Authority Snapshot & Frozen Command Validation
-    const project = this.repo.getProject(sub.project_id);
+    const project = this.repo.getProjectForRepositoryUse(sub.project_id);
     if (!project) {
       throw new CoderSubmissionAdjudicationError('PRECONDITION_FENCED', 'Project not found');
     }
@@ -3577,7 +3597,7 @@ export class CoderSubmissionAdjudicationService {
       throw new CoderSubmissionAdjudicationError('PRECONDITION_FENCED', 'Project repository path missing');
     }
 
-    const prePhaseAFingerprint = await this.captureCanonicalWorkspaceFingerprint(project.repository_path, sub.base_sha);
+    const prePhaseAFingerprint = await this.captureCanonicalWorkspaceFingerprint(project.repository_path, sub.base_sha, this.repo.getProjectRepositoryIdentity(project.id));
     if (prePhaseAFingerprint.head_sha.toLowerCase() !== sub.authorized_head_sha.toLowerCase()) {
       throw new CoderSubmissionAdjudicationError(
         'WORKTREE_DRIFT',
@@ -3800,7 +3820,8 @@ export class CoderSubmissionAdjudicationService {
     try {
       freshPhaseBObservation = await this.captureCanonicalWorkspaceFingerprint(
         project.repository_path,
-        sub.base_sha
+        sub.base_sha,
+        this.repo.getProjectRepositoryIdentity(project.id)
       );
     } catch (obsErr: unknown) {
       this.repo.runInTransaction(() => {
@@ -3930,7 +3951,7 @@ export class CoderSubmissionAdjudicationService {
       }
 
       // Validate project/task/attempt/assignment/auth/provider/account/resource/slot/lease state
-      const liveProject = this.repo.getProject(sub.project_id);
+      const liveProject = this.repo.getProjectForRepositoryUse(sub.project_id);
       if (!liveProject || liveProject.status !== 'RUNNING') {
         throw new CoderSubmissionAdjudicationError('STATUS_CONFLICT', 'Project is not RUNNING');
       }
@@ -4090,9 +4111,9 @@ export class CoderSubmissionAdjudicationService {
     let driftReason = '';
 
     try {
-      postObservation = await this.captureCanonicalWorkspaceFingerprint(project.repository_path, sub.base_sha);
-      postGitStatus = await GitService.getStatus(project.repository_path);
-      postGitDiff = await GitService.getDiff(project.repository_path, sub.base_sha);
+      postObservation = await this.captureCanonicalWorkspaceFingerprint(project.repository_path, sub.base_sha, this.repo.getProjectRepositoryIdentity(project.id));
+      postGitStatus = await GitService.getStatus(project.repository_path, this.repo.getProjectRepositoryIdentity(project.id));
+      postGitDiff = await GitService.getDiff(project.repository_path, sub.base_sha, this.repo.getProjectRepositoryIdentity(project.id));
 
       if (postObservation.head_sha.toLowerCase() !== freshPhaseBObservation.head_sha.toLowerCase()) {
         driftDetected = true;
@@ -5083,7 +5104,7 @@ export class CoderSubmissionAdjudicationService {
       );
     }
 
-    const project = this.repo.getProject(adj.project_id);
+    const project = this.repo.getProjectForRepositoryUse(adj.project_id);
     if (!project) {
       throw new CoderSubmissionAdjudicationError('NOT_FOUND', `Project "${adj.project_id}" not found`);
     }
@@ -5448,7 +5469,12 @@ export class CoderSubmissionAdjudicationService {
     }
 
     // 4. Validate durable authority graph with exact FK/ID equality
-    const project = this.repo.getProject(sub.project_id);
+    let project: Project | null = null;
+    try { project = this.repo.getProjectForRepositoryUse(sub.project_id); }
+    catch (error) {
+      if (!(error instanceof RepositoryRootError)) throw error;
+      fenced_reasons.push(error.code);
+    }
     if (!project) {
       fenced_reasons.push(`Project "${sub.project_id}" not found`);
     } else if (project.status !== 'RUNNING') {
@@ -5939,7 +5965,7 @@ export class CoderSubmissionAdjudicationService {
    * Builds the complete, exact canonical authority snapshot.
    */
   public buildCanonicalAuthoritySnapshot(sub: CoderSubmission): CanonicalAuthoritySnapshot {
-    const project = this.repo.getProject(sub.project_id)!;
+    const project = this.repo.getProjectForRepositoryUse(sub.project_id)!;
     const task = this.repo.getTask(sub.task_id)!;
     const auth = this.repo.getExecutionAuthorization(sub.authorization_id)!;
     const attempt = sub.attempt_id ? this.repo.getTaskAttempt(sub.attempt_id) : null;
@@ -6027,19 +6053,26 @@ export class CoderSubmissionAdjudicationService {
    */
   public async captureCanonicalWorkspaceFingerprint(
     repoPath: string,
-    baseSha?: string
+    baseSha?: string,
+    expectedIdentity?: RepositoryRootIdentity,
   ): Promise<CanonicalWorkspaceFingerprint> {
-    const headRes = await GitService.getHeadSha(repoPath);
+    const rootLease = RepositoryRootLease.acquire(expectedIdentity ?? captureRepositoryRoot(repoPath));
+    try {
+    const headRes = await GitService.getHeadSha(repoPath, rootLease.identity);
     if (headRes.status !== 'SUCCESS' || !headRes.sha) {
       throw new CoderSubmissionAdjudicationError('WORKTREE_DRIFT', 'Failed to read repository HEAD SHA');
     }
 
     const statusProc = await ProcessRunner.execute({
       executable: 'git',
-      args: ['status', '--porcelain=v1', '-uall'],
-      cwd: repoPath,
+      args: ['-c', 'core.fsmonitor=false', '-c', 'core.untrackedCache=false', 'status', '--porcelain=v1', '-uall'],
+      cwd: rootLease.cwd,
+      repositoryIdentity: rootLease.identity,
       timeoutMs: 15000,
+      env: { GIT_OPTIONAL_LOCKS: '0', GIT_WORK_TREE: rootLease.cwd },
+      allowedEnvKeys: ['GIT_OPTIONAL_LOCKS', 'GIT_WORK_TREE'],
     });
+    rootLease.assertActive();
 
     if (statusProc.exitCode !== 0) {
       throw new CoderSubmissionAdjudicationError(
@@ -6058,18 +6091,23 @@ export class CoderSubmissionAdjudicationService {
     // Tracked diff identity
     const diffProc = await ProcessRunner.execute({
       executable: 'git',
-      args: ['diff', 'HEAD'],
-      cwd: repoPath,
+      args: ['-c', 'core.fsmonitor=false', '-c', 'core.untrackedCache=false', 'diff', '--no-ext-diff', '--no-textconv', '--end-of-options', headRes.sha, '--'],
+      cwd: rootLease.cwd,
+      repositoryIdentity: rootLease.identity,
       timeoutMs: 20000,
+      env: { GIT_OPTIONAL_LOCKS: '0', GIT_WORK_TREE: rootLease.cwd },
+      allowedEnvKeys: ['GIT_OPTIONAL_LOCKS', 'GIT_WORK_TREE'],
     });
-    const diffHash = computeSha256(diffProc.exitCode === 0 ? diffProc.stdout : '');
+    rootLease.assertActive();
+    if (diffProc.exitCode !== 0) throw new CoderSubmissionAdjudicationError('WORKTREE_DRIFT', 'Git diff failed while capturing selected workspace');
+    const diffHash = computeSha256(diffProc.stdout);
 
     // Deterministic content identity for untracked files
     const untrackedFileLines: string[] = [];
     for (const line of statusLines) {
       if (line.startsWith('?? ')) {
         const relPath = line.substring(3).trim();
-        const absPath = path.join(repoPath, relPath);
+        const absPath = path.join(rootLease.cwd, relPath);
         let contentHash = 'MISSING';
         try {
           if (fs.existsSync(absPath)) {
@@ -6093,8 +6131,9 @@ export class CoderSubmissionAdjudicationService {
       untracked_files_hash: untrackedFilesHash,
     });
 
-    const branchRes = await GitService.getCurrentBranch(repoPath);
+    const branchRes = await GitService.getCurrentBranch(repoPath, rootLease.identity);
     const branch = branchRes.status === 'SUCCESS' ? branchRes.branch ?? null : null;
+    rootLease.assertActive();
 
     return {
       head_sha: headRes.sha,
@@ -6106,5 +6145,6 @@ export class CoderSubmissionAdjudicationService {
       isClean: statusLines.length === 0,
       branch,
     };
+    } finally { rootLease.close(); }
   }
 }

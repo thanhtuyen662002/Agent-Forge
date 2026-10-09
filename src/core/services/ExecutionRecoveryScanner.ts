@@ -1,5 +1,6 @@
 import Database from 'better-sqlite3';
 import { Repository } from '../database/repositories';
+import { RepositoryRootError } from './RepositoryRootIdentity';
 import { EventService } from './EventService';
 import {
   ExecutionAuthorization,
@@ -147,7 +148,13 @@ export class ExecutionRecoveryScanner {
         return new NonHandoffExecutionLifecycle(this.repo).reconcile(auth);
       }
 
-      const project = this.repo.getProject(auth.project_id);
+      const project = this.repo.getProjectMetadata(auth.project_id);
+      let repositoryFailure: string | null = null;
+      try { this.repo.getProjectRepositoryIdentity(auth.project_id); }
+      catch (error) {
+        if (!(error instanceof RepositoryRootError)) throw error;
+        repositoryFailure = error.code;
+      }
       const task = this.repo.getTask(auth.task_id);
       const assignment = transfer.successor_assignment_id
         ? this.repo.getAgentAssignment(transfer.successor_assignment_id)
@@ -161,7 +168,7 @@ export class ExecutionRecoveryScanner {
         : null;
 
       // 1. Check Authority & Complete Binding Graph Integrity
-      let bindingConflictReason: string | null = null;
+      let bindingConflictReason: string | null = repositoryFailure;
       if (auth.lifecycle_version === 1) {
         if (
           !auth.task_id ||

@@ -299,6 +299,13 @@ export interface TranslationDictionary {
     importSuccess: string;
     importError: string;
     importButton: string;
+    repositoryBinding: {
+      title: string;
+      description: string;
+      button: string;
+      success: string;
+      blocked: string;
+    };
     createModal: {
       title: string;
       nameLabel: string;
@@ -315,6 +322,8 @@ export interface TranslationDictionary {
       repositoryErrors: {
         notGitRepository: string;
         invalidLocation: string;
+        alias: string;
+        changed: string;
         unknown: string;
         technicalDetails: string;
       };

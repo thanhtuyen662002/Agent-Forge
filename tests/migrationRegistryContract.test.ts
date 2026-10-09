@@ -28,6 +28,7 @@ const EXPECTED_MIGRATION_NAMES = [
   '023_r5j_quarantined_submission_adjudication_and_verification_admission',
   '024_r5j_reviewer_session_authority',
   'durable_owner_verification_capabilities',
+  'selected_project_repository_identities',
 ] as const;
 
 describe('migration registry contract', () => {

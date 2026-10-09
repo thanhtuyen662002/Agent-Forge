@@ -1,3 +1,5 @@
+import { captureRepositoryRoot } from '../src/core/services/RepositoryRootIdentity';
+import { execFileSync as initializeFixtureGit } from 'node:child_process';
 import Database from 'better-sqlite3';
 import fs from 'fs';
 import os from 'os';
@@ -112,6 +114,7 @@ describe('Local CLI provider workspace isolation', () => {
     repo = new Repository(db);
     artifactStore = new ArtifactStore(path.join(tmpDir, 'artifacts'));
     const now = new Date().toISOString();
+    if (!fs.existsSync(path.join(projectRoot, '.git'))) initializeFixtureGit('git', ['init', '-q', '--template=', '--initial-branch=main'], { cwd: projectRoot, stdio: 'ignore', windowsHide: true });
     repo.createProject({
       id: 'PROJ-WORKSPACE-TEST',
       name: 'Workspace isolation test project',
@@ -124,7 +127,7 @@ describe('Local CLI provider workspace isolation', () => {
       updated_at: now,
       started_at: null,
       completed_at: null,
-    });
+    }, captureRepositoryRoot(projectRoot));
     repo.createTask({
       id: 'TSK-WORKSPACE-TEST',
       project_id: 'PROJ-WORKSPACE-TEST',

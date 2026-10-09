@@ -1,3 +1,5 @@
+import { captureRepositoryRoot } from '../src/core/services/RepositoryRootIdentity';
+import { execFileSync as initializeFixtureGit } from 'node:child_process';
 import Database from 'better-sqlite3';
 import fs from 'node:fs';
 import os from 'node:os';
@@ -57,8 +59,9 @@ describe('complete compatibility dispatch / recovery boundary', () => {
       getHealth: async () => 'AVAILABLE', getCapabilities: async () => ['CODING'],
       getQuota: async () => ({ remaining: null, total: null, unit: 'REQUESTS', source: 'UNKNOWN', confidence: 0, resetAt: null }) };
     const now = new Date().toISOString();
+    if (!fs.existsSync(path.join(root, '.git'))) initializeFixtureGit('git', ['init', '-q', '--template=', '--initial-branch=main'], { cwd: root, stdio: 'ignore', windowsHide: true });
     repo.createProject({ id: 'P', name: 'Dispatch fixture', description: null, repository_path: root, default_branch: 'main',
-      status: 'RUNNING', contract: null, created_at: now, updated_at: now, started_at: now, completed_at: null });
+      status: 'RUNNING', contract: null, created_at: now, updated_at: now, started_at: now, completed_at: null }, captureRepositoryRoot(root));
     repo.createTask({ id: 'T', project_id: 'P', milestone_id: null, title: 'Legacy execution', description: null,
       state: 'CODING', paused_from_state: null, priority: 'HIGH', risk: 'LOW', assigned_agent_id: null, revision_count: 0,
       max_revisions: 3, base_sha: 'a'.repeat(40), current_sha: 'a'.repeat(40), progress_cache_percent: 0,
@@ -261,8 +264,12 @@ describe('complete compatibility dispatch / recovery boundary', () => {
     expect(repo.getExecutionAuthorization(auth.id)).toMatchObject({ adapter_outcome: 'TIMED_OUT', adapter_finished_at: null,
       termination_status: 'UNRESOLVED', termination_confirmed_at: null, settled_at: null });
     expect(cancel).toHaveBeenCalledWith(result.executionId);
+    const gitDirectory = path.join(root, '.git');
+    if (process.platform === 'win32') expect(() => fs.renameSync(gitDirectory, gitDirectory + '-changed')).toThrow();
     finish({ executionId: 'late-provider-id', status: 'COMPLETED' });
     await Promise.resolve();
+    fs.renameSync(gitDirectory, gitDirectory + '-changed');
+    fs.renameSync(gitDirectory + '-changed', gitDirectory);
     const scanner = reopen();
     expect(scanner.scanAndReconcile().items[0]).toMatchObject({ classification: 'ADAPTER_IN_FLIGHT_UNRESOLVED', mutatedResources: false });
     expect(repo.getExecutionAuthorization(auth.id)?.settled_at).toBeNull();

@@ -161,7 +161,9 @@ export class NonHandoffExecutionLifecycle {
       let classification: ExecutionRecoveryClassification;
       let disposition: ExecutionRecoveryDisposition;
       let mutatedTerminalState = false;
-      if (!task || task.project_id !== auth.project_id || this.repo.getTaskOwnershipEpoch(task.id) !== auth.task_ownership_epoch) {
+      let repositoryBound = false;
+      try { repositoryBound = !!this.repo.getProjectForRepositoryUse(auth.project_id); } catch { /* Missing root authority fences this item. */ }
+      if (!repositoryBound || !task || task.project_id !== auth.project_id || this.repo.getTaskOwnershipEpoch(task.id) !== auth.task_ownership_epoch) {
         classification = 'AUTHORITY_CONFLICT'; disposition = 'REJECTED_INTEGRITY_CONFLICT';
       } else if (auth.lifecycle_version === 1) {
         // Direct product authority is handled by product/adjudication recovery. Never abort it for lack of a handoff.
@@ -213,7 +215,7 @@ export class NonHandoffExecutionLifecycle {
   private hasCapabilities(auth: ExecutionAuthorization): boolean {
     try {
       if (!this.stopFence.assertDispatchAdmission(auth.id).admitted) return false;
-      const project = this.repo.getProject(auth.project_id);
+      const project = this.repo.getProjectForRepositoryUse(auth.project_id);
       if (!project) return false;
       const payload = JSON.parse(auth.canonical_payload_json ?? '');
       new VerificationCapabilityService(this.repo).validateSnapshot(auth.project_id, payload.verificationCommands, project.repository_path);

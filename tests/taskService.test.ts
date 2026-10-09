@@ -1,3 +1,6 @@
+import { captureRepositoryRoot } from '../src/core/services/RepositoryRootIdentity';
+import selectedFixtureFs from 'node:fs';
+import selectedFixturePath from 'node:path';
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import Database from 'better-sqlite3';
 import { MigrationRunner } from '../src/core/database/migrations';
@@ -8,6 +11,8 @@ import { GitService } from '../src/core/services/GitService';
 import { ProgressService } from '../src/core/services/ProgressService';
 import { ManagerProtocol, CoderProtocol } from '../src/core/types/protocols';
 import { Task, Project } from '../src/core/types/domain';
+
+const selectedFixtureRoot = selectedFixtureFs.realpathSync.native(selectedFixturePath.resolve(__dirname, '..'));
 
 describe('TaskService & Protocol Idempotency', () => {
   let db: Database.Database;
@@ -30,7 +35,7 @@ describe('TaskService & Protocol Idempotency', () => {
       id: 'PROJ-TEST',
       name: 'Test Project',
       description: null,
-      repository_path: 'd:/test',
+      repository_path: selectedFixtureRoot,
       default_branch: 'main',
       status: 'RUNNING',
       contract: null,
@@ -39,7 +44,7 @@ describe('TaskService & Protocol Idempotency', () => {
       started_at: new Date().toISOString(),
       completed_at: null,
     };
-    repo.createProject(proj);
+    repo.createProject(proj, captureRepositoryRoot(proj.repository_path));
 
     const task: Task = {
       id: 'TSK-001',

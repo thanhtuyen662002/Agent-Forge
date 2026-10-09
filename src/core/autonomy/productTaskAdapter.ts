@@ -1,3 +1,4 @@
+import { RepositoryRootLease } from '../services/RepositoryRootLease';
 import crypto from 'crypto';
 import path from 'path';
 import { Repository } from '../database/repositories';
@@ -306,7 +307,7 @@ export class ProductTaskAutonomyAdapter {
       return fail('CANONICAL_PAYLOAD_HASH_MISMATCH', 'ExecutionAuthorization canonical payload failed hash verification.');
     }
     try {
-      const project = this.repo.getProject(task.project_id);
+      const project = this.repo.getProjectForRepositoryUse(task.project_id);
       if (!project) throw new Error('CAPABILITY_PROJECT_MISSING');
       new VerificationCapabilityService(this.repo).validateSnapshot(task.project_id,
         canonicalPayload.verificationCommands, project.repository_path);
@@ -802,6 +803,8 @@ export class ProductTaskAutonomyAdapter {
     if (!validated.valid || !validated.authority) {
       return { success: false, finalTaskState: 'UNKNOWN', leaseAcquired: false, leaseReleased: false, error: `${validated.code}: ${validated.error}` };
     }
+    const rootLease = RepositoryRootLease.acquire(this.repo.getProjectRepositoryIdentity(validated.authority.task.project_id));
+    try {
     const workOrder = this.buildAuthorizedWorkOrder(input);
     const acquired = this.acquireWorkerSlotLease(validated.authority.assignment.id);
     if (acquired.status !== 'ACQUIRED') {
@@ -819,11 +822,14 @@ export class ProductTaskAutonomyAdapter {
       if (task.state === 'DISPATCHED' || task.state === 'FIX_REQUIRED') task = this.transitionTask(task, 'START_CODING');
       if (task.state !== 'CODING') throw new Error(`PRODUCT_TASK_NOT_CODING: ${task.state}`);
 
+      rootLease.assertActive();
       const coder = await input.runCoder(workOrder);
+      rootLease.assertActive();
       if (!coder.success) throw new Error(coder.error ?? 'CODER_EXECUTION_FAILED');
 
       // Independently observe Git HEAD and working-tree snapshot before review, never trusting only runCoder claims
       const preReviewEvidence = await evidenceCollector.collect(workOrder, []);
+      rootLease.assertActive();
       if (coder.currentHeadSha && coder.currentHeadSha.toLowerCase() !== preReviewEvidence.headSha.toLowerCase()) {
         throw new Error(`CODER_HEAD_MISMATCH: coder claimed ${coder.currentHeadSha}, observed ${preReviewEvidence.headSha}`);
       }
@@ -854,13 +860,14 @@ export class ProductTaskAutonomyAdapter {
         expectedState: task.state,
         executionId: validated.authority.authorization.execution_id ?? validated.authority.authorization.id,
       };
-      const verificationProject = this.repo.getProject(task.project_id);
+      const verificationProject = this.repo.getProjectForRepositoryUse(task.project_id);
       if (!verificationProject) throw new Error('VERIFICATION_CAPABILITY_PROJECT_MISSING');
       const verificationPayload = CanonicalExecutionPayloadSchema.parse(JSON.parse(validated.authority.authorization.canonical_payload_json!));
       const capabilities = new VerificationCapabilityService(this.repo);
       capabilities.validateSnapshot(task.project_id, verificationPayload.verificationCommands,
         verificationProject.repository_path, validated.authority.authorization.id);
       const currentTestRun = await input.runVerification(validated.authority, workOrder, verificationBinding);
+      rootLease.assertActive();
       const afterVerificationTask = this.repo.getTask(task.id);
       const afterVerificationEpoch = afterVerificationTask?.ownership_epoch ?? authorityEpoch;
       if (
@@ -1033,6 +1040,7 @@ export class ProductTaskAutonomyAdapter {
           changedFiles: input.managerContext?.changedFiles ?? preReviewEvidence.changedFiles,
         });
         const rawReview = await input.conductReview(context);
+        rootLease.assertActive();
         const parsedReview = ManagerReviewSchema.safeParse(rawReview);
         if (!parsedReview.success) {
           throw new Error(`CONTRACT_INVALID: conductReview returned invalid review contract: ${parsedReview.error.message}`);
@@ -1071,6 +1079,7 @@ export class ProductTaskAutonomyAdapter {
 
         // Independently observe a fresh Git HEAD and working-tree snapshot after manager review
         const postReviewEvidence = await evidenceCollector.collect(workOrder, []);
+        rootLease.assertActive();
         const freshness = this.validateReviewFreshness(
           review,
           postReviewEvidence.headSha,
@@ -1297,6 +1306,7 @@ export class ProductTaskAutonomyAdapter {
       );
     }
     return result;
+      } finally { rootLease.close(); }
   }
 }
 

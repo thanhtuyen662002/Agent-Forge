@@ -1,4 +1,6 @@
-import { describe, it, expect, beforeEach, afterEach } from 'vitest';
+import { captureRepositoryRoot } from '../src/core/services/RepositoryRootIdentity';
+import { execFileSync as initializeFixtureGit } from 'node:child_process';
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { testWindowsWorktree, withoutWindowsWorktreeBoundary } from './helpers/worktreePlatforms';
 import Database from 'better-sqlite3';
 import fs from 'fs';
@@ -246,6 +248,7 @@ describe('R5I7 Cross-Provider Handoff Evidence and Closure Integration Suite', (
 
     // 5. Initial Fixture: Project & Task
     if (!repo.getProject(pid)) {
+      if (!fs.existsSync(path.join(repoDir, '.git'))) initializeFixtureGit('git', ['init', '-q', '--template=', '--initial-branch=main'], { cwd: repoDir, stdio: 'ignore', windowsHide: true });
       repo.createProject({
         id: pid,
         name: 'Closure Project',
@@ -258,7 +261,7 @@ describe('R5I7 Cross-Provider Handoff Evidence and Closure Integration Suite', (
         completed_at: null,
         created_at: nowIso,
         updated_at: nowIso,
-      });
+      }, captureRepositoryRoot(repoDir));
     }
 
     if (!repo.getTask(tid)) {
@@ -2249,7 +2252,12 @@ describe('R5I7 Cross-Provider Handoff Evidence and Closure Integration Suite', (
     const transfer = repo.getHandoffTransfer(flow.transferId);
     const task = repo.getTask(flow.taskId);
     const managedEntries = fs.readdirSync(managedDir);
-    const result = await withoutWindowsWorktreeBoundary(() => scheduler.execute(flow.authorizationId!));
+    const originalCreate = worktreeService.createWorktree.bind(worktreeService);
+    const create = vi.spyOn(worktreeService, 'createWorktree').mockImplementation((...args) =>
+      withoutWindowsWorktreeBoundary(() => originalCreate(...args)));
+    let result: Awaited<ReturnType<ConcurrentExecutionScheduler['execute']>>;
+    try { result = await scheduler.execute(flow.authorizationId!); }
+    finally { create.mockRestore(); }
     expect(result.status).toBe('WORKTREE_CREATE_FAILED');
     expect(result.errorCode).toBe('UNSUPPORTED_MUTATION_BOUNDARY');
     expect(repo.getExecutionAuthorization(flow.authorizationId!)).toEqual(authorization);

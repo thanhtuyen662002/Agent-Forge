@@ -1,3 +1,5 @@
+import { captureRepositoryRoot } from '../src/core/services/RepositoryRootIdentity';
+import { execFileSync as initializeFixtureGit } from 'node:child_process';
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { testWindowsWorktree } from './helpers/worktreePlatforms';
 import Database from 'better-sqlite3';
@@ -191,6 +193,7 @@ describe('R5I6 Crash Recovery, Execution Lifecycle Linearization, and Durable Au
     // 1. Seed Project & Task
     const existingProject = repo.getProject(projectId);
     if (!existingProject) {
+      if (!fs.existsSync(path.join(repoDir, '.git'))) initializeFixtureGit('git', ['init', '-q', '--template=', '--initial-branch=main'], { cwd: repoDir, stdio: 'ignore', windowsHide: true });
       repo.createProject({
         id: projectId,
         name: 'Project 1',
@@ -203,7 +206,7 @@ describe('R5I6 Crash Recovery, Execution Lifecycle Linearization, and Durable Au
         updated_at: nowIso,
         started_at: null,
         completed_at: null,
-      });
+      }, captureRepositoryRoot(repoDir));
     }
 
     repo.createTask({
@@ -599,11 +602,11 @@ describe('R5I6 Crash Recovery, Execution Lifecycle Linearization, and Durable Au
     testDb.close();
   });
 
-  // 4. RC verifier requires exactly 25 migrations
-  it('4. should require exactly 25 migrations in static contract count', () => {
-    expect(MIGRATIONS.length).toBe(25);
+  // 4. RC verifier requires exactly 26 migrations
+  it('4. should require exactly 26 migrations in static contract count', () => {
+    expect(MIGRATIONS.length).toBe(26);
     const verifierScript = fs.readFileSync(path.join(process.cwd(), 'scripts/verify-demo-rc-win.ps1'), 'utf-8');
-    expect(verifierScript).toContain('Expected exactly 25 migrations');
+    expect(verifierScript).toContain('Expected exactly 26 migrations');
     expect(verifierScript).not.toContain('Expected exactly 20 migrations');
   });
 

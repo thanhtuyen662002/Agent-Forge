@@ -1,3 +1,5 @@
+import { captureRepositoryRoot } from '../src/core/services/RepositoryRootIdentity';
+import { execFileSync as initializeFixtureGit } from 'node:child_process';
 import crypto from 'crypto';
 import fs from 'fs';
 import os from 'os';
@@ -167,6 +169,7 @@ describe('Two-Worker Autonomy Scheduler (TSK-TWO-WORKER-ENABLEMENT)', () => {
     function seedProductEnvironment() {
       const now = new Date().toISOString();
       const projectId = 'proj-sched';
+      if (!fs.existsSync(path.join(root, '.git'))) initializeFixtureGit('git', ['init', '-q', '--template=', '--initial-branch=main'], { cwd: root, stdio: 'ignore', windowsHide: true });
       repo.createProject({
         id: projectId,
         name: 'Scheduler project',
@@ -179,7 +182,7 @@ describe('Two-Worker Autonomy Scheduler (TSK-TWO-WORKER-ENABLEMENT)', () => {
         updated_at: now,
         started_at: now,
         completed_at: null,
-      });
+      }, captureRepositoryRoot(root));
       repo.createProvider({ id: 'prov-agy', name: 'Antigravity', adapter_type: 'LOCAL_CLI', enabled: true, created_at: now });
       repo.createProviderAccount({
         id: 'acc-agy',
@@ -706,6 +709,7 @@ describe('Two-Worker Autonomy Scheduler (TSK-TWO-WORKER-ENABLEMENT)', () => {
     function ensureProductFixture(projectId = 'proj-auth-scope') {
       const now = new Date().toISOString();
       if (!repo.getProject(projectId)) {
+        if (!fs.existsSync(path.join(root, '.git'))) initializeFixtureGit('git', ['init', '-q', '--template=', '--initial-branch=main'], { cwd: root, stdio: 'ignore', windowsHide: true });
         repo.createProject({
           id: projectId,
           name: 'Auth scope project',
@@ -718,7 +722,7 @@ describe('Two-Worker Autonomy Scheduler (TSK-TWO-WORKER-ENABLEMENT)', () => {
           updated_at: now,
           started_at: now,
           completed_at: null,
-        });
+        }, captureRepositoryRoot(root));
         repo.createProvider({ id: 'prov-agy-scope', name: 'Antigravity', adapter_type: 'LOCAL_CLI', enabled: true, created_at: now });
         repo.createProviderAccount({
           id: 'acc-agy-scope',

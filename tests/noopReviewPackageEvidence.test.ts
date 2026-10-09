@@ -1,3 +1,5 @@
+import { captureRepositoryRoot } from '../src/core/services/RepositoryRootIdentity';
+import { execFileSync as initializeFixtureGit } from 'node:child_process';
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import Database from 'better-sqlite3';
 import path from 'path';
@@ -76,6 +78,7 @@ describe('No-Op Review Package Evidence Hardening (Fail-Closed & Clean Fallback)
     );
 
     // Setup base project and task
+    if (!fs.existsSync(path.join(tmpDataDir, '.git'))) initializeFixtureGit('git', ['init', '-q', '--template=', '--initial-branch=main'], { cwd: tmpDataDir, stdio: 'ignore', windowsHide: true });
     repo.createProject({
       id: projectId,
       name: 'No-Op Evidence Test Project',
@@ -88,7 +91,7 @@ describe('No-Op Review Package Evidence Hardening (Fail-Closed & Clean Fallback)
       updated_at: new Date().toISOString(),
       started_at: null,
       completed_at: null,
-    });
+    }, captureRepositoryRoot(tmpDataDir));
 
     repo.createTask({
       id: taskId,

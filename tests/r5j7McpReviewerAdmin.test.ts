@@ -1,3 +1,5 @@
+import { captureRepositoryRoot } from '../src/core/services/RepositoryRootIdentity';
+import { execFileSync as initializeFixtureGit } from 'node:child_process';
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import fs from 'fs';
 import path from 'path';
@@ -84,6 +86,7 @@ function seedReviewerEnvironment(tempDir: string): ReviewerFixtures {
   db.prepare(`INSERT INTO agents (id, display_name, role, provider_resource_id, status, current_task_id, last_seen_at) VALUES (?, 'ReviewerAgent', 'REVIEWER', ?, 'IDLE', NULL, ?)`).run(reviewerAgentId, reviewerResourceId, now);
 
   // 5. Project & Task (state: REVIEW_READY)
+  if (!fs.existsSync(path.join(tempDir, '.git'))) initializeFixtureGit('git', ['init', '-q', '--template=', '--initial-branch=main'], { cwd: tempDir, stdio: 'ignore', windowsHide: true });
   repo.createProject({
     id: projectId,
     name: 'Reviewer Test Project',
@@ -96,7 +99,7 @@ function seedReviewerEnvironment(tempDir: string): ReviewerFixtures {
     updated_at: now,
     started_at: null,
     completed_at: null,
-  });
+  }, captureRepositoryRoot(tempDir));
 
   db.prepare(`
     INSERT INTO tasks (id, project_id, title, state, priority, risk, revision_count, max_revisions, progress_cache_percent, base_sha, ownership_epoch, created_at, updated_at)

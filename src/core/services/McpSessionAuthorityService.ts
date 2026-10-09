@@ -1,6 +1,7 @@
 import crypto from 'crypto';
 import Database from 'better-sqlite3';
 import { Repository } from '../database/repositories';
+import { RepositoryRootError } from './RepositoryRootIdentity';
 import {
   ExecutionAuthorization,
   McpClientSession,
@@ -346,7 +347,12 @@ export class McpSessionAuthorityService {
     }
 
     // 4. Project
-    const project = this.repo.getProject(auth.project_id);
+    let project: Project | null;
+    try { project = this.repo.getProjectForRepositoryUse(auth.project_id); }
+    catch (error) {
+      if (!(error instanceof RepositoryRootError)) throw error;
+      throw new McpAuthorityError('MCP_AUTHORITY_FENCED', error.code);
+    }
     if (!project || project.id !== auth.project_id) {
       throw new McpAuthorityError('MCP_AUTHORITY_FENCED', `Project "${auth.project_id}" not found or mismatched`);
     }

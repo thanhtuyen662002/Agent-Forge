@@ -1,5 +1,5 @@
+import { RepositoryRootLease } from '../core/services/RepositoryRootLease';
 import { ipcMain, dialog, app } from 'electron';
-import path from 'path';
 import { Repository } from '../core/database/repositories';
 import { ProjectService } from '../core/services/ProjectService';
 import { TaskService } from '../core/services/TaskService';
@@ -13,6 +13,7 @@ import { defaultArtifactStore } from '../core/services/ArtifactStore';
 import { EmergencyStopService } from '../core/services/EmergencyStopService';
 import { PolicyService } from '../core/services/PolicyService';
 import { RepositorySelectionService } from '../core/services/RepositorySelectionService';
+import { assertRepositoryRootIdentity, captureRepositoryRoot, RepositoryRootError } from '../core/services/RepositoryRootIdentity';
 import { ProviderRoutingService } from '../core/services/ProviderRoutingService';
 import { ExecutionAuthorizationService } from '../core/services/ExecutionAuthorizationService';
 import { ProviderDispatchService } from '../core/services/ProviderDispatchService';
@@ -20,6 +21,7 @@ import { UpdateService } from '../core/services/UpdateService';
 import { CommandParser } from '../core/services/CommandParser';
 import {
   CreateProjectIpcSchema,
+  BindProjectRepositoryIpcSchema,
   ImportContractIpcSchema,
   TransitionProjectIpcSchema,
   CreateTaskIpcSchema,
@@ -117,7 +119,11 @@ export function registerIpcHandlers(
       if (!isTrustedIpcSender(event, rendererPolicy)) {
         throw new IpcSenderTrustError();
       }
-      return handler(event, payload);
+      try { return await handler(event, payload); }
+      catch (error) {
+        if (!(error instanceof RepositoryRootError)) throw error;
+        return { success: false, errorCode: error.code, error: error.message };
+      }
     });
   };
   const capabilityApprovalsInProgress = new Set<string>();
@@ -133,39 +139,45 @@ export function registerIpcHandlers(
       return { success: false, cancelled: true };
     }
 
-    const selectedPath = path.normalize(path.resolve(filePaths[0]));
+    try {
+      const rootIdentity = captureRepositoryRoot(filePaths[0]);
+      const selectedPath = rootIdentity.canonicalPath;
 
-    // Validate path against security policy
-    const policy = PolicyService.evaluatePathAccess(selectedPath, selectedPath, false);
-    if (!policy.allowed) {
+      // Validate path against security policy
+      const policy = PolicyService.evaluateRepositoryPathAccess(selectedPath, rootIdentity, false);
+      if (!policy.allowed) {
+        return {
+          success: false,
+          errorCode: policy.reasonCode ?? 'INVALID_REPOSITORY_LOCATION',
+          errorDetail: policy.reason,
+          error: `Invalid repository location: ${policy.reason}`,
+        };
+      }
+
+      // Verify directory is a genuine Git working tree
+      const gitStatus = await GitService.getStatus(selectedPath, rootIdentity);
+      if (gitStatus.status !== 'SUCCESS') {
+        const errorDetail = gitStatus.errorMessage || 'git status failed';
+        return {
+          success: false,
+          errorCode: gitStatus.errorCode ?? 'NOT_GIT_REPOSITORY',
+          errorDetail,
+          error: `Selected directory is not a valid Git repository (${errorDetail}).`,
+        };
+      }
+
+      // Issue short-lived, single-use selection token
+      const token = RepositorySelectionService.issueToken(filePaths[0], rootIdentity);
+
       return {
-        success: false,
-        errorCode: 'INVALID_REPOSITORY_LOCATION',
-        errorDetail: policy.reason,
-        error: `Invalid repository location: ${policy.reason}`,
+        success: true,
+        selectionId: token.selectionId,
+        displayPath: token.displayPath,
       };
+    } catch (error) {
+      if (!(error instanceof RepositoryRootError)) throw error;
+      return { success: false, errorCode: error.code, errorDetail: error.message, error: error.message };
     }
-
-    // Verify directory is a genuine Git working tree
-    const gitStatus = await GitService.getStatus(selectedPath);
-    if (gitStatus.status !== 'SUCCESS') {
-      const errorDetail = gitStatus.errorMessage || 'git status failed';
-      return {
-        success: false,
-        errorCode: 'NOT_GIT_REPOSITORY',
-        errorDetail,
-        error: `Selected directory is not a valid Git repository (${errorDetail}).`,
-      };
-    }
-
-    // Issue short-lived, single-use selection token
-    const token = RepositorySelectionService.issueToken(selectedPath);
-
-    return {
-      success: true,
-      selectionId: token.selectionId,
-      displayPath: token.displayPath,
-    };
   });
 
   // ==========================================
@@ -179,40 +191,70 @@ export function registerIpcHandlers(
 
     // Consume native selection token
     const tokenRes = RepositorySelectionService.consumeToken(parsed.data.repositorySelectionId);
-    if (!tokenRes.success || !tokenRes.canonicalPath) {
-      return { success: false, error: tokenRes.error || 'Invalid repository selection token.' };
+    if (!tokenRes.success || !tokenRes.canonicalPath || !tokenRes.rootIdentity) {
+      return { success: false, errorCode: tokenRes.errorCode, error: tokenRes.error || 'Invalid repository selection token.' };
     }
 
-    const canonicalRepoPath = tokenRes.canonicalPath;
+    try {
+      const canonicalRepoPath = tokenRes.canonicalPath;
 
-    // Validate path security and Git repository validity
-    const policy = PolicyService.evaluatePathAccess(canonicalRepoPath, canonicalRepoPath, false);
-    if (!policy.allowed) {
-      return { success: false, error: `Unauthorized repository path: ${policy.reason}` };
+      // Validate path security and Git repository validity
+      const policy = PolicyService.evaluateRepositoryPathAccess(canonicalRepoPath, tokenRes.rootIdentity, false);
+      if (!policy.allowed) {
+        return { success: false, errorCode: policy.reasonCode ?? 'INVALID_REPOSITORY_LOCATION', error: policy.reason };
+      }
+
+      const gitStatus = await GitService.getStatus(canonicalRepoPath, tokenRes.rootIdentity);
+      if (gitStatus.status !== 'SUCCESS') {
+        return {
+          success: false,
+          errorCode: gitStatus.errorCode,
+          error: `Repository path is not a valid Git repository: ${gitStatus.errorMessage || 'git status failed'}`,
+        };
+      }
+
+      assertRepositoryRootIdentity(tokenRes.rootIdentity);
+      const project = projectService.createProject(
+        parsed.data.name,
+        parsed.data.description,
+        canonicalRepoPath,
+        parsed.data.defaultBranch,
+        tokenRes.rootIdentity,
+      );
+
+      return { success: true, project };
+    } catch (error) {
+      if (!(error instanceof RepositoryRootError)) throw error;
+      return { success: false, errorCode: error.code, error: error.message };
     }
+  });
 
-    const gitStatus = await GitService.getStatus(canonicalRepoPath);
-    if (gitStatus.status !== 'SUCCESS') {
-      return {
-        success: false,
-        error: `Repository path is not a valid Git repository: ${gitStatus.errorMessage || 'git status failed'}`,
-      };
+  registerPrivilegedHandler('project:bindRepository', async (_, payload: unknown) => {
+    const parsed = BindProjectRepositoryIpcSchema.safeParse(payload);
+    if (!parsed.success) return { success: false, error: 'A project ID and native repository selection are required.' };
+    const selected = RepositorySelectionService.consumeToken(parsed.data.repositorySelectionId);
+    if (!selected.success || !selected.canonicalPath || !selected.rootIdentity) {
+      return { success: false, errorCode: selected.errorCode, error: selected.error || 'Invalid repository selection token.' };
     }
-
-    const project = projectService.createProject(
-      parsed.data.name,
-      parsed.data.description,
-      canonicalRepoPath,
-      parsed.data.defaultBranch
-    );
-
-    return { success: true, project };
+    try {
+      const metadata = repo.getProjectMetadata(parsed.data.projectId);
+      if (!metadata || metadata.repository_path !== selected.canonicalPath) throw new RepositoryRootError('REPOSITORY_ROOT_IDENTITY_CHANGED');
+      const policy = PolicyService.evaluateRepositoryPathAccess(selected.canonicalPath, selected.rootIdentity, false);
+      if (!policy.allowed) return { success: false, errorCode: policy.reasonCode ?? 'INVALID_REPOSITORY_LOCATION', error: policy.reason };
+      const status = await GitService.getStatus(selected.canonicalPath, selected.rootIdentity);
+      if (status.status !== 'SUCCESS') return { success: false, errorCode: status.errorCode ?? 'NOT_GIT_REPOSITORY', error: 'The configured repository could not be verified.' };
+      assertRepositoryRootIdentity(selected.rootIdentity);
+      return { success: true, project: projectService.bindRepository(parsed.data.projectId, selected.rootIdentity) };
+    } catch (error) {
+      if (!(error instanceof RepositoryRootError)) throw error;
+      return { success: false, errorCode: error.code, error: error.message };
+    }
   });
 
   registerPrivilegedHandler('project:get', async (_, payload: unknown) => {
     const parsed = ProjectScopedIpcSchema.safeParse(payload);
     if (!parsed.success) return null;
-    return repo.getProject(parsed.data.projectId);
+    return repo.getProjectMetadata(parsed.data.projectId);
   });
 
   registerPrivilegedHandler('project:list', async () => {
@@ -543,21 +585,28 @@ export function registerIpcHandlers(
       };
     }
 
-    const project = repo.getProject(parsed.data.projectId);
-    if (!project) {
-      return {
-        status: 'ERROR',
-        branch: 'UNKNOWN',
-        isClean: false,
-        modifiedFiles: [],
-        untrackedFiles: [],
-        aheadCount: 0,
-        behindCount: 0,
-        errorMessage: 'Project not found',
-      };
-    }
+    try {
+      const project = repo.getProject(parsed.data.projectId);
+      if (!project) {
+        return {
+          status: 'ERROR',
+          branch: 'UNKNOWN',
+          isClean: false,
+          modifiedFiles: [],
+          untrackedFiles: [],
+          aheadCount: 0,
+          behindCount: 0,
+          errorMessage: 'Project not found',
+        };
+      }
 
-    return GitService.getStatus(project.repository_path);
+      const rootIdentity = repo.getProjectRepositoryIdentity(project.id);
+      return await GitService.getStatus(project.repository_path, rootIdentity);
+    } catch (error) {
+      if (!(error instanceof RepositoryRootError)) throw error;
+      return { status: 'ERROR', branch: 'UNKNOWN', isClean: false, modifiedFiles: [], untrackedFiles: [],
+        aheadCount: 0, behindCount: 0, errorCode: error.code, errorMessage: error.message };
+    }
   });
 
   registerPrivilegedHandler('git:getDiff', async (_, payload: unknown) => {
@@ -587,20 +636,27 @@ export function registerIpcHandlers(
       };
     }
 
-    const project = repo.getProject(task.project_id);
-    if (!project) {
-      return {
-        status: 'ERROR',
-        diffStat: '',
-        diffContent: '',
-        filesChanged: [],
-        insertions: 0,
-        deletions: 0,
-        errorMessage: 'Project not found',
-      };
-    }
+    try {
+      const project = repo.getProject(task.project_id);
+      if (!project) {
+        return {
+          status: 'ERROR',
+          diffStat: '',
+          diffContent: '',
+          filesChanged: [],
+          insertions: 0,
+          deletions: 0,
+          errorMessage: 'Project not found',
+        };
+      }
 
-    return GitService.getDiff(project.repository_path, task.base_sha);
+      const rootIdentity = repo.getProjectRepositoryIdentity(project.id);
+      return await GitService.getDiff(project.repository_path, task.base_sha, rootIdentity);
+    } catch (error) {
+      if (!(error instanceof RepositoryRootError)) throw error;
+      return { status: 'ERROR', diffStat: '', diffContent: '', filesChanged: [], insertions: 0, deletions: 0,
+        errorCode: error.code, errorMessage: error.message };
+    }
   });
 
   registerPrivilegedHandler('verification:runTests', async (_, payload: unknown) => {
@@ -643,7 +699,7 @@ export function registerIpcHandlers(
       return { success: false, error: parsed.error.issues.map((i) => i.message).join(', ') };
     }
 
-    const project = repo.getProject(parsed.data.projectId);
+    const project = repo.getProjectForRepositoryUse(parsed.data.projectId);
     if (!project) {
       return { success: false, error: `Project "${parsed.data.projectId}" not found.` };
     }
@@ -651,6 +707,7 @@ export function registerIpcHandlers(
     if (capabilityApprovalsInProgress.has(project.id)) {
       return { success: false, error: 'CAPABILITY_APPROVAL_IN_PROGRESS' };
     }
+    const rootLease = RepositoryRootLease.acquire(repo.getProjectRepositoryIdentity(project.id));
     capabilityApprovalsInProgress.add(project.id);
     const capabilities = new VerificationCapabilityService(repo);
     const approved: VerificationCapabilityReference[] = [];
@@ -691,20 +748,24 @@ export function registerIpcHandlers(
         parsedCommands[type] = { executable: proposal.executable.path, args: [...proposal.args], capability };
       }
       const updatedCommands = repo.runInImmediateTransaction(() => {
-        const current = repo.getProject(project.id);
+        const current = repo.getProjectForRepositoryUse(project.id);
         if (!current || current.repository_path !== project.repository_path ||
             JSON.stringify(repo.getVerificationCommandsByProject(project.id)) !== before) {
           throw new VerificationCapabilityError('CAPABILITY_BINDING_MISMATCH');
         }
-        return repo.setProjectVerificationCommands(project.id, parsedCommands);
+        const commands = repo.setProjectVerificationCommands(project.id, parsedCommands);
+        rootLease.assertActive();
+        return commands;
       });
       return { success: true, commands: updatedCommands };
     } catch (error) {
       for (const reference of approved) {
         try { capabilities.revoke(reference); } catch { /* A replaced/revoked grant is already fenced. */ }
       }
+      if (error instanceof RepositoryRootError) return { success: false, errorCode: error.code, error: error.message };
       return { success: false, error: error instanceof VerificationCapabilityError ? error.code : 'INVALID_VERIFICATION_CAPABILITY' };
     } finally {
+      rootLease.close();
       capabilityApprovalsInProgress.delete(project.id);
     }
   });
@@ -890,7 +951,7 @@ export function registerIpcHandlers(
       return { success: false, error: `Task "${parsed.data.taskId}" not found.` };
     }
 
-    const project = repo.getProject(task.project_id);
+    const project = repo.getProjectMetadata(task.project_id);
     const latestManagerRecord = repo.getLatestAppliedManagerProtocolMessage(task.id, task.project_id);
 
     let hasAuthority = false;
@@ -933,9 +994,19 @@ export function registerIpcHandlers(
 
     let gitHeadSha: string | null = null;
     if (project) {
-      const headRes = await GitService.getHeadSha(project.repository_path);
-      if (headRes.status === 'SUCCESS' && headRes.sha) {
-        gitHeadSha = headRes.sha;
+      try {
+        const identity = repo.getProjectRepositoryIdentity(project.id);
+        const headRes = await GitService.getHeadSha(project.repository_path, identity);
+        if (headRes.status === 'SUCCESS' && headRes.sha) {
+          gitHeadSha = headRes.sha;
+        } else if (headRes.errorCode) {
+          decisionValidForCurrentRevision = false;
+          authorityReason = headRes.errorCode;
+        }
+      } catch (error) {
+        if (!(error instanceof RepositoryRootError)) throw error;
+        decisionValidForCurrentRevision = false;
+        authorityReason = error.code;
       }
     }
 

@@ -8,6 +8,8 @@ import { VerificationService } from './VerificationService';
 import { VerificationCapabilityService } from './VerificationCapabilityService';
 import { ArtifactStore } from './ArtifactStore';
 import { GitService } from './GitService';
+import { RepositoryRootLease } from './RepositoryRootLease';
+import { RepositoryRootError, RepositoryRootErrorCode } from './RepositoryRootIdentity';
 import { ProgressService } from './ProgressService';
 import { TaskStateMachine, TaskTrigger } from '../state/taskStateMachine';
 import { ManagerProtocol, CoderProtocol } from '../types/protocols';
@@ -32,7 +34,7 @@ export interface ApplyProtocolResult {
   isDuplicate?: boolean;
   message?: string;
   task?: Task;
-  errorCode?: 'PROTOCOL_REPLAY_CONFLICT';
+  errorCode?: 'PROTOCOL_REPLAY_CONFLICT' | RepositoryRootErrorCode;
   error?: string;
 }
 
@@ -270,7 +272,7 @@ export class TaskService {
   }
 
   public createTask(spec: TaskCreationSpec): Task {
-    const project = this.repo.getProject(spec.projectId);
+    const project = this.repo.getProjectMetadata(spec.projectId);
     if (!project) {
       throw new Error(`Project "${spec.projectId}" not found.`);
     }
@@ -431,14 +433,14 @@ export class TaskService {
     // re-reads the task and keeps a base SHA that another winner may already
     // have bound.
     let resolvedBaseSha: string | null = taskForGit.base_sha;
+    let rootLease: RepositoryRootLease | undefined;
+    try {
     if (managerMsg.decision === 'EXECUTE') {
+      const project = this.repo.getProjectForRepositoryUse(taskForGit.project_id);
+      if (!project) return { success: false, error: `Project "${taskForGit.project_id}" not found.` };
+      rootLease = RepositoryRootLease.acquire(this.repo.getProjectRepositoryIdentity(project.id));
       if (!resolvedBaseSha) {
-        const project = this.repo.getProject(taskForGit.project_id);
-        if (!project) {
-          return { success: false, error: `Project "${taskForGit.project_id}" not found.` };
-        }
-
-        const headShaRes = await GitService.getHeadSha(project.repository_path);
+        const headShaRes = await GitService.getHeadSha(project.repository_path, rootLease.identity);
         if (headShaRes.status !== 'SUCCESS' || !headShaRes.sha) {
           const reason = `Cannot begin coding: Git repository HEAD SHA could not be authoritatively resolved (${headShaRes.errorMessage || 'git rev-parse HEAD failed'}).`;
           return rejectBeforeGit(reason);
@@ -447,8 +449,8 @@ export class TaskService {
       }
     }
 
-    try {
       return this.repo.runInImmediateTransaction(() => {
+        rootLease?.assertActive();
         // Repeat the full immutable-binding comparison after acquiring the
         // write lock. A concurrent caller may have inserted this ID while the
         // Git lookup above was in flight.
@@ -582,6 +584,7 @@ export class TaskService {
           { decision: managerMsg.decision, fromState: task.state, toState: transitionRes.nextState, baseSha: boundBaseSha },
           task.id
         );
+        rootLease?.assertActive();
         return {
           success: true,
           message: `Task ${task.id} transitioned to ${transitionRes.nextState}.`,
@@ -589,8 +592,9 @@ export class TaskService {
         };
       });
     } catch (err: any) {
+      if (err instanceof RepositoryRootError) return { success: false, errorCode: err.code, error: err.message };
       return { success: false, error: err.message };
-    }
+    } finally { rootLease?.close(); }
   }
 
   public applyCoderReport(
@@ -868,12 +872,14 @@ export class TaskService {
       throw new Error(`TASK_BINDING_STALE: validation start binding does not match task ${task.id}.`);
     }
 
-    const project = this.repo.getProject(task.project_id);
+    const project = this.repo.getProjectForRepositoryUse(task.project_id);
     if (!project) {
       throw new Error(`Project ${task.project_id} not found.`);
     }
 
     const repoPath = project.repository_path;
+    const rootLease = RepositoryRootLease.acquire(this.repo.getProjectRepositoryIdentity(project.id));
+    try {
 
     // Record the execution identity before long-running Git/tests work.  The
     // same binding is required again at the final write fence.
@@ -900,9 +906,9 @@ export class TaskService {
     });
 
     // 1. Gather authoritative Git status & diff
-    const gitStatus = await GitService.getStatus(repoPath);
-    const gitDiff = await GitService.getDiff(repoPath, task.base_sha);
-    const headShaRes = await GitService.getHeadSha(repoPath);
+    const gitStatus = await GitService.getStatus(repoPath, rootLease.identity);
+    const gitDiff = await GitService.getDiff(repoPath, task.base_sha, rootLease.identity);
+    const headShaRes = await GitService.getHeadSha(repoPath, rootLease.identity);
     const currentSha = headShaRes.status === 'SUCCESS' ? headShaRes.sha : null;
 
     // 2. Execute configured test verification suite
@@ -929,7 +935,7 @@ export class TaskService {
     // commit created by another actor during verification invalidates the
     // captured SHA and must lose the write fence instead of being recorded as
     // evidence for the newer workspace.
-    const finalHeadShaRes = await GitService.getHeadSha(repoPath);
+    const finalHeadShaRes = await GitService.getHeadSha(repoPath, rootLease.identity);
     const finalCurrentSha = finalHeadShaRes.status === 'SUCCESS' ? finalHeadShaRes.sha : null;
     const workspaceHeadDrifted =
       headShaRes.status === 'SUCCESS' &&
@@ -991,6 +997,7 @@ export class TaskService {
     const commitResult = (() => {
       try {
         return this.repo.runInImmediateTransaction(() => {
+          rootLease.assertActive();
           const currentTask = this.repo.getTask(task.id);
           if (!currentTask) throw new Error(`Task ${task.id} not found.`);
           const currentEpoch = currentTask.ownership_epoch ?? 1;
@@ -1148,6 +1155,7 @@ export class TaskService {
               task.id,
             );
           }
+          rootLease.assertActive();
           return { stale: false, success: verificationPassed, task: this.repo.getTask(task.id)!, nextState: trans.nextState };
         });
       } catch (error) {
@@ -1190,5 +1198,6 @@ export class TaskService {
           : 'Verification tests failed.'
         : undefined,
     };
+    } finally { rootLease.close(); }
   }
 }

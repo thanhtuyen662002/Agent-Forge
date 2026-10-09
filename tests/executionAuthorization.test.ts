@@ -1,4 +1,5 @@
-import { describe, it, expect, beforeEach, afterEach } from 'vitest';
+import { captureRepositoryRoot } from '../src/core/services/RepositoryRootIdentity';
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import fs from 'fs';
 import path from 'path';
 import os from 'os';
@@ -162,7 +163,7 @@ describe('PR #7 — Durable Execution Authorization & Orchestration Binding', ()
       updated_at: new Date().toISOString(),
       started_at: null,
       completed_at: null,
-    });
+    }, captureRepositoryRoot(tmpDir));
 
     // Create base task fixture in CODING state
     repo.createTask({
@@ -198,6 +199,7 @@ describe('PR #7 — Durable Execution Authorization & Orchestration Binding', ()
   });
 
   afterEach(() => {
+    vi.restoreAllMocks();
     db.close();
     try {
       fs.rmSync(tmpDir, { recursive: true, force: true });
@@ -316,6 +318,85 @@ describe('PR #7 — Durable Execution Authorization & Orchestration Binding', ()
   // =========================================================================
 
   // 1. EXECUTE applied -> auth A -> newer CANCEL -> A becomes INVALIDATED -> dispatch A -> zero provider execution
+  it('root binding: refuses new execution authority for an unbound historical project with a valid Git folder', async () => {
+    setupResource('res-unbound', 'prov-unbound');
+    const decision = await router.route({ projectId: 'PROJ-AUTH', taskId: 'TSK-AUTH-001', requiredCapabilities: ['CODING'], candidateResourceIds: ['res-unbound'], allowManualBridge: false });
+    db.prepare('DELETE FROM project_repository_identities WHERE project_id=?').run('PROJ-AUTH');
+    const task = repo.getTask('TSK-AUTH-001');
+    await expect(authService.createAuthorization({ projectId: 'PROJ-AUTH', taskId: 'TSK-AUTH-001', routingDecisionId: decision.decisionId })).rejects.toThrow('REPOSITORY_ROOT_UNBOUND');
+    expect(db.prepare('SELECT COUNT(*) AS count FROM execution_authorizations').get()).toEqual({ count: 0 });
+    expect(repo.getTask('TSK-AUTH-001')).toEqual(task);
+    expect(repo.getProcessRunsByTask('TSK-AUTH-001')).toEqual([]);
+  });
+
+  it('root binding: refuses dispatch before provider invocation or authority mutation when the persisted root receipt is missing', async () => {
+    const adapter = setupResource('res-unbound-dispatch', 'prov-unbound-dispatch');
+    const decision = await router.route({ projectId: 'PROJ-AUTH', taskId: 'TSK-AUTH-001', requiredCapabilities: ['CODING'], candidateResourceIds: ['res-unbound-dispatch'], allowManualBridge: false });
+    const authorization = await authService.createAuthorization({ projectId: 'PROJ-AUTH', taskId: 'TSK-AUTH-001', routingDecisionId: decision.decisionId });
+    db.prepare('DELETE FROM project_repository_identities WHERE project_id=?').run('PROJ-AUTH');
+    const task = repo.getTask('TSK-AUTH-001');
+    const storedAuthorization = repo.getExecutionAuthorization(authorization.id);
+    const storedRow = db.prepare('SELECT * FROM execution_authorizations WHERE id=?').get(authorization.id);
+    const result = await dispatcher.dispatch(authorization.id);
+    expect(result.status).toBe('FAILED');
+    expect(result.errorCode).toBe('REPOSITORY_ROOT_UNBOUND');
+    expect(adapter.executionCount).toBe(0);
+    expect(repo.getExecutionAuthorization(authorization.id)).toEqual(storedAuthorization);
+    expect(db.prepare('SELECT * FROM execution_authorizations WHERE id=?').get(authorization.id)).toEqual(storedRow);
+    expect(repo.getTask('TSK-AUTH-001')).toEqual(task);
+    expect(repo.getProcessRunsByTask('TSK-AUTH-001')).toEqual([]);
+  });
+
+  it('root binding: refuses context materialization for unbound historical metadata without adopting its current path', () => {
+    db.prepare('DELETE FROM project_repository_identities WHERE project_id=?').run('PROJ-AUTH');
+    const rows = db.prepare('SELECT COUNT(*) AS count FROM context_snapshots').get();
+    const builder = new ContextBuilderService(repo);
+    expect(() => builder.buildContextSnapshot({ projectId: 'PROJ-AUTH', taskId: 'TSK-AUTH-001' })).toThrow('REPOSITORY_ROOT_UNBOUND');
+    expect(db.prepare('SELECT COUNT(*) AS count FROM context_snapshots').get()).toEqual(rows);
+    expect(db.prepare('SELECT COUNT(*) AS count FROM project_repository_identities').get()).toEqual({ count: 0 });
+  });
+
+  it.runIf(process.platform === 'win32')('root lifetime: retains selected native objects through the final authorization transaction commit', async () => {
+    setupResource('res-commit-root', 'prov-commit-root');
+    const decision = await router.route({ projectId: 'PROJ-AUTH', taskId: 'TSK-AUTH-001', requiredCapabilities: ['CODING'], candidateResourceIds: ['res-commit-root'], allowManualBridge: false });
+    const transaction = repo.runInImmediateTransaction.bind(repo);
+    let commitBoundaries = 0;
+    vi.spyOn(repo, 'runInImmediateTransaction').mockImplementation((action) => transaction(() => {
+      const value = action();
+      if ((db.prepare('SELECT COUNT(*) AS count FROM execution_authorizations').get() as { count: number }).count > 0) {
+        commitBoundaries++;
+        let renamed = false;
+        try { fs.renameSync(tmpDir, tmpDir + '-changed'); renamed = true; } catch {}
+        if (renamed) fs.renameSync(tmpDir + '-changed', tmpDir);
+        expect(renamed).toBe(false);
+      }
+      return value;
+    }));
+    const authorization = await authService.createAuthorization({ projectId: 'PROJ-AUTH', taskId: 'TSK-AUTH-001', routingDecisionId: decision.decisionId });
+    expect(commitBoundaries).toBeGreaterThan(0);
+    expect(repo.getExecutionAuthorization(authorization.id)?.status).toBe('AUTHORIZED');
+    fs.renameSync(tmpDir, tmpDir + '-changed');
+    fs.renameSync(tmpDir + '-changed', tmpDir);
+  });
+
+  it.runIf(process.platform === 'win32')('root lifetime: retains selected native objects through context manifest persistence and releases them after commit', () => {
+    const persist = repo.createContextManifest.bind(repo);
+    let manifestWrites = 0;
+    vi.spyOn(repo, 'createContextManifest').mockImplementation((manifest) => {
+      persist(manifest);
+      manifestWrites++;
+      let renamed = false;
+      try { fs.renameSync(tmpDir, tmpDir + '-changed'); renamed = true; } catch {}
+      if (renamed) fs.renameSync(tmpDir + '-changed', tmpDir);
+      expect(renamed).toBe(false);
+    });
+    const built = new ContextBuilderService(repo).buildContextSnapshot({ projectId: 'PROJ-AUTH', taskId: 'TSK-AUTH-001' });
+    expect(manifestWrites).toBe(1);
+    expect(repo.getContextManifest(built.manifest.id)).toEqual(built.manifest);
+    fs.renameSync(tmpDir, tmpDir + '-changed');
+    fs.renameSync(tmpDir + '-changed', tmpDir);
+  });
+
   it('1. Newer applied CANCEL decision invalidates existing authorization with zero execution', async () => {
     const mock = setupResource('res-sup-cancel', 'prov-sup-cancel');
     const decision = await router.route({
@@ -1239,7 +1320,7 @@ describe('PR #7 — Durable Execution Authorization & Orchestration Binding', ()
       updated_at: new Date().toISOString(),
       started_at: null,
       completed_at: null,
-    });
+    }, captureRepositoryRoot(tmpDir));
 
     diskRepo.createTask({
       id: 'TSK-RESTART',
@@ -1401,7 +1482,7 @@ describe('PR #7 — Durable Execution Authorization & Orchestration Binding', ()
           updated_at: now,
           started_at: null,
           completed_at: null,
-        });
+        }, captureRepositoryRoot(tmpDir));
       }
 
       if (!repo.getTask(taskId)) {
@@ -1595,7 +1676,7 @@ describe('PR #7 — Durable Execution Authorization & Orchestration Binding', ()
           updated_at: now,
           started_at: null,
           completed_at: null,
-        });
+        }, captureRepositoryRoot(tmpDir));
       }
 
       if (overrides.assignmentTaskId && !repo.getTask(overrides.assignmentTaskId)) {

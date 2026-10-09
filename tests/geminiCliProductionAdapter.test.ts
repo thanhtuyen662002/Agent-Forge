@@ -1,3 +1,5 @@
+import { captureRepositoryRoot } from '../src/core/services/RepositoryRootIdentity';
+import { execFileSync as initializeFixtureGit } from 'node:child_process';
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import Database from 'better-sqlite3';
 import path from 'path';
@@ -53,6 +55,7 @@ describe('R5F0D1 — Production Gemini CLI Adapter Contract Suite', () => {
     projectRepoDir = path.join(tmpDir, 'project-repo');
     fs.mkdirSync(projectRepoDir, { recursive: true });
 
+    if (!fs.existsSync(path.join(projectRepoDir, '.git'))) initializeFixtureGit('git', ['init', '-q', '--template=', '--initial-branch=main'], { cwd: projectRepoDir, stdio: 'ignore', windowsHide: true });
     repo.createProject({
       id: 'PROJ-GEMINI-TEST',
       name: 'Gemini Test Project',
@@ -65,7 +68,7 @@ describe('R5F0D1 — Production Gemini CLI Adapter Contract Suite', () => {
       updated_at: new Date().toISOString(),
       started_at: null,
       completed_at: null,
-    });
+    }, captureRepositoryRoot(projectRepoDir));
 
     repo.createTask({
       id: 'TSK-GEMINI-001',

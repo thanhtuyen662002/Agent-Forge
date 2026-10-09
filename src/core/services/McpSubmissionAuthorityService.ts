@@ -34,6 +34,8 @@ import { TestRun, TaskStateEnum, Project, Task, ExecutionAuthorization } from '.
 import { AUTHORITY_SNAPSHOT_KEYS, CoderSubmissionAdjudication } from '../types/adjudication';
 import { validateAndParseCanonicalResultEnvelope } from './CoderSubmissionAdjudicationService';
 import { buildTrustedEnvironment, resolveTrustedExecutable } from './ExecutableResolver';
+import { RepositoryRootError, RepositoryRootIdentity } from './RepositoryRootIdentity';
+import { RepositoryRootLease } from './RepositoryRootLease';
 
 export class McpSubmissionAuthorityError extends Error {
   constructor(
@@ -70,26 +72,29 @@ export class McpSubmissionAuthorityService {
    * Diagnostics are intentionally discarded so Git paths and stderr cannot
    * enter the durable submission result.
    */
-  private observeRepositoryHead(repositoryPath: string): string {
+  private observeRepositoryHead(identity: RepositoryRootIdentity): string {
+    let lease: RepositoryRootLease | undefined;
     try {
+      lease = RepositoryRootLease.acquire(identity);
       const gitExecutable = resolveTrustedExecutable('git', 'git');
       if (!gitExecutable) throw new Error('GIT_EXECUTABLE_NOT_FOUND');
       const gitOutput = child_process.execFileSync(gitExecutable, ['rev-parse', 'HEAD'], {
-        cwd: repositoryPath,
+        cwd: lease.cwd,
         timeout: 5000,
         stdio: ['ignore', 'pipe', 'pipe'],
         encoding: 'utf8',
-        env: buildTrustedEnvironment({ env: process.env }),
+        env: { ...buildTrustedEnvironment({ env: process.env }), GIT_OPTIONAL_LOCKS: '0', GIT_WORK_TREE: lease.cwd },
       });
+      lease.assertActive();
       const observedHeadSha = gitOutput.trim().toLowerCase();
       if (!/^[0-9a-f]{40}$/.test(observedHeadSha)) throw new Error('MALFORMED_GIT_HEAD');
       return observedHeadSha;
-    } catch {
+    } catch (error) {
       throw new McpSubmissionAuthorityError(
         'MCP_AUTHORITY_FENCED',
-        'Synchronous git rev-parse HEAD inspection failed'
+        error instanceof RepositoryRootError ? error.code : 'Synchronous git rev-parse HEAD inspection failed'
       );
-    }
+    } finally { lease?.close(); }
   }
 
   /**
@@ -141,6 +146,7 @@ export class McpSubmissionAuthorityService {
 
     // 4. Preliminary authentication and binding checks outside transaction (using preflightNowIso)
     // Ensures invalid callers cannot spawn Git
+    let rootLease: RepositoryRootLease | undefined;
     try {
       const preflightNowIso = new Date().toISOString();
       const session = this.repo.getMcpSubmissionSessionByTokenHash(tokenHash);
@@ -190,6 +196,8 @@ export class McpSubmissionAuthorityService {
           };
         }
 
+        // This is only a metadata preflight. Strict repository authority is
+        // checked inside the writer transaction after session revalidation.
         const preflightProject = this.repo.getProject(preflightAuth.project_id);
         if (!preflightProject || !preflightProject.repository_path) {
           return {
@@ -203,7 +211,7 @@ export class McpSubmissionAuthorityService {
       }
 
       // 6. Enter Repository.runInImmediateTransaction (strictly synchronous callback)
-      return this.repo.runInImmediateTransaction<SubmissionResult>(() => {
+      const result = this.repo.runInImmediateTransaction<SubmissionResult>(() => {
         // Record total changes at start of transaction to prove replay makes zero mutations
         const totalChangesBefore = (
           this.db.prepare('SELECT total_changes() AS c').get() as { c: number }
@@ -242,15 +250,24 @@ export class McpSubmissionAuthorityService {
           // ===================================================================
           // 7.1 NEW SUBMISSION PATH
           // ===================================================================
-          return this.executeNewSubmissionPath(
+          const currentAuth = this.repo.getExecutionAuthorization(currentSession.authorization_id);
+          if (currentAuth) rootLease = RepositoryRootLease.acquire(this.repo.getProjectRepositoryIdentity(currentAuth.project_id));
+          const admission = this.executeNewSubmissionPath(
             input,
             currentSession,
             transactionNowIso,
             canonicalBytes
           );
+          rootLease?.assertActive();
+          return admission;
         }
       });
+      rootLease?.assertActive();
+      return result;
     } catch (err: unknown) {
+      if (err instanceof RepositoryRootError) {
+        return { accepted: false, error_code: 'MCP_AUTHORITY_FENCED', message: err.code, retryable: false };
+      }
       if (err instanceof McpSubmissionAuthorityError) {
         return {
           accepted: false,
@@ -274,7 +291,7 @@ export class McpSubmissionAuthorityService {
         message: 'Internal error processing coder submission',
         retryable: false,
       };
-    }
+    } finally { rootLease?.close(); }
   }
 
   /**
@@ -718,7 +735,7 @@ export class McpSubmissionAuthorityService {
     }
 
     // 2. Project must exist and be active (RUNNING)
-    const project = this.repo.getProject(auth.project_id);
+    const project = this.repo.getProjectForRepositoryUse(auth.project_id);
     if (!project || project.status !== 'RUNNING') {
       throw new McpSubmissionAuthorityError('MCP_AUTHORITY_FENCED', 'Project is missing or not active');
     }
@@ -915,7 +932,7 @@ export class McpSubmissionAuthorityService {
     // 7. Base and Head Git SHAs. The first observation happens after all
     // durable authority checks and while the immediate transaction is held,
     // eliminating the old preflight-to-transaction race window.
-    const observedHeadSha = this.observeRepositoryHead(project.repository_path);
+    const observedHeadSha = this.observeRepositoryHead(this.repo.getProjectRepositoryIdentity(project.id));
     if (observedHeadSha !== auth.repository_head_sha.toLowerCase()) {
       throw new McpSubmissionAuthorityError('REPOSITORY_HEAD_DRIFT_DETECTED', 'Synchronously observed Git HEAD does not match authorization repository_head_sha');
     }
@@ -998,7 +1015,7 @@ export class McpSubmissionAuthorityService {
     // Re-observe immediately before the first durable write. A checkout/reset
     // during the validation work is a deterministic drift failure and the
     // enclosing transaction rolls back without partial submission rows.
-    const finalObservedHeadSha = this.observeRepositoryHead(project.repository_path);
+    const finalObservedHeadSha = this.observeRepositoryHead(this.repo.getProjectRepositoryIdentity(project.id));
     if (finalObservedHeadSha !== observedHeadSha || finalObservedHeadSha !== auth.repository_head_sha.toLowerCase()) {
       throw new McpSubmissionAuthorityError(
         'REPOSITORY_HEAD_DRIFT_DETECTED',
@@ -1213,7 +1230,7 @@ export class McpSubmissionAuthorityService {
         };
       }
 
-      const project = this.repo.getProject(auth.project_id);
+      const project = this.repo.getProjectForRepositoryUse(auth.project_id);
       if (!project) {
         return {
           ok: false,

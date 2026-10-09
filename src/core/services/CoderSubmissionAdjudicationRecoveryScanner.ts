@@ -1,7 +1,8 @@
 import crypto from 'crypto';
 import Database from 'better-sqlite3';
 import { Repository, CoderSubmission } from '../database/repositories';
-import { TestRun } from '../types/domain';
+import { Project, TestRun } from '../types/domain';
+import { RepositoryRootError } from './RepositoryRootIdentity';
 import { EventService } from './EventService';
 import {
   CoderSubmissionAdjudication,
@@ -115,7 +116,9 @@ export class CoderSubmissionAdjudicationRecoveryScanner {
     const sub = this.repo.getCoderSubmissionById(adj.submission_id);
     const auth = this.repo.getExecutionAuthorization(adj.authorization_id);
     const task = this.repo.getTask(adj.task_id);
-    const project = this.repo.getProject(adj.project_id);
+    let project: Project | null = null;
+    try { project = this.repo.getProjectForRepositoryUse(adj.project_id); }
+    catch (error) { if (!(error instanceof RepositoryRootError)) throw error; }
     const attempt = this.repo.getTaskAttempt(adj.attempt_id);
     const assignment = this.repo.getAgentAssignment(adj.assignment_id);
 

@@ -1,3 +1,5 @@
+import { captureRepositoryRoot } from '../src/core/services/RepositoryRootIdentity';
+import { execFileSync as initializeFixtureGit } from 'node:child_process';
 import crypto from 'crypto';
 import fs from 'fs';
 import os from 'os';
@@ -74,6 +76,7 @@ describe('product-task autonomy consolidation', () => {
     const now = new Date().toISOString();
     const projectId = 'project-product';
     if (!repo.getProject(projectId)) {
+      if (!fs.existsSync(path.join(root, '.git'))) initializeFixtureGit('git', ['init', '-q', '--template=', '--initial-branch=main'], { cwd: root, stdio: 'ignore', windowsHide: true });
       repo.createProject({
         id: projectId,
         name: 'Product project',
@@ -86,7 +89,7 @@ describe('product-task autonomy consolidation', () => {
         updated_at: now,
         started_at: now,
         completed_at: null,
-      });
+      }, captureRepositoryRoot(root));
       repo.createProvider({ id: 'provider-agy', name: 'Antigravity', adapter_type: 'LOCAL_CLI', enabled: true, created_at: now });
       repo.createProviderAccount({
         id: 'account-agy',

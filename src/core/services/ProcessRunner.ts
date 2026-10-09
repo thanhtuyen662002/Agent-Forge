@@ -5,7 +5,9 @@ import fs from 'fs';
 import { PolicyService } from './PolicyService';
 import { Repository } from '../database/repositories';
 import { ArtifactStore } from './ArtifactStore';
-import { isIssuedVerificationProcessBoundary, VerificationProcessBoundary } from '../types/verificationCapability';
+import { isIssuedVerificationProcessBoundary, VerificationInvocationLease, VerificationProcessBoundary } from '../types/verificationCapability';
+import { RepositoryRootError, RepositoryRootErrorCode, RepositoryRootIdentity } from './RepositoryRootIdentity';
+import { RepositoryRootLease } from './RepositoryRootLease';
 import {
   buildTrustedEnvironment,
   isProtectedExecutableName,
@@ -37,7 +39,7 @@ export interface ProcessRunResult {
   timedOut: boolean;
   cancelled: boolean;
   outputLimitExceeded?: boolean;
-  errorCode?: 'TIMEOUT' | 'CANCELLED' | 'PROCESS_LAUNCH_FAILED' | 'NONZERO_EXIT' | 'OUTPUT_LIMIT_EXCEEDED' | null;
+  errorCode?: RepositoryRootErrorCode | 'TIMEOUT' | 'CANCELLED' | 'PROCESS_LAUNCH_FAILED' | 'NONZERO_EXIT' | 'OUTPUT_LIMIT_EXCEEDED' | null;
   error?: Error | null;
   stdoutEvidenceId?: string | null;
   stderrEvidenceId?: string | null;
@@ -69,6 +71,8 @@ export interface StructuredProcessOptions {
   deferPersistence?: boolean;
   /** Only an issued backend capability boundary can select exact invocation/environment. */
   verificationBoundary?: VerificationProcessBoundary;
+  /** Backend-selected receipt for standalone repository observations. */
+  repositoryIdentity?: RepositoryRootIdentity;
 }
 
 interface ResolvedInvocation {
@@ -117,6 +121,7 @@ export class ProcessRunner {
   private static persistenceFencedEntries = new Map<string, PersistenceFencedEntry>();
   private static terminationPromises = new Map<number, Promise<ProcessTerminationTruth>>();
   private static cancellationPromises = new Map<string, Promise<ProcessTerminationTruth>>();
+  private static repositoryFencedProcesses = new Map<string, { lease: VerificationInvocationLease; child: ChildProcess }>();
 
   public static readonly DEFAULT_MAX_OUTPUT_BYTES = 8 * 1024 * 1024; // 8 MiB default
   public static readonly MAX_ALLOWED_OUTPUT_BYTES = 32 * 1024 * 1024; // 32 MiB hard cap
@@ -609,7 +614,7 @@ export class ProcessRunner {
           processTermination: 'NOT_APPLICABLE',
         };
       }
-      if (this.activeProcesses.has(options.executionId)) {
+      if (this.activeProcesses.has(options.executionId) || this.repositoryFencedProcesses.has(options.executionId)) {
         return {
           executionId: options.executionId,
           pid: null,
@@ -645,6 +650,34 @@ export class ProcessRunner {
     const startTime = Date.now();
     const startIso = new Date(startTime).toISOString();
     const shouldPersist = Boolean(options.repo && !options.deferPersistence);
+    let repositoryLease: VerificationInvocationLease | undefined;
+    let unresolvedChild: ChildProcess | undefined;
+    let retainRepositoryLease = false;
+    let invocationCwd = options.cwd;
+    try {
+      try {
+        if (verificationBoundary) {
+          repositoryLease = verificationBoundary.acquireInvocation(options.executable, options.args, options.cwd);
+        } else if (options.repositoryIdentity) {
+          repositoryLease = RepositoryRootLease.acquire(options.repositoryIdentity);
+          invocationCwd = repositoryLease.cwd;
+        } else if (options.repo) {
+          const projectId = options.projectId ?? (options.taskId ? options.repo.getTask(options.taskId)?.project_id : undefined);
+          if (projectId) {
+            const selected = options.repo.getProjectRepositoryIdentity(projectId);
+            repositoryLease = RepositoryRootLease.acquire(selected);
+            const sameRoot = process.platform === 'win32'
+              ? path.resolve(options.cwd).toLowerCase() === selected.canonicalPath.toLowerCase()
+              : path.resolve(options.cwd) === selected.canonicalPath;
+            if (sameRoot) invocationCwd = repositoryLease.cwd;
+          }
+        }
+      } catch (error) {
+        if (!(error instanceof RepositoryRootError)) {
+          return this.createLaunchFailureResult(executionId, options, 'INVALID_VERIFICATION_BOUNDARY');
+        }
+        return { ...this.createLaunchFailureResult(executionId, options, error.code), errorCode: error.code };
+      }
 
     const maxStdout =
       options.maxStdoutBytes !== undefined && options.maxStdoutBytes > 0
@@ -867,7 +900,7 @@ export class ProcessRunner {
       }
     }
 
-    return new Promise<ProcessRunResult>((resolve, reject) => {
+    return await new Promise<ProcessRunResult>((resolve, reject) => {
       let stdoutAcc = '';
       let stderrAcc = '';
       let stdoutByteCount = 0;
@@ -880,13 +913,16 @@ export class ProcessRunner {
       let child: ChildProcess;
       try {
         verificationBoundary?.assertInvocation(invocation.executable, invocation.args, options.cwd);
+        repositoryLease?.assertActive();
         child = spawn(invocation.executable, invocation.args, {
-          cwd: options.cwd,
+          cwd: verificationBoundary && repositoryLease ? repositoryLease.cwd : invocationCwd,
           shell: options.allowShell ?? false,
           env: minimalEnv,
           windowsHide: true,
           windowsVerbatimArguments: invocation.windowsVerbatimArguments ?? false,
         });
+        unresolvedChild = child;
+        retainRepositoryLease = true;
       } catch (spawnErr: unknown) {
         const result = ProcessRunner.createLaunchFailureResult(
           executionId,
@@ -954,13 +990,21 @@ export class ProcessRunner {
               termTruth = 'PROCESS_TREE_TERMINATED_PROVEN';
             }
           }
+          // A timeout/cancel acknowledgement is insufficient. Keep native
+          // pins owned by this process while descendants remain unproven.
+          retainRepositoryLease = termTruth === 'TERMINATION_UNRESOLVED';
+          let repositoryFailure: RepositoryRootError | undefined;
+          if (!retainRepositoryLease) {
+            try { repositoryLease?.assertActive(); }
+            catch (error) { repositoryFailure = error instanceof RepositoryRootError ? error : new RepositoryRootError('REPOSITORY_ROOT_IDENTITY_UNAVAILABLE'); }
+          }
 
           const durationMs = Date.now() - startTime;
           const endIso = new Date().toISOString();
           const wasCancelled = procEntry.isCancelled;
 
           let terminalStatus: 'COMPLETED' | 'FAILED' | 'CANCELLED' | 'TIMED_OUT' = 'COMPLETED';
-          let finalErrorCode: 'TIMEOUT' | 'CANCELLED' | 'PROCESS_LAUNCH_FAILED' | 'NONZERO_EXIT' | 'OUTPUT_LIMIT_EXCEEDED' | null =
+          let finalErrorCode: ProcessRunResult['errorCode'] =
             null;
 
           if (wasCancelled) {
@@ -979,6 +1023,10 @@ export class ProcessRunner {
             terminalStatus = 'FAILED';
             finalErrorCode = 'NONZERO_EXIT';
           }
+          if (repositoryFailure) {
+            terminalStatus = 'FAILED';
+            finalErrorCode = repositoryFailure.code;
+          }
 
           const startTruth: ProcessStartTruth =
             trigger === 'ERROR' && !hasPid
@@ -988,7 +1036,7 @@ export class ProcessRunner {
               : 'STARTED_PROVEN';
 
           const finalExitCode =
-            effectiveExitCodeResolved ??
+            repositoryFailure ? -1 : effectiveExitCodeResolved ??
             (isTimedOut ? -2 : wasCancelled ? -1 : isOutputLimitExceeded ? -3 : isStdinFailed || trigger === 'ERROR' ? -1 : 0);
 
           let finalStderr = stderrAcc;
@@ -1000,8 +1048,8 @@ export class ProcessRunner {
             finalStderr = `Failed to start process: ${ProcessRunner.sanitizeLaunchError(err)}`;
           }
 
-          finalStderr = ProcessRunner.scrubSecrets(finalStderr);
-          const finalStdout = ProcessRunner.scrubSecrets(stdoutAcc);
+          finalStderr = repositoryFailure ? repositoryFailure.code : ProcessRunner.scrubSecrets(finalStderr);
+          const finalStdout = repositoryFailure ? '' : ProcessRunner.scrubSecrets(stdoutAcc);
 
           let stdoutEvidenceId: string | null = null;
           let stderrEvidenceId: string | null = null;
@@ -1238,6 +1286,13 @@ export class ProcessRunner {
         }
       }
     });
+    } finally {
+      if (repositoryLease) {
+        if (retainRepositoryLease && unresolvedChild) {
+          this.repositoryFencedProcesses.set(executionId, { lease: repositoryLease, child: unresolvedChild });
+        } else repositoryLease.close();
+      }
+    }
   }
 
   public static cancel(executionId: string): Promise<ProcessTerminationTruth> {
@@ -1250,6 +1305,13 @@ export class ProcessRunner {
     }
     const entry = this.activeProcesses.get(executionId);
     if (!entry) {
+      const fenced = this.repositoryFencedProcesses.get(executionId);
+      if (fenced) return this.terminateProcessTree(fenced.child).then(truth => {
+        if (truth === 'PROCESS_TREE_TERMINATED_PROVEN' || truth === 'NOT_APPLICABLE') {
+          fenced.lease.close(); this.repositoryFencedProcesses.delete(executionId);
+        }
+        return truth;
+      });
       return Promise.resolve('NOT_APPLICABLE');
     }
 
@@ -1282,11 +1344,11 @@ export class ProcessRunner {
     unproven: number;
     allTerminatedProven: boolean;
   }> {
-    const initialActive = Array.from(this.activeProcesses.entries());
+    const initialActive = Array.from(new Set([...this.activeProcesses.keys(), ...this.repositoryFencedProcesses.keys()]));
     const initialFencedKeys = new Set(this.persistenceFencedEntries.keys());
 
     const settlementResults = await Promise.all(
-      initialActive.map(async ([id]) => {
+      initialActive.map(async (id) => {
         try {
           const truth = await this.cancel(id);
           return {
@@ -1301,7 +1363,7 @@ export class ProcessRunner {
     );
 
     const allIds = new Set<string>([
-      ...initialActive.map(([id]) => id),
+      ...initialActive,
       ...initialFencedKeys,
       ...this.persistenceFencedEntries.keys(),
     ]);
@@ -1318,7 +1380,7 @@ export class ProcessRunner {
     }
 
     for (const fencedId of this.persistenceFencedEntries.keys()) {
-      if (!initialActive.some(([id]) => id === fencedId)) {
+      if (!initialActive.includes(fencedId)) {
         unproven++;
       }
     }
@@ -1339,6 +1401,7 @@ export class ProcessRunner {
     const uniqueIds = new Set<string>([
       ...this.activeProcesses.keys(),
       ...this.persistenceFencedEntries.keys(),
+      ...this.repositoryFencedProcesses.keys(),
     ]);
     return uniqueIds.size;
   }

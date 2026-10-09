@@ -1,5 +1,7 @@
 import Database from 'better-sqlite3';
 import { Project, ProjectContract, ProjectStatus } from '../../types/domain';
+import { assertRepositoryRootIdentity, RepositoryRootError, RepositoryRootIdentity } from '../../services/RepositoryRootIdentity';
+import { RepositoryRootLease } from '../../services/RepositoryRootLease';
 
 /**
  * Project persistence boundary extracted from the compatibility Repository
@@ -9,33 +11,105 @@ import { Project, ProjectContract, ProjectStatus } from '../../types/domain';
 export class ProjectRepository {
   constructor(private readonly db: Database.Database) {}
 
-  public createProject(project: Project): void {
-    this.db
-      .prepare(`
-        INSERT INTO projects (
-          id, name, description, repository_path, default_branch,
-          status, contract_json, created_at, updated_at, started_at, completed_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-      `)
-      .run(
-        project.id,
-        project.name,
-        project.description,
-        project.repository_path,
-        project.default_branch,
-        project.status,
-        project.contract ? JSON.stringify(project.contract) : null,
-        project.created_at,
-        project.updated_at,
-        project.started_at,
-        project.completed_at
-      );
+  public createProject(project: Project, rootIdentity?: RepositoryRootIdentity): void {
+    if (rootIdentity && project.repository_path !== rootIdentity.canonicalPath) throw new RepositoryRootError('REPOSITORY_ROOT_IDENTITY_CHANGED');
+    const receipt = rootIdentity ? JSON.stringify(rootIdentity) : null;
+    if (receipt && Buffer.byteLength(receipt) > 262_144) throw new RepositoryRootError('REPOSITORY_ROOT_IDENTITY_UNAVAILABLE');
+    const lease = rootIdentity ? RepositoryRootLease.acquire(rootIdentity) : undefined;
+    try { this.db.transaction(() => {
+      if (rootIdentity) assertRepositoryRootIdentity(rootIdentity);
+      this.db
+        .prepare(`
+          INSERT INTO projects (
+            id, name, description, repository_path, default_branch,
+            status, contract_json, created_at, updated_at, started_at, completed_at
+          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        `)
+        .run(
+          project.id,
+          project.name,
+          project.description,
+          project.repository_path,
+          project.default_branch,
+          project.status,
+          project.contract ? JSON.stringify(project.contract) : null,
+          project.created_at,
+          project.updated_at,
+          project.started_at,
+          project.completed_at
+        );
+      if (rootIdentity) {
+        this.db.prepare(`INSERT INTO project_repository_identities (project_id, canonical_path, identity_json, created_at)
+          VALUES (?, ?, ?, ?)`).run(project.id, rootIdentity.canonicalPath, receipt, project.created_at);
+        assertRepositoryRootIdentity(rootIdentity);
+      }
+    }).immediate(); } finally { lease?.close(); }
   }
 
   public getProject(id: string): Project | null {
+    const project = this.getProjectMetadata(id);
+    if (!project) return null;
+    this.getRepositoryIdentity(id);
+    return project;
+  }
+
+  /** Explicit first owner selection only; persisted identity is immutable. */
+  public bindRepositoryIdentity(id: string, identity: RepositoryRootIdentity): boolean {
+    const receipt = JSON.stringify(identity);
+    if (Buffer.byteLength(receipt) > 262_144) throw new RepositoryRootError('REPOSITORY_ROOT_IDENTITY_UNAVAILABLE');
+    const lease = RepositoryRootLease.acquire(identity);
+    try {
+      return this.db.transaction(() => {
+        const project = this.getProjectMetadata(id);
+        if (!project || project.repository_path !== identity.canonicalPath) throw new RepositoryRootError('REPOSITORY_ROOT_IDENTITY_CHANGED');
+        if (!this.db.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='project_repository_identities'").get()) {
+          throw new RepositoryRootError('REPOSITORY_ROOT_IDENTITY_UNAVAILABLE');
+        }
+        const existing = this.getRepositoryIdentity(id);
+        if (existing) {
+          if (JSON.stringify(existing) !== receipt) throw new RepositoryRootError('REPOSITORY_ROOT_IDENTITY_CHANGED');
+          lease.assertActive();
+          return false;
+        }
+        // A first binding cannot reinterpret any previous execution authority.
+        // Even terminal history is retained, never cleared to permit binding.
+        if (!['DRAFT', 'PLANNING', 'READY'].includes(project.status) ||
+            this.db.prepare('SELECT 1 FROM execution_authorizations WHERE project_id=? LIMIT 1').get(id) ||
+            this.db.prepare('SELECT 1 FROM agent_assignments WHERE project_id=? LIMIT 1').get(id) ||
+            this.db.prepare(`SELECT 1 FROM process_runs p LEFT JOIN tasks t ON t.id=p.task_id
+              WHERE p.project_id=? OR t.project_id=? LIMIT 1`).get(id, id)) {
+          throw new RepositoryRootError('REPOSITORY_ROOT_BINDING_BLOCKED');
+        }
+        this.db.prepare(`INSERT INTO project_repository_identities (project_id, canonical_path, identity_json, created_at)
+          VALUES (?, ?, ?, ?)`).run(id, identity.canonicalPath, receipt, new Date().toISOString());
+        lease.assertActive();
+        return true;
+      }).immediate();
+    } finally { lease.close(); }
+  }
+
+  /** Display/stop metadata only; this lookup grants no repository access. */
+  public getProjectMetadata(id: string): Project | null {
     const row = this.db.prepare('SELECT * FROM projects WHERE id = ?').get(id) as Record<string, unknown> | undefined;
     if (!row) return null;
     return this.mapProject(row);
+  }
+
+  public getRepositoryIdentity(id: string): RepositoryRootIdentity | null {
+    if (!this.db.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='project_repository_identities'").get()) return null;
+    const row = this.db.prepare(`SELECT r.canonical_path, r.identity_json, p.repository_path
+      FROM project_repository_identities r JOIN projects p ON p.id=r.project_id WHERE r.project_id=?`).get(id) as {
+      canonical_path: string; identity_json: string; repository_path: string;
+    } | undefined;
+    if (!row) return null;
+    let identity: RepositoryRootIdentity;
+    try {
+      if (typeof row.identity_json !== 'string' || Buffer.byteLength(row.identity_json) > 262_144) throw new Error();
+      identity = JSON.parse(row.identity_json) as RepositoryRootIdentity;
+      if (row.repository_path !== row.canonical_path || identity.canonicalPath !== row.canonical_path) throw new Error();
+    } catch { throw new RepositoryRootError('REPOSITORY_ROOT_IDENTITY_UNAVAILABLE'); }
+    assertRepositoryRootIdentity(identity);
+    return identity;
   }
 
   public getAllProjects(): Project[] {

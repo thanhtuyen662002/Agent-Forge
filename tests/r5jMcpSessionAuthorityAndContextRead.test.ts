@@ -1,3 +1,4 @@
+import { captureRepositoryRoot } from '../src/core/services/RepositoryRootIdentity';
 import fs from 'fs';
 import path from 'path';
 import os from 'os';
@@ -877,6 +878,9 @@ interface FullGraphFixtures {
 }
 
 function setupFullGraph(db: Database.Database): FullGraphFixtures {
+  // Schema-only migration 21 fixtures stay historical. A live selected-root
+  // authority graph needs the current append-only migrations before binding.
+  MigrationRunner.run(db);
   const repo = new Repository(db);
   const service = new McpSessionAuthorityService(repo, db);
 
@@ -898,7 +902,7 @@ function setupFullGraph(db: Database.Database): FullGraphFixtures {
     id: projectId,
     name: 'Test Project',
     description: 'Testing',
-    repository_path: 'D:/fake/repo',
+    repository_path: fs.realpathSync.native(path.resolve(__dirname, '..')),
     default_branch: 'main',
     status: 'RUNNING',
     contract: null,
@@ -906,7 +910,7 @@ function setupFullGraph(db: Database.Database): FullGraphFixtures {
     updated_at: now,
     started_at: null,
     completed_at: null,
-  });
+  }, captureRepositoryRoot(fs.realpathSync.native(path.resolve(__dirname, '..'))));
 
   // 2. Task
   const baseSha = 'b'.repeat(40);
@@ -1166,7 +1170,7 @@ describe('R5J2 MCP Session Authority and Scoped Context Read Truth Suite', () =>
       const row = db.prepare('SELECT COUNT(*) as c, MAX(version) as max_v FROM schema_migrations').get() as { c: number; max_v: number };
       expect(row.c).toBe(21);
       expect(row.max_v).toBe(21);
-      expect(MIGRATIONS.length).toBe(25);
+      expect(MIGRATIONS.length).toBe(26);
       expect(Array.isArray(MIGRATIONS)).toBe(true);
     } finally {
       db.close();
@@ -1216,7 +1220,7 @@ describe('R5J2 MCP Session Authority and Scoped Context Read Truth Suite', () =>
 
     const rcScript = fs.readFileSync(path.join(process.cwd(), 'scripts/verify-demo-rc-win.ps1'), 'utf-8');
     expect(rcScript).not.toContain('Expected exactly 20 migrations');
-    expect(rcScript).toContain('Expected exactly 25 migrations');
+    expect(rcScript).toContain('Expected exactly 26 migrations');
   });
 
   it('4. Migration 21 fails closed on pre-existing conflicting mcp_client_sessions table with no ledger row written', () => {

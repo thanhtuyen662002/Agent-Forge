@@ -2,6 +2,8 @@ import crypto from 'crypto';
 import { VerificationCapabilityReference } from '../types/verificationCapability';
 import { VerificationCapabilityService } from '../services/VerificationCapabilityService';
 import Database from 'better-sqlite3';
+import { RepositoryRootError, RepositoryRootErrorCode, RepositoryRootIdentity } from '../services/RepositoryRootIdentity';
+import { RepositoryRootLease } from '../services/RepositoryRootLease';
 import {
   Project,
   Task,
@@ -254,12 +256,34 @@ export class Repository {
   // ==========================================
   // Projects
   // ==========================================
-  public createProject(project: Project): void {
-    this.projectRepository.createProject(project);
+  public createProject(project: Project, rootIdentity?: RepositoryRootIdentity): void {
+    this.projectRepository.createProject(project, rootIdentity);
+  }
+
+  public getProjectRepositoryIdentity(projectId: string): RepositoryRootIdentity {
+    const identity = this.projectRepository.getRepositoryIdentity(projectId);
+    if (!identity) throw new RepositoryRootError('REPOSITORY_ROOT_UNBOUND');
+    return identity;
+  }
+
+  public bindProjectRepositoryIdentity(projectId: string, identity: RepositoryRootIdentity): boolean {
+    return this.projectRepository.bindRepositoryIdentity(projectId, identity);
   }
 
   public getProject(id: string): Project | null {
     return this.projectRepository.getProject(id);
+  }
+
+  public getProjectMetadata(id: string): Project | null {
+    return this.projectRepository.getProjectMetadata(id);
+  }
+
+  /** Repository authority requires an explicit durable native selection. */
+  public getProjectForRepositoryUse(id: string): Project | null {
+    const project = this.projectRepository.getProjectMetadata(id);
+    if (!project) return null;
+    this.getProjectRepositoryIdentity(id);
+    return project;
   }
 
   public getAllProjects(): Project[] {
@@ -7431,6 +7455,7 @@ export class Repository {
     authorization?: ExecutionAuthorization;
     alreadyAuthorized?: boolean;
     errorCode?:
+      | RepositoryRootErrorCode
       | 'TRANSFER_NOT_FOUND'
       | 'TASK_NOT_FOUND'
       | 'PROJECT_NOT_FOUND'
@@ -7466,7 +7491,9 @@ export class Repository {
       | 'INTERNAL_ERROR';
     error?: string;
   } {
-    return this.runInImmediateTransaction(() => {
+    let rootLease: RepositoryRootLease | undefined;
+    try {
+    const result = this.runInImmediateTransaction<ReturnType<Repository['resumeHandoffSuccessorAuthorization']>>(() => {
       const nowIso = new Date().toISOString();
       const transfer = this.getHandoffTransfer(params.transferId);
       if (!transfer) {
@@ -7597,10 +7624,11 @@ export class Repository {
       if (!task) {
         return { success: false, transfer, errorCode: 'TASK_NOT_FOUND', error: `Task "${transfer.task_id}" not found.` };
       }
-      const project = this.getProject(task.project_id);
+      const project = this.getProjectForRepositoryUse(task.project_id);
       if (!project) {
         return { success: false, transfer, errorCode: 'PROJECT_NOT_FOUND', error: `Project "${task.project_id}" not found.` };
       }
+      rootLease = RepositoryRootLease.acquire(this.getProjectRepositoryIdentity(project.id));
 
       if (task.ownership_epoch !== transfer.successor_ownership_epoch) {
         return {
@@ -8189,6 +8217,7 @@ export class Repository {
       }
 
       const updatedTransfer = this.getHandoffTransfer(transfer.id)!;
+      rootLease.assertActive();
       return {
         success: true,
         transfer: updatedTransfer,
@@ -8196,6 +8225,13 @@ export class Repository {
         alreadyAuthorized: false,
       };
     });
+    rootLease?.assertActive();
+    return result;
+    } catch (error) {
+      if (!(error instanceof RepositoryRootError)) throw error;
+      return { success: false, transfer: this.getHandoffTransfer(params.transferId) ?? undefined,
+        errorCode: error.code, error: error.code };
+    } finally { rootLease?.close(); }
   }
 
   public acceptHandoffSuccessorExecution(params: {

@@ -1,3 +1,5 @@
+import { captureRepositoryRoot } from '../src/core/services/RepositoryRootIdentity';
+import { execFileSync as initializeFixtureGit } from 'node:child_process';
 import fs from 'fs';
 import path from 'path';
 import os from 'os';
@@ -1055,6 +1057,7 @@ describe('OmniRoute Coder Transport & Structured Edits', () => {
       const repo: any = new Repository(db);
 
       const now = new Date().toISOString();
+      if (!fs.existsSync(path.join(worktreeDir, '.git'))) initializeFixtureGit('git', ['init', '-q', '--template=', '--initial-branch=main'], { cwd: worktreeDir, stdio: 'ignore', windowsHide: true });
       repo.createProject({
         id: 'PROJ-OMNI',
         name: 'Project Omni',
@@ -1064,7 +1067,7 @@ describe('OmniRoute Coder Transport & Structured Edits', () => {
         contract: null,
         created_at: now,
         updated_at: now,
-      });
+      }, captureRepositoryRoot(worktreeDir));
 
       repo.createTask({
         id: 'TSK-OMNI-FAIL',
@@ -1323,6 +1326,7 @@ describe('OmniRoute Coder Transport & Structured Edits', () => {
       const repo: any = new Repository(db);
 
       const now = new Date().toISOString();
+      if (!fs.existsSync(path.join(worktreeDir, '.git'))) initializeFixtureGit('git', ['init', '-q', '--template=', '--initial-branch=main'], { cwd: worktreeDir, stdio: 'ignore', windowsHide: true });
       repo.createProject({
         id: 'PROJ-NO-AUTH',
         name: 'Project No Auth',
@@ -1332,7 +1336,7 @@ describe('OmniRoute Coder Transport & Structured Edits', () => {
         contract: null,
         created_at: now,
         updated_at: now,
-      });
+      }, captureRepositoryRoot(worktreeDir));
 
       repo.createTask({
         id: 'TSK-NO-AUTH',
@@ -1425,6 +1429,7 @@ describe('OmniRoute Coder Transport & Structured Edits', () => {
       const repo: any = new Repository(db);
 
       const now = new Date().toISOString();
+      if (!fs.existsSync(path.join(worktreeDir, '.git'))) initializeFixtureGit('git', ['init', '-q', '--template=', '--initial-branch=main'], { cwd: worktreeDir, stdio: 'ignore', windowsHide: true });
       repo.createProject({
         id: 'PROJ-UNK',
         name: 'Project Unknown',
@@ -1434,7 +1439,7 @@ describe('OmniRoute Coder Transport & Structured Edits', () => {
         contract: null,
         created_at: now,
         updated_at: now,
-      });
+      }, captureRepositoryRoot(worktreeDir));
 
       repo.createTask({
         id: 'TSK-UNK-AUTH',
@@ -1582,6 +1587,7 @@ describe('OmniRoute Coder Transport & Structured Edits', () => {
       const repo: any = new Repository(db);
 
       const now = new Date().toISOString();
+      if (!fs.existsSync(path.join(worktreeDir, '.git'))) initializeFixtureGit('git', ['init', '-q', '--template=', '--initial-branch=main'], { cwd: worktreeDir, stdio: 'ignore', windowsHide: true });
       repo.createProject({
         id: 'PROJ-AMB',
         name: 'Project Ambiguous',
@@ -1591,7 +1597,7 @@ describe('OmniRoute Coder Transport & Structured Edits', () => {
         contract: null,
         created_at: now,
         updated_at: now,
-      });
+      }, captureRepositoryRoot(worktreeDir));
 
       repo.createTask({
         id: 'TSK-AMB-AUTH',
@@ -1744,6 +1750,7 @@ describe('OmniRoute Coder Transport & Structured Edits', () => {
       const repo: any = new Repository(db);
 
       const now = new Date().toISOString();
+      if (!fs.existsSync(path.join(worktreeDir, '.git'))) initializeFixtureGit('git', ['init', '-q', '--template=', '--initial-branch=main'], { cwd: worktreeDir, stdio: 'ignore', windowsHide: true });
       repo.createProject({
         id: 'PROJ-AGY',
         name: 'Project AGY',
@@ -1753,7 +1760,7 @@ describe('OmniRoute Coder Transport & Structured Edits', () => {
         contract: null,
         created_at: now,
         updated_at: now,
-      });
+      }, captureRepositoryRoot(worktreeDir));
 
       repo.createTask({
         id: 'TSK-AGY-SELECT',
@@ -2019,6 +2026,7 @@ describe('OmniRoute Coder Transport & Structured Edits', () => {
       const repo: any = new Repository(db);
 
       const now = new Date().toISOString();
+      if (!fs.existsSync(path.join(worktreeDir, '.git'))) initializeFixtureGit('git', ['init', '-q', '--template=', '--initial-branch=main'], { cwd: worktreeDir, stdio: 'ignore', windowsHide: true });
       repo.createProject({
         id: 'PROJ-PROD-AGY',
         name: 'Product Project AGY',
@@ -2028,7 +2036,7 @@ describe('OmniRoute Coder Transport & Structured Edits', () => {
         contract: null,
         created_at: now,
         updated_at: now,
-      });
+      }, captureRepositoryRoot(worktreeDir));
 
       repo.createTask({
         id: 'TSK-PROD-AGY-1',

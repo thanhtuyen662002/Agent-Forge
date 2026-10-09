@@ -1,6 +1,7 @@
 import { Capability, ProviderHealthStatus, ProviderAdapterType, QuotaSource, AccountAuthMode } from '../types/domain';
+import type { RepositoryRootErrorCode } from '../services/RepositoryRootIdentity';
 
-export type RuntimeErrorCode =
+export type RuntimeErrorCode = RepositoryRootErrorCode
   | 'AUTH_ERROR'
   | 'QUOTA_EXHAUSTED'
   | 'TIMEOUT'

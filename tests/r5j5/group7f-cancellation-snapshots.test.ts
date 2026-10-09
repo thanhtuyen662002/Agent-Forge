@@ -1,3 +1,5 @@
+import { captureRepositoryRoot } from '../../src/core/services/RepositoryRootIdentity';
+import { execFileSync as initializeFixtureGit } from 'node:child_process';
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import Database from 'better-sqlite3';
 import path from 'path';
@@ -2325,6 +2327,7 @@ describe('R5J5 Quarantined Submission Adjudication and Verification Suite', () =
 
       // Probe 2: Evidence project_id mismatch
       const otherProjId = crypto.randomUUID();
+      if (!fs.existsSync(path.join(fixtures.projectRoot, '.git'))) initializeFixtureGit('git', ['init', '-q', '--template=', '--initial-branch=main'], { cwd: fixtures.projectRoot, stdio: 'ignore', windowsHide: true });
       fixtures.repo.createProject({
         id: otherProjId,
         name: 'other-project',
@@ -2337,7 +2340,7 @@ describe('R5J5 Quarantined Submission Adjudication and Verification Suite', () =
         updated_at: nowIso,
         started_at: null,
         completed_at: null,
-      });
+      }, captureRepositoryRoot(fixtures.projectRoot));
       const badProjEv: Evidence = { ...afterEv, id: crypto.randomUUID(), project_id: otherProjId };
       fixtures.repo.createEvidence(badProjEv);
       const envBadProj = { ...envelopeObj, workspace_snapshot_after_evidence_id: badProjEv.id };
@@ -4438,6 +4441,7 @@ describe('R5J5 Quarantined Submission Adjudication and Verification Suite', () =
       // Create two distinct projects in RUNNING state
       const proj1Id = 'proj-stop-1-' + crypto.randomUUID();
       const proj2Id = 'proj-stop-2-' + crypto.randomUUID();
+      if (!fs.existsSync(path.join(fixtures.projectRoot, '.git'))) initializeFixtureGit('git', ['init', '-q', '--template=', '--initial-branch=main'], { cwd: fixtures.projectRoot, stdio: 'ignore', windowsHide: true });
       fixtures.repo.createProject({
         id: proj1Id,
         name: 'Project One',
@@ -4450,7 +4454,8 @@ describe('R5J5 Quarantined Submission Adjudication and Verification Suite', () =
         updated_at: new Date().toISOString(),
         started_at: new Date().toISOString(),
         completed_at: null,
-      });
+      }, captureRepositoryRoot(fixtures.projectRoot));
+      if (!fs.existsSync(path.join(fixtures.projectRoot, '.git'))) initializeFixtureGit('git', ['init', '-q', '--template=', '--initial-branch=main'], { cwd: fixtures.projectRoot, stdio: 'ignore', windowsHide: true });
       fixtures.repo.createProject({
         id: proj2Id,
         name: 'Project Two',
@@ -4463,7 +4468,7 @@ describe('R5J5 Quarantined Submission Adjudication and Verification Suite', () =
         updated_at: new Date().toISOString(),
         started_at: new Date().toISOString(),
         completed_at: null,
-      });
+      }, captureRepositoryRoot(fixtures.projectRoot));
 
       const stopResult = await fixtures.emergencyStopService.triggerEmergencyStop('Multi-project emergency pause');
       expect(stopResult.projectsPaused).toContain(proj1Id);

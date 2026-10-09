@@ -1,3 +1,5 @@
+import { captureRepositoryRoot } from '../src/core/services/RepositoryRootIdentity';
+import { execFileSync as initializeFixtureGit } from 'node:child_process';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import fs from 'node:fs';
 import path from 'node:path';
@@ -34,8 +36,9 @@ describe('issued capability process boundary', () => {
     MigrationRunner.run(database);
     repo = new Repository(database);
     const now = new Date().toISOString();
+    if (!fs.existsSync(path.join(root, '.git'))) initializeFixtureGit('git', ['init', '-q', '--template=', '--initial-branch=main'], { cwd: root, stdio: 'ignore', windowsHide: true });
     repo.createProject({ id: 'P', name: 'Process fixture', description: null, repository_path: root, default_branch: 'main',
-      status: 'READY', contract: null, created_at: now, updated_at: now, started_at: null, completed_at: null });
+      status: 'READY', contract: null, created_at: now, updated_at: now, started_at: null, completed_at: null }, captureRepositoryRoot(root));
     service = new VerificationCapabilityService(repo, () => '1'.repeat(64));
     repo.createTask({ id: 'T', project_id: 'P', milestone_id: null, title: 'Verify capability', description: null, state: 'VALIDATING',
       paused_from_state: null, priority: 'HIGH', risk: 'LOW', assigned_agent_id: null, revision_count: 0, max_revisions: 3,
@@ -101,6 +104,51 @@ describe('issued capability process boundary', () => {
     new VerificationCapabilityService(repo).revoke(command.capability);
     expect((await verification.runTests('P', 'T', null, root)).exit_code).not.toBe(0);
     expect((await verification.runTestsWithFrozenCommand('P', 'T', null, root, frozen)).exit_code).not.toBe(0);
+  });
+
+  it.runIf(process.platform === 'win32').each(['configured', 'frozen'] as const)('retains the selected native root through %s verification result persistence', async mode => {
+    const { snapshot, verification } = await configured();
+    authorize(snapshot);
+    const originalCreate = repo.createTestRun.bind(repo);
+    const persist = vi.spyOn(repo, 'createTestRun').mockImplementation(row => {
+      const selectedGit = path.join(root, '.git');
+      const movedGit = path.join(root, '.git-changed');
+      let renamed = false;
+      try { fs.renameSync(selectedGit, movedGit); renamed = true; } catch {}
+      if (renamed) fs.renameSync(movedGit, selectedGit);
+      expect(renamed).toBe(false);
+      return originalCreate(row);
+    });
+    const result = mode === 'configured'
+      ? await verification.runTests('P', 'T', null, root)
+      : await verification.runTestsWithFrozenCommand('P', 'T', null, root, { ...snapshot.TEST!, timeout_ms: 10000, authorization_id: 'AUTH' });
+    expect(result.exit_code).toBe(0);
+    expect(persist).toHaveBeenCalledTimes(1);
+    expect(repo.getLatestTestRun('T')?.id).toBe(result.id);
+    fs.renameSync(path.join(root, '.git'), path.join(root, '.git-changed'));
+    fs.renameSync(path.join(root, '.git-changed'), path.join(root, '.git'));
+  });
+
+  it.each(['configured', 'frozen', 'sealed'] as const)('returns the fixed selected-root failure before executing %s historical verification', async mode => {
+    const { snapshot, verification } = await configured();
+    authorize(snapshot);
+    database.prepare('DELETE FROM project_repository_identities WHERE project_id=?').run('P');
+    const execute = vi.spyOn(ProcessRunner, 'execute');
+    if (mode === 'sealed') {
+      expect(await verification.executeSealedVerification(sealed(snapshot))).toMatchObject({
+        outcome: 'COMMAND_POLICY_REJECTED', failure_code: 'REPOSITORY_ROOT_UNBOUND', process_start: 'NOT_STARTED_PROVEN', process_termination: 'NOT_APPLICABLE',
+      });
+    } else {
+      const result = mode === 'configured'
+        ? await verification.runTests('P', 'T', null, root)
+        : await verification.runTestsWithFrozenCommand('P', 'T', null, root, { ...snapshot.TEST!, timeout_ms: 10000, authorization_id: 'AUTH' });
+      expect(result.exit_code).toBe(-1);
+      const evidence = repo.getEvidence(result.evidence_id!)!;
+      expect(verification.getArtifactStore().read(evidence)).toBe('REPOSITORY_ROOT_UNBOUND');
+    }
+    expect(execute).not.toHaveBeenCalled();
+    expect(repo.getProcessRunsByTask('T')).toEqual([]);
+    expect(database.prepare('SELECT COUNT(*) AS count FROM project_repository_identities').get()).toEqual({ count: 0 });
   });
 
   it('executes sealed verification with a live durable authorization and rejects recomputed snapshots after revocation or command substitution', async () => {
@@ -183,6 +231,7 @@ describe('issued capability process boundary', () => {
     const { command, snapshot } = await configured();
     const worktree = path.join(root, 'owned-worktree');
     fs.mkdirSync(worktree);
+    initializeFixtureGit('git', ['init', '-q', '--template=', '--initial-branch=main'], { cwd: worktree, stdio: 'ignore', windowsHide: true });
     const capabilities = new VerificationCapabilityService(repo);
     expect(() => capabilities.validate(command.capability, 'P', command.executable, command.args, worktree, worktree)).toThrow('CAPABILITY_BINDING_MISMATCH');
     authorize(snapshot, worktree);
@@ -198,6 +247,7 @@ describe('issued capability process boundary', () => {
     fs.writeFileSync(script, source);
     const worktree = path.join(root, 'owned-worktree');
     fs.mkdirSync(worktree);
+    initializeFixtureGit('git', ['init', '-q', '--template=', '--initial-branch=main'], { cwd: worktree, stdio: 'ignore', windowsHide: true });
     fs.writeFileSync(path.join(worktree, 'verify.js'), source);
     const command = await approveFixtureCommand(repo, 'P', [script]);
     const snapshot = { TEST: { ...command, timeout_ms: 10000 }, LINT: null, BUILD: null };
@@ -216,6 +266,7 @@ describe('issued capability process boundary', () => {
     fs.writeFileSync(path.join(root, 'verify.js'), 'process.stdout.write("approved");');
     const worktree = path.join(root, 'owned-worktree');
     fs.mkdirSync(worktree);
+    initializeFixtureGit('git', ['init', '-q', '--template=', '--initial-branch=main'], { cwd: worktree, stdio: 'ignore', windowsHide: true });
     fs.copyFileSync(path.join(root, 'verify.js'), path.join(worktree, 'verify.js'));
     const command = await approveFixtureCommand(repo, 'P', ['verify.js']);
     authorize({ TEST: { ...command, timeout_ms: 10000 }, LINT: null, BUILD: null }, worktree);
@@ -261,6 +312,37 @@ describe('issued capability process boundary', () => {
     expect(result.exitCode).toBe(0);
     expect(JSON.parse(result.stdout)).toEqual({ value: null, profile: '', home: '', path: boundary.environment.PATH });
     expect(boundary.environment).not.toHaveProperty('NODE_OPTIONS');
+  });
+
+  it.runIf(process.platform === 'win32')('holds the selected native root through an actual running verification child and releases it only after exit', async () => {
+    const started = path.join(root, 'child-started');
+    const release = path.join(root, 'release-child');
+    fs.writeFileSync(path.join(root, 'held-child.js'), "const fs=require('fs'),path=require('path');fs.writeFileSync(path.join(__dirname,'child-started'),'running');const deadline=setTimeout(()=>process.exit(3),10000);const poll=setInterval(()=>{if(fs.existsSync(path.join(__dirname,'release-child'))){clearInterval(poll);clearTimeout(deadline);process.exit(0)}},20);");
+    const { payload, boundary } = await approve(['held-child.js']);
+    const execution = ProcessRunner.execute({ executable: payload.executable.path, args: payload.args, cwd: root, timeoutMs: 15000, verificationBoundary: boundary });
+    try {
+      const deadline = Date.now() + 5000;
+      while (!fs.existsSync(started) && Date.now() < deadline) await new Promise(resolve => setTimeout(resolve, 20));
+      expect(fs.readFileSync(started, 'utf8')).toBe('running');
+      let renamed = false;
+      try { fs.renameSync(root, root + '-changed'); renamed = true; } catch {}
+      if (renamed) fs.renameSync(root + '-changed', root);
+      expect(renamed).toBe(false);
+      expect(() => fs.renameSync(path.join(root, '.git'), path.join(root, '.git-changed'))).toThrow();
+    } finally {
+      fs.writeFileSync(release, 'finish');
+      expect(await execution).toMatchObject({ exitCode: 0, processStart: 'STARTED_PROVEN', processTermination: 'PROCESS_TREE_TERMINATED_PROVEN' });
+    }
+    fs.renameSync(root, root + '-changed');
+    fs.renameSync(root + '-changed', root);
+  });
+
+  it('refuses an unbound historical project before persisting RUNNING or spawning the actual process', async () => {
+    database.prepare('DELETE FROM project_repository_identities WHERE project_id=?').run('P');
+    expect(await ProcessRunner.execute({ executable: process.execPath, args: ['--version'], cwd: root, timeoutMs: 10000, repo, projectId: 'P', taskId: 'T' }))
+      .toMatchObject({ pid: null, processStart: 'NOT_STARTED_PROVEN', processTermination: 'NOT_APPLICABLE', errorCode: 'REPOSITORY_ROOT_UNBOUND' });
+    expect(repo.getProcessRunsByTask('T')).toEqual([]);
+    expect(database.prepare('SELECT COUNT(*) AS count FROM project_repository_identities').get()).toEqual({ count: 0 });
   });
 
   it('resolves bare trusted Git from its standard installation and executes its approved physical identity', async () => {

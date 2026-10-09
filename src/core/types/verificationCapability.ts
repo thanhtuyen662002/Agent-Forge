@@ -59,15 +59,23 @@ export class VerificationCapabilityError extends Error {
 }
 
 /** Backend-only process boundary. Structured IPC cannot supply its closure. */
+export interface VerificationInvocationLease {
+  readonly cwd: string;
+  assertActive(): void;
+  close(): void;
+}
+
 export interface VerificationProcessBoundary {
   readonly environment: Readonly<Record<string, string>>;
   readonly assertInvocation: (executable: string, args: string[], cwd: string) => void;
+  readonly acquireInvocation: (executable: string, args: string[], cwd: string) => VerificationInvocationLease;
 }
 const issuedProcessBoundaries = new WeakSet<object>();
 
 export function issueVerificationProcessBoundary(environment: Record<string, string>,
-  assertInvocation: VerificationProcessBoundary['assertInvocation']): VerificationProcessBoundary {
-  const boundary = Object.freeze({ environment: Object.freeze({ ...environment }), assertInvocation });
+  assertInvocation: VerificationProcessBoundary['assertInvocation'],
+  acquireInvocation: VerificationProcessBoundary['acquireInvocation']): VerificationProcessBoundary {
+  const boundary = Object.freeze({ environment: Object.freeze({ ...environment }), assertInvocation, acquireInvocation });
   issuedProcessBoundaries.add(boundary);
   return boundary;
 }

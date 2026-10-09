@@ -1,3 +1,5 @@
+import { captureRepositoryRoot } from '../src/core/services/RepositoryRootIdentity';
+import { execFileSync as initializeFixtureGit } from 'node:child_process';
 import fs from 'fs';
 import path from 'path';
 import os from 'os';
@@ -114,6 +116,7 @@ function seedFullAuthorityEnv(tempDir: string): Fixtures {
   db.prepare(`INSERT INTO agents (id, display_name, role, provider_resource_id, status, current_task_id, last_seen_at) VALUES (?, 'ReviewerAgent2', 'REVIEWER', ?, 'IDLE', NULL, ?)`).run(reviewerAgentId2, reviewerResourceId, now);
 
   // 5. Project & Task
+  if (!fs.existsSync(path.join(tempDir, '.git'))) initializeFixtureGit('git', ['init', '-q', '--template=', '--initial-branch=main'], { cwd: tempDir, stdio: 'ignore', windowsHide: true });
   repo.createProject({
     id: projectId,
     name: 'Authority Test Project',
@@ -126,7 +129,7 @@ function seedFullAuthorityEnv(tempDir: string): Fixtures {
     updated_at: now,
     started_at: null,
     completed_at: null,
-  });
+  }, captureRepositoryRoot(tempDir));
 
   db.prepare(`
     INSERT INTO tasks (id, project_id, title, state, priority, risk, revision_count, max_revisions, progress_cache_percent, base_sha, ownership_epoch, created_at, updated_at)
@@ -1253,7 +1256,7 @@ describe('R5J7 MCP Reviewer Authority & Invariants (Cases 1–70, 124–131, 135
   // 124. Migration 24 embedded DDL inventory, foreign key graph, and canonical SQL integrity verification
   it('124. Migration 24 embedded DDL inventory, foreign key graph, and canonical SQL integrity verification', () => {
     verifyMigration24SchemaAuthority(fixtures.db);
-    expect(MIGRATIONS).toHaveLength(25);
+    expect(MIGRATIONS).toHaveLength(26);
     const mig24 = MIGRATIONS[23];
     expect(mig24.version).toBe(24);
     expect(mig24.name).toBe('024_r5j_reviewer_session_authority');

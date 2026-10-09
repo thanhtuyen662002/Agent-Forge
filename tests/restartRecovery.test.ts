@@ -1,3 +1,4 @@
+import { captureRepositoryRoot } from '../src/core/services/RepositoryRootIdentity';
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import Database from 'better-sqlite3';
 import fs from 'fs';
@@ -75,7 +76,7 @@ describe('Workflow & State Restart Recovery Invariants (PR #9)', () => {
     dispatchService = new ProviderDispatchService(providerRegistry, repo, eventService);
 
     // Seed test project & provider resources
-    const proj = projectService.createProject('Restart Recovery Project', 'Testing restart loop', gitRepoDir, 'main');
+    const proj = projectService.createProject('Restart Recovery Project', 'Testing restart loop', gitRepoDir, 'main', captureRepositoryRoot(gitRepoDir));
     testProjectId = proj.id;
 
     // Seed Manual Bridge provider & resource

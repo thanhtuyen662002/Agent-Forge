@@ -44,6 +44,11 @@ export const CreateProjectIpcSchema = z.object({
 });
 export type CreateProjectIpc = z.infer<typeof CreateProjectIpcSchema>;
 
+export const BindProjectRepositoryIpcSchema = z.object({
+  projectId: requiredIpcString(),
+  repositorySelectionId: boundedString(z.string().uuid('A valid native repository selection token is required')),
+}).strict();
+
 export const ImportContractIpcSchema = z.object({
   projectId: requiredIpcString(),
   contract: z.object({

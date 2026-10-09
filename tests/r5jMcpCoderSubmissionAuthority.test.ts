@@ -1,3 +1,5 @@
+import { captureRepositoryRoot } from '../src/core/services/RepositoryRootIdentity';
+import { execFileSync as initializeFixtureGit } from 'node:child_process';
 import fs from 'fs';
 import path from 'path';
 import os from 'os';
@@ -147,6 +149,7 @@ function setupFullSubmissionGraph(db: Database.Database, projectRepoPath?: strin
   }
 
   // 1. Project
+  if (!fs.existsSync(path.join(resolvedRepoPath, '.git'))) initializeFixtureGit('git', ['init', '-q', '--template=', '--initial-branch=main'], { cwd: resolvedRepoPath, stdio: 'ignore', windowsHide: true });
   repo.createProject({
     id: projectId,
     name: 'Submission Test Project',
@@ -159,7 +162,7 @@ function setupFullSubmissionGraph(db: Database.Database, projectRepoPath?: strin
     updated_at: now,
     started_at: null,
     completed_at: null,
-  });
+  }, captureRepositoryRoot(resolvedRepoPath));
 
   // 2. Task (receptive state: CODING)
   const baseSha = 'b'.repeat(40);
@@ -1099,6 +1102,56 @@ describe('R5J4 Durable Coder Submission Authority Comprehensive Suite', () => {
   // Group 4: Immediate Transaction Semantics, Concurrency, and Idempotency
   // =========================================================================
   describe('Group 4: Immediate Transaction Semantics, Concurrency, and Idempotency', () => {
+    it.runIf(process.platform === 'win32')('holds the selected root at both actual Git invocations and the final submission transaction boundary', () => {
+      const root = path.join(tempDir, 'selected-root'); fs.mkdirSync(root);
+      child_process.execFileSync('git', ['init', '-q', '--template=', '--initial-branch=main'], { cwd: root, stdio: 'ignore' });
+      fs.writeFileSync(path.join(root, 'tracked.txt'), 'selected-owner');
+      child_process.execFileSync('git', ['add', '--', 'tracked.txt'], { cwd: root, stdio: 'ignore' });
+      child_process.execFileSync('git', ['-c', 'user.name=Fixture', '-c', 'user.email=fixture@example.invalid', 'commit', '-q', '-m', 'fixture'], { cwd: root, stdio: 'ignore' });
+      const selected = setupFullSubmissionGraph(db, root);
+      const { plaintextToken } = issueSubmissionSessionHelper(selected.repo, selected.authorizationId);
+      const renamed: boolean[] = [];
+      const attemptReplacement = () => {
+        let moved = false;
+        try { fs.renameSync(path.join(root, '.git'), path.join(root, '.git-changed')); moved = true; } catch {}
+        if (moved) fs.renameSync(path.join(root, '.git-changed'), path.join(root, '.git'));
+        renamed.push(moved);
+      };
+      const execute = child_process.execFileSync;
+      const gitSpy = vi.spyOn(child_process, 'execFileSync').mockImplementation(((...args: Parameters<typeof execute>) => {
+        if ((args[2] as { cwd?: string })?.cwd === root) attemptReplacement();
+        return (execute as Function)(...args);
+      }) as typeof execute);
+      const transaction = selected.repo.runInImmediateTransaction.bind(selected.repo);
+      const commitSpy = vi.spyOn(selected.repo, 'runInImmediateTransaction').mockImplementation(callback => transaction(() => {
+        const result = callback(); attemptReplacement(); return result;
+      }));
+      try {
+        const result = selected.service.submitCoderClaim(createValidSubmissionPayload(selected), plaintextToken);
+        expect(result.accepted).toBe(true);
+        expect(renamed).toEqual([false, false, false]);
+      } finally { gitSpy.mockRestore(); commitSpy.mockRestore(); }
+      fs.renameSync(path.join(root, '.git'), path.join(root, '.git-changed'));
+      fs.renameSync(path.join(root, '.git-changed'), path.join(root, '.git'));
+    });
+
+    it('fences an unbound historical submission before Git or durable admission with a fixed root reason', () => {
+      const { plaintextToken } = issueSubmissionSessionHelper(fixtures.repo, fixtures.authorizationId);
+      db.prepare('DELETE FROM project_repository_identities WHERE project_id=?').run(fixtures.projectId);
+      const payload = createValidSubmissionPayload(fixtures);
+      const before = db.prepare('SELECT total_changes() AS c').get();
+      const gitSpy = vi.spyOn(child_process, 'execFileSync');
+      try {
+        expect(fixtures.service.submitCoderClaim(payload, plaintextToken)).toMatchObject({
+          accepted: false, error_code: 'MCP_AUTHORITY_FENCED', message: 'REPOSITORY_ROOT_UNBOUND', retryable: false,
+        });
+        expect(gitSpy).not.toHaveBeenCalled();
+        expect(db.prepare('SELECT total_changes() AS c').get()).toEqual(before);
+        expect(fixtures.repo.getCoderSubmissionById(String(payload.submission_id))).toBeNull();
+        expect(db.prepare('SELECT COUNT(*) AS count FROM project_repository_identities').get()).toEqual({ count: 0 });
+      } finally { gitSpy.mockRestore(); }
+    });
+
     it('37. Synchronous Transaction: all 3 records inserted in a single atomic transaction', () => {
       const { plaintextToken } = issueSubmissionSessionHelper(fixtures.repo, fixtures.authorizationId);
       const subId = crypto.randomUUID();
@@ -1390,6 +1443,7 @@ describe('R5J4 Durable Coder Submission Authority Comprehensive Suite', () => {
 
     it('52. Task must belong to project', () => {
       const { plaintextToken } = issueSubmissionSessionHelper(fixtures.repo, fixtures.authorizationId);
+      if (!fs.existsSync(path.join(fixtures.projectRoot, '.git'))) initializeFixtureGit('git', ['init', '-q', '--template=', '--initial-branch=main'], { cwd: fixtures.projectRoot, stdio: 'ignore', windowsHide: true });
       fixtures.repo.createProject({
         id: 'proj-diff-52',
         name: 'Diff Project',
@@ -1402,7 +1456,7 @@ describe('R5J4 Durable Coder Submission Authority Comprehensive Suite', () => {
         updated_at: new Date().toISOString(),
         started_at: null,
         completed_at: null,
-      });
+      }, captureRepositoryRoot(fixtures.projectRoot));
       db.prepare("UPDATE tasks SET project_id = 'proj-diff-52' WHERE id = ?").run(fixtures.taskId);
 
       const payload = createValidSubmissionPayload(fixtures);
@@ -2073,8 +2127,8 @@ describe('R5J4 Durable Coder Submission Authority Comprehensive Suite', () => {
   // Group 9: Section 6.1 — Production Determinism and Migration Compatibility
   // =========================================================================
   describe('Group 9: Section 6.1 — Production Determinism and Migration Compatibility', () => {
-    it('111. MIGRATIONS is exactly 25 in every caller/process/test filename', () => {
-      expect(MIGRATIONS).toHaveLength(25);
+    it('111. MIGRATIONS is exactly 26 in every caller/process/test filename', () => {
+      expect(MIGRATIONS).toHaveLength(26);
       expect(MIGRATIONS[21].version).toBe(22);
       expect(MIGRATIONS[21].name).toBe('022_r5j_coder_submission_authority');
     });
@@ -2085,7 +2139,7 @@ describe('R5J4 Durable Coder Submission Authority Comprehensive Suite', () => {
       try {
         process.argv.push('--file=ContextRead.test.ts');
         process.env.TEST_NAME = 'CrashRecovery';
-        expect(MIGRATIONS).toHaveLength(25);
+        expect(MIGRATIONS).toHaveLength(26);
       } finally {
         process.argv = originalArgv;
         process.env.TEST_NAME = originalEnv;
@@ -4226,12 +4280,13 @@ SELECT * FROM users WHERE id = 1;`;
       expect(typeof fixtures.service.getSubmissionStatus).toBe('function');
     });
 
-    it('39. Migration count remains exactly 25', () => {
-      expect(MIGRATIONS).toHaveLength(25);
-      expect(MIGRATIONS[MIGRATIONS.length - 1].version).toBe(25);
+    it('39. Migration count remains exactly 26 and retains the capability migration', () => {
+      expect(MIGRATIONS).toHaveLength(26);
+      expect(MIGRATIONS[MIGRATIONS.length - 1].version).toBe(26);
       expect(MIGRATIONS[MIGRATIONS.length - 1].name).toBe(
-        'durable_owner_verification_capabilities'
+        'selected_project_repository_identities'
       );
+      expect(MIGRATIONS[24]).toMatchObject({ version: 25, name: 'durable_owner_verification_capabilities' });
     });
 
     it('40. Tool schema, resource schema, Zod schema, TypeScript type, and runtime payload remain exact and closed', () => {
@@ -5355,7 +5410,7 @@ SELECT * FROM users WHERE id = 1;`;
     });
 
     it('H34. Existing R5J1-R5J5 suites remain unchanged and pass', () => {
-      expect(MIGRATIONS).toHaveLength(25);
+      expect(MIGRATIONS).toHaveLength(26);
       expect(MIGRATIONS[22].version).toBe(23);
       expect(typeof verifyMigration23SchemaAuthority).toBe('function');
     });

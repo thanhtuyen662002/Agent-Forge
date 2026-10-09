@@ -1,3 +1,5 @@
+import { captureRepositoryRoot } from '../src/core/services/RepositoryRootIdentity';
+import { execFileSync as initializeFixtureGit } from 'node:child_process';
 import Database from 'better-sqlite3';
 import fs from 'node:fs';
 import os from 'node:os';
@@ -19,9 +21,10 @@ describe('non-handoff execution restart discovery', () => {
     MigrationRunner.run(db);
     repo = new Repository(db);
     const now = new Date().toISOString();
+    if (!fs.existsSync(path.join(root, '.git'))) initializeFixtureGit('git', ['init', '-q', '--template=', '--initial-branch=main'], { cwd: root, stdio: 'ignore', windowsHide: true });
     repo.createProject({ id: 'P', name: 'Recovery fixture', description: null, repository_path: root,
       default_branch: 'main', status: 'RUNNING', contract: null, created_at: now, updated_at: now,
-      started_at: now, completed_at: null });
+      started_at: now, completed_at: null }, captureRepositoryRoot(root));
     repo.createTask({ id: 'T', project_id: 'P', milestone_id: null, title: 'Direct execution', description: null,
       state: 'CODING', paused_from_state: null, priority: 'HIGH', risk: 'LOW', assigned_agent_id: null,
       revision_count: 0, max_revisions: 3, base_sha: 'a'.repeat(40), current_sha: 'a'.repeat(40),

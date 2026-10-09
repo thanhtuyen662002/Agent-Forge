@@ -1,5 +1,6 @@
 import fs from 'fs';
 import path from 'path';
+import { assertRepositoryRootIdentity, RepositoryRootError, RepositoryRootErrorCode, RepositoryRootIdentity } from './RepositoryRootIdentity';
 
 export type PolicyDecision = 'ALLOW' | 'DENY' | 'REQUIRES_OWNER_APPROVAL';
 
@@ -7,6 +8,7 @@ export interface PolicyEvaluationResult {
   allowed: boolean;
   decision: PolicyDecision;
   reason: string;
+  reasonCode?: RepositoryRootErrorCode;
 }
 
 export type VerificationCandidateReason =
@@ -39,6 +41,23 @@ const VERIFICATION_CANDIDATE_MAX_ARGUMENT = 4096;
 const VERIFICATION_CANDIDATE_MAX_TOTAL_ARGUMENTS = 16384;
 
 export class PolicyService {
+  /** Classification only; actual IO must still retain its operation lease. */
+  public static evaluateRepositoryPathAccess(
+    targetPath: string,
+    identity: RepositoryRootIdentity,
+    isWrite: boolean = false,
+  ): PolicyEvaluationResult {
+    try {
+      assertRepositoryRootIdentity(identity);
+      const result = this.evaluateRealPathAccess(targetPath, identity.canonicalPath, isWrite);
+      assertRepositoryRootIdentity(identity);
+      return result;
+    } catch (error) {
+      const failure = error instanceof RepositoryRootError ? error : new RepositoryRootError('REPOSITORY_ROOT_IDENTITY_UNAVAILABLE');
+      return { allowed: false, decision: 'DENY', reasonCode: failure.code, reason: failure.message };
+    }
+  }
+
   /**
    * Pure preparation for the verification capability boundary. This classifier
    * never authorizes execution and does not alter general process policy.

@@ -55,7 +55,7 @@ export class EmergencyStopService {
     const affectedProjectIds = fence.projectIds;
     for (const projId of affectedProjectIds) {
       const mutation = fence.projects.find((item) => item.projectId === projId);
-      const proj = this.repo.getProject(projId);
+      const proj = this.repo.getProjectMetadata(projId);
       this.eventService.record(
         projId,
         'EMERGENCY_STOP',
@@ -75,7 +75,7 @@ export class EmergencyStopService {
       processesTerminated: provenTerminated,
       tasksPaused: fence.tasksPaused,
       projectsPaused: fence.projects
-        .filter((mutation) => mutation.status === 'STOPPED' && this.repo.getProject(mutation.projectId)?.status === 'PAUSED')
+        .filter((mutation) => mutation.status === 'STOPPED' && this.repo.getProjectMetadata(mutation.projectId)?.status === 'PAUSED')
         .map((mutation) => mutation.projectId),
       timestamp: now,
       unprovenProcesses: summary.unproven,

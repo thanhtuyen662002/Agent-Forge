@@ -1,3 +1,5 @@
+import { captureRepositoryRoot } from '../src/core/services/RepositoryRootIdentity';
+import { execFileSync as initializeFixtureGit } from 'node:child_process';
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import Database from 'better-sqlite3';
 import path from 'path';
@@ -22,6 +24,7 @@ describe('ProcessRunner Windows Command-Shim Resolution & Security Invariants', 
     repo = new Repository(db);
     artifactStore = new ArtifactStore(path.join(tmpDir, 'artifacts'));
 
+    if (!fs.existsSync(path.join(tmpDir, '.git'))) initializeFixtureGit('git', ['init', '-q', '--template=', '--initial-branch=main'], { cwd: tmpDir, stdio: 'ignore', windowsHide: true });
     repo.createProject({
       id: 'PROJ-SHIM',
       name: 'Windows Shim Test Project',
@@ -34,7 +37,7 @@ describe('ProcessRunner Windows Command-Shim Resolution & Security Invariants', 
       updated_at: new Date().toISOString(),
       started_at: null,
       completed_at: null,
-    });
+    }, captureRepositoryRoot(tmpDir));
   });
 
   afterEach(() => {

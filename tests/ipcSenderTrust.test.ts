@@ -1,4 +1,12 @@
-import { beforeEach, describe, expect, it, vi } from 'vitest';
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
+import { execFileSync } from 'node:child_process';
+import { beforeEach, afterEach, describe, expect, it, vi } from 'vitest';
+import { dialog } from 'electron';
+import { GitService } from '../src/core/services/GitService';
+import { RepositorySelectionService } from '../src/core/services/RepositorySelectionService';
+import { captureRepositoryRoot, RepositoryRootError } from '../src/core/services/RepositoryRootIdentity';
 import { registerIpcHandlers, IpcSenderTrustError } from '../src/electron/ipcHandlers';
 
 const handlers = new Map<string, (event: unknown, payload: unknown) => Promise<unknown>>();
@@ -18,9 +26,21 @@ vi.mock('electron', () => ({
 }));
 
 describe('privileged IPC sender trust boundary', () => {
+  const fixtures: string[] = [];
+  const projectService = {
+    createProject: vi.fn((name: string, _: string, repositoryPath: string) => ({ id: 'new-project', name, repository_path: repositoryPath })),
+    bindRepository: vi.fn((id: string, identity: { canonicalPath: string }) => ({ id, repository_path: identity.canonicalPath })),
+  };
   const repo = {
     getAllProjects: vi.fn(() => []),
     getProject: vi.fn((id: string) => ({ id })),
+    getProjectMetadata: vi.fn((id: string) => ({ id, repository_path: '' })),
+    getProjectRepositoryIdentity: vi.fn(() => { throw new RepositoryRootError('REPOSITORY_ROOT_UNBOUND'); }),
+    getTask: vi.fn(() => ({ id: 'task-1', project_id: 'historical', revision_count: 0 })),
+    getLatestAppliedManagerProtocolMessage: vi.fn(() => null),
+    getAllProviderResources: vi.fn(() => []),
+    getExecutionAuthorizationsByTask: vi.fn(() => []),
+    getLatestRoutingDecisionEventByTask: vi.fn(() => null),
     getProjectMaxRevisions: vi.fn(() => 3),
     setProjectMaxRevisions: vi.fn((_: string, value: number) => value),
     getProviderResource: vi.fn((id: string) => id === 'res-1' ? { id } : null),
@@ -31,9 +51,12 @@ describe('privileged IPC sender trust boundary', () => {
   beforeEach(() => {
     handlers.clear();
     vi.clearAllMocks();
+    repo.getProject.mockReset().mockImplementation((id: string) => ({ id }));
+    repo.getProjectMetadata.mockReset().mockImplementation((id: string) => ({ id, repository_path: '' }));
+    RepositorySelectionService.clearTokens();
     registerIpcHandlers(
       repo as any,
-      {} as any,
+      projectService as any,
       {} as any,
       {} as any,
       {} as any,
@@ -44,6 +67,25 @@ describe('privileged IPC sender trust boundary', () => {
       {} as any,
     );
   });
+
+  afterEach(() => {
+    vi.restoreAllMocks();
+    RepositorySelectionService.clearTokens();
+    for (const fixture of fixtures.splice(0)) {
+      if (fs.realpathSync.native(fixture) !== fixture || !path.basename(fixture).startsWith('af-ipc-root-')) throw new Error('FIXTURE_BOUNDARY_CHANGED');
+      fs.rmSync(fixture, { recursive: true, force: true });
+    }
+  });
+
+  function repositoryFixture(): { fixture: string; root: string } {
+    const fixture = fs.realpathSync.native(fs.mkdtempSync(path.join(os.tmpdir(), 'af-ipc-root-')));
+    fixtures.push(fixture);
+    const root = path.join(fixture, 'repo'); fs.mkdirSync(root);
+    const git = (args: string[]) => execFileSync('git', args, { cwd: root, stdio: 'ignore', windowsHide: true });
+    git(['init', '-q']);
+    git(['-c', 'user.name=Fixture', '-c', 'user.email=fixture@example.invalid', 'commit', '--allow-empty', '-qm', 'Fixture']);
+    return { fixture, root };
+  }
 
   it('rejects missing, synthetic, remote, and lookalike sender frames before handler logic', async () => {
     const handler = handlers.get('project:list');
@@ -63,6 +105,46 @@ describe('privileged IPC sender trust boundary', () => {
     expect(repo.getAllProjects).not.toHaveBeenCalled();
   });
 
+  it('binds only the configured folder through a trusted single-use native selection', async () => {
+    const { root } = repositoryFixture();
+    repo.getProjectMetadata.mockReturnValueOnce({ id: 'existing-project', repository_path: root });
+    const selection = RepositorySelectionService.issueToken(root);
+    const handler = handlers.get('project:bindRepository')!;
+    const payload = { projectId: 'existing-project', repositorySelectionId: selection.selectionId };
+    await expect(handler({ senderFrame: { url: 'https://remote.example/' } }, payload)).rejects.toBeInstanceOf(IpcSenderTrustError);
+    expect(projectService.bindRepository).not.toHaveBeenCalled();
+    expect(await handler({ senderFrame: { url: 'http://localhost:5173/projects' } }, payload)).toMatchObject({ success: true });
+    expect(projectService.bindRepository).toHaveBeenCalledWith('existing-project', captureRepositoryRoot(root));
+    expect(await handler({ senderFrame: { url: 'http://localhost:5173/projects' } }, payload)).toMatchObject({ success: false });
+    expect(projectService.bindRepository).toHaveBeenCalledTimes(1);
+  });
+
+  it('rejects renderer-supplied paths and different configured folders before binding', async () => {
+    const { root } = repositoryFixture();
+    const selection = RepositorySelectionService.issueToken(root);
+    const handler = handlers.get('project:bindRepository')!;
+    const event = { senderFrame: { url: 'http://localhost:5173/projects' } };
+    const payload = { projectId: 'existing-project', repositorySelectionId: selection.selectionId };
+    expect(await handler(event, { ...payload, repositoryPath: root })).toMatchObject({ success: false });
+    repo.getProjectMetadata.mockReturnValueOnce({ id: 'existing-project', repository_path: root + '-different' });
+    expect(await handler(event, payload)).toMatchObject({ success: false, errorCode: 'REPOSITORY_ROOT_IDENTITY_CHANGED' });
+    expect(projectService.bindRepository).not.toHaveBeenCalled();
+  });
+
+  it('discards a native binding observation if the root changes during awaited Git validation', async () => {
+    const { root } = repositoryFixture();
+    repo.getProjectMetadata.mockReturnValueOnce({ id: 'existing-project', repository_path: root });
+    const selection = RepositorySelectionService.issueToken(root);
+    vi.spyOn(GitService, 'getStatus').mockImplementationOnce(async () => {
+      fs.renameSync(root, root + '-original'); fs.mkdirSync(root);
+      return { status: 'SUCCESS', isDirty: false, branch: 'main' } as any;
+    });
+    expect(await handlers.get('project:bindRepository')!({ senderFrame: { url: 'http://localhost:5173/projects' } }, {
+      projectId: 'existing-project', repositorySelectionId: selection.selectionId,
+    })).toMatchObject({ success: false, errorCode: 'REPOSITORY_ROOT_IDENTITY_CHANGED' });
+    expect(projectService.bindRepository).not.toHaveBeenCalled();
+  });
+
   it('allows an exact trusted renderer origin and invokes the handler', async () => {
     const handler = handlers.get('project:list');
     expect(handler).toBeDefined();
@@ -71,6 +153,116 @@ describe('privileged IPC sender trust boundary', () => {
       handler!({ senderFrame: { url: 'http://localhost:5173/tasks' } }, undefined),
     ).resolves.toEqual([]);
     expect(repo.getAllProjects).toHaveBeenCalledTimes(1);
+  });
+
+  it('selects a real canonical Git repository and consumes the native capability for creation', async () => {
+    const { root } = repositoryFixture();
+    vi.mocked(dialog.showOpenDialog).mockResolvedValueOnce({ canceled: false, filePaths: [root] });
+    const event = { senderFrame: { url: 'http://localhost:5173/' } };
+    const selection = await handlers.get('dialog:selectRepository')!(event, undefined) as { success: boolean; selectionId: string; displayPath: string };
+    expect(selection.success).toBe(true);
+    expect(selection.displayPath).toBe(root);
+    expect(await handlers.get('project:create')!(event, { name: 'Selected project', repositorySelectionId: selection.selectionId })).toMatchObject({ success: true });
+    expect(projectService.createProject).toHaveBeenCalledTimes(1);
+    expect(projectService.createProject.mock.calls[0][2]).toBe(root);
+  });
+
+  it('returns a typed junction/alias selection error before invoking Git', async () => {
+    const { fixture, root } = repositoryFixture();
+    const alias = path.join(fixture, 'alias');
+    fs.symlinkSync(root, alias, process.platform === 'win32' ? 'junction' : 'dir');
+    vi.mocked(dialog.showOpenDialog).mockResolvedValueOnce({ canceled: false, filePaths: [alias] });
+    const status = vi.spyOn(GitService, 'getStatus');
+    const result = await handlers.get('dialog:selectRepository')!({ senderFrame: { url: 'http://localhost:5173/' } }, undefined);
+    expect(result).toMatchObject({ success: false, errorCode: 'REPOSITORY_ROOT_ALIAS' });
+    expect(status).not.toHaveBeenCalled();
+    expect(projectService.createProject).not.toHaveBeenCalled();
+  });
+
+  it('does not issue a capability after the selected root changes during Git validation', async () => {
+    const { root } = repositoryFixture();
+    vi.mocked(dialog.showOpenDialog).mockResolvedValueOnce({ canceled: false, filePaths: [root] });
+    const originalStatus = GitService.getStatus.bind(GitService);
+    vi.spyOn(GitService, 'getStatus').mockImplementationOnce(async (...args) => {
+      const result = await originalStatus(...args);
+      expect(result.status).toBe('SUCCESS');
+      fs.renameSync(root, root + '-original'); fs.mkdirSync(root);
+      return result;
+    });
+    expect(await handlers.get('dialog:selectRepository')!({ senderFrame: { url: 'http://localhost:5173/' } }, undefined))
+      .toMatchObject({ success: false, errorCode: 'REPOSITORY_ROOT_IDENTITY_CHANGED' });
+    expect(projectService.createProject).not.toHaveBeenCalled();
+  });
+
+  it('rejects a post-consumption root replacement before project persistence', async () => {
+    const { root } = repositoryFixture();
+    const token = RepositorySelectionService.issueToken(root);
+    const originalStatus = GitService.getStatus.bind(GitService);
+    vi.spyOn(GitService, 'getStatus').mockImplementationOnce(async (...args) => {
+      const result = await originalStatus(...args);
+      expect(result.status).toBe('SUCCESS');
+      fs.renameSync(root, root + '-original'); fs.mkdirSync(root);
+      return result;
+    });
+    expect(await handlers.get('project:create')!({ senderFrame: { url: 'http://localhost:5173/' } }, {
+      name: 'Stale selected project', repositorySelectionId: token.selectionId,
+    })).toMatchObject({ success: false, errorCode: 'REPOSITORY_ROOT_IDENTITY_CHANGED' });
+    expect(projectService.createProject).not.toHaveBeenCalled();
+    expect(RepositorySelectionService.consumeToken(token.selectionId).success).toBe(false);
+  });
+
+  it('denies unbound historical project Git reads with a typed actionable result', async () => {
+    const { root } = repositoryFixture();
+    repo.getProject.mockReturnValueOnce({ id: 'historical', repository_path: root } as any);
+    const status = vi.spyOn(GitService, 'getStatus');
+    expect(await handlers.get('git:getStatus')!({ senderFrame: { url: 'http://localhost:5173/' } }, { projectId: 'historical' }))
+      .toMatchObject({ status: 'ERROR', isClean: false, errorCode: 'REPOSITORY_ROOT_UNBOUND' });
+    expect(status).not.toHaveBeenCalled();
+  });
+
+  it('returns typed root-load failures without invoking Git or reporting a clean project', async () => {
+    repo.getProject.mockImplementationOnce(() => { throw new RepositoryRootError('REPOSITORY_ROOT_IDENTITY_CHANGED'); });
+    const status = vi.spyOn(GitService, 'getStatus');
+    expect(await handlers.get('git:getStatus')!({ senderFrame: { url: 'http://localhost:5173/' } }, { projectId: 'changed' }))
+      .toMatchObject({ status: 'ERROR', isClean: false, errorCode: 'REPOSITORY_ROOT_IDENTITY_CHANGED' });
+    expect(status).not.toHaveBeenCalled();
+  });
+
+  it('passes the persisted project identity into actual Git status collection', async () => {
+    const { root } = repositoryFixture();
+    const identity = captureRepositoryRoot(root);
+    repo.getProject.mockReturnValueOnce({ id: 'bound', repository_path: root } as any);
+    repo.getProjectRepositoryIdentity.mockReturnValueOnce(identity as never);
+    const status = vi.spyOn(GitService, 'getStatus');
+    expect(await handlers.get('git:getStatus')!({ senderFrame: { url: 'http://localhost:5173/' } }, { projectId: 'bound' }))
+      .toMatchObject({ status: 'SUCCESS', isClean: true });
+    expect(status).toHaveBeenCalledWith(root, identity);
+  });
+
+  it('keeps historical handoff metadata available without adopting its unbound path for Git', async () => {
+    const { root } = repositoryFixture();
+    const project = { id: 'historical', repository_path: root };
+    repo.getProject.mockReturnValueOnce(project);
+    repo.getProjectMetadata.mockReturnValueOnce(project);
+    const head = vi.spyOn(GitService, 'getHeadSha');
+    expect(await handlers.get('routing:getHandoffSnapshot')!({ senderFrame: { url: 'http://localhost:5173/' } }, { taskId: 'task-1' }))
+      .toMatchObject({ success: true, snapshot: { project, gitHeadSha: null,
+        managerAuthority: { decisionValidForCurrentRevision: false, reason: 'REPOSITORY_ROOT_UNBOUND' } } });
+    expect(head).not.toHaveBeenCalled();
+  });
+
+  it('uses the persisted selected identity for the real handoff snapshot HEAD read', async () => {
+    const { root } = repositoryFixture();
+    const identity = captureRepositoryRoot(root);
+    const project = { id: 'historical', repository_path: root };
+    repo.getProject.mockReturnValueOnce(project);
+    repo.getProjectMetadata.mockReturnValueOnce(project);
+    repo.getProjectRepositoryIdentity.mockReturnValueOnce(identity as never);
+    const expectedHead = execFileSync('git', ['rev-parse', 'HEAD'], { cwd: root, encoding: 'utf8', windowsHide: true }).trim();
+    const head = vi.spyOn(GitService, 'getHeadSha');
+    expect(await handlers.get('routing:getHandoffSnapshot')!({ senderFrame: { url: 'http://localhost:5173/' } }, { taskId: 'task-1' }))
+      .toMatchObject({ success: true, snapshot: { project, gitHeadSha: expectedHead } });
+    expect(head).toHaveBeenCalledWith(root, identity);
   });
 
   it('confirms quota mutation only for an existing resource inside the immediate transaction', async () => {

@@ -230,7 +230,7 @@ export class RoleAwareRoutingService {
       : null;
 
     // 1. Validate Scope: Project & Task
-    const project = this.repo.getProject(request.projectId);
+    const project = this.repo.getProjectForRepositoryUse(request.projectId);
     if (!project) {
       return this.failClosed(
         decisionId,
@@ -1155,7 +1155,7 @@ export class RoleAwareRoutingService {
   ): void {
     if (!this.eventService) return;
     try {
-      const project = this.repo.getProject(request.projectId);
+      const project = this.repo.getProjectForRepositoryUse(request.projectId);
       if (!project) return;
       const task = this.repo.getTask(request.taskId);
       const validTaskId = task && task.project_id === request.projectId ? request.taskId : null;

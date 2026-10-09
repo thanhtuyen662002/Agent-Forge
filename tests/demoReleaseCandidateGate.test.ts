@@ -1,3 +1,4 @@
+import { captureRepositoryRoot } from '../src/core/services/RepositoryRootIdentity';
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import { approveFixtureCommand } from './helpers/verificationCapabilityFixture';
 import Database from 'better-sqlite3';
@@ -137,7 +138,7 @@ describe('PR #10 — AgentForge Demo & Release Candidate Gate Contract Tests', (
       'Demo RC Project',
       'Windows Demo Release Candidate Verification',
       gitRepoDir,
-      'main'
+      'main', captureRepositoryRoot(gitRepoDir)
     );
     testProjectId = project.id;
 

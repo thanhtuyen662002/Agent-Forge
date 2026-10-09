@@ -296,6 +296,13 @@ export const viVN: TranslationDictionary = {
     importSuccess: 'Đã nhập hợp đồng thành công!',
     importError: 'Lỗi cú pháp JSON: {error}',
     importButton: 'NHẬP HỢP ĐỒNG',
+    repositoryBinding: {
+      title: 'Xác nhận thư mục dự án hiện có',
+      description: 'Với dự án được tạo trước khi có xác minh thư mục, hãy chọn đúng thư mục Git đã cấu hình. Thư mục đã xác minh không thể bị thay thế.',
+      button: 'Xác nhận thư mục kho mã',
+      success: 'Thư mục kho mã đã cấu hình được xác minh.',
+      blocked: 'Dự án này đã bắt đầu thực thi. Hãy tạo dự án mới với thư mục được xác minh; lịch sử hiện có được giữ nguyên.',
+    },
     createModal: {
       title: 'Tạo Dự án Mới',
       nameLabel: 'Tên Dự án',
@@ -312,6 +319,8 @@ export const viVN: TranslationDictionary = {
       repositoryErrors: {
         notGitRepository: 'Thư mục đã chọn không phải là kho mã Git hợp lệ. Hãy chọn thư mục gốc của một kho Git.',
         invalidLocation: 'Vị trí kho mã không hợp lệ. Đường dẫn thư mục không thể truy cập hoặc không được phép.',
+        alias: 'Hãy chọn thư mục gốc thực tế của kho mã. Không thể dùng thư mục liên kết hoặc đường dẫn thay thế.',
+        changed: 'Thư mục kho mã đã thay đổi hoặc chưa được xác minh. Hãy chọn lại thư mục trước khi tiếp tục.',
         unknown: 'Đã xảy ra lỗi không xác định khi chọn kho mã.',
         technicalDetails: 'Chi tiết kỹ thuật: {error}',
       },

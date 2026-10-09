@@ -1,3 +1,5 @@
+import { captureRepositoryRoot } from '../src/core/services/RepositoryRootIdentity';
+import { execFileSync as initializeSelectedFixtureGit } from 'node:child_process';
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import { approveFixtureCommand } from './helpers/verificationCapabilityFixture';
 import Database from 'better-sqlite3';
@@ -85,7 +87,7 @@ describe('Real End-to-End Orchestration Integration Lifecycle', () => {
       'Real E2E Project',
       'End to end verification without shortcuts',
       gitRepoDir,
-      'main'
+      'main', captureRepositoryRoot(gitRepoDir)
     );
 
     const contract: ProjectContract = {
@@ -280,12 +282,16 @@ describe('Real End-to-End Orchestration Integration Lifecycle', () => {
     const nonGitDir = path.join(tmpDataDir, 'non_git_workspace');
     fs.mkdirSync(nonGitDir, { recursive: true });
 
+    initializeSelectedFixtureGit('git', ['init', '-q', '--template=', '--initial-branch=main'], { cwd: nonGitDir, stdio: 'ignore', windowsHide: true });
     const project = projectService.createProject(
       'Git Failure Test Project',
       'Verify fail-closed on git error',
       nonGitDir,
-      'main'
+      'main', captureRepositoryRoot(nonGitDir)
     );
+    // Capture a genuine ordinary Git root first, then make real Git metadata
+    // invalid. Verification can pass while actual Git status must fail.
+    fs.writeFileSync(path.join(nonGitDir, '.git', 'config'), '[invalid-fixture\n');
 
     const task: Task = {
       id: 'TSK-GIT-FAIL',

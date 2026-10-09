@@ -1,3 +1,5 @@
+import { captureRepositoryRoot } from '../src/core/services/RepositoryRootIdentity';
+import { execFileSync as initializeFixtureGit } from 'node:child_process';
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import fs from 'fs';
 import path from 'path';
@@ -157,6 +159,7 @@ describe('R5F0B — Runtime Execution Binding & Process Runner Hardening Tests',
     dispatcher = new ProviderDispatchService(registry, repo, eventService);
 
     // Setup base project & task
+    if (!fs.existsSync(path.join(projectRepoDir, '.git'))) initializeFixtureGit('git', ['init', '-q', '--template=', '--initial-branch=main'], { cwd: projectRepoDir, stdio: 'ignore', windowsHide: true });
     repo.createProject({
       id: 'proj-r5f',
       name: 'R5F Test Project',
@@ -169,7 +172,7 @@ describe('R5F0B — Runtime Execution Binding & Process Runner Hardening Tests',
       updated_at: new Date().toISOString(),
       started_at: new Date().toISOString(),
       completed_at: null,
-    });
+    }, captureRepositoryRoot(projectRepoDir));
 
     repo.createTask({
       id: 'task-r5f-001',
