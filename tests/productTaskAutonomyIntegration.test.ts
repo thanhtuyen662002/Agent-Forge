@@ -2069,10 +2069,11 @@ describe('product-task autonomy consolidation', () => {
   });
 
   it('returns the original execution outcome with a typed durable cleanup marker when lease release throws', async () => {
+    const secret = 'AF_TEST_ONLY_CLEANUP_CREDENTIAL';
     const fixture = await seed('task-lease-release-failure');
     const leaseService = (adapter as any).leaseService as WorkerSlotLeaseService;
     const releaseSpy = vi.spyOn(leaseService, 'release').mockImplementation(() => {
-      throw new Error('SQLITE_BUSY: simulated release transaction failure');
+      throw new Error('SQLITE_BUSY: simulated release transaction failure; password=' + secret);
     });
     try {
       const result = await adapter.executeProductTask({
@@ -2120,11 +2121,13 @@ describe('product-task autonomy consolidation', () => {
         code: 'LEASE_RELEASE_FAILED',
       });
       expect(result.error).toBeUndefined();
+      expect(JSON.stringify(result).includes(secret)).toBe(false);
       expect(repo.getWorkerSlot(fixture.slotId)?.status).toBe('LEASED');
       const marker = repo.getDatabase().prepare(
         "SELECT type, task_id, structured_payload_json FROM events WHERE type = 'PRODUCT_LEASE_RECOVERY_REQUIRED'",
       ).get() as { type: string; task_id: string; structured_payload_json: string } | undefined;
       expect(marker?.type).toBe('PRODUCT_LEASE_RECOVERY_REQUIRED');
+      expect(marker?.structured_payload_json.includes(secret)).toBe(false);
       expect(marker?.task_id).toBe(fixture.task.id);
       expect(marker?.structured_payload_json).toContain('simulated release transaction failure');
       expect(marker?.structured_payload_json).toContain('owner_token_sha256');

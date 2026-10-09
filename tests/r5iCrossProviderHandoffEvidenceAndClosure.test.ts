@@ -1,4 +1,5 @@
 import { captureRepositoryRoot } from '../src/core/services/RepositoryRootIdentity';
+import { redactSensitiveText } from '../src/shared/security/secretRedaction';
 import { execFileSync as initializeFixtureGit } from 'node:child_process';
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { testWindowsWorktree, withoutWindowsWorktreeBoundary } from './helpers/worktreePlatforms';
@@ -1244,6 +1245,64 @@ describe('R5I7 Cross-Provider Handoff Evidence and Closure Integration Suite', (
         }
       }
     }
+  }, 60000);
+
+  testWindowsWorktree('sanitizes genuine lifecycle-v1 result/error bytes and direct repository replay before canonical hashing', async () => {
+    const secret = 'AF_TEST_ONLY_V1_CREDENTIAL';
+    const response = 'password=' + secret;
+    const flow = await runProductionHandoffFlow({ adapterBReturnResult: { status: 'FAILED', rawResponse: response,
+      error: 'api_key=' + secret, errorCode: 'EXECUTION_FAILED' } });
+    const auth = repo.getExecutionAuthorization(flow.authorizationId!)!;
+    expect(auth.settlement_status).toBe('FAILED');
+    expect(auth.adapter_outcome).toBe('RETURNED');
+    expect(JSON.stringify(flow.schedulerResult?.providerResult).includes(secret)).toBe(false);
+    expect((auth.settlement_evidence_json! + (auth.adapter_error_json ?? '')).includes(secret)).toBe(false);
+    const stored = JSON.parse(auth.settlement_evidence_json!);
+    expect(stored.result_payload.rawResponse === redactSensitiveText(response)).toBe(true);
+    expect(auth.settlement_evidence_hash === computeSha256(canonicalJsonStringify(stored))).toBe(true);
+    const replay = repo.settleExecutionResult({ authorizationId: auth.id, executionId: auth.execution_id!, outcome: 'RETURNED',
+      status: 'FAILED', finishedAt: stored.finished_at,
+      resultPayload: { ...stored.result_payload, rawResponse: response, error: 'api_key=' + secret }, errorJson: stored.error_json });
+    expect(replay.success && replay.alreadySettled && replay.evidenceHash === auth.settlement_evidence_hash).toBe(true);
+    expect(adapterB.invocationCount).toBe(1);
+    expect(repo.getTask(flow.taskId)?.state === 'DONE').toBe(false);
+  }, 60000);
+
+  testWindowsWorktree('sanitizes a direct initial lifecycle-v1 settlement and error JSON under genuine accepted authority', async () => {
+    const flow = await runProductionHandoffFlow({ stopAt: 'ACCEPTED' });
+    const auth = repo.getExecutionAuthorization(flow.authorizationId!)!;
+    const executionId = crypto.randomUUID();
+    const secret = 'AF_TEST_ONLY_DIRECT_SETTLEMENT_CREDENTIAL';
+    expect(repo.claimExecutionAuthorization(auth.id, new Date().toISOString())).toBe(true);
+    const claim = repo.claimAdapterExecutionStart({ authorizationId: auth.id, executionId,
+      expectedEpoch: auth.task_ownership_epoch!, expectedLifecycleVersion: 1 });
+    expect(claim.success).toBe(true);
+    const result = repo.settleExecutionResult({ authorizationId: auth.id, executionId, outcome: 'THREW', status: 'FAILED',
+      resultPayload: { status: 'FAILED', rawResponse: 'password=' + secret },
+      errorJson: JSON.stringify({ message: 'api_key=' + secret, stack: 'fixture-stack password=' + secret }) });
+    expect(result.success).toBe(true);
+    const durable = repo.getExecutionAuthorization(auth.id)!;
+    expect(durable.settlement_status).toBe('FAILED');
+    expect(durable.adapter_outcome).toBe('THREW');
+    expect((durable.settlement_evidence_json! + durable.adapter_error_json!).includes(secret)).toBe(false);
+    const stored = JSON.parse(durable.settlement_evidence_json!);
+    expect(durable.settlement_evidence_hash === computeSha256(canonicalJsonStringify(stored))).toBe(true);
+    expect(adapterB.invocationCount).toBe(0);
+  }, 60000);
+
+  testWindowsWorktree('rejects unsafe direct lifecycle-v1 replay without changing the original settlement receipt', async () => {
+    const flow = await runProductionHandoffFlow();
+    const auth = repo.getExecutionAuthorization(flow.authorizationId!)!;
+    const stored = JSON.parse(auth.settlement_evidence_json!);
+    let code: unknown;
+    try { repo.settleExecutionResult({ authorizationId: auth.id, executionId: auth.execution_id!, outcome: 'RETURNED',
+      status: 'COMPLETED', finishedAt: stored.finished_at, resultPayload: { ...stored.result_payload,
+        rawResponse: 'api_key:{first:"AF_TEST_ONLY_V1_CREDENTIAL",second:17}' } }); }
+    catch (error) { code = (error as { code?: unknown }).code; }
+    expect(code).toBe('OUTPUT_REDACTION_UNSAFE');
+    const observed = repo.getExecutionAuthorization(auth.id)!;
+    expect(observed.settlement_evidence_json === auth.settlement_evidence_json && observed.settlement_evidence_hash === auth.settlement_evidence_hash).toBe(true);
+    expect(adapterB.invocationCount).toBe(1);
   }, 60000);
 
   // 12. Spoofed adapter provenance is removed and replaced with authentic durable Provider B provenance

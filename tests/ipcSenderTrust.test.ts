@@ -1,6 +1,8 @@
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import crypto from 'node:crypto';
+import type { Evidence } from '../src/core/types/domain';
 import { execFileSync } from 'node:child_process';
 import { beforeEach, afterEach, describe, expect, it, vi } from 'vitest';
 import { dialog } from 'electron';
@@ -33,6 +35,8 @@ describe('privileged IPC sender trust boundary', () => {
   };
   const repo = {
     getAllProjects: vi.fn(() => []),
+    getEventsByProject: vi.fn((): unknown[] => []),
+    getEvidenceByProject: vi.fn((): Evidence[] => []),
     getProject: vi.fn((id: string) => ({ id })),
     getProjectMetadata: vi.fn((id: string) => ({ id, repository_path: '' })),
     getProjectRepositoryIdentity: vi.fn(() => { throw new RepositoryRootError('REPOSITORY_ROOT_UNBOUND'); }),
@@ -53,6 +57,8 @@ describe('privileged IPC sender trust boundary', () => {
     vi.clearAllMocks();
     repo.getProject.mockReset().mockImplementation((id: string) => ({ id }));
     repo.getProjectMetadata.mockReset().mockImplementation((id: string) => ({ id, repository_path: '' }));
+    repo.getEventsByProject.mockReset().mockReturnValue([]);
+    repo.getEvidenceByProject.mockReset().mockReturnValue([]);
     RepositorySelectionService.clearTokens();
     registerIpcHandlers(
       repo as any,
@@ -86,6 +92,49 @@ describe('privileged IPC sender trust boundary', () => {
     git(['-c', 'user.name=Fixture', '-c', 'user.email=fixture@example.invalid', 'commit', '--allow-empty', '-qm', 'Fixture']);
     return { fixture, root };
   }
+
+  it('returns sanitized legacy event diagnostics through the actual trusted handler without mutating stored input', async () => {
+    const secret = 'AF_TEST_ONLY_IPC_CREDENTIAL';
+    const event = { id: 'event-fixture', project_id: 'P', type: 'FIXTURE_FAILURE', summary: 'password=' + secret,
+      structured_payload: { authorizationId: 'trusted-auth-fixture', message: 'api_key=' + secret, token_count: 3 } };
+    repo.getEventsByProject.mockReturnValue([event]);
+    const result = await handlers.get('events:list')!({ senderFrame: { url: 'http://localhost:5173/' } }, { projectId: 'P' });
+    expect(JSON.stringify(result).includes(secret)).toBe(false);
+    expect(result).toMatchObject([{ id: 'event-fixture', type: 'FIXTURE_FAILURE',
+      structured_payload: { authorizationId: 'trusted-auth-fixture', token_count: 3 } }]);
+    expect(event.summary.includes(secret)).toBe(true);
+  });
+
+  it.each(['ordinary', 'unsafe'] as const)('preserves or rejects %s legacy evidence with its exact stored hash and bytes', async variant => {
+    const secret = 'AF_TEST_ONLY_IPC_CREDENTIAL';
+    const payload = variant === 'unsafe' ? 'api_key=' + secret : 'ordinary verification diagnostic';
+    const evidence: Evidence = { id: 'legacy-evidence', project_id: 'P', task_id: null, attempt_id: null,
+      evidence_type: 'CUSTOM', storage_type: 'INLINE', file_path: null,
+      hash: crypto.createHash('sha256').update(payload).digest('hex'), byte_size: Buffer.byteLength(payload),
+      content_type: 'text/plain', summary: 'password=' + secret, raw_payload: payload, created_at: new Date().toISOString() };
+    repo.getEvidenceByProject.mockReturnValue([evidence]);
+    const invocation = handlers.get('evidence:list')!({ senderFrame: { url: 'http://localhost:5173/' } }, { projectId: 'P' });
+    if (variant === 'unsafe') await expect(invocation).rejects.toMatchObject({ code: 'OUTPUT_REDACTION_UNSAFE' });
+    else {
+      const result = await invocation as Evidence[];
+      expect(JSON.stringify(result).includes(secret)).toBe(false);
+      expect(result[0].raw_payload === payload && result[0].hash === evidence.hash && result[0].byte_size === evidence.byte_size).toBe(true);
+    }
+    expect(evidence.raw_payload === payload).toBe(true);
+    expect(evidence.hash === crypto.createHash('sha256').update(payload).digest('hex')).toBe(true);
+  });
+
+  it('sanitizes unexpected failure message and stack through the actual trusted handler', async () => {
+    const secret = 'AF_TEST_ONLY_IPC_CREDENTIAL';
+    const failure = new Error('password=' + secret);
+    failure.stack = 'fixture-stack api_key=' + secret;
+    repo.getAllProjects.mockImplementationOnce(() => { throw failure; });
+    let observed: unknown;
+    try { await handlers.get('project:list')!({ senderFrame: { url: 'http://localhost:5173/' } }, undefined); }
+    catch (error) { observed = error; }
+    expect(observed instanceof Error).toBe(true);
+    expect(((observed as Error).message + (observed as Error).stack).includes(secret)).toBe(false);
+  });
 
   it('rejects missing, synthetic, remote, and lookalike sender frames before handler logic', async () => {
     const handler = handlers.get('project:list');

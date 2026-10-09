@@ -969,6 +969,61 @@ describe('R5J5 Quarantined Submission Adjudication and Verification Suite', () =
       }
     });
 
+    it('rejects unsafe child output at actual zero exit before adjudication can verify the task', async () => {
+      const secret = 'AF_TEST_ONLY_VERIFICATION_CREDENTIAL';
+      const { plaintextToken } = issueSubmissionSessionHelper(fixtures.repo, fixtures.authorizationId);
+      const subId = crypto.randomUUID();
+      fixtures.mcpService.submitCoderClaim(createValidSubmissionPayload(fixtures, subId), plaintextToken);
+      const script = path.join(fixtures.projectRoot, 'temp-artifacts', 'unsafe_output_' + crypto.randomUUID() + '.cjs');
+      fs.writeFileSync(script, 'process.stdout.write(' + JSON.stringify('api_key:{first:"' + secret + '",second:17}') + ');');
+      const auth = fixtures.repo.getExecutionAuthorization(fixtures.authorizationId)!;
+      const payload = JSON.parse(auth.canonical_payload_json!);
+      payload.verificationCommands.TEST = { ...await approveFixtureCommand(fixtures.repo, fixtures.projectId, [script]), timeout_ms: 120000 };
+      db.prepare('UPDATE execution_authorizations SET canonical_payload_json=?,instruction_payload_hash=? WHERE id=?')
+        .run(JSON.stringify(payload), computePayloadHash(payload), fixtures.authorizationId);
+      let observed: import('../../src/core/types/adjudication').VerificationExecutionObservation | undefined;
+      const execute = fixtures.verificationService.executeSealedVerification.bind(fixtures.verificationService);
+      const spy = vi.spyOn(fixtures.verificationService, 'executeSealedVerification').mockImplementation(async input => {
+        observed = await execute(input); return observed;
+      });
+      try {
+        const result = await fixtures.adjudicationService.admitSubmissionForVerification({ requestId: crypto.randomUUID(), submissionId: subId });
+        expect(observed?.exit_code).toBe(0);
+        expect(observed?.failure_code).toBe('OUTPUT_REDACTION_UNSAFE');
+        expect(observed?.outcome === 'SUCCESS').toBe(false);
+        expect(observed?.process_start).toBe('STARTED_PROVEN');
+        expect(observed?.process_termination).toBe('PROCESS_TREE_TERMINATED_PROVEN');
+        expect(result.adjudication.status === 'VERIFIED').toBe(false);
+        const durable = fixtures.repo.getCoderSubmissionAdjudicationById(result.adjudication.id)!;
+        expect(JSON.stringify(durable).includes(secret)).toBe(false);
+        expect(['DONE', 'REVIEW_READY'].includes(fixtures.repo.getTask(fixtures.taskId)!.state)).toBe(false);
+      } finally { spy.mockRestore(); fs.unlinkSync(script); }
+    });
+
+    it('sanitizes verification abort diagnostics in real recovery-fenced SQLite rows and the rethrown error', async () => {
+      const secret = 'AF_TEST_ONLY_ABORT_CREDENTIAL';
+      const { plaintextToken } = issueSubmissionSessionHelper(fixtures.repo, fixtures.authorizationId);
+      const subId = crypto.randomUUID();
+      fixtures.mcpService.submitCoderClaim(createValidSubmissionPayload(fixtures, subId), plaintextToken);
+      const error = new Error('password=' + secret);
+      error.stack = 'fixture-stack api_key=' + secret;
+      const spy = vi.spyOn(fixtures.verificationService, 'executeSealedVerification').mockRejectedValue(error);
+      let observed: unknown;
+      try { await fixtures.adjudicationService.admitSubmissionForVerification({ requestId: crypto.randomUUID(), submissionId: subId }); }
+      catch (failure) { observed = failure; }
+      finally { spy.mockRestore(); }
+      expect(observed instanceof Error).toBe(true);
+      expect(((observed as Error).message + (observed as Error).stack).includes(secret)).toBe(false);
+      const row = db.prepare('SELECT status,failure_code,failure_json FROM coder_submission_adjudications WHERE submission_id=?').get(subId) as {
+        status: string; failure_code: string; failure_json: string;
+      };
+      expect(row.status).toBe('RECOVERY_FENCED');
+      expect(row.failure_code).toBe('ORPHANED_VERIFICATION_CANCELLED');
+      expect(row.failure_json.includes(secret)).toBe(false);
+      expect(JSON.parse(row.failure_json).error).toBe('password=[REDACTED_SECRET]');
+      expect(['DONE', 'REVIEW_READY'].includes(fixtures.repo.getTask(fixtures.taskId)!.state)).toBe(false);
+    });
+
     it.each([0, 1])('sanitizes real child diagnostics before adjudication hash/manifest settlement with exit %s', async exitCode => {
       const { plaintextToken } = issueSubmissionSessionHelper(fixtures.repo, fixtures.authorizationId);
       const subId = crypto.randomUUID();

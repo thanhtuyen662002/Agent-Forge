@@ -157,4 +157,14 @@ describe('real process output and durable observation sanitization', () => {
     expect(code).toBe('OUTPUT_REDACTION_UNSAFE');
     expect(repo.getEvidence('unsafe-evidence')).toBeNull();
   });
+
+  it('rejects an invalid credential-shaped execution identity before spawn without reflecting it into diagnostics', async () => {
+    const result = await ProcessRunner.execute({ executable: process.execPath, args: [script('ordinary')], cwd: root,
+      executionId: 'password=' + secret, repo, projectId: 'runtime-output-project' });
+    expect(result.executionId).toBe('INVALID_ID');
+    expect(result.processStart).toBe('NOT_STARTED_PROVEN');
+    expect(result.processTermination).toBe('NOT_APPLICABLE');
+    expect(JSON.stringify(result).includes(secret)).toBe(false);
+    expect(db.prepare('SELECT COUNT(*) AS count FROM process_runs').get()).toEqual({ count: 0 });
+  });
 });

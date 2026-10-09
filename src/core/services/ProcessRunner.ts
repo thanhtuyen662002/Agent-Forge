@@ -587,13 +587,13 @@ export class ProcessRunner {
         !/^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$/.test(options.executionId)
       ) {
         return {
-          executionId: typeof options.executionId === 'string' ? options.executionId : 'INVALID_ID',
+          executionId: 'INVALID_ID',
           pid: null,
           command: this.scrubSecrets(commandStr),
           cwd: options.cwd,
           exitCode: -1,
           stdout: '',
-          stderr: `INVALID_EXECUTION_ID: Supplied executionId "${options.executionId}" is not a valid canonical UUID.`,
+          stderr: 'INVALID_EXECUTION_ID: Supplied executionId is not a valid canonical UUID.',
           durationMs: 0,
           timedOut: false,
           cancelled: false,
