@@ -3,7 +3,7 @@ import fs from 'fs';
 import path from 'path';
 import Database from 'better-sqlite3';
 import { VerificationCapabilityService } from './VerificationCapabilityService';
-import { captureRepositoryRoot, RepositoryRootError } from './RepositoryRootIdentity';
+import { captureRepositoryRoot, RepositoryRootError, RepositoryRootIdentity } from './RepositoryRootIdentity';
 import { RepositoryRootLease } from './RepositoryRootLease';
 import {
   Repository,
@@ -3597,7 +3597,7 @@ export class CoderSubmissionAdjudicationService {
       throw new CoderSubmissionAdjudicationError('PRECONDITION_FENCED', 'Project repository path missing');
     }
 
-    const prePhaseAFingerprint = await this.captureCanonicalWorkspaceFingerprint(project.repository_path, sub.base_sha);
+    const prePhaseAFingerprint = await this.captureCanonicalWorkspaceFingerprint(project.repository_path, sub.base_sha, this.repo.getProjectRepositoryIdentity(project.id));
     if (prePhaseAFingerprint.head_sha.toLowerCase() !== sub.authorized_head_sha.toLowerCase()) {
       throw new CoderSubmissionAdjudicationError(
         'WORKTREE_DRIFT',
@@ -3820,7 +3820,8 @@ export class CoderSubmissionAdjudicationService {
     try {
       freshPhaseBObservation = await this.captureCanonicalWorkspaceFingerprint(
         project.repository_path,
-        sub.base_sha
+        sub.base_sha,
+        this.repo.getProjectRepositoryIdentity(project.id)
       );
     } catch (obsErr: unknown) {
       this.repo.runInTransaction(() => {
@@ -4110,7 +4111,7 @@ export class CoderSubmissionAdjudicationService {
     let driftReason = '';
 
     try {
-      postObservation = await this.captureCanonicalWorkspaceFingerprint(project.repository_path, sub.base_sha);
+      postObservation = await this.captureCanonicalWorkspaceFingerprint(project.repository_path, sub.base_sha, this.repo.getProjectRepositoryIdentity(project.id));
       postGitStatus = await GitService.getStatus(project.repository_path, this.repo.getProjectRepositoryIdentity(project.id));
       postGitDiff = await GitService.getDiff(project.repository_path, sub.base_sha, this.repo.getProjectRepositoryIdentity(project.id));
 
@@ -6052,9 +6053,10 @@ export class CoderSubmissionAdjudicationService {
    */
   public async captureCanonicalWorkspaceFingerprint(
     repoPath: string,
-    baseSha?: string
+    baseSha?: string,
+    expectedIdentity?: RepositoryRootIdentity,
   ): Promise<CanonicalWorkspaceFingerprint> {
-    const rootLease = RepositoryRootLease.acquire(captureRepositoryRoot(repoPath));
+    const rootLease = RepositoryRootLease.acquire(expectedIdentity ?? captureRepositoryRoot(repoPath));
     try {
     const headRes = await GitService.getHeadSha(repoPath, rootLease.identity);
     if (headRes.status !== 'SUCCESS' || !headRes.sha) {

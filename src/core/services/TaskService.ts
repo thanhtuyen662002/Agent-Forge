@@ -9,6 +9,7 @@ import { VerificationCapabilityService } from './VerificationCapabilityService';
 import { ArtifactStore } from './ArtifactStore';
 import { GitService } from './GitService';
 import { RepositoryRootLease } from './RepositoryRootLease';
+import { RepositoryRootError, RepositoryRootErrorCode } from './RepositoryRootIdentity';
 import { ProgressService } from './ProgressService';
 import { TaskStateMachine, TaskTrigger } from '../state/taskStateMachine';
 import { ManagerProtocol, CoderProtocol } from '../types/protocols';
@@ -33,7 +34,7 @@ export interface ApplyProtocolResult {
   isDuplicate?: boolean;
   message?: string;
   task?: Task;
-  errorCode?: 'PROTOCOL_REPLAY_CONFLICT';
+  errorCode?: 'PROTOCOL_REPLAY_CONFLICT' | RepositoryRootErrorCode;
   error?: string;
 }
 
@@ -432,14 +433,14 @@ export class TaskService {
     // re-reads the task and keeps a base SHA that another winner may already
     // have bound.
     let resolvedBaseSha: string | null = taskForGit.base_sha;
+    let rootLease: RepositoryRootLease | undefined;
+    try {
     if (managerMsg.decision === 'EXECUTE') {
+      const project = this.repo.getProjectForRepositoryUse(taskForGit.project_id);
+      if (!project) return { success: false, error: `Project "${taskForGit.project_id}" not found.` };
+      rootLease = RepositoryRootLease.acquire(this.repo.getProjectRepositoryIdentity(project.id));
       if (!resolvedBaseSha) {
-        const project = this.repo.getProjectForRepositoryUse(taskForGit.project_id);
-        if (!project) {
-          return { success: false, error: `Project "${taskForGit.project_id}" not found.` };
-        }
-
-        const headShaRes = await GitService.getHeadSha(project.repository_path, this.repo.getProjectRepositoryIdentity(project.id));
+        const headShaRes = await GitService.getHeadSha(project.repository_path, rootLease.identity);
         if (headShaRes.status !== 'SUCCESS' || !headShaRes.sha) {
           const reason = `Cannot begin coding: Git repository HEAD SHA could not be authoritatively resolved (${headShaRes.errorMessage || 'git rev-parse HEAD failed'}).`;
           return rejectBeforeGit(reason);
@@ -448,8 +449,8 @@ export class TaskService {
       }
     }
 
-    try {
       return this.repo.runInImmediateTransaction(() => {
+        rootLease?.assertActive();
         // Repeat the full immutable-binding comparison after acquiring the
         // write lock. A concurrent caller may have inserted this ID while the
         // Git lookup above was in flight.
@@ -583,6 +584,7 @@ export class TaskService {
           { decision: managerMsg.decision, fromState: task.state, toState: transitionRes.nextState, baseSha: boundBaseSha },
           task.id
         );
+        rootLease?.assertActive();
         return {
           success: true,
           message: `Task ${task.id} transitioned to ${transitionRes.nextState}.`,
@@ -590,8 +592,9 @@ export class TaskService {
         };
       });
     } catch (err: any) {
+      if (err instanceof RepositoryRootError) return { success: false, errorCode: err.code, error: err.message };
       return { success: false, error: err.message };
-    }
+    } finally { rootLease?.close(); }
   }
 
   public applyCoderReport(

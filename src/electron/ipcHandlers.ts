@@ -951,7 +951,7 @@ export function registerIpcHandlers(
       return { success: false, error: `Task "${parsed.data.taskId}" not found.` };
     }
 
-    const project = repo.getProject(task.project_id);
+    const project = repo.getProjectMetadata(task.project_id);
     const latestManagerRecord = repo.getLatestAppliedManagerProtocolMessage(task.id, task.project_id);
 
     let hasAuthority = false;
@@ -994,9 +994,19 @@ export function registerIpcHandlers(
 
     let gitHeadSha: string | null = null;
     if (project) {
-      const headRes = await GitService.getHeadSha(project.repository_path);
-      if (headRes.status === 'SUCCESS' && headRes.sha) {
-        gitHeadSha = headRes.sha;
+      try {
+        const identity = repo.getProjectRepositoryIdentity(project.id);
+        const headRes = await GitService.getHeadSha(project.repository_path, identity);
+        if (headRes.status === 'SUCCESS' && headRes.sha) {
+          gitHeadSha = headRes.sha;
+        } else if (headRes.errorCode) {
+          decisionValidForCurrentRevision = false;
+          authorityReason = headRes.errorCode;
+        }
+      } catch (error) {
+        if (!(error instanceof RepositoryRootError)) throw error;
+        decisionValidForCurrentRevision = false;
+        authorityReason = error.code;
       }
     }
 

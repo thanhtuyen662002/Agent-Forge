@@ -74,8 +74,8 @@ describe('MCP submission Git-head race boundary', () => {
       'utf8'
     );
     const transactionStart = source.indexOf('runInImmediateTransaction<SubmissionResult>');
-    const firstObservation = source.indexOf('const observedHeadSha = this.observeRepositoryHead(project.repository_path)');
-    const secondObservation = source.indexOf('const finalObservedHeadSha = this.observeRepositoryHead(project.repository_path)');
+    const firstObservation = source.indexOf('const observedHeadSha = this.observeRepositoryHead(');
+    const secondObservation = source.indexOf('const finalObservedHeadSha = this.observeRepositoryHead(');
     const firstInsert = source.indexOf('this.repo.createCoderSubmission(submissionRecord)');
 
     expect(transactionStart).toBeGreaterThanOrEqual(0);

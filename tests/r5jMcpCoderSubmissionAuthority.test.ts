@@ -1102,6 +1102,56 @@ describe('R5J4 Durable Coder Submission Authority Comprehensive Suite', () => {
   // Group 4: Immediate Transaction Semantics, Concurrency, and Idempotency
   // =========================================================================
   describe('Group 4: Immediate Transaction Semantics, Concurrency, and Idempotency', () => {
+    it.runIf(process.platform === 'win32')('holds the selected root at both actual Git invocations and the final submission transaction boundary', () => {
+      const root = path.join(tempDir, 'selected-root'); fs.mkdirSync(root);
+      child_process.execFileSync('git', ['init', '-q', '--template=', '--initial-branch=main'], { cwd: root, stdio: 'ignore' });
+      fs.writeFileSync(path.join(root, 'tracked.txt'), 'selected-owner');
+      child_process.execFileSync('git', ['add', '--', 'tracked.txt'], { cwd: root, stdio: 'ignore' });
+      child_process.execFileSync('git', ['-c', 'user.name=Fixture', '-c', 'user.email=fixture@example.invalid', 'commit', '-q', '-m', 'fixture'], { cwd: root, stdio: 'ignore' });
+      const selected = setupFullSubmissionGraph(db, root);
+      const { plaintextToken } = issueSubmissionSessionHelper(selected.repo, selected.authorizationId);
+      const renamed: boolean[] = [];
+      const attemptReplacement = () => {
+        let moved = false;
+        try { fs.renameSync(path.join(root, '.git'), path.join(root, '.git-changed')); moved = true; } catch {}
+        if (moved) fs.renameSync(path.join(root, '.git-changed'), path.join(root, '.git'));
+        renamed.push(moved);
+      };
+      const execute = child_process.execFileSync;
+      const gitSpy = vi.spyOn(child_process, 'execFileSync').mockImplementation(((...args: Parameters<typeof execute>) => {
+        if ((args[2] as { cwd?: string })?.cwd === root) attemptReplacement();
+        return (execute as Function)(...args);
+      }) as typeof execute);
+      const transaction = selected.repo.runInImmediateTransaction.bind(selected.repo);
+      const commitSpy = vi.spyOn(selected.repo, 'runInImmediateTransaction').mockImplementation(callback => transaction(() => {
+        const result = callback(); attemptReplacement(); return result;
+      }));
+      try {
+        const result = selected.service.submitCoderClaim(createValidSubmissionPayload(selected), plaintextToken);
+        expect(result.accepted).toBe(true);
+        expect(renamed).toEqual([false, false, false]);
+      } finally { gitSpy.mockRestore(); commitSpy.mockRestore(); }
+      fs.renameSync(path.join(root, '.git'), path.join(root, '.git-changed'));
+      fs.renameSync(path.join(root, '.git-changed'), path.join(root, '.git'));
+    });
+
+    it('fences an unbound historical submission before Git or durable admission with a fixed root reason', () => {
+      const { plaintextToken } = issueSubmissionSessionHelper(fixtures.repo, fixtures.authorizationId);
+      db.prepare('DELETE FROM project_repository_identities WHERE project_id=?').run(fixtures.projectId);
+      const payload = createValidSubmissionPayload(fixtures);
+      const before = db.prepare('SELECT total_changes() AS c').get();
+      const gitSpy = vi.spyOn(child_process, 'execFileSync');
+      try {
+        expect(fixtures.service.submitCoderClaim(payload, plaintextToken)).toMatchObject({
+          accepted: false, error_code: 'MCP_AUTHORITY_FENCED', message: 'REPOSITORY_ROOT_UNBOUND', retryable: false,
+        });
+        expect(gitSpy).not.toHaveBeenCalled();
+        expect(db.prepare('SELECT total_changes() AS c').get()).toEqual(before);
+        expect(fixtures.repo.getCoderSubmissionById(String(payload.submission_id))).toBeNull();
+        expect(db.prepare('SELECT COUNT(*) AS count FROM project_repository_identities').get()).toEqual({ count: 0 });
+      } finally { gitSpy.mockRestore(); }
+    });
+
     it('37. Synchronous Transaction: all 3 records inserted in a single atomic transaction', () => {
       const { plaintextToken } = issueSubmissionSessionHelper(fixtures.repo, fixtures.authorizationId);
       const subId = crypto.randomUUID();

@@ -1,6 +1,6 @@
 import { captureRepositoryRoot } from '../src/core/services/RepositoryRootIdentity';
 import { execFileSync as initializeFixtureGit } from 'node:child_process';
-import { describe, it, expect, beforeEach, afterEach } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { testWindowsWorktree } from './helpers/worktreePlatforms';
 import { approveFixtureCommand } from './helpers/verificationCapabilityFixture';
 import Database from 'better-sqlite3';
@@ -567,6 +567,7 @@ describe('R5I5 Successor Resume, Linearization, and Idempotency Authority', () =
   });
 
   afterEach(() => {
+    vi.restoreAllMocks();
     db.close();
     try {
       fs.rmSync(testDir, { recursive: true, force: true });
@@ -576,6 +577,39 @@ describe('R5I5 Successor Resume, Linearization, and Idempotency Authority', () =
   // ==========================================
   // A. ROUTING / ASSIGNMENT BRIDGE (Tests 1-8)
   // ==========================================
+
+  it.runIf(process.platform === 'win32')('retains the selected root through the actual successor root transaction commit', async () => {
+    const prepared = await authService.prepareHandoffSuccessorAuthorization({ transferId: defaultTransfer.id });
+    expect(prepared.success).toBe(true);
+    const transaction = repo.runInImmediateTransaction.bind(repo);
+    const replacements: boolean[] = [];
+    vi.spyOn(repo, 'runInImmediateTransaction').mockImplementation(callback => transaction(() => {
+      const result = callback();
+      let moved = false;
+      try { fs.renameSync(path.join(repoDir, '.git'), path.join(repoDir, '.git-changed')); moved = true; } catch {}
+      if (moved) fs.renameSync(path.join(repoDir, '.git-changed'), path.join(repoDir, '.git'));
+      replacements.push(moved);
+      return result;
+    }));
+    expect(repo.resumeHandoffSuccessorAuthorization({ transferId: defaultTransfer.id,
+      expectedVersion: defaultTransfer.version, candidate: prepared.candidate! })).toMatchObject({ success: true });
+    expect(replacements).toEqual([false]);
+    fs.renameSync(path.join(repoDir, '.git'), path.join(repoDir, '.git-changed'));
+    fs.renameSync(path.join(repoDir, '.git-changed'), path.join(repoDir, '.git'));
+  });
+
+  it('rejects an unbound selected identity before the actual successor root transaction inspects context files', async () => {
+    const prepared = await authService.prepareHandoffSuccessorAuthorization({ transferId: defaultTransfer.id });
+    expect(prepared.success).toBe(true);
+    db.prepare('DELETE FROM project_repository_identities WHERE project_id=?').run(projectId);
+    const before = repo.getHandoffTransfer(defaultTransfer.id);
+    expect(repo.resumeHandoffSuccessorAuthorization({ transferId: defaultTransfer.id,
+      expectedVersion: defaultTransfer.version, candidate: prepared.candidate! }))
+      .toMatchObject({ success: false, errorCode: 'REPOSITORY_ROOT_UNBOUND' });
+    expect(repo.getHandoffTransfer(defaultTransfer.id)).toEqual(before);
+    expect(repo.getExecutionAuthorization(prepared.candidate!.id)).toBeNull();
+    expect(db.prepare('SELECT COUNT(*) AS count FROM project_repository_identities').get()).toEqual({ count: 0 });
+  });
 
   it('1. R5I4 routing event with selectedAssignmentId NULL resumes successfully', async () => {
     const resumeRes = await handoffService.resumeHandoffSuccessor({

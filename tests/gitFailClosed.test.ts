@@ -221,6 +221,29 @@ describe('GitService Fail-Closed Behavior', () => {
     }
   });
 
+  it('rejects a replaced selected fingerprint root before adopting a fresh Git identity', async () => {
+    const selected = createGitFixture();
+    const replacement = createGitFixture();
+    const identity = captureRepositoryRoot(selected.root);
+    const original = selected.root + '-original';
+    try {
+      renameReleasedFixture(selected.root, original);
+      renameReleasedFixture(replacement.root, selected.root);
+      fs.writeFileSync(path.join(selected.root, 'tracked.txt'), 'replacement-owner\n');
+      const execute = vi.spyOn(ProcessRunner, 'execute');
+      const service = new CoderSubmissionAdjudicationService({} as never, {} as never);
+      await expect(service.captureCanonicalWorkspaceFingerprint(selected.root, undefined, identity))
+        .rejects.toMatchObject({ code: 'REPOSITORY_ROOT_IDENTITY_CHANGED' });
+      expect(execute).not.toHaveBeenCalled();
+      expect(fs.readFileSync(path.join(original, 'tracked.txt'), 'utf8')).toBe('after\n');
+      expect(fs.readFileSync(path.join(selected.root, 'tracked.txt'), 'utf8')).toBe('replacement-owner\n');
+    } finally {
+      fs.rmSync(selected.root, { recursive: true, force: true });
+      fs.rmSync(original, { recursive: true, force: true });
+      if (fs.existsSync(replacement.root)) fs.rmSync(replacement.root, { recursive: true, force: true });
+    }
+  });
+
   it('discards a completed branch observation when the root changes before status collection', async () => {
     const fixture = createGitFixture();
     const original = fixture.root + '-original';

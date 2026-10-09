@@ -36,6 +36,11 @@ describe('privileged IPC sender trust boundary', () => {
     getProject: vi.fn((id: string) => ({ id })),
     getProjectMetadata: vi.fn((id: string) => ({ id, repository_path: '' })),
     getProjectRepositoryIdentity: vi.fn(() => { throw new RepositoryRootError('REPOSITORY_ROOT_UNBOUND'); }),
+    getTask: vi.fn(() => ({ id: 'task-1', project_id: 'historical', revision_count: 0 })),
+    getLatestAppliedManagerProtocolMessage: vi.fn(() => null),
+    getAllProviderResources: vi.fn(() => []),
+    getExecutionAuthorizationsByTask: vi.fn(() => []),
+    getLatestRoutingDecisionEventByTask: vi.fn(() => null),
     getProjectMaxRevisions: vi.fn(() => 3),
     setProjectMaxRevisions: vi.fn((_: string, value: number) => value),
     getProviderResource: vi.fn((id: string) => id === 'res-1' ? { id } : null),
@@ -46,6 +51,8 @@ describe('privileged IPC sender trust boundary', () => {
   beforeEach(() => {
     handlers.clear();
     vi.clearAllMocks();
+    repo.getProject.mockReset().mockImplementation((id: string) => ({ id }));
+    repo.getProjectMetadata.mockReset().mockImplementation((id: string) => ({ id, repository_path: '' }));
     RepositorySelectionService.clearTokens();
     registerIpcHandlers(
       repo as any,
@@ -230,6 +237,32 @@ describe('privileged IPC sender trust boundary', () => {
     expect(await handlers.get('git:getStatus')!({ senderFrame: { url: 'http://localhost:5173/' } }, { projectId: 'bound' }))
       .toMatchObject({ status: 'SUCCESS', isClean: true });
     expect(status).toHaveBeenCalledWith(root, identity);
+  });
+
+  it('keeps historical handoff metadata available without adopting its unbound path for Git', async () => {
+    const { root } = repositoryFixture();
+    const project = { id: 'historical', repository_path: root };
+    repo.getProject.mockReturnValueOnce(project);
+    repo.getProjectMetadata.mockReturnValueOnce(project);
+    const head = vi.spyOn(GitService, 'getHeadSha');
+    expect(await handlers.get('routing:getHandoffSnapshot')!({ senderFrame: { url: 'http://localhost:5173/' } }, { taskId: 'task-1' }))
+      .toMatchObject({ success: true, snapshot: { project, gitHeadSha: null,
+        managerAuthority: { decisionValidForCurrentRevision: false, reason: 'REPOSITORY_ROOT_UNBOUND' } } });
+    expect(head).not.toHaveBeenCalled();
+  });
+
+  it('uses the persisted selected identity for the real handoff snapshot HEAD read', async () => {
+    const { root } = repositoryFixture();
+    const identity = captureRepositoryRoot(root);
+    const project = { id: 'historical', repository_path: root };
+    repo.getProject.mockReturnValueOnce(project);
+    repo.getProjectMetadata.mockReturnValueOnce(project);
+    repo.getProjectRepositoryIdentity.mockReturnValueOnce(identity as never);
+    const expectedHead = execFileSync('git', ['rev-parse', 'HEAD'], { cwd: root, encoding: 'utf8', windowsHide: true }).trim();
+    const head = vi.spyOn(GitService, 'getHeadSha');
+    expect(await handlers.get('routing:getHandoffSnapshot')!({ senderFrame: { url: 'http://localhost:5173/' } }, { taskId: 'task-1' }))
+      .toMatchObject({ success: true, snapshot: { project, gitHeadSha: expectedHead } });
+    expect(head).toHaveBeenCalledWith(root, identity);
   });
 
   it('confirms quota mutation only for an existing resource inside the immediate transaction', async () => {
