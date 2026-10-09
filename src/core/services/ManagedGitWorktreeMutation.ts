@@ -155,7 +155,7 @@ export function encodeCheckoutIndex(entries: CheckoutEntry[]): Buffer {
   return Buffer.concat([index, crypto.createHash('sha1').update(index).digest()]);
 }
 
-/** Complete checkout/metadata engine; service integration is a separate gate. */
+/** Captured checkout/metadata engine used by GitWorktreeService. */
 export class ManagedGitWorktreeMutation {
   private checkout: WorktreeMutationBoundary | null = null;
   private metadata: WorktreeMutationBoundary | null = null;

@@ -6,7 +6,7 @@ import { WINDOWS_DIRECTORY_BOOTSTRAP, WINDOWS_DIRECTORY_BOUNDARY } from './workt
 export interface NativeIdentity { volume: string; fileId: string; created: string }
 interface Response { ok: boolean; identity?: NativeIdentity; error?: string; data?: string; root?: string }
 
-/** Windows kernel primitives, awaiting complete Git/ownership integration. */
+/** Captured Windows primitives used by ManagedGitWorktreeMutation. */
 export class WorktreeMutationBoundary {
   private buffer = '';
   private closed = false;

@@ -105,6 +105,29 @@ describe('kernel worktree directory primitives (not complete service acceptance)
     expect(fs.readFileSync(sentinel, 'utf8')).toBe('keep');
   });
 
+  it.runIf(process.platform === 'win32')('returns bounded failure when the real native helper cannot spawn', async () => {
+    const originalSystemRoot = process.env.SystemRoot;
+    const sentinel = path.join(managed, 'sentinel');
+    fs.writeFileSync(sentinel, 'keep');
+    let timer: NodeJS.Timeout | undefined;
+    try {
+      process.env.SystemRoot = path.join(root, 'missing-windows-runtime');
+      const observed = await Promise.race([
+        WorktreeMutationBoundary.acquire(managed).then(
+          async unexpected => { await unexpected.close(); return 'UNEXPECTED_ACQUISITION'; },
+          error => error instanceof Error ? error.message : 'UNKNOWN_FAILURE'),
+        new Promise<string>(resolve => { timer = setTimeout(() => resolve('HELPER_FAILURE_HUNG'), 3000); }),
+      ]);
+      expect(observed).toMatch(/^BOUNDARY_HELPER_(FAILED|EXITED)$/);
+      expect(fs.readdirSync(managed)).toEqual(['sentinel']);
+      expect(fs.readFileSync(sentinel, 'utf8')).toBe('keep');
+    } finally {
+      if (timer) clearTimeout(timer);
+      if (originalSystemRoot === undefined) delete process.env.SystemRoot;
+      else process.env.SystemRoot = originalSystemRoot;
+    }
+  });
+
   describe.skipIf(process.platform !== 'win32')('real Windows handle fences', () => {
     beforeEach(async () => { boundary = await WorktreeMutationBoundary.acquire(managed); });
 
