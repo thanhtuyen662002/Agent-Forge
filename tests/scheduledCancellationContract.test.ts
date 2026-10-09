@@ -1,3 +1,5 @@
+import { captureRepositoryRoot } from '../src/core/services/RepositoryRootIdentity';
+import { execFileSync as initializeFixtureGit } from 'node:child_process';
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { testWindowsWorktree, withoutWindowsWorktreeBoundary } from './helpers/worktreePlatforms';
 import fs from 'fs';
@@ -239,6 +241,7 @@ setInterval(() => {
     managerMessageId = `msg-${crypto.randomUUID()}`;
     authId = `auth-${crypto.randomUUID()}`;
 
+    if (!fs.existsSync(path.join(repoDir, '.git'))) initializeFixtureGit('git', ['init', '-q', '--template=', '--initial-branch=main'], { cwd: repoDir, stdio: 'ignore', windowsHide: true });
     repo.createProject({
       id: projectId,
       name: 'Cancellation Test Project',
@@ -251,7 +254,7 @@ setInterval(() => {
       updated_at: new Date().toISOString(),
       started_at: new Date().toISOString(),
       completed_at: null,
-    });
+    }, captureRepositoryRoot(repoDir));
 
     repo.createTask({
       id: taskId,

@@ -368,7 +368,7 @@ describe('Owner Vietnamese I18n Coverage Contract (PR #11)', () => {
     // 1. Assert ipcHandlers returns structured error codes
     expect(ipcContent).toMatch(/errorCode:\s*(?:gitStatus\.errorCode\s*\?\?\s*)?'NOT_GIT_REPOSITORY'/);
     expect(ipcContent.includes('errorCode: error.code')).toBe(true);
-    expect(ipcContent.includes("errorCode: 'INVALID_REPOSITORY_LOCATION'")).toBe(true);
+    expect(ipcContent).toMatch(/errorCode:\s*(?:policy\.reasonCode\s*\?\?\s*)?'INVALID_REPOSITORY_LOCATION'/);
 
     // 2. Assert hardcoded English dialog title is removed
     expect(ipcContent.includes("title: 'Select Git Repository for Project'")).toBe(false);

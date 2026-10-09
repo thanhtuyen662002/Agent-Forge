@@ -1,3 +1,5 @@
+import { captureRepositoryRoot } from '../src/core/services/RepositoryRootIdentity';
+import { execFileSync as initializeFixtureGit } from 'node:child_process';
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { testWindowsWorktree } from './helpers/worktreePlatforms';
 import Database from 'better-sqlite3';
@@ -191,6 +193,7 @@ describe('R5I6 Crash Recovery, Execution Lifecycle Linearization, and Durable Au
     // 1. Seed Project & Task
     const existingProject = repo.getProject(projectId);
     if (!existingProject) {
+      if (!fs.existsSync(path.join(repoDir, '.git'))) initializeFixtureGit('git', ['init', '-q', '--template=', '--initial-branch=main'], { cwd: repoDir, stdio: 'ignore', windowsHide: true });
       repo.createProject({
         id: projectId,
         name: 'Project 1',
@@ -203,7 +206,7 @@ describe('R5I6 Crash Recovery, Execution Lifecycle Linearization, and Durable Au
         updated_at: nowIso,
         started_at: null,
         completed_at: null,
-      });
+      }, captureRepositoryRoot(repoDir));
     }
 
     repo.createTask({

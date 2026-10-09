@@ -1,3 +1,4 @@
+import { RepositoryRootLease } from '../core/services/RepositoryRootLease';
 import { ipcMain, dialog, app } from 'electron';
 import { Repository } from '../core/database/repositories';
 import { ProjectService } from '../core/services/ProjectService';
@@ -118,7 +119,11 @@ export function registerIpcHandlers(
       if (!isTrustedIpcSender(event, rendererPolicy)) {
         throw new IpcSenderTrustError();
       }
-      return handler(event, payload);
+      try { return await handler(event, payload); }
+      catch (error) {
+        if (!(error instanceof RepositoryRootError)) throw error;
+        return { success: false, errorCode: error.code, error: error.message };
+      }
     });
   };
   const capabilityApprovalsInProgress = new Set<string>();
@@ -694,7 +699,7 @@ export function registerIpcHandlers(
       return { success: false, error: parsed.error.issues.map((i) => i.message).join(', ') };
     }
 
-    const project = repo.getProject(parsed.data.projectId);
+    const project = repo.getProjectForRepositoryUse(parsed.data.projectId);
     if (!project) {
       return { success: false, error: `Project "${parsed.data.projectId}" not found.` };
     }
@@ -702,6 +707,7 @@ export function registerIpcHandlers(
     if (capabilityApprovalsInProgress.has(project.id)) {
       return { success: false, error: 'CAPABILITY_APPROVAL_IN_PROGRESS' };
     }
+    const rootLease = RepositoryRootLease.acquire(repo.getProjectRepositoryIdentity(project.id));
     capabilityApprovalsInProgress.add(project.id);
     const capabilities = new VerificationCapabilityService(repo);
     const approved: VerificationCapabilityReference[] = [];
@@ -742,20 +748,24 @@ export function registerIpcHandlers(
         parsedCommands[type] = { executable: proposal.executable.path, args: [...proposal.args], capability };
       }
       const updatedCommands = repo.runInImmediateTransaction(() => {
-        const current = repo.getProject(project.id);
+        const current = repo.getProjectForRepositoryUse(project.id);
         if (!current || current.repository_path !== project.repository_path ||
             JSON.stringify(repo.getVerificationCommandsByProject(project.id)) !== before) {
           throw new VerificationCapabilityError('CAPABILITY_BINDING_MISMATCH');
         }
-        return repo.setProjectVerificationCommands(project.id, parsedCommands);
+        const commands = repo.setProjectVerificationCommands(project.id, parsedCommands);
+        rootLease.assertActive();
+        return commands;
       });
       return { success: true, commands: updatedCommands };
     } catch (error) {
       for (const reference of approved) {
         try { capabilities.revoke(reference); } catch { /* A replaced/revoked grant is already fenced. */ }
       }
+      if (error instanceof RepositoryRootError) return { success: false, errorCode: error.code, error: error.message };
       return { success: false, error: error instanceof VerificationCapabilityError ? error.code : 'INVALID_VERIFICATION_CAPABILITY' };
     } finally {
+      rootLease.close();
       capabilityApprovalsInProgress.delete(project.id);
     }
   });

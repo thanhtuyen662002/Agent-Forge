@@ -1,3 +1,5 @@
+import { captureRepositoryRoot } from '../../src/core/services/RepositoryRootIdentity';
+import { execFileSync as initializeFixtureGit } from 'node:child_process';
 import { vi } from 'vitest';
 import { approveFixtureCommand } from './verificationCapabilityFixture';
 import Database from 'better-sqlite3';
@@ -190,6 +192,7 @@ export async function setupSyntheticRehearsalEnv(options?: {
     `).run(agentIdReviewer, reviewerResourceId, now);
 
     // 3. Project and Task
+    if (!fs.existsSync(path.join(repoDir, '.git'))) initializeFixtureGit('git', ['init', '-q', '--template=', '--initial-branch=main'], { cwd: repoDir, stdio: 'ignore', windowsHide: true });
     repo.createProject({
       id: projectId,
       name: 'Synthetic Rehearsal Project',
@@ -202,7 +205,7 @@ export async function setupSyntheticRehearsalEnv(options?: {
       updated_at: now,
       started_at: null,
       completed_at: null,
-    });
+    }, captureRepositoryRoot(repoDir));
 
     db.prepare(`
       INSERT INTO tasks (id, project_id, title, state, priority, risk, revision_count, max_revisions, progress_cache_percent, base_sha, ownership_epoch, created_at, updated_at)

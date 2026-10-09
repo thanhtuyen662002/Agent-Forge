@@ -9,6 +9,9 @@ import os from 'os';
 import { execFileSync } from 'child_process';
 import { captureRepositoryRoot } from '../src/core/services/RepositoryRootIdentity';
 import { RepositoryRootLease } from '../src/core/services/RepositoryRootLease';
+import crypto from 'node:crypto';
+import { CoderSubmissionAdjudicationService } from '../src/core/services/CoderSubmissionAdjudicationService';
+import { renameReleasedFixture } from './helpers/renameReleasedFixture';
 
 function runGit(cwd: string, args: string[]): string {
   return execFileSync('git', args, {
@@ -205,7 +208,7 @@ describe('GitService Fail-Closed Behavior', () => {
     const original = fixture.root + '-original';
     const execute = vi.spyOn(ProcessRunner, 'execute');
     try {
-      fs.renameSync(fixture.root, original); fs.mkdirSync(fixture.root);
+      renameReleasedFixture(fixture.root, original); fs.mkdirSync(fixture.root);
       expect(await GitService.getStatus(fixture.root, identity))
         .toMatchObject({ status: 'ERROR', isClean: false, errorCode: 'REPOSITORY_ROOT_IDENTITY_CHANGED' });
       expect(await GitService.getHeadSha(fixture.root, identity))
@@ -222,10 +225,25 @@ describe('GitService Fail-Closed Behavior', () => {
     const fixture = createGitFixture();
     const original = fixture.root + '-original';
     const execute = vi.spyOn(ProcessRunner, 'execute');
+    const originalAcquire = RepositoryRootLease.acquire;
     const originalClose = RepositoryRootLease.prototype.close;
-    vi.spyOn(RepositoryRootLease.prototype, 'close').mockImplementationOnce(function (this: RepositoryRootLease) {
+    const activePins = new Set<RepositoryRootLease>();
+    let replaced = false;
+    vi.spyOn(RepositoryRootLease, 'acquire').mockImplementation(identity => {
+      const lease = originalAcquire.call(RepositoryRootLease, identity);
+      if (identity.canonicalPath === fixture.root) activePins.add(lease);
+      return lease;
+    });
+    vi.spyOn(RepositoryRootLease.prototype, 'close').mockImplementation(function (this: RepositoryRootLease) {
       originalClose.call(this);
-      fs.renameSync(fixture.root, original); fs.mkdirSync(fixture.root);
+      activePins.delete(this);
+      if (this.identity.canonicalPath !== fixture.root || replaced) return;
+      // ProcessRunner also holds the actual invocation lease. Replace only
+      // after every read pin has been released, never while another pin lives.
+      if (activePins.size !== 0) return;
+      renameReleasedFixture(fixture.root, original);
+      replaced = true;
+      fs.mkdirSync(fixture.root);
       fs.writeFileSync(path.join(fixture.root, 'sentinel'), 'replacement-owner');
     });
     try {
@@ -233,6 +251,7 @@ describe('GitService Fail-Closed Behavior', () => {
       expect(result).toMatchObject({ status: 'ERROR', branch: 'UNKNOWN', isClean: false,
         errorCode: 'REPOSITORY_ROOT_IDENTITY_CHANGED', modifiedFiles: [], untrackedFiles: [] });
       expect(execute).toHaveBeenCalledTimes(1);
+      expect(replaced).toBe(true);
       expect(fs.readFileSync(path.join(original, 'tracked.txt'), 'utf8')).toBe('after\n');
       expect(fs.readFileSync(path.join(fixture.root, 'sentinel'), 'utf8')).toBe('replacement-owner');
     } finally {
@@ -241,17 +260,23 @@ describe('GitService Fail-Closed Behavior', () => {
     }
   });
 
-  it('reads only the captured selected working tree when local Git config redirects core.worktree outside it', async () => {
+  it.each(['selected Git', 'adjudication fingerprint'] as const)('%s reads only the captured selected working tree when local Git config redirects core.worktree outside it', async reader => {
     const fixture = createGitFixture();
     const outside = fixture.root + '-outside';
     fs.mkdirSync(outside); fs.writeFileSync(path.join(outside, 'tracked.txt'), 'outside-owner-fixture\n');
     try {
+      const selectedDiffHash = crypto.createHash('sha256').update(runGit(fixture.root, ['diff', '--no-ext-diff', '--no-textconv', 'HEAD']) + '\n').digest('hex');
       runGit(fixture.root, ['config', 'core.worktree', outside]);
       const receipt = captureRepositoryRoot(fixture.root);
-      const diff = await GitService.getDiff(fixture.root, fixture.baseSha, receipt);
-      expect(diff.status).toBe('SUCCESS');
-      expect(diff.diffContent).toContain('+after');
-      expect(diff.diffContent).not.toContain('outside-owner-fixture');
+      if (reader === 'selected Git') {
+        const diff = await GitService.getDiff(fixture.root, fixture.baseSha, receipt);
+        expect(diff.status).toBe('SUCCESS');
+        expect(diff.diffContent).toContain('+after');
+        expect(diff.diffContent).not.toContain('outside-owner-fixture');
+      } else {
+        const fingerprint = await new CoderSubmissionAdjudicationService({} as never, {} as never).captureCanonicalWorkspaceFingerprint(fixture.root, fixture.baseSha);
+        expect(fingerprint.diff_hash).toBe(selectedDiffHash);
+      }
       expect(fs.readFileSync(path.join(outside, 'tracked.txt'), 'utf8')).toBe('outside-owner-fixture\n');
     } finally {
       if (fs.realpathSync.native(outside) !== outside || !path.basename(outside).startsWith('git-revision-boundary-')) throw new Error('FIXTURE_BOUNDARY_CHANGED');
@@ -260,7 +285,10 @@ describe('GitService Fail-Closed Behavior', () => {
     }
   });
 
-  it.each(['external', 'textconv'])('does not execute a repository-controlled %s diff driver while collecting selected-root evidence', async driver => {
+  it.each([
+    { reader: 'selected Git', driver: 'external' }, { reader: 'selected Git', driver: 'textconv' },
+    { reader: 'adjudication fingerprint', driver: 'external' }, { reader: 'adjudication fingerprint', driver: 'textconv' },
+  ])('$reader does not execute a repository-controlled $driver diff driver while collecting selected-root evidence', async ({ reader, driver }) => {
     const fixture = createGitFixture();
     const script = path.join(fixture.root, '.git', 'diff-driver.cjs');
     const marker = path.join(fixture.root, '.git', 'diff-driver-ran');
@@ -273,11 +301,15 @@ describe('GitService Fail-Closed Behavior', () => {
         runGit(fixture.root, ['config', 'diff.fixture.textconv', command]);
         fs.writeFileSync(path.join(fixture.root, '.gitattributes'), '*.txt diff=fixture\n');
       }
-      const result = await GitService.getDiff(fixture.root, fixture.baseSha, captureRepositoryRoot(fixture.root));
+      if (reader === 'adjudication fingerprint') {
+        await new CoderSubmissionAdjudicationService({} as never, {} as never).captureCanonicalWorkspaceFingerprint(fixture.root, fixture.baseSha);
+      } else {
+        const result = await GitService.getDiff(fixture.root, fixture.baseSha, captureRepositoryRoot(fixture.root));
+        expect(result.status).toBe('SUCCESS');
+        expect(result.diffContent).toContain('+after');
+        expect(result.diffContent).not.toContain('forged-driver-fixture');
+      }
       expect(fs.existsSync(marker)).toBe(false);
-      expect(result.status).toBe('SUCCESS');
-      expect(result.diffContent).toContain('+after');
-      expect(result.diffContent).not.toContain('forged-driver-fixture');
     } finally { fs.rmSync(fixture.root, { recursive: true, force: true }); }
   });
 

@@ -1,3 +1,5 @@
+import { captureRepositoryRoot } from '../src/core/services/RepositoryRootIdentity';
+import { execFileSync as initializeFixtureGit } from 'node:child_process';
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import { testWindowsWorktree } from './helpers/worktreePlatforms';
 import { approveFixtureCommand } from './helpers/verificationCapabilityFixture';
@@ -182,6 +184,7 @@ describe('R5I5 Successor Resume, Linearization, and Idempotency Authority', () =
     const nowIso = new Date().toISOString();
 
     // 1. Seed Project & Task
+    if (!fs.existsSync(path.join(repoDir, '.git'))) initializeFixtureGit('git', ['init', '-q', '--template=', '--initial-branch=main'], { cwd: repoDir, stdio: 'ignore', windowsHide: true });
     repo.createProject({
       id: projectId,
       name: 'R5I5 Project',
@@ -194,7 +197,7 @@ describe('R5I5 Successor Resume, Linearization, and Idempotency Authority', () =
       completed_at: null,
       created_at: nowIso,
       updated_at: nowIso,
-    });
+    }, captureRepositoryRoot(repoDir));
 
     repo.createTask({
       id: taskId,

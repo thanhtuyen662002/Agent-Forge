@@ -1,3 +1,5 @@
+import { captureRepositoryRoot } from '../../src/core/services/RepositoryRootIdentity';
+import { execFileSync as initializeFixtureGit } from 'node:child_process';
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import Database from 'better-sqlite3';
 import { approveFixtureCommand } from '../helpers/verificationCapabilityFixture';
@@ -197,6 +199,7 @@ export async function setupFullSubmissionGraph(db: Database.Database, projectRep
   }
 
   // 1. Project
+  if (!fs.existsSync(path.join(resolvedRepoPath, '.git'))) initializeFixtureGit('git', ['init', '-q', '--template=', '--initial-branch=main'], { cwd: resolvedRepoPath, stdio: 'ignore', windowsHide: true });
   repo.createProject({
     id: projectId,
     name: 'Adjudication Test Project',
@@ -209,7 +212,7 @@ export async function setupFullSubmissionGraph(db: Database.Database, projectRep
     updated_at: now,
     started_at: null,
     completed_at: null,
-  });
+  }, captureRepositoryRoot(resolvedRepoPath));
 
   // 2. Task (receptive state: CODING)
   const baseSha = repoHeadSha;

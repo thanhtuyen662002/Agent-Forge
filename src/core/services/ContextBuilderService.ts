@@ -1,5 +1,6 @@
 import crypto from 'crypto';
 import { Repository } from '../database/repositories';
+import { RepositoryRootLease } from './RepositoryRootLease';
 import {
   ContextSnapshot,
   ContextSnapshotPurpose,
@@ -66,6 +67,16 @@ export class ContextBuilderService {
    * generates immutable ContextSnapshot, ordered ContextItems, and a reproducible ContextManifest.
    */
   public buildContextSnapshot(options: BuildContextOptions): BuildContextResult {
+    if (!this.repo.getProjectForRepositoryUse(options.projectId)) {
+      throw new Error(`[ContextBuilderService] Project "${options.projectId}" not found.`);
+    }
+    const lease = RepositoryRootLease.acquire(this.repo.getProjectRepositoryIdentity(options.projectId));
+    try {
+      return this.buildWithRepositoryLease(options, lease);
+    } finally { lease.close(); }
+  }
+
+  private buildWithRepositoryLease(options: BuildContextOptions, lease: RepositoryRootLease): BuildContextResult {
     const {
       projectId,
       taskId,
@@ -87,7 +98,7 @@ export class ContextBuilderService {
     } = options;
 
     // 1. Ownership & Entity Validation (Fail-Closed)
-    const project = this.repo.getProject(projectId);
+    const project = this.repo.getProjectForRepositoryUse(projectId);
     if (!project) {
       throw new Error(`[ContextBuilderService] Project "${projectId}" not found.`);
     }
@@ -470,11 +481,13 @@ export class ContextBuilderService {
 
     // Transactionally persist all entities
     this.repo.runInTransaction(() => {
+      lease.assertActive();
       this.repo.createContextSnapshot(snapshot);
       for (const item of contextItems) {
         this.repo.createContextItem(item);
       }
       this.repo.createContextManifest(manifest);
+      lease.assertActive();
     });
 
     return {

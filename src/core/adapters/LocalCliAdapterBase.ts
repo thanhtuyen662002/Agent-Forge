@@ -1,3 +1,5 @@
+import { captureRepositoryRoot, RepositoryRootError } from '../services/RepositoryRootIdentity';
+import { RepositoryRootLease } from '../services/RepositoryRootLease';
 import fs from 'fs';
 import path from 'path';
 import crypto from 'crypto';
@@ -941,6 +943,7 @@ export abstract class LocalCliAdapterBase implements ProviderAdapter {
   public async execute(request: AgentExecutionRequest): Promise<AgentExecutionResult> {
     const isScheduled = !!(request.runtimeBinding?.executionId ?? request.executionId);
     const executionId = request.runtimeBinding?.executionId ?? request.executionId ?? crypto.randomUUID();
+    const rootLeases: RepositoryRootLease[] = [];
 
     if (isScheduled) {
       if (this.activeExecutions.has(executionId)) {
@@ -1030,7 +1033,7 @@ export abstract class LocalCliAdapterBase implements ProviderAdapter {
         executionRoot = wsPath;
       } else {
         // Legacy path resolution from durable Project database entity
-        const project = this.repo.getProject(request.projectId);
+        const project = this.repo.getProjectForRepositoryUse(request.projectId);
         if (!project) {
           return {
             executionId,
@@ -1075,6 +1078,12 @@ export abstract class LocalCliAdapterBase implements ProviderAdapter {
       }
 
       // 3. Mandatory PolicyService Evaluation Gate for Working Directory Access
+      const selectedRoot = this.repo.getProjectRepositoryIdentity(request.projectId);
+      rootLeases.push(RepositoryRootLease.acquire(selectedRoot));
+      const sameRoot = process.platform === 'win32'
+        ? executionRoot.toLowerCase() === selectedRoot.canonicalPath.toLowerCase()
+        : executionRoot === selectedRoot.canonicalPath;
+      if (!sameRoot) rootLeases.push(RepositoryRootLease.acquire(captureRepositoryRoot(executionRoot)));
       const workingDirPolicy = PolicyService.evaluateRealPathAccess(executionRoot, executionRoot, false);
       if (!workingDirPolicy.allowed) {
         return {
@@ -1203,6 +1212,7 @@ export abstract class LocalCliAdapterBase implements ProviderAdapter {
           stdin: this.useStdin ? prompt : undefined,
           executionId: isScheduled ? executionId : undefined,
         });
+        rootLeases.forEach(lease => lease.assertActive());
 
       // 7. Map cancellation truthfully
       if (processResult.cancelled || processResult.errorCode === 'CANCELLED') {
@@ -1361,7 +1371,11 @@ export abstract class LocalCliAdapterBase implements ProviderAdapter {
           };
         }
       }
+    } catch (error) {
+      if (!(error instanceof RepositoryRootError)) throw error;
+      return { executionId, status: 'FAILED', errorCode: error.code, error: error.message };
     } finally {
+      for (const lease of rootLeases.reverse()) lease.close();
       if (isScheduled) {
         this.activeExecutions.delete(executionId);
       }

@@ -103,7 +103,7 @@ export class ProviderRoutingService {
     }
 
     // 1. Validate Scope: Project, Task, and Attempt ownership
-    const project = this.repo.getProject(request.projectId);
+    const project = this.repo.getProjectForRepositoryUse(request.projectId);
     if (!project) {
       const decision: RoutingDecision = {
         decisionId,
@@ -567,7 +567,7 @@ export class ProviderRoutingService {
     if (!this.eventService) return;
 
     // Respect database foreign keys: only persist event if project exists
-    const project = this.repo.getProject(request.projectId);
+    const project = this.repo.getProjectForRepositoryUse(request.projectId);
     if (!project) return;
 
     const task = this.repo.getTask(request.taskId);

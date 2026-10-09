@@ -87,6 +87,7 @@ export class GitService {
         executable: 'git',
         args: ['-c', 'core.fsmonitor=false', '-c', 'core.untrackedCache=false', ...args],
         cwd: lease.cwd,
+        repositoryIdentity: identity,
         timeoutMs,
         // core.worktree in local config must never select another directory.
         // Linux names the captured descriptor here, not its replaceable path.

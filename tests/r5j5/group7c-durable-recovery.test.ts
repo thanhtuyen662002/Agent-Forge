@@ -1,3 +1,5 @@
+import { captureRepositoryRoot } from '../../src/core/services/RepositoryRootIdentity';
+import { execFileSync as initializeFixtureGit } from 'node:child_process';
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import Database from 'better-sqlite3';
 import path from 'path';
@@ -1243,6 +1245,7 @@ describe('R5J5 Quarantined Submission Adjudication and Verification Suite', () =
       fixtures.mcpService.submitCoderClaim(createValidSubmissionPayload(fixtures, subId), plaintextToken);
 
       const wrongProjId = 'proj-other-' + crypto.randomUUID();
+      if (!fs.existsSync(path.join(fixtures.projectRoot, '.git'))) initializeFixtureGit('git', ['init', '-q', '--template=', '--initial-branch=main'], { cwd: fixtures.projectRoot, stdio: 'ignore', windowsHide: true });
       fixtures.repo.createProject({
         id: wrongProjId,
         name: 'Other Project',
@@ -1255,7 +1258,7 @@ describe('R5J5 Quarantined Submission Adjudication and Verification Suite', () =
         updated_at: new Date().toISOString(),
         started_at: null,
         completed_at: null,
-      });
+      }, captureRepositoryRoot(fixtures.projectRoot));
 
       const trEvId = crypto.randomUUID();
       fixtures.repo.createEvidence({

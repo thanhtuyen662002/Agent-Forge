@@ -5,6 +5,7 @@ import { execFileSync, spawnSync } from 'node:child_process';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { captureRepositoryRoot } from '../src/core/services/RepositoryRootIdentity';
 import { RepositoryRootLease } from '../src/core/services/RepositoryRootLease';
+import { renameReleasedFixture } from './helpers/renameReleasedFixture';
 
 function git(cwd: string, args: string[]): string {
   return execFileSync('git', args, { cwd, encoding: 'utf8', windowsHide: true,
@@ -126,8 +127,8 @@ describe('captured repository read lease', () => {
     const empty = path.join(fixture, 'unprovable-root'); fs.mkdirSync(empty);
     expect(() => RepositoryRootLease.acquire(captureRepositoryRoot(empty))).toThrow('REPOSITORY_ROOT_IDENTITY_UNAVAILABLE');
     fs.renameSync(empty, empty + '-moved');
-    fs.renameSync(fixture, fixture + '-moved');
-    fs.renameSync(fixture + '-moved', fixture);
+    renameReleasedFixture(fixture, fixture + '-moved');
+    renameReleasedFixture(fixture + '-moved', fixture);
     expect(fs.readdirSync(empty + '-moved')).toEqual([]);
   });
 

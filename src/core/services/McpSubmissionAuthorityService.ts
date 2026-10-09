@@ -190,7 +190,7 @@ export class McpSubmissionAuthorityService {
           };
         }
 
-        const preflightProject = this.repo.getProject(preflightAuth.project_id);
+        const preflightProject = this.repo.getProjectForRepositoryUse(preflightAuth.project_id);
         if (!preflightProject || !preflightProject.repository_path) {
           return {
             accepted: false,
@@ -718,7 +718,7 @@ export class McpSubmissionAuthorityService {
     }
 
     // 2. Project must exist and be active (RUNNING)
-    const project = this.repo.getProject(auth.project_id);
+    const project = this.repo.getProjectForRepositoryUse(auth.project_id);
     if (!project || project.status !== 'RUNNING') {
       throw new McpSubmissionAuthorityError('MCP_AUTHORITY_FENCED', 'Project is missing or not active');
     }
@@ -1213,7 +1213,7 @@ export class McpSubmissionAuthorityService {
         };
       }
 
-      const project = this.repo.getProject(auth.project_id);
+      const project = this.repo.getProjectForRepositoryUse(auth.project_id);
       if (!project) {
         return {
           ok: false,

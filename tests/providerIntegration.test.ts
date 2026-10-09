@@ -1,3 +1,5 @@
+import { captureRepositoryRoot } from '../src/core/services/RepositoryRootIdentity';
+import { execFileSync as initializeFixtureGit } from 'node:child_process';
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import Database from 'better-sqlite3';
 import path from 'path';
@@ -85,6 +87,7 @@ describe('PR #5 — Provider Integration Foundation', () => {
     taskService = new TaskService(repo, eventService, verificationService, artifactStore);
 
     // Create a base project and task
+    if (!fs.existsSync(path.join(repoDir, '.git'))) initializeFixtureGit('git', ['init', '-q', '--template=', '--initial-branch=main'], { cwd: repoDir, stdio: 'ignore', windowsHide: true });
     repo.createProject({
       id: 'PROJ-TEST',
       name: 'Provider Test Project',
@@ -97,7 +100,7 @@ describe('PR #5 — Provider Integration Foundation', () => {
       updated_at: new Date().toISOString(),
       started_at: null,
       completed_at: null,
-    });
+    }, captureRepositoryRoot(repoDir));
 
     repo.createTask({
       id: 'TSK-TEST-001',

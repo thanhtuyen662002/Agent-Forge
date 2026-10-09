@@ -5,6 +5,7 @@ import { Repository } from '../database/repositories';
 import { EventService } from './EventService';
 import { PolicyService } from './PolicyService';
 import { GitService } from './GitService';
+import { RepositoryRootLease } from './RepositoryRootLease';
 import { ProtocolParser } from '../protocol/parser';
 import {
   AgentAssignment,
@@ -432,12 +433,14 @@ export class ExecutionAuthorizationService {
     }
 
     // 1. Validate Scope: Project, Task, Attempt
-    const project = this.repo.getProject(params.projectId);
+    const project = this.repo.getProjectMetadata(params.projectId);
     if (!project) {
       this.recordRejectionEvent(params, `Project "${params.projectId}" not found in database.`);
       throw new Error(`EXECUTION_AUTHORIZATION_FAILED: Project "${params.projectId}" not found.`);
     }
 
+    const rootLease = RepositoryRootLease.acquire(this.repo.getProjectRepositoryIdentity(project.id));
+    try {
     const initialStopFence = this.stopFence.getFence(params.projectId);
     if (!initialStopFence) {
       const reason = `EXECUTION_AUTHORIZATION_PROJECT_NOT_FOUND: Project "${params.projectId}" has no durable admission fence.`;
@@ -763,7 +766,7 @@ export class ExecutionAuthorizationService {
     }
     const baseSha = task.base_sha.trim();
 
-    const gitHeadResult = await GitService.getHeadSha(project.repository_path);
+    const gitHeadResult = await GitService.getHeadSha(project.repository_path, rootLease.identity);
     if (gitHeadResult.status !== 'SUCCESS' || !gitHeadResult.sha) {
       const reason = `EXECUTION_AUTHORIZATION_GIT_HEAD_FAILED: Could not resolve current Git HEAD for repository "${project.repository_path}" (${gitHeadResult.errorMessage || 'git error'}).`;
       this.recordRejectionEvent(params, reason);
@@ -872,6 +875,8 @@ export class ExecutionAuthorizationService {
       lifecycle_version: isProductBindingRequested ? 1 : null,
     };
 
+    const admission = this.repo.runInImmediateTransaction(() => {
+    rootLease.assertActive();
     this.repo.createExecutionAuthorization(authorization);
 
     // Bind the authorization to the exact project epoch after asynchronous
@@ -884,14 +889,8 @@ export class ExecutionAuthorizationService {
       authorizationStopEpoch,
       createdAt
     );
-    if (!admission.admitted) {
-      const reason = `EXECUTION_AUTHORIZATION_PROJECT_STOPPED: ${admission.reason ?? 'project admission fence changed while authorizing.'}`;
-      this.recordRejectionEvent(params, reason);
-      throw new Error(`EXECUTION_AUTHORIZATION_FAILED: ${reason}`);
-    }
-
     // 10. Persist Audit Event
-    if (this.eventService) {
+    if (admission.admitted && this.eventService) {
       this.eventService.record(
         params.projectId,
         'EXECUTION_AUTHORIZATION_CREATED',
@@ -928,7 +927,16 @@ export class ExecutionAuthorizationService {
       );
     }
 
+    rootLease.assertActive();
+    return admission;
+    });
+    if (!admission.admitted) {
+      const reason = `EXECUTION_AUTHORIZATION_PROJECT_STOPPED: ${admission.reason ?? 'project admission fence changed while authorizing.'}`;
+      this.recordRejectionEvent(params, reason);
+      throw new Error(`EXECUTION_AUTHORIZATION_FAILED: ${reason}`);
+    }
     return authorization;
+    } finally { rootLease.close(); }
   }
 
   /**
@@ -995,7 +1003,7 @@ export class ExecutionAuthorizationService {
       };
     }
 
-    const project = this.repo.getProject(task.project_id);
+    const project = this.repo.getProjectForRepositoryUse(task.project_id);
     if (!project) {
       return {
         success: false,
@@ -1004,6 +1012,8 @@ export class ExecutionAuthorizationService {
       };
     }
 
+    const rootLease = RepositoryRootLease.acquire(this.repo.getProjectRepositoryIdentity(project.id));
+    try {
     // 3. Task base SHA check
     if (!task.base_sha || task.base_sha.trim() === '') {
       return {
@@ -1269,7 +1279,7 @@ export class ExecutionAuthorizationService {
     }
 
     // 10. Git HEAD resolution
-    const gitHeadResult = await GitService.getHeadSha(project.repository_path);
+    const gitHeadResult = await GitService.getHeadSha(project.repository_path, rootLease.identity);
     if (gitHeadResult.status !== 'SUCCESS' || !gitHeadResult.sha) {
       return {
         success: false,
@@ -1434,6 +1444,7 @@ export class ExecutionAuthorizationService {
 
     const authorizationId = computeHandoffAuthorizationId(authority);
 
+    rootLease.assertActive();
     // 15. Return Candidate
     const candidate: ExecutionAuthorization = {
       id: authorizationId,
@@ -1466,11 +1477,12 @@ export class ExecutionAuthorizationService {
       candidate,
       authority,
     };
+      } finally { rootLease.close(); }
   }
 
   private recordRejectionEvent(params: CreateAuthorizationParams, reason: string): void {
     if (!this.eventService) return;
-    const project = this.repo.getProject(params.projectId);
+    const project = this.repo.getProjectMetadata(params.projectId);
     if (!project) return;
     const task = this.repo.getTask(params.taskId);
     const validTaskId = task && task.project_id === params.projectId ? params.taskId : undefined;

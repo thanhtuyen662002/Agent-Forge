@@ -1,3 +1,5 @@
+import { captureRepositoryRoot } from '../src/core/services/RepositoryRootIdentity';
+import { execFileSync as initializeFixtureGit } from 'node:child_process';
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import fs from 'fs';
 import path from 'path';
@@ -130,6 +132,7 @@ describe('R5H4 Provider Health Routing Safety & Liveness Guard Contract Tests', 
 
   function createBaselineEntities() {
     const now = new Date().toISOString();
+    if (!fs.existsSync(path.join(repoDir, '.git'))) initializeFixtureGit('git', ['init', '-q', '--template=', '--initial-branch=main'], { cwd: repoDir, stdio: 'ignore', windowsHide: true });
     repo.createProject({
       id: projectId,
       name: 'Safety Project',
@@ -142,7 +145,7 @@ describe('R5H4 Provider Health Routing Safety & Liveness Guard Contract Tests', 
       completed_at: null,
       created_at: now,
       updated_at: now,
-    });
+    }, captureRepositoryRoot(repoDir));
 
     repo.createTask({
       id: taskId,

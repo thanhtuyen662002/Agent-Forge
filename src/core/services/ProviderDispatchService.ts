@@ -34,6 +34,8 @@ import { ProviderHealthObservationService } from './ProviderHealthObservationSer
 import { applyProviderHealthObservation } from './ProviderHealthApplication';
 import { ProjectStopFenceService } from './ProjectStopFenceService';
 import { NonHandoffExecutionLifecycle, NonHandoffClaim } from './NonHandoffExecutionLifecycle';
+import { RepositoryRootError } from './RepositoryRootIdentity';
+import { RepositoryRootLease } from './RepositoryRootLease';
 
 export type ScheduledCancellationStatus =
   | 'CANCEL_REQUESTED'
@@ -212,6 +214,7 @@ export class ProviderDispatchService {
 
     let control: ScheduledDispatchControl | undefined;
     let nonHandoffClaim: NonHandoffClaim | undefined;
+    let rootLease: RepositoryRootLease | undefined;
     if (mode === 'SCHEDULED') {
       if (this.activeDispatches.has(authorizationId)) {
         const currentAuth = this.repo.getExecutionAuthorization(authorizationId);
@@ -297,7 +300,7 @@ export class ProviderDispatchService {
     }
 
     // 3. Validate Project, Task, and Attempt Existence & Revision Binding
-    const project = this.repo.getProject(auth.project_id);
+    const project = this.repo.getProjectForRepositoryUse(auth.project_id);
     if (!project) {
       this.repo.invalidateExecutionAuthorization(auth.id);
       this.recordRejectionEvent(auth, `Project "${auth.project_id}" not found.`);
@@ -308,6 +311,7 @@ export class ProviderDispatchService {
       };
     }
 
+    rootLease = RepositoryRootLease.acquire(this.repo.getProjectRepositoryIdentity(project.id));
     const task = this.repo.getTask(auth.task_id);
     if (!task) {
       this.repo.invalidateExecutionAuthorization(auth.id);
@@ -367,7 +371,7 @@ export class ProviderDispatchService {
     }
 
     // 4. Real Git Repository HEAD Authority Check at Dispatch
-    const gitHeadRes = await GitService.getHeadSha(project.repository_path);
+    const gitHeadRes = await GitService.getHeadSha(project.repository_path, rootLease.identity);
     if (gitHeadRes.status !== 'SUCCESS' || !gitHeadRes.sha || gitHeadRes.sha !== auth.repository_head_sha) {
       this.repo.invalidateExecutionAuthorization(auth.id);
       const currentSha = gitHeadRes.sha ?? 'UNKNOWN';
@@ -1077,7 +1081,7 @@ export class ProviderDispatchService {
     }
 
     try {
-      const capabilityProject = this.repo.getProject(auth.project_id);
+      const capabilityProject = this.repo.getProjectForRepositoryUse(auth.project_id);
       if (!capabilityProject) throw new Error('CAPABILITY_PROJECT_MISSING');
       new VerificationCapabilityService(this.repo).validateSnapshot(auth.project_id,
         parsedCanonicalPayload.verificationCommands, capabilityProject.repository_path);
@@ -1179,7 +1183,7 @@ export class ProviderDispatchService {
           }
         }
 
-        const project = this.repo.getProject(task.project_id);
+        const project = this.repo.getProjectForRepositoryUse(task.project_id);
         const sanitizeResult = sanitizeContextFiles(rawFilePaths, project ? project.repository_path : '');
         const currentCanonicalContextFiles = sanitizeResult.validFiles;
         const currentContextManifestHash = computeContextManifestHash(currentCanonicalContextFiles);
@@ -1450,7 +1454,7 @@ export class ProviderDispatchService {
     // Revocation and file changes after asynchronous dispatch admission must
     // prevent the final adapter-start claim as well.
     try {
-      const currentProject = this.repo.getProject(auth.project_id);
+      const currentProject = this.repo.getProjectForRepositoryUse(auth.project_id);
       if (!currentProject) throw new Error('CAPABILITY_PROJECT_MISSING');
       new VerificationCapabilityService(this.repo).validateSnapshot(auth.project_id,
         parsedCanonicalPayload.verificationCommands, currentProject.repository_path);
@@ -1510,6 +1514,7 @@ export class ProviderDispatchService {
     let timedOut = false;
     const deadlineExpired = Symbol('non-handoff deadline');
     try {
+      rootLease.assertActive();
       const invocation = adapter.execute(request);
       if (nonHandoffClaim) {
         const expired = new Promise<typeof deadlineExpired>((resolve) => {
@@ -1518,6 +1523,12 @@ export class ProviderDispatchService {
         const observed = await Promise.race([invocation, expired]);
         if (observed === deadlineExpired) {
           timedOut = true;
+          // A deadline/cancel acknowledgement does not end the invocation.
+          // Transfer pins to the outstanding promise; a hung provider keeps
+          // the selected root fenced until its actual invocation finishes.
+          const outstandingLease = rootLease;
+          rootLease = undefined;
+          void invocation.then(() => outstandingLease.close(), () => outstandingLease.close());
           this.nonHandoffLifecycle.recordUnresolvedTimeout(auth, nonHandoffClaim);
           // Cancellation acknowledgement does not prove termination and must not extend the deadline.
           void Promise.resolve().then(() => adapter.cancel(executionId)).catch(() => {});
@@ -1556,6 +1567,7 @@ export class ProviderDispatchService {
     }
 
     const finalExecutionId = executionId;
+    rootLease?.assertActive();
 
     // Build trusted provenance stamped strictly by ProviderDispatchService
     const provenance: ProviderExecutionProvenanceV1 = {
@@ -1674,7 +1686,11 @@ export class ProviderDispatchService {
     }
 
     return result;
+    } catch (error) {
+      if (!(error instanceof RepositoryRootError)) throw error;
+      return { executionId, status: 'FAILED', errorCode: error.code, error: error.message };
     } finally {
+      rootLease?.close();
       if (mode === 'SCHEDULED') {
         this.activeDispatches.delete(authorizationId);
       }

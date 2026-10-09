@@ -1,3 +1,5 @@
+import { captureRepositoryRoot } from '../src/core/services/RepositoryRootIdentity';
+import { execFileSync as initializeFixtureGit } from 'node:child_process';
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import Database from 'better-sqlite3';
 import path from 'path';
@@ -31,6 +33,7 @@ describe('ProcessRunner Persistence, PID Tracking & Cancellation', () => {
   });
 
   it('should block node -e inline evaluation without spawning child process and preserve direct task/project ownership', async () => {
+    if (!fs.existsSync(path.join(tmpDir, '.git'))) initializeFixtureGit('git', ['init', '-q', '--template=', '--initial-branch=main'], { cwd: tmpDir, stdio: 'ignore', windowsHide: true });
     repo.createProject({
       id: 'PROJ-DENIED',
       name: 'Policy Denied Project',
@@ -43,7 +46,7 @@ describe('ProcessRunner Persistence, PID Tracking & Cancellation', () => {
       updated_at: new Date().toISOString(),
       started_at: null,
       completed_at: null,
-    });
+    }, captureRepositoryRoot(tmpDir));
 
     repo.createTask({
       id: 'TSK-DENIED',
@@ -101,6 +104,7 @@ describe('ProcessRunner Persistence, PID Tracking & Cancellation', () => {
     fs.writeFileSync(scriptPath, 'console.log("Safe script execution output."); process.exit(0);', 'utf8');
 
     // Create a mock project for evidence association
+    if (!fs.existsSync(path.join(tmpDir, '.git'))) initializeFixtureGit('git', ['init', '-q', '--template=', '--initial-branch=main'], { cwd: tmpDir, stdio: 'ignore', windowsHide: true });
     repo.createProject({
       id: 'PROJ-PROC',
       name: 'Process Project',
@@ -113,7 +117,7 @@ describe('ProcessRunner Persistence, PID Tracking & Cancellation', () => {
       updated_at: new Date().toISOString(),
       started_at: null,
       completed_at: null,
-    });
+    }, captureRepositoryRoot(tmpDir));
 
     const res = await ProcessRunner.execute({
       executable: 'node',
@@ -137,6 +141,7 @@ describe('ProcessRunner Persistence, PID Tracking & Cancellation', () => {
   });
 
   it('should associate process runs directly with task_id and remain discoverable even with empty output or policy denials', async () => {
+    if (!fs.existsSync(path.join(tmpDir, '.git'))) initializeFixtureGit('git', ['init', '-q', '--template=', '--initial-branch=main'], { cwd: tmpDir, stdio: 'ignore', windowsHide: true });
     repo.createProject({
       id: 'PROJ-EMPTY',
       name: 'Empty Process Project',
@@ -149,7 +154,7 @@ describe('ProcessRunner Persistence, PID Tracking & Cancellation', () => {
       updated_at: new Date().toISOString(),
       started_at: null,
       completed_at: null,
-    });
+    }, captureRepositoryRoot(tmpDir));
 
     repo.createTask({
       id: 'TSK-EMPTY-PROC',

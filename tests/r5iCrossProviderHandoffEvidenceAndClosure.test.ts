@@ -1,3 +1,5 @@
+import { captureRepositoryRoot } from '../src/core/services/RepositoryRootIdentity';
+import { execFileSync as initializeFixtureGit } from 'node:child_process';
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import { testWindowsWorktree, withoutWindowsWorktreeBoundary } from './helpers/worktreePlatforms';
 import Database from 'better-sqlite3';
@@ -246,6 +248,7 @@ describe('R5I7 Cross-Provider Handoff Evidence and Closure Integration Suite', (
 
     // 5. Initial Fixture: Project & Task
     if (!repo.getProject(pid)) {
+      if (!fs.existsSync(path.join(repoDir, '.git'))) initializeFixtureGit('git', ['init', '-q', '--template=', '--initial-branch=main'], { cwd: repoDir, stdio: 'ignore', windowsHide: true });
       repo.createProject({
         id: pid,
         name: 'Closure Project',
@@ -258,7 +261,7 @@ describe('R5I7 Cross-Provider Handoff Evidence and Closure Integration Suite', (
         completed_at: null,
         created_at: nowIso,
         updated_at: nowIso,
-      });
+      }, captureRepositoryRoot(repoDir));
     }
 
     if (!repo.getTask(tid)) {

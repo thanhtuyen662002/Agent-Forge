@@ -1,3 +1,5 @@
+import { captureRepositoryRoot } from '../src/core/services/RepositoryRootIdentity';
+import { execFileSync as initializeFixtureGit } from 'node:child_process';
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import { testWindowsWorktree } from './helpers/worktreePlatforms';
 import fs from 'fs';
@@ -121,6 +123,7 @@ function createHierarchy(repo: Repository, repoDir: string, baseSha: string, cus
   const authId = customAuthId ?? 'auth-obs-1';
   const routingDecisionId = 'rd-obs-1';
 
+  if (!fs.existsSync(path.join(repoDir, '.git'))) initializeFixtureGit('git', ['init', '-q', '--template=', '--initial-branch=main'], { cwd: repoDir, stdio: 'ignore', windowsHide: true });
   repo.createProject({
     id: projectId,
     name: 'Obs Project',
@@ -133,7 +136,7 @@ function createHierarchy(repo: Repository, repoDir: string, baseSha: string, cus
     completed_at: null,
     created_at: now,
     updated_at: now,
-  });
+  }, captureRepositoryRoot(repoDir));
 
   repo.createTask({
     id: taskId,
@@ -1480,6 +1483,7 @@ describe('R5H4 Durable Provider Health Observation Contract', () => {
   it('47. raw claim fails closed when assignment project_id mismatches authorization project_id', () => {
     const hierarchy = createHierarchy(repo, repoDir, baseSha);
     const now = new Date().toISOString();
+    if (!fs.existsSync(path.join(repoDir, '.git'))) initializeFixtureGit('git', ['init', '-q', '--template=', '--initial-branch=main'], { cwd: repoDir, stdio: 'ignore', windowsHide: true });
     repo.createProject({
       id: 'proj-foreign',
       name: 'Foreign Project',
@@ -1492,7 +1496,7 @@ describe('R5H4 Durable Provider Health Observation Contract', () => {
       completed_at: null,
       created_at: now,
       updated_at: now,
-    });
+    }, captureRepositoryRoot(repoDir));
     repo.createTask({
       id: 'task-proj-foreign',
       project_id: 'proj-foreign',

@@ -1,3 +1,5 @@
+import { captureRepositoryRoot } from '../src/core/services/RepositoryRootIdentity';
+import { execFileSync as initializeFixtureGit } from 'node:child_process';
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import Database from 'better-sqlite3';
 import crypto from 'crypto';
@@ -68,6 +70,7 @@ describe('R5B — Durable Memory & Context Fabric Contract Tests', () => {
     authService = new ExecutionAuthorizationService(repo, eventService);
 
     // Setup base project A
+    if (!fs.existsSync(path.join(repoPath, '.git'))) initializeFixtureGit('git', ['init', '-q', '--template=', '--initial-branch=main'], { cwd: repoPath, stdio: 'ignore', windowsHide: true });
     repo.createProject({
       id: projectIdA,
       name: 'R5B Project A',
@@ -90,9 +93,10 @@ describe('R5B — Durable Memory & Context Fabric Contract Tests', () => {
       updated_at: new Date().toISOString(),
       started_at: null,
       completed_at: null,
-    });
+    }, captureRepositoryRoot(repoPath));
 
     // Setup base project B (for isolation tests)
+    if (!fs.existsSync(path.join(repoPath, '.git'))) initializeFixtureGit('git', ['init', '-q', '--template=', '--initial-branch=main'], { cwd: repoPath, stdio: 'ignore', windowsHide: true });
     repo.createProject({
       id: projectIdB,
       name: 'R5B Project B',
@@ -115,7 +119,7 @@ describe('R5B — Durable Memory & Context Fabric Contract Tests', () => {
       updated_at: new Date().toISOString(),
       started_at: null,
       completed_at: null,
-    });
+    }, captureRepositoryRoot(repoPath));
 
     // Setup base tasks
     repo.createTask({

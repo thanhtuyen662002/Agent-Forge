@@ -1,3 +1,4 @@
+import { captureRepositoryRoot } from '../src/core/services/RepositoryRootIdentity';
 import fs from 'fs';
 import path from 'path';
 import os from 'os';
@@ -313,7 +314,7 @@ function setupTestAuthorityDatabase(dbPath: string): {
     id: projectId,
     name: 'Test Project',
     description: 'Testing',
-    repository_path: 'D:/fake/repo',
+    repository_path: fs.realpathSync.native(path.resolve(__dirname, '..')),
     default_branch: 'main',
     status: 'RUNNING',
     contract: null,
@@ -321,7 +322,7 @@ function setupTestAuthorityDatabase(dbPath: string): {
     updated_at: now,
     started_at: null,
     completed_at: null,
-  });
+  }, captureRepositoryRoot(fs.realpathSync.native(path.resolve(__dirname, '..'))));
 
   const baseSha = 'b'.repeat(40);
   db.prepare(`

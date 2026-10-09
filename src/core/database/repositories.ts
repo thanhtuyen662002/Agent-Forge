@@ -277,6 +277,14 @@ export class Repository {
     return this.projectRepository.getProjectMetadata(id);
   }
 
+  /** Repository authority requires an explicit durable native selection. */
+  public getProjectForRepositoryUse(id: string): Project | null {
+    const project = this.projectRepository.getProjectMetadata(id);
+    if (!project) return null;
+    this.getProjectRepositoryIdentity(id);
+    return project;
+  }
+
   public getAllProjects(): Project[] {
     return this.projectRepository.getAllProjects();
   }

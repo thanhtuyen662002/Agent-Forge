@@ -468,7 +468,7 @@ repo.createProject({
   updated_at: now,
   started_at: null,
   completed_at: null,
-});
+}, captureRepositoryRoot(projectRoot));
 
 db.prepare(`
   INSERT INTO tasks (id, project_id, title, state, priority, risk, revision_count, max_revisions, progress_cache_percent, base_sha, ownership_epoch, created_at, updated_at)

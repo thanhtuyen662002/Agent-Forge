@@ -1,3 +1,5 @@
+import { captureRepositoryRoot } from '../src/core/services/RepositoryRootIdentity';
+import { execFileSync as initializeFixtureGit } from 'node:child_process';
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { testWindowsWorktree, withoutWindowsWorktreeBoundary } from './helpers/worktreePlatforms';
 import fs from 'fs';
@@ -204,6 +206,7 @@ describe('ConcurrentExecutionScheduler (R5G3D1)', () => {
     routingDecisionId = `rout-${crypto.randomUUID()}`;
     managerMessageId = `msg-${crypto.randomUUID()}`;
 
+    if (!fs.existsSync(path.join(repoDir, '.git'))) initializeFixtureGit('git', ['init', '-q', '--template=', '--initial-branch=main'], { cwd: repoDir, stdio: 'ignore', windowsHide: true });
     repo.createProject({
       id: projectId,
       name: 'Test Project',
@@ -216,7 +219,7 @@ describe('ConcurrentExecutionScheduler (R5G3D1)', () => {
       updated_at: new Date().toISOString(),
       started_at: new Date().toISOString(),
       completed_at: null,
-    });
+    }, captureRepositoryRoot(repoDir));
 
     repo.createTask({
       id: taskId,
@@ -1518,7 +1521,10 @@ describe('ConcurrentExecutionScheduler (R5G3D1)', () => {
     const managedEntries = fs.readdirSync(managedDir);
     const dispatch = vi.spyOn(dispatchService, 'dispatchScheduled');
     const remove = vi.spyOn(worktreeService, 'removeWorktree');
-    const result = await withoutWindowsWorktreeBoundary(() => scheduler.execute(authId));
+    const originalCreate = worktreeService.createWorktree.bind(worktreeService);
+    vi.spyOn(worktreeService, 'createWorktree').mockImplementation((...args) =>
+      withoutWindowsWorktreeBoundary(() => originalCreate(...args)));
+    const result = await scheduler.execute(authId);
     expect(result.status).toBe('WORKTREE_CREATE_FAILED');
     expect(result.errorCode).toBe('UNSUPPORTED_MUTATION_BOUNDARY');
     expect(dispatch).not.toHaveBeenCalled(); expect(remove).not.toHaveBeenCalled();

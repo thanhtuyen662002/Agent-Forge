@@ -1,3 +1,5 @@
+import { captureRepositoryRoot } from '../src/core/services/RepositoryRootIdentity';
+import { execFileSync as initializeFixtureGit } from 'node:child_process';
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import Database from 'better-sqlite3';
 import path from 'path';
@@ -152,6 +154,7 @@ describe('PR #6 — Deterministic Quota-Aware Provider Routing & Pre-Dispatch Fa
     const initSha = execSync('git rev-parse HEAD', { cwd: tmpDir }).toString().trim();
 
     // Create base project and task
+    if (!fs.existsSync(path.join(tmpDir, '.git'))) initializeFixtureGit('git', ['init', '-q', '--template=', '--initial-branch=main'], { cwd: tmpDir, stdio: 'ignore', windowsHide: true });
     repo.createProject({
       id: 'PROJ-ROUTING',
       name: 'Routing Test Project',
@@ -164,7 +167,7 @@ describe('PR #6 — Deterministic Quota-Aware Provider Routing & Pre-Dispatch Fa
       updated_at: new Date().toISOString(),
       started_at: null,
       completed_at: null,
-    });
+    }, captureRepositoryRoot(tmpDir));
 
     repo.createTask({
       id: 'TSK-ROUTING-001',
@@ -1271,6 +1274,7 @@ describe('PR #6 — Deterministic Quota-Aware Provider Routing & Pre-Dispatch Fa
     const mock = new MockProviderAdapter('prov-restart', 'Restart Adapter');
     registry1.register(mock);
 
+    if (!fs.existsSync(path.join(tmpDir, '.git'))) initializeFixtureGit('git', ['init', '-q', '--template=', '--initial-branch=main'], { cwd: tmpDir, stdio: 'ignore', windowsHide: true });
     repo1.createProject({
       id: 'PROJ-REST',
       name: 'Restart Project',
@@ -1283,7 +1287,7 @@ describe('PR #6 — Deterministic Quota-Aware Provider Routing & Pre-Dispatch Fa
       updated_at: new Date().toISOString(),
       started_at: null,
       completed_at: null,
-    });
+    }, captureRepositoryRoot(tmpDir));
 
     repo1.createTask({
       id: 'TSK-REST',
@@ -1797,6 +1801,7 @@ describe('PR #6 — Deterministic Quota-Aware Provider Routing & Pre-Dispatch Fa
   // 59. Cross-project task routing request → fail closed
   it('59. Task not belonging to project in routing request fails closed with NO_ELIGIBLE_PROVIDER', async () => {
     // Create second project
+    if (!fs.existsSync(path.join(tmpDir, '.git'))) initializeFixtureGit('git', ['init', '-q', '--template=', '--initial-branch=main'], { cwd: tmpDir, stdio: 'ignore', windowsHide: true });
     repo.createProject({
       id: 'PROJ-SECOND',
       name: 'Second Project',
@@ -1809,7 +1814,7 @@ describe('PR #6 — Deterministic Quota-Aware Provider Routing & Pre-Dispatch Fa
       updated_at: new Date().toISOString(),
       started_at: null,
       completed_at: null,
-    });
+    }, captureRepositoryRoot(tmpDir));
 
     setupResource('res-cpt', 'prov-cpt', { health: 'AVAILABLE' });
 

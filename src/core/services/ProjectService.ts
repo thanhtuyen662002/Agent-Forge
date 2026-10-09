@@ -57,7 +57,7 @@ export class ProjectService {
   }
 
   public importContract(projectId: string, contract: ProjectContract): boolean {
-    const project = this.repo.getProject(projectId);
+    const project = this.repo.getProjectMetadata(projectId);
     if (!project) return false;
 
     this.repo.updateProjectContract(projectId, contract);
@@ -76,7 +76,7 @@ export class ProjectService {
   }
 
   public transitionStatus(projectId: string, trigger: ProjectTrigger): ProjectStatus {
-    const project = this.repo.getProject(projectId);
+    const project = this.repo.getProjectMetadata(projectId);
     if (!project) throw new Error(`Project ${projectId} not found.`);
 
     const nextStatus = ProjectStateMachine.transition(project.status, trigger);
@@ -86,6 +86,7 @@ export class ProjectService {
     // owner-controlled CAS resume operation.
     if (nextStatus === 'RUNNING') {
       this.stopFence.assertProjectRunningAllowed(projectId);
+      this.repo.getProjectRepositoryIdentity(projectId);
     }
     const startedAt = trigger === 'START_PROJECT' ? new Date().toISOString() : undefined;
     const completedAt = trigger === 'FINAL_PASS' ? new Date().toISOString() : undefined;

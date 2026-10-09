@@ -1,3 +1,5 @@
+import { captureRepositoryRoot } from '../src/core/services/RepositoryRootIdentity';
+import { execFileSync as initializeFixtureGit } from 'node:child_process';
 import fs from 'fs';
 import path from 'path';
 import os from 'os';
@@ -147,6 +149,7 @@ function setupFullSubmissionGraph(db: Database.Database, projectRepoPath?: strin
   }
 
   // 1. Project
+  if (!fs.existsSync(path.join(resolvedRepoPath, '.git'))) initializeFixtureGit('git', ['init', '-q', '--template=', '--initial-branch=main'], { cwd: resolvedRepoPath, stdio: 'ignore', windowsHide: true });
   repo.createProject({
     id: projectId,
     name: 'Submission Test Project',
@@ -159,7 +162,7 @@ function setupFullSubmissionGraph(db: Database.Database, projectRepoPath?: strin
     updated_at: now,
     started_at: null,
     completed_at: null,
-  });
+  }, captureRepositoryRoot(resolvedRepoPath));
 
   // 2. Task (receptive state: CODING)
   const baseSha = 'b'.repeat(40);
@@ -1390,6 +1393,7 @@ describe('R5J4 Durable Coder Submission Authority Comprehensive Suite', () => {
 
     it('52. Task must belong to project', () => {
       const { plaintextToken } = issueSubmissionSessionHelper(fixtures.repo, fixtures.authorizationId);
+      if (!fs.existsSync(path.join(fixtures.projectRoot, '.git'))) initializeFixtureGit('git', ['init', '-q', '--template=', '--initial-branch=main'], { cwd: fixtures.projectRoot, stdio: 'ignore', windowsHide: true });
       fixtures.repo.createProject({
         id: 'proj-diff-52',
         name: 'Diff Project',
@@ -1402,7 +1406,7 @@ describe('R5J4 Durable Coder Submission Authority Comprehensive Suite', () => {
         updated_at: new Date().toISOString(),
         started_at: null,
         completed_at: null,
-      });
+      }, captureRepositoryRoot(fixtures.projectRoot));
       db.prepare("UPDATE tasks SET project_id = 'proj-diff-52' WHERE id = ?").run(fixtures.taskId);
 
       const payload = createValidSubmissionPayload(fixtures);

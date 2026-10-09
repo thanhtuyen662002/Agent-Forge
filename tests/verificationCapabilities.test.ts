@@ -1,3 +1,5 @@
+import { captureRepositoryRoot } from '../src/core/services/RepositoryRootIdentity';
+import { execFileSync as initializeFixtureGit } from 'node:child_process';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import fs from 'node:fs';
 import os from 'node:os';
@@ -26,8 +28,9 @@ describe('durable owner verification capabilities', () => {
     MigrationRunner.run(database);
     repo = new Repository(database);
     const now = new Date().toISOString();
+    if (!fs.existsSync(path.join(projectRoot, '.git'))) initializeFixtureGit('git', ['init', '-q', '--template=', '--initial-branch=main'], { cwd: projectRoot, stdio: 'ignore', windowsHide: true });
     repo.createProject({ id: 'P', name: 'Capability fixture', description: null, repository_path: projectRoot,
-      default_branch: 'main', status: 'READY', contract: null, created_at: now, updated_at: now, started_at: null, completed_at: null });
+      default_branch: 'main', status: 'READY', contract: null, created_at: now, updated_at: now, started_at: null, completed_at: null }, captureRepositoryRoot(projectRoot));
     owner = OWNER;
     service = new VerificationCapabilityService(repo, () => owner);
   });
