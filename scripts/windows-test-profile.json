@@ -1,0 +1,18 @@
+{
+  "schemaVersion": 1,
+  "observations": [
+    {
+      "runId": "37965271483",
+      "sourceCommitSha": "587daa184bebbd1f5fe88ca1d80dc227f68c5f41",
+      "sourceTreeSha": "020f020ff39f3ccb4cb318201eeb72992f1b3ce0",
+      "conclusion": "SUCCESS",
+      "shards": [
+        { "shard": 1, "jobId": "113937988932", "durationSeconds": 1243 },
+        { "shard": 2, "jobId": "113937988964", "durationSeconds": 1370 },
+        { "shard": 3, "jobId": "113937989657", "durationSeconds": 1973 },
+        { "shard": 4, "jobId": "113937988779", "durationSeconds": 935 }
+      ]
+    }
+  ],
+  "files": {}
+}
