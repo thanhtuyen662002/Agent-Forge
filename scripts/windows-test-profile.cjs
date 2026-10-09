@@ -39,8 +39,8 @@ function publicId(root, absolute) {
   check(!relative.startsWith('../') && !path.isAbsolute(relative));
   return relative;
 }
-// Keep current dispatch. New/unprofiled files join complete discovery and use
-// the same SHA1 assignment; timing history never filters the executable set.
+// Reconstruct the original partition for historical receipt validation.
+// Current execution uses complete discovery and the measured timing plan.
 function partition(files) {
   const sorted = inventory(files).map(file => ({ file, hash: crypto.createHash('sha1').update('/' + file).digest('hex') }))
     .sort((a, b) => a.hash < b.hash ? -1 : a.hash > b.hash ? 1 : 0);
