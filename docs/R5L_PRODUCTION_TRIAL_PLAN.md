@@ -1,12 +1,20 @@
 # Milestone R5L: Production Trial Specification & Operational Readiness Audit
 
-> **Document Status**: `DRAFT / SPECIFICATION UNDER AUDIT (HOLD)`
+> **Document Scope**: `MERGED R5L0 PLANNING SPECIFICATION / EXECUTION EVIDENCE GATED`
 > **Milestone Family**: `R5L (Phases R5L0 through R5L4)`
-> **Authoritative Baseline Commit**: `0dbf81ad74a7b630c65e232ab85add90a7e0a082`
-> **Baseline Git Tree SHA**: `e6afe8d9bcd84f15638a54e442bd196c89db29b1`
+> **Historical R5L0 Planning Baseline Commit**: `0dbf81ad74a7b630c65e232ab85add90a7e0a082`
+> **Historical Planning Git Tree SHA**: `e6afe8d9bcd84f15638a54e442bd196c89db29b1`
 > **Historical Verification Evidence**: Workflow Run [35180140476](https://github.com/thanhtuyen662002/Agent-Forge/actions/runs/35180140476)
-> **Trial Branch**: `docs/r5l0-production-trial-readiness`
-> **Pull Request**: [#56](https://github.com/thanhtuyen662002/Agent-Forge/pull/56) (Draft)
+> **Historical Planning Branch**: `docs/r5l0-production-trial-readiness`
+> **Planning Pull Request**: [#56](https://github.com/thanhtuyen662002/Agent-Forge/pull/56) (merged; planning approval does not authorize a live trial)
+
+PR #56 merged on 2026-09-18 at `eaa878f78f725aaac8a62b3f3c57ec96b6e23d06`.
+The planning commit/tree and historical CI above identify that earlier audit;
+each trial must record its own approved source and matching verification.
+Current engineering and production acceptance live in
+[GitHub Issues and PRs](WEB_AUTONOMY.md), including
+[the production evidence contract #195](https://github.com/thanhtuyen662002/Agent-Forge/issues/195).
+This specification is not a mutable phase-approval record.
 
 ---
 
@@ -38,7 +46,7 @@ graph LR
         R5L4[R5L4: Closure Audit]
     end
 
-    R5J -->|Authoritative Baseline 0dbf81a| R5L0
+    R5J -->|Historical Planning Baseline 0dbf81a| R5L0
     R5L0 -.->|Requires Manager Decision| R5L1
     R5L1 -.->|Requires Manager Decision| R5L2
     R5L2 -.->|Requires Manager Decision| R5L3
@@ -52,12 +60,57 @@ graph LR
 ### Strict Authority Boundary
 1. **R5L0 Authority Limit**: Milestone R5L0 is strictly restricted to specification authoring, operational planning, and readiness auditing. Merging R5L0 does **not** authorize executing live trials, resolving real credentials, consuming external provider tokens, dispatching external agent subprocesses, or mutating production data.
 2. **Phase Decoupling & Future-Safe Source Identity**: Commit `0dbf81ad74a7b630c65e232ab85add90a7e0a082` serves strictly as the authoritative planning baseline for R5L0. Every subsequent execution phase (R5L1 through R5L4) must explicitly record its own approved phase source commit and Git tree SHA containing the merged R5L0 plan. Any downstream commit drift requires an independent manager audit before execution. Historical workflow run `35180140476` documents R5J closure and is not the CI authority for future phases.
-3. **No Fabricated Capabilities**: Every lifecycle capability, entity, table, state, tool, and error code asserted in this plan is verified against active repository code in `src/core/`, `src/mcp/`, and schema migrations 1–24.
+3. **No Fabricated Capabilities**: Capability claims must be checked against the approved trial source in `src/core/` and `src/mcp/`. The migration registry is `src/core/database/migrations/registry.ts`; it now includes append-only versions 1–26. Versions 1–24 retain their published definitions. Migration 25 adds durable owner verification capabilities, and migration 26 binds selected project repository identities; neither may be replaced by historical-path adoption or inferred approval.
 4. **Classification Taxonomy**: All entities, evidence fields, and trial procedures are classified into four explicit categories:
    - `[IMPLEMENTED AND SOURCE-VERIFIED]`: Active runtime code or database schema.
    - `[OPERATOR-PRODUCED TRIAL ARTIFACT]`: Manifests, logs, or reports compiled by human operators.
    - `[PROPOSED — REQUIRES IMPLEMENTATION]`: Tooling or harnesses needed before specific phases.
    - `[UNRESOLVED READINESS INPUT]`: Operational configurations, accounts, or approvals not yet provisioned.
+
+---
+
+### Integrated tools and operator entrypoints
+
+These tools are committed product code. Their presence does not prove a live
+trial, a provider account, an approval, or a signed production installer.
+Run the CLI from a build of the approved source; file inputs and outputs must
+remain under the explicitly selected `AGENT_FORGE_RUNTIME_ROOT`. See
+[the CLI and evidence guide](AUTONOMY.md) for command arguments and containment.
+
+| Contract | Source authority | Operator use and limit |
+| :--- | :--- | :--- |
+| Canonical manifest | [trialEvidence.ts](../src/core/autonomy/trialEvidence.ts): `ProductionTrialEvidenceManifest`, `buildTrialEvidenceManifest`, `parseAndVerifyTrialEvidenceManifest` | `autonomy:trial-manifest` and `autonomy:verify-trial-manifest` bind canonical bytes and SHA-256. A valid schema/hash does not prove that supplied observations occurred. |
+| Phase preflight | [trialReadiness.ts](../src/core/autonomy/trialReadiness.ts): `TrialReadinessInput`, `evaluateTrialReadiness` | `autonomy:trial-readiness` compares supplied approved/observed source, CI, identities and phase-specific evidence. It is read-only and returns `HOLD` for missing/contradictory input; it does not contact a provider, grant approval or verify an Authenticode certificate itself. |
+| Trial run identity | [trialRegistry.ts](../src/core/autonomy/trialRegistry.ts): `TrialRunRegistry` | `autonomy:trial-run-register`, `autonomy:trial-run-start`, `autonomy:trial-run-complete`, `autonomy:trial-run-list` maintain immutable manifest binding and ordered run transitions in the autonomy SQLite extension. Registration is not trial authorization or backup verification. |
+| Retained logs | [trialLogCollector.ts](../src/core/autonomy/trialLogCollector.ts): `collectRedactedTrialLogs`, `verifyRedactedTrialLogCollectionFile` | `autonomy:trial-log-collect` and `autonomy:trial-log-verify` bound selected files/bytes, enforce contained paths and verify redaction/hashes. The operator selects and retains the real inputs; no upload or credential discovery occurs. |
+| Retention designation | [trialRetention.ts](../src/core/autonomy/trialRetention.ts): `buildTrialRetentionDesignation`, `isTrialRetentionDesignationBound`, `writeTrialRetentionDesignation` | A canonical receipt binds trial/phase/location/class/security identity to the exact manifest SHA. R5L2/R5L4 additionally require the independent designation flag; an approved durable destination must actually exist. |
+| Failure injection | [failureInjection.ts](../src/core/autonomy/failureInjection.ts): `FAILURE_INJECTION_IDS`, `DeterministicFailureInjectionHarness` | FI-01..FI-15 checkpoints are deterministic and side-effect-free by themselves. Connect each to an approved fixture and retain empirical evidence or an explicit waiver; a checkpoint invocation alone is not resilience proof. |
+| Owner verification capability | [migration025.ts](../src/core/database/migrations/migration025.ts), [VerificationCapabilityService.ts](../src/core/services/VerificationCapabilityService.ts): `approve`, `validate`, `createProcessBoundary` | Verification requires a durable owner-approved capability bound to project, command, environment and root. Historical command metadata does not confer execution authority. |
+| Selected repository identity | [migration026.ts](../src/core/database/migrations/migration026.ts), [RepositoryRootIdentity.ts](../src/core/services/RepositoryRootIdentity.ts), [RepositoryRootLease.ts](../src/core/services/RepositoryRootLease.ts) | Repository use requires the selected identity and an active native operation lease. Existing paths are not automatically backfilled as trusted identities. Metadata access and emergency stop do not establish repository execution authority. |
+| Windows installation evidence | [ci.yml](../.github/workflows/ci.yml), [test-installed-update-win.ps1](../scripts/test-installed-update-win.ps1), [smoke-installed-production-win.ps1](../scripts/smoke-installed-production-win.ps1), [verify-demo-rc-win.ps1](../scripts/verify-demo-rc-win.ps1) | CI packages the exact source and exercises packaged/installed/update/RC gates in isolated fixtures. Installer metadata records SHA and observed signing status. An unsigned passing CI artifact does not satisfy production signing; the update fixture does not publish a release or replace the owner's production installation. |
+
+Operator sequence:
+
+1. Record the approved checkout's commit/tree and matching successful CI run,
+   then independently observe a clean source tree and actual package/database
+   artifact hashes. Historical planning CI is not execution evidence.
+2. Build/verify the canonical manifest below using retained, redacted evidence.
+   Keep supporting environment and lifecycle observations in evidence files;
+   extra top-level manifest fields are rejected.
+3. Supply separately observed `TrialReadinessInput`: approved/observed source,
+   matching CI/artifact digests, designated operator/approver IDs, prior phase
+   outcomes and the applicable phase authorization. R5L2/R5L4 require fresh
+   `installerCodeSigned`, `installerSignatureSha256`, `installerSignerThumbprint`
+   and `installerSignedArtifactSha256` observations bound to the manifest
+   installer, plus its exact retention-designation receipt.
+4. Evaluate readiness before execution. `HOLD` stops progression; `READY`
+   means the supplied input passes preflight and does not replace independent
+   approval, provider/backup/signature observations or the actual trial.
+5. Retain the manifest digest, run events, package/backup receipts and all
+   required FI evidence. Never fill unknown facts with passing flags. The
+   [runtime secret-output coverage #131](https://github.com/thanhtuyen662002/Agent-Forge/issues/131)
+   and the production evidence contract remain required until their GitHub
+   acceptance is satisfied. Release publication remains owner controlled.
 
 ---
 
@@ -79,7 +132,7 @@ graph TD
     style R5L4 fill:#1a202c,stroke:#4a5568,color:#cbd5e0
 ```
 
-### 1. Phase R5L0 — Specification and Readiness Audit `[CURRENT PHASE]`
+### 1. Phase R5L0 — Specification and Readiness Audit `[PLANNING SCOPE]`
 - **Entry Criteria**: Milestones R5A–R5J merged to `main`; post-merge CI green; baseline commit `0dbf81ad74a7b630c65e232ab85add90a7e0a082` audited.
 - **Permitted Actions**: Architectural analysis; documentation authoring; schema inspection; operational topology modeling; readiness gap cataloging.
 - **Required Evidence**:
@@ -90,12 +143,12 @@ graph TD
 - **Exit Criteria**: Approved Pull Request merging R5L0 documentation to `main`.
 - **Approval Required**: Project Lead and Security Auditor.
 
-### 2. Phase R5L1 — Rehearsal Using Controlled / Non-Production Fixtures `[UNAUTHORIZED — REQUIRES MANAGER DECISION]`
+### 2. Phase R5L1 — Rehearsal Using Controlled / Non-Production Fixtures `[REQUIRES RECORDED MANAGER DECISION]`
 - **Nature of Actions**:
   - *Automated Product Action*: Execution of implemented lifecycle steps against local synthetic Git repositories and isolated SQLite test databases.
   - *Explicit Human / Operator Action*: Setting up synthetic test fixtures, executing manual bridge steps (if exercised), initiating verification admission, issuing reviewer session tokens, and recording observations.
   - *Audit-Only Observation*: Observing reviewer MCP reads via Stdio; verifying zero database mutation.
-  - *Capability Gaps*: Canonical evidence manifest tooling and deterministic FI checkpoints are implemented locally; operator-produced artifacts and approved fixture execution remain required.
+  - *Evidence Still Required*: Canonical evidence manifest tooling and deterministic FI checkpoints are committed source; operator-produced artifacts and approved fixture execution remain required.
 - **Entry Criteria**: R5L0 merged to `main`; explicit manager decision authorizing R5L1; approved rehearsal source commit and Git tree SHA recorded; synthetic fixtures provisioned without external network or real API credentials.
 - **Permitted Actions**: Rehearsal execution of the 15-step lifecycle using non-production test projects, synthetic commits, and isolated SQLite database instances.
 - **Required Evidence**:
@@ -106,7 +159,7 @@ graph TD
 - **Exit Criteria**: All implemented lifecycle steps complete successfully in rehearsal with valid durable records and zero database corruption.
 - **Approval Required**: Trial Lead and Principal Engineer.
 
-### 3. Phase R5L2 — Controlled Live Multi-Provider Trial `[UNAUTHORIZED — REQUIRES SEPARATE AUTHORIZATION]`
+### 3. Phase R5L2 — Controlled Live Multi-Provider Trial `[REQUIRES SEPARATE LIVE AUTHORIZATION]`
 - **Nature of Actions**:
   - *Automated Product Action*: Live CLI adapter dispatch (e.g., Gemini CLI, Claude CLI); automated verification test suite execution; adjudication settlement.
   - *Explicit Human / Operator Action*: Preflight checklist sign-off; credential profile verification; task creation; manual bridge relay (if used); owner adjudication admission; reviewer MCP client connection.
@@ -123,12 +176,12 @@ graph TD
 - **Exit Criteria**: Successful automated verification, independent reviewer evaluation, and durable settlement.
 - **Approval Required**: Project Lead and Executive Sponsor.
 
-### 4. Phase R5L3 — Failure Injection, Recovery, and Continuity Proof `[UNAUTHORIZED — FIXTURE EVIDENCE REQUIRED]`
+### 4. Phase R5L3 — Failure Injection, Recovery, and Continuity Proof `[INJECTION AUTHORIZATION AND FIXTURE EVIDENCE REQUIRED]`
 - **Nature of Actions**:
   - *Automated Product Action*: Recovery scanner execution (`CoderSubmissionAdjudicationRecoveryScanner`, `CrashRecoveryService`); health observation ordering; cooldown backoff.
   - *Explicit Human / Operator Action*: Injecting supported fault scenarios via public service APIs; inspecting recovery audit events; resolving `NEEDS_HUMAN` fallback states.
   - *Audit-Only Observation*: Verification that invalid inputs fail closed without mutating persistent state.
-  - *Capability Gaps*: Deterministic FI-01..FI-15 checkpoints are available locally; R5L3 remains blocked until every mandatory scenario has fixture evidence or an explicit manager waiver.
+  - *Evidence Still Required*: Deterministic FI-01..FI-15 checkpoints are committed source; R5L3 remains blocked until every mandatory scenario has fixture evidence or an explicit manager waiver.
 - **Entry Criteria**: Phase R5L2 completed successfully; baseline database snapshot archived; safe failure injection plan approved.
 - **Permitted Actions**: Execution of supported, non-destructive failure scenarios.
 - **Required Evidence**:
@@ -142,7 +195,7 @@ graph TD
   Closing Phase R5L3 by testing only whichever scenarios happen to be supported is strictly prohibited. Any unexecuted mandatory scenario without a recorded manager waiver keeps R5L3 in a **`HOLD`** state.
 - **Approval Required**: Security Lead and Trial Lead.
 
-### 5. Phase R5L4 — Closure Audit and Release Decision `[UNAUTHORIZED]`
+### 5. Phase R5L4 — Closure Audit and Release Decision `[CLOSURE AUDIT AND RELEASE DECISION REQUIRED]`
 - **Nature of Actions**:
   - *Automated Product Action*: Execution of Windows packaging and verification gates (`verify-demo-rc-win.ps1`, `smoke-installed-production-win.ps1`).
   - *Explicit Human / Operator Action*: Comprehensive review of all trial evidence manifests, hash verification, packaging receipt audit, and drafting the final release recommendation.
@@ -305,7 +358,7 @@ In accordance with phase rules, every mandatory scenario must have concrete empi
 | Scenario ID | Scenario Name | Injection Fault Description | Target Component | Expected State Machine & System Response | User / Auditor Observable Outcome | Durable Audit Evidence | Safe Recovery Procedure | Harness Status |
 | :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- |
 | **FI-01** | **Account Exhaustion Failover** | Inject rate-limit error into active provider account. | `RoleAwareRoutingService` / `FailoverNextRoutePolicyService` / `ProviderHealthObservationService`. | Account health recorded as `RATE_LIMITED` in `provider_health_observations` with monotonic `account_order`. During pre-dispatch routing evaluation, `RoleAwareRoutingService` excludes rate-limited account and selects next eligible candidate according to route policy. | Coder dispatched to secondary account; task progresses without user intervention. | `provider_health_observations` row with `account_order`; `events` table: `ROLE_AWARE_ROUTING_DECISION` (`outcome: 'SELECTED'`, `appliedExclusions`). | Cooldown backoff expires; health restored to `AVAILABLE`. | `SAFE FOR REHEARSAL ONLY` *(mock provider)* |
-| **FI-02** | **Provider Outage / Execution Failure Handling** | Simulate provider process failure / auth rejection during dispatch. | `ProviderDispatchService` / `RoleAwareRoutingService`. | **Pre-dispatch**: If provider is marked `UNHEALTHY` prior to routing, router selects fallback candidate via `ROLE_AWARE_ROUTING_DECISION`.<br>**Post-dispatch**: `ProviderDispatchService` executes selected provider exactly once (zero automatic retry or failover post-dispatch; `ProviderDispatchService.ts:1342`). Failure returns `status: 'FAILED'`, records `PROVIDER_RUNTIME_EXECUTION_RESULT` with `status: 'FAILED'`, and writes health observation. Task moves to `NEEDS_HUMAN` (or attempt fails).<br>**Mid-dispatch automatic failover**: `BLOCKED — NOT IMPLEMENTED / ARCHITECTURALLY PROHIBITED`. (Event `PROVIDER_FAILOVER_DISPATCHED` does not exist). | Pre-dispatch: routed to alternate provider. Post-dispatch: execution failure acknowledged truthfully; zero unauthorized secondary dispatch without new routing decision. | `events` table: `PROVIDER_RUNTIME_EXECUTION_RESULT` (`status: 'FAILED'`); `provider_health_observations` row; task in `NEEDS_HUMAN` or attempt failed. | Resolve provider outage / credentials; re-route on successor attempt. | `SAFE FOR REHEARSAL ONLY` *(post-dispatch failure handling)*; `BLOCKED — mid-dispatch transparent failover not implemented/supported` |
+| **FI-02** | **Provider Outage / Execution Failure Handling** | Simulate provider process failure / auth rejection during dispatch. | `ProviderDispatchService` / `RoleAwareRoutingService`. | **Pre-dispatch**: If provider is marked `UNHEALTHY` prior to routing, router selects fallback candidate via `ROLE_AWARE_ROUTING_DECISION`.<br>**Post-dispatch**: `ProviderDispatchService` executes selected provider exactly once (zero automatic retry or failover post-dispatch; `ProviderDispatchService.dispatch()`). Failure returns `status: 'FAILED'`, records `PROVIDER_RUNTIME_EXECUTION_RESULT` with `status: 'FAILED'`, and writes health observation. Task moves to `NEEDS_HUMAN` (or attempt fails).<br>**Mid-dispatch automatic failover**: `BLOCKED — NOT IMPLEMENTED / ARCHITECTURALLY PROHIBITED`. (Event `PROVIDER_FAILOVER_DISPATCHED` does not exist). | Pre-dispatch: routed to alternate provider. Post-dispatch: execution failure acknowledged truthfully; zero unauthorized secondary dispatch without new routing decision. | `events` table: `PROVIDER_RUNTIME_EXECUTION_RESULT` (`status: 'FAILED'`); `provider_health_observations` row; task in `NEEDS_HUMAN` or attempt failed. | Resolve provider outage / credentials; re-route on successor attempt. | `SAFE FOR REHEARSAL ONLY` *(post-dispatch failure handling)*; `BLOCKED — mid-dispatch transparent failover not implemented/supported` |
 | **FI-03** | **Separation Policy Violation** | Attempt to issue reviewer session where `reviewer_agent_id === coderAttempt.agent_id`. | `ReviewerAuthorityService.issueReviewerSession`. | Synchronous validation fails closed. Session issuance rejected. | Error returned: `[SELF_REVIEW_FORBIDDEN] Reviewer agent cannot be coder agent`. | Zero session rows written in `mcp_reviewer_sessions`. | Assign distinct reviewer profile; re-request session issuance. | `SAFE FOR REHEARSAL & LIVE` |
 | **FI-04** | **Malformed Coder Claim Arguments** | Submit claim with argument size > 64 KiB or malformed schema. | `McpSubmissionAuthorityService.submitCoderClaim`. | Argument cap or schema validation rejects submission. | MCP tool returns `CLAIM_ARGUMENTS_TOO_LARGE` or `SCHEMA_VALIDATION_FAILED`. | Zero submission rows written in `coder_submissions`. | Re-submit compliant claim within 64 KiB cap. | `SAFE FOR REHEARSAL & LIVE` |
 | **FI-05** | **Agent Process Termination** | Coder process killed via OS signals during execution. | Active coder execution in `ProcessRunner`. | Non-zero exit code or process termination recorded in `process_runs`. Adapter catches termination and returns `status: 'FAILED'`. Task transitions via `TaskStateMachine` to `NEEDS_HUMAN` (or `CODING` if attempts remain). Slot lease release requires explicit lease management invocation. | User notified of agent exit; task transitions to fail-closed state (`NEEDS_HUMAN`). | `process_runs.exit_code != 0`, `process_runs.status == 'FAILED'`. | Slot lease released via `WorkerSlotLeaseService.release(leaseId, leaseToken)`; fresh attempt allocated if attempts remain. | `SAFE FOR REHEARSAL ONLY` |
@@ -330,13 +383,18 @@ At the conclusion of a trial phase, all durable evidence is compiled by the tria
 
 Every field in the evidence bundle MUST be mapped to its authoritative producer:
 
+The table includes supporting observation names from SQLite and operator logs.
+The canonical manifest uses the exact fields shown in section G.2; supporting
+observations belong in retained evidence files referenced by `evidence` and
+their IDs/hashes in `lifecycleIds`/`contextHashes`, not extra top-level keys.
+
 | Field Group | Field Name | Producer / Authority | Source Classification |
 | :--- | :--- | :--- | :--- |
-| **Trial Metadata** | `trial_id`, `schema_version`, `phase` | Assigned by Trial Operator | `OPERATOR-PRODUCED TRIAL ARTIFACT` |
+| **Trial Metadata** | `trialId`, `schemaVersion`, `phase`, `createdAt` | Operator trial identity/phase; version 1 enforced by manifest code | `OPERATOR-PRODUCED TRIAL ARTIFACT` |
 | **Environment** | `os_version`, `node_version`, `git_version`, `application_version` | Captured from host environment by operator | `OPERATOR-PRODUCED TRIAL ARTIFACT` |
-| **Provenance** | `source_commit`, `git_tree_sha` | `git rev-parse HEAD`, `git write-tree` | `IMPLEMENTED AND SOURCE-VERIFIED` |
-| **Provenance** | `ci_run_id` | GitHub Actions workflow execution ID on trial commit | `IMPLEMENTED AND SOURCE-VERIFIED` |
-| **Provenance** | `installer_sha256`, `installed_app_asar_sha256` | SHA-256 computed on generated packaging artifacts | `OPERATOR-PRODUCED TRIAL ARTIFACT` |
+| **Provenance** | `source.commitSha`, `source.treeSha` | `git rev-parse HEAD`, `git rev-parse 'HEAD^{tree}'`; approved checkout must be clean | `IMPLEMENTED AND SOURCE-VERIFIED` |
+| **Provenance** | `source.ciRunId` | GitHub Actions workflow execution ID on trial commit | `IMPLEMENTED AND SOURCE-VERIFIED` |
+| **Provenance** | `artifacts.installerSha256`, `artifacts.appSha256`, `artifacts.databaseProjectionSha256` | SHA-256 computed on exact retained installer/application/database artifacts | `OPERATOR-PRODUCED TRIAL ARTIFACT` |
 | **Lifecycle IDs** | `project_id`, `task_id`, `task_ownership_epoch` | `tasks` table columns in SQLite | `IMPLEMENTED AND SOURCE-VERIFIED` |
 | **Lifecycle IDs** | `coder_assignment_id`, `reviewer_assignment_id` | `agent_assignments` table columns in SQLite | `IMPLEMENTED AND SOURCE-VERIFIED` |
 | **Lifecycle IDs** | `coder_submission_id` | `coder_submissions.id` in SQLite | `IMPLEMENTED AND SOURCE-VERIFIED` |
@@ -349,55 +407,41 @@ Every field in the evidence bundle MUST be mapped to its authoritative producer:
 | **Hashes** | `verification_result_envelope_hash` | `coder_submission_adjudications.verification_result_envelope_hash` | `IMPLEMENTED AND SOURCE-VERIFIED` |
 | **Hashes** | `reviewer_frozen_projection_hash` | `mcp_reviewer_sessions.projection_hash` in SQLite | `IMPLEMENTED AND SOURCE-VERIFIED` |
 | **Terminal Outcome**| `adjudication_status`, `disposition_event`, `disposition_reason` | `coder_submission_dispositions` table in SQLite | `IMPLEMENTED AND SOURCE-VERIFIED` |
-| **Sign-off** | `trial_lead`, `security_lead`, `manifest_sha256` | Operator signatures and SHA-256 hash of manifest JSON | `OPERATOR-PRODUCED TRIAL ARTIFACT` |
+| **Sign-off** | `approvals.operatorIds`, `approvals.approverIds`; manifest result `sha256` | Designated identities and independently retained approvals; hash computed over canonical manifest bytes outside the manifest itself | `OPERATOR-PRODUCED TRIAL ARTIFACT` |
 
-### 2. Example Evidence Manifest `[PROPOSED — NON-NORMATIVE TRIAL ARTIFACT]`
+### 2. Canonical Manifest Shape `[SYNTHETIC EXAMPLE — DOES NOT AUTHORIZE EXECUTION]`
+
+The actual interface is `ProductionTrialEvidenceManifest` in
+`src/core/autonomy/trialEvidence.ts`. `autonomy:verify-trial-manifest` accepts
+this shape; `autonomy:trial-manifest` generates `schemaVersion` and can generate
+`createdAt`. The example has invented source identifiers, no evidence,
+approvals or artifact receipts, and outcome `HOLD`. It demonstrates parser
+shape only and cannot satisfy readiness. Capture real observations separately;
+do not copy these values into an execution authorization or live receipt.
+
 ```json
 {
-  "trial_id": "trial-20260917-r5l-live-01",
-  "schema_version": 1,
-  "phase": "R5L2",
-  "environment": {
-    "os_version": "Microsoft Windows 11 Pro 10.0.22631",
-    "node_version": "v22.14.0",
-    "git_version": "git version 2.47.1.windows.1",
-    "application_version": "0.1.0"
+  "schemaVersion": 1,
+  "trialId": "example-rehearsal",
+  "phase": "R5L1",
+  "createdAt": "2026-01-01T00:00:00.000Z",
+  "source": {
+    "commitSha": "1111111111111111111111111111111111111111",
+    "treeSha": "2222222222222222222222222222222222222222",
+    "ciRunId": "example-no-run"
   },
-  "provenance": {
-    "source_commit": "304be9641bdf95f74e8953e2db4ba92164e8c1a6",
-    "git_tree_sha": "git_tree_sha_placeholder",
-    "ci_run_id": "35206493999",
-    "installer_sha256": "placeholder_sha256_hash",
-    "installed_app_asar_sha256": "placeholder_sha256_hash"
+  "artifacts": {
+    "installerSha256": null,
+    "appSha256": null,
+    "databaseProjectionSha256": null
   },
-  "lifecycle_identifiers": {
-    "project_id": "proj-uuid",
-    "task_id": "task-uuid",
-    "task_ownership_epoch": 1,
-    "coder_assignment_id": "asgn-coder-uuid",
-    "coder_submission_id": "sub-uuid",
-    "adjudication_id": "adj-uuid",
-    "workspace_lease_id": "lease-uuid",
-    "reviewer_session_id": "rev-session-uuid"
-  },
-  "cryptographic_hashes": {
-    "context_manifest_hash": "a1b2c3...",
-    "coder_claim_content_hash": "d4e5f6...",
-    "verification_artifact_manifest_hash": "7a8b9c...",
-    "verification_result_envelope_hash": "1d2e3f...",
-    "reviewer_frozen_projection_hash": "4a5b6c..."
-  },
-  "terminal_outcome": {
-    "adjudication_status": "VERIFIED",
-    "disposition_event": "SETTLED",
-    "disposition_reason": "ACCEPTED_VERIFIED",
-    "task_state": "REVIEW_READY"
-  },
-  "sign_off": {
-    "trial_lead": "Vo Thanh Tuyen",
-    "security_lead": "Lead Auditor",
-    "manifest_sha256": "placeholder_manifest_sha256"
-  }
+  "lifecycleIds": [],
+  "contextHashes": {},
+  "outcome": "HOLD",
+  "evidence": [],
+  "approvals": { "operatorIds": [], "approverIds": [] },
+  "retention": { "location": "trial-evidence/example", "retentionClass": "example-only" },
+  "notes": "Example only; no phase authorization or production evidence."
 }
 ```
 
@@ -410,7 +454,7 @@ Execution of any trial phase MUST immediately halt upon encountering any of the 
 1. **Security / Credential Containment Breach**: Any plaintext secret emitted to logs, console, or database.
 2. **Separation Policy Failure**: Any occurrence where `reviewer_agent_id === coder_agent_id` or `reviewer_account_id === coder_account_id`.
 3. **Workspace Corruption / Escape**: Primary Git repository dirty state detected during or after coder execution.
-4. **Adjudication Hash Discrepancy**: Reviewer MCP `projection_hash` mismatching the stored adjudication envelope hash.
+4. **Adjudication Hash Discrepancy**: Frozen reviewer projection bytes do not match the session `projection_hash`, or its embedded verification envelope differs from the durable adjudication envelope/hash. The projection and envelope are different canonical objects; their hashes are not required to equal one another.
 5. **Database Mutation During Reviewer Read**: `SELECT total_changes()` changing during an authenticated review read.
 6. **Concurrent Lease Collision**: Attempt to acquire more than one active lease per worker slot or worktree.
 7. **Monotonic Sequence Violation**: Out-of-order health observation sequence or backwards `task_ownership_epoch`.
@@ -540,8 +584,7 @@ If a coder or verification process hangs or must be aborted:
 
 ## L. Open Readiness Gaps
 
-The current source now provides the first local implementation slice for the
-previously proposed recovery/evidence work: startup process-run reconciliation
+Committed source provides the recovery/evidence tools: startup process-run reconciliation
 keeps unresolved rows fenced; ordered provider-health observations replay
 idempotently; canonical trial manifests bind source/package/projection hashes;
 the deterministic FI-01..FI-15 checkpoint harness is available for fixtures;
@@ -571,16 +614,16 @@ The following operational and technical gaps are formally tracked. They represen
 | Gap ID | Readiness Gap Description | Blocking Phase | Required Resolution | Authority Owner | Source Classification |
 | :--- | :--- | :--- | :--- | :--- | :--- |
 | **GAP-01** | **Absence of Reviewer Verdict Ingestion (Intentional Boundary)** | Post-R5L / Milestone Future | In R5J7, Reviewer MCP server (`stdio-review`) is strictly read-only. There is no API or schema for ingesting reviewer verdicts back into task state. The trial treats reviewer output as an external observational audit. | Architect | `UNRESOLVED READINESS INPUT` |
-| **GAP-02** | **Automated Evidence Bundle Collector** | Phase R5L1 & R5L2 *(Optional Enhancement)* | A strict CLI manifest builder/verifier now binds trial metadata, source/package/projection hashes, lifecycle IDs, redacted evidence entries, approvals, and retention location. A real trial still requires operator-produced artifacts and exact SQLite/package hashes. | Trial Lead | `IMPLEMENTED LOCALLY — LIVE EVIDENCE REQUIRED` |
-| **GAP-03** | **Deterministic Failure-Injection Harness** | Phase R5L3 | A side-effect-free deterministic FI-01..FI-15 checkpoint harness now exists. Each scenario still requires an approved fixture, empirical evidence, or an explicit manager waiver; the harness alone does not close R5L3. | Test Lead | `IMPLEMENTED LOCALLY — FIXTURE EVIDENCE REQUIRED` |
-| **GAP-04** | **Phase-Specific Exact-Head & Installer Binding Mechanism** | Phase R5L1 & R5L2 | The trial manifest now records exact source commit/tree SHA, CI run, installer hash, application hash, and projection hash; readiness also requires the observed CI run ID to match the manifest. The phase protocol and release approval must still be adopted for each actual trial. | Release Eng | `IMPLEMENTED LOCALLY — PROTOCOL APPROVAL REQUIRED` |
-| **GAP-05** | **Trial Identity & Run Tracking Model** | Phase R5L1 & R5L2 | `TrialRunRegistry` now stores an immutable `(trialId, runId)` binding to the canonical manifest SHA, source commit/tree, phase, and database projection hash in the autonomy extension schema, with ordered fail-closed lifecycle events. It does not change the product migration ledger. A live trial still must bind and retain the exact SQLite backup/projection artifact and operator manifest. | Architect | `IMPLEMENTED LOCALLY — LIVE DATABASE BINDING REQUIRED` |
-| **GAP-06** | **Redacted Log Collector** | Phase R5L2 | `autonomy:trial-log-collect` extracts explicitly selected runtime files, rejects traversal/symlink paths, applies bounded secret redaction, writes an atomic canonical collection, and `autonomy:trial-log-verify` verifies its hashes and schema. Live trial operators must still select the approved inputs and retain the resulting artifact. | Security Lead | `IMPLEMENTED LOCALLY — LIVE EVIDENCE REQUIRED` |
-| **GAP-07** | **Trial Evidence Retention Location** | Phase R5L2 | `src/core/autonomy/trialRetention.ts` now defines a strict canonical retention-designation receipt. The receipt binds trial/phase/location/class to the exact manifest SHA, is atomically retained beneath the runtime root, and R5L2/R5L4 readiness requires the receipt plus an independent designation flag. A security lead must still designate an approved secure durable location for a live trial. | Security Lead | `IMPLEMENTED LOCALLY — SECURITY DESIGNATION REQUIRED` |
+| **GAP-02** | **Automated Evidence Bundle Collector** | Phase R5L1 & R5L2 *(Optional Enhancement)* | A strict CLI manifest builder/verifier now binds trial metadata, source/package/projection hashes, lifecycle IDs, redacted evidence entries, approvals, and retention location. A real trial still requires operator-produced artifacts and exact SQLite/package hashes. | Trial Lead | `IMPLEMENTED IN SOURCE — LIVE EVIDENCE REQUIRED` |
+| **GAP-03** | **Deterministic Failure-Injection Harness** | Phase R5L3 | A side-effect-free deterministic FI-01..FI-15 checkpoint harness now exists. Each scenario still requires an approved fixture, empirical evidence, or an explicit manager waiver; the harness alone does not close R5L3. | Test Lead | `IMPLEMENTED IN SOURCE — FIXTURE EVIDENCE REQUIRED` |
+| **GAP-04** | **Phase-Specific Exact-Head & Installer Binding Mechanism** | Phase R5L1 & R5L2 | The trial manifest now records exact source commit/tree SHA, CI run, installer hash, application hash, and projection hash; readiness also requires the observed CI run ID to match the manifest. The phase protocol and release approval must still be adopted for each actual trial. | Release Eng | `IMPLEMENTED IN SOURCE — PROTOCOL APPROVAL REQUIRED` |
+| **GAP-05** | **Trial Identity & Run Tracking Model** | Phase R5L1 & R5L2 | `TrialRunRegistry` now stores an immutable `(trialId, runId)` binding to the canonical manifest SHA, source commit/tree, phase, and database projection hash in the autonomy extension schema, with ordered fail-closed lifecycle events. It does not change the product migration ledger. A live trial still must bind and retain the exact SQLite backup/projection artifact and operator manifest. | Architect | `IMPLEMENTED IN SOURCE — LIVE DATABASE BINDING REQUIRED` |
+| **GAP-06** | **Redacted Log Collector** | Phase R5L2 | `autonomy:trial-log-collect` extracts explicitly selected runtime files, rejects traversal/symlink paths, applies bounded secret redaction, writes an atomic canonical collection, and `autonomy:trial-log-verify` verifies its hashes and schema. Live trial operators must still select the approved inputs and retain the resulting artifact. | Security Lead | `IMPLEMENTED IN SOURCE — LIVE EVIDENCE REQUIRED` |
+| **GAP-07** | **Trial Evidence Retention Location** | Phase R5L2 | `src/core/autonomy/trialRetention.ts` now defines a strict canonical retention-designation receipt. The receipt binds trial/phase/location/class to the exact manifest SHA, is atomically retained beneath the runtime root, and R5L2/R5L4 readiness requires the receipt plus an independent designation flag. A security lead must still designate an approved secure durable location for a live trial. | Security Lead | `IMPLEMENTED IN SOURCE — SECURITY DESIGNATION REQUIRED` |
 | **GAP-08** | **Live Provider Accounts & Credentials** | Phase R5L2 | Provisioning and configuration of at least two distinct, funded provider accounts on the trial host machine. Required for R5L2 live trial only; synthetic fixtures used for R5L1. | Trial Operator | `UNRESOLVED READINESS INPUT` |
 | **GAP-09** | **Designated Operator & Approval Identities** | Phase R5L1 & R5L2 | Named human operators and auditors must be assigned responsibility for trial monitoring, manual bridge steps, and sign-offs. | Management | `UNRESOLVED READINESS INPUT` |
-| **GAP-10** | **Authoritative External PR Claim Observation** | Phase R5L1 & R5L2 | A pure fail-closed evaluator now binds repository/PR identity, Draft status, branch, exact head SHA, and durable claim owner before persistence. The Supervisor still requires an authenticated `gh` observation to produce live evidence; missing remote metadata keeps the watch fenced. | Supervisor / Release Eng | `IMPLEMENTED LOCALLY — REMOTE EVIDENCE REQUIRED` |
-| **GAP-11** | **Installer Signature Attestation** | Phase R5L2 & R5L4 | Readiness now requires signed status, a signature digest, signer certificate thumbprint, and an exact binding to the manifest installer digest. A release operator must still obtain the Authenticode observation and protected approval on the target Windows host; unsigned MVP artifacts remain ineligible for production readiness. | Release Eng / Security Lead | `IMPLEMENTED LOCALLY — LIVE CERTIFICATE EVIDENCE REQUIRED` |
+| **GAP-10** | **Authoritative External PR Claim Observation** | Phase R5L1 & R5L2 | A pure fail-closed evaluator now binds repository/PR identity, Draft status, branch, exact head SHA, and durable claim owner before persistence. The Supervisor still requires an authenticated `gh` observation to produce live evidence; missing remote metadata keeps the watch fenced. | Supervisor / Release Eng | `IMPLEMENTED IN SOURCE — REMOTE EVIDENCE REQUIRED` |
+| **GAP-11** | **Installer Signature Attestation** | Phase R5L2 & R5L4 | Readiness now requires signed status, a signature digest, signer certificate thumbprint, and an exact binding to the manifest installer digest. A release operator must still obtain the Authenticode observation and protected approval on the target Windows host; unsigned MVP artifacts remain ineligible for production readiness. | Release Eng / Security Lead | `IMPLEMENTED IN SOURCE — LIVE CERTIFICATE EVIDENCE REQUIRED` |
 
 ---
 
@@ -600,18 +643,18 @@ The following traceability matrix maps each core trial requirement to its defini
 
 | Requirement / Invariant Area | Defining Source Symbol | Empirical Test / Durable Evidence | Architectural Scope & Known Limitations |
 | :--- | :--- | :--- | :--- |
-| **Reviewer Read-Only Surface** | `buildAgentForgeReviewerMcpServer()` (`src/mcp/reviewerServer.ts`), `ReviewerAuthorityService.authenticateAndFetchProjection()` (`src/mcp/reviewerAuthority.ts:280`) | `tests/r5j7McpReviewerProtocol.test.ts` (test 23: `SELECT total_changes()` unchanged before and after read); tool `agentforge_get_review_package`; resource `agentforge://reviews/packages/{adjudication_id}` | Reviewer server is strictly read-only. In R5J7, no API or schema exists for ingesting reviewer verdicts back into task state; verdict is an external observational audit. |
-| **Reviewer Token Expiry Zero-Write** | `ReviewerAuthorityService.authenticateAndFetchProjection()` (`src/mcp/reviewerAuthority.ts:251`) | `tests/r5j7McpReviewerProtocol.test.ts` (test 14: expired token read rejected with `TOKEN_EXPIRED`, zero DB writes confirmed via `total_changes`) | Revocation records `revoked_at` in `mcp_reviewer_sessions`; passive expiration produces strictly zero database mutations. |
-| **Quarantined Coder Submission** | `McpSubmissionAuthorityService.submitCoderClaim()` (`src/core/services/McpSubmissionAuthorityService.ts:167`), Migration 22 (`trg_coder_submissions_immutable_update`) | `tests/r5jMcpCoderSubmissionAuthority.test.ts`; `SELECT quarantine_status FROM coder_submissions` equals `QUARANTINED` | Unadmitted coder submissions cannot mutate task settlement state; submission remains quarantined until human owner admission. |
-| **Verification Admission & Task Transition** | `CoderSubmissionAdjudicationService.admitSubmissionForVerification()` (`src/core/services/CoderSubmissionAdjudicationService.ts:1800`) | `tests/r5j5QuarantinedSubmissionAdjudication.test.ts` (task moves `CODING` $\rightarrow$ `VALIDATING`, adjudication moves `ADMITTED` $\rightarrow$ `VERIFYING`) | `CODING` $\rightarrow$ `VALIDATING` task transition is exclusively triggered by `admitSubmissionForVerification()`; coder dispatch cannot trigger it. |
-| **Deterministic Settlement & Single Disposition** | `buildCanonicalTerminalDisposition()` (`src/core/services/CoderSubmissionAdjudicationService.ts:565`), `deriveDeterministicDispositionId()` | `tests/r5j5QuarantinedSubmissionAdjudication.test.ts`; `coder_submission_dispositions` row with deterministic ID, sequence 3 | Exactly one terminal disposition per adjudication (`SETTLED` or `REJECTED`). Test failures transition task to `CODING` (if revisions remain) or `NEEDS_HUMAN`. |
-| **Recovery Scanner Branch Fidelity** | `CoderSubmissionAdjudicationRecoveryScanner.scanAndReconcile()` (`src/core/services/CoderSubmissionAdjudicationRecoveryScanner.ts:51–1419`) | `tests/r5j5QuarantinedSubmissionAdjudication.test.ts` (test 97: `ADMITTED` $\rightarrow$ `KEPT_ADMITTED`; test 98: `VERIFYING` interrupted $\rightarrow$ `RECOVERY_FENCED`, `ORPHANED_VERIFICATION_INTERRUPTED`, task `NEEDS_HUMAN`; test 99: `ALREADY_RECONCILED`) | Scanner never automatically re-executes tests or re-launches processes; interrupted in-flight verification requires human review. Restart does NOT default to `REVIEW_READY`. |
-| **Process Termination vs Task/Lease Lifecycle** | `ProcessRunner.cancel()` (`src/core/services/ProcessRunner.ts:1033`), `TaskService.applyManagerDecision()` (`src/core/services/TaskService.ts:95–260`), `WorkerSlotLeaseService.release(leaseId, leaseToken)` (`src/core/services/WorkerSlotLeaseService.ts:451–511`), `CoderSubmissionAdjudicationService.acknowledgeRecoveryFenced()` (`src/core/services/CoderSubmissionAdjudicationService.ts:5003–5130`) | `tests/processRunner.test.ts` (returns typed `ProcessTerminationTruth`: `PROCESS_TREE_TERMINATED_PROVEN`, `TERMINATION_UNRESOLVED`, `NOT_APPLICABLE`); `tests/taskStateMachine.test.ts` (`CANCEL` from valid states); `tests/workerSlotLeaseService.test.ts` (token-gated release); `tests/r5j5QuarantinedSubmissionAdjudication.test.ts` (`acknowledgeRecoveryFenced`) | Complete decoupling: `ProcessRunner.cancel()` only terminates OS process tree; `TaskService.applyManagerDecision()` requires manager authority, idempotency, and supported trigger (`CANCEL` valid from `CREATED`, `PLANNED`, `APPROVED`, `QUEUED`, `DISPATCHED`, `CODING`, `VALIDATING`, `BLOCKED`, `NEEDS_HUMAN`); `WorkerSlotLeaseService.release()` enforces `leaseToken` match and slot/assignment binding invariants. No single API cross-coordinates these concerns. Operator safety rule prohibits lease release/worktree cleanup if `TERMINATION_UNRESOLVED`. |
-| **Emergency Stop Confirmation Gate** | `EmergencyStopService.triggerEmergencyStop()` (`src/core/services/EmergencyStopService.ts:22–93`), `ProcessRunner.terminateAllProcesses()` | `tests/emergencyStop.test.ts`; `EMERGENCY_STOP` event payload (`allTerminatedProven`, `unprovenProcesses`) | Project/task `PAUSED` state is an orchestration state, NOT proof of process termination. Truthful confirmation gate requires `allTerminatedProven === true` and `unprovenProcesses === 0`. |
-| **Role Separation Enforcement** | `RoleAwareRoutingService.route()` (`src/core/services/RoleAwareRoutingService.ts`), `ReviewerAuthorityService.issueReviewerSession()` (`src/mcp/reviewerAuthority.ts:166`, `SELF_REVIEW_FORBIDDEN`) | `tests/r5j7McpReviewerProtocol.test.ts` (test 13); `tests/roleAwareRouting.test.ts` | Enforced synchronously at session issuance and routing; static policy configuration must be present in database. |
-| **Pre-Dispatch Routing vs Post-Dispatch Failover** | `RoleAwareRoutingService.route()` (`src/core/services/RoleAwareRoutingService.ts:1174`), `ProviderDispatchService.dispatch()` (`src/core/services/ProviderDispatchService.ts:1342`) | `tests/providerRouting.test.ts` (test 14, 15: pre-dispatch routing bypasses unhealthy accounts; test 28, 29, 30: zero post-dispatch failover); event `ROLE_AWARE_ROUTING_DECISION` | Pre-dispatch routing selects fallback candidates when accounts are rate-limited. Post-dispatch `ProviderDispatchService` executes selected provider exactly once (zero automatic failover/retry). Event `PROVIDER_FAILOVER_DISPATCHED` does not exist. |
-| **Active Workspace Lease Concurrency Index** | Migration 23 (`src/core/database/migrations.ts:1986–1988`) | `idx_coder_submission_workspace_leases_active` ON `coder_submission_workspace_leases(worktree_identity_hash) WHERE state IN ('ACQUIRED', 'VERIFYING')` | Strictly bounds active adjudication leases per worktree. Distinct from worker slot lease index (`idx_active_slot_lease` on `account_leases(worker_slot_id) WHERE released_at IS NULL`, Migration 8:661). |
-| **Context Continuity, Provenance & Successor Snapshot Binding** | `HandoffTransferService.prepareHandoffSuccessor()` (`src/core/services/HandoffTransferService.ts:1029–1310`), `ContextBuilderService.buildContextSnapshot()` (`src/core/services/ContextBuilderService.ts:430–485`), Migration 18 (`018_r5i_successor_context_authority`) | `tests/r5iSuccessorPreparationContextRebinding.test.ts` (tests 1–14: binding `transfer.successor_context_snapshot_id`, schema authority, and retry idempotency); `tests/r5iSuccessorResumeAndIdempotency.test.ts`; `tests/r5iCrossProviderSuccessorRouting.test.ts` | Snapshot and manifest hashes before and after handoff are **inherently non-identical** because `ContextBuilderService` explicitly embeds `attempt_id` (which advances on handoff) and `purpose = 'HANDOFF'` into the canonical `manifestDescriptor` before computing `manifest_hash`. Invariant guarantees: (1) deterministic creation and binding of successor snapshot to successor attempt (`successor_context_snapshot_id`), (2) canonical SHA-256 item and manifest integrity, (3) preservation of task memory items, and (4) idempotent return of identical snapshot/manifest on handoff transfer retry without state corruption. |
+| **Reviewer Read-Only Surface** | `buildAgentForgeReviewerMcpServer()` (`src/mcp/reviewerServer.ts`), `ReviewerAuthorityService.authenticateAndGetReviewPackage()` (`src/mcp/reviewerAuthority.ts`) | `tests/r5j7McpReviewerProtocol.test.ts` (`SELECT total_changes()` unchanged before and after read); tool `agentforge_get_review_package`; resource `agentforge://reviews/packages/{adjudication_id}` | Reviewer server is strictly read-only. In R5J7, no API or schema exists for ingesting reviewer verdicts back into task state; verdict is an external observational audit. |
+| **Reviewer Token Expiry Zero-Write** | `ReviewerAuthorityService.authenticateAndGetReviewPackage()` (`src/mcp/reviewerAuthority.ts`) | `tests/r5j7McpReviewerProtocol.test.ts` (expired token read rejected with `TOKEN_EXPIRED`, zero DB writes confirmed via `total_changes`) | Revocation records `revoked_at` in `mcp_reviewer_sessions`; passive expiration produces strictly zero database mutations. |
+| **Quarantined Coder Submission** | `McpSubmissionAuthorityService.submitCoderClaim()` (`src/core/services/McpSubmissionAuthorityService.ts`), Migration 22 (`trg_coder_submissions_immutable_update`) | `tests/r5jMcpCoderSubmissionAuthority.test.ts`; `SELECT quarantine_status FROM coder_submissions` equals `QUARANTINED` | Unadmitted coder submissions cannot mutate task settlement state; submission remains quarantined until human owner admission. |
+| **Verification Admission & Task Transition** | `CoderSubmissionAdjudicationService.admitSubmissionForVerification()` (`src/core/services/CoderSubmissionAdjudicationService.ts`) | `tests/r5j5/group4-admission-authority.test.ts` (task moves `CODING` $\rightarrow$ `VALIDATING`, adjudication moves `ADMITTED` $\rightarrow$ `VERIFYING`) | `CODING` $\rightarrow$ `VALIDATING` task transition is exclusively triggered by `admitSubmissionForVerification()`; coder dispatch cannot trigger it. |
+| **Deterministic Settlement & Single Disposition** | `buildCanonicalTerminalDisposition()` (`src/core/services/CoderSubmissionAdjudicationService.ts`), `deriveDeterministicDispositionId()` | `tests/r5j5/group5-linearization-execution.test.ts`; `coder_submission_dispositions` row with deterministic ID, sequence 3 | Exactly one terminal disposition per adjudication (`SETTLED` or `REJECTED`). Test failures transition task to `CODING` (if revisions remain) or `NEEDS_HUMAN`. |
+| **Recovery Scanner Branch Fidelity** | `CoderSubmissionAdjudicationRecoveryScanner.scanAndReconcile()` (`src/core/services/CoderSubmissionAdjudicationRecoveryScanner.ts`) | `tests/r5j5/group6-settlement-recovery.test.ts` (recovery branch: `ADMITTED` $\rightarrow$ `KEPT_ADMITTED`; interruption branch: `VERIFYING` interrupted $\rightarrow$ `RECOVERY_FENCED`, `ORPHANED_VERIFICATION_INTERRUPTED`, task `NEEDS_HUMAN`; replay branch: `ALREADY_RECONCILED`) | Scanner never automatically re-executes tests or re-launches processes; interrupted in-flight verification requires human review. Restart does NOT default to `REVIEW_READY`. |
+| **Process Termination vs Task/Lease Lifecycle** | `ProcessRunner.cancel()` (`src/core/services/ProcessRunner.ts`), `TaskService.applyManagerDecision()` (`src/core/services/TaskService.ts`), `WorkerSlotLeaseService.release(leaseId, leaseToken)` (`src/core/services/WorkerSlotLeaseService.ts`), `CoderSubmissionAdjudicationService.acknowledgeRecoveryFenced()` (`src/core/services/CoderSubmissionAdjudicationService.ts`) | `tests/processRunnerPersistence.test.ts`, `tests/processRunnerRecovery.test.ts`, `tests/r5j5/group7d-workspace-artifacts.test.ts` (exercise typed `ProcessTerminationTruth`: `PROCESS_TREE_TERMINATED_PROVEN`, `TERMINATION_UNRESOLVED`, `NOT_APPLICABLE`); `tests/stateMachine.test.ts` (`CANCEL` from valid states); `tests/workerSlotLeaseService.test.ts` (token-gated release); `tests/r5j5/group6-settlement-recovery.test.ts` (`acknowledgeRecoveryFenced`) | Complete decoupling: `ProcessRunner.cancel()` only terminates OS process tree; `TaskService.applyManagerDecision()` requires manager authority, idempotency, and supported trigger (`CANCEL` valid from `CREATED`, `PLANNED`, `APPROVED`, `QUEUED`, `DISPATCHED`, `CODING`, `VALIDATING`, `BLOCKED`, `NEEDS_HUMAN`); `WorkerSlotLeaseService.release()` enforces `leaseToken` match and slot/assignment binding invariants. No single API cross-coordinates these concerns. Operator safety rule prohibits lease release/worktree cleanup if `TERMINATION_UNRESOLVED`. |
+| **Emergency Stop Confirmation Gate** | `EmergencyStopService.triggerEmergencyStop()` (`src/core/services/EmergencyStopService.ts`), `ProcessRunner.terminateAllProcesses()` | `tests/emergencyStop.test.ts`; `EMERGENCY_STOP` event payload (`allTerminatedProven`, `unprovenProcesses`) | Project/task `PAUSED` state is an orchestration state, NOT proof of process termination. Truthful confirmation gate requires `allTerminatedProven === true` and `unprovenProcesses === 0`. |
+| **Role Separation Enforcement** | `RoleAwareRoutingService.route()` (`src/core/services/RoleAwareRoutingService.ts`), `ReviewerAuthorityService.issueReviewerSession()` (`src/mcp/reviewerAuthority.ts`, `SELF_REVIEW_FORBIDDEN`) | `tests/r5j7McpReviewerProtocol.test.ts`; `tests/roleAwareRouting.test.ts` | Enforced synchronously at session issuance and routing; static policy configuration must be present in database. |
+| **Pre-Dispatch Routing vs Post-Dispatch Failover** | `RoleAwareRoutingService.route()` (`src/core/services/RoleAwareRoutingService.ts`), `ProviderDispatchService.dispatch()` (`src/core/services/ProviderDispatchService.ts`) | `tests/providerRouting.test.ts` (pre-dispatch routing bypasses unhealthy accounts; zero post-dispatch failover); event `ROLE_AWARE_ROUTING_DECISION` | Pre-dispatch routing selects fallback candidates when accounts are rate-limited. Post-dispatch `ProviderDispatchService` executes selected provider exactly once (zero automatic failover/retry). Event `PROVIDER_FAILOVER_DISPATCHED` does not exist. |
+| **Active Workspace Lease Concurrency Index** | Migration 23 (`src/core/database/migrations/migration023.ts`) | `idx_coder_submission_workspace_leases_active` ON `coder_submission_workspace_leases(worktree_identity_hash) WHERE state IN ('ACQUIRED', 'VERIFYING')` | Strictly bounds active adjudication leases per worktree. Distinct from worker slot lease index (`idx_active_slot_lease` on `account_leases(worker_slot_id) WHERE released_at IS NULL`, Migration 8; src/core/database/migrations/migration008.ts). |
+| **Context Continuity, Provenance & Successor Snapshot Binding** | `HandoffTransferService.prepareHandoffSuccessor()` (`src/core/services/HandoffTransferService.ts`), `ContextBuilderService.buildContextSnapshot()` (`src/core/services/ContextBuilderService.ts`), Migration 18 (`018_r5i_successor_context_authority`) | `tests/r5iSuccessorPreparationContextRebinding.test.ts` (binding `transfer.successor_context_snapshot_id`, schema authority, and retry idempotency); `tests/r5iSuccessorResumeAndIdempotency.test.ts`; `tests/r5iCrossProviderSuccessorRouting.test.ts` | Snapshot and manifest hashes before and after handoff are **inherently non-identical** because `ContextBuilderService` explicitly embeds `attempt_id` (which advances on handoff) and `purpose = 'HANDOFF'` into the canonical `manifestDescriptor` before computing `manifest_hash`. Invariant guarantees: (1) deterministic creation and binding of successor snapshot to successor attempt (`successor_context_snapshot_id`), (2) canonical SHA-256 item and manifest integrity, (3) preservation of task memory items, and (4) idempotent return of identical snapshot/manifest on handoff transfer retry without state corruption. |
 
 ### 3. Repository Entity Cross-Reference
 
@@ -619,34 +662,34 @@ This appendix maps every capability, service, table, state, tool, and error code
 
 | Asserted Plan Entity | Entity Type | Authoritative Source File | Authoritative Symbol / Table / Definition |
 | :--- | :--- | :--- | :--- |
-| **Task States** (`CREATED`, `PLANNED`, `APPROVED`, `QUEUED`, `DISPATCHED`, `CODING`, `VALIDATING`, `REVIEW_READY`, `REVIEWING`, `PAUSED`, `FIX_REQUIRED`, `HANDOFF_REQUIRED`, `WAITING_FOR_CAPACITY`, `WAITING_FOR_AUTHORITY`, `BLOCKED`, `NEEDS_HUMAN`, `DONE`, `FAILED`, `CANCELLED`) | Domain Enum | `src/core/types/domain.ts` | `TaskStateEnum` (lines 23–43) |
+| **Task States** (`CREATED`, `PLANNED`, `APPROVED`, `QUEUED`, `DISPATCHED`, `CODING`, `VALIDATING`, `REVIEW_READY`, `REVIEWING`, `PAUSED`, `FIX_REQUIRED`, `HANDOFF_REQUIRED`, `WAITING_FOR_CAPACITY`, `WAITING_FOR_AUTHORITY`, `BLOCKED`, `NEEDS_HUMAN`, `DONE`, `FAILED`, `CANCELLED`) | Domain Enum | `src/core/types/domain.ts` | `TaskStateEnum` |
 | **Task State Machine** | Service / State Logic | `src/core/state/taskStateMachine.ts` | `class TaskStateMachine`, `TaskTrigger` |
-| **Projects Table** | SQLite Schema | `src/core/database/migrations.ts` | `CREATE TABLE IF NOT EXISTS projects` (Migration 1) |
-| **Tasks Table** | SQLite Schema | `src/core/database/migrations.ts` | `CREATE TABLE IF NOT EXISTS tasks` (Migration 1) |
-| **Role Profiles Table** | SQLite Schema | `src/core/database/migrations.ts` | `CREATE TABLE IF NOT EXISTS role_profiles` (Migration 8) |
-| **Agent Profiles Table** | SQLite Schema | `src/core/database/migrations.ts` | `CREATE TABLE IF NOT EXISTS agent_profiles` (Migration 8) |
-| **Provider Accounts Table** | SQLite Schema | `src/core/database/migrations.ts` | `CREATE TABLE IF NOT EXISTS provider_accounts` (Migration 8) |
-| **Worker Slots Table** | SQLite Schema | `src/core/database/migrations.ts` | `CREATE TABLE IF NOT EXISTS worker_slots` (Migration 8) |
-| **Agent Assignments Table** | SQLite Schema | `src/core/database/migrations.ts` | `CREATE TABLE IF NOT EXISTS agent_assignments` (Migration 8) |
-| **Account Leases Table** | SQLite Schema | `src/core/database/migrations.ts` | `CREATE TABLE IF NOT EXISTS account_leases` (Migration 8) |
-| **Active Slot Lease Unique Index** | SQLite Index | `src/core/database/migrations.ts` | `idx_active_slot_lease` ON `account_leases(worker_slot_id) WHERE released_at IS NULL` (Migration 8) |
-| **Separation Policies Table** | SQLite Schema | `src/core/database/migrations.ts` | `CREATE TABLE IF NOT EXISTS separation_policies` (Migration 8) |
-| **Route Policies Table** | SQLite Schema | `src/core/database/migrations.ts` | `CREATE TABLE IF NOT EXISTS route_policies` (Migration 8) |
-| **Execution Authorizations Table** | SQLite Schema | `src/core/database/migrations.ts` | `CREATE TABLE IF NOT EXISTS execution_authorizations` (Migration 6) |
-| **Coder Submissions Table** | SQLite Schema | `src/core/database/migrations.ts` | `CREATE TABLE coder_submissions` (Migration 22) |
-| **Coder Submission Dispositions Table** | SQLite Schema | `src/core/database/migrations.ts` | `CREATE TABLE coder_submission_dispositions` (Migration 22) |
-| **Coder Submission Adjudications Table** | SQLite Schema | `src/core/database/migrations.ts` | `CREATE TABLE coder_submission_adjudications` (Migration 23) |
-| **Workspace Leases Table** | SQLite Schema | `src/core/database/migrations.ts` | `CREATE TABLE coder_submission_workspace_leases` (Migration 23) |
-| **Active Workspace Lease Unique Index** | SQLite Index | `src/core/database/migrations.ts` | `idx_coder_submission_workspace_leases_active` ON `coder_submission_workspace_leases(worktree_identity_hash) WHERE state IN ('ACQUIRED', 'VERIFYING')` (Migration 23) |
-| **Adjudication Events Table** | SQLite Schema | `src/core/database/migrations.ts` | `CREATE TABLE coder_submission_adjudication_events` (Migration 23) |
-| **Adjudication Statuses** (`ADMITTED`, `VERIFYING`, `VERIFIED`, `VERIFICATION_FAILED`, `RECOVERY_FENCED`, `REJECTED`, `SUPERSEDED`) | Domain Enum | `src/core/types/adjudication.ts` | `AdjudicationStatusEnum` (lines 16–25) |
-| **Reviewer Sessions Table** | SQLite Schema | `src/core/database/migrations.ts` | `CREATE TABLE mcp_reviewer_sessions` (Migration 24) |
-| **Reviewer Session Token Hash Index** | SQLite Index | `src/core/database/migrations.ts` | `idx_mcp_reviewer_sessions_token_hash` ON `mcp_reviewer_sessions(token_hash)` (Migration 24) |
-| **Provider Health Observations Table** | SQLite Schema | `src/core/database/migrations.ts` | `CREATE TABLE IF NOT EXISTS provider_health_observations` (Migration 11) |
-| **Provider Health Statuses** (`AVAILABLE`, `BUSY`, `LOW_QUOTA`, `RATE_LIMITED`, `QUOTA_EXHAUSTED`, `AUTH_ERROR`, `OFFLINE`, `UNHEALTHY`, `COOLDOWN`, `DISABLED`, `UNKNOWN`) | Domain Enum | `src/core/types/domain.ts` | `ProviderHealthStatusEnum` (lines 86–99) |
-| **Handoff Transfers Table** | SQLite Schema | `src/core/database/migrations.ts` | `CREATE TABLE IF NOT EXISTS handoff_transfers` (Migration 16) |
-| **Context Snapshots & Manifests Tables** | SQLite Schema | `src/core/database/migrations.ts` | `context_snapshots`, `context_manifests` (Migration 9) |
-| **Domain Events Table** | SQLite Schema | `src/core/database/migrations.ts` | `CREATE TABLE IF NOT EXISTS events` (Migration 1) |
+| **Projects Table** | SQLite Schema | `src/core/database/migrations/migration001.ts` | `CREATE TABLE IF NOT EXISTS projects` (Migration 1) |
+| **Tasks Table** | SQLite Schema | `src/core/database/migrations/migration001.ts` | `CREATE TABLE IF NOT EXISTS tasks` (Migration 1) |
+| **Role Profiles Table** | SQLite Schema | `src/core/database/migrations/migration008.ts` | `CREATE TABLE IF NOT EXISTS role_profiles` (Migration 8) |
+| **Agent Profiles Table** | SQLite Schema | `src/core/database/migrations/migration008.ts` | `CREATE TABLE IF NOT EXISTS agent_profiles` (Migration 8) |
+| **Provider Accounts Table** | SQLite Schema | `src/core/database/migrations/migration008.ts` | `CREATE TABLE IF NOT EXISTS provider_accounts` (Migration 8) |
+| **Worker Slots Table** | SQLite Schema | `src/core/database/migrations/migration008.ts` | `CREATE TABLE IF NOT EXISTS worker_slots` (Migration 8) |
+| **Agent Assignments Table** | SQLite Schema | `src/core/database/migrations/migration008.ts` | `CREATE TABLE IF NOT EXISTS agent_assignments` (Migration 8) |
+| **Account Leases Table** | SQLite Schema | `src/core/database/migrations/migration008.ts` | `CREATE TABLE IF NOT EXISTS account_leases` (Migration 8) |
+| **Active Slot Lease Unique Index** | SQLite Index | `src/core/database/migrations/migration008.ts` | `idx_active_slot_lease` ON `account_leases(worker_slot_id) WHERE released_at IS NULL` (Migration 8) |
+| **Separation Policies Table** | SQLite Schema | `src/core/database/migrations/migration008.ts` | `CREATE TABLE IF NOT EXISTS separation_policies` (Migration 8) |
+| **Route Policies Table** | SQLite Schema | `src/core/database/migrations/migration008.ts` | `CREATE TABLE IF NOT EXISTS route_policies` (Migration 8) |
+| **Execution Authorizations Table** | SQLite Schema | `src/core/database/migrations/migration006.ts` | `CREATE TABLE IF NOT EXISTS execution_authorizations` (Migration 6) |
+| **Coder Submissions Table** | SQLite Schema | `src/core/database/migrations/migration022.ts` | `CREATE TABLE coder_submissions` (Migration 22) |
+| **Coder Submission Dispositions Table** | SQLite Schema | `src/core/database/migrations/migration022.ts` | `CREATE TABLE coder_submission_dispositions` (Migration 22) |
+| **Coder Submission Adjudications Table** | SQLite Schema | `src/core/database/migrations/migration023.ts` | `CREATE TABLE coder_submission_adjudications` (Migration 23) |
+| **Workspace Leases Table** | SQLite Schema | `src/core/database/migrations/migration023.ts` | `CREATE TABLE coder_submission_workspace_leases` (Migration 23) |
+| **Active Workspace Lease Unique Index** | SQLite Index | `src/core/database/migrations/migration023.ts` | `idx_coder_submission_workspace_leases_active` ON `coder_submission_workspace_leases(worktree_identity_hash) WHERE state IN ('ACQUIRED', 'VERIFYING')` (Migration 23) |
+| **Adjudication Events Table** | SQLite Schema | `src/core/database/migrations/migration023.ts` | `CREATE TABLE coder_submission_adjudication_events` (Migration 23) |
+| **Adjudication Statuses** (`ADMITTED`, `VERIFYING`, `VERIFIED`, `VERIFICATION_FAILED`, `RECOVERY_FENCED`, `REJECTED`, `SUPERSEDED`) | Domain Enum | `src/core/types/adjudication.ts` | `AdjudicationStatusEnum` |
+| **Reviewer Sessions Table** | SQLite Schema | `src/core/database/migrations/migration024.ts` | `CREATE TABLE mcp_reviewer_sessions` (Migration 24) |
+| **Reviewer Session Token Hash Index** | SQLite Index | `src/core/database/migrations/migration024.ts` | `idx_mcp_reviewer_sessions_token_hash` ON `mcp_reviewer_sessions(token_hash)` (Migration 24) |
+| **Provider Health Observations Table** | SQLite Schema | `src/core/database/migrations/migration011.ts` | `CREATE TABLE IF NOT EXISTS provider_health_observations` (Migration 11) |
+| **Provider Health Statuses** (`AVAILABLE`, `BUSY`, `LOW_QUOTA`, `RATE_LIMITED`, `QUOTA_EXHAUSTED`, `AUTH_ERROR`, `OFFLINE`, `UNHEALTHY`, `COOLDOWN`, `DISABLED`, `UNKNOWN`) | Domain Enum | `src/core/types/domain.ts` | `ProviderHealthStatusEnum` |
+| **Handoff Transfers Table** | SQLite Schema | `src/core/database/migrations/migration016.ts` | `CREATE TABLE IF NOT EXISTS handoff_transfers` (Migration 16) |
+| **Context Snapshots & Manifests Tables** | SQLite Schema | `src/core/database/migrations/migration009.ts` | `context_snapshots`, `context_manifests` (Migration 9) |
+| **Domain Events Table** | SQLite Schema | `src/core/database/migrations/migration001.ts` | `CREATE TABLE IF NOT EXISTS events` (Migration 1) |
 | **Context Builder Service** | Core Service | `src/core/services/ContextBuilderService.ts` | `class ContextBuilderService` |
 | **Role-Aware Router** | Core Service | `src/core/services/RoleAwareRoutingService.ts` | `class RoleAwareRoutingService` |
 | **Concurrent Execution Scheduler** | Core Service | `src/core/services/ConcurrentExecutionScheduler.ts` | `class ConcurrentExecutionScheduler` |
@@ -660,7 +703,7 @@ This appendix maps every capability, service, table, state, tool, and error code
 | **Coder Submission Tool Name** | MCP Protocol Constant | `src/mcp/submissionProtocol.ts` | `agentforge_submit_coder_claim` |
 | **Handoff Transfer Service** | Core Service | `src/core/services/HandoffTransferService.ts` | `class HandoffTransferService` |
 | **Adjudication Service** | Core Service | `src/core/services/CoderSubmissionAdjudicationService.ts` | `class CoderSubmissionAdjudicationService`, `admitSubmissionForVerification()` |
-| **Canonical Terminal Disposition Helper** | Utility Function | `src/core/services/CoderSubmissionAdjudicationService.ts` | `buildCanonicalTerminalDisposition()` (line 565) |
+| **Canonical Terminal Disposition Helper** | Utility Function | `src/core/services/CoderSubmissionAdjudicationService.ts` | `buildCanonicalTerminalDisposition()` |
 | **Deterministic Disposition ID Helper** | Utility Function | `src/core/services/CoderSubmissionAdjudicationService.ts` | `deriveDeterministicDispositionId()` |
 | **Adjudication Recovery Scanner** | Core Service | `src/core/services/CoderSubmissionAdjudicationRecoveryScanner.ts` | `class CoderSubmissionAdjudicationRecoveryScanner`, `scanAndReconcile()` |
 | **Reviewer Authority Service** | MCP Authority Service | `src/mcp/reviewerAuthority.ts` | `class ReviewerAuthorityService`, `issueReviewerSession()`, `revokeReviewerSession()` |
