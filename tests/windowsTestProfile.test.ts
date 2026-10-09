@@ -91,6 +91,13 @@ describe('bounded public Windows timing evidence', () => {
       const hook = path.join(repository, 'tests/testOutputSanitizer.ts').replace(/\\/g, '/');
       fs.writeFileSync(path.join(root, 'vite.config.mjs'), `export default { test: { setupFiles: [${JSON.stringify(hook)}] } };`);
       for (const letter of ['a', 'b', 'c', 'd']) fs.writeFileSync(path.join(root, 'tests', `${letter}.test.ts`), "import { it, expect } from 'vitest'; it('AF_TEST_ONLY_PRIVATE_DIAGNOSTIC', () => expect(true).toBe(true));\n");
+      fs.writeFileSync(path.join(root, 'tests/a.test.ts'), [
+        "import { it, expect } from 'vitest'; import { spawnSync } from 'node:child_process';",
+        "it('nested protected runner remains independent of parent timing', () => {",
+        "  const child = spawnSync(process.execPath, ['scripts/run-test-suite.cjs'], { cwd: process.cwd(), env: { ...process.env, AGENTFORGE_TEST_FILES: 'tests/b.test.ts' }, encoding: 'utf8', timeout: 30000 });",
+        "  expect(child.status).toBe(0);",
+        "});",
+      ].join('\n'));
       git(['init']); git(['add', '.']); git(['-c', 'user.name=AF Fixture', '-c', 'user.email=fixture@example.invalid', 'commit', '-m', 'synthetic timing fixture']);
       const env = { ...process.env, AGENTFORGE_WINDOWS_TEST_PROFILE: '1', AGENTFORGE_PROFILE_SOURCE_SHA: git(['rev-parse', 'HEAD']),
         GITHUB_RUN_ID: '123', GITHUB_RUN_ATTEMPT: '1', AGENTFORGE_TEST_SINGLE_RUN: '1', AGENTFORGE_TEST_FILES: '', AGENTFORGE_TEST_PHASE: '' };
