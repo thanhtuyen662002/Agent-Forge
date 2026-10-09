@@ -296,6 +296,13 @@ export const enUS: TranslationDictionary = {
     importSuccess: 'Contract successfully imported!',
     importError: 'JSON Error: {error}',
     importButton: 'IMPORT CONTRACT',
+    repositoryBinding: {
+      title: 'Confirm the existing project folder',
+      description: 'For a project created before folder verification, choose its configured Git folder. Existing verified folders cannot be replaced.',
+      button: 'Confirm repository folder',
+      success: 'The configured repository folder is verified.',
+      blocked: 'This project has already started work. Create a new project with a verified folder; its existing history is preserved.',
+    },
     createModal: {
       title: 'Create New Project',
       nameLabel: 'Project Name',

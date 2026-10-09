@@ -4,7 +4,7 @@ import { EventService } from './EventService';
 import { ProjectStateMachine, ProjectTrigger } from '../state/projectStateMachine';
 import { Project, ProjectContract, ProjectStatus } from '../types/domain';
 import { ProjectStopFenceService } from './ProjectStopFenceService';
-import { assertRepositoryRootIdentity, RepositoryRootIdentity } from './RepositoryRootIdentity';
+import { assertRepositoryRootIdentity, RepositoryRootError, RepositoryRootIdentity } from './RepositoryRootIdentity';
 import { RepositoryRootLease } from './RepositoryRootLease';
 
 export class ProjectService {
@@ -40,6 +40,20 @@ export class ProjectService {
       if (rootIdentity) assertRepositoryRootIdentity(rootIdentity);
     }); } finally { lease?.close(); }
     return project;
+  }
+
+  public bindRepository(projectId: string, identity: RepositoryRootIdentity): Project {
+    const lease = RepositoryRootLease.acquire(identity);
+    try {
+      return this.repo.runInImmediateTransaction(() => {
+        const created = this.repo.bindProjectRepositoryIdentity(projectId, identity);
+        if (created) this.eventService.record(projectId, 'PROJECT_REPOSITORY_BOUND', 'Native repository selection confirmed for the configured project folder.');
+        lease.assertActive();
+        const project = this.repo.getProjectMetadata(projectId);
+        if (!project) throw new RepositoryRootError('REPOSITORY_ROOT_IDENTITY_CHANGED');
+        return project;
+      });
+    } finally { lease.close(); }
   }
 
   public importContract(projectId: string, contract: ProjectContract): boolean {

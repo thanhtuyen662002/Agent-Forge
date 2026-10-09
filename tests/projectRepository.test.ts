@@ -228,6 +228,102 @@ describe('ProjectRepository extraction contract', () => {
     expect(fs.readFileSync(path.join(root, 'sentinel'), 'utf8')).toBe('selected-owner');
   });
 
+  it('explicitly binds a historical inactive project without changing its metadata and is idempotent after restart', () => {
+    const { fixture, root } = fixtureRoot();
+    const databasePath = path.join(fixture, 'binding.sqlite');
+    const current = services(databasePath);
+    const project = current.projects.createProject('Historical project', 'Original metadata', root);
+    const identity = captureRepositoryRoot(root);
+    expect(() => current.repository.getProjectRepositoryIdentity(project.id)).toThrow('REPOSITORY_ROOT_UNBOUND');
+    expect(current.projects.bindRepository(project.id, identity)).toEqual(project);
+    expect(current.repository.getProjectRepositoryIdentity(project.id)).toEqual(identity);
+    expect(current.repository.getEvents(project.id).filter(event => event.type === 'PROJECT_REPOSITORY_BOUND')).toHaveLength(1);
+    db!.close(); db = undefined;
+    const restarted = services(databasePath);
+    expect(restarted.projects.bindRepository(project.id, captureRepositoryRoot(root))).toEqual(project);
+    expect(restarted.repository.getEvents(project.id).filter(event => event.type === 'PROJECT_REPOSITORY_BOUND')).toHaveLength(1);
+    expect(restarted.repository.getProject(project.id)).toEqual(project);
+  });
+
+  it('rejects a different selected folder and does not retarget a historical project', () => {
+    const { root } = fixtureRoot(); const other = fixtureRoot().root;
+    const current = services();
+    const project = current.projects.createProject('Configured folder', 'Original metadata', root);
+    const events = current.repository.getEvents(project.id);
+    expect(() => current.projects.bindRepository(project.id, captureRepositoryRoot(other))).toThrow('REPOSITORY_ROOT_IDENTITY_CHANGED');
+    expect(current.repository.getProjectMetadata(project.id)).toEqual(project);
+    expect(current.repository.getEvents(project.id)).toEqual(events);
+    expect(() => current.repository.getProjectRepositoryIdentity(project.id)).toThrow('REPOSITORY_ROOT_UNBOUND');
+  });
+
+  it('cannot overwrite a persisted identity with a new native selection of its replacement', () => {
+    const { root } = fixtureRoot();
+    const current = services();
+    const project = current.projects.createProject('Immutable binding', 'Original metadata', root, 'main', captureRepositoryRoot(root));
+    const receipt = db!.prepare('SELECT * FROM project_repository_identities WHERE project_id=?').get(project.id);
+    const events = current.repository.getEvents(project.id);
+    fs.renameSync(root, root + '-original'); fs.mkdirSync(root);
+    execFileSync('git', ['init', '-q'], { cwd: root, stdio: 'ignore', windowsHide: true });
+    expect(() => current.projects.bindRepository(project.id, captureRepositoryRoot(root))).toThrow('REPOSITORY_ROOT_IDENTITY_CHANGED');
+    expect(db!.prepare('SELECT * FROM project_repository_identities WHERE project_id=?').get(project.id)).toEqual(receipt);
+    expect(current.repository.getEvents(project.id)).toEqual(events);
+    expect(current.repository.getProjectMetadata(project.id)).toEqual(project);
+  });
+
+  it('rolls back first binding when its audit event fails', () => {
+    const { root } = fixtureRoot();
+    const current = services();
+    const project = current.projects.createProject('Binding audit', 'Original metadata', root);
+    const events = current.repository.getEvents(project.id);
+    vi.spyOn(current.events, 'record').mockImplementationOnce(() => { throw new Error('INJECTED_BINDING_AUDIT_FAILURE'); });
+    expect(() => current.projects.bindRepository(project.id, captureRepositoryRoot(root))).toThrow('INJECTED_BINDING_AUDIT_FAILURE');
+    expect(current.repository.getEvents(project.id)).toEqual(events);
+    expect(() => current.repository.getProjectRepositoryIdentity(project.id)).toThrow('REPOSITORY_ROOT_UNBOUND');
+    expect(current.repository.getProjectMetadata(project.id)).toEqual(project);
+  });
+
+  it('holds the native root through binding audit and final transaction commit', () => {
+    const { root } = fixtureRoot();
+    const current = services();
+    const project = current.projects.createProject('Binding race', 'Original metadata', root);
+    const record = current.events.record.bind(current.events);
+    let reached = false;
+    vi.spyOn(current.events, 'record').mockImplementationOnce((...args) => {
+      reached = true;
+      if (process.platform === 'win32') expect(() => fs.renameSync(root, root + '-original')).toThrow();
+      else { fs.renameSync(root, root + '-original'); fs.mkdirSync(root); }
+      return record(...args);
+    });
+    const bind = () => current.projects.bindRepository(project.id, captureRepositoryRoot(root));
+    if (process.platform === 'win32') {
+      expect(bind()).toEqual(project);
+      expect(current.repository.getProjectRepositoryIdentity(project.id).canonicalPath).toBe(root);
+      fs.renameSync(root, root + '-released');
+    } else {
+      expect(bind).toThrow('REPOSITORY_ROOT_IDENTITY_CHANGED');
+      expect(() => current.repository.getProjectRepositoryIdentity(project.id)).toThrow('REPOSITORY_ROOT_UNBOUND');
+      expect(current.repository.getEvents(project.id).filter(event => event.type === 'PROJECT_REPOSITORY_BOUND')).toHaveLength(0);
+    }
+    expect(reached).toBe(true);
+  });
+
+  it('blocks initial binding of active projects and preserves terminal execution history', () => {
+    const { root } = fixtureRoot();
+    const current = services();
+    const project = current.projects.createProject('Execution history', 'Original metadata', root);
+    const identity = captureRepositoryRoot(root);
+    current.repository.updateProjectStatus(project.id, 'RUNNING');
+    expect(() => current.projects.bindRepository(project.id, identity)).toThrow('REPOSITORY_ROOT_BINDING_BLOCKED');
+    current.repository.updateProjectStatus(project.id, 'READY');
+    db!.prepare(`INSERT INTO process_runs (id, project_id, command, working_directory, status, start_time, end_time, exit_code, created_at)
+      VALUES (?, ?, ?, ?, 'COMPLETED', ?, ?, 0, ?)`).run('old-process', project.id, 'git status', root, project.created_at, project.created_at, project.created_at);
+    const history = current.repository.getProcessRun('old-process');
+    expect(() => current.projects.bindRepository(project.id, identity)).toThrow('REPOSITORY_ROOT_BINDING_BLOCKED');
+    expect(current.repository.getProcessRun('old-process')).toEqual(history);
+    expect(() => current.repository.getProjectRepositoryIdentity(project.id)).toThrow('REPOSITORY_ROOT_UNBOUND');
+    expect(current.repository.getEvents(project.id).filter(event => event.type === 'PROJECT_REPOSITORY_BOUND')).toHaveLength(0);
+  });
+
   it('keeps the real durable Emergency Stop latch and audit available after a bound root replacement', async () => {
     const { root } = fixtureRoot();
     const current = services();

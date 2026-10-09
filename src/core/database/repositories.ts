@@ -265,6 +265,10 @@ export class Repository {
     return identity;
   }
 
+  public bindProjectRepositoryIdentity(projectId: string, identity: RepositoryRootIdentity): boolean {
+    return this.projectRepository.bindRepositoryIdentity(projectId, identity);
+  }
+
   public getProject(id: string): Project | null {
     return this.projectRepository.getProject(id);
   }

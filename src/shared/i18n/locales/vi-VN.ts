@@ -296,6 +296,13 @@ export const viVN: TranslationDictionary = {
     importSuccess: 'Đã nhập hợp đồng thành công!',
     importError: 'Lỗi cú pháp JSON: {error}',
     importButton: 'NHẬP HỢP ĐỒNG',
+    repositoryBinding: {
+      title: 'Xác nhận thư mục dự án hiện có',
+      description: 'Với dự án được tạo trước khi có xác minh thư mục, hãy chọn đúng thư mục Git đã cấu hình. Thư mục đã xác minh không thể bị thay thế.',
+      button: 'Xác nhận thư mục kho mã',
+      success: 'Thư mục kho mã đã cấu hình được xác minh.',
+      blocked: 'Dự án này đã bắt đầu thực thi. Hãy tạo dự án mới với thư mục được xác minh; lịch sử hiện có được giữ nguyên.',
+    },
     createModal: {
       title: 'Tạo Dự án Mới',
       nameLabel: 'Tên Dự án',

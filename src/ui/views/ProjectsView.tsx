@@ -6,7 +6,7 @@ import { uiActionFailureKey } from '../actionState';
 import { AccessibleDialog } from '../components/AccessibleDialog';
 
 export const ProjectsView: React.FC = () => {
-  const { projects, activeProject, createProject, importContract, isElectron, pendingActions } = useOrchestrator();
+  const { projects, activeProject, createProject, importContract, isElectron, pendingActions, refreshData } = useOrchestrator();
   const { t } = useI18n();
   const [isCreateOpen, setIsCreateOpen] = useState<boolean>(false);
   const [name, setName] = useState<string>('');
@@ -17,8 +17,36 @@ export const ProjectsView: React.FC = () => {
   const [importStatus, setImportStatus] = useState<string | null>(null);
   const [errorStatus, setErrorStatus] = useState<string | null>(null);
   const [importSucceeded, setImportSucceeded] = useState(false);
+  const [binding, setBinding] = useState(false);
+  const [bindingResult, setBindingResult] = useState<{ projectId: string; success: boolean; message: string } | null>(null);
   const creating = pendingActions.includes('createProject');
   const importing = pendingActions.includes('importContract');
+
+  const handleBindRepository = async () => {
+    if (!activeProject || binding) return;
+    const projectId = activeProject.id;
+    setBinding(true); setBindingResult(null);
+    try {
+      const api = (window as any).orchestrator;
+      const selection = await api.selectRepositoryDirectory();
+      if (selection.cancelled) return;
+      if (!selection.success || !selection.selectionId) {
+        setBindingResult({ projectId, success: false, message: t(selection.errorCode === 'REPOSITORY_ROOT_ALIAS' ?
+          'projects.createModal.repositoryErrors.alias' : 'projects.createModal.repositoryErrors.changed') });
+        return;
+      }
+      const result = await api.bindProjectRepository({ projectId, repositorySelectionId: selection.selectionId });
+      if (!result.success) {
+        setBindingResult({ projectId, success: false, message: t(result.errorCode === 'REPOSITORY_ROOT_BINDING_BLOCKED' ?
+          'projects.repositoryBinding.blocked' : 'projects.createModal.repositoryErrors.changed') });
+        return;
+      }
+      await refreshData();
+      setBindingResult({ projectId, success: true, message: t('projects.repositoryBinding.success') });
+    } catch {
+      setBindingResult({ projectId, success: false, message: t('actions.requestRejected') });
+    } finally { setBinding(false); }
+  };
 
   const handleSelectDirectory = async () => {
     setErrorStatus(null);
@@ -128,6 +156,20 @@ export const ProjectsView: React.FC = () => {
           <span>{t('projects.newProject')}</span>
         </button>
       </div>
+
+      {activeProject && (
+        <section aria-labelledby="repository-binding-title" className="bg-surface-card border border-surface-border rounded-xl p-6 space-y-3">
+          <h3 id="repository-binding-title" className="text-sm font-semibold text-white">{t('projects.repositoryBinding.title')}</h3>
+          <p className="text-xs text-slate-400">{t('projects.repositoryBinding.description')}</p>
+          <p className="text-xs text-slate-200 break-all">{activeProject.repository_path}</p>
+          <button type="button" onClick={handleBindRepository} disabled={!isElectron || binding || activeProject.status === 'RUNNING'}
+            aria-busy={binding} title={!isElectron ? t('actions.desktopRequired') : undefined}
+            className="px-3 py-2 bg-surface-border text-slate-200 rounded-lg text-xs font-semibold disabled:opacity-50">
+            {binding ? t('actions.pending') : t('projects.repositoryBinding.button')}
+          </button>
+          {bindingResult?.projectId === activeProject.id && <p role={bindingResult.success ? 'status' : 'alert'} className={bindingResult.success ? 'text-emerald-300 text-xs' : 'text-rose-300 text-xs'}>{bindingResult.message}</p>}
+        </section>
+      )}
 
       {/* Contract Editor / Importer */}
       <div className="bg-surface-card border border-surface-border rounded-xl p-6 shadow-lg space-y-4">

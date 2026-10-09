@@ -27,10 +27,14 @@ vi.mock('electron', () => ({
 
 describe('privileged IPC sender trust boundary', () => {
   const fixtures: string[] = [];
-  const projectService = { createProject: vi.fn((name: string, _: string, repositoryPath: string) => ({ id: 'new-project', name, repository_path: repositoryPath })) };
+  const projectService = {
+    createProject: vi.fn((name: string, _: string, repositoryPath: string) => ({ id: 'new-project', name, repository_path: repositoryPath })),
+    bindRepository: vi.fn((id: string, identity: { canonicalPath: string }) => ({ id, repository_path: identity.canonicalPath })),
+  };
   const repo = {
     getAllProjects: vi.fn(() => []),
     getProject: vi.fn((id: string) => ({ id })),
+    getProjectMetadata: vi.fn((id: string) => ({ id, repository_path: '' })),
     getProjectRepositoryIdentity: vi.fn(() => { throw new RepositoryRootError('REPOSITORY_ROOT_UNBOUND'); }),
     getProjectMaxRevisions: vi.fn(() => 3),
     setProjectMaxRevisions: vi.fn((_: string, value: number) => value),
@@ -92,6 +96,46 @@ describe('privileged IPC sender trust boundary', () => {
       await expect(handler!(event, undefined)).rejects.toMatchObject({ code: 'IPC_SENDER_UNTRUSTED' });
     }
     expect(repo.getAllProjects).not.toHaveBeenCalled();
+  });
+
+  it('binds only the configured folder through a trusted single-use native selection', async () => {
+    const { root } = repositoryFixture();
+    repo.getProjectMetadata.mockReturnValueOnce({ id: 'existing-project', repository_path: root });
+    const selection = RepositorySelectionService.issueToken(root);
+    const handler = handlers.get('project:bindRepository')!;
+    const payload = { projectId: 'existing-project', repositorySelectionId: selection.selectionId };
+    await expect(handler({ senderFrame: { url: 'https://remote.example/' } }, payload)).rejects.toBeInstanceOf(IpcSenderTrustError);
+    expect(projectService.bindRepository).not.toHaveBeenCalled();
+    expect(await handler({ senderFrame: { url: 'http://localhost:5173/projects' } }, payload)).toMatchObject({ success: true });
+    expect(projectService.bindRepository).toHaveBeenCalledWith('existing-project', captureRepositoryRoot(root));
+    expect(await handler({ senderFrame: { url: 'http://localhost:5173/projects' } }, payload)).toMatchObject({ success: false });
+    expect(projectService.bindRepository).toHaveBeenCalledTimes(1);
+  });
+
+  it('rejects renderer-supplied paths and different configured folders before binding', async () => {
+    const { root } = repositoryFixture();
+    const selection = RepositorySelectionService.issueToken(root);
+    const handler = handlers.get('project:bindRepository')!;
+    const event = { senderFrame: { url: 'http://localhost:5173/projects' } };
+    const payload = { projectId: 'existing-project', repositorySelectionId: selection.selectionId };
+    expect(await handler(event, { ...payload, repositoryPath: root })).toMatchObject({ success: false });
+    repo.getProjectMetadata.mockReturnValueOnce({ id: 'existing-project', repository_path: root + '-different' });
+    expect(await handler(event, payload)).toMatchObject({ success: false, errorCode: 'REPOSITORY_ROOT_IDENTITY_CHANGED' });
+    expect(projectService.bindRepository).not.toHaveBeenCalled();
+  });
+
+  it('discards a native binding observation if the root changes during awaited Git validation', async () => {
+    const { root } = repositoryFixture();
+    repo.getProjectMetadata.mockReturnValueOnce({ id: 'existing-project', repository_path: root });
+    const selection = RepositorySelectionService.issueToken(root);
+    vi.spyOn(GitService, 'getStatus').mockImplementationOnce(async () => {
+      fs.renameSync(root, root + '-original'); fs.mkdirSync(root);
+      return { status: 'SUCCESS', isDirty: false, branch: 'main' } as any;
+    });
+    expect(await handlers.get('project:bindRepository')!({ senderFrame: { url: 'http://localhost:5173/projects' } }, {
+      projectId: 'existing-project', repositorySelectionId: selection.selectionId,
+    })).toMatchObject({ success: false, errorCode: 'REPOSITORY_ROOT_IDENTITY_CHANGED' });
+    expect(projectService.bindRepository).not.toHaveBeenCalled();
   });
 
   it('allows an exact trusted renderer origin and invokes the handler', async () => {

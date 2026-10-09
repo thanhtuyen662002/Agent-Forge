@@ -25,6 +25,7 @@ export interface OrchestratorApi {
   // Projects
   getProjects: () => Promise<any[]>;
   createProject: (data: { name: string; description?: string; repositorySelectionId: string; defaultBranch?: string }) => Promise<any>;
+  bindProjectRepository: (data: { projectId: string; repositorySelectionId: string }) => Promise<{ success: boolean; errorCode?: RepositoryRootErrorCode | 'NOT_GIT_REPOSITORY' | 'INVALID_REPOSITORY_LOCATION'; error?: string }>;
   importContract: (data: { projectId: string; contract: any }) => Promise<any>;
   transitionProject: (data: { projectId: string; trigger: string }) => Promise<any>;
 
@@ -149,6 +150,7 @@ const api: OrchestratorApi = {
 
   getProjects: () => ipcRenderer.invoke('project:list'),
   createProject: (data) => ipcRenderer.invoke('project:create', data),
+  bindProjectRepository: (data) => ipcRenderer.invoke('project:bindRepository', data),
   importContract: (data) => ipcRenderer.invoke('project:importContract', data),
   transitionProject: (data) => ipcRenderer.invoke('project:transition', data),
 

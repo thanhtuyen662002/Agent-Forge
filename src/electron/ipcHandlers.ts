@@ -20,6 +20,7 @@ import { UpdateService } from '../core/services/UpdateService';
 import { CommandParser } from '../core/services/CommandParser';
 import {
   CreateProjectIpcSchema,
+  BindProjectRepositoryIpcSchema,
   ImportContractIpcSchema,
   TransitionProjectIpcSchema,
   CreateTaskIpcSchema,
@@ -223,10 +224,32 @@ export function registerIpcHandlers(
     }
   });
 
+  registerPrivilegedHandler('project:bindRepository', async (_, payload: unknown) => {
+    const parsed = BindProjectRepositoryIpcSchema.safeParse(payload);
+    if (!parsed.success) return { success: false, error: 'A project ID and native repository selection are required.' };
+    const selected = RepositorySelectionService.consumeToken(parsed.data.repositorySelectionId);
+    if (!selected.success || !selected.canonicalPath || !selected.rootIdentity) {
+      return { success: false, errorCode: selected.errorCode, error: selected.error || 'Invalid repository selection token.' };
+    }
+    try {
+      const metadata = repo.getProjectMetadata(parsed.data.projectId);
+      if (!metadata || metadata.repository_path !== selected.canonicalPath) throw new RepositoryRootError('REPOSITORY_ROOT_IDENTITY_CHANGED');
+      const policy = PolicyService.evaluatePathAccess(selected.canonicalPath, selected.canonicalPath, false);
+      if (!policy.allowed) return { success: false, errorCode: 'INVALID_REPOSITORY_LOCATION', error: 'The configured repository location is not allowed.' };
+      const status = await GitService.getStatus(selected.canonicalPath, selected.rootIdentity);
+      if (status.status !== 'SUCCESS') return { success: false, errorCode: status.errorCode ?? 'NOT_GIT_REPOSITORY', error: 'The configured repository could not be verified.' };
+      assertRepositoryRootIdentity(selected.rootIdentity);
+      return { success: true, project: projectService.bindRepository(parsed.data.projectId, selected.rootIdentity) };
+    } catch (error) {
+      if (!(error instanceof RepositoryRootError)) throw error;
+      return { success: false, errorCode: error.code, error: error.message };
+    }
+  });
+
   registerPrivilegedHandler('project:get', async (_, payload: unknown) => {
     const parsed = ProjectScopedIpcSchema.safeParse(payload);
     if (!parsed.success) return null;
-    return repo.getProject(parsed.data.projectId);
+    return repo.getProjectMetadata(parsed.data.projectId);
   });
 
   registerPrivilegedHandler('project:list', async () => {

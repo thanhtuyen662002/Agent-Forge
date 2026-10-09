@@ -53,6 +53,41 @@ export class ProjectRepository {
     return project;
   }
 
+  /** Explicit first owner selection only; persisted identity is immutable. */
+  public bindRepositoryIdentity(id: string, identity: RepositoryRootIdentity): boolean {
+    const receipt = JSON.stringify(identity);
+    if (Buffer.byteLength(receipt) > 262_144) throw new RepositoryRootError('REPOSITORY_ROOT_IDENTITY_UNAVAILABLE');
+    const lease = RepositoryRootLease.acquire(identity);
+    try {
+      return this.db.transaction(() => {
+        const project = this.getProjectMetadata(id);
+        if (!project || project.repository_path !== identity.canonicalPath) throw new RepositoryRootError('REPOSITORY_ROOT_IDENTITY_CHANGED');
+        if (!this.db.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='project_repository_identities'").get()) {
+          throw new RepositoryRootError('REPOSITORY_ROOT_IDENTITY_UNAVAILABLE');
+        }
+        const existing = this.getRepositoryIdentity(id);
+        if (existing) {
+          if (JSON.stringify(existing) !== receipt) throw new RepositoryRootError('REPOSITORY_ROOT_IDENTITY_CHANGED');
+          lease.assertActive();
+          return false;
+        }
+        // A first binding cannot reinterpret any previous execution authority.
+        // Even terminal history is retained, never cleared to permit binding.
+        if (!['DRAFT', 'PLANNING', 'READY'].includes(project.status) ||
+            this.db.prepare('SELECT 1 FROM execution_authorizations WHERE project_id=? LIMIT 1').get(id) ||
+            this.db.prepare('SELECT 1 FROM agent_assignments WHERE project_id=? LIMIT 1').get(id) ||
+            this.db.prepare(`SELECT 1 FROM process_runs p LEFT JOIN tasks t ON t.id=p.task_id
+              WHERE p.project_id=? OR t.project_id=? LIMIT 1`).get(id, id)) {
+          throw new RepositoryRootError('REPOSITORY_ROOT_BINDING_BLOCKED');
+        }
+        this.db.prepare(`INSERT INTO project_repository_identities (project_id, canonical_path, identity_json, created_at)
+          VALUES (?, ?, ?, ?)`).run(id, identity.canonicalPath, receipt, new Date().toISOString());
+        lease.assertActive();
+        return true;
+      }).immediate();
+    } finally { lease.close(); }
+  }
+
   /** Display/stop metadata only; this lookup grants no repository access. */
   public getProjectMetadata(id: string): Project | null {
     const row = this.db.prepare('SELECT * FROM projects WHERE id = ?').get(id) as Record<string, unknown> | undefined;
