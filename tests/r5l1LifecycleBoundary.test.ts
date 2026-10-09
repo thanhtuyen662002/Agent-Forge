@@ -290,6 +290,11 @@ it('exercises real lifecycle setup and records the truthful context-hash dispatc
     )
       .trim()
       .split(/\r?\n/)[0];
+    if (process.platform !== 'win32') {
+      // The portable fixture supplies an existing root. Production rejects
+      // missing-root initialization before mutation on unsupported platforms.
+      fs.mkdirSync(path.join(tempDir, 'worktrees'));
+    }
     const worktrees = new GitWorktreeService({
       gitExecutable,
       repositoryRoot: repoDir,
@@ -304,20 +309,30 @@ it('exercises real lifecycle setup and records the truthful context-hash dispatc
     );
     const result = await scheduler.execute(auth.id);
 
-    expect(result.status).toBe('PROVIDER_FAILED');
-    expect(result.providerResult?.error).toContain('EXECUTION_AUTHORIZATION_INVALID:');
-    expect(result.providerResult?.error).toContain('No HandoffTransfer found');
-    expect(result.providerResult?.errorCode).toBe('RESOURCE_UNAVAILABLE');
+    if (process.platform === 'win32') {
+      expect(result.status).toBe('PROVIDER_FAILED');
+      expect(result.providerResult?.error).toContain('EXECUTION_AUTHORIZATION_INVALID:');
+      expect(result.providerResult?.error).toContain('No HandoffTransfer found');
+      expect(result.providerResult?.errorCode).toBe('RESOURCE_UNAVAILABLE');
+      expect(repo.getExecutionAuthorization(auth.id)?.status).toBe('INVALIDATED');
+      expect(result.workspaceOwnershipDigest).toMatch(/^[0-9a-f]{64}$/);
+    } else {
+      expect(result.status).toBe('WORKTREE_CREATE_FAILED');
+      expect(result.errorCode).toBe('UNSUPPORTED_MUTATION_BOUNDARY');
+      expect(result.providerResult).toBeUndefined();
+      expect(result.workspaceOwnershipDigest).toBeUndefined();
+      expect(repo.getExecutionAuthorization(auth.id)).toEqual(durableAuth);
+      expect(fs.readdirSync(path.join(tempDir, 'worktrees'))).toEqual([]);
+      expect(repo.getProcessRunsByTask(task.id)).toEqual([]);
+    }
     expect(auth.context_manifest_hash).not.toBe(
       crypto.createHash('sha256').update(JSON.stringify(['README.md'])).digest('hex'),
     );
     expect(adapterCalls).toBe(0);
     expect(adapterRequest).toBeUndefined();
-    expect(repo.getExecutionAuthorization(auth.id)?.status).toBe('INVALIDATED');
     expect(result.assignmentId).toBe(assignmentId);
     expect(result.workerSlotId).toBe(workerSlotId);
     expect(result.leaseId).toBeTruthy();
-    expect(result.workspaceOwnershipDigest).toMatch(/^[0-9a-f]{64}$/);
     expect(repo.getAccountLease(result.leaseId!)?.released_at).toBeTruthy();
     expect(repo.getWorkerSlot(workerSlotId)?.status).toBe('IDLE');
     expect(await worktrees.listPorcelain()).toHaveLength(1);
@@ -336,9 +351,11 @@ it('exercises real lifecycle setup and records the truthful context-hash dispatc
         persistedAssignmentBinding: durableAuth.assignment_id === assignmentId,
         persistedAccountBinding: durableAuth.selected_account_id === accountId,
         schedulerStatus: result.status,
-        errorCode: result.providerResult?.errorCode,
+        errorCode: result.errorCode ?? result.providerResult?.errorCode,
         adapterCalls,
-        downstream: 'NOT_EXERCISED: dispatch rejected before coder execution',
+        downstream: process.platform === 'win32'
+          ? 'NOT_EXERCISED: dispatch rejected before coder execution'
+          : 'NOT_EXERCISED: native worktree boundary unavailable',
         coderWorktreeHeadBinding: 'NOT_EXERCISED: no coder output was produced',
         conditionalHandoff: 'NOT_EXERCISED',
       }),

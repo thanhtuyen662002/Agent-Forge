@@ -822,9 +822,20 @@ export class ProviderDispatchService {
         assignmentId: assignment.id,
         workerSlotId: assignment.selected_worker_slot_id,
         baseSha: auth.repository_head_sha,
+        ownershipEpoch: auth.lifecycle_version === 1 ? auth.task_ownership_epoch : null,
       };
 
       const inspectResult = await this.gitWorktreeService.inspectWorktree(ownershipTuple);
+      // Inspection is asynchronous; honor a recorded cancellation before
+      // interpreting its result or claiming authority for provider execution.
+      if (control?.cancelRequested) {
+        return {
+          executionId,
+          status: 'CANCELLED',
+          errorCode: 'CANCELLED',
+          error: 'Execution was cancelled during scheduled preparation.',
+        };
+      }
       if (inspectResult.status !== 'INSPECTED') {
         return {
           executionId,

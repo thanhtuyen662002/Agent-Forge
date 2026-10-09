@@ -1,4 +1,5 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
+import { testWindowsWorktree, withoutWindowsWorktreeBoundary } from './helpers/worktreePlatforms';
 import fs from 'fs';
 import path from 'path';
 import os from 'os';
@@ -444,7 +445,7 @@ describe('ConcurrentExecutionScheduler (R5G3D1)', () => {
   });
 
   // 1. public execute input is authorizationId only.
-  it('1. public execute input is authorizationId only', async () => {
+  testWindowsWorktree('1. public execute input is authorizationId only', async () => {
     const result = await scheduler.execute(authId);
     expect(result.status).toBe('COMPLETED');
     expect(result.authorizationId).toBe(authId);
@@ -593,13 +594,13 @@ describe('ConcurrentExecutionScheduler (R5G3D1)', () => {
   });
 
   // 13. caller cannot choose source SHA.
-  it('13. caller cannot choose source SHA', async () => {
+  testWindowsWorktree('13. caller cannot choose source SHA', async () => {
     const res = await scheduler.execute(authId);
     expect(res.status).toBe('COMPLETED');
   });
 
   // 14. caller cannot choose worktree path.
-  it('14. caller cannot choose worktree path', async () => {
+  testWindowsWorktree('14. caller cannot choose worktree path', async () => {
     const res = await scheduler.execute(authId);
     expect(res.workspaceOwnershipDigest).toBeDefined();
   });
@@ -683,7 +684,7 @@ describe('ConcurrentExecutionScheduler (R5G3D1)', () => {
   });
 
   // 21. valid preparation calls dispatchScheduled exactly once.
-  it('21. valid preparation calls dispatchScheduled exactly once', async () => {
+  testWindowsWorktree('21. valid preparation calls dispatchScheduled exactly once', async () => {
     const dispatchSpy = vi.spyOn(dispatchService, 'dispatchScheduled');
     await scheduler.execute(authId);
     expect(dispatchSpy).toHaveBeenCalledTimes(1);
@@ -691,19 +692,19 @@ describe('ConcurrentExecutionScheduler (R5G3D1)', () => {
   });
 
   // 22. scheduler never calls adapter.execute directly.
-  it('22. scheduler never calls adapter.execute directly', async () => {
+  testWindowsWorktree('22. scheduler never calls adapter.execute directly', async () => {
     await scheduler.execute(authId);
     expect(adapter.executeCallCount).toBe(1);
   });
 
   // 23. scheduler never calls ProcessRunner directly.
-  it('23. scheduler never calls ProcessRunner directly', async () => {
+  testWindowsWorktree('23. scheduler never calls ProcessRunner directly', async () => {
     const res = await scheduler.execute(authId);
     expect(res.status).toBe('COMPLETED');
   });
 
   // 24. heartbeat continues while dispatch promise is pending.
-  it('24. heartbeat continues while dispatch promise is pending', async () => {
+  testWindowsWorktree('24. heartbeat continues while dispatch promise is pending', async () => {
     let resolveDispatch!: (res: AgentExecutionResult) => void;
     adapter.executionBarrier = new Promise((resolve) => {
       resolveDispatch = resolve;
@@ -720,7 +721,7 @@ describe('ConcurrentExecutionScheduler (R5G3D1)', () => {
   });
 
   // 25. heartbeat loss during active provider execution calls cancelScheduled(authId).
-  it('25. heartbeat loss during active provider execution calls cancelScheduled(authId)', async () => {
+  testWindowsWorktree('25. heartbeat loss during active provider execution calls cancelScheduled(authId)', async () => {
     const cancelSpy = vi.spyOn(dispatchService, 'cancelScheduled');
     let resolveDispatch!: (res: AgentExecutionResult) => void;
     const executeStartedPromise = new Promise<void>((resolve) => {
@@ -743,7 +744,7 @@ describe('ConcurrentExecutionScheduler (R5G3D1)', () => {
   });
 
   // 26. cancelScheduled called at most once for one ownership-loss event.
-  it('26. cancelScheduled called at most once for one ownership-loss event', async () => {
+  testWindowsWorktree('26. cancelScheduled called at most once for one ownership-loss event', async () => {
     const cancelSpy = vi.spyOn(dispatchService, 'cancelScheduled');
     let resolveDispatch!: (res: AgentExecutionResult) => void;
     const executeStartedPromise = new Promise<void>((resolve) => {
@@ -766,7 +767,7 @@ describe('ConcurrentExecutionScheduler (R5G3D1)', () => {
   });
 
   // 27. scheduler waits for original dispatch promise after cancellation.
-  it('27. scheduler waits for original dispatch promise after cancellation', async () => {
+  testWindowsWorktree('27. scheduler waits for original dispatch promise after cancellation', async () => {
     const cancelSpy = vi.spyOn(dispatchService, 'cancelScheduled');
     let resolveDispatch!: (res: AgentExecutionResult) => void;
     const executeStartedPromise = new Promise<void>((resolve) => {
@@ -864,7 +865,7 @@ describe('ConcurrentExecutionScheduler (R5G3D1)', () => {
   });
 
   // 32. normal COMPLETED + dirty retains worktree.
-  it('32. normal COMPLETED + dirty retains worktree', async () => {
+  testWindowsWorktree('32. normal COMPLETED + dirty retains worktree', async () => {
     const removeSpy = vi.spyOn(worktreeService, 'removeWorktree');
     let inspectCount = 0;
     vi.spyOn(worktreeService, 'inspectWorktree').mockImplementation(async () => {
@@ -890,7 +891,7 @@ describe('ConcurrentExecutionScheduler (R5G3D1)', () => {
   });
 
   // 33. normal COMPLETED + clean retains worktree.
-  it('33. normal COMPLETED + clean retains worktree', async () => {
+  testWindowsWorktree('33. normal COMPLETED + clean retains worktree', async () => {
     const removeSpy = vi.spyOn(worktreeService, 'removeWorktree');
     vi.spyOn(worktreeService, 'inspectWorktree').mockResolvedValue({
       status: 'INSPECTED',
@@ -912,7 +913,7 @@ describe('ConcurrentExecutionScheduler (R5G3D1)', () => {
   });
 
   // 34. normal FAILED + dirty retains worktree.
-  it('34. normal FAILED + dirty retains worktree', async () => {
+  testWindowsWorktree('34. normal FAILED + dirty retains worktree', async () => {
     adapter.throwOnExecute = true;
     const removeSpy = vi.spyOn(worktreeService, 'removeWorktree');
     let inspectCount = 0;
@@ -939,7 +940,7 @@ describe('ConcurrentExecutionScheduler (R5G3D1)', () => {
   });
 
   // 35. normal FAILED + clean removes worktree safely.
-  it('35. normal FAILED + clean removes worktree safely', async () => {
+  testWindowsWorktree('35. normal FAILED + clean removes worktree safely', async () => {
     adapter.throwOnExecute = true;
     const removeSpy = vi.spyOn(worktreeService, 'removeWorktree');
     vi.spyOn(worktreeService, 'inspectWorktree').mockResolvedValue({
@@ -962,7 +963,7 @@ describe('ConcurrentExecutionScheduler (R5G3D1)', () => {
   });
 
   // 36. normal CANCELLED + dirty retains worktree.
-  it('36. normal CANCELLED + dirty retains worktree', async () => {
+  testWindowsWorktree('36. normal CANCELLED + dirty retains worktree', async () => {
     adapter.executionBarrier = Promise.resolve({ executionId: 'exec-1', status: 'CANCELLED' });
     const removeSpy = vi.spyOn(worktreeService, 'removeWorktree');
     let inspectCount = 0;
@@ -989,7 +990,7 @@ describe('ConcurrentExecutionScheduler (R5G3D1)', () => {
   });
 
   // 37. normal CANCELLED + clean removes worktree safely.
-  it('37. normal CANCELLED + clean removes worktree safely', async () => {
+  testWindowsWorktree('37. normal CANCELLED + clean removes worktree safely', async () => {
     adapter.executionBarrier = Promise.resolve({ executionId: 'exec-1', status: 'CANCELLED' });
     const removeSpy = vi.spyOn(worktreeService, 'removeWorktree');
     vi.spyOn(worktreeService, 'inspectWorktree').mockResolvedValue({
@@ -1012,7 +1013,7 @@ describe('ConcurrentExecutionScheduler (R5G3D1)', () => {
   });
 
   // 38. safe removal occurs only after dispatch promise terminal.
-  it('38. safe removal occurs only after dispatch promise terminal', async () => {
+  testWindowsWorktree('38. safe removal occurs only after dispatch promise terminal', async () => {
     let dispatchFinished = false;
     const removeSpy = vi.spyOn(worktreeService, 'removeWorktree').mockImplementation(async () => {
       expect(dispatchFinished).toBe(true);
@@ -1046,7 +1047,7 @@ describe('ConcurrentExecutionScheduler (R5G3D1)', () => {
   });
 
   // 39. safe removal occurs while lease heartbeat ownership still active.
-  it('39. safe removal occurs while lease heartbeat ownership still active', async () => {
+  testWindowsWorktree('39. safe removal occurs while lease heartbeat ownership still active', async () => {
     adapter.executionBarrier = Promise.resolve({ executionId: 'exec-1', status: 'FAILED' });
     vi.spyOn(worktreeService, 'inspectWorktree').mockResolvedValue({
       status: 'INSPECTED',
@@ -1077,7 +1078,7 @@ describe('ConcurrentExecutionScheduler (R5G3D1)', () => {
   });
 
   // 40. worktree removal failure uses no force and is surfaced.
-  it('40. worktree removal failure uses no force and is surfaced', async () => {
+  testWindowsWorktree('40. worktree removal failure uses no force and is surfaced', async () => {
     adapter.executionBarrier = Promise.resolve({ executionId: 'exec-1', status: 'FAILED' });
     vi.spyOn(worktreeService, 'inspectWorktree').mockResolvedValue({
       status: 'INSPECTED',
@@ -1104,7 +1105,7 @@ describe('ConcurrentExecutionScheduler (R5G3D1)', () => {
   });
 
   // 41. heartbeat continues through post-dispatch inspect/cleanup.
-  it('41. heartbeat continues through post-dispatch inspect/cleanup', async () => {
+  testWindowsWorktree('41. heartbeat continues through post-dispatch inspect/cleanup', async () => {
     let postDispatchHeartbeatFired = false;
     let inspectCount = 0;
     vi.spyOn(worktreeService, 'inspectWorktree').mockImplementation(async () => {
@@ -1133,13 +1134,13 @@ describe('ConcurrentExecutionScheduler (R5G3D1)', () => {
   });
 
   // 42. heartbeat supervisor stop waits for in-flight heartbeat.
-  it('42. heartbeat supervisor stop waits for in-flight heartbeat', async () => {
+  testWindowsWorktree('42. heartbeat supervisor stop waits for in-flight heartbeat', async () => {
     const res = await scheduler.execute(authId);
     expect(res.status).toBe('COMPLETED');
   });
 
   // 43. in-flight final heartbeat loss prevents lease release.
-  it('43. in-flight final heartbeat loss prevents lease release', async () => {
+  testWindowsWorktree('43. in-flight final heartbeat loss prevents lease release', async () => {
     const releaseSpy = vi.spyOn(leaseService, 'release');
     vi.spyOn(worktreeService, 'inspectWorktree').mockImplementation(async () => {
       db.prepare("UPDATE account_leases SET expires_at = '2020-01-01T00:00:00.000Z'").run();
@@ -1192,7 +1193,7 @@ describe('ConcurrentExecutionScheduler (R5G3D1)', () => {
   });
 
   // 46. lease release failure is surfaced and not retried.
-  it('46. lease release failure is surfaced and not retried', async () => {
+  testWindowsWorktree('46. lease release failure is surfaced and not retried', async () => {
     const releaseSpy = vi.spyOn(leaseService, 'release').mockReturnValueOnce({
       status: 'FAILED',
       code: 'LEASE_TOKEN_MISMATCH',
@@ -1205,7 +1206,7 @@ describe('ConcurrentExecutionScheduler (R5G3D1)', () => {
   });
 
   // 47. no stale lease reclaim.
-  it('47. no stale lease reclaim', async () => {
+  testWindowsWorktree('47. no stale lease reclaim', async () => {
     const res = await scheduler.execute(authId);
     expect(res.status).toBe('COMPLETED');
   });
@@ -1245,33 +1246,33 @@ describe('ConcurrentExecutionScheduler (R5G3D1)', () => {
   });
 
   // 52. no provider-specific branch.
-  it('52. no provider-specific branch', async () => {
+  testWindowsWorktree('52. no provider-specific branch', async () => {
     const res = await scheduler.execute(authId);
     expect(res.status).toBe('COMPLETED');
   });
 
   // 53. provider COMPLETED maps to scheduler COMPLETED only when lifecycle and release succeed.
-  it('53. provider COMPLETED maps to scheduler COMPLETED only when lifecycle and release succeed', async () => {
+  testWindowsWorktree('53. provider COMPLETED maps to scheduler COMPLETED only when lifecycle and release succeed', async () => {
     const res = await scheduler.execute(authId);
     expect(res.status).toBe('COMPLETED');
   });
 
   // 54. provider FAILED maps to PROVIDER_FAILED.
-  it('54. provider FAILED maps to PROVIDER_FAILED', async () => {
+  testWindowsWorktree('54. provider FAILED maps to PROVIDER_FAILED', async () => {
     adapter.throwOnExecute = true;
     const res = await scheduler.execute(authId);
     expect(res.status).toBe('PROVIDER_FAILED');
   });
 
   // 55. provider CANCELLED maps to CANCELLED.
-  it('55. provider CANCELLED maps to CANCELLED', async () => {
+  testWindowsWorktree('55. provider CANCELLED maps to CANCELLED', async () => {
     adapter.executionBarrier = Promise.resolve({ executionId: 'exec-1', status: 'CANCELLED' });
     const res = await scheduler.execute(authId);
     expect(res.status).toBe('CANCELLED');
   });
 
   // 56. post-dispatch worktree inspection failure prevents normal success.
-  it('56. post-dispatch worktree inspection failure prevents normal success', async () => {
+  testWindowsWorktree('56. post-dispatch worktree inspection failure prevents normal success', async () => {
     let inspectCount = 0;
     vi.spyOn(worktreeService, 'inspectWorktree').mockImplementation(async () => {
       inspectCount++;
@@ -1308,7 +1309,7 @@ describe('ConcurrentExecutionScheduler (R5G3D1)', () => {
   });
 
   // 58. scheduler result may safely include leaseId/slot/digest.
-  it('58. scheduler result may safely include leaseId/slot/digest', async () => {
+  testWindowsWorktree('58. scheduler result may safely include leaseId/slot/digest', async () => {
     const res = await scheduler.execute(authId);
     expect(res.leaseId).toBeDefined();
     expect(res.workerSlotId).toBe(slotId);
@@ -1336,7 +1337,7 @@ describe('ConcurrentExecutionScheduler (R5G3D1)', () => {
   });
 
   // 61. scheduler returns RECOVERY_FENCED without releasing lease or removing worktree on typed RECOVERY_FENCED dispatch failure
-  it('61. scheduler returns RECOVERY_FENCED without releasing lease or removing worktree on typed RECOVERY_FENCED dispatch failure', async () => {
+  testWindowsWorktree('61. scheduler returns RECOVERY_FENCED without releasing lease or removing worktree on typed RECOVERY_FENCED dispatch failure', async () => {
     vi.spyOn(dispatchService, 'dispatchScheduled').mockResolvedValue({
       executionId: 'exec-fenced',
       status: 'FAILED',
@@ -1358,7 +1359,7 @@ describe('ConcurrentExecutionScheduler (R5G3D1)', () => {
   });
 
   // 62. scheduler returns RECOVERY_FENCED when dispatch encounters RECOVERY_FENCED from start claim failure
-  it('62. scheduler returns RECOVERY_FENCED when dispatch encounters RECOVERY_FENCED from start claim failure', async () => {
+  testWindowsWorktree('62. scheduler returns RECOVERY_FENCED when dispatch encounters RECOVERY_FENCED from start claim failure', async () => {
     vi.spyOn(dispatchService, 'dispatchScheduled').mockResolvedValue({
       executionId: 'exec-concurrent',
       status: 'FAILED',
@@ -1376,7 +1377,7 @@ describe('ConcurrentExecutionScheduler (R5G3D1)', () => {
   });
 
   // 63. scheduler returns RECOVERY_FENCED on settlement failure and retains lease and worktree
-  it('63. scheduler returns RECOVERY_FENCED on settlement failure and retains lease and worktree', async () => {
+  testWindowsWorktree('63. scheduler returns RECOVERY_FENCED on settlement failure and retains lease and worktree', async () => {
     vi.spyOn(dispatchService, 'dispatchScheduled').mockResolvedValue({
       executionId: 'exec-settle-fail',
       status: 'FAILED',
@@ -1396,7 +1397,7 @@ describe('ConcurrentExecutionScheduler (R5G3D1)', () => {
   });
 
   // 64. scheduler returns RECOVERY_FENCED on rejected adapter start claim CAS and stops supervisor without idling slot
-  it('64. scheduler returns RECOVERY_FENCED on rejected adapter start claim CAS and stops supervisor without idling slot', async () => {
+  testWindowsWorktree('64. scheduler returns RECOVERY_FENCED on rejected adapter start claim CAS and stops supervisor without idling slot', async () => {
     vi.spyOn(dispatchService, 'dispatchScheduled').mockResolvedValue({
       executionId: 'exec-start-claim-fail',
       status: 'FAILED',
@@ -1451,7 +1452,7 @@ describe('ConcurrentExecutionScheduler (R5G3D1)', () => {
   });
 
   // 66. Scheduler dispatch exception retains all recovery resources
-  it('66. Scheduler dispatch exception retains all recovery resources', async () => {
+  testWindowsWorktree('66. Scheduler dispatch exception retains all recovery resources', async () => {
     db.prepare("UPDATE execution_authorizations SET lifecycle_version = 1, assignment_id = ?, selected_account_id = ?, task_ownership_epoch = 1 WHERE id = ?").run(assignmentId, accountId, authId);
     db.prepare("UPDATE tasks SET ownership_epoch = 1 WHERE id = ?").run(taskId);
 
@@ -1463,6 +1464,10 @@ describe('ConcurrentExecutionScheduler (R5G3D1)', () => {
     expect(res.status).toBe('RECOVERY_FENCED');
     expect(res.errorCode).toBe('RECOVERY_FENCED');
     expect(timer.pendingCount).toBe(0);
+
+    const epochOwner = { projectId, taskId, attemptId, assignmentId, workerSlotId: slotId, baseSha, ownershipEpoch: 1 };
+    expect(fs.existsSync(worktreeService.deriveWorktreePath(epochOwner).worktreePath)).toBe(true);
+    expect(fs.existsSync(worktreeService.deriveWorktreePath({ ...epochOwner, ownershipEpoch: null }).worktreePath)).toBe(false);
 
     const lease = repo.getActiveLeaseForAssignment(assignmentId);
     expect(lease).not.toBeNull();
@@ -1491,5 +1496,39 @@ describe('ConcurrentExecutionScheduler (R5G3D1)', () => {
     expect(lease).not.toBeNull();
     const slot = repo.getWorkerSlot(slotId);
     expect(slot?.status).toBe('LEASED');
+  });
+
+  testWindowsWorktree('68. Legacy authorization backfill does not silently rename its durable worktree namespace', async () => {
+    const authorization = repo.getExecutionAuthorization(authId)!;
+    expect(authorization.lifecycle_version).not.toBe(1);
+    expect(authorization.task_ownership_epoch).toBe(1);
+    const result = await scheduler.execute(authId);
+    expect(result.status).toBe('COMPLETED');
+    const legacy = { projectId, taskId, attemptId, assignmentId, workerSlotId: slotId, baseSha };
+    const inspected = await worktreeService.inspectWorktree(legacy);
+    expect(inspected.status).toBe('INSPECTED');
+    if (inspected.status === 'INSPECTED') expect(inspected.inspection.exists).toBe(true);
+    expect(fs.existsSync(worktreeService.deriveWorktreePath({ ...legacy, ownershipEpoch: 1 }).worktreePath)).toBe(false);
+    expect(adapter.executeCallCount).toBe(1);
+  });
+
+  it('69. Unsupported native preparation preserves authorization and releases its newly acquired lease without dispatch', async () => {
+    const authorization = repo.getExecutionAuthorization(authId);
+    const task = repo.getTask(taskId);
+    const managedEntries = fs.readdirSync(managedDir);
+    const dispatch = vi.spyOn(dispatchService, 'dispatchScheduled');
+    const remove = vi.spyOn(worktreeService, 'removeWorktree');
+    const result = await withoutWindowsWorktreeBoundary(() => scheduler.execute(authId));
+    expect(result.status).toBe('WORKTREE_CREATE_FAILED');
+    expect(result.errorCode).toBe('UNSUPPORTED_MUTATION_BOUNDARY');
+    expect(dispatch).not.toHaveBeenCalled(); expect(remove).not.toHaveBeenCalled();
+    expect(adapter.executeCallCount).toBe(0);
+    expect(repo.getExecutionAuthorization(authId)).toEqual(authorization);
+    expect(repo.getTask(taskId)).toEqual(task);
+    expect(repo.getProcessRunsByTask(taskId)).toEqual([]);
+    expect(fs.readdirSync(managedDir)).toEqual(managedEntries);
+    expect(repo.getActiveLeaseForAssignment(assignmentId)).toBeNull();
+    expect(repo.getWorkerSlot(slotId)?.status).toBe('IDLE');
+    expect(repo.getAccountLease(result.leaseId!)?.released_at).toBeTruthy();
   });
 });
