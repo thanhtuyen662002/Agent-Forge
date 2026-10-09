@@ -1,4 +1,5 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
+import { testWindowsWorktree } from './helpers/worktreePlatforms';
 import Database from 'better-sqlite3';
 import fs from 'fs';
 import path from 'path';
@@ -1487,7 +1488,7 @@ describe('R5I6 Crash Recovery, Execution Lifecycle Linearization, and Durable Au
   });
 
   // 38. Existing scheduler, provider dispatch, restart recovery, R5I3, and R5I4 regressions remain green
-  it('38. should execute scheduled dispatch through full pipeline end-to-end', async () => {
+  testWindowsWorktree('38. should execute scheduled dispatch through full pipeline end-to-end', async () => {
     const { auth } = await seedStandardTopology();
 
     const schedRes = await scheduler.execute(auth.id);
@@ -1745,7 +1746,7 @@ describe('R5I6 Crash Recovery, Execution Lifecycle Linearization, and Durable Au
   });
 
   // 50. Dispatch settlement failure returns RECOVERY_FENCED, retaining lease, slot, and worktree
-  it('50. should return RECOVERY_FENCED on settlement failure and retain lease, slot, and worktree', async () => {
+  testWindowsWorktree('50. should return RECOVERY_FENCED on settlement failure and retain lease, slot, and worktree', async () => {
     const { auth } = await seedStandardTopology();
 
     // Spy on settleExecutionResult to simulate database / transaction failure during settlement

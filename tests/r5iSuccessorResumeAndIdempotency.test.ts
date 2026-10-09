@@ -1,4 +1,5 @@
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
+import { testWindowsWorktree } from './helpers/worktreePlatforms';
 import { approveFixtureCommand } from './helpers/verificationCapabilityFixture';
 import Database from 'better-sqlite3';
 import fs from 'fs';
@@ -658,7 +659,7 @@ describe('R5I5 Successor Resume, Linearization, and Idempotency Authority', () =
     expect(schedRes.error).toMatch(/ROUTING_ASSIGNMENT_NOT_FOUND|PREPARATION_FAILED|Durable binding invariant/);
   });
 
-  it('8. legacy auth.assignment_id NULL still uses selectedAssignmentId from routing payload', async () => {
+  testWindowsWorktree('8. legacy auth.assignment_id NULL still uses selectedAssignmentId from routing payload', async () => {
     const legacyDecId = 'dec-legacy-1';
     const legacyAsgnId = 'asgn-legacy-1';
     repo.createAgentAssignment({
@@ -1449,7 +1450,7 @@ describe('R5I5 Successor Resume, Linearization, and Idempotency Authority', () =
   // F. LEASE / ACCEPTANCE (Tests 46-60)
   // ==========================================
 
-  it('46. scheduler performs exactly one first acquireForAssignment and accepts execution', async () => {
+  testWindowsWorktree('46. scheduler performs exactly one first acquireForAssignment and accepts execution', async () => {
     const resumeRes = await handoffService.resumeHandoffSuccessor({ transferId: defaultTransfer.id });
     const schedRes = await scheduler.execute(resumeRes.authorization!.id);
     expect(schedRes.status).toBe('COMPLETED');
@@ -1926,7 +1927,7 @@ describe('R5I5 Successor Resume, Linearization, and Idempotency Authority', () =
     expect(replayRes.errorCode).toBe('LEASE_INTEGRITY_MISMATCH');
   });
 
-  it('60. accept failure before dispatch releases owned lease and does not mark ACCEPTED', async () => {
+  testWindowsWorktree('60. accept failure before dispatch releases owned lease and does not mark ACCEPTED', async () => {
     const resumeRes = await handoffService.resumeHandoffSuccessor({ transferId: defaultTransfer.id });
     // Sabotage attempt to make acceptance fail
     db.prepare("UPDATE task_attempts SET status = 'FAILED' WHERE id = ?").run(successorAttemptId);
@@ -1954,7 +1955,7 @@ describe('R5I5 Successor Resume, Linearization, and Idempotency Authority', () =
     expect(dispatchRes.error).toContain('EXECUTION_AUTHORIZATION_NOT_ACCEPTED');
   });
 
-  it('62. R5I dispatch requires transfer in ACCEPTED state', async () => {
+  testWindowsWorktree('62. R5I dispatch requires transfer in ACCEPTED state', async () => {
     const resumeRes = await handoffService.resumeHandoffSuccessor({ transferId: defaultTransfer.id });
     expect(resumeRes.success).toBe(true);
     const schedRes = await scheduler.execute(resumeRes.authorization!.id);
@@ -2141,7 +2142,7 @@ describe('R5I5 Successor Resume, Linearization, and Idempotency Authority', () =
     expect(res.status).toBe('COMPLETED');
   });
 
-  it('69. legacy scheduler remains functional', async () => {
+  testWindowsWorktree('69. legacy scheduler remains functional', async () => {
     const legacyDecId = 'dec-leg-sched';
     const legacyAsgnId = 'asgn-leg-sched';
     repo.createAgentAssignment({

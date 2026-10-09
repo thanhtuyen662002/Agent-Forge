@@ -1,4 +1,5 @@
 import { describe, it, expect, beforeEach } from 'vitest';
+import { testWindowsWorktree } from './helpers/worktreePlatforms';
 import fs from 'fs';
 import path from 'path';
 import os from 'os';
@@ -481,7 +482,7 @@ describe('R5H4 Provider Execution Provenance Contract', () => {
   });
 
   // 8. scheduled cancellation during preparation (pre-claim) returns CANCELLED without provenance and leaves authorization unclaimed
-  it('8. scheduled cancellation during preparation (pre-claim) returns CANCELLED without provenance and leaves authorization unclaimed', async () => {
+  testWindowsWorktree('8. scheduled cancellation during preparation (pre-claim) returns CANCELLED without provenance and leaves authorization unclaimed', async () => {
     const worktreeTuple = {
       projectId,
       taskId,
@@ -518,7 +519,7 @@ describe('R5H4 Provider Execution Provenance Contract', () => {
   });
 
   // 9. scheduled cancellation post-claim but pre-adapter returns CANCELLED without provenance after claiming authorization
-  it('9. scheduled cancellation post-claim but pre-adapter returns CANCELLED without provenance after claiming authorization', async () => {
+  testWindowsWorktree('9. scheduled cancellation post-claim but pre-adapter returns CANCELLED without provenance after claiming authorization', async () => {
     const worktreeTuple = {
       projectId,
       taskId,
@@ -685,7 +686,7 @@ describe('R5H4 Provider Execution Provenance Contract', () => {
   });
 
   // 19. scheduled mode provenance.executionId equals final returned executionId
-  it('19. scheduled mode provenance.executionId equals final returned executionId', async () => {
+  testWindowsWorktree('19. scheduled mode provenance.executionId equals final returned executionId', async () => {
     const scheduler = new ConcurrentExecutionScheduler(repo, leaseService, worktreeService, dispatchService);
     const schedResult = await scheduler.execute(authId);
     expect(schedResult.status).toBe('COMPLETED');
@@ -760,7 +761,7 @@ describe('R5H4 Provider Execution Provenance Contract', () => {
   });
 
   // 23. scheduler entered execution path with real dispatch pre-adapter rejection exposes no provider provenance
-  it('23. scheduler entered execution path with real dispatch pre-adapter rejection exposes no provider provenance', async () => {
+  testWindowsWorktree('23. scheduler entered execution path with real dispatch pre-adapter rejection exposes no provider provenance', async () => {
     const scheduler = new ConcurrentExecutionScheduler(repo, leaseService, worktreeService, dispatchService);
 
     // Mutate provider account after worktree created, right before dispatchScheduled runs
@@ -787,7 +788,7 @@ describe('R5H4 Provider Execution Provenance Contract', () => {
   });
 
   // 24. scheduler genuine provider failure exposes provenance
-  it('24. scheduler genuine provider failure exposes provenance', async () => {
+  testWindowsWorktree('24. scheduler genuine provider failure exposes provenance', async () => {
     mockAdapter.executeResult = {
       status: 'FAILED',
       errorCode: 'QUOTA_EXHAUSTED',
@@ -802,7 +803,7 @@ describe('R5H4 Provider Execution Provenance Contract', () => {
   });
 
   // 25. scheduler post-adapter worktree/lease cleanup failure preserves exact provider provenance
-  it('25. scheduler post-adapter worktree/lease cleanup failure preserves exact provider provenance', async () => {
+  testWindowsWorktree('25. scheduler post-adapter worktree/lease cleanup failure preserves exact provider provenance', async () => {
     mockAdapter.executeResult = {
       status: 'FAILED',
       errorCode: 'QUOTA_EXHAUSTED',
@@ -831,7 +832,7 @@ describe('R5H4 Provider Execution Provenance Contract', () => {
   });
 
   // 26. scheduler dispatch exception synthetic result has no provenance
-  it('26. scheduler dispatch exception synthetic result has no provenance', async () => {
+  testWindowsWorktree('26. scheduler dispatch exception synthetic result has no provenance', async () => {
     const scheduler = new ConcurrentExecutionScheduler(repo, leaseService, worktreeService, dispatchService);
     const origDispatchScheduled = dispatchService.dispatchScheduled.bind(dispatchService);
     dispatchService.dispatchScheduled = async () => {

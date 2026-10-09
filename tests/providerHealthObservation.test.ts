@@ -1,4 +1,5 @@
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
+import { testWindowsWorktree } from './helpers/worktreePlatforms';
 import fs from 'fs';
 import path from 'path';
 import os from 'os';
@@ -1002,7 +1003,7 @@ describe('R5H4 Durable Provider Health Observation Contract', () => {
   });
 
   // 34. Post-claim/pre-adapter cancellation writes no observation
-  it('34. post-claim/pre-adapter cancellation writes no observation', async () => {
+  testWindowsWorktree('34. post-claim/pre-adapter cancellation writes no observation', async () => {
     const registry = new ProviderRegistry();
     const adapter = new MockAdapter('prov-test-obs', 'Obs Provider');
     registry.register(adapter);

@@ -1,4 +1,5 @@
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
+import { testWindowsWorktree } from './helpers/worktreePlatforms';
 import fs from 'fs';
 import path from 'path';
 import os from 'os';
@@ -575,7 +576,7 @@ describe('R5G3B — Verified Workspace Runtime Binding & Local CLI Authority', (
     expect(recordingAdapter.executionCount).toBe(0);
   });
 
-  it('5. Scheduled caller supplies authorizationId only', async () => {
+  testWindowsWorktree('5. Scheduled caller supplies authorizationId only', async () => {
     const createRes = await worktreeService.createWorktree(getOwnershipTuple());
     expect(createRes.status).toBe('CREATED');
 
@@ -584,7 +585,7 @@ describe('R5G3B — Verified Workspace Runtime Binding & Local CLI Authority', (
     expect(recordingAdapter.executionCount).toBe(1);
   });
 
-  it('6. Scheduled dispatch derives assignment from durable routing state', async () => {
+  testWindowsWorktree('6. Scheduled dispatch derives assignment from durable routing state', async () => {
     const createRes = await worktreeService.createWorktree(getOwnershipTuple());
     expect(createRes.status).toBe('CREATED');
 
@@ -610,7 +611,7 @@ describe('R5G3B — Verified Workspace Runtime Binding & Local CLI Authority', (
     expect(dispatchService.dispatchScheduled.length).toBe(1);
   });
 
-  it('10. Scheduled source uses auth.repository_head_sha', async () => {
+  testWindowsWorktree('10. Scheduled source uses auth.repository_head_sha', async () => {
     const createRes = await worktreeService.createWorktree(getOwnershipTuple());
     expect(createRes.status).toBe('CREATED');
 
@@ -619,7 +620,7 @@ describe('R5G3B — Verified Workspace Runtime Binding & Local CLI Authority', (
     expect(recordingAdapter.lastRequest?.runtimeBinding?.workspace?.sourceSha).toBe(baseSha);
   });
 
-  it('11. Task.base_sha differing from repository_head_sha does not become worktree source', async () => {
+  testWindowsWorktree('11. Task.base_sha differing from repository_head_sha does not become worktree source', async () => {
     const createRes = await worktreeService.createWorktree(getOwnershipTuple());
     expect(createRes.status).toBe('CREATED');
 
@@ -639,7 +640,7 @@ describe('R5G3B — Verified Workspace Runtime Binding & Local CLI Authority', (
     expect(recordingAdapter.executionCount).toBe(0);
   });
 
-  it('13. Workspace missing -> scheduled dispatch fails before auth claim', async () => {
+  testWindowsWorktree('13. Workspace missing -> scheduled dispatch fails before auth claim', async () => {
     const res = await dispatchService.dispatchScheduled(authId);
     expect(res.status).toBe('FAILED');
     expect(res.error).toContain('SCHEDULED_WORKSPACE_MISSING');
@@ -649,7 +650,7 @@ describe('R5G3B — Verified Workspace Runtime Binding & Local CLI Authority', (
     expect(auth?.status).toBe('AUTHORIZED');
   });
 
-  it('14. Workspace unregistered -> fails before claim', async () => {
+  testWindowsWorktree('14. Workspace unregistered -> fails before claim', async () => {
     const createRes = await worktreeService.createWorktree(getOwnershipTuple());
     expect(createRes.status).toBe('CREATED');
     if (createRes.status === 'CREATED') {
@@ -667,7 +668,7 @@ describe('R5G3B — Verified Workspace Runtime Binding & Local CLI Authority', (
     expect(auth?.status).toBe('AUTHORIZED');
   });
 
-  it('15. Workspace wrong HEAD -> fails before claim', async () => {
+  testWindowsWorktree('15. Workspace wrong HEAD -> fails before claim', async () => {
     fs.writeFileSync(path.join(repoDir, 'c2.txt'), 'c2');
     execSync(`"${gitExe}" add c2.txt`, { cwd: repoDir, stdio: 'pipe' });
     execSync(`"${gitExe}" commit -m "Commit 2"`, { cwd: repoDir, stdio: 'pipe' });
@@ -688,7 +689,7 @@ describe('R5G3B — Verified Workspace Runtime Binding & Local CLI Authority', (
     expect(auth?.status).toBe('AUTHORIZED');
   });
 
-  it('16. Workspace non-detached -> fails before claim', async () => {
+  testWindowsWorktree('16. Workspace non-detached -> fails before claim', async () => {
     const createRes = await worktreeService.createWorktree(getOwnershipTuple());
     expect(createRes.status).toBe('CREATED');
     if (createRes.status === 'CREATED') {
@@ -704,7 +705,7 @@ describe('R5G3B — Verified Workspace Runtime Binding & Local CLI Authority', (
     expect(auth?.status).toBe('AUTHORIZED');
   });
 
-  it('17. Workspace unlocked -> fails before claim', async () => {
+  testWindowsWorktree('17. Workspace unlocked -> fails before claim', async () => {
     const createRes = await worktreeService.createWorktree(getOwnershipTuple());
     expect(createRes.status).toBe('CREATED');
     if (createRes.status === 'CREATED') {
@@ -720,7 +721,7 @@ describe('R5G3B — Verified Workspace Runtime Binding & Local CLI Authority', (
     expect(auth?.status).toBe('AUTHORIZED');
   });
 
-  it('18. Workspace dirty before dispatch -> fails before claim', async () => {
+  testWindowsWorktree('18. Workspace dirty before dispatch -> fails before claim', async () => {
     const createRes = await worktreeService.createWorktree(getOwnershipTuple());
     expect(createRes.status).toBe('CREATED');
     if (createRes.status === 'CREATED') {
@@ -745,7 +746,7 @@ describe('R5G3B — Verified Workspace Runtime Binding & Local CLI Authority', (
     expect(recordingAdapter.executionCount).toBe(0);
   });
 
-  it('21. Valid workspace causes runtimeBinding.workspace to be populated', async () => {
+  testWindowsWorktree('21. Valid workspace causes runtimeBinding.workspace to be populated', async () => {
     const createRes = await worktreeService.createWorktree(getOwnershipTuple());
     expect(createRes.status).toBe('CREATED');
 
@@ -754,7 +755,7 @@ describe('R5G3B — Verified Workspace Runtime Binding & Local CLI Authority', (
     expect(recordingAdapter.lastRequest?.runtimeBinding?.workspace).toBeDefined();
   });
 
-  it('22. Workspace workerSlotId equals durable assignment slot', async () => {
+  testWindowsWorktree('22. Workspace workerSlotId equals durable assignment slot', async () => {
     const createRes = await worktreeService.createWorktree(getOwnershipTuple());
     expect(createRes.status).toBe('CREATED');
 
@@ -762,7 +763,7 @@ describe('R5G3B — Verified Workspace Runtime Binding & Local CLI Authority', (
     expect(recordingAdapter.lastRequest?.runtimeBinding?.workspace?.workerSlotId).toBe(slotId);
   });
 
-  it('23. Workspace sourceSha equals auth.repository_head_sha', async () => {
+  testWindowsWorktree('23. Workspace sourceSha equals auth.repository_head_sha', async () => {
     const createRes = await worktreeService.createWorktree(getOwnershipTuple());
     expect(createRes.status).toBe('CREATED');
 
@@ -770,7 +771,7 @@ describe('R5G3B — Verified Workspace Runtime Binding & Local CLI Authority', (
     expect(recordingAdapter.lastRequest?.runtimeBinding?.workspace?.sourceSha).toBe(baseSha);
   });
 
-  it('24. Workspace ownership digest equals GitWorktreeService result', async () => {
+  testWindowsWorktree('24. Workspace ownership digest equals GitWorktreeService result', async () => {
     const createRes = await worktreeService.createWorktree(getOwnershipTuple());
     expect(createRes.status).toBe('CREATED');
 
@@ -779,7 +780,7 @@ describe('R5G3B — Verified Workspace Runtime Binding & Local CLI Authority', (
     expect(recordingAdapter.lastRequest?.runtimeBinding?.workspace?.ownershipDigest).toBe(derived.digest);
   });
 
-  it('25. Workspace workingDirectory equals canonical inspected path', async () => {
+  testWindowsWorktree('25. Workspace workingDirectory equals canonical inspected path', async () => {
     const createRes = await worktreeService.createWorktree(getOwnershipTuple());
     expect(createRes.status).toBe('CREATED');
 
@@ -788,7 +789,7 @@ describe('R5G3B — Verified Workspace Runtime Binding & Local CLI Authority', (
     expect(recordingAdapter.lastRequest?.runtimeBinding?.workspace?.workingDirectory).toBe(derived.worktreePath);
   });
 
-  it('26. LocalCli scheduled execution uses worktree path as ProcessRunner cwd', async () => {
+  testWindowsWorktree('26. LocalCli scheduled execution uses worktree path as ProcessRunner cwd', async () => {
     const createRes = await worktreeService.createWorktree(getOwnershipTuple());
     expect(createRes.status).toBe('CREATED');
     if (createRes.status === 'CREATED') {
@@ -823,7 +824,7 @@ describe('R5G3B — Verified Workspace Runtime Binding & Local CLI Authority', (
     }
   });
 
-  it('27. Scheduled context-file validation root is worktree path', async () => {
+  testWindowsWorktree('27. Scheduled context-file validation root is worktree path', async () => {
     const createRes = await worktreeService.createWorktree(getOwnershipTuple());
     expect(createRes.status).toBe('CREATED');
     if (createRes.status === 'CREATED') {
@@ -858,7 +859,7 @@ describe('R5G3B — Verified Workspace Runtime Binding & Local CLI Authority', (
     }
   });
 
-  it('28. Context file existing only in worktree can be used', async () => {
+  testWindowsWorktree('28. Context file existing only in worktree can be used', async () => {
     const createRes = await worktreeService.createWorktree(getOwnershipTuple());
     expect(createRes.status).toBe('CREATED');
     if (createRes.status === 'CREATED') {
@@ -895,7 +896,7 @@ describe('R5G3B — Verified Workspace Runtime Binding & Local CLI Authority', (
     }
   });
 
-  it('29. Context escape outside worktree is denied', async () => {
+  testWindowsWorktree('29. Context escape outside worktree is denied', async () => {
     const createRes = await worktreeService.createWorktree(getOwnershipTuple());
     expect(createRes.status).toBe('CREATED');
     if (createRes.status === 'CREATED') {
@@ -960,7 +961,7 @@ describe('R5G3B — Verified Workspace Runtime Binding & Local CLI Authority', (
     expect(adapter.adapterType).toBe('LOCAL_CLI');
   });
 
-  it('32. Scheduled runtime bound event contains safe slot/source/digest fields', async () => {
+  testWindowsWorktree('32. Scheduled runtime bound event contains safe slot/source/digest fields', async () => {
     const createRes = await worktreeService.createWorktree(getOwnershipTuple());
     expect(createRes.status).toBe('CREATED');
 
@@ -973,7 +974,7 @@ describe('R5G3B — Verified Workspace Runtime Binding & Local CLI Authority', (
     expect(boundEvent?.structured_payload.workspaceOwnershipDigest).toBeDefined();
   });
 
-  it('33. Scheduled runtime event contains no lease token', async () => {
+  testWindowsWorktree('33. Scheduled runtime event contains no lease token', async () => {
     const createRes = await worktreeService.createWorktree(getOwnershipTuple());
     expect(createRes.status).toBe('CREATED');
 
@@ -985,7 +986,7 @@ describe('R5G3B — Verified Workspace Runtime Binding & Local CLI Authority', (
     }
   });
 
-  it('34. Successful scheduled dispatch still claims authorization exactly once', async () => {
+  testWindowsWorktree('34. Successful scheduled dispatch still claims authorization exactly once', async () => {
     const createRes = await worktreeService.createWorktree(getOwnershipTuple());
     expect(createRes.status).toBe('CREATED');
 
@@ -997,7 +998,7 @@ describe('R5G3B — Verified Workspace Runtime Binding & Local CLI Authority', (
     expect(auth?.dispatched_at).not.toBeNull();
   });
 
-  it('35. Second scheduled dispatch with same authorization fails as already dispatched', async () => {
+  testWindowsWorktree('35. Second scheduled dispatch with same authorization fails as already dispatched', async () => {
     const createRes = await worktreeService.createWorktree(getOwnershipTuple());
     expect(createRes.status).toBe('CREATED');
 
@@ -1027,7 +1028,7 @@ describe('R5G3B — Verified Workspace Runtime Binding & Local CLI Authority', (
     expect((dispatchService as any).removeWorktree).toBeUndefined();
   });
 
-  it('39. No WorkerSlot status/current_execution_id mutation', async () => {
+  testWindowsWorktree('39. No WorkerSlot status/current_execution_id mutation', async () => {
     const slotBefore = repo.getWorkerSlot(slotId);
     const createRes = await worktreeService.createWorktree(getOwnershipTuple());
     expect(createRes.status).toBe('CREATED');
@@ -1040,7 +1041,7 @@ describe('R5G3B — Verified Workspace Runtime Binding & Local CLI Authority', (
     expect(slotAfter?.current_execution_id).toBe(slotBefore?.current_execution_id);
   });
 
-  it('40. No provider-specific branch exists in dispatchScheduled', async () => {
+  testWindowsWorktree('40. No provider-specific branch exists in dispatchScheduled', async () => {
     const createRes = await worktreeService.createWorktree(getOwnershipTuple());
     expect(createRes.status).toBe('CREATED');
 

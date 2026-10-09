@@ -1,4 +1,5 @@
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
+import { testWindowsWorktree, withoutWindowsWorktreeBoundary } from './helpers/worktreePlatforms';
 import Database from 'better-sqlite3';
 import fs from 'fs';
 import path from 'path';
@@ -1200,7 +1201,7 @@ describe('R5I7 Cross-Provider Handoff Evidence and Closure Integration Suite', (
   });
 
   // 10. Adapter-start claim invokes Provider B exactly once
-  it('10. Adapter-start claim invokes Provider B exactly once', async () => {
+  testWindowsWorktree('10. Adapter-start claim invokes Provider B exactly once', async () => {
     const flow = await runProductionHandoffFlow();
 
     expect(flow.schedulerResult!.status).toBe('COMPLETED');
@@ -1243,7 +1244,7 @@ describe('R5I7 Cross-Provider Handoff Evidence and Closure Integration Suite', (
   }, 60000);
 
   // 12. Spoofed adapter provenance is removed and replaced with authentic durable Provider B provenance
-  it('12. Spoofed adapter provenance is removed and replaced with authentic durable Provider B provenance', async () => {
+  testWindowsWorktree('12. Spoofed adapter provenance is removed and replaced with authentic durable Provider B provenance', async () => {
     // Configure Provider B adapter to return spoofed Provider A values across recognized provenance fields
     const spoofedReturnResult = {
       status: 'COMPLETED' as const,
@@ -1323,7 +1324,7 @@ describe('R5I7 Cross-Provider Handoff Evidence and Closure Integration Suite', (
   });
 
   // 13. COMPLETED, FAILED, and CANCELLED settlement outcomes each persist atomically with correct terminal graph state
-  it('13. COMPLETED, FAILED, and CANCELLED settlement outcomes each persist atomically with correct terminal graph state', async () => {
+  testWindowsWorktree('13. COMPLETED, FAILED, and CANCELLED settlement outcomes each persist atomically with correct terminal graph state', async () => {
     const testCases = [
       {
         idSuffix: 'comp',
@@ -1477,7 +1478,7 @@ describe('R5I7 Cross-Provider Handoff Evidence and Closure Integration Suite', (
   }, 60000);
 
   // 14. Successful settlement releases the exact guarded lease and returns only the matching slot to IDLE
-  it('14. Successful settlement releases the exact guarded lease and returns only the matching slot to IDLE', async () => {
+  testWindowsWorktree('14. Successful settlement releases the exact guarded lease and returns only the matching slot to IDLE', async () => {
     const flow = await runProductionHandoffFlow();
 
     expect(flow.schedulerResult!.status).toBe('COMPLETED');
@@ -1498,7 +1499,7 @@ describe('R5I7 Cross-Provider Handoff Evidence and Closure Integration Suite', (
   });
 
   // 15. Identical workflow replay creates no second transfer, attempt, assignment, authorization, execution, settlement event, or adapter call
-  it('15. Identical workflow replay creates no second transfer, attempt, assignment, authorization, execution, settlement event, or adapter call', async () => {
+  testWindowsWorktree('15. Identical workflow replay creates no second transfer, attempt, assignment, authorization, execution, settlement event, or adapter call', async () => {
     const flow = await runProductionHandoffFlow();
     expect(flow.schedulerResult!.status).toBe('COMPLETED');
     expect(adapterB.invocationCount).toBe(1);
@@ -2044,7 +2045,7 @@ describe('R5I7 Cross-Provider Handoff Evidence and Closure Integration Suite', (
   }, 60000);
 
   // 20. Provider A -> Provider B evidence remains isolated from unrelated projects, attempts, accounts, and resources
-  it('20. Provider A -> Provider B evidence remains isolated from unrelated projects, attempts, accounts, and resources', async () => {
+  testWindowsWorktree('20. Provider A -> Provider B evidence remains isolated from unrelated projects, attempts, accounts, and resources', async () => {
     // 1. Execute Project 2 through a complete terminal production handoff via scheduler
     const p2Flow = await runProductionHandoffFlow({
       projectId: 'proj-closure-iso-2',
@@ -2242,4 +2243,25 @@ describe('R5I7 Cross-Provider Handoff Evidence and Closure Integration Suite', (
       expect(manifests.length).toBeGreaterThan(0);
     }
   }, 120000);
+  it('unsupported successor worktree preparation preserves the authorized handoff without adapter-start or settlement', async () => {
+    const flow = await runProductionHandoffFlow({ stopAt: 'AUTHORIZED' });
+    const authorization = repo.getExecutionAuthorization(flow.authorizationId!);
+    const transfer = repo.getHandoffTransfer(flow.transferId);
+    const task = repo.getTask(flow.taskId);
+    const managedEntries = fs.readdirSync(managedDir);
+    const result = await withoutWindowsWorktreeBoundary(() => scheduler.execute(flow.authorizationId!));
+    expect(result.status).toBe('WORKTREE_CREATE_FAILED');
+    expect(result.errorCode).toBe('UNSUPPORTED_MUTATION_BOUNDARY');
+    expect(repo.getExecutionAuthorization(flow.authorizationId!)).toEqual(authorization);
+    expect(repo.getHandoffTransfer(flow.transferId)).toEqual(transfer);
+    expect(repo.getTask(flow.taskId)).toEqual(task);
+    expect(adapterB.invocationCount).toBe(0);
+    expect(repo.getProcessRunsByTask(flow.taskId)).toEqual([]);
+    expect(repo.getActiveLeaseForAssignment(flow.succAsgnId!)).toBeNull();
+    expect(repo.getWorkerSlot(flow.slotBId)?.status).toBe('IDLE');
+    expect(repo.getAccountLease(result.leaseId!)?.released_at).toBeTruthy();
+    expect(fs.readdirSync(managedDir)).toEqual(managedEntries);
+    expect(authorization?.execution_id).toBeNull();
+    expect(authorization?.settled_at).toBeNull();
+  });
 });

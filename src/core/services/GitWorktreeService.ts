@@ -553,6 +553,13 @@ export class GitWorktreeService {
   public async createWorktree(tuple: WorktreeOwnershipTuple): Promise<WorktreeCreateResult> {
     const invalidEpoch = this.validateOwnershipEpoch(tuple);
     if (invalidEpoch) return invalidEpoch;
+    // Pure input policy remains available before a platform boundary, lock or
+    // filesystem mutation. Commit existence is checked only inside the safe
+    // supported boundary below.
+    if (!tuple.baseSha || typeof tuple.baseSha !== 'string' || !/^[0-9a-fA-F]{40}$/.test(tuple.baseSha)) {
+      return { status: 'FAILED', code: 'INVALID_SOURCE_SHA',
+        error: 'INVALID_SOURCE_SHA: baseSha must be a 40-character hexadecimal string.' };
+    }
     const unsupported = this.unsupportedMutationBoundary();
     if (unsupported) return unsupported;
     return this.withManagedRootLock<WorktreeCreateResult>(

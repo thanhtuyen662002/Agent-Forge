@@ -1,4 +1,5 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
+import { testWindowsWorktree } from './helpers/worktreePlatforms';
 import fs from 'fs';
 import path from 'path';
 import os from 'os';
@@ -540,7 +541,7 @@ describe('Parallel ConcurrentExecutionScheduler Proof (R5G3E1)', () => {
   });
 
   // SCENARIO 1: Primary 3-Way Parallel Schedulers Execution & Overlap Proof (Tests 1 - 33)
-  it('Primary 3-way concurrent scheduler execution proves true temporal overlap, slot isolation, worktree isolation, account capacity limit, and healthy terminal lifecycle', async () => {
+  testWindowsWorktree('Primary 3-way concurrent scheduler execution proves true temporal overlap, slot isolation, worktree isolation, account capacity limit, and healthy terminal lifecycle', async () => {
     const chainA = createAuthChain('Task A');
     const chainB = createAuthChain('Task B');
     const chainC = createAuthChain('Task C');
@@ -797,7 +798,7 @@ describe('Parallel ConcurrentExecutionScheduler Proof (R5G3E1)', () => {
   }, 120000);
 
   // SCENARIO 2: Failure & Lease Loss Isolation Scenario (Tests 34 - 42)
-  it('Lease loss isolation proves single-execution cancellation does not affect parallel healthy execution', async () => {
+  testWindowsWorktree('Lease loss isolation proves single-execution cancellation does not affect parallel healthy execution', async () => {
     const timer = new MockDeterministicTimer();
     const isolatedScheduler = new ConcurrentExecutionScheduler(
       repo,
@@ -888,7 +889,7 @@ describe('Parallel ConcurrentExecutionScheduler Proof (R5G3E1)', () => {
   }, 120000);
 
   // SCENARIO 3: Same Auth Duplicate Scenario (Tests 43 - 44)
-  it('Duplicate concurrent execution of the same authorization fails closed without creating second lease or worktree', async () => {
+  testWindowsWorktree('Duplicate concurrent execution of the same authorization fails closed without creating second lease or worktree', async () => {
     const chainX = createAuthChain('Task X');
 
     const promise1 = scheduler.execute(chainX.authId);
@@ -919,7 +920,7 @@ describe('Parallel ConcurrentExecutionScheduler Proof (R5G3E1)', () => {
   });
 
   // SCENARIO 4: Cross-Scheduler Instance Concurrency (Tests 45 - 47)
-  it('Cross-scheduler instance concurrent execution of the same assignment is blocked durably', async () => {
+  testWindowsWorktree('Cross-scheduler instance concurrent execution of the same assignment is blocked durably', async () => {
     const scheduler1 = new ConcurrentExecutionScheduler(repo, leaseService, worktreeService, dispatchService);
     const scheduler2 = new ConcurrentExecutionScheduler(repo, leaseService, worktreeService, dispatchService);
 

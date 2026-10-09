@@ -1,4 +1,5 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
+import { testWindowsWorktree, withoutWindowsWorktreeBoundary } from './helpers/worktreePlatforms';
 import fs from 'fs';
 import path from 'path';
 import os from 'os';
@@ -475,11 +476,17 @@ setInterval(() => {
       workerSlotId: slotId,
       baseSha,
     };
-    const created = await worktreeService.createWorktree(tuple);
-    if (created.status !== 'CREATED') {
-      throw new Error(`Failed to set up worktree: ${created.error}`);
+    if (process.platform === 'win32') {
+      const created = await worktreeService.createWorktree(tuple);
+      if (created.status !== 'CREATED') {
+        throw new Error(`Failed to set up worktree: ${created.error}`);
+      }
+      defaultWorktreePath = created.worktreePath;
+    } else {
+      // Portable process/legacy/pre-claim tests need no native workspace.
+      // Unsupported dispatch is exercised below with the real service.
+      defaultWorktreePath = worktreeService.deriveWorktreePath(tuple).worktreePath;
     }
-    defaultWorktreePath = created.worktreePath;
   });
 
   afterEach(async () => {
@@ -492,7 +499,28 @@ setInterval(() => {
     } catch {}
   });
 
-  it('1. scheduled ProviderDispatch generates canonical UUID internally', async () => {
+  it('unsupported worktree inspection cannot claim authorization, spawn or leak active dispatch', async () => {
+    const authorization = repo.getExecutionAuthorization(authId);
+    const task = repo.getTask(taskId);
+    const managedEntries = fs.readdirSync(managedDir);
+    const originalInspect = worktreeService.inspectWorktree.bind(worktreeService);
+    const inspect = vi.spyOn(worktreeService, 'inspectWorktree').mockImplementation(tuple =>
+      withoutWindowsWorktreeBoundary(() => originalInspect(tuple)));
+    const result = await dispatchService.dispatchScheduled(authId);
+    expect(result.status).toBe('FAILED');
+    expect(result.error).toContain('UNSUPPORTED_MUTATION_BOUNDARY');
+    expect(result.providerExecutionProvenance).toBeUndefined();
+    expect(inspect).toHaveBeenCalledTimes(1);
+    expect(recordingAdapter.executionCount).toBe(0);
+    expect(repo.getExecutionAuthorization(authId)).toEqual(authorization);
+    expect(repo.getTask(taskId)).toEqual(task);
+    expect(repo.getProcessRunsByTask(taskId)).toEqual([]);
+    expect(fs.readdirSync(managedDir)).toEqual(managedEntries);
+    expect(db.prepare('SELECT COUNT(*) AS count FROM account_leases').get()).toEqual({ count: 0 });
+    expect((await dispatchService.cancelScheduled(authId)).status).toBe('NOT_ACTIVE');
+  });
+
+  testWindowsWorktree('1. scheduled ProviderDispatch generates canonical UUID internally', async () => {
     const res = await dispatchService.dispatchScheduled(authId);
     expect(res.status).toBe('COMPLETED');
     expect(res.executionId).toMatch(/^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$/);
@@ -510,14 +538,14 @@ setInterval(() => {
     expect(dispatchService.dispatchScheduled.length).toBe(1);
   });
 
-  it('4. runtimeBinding receives canonical execution ID', async () => {
+  testWindowsWorktree('4. runtimeBinding receives canonical execution ID', async () => {
     await dispatchService.dispatchScheduled(authId);
     expect(recordingAdapter.lastRequest).toBeDefined();
     expect(recordingAdapter.lastRequest?.runtimeBinding?.executionId).toBeDefined();
     expect(recordingAdapter.lastRequest?.runtimeBinding?.executionId).toMatch(/^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$/);
   });
 
-  it('5. scheduled LocalCli receives exact canonical ID', async () => {
+  testWindowsWorktree('5. scheduled LocalCli receives exact canonical ID', async () => {
     const localCliAdapter = new BarrierLocalCliAdapter(providerId, 'Barrier Local CLI', { scriptPath: quickScriptPath });
     localCliAdapter.setRepository(repo);
     const customRegistry = new ProviderRegistry();
@@ -529,7 +557,7 @@ setInterval(() => {
     expect(res.executionId).toMatch(/^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$/);
   });
 
-  it('6. scheduled LocalCli does not replace ID with crypto.randomUUID', async () => {
+  testWindowsWorktree('6. scheduled LocalCli does not replace ID with crypto.randomUUID', async () => {
     const localCliAdapter = new BarrierLocalCliAdapter(providerId, 'Barrier Local CLI', { scriptPath: quickScriptPath });
     localCliAdapter.setRepository(repo);
     const customRegistry = new ProviderRegistry();
@@ -738,7 +766,7 @@ setInterval(() => {
     expect(recordingAdapter.executionCount).toBe(0);
   });
 
-  it('19. LocalCli registers scheduled control before asynchronous preparation', async () => {
+  testWindowsWorktree('19. LocalCli registers scheduled control before asynchronous preparation', async () => {
     const localCliAdapter = new BarrierLocalCliAdapter(providerId, 'Barrier Local CLI', { scriptPath: quickScriptPath });
     localCliAdapter.setRepository(repo);
 
@@ -750,7 +778,7 @@ setInterval(() => {
     expect(res.status).toBe('COMPLETED');
   });
 
-  it('20. LocalCli cancellation before ProcessRunner start causes no spawn', async () => {
+  testWindowsWorktree('20. LocalCli cancellation before ProcessRunner start causes no spawn', async () => {
     const localCliAdapter = new BarrierLocalCliAdapter(providerId, 'Barrier Local CLI', { scriptPath: quickScriptPath });
     localCliAdapter.setRepository(repo);
 
@@ -793,7 +821,7 @@ setInterval(() => {
     expect(res.executionId).toBe(assignedId);
   });
 
-  it('21. pre-spawn cancellation returns CANCELLED with canonical ID', async () => {
+  testWindowsWorktree('21. pre-spawn cancellation returns CANCELLED with canonical ID', async () => {
     const localCliAdapter = new BarrierLocalCliAdapter(providerId, 'Barrier Local CLI', { scriptPath: quickScriptPath });
     localCliAdapter.setRepository(repo);
 
@@ -835,7 +863,7 @@ setInterval(() => {
     expect(res.executionId).toBe(assignedId);
   });
 
-  it('22. active long-running synthetic process can be cancelled through cancelScheduled(authId)', async () => {
+  testWindowsWorktree('22. active long-running synthetic process can be cancelled through cancelScheduled(authId)', async () => {
     const localCliAdapter = new BarrierLocalCliAdapter(providerId, 'Barrier Local CLI', { scriptPath: longRunningScriptPath });
     localCliAdapter.setRepository(repo);
 
@@ -865,7 +893,7 @@ setInterval(() => {
     expect(dispatchService.cancelScheduled.length).toBe(1);
   });
 
-  it('24. ProviderDispatch never calls ProcessRunner.cancel directly', async () => {
+  testWindowsWorktree('24. ProviderDispatch never calls ProcessRunner.cancel directly', async () => {
     let releaseBarrier: () => void;
     const executeReached = new Promise<void>((resolve) => {
       recordingAdapter.onExecuteStarted = resolve;
@@ -884,7 +912,7 @@ setInterval(() => {
     await dispatchPromise;
   });
 
-  it('25. wrong authorization ID cannot cancel active execution', async () => {
+  testWindowsWorktree('25. wrong authorization ID cannot cancel active execution', async () => {
     let releaseBarrier: () => void;
     recordingAdapter.executeDelayBarrier = new Promise((resolve) => {
       releaseBarrier = resolve;
@@ -900,7 +928,7 @@ setInterval(() => {
     expect(res.status).toBe('COMPLETED');
   });
 
-  it('26. duplicate cancel is deterministic/idempotent', async () => {
+  testWindowsWorktree('26. duplicate cancel is deterministic/idempotent', async () => {
     let releaseBarrier: () => void;
     recordingAdapter.executeDelayBarrier = new Promise((resolve) => {
       releaseBarrier = resolve;
@@ -918,7 +946,7 @@ setInterval(() => {
     await dispatchPromise;
   });
 
-  it('27. second concurrent dispatchScheduled on same authorization is denied', async () => {
+  testWindowsWorktree('27. second concurrent dispatchScheduled on same authorization is denied', async () => {
     let releaseBarrier: () => void;
     recordingAdapter.executeDelayBarrier = new Promise((resolve) => {
       releaseBarrier = resolve;
@@ -935,7 +963,7 @@ setInterval(() => {
     await dispatchPromise;
   });
 
-  it('28. scheduled ProcessRun terminal cancellation uses canonical ID', async () => {
+  testWindowsWorktree('28. scheduled ProcessRun terminal cancellation uses canonical ID', async () => {
     const localCliAdapter = new BarrierLocalCliAdapter(providerId, 'Barrier Local CLI', { scriptPath: longRunningScriptPath });
     localCliAdapter.setRepository(repo);
 
@@ -961,7 +989,7 @@ setInterval(() => {
     expect(runs[0].status).toBe('CANCELLED');
   });
 
-  it('29. scheduled AgentExecutionResult cancellation uses canonical ID', async () => {
+  testWindowsWorktree('29. scheduled AgentExecutionResult cancellation uses canonical ID', async () => {
     const localCliAdapter = new BarrierLocalCliAdapter(providerId, 'Barrier Local CLI', { scriptPath: longRunningScriptPath });
     localCliAdapter.setRepository(repo);
 
@@ -984,13 +1012,13 @@ setInterval(() => {
     expect(res.executionId).toMatch(/^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$/);
   });
 
-  it('30. successful scheduled completion uses canonical ID', async () => {
+  testWindowsWorktree('30. successful scheduled completion uses canonical ID', async () => {
     const res = await dispatchService.dispatchScheduled(authId);
     expect(res.status).toBe('COMPLETED');
     expect(res.executionId).toMatch(/^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$/);
   });
 
-  it('31. scheduled provider failure uses canonical ID', async () => {
+  testWindowsWorktree('31. scheduled provider failure uses canonical ID', async () => {
     recordingAdapter.execute = async (req) => {
       return {
         executionId: req.runtimeBinding?.executionId ?? 'bad',
@@ -1004,7 +1032,7 @@ setInterval(() => {
     expect(res.executionId).toMatch(/^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$/);
   });
 
-  it('32. scheduled adapter-returned execution ID is canonically reconciled to preassigned ID', async () => {
+  testWindowsWorktree('32. scheduled adapter-returned execution ID is canonically reconciled to preassigned ID', async () => {
     recordingAdapter.returnMismatchedId = true;
     const res = await dispatchService.dispatchScheduled(authId);
     expect(res.status).toBe('COMPLETED');
@@ -1012,7 +1040,7 @@ setInterval(() => {
     expect(recordingAdapter.lastRequest?.runtimeBinding?.executionId).toBe(res.executionId);
   });
 
-  it('33. adapter throw clears ProviderDispatch active state', async () => {
+  testWindowsWorktree('33. adapter throw clears ProviderDispatch active state', async () => {
     recordingAdapter.execute = async () => {
       throw new Error('Explosion');
     };
@@ -1033,7 +1061,7 @@ setInterval(() => {
     expect(cancelRes.status).toBe('NOT_ACTIVE');
   });
 
-  it('35. normal completion clears active state', async () => {
+  testWindowsWorktree('35. normal completion clears active state', async () => {
     const res = await dispatchService.dispatchScheduled(authId);
     expect(res.status).toBe('COMPLETED');
 
@@ -1041,7 +1069,7 @@ setInterval(() => {
     expect(cancelRes.status).toBe('NOT_ACTIVE');
   });
 
-  it('36. LocalCli control clears after normal completion', async () => {
+  testWindowsWorktree('36. LocalCli control clears after normal completion', async () => {
     const localCliAdapter = new BarrierLocalCliAdapter(providerId, 'Barrier Local CLI', { scriptPath: quickScriptPath });
     localCliAdapter.setRepository(repo);
 
@@ -1053,7 +1081,7 @@ setInterval(() => {
     expect((localCliAdapter as any).activeExecutions.size).toBe(0);
   });
 
-  it('37. LocalCli control clears after cancellation', async () => {
+  testWindowsWorktree('37. LocalCli control clears after cancellation', async () => {
     const localCliAdapter = new BarrierLocalCliAdapter(providerId, 'Barrier Local CLI', { scriptPath: longRunningScriptPath });
     localCliAdapter.setRepository(repo);
 
@@ -1125,7 +1153,7 @@ setInterval(() => {
     expect(count).toBe(0);
   });
 
-  it('45. no provider-specific cancellation branch', async () => {
+  testWindowsWorktree('45. no provider-specific cancellation branch', async () => {
     const res = await dispatchService.dispatchScheduled(authId);
     expect(res.status).toBe('COMPLETED');
   });

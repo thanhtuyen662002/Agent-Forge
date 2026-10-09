@@ -1,4 +1,5 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
+import { testWindowsWorktree } from './helpers/worktreePlatforms';
 import fs from 'fs';
 import path from 'path';
 import os from 'os';
@@ -220,7 +221,7 @@ describe('R5G2A — GitWorktreeService Contract & Invariant Suite', () => {
     }
   });
 
-  it('12. Nonexistent valid-looking SHA rejected', async () => {
+  testWindowsWorktree('12. Nonexistent valid-looking SHA rejected', async () => {
     const fakeSha = '0123456789abcdef0123456789abcdef01234567';
     const fakeTuple = makeTuple({ baseSha: fakeSha });
     const res = await service.createWorktree(fakeTuple);
@@ -234,7 +235,7 @@ describe('R5G2A — GitWorktreeService Contract & Invariant Suite', () => {
   // 4. Create Worktree Lifecycle
   // =========================================================================
 
-  it('13. Creation makes detached worktree at exact SHA', async () => {
+  testWindowsWorktree('13. Creation makes detached worktree at exact SHA', async () => {
     const t = makeTuple({ baseSha: baseCommitSha });
     const res = await service.createWorktree(t);
     expect(res.status, JSON.stringify(res)).toBe('CREATED');
@@ -244,7 +245,7 @@ describe('R5G2A — GitWorktreeService Contract & Invariant Suite', () => {
     }
   });
 
-  it('14. New worktree HEAD exactly equals requested SHA', async () => {
+  testWindowsWorktree('14. New worktree HEAD exactly equals requested SHA', async () => {
     const t = makeTuple({ baseSha: baseCommitSha });
     const res = await service.createWorktree(t);
     expect(res.status).toBe('CREATED');
@@ -254,7 +255,7 @@ describe('R5G2A — GitWorktreeService Contract & Invariant Suite', () => {
     }
   });
 
-  it('15. New worktree registered exactly once', async () => {
+  testWindowsWorktree('15. New worktree registered exactly once', async () => {
     const t = makeTuple();
     const res = await service.createWorktree(t);
     expect(res.status).toBe('CREATED');
@@ -265,7 +266,7 @@ describe('R5G2A — GitWorktreeService Contract & Invariant Suite', () => {
     }
   });
 
-  it('16. New worktree is locked', async () => {
+  testWindowsWorktree('16. New worktree is locked', async () => {
     const t = makeTuple();
     const res = await service.createWorktree(t);
     expect(res.status).toBe('CREATED');
@@ -277,7 +278,7 @@ describe('R5G2A — GitWorktreeService Contract & Invariant Suite', () => {
     }
   });
 
-  it('17. No branch created for worktree', async () => {
+  testWindowsWorktree('17. No branch created for worktree', async () => {
     const t = makeTuple();
     const res = await service.createWorktree(t);
     expect(res.status).toBe('CREATED');
@@ -287,7 +288,7 @@ describe('R5G2A — GitWorktreeService Contract & Invariant Suite', () => {
     }
   });
 
-  it('18. Second create with same ownership fails closed (WORKTREE_ALREADY_EXISTS / REGISTERED)', async () => {
+  testWindowsWorktree('18. Second create with same ownership fails closed (WORKTREE_ALREADY_EXISTS / REGISTERED)', async () => {
     const t = makeTuple();
     const res1 = await service.createWorktree(t);
     expect(res1.status).toBe('CREATED');
@@ -303,7 +304,7 @@ describe('R5G2A — GitWorktreeService Contract & Invariant Suite', () => {
   // 5. Inspect API
   // =========================================================================
 
-  it('19. Inspect returns correct registered/head/detached/locked/clean state', async () => {
+  testWindowsWorktree('19. Inspect returns correct registered/head/detached/locked/clean state', async () => {
     const t = makeTuple();
     await service.createWorktree(t);
 
@@ -324,7 +325,7 @@ describe('R5G2A — GitWorktreeService Contract & Invariant Suite', () => {
   // 6. Multi-Worktree Isolation
   // =========================================================================
 
-  it('20. Two distinct assignments can create two isolated worktrees from same base SHA', async () => {
+  testWindowsWorktree('20. Two distinct assignments can create two isolated worktrees from same base SHA', async () => {
     const t1 = makeTuple({ assignmentId: 'asgn-1', workerSlotId: 'slot-1' });
     const t2 = makeTuple({ assignmentId: 'asgn-2', workerSlotId: 'slot-2' });
 
@@ -373,7 +374,7 @@ describe('R5G2A — GitWorktreeService Contract & Invariant Suite', () => {
   // 7. Remove Safety & Dirty Rejection
   // =========================================================================
 
-  it('23. Dirty worktree removal denied (DIRTY_WORKTREE)', async () => {
+  testWindowsWorktree('23. Dirty worktree removal denied (DIRTY_WORKTREE)', async () => {
     const t = makeTuple();
     const res = await service.createWorktree(t);
     expect(res.status).toBe('CREATED');
@@ -416,7 +417,7 @@ describe('R5G2A — GitWorktreeService Contract & Invariant Suite', () => {
     }
   });
 
-  it('26. Successful removal leaves no registered entry', async () => {
+  testWindowsWorktree('26. Successful removal leaves no registered entry', async () => {
     const t = makeTuple();
     await service.createWorktree(t);
     const rem = await service.removeWorktree(t);
@@ -456,7 +457,7 @@ describe('R5G2A — GitWorktreeService Contract & Invariant Suite', () => {
     const rem = await service.removeWorktree(unmanagedTuple);
     expect(rem.status).toBe('FAILED');
     if (rem.status === 'FAILED') {
-      expect(rem.code).toBe('UNMANAGED_WORKTREE');
+      expect(rem.code).toBe(process.platform === 'win32' ? 'UNMANAGED_WORKTREE' : 'UNSUPPORTED_MUTATION_BOUNDARY');
     }
   });
 
@@ -480,7 +481,7 @@ describe('R5G2A — GitWorktreeService Contract & Invariant Suite', () => {
     const rem = await service.removeWorktree(fakeTuple);
     expect(rem.status).toBe('FAILED');
     if (rem.status === 'FAILED') {
-      expect(rem.code).toBe('UNMANAGED_WORKTREE');
+      expect(rem.code).toBe(process.platform === 'win32' ? 'UNMANAGED_WORKTREE' : 'UNSUPPORTED_MUTATION_BOUNDARY');
     }
 
     service.deriveWorktreePath = origDerive;
@@ -490,7 +491,7 @@ describe('R5G2A — GitWorktreeService Contract & Invariant Suite', () => {
   // 8. Rollback & Structural Invariants
   // =========================================================================
 
-  it('32. Lock verification failure after checkout triggers safe owned rollback', async () => {
+  testWindowsWorktree('32. Lock verification failure after checkout triggers safe owned rollback', async () => {
     const executedCommands: { command: string; args: string[] }[] = [];
     let lists = 0;
     const customExecutor: IProcessExecutor = {
@@ -528,7 +529,7 @@ describe('R5G2A — GitWorktreeService Contract & Invariant Suite', () => {
     }
   });
 
-  it('33. Failed rollback is surfaced distinctly as CREATE_ROLLBACK_FAILED', async () => {
+  testWindowsWorktree('33. Failed rollback is surfaced distinctly as CREATE_ROLLBACK_FAILED', async () => {
     let lists = 0;
     let busyFd: number | null = null;
     const customExecutor: IProcessExecutor = {
@@ -634,7 +635,7 @@ describe('R5G2A — GitWorktreeService Contract & Invariant Suite', () => {
     }
   });
 
-  it('36. All git invocation args are structured, shell=false', async () => {
+  testWindowsWorktree('36. All git invocation args are structured, shell=false', async () => {
     const t = makeTuple();
     const res = await service.createWorktree(t);
     expect(res.status).toBe('CREATED');
@@ -672,14 +673,14 @@ describe('R5G2A — GitWorktreeService Contract & Invariant Suite', () => {
       fs.symlinkSync(outside, target, process.platform === 'win32' ? 'junction' : 'dir');
       const result = await service.createWorktree(tuple);
       expect(result.status).toBe('FAILED');
-      if (result.status === 'FAILED') expect(result.code).toBe('PATH_CONTAINMENT_DENIED');
+      if (result.status === 'FAILED') expect(result.code).toBe(process.platform === 'win32' ? 'PATH_CONTAINMENT_DENIED' : 'UNSUPPORTED_MUTATION_BOUNDARY');
       expect(fs.readFileSync(marker, 'utf8')).toBe('keep');
     } finally {
       try { fs.unlinkSync(target); } catch {}
     }
   });
 
-  it('40. Target replacement with a symlink is fenced before removal and cannot delete outside files', async () => {
+  testWindowsWorktree('40. Target replacement with a symlink is fenced before removal and cannot delete outside files', async () => {
     const tuple = makeTuple({ assignmentId: 'remove-race' });
     const created = await service.createWorktree(tuple);
     expect(created.status).toBe('CREATED');
@@ -706,7 +707,7 @@ describe('R5G2A — GitWorktreeService Contract & Invariant Suite', () => {
     }
   });
 
-  it('41. A target symlink inserted after checked absence and before reservation fails closed', async () => {
+  testWindowsWorktree('41. A target symlink inserted after checked absence and before reservation fails closed', async () => {
     const tuple = makeTuple({ assignmentId: 'add-race' });
     const target = service.deriveWorktreePath(tuple).worktreePath;
     const outside = path.join(testBaseDir, 'outside-add-target');
@@ -739,7 +740,7 @@ describe('R5G2A — GitWorktreeService Contract & Invariant Suite', () => {
     }
   });
 
-  it('42. Concurrent creates serialize through the managed-root lock without cross-target interference', async () => {
+  testWindowsWorktree('42. Concurrent creates serialize through the managed-root lock without cross-target interference', async () => {
     const first = makeTuple({ assignmentId: 'concurrent-a', workerSlotId: 'slot-a' });
     const second = makeTuple({ assignmentId: 'concurrent-b', workerSlotId: 'slot-b' });
     const [firstResult, secondResult] = await Promise.all([
@@ -753,7 +754,7 @@ describe('R5G2A — GitWorktreeService Contract & Invariant Suite', () => {
     }
   });
 
-  it('43. A stale operation lock is recovered without weakening the root identity fence', async () => {
+  testWindowsWorktree('43. A stale operation lock is recovered without weakening the root identity fence', async () => {
     const tuple = makeTuple({ assignmentId: 'stale-lock-recovery' });
     const lockPath = path.join(managedDir, '.agent-forge-worktree-operation.lock');
     fs.writeFileSync(lockPath, JSON.stringify({ pid: 999999999, createdAt: Date.now() }), 'utf8');
@@ -800,7 +801,8 @@ describe('R5G2A — GitWorktreeService Contract & Invariant Suite', () => {
       fs.symlinkSync(outside, managedDir, process.platform === 'win32' ? 'junction' : 'dir');
       const result = await service.createWorktree(tuple);
       expect(result.status).toBe('FAILED');
-      if (result.status === 'FAILED') expect(['PATH_IDENTITY_CHANGED', 'PATH_CONTAINMENT_DENIED']).toContain(result.code);
+      if (result.status === 'FAILED') expect(process.platform === 'win32'
+        ? ['PATH_IDENTITY_CHANGED', 'PATH_CONTAINMENT_DENIED'] : ['UNSUPPORTED_MUTATION_BOUNDARY']).toContain(result.code);
       expect(fs.readFileSync(marker, 'utf8')).toBe('keep');
     } finally {
       try { fs.unlinkSync(managedDir); } catch {}
@@ -914,7 +916,7 @@ $request=[Console]::ReadLine()|ConvertFrom-Json
     expect(fs.existsSync(path.join(repoDir, 'forbidden-new-parent'))).toBe(false);
   });
 
-  it('52. Cleanup from an earlier epoch cannot address a newer worktree with otherwise identical ownership', async () => {
+  testWindowsWorktree('52. Cleanup from an earlier epoch cannot address a newer worktree with otherwise identical ownership', async () => {
     const previous = makeTuple({ ownershipEpoch: 1 });
     const current = makeTuple({ ownershipEpoch: 2 });
     const old = await service.createWorktree(previous);
