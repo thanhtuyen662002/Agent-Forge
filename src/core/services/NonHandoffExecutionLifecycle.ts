@@ -5,6 +5,7 @@ import type { AdapterOutcome, ExecutionAuthorization, ExecutionRecoveryClassific
   ExecutionRecoveryDisposition, ExecutionRecoveryScanItemResult, Task } from '../types/domain';
 import { VerificationCapabilityService } from './VerificationCapabilityService';
 import { ProjectStopFenceService } from './ProjectStopFenceService';
+import { OutputSanitizationError, sanitizeOutputValue } from '../../shared/security/secretRedaction';
 
 const PROTOCOL = 'nonhandoffexecution.v1';
 export const NON_HANDOFF_CLAIM_EVENT = 'NON_HANDOFF_EXECUTION_CLAIMED';
@@ -79,6 +80,16 @@ export class NonHandoffExecutionLifecycle {
 
   finish(auth: ExecutionAuthorization, captured: NonHandoffClaim, result: AgentExecutionResult,
     outcome: AdapterOutcome): boolean {
+    const safe = sanitizeOutputValue(result) as AgentExecutionResult;
+    if (!safe || typeof safe !== 'object' || !['COMPLETED', 'FAILED', 'CANCELLED', 'AWAITING_OWNER'].includes(safe.status) ||
+      ['outputProtocol', 'rawResponse', 'error'].some(key => {
+        const value = (safe as unknown as Record<string, unknown>)[key];
+        return value !== undefined && typeof value !== 'string';
+      }) || ['errorCode', 'stdoutEvidenceId', 'stderrEvidenceId'].some(key => {
+        const value = (safe as unknown as Record<string, unknown>)[key];
+        return value != null && typeof value !== 'string';
+      })) throw new OutputSanitizationError('OUTPUT_TYPE_INVALID');
+    result = safe;
     return this.repo.runInImmediateTransaction(() => {
       if (!this.matchesClaim(auth.id, captured)) return false;
       const current = this.repo.getExecutionAuthorization(auth.id);

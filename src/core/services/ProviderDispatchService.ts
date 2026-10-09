@@ -1,4 +1,6 @@
 import crypto from 'crypto';
+import { sanitizeOutputValue } from '../../shared/security/secretRedaction';
+import { isOutputSanitizationErrorCode, outputSanitizationFailure, sanitizeErrorDiagnostics, safeDiagnosticText } from '../../shared/security/outputDiagnostics';
 import { ProviderRegistry } from '../adapters/ProviderRegistry';
 import { Repository } from '../database/repositories';
 import { VerificationCapabilityService } from './VerificationCapabilityService';
@@ -1540,9 +1542,19 @@ export class ProviderDispatchService {
       } else {
         rawResult = await invocation;
       }
-      if (nonHandoffClaim && !timedOut && !this.isValidCompatibilityResult(rawResult)) {
-        rawResult = { executionId, status: 'FAILED', errorCode: 'PROTOCOL_INVALID',
-          error: 'NON_HANDOFF_RESULT_INVALID: Provider returned a malformed result.' };
+      if (!timedOut) {
+        // A rejected returned observation still has RETURNED provenance. Never
+        // inspect getters or spread the adapter's original untrusted value.
+        try {
+          const safeOutput = sanitizeOutputValue(rawResult);
+          if (!this.isValidCompatibilityResult(safeOutput)) {
+            rawResult = { executionId, status: 'FAILED', errorCode: 'PROTOCOL_INVALID',
+              error: 'NON_HANDOFF_RESULT_INVALID: Provider returned a malformed result.' };
+          } else rawResult = safeOutput;
+        } catch (error) {
+          const failure = outputSanitizationFailure(error);
+          rawResult = { executionId, status: 'FAILED', errorCode: failure.code, error: failure.message };
+        }
       }
       if (timedOut) {
         adapterInvocation = 'TIMED_OUT';
@@ -1552,7 +1564,8 @@ export class ProviderDispatchService {
         adapterOutcome = rawResult.status === 'CANCELLED' ? 'CANCELLED' : 'RETURNED';
       }
     } catch (err: unknown) {
-      const message = err instanceof Error ? err.message : 'Provider rejected without an Error value.';
+      const diagnostics = sanitizeErrorDiagnostics(err, 'Provider rejected without an Error value.');
+      const message = diagnostics.message;
       rawResult = {
         executionId,
         status: 'FAILED',
@@ -1561,7 +1574,7 @@ export class ProviderDispatchService {
       };
       adapterInvocation = 'THREW';
       adapterOutcome = 'THREW';
-      adapterErrorJson = JSON.stringify({ message, stack: err instanceof Error ? err.stack : undefined });
+      adapterErrorJson = JSON.stringify(diagnostics);
     } finally {
       if (deadline) clearTimeout(deadline);
     }
@@ -1588,7 +1601,8 @@ export class ProviderDispatchService {
     };
 
     // Strip any spoofed or adapter-supplied providerExecutionProvenance from rawResult
-    const { providerExecutionProvenance: _discardedSpoof, ...sanitizedResult } = rawResult as any;
+    const { providerExecutionProvenance: _discardedSpoof, ...sanitizedResult } =
+      rawResult as AgentExecutionResult & { providerExecutionProvenance?: unknown };
 
     const result: ProviderDispatchExecutionResult = {
       ...sanitizedResult,
@@ -1605,6 +1619,11 @@ export class ProviderDispatchService {
           providerExecutionProvenance: provenance };
       }
     } else if (isR5ILifecycle) {
+      if (sanitizedResult.status === 'AWAITING_OWNER') {
+        return { executionId: finalExecutionId, status: 'FAILED', errorCode: 'SETTLEMENT_FAILED',
+          error: 'SETTLEMENT_FAILED: UNKNOWN_RESULT_STATUS: AWAITING_OWNER is not a valid terminal settlement.',
+          providerExecutionProvenance: provenance };
+      }
       const finishTimestamp = new Date().toISOString();
       try {
         const settleRes = this.repo.settleExecutionResult({
@@ -1622,17 +1641,18 @@ export class ProviderDispatchService {
             executionId: finalExecutionId,
             status: 'FAILED',
             errorCode: 'SETTLEMENT_FAILED',
-            error: `SETTLEMENT_FAILED: ${settleRes.error}`,
+            error: `SETTLEMENT_FAILED: ${safeDiagnosticText(settleRes.error ?? 'Settlement rejected.')}`,
             providerExecutionProvenance: provenance,
           };
         }
-      } catch (settleErr: any) {
-        console.error(`[ProviderDispatchService] Durable result settlement failure:`, settleErr);
+      } catch (settleErr: unknown) {
+        const diagnostic = sanitizeErrorDiagnostics(settleErr);
+        console.error(`[ProviderDispatchService] Durable result settlement failure:`, diagnostic.message);
         return {
           executionId: finalExecutionId,
           status: 'FAILED',
           errorCode: 'SETTLEMENT_FAILED',
-          error: `SETTLEMENT_FAILED: ${settleErr.message}`,
+          error: `SETTLEMENT_FAILED: ${diagnostic.message}`,
           providerExecutionProvenance: provenance,
         };
       }
@@ -1703,8 +1723,10 @@ export class ProviderDispatchService {
     if (typeof result.status !== 'string' || !['COMPLETED', 'FAILED', 'CANCELLED', 'AWAITING_OWNER'].includes(result.status)) return false;
     if (['outputProtocol', 'rawResponse', 'error'].some(key => result[key] !== undefined && typeof result[key] !== 'string')) return false;
     if (['stdoutEvidenceId', 'stderrEvidenceId'].some(key => result[key] != null && typeof result[key] !== 'string')) return false;
-    return result.errorCode == null || (typeof result.errorCode === 'string' && ['AUTH_ERROR', 'QUOTA_EXHAUSTED', 'TIMEOUT', 'CANCELLED',
+    return result.errorCode == null || isOutputSanitizationErrorCode(result.errorCode) || (typeof result.errorCode === 'string' && ['AUTH_ERROR', 'QUOTA_EXHAUSTED', 'TIMEOUT', 'CANCELLED',
       'PROCESS_LAUNCH_FAILED', 'NONZERO_EXIT', 'PROTOCOL_INVALID', 'UNSUPPORTED_CLIENT', 'RESOURCE_UNAVAILABLE',
+      'REPOSITORY_ROOT_INVALID_PATH', 'REPOSITORY_ROOT_MISSING', 'REPOSITORY_ROOT_NOT_DIRECTORY', 'REPOSITORY_ROOT_ALIAS',
+      'REPOSITORY_ROOT_IDENTITY_UNAVAILABLE', 'REPOSITORY_ROOT_IDENTITY_CHANGED', 'REPOSITORY_ROOT_UNBOUND', 'REPOSITORY_ROOT_BINDING_BLOCKED',
       'OUTPUT_LIMIT_EXCEEDED', 'POLICY_DENIAL', 'EXECUTION_FAILED', 'SETTLEMENT_FAILED', 'RECOVERY_FENCED', 'UNKNOWN']
       .includes(result.errorCode));
   }

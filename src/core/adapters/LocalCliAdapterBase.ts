@@ -18,6 +18,8 @@ import { ProcessRunner, ProcessRunResult } from '../services/ProcessRunner';
 import { PolicyService } from '../services/PolicyService';
 import { ProtocolParser } from '../protocol/parser';
 import { NonHandoffExecutionLifecycle } from '../services/NonHandoffExecutionLifecycle';
+import { OutputSanitizationError, redactSensitiveText } from '../../shared/security/secretRedaction';
+import { isOutputSanitizationErrorCode, safeDiagnosticText, sanitizeErrorDiagnostics, sanitizedDiagnosticError } from '../../shared/security/outputDiagnostics';
 import {
   canonicalizePortableRelativePath,
   canonicalizePortableRelativePathList,
@@ -890,7 +892,7 @@ export abstract class LocalCliAdapterBase implements ProviderAdapter {
         return 'UNHEALTHY';
       }
 
-      if (res.exitCode === 0) {
+      if (res.exitCode === 0 && !res.errorCode && !res.outputLimitExceeded && !res.timedOut) {
         return 'AVAILABLE';
       }
 
@@ -1027,7 +1029,7 @@ export abstract class LocalCliAdapterBase implements ProviderAdapter {
           return {
             executionId,
             status: 'FAILED',
-            error: `INVALID_WORKSPACE_BINDING: Cannot access workspace working directory: ${err.message}`,
+            error: `INVALID_WORKSPACE_BINDING: Cannot access workspace working directory: ${sanitizeErrorDiagnostics(err).message}`,
           };
         }
         executionRoot = wsPath;
@@ -1071,7 +1073,7 @@ export abstract class LocalCliAdapterBase implements ProviderAdapter {
           return {
             executionId,
             status: 'FAILED',
-            error: `REPOSITORY_PATH_ACCESS_ERROR: Cannot access configured project repository path: ${err.message}`,
+            error: `REPOSITORY_PATH_ACCESS_ERROR: Cannot access configured project repository path: ${sanitizeErrorDiagnostics(err).message}`,
           };
         }
         executionRoot = repoPath;
@@ -1176,7 +1178,7 @@ export abstract class LocalCliAdapterBase implements ProviderAdapter {
           executionId,
           status: 'FAILED',
           errorCode: 'POLICY_DENIAL',
-          error: workspaceError,
+          error: safeDiagnosticText(workspaceError),
         };
       }
 
@@ -1212,6 +1214,8 @@ export abstract class LocalCliAdapterBase implements ProviderAdapter {
           stdin: this.useStdin ? prompt : undefined,
           executionId: isScheduled ? executionId : undefined,
         });
+        processResult.stdout = redactSensitiveText(processResult.stdout);
+        processResult.stderr = redactSensitiveText(processResult.stderr);
         rootLeases.forEach(lease => lease.assertActive());
 
       // 7. Map cancellation truthfully
@@ -1228,6 +1232,11 @@ export abstract class LocalCliAdapterBase implements ProviderAdapter {
       }
 
       // 8. Map timeout / output limit / nonzero process exit truthfully
+      if (isOutputSanitizationErrorCode(processResult.errorCode)) {
+        return { executionId: processResult.executionId, status: 'FAILED', errorCode: processResult.errorCode,
+          rawResponse: processResult.stdout, error: processResult.stderr,
+          stdoutEvidenceId: processResult.stdoutEvidenceId, stderrEvidenceId: processResult.stderrEvidenceId };
+      }
       if (processResult.timedOut || processResult.errorCode === 'TIMEOUT') {
         return {
           executionId: processResult.executionId,
@@ -1290,7 +1299,8 @@ export abstract class LocalCliAdapterBase implements ProviderAdapter {
       }
 
       // 9. Protocol validation: Process exit 0 alone is NOT task completion
-      const protocolText = this.extractProtocolText(request, processResult.stdout);
+      const extracted = this.extractProtocolText(request, processResult.stdout);
+      const protocolText = extracted === null ? null : redactSensitiveText(extracted);
 
       if (protocolText === null) {
         return {
@@ -1331,7 +1341,7 @@ export abstract class LocalCliAdapterBase implements ProviderAdapter {
             status: 'FAILED',
             errorCode: 'EXECUTION_FAILED',
             rawResponse: processResult.stdout,
-            error: syncError,
+            error: safeDiagnosticText(syncError),
             stdoutEvidenceId: processResult.stdoutEvidenceId,
             stderrEvidenceId: processResult.stderrEvidenceId,
           };
@@ -1372,7 +1382,10 @@ export abstract class LocalCliAdapterBase implements ProviderAdapter {
         }
       }
     } catch (error) {
-      if (!(error instanceof RepositoryRootError)) throw error;
+      if (error instanceof OutputSanitizationError) {
+        return { executionId, status: 'FAILED', errorCode: error.code, error: error.message };
+      }
+      if (!(error instanceof RepositoryRootError)) throw sanitizedDiagnosticError(error);
       return { executionId, status: 'FAILED', errorCode: error.code, error: error.message };
     } finally {
       for (const lease of rootLeases.reverse()) lease.close();

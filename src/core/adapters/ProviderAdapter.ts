@@ -1,7 +1,8 @@
 import { Capability, ProviderHealthStatus, ProviderAdapterType, QuotaSource, AccountAuthMode } from '../types/domain';
 import type { RepositoryRootErrorCode } from '../services/RepositoryRootIdentity';
+import type { OutputSanitizationErrorCode } from '../../shared/security/secretRedaction';
 
-export type RuntimeErrorCode = RepositoryRootErrorCode
+export type RuntimeErrorCode = RepositoryRootErrorCode | OutputSanitizationErrorCode
   | 'AUTH_ERROR'
   | 'QUOTA_EXHAUSTED'
   | 'TIMEOUT'

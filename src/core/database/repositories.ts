@@ -1,4 +1,5 @@
 import crypto from 'crypto';
+import { OutputSanitizationError, redactSensitiveText, sanitizeOutputValue } from '../../shared/security/secretRedaction';
 import { VerificationCapabilityReference } from '../types/verificationCapability';
 import { VerificationCapabilityService } from '../services/VerificationCapabilityService';
 import Database from 'better-sqlite3';
@@ -1382,6 +1383,12 @@ export class Repository {
   // Evidence & Large Artifacts
   // ==========================================
   public createEvidence(evidence: Evidence): void {
+    const summary = redactSensitiveText(evidence.summary);
+    // Callers supply a hash for the original bytes. Reject unsafe alternate
+    // inline writes instead of changing their content under that old identity.
+    if (evidence.raw_payload !== null && redactSensitiveText(evidence.raw_payload) !== evidence.raw_payload) {
+      throw new OutputSanitizationError('OUTPUT_REDACTION_UNSAFE');
+    }
     this.db
       .prepare(`
         INSERT INTO evidence (
@@ -1400,7 +1407,7 @@ export class Repository {
         evidence.hash,
         evidence.byte_size,
         evidence.content_type,
-        evidence.summary,
+        summary,
         evidence.raw_payload,
         evidence.created_at
       );
@@ -2300,6 +2307,8 @@ export class Repository {
     evidenceHash: string;
     error?: string;
   } {
+    const safeResultPayload = params.resultPayload === undefined ? undefined : sanitizeOutputValue(params.resultPayload);
+    const safeErrorJson = params.errorJson == null ? null : redactSensitiveText(params.errorJson);
     return this.runInImmediateTransaction(() => {
       const auth = this.getExecutionAuthorization(params.authorizationId);
       if (!auth) {
@@ -2475,6 +2484,9 @@ export class Repository {
         }
         let storedEvidence: any;
         try {
+          if (redactSensitiveText(auth.settlement_evidence_json) !== auth.settlement_evidence_json) {
+            throw new OutputSanitizationError('OUTPUT_REDACTION_UNSAFE');
+          }
           storedEvidence = JSON.parse(auth.settlement_evidence_json);
           if (!storedEvidence || typeof storedEvidence !== 'object' || Array.isArray(storedEvidence)) {
             return {
@@ -2542,7 +2554,7 @@ export class Repository {
               alreadySettled: false,
               settledAt: auth.settled_at,
               evidenceHash: auth.settlement_evidence_hash,
-              error: `SETTLEMENT_CONFLICT: Stored settlement evidence error_json "${storedEvidence.error_json}" !== auth adapter_error_json "${auth.adapter_error_json}".`,
+              error: 'SETTLEMENT_CONFLICT: Stored settlement error diagnostics do not match the authorization.',
             };
           }
           const computedStoredHash = computeSha256(canonicalJsonStringify(storedEvidence));
@@ -2555,13 +2567,13 @@ export class Repository {
               error: `SETTLEMENT_CONFLICT: Stored settlement evidence hash mismatch: stored "${auth.settlement_evidence_hash}", recomputed "${computedStoredHash}".`,
             };
           }
-        } catch (e: any) {
+        } catch {
           return {
             success: false,
             alreadySettled: false,
             settledAt: auth.settled_at,
             evidenceHash: auth.settlement_evidence_hash,
-            error: `SETTLEMENT_CONFLICT: Stored settlement evidence JSON is malformed: ${e.message}`,
+            error: 'SETTLEMENT_CONFLICT: Stored settlement evidence JSON is malformed or unsafe.',
           };
         }
 
@@ -2693,7 +2705,7 @@ export class Repository {
             error: `SETTLEMENT_CONFLICT: Supplied finishedAt "${params.finishedAt}" !== stored finished_at "${storedEvidence.finished_at}".`,
           };
         }
-        if (params.errorJson !== undefined && (params.errorJson ?? null) !== (storedEvidence.error_json ?? null)) {
+        if (params.errorJson !== undefined && safeErrorJson !== (storedEvidence.error_json ?? null)) {
           return {
             success: false,
             alreadySettled: false,
@@ -2723,8 +2735,8 @@ export class Repository {
           outcome: params.outcome,
           started_at: auth.adapter_started_at,
           finished_at: effectiveFinishedAt,
-          result_payload: params.resultPayload,
-          error_json: params.errorJson ?? null,
+          result_payload: safeResultPayload,
+          error_json: safeErrorJson,
         };
         const replayEvidenceHash = computeSha256(canonicalJsonStringify(replayEvidence));
 
@@ -3023,8 +3035,8 @@ export class Repository {
         outcome: params.outcome,
         started_at: auth.adapter_started_at,
         finished_at: finishedAt,
-        result_payload: params.resultPayload,
-        error_json: params.errorJson ?? null,
+        result_payload: safeResultPayload,
+        error_json: safeErrorJson,
       };
       const canonicalEvidenceJson = canonicalJsonStringify(canonicalEvidence);
       const evidenceHash = computeSha256(canonicalEvidenceJson);
@@ -3051,7 +3063,7 @@ export class Repository {
           params.status,
           finishedAt,
           params.outcome,
-          params.errorJson ?? null,
+          safeErrorJson,
           finishedAt,
           canonicalEvidenceJson,
           evidenceHash,
@@ -8813,6 +8825,7 @@ export class Repository {
   // Test Runs
   // ==========================================
   public createTestRun(testRun: TestRun): void {
+    const command = redactSensitiveText(testRun.command);
     this.db
       .prepare(`
         INSERT INTO test_runs (id, task_id, command, passed_count, failed_count, skipped_count, duration_ms, exit_code, evidence_id, created_at)
@@ -8821,7 +8834,7 @@ export class Repository {
       .run(
         testRun.id,
         testRun.task_id,
-        testRun.command,
+        command,
         testRun.passed_count,
         testRun.failed_count,
         testRun.skipped_count,
@@ -8924,6 +8937,7 @@ export class Repository {
     status: 'RUNNING' | 'COMPLETED' | 'FAILED' | 'CANCELLED' | 'TIMED_OUT';
     start_time: string;
   }): void {
+    const command = redactSensitiveText(run.command);
     this.db
       .prepare(`
         INSERT INTO process_runs (id, pid, project_id, task_id, attempt_id, command, working_directory, status, start_time, end_time, exit_code, stdout_evidence_id, stderr_evidence_id, created_at)
@@ -8935,7 +8949,7 @@ export class Repository {
         run.project_id ?? null,
         run.task_id ?? null,
         run.attempt_id ?? null,
-        run.command,
+        command,
         run.working_directory,
         run.status,
         run.start_time,
