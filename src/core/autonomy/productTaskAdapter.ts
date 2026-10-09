@@ -649,7 +649,11 @@ export class ProductTaskAutonomyAdapter {
         if (evidence!.evidence_type !== 'TEST_RESULT' || evidence!.content_type !== 'text/plain' ||
             !['INLINE', 'FILE'].includes(evidence!.storage_type) || !/^[a-f0-9]{64}$/.test(evidence!.hash) ||
             !Number.isSafeInteger(evidence!.byte_size) || evidence!.byte_size < 0) reject('VERIFICATION_EVIDENCE_METADATA_INVALID');
-        if (evidence!.byte_size > Math.min(VERIFICATION_REPORT_MAX_READ_BYTES, remainingReadBytes)) {
+        // A positive I/O bound also covers empty/corrupt size metadata without
+        // triggering ArtifactStore's default-bound fallback. Charge failed
+        // reads too; their bytes cannot disappear from the cumulative budget.
+        const readLimit = Math.max(1, evidence!.byte_size);
+        if (readLimit > Math.min(VERIFICATION_REPORT_MAX_READ_BYTES, remainingReadBytes)) {
           reject('VERIFICATION_EVIDENCE_LIMIT_EXCEEDED');
         }
         const processes = db.prepare(`SELECT project_id,task_id,attempt_id,status,exit_code FROM process_runs
@@ -662,9 +666,9 @@ export class ProductTaskAutonomyAdapter {
           reject('VERIFICATION_EVIDENCE_PROCESS_INVALID');
         }
         let payload: string;
-        try { payload = this.options.artifactStore.readText(evidence!, Math.min(VERIFICATION_REPORT_MAX_READ_BYTES, remainingReadBytes)); }
+        remainingReadBytes -= readLimit;
+        try { payload = this.options.artifactStore.readText(evidence!, readLimit); }
         catch { reject('VERIFICATION_EVIDENCE_READ_FAILED'); }
-        remainingReadBytes -= evidence!.byte_size;
         const stdoutMarker = '=== STDOUT ===\n', stderrMarker = '\n=== STDERR ===\n';
         const start = payload!.indexOf(stdoutMarker);
         const separator = payload!.indexOf(stderrMarker, start + stdoutMarker.length);

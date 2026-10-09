@@ -159,6 +159,33 @@ describe('bounded truthful verification evidence reports', () => {
     expect(observed.attempts[8].evidenceStatus).toBe('INCOMPLETE');
   });
 
+  it('charges corrupt file reads to the cumulative budget before integrity verification', () => {
+    useThreshold(0);
+    for (let i = 0; i < 9; i++) {
+      const run = record(`${i}` + 'x'.repeat(VERIFICATION_REPORT_MAX_READ_BYTES - 101));
+      const evidence = repo.getEvidence(run.evidence_id!)!;
+      const bytes = fs.readFileSync(evidence.file_path!);
+      bytes[bytes.length - 1] ^= 1;
+      fs.writeFileSync(evidence.file_path!, bytes);
+    }
+    const beforeTask = repo.getTask('report-task');
+    const read = vi.spyOn(artifactStore, 'readText');
+    const observed = report();
+    expect(read).toHaveBeenCalledTimes(8);
+    expect(observed.attempts.slice(0, 8).every(attempt => attempt.evidenceErrorCode === 'VERIFICATION_EVIDENCE_READ_FAILED')).toBe(true);
+    expect(observed.attempts[8].evidenceErrorCode).toBe('VERIFICATION_EVIDENCE_LIMIT_EXCEEDED');
+    expect(observed.latestAttemptPassed).toBe(false);
+    expect(repo.getTask('report-task')).toEqual(beforeTask);
+  });
+
+  it('uses declared size as an I/O bound even when file metadata understates the actual bytes', () => {
+    useThreshold(0); const run = record('x'.repeat(VERIFICATION_REPORT_MAX_READ_BYTES - 100));
+    db.prepare('UPDATE evidence SET byte_size=1 WHERE id=?').run(run.evidence_id);
+    const read = vi.spyOn(artifactStore, 'readText');
+    expect(report().evidenceErrorCode).toBe('VERIFICATION_EVIDENCE_READ_FAILED');
+    expect(read).toHaveBeenCalledWith(expect.objectContaining({ byte_size: 1 }), 1);
+  });
+
   it('rejects missing evidence references and ambiguous stdout/stderr framing', () => {
     const first = record(); db.prepare('UPDATE test_runs SET evidence_id=NULL WHERE id=?').run(first.id);
     expect(report().attempts[0].evidenceErrorCode).toBe('VERIFICATION_EVIDENCE_MISSING');
