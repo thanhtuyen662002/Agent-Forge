@@ -660,7 +660,7 @@ ${coderReport.tests_claimed.map((t) => `  - ${t}`).join('\n') || '  - None'}
     const testEvidenceText = testRun
       ? `
 - **Command**: \`${testRun.command}\`
-- **Authoritative Verdict**: ${testRun.exit_code === 0 ? '🟢 PASSED' : '🔴 FAILED'} (Exit Code: \`${testRun.exit_code}\`)
+- **Authoritative Verdict**: ${testRun.exit_code === 0 && testRun.failed_count === 0 ? '🟢 PASSED' : '🔴 FAILED'} (Exit Code: \`${testRun.exit_code}\`)
 - **Metrics**: ${testRun.passed_count} Passed | ${testRun.failed_count} Failed | ${testRun.skipped_count} Skipped
 - **Duration**: ${testRun.duration_ms}ms
 - **Evidence Reference**: \`${testRun.evidence_id || 'INLINE'}\`
