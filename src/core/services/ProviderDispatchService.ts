@@ -826,6 +826,16 @@ export class ProviderDispatchService {
       };
 
       const inspectResult = await this.gitWorktreeService.inspectWorktree(ownershipTuple);
+      // Inspection is asynchronous; honor a recorded cancellation before
+      // interpreting its result or claiming authority for provider execution.
+      if (control?.cancelRequested) {
+        return {
+          executionId,
+          status: 'CANCELLED',
+          errorCode: 'CANCELLED',
+          error: 'Execution was cancelled during scheduled preparation.',
+        };
+      }
       if (inspectResult.status !== 'INSPECTED') {
         return {
           executionId,

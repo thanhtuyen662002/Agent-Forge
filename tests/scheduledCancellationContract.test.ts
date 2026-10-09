@@ -500,6 +500,7 @@ setInterval(() => {
   });
 
   it('unsupported worktree inspection cannot claim authorization, spawn or leak active dispatch', async () => {
+    expect(dispatchService.dispatchScheduled.length).toBe(1);
     const authorization = repo.getExecutionAuthorization(authId);
     const task = repo.getTask(taskId);
     const managedEntries = fs.readdirSync(managedDir);
@@ -520,13 +521,52 @@ setInterval(() => {
     expect((await dispatchService.cancelScheduled(authId)).status).toBe('NOT_ACTIVE');
   });
 
+  it('cancellation during unsupported inspection remains unclaimed and cannot start a provider', async () => {
+    const authorization = repo.getExecutionAuthorization(authId);
+    const task = repo.getTask(taskId);
+    const managedEntries = fs.readdirSync(managedDir);
+    let enteredInspection!: () => void;
+    let releaseInspection!: () => void;
+    const inspectionEntered = new Promise<void>(resolve => { enteredInspection = resolve; });
+    const inspectionBarrier = new Promise<void>(resolve => { releaseInspection = resolve; });
+    const originalInspect = worktreeService.inspectWorktree.bind(worktreeService);
+    const inspect = vi.spyOn(worktreeService, 'inspectWorktree').mockImplementation(async tuple => {
+      enteredInspection();
+      await inspectionBarrier;
+      return withoutWindowsWorktreeBoundary(() => originalInspect(tuple));
+    });
+
+    const dispatch = dispatchService.dispatchScheduled(authId);
+    await inspectionEntered;
+    expect(dispatchService.hasActiveDispatch(authId)).toBe(true);
+    const cancel = await dispatchService.cancelScheduled(authId);
+    expect(cancel.status).toBe('CANCEL_REQUESTED');
+    releaseInspection();
+    const result = await dispatch;
+
+    expect(result.status).toBe('CANCELLED');
+    expect(result.errorCode).toBe('CANCELLED');
+    expect(result.executionId).toBe(cancel.executionId);
+    expect(result.providerExecutionProvenance).toBeUndefined();
+    expect(inspect).toHaveBeenCalledTimes(1);
+    expect(recordingAdapter.executionCount).toBe(0);
+    expect(recordingAdapter.cancelCount).toBe(0);
+    expect(repo.getExecutionAuthorization(authId)).toEqual(authorization);
+    expect(repo.getTask(taskId)).toEqual(task);
+    expect(repo.getProcessRunsByTask(taskId)).toEqual([]);
+    expect(fs.readdirSync(managedDir)).toEqual(managedEntries);
+    expect(db.prepare('SELECT COUNT(*) AS count FROM account_leases').get()).toEqual({ count: 0 });
+    expect(dispatchService.hasActiveDispatch(authId)).toBe(false);
+    expect((await dispatchService.cancelScheduled(authId)).status).toBe('NOT_ACTIVE');
+  });
+
   testWindowsWorktree('1. scheduled ProviderDispatch generates canonical UUID internally', async () => {
     const res = await dispatchService.dispatchScheduled(authId);
     expect(res.status).toBe('COMPLETED');
     expect(res.executionId).toMatch(/^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$/);
   });
 
-  it('2. scheduled caller supplies authorizationId only', async () => {
+  testWindowsWorktree('2. scheduled caller supplies authorizationId only', async () => {
     expect(dispatchService.dispatchScheduled.length).toBe(1);
     const res = await dispatchService.dispatchScheduled(authId);
     expect(res.status).toBe('COMPLETED');
