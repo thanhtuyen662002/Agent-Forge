@@ -106,6 +106,51 @@ describe('issued capability process boundary', () => {
     expect((await verification.runTestsWithFrozenCommand('P', 'T', null, root, frozen)).exit_code).not.toBe(0);
   });
 
+  it.runIf(process.platform === 'win32').each(['configured', 'frozen'] as const)('retains the selected native root through %s verification result persistence', async mode => {
+    const { snapshot, verification } = await configured();
+    authorize(snapshot);
+    const originalCreate = repo.createTestRun.bind(repo);
+    const persist = vi.spyOn(repo, 'createTestRun').mockImplementation(row => {
+      const selectedGit = path.join(root, '.git');
+      const movedGit = path.join(root, '.git-changed');
+      let renamed = false;
+      try { fs.renameSync(selectedGit, movedGit); renamed = true; } catch {}
+      if (renamed) fs.renameSync(movedGit, selectedGit);
+      expect(renamed).toBe(false);
+      return originalCreate(row);
+    });
+    const result = mode === 'configured'
+      ? await verification.runTests('P', 'T', null, root)
+      : await verification.runTestsWithFrozenCommand('P', 'T', null, root, { ...snapshot.TEST!, timeout_ms: 10000, authorization_id: 'AUTH' });
+    expect(result.exit_code).toBe(0);
+    expect(persist).toHaveBeenCalledTimes(1);
+    expect(repo.getLatestTestRun('T')?.id).toBe(result.id);
+    fs.renameSync(path.join(root, '.git'), path.join(root, '.git-changed'));
+    fs.renameSync(path.join(root, '.git-changed'), path.join(root, '.git'));
+  });
+
+  it.each(['configured', 'frozen', 'sealed'] as const)('returns the fixed selected-root failure before executing %s historical verification', async mode => {
+    const { snapshot, verification } = await configured();
+    authorize(snapshot);
+    database.prepare('DELETE FROM project_repository_identities WHERE project_id=?').run('P');
+    const execute = vi.spyOn(ProcessRunner, 'execute');
+    if (mode === 'sealed') {
+      expect(await verification.executeSealedVerification(sealed(snapshot))).toMatchObject({
+        outcome: 'COMMAND_POLICY_REJECTED', failure_code: 'REPOSITORY_ROOT_UNBOUND', process_start: 'NOT_STARTED_PROVEN', process_termination: 'NOT_APPLICABLE',
+      });
+    } else {
+      const result = mode === 'configured'
+        ? await verification.runTests('P', 'T', null, root)
+        : await verification.runTestsWithFrozenCommand('P', 'T', null, root, { ...snapshot.TEST!, timeout_ms: 10000, authorization_id: 'AUTH' });
+      expect(result.exit_code).toBe(-1);
+      const evidence = repo.getEvidence(result.evidence_id!)!;
+      expect(verification.getArtifactStore().read(evidence)).toBe('REPOSITORY_ROOT_UNBOUND');
+    }
+    expect(execute).not.toHaveBeenCalled();
+    expect(repo.getProcessRunsByTask('T')).toEqual([]);
+    expect(database.prepare('SELECT COUNT(*) AS count FROM project_repository_identities').get()).toEqual({ count: 0 });
+  });
+
   it('executes sealed verification with a live durable authorization and rejects recomputed snapshots after revocation or command substitution', async () => {
     const { command, snapshot, verification } = await configured();
     authorize(snapshot);

@@ -11,7 +11,9 @@ import {
 } from '../types/adjudication';
 import { computeSha256 } from '../../mcp/submissionProtocol';
 import { VerificationCapabilityService } from './VerificationCapabilityService';
-import { VerificationCapabilityReference, VerificationProcessBoundary } from '../types/verificationCapability';
+import { VerificationCapabilityReference, VerificationInvocationLease, VerificationProcessBoundary } from '../types/verificationCapability';
+import { RepositoryRootError } from './RepositoryRootIdentity';
+import { RepositoryRootLease } from './RepositoryRootLease';
 
 export { shouldRunCoderVerification } from '../state/taskStateMachine';
 
@@ -202,11 +204,21 @@ export class VerificationService {
     }
 
     const fullCommandStr = `${executable} ${args.join(' ')}`;
+    let rootLease: RepositoryRootLease;
+    try { rootLease = RepositoryRootLease.acquire(this.repo.getProjectRepositoryIdentity(projectId)); }
+    catch (error) {
+      if (!(error instanceof RepositoryRootError)) throw error;
+      return this.recordFailure(projectId, taskId, attemptId, fullCommandStr, error.code, deferPersistence);
+    }
+    let invocationLease: VerificationInvocationLease | undefined;
+    try {
     let verificationBoundary: VerificationProcessBoundary;
     try {
       verificationBoundary = new VerificationCapabilityService(this.repo).createProcessBoundary(
         capability as VerificationCapabilityReference, projectId, executable, args, repoPath, options.authorizationId);
-    } catch {
+      invocationLease = verificationBoundary.acquireInvocation(executable, args, repoPath);
+    } catch (error) {
+      if (error instanceof RepositoryRootError) return this.recordFailure(projectId, taskId, attemptId, fullCommandStr, error.code, deferPersistence);
       return this.recordFailure(projectId, taskId, attemptId, fullCommandStr, 'OWNER_APPROVAL_REQUIRED: Verification capability is missing, stale or revoked.', deferPersistence);
     }
 
@@ -244,6 +256,7 @@ export class VerificationService {
           }),
     });
 
+    rootLease.assertActive(); invocationLease.assertActive();
     // 4. Parse test results & metrics
     const stdout = result.stdout;
     const stderr = result.stderr;
@@ -260,10 +273,6 @@ export class VerificationService {
       combinedOutput,
       'text/plain'
     );
-    if (!deferPersistence) {
-      this.repo.createEvidence(evidence);
-    }
-
     const metrics = parseTestMetrics(stdout, result.exitCode);
 
     const testRun: DeferredTestRun = {
@@ -336,9 +345,16 @@ export class VerificationService {
         stderr_evidence_id: stderrEvidenceId,
       };
     } else {
-      this.repo.createTestRun(testRun);
+      this.repo.runInImmediateTransaction(() => {
+        rootLease.assertActive(); invocationLease!.assertActive();
+        this.repo.createEvidence(evidence);
+        this.repo.createTestRun(testRun);
+        rootLease.assertActive(); invocationLease!.assertActive();
+      });
     }
+    rootLease.assertActive(); invocationLease.assertActive();
     return testRun;
+    } finally { invocationLease?.close(); rootLease.close(); }
   }
 
   public async executeSealedVerification(
@@ -571,22 +587,28 @@ export class VerificationService {
     const commandName = typeof testCmdObj.name === 'string' ? testCmdObj.name : 'Frozen Authorization Test Suite';
     const fullCommandStr = `${executable} ${args.join(' ')}`;
     let verificationBoundary: VerificationProcessBoundary;
+    let rootLease: RepositoryRootLease | undefined;
+    let invocationLease: VerificationInvocationLease | undefined;
     try {
+      rootLease = RepositoryRootLease.acquire(this.repo.getProjectRepositoryIdentity(input.project_id));
       const capabilities = new VerificationCapabilityService(this.repo);
       capabilities.validateSnapshot(input.project_id, commandsObj, input.repo_path, input.authorization_id);
       verificationBoundary = capabilities.createProcessBoundary(testCmdObj.capability as VerificationCapabilityReference,
         input.project_id, executable, args, input.repo_path, input.authorization_id);
-    } catch {
+      invocationLease = verificationBoundary.acquireInvocation(executable, args, input.repo_path);
+    } catch (error) {
+      invocationLease?.close(); rootLease?.close();
+      const code = error instanceof RepositoryRootError ? error.code : 'COMMAND_POLICY_REJECTED';
       return {
-        outcome: 'COMMAND_POLICY_REJECTED', failure_code: 'COMMAND_POLICY_REJECTED',
-        reason: 'OWNER_APPROVAL_REQUIRED: Frozen verification capability is missing, stale or revoked.',
+        outcome: 'COMMAND_POLICY_REJECTED', failure_code: code,
+        reason: error instanceof RepositoryRootError ? code : 'OWNER_APPROVAL_REQUIRED: Frozen verification capability is missing, stale or revoked.',
         command: fullCommandStr, repo_path: input.repo_path, started_at: startedAtIso, finished_at: new Date().toISOString(),
-        exit_code: -1, duration_ms: 0, stdout: '', stderr: 'Verification capability rejected',
+        exit_code: -1, duration_ms: 0, stdout: '', stderr: error instanceof RepositoryRootError ? code : 'Verification capability rejected',
         stdout_bytes: 0, stderr_bytes: 0, combined_output: '', metrics: { passedCount: 0, failedCount: 0, skippedCount: 0 },
         process_start: 'NOT_STARTED_PROVEN', process_termination: 'NOT_APPLICABLE', timed_out: false, cancelled: false,
       };
     }
-
+    try {
     // 3. PolicyService execution gate
     const policy = PolicyService.evaluateProcessExecution(executable, args, false);
     if (!policy.allowed) {
@@ -725,6 +747,20 @@ export class VerificationService {
       };
     }
 
+    let rootFailure = typeof result.errorCode === 'string' && result.errorCode.startsWith('REPOSITORY_ROOT_') ? result.errorCode : undefined;
+    try { rootLease.assertActive(); invocationLease.assertActive(); }
+    catch (error) { rootFailure = error instanceof RepositoryRootError ? error.code : 'REPOSITORY_ROOT_IDENTITY_UNAVAILABLE'; }
+    if (rootFailure) {
+      return {
+        outcome: 'COMMAND_POLICY_REJECTED', failure_code: rootFailure, reason: rootFailure,
+        command: fullCommandStr, repo_path: input.repo_path, started_at: startedAtIso, finished_at: finishedAtIso,
+        exit_code: result.exitCode, duration_ms: result.durationMs, stdout: '', stderr: rootFailure,
+        stdout_bytes: 0, stderr_bytes: Buffer.byteLength(rootFailure, 'utf8'), combined_output: rootFailure,
+        metrics: { passedCount: 0, failedCount: 0, skippedCount: 0 },
+        process_start: result.processStart, process_termination: result.processTermination, timed_out: result.timedOut, cancelled: result.cancelled,
+      };
+    }
+
     // - Authoritative timeout with proven termination
     if (result.timedOut) {
       return {
@@ -778,11 +814,12 @@ export class VerificationService {
     // Approval must still authorize the observed result after the child exits.
     // Preserve actual process/exit observations if permission was withdrawn.
     try {
+      rootLease.assertActive(); invocationLease.assertActive();
       verificationBoundary.assertInvocation(executable, args, input.repo_path);
-    } catch {
+    } catch (error) {
       return {
-        outcome: 'COMMAND_POLICY_REJECTED', failure_code: 'COMMAND_POLICY_REJECTED',
-        reason: 'Verification capability changed while the child was running.', command: fullCommandStr, repo_path: input.repo_path,
+        outcome: 'COMMAND_POLICY_REJECTED', failure_code: error instanceof RepositoryRootError ? error.code : 'COMMAND_POLICY_REJECTED',
+        reason: error instanceof RepositoryRootError ? error.code : 'Verification capability changed while the child was running.', command: fullCommandStr, repo_path: input.repo_path,
         started_at: startedAtIso, finished_at: finishedAtIso, exit_code: result.exitCode, duration_ms: result.durationMs,
         stdout, stderr, stdout_bytes: stdoutBytes, stderr_bytes: stderrBytes, combined_output: combinedOutput, metrics,
         process_start: result.processStart, process_termination: result.processTermination, timed_out: result.timedOut, cancelled: result.cancelled,
@@ -809,6 +846,7 @@ export class VerificationService {
       timed_out: false,
       cancelled: false,
     };
+    } finally { invocationLease.close(); rootLease.close(); }
   }
 
   public async runTestsWithFrozenCommand(
@@ -844,11 +882,21 @@ export class VerificationService {
     }
     const commandName = frozenCommand.name || 'Frozen Authorization Test Suite';
     const fullCommandStr = `${executable} ${args.join(' ')}`;
+    let rootLease: RepositoryRootLease;
+    try { rootLease = RepositoryRootLease.acquire(this.repo.getProjectRepositoryIdentity(projectId)); }
+    catch (error) {
+      if (!(error instanceof RepositoryRootError)) throw error;
+      return this.recordFailure(projectId, taskId, attemptId, fullCommandStr, error.code);
+    }
+    let invocationLease: VerificationInvocationLease | undefined;
+    try {
     let verificationBoundary: VerificationProcessBoundary;
     try {
       verificationBoundary = new VerificationCapabilityService(this.repo).createProcessBoundary(frozenCommand.capability as VerificationCapabilityReference,
         projectId, executable, args, repoPath, frozenCommand.authorization_id);
-    } catch {
+      invocationLease = verificationBoundary.acquireInvocation(executable, args, repoPath);
+    } catch (error) {
+      if (error instanceof RepositoryRootError) return this.recordFailure(projectId, taskId, attemptId, fullCommandStr, error.code);
       return this.recordFailure(projectId, taskId, attemptId, fullCommandStr, 'OWNER_APPROVAL_REQUIRED: Frozen verification capability is missing, stale or revoked.');
     }
 
@@ -877,6 +925,7 @@ export class VerificationService {
       taskId,
     });
 
+    rootLease.assertActive(); invocationLease.assertActive();
     // 3. Parse test results & metrics
     const stdout = result.stdout;
     const stderr = result.stderr;
@@ -893,8 +942,6 @@ export class VerificationService {
       combinedOutput,
       'text/plain'
     );
-    this.repo.createEvidence(evidence);
-
     const metrics = parseTestMetrics(stdout, result.exitCode);
 
     const testRun: TestRun = {
@@ -910,8 +957,14 @@ export class VerificationService {
       created_at: new Date().toISOString(),
     };
 
-    this.repo.createTestRun(testRun);
+    this.repo.runInImmediateTransaction(() => {
+      rootLease.assertActive(); invocationLease!.assertActive();
+      this.repo.createEvidence(evidence);
+      this.repo.createTestRun(testRun);
+      rootLease.assertActive(); invocationLease!.assertActive();
+    });
     return testRun;
+    } finally { invocationLease?.close(); rootLease.close(); }
   }
 
   private recordFailure(
