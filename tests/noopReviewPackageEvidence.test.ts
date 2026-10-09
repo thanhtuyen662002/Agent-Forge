@@ -15,6 +15,7 @@ import { VerificationService } from '../src/core/services/VerificationService';
 import { ArtifactStore } from '../src/core/services/ArtifactStore';
 import { EmergencyStopService } from '../src/core/services/EmergencyStopService';
 import { registerIpcHandlers } from '../src/electron/ipcHandlers';
+import type { Review } from '../src/core/types/domain';
 
 // Mock electron's ipcMain, dialog, app
 const ipcHandlers = new Map<string, Function>();
@@ -129,6 +130,91 @@ describe('No-Op Review Package Evidence Hardening (Fail-Closed & Clean Fallback)
     if (!handler) throw new Error('protocol:generateReviewPackage handler not registered');
     return await handler({ senderFrame: { url: 'http://localhost:5173/' } }, { projectId: pId, taskId: tId });
   };
+
+  function fixtureReview(text: string): Review {
+    const id = crypto.randomUUID();
+    return { id, task_id: taskId, attempt_id: null, reviewer_agent_id: null, verdict: 'FIX_REQUIRED',
+      summary: text, created_at: new Date().toISOString(), issues: [{ id: crypto.randomUUID(), review_id: id,
+        severity: 'REQUIRED', title: text, file_path: 'src/ordinary.ts', line_number: 3,
+        description: text, resolved: false }] };
+  }
+
+  function ordinaryDiff() {
+    const evidence = artifactStore.store(crypto.randomUUID(), projectId, taskId, null, 'GIT_DIFF',
+      'Git Diff: 1 file changed', 'diff --git a/file.js b/file.js\n+ordinary line', 'text/x-diff');
+    repo.createEvidence(evidence);
+    return evidence;
+  }
+
+  it('sanitizes direct review diagnostics in actual SQLite before any review or issue is published', () => {
+    const secret = 'AF_TEST_ONLY_REVIEW_CREDENTIAL';
+    const review = fixtureReview('password=' + secret);
+    repo.createReview(review);
+    const durable = repo.getReviewsByTask(taskId);
+    expect(JSON.stringify(durable).includes(secret)).toBe(false);
+    expect(durable).toMatchObject([{ id: review.id, task_id: taskId, verdict: 'FIX_REQUIRED',
+      issues: [{ id: review.issues![0].id, severity: 'REQUIRED', file_path: 'src/ordinary.ts', line_number: 3 }] }]);
+    expect(review.summary.includes(secret)).toBe(true);
+  });
+
+  it.each(['compound', 'accessor', 'malformed'] as const)('rejects %s review diagnostics with zero partial SQLite rows and no getter invocation', variant => {
+    const review = fixtureReview('ordinary review diagnostic');
+    let getterCalls = 0;
+    if (variant === 'compound') review.issues![0].description = 'api_key:{first:"AF_TEST_ONLY_REVIEW_CREDENTIAL",second:17}';
+    if (variant === 'accessor') Object.defineProperty(review.issues![0], 'title', { enumerable: true,
+      get: () => { getterCalls++; return 'password=AF_TEST_ONLY_REVIEW_CREDENTIAL'; } });
+    if (variant === 'malformed') (review.issues![0] as unknown as Record<string, unknown>).description = 17;
+    let code: unknown;
+    try { repo.createReview(review); } catch (error) { code = (error as { code?: unknown }).code; }
+    expect(code).toBe(variant === 'compound' ? 'OUTPUT_REDACTION_UNSAFE' : 'OUTPUT_TYPE_INVALID');
+    expect(getterCalls).toBe(0);
+    expect(db.prepare('SELECT COUNT(*) AS count FROM reviews').get()).toEqual({ count: 0 });
+    expect(db.prepare('SELECT COUNT(*) AS count FROM review_issues').get()).toEqual({ count: 0 });
+  });
+
+  it('sanitizes a legacy diff summary in the actual generated IPC review package without rewriting evidence bytes or hash', async () => {
+    const secret = 'AF_TEST_ONLY_LEGACY_REVIEW_CREDENTIAL';
+    const evidence = ordinaryDiff();
+    db.prepare('UPDATE evidence SET summary=? WHERE id=?').run('password=' + secret, evidence.id);
+    const result = await invokeGenerateReviewPackage();
+    expect(result.success).toBe(true);
+    expect(result.reviewPackage.includes(secret)).toBe(false);
+    expect(result.reviewPackage.includes('+ordinary line')).toBe(true);
+    const stored = repo.getEvidence(evidence.id)!;
+    expect(stored.hash === evidence.hash && stored.raw_payload === evidence.raw_payload).toBe(true);
+    expect(stored.summary.includes(secret)).toBe(true);
+  });
+
+  it('sanitizes legacy review titles, descriptions and test diagnostics in the actual IPC package', async () => {
+    const secret = 'AF_TEST_ONLY_LEGACY_REVIEW_CREDENTIAL';
+    ordinaryDiff();
+    const review = fixtureReview('ordinary review diagnostic');
+    repo.createReview(review);
+    db.prepare('UPDATE review_issues SET title=?,description=? WHERE review_id=?')
+      .run('password=' + secret, 'api_key=' + secret, review.id);
+    repo.createTestRun({ id: crypto.randomUUID(), task_id: taskId, command: 'ordinary verification command',
+      passed_count: 1, failed_count: 0, skipped_count: 0, duration_ms: 1, exit_code: 0,
+      evidence_id: null, created_at: new Date().toISOString() });
+    db.prepare('UPDATE test_runs SET command=? WHERE task_id=?').run('api_key=' + secret, taskId);
+    const result = await invokeGenerateReviewPackage();
+    expect(result.success).toBe(true);
+    expect(result.reviewPackage.includes(secret)).toBe(false);
+    expect(result.reviewPackage.includes('1 Passed | 0 Failed | 0 Skipped')).toBe(true);
+    expect(repo.getReviewsByTask(taskId)[0].issues![0].title.includes(secret)).toBe(true);
+  });
+
+  it('rejects unsafe legacy diff bytes before advancing the task or laundering their original evidence identity', async () => {
+    const secret = 'AF_TEST_ONLY_LEGACY_REVIEW_CREDENTIAL';
+    const evidence = ordinaryDiff();
+    const payload = 'api_key=' + secret;
+    const hash = crypto.createHash('sha256').update(payload).digest('hex');
+    db.prepare('UPDATE evidence SET raw_payload=?,hash=?,byte_size=? WHERE id=?')
+      .run(payload, hash, Buffer.byteLength(payload), evidence.id);
+    await expect(invokeGenerateReviewPackage()).rejects.toMatchObject({ code: 'OUTPUT_REDACTION_UNSAFE' });
+    expect(repo.getTask(taskId)?.state).toBe('REVIEW_READY');
+    const stored = repo.getEvidence(evidence.id)!;
+    expect(stored.hash === hash && stored.raw_payload === payload).toBe(true);
+  });
 
   it('CASE A: Standard diff path succeeds when durable GIT_DIFF exists', async () => {
     // 1. Create passing TestRun

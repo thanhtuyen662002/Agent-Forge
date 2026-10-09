@@ -3,6 +3,7 @@ import fs from 'fs';
 import path from 'path';
 import Database from 'better-sqlite3';
 import { redactSensitiveText, sanitizeOutputValue } from '../../shared/security/secretRedaction';
+import { safeDiagnosticText, sanitizeErrorDiagnostics, sanitizedDiagnosticError } from '../../shared/security/outputDiagnostics';
 import { VerificationCapabilityService } from './VerificationCapabilityService';
 import { captureRepositoryRoot, RepositoryRootError, RepositoryRootIdentity } from './RepositoryRootIdentity';
 import { RepositoryRootLease } from './RepositoryRootLease';
@@ -65,8 +66,7 @@ export {
 } from './adjudication/canonicalExecutionPayload';
 
 export function scrubAdjudicationDiagnostics(text: string): string {
-  if (!text || typeof text !== 'string') return '';
-  let scrubbed = text;
+  let scrubbed = safeDiagnosticText(text);
   // 1. Redact Windows drive paths: e.g. C:\... or d:/...
   scrubbed = scrubbed.replace(/[A-Za-z]:[\\/][^ \n\r\t,;"']+(?:[\\/][^ \n\r\t,;"']+)*/g, '[REDACTED_PATH]');
   // 2. Redact Unix paths: e.g. /home/... /usr/... /tmp/...
@@ -4071,7 +4071,7 @@ export class CoderSubmissionAdjudicationService {
       const cleanupRes = this.artifactStore.cleanupRollbackFiles(newlyMaterializedPaths);
       const isCleanupDebt = cleanupRes.failures && cleanupRes.failures.length > 0;
       const failureCode = isCleanupDebt ? 'CLEANUP_DEBT_FENCED' : 'ORPHANED_VERIFICATION_CANCELLED';
-      const failureDetail = verifErr instanceof Error ? verifErr.message : String(verifErr);
+      const failureDetail = scrubAdjudicationDiagnostics(sanitizeErrorDiagnostics(verifErr).message);
 
       try {
         const nowIso = new Date().toISOString();
@@ -4097,11 +4097,11 @@ export class CoderSubmissionAdjudicationService {
           `).run(failureCode, nowIso, leaseId);
         }
       } catch (fenceErr: unknown) {
-        const fenceMsg = fenceErr instanceof Error ? fenceErr.message : String(fenceErr);
-        const origMsg = verifErr instanceof Error ? verifErr.message : String(verifErr);
+        const fenceMsg = sanitizeErrorDiagnostics(fenceErr).message;
+        const origMsg = sanitizeErrorDiagnostics(verifErr).message;
         throw new Error(`VERIFICATION_ABORT_WITH_FENCE_FAILURE: Verification aborted: [${origMsg}]. Lease fencing failed: [${fenceMsg}].`);
       }
-      throw verifErr;
+      throw sanitizedDiagnosticError(verifErr);
     }
 
     // Collect post-run Git evidence & post-run observation outside all transactions
@@ -4892,12 +4892,15 @@ export class CoderSubmissionAdjudicationService {
             }
           });
         } catch (debtErr: unknown) {
-          const debtMsg = debtErr instanceof Error ? debtErr.message : String(debtErr);
-          const primaryMsg = err instanceof Error ? err.message : String(err);
+          const debtMsg = sanitizeErrorDiagnostics(debtErr).message;
+          const primaryMsg = sanitizeErrorDiagnostics(err).message;
           throw new Error(`PHASE_C_ROLLBACK_AND_CLEANUP_DEBT_FAILURE: Primary error: [${primaryMsg}]. Cleanup debt fencing failed: [${debtMsg}].`);
         }
       }
-      throw err;
+      if (err instanceof CoderSubmissionAdjudicationError) {
+        throw new CoderSubmissionAdjudicationError(err.code, scrubAdjudicationDiagnostics(sanitizeErrorDiagnostics(err).message));
+      }
+      throw sanitizedDiagnosticError(err);
     }
 
     return {

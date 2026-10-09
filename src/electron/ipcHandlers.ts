@@ -1,4 +1,7 @@
 import { RepositoryRootLease } from '../core/services/RepositoryRootLease';
+import type { Evidence } from '../core/types/domain';
+import { OutputSanitizationError, redactSensitiveText, sanitizeOutputValue } from '../shared/security/secretRedaction';
+import { sanitizeErrorDiagnostics, sanitizedDiagnosticError } from '../shared/security/outputDiagnostics';
 import { ipcMain, dialog, app } from 'electron';
 import { Repository } from '../core/database/repositories';
 import { ProjectService } from '../core/services/ProjectService';
@@ -80,11 +83,27 @@ export class IpcSenderTrustError extends Error {
 
 type PrivilegedIpcHandler = (event: unknown, payload: unknown) => unknown | Promise<unknown>;
 
+function safeEvidenceOutput(evidence: Evidence): Evidence {
+  const safe = sanitizeOutputValue(evidence) as Evidence;
+  // Only descriptive summary can change. Bytes and the metadata identifying
+  // their stored hash/path must remain exact, including legacy inline bytes.
+  for (const key of Object.keys(evidence) as Array<keyof Evidence>) {
+    if (key !== 'summary' && safe[key] !== evidence[key]) throw new OutputSanitizationError('OUTPUT_REDACTION_UNSAFE');
+  }
+  return safe;
+}
+
+function safeEvidenceText(text: unknown): string {
+  const safe = redactSensitiveText(text);
+  if (safe !== text) throw new OutputSanitizationError('OUTPUT_REDACTION_UNSAFE');
+  return safe;
+}
+
 export function scrubAdjudicationError(err: unknown): { code: string; message: string } {
   if (err instanceof CoderSubmissionAdjudicationError) {
     return { code: err.code, message: scrubAdjudicationDiagnostics(err.message) };
   }
-  const msg = err instanceof Error ? err.message : String(err);
+  const msg = sanitizeErrorDiagnostics(err).message;
   if (msg.includes('NOT_FOUND')) return { code: 'NOT_FOUND', message: 'Requested resource not found.' };
   if (msg.includes('INTEGRITY') || msg.includes('CHECKSUM') || msg.includes('HASH')) return { code: 'INTEGRITY_CONFLICT', message: 'Durable integrity conflict detected.' };
   if (msg.includes('PRECONDITION') || msg.includes('FENCED')) return { code: 'PRECONDITION_FENCED', message: 'Precondition check failed or authority fenced.' };
@@ -121,8 +140,9 @@ export function registerIpcHandlers(
       }
       try { return await handler(event, payload); }
       catch (error) {
-        if (!(error instanceof RepositoryRootError)) throw error;
-        return { success: false, errorCode: error.code, error: error.message };
+        if (error instanceof RepositoryRootError) return { success: false, errorCode: error.code, error: error.message };
+        if (error instanceof OutputSanitizationError) throw new OutputSanitizationError(error.code);
+        throw sanitizedDiagnosticError(error);
       }
     });
   };
@@ -402,12 +422,14 @@ export function registerIpcHandlers(
     let diffStat = '';
 
     if (gitDiffEv) {
-      diffStat = gitDiffEv.summary || 'Git Diff recorded.';
+      const safeDiff = safeEvidenceOutput(gitDiffEv);
+      diffStat = safeDiff.summary || 'Git Diff recorded.';
       try {
         diffContent = defaultArtifactStore.read(gitDiffEv);
       } catch {
         diffContent = gitDiffEv.raw_payload || '';
       }
+      diffContent = safeEvidenceText(diffContent);
     } else {
       // Strict fail-closed CLEAN-NOOP fallback
       // Condition 1: Task state is REVIEW_READY or REVIEWING
@@ -456,12 +478,14 @@ export function registerIpcHandlers(
       }
 
       // Condition 8: Read the actual durable GIT_STATUS evidence using ArtifactStore with raw_payload fallback
+      safeEvidenceOutput(gitStatusEv);
       let rawStatusPayload = '';
       try {
         rawStatusPayload = defaultArtifactStore.read(gitStatusEv);
       } catch {
         rawStatusPayload = gitStatusEv.raw_payload || '';
       }
+      rawStatusPayload = safeEvidenceText(rawStatusPayload);
 
       // Condition 9: The GIT_STATUS payload parses as JSON successfully
       let parsedGitStatus: any = null;
@@ -532,8 +556,9 @@ export function registerIpcHandlers(
       try {
         const projection = adjService.buildVerifiedAdjudicationReviewProjection(activeOrLatestAdj.id);
         const reviewPackage = PackageGenerator.renderVerifiedAdjudicationReviewProjection(projection);
-        return { success: true, reviewPackage };
-      } catch {
+        return { success: true, reviewPackage: redactSensitiveText(reviewPackage) };
+      } catch (error) {
+        if (error instanceof OutputSanitizationError) throw error;
         const adjTestRun = activeOrLatestAdj.test_run_id ? repo.getTestRun(activeOrLatestAdj.test_run_id) : null;
         const gitStatusEv = activeOrLatestAdj.git_status_evidence_id
           ? repo.getEvidence(activeOrLatestAdj.git_status_evidence_id)
@@ -564,7 +589,7 @@ export function registerIpcHandlers(
       adjudicationLinkage
     );
 
-    return { success: true, reviewPackage };
+    return { success: true, reviewPackage: redactSensitiveText(reviewPackage) };
   });
 
   // ==========================================
@@ -841,13 +866,16 @@ export function registerIpcHandlers(
   registerPrivilegedHandler('events:list', async (_, payload: unknown) => {
     const parsed = ProjectScopedIpcSchema.safeParse(payload);
     if (!parsed.success) return [];
-    return repo.getEventsByProject(parsed.data.projectId);
+    return sanitizeOutputValue(repo.getEventsByProject(parsed.data.projectId));
   });
 
   registerPrivilegedHandler('evidence:list', async (_, payload: unknown) => {
     const parsed = ProjectScopedIpcSchema.safeParse(payload);
     if (!parsed.success) return [];
-    return repo.getEvidenceByProject(parsed.data.projectId);
+    const evidence = repo.getEvidenceByProject(parsed.data.projectId);
+    // Validate cumulative structure/text bounds before returning any row.
+    sanitizeOutputValue(evidence);
+    return evidence.map(safeEvidenceOutput);
   });
 
   // ==========================================

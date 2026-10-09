@@ -8,6 +8,7 @@ import { ArtifactStore } from './ArtifactStore';
 import { isIssuedVerificationProcessBoundary, VerificationInvocationLease, VerificationProcessBoundary } from '../types/verificationCapability';
 import { RepositoryRootError, RepositoryRootErrorCode, RepositoryRootIdentity } from './RepositoryRootIdentity';
 import { RepositoryRootLease } from './RepositoryRootLease';
+import { OutputSanitizationError, type OutputSanitizationErrorCode, redactSensitiveText } from '../../shared/security/secretRedaction';
 import {
   buildTrustedEnvironment,
   isProtectedExecutableName,
@@ -39,7 +40,7 @@ export interface ProcessRunResult {
   timedOut: boolean;
   cancelled: boolean;
   outputLimitExceeded?: boolean;
-  errorCode?: RepositoryRootErrorCode | 'TIMEOUT' | 'CANCELLED' | 'PROCESS_LAUNCH_FAILED' | 'NONZERO_EXIT' | 'OUTPUT_LIMIT_EXCEEDED' | null;
+  errorCode?: RepositoryRootErrorCode | OutputSanitizationErrorCode | 'TIMEOUT' | 'CANCELLED' | 'PROCESS_LAUNCH_FAILED' | 'NONZERO_EXIT' | 'OUTPUT_LIMIT_EXCEEDED' | null;
   error?: Error | null;
   stdoutEvidenceId?: string | null;
   stderrEvidenceId?: string | null;
@@ -293,7 +294,7 @@ export class ProcessRunner {
           ? 'CANCELLED'
           : entry.result.timedOut
           ? 'TIMED_OUT'
-          : entry.result.exitCode === 0
+          : entry.result.exitCode === 0 && !entry.result.errorCode && !entry.result.outputLimitExceeded
           ? 'COMPLETED'
           : 'FAILED';
 
@@ -354,13 +355,6 @@ export class ProcessRunner {
     return null;
   }
 
-  private static SECRET_PATTERNS = [
-    /AKIA[0-9A-Z]{16}/g, // AWS Access Key
-    /Bearer\s+[A-Za-z0-9-_=]+\.[A-Za-z0-9-_=]+\.?[A-Za-z0-9-_.+/=]*/g, // JWT / Bearer
-    /-----BEGIN (?:RSA )?PRIVATE KEY-----[\s\S]*?-----END (?:RSA )?PRIVATE KEY-----/g, // Private Key
-    /(?:ghp|gho|ghu|ghs|ghr)_[A-Za-z0-9_]{36,}/g, // GitHub Token
-  ];
-
   // Minimal safe environment variable keys
   private static SAFE_ENV_VARS = [
     'PATH',
@@ -403,12 +397,7 @@ export class ProcessRunner {
   }
 
   public static scrubSecrets(text: string): string {
-    if (!text || typeof text !== 'string') return '';
-    let scrubbed = text;
-    for (const pattern of this.SECRET_PATTERNS) {
-      scrubbed = scrubbed.replace(pattern, '[REDACTED_SECRET]');
-    }
-    return scrubbed;
+    return redactSensitiveText(text);
   }
 
   /**
@@ -598,13 +587,13 @@ export class ProcessRunner {
         !/^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$/.test(options.executionId)
       ) {
         return {
-          executionId: typeof options.executionId === 'string' ? options.executionId : 'INVALID_ID',
+          executionId: 'INVALID_ID',
           pid: null,
           command: this.scrubSecrets(commandStr),
           cwd: options.cwd,
           exitCode: -1,
           stdout: '',
-          stderr: `INVALID_EXECUTION_ID: Supplied executionId "${options.executionId}" is not a valid canonical UUID.`,
+          stderr: 'INVALID_EXECUTION_ID: Supplied executionId is not a valid canonical UUID.',
           durationMs: 0,
           timedOut: false,
           cancelled: false,
@@ -1048,8 +1037,25 @@ export class ProcessRunner {
             finalStderr = `Failed to start process: ${ProcessRunner.sanitizeLaunchError(err)}`;
           }
 
-          finalStderr = repositoryFailure ? repositoryFailure.code : ProcessRunner.scrubSecrets(finalStderr);
-          const finalStdout = repositoryFailure ? '' : ProcessRunner.scrubSecrets(stdoutAcc);
+          // Sanitize the complete observation before publishing either stream.
+          // A real zero exit remains zero, but unsafe output cannot be recorded
+          // as successful execution or leave the durable row RUNNING.
+          let finalStdout = '';
+          if (repositoryFailure) {
+            finalStderr = repositoryFailure.code;
+          } else {
+            try {
+              finalStdout = ProcessRunner.scrubSecrets(stdoutAcc);
+              finalStderr = ProcessRunner.scrubSecrets(finalStderr);
+            } catch (error) {
+              const failure = error instanceof OutputSanitizationError
+                ? error : new OutputSanitizationError('OUTPUT_REDACTION_UNSAFE');
+              finalStdout = '';
+              finalStderr = failure.message;
+              finalErrorCode = failure.code;
+              if (terminalStatus === 'COMPLETED') terminalStatus = 'FAILED';
+            }
+          }
 
           let stdoutEvidenceId: string | null = null;
           let stderrEvidenceId: string | null = null;

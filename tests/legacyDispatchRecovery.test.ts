@@ -18,6 +18,7 @@ import { NonHandoffExecutionLifecycle } from '../src/core/services/NonHandoffExe
 import { GitService } from '../src/core/services/GitService';
 import { canonicalJsonStringify, computeSha256 } from '../src/core/context/ContextIntegrity';
 import { ProjectStopFenceService } from '../src/core/services/ProjectStopFenceService';
+import { OUTPUT_MAX_TEXT_CHARACTERS, redactSensitiveText } from '../src/shared/security/secretRedaction';
 import { VerificationCapabilityService } from '../src/core/services/VerificationCapabilityService';
 import { approveFixtureCommand } from './helpers/verificationCapabilityFixture';
 import { LocalCliAdapterBase } from '../src/core/adapters/LocalCliAdapterBase';
@@ -100,6 +101,89 @@ describe('complete compatibility dispatch / recovery boundary', () => {
     return new ExecutionRecoveryScanner(db, repo);
   }
 
+  it.each(['COMPLETED', 'FAILED'] as const)('sanitizes actual returned %s diagnostics before dispatch and receipt hashing', async status => {
+    const secret = 'AF_TEST_ONLY_PROVIDER_CREDENTIAL';
+    const text = 'password=' + secret;
+    execute.mockResolvedValue({ executionId: 'provider-id', status, rawResponse: text, outputProtocol: text,
+      error: status === 'FAILED' ? text : undefined });
+    const auth = await authorize();
+    const result = await dispatcher().dispatch(auth.id);
+    expect(result.status).toBe(status);
+    expect(JSON.stringify(result).includes(secret)).toBe(false);
+    const durable = repo.getExecutionAuthorization(auth.id)!;
+    expect(durable.settlement_status).toBe(status);
+    expect(durable.adapter_outcome).toBe('RETURNED');
+    const event = repo.getEvents('P', 100).find(item => item.type === 'NON_HANDOFF_EXECUTION_RESULT')!;
+    expect(JSON.stringify(event).includes(secret)).toBe(false);
+    expect(event.structured_payload).toMatchObject({ evidence: {
+      outputHash: computeSha256(redactSensitiveText(text)), responseHash: computeSha256(redactSensitiveText(text)),
+    } });
+    expect(repo.getTask('T')?.state).toBe('CODING');
+    expect(execute).toHaveBeenCalledTimes(1);
+  });
+
+  it('sanitizes thrown message and stack while preserving THREW and failed settlement', async () => {
+    const secret = 'AF_TEST_ONLY_PROVIDER_CREDENTIAL';
+    const error = new Error('password=' + secret);
+    error.stack = 'fixture-stack api_key=' + secret;
+    execute.mockRejectedValue(error);
+    const auth = await authorize();
+    const result = await dispatcher().dispatch(auth.id);
+    expect(result.status).toBe('FAILED');
+    expect(JSON.stringify(result).includes(secret)).toBe(false);
+    expect(result.providerExecutionProvenance?.adapterInvocation).toBe('THREW');
+    const durable = repo.getExecutionAuthorization(auth.id)!;
+    expect(durable).toMatchObject({ settlement_status: 'FAILED', adapter_outcome: 'THREW' });
+    expect(JSON.stringify(durable).includes(secret)).toBe(false);
+    expect(execute).toHaveBeenCalledTimes(1);
+  });
+
+  it('does not evaluate a getter-bearing Error while preserving actual thrown provider failure', async () => {
+    let getterCalls = 0;
+    const error = new Error('fixture-message');
+    Object.defineProperty(error, 'message', { get: () => {
+      getterCalls++; throw new Error('password=AF_TEST_ONLY_PROVIDER_CREDENTIAL');
+    } });
+    execute.mockRejectedValue(error);
+    const auth = await authorize();
+    const result = await dispatcher().dispatch(auth.id);
+    expect(getterCalls).toBe(0);
+    expect(result.status).toBe('FAILED');
+    expect(result.providerExecutionProvenance?.adapterInvocation).toBe('THREW');
+    expect(JSON.stringify(result).includes('AF_TEST_ONLY_PROVIDER_CREDENTIAL')).toBe(false);
+    expect(repo.getExecutionAuthorization(auth.id)).toMatchObject({ settlement_status: 'FAILED', adapter_outcome: 'THREW' });
+  });
+
+  it('preserves ordinary thrown diagnostics without evaluating an accessor stack', async () => {
+    let stackReads = 0;
+    const error = new Error('SQLITE_BUSY: ordinary adapter failure');
+    Object.defineProperty(error, 'stack', { get: () => { stackReads++; throw new Error('AF_TEST_ONLY_STACK_TRAP'); } });
+    execute.mockRejectedValue(error);
+    const auth = await authorize();
+    const result = await dispatcher().dispatch(auth.id);
+    expect(result.error?.includes('SQLITE_BUSY: ordinary adapter failure')).toBe(true);
+    expect(stackReads).toBe(0);
+    expect(result).toMatchObject({ status: 'FAILED', providerExecutionProvenance: { adapterInvocation: 'THREW' } });
+  });
+
+  it.each(['accessor', 'cyclic', 'oversized'] as const)('rejects a returned %s success shape with no getter or task success', async variant => {
+    let getterCalls = 0;
+    const returned: Record<string, unknown> = { executionId: 'provider-id', status: 'COMPLETED' };
+    if (variant === 'accessor') Object.defineProperty(returned, 'rawResponse', { enumerable: true,
+      get: () => { getterCalls++; return 'password=AF_TEST_ONLY_PROVIDER_CREDENTIAL'; } });
+    if (variant === 'cyclic') returned.extra = returned;
+    if (variant === 'oversized') returned.rawResponse = 'x'.repeat(OUTPUT_MAX_TEXT_CHARACTERS + 1);
+    execute.mockResolvedValue(returned as unknown as AgentExecutionResult);
+    const auth = await authorize();
+    const result = await dispatcher().dispatch(auth.id);
+    expect(getterCalls).toBe(0);
+    expect(result).toMatchObject({ status: 'FAILED', errorCode: variant === 'oversized' ? 'OUTPUT_SIZE_EXCEEDED' : 'OUTPUT_TYPE_INVALID',
+      providerExecutionProvenance: { adapterInvocation: 'RETURNED' } });
+    expect(repo.getExecutionAuthorization(auth.id)).toMatchObject({ settlement_status: 'FAILED', adapter_outcome: 'RETURNED' });
+    expect(repo.getTask('T')?.state).toBe('CODING');
+    expect(execute).toHaveBeenCalledTimes(1);
+  });
+
   it.each(['COMPLETED', 'FAILED', 'CANCELLED'] as const)('persists actual %s with the backend execution identity and replays without task success', async status => {
     execute.mockResolvedValue({ executionId: 'provider-supplied-id', status, errorCode: status === 'FAILED' ? 'EXECUTION_FAILED' : null });
     const auth = await authorize();
@@ -171,6 +255,23 @@ describe('complete compatibility dispatch / recovery boundary', () => {
     expect(rows[0]).toMatchObject({ id: result.executionId, exit_code: 0, status: 'COMPLETED' });
     expect(repo.getExecutionAuthorization(auth.id)?.execution_id).toBe(rows[0].id);
     expect(reopen().scanAndReconcile().items[0].classification).toBe('ALREADY_RECONCILED');
+  });
+
+  it('keeps a real unsafe zero-exit CLI child from becoming protocol or authorization success', async () => {
+    const secret = 'AF_TEST_ONLY_CLI_CREDENTIAL';
+    const script = path.join(root, 'fixture-unsafe-cli.cjs');
+    fs.writeFileSync(script, 'process.stdin.resume(); process.stdin.on("end",()=>{' +
+      'process.stdout.write(' + JSON.stringify('api_key:{first:"' + secret + '",second:17}') + ');});');
+    adapter = new RecoveryFixtureCli(script, repo, new ArtifactStore(path.join(root, 'artifacts')));
+    const auth = await authorize();
+    const result = await dispatcher().dispatch(auth.id);
+    expect(result.status).toBe('FAILED');
+    expect(result.errorCode).toBe('OUTPUT_REDACTION_UNSAFE');
+    expect(JSON.stringify(result).includes(secret)).toBe(false);
+    const process = repo.getProcessRunsByTask('T')[0];
+    expect(process).toMatchObject({ id: result.executionId, status: 'FAILED', exit_code: 0 });
+    expect(repo.getExecutionAuthorization(auth.id)).toMatchObject({ settlement_status: 'FAILED', adapter_outcome: 'RETURNED' });
+    expect(repo.getTask('T')?.state).toBe('CODING');
   });
 
   it('passes the backend identity to the actual Manual Bridge adapter without inventing assignment authority', async () => {

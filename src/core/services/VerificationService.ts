@@ -14,6 +14,8 @@ import { VerificationCapabilityService } from './VerificationCapabilityService';
 import { VerificationCapabilityReference, VerificationInvocationLease, VerificationProcessBoundary } from '../types/verificationCapability';
 import { RepositoryRootError } from './RepositoryRootIdentity';
 import { RepositoryRootLease } from './RepositoryRootLease';
+import { redactSensitiveText } from '../../shared/security/secretRedaction';
+import { sanitizeErrorDiagnostics } from '../../shared/security/outputDiagnostics';
 
 export { shouldRunCoderVerification } from '../state/taskStateMachine';
 
@@ -258,8 +260,8 @@ export class VerificationService {
 
     rootLease.assertActive(); invocationLease.assertActive();
     // 4. Parse test results & metrics
-    const stdout = result.stdout;
-    const stderr = result.stderr;
+    const stdout = redactSensitiveText(result.stdout);
+    const stderr = redactSensitiveText(result.stderr);
     const combinedOutput = `=== STDOUT ===\n${stdout}\n\n=== STDERR ===\n${stderr}`;
 
     const evidenceId = crypto.randomUUID();
@@ -273,12 +275,13 @@ export class VerificationService {
       combinedOutput,
       'text/plain'
     );
-    const metrics = parseTestMetrics(stdout, result.exitCode);
+    const metrics = (result.errorCode && result.exitCode === 0) || result.outputLimitExceeded
+      ? { passedCount: 0, failedCount: 1, skippedCount: 0 } : parseTestMetrics(stdout, result.exitCode);
 
     const testRun: DeferredTestRun = {
       id: crypto.randomUUID(),
       task_id: taskId,
-      command: fullCommandStr,
+      command: redactSensitiveText(fullCommandStr),
       passed_count: metrics.passedCount,
       failed_count: metrics.failedCount,
       skipped_count: metrics.skippedCount,
@@ -327,7 +330,7 @@ export class VerificationService {
         ? 'CANCELLED'
         : result.timedOut
         ? 'TIMED_OUT'
-        : result.exitCode === 0
+        : result.exitCode === 0 && !result.errorCode && !result.outputLimitExceeded
         ? 'COMPLETED'
         : 'FAILED';
       const endTime = result.endTime ?? new Date().toISOString();
@@ -602,7 +605,7 @@ export class VerificationService {
       return {
         outcome: 'COMMAND_POLICY_REJECTED', failure_code: code,
         reason: error instanceof RepositoryRootError ? code : 'OWNER_APPROVAL_REQUIRED: Frozen verification capability is missing, stale or revoked.',
-        command: fullCommandStr, repo_path: input.repo_path, started_at: startedAtIso, finished_at: new Date().toISOString(),
+        command: redactSensitiveText(fullCommandStr), repo_path: input.repo_path, started_at: startedAtIso, finished_at: new Date().toISOString(),
         exit_code: -1, duration_ms: 0, stdout: '', stderr: error instanceof RepositoryRootError ? code : 'Verification capability rejected',
         stdout_bytes: 0, stderr_bytes: 0, combined_output: '', metrics: { passedCount: 0, failedCount: 0, skippedCount: 0 },
         process_start: 'NOT_STARTED_PROVEN', process_termination: 'NOT_APPLICABLE', timed_out: false, cancelled: false,
@@ -616,7 +619,7 @@ export class VerificationService {
         outcome: 'COMMAND_POLICY_REJECTED',
         failure_code: 'POLICY_VIOLATION',
         reason: `Verification denied by PolicyService: ${policy.reason} (${policy.decision})`,
-        command: fullCommandStr,
+        command: redactSensitiveText(fullCommandStr),
         repo_path: input.repo_path,
         started_at: startedAtIso,
         finished_at: new Date().toISOString(),
@@ -652,12 +655,12 @@ export class VerificationService {
         // ZERO DB WRITES: repo and artifactStore are omitted!
       });
     } catch (spawnErr: unknown) {
-      const errMsg = spawnErr instanceof Error ? spawnErr.message : String(spawnErr);
+      const errMsg = sanitizeErrorDiagnostics(spawnErr).message;
       return {
         outcome: 'RECOVERY_FENCED',
         failure_code: 'ORPHANED_VERIFICATION_INTERRUPTED',
         error: `Ambiguous process execution failure: ${errMsg}`,
-        command: fullCommandStr,
+        command: redactSensitiveText(fullCommandStr),
         repo_path: input.repo_path,
         started_at: startedAtIso,
         finished_at: new Date().toISOString(),
@@ -677,10 +680,11 @@ export class VerificationService {
     }
 
     const finishedAtIso = new Date().toISOString();
-    const stdout = result.stdout;
-    const stderr = result.stderr;
+    const stdout = redactSensitiveText(result.stdout);
+    const stderr = redactSensitiveText(result.stderr);
     const combinedOutput = `=== STDOUT ===\n${stdout}\n\n=== STDERR ===\n${stderr}`;
-    const metrics = parseTestMetrics(stdout, result.exitCode);
+    const metrics = (result.errorCode && result.exitCode === 0) || result.outputLimitExceeded
+      ? { passedCount: 0, failedCount: 1, skippedCount: 0 } : parseTestMetrics(stdout, result.exitCode);
     const stdoutBytes = Buffer.byteLength(stdout, 'utf8');
     const stderrBytes = Buffer.byteLength(stderr, 'utf8');
 
@@ -691,7 +695,7 @@ export class VerificationService {
         outcome: 'PROCESS_START_FAILED',
         failure_code: 'PROCESS_START_FAILED',
         error: result.stderr || 'Process launch failed before spawn',
-        command: fullCommandStr,
+        command: redactSensitiveText(fullCommandStr),
         repo_path: input.repo_path,
         started_at: startedAtIso,
         finished_at: finishedAtIso,
@@ -728,7 +732,7 @@ export class VerificationService {
         outcome: 'RECOVERY_FENCED',
         failure_code: failureCode,
         error: result.stderr || 'Process start or termination truth is not durably proven',
-        command: fullCommandStr,
+        command: redactSensitiveText(fullCommandStr),
         repo_path: input.repo_path,
         started_at: startedAtIso,
         finished_at: finishedAtIso,
@@ -753,7 +757,7 @@ export class VerificationService {
     if (rootFailure) {
       return {
         outcome: 'COMMAND_POLICY_REJECTED', failure_code: rootFailure, reason: rootFailure,
-        command: fullCommandStr, repo_path: input.repo_path, started_at: startedAtIso, finished_at: finishedAtIso,
+        command: redactSensitiveText(fullCommandStr), repo_path: input.repo_path, started_at: startedAtIso, finished_at: finishedAtIso,
         exit_code: result.exitCode, duration_ms: result.durationMs, stdout: '', stderr: rootFailure,
         stdout_bytes: 0, stderr_bytes: Buffer.byteLength(rootFailure, 'utf8'), combined_output: rootFailure,
         metrics: { passedCount: 0, failedCount: 0, skippedCount: 0 },
@@ -767,7 +771,7 @@ export class VerificationService {
         outcome: 'TEST_TIMEOUT',
         failure_code: 'VERIFICATION_TIMEOUT',
         error: `Test execution timed out after ${result.durationMs}ms`,
-        command: fullCommandStr,
+        command: redactSensitiveText(fullCommandStr),
         repo_path: input.repo_path,
         started_at: startedAtIso,
         finished_at: finishedAtIso,
@@ -786,13 +790,27 @@ export class VerificationService {
       };
     }
 
+    // A zero exit does not verify output that was rejected by the process
+    // boundary. Keep the observed exit and lifecycle in the failure evidence.
+    if ((result.errorCode || result.outputLimitExceeded) && result.exitCode === 0) {
+      return {
+        outcome: 'TEST_FAILED', failure_code: result.errorCode ?? 'OUTPUT_LIMIT_EXCEEDED',
+        error: stderr || 'Process output or execution could not be verified safely.',
+        command: redactSensitiveText(fullCommandStr), repo_path: input.repo_path,
+        started_at: startedAtIso, finished_at: finishedAtIso, exit_code: result.exitCode, duration_ms: result.durationMs,
+        stdout, stderr, stdout_bytes: stdoutBytes, stderr_bytes: stderrBytes, combined_output: combinedOutput, metrics,
+        process_start: result.processStart, process_termination: result.processTermination,
+        timed_out: result.timedOut, cancelled: result.cancelled,
+      };
+    }
+
     // - Authoritative non-zero exit
     if (result.exitCode !== 0) {
       return {
         outcome: 'TEST_FAILED',
         failure_code: 'TESTS_FAILED',
         error: `Test run failed with exit code ${result.exitCode}`,
-        command: fullCommandStr,
+        command: redactSensitiveText(fullCommandStr),
         repo_path: input.repo_path,
         started_at: startedAtIso,
         finished_at: finishedAtIso,
@@ -819,7 +837,7 @@ export class VerificationService {
     } catch (error) {
       return {
         outcome: 'COMMAND_POLICY_REJECTED', failure_code: error instanceof RepositoryRootError ? error.code : 'COMMAND_POLICY_REJECTED',
-        reason: error instanceof RepositoryRootError ? error.code : 'Verification capability changed while the child was running.', command: fullCommandStr, repo_path: input.repo_path,
+        reason: error instanceof RepositoryRootError ? error.code : 'Verification capability changed while the child was running.', command: redactSensitiveText(fullCommandStr), repo_path: input.repo_path,
         started_at: startedAtIso, finished_at: finishedAtIso, exit_code: result.exitCode, duration_ms: result.durationMs,
         stdout, stderr, stdout_bytes: stdoutBytes, stderr_bytes: stderrBytes, combined_output: combinedOutput, metrics,
         process_start: result.processStart, process_termination: result.processTermination, timed_out: result.timedOut, cancelled: result.cancelled,
@@ -829,7 +847,7 @@ export class VerificationService {
     return {
       outcome: 'SUCCESS',
       failure_code: null,
-      command: fullCommandStr,
+      command: redactSensitiveText(fullCommandStr),
       repo_path: input.repo_path,
       started_at: startedAtIso,
       finished_at: finishedAtIso,
@@ -927,8 +945,8 @@ export class VerificationService {
 
     rootLease.assertActive(); invocationLease.assertActive();
     // 3. Parse test results & metrics
-    const stdout = result.stdout;
-    const stderr = result.stderr;
+    const stdout = redactSensitiveText(result.stdout);
+    const stderr = redactSensitiveText(result.stderr);
     const combinedOutput = `=== STDOUT ===\n${stdout}\n\n=== STDERR ===\n${stderr}`;
 
     const evidenceId = crypto.randomUUID();
@@ -942,12 +960,13 @@ export class VerificationService {
       combinedOutput,
       'text/plain'
     );
-    const metrics = parseTestMetrics(stdout, result.exitCode);
+    const metrics = (result.errorCode && result.exitCode === 0) || result.outputLimitExceeded
+      ? { passedCount: 0, failedCount: 1, skippedCount: 0 } : parseTestMetrics(stdout, result.exitCode);
 
     const testRun: TestRun = {
       id: crypto.randomUUID(),
       task_id: taskId,
-      command: fullCommandStr,
+      command: redactSensitiveText(fullCommandStr),
       passed_count: metrics.passedCount,
       failed_count: metrics.failedCount,
       skipped_count: metrics.skippedCount,
@@ -975,6 +994,8 @@ export class VerificationService {
     errorMessage: string,
     deferPersistence = false
   ): TestRun {
+    commandStr = redactSensitiveText(commandStr);
+    errorMessage = redactSensitiveText(errorMessage);
     const evidenceId = crypto.randomUUID();
     const evidence = this.artifactStore.store(
       evidenceId,

@@ -10,6 +10,7 @@ import {
 import { ArtifactStore } from '../services/ArtifactStore';
 import { ProcessRunner } from '../services/ProcessRunner';
 import { redactTrialEvidenceText } from './trialEvidence';
+import { safeDiagnosticText, sanitizeErrorDiagnostics, sanitizedDiagnosticError } from '../../shared/security/outputDiagnostics';
 import { VerificationCapabilityService } from '../services/VerificationCapabilityService';
 import { EventService } from '../services/EventService';
 import { TaskService, captureAuthorizedTaskTransitionBinding } from '../services/TaskService';
@@ -301,7 +302,7 @@ export class ProductTaskAutonomyAdapter {
     try {
       canonicalPayload = CanonicalExecutionPayloadSchema.parse(JSON.parse(authorization.canonical_payload_json));
     } catch (error) {
-      return fail('CANONICAL_PAYLOAD_INVALID', error instanceof Error ? error.message : String(error));
+      return fail('CANONICAL_PAYLOAD_INVALID', sanitizeErrorDiagnostics(error).message);
     }
     if (computePayloadHash(canonicalPayload) !== authorization.instruction_payload_hash) {
       return fail('CANONICAL_PAYLOAD_HASH_MISMATCH', 'ExecutionAuthorization canonical payload failed hash verification.');
@@ -619,7 +620,7 @@ export class ProductTaskAutonomyAdapter {
           (filePath) => this.repo.isEvidenceFilePathReferenced(filePath),
         );
       }
-      throw error;
+      throw sanitizedDiagnosticError(error);
     }
     return run;
   }
@@ -705,7 +706,7 @@ export class ProductTaskAutonomyAdapter {
       return {
         attemptNumber: index + 1,
         testRunId: run.id,
-        command: redactTrialEvidenceText(ProcessRunner.scrubSecrets(run.command)).slice(0, 4096),
+        command: safeDiagnosticText(run.command).slice(0, 4096),
         passedCount: run.passed_count,
         failedCount: run.failed_count,
         skippedCount: run.skipped_count,
@@ -1249,7 +1250,7 @@ export class ProductTaskAutonomyAdapter {
     } catch (error) {
       const currentTask = this.repo.getTask(validated.authority.task.id);
       let finalTaskState = currentTask?.state ?? 'UNKNOWN';
-      const executionError = error instanceof Error ? error.message : String(error);
+      const executionError = sanitizeErrorDiagnostics(error).message;
       let reportedError = executionError;
       if (currentTask && task.state === 'REVIEWING') {
         const currentEpoch = currentTask.ownership_epoch ?? authorityEpoch;
@@ -1259,7 +1260,7 @@ export class ProductTaskAutonomyAdapter {
             finalTaskState = recovered.state;
           } catch (recoveryError) {
             finalTaskState = this.repo.getTask(currentTask.id)?.state ?? currentTask.state;
-            const recoveryMessage = recoveryError instanceof Error ? recoveryError.message : String(recoveryError);
+            const recoveryMessage = sanitizeErrorDiagnostics(recoveryError).message;
             reportedError = recoveryMessage.includes('OWNERSHIP_EPOCH_MISMATCH') || recoveryMessage.includes('STALE_TASK_TRANSITION')
               ? `AUTHORITY_FENCED_DURING_EXECUTION: ${recoveryMessage}`
               : `REVIEW_RESUME_FAILED: ${recoveryMessage}; original error: ${executionError}`;
@@ -1283,7 +1284,7 @@ export class ProductTaskAutonomyAdapter {
     try {
       released = this.releaseWorkerSlotLease(acquired.lease.id, acquired.lease.lease_token);
     } catch (error) {
-      const cleanupError = error instanceof Error ? error.message : String(error);
+      const cleanupError = sanitizeErrorDiagnostics(error).message;
       released = {
         status: 'FAILED',
         code: 'LEASE_RELEASE_FAILED',
