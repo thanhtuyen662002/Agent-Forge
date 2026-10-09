@@ -1,3 +1,5 @@
+import { captureRepositoryRoot } from '../src/core/services/RepositoryRootIdentity';
+import { execFileSync as initializeSelectedFixtureGit } from 'node:child_process';
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import Database from 'better-sqlite3';
 import { MigrationRunner } from '../src/core/database/migrations';
@@ -561,7 +563,8 @@ describe('PR #14: Verification Settings Persistence, Parser, & Formatter', () =>
         started_at: now,
         completed_at: null,
       };
-      repo.createProject(project);
+      initializeSelectedFixtureGit('git', ['init', '-q', '--template=', '--initial-branch=main'], { cwd: project.repository_path, stdio: 'ignore', windowsHide: true });
+      repo.createProject(project, captureRepositoryRoot(project.repository_path));
 
       task = {
         id: 'TSK-DISCOVERY-1',

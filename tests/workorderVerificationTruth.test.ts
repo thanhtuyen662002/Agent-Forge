@@ -1,3 +1,4 @@
+import { captureRepositoryRoot } from '../src/core/services/RepositoryRootIdentity';
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import { approveFixtureCommand } from './helpers/verificationCapabilityFixture';
 import { execSync } from 'child_process';
@@ -119,7 +120,7 @@ describe('WorkOrder Verification Guidance Truthfulness & Immutability Hardening'
       started_at: new Date().toISOString(),
       completed_at: null,
     };
-    repo.createProject(testProject);
+    repo.createProject(testProject, captureRepositoryRoot(testProject.repository_path));
 
     const t = taskService.createTask({
       projectId: testProjectId,
@@ -218,7 +219,7 @@ describe('WorkOrder Verification Guidance Truthfulness & Immutability Hardening'
       started_at: new Date().toISOString(),
       completed_at: null,
     };
-    repo.createProject(projB);
+    repo.createProject(projB, captureRepositoryRoot(projB.repository_path));
 
     const taskB = taskService.createTask({
       projectId: projBId,
@@ -420,7 +421,7 @@ describe('WorkOrder Verification Guidance Truthfulness & Immutability Hardening'
       started_at: new Date().toISOString(),
       completed_at: null,
     };
-    repo.createProject(projB);
+    repo.createProject(projB, captureRepositoryRoot(projB.repository_path));
 
     const taskB = taskService.createTask({
       projectId: projBId,

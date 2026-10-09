@@ -1,3 +1,6 @@
+import { captureRepositoryRoot } from '../src/core/services/RepositoryRootIdentity';
+import selectedFixtureFs from 'node:fs';
+import selectedFixturePath from 'node:path';
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import Database from 'better-sqlite3';
 import fs from 'fs';
@@ -18,6 +21,8 @@ import {
   ProviderAccountHealthAction,
 } from '../src/core/types/domain';
 import type { ProviderDispatchExecutionResult } from '../src/core/services/ProviderDispatchService';
+
+const selectedFixtureRoot = selectedFixtureFs.realpathSync.native(selectedFixturePath.resolve(__dirname, '..'));
 
 describe('R5H4 Ordered Provider Health Application & Idempotency Contract Tests', () => {
   let db: Database.Database;
@@ -61,7 +66,7 @@ describe('R5H4 Ordered Provider Health Application & Idempotency Contract Tests'
       id: PROJECT_ID,
       name: 'Test Project',
       description: null,
-      repository_path: 'd:/test',
+      repository_path: selectedFixtureRoot,
       default_branch: 'main',
       status: 'READY',
       contract: null,
@@ -69,7 +74,7 @@ describe('R5H4 Ordered Provider Health Application & Idempotency Contract Tests'
       completed_at: null,
       created_at: '2026-08-26T12:00:00.000Z',
       updated_at: '2026-08-26T12:00:00.000Z',
-    });
+    }, captureRepositoryRoot(selectedFixtureRoot));
 
     repo.createTask({
       id: TASK_ID,

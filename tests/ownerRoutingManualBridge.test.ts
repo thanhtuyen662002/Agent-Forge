@@ -1,3 +1,4 @@
+import { captureRepositoryRoot } from '../src/core/services/RepositoryRootIdentity';
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import Database from 'better-sqlite3';
 import fs from 'fs';
@@ -137,7 +138,7 @@ describe('Owner Routing & Manual Bridge Handoff Loop (PR #8)', () => {
     dispatchService = new ProviderDispatchService(providerRegistry, repo, eventService);
 
     // Seed test project & provider resources
-    const proj = projectService.createProject('PR8 Test Project', 'Testing owner routing loop', gitRepoDir, 'main');
+    const proj = projectService.createProject('PR8 Test Project', 'Testing owner routing loop', gitRepoDir, 'main', captureRepositoryRoot(gitRepoDir));
     testProjectId = proj.id;
 
     // Seed Manual Bridge provider & resources

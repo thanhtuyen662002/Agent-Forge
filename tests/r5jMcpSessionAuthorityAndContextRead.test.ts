@@ -878,6 +878,9 @@ interface FullGraphFixtures {
 }
 
 function setupFullGraph(db: Database.Database): FullGraphFixtures {
+  // Schema-only migration 21 fixtures stay historical. A live selected-root
+  // authority graph needs the current append-only migrations before binding.
+  MigrationRunner.run(db);
   const repo = new Repository(db);
   const service = new McpSessionAuthorityService(repo, db);
 

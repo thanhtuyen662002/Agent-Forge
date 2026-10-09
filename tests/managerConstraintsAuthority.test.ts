@@ -1,3 +1,4 @@
+import { captureRepositoryRoot } from '../src/core/services/RepositoryRootIdentity';
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import { approveFixtureCommand } from './helpers/verificationCapabilityFixture';
 import { execSync } from 'child_process';
@@ -109,7 +110,7 @@ describe('Manager Constraints Authority Binding to ExecutionAuthorization and Wo
       started_at: new Date().toISOString(),
       completed_at: null,
     };
-    repo.createProject(testProject);
+    repo.createProject(testProject, captureRepositoryRoot(testProject.repository_path));
 
     const t = taskService.createTask({
       projectId: testProjectId,

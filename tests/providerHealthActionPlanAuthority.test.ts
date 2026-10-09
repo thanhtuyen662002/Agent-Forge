@@ -1,3 +1,6 @@
+import { captureRepositoryRoot } from '../src/core/services/RepositoryRootIdentity';
+import selectedFixtureFs from 'node:fs';
+import selectedFixturePath from 'node:path';
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import Database from 'better-sqlite3';
 import { MigrationRunner } from '../src/core/database/migrations';
@@ -12,6 +15,8 @@ import {
   FailoverPolicyAuthoritySnapshotV1,
 } from '../src/core/types/domain';
 import { ProviderDispatchExecutionResult } from '../src/core/services/ProviderDispatchService';
+
+const selectedFixtureRoot = selectedFixtureFs.realpathSync.native(selectedFixturePath.resolve(__dirname, '..'));
 
 class TestMockAdapter implements ProviderAdapter {
   public id = 'prov-test';
@@ -64,7 +69,7 @@ describe('R5H4 Durable Provider Health Action Plan Authority & Routing Snapshot 
       id: 'proj-1',
       name: 'Action Plan Project',
       description: 'Project for action plan test',
-      repository_path: '/test/repo',
+      repository_path: selectedFixtureRoot,
       default_branch: 'main',
       status: 'READY',
       contract: null,
@@ -72,7 +77,7 @@ describe('R5H4 Durable Provider Health Action Plan Authority & Routing Snapshot 
       completed_at: null,
       created_at: '2026-08-26T12:00:00.000Z',
       updated_at: '2026-08-26T12:00:00.000Z',
-    });
+    }, captureRepositoryRoot(selectedFixtureRoot));
 
     repo.createTask({
       id: 'task-1',

@@ -1,3 +1,6 @@
+import { captureRepositoryRoot } from '../src/core/services/RepositoryRootIdentity';
+import selectedFixtureFs from 'node:fs';
+import selectedFixturePath from 'node:path';
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import Database from 'better-sqlite3';
 import { MigrationRunner } from '../src/core/database/migrations';
@@ -26,6 +29,8 @@ import {
   ProviderHealthStatus,
   ProviderAdapterType,
 } from '../src/core/types/domain';
+
+const selectedFixtureRoot = selectedFixtureFs.realpathSync.native(selectedFixturePath.resolve(__dirname, '..'));
 
 class MockProviderAdapter implements ProviderAdapter {
   constructor(
@@ -611,7 +616,7 @@ describe('R5H1 — Failure Taxonomy, Account Health & Routing Cooldown', () => {
         id: projectId,
         name: 'Cooldown Project',
         description: null,
-        repository_path: 'D:/Projects/Test',
+        repository_path: selectedFixtureRoot,
         default_branch: 'main',
         status: 'RUNNING',
         contract: null,
@@ -620,7 +625,7 @@ describe('R5H1 — Failure Taxonomy, Account Health & Routing Cooldown', () => {
         started_at: fakeNow.toISOString(),
         completed_at: null,
       };
-      repo.createProject(project);
+      repo.createProject(project, captureRepositoryRoot(project.repository_path));
 
       const task: Task = {
         id: taskId,

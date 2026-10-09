@@ -36,7 +36,7 @@ import {
   CANONICAL_WORKSPACE_SNAPSHOT_AFTER_KEYS,
   CanonicalWorkspaceSnapshotAfterPayload,
 } from '../types/adjudication';
-import { Evidence, EvidenceType, GitStatusSummary, GitDiffSummary, TestRun } from '../types/domain';
+import { Evidence, EvidenceType, GitStatusSummary, GitDiffSummary, Project, TestRun } from '../types/domain';
 import {
   ArtifactStore,
   defaultArtifactStore,
@@ -5468,7 +5468,12 @@ export class CoderSubmissionAdjudicationService {
     }
 
     // 4. Validate durable authority graph with exact FK/ID equality
-    const project = this.repo.getProjectForRepositoryUse(sub.project_id);
+    let project: Project | null = null;
+    try { project = this.repo.getProjectForRepositoryUse(sub.project_id); }
+    catch (error) {
+      if (!(error instanceof RepositoryRootError)) throw error;
+      fenced_reasons.push(error.code);
+    }
     if (!project) {
       fenced_reasons.push(`Project "${sub.project_id}" not found`);
     } else if (project.status !== 'RUNNING') {

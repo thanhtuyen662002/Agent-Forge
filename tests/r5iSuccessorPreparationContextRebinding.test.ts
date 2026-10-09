@@ -1,3 +1,6 @@
+import { captureRepositoryRoot } from '../src/core/services/RepositoryRootIdentity';
+import selectedFixtureFs from 'node:fs';
+import selectedFixturePath from 'node:path';
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import Database from 'better-sqlite3';
 import * as fs from 'fs';
@@ -26,6 +29,8 @@ import {
   ContextSnapshotPurpose,
   HandoffContext,
 } from '../src/core/types/domain';
+
+const selectedFixtureRoot = selectedFixtureFs.realpathSync.native(selectedFixturePath.resolve(__dirname, '..'));
 
 describe('R5I3 Corrective Durable Successor Context Authority and Attempt State Hardening', () => {
   let db: Database.Database;
@@ -72,7 +77,7 @@ describe('R5I3 Corrective Durable Successor Context Authority and Attempt State 
       id: 'proj-1',
       name: 'Project 1',
       description: null,
-      repository_path: '/repo',
+      repository_path: selectedFixtureRoot,
       default_branch: 'main',
       status: 'RUNNING',
       contract: null,
@@ -80,7 +85,7 @@ describe('R5I3 Corrective Durable Successor Context Authority and Attempt State 
       updated_at: nowIso,
       started_at: nowIso,
       completed_at: null,
-    });
+    }, captureRepositoryRoot(selectedFixtureRoot));
 
     // Source Role Profile & Agent Profile
     targetRepo.createRoleProfile({

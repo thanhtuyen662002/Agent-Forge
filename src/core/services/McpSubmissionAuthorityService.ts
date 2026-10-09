@@ -190,7 +190,9 @@ export class McpSubmissionAuthorityService {
           };
         }
 
-        const preflightProject = this.repo.getProjectForRepositoryUse(preflightAuth.project_id);
+        // This is only a metadata preflight. Strict repository authority is
+        // checked inside the writer transaction after session revalidation.
+        const preflightProject = this.repo.getProject(preflightAuth.project_id);
         if (!preflightProject || !preflightProject.repository_path) {
           return {
             accepted: false,

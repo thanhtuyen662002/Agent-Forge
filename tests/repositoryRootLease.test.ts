@@ -132,6 +132,31 @@ describe('captured repository read lease', () => {
     expect(fs.readdirSync(empty + '-moved')).toEqual([]);
   });
 
+  it.runIf(process.platform === 'win32')('denies attributes-only conversion of the pinned Git directory after an attacker tries to empty it', () => {
+    const gitMetadata = path.join(repository, '.git');
+    const outside = path.join(fixture, 'outside-admin');
+    const empty = path.join(fixture, 'empty-admin-control');
+    fs.mkdirSync(outside); fs.mkdirSync(empty);
+    fs.writeFileSync(path.join(outside, 'sentinel'), 'outside-admin-must-survive');
+    lease = RepositoryRootLease.acquire(captureRepositoryRoot(repository));
+    if (fs.realpathSync.native(gitMetadata) !== gitMetadata || path.dirname(gitMetadata) !== repository) throw new Error('FIXTURE_BOUNDARY_CHANGED');
+    for (const entry of fs.readdirSync(gitMetadata)) {
+      const target = path.resolve(gitMetadata, entry);
+      if (path.dirname(target) !== gitMetadata) throw new Error('FIXTURE_BOUNDARY_CHANGED');
+      try { fs.rmSync(target, { recursive: true, force: true }); } catch {}
+    }
+    const observed = spawnSync(path.join(process.env.SystemRoot!, 'System32/WindowsPowerShell/v1.0/powershell.exe'),
+      ['-NoLogo', '-NoProfile', '-NonInteractive', '-EncodedCommand', Buffer.from(reparseProgram, 'utf16le').toString('base64')],
+      { input: JSON.stringify({ root: gitMetadata, outside, empty }) + '\n', encoding: 'utf8', windowsHide: true, timeout: 15000, maxBuffer: 16384 });
+    expect(observed.status).toBe(0);
+    expect(JSON.parse(observed.stdout.trim())).toEqual({ control: true, selected: false });
+    expect(fs.lstatSync(gitMetadata).isSymbolicLink()).toBe(false);
+    expect(() => lease!.assertActive()).not.toThrow();
+    expect(fs.readFileSync(path.join(outside, 'sentinel'), 'utf8')).toBe('outside-admin-must-survive');
+    expect(fs.readdirSync(outside)).toEqual(['sentinel']);
+    fs.unlinkSync(empty);
+  });
+
   it.runIf(process.platform === 'linux')('retains descriptor cwd across a last-invocation path swap and rejects the stale observation', () => {
     lease = RepositoryRootLease.acquire(captureRepositoryRoot(repository));
     fs.renameSync(repository, repository + '-original');

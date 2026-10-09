@@ -1,3 +1,4 @@
+import { captureRepositoryRoot } from '../src/core/services/RepositoryRootIdentity';
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import { execSync } from 'child_process';
 import Database from 'better-sqlite3';
@@ -68,7 +69,7 @@ describe('Coder Auto-Verification State Gate (PR18)', () => {
       started_at: new Date().toISOString(),
       completed_at: null,
     };
-    repo.createProject(testProject);
+    repo.createProject(testProject, captureRepositoryRoot(testProject.repository_path));
 
     testTask = {
       id: 'TSK-VERIF-001',

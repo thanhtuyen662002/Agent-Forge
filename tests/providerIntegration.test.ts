@@ -686,7 +686,7 @@ describe('PR #5 — Provider Integration Foundation', () => {
     const project = bootstrap1.projectService.createProject(
       'Restart Test Project',
       'Validating state survival',
-      repoDir
+      repoDir, 'main', captureRepositoryRoot(repoDir)
     );
 
     const task = bootstrap1.taskService.createTask({

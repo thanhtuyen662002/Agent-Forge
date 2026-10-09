@@ -1,3 +1,6 @@
+import { captureRepositoryRoot } from '../src/core/services/RepositoryRootIdentity';
+import selectedFixtureFs from 'node:fs';
+import selectedFixturePath from 'node:path';
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import Database from 'better-sqlite3';
 import { MigrationRunner } from '../src/core/database/migrations';
@@ -36,6 +39,8 @@ import {
   Task,
   Project,
 } from '../src/core/types/domain';
+
+const selectedFixtureRoot = selectedFixtureFs.realpathSync.native(selectedFixturePath.resolve(__dirname, '..'));
 
 class MockTestAdapter implements ProviderAdapter {
   constructor(
@@ -132,7 +137,7 @@ describe('R5I4 Cross-Provider Successor Routing and Replay Identity Authority', 
       id: projectId,
       name: 'R5I4 Project',
       description: null,
-      repository_path: '/repo',
+      repository_path: selectedFixtureRoot,
       default_branch: 'main',
       status: 'RUNNING',
       contract: null,
@@ -140,7 +145,7 @@ describe('R5I4 Cross-Provider Successor Routing and Replay Identity Authority', 
       updated_at: nowIso,
       started_at: nowIso,
       completed_at: null,
-    });
+    }, captureRepositoryRoot(selectedFixtureRoot));
 
     repo.createTask({
       id: taskId,
