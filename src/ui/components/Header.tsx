@@ -31,7 +31,7 @@ export const Header: React.FC = () => {
     : null;
 
   const doneTasks = tasks.filter((t) => t.state === 'DONE').length;
-  const activeAgents = agents.filter((a) => a.status === 'ACTIVE' || a.status === 'BUSY').length;
+  const configuredAgents = agents.length;
 
   const getStatusColor = (status?: string) => {
     switch (status) {
@@ -144,7 +144,7 @@ export const Header: React.FC = () => {
         <div className="flex items-center space-x-2">
           <Cpu className="w-4 h-4 text-forge-emerald" />
           <span>
-            {t('nav.agentCenter')}: <strong className="text-slate-100">{activeAgents}</strong> {t('header.agentsActive')}
+            {t('nav.agentCenter')}: <strong className="text-slate-100">{configuredAgents}</strong> {t('header.agentsConfigured')}
           </span>
         </div>
       </div>

@@ -98,40 +98,50 @@ export const DashboardView: React.FC = () => {
         <div className="flex flex-col lg:flex-row lg:items-center justify-between gap-6 relative z-10">
           <div className="space-y-2">
             <div className="flex items-center space-x-3">
-              <span className="px-2.5 py-1 rounded-md text-xs font-mono font-bold bg-forge-cyan/20 text-forge-cyan border border-forge-cyan/30">
-                {activeProject?.id || 'PROJ-CORE'}
-              </span>
+              {activeProject && (
+                <span className="px-2.5 py-1 rounded-md text-xs font-mono font-bold bg-forge-cyan/20 text-forge-cyan border border-forge-cyan/30">
+                  {activeProject.id}
+                </span>
+              )}
               <h2 className="text-2xl font-bold text-white tracking-tight">
-                {activeProject?.name || t('dashboard.fallbackTitle')}
+                {activeProject?.name || t('header.noProject')}
               </h2>
             </div>
             <p className="text-sm text-slate-400 max-w-2xl">
-              {activeProject?.description || t('dashboard.fallbackDescription')}
+              {activeProject ? activeProject.description : t('dashboard.noProjectDescription')}
             </p>
-            <div className="flex items-center space-x-6 text-xs font-mono text-slate-400 pt-2">
-              <div className="flex items-center space-x-2">
-                <GitBranch className="w-4 h-4 text-forge-cyan" />
-                <span>{t('dashboard.repoLabel')}: <strong className="text-slate-200">{activeProject?.repository_path || t('dashboard.currentWorkspace')}</strong></span>
+            {activeProject ? (
+              <div className="flex items-center space-x-6 text-xs font-mono text-slate-400 pt-2">
+                <div className="flex items-center space-x-2">
+                  <GitBranch className="w-4 h-4 text-forge-cyan" />
+                  <span>{t('dashboard.repoLabel')}: <strong className="text-slate-200">{activeProject.repository_path}</strong></span>
+                </div>
+                <div className="flex items-center space-x-2">
+                  <ShieldCheck className="w-4 h-4 text-forge-emerald" />
+                  <span>{t('dashboard.branchLabel')}: <strong className="text-slate-200">{activeProject.default_branch}</strong></span>
+                </div>
               </div>
-              <div className="flex items-center space-x-2">
-                <ShieldCheck className="w-4 h-4 text-forge-emerald" />
-                <span>{t('dashboard.branchLabel')}: <strong className="text-slate-200">{activeProject?.default_branch || t('dashboard.defaultBranch')}</strong></span>
-              </div>
-            </div>
+            ) : (
+              <button onClick={() => setActiveView('projects')} className="text-xs font-medium text-forge-cyan hover:underline">
+                {t('header.openProjects')}
+              </button>
+            )}
           </div>
 
           {/* Overall Progress Widget */}
-          <div className="w-full lg:w-80 bg-surface/80 p-5 rounded-xl border border-surface-border space-y-3 shrink-0">
-            <div className="flex items-center justify-between">
-              <span className="text-xs font-mono uppercase tracking-wider text-slate-400">{t('dashboard.projectProgress')}</span>
-              <span className="text-lg font-mono font-bold text-forge-cyan">{totalProgress}%</span>
+          {activeProject && (
+            <div className="w-full lg:w-80 bg-surface/80 p-5 rounded-xl border border-surface-border space-y-3 shrink-0">
+              <div className="flex items-center justify-between">
+                <span className="text-xs font-mono uppercase tracking-wider text-slate-400">{t('dashboard.projectProgress')}</span>
+                <span className="text-lg font-mono font-bold text-forge-cyan">{totalProgress}%</span>
+              </div>
+              <ProgressIndicator percent={totalProgress} size="lg" />
+              <div className="flex justify-between text-[11px] font-mono text-slate-400">
+                <span>{completedTasks}/{tasks.length} {t('dashboard.tasksFinished')}</span>
+                <span className="text-forge-cyan font-semibold">{projectStatusLabel}</span>
+              </div>
             </div>
-            <ProgressIndicator percent={totalProgress} size="lg" />
-            <div className="flex justify-between text-[11px] font-mono text-slate-400">
-              <span>{completedTasks}/{tasks.length} {t('dashboard.tasksFinished')}</span>
-              <span className="text-forge-cyan font-semibold">{projectStatusLabel}</span>
-            </div>
-          </div>
+          )}
         </div>
       </div>
 
@@ -200,12 +210,12 @@ export const DashboardView: React.FC = () => {
         </div>
       </div>
 
-      {/* Active Agents Section */}
+      {/* Configured Agents Section */}
       <div className="space-y-4">
         <div className="flex items-center justify-between">
           <div className="flex items-center space-x-2.5">
             <Sparkles className="w-5 h-5 text-forge-cyan" />
-            <h3 className="text-base font-semibold text-white">{t('dashboard.activeAgentsTitle')}</h3>
+            <h3 className="text-base font-semibold text-white">{t('dashboard.agentsTitle')}</h3>
           </div>
           <button
             onClick={() => setActiveView('agent-center')}

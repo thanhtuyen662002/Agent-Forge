@@ -12,8 +12,8 @@ describe('Bootstrap Smoke & Fresh Database Startup', () => {
   let tmpGitDir: string;
 
   beforeEach(() => {
-    tmpUserDataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'af-bootstrap-data-'));
-    tmpGitDir = fs.mkdtempSync(path.join(os.tmpdir(), 'af-bootstrap-git-'));
+    tmpUserDataDir = fs.realpathSync.native(fs.mkdtempSync(path.join(os.tmpdir(), 'af-bootstrap-data-')));
+    tmpGitDir = fs.realpathSync.native(fs.mkdtempSync(path.join(os.tmpdir(), 'af-bootstrap-git-')));
 
     execSync('git init', { cwd: tmpGitDir });
     execSync('git config user.name "Bootstrap Agent"', { cwd: tmpGitDir });
@@ -34,6 +34,10 @@ describe('Bootstrap Smoke & Fresh Database Startup', () => {
   it('should cleanly perform fresh installation, apply all migrations, seed default resources with UNKNOWN health and null quota without constraint errors', () => {
     // Initialize fresh application via composition root BootstrapService
     const bootstrap = BootstrapService.initialize(tmpUserDataDir);
+
+    // Installing into an unused profile creates no project or task work.
+    expect(bootstrap.repo.getAllProjects()).toEqual([]);
+    expect(bootstrap.db.prepare('SELECT COUNT(*) AS count FROM tasks').get()).toEqual({ count: 0 });
 
     // Assert all default providers seeded
     const providers = bootstrap.repo.getAllProviders();
@@ -62,6 +66,7 @@ describe('Bootstrap Smoke & Fresh Database Startup', () => {
     // Assert default agents seeded
     const agents = bootstrap.repo.getAllAgents();
     expect(agents.length).toBe(2);
+    expect(agents.every((agent) => agent.current_task_id === null)).toBe(true);
 
     // Assert provider registry initialized with registered adapters (Antigravity is MANUAL_BRIDGE_ONLY)
     expect(bootstrap.providerRegistry).toBeDefined();
@@ -111,5 +116,17 @@ describe('Bootstrap Smoke & Fresh Database Startup', () => {
     // Clean database shutdown
     expect(bootstrap.dbEngine).toBeDefined();
     bootstrap.dbEngine.close();
+
+    // A binary reinstall shares the same profile; existing work must survive.
+    const reopened = BootstrapService.initialize(tmpUserDataDir);
+    try {
+      expect(reopened.repo.getAllProjects()).toEqual([project]);
+      expect(reopened.repo.getTask(task.id)).toEqual(persistedTask);
+      expect(reopened.repo.getAllAgents()).toHaveLength(2);
+      expect(reopened.repo.getAllProviderResources()).toHaveLength(2);
+      expect(reopened.db.prepare('SELECT COUNT(*) AS count FROM tasks').get()).toEqual({ count: 1 });
+    } finally {
+      reopened.dbEngine.close();
+    }
   });
 });
