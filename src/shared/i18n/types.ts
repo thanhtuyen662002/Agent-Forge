@@ -74,7 +74,7 @@ export interface TranslationDictionary {
   header: {
     projectSelectorLabel: string;
     tasksDone: string;
-    agentsActive: string;
+    agentsConfigured: string;
     startProject: string;
     pause: string;
     resume: string;
@@ -99,6 +99,7 @@ export interface TranslationDictionary {
     offlineTag: string;
   };
   dashboard: {
+    noProjectDescription: string;
     fallbackTitle: string;
     fallbackDescription: string;
     repoLabel: string;
@@ -122,7 +123,7 @@ export interface TranslationDictionary {
     capacityHighSubtext: string;
     capacityUnknown: string;
     capacityUnknownSubtext: string;
-    activeAgentsTitle: string;
+    agentsTitle: string;
     viewAllAgents: string;
     ownerAttentionTitle: string;
     allSystemsNormalTitle: string;

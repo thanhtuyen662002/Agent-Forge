@@ -31,11 +31,22 @@ This document is the operator runbook for evaluating the AgentForge MVP Windows 
 3. **Installed App Location**:
    - Default install path: `%LOCALAPPDATA%\Programs\AgentForge\`
    - Executable: `%LOCALAPPDATA%\Programs\AgentForge\AgentForge.exe`
-   - User Data & SQLite DB: `%APPDATA%\AgentForge\database\agent-forge.db`
+   - Default desktop User Data & SQLite DB: `%APPDATA%\agent-forge\database\agent-forge.db` (the current application name is `agent-forge`; `AgentForge` is the installer product name).
+   - `AGENT_FORGE_DATA_DIR`, when explicitly set for the desktop process, overrides the profile root. Its database is `<profile-root>\database\agent-forge.db`.
 
 4. **Uninstall / Reinstall Behavior**:
    - Run `%LOCALAPPDATA%\Programs\AgentForge\Uninstall AgentForge.exe /S` to remove binary files.
-   - User database in `%APPDATA%\AgentForge\` persists across reinstalls unless manually purged.
+   - The default user profile in `%APPDATA%\agent-forge\` persists across reinstalls (`deleteAppDataOnUninstall: false`). Installing binaries in another folder, including a custom drive, still opens that same profile for the same Windows user.
+   - A genuinely unused profile starts with **zero projects and zero tasks**. The two initial Manual Bridge agent/resource configurations do not start provider work. The header counts **configured agents**; a configuration is not a running project or evidence of provider execution.
+   - If old projects appear, inspect the profile you are opening: they are preserved user data. Close the application and back up the complete profile before any intentional reset. To test a separate empty profile without altering existing data, launch with an explicit unused profile root:
+
+     ```powershell
+     $env:AGENT_FORGE_DATA_DIR = Join-Path $env:LOCALAPPDATA ('AgentForge-Test-' + [guid]::NewGuid().ToString('N'))
+     Start-Process -FilePath '<install-dir>\AgentForge.exe'
+     Remove-Item Env:AGENT_FORGE_DATA_DIR
+     ```
+
+     Replace `<install-dir>` with the binary directory. This creates a separate test profile and keeps the existing profile intact. Remove the override from the launching shell to return to the default profile on the next launch.
 
 ---
 
@@ -132,6 +143,6 @@ Review Ready (Task moves to REVIEW_READY) -> Generate Review Package with author
 ## 8. Diagnostic Evidence Collection
 
 To collect diagnostics for support or verification:
-1. **User Database**: `%APPDATA%\AgentForge\database\agent-forge.db`
+1. **Desktop User Database**: `%APPDATA%\agent-forge\database\agent-forge.db` by default, or `<AGENT_FORGE_DATA_DIR>\database\agent-forge.db` when the desktop profile override is set. This desktop default does not replace explicit MCP database configuration.
 2. **Packaged Verification Receipt**: Run `scripts/verify-demo-rc-win.ps1` to produce `release/demo-rc-receipt.txt`.
 3. **Production Installed Smoke**: Run `scripts/smoke-installed-production-win.ps1` to perform isolated NSIS installation and startup verification.
