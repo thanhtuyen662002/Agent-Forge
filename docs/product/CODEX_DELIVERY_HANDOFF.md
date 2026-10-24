@@ -71,4 +71,10 @@ Keep failures and evidence. Do not delete assertions, bypass checks, fake quota/
 
 ## 5. Practical first action
 
-Reconcile #226 with its current writer/saved work and verify its first end-to-end journey. If incomplete, finish the existing coordinated scope before starting graph/theme work. Once accepted, create only the next few executable successor issues with concrete dependencies/path ownership; do not create a giant duplicate backlog or a second status file. GitHub Issues/PRs remain the execution record.
+**Updated after PR #226 merged (main `f2b83a7`).** Stage A's usable core shipped through #225/#226; see `docs/OWNER_WORKFLOWS.md` and the status table in the roadmap. The coordinated successors are:
+
+- **#231**: product execution restart recovery and termination evidence (PR #232).
+- **#230**: automated verification on the retained worktree, then hand-off to review. It also fixes the authorized worktree path.
+- **#233**: account-bound automated reviewer.
+
+Continue with the highest-priority READY one under the repository protocol. Do not reopen #225's scope. Graph, theme and scheduling work (stages C/D) waits until the verified run pipeline (#230/#233) is accepted.

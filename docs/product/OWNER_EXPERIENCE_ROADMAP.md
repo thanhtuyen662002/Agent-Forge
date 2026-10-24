@@ -37,6 +37,23 @@ Source reviewed at [main 15cfbcd82312f6d27cb56096d22daa589cafbbf8](https://githu
 | Understand task dependencies | Task/authority infrastructure exists; referenced screenshots show a richer graph than audited UI. | Validate dependency logic first; add list/Kanban/graph projections over one authoritative task model. | B/C |
 | Trust results | Verification/recovery/evidence primitives exist; README still labels product AUTONOMY_BOOTSTRAP_PILOT. | End-to-end installed-app proof, readable results, truthful partial/failed/not-run states. | Every stage |
 
+### Status after PR #226 (main `f2b83a770ba5dd4f02bba77eaab775bc5a875466`)
+
+The matrix above is pinned to the audited main `15cfbcd`. PR #226 (Issue #225) has since merged. The table below reconciles each row with current main; the verified workflows are in [`docs/OWNER_WORKFLOWS.md`](https://github.com/thanhtuyen662002/Agent-Forge/blob/f2b83a770ba5dd4f02bba77eaab775bc5a875466/docs/OWNER_WORKFLOWS.md). Source and CI evidence only; no installed-app or live-provider proof is claimed.
+
+| Owner need | State on current main | Remaining work |
+| --- | --- | --- |
+| Start autonomous work from desktop | `DesktopAutomationService` runs the real PRODUCT_BOUND chain for RUNNING projects: attempt, role-aware routing, manifest, authorization, scheduler, settlement. The header shows a truthful automation phase. | Automated verification and review hand-off (#230), account-bound reviewer (#233), product restart recovery (#231). |
+| Add, edit and remove agents | Guided create/edit/remove/restore for all roles; blockers explained; history kept. | Disable without removal; starter templates. |
+| Understand fresh installation | Dashboard "Getting started" checklist from real state; removed seeded agents stay removed. | Installed-app onboarding proof. |
+| Connect accounts and see automatic quota | In-app Codex device-code sign-in; official `codex app-server` rate-limit reads (5-minute and on-demand); unknown stays unknown; single-writer verified-account initialization. | Gemini telemetry (unsupported today); usage/cost views. |
+| Remove old/test projects and work | Reversible trash/restore with fences, search, selection reconciliation. | Permanent purge policy (none by design). |
+| Work without JSON | Plain-text plan form with reachable plan approval; JSON is advanced-only; typed acknowledgements. | Readable capability approval forms. |
+| Know what requires attention | Dashboard "Needs your attention" list with reasons. | Unified inbox and project roll-ups. |
+| Use several agents reliably | At most one automated execution per project and two overall; reserved coders are not reused. | Fair multi-project scheduling and tested larger caps (stage B). |
+| Understand task dependencies | Unchanged. | Stage B/C. |
+| Trust results | Coder runs settle with verified evidence; completed work waits for review. | #230, #231, #233; release gate #195. |
+
 Source entry points (all pinned):
 - [README](https://github.com/thanhtuyen662002/Agent-Forge/blob/15cfbcd82312f6d27cb56096d22daa589cafbbf8/README.md)
 - [Header](https://github.com/thanhtuyen662002/Agent-Forge/blob/15cfbcd82312f6d27cb56096d22daa589cafbbf8/src/ui/components/Header.tsx), [ProjectService](https://github.com/thanhtuyen662002/Agent-Forge/blob/15cfbcd82312f6d27cb56096d22daa589cafbbf8/src/core/services/ProjectService.ts), [autonomyCli](https://github.com/thanhtuyen662002/Agent-Forge/blob/15cfbcd82312f6d27cb56096d22daa589cafbbf8/src/electron/autonomyCli.ts)
