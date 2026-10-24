@@ -9,6 +9,7 @@ import { ProjectStopFenceService } from './ProjectStopFenceService';
 import { WorkerSlotLeaseService } from './WorkerSlotLeaseService';
 import { EvidenceCollector } from '../autonomy/evidence';
 import { parseReviewProtocol } from '../protocol/reviewProtocol';
+import { createProductLeaseRecoveryMarkerEvent, createProductLeaseRecoveryResolvedEvent } from './ProductLeaseRecoveryScanner';
 import type { WorkOrder } from '../autonomy/contracts';
 import type { AgentExecutionResult, RuntimeExecutionBinding } from '../adapters/ProviderAdapter';
 import type { AccountLease, ExecutionAuthorization, Task } from '../types/domain';
@@ -24,14 +25,18 @@ export const REVIEW_BLOCKED_EVENT = 'AUTOMATION_REVIEW_BLOCKED';
 export const REVIEW_FAILED_EVENT = 'AUTOMATION_REVIEW_FAILED';
 export const REVIEW_STALE_EVENT = 'AUTOMATION_REVIEW_STALE';
 export const REVIEW_INTERRUPTED_EVENT = 'AUTOMATION_REVIEW_INTERRUPTED';
-export const REVIEW_TERMINAL_EVENTS = [REVIEW_PASSED_EVENT, REVIEW_FIX_REQUIRED_EVENT, REVIEW_BLOCKED_EVENT,
-  REVIEW_FAILED_EVENT, REVIEW_STALE_EVENT, REVIEW_INTERRUPTED_EVENT];
+/** Not started yet (no reviewer could be routed or leased); retried later and never consumes the work. */
+export const REVIEW_NOT_RUN_EVENT = 'AUTOMATION_REVIEW_NOT_RUN';
+export const REVIEW_VERDICT_EVENTS = [REVIEW_PASSED_EVENT, REVIEW_FIX_REQUIRED_EVENT, REVIEW_BLOCKED_EVENT];
+export const REVIEW_TERMINAL_EVENTS = [...REVIEW_VERDICT_EVENTS, REVIEW_FAILED_EVENT, REVIEW_STALE_EVENT, REVIEW_INTERRUPTED_EVENT];
 /** Separation policy every automated review is routed under: never the coder's account. */
 export const AUTOMATED_REVIEW_SEPARATION_POLICY_ID = 'sep-automated-review';
 
 const VERIFICATION_PASSED_EVENT = 'AUTOMATION_VERIFICATION_PASSED';
 /** Diffs above this are not sent to a reviewer; the review fails closed instead. */
 const MAX_REVIEW_DIFF_BYTES = 256 * 1024;
+/** A review that could not start is offered again after this delay. */
+const REVIEW_RETRY_AFTER_MS = 5 * 60_000;
 
 export interface ReviewerCandidate {
   agentId: string;
@@ -78,6 +83,8 @@ export class ProductReviewService {
   private readonly evidence: Pick<EvidenceCollector, 'collect'>;
   /** Review attempts running in this process; recovery never touches them. */
   private readonly ownedAttempts = new Set<string>();
+  /** Verification events whose review could not start, and when to offer them again. */
+  private readonly retryAfter = new Map<string, number>();
 
   constructor(
     private readonly repo: Repository,
@@ -117,14 +124,20 @@ export class ProductReviewService {
     return null;
   }
 
-  /** Verified, REVIEW_READY work at the current revision that no review has started for. */
-  public pendingReview(projectId: string): { task: Task; work: VerifiedWork } | null {
+  /**
+   * Verified, REVIEW_READY work at the current revision that no review has
+   * started (or conclusively ended) for. `deferred` is true while a review
+   * that could not start waits for its retry delay.
+   */
+  public pendingReview(projectId: string): { task: Task; work: VerifiedWork; deferred: boolean } | null {
     const started = new Set(this.reviewEvents(projectId)
       .filter((event) => event.type === REVIEW_STARTED_EVENT || event.type === REVIEW_STALE_EVENT || event.type === REVIEW_FAILED_EVENT)
       .map((event) => (event.structured_payload as { verificationEventId?: unknown } | null)?.verificationEventId));
     for (const task of this.repo.getTasksByProject(projectId)) {
       const work = this.verifiedWork(task);
-      if (work && !started.has(work.verificationEventId)) return { task, work };
+      if (work && !started.has(work.verificationEventId)) {
+        return { task, work, deferred: (this.retryAfter.get(work.verificationEventId) ?? 0) > this.now().getTime() };
+      }
     }
     return null;
   }
@@ -151,23 +164,33 @@ export class ProductReviewService {
       record(type, `Automated review for task ${taskId} ended without a verdict: ${reasonCode}.`, { reasonCode, ...extra });
       return { outcome: type === REVIEW_STALE_EVENT ? 'STALE' : 'FAILED', reasonCode };
     };
+    /** Could not start (transient): nothing ran, the work is not consumed, retry later. */
+    const notStarted = (reasonCode: string): ProductReviewOutcome => {
+      this.retryAfter.set(work.verificationEventId, this.now().getTime() + REVIEW_RETRY_AFTER_MS);
+      const already = this.reviewEventsFor(auth.project_id, work.verificationEventId)
+        .some((event) => event.type === REVIEW_NOT_RUN_EVENT && (event.structured_payload as { reasonCode?: unknown } | null)?.reasonCode === reasonCode);
+      if (!already) record(REVIEW_NOT_RUN_EVENT, `Automated review for task ${taskId} could not start yet: ${reasonCode}.`, { reasonCode });
+      return { outcome: 'NOT_RUN', reasonCode };
+    };
 
     // 1. The task, project and verified work must still be exactly what was verified.
     const precheck = this.fenceReason(taskId, 'REVIEW_READY', auth);
     if (precheck) return { outcome: 'NOT_RUN', reasonCode: precheck };
     const coderAssignment = this.repo.getAgentAssignment(auth.assignment_id!);
     if (!coderAssignment?.selected_worker_slot_id) return terminal(REVIEW_STALE_EVENT, 'EXECUTION_SCOPE_INVALID');
-    if (coderAssignment.selected_account_id === reviewer.accountId) return { outcome: 'NOT_RUN', reasonCode: 'REVIEWER_SAME_ACCOUNT' };
+    if (coderAssignment.selected_account_id === reviewer.accountId) return notStarted('REVIEWER_SAME_ACCOUNT');
     const inspected = await worktrees.inspectWorktree({
       projectId: auth.project_id, taskId: auth.task_id, attemptId: auth.attempt_id ?? null, assignmentId: coderAssignment.id,
       workerSlotId: coderAssignment.selected_worker_slot_id, baseSha: auth.repository_head_sha, ownershipEpoch: auth.task_ownership_epoch,
     });
-    if (inspected.status !== 'INSPECTED' || !inspected.inspection.registered || !inspected.inspection.exists ||
+    if (inspected.status !== 'INSPECTED') return notStarted('WORKTREE_INSPECTION_FAILED');
+    if (!inspected.inspection.registered || !inspected.inspection.exists ||
         !inspected.inspection.sourceMatch || inspected.inspection.managedPath !== work.worktree) {
       return terminal(REVIEW_STALE_EVENT, 'WORKTREE_NOT_VERIFIABLE');
     }
     const before = await this.collect(work.worktree, auth.repository_head_sha);
-    if (!before || before.headSha !== work.headSha.toLowerCase() || before.snapshotSha !== work.snapshotSha) {
+    if (!before) return notStarted('EVIDENCE_UNAVAILABLE');
+    if (before.headSha !== work.headSha.toLowerCase() || before.snapshotSha !== work.snapshotSha) {
       return terminal(REVIEW_STALE_EVENT, 'SNAPSHOT_CHANGED_SINCE_VERIFICATION');
     }
     const diff = before.diff.split('\nWorking file snapshots (includes untracked):\n')[0];
@@ -213,12 +236,12 @@ export class ProductReviewService {
       assignmentId = routing.selectedAssignmentId ?? null;
       if (routing.outcome !== 'SELECTED' || !routing.selectedAssignmentId || !routing.decisionId) {
         finish('FAILED');
-        return terminal(REVIEW_FAILED_EVENT, 'ROUTING_NOT_SELECTED');
+        return notStarted('ROUTING_NOT_SELECTED');
       }
       const acquired = leases.acquireForAssignment(routing.selectedAssignmentId, this.leaseTtlMs);
       if (acquired.status !== 'ACQUIRED') {
         finish('FAILED');
-        return terminal(REVIEW_FAILED_EVENT, acquired.code);
+        return notStarted(acquired.code);
       }
       lease = acquired.lease;
       const assignment = acquired.assignment;
@@ -227,15 +250,16 @@ export class ProductReviewService {
       const adapter = this.registry.get(assignment.selected_provider_id);
       if (!account || !resource || !adapter || account.id === coderAssignment.selected_account_id) {
         finish('FAILED');
-        return terminal(REVIEW_FAILED_EVENT, 'REVIEWER_BINDING_INVALID');
+        return notStarted('REVIEWER_BINDING_INVALID');
       }
 
       // 3. Re-check every fence, then mark the task REVIEWING before the reviewer runs.
       const fenced = this.fenceReason(taskId, 'REVIEW_READY', auth);
       if (fenced || !this.transition(taskId, 'START_REVIEW')) {
         finish('FAILED');
-        return terminal(REVIEW_FAILED_EVENT, fenced ?? 'TASK_TRANSITION_REJECTED');
+        return notStarted(fenced ?? 'TASK_TRANSITION_REJECTED');
       }
+      this.retryAfter.delete(work.verificationEventId);
       const executionId = crypto.randomUUID();
       record(REVIEW_STARTED_EVENT, `Automated review started for task ${taskId}.`, {
         attemptId, assignmentId, executionId, reviewerAgentId: reviewer.agentId, accountId: account.id,
@@ -253,8 +277,14 @@ export class ProductReviewService {
       };
       let leaseLost = false;
       const heartbeat = setInterval(() => {
-        const beat = leases.heartbeat(lease!.id, lease!.lease_token, this.leaseTtlMs);
-        if (beat.status !== 'HEARTBEAT_ACKNOWLEDGED' || this.fenceReason(taskId, 'REVIEWING', auth)) {
+        let keep = false;
+        try {
+          const beat = leases.heartbeat(lease!.id, lease!.lease_token, this.leaseTtlMs);
+          keep = beat.status === 'HEARTBEAT_ACKNOWLEDGED' && !this.fenceReason(taskId, 'REVIEWING', auth);
+        } catch {
+          keep = false; // An unprovable lease is a lost lease.
+        }
+        if (!keep && !leaseLost) {
           leaseLost = true;
           void adapter.cancel(executionId).catch(() => undefined);
         }
@@ -294,16 +324,16 @@ export class ProductReviewService {
         return terminal(failure!.type, failure!.reason, { attemptId, executionId });
       }
 
-      const applied = this.applyVerdict(taskId, auth, attemptId, reviewer.agentId, verdict, lease);
+      const type = verdict.verdict === 'PASS' ? REVIEW_PASSED_EVENT : verdict.verdict === 'FIX_REQUIRED' ? REVIEW_FIX_REQUIRED_EVENT : REVIEW_BLOCKED_EVENT;
+      const applied = this.applyVerdict(taskId, auth, attemptId, reviewer.agentId, verdict, lease, (reviewId) =>
+        record(type, `Automated review of task ${taskId}: ${verdict.verdict}.`, {
+          attemptId, executionId, reviewId, verdict: verdict.verdict, issueCount: verdict.issues.length,
+          headSha: work.headSha, snapshotSha: work.snapshotSha,
+        }));
       if (!applied.success) {
         finish('FAILED');
         return terminal(REVIEW_FAILED_EVENT, applied.reasonCode, { attemptId, executionId });
       }
-      const type = verdict.verdict === 'PASS' ? REVIEW_PASSED_EVENT : verdict.verdict === 'FIX_REQUIRED' ? REVIEW_FIX_REQUIRED_EVENT : REVIEW_BLOCKED_EVENT;
-      record(type, `Automated review of task ${taskId}: ${verdict.verdict}.`, {
-        attemptId, executionId, reviewId: applied.reviewId, verdict: verdict.verdict, issueCount: verdict.issues.length,
-        headSha: work.headSha, snapshotSha: work.snapshotSha,
-      });
       finish('COMPLETED');
       return { outcome: verdict.verdict === 'PASS' ? 'PASSED' : verdict.verdict, reviewId: applied.reviewId };
     } catch {
@@ -327,8 +357,10 @@ export class ProductReviewService {
           if (attempt.status !== 'RUNNING' || attempt.summary !== REVIEW_ATTEMPT_MARKER || this.ownedAttempts.has(attempt.id)) continue;
           const forAttempt = reviewEvents.filter((event) => (event.structured_payload as { attemptId?: unknown } | null)?.attemptId === attempt.id);
           const started = forAttempt.find((event) => event.type === REVIEW_STARTED_EVENT);
-          // An earlier INTERRUPTED note (process not proven stopped) is not an outcome.
-          const finished = forAttempt.some((event) => REVIEW_TERMINAL_EVENTS.includes(event.type) && event.type !== REVIEW_INTERRUPTED_EVENT);
+          // Only an applied verdict completes a review; failures and interruptions do not.
+          const completed = forAttempt.some((event) => REVIEW_VERDICT_EVENTS.includes(event.type)) ||
+            this.repo.getReviewsByTask(task.id).some((review) => review.attempt_id === attempt.id);
+          const finished = completed || forAttempt.some((event) => event.type === REVIEW_FAILED_EVENT || event.type === REVIEW_STALE_EVENT);
           const executionId = (started?.structured_payload as { executionId?: unknown } | null)?.executionId;
           if (typeof executionId === 'string' && this.repo.getProcessRun(executionId)?.status === 'RUNNING') {
             if (!forAttempt.some((event) => event.type === REVIEW_INTERRUPTED_EVENT)) {
@@ -339,13 +371,9 @@ export class ProductReviewService {
           }
           const assignment = this.repo.getAgentAssignmentsByTask(task.id).find((candidate) => candidate.attempt_id === attempt.id) ?? null;
           const lease = assignment ? this.repo.getActiveLeaseForAssignment(assignment.id) : null;
-          if (lease) {
-            const released = new WorkerSlotLeaseService(this.repo, { clock: this.now })
-              .recoverExpiredLease(lease.id, lease.lease_token, this.now(), { expectedTaskStates: [task.state] });
-            if (released.status !== 'RELEASED') continue; // Not expired yet, or fenced: a later pass decides.
-          }
-          if (assignment) this.repo.endUnleasedAgentAssignment(assignment.id, finished ? 'COMPLETED' : 'FAILED', this.iso());
-          this.repo.endRunningTaskAttempt(attempt.id, finished ? 'COMPLETED' : 'FAILED', this.iso());
+          if (lease && assignment && !this.releaseExpiredLease(lease, assignment.id, task)) continue; // Not expired yet, or fenced.
+          if (assignment) this.repo.endUnleasedAgentAssignment(assignment.id, completed ? 'COMPLETED' : 'FAILED', this.iso());
+          this.repo.endRunningTaskAttempt(attempt.id, completed ? 'COMPLETED' : 'FAILED', this.iso());
           if (!finished) {
             this.events.record(project.id, REVIEW_INTERRUPTED_EVENT, `Automated review for task ${task.id} was interrupted by a restart; no verdict was applied.`,
               { ...(started?.structured_payload as object), attemptId: attempt.id, reasonCode: 'REVIEW_INTERRUPTED' }, task.id);
@@ -355,6 +383,37 @@ export class ProductReviewService {
       }
     }
     return recovered;
+  }
+
+  /**
+   * Releases an expired review lease through the guarded recovery primitive
+   * and, in the same transaction, closes the startup quarantine marker that
+   * ProductLeaseRecoveryScanner may have written for it.
+   */
+  private releaseExpiredLease(lease: AccountLease, assignmentId: string, task: Task): boolean {
+    try {
+      return this.repo.runInImmediateTransaction(() => {
+        const released = new WorkerSlotLeaseService(this.repo, { clock: this.now })
+          .recoverExpiredLease(lease.id, lease.lease_token, this.now(), { expectedTaskStates: [task.state] });
+        if (released.status !== 'RELEASED') return false;
+        const binding = {
+          leaseId: lease.id, assignmentId, taskId: task.id, projectId: task.project_id,
+          accountId: lease.provider_account_id, workerSlotId: lease.worker_slot_id, leaseToken: lease.lease_token,
+        };
+        const markerId = createProductLeaseRecoveryMarkerEvent({ ...binding, reasonCode: 'RECOVERY_REQUIRED', reason: 'Product lease cleanup recovery marker.', observedAt: lease.expires_at }).id;
+        if (this.repo.getEvent(markerId)) {
+          this.repo.createDeterministicGenericEvent(createProductLeaseRecoveryResolvedEvent({ ...binding, markerEventId: markerId, observedAt: this.iso() }));
+        }
+        return true;
+      });
+    } catch {
+      return false; // A later pass retries.
+    }
+  }
+
+  private reviewEventsFor(projectId: string, verificationEventId: string) {
+    return this.repo.getEventsByProject(projectId).filter((event) =>
+      (event.structured_payload as { verificationEventId?: unknown } | null)?.verificationEventId === verificationEventId);
   }
 
   /** Why the review must not proceed for this task state, or null. */
@@ -372,7 +431,7 @@ export class ProductReviewService {
 
   /** Records the review and moves the task in one transaction; a rejected transition writes nothing. */
   private applyVerdict(taskId: string, auth: ExecutionAuthorization, attemptId: string, reviewerAgentId: string, verdict: ReviewProtocol,
-    lease: AccountLease): { success: true; reviewId: string } | { success: false; reasonCode: string } {
+    lease: AccountLease, recordOutcome: (reviewId: string) => void): { success: true; reviewId: string } | { success: false; reasonCode: string } {
     const fenced = this.fenceReason(taskId, 'REVIEWING', auth);
     if (fenced) return { success: false, reasonCode: fenced };
     const reviewId = `review-${crypto.randomUUID()}`;
@@ -398,6 +457,8 @@ export class ProductReviewService {
           : verdict.verdict === 'FIX_REQUIRED' ? (task.revision_count >= task.max_revisions ? 'MAX_REVISIONS_EXCEEDED' : 'FIX_VERDICT')
             : null; // BLOCKED: the task stays REVIEWING for the Manager or owner.
         if (trigger && !this.transition(taskId, trigger)) throw new Error('TASK_TRANSITION_REJECTED');
+        // Review row, task transition and outcome event commit together or not at all.
+        recordOutcome(reviewId);
       });
       return { success: true, reviewId };
     } catch (error) {

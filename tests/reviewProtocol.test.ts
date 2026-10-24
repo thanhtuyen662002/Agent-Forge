@@ -25,6 +25,8 @@ describe('review.v1 verdict protocol (#233)', () => {
     ['a missing snapshot', verdict({ reviewed_snapshot_sha: undefined }), 'REVIEW_PROTOCOL_INVALID'],
     ['a missing revision', verdict({ task_revision: undefined }), 'REVIEW_PROTOCOL_INVALID'],
     ['an extra field', verdict({ merge: true }), 'REVIEW_PROTOCOL_INVALID'],
+    ['PASS with a BLOCKER issue', verdict({ verdict: 'PASS', issues: [{ severity: 'BLOCKER', title: 'Broken', description: 'It fails.' }] }), 'REVIEW_PROTOCOL_INVALID'],
+    ['FIX_REQUIRED without issues', verdict({ issues: [] }), 'REVIEW_PROTOCOL_INVALID'],
   ])('rejects %s', (_name, raw, reasonCode) => {
     expect(parseReviewProtocol(raw)).toEqual({ success: false, reasonCode });
   });

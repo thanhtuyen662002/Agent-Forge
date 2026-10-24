@@ -44,12 +44,13 @@ describe('desktop automation runtime', () => {
   const git = (...args: string[]) => execFileSync('git', args, { cwd: repoDir, encoding: 'utf8' }).trim();
   const fakeTimer = { setInterval: () => 'handle', clearInterval: () => undefined };
 
-  const synthetic = (id: string): ProviderAdapter => ({
+  let healthy: boolean;
+  const synthetic = (id: string, capabilities: Array<'CODING' | 'REVIEW'> = ['CODING', 'REVIEW']): ProviderAdapter => ({
     id,
     name: 'Synthetic CLI coder',
     adapterType: 'LOCAL_CLI',
-    async getCapabilities() { return ['CODING', 'REVIEW']; },
-    async getHealth() { return 'AVAILABLE'; },
+    async getCapabilities() { return capabilities; },
+    async getHealth() { return healthy ? 'AVAILABLE' : 'OFFLINE'; },
     async getQuota() { return { remaining: null, total: null, unit: 'REQUESTS', source: 'UNKNOWN', confidence: 0, resetAt: null }; },
     async execute(request) {
       if (request.expectedProtocol === 'review.v1') {
@@ -100,6 +101,7 @@ describe('desktop automation runtime', () => {
     registry = new ProviderRegistry();
     registry.register(synthetic('prov-codex-cli'));
     adapterCalls = 0;
+    healthy = true;
     reviewRequests = [];
     reviewReply = () => { throw new Error('no review expected'); };
 
@@ -380,9 +382,11 @@ describe('desktop automation runtime', () => {
         ...await approveFixtureCommand(repo, projectId, ['verify.js']), timeout_ms: 60_000, enabled: true,
       });
     };
-    const reviewingService = (now?: () => string) => new DesktopAutomationService(repo, events, registry, {
+    let clock = 0;
+    const reviewingService = (now: () => string = () => new Date(Date.now() + clock).toISOString()) => new DesktopAutomationService(repo, events, registry, {
       worktreeRoot: path.join(tempDir, 'worktrees'), timer: fakeTimer, taskService: tasks, verificationService: verification, now,
     });
+    beforeEach(() => { clock = 0; });
     const addReviewer = () => {
       const created = new WorkspaceManagementService(repo).createAgent({
         displayName: 'Codex reviewer', role: 'REVIEWER', connection: 'CODEX_CLI', modelName: 'gpt-5-codex', workerSlots: 1,
@@ -407,7 +411,7 @@ describe('desktop automation runtime', () => {
     const eventsOf = (type: string) => repo.getEventsByProject(projectId).filter((e) => e.type === type);
 
     /** Coder run plus verification on the first pass; the review on the second. */
-    const runToReview = async () => {
+    const runToReview = async (beforeReview: (taskId: string) => void = () => undefined) => {
       const coder = addCodexCoder();
       verify(coder);
       const reviewer = addReviewer();
@@ -417,6 +421,7 @@ describe('desktop automation runtime', () => {
       await service.tick();
       await service.drain();
       expect(repo.getTask(task.id)!.state).toBe('REVIEW_READY');
+      beforeReview(task.id);
       await service.tick();
       await service.drain();
       return { task, coder, reviewer };
@@ -510,6 +515,103 @@ describe('desktop automation runtime', () => {
       expect(reviewRequests).toHaveLength(1);
     }, 120_000);
 
+    it('records a BLOCKED verdict and leaves the task REVIEWING for the Manager or owner', async () => {
+      reviewReply = verdict('BLOCKED');
+      const { task } = await runToReview();
+
+      expect(repo.getTask(task.id)!.state).toBe('REVIEWING');
+      expect(repo.getReviewsByTask(task.id)[0].verdict).toBe('BLOCKED');
+      expect(statusOf()).toMatchObject({ phase: 'AWAITING_REVIEW', taskId: task.id, reasonCode: 'REVIEW_BLOCKED' });
+    }, 120_000);
+
+    it('escalates FIX_REQUIRED at the revision limit to NEEDS_HUMAN', async () => {
+      reviewReply = verdict('FIX_REQUIRED');
+      const { task } = await runToReview((taskId) => { db.prepare('UPDATE tasks SET max_revisions = 1 WHERE id = ?').run(taskId); });
+
+      expect(repo.getTask(task.id)!.state).toBe('NEEDS_HUMAN');
+      expect(repo.getReviewsByTask(task.id)[0].verdict).toBe('FIX_REQUIRED');
+    }, 120_000);
+
+    it('does not apply a verdict when the project is stopped while the reviewer runs', async () => {
+      const pass = verdict('PASS');
+      reviewReply = (request) => {
+        db.prepare("UPDATE projects SET status = 'PAUSED' WHERE id = ?").run(projectId);
+        return pass(request);
+      };
+      const { task } = await runToReview();
+
+      expect(repo.getTask(task.id)!.state).toBe('REVIEWING');
+      expect(repo.getReviewsByTask(task.id)).toEqual([]);
+      expect(eventsOf('AUTOMATION_REVIEW_FAILED')[0].structured_payload).toMatchObject({ reasonCode: 'PROJECT_NOT_RUNNING' });
+    }, 120_000);
+
+    it('never reviews on the coder’s account', async () => {
+      reviewReply = verdict('PASS');
+      let coderAccount = '';
+      const { task } = await runToReview((taskId) => {
+        const coderAssignment = repo.getAgentAssignmentsByTask(taskId)[0];
+        coderAccount = coderAssignment.selected_account_id;
+        const reviewerAgent = repo.getAllAgents().find((agent) => agent.role === 'REVIEWER')!;
+        db.prepare('UPDATE provider_resources SET provider_account_id = ? WHERE id = ?').run(coderAccount, reviewerAgent.provider_resource_id);
+      });
+
+      expect(coderAccount).not.toBe('');
+      expect(reviewRequests).toHaveLength(0);
+      expect(repo.getTask(task.id)!.state).toBe('REVIEW_READY');
+      expect(statusOf()).toMatchObject({ phase: 'AWAITING_REVIEW', taskId: task.id, reasonCode: 'REVIEWER_NOT_AVAILABLE' });
+    }, 120_000);
+
+    it('skips a reviewer whose adapter cannot review and uses one that can', async () => {
+      registry.register(synthetic('prov-gemini-cli', ['CODING']));
+      const coder = addCodexCoder();
+      verify(coder);
+      const gemini = new WorkspaceManagementService(repo).createAgent({
+        displayName: 'Gemini reviewer', role: 'REVIEWER', connection: 'GEMINI_CLI', modelName: 'gemini-2.5-pro', workerSlots: 1,
+      });
+      verify(gemini);
+      await configureTest();
+      const task = await approvedTask();
+      service = reviewingService();
+      await service.tick();
+      await service.drain();
+      await service.tick();
+      await service.drain();
+      expect(reviewRequests).toHaveLength(0);
+      expect(repo.getTask(task.id)!.state).toBe('REVIEW_READY');
+      expect(statusOf()).toMatchObject({ phase: 'AWAITING_REVIEW', taskId: task.id, reasonCode: 'REVIEWER_NOT_AVAILABLE' });
+
+      reviewReply = verdict('PASS');
+      const codex = addReviewer();
+      await service.tick();
+      await service.drain();
+      expect(reviewRequests).toHaveLength(1);
+      expect(reviewRequests[0].runtimeBinding!.accountId).toBe(accountOf(codex));
+      expect(repo.getTask(task.id)!.state).toBe('DONE');
+    }, 120_000);
+
+    it('retries a review that could not start, after the retry delay, without consuming the work', async () => {
+      reviewReply = verdict('PASS');
+      const { task } = await runToReview(() => { healthy = false; });
+
+      expect(reviewRequests).toHaveLength(0);
+      expect(repo.getTask(task.id)!.state).toBe('REVIEW_READY');
+      expect(eventsOf('AUTOMATION_REVIEW_NOT_RUN')[0].structured_payload).toMatchObject({ reasonCode: 'ROUTING_NOT_SELECTED' });
+      expect(eventsOf('AUTOMATION_REVIEW_FAILED')).toEqual([]);
+      const failedAttempt = repo.getTaskAttemptsByTask(task.id).find((a) => a.summary === 'desktop-review')!;
+      expect(failedAttempt.status).toBe('FAILED');
+      expect(statusOf()).toMatchObject({ phase: 'AWAITING_REVIEW', reasonCode: 'REVIEWER_NOT_AVAILABLE' });
+
+      healthy = true;
+      await service.tick();
+      await service.drain();
+      expect(reviewRequests).toHaveLength(0); // Still inside the retry delay.
+      clock = 6 * 60_000;
+      await service.tick();
+      await service.drain();
+      expect(reviewRequests).toHaveLength(1);
+      expect(repo.getTask(task.id)!.state).toBe('DONE');
+    }, 120_000);
+
     it('fences an interrupted review on restart and never infers a verdict', async () => {
       let finishHung: (result: AgentExecutionResult) => void = () => undefined;
       reviewReply = () => new Promise((resolve) => { finishHung = resolve; });
@@ -525,9 +627,16 @@ describe('desktop automation runtime', () => {
       void first.tick();
       await vi.waitFor(() => expect(reviewRequests).toHaveLength(1), { timeout: 30_000 });
       expect(repo.getTask(task.id)!.state).toBe('REVIEWING');
+      expect(first.getStatus().projects.find((p) => p.projectId === projectId)).toMatchObject({ phase: 'REVIEWING', taskId: task.id });
       const attempt = repo.getTaskAttemptsByTask(task.id).find((a) => a.summary === 'desktop-review')!;
       const assignment = repo.getAgentAssignmentsByTask(task.id).find((a) => a.attempt_id === attempt.id)!;
       const executionId = reviewRequests[0].runtimeBinding!.executionId!;
+
+      // A restart before the lease expired defers: nothing is released yet.
+      const early = reviewingService(() => new Date().toISOString());
+      await early.tick();
+      expect(repo.getTaskAttempt(attempt.id)!.status).toBe('RUNNING');
+      expect(repo.getActiveLeaseForAssignment(assignment.id)).not.toBeNull();
 
       // (a) A process that may still run keeps everything fenced.
       repo.createProcessRun({ id: executionId, pid: null, project_id: projectId, task_id: task.id, attempt_id: attempt.id,

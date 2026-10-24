@@ -82,6 +82,8 @@ export class DesktopAutomationService {
   private readonly lastFailure = new Map<string, { taskId: string; revision: number; reasonCode: string }>();
   private readonly verifier: AutomatedVerificationService | null;
   private readonly reviewer: ProductReviewService | null;
+  /** Provider capabilities read on each pass; a reviewer needs an adapter that can REVIEW. */
+  private readonly capabilities = new Map<string, readonly string[]>();
 
   constructor(
     private readonly repo: Repository,
@@ -158,7 +160,9 @@ export class DesktopAutomationService {
     this.ticking = true;
     try {
       // Reviews interrupted by a previous process are fenced or released first.
-      this.reviewer?.recoverAbandonedReviews();
+      // A failure here is retried on the next pass and never stops dispatch.
+      try { this.reviewer?.recoverAbandonedReviews(); } catch { /* next pass */ }
+      if (this.reviewer) await this.refreshCapabilities();
       for (const project of this.runnableProjects()) {
         if (this.inFlight.size >= this.maxConcurrent) break;
         if (this.inFlight.has(project.id)) continue;
@@ -173,7 +177,7 @@ export class DesktopAutomationService {
         }
         // Verified work goes to an account-bound reviewer on a different account.
         const toReview = this.reviewer?.pendingReview(project.id) ?? null;
-        if (toReview) {
+        if (toReview && !toReview.deferred) {
           const reviewer = this.findAgent('REVIEWER', this.reviewer!.coderAccountOf(toReview.work));
           if (reviewer) {
             const review = this.runReview(project, toReview.task.id, toReview.work, reviewer)
@@ -322,7 +326,7 @@ export class DesktopAutomationService {
     if (reviewed && task.state === 'REVIEWING') return reviewed;
     const pending = this.reviewer?.pendingReview(task.project_id) ?? null;
     if (pending?.task.id === task.id) {
-      if (this.findAgent('REVIEWER', this.reviewer!.coderAccountOf(pending.work))) return 'VERIFIED';
+      if (!pending.deferred && this.findAgent('REVIEWER', this.reviewer!.coderAccountOf(pending.work))) return 'VERIFIED';
       return this.repo.getAllAgents().some((agent) => !agent.removed_at && agent.role === 'REVIEWER') ? 'REVIEWER_NOT_AVAILABLE' : 'NO_REVIEWER';
     }
     return reviewed ?? this.verificationReason(task.id) ?? null;
@@ -356,6 +360,7 @@ export class DesktopAutomationService {
       if (resource.provider_account_id === excludedAccountId) continue;
       const provider = this.repo.getProvider(resource.provider_id);
       if (!provider?.enabled || provider.adapter_type !== 'LOCAL_CLI' || !this.providerRegistry.get(provider.id)) continue;
+      if (role === 'REVIEWER' && !this.capabilities.get(provider.id)?.includes('REVIEW')) continue;
       const account = this.repo.getProviderAccount(resource.provider_account_id);
       if (!account?.enabled || !SCHEDULABLE_ACCOUNT_HEALTH.has(account.health_status)) continue;
       if (account.cooldown_until && Date.parse(account.cooldown_until) > Date.parse(this.now())) continue;
@@ -557,6 +562,23 @@ export class DesktopAutomationService {
     if (latest.type === VERIFICATION_FAILED_EVENT) return 'VERIFICATION_FAILED';
     const code = (latest.structured_payload as { reasonCode?: unknown } | null)?.reasonCode;
     return typeof code === 'string' ? code : 'NOT_VERIFIED';
+  }
+
+  /** Reads the capabilities of every provider a Reviewer agent uses; unknown means not capable. */
+  private async refreshCapabilities(): Promise<void> {
+    const providerIds = new Set<string>();
+    for (const agent of this.repo.getAllAgents()) {
+      if (agent.removed_at || agent.role !== 'REVIEWER' || !agent.provider_resource_id) continue;
+      const resource = this.repo.getProviderResource(agent.provider_resource_id);
+      if (resource) providerIds.add(resource.provider_id);
+    }
+    for (const providerId of providerIds) {
+      try {
+        this.capabilities.set(providerId, (await this.providerRegistry.get(providerId)?.getCapabilities()) ?? []);
+      } catch {
+        this.capabilities.set(providerId, []);
+      }
+    }
   }
 
   /** Same eligibility and ordering as WorkerSlotLeaseService fresh allocation. */

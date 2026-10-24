@@ -283,8 +283,10 @@ Manager or owner path. Nothing is merged into the repository automatically.
 When a task is `REVIEW_READY` with an `AUTOMATION_VERIFICATION_PASSED` result
 at its current revision, `ProductReviewService` asks a **Reviewer** agent to
 review it. Add one in Agent Center (role *Reviewer*, Codex CLI) and sign it in
-to **its own** account: a reviewer never uses the coder's account. Gemini CLI
-has no read-only review mode and is not used as a reviewer.
+to **its own** account: a reviewer never uses the coder's account. Only
+adapters that report the `REVIEW` capability are used; Gemini CLI has no
+read-only review mode, so a Gemini Reviewer is skipped in favour of one that
+can review.
 
 The review runs on the product authority path:
 
@@ -313,16 +315,25 @@ review row and the task transition are written in one transaction:
 
 A provider failure, a malformed or wrong-protocol answer, or a verdict for a
 stale snapshot or another revision is recorded as `AUTOMATION_REVIEW_FAILED`
-or `AUTOMATION_REVIEW_STALE` and never becomes a verdict. Automated review is
-not retried; the header says so, and the Manager or owner reviews instead.
+or `AUTOMATION_REVIEW_STALE` and never becomes a verdict. A review that ran is
+not retried; the header says so, and the Manager or owner reviews instead. A
+review that could not **start** (no routable reviewer, lease contention, a
+transient Git error) records `AUTOMATION_REVIEW_NOT_RUN`, leaves the task
+`REVIEW_READY` and is offered again after five minutes. PASS cannot carry
+`BLOCKER` or `REQUIRED` issues, and `FIX_REQUIRED` needs at least one issue;
+contradictory verdicts are malformed. The review row, task transition and
+outcome event are committed together.
 
 **Restart.** A review attempt left `RUNNING` by a previous process is never
 completed from a guess. While its `process_runs` row is still `RUNNING`,
 everything stays fenced and an `AUTOMATION_REVIEW_INTERRUPTED` event says the
 process is not proven stopped. Once the process is terminal and the lease has
 expired, the lease is released through the guarded recovery primitive, the
-attempt and assignment end `FAILED`, and the task stays `REVIEWING`. A late
-result from the old process is discarded because it no longer holds its lease.
+attempt and assignment end `FAILED` (`COMPLETED` only when a verdict was
+already applied), and the task stays `REVIEWING`. The same transaction closes
+any startup quarantine marker (`PRODUCT_LEASE_RECOVERY_REQUIRED`) for that
+lease. A late result from the old process is discarded because it no longer
+holds its lease.
 
 ## Restart recovery for automated executions
 

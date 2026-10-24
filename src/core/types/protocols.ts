@@ -158,7 +158,15 @@ export const ReviewProtocolSchema = z.object({
   reviewed_head_sha: sha40(),
   reviewed_snapshot_sha: sha256Hex(),
   created_at: protocolString().optional(),
-}).strict();
+}).strict().superRefine((review, ctx) => {
+  // A verdict must agree with its own issues.
+  if (review.verdict === 'PASS' && review.issues.some((issue) => issue.severity === 'BLOCKER' || issue.severity === 'REQUIRED')) {
+    ctx.addIssue({ code: 'custom', path: ['verdict'], message: 'PASS cannot carry BLOCKER or REQUIRED issues.' });
+  }
+  if (review.verdict === 'FIX_REQUIRED' && review.issues.length === 0) {
+    ctx.addIssue({ code: 'custom', path: ['issues'], message: 'FIX_REQUIRED needs at least one issue.' });
+  }
+});
 export type ReviewProtocol = z.infer<typeof ReviewProtocolSchema>;
 
 // ==========================================
