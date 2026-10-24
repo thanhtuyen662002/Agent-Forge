@@ -6,6 +6,8 @@ import { GitWorktreeService } from './GitWorktreeService';
 import { ProjectStopFenceService } from './ProjectStopFenceService';
 import type { ExecutionAuthorization } from '../types/domain';
 import type { TaskTrigger } from '../state/taskStateMachine';
+import { EvidenceCollector } from '../autonomy/evidence';
+import type { WorkOrder } from '../autonomy/contracts';
 
 export const VERIFICATION_PASSED_EVENT = 'AUTOMATION_VERIFICATION_PASSED';
 export const VERIFICATION_FAILED_EVENT = 'AUTOMATION_VERIFICATION_FAILED';
@@ -31,7 +33,22 @@ export class AutomatedVerificationService {
     private readonly events: EventService,
     private readonly tasks: TaskService,
     private readonly verification: VerificationService,
+    private readonly evidence: Pick<EvidenceCollector, 'collect'> = new EvidenceCollector(),
   ) {}
+
+  /**
+   * Content identity of the coder's uncommitted work: HEAD stays at the base, so
+   * (headSha, snapshotSha) is what a later review must be bound to.
+   */
+  private async snapshot(worktree: string, baseSha: string): Promise<{ headSha: string; snapshotSha: string; changedFiles: string[] } | null> {
+    try {
+      const collected = await this.evidence.collect({ worktree, base_sha: baseSha } as WorkOrder);
+      if (!collected.snapshotSha) return null;
+      return { headSha: collected.headSha, snapshotSha: collected.snapshotSha, changedFiles: collected.changedFiles };
+    } catch {
+      return null;
+    }
+  }
 
   /** True when this settled execution already has a durable verification result or skip. */
   public hasOutcome(auth: ExecutionAuthorization): boolean {
@@ -84,6 +101,8 @@ export class AutomatedVerificationService {
       return notRun('WORKTREE_NOT_VERIFIABLE');
     }
 
+    const before = await this.snapshot(worktree, auth.repository_head_sha);
+    if (!before) return notRun('EVIDENCE_UNAVAILABLE');
     if (!this.transition(task.id, 'SUBMIT_REPORT')) return notRun('TASK_TRANSITION_REJECTED');
 
     let testRunId: string | null = null;
@@ -97,15 +116,22 @@ export class AutomatedVerificationService {
       reasonCode = (error instanceof Error && /^([A-Z_]+)/.exec(error.message)?.[1]) || 'VERIFICATION_ERROR';
     }
 
+    // Verification must not change the work it verified (or the result is about something else).
+    const after = await this.snapshot(worktree, auth.repository_head_sha);
+    if (passed && (!after || after.snapshotSha !== before.snapshotSha || after.headSha !== before.headSha)) {
+      passed = false;
+      reasonCode = 'WORKTREE_CHANGED_DURING_VERIFICATION';
+    }
+    const evidence = { headSha: before.headSha, snapshotSha: before.snapshotSha, changedFiles: before.changedFiles };
     if (passed && this.transition(task.id, 'EVIDENCE_GATHERED')) {
       this.record(auth, VERIFICATION_PASSED_EVENT, `Automated verification passed for task ${task.id}; ready for review.`,
-        { testRunId, worktree, headSha: inspected.inspection.headSha });
+        { testRunId, worktree, ...evidence });
       return { outcome: 'PASSED', testRunId: testRunId! };
     }
     // A failure, an unrunnable command or a rejected transition never becomes success.
     this.transition(task.id, 'TESTS_FAILED');
     this.record(auth, VERIFICATION_FAILED_EVENT, `Automated verification failed for task ${task.id}: ${reasonCode}.`,
-      { reasonCode, testRunId, worktree, headSha: inspected.inspection.headSha });
+      { reasonCode, testRunId, worktree, ...evidence });
     return { outcome: 'FAILED', reasonCode, testRunId };
   }
 

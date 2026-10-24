@@ -271,7 +271,8 @@ describe('desktop automation runtime', () => {
       expect(repo.getTask(task.id)!.state).toBe('REVIEW_READY');
       const passed = repo.getEventsByProject(projectId).find((e) => e.type === 'AUTOMATION_VERIFICATION_PASSED')!;
       const auth = repo.getExecutionAuthorizationsByTask(task.id)[0];
-      expect(passed.structured_payload).toMatchObject({ authorizationId: auth.id, worktree: JSON.parse(auth.canonical_payload_json!).executionScope.worktree });
+      expect(passed.structured_payload).toMatchObject({ authorizationId: auth.id, worktree: JSON.parse(auth.canonical_payload_json!).executionScope.worktree,
+        headSha: auth.repository_head_sha, snapshotSha: expect.stringMatching(/^[0-9a-f]{64}$/) });
       expect(statusOf()).toMatchObject({ phase: 'AWAITING_REVIEW', taskId: task.id, reasonCode: 'VERIFIED' });
       // No second verification or dispatch for the same settled run.
       await service.tick();
@@ -297,6 +298,27 @@ describe('desktop automation runtime', () => {
       await service.tick();
       await service.drain();
       expect(adapterCalls).toBe(1);
+    }, 90_000);
+
+    it('fails verification when the test changes the work it verifies', async () => {
+      verify(addCodexCoder());
+      fs.writeFileSync(path.join(repoDir, 'verify.js'),
+        "require('fs').appendFileSync('README.md', 'mutated by test'); process.exit(0);", 'utf8');
+      git('add', 'verify.js');
+      git('commit', '-m', 'mutating verification script');
+      repo.createVerificationCommand({
+        id: `vc-${crypto.randomUUID()}`, project_id: projectId, name: 'Mutating test', command_type: 'TEST',
+        ...await approveFixtureCommand(repo, projectId, ['verify.js']), timeout_ms: 60_000, enabled: true,
+      });
+      const task = await approvedTask();
+      service = verifyingService();
+      await service.tick();
+      await service.drain();
+
+      const failed = repo.getEventsByProject(projectId).find((e) => e.type === 'AUTOMATION_VERIFICATION_FAILED');
+      expect(failed?.structured_payload).toMatchObject({ reasonCode: 'WORKTREE_CHANGED_DURING_VERIFICATION' });
+      expect(repo.getTask(task.id)!.state).toBe('CODING');
+      expect(repo.getTask(task.id)!.revision_count).toBe(task.revision_count + 1);
     }, 90_000);
 
     it('does not transition the task when no TEST command is configured, and says so', async () => {
