@@ -965,6 +965,31 @@ export function registerIpcHandlers(
     return sanitizeOutputValue(result);
   });
 
+  // Owner-controlled integration of reviewed work (#238): list, create a branch, discard.
+  const readIntegrationTarget = (payload: unknown) => {
+    const body = payload && typeof payload === 'object' ? payload as { projectId?: unknown; taskId?: unknown } : {};
+    const ok = (value: unknown): value is string => typeof value === 'string' && value.length > 0 && value.length <= 200;
+    return ok(body.projectId) && ok(body.taskId) ? { projectId: body.projectId, taskId: body.taskId } : null;
+  };
+  registerPrivilegedHandler('integration:list', async (_, payload: unknown) => {
+    const projectId = readProjectId(payload);
+    if (!runtime.automation) return { success: false, errorCode: 'AUTOMATION_UNAVAILABLE' };
+    if (!projectId) return { success: false, errorCode: 'PROJECT_NOT_FOUND' };
+    return sanitizeOutputValue({ success: true, entries: runtime.automation.getIntegration().list(projectId) });
+  });
+  registerPrivilegedHandler('integration:createBranch', async (_, payload: unknown) => {
+    const target = readIntegrationTarget(payload);
+    if (!runtime.automation) return { success: false, errorCode: 'AUTOMATION_UNAVAILABLE' };
+    if (!target) return { success: false, errorCode: 'TASK_NOT_FOUND' };
+    return sanitizeOutputValue(await runtime.automation.getIntegration().createBranch(target.projectId, target.taskId));
+  });
+  registerPrivilegedHandler('integration:discard', async (_, payload: unknown) => {
+    const target = readIntegrationTarget(payload);
+    if (!runtime.automation) return { success: false, errorCode: 'AUTOMATION_UNAVAILABLE' };
+    if (!target) return { success: false, errorCode: 'TASK_NOT_FOUND' };
+    return sanitizeOutputValue(await runtime.automation.getIntegration().discard(target.projectId, target.taskId));
+  });
+
   registerPrivilegedHandler('quota:list', async () => {
     if (!runtime.quota) return { success: false, errorCode: 'QUOTA_UNAVAILABLE' };
     return sanitizeOutputValue({ success: true, observations: runtime.quota.getLatestObservations() });

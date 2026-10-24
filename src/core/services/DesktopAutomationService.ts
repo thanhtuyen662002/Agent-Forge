@@ -18,6 +18,7 @@ import { VerificationService } from './VerificationService';
 import { AutomatedVerificationService, VERIFICATION_FAILED_EVENT, VERIFICATION_PASSED_EVENT, VERIFICATION_SKIPPED_EVENT } from './AutomatedVerificationService';
 import { ProductReviewService, type ReviewerCandidate } from './ProductReviewService';
 import { ProductManagerService, managerAuthorizesRevision, type PendingManagerDecision } from './ProductManagerService';
+import { WorktreeIntegrationService } from './WorktreeIntegrationService';
 import type { Project, Task } from '../types/domain';
 import type { ManagedAgent } from '../types/workspace';
 import type { AutomationPhase, DesktopAutomationStatus, ProjectAutomationStatus } from '../types/desktopAutomation';
@@ -86,6 +87,7 @@ export class DesktopAutomationService {
   private readonly verifier: AutomatedVerificationService | null;
   private readonly reviewer: ProductReviewService | null;
   private readonly manager: ProductManagerService | null;
+  private readonly integration: WorktreeIntegrationService;
   /** Provider capabilities read on each pass; a reviewer needs an adapter that can REVIEW. */
   private readonly capabilities = new Map<string, readonly string[]>();
 
@@ -110,10 +112,22 @@ export class DesktopAutomationService {
       ? new ProductReviewService(repo, eventService, providerRegistry, options.taskService,
         { now: () => new Date(this.now()), heartbeatMs: options.reviewHeartbeatMs })
       : null;
+    this.integration = new WorktreeIntegrationService(repo, eventService, (projectId) => {
+      const project = this.repo.getProjectMetadata(projectId);
+      const gitExecutable = this.resolveGit();
+      return project && gitExecutable
+        ? new GitWorktreeService({ gitExecutable, repositoryRoot: project.repository_path, managedRoot: path.join(this.options.worktreeRoot, project.id) })
+        : null;
+    }, () => this.resolveGit());
     this.manager = options.taskService
       ? new ProductManagerService(repo, eventService, providerRegistry, options.taskService,
         { now: () => new Date(this.now()), heartbeatMs: options.reviewHeartbeatMs })
       : null;
+  }
+
+  /** Owner-controlled integration of reviewed work (#238). */
+  public getIntegration(): WorktreeIntegrationService {
+    return this.integration;
   }
 
   /** The automated Manager, for the owner's approve/reject IPC (#239). */
@@ -256,6 +270,8 @@ export class DesktopAutomationService {
     if (validating) return status('VERIFYING', validating.id);
     const reviewReady = tasks.find((task) => task.state === 'REVIEW_READY' || task.state === 'REVIEWING');
     if (reviewReady) return status('AWAITING_REVIEW', reviewReady.id, this.awaitingReviewReason(reviewReady));
+    const readyForIntegration = this.integration.hasReadyWork(project.id);
+    if (readyForIntegration) return status('READY_FOR_INTEGRATION', readyForIntegration, 'REVIEWED_WORK_READY');
 
     const authorized = this.authorizedTasks(project);
     for (const task of authorized) {

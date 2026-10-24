@@ -7,6 +7,7 @@ import { clampProgressPercent, validateQuotaSnapshot, quotaSourceLabel } from '.
 import { getTaskStateCounts } from '../taskStatePresentation';
 import { getAttentionTasks, getSetupSteps } from '../dashboardGuide';
 import { ManagerDecisionsPanel } from '../components/ManagerDecisionsPanel';
+import { ReviewedWorkPanel } from '../components/ReviewedWorkPanel';
 import {
   Activity,
   CheckCircle2,
@@ -129,6 +130,7 @@ export const DashboardView: React.FC = () => {
         )}
       </section>
 
+      {activeProject && <ReviewedWorkPanel projectId={activeProject.id} />}
       {activeProject && <ManagerDecisionsPanel projectId={activeProject.id} />}
 
       <section aria-labelledby="dashboard-attention-title" className="bg-surface-card border border-surface-border rounded-2xl p-6 shadow-xl space-y-4">

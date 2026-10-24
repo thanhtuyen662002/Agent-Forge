@@ -873,6 +873,147 @@ export class GitWorktreeService {
   }
 
   /**
+   * Owner-controlled integration (#238): commits the worktree's current
+   * changes on a NEW branch in the repository with Git plumbing, without
+   * moving the worktree's HEAD or touching any existing branch or checkout.
+   * The branch is created atomically (`update-ref` with an empty old value),
+   * so an existing branch is never overwritten. Only an owned, registered,
+   * detached worktree still at its base SHA qualifies.
+   */
+  public async commitChangesToNewBranch(tuple: WorktreeOwnershipTuple, branchName: string, message: string):
+    Promise<{ status: 'COMMITTED'; commitSha: string; changedFiles: string[] } | WorktreeFailure> {
+    const invalidEpoch = this.validateOwnershipEpoch(tuple);
+    if (invalidEpoch) return invalidEpoch;
+    const unsupported = this.unsupportedMutationBoundary();
+    if (unsupported) return unsupported;
+    if (!/^agent\/[a-z0-9][a-z0-9-]{0,80}$/.test(branchName) || message.length === 0 || message.length > 2000 || /\u0000/.test(message)) {
+      return { status: 'FAILED', code: 'PATH_CONTAINMENT_DENIED', error: 'PATH_CONTAINMENT_DENIED: Invalid integration branch or message.' };
+    }
+    return this.withManagedRootLock<{ status: 'COMMITTED'; commitSha: string; changedFiles: string[] } | WorktreeFailure>(
+      () => ({ status: 'FAILED' as const, code: 'PATH_CONTAINMENT_DENIED' as const, error: 'PATH_CONTAINMENT_DENIED: Managed-root operation lock could not be acquired safely.' }),
+      async () => {
+        const owned = await this.ownedDetachedTarget(tuple);
+        if ('status' in owned) return owned;
+        const { targetPath, targetIdentity } = owned;
+        const git = (args: string[]) => this.executeGitWithTargetBoundary(args, targetPath, targetIdentity);
+        const base = tuple.baseSha.toLowerCase();
+        const fail = (detail: string): WorktreeFailure => ({ status: 'FAILED', code: 'INSPECTION_FAILED', error: `INTEGRATION_FAILED: ${detail}`, worktreePath: targetPath });
+        try {
+          const exists = await git(['rev-parse', '--verify', '--quiet', `refs/heads/${branchName}`]);
+          if (exists.exitCode === 0) return { status: 'FAILED', code: 'INSPECTION_FAILED', error: 'BRANCH_EXISTS: The integration branch already exists.', worktreePath: targetPath };
+          // Raw bytes, exactly as reviewed: no line-ending conversion when staging.
+          if ((await git(['-c', 'core.autocrlf=false', '-c', 'core.safecrlf=false', 'add', '-A', '--', '.'])).exitCode !== 0) return fail('staging failed');
+          const tree = await git(['write-tree']);
+          if (tree.exitCode !== 0 || !/^[0-9a-f]{40}$/i.test(tree.stdout.trim())) return fail('write-tree failed');
+          const commit = await git(['-c', 'user.name=Agent Forge', '-c', 'user.email=agent-forge@localhost',
+            'commit-tree', tree.stdout.trim(), '-p', base, '-m', message]);
+          const commitSha = commit.stdout.trim().toLowerCase();
+          if (commit.exitCode !== 0 || !/^[0-9a-f]{40}$/.test(commitSha)) return fail('commit-tree failed');
+          // An empty old value: create only, never move an existing ref.
+          const ref = await git(['update-ref', `refs/heads/${branchName}`, commitSha, '0000000000000000000000000000000000000000']);
+          if (ref.exitCode !== 0) return { status: 'FAILED', code: 'INSPECTION_FAILED', error: 'BRANCH_EXISTS: The integration branch could not be created.', worktreePath: targetPath };
+          const names = await git(['diff', '--name-only', '-z', base, commitSha]);
+          return { status: 'COMMITTED', commitSha, changedFiles: names.stdout.split('\0').filter(Boolean).sort() };
+        } catch (error) {
+          if (error instanceof PathIdentityError) return { status: 'FAILED', code: error.code, error: error.message, worktreePath: targetPath };
+          return fail('unexpected error');
+        } finally {
+          // Unstage again, so the worktree's status (and its reviewed snapshot) is as before.
+          try { await git(['reset', '-q', '--', '.']); } catch { /* the identity fence already failed the operation */ }
+        }
+      },
+    );
+  }
+
+  /**
+   * Owned discard (#238): returns an owned, registered, detached worktree that
+   * is still at its base SHA to a clean checkout of that base (reset and clean
+   * inside the worktree only), so `removeWorktree` can then remove it.
+   */
+  public async discardOwnedChanges(tuple: WorktreeOwnershipTuple): Promise<{ status: 'DISCARDED' } | WorktreeFailure> {
+    const invalidEpoch = this.validateOwnershipEpoch(tuple);
+    if (invalidEpoch) return invalidEpoch;
+    const unsupported = this.unsupportedMutationBoundary();
+    if (unsupported) return unsupported;
+    return this.withManagedRootLock<{ status: 'DISCARDED' } | WorktreeFailure>(
+      () => ({ status: 'FAILED' as const, code: 'PATH_CONTAINMENT_DENIED' as const, error: 'PATH_CONTAINMENT_DENIED: Managed-root operation lock could not be acquired safely.' }),
+      async () => {
+        const owned = await this.ownedDetachedTarget(tuple);
+        if ('status' in owned) return owned;
+        const { targetPath, targetIdentity } = owned;
+        const git = (args: string[]) => this.executeGitWithTargetBoundary(args, targetPath, targetIdentity);
+        try {
+          // Policy forbids `reset --hard` and `clean -f`, so discard with allowed steps
+          // only: unstage, restore tracked files from the base, then delete the
+          // untracked files of this owned worktree (contained paths, never followed).
+          const base = tuple.baseSha.toLowerCase();
+          // No line-ending conversion: the managed checkout holds raw blob bytes, and so must the restore.
+          if ((await git(['reset', '-q', '--', '.'])).exitCode !== 0 ||
+              (await git(['-c', 'core.autocrlf=false', '-c', 'core.eol=lf', 'checkout', base, '--', '.'])).exitCode !== 0) {
+            return { status: 'FAILED', code: 'INSPECTION_FAILED', error: 'DISCARD_FAILED: Tracked files could not be restored.', worktreePath: targetPath };
+          }
+          const untracked = await git(['ls-files', '--others', '-z']);
+          if (untracked.exitCode !== 0) {
+            return { status: 'FAILED', code: 'INSPECTION_FAILED', error: 'DISCARD_FAILED: Untracked files could not be listed.', worktreePath: targetPath };
+          }
+          const parents = new Set<string>();
+          for (const relative of untracked.stdout.split('\0').filter(Boolean)) {
+            const absolute = path.resolve(targetPath, relative);
+            const inside = path.relative(targetPath, absolute);
+            if (!inside || inside.startsWith('..') || path.isAbsolute(inside) || inside.split(/[\\/]/)[0].toLowerCase() === '.git') {
+              return { status: 'FAILED', code: 'PATH_CONTAINMENT_DENIED', error: 'PATH_CONTAINMENT_DENIED: An untracked path escaped the worktree.', worktreePath: targetPath };
+            }
+            this.assertTargetIdentity(targetPath, targetIdentity, true);
+            fs.rmSync(absolute, { force: true }); // A link is removed itself, never its target.
+            for (let dir = path.dirname(absolute); path.relative(targetPath, dir) && !path.relative(targetPath, dir).startsWith('..'); dir = path.dirname(dir)) parents.add(dir);
+          }
+          for (const dir of [...parents].sort((a, b) => b.length - a.length)) {
+            try { fs.rmdirSync(dir); } catch { /* not empty, or tracked content: keep */ }
+          }
+          const status = await git(['status', '--porcelain', '-uall']);
+          if (status.exitCode !== 0 || status.stdout.trim() !== '') {
+            return { status: 'FAILED', code: 'DIRTY_WORKTREE', error: 'DIRTY_WORKTREE: The worktree is not clean after discard.', worktreePath: targetPath };
+          }
+          return { status: 'DISCARDED' };
+        } catch (error) {
+          if (error instanceof PathIdentityError) return { status: 'FAILED', code: error.code, error: error.message, worktreePath: targetPath };
+          return { status: 'FAILED', code: 'INSPECTION_FAILED', error: 'DISCARD_FAILED: unexpected error.', worktreePath: targetPath };
+        }
+      },
+    );
+  }
+
+  /** The derived, registered, existing, detached worktree at its base SHA, with its captured identity. */
+  private async ownedDetachedTarget(tuple: WorktreeOwnershipTuple):
+    Promise<{ targetPath: string; targetIdentity: DirectoryIdentity } | WorktreeFailure> {
+    let targetPath: string;
+    try {
+      targetPath = this.deriveWorktreePath(tuple).worktreePath;
+    } catch (err: any) {
+      return { status: 'FAILED', code: 'PATH_CONTAINMENT_DENIED', error: `PATH_CONTAINMENT_DENIED: ${err.message}` };
+    }
+    let targetIdentity: DirectoryIdentity | null;
+    try {
+      this.assertRootIdentities();
+      targetIdentity = this.captureTargetIdentity(targetPath, false);
+      if (!targetIdentity) return { status: 'FAILED', code: 'UNMANAGED_WORKTREE', error: 'UNMANAGED_WORKTREE: The worktree does not exist.', worktreePath: targetPath };
+      const entry = (await this.listPorcelain()).find((e) => normalizePathForComparison(e.worktreePath) === normalizePathForComparison(targetPath));
+      this.assertRootIdentities();
+      this.assertTargetIdentity(targetPath, targetIdentity, true);
+      if (!entry) return { status: 'FAILED', code: 'UNMANAGED_WORKTREE', error: 'UNMANAGED_WORKTREE: The worktree is not registered.', worktreePath: targetPath };
+      const head = await this.executeGitWithTargetBoundary(['rev-parse', 'HEAD'], targetPath, targetIdentity);
+      const branch = await this.executeGitWithTargetBoundary(['branch', '--show-current'], targetPath, targetIdentity);
+      if (head.exitCode !== 0 || head.stdout.trim().toLowerCase() !== tuple.baseSha.toLowerCase() || branch.exitCode !== 0 || branch.stdout.trim() !== '') {
+        return { status: 'FAILED', code: 'HEAD_CHANGED', error: 'HEAD_CHANGED: The worktree is not detached at its base SHA.', worktreePath: targetPath };
+      }
+    } catch (error) {
+      const code = error instanceof PathIdentityError ? error.code : 'PATH_IDENTITY_CHANGED';
+      return { status: 'FAILED', code, error: error instanceof Error ? error.message : 'PATH_IDENTITY_CHANGED', worktreePath: targetPath };
+    }
+    return { targetPath, targetIdentity };
+  }
+
+  /**
    * Safely removes an un-modified, clean, detached managed Git worktree.
    */
   public async removeWorktree(tuple: WorktreeOwnershipTuple): Promise<WorktreeRemoveResult> {

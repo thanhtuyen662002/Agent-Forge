@@ -453,6 +453,7 @@ export interface TranslationDictionary {
       EXECUTING: string;
       VERIFYING: string;
       REVIEWING: string;
+      READY_FOR_INTEGRATION: string;
       AWAITING_REVIEW: string;
       FAILED: string;
     };
@@ -479,7 +480,20 @@ export interface TranslationDictionary {
       MANAGER_PROPOSAL_REJECTED: string;
       MANAGER_FAILED: string;
       MANAGER_RETRY_PENDING: string;
+      REVIEWED_WORK_READY: string;
       GENERIC: string;
+    };
+    integrationPanel: {
+      title: string;
+      subtitle: string;
+      empty: string;
+      create: string;
+      discard: string;
+      confirmDiscard: string;
+      branchCreated: string;
+      discarded: string;
+      filesChanged: string;
+      failed: string;
     };
     managerPanel: {
       title: string;

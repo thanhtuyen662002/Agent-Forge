@@ -13,6 +13,9 @@ import { VerificationService } from '../src/core/services/VerificationService';
 import { ArtifactStore } from '../src/core/services/ArtifactStore';
 import { WorkspaceManagementService } from '../src/core/services/WorkspaceManagementService';
 import { DesktopAutomationService } from '../src/core/services/DesktopAutomationService';
+import { GitWorktreeService } from '../src/core/services/GitWorktreeService';
+import { WorktreeIntegrationService } from '../src/core/services/WorktreeIntegrationService';
+import { resolveTrustedExecutable } from '../src/core/services/ExecutableResolver';
 import { ProviderRegistry } from '../src/core/adapters/ProviderRegistry';
 import { captureRepositoryRoot } from '../src/core/services/RepositoryRootIdentity';
 import type { AgentExecutionRequest, AgentExecutionResult, ProviderAdapter } from '../src/core/adapters/ProviderAdapter';
@@ -38,6 +41,8 @@ describe('desktop automation runtime', () => {
   let adapterCalls: number;
   let reviewRequests: AgentExecutionRequest[];
   let managerRequests: AgentExecutionRequest[];
+  /** When set, the synthetic coder edits its managed worktree like a real coder would. */
+  let coderEdits: ((worktree: string) => void) | null;
   let managerReply: (request: AgentExecutionRequest) => AgentExecutionResult | Promise<AgentExecutionResult>;
   let reviewReply: (request: AgentExecutionRequest) => AgentExecutionResult | Promise<AgentExecutionResult>;
   let projectId: string;
@@ -64,6 +69,8 @@ describe('desktop automation runtime', () => {
         return managerReply(request);
       }
       adapterCalls += 1;
+      const workspace = request.runtimeBinding?.workspace?.workingDirectory;
+      if (coderEdits && workspace) coderEdits(workspace);
       return { executionId: request.runtimeBinding?.executionId ?? 'x', status: 'COMPLETED', outputProtocol: 'coder.v1', rawResponse: 'Synthetic coder result' };
     },
     async cancel() {},
@@ -111,6 +118,7 @@ describe('desktop automation runtime', () => {
     reviewRequests = [];
     reviewReply = () => { throw new Error('no review expected'); };
     managerRequests = [];
+    coderEdits = null;
     managerReply = () => { throw new Error('no Manager call expected'); };
 
     const now = new Date().toISOString();
@@ -955,5 +963,104 @@ describe('desktop automation runtime', () => {
       expect(eventsOf('AUTOMATION_MANAGER_APPLIED')).toHaveLength(2);
       expect(repo.getReviewsByTask(task.id).map((review) => review.verdict).sort()).toEqual(['FIX_REQUIRED', 'PASS']);
     }, 240_000);
+  });
+  describe.runIf(process.platform === 'win32')('owner-controlled integration of reviewed work (#238)', () => {
+    const integratingService = () => new DesktopAutomationService(repo, events, registry, {
+      worktreeRoot: path.join(tempDir, 'worktrees'), timer: fakeTimer, taskService: tasks, verificationService: verification,
+    });
+    const reviewerAgent = () => {
+      const created = new WorkspaceManagementService(repo).createAgent({
+        displayName: 'Codex reviewer', role: 'REVIEWER', connection: 'CODEX_CLI', modelName: 'gpt-5-codex', workerSlots: 1,
+      });
+      expect(created.success).toBe(true);
+      verify(created);
+    };
+    /** Coder edits README.md and adds NOTES.md; tests pass; the reviewer passes the exact verified snapshot. */
+    const runToDone = async () => {
+      verify(addCodexCoder());
+      reviewerAgent();
+      fs.writeFileSync(path.join(repoDir, 'verify.js'), 'process.exit(0);\n', 'utf8');
+      git('add', 'verify.js');
+      git('commit', '-m', 'add verification script');
+      repo.createVerificationCommand({
+        id: `vc-${crypto.randomUUID()}`, project_id: projectId, name: 'Fixture test', command_type: 'TEST',
+        ...await approveFixtureCommand(repo, projectId, ['verify.js']), timeout_ms: 60_000, enabled: true,
+      });
+      coderEdits = (worktree) => {
+        fs.appendFileSync(path.join(worktree, 'README.md'), 'Hello from the coder\n', 'utf8');
+        fs.writeFileSync(path.join(worktree, 'NOTES.md'), '# Notes\n', 'utf8');
+      };
+      reviewReply = (request) => {
+        const verified = repo.getEventsByProject(projectId).filter((e) => e.type === 'AUTOMATION_VERIFICATION_PASSED').at(-1)!.structured_payload as any;
+        return { executionId: request.runtimeBinding!.executionId!, status: 'COMPLETED', outputProtocol: JSON.stringify({
+          protocol: 'review.v1', message_id: `review-${crypto.randomUUID()}`, project_id: projectId, task_id: request.taskId,
+          task_revision: repo.getTask(request.taskId)!.revision_count, verdict: 'PASS', summary: 'Looks right', issues: [],
+          reviewed_head_sha: verified.headSha, reviewed_snapshot_sha: verified.snapshotSha,
+        }) };
+      };
+      const task = await approvedTask();
+      service = integratingService();
+      for (let i = 0; i < 4 && repo.getTask(task.id)!.state !== 'DONE'; i += 1) { await service.tick(); await service.drain(); }
+      expect(repo.getTask(task.id)!.state).toBe('DONE');
+      const worktree = (repo.getEventsByProject(projectId).find((e) => e.type === 'AUTOMATION_VERIFICATION_PASSED')!.structured_payload as any).worktree as string;
+      return { task, worktree };
+    };
+
+    it('creates a branch from exactly the reviewed work only when the owner asks, never touching the default branch', async () => {
+      const { task, worktree } = await runToDone();
+      const mainBefore = git('rev-parse', 'main');
+      expect(statusOf()).toMatchObject({ phase: 'READY_FOR_INTEGRATION', taskId: task.id });
+      expect(service.getIntegration().list(projectId)).toEqual([expect.objectContaining({ taskId: task.id, state: 'READY' })]);
+      expect(git('branch', '--list', 'agent/*')).toBe(''); // Nothing happens without the owner.
+
+      const created = await service.getIntegration().createBranch(projectId, task.id);
+      expect(created).toMatchObject({ success: true });
+      const branch = (created as { branch: string }).branch;
+      expect(branch).toMatch(/^agent\/add-a-greeting-[a-z0-9]+-r0$/);
+      expect(git('rev-parse', `${branch}^`)).toBe(mainBefore);
+      expect(git('diff', '--name-only', mainBefore, branch).split(/\r?\n/).sort()).toEqual(['NOTES.md', 'README.md']);
+      expect(git('show', `${branch}:README.md`)).toContain('Hello from the coder');
+      expect(git('rev-parse', 'main')).toBe(mainBefore);
+      expect(git('branch', '--show-current')).toBe('main');
+      expect(fs.readFileSync(path.join(repoDir, 'README.md'), 'utf8')).toBe('# Fixture\n'); // The owner's checkout is untouched.
+      expect(fs.existsSync(worktree)).toBe(false); // The retained worktree is removed.
+      expect(service.getIntegration().list(projectId)[0]).toMatchObject({ state: 'BRANCH_CREATED', branch, changedFiles: ['NOTES.md', 'README.md'] });
+      expect(await service.getIntegration().createBranch(projectId, task.id)).toEqual({ success: false, errorCode: 'ALREADY_INTEGRATED' });
+    }, 180_000);
+
+    it('refuses work that changed after it was reviewed', async () => {
+      const { task, worktree } = await runToDone();
+      fs.appendFileSync(path.join(worktree, 'README.md'), 'tampered\n', 'utf8');
+      expect(await service.getIntegration().createBranch(projectId, task.id)).toEqual({ success: false, errorCode: 'SNAPSHOT_CHANGED_SINCE_REVIEW' });
+      expect(git('branch', '--list', 'agent/*')).toBe('');
+    }, 180_000);
+
+    it('adopts a branch an interrupted attempt already created from the same work', async () => {
+      const { task, worktree } = await runToDone();
+      // Simulate a crash after the branch was written but before the result was recorded.
+      const auth = repo.getExecutionAuthorizationsByTask(task.id)[0];
+      const assignment = repo.getAgentAssignment(auth.assignment_id!)!;
+      const worktrees = new GitWorktreeService({ gitExecutable: resolveTrustedExecutable('git', 'git')!, repositoryRoot: repoDir, managedRoot: path.join(tempDir, 'worktrees', projectId) });
+      const tuple = { projectId, taskId: task.id, attemptId: auth.attempt_id, assignmentId: assignment.id, workerSlotId: assignment.selected_worker_slot_id!,
+        baseSha: auth.repository_head_sha, ownershipEpoch: auth.task_ownership_epoch };
+      const branch = WorktreeIntegrationService.branchName(repo.getTask(task.id)!);
+      expect((await worktrees.commitChangesToNewBranch(tuple, branch, 'interrupted')).status).toBe('COMMITTED');
+
+      expect(await service.getIntegration().createBranch(projectId, task.id)).toMatchObject({ success: true, branch });
+      expect(fs.existsSync(worktree)).toBe(false);
+      expect(repo.getEventsByProject(projectId).find((e) => e.type === 'AUTOMATION_INTEGRATION_BRANCH_CREATED')!.structured_payload).toMatchObject({ adopted: true });
+    }, 180_000);
+
+    it('discards the retained work of a terminal task only', async () => {
+      const { task, worktree } = await runToDone();
+      expect(await service.getIntegration().discard(projectId, task.id)).toEqual({ success: true });
+      expect(fs.existsSync(worktree)).toBe(false);
+      expect(service.getIntegration().list(projectId)[0]).toMatchObject({ state: 'DISCARDED' });
+      expect(git('branch', '--list', 'agent/*')).toBe('');
+      expect(await service.getIntegration().createBranch(projectId, task.id)).toEqual({ success: false, errorCode: 'ALREADY_DISCARDED' });
+
+      const open = tasks.createTask({ projectId, title: 'Still open', description: null, priority: 'LOW', risk: 'LOW', acceptanceCriteria: ['x'], constraints: [] });
+      expect(await service.getIntegration().discard(projectId, open.id)).toEqual({ success: false, errorCode: 'TASK_NOT_TERMINAL' });
+    }, 180_000);
   });
 });

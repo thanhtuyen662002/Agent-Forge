@@ -24,6 +24,8 @@ export type AutomationPhase =
   | 'REVIEWING'
   /** The coder execution settled COMPLETED and (when configured) verification passed; awaiting review. */
   | 'AWAITING_REVIEW'
+  /** A task passed automated review; its work waits for the owner to create a branch or discard it (#238). */
+  | 'READY_FOR_INTEGRATION'
   /** The latest automated execution for the current revision failed. */
   | 'FAILED';
 
