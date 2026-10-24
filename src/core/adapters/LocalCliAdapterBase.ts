@@ -17,6 +17,7 @@ import { ArtifactStore } from '../services/ArtifactStore';
 import { ProcessRunner, ProcessRunResult } from '../services/ProcessRunner';
 import { PolicyService } from '../services/PolicyService';
 import { ProtocolParser } from '../protocol/parser';
+import { parseReviewProtocol } from '../protocol/reviewProtocol';
 import { NonHandoffExecutionLifecycle } from '../services/NonHandoffExecutionLifecycle';
 import { OutputSanitizationError, redactSensitiveText } from '../../shared/security/secretRedaction';
 import { isOutputSanitizationErrorCode, safeDiagnosticText, sanitizeErrorDiagnostics, sanitizedDiagnosticError } from '../../shared/security/outputDiagnostics';
@@ -930,9 +931,9 @@ export abstract class LocalCliAdapterBase implements ProviderAdapter {
 
     lines.push('');
     lines.push('OUTPUT REQUIREMENT:');
-    lines.push(
-      'Emit a valid JSON coder.v1 protocol object conforming to the CoderProtocol schema upon task completion.'
-    );
+    lines.push(request.expectedProtocol === 'review.v1'
+      ? 'Do not modify any file. Emit one valid JSON review.v1 object (protocol, message_id, project_id, task_id, task_revision, verdict PASS|FIX_REQUIRED|BLOCKED, summary, issues, reviewed_head_sha, reviewed_snapshot_sha) using the exact identifiers given above.'
+      : 'Emit a valid JSON coder.v1 protocol object conforming to the CoderProtocol schema upon task completion.');
 
     return lines.join('\n');
   }
@@ -946,6 +947,10 @@ export abstract class LocalCliAdapterBase implements ProviderAdapter {
     const isScheduled = !!(request.runtimeBinding?.executionId ?? request.executionId);
     const executionId = request.runtimeBinding?.executionId ?? request.executionId ?? crypto.randomUUID();
     const rootLeases: RepositoryRootLease[] = [];
+
+    if (request.expectedProtocol === 'review.v1' && !(await this.getCapabilities()).includes('REVIEW')) {
+      return { executionId, status: 'FAILED', errorCode: 'UNSUPPORTED_CLIENT', error: 'UNSUPPORTED_CLIENT: this CLI adapter does not support read-only review.' };
+    }
 
     if (isScheduled) {
       if (this.activeExecutions.has(executionId)) {
@@ -1312,6 +1317,17 @@ export abstract class LocalCliAdapterBase implements ProviderAdapter {
           stdoutEvidenceId: processResult.stdoutEvidenceId,
           stderrEvidenceId: processResult.stderrEvidenceId,
         };
+      }
+
+      if (request.expectedProtocol === 'review.v1') {
+        // A review never publishes its workspace; only a valid verdict completes it.
+        const review = parseReviewProtocol(protocolText);
+        if (!review.success) {
+          return { executionId: processResult.executionId, status: 'FAILED', errorCode: 'PROTOCOL_INVALID', rawResponse: processResult.stdout,
+            error: `PROTOCOL_INVALID: ${review.reasonCode}`, stdoutEvidenceId: processResult.stdoutEvidenceId, stderrEvidenceId: processResult.stderrEvidenceId };
+        }
+        return { executionId: processResult.executionId, status: 'COMPLETED', outputProtocol: JSON.stringify(review.data), rawResponse: processResult.stdout,
+          stdoutEvidenceId: processResult.stdoutEvidenceId, stderrEvidenceId: processResult.stderrEvidenceId };
       }
 
       const parseResult = ProtocolParser.parse(protocolText);

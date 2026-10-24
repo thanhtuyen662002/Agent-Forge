@@ -1160,7 +1160,7 @@ describe('PR #7 — Durable Execution Authorization & Orchestration Binding', ()
   // 22. Codex requires RuntimeExecutionBinding and advertises capabilities
   it('22. Codex CLI contract requires RuntimeExecutionBinding and advertises capabilities', async () => {
     const codexAdapter = new CodexCliAdapter({ repo, artifactStore: {} as any });
-    expect(await codexAdapter.getCapabilities()).toEqual(['CODING', 'TERMINAL', 'FILESYSTEM_EDIT', 'TEST_EXECUTION']);
+    expect(await codexAdapter.getCapabilities()).toEqual(['CODING', 'TERMINAL', 'FILESYSTEM_EDIT', 'TEST_EXECUTION', 'REVIEW']);
 
     const execResult = await codexAdapter.execute({
       projectId: 'PROJ-AUTH',

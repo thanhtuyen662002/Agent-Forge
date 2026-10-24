@@ -1445,7 +1445,7 @@ describe('Owner Routing & Manual Bridge Handoff Loop (PR #8)', () => {
   describe('Provider Safety & Adapter Contracts', () => {
     it('36. Codex requires RuntimeExecutionBinding and advertises capabilities', async () => {
       const codex = new CodexCliAdapter({ repo, artifactStore });
-      expect(await codex.getCapabilities()).toEqual(['CODING', 'TERMINAL', 'FILESYSTEM_EDIT', 'TEST_EXECUTION']);
+      expect(await codex.getCapabilities()).toEqual(['CODING', 'TERMINAL', 'FILESYSTEM_EDIT', 'TEST_EXECUTION', 'REVIEW']);
       const exec = await codex.execute({
         taskId: testTaskId,
         projectId: testProjectId,

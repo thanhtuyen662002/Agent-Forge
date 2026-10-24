@@ -131,7 +131,46 @@ export const CoderReportProtocolSchema = z.object({
 export type CoderReportProtocol = z.infer<typeof CoderReportProtocolSchema>;
 
 // ==========================================
-// 5. Outbox Packages
+// 5. Automated Review Verdict (review.v1)
+// ==========================================
+
+export const ReviewVerdictEnum = z.enum(['PASS', 'FIX_REQUIRED', 'BLOCKED']);
+export type ReviewVerdict = z.infer<typeof ReviewVerdictEnum>;
+
+const sha40 = () => z.string().regex(/^[0-9a-f]{40}$/i);
+const sha256Hex = () => z.string().regex(/^[0-9a-f]{64}$/i);
+
+/**
+ * Verdict of an account-bound REVIEWER execution (#233). It names the exact
+ * verified work it reviewed, so a verdict for any other (stale) snapshot is
+ * rejected. Parsed only by the automated review path, never by the protocol
+ * inbox.
+ */
+export const ReviewProtocolSchema = z.object({
+  protocol: z.literal('review.v1'),
+  message_id: requiredProtocolString(),
+  project_id: requiredProtocolString(),
+  task_id: requiredProtocolString(),
+  task_revision: z.number().int().nonnegative(),
+  verdict: ReviewVerdictEnum,
+  summary: requiredProtocolString(),
+  issues: boundedArray(z.array(ReviewIssueSchema), MAX_PROTOCOL_ARRAY_ITEMS).optional().default([]),
+  reviewed_head_sha: sha40(),
+  reviewed_snapshot_sha: sha256Hex(),
+  created_at: protocolString().optional(),
+}).strict().superRefine((review, ctx) => {
+  // A verdict must agree with its own issues.
+  if (review.verdict === 'PASS' && review.issues.some((issue) => issue.severity === 'BLOCKER' || issue.severity === 'REQUIRED')) {
+    ctx.addIssue({ code: 'custom', path: ['verdict'], message: 'PASS cannot carry BLOCKER or REQUIRED issues.' });
+  }
+  if (review.verdict === 'FIX_REQUIRED' && review.issues.length === 0) {
+    ctx.addIssue({ code: 'custom', path: ['issues'], message: 'FIX_REQUIRED needs at least one issue.' });
+  }
+});
+export type ReviewProtocol = z.infer<typeof ReviewProtocolSchema>;
+
+// ==========================================
+// 6. Outbox Packages
 // ==========================================
 
 export interface WorkOrderPackage {

@@ -185,7 +185,7 @@ describe('PR #5 — Provider Integration Foundation', () => {
     expect(['AVAILABLE', 'OFFLINE', 'UNHEALTHY']).toContain(health);
 
     const capabilities = await adapter.getCapabilities();
-    expect(capabilities).toEqual(['CODING', 'TERMINAL', 'FILESYSTEM_EDIT', 'TEST_EXECUTION']);
+    expect(capabilities).toEqual(['CODING', 'TERMINAL', 'FILESYSTEM_EDIT', 'TEST_EXECUTION', 'REVIEW']);
   });
 
   // 5. Unverified Codex execute -> FAIL CLOSED / NO SPAWN / NO WORKSPACE MODIFICATION

@@ -236,11 +236,12 @@ The header shows the automation phase next to the project status, because a
 RUNNING project is not proof that a worker is running: `not running`,
 `waiting for an approved task`, `only Manual Bridge coders`, `waiting for a
 usable coder` (with a reason such as *account not verified*), `coder is
-working`, `coder finished; waiting for verification and review`, `last
-automated run failed`.
+working`, `running your approved tests`, `reviewer agent is checking the
+tested changes`, `coder finished; waiting for review` (with a reason such as
+*no Reviewer agent*), `last automated run failed`.
 
-**Limits.** Automation covers the coder stage and automated verification
-(below). Review and merging the retained worktree remain owner-driven. The CLI
+**Limits.** Automation covers the coder stage, automated verification and
+automated review (below). Merging the retained worktree remains owner-driven. The CLI
 sees only the files in the context manifest and can update existing files
 only (`docs/LOCAL_PROVIDER_WORKSPACES.md`). Large repositories that exceed the
 workspace bounds fail closed with a reason.
@@ -273,9 +274,66 @@ left unverified by a restart is picked up on the next pass.
 
 If no `TEST` command is approved, the task is not moved, and the header says
 the changes were not tested. Once the owner approves a `TEST` command, the same
-settled work is verified on the next pass. Review stays with the existing Manager or owner
-path (automated account-bound review is #233). Nothing is merged into the
-repository automatically.
+settled work is verified on the next pass. Verified work then goes to automated
+review (below) when a Reviewer agent is configured, otherwise to the existing
+Manager or owner path. Nothing is merged into the repository automatically.
+
+## Automated review of verified work
+
+When a task is `REVIEW_READY` with an `AUTOMATION_VERIFICATION_PASSED` result
+at its current revision, `ProductReviewService` asks a **Reviewer** agent to
+review it. Add one in Agent Center (role *Reviewer*, Codex CLI) and sign it in
+to **its own** account: a reviewer never uses the coder's account. Only
+adapters that report the `REVIEW` capability are used; Gemini CLI has no
+read-only review mode, so a Gemini Reviewer is skipped in favour of one that
+can review.
+
+The review runs on the product authority path:
+
+- a `desktop-review` attempt and a REVIEWER routing decision with a persisted
+  assignment, under the `sep-automated-review` separation policy (different
+  account, no self-review);
+- an account lease and worker slot from `WorkerSlotLeaseService`, renewed while
+  the reviewer runs; a lost lease or a stop cancels the review;
+- the reviewer's own CLI profile (`CODEX_HOME`), on an isolated **read-only**
+  copy of the verified worktree (`--sandbox read-only`). The copy is never
+  synchronized back. The diff is included in the prompt; diffs over 256 KB are
+  not reviewed (`REVIEW_DIFF_TOO_LARGE`).
+
+The task moves to `REVIEWING` only after every fence passes. A verdict is a
+`review.v1` object (`PASS`, `FIX_REQUIRED` or `BLOCKED`, issues, and the
+reviewed `task_revision`, `reviewed_head_sha` and `reviewed_snapshot_sha`). It
+is applied only when it names exactly the verified work, the worktree did not
+change while the reviewer ran, and the review still holds its lease. The
+review row and the task transition are written in one transaction:
+
+| Verdict | Result |
+| --- | --- |
+| `PASS` | `PASS_VERDICT`: the task is `DONE`. The changes stay in the retained worktree; nothing is merged. |
+| `FIX_REQUIRED` | `FIX_VERDICT`: back to `CODING` at the next revision (or `NEEDS_HUMAN` at the revision limit). The Manager must authorize the next revision. |
+| `BLOCKED` | Recorded; the task stays `REVIEWING` for the Manager or owner. |
+
+A provider failure, a malformed or wrong-protocol answer, or a verdict for a
+stale snapshot or another revision is recorded as `AUTOMATION_REVIEW_FAILED`
+or `AUTOMATION_REVIEW_STALE` and never becomes a verdict. A review that ran is
+not retried; the header says so, and the Manager or owner reviews instead. A
+review that could not **start** (no routable reviewer, lease contention, a
+transient Git error) records `AUTOMATION_REVIEW_NOT_RUN`, leaves the task
+`REVIEW_READY` and is offered again after five minutes. PASS cannot carry
+`BLOCKER` or `REQUIRED` issues, and `FIX_REQUIRED` needs at least one issue;
+contradictory verdicts are malformed. The review row, task transition and
+outcome event are committed together.
+
+**Restart.** A review attempt left `RUNNING` by a previous process is never
+completed from a guess. While its `process_runs` row is still `RUNNING`,
+everything stays fenced and an `AUTOMATION_REVIEW_INTERRUPTED` event says the
+process is not proven stopped. Once the process is terminal and the lease has
+expired, the lease is released through the guarded recovery primitive, the
+attempt and assignment end `FAILED` (`COMPLETED` only when a verdict was
+already applied), and the task stays `REVIEWING`. The same transaction closes
+any startup quarantine marker (`PRODUCT_LEASE_RECOVERY_REQUIRED`) for that
+lease. A late result from the old process is discarded because it no longer
+holds its lease.
 
 ## Restart recovery for automated executions
 
@@ -340,7 +398,8 @@ waiting, failed and fix-required tasks with a plain-language reason and an
 
 ## Not yet covered by this slice of Issue #225
 
-- Automatic verification, review and integration of a completed coder worktree.
+- Automatic integration (merge) of a reviewed coder worktree into the
+  repository. Automated verification (#230) and review (#233) are covered above.
 
 
 These remain open acceptance criteria on Issue #225.
