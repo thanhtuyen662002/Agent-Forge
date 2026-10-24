@@ -1,4 +1,4 @@
-import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, onTestFinished, vi } from 'vitest';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -15,7 +15,7 @@ import { WorkspaceManagementService } from '../src/core/services/WorkspaceManage
 import { DesktopAutomationService } from '../src/core/services/DesktopAutomationService';
 import { ProviderRegistry } from '../src/core/adapters/ProviderRegistry';
 import { captureRepositoryRoot } from '../src/core/services/RepositoryRootIdentity';
-import type { ProviderAdapter } from '../src/core/adapters/ProviderAdapter';
+import type { AgentExecutionRequest, AgentExecutionResult, ProviderAdapter } from '../src/core/adapters/ProviderAdapter';
 import { performSafeCleanup } from './helpers/r5l1SyntheticFixture';
 import { approveFixtureCommand } from './helpers/verificationCapabilityFixture';
 
@@ -36,6 +36,8 @@ describe('desktop automation runtime', () => {
   let verification: VerificationService;
   let registry: ProviderRegistry;
   let adapterCalls: number;
+  let reviewRequests: AgentExecutionRequest[];
+  let reviewReply: (request: AgentExecutionRequest) => AgentExecutionResult | Promise<AgentExecutionResult>;
   let projectId: string;
   let service: DesktopAutomationService;
 
@@ -46,10 +48,14 @@ describe('desktop automation runtime', () => {
     id,
     name: 'Synthetic CLI coder',
     adapterType: 'LOCAL_CLI',
-    async getCapabilities() { return ['CODING']; },
+    async getCapabilities() { return ['CODING', 'REVIEW']; },
     async getHealth() { return 'AVAILABLE'; },
     async getQuota() { return { remaining: null, total: null, unit: 'REQUESTS', source: 'UNKNOWN', confidence: 0, resetAt: null }; },
     async execute(request) {
+      if (request.expectedProtocol === 'review.v1') {
+        reviewRequests.push(request);
+        return reviewReply(request);
+      }
       adapterCalls += 1;
       return { executionId: request.runtimeBinding?.executionId ?? 'x', status: 'COMPLETED', outputProtocol: 'coder.v1', rawResponse: 'Synthetic coder result' };
     },
@@ -94,6 +100,8 @@ describe('desktop automation runtime', () => {
     registry = new ProviderRegistry();
     registry.register(synthetic('prov-codex-cli'));
     adapterCalls = 0;
+    reviewRequests = [];
+    reviewReply = () => { throw new Error('no review expected'); };
 
     const now = new Date().toISOString();
     projectId = `project-${crypto.randomUUID()}`;
@@ -273,7 +281,7 @@ describe('desktop automation runtime', () => {
       const auth = repo.getExecutionAuthorizationsByTask(task.id)[0];
       expect(passed.structured_payload).toMatchObject({ authorizationId: auth.id, worktree: JSON.parse(auth.canonical_payload_json!).executionScope.worktree,
         headSha: auth.repository_head_sha, snapshotSha: expect.stringMatching(/^[0-9a-f]{64}$/) });
-      expect(statusOf()).toMatchObject({ phase: 'AWAITING_REVIEW', taskId: task.id, reasonCode: 'VERIFIED' });
+      expect(statusOf()).toMatchObject({ phase: 'AWAITING_REVIEW', taskId: task.id, reasonCode: 'NO_REVIEWER' });
       // No second verification or dispatch for the same settled run.
       await service.tick();
       await service.drain();
@@ -361,5 +369,196 @@ describe('desktop automation runtime', () => {
       expect(repo.getTask(task.id)!.state).toBe('REVIEW_READY');
       expect(adapterCalls).toBe(1);
     }, 90_000);
+  });
+  describe.runIf(process.platform === 'win32')('account-bound automated review of verified work (#233)', () => {
+    const configureTest = async () => {
+      fs.writeFileSync(path.join(repoDir, 'verify.js'), 'process.exit(0);\n', 'utf8');
+      git('add', 'verify.js');
+      git('commit', '-m', 'add verification script');
+      repo.createVerificationCommand({
+        id: `vc-${crypto.randomUUID()}`, project_id: projectId, name: 'Fixture test', command_type: 'TEST',
+        ...await approveFixtureCommand(repo, projectId, ['verify.js']), timeout_ms: 60_000, enabled: true,
+      });
+    };
+    const reviewingService = (now?: () => string) => new DesktopAutomationService(repo, events, registry, {
+      worktreeRoot: path.join(tempDir, 'worktrees'), timer: fakeTimer, taskService: tasks, verificationService: verification, now,
+    });
+    const addReviewer = () => {
+      const created = new WorkspaceManagementService(repo).createAgent({
+        displayName: 'Codex reviewer', role: 'REVIEWER', connection: 'CODEX_CLI', modelName: 'gpt-5-codex', workerSlots: 1,
+      });
+      expect(created.success).toBe(true);
+      verify(created);
+      return created;
+    };
+    const accountOf = (created: ReturnType<typeof addCodexCoder>) =>
+      repo.getProviderResource(created.success ? created.agent.provider_resource_id! : '')!.provider_account_id;
+    const verified = () => repo.getEventsByProject(projectId).filter((e) => e.type === 'AUTOMATION_VERIFICATION_PASSED').at(-1)!
+      .structured_payload as { headSha: string; snapshotSha: string; worktree: string };
+    const verdict = (value: 'PASS' | 'FIX_REQUIRED' | 'BLOCKED', overrides: Record<string, unknown> = {}) => (request: AgentExecutionRequest): AgentExecutionResult => ({
+      executionId: request.runtimeBinding?.executionId ?? 'x', status: 'COMPLETED',
+      outputProtocol: JSON.stringify({
+        protocol: 'review.v1', message_id: `review-${crypto.randomUUID()}`, project_id: projectId, task_id: request.taskId,
+        task_revision: repo.getTask(request.taskId)!.revision_count, verdict: value, summary: 'Synthetic review',
+        issues: value === 'FIX_REQUIRED' ? [{ severity: 'REQUIRED', title: 'Missing greeting', description: 'README has no greeting.' }] : [],
+        reviewed_head_sha: verified().headSha, reviewed_snapshot_sha: verified().snapshotSha, ...overrides,
+      }),
+    });
+    const eventsOf = (type: string) => repo.getEventsByProject(projectId).filter((e) => e.type === type);
+
+    /** Coder run plus verification on the first pass; the review on the second. */
+    const runToReview = async () => {
+      const coder = addCodexCoder();
+      verify(coder);
+      const reviewer = addReviewer();
+      await configureTest();
+      const task = await approvedTask();
+      service = reviewingService();
+      await service.tick();
+      await service.drain();
+      expect(repo.getTask(task.id)!.state).toBe('REVIEW_READY');
+      await service.tick();
+      await service.drain();
+      return { task, coder, reviewer };
+    };
+
+    it('reviews on the reviewer’s own account and a PASS verdict completes the task', async () => {
+      reviewReply = verdict('PASS');
+      const { task, coder, reviewer } = await runToReview();
+
+      expect(reviewRequests).toHaveLength(1);
+      const request = reviewRequests[0];
+      expect(request.runtimeBinding!.accountId).toBe(accountOf(reviewer));
+      expect(request.runtimeBinding!.accountId).not.toBe(accountOf(coder));
+      expect(request.runtimeBinding!.workspace!.workingDirectory).toBe(verified().worktree);
+      expect(repo.getTask(task.id)!.state).toBe('DONE');
+      const reviews = repo.getReviewsByTask(task.id);
+      expect(reviews).toHaveLength(1);
+      expect(reviews[0]).toMatchObject({ verdict: 'PASS', reviewer_agent_id: reviewer.success ? reviewer.agent.id : '' });
+      const attempt = repo.getTaskAttempt(reviews[0].attempt_id!)!;
+      expect(attempt).toMatchObject({ status: 'COMPLETED', summary: 'desktop-review' });
+      const assignment = repo.getAgentAssignmentsByTask(task.id).find((a) => a.attempt_id === attempt.id)!;
+      expect(assignment.status).toBe('COMPLETED');
+      expect(repo.getActiveLeaseForAssignment(assignment.id)).toBeNull();
+      expect(eventsOf('AUTOMATION_REVIEW_PASSED')).toHaveLength(1);
+      // The settled review is never repeated, and nothing was dispatched again.
+      await service.tick();
+      await service.drain();
+      expect(reviewRequests).toHaveLength(1);
+      expect(adapterCalls).toBe(1);
+    }, 120_000);
+
+    it('sends FIX_REQUIRED back to the Manager at the next revision without re-dispatching', async () => {
+      reviewReply = verdict('FIX_REQUIRED');
+      const { task } = await runToReview();
+
+      const after = repo.getTask(task.id)!;
+      expect(after.state).toBe('CODING');
+      expect(after.revision_count).toBe(task.revision_count + 1);
+      expect(repo.getReviewsByTask(task.id)[0].verdict).toBe('FIX_REQUIRED');
+      expect(statusOf()).toMatchObject({ phase: 'WAITING_FOR_MANAGER', taskId: task.id, reasonCode: 'REVIEW_FIX_REQUIRED' });
+      await service.tick();
+      await service.drain();
+      expect(adapterCalls).toBe(1);
+    }, 120_000);
+
+    it('never applies a malformed verdict and does not retry it', async () => {
+      reviewReply = (request) => ({ executionId: request.runtimeBinding!.executionId!, status: 'COMPLETED', outputProtocol: '{"protocol":"coder.v1"}' });
+      const { task } = await runToReview();
+
+      expect(repo.getTask(task.id)!.state).toBe('REVIEWING');
+      expect(repo.getReviewsByTask(task.id)).toEqual([]);
+      expect(eventsOf('AUTOMATION_REVIEW_FAILED')[0].structured_payload).toMatchObject({ reasonCode: 'REVIEW_PROTOCOL_INVALID' });
+      expect(statusOf()).toMatchObject({ phase: 'AWAITING_REVIEW', taskId: task.id, reasonCode: 'REVIEW_FAILED' });
+      await service.tick();
+      await service.drain();
+      expect(reviewRequests).toHaveLength(1);
+    }, 120_000);
+
+    it('rejects a verdict for a stale snapshot', async () => {
+      reviewReply = verdict('PASS', { reviewed_snapshot_sha: 'f'.repeat(64) });
+      const { task } = await runToReview();
+
+      expect(repo.getTask(task.id)!.state).toBe('REVIEWING');
+      expect(repo.getReviewsByTask(task.id)).toEqual([]);
+      expect(eventsOf('AUTOMATION_REVIEW_STALE')[0].structured_payload).toMatchObject({ reasonCode: 'VERDICT_FOR_STALE_SNAPSHOT' });
+    }, 120_000);
+
+    it('rejects a review when the verified worktree changed while it ran', async () => {
+      const pass = verdict('PASS');
+      reviewReply = (request) => {
+        fs.writeFileSync(path.join(request.runtimeBinding!.workspace!.workingDirectory, 'README.md'), '# Tampered\n', 'utf8');
+        return pass(request);
+      };
+      const { task } = await runToReview();
+
+      expect(repo.getTask(task.id)!.state).toBe('REVIEWING');
+      expect(eventsOf('AUTOMATION_REVIEW_STALE')[0].structured_payload).toMatchObject({ reasonCode: 'WORKTREE_CHANGED_DURING_REVIEW' });
+    }, 120_000);
+
+    it('never turns a provider failure into a verdict', async () => {
+      reviewReply = (request) => ({ executionId: request.runtimeBinding!.executionId!, status: 'FAILED', errorCode: 'AUTH_ERROR', error: 'not logged in' });
+      const { task } = await runToReview();
+
+      expect(repo.getTask(task.id)!.state).toBe('REVIEWING');
+      expect(repo.getReviewsByTask(task.id)).toEqual([]);
+      expect(eventsOf('AUTOMATION_REVIEW_FAILED')[0].structured_payload).toMatchObject({ reasonCode: 'AUTH_ERROR' });
+      const attempt = repo.getTaskAttemptsByTask(task.id).find((a) => a.summary === 'desktop-review')!;
+      expect(attempt.status).toBe('FAILED');
+      await service.tick();
+      await service.drain();
+      expect(reviewRequests).toHaveLength(1);
+    }, 120_000);
+
+    it('fences an interrupted review on restart and never infers a verdict', async () => {
+      let finishHung: (result: AgentExecutionResult) => void = () => undefined;
+      reviewReply = () => new Promise((resolve) => { finishHung = resolve; });
+      const coder = addCodexCoder();
+      verify(coder);
+      addReviewer();
+      await configureTest();
+      const task = await approvedTask();
+      const first = reviewingService();
+      service = first;
+      await first.tick();
+      await first.drain();
+      void first.tick();
+      await vi.waitFor(() => expect(reviewRequests).toHaveLength(1), { timeout: 30_000 });
+      expect(repo.getTask(task.id)!.state).toBe('REVIEWING');
+      const attempt = repo.getTaskAttemptsByTask(task.id).find((a) => a.summary === 'desktop-review')!;
+      const assignment = repo.getAgentAssignmentsByTask(task.id).find((a) => a.attempt_id === attempt.id)!;
+      const executionId = reviewRequests[0].runtimeBinding!.executionId!;
+
+      // (a) A process that may still run keeps everything fenced.
+      repo.createProcessRun({ id: executionId, pid: null, project_id: projectId, task_id: task.id, attempt_id: attempt.id,
+        command: 'codex exec', working_directory: tempDir, status: 'RUNNING', start_time: new Date().toISOString() });
+      const later = () => new Date(Date.now() + 10 * 60_000).toISOString();
+      const restarted = reviewingService(later);
+      // Teardown drains the restarted service; the hung first one is released below.
+      service = restarted;
+      onTestFinished(() => finishHung({ executionId, status: 'CANCELLED', errorCode: 'CANCELLED' }));
+      await restarted.tick();
+      expect(repo.getTaskAttempt(attempt.id)!.status).toBe('RUNNING');
+      expect(repo.getActiveLeaseForAssignment(assignment.id)).not.toBeNull();
+      expect(eventsOf('AUTOMATION_REVIEW_INTERRUPTED')[0].structured_payload).toMatchObject({ reasonCode: 'PROCESS_NOT_PROVEN_STOPPED' });
+
+      // (b) Once the process is terminal, the expired lease is released and the attempt ends; no verdict, no retry.
+      db.prepare("UPDATE process_runs SET status = 'FAILED' WHERE id = ?").run(executionId);
+      await restarted.tick();
+      await restarted.drain();
+      expect(repo.getTaskAttempt(attempt.id)!.status).toBe('FAILED');
+      expect(repo.getAgentAssignment(assignment.id)!.status).toBe('FAILED');
+      expect(repo.getActiveLeaseForAssignment(assignment.id)).toBeNull();
+      expect(eventsOf('AUTOMATION_REVIEW_INTERRUPTED').some((e) => (e.structured_payload as any).reasonCode === 'REVIEW_INTERRUPTED')).toBe(true);
+      expect(repo.getTask(task.id)!.state).toBe('REVIEWING');
+      expect(repo.getReviewsByTask(task.id)).toEqual([]);
+      expect(reviewRequests).toHaveLength(1);
+
+      // The old process's late result is not applied either.
+      finishHung(verdict('PASS')(reviewRequests[0]));
+      await first.drain();
+      expect(repo.getTask(task.id)!.state).toBe('REVIEWING');
+      expect(repo.getReviewsByTask(task.id)).toEqual([]);
+    }, 120_000);
   });
 });

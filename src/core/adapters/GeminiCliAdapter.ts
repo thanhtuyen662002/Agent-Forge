@@ -199,6 +199,11 @@ export class GeminiCliAdapter extends LocalCliAdapterBase {
   public override async execute(request: AgentExecutionRequest): Promise<AgentExecutionResult> {
     const executionId = crypto.randomUUID();
 
+    // Gemini has no read-only review mode; a review request never spawns.
+    if (request.expectedProtocol === 'review.v1') {
+      return { executionId, status: 'FAILED', errorCode: 'UNSUPPORTED_CLIENT', error: 'UNSUPPORTED_CLIENT: Gemini CLI does not support read-only review.' };
+    }
+
     // 1. Mandatory RuntimeExecutionBinding validation before any process spawn
     if (!request.runtimeBinding) {
       return {

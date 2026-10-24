@@ -449,6 +449,7 @@ export interface TranslationDictionary {
       QUEUED: string;
       EXECUTING: string;
       VERIFYING: string;
+      REVIEWING: string;
       AWAITING_REVIEW: string;
       FAILED: string;
     };
@@ -462,6 +463,13 @@ export interface TranslationDictionary {
       NOT_VERIFIED: string;
       WORKTREE_NOT_VERIFIABLE: string;
       PROVIDER_EXECUTION_FAILED: string;
+      NO_REVIEWER: string;
+      REVIEWER_NOT_AVAILABLE: string;
+      REVIEW_FIX_REQUIRED: string;
+      REVIEW_BLOCKED: string;
+      REVIEW_FAILED: string;
+      REVIEW_STALE: string;
+      REVIEW_INTERRUPTED: string;
       GENERIC: string;
     };
     quota: {

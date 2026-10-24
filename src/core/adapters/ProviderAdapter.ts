@@ -59,6 +59,11 @@ export interface AgentExecutionRequest {
   contextFiles: string[];
   attemptId?: string | null;
   runtimeBinding?: RuntimeExecutionBinding;
+  /**
+   * Output the caller requires. Defaults to coder.v1. A review.v1 execution is
+   * read-only: its isolated workspace is never synchronized back (#233).
+   */
+  expectedProtocol?: 'coder.v1' | 'review.v1';
 }
 
 export interface AgentExecutionResult {
