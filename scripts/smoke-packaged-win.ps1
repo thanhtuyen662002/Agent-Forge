@@ -402,14 +402,16 @@ if (nativeBindingPath.toLowerCase().includes('temp\\node_modules')) {
 MigrationRunner.run(db);
 
 const appliedMigrations = db.prepare("SELECT version,name FROM schema_migrations ORDER BY version ASC").all();
-if (appliedMigrations.length !== 26 || appliedMigrations.some((migration, index) => migration.version !== index + 1) ||
+if (appliedMigrations.length !== 27 || appliedMigrations.some((migration, index) => migration.version !== index + 1) ||
     appliedMigrations[24]?.name !== 'durable_owner_verification_capabilities' ||
-    appliedMigrations[25]?.name !== 'selected_project_repository_identities') {
-  throw new Error("Expected exact migration inventory 1..26 with owner-capability and selected-root identities");
+    appliedMigrations[25]?.name !== 'selected_project_repository_identities' ||
+    appliedMigrations[26]?.name !== 'owner_workspace_lifecycle') {
+  throw new Error("Expected exact migration inventory 1..27 with owner-capability, selected-root and owner-workspace identities");
 }
-console.log("MIGRATION_REGISTRY_26=PASS");
+console.log("MIGRATION_REGISTRY_27=PASS");
 console.log("OWNER_CAPABILITY_MIGRATION_25=PASS");
 console.log("SELECTED_ROOT_IDENTITY_MIGRATION_26=PASS");
+console.log("WORKSPACE_LIFECYCLE_MIGRATION_27=PASS");
 
 // Exercise the shipped lease and native addon, never a workspace dependency.
 const { captureRepositoryRoot } = require(path.join(asarPath, 'dist-electron', 'core', 'services', 'RepositoryRootIdentity.js'));
@@ -1814,7 +1816,7 @@ const harness = new McpRpcHarness(child);
   Write-Host "MCP Proof Output:"
   Write-Host $mcpStdout
 
-  if ($mcpProc.ExitCode -ne 0 -or -not ($mcpStdout -match "R5J3_MCP_BRIDGE_PROOF=PASS") -or -not ($mcpStdout -match "R5J4_MCP_SUBMISSION_PROOF=PASS") -or -not ($mcpStdout -match "R5J5_OWNER_ADJUDICATION_PROOF=PASS") -or -not ($mcpStdout -match "R5J6_SUBMISSION_OBSERVABILITY_PROOF=PASS") -or -not ($mcpStdout -match "MIGRATION_REGISTRY_26=PASS") -or -not ($mcpStdout -match "OWNER_CAPABILITY_MIGRATION_25=PASS") -or -not ($mcpStdout -match "SELECTED_ROOT_IDENTITY_MIGRATION_26=PASS") -or -not ($mcpStdout -match "KOFFI_NATIVE_PACKAGE_BOUND=PASS") -or -not ($mcpStdout -match "SELECTED_ROOT_NATIVE_LEASE=PASS")) {
+  if ($mcpProc.ExitCode -ne 0 -or -not ($mcpStdout -match "R5J3_MCP_BRIDGE_PROOF=PASS") -or -not ($mcpStdout -match "R5J4_MCP_SUBMISSION_PROOF=PASS") -or -not ($mcpStdout -match "R5J5_OWNER_ADJUDICATION_PROOF=PASS") -or -not ($mcpStdout -match "R5J6_SUBMISSION_OBSERVABILITY_PROOF=PASS") -or -not ($mcpStdout -match "MIGRATION_REGISTRY_27=PASS") -or -not ($mcpStdout -match "WORKSPACE_LIFECYCLE_MIGRATION_27=PASS") -or -not ($mcpStdout -match "OWNER_CAPABILITY_MIGRATION_25=PASS") -or -not ($mcpStdout -match "SELECTED_ROOT_IDENTITY_MIGRATION_26=PASS") -or -not ($mcpStdout -match "KOFFI_NATIVE_PACKAGE_BOUND=PASS") -or -not ($mcpStdout -match "SELECTED_ROOT_NATIVE_LEASE=PASS")) {
     Write-Error "Packaged MCP bridge verification failed (exit code $($mcpProc.ExitCode)): $mcpStderr"
     exit 1
   }
@@ -1822,7 +1824,8 @@ const harness = new McpRpcHarness(child);
   Write-Host "[9/9] Packaged MCP Client Bridge & Node-Mode Stdio Proof: PASS" -ForegroundColor Green
   Write-Host "R5J5_OWNER_ADJUDICATION_PROOF=PASS" -ForegroundColor Green
   Write-Host "R5J6_SUBMISSION_OBSERVABILITY_PROOF=PASS" -ForegroundColor Green
-  Write-Host "MIGRATION_REGISTRY_26=PASS" -ForegroundColor Green
+  Write-Host "MIGRATION_REGISTRY_27=PASS" -ForegroundColor Green
+  Write-Host "WORKSPACE_LIFECYCLE_MIGRATION_27=PASS" -ForegroundColor Green
   Write-Host "OWNER_CAPABILITY_MIGRATION_25=PASS" -ForegroundColor Green
   Write-Host "SELECTED_ROOT_IDENTITY_MIGRATION_26=PASS" -ForegroundColor Green
 

@@ -2,7 +2,7 @@ import { RepositoryRootLease } from '../core/services/RepositoryRootLease';
 import type { Evidence } from '../core/types/domain';
 import { OutputSanitizationError, redactSensitiveText, sanitizeOutputValue } from '../shared/security/secretRedaction';
 import { sanitizeErrorDiagnostics, sanitizedDiagnosticError } from '../shared/security/outputDiagnostics';
-import { ipcMain, dialog, app } from 'electron';
+import { ipcMain, dialog, app, shell } from 'electron';
 import { Repository } from '../core/database/repositories';
 import { ProjectService } from '../core/services/ProjectService';
 import { TaskService } from '../core/services/TaskService';
@@ -22,6 +22,10 @@ import { ExecutionAuthorizationService } from '../core/services/ExecutionAuthori
 import { ProviderDispatchService } from '../core/services/ProviderDispatchService';
 import { UpdateService } from '../core/services/UpdateService';
 import { CommandParser } from '../core/services/CommandParser';
+import { WorkspaceManagementService } from '../core/services/WorkspaceManagementService';
+import type { DesktopAutomationService } from '../core/services/DesktopAutomationService';
+import type { AccountQuotaService } from '../core/services/AccountQuotaService';
+import type { CodexAccountConnectionService } from '../core/services/CodexAccountConnectionService';
 import {
   CreateProjectIpcSchema,
   BindProjectRepositoryIpcSchema,
@@ -128,15 +132,48 @@ export function registerIpcHandlers(
   updateService?: UpdateService,
   coderSubmissionAdjudicationService?: CoderSubmissionAdjudicationService,
   rendererPolicy: RendererNavigationPolicyOptions = resolveRendererNavigationPolicy({ isPackaged: false }),
+  runtime: { automation?: DesktopAutomationService; quota?: AccountQuotaService; signIn?: CodexAccountConnectionService } = {},
 ): void {
   const adjService =
     coderSubmissionAdjudicationService ||
     new CoderSubmissionAdjudicationService(repo, repo.getDatabase(), verificationService);
 
+  const workspaceManagementService = new WorkspaceManagementService(repo);
+
+  // Owner trash fence. Mutations and work-order generation for a trashed
+  // project or task are refused before the handler runs; trashing also
+  // invalidated its AUTHORIZED executions and dispatch re-checks the trash.
+  const trashFencedChannels = new Set([
+    'project:importContract', 'project:transition', 'task:create', 'task:startReview',
+    'protocol:generateWorkOrder', 'protocol:generateReviewPackage', 'verification:runTests',
+    'verification:saveCommands', 'routing:routeTask', 'routing:authorizeTask',
+    'routing:dispatchAuthorization', 'routing:generateAuthorizedWorkOrder',
+  ]);
+  const trashRejection = (projectId: unknown, taskId: unknown) => {
+    const trashed = (typeof projectId === 'string' && repo.isProjectTrashed(projectId)) ||
+      (typeof taskId === 'string' && repo.isTaskTrashed(taskId));
+    return trashed
+      ? { success: false, errorCode: 'ENTITY_IN_TRASH', error: 'ENTITY_IN_TRASH: Restore the project or task from the trash first.' }
+      : null;
+  };
+  const trashFence = (payload: unknown) => {
+    if (!payload || typeof payload !== 'object') return null;
+    const record = payload as Record<string, unknown>;
+    let taskId = record.taskId;
+    if (typeof record.authorizationId === 'string') {
+      taskId = repo.getExecutionAuthorization(record.authorizationId)?.task_id ?? taskId;
+    }
+    return trashRejection(record.projectId ?? record.expectedProjectId, taskId);
+  };
+
   const registerPrivilegedHandler = (channel: string, handler: PrivilegedIpcHandler): void => {
     ipcMain.handle(channel, async (event, payload) => {
       if (!isTrustedIpcSender(event, rendererPolicy)) {
         throw new IpcSenderTrustError();
+      }
+      if (trashFencedChannels.has(channel)) {
+        const rejected = trashFence(payload);
+        if (rejected) return rejected;
       }
       try { return await handler(event, payload); }
       catch (error) {
@@ -278,7 +315,7 @@ export function registerIpcHandlers(
   });
 
   registerPrivilegedHandler('project:list', async () => {
-    return repo.getAllProjects();
+    return repo.getAllProjects().filter((project) => !repo.isProjectTrashed(project.id));
   });
 
   registerPrivilegedHandler('project:importContract', async (_, payload: unknown) => {
@@ -286,7 +323,11 @@ export function registerIpcHandlers(
     if (!parsed.success) {
       return { success: false, error: parsed.error.issues.map((i) => i.message).join(', ') };
     }
-    return projectService.importContract(parsed.data.projectId, parsed.data.contract as any);
+    // Typed acknowledgement: the renderer only treats an explicit success envelope as saved.
+    if (!projectService.importContract(parsed.data.projectId, parsed.data.contract as any)) {
+      return { success: false, errorCode: 'PROJECT_NOT_FOUND', error: `Project "${parsed.data.projectId}" not found.` };
+    }
+    return { success: true, project: repo.getProjectMetadata(parsed.data.projectId) };
   });
 
   registerPrivilegedHandler('project:transition', async (_, payload: unknown) => {
@@ -294,7 +335,20 @@ export function registerIpcHandlers(
     if (!parsed.success) {
       return { success: false, error: parsed.error.issues.map((i) => i.message).join(', ') };
     }
-    return projectService.transitionStatus(parsed.data.projectId, parsed.data.trigger);
+    try {
+      const status = projectService.transitionStatus(parsed.data.projectId, parsed.data.trigger);
+      // Starting or resuming is picked up immediately instead of on the next interval.
+      if (status === 'RUNNING') void runtime.automation?.tick();
+      return { success: true, status, project: repo.getProjectMetadata(parsed.data.projectId) };
+    } catch (error) {
+      // Repository identity failures keep their typed code through the registration wrapper.
+      if (error instanceof RepositoryRootError) throw error;
+      const message = error instanceof Error ? error.message : '';
+      const errorCode = message.includes('Invalid transition') ? 'INVALID_TRANSITION'
+        : message.includes('EMERGENCY_STOP_LATCHED') ? 'EMERGENCY_STOP_LATCHED'
+        : /not found/i.test(message) ? 'PROJECT_NOT_FOUND' : 'TRANSITION_REJECTED';
+      return { success: false, errorCode, error: redactSensitiveText(message || 'Project transition was rejected.') };
+    }
   });
 
   // ==========================================
@@ -322,7 +376,8 @@ export function registerIpcHandlers(
   registerPrivilegedHandler('task:list', async (_, payload: unknown) => {
     const parsed = ProjectScopedIpcSchema.safeParse(payload);
     if (!parsed.success) return [];
-    return repo.getTasksByProject(parsed.data.projectId);
+    if (repo.isProjectTrashed(parsed.data.projectId)) return [];
+    return repo.getTasksByProject(parsed.data.projectId).filter((task) => !repo.isTaskTrashed(task.id));
   });
 
   registerPrivilegedHandler('task:startReview', async (_, payload: unknown) => {
@@ -359,6 +414,10 @@ export function registerIpcHandlers(
     if (!parseRes.success || !parseRes.data) {
       return { success: false, error: `Invalid protocol format: ${parseRes.error}` };
     }
+
+    const protocolScope = parseRes.data.data as { project_id?: unknown; task_id?: unknown };
+    const trashed = trashRejection(protocolScope.project_id, protocolScope.task_id);
+    if (trashed) return trashed;
 
     if (parseRes.data.type === 'manager.v1') {
       return await taskService.applyManagerDecision(parseRes.data.data, parsed.data.rawInput);
@@ -837,6 +896,104 @@ export function registerIpcHandlers(
 
   registerPrivilegedHandler('agents:list', async () => {
     return repo.getAllAgents();
+  });
+
+  // Owner agent roster management. Every mutation is one immediate transaction
+  // and replies with a typed result; removal is reversible and fenced by
+  // active-work blockers.
+  registerPrivilegedHandler('agents:roster', async (_, payload: unknown) => {
+    const includeRemoved = Boolean(payload && typeof payload === 'object' && (payload as { includeRemoved?: unknown }).includeRemoved === true);
+    return sanitizeOutputValue(workspaceManagementService.listAgents({ includeRemoved }));
+  });
+
+  registerPrivilegedHandler('agents:create', async (_, payload: unknown) => {
+    return sanitizeOutputValue(workspaceManagementService.createAgent(payload));
+  });
+
+  registerPrivilegedHandler('agents:update', async (_, payload: unknown) => {
+    return sanitizeOutputValue(workspaceManagementService.updateAgent(payload));
+  });
+
+  registerPrivilegedHandler('agents:remove', async (_, payload: unknown) => {
+    return sanitizeOutputValue(workspaceManagementService.removeAgent(payload));
+  });
+
+  registerPrivilegedHandler('agents:restore', async (_, payload: unknown) => {
+    return sanitizeOutputValue(workspaceManagementService.restoreAgent(payload));
+  });
+
+  // Desktop runtime status and read-only quota telemetry.
+  registerPrivilegedHandler('automation:status', async () => {
+    if (!runtime.automation) return { success: false, errorCode: 'AUTOMATION_UNAVAILABLE' };
+    return { success: true, status: runtime.automation.getStatus() };
+  });
+
+  registerPrivilegedHandler('quota:list', async () => {
+    if (!runtime.quota) return { success: false, errorCode: 'QUOTA_UNAVAILABLE' };
+    return sanitizeOutputValue({ success: true, observations: runtime.quota.getLatestObservations() });
+  });
+
+  registerPrivilegedHandler('quota:refresh', async () => {
+    if (!runtime.quota) return { success: false, errorCode: 'QUOTA_UNAVAILABLE' };
+    const observations = await runtime.quota.refreshAll();
+    // A newly verified account may make queued work schedulable.
+    void runtime.automation?.tick();
+    return sanitizeOutputValue({ success: true, observations });
+  });
+
+  // Optional Codex device-code sign-in into the account's isolated profile.
+  // The renderer only ever sees the one-time code and a session id; the
+  // verification page is opened from the URL held by the main process.
+  const readSessionId = (payload: unknown) => {
+    const value = payload && typeof payload === 'object' ? (payload as { sessionId?: unknown }).sessionId : undefined;
+    return typeof value === 'string' && value.length > 0 && value.length <= 128 ? value : null;
+  };
+  registerPrivilegedHandler('accounts:startCodexSignIn', async (_, payload: unknown) => {
+    if (!runtime.signIn) return { success: false, errorCode: 'SIGN_IN_UNAVAILABLE' };
+    const accountId = payload && typeof payload === 'object' ? (payload as { accountId?: unknown }).accountId : undefined;
+    if (typeof accountId !== 'string' || !accountId || accountId.length > 200) return { success: false, errorCode: 'ACCOUNT_NOT_FOUND' };
+    return runtime.signIn.startDeviceLogin(accountId);
+  });
+  registerPrivilegedHandler('accounts:codexSignInStatus', async (_, payload: unknown) => {
+    const sessionId = readSessionId(payload);
+    const status = runtime.signIn && sessionId ? runtime.signIn.getLoginStatus(sessionId) : null;
+    return status ? { success: true, status } : { success: false, errorCode: 'SESSION_NOT_FOUND' };
+  });
+  registerPrivilegedHandler('accounts:cancelCodexSignIn', async (_, payload: unknown) => {
+    const sessionId = readSessionId(payload);
+    if (!runtime.signIn || !sessionId) return { success: false, errorCode: 'SESSION_NOT_FOUND' };
+    runtime.signIn.cancelLogin(sessionId);
+    return { success: true };
+  });
+  registerPrivilegedHandler('accounts:openCodexSignInPage', async (_, payload: unknown) => {
+    const sessionId = readSessionId(payload);
+    const status = runtime.signIn && sessionId ? runtime.signIn.getLoginStatus(sessionId) : null;
+    if (!status || status.state !== 'WAITING_FOR_USER' || !status.verificationUrl) return { success: false, errorCode: 'SESSION_NOT_FOUND' };
+    const url = new URL(status.verificationUrl);
+    if (url.protocol !== 'https:') return { success: false, errorCode: 'PROTOCOL_ERROR' };
+    await shell.openExternal(url.toString());
+    return { success: true };
+  });
+
+  // Owner trash for projects and tasks: reversible, history-preserving.
+  registerPrivilegedHandler('trash:list', async () => {
+    return sanitizeOutputValue(workspaceManagementService.listTrash());
+  });
+
+  registerPrivilegedHandler('trash:project', async (_, payload: unknown) => {
+    return sanitizeOutputValue(workspaceManagementService.trashProject(payload));
+  });
+
+  registerPrivilegedHandler('trash:restoreProject', async (_, payload: unknown) => {
+    return sanitizeOutputValue(workspaceManagementService.restoreProject(payload));
+  });
+
+  registerPrivilegedHandler('trash:task', async (_, payload: unknown) => {
+    return sanitizeOutputValue(workspaceManagementService.trashTask(payload));
+  });
+
+  registerPrivilegedHandler('trash:restoreTask', async (_, payload: unknown) => {
+    return sanitizeOutputValue(workspaceManagementService.restoreTask(payload));
   });
 
   registerPrivilegedHandler('providers:updateResourceQuota', async (_, payload: unknown) => {

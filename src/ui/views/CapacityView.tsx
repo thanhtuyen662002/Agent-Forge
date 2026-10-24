@@ -6,6 +6,7 @@ import { ProviderResource, QuotaSource } from '../../core/types/domain';
 import { Cpu, Edit2 } from 'lucide-react';
 import { isQuotaInputValid, validateQuotaSnapshot } from '../capacityTruth';
 import { AccessibleDialog } from '../components/AccessibleDialog';
+import { ProviderQuotaPanel } from '../components/ProviderQuotaPanel';
 
 export interface QuotaSnapshotResolution {
   remaining: number | null;
@@ -158,6 +159,8 @@ export const CapacityView: React.FC = () => {
           {t('capacity.subtitle')}
         </p>
       </div>
+
+      <ProviderQuotaPanel />
 
       {/* Resource Table / Cards */}
       <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-5">

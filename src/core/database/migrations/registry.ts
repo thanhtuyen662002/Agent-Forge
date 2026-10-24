@@ -25,6 +25,7 @@ import { migration023 } from './migration023';
 import { migration024 } from './migration024';
 import { migration025 } from './migration025';
 import { migration026 } from './migration026';
+import { migration027 } from './migration027';
 
 const REGISTERED_MIGRATIONS: readonly Migration[] = Object.freeze([
   migration001,
@@ -53,6 +54,7 @@ const REGISTERED_MIGRATIONS: readonly Migration[] = Object.freeze([
   migration024,
   migration025,
   migration026,
+  migration027,
 ]);
 
 const expectedVersions = REGISTERED_MIGRATIONS.map((migration, index) => index + 1);

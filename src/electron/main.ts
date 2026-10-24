@@ -11,10 +11,16 @@ import {
 } from './pathHelper';
 import { UpdateService } from '../core/services/UpdateService';
 import { ElectronUpdaterAdapter } from './updaterAdapter';
+import { DesktopAutomationService } from '../core/services/DesktopAutomationService';
+import { AccountQuotaService } from '../core/services/AccountQuotaService';
+import { CodexAccountConnectionService } from '../core/services/CodexAccountConnectionService';
 
 let mainWindow: BrowserWindow | null = null;
 let bootstrapInstance: BootstrapResult | null = null;
 let updateServiceInstance: UpdateService | null = null;
+let automationInstance: DesktopAutomationService | null = null;
+let quotaInstance: AccountQuotaService | null = null;
+let signInInstance: CodexAccountConnectionService | null = null;
 
 function createWindow(
   userDataDir: string,
@@ -161,6 +167,26 @@ app.whenReady().then(() => {
     repository: bootstrapInstance.repo,
   });
 
+  // Bounded desktop runtime: automated coder execution for RUNNING projects and
+  // read-only account quota polling. Both only use existing durable fences.
+  automationInstance = new DesktopAutomationService(
+    bootstrapInstance.repo,
+    bootstrapInstance.eventService,
+    bootstrapInstance.providerRegistry,
+    { worktreeRoot: path.join(userDataDir, 'worktrees') },
+  );
+  quotaInstance = new AccountQuotaService(bootstrapInstance.repo, { initializeVerifiedAccounts: true });
+  const quotaForSignIn = quotaInstance;
+  const automationForSignIn = automationInstance;
+  signInInstance = new CodexAccountConnectionService(bootstrapInstance.repo, {
+    // A completed sign-in is verified by an authenticated quota read, which is
+    // the only path that may initialize the never-used account's health.
+    onSignedIn: async (accountId) => {
+      await quotaForSignIn.refreshAccount(accountId);
+      await automationForSignIn.tick();
+    },
+  });
+
   // Register Typed & Validated IPC Handlers
   registerIpcHandlers(
     bootstrapInstance.repo,
@@ -174,7 +200,11 @@ app.whenReady().then(() => {
     updateServiceInstance,
     undefined,
     navigationPolicy,
+    { automation: automationInstance, quota: quotaInstance, signIn: signInInstance },
   );
+  automationInstance.start();
+  quotaInstance.start();
+  void quotaInstance.refreshAll();
 
   // Create Desktop Window
   createWindow(userDataDir, rendererTarget, navigationPolicy);
@@ -193,6 +223,11 @@ app.on('window-all-closed', () => {
 });
 
 app.on('before-quit', () => {
+  // Stop new dispatch and polling first; in-flight executions keep their
+  // durable fences and are reconciled by startup recovery if interrupted.
+  automationInstance?.stop();
+  quotaInstance?.stop();
+  signInInstance?.dispose();
   if (bootstrapInstance) {
     try {
       bootstrapInstance.dbEngine.close();

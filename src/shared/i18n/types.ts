@@ -208,6 +208,305 @@ export interface TranslationDictionary {
     managerPool: string;
     coderPool: string;
     reviewerPool: string;
+    toolPool: string;
+    addAgent: string;
+    showRemoved: string;
+    emptyRole: string;
+    emptyRoster: string;
+    loadFailed: string;
+    retry: string;
+    removedBadge: string;
+    desktopOnly: string;
+    roles: {
+      PRIMARY_MANAGER: string;
+      BACKUP_MANAGER: string;
+      CODER: string;
+      REVIEWER: string;
+      TOOL: string;
+    };
+    roleHelp: {
+      PRIMARY_MANAGER: string;
+      BACKUP_MANAGER: string;
+      CODER: string;
+      REVIEWER: string;
+      TOOL: string;
+    };
+    connections: {
+      MANUAL_BRIDGE: string;
+      CODEX_CLI: string;
+      GEMINI_CLI: string;
+      OTHER: string;
+    };
+    connectionHelp: {
+      MANUAL_BRIDGE: string;
+      CODEX_CLI: string;
+      GEMINI_CLI: string;
+      OTHER: string;
+    };
+    form: {
+      createTitle: string;
+      editTitle: string;
+      stepWho: string;
+      stepHow: string;
+      stepExtra: string;
+      nameLabel: string;
+      namePlaceholder: string;
+      roleLabel: string;
+      connectionLabel: string;
+      modelLabel: string;
+      modelPlaceholder: string;
+      profileLabel: string;
+      profileHelp: string;
+      slotsLabel: string;
+      slotsHelp: string;
+      instructionsLabel: string;
+      instructionsPlaceholder: string;
+      modelLockedHint: string;
+      healthUnknownNote: string;
+      cancel: string;
+      create: string;
+      save: string;
+      created: string;
+      saved: string;
+    };
+    actions: {
+      edit: string;
+      remove: string;
+      restore: string;
+    };
+    remove: {
+      confirmTitle: string;
+      confirmBody: string;
+      confirm: string;
+      cancel: string;
+      removed: string;
+      restored: string;
+      blockedHint: string;
+    };
+    blockers: {
+      title: string;
+      CURRENT_TASK: string;
+      AGENT_BUSY: string;
+      REVIEWER_SESSION: string;
+      ACTIVE_ASSIGNMENT: string;
+      PENDING_AUTHORIZATION: string;
+      IN_FLIGHT_EXECUTION: string;
+      BUSY_WORKER_SLOT: string;
+      ACTIVE_ACCOUNT_LEASE: string;
+    };
+    errors: {
+      INVALID_INPUT: string;
+      AGENT_NOT_FOUND: string;
+      AGENT_ALREADY_REMOVED: string;
+      AGENT_NOT_REMOVED: string;
+      AGENT_HAS_ACTIVE_WORK: string;
+      PROFILE_ALREADY_IN_USE: string;
+      INTERNAL_ERROR: string;
+      DESKTOP_REQUIRED: string;
+      INVALID_RESPONSE: string;
+    };
+    details: {
+      model: string;
+      connection: string;
+      account: string;
+      slots: string;
+      noSlots: string;
+      profile: string;
+      instructions: string;
+    };
+  };
+  trash: {
+    title: string;
+    subtitle: string;
+    projectsHeading: string;
+    tasksHeading: string;
+    empty: string;
+    restore: string;
+    moveToTrash: string;
+    showTrash: string;
+    hideTrash: string;
+    inProject: string;
+    trashedAt: string;
+    projectSearch: string;
+    projectSearchPlaceholder: string;
+    taskSearch: string;
+    taskSearchPlaceholder: string;
+    noMatches: string;
+    projectListTitle: string;
+    open: string;
+    selected: string;
+    noProjects: string;
+    loadFailed: string;
+    confirm: {
+      projectTitle: string;
+      taskTitle: string;
+      body: string;
+      confirm: string;
+      cancel: string;
+    };
+    results: {
+      projectTrashed: string;
+      taskTrashed: string;
+      projectRestored: string;
+      taskRestored: string;
+      invalidated: string;
+    };
+    blockers: {
+      PROJECT_RUNNING: string;
+      TASK_ACTIVE_STATE: string;
+      ACTIVE_TASK_LEASE: string;
+      ACTIVE_ASSIGNMENT: string;
+      IN_FLIGHT_EXECUTION: string;
+      AGENT_ASSIGNED: string;
+    };
+    errors: {
+      INVALID_INPUT: string;
+      PROJECT_NOT_FOUND: string;
+      TASK_NOT_FOUND: string;
+      ALREADY_IN_TRASH: string;
+      NOT_IN_TRASH: string;
+      PROJECT_IN_TRASH: string;
+      HAS_ACTIVE_WORK: string;
+      INTERNAL_ERROR: string;
+      DESKTOP_REQUIRED: string;
+      INVALID_RESPONSE: string;
+    };
+  };
+  projectPlan: {
+    title: string;
+    subtitle: string;
+    noProject: string;
+    linesHelp: string;
+    goalRequired: string;
+    save: string;
+    saved: string;
+    advancedSummary: string;
+    advancedHelp: string;
+    jsonLabel: string;
+    saveJson: string;
+    jsonInvalid: string;
+    approval: {
+      title: string;
+      status: string;
+      needsPlan: string;
+      help: string;
+      approve: string;
+      approved: string;
+      alreadyApproved: string;
+      notApprovable: string;
+    };
+    fields: {
+      goal: {
+        label: string;
+        placeholder: string;
+      };
+      business_context: {
+        label: string;
+        placeholder: string;
+      };
+      acceptance_criteria: {
+        label: string;
+        placeholder: string;
+      };
+      definition_of_done: {
+        label: string;
+        placeholder: string;
+      };
+      testing_requirements: {
+        label: string;
+        placeholder: string;
+      };
+      technical_constraints: {
+        label: string;
+        placeholder: string;
+      };
+      architecture_constraints: {
+        label: string;
+        placeholder: string;
+      };
+      security_requirements: {
+        label: string;
+        placeholder: string;
+      };
+      non_goals: {
+        label: string;
+        placeholder: string;
+      };
+      owner_policies: {
+        label: string;
+        placeholder: string;
+      };
+    };
+  };
+  runtime: {
+    automationLabel: string;
+    statusUnavailable: string;
+    phases: {
+      PROJECT_NOT_RUNNING: string;
+      WAITING_FOR_MANAGER: string;
+      MANUAL_RELAY_REQUIRED: string;
+      WAITING_FOR_CAPACITY: string;
+      QUEUED: string;
+      EXECUTING: string;
+      AWAITING_REVIEW: string;
+      FAILED: string;
+    };
+    reasons: {
+      ACCOUNT_NOT_VERIFIED: string;
+      NO_CLI_CODER: string;
+      AUTOMATION_STOPPED: string;
+      PROVIDER_EXECUTION_FAILED: string;
+      GENERIC: string;
+    };
+    quota: {
+      title: string;
+      subtitle: string;
+      refresh: string;
+      refreshing: string;
+      empty: string;
+      failed: string;
+      remaining: string;
+      resetsAt: string;
+      observedAt: string;
+      status: {
+        OK: string;
+        UNAUTHENTICATED: string;
+        UNSUPPORTED: string;
+        UNAVAILABLE: string;
+        ERROR: string;
+      };
+    };
+  };
+  accountSignIn: {
+    button: string;
+    needed: string;
+    title: string;
+    starting: string;
+    instructions: string;
+    openPage: string;
+    copyCode: string;
+    copied: string;
+    waiting: string;
+    privacy: string;
+    signedIn: string;
+    close: string;
+    cancel: string;
+    states: {
+      FAILED: string;
+      CANCELLED: string;
+      TIMED_OUT: string;
+    };
+    errors: {
+      ACCOUNT_NOT_FOUND: string;
+      NOT_A_CODEX_ACCOUNT: string;
+      PROFILE_UNAVAILABLE: string;
+      CODEX_UNAVAILABLE: string;
+      LOGIN_ALREADY_IN_PROGRESS: string;
+      PROTOCOL_ERROR: string;
+      TIMEOUT: string;
+      SIGN_IN_UNAVAILABLE: string;
+      INVALID_RESPONSE: string;
+    };
   };
   agentCard: {
     noAssignedModel: string;
@@ -778,5 +1077,32 @@ export interface TranslationDictionary {
     settlementInProgressNotice: string;
     actionSuccessNotice: string;
     actionFailedNotice: string;
+  };
+  dashboardGuide: {
+    title: string;
+    setupComplete: string;
+    done: string;
+    notDone: string;
+    steps: {
+      createProject: { label: string; action: string };
+      addAgents: { label: string; action: string };
+      writePlan: { label: string; action: string };
+      approvePlan: { label: string; action: string };
+      addTasks: { label: string; action: string };
+      startProject: { label: string; action: string };
+    };
+    attentionTitle: string;
+    noAttention: string;
+    openTask: string;
+    openTaskLabel: string;
+    reasons: {
+      BLOCKED: string;
+      NEEDS_HUMAN: string;
+      HANDOFF_REQUIRED: string;
+      WAITING_FOR_CAPACITY: string;
+      WAITING_FOR_AUTHORITY: string;
+      FAILED: string;
+      FIX_REQUIRED: string;
+    };
   };
 }

@@ -26,19 +26,17 @@ import type { ProviderAdapter } from '../src/core/adapters/ProviderAdapter';
 import { performSafeCleanup } from './helpers/r5l1SyntheticFixture';
 
 /**
- * This is an executable characterization of the current R5L1 boundary.
+ * Executable characterization of the R5L1 product lifecycle.
  *
  * The setup intentionally seeds only provider configuration. The task,
- * Manager authority, route, ContextManifest, authorization, lease and
- * worktree are all produced by their real services. The current dispatch
- * implementation still routes assignment-bound authorizations through the
- * handoff-authority fence before reaching its context-hash check. The
- * assignment-bound authorization therefore rejects at that first durable
- * boundary; the durable manifest hash divergence is asserted explicitly so
- * the later hash blocker cannot be mistaken for a successful dispatch.
- * Keeping both boundaries explicit prevents a passing report from claiming
- * coder, submission, adjudication or reviewer stages that were never
- * exercised.
+ * Manager authority, attempt, route, ContextManifest, authorization, lease
+ * and worktree are all produced by their real services. Assignment-bound
+ * PRODUCT_BOUND authorizations are fenced by their own durable product
+ * authority (not the handoff fence), keep their durable manifest hash, and
+ * include the bound execution scope in the payload hash, so the real
+ * scheduler reaches the provider adapter exactly once and settles. Only the
+ * provider is synthetic; coder submission, adjudication and reviewer stages
+ * remain explicitly unexercised.
  */
 it('exercises real lifecycle setup and records the truthful context-hash dispatch boundary', async () => {
   const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'af-r5l1-boundary-'));
@@ -222,12 +220,24 @@ it('exercises real lifecycle setup and records the truthful context-hash dispatc
     expect(managerResult.success).toBe(true);
     expect(repo.getTask(task.id)?.state).toBe('CODING');
     expect(repo.getTask(task.id)?.base_sha).toBe(baseSha);
+    const agentProfileId = `agent-profile-${crypto.randomUUID()}`;
+    repo.createAgentProfile({
+      id: agentProfileId, role_profile_id: roleId, name: 'Synthetic coder profile', prompt_template: null,
+      config: null, enabled: true, created_at: now, updated_at: now,
+    });
+    const attemptId = `attempt-${crypto.randomUUID()}`;
+    repo.createTaskAttempt({
+      id: attemptId, task_id: task.id, attempt_number: 1, agent_id: null, agent_profile_id: agentProfileId,
+      status: 'RUNNING', started_at: new Date().toISOString(), ended_at: null, summary: null,
+    });
 
     // 2. Real routing creates the assignment and durable routing event.
     const routing = await new RoleAwareRoutingService(repo, registry, events).routeRole({
       projectId,
       taskId: task.id,
+      attemptId,
       roleProfileId: roleId,
+      agentProfileId,
       candidateRefs: [{ accountId, resourceId }],
       persistAssignment: true,
       allowManualBridge: false,
@@ -244,6 +254,7 @@ it('exercises real lifecycle setup and records the truthful context-hash dispatc
     const context = new ContextBuilderService(repo).buildContextSnapshot({
       projectId,
       taskId: task.id,
+      attemptId,
       assignmentId,
       contextFiles: ['README.md'],
       purpose: 'EXECUTION',
@@ -260,6 +271,7 @@ it('exercises real lifecycle setup and records the truthful context-hash dispatc
     const auth = await new ExecutionAuthorizationService(repo, events).createAuthorization({
       projectId,
       taskId: task.id,
+      attemptId,
       routingDecisionId: routing.decisionId,
       assignmentId,
       taskOwnershipEpoch: repo.getTask(task.id)!.ownership_epoch!,
@@ -313,12 +325,13 @@ it('exercises real lifecycle setup and records the truthful context-hash dispatc
     const result = await scheduler.execute(auth.id);
 
     if (process.platform === 'win32') {
-      expect(result.status).toBe('PROVIDER_FAILED');
-      expect(result.providerResult?.error).toContain('EXECUTION_AUTHORIZATION_INVALID:');
-      expect(result.providerResult?.error).toContain('No HandoffTransfer found');
-      expect(result.providerResult?.errorCode).toBe('RESOURCE_UNAVAILABLE');
-      expect(repo.getExecutionAuthorization(auth.id)?.status).toBe('INVALIDATED');
+      expect(result.status).toBe('COMPLETED');
+      expect(result.providerResult?.status).toBe('COMPLETED');
+      expect(repo.getExecutionAuthorization(auth.id)?.status).toBe('DISPATCHED');
       expect(result.workspaceOwnershipDigest).toMatch(/^[0-9a-f]{64}$/);
+      expect(adapterCalls).toBe(1);
+      expect(adapterRequest?.runtimeBinding?.assignmentId).toBe(assignmentId);
+      expect(adapterRequest?.runtimeBinding?.accountId).toBe(accountId);
     } else {
       expect(result.status).toBe('WORKTREE_CREATE_FAILED');
       expect(result.errorCode).toBe('UNSUPPORTED_MUTATION_BOUNDARY');
@@ -331,14 +344,17 @@ it('exercises real lifecycle setup and records the truthful context-hash dispatc
     expect(auth.context_manifest_hash).not.toBe(
       crypto.createHash('sha256').update(JSON.stringify(['README.md'])).digest('hex'),
     );
-    expect(adapterCalls).toBe(0);
-    expect(adapterRequest).toBeUndefined();
+    if (process.platform !== 'win32') {
+      expect(adapterCalls).toBe(0);
+      expect(adapterRequest).toBeUndefined();
+    }
     expect(result.assignmentId).toBe(assignmentId);
     expect(result.workerSlotId).toBe(workerSlotId);
     expect(result.leaseId).toBeTruthy();
     expect(repo.getAccountLease(result.leaseId!)?.released_at).toBeTruthy();
     expect(repo.getWorkerSlot(workerSlotId)?.status).toBe('IDLE');
-    expect(await worktrees.listPorcelain()).toHaveLength(1);
+    // A COMPLETED execution retains its managed worktree for review (main + 1).
+    expect(await worktrees.listPorcelain()).toHaveLength(process.platform === 'win32' ? 2 : 1);
 
     console.log(
       'R5L1_BOUNDARY',
@@ -357,7 +373,7 @@ it('exercises real lifecycle setup and records the truthful context-hash dispatc
         errorCode: result.errorCode ?? result.providerResult?.errorCode,
         adapterCalls,
         downstream: process.platform === 'win32'
-          ? 'NOT_EXERCISED: dispatch rejected before coder execution'
+          ? 'PROVIDER_SETTLED: synthetic provider only; submission/adjudication/review not exercised'
           : 'NOT_EXERCISED: native worktree boundary unavailable',
         coderWorktreeHeadBinding: 'NOT_EXERCISED: no coder output was produced',
         conditionalHandoff: 'NOT_EXERCISED',
