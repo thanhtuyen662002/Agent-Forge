@@ -15,6 +15,7 @@ import {
 } from '../types/domain';
 import { canonicalJsonStringify, computeSha256 } from '../context/ContextIntegrity';
 import { NonHandoffExecutionLifecycle, NON_HANDOFF_CLAIM_EVENT } from './NonHandoffExecutionLifecycle';
+import { DirectProductExecutionLifecycle, isProductAssignmentAuthorization } from './DirectProductExecutionLifecycle';
 
 function isValidIsoTimestamp(ts: any): boolean {
   if (typeof ts !== 'string' || ts.trim().length < 10) return false;
@@ -145,6 +146,8 @@ export class ExecutionRecoveryScanner {
             .some(key => Object.prototype.hasOwnProperty.call(metadata, key)))) {
           throw new Error(`HandoffTransfer for successor authorization "${auth.id}" not found.`);
         }
+        // Lifecycle-v1 product executions have their own durable receipts (#231).
+        if (isProductAssignmentAuthorization(this.repo, auth)) return new DirectProductExecutionLifecycle(this.repo).reconcile(auth);
         return new NonHandoffExecutionLifecycle(this.repo).reconcile(auth);
       }
 

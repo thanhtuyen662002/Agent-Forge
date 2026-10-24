@@ -245,6 +245,27 @@ sees only the files in the context manifest and can update existing files
 only (`docs/LOCAL_PROVIDER_WORKSPACES.md`). Large repositories that exceed the
 workspace bounds fail closed with a reason.
 
+## Restart recovery for automated executions
+
+At startup, `ExecutionRecoveryScanner` sends lifecycle-v1 product
+authorizations (assignment-bound, no handoff transfer) to
+`DirectProductExecutionLifecycle`. It acts only on exact durable receipts and
+records a `PRODUCT_EXECUTION_RECOVERY` event:
+
+| Durable state | Recovery |
+| --- | --- |
+| `AUTHORIZED` | Untouched; an owner may still dispatch it. Desktop automation expires only authorizations whose attempt it created (`desktop-automation` marker) when it starts. |
+| `DISPATCHED`, adapter start never claimed | Expired; lease and slot released through the guarded primitive; attempt and assignment `FAILED`. |
+| Adapter started, not settled | Stays fenced. A terminal `process_runs` row without a settlement is reported as *result missing*, never as success. |
+| Settled with verified product evidence | A lease and slot that the interrupted scheduler did not release are released. Tampered evidence is rejected and nothing is released. |
+
+Product settlement records the execution's `process_runs` truth
+(`process_run: { status, exit_code }`, or `null` when no native process
+started, for example an early adapter validation failure). It refuses to
+settle while that process is still `RUNNING`. A rejection after the dispatch
+claim but before the adapter start (status `DISPATCHED`, no start) is
+expired at runtime too, so the task is not blocked.
+
 ## Provider quota and account verification
 
 `AccountQuotaService` reads Codex usage through the official
