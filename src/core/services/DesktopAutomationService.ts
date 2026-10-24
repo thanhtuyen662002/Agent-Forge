@@ -13,6 +13,7 @@ import { ProviderDispatchService } from './ProviderDispatchService';
 import { ConcurrentExecutionScheduler } from './ConcurrentExecutionScheduler';
 import { WorkerSlotLeaseService } from './WorkerSlotLeaseService';
 import { resolveTrustedExecutable } from './ExecutableResolver';
+import { GitService } from './GitService';
 import type { Project, Task } from '../types/domain';
 import type { ManagedAgent } from '../types/workspace';
 import type { AutomationPhase, DesktopAutomationStatus, ProjectAutomationStatus } from '../types/desktopAutomation';
@@ -348,32 +349,60 @@ export class DesktopAutomationService {
         includeLatestHandoff: false,
       });
 
-      // 4. Immutable PRODUCT_BOUND authorization bound to all of the above.
+      // 4. Bind the worker slot now, so the authorized execution scope names the
+      // exact managed worktree the scheduler will create (GitWorktreeService
+      // derives it from the slot, base HEAD and epoch). Verification later may
+      // only run in that authorized worktree.
       const managedRoot = path.join(this.options.worktreeRoot, project.id);
       fs.mkdirSync(managedRoot, { recursive: true });
       const current = this.repo.getTask(task.id)!;
+      const slotId = this.chooseIdleSlot(coder);
+      if (!slotId || !this.repo.bindAgentAssignmentWorkerSlotIfUnbound(routing.selectedAssignmentId, slotId)) {
+        releaseUnclaimed();
+        fail('NO_IDLE_SLOT');
+        return;
+      }
+      const head = await GitService.getHeadSha(project.repository_path);
+      if (head.status !== 'SUCCESS' || !head.sha) {
+        releaseUnclaimed();
+        fail('REPOSITORY_HEAD_UNAVAILABLE');
+        return;
+      }
+      const worktrees = new GitWorktreeService({ gitExecutable, repositoryRoot: project.repository_path, managedRoot });
+      const epoch = current.ownership_epoch ?? 1;
+      const plannedWorktree = worktrees.deriveWorktreePath({
+        projectId: project.id, taskId: task.id, attemptId, assignmentId: routing.selectedAssignmentId,
+        workerSlotId: slotId, baseSha: head.sha, ownershipEpoch: epoch,
+      }).worktreePath;
+
+      // 5. Immutable PRODUCT_BOUND authorization bound to all of the above.
       const auth = await new ExecutionAuthorizationService(this.repo, this.eventService).createAuthorization({
         projectId: project.id,
         taskId: task.id,
         attemptId,
         routingDecisionId: routing.decisionId,
         assignmentId: routing.selectedAssignmentId,
-        taskOwnershipEpoch: current.ownership_epoch ?? 1,
+        taskOwnershipEpoch: epoch,
         contextManifestId: context.manifest.id,
         contextFiles,
         executionMode: 'PRODUCT_BOUND',
         executionScope: {
           branch: `agent/${task.id.toLowerCase()}`,
-          worktree: path.join(managedRoot, task.id),
+          worktree: plannedWorktree,
           allowedPaths: contextFiles,
           forbiddenPaths: ['.git'],
         },
       });
 
       authorizationId = auth.id;
+      if (auth.repository_head_sha.toLowerCase() !== head.sha.toLowerCase()) {
+        // HEAD moved between planning and authorization: the planned path is wrong.
+        releaseUnclaimed();
+        fail('REPOSITORY_HEAD_CHANGED');
+        return;
+      }
 
-      // 5. Lease, managed worktree, scheduled dispatch and settlement.
-      const worktrees = new GitWorktreeService({ gitExecutable, repositoryRoot: project.repository_path, managedRoot });
+      // 6. Lease, managed worktree, scheduled dispatch and settlement.
       const dispatch = new ProviderDispatchService(this.providerRegistry, this.repo, this.eventService, worktrees);
       const scheduler = new ConcurrentExecutionScheduler(this.repo, new WorkerSlotLeaseService(this.repo), worktrees, dispatch);
       const result = await scheduler.execute(auth.id);
@@ -396,6 +425,16 @@ export class DesktopAutomationService {
       const code = /^([A-Z_]+):/.exec(message.replace(/^EXECUTION_AUTHORIZATION_FAILED:\s*/, ''))?.[1] ?? 'PREPARATION_FAILED';
       fail(code);
     }
+  }
+
+  /** Same eligibility and ordering as WorkerSlotLeaseService fresh allocation. */
+  private chooseIdleSlot(coder: CoderCandidate): string | null {
+    const unreleased = new Set(this.repo.getUnreleasedAccountLeasesByAccount(coder.accountId).map((lease) => lease.worker_slot_id));
+    const eligible = this.repo.getWorkerSlotsByAccount(coder.accountId)
+      .filter((slot) => slot.status === 'IDLE' && !slot.current_assignment_id && !slot.current_execution_id &&
+        !unreleased.has(slot.id) && (slot.provider_resource_id === null || slot.provider_resource_id === coder.resourceId))
+      .sort((a, b) => (a.slot_index - b.slot_index) || a.id.localeCompare(b.id));
+    return eligible[0]?.id ?? null;
   }
 
   private contextEntries(repositoryPath: string): string[] {

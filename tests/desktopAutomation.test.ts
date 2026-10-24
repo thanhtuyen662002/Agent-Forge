@@ -174,8 +174,8 @@ describe('desktop automation runtime', () => {
     await service.drain();
 
     expect(adapterCalls).toBe(0);
-    const [auth] = repo.getExecutionAuthorizationsByTask(task.id);
-    expect(auth.status).toBe('INVALIDATED');
+    // The worktree service fails before an authorization exists; nothing may stay blocked.
+    expect(repo.getExecutionAuthorizationsByTask(task.id).every((a) => a.status === 'INVALIDATED')).toBe(true);
     expect(repo.getAgentAssignmentsByTask(task.id).map((a) => a.status)).toEqual(['FAILED']);
     const attempt = repo.getTaskAttemptsByTask(task.id).find((a) => !a.id.startsWith('old-'))!;
     expect(attempt).toMatchObject({ attempt_number: 4, status: 'FAILED' });
@@ -228,6 +228,11 @@ describe('desktop automation runtime', () => {
     expect(repo.getTaskAttemptsByTask(task.id).map((a) => a.status)).toEqual(['COMPLETED']);
     expect(repo.getAgentAssignmentsByTask(task.id).map((a) => a.status)).toEqual(['COMPLETED']);
     expect(statusOf()).toMatchObject({ phase: 'AWAITING_REVIEW', taskId: task.id });
+    // The authorized execution scope names the exact worktree the scheduler created and retained.
+    const scope = JSON.parse(auth.canonical_payload_json!).executionScope;
+    expect(fs.existsSync(scope.worktree)).toBe(true);
+    expect(path.basename(scope.worktree)).toMatch(/^afw-[0-9a-f]{32}$/);
+    expect(fs.existsSync(path.join(scope.worktree, 'README.md'))).toBe(true);
     expect(repo.getEventsByProject(projectId).some((e) => e.type === 'PRODUCT_EXECUTION_COMPLETED')).toBe(true);
 
     // A settled revision is never re-run.
