@@ -995,6 +995,11 @@ export abstract class LocalCliAdapterBase implements ProviderAdapter {
     this.artifactStore = artifactStore;
   }
 
+  /** The executable this adapter runs, so sign-in checks use exactly the same binary. */
+  public getExecutablePath(): string {
+    return this.executable;
+  }
+
   public setExecutable(executable: string): void {
     this.executable = executable;
   }

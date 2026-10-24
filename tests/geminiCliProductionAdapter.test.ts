@@ -790,10 +790,11 @@ describe('R5F0D1 — Production Gemini CLI Adapter Contract Suite', () => {
         'json',
         '--model',
         'gemini-1.5-pro',
-        '--sandbox',
         '--approval-mode',
-        'default',
+        'auto_edit',
       ]);
+      // Headless 'default' denies every edit, and --sandbox needs Docker (#242).
+      expect(log.argv).not.toContain('--sandbox');
 
       // No YOLO flag
       expect(log.argv).not.toContain('--yolo');

@@ -70,6 +70,8 @@ export interface OrchestratorApi {
   getTrash: () => Promise<any>;
   getAutomationStatus: () => Promise<any>;
   getManagerDecisions: (projectId: string) => Promise<any>;
+  startCliSignIn: (accountId: string) => Promise<any>;
+  verifyCliSignIn: (accountId: string) => Promise<any>;
   setManagerMode: (projectId: string, mode: string) => Promise<any>;
   decideManagerProposal: (projectId: string, eventId: string, approve: boolean) => Promise<any>;
   startCodexSignIn: (accountId: string) => Promise<any>;
@@ -202,6 +204,8 @@ const api: OrchestratorApi = {
   getTrash: () => ipcRenderer.invoke('trash:list'),
   getAutomationStatus: () => ipcRenderer.invoke('automation:status'),
   getManagerDecisions: (projectId: string) => ipcRenderer.invoke('automation:managerDecisions', { projectId }),
+  startCliSignIn: (accountId: string) => ipcRenderer.invoke('accounts:startCliSignIn', { accountId }),
+  verifyCliSignIn: (accountId: string) => ipcRenderer.invoke('accounts:verifyCliSignIn', { accountId }),
   setManagerMode: (projectId: string, mode: string) => ipcRenderer.invoke('automation:setManagerMode', { projectId, mode }),
   decideManagerProposal: (projectId: string, eventId: string, approve: boolean) =>
     ipcRenderer.invoke('automation:decideManagerProposal', { projectId, eventId, approve }),

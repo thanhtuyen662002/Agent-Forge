@@ -14,6 +14,7 @@ import { ElectronUpdaterAdapter } from './updaterAdapter';
 import { DesktopAutomationService } from '../core/services/DesktopAutomationService';
 import { AccountQuotaService } from '../core/services/AccountQuotaService';
 import { CodexAccountConnectionService } from '../core/services/CodexAccountConnectionService';
+import { CliAccountConnectionService } from '../core/services/CliAccountConnectionService';
 
 let mainWindow: BrowserWindow | null = null;
 let bootstrapInstance: BootstrapResult | null = null;
@@ -191,6 +192,17 @@ app.whenReady().then(() => {
     },
   });
 
+  // Claude Code and Gemini: the CLI's own browser sign-in, then its own check (#242).
+  const registryForSignIn = bootstrapInstance.providerRegistry;
+  const cliSignIn = new CliAccountConnectionService(bootstrapInstance.repo, {
+    // The check proves exactly the binary the adapter will run.
+    executableFor: (providerId) => {
+      const adapter = registryForSignIn.get(providerId) as { getExecutablePath?: () => string } | undefined;
+      return adapter?.getExecutablePath?.() ?? null;
+    },
+    onVerified: async () => { await automationForSignIn.tick(); },
+  });
+
   // Register Typed & Validated IPC Handlers
   registerIpcHandlers(
     bootstrapInstance.repo,
@@ -204,7 +216,7 @@ app.whenReady().then(() => {
     updateServiceInstance,
     undefined,
     navigationPolicy,
-    { automation: automationInstance, quota: quotaInstance, signIn: signInInstance },
+    { automation: automationInstance, quota: quotaInstance, signIn: signInInstance, cliSignIn },
   );
   automationInstance.start();
   quotaInstance.start();

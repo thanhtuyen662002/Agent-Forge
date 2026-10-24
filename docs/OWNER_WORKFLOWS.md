@@ -392,6 +392,50 @@ settle while that process is still `RUNNING`. A rejection after the dispatch
 claim but before the adapter start (status `DISPATCHED`, no start) is
 expired at runtime too, so the task is not blocked.
 
+## Claude Code and Gemini CLI agents
+
+Agent Center offers four connections: Manual Bridge, **Codex CLI**, **Claude
+Code CLI** and **Gemini CLI** (#242). Each agent gets its own account and its
+own profile directory, so any number of accounts per CLI can run side by side
+without sharing a login:
+
+| CLI | Profile variable | Coder run | Reviewer / Manager run |
+| --- | --- | --- | --- |
+| Codex | `CODEX_HOME` | `--sandbox workspace-write` | `--sandbox read-only` |
+| Claude Code | `CLAUDE_CONFIG_DIR` | `claude -p --output-format json --permission-mode acceptEdits --tools Read,Edit,Write,Glob,Grep` | `--permission-mode dontAsk --tools Read,Glob,Grep` |
+| Gemini | `GEMINI_CLI_HOME` | `--approval-mode auto_edit` | `--approval-mode plan` |
+
+All runs happen in the isolated provider workspace. Child processes get only a
+minimal environment, so host credentials such as `ANTHROPIC_API_KEY` never
+reach them. Permission-bypass flags are never used. Gemini no longer passes
+`--sandbox` (it needs Docker); headless `default` approval denied every edit.
+Claude runs with `--setting-sources user --strict-mcp-config`, so only the
+agent profile's own settings apply. Agent CLI project configuration
+(`.claude/`, `.gemini/`, `.codex/`, `.mcp.json`) is a policy-denied path. It is
+never copied into a workspace, and a run that creates it fails, because hooks,
+MCP servers or endpoint overrides in it could run commands or redirect
+credentials. Claude reports no `TEST_EXECUTION`, and Gemini no `TERMINAL` or
+`TEST_EXECUTION`: their headless modes have no shell.
+
+**Sign-in.** For a Claude Code or Gemini agent whose account is not verified
+yet, *Sign in* opens a terminal running the CLI's own sign-in with that
+agent's profile: `claude auth login`, or `gemini` and then *Sign in with
+Google*. After finishing in the browser, the owner presses *Check sign-in*.
+
+- **Claude:** the app runs `claude auth status`. Only a subscription login
+  (`claude.ai` or `oauth_token`) counts.
+- **Gemini:** the app checks that a cached login exists (presence only; it is
+  never read), then runs a one-line read-only prompt. Exit `41` means not
+  signed in.
+
+A verified, never-used account is initialized through `AccountHealthService`.
+Auth and usage-limit failures in runs are classified, for example Claude's
+*You've hit your session limit · resets …*, and never become success. Codex
+keeps its device-code sign-in. Checks use the adapter's own executable (npm
+`.cmd` shims run through the trusted `cmd.exe`) from an empty private
+directory. An account with a recorded failure (for example `AUTH_ERROR`) is not
+cleared by a sign-in check (follow-up #247).
+
 ## Provider quota and account verification
 
 `AccountQuotaService` reads Codex usage through the official

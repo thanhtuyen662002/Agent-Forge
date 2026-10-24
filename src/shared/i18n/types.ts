@@ -235,12 +235,14 @@ export interface TranslationDictionary {
       MANUAL_BRIDGE: string;
       CODEX_CLI: string;
       GEMINI_CLI: string;
+      CLAUDE_CODE_CLI: string;
       OTHER: string;
     };
     connectionHelp: {
       MANUAL_BRIDGE: string;
       CODEX_CLI: string;
       GEMINI_CLI: string;
+      CLAUDE_CODE_CLI: string;
       OTHER: string;
     };
     form: {
@@ -510,6 +512,33 @@ export interface TranslationDictionary {
         UNAVAILABLE: string;
         ERROR: string;
       };
+    };
+  };
+  cliSignIn: {
+    title: string;
+    step1: string;
+    step2: string;
+    step3: string;
+    open: string;
+    verify: string;
+    verifying: string;
+    opened: string;
+    privacy: string;
+    close: string;
+    reasons: {
+      VERIFIED: string;
+      NOT_SIGNED_IN: string;
+      NOT_A_SUBSCRIPTION_LOGIN: string;
+      VERIFY_FAILED: string;
+      ALREADY_IN_USE: string;
+    };
+    errors: {
+      ACCOUNT_NOT_FOUND: string;
+      NOT_A_SUPPORTED_CLI_ACCOUNT: string;
+      PROFILE_UNAVAILABLE: string;
+      CLI_UNAVAILABLE: string;
+      UNSUPPORTED_PLATFORM: string;
+      SIGN_IN_UNAVAILABLE: string;
     };
   };
   accountSignIn: {
