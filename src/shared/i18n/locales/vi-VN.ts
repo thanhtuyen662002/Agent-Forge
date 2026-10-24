@@ -506,6 +506,7 @@ export const viVN: TranslationDictionary = {
       revision: 'lần sửa {revision}',
       decisionEXECUTE: 'Cho lập trình viên bắt đầu',
       decisionBLOCK: 'Dừng và hỏi chủ dự án',
+      decisionPLAN: 'Tạo các nhiệm vụ này',
     },
     quota: {
       title: 'Hạn ngạch nhà cung cấp (chỉ đọc)',

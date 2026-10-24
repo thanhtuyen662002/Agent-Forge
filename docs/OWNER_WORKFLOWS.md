@@ -280,7 +280,19 @@ after five minutes, at most three times. The header then says the Manager
 could not decide, and the owner decides. Without a usable Manager agent the
 header says so. A Manager call interrupted by a restart is fenced like a
 review: its expired lease is released, nothing is applied, and the revision is
-asked again. Turning the contract into tasks is #245.
+asked again.
+
+**Planning (#245).** When a project is `RUNNING` with an approved contract and
+no tasks, a *Plan the project* task is created as the durable planning record.
+The Manager is asked, in the same read-only call, for a `plan.v1` breakdown:
+at most 20 tasks, each with a title, a description and acceptance criteria,
+bound to the project and to the SHA-256 of the exact contract. Tasks are
+created only through `TaskService.createTask`, and only if the contract hash
+still matches and no other tasks exist. The planning record then becomes
+`APPROVED` and is never dispatched; the Manager starts the first task next.
+In *approve each decision* mode the proposed task list is shown under *Manager
+decisions* first. A malformed plan, or a plan for another project or contract,
+creates nothing. Task-scoped context paths are follow-up #254.
 
 ## Automated verification after a completed coder run
 
