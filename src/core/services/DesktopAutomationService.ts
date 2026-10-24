@@ -4,7 +4,6 @@ import path from 'path';
 import { Repository } from '../database/repositories';
 import { EventService } from './EventService';
 import { ProviderRegistry } from '../adapters/ProviderRegistry';
-import { ProtocolParser } from '../protocol/parser';
 import { RoleAwareRoutingService } from './RoleAwareRoutingService';
 import { ContextBuilderService } from './ContextBuilderService';
 import { ExecutionAuthorizationService } from './ExecutionAuthorizationService';
@@ -18,6 +17,7 @@ import { TaskService } from './TaskService';
 import { VerificationService } from './VerificationService';
 import { AutomatedVerificationService, VERIFICATION_FAILED_EVENT, VERIFICATION_PASSED_EVENT, VERIFICATION_SKIPPED_EVENT } from './AutomatedVerificationService';
 import { ProductReviewService, type ReviewerCandidate } from './ProductReviewService';
+import { ProductManagerService, managerAuthorizesRevision, type PendingManagerDecision } from './ProductManagerService';
 import type { Project, Task } from '../types/domain';
 import type { ManagedAgent } from '../types/workspace';
 import type { AutomationPhase, DesktopAutomationStatus, ProjectAutomationStatus } from '../types/desktopAutomation';
@@ -49,7 +49,10 @@ export interface DesktopAutomationOptions {
   reviewHeartbeatMs?: number;
 }
 
-type InFlightKind = 'EXECUTION' | 'VERIFICATION' | 'REVIEW';
+type InFlightKind = 'EXECUTION' | 'VERIFICATION' | 'REVIEW' | 'MANAGER';
+type AutomationRole = 'CODER' | 'REVIEWER' | 'MANAGER';
+/** Capability an agent's adapter must report for each automated role. */
+const ROLE_CAPABILITY: Partial<Record<AutomationRole, string>> = { REVIEWER: 'REVIEW', MANAGER: 'PLANNING' };
 
 type ReviewWork = NonNullable<ReturnType<ProductReviewService['pendingReview']>>['work'];
 
@@ -82,6 +85,7 @@ export class DesktopAutomationService {
   private readonly lastFailure = new Map<string, { taskId: string; revision: number; reasonCode: string }>();
   private readonly verifier: AutomatedVerificationService | null;
   private readonly reviewer: ProductReviewService | null;
+  private readonly manager: ProductManagerService | null;
   /** Provider capabilities read on each pass; a reviewer needs an adapter that can REVIEW. */
   private readonly capabilities = new Map<string, readonly string[]>();
 
@@ -106,6 +110,15 @@ export class DesktopAutomationService {
       ? new ProductReviewService(repo, eventService, providerRegistry, options.taskService,
         { now: () => new Date(this.now()), heartbeatMs: options.reviewHeartbeatMs })
       : null;
+    this.manager = options.taskService
+      ? new ProductManagerService(repo, eventService, providerRegistry, options.taskService,
+        { now: () => new Date(this.now()), heartbeatMs: options.reviewHeartbeatMs })
+      : null;
+  }
+
+  /** The automated Manager, for the owner's approve/reject IPC (#239). */
+  public getManager(): ProductManagerService | null {
+    return this.manager;
   }
 
   public start(): void {
@@ -162,7 +175,8 @@ export class DesktopAutomationService {
       // Reviews interrupted by a previous process are fenced or released first.
       // A failure here is retried on the next pass and never stops dispatch.
       try { this.reviewer?.recoverAbandonedReviews(); } catch { /* next pass */ }
-      if (this.reviewer) await this.refreshCapabilities();
+      try { this.manager?.recoverAbandoned(); } catch { /* next pass */ }
+      if (this.reviewer || this.manager) await this.refreshCapabilities();
       for (const project of this.runnableProjects()) {
         if (this.inFlight.size >= this.maxConcurrent) break;
         if (this.inFlight.has(project.id)) continue;
@@ -184,6 +198,18 @@ export class DesktopAutomationService {
               .catch(() => undefined)
               .finally(() => this.inFlight.delete(project.id));
             this.inFlight.set(project.id, { kind: 'REVIEW', taskId: toReview.task.id, agentId: reviewer.agent.id, promise: review });
+            continue;
+          }
+        }
+        // A task without Manager authority for its revision asks the Manager agent first.
+        const toDecide = this.manager?.pendingDecision(project.id) ?? null;
+        if (toDecide && !toDecide.deferred) {
+          const manager = this.findAgent('MANAGER');
+          if (manager) {
+            const decide = this.runManager(project, toDecide, manager)
+              .catch(() => undefined)
+              .finally(() => this.inFlight.delete(project.id));
+            this.inFlight.set(project.id, { kind: 'MANAGER', taskId: toDecide.task.id, agentId: manager.agent.id, promise: decide });
             continue;
           }
         }
@@ -219,6 +245,7 @@ export class DesktopAutomationService {
     const running = this.inFlight.get(project.id);
     if (running) {
       if (running.kind === 'REVIEW') return status('REVIEWING', running.taskId);
+      if (running.kind === 'MANAGER') return status('DECIDING', running.taskId);
       return running.kind === 'VERIFICATION' || this.repo.getTask(running.taskId)?.state === 'VALIDATING'
         ? status('VERIFYING', running.taskId) : status('EXECUTING', running.taskId);
     }
@@ -242,10 +269,14 @@ export class DesktopAutomationService {
     }
     const eligible = authorized.find((task) => this.isDispatchable(task));
     if (!eligible) {
+      // A concrete Manager state first, then what sent the task back, then a missing Manager agent.
+      const waiting = this.managerWaitingReason(project);
+      if (waiting && waiting.reasonCode !== 'NO_MANAGER') return status('WAITING_FOR_MANAGER', waiting.taskId, waiting.reasonCode);
       const failedVerification = tasks.find((task) => this.verificationReason(task.id) === 'VERIFICATION_FAILED' && task.state === 'CODING');
       if (failedVerification) return status('WAITING_FOR_MANAGER', failedVerification.id, 'VERIFICATION_FAILED');
       const sentBack = tasks.find((task) => task.state === 'CODING' && this.reviewer?.reviewReason(task) === 'REVIEW_FIX_REQUIRED');
-      return status('WAITING_FOR_MANAGER', sentBack?.id ?? null, sentBack ? 'REVIEW_FIX_REQUIRED' : null);
+      if (sentBack) return status('WAITING_FOR_MANAGER', sentBack.id, 'REVIEW_FIX_REQUIRED');
+      return status('WAITING_FOR_MANAGER', waiting?.taskId ?? null, waiting?.reasonCode ?? null);
     }
     if (this.findAgent('CODER')) return status('QUEUED', eligible.id, this.isActive() ? null : 'AUTOMATION_STOPPED');
     if (this.hasUnverifiedCliCoder()) return status('WAITING_FOR_CAPACITY', eligible.id, 'ACCOUNT_NOT_VERIFIED');
@@ -261,18 +292,28 @@ export class DesktopAutomationService {
 
   /** CODING tasks whose latest applied Manager decision authorizes their current revision. */
   private authorizedTasks(project: Project): Task[] {
-    return this.repo.getTasksByProject(project.id).filter((task) => {
-      if (task.state !== 'CODING' || this.repo.isTaskTrashed(task.id)) return false;
-      const record = this.repo.getLatestAppliedManagerProtocolMessage(task.id, project.id);
-      if (!record?.raw_payload) return false;
-      const parsed = ProtocolParser.parse(String(record.raw_payload));
-      if (!parsed.success || parsed.data?.type !== 'manager.v1') return false;
-      const decision = parsed.data.data;
-      const expected = typeof decision.expected_revision === 'number' ? decision.expected_revision : null;
-      if (decision.decision === 'EXECUTE') return expected === task.revision_count;
-      if (decision.decision === 'FIX_REQUIRED') return expected !== null && expected + 1 === task.revision_count;
-      return false;
-    });
+    return this.repo.getTasksByProject(project.id).filter((task) =>
+      task.state === 'CODING' && !this.repo.isTaskTrashed(task.id) && managerAuthorizesRevision(this.repo, task));
+  }
+
+  /** Why work waits on the Manager: an open proposal, a failed Manager call, or no usable Manager agent. */
+  private managerWaitingReason(project: Project): { taskId: string; reasonCode: string } | null {
+    if (!this.manager) return null;
+    const known = this.manager.waitingReason(project.id);
+    if (known) return known;
+    const pending = this.manager.pendingDecision(project.id);
+    if (!pending) return null;
+    if (!pending.deferred && this.findAgent('MANAGER')) return null;
+    const hasManager = this.repo.getAllAgents().some((agent) => !agent.removed_at && (agent.role === 'PRIMARY_MANAGER' || agent.role === 'BACKUP_MANAGER'));
+    return { taskId: pending.task.id, reasonCode: hasManager ? 'MANAGER_NOT_AVAILABLE' : 'NO_MANAGER' };
+  }
+
+  private async runManager(project: Project, pending: PendingManagerDecision, manager: CoderCandidate): Promise<void> {
+    if (!this.manager) return;
+    await this.manager.decide(pending, {
+      agentId: manager.agent.id, agentProfileId: manager.agentProfileId, roleProfileId: manager.roleProfileId,
+      accountId: manager.accountId, resourceId: manager.resourceId,
+    }, this.manager.getMode(project.id));
   }
 
   private nextEligibleTask(project: Project): Task | null {
@@ -350,17 +391,19 @@ export class DesktopAutomationService {
    * that has a usable account and idle slot. A reviewer never uses the
    * account of the work it reviews.
    */
-  private findAgent(role: 'CODER' | 'REVIEWER', excludedAccountId: string | null = null): CoderCandidate | null {
+  private findAgent(role: AutomationRole, excludedAccountId: string | null = null): CoderCandidate | null {
     const reserved = new Set([...this.inFlight.values()].map((item) => item.agentId));
     for (const agent of this.repo.getAllAgents()) {
       if (reserved.has(agent.id)) continue;
-      if (agent.removed_at || agent.role !== role || agent.status === 'BUSY' || !agent.provider_resource_id || !agent.agent_profile_id) continue;
+      const roleMatches = role === 'MANAGER' ? agent.role === 'PRIMARY_MANAGER' || agent.role === 'BACKUP_MANAGER' : agent.role === role;
+      if (agent.removed_at || !roleMatches || agent.status === 'BUSY' || !agent.provider_resource_id || !agent.agent_profile_id) continue;
       const resource = this.repo.getProviderResource(agent.provider_resource_id);
       if (!resource?.enabled || !resource.provider_account_id) continue;
       if (resource.provider_account_id === excludedAccountId) continue;
       const provider = this.repo.getProvider(resource.provider_id);
       if (!provider?.enabled || provider.adapter_type !== 'LOCAL_CLI' || !this.providerRegistry.get(provider.id)) continue;
-      if (role === 'REVIEWER' && !this.capabilities.get(provider.id)?.includes('REVIEW')) continue;
+      const capability = ROLE_CAPABILITY[role];
+      if (capability && !this.capabilities.get(provider.id)?.includes(capability)) continue;
       const account = this.repo.getProviderAccount(resource.provider_account_id);
       if (!account?.enabled || !SCHEDULABLE_ACCOUNT_HEALTH.has(account.health_status)) continue;
       if (account.cooldown_until && Date.parse(account.cooldown_until) > Date.parse(this.now())) continue;
@@ -564,11 +607,11 @@ export class DesktopAutomationService {
     return typeof code === 'string' ? code : 'NOT_VERIFIED';
   }
 
-  /** Reads the capabilities of every provider a Reviewer agent uses; unknown means not capable. */
+  /** Reads the capabilities of every provider a Reviewer or Manager agent uses; unknown means not capable. */
   private async refreshCapabilities(): Promise<void> {
     const providerIds = new Set<string>();
     for (const agent of this.repo.getAllAgents()) {
-      if (agent.removed_at || agent.role !== 'REVIEWER' || !agent.provider_resource_id) continue;
+      if (agent.removed_at || !['REVIEWER', 'PRIMARY_MANAGER', 'BACKUP_MANAGER'].includes(agent.role) || !agent.provider_resource_id) continue;
       const resource = this.repo.getProviderResource(agent.provider_resource_id);
       if (resource) providerIds.add(resource.provider_id);
     }

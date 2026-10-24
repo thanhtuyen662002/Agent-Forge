@@ -18,6 +18,8 @@ export type AutomationPhase =
   | 'EXECUTING'
   /** The settled coder work is being verified in its worktree with the approved TEST command. */
   | 'VERIFYING'
+  /** An account-bound Manager agent is deciding whether and how the coder proceeds (#239). */
+  | 'DECIDING'
   /** An account-bound REVIEWER agent is reviewing the verified work (#233). */
   | 'REVIEWING'
   /** The coder execution settled COMPLETED and (when configured) verification passed; awaiting review. */

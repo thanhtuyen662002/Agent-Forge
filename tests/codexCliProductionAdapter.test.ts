@@ -1064,7 +1064,7 @@ describe('R5F0C3 — Production Codex CLI Adapter Contract Suite', () => {
       });
 
       const capabilities = await adapter.getCapabilities();
-      expect(capabilities).toEqual(['CODING', 'TERMINAL', 'FILESYSTEM_EDIT', 'TEST_EXECUTION', 'REVIEW']);
+      expect(capabilities).toEqual(['CODING', 'TERMINAL', 'FILESYSTEM_EDIT', 'TEST_EXECUTION', 'REVIEW', 'PLANNING']);
     });
   });
 });

@@ -447,6 +447,7 @@ export interface TranslationDictionary {
       MANUAL_RELAY_REQUIRED: string;
       WAITING_FOR_CAPACITY: string;
       QUEUED: string;
+      DECIDING: string;
       EXECUTING: string;
       VERIFYING: string;
       REVIEWING: string;
@@ -470,7 +471,26 @@ export interface TranslationDictionary {
       REVIEW_FAILED: string;
       REVIEW_STALE: string;
       REVIEW_INTERRUPTED: string;
+      NO_MANAGER: string;
+      MANAGER_NOT_AVAILABLE: string;
+      MANAGER_PROPOSAL_PENDING: string;
+      MANAGER_PROPOSAL_REJECTED: string;
+      MANAGER_FAILED: string;
       GENERIC: string;
+    };
+    managerPanel: {
+      title: string;
+      subtitle: string;
+      modeLabel: string;
+      modeAuto: string;
+      modeApprove: string;
+      empty: string;
+      approve: string;
+      reject: string;
+      failed: string;
+      revision: string;
+      decisionEXECUTE: string;
+      decisionBLOCK: string;
     };
     quota: {
       title: string;

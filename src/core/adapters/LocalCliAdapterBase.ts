@@ -1081,7 +1081,9 @@ export abstract class LocalCliAdapterBase implements ProviderAdapter {
     lines.push('OUTPUT REQUIREMENT:');
     lines.push(request.expectedProtocol === 'review.v1'
       ? 'Do not modify any file. Emit one valid JSON review.v1 object (protocol, message_id, project_id, task_id, task_revision, verdict PASS|FIX_REQUIRED|BLOCKED, summary, issues, reviewed_head_sha, reviewed_snapshot_sha) using the exact identifiers given above.'
-      : 'Emit a valid JSON coder.v1 protocol object conforming to the CoderProtocol schema upon task completion.');
+      : request.expectedProtocol === 'manager.v1'
+        ? 'Do not modify any file. Emit one valid JSON manager.v1 object (protocol, message_id, project_id, task_id, decision EXECUTE|BLOCK, instructions, expected_task_state, expected_revision) using the exact identifiers given above.'
+        : 'Emit a valid JSON coder.v1 protocol object conforming to the CoderProtocol schema upon task completion.');
 
     return lines.join('\n');
   }
@@ -1096,8 +1098,10 @@ export abstract class LocalCliAdapterBase implements ProviderAdapter {
     const executionId = request.runtimeBinding?.executionId ?? request.executionId ?? crypto.randomUUID();
     const rootLeases: RepositoryRootLease[] = [];
 
-    if (request.expectedProtocol === 'review.v1' && !(await this.getCapabilities()).includes('REVIEW')) {
-      return { executionId, status: 'FAILED', errorCode: 'UNSUPPORTED_CLIENT', error: 'UNSUPPORTED_CLIENT: this CLI adapter does not support read-only review.' };
+    // Read-only roles need an adapter that declares them (Gemini has no read-only mode here).
+    const requiredCapability = request.expectedProtocol === 'review.v1' ? 'REVIEW' : request.expectedProtocol === 'manager.v1' ? 'PLANNING' : null;
+    if (requiredCapability && !(await this.getCapabilities()).includes(requiredCapability)) {
+      return { executionId, status: 'FAILED', errorCode: 'UNSUPPORTED_CLIENT', error: `UNSUPPORTED_CLIENT: this CLI adapter does not support read-only ${requiredCapability.toLowerCase()}.` };
     }
 
     if (isScheduled) {
@@ -1479,6 +1483,16 @@ export abstract class LocalCliAdapterBase implements ProviderAdapter {
       }
 
       const parseResult = ProtocolParser.parse(protocolText);
+
+      if (request.expectedProtocol === 'manager.v1') {
+        // A Manager decision is advice for TaskService to validate; it never publishes the workspace.
+        if (!parseResult.success || parseResult.data?.type !== 'manager.v1') {
+          return { executionId: processResult.executionId, status: 'FAILED', errorCode: 'PROTOCOL_INVALID', rawResponse: processResult.stdout,
+            error: 'PROTOCOL_INVALID: Manager output was not a valid manager.v1 object.', stdoutEvidenceId: processResult.stdoutEvidenceId, stderrEvidenceId: processResult.stderrEvidenceId };
+        }
+        return { executionId: processResult.executionId, status: 'COMPLETED', outputProtocol: parseResult.rawJson, rawResponse: processResult.stdout,
+          stdoutEvidenceId: processResult.stdoutEvidenceId, stderrEvidenceId: processResult.stderrEvidenceId };
+      }
 
       if (parseResult.success && parseResult.data?.type === 'coder.v1') {
         if (control?.cancelRequested) {

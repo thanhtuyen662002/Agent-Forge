@@ -928,6 +928,40 @@ export function registerIpcHandlers(
     return { success: true, status: runtime.automation.getStatus() };
   });
 
+  // Automated Manager (#239): the owner's mode and decisions on its proposals.
+  const readProjectId = (payload: unknown) => {
+    const value = payload && typeof payload === 'object' ? (payload as { projectId?: unknown }).projectId : undefined;
+    return typeof value === 'string' && value.length > 0 && value.length <= 200 && repo.getProjectMetadata(value) ? value : null;
+  };
+  registerPrivilegedHandler('automation:managerDecisions', async (_, payload: unknown) => {
+    const manager = runtime.automation?.getManager();
+    const projectId = readProjectId(payload);
+    if (!manager) return { success: false, errorCode: 'AUTOMATION_UNAVAILABLE' };
+    if (!projectId) return { success: false, errorCode: 'PROJECT_NOT_FOUND' };
+    return sanitizeOutputValue({ success: true, mode: manager.getMode(projectId), proposals: manager.listProposals(projectId) });
+  });
+  registerPrivilegedHandler('automation:setManagerMode', async (_, payload: unknown) => {
+    const projectId = readProjectId(payload);
+    const mode = payload && typeof payload === 'object' ? (payload as { mode?: unknown }).mode : undefined;
+    if (!projectId) return { success: false, errorCode: 'PROJECT_NOT_FOUND' };
+    if (mode !== 'AUTO' && mode !== 'APPROVE') return { success: false, errorCode: 'MANAGER_MODE_INVALID' };
+    repo.setProjectManagerMode(projectId, mode);
+    void runtime.automation?.tick();
+    return { success: true, mode };
+  });
+  registerPrivilegedHandler('automation:decideManagerProposal', async (_, payload: unknown) => {
+    const manager = runtime.automation?.getManager();
+    const projectId = readProjectId(payload);
+    const body = payload && typeof payload === 'object' ? payload as { eventId?: unknown; approve?: unknown } : {};
+    if (!manager) return { success: false, errorCode: 'AUTOMATION_UNAVAILABLE' };
+    if (!projectId || typeof body.eventId !== 'string' || body.eventId.length > 200 || typeof body.approve !== 'boolean') {
+      return { success: false, errorCode: 'PROPOSAL_NOT_FOUND' };
+    }
+    const result = await manager.decideProposal(projectId, body.eventId, body.approve);
+    if (result.success) void runtime.automation?.tick();
+    return sanitizeOutputValue(result);
+  });
+
   registerPrivilegedHandler('quota:list', async () => {
     if (!runtime.quota) return { success: false, errorCode: 'QUOTA_UNAVAILABLE' };
     return sanitizeOutputValue({ success: true, observations: runtime.quota.getLatestObservations() });
