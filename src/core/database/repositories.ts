@@ -12516,4 +12516,25 @@ export class Repository {
       reason: `PENDING_APPLICATION: Effective head observation "${headAuth}" (order ${headOrder}) has not yet been applied to account watermark (order ${watermarkOrder}).`,
     };
   }
+
+  /** Persist quota observations without granting or updating health authority. */
+  public updateProviderResourceQuotaObservation(
+    id: string,
+    observation: {
+      remaining: number | null;
+      total: number | null;
+      unit: string;
+      resetAt: string | null;
+      source: ProviderResource['quota_source'];
+      confidence: number;
+    }
+  ): void {
+    this.db.prepare(`
+      UPDATE provider_resources
+      SET remaining_quota = ?, total_quota = ?, quota_unit = ?, quota_reset_at = ?,
+          quota_source = ?, quota_confidence = ?
+      WHERE id = ? AND (quota_source <> 'MANUAL' OR ? = 'MANUAL')
+    `).run(observation.remaining, observation.total, observation.unit, observation.resetAt,
+      observation.source, observation.confidence, id, observation.source);
+  }
 }
