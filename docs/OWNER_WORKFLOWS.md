@@ -265,11 +265,15 @@ It then moves the task only through `TaskService.transitionAuthorizedTask`:
 `REVIEW_READY`) on a pass, or `TESTS_FAILED` (back to `CODING` at the next
 revision, so the Manager must authorize again) on a failure or when the
 command could not run. Each result is an `AUTOMATION_VERIFICATION_*` event
-bound to the authorization. A run is verified once. Settled work left
-unverified by a restart is picked up on the next pass.
+bound to the authorization and to the work it tested: the worktree HEAD, a
+content snapshot of the uncommitted changes and the changed files. If the
+worktree changes while the command runs, the result is a failure
+(`WORKTREE_CHANGED_DURING_VERIFICATION`). A run is verified once. Settled work
+left unverified by a restart is picked up on the next pass.
 
 If no `TEST` command is approved, the task is not moved, and the header says
-the changes were not tested. Review stays with the existing Manager or owner
+the changes were not tested. Once the owner approves a `TEST` command, the same
+settled work is verified on the next pass. Review stays with the existing Manager or owner
 path (automated account-bound review is #233). Nothing is merged into the
 repository automatically.
 
