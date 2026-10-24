@@ -3,7 +3,7 @@ import { ProviderResource, Task } from '../../core/types/domain';
 import type { AgentRosterEntry, ManagedAgent } from '../../core/types/workspace';
 import { useI18n } from '../context/I18nContext';
 import { QuotaBadge } from './QuotaBadge';
-import { Bot, Terminal, Shield, ArrowUpRight, Pencil, Trash2, RotateCcw, Wrench } from 'lucide-react';
+import { Bot, Terminal, Shield, ArrowUpRight, Pencil, Trash2, RotateCcw, Wrench, LogIn } from 'lucide-react';
 
 interface AgentCardProps {
   agent: ManagedAgent;
@@ -16,6 +16,8 @@ interface AgentCardProps {
   onEdit?: () => void;
   onRemove?: () => void;
   onRestore?: () => void;
+  /** Offered for Codex CLI agents whose account is not yet proven signed in. */
+  onSignIn?: () => void;
 }
 
 export const AgentCard: React.FC<AgentCardProps> = ({
@@ -28,6 +30,7 @@ export const AgentCard: React.FC<AgentCardProps> = ({
   onEdit,
   onRemove,
   onRestore,
+  onSignIn,
 }) => {
   const { t } = useI18n();
   const removed = Boolean(agent.removed_at);
@@ -186,6 +189,18 @@ export const AgentCard: React.FC<AgentCardProps> = ({
             ))}
           </ul>
           <div className="text-amber-300/80">{t('agentCenter.remove.blockedHint')}</div>
+        </div>
+      )}
+
+      {!removed && onSignIn && entry?.connection === 'CODEX_CLI' && entry.account &&
+        (entry.account.healthStatus === 'UNKNOWN' || entry.account.healthStatus === 'AUTH_ERROR') && (
+        <div className="p-2.5 rounded-lg border border-forge-cyan/40 bg-forge-cyan/5 text-xs text-slate-200 flex items-center justify-between gap-3">
+          <span>{t('accountSignIn.needed')}</span>
+          <button type="button" onClick={onSignIn} disabled={actionsDisabled}
+            className="shrink-0 px-3 py-1.5 rounded-lg font-medium bg-forge-cyan text-slate-950 hover:bg-cyan-600 disabled:opacity-40 flex items-center gap-1.5">
+            <LogIn className="w-3.5 h-3.5" aria-hidden="true" />
+            <span>{t('accountSignIn.button')}</span>
+          </button>
         </div>
       )}
 

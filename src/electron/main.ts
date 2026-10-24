@@ -13,12 +13,14 @@ import { UpdateService } from '../core/services/UpdateService';
 import { ElectronUpdaterAdapter } from './updaterAdapter';
 import { DesktopAutomationService } from '../core/services/DesktopAutomationService';
 import { AccountQuotaService } from '../core/services/AccountQuotaService';
+import { CodexAccountConnectionService } from '../core/services/CodexAccountConnectionService';
 
 let mainWindow: BrowserWindow | null = null;
 let bootstrapInstance: BootstrapResult | null = null;
 let updateServiceInstance: UpdateService | null = null;
 let automationInstance: DesktopAutomationService | null = null;
 let quotaInstance: AccountQuotaService | null = null;
+let signInInstance: CodexAccountConnectionService | null = null;
 
 function createWindow(
   userDataDir: string,
@@ -174,6 +176,16 @@ app.whenReady().then(() => {
     { worktreeRoot: path.join(userDataDir, 'worktrees') },
   );
   quotaInstance = new AccountQuotaService(bootstrapInstance.repo, { initializeVerifiedAccounts: true });
+  const quotaForSignIn = quotaInstance;
+  const automationForSignIn = automationInstance;
+  signInInstance = new CodexAccountConnectionService(bootstrapInstance.repo, {
+    // A completed sign-in is verified by an authenticated quota read, which is
+    // the only path that may initialize the never-used account's health.
+    onSignedIn: async (accountId) => {
+      await quotaForSignIn.refreshAccount(accountId);
+      await automationForSignIn.tick();
+    },
+  });
 
   // Register Typed & Validated IPC Handlers
   registerIpcHandlers(
@@ -188,7 +200,7 @@ app.whenReady().then(() => {
     updateServiceInstance,
     undefined,
     navigationPolicy,
-    { automation: automationInstance, quota: quotaInstance },
+    { automation: automationInstance, quota: quotaInstance, signIn: signInInstance },
   );
   automationInstance.start();
   quotaInstance.start();
@@ -215,6 +227,7 @@ app.on('before-quit', () => {
   // durable fences and are reconciled by startup recovery if interrupted.
   automationInstance?.stop();
   quotaInstance?.stop();
+  signInInstance?.dispose();
   if (bootstrapInstance) {
     try {
       bootstrapInstance.dbEngine.close();

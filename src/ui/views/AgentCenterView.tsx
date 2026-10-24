@@ -4,6 +4,8 @@ import { useI18n } from '../context/I18nContext';
 import { AgentCard } from '../components/AgentCard';
 import { AccessibleDialog } from '../components/AccessibleDialog';
 import { useAgentRoster } from '../agentRoster';
+import { useAccountSignIn } from '../accountSignIn';
+import { SignInDialog } from '../components/SignInDialog';
 import type { AgentMutationResult } from '../agentRoster';
 import type { AgentRole } from '../../core/types/domain';
 import type { AgentConnectionKind, AgentRosterEntry } from '../../core/types/workspace';
@@ -49,6 +51,8 @@ export const AgentCenterView: React.FC = () => {
   const [confirmRemove, setConfirmRemove] = useState<AgentRosterEntry | null>(null);
   const [removeError, setRemoveError] = useState<AgentMutationResult | null>(null);
   const [notice, setNotice] = useState<Notice>(null);
+  const [signInEntry, setSignInEntry] = useState<AgentRosterEntry | null>(null);
+  const signIn = useAccountSignIn(async () => { await roster.reload(); await refreshData(); });
 
   const groups = useMemo(() => {
     const byRole = (roles: AgentRole[]) => roster.entries.filter((entry) => roles.includes(entry.agent.role));
@@ -238,6 +242,7 @@ export const AgentCenterView: React.FC = () => {
                   onEdit={() => openEdit(entry)}
                   onRemove={() => { setRemoveError(null); setConfirmRemove(entry); }}
                   onRestore={() => void restore(entry)}
+                  onSignIn={signIn.available && entry.account ? () => { setSignInEntry(entry); void signIn.start(entry.account!.id); } : undefined}
                 />
               ))}
             </div>
@@ -402,6 +407,17 @@ export const AgentCenterView: React.FC = () => {
             </form>
           </AccessibleDialog>
         </div>
+      )}
+
+      {signInEntry && signIn.view && (
+        <SignInDialog
+          agentName={signInEntry.agent.display_name}
+          view={signIn.view}
+          terminal={signIn.terminal}
+          onOpenPage={() => void signIn.openPage()}
+          onCancel={() => { void signIn.cancel(); setSignInEntry(null); }}
+          onClose={() => { signIn.close(); setSignInEntry(null); }}
+        />
       )}
 
       {confirmRemove && (

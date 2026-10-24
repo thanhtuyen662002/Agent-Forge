@@ -476,6 +476,37 @@ export interface TranslationDictionary {
       };
     };
   };
+  accountSignIn: {
+    button: string;
+    needed: string;
+    title: string;
+    starting: string;
+    instructions: string;
+    openPage: string;
+    copyCode: string;
+    copied: string;
+    waiting: string;
+    privacy: string;
+    signedIn: string;
+    close: string;
+    cancel: string;
+    states: {
+      FAILED: string;
+      CANCELLED: string;
+      TIMED_OUT: string;
+    };
+    errors: {
+      ACCOUNT_NOT_FOUND: string;
+      NOT_A_CODEX_ACCOUNT: string;
+      PROFILE_UNAVAILABLE: string;
+      CODEX_UNAVAILABLE: string;
+      LOGIN_ALREADY_IN_PROGRESS: string;
+      PROTOCOL_ERROR: string;
+      TIMEOUT: string;
+      SIGN_IN_UNAVAILABLE: string;
+      INVALID_RESPONSE: string;
+    };
+  };
   agentCard: {
     noAssignedModel: string;
     observableAction: string;

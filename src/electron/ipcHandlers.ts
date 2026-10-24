@@ -2,7 +2,7 @@ import { RepositoryRootLease } from '../core/services/RepositoryRootLease';
 import type { Evidence } from '../core/types/domain';
 import { OutputSanitizationError, redactSensitiveText, sanitizeOutputValue } from '../shared/security/secretRedaction';
 import { sanitizeErrorDiagnostics, sanitizedDiagnosticError } from '../shared/security/outputDiagnostics';
-import { ipcMain, dialog, app } from 'electron';
+import { ipcMain, dialog, app, shell } from 'electron';
 import { Repository } from '../core/database/repositories';
 import { ProjectService } from '../core/services/ProjectService';
 import { TaskService } from '../core/services/TaskService';
@@ -25,6 +25,7 @@ import { CommandParser } from '../core/services/CommandParser';
 import { WorkspaceManagementService } from '../core/services/WorkspaceManagementService';
 import type { DesktopAutomationService } from '../core/services/DesktopAutomationService';
 import type { AccountQuotaService } from '../core/services/AccountQuotaService';
+import type { CodexAccountConnectionService } from '../core/services/CodexAccountConnectionService';
 import {
   CreateProjectIpcSchema,
   BindProjectRepositoryIpcSchema,
@@ -131,7 +132,7 @@ export function registerIpcHandlers(
   updateService?: UpdateService,
   coderSubmissionAdjudicationService?: CoderSubmissionAdjudicationService,
   rendererPolicy: RendererNavigationPolicyOptions = resolveRendererNavigationPolicy({ isPackaged: false }),
-  runtime: { automation?: DesktopAutomationService; quota?: AccountQuotaService } = {},
+  runtime: { automation?: DesktopAutomationService; quota?: AccountQuotaService; signIn?: CodexAccountConnectionService } = {},
 ): void {
   const adjService =
     coderSubmissionAdjudicationService ||
@@ -938,6 +939,40 @@ export function registerIpcHandlers(
     // A newly verified account may make queued work schedulable.
     void runtime.automation?.tick();
     return sanitizeOutputValue({ success: true, observations });
+  });
+
+  // Optional Codex device-code sign-in into the account's isolated profile.
+  // The renderer only ever sees the one-time code and a session id; the
+  // verification page is opened from the URL held by the main process.
+  const readSessionId = (payload: unknown) => {
+    const value = payload && typeof payload === 'object' ? (payload as { sessionId?: unknown }).sessionId : undefined;
+    return typeof value === 'string' && value.length > 0 && value.length <= 128 ? value : null;
+  };
+  registerPrivilegedHandler('accounts:startCodexSignIn', async (_, payload: unknown) => {
+    if (!runtime.signIn) return { success: false, errorCode: 'SIGN_IN_UNAVAILABLE' };
+    const accountId = payload && typeof payload === 'object' ? (payload as { accountId?: unknown }).accountId : undefined;
+    if (typeof accountId !== 'string' || !accountId || accountId.length > 200) return { success: false, errorCode: 'ACCOUNT_NOT_FOUND' };
+    return runtime.signIn.startDeviceLogin(accountId);
+  });
+  registerPrivilegedHandler('accounts:codexSignInStatus', async (_, payload: unknown) => {
+    const sessionId = readSessionId(payload);
+    const status = runtime.signIn && sessionId ? runtime.signIn.getLoginStatus(sessionId) : null;
+    return status ? { success: true, status } : { success: false, errorCode: 'SESSION_NOT_FOUND' };
+  });
+  registerPrivilegedHandler('accounts:cancelCodexSignIn', async (_, payload: unknown) => {
+    const sessionId = readSessionId(payload);
+    if (!runtime.signIn || !sessionId) return { success: false, errorCode: 'SESSION_NOT_FOUND' };
+    runtime.signIn.cancelLogin(sessionId);
+    return { success: true };
+  });
+  registerPrivilegedHandler('accounts:openCodexSignInPage', async (_, payload: unknown) => {
+    const sessionId = readSessionId(payload);
+    const status = runtime.signIn && sessionId ? runtime.signIn.getLoginStatus(sessionId) : null;
+    if (!status || status.state !== 'WAITING_FOR_USER' || !status.verificationUrl) return { success: false, errorCode: 'SESSION_NOT_FOUND' };
+    const url = new URL(status.verificationUrl);
+    if (url.protocol !== 'https:') return { success: false, errorCode: 'PROTOCOL_ERROR' };
+    await shell.openExternal(url.toString());
+    return { success: true };
   });
 
   // Owner trash for projects and tasks: reversible, history-preserving.

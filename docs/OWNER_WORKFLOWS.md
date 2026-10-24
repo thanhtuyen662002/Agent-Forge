@@ -256,13 +256,19 @@ single health writer) promote a never-used `UNKNOWN` account to `AVAILABLE`,
 with an atomic identity check. It never clears a recorded failure or cooldown
 and records no success timestamp.
 
-To sign a Codex coder in until in-app sign-in exists, run this once in
-PowerShell, using the profile name from the agent card
-(`native-profile://codex/<name>`), then press **Refresh from provider**:
-
-```powershell
-$env:CODEX_HOME = "$env:LOCALAPPDATA\AgentForge\profiles\codex\<name>"; codex login
-```
+**Sign in a Codex coder.** A Codex CLI card whose account is `UNKNOWN` or
+`AUTH_ERROR` shows **Sign in**. It starts `codex app-server` with the agent's
+isolated profile as `CODEX_HOME` and requests `account/login/start` with type
+`chatgptDeviceCode`. The dialog shows only the one-time code. **Open sign-in
+page** asks the main process to open the verification URL it holds for that
+session; the URL is only accepted as `https` on an OpenAI host. Codex stores
+the credentials in the profile. Agent Forge never reads them, and the
+renderer never sees them. When `account/login/completed` reports success, the
+app runs an authenticated quota read, which initializes the account as
+described above, and nudges automation. Sign-in is optional, cancellable, and
+times out after 15 minutes. As an alternative you can run
+`codex login` yourself with `CODEX_HOME` set to
+`%LOCALAPPDATA%\AgentForge\profiles\codex\<name>`.
 
 ## Dashboard guidance
 
@@ -275,7 +281,6 @@ waiting, failed and fix-required tasks with a plain-language reason and an
 
 ## Not yet covered by this slice of Issue #225
 
-- In-app Codex device-code sign-in (use `codex login` with `CODEX_HOME` above).
 - Automatic verification, review and integration of a completed coder worktree.
 
 
