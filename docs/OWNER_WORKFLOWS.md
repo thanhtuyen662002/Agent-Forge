@@ -246,6 +246,42 @@ sees only the files in the context manifest and can update existing files
 only (`docs/LOCAL_PROVIDER_WORKSPACES.md`). Large repositories that exceed the
 workspace bounds fail closed with a reason.
 
+## Automated Manager decisions
+
+A **Manager** agent (role *Primary* or *Backup Manager*, Codex CLI, its own
+account) gives the coder its authority, so tasks run without pasted JSON
+(#239). `ProductManagerService` asks it when:
+
+- a task is `PLANNED` and has no Manager decision yet, or
+- a task is `CODING` at a revision that no Manager decision authorizes. This
+  happens after automated tests failed or the reviewer asked for fixes, and the
+  prompt then includes the review issues and the failed result.
+
+The call uses role-aware routing, a lease and a heartbeat. It runs read-only:
+no repository context is copied, and the CLI runs with `--sandbox read-only`.
+Gemini CLI cannot be a Manager. The answer must be a `manager.v1` object for
+exactly this task, its current state and revision, with decision `EXECUTE` (the
+coder starts with the Manager's instructions) or `BLOCK` (the owner decides).
+Review verdicts are never taken from the Manager. The provider's message id is
+replaced, so it can never replay an earlier decision.
+
+**Mode** (Dashboard → *Manager decisions*, per project):
+
+- **I approve each decision** (default): the proposal is shown with its
+  instructions. *Approve* re-checks that the task has not moved, then applies
+  the decision through `TaskService.applyManagerDecision`. *Reject* records the
+  rejection; that revision is not asked again.
+- **Manager decides automatically:** the decision is applied directly, through
+  the same validation.
+
+A malformed, disallowed, stale or other-task decision is recorded as
+`AUTOMATION_MANAGER_FAILED` and not retried. Provider failures are retried
+after five minutes, at most three times. The header then says the Manager
+could not decide, and the owner decides. Without a usable Manager agent the
+header says so. A Manager call interrupted by a restart is fenced like a
+review: its expired lease is released, nothing is applied, and the revision is
+asked again. Turning the contract into tasks is #245.
+
 ## Automated verification after a completed coder run
 
 When a coder execution settles `COMPLETED`, `AutomatedVerificationService`

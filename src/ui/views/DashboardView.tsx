@@ -6,6 +6,7 @@ import { ProgressIndicator } from '../components/ProgressIndicator';
 import { clampProgressPercent, validateQuotaSnapshot, quotaSourceLabel } from '../capacityTruth';
 import { getTaskStateCounts } from '../taskStatePresentation';
 import { getAttentionTasks, getSetupSteps } from '../dashboardGuide';
+import { ManagerDecisionsPanel } from '../components/ManagerDecisionsPanel';
 import {
   Activity,
   CheckCircle2,
@@ -127,6 +128,8 @@ export const DashboardView: React.FC = () => {
           </ul>
         )}
       </section>
+
+      {activeProject && <ManagerDecisionsPanel projectId={activeProject.id} />}
 
       <section aria-labelledby="dashboard-attention-title" className="bg-surface-card border border-surface-border rounded-2xl p-6 shadow-xl space-y-4">
         <h3 id="dashboard-attention-title" className="text-base font-semibold text-white flex items-center gap-2.5">

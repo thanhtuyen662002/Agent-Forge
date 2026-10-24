@@ -320,6 +320,35 @@ export class Repository {
   }
 
   /**
+   * Whether the automated Manager's decisions are applied directly (AUTO) or
+   * proposed for the owner's approval (APPROVE, the default and the fallback
+   * for missing or malformed values) (#239).
+   */
+  public getProjectManagerMode(projectId: string): 'AUTO' | 'APPROVE' {
+    const row = this.db
+      .prepare('SELECT value_json FROM project_settings WHERE project_id = ? AND key = ?')
+      .get(projectId, 'automation.manager_mode') as { value_json?: unknown } | undefined;
+    try {
+      return typeof row?.value_json === 'string' && JSON.parse(row.value_json) === 'AUTO' ? 'AUTO' : 'APPROVE';
+    } catch {
+      return 'APPROVE';
+    }
+  }
+
+  public setProjectManagerMode(projectId: string, mode: 'AUTO' | 'APPROVE'): 'AUTO' | 'APPROVE' {
+    if (mode !== 'AUTO' && mode !== 'APPROVE') throw new Error('MANAGER_MODE_INVALID: value must be AUTO or APPROVE.');
+    if (!this.getProject(projectId)) throw new Error(`Project "${projectId}" not found.`);
+    this.db
+      .prepare(`
+        INSERT INTO project_settings (project_id, key, value_json)
+        VALUES (?, 'automation.manager_mode', ?)
+        ON CONFLICT(project_id, key) DO UPDATE SET value_json = excluded.value_json
+      `)
+      .run(projectId, JSON.stringify(mode));
+    return mode;
+  }
+
+  /**
    * Persists the project-scoped revision ceiling atomically and only after
    * validating its bounded integer domain.
    */

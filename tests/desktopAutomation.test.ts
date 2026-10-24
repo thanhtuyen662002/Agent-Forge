@@ -37,6 +37,8 @@ describe('desktop automation runtime', () => {
   let registry: ProviderRegistry;
   let adapterCalls: number;
   let reviewRequests: AgentExecutionRequest[];
+  let managerRequests: AgentExecutionRequest[];
+  let managerReply: (request: AgentExecutionRequest) => AgentExecutionResult | Promise<AgentExecutionResult>;
   let reviewReply: (request: AgentExecutionRequest) => AgentExecutionResult | Promise<AgentExecutionResult>;
   let projectId: string;
   let service: DesktopAutomationService;
@@ -45,7 +47,7 @@ describe('desktop automation runtime', () => {
   const fakeTimer = { setInterval: () => 'handle', clearInterval: () => undefined };
 
   let healthy: boolean;
-  const synthetic = (id: string, capabilities: Array<'CODING' | 'REVIEW'> = ['CODING', 'REVIEW']): ProviderAdapter => ({
+  const synthetic = (id: string, capabilities: Array<'CODING' | 'REVIEW' | 'PLANNING'> = ['CODING', 'REVIEW', 'PLANNING']): ProviderAdapter => ({
     id,
     name: 'Synthetic CLI coder',
     adapterType: 'LOCAL_CLI',
@@ -56,6 +58,10 @@ describe('desktop automation runtime', () => {
       if (request.expectedProtocol === 'review.v1') {
         reviewRequests.push(request);
         return reviewReply(request);
+      }
+      if (request.expectedProtocol === 'manager.v1') {
+        managerRequests.push(request);
+        return managerReply(request);
       }
       adapterCalls += 1;
       return { executionId: request.runtimeBinding?.executionId ?? 'x', status: 'COMPLETED', outputProtocol: 'coder.v1', rawResponse: 'Synthetic coder result' };
@@ -104,6 +110,8 @@ describe('desktop automation runtime', () => {
     healthy = true;
     reviewRequests = [];
     reviewReply = () => { throw new Error('no review expected'); };
+    managerRequests = [];
+    managerReply = () => { throw new Error('no Manager call expected'); };
 
     const now = new Date().toISOString();
     projectId = `project-${crypto.randomUUID()}`;
@@ -669,5 +677,283 @@ describe('desktop automation runtime', () => {
       expect(repo.getTask(task.id)!.state).toBe('REVIEWING');
       expect(repo.getReviewsByTask(task.id)).toEqual([]);
     }, 120_000);
+  });
+  describe('account-bound automated Manager (#239)', () => {
+    let clock = 0;
+    const managedService = () => new DesktopAutomationService(repo, events, registry, {
+      worktreeRoot: path.join(tempDir, 'worktrees'), timer: fakeTimer, taskService: tasks, verificationService: verification,
+      now: () => new Date(Date.now() + clock).toISOString(),
+    });
+    beforeEach(() => { clock = 0; });
+    const plannedTask = () => tasks.createTask({ projectId, title: 'Add a greeting', description: 'Manager test', priority: 'LOW', risk: 'LOW',
+      acceptanceCriteria: ['Greeting exists'], constraints: [] });
+    const addAgent = (role: 'PRIMARY_MANAGER' | 'REVIEWER', connection: 'CODEX_CLI' | 'GEMINI_CLI' = 'CODEX_CLI') => {
+      const created = new WorkspaceManagementService(repo).createAgent({
+        displayName: `${role} ${connection}`, role, connection, modelName: connection === 'CODEX_CLI' ? 'gpt-5-codex' : 'gemini-2.5-pro', workerSlots: 1,
+      });
+      expect(created.success).toBe(true);
+      verify(created);
+      return created;
+    };
+    /** A manager.v1 answer bound to the task as it is when the Manager runs. */
+    const decision = (value: string, overrides: Record<string, unknown> = {}) => (request: AgentExecutionRequest): AgentExecutionResult => {
+      const task = repo.getTask(request.taskId)!;
+      return {
+        executionId: request.runtimeBinding?.executionId ?? 'x', status: 'COMPLETED',
+        outputProtocol: JSON.stringify({
+          protocol: 'manager.v1', message_id: 'reused-provider-id', project_id: projectId, task_id: task.id, decision: value,
+          instructions: [`Do revision ${task.revision_count}`], expected_task_state: task.state, expected_revision: task.revision_count, ...overrides,
+        }),
+      };
+    };
+    const eventsOf = (type: string) => repo.getEventsByProject(projectId).filter((e) => e.type === type);
+    const pass = async () => { await service.tick(); await service.drain(); };
+
+    it('says a Manager agent is missing for a planned task and never dispatches it', async () => {
+      const task = plannedTask();
+      service = managedService();
+      await pass();
+      expect(repo.getTask(task.id)!.state).toBe('PLANNED');
+      expect(statusOf()).toMatchObject({ phase: 'WAITING_FOR_MANAGER', taskId: task.id, reasonCode: 'NO_MANAGER' });
+    });
+
+    it('proposes in approve mode (the default) and applies only after the owner approves', async () => {
+      addAgent('PRIMARY_MANAGER');
+      managerReply = decision('EXECUTE');
+      const task = plannedTask();
+      service = managedService();
+      await pass();
+
+      expect(managerRequests).toHaveLength(1);
+      expect(managerRequests[0].contextFiles).toEqual([]);
+      expect(repo.getTask(task.id)!.state).toBe('PLANNED');
+      expect(statusOf()).toMatchObject({ phase: 'WAITING_FOR_MANAGER', taskId: task.id, reasonCode: 'MANAGER_PROPOSAL_PENDING' });
+      const [proposal] = service.getManager()!.listProposals(projectId);
+      expect(proposal).toMatchObject({ taskId: task.id, decision: 'EXECUTE', instructions: ['Do revision 0'] });
+      await pass();
+      expect(managerRequests).toHaveLength(1); // An open proposal is never asked again.
+
+      expect(await service.getManager()!.decideProposal(projectId, proposal.eventId, true)).toEqual({ success: true });
+      expect(repo.getTask(task.id)!.state).toBe('CODING');
+      expect(await service.getManager()!.decideProposal(projectId, proposal.eventId, true)).toMatchObject({ success: false, errorCode: 'PROPOSAL_ALREADY_DECIDED' });
+    });
+
+    it('records a rejected proposal and does not ask the Manager again for that revision', async () => {
+      addAgent('PRIMARY_MANAGER');
+      managerReply = decision('EXECUTE');
+      const task = plannedTask();
+      service = managedService();
+      await pass();
+      const [proposal] = service.getManager()!.listProposals(projectId);
+      expect(await service.getManager()!.decideProposal(projectId, proposal.eventId, false)).toEqual({ success: true });
+      await pass();
+
+      expect(managerRequests).toHaveLength(1);
+      expect(repo.getTask(task.id)!.state).toBe('PLANNED');
+      expect(statusOf()).toMatchObject({ reasonCode: 'MANAGER_PROPOSAL_REJECTED' });
+    });
+
+    it('refuses to apply a proposal the task has moved past', async () => {
+      addAgent('PRIMARY_MANAGER');
+      managerReply = decision('EXECUTE');
+      const task = plannedTask();
+      service = managedService();
+      await pass();
+      const [proposal] = service.getManager()!.listProposals(projectId);
+      const manual = { protocol: 'manager.v1' as const, message_id: `owner-${crypto.randomUUID()}`, project_id: projectId, task_id: task.id,
+        decision: 'EXECUTE' as const, priority: 'LOW' as const, risk: 'LOW' as const, instructions: ['Owner start'], acceptance_criteria: [],
+        constraints: [], review_issues: [], expected_task_state: 'PLANNED' as const, expected_revision: 0 };
+      expect((await tasks.applyManagerDecision(manual, JSON.stringify(manual))).success).toBe(true);
+
+      expect(await service.getManager()!.decideProposal(projectId, proposal.eventId, true)).toMatchObject({ success: false });
+      expect(repo.getTask(task.id)!.state).toBe('CODING');
+    });
+
+    it.each([
+      ['a disallowed verdict', decision('PASS'), 'MANAGER_DECISION_NOT_ALLOWED'],
+      ['BLOCK for a task that has not started', decision('BLOCK'), 'MANAGER_DECISION_NOT_ALLOWED'],
+      ['a stale revision', decision('EXECUTE', { expected_revision: 4 }), 'MANAGER_DECISION_STALE'],
+      ['another task', decision('EXECUTE', { task_id: 'TSK-OTHER' }), 'MANAGER_DECISION_FOR_OTHER_TASK'],
+      ['malformed output', (request: AgentExecutionRequest): AgentExecutionResult => ({ executionId: request.runtimeBinding!.executionId!, status: 'COMPLETED', outputProtocol: '{"protocol":"coder.v1"}' }), 'MANAGER_PROTOCOL_INVALID'],
+    ])('never applies %s and does not retry it', async (_name, reply, reasonCode) => {
+      addAgent('PRIMARY_MANAGER');
+      repo.setProjectManagerMode(projectId, 'AUTO');
+      managerReply = reply;
+      const task = plannedTask();
+      service = managedService();
+      await pass();
+      clock = 10 * 60_000;
+      await pass();
+
+      expect(managerRequests).toHaveLength(1);
+      expect(repo.getTask(task.id)!.state).toBe('PLANNED');
+      expect(eventsOf('AUTOMATION_MANAGER_FAILED')[0].structured_payload).toMatchObject({ reasonCode, retryable: false });
+      expect(statusOf()).toMatchObject({ reasonCode: 'MANAGER_FAILED' });
+    });
+
+    it('retries a provider failure after a delay, at most three times', async () => {
+      addAgent('PRIMARY_MANAGER');
+      repo.setProjectManagerMode(projectId, 'AUTO');
+      managerReply = (request) => ({ executionId: request.runtimeBinding!.executionId!, status: 'FAILED', errorCode: 'QUOTA_EXHAUSTED' });
+      const task = plannedTask();
+      service = managedService();
+      await pass();
+      await pass();
+      expect(managerRequests).toHaveLength(1); // Inside the retry delay.
+      for (let attempt = 1; attempt <= 4; attempt += 1) { clock = attempt * 6 * 60_000; await pass(); }
+
+      expect(managerRequests).toHaveLength(3);
+      expect(repo.getTask(task.id)!.state).toBe('PLANNED');
+      expect(statusOf()).toMatchObject({ reasonCode: 'MANAGER_FAILED' });
+    });
+
+    it('honours a switch to approve mode made while the Manager was deciding', async () => {
+      addAgent('PRIMARY_MANAGER');
+      repo.setProjectManagerMode(projectId, 'AUTO');
+      let finish: (result: AgentExecutionResult) => void = () => undefined;
+      managerReply = () => new Promise((resolve) => { finish = resolve; });
+      const task = plannedTask();
+      service = managedService();
+      void service.tick();
+      await vi.waitFor(() => expect(managerRequests).toHaveLength(1), { timeout: 30_000 });
+      repo.setProjectManagerMode(projectId, 'APPROVE');
+      finish(decision('EXECUTE')(managerRequests[0]));
+      await service.drain();
+
+      expect(repo.getTask(task.id)!.state).toBe('PLANNED');
+      expect(service.getManager()!.listProposals(projectId)).toHaveLength(1);
+    });
+
+    it('never applies an answer that arrives after the call lost its lease', async () => {
+      addAgent('PRIMARY_MANAGER');
+      repo.setProjectManagerMode(projectId, 'AUTO');
+      let finish: (result: AgentExecutionResult) => void = () => undefined;
+      managerReply = () => new Promise((resolve) => { finish = resolve; });
+      const task = plannedTask();
+      service = managedService();
+      void service.tick();
+      await vi.waitFor(() => expect(managerRequests).toHaveLength(1), { timeout: 30_000 });
+      clock = 10 * 60_000; // e.g. the machine slept: the lease expired without a heartbeat.
+      finish(decision('EXECUTE')(managerRequests[0]));
+      await service.drain();
+
+      expect(repo.getTask(task.id)!.state).toBe('PLANNED');
+      expect(eventsOf('AUTOMATION_MANAGER_FAILED')[0].structured_payload).toMatchObject({ reasonCode: 'MANAGER_LEASE_OR_FENCE_LOST', retryable: true });
+    });
+
+    it('decides a proposal exactly once when Approve and Reject race', async () => {
+      addAgent('PRIMARY_MANAGER');
+      managerReply = decision('EXECUTE');
+      const task = plannedTask();
+      service = managedService();
+      await pass();
+      const [proposal] = service.getManager()!.listProposals(projectId);
+      const results = await Promise.all([
+        service.getManager()!.decideProposal(projectId, proposal.eventId, true),
+        service.getManager()!.decideProposal(projectId, proposal.eventId, false),
+      ]);
+
+      expect(results.filter((result) => result.success)).toHaveLength(1);
+      expect(eventsOf('AUTOMATION_MANAGER_PROPOSAL_CLAIMED')).toHaveLength(1);
+      const applied = eventsOf('AUTOMATION_MANAGER_APPLIED').length;
+      const rejected = eventsOf('AUTOMATION_MANAGER_REJECTED').length;
+      expect(applied + rejected).toBe(1);
+      expect(repo.getTask(task.id)!.state).toBe(applied === 1 ? 'CODING' : 'PLANNED');
+    });
+
+    it('does not let a task waiting to retry block the Manager for other tasks', async () => {
+      addAgent('PRIMARY_MANAGER');
+      repo.setProjectManagerMode(projectId, 'AUTO');
+      const first = plannedTask();
+      const second = tasks.createTask({ projectId, title: 'Second task', description: null, priority: 'LOW', risk: 'LOW', acceptanceCriteria: ['x'], constraints: [] });
+      const execute = decision('EXECUTE');
+      managerReply = (request) => request.taskId === first.id
+        ? { executionId: request.runtimeBinding!.executionId!, status: 'FAILED', errorCode: 'QUOTA_EXHAUSTED' }
+        : execute(request);
+      service = managedService();
+      await pass();
+      await pass();
+
+      expect(managerRequests.map((request) => request.taskId)).toEqual([first.id, second.id]);
+      expect(repo.getTask(second.id)!.state).toBe('CODING');
+      // The second task now waits for a coder; the first waits out its retry delay.
+      expect(service.getManager()!.pendingDecision(projectId)).toMatchObject({ task: { id: first.id }, deferred: true });
+    });
+
+    it('does not use a Manager whose CLI cannot manage', async () => {
+      registry.register(synthetic('prov-gemini-cli', ['CODING']));
+      addAgent('PRIMARY_MANAGER', 'GEMINI_CLI');
+      const task = plannedTask();
+      service = managedService();
+      await pass();
+      expect(managerRequests).toHaveLength(0);
+      expect(statusOf()).toMatchObject({ taskId: task.id, reasonCode: 'MANAGER_NOT_AVAILABLE' });
+    });
+
+    it('fences an interrupted Manager call on restart and asks again, never inferring a decision', async () => {
+      addAgent('PRIMARY_MANAGER');
+      repo.setProjectManagerMode(projectId, 'AUTO');
+      let finishHung: (result: AgentExecutionResult) => void = () => undefined;
+      managerReply = () => new Promise((resolve) => { finishHung = resolve; });
+      const task = plannedTask();
+      const first = managedService();
+      service = first;
+      void first.tick();
+      await vi.waitFor(() => expect(managerRequests).toHaveLength(1), { timeout: 30_000 });
+      expect(first.getStatus().projects.find((p) => p.projectId === projectId)).toMatchObject({ phase: 'DECIDING', taskId: task.id });
+      const attempt = repo.getTaskAttemptsByTask(task.id).find((a) => a.summary === 'desktop-manager')!;
+
+      clock = 10 * 60_000;
+      managerReply = decision('EXECUTE');
+      const restarted = managedService();
+      service = restarted;
+      onTestFinished(() => finishHung({ executionId: 'x', status: 'CANCELLED', errorCode: 'CANCELLED' }));
+      await restarted.tick();
+      await restarted.drain();
+
+      expect(repo.getTaskAttempt(attempt.id)!.status).toBe('FAILED');
+      expect(eventsOf('AUTOMATION_MANAGER_INTERRUPTED')).toHaveLength(1);
+      expect(managerRequests).toHaveLength(2);
+      expect(repo.getTask(task.id)!.state).toBe('CODING');
+      finishHung(decision('BLOCK')(managerRequests[0]));
+      await first.drain();
+      expect(repo.getTask(task.id)!.state).toBe('CODING'); // The old call's late answer changed nothing.
+    }, 60_000);
+
+    it.runIf(process.platform === 'win32')('runs a planned task to DONE through Manager, coder, tests and a FIX review without pasted JSON', async () => {
+      verify(addCodexCoder());
+      addAgent('REVIEWER');
+      addAgent('PRIMARY_MANAGER');
+      repo.setProjectManagerMode(projectId, 'AUTO');
+      fs.writeFileSync(path.join(repoDir, 'verify.js'), 'process.exit(0);\n', 'utf8');
+      git('add', 'verify.js');
+      git('commit', '-m', 'add verification script');
+      repo.createVerificationCommand({
+        id: `vc-${crypto.randomUUID()}`, project_id: projectId, name: 'Fixture test', command_type: 'TEST',
+        ...await approveFixtureCommand(repo, projectId, ['verify.js']), timeout_ms: 60_000, enabled: true,
+      });
+      managerReply = decision('EXECUTE');
+      let reviews = 0;
+      reviewReply = (request) => {
+        const verified = repo.getEventsByProject(projectId).filter((e) => e.type === 'AUTOMATION_VERIFICATION_PASSED').at(-1)!.structured_payload as any;
+        const value = reviews++ === 0 ? 'FIX_REQUIRED' : 'PASS';
+        return { executionId: request.runtimeBinding!.executionId!, status: 'COMPLETED', outputProtocol: JSON.stringify({
+          protocol: 'review.v1', message_id: `review-${crypto.randomUUID()}`, project_id: projectId, task_id: request.taskId,
+          task_revision: repo.getTask(request.taskId)!.revision_count, verdict: value, summary: 'Synthetic review',
+          issues: value === 'FIX_REQUIRED' ? [{ severity: 'REQUIRED', title: 'Missing greeting', description: 'README has no greeting.' }] : [],
+          reviewed_head_sha: verified.headSha, reviewed_snapshot_sha: verified.snapshotSha,
+        }) };
+      };
+      const task = plannedTask();
+      service = managedService();
+      for (let i = 0; i < 8 && repo.getTask(task.id)!.state !== 'DONE'; i += 1) await pass();
+
+      expect(repo.getTask(task.id)!.state).toBe('DONE');
+      expect(managerRequests).toHaveLength(2);
+      expect(managerRequests[1].instructions.join('\n')).toContain('Missing greeting');
+      expect(adapterCalls).toBe(2);
+      expect(eventsOf('AUTOMATION_MANAGER_APPLIED')).toHaveLength(2);
+      expect(repo.getReviewsByTask(task.id).map((review) => review.verdict).sort()).toEqual(['FIX_REQUIRED', 'PASS']);
+    }, 240_000);
   });
 });

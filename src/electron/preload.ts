@@ -69,6 +69,9 @@ export interface OrchestratorApi {
   restoreAgent: (agentId: string) => Promise<any>;
   getTrash: () => Promise<any>;
   getAutomationStatus: () => Promise<any>;
+  getManagerDecisions: (projectId: string) => Promise<any>;
+  setManagerMode: (projectId: string, mode: string) => Promise<any>;
+  decideManagerProposal: (projectId: string, eventId: string, approve: boolean) => Promise<any>;
   startCodexSignIn: (accountId: string) => Promise<any>;
   getCodexSignInStatus: (sessionId: string) => Promise<any>;
   cancelCodexSignIn: (sessionId: string) => Promise<any>;
@@ -198,6 +201,10 @@ const api: OrchestratorApi = {
   restoreAgent: (agentId: string) => ipcRenderer.invoke('agents:restore', { agentId }),
   getTrash: () => ipcRenderer.invoke('trash:list'),
   getAutomationStatus: () => ipcRenderer.invoke('automation:status'),
+  getManagerDecisions: (projectId: string) => ipcRenderer.invoke('automation:managerDecisions', { projectId }),
+  setManagerMode: (projectId: string, mode: string) => ipcRenderer.invoke('automation:setManagerMode', { projectId, mode }),
+  decideManagerProposal: (projectId: string, eventId: string, approve: boolean) =>
+    ipcRenderer.invoke('automation:decideManagerProposal', { projectId, eventId, approve }),
   startCodexSignIn: (accountId: string) => ipcRenderer.invoke('accounts:startCodexSignIn', { accountId }),
   getCodexSignInStatus: (sessionId: string) => ipcRenderer.invoke('accounts:codexSignInStatus', { sessionId }),
   cancelCodexSignIn: (sessionId: string) => ipcRenderer.invoke('accounts:cancelCodexSignIn', { sessionId }),

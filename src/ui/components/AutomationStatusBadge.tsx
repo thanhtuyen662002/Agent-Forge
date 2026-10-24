@@ -6,7 +6,7 @@ import { useAutomationStatus } from '../runtimeStatus';
 const KNOWN_REASONS = new Set([
   'ACCOUNT_NOT_VERIFIED', 'NO_CLI_CODER', 'AUTOMATION_STOPPED', 'PROVIDER_EXECUTION_FAILED',
   'VERIFIED', 'VERIFICATION_FAILED', 'VERIFICATION_NOT_CONFIGURED', 'NOT_VERIFIED', 'WORKTREE_NOT_VERIFIABLE',
-  'NO_REVIEWER', 'REVIEWER_NOT_AVAILABLE', 'REVIEW_FIX_REQUIRED', 'REVIEW_BLOCKED', 'REVIEW_FAILED', 'REVIEW_STALE', 'REVIEW_INTERRUPTED',
+  'NO_MANAGER', 'MANAGER_NOT_AVAILABLE', 'MANAGER_PROPOSAL_PENDING', 'MANAGER_PROPOSAL_REJECTED', 'MANAGER_FAILED', 'MANAGER_RETRY_PENDING', 'NO_REVIEWER', 'REVIEWER_NOT_AVAILABLE', 'REVIEW_FIX_REQUIRED', 'REVIEW_BLOCKED', 'REVIEW_FAILED', 'REVIEW_STALE', 'REVIEW_INTERRUPTED',
 ]);
 
 /**
@@ -28,7 +28,7 @@ export const AutomationStatusBadge: React.FC<{ projectId: string }> = ({ project
   const tone = project?.phase === 'EXECUTING'
     ? 'text-emerald-300 border-emerald-700/50'
     : project?.phase === 'FAILED' ? 'text-rose-300 border-rose-700/50'
-    : project?.phase === 'AWAITING_REVIEW' || project?.phase === 'VERIFYING' || project?.phase === 'REVIEWING' ? 'text-forge-cyan border-forge-cyan/40'
+    : project?.phase === 'AWAITING_REVIEW' || project?.phase === 'VERIFYING' || project?.phase === 'REVIEWING' || project?.phase === 'DECIDING' ? 'text-forge-cyan border-forge-cyan/40'
     : 'text-amber-300 border-amber-700/40';
 
   return (
