@@ -178,6 +178,18 @@ describe('R5F0C3 — Production Codex CLI Adapter Contract Suite', () => {
         process.exit(0);
       }
 
+      if (scenario.mode === 'REVIEW_SUCCESS') {
+        // A reviewer that tries to write: the isolated copy must never reach the source.
+        fs.writeFileSync(path.join(process.cwd(), 'reviewer-wrote.txt'), 'x');
+        const review = {
+          protocol: 'review.v1', message_id: 'review-1', project_id: 'PROJ-CODEX-TEST', task_id: 'TSK-CODEX-001',
+          task_revision: 0, verdict: 'PASS', summary: 'Looks right', issues: [],
+          reviewed_head_sha: 'a'.repeat(40), reviewed_snapshot_sha: 'b'.repeat(64),
+        };
+        console.log(JSON.stringify({ type: 'item.completed', item: { type: 'agent_message', text: JSON.stringify(review) } }));
+        process.exit(0);
+      }
+
       if (scenario.mode === 'MULTI_MESSAGE_LAST_WINS') {
         const intermediate = {
           type: 'item.completed',
@@ -783,6 +795,31 @@ describe('R5F0C3 — Production Codex CLI Adapter Contract Suite', () => {
   // =============================================================
   // SECTION C: JSONL PROTOCOL PARSING (Phase 19)
   // =============================================================
+  describe('C0. Read-only review executions (#233)', () => {
+    it('runs a review in a read-only sandbox, returns the verdict and never syncs the workspace back', async () => {
+      const adapter = new CodexCliAdapter({ executable: fakeCodexExecutable, repo, artifactStore, profileResolver: resolver });
+      setScenario({ mode: 'REVIEW_SUCCESS' });
+      const res = await adapter.execute(createValidRequest({ expectedProtocol: 'review.v1' }));
+
+      expect(res.status).toBe('COMPLETED');
+      expect(JSON.parse(res.outputProtocol!)).toMatchObject({ protocol: 'review.v1', verdict: 'PASS' });
+      const log = getLogs()[0];
+      expect(log.argv).toContain('read-only');
+      expect(log.argv).not.toContain('workspace-write');
+      expect(log.stdin).toContain('Do not modify any file');
+      expect(fs.existsSync(path.join(projectRepoDir, 'reviewer-wrote.txt'))).toBe(false);
+    });
+
+    it('treats a coder.v1 answer to a review as PROTOCOL_INVALID, never as a verdict', async () => {
+      const adapter = new CodexCliAdapter({ executable: fakeCodexExecutable, repo, artifactStore, profileResolver: resolver });
+      setScenario({ mode: 'SUCCESS' });
+      const res = await adapter.execute(createValidRequest({ expectedProtocol: 'review.v1' }));
+
+      expect(res.status).toBe('FAILED');
+      expect(res.errorCode).toBe('PROTOCOL_INVALID');
+    });
+  });
+
   describe('C. JSONL Protocol Parsing Matrix', () => {
     it('20. Valid single completed agent_message completes task with validated coder.v1 protocol', async () => {
       const adapter = new CodexCliAdapter({
@@ -1027,7 +1064,7 @@ describe('R5F0C3 — Production Codex CLI Adapter Contract Suite', () => {
       });
 
       const capabilities = await adapter.getCapabilities();
-      expect(capabilities).toEqual(['CODING', 'TERMINAL', 'FILESYSTEM_EDIT', 'TEST_EXECUTION']);
+      expect(capabilities).toEqual(['CODING', 'TERMINAL', 'FILESYSTEM_EDIT', 'TEST_EXECUTION', 'REVIEW', 'PLANNING']);
     });
   });
 });

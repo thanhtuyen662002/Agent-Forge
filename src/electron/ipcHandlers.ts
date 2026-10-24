@@ -26,6 +26,7 @@ import { WorkspaceManagementService } from '../core/services/WorkspaceManagement
 import type { DesktopAutomationService } from '../core/services/DesktopAutomationService';
 import type { AccountQuotaService } from '../core/services/AccountQuotaService';
 import type { CodexAccountConnectionService } from '../core/services/CodexAccountConnectionService';
+import type { CliAccountConnectionService } from '../core/services/CliAccountConnectionService';
 import {
   CreateProjectIpcSchema,
   BindProjectRepositoryIpcSchema,
@@ -132,7 +133,9 @@ export function registerIpcHandlers(
   updateService?: UpdateService,
   coderSubmissionAdjudicationService?: CoderSubmissionAdjudicationService,
   rendererPolicy: RendererNavigationPolicyOptions = resolveRendererNavigationPolicy({ isPackaged: false }),
-  runtime: { automation?: DesktopAutomationService; quota?: AccountQuotaService; signIn?: CodexAccountConnectionService } = {},
+  runtime: {
+    automation?: DesktopAutomationService; quota?: AccountQuotaService; signIn?: CodexAccountConnectionService; cliSignIn?: CliAccountConnectionService;
+  } = {},
 ): void {
   const adjService =
     coderSubmissionAdjudicationService ||
@@ -928,6 +931,65 @@ export function registerIpcHandlers(
     return { success: true, status: runtime.automation.getStatus() };
   });
 
+  // Automated Manager (#239): the owner's mode and decisions on its proposals.
+  const readProjectId = (payload: unknown) => {
+    const value = payload && typeof payload === 'object' ? (payload as { projectId?: unknown }).projectId : undefined;
+    return typeof value === 'string' && value.length > 0 && value.length <= 200 && repo.getProjectMetadata(value) ? value : null;
+  };
+  registerPrivilegedHandler('automation:managerDecisions', async (_, payload: unknown) => {
+    const manager = runtime.automation?.getManager();
+    const projectId = readProjectId(payload);
+    if (!manager) return { success: false, errorCode: 'AUTOMATION_UNAVAILABLE' };
+    if (!projectId) return { success: false, errorCode: 'PROJECT_NOT_FOUND' };
+    return sanitizeOutputValue({ success: true, mode: manager.getMode(projectId), proposals: manager.listProposals(projectId) });
+  });
+  registerPrivilegedHandler('automation:setManagerMode', async (_, payload: unknown) => {
+    const projectId = readProjectId(payload);
+    const mode = payload && typeof payload === 'object' ? (payload as { mode?: unknown }).mode : undefined;
+    if (!projectId) return { success: false, errorCode: 'PROJECT_NOT_FOUND' };
+    if (mode !== 'AUTO' && mode !== 'APPROVE') return { success: false, errorCode: 'MANAGER_MODE_INVALID' };
+    repo.setProjectManagerMode(projectId, mode);
+    void runtime.automation?.tick();
+    return { success: true, mode };
+  });
+  registerPrivilegedHandler('automation:decideManagerProposal', async (_, payload: unknown) => {
+    const manager = runtime.automation?.getManager();
+    const projectId = readProjectId(payload);
+    const body = payload && typeof payload === 'object' ? payload as { eventId?: unknown; approve?: unknown } : {};
+    if (!manager) return { success: false, errorCode: 'AUTOMATION_UNAVAILABLE' };
+    if (!projectId || typeof body.eventId !== 'string' || body.eventId.length > 200 || typeof body.approve !== 'boolean') {
+      return { success: false, errorCode: 'PROPOSAL_NOT_FOUND' };
+    }
+    const result = await manager.decideProposal(projectId, body.eventId, body.approve);
+    if (result.success) void runtime.automation?.tick();
+    return sanitizeOutputValue(result);
+  });
+
+  // Owner-controlled integration of reviewed work (#238): list, create a branch, discard.
+  const readIntegrationTarget = (payload: unknown) => {
+    const body = payload && typeof payload === 'object' ? payload as { projectId?: unknown; taskId?: unknown } : {};
+    const ok = (value: unknown): value is string => typeof value === 'string' && value.length > 0 && value.length <= 200;
+    return ok(body.projectId) && ok(body.taskId) ? { projectId: body.projectId, taskId: body.taskId } : null;
+  };
+  registerPrivilegedHandler('integration:list', async (_, payload: unknown) => {
+    const projectId = readProjectId(payload);
+    if (!runtime.automation) return { success: false, errorCode: 'AUTOMATION_UNAVAILABLE' };
+    if (!projectId) return { success: false, errorCode: 'PROJECT_NOT_FOUND' };
+    return sanitizeOutputValue({ success: true, entries: runtime.automation.getIntegration().list(projectId) });
+  });
+  registerPrivilegedHandler('integration:createBranch', async (_, payload: unknown) => {
+    const target = readIntegrationTarget(payload);
+    if (!runtime.automation) return { success: false, errorCode: 'AUTOMATION_UNAVAILABLE' };
+    if (!target) return { success: false, errorCode: 'TASK_NOT_FOUND' };
+    return sanitizeOutputValue(await runtime.automation.getIntegration().createBranch(target.projectId, target.taskId));
+  });
+  registerPrivilegedHandler('integration:discard', async (_, payload: unknown) => {
+    const target = readIntegrationTarget(payload);
+    if (!runtime.automation) return { success: false, errorCode: 'AUTOMATION_UNAVAILABLE' };
+    if (!target) return { success: false, errorCode: 'TASK_NOT_FOUND' };
+    return sanitizeOutputValue(await runtime.automation.getIntegration().discard(target.projectId, target.taskId));
+  });
+
   registerPrivilegedHandler('quota:list', async () => {
     if (!runtime.quota) return { success: false, errorCode: 'QUOTA_UNAVAILABLE' };
     return sanitizeOutputValue({ success: true, observations: runtime.quota.getLatestObservations() });
@@ -948,6 +1010,23 @@ export function registerIpcHandlers(
     const value = payload && typeof payload === 'object' ? (payload as { sessionId?: unknown }).sessionId : undefined;
     return typeof value === 'string' && value.length > 0 && value.length <= 128 ? value : null;
   };
+  // Claude Code / Gemini sign-in: open the CLI's own login for the account's profile, then verify it.
+  const readAccountId = (payload: unknown) => {
+    const value = payload && typeof payload === 'object' ? (payload as { accountId?: unknown }).accountId : undefined;
+    return typeof value === 'string' && value.length > 0 && value.length <= 200 ? value : null;
+  };
+  registerPrivilegedHandler('accounts:startCliSignIn', async (_, payload: unknown) => {
+    const accountId = readAccountId(payload);
+    if (!runtime.cliSignIn) return { success: false, errorCode: 'SIGN_IN_UNAVAILABLE' };
+    if (!accountId) return { success: false, errorCode: 'ACCOUNT_NOT_FOUND' };
+    return runtime.cliSignIn.startSignIn(accountId);
+  });
+  registerPrivilegedHandler('accounts:verifyCliSignIn', async (_, payload: unknown) => {
+    const accountId = readAccountId(payload);
+    if (!runtime.cliSignIn) return { success: false, errorCode: 'SIGN_IN_UNAVAILABLE' };
+    if (!accountId) return { success: false, errorCode: 'ACCOUNT_NOT_FOUND' };
+    return sanitizeOutputValue(await runtime.cliSignIn.verify(accountId));
+  });
   registerPrivilegedHandler('accounts:startCodexSignIn', async (_, payload: unknown) => {
     if (!runtime.signIn) return { success: false, errorCode: 'SIGN_IN_UNAVAILABLE' };
     const accountId = payload && typeof payload === 'object' ? (payload as { accountId?: unknown }).accountId : undefined;

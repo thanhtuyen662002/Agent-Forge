@@ -236,14 +236,246 @@ The header shows the automation phase next to the project status, because a
 RUNNING project is not proof that a worker is running: `not running`,
 `waiting for an approved task`, `only Manual Bridge coders`, `waiting for a
 usable coder` (with a reason such as *account not verified*), `coder is
-working`, `coder finished; waiting for verification and review`, `last
-automated run failed`.
+working`, `running your approved tests`, `reviewer agent is checking the
+tested changes`, `coder finished; waiting for review` (with a reason such as
+*no Reviewer agent*), `last automated run failed`.
 
-**Limits.** Automation covers the coder stage. Verification, review and
-merging the retained worktree remain the existing owner-driven steps. The CLI
+**Limits.** Automation covers the coder stage, automated verification and
+automated review (below). Merging the retained worktree remains owner-driven. The CLI
 sees only the files in the context manifest and can update existing files
 only (`docs/LOCAL_PROVIDER_WORKSPACES.md`). Large repositories that exceed the
 workspace bounds fail closed with a reason.
+
+## Automated Manager decisions
+
+A **Manager** agent (role *Primary* or *Backup Manager*, Codex CLI, its own
+account) gives the coder its authority, so tasks run without pasted JSON
+(#239). `ProductManagerService` asks it when:
+
+- a task is `PLANNED` and has no Manager decision yet, or
+- a task is `CODING` at a revision that no Manager decision authorizes. This
+  happens after automated tests failed or the reviewer asked for fixes, and the
+  prompt then includes the review issues and the failed result.
+
+The call uses role-aware routing, a lease and a heartbeat. It runs read-only:
+no repository context is copied, and the CLI runs with `--sandbox read-only`.
+Gemini CLI cannot be a Manager. The answer must be a `manager.v1` object for
+exactly this task, its current state and revision, with decision `EXECUTE` (the
+coder starts with the Manager's instructions) or `BLOCK` (the owner decides).
+Review verdicts are never taken from the Manager. The provider's message id is
+replaced, so it can never replay an earlier decision.
+
+**Mode** (Dashboard → *Manager decisions*, per project):
+
+- **I approve each decision** (default): the proposal is shown with its
+  instructions. *Approve* re-checks that the task has not moved, then applies
+  the decision through `TaskService.applyManagerDecision`. *Reject* records the
+  rejection; that revision is not asked again.
+- **Manager decides automatically:** the decision is applied directly, through
+  the same validation.
+
+A malformed, disallowed, stale or other-task decision is recorded as
+`AUTOMATION_MANAGER_FAILED` and not retried. Provider failures are retried
+after five minutes, at most three times. The header then says the Manager
+could not decide, and the owner decides. Without a usable Manager agent the
+header says so. A Manager call interrupted by a restart is fenced like a
+review: its expired lease is released, nothing is applied, and the revision is
+asked again. Turning the contract into tasks is #245.
+
+## Automated verification after a completed coder run
+
+When a coder execution settles `COMPLETED`, `AutomatedVerificationService`
+tests the coder's changes in the exact managed worktree that the
+authorization names. The automation pre-binds the worker slot and authorizes
+the scheduler-derived `afw-<digest>` path, so the verification capability
+fence admits that worktree and nothing else. Before running, it checks that:
+
+- the project is `RUNNING`, not trashed and not emergency-stopped;
+- the task is still `CODING` at the authorized revision and epoch;
+- the worktree is registered, exists, still sits on the authorized base, and is
+  the authorized path;
+- the project has an approved `TEST` command.
+
+It then moves the task only through `TaskService.transitionAuthorizedTask`:
+`SUBMIT_REPORT` (to `VALIDATING`), runs the approved `TEST` command with
+`VerificationService.runTests` in the worktree, then `EVIDENCE_GATHERED` (to
+`REVIEW_READY`) on a pass, or `TESTS_FAILED` (back to `CODING` at the next
+revision, so the Manager must authorize again) on a failure or when the
+command could not run. Each result is an `AUTOMATION_VERIFICATION_*` event
+bound to the authorization and to the work it tested: the worktree HEAD, a
+content snapshot of the uncommitted changes and the changed files. If the
+worktree changes while the command runs, the result is a failure
+(`WORKTREE_CHANGED_DURING_VERIFICATION`). A run is verified once. Settled work
+left unverified by a restart is picked up on the next pass.
+
+If no `TEST` command is approved, the task is not moved, and the header says
+the changes were not tested. Once the owner approves a `TEST` command, the same
+settled work is verified on the next pass. Verified work then goes to automated
+review (below) when a Reviewer agent is configured, otherwise to the existing
+Manager or owner path. Nothing is merged into the repository automatically.
+
+## Automated review of verified work
+
+When a task is `REVIEW_READY` with an `AUTOMATION_VERIFICATION_PASSED` result
+at its current revision, `ProductReviewService` asks a **Reviewer** agent to
+review it. Add one in Agent Center (role *Reviewer*, Codex CLI) and sign it in
+to **its own** account: a reviewer never uses the coder's account. Only
+adapters that report the `REVIEW` capability are used; Gemini CLI has no
+read-only review mode, so a Gemini Reviewer is skipped in favour of one that
+can review.
+
+The review runs on the product authority path:
+
+- a `desktop-review` attempt and a REVIEWER routing decision with a persisted
+  assignment, under the `sep-automated-review` separation policy (different
+  account, no self-review);
+- an account lease and worker slot from `WorkerSlotLeaseService`, renewed while
+  the reviewer runs; a lost lease or a stop cancels the review;
+- the reviewer's own CLI profile (`CODEX_HOME`), on an isolated **read-only**
+  copy of the verified worktree (`--sandbox read-only`). The copy is never
+  synchronized back. The diff is included in the prompt; diffs over 256 KB are
+  not reviewed (`REVIEW_DIFF_TOO_LARGE`).
+
+The task moves to `REVIEWING` only after every fence passes. A verdict is a
+`review.v1` object (`PASS`, `FIX_REQUIRED` or `BLOCKED`, issues, and the
+reviewed `task_revision`, `reviewed_head_sha` and `reviewed_snapshot_sha`). It
+is applied only when it names exactly the verified work, the worktree did not
+change while the reviewer ran, and the review still holds its lease. The
+review row and the task transition are written in one transaction:
+
+| Verdict | Result |
+| --- | --- |
+| `PASS` | `PASS_VERDICT`: the task is `DONE`. The changes stay in the retained worktree; nothing is merged. |
+| `FIX_REQUIRED` | `FIX_VERDICT`: back to `CODING` at the next revision (or `NEEDS_HUMAN` at the revision limit). The Manager must authorize the next revision. |
+| `BLOCKED` | Recorded; the task stays `REVIEWING` for the Manager or owner. |
+
+A provider failure, a malformed or wrong-protocol answer, or a verdict for a
+stale snapshot or another revision is recorded as `AUTOMATION_REVIEW_FAILED`
+or `AUTOMATION_REVIEW_STALE` and never becomes a verdict. A review that ran is
+not retried; the header says so, and the Manager or owner reviews instead. A
+review that could not **start** (no routable reviewer, lease contention, a
+transient Git error) records `AUTOMATION_REVIEW_NOT_RUN`, leaves the task
+`REVIEW_READY` and is offered again after five minutes. PASS cannot carry
+`BLOCKER` or `REQUIRED` issues, and `FIX_REQUIRED` needs at least one issue;
+contradictory verdicts are malformed. The review row, task transition and
+outcome event are committed together.
+
+**Restart.** A review attempt left `RUNNING` by a previous process is never
+completed from a guess. While its `process_runs` row is still `RUNNING`,
+everything stays fenced and an `AUTOMATION_REVIEW_INTERRUPTED` event says the
+process is not proven stopped. Once the process is terminal and the lease has
+expired, the lease is released through the guarded recovery primitive, the
+attempt and assignment end `FAILED` (`COMPLETED` only when a verdict was
+already applied), and the task stays `REVIEWING`. The same transaction closes
+any startup quarantine marker (`PRODUCT_LEASE_RECOVERY_REQUIRED`) for that
+lease. A late result from the old process is discarded because it no longer
+holds its lease.
+
+## Taking reviewed work: create a branch or discard
+
+When a task passes automated review it is `DONE`, and its changes are still
+uncommitted in a hidden managed worktree. The header then shows *reviewed work
+is ready* (`READY_FOR_INTEGRATION`). Under **Dashboard → Reviewed work** the
+owner chooses what happens to it (#238). Nothing happens without that action,
+and nothing is ever merged or pushed.
+
+- **Create branch.** The worktree must still hold exactly the reviewed
+  snapshot (same HEAD and snapshot as the PASS review), otherwise
+  `SNAPSHOT_CHANGED_SINCE_REVIEW`. The changes are committed with Git plumbing
+  (`add` → `write-tree` → `commit-tree` → `update-ref` with an empty old value)
+  as one commit on the reviewed base. They land on a **new** branch
+  `agent/<task-title>-<task-id>-r<revision>`, authored by *Agent Forge*.
+  - Line endings are not converted; the commit holds the reviewed bytes.
+  - Changes are staged into a private copy of the worktree's index, so the
+    reviewed snapshot never changes. The commit's files (rename detection off)
+    must equal the reviewed ones *before* any branch is written. The exact
+    commit is recorded as an intent first.
+  - The default branch, the owner's checkout and every existing branch are
+    never modified. An existing branch name is never overwritten.
+  - The retained worktree is then cleaned and removed through
+    `GitWorktreeService`. The branch stays in the repository for the owner to
+    merge with their usual Git tool.
+- **Discard** (terminal tasks only: `DONE`, `CANCELLED`, `FAILED`). The task's
+  retained worktrees are cleaned and removed. The repository policy forbids
+  `git reset --hard` and `git clean -f`, so discard only unstages, restores
+  tracked files from the base, and deletes the worktree's untracked files
+  inside the managed path. Deletion never follows a symlink or junction: the
+  link itself is removed and its target is untouched. Removal then requires the
+  exact checkout again. A repository whose `.gitattributes` converts line
+  endings or applies filters can fail this check; the discard then reports
+  `DISCARD_INCOMPLETE` and keeps the copy. If the branch was created but its
+  hidden copy could not be removed, the panel offers *Remove leftover copy*,
+  which keeps the branch.
+- **Restart.** If an earlier attempt wrote the branch but was interrupted
+  before recording it, the next *Create branch* adopts the branch. It does so
+  only if the branch tip is exactly the recorded intended commit, one commit on
+  the reviewed base. Any other branch with that name, for example one of the
+  owner's, is refused (`BRANCH_EXISTS`) and left untouched.
+
+## Restart recovery for automated executions
+
+At startup, `ExecutionRecoveryScanner` sends lifecycle-v1 product
+authorizations (assignment-bound, no handoff transfer) to
+`DirectProductExecutionLifecycle`. It acts only on exact durable receipts and
+records a `PRODUCT_EXECUTION_RECOVERY` event:
+
+| Durable state | Recovery |
+| --- | --- |
+| `AUTHORIZED` | Untouched; an owner may still dispatch it. Desktop automation expires only authorizations whose attempt it created (`desktop-automation` marker) when it starts. |
+| `DISPATCHED`, adapter start never claimed | Expired; lease and slot released through the guarded primitive; attempt and assignment `FAILED`. |
+| Adapter started, not settled | Stays fenced. A terminal `process_runs` row without a settlement is reported as *result missing*, never as success. |
+| Settled with verified product evidence | A lease and slot that the interrupted scheduler did not release are released. Tampered evidence is rejected and nothing is released. |
+
+Product settlement records the execution's `process_runs` truth
+(`process_run: { status, exit_code }`, or `null` when no native process
+started, for example an early adapter validation failure). It refuses to
+settle while that process is still `RUNNING`. A rejection after the dispatch
+claim but before the adapter start (status `DISPATCHED`, no start) is
+expired at runtime too, so the task is not blocked.
+
+## Claude Code and Gemini CLI agents
+
+Agent Center offers four connections: Manual Bridge, **Codex CLI**, **Claude
+Code CLI** and **Gemini CLI** (#242). Each agent gets its own account and its
+own profile directory, so any number of accounts per CLI can run side by side
+without sharing a login:
+
+| CLI | Profile variable | Coder run | Reviewer / Manager run |
+| --- | --- | --- | --- |
+| Codex | `CODEX_HOME` | `--sandbox workspace-write` | `--sandbox read-only` |
+| Claude Code | `CLAUDE_CONFIG_DIR` | `claude -p --output-format json --permission-mode acceptEdits --tools Read,Edit,Write,Glob,Grep` | `--permission-mode dontAsk --tools Read,Glob,Grep` |
+| Gemini | `GEMINI_CLI_HOME` | `--approval-mode auto_edit` | `--approval-mode plan` |
+
+All runs happen in the isolated provider workspace. Child processes get only a
+minimal environment, so host credentials such as `ANTHROPIC_API_KEY` never
+reach them. Permission-bypass flags are never used. Gemini no longer passes
+`--sandbox` (it needs Docker); headless `default` approval denied every edit.
+Claude runs with `--setting-sources user --strict-mcp-config`, so only the
+agent profile's own settings apply. Agent CLI project configuration
+(`.claude/`, `.gemini/`, `.codex/`, `.mcp.json`) is a policy-denied path. It is
+never copied into a workspace, and a run that creates it fails, because hooks,
+MCP servers or endpoint overrides in it could run commands or redirect
+credentials. Claude reports no `TEST_EXECUTION`, and Gemini no `TERMINAL` or
+`TEST_EXECUTION`: their headless modes have no shell.
+
+**Sign-in.** For a Claude Code or Gemini agent whose account is not verified
+yet, *Sign in* opens a terminal running the CLI's own sign-in with that
+agent's profile: `claude auth login`, or `gemini` and then *Sign in with
+Google*. After finishing in the browser, the owner presses *Check sign-in*.
+
+- **Claude:** the app runs `claude auth status`. Only a subscription login
+  (`claude.ai` or `oauth_token`) counts.
+- **Gemini:** the app checks that a cached login exists (presence only; it is
+  never read), then runs a one-line read-only prompt. Exit `41` means not
+  signed in.
+
+A verified, never-used account is initialized through `AccountHealthService`.
+Auth and usage-limit failures in runs are classified, for example Claude's
+*You've hit your session limit · resets …*, and never become success. Codex
+keeps its device-code sign-in. Checks use the adapter's own executable (npm
+`.cmd` shims run through the trusted `cmd.exe`) from an empty private
+directory. An account with a recorded failure (for example `AUTH_ERROR`) is not
+cleared by a sign-in check (follow-up #247).
 
 ## Provider quota and account verification
 
@@ -287,7 +519,9 @@ waiting, failed and fix-required tasks with a plain-language reason and an
 
 ## Not yet covered by this slice of Issue #225
 
-- Automatic verification, review and integration of a completed coder worktree.
+- Automatic merge of a reviewed branch into the default branch. Automated
+  verification (#230), review (#233) and the owner's branch hand-off (#238)
+  are covered above; merging stays with the owner.
 
 
 These remain open acceptance criteria on Issue #225.

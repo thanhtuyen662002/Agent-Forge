@@ -16,8 +16,16 @@ export type AutomationPhase =
   | 'QUEUED'
   /** Automation is preparing or running a coder execution. */
   | 'EXECUTING'
-  /** The coder execution settled COMPLETED; changes await verification and review. */
+  /** The settled coder work is being verified in its worktree with the approved TEST command. */
+  | 'VERIFYING'
+  /** An account-bound Manager agent is deciding whether and how the coder proceeds (#239). */
+  | 'DECIDING'
+  /** An account-bound REVIEWER agent is reviewing the verified work (#233). */
+  | 'REVIEWING'
+  /** The coder execution settled COMPLETED and (when configured) verification passed; awaiting review. */
   | 'AWAITING_REVIEW'
+  /** A task passed automated review; its work waits for the owner to create a branch or discard it (#238). */
+  | 'READY_FOR_INTEGRATION'
   /** The latest automated execution for the current revision failed. */
   | 'FAILED';
 

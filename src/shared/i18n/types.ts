@@ -235,12 +235,14 @@ export interface TranslationDictionary {
       MANUAL_BRIDGE: string;
       CODEX_CLI: string;
       GEMINI_CLI: string;
+      CLAUDE_CODE_CLI: string;
       OTHER: string;
     };
     connectionHelp: {
       MANUAL_BRIDGE: string;
       CODEX_CLI: string;
       GEMINI_CLI: string;
+      CLAUDE_CODE_CLI: string;
       OTHER: string;
     };
     form: {
@@ -447,7 +449,11 @@ export interface TranslationDictionary {
       MANUAL_RELAY_REQUIRED: string;
       WAITING_FOR_CAPACITY: string;
       QUEUED: string;
+      DECIDING: string;
       EXECUTING: string;
+      VERIFYING: string;
+      REVIEWING: string;
+      READY_FOR_INTEGRATION: string;
       AWAITING_REVIEW: string;
       FAILED: string;
     };
@@ -455,8 +461,54 @@ export interface TranslationDictionary {
       ACCOUNT_NOT_VERIFIED: string;
       NO_CLI_CODER: string;
       AUTOMATION_STOPPED: string;
+      VERIFIED: string;
+      VERIFICATION_FAILED: string;
+      VERIFICATION_NOT_CONFIGURED: string;
+      NOT_VERIFIED: string;
+      WORKTREE_NOT_VERIFIABLE: string;
       PROVIDER_EXECUTION_FAILED: string;
+      NO_REVIEWER: string;
+      REVIEWER_NOT_AVAILABLE: string;
+      REVIEW_FIX_REQUIRED: string;
+      REVIEW_BLOCKED: string;
+      REVIEW_FAILED: string;
+      REVIEW_STALE: string;
+      REVIEW_INTERRUPTED: string;
+      NO_MANAGER: string;
+      MANAGER_NOT_AVAILABLE: string;
+      MANAGER_PROPOSAL_PENDING: string;
+      MANAGER_PROPOSAL_REJECTED: string;
+      MANAGER_FAILED: string;
+      MANAGER_RETRY_PENDING: string;
+      REVIEWED_WORK_READY: string;
       GENERIC: string;
+    };
+    integrationPanel: {
+      title: string;
+      subtitle: string;
+      empty: string;
+      create: string;
+      discard: string;
+      confirmDiscard: string;
+      branchCreated: string;
+      discarded: string;
+      removeLeftover: string;
+      filesChanged: string;
+      failed: string;
+    };
+    managerPanel: {
+      title: string;
+      subtitle: string;
+      modeLabel: string;
+      modeAuto: string;
+      modeApprove: string;
+      empty: string;
+      approve: string;
+      reject: string;
+      failed: string;
+      revision: string;
+      decisionEXECUTE: string;
+      decisionBLOCK: string;
     };
     quota: {
       title: string;
@@ -475,6 +527,33 @@ export interface TranslationDictionary {
         UNAVAILABLE: string;
         ERROR: string;
       };
+    };
+  };
+  cliSignIn: {
+    title: string;
+    step1: string;
+    step2: string;
+    step3: string;
+    open: string;
+    verify: string;
+    verifying: string;
+    opened: string;
+    privacy: string;
+    close: string;
+    reasons: {
+      VERIFIED: string;
+      NOT_SIGNED_IN: string;
+      NOT_A_SUBSCRIPTION_LOGIN: string;
+      VERIFY_FAILED: string;
+      ALREADY_IN_USE: string;
+    };
+    errors: {
+      ACCOUNT_NOT_FOUND: string;
+      NOT_A_SUPPORTED_CLI_ACCOUNT: string;
+      PROFILE_UNAVAILABLE: string;
+      CLI_UNAVAILABLE: string;
+      UNSUPPORTED_PLATFORM: string;
+      SIGN_IN_UNAVAILABLE: string;
     };
   };
   accountSignIn: {

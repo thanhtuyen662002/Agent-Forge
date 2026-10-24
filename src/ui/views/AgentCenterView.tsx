@@ -6,6 +6,7 @@ import { AccessibleDialog } from '../components/AccessibleDialog';
 import { useAgentRoster } from '../agentRoster';
 import { useAccountSignIn } from '../accountSignIn';
 import { SignInDialog } from '../components/SignInDialog';
+import { CliSignInDialog } from '../components/CliSignInDialog';
 import type { AgentMutationResult } from '../agentRoster';
 import type { AgentRole } from '../../core/types/domain';
 import type { AgentConnectionKind, AgentRosterEntry } from '../../core/types/workspace';
@@ -13,7 +14,7 @@ import { MAX_AGENT_WORKER_SLOTS } from '../../core/types/workspace';
 import { Bot, Shield, Terminal, Wrench, Plus, RefreshCw } from 'lucide-react';
 
 const ROLE_OPTIONS: AgentRole[] = ['PRIMARY_MANAGER', 'BACKUP_MANAGER', 'CODER', 'REVIEWER', 'TOOL'];
-const CONNECTION_OPTIONS: AgentConnectionKind[] = ['MANUAL_BRIDGE', 'CODEX_CLI', 'GEMINI_CLI'];
+const CONNECTION_OPTIONS: AgentConnectionKind[] = ['MANUAL_BRIDGE', 'CODEX_CLI', 'CLAUDE_CODE_CLI', 'GEMINI_CLI'];
 
 const inputClass =
   'w-full bg-surface-card border border-surface-border rounded-lg px-3 py-2 text-sm text-white focus:outline-none focus:border-forge-cyan';
@@ -52,6 +53,7 @@ export const AgentCenterView: React.FC = () => {
   const [removeError, setRemoveError] = useState<AgentMutationResult | null>(null);
   const [notice, setNotice] = useState<Notice>(null);
   const [signInEntry, setSignInEntry] = useState<AgentRosterEntry | null>(null);
+  const [cliSignInEntry, setCliSignInEntry] = useState<AgentRosterEntry | null>(null);
   const reloadRoster = roster.reload;
   const afterSignIn = useCallback(async () => { await reloadRoster(); await refreshData(); }, [reloadRoster, refreshData]);
   const signIn = useAccountSignIn(afterSignIn);
@@ -244,7 +246,10 @@ export const AgentCenterView: React.FC = () => {
                   onEdit={() => openEdit(entry)}
                   onRemove={() => { setRemoveError(null); setConfirmRemove(entry); }}
                   onRestore={() => void restore(entry)}
-                  onSignIn={signIn.available && entry.account ? () => { setSignInEntry(entry); void signIn.start(entry.account!.id); } : undefined}
+                  onSignIn={!entry.account ? undefined
+                    : entry.connection === 'CODEX_CLI'
+                      ? (signIn.available ? () => { setSignInEntry(entry); void signIn.start(entry.account!.id); } : undefined)
+                      : () => setCliSignInEntry(entry)}
                 />
               ))}
             </div>
@@ -411,6 +416,14 @@ export const AgentCenterView: React.FC = () => {
         </div>
       )}
 
+      {cliSignInEntry?.account && (
+        <CliSignInDialog
+          agentName={cliSignInEntry.agent.display_name}
+          accountId={cliSignInEntry.account.id}
+          onVerified={afterSignIn}
+          onClose={() => setCliSignInEntry(null)}
+        />
+      )}
       {signInEntry && signIn.view && (
         <SignInDialog
           agentName={signInEntry.agent.display_name}

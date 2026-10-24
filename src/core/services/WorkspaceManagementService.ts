@@ -30,6 +30,7 @@ const MANUAL_BRIDGE_PROVIDER_ID = 'prov-manual-bridge';
 const CLI_PROVIDERS: Record<Exclude<AgentConnectionKind, 'MANUAL_BRIDGE'>, { id: string; name: string; profileProvider: string }> = {
   CODEX_CLI: { id: 'prov-codex-cli', name: 'Codex CLI', profileProvider: 'codex' },
   GEMINI_CLI: { id: 'prov-gemini-cli', name: 'Gemini CLI', profileProvider: 'gemini' },
+  CLAUDE_CODE_CLI: { id: 'prov-claude-code-cli', name: 'Claude Code CLI', profileProvider: 'claude' },
 };
 
 const ROLE_CAPABILITIES: Record<FabricRole, Capability[]> = {
@@ -559,6 +560,7 @@ export class WorkspaceManagementService {
     if (provider.adapter_type === 'MANUAL_BRIDGE') return 'MANUAL_BRIDGE';
     if (provider.id === CLI_PROVIDERS.CODEX_CLI.id) return 'CODEX_CLI';
     if (provider.id === CLI_PROVIDERS.GEMINI_CLI.id) return 'GEMINI_CLI';
+    if (provider.id === CLI_PROVIDERS.CLAUDE_CODE_CLI.id) return 'CLAUDE_CODE_CLI';
     return 'OTHER';
   }
 }

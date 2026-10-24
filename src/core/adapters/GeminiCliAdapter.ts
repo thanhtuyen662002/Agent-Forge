@@ -70,7 +70,8 @@ export class GeminiCliAdapter extends LocalCliAdapterBase {
   }
 
   public async getCapabilities(): Promise<Capability[]> {
-    return ['CODING', 'FILESYSTEM_EDIT', 'TEST_EXECUTION', 'TERMINAL'];
+    // Headless auto_edit / plan deny shell tools, so no TERMINAL or TEST_EXECUTION.
+    return ['CODING', 'FILESYSTEM_EDIT', 'REVIEW', 'PLANNING'];
   }
 
   public override async getHealth(): Promise<ProviderHealthStatus> {
@@ -117,15 +118,12 @@ export class GeminiCliAdapter extends LocalCliAdapterBase {
     _prompt: string
   ): string[] {
     const modelName = request.runtimeBinding?.modelName;
-    return [
-      '--output-format',
-      'json',
-      '--model',
-      modelName ?? '',
-      '--sandbox',
-      '--approval-mode',
-      'default',
-    ];
+    // Headless runs deny every tool that needs approval, so `default` could never
+    // edit. A coder auto-approves edits inside the isolated workspace (the
+    // workspace is the boundary; Docker sandboxes are not assumed on Windows).
+    // A reviewer or Manager runs in the documented read-only `plan` mode (#242).
+    const readOnly = request.expectedProtocol === 'review.v1' || request.expectedProtocol === 'manager.v1';
+    return ['--output-format', 'json', '--model', modelName ?? '', '--approval-mode', readOnly ? 'plan' : 'auto_edit'];
   }
 
   protected override extractProtocolText(

@@ -39,7 +39,7 @@ export class CodexCliAdapter extends LocalCliAdapterBase {
   }
 
   public async getCapabilities(): Promise<Capability[]> {
-    return ['CODING', 'TERMINAL', 'FILESYSTEM_EDIT', 'TEST_EXECUTION'];
+    return ['CODING', 'TERMINAL', 'FILESYSTEM_EDIT', 'TEST_EXECUTION', 'REVIEW', 'PLANNING'];
   }
 
   public override async getHealth(): Promise<ProviderHealthStatus> {
@@ -86,7 +86,9 @@ export class CodexCliAdapter extends LocalCliAdapterBase {
     _prompt: string
   ): string[] {
     const modelName = request.runtimeBinding?.modelName;
-    return ['exec', '--json', '--model', modelName ?? '', '--sandbox', 'workspace-write'];
+    // A reviewer or Manager may read the isolated copy but never write to it.
+    const sandbox = request.expectedProtocol === 'review.v1' || request.expectedProtocol === 'manager.v1' ? 'read-only' : 'workspace-write';
+    return ['exec', '--json', '--model', modelName ?? '', '--sandbox', sandbox];
   }
 
   protected override classifyProviderProcessFailure(
