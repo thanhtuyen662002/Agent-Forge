@@ -609,6 +609,19 @@ export class Repository {
     `).run(status, endedAt, id).changes === 1;
   }
 
+  /**
+   * Expires a lifecycle-v1 product authorization whose adapter start was never
+   * claimed (AUTHORIZED, or DISPATCHED without adapter_started_at). Recovery and
+   * post-claim rejection use it; a started or settled execution is never touched.
+   */
+  public expireUnstartedProductAuthorization(id: string): boolean {
+    return this.db.prepare(`
+      UPDATE execution_authorizations SET status = 'INVALIDATED'
+      WHERE id = ? AND lifecycle_version = 1 AND assignment_id IS NOT NULL
+        AND adapter_started_at IS NULL AND settled_at IS NULL AND status IN ('AUTHORIZED', 'DISPATCHED')
+    `).run(id).changes === 1;
+  }
+
   /** Ends a still-RUNNING attempt; a no-op when settlement already terminalized it. */
   public endRunningTaskAttempt(id: string, status: 'FAILED' | 'CANCELLED', endedAt: string): boolean {
     return this.db.prepare("UPDATE task_attempts SET status = ?, ended_at = ? WHERE id = ? AND status = 'RUNNING'")
@@ -3377,7 +3390,17 @@ export class Repository {
     safeErrorJson: string | null,
   ): { success: boolean; alreadySettled: boolean; settledAt: string; evidenceHash: string; error?: string } {
     const fail = (error: string, settledAt = '', evidenceHash = '') => ({ success: false, alreadySettled: false, settledAt, evidenceHash, error });
-    const evidenceFor = (accountId: string | null | undefined, epoch: number | null | undefined, effectiveFinishedAt: string) => ({
+    type ProcessRunEvidence = { status: string; exit_code: number | null } | null;
+    // Process truth for the execution: the native run row written by ProcessRunner
+    // (id = execution id), or null when no process was ever started (for example an
+    // early adapter validation failure). Recorded in the hashed evidence.
+    const processRunOf = (): ProcessRunEvidence => {
+      const row = this.db.prepare('SELECT status, exit_code FROM process_runs WHERE id = ?').get(params.executionId) as
+        { status: string; exit_code: number | null } | undefined;
+      return row ? { status: String(row.status), exit_code: row.exit_code === null || row.exit_code === undefined ? null : Number(row.exit_code) } : null;
+    };
+    const evidenceFor = (accountId: string | null | undefined, epoch: number | null | undefined, effectiveFinishedAt: string,
+      processRun: ProcessRunEvidence) => ({
       authorization_id: auth.id,
       execution_id: params.executionId,
       transfer_id: null,
@@ -3397,6 +3420,7 @@ export class Repository {
       finished_at: effectiveFinishedAt,
       result_payload: safeResultPayload,
       error_json: safeErrorJson,
+      process_run: processRun,
     });
 
     // Replay: identical settlement is idempotent, anything else conflicts.
@@ -3419,7 +3443,8 @@ export class Repository {
         return fail(`SETTLEMENT_CONFLICT: Supplied finishedAt "${params.finishedAt}" !== stored finished_at "${stored.finished_at}".`, auth.settled_at, auth.settlement_evidence_hash);
       }
       const replayHash = computeSha256(canonicalJsonStringify(
-        evidenceFor(stored.account_id as string | null, stored.ownership_epoch as number | null, stored.finished_at as string),
+        evidenceFor(stored.account_id as string | null, stored.ownership_epoch as number | null, stored.finished_at as string,
+          (stored.process_run ?? null) as ProcessRunEvidence),
       ));
       if (
         replayHash === auth.settlement_evidence_hash &&
@@ -3472,7 +3497,12 @@ export class Repository {
       return fail(`OWNERSHIP_EPOCH_MISMATCH: Auth task epoch "${auth.task_ownership_epoch}" !== current task epoch "${currentTaskEpoch}".`);
     }
 
-    const canonicalEvidenceJson = canonicalJsonStringify(evidenceFor(assignment.selected_account_id, currentTaskEpoch, finishedAt));
+    const processRun = processRunOf();
+    if (processRun && processRun.status === 'RUNNING') {
+      // A native process that is not proven terminated cannot be settled; keep it fenced.
+      return fail(`PROCESS_NOT_TERMINATED: Process run for execution "${params.executionId}" is still RUNNING.`);
+    }
+    const canonicalEvidenceJson = canonicalJsonStringify(evidenceFor(assignment.selected_account_id, currentTaskEpoch, finishedAt, processRun));
     const evidenceHash = computeSha256(canonicalEvidenceJson);
 
     const authRes = this.db

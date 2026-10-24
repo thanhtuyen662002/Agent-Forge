@@ -1537,7 +1537,9 @@ describe('R5I7 Cross-Provider Handoff Evidence and Closure Integration Suite', (
       const slotA = repo.getWorkerSlot(flow.slotAId)!;
       expect(slotA.status).toBe('IDLE');
     }
-  }, 60000);
+  // Three complete worktree-backed handoff flows take ~36s on an idle machine
+  // (unchanged since before #226); 60s timed out on loaded Windows CI runners.
+  }, 180_000);
 
   // 14. Successful settlement releases the exact guarded lease and returns only the matching slot to IDLE
   testWindowsWorktree('14. Successful settlement releases the exact guarded lease and returns only the matching slot to IDLE', async () => {

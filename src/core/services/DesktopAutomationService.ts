@@ -22,6 +22,9 @@ const EXCLUDED_CONTEXT_ENTRIES = new Set(['.git', 'node_modules', 'dist', 'dist-
 /** Mirrors WorkerSlotLeaseService: only proven-available accounts can be leased. */
 const SCHEDULABLE_ACCOUNT_HEALTH = new Set(['AVAILABLE', 'LOW_QUOTA']);
 
+/** Marks attempts created by this service so restart cleanup only touches its own work. */
+export const AUTOMATION_ATTEMPT_MARKER = 'desktop-automation';
+
 export interface DesktopAutomationOptions {
   /** Root under which each project's managed execution worktrees live. */
   worktreeRoot: string;
@@ -78,6 +81,7 @@ export class DesktopAutomationService {
 
   public start(): void {
     if (this.handle) return;
+    this.releaseAbandonedAuthorizations();
     this.handle = this.timer.setInterval(() => { void this.tick(); }, this.intervalMs);
   }
 
@@ -85,6 +89,31 @@ export class DesktopAutomationService {
   public stop(): void {
     if (this.handle) this.timer.clearInterval(this.handle);
     this.handle = null;
+  }
+
+  /**
+   * Runs once before the loop starts: nothing of ours can be in flight yet, so
+   * an AUTHORIZED product authorization whose attempt this service created was
+   * abandoned by a previous process. Expire it and release its attempt and
+   * assignment. Owner-created authorizations are never touched.
+   */
+  public releaseAbandonedAuthorizations(): number {
+    if (this.inFlight.size > 0) return 0;
+    let released = 0;
+    for (const project of this.repo.getAllProjects()) {
+      for (const task of this.repo.getTasksByProject(project.id)) {
+        for (const auth of this.repo.getExecutionAuthorizationsByTask(task.id)) {
+          if (auth.status !== 'AUTHORIZED' || auth.lifecycle_version !== 1 || !auth.assignment_id || !auth.attempt_id) continue;
+          if (this.repo.getTaskAttempt(auth.attempt_id)?.summary !== AUTOMATION_ATTEMPT_MARKER) continue;
+          if (this.repo.getActiveLeaseForAssignment(auth.assignment_id)) continue;
+          if (!this.repo.expireUnstartedProductAuthorization(auth.id)) continue;
+          this.repo.endUnleasedAgentAssignment(auth.assignment_id, 'FAILED', this.now());
+          this.repo.endRunningTaskAttempt(auth.attempt_id, 'FAILED', this.now());
+          released += 1;
+        }
+      }
+    }
+    return released;
   }
 
   public isActive(): boolean {
@@ -264,8 +293,15 @@ export class DesktopAutomationService {
      * authorization is DISPATCHED, settlement and recovery own its terminal state.
      */
     const releaseUnclaimed = () => {
-      if (authorizationId && this.repo.getExecutionAuthorization(authorizationId)?.status !== 'AUTHORIZED') return;
-      if (authorizationId) this.repo.invalidateExecutionAuthorization(authorizationId);
+      if (authorizationId) {
+        const current = this.repo.getExecutionAuthorization(authorizationId);
+        // A started or settled execution belongs to settlement and recovery.
+        if (!current || current.adapter_started_at || current.settled_at) return;
+        // AUTHORIZED, or DISPATCHED but rejected before the adapter start claim: nothing
+        // ran, so expire it. Dispatch may already have INVALIDATED it; either way the
+        // attempt and assignment below must be released too.
+        if (current.status === 'AUTHORIZED' || current.status === 'DISPATCHED') this.repo.expireUnstartedProductAuthorization(authorizationId);
+      }
       if (assignmentId) this.repo.endUnleasedAgentAssignment(assignmentId, 'FAILED', this.now());
       endAttempt('FAILED');
     };
@@ -275,7 +311,7 @@ export class DesktopAutomationService {
       const nextAttemptNumber = Math.max(0, ...this.repo.getTaskAttemptsByTask(task.id).map((a) => a.attempt_number)) + 1;
       this.repo.createTaskAttempt({
         id: attemptId, task_id: task.id, attempt_number: nextAttemptNumber, agent_id: coder.agent.id,
-        agent_profile_id: coder.agentProfileId, status: 'RUNNING', started_at: this.now(), ended_at: null, summary: null,
+        agent_profile_id: coder.agentProfileId, status: 'RUNNING', started_at: this.now(), ended_at: null, summary: AUTOMATION_ATTEMPT_MARKER,
       });
 
       // 2. Role-aware routing persists the assignment and routing decision.
