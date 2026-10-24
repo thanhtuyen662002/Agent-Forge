@@ -1026,6 +1026,9 @@ describe('desktop automation runtime', () => {
       expect(fs.existsSync(worktree)).toBe(false); // The retained worktree is removed.
       expect(service.getIntegration().list(projectId)[0]).toMatchObject({ state: 'BRANCH_CREATED', branch, changedFiles: ['NOTES.md', 'README.md'] });
       expect(await service.getIntegration().createBranch(projectId, task.id)).toEqual({ success: false, errorCode: 'ALREADY_INTEGRATED' });
+      // Discard after a branch keeps the branch outcome (it only cleans up a leftover copy).
+      expect(await service.getIntegration().discard(projectId, task.id)).toEqual({ success: true });
+      expect(service.getIntegration().list(projectId)[0]).toMatchObject({ state: 'BRANCH_CREATED', branch });
     }, 180_000);
 
     it('refuses work that changed after it was reviewed', async () => {
@@ -1035,20 +1038,62 @@ describe('desktop automation runtime', () => {
       expect(git('branch', '--list', 'agent/*')).toBe('');
     }, 180_000);
 
-    it('adopts a branch an interrupted attempt already created from the same work', async () => {
-      const { task, worktree } = await runToDone();
-      // Simulate a crash after the branch was written but before the result was recorded.
-      const auth = repo.getExecutionAuthorizationsByTask(task.id)[0];
+    const tupleOf = (taskId: string) => {
+      const auth = repo.getExecutionAuthorizationsByTask(taskId)[0];
       const assignment = repo.getAgentAssignment(auth.assignment_id!)!;
-      const worktrees = new GitWorktreeService({ gitExecutable: resolveTrustedExecutable('git', 'git')!, repositoryRoot: repoDir, managedRoot: path.join(tempDir, 'worktrees', projectId) });
-      const tuple = { projectId, taskId: task.id, attemptId: auth.attempt_id, assignmentId: assignment.id, workerSlotId: assignment.selected_worker_slot_id!,
+      return { projectId, taskId, attemptId: auth.attempt_id, assignmentId: assignment.id, workerSlotId: assignment.selected_worker_slot_id!,
         baseSha: auth.repository_head_sha, ownershipEpoch: auth.task_ownership_epoch };
-      const branch = WorktreeIntegrationService.branchName(repo.getTask(task.id)!);
-      expect((await worktrees.commitChangesToNewBranch(tuple, branch, 'interrupted')).status).toBe('COMMITTED');
+    };
+    const worktreesFor = () => new GitWorktreeService({ gitExecutable: resolveTrustedExecutable('git', 'git')!, repositoryRoot: repoDir, managedRoot: path.join(tempDir, 'worktrees', projectId) });
 
-      expect(await service.getIntegration().createBranch(projectId, task.id)).toMatchObject({ success: true, branch });
+    it('adopts exactly the intended commit of an interrupted attempt', async () => {
+      const { task, worktree } = await runToDone();
+      // Simulate a crash after the intent and the branch were written but before the result was recorded.
+      const reviewEventId = repo.getEventsByProject(projectId).find((e) => e.type === 'AUTOMATION_REVIEW_PASSED')!.id;
+      const branch = WorktreeIntegrationService.branchName(repo.getTask(task.id)!);
+      const committed = await worktreesFor().commitChangesToNewBranch(tupleOf(task.id), branch, 'interrupted', ['NOTES.md', 'README.md'], (commitSha) => {
+        events.record(projectId, 'AUTOMATION_INTEGRATION_INTENT', 'intent', { reviewEventId, branch, commitSha, taskRevision: 0 }, task.id);
+      });
+      expect(committed.status).toBe('COMMITTED');
+
+      expect(await service.getIntegration().createBranch(projectId, task.id)).toMatchObject({ success: true, branch, worktreeRemoved: true });
       expect(fs.existsSync(worktree)).toBe(false);
       expect(repo.getEventsByProject(projectId).find((e) => e.type === 'AUTOMATION_INTEGRATION_BRANCH_CREATED')!.structured_payload).toMatchObject({ adopted: true });
+    }, 180_000);
+
+    it('never adopts a branch of the same name it did not create', async () => {
+      const { task, worktree } = await runToDone();
+      const branch = WorktreeIntegrationService.branchName(repo.getTask(task.id)!);
+      git('branch', branch); // The owner's own branch, pointing at main.
+      const before = git('rev-parse', branch);
+      expect(await service.getIntegration().createBranch(projectId, task.id)).toEqual({ success: false, errorCode: 'BRANCH_EXISTS' });
+      expect(git('rev-parse', branch)).toBe(before);
+      expect(fs.existsSync(worktree)).toBe(true);
+    }, 180_000);
+
+    it('refuses a commit whose files differ from the reviewed ones before any branch exists', async () => {
+      const { task, worktree } = await runToDone();
+      const branch = WorktreeIntegrationService.branchName(repo.getTask(task.id)!);
+      // Expected files that do not match what is in the worktree: refused before any ref exists.
+      const mismatch = await worktreesFor().commitChangesToNewBranch(tupleOf(task.id), branch, 'x', ['README.md'], () => undefined);
+      expect(mismatch).toMatchObject({ status: 'FAILED' });
+      expect((mismatch as { error: string }).error).toContain('COMMIT_DOES_NOT_MATCH_REVIEW');
+      expect(git('branch', '--list', 'agent/*')).toBe('');
+      expect(fs.readFileSync(path.join(worktree, 'NOTES.md'), 'utf8')).toBe('# Notes\n'); // The worktree is untouched.
+      expect(await service.getIntegration().createBranch(projectId, task.id)).toMatchObject({ success: true });
+    }, 180_000);
+
+    it('discards through a junction without touching its target', async () => {
+      const { task, worktree } = await runToDone();
+      const outside = path.join(tempDir, 'precious');
+      fs.mkdirSync(outside);
+      fs.writeFileSync(path.join(outside, 'keep.txt'), 'owner data\n', 'utf8');
+      fs.symlinkSync(outside, path.join(worktree, 'linked'), 'junction');
+      fs.mkdirSync(path.join(worktree, 'empty-dir'));
+
+      expect(await service.getIntegration().discard(projectId, task.id)).toEqual({ success: true });
+      expect(fs.readFileSync(path.join(outside, 'keep.txt'), 'utf8')).toBe('owner data\n');
+      expect(fs.existsSync(worktree)).toBe(false);
     }, 180_000);
 
     it('discards the retained work of a terminal task only', async () => {
@@ -1058,6 +1103,7 @@ describe('desktop automation runtime', () => {
       expect(service.getIntegration().list(projectId)[0]).toMatchObject({ state: 'DISCARDED' });
       expect(git('branch', '--list', 'agent/*')).toBe('');
       expect(await service.getIntegration().createBranch(projectId, task.id)).toEqual({ success: false, errorCode: 'ALREADY_DISCARDED' });
+      expect(await service.getIntegration().discard(projectId, task.id)).toEqual({ success: false, errorCode: 'ALREADY_DISCARDED' });
 
       const open = tasks.createTask({ projectId, title: 'Still open', description: null, priority: 'LOW', risk: 'LOW', acceptanceCriteria: ['x'], constraints: [] });
       expect(await service.getIntegration().discard(projectId, open.id)).toEqual({ success: false, errorCode: 'TASK_NOT_TERMINAL' });

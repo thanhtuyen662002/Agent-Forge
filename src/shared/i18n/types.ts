@@ -492,6 +492,7 @@ export interface TranslationDictionary {
       confirmDiscard: string;
       branchCreated: string;
       discarded: string;
+      removeLeftover: string;
       filesChanged: string;
       failed: string;
     };

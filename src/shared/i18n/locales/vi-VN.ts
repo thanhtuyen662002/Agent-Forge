@@ -489,6 +489,7 @@ export const viVN: TranslationDictionary = {
       confirmDiscard: 'Bỏ hẳn phần việc này?',
       branchCreated: 'Đã lưu trên nhánh {branch}. Mở bằng công cụ Git của bạn để tự merge.',
       discarded: 'Đã bỏ.',
+      removeLeftover: 'Xóa bản sao còn sót',
       filesChanged: '{count} file thay đổi',
       failed: 'Không thực hiện được ({code}).',
     },

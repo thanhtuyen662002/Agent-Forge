@@ -4,11 +4,14 @@ import { GitWorktreeService, type WorktreeOwnershipTuple } from './GitWorktreeSe
 import { EvidenceCollector } from '../autonomy/evidence';
 import { ProcessRunner } from './ProcessRunner';
 import type { WorkOrder } from '../autonomy/contracts';
-import type { ExecutionAuthorization, Task } from '../types/domain';
+import type { EventRecord, ExecutionAuthorization, Task } from '../types/domain';
 
+export const INTEGRATION_INTENT_EVENT = 'AUTOMATION_INTEGRATION_INTENT';
 export const INTEGRATION_BRANCH_CREATED_EVENT = 'AUTOMATION_INTEGRATION_BRANCH_CREATED';
 export const INTEGRATION_DISCARDED_EVENT = 'AUTOMATION_INTEGRATION_DISCARDED';
+export const INTEGRATION_CLEANED_EVENT = 'AUTOMATION_INTEGRATION_CLEANED';
 const REVIEW_PASSED_EVENT = 'AUTOMATION_REVIEW_PASSED';
+const INTEGRATION_EVENTS = [INTEGRATION_INTENT_EVENT, INTEGRATION_BRANCH_CREATED_EVENT, INTEGRATION_DISCARDED_EVENT, INTEGRATION_CLEANED_EVENT];
 const TERMINAL_STATES = new Set(['DONE', 'CANCELLED', 'FAILED']);
 
 export interface IntegrationEntry {
@@ -19,10 +22,12 @@ export interface IntegrationEntry {
   branch: string | null;
   commitSha: string | null;
   changedFiles: string[];
+  /** The hidden working copy could not be removed yet; Discard cleans it up without touching the branch. */
+  leftoverCopy: boolean;
 }
 
 export type IntegrationResult =
-  | { success: true; branch?: string; commitSha?: string }
+  | { success: true; branch?: string; commitSha?: string; worktreeRemoved?: boolean }
   | { success: false; errorCode: string };
 
 interface ReviewedWork {
@@ -32,9 +37,9 @@ interface ReviewedWork {
   worktree: string;
   headSha: string;
   snapshotSha: string;
-  /** The verified changed files, kept for adopting a branch after the worktree is gone. */
-  changedFiles: string[];
 }
+
+const payloadOf = (event: EventRecord) => (event.structured_payload ?? {}) as Record<string, unknown>;
 
 /**
  * Owner-controlled integration of reviewed coder work (#238). Only an explicit
@@ -43,7 +48,7 @@ interface ReviewedWork {
  * owner's checkout and every existing branch are never modified; nothing is
  * merged or pushed). The retained worktree is then discarded and removed
  * through GitWorktreeService's owned primitives. Discard is offered for
- * terminal tasks only.
+ * terminal tasks only and never hides a branch that holds the work.
  */
 export class WorktreeIntegrationService {
   private readonly busy = new Set<string>();
@@ -57,56 +62,62 @@ export class WorktreeIntegrationService {
   ) {}
 
   /** The latest PASS review of the task's current revision, bound to its verified worktree. */
-  private reviewedWork(task: Task): ReviewedWork | null {
-    const passed = this.repo.getEventsByProject(task.project_id)
+  private reviewedWork(task: Task, projectEvents: EventRecord[]): ReviewedWork | null {
+    const passed = projectEvents
       .filter((event) => event.type === REVIEW_PASSED_EVENT && event.task_id === task.id)
       .sort((a, b) => b.timestamp.localeCompare(a.timestamp))[0];
     if (!passed) return null;
-    const payload = passed.structured_payload as { coderAuthorizationId?: unknown; verificationEventId?: unknown; headSha?: unknown; snapshotSha?: unknown };
+    const payload = payloadOf(passed);
     const coderAuth = typeof payload.coderAuthorizationId === 'string' ? this.repo.getExecutionAuthorization(payload.coderAuthorizationId) : null;
     const verification = typeof payload.verificationEventId === 'string' ? this.repo.getEvent(payload.verificationEventId) : null;
-    const worktree = (verification?.structured_payload as { worktree?: unknown } | undefined)?.worktree;
+    const worktree = verification ? payloadOf(verification).worktree : undefined;
     if (!coderAuth?.assignment_id || typeof worktree !== 'string' || typeof payload.headSha !== 'string' || typeof payload.snapshotSha !== 'string') return null;
     if (coderAuth.task_revision !== task.revision_count) return null;
     const assignment = this.repo.getAgentAssignment(coderAuth.assignment_id);
     if (!assignment?.selected_worker_slot_id) return null;
-    const verifiedFiles = (verification?.structured_payload as { changedFiles?: unknown } | undefined)?.changedFiles;
     return {
       reviewEventId: passed.id, coderAuth, worktree, headSha: payload.headSha, snapshotSha: payload.snapshotSha,
-      changedFiles: Array.isArray(verifiedFiles) ? verifiedFiles.filter((file): file is string => typeof file === 'string') : [],
       tuple: { projectId: coderAuth.project_id, taskId: coderAuth.task_id, attemptId: coderAuth.attempt_id ?? null, assignmentId: assignment.id,
         workerSlotId: assignment.selected_worker_slot_id, baseSha: coderAuth.repository_head_sha, ownershipEpoch: coderAuth.task_ownership_epoch },
     };
   }
 
-  private outcomeFor(task: Task, reviewEventId: string) {
-    return this.repo.getEventsByProject(task.project_id)
-      .filter((event) => event.task_id === task.id && (event.type === INTEGRATION_BRANCH_CREATED_EVENT || event.type === INTEGRATION_DISCARDED_EVENT) &&
-        (event.structured_payload as { reviewEventId?: unknown }).reviewEventId === reviewEventId)
-      .sort((a, b) => b.timestamp.localeCompare(a.timestamp))[0] ?? null;
+  private integrationEvents(projectEvents: EventRecord[], taskId: string, reviewEventId: string) {
+    return projectEvents
+      .filter((event) => event.task_id === taskId && INTEGRATION_EVENTS.includes(event.type) && payloadOf(event).reviewEventId === reviewEventId)
+      .sort((a, b) => b.timestamp.localeCompare(a.timestamp));
+  }
+
+  /** The owner's decision for this reviewed work: a branch, a discard, or nothing yet. Cleanup never replaces it. */
+  private outcomeFor(projectEvents: EventRecord[], taskId: string, reviewEventId: string) {
+    return this.integrationEvents(projectEvents, taskId, reviewEventId)
+      .find((event) => event.type === INTEGRATION_BRANCH_CREATED_EVENT || event.type === INTEGRATION_DISCARDED_EVENT) ?? null;
   }
 
   /** Reviewed work of the project and what the owner did with it. */
   public list(projectId: string): IntegrationEntry[] {
+    const projectEvents = this.repo.getEventsByProject(projectId);
     const entries: IntegrationEntry[] = [];
     for (const task of this.repo.getTasksByProject(projectId)) {
       if (task.state !== 'DONE' || this.repo.isTaskTrashed(task.id)) continue;
-      const work = this.reviewedWork(task);
+      const work = this.reviewedWork(task, projectEvents);
       if (!work) continue;
-      const outcome = this.outcomeFor(task, work.reviewEventId);
-      const payload = (outcome?.structured_payload ?? {}) as { branch?: unknown; commitSha?: unknown; changedFiles?: unknown };
+      const outcome = this.outcomeFor(projectEvents, task.id, work.reviewEventId);
+      const payload = outcome ? payloadOf(outcome) : {};
+      const cleaned = this.integrationEvents(projectEvents, task.id, work.reviewEventId).some((event) => event.type === INTEGRATION_CLEANED_EVENT);
       entries.push({
         taskId: task.id, taskTitle: task.title, taskRevision: task.revision_count,
         state: !outcome ? 'READY' : outcome.type === INTEGRATION_BRANCH_CREATED_EVENT ? 'BRANCH_CREATED' : 'DISCARDED',
         branch: typeof payload.branch === 'string' ? payload.branch : null,
         commitSha: typeof payload.commitSha === 'string' ? payload.commitSha : null,
         changedFiles: Array.isArray(payload.changedFiles) ? payload.changedFiles.filter((file): file is string => typeof file === 'string') : [],
+        leftoverCopy: outcome?.type === INTEGRATION_BRANCH_CREATED_EVENT && payload.worktreeRemoved === false && !cleaned,
       });
     }
     return entries;
   }
 
-  /** True when a DONE task's reviewed work waits for the owner. */
+  /** A DONE task whose reviewed work waits for the owner, if any. */
   public hasReadyWork(projectId: string): string | null {
     return this.list(projectId).find((entry) => entry.state === 'READY')?.taskId ?? null;
   }
@@ -129,23 +140,24 @@ export class WorktreeIntegrationService {
       const task = this.repo.getTask(taskId);
       if (!task || task.project_id !== projectId || this.repo.isTaskTrashed(taskId) || this.repo.isProjectTrashed(projectId)) return { success: false, errorCode: 'TASK_NOT_FOUND' };
       if (task.state !== 'DONE') return { success: false, errorCode: 'TASK_NOT_DONE' };
-      const work = this.reviewedWork(task);
+      const projectEvents = this.repo.getEventsByProject(projectId);
+      const work = this.reviewedWork(task, projectEvents);
       if (!work) return { success: false, errorCode: 'NO_REVIEWED_WORK' };
-      const outcome = this.outcomeFor(task, work.reviewEventId);
+      const outcome = this.outcomeFor(projectEvents, task.id, work.reviewEventId);
       if (outcome) return { success: false, errorCode: outcome.type === INTEGRATION_BRANCH_CREATED_EVENT ? 'ALREADY_INTEGRATED' : 'ALREADY_DISCARDED' };
       const worktrees = this.worktreesFor(projectId);
       if (!worktrees) return { success: false, errorCode: 'GIT_UNAVAILABLE' };
       const branch = WorktreeIntegrationService.branchName(task);
 
+      // An interrupted earlier attempt may already have written exactly the intended commit: adopt it.
+      const adopted = await this.adoptIntended(task, work, branch, projectEvents, worktrees);
+      if (adopted) return adopted;
+
       const inspected = await worktrees.inspectWorktree(work.tuple);
       if (inspected.status !== 'INSPECTED' || !inspected.inspection.registered || !inspected.inspection.exists ||
           inspected.inspection.managedPath !== work.worktree) {
-        // A branch already made from this exact work by an interrupted earlier attempt is adopted, never re-created.
-        return (await this.adoptExisting(task, work, branch)) ?? { success: false, errorCode: 'WORKTREE_NOT_AVAILABLE' };
+        return { success: false, errorCode: 'WORKTREE_NOT_AVAILABLE' };
       }
-      // An interrupted earlier attempt may already have written the branch: adopt it if it is exactly this work.
-      const adopted = await this.adoptExisting(task, work, branch);
-      if (adopted) return adopted;
       let snapshot;
       try {
         snapshot = await this.evidence.collect({ worktree: work.worktree, base_sha: work.coderAuth.repository_head_sha } as WorkOrder);
@@ -158,31 +170,41 @@ export class WorktreeIntegrationService {
       if (snapshot.changedFiles.length === 0) return { success: false, errorCode: 'NOTHING_TO_INTEGRATE' };
 
       const message = `${task.title}\n\nReviewed work of Agent Forge task ${task.id}, revision ${task.revision_count}.`;
-      const committed = await worktrees.commitChangesToNewBranch(work.tuple, branch, message);
+      const committed = await worktrees.commitChangesToNewBranch(work.tuple, branch, message, snapshot.changedFiles, (commitSha) => {
+        // Durable intent before the ref exists: only this exact commit may ever be adopted.
+        this.events.record(projectId, INTEGRATION_INTENT_EVENT, `Creating branch ${branch} for task ${task.id}.`,
+          { reviewEventId: work.reviewEventId, branch, commitSha, taskRevision: task.revision_count }, task.id);
+      });
       if (committed.status !== 'COMMITTED') {
-        const adopted = committed.error?.startsWith('BRANCH_EXISTS') ? await this.adoptExisting(task, work, branch, snapshot.changedFiles) : null;
-        return adopted ?? { success: false, errorCode: committed.error?.startsWith('BRANCH_EXISTS') ? 'BRANCH_EXISTS' : 'BRANCH_CREATION_FAILED' };
+        const code = committed.error?.split(':')[0] ?? '';
+        return { success: false, errorCode: code === 'BRANCH_EXISTS' || code === 'COMMIT_DOES_NOT_MATCH_REVIEW' ? code : 'BRANCH_CREATION_FAILED' };
       }
-      const expected = [...snapshot.changedFiles].sort();
-      if (JSON.stringify(committed.changedFiles) !== JSON.stringify(expected)) {
-        // The commit is not exactly the reviewed work: never report it as integrated.
-        return { success: false, errorCode: 'COMMIT_DOES_NOT_MATCH_REVIEW' };
-      }
-      this.events.record(projectId, INTEGRATION_BRANCH_CREATED_EVENT, `Reviewed work of task ${task.id} is on branch ${branch}.`, {
-        reviewEventId: work.reviewEventId, branch, commitSha: committed.commitSha, baseSha: work.coderAuth.repository_head_sha,
-        changedFiles: committed.changedFiles, taskRevision: task.revision_count,
-      }, task.id);
-      await this.removeRetained(worktrees, work.tuple);
-      return { success: true, branch, commitSha: committed.commitSha };
+      return this.recordCreated(task, work, branch, committed.commitSha, committed.changedFiles, worktrees, false);
     }, { success: false, errorCode: 'OPERATION_IN_PROGRESS' });
   }
 
+  private async recordCreated(task: Task, work: ReviewedWork, branch: string, commitSha: string, changedFiles: string[],
+    worktrees: GitWorktreeService, adopted: boolean): Promise<IntegrationResult> {
+    // The branch holds the work either way; whether the hidden copy is gone is reported honestly.
+    const worktreeRemoved = await this.removeRetained(worktrees, work.tuple);
+    this.events.record(task.project_id, INTEGRATION_BRANCH_CREATED_EVENT, `Reviewed work of task ${task.id} is on branch ${branch}.`, {
+      reviewEventId: work.reviewEventId, branch, commitSha, baseSha: work.coderAuth.repository_head_sha, changedFiles,
+      taskRevision: task.revision_count, worktreeRemoved, adopted,
+    }, task.id);
+    return { success: true, branch, commitSha, worktreeRemoved };
+  }
+
   /**
-   * After an interrupted createBranch (commit and ref written, event not):
-   * adopts the branch only if it is exactly one commit on the reviewed base
-   * whose changed files are the reviewed ones.
+   * After an interrupted createBranch (intent recorded and ref written, result
+   * not): adopts the branch only if its tip is exactly the intended commit,
+   * one commit on the reviewed base.
    */
-  private async adoptExisting(task: Task, work: ReviewedWork, branch: string, changedFiles?: string[]): Promise<IntegrationResult | null> {
+  private async adoptIntended(task: Task, work: ReviewedWork, branch: string, projectEvents: EventRecord[],
+    worktrees: GitWorktreeService): Promise<IntegrationResult | null> {
+    const intent = this.integrationEvents(projectEvents, task.id, work.reviewEventId)
+      .find((event) => event.type === INTEGRATION_INTENT_EVENT && payloadOf(event).branch === branch);
+    const intended = intent ? payloadOf(intent).commitSha : null;
+    if (typeof intended !== 'string') return null;
     const git = this.gitExecutable();
     const project = this.repo.getProjectMetadata(task.project_id);
     if (!git || !project) return null;
@@ -192,35 +214,37 @@ export class WorktreeIntegrationService {
     });
     const base = work.coderAuth.repository_head_sha.toLowerCase();
     const tip = await run(['rev-parse', '--verify', '--quiet', `refs/heads/${branch}^{commit}`]);
-    const commitSha = tip.stdout.trim().toLowerCase();
-    if (tip.exitCode !== 0 || !/^[0-9a-f]{40}$/.test(commitSha)) return null;
-    const parents = (await run(['rev-list', '--parents', '-n', '1', commitSha])).stdout.trim().toLowerCase().split(/\s+/);
+    if (tip.exitCode !== 0 || tip.stdout.trim().toLowerCase() !== intended) return null;
+    const parents = (await run(['rev-list', '--parents', '-n', '1', intended])).stdout.trim().toLowerCase().split(/\s+/);
     if (parents.length !== 2 || parents[1] !== base) return null;
-    const files = (await run(['diff', '--name-only', '-z', base, commitSha])).stdout.split('\0').filter(Boolean).sort();
-    const expected = [...(changedFiles ?? work.changedFiles)].sort();
-    if (expected.length === 0 || JSON.stringify(files) !== JSON.stringify(expected)) return null;
-    this.events.record(task.project_id, INTEGRATION_BRANCH_CREATED_EVENT, `Reviewed work of task ${task.id} is on branch ${branch}.`, {
-      reviewEventId: work.reviewEventId, branch, commitSha, baseSha: base, changedFiles: files, taskRevision: task.revision_count, adopted: true,
-    }, task.id);
-    const worktrees = this.worktreesFor(task.project_id);
-    if (worktrees) await this.removeRetained(worktrees, work.tuple);
-    return { success: true, branch, commitSha };
+    const files = (await run(['diff', '--no-renames', '--name-only', '-z', base, intended])).stdout.split('\0').filter(Boolean).sort();
+    return this.recordCreated(task, work, branch, intended, files, worktrees, true);
   }
 
   private async removeRetained(worktrees: GitWorktreeService, tuple: WorktreeOwnershipTuple): Promise<boolean> {
+    const inspected = await worktrees.inspectWorktree(tuple);
+    if (inspected.status === 'INSPECTED' && !inspected.inspection.registered && !inspected.inspection.exists) return true; // Already gone.
     const discarded = await worktrees.discardOwnedChanges(tuple);
     if (discarded.status !== 'DISCARDED') return false;
     return (await worktrees.removeWorktree(tuple)).status === 'REMOVED';
   }
 
-  /** Discards the retained worktrees of a terminal task; the reviewed work is not kept. */
+  /**
+   * Discards the retained worktrees of a terminal task. When the reviewed work
+   * is already on a branch, only the leftover hidden copy is cleaned up and
+   * the branch outcome is kept.
+   */
   public discard(projectId: string, taskId: string): Promise<IntegrationResult> {
     return this.exclusive(taskId, async () => {
       const task = this.repo.getTask(taskId);
-      if (!task || task.project_id !== projectId) return { success: false, errorCode: 'TASK_NOT_FOUND' };
+      if (!task || task.project_id !== projectId || this.repo.isTaskTrashed(taskId) || this.repo.isProjectTrashed(projectId)) return { success: false, errorCode: 'TASK_NOT_FOUND' };
       if (!TERMINAL_STATES.has(task.state)) return { success: false, errorCode: 'TASK_NOT_TERMINAL' };
       const worktrees = this.worktreesFor(projectId);
       if (!worktrees) return { success: false, errorCode: 'GIT_UNAVAILABLE' };
+      const projectEvents = this.repo.getEventsByProject(projectId);
+      const work = this.reviewedWork(task, projectEvents);
+      const outcome = work ? this.outcomeFor(projectEvents, task.id, work.reviewEventId) : null;
+      if (outcome?.type === INTEGRATION_DISCARDED_EVENT) return { success: false, errorCode: 'ALREADY_DISCARDED' };
       let failed = 0;
       for (const auth of this.repo.getExecutionAuthorizationsByTask(task.id)) {
         if (auth.lifecycle_version !== 1 || !auth.assignment_id) continue;
@@ -228,12 +252,14 @@ export class WorktreeIntegrationService {
         if (!assignment?.selected_worker_slot_id) continue;
         const tuple: WorktreeOwnershipTuple = { projectId: auth.project_id, taskId: auth.task_id, attemptId: auth.attempt_id ?? null, assignmentId: assignment.id,
           workerSlotId: assignment.selected_worker_slot_id, baseSha: auth.repository_head_sha, ownershipEpoch: auth.task_ownership_epoch };
-        const inspected = await worktrees.inspectWorktree(tuple);
-        if (inspected.status === 'INSPECTED' && !inspected.inspection.registered && !inspected.inspection.exists) continue; // Already gone.
         if (!(await this.removeRetained(worktrees, tuple))) failed += 1;
       }
       if (failed > 0) return { success: false, errorCode: 'DISCARD_INCOMPLETE' };
-      const work = this.reviewedWork(task);
+      if (outcome?.type === INTEGRATION_BRANCH_CREATED_EVENT) {
+        this.events.record(projectId, INTEGRATION_CLEANED_EVENT, `The leftover copy of task ${task.id} was removed; its branch is kept.`,
+          { reviewEventId: work!.reviewEventId, taskRevision: task.revision_count }, task.id);
+        return { success: true };
+      }
       this.events.record(projectId, INTEGRATION_DISCARDED_EVENT, `The owner discarded the retained work of task ${task.id}.`,
         { reviewEventId: work?.reviewEventId ?? null, taskRevision: task.revision_count }, task.id);
       return { success: true };

@@ -9,6 +9,7 @@ interface IntegrationEntryView {
   state: 'READY' | 'BRANCH_CREATED' | 'DISCARDED';
   branch: string | null;
   changedFiles: string[];
+  leftoverCopy: boolean;
 }
 
 const isRecord = (value: unknown): value is Record<string, unknown> => !!value && typeof value === 'object' && !Array.isArray(value);
@@ -25,6 +26,7 @@ export function normalizeIntegrationReply(reply: unknown): IntegrationEntryView[
       taskId: item.taskId, taskTitle: item.taskTitle, taskRevision: item.taskRevision, state: item.state as IntegrationEntryView['state'],
       branch: typeof item.branch === 'string' ? item.branch : null,
       changedFiles: Array.isArray(item.changedFiles) ? item.changedFiles.filter((file): file is string => typeof file === 'string') : [],
+      leftoverCopy: item.leftoverCopy === true,
     });
   }
   return entries;
@@ -105,6 +107,13 @@ export const ReviewedWorkPanel: React.FC<{ projectId: string }> = ({ projectId }
               )}
               {entry.state === 'DISCARDED' && <p className="text-xs text-slate-400">{t('runtime.integrationPanel.discarded')}</p>}
             </div>
+            {entry.state === 'BRANCH_CREATED' && entry.leftoverCopy && (
+              <button type="button" disabled={busy !== null}
+                onClick={() => void act(entry.taskId, () => api.discardIntegration(projectId, entry.taskId))}
+                className="px-3 py-1.5 rounded-lg text-xs border border-surface-border text-slate-300 hover:bg-surface-hover disabled:opacity-40">
+                {t('runtime.integrationPanel.removeLeftover')}
+              </button>
+            )}
             {entry.state === 'READY' && (
               <div className="flex gap-2">
                 <button type="button" disabled={busy !== null}

@@ -386,9 +386,12 @@ and nothing is ever merged or pushed.
   as one commit on the reviewed base. They land on a **new** branch
   `agent/<task-title>-<task-id>-r<revision>`, authored by *Agent Forge*.
   - Line endings are not converted; the commit holds the reviewed bytes.
+  - Changes are staged into a private copy of the worktree's index, so the
+    reviewed snapshot never changes. The commit's files (rename detection off)
+    must equal the reviewed ones *before* any branch is written. The exact
+    commit is recorded as an intent first.
   - The default branch, the owner's checkout and every existing branch are
     never modified. An existing branch name is never overwritten.
-  - The commit's changed files must equal the reviewed ones.
   - The retained worktree is then cleaned and removed through
     `GitWorktreeService`. The branch stays in the repository for the owner to
     merge with their usual Git tool.
@@ -396,11 +399,18 @@ and nothing is ever merged or pushed.
   retained worktrees are cleaned and removed. The repository policy forbids
   `git reset --hard` and `git clean -f`, so discard only unstages, restores
   tracked files from the base, and deletes the worktree's untracked files
-  inside the managed path. Removal then requires the exact checkout again.
+  inside the managed path. Deletion never follows a symlink or junction: the
+  link itself is removed and its target is untouched. Removal then requires the
+  exact checkout again. A repository whose `.gitattributes` converts line
+  endings or applies filters can fail this check; the discard then reports
+  `DISCARD_INCOMPLETE` and keeps the copy. If the branch was created but its
+  hidden copy could not be removed, the panel offers *Remove leftover copy*,
+  which keeps the branch.
 - **Restart.** If an earlier attempt wrote the branch but was interrupted
   before recording it, the next *Create branch* adopts the branch. It does so
-  only if the branch is exactly one commit on the reviewed base with the
-  reviewed files; otherwise the action is refused (`BRANCH_EXISTS`).
+  only if the branch tip is exactly the recorded intended commit, one commit on
+  the reviewed base. Any other branch with that name, for example one of the
+  owner's, is refused (`BRANCH_EXISTS`) and left untouched.
 
 ## Restart recovery for automated executions
 

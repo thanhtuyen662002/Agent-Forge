@@ -270,8 +270,6 @@ export class DesktopAutomationService {
     if (validating) return status('VERIFYING', validating.id);
     const reviewReady = tasks.find((task) => task.state === 'REVIEW_READY' || task.state === 'REVIEWING');
     if (reviewReady) return status('AWAITING_REVIEW', reviewReady.id, this.awaitingReviewReason(reviewReady));
-    const readyForIntegration = this.integration.hasReadyWork(project.id);
-    if (readyForIntegration) return status('READY_FOR_INTEGRATION', readyForIntegration, 'REVIEWED_WORK_READY');
 
     const authorized = this.authorizedTasks(project);
     for (const task of authorized) {
@@ -288,6 +286,9 @@ export class DesktopAutomationService {
       // A concrete Manager state first, then what sent the task back, then a missing Manager agent.
       const waiting = this.managerWaitingReason(project);
       if (waiting && waiting.reasonCode !== 'NO_MANAGER') return status('WAITING_FOR_MANAGER', waiting.taskId, waiting.reasonCode);
+      // Shown only when nothing is running, failed or queued, so it never hides those.
+      const readyForIntegration = this.integration.hasReadyWork(project.id);
+      if (readyForIntegration) return status('READY_FOR_INTEGRATION', readyForIntegration, 'REVIEWED_WORK_READY');
       const failedVerification = tasks.find((task) => this.verificationReason(task.id) === 'VERIFICATION_FAILED' && task.state === 'CODING');
       if (failedVerification) return status('WAITING_FOR_MANAGER', failedVerification.id, 'VERIFICATION_FAILED');
       const sentBack = tasks.find((task) => task.state === 'CODING' && this.reviewer?.reviewReason(task) === 'REVIEW_FIX_REQUIRED');

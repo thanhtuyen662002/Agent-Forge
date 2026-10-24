@@ -489,6 +489,7 @@ export const enUS: TranslationDictionary = {
       confirmDiscard: 'Discard this work for good?',
       branchCreated: 'On branch {branch}. Open it in your Git tool to merge it yourself.',
       discarded: 'Discarded.',
+      removeLeftover: 'Remove leftover copy',
       filesChanged: '{count} file(s) changed',
       failed: 'Could not complete the action ({code}).',
     },
