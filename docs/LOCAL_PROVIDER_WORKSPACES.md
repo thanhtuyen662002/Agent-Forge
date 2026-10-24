@@ -37,14 +37,32 @@ the source repository path through the prompt or environment. Version probes
 also run from a disposable temporary directory. Workspace parents are created
 as real directories and the workspace identity is fenced throughout cleanup.
 
-Only an existing, authorized context file can be synchronized back. A valid
-`coder.v1` protocol is required before synchronization. All source and
+Synchronization back to the source is limited to the authorized scope
+(#240). A valid `coder.v1` protocol is required before synchronization.
+
+- **Edits** of authorized context files are synchronized.
+- **Deletions** of authorized context files are synchronized.
+- **New files** are synchronized only inside a context path that was an
+  explicitly authorized **directory** (for example `src`), including new
+  nested directories. A new file anywhere else fails the execution with
+  `WORKSPACE_SYNC_OUT_OF_SCOPE`; authorizing only individual files allows no
+  new files.
+- A new file with a policy-denied name (such as `.env*`), a link or special
+  file anywhere in the workspace (`WORKSPACE_REPARSE_POINT`), or a new file
+  whose path already exists in the source (`WORKSPACE_SYNC_CONFLICT`) fails
+  the execution and nothing is written.
+- New content is bounded to 128 files and 16 MiB, and the workspace scan to
+  4096 entries (`WORKSPACE_SYNC_LIMIT_EXCEEDED`).
+
+A review execution (`review.v1`) is never synchronized back. All source and
 workspace entries are preflighted before the first write; the source file's
 identity and SHA-256 hash are checked again, the replacement is written through
 a flushed temporary file, and the parent directory and target identity are
 revalidated before an atomic rename. If a later entry conflicts after an
-earlier entry was written, earlier writes are rolled back in reverse order only
-while their identity and provider-result hash still match. A concurrent
+earlier entry was written, earlier writes, creations and deletions are rolled
+back in reverse order only while their identity and provider-result hash still
+match (a created file is removed with the directories it created; a deleted
+file is restored only if nothing reappeared at its path). A concurrent
 replacement is never overwritten during rollback and is reported as a rollback
 failure. Provider failures, invalid protocols, or conflicts therefore never
 silently become task success. Windows alternate data stream paths are rejected
