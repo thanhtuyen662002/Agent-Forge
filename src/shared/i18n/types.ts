@@ -1008,4 +1008,31 @@ export interface TranslationDictionary {
     actionSuccessNotice: string;
     actionFailedNotice: string;
   };
+  dashboardGuide: {
+    title: string;
+    setupComplete: string;
+    done: string;
+    notDone: string;
+    steps: {
+      createProject: { label: string; action: string };
+      addAgents: { label: string; action: string };
+      writePlan: { label: string; action: string };
+      approvePlan: { label: string; action: string };
+      addTasks: { label: string; action: string };
+      startProject: { label: string; action: string };
+    };
+    attentionTitle: string;
+    noAttention: string;
+    openTask: string;
+    openTaskLabel: string;
+    reasons: {
+      BLOCKED: string;
+      NEEDS_HUMAN: string;
+      HANDOFF_REQUIRED: string;
+      WAITING_FOR_CAPACITY: string;
+      WAITING_FOR_AUTHORITY: string;
+      FAILED: string;
+      FIX_REQUIRED: string;
+    };
+  };
 }

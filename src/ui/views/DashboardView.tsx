@@ -5,6 +5,7 @@ import { AgentCard } from '../components/AgentCard';
 import { ProgressIndicator } from '../components/ProgressIndicator';
 import { clampProgressPercent, validateQuotaSnapshot, quotaSourceLabel } from '../capacityTruth';
 import { getTaskStateCounts } from '../taskStatePresentation';
+import { getAttentionTasks, getSetupSteps } from '../dashboardGuide';
 import {
   Activity,
   CheckCircle2,
@@ -15,10 +16,12 @@ import {
   ArrowRight,
   Clock,
   Sparkles,
+  Circle,
 } from 'lucide-react';
 
 export const DashboardView: React.FC = () => {
   const {
+    projects,
     activeProject,
     tasks,
     agents,
@@ -29,6 +32,9 @@ export const DashboardView: React.FC = () => {
   } = useOrchestrator();
 
   const { t } = useI18n();
+  const setupSteps = getSetupSteps({ projects, activeProject, agents, tasks });
+  const setupComplete = setupSteps.every(step => step.done);
+  const attentionTasks = getAttentionTasks(tasks);
 
   const taskStateCounts = getTaskStateCounts(tasks);
   const completedTasks = taskStateCounts.DONE;
@@ -91,6 +97,69 @@ export const DashboardView: React.FC = () => {
 
   return (
     <div className="p-8 space-y-8 max-w-7xl mx-auto overflow-y-auto">
+      <section aria-labelledby="dashboard-setup-title" className="bg-surface-card border border-surface-border rounded-2xl p-6 shadow-xl space-y-4">
+        <h3 id="dashboard-setup-title" className="text-base font-semibold text-white flex items-center gap-2.5">
+          <CheckCircle2 aria-hidden="true" className="w-5 h-5 text-forge-cyan" />
+          {t(setupComplete ? 'dashboardGuide.setupComplete' : 'dashboardGuide.title')}
+        </h3>
+        {!setupComplete && (
+          <ul className="space-y-3">
+            {setupSteps.map(step => (
+              <li key={step.id} className="flex flex-col sm:flex-row sm:items-center justify-between gap-3 p-3 bg-surface/60 border border-surface-border rounded-lg">
+                <div className="flex items-center gap-3 min-w-0">
+                  {step.done
+                    ? <CheckCircle2 aria-hidden="true" className="w-5 h-5 shrink-0 text-forge-emerald" />
+                    : <Circle aria-hidden="true" className="w-5 h-5 shrink-0 text-slate-400" />}
+                  <div>
+                    <p className="text-sm font-medium text-slate-200">{t(`dashboardGuide.steps.${step.id}.label`)}</p>
+                    <p className="text-xs text-slate-400">{t(step.done ? 'dashboardGuide.done' : 'dashboardGuide.notDone')}</p>
+                  </div>
+                </div>
+                <button
+                  type="button"
+                  onClick={() => setActiveView(step.view)}
+                  className="shrink-0 px-3 py-2 text-xs font-semibold text-forge-cyan bg-forge-cyan/10 hover:bg-forge-cyan/20 border border-forge-cyan/30 rounded-md transition focus-visible:outline focus-visible:outline-2 focus-visible:outline-forge-cyan"
+                >
+                  {t(`dashboardGuide.steps.${step.id}.action`)}
+                </button>
+              </li>
+            ))}
+          </ul>
+        )}
+      </section>
+
+      <section aria-labelledby="dashboard-attention-title" className="bg-surface-card border border-surface-border rounded-2xl p-6 shadow-xl space-y-4">
+        <h3 id="dashboard-attention-title" className="text-base font-semibold text-white flex items-center gap-2.5">
+          <AlertTriangle aria-hidden="true" className="w-5 h-5 text-forge-amber" />
+          {t('dashboardGuide.attentionTitle')}
+        </h3>
+        {attentionTasks.length === 0 ? (
+          <p className="text-sm text-slate-400">{t('dashboardGuide.noAttention')}</p>
+        ) : (
+          <ul className="space-y-3">
+            {attentionTasks.map(task => (
+              <li key={task.id} className="flex flex-col sm:flex-row sm:items-center justify-between gap-3 p-3 bg-surface/60 border border-surface-border rounded-lg">
+                <div className="min-w-0 space-y-1">
+                  <p className="text-sm font-medium text-slate-200 break-words">{task.title}</p>
+                  <p className="text-xs text-slate-400">{t(`dashboardGuide.reasons.${task.state}`)}</p>
+                </div>
+                <button
+                  type="button"
+                  aria-label={t('dashboardGuide.openTaskLabel', { title: task.title })}
+                  onClick={() => {
+                    setSelectedTaskId(task.id);
+                    setActiveView('task-detail');
+                  }}
+                  className="shrink-0 px-3 py-2 text-xs font-semibold text-forge-cyan bg-forge-cyan/10 hover:bg-forge-cyan/20 border border-forge-cyan/30 rounded-md transition focus-visible:outline focus-visible:outline-2 focus-visible:outline-forge-cyan"
+                >
+                  {t('dashboardGuide.openTask')}
+                </button>
+              </li>
+            ))}
+          </ul>
+        )}
+      </section>
+
       {/* Top Banner / Project Overview */}
       <div className="bg-surface-card border border-surface-border rounded-2xl p-6 shadow-xl relative overflow-hidden">
         <div className="absolute top-0 right-0 w-96 h-96 bg-forge-cyan/5 rounded-full blur-3xl -mr-20 -mt-20 pointer-events-none"></div>
@@ -122,7 +191,7 @@ export const DashboardView: React.FC = () => {
                 </div>
               </div>
             ) : (
-              <button onClick={() => setActiveView('projects')} className="text-xs font-medium text-forge-cyan hover:underline">
+              <button type="button" onClick={() => setActiveView('projects')} className="text-xs font-medium text-forge-cyan hover:underline">
                 {t('header.openProjects')}
               </button>
             )}
@@ -186,7 +255,7 @@ export const DashboardView: React.FC = () => {
         </div>
       </div>
 
-      {/* Keep non-happy-path work visible even when the owner attention card is collapsed. */}
+      {/* Task state counts complement the actionable attention list. */}
       <div className="grid grid-cols-2 md:grid-cols-5 gap-3 text-xs font-mono">
         <div className="bg-surface-card border border-amber-500/30 rounded-lg px-3 py-2 text-amber-300">
           <div className="text-[10px] uppercase text-slate-500">{t('taskBoard.lanes.handoff')}</div>
@@ -218,6 +287,7 @@ export const DashboardView: React.FC = () => {
             <h3 className="text-base font-semibold text-white">{t('dashboard.agentsTitle')}</h3>
           </div>
           <button
+            type="button"
             onClick={() => setActiveView('agent-center')}
             className="text-xs font-mono text-forge-cyan hover:underline flex items-center space-x-1"
           >
@@ -246,40 +316,21 @@ export const DashboardView: React.FC = () => {
         </div>
       </div>
 
-      {/* Bottom Section: Owner Attention & Live Activity */}
+      {/* Bottom Section: Manual Relay & Live Activity */}
       <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
-        {/* Owner Attention Panel (Left 1 col) */}
+        {/* Manual Relay Panel (Left 1 col) */}
         <div className="bg-surface-card border border-surface-border rounded-xl p-6 shadow-lg space-y-4">
           <h3 className="text-sm font-semibold text-white font-mono uppercase tracking-wider flex items-center space-x-2">
             <span className="w-2 h-2 rounded-full bg-forge-emerald"></span>
-            <span>{t('dashboard.ownerAttentionTitle')}</span>
+            <span>{t('dashboard.manualRelayTitle')}</span>
           </h3>
 
-          {blockedTasks === 0 ? (
-            <div className="p-4 bg-emerald-950/20 border border-emerald-800/30 rounded-lg text-xs text-emerald-300 space-y-1">
-              <div className="font-semibold">{t('dashboard.allSystemsNormalTitle')}</div>
-              <p className="text-slate-400">
-                {t('dashboard.allSystemsNormalDesc')}
-              </p>
-            </div>
-          ) : (
-            <div className="p-4 bg-rose-950/20 border border-rose-800/30 rounded-lg text-xs text-rose-300 space-y-2">
-              <div className="font-semibold">{t('dashboard.humanAttentionTitle', { count: blockedTasks.toString() })}</div>
-              <button
-                onClick={() => setActiveView('task-board')}
-                className="px-3 py-1.5 bg-rose-600 hover:bg-rose-700 text-white rounded text-[11px] font-semibold transition"
-              >
-                {t('dashboard.inspectBlockedTasks')}
-              </button>
-            </div>
-          )}
-
           <div className="p-4 bg-surface rounded-lg border border-surface-border space-y-2 text-xs">
-            <div className="text-slate-400 font-mono">{t('dashboard.manualRelayTitle')}:</div>
             <p className="text-slate-300">
               {t('dashboard.manualRelayDesc')}
             </p>
             <button
+              type="button"
               onClick={() => setActiveView('manual-bridge')}
               className="w-full mt-2 py-2 bg-forge-cyan/20 hover:bg-forge-cyan/30 text-forge-cyan font-mono font-semibold rounded-md border border-forge-cyan/30 transition text-xs flex items-center justify-center space-x-2"
             >
@@ -297,6 +348,7 @@ export const DashboardView: React.FC = () => {
               <span>{t('dashboard.liveStreamTitle')}</span>
             </h3>
             <button
+              type="button"
               onClick={() => setActiveView('timeline')}
               className="text-xs font-mono text-forge-cyan hover:underline"
             >
