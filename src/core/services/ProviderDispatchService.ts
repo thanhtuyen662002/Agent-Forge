@@ -573,6 +573,8 @@ export class ProviderDispatchService {
     // 8. R5F Account and Assignment Rebinding (for SELECTED routing outcome or R5I Handoff Authorization)
     let account: ProviderAccount | null = null;
     let assignment: AgentAssignment | null = null;
+    // Durable manifest proven by the product authority fence, reused for the hash check.
+    let productManifestHash: string | null = null;
 
     if (auth.assignment_id) {
       // A lifecycle-v1 PRODUCT_BOUND authorization bound to an ordinary
@@ -592,6 +594,7 @@ export class ProviderDispatchService {
       }
 
       assignment = valRes.assignment!;
+      if (isProductAssignment) productManifestHash = (valRes as { manifest?: { manifest_hash: string } }).manifest?.manifest_hash ?? null;
 
       if (!isProductAssignment) {
         const handoffAuthority = valRes as ReturnType<Repository['validateHandoffSuccessorExecutionAuthority']>;
@@ -1116,9 +1119,7 @@ export class ProviderDispatchService {
     }
     const productManifestBound = auth.lifecycle_version === 1 && Boolean(auth.assignment_id) &&
       !this.repo.getHandoffTransferBySuccessorAuthId(auth.id);
-    const recomputedContextHash = productManifestBound
-      ? this.repo.validateProductAssignmentExecutionAuthority(auth.id).manifest?.manifest_hash ?? null
-      : computeContextManifestHash(parsedContextFiles);
+    const recomputedContextHash = productManifestBound ? productManifestHash : computeContextManifestHash(parsedContextFiles);
     if (recomputedContextHash !== auth.context_manifest_hash) {
       this.repo.invalidateExecutionAuthorization(auth.id);
       this.recordRejectionEvent(auth, 'EXECUTION_AUTHORIZATION_HASH_MISMATCH: Context manifest hash recomputation failed.');

@@ -4,7 +4,7 @@ import type { QuotaObservation } from '../core/types/quota';
 
 const PHASES = new Set<AutomationPhase>([
   'PROJECT_NOT_RUNNING', 'WAITING_FOR_MANAGER', 'MANUAL_RELAY_REQUIRED', 'WAITING_FOR_CAPACITY',
-  'EXECUTING', 'AWAITING_REVIEW', 'FAILED',
+  'QUEUED', 'EXECUTING', 'AWAITING_REVIEW', 'FAILED',
 ]);
 const isRecord = (value: unknown): value is Record<string, unknown> => !!value && typeof value === 'object' && !Array.isArray(value);
 

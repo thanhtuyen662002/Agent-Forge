@@ -597,6 +597,18 @@ export class Repository {
       );
   }
 
+  /**
+   * Terminalizes an assignment that never acquired a lease (pre-claim failure).
+   * A no-op when the assignment is already terminal or holds any account lease.
+   */
+  public endUnleasedAgentAssignment(id: string, status: 'FAILED' | 'CANCELLED', endedAt: string): boolean {
+    return this.db.prepare(`
+      UPDATE agent_assignments SET status = ?, ended_at = ?
+      WHERE id = ? AND status IN ('ASSIGNED', 'RUNNING')
+        AND NOT EXISTS (SELECT 1 FROM account_leases WHERE assignment_id = agent_assignments.id AND released_at IS NULL)
+    `).run(status, endedAt, id).changes === 1;
+  }
+
   /** Ends a still-RUNNING attempt; a no-op when settlement already terminalized it. */
   public endRunningTaskAttempt(id: string, status: 'FAILED' | 'CANCELLED', endedAt: string): boolean {
     return this.db.prepare("UPDATE task_attempts SET status = ?, ended_at = ? WHERE id = ? AND status = 'RUNNING'")

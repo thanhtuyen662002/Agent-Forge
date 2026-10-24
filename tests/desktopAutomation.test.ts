@@ -150,6 +150,39 @@ describe('desktop automation runtime', () => {
     expect(repo.getTaskAttemptsByTask(task.id)).toEqual([]);
   });
 
+  it('reports QUEUED, not EXECUTING, before anything is dispatched', async () => {
+    verify(addCodexCoder());
+    const task = await approvedTask();
+    expect(statusOf()).toMatchObject({ phase: 'QUEUED', taskId: task.id, reasonCode: 'AUTOMATION_STOPPED' });
+    expect(adapterCalls).toBe(0);
+  });
+
+  it('releases authorization, assignment and attempt when execution fails before the claim', async () => {
+    verify(addCodexCoder());
+    const task = await approvedTask();
+    // Non-contiguous history: the next attempt must not collide with attempt 3.
+    const profile = repo.getAllAgents().find((a) => a.role === 'CODER')!.agent_profile_id!;
+    for (const n of [1, 3]) {
+      repo.createTaskAttempt({ id: `old-${n}`, task_id: task.id, attempt_number: n, agent_id: null, agent_profile_id: profile,
+        status: 'FAILED', started_at: new Date().toISOString(), ended_at: new Date().toISOString(), summary: null });
+    }
+    service = new DesktopAutomationService(repo, events, registry, {
+      worktreeRoot: path.join(tempDir, 'worktrees'), timer: fakeTimer,
+      resolveGitExecutable: () => path.join(tempDir, 'missing-git.exe'),
+    });
+    await service.tick();
+    await service.drain();
+
+    expect(adapterCalls).toBe(0);
+    const [auth] = repo.getExecutionAuthorizationsByTask(task.id);
+    expect(auth.status).toBe('INVALIDATED');
+    expect(repo.getAgentAssignmentsByTask(task.id).map((a) => a.status)).toEqual(['FAILED']);
+    const attempt = repo.getTaskAttemptsByTask(task.id).find((a) => !a.id.startsWith('old-'))!;
+    expect(attempt).toMatchObject({ attempt_number: 4, status: 'FAILED' });
+    expect(statusOf()).toMatchObject({ phase: 'FAILED', taskId: task.id });
+    expect(repo.getEventsByProject(projectId).some((e) => e.type === 'AUTOMATION_EXECUTION_FAILED')).toBe(true);
+  });
+
   it('does not use a coder whose account is in AUTH_ERROR', async () => {
     const created = addCodexCoder();
     const task = await approvedTask();

@@ -12,6 +12,8 @@ export type AutomationPhase =
   | 'MANUAL_RELAY_REQUIRED'
   /** Approved work exists but no CLI coder has a usable account and idle slot. */
   | 'WAITING_FOR_CAPACITY'
+  /** Approved work and a usable coder exist; dispatch starts on the next pass. */
+  | 'QUEUED'
   /** Automation is preparing or running a coder execution. */
   | 'EXECUTING'
   /** The coder execution settled COMPLETED; changes await verification and review. */

@@ -57,7 +57,7 @@ export class DesktopAutomationService {
   private readonly resolveGit: () => string | null;
   private handle: unknown = null;
   private ticking = false;
-  private readonly inFlight = new Map<string, { taskId: string; promise: Promise<void> }>();
+  private readonly inFlight = new Map<string, { taskId: string; agentId: string; promise: Promise<void> }>();
   private readonly lastFailure = new Map<string, { taskId: string; revision: number; reasonCode: string }>();
 
   constructor(
@@ -108,8 +108,12 @@ export class DesktopAutomationService {
         if (!task) continue;
         const coder = this.findCoder(project.id);
         if (!coder) continue;
-        const promise = this.execute(project, task, coder).finally(() => this.inFlight.delete(project.id));
-        this.inFlight.set(project.id, { taskId: task.id, promise });
+        // execute() reports its own failures; this catch only keeps an unexpected
+        // throw from becoming an unhandled rejection in the main process.
+        const promise = this.execute(project, task, coder)
+          .catch(() => { this.lastFailure.set(task.id, { taskId: task.id, revision: task.revision_count, reasonCode: 'INTERNAL_ERROR' }); })
+          .finally(() => this.inFlight.delete(project.id));
+        this.inFlight.set(project.id, { taskId: task.id, agentId: coder.agent.id, promise });
       }
     } finally {
       this.ticking = false;
@@ -145,7 +149,7 @@ export class DesktopAutomationService {
     }
     const eligible = authorized.find((task) => this.isDispatchable(task));
     if (!eligible) return status('WAITING_FOR_MANAGER');
-    if (this.findCoder(project.id)) return status('EXECUTING', eligible.id, 'QUEUED_FOR_NEXT_TICK');
+    if (this.findCoder(project.id)) return status('QUEUED', eligible.id, this.isActive() ? null : 'AUTOMATION_STOPPED');
     if (this.hasUnverifiedCliCoder()) return status('WAITING_FOR_CAPACITY', eligible.id, 'ACCOUNT_NOT_VERIFIED');
     return this.hasManualCoder() ? status('MANUAL_RELAY_REQUIRED', eligible.id) : status('WAITING_FOR_CAPACITY', eligible.id, 'NO_CLI_CODER');
   }
@@ -220,7 +224,9 @@ export class DesktopAutomationService {
 
   /** An active CLI coder whose provider adapter is registered and that has a usable account and idle slot. */
   private findCoder(_projectId: string): CoderCandidate | null {
+    const reserved = new Set([...this.inFlight.values()].map((item) => item.agentId));
     for (const agent of this.repo.getAllAgents()) {
+      if (reserved.has(agent.id)) continue;
       if (agent.removed_at || agent.role !== 'CODER' || agent.status === 'BUSY' || !agent.provider_resource_id || !agent.agent_profile_id) continue;
       const resource = this.repo.getProviderResource(agent.provider_resource_id);
       if (!resource?.enabled || !resource.provider_account_id) continue;
@@ -249,16 +255,29 @@ export class DesktopAutomationService {
     const gitExecutable = this.resolveGit();
     if (!gitExecutable) { fail('GIT_UNAVAILABLE'); return; }
 
-    // 1. A RUNNING attempt bound to the coder's durable profile.
     const attemptId = `attempt-${crypto.randomUUID()}`;
-    const priorAttempts = this.repo.getTaskAttemptsByTask(task.id).length;
-    this.repo.createTaskAttempt({
-      id: attemptId, task_id: task.id, attempt_number: priorAttempts + 1, agent_id: coder.agent.id,
-      agent_profile_id: coder.agentProfileId, status: 'RUNNING', started_at: this.now(), ended_at: null, summary: null,
-    });
+    let assignmentId: string | null = null;
+    let authorizationId: string | null = null;
     const endAttempt = (status: 'FAILED' | 'CANCELLED') => { this.repo.endRunningTaskAttempt(attemptId, status, this.now()); };
+    /**
+     * Releases durable authority that never reached the dispatch claim. Once an
+     * authorization is DISPATCHED, settlement and recovery own its terminal state.
+     */
+    const releaseUnclaimed = () => {
+      if (authorizationId && this.repo.getExecutionAuthorization(authorizationId)?.status !== 'AUTHORIZED') return;
+      if (authorizationId) this.repo.invalidateExecutionAuthorization(authorizationId);
+      if (assignmentId) this.repo.endUnleasedAgentAssignment(assignmentId, 'FAILED', this.now());
+      endAttempt('FAILED');
+    };
 
     try {
+      // 1. A RUNNING attempt bound to the coder's durable profile.
+      const nextAttemptNumber = Math.max(0, ...this.repo.getTaskAttemptsByTask(task.id).map((a) => a.attempt_number)) + 1;
+      this.repo.createTaskAttempt({
+        id: attemptId, task_id: task.id, attempt_number: nextAttemptNumber, agent_id: coder.agent.id,
+        agent_profile_id: coder.agentProfileId, status: 'RUNNING', started_at: this.now(), ended_at: null, summary: null,
+      });
+
       // 2. Role-aware routing persists the assignment and routing decision.
       const routing = await new RoleAwareRoutingService(this.repo, this.providerRegistry, this.eventService).routeRole({
         projectId: project.id,
@@ -271,14 +290,15 @@ export class DesktopAutomationService {
         allowManualBridge: false,
       });
       if (routing.outcome !== 'SELECTED' || !routing.selectedAssignmentId) {
-        endAttempt('FAILED');
+        releaseUnclaimed();
         fail('ROUTING_NOT_SELECTED', routing.reason);
         return;
       }
+      assignmentId = routing.selectedAssignmentId;
 
       // 3. Durable, assignment-bound context manifest of the repository's top-level entries.
       const contextFiles = this.contextEntries(project.repository_path);
-      if (contextFiles.length === 0) { endAttempt('FAILED'); fail('NO_CONTEXT_FILES'); return; }
+      if (contextFiles.length === 0) { releaseUnclaimed(); fail('NO_CONTEXT_FILES'); return; }
       const context = new ContextBuilderService(this.repo).buildContextSnapshot({
         projectId: project.id,
         taskId: task.id,
@@ -314,13 +334,18 @@ export class DesktopAutomationService {
         },
       });
 
+      authorizationId = auth.id;
+
       // 5. Lease, managed worktree, scheduled dispatch and settlement.
       const worktrees = new GitWorktreeService({ gitExecutable, repositoryRoot: project.repository_path, managedRoot });
       const dispatch = new ProviderDispatchService(this.providerRegistry, this.repo, this.eventService, worktrees);
       const scheduler = new ConcurrentExecutionScheduler(this.repo, new WorkerSlotLeaseService(this.repo), worktrees, dispatch);
       const result = await scheduler.execute(auth.id);
       if (result.status !== 'COMPLETED') {
-        // The scheduler and settlement own attempt/assignment terminal state once dispatched.
+        // Pre-claim failures (lease, worktree, preparation) leave the authorization
+        // AUTHORIZED; release it so the task is not blocked. Claimed work is owned
+        // by settlement and recovery.
+        releaseUnclaimed();
         fail(result.status, result.errorCode ? String(result.errorCode) : undefined);
         return;
       }
@@ -329,8 +354,8 @@ export class DesktopAutomationService {
         `Automated coder execution for task ${task.id} settled COMPLETED; changes await verification and review.`,
         { authorizationId: auth.id, assignmentId: routing.selectedAssignmentId }, task.id);
     } catch (error) {
-      // Pre-dispatch failures (routing, context, authorization) leave nothing running.
-      endAttempt('FAILED');
+      // Pre-dispatch failures (attempt, routing, context, authorization) leave nothing running.
+      releaseUnclaimed();
       const message = error instanceof Error ? error.message : '';
       const code = /^([A-Z_]+):/.exec(message.replace(/^EXECUTION_AUTHORIZATION_FAILED:\s*/, ''))?.[1] ?? 'PREPARATION_FAILED';
       fail(code);

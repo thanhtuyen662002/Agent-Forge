@@ -446,6 +446,7 @@ export interface TranslationDictionary {
       WAITING_FOR_MANAGER: string;
       MANUAL_RELAY_REQUIRED: string;
       WAITING_FOR_CAPACITY: string;
+      QUEUED: string;
       EXECUTING: string;
       AWAITING_REVIEW: string;
       FAILED: string;
@@ -453,7 +454,7 @@ export interface TranslationDictionary {
     reasons: {
       ACCOUNT_NOT_VERIFIED: string;
       NO_CLI_CODER: string;
-      QUEUED_FOR_NEXT_TICK: string;
+      AUTOMATION_STOPPED: string;
       PROVIDER_EXECUTION_FAILED: string;
       GENERIC: string;
     };

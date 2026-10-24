@@ -443,6 +443,7 @@ export const enUS: TranslationDictionary = {
       WAITING_FOR_MANAGER: 'waiting for an approved task',
       MANUAL_RELAY_REQUIRED: 'only Manual Bridge coders; relay work yourself',
       WAITING_FOR_CAPACITY: 'waiting for a usable coder',
+      QUEUED: 'approved task queued for a coder',
       EXECUTING: 'coder is working',
       AWAITING_REVIEW: 'coder finished; waiting for verification and review',
       FAILED: 'last automated run failed',
@@ -450,7 +451,7 @@ export const enUS: TranslationDictionary = {
     reasons: {
       ACCOUNT_NOT_VERIFIED: 'The coder account is not verified yet. Sign in to its CLI profile, then refresh quota on the Capacity page.',
       NO_CLI_CODER: 'Add a Codex CLI or Gemini CLI coder in Agent Center.',
-      QUEUED_FOR_NEXT_TICK: 'Starting shortly.',
+      AUTOMATION_STOPPED: 'Automation is not running in this window.',
       PROVIDER_EXECUTION_FAILED: 'The provider run did not complete. Open the task to see what happened.',
       GENERIC: 'See the task timeline for details ({code}).',
     },

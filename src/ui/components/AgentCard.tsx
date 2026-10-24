@@ -192,8 +192,8 @@ export const AgentCard: React.FC<AgentCardProps> = ({
         </div>
       )}
 
-      {!removed && onSignIn && entry?.connection === 'CODEX_CLI' && entry.account &&
-        (entry.account.healthStatus === 'UNKNOWN' || entry.account.healthStatus === 'AUTH_ERROR') && (
+      {/* Sign-in can only initialize a never-used UNKNOWN account; other states keep their recorded health. */}
+      {!removed && onSignIn && entry?.connection === 'CODEX_CLI' && entry.account?.healthStatus === 'UNKNOWN' && (
         <div className="p-2.5 rounded-lg border border-forge-cyan/40 bg-forge-cyan/5 text-xs text-slate-200 flex items-center justify-between gap-3">
           <span>{t('accountSignIn.needed')}</span>
           <button type="button" onClick={onSignIn} disabled={actionsDisabled}

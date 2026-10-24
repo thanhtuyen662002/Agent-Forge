@@ -66,7 +66,8 @@ agents can be removed too, and startup seeding does not bring them back.
 
 Turn on **Show removed agents** to see removed agents and **Restore** them.
 Restore clears the marker, re-enables the resource and profile, and returns
-disabled slots to `IDLE`.
+disabled slots to `IDLE`. Restore does not remember why a resource was disabled before
+removal: a resource or slot disabled for another reason is enabled again.
 
 Remove is refused, and the card lists the reason, while the agent has any of
 these:
@@ -200,6 +201,11 @@ chain, with no shortcuts:
 5. `ConcurrentExecutionScheduler`: worker-slot lease, managed worktree under
    `<userData>/worktrees/<projectId>`, scheduled dispatch to the Codex or
    Gemini CLI adapter, settlement.
+
+If anything fails before the dispatch claim (routing, context, authorization,
+lease or worktree), the unclaimed authorization is invalidated, and the
+assignment and attempt are ended as `FAILED`, so the task is never left
+blocked. Approved work waiting for its first pass is shown as `queued`.
 
 It uses only active, owner-created CLI coders whose provider adapter is
 registered, whose account is enabled and proven `AVAILABLE`/`LOW_QUOTA`

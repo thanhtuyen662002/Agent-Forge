@@ -3,7 +3,7 @@ import { Bot } from 'lucide-react';
 import { useI18n } from '../context/I18nContext';
 import { useAutomationStatus } from '../runtimeStatus';
 
-const KNOWN_REASONS = new Set(['ACCOUNT_NOT_VERIFIED', 'NO_CLI_CODER', 'QUEUED_FOR_NEXT_TICK', 'PROVIDER_EXECUTION_FAILED']);
+const KNOWN_REASONS = new Set(['ACCOUNT_NOT_VERIFIED', 'NO_CLI_CODER', 'AUTOMATION_STOPPED', 'PROVIDER_EXECUTION_FAILED']);
 
 /**
  * The automation phase is shown next to, and separately from, the project

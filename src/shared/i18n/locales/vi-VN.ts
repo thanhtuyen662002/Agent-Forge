@@ -443,6 +443,7 @@ export const viVN: TranslationDictionary = {
       WAITING_FOR_MANAGER: 'đang chờ nhiệm vụ được duyệt',
       MANUAL_RELAY_REQUIRED: 'chỉ có lập trình viên Cầu nối Thủ công; bạn cần tự chuyển việc',
       WAITING_FOR_CAPACITY: 'đang chờ lập trình viên dùng được',
+      QUEUED: 'nhiệm vụ đã duyệt đang chờ lập trình viên nhận',
       EXECUTING: 'lập trình viên đang làm',
       AWAITING_REVIEW: 'lập trình viên đã xong; đang chờ kiểm chứng và đánh giá',
       FAILED: 'lần chạy tự động gần nhất bị lỗi',
@@ -450,7 +451,7 @@ export const viVN: TranslationDictionary = {
     reasons: {
       ACCOUNT_NOT_VERIFIED: 'Tài khoản của lập trình viên chưa được xác minh. Hãy đăng nhập hồ sơ CLI của nó, rồi làm mới hạn ngạch ở trang Dung lượng.',
       NO_CLI_CODER: 'Hãy thêm lập trình viên Codex CLI hoặc Gemini CLI trong Trung tâm Tác tử.',
-      QUEUED_FOR_NEXT_TICK: 'Sắp bắt đầu.',
+      AUTOMATION_STOPPED: 'Tự động hóa không chạy trong cửa sổ này.',
       PROVIDER_EXECUTION_FAILED: 'Lượt chạy của nhà cung cấp không hoàn tất. Mở nhiệm vụ để xem chuyện gì đã xảy ra.',
       GENERIC: 'Xem dòng thời gian của nhiệm vụ để biết chi tiết ({code}).',
     },

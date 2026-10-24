@@ -1,4 +1,4 @@
-import React, { useMemo, useState } from 'react';
+import React, { useCallback, useMemo, useState } from 'react';
 import { useOrchestrator } from '../context/OrchestratorContext';
 import { useI18n } from '../context/I18nContext';
 import { AgentCard } from '../components/AgentCard';
@@ -52,7 +52,9 @@ export const AgentCenterView: React.FC = () => {
   const [removeError, setRemoveError] = useState<AgentMutationResult | null>(null);
   const [notice, setNotice] = useState<Notice>(null);
   const [signInEntry, setSignInEntry] = useState<AgentRosterEntry | null>(null);
-  const signIn = useAccountSignIn(async () => { await roster.reload(); await refreshData(); });
+  const reloadRoster = roster.reload;
+  const afterSignIn = useCallback(async () => { await reloadRoster(); await refreshData(); }, [reloadRoster, refreshData]);
+  const signIn = useAccountSignIn(afterSignIn);
 
   const groups = useMemo(() => {
     const byRole = (roles: AgentRole[]) => roster.entries.filter((entry) => roles.includes(entry.agent.role));
