@@ -50,9 +50,18 @@ export class AutomatedVerificationService {
     }
   }
 
-  /** True when this settled execution already has a durable verification result or skip. */
+  /**
+   * True when this settled execution already has a final verification outcome.
+   * VERIFICATION_NOT_CONFIGURED is not final: once the owner approves a TEST
+   * command, the same settled work is verified on the next pass.
+   */
   public hasOutcome(auth: ExecutionAuthorization): boolean {
-    return this.repo.getEventsByProject(auth.project_id).some((event) =>
+    return this.eventsFor(auth).some((event) => event.type !== VERIFICATION_SKIPPED_EVENT ||
+      (event.structured_payload as { reasonCode?: unknown } | null)?.reasonCode !== 'VERIFICATION_NOT_CONFIGURED');
+  }
+
+  private eventsFor(auth: ExecutionAuthorization) {
+    return this.repo.getEventsByProject(auth.project_id).filter((event) =>
       [VERIFICATION_PASSED_EVENT, VERIFICATION_FAILED_EVENT, VERIFICATION_SKIPPED_EVENT].includes(event.type) &&
       (event.structured_payload as { authorizationId?: unknown } | null)?.authorizationId === auth.id);
   }
@@ -63,7 +72,10 @@ export class AutomatedVerificationService {
       return { outcome: 'NOT_RUN', reasonCode: 'NOT_A_COMPLETED_PRODUCT_EXECUTION' };
     }
     const notRun = (reasonCode: string) => {
-      this.record(auth, VERIFICATION_SKIPPED_EVENT, `Automated verification for task ${auth.task_id} did not run: ${reasonCode}.`, { reasonCode });
+      // One event per reason, so a repeated re-check does not flood the timeline.
+      const already = this.eventsFor(auth).some((event) => event.type === VERIFICATION_SKIPPED_EVENT &&
+        (event.structured_payload as { reasonCode?: unknown } | null)?.reasonCode === reasonCode);
+      if (!already) this.record(auth, VERIFICATION_SKIPPED_EVENT, `Automated verification for task ${auth.task_id} did not run: ${reasonCode}.`, { reasonCode });
       return { outcome: 'NOT_RUN' as const, reasonCode };
     };
 

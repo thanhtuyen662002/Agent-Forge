@@ -330,6 +330,20 @@ describe('desktop automation runtime', () => {
 
       expect(repo.getTask(task.id)!.state).toBe('CODING');
       expect(statusOf()).toMatchObject({ phase: 'AWAITING_REVIEW', taskId: task.id, reasonCode: 'VERIFICATION_NOT_CONFIGURED' });
+
+      // A later pass without a TEST command records nothing new...
+      await service.tick();
+      await service.drain();
+      expect(repo.getEventsByProject(projectId).filter((e) => e.type === 'AUTOMATION_VERIFICATION_NOT_RUN')).toHaveLength(1);
+      // ...and once the owner approves one, the same settled work is verified again (as the UI tells
+      // them). The retained worktree predates the new script, so the run itself fails closed.
+      await configureTest(0);
+      await service.tick();
+      await service.drain();
+      const outcomes = repo.getEventsByProject(projectId).filter((e) =>
+        e.type === 'AUTOMATION_VERIFICATION_PASSED' || e.type === 'AUTOMATION_VERIFICATION_FAILED');
+      expect(outcomes).toHaveLength(1);
+      expect(repo.getTask(task.id)!.state).not.toBe('REVIEW_READY');
     }, 90_000);
 
     it('verifies settled work left unverified by a restart', async () => {
