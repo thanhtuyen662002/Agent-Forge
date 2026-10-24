@@ -13,6 +13,10 @@ import { ProviderDispatchService } from './ProviderDispatchService';
 import { ConcurrentExecutionScheduler } from './ConcurrentExecutionScheduler';
 import { WorkerSlotLeaseService } from './WorkerSlotLeaseService';
 import { resolveTrustedExecutable } from './ExecutableResolver';
+import { GitService } from './GitService';
+import { TaskService } from './TaskService';
+import { VerificationService } from './VerificationService';
+import { AutomatedVerificationService, VERIFICATION_FAILED_EVENT, VERIFICATION_PASSED_EVENT, VERIFICATION_SKIPPED_EVENT } from './AutomatedVerificationService';
 import type { Project, Task } from '../types/domain';
 import type { ManagedAgent } from '../types/workspace';
 import type { AutomationPhase, DesktopAutomationStatus, ProjectAutomationStatus } from '../types/desktopAutomation';
@@ -33,6 +37,9 @@ export interface DesktopAutomationOptions {
   now?: () => string;
   timer?: { setInterval(fn: () => void, ms: number): unknown; clearInterval(handle: unknown): void };
   resolveGitExecutable?: () => string | null;
+  /** When both are given, a settled COMPLETED coder run is verified in its worktree (#230). */
+  taskService?: TaskService;
+  verificationService?: VerificationService;
 }
 
 interface CoderCandidate {
@@ -62,6 +69,7 @@ export class DesktopAutomationService {
   private ticking = false;
   private readonly inFlight = new Map<string, { taskId: string; agentId: string; promise: Promise<void> }>();
   private readonly lastFailure = new Map<string, { taskId: string; revision: number; reasonCode: string }>();
+  private readonly verifier: AutomatedVerificationService | null;
 
   constructor(
     private readonly repo: Repository,
@@ -77,6 +85,9 @@ export class DesktopAutomationService {
       clearInterval: (h) => clearInterval(h as ReturnType<typeof setInterval>),
     };
     this.resolveGit = options.resolveGitExecutable ?? (() => resolveTrustedExecutable('git', 'git'));
+    this.verifier = options.taskService && options.verificationService
+      ? new AutomatedVerificationService(repo, eventService, options.taskService, options.verificationService)
+      : null;
   }
 
   public start(): void {
@@ -133,6 +144,15 @@ export class DesktopAutomationService {
       for (const project of this.runnableProjects()) {
         if (this.inFlight.size >= this.maxConcurrent) break;
         if (this.inFlight.has(project.id)) continue;
+        // Settled work that was never verified (e.g. interrupted by a restart) comes first.
+        const pending = this.pendingVerification(project);
+        if (pending) {
+          const verify = this.runVerification(project, pending.id)
+            .catch(() => undefined)
+            .finally(() => this.inFlight.delete(project.id));
+          this.inFlight.set(project.id, { taskId: pending.task_id, agentId: '', promise: verify });
+          continue;
+        }
         const task = this.nextEligibleTask(project);
         if (!task) continue;
         const coder = this.findCoder(project.id);
@@ -163,13 +183,22 @@ export class DesktopAutomationService {
     const status = (phase: AutomationPhase, taskId: string | null = null, reasonCode: string | null = null): ProjectAutomationStatus =>
       ({ projectId: project.id, phase, taskId, reasonCode, updatedAt: this.now() });
     const running = this.inFlight.get(project.id);
-    if (running) return status('EXECUTING', running.taskId);
+    if (running) {
+      return this.repo.getTask(running.taskId)?.state === 'VALIDATING' || this.pendingVerification(project)?.task_id === running.taskId
+        ? status('VERIFYING', running.taskId) : status('EXECUTING', running.taskId);
+    }
     if (project.status !== 'RUNNING') return status('PROJECT_NOT_RUNNING');
+
+    const tasks = this.repo.getTasksByProject(project.id).filter((task) => !this.repo.isTaskTrashed(task.id));
+    const validating = tasks.find((task) => task.state === 'VALIDATING');
+    if (validating) return status('VERIFYING', validating.id);
+    const reviewReady = tasks.find((task) => task.state === 'REVIEW_READY' || task.state === 'REVIEWING');
+    if (reviewReady) return status('AWAITING_REVIEW', reviewReady.id, this.verificationReason(reviewReady.id) ?? null);
 
     const authorized = this.authorizedTasks(project);
     for (const task of authorized) {
       const settled = this.settledForRevision(task);
-      if (settled === 'COMPLETED') return status('AWAITING_REVIEW', task.id);
+      if (settled === 'COMPLETED') return status('AWAITING_REVIEW', task.id, this.verificationReason(task.id) ?? 'NOT_VERIFIED');
     }
     for (const task of authorized) {
       const failure = this.lastFailure.get(task.id);
@@ -177,7 +206,10 @@ export class DesktopAutomationService {
       if (this.settledForRevision(task) === 'FAILED') return status('FAILED', task.id, 'PROVIDER_EXECUTION_FAILED');
     }
     const eligible = authorized.find((task) => this.isDispatchable(task));
-    if (!eligible) return status('WAITING_FOR_MANAGER');
+    if (!eligible) {
+      const failedVerification = tasks.find((task) => this.verificationReason(task.id) === 'VERIFICATION_FAILED' && task.state === 'CODING');
+      return status('WAITING_FOR_MANAGER', failedVerification?.id ?? null, failedVerification ? 'VERIFICATION_FAILED' : null);
+    }
     if (this.findCoder(project.id)) return status('QUEUED', eligible.id, this.isActive() ? null : 'AUTOMATION_STOPPED');
     if (this.hasUnverifiedCliCoder()) return status('WAITING_FOR_CAPACITY', eligible.id, 'ACCOUNT_NOT_VERIFIED');
     return this.hasManualCoder() ? status('MANUAL_RELAY_REQUIRED', eligible.id) : status('WAITING_FOR_CAPACITY', eligible.id, 'NO_CLI_CODER');
@@ -348,32 +380,60 @@ export class DesktopAutomationService {
         includeLatestHandoff: false,
       });
 
-      // 4. Immutable PRODUCT_BOUND authorization bound to all of the above.
+      // 4. Bind the worker slot now, so the authorized execution scope names the
+      // exact managed worktree the scheduler will create (GitWorktreeService
+      // derives it from the slot, base HEAD and epoch). Verification later may
+      // only run in that authorized worktree.
       const managedRoot = path.join(this.options.worktreeRoot, project.id);
       fs.mkdirSync(managedRoot, { recursive: true });
       const current = this.repo.getTask(task.id)!;
+      const slotId = this.chooseIdleSlot(coder);
+      if (!slotId || !this.repo.bindAgentAssignmentWorkerSlotIfUnbound(routing.selectedAssignmentId, slotId)) {
+        releaseUnclaimed();
+        fail('NO_IDLE_SLOT');
+        return;
+      }
+      const head = await GitService.getHeadSha(project.repository_path);
+      if (head.status !== 'SUCCESS' || !head.sha) {
+        releaseUnclaimed();
+        fail('REPOSITORY_HEAD_UNAVAILABLE');
+        return;
+      }
+      const worktrees = new GitWorktreeService({ gitExecutable, repositoryRoot: project.repository_path, managedRoot });
+      const epoch = current.ownership_epoch ?? 1;
+      const plannedWorktree = worktrees.deriveWorktreePath({
+        projectId: project.id, taskId: task.id, attemptId, assignmentId: routing.selectedAssignmentId,
+        workerSlotId: slotId, baseSha: head.sha, ownershipEpoch: epoch,
+      }).worktreePath;
+
+      // 5. Immutable PRODUCT_BOUND authorization bound to all of the above.
       const auth = await new ExecutionAuthorizationService(this.repo, this.eventService).createAuthorization({
         projectId: project.id,
         taskId: task.id,
         attemptId,
         routingDecisionId: routing.decisionId,
         assignmentId: routing.selectedAssignmentId,
-        taskOwnershipEpoch: current.ownership_epoch ?? 1,
+        taskOwnershipEpoch: epoch,
         contextManifestId: context.manifest.id,
         contextFiles,
         executionMode: 'PRODUCT_BOUND',
         executionScope: {
           branch: `agent/${task.id.toLowerCase()}`,
-          worktree: path.join(managedRoot, task.id),
+          worktree: plannedWorktree,
           allowedPaths: contextFiles,
           forbiddenPaths: ['.git'],
         },
       });
 
       authorizationId = auth.id;
+      if (auth.repository_head_sha.toLowerCase() !== head.sha.toLowerCase()) {
+        // HEAD moved between planning and authorization: the planned path is wrong.
+        releaseUnclaimed();
+        fail('REPOSITORY_HEAD_CHANGED');
+        return;
+      }
 
-      // 5. Lease, managed worktree, scheduled dispatch and settlement.
-      const worktrees = new GitWorktreeService({ gitExecutable, repositoryRoot: project.repository_path, managedRoot });
+      // 6. Lease, managed worktree, scheduled dispatch and settlement.
       const dispatch = new ProviderDispatchService(this.providerRegistry, this.repo, this.eventService, worktrees);
       const scheduler = new ConcurrentExecutionScheduler(this.repo, new WorkerSlotLeaseService(this.repo), worktrees, dispatch);
       const result = await scheduler.execute(auth.id);
@@ -389,6 +449,7 @@ export class DesktopAutomationService {
       this.eventService.record(project.id, 'AUTOMATION_EXECUTION_COMPLETED',
         `Automated coder execution for task ${task.id} settled COMPLETED; changes await verification and review.`,
         { authorizationId: auth.id, assignmentId: routing.selectedAssignmentId }, task.id);
+      if (this.verifier) await this.verifier.verify(auth.id, worktrees);
     } catch (error) {
       // Pre-dispatch failures (attempt, routing, context, authorization) leave nothing running.
       releaseUnclaimed();
@@ -396,6 +457,53 @@ export class DesktopAutomationService {
       const code = /^([A-Z_]+):/.exec(message.replace(/^EXECUTION_AUTHORIZATION_FAILED:\s*/, ''))?.[1] ?? 'PREPARATION_FAILED';
       fail(code);
     }
+  }
+
+  /** A settled COMPLETED product execution at the task's current revision with no verification result yet. */
+  private pendingVerification(project: Project) {
+    if (!this.verifier) return null;
+    for (const task of this.repo.getTasksByProject(project.id)) {
+      if (task.state !== 'CODING' || this.repo.isTaskTrashed(task.id)) continue;
+      const auth = this.repo.getExecutionAuthorizationsByTask(task.id).find((candidate) =>
+        candidate.lifecycle_version === 1 && candidate.assignment_id && candidate.settlement_status === 'COMPLETED' &&
+        candidate.task_revision === task.revision_count);
+      if (auth && !this.verifier.hasOutcome(auth)) return auth;
+    }
+    return null;
+  }
+
+  private async runVerification(project: Project, authorizationId: string): Promise<void> {
+    const gitExecutable = this.resolveGit();
+    if (!gitExecutable || !this.verifier) return;
+    const worktrees = new GitWorktreeService({
+      gitExecutable, repositoryRoot: project.repository_path, managedRoot: path.join(this.options.worktreeRoot, project.id),
+    });
+    await this.verifier.verify(authorizationId, worktrees);
+  }
+
+  /** Latest durable automated-verification result for the task, as a status reason code. */
+  private verificationReason(taskId: string): string | null {
+    const task = this.repo.getTask(taskId);
+    if (!task) return null;
+    const latest = this.repo.getEventsByProject(task.project_id)
+      .filter((event) => event.task_id === taskId &&
+        [VERIFICATION_PASSED_EVENT, VERIFICATION_FAILED_EVENT, VERIFICATION_SKIPPED_EVENT].includes(event.type))
+      .sort((a, b) => b.timestamp.localeCompare(a.timestamp))[0];
+    if (!latest) return null;
+    if (latest.type === VERIFICATION_PASSED_EVENT) return 'VERIFIED';
+    if (latest.type === VERIFICATION_FAILED_EVENT) return 'VERIFICATION_FAILED';
+    const code = (latest.structured_payload as { reasonCode?: unknown } | null)?.reasonCode;
+    return typeof code === 'string' ? code : 'NOT_VERIFIED';
+  }
+
+  /** Same eligibility and ordering as WorkerSlotLeaseService fresh allocation. */
+  private chooseIdleSlot(coder: CoderCandidate): string | null {
+    const unreleased = new Set(this.repo.getUnreleasedAccountLeasesByAccount(coder.accountId).map((lease) => lease.worker_slot_id));
+    const eligible = this.repo.getWorkerSlotsByAccount(coder.accountId)
+      .filter((slot) => slot.status === 'IDLE' && !slot.current_assignment_id && !slot.current_execution_id &&
+        !unreleased.has(slot.id) && (slot.provider_resource_id === null || slot.provider_resource_id === coder.resourceId))
+      .sort((a, b) => (a.slot_index - b.slot_index) || a.id.localeCompare(b.id));
+    return eligible[0]?.id ?? null;
   }
 
   private contextEntries(repositoryPath: string): string[] {

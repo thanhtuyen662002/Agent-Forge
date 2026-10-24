@@ -239,11 +239,43 @@ usable coder` (with a reason such as *account not verified*), `coder is
 working`, `coder finished; waiting for verification and review`, `last
 automated run failed`.
 
-**Limits.** Automation covers the coder stage. Verification, review and
-merging the retained worktree remain the existing owner-driven steps. The CLI
+**Limits.** Automation covers the coder stage and automated verification
+(below). Review and merging the retained worktree remain owner-driven. The CLI
 sees only the files in the context manifest and can update existing files
 only (`docs/LOCAL_PROVIDER_WORKSPACES.md`). Large repositories that exceed the
 workspace bounds fail closed with a reason.
+
+## Automated verification after a completed coder run
+
+When a coder execution settles `COMPLETED`, `AutomatedVerificationService`
+tests the coder's changes in the exact managed worktree that the
+authorization names. The automation pre-binds the worker slot and authorizes
+the scheduler-derived `afw-<digest>` path, so the verification capability
+fence admits that worktree and nothing else. Before running, it checks that:
+
+- the project is `RUNNING`, not trashed and not emergency-stopped;
+- the task is still `CODING` at the authorized revision and epoch;
+- the worktree is registered, exists, still sits on the authorized base, and is
+  the authorized path;
+- the project has an approved `TEST` command.
+
+It then moves the task only through `TaskService.transitionAuthorizedTask`:
+`SUBMIT_REPORT` (to `VALIDATING`), runs the approved `TEST` command with
+`VerificationService.runTests` in the worktree, then `EVIDENCE_GATHERED` (to
+`REVIEW_READY`) on a pass, or `TESTS_FAILED` (back to `CODING` at the next
+revision, so the Manager must authorize again) on a failure or when the
+command could not run. Each result is an `AUTOMATION_VERIFICATION_*` event
+bound to the authorization and to the work it tested: the worktree HEAD, a
+content snapshot of the uncommitted changes and the changed files. If the
+worktree changes while the command runs, the result is a failure
+(`WORKTREE_CHANGED_DURING_VERIFICATION`). A run is verified once. Settled work
+left unverified by a restart is picked up on the next pass.
+
+If no `TEST` command is approved, the task is not moved, and the header says
+the changes were not tested. Once the owner approves a `TEST` command, the same
+settled work is verified on the next pass. Review stays with the existing Manager or owner
+path (automated account-bound review is #233). Nothing is merged into the
+repository automatically.
 
 ## Restart recovery for automated executions
 

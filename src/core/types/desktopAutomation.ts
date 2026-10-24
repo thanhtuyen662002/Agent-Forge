@@ -16,7 +16,9 @@ export type AutomationPhase =
   | 'QUEUED'
   /** Automation is preparing or running a coder execution. */
   | 'EXECUTING'
-  /** The coder execution settled COMPLETED; changes await verification and review. */
+  /** The settled coder work is being verified in its worktree with the approved TEST command. */
+  | 'VERIFYING'
+  /** The coder execution settled COMPLETED and (when configured) verification passed; awaiting review. */
   | 'AWAITING_REVIEW'
   /** The latest automated execution for the current revision failed. */
   | 'FAILED';
