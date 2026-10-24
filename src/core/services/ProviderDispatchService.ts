@@ -575,8 +575,15 @@ export class ProviderDispatchService {
     let assignment: AgentAssignment | null = null;
 
     if (auth.assignment_id) {
-      // R5I Handoff Execution Authority Fence
-      const valRes = this.repo.validateHandoffSuccessorExecutionAuthority(auth.id);
+      // A lifecycle-v1 PRODUCT_BOUND authorization bound to an ordinary
+      // assignment has no HandoffTransfer. It is fenced by its own durable
+      // product authority (task epoch, assignment, role-aware routing and the
+      // context manifest it was created from). Handoff successors keep the R5I
+      // handoff execution authority fence unchanged.
+      const isProductAssignment = auth.lifecycle_version === 1 && !this.repo.getHandoffTransferBySuccessorAuthId(auth.id);
+      const valRes = isProductAssignment
+        ? this.repo.validateProductAssignmentExecutionAuthority(auth.id)
+        : this.repo.validateHandoffSuccessorExecutionAuthority(auth.id);
       if (!valRes.valid) {
         this.repo.invalidateExecutionAuthorization(auth.id);
         const reason = `EXECUTION_AUTHORIZATION_INVALID: ${valRes.error}`;
@@ -584,30 +591,33 @@ export class ProviderDispatchService {
         return { executionId, status: 'FAILED', error: reason, errorCode: 'RESOURCE_UNAVAILABLE' };
       }
 
-      const transfer = valRes.transfer!;
-      const task = valRes.task!;
-      const attempt = valRes.attempt!;
       assignment = valRes.assignment!;
 
-      if (transfer.status !== 'ACCEPTED') {
-        this.repo.invalidateExecutionAuthorization(auth.id);
-        const reason = `EXECUTION_AUTHORIZATION_NOT_ACCEPTED: HandoffTransfer "${transfer.id}" status is "${transfer.status}", expected "ACCEPTED".`;
-        this.recordRejectionEvent(auth, reason);
-        return { executionId, status: 'FAILED', error: reason, errorCode: 'RESOURCE_UNAVAILABLE' };
-      }
+      if (!isProductAssignment) {
+        const handoffAuthority = valRes as ReturnType<Repository['validateHandoffSuccessorExecutionAuthority']>;
+        const transfer = handoffAuthority.transfer!;
+        const attempt = handoffAuthority.attempt!;
 
-      if (attempt.status !== 'RUNNING') {
-        this.repo.invalidateExecutionAuthorization(auth.id);
-        const reason = `EXECUTION_AUTHORIZATION_ATTEMPT_NOT_RUNNING: Successor attempt status is "${attempt.status}", expected "RUNNING".`;
-        this.recordRejectionEvent(auth, reason);
-        return { executionId, status: 'FAILED', error: reason, errorCode: 'RESOURCE_UNAVAILABLE' };
-      }
+        if (transfer.status !== 'ACCEPTED') {
+          this.repo.invalidateExecutionAuthorization(auth.id);
+          const reason = `EXECUTION_AUTHORIZATION_NOT_ACCEPTED: HandoffTransfer "${transfer.id}" status is "${transfer.status}", expected "ACCEPTED".`;
+          this.recordRejectionEvent(auth, reason);
+          return { executionId, status: 'FAILED', error: reason, errorCode: 'RESOURCE_UNAVAILABLE' };
+        }
 
-      if (assignment.status !== 'RUNNING') {
-        this.repo.invalidateExecutionAuthorization(auth.id);
-        const reason = `ROUTING_ASSIGNMENT_STATUS_INVALID: Successor assignment "${assignment.id}" status is "${assignment.status}", expected "RUNNING".`;
-        this.recordRejectionEvent(auth, reason);
-        return { executionId, status: 'FAILED', error: reason, errorCode: 'RESOURCE_UNAVAILABLE' };
+        if (attempt.status !== 'RUNNING') {
+          this.repo.invalidateExecutionAuthorization(auth.id);
+          const reason = `EXECUTION_AUTHORIZATION_ATTEMPT_NOT_RUNNING: Successor attempt status is "${attempt.status}", expected "RUNNING".`;
+          this.recordRejectionEvent(auth, reason);
+          return { executionId, status: 'FAILED', error: reason, errorCode: 'RESOURCE_UNAVAILABLE' };
+        }
+
+        if (assignment.status !== 'RUNNING') {
+          this.repo.invalidateExecutionAuthorization(auth.id);
+          const reason = `ROUTING_ASSIGNMENT_STATUS_INVALID: Successor assignment "${assignment.id}" status is "${assignment.status}", expected "RUNNING".`;
+          this.recordRejectionEvent(auth, reason);
+          return { executionId, status: 'FAILED', error: reason, errorCode: 'RESOURCE_UNAVAILABLE' };
+        }
       }
 
       const routingPayload = (valRes.routingPayload || {}) as Record<string, unknown>;
@@ -1104,7 +1114,11 @@ export class ProviderDispatchService {
       this.recordRejectionEvent(auth, 'OWNER_APPROVAL_REQUIRED: Verification capability rejected.');
       return { executionId, status: 'FAILED', errorCode: 'POLICY_DENIAL', error: 'OWNER_APPROVAL_REQUIRED: Verification capability is missing, stale or revoked.' };
     }
-    const recomputedContextHash = computeContextManifestHash(parsedContextFiles);
+    const productManifestBound = auth.lifecycle_version === 1 && Boolean(auth.assignment_id) &&
+      !this.repo.getHandoffTransferBySuccessorAuthId(auth.id);
+    const recomputedContextHash = productManifestBound
+      ? this.repo.validateProductAssignmentExecutionAuthority(auth.id).manifest?.manifest_hash ?? null
+      : computeContextManifestHash(parsedContextFiles);
     if (recomputedContextHash !== auth.context_manifest_hash) {
       this.repo.invalidateExecutionAuthorization(auth.id);
       this.recordRejectionEvent(auth, 'EXECUTION_AUTHORIZATION_HASH_MISMATCH: Context manifest hash recomputation failed.');
@@ -1151,6 +1165,9 @@ export class ProviderDispatchService {
       verificationCommands: parsedCanonicalPayload.verificationCommands,
       managerMessageId: auth.manager_message_id,
       managerPayloadHash: auth.manager_payload_hash,
+      // The scope is part of the hashed authority at creation; omitting it here
+      // made every scope-bound authorization fail its own integrity check.
+      executionScope: parsedCanonicalPayload.executionScope,
     });
     const recomputedPayloadHash = computePayloadHash(recomputedPayload);
     if (recomputedPayloadHash !== auth.instruction_payload_hash) {

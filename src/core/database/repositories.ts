@@ -597,6 +597,12 @@ export class Repository {
       );
   }
 
+  /** Ends a still-RUNNING attempt; a no-op when settlement already terminalized it. */
+  public endRunningTaskAttempt(id: string, status: 'FAILED' | 'CANCELLED', endedAt: string): boolean {
+    return this.db.prepare("UPDATE task_attempts SET status = ?, ended_at = ? WHERE id = ? AND status = 'RUNNING'")
+      .run(status, endedAt, id).changes === 1;
+  }
+
   public getTaskAttempt(id: string): TaskAttempt | null {
     const row = this.db.prepare('SELECT * FROM task_attempts WHERE id = ?').get(id) as Record<string, unknown> | undefined;
     if (!row) return null;
@@ -2643,6 +2649,13 @@ export class Repository {
         };
       }
 
+      // Lifecycle-v1 PRODUCT_BOUND authorizations bound to an ordinary
+      // assignment have no HandoffTransfer to terminalize; settle them through
+      // the product path. Handoff successors continue below unchanged.
+      if (auth.assignment_id && !this.getHandoffTransferBySuccessorAuthId(auth.id)) {
+        return this.settleProductAssignmentExecution(auth, params, finishedAt, safeResultPayload, safeErrorJson);
+      }
+
       // 8. Replay check if already settled
       if (auth.settled_at) {
         if (!auth.settlement_status) {
@@ -3336,6 +3349,155 @@ export class Repository {
         evidenceHash,
       };
     });
+  }
+
+  /**
+   * Settlement for a lifecycle-v1 PRODUCT_BOUND authorization bound to an
+   * ordinary assignment. Runs inside settleExecutionResult's immediate
+   * transaction after its generic status/outcome/timestamp checks. Evidence has
+   * the same canonical shape as handoff settlement with transfer_id = null.
+   */
+  private settleProductAssignmentExecution(
+    auth: ExecutionAuthorization,
+    params: { executionId: string; outcome: AdapterOutcome; status: SettlementStatus; finishedAt?: string },
+    finishedAt: string,
+    safeResultPayload: unknown,
+    safeErrorJson: string | null,
+  ): { success: boolean; alreadySettled: boolean; settledAt: string; evidenceHash: string; error?: string } {
+    const fail = (error: string, settledAt = '', evidenceHash = '') => ({ success: false, alreadySettled: false, settledAt, evidenceHash, error });
+    const evidenceFor = (accountId: string | null | undefined, epoch: number | null | undefined, effectiveFinishedAt: string) => ({
+      authorization_id: auth.id,
+      execution_id: params.executionId,
+      transfer_id: null,
+      project_id: auth.project_id,
+      task_id: auth.task_id,
+      attempt_id: auth.attempt_id,
+      assignment_id: auth.assignment_id,
+      provider_id: auth.selected_provider_id,
+      resource_id: auth.selected_resource_id,
+      account_id: accountId ?? null,
+      routing_decision_id: auth.routing_decision_id,
+      ownership_epoch: epoch ?? null,
+      lifecycle_version: 1,
+      settlement_status: params.status,
+      outcome: params.outcome,
+      started_at: auth.adapter_started_at,
+      finished_at: effectiveFinishedAt,
+      result_payload: safeResultPayload,
+      error_json: safeErrorJson,
+    });
+
+    // Replay: identical settlement is idempotent, anything else conflicts.
+    if (auth.settled_at) {
+      if (!auth.settlement_status || !auth.settlement_evidence_json || !auth.settlement_evidence_hash) {
+        return fail(`SETTLEMENT_CORRUPTION: Authorization "${auth.id}" is settled without complete settlement evidence.`, auth.settled_at, auth.settlement_evidence_hash || '');
+      }
+      let stored: Record<string, unknown>;
+      try {
+        if (redactSensitiveText(auth.settlement_evidence_json) !== auth.settlement_evidence_json) throw new OutputSanitizationError('OUTPUT_REDACTION_UNSAFE');
+        stored = JSON.parse(auth.settlement_evidence_json);
+      } catch (error) {
+        if (error instanceof OutputSanitizationError) throw error;
+        return fail('SETTLEMENT_CONFLICT: Stored settlement evidence is not valid JSON.', auth.settled_at, auth.settlement_evidence_hash);
+      }
+      if (!stored || typeof stored !== 'object' || stored.transfer_id !== null || typeof stored.finished_at !== 'string') {
+        return fail('SETTLEMENT_CONFLICT: Stored settlement evidence does not describe a product settlement.', auth.settled_at, auth.settlement_evidence_hash);
+      }
+      if (params.finishedAt !== undefined && params.finishedAt !== stored.finished_at) {
+        return fail(`SETTLEMENT_CONFLICT: Supplied finishedAt "${params.finishedAt}" !== stored finished_at "${stored.finished_at}".`, auth.settled_at, auth.settlement_evidence_hash);
+      }
+      const replayHash = computeSha256(canonicalJsonStringify(
+        evidenceFor(stored.account_id as string | null, stored.ownership_epoch as number | null, stored.finished_at as string),
+      ));
+      if (
+        replayHash === auth.settlement_evidence_hash &&
+        auth.adapter_outcome === params.outcome &&
+        auth.settlement_status === params.status &&
+        auth.execution_id === params.executionId
+      ) {
+        return { success: true, alreadySettled: true, settledAt: auth.settled_at, evidenceHash: auth.settlement_evidence_hash };
+      }
+      return fail(`SETTLEMENT_CONFLICT: Authorization "${auth.id}" is already settled with different outcome/evidence.`, auth.settled_at, auth.settlement_evidence_hash);
+    }
+
+    // Initial settlement: re-prove the complete binding graph.
+    if (
+      !auth.attempt_id || !auth.assignment_id || !auth.selected_account_id || !auth.selected_provider_id ||
+      !auth.selected_resource_id || !auth.routing_decision_id ||
+      auth.task_ownership_epoch === null || auth.task_ownership_epoch === undefined
+    ) {
+      return fail(`BINDING_MISMATCH: Authorization "${auth.id}" has missing or null required lifecycle bindings.`);
+    }
+    const attempt = this.getTaskAttempt(auth.attempt_id);
+    if (!attempt || attempt.task_id !== auth.task_id || attempt.status !== 'RUNNING') {
+      return fail(`ATTEMPT_NOT_RUNNING: Task attempt "${auth.attempt_id}" is missing, belongs to another task or is not RUNNING.`);
+    }
+    const assignment = this.getAgentAssignment(auth.assignment_id);
+    if (
+      !assignment ||
+      (assignment.status !== 'ASSIGNED' && assignment.status !== 'RUNNING') ||
+      assignment.task_id !== auth.task_id ||
+      assignment.project_id !== auth.project_id ||
+      (assignment.attempt_id ?? null) !== auth.attempt_id ||
+      assignment.selected_provider_id !== auth.selected_provider_id ||
+      assignment.selected_resource_id !== auth.selected_resource_id ||
+      assignment.selected_account_id !== auth.selected_account_id ||
+      assignment.routing_decision_id !== auth.routing_decision_id
+    ) {
+      return fail(`BINDING_MISMATCH: Assignment "${auth.assignment_id}" is missing, terminal or does not match authorization "${auth.id}".`);
+    }
+    const account = this.db.prepare('SELECT id, provider_id FROM provider_accounts WHERE id = ?').get(assignment.selected_account_id) as
+      { id: string; provider_id: string } | undefined;
+    if (!account || account.provider_id !== assignment.selected_provider_id) {
+      return fail(`BINDING_MISMATCH: Account "${assignment.selected_account_id}" is missing or bound to another provider.`);
+    }
+    const resource = this.getProviderResource(assignment.selected_resource_id);
+    if (!resource || resource.provider_id !== assignment.selected_provider_id || resource.provider_account_id !== assignment.selected_account_id) {
+      return fail(`BINDING_MISMATCH: Resource "${assignment.selected_resource_id}" is missing or bound elsewhere.`);
+    }
+    const currentTaskEpoch = this.getTask(auth.task_id)?.ownership_epoch;
+    if (currentTaskEpoch !== auth.task_ownership_epoch) {
+      return fail(`OWNERSHIP_EPOCH_MISMATCH: Auth task epoch "${auth.task_ownership_epoch}" !== current task epoch "${currentTaskEpoch}".`);
+    }
+
+    const canonicalEvidenceJson = canonicalJsonStringify(evidenceFor(assignment.selected_account_id, currentTaskEpoch, finishedAt));
+    const evidenceHash = computeSha256(canonicalEvidenceJson);
+
+    const authRes = this.db
+      .prepare(`
+        UPDATE execution_authorizations
+        SET settlement_status = ?, adapter_finished_at = ?, adapter_outcome = ?, adapter_error_json = ?,
+            settled_at = ?, settlement_evidence_json = ?, settlement_evidence_hash = ?
+        WHERE id = ? AND settled_at IS NULL AND status = 'DISPATCHED' AND execution_id = ? AND lifecycle_version = 1
+      `)
+      .run(params.status, finishedAt, params.outcome, safeErrorJson, finishedAt, canonicalEvidenceJson, evidenceHash, auth.id, params.executionId);
+    if (authRes.changes !== 1) throw new Error(`SETTLEMENT_AUTH_UPDATE_FAILED: Expected 1 auth row updated, got ${authRes.changes}`);
+
+    const attemptRes = this.db
+      .prepare("UPDATE task_attempts SET status = ?, ended_at = ? WHERE id = ? AND status = 'RUNNING'")
+      .run(params.status, finishedAt, auth.attempt_id);
+    if (attemptRes.changes !== 1) throw new Error(`SETTLEMENT_ATTEMPT_UPDATE_FAILED: Expected 1 attempt row updated, got ${attemptRes.changes}`);
+
+    const assignmentRes = this.db
+      .prepare("UPDATE agent_assignments SET status = ?, ended_at = ? WHERE id = ? AND status IN ('ASSIGNED', 'RUNNING')")
+      .run(params.status, finishedAt, auth.assignment_id);
+    if (assignmentRes.changes !== 1) throw new Error(`SETTLEMENT_ASSIGNMENT_UPDATE_FAILED: Expected 1 assignment row updated, got ${assignmentRes.changes}`);
+
+    const eventType = params.status === 'COMPLETED'
+      ? 'PRODUCT_EXECUTION_COMPLETED'
+      : params.status === 'CANCELLED' ? 'PRODUCT_EXECUTION_CANCELLED' : 'PRODUCT_EXECUTION_FAILED';
+    const eventId = 'evt-res-' + computeSha256(`${auth.id}:${params.executionId}:${evidenceHash}`).slice(0, 32);
+    const eventRes = this.db
+      .prepare(`
+        INSERT INTO events (id, project_id, task_id, agent_id, type, summary, structured_payload_json, timestamp)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+      `)
+      .run(eventId, auth.project_id, auth.task_id, null, eventType,
+        `Execution ${params.executionId} settled as ${params.status} (outcome: ${params.outcome}) for task ${auth.task_id}`,
+        canonicalEvidenceJson, finishedAt);
+    if (eventRes.changes !== 1) throw new Error(`SETTLEMENT_EVENT_INSERT_FAILED: Expected 1 event row inserted, got ${eventRes.changes}`);
+
+    return { success: true, alreadySettled: false, settledAt: finishedAt, evidenceHash };
   }
 
   public markCancellationRequested(params: {
@@ -7233,6 +7395,122 @@ export class Repository {
     return this.mapHandoffTransfer(row);
   }
 
+  /**
+   * Durable authority for a lifecycle-v1 PRODUCT_BOUND authorization that is
+   * bound to an ordinary (non-handoff) assignment. It re-proves every binding
+   * captured at creation: task epoch/revision/base, assignment, role-aware
+   * routing decision and the durable context manifest the hash was taken from.
+   * Handoff successors keep using validateHandoffSuccessorExecutionAuthority.
+   */
+  public validateProductAssignmentExecutionAuthority(authorizationId: string): {
+    valid: boolean;
+    auth?: ExecutionAuthorization;
+    task?: Task;
+    assignment?: AgentAssignment;
+    routingPayload?: Record<string, unknown>;
+    manifest?: ContextManifest;
+    errorCode?: string;
+    error?: string;
+  } {
+    const auth = this.getExecutionAuthorization(authorizationId);
+    if (!auth) {
+      return { valid: false, errorCode: 'AUTHORIZATION_NOT_FOUND', error: `Execution authorization "${authorizationId}" not found.` };
+    }
+    if (!auth.assignment_id || auth.lifecycle_version !== 1) {
+      return { valid: false, auth, errorCode: 'NON_PRODUCT_AUTHORIZATION', error: `Execution authorization "${auth.id}" is not a lifecycle-v1 assignment-bound authorization.` };
+    }
+    if (this.getHandoffTransferBySuccessorAuthId(auth.id)) {
+      return { valid: false, auth, errorCode: 'HANDOFF_AUTHORIZATION', error: `Execution authorization "${auth.id}" is a handoff successor authorization.` };
+    }
+    // Settlement requires every lifecycle binding. Refuse before the claim so a
+    // provider never runs work whose result could not be settled.
+    if (
+      !auth.attempt_id ||
+      !auth.selected_account_id ||
+      !auth.selected_provider_id ||
+      !auth.selected_resource_id ||
+      !auth.routing_decision_id ||
+      auth.task_ownership_epoch === null ||
+      auth.task_ownership_epoch === undefined
+    ) {
+      return { valid: false, auth, errorCode: 'LIFECYCLE_BINDING_INCOMPLETE', error: `Authorization "${auth.id}" is missing an attempt, account or other lifecycle binding required for settlement.` };
+    }
+    const attempt = this.getTaskAttempt(auth.attempt_id);
+    if (!attempt || attempt.task_id !== auth.task_id || attempt.status !== 'RUNNING') {
+      return { valid: false, auth, errorCode: 'ATTEMPT_NOT_RUNNING', error: `Attempt "${auth.attempt_id}" is missing, belongs to another task or is not RUNNING.` };
+    }
+
+    const task = this.getTask(auth.task_id);
+    if (
+      !task ||
+      task.project_id !== auth.project_id ||
+      task.ownership_epoch !== auth.task_ownership_epoch ||
+      task.revision_count !== auth.task_revision ||
+      !task.base_sha ||
+      task.base_sha.trim() !== auth.base_sha.trim()
+    ) {
+      return { valid: false, auth, task: task ?? undefined, errorCode: 'STALE_OWNERSHIP_EPOCH', error: `Task "${auth.task_id}" no longer matches the authorization epoch, revision or base.` };
+    }
+
+    const assignment = this.getAgentAssignment(auth.assignment_id);
+    if (
+      !assignment ||
+      assignment.project_id !== auth.project_id ||
+      assignment.task_id !== auth.task_id ||
+      (assignment.attempt_id ?? null) !== (auth.attempt_id ?? null) ||
+      assignment.routing_decision_id !== auth.routing_decision_id ||
+      assignment.selected_provider_id !== auth.selected_provider_id ||
+      assignment.selected_resource_id !== auth.selected_resource_id ||
+      (auth.selected_account_id != null && assignment.selected_account_id !== auth.selected_account_id) ||
+      (assignment.status !== 'ASSIGNED' && assignment.status !== 'RUNNING')
+    ) {
+      return { valid: false, auth, task, assignment: assignment ?? undefined, errorCode: 'ASSIGNMENT_NOT_FOUND', error: `Assignment "${auth.assignment_id}" is missing, terminal or does not match the authorization.` };
+    }
+
+    const routingEvent = this.getRoutingDecisionEvent(assignment.routing_decision_id ?? '');
+    const routingPayload = (routingEvent?.structured_payload ?? null) as Record<string, unknown> | null;
+    if (
+      !routingEvent ||
+      routingEvent.type !== 'ROLE_AWARE_ROUTING_DECISION' ||
+      !routingPayload ||
+      routingPayload.outcome !== 'SELECTED' ||
+      routingPayload.projectId !== task.project_id ||
+      routingPayload.taskId !== task.id ||
+      routingPayload.selectedAssignmentId !== assignment.id ||
+      routingPayload.selectedProviderId !== assignment.selected_provider_id ||
+      routingPayload.selectedAccountId !== assignment.selected_account_id ||
+      routingPayload.selectedResourceId !== assignment.selected_resource_id
+    ) {
+      return { valid: false, auth, task, assignment, errorCode: 'ROUTING_DECISION_MISMATCH', error: `Routing decision "${assignment.routing_decision_id}" does not select assignment "${assignment.id}".` };
+    }
+
+    const manifestRow = this.db
+      .prepare(`
+        SELECT m.* FROM context_manifests m
+        JOIN context_snapshots s ON s.id = m.snapshot_id
+        WHERE m.manifest_hash = ? AND s.assignment_id = ?
+        ORDER BY m.created_at DESC, m.rowid DESC LIMIT 1
+      `)
+      .get(auth.context_manifest_hash, assignment.id) as Record<string, unknown> | undefined;
+    const manifest = manifestRow ? this.mapContextManifest(manifestRow) : null;
+    const integrity = manifest ? verifyContextManifestIntegrity(this, manifest.id) : null;
+    const snapshot = integrity?.snapshot;
+    if (
+      !manifest ||
+      !integrity?.valid ||
+      !snapshot ||
+      manifest.manifest_hash !== auth.context_manifest_hash ||
+      snapshot.project_id !== auth.project_id ||
+      snapshot.task_id !== auth.task_id ||
+      (snapshot.attempt_id ?? null) !== (auth.attempt_id ?? null) ||
+      snapshot.assignment_id !== assignment.id
+    ) {
+      return { valid: false, auth, task, assignment, routingPayload, errorCode: 'CONTEXT_MANIFEST_INTEGRITY_FAILED', error: 'Durable context manifest for the authorization is missing, altered or bound elsewhere.' };
+    }
+
+    return { valid: true, auth, task, assignment, routingPayload, manifest };
+  }
+
   public validateHandoffSuccessorExecutionAuthority(authorizationId: string): {
     valid: boolean;
     auth?: ExecutionAuthorization;
@@ -9429,6 +9707,27 @@ export class Repository {
   public getAllProviderAccounts(): ProviderAccount[] {
     const rows = this.db.prepare('SELECT * FROM provider_accounts ORDER BY priority DESC, created_at ASC').all() as Record<string, unknown>[];
     return rows.map((r) => this.mapProviderAccount(r));
+  }
+
+  /**
+   * Storage primitive for AccountHealthService.initializeVerifiedAccount only.
+   * Compare-and-set: promotes an enabled, never-used UNKNOWN account to
+   * AVAILABLE when its identity is unchanged. Records no success or failure
+   * timestamp, because no execution happened.
+   */
+  public initializeUnusedProviderAccountHealth(id: string, expectedProviderId: string, expectedProfileRef: string): boolean {
+    const now = new Date().toISOString();
+    return this.db
+      .prepare(`
+        UPDATE provider_accounts
+        SET health_status = 'AVAILABLE', updated_at = ?
+        WHERE id = ? AND provider_id = ? AND profile_ref = ? AND enabled = 1
+          AND health_status = 'UNKNOWN' AND cooldown_until IS NULL
+          AND last_success_at IS NULL AND last_failure_at IS NULL AND last_failure_code IS NULL
+          AND NOT EXISTS (SELECT 1 FROM agent_assignments WHERE selected_account_id = provider_accounts.id)
+          AND NOT EXISTS (SELECT 1 FROM account_leases WHERE provider_account_id = provider_accounts.id)
+      `)
+      .run(now, id, expectedProviderId, expectedProfileRef).changes === 1;
   }
 
   public updateProviderAccountHealth(
