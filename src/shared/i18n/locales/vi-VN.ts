@@ -369,6 +369,72 @@ export const viVN: TranslationDictionary = {
       INVALID_RESPONSE: 'Ứng dụng trả về phản hồi không hợp lệ. Không coi là đã thay đổi.',
     },
   },
+  projectPlan: {
+    title: 'Kế hoạch dự án',
+    subtitle: 'Mô tả điều bạn muốn làm bằng lời thường. Không cần JSON.',
+    noProject: 'Hãy chọn hoặc tạo một dự án trước.',
+    linesHelp: 'Mỗi dòng một ý. Dấu gạch đầu dòng và số thứ tự sẽ được tự bỏ đi.',
+    goalRequired: 'Hãy viết mục tiêu dự án trước.',
+    save: 'Lưu kế hoạch',
+    saved: 'Đã lưu kế hoạch. Hãy xem lại rồi duyệt ở bên dưới.',
+    advancedSummary: 'Nâng cao: sửa kế hoạch dạng JSON',
+    advancedHelp: 'Dành cho người đã có sẵn tệp hợp đồng dự án. Lưu JSON sẽ thay thế kế hoạch ở trên.',
+    jsonLabel: 'JSON hợp đồng dự án',
+    saveJson: 'Lưu JSON',
+    jsonInvalid: 'Không đọc được JSON. Hãy kiểm tra dấu phẩy và dấu ngoặc kép.',
+    approval: {
+      title: 'Duyệt kế hoạch',
+      status: 'Trạng thái dự án: {status}',
+      needsPlan: 'Hãy lưu kế hoạch có mục tiêu trước khi duyệt.',
+      help: 'Duyệt nghĩa là bạn xác nhận kế hoạch đã chốt. Dự án chuyển sang READY; chưa có gì chạy cho tới khi bạn bấm Start trên thanh tiêu đề.',
+      approve: 'Duyệt kế hoạch',
+      approved: 'Đã duyệt kế hoạch. Dự án ở trạng thái READY. Bấm Start trên thanh tiêu đề khi muốn chạy.',
+      alreadyApproved: 'Kế hoạch này đã được duyệt (trạng thái {status}).',
+      notApprovable: 'Không thể duyệt kế hoạch khi dự án đang ở trạng thái {status}.',
+    },
+    fields: {
+      goal: {
+        label: 'Dự án này cần đạt được gì?',
+        placeholder: 'Ví dụ: Ứng dụng máy tính giúp nhóm theo dõi đơn hàng khi không có mạng.',
+      },
+      business_context: {
+        label: 'Bối cảnh (không bắt buộc)',
+        placeholder: 'Ai dùng, vì sao quan trọng, điều tác tử cần biết.',
+      },
+      acceptance_criteria: {
+        label: 'Làm sao biết là đã chạy đúng?',
+        placeholder: 'Tạo được đơn hàng khi không có mạng\nDữ liệu đồng bộ khi có mạng trở lại',
+      },
+      definition_of_done: {
+        label: 'Khi nào là xong?',
+        placeholder: 'Tất cả kiểm thử đều qua\nBuild được bộ cài trên Windows',
+      },
+      testing_requirements: {
+        label: 'Yêu cầu kiểm thử',
+        placeholder: 'Kiểm thử đơn vị cho mọi service\nMột kiểm thử đầu-cuối cho luồng chính',
+      },
+      technical_constraints: {
+        label: 'Ràng buộc kỹ thuật',
+        placeholder: 'Dùng TypeScript\nKhông thêm dịch vụ trả phí',
+      },
+      architecture_constraints: {
+        label: 'Ràng buộc kiến trúc',
+        placeholder: 'Giữ nguyên lược đồ cơ sở dữ liệu\nMỗi tính năng một service',
+      },
+      security_requirements: {
+        label: 'Yêu cầu bảo mật',
+        placeholder: 'Không lưu mật khẩu dạng văn bản thường\nKhông để bí mật trong kho mã',
+      },
+      non_goals: {
+        label: 'Ngoài phạm vi',
+        placeholder: 'Ứng dụng di động\nXử lý thanh toán',
+      },
+      owner_policies: {
+        label: 'Quy tắc của bạn cho tác tử',
+        placeholder: 'Hỏi tôi trước khi xóa tệp\nƯu tiên pull request nhỏ',
+      },
+    },
+  },
   agentCard: {
     noAssignedModel: 'Chưa gán mô hình',
     observableAction: 'Hành động Quan sát được',

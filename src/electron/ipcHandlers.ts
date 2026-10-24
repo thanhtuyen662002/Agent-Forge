@@ -319,7 +319,11 @@ export function registerIpcHandlers(
     if (!parsed.success) {
       return { success: false, error: parsed.error.issues.map((i) => i.message).join(', ') };
     }
-    return projectService.importContract(parsed.data.projectId, parsed.data.contract as any);
+    // Typed acknowledgement: the renderer only treats an explicit success envelope as saved.
+    if (!projectService.importContract(parsed.data.projectId, parsed.data.contract as any)) {
+      return { success: false, errorCode: 'PROJECT_NOT_FOUND', error: `Project "${parsed.data.projectId}" not found.` };
+    }
+    return { success: true, project: repo.getProjectMetadata(parsed.data.projectId) };
   });
 
   registerPrivilegedHandler('project:transition', async (_, payload: unknown) => {
@@ -327,7 +331,18 @@ export function registerIpcHandlers(
     if (!parsed.success) {
       return { success: false, error: parsed.error.issues.map((i) => i.message).join(', ') };
     }
-    return projectService.transitionStatus(parsed.data.projectId, parsed.data.trigger);
+    try {
+      const status = projectService.transitionStatus(parsed.data.projectId, parsed.data.trigger);
+      return { success: true, status, project: repo.getProjectMetadata(parsed.data.projectId) };
+    } catch (error) {
+      // Repository identity failures keep their typed code through the registration wrapper.
+      if (error instanceof RepositoryRootError) throw error;
+      const message = error instanceof Error ? error.message : '';
+      const errorCode = message.includes('Invalid transition') ? 'INVALID_TRANSITION'
+        : message.includes('EMERGENCY_STOP_LATCHED') ? 'EMERGENCY_STOP_LATCHED'
+        : /not found/i.test(message) ? 'PROJECT_NOT_FOUND' : 'TRANSITION_REJECTED';
+      return { success: false, errorCode, error: redactSensitiveText(message || 'Project transition was rejected.') };
+    }
   });
 
   // ==========================================

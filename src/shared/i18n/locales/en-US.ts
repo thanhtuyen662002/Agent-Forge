@@ -369,6 +369,72 @@ export const enUS: TranslationDictionary = {
       INVALID_RESPONSE: 'The desktop app returned an unexpected reply. Nothing is assumed changed.',
     },
   },
+  projectPlan: {
+    title: 'Project plan',
+    subtitle: 'Describe what you want built in plain words. No JSON needed.',
+    noProject: 'Select or create a project first.',
+    linesHelp: 'One item per line. Bullets and numbering are removed automatically.',
+    goalRequired: 'Write the project goal first.',
+    save: 'Save plan',
+    saved: 'Plan saved. Review it, then approve it below.',
+    advancedSummary: 'Advanced: edit the plan as JSON',
+    advancedHelp: 'For people who already have a project contract file. Saving JSON replaces the plan above.',
+    jsonLabel: 'Project contract JSON',
+    saveJson: 'Save JSON',
+    jsonInvalid: 'The JSON could not be read. Check commas and quotes.',
+    approval: {
+      title: 'Approve the plan',
+      status: 'Project status: {status}',
+      needsPlan: 'Save a plan with a goal before approving it.',
+      help: 'Approving tells Agent Forge the plan is final. The project becomes READY; nothing runs until you press Start in the header.',
+      approve: 'Approve plan',
+      approved: 'Plan approved. The project is READY. Press Start in the header when you want it to run.',
+      alreadyApproved: 'This plan is approved (status {status}).',
+      notApprovable: 'The plan cannot be approved while the project is {status}.',
+    },
+    fields: {
+      goal: {
+        label: 'What should this project achieve?',
+        placeholder: 'For example: A desktop app that lets my team track customer orders offline.',
+      },
+      business_context: {
+        label: 'Background (optional)',
+        placeholder: 'Who uses it, why it matters, anything the agents should know.',
+      },
+      acceptance_criteria: {
+        label: 'How will you know it works?',
+        placeholder: 'Orders can be created without internet\nData syncs when the connection returns',
+      },
+      definition_of_done: {
+        label: 'When is it finished?',
+        placeholder: 'All tests pass\nInstaller builds on Windows',
+      },
+      testing_requirements: {
+        label: 'Testing requirements',
+        placeholder: 'Unit tests for every service\nOne end-to-end test of the main flow',
+      },
+      technical_constraints: {
+        label: 'Technical constraints',
+        placeholder: 'Use TypeScript\nNo new paid services',
+      },
+      architecture_constraints: {
+        label: 'Architecture constraints',
+        placeholder: 'Keep the existing database schema\nOne service per feature',
+      },
+      security_requirements: {
+        label: 'Security requirements',
+        placeholder: 'Never store passwords in plain text\nNo secrets in the repository',
+      },
+      non_goals: {
+        label: 'Out of scope',
+        placeholder: 'Mobile app\nPayment processing',
+      },
+      owner_policies: {
+        label: 'Your rules for the agents',
+        placeholder: 'Ask me before deleting files\nPrefer small pull requests',
+      },
+    },
+  },
   agentCard: {
     noAssignedModel: 'No assigned model',
     observableAction: 'Observable Action',

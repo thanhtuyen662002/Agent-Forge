@@ -372,6 +372,72 @@ export interface TranslationDictionary {
       INVALID_RESPONSE: string;
     };
   };
+  projectPlan: {
+    title: string;
+    subtitle: string;
+    noProject: string;
+    linesHelp: string;
+    goalRequired: string;
+    save: string;
+    saved: string;
+    advancedSummary: string;
+    advancedHelp: string;
+    jsonLabel: string;
+    saveJson: string;
+    jsonInvalid: string;
+    approval: {
+      title: string;
+      status: string;
+      needsPlan: string;
+      help: string;
+      approve: string;
+      approved: string;
+      alreadyApproved: string;
+      notApprovable: string;
+    };
+    fields: {
+      goal: {
+        label: string;
+        placeholder: string;
+      };
+      business_context: {
+        label: string;
+        placeholder: string;
+      };
+      acceptance_criteria: {
+        label: string;
+        placeholder: string;
+      };
+      definition_of_done: {
+        label: string;
+        placeholder: string;
+      };
+      testing_requirements: {
+        label: string;
+        placeholder: string;
+      };
+      technical_constraints: {
+        label: string;
+        placeholder: string;
+      };
+      architecture_constraints: {
+        label: string;
+        placeholder: string;
+      };
+      security_requirements: {
+        label: string;
+        placeholder: string;
+      };
+      non_goals: {
+        label: string;
+        placeholder: string;
+      };
+      owner_policies: {
+        label: string;
+        placeholder: string;
+      };
+    };
+  };
   agentCard: {
     noAssignedModel: string;
     observableAction: string;

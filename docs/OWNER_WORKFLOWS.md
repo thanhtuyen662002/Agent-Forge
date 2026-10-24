@@ -96,6 +96,42 @@ The renderer (`src/ui/agentRoster.ts`) only treats a reply as saved when it is
 an explicit success envelope that carries the persisted agent. Malformed
 replies show an error and are not counted as success.
 
+## Project plan: plain-text input and plan approval
+
+The **Project plan** section of **Projects** replaces the old JSON-only
+contract importer. The owner fills labeled fields in plain words:
+
+- **What should this project achieve?** (required) and an optional
+  **Background**;
+- list fields, one item per line: how you will know it works, when it is
+  finished, testing requirements, technical and architecture constraints,
+  security requirements, out of scope, and your rules for the agents. Bullets
+  and numbering (`- `, `* `, `• `, `1. `, `2) `) are removed automatically.
+
+**Save plan** converts the fields into the existing `ProjectContract`
+(`src/ui/projectContractForm.ts`) and sends it through
+`project:importContract`. The form is prefilled from the stored contract.
+Editing JSON is still possible under **Advanced: edit the plan as JSON**;
+malformed JSON is refused in the renderer and never sent.
+
+**Approve the plan** appears when the project is `DRAFT` or `PLANNING` and has
+a stored goal. It sends `PLAN_APPROVED`, which moves the project to `READY`.
+Approval does not start work: the project runs only after **Start** in the
+header.
+
+Both channels now reply with typed acknowledgements, so the renderer's
+success check works:
+
+| Channel | Success | Failure |
+| --- | --- | --- |
+| `project:importContract` | `{ success: true, project }` | `{ success: false, errorCode: 'PROJECT_NOT_FOUND', error }` |
+| `project:transition` | `{ success: true, status, project }` | `{ success: false, errorCode: 'INVALID_TRANSITION' \| 'EMERGENCY_STOP_LATCHED' \| 'PROJECT_NOT_FOUND' \| 'TRANSITION_REJECTED', error }` |
+
+Previously `project:importContract` returned a bare boolean and
+`project:transition` a bare status string, so the renderer reported both
+(including the header's Start and Pause) as invalid responses even when they
+succeeded.
+
 ## Projects and tasks: search, trash and restore
 
 **Projects** lists every active project with a search box (case- and
@@ -148,7 +184,6 @@ There is no permanent delete.
 
 ## Not yet covered by this slice of Issue #225
 
-- Natural-text project goal/constraint input instead of JSON contracts.
 - A desktop Start/Pause control wired to the bounded execution runtime.
 - Automatic quota refresh and Codex device-code sign-in.
 - Dashboard setup/blocker guidance.

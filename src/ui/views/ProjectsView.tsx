@@ -1,16 +1,18 @@
-import React, { useMemo, useState } from 'react';
+import React, { useEffect, useMemo, useState } from 'react';
 import { useOrchestrator } from '../context/OrchestratorContext';
 import { useI18n } from '../context/I18nContext';
-import { FolderGit2, Plus, FileCode, FolderOpen, Search, Trash2 } from 'lucide-react';
+import { FolderGit2, Plus, FileCode, FolderOpen, Search, Trash2, CheckCircle2 } from 'lucide-react';
 import { uiActionFailureKey } from '../actionState';
 import { AccessibleDialog } from '../components/AccessibleDialog';
 import { ConfirmTrashDialog, TrashFailureMessage, TrashList } from '../components/TrashPanel';
 import { matchesSearch, useWorkspaceTrash } from '../workspaceTrash';
 import type { TrashActionResult } from '../workspaceTrash';
-import type { Project } from '../../core/types/domain';
+import type { Project, ProjectContract } from '../../core/types/domain';
+import { CONTRACT_LIST_FIELDS, canApprovePlan, contractFromForm, emptyContractForm, formFromContract } from '../projectContractForm';
+import type { ContractFormState } from '../projectContractForm';
 
 export const ProjectsView: React.FC = () => {
-  const { projects, activeProject, setActiveProject, createProject, importContract, isElectron, pendingActions, refreshData } = useOrchestrator();
+  const { projects, activeProject, setActiveProject, createProject, importContract, transitionProject, isElectron, pendingActions, refreshData } = useOrchestrator();
   const { t } = useI18n();
   const [isCreateOpen, setIsCreateOpen] = useState<boolean>(false);
   const [name, setName] = useState<string>('');
@@ -55,6 +57,15 @@ export const ProjectsView: React.FC = () => {
       : { ok: false, message: '', failure: result });
   };
   const importing = pendingActions.includes('importContract');
+  const approving = pendingActions.includes('projectTransition');
+  const [contractForm, setContractForm] = useState<ContractFormState>(emptyContractForm);
+  const [approvalStatus, setApprovalStatus] = useState<{ ok: boolean; message: string } | null>(null);
+
+  // Prefill the guided form from the stored plan whenever the selected project or its plan changes.
+  useEffect(() => {
+    setContractForm(formFromContract(activeProject?.contract));
+    setApprovalStatus(null);
+  }, [activeProject?.id, activeProject?.updated_at]);
 
   const handleBindRepository = async () => {
     if (!activeProject || binding) return;
@@ -146,22 +157,46 @@ export const ProjectsView: React.FC = () => {
     }
   };
 
-  const handleImportContract = async () => {
-    if (!contractJson.trim()) return;
+  const handleImportContract = async (source: 'form' | 'json' = 'form') => {
     setImportStatus(null);
     setImportSucceeded(false);
+    let contract: ProjectContract;
+    if (source === 'json') {
+      if (!contractJson.trim()) return;
+      try {
+        contract = JSON.parse(contractJson);
+      } catch {
+        setImportStatus(t('projectPlan.jsonInvalid'));
+        return;
+      }
+    } else {
+      contract = contractFromForm(contractForm);
+      if (!contract.goal) {
+        setImportStatus(t('projectPlan.goalRequired'));
+        return;
+      }
+    }
     try {
-      const parsed = JSON.parse(contractJson);
-      const result = await importContract(parsed);
+      const result = await importContract(contract);
       if (!result.success) {
         setImportStatus(t(uiActionFailureKey(result.code)));
         return;
       }
       setImportSucceeded(true);
-      setImportStatus(t('projects.importSuccess'));
+      setImportStatus(t('projectPlan.saved'));
     } catch (err: any) {
       setImportStatus(t('actions.invalidResponse'));
     }
+  };
+
+  const handleApprovePlan = async () => {
+    setApprovalStatus(null);
+    const result = await transitionProject('PLAN_APPROVED');
+    if (!result.success) {
+      setApprovalStatus({ ok: false, message: t(uiActionFailureKey(result.code)) });
+      return;
+    }
+    setApprovalStatus({ ok: true, message: t('projectPlan.approval.approved') });
   };
 
   return (
@@ -290,48 +325,141 @@ export const ProjectsView: React.FC = () => {
         </section>
       )}
 
-      {/* Contract Editor / Importer */}
-      <div className="bg-surface-card border border-surface-border rounded-xl p-6 shadow-lg space-y-4">
-        <h3 id="project-contract-label" className="text-sm font-semibold text-white font-mono uppercase tracking-wider flex items-center space-x-2">
-          <FileCode className="w-4 h-4 text-forge-purple" />
-          <span>{t('projects.importerTitle')}</span>
-        </h3>
-        <p className="text-xs text-slate-400">
-          {t('projects.importerSubtitle')}
-        </p>
-
-        <textarea
-          aria-labelledby="project-contract-label"
-          disabled={importing}
-          value={contractJson}
-          onChange={(e) => setContractJson(e.target.value)}
-          placeholder={`{
-  "goal": "Build a local AI engineering desktop orchestrator",
-  "architecture_constraints": ["Must use better-sqlite3 with WAL mode", "Strict Electron security boundary"],
-  "security_requirements": ["No arbitrary shell execution", "Zero ChatGPT web scraping"],
-  "definition_of_done": ["All unit tests pass", "Manual bridge functions end-to-end"]
-}`}
-          className="w-full h-48 bg-surface border border-surface-border rounded-lg p-4 text-xs font-mono text-slate-100 focus:outline-none focus:border-forge-purple resize-none"
-        />
-
-        {importStatus && (
-          <div role={importSucceeded ? 'status' : 'alert'} className={`p-3 border rounded-lg text-xs font-mono ${importSucceeded ? 'bg-emerald-950/30 border-emerald-800/40 text-emerald-300' : 'bg-rose-950/30 border-rose-800/40 text-rose-300'}`}>
-            {importStatus}
-          </div>
-        )}
-
-        <div className="flex justify-end">
-          <button
-            onClick={handleImportContract}
-            disabled={!isElectron || !activeProject || importing || !contractJson.trim()}
-            aria-busy={importing}
-            title={!isElectron ? t('actions.desktopRequired') : undefined}
-            className="px-5 py-2 bg-forge-purple hover:bg-purple-600 text-white font-mono font-bold text-xs rounded-lg shadow transition"
-          >
-            {importing ? t('actions.pending') : t('projects.importButton')}
-          </button>
+      {/* Project plan: guided natural-text form, JSON only as an advanced option */}
+      <section aria-labelledby="project-plan-title" className="bg-surface-card border border-surface-border rounded-xl p-6 shadow-lg space-y-5">
+        <div>
+          <h3 id="project-plan-title" className="text-sm font-semibold text-white flex items-center space-x-2">
+            <FileCode className="w-4 h-4 text-forge-purple" aria-hidden="true" />
+            <span>{t('projectPlan.title')}</span>
+          </h3>
+          <p className="text-xs text-slate-400 mt-1">{t('projectPlan.subtitle')}</p>
         </div>
-      </div>
+
+        {!activeProject ? (
+          <p className="text-xs text-slate-500">{t('projectPlan.noProject')}</p>
+        ) : (
+          <>
+            <div className="space-y-4">
+              <div>
+                <label htmlFor="plan-goal" className="block text-sm text-slate-200 mb-1">{t('projectPlan.fields.goal.label')}</label>
+                <textarea
+                  id="plan-goal"
+                  required
+                  disabled={importing}
+                  value={contractForm.goal}
+                  onChange={(event) => setContractForm({ ...contractForm, goal: event.target.value })}
+                  placeholder={t('projectPlan.fields.goal.placeholder')}
+                  className="w-full h-20 bg-surface border border-surface-border rounded-lg p-3 text-sm text-slate-100 focus:outline-none focus:border-forge-purple resize-y"
+                />
+              </div>
+              <div>
+                <label htmlFor="plan-business_context" className="block text-sm text-slate-200 mb-1">{t('projectPlan.fields.business_context.label')}</label>
+                <textarea
+                  id="plan-business_context"
+                  disabled={importing}
+                  value={contractForm.business_context}
+                  onChange={(event) => setContractForm({ ...contractForm, business_context: event.target.value })}
+                  placeholder={t('projectPlan.fields.business_context.placeholder')}
+                  className="w-full h-16 bg-surface border border-surface-border rounded-lg p-3 text-sm text-slate-100 focus:outline-none focus:border-forge-purple resize-y"
+                />
+              </div>
+              <p id="plan-lines-help" className="text-xs text-slate-500">{t('projectPlan.linesHelp')}</p>
+              <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
+                {CONTRACT_LIST_FIELDS.map((field) => (
+                  <div key={field}>
+                    <label htmlFor={`plan-${field}`} className="block text-sm text-slate-200 mb-1">{t(`projectPlan.fields.${field}.label`)}</label>
+                    <textarea
+                      id={`plan-${field}`}
+                      disabled={importing}
+                      aria-describedby="plan-lines-help"
+                      value={contractForm[field]}
+                      onChange={(event) => setContractForm({ ...contractForm, [field]: event.target.value })}
+                      placeholder={t(`projectPlan.fields.${field}.placeholder`)}
+                      className="w-full h-24 bg-surface border border-surface-border rounded-lg p-3 text-sm text-slate-100 focus:outline-none focus:border-forge-purple resize-y"
+                    />
+                  </div>
+                ))}
+              </div>
+            </div>
+
+            {importStatus && (
+              <div role={importSucceeded ? 'status' : 'alert'} className={`p-3 border rounded-lg text-xs ${importSucceeded ? 'bg-emerald-950/30 border-emerald-800/40 text-emerald-300' : 'bg-rose-950/30 border-rose-800/40 text-rose-300'}`}>
+                {importStatus}
+              </div>
+            )}
+
+            <div className="flex justify-end">
+              <button
+                type="button"
+                onClick={() => void handleImportContract('form')}
+                disabled={!isElectron || importing || !contractForm.goal.trim()}
+                aria-busy={importing}
+                title={!isElectron ? t('actions.desktopRequired') : undefined}
+                className="px-5 py-2 bg-forge-purple hover:bg-purple-600 disabled:opacity-40 disabled:cursor-not-allowed text-white font-bold text-xs rounded-lg shadow transition"
+              >
+                {importing ? t('actions.pending') : t('projectPlan.save')}
+              </button>
+            </div>
+
+            <details className="rounded-lg border border-surface-border p-4">
+              <summary className="cursor-pointer text-xs text-slate-300">{t('projectPlan.advancedSummary')}</summary>
+              <div className="space-y-3 pt-3">
+                <p className="text-xs text-slate-400">{t('projectPlan.advancedHelp')}</p>
+                <label htmlFor="plan-json" className="block text-xs text-slate-300">{t('projectPlan.jsonLabel')}</label>
+                <textarea
+                  id="plan-json"
+                  disabled={importing}
+                  value={contractJson}
+                  onChange={(e) => setContractJson(e.target.value)}
+                  placeholder={'{ "goal": "..." }'}
+                  className="w-full h-40 bg-surface border border-surface-border rounded-lg p-3 text-xs font-mono text-slate-100 focus:outline-none focus:border-forge-purple resize-y"
+                />
+                <div className="flex justify-end">
+                  <button
+                    type="button"
+                    onClick={() => void handleImportContract('json')}
+                    disabled={!isElectron || importing || !contractJson.trim()}
+                    className="px-4 py-2 bg-surface-border hover:bg-surface-hover disabled:opacity-40 text-slate-200 text-xs rounded-lg"
+                  >
+                    {t('projectPlan.saveJson')}
+                  </button>
+                </div>
+              </div>
+            </details>
+
+            <div className="border-t border-surface-border pt-4 space-y-2" aria-labelledby="plan-approval-title" role="group">
+              <h4 id="plan-approval-title" className="text-sm font-semibold text-white flex items-center gap-2">
+                <CheckCircle2 className="w-4 h-4 text-forge-emerald" aria-hidden="true" />
+                <span>{t('projectPlan.approval.title')}</span>
+              </h4>
+              <p className="text-xs text-slate-400">{t('projectPlan.approval.status', { status: activeProject.status })}</p>
+              <p className="text-xs text-slate-400">{t('projectPlan.approval.help')}</p>
+              {canApprovePlan(activeProject.status, activeProject.contract) ? (
+                <button
+                  type="button"
+                  onClick={() => void handleApprovePlan()}
+                  disabled={!isElectron || approving}
+                  aria-busy={approving}
+                  className="px-5 py-2 bg-forge-emerald/90 hover:bg-emerald-500 disabled:opacity-40 text-slate-950 font-bold text-xs rounded-lg shadow"
+                >
+                  {approving ? t('actions.pending') : t('projectPlan.approval.approve')}
+                </button>
+              ) : activeProject.status === 'DRAFT' || activeProject.status === 'PLANNING' ? (
+                <p className="text-xs text-amber-300">{t('projectPlan.approval.needsPlan')}</p>
+              ) : ['READY', 'RUNNING', 'PAUSED', 'BLOCKED', 'WAITING_FOR_CAPACITY', 'WAITING_FOR_OWNER', 'FINAL_REVIEW', 'COMPLETED'].includes(activeProject.status) ? (
+                <p className="text-xs text-emerald-300">{t('projectPlan.approval.alreadyApproved', { status: activeProject.status })}</p>
+              ) : (
+                <p className="text-xs text-slate-400">{t('projectPlan.approval.notApprovable', { status: activeProject.status })}</p>
+              )}
+              {approvalStatus && (
+                <p role={approvalStatus.ok ? 'status' : 'alert'} className={`text-xs ${approvalStatus.ok ? 'text-emerald-300' : 'text-rose-300'}`}>
+                  {approvalStatus.message}
+                </p>
+              )}
+            </div>
+          </>
+        )}
+      </section>
 
       {/* New Project Modal */}
       {isCreateOpen && (
