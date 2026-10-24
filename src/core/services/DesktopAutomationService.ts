@@ -206,7 +206,7 @@ export class DesktopAutomationService {
         if (toDecide && !toDecide.deferred) {
           const manager = this.findAgent('MANAGER');
           if (manager) {
-            const decide = this.runManager(project, toDecide, manager)
+            const decide = this.runManager(toDecide, manager)
               .catch(() => undefined)
               .finally(() => this.inFlight.delete(project.id));
             this.inFlight.set(project.id, { kind: 'MANAGER', taskId: toDecide.task.id, agentId: manager.agent.id, promise: decide });
@@ -303,17 +303,19 @@ export class DesktopAutomationService {
     if (known) return known;
     const pending = this.manager.pendingDecision(project.id);
     if (!pending) return null;
-    if (!pending.deferred && this.findAgent('MANAGER')) return null;
+    if (pending.deferred) return { taskId: pending.task.id, reasonCode: 'MANAGER_RETRY_PENDING' };
+    if (this.findAgent('MANAGER')) return null;
     const hasManager = this.repo.getAllAgents().some((agent) => !agent.removed_at && (agent.role === 'PRIMARY_MANAGER' || agent.role === 'BACKUP_MANAGER'));
     return { taskId: pending.task.id, reasonCode: hasManager ? 'MANAGER_NOT_AVAILABLE' : 'NO_MANAGER' };
   }
 
-  private async runManager(project: Project, pending: PendingManagerDecision, manager: CoderCandidate): Promise<void> {
+  /** The mode (auto or approve) is read by the Manager service when the answer arrives, not at dispatch. */
+  private async runManager(pending: PendingManagerDecision, manager: CoderCandidate): Promise<void> {
     if (!this.manager) return;
     await this.manager.decide(pending, {
       agentId: manager.agent.id, agentProfileId: manager.agentProfileId, roleProfileId: manager.roleProfileId,
       accountId: manager.accountId, resourceId: manager.resourceId,
-    }, this.manager.getMode(project.id));
+    });
   }
 
   private nextEligibleTask(project: Project): Task | null {

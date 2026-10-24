@@ -17,17 +17,27 @@ export const MANAGER_ATTEMPT_MARKER = 'desktop-manager';
 export const MANAGER_STARTED_EVENT = 'AUTOMATION_MANAGER_STARTED';
 export const MANAGER_APPLIED_EVENT = 'AUTOMATION_MANAGER_APPLIED';
 export const MANAGER_PROPOSED_EVENT = 'AUTOMATION_MANAGER_PROPOSED';
+export const MANAGER_PROPOSAL_CLAIMED_EVENT = 'AUTOMATION_MANAGER_PROPOSAL_CLAIMED';
 export const MANAGER_REJECTED_EVENT = 'AUTOMATION_MANAGER_REJECTED';
 export const MANAGER_FAILED_EVENT = 'AUTOMATION_MANAGER_FAILED';
 export const MANAGER_NOT_RUN_EVENT = 'AUTOMATION_MANAGER_NOT_RUN';
 export const MANAGER_INTERRUPTED_EVENT = 'AUTOMATION_MANAGER_INTERRUPTED';
-const MANAGER_EVENTS = [MANAGER_STARTED_EVENT, MANAGER_APPLIED_EVENT, MANAGER_PROPOSED_EVENT, MANAGER_REJECTED_EVENT,
-  MANAGER_FAILED_EVENT, MANAGER_NOT_RUN_EVENT, MANAGER_INTERRUPTED_EVENT];
+const MANAGER_EVENTS = [MANAGER_STARTED_EVENT, MANAGER_APPLIED_EVENT, MANAGER_PROPOSED_EVENT, MANAGER_PROPOSAL_CLAIMED_EVENT,
+  MANAGER_REJECTED_EVENT, MANAGER_FAILED_EVENT, MANAGER_NOT_RUN_EVENT, MANAGER_INTERRUPTED_EVENT];
+/** Events that close a proposal: decided (claimed) by the owner, or superseded. */
+const PROPOSAL_CLOSING_EVENTS = [MANAGER_PROPOSAL_CLAIMED_EVENT, MANAGER_APPLIED_EVENT, MANAGER_REJECTED_EVENT, MANAGER_FAILED_EVENT];
 
 /** Owner setting: the Manager's decision is applied directly, or proposed for approval (default). */
 export type ManagerMode = 'AUTO' | 'APPROVE';
-/** Only dispatch authority comes from the automated Manager; verdicts stay with the reviewer. */
-const ALLOWED_DECISIONS = new Set(['EXECUTE', 'BLOCK']);
+/**
+ * Only dispatch authority comes from the automated Manager; verdicts stay with
+ * the reviewer. A PLANNED task can only be started (the state machine has no
+ * BLOCK from PLANNED); a sent-back revision may also be escalated with BLOCK.
+ */
+const ALLOWED_DECISIONS: Record<PendingManagerDecision['kind'], ReadonlySet<string>> = {
+  START: new Set(['EXECUTE']),
+  NEXT_REVISION: new Set(['EXECUTE', 'BLOCK']),
+};
 const RETRY_AFTER_MS = 5 * 60_000;
 /** Provider failures for one task revision are retried this many times before the owner is asked. */
 const MAX_PROVIDER_ATTEMPTS = 3;
@@ -67,11 +77,22 @@ export function managerAuthorizesRevision(repo: Repository, task: Task): boolean
   return false;
 }
 
-interface ProposalPayload {
-  taskId: string;
+/** Everything a decision is bound to: a change in any of these makes it stale. */
+interface TaskSnapshot {
   taskState: string;
   taskRevision: number;
+  ownershipEpoch: number;
+  /** The latest applied Manager message, so an owner decision in between is never overwritten. */
+  authorityMessageId: string | null;
+}
+
+interface ProposalPayload extends TaskSnapshot {
+  taskId: string;
   decision: ManagerProtocol;
+}
+
+class ManagerApplyError extends Error {
+  constructor(public readonly reasonCode: string, public readonly retryable: boolean) { super(reasonCode); }
 }
 
 /**
@@ -79,11 +100,11 @@ interface ProposalPayload {
  * whose current revision has no Manager authority (after a failed
  * verification or a FIX_REQUIRED review), it asks a Manager agent on its own
  * account (role-aware routing, WorkerSlotLeaseService lease, read-only CLI
- * with no repository context) for a manager.v1 EXECUTE or BLOCK decision bound
- * to the task's exact state and revision. The decision is applied only through
- * TaskService.applyManagerDecision, directly in AUTO mode or after the owner
- * approves it in APPROVE mode (the default). Failed, malformed, stale or
- * disallowed output never moves a task.
+ * with no repository context) for a manager.v1 decision bound to the task's
+ * exact state, revision, epoch and current Manager authority. The decision is
+ * applied only through TaskService.applyManagerDecision, directly in AUTO mode
+ * or after the owner approves it in APPROVE mode (the default). Failed,
+ * malformed, stale or disallowed output never moves a task.
  */
 export class ProductManagerService {
   private readonly now: () => Date;
@@ -116,32 +137,62 @@ export class ProductManagerService {
     return `${task.id}:${task.revision_count}`;
   }
 
+  private snapshot(task: Task): TaskSnapshot {
+    const authority = this.repo.getLatestAppliedManagerProtocolMessage(task.id, task.project_id);
+    return {
+      taskState: task.state, taskRevision: task.revision_count, ownershipEpoch: task.ownership_epoch ?? 1,
+      authorityMessageId: authority?.message_id ? String(authority.message_id) : null,
+    };
+  }
+
+  /** The task as it is now still matches the snapshot a decision was made for. */
+  private stillMatches(taskId: string, expected: TaskSnapshot): boolean {
+    const current = this.repo.getTask(taskId);
+    if (!current) return false;
+    const now = this.snapshot(current);
+    return now.taskState === expected.taskState && now.taskRevision === expected.taskRevision &&
+      now.ownershipEpoch === expected.ownershipEpoch && now.authorityMessageId === expected.authorityMessageId;
+  }
+
   private managerEvents(projectId: string, taskId?: string) {
     return this.repo.getEventsByProject(projectId).filter((event) => MANAGER_EVENTS.includes(event.type) && (!taskId || event.task_id === taskId));
   }
 
   private eventsForRevision(task: Task) {
     return this.managerEvents(task.project_id, task.id)
-      .filter((event) => (event.structured_payload as { taskRevision?: unknown } | null)?.taskRevision === task.revision_count);
+      .filter((event) => (event.structured_payload as { taskRevision?: unknown } | null)?.taskRevision === task.revision_count)
+      .sort((a, b) => b.timestamp.localeCompare(a.timestamp));
   }
 
-  /** The first task (oldest first) that needs a Manager decision no automated call has settled yet. */
-  public pendingDecision(projectId: string): PendingManagerDecision | null {
-    const candidates = this.repo.getTasksByProject(projectId)
-      .filter((task) => !this.repo.isTaskTrashed(task.id))
-      .sort((a, b) => a.created_at.localeCompare(b.created_at));
-    for (const task of candidates) {
-      let kind: PendingManagerDecision['kind'];
-      if (task.state === 'PLANNED' && !this.repo.getLatestAppliedManagerProtocolMessage(task.id, projectId)) kind = 'START';
-      else if (task.state === 'CODING' && !managerAuthorizesRevision(this.repo, task)) kind = 'NEXT_REVISION';
-      else continue;
-      if (this.isSettled(task)) continue;
-      return { task, kind, deferred: (this.retryAfter.get(this.key(task)) ?? 0) > this.now().getTime() };
-    }
+  /** What kind of decision the task needs now, or null when it has Manager authority or is elsewhere. */
+  private needsDecision(task: Task): PendingManagerDecision['kind'] | null {
+    if (this.repo.isTaskTrashed(task.id)) return null;
+    if (task.state === 'PLANNED' && !this.repo.getLatestAppliedManagerProtocolMessage(task.id, task.project_id)) return 'START';
+    if (task.state === 'CODING' && !managerAuthorizesRevision(this.repo, task)) return 'NEXT_REVISION';
     return null;
   }
 
-  /** A proposal, an applied or rejected decision, a terminal failure, or too many provider failures settle a revision. */
+  /**
+   * The oldest task that needs a Manager decision no automated call has
+   * settled yet. A task waiting out its retry delay does not block the others;
+   * it is returned as deferred only when no other task is ready.
+   */
+  public pendingDecision(projectId: string): PendingManagerDecision | null {
+    const candidates = this.repo.getTasksByProject(projectId).sort((a, b) => a.created_at.localeCompare(b.created_at));
+    let deferred: PendingManagerDecision | null = null;
+    for (const task of candidates) {
+      const kind = this.needsDecision(task);
+      if (!kind || this.isSettled(task)) continue;
+      if ((this.retryAfter.get(this.key(task)) ?? 0) > this.now().getTime()) {
+        deferred ??= { task, kind, deferred: true };
+        continue;
+      }
+      return { task, kind, deferred: false };
+    }
+    return deferred;
+  }
+
+  /** A proposal, an owner decision, a terminal failure, or too many provider failures settle a revision. */
   private isSettled(task: Task): boolean {
     const events = this.eventsForRevision(task);
     if (events.some((event) => [MANAGER_APPLIED_EVENT, MANAGER_PROPOSED_EVENT, MANAGER_REJECTED_EVENT].includes(event.type))) return true;
@@ -150,14 +201,15 @@ export class ProductManagerService {
     return failures.length >= MAX_PROVIDER_ATTEMPTS;
   }
 
-  /** Why a task is waiting on the Manager, for the status header; null when nothing is known. */
+  /** Why a task is waiting on the Manager, for the status header; only tasks that still need a decision count. */
   public waitingReason(projectId: string): { taskId: string; reasonCode: string } | null {
     for (const task of this.repo.getTasksByProject(projectId)) {
-      if (this.repo.isTaskTrashed(task.id) || (task.state !== 'PLANNED' && task.state !== 'CODING')) continue;
-      const events = this.eventsForRevision(task).sort((a, b) => b.timestamp.localeCompare(a.timestamp));
+      if (!this.needsDecision(task)) continue;
       if (this.openProposal(task)) return { taskId: task.id, reasonCode: 'MANAGER_PROPOSAL_PENDING' };
-      if (this.isSettled(task) && events.some((event) => event.type === MANAGER_FAILED_EVENT)) return { taskId: task.id, reasonCode: 'MANAGER_FAILED' };
-      if (events[0]?.type === MANAGER_REJECTED_EVENT) return { taskId: task.id, reasonCode: 'MANAGER_PROPOSAL_REJECTED' };
+      if (!this.isSettled(task)) continue;
+      const latest = this.eventsForRevision(task).find((event) => event.type !== MANAGER_STARTED_EVENT && event.type !== MANAGER_NOT_RUN_EVENT);
+      if (latest?.type === MANAGER_REJECTED_EVENT) return { taskId: task.id, reasonCode: 'MANAGER_PROPOSAL_REJECTED' };
+      return { taskId: task.id, reasonCode: 'MANAGER_FAILED' };
     }
     return null;
   }
@@ -175,45 +227,82 @@ export class ProductManagerService {
     return result.sort((a, b) => b.createdAt.localeCompare(a.createdAt));
   }
 
+  /** The current revision's proposal, while undecided and while the task still needs exactly that decision. */
   private openProposal(task: Task) {
+    if (!this.needsDecision(task)) return null; // Authority arrived another way: the proposal is moot.
     const events = this.eventsForRevision(task);
     const proposal = events.find((event) => event.type === MANAGER_PROPOSED_EVENT);
     if (!proposal) return null;
-    const decided = events.some((event) => (event.type === MANAGER_APPLIED_EVENT || event.type === MANAGER_REJECTED_EVENT) &&
+    const closed = events.some((event) => PROPOSAL_CLOSING_EVENTS.includes(event.type) &&
       (event.structured_payload as { proposalEventId?: unknown } | null)?.proposalEventId === proposal.id);
-    return decided ? null : proposal;
+    if (closed) return null;
+    return this.stillMatches(task.id, proposal.structured_payload as unknown as ProposalPayload) ? proposal : null;
   }
 
-  /** The owner approves or rejects a proposal. Approval re-checks freshness and applies through TaskService. */
+  /**
+   * The owner approves or rejects a proposal. The proposal is claimed first in
+   * one transaction (a deterministic event per proposal), so a double click,
+   * a second window or Approve racing Reject decides it exactly once.
+   */
   public async decideProposal(projectId: string, eventId: string, approve: boolean): Promise<{ success: boolean; errorCode?: string; error?: string }> {
-    const proposal = this.managerEvents(projectId).find((event) => event.id === eventId && event.type === MANAGER_PROPOSED_EVENT);
-    if (!proposal || !proposal.task_id) return { success: false, errorCode: 'PROPOSAL_NOT_FOUND' };
-    const task = this.repo.getTask(proposal.task_id);
-    if (!task || this.openProposal(task)?.id !== eventId) return { success: false, errorCode: 'PROPOSAL_ALREADY_DECIDED' };
-    const payload = proposal.structured_payload as unknown as ProposalPayload;
+    let payload: ProposalPayload;
+    let task: Task;
+    try {
+      ({ payload, task } = this.repo.runInImmediateTransaction(() => {
+        const proposal = this.managerEvents(projectId).find((event) => event.id === eventId && event.type === MANAGER_PROPOSED_EVENT);
+        const current = proposal?.task_id ? this.repo.getTask(proposal.task_id) : null;
+        if (!proposal || !current || current.project_id !== projectId) throw new ManagerApplyError('PROPOSAL_NOT_FOUND', false);
+        if (this.openProposal(current)?.id !== eventId) throw new ManagerApplyError('PROPOSAL_ALREADY_DECIDED', false);
+        const claimed = proposal.structured_payload as unknown as ProposalPayload;
+        this.repo.createDeterministicGenericEvent({
+          id: `manager-proposal-claim-${eventId}`, project_id: projectId, task_id: current.id, agent_id: null,
+          type: MANAGER_PROPOSAL_CLAIMED_EVENT, summary: `The owner ${approve ? 'approved' : 'rejected'} the Manager's proposal for task ${current.id}.`,
+          structured_payload: { proposalEventId: eventId, taskRevision: claimed.taskRevision, approve }, timestamp: this.iso(),
+        });
+        return { payload: claimed, task: current };
+      }));
+    } catch (error) {
+      if (error instanceof ManagerApplyError) return { success: false, errorCode: error.reasonCode };
+      return { success: false, errorCode: 'PROPOSAL_ALREADY_DECIDED' }; // The claim event already exists.
+    }
     const base = { proposalEventId: eventId, taskRevision: payload.taskRevision };
     if (!approve) {
       this.events.record(projectId, MANAGER_REJECTED_EVENT, `The owner rejected the Manager's proposal for task ${task.id}.`, base, task.id);
       return { success: true };
     }
-    if (task.state !== payload.taskState || task.revision_count !== payload.taskRevision) {
-      this.events.record(projectId, MANAGER_REJECTED_EVENT, `The Manager's proposal for task ${task.id} is stale.`, { ...base, reasonCode: 'PROPOSAL_STALE' }, task.id);
-      return { success: false, errorCode: 'PROPOSAL_STALE' };
-    }
     const fenced = this.projectFence(task.project_id, task.id);
-    if (fenced) return { success: false, errorCode: fenced };
-    const applied = await this.tasks.applyManagerDecision(payload.decision, JSON.stringify(payload.decision));
-    if (!applied.success) {
-      this.events.record(projectId, MANAGER_REJECTED_EVENT, `The Manager's proposal for task ${task.id} was not accepted.`, { ...base, reasonCode: 'MANAGER_DECISION_REJECTED' }, task.id);
-      return { success: false, errorCode: 'MANAGER_DECISION_REJECTED', error: applied.error };
+    try {
+      if (fenced) throw new ManagerApplyError(fenced, false);
+      await this.applyBound(payload.decision, task.id, payload);
+    } catch (error) {
+      const reasonCode = error instanceof ManagerApplyError ? error.reasonCode : 'MANAGER_DECISION_REJECTED';
+      // Approved but not applicable: recorded as such, never as an owner rejection.
+      this.events.record(projectId, MANAGER_FAILED_EVENT, `The approved Manager decision for task ${task.id} could not be applied: ${reasonCode}.`,
+        { ...base, reasonCode, retryable: false, approvedByOwner: true }, task.id);
+      return { success: false, errorCode: reasonCode };
     }
     this.events.record(projectId, MANAGER_APPLIED_EVENT, `The owner approved the Manager's ${payload.decision.decision} for task ${task.id}.`,
       { ...base, decision: payload.decision.decision, approvedByOwner: true }, task.id);
     return { success: true };
   }
 
-  public async decide(pending: PendingManagerDecision, manager: ManagerCandidate, mode: ManagerMode): Promise<ManagerOutcome> {
+  /**
+   * Applies a decision only if the task still matches its snapshot. A
+   * rejection recorded by TaskService is final; a failure without one (busy
+   * database, repository root error) may be retried.
+   */
+  private async applyBound(decision: ManagerProtocol, taskId: string, expected: TaskSnapshot): Promise<void> {
+    if (!this.stillMatches(taskId, expected)) throw new ManagerApplyError('TASK_MOVED_ON', false);
+    const applied = await this.tasks.applyManagerDecision(decision, JSON.stringify(decision));
+    if (applied.success && !applied.isDuplicate) return;
+    if (applied.success) throw new ManagerApplyError('MANAGER_DECISION_DUPLICATE', false);
+    const recorded = this.repo.getProtocolMessageById(decision.message_id);
+    throw new ManagerApplyError('MANAGER_DECISION_REJECTED', !recorded || recorded.status !== 'REJECTED');
+  }
+
+  public async decide(pending: PendingManagerDecision, manager: ManagerCandidate): Promise<ManagerOutcome> {
     const task = pending.task;
+    const snapshot = this.snapshot(task);
     const base = { taskRevision: task.revision_count, kind: pending.kind };
     const record = (type: string, summary: string, payload: Record<string, unknown>) =>
       this.events.record(task.project_id, type, summary, { ...base, ...payload }, task.id);
@@ -229,15 +318,10 @@ export class ProductManagerService {
       if (!already) record(MANAGER_NOT_RUN_EVENT, `The automated Manager could not start for task ${task.id} yet: ${reasonCode}.`, { reasonCode });
       return { outcome: 'NOT_RUN', reasonCode };
     };
-    const unchanged = () => {
-      const current = this.repo.getTask(task.id);
-      return !!current && current.state === task.state && current.revision_count === task.revision_count &&
-        (current.ownership_epoch ?? 1) === (task.ownership_epoch ?? 1);
-    };
 
     const fenced = this.projectFence(task.project_id, task.id);
     if (fenced) return { outcome: 'NOT_RUN', reasonCode: fenced };
-    if (!unchanged()) return { outcome: 'NOT_RUN', reasonCode: 'TASK_MOVED_ON' };
+    if (!this.stillMatches(task.id, snapshot)) return { outcome: 'NOT_RUN', reasonCode: 'TASK_MOVED_ON' };
 
     const attemptId = `attempt-${crypto.randomUUID()}`;
     const nextAttemptNumber = Math.max(0, ...this.repo.getTaskAttemptsByTask(task.id).map((a) => a.attempt_number)) + 1;
@@ -249,14 +333,23 @@ export class ProductManagerService {
     let assignmentId: string | null = null;
     let lease: AccountLease | null = null;
     const leases = new WorkerSlotLeaseService(this.repo, { clock: this.now });
-    const finish = (status: 'COMPLETED' | 'FAILED') => {
+    /** Releases lease, assignment and attempt; false when the lease could not be released (left for recovery). */
+    const finish = (status: 'COMPLETED' | 'FAILED'): boolean => {
       if (lease) {
         const released = leases.release(lease.id, lease.lease_token);
-        if (released.status !== 'RELEASED') { this.ownedAttempts.delete(attemptId); return; } // Left for recovery.
+        if (released.status !== 'RELEASED') { this.ownedAttempts.delete(attemptId); return false; }
       }
       if (assignmentId) this.repo.endUnleasedAgentAssignment(assignmentId, status, this.iso());
       this.repo.endRunningTaskAttempt(attemptId, status, this.iso());
       this.ownedAttempts.delete(attemptId);
+      return true;
+    };
+    /** The call still owns its lease and attempt, so its answer may still decide. */
+    const stillOwned = (): boolean => {
+      if (!lease) return false;
+      const current = this.repo.getAccountLease(lease.id);
+      return !!current && !current.released_at && current.lease_token === lease.lease_token &&
+        Date.parse(current.expires_at) > this.now().getTime() && this.repo.getTaskAttempt(attemptId)?.status === 'RUNNING';
     };
 
     try {
@@ -274,7 +367,7 @@ export class ProductManagerService {
       const resource = this.repo.getProviderResource(assignment.selected_resource_id);
       const adapter = this.registry.get(assignment.selected_provider_id);
       if (!account || !resource || !adapter) { finish('FAILED'); return notStarted('MANAGER_BINDING_INVALID'); }
-      if (this.projectFence(task.project_id, task.id) || !unchanged()) { finish('FAILED'); return notStarted('TASK_MOVED_ON'); }
+      if (this.projectFence(task.project_id, task.id) || !this.stillMatches(task.id, snapshot)) { finish('FAILED'); return notStarted('TASK_MOVED_ON'); }
 
       const executionId = crypto.randomUUID();
       record(MANAGER_STARTED_EVENT, `The automated Manager is deciding task ${task.id}.`,
@@ -289,7 +382,7 @@ export class ProductManagerService {
         let keep = false;
         try {
           keep = leases.heartbeat(lease!.id, lease!.lease_token, this.leaseTtlMs).status === 'HEARTBEAT_ACKNOWLEDGED' &&
-            !this.projectFence(task.project_id, task.id) && unchanged();
+            !this.projectFence(task.project_id, task.id) && this.stillMatches(task.id, snapshot);
         } catch { keep = false; }
         if (!keep && !leaseLost) { leaseLost = true; void adapter.cancel(executionId).catch(() => undefined); }
       }, this.heartbeatMs);
@@ -305,31 +398,45 @@ export class ProductManagerService {
         clearInterval(heartbeat);
       }
 
-      if (leaseLost) { finish('FAILED'); return failed('MANAGER_LEASE_OR_FENCE_LOST', true, { attemptId }); }
+      if (leaseLost || !stillOwned()) { finish('FAILED'); return failed('MANAGER_LEASE_OR_FENCE_LOST', true, { attemptId }); }
       if (result.status !== 'COMPLETED') { finish('FAILED'); return failed(result.errorCode ? String(result.errorCode) : 'PROVIDER_EXECUTION_FAILED', true, { attemptId }); }
       const parsed = ProtocolParser.parse(result.outputProtocol ?? '');
       if (!parsed.success || parsed.data?.type !== 'manager.v1') { finish('FAILED'); return failed('MANAGER_PROTOCOL_INVALID', false, { attemptId }); }
       const raw = parsed.data.data;
       if (raw.project_id !== task.project_id || raw.task_id !== task.id) { finish('FAILED'); return failed('MANAGER_DECISION_FOR_OTHER_TASK', false, { attemptId }); }
-      if (!ALLOWED_DECISIONS.has(raw.decision)) { finish('FAILED'); return failed('MANAGER_DECISION_NOT_ALLOWED', false, { attemptId, decision: raw.decision }); }
-      if (raw.expected_task_state !== task.state || raw.expected_revision !== task.revision_count) {
+      if (!ALLOWED_DECISIONS[pending.kind].has(raw.decision)) {
+        finish('FAILED');
+        return failed('MANAGER_DECISION_NOT_ALLOWED', false, { attemptId, decision: raw.decision });
+      }
+      if (raw.expected_task_state !== snapshot.taskState || raw.expected_revision !== snapshot.taskRevision) {
         finish('FAILED');
         return failed('MANAGER_DECISION_STALE', false, { attemptId });
       }
       // Our own message identity: a reused provider message_id must never replay an earlier decision.
       const decision: ManagerProtocol = { ...raw, message_id: `manager-auto-${crypto.randomUUID()}`, created_at: this.iso() };
-      finish('COMPLETED');
 
-      if (mode === 'APPROVE') {
-        const proposal = this.events.record(task.project_id, MANAGER_PROPOSED_EVENT, `The Manager proposes ${decision.decision} for task ${task.id}; waiting for the owner.`,
-          { ...base, taskId: task.id, taskState: task.state, decision }, task.id);
+      // The mode is read now, not at dispatch: a switch to approval during the call is honoured.
+      if (this.getMode(task.project_id) === 'APPROVE') {
+        if (!this.stillMatches(task.id, snapshot)) { finish('FAILED'); return failed('TASK_MOVED_ON', false, { attemptId }); }
+        const proposal = this.events.record(task.project_id, MANAGER_PROPOSED_EVENT,
+          `The Manager proposes ${decision.decision} for task ${task.id}; waiting for the owner.`,
+          { ...base, ...snapshot, taskId: task.id, attemptId, decision }, task.id);
+        finish('COMPLETED');
         return { outcome: 'PROPOSED', eventId: proposal.id };
       }
-      if (this.projectFence(task.project_id, task.id) || !unchanged()) return failed('TASK_MOVED_ON', false, { attemptId });
-      const applied = await this.tasks.applyManagerDecision(decision, JSON.stringify(decision));
-      if (!applied.success) return failed('MANAGER_DECISION_REJECTED', false, { attemptId, error: applied.error ?? null });
+      if (this.projectFence(task.project_id, task.id)) { finish('FAILED'); return failed('PROJECT_NOT_RUNNING', true, { attemptId }); }
+      try {
+        // Applied while the call still holds its lease; recovery cannot have released it.
+        if (!stillOwned()) throw new ManagerApplyError('MANAGER_LEASE_OR_FENCE_LOST', true);
+        await this.applyBound(decision, task.id, snapshot);
+      } catch (error) {
+        finish('FAILED');
+        const apply = error instanceof ManagerApplyError ? error : new ManagerApplyError('MANAGER_DECISION_REJECTED', true);
+        return failed(apply.reasonCode, apply.retryable, { attemptId });
+      }
       const event = this.events.record(task.project_id, MANAGER_APPLIED_EVENT, `The automated Manager applied ${decision.decision} for task ${task.id}.`,
         { ...base, attemptId, decision: decision.decision, approvedByOwner: false }, task.id);
+      finish('COMPLETED');
       return { outcome: 'APPLIED', eventId: event.id };
     } catch {
       finish('FAILED');
@@ -340,8 +447,9 @@ export class ProductManagerService {
   /**
    * Restart recovery for Manager attempts this process does not own: fenced
    * while their process may still run; otherwise the expired lease is released
-   * (closing any startup quarantine marker) and the attempt ends FAILED. No
-   * decision is inferred; the revision is asked again.
+   * (closing any startup quarantine marker) and the attempt ends. Nothing is
+   * inferred: an attempt that already decided ends COMPLETED, any other FAILED,
+   * and the revision is asked again only if nothing was decided.
    */
   public recoverAbandoned(): number {
     let recovered = 0;
@@ -350,16 +458,20 @@ export class ProductManagerService {
       for (const task of this.repo.getTasksByProject(project.id)) {
         for (const attempt of this.repo.getTaskAttemptsByTask(task.id)) {
           if (attempt.status !== 'RUNNING' || attempt.summary !== MANAGER_ATTEMPT_MARKER || this.ownedAttempts.has(attempt.id)) continue;
-          const started = events.find((event) => event.type === MANAGER_STARTED_EVENT && (event.structured_payload as { attemptId?: unknown } | null)?.attemptId === attempt.id);
+          const forAttempt = events.filter((event) => (event.structured_payload as { attemptId?: unknown } | null)?.attemptId === attempt.id);
+          const started = forAttempt.find((event) => event.type === MANAGER_STARTED_EVENT);
           const executionId = (started?.structured_payload as { executionId?: unknown } | null)?.executionId;
           if (typeof executionId === 'string' && this.repo.getProcessRun(executionId)?.status === 'RUNNING') continue;
           const assignment = this.repo.getAgentAssignmentsByTask(task.id).find((candidate) => candidate.attempt_id === attempt.id) ?? null;
           const lease = assignment ? this.repo.getActiveLeaseForAssignment(assignment.id) : null;
           if (lease && assignment && !this.releaseExpiredLease(lease, assignment.id, task)) continue;
-          if (assignment) this.repo.endUnleasedAgentAssignment(assignment.id, 'FAILED', this.iso());
-          this.repo.endRunningTaskAttempt(attempt.id, 'FAILED', this.iso());
-          this.events.record(project.id, MANAGER_INTERRUPTED_EVENT, `The automated Manager call for task ${task.id} was interrupted; nothing was applied.`,
-            { attemptId: attempt.id, taskRevision: (started?.structured_payload as { taskRevision?: unknown } | null)?.taskRevision ?? null }, task.id);
+          const decided = forAttempt.some((event) => event.type === MANAGER_APPLIED_EVENT || event.type === MANAGER_PROPOSED_EVENT);
+          if (assignment) this.repo.endUnleasedAgentAssignment(assignment.id, decided ? 'COMPLETED' : 'FAILED', this.iso());
+          this.repo.endRunningTaskAttempt(attempt.id, decided ? 'COMPLETED' : 'FAILED', this.iso());
+          if (!decided && !forAttempt.some((event) => event.type === MANAGER_FAILED_EVENT)) {
+            this.events.record(project.id, MANAGER_INTERRUPTED_EVENT, `The automated Manager call for task ${task.id} was interrupted; nothing was applied.`,
+              { attemptId: attempt.id, taskRevision: (started?.structured_payload as { taskRevision?: unknown } | null)?.taskRevision ?? null }, task.id);
+          }
           recovered += 1;
         }
       }
@@ -393,11 +505,40 @@ export class ProductManagerService {
     return null;
   }
 
+  /** Why the previous revision was sent back: its review issues and its failed test run, if any. */
+  private previousRevisionResults(task: Task): string[] {
+    const previous = task.revision_count - 1;
+    const revisionOf = (authorizationId: unknown) =>
+      typeof authorizationId === 'string' ? this.repo.getExecutionAuthorization(authorizationId)?.task_revision ?? null : null;
+    const events = this.repo.getEventsByProject(task.project_id)
+      .filter((event) => event.task_id === task.id)
+      .sort((a, b) => b.timestamp.localeCompare(a.timestamp));
+    const lines: string[] = [];
+    const review = events.find((event) => event.type === 'AUTOMATION_REVIEW_FIX_REQUIRED' &&
+      revisionOf((event.structured_payload as { coderAuthorizationId?: unknown }).coderAuthorizationId) === previous);
+    const reviewId = (review?.structured_payload as { reviewId?: unknown } | undefined)?.reviewId;
+    const reviewRow = typeof reviewId === 'string' ? this.repo.getReviewsByTask(task.id).find((row) => row.id === reviewId) : undefined;
+    if (reviewRow) {
+      lines.push(`Review of revision ${previous} (${reviewRow.verdict}): ${reviewRow.summary}`);
+      for (const issue of reviewRow.issues ?? []) lines.push(`Review issue [${issue.severity}] ${issue.title}${issue.file_path ? ` (${issue.file_path})` : ''}: ${issue.description}`);
+    }
+    const verification = events.find((event) => event.type === 'AUTOMATION_VERIFICATION_FAILED' &&
+      revisionOf((event.structured_payload as { authorizationId?: unknown }).authorizationId) === previous);
+    if (verification) {
+      const payload = verification.structured_payload as { reasonCode?: unknown; testRunId?: unknown };
+      const run = typeof payload.testRunId === 'string' ? this.repo.getTestRun(payload.testRunId) : null;
+      lines.push(run
+        ? `Automated tests of revision ${previous} failed (${run.command}): exit code ${run.exit_code}, ${run.passed_count} passed, ${run.failed_count} failed, ${run.skipped_count} skipped.`
+        : `Automated tests of revision ${previous} did not pass: ${String(payload.reasonCode ?? 'TESTS_FAILED')}.`);
+    }
+    return lines;
+  }
+
   /** What the Manager needs to decide: the task, the project goal and, for a new revision, what went wrong. */
   private instructions(task: Task, kind: PendingManagerDecision['kind']): string[] {
     const project: Project | null = this.repo.getProjectMetadata(task.project_id);
     const lines = [
-      'You are the project Manager. Decide whether the coder should work on this task now, and give the coder concrete instructions.',
+      'You are the project Manager. Decide how the coder should work on this task now, and give the coder concrete instructions.',
       `Project goal: ${project?.contract?.goal ?? project?.description ?? project?.name ?? ''}`,
       `Task: ${task.title}`,
       ...(task.description ? [`Description: ${task.description}`] : []),
@@ -406,21 +547,13 @@ export class ProductManagerService {
     ];
     if (kind === 'NEXT_REVISION') {
       lines.push(`This is revision ${task.revision_count} of ${task.max_revisions}. The previous revision was sent back.`);
-      const review = this.repo.getReviewsByTask(task.id).sort((a, b) => b.created_at.localeCompare(a.created_at))[0];
-      if (review) {
-        lines.push(`Latest review (${review.verdict}): ${review.summary}`);
-        for (const issue of review.issues ?? []) lines.push(`Review issue [${issue.severity}] ${issue.title}${issue.file_path ? ` (${issue.file_path})` : ''}: ${issue.description}`);
-      }
-      const verification = this.repo.getEventsByProject(task.project_id)
-        .filter((event) => event.task_id === task.id && event.type === 'AUTOMATION_VERIFICATION_FAILED')
-        .sort((a, b) => b.timestamp.localeCompare(a.timestamp))[0];
-      if (verification) lines.push(`Latest automated tests failed: ${(verification.structured_payload as { reasonCode?: unknown } | null)?.reasonCode ?? 'TESTS_FAILED'}.`);
+      lines.push(...this.previousRevisionResults(task));
       lines.push('Tell the coder exactly what to fix in "instructions".');
+      lines.push('Decision EXECUTE starts the coder with your instructions; BLOCK stops automation for this task and asks the owner.');
+    } else {
+      lines.push('Decision EXECUTE starts the coder with your instructions.');
     }
-    lines.push(
-      'Decision EXECUTE starts the coder with your instructions; BLOCK stops automation for this task and asks the owner.',
-      `Use exactly: project_id "${task.project_id}", task_id "${task.id}", expected_task_state "${task.state}", expected_revision ${task.revision_count}.`,
-    );
+    lines.push(`Use exactly: project_id "${task.project_id}", task_id "${task.id}", expected_task_state "${task.state}", expected_revision ${task.revision_count}.`);
     return lines;
   }
 }

@@ -473,6 +473,7 @@ export const viVN: TranslationDictionary = {
       MANAGER_PROPOSAL_PENDING: 'Quản lý đã đề xuất bước tiếp theo. Hãy duyệt hoặc từ chối trong mục Quyết định của Quản lý.',
       MANAGER_PROPOSAL_REJECTED: 'Bạn đã từ chối đề xuất của Quản lý. Hãy tự quyết định bước tiếp theo cho nhiệm vụ này.',
       MANAGER_FAILED: 'Quản lý tự động không quyết định được nhiệm vụ này. Hãy tự quyết định bước tiếp theo.',
+      MANAGER_RETRY_PENDING: 'Quản lý chưa quyết định được (ví dụ hết hạn ngạch); sẽ thử lại sau vài phút.',
       GENERIC: 'Xem dòng thời gian của nhiệm vụ để biết chi tiết ({code}).',
     },
     managerPanel: {

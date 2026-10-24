@@ -476,6 +476,7 @@ export interface TranslationDictionary {
       MANAGER_PROPOSAL_PENDING: string;
       MANAGER_PROPOSAL_REJECTED: string;
       MANAGER_FAILED: string;
+      MANAGER_RETRY_PENDING: string;
       GENERIC: string;
     };
     managerPanel: {

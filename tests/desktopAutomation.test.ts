@@ -771,6 +771,7 @@ describe('desktop automation runtime', () => {
 
     it.each([
       ['a disallowed verdict', decision('PASS'), 'MANAGER_DECISION_NOT_ALLOWED'],
+      ['BLOCK for a task that has not started', decision('BLOCK'), 'MANAGER_DECISION_NOT_ALLOWED'],
       ['a stale revision', decision('EXECUTE', { expected_revision: 4 }), 'MANAGER_DECISION_STALE'],
       ['another task', decision('EXECUTE', { task_id: 'TSK-OTHER' }), 'MANAGER_DECISION_FOR_OTHER_TASK'],
       ['malformed output', (request: AgentExecutionRequest): AgentExecutionResult => ({ executionId: request.runtimeBinding!.executionId!, status: 'COMPLETED', outputProtocol: '{"protocol":"coder.v1"}' }), 'MANAGER_PROTOCOL_INVALID'],
@@ -804,6 +805,79 @@ describe('desktop automation runtime', () => {
       expect(managerRequests).toHaveLength(3);
       expect(repo.getTask(task.id)!.state).toBe('PLANNED');
       expect(statusOf()).toMatchObject({ reasonCode: 'MANAGER_FAILED' });
+    });
+
+    it('honours a switch to approve mode made while the Manager was deciding', async () => {
+      addAgent('PRIMARY_MANAGER');
+      repo.setProjectManagerMode(projectId, 'AUTO');
+      let finish: (result: AgentExecutionResult) => void = () => undefined;
+      managerReply = () => new Promise((resolve) => { finish = resolve; });
+      const task = plannedTask();
+      service = managedService();
+      void service.tick();
+      await vi.waitFor(() => expect(managerRequests).toHaveLength(1), { timeout: 30_000 });
+      repo.setProjectManagerMode(projectId, 'APPROVE');
+      finish(decision('EXECUTE')(managerRequests[0]));
+      await service.drain();
+
+      expect(repo.getTask(task.id)!.state).toBe('PLANNED');
+      expect(service.getManager()!.listProposals(projectId)).toHaveLength(1);
+    });
+
+    it('never applies an answer that arrives after the call lost its lease', async () => {
+      addAgent('PRIMARY_MANAGER');
+      repo.setProjectManagerMode(projectId, 'AUTO');
+      let finish: (result: AgentExecutionResult) => void = () => undefined;
+      managerReply = () => new Promise((resolve) => { finish = resolve; });
+      const task = plannedTask();
+      service = managedService();
+      void service.tick();
+      await vi.waitFor(() => expect(managerRequests).toHaveLength(1), { timeout: 30_000 });
+      clock = 10 * 60_000; // e.g. the machine slept: the lease expired without a heartbeat.
+      finish(decision('EXECUTE')(managerRequests[0]));
+      await service.drain();
+
+      expect(repo.getTask(task.id)!.state).toBe('PLANNED');
+      expect(eventsOf('AUTOMATION_MANAGER_FAILED')[0].structured_payload).toMatchObject({ reasonCode: 'MANAGER_LEASE_OR_FENCE_LOST', retryable: true });
+    });
+
+    it('decides a proposal exactly once when Approve and Reject race', async () => {
+      addAgent('PRIMARY_MANAGER');
+      managerReply = decision('EXECUTE');
+      const task = plannedTask();
+      service = managedService();
+      await pass();
+      const [proposal] = service.getManager()!.listProposals(projectId);
+      const results = await Promise.all([
+        service.getManager()!.decideProposal(projectId, proposal.eventId, true),
+        service.getManager()!.decideProposal(projectId, proposal.eventId, false),
+      ]);
+
+      expect(results.filter((result) => result.success)).toHaveLength(1);
+      expect(eventsOf('AUTOMATION_MANAGER_PROPOSAL_CLAIMED')).toHaveLength(1);
+      const applied = eventsOf('AUTOMATION_MANAGER_APPLIED').length;
+      const rejected = eventsOf('AUTOMATION_MANAGER_REJECTED').length;
+      expect(applied + rejected).toBe(1);
+      expect(repo.getTask(task.id)!.state).toBe(applied === 1 ? 'CODING' : 'PLANNED');
+    });
+
+    it('does not let a task waiting to retry block the Manager for other tasks', async () => {
+      addAgent('PRIMARY_MANAGER');
+      repo.setProjectManagerMode(projectId, 'AUTO');
+      const first = plannedTask();
+      const second = tasks.createTask({ projectId, title: 'Second task', description: null, priority: 'LOW', risk: 'LOW', acceptanceCriteria: ['x'], constraints: [] });
+      const execute = decision('EXECUTE');
+      managerReply = (request) => request.taskId === first.id
+        ? { executionId: request.runtimeBinding!.executionId!, status: 'FAILED', errorCode: 'QUOTA_EXHAUSTED' }
+        : execute(request);
+      service = managedService();
+      await pass();
+      await pass();
+
+      expect(managerRequests.map((request) => request.taskId)).toEqual([first.id, second.id]);
+      expect(repo.getTask(second.id)!.state).toBe('CODING');
+      // The second task now waits for a coder; the first waits out its retry delay.
+      expect(service.getManager()!.pendingDecision(projectId)).toMatchObject({ task: { id: first.id }, deferred: true });
     });
 
     it('does not use a Manager whose CLI cannot manage', async () => {

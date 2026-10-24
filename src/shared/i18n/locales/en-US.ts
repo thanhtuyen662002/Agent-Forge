@@ -473,6 +473,7 @@ export const enUS: TranslationDictionary = {
       MANAGER_PROPOSAL_PENDING: 'The Manager proposed the next step. Approve or reject it in Manager decisions.',
       MANAGER_PROPOSAL_REJECTED: 'You rejected the Manager’s proposal. Decide the next step for this task yourself.',
       MANAGER_FAILED: 'The automated Manager could not decide this task. Decide the next step yourself.',
+      MANAGER_RETRY_PENDING: 'The Manager could not decide yet (for example quota); it will try again in a few minutes.',
       GENERIC: 'See the task timeline for details ({code}).',
     },
     managerPanel: {
