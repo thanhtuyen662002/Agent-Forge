@@ -4,6 +4,7 @@ import { useI18n } from '../context/I18nContext';
 import { UIDensityMode } from '../../core/types/domain';
 import { ShieldAlert, Play, Pause, FolderGit2, Activity, Cpu, Languages } from 'lucide-react';
 import { uiActionFailureKey } from '../actionState';
+import { AutomationStatusBadge } from './AutomationStatusBadge';
 
 export const Header: React.FC = () => {
   const {
@@ -120,6 +121,7 @@ export const Header: React.FC = () => {
                   <span>{getStatusLabel(activeProject.status)}</span>
                 </div>
               )}
+              {activeProject && <AutomationStatusBadge projectId={activeProject.id} />}
             </>
           ) : (
             <button

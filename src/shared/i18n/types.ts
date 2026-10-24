@@ -438,6 +438,44 @@ export interface TranslationDictionary {
       };
     };
   };
+  runtime: {
+    automationLabel: string;
+    statusUnavailable: string;
+    phases: {
+      PROJECT_NOT_RUNNING: string;
+      WAITING_FOR_MANAGER: string;
+      MANUAL_RELAY_REQUIRED: string;
+      WAITING_FOR_CAPACITY: string;
+      EXECUTING: string;
+      AWAITING_REVIEW: string;
+      FAILED: string;
+    };
+    reasons: {
+      ACCOUNT_NOT_VERIFIED: string;
+      NO_CLI_CODER: string;
+      QUEUED_FOR_NEXT_TICK: string;
+      PROVIDER_EXECUTION_FAILED: string;
+      GENERIC: string;
+    };
+    quota: {
+      title: string;
+      subtitle: string;
+      refresh: string;
+      refreshing: string;
+      empty: string;
+      failed: string;
+      remaining: string;
+      resetsAt: string;
+      observedAt: string;
+      status: {
+        OK: string;
+        UNAUTHENTICATED: string;
+        UNSUPPORTED: string;
+        UNAVAILABLE: string;
+        ERROR: string;
+      };
+    };
+  };
   agentCard: {
     noAssignedModel: string;
     observableAction: string;

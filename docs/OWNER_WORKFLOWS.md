@@ -182,10 +182,101 @@ the trash before claiming an authorization.
 
 There is no permanent delete.
 
+## Automatic coder execution (Start / Pause)
+
+`DesktopAutomationService` (started by `src/electron/main.ts`) checks RUNNING
+projects every 15 seconds and right after **Start**/**Resume**. **Pause** in
+the header stops new dispatch for that project. For a task that is `CODING`
+and whose latest applied Manager decision is `EXECUTE` for its current
+revision (or `FIX_REQUIRED` for the previous one), it runs the real product
+chain, with no shortcuts:
+
+1. a `RUNNING` task attempt bound to the coder agent's profile;
+2. `RoleAwareRoutingService.routeRole` with a persisted assignment;
+3. an assignment-bound context manifest (`ContextBuilderService`) of the
+   repository's top-level entries, excluding `.git`, `node_modules`, build
+   output and `.env*`;
+4. an immutable `PRODUCT_BOUND` `ExecutionAuthorization`;
+5. `ConcurrentExecutionScheduler`: worker-slot lease, managed worktree under
+   `<userData>/worktrees/<projectId>`, scheduled dispatch to the Codex or
+   Gemini CLI adapter, settlement.
+
+It uses only active, owner-created CLI coders whose provider adapter is
+registered, whose account is enabled and proven `AVAILABLE`/`LOW_QUOTA`
+(the same rule as the slot lease), and that have an idle slot. It runs at most
+one execution per project (two overall) and never re-runs a revision that
+already settled.
+
+This required three dispatch/settlement repairs, which also make manual
+product-bound dispatch work:
+
+- assignment-bound lifecycle-v1 authorizations that are not handoff
+  successors are fenced by
+  `Repository.validateProductAssignmentExecutionAuthority` (task
+  epoch/revision/base, assignment, role-aware routing decision,
+  assignment-bound manifest, RUNNING attempt, every settlement binding)
+  instead of the handoff fence, which rejected them with
+  `TRANSFER_NOT_FOUND`;
+- dispatch compares the durable manifest hash and includes the bound
+  execution scope in the payload hash, exactly as creation does;
+- settlement uses a product path (`settleProductAssignmentExecution`) that
+  terminalizes the attempt and assignment and records a
+  `PRODUCT_EXECUTION_*` event.
+
+`tests/r5l1LifecycleBoundary.test.ts` and `tests/desktopAutomation.test.ts`
+run this chain with real services; only the provider adapter is synthetic.
+
+The header shows the automation phase next to the project status, because a
+RUNNING project is not proof that a worker is running: `not running`,
+`waiting for an approved task`, `only Manual Bridge coders`, `waiting for a
+usable coder` (with a reason such as *account not verified*), `coder is
+working`, `coder finished; waiting for verification and review`, `last
+automated run failed`.
+
+**Limits.** Automation covers the coder stage. Verification, review and
+merging the retained worktree remain the existing owner-driven steps. The CLI
+sees only the files in the context manifest and can update existing files
+only (`docs/LOCAL_PROVIDER_WORKSPACES.md`). Large repositories that exceed the
+workspace bounds fail closed with a reason.
+
+## Provider quota and account verification
+
+`AccountQuotaService` reads Codex usage through the official
+`codex app-server` JSON-RPC (`initialize`, `initialized`,
+`account/rateLimits/read`), using the agent's isolated profile as `CODEX_HOME`.
+It refreshes every five minutes and when you press **Refresh from provider**
+on the **Capacity** page. The primary window becomes *percent left* with its
+reset time (`PROVIDER_REPORTED`). Not signed in, unavailable or unreadable
+replies stay unknown, never zero. Manual snapshots are never overwritten.
+Gemini has no supported reader and shows *Not supported*.
+
+New CLI accounts start `UNKNOWN` and cannot be leased. A successful
+authenticated read lets `AccountHealthService.initializeVerifiedAccount` (the
+single health writer) promote a never-used `UNKNOWN` account to `AVAILABLE`,
+with an atomic identity check. It never clears a recorded failure or cooldown
+and records no success timestamp.
+
+To sign a Codex coder in until in-app sign-in exists, run this once in
+PowerShell, using the profile name from the agent card
+(`native-profile://codex/<name>`), then press **Refresh from provider**:
+
+```powershell
+$env:CODEX_HOME = "$env:LOCALAPPDATA\AgentForge\profiles\codex\<name>"; codex login
+```
+
+## Dashboard guidance
+
+The dashboard starts with a **Getting started** checklist computed from real
+state: project, manager and coder agents, saved plan, approved plan, tasks,
+started project. Each step links to the page where you do it. Start is only
+explained there, never triggered. **Needs your attention** lists blocked,
+waiting, failed and fix-required tasks with a plain-language reason and an
+**Open task** button.
+
 ## Not yet covered by this slice of Issue #225
 
-- A desktop Start/Pause control wired to the bounded execution runtime.
-- Automatic quota refresh and Codex device-code sign-in.
-- Dashboard setup/blocker guidance.
+- In-app Codex device-code sign-in (use `codex login` with `CODEX_HOME` above).
+- Automatic verification, review and integration of a completed coder worktree.
+
 
 These remain open acceptance criteria on Issue #225.

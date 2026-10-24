@@ -2,6 +2,7 @@ import { NativeProfileResolver } from '../credentials/NativeProfileResolver';
 import { Repository } from '../database/repositories';
 import type { ProviderAccount, ProviderResource } from '../types/domain';
 import type { QuotaObservation, QuotaObservationStatus, QuotaWindowObservation } from '../types/quota';
+import { AccountHealthService } from './AccountHealthService';
 import { CodexQuotaClient, type CodexQuotaReader, type CodexRateLimitResult, type CodexRateLimitWindow } from './CodexQuotaClient';
 
 export interface QuotaPollHandle { unref?(): void }
@@ -16,6 +17,12 @@ export interface AccountQuotaServiceOptions {
   profileResolver?: Pick<NativeProfileResolver, 'resolve'>;
   timer?: QuotaPollTimer;
   now?: () => string;
+  /**
+   * When true, an authenticated OK read may initialize a never-used UNKNOWN
+   * account to AVAILABLE through AccountHealthService (the single health
+   * writer). Off by default: quota polling itself stays observation-only.
+   */
+  initializeVerifiedAccounts?: boolean;
 }
 
 const nodeTimer: QuotaPollTimer = {
@@ -39,12 +46,17 @@ function copyObservation(observation: QuotaObservation): QuotaObservation {
   return { ...observation, resourceIds: [...observation.resourceIds], secondary: observation.secondary ? { ...observation.secondary } : null };
 }
 
-/** Usage polling only: never authenticates, executes work, or changes health authority. */
+/**
+ * Usage polling: never authenticates or executes work. Quota observations are
+ * kept separate from health; the only health effect is the optional, single-writer
+ * initialization of a never-used UNKNOWN account after an authenticated read.
+ */
 export class AccountQuotaService {
   private readonly reader: CodexQuotaReader;
   private readonly profileResolver: Pick<NativeProfileResolver, 'resolve'> | undefined;
   private readonly timer: QuotaPollTimer;
   private readonly now: () => string;
+  private readonly initializeVerifiedAccounts: boolean;
   private readonly latest = new Map<string, QuotaObservation>();
   private readonly accountReads = new Map<string, Promise<QuotaObservation>>();
   // Invalidate only snapshots this instance wrote, while values/bindings match.
@@ -57,6 +69,7 @@ export class AccountQuotaService {
     this.profileResolver = options.profileResolver;
     this.timer = options.timer ?? nodeTimer;
     this.now = options.now ?? (() => new Date().toISOString());
+    this.initializeVerifiedAccounts = options.initializeVerifiedAccounts === true;
   }
 
   /** Detached snapshots; callers cannot modify the service's cache. */
@@ -169,6 +182,12 @@ export class AccountQuotaService {
       observation = this.unknown(accountId, account.provider_id, 'UNAVAILABLE', 'Account binding changed during quota refresh.');
       this.latest.delete(accountId);
       return observation;
+    }
+    if (this.initializeVerifiedAccounts && observation.status === 'OK' && account.profile_ref) {
+      AccountHealthService.create(this.repo).initializeVerifiedAccount(accountId, {
+        providerId: account.provider_id,
+        profileRef: account.profile_ref,
+      });
     }
     const resources = this.repo.getProviderResourcesByAccount(accountId);
     observation.resourceIds = resources.map((resource) => resource.id);

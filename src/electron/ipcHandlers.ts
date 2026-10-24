@@ -23,6 +23,8 @@ import { ProviderDispatchService } from '../core/services/ProviderDispatchServic
 import { UpdateService } from '../core/services/UpdateService';
 import { CommandParser } from '../core/services/CommandParser';
 import { WorkspaceManagementService } from '../core/services/WorkspaceManagementService';
+import type { DesktopAutomationService } from '../core/services/DesktopAutomationService';
+import type { AccountQuotaService } from '../core/services/AccountQuotaService';
 import {
   CreateProjectIpcSchema,
   BindProjectRepositoryIpcSchema,
@@ -129,6 +131,7 @@ export function registerIpcHandlers(
   updateService?: UpdateService,
   coderSubmissionAdjudicationService?: CoderSubmissionAdjudicationService,
   rendererPolicy: RendererNavigationPolicyOptions = resolveRendererNavigationPolicy({ isPackaged: false }),
+  runtime: { automation?: DesktopAutomationService; quota?: AccountQuotaService } = {},
 ): void {
   const adjService =
     coderSubmissionAdjudicationService ||
@@ -333,6 +336,8 @@ export function registerIpcHandlers(
     }
     try {
       const status = projectService.transitionStatus(parsed.data.projectId, parsed.data.trigger);
+      // Starting or resuming is picked up immediately instead of on the next interval.
+      if (status === 'RUNNING') void runtime.automation?.tick();
       return { success: true, status, project: repo.getProjectMetadata(parsed.data.projectId) };
     } catch (error) {
       // Repository identity failures keep their typed code through the registration wrapper.
@@ -914,6 +919,25 @@ export function registerIpcHandlers(
 
   registerPrivilegedHandler('agents:restore', async (_, payload: unknown) => {
     return sanitizeOutputValue(workspaceManagementService.restoreAgent(payload));
+  });
+
+  // Desktop runtime status and read-only quota telemetry.
+  registerPrivilegedHandler('automation:status', async () => {
+    if (!runtime.automation) return { success: false, errorCode: 'AUTOMATION_UNAVAILABLE' };
+    return { success: true, status: runtime.automation.getStatus() };
+  });
+
+  registerPrivilegedHandler('quota:list', async () => {
+    if (!runtime.quota) return { success: false, errorCode: 'QUOTA_UNAVAILABLE' };
+    return sanitizeOutputValue({ success: true, observations: runtime.quota.getLatestObservations() });
+  });
+
+  registerPrivilegedHandler('quota:refresh', async () => {
+    if (!runtime.quota) return { success: false, errorCode: 'QUOTA_UNAVAILABLE' };
+    const observations = await runtime.quota.refreshAll();
+    // A newly verified account may make queued work schedulable.
+    void runtime.automation?.tick();
+    return sanitizeOutputValue({ success: true, observations });
   });
 
   // Owner trash for projects and tasks: reversible, history-preserving.
