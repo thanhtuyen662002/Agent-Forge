@@ -70,7 +70,7 @@ export class GeminiCliAdapter extends LocalCliAdapterBase {
   }
 
   public async getCapabilities(): Promise<Capability[]> {
-    return ['CODING', 'FILESYSTEM_EDIT', 'TEST_EXECUTION', 'TERMINAL'];
+    return ['CODING', 'FILESYSTEM_EDIT', 'TEST_EXECUTION', 'TERMINAL', 'REVIEW', 'PLANNING'];
   }
 
   public override async getHealth(): Promise<ProviderHealthStatus> {
@@ -117,15 +117,12 @@ export class GeminiCliAdapter extends LocalCliAdapterBase {
     _prompt: string
   ): string[] {
     const modelName = request.runtimeBinding?.modelName;
-    return [
-      '--output-format',
-      'json',
-      '--model',
-      modelName ?? '',
-      '--sandbox',
-      '--approval-mode',
-      'default',
-    ];
+    // Headless runs deny every tool that needs approval, so `default` could never
+    // edit. A coder auto-approves edits inside the isolated workspace (the
+    // workspace is the boundary; Docker sandboxes are not assumed on Windows).
+    // A reviewer or Manager runs in the documented read-only `plan` mode (#242).
+    const readOnly = request.expectedProtocol === 'review.v1' || request.expectedProtocol === 'manager.v1';
+    return ['--output-format', 'json', '--model', modelName ?? '', '--approval-mode', readOnly ? 'plan' : 'auto_edit'];
   }
 
   protected override extractProtocolText(
@@ -198,11 +195,6 @@ export class GeminiCliAdapter extends LocalCliAdapterBase {
 
   public override async execute(request: AgentExecutionRequest): Promise<AgentExecutionResult> {
     const executionId = crypto.randomUUID();
-
-    // Gemini has no read-only mode here; review and Manager requests never spawn.
-    if (request.expectedProtocol === 'review.v1' || request.expectedProtocol === 'manager.v1') {
-      return { executionId, status: 'FAILED', errorCode: 'UNSUPPORTED_CLIENT', error: 'UNSUPPORTED_CLIENT: Gemini CLI does not support read-only review or management.' };
-    }
 
     // 1. Mandatory RuntimeExecutionBinding validation before any process spawn
     if (!request.runtimeBinding) {

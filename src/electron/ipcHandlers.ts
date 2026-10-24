@@ -26,6 +26,7 @@ import { WorkspaceManagementService } from '../core/services/WorkspaceManagement
 import type { DesktopAutomationService } from '../core/services/DesktopAutomationService';
 import type { AccountQuotaService } from '../core/services/AccountQuotaService';
 import type { CodexAccountConnectionService } from '../core/services/CodexAccountConnectionService';
+import type { CliAccountConnectionService } from '../core/services/CliAccountConnectionService';
 import {
   CreateProjectIpcSchema,
   BindProjectRepositoryIpcSchema,
@@ -132,7 +133,9 @@ export function registerIpcHandlers(
   updateService?: UpdateService,
   coderSubmissionAdjudicationService?: CoderSubmissionAdjudicationService,
   rendererPolicy: RendererNavigationPolicyOptions = resolveRendererNavigationPolicy({ isPackaged: false }),
-  runtime: { automation?: DesktopAutomationService; quota?: AccountQuotaService; signIn?: CodexAccountConnectionService } = {},
+  runtime: {
+    automation?: DesktopAutomationService; quota?: AccountQuotaService; signIn?: CodexAccountConnectionService; cliSignIn?: CliAccountConnectionService;
+  } = {},
 ): void {
   const adjService =
     coderSubmissionAdjudicationService ||
@@ -982,6 +985,23 @@ export function registerIpcHandlers(
     const value = payload && typeof payload === 'object' ? (payload as { sessionId?: unknown }).sessionId : undefined;
     return typeof value === 'string' && value.length > 0 && value.length <= 128 ? value : null;
   };
+  // Claude Code / Gemini sign-in: open the CLI's own login for the account's profile, then verify it.
+  const readAccountId = (payload: unknown) => {
+    const value = payload && typeof payload === 'object' ? (payload as { accountId?: unknown }).accountId : undefined;
+    return typeof value === 'string' && value.length > 0 && value.length <= 200 ? value : null;
+  };
+  registerPrivilegedHandler('accounts:startCliSignIn', async (_, payload: unknown) => {
+    const accountId = readAccountId(payload);
+    if (!runtime.cliSignIn) return { success: false, errorCode: 'SIGN_IN_UNAVAILABLE' };
+    if (!accountId) return { success: false, errorCode: 'ACCOUNT_NOT_FOUND' };
+    return runtime.cliSignIn.startSignIn(accountId);
+  });
+  registerPrivilegedHandler('accounts:verifyCliSignIn', async (_, payload: unknown) => {
+    const accountId = readAccountId(payload);
+    if (!runtime.cliSignIn) return { success: false, errorCode: 'SIGN_IN_UNAVAILABLE' };
+    if (!accountId) return { success: false, errorCode: 'ACCOUNT_NOT_FOUND' };
+    return sanitizeOutputValue(await runtime.cliSignIn.verify(accountId));
+  });
   registerPrivilegedHandler('accounts:startCodexSignIn', async (_, payload: unknown) => {
     if (!runtime.signIn) return { success: false, errorCode: 'SIGN_IN_UNAVAILABLE' };
     const accountId = payload && typeof payload === 'object' ? (payload as { accountId?: unknown }).accountId : undefined;

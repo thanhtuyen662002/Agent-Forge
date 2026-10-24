@@ -1,7 +1,14 @@
 import { describe, expect, it } from 'vitest';
 import { parseReviewProtocol } from '../src/core/protocol/reviewProtocol';
 import { ProtocolParser } from '../src/core/protocol/parser';
-import { GeminiCliAdapter } from '../src/core/adapters/GeminiCliAdapter';
+import { LocalCliAdapterBase } from '../src/core/adapters/LocalCliAdapterBase';
+
+class CodingOnlyAdapter extends LocalCliAdapterBase {
+  public readonly id = 'coding-only';
+  public readonly name = 'Coding only';
+  protected getDefaultExecutable(): string { return 'not-installed'; }
+  public async getCapabilities() { return ['CODING' as const]; }
+}
 
 const verdict = (overrides: Record<string, unknown> = {}) => JSON.stringify({
   protocol: 'review.v1', message_id: 'review-1', project_id: 'project-1', task_id: 'task-1', task_revision: 2,
@@ -36,8 +43,8 @@ describe('review.v1 verdict protocol (#233)', () => {
   });
 
   it('is refused by a CLI adapter without REVIEW capability before anything runs', async () => {
-    const gemini = new GeminiCliAdapter({ executable: 'gemini-not-installed' });
-    const result = await gemini.execute({
+    const adapter = new CodingOnlyAdapter({ executable: 'not-installed' });
+    const result = await adapter.execute({
       taskId: 'task-1', projectId: 'project-1', instructions: [], contextFiles: [], expectedProtocol: 'review.v1',
     });
     expect(result).toMatchObject({ status: 'FAILED', errorCode: 'UNSUPPORTED_CLIENT' });
