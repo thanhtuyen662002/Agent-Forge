@@ -520,6 +520,33 @@ export interface TranslationDictionary {
       remaining: string;
       resetsAt: string;
       observedAt: string;
+      usableSummary: string;
+      usable: string;
+      notUsable: string;
+      plan: string;
+      resetsIn: string;
+      durationDays: string;
+      durationHours: string;
+      durationMinutes: string;
+      unknownValue: string;
+      cli: {
+        CODEX: string;
+        CLAUDE: string;
+        GEMINI: string;
+        OTHER: string;
+      };
+      source: {
+        PROVIDER_REPORTED: string;
+        OBSERVED: string;
+        UNKNOWN: string;
+      };
+      window: {
+        FIVE_HOUR: string;
+        DAY: string;
+        WEEK: string;
+        MINUTES: string;
+        LIMIT: string;
+      };
       status: {
         OK: string;
         UNAUTHENTICATED: string;

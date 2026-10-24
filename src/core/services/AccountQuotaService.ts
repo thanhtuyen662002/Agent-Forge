@@ -135,8 +135,28 @@ export class AccountQuotaService {
     return {
       accountId, providerId, resourceIds: [], status, source: 'UNKNOWN',
       usedPercent: null, remainingPercent: null, resetsAt: null, windowMinutes: null,
-      secondary: null, planType: null, observedAt: this.now(), message,
+      secondary: null, planType: null, observedAt: this.now(), message, healthStatus: null,
     };
+  }
+
+  /**
+   * CLIs without an official usage reader (Claude Code, Gemini): only what a
+   * real run recorded through the single health writer. A limit reached shows
+   * as exhausted until its recorded reset; nothing else is guessed (#243).
+   */
+  private observedFromHealth(account: ProviderAccount): QuotaObservation {
+    const cooldown = account.cooldown_until && Date.parse(account.cooldown_until) > Date.parse(this.now()) ? account.cooldown_until : null;
+    if (account.health_status === 'AUTH_ERROR') {
+      return this.unknown(account.id, account.provider_id, 'UNAUTHENTICATED', 'Sign-in needed: the last run was not signed in.');
+    }
+    if (['QUOTA_EXHAUSTED', 'RATE_LIMITED', 'COOLDOWN'].includes(account.health_status) && (cooldown || account.health_status === 'QUOTA_EXHAUSTED')) {
+      return {
+        accountId: account.id, providerId: account.provider_id, resourceIds: [], status: 'OK', source: 'OBSERVED',
+        usedPercent: 100, remainingPercent: 0, resetsAt: cooldown, windowMinutes: null, secondary: null, planType: null,
+        observedAt: this.now(), message: 'A run reached this account\'s usage limit.', healthStatus: account.health_status,
+      };
+    }
+    return this.unknown(account.id, account.provider_id, 'UNSUPPORTED', 'No official usage reader for this CLI; limits appear when a run reaches them.');
   }
 
   private async readAccount(accountId: string): Promise<QuotaObservation> {
@@ -148,7 +168,7 @@ export class AccountQuotaService {
     }
     let observation: QuotaObservation;
     if (account.provider_id !== 'prov-codex-cli') {
-      observation = this.unknown(accountId, account.provider_id, 'UNSUPPORTED', 'This provider has no supported quota telemetry reader.');
+      observation = this.observedFromHealth(account);
     } else {
       let result: CodexRateLimitResult;
       try {
@@ -169,7 +189,7 @@ export class AccountQuotaService {
         accountId, providerId: account.provider_id, resourceIds: [], status: 'OK', source: 'PROVIDER_REPORTED',
         ...observeWindow(result.primary),
         secondary: result.secondary ? observeWindow(result.secondary) : null,
-        planType: result.planType, observedAt: this.now(), message: null,
+        planType: result.planType, observedAt: this.now(), message: null, healthStatus: null,
       } : this.unknown(
         accountId, account.provider_id,
         result.status === 'MALFORMED' ? 'ERROR' : result.status === 'TIMEOUT' ? 'UNAVAILABLE' : result.status,
@@ -183,12 +203,14 @@ export class AccountQuotaService {
       this.latest.delete(accountId);
       return observation;
     }
-    if (this.initializeVerifiedAccounts && observation.status === 'OK' && account.profile_ref) {
+    // Only an official provider read proves a signed-in profile; observations never do.
+    if (this.initializeVerifiedAccounts && observation.status === 'OK' && observation.source === 'PROVIDER_REPORTED' && account.profile_ref) {
       AccountHealthService.create(this.repo).initializeVerifiedAccount(accountId, {
         providerId: account.provider_id,
         profileRef: account.profile_ref,
       });
     }
+    observation.healthStatus = this.repo.getProviderAccount(accountId)?.health_status ?? null;
     const resources = this.repo.getProviderResourcesByAccount(accountId);
     observation.resourceIds = resources.map((resource) => resource.id);
     for (const resource of resources) this.persist(resource, observation);
@@ -206,7 +228,8 @@ export class AccountQuotaService {
       this.ownedSnapshots.delete(resource.id);
       return;
     }
-    if (observation.status === 'OK') {
+    // Observed limits are never stored as provider-reported quota.
+    if (observation.status === 'OK' && observation.source === 'PROVIDER_REPORTED') {
       this.repo.updateProviderResourceQuotaObservation(resource.id, {
         remaining: observation.remainingPercent, total: 100, unit: 'PERCENT', resetAt: observation.resetsAt,
         source: 'PROVIDER_REPORTED', confidence: 1,

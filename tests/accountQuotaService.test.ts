@@ -75,7 +75,7 @@ describe('account quota observations', () => {
       status: 'OK', source: 'PROVIDER_REPORTED', usedPercent: 37, remainingPercent: 63,
       resetsAt: RESET, windowMinutes: 300,
       secondary: { usedPercent: 12, remainingPercent: 88, resetsAt: new Date(1_800_600_000_000).toISOString(), windowMinutes: 10_080 },
-      planType: 'plus', observedAt: NOW, message: null,
+      planType: 'plus', observedAt: NOW, message: null, healthStatus: 'AUTH_ERROR',
     });
     for (const id of [resource.id, 'another-model']) {
       expect(repo.getProviderResource(id)).toMatchObject({
