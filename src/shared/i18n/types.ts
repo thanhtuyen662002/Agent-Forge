@@ -448,6 +448,7 @@ export interface TranslationDictionary {
       WAITING_FOR_CAPACITY: string;
       QUEUED: string;
       EXECUTING: string;
+      VERIFYING: string;
       AWAITING_REVIEW: string;
       FAILED: string;
     };
@@ -455,6 +456,11 @@ export interface TranslationDictionary {
       ACCOUNT_NOT_VERIFIED: string;
       NO_CLI_CODER: string;
       AUTOMATION_STOPPED: string;
+      VERIFIED: string;
+      VERIFICATION_FAILED: string;
+      VERIFICATION_NOT_CONFIGURED: string;
+      NOT_VERIFIED: string;
+      WORKTREE_NOT_VERIFIABLE: string;
       PROVIDER_EXECUTION_FAILED: string;
       GENERIC: string;
     };

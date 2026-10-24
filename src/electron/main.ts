@@ -173,7 +173,11 @@ app.whenReady().then(() => {
     bootstrapInstance.repo,
     bootstrapInstance.eventService,
     bootstrapInstance.providerRegistry,
-    { worktreeRoot: path.join(userDataDir, 'worktrees') },
+    {
+      worktreeRoot: path.join(userDataDir, 'worktrees'),
+      taskService: bootstrapInstance.taskService,
+      verificationService: bootstrapInstance.verificationService,
+    },
   );
   quotaInstance = new AccountQuotaService(bootstrapInstance.repo, { initializeVerifiedAccounts: true });
   const quotaForSignIn = quotaInstance;

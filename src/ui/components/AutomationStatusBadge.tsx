@@ -3,7 +3,10 @@ import { Bot } from 'lucide-react';
 import { useI18n } from '../context/I18nContext';
 import { useAutomationStatus } from '../runtimeStatus';
 
-const KNOWN_REASONS = new Set(['ACCOUNT_NOT_VERIFIED', 'NO_CLI_CODER', 'AUTOMATION_STOPPED', 'PROVIDER_EXECUTION_FAILED']);
+const KNOWN_REASONS = new Set([
+  'ACCOUNT_NOT_VERIFIED', 'NO_CLI_CODER', 'AUTOMATION_STOPPED', 'PROVIDER_EXECUTION_FAILED',
+  'VERIFIED', 'VERIFICATION_FAILED', 'VERIFICATION_NOT_CONFIGURED', 'NOT_VERIFIED', 'WORKTREE_NOT_VERIFIABLE',
+]);
 
 /**
  * The automation phase is shown next to, and separately from, the project
@@ -24,7 +27,7 @@ export const AutomationStatusBadge: React.FC<{ projectId: string }> = ({ project
   const tone = project?.phase === 'EXECUTING'
     ? 'text-emerald-300 border-emerald-700/50'
     : project?.phase === 'FAILED' ? 'text-rose-300 border-rose-700/50'
-    : project?.phase === 'AWAITING_REVIEW' ? 'text-forge-cyan border-forge-cyan/40'
+    : project?.phase === 'AWAITING_REVIEW' || project?.phase === 'VERIFYING' ? 'text-forge-cyan border-forge-cyan/40'
     : 'text-amber-300 border-amber-700/40';
 
   return (
