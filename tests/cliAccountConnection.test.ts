@@ -109,11 +109,22 @@ describe('Claude Code and Gemini account sign-in (#242)', () => {
     expect(calls).toEqual([]);
   });
 
-  it('does not report success for an account with a recorded failure', async () => {
+  it('does not clear other recorded failures such as an exhausted quota', async () => {
     const accountId = addAgent('CLAUDE_CODE_CLI');
-    db.prepare("UPDATE provider_accounts SET health_status = 'AUTH_ERROR' WHERE id = ?").run(accountId);
+    db.prepare("UPDATE provider_accounts SET health_status = 'QUOTA_EXHAUSTED' WHERE id = ?").run(accountId);
     nextRun = { exitCode: 0, stdout: JSON.stringify({ authMethod: 'claude.ai' }) };
     expect(await service().verify(accountId)).toEqual({ success: true, verified: false, reasonCode: 'ALREADY_IN_USE' });
+    expect(repo.getProviderAccount(accountId)!.health_status).toBe('QUOTA_EXHAUSTED');
+  });
+
+  it('recovers an expired login once the CLI proves the profile is signed in again (#247)', async () => {
+    const accountId = addAgent('CLAUDE_CODE_CLI');
+    db.prepare("UPDATE provider_accounts SET health_status = 'AUTH_ERROR', last_failure_code = 'AUTH_ERROR' WHERE id = ?").run(accountId);
+    nextRun = { exitCode: 1, stdout: '' };
+    expect(await service().verify(accountId)).toMatchObject({ verified: false, reasonCode: 'NOT_SIGNED_IN' });
     expect(repo.getProviderAccount(accountId)!.health_status).toBe('AUTH_ERROR');
+    nextRun = { exitCode: 0, stdout: JSON.stringify({ authMethod: 'claude.ai' }) };
+    expect(await service().verify(accountId)).toEqual({ success: true, verified: true, reasonCode: 'VERIFIED' });
+    expect(repo.getProviderAccount(accountId)).toMatchObject({ health_status: 'AVAILABLE', last_failure_code: null });
   });
 });

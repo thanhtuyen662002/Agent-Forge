@@ -205,10 +205,12 @@ export class AccountQuotaService {
     }
     // Only an official provider read proves a signed-in profile; observations never do.
     if (this.initializeVerifiedAccounts && observation.status === 'OK' && observation.source === 'PROVIDER_REPORTED' && account.profile_ref) {
-      AccountHealthService.create(this.repo).initializeVerifiedAccount(accountId, {
-        providerId: account.provider_id,
-        profileRef: account.profile_ref,
-      });
+      const health = AccountHealthService.create(this.repo);
+      const expected = { providerId: account.provider_id, profileRef: account.profile_ref };
+      // An authenticated official read proves the profile is signed in: a new account
+      // is initialized, an expired login (AUTH_ERROR) is recovered (#247).
+      if (current?.health_status === 'AUTH_ERROR') health.recordReauthenticated(accountId, expected);
+      else health.initializeVerifiedAccount(accountId, expected);
     }
     observation.healthStatus = this.repo.getProviderAccount(accountId)?.health_status ?? null;
     const resources = this.repo.getProviderResourcesByAccount(accountId);

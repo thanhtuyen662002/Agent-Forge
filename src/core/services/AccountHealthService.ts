@@ -90,6 +90,17 @@ export class AccountHealthService {
   }
 
   /**
+   * Recovers an expired login after the CLI's own check proved the same
+   * profile is signed in again (#247). Only AUTH_ERROR is cleared; cooldowns,
+   * quota and rate limits stay; a leased or running account is refused; a
+   * changed identity fails closed.
+   */
+  public recordReauthenticated(accountId: string, expected: { providerId: string; profileRef: string }): boolean {
+    return this.repo.runInImmediateTransaction(() =>
+      this.repo.reauthenticateProviderAccountHealth(accountId, expected.providerId, expected.profileRef));
+  }
+
+  /**
    * Records rate limiting for the provider account with an explicit future cooldown.
    * Fails closed if no explicit cooldown duration or timestamp is provided (no invented defaults).
    * Always binds last_failure_code to RATE_LIMITED.

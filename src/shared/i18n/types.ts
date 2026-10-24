@@ -584,6 +584,8 @@ export interface TranslationDictionary {
     };
   };
   accountSignIn: {
+    expired: string;
+    again: string;
     button: string;
     needed: string;
     title: string;

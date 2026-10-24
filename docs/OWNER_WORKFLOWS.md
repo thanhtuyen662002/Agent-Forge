@@ -474,8 +474,15 @@ Auth and usage-limit failures in runs are classified, for example Claude's
 *You've hit your session limit · resets …*, and never become success. Codex
 keeps its device-code sign-in. Checks use the adapter's own executable (npm
 `.cmd` shims run through the trusted `cmd.exe`) from an empty private
-directory. An account with a recorded failure (for example `AUTH_ERROR`) is not
-cleared by a sign-in check (follow-up #247).
+directory. **Expired logins (#247).** An account whose login expired (`AUTH_ERROR`)
+shows *Sign in again* in Agent Center, for Codex, Claude Code and Gemini. The
+expired state is cleared through `AccountHealthService.recordReauthenticated`
+only after the CLI's own check proves the same profile is signed in: an
+authenticated official quota read for Codex, `claude auth status` for Claude,
+or a read-only prompt for Gemini. The account then becomes `AVAILABLE` again
+and its failure code is cleared. Cooldowns, quota exhaustion and rate limits are
+never cleared this way, and an account with an unreleased lease or a running
+assignment is refused.
 
 ## Provider quota and account verification
 

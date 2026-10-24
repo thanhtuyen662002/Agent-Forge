@@ -9802,6 +9802,25 @@ export class Repository {
       .run(now, id, expectedProviderId, expectedProfileRef).changes === 1;
   }
 
+  /**
+   * Recovers an expired login (#247): AUTH_ERROR -> AVAILABLE for exactly the
+   * same account identity, only while nothing is leased or running on it and
+   * no cooldown is recorded. Other failure states are never cleared here.
+   */
+  public reauthenticateProviderAccountHealth(id: string, expectedProviderId: string, expectedProfileRef: string): boolean {
+    const now = new Date().toISOString();
+    return this.db
+      .prepare(`
+        UPDATE provider_accounts
+        SET health_status = 'AVAILABLE', last_failure_code = NULL, updated_at = ?
+        WHERE id = ? AND provider_id = ? AND profile_ref = ? AND enabled = 1
+          AND health_status = 'AUTH_ERROR' AND cooldown_until IS NULL
+          AND NOT EXISTS (SELECT 1 FROM agent_assignments WHERE selected_account_id = provider_accounts.id AND status IN ('ASSIGNED', 'RUNNING'))
+          AND NOT EXISTS (SELECT 1 FROM account_leases WHERE provider_account_id = provider_accounts.id AND released_at IS NULL)
+      `)
+      .run(now, id, expectedProviderId, expectedProfileRef).changes === 1;
+  }
+
   public updateProviderAccountHealth(
     id: string,
     healthStatus: ProviderHealthStatus,
