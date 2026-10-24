@@ -581,6 +581,8 @@ export const viVN: TranslationDictionary = {
     },
   },
   accountSignIn: {
+    expired: 'Phiên đăng nhập của tài khoản này đã hết hạn. Hãy đăng nhập lại để dùng tiếp.',
+    again: 'Đăng nhập lại',
     button: 'Đăng nhập',
     needed: 'Chưa đăng nhập. Lập trình viên này chưa thể làm việc cho tới khi bạn đăng nhập.',
     title: 'Đăng nhập Codex cho {name}',

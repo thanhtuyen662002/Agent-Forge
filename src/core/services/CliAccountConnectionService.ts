@@ -179,8 +179,13 @@ export class CliAccountConnectionService {
       if (!initialized && this.repo.getProviderAccount(accountId)?.health_status !== 'AVAILABLE') {
         return { success: true, verified: false, reasonCode: 'ALREADY_IN_USE' };
       }
+    } else if (health === 'AUTH_ERROR') {
+      // An expired login that the CLI now proves signed in again (#247).
+      const recovered = AccountHealthService.create(this.repo)
+        .recordReauthenticated(accountId, { providerId: prepared.providerId, profileRef: prepared.profileRef });
+      if (!recovered) return { success: true, verified: false, reasonCode: 'ALREADY_IN_USE' };
     } else if (health !== 'AVAILABLE' && health !== 'LOW_QUOTA') {
-      // Recorded failures (for example AUTH_ERROR) are not cleared by a sign-in check.
+      // Other recorded failures (cooldown, quota, rate limit) are not cleared by a sign-in check.
       return { success: true, verified: false, reasonCode: 'ALREADY_IN_USE' };
     }
     await this.onVerified?.(accountId);

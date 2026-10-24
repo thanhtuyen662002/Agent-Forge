@@ -581,6 +581,8 @@ export const enUS: TranslationDictionary = {
     },
   },
   accountSignIn: {
+    expired: 'The login of this account expired. Sign in again to use it.',
+    again: 'Sign in again',
     button: 'Sign in',
     needed: 'Not signed in yet. This coder cannot run work until you sign in.',
     title: 'Sign in to Codex for {name}',
