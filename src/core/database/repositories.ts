@@ -1904,6 +1904,25 @@ export class Repository {
     }));
   }
 
+  /** Every event of the given types for a project (optionally one task), newest first; unbounded, unlike getEventsByProject. */
+  public getProjectEventsOfTypes(projectId: string, types: string[], taskId?: string): EventRecord[] {
+    if (types.length === 0) return [];
+    const placeholders = types.map(() => '?').join(', ');
+    const rows = this.db.prepare(
+      `SELECT * FROM events WHERE project_id = ? AND type IN (${placeholders})${taskId ? ' AND task_id = ?' : ''} ORDER BY timestamp DESC`,
+    ).all(projectId, ...types, ...(taskId ? [taskId] : [])) as Record<string, unknown>[];
+    return rows.map((r) => ({
+      id: String(r.id),
+      project_id: String(r.project_id),
+      task_id: r.task_id ? String(r.task_id) : null,
+      agent_id: r.agent_id ? String(r.agent_id) : null,
+      type: String(r.type),
+      summary: String(r.summary),
+      structured_payload: r.structured_payload_json ? JSON.parse(String(r.structured_payload_json)) : {},
+      timestamp: String(r.timestamp),
+    }));
+  }
+
   public getEventsByProject(projectId: string, limit: number = 100): EventRecord[] {
     return this.getEvents(projectId, limit);
   }

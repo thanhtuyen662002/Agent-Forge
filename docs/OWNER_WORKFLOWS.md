@@ -289,7 +289,11 @@ at most 20 tasks, each with a title, a description and acceptance criteria,
 bound to the project and to the SHA-256 of the exact contract. Tasks are
 created only through `TaskService.createTask`, and only if the contract hash
 still matches and no other tasks exist. The planning record then becomes
-`APPROVED` and is never dispatched; the Manager starts the first task next.
+`APPROVED` and leaves the active task list (system trash, so it is never
+counted or dispatched; no Manager decision is ever accepted for it, pasted
+ones included). The Manager starts the first task next. Planning results are
+bound to the contract's hash: after a rejected or failed plan, editing the
+contract plans again, and creating a task by hand ends planning.
 In *approve each decision* mode the proposed task list is shown under *Manager
 decisions* first. A malformed plan, or a plan for another project or contract,
 creates nothing. Task-scoped context paths are follow-up #254.

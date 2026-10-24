@@ -1157,6 +1157,7 @@ describe('desktop automation runtime', () => {
       expect(managerRequests[0].instructions.join('\n')).toContain('Greet visitors');
       const anchor = repo.getTask(repo.getProjectPlanningTaskId(projectId)!)!;
       expect(anchor).toMatchObject({ title: 'Plan the project', state: 'APPROVED' });
+      expect(repo.isTaskTrashed(anchor.id)).toBe(true); // The planning record leaves the active task list.
       expect(realTasks().map((task) => [task.title, task.state])).toEqual([['Add the greeting', 'PLANNED'], ['Test the greeting', 'PLANNED']]);
 
       await pass();
@@ -1174,6 +1175,7 @@ describe('desktop automation runtime', () => {
       expect(realTasks()).toEqual([]);
       const [proposal] = service.getManager()!.listProposals(projectId);
       expect(proposal).toMatchObject({ decision: 'PLAN', instructions: ['Add the greeting', 'Test the greeting'] });
+      expect(proposal.plannedTasks[0]).toEqual({ title: 'Add the greeting', description: 'Show a greeting', acceptanceCriteria: ['Greeting shown'], priority: 'HIGH', risk: 'LOW' });
       expect(statusOf()).toMatchObject({ phase: 'WAITING_FOR_MANAGER', reasonCode: 'MANAGER_PROPOSAL_PENDING' });
       expect(await service.getManager()!.decideProposal(projectId, proposal.eventId, true)).toEqual({ success: true });
       expect(realTasks()).toHaveLength(2);
@@ -1187,13 +1189,15 @@ describe('desktop automation runtime', () => {
       const [proposal] = service.getManager()!.listProposals(projectId);
       repo.updateProjectContract(projectId, { ...contract, goal: 'Greet visitors in two languages' });
 
-      expect(await service.getManager()!.decideProposal(projectId, proposal.eventId, true)).toMatchObject({ success: false, errorCode: 'PLAN_FOR_STALE_CONTRACT' });
+      // A plan for an older contract closes; approving it creates nothing, and the new contract is planned again.
+      expect(await service.getManager()!.decideProposal(projectId, proposal.eventId, true)).toMatchObject({ success: false, errorCode: 'PROPOSAL_ALREADY_DECIDED' });
       expect(realTasks()).toEqual([]);
+      await pass();
+      expect(managerRequests).toHaveLength(2);
     });
 
     it.each([
       ['a malformed plan', { tasks: [] }, 'PLAN_PROTOCOL_INVALID'],
-      ['a plan for another contract', { contract_sha256: 'a'.repeat(64) }, 'PLAN_FOR_STALE_CONTRACT'],
       ['a plan for another project', { project_id: 'project-other' }, 'PLAN_FOR_OTHER_PROJECT'],
     ])('creates nothing for %s and does not retry it', async (_name, overrides, reasonCode) => {
       addManager();
@@ -1206,6 +1210,58 @@ describe('desktop automation runtime', () => {
       expect(managerRequests).toHaveLength(1);
       expect(realTasks()).toEqual([]);
       expect(repo.getEventsByProject(projectId).find((e) => e.type === 'AUTOMATION_MANAGER_FAILED')!.structured_payload).toMatchObject({ reasonCode });
+    });
+
+    it('retries a plan that names the wrong contract hash while the contract is unchanged', async () => {
+      addManager();
+      repo.setProjectManagerMode(projectId, 'AUTO');
+      let calls = 0;
+      managerReply = (request) => planReply(calls++ === 0 ? { contract_sha256: 'a'.repeat(64) } : {})(request);
+      service = planningService();
+      await pass();
+      expect(repo.getEventsByProject(projectId).find((e) => e.type === 'AUTOMATION_MANAGER_FAILED')!.structured_payload)
+        .toMatchObject({ reasonCode: 'PLAN_HASH_MISMATCH', retryable: true });
+      expect(realTasks()).toEqual([]);
+    });
+
+    it('plans again once the owner edits the contract after a rejected plan', async () => {
+      addManager();
+      managerReply = planReply();
+      service = planningService();
+      await pass();
+      const [first] = service.getManager()!.listProposals(projectId);
+      await service.getManager()!.decideProposal(projectId, first.eventId, false);
+      await pass();
+      expect(managerRequests).toHaveLength(1); // The rejected plan is not asked again for the same contract.
+
+      repo.updateProjectContract(projectId, { ...contract, goal: 'Greet visitors politely' });
+      await pass();
+      expect(managerRequests).toHaveLength(2);
+      expect(managerRequests[1].instructions.join('\n')).toContain('Greet visitors politely');
+      expect(service.getManager()!.listProposals(projectId)).toHaveLength(1);
+    });
+
+    it('closes a plan proposal once the owner creates a task, and never plans then', async () => {
+      addManager();
+      managerReply = planReply();
+      service = planningService();
+      await pass();
+      expect(service.getManager()!.listProposals(projectId)).toHaveLength(1);
+      tasks.createTask({ projectId, title: 'Owner task', description: null, priority: 'LOW', risk: 'LOW', acceptanceCriteria: ['x'], constraints: [] });
+      expect(service.getManager()!.listProposals(projectId).filter((proposal) => proposal.decision === 'PLAN')).toEqual([]);
+    });
+
+    it('refuses any Manager decision for the planning record, so it is never dispatched', async () => {
+      addManager();
+      managerReply = planReply();
+      service = planningService();
+      await pass();
+      const anchorId = repo.getProjectPlanningTaskId(projectId)!;
+      const pasted = { protocol: 'manager.v1' as const, message_id: `owner-${crypto.randomUUID()}`, project_id: projectId, task_id: anchorId,
+        decision: 'EXECUTE' as const, priority: 'LOW' as const, risk: 'LOW' as const, instructions: [], acceptance_criteria: [], constraints: [],
+        review_issues: [], expected_task_state: 'PLANNED' as const, expected_revision: 0 };
+      expect((await tasks.applyManagerDecision(pasted, JSON.stringify(pasted))).success).toBe(false);
+      expect(repo.getTask(anchorId)!.state).toBe('PLANNED');
     });
 
     it('does not plan a project that already has tasks', async () => {

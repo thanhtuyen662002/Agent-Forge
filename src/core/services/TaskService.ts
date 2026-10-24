@@ -388,6 +388,9 @@ export class TaskService {
       );
       return { success: false, error: reason };
     });
+    if (this.repo.getProjectPlanningTaskId(taskForGit.project_id) === taskForGit.id) {
+      return rejectBeforeGit('The project planning record cannot receive Manager decisions.');
+    }
     if (managerMsg.project_id !== taskForGit.project_id) {
       return rejectBeforeGit(`Cross-project conflict: Protocol targets project "${managerMsg.project_id}", but task belongs to "${taskForGit.project_id}".`);
     }

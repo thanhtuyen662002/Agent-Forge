@@ -161,20 +161,36 @@ export class ProductManagerService {
   }
 
   private managerEvents(projectId: string, taskId?: string) {
-    return this.repo.getEventsByProject(projectId).filter((event) => MANAGER_EVENTS.includes(event.type) && (!taskId || event.task_id === taskId));
+    // Unbounded by type: settlement must never fall out of a recent-events window.
+    return this.repo.getProjectEventsOfTypes(projectId, MANAGER_EVENTS, taskId);
   }
 
+  private isPlanningAnchor(task: Task): boolean {
+    return task.id === this.repo.getProjectPlanningTaskId(task.project_id);
+  }
+
+  private currentContractHash(projectId: string): string | null {
+    const contract = this.repo.getProjectMetadata(projectId)?.contract;
+    return contract ? contractSha256(contract) : null;
+  }
+
+  /** Events of the task's current revision; for the planning anchor, only those for the current contract. */
   private eventsForRevision(task: Task) {
+    const planHash = this.isPlanningAnchor(task) ? this.currentContractHash(task.project_id) : undefined;
     return this.managerEvents(task.project_id, task.id)
       .filter((event) => (event.structured_payload as { taskRevision?: unknown } | null)?.taskRevision === task.revision_count)
+      .filter((event) => planHash === undefined || (event.structured_payload as { contractSha256?: unknown } | null)?.contractSha256 === planHash)
       .sort((a, b) => b.timestamp.localeCompare(a.timestamp));
   }
 
   /** What kind of decision the task needs now, or null when it has Manager authority or is elsewhere. */
   private needsDecision(task: Task): PendingManagerDecision['kind'] | null {
     if (this.repo.isTaskTrashed(task.id)) return null;
-    // The planning anchor is never dispatched; while PLANNED it waits for a plan.
-    if (task.id === this.repo.getProjectPlanningTaskId(task.project_id)) return task.state === 'PLANNED' ? 'PLAN' : null;
+    // The planning anchor is never dispatched; while PLANNED, and only while no other task exists, it waits for a plan.
+    if (this.isPlanningAnchor(task)) {
+      const others = this.repo.getTasksByProject(task.project_id).some((other) => other.id !== task.id && !this.repo.isTaskTrashed(other.id));
+      return task.state === 'PLANNED' && !others && this.currentContractHash(task.project_id) ? 'PLAN' : null;
+    }
     if (task.state === 'PLANNED' && !this.repo.getLatestAppliedManagerProtocolMessage(task.id, task.project_id)) return 'START';
     if (task.state === 'CODING' && !managerAuthorizesRevision(this.repo, task)) return 'NEXT_REVISION';
     return null;
@@ -223,7 +239,8 @@ export class ProductManagerService {
   }
 
   /** Open (undecided) proposals of a project, newest first, for the owner. */
-  public listProposals(projectId: string): Array<{ eventId: string; taskId: string; taskTitle: string; taskRevision: number; decision: string; instructions: string[]; createdAt: string }> {
+  public listProposals(projectId: string): Array<{ eventId: string; taskId: string; taskTitle: string; taskRevision: number; decision: string; instructions: string[];
+    plannedTasks: Array<{ title: string; description: string; acceptanceCriteria: string[]; priority: string; risk: string }>; createdAt: string }> {
     const result = [];
     for (const task of this.repo.getTasksByProject(projectId)) {
       const proposal = this.openProposal(task);
@@ -232,6 +249,9 @@ export class ProductManagerService {
       result.push({ eventId: proposal.id, taskId: task.id, taskTitle: task.title, taskRevision: payload.taskRevision,
         decision: payload.plan ? 'PLAN' : payload.decision?.decision ?? 'UNKNOWN',
         instructions: payload.plan ? payload.plan.tasks.map((planned) => planned.title) : payload.decision?.instructions ?? [],
+        // The owner sees exactly what would be created, not only titles.
+        plannedTasks: payload.plan?.tasks.map((planned) => ({ title: planned.title, description: planned.description ?? '',
+          acceptanceCriteria: planned.acceptance_criteria, priority: planned.priority, risk: planned.risk })) ?? [],
         createdAt: proposal.timestamp });
     }
     return result.sort((a, b) => b.createdAt.localeCompare(a.createdAt));
@@ -243,6 +263,8 @@ export class ProductManagerService {
     const events = this.eventsForRevision(task);
     const proposal = events.find((event) => event.type === MANAGER_PROPOSED_EVENT);
     if (!proposal) return null;
+    const planned = (proposal.structured_payload as { contractSha256?: unknown } | null)?.contractSha256;
+    if (planned !== undefined && planned !== this.currentContractHash(task.project_id)) return null; // A plan for an older contract.
     const closed = events.some((event) => PROPOSAL_CLOSING_EVENTS.includes(event.type) &&
       (event.structured_payload as { proposalEventId?: unknown } | null)?.proposalEventId === proposal.id);
     if (closed) return null;
@@ -259,7 +281,8 @@ export class ProductManagerService {
     let task: Task;
     try {
       ({ payload, task } = this.repo.runInImmediateTransaction(() => {
-        const proposal = this.managerEvents(projectId).find((event) => event.id === eventId && event.type === MANAGER_PROPOSED_EVENT);
+        const found = this.repo.getEvent(eventId);
+        const proposal = found && found.project_id === projectId && found.type === MANAGER_PROPOSED_EVENT ? found : null;
         const current = proposal?.task_id ? this.repo.getTask(proposal.task_id) : null;
         if (!proposal || !current || current.project_id !== projectId) throw new ManagerApplyError('PROPOSAL_NOT_FOUND', false);
         if (this.openProposal(current)?.id !== eventId) throw new ManagerApplyError('PROPOSAL_ALREADY_DECIDED', false);
@@ -414,7 +437,11 @@ export class ProductManagerService {
   public async decide(pending: PendingManagerDecision, manager: ManagerCandidate): Promise<ManagerOutcome> {
     const task = pending.task;
     const snapshot = this.snapshot(task);
-    const base = { taskRevision: task.revision_count, kind: pending.kind };
+    const project = this.repo.getProjectMetadata(task.project_id);
+    if (pending.kind === 'PLAN' && !project?.contract) return { outcome: 'NOT_RUN', reasonCode: 'NO_APPROVED_CONTRACT' };
+    const contractHash = pending.kind === 'PLAN' ? contractSha256(project!.contract!) : null;
+    // A plan's events are bound to the contract they planned, so an edited contract is planned again.
+    const base = { taskRevision: task.revision_count, kind: pending.kind, ...(contractHash ? { contractSha256: contractHash } : {}) };
     const record = (type: string, summary: string, payload: Record<string, unknown>) =>
       this.events.record(task.project_id, type, summary, { ...base, ...payload }, task.id);
     const failed = (reasonCode: string, retryable: boolean, extra: Record<string, unknown> = {}): ManagerOutcome => {
@@ -433,9 +460,6 @@ export class ProductManagerService {
     const fenced = this.projectFence(task.project_id, task.id);
     if (fenced) return { outcome: 'NOT_RUN', reasonCode: fenced };
     if (!this.stillMatches(task.id, snapshot)) return { outcome: 'NOT_RUN', reasonCode: 'TASK_MOVED_ON' };
-    const project = this.repo.getProjectMetadata(task.project_id);
-    if (pending.kind === 'PLAN' && !project?.contract) return { outcome: 'NOT_RUN', reasonCode: 'NO_APPROVED_CONTRACT' };
-    const contractHash = pending.kind === 'PLAN' ? contractSha256(project!.contract!) : null;
 
     const call = await this.callAgent(task, manager, snapshot, record, pending.kind === 'PLAN' ? 'plan.v1' : 'manager.v1',
       pending.kind === 'PLAN' ? this.planningInstructions(project!, contractHash!) : this.instructions(task, pending.kind));
@@ -453,7 +477,10 @@ export class ProductManagerService {
         const parsed = parsePlanProtocol(result.outputProtocol);
         if (!parsed.success) { finish('FAILED'); return failed('PLAN_PROTOCOL_INVALID', false, { attemptId }); }
         if (parsed.data.project_id !== task.project_id) { finish('FAILED'); return failed('PLAN_FOR_OTHER_PROJECT', false, { attemptId }); }
-        if (parsed.data.contract_sha256.toLowerCase() !== contractHash) { finish('FAILED'); return failed('PLAN_FOR_STALE_CONTRACT', false, { attemptId }); }
+        // The contract really changed during the call: that plan is over (the new contract is planned again).
+        if (this.currentContractHash(task.project_id) !== contractHash) { finish('FAILED'); return failed('PLAN_FOR_STALE_CONTRACT', false, { attemptId }); }
+        // The contract is unchanged but the answer names another hash: a malformed answer, retried.
+        if (parsed.data.contract_sha256.toLowerCase() !== contractHash) { finish('FAILED'); return failed('PLAN_HASH_MISMATCH', true, { attemptId }); }
         const plan = parsed.data;
         proposalPayload = { plan, contractSha256: contractHash };
         apply = () => this.applyPlan(task.id, plan, contractHash!, snapshot);
@@ -519,18 +546,21 @@ export class ProductManagerService {
     const existing = this.repo.getProjectPlanningTaskId(projectId);
     if (existing) return this.repo.getTask(existing);
     if (this.repo.getTasksByProject(projectId).some((task) => !this.repo.isTaskTrashed(task.id))) return null;
-    const anchor = this.tasks.createTask({
-      projectId, title: 'Plan the project', priority: 'MEDIUM', risk: 'LOW',
-      description: 'Agent Forge planning record: the Manager turns the approved contract into tasks. This task is never dispatched.',
-      acceptanceCriteria: ['The approved contract is split into concrete tasks'], constraints: [],
-    });
-    if (!this.repo.setProjectPlanningTaskId(projectId, anchor.id)) {
-      // Another anchor won; ours is cancelled so only one planning record exists.
-      this.transition(anchor.id, 'CANCEL');
+    // The task and its role as planning record are written together, or not at all.
+    try {
+      return this.repo.runInImmediateTransaction(() => {
+        const anchor = this.tasks.createTask({
+          projectId, title: 'Plan the project', priority: 'MEDIUM', risk: 'LOW',
+          description: 'Agent Forge planning record: the Manager turns the approved contract into tasks. This task is never dispatched.',
+          acceptanceCriteria: ['The approved contract is split into concrete tasks'], constraints: [],
+        });
+        if (!this.repo.setProjectPlanningTaskId(projectId, anchor.id)) throw new Error('PLANNING_ANCHOR_EXISTS');
+        return anchor;
+      });
+    } catch {
       const winner = this.repo.getProjectPlanningTaskId(projectId);
       return winner ? this.repo.getTask(winner) : null;
     }
-    return anchor;
   }
 
   /** Creates the planned tasks through TaskService only if nothing moved, then approves the anchor. */
@@ -550,6 +580,8 @@ export class ProductManagerService {
         });
       }
       if (!this.transition(anchorId, 'APPROVE')) throw new ManagerApplyError('TASK_TRANSITION_REJECTED', false);
+      // The planning record leaves the active task list; its plan stays in the events.
+      this.repo.insertTrashEntry('TASK', anchorId, project.id, this.iso());
     });
   }
 
@@ -574,6 +606,7 @@ export class ProductManagerService {
       ...list('Testing requirement', contract.testing_requirements),
       ...list('Definition of done', contract.definition_of_done),
       ...list('Non-goal', contract.non_goals),
+      ...list('Owner policy', contract.owner_policies),
       'Each task needs a short title, a description and at least one acceptance criterion. Use at most 20 tasks.',
       `Use exactly: project_id "${project.id}", contract_sha256 "${contractHash}".`,
     ];

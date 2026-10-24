@@ -98,7 +98,20 @@ export const ManagerDecisionsPanel: React.FC<{ projectId: string }> = ({ project
                     : proposal.decision}
                 </span>
               </div>
-              {proposal.instructions.length > 0 && (
+              {proposal.plannedTasks.length > 0 ? (
+                <ol className="list-decimal pl-5 text-xs text-slate-300 space-y-1.5">
+                  {proposal.plannedTasks.map((planned, index) => (
+                    <li key={index}>
+                      <span className="text-slate-100 font-medium">{planned.title}</span>
+                      <span className="text-slate-500"> · {planned.priority} · {planned.risk}</span>
+                      {planned.description && <p className="text-slate-400">{planned.description}</p>}
+                      <ul className="list-disc pl-4 text-slate-400">
+                        {planned.acceptanceCriteria.map((criterion, i) => <li key={i}>{criterion}</li>)}
+                      </ul>
+                    </li>
+                  ))}
+                </ol>
+              ) : proposal.instructions.length > 0 && (
                 <ul className="list-disc pl-5 text-xs text-slate-300 space-y-0.5">
                   {proposal.instructions.map((line, index) => <li key={index}>{line}</li>)}
                 </ul>
