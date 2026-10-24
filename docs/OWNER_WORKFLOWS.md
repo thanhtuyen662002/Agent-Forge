@@ -486,7 +486,25 @@ It refreshes every five minutes and when you press **Refresh from provider**
 on the **Capacity** page. The primary window becomes *percent left* with its
 reset time (`PROVIDER_REPORTED`). Not signed in, unavailable or unreadable
 replies stay unknown, never zero. Manual snapshots are never overwritten.
-Gemini has no supported reader and shows *Not supported*.
+
+**Router-style overview (#243).** The Capacity page shows one card per account,
+grouped by CLI, with a usable/total summary per CLI. Each card shows:
+
+- the agents and models on the account, and its plan;
+- one bar per limit window (5-hour, weekly, …) with remaining %, colour
+  (more than 50 % green, 20–50 % amber, under 20 % red) and a reset countdown;
+- whether the account is usable now;
+- the **source** of the numbers:
+
+| Source | Meaning |
+| --- | --- |
+| Official | Codex `account/rateLimits/read`. |
+| Observed from a run | Claude Code and Gemini have no official usage reader. When a run hits a usage limit, the recorded health shows that limit as exhausted until its recorded reset, and an expired sign-in shows as *Not signed in*. |
+| Unknown | Nothing is known; no number is shown. |
+
+Observed values are never stored as provider-reported quota and never verify an
+account. Reading Claude or Gemini OAuth tokens to call their undocumented usage
+endpoints, as some routers do, is not done without the owner's explicit choice.
 
 New CLI accounts start `UNKNOWN` and cannot be leased. A successful
 authenticated read lets `AccountHealthService.initializeVerifiedAccount` (the

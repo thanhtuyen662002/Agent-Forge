@@ -18,7 +18,14 @@ export interface QuotaObservation extends QuotaWindowObservation {
   resourceIds: string[];
   providerId: string;
   status: QuotaObservationStatus;
-  source: 'PROVIDER_REPORTED' | 'UNKNOWN';
+  /**
+   * PROVIDER_REPORTED: read from the provider's official tool (Codex app-server).
+   * OBSERVED: derived from what a real run recorded (a limit reached until a reset, a lost sign-in).
+   * UNKNOWN: nothing is known; never guessed.
+   */
+  source: 'PROVIDER_REPORTED' | 'OBSERVED' | 'UNKNOWN';
+  /** The account's recorded health when the observation was made (single health writer). */
+  healthStatus: string | null;
   secondary: QuotaWindowObservation | null;
   planType: string | null;
   observedAt: string;
