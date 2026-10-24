@@ -315,6 +315,63 @@ export interface TranslationDictionary {
       instructions: string;
     };
   };
+  trash: {
+    title: string;
+    subtitle: string;
+    projectsHeading: string;
+    tasksHeading: string;
+    empty: string;
+    restore: string;
+    moveToTrash: string;
+    showTrash: string;
+    hideTrash: string;
+    inProject: string;
+    trashedAt: string;
+    projectSearch: string;
+    projectSearchPlaceholder: string;
+    taskSearch: string;
+    taskSearchPlaceholder: string;
+    noMatches: string;
+    projectListTitle: string;
+    open: string;
+    selected: string;
+    noProjects: string;
+    loadFailed: string;
+    confirm: {
+      projectTitle: string;
+      taskTitle: string;
+      body: string;
+      confirm: string;
+      cancel: string;
+    };
+    results: {
+      projectTrashed: string;
+      taskTrashed: string;
+      projectRestored: string;
+      taskRestored: string;
+      invalidated: string;
+    };
+    blockers: {
+      PROJECT_RUNNING: string;
+      TASK_ACTIVE_STATE: string;
+      ACTIVE_TASK_LEASE: string;
+      ACTIVE_ASSIGNMENT: string;
+      IN_FLIGHT_EXECUTION: string;
+      AGENT_ASSIGNED: string;
+    };
+    errors: {
+      INVALID_INPUT: string;
+      PROJECT_NOT_FOUND: string;
+      TASK_NOT_FOUND: string;
+      ALREADY_IN_TRASH: string;
+      NOT_IN_TRASH: string;
+      PROJECT_IN_TRASH: string;
+      HAS_ACTIVE_WORK: string;
+      INTERNAL_ERROR: string;
+      DESKTOP_REQUIRED: string;
+      INVALID_RESPONSE: string;
+    };
+  };
   agentCard: {
     noAssignedModel: string;
     observableAction: string;

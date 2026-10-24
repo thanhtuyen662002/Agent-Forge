@@ -1397,6 +1397,69 @@ export class Repository {
     };
   }
 
+  // ==========================================
+  // Owner Workspace Trash (migration 027)
+  // ==========================================
+  public getTrashEntries(): Array<{ entity_type: 'PROJECT' | 'TASK'; entity_id: string; project_id: string; trashed_at: string }> {
+    return this.db
+      .prepare('SELECT entity_type, entity_id, project_id, trashed_at FROM workspace_trash ORDER BY trashed_at DESC')
+      .all() as Array<{ entity_type: 'PROJECT' | 'TASK'; entity_id: string; project_id: string; trashed_at: string }>;
+  }
+
+  public isProjectTrashed(projectId: string): boolean {
+    return Boolean(this.db.prepare("SELECT 1 FROM workspace_trash WHERE entity_type = 'PROJECT' AND entity_id = ?").get(projectId));
+  }
+
+  /** True when the task itself or its project is in the owner trash. */
+  public isTaskTrashed(taskId: string): boolean {
+    return Boolean(this.db.prepare(`
+      SELECT 1 FROM tasks t
+      JOIN workspace_trash w ON (w.entity_type = 'TASK' AND w.entity_id = t.id)
+                             OR (w.entity_type = 'PROJECT' AND w.entity_id = t.project_id)
+      WHERE t.id = ? LIMIT 1
+    `).get(taskId));
+  }
+
+  public insertTrashEntry(entityType: 'PROJECT' | 'TASK', entityId: string, projectId: string, trashedAt: string): boolean {
+    return this.db
+      .prepare('INSERT OR IGNORE INTO workspace_trash (entity_type, entity_id, project_id, trashed_at) VALUES (?, ?, ?, ?)')
+      .run(entityType, entityId, projectId, trashedAt).changes === 1;
+  }
+
+  public deleteTrashEntry(entityType: 'PROJECT' | 'TASK', entityId: string): boolean {
+    return this.db.prepare('DELETE FROM workspace_trash WHERE entity_type = ? AND entity_id = ?').run(entityType, entityId).changes === 1;
+  }
+
+  /**
+   * Durable work that would be orphaned if the task left the active list.
+   * Only CREATED, PLANNED and terminal tasks may be trashed; anything queued
+   * or in flight can still be picked up by the runtime.
+   */
+  public getTaskTrashBlockers(taskId: string): Array<{ code: string; reference: string }> {
+    const blockers: Array<{ code: string; reference: string }> = [];
+    const task = this.getTask(taskId);
+    if (!task) return blockers;
+    if (!['CREATED', 'PLANNED', 'DONE', 'FAILED', 'CANCELLED'].includes(task.state)) {
+      blockers.push({ code: 'TASK_ACTIVE_STATE', reference: task.state });
+    }
+    const lease = this.db.prepare('SELECT task_id FROM task_leases WHERE task_id = ? AND released_at IS NULL').get(taskId);
+    if (lease) blockers.push({ code: 'ACTIVE_TASK_LEASE', reference: taskId });
+    const assignments = this.db
+      .prepare("SELECT id FROM agent_assignments WHERE task_id = ? AND status IN ('ASSIGNED', 'RUNNING')")
+      .all(taskId) as Array<{ id: string }>;
+    for (const row of assignments) blockers.push({ code: 'ACTIVE_ASSIGNMENT', reference: row.id });
+    const executions = this.db
+      .prepare(`
+        SELECT id FROM execution_authorizations
+        WHERE task_id = ? AND status = 'DISPATCHED' AND adapter_started_at IS NOT NULL AND adapter_finished_at IS NULL
+      `)
+      .all(taskId) as Array<{ id: string }>;
+    for (const row of executions) blockers.push({ code: 'IN_FLIGHT_EXECUTION', reference: row.id });
+    const agents = this.db.prepare('SELECT id FROM agents WHERE current_task_id = ?').all(taskId) as Array<{ id: string }>;
+    for (const row of agents) blockers.push({ code: 'AGENT_ASSIGNED', reference: row.id });
+    return blockers;
+  }
+
   public setAgentProfileId(id: string, agentProfileId: string | null): void {
     this.db.prepare('UPDATE agents SET agent_profile_id = ? WHERE id = ?').run(agentProfileId, id);
   }

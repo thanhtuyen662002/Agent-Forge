@@ -136,10 +136,40 @@ export function registerIpcHandlers(
 
   const workspaceManagementService = new WorkspaceManagementService(repo);
 
+  // Owner trash fence. Mutations and work-order generation for a trashed
+  // project or task are refused before the handler runs; trashing also
+  // invalidated its AUTHORIZED executions and dispatch re-checks the trash.
+  const trashFencedChannels = new Set([
+    'project:importContract', 'project:transition', 'task:create', 'task:startReview',
+    'protocol:generateWorkOrder', 'protocol:generateReviewPackage', 'verification:runTests',
+    'verification:saveCommands', 'routing:routeTask', 'routing:authorizeTask',
+    'routing:dispatchAuthorization', 'routing:generateAuthorizedWorkOrder',
+  ]);
+  const trashRejection = (projectId: unknown, taskId: unknown) => {
+    const trashed = (typeof projectId === 'string' && repo.isProjectTrashed(projectId)) ||
+      (typeof taskId === 'string' && repo.isTaskTrashed(taskId));
+    return trashed
+      ? { success: false, errorCode: 'ENTITY_IN_TRASH', error: 'ENTITY_IN_TRASH: Restore the project or task from the trash first.' }
+      : null;
+  };
+  const trashFence = (payload: unknown) => {
+    if (!payload || typeof payload !== 'object') return null;
+    const record = payload as Record<string, unknown>;
+    let taskId = record.taskId;
+    if (typeof record.authorizationId === 'string') {
+      taskId = repo.getExecutionAuthorization(record.authorizationId)?.task_id ?? taskId;
+    }
+    return trashRejection(record.projectId ?? record.expectedProjectId, taskId);
+  };
+
   const registerPrivilegedHandler = (channel: string, handler: PrivilegedIpcHandler): void => {
     ipcMain.handle(channel, async (event, payload) => {
       if (!isTrustedIpcSender(event, rendererPolicy)) {
         throw new IpcSenderTrustError();
+      }
+      if (trashFencedChannels.has(channel)) {
+        const rejected = trashFence(payload);
+        if (rejected) return rejected;
       }
       try { return await handler(event, payload); }
       catch (error) {
@@ -281,7 +311,7 @@ export function registerIpcHandlers(
   });
 
   registerPrivilegedHandler('project:list', async () => {
-    return repo.getAllProjects();
+    return repo.getAllProjects().filter((project) => !repo.isProjectTrashed(project.id));
   });
 
   registerPrivilegedHandler('project:importContract', async (_, payload: unknown) => {
@@ -325,7 +355,8 @@ export function registerIpcHandlers(
   registerPrivilegedHandler('task:list', async (_, payload: unknown) => {
     const parsed = ProjectScopedIpcSchema.safeParse(payload);
     if (!parsed.success) return [];
-    return repo.getTasksByProject(parsed.data.projectId);
+    if (repo.isProjectTrashed(parsed.data.projectId)) return [];
+    return repo.getTasksByProject(parsed.data.projectId).filter((task) => !repo.isTaskTrashed(task.id));
   });
 
   registerPrivilegedHandler('task:startReview', async (_, payload: unknown) => {
@@ -362,6 +393,10 @@ export function registerIpcHandlers(
     if (!parseRes.success || !parseRes.data) {
       return { success: false, error: `Invalid protocol format: ${parseRes.error}` };
     }
+
+    const protocolScope = parseRes.data.data as { project_id?: unknown; task_id?: unknown };
+    const trashed = trashRejection(protocolScope.project_id, protocolScope.task_id);
+    if (trashed) return trashed;
 
     if (parseRes.data.type === 'manager.v1') {
       return await taskService.applyManagerDecision(parseRes.data.data, parsed.data.rawInput);
@@ -864,6 +899,27 @@ export function registerIpcHandlers(
 
   registerPrivilegedHandler('agents:restore', async (_, payload: unknown) => {
     return sanitizeOutputValue(workspaceManagementService.restoreAgent(payload));
+  });
+
+  // Owner trash for projects and tasks: reversible, history-preserving.
+  registerPrivilegedHandler('trash:list', async () => {
+    return sanitizeOutputValue(workspaceManagementService.listTrash());
+  });
+
+  registerPrivilegedHandler('trash:project', async (_, payload: unknown) => {
+    return sanitizeOutputValue(workspaceManagementService.trashProject(payload));
+  });
+
+  registerPrivilegedHandler('trash:restoreProject', async (_, payload: unknown) => {
+    return sanitizeOutputValue(workspaceManagementService.restoreProject(payload));
+  });
+
+  registerPrivilegedHandler('trash:task', async (_, payload: unknown) => {
+    return sanitizeOutputValue(workspaceManagementService.trashTask(payload));
+  });
+
+  registerPrivilegedHandler('trash:restoreTask', async (_, payload: unknown) => {
+    return sanitizeOutputValue(workspaceManagementService.restoreTask(payload));
   });
 
   registerPrivilegedHandler('providers:updateResourceQuota', async (_, payload: unknown) => {

@@ -1,11 +1,14 @@
 import crypto from 'crypto';
 import { Repository } from '../database/repositories';
+import { EventService } from './EventService';
 import { isValidNativeProfileRef, parseNativeProfileRef } from '../credentials/NativeProfileRef';
 import type { AgentRole, Capability, FabricRole, Provider, RoleProfile } from '../types/domain';
 import {
   AGENT_ROLE_FABRIC_ROLE,
   AgentIdIpcSchema,
   CreateAgentIpcSchema,
+  ProjectTrashIpcSchema,
+  TaskTrashIpcSchema,
   UpdateAgentIpcSchema,
 } from '../types/workspace';
 import type {
@@ -15,6 +18,10 @@ import type {
   AgentRosterEntry,
   AgentWorkBlocker,
   ManagedAgent,
+  TrashBlocker,
+  TrashErrorCode,
+  TrashListing,
+  TrashMutationResult,
 } from '../types/workspace';
 
 const MANUAL_BRIDGE_PROVIDER_ID = 'prov-manual-bridge';
@@ -42,6 +49,18 @@ const ROLE_OUTPUT_PROTOCOL: Partial<Record<FabricRole, string>> = {
   CODER: 'coder.v1',
   REVIEWER: 'coder-report.v1',
 };
+
+const PROJECT_ACTIVE_STATUSES = new Set(['RUNNING', 'FINAL_REVIEW', 'WAITING_FOR_CAPACITY']);
+
+class TrashError extends Error {
+  constructor(
+    readonly errorCode: TrashErrorCode,
+    message: string,
+    readonly blockers?: TrashBlocker[],
+  ) {
+    super(message);
+  }
+}
 
 class AgentManagementError extends Error {
   constructor(
@@ -343,6 +362,129 @@ export class WorkspaceManagementService {
       }
       return agent.id;
     });
+  }
+
+  // ==========================================
+  // Project / task trash
+  // ==========================================
+
+  public listTrash(): TrashListing {
+    return this.repo.runInReadTransaction(() => {
+      const listing: TrashListing = { projects: [], tasks: [] };
+      for (const entry of this.repo.getTrashEntries()) {
+        const project = this.repo.getProjectMetadata(entry.project_id);
+        if (!project) continue;
+        if (entry.entity_type === 'PROJECT') {
+          listing.projects.push({ id: project.id, name: project.name, status: project.status, trashedAt: entry.trashed_at });
+        } else {
+          const task = this.repo.getTask(entry.entity_id);
+          if (!task) continue;
+          listing.tasks.push({
+            id: task.id, title: task.title, state: task.state,
+            projectId: project.id, projectName: project.name, trashedAt: entry.trashed_at,
+          });
+        }
+      }
+      return listing;
+    });
+  }
+
+  /**
+   * Moves an idle project to the trash. Every still-AUTHORIZED execution of its
+   * tasks is invalidated in the same transaction, so restoring the project can
+   * never revive approved work; the dispatch claim CAS rejects it afterwards.
+   */
+  public trashProject(payload: unknown): TrashMutationResult {
+    const parsed = ProjectTrashIpcSchema.safeParse(payload);
+    if (!parsed.success) return this.trashInvalid(parsed.error.issues.map((i) => i.message).join(', '));
+    return this.trashMutate(() => {
+      const nowIso = this.now();
+      const project = this.repo.getProjectMetadata(parsed.data.projectId);
+      if (!project) throw new TrashError('PROJECT_NOT_FOUND', `Project "${parsed.data.projectId}" was not found.`);
+      if (this.repo.isProjectTrashed(project.id)) throw new TrashError('ALREADY_IN_TRASH', 'The project is already in the trash.');
+
+      const blockers: TrashBlocker[] = [];
+      if (PROJECT_ACTIVE_STATUSES.has(project.status)) blockers.push({ code: 'PROJECT_RUNNING', reference: project.status });
+      const tasks = this.repo.getTasksByProject(project.id);
+      for (const task of tasks) {
+        for (const blocker of this.repo.getTaskTrashBlockers(task.id) as TrashBlocker[]) blockers.push({ ...blocker, taskId: task.id });
+      }
+      if (blockers.length > 0) throw new TrashError('HAS_ACTIVE_WORK', 'The project still has active work.', blockers);
+
+      let invalidated = 0;
+      for (const task of tasks) invalidated += this.repo.invalidateAuthorizedExecutionAuthorizationsForTask(task.id);
+      this.repo.insertTrashEntry('PROJECT', project.id, project.id, nowIso);
+      this.events().record(project.id, 'PROJECT_TRASHED', `Owner moved project "${project.name}" to the trash.`, {
+        invalidatedAuthorizations: invalidated,
+      });
+      return { success: true, entityType: 'PROJECT', entityId: project.id, invalidatedAuthorizations: invalidated };
+    });
+  }
+
+  public restoreProject(payload: unknown): TrashMutationResult {
+    const parsed = ProjectTrashIpcSchema.safeParse(payload);
+    if (!parsed.success) return this.trashInvalid(parsed.error.issues.map((i) => i.message).join(', '));
+    return this.trashMutate(() => {
+      const project = this.repo.getProjectMetadata(parsed.data.projectId);
+      if (!project) throw new TrashError('PROJECT_NOT_FOUND', `Project "${parsed.data.projectId}" was not found.`);
+      if (!this.repo.deleteTrashEntry('PROJECT', project.id)) throw new TrashError('NOT_IN_TRASH', 'The project is not in the trash.');
+      this.events().record(project.id, 'PROJECT_RESTORED', `Owner restored project "${project.name}" from the trash.`);
+      return { success: true, entityType: 'PROJECT', entityId: project.id, invalidatedAuthorizations: 0 };
+    });
+  }
+
+  public trashTask(payload: unknown): TrashMutationResult {
+    const parsed = TaskTrashIpcSchema.safeParse(payload);
+    if (!parsed.success) return this.trashInvalid(parsed.error.issues.map((i) => i.message).join(', '));
+    return this.trashMutate(() => {
+      const nowIso = this.now();
+      const task = this.repo.getTask(parsed.data.taskId);
+      if (!task) throw new TrashError('TASK_NOT_FOUND', `Task "${parsed.data.taskId}" was not found.`);
+      if (this.repo.isTaskTrashed(task.id)) throw new TrashError('ALREADY_IN_TRASH', 'The task or its project is already in the trash.');
+      const blockers = this.repo.getTaskTrashBlockers(task.id) as TrashBlocker[];
+      if (blockers.length > 0) throw new TrashError('HAS_ACTIVE_WORK', 'The task still has active work.', blockers);
+
+      const invalidated = this.repo.invalidateAuthorizedExecutionAuthorizationsForTask(task.id);
+      this.repo.insertTrashEntry('TASK', task.id, task.project_id, nowIso);
+      this.events().record(task.project_id, 'TASK_TRASHED', `Owner moved task "${task.title}" to the trash.`, {
+        invalidatedAuthorizations: invalidated,
+      }, task.id);
+      return { success: true, entityType: 'TASK', entityId: task.id, invalidatedAuthorizations: invalidated };
+    });
+  }
+
+  public restoreTask(payload: unknown): TrashMutationResult {
+    const parsed = TaskTrashIpcSchema.safeParse(payload);
+    if (!parsed.success) return this.trashInvalid(parsed.error.issues.map((i) => i.message).join(', '));
+    return this.trashMutate(() => {
+      const task = this.repo.getTask(parsed.data.taskId);
+      if (!task) throw new TrashError('TASK_NOT_FOUND', `Task "${parsed.data.taskId}" was not found.`);
+      if (this.repo.isProjectTrashed(task.project_id)) {
+        throw new TrashError('PROJECT_IN_TRASH', 'Restore the project before restoring its tasks.');
+      }
+      if (!this.repo.deleteTrashEntry('TASK', task.id)) throw new TrashError('NOT_IN_TRASH', 'The task is not in the trash.');
+      this.events().record(task.project_id, 'TASK_RESTORED', `Owner restored task "${task.title}" from the trash.`, {}, task.id);
+      return { success: true, entityType: 'TASK', entityId: task.id, invalidatedAuthorizations: 0 };
+    });
+  }
+
+  private events(): EventService {
+    return new EventService(this.repo);
+  }
+
+  private trashMutate(fn: () => TrashMutationResult): TrashMutationResult {
+    try {
+      return this.repo.runInImmediateTransaction(fn);
+    } catch (err) {
+      if (err instanceof TrashError) {
+        return { success: false, errorCode: err.errorCode, error: err.message, ...(err.blockers ? { blockers: err.blockers } : {}) };
+      }
+      return { success: false, errorCode: 'INTERNAL_ERROR', error: 'The change could not be saved.' };
+    }
+  }
+
+  private trashInvalid(message: string): TrashMutationResult {
+    return { success: false, errorCode: 'INVALID_INPUT', error: message || 'Invalid input.' };
   }
 
   private mutate(fn: () => string): AgentManagementResult {

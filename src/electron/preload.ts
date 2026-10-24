@@ -67,6 +67,11 @@ export interface OrchestratorApi {
   updateAgent: (data: Record<string, unknown>) => Promise<any>;
   removeAgent: (agentId: string) => Promise<any>;
   restoreAgent: (agentId: string) => Promise<any>;
+  getTrash: () => Promise<any>;
+  trashProject: (projectId: string) => Promise<any>;
+  restoreProject: (projectId: string) => Promise<any>;
+  trashTask: (taskId: string) => Promise<any>;
+  restoreTask: (taskId: string) => Promise<any>;
   getProviderResources: () => Promise<any[]>;
   updateResourceQuota: (data: { id: string; remaining: number | null; total: number | null; source: string; confidence: number }) => Promise<any>;
 
@@ -184,6 +189,11 @@ const api: OrchestratorApi = {
   updateAgent: (data) => ipcRenderer.invoke('agents:update', data),
   removeAgent: (agentId: string) => ipcRenderer.invoke('agents:remove', { agentId }),
   restoreAgent: (agentId: string) => ipcRenderer.invoke('agents:restore', { agentId }),
+  getTrash: () => ipcRenderer.invoke('trash:list'),
+  trashProject: (projectId: string) => ipcRenderer.invoke('trash:project', { projectId }),
+  restoreProject: (projectId: string) => ipcRenderer.invoke('trash:restoreProject', { projectId }),
+  trashTask: (taskId: string) => ipcRenderer.invoke('trash:task', { taskId }),
+  restoreTask: (taskId: string) => ipcRenderer.invoke('trash:restoreTask', { taskId }),
   getProviderResources: () => ipcRenderer.invoke('providers:listResources'),
   updateResourceQuota: (data) => ipcRenderer.invoke('providers:updateResourceQuota', data),
 

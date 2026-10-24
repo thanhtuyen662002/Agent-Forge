@@ -1,9 +1,13 @@
-import React, { useState } from 'react';
+import React, { useMemo, useState } from 'react';
 import { useOrchestrator } from '../context/OrchestratorContext';
 import { useI18n } from '../context/I18nContext';
 import { UiActionFailure, uiActionFailureKey } from '../actionState';
 import { ProgressIndicator } from '../components/ProgressIndicator';
 import { AccessibleDialog } from '../components/AccessibleDialog';
+import { ConfirmTrashDialog, TrashFailureMessage, TrashList } from '../components/TrashPanel';
+import { matchesSearch, useWorkspaceTrash } from '../workspaceTrash';
+import type { TrashActionResult } from '../workspaceTrash';
+import type { Task } from '../../core/types/domain';
 import {
   getTaskLaneId,
   TASK_LANE_STATE_GROUPS,
@@ -19,10 +23,15 @@ import {
   Sparkles,
   CheckCircle2,
   Clock,
+  Search,
+  Trash2,
 } from 'lucide-react';
 
+/** Matches the backend fence: only new, planned or finished tasks can be trashed. */
+const TRASHABLE_STATES = new Set(['CREATED', 'PLANNED', 'DONE', 'FAILED', 'CANCELLED']);
+
 export const TaskBoardView: React.FC = () => {
-  const { tasks, createTask, setSelectedTaskId, setActiveView, isElectron, activeProject, pendingActions } = useOrchestrator();
+  const { tasks, createTask, setSelectedTaskId, setActiveView, isElectron, activeProject, pendingActions, refreshData } = useOrchestrator();
   const { t } = useI18n();
   const [isCreateModalOpen, setIsCreateModalOpen] = useState<boolean>(false);
   const [newTitle, setNewTitle] = useState<string>('');
@@ -32,6 +41,40 @@ export const TaskBoardView: React.FC = () => {
   const [newCriteria, setNewCriteria] = useState<string>('');
   const [createError, setCreateError] = useState<UiActionFailure | null>(null);
   const creating = pendingActions.includes('createTask');
+  const trash = useWorkspaceTrash(refreshData);
+  const [taskQuery, setTaskQuery] = useState('');
+  const [showTrash, setShowTrash] = useState(false);
+  const [trashTarget, setTrashTarget] = useState<Task | null>(null);
+  const [trashFailure, setTrashFailure] = useState<TrashActionResult | null>(null);
+  const [trashNotice, setTrashNotice] = useState<{ ok: boolean; message: string; failure?: TrashActionResult } | null>(null);
+  const visibleTasks = useMemo(
+    () => tasks.filter((task) => matchesSearch(taskQuery, task.title, task.id, task.description)),
+    [tasks, taskQuery],
+  );
+  const projectTrash = useMemo(
+    () => ({ projects: [], tasks: trash.listing.tasks.filter((task) => task.projectId === activeProject?.id) }),
+    [trash.listing, activeProject?.id],
+  );
+
+  const confirmTrashTask = async () => {
+    if (!trashTarget) return;
+    const result = await trash.trashTask(trashTarget.id);
+    if (result.success) {
+      const extra = result.invalidatedAuthorizations > 0 ? ` ${t('trash.results.invalidated', { count: result.invalidatedAuthorizations })}` : '';
+      setTrashNotice({ ok: true, message: t('trash.results.taskTrashed', { name: trashTarget.title }) + extra });
+      setTrashTarget(null);
+      setTrashFailure(null);
+    } else {
+      setTrashFailure(result);
+    }
+  };
+
+  const restoreTask = async (taskId: string, title: string) => {
+    const result = await trash.restoreTask(taskId);
+    setTrashNotice(result.success
+      ? { ok: true, message: t('trash.results.taskRestored', { name: title }) }
+      : { ok: false, message: '', failure: result });
+  };
 
   const laneLabels: Record<TaskLaneId, string> = {
     planned: t('taskBoard.lanes.planned'),
@@ -128,10 +171,58 @@ export const TaskBoardView: React.FC = () => {
         </button>
       </div>
 
+      <div className="flex flex-wrap items-center gap-3 shrink-0">
+        <label className="relative block flex-1 min-w-[220px] max-w-md">
+          <span className="sr-only">{t('trash.taskSearch')}</span>
+          <Search className="w-4 h-4 text-slate-500 absolute left-3 top-1/2 -translate-y-1/2" aria-hidden="true" />
+          <input
+            type="search"
+            value={taskQuery}
+            onChange={(event) => setTaskQuery(event.target.value)}
+            placeholder={t('trash.taskSearchPlaceholder')}
+            className="w-full bg-surface border border-surface-border rounded-lg pl-9 pr-3 py-2 text-sm text-white focus:outline-none focus:border-forge-cyan"
+          />
+        </label>
+        <button
+          type="button"
+          onClick={() => setShowTrash((value) => !value)}
+          disabled={!trash.available || !activeProject}
+          aria-expanded={showTrash}
+          className="px-3 py-2 rounded-lg text-xs border border-surface-border text-slate-300 hover:bg-surface-border disabled:opacity-40 flex items-center gap-1.5"
+        >
+          <Trash2 className="w-3.5 h-3.5" aria-hidden="true" />
+          <span>{showTrash ? t('trash.hideTrash') : t('trash.showTrash')} ({projectTrash.tasks.length})</span>
+        </button>
+        {taskQuery.trim() && visibleTasks.length === 0 && <span className="text-xs text-slate-500">{t('trash.noMatches')}</span>}
+      </div>
+
+      {trashNotice && (trashNotice.ok
+        ? <p role="status" className="text-xs text-emerald-300 shrink-0">{trashNotice.message}</p>
+        : trashNotice.failure && <div className="shrink-0"><TrashFailureMessage result={trashNotice.failure} /></div>)}
+
+      {showTrash && (
+        <div className="shrink-0 max-h-64 overflow-y-auto">
+          {trash.loadFailed
+            ? <p role="alert" className="text-xs text-rose-300">{t('trash.loadFailed')}</p>
+            : <TrashList listing={projectTrash} show="tasks" pending={trash.pending} onRestoreTask={(id, title) => void restoreTask(id, title)} />}
+        </div>
+      )}
+
+      {trashTarget && (
+        <ConfirmTrashDialog
+          kind="task"
+          name={trashTarget.title}
+          pending={trash.pending}
+          failure={trashFailure}
+          onCancel={() => setTrashTarget(null)}
+          onConfirm={() => void confirmTrashTask()}
+        />
+      )}
+
       {/* Kanban Board Columns Grid */}
       <div className="grid grid-cols-1 md:grid-cols-[repeat(3,minmax(240px,1fr))] xl:grid-cols-[repeat(5,minmax(240px,1fr))] gap-4 flex-1 overflow-x-auto pb-4">
         {columns.map((col) => {
-          const colTasks = tasks.filter((task) => getTaskLaneId(task.state) === col.id);
+          const colTasks = visibleTasks.filter((task) => getTaskLaneId(task.state) === col.id);
           return (
             <div
               key={col.id}
@@ -155,9 +246,9 @@ export const TaskBoardView: React.FC = () => {
                   </div>
                 ) : (
                   colTasks.map((task) => (
+                    <div key={task.id} className="space-y-1">
                     <button
                       type="button"
-                      key={task.id}
                       onClick={() => {
                         setSelectedTaskId(task.id);
                         setActiveView('task-detail');
@@ -190,6 +281,19 @@ export const TaskBoardView: React.FC = () => {
                         <span className="text-slate-300 font-medium">{task.state}</span>
                       </span>
                     </button>
+                    {TRASHABLE_STATES.has(task.state) && (
+                      <button
+                        type="button"
+                        onClick={() => { setTrashFailure(null); setTrashTarget(task); }}
+                        disabled={!trash.available || trash.pending}
+                        aria-label={`${t('trash.moveToTrash')}: ${task.title}`}
+                        className="w-full px-2 py-1 rounded-md text-[11px] text-slate-400 hover:text-rose-300 hover:bg-rose-950/30 disabled:opacity-40 flex items-center justify-end gap-1"
+                      >
+                        <Trash2 className="w-3 h-3" aria-hidden="true" />
+                        <span>{t('trash.moveToTrash')}</span>
+                      </button>
+                    )}
+                    </div>
                   ))
                 )}
               </div>

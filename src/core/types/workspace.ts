@@ -119,3 +119,43 @@ export const AGENT_ROLE_FABRIC_ROLE: Record<AgentRole, FabricRole> = {
   REVIEWER: 'REVIEWER',
   TOOL: 'TOOL',
 };
+
+// ==========================================
+// Owner workspace trash for projects and tasks
+// ==========================================
+export const ProjectTrashIpcSchema = z.object({ projectId: ownerText(200) }).strict();
+export const TaskTrashIpcSchema = z.object({ taskId: ownerText(200) }).strict();
+
+export type TrashBlockerCode =
+  | 'PROJECT_RUNNING'
+  | 'TASK_ACTIVE_STATE'
+  | 'ACTIVE_TASK_LEASE'
+  | 'ACTIVE_ASSIGNMENT'
+  | 'IN_FLIGHT_EXECUTION'
+  | 'AGENT_ASSIGNED';
+
+export interface TrashBlocker {
+  code: TrashBlockerCode;
+  reference: string;
+  /** Task the blocker belongs to when a whole project is being trashed. */
+  taskId?: string;
+}
+
+export type TrashErrorCode =
+  | 'INVALID_INPUT'
+  | 'PROJECT_NOT_FOUND'
+  | 'TASK_NOT_FOUND'
+  | 'ALREADY_IN_TRASH'
+  | 'NOT_IN_TRASH'
+  | 'PROJECT_IN_TRASH'
+  | 'HAS_ACTIVE_WORK'
+  | 'INTERNAL_ERROR';
+
+export type TrashMutationResult =
+  | { success: true; entityType: 'PROJECT' | 'TASK'; entityId: string; invalidatedAuthorizations: number }
+  | { success: false; errorCode: TrashErrorCode; error: string; blockers?: TrashBlocker[] };
+
+export interface TrashListing {
+  projects: Array<{ id: string; name: string; status: string; trashedAt: string }>;
+  tasks: Array<{ id: string; title: string; state: string; projectId: string; projectName: string; trashedAt: string }>;
+}

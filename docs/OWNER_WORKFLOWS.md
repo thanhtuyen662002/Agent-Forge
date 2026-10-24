@@ -96,9 +96,58 @@ The renderer (`src/ui/agentRoster.ts`) only treats a reply as saved when it is
 an explicit success envelope that carries the persisted agent. Malformed
 replies show an error and are not counted as success.
 
+## Projects and tasks: search, trash and restore
+
+**Projects** lists every active project with a search box (case- and
+accent-insensitive, so `lap trinh` finds `Lập trình`). Each row has **Open**
+and **Move to trash**. **Task Board** has the same search over task titles and
+IDs, and a **Move to trash** control on tasks that are eligible.
+
+Moving to the trash asks for confirmation and runs one immediate transaction
+in `WorkspaceManagementService`:
+
+- A row is added to `workspace_trash` (migration 027). Nothing else is
+  deleted: the project or task row, its events, evidence, attempts and the
+  repository on disk are untouched. A `PROJECT_TRASHED` / `TASK_TRASHED`
+  event is recorded.
+- Every still-`AUTHORIZED` execution authorization of the task (or of every
+  task in the project) is set to `INVALIDATED`. The dispatch claim only
+  accepts `AUTHORIZED`, so approved work cannot start after trashing, and
+  restoring does not bring it back; approve again if needed.
+
+A task can be trashed only in `CREATED`, `PLANNED`, `DONE`, `FAILED` or
+`CANCELLED`. A queued or active task could still be picked up by the runtime,
+so it is refused with the reason. Trash is also refused while the task has an
+unreleased task lease, an `ASSIGNED`/`RUNNING` assignment, an execution whose
+adapter started and has not finished, or an agent working on it. A project is
+refused while it is `RUNNING`, `FINAL_REVIEW` or `WAITING_FOR_CAPACITY`, or
+while any of its tasks has one of these blockers; every blocker is listed.
+
+Trashed items leave `project:list` and `task:list` (tasks of a trashed project
+are hidden too). If the selected project is trashed, the app selects the first
+remaining project. **Show trash** lists trashed items with **Restore**.
+Restoring a project brings back its tasks, except tasks that were trashed on
+their own; a task cannot be restored while its project is in the trash.
+
+These IPC channels refuse a trashed project or task with
+`ENTITY_IN_TRASH` before their handler runs: `project:importContract`,
+`project:transition`, `task:create`, `task:startReview`, `protocol:apply`,
+`protocol:generateWorkOrder`, `protocol:generateReviewPackage`,
+`verification:runTests`, `verification:saveCommands`, `routing:routeTask`,
+`routing:authorizeTask`, `routing:dispatchAuthorization` and
+`routing:generateAuthorizedWorkOrder`. `ProviderDispatchService` also checks
+the trash before claiming an authorization.
+
+| Channel | Payload | Reply |
+| --- | --- | --- |
+| `trash:list` | none | `{ projects, tasks }` |
+| `trash:project` / `trash:restoreProject` | `{ projectId }` | `{ success: true, entityType, entityId, invalidatedAuthorizations }` or `{ success: false, errorCode, error, blockers? }` |
+| `trash:task` / `trash:restoreTask` | `{ taskId }` | same |
+
+There is no permanent delete.
+
 ## Not yet covered by this slice of Issue #225
 
-- Trash and restore for projects and tasks, and search.
 - Natural-text project goal/constraint input instead of JSON contracts.
 - A desktop Start/Pause control wired to the bounded execution runtime.
 - Automatic quota refresh and Codex device-code sign-in.

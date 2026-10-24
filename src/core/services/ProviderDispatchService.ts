@@ -325,6 +325,18 @@ export class ProviderDispatchService {
       };
     }
 
+    // Owner trash: trashing already invalidated AUTHORIZED rows, so the claim CAS
+    // below would also reject. Fail early and explicitly for any surviving row.
+    if (this.repo.isTaskTrashed(task.id)) {
+      this.repo.invalidateExecutionAuthorization(auth.id);
+      this.recordRejectionEvent(auth, `Task "${auth.task_id}" or its project is in the owner trash.`);
+      return {
+        executionId,
+        status: 'FAILED',
+        error: `EXECUTION_AUTHORIZATION_TASK_TRASHED: Task "${auth.task_id}" or its project is in the owner trash.`,
+      };
+    }
+
     // Capture owner/task identity before the first external Git/provider await.
     if (auth.lifecycle_version == null) {
       nonHandoffClaim = this.nonHandoffLifecycle.capture(auth, executionId, this.nonHandoffTimeoutMs);

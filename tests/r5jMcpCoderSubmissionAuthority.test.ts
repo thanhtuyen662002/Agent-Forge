@@ -4280,11 +4280,11 @@ SELECT * FROM users WHERE id = 1;`;
       expect(typeof fixtures.service.getSubmissionStatus).toBe('function');
     });
 
-    it('39. Migration count remains exactly 27 and appends the agent roster migration', () => {
+    it('39. Migration count remains exactly 27 and appends the owner workspace lifecycle migration', () => {
       expect(MIGRATIONS).toHaveLength(27);
       expect(MIGRATIONS[MIGRATIONS.length - 1].version).toBe(27);
       expect(MIGRATIONS[MIGRATIONS.length - 1].name).toBe(
-        'agent_roster_lifecycle'
+        'owner_workspace_lifecycle'
       );
       expect(MIGRATIONS[25].name).toBe('selected_project_repository_identities');
       expect(MIGRATIONS[24]).toMatchObject({ version: 25, name: 'durable_owner_verification_capabilities' });

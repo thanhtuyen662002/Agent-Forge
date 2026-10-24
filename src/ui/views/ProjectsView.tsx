@@ -1,12 +1,16 @@
-import React, { useState } from 'react';
+import React, { useMemo, useState } from 'react';
 import { useOrchestrator } from '../context/OrchestratorContext';
 import { useI18n } from '../context/I18nContext';
-import { FolderGit2, Plus, FileCode, FolderOpen } from 'lucide-react';
+import { FolderGit2, Plus, FileCode, FolderOpen, Search, Trash2 } from 'lucide-react';
 import { uiActionFailureKey } from '../actionState';
 import { AccessibleDialog } from '../components/AccessibleDialog';
+import { ConfirmTrashDialog, TrashFailureMessage, TrashList } from '../components/TrashPanel';
+import { matchesSearch, useWorkspaceTrash } from '../workspaceTrash';
+import type { TrashActionResult } from '../workspaceTrash';
+import type { Project } from '../../core/types/domain';
 
 export const ProjectsView: React.FC = () => {
-  const { projects, activeProject, createProject, importContract, isElectron, pendingActions, refreshData } = useOrchestrator();
+  const { projects, activeProject, setActiveProject, createProject, importContract, isElectron, pendingActions, refreshData } = useOrchestrator();
   const { t } = useI18n();
   const [isCreateOpen, setIsCreateOpen] = useState<boolean>(false);
   const [name, setName] = useState<string>('');
@@ -20,6 +24,36 @@ export const ProjectsView: React.FC = () => {
   const [binding, setBinding] = useState(false);
   const [bindingResult, setBindingResult] = useState<{ projectId: string; success: boolean; message: string } | null>(null);
   const creating = pendingActions.includes('createProject');
+  const trash = useWorkspaceTrash(refreshData);
+  const [projectQuery, setProjectQuery] = useState('');
+  const [showTrash, setShowTrash] = useState(false);
+  const [trashTarget, setTrashTarget] = useState<Project | null>(null);
+  const [trashFailure, setTrashFailure] = useState<TrashActionResult | null>(null);
+  const [trashNotice, setTrashNotice] = useState<{ ok: boolean; message: string; failure?: TrashActionResult } | null>(null);
+  const visibleProjects = useMemo(
+    () => projects.filter((project) => matchesSearch(projectQuery, project.name, project.description, project.id)),
+    [projects, projectQuery],
+  );
+
+  const confirmTrashProject = async () => {
+    if (!trashTarget) return;
+    const result = await trash.trashProject(trashTarget.id);
+    if (result.success) {
+      const extra = result.invalidatedAuthorizations > 0 ? ` ${t('trash.results.invalidated', { count: result.invalidatedAuthorizations })}` : '';
+      setTrashNotice({ ok: true, message: t('trash.results.projectTrashed', { name: trashTarget.name }) + extra });
+      setTrashTarget(null);
+      setTrashFailure(null);
+    } else {
+      setTrashFailure(result);
+    }
+  };
+
+  const restoreProject = async (projectId: string, name: string) => {
+    const result = await trash.restoreProject(projectId);
+    setTrashNotice(result.success
+      ? { ok: true, message: t('trash.results.projectRestored', { name }) }
+      : { ok: false, message: '', failure: result });
+  };
   const importing = pendingActions.includes('importContract');
 
   const handleBindRepository = async () => {
@@ -156,6 +190,91 @@ export const ProjectsView: React.FC = () => {
           <span>{t('projects.newProject')}</span>
         </button>
       </div>
+
+      <section aria-labelledby="project-list-title" className="bg-surface-card border border-surface-border rounded-xl p-6 space-y-4">
+        <div className="flex flex-wrap items-center justify-between gap-3">
+          <h3 id="project-list-title" className="text-sm font-semibold text-white">{t('trash.projectListTitle')}</h3>
+          <button
+            type="button"
+            onClick={() => setShowTrash((value) => !value)}
+            disabled={!trash.available}
+            aria-expanded={showTrash}
+            className="px-3 py-1.5 rounded-lg text-xs border border-surface-border text-slate-300 hover:bg-surface-border disabled:opacity-40 flex items-center gap-1.5"
+          >
+            <Trash2 className="w-3.5 h-3.5" aria-hidden="true" />
+            <span>{showTrash ? t('trash.hideTrash') : t('trash.showTrash')} ({trash.listing.projects.length})</span>
+          </button>
+        </div>
+        <label className="relative block">
+          <span className="sr-only">{t('trash.projectSearch')}</span>
+          <Search className="w-4 h-4 text-slate-500 absolute left-3 top-1/2 -translate-y-1/2" aria-hidden="true" />
+          <input
+            type="search"
+            value={projectQuery}
+            onChange={(event) => setProjectQuery(event.target.value)}
+            placeholder={t('trash.projectSearchPlaceholder')}
+            className="w-full bg-surface border border-surface-border rounded-lg pl-9 pr-3 py-2 text-sm text-white focus:outline-none focus:border-forge-cyan"
+          />
+        </label>
+        {trashNotice && (trashNotice.ok
+          ? <p role="status" className="text-xs text-emerald-300">{trashNotice.message}</p>
+          : trashNotice.failure && <TrashFailureMessage result={trashNotice.failure} />)}
+        {projects.length === 0 ? (
+          <p className="text-xs text-slate-500">{t('trash.noProjects')}</p>
+        ) : visibleProjects.length === 0 ? (
+          <p className="text-xs text-slate-500">{t('trash.noMatches')}</p>
+        ) : (
+          <ul className="divide-y divide-surface-border" aria-label={t('trash.projectListTitle')}>
+            {visibleProjects.map((project) => {
+              const selected = activeProject?.id === project.id;
+              return (
+                <li key={project.id} className="py-2.5 flex items-center justify-between gap-3">
+                  <div className="min-w-0">
+                    <div className="text-sm text-slate-100 truncate" title={project.name}>{project.name}</div>
+                    <div className="text-[11px] text-slate-500 truncate">{project.status}{project.description ? ` · ${project.description}` : ''}</div>
+                  </div>
+                  <div className="flex items-center gap-2 shrink-0">
+                    {selected ? (
+                      <span className="px-2 py-1 rounded-md text-[11px] bg-forge-cyan/15 text-forge-cyan">{t('trash.selected')}</span>
+                    ) : (
+                      <button type="button" onClick={() => setActiveProject(project)}
+                        className="px-3 py-1.5 rounded-lg text-xs border border-surface-border text-slate-200 hover:bg-surface-border">
+                        {t('trash.open')}
+                      </button>
+                    )}
+                    <button
+                      type="button"
+                      onClick={() => { setTrashFailure(null); setTrashTarget(project); }}
+                      disabled={!trash.available || trash.pending}
+                      className="px-3 py-1.5 rounded-lg text-xs bg-rose-950/40 border border-rose-800/60 text-rose-300 hover:bg-rose-900/40 disabled:opacity-40 flex items-center gap-1.5"
+                    >
+                      <Trash2 className="w-3.5 h-3.5" aria-hidden="true" />
+                      <span>{t('trash.moveToTrash')}</span>
+                    </button>
+                  </div>
+                </li>
+              );
+            })}
+          </ul>
+        )}
+      </section>
+
+      {showTrash && (
+        trash.loadFailed
+          ? <p role="alert" className="text-xs text-rose-300">{t('trash.loadFailed')}</p>
+          : <TrashList listing={trash.listing} show="projects" pending={trash.pending} onRestoreProject={(id, name) => void restoreProject(id, name)} />
+      )}
+
+      {trashTarget && (
+        <ConfirmTrashDialog
+          kind="project"
+          name={trashTarget.name}
+          pending={trash.pending}
+          failure={trashFailure}
+          onCancel={() => setTrashTarget(null)}
+          onConfirm={() => void confirmTrashProject()}
+        />
+      )}
 
       {activeProject && (
         <section aria-labelledby="repository-binding-title" className="bg-surface-card border border-surface-border rounded-xl p-6 space-y-3">

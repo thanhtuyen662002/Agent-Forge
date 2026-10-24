@@ -263,9 +263,10 @@ export const OrchestratorProvider: React.FC<{ children: React.ReactNode }> = ({ 
       if (!Array.isArray(projList)) throw new Error('INVALID_REFRESH_RESPONSE');
       if (!isCurrentRequest() || !selectionUnchanged()) return;
 
-      const currentProj = (requestedProjectId
-        ? projList.find((project: Project) => project.id === requestedProjectId)
-        : projList[0]) || null;
+      // A selected project that left the active list (for example, moved to the
+      // trash) falls back to the first remaining project instead of a blank view.
+      const reconciledProjectId = reconcileSelectedId(requestedProjectId ?? null, projList);
+      const currentProj = projList.find((project: Project) => project.id === reconciledProjectId) || null;
       setProjects(projList);
       setActiveProject(currentProj);
 
