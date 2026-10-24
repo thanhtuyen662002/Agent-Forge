@@ -1,4 +1,4 @@
-import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -192,6 +192,28 @@ describe('desktop automation runtime', () => {
     expect(statusOf()).toMatchObject({ phase: 'WAITING_FOR_CAPACITY', taskId: task.id });
     expect(adapterCalls).toBe(0);
   });
+
+  it.runIf(process.platform === 'win32')('releases attempt and assignment when dispatch itself invalidates the authorization', async () => {
+    const created = addCodexCoder();
+    verify(created);
+    const task = await approvedTask();
+    const accountId = repo.getProviderResource(created.success ? created.agent.provider_resource_id! : '')!.provider_account_id!;
+    // The task moves on right after authorization (lease still succeeds): dispatch rejects the
+    // stale authorization and INVALIDATES it before any claim.
+    void accountId;
+    const original = repo.createExecutionAuthorization.bind(repo);
+    vi.spyOn(repo, 'createExecutionAuthorization').mockImplementation((auth) => {
+      original(auth);
+      db.prepare('UPDATE tasks SET revision_count = revision_count + 1 WHERE id = ?').run(auth.task_id);
+    });
+    await service.tick();
+    await service.drain();
+
+    expect(adapterCalls).toBe(0);
+    expect(repo.getExecutionAuthorizationsByTask(task.id).map((a) => a.status)).toEqual(['INVALIDATED']);
+    expect(repo.getAgentAssignmentsByTask(task.id).map((a) => a.status)).toEqual(['FAILED']);
+    expect(repo.getTaskAttemptsByTask(task.id).map((a) => a.status)).toEqual(['FAILED']);
+  }, 60_000);
 
   it.runIf(process.platform === 'win32')('runs the real product chain once and then waits for review', async () => {
     verify(addCodexCoder());

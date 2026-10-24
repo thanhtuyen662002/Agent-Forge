@@ -295,11 +295,12 @@ export class DesktopAutomationService {
     const releaseUnclaimed = () => {
       if (authorizationId) {
         const current = this.repo.getExecutionAuthorization(authorizationId);
-        // AUTHORIZED, or DISPATCHED but rejected before the adapter start claim:
-        // nothing ran, so expire it. A started execution belongs to settlement/recovery.
-        if (!current || current.adapter_started_at || current.settled_at ||
-            (current.status !== 'AUTHORIZED' && current.status !== 'DISPATCHED')) return;
-        this.repo.expireUnstartedProductAuthorization(authorizationId);
+        // A started or settled execution belongs to settlement and recovery.
+        if (!current || current.adapter_started_at || current.settled_at) return;
+        // AUTHORIZED, or DISPATCHED but rejected before the adapter start claim: nothing
+        // ran, so expire it. Dispatch may already have INVALIDATED it; either way the
+        // attempt and assignment below must be released too.
+        if (current.status === 'AUTHORIZED' || current.status === 'DISPATCHED') this.repo.expireUnstartedProductAuthorization(authorizationId);
       }
       if (assignmentId) this.repo.endUnleasedAgentAssignment(assignmentId, 'FAILED', this.now());
       endAttempt('FAILED');
