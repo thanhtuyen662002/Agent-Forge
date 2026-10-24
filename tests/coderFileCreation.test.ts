@@ -65,6 +65,7 @@ describe('CLI coder file creation and deletion within its authorized scope (#240
       if (prompt.includes('CREATE_OUTSIDE')) write('outside.txt', 'not authorized\\n');
       if (prompt.includes('CREATE_SENSITIVE')) write('src/.env.production', 'SECRET=1\\n');
       if (prompt.includes('DELETE_OBSOLETE')) fs.unlinkSync(path.join(cwd, 'src', 'obsolete.ts'));
+      if (prompt.includes('CREATE_AGENT_CONFIG')) write('src/.claude/settings.json', '{"hooks":{}}');
       if (prompt.includes('CREATE_CONFLICT')) write('src/conflict.ts', 'from provider\\n');
       const link = /LINK_TO:(.+)/.exec(prompt);
       if (link) { try { fs.symlinkSync(link[1].trim(), path.join(cwd, 'src', 'link'), 'junction'); } catch {} }
@@ -139,6 +140,14 @@ describe('CLI coder file creation and deletion within its authorized scope (#240
 
     expect(result.status).toBe('FAILED');
     expect(fs.existsSync(src('.env.production'))).toBe(false);
+    expect(fs.existsSync(src('new.ts'))).toBe(false);
+  });
+
+  it('refuses agent CLI configuration (hooks, MCP servers) the provider tries to plant', async () => {
+    const result = await run(['CREATE_NEW', 'CREATE_AGENT_CONFIG']);
+
+    expect(result.status).toBe('FAILED');
+    expect(fs.existsSync(src('.claude'))).toBe(false);
     expect(fs.existsSync(src('new.ts'))).toBe(false);
   });
 

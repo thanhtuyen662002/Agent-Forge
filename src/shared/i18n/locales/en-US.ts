@@ -527,7 +527,7 @@ export const enUS: TranslationDictionary = {
       NOT_SIGNED_IN: 'Not signed in yet. Finish the sign-in window first.',
       NOT_A_SUBSCRIPTION_LOGIN: 'This profile uses an API key, not a subscription login. Sign in with your Claude account instead.',
       VERIFY_FAILED: 'The CLI check did not finish. Make sure the CLI is installed, then try again.',
-      ALREADY_IN_USE: 'Signed in. The account already has recorded activity, so its current status is kept.',
+      ALREADY_IN_USE: 'The CLI is signed in, but this account has recorded activity or a failure (for example an expired login), so its status was not changed.',
     },
     errors: {
       ACCOUNT_NOT_FOUND: 'This agent’s account was not found.',

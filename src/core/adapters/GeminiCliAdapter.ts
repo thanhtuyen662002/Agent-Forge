@@ -70,7 +70,8 @@ export class GeminiCliAdapter extends LocalCliAdapterBase {
   }
 
   public async getCapabilities(): Promise<Capability[]> {
-    return ['CODING', 'FILESYSTEM_EDIT', 'TEST_EXECUTION', 'TERMINAL', 'REVIEW', 'PLANNING'];
+    // Headless auto_edit / plan deny shell tools, so no TERMINAL or TEST_EXECUTION.
+    return ['CODING', 'FILESYSTEM_EDIT', 'REVIEW', 'PLANNING'];
   }
 
   public override async getHealth(): Promise<ProviderHealthStatus> {

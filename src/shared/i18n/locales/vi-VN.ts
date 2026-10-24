@@ -527,7 +527,7 @@ export const viVN: TranslationDictionary = {
       NOT_SIGNED_IN: 'Chưa đăng nhập. Hãy hoàn tất cửa sổ đăng nhập trước.',
       NOT_A_SUBSCRIPTION_LOGIN: 'Hồ sơ này dùng API key, không phải đăng nhập gói thuê bao. Hãy đăng nhập bằng tài khoản Claude.',
       VERIFY_FAILED: 'Bước kiểm tra của CLI không hoàn tất. Hãy chắc CLI đã được cài, rồi thử lại.',
-      ALREADY_IN_USE: 'Đã đăng nhập. Tài khoản đã có hoạt động trước đó nên giữ nguyên trạng thái hiện tại.',
+      ALREADY_IN_USE: 'CLI đã đăng nhập, nhưng tài khoản này đã có hoạt động hoặc lỗi trước đó (ví dụ đăng nhập hết hạn) nên trạng thái chưa được đổi.',
     },
     errors: {
       ACCOUNT_NOT_FOUND: 'Không tìm thấy tài khoản của tác tử này.',

@@ -50,7 +50,8 @@ export class ClaudeCodeCliAdapter extends LocalCliAdapterBase {
   }
 
   public async getCapabilities(): Promise<Capability[]> {
-    return ['CODING', 'FILESYSTEM_EDIT', 'TEST_EXECUTION', 'REVIEW', 'PLANNING'];
+    // No TEST_EXECUTION: the coder has no shell tool.
+    return ['CODING', 'FILESYSTEM_EDIT', 'REVIEW', 'PLANNING'];
   }
 
   public override async getHealth(): Promise<ProviderHealthStatus> {
@@ -78,6 +79,8 @@ export class ClaudeCodeCliAdapter extends LocalCliAdapterBase {
     return [
       '-p', '--output-format', 'json', '--model', request.runtimeBinding?.modelName ?? '',
       '--max-turns', String(this.#maxTurns), '--no-session-persistence',
+      // Only the account profile's own settings; never project settings, hooks or MCP servers from the workspace.
+      '--setting-sources', 'user', '--strict-mcp-config',
       ...(readOnly
         ? ['--permission-mode', 'dontAsk', '--tools', READ_ONLY_TOOLS.join(',')]
         : ['--permission-mode', 'acceptEdits', '--tools', CODER_TOOLS.join(',')]),
@@ -95,7 +98,10 @@ export class ClaudeCodeCliAdapter extends LocalCliAdapterBase {
     _request: AgentExecutionRequest,
     result: ProcessRunResult,
   ): { errorCode: RuntimeErrorCode; error: string } | null {
-    return classifyClaudeFailure(`${parseClaudeResult(result.stdout)?.result ?? ''}\n${result.stdout}\n${result.stderr}`);
+    // Only the CLI's own error text: never the model's free text or JSON numbers on a successful-looking result.
+    const parsed = parseClaudeResult(result.stdout);
+    const errorText = parsed?.is_error === true && typeof parsed.result === 'string' ? parsed.result : '';
+    return classifyClaudeFailure(`${errorText}\n${result.stderr}`);
   }
 
   public override async execute(request: AgentExecutionRequest): Promise<AgentExecutionResult> {
@@ -138,11 +144,11 @@ export function parseClaudeResult(stdout: string): { result?: unknown; is_error?
 
 /** Documented Claude Code error texts (code.claude.com/docs/en/errors). Wording may change; unknown stays unclassified. */
 export function classifyClaudeFailure(text: string): { errorCode: RuntimeErrorCode; error: string } | null {
-  if (/not logged in|login expired|please run \/login|failed to authenticate|invalid api key|invalid authentication credentials|401/i.test(text)) {
+  if (/not logged in|login expired|please run \/login|failed to authenticate|invalid api key|invalid authentication credentials|api error: 401\b/i.test(text)) {
     return { errorCode: 'AUTH_ERROR', error: 'Claude Code is not signed in for this profile, or the login expired.' };
   }
   const limit = /you['’]ve hit your (?:session|weekly|opus|sonnet)?\s*limit(?:[^\n]*?resets ([^\n"]+))?/i.exec(text);
-  if (limit || /request rejected \(429\)|usage limit|rate limit/i.test(text)) {
+  if (limit || /request rejected \(429\)|api error: 429\b|monthly spend limit/i.test(text)) {
     return { errorCode: 'QUOTA_EXHAUSTED', error: limit?.[1] ? `Claude Code usage limit reached; resets ${limit[1].trim()}.` : 'Claude Code usage limit reached.' };
   }
   return null;

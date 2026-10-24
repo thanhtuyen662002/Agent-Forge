@@ -6,63 +6,55 @@ import { NativeProfileResolver } from '../credentials/NativeProfileResolver';
 import type { Repository } from '../database/repositories';
 import { AccountHealthService } from './AccountHealthService';
 import { buildTrustedEnvironment, resolveTrustedExecutable } from './ExecutableResolver';
+import { ProcessRunner } from './ProcessRunner';
 
 export type CliSignInErrorCode =
   | 'ACCOUNT_NOT_FOUND' | 'NOT_A_SUPPORTED_CLI_ACCOUNT' | 'PROFILE_UNAVAILABLE' | 'CLI_UNAVAILABLE' | 'UNSUPPORTED_PLATFORM';
 
 export type CliVerifyReason = 'VERIFIED' | 'NOT_SIGNED_IN' | 'NOT_A_SUBSCRIPTION_LOGIN' | 'VERIFY_FAILED' | 'ALREADY_IN_USE';
 
+type ProfileEnvKey = 'CLAUDE_CONFIG_DIR' | 'GEMINI_CLI_HOME';
+
 interface CliDriver {
   label: string;
   profileProvider: 'claude' | 'gemini';
-  envKey: 'CLAUDE_CONFIG_DIR' | 'GEMINI_CLI_HOME';
-  executableName: string;
+  envKey: ProfileEnvKey;
   loginArgs: string[];
-  verify: (run: CliRunner, executable: string, env: NodeJS.ProcessEnv, profileDirectory: string) => Promise<CliVerifyReason>;
+  verify: (check: (args: string[], timeoutMs: number) => Promise<CliRunResult>, profileDirectory: string) => Promise<CliVerifyReason>;
 }
 
 export interface CliRunResult { exitCode: number | null; stdout: string }
 export interface CliRunner {
-  /** Runs a short, non-interactive check and captures bounded stdout. */
-  run(executable: string, args: string[], env: NodeJS.ProcessEnv, timeoutMs: number): Promise<CliRunResult>;
+  /** Runs a short, non-interactive check in `cwd` with only the profile variable added to a minimal environment. */
+  run(executable: string, args: string[], profileEnv: Record<string, string>, cwd: string, timeoutMs: number): Promise<CliRunResult>;
   /** Opens a visible terminal where the owner completes the CLI's own browser sign-in. */
-  openTerminal(executable: string, args: string[], env: NodeJS.ProcessEnv): void;
+  openTerminal(executable: string, args: string[], profileEnv: Record<string, string>, cwd: string): void;
 }
 
-const MAX_OUTPUT_BYTES = 256 * 1024;
 /** A path that can be placed inside a cmd.exe command line without any interpretation. */
-const SAFE_WINDOWS_PATH = /^[A-Za-z]:\\[^"&|<>^%!\r\n]*$/;
+const SAFE_WINDOWS_PATH = /^[A-Za-z]:\\[^"&|<>^%!\r\n]*[^"&|<>^%!\r\n\\]$/;
 
 export class NodeCliRunner implements CliRunner {
-  public run(executable: string, args: string[], env: NodeJS.ProcessEnv, timeoutMs: number): Promise<CliRunResult> {
-    return new Promise((resolve) => {
-      let stdout = '';
-      let bytes = 0;
-      let settled = false;
-      const done = (result: CliRunResult) => { if (!settled) { settled = true; clearTimeout(timer); resolve(result); } };
-      let child: ReturnType<typeof spawn>;
-      try {
-        child = spawn(executable, args, { env, cwd: os.tmpdir(), shell: false, windowsHide: true, stdio: ['ignore', 'pipe', 'ignore'] });
-      } catch {
-        resolve({ exitCode: null, stdout: '' });
-        return;
-      }
-      const timer = setTimeout(() => { try { child.kill(); } catch { /* already gone */ } done({ exitCode: null, stdout }); }, timeoutMs);
-      child.stdout?.on('data', (chunk: Buffer) => {
-        bytes += chunk.length;
-        if (bytes <= MAX_OUTPUT_BYTES) stdout += chunk.toString('utf8');
-      });
-      child.on('error', () => done({ exitCode: null, stdout }));
-      child.on('close', (code) => done({ exitCode: code, stdout }));
+  public async run(executable: string, args: string[], profileEnv: Record<string, string>, cwd: string, timeoutMs: number): Promise<CliRunResult> {
+    // ProcessRunner: minimal environment, trusted cmd.exe for .cmd shims, no shell, bounded output, no durable rows.
+    const result = await ProcessRunner.execute({
+      executable, args, cwd, timeoutMs, env: profileEnv, allowedEnvKeys: Object.keys(profileEnv), allowShell: false,
+      maxStdoutBytes: 256 * 1024, maxStderrBytes: 64 * 1024, deferPersistence: true,
     });
+    return { exitCode: result.timedOut || result.cancelled ? null : result.exitCode, stdout: result.stdout };
   }
 
-  public openTerminal(executable: string, args: string[], env: NodeJS.ProcessEnv): void {
+  public openTerminal(executable: string, args: string[], profileEnv: Record<string, string>, cwd: string): void {
     if (process.platform !== 'win32') throw new Error('UNSUPPORTED_PLATFORM');
-    if (!SAFE_WINDOWS_PATH.test(executable) || args.some((arg) => !/^[a-z-]+$/i.test(arg))) throw new Error('UNSAFE_COMMAND');
-    // cmd.exe /d /c start "<title>" cmd.exe /k ""<exe>" <args>": every part is validated above.
-    const command = `/d /c start "Agent Forge sign-in" cmd.exe /k ""${executable}"${args.length ? ` ${args.join(' ')}` : ''}"`;
-    const child = spawn('cmd.exe', [command], { env, cwd: os.tmpdir(), shell: false, detached: true, stdio: 'ignore', windowsVerbatimArguments: true });
+    // Never a cmd.exe found through cwd or PATH, and no AutoRun commands (/d) in either shell.
+    const cmd = resolveTrustedExecutable('cmd', 'cmd', { env: process.env });
+    if (!cmd || !SAFE_WINDOWS_PATH.test(cmd) || !SAFE_WINDOWS_PATH.test(executable) || args.some((arg) => !/^[a-z-]+$/i.test(arg))) {
+      throw new Error('UNSAFE_COMMAND');
+    }
+    // cmd /d /c start "<title>" "<cmd>" /d /k ""<cli>" <args>": every part is validated above.
+    const command = `/d /c start "Agent Forge sign-in" "${cmd}" /d /k ""${executable}"${args.length ? ` ${args.join(' ')}` : ''}"`;
+    const env = buildTrustedEnvironment({ allowedEnvKeys: Object.keys(profileEnv), customEnv: profileEnv });
+    const child = spawn(cmd, [command], { env, cwd, shell: false, detached: true, stdio: 'ignore', windowsVerbatimArguments: true });
     child.on('error', () => undefined);
     child.unref();
   }
@@ -70,10 +62,10 @@ export class NodeCliRunner implements CliRunner {
 
 const DRIVERS: Record<string, CliDriver> = {
   'prov-claude-code-cli': {
-    label: 'Claude Code', profileProvider: 'claude', envKey: 'CLAUDE_CONFIG_DIR', executableName: 'claude', loginArgs: ['auth', 'login'],
+    label: 'Claude Code', profileProvider: 'claude', envKey: 'CLAUDE_CONFIG_DIR', loginArgs: ['auth', 'login'],
     // `claude auth status` prints JSON and exits 0 when signed in, 1 when not.
-    async verify(run, executable, env) {
-      const result = await run.run(executable, ['auth', 'status'], env, 30_000);
+    async verify(check) {
+      const result = await check(['auth', 'status'], 30_000);
       if (result.exitCode === 1) return 'NOT_SIGNED_IN';
       if (result.exitCode !== 0) return 'VERIFY_FAILED';
       try {
@@ -86,11 +78,11 @@ const DRIVERS: Record<string, CliDriver> = {
     },
   },
   'prov-gemini-cli': {
-    label: 'Gemini', profileProvider: 'gemini', envKey: 'GEMINI_CLI_HOME', executableName: 'gemini', loginArgs: [],
+    label: 'Gemini', profileProvider: 'gemini', envKey: 'GEMINI_CLI_HOME', loginArgs: [],
     // Headless Gemini exits 41 without a cached login; a minimal read-only prompt proves the login works.
-    async verify(run, executable, env, profileDirectory) {
+    async verify(check, profileDirectory) {
       if (!fs.existsSync(path.join(profileDirectory, '.gemini', 'oauth_creds.json'))) return 'NOT_SIGNED_IN'; // Presence only; never read.
-      const result = await run.run(executable, ['-p', 'Reply with the single word OK.', '-o', 'json', '--approval-mode', 'plan'], env, 90_000);
+      const result = await check(['-p', 'Reply with the single word OK.', '-o', 'json', '--approval-mode', 'plan'], 90_000);
       if (result.exitCode === 0) return 'VERIFIED';
       return result.exitCode === 41 ? 'NOT_SIGNED_IN' : 'VERIFY_FAILED';
     },
@@ -99,7 +91,8 @@ const DRIVERS: Record<string, CliDriver> = {
 
 export interface CliAccountConnectionOptions {
   runner?: CliRunner;
-  resolveExecutable?: (name: string) => string | null;
+  /** The executable the provider's adapter runs, so the check proves exactly that binary. */
+  executableFor: (providerId: string) => string | null;
   profileResolver?: Pick<NativeProfileResolver, 'resolve'>;
   onVerified?: (accountId: string) => void | Promise<void>;
 }
@@ -108,25 +101,26 @@ export interface CliAccountConnectionOptions {
  * In-app sign-in for Claude Code and Gemini CLI accounts (#242). The owner
  * signs in through the CLI's own browser flow in a terminal opened with the
  * account's isolated profile (`CLAUDE_CONFIG_DIR` / `GEMINI_CLI_HOME`); only
- * the CLI handles credentials. Verification runs the CLI's own check and, when
- * it proves a signed-in profile, initializes the never-used account through
- * the single health writer.
+ * the CLI handles credentials. Verification runs the CLI's own check with the
+ * adapter's executable from an empty private directory and, when it proves a
+ * signed-in profile, initializes the never-used account through the single
+ * health writer.
  */
 export class CliAccountConnectionService {
   private readonly runner: CliRunner;
-  private readonly resolveExecutable: (name: string) => string | null;
+  private readonly executableFor: (providerId: string) => string | null;
   private readonly profileResolver: Pick<NativeProfileResolver, 'resolve'>;
   private readonly onVerified: CliAccountConnectionOptions['onVerified'];
 
-  constructor(private readonly repo: Repository, options: CliAccountConnectionOptions = {}) {
+  constructor(private readonly repo: Repository, options: CliAccountConnectionOptions) {
     this.runner = options.runner ?? new NodeCliRunner();
-    this.resolveExecutable = options.resolveExecutable ?? ((name) => resolveTrustedExecutable(name, 'generic'));
+    this.executableFor = options.executableFor;
     this.profileResolver = options.profileResolver ?? new NativeProfileResolver();
     this.onVerified = options.onVerified;
   }
 
   private prepare(accountId: string):
-    { ok: true; driver: CliDriver; executable: string; env: NodeJS.ProcessEnv; profileDirectory: string; profileRef: string; providerId: string } |
+    { ok: true; driver: CliDriver; executable: string; profileEnv: Record<string, string>; profileDirectory: string; profileRef: string; providerId: string } |
     { ok: false; errorCode: CliSignInErrorCode } {
     const account = this.repo.getProviderAccount(accountId);
     if (!account || !account.enabled) return { ok: false, errorCode: 'ACCOUNT_NOT_FOUND' };
@@ -143,10 +137,9 @@ export class CliAccountConnectionService {
     } catch {
       return { ok: false, errorCode: 'PROFILE_UNAVAILABLE' };
     }
-    const executable = this.resolveExecutable(driver.executableName);
-    if (!executable || (process.platform === 'win32' && /\.(cmd|bat)$/i.test(executable))) return { ok: false, errorCode: 'CLI_UNAVAILABLE' };
-    const env = buildTrustedEnvironment({ allowedEnvKeys: [driver.envKey], customEnv: { [driver.envKey]: profileDirectory } });
-    return { ok: true, driver, executable, env, profileDirectory, profileRef: account.profile_ref, providerId: account.provider_id };
+    const executable = this.executableFor(account.provider_id);
+    if (!executable || !path.isAbsolute(executable) || !fs.existsSync(executable)) return { ok: false, errorCode: 'CLI_UNAVAILABLE' };
+    return { ok: true, driver, executable, profileEnv: { [driver.envKey]: profileDirectory }, profileDirectory, profileRef: account.profile_ref, providerId: account.provider_id };
   }
 
   /** Opens the CLI's sign-in in a terminal bound to this account's profile. */
@@ -154,7 +147,7 @@ export class CliAccountConnectionService {
     const prepared = this.prepare(accountId);
     if (!prepared.ok) return { success: false, errorCode: prepared.errorCode };
     try {
-      this.runner.openTerminal(prepared.executable, prepared.driver.loginArgs, prepared.env);
+      this.runner.openTerminal(prepared.executable, prepared.driver.loginArgs, prepared.profileEnv, prepared.profileDirectory);
     } catch (error) {
       return { success: false, errorCode: error instanceof Error && error.message === 'UNSUPPORTED_PLATFORM' ? 'UNSUPPORTED_PLATFORM' : 'CLI_UNAVAILABLE' };
     }
@@ -165,19 +158,30 @@ export class CliAccountConnectionService {
   public async verify(accountId: string): Promise<{ success: true; verified: boolean; reasonCode: CliVerifyReason } | { success: false; errorCode: CliSignInErrorCode }> {
     const prepared = this.prepare(accountId);
     if (!prepared.ok) return { success: false, errorCode: prepared.errorCode };
+    // An empty private directory, so no project files near the check are loaded.
+    const cwd = fs.mkdtempSync(path.join(os.tmpdir(), 'agent-forge-cli-check-'));
     let reason: CliVerifyReason;
     try {
-      reason = await prepared.driver.verify(this.runner, prepared.executable, prepared.env, prepared.profileDirectory);
+      reason = await prepared.driver.verify(
+        (args, timeoutMs) => this.runner.run(prepared.executable, args, prepared.profileEnv, cwd, timeoutMs), prepared.profileDirectory);
     } catch {
       reason = 'VERIFY_FAILED';
+    } finally {
+      try { fs.rmSync(cwd, { recursive: true, force: true }); } catch { /* best effort */ }
     }
     if (reason !== 'VERIFIED') return { success: true, verified: false, reasonCode: reason };
-    const account = this.repo.getProviderAccount(accountId);
-    if (account?.health_status === 'UNKNOWN') {
+    const health = this.repo.getProviderAccount(accountId)?.health_status;
+    if (health === 'UNKNOWN') {
       const initialized = AccountHealthService.create(this.repo)
         .initializeVerifiedAccount(accountId, { providerId: prepared.providerId, profileRef: prepared.profileRef });
-      // A routed or leased UNKNOWN account is never flipped by a sign-in check.
-      if (!initialized) return { success: true, verified: true, reasonCode: 'ALREADY_IN_USE' };
+      // A routed or leased UNKNOWN account is never flipped by a sign-in check;
+      // a concurrent check that already initialized it still counts as verified.
+      if (!initialized && this.repo.getProviderAccount(accountId)?.health_status !== 'AVAILABLE') {
+        return { success: true, verified: false, reasonCode: 'ALREADY_IN_USE' };
+      }
+    } else if (health !== 'AVAILABLE' && health !== 'LOW_QUOTA') {
+      // Recorded failures (for example AUTH_ERROR) are not cleared by a sign-in check.
+      return { success: true, verified: false, reasonCode: 'ALREADY_IN_USE' };
     }
     await this.onVerified?.(accountId);
     return { success: true, verified: true, reasonCode: 'VERIFIED' };

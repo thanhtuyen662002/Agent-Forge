@@ -108,7 +108,8 @@ describe('Claude Code CLI adapter (#242)', () => {
     expect(JSON.parse(result.outputProtocol!).protocol).toBe('coder.v1');
     const call = log();
     expect(call.argv.slice(0, 5)).toEqual(['-p', '--output-format', 'json', '--model', 'claude-sonnet-4-5']);
-    expect(call.argv).toEqual(expect.arrayContaining(['--permission-mode', 'acceptEdits', '--tools', 'Read,Edit,Write,Glob,Grep', '--no-session-persistence']));
+    expect(call.argv).toEqual(expect.arrayContaining(['--permission-mode', 'acceptEdits', '--tools', 'Read,Edit,Write,Glob,Grep', '--no-session-persistence',
+      '--setting-sources', 'user', '--strict-mcp-config']));
     expect(call.argv.join(' ')).not.toMatch(/dangerously|bypassPermissions|Bash/);
     expect(call.configDir).toBe(path.join(tmpDir, 'profiles', 'claude', 'c01'));
     expect(call.apiKeyPresent).toBe(false); // The host's API key never reaches the child.
@@ -136,6 +137,8 @@ describe('Claude Code CLI adapter (#242)', () => {
     expect(limited.error).toContain('3:45pm');
     expect(classifyClaudeFailure('Login expired · Please run /login')?.errorCode).toBe('AUTH_ERROR');
     expect(classifyClaudeFailure('Repeated 529 Overloaded errors')).toBeNull();
+    // The model's own text and JSON numbers are never classified.
+    expect(classifyClaudeFailure('I added rate limit handling; duration_ms 14013, status 401 docs')).toBeNull();
   });
 
   it('refuses a profile of another CLI or one that was never signed in', async () => {

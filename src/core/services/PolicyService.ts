@@ -131,6 +131,11 @@ export class PolicyService {
     '.aws',
     '.env',
     '.config',
+    // Agent CLI project configuration can define hooks, MCP servers or API
+    // endpoints that run commands or redirect credentials (#242).
+    '.claude',
+    '.gemini',
+    '.codex',
     'windows',
     'system32',
     'etc',
@@ -142,6 +147,7 @@ export class PolicyService {
     '.pypirc',
     '.netrc',
     '.dockerconfigjson',
+    '.mcp.json',
     'credentials',
     'credentials.json',
     'credential.json',
