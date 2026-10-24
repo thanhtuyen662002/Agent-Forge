@@ -17,9 +17,9 @@ describe('Database Migrations & Upgrade Integrity', () => {
     db.close();
   });
 
-  it('retains MCP authority at schema 26 and rejects unknown or renamed capability migrations', () => {
+  it('retains MCP authority at schema 27 and rejects unknown or renamed capability migrations', () => {
     MigrationRunner.run(db);
-    expect(db.prepare('SELECT MAX(version) AS version FROM schema_migrations').get()).toEqual({ version: 26 });
+    expect(db.prepare('SELECT MAX(version) AS version FROM schema_migrations').get()).toEqual({ version: 27 });
     for (const verify of [verifyMigration21SchemaAuthority, verifyMigration22SchemaAuthority]) {
       expect(() => verify(db)).not.toThrow();
       db.prepare("UPDATE schema_migrations SET name='untrusted-capability-schema' WHERE version=25").run();
@@ -28,9 +28,12 @@ describe('Database Migrations & Upgrade Integrity', () => {
       db.prepare("UPDATE schema_migrations SET name='untrusted-repository-schema' WHERE version=26").run();
       expect(() => verify(db)).toThrow(/SCHEMA_AUTHORITY_INVALID/);
       db.prepare("UPDATE schema_migrations SET name=? WHERE version=26").run(MIGRATIONS[25].name);
-      db.prepare("INSERT INTO schema_migrations(version,name,applied_at) VALUES(27,'unknown',?)").run(new Date().toISOString());
+      db.prepare("UPDATE schema_migrations SET name='untrusted-roster-schema' WHERE version=27").run();
       expect(() => verify(db)).toThrow(/SCHEMA_AUTHORITY_INVALID/);
-      db.prepare('DELETE FROM schema_migrations WHERE version=27').run();
+      db.prepare("UPDATE schema_migrations SET name=? WHERE version=27").run(MIGRATIONS[26].name);
+      db.prepare("INSERT INTO schema_migrations(version,name,applied_at) VALUES(28,'unknown',?)").run(new Date().toISOString());
+      expect(() => verify(db)).toThrow(/SCHEMA_AUTHORITY_INVALID/);
+      db.prepare('DELETE FROM schema_migrations WHERE version=28').run();
     }
   });
 

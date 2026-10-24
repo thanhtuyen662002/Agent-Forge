@@ -78,6 +78,18 @@ export class AccountHealthService {
   }
 
   /**
+   * Initializes a never-used UNKNOWN account to AVAILABLE after a supported,
+   * authenticated provider check (for example an official quota read) proved
+   * the isolated profile is signed in. It never clears failures or cooldowns,
+   * never touches an account that has been routed, leased or observed, and
+   * fails closed if the account identity changed since the check started.
+   */
+  public initializeVerifiedAccount(accountId: string, expected: { providerId: string; profileRef: string }): boolean {
+    return this.repo.runInImmediateTransaction(() =>
+      this.repo.initializeUnusedProviderAccountHealth(accountId, expected.providerId, expected.profileRef));
+  }
+
+  /**
    * Records rate limiting for the provider account with an explicit future cooldown.
    * Fails closed if no explicit cooldown duration or timestamp is provided (no invented defaults).
    * Always binds last_failure_code to RATE_LIMITED.

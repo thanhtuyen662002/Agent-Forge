@@ -20,11 +20,18 @@ describe('Issue #130 renderer dispatch admission boundary', () => {
     dispatchProductBound: vi.fn(async (authorizationId: string) => ({ mode: 'PRODUCT_BOUND', authorizationId })),
   };
 
+  // Only the owner-trash fence reads the repository before admission.
+  const repo = {
+    getExecutionAuthorization: vi.fn((id: string) => ({ id, task_id: `task-for-${id}` })),
+    isProjectTrashed: vi.fn(() => false),
+    isTaskTrashed: vi.fn((taskId: string) => taskId === 'task-for-auth-trashed'),
+  };
+
   beforeEach(() => {
     handlers.clear();
     vi.clearAllMocks();
     registerIpcHandlers(
-      {} as any,
+      repo as any,
       {} as any,
       {} as any,
       {} as any,
@@ -65,6 +72,16 @@ describe('Issue #130 renderer dispatch admission boundary', () => {
     });
     expect(providerDispatchService.dispatchProductBound).toHaveBeenCalledWith('auth-product');
     expect(providerDispatchService.dispatchManualBridge).not.toHaveBeenCalled();
+  });
+
+  it('refuses to dispatch an authorization whose task is in the owner trash', async () => {
+    const handler = handlers.get('routing:dispatchAuthorization');
+    await expect(
+      handler!(trustedRenderer, { authorizationId: 'auth-trashed', executionMode: 'PRODUCT_BOUND' }),
+    ).resolves.toMatchObject({ success: false, errorCode: 'ENTITY_IN_TRASH' });
+    expect(repo.isTaskTrashed).toHaveBeenCalledWith('task-for-auth-trashed');
+    expect(providerDispatchService.dispatchManualBridge).not.toHaveBeenCalled();
+    expect(providerDispatchService.dispatchProductBound).not.toHaveBeenCalled();
   });
 
   it('rejects a legacy dispatch payload before invoking either admission method', async () => {

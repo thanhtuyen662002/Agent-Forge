@@ -62,6 +62,23 @@ export interface OrchestratorApi {
 
   // Agents & Resources
   getAgents: () => Promise<any[]>;
+  getAgentRoster: (options?: { includeRemoved?: boolean }) => Promise<any[]>;
+  createAgent: (data: Record<string, unknown>) => Promise<any>;
+  updateAgent: (data: Record<string, unknown>) => Promise<any>;
+  removeAgent: (agentId: string) => Promise<any>;
+  restoreAgent: (agentId: string) => Promise<any>;
+  getTrash: () => Promise<any>;
+  getAutomationStatus: () => Promise<any>;
+  startCodexSignIn: (accountId: string) => Promise<any>;
+  getCodexSignInStatus: (sessionId: string) => Promise<any>;
+  cancelCodexSignIn: (sessionId: string) => Promise<any>;
+  openCodexSignInPage: (sessionId: string) => Promise<any>;
+  getQuotaObservations: () => Promise<any>;
+  refreshQuota: () => Promise<any>;
+  trashProject: (projectId: string) => Promise<any>;
+  restoreProject: (projectId: string) => Promise<any>;
+  trashTask: (taskId: string) => Promise<any>;
+  restoreTask: (taskId: string) => Promise<any>;
   getProviderResources: () => Promise<any[]>;
   updateResourceQuota: (data: { id: string; remaining: number | null; total: number | null; source: string; confidence: number }) => Promise<any>;
 
@@ -174,6 +191,23 @@ const api: OrchestratorApi = {
   ) => ipcRenderer.invoke('verification:runTests', { taskId, commandConfigId, ...(binding ?? {}) }),
 
   getAgents: () => ipcRenderer.invoke('agents:list'),
+  getAgentRoster: (options) => ipcRenderer.invoke('agents:roster', { includeRemoved: options?.includeRemoved === true }),
+  createAgent: (data) => ipcRenderer.invoke('agents:create', data),
+  updateAgent: (data) => ipcRenderer.invoke('agents:update', data),
+  removeAgent: (agentId: string) => ipcRenderer.invoke('agents:remove', { agentId }),
+  restoreAgent: (agentId: string) => ipcRenderer.invoke('agents:restore', { agentId }),
+  getTrash: () => ipcRenderer.invoke('trash:list'),
+  getAutomationStatus: () => ipcRenderer.invoke('automation:status'),
+  startCodexSignIn: (accountId: string) => ipcRenderer.invoke('accounts:startCodexSignIn', { accountId }),
+  getCodexSignInStatus: (sessionId: string) => ipcRenderer.invoke('accounts:codexSignInStatus', { sessionId }),
+  cancelCodexSignIn: (sessionId: string) => ipcRenderer.invoke('accounts:cancelCodexSignIn', { sessionId }),
+  openCodexSignInPage: (sessionId: string) => ipcRenderer.invoke('accounts:openCodexSignInPage', { sessionId }),
+  getQuotaObservations: () => ipcRenderer.invoke('quota:list'),
+  refreshQuota: () => ipcRenderer.invoke('quota:refresh'),
+  trashProject: (projectId: string) => ipcRenderer.invoke('trash:project', { projectId }),
+  restoreProject: (projectId: string) => ipcRenderer.invoke('trash:restoreProject', { projectId }),
+  trashTask: (taskId: string) => ipcRenderer.invoke('trash:task', { taskId }),
+  restoreTask: (taskId: string) => ipcRenderer.invoke('trash:restoreTask', { taskId }),
   getProviderResources: () => ipcRenderer.invoke('providers:listResources'),
   updateResourceQuota: (data) => ipcRenderer.invoke('providers:updateResourceQuota', data),
 

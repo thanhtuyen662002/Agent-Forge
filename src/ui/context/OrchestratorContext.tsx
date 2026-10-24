@@ -2,6 +2,7 @@ import React, { createContext, useContext, useState, useEffect, useCallback, use
 import { Project, Task, Agent, ProviderResource, EventRecord, Evidence, UIDensityMode } from '../../core/types/domain';
 import type { CanonicalExecutionScope } from '../../core/services/ExecutionAuthorizationService';
 import type { RendererAuthorizationMode } from '../../core/types/ipc';
+import type { ManagedAgent } from '../../core/types/workspace';
 import { UiActionName, UiActionResult, UiActionRunner, uiActionFailure, normalizeVerificationReply, normalizeEmergencyReply, UiVerificationObservation, UiEmergencyObservation } from '../actionState';
 
 interface OrchestratorContextType {
@@ -262,9 +263,10 @@ export const OrchestratorProvider: React.FC<{ children: React.ReactNode }> = ({ 
       if (!Array.isArray(projList)) throw new Error('INVALID_REFRESH_RESPONSE');
       if (!isCurrentRequest() || !selectionUnchanged()) return;
 
-      const currentProj = (requestedProjectId
-        ? projList.find((project: Project) => project.id === requestedProjectId)
-        : projList[0]) || null;
+      // A selected project that left the active list (for example, moved to the
+      // trash) falls back to the first remaining project instead of a blank view.
+      const reconciledProjectId = reconcileSelectedId(requestedProjectId ?? null, projList);
+      const currentProj = projList.find((project: Project) => project.id === reconciledProjectId) || null;
       setProjects(projList);
       setActiveProject(currentProj);
 
@@ -293,7 +295,8 @@ export const OrchestratorProvider: React.FC<{ children: React.ReactNode }> = ({ 
       if (!isCurrentRequest() || !selectionUnchanged()) return;
       if (![resList, agentList].every(Array.isArray)) throw new Error('INVALID_REFRESH_RESPONSE');
       setResources(resList);
-      setAgents(agentList);
+      // Agents removed from the active roster keep their history but are not configured agents.
+      setAgents(agentList.filter((agent: ManagedAgent) => !agent.removed_at));
       setHasRefreshed(true);
     } catch (err) {
       if (isCurrentRequest()) {
