@@ -2,6 +2,7 @@ import React, { createContext, useContext, useState, useEffect, useCallback, use
 import { Project, Task, Agent, ProviderResource, EventRecord, Evidence, UIDensityMode } from '../../core/types/domain';
 import type { CanonicalExecutionScope } from '../../core/services/ExecutionAuthorizationService';
 import type { RendererAuthorizationMode } from '../../core/types/ipc';
+import type { ManagedAgent } from '../../core/types/workspace';
 import { UiActionName, UiActionResult, UiActionRunner, uiActionFailure, normalizeVerificationReply, normalizeEmergencyReply, UiVerificationObservation, UiEmergencyObservation } from '../actionState';
 
 interface OrchestratorContextType {
@@ -293,7 +294,8 @@ export const OrchestratorProvider: React.FC<{ children: React.ReactNode }> = ({ 
       if (!isCurrentRequest() || !selectionUnchanged()) return;
       if (![resList, agentList].every(Array.isArray)) throw new Error('INVALID_REFRESH_RESPONSE');
       setResources(resList);
-      setAgents(agentList);
+      // Agents removed from the active roster keep their history but are not configured agents.
+      setAgents(agentList.filter((agent: ManagedAgent) => !agent.removed_at));
       setHasRefreshed(true);
     } catch (err) {
       if (isCurrentRequest()) {

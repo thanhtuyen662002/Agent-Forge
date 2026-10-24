@@ -22,6 +22,7 @@ import { ExecutionAuthorizationService } from '../core/services/ExecutionAuthori
 import { ProviderDispatchService } from '../core/services/ProviderDispatchService';
 import { UpdateService } from '../core/services/UpdateService';
 import { CommandParser } from '../core/services/CommandParser';
+import { WorkspaceManagementService } from '../core/services/WorkspaceManagementService';
 import {
   CreateProjectIpcSchema,
   BindProjectRepositoryIpcSchema,
@@ -132,6 +133,8 @@ export function registerIpcHandlers(
   const adjService =
     coderSubmissionAdjudicationService ||
     new CoderSubmissionAdjudicationService(repo, repo.getDatabase(), verificationService);
+
+  const workspaceManagementService = new WorkspaceManagementService(repo);
 
   const registerPrivilegedHandler = (channel: string, handler: PrivilegedIpcHandler): void => {
     ipcMain.handle(channel, async (event, payload) => {
@@ -837,6 +840,30 @@ export function registerIpcHandlers(
 
   registerPrivilegedHandler('agents:list', async () => {
     return repo.getAllAgents();
+  });
+
+  // Owner agent roster management. Every mutation is one immediate transaction
+  // and replies with a typed result; removal is reversible and fenced by
+  // active-work blockers.
+  registerPrivilegedHandler('agents:roster', async (_, payload: unknown) => {
+    const includeRemoved = Boolean(payload && typeof payload === 'object' && (payload as { includeRemoved?: unknown }).includeRemoved === true);
+    return sanitizeOutputValue(workspaceManagementService.listAgents({ includeRemoved }));
+  });
+
+  registerPrivilegedHandler('agents:create', async (_, payload: unknown) => {
+    return sanitizeOutputValue(workspaceManagementService.createAgent(payload));
+  });
+
+  registerPrivilegedHandler('agents:update', async (_, payload: unknown) => {
+    return sanitizeOutputValue(workspaceManagementService.updateAgent(payload));
+  });
+
+  registerPrivilegedHandler('agents:remove', async (_, payload: unknown) => {
+    return sanitizeOutputValue(workspaceManagementService.removeAgent(payload));
+  });
+
+  registerPrivilegedHandler('agents:restore', async (_, payload: unknown) => {
+    return sanitizeOutputValue(workspaceManagementService.restoreAgent(payload));
   });
 
   registerPrivilegedHandler('providers:updateResourceQuota', async (_, payload: unknown) => {

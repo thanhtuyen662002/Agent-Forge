@@ -208,6 +208,112 @@ export interface TranslationDictionary {
     managerPool: string;
     coderPool: string;
     reviewerPool: string;
+    toolPool: string;
+    addAgent: string;
+    showRemoved: string;
+    emptyRole: string;
+    emptyRoster: string;
+    loadFailed: string;
+    retry: string;
+    removedBadge: string;
+    desktopOnly: string;
+    roles: {
+      PRIMARY_MANAGER: string;
+      BACKUP_MANAGER: string;
+      CODER: string;
+      REVIEWER: string;
+      TOOL: string;
+    };
+    roleHelp: {
+      PRIMARY_MANAGER: string;
+      BACKUP_MANAGER: string;
+      CODER: string;
+      REVIEWER: string;
+      TOOL: string;
+    };
+    connections: {
+      MANUAL_BRIDGE: string;
+      CODEX_CLI: string;
+      GEMINI_CLI: string;
+      OTHER: string;
+    };
+    connectionHelp: {
+      MANUAL_BRIDGE: string;
+      CODEX_CLI: string;
+      GEMINI_CLI: string;
+      OTHER: string;
+    };
+    form: {
+      createTitle: string;
+      editTitle: string;
+      stepWho: string;
+      stepHow: string;
+      stepExtra: string;
+      nameLabel: string;
+      namePlaceholder: string;
+      roleLabel: string;
+      connectionLabel: string;
+      modelLabel: string;
+      modelPlaceholder: string;
+      profileLabel: string;
+      profileHelp: string;
+      slotsLabel: string;
+      slotsHelp: string;
+      instructionsLabel: string;
+      instructionsPlaceholder: string;
+      modelLockedHint: string;
+      healthUnknownNote: string;
+      cancel: string;
+      create: string;
+      save: string;
+      created: string;
+      saved: string;
+    };
+    actions: {
+      edit: string;
+      remove: string;
+      restore: string;
+    };
+    remove: {
+      confirmTitle: string;
+      confirmBody: string;
+      confirm: string;
+      cancel: string;
+      removed: string;
+      restored: string;
+      blockedHint: string;
+    };
+    blockers: {
+      title: string;
+      CURRENT_TASK: string;
+      AGENT_BUSY: string;
+      REVIEWER_SESSION: string;
+      ACTIVE_ASSIGNMENT: string;
+      PENDING_AUTHORIZATION: string;
+      IN_FLIGHT_EXECUTION: string;
+      BUSY_WORKER_SLOT: string;
+      ACTIVE_ACCOUNT_LEASE: string;
+    };
+    errors: {
+      INVALID_INPUT: string;
+      AGENT_NOT_FOUND: string;
+      AGENT_ALREADY_REMOVED: string;
+      AGENT_NOT_REMOVED: string;
+      AGENT_HAS_ACTIVE_WORK: string;
+      PROFILE_ALREADY_IN_USE: string;
+      INTERNAL_ERROR: string;
+      DESKTOP_REQUIRED: string;
+      INVALID_RESPONSE: string;
+    };
+    details: {
+      model: string;
+      connection: string;
+      account: string;
+      slots: string;
+      noSlots: string;
+      profile: string;
+      instructions: string;
+    };
   };
   agentCard: {
     noAssignedModel: string;

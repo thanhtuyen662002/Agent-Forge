@@ -86,6 +86,7 @@ import {
   AdjudicationStatus,
   AdjudicationEventType,
 } from '../types/domain';
+import type { ManagedAgent } from '../types/workspace';
 import type { CoderSubmissionWorkspaceLease, WorkspaceLeaseState } from '../types/adjudication';
 import type {
   McpReviewerSession,
@@ -1252,6 +1253,14 @@ export class Repository {
     }));
   }
 
+  public updateProviderResourceModelName(id: string, modelName: string): void {
+    this.db.prepare('UPDATE provider_resources SET model_name = ? WHERE id = ?').run(modelName, id);
+  }
+
+  public setProviderResourceEnabled(id: string, enabled: boolean): void {
+    this.db.prepare('UPDATE provider_resources SET enabled = ? WHERE id = ?').run(enabled ? 1 : 0, id);
+  }
+
   public updateProviderResourceAccount(id: string, accountId: string | null): void {
     const resource = this.getProviderResource(id);
     if (!resource) {
@@ -1350,18 +1359,32 @@ export class Repository {
   // ==========================================
   // Agents
   // ==========================================
-  public createAgent(agent: Agent): void {
+  public createAgent(agent: ManagedAgent): void {
     this.db
       .prepare(`
-        INSERT INTO agents (id, display_name, role, provider_resource_id, status, current_task_id, last_seen_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?)
+        INSERT INTO agents (id, display_name, role, provider_resource_id, status, current_task_id, last_seen_at, agent_profile_id, removed_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
       `)
-      .run(agent.id, agent.display_name, agent.role, agent.provider_resource_id, agent.status, agent.current_task_id, agent.last_seen_at);
+      .run(
+        agent.id,
+        agent.display_name,
+        agent.role,
+        agent.provider_resource_id,
+        agent.status,
+        agent.current_task_id,
+        agent.last_seen_at,
+        agent.agent_profile_id ?? null,
+        agent.removed_at ?? null
+      );
   }
 
-  public getAllAgents(): Agent[] {
+  public getAllAgents(): ManagedAgent[] {
     const rows = this.db.prepare('SELECT * FROM agents ORDER BY display_name ASC').all() as Record<string, unknown>[];
-    return rows.map((r) => ({
+    return rows.map((r) => this.mapAgent(r));
+  }
+
+  private mapAgent(r: Record<string, unknown>): ManagedAgent {
+    return {
       id: String(r.id),
       display_name: String(r.display_name),
       role: r.role as any,
@@ -1369,7 +1392,81 @@ export class Repository {
       status: r.status as any,
       current_task_id: r.current_task_id ? String(r.current_task_id) : null,
       last_seen_at: String(r.last_seen_at),
-    }));
+      agent_profile_id: r.agent_profile_id ? String(r.agent_profile_id) : null,
+      removed_at: r.removed_at ? String(r.removed_at) : null,
+    };
+  }
+
+  public setAgentProfileId(id: string, agentProfileId: string | null): void {
+    this.db.prepare('UPDATE agents SET agent_profile_id = ? WHERE id = ?').run(agentProfileId, id);
+  }
+
+  public updateAgentDisplayName(id: string, displayName: string): void {
+    this.db.prepare('UPDATE agents SET display_name = ? WHERE id = ?').run(displayName, id);
+  }
+
+  /** Marks or clears roster removal. Status is parked OFFLINE while removed so it cannot look dispatchable. */
+  public setAgentRemoved(id: string, removedAt: string | null): void {
+    this.db
+      .prepare('UPDATE agents SET removed_at = ?, status = ?, last_seen_at = ? WHERE id = ?')
+      .run(removedAt, removedAt ? 'OFFLINE' : 'IDLE', removedAt ?? new Date().toISOString(), id);
+  }
+
+  /**
+   * Reports durable work that still references an agent's resource. Any entry
+   * means the agent is not idle and must not leave the active roster.
+   */
+  public getAgentActiveWorkBlockers(agentId: string, nowIso: string): Array<{ code: string; reference: string }> {
+    const blockers: Array<{ code: string; reference: string }> = [];
+    const agent = this.getAgent(agentId);
+    if (!agent) return blockers;
+    if (agent.current_task_id) blockers.push({ code: 'CURRENT_TASK', reference: agent.current_task_id });
+    if (agent.status === 'BUSY') blockers.push({ code: 'AGENT_BUSY', reference: agent.id });
+
+    const reviewerSessions = this.db
+      .prepare('SELECT id FROM mcp_reviewer_sessions WHERE reviewer_agent_id = ? AND revoked_at IS NULL AND expires_at > ?')
+      .all(agentId, nowIso) as Array<{ id: string }>;
+    for (const row of reviewerSessions) blockers.push({ code: 'REVIEWER_SESSION', reference: row.id });
+
+    if (agent.provider_resource_id) {
+      const resourceId = agent.provider_resource_id;
+      const assignments = this.db
+        .prepare("SELECT id FROM agent_assignments WHERE selected_resource_id = ? AND status IN ('ASSIGNED', 'RUNNING')")
+        .all(resourceId) as Array<{ id: string }>;
+      for (const row of assignments) blockers.push({ code: 'ACTIVE_ASSIGNMENT', reference: row.id });
+
+      const authorizations = this.db
+        .prepare(`
+          SELECT id, status FROM execution_authorizations
+          WHERE selected_resource_id = ?
+            AND (status = 'AUTHORIZED' OR (status = 'DISPATCHED' AND adapter_started_at IS NOT NULL AND adapter_finished_at IS NULL))
+        `)
+        .all(resourceId) as Array<{ id: string; status: string }>;
+      for (const row of authorizations) {
+        blockers.push({ code: row.status === 'AUTHORIZED' ? 'PENDING_AUTHORIZATION' : 'IN_FLIGHT_EXECUTION', reference: row.id });
+      }
+
+      const slots = this.db
+        .prepare(`
+          SELECT id FROM worker_slots
+          WHERE provider_resource_id = ?
+            AND (status IN ('LEASED', 'RUNNING') OR current_assignment_id IS NOT NULL OR current_execution_id IS NOT NULL)
+        `)
+        .all(resourceId) as Array<{ id: string }>;
+      for (const row of slots) blockers.push({ code: 'BUSY_WORKER_SLOT', reference: row.id });
+
+      // Unreleased leases block even after expiry: until recovery releases them they
+      // may still belong to a live process.
+      const leases = this.db
+        .prepare(`
+          SELECT l.id FROM account_leases l
+          JOIN worker_slots s ON s.id = l.worker_slot_id
+          WHERE s.provider_resource_id = ? AND l.released_at IS NULL
+        `)
+        .all(resourceId) as Array<{ id: string }>;
+      for (const row of leases) blockers.push({ code: 'ACTIVE_ACCOUNT_LEASE', reference: row.id });
+    }
+    return blockers;
   }
 
   public updateAgentStatus(id: string, status: string, currentTaskId: string | null = null): void {
@@ -8694,18 +8791,9 @@ export class Repository {
     };
   }
 
-  public getAgent(id: string): Agent | null {
+  public getAgent(id: string): ManagedAgent | null {
     const row = this.db.prepare('SELECT * FROM agents WHERE id = ?').get(id) as Record<string, unknown> | undefined;
-    if (!row) return null;
-    return {
-      id: String(row.id),
-      display_name: String(row.display_name),
-      role: row.role as any,
-      provider_resource_id: row.provider_resource_id ? String(row.provider_resource_id) : null,
-      status: row.status as any,
-      current_task_id: row.current_task_id ? String(row.current_task_id) : null,
-      last_seen_at: String(row.last_seen_at),
-    };
+    return row ? this.mapAgent(row) : null;
   }
 
   // ==========================================

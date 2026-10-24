@@ -2127,8 +2127,8 @@ describe('R5J4 Durable Coder Submission Authority Comprehensive Suite', () => {
   // Group 9: Section 6.1 — Production Determinism and Migration Compatibility
   // =========================================================================
   describe('Group 9: Section 6.1 — Production Determinism and Migration Compatibility', () => {
-    it('111. MIGRATIONS is exactly 26 in every caller/process/test filename', () => {
-      expect(MIGRATIONS).toHaveLength(26);
+    it('111. MIGRATIONS is exactly 27 in every caller/process/test filename', () => {
+      expect(MIGRATIONS).toHaveLength(27);
       expect(MIGRATIONS[21].version).toBe(22);
       expect(MIGRATIONS[21].name).toBe('022_r5j_coder_submission_authority');
     });
@@ -2139,7 +2139,7 @@ describe('R5J4 Durable Coder Submission Authority Comprehensive Suite', () => {
       try {
         process.argv.push('--file=ContextRead.test.ts');
         process.env.TEST_NAME = 'CrashRecovery';
-        expect(MIGRATIONS).toHaveLength(26);
+        expect(MIGRATIONS).toHaveLength(27);
       } finally {
         process.argv = originalArgv;
         process.env.TEST_NAME = originalEnv;
@@ -4280,12 +4280,13 @@ SELECT * FROM users WHERE id = 1;`;
       expect(typeof fixtures.service.getSubmissionStatus).toBe('function');
     });
 
-    it('39. Migration count remains exactly 26 and retains the capability migration', () => {
-      expect(MIGRATIONS).toHaveLength(26);
-      expect(MIGRATIONS[MIGRATIONS.length - 1].version).toBe(26);
+    it('39. Migration count remains exactly 27 and appends the agent roster migration', () => {
+      expect(MIGRATIONS).toHaveLength(27);
+      expect(MIGRATIONS[MIGRATIONS.length - 1].version).toBe(27);
       expect(MIGRATIONS[MIGRATIONS.length - 1].name).toBe(
-        'selected_project_repository_identities'
+        'agent_roster_lifecycle'
       );
+      expect(MIGRATIONS[25].name).toBe('selected_project_repository_identities');
       expect(MIGRATIONS[24]).toMatchObject({ version: 25, name: 'durable_owner_verification_capabilities' });
     });
 
@@ -5410,7 +5411,7 @@ SELECT * FROM users WHERE id = 1;`;
     });
 
     it('H34. Existing R5J1-R5J5 suites remain unchanged and pass', () => {
-      expect(MIGRATIONS).toHaveLength(26);
+      expect(MIGRATIONS).toHaveLength(27);
       expect(MIGRATIONS[22].version).toBe(23);
       expect(typeof verifyMigration23SchemaAuthority).toBe('function');
     });

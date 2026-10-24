@@ -421,12 +421,13 @@ const { VerificationCapabilityService } = require(capabilityServicePath);
 MigrationRunner.run(db);
 
 const appliedMigrations = db.prepare("SELECT version,name FROM schema_migrations ORDER BY version ASC").all();
-if (appliedMigrations.length !== 26 || appliedMigrations.some((migration, index) => migration.version !== index + 1) ||
+if (appliedMigrations.length !== 27 || appliedMigrations.some((migration, index) => migration.version !== index + 1) ||
     appliedMigrations[24]?.name !== 'durable_owner_verification_capabilities' ||
-    appliedMigrations[25]?.name !== 'selected_project_repository_identities') {
-  throw new Error("Expected exact migration inventory 1..26 with owner-capability and selected-root identities");
+    appliedMigrations[25]?.name !== 'selected_project_repository_identities' ||
+    appliedMigrations[26]?.name !== 'agent_roster_lifecycle') {
+  throw new Error("Expected exact migration inventory 1..27 with owner-capability, selected-root and agent-roster identities");
 }
-console.log("MIGRATION_REGISTRY_26=PASS");
+console.log("MIGRATION_REGISTRY_27=PASS");
 console.log("OWNER_CAPABILITY_MIGRATION_25=PASS");
 console.log("SELECTED_ROOT_IDENTITY_MIGRATION_26=PASS");
 
