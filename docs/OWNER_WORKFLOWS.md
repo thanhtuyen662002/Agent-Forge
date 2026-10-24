@@ -371,6 +371,47 @@ any startup quarantine marker (`PRODUCT_LEASE_RECOVERY_REQUIRED`) for that
 lease. A late result from the old process is discarded because it no longer
 holds its lease.
 
+## Taking reviewed work: create a branch or discard
+
+When a task passes automated review it is `DONE`, and its changes are still
+uncommitted in a hidden managed worktree. The header then shows *reviewed work
+is ready* (`READY_FOR_INTEGRATION`). Under **Dashboard → Reviewed work** the
+owner chooses what happens to it (#238). Nothing happens without that action,
+and nothing is ever merged or pushed.
+
+- **Create branch.** The worktree must still hold exactly the reviewed
+  snapshot (same HEAD and snapshot as the PASS review), otherwise
+  `SNAPSHOT_CHANGED_SINCE_REVIEW`. The changes are committed with Git plumbing
+  (`add` → `write-tree` → `commit-tree` → `update-ref` with an empty old value)
+  as one commit on the reviewed base. They land on a **new** branch
+  `agent/<task-title>-<task-id>-r<revision>`, authored by *Agent Forge*.
+  - Line endings are not converted; the commit holds the reviewed bytes.
+  - Changes are staged into a private copy of the worktree's index, so the
+    reviewed snapshot never changes. The commit's files (rename detection off)
+    must equal the reviewed ones *before* any branch is written. The exact
+    commit is recorded as an intent first.
+  - The default branch, the owner's checkout and every existing branch are
+    never modified. An existing branch name is never overwritten.
+  - The retained worktree is then cleaned and removed through
+    `GitWorktreeService`. The branch stays in the repository for the owner to
+    merge with their usual Git tool.
+- **Discard** (terminal tasks only: `DONE`, `CANCELLED`, `FAILED`). The task's
+  retained worktrees are cleaned and removed. The repository policy forbids
+  `git reset --hard` and `git clean -f`, so discard only unstages, restores
+  tracked files from the base, and deletes the worktree's untracked files
+  inside the managed path. Deletion never follows a symlink or junction: the
+  link itself is removed and its target is untouched. Removal then requires the
+  exact checkout again. A repository whose `.gitattributes` converts line
+  endings or applies filters can fail this check; the discard then reports
+  `DISCARD_INCOMPLETE` and keeps the copy. If the branch was created but its
+  hidden copy could not be removed, the panel offers *Remove leftover copy*,
+  which keeps the branch.
+- **Restart.** If an earlier attempt wrote the branch but was interrupted
+  before recording it, the next *Create branch* adopts the branch. It does so
+  only if the branch tip is exactly the recorded intended commit, one commit on
+  the reviewed base. Any other branch with that name, for example one of the
+  owner's, is refused (`BRANCH_EXISTS`) and left untouched.
+
 ## Restart recovery for automated executions
 
 At startup, `ExecutionRecoveryScanner` sends lifecycle-v1 product
@@ -478,8 +519,9 @@ waiting, failed and fix-required tasks with a plain-language reason and an
 
 ## Not yet covered by this slice of Issue #225
 
-- Automatic integration (merge) of a reviewed coder worktree into the
-  repository. Automated verification (#230) and review (#233) are covered above.
+- Automatic merge of a reviewed branch into the default branch. Automated
+  verification (#230), review (#233) and the owner's branch hand-off (#238)
+  are covered above; merging stays with the owner.
 
 
 These remain open acceptance criteria on Issue #225.

@@ -32,7 +32,7 @@ export class DefaultProcessExecutor implements IProcessExecutor {
       timeoutMs: options?.timeoutMs ?? 30000,
       allowShell: false,
       env: options?.env,
-      allowedEnvKeys: ['GIT_OPTIONAL_LOCKS'],
+      allowedEnvKeys: ['GIT_OPTIONAL_LOCKS', 'GIT_INDEX_FILE'],
     });
     return {
       exitCode: res.exitCode,
@@ -480,11 +480,12 @@ export class GitWorktreeService {
     args: string[],
     targetPath: string,
     targetIdentity: DirectoryIdentity,
+    extraEnv?: Record<string, string>,
   ): Promise<{ exitCode: number; stdout: string; stderr: string }> {
     this.assertOperationBoundary(targetPath, targetIdentity, true);
     const result = await this.executor.execute(this.gitExecutable, args, {
       cwd: targetPath,
-      env: { GIT_OPTIONAL_LOCKS: '0' },
+      env: { GIT_OPTIONAL_LOCKS: '0', ...(extraEnv ?? {}) },
     });
     this.assertRootIdentities();
     this.assertTargetIdentity(targetPath, targetIdentity, true);
@@ -873,6 +874,176 @@ export class GitWorktreeService {
   }
 
   /**
+   * Owner-controlled integration (#238): commits the worktree's current
+   * changes on a NEW branch in the repository with Git plumbing, without
+   * moving the worktree's HEAD, touching its index, or touching any existing
+   * branch or checkout. Changes are staged into a temporary copy of the index,
+   * so the reviewed snapshot is unchanged whatever happens. The commit's files
+   * must equal `expectedFiles` (rename detection off) before any ref is
+   * written; `onIntent` records the exact commit before the branch is created
+   * atomically (`update-ref` with an empty old value), so an existing branch
+   * is never overwritten and an interrupted attempt can be adopted exactly.
+   */
+  public async commitChangesToNewBranch(
+    tuple: WorktreeOwnershipTuple,
+    branchName: string,
+    message: string,
+    expectedFiles: string[],
+    onIntent: (commitSha: string) => void,
+  ): Promise<{ status: 'COMMITTED'; commitSha: string; changedFiles: string[] } | WorktreeFailure> {
+    const invalidEpoch = this.validateOwnershipEpoch(tuple);
+    if (invalidEpoch) return invalidEpoch;
+    const unsupported = this.unsupportedMutationBoundary();
+    if (unsupported) return unsupported;
+    if (!/^agent\/[a-z0-9][a-z0-9-]{0,80}$/.test(branchName) || message.length === 0 || message.length > 2000 || /\u0000/.test(message)) {
+      return { status: 'FAILED', code: 'PATH_CONTAINMENT_DENIED', error: 'PATH_CONTAINMENT_DENIED: Invalid integration branch or message.' };
+    }
+    return this.withManagedRootLock<{ status: 'COMMITTED'; commitSha: string; changedFiles: string[] } | WorktreeFailure>(
+      () => ({ status: 'FAILED' as const, code: 'PATH_CONTAINMENT_DENIED' as const, error: 'PATH_CONTAINMENT_DENIED: Managed-root operation lock could not be acquired safely.' }),
+      async () => {
+        const owned = await this.ownedDetachedTarget(tuple);
+        if ('status' in owned) return owned;
+        const { targetPath, targetIdentity } = owned;
+        const base = tuple.baseSha.toLowerCase();
+        const fail = (detail: string): WorktreeFailure => ({ status: 'FAILED', code: 'INSPECTION_FAILED', error: `INTEGRATION_FAILED: ${detail}`, worktreePath: targetPath });
+        let temporaryIndex: string | null = null;
+        try {
+          const git = (args: string[], env?: Record<string, string>) => this.executeGitWithTargetBoundary(args, targetPath, targetIdentity, env);
+          const exists = await git(['rev-parse', '--verify', '--quiet', `refs/heads/${branchName}`]);
+          if (exists.exitCode === 0) return { status: 'FAILED', code: 'INSPECTION_FAILED', error: 'BRANCH_EXISTS: The integration branch already exists.', worktreePath: targetPath };
+          // A private copy of the worktree's index: staging never changes the reviewed status.
+          const indexPath = (await git(['rev-parse', '--path-format=absolute', '--git-path', 'index'])).stdout.trim();
+          if (!indexPath || !path.isAbsolute(indexPath)) return fail('index path unavailable');
+          // Next to the real index, inside this worktree's own Git administration directory.
+          temporaryIndex = `${path.normalize(indexPath)}.agent-forge-${crypto.randomUUID()}`;
+          if (fs.existsSync(indexPath)) fs.copyFileSync(indexPath, temporaryIndex);
+          const indexEnv = { GIT_INDEX_FILE: temporaryIndex };
+          // Raw bytes, exactly as reviewed: no line-ending conversion when staging.
+          const staged = await git(['-c', 'core.autocrlf=false', '-c', 'core.safecrlf=false', 'add', '-A', '--', '.'], indexEnv);
+          if (staged.exitCode !== 0) return fail('staging failed');
+          const tree = await git(['write-tree'], indexEnv);
+          if (tree.exitCode !== 0 || !/^[0-9a-f]{40}$/i.test(tree.stdout.trim())) return fail('write-tree failed');
+          const commit = await git(['-c', 'user.name=Agent Forge', '-c', 'user.email=agent-forge@localhost',
+            'commit-tree', tree.stdout.trim(), '-p', base, '-m', message]);
+          const commitSha = commit.stdout.trim().toLowerCase();
+          if (commit.exitCode !== 0 || !/^[0-9a-f]{40}$/.test(commitSha)) return fail('commit-tree failed');
+          // Compare before any ref exists; an unreferenced commit object is harmless.
+          const names = await git(['diff', '--no-renames', '--name-only', '-z', base, commitSha]);
+          const changedFiles = names.stdout.split('\0').filter(Boolean).sort();
+          if (names.exitCode !== 0 || JSON.stringify(changedFiles) !== JSON.stringify([...expectedFiles].sort())) {
+            return { status: 'FAILED', code: 'INSPECTION_FAILED', error: 'COMMIT_DOES_NOT_MATCH_REVIEW: The commit does not contain exactly the reviewed files.', worktreePath: targetPath };
+          }
+          onIntent(commitSha);
+          // An empty old value: create only, never move an existing ref.
+          const ref = await git(['update-ref', `refs/heads/${branchName}`, commitSha, '0000000000000000000000000000000000000000']);
+          if (ref.exitCode !== 0) return { status: 'FAILED', code: 'INSPECTION_FAILED', error: 'BRANCH_EXISTS: The integration branch could not be created.', worktreePath: targetPath };
+          return { status: 'COMMITTED', commitSha, changedFiles };
+        } catch (error) {
+          if (error instanceof PathIdentityError) return { status: 'FAILED', code: error.code, error: error.message, worktreePath: targetPath };
+          return fail('unexpected error');
+        } finally {
+          if (temporaryIndex) { try { fs.rmSync(temporaryIndex, { force: true }); } catch { /* best effort */ } }
+        }
+      },
+    );
+  }
+
+  /**
+   * Owned discard (#238): returns an owned, registered, detached worktree that
+   * is still at its base SHA to a clean checkout of that base, so
+   * `removeWorktree` can remove it. Policy forbids `reset --hard` and
+   * `clean -f`, so it only unstages, restores tracked files from the base and
+   * deletes untracked entries itself. Deletion never follows a link: a
+   * symlink or junction is removed itself and never entered, and nothing
+   * outside the worktree is touched.
+   */
+  public async discardOwnedChanges(tuple: WorktreeOwnershipTuple): Promise<{ status: 'DISCARDED' } | WorktreeFailure> {
+    const invalidEpoch = this.validateOwnershipEpoch(tuple);
+    if (invalidEpoch) return invalidEpoch;
+    const unsupported = this.unsupportedMutationBoundary();
+    if (unsupported) return unsupported;
+    return this.withManagedRootLock<{ status: 'DISCARDED' } | WorktreeFailure>(
+      () => ({ status: 'FAILED' as const, code: 'PATH_CONTAINMENT_DENIED' as const, error: 'PATH_CONTAINMENT_DENIED: Managed-root operation lock could not be acquired safely.' }),
+      async () => {
+        const owned = await this.ownedDetachedTarget(tuple);
+        if ('status' in owned) return owned;
+        const { targetPath, targetIdentity } = owned;
+        const git = (args: string[]) => this.executeGitWithTargetBoundary(args, targetPath, targetIdentity);
+        try {
+          const base = tuple.baseSha.toLowerCase();
+          // No line-ending conversion: the managed checkout holds raw blob bytes, and so must the restore.
+          if ((await git(['reset', '-q', '--', '.'])).exitCode !== 0 ||
+              (await git(['-c', 'core.autocrlf=false', '-c', 'core.eol=lf', 'checkout', base, '--', '.'])).exitCode !== 0) {
+            return { status: 'FAILED', code: 'INSPECTION_FAILED', error: 'DISCARD_FAILED: Tracked files could not be restored.', worktreePath: targetPath };
+          }
+          // --directory lists untracked directories (also nested repositories and empty ones) as single entries.
+          const untracked = await git(['ls-files', '--others', '--directory', '-z']);
+          if (untracked.exitCode !== 0) {
+            return { status: 'FAILED', code: 'INSPECTION_FAILED', error: 'DISCARD_FAILED: Untracked files could not be listed.', worktreePath: targetPath };
+          }
+          for (const raw of untracked.stdout.split('\0').filter(Boolean)) {
+            const relative = raw.replace(/[\\/]+$/, '');
+            const absolute = path.resolve(targetPath, relative);
+            const inside = path.relative(targetPath, absolute);
+            if (!inside || inside.startsWith('..') || path.isAbsolute(inside) || inside.split(/[\\/]/)[0].toLowerCase() === '.git') {
+              return { status: 'FAILED', code: 'PATH_CONTAINMENT_DENIED', error: 'PATH_CONTAINMENT_DENIED: An untracked path escaped the worktree.', worktreePath: targetPath };
+            }
+            this.assertTargetIdentity(targetPath, targetIdentity, true);
+            // Every ancestor must be a real directory: below a link, only the link itself is removed.
+            let parent = targetPath;
+            let linked: string | null = null;
+            for (const part of inside.split(/[\\/]/).slice(0, -1)) {
+              parent = path.join(parent, part);
+              const stat = fs.lstatSync(parent, { throwIfNoEntry: false });
+              if (!stat) break;
+              if (stat.isSymbolicLink() || !stat.isDirectory()) { linked = parent; break; }
+            }
+            removeWithoutFollowing(linked ?? absolute);
+          }
+          const status = await git(['status', '--porcelain', '-uall', '--ignored']);
+          if (status.exitCode !== 0 || status.stdout.trim() !== '') {
+            return { status: 'FAILED', code: 'DIRTY_WORKTREE', error: 'DIRTY_WORKTREE: The worktree is not clean after discard (for example .gitattributes conversions).', worktreePath: targetPath };
+          }
+          return { status: 'DISCARDED' };
+        } catch (error) {
+          if (error instanceof PathIdentityError) return { status: 'FAILED', code: error.code, error: error.message, worktreePath: targetPath };
+          return { status: 'FAILED', code: 'INSPECTION_FAILED', error: 'DISCARD_FAILED: unexpected error.', worktreePath: targetPath };
+        }
+      },
+    );
+  }
+
+  /** The derived, registered, existing, detached worktree at its base SHA, with its captured identity. */
+  private async ownedDetachedTarget(tuple: WorktreeOwnershipTuple):
+    Promise<{ targetPath: string; targetIdentity: DirectoryIdentity } | WorktreeFailure> {
+    let targetPath: string;
+    try {
+      targetPath = this.deriveWorktreePath(tuple).worktreePath;
+    } catch (err: any) {
+      return { status: 'FAILED', code: 'PATH_CONTAINMENT_DENIED', error: `PATH_CONTAINMENT_DENIED: ${err.message}` };
+    }
+    let targetIdentity: DirectoryIdentity | null;
+    try {
+      this.assertRootIdentities();
+      targetIdentity = this.captureTargetIdentity(targetPath, false);
+      if (!targetIdentity) return { status: 'FAILED', code: 'UNMANAGED_WORKTREE', error: 'UNMANAGED_WORKTREE: The worktree does not exist.', worktreePath: targetPath };
+      const entry = (await this.listPorcelain()).find((e) => normalizePathForComparison(e.worktreePath) === normalizePathForComparison(targetPath));
+      this.assertRootIdentities();
+      this.assertTargetIdentity(targetPath, targetIdentity, true);
+      if (!entry) return { status: 'FAILED', code: 'UNMANAGED_WORKTREE', error: 'UNMANAGED_WORKTREE: The worktree is not registered.', worktreePath: targetPath };
+      const head = await this.executeGitWithTargetBoundary(['rev-parse', 'HEAD'], targetPath, targetIdentity);
+      const branch = await this.executeGitWithTargetBoundary(['branch', '--show-current'], targetPath, targetIdentity);
+      if (head.exitCode !== 0 || head.stdout.trim().toLowerCase() !== tuple.baseSha.toLowerCase() || branch.exitCode !== 0 || branch.stdout.trim() !== '') {
+        return { status: 'FAILED', code: 'HEAD_CHANGED', error: 'HEAD_CHANGED: The worktree is not detached at its base SHA.', worktreePath: targetPath };
+      }
+    } catch (error) {
+      const code = error instanceof PathIdentityError ? error.code : 'PATH_IDENTITY_CHANGED';
+      return { status: 'FAILED', code, error: error instanceof Error ? error.message : 'PATH_IDENTITY_CHANGED', worktreePath: targetPath };
+    }
+    return { targetPath, targetIdentity };
+  }
+
+  /**
    * Safely removes an un-modified, clean, detached managed Git worktree.
    */
   public async removeWorktree(tuple: WorktreeOwnershipTuple): Promise<WorktreeRemoveResult> {
@@ -1117,4 +1288,24 @@ export class GitWorktreeService {
 
     return entries;
   }
+}
+
+/**
+ * Removes a path without ever following a link: a symlink or junction is
+ * unlinked itself (its target is untouched); a real directory is emptied
+ * recursively with the same rule and then removed.
+ */
+function removeWithoutFollowing(target: string): void {
+  const stat = fs.lstatSync(target, { throwIfNoEntry: false });
+  if (!stat) return;
+  if (stat.isSymbolicLink()) {
+    try { fs.unlinkSync(target); } catch { fs.rmdirSync(target); } // A Windows junction is a directory link.
+    return;
+  }
+  if (stat.isDirectory()) {
+    for (const name of fs.readdirSync(target)) removeWithoutFollowing(path.join(target, name));
+    fs.rmdirSync(target);
+    return;
+  }
+  fs.unlinkSync(target);
 }
