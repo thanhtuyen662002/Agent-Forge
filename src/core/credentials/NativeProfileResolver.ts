@@ -115,10 +115,10 @@ export class NativeProfileResolver {
             CLAUDE_CONFIG_DIR: profileDir,
           },
           profileDirectory: profileDir,
-          configurationStatus: 'DOCUMENTED_SUPPORTED',
+          configurationStatus: 'EXPERIMENTAL_UNPROVEN',
           runtimeIsolationStatus: 'PENDING_R5D',
           notes:
-            'Claude Code configuration mapping via CLAUDE_CONFIG_DIR (documented: separate settings, history and login per directory). Live multi-account isolation is not yet proven with real accounts.',
+            'Claude Code profile isolation is unverified and experimental. Multi-profile runtime isolation pending R5D proof.',
         };
       }
 

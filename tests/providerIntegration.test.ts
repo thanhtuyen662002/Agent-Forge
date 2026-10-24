@@ -786,7 +786,7 @@ describe('PR #5 — Provider Integration Foundation', () => {
   });
 
   // 26. Live application composition registers ManualBridge, Codex, and Gemini with strict provider exclusion
-  it('26. BootstrapService registers ManualBridge, CodexCliAdapter, and GeminiCliAdapter with distinct IDs and excludes unproven providers', () => {
+  it('26. BootstrapService registers ManualBridge, Codex, Gemini and Claude Code CLI adapters with distinct IDs and excludes unproven providers', () => {
     const bootstrapDir = path.join(tmpDir, 'bootstrap-composition-test');
     const bootstrap = BootstrapService.initialize(bootstrapDir);
 
@@ -816,8 +816,11 @@ describe('PR #5 — Provider Integration Foundation', () => {
     expect(codex.id).not.toBe(manual.id);
     expect(gemini.id).not.toBe(manual.id);
 
-    // Registered adapter count equals exactly 3
-    expect(registry.size).toBe(3);
+    // Claude Code CLI is registered under its own ID since #242.
+    expect(registry.resolve('prov-claude-code-cli').id).toBe('prov-claude-code-cli');
+
+    // Registered adapter count equals exactly 4
+    expect(registry.size).toBe(4);
 
     // Excluded providers are absent
     expect(registry.has('prov-antigravity-cli')).toBe(false);
