@@ -3,14 +3,15 @@ import { Repository } from '../database/repositories';
 import { EventService } from './EventService';
 import { ProviderRegistry } from '../adapters/ProviderRegistry';
 import { RoleAwareRoutingService } from './RoleAwareRoutingService';
-import { TaskService } from './TaskService';
+import { TaskService, captureAuthorizedTaskTransitionBinding } from './TaskService';
 import { ProjectStopFenceService } from './ProjectStopFenceService';
 import { WorkerSlotLeaseService } from './WorkerSlotLeaseService';
 import { ProtocolParser } from '../protocol/parser';
 import { createProductLeaseRecoveryMarkerEvent, createProductLeaseRecoveryResolvedEvent } from './ProductLeaseRecoveryScanner';
 import type { AgentExecutionResult, RuntimeExecutionBinding } from '../adapters/ProviderAdapter';
 import type { AccountLease, Project, Task } from '../types/domain';
-import type { ManagerProtocol } from '../types/protocols';
+import type { ManagerProtocol, PlanProtocol } from '../types/protocols';
+import { contractSha256, parsePlanProtocol } from '../protocol/planProtocol';
 
 /** Marks Manager attempts so restart recovery only touches automated Manager calls. */
 export const MANAGER_ATTEMPT_MARKER = 'desktop-manager';
@@ -34,7 +35,7 @@ export type ManagerMode = 'AUTO' | 'APPROVE';
  * the reviewer. A PLANNED task can only be started (the state machine has no
  * BLOCK from PLANNED); a sent-back revision may also be escalated with BLOCK.
  */
-const ALLOWED_DECISIONS: Record<PendingManagerDecision['kind'], ReadonlySet<string>> = {
+const ALLOWED_DECISIONS: Record<'START' | 'NEXT_REVISION', ReadonlySet<string>> = {
   START: new Set(['EXECUTE']),
   NEXT_REVISION: new Set(['EXECUTE', 'BLOCK']),
 };
@@ -52,7 +53,8 @@ export interface ManagerCandidate {
 
 export interface PendingManagerDecision {
   task: Task;
-  kind: 'START' | 'NEXT_REVISION';
+  /** PLAN: the project's planning anchor waits for the Manager's task breakdown (#245). */
+  kind: 'START' | 'NEXT_REVISION' | 'PLAN';
   deferred: boolean;
 }
 
@@ -88,7 +90,11 @@ interface TaskSnapshot {
 
 interface ProposalPayload extends TaskSnapshot {
   taskId: string;
-  decision: ManagerProtocol;
+  /** A dispatch decision (#239), or ... */
+  decision?: ManagerProtocol;
+  /** ... a task breakdown of the approved contract (#245). */
+  plan?: PlanProtocol;
+  contractSha256?: string;
 }
 
 class ManagerApplyError extends Error {
@@ -167,6 +173,8 @@ export class ProductManagerService {
   /** What kind of decision the task needs now, or null when it has Manager authority or is elsewhere. */
   private needsDecision(task: Task): PendingManagerDecision['kind'] | null {
     if (this.repo.isTaskTrashed(task.id)) return null;
+    // The planning anchor is never dispatched; while PLANNED it waits for a plan.
+    if (task.id === this.repo.getProjectPlanningTaskId(task.project_id)) return task.state === 'PLANNED' ? 'PLAN' : null;
     if (task.state === 'PLANNED' && !this.repo.getLatestAppliedManagerProtocolMessage(task.id, task.project_id)) return 'START';
     if (task.state === 'CODING' && !managerAuthorizesRevision(this.repo, task)) return 'NEXT_REVISION';
     return null;
@@ -222,7 +230,9 @@ export class ProductManagerService {
       if (!proposal) continue;
       const payload = proposal.structured_payload as unknown as ProposalPayload;
       result.push({ eventId: proposal.id, taskId: task.id, taskTitle: task.title, taskRevision: payload.taskRevision,
-        decision: payload.decision.decision, instructions: payload.decision.instructions ?? [], createdAt: proposal.timestamp });
+        decision: payload.plan ? 'PLAN' : payload.decision?.decision ?? 'UNKNOWN',
+        instructions: payload.plan ? payload.plan.tasks.map((planned) => planned.title) : payload.decision?.instructions ?? [],
+        createdAt: proposal.timestamp });
     }
     return result.sort((a, b) => b.createdAt.localeCompare(a.createdAt));
   }
@@ -273,7 +283,9 @@ export class ProductManagerService {
     const fenced = this.projectFence(task.project_id, task.id);
     try {
       if (fenced) throw new ManagerApplyError(fenced, false);
-      await this.applyBound(payload.decision, task.id, payload);
+      if (payload.plan && payload.contractSha256) await this.applyPlan(task.id, payload.plan, payload.contractSha256, payload);
+      else if (payload.decision) await this.applyBound(payload.decision, task.id, payload);
+      else throw new ManagerApplyError('PROPOSAL_NOT_FOUND', false);
     } catch (error) {
       const reasonCode = error instanceof ManagerApplyError ? error.reasonCode : 'MANAGER_DECISION_REJECTED';
       // Approved but not applicable: recorded as such, never as an owner rejection.
@@ -281,8 +293,9 @@ export class ProductManagerService {
         { ...base, reasonCode, retryable: false, approvedByOwner: true }, task.id);
       return { success: false, errorCode: reasonCode };
     }
-    this.events.record(projectId, MANAGER_APPLIED_EVENT, `The owner approved the Manager's ${payload.decision.decision} for task ${task.id}.`,
-      { ...base, decision: payload.decision.decision, approvedByOwner: true }, task.id);
+    const label = payload.plan ? 'PLAN' : payload.decision!.decision;
+    this.events.record(projectId, MANAGER_APPLIED_EVENT, `The owner approved the Manager's ${label} for task ${task.id}.`,
+      { ...base, decision: label, approvedByOwner: true }, task.id);
     return { success: true };
   }
 
@@ -300,29 +313,24 @@ export class ProductManagerService {
     throw new ManagerApplyError('MANAGER_DECISION_REJECTED', !recorded || recorded.status !== 'REJECTED');
   }
 
-  public async decide(pending: PendingManagerDecision, manager: ManagerCandidate): Promise<ManagerOutcome> {
-    const task = pending.task;
-    const snapshot = this.snapshot(task);
-    const base = { taskRevision: task.revision_count, kind: pending.kind };
-    const record = (type: string, summary: string, payload: Record<string, unknown>) =>
-      this.events.record(task.project_id, type, summary, { ...base, ...payload }, task.id);
-    const failed = (reasonCode: string, retryable: boolean, extra: Record<string, unknown> = {}): ManagerOutcome => {
-      if (retryable) this.retryAfter.set(this.key(task), this.now().getTime() + RETRY_AFTER_MS);
-      record(MANAGER_FAILED_EVENT, `The automated Manager made no decision for task ${task.id}: ${reasonCode}.`, { reasonCode, retryable, ...extra });
-      return { outcome: 'FAILED', reasonCode };
-    };
-    const notStarted = (reasonCode: string): ManagerOutcome => {
-      this.retryAfter.set(this.key(task), this.now().getTime() + RETRY_AFTER_MS);
-      const already = this.eventsForRevision(task).some((event) => event.type === MANAGER_NOT_RUN_EVENT &&
-        (event.structured_payload as { reasonCode?: unknown } | null)?.reasonCode === reasonCode);
-      if (!already) record(MANAGER_NOT_RUN_EVENT, `The automated Manager could not start for task ${task.id} yet: ${reasonCode}.`, { reasonCode });
-      return { outcome: 'NOT_RUN', reasonCode };
-    };
-
-    const fenced = this.projectFence(task.project_id, task.id);
-    if (fenced) return { outcome: 'NOT_RUN', reasonCode: fenced };
-    if (!this.stillMatches(task.id, snapshot)) return { outcome: 'NOT_RUN', reasonCode: 'TASK_MOVED_ON' };
-
+  /**
+   * One account-bound, read-only Manager CLI call (#239, #245): RUNNING
+   * attempt, role-aware routing, WorkerSlotLeaseService lease with heartbeat,
+   * no repository context. Returns the provider's answer while the lease is
+   * still held, so the caller applies or proposes it and then `finish`es.
+   */
+  private async callAgent(
+    task: Task,
+    manager: ManagerCandidate,
+    snapshot: TaskSnapshot,
+    record: (type: string, summary: string, payload: Record<string, unknown>) => void,
+    expectedProtocol: 'manager.v1' | 'plan.v1',
+    instructions: string[],
+  ): Promise<
+    | { status: 'NOT_STARTED'; reasonCode: string }
+    | { status: 'ANSWERED'; result: AgentExecutionResult; attemptId: string; leaseLost: boolean; stillOwned: () => boolean; finish: (status: 'COMPLETED' | 'FAILED') => boolean }
+    | { status: 'ERROR'; attemptId: string }
+  > {
     const attemptId = `attempt-${crypto.randomUUID()}`;
     const nextAttemptNumber = Math.max(0, ...this.repo.getTaskAttemptsByTask(task.id).map((a) => a.attempt_number)) + 1;
     this.repo.createTaskAttempt({
@@ -351,26 +359,25 @@ export class ProductManagerService {
       return !!current && !current.released_at && current.lease_token === lease.lease_token &&
         Date.parse(current.expires_at) > this.now().getTime() && this.repo.getTaskAttempt(attemptId)?.status === 'RUNNING';
     };
-
     try {
       const routing = await new RoleAwareRoutingService(this.repo, this.registry, this.events).routeRole({
         projectId: task.project_id, taskId: task.id, attemptId, roleProfileId: manager.roleProfileId, agentProfileId: manager.agentProfileId,
         candidateRefs: [{ accountId: manager.accountId, resourceId: manager.resourceId }], persistAssignment: true, allowManualBridge: false,
       });
       assignmentId = routing.selectedAssignmentId ?? null;
-      if (routing.outcome !== 'SELECTED' || !routing.selectedAssignmentId || !routing.decisionId) { finish('FAILED'); return notStarted('ROUTING_NOT_SELECTED'); }
+      if (routing.outcome !== 'SELECTED' || !routing.selectedAssignmentId || !routing.decisionId) { finish('FAILED'); return { status: 'NOT_STARTED', reasonCode: 'ROUTING_NOT_SELECTED' }; }
       const acquired = leases.acquireForAssignment(routing.selectedAssignmentId, this.leaseTtlMs);
-      if (acquired.status !== 'ACQUIRED') { finish('FAILED'); return notStarted(acquired.code); }
+      if (acquired.status !== 'ACQUIRED') { finish('FAILED'); return { status: 'NOT_STARTED', reasonCode: acquired.code }; }
       lease = acquired.lease;
       const assignment = acquired.assignment;
       const account = this.repo.getProviderAccount(assignment.selected_account_id);
       const resource = this.repo.getProviderResource(assignment.selected_resource_id);
       const adapter = this.registry.get(assignment.selected_provider_id);
-      if (!account || !resource || !adapter) { finish('FAILED'); return notStarted('MANAGER_BINDING_INVALID'); }
-      if (this.projectFence(task.project_id, task.id) || !this.stillMatches(task.id, snapshot)) { finish('FAILED'); return notStarted('TASK_MOVED_ON'); }
+      if (!account || !resource || !adapter) { finish('FAILED'); return { status: 'NOT_STARTED', reasonCode: 'MANAGER_BINDING_INVALID' }; }
+      if (this.projectFence(task.project_id, task.id) || !this.stillMatches(task.id, snapshot)) { finish('FAILED'); return { status: 'NOT_STARTED', reasonCode: 'TASK_MOVED_ON' }; }
 
       const executionId = crypto.randomUUID();
-      record(MANAGER_STARTED_EVENT, `The automated Manager is deciding task ${task.id}.`,
+      record(MANAGER_STARTED_EVENT, `The automated Manager is working on task ${task.id}.`,
         { attemptId, assignmentId, executionId, managerAgentId: manager.agentId, accountId: account.id });
       const binding: RuntimeExecutionBinding = {
         authorizationId: `manager:${attemptId}`, routingDecisionId: routing.decisionId, assignmentId: assignment.id,
@@ -389,38 +396,94 @@ export class ProductManagerService {
       heartbeat.unref?.();
       let result: AgentExecutionResult;
       try {
-        // No repository context: the Manager decides from the task, contract and results in the prompt.
+        // No repository context: the Manager works from the task, contract and results in the prompt.
         result = await adapter.execute({ projectId: task.project_id, taskId: task.id, attemptId, contextFiles: [], runtimeBinding: binding,
-          expectedProtocol: 'manager.v1', instructions: this.instructions(task, pending.kind) });
+          expectedProtocol, instructions });
       } catch {
         result = { executionId, status: 'FAILED', errorCode: 'EXECUTION_FAILED' };
       } finally {
         clearInterval(heartbeat);
       }
+      return { status: 'ANSWERED', result, attemptId, leaseLost, stillOwned, finish };
+    } catch {
+      finish('FAILED');
+      return { status: 'ERROR', attemptId };
+    }
+  }
 
-      if (leaseLost || !stillOwned()) { finish('FAILED'); return failed('MANAGER_LEASE_OR_FENCE_LOST', true, { attemptId }); }
+  public async decide(pending: PendingManagerDecision, manager: ManagerCandidate): Promise<ManagerOutcome> {
+    const task = pending.task;
+    const snapshot = this.snapshot(task);
+    const base = { taskRevision: task.revision_count, kind: pending.kind };
+    const record = (type: string, summary: string, payload: Record<string, unknown>) =>
+      this.events.record(task.project_id, type, summary, { ...base, ...payload }, task.id);
+    const failed = (reasonCode: string, retryable: boolean, extra: Record<string, unknown> = {}): ManagerOutcome => {
+      if (retryable) this.retryAfter.set(this.key(task), this.now().getTime() + RETRY_AFTER_MS);
+      record(MANAGER_FAILED_EVENT, `The automated Manager made no decision for task ${task.id}: ${reasonCode}.`, { reasonCode, retryable, ...extra });
+      return { outcome: 'FAILED', reasonCode };
+    };
+    const notStarted = (reasonCode: string): ManagerOutcome => {
+      this.retryAfter.set(this.key(task), this.now().getTime() + RETRY_AFTER_MS);
+      const already = this.eventsForRevision(task).some((event) => event.type === MANAGER_NOT_RUN_EVENT &&
+        (event.structured_payload as { reasonCode?: unknown } | null)?.reasonCode === reasonCode);
+      if (!already) record(MANAGER_NOT_RUN_EVENT, `The automated Manager could not start for task ${task.id} yet: ${reasonCode}.`, { reasonCode });
+      return { outcome: 'NOT_RUN', reasonCode };
+    };
+
+    const fenced = this.projectFence(task.project_id, task.id);
+    if (fenced) return { outcome: 'NOT_RUN', reasonCode: fenced };
+    if (!this.stillMatches(task.id, snapshot)) return { outcome: 'NOT_RUN', reasonCode: 'TASK_MOVED_ON' };
+    const project = this.repo.getProjectMetadata(task.project_id);
+    if (pending.kind === 'PLAN' && !project?.contract) return { outcome: 'NOT_RUN', reasonCode: 'NO_APPROVED_CONTRACT' };
+    const contractHash = pending.kind === 'PLAN' ? contractSha256(project!.contract!) : null;
+
+    const call = await this.callAgent(task, manager, snapshot, record, pending.kind === 'PLAN' ? 'plan.v1' : 'manager.v1',
+      pending.kind === 'PLAN' ? this.planningInstructions(project!, contractHash!) : this.instructions(task, pending.kind));
+    if (call.status === 'NOT_STARTED') return notStarted(call.reasonCode);
+    if (call.status === 'ERROR') return failed('MANAGER_INTERNAL_ERROR', true, { attemptId: call.attemptId });
+    const { result, attemptId, finish, stillOwned } = call;
+    try {
+      if (call.leaseLost || !stillOwned()) { finish('FAILED'); return failed('MANAGER_LEASE_OR_FENCE_LOST', true, { attemptId }); }
       if (result.status !== 'COMPLETED') { finish('FAILED'); return failed(result.errorCode ? String(result.errorCode) : 'PROVIDER_EXECUTION_FAILED', true, { attemptId }); }
-      const parsed = ProtocolParser.parse(result.outputProtocol ?? '');
-      if (!parsed.success || parsed.data?.type !== 'manager.v1') { finish('FAILED'); return failed('MANAGER_PROTOCOL_INVALID', false, { attemptId }); }
-      const raw = parsed.data.data;
-      if (raw.project_id !== task.project_id || raw.task_id !== task.id) { finish('FAILED'); return failed('MANAGER_DECISION_FOR_OTHER_TASK', false, { attemptId }); }
-      if (!ALLOWED_DECISIONS[pending.kind].has(raw.decision)) {
-        finish('FAILED');
-        return failed('MANAGER_DECISION_NOT_ALLOWED', false, { attemptId, decision: raw.decision });
+
+      let proposalPayload: Record<string, unknown>;
+      let apply: () => Promise<void>;
+      let label: string;
+      if (pending.kind === 'PLAN') {
+        const parsed = parsePlanProtocol(result.outputProtocol);
+        if (!parsed.success) { finish('FAILED'); return failed('PLAN_PROTOCOL_INVALID', false, { attemptId }); }
+        if (parsed.data.project_id !== task.project_id) { finish('FAILED'); return failed('PLAN_FOR_OTHER_PROJECT', false, { attemptId }); }
+        if (parsed.data.contract_sha256.toLowerCase() !== contractHash) { finish('FAILED'); return failed('PLAN_FOR_STALE_CONTRACT', false, { attemptId }); }
+        const plan = parsed.data;
+        proposalPayload = { plan, contractSha256: contractHash };
+        apply = () => this.applyPlan(task.id, plan, contractHash!, snapshot);
+        label = `a plan of ${plan.tasks.length} task(s)`;
+      } else {
+        const parsed = ProtocolParser.parse(result.outputProtocol ?? '');
+        if (!parsed.success || parsed.data?.type !== 'manager.v1') { finish('FAILED'); return failed('MANAGER_PROTOCOL_INVALID', false, { attemptId }); }
+        const raw = parsed.data.data;
+        if (raw.project_id !== task.project_id || raw.task_id !== task.id) { finish('FAILED'); return failed('MANAGER_DECISION_FOR_OTHER_TASK', false, { attemptId }); }
+        if (!ALLOWED_DECISIONS[pending.kind].has(raw.decision)) {
+          finish('FAILED');
+          return failed('MANAGER_DECISION_NOT_ALLOWED', false, { attemptId, decision: raw.decision });
+        }
+        if (raw.expected_task_state !== snapshot.taskState || raw.expected_revision !== snapshot.taskRevision) {
+          finish('FAILED');
+          return failed('MANAGER_DECISION_STALE', false, { attemptId });
+        }
+        // Our own message identity: a reused provider message_id must never replay an earlier decision.
+        const decision: ManagerProtocol = { ...raw, message_id: `manager-auto-${crypto.randomUUID()}`, created_at: this.iso() };
+        proposalPayload = { decision };
+        apply = () => this.applyBound(decision, task.id, snapshot);
+        label = decision.decision;
       }
-      if (raw.expected_task_state !== snapshot.taskState || raw.expected_revision !== snapshot.taskRevision) {
-        finish('FAILED');
-        return failed('MANAGER_DECISION_STALE', false, { attemptId });
-      }
-      // Our own message identity: a reused provider message_id must never replay an earlier decision.
-      const decision: ManagerProtocol = { ...raw, message_id: `manager-auto-${crypto.randomUUID()}`, created_at: this.iso() };
 
       // The mode is read now, not at dispatch: a switch to approval during the call is honoured.
       if (this.getMode(task.project_id) === 'APPROVE') {
         if (!this.stillMatches(task.id, snapshot)) { finish('FAILED'); return failed('TASK_MOVED_ON', false, { attemptId }); }
         const proposal = this.events.record(task.project_id, MANAGER_PROPOSED_EVENT,
-          `The Manager proposes ${decision.decision} for task ${task.id}; waiting for the owner.`,
-          { ...base, ...snapshot, taskId: task.id, attemptId, decision }, task.id);
+          `The Manager proposes ${label} for task ${task.id}; waiting for the owner.`,
+          { ...base, ...snapshot, taskId: task.id, attemptId, ...proposalPayload }, task.id);
         finish('COMPLETED');
         return { outcome: 'PROPOSED', eventId: proposal.id };
       }
@@ -428,20 +491,92 @@ export class ProductManagerService {
       try {
         // Applied while the call still holds its lease; recovery cannot have released it.
         if (!stillOwned()) throw new ManagerApplyError('MANAGER_LEASE_OR_FENCE_LOST', true);
-        await this.applyBound(decision, task.id, snapshot);
+        await apply();
       } catch (error) {
         finish('FAILED');
-        const apply = error instanceof ManagerApplyError ? error : new ManagerApplyError('MANAGER_DECISION_REJECTED', true);
-        return failed(apply.reasonCode, apply.retryable, { attemptId });
+        const applyError = error instanceof ManagerApplyError ? error : new ManagerApplyError('MANAGER_DECISION_REJECTED', true);
+        return failed(applyError.reasonCode, applyError.retryable, { attemptId });
       }
-      const event = this.events.record(task.project_id, MANAGER_APPLIED_EVENT, `The automated Manager applied ${decision.decision} for task ${task.id}.`,
-        { ...base, attemptId, decision: decision.decision, approvedByOwner: false }, task.id);
+      const event = this.events.record(task.project_id, MANAGER_APPLIED_EVENT, `The automated Manager applied ${label} for task ${task.id}.`,
+        { ...base, attemptId, decision: pending.kind === 'PLAN' ? 'PLAN' : (proposalPayload.decision as ManagerProtocol).decision, approvedByOwner: false }, task.id);
       finish('COMPLETED');
       return { outcome: 'APPLIED', eventId: event.id };
     } catch {
       finish('FAILED');
       return failed('MANAGER_INTERNAL_ERROR', true, { attemptId });
     }
+  }
+
+  /**
+   * The planning anchor (#245): for a RUNNING project with an approved
+   * contract and no tasks, one durable *Plan the project* task that the
+   * Manager's plan.v1 call is bound to. It is never dispatched; after the plan
+   * is applied it becomes APPROVED and records the plan.
+   */
+  public ensurePlanningAnchor(projectId: string): Task | null {
+    const project = this.repo.getProjectMetadata(projectId);
+    if (!project?.contract || project.status !== 'RUNNING' || this.repo.isProjectTrashed(projectId)) return null;
+    const existing = this.repo.getProjectPlanningTaskId(projectId);
+    if (existing) return this.repo.getTask(existing);
+    if (this.repo.getTasksByProject(projectId).some((task) => !this.repo.isTaskTrashed(task.id))) return null;
+    const anchor = this.tasks.createTask({
+      projectId, title: 'Plan the project', priority: 'MEDIUM', risk: 'LOW',
+      description: 'Agent Forge planning record: the Manager turns the approved contract into tasks. This task is never dispatched.',
+      acceptanceCriteria: ['The approved contract is split into concrete tasks'], constraints: [],
+    });
+    if (!this.repo.setProjectPlanningTaskId(projectId, anchor.id)) {
+      // Another anchor won; ours is cancelled so only one planning record exists.
+      this.transition(anchor.id, 'CANCEL');
+      const winner = this.repo.getProjectPlanningTaskId(projectId);
+      return winner ? this.repo.getTask(winner) : null;
+    }
+    return anchor;
+  }
+
+  /** Creates the planned tasks through TaskService only if nothing moved, then approves the anchor. */
+  private async applyPlan(anchorId: string, plan: PlanProtocol, contractHash: string, expected: TaskSnapshot): Promise<void> {
+    const anchor = this.repo.getTask(anchorId);
+    const project = anchor ? this.repo.getProjectMetadata(anchor.project_id) : null;
+    if (!anchor || !project?.contract || !this.stillMatches(anchorId, expected)) throw new ManagerApplyError('TASK_MOVED_ON', false);
+    if (contractSha256(project.contract) !== contractHash) throw new ManagerApplyError('PLAN_FOR_STALE_CONTRACT', false);
+    if (this.repo.getTasksByProject(project.id).some((task) => task.id !== anchorId && !this.repo.isTaskTrashed(task.id))) {
+      throw new ManagerApplyError('PLAN_TASKS_ALREADY_EXIST', false);
+    }
+    this.repo.runInImmediateTransaction(() => {
+      for (const planned of plan.tasks) {
+        this.tasks.createTask({
+          projectId: project.id, title: planned.title, description: planned.description || null, priority: planned.priority, risk: planned.risk,
+          acceptanceCriteria: planned.acceptance_criteria, constraints: planned.constraints,
+        });
+      }
+      if (!this.transition(anchorId, 'APPROVE')) throw new ManagerApplyError('TASK_TRANSITION_REJECTED', false);
+    });
+  }
+
+  private transition(taskId: string, trigger: 'APPROVE' | 'CANCEL'): boolean {
+    const current = this.repo.getTask(taskId);
+    if (!current) return false;
+    return this.tasks.transitionAuthorizedTask(taskId, trigger, captureAuthorizedTaskTransitionBinding(current)).success;
+  }
+
+  private planningInstructions(project: Project, contractHash: string): string[] {
+    const contract = project.contract!;
+    const list = (label: string, items: string[] | undefined) => (items ?? []).map((item) => `${label}: ${item}`);
+    return [
+      'You are the project Manager. Split this approved project contract into concrete, independently checkable coding tasks, in the order they should be done.',
+      `Project: ${project.name}`,
+      `Goal: ${contract.goal}`,
+      ...(contract.business_context ? [`Business context: ${contract.business_context}`] : []),
+      ...list('Acceptance criterion', contract.acceptance_criteria),
+      ...list('Architecture constraint', contract.architecture_constraints),
+      ...list('Technical constraint', contract.technical_constraints),
+      ...list('Security requirement', contract.security_requirements),
+      ...list('Testing requirement', contract.testing_requirements),
+      ...list('Definition of done', contract.definition_of_done),
+      ...list('Non-goal', contract.non_goals),
+      'Each task needs a short title, a description and at least one acceptance criterion. Use at most 20 tasks.',
+      `Use exactly: project_id "${project.id}", contract_sha256 "${contractHash}".`,
+    ];
   }
 
   /**

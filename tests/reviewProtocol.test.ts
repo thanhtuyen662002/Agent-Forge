@@ -49,4 +49,10 @@ describe('review.v1 verdict protocol (#233)', () => {
     });
     expect(result).toMatchObject({ status: 'FAILED', errorCode: 'UNSUPPORTED_CLIENT' });
   });
+
+  it('keeps plan.v1 out of the manual protocol inbox too (#245)', () => {
+    const plan = JSON.stringify({ protocol: 'plan.v1', message_id: 'p', project_id: 'project-1', contract_sha256: 'a'.repeat(64),
+      tasks: [{ title: 'One', acceptance_criteria: ['done'] }] });
+    expect(ProtocolParser.parse(plan).success).toBe(false);
+  });
 });

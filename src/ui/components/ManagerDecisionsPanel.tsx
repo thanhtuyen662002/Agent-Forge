@@ -93,7 +93,7 @@ export const ManagerDecisionsPanel: React.FC<{ projectId: string }> = ({ project
                   <span className="text-xs text-slate-400">({t('runtime.managerPanel.revision', { revision: proposal.taskRevision })})</span>
                 </span>
                 <span className="text-xs text-forge-cyan">
-                  {proposal.decision === 'EXECUTE' || proposal.decision === 'BLOCK'
+                  {proposal.decision === 'EXECUTE' || proposal.decision === 'BLOCK' || proposal.decision === 'PLAN'
                     ? t(`runtime.managerPanel.decision${proposal.decision}`)
                     : proposal.decision}
                 </span>

@@ -170,7 +170,36 @@ export const ReviewProtocolSchema = z.object({
 export type ReviewProtocol = z.infer<typeof ReviewProtocolSchema>;
 
 // ==========================================
-// 6. Outbox Packages
+// 6. Manager Plan (plan.v1)
+// ==========================================
+
+export const PlanTaskSchema = z.object({
+  title: boundedString(z.string().min(1).max(200), MAX_PROTOCOL_STRING_BYTES),
+  description: protocolString().optional().default(''),
+  acceptance_criteria: boundedArray(z.array(requiredProtocolString()).min(1), 20),
+  constraints: boundedArray(z.array(requiredProtocolString()), 20).optional().default([]),
+  priority: PriorityEnum.optional().default('MEDIUM'),
+  risk: RiskLevelEnum.optional().default('MEDIUM'),
+}).strict();
+export type PlanTask = z.infer<typeof PlanTaskSchema>;
+
+/**
+ * The Manager's task breakdown of an approved project contract (#245). It is
+ * bound to the project and to the SHA-256 of the exact contract it planned;
+ * parsed only by the automated planning path, never by the protocol inbox.
+ */
+export const PlanProtocolSchema = z.object({
+  protocol: z.literal('plan.v1'),
+  message_id: requiredProtocolString(),
+  project_id: requiredProtocolString(),
+  contract_sha256: z.string().regex(/^[0-9a-f]{64}$/i),
+  tasks: boundedArray(z.array(PlanTaskSchema).min(1), 20),
+  created_at: protocolString().optional(),
+}).strict();
+export type PlanProtocol = z.infer<typeof PlanProtocolSchema>;
+
+// ==========================================
+// 7. Outbox Packages
 // ==========================================
 
 export interface WorkOrderPackage {

@@ -74,7 +74,7 @@ export class ClaudeCodeCliAdapter extends LocalCliAdapterBase {
   }
 
   protected override buildExecutionArgs(request: AgentExecutionRequest, _prompt: string): string[] {
-    const readOnly = request.expectedProtocol === 'review.v1' || request.expectedProtocol === 'manager.v1';
+    const readOnly = request.expectedProtocol === 'review.v1' || request.expectedProtocol === 'manager.v1' || request.expectedProtocol === 'plan.v1';
     // The prompt arrives on stdin. Variadic tool lists come last so they cannot swallow other flags.
     return [
       '-p', '--output-format', 'json', '--model', request.runtimeBinding?.modelName ?? '',

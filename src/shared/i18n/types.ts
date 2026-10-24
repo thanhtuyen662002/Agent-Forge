@@ -509,6 +509,7 @@ export interface TranslationDictionary {
       revision: string;
       decisionEXECUTE: string;
       decisionBLOCK: string;
+      decisionPLAN: string;
     };
     quota: {
       title: string;

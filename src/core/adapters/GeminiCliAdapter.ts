@@ -122,7 +122,7 @@ export class GeminiCliAdapter extends LocalCliAdapterBase {
     // edit. A coder auto-approves edits inside the isolated workspace (the
     // workspace is the boundary; Docker sandboxes are not assumed on Windows).
     // A reviewer or Manager runs in the documented read-only `plan` mode (#242).
-    const readOnly = request.expectedProtocol === 'review.v1' || request.expectedProtocol === 'manager.v1';
+    const readOnly = request.expectedProtocol === 'review.v1' || request.expectedProtocol === 'manager.v1' || request.expectedProtocol === 'plan.v1';
     return ['--output-format', 'json', '--model', modelName ?? '', '--approval-mode', readOnly ? 'plan' : 'auto_edit'];
   }
 

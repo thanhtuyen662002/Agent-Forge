@@ -215,7 +215,9 @@ export class DesktopAutomationService {
             continue;
           }
         }
-        // A task without Manager authority for its revision asks the Manager agent first.
+        // An approved contract with no tasks yet gets its planning record first (#245).
+        if (this.manager) { try { this.manager.ensurePlanningAnchor(project.id); } catch { /* next pass */ } }
+        // A task without Manager authority for its revision (or the plan) asks the Manager agent first.
         const toDecide = this.manager?.pendingDecision(project.id) ?? null;
         if (toDecide && !toDecide.deferred) {
           const manager = this.findAgent('MANAGER');
