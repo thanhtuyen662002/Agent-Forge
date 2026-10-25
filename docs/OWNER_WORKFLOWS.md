@@ -26,7 +26,17 @@ Click **Add agent**. The form has three steps:
      may name the profile or leave it empty to generate one. You also choose
      how many tasks it may run in parallel (1 or 2, matching the bounded
      self-host runtime).
-   - Enter the model name the tool should use.
+   - Pick the model (#263). The list depends on the connection:
+     - **Codex CLI**: the list comes live from Codex's own `model/list`. The
+       CLI's default model is preselected, and each model shows its
+       description. It is read in a temporary, empty `CODEX_HOME` (no sign-in,
+       token or profile is read), cached for 10 minutes, and replaced by a
+       built-in list if the read fails.
+     - **Claude Code / Gemini CLI**: the CLI's aliases (`sonnet`, `opus`,
+       `haiku`; `auto`, `pro`, `flash`, `flash-lite`) always resolve to the
+       latest version, followed by specific model IDs.
+     - **Other (type it)** accepts any model name. The manual bridge keeps a
+       plain text field.
 3. **Optional instructions** that are stored on the agent's profile.
 
 Saving runs one immediate SQLite transaction

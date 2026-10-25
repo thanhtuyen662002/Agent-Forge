@@ -7,6 +7,7 @@ import { useAgentRoster } from '../agentRoster';
 import { useAccountSignIn } from '../accountSignIn';
 import { SignInDialog } from '../components/SignInDialog';
 import { CliSignInDialog } from '../components/CliSignInDialog';
+import { ModelPicker } from '../components/ModelPicker';
 import type { AgentMutationResult } from '../agentRoster';
 import type { AgentRole } from '../../core/types/domain';
 import type { AgentConnectionKind, AgentRosterEntry } from '../../core/types/workspace';
@@ -307,7 +308,7 @@ export const AgentCenterView: React.FC = () => {
                   <div role="radiogroup" aria-label={t('agentCenter.form.connectionLabel')} className="space-y-2">
                     {CONNECTION_OPTIONS.map((connection) => (
                       <label key={connection} className={`flex gap-3 p-2.5 rounded-lg border cursor-pointer ${form.connection === connection ? 'border-forge-cyan bg-forge-cyan/10' : 'border-surface-border hover:border-surface-hover'}`}>
-                        <input type="radio" name="agent-connection" value={connection} checked={form.connection === connection} onChange={() => setForm({ ...form, connection })} className="mt-1 accent-forge-cyan" />
+                        <input type="radio" name="agent-connection" value={connection} checked={form.connection === connection} onChange={() => setForm({ ...form, connection, modelName: '' })} className="mt-1 accent-forge-cyan" />
                         <span>
                           <span className="block text-white font-medium">{t(`agentCenter.connections.${connection}`)}</span>
                           <span className="block text-xs text-slate-400">{t(`agentCenter.connectionHelp.${connection}`)}</span>
@@ -323,17 +324,14 @@ export const AgentCenterView: React.FC = () => {
 
                 <div>
                   <label htmlFor="agent-model" className="block text-slate-300 mb-1">{t('agentCenter.form.modelLabel')}</label>
-                  <input
+                  <ModelPicker
                     id="agent-model"
-                    type="text"
-                    required
-                    maxLength={120}
+                    connection={editing ? editing.connection : form.connection}
                     value={form.modelName}
                     disabled={modelLocked}
-                    aria-describedby={modelLocked ? 'agent-model-locked' : undefined}
-                    onChange={(event) => setForm({ ...form, modelName: event.target.value })}
-                    placeholder={t('agentCenter.form.modelPlaceholder')}
-                    className={`${inputClass} disabled:opacity-50`}
+                    describedBy={modelLocked ? 'agent-model-locked' : undefined}
+                    onChange={(modelName) => setForm((current) => ({ ...current, modelName }))}
+                    inputClass={inputClass}
                   />
                   {modelLocked && <p id="agent-model-locked" className="mt-1 text-xs text-amber-300">{t('agentCenter.form.modelLockedHint')}</p>}
                 </div>

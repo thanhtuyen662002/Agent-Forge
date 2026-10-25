@@ -66,6 +66,7 @@ export interface OrchestratorApi {
   getAgents: () => Promise<any[]>;
   getAgentRoster: (options?: { includeRemoved?: boolean }) => Promise<any[]>;
   createAgent: (data: Record<string, unknown>) => Promise<any>;
+  listAgentModels: (connection: string) => Promise<any>;
   updateAgent: (data: Record<string, unknown>) => Promise<any>;
   removeAgent: (agentId: string) => Promise<any>;
   restoreAgent: (agentId: string) => Promise<any>;
@@ -207,6 +208,7 @@ const api: OrchestratorApi = {
   getAgents: () => ipcRenderer.invoke('agents:list'),
   getAgentRoster: (options) => ipcRenderer.invoke('agents:roster', { includeRemoved: options?.includeRemoved === true }),
   createAgent: (data) => ipcRenderer.invoke('agents:create', data),
+  listAgentModels: (connection) => ipcRenderer.invoke('agents:listModels', { connection }),
   updateAgent: (data) => ipcRenderer.invoke('agents:update', data),
   removeAgent: (agentId: string) => ipcRenderer.invoke('agents:remove', { agentId }),
   restoreAgent: (agentId: string) => ipcRenderer.invoke('agents:restore', { agentId }),
