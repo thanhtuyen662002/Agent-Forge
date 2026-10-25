@@ -180,6 +180,8 @@ export const PlanTaskSchema = z.object({
   constraints: boundedArray(z.array(requiredProtocolString()), 20).optional().default([]),
   priority: PriorityEnum.optional().default('MEDIUM'),
   risk: RiskLevelEnum.optional().default('MEDIUM'),
+  /** Repository paths the coder needs for this task (#254); validated before use. */
+  context_paths: boundedArray(z.array(requiredProtocolString()), 32).optional().default([]),
 }).strict();
 export type PlanTask = z.infer<typeof PlanTaskSchema>;
 

@@ -296,7 +296,18 @@ bound to the contract's hash: after a rejected or failed plan, editing the
 contract plans again, and creating a task by hand ends planning.
 In *approve each decision* mode the proposed task list is shown under *Manager
 decisions* first. A malformed plan, or a plan for another project or contract,
-creates nothing. Task-scoped context paths are follow-up #254.
+creates nothing.
+
+**Task context (#254).** A planned task may name up to 32 `context_paths`:
+repository files or directories the coder needs. Each must be a portable
+relative path inside the repository that exists, is not a link, and is allowed
+by policy (`.git`, secrets and agent configuration are denied). A plan naming
+an invalid path is retried. The paths are stored per task and checked again at
+dispatch; the coder is then authorized for exactly those paths instead of the
+repository's top-level entries, so large repositories stay within the workspace
+bounds. A directory there is also where the coder may create new files (#240).
+A stored path that no longer exists stops the dispatch with
+`TASK_CONTEXT_INVALID`. Editing the paths by hand is a later follow-up.
 
 ## Automated verification after a completed coder run
 

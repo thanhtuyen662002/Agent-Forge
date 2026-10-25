@@ -1,4 +1,8 @@
 import crypto from 'crypto';
+import fs from 'fs';
+import path from 'path';
+import { canonicalizePortableRelativePath } from '../context/ContextIntegrity';
+import { PolicyService } from '../services/PolicyService';
 import { PlanProtocolSchema, type PlanProtocol } from '../types/protocols';
 import type { ProjectContract } from '../types/domain';
 import { MAX_PROTOCOL_INPUT_BYTES, isWithinByteLimit } from './limits';
@@ -34,4 +38,43 @@ export function contractSha256(contract: ProjectContract): string {
       ? Object.fromEntries(Object.keys(value as Record<string, unknown>).sort().map((key) => [key, canonical((value as Record<string, unknown>)[key])]))
       : value;
   return crypto.createHash('sha256').update(JSON.stringify(canonical(contract))).digest('hex');
+}
+
+export const MAX_TASK_CONTEXT_PATHS = 32;
+
+export type ContextPathCheck =
+  | { ok: true; paths: string[] }
+  | { ok: false; reasonCode: 'CONTEXT_PATH_INVALID' | 'CONTEXT_PATH_MISSING' | 'CONTEXT_PATH_DENIED' | 'CONTEXT_PATH_LINK' | 'CONTEXT_LIMIT_EXCEEDED'; path: string };
+
+/**
+ * Validates task-scoped coder context (#254): each path is a canonical
+ * portable relative path inside the repository, exists, is not a link, and is
+ * allowed by policy (sensitive names, .git and agent configuration are
+ * denied). Duplicates are folded; at most 32 paths.
+ */
+export function validateContextPaths(repositoryRoot: string, paths: readonly string[]): ContextPathCheck {
+  const result: string[] = [];
+  const seen = new Set<string>();
+  for (const raw of paths) {
+    let relative: string;
+    try { relative = canonicalizePortableRelativePath(raw); } catch { return { ok: false, reasonCode: 'CONTEXT_PATH_INVALID', path: String(raw) }; }
+    const key = relative.toLowerCase();
+    if (seen.has(key)) continue;
+    seen.add(key);
+    if (seen.size > MAX_TASK_CONTEXT_PATHS) return { ok: false, reasonCode: 'CONTEXT_LIMIT_EXCEEDED', path: relative };
+    const absolute = path.resolve(repositoryRoot, relative);
+    const inside = path.relative(repositoryRoot, absolute);
+    if (!inside || inside.startsWith('..') || path.isAbsolute(inside)) return { ok: false, reasonCode: 'CONTEXT_PATH_INVALID', path: relative };
+    // Every component must be a real file or directory; a link could leave the repository.
+    let current = repositoryRoot;
+    for (const part of inside.split(/[\\/]/)) {
+      current = path.join(current, part);
+      const stat = fs.lstatSync(current, { throwIfNoEntry: false });
+      if (!stat) return { ok: false, reasonCode: 'CONTEXT_PATH_MISSING', path: relative };
+      if (stat.isSymbolicLink()) return { ok: false, reasonCode: 'CONTEXT_PATH_LINK', path: relative };
+    }
+    if (!PolicyService.evaluateRealPathAccess(absolute, repositoryRoot, false).allowed) return { ok: false, reasonCode: 'CONTEXT_PATH_DENIED', path: relative };
+    result.push(relative);
+  }
+  return { ok: true, paths: result };
 }
