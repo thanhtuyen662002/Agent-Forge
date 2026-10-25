@@ -28,6 +28,8 @@ import type { DesktopAutomationService } from '../core/services/DesktopAutomatio
 import type { AccountQuotaService } from '../core/services/AccountQuotaService';
 import type { CodexAccountConnectionService } from '../core/services/CodexAccountConnectionService';
 import type { CliAccountConnectionService } from '../core/services/CliAccountConnectionService';
+import { ModelCatalogService } from '../core/services/ModelCatalogService';
+import { AgentConnectionKindEnum } from '../core/types/workspace';
 import {
   CreateProjectIpcSchema,
   BindProjectRepositoryIpcSchema,
@@ -138,6 +140,7 @@ export function registerIpcHandlers(
   rendererPolicy: RendererNavigationPolicyOptions = resolveRendererNavigationPolicy({ isPackaged: false }),
   runtime: {
     automation?: DesktopAutomationService; quota?: AccountQuotaService; signIn?: CodexAccountConnectionService; cliSignIn?: CliAccountConnectionService;
+    models?: ModelCatalogService;
   } = {},
 ): void {
   const adjService =
@@ -936,6 +939,14 @@ export function registerIpcHandlers(
   registerPrivilegedHandler('agents:roster', async (_, payload: unknown) => {
     const includeRemoved = Boolean(payload && typeof payload === 'object' && (payload as { includeRemoved?: unknown }).includeRemoved === true);
     return sanitizeOutputValue(workspaceManagementService.listAgents({ includeRemoved }));
+  });
+
+  // Model picker (#263): the CLI's own list (Codex) or its latest-tracking aliases.
+  const modelCatalog = runtime.models ?? new ModelCatalogService();
+  registerPrivilegedHandler('agents:listModels', async (_, payload: unknown) => {
+    const connection = AgentConnectionKindEnum.safeParse(payload && typeof payload === 'object' ? (payload as { connection?: unknown }).connection : undefined);
+    if (!connection.success) return { success: false, errorCode: 'INVALID_INPUT' };
+    return sanitizeOutputValue({ success: true, catalog: await modelCatalog.list(connection.data) });
   });
 
   registerPrivilegedHandler('agents:create', async (_, payload: unknown) => {

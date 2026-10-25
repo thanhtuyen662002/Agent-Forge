@@ -264,6 +264,29 @@ export interface TranslationDictionary {
       CLAUDE_CODE_CLI: string;
       OTHER: string;
     };
+    models: {
+      loading: string;
+      customLabel: string;
+      custom: string;
+      latestGroup: string;
+      modelGroup: string;
+      default: string;
+      sourceLive: string;
+      sourceBuiltIn: string;
+      descriptions: {
+        sonnet: string;
+        opus: string;
+        haiku: string;
+        auto: string;
+        pro: string;
+        flash: string;
+        'flash-lite': string;
+        codexWorkhorse: string;
+        codexFrontier: string;
+        codexPrevious: string;
+        codexFast: string;
+      };
+    };
     form: {
       createTitle: string;
       editTitle: string;
