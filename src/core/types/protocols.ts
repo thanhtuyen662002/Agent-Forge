@@ -37,14 +37,17 @@ export const ReviewIssueSchema = z.object({
 });
 export type ReviewIssuePayload = z.infer<typeof ReviewIssueSchema>;
 
+/** Models often write enum values in lower case (`high`); the meaning is unambiguous (found in the first real trial). */
+const upperCaseEnum = <T extends z.ZodType>(schema: T) => z.preprocess((value) => (typeof value === 'string' ? value.trim().toUpperCase() : value), schema);
+
 export const ManagerProtocolSchema = z.object({
   protocol: z.literal('manager.v1'),
   message_id: requiredProtocolString(),
   project_id: requiredProtocolString(),
   task_id: protocolString().nullable().optional(),
   decision: ManagerDecisionEnum,
-  priority: PriorityEnum.optional().default('MEDIUM'),
-  risk: RiskLevelEnum.optional().default('MEDIUM'),
+  priority: upperCaseEnum(PriorityEnum).optional().default('MEDIUM'),
+  risk: upperCaseEnum(RiskLevelEnum).optional().default('MEDIUM'),
   instructions: protocolStringArray().optional().default([]),
   acceptance_criteria: protocolStringArray().optional().default([]),
   constraints: protocolStringArray().optional().default([]),
@@ -178,8 +181,8 @@ export const PlanTaskSchema = z.object({
   description: protocolString().optional().default(''),
   acceptance_criteria: boundedArray(z.array(requiredProtocolString()).min(1), 20),
   constraints: boundedArray(z.array(requiredProtocolString()), 20).optional().default([]),
-  priority: PriorityEnum.optional().default('MEDIUM'),
-  risk: RiskLevelEnum.optional().default('MEDIUM'),
+  priority: upperCaseEnum(PriorityEnum).optional().default('MEDIUM'),
+  risk: upperCaseEnum(RiskLevelEnum).optional().default('MEDIUM'),
   /** Repository paths the coder needs for this task (#254); validated before use. */
   context_paths: boundedArray(z.array(requiredProtocolString()), 32).optional().default([]),
 }).strict();

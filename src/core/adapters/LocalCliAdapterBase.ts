@@ -29,7 +29,16 @@ import {
 } from '../context/ContextIntegrity';
 
 const LOCAL_CLI_WORKSPACE_VERSION = 1;
-const LOCAL_CLI_WORKSPACE_BASE = path.join(os.tmpdir(), 'agent-forge-local-cli-workspaces');
+// Canonical: Windows TEMP is often a DOS short name (VOTHAN~1). CLIs resolve their
+// cwd to the long path and then refuse tool calls on short-name paths as outside it.
+function canonicalTemporaryRoot(): string {
+  try { return fs.realpathSync.native(os.tmpdir()); } catch { return os.tmpdir(); }
+}
+const LOCAL_CLI_WORKSPACE_BASE = path.join(canonicalTemporaryRoot(), 'agent-forge-local-cli-workspaces');
+/** Where isolated provider workspaces are created (canonical path). */
+export function getLocalCliWorkspaceBase(): string {
+  return LOCAL_CLI_WORKSPACE_BASE;
+}
 const LOCAL_CLI_WORKSPACE_MARKER_SUFFIX = '.workspace.json';
 const LOCAL_CLI_WORKSPACE_STALE_AFTER_MS = 6 * 60 * 60 * 1000;
 const LOCAL_CLI_WORKSPACE_MAX_FILES = 256;
@@ -1088,7 +1097,7 @@ export abstract class LocalCliAdapterBase implements ProviderAdapter {
     lines.push(request.expectedProtocol === 'review.v1'
       ? 'Do not modify any file. Emit one valid JSON review.v1 object (protocol, message_id, project_id, task_id, task_revision, verdict PASS|FIX_REQUIRED|BLOCKED, summary, issues, reviewed_head_sha, reviewed_snapshot_sha) using the exact identifiers given above.'
       : request.expectedProtocol === 'plan.v1'
-        ? 'Do not modify any file. Emit one valid JSON plan.v1 object (protocol, message_id, project_id, contract_sha256, tasks: [{title, description, acceptance_criteria, constraints, priority, risk}]) using the exact identifiers given above.'
+        ? 'Do not modify any file. Emit one valid JSON plan.v1 object (protocol, message_id, project_id, contract_sha256, tasks: [{title, description, acceptance_criteria, constraints, priority, risk, context_paths}]) using the exact identifiers given above. priority and risk are one of LOW, MEDIUM, HIGH, CRITICAL.'
       : request.expectedProtocol === 'manager.v1'
         ? 'Do not modify any file. Emit one valid JSON manager.v1 object (protocol, message_id, project_id, task_id, decision EXECUTE|BLOCK, instructions, expected_task_state, expected_revision) using the exact identifiers given above.'
         : 'Emit a valid JSON coder.v1 protocol object conforming to the CoderProtocol schema upon task completion.');
