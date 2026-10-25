@@ -154,3 +154,37 @@ That GitHub record is authoritative for current completion. This document is
 implementation/evidence reference, not a second mutable engineering queue.
 Owner signing, production release publication and real-provider R5L acceptance
 remain separate gates under [#195](https://github.com/thanhtuyen662002/Agent-Forge/issues/195).
+
+## Development toolchain (#234)
+
+Issue [#234](https://github.com/thanhtuyen662002/Agent-Forge/issues/234)
+lands the Dependabot development group from #251 with these versions:
+TypeScript 7.0.2, Vite 8.3.5, Vitest 5.0.5, `@vitejs/plugin-react` 6.1.2,
+jsdom 30.1.3, `@types/node` 26.6.5, `@types/better-sqlite3` 9.6.0,
+electron-builder 26.18.0, postcss 8.5.31 and `@electron/rebuild` 4.2.1.
+Rolldown 1.2.15, already Vite 8's bundler, is now also a direct development
+dependency (see below). Runtime dependencies are unchanged.
+
+Electron stays at 44.6.0 because Electron major upgrades are a non-goal of
+#234. The #251 bump to Electron 45 is deferred to its own Issue.
+
+Configuration changes required by the toolchain:
+
+- TypeScript 7 removed `baseUrl` and the `node10` module resolution. Both
+  tsconfig files map `@/*` to `./src/*`. The Electron/Node config keeps
+  CommonJS output and uses `bundler` resolution.
+- TypeScript 7 checks side-effect imports and no longer includes every
+  `@types` package by default. The renderer config therefore lists
+  `node` and `vite/client` types explicitly, so the CSS import type-checks.
+- TypeScript 7 has no JavaScript API (`transpileModule`). The repository-root
+  native-load test bundles the services to CommonJS with Rolldown, keeping
+  every package external so the injected `koffi` failure stays observable.
+- Vite 8's native config loader prefers `import.meta.dirname` to `__dirname`.
+
+The 2026-10-25 audit of protected main `5cfe24a` reported 6 vulnerable package
+records: 3 high and 3 moderate (vite, vitest, `@vitest/mocker`, fast-uri,
+undici and electron). With this lock, npm's non-forced fix moves the
+transitive undici copies to 6.29.1 and 7.30.1. One record remains: Electron
+44.6.0 (GHSA-jr5w-w6x2-84p9; fixed in 44.9.1). That is a same-major Electron
+runtime update, tracked by its own Issue because it changes the shipped binary
+and its packaging evidence.

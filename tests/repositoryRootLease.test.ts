@@ -132,13 +132,19 @@ describe('captured repository read lease', () => {
     expect(fs.readdirSync(empty + '-moved')).toEqual([]);
   });
 
-  it('keeps repository services loadable when the native package cannot load and fences Windows acquisition with a fixed reason', () => {
+  it('keeps repository services loadable when the native package cannot load and fences Windows acquisition with a fixed reason', async () => {
+    // TypeScript 7 has no JavaScript API, so the services are bundled to CommonJS
+    // with every package left external: the child's require('koffi') stays observable.
+    const { rolldown } = await import('rolldown');
+    const bundleDir = fs.mkdtempSync(path.join(os.tmpdir(), 'root-lease-bundle-'));
+    const services = path.resolve(__dirname, '../src/core/services');
+    const bundle = await rolldown({ platform: 'node', logLevel: 'silent',
+      input: { lease: path.join(services, 'RepositoryRootLease.ts'), identity: path.join(services, 'RepositoryRootIdentity.ts') },
+      external: (id) => !id.startsWith('.') && !path.isAbsolute(id) });
+    await bundle.write({ dir: bundleDir, format: 'cjs', entryFileNames: '[name].cjs', chunkFileNames: '[name]-[hash].cjs' });
+    await bundle.close();
     const program = String.raw`
 const Module = require('node:module');
-const fs = require('node:fs');
-const ts = require('typescript');
-Module._extensions['.ts'] = (module, filename) => module._compile(ts.transpileModule(fs.readFileSync(filename, 'utf8'),
-  { compilerOptions: { module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2022, esModuleInterop: true } }).outputText, filename);
 const load = Module._load;
 Module._load = function(request, ...args) {
   if (request === 'koffi') throw new Error('INJECTED_NATIVE_PACKAGE_UNAVAILABLE');
@@ -161,9 +167,9 @@ try {
 } catch { process.stdout.write('REPOSITORY_NATIVE_LOAD_BOUNDARY=FAIL\n'); process.exitCode = 1; }
 `;
     const observed = spawnSync(process.execPath, ['-e', program,
-      path.resolve(__dirname, '../src/core/services/RepositoryRootLease.ts'),
-      path.resolve(__dirname, '../src/core/services/RepositoryRootIdentity.ts'), repository],
+      path.join(bundleDir, 'lease.cjs'), path.join(bundleDir, 'identity.cjs'), repository],
       { cwd: path.resolve(__dirname, '..'), encoding: 'utf8', windowsHide: true, timeout: 15000, maxBuffer: 16384 });
+    fs.rmSync(bundleDir, { recursive: true, force: true });
     expect(observed.status).toBe(0);
     expect(observed.stdout).toContain('REPOSITORY_MODULE_LOAD=PASS');
     expect(observed.stdout).toContain(process.platform === 'win32' ? 'TYPED_NATIVE_FAILURE=PASS' : 'DESCRIPTOR_WITHOUT_WINDOWS_NATIVE=PASS');
