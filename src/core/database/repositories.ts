@@ -335,6 +335,26 @@ export class Repository {
     }
   }
 
+  /** The project's planning anchor task (#245), if one was created. */
+  public getProjectPlanningTaskId(projectId: string): string | null {
+    const row = this.db
+      .prepare('SELECT value_json FROM project_settings WHERE project_id = ? AND key = ?')
+      .get(projectId, 'automation.planning_task_id') as { value_json?: unknown } | undefined;
+    try {
+      const value = typeof row?.value_json === 'string' ? JSON.parse(row.value_json) : null;
+      return typeof value === 'string' && value.length > 0 ? value : null;
+    } catch {
+      return null;
+    }
+  }
+
+  /** Records the planning anchor once; an existing anchor is never replaced. */
+  public setProjectPlanningTaskId(projectId: string, taskId: string): boolean {
+    return this.db
+      .prepare(`INSERT OR IGNORE INTO project_settings (project_id, key, value_json) VALUES (?, 'automation.planning_task_id', ?)`)
+      .run(projectId, JSON.stringify(taskId)).changes === 1;
+  }
+
   public setProjectManagerMode(projectId: string, mode: 'AUTO' | 'APPROVE'): 'AUTO' | 'APPROVE' {
     if (mode !== 'AUTO' && mode !== 'APPROVE') throw new Error('MANAGER_MODE_INVALID: value must be AUTO or APPROVE.');
     if (!this.getProject(projectId)) throw new Error(`Project "${projectId}" not found.`);
@@ -1872,6 +1892,25 @@ export class Repository {
     params.push(limit);
 
     const rows = this.db.prepare(query).all(...params) as Record<string, unknown>[];
+    return rows.map((r) => ({
+      id: String(r.id),
+      project_id: String(r.project_id),
+      task_id: r.task_id ? String(r.task_id) : null,
+      agent_id: r.agent_id ? String(r.agent_id) : null,
+      type: String(r.type),
+      summary: String(r.summary),
+      structured_payload: r.structured_payload_json ? JSON.parse(String(r.structured_payload_json)) : {},
+      timestamp: String(r.timestamp),
+    }));
+  }
+
+  /** Every event of the given types for a project (optionally one task), newest first; unbounded, unlike getEventsByProject. */
+  public getProjectEventsOfTypes(projectId: string, types: string[], taskId?: string): EventRecord[] {
+    if (types.length === 0) return [];
+    const placeholders = types.map(() => '?').join(', ');
+    const rows = this.db.prepare(
+      `SELECT * FROM events WHERE project_id = ? AND type IN (${placeholders})${taskId ? ' AND task_id = ?' : ''} ORDER BY timestamp DESC`,
+    ).all(projectId, ...types, ...(taskId ? [taskId] : [])) as Record<string, unknown>[];
     return rows.map((r) => ({
       id: String(r.id),
       project_id: String(r.project_id),

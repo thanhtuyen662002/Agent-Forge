@@ -64,7 +64,7 @@ export interface AgentExecutionRequest {
    * manager.v1 (#239) executions are read-only: their isolated workspace is
    * never synchronized back.
    */
-  expectedProtocol?: 'coder.v1' | 'review.v1' | 'manager.v1';
+  expectedProtocol?: 'coder.v1' | 'review.v1' | 'manager.v1' | 'plan.v1';
 }
 
 export interface AgentExecutionResult {

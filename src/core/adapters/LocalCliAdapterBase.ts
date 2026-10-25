@@ -18,6 +18,7 @@ import { ProcessRunner, ProcessRunResult } from '../services/ProcessRunner';
 import { PolicyService } from '../services/PolicyService';
 import { ProtocolParser } from '../protocol/parser';
 import { parseReviewProtocol } from '../protocol/reviewProtocol';
+import { parsePlanProtocol } from '../protocol/planProtocol';
 import { NonHandoffExecutionLifecycle } from '../services/NonHandoffExecutionLifecycle';
 import { OutputSanitizationError, redactSensitiveText } from '../../shared/security/secretRedaction';
 import { isOutputSanitizationErrorCode, safeDiagnosticText, sanitizeErrorDiagnostics, sanitizedDiagnosticError } from '../../shared/security/outputDiagnostics';
@@ -1086,6 +1087,8 @@ export abstract class LocalCliAdapterBase implements ProviderAdapter {
     lines.push('OUTPUT REQUIREMENT:');
     lines.push(request.expectedProtocol === 'review.v1'
       ? 'Do not modify any file. Emit one valid JSON review.v1 object (protocol, message_id, project_id, task_id, task_revision, verdict PASS|FIX_REQUIRED|BLOCKED, summary, issues, reviewed_head_sha, reviewed_snapshot_sha) using the exact identifiers given above.'
+      : request.expectedProtocol === 'plan.v1'
+        ? 'Do not modify any file. Emit one valid JSON plan.v1 object (protocol, message_id, project_id, contract_sha256, tasks: [{title, description, acceptance_criteria, constraints, priority, risk}]) using the exact identifiers given above.'
       : request.expectedProtocol === 'manager.v1'
         ? 'Do not modify any file. Emit one valid JSON manager.v1 object (protocol, message_id, project_id, task_id, decision EXECUTE|BLOCK, instructions, expected_task_state, expected_revision) using the exact identifiers given above.'
         : 'Emit a valid JSON coder.v1 protocol object conforming to the CoderProtocol schema upon task completion.');
@@ -1104,7 +1107,8 @@ export abstract class LocalCliAdapterBase implements ProviderAdapter {
     const rootLeases: RepositoryRootLease[] = [];
 
     // Read-only roles need an adapter that declares them (Gemini has no read-only mode here).
-    const requiredCapability = request.expectedProtocol === 'review.v1' ? 'REVIEW' : request.expectedProtocol === 'manager.v1' ? 'PLANNING' : null;
+    const requiredCapability = request.expectedProtocol === 'review.v1' ? 'REVIEW'
+      : request.expectedProtocol === 'manager.v1' || request.expectedProtocol === 'plan.v1' ? 'PLANNING' : null;
     if (requiredCapability && !(await this.getCapabilities()).includes(requiredCapability)) {
       return { executionId, status: 'FAILED', errorCode: 'UNSUPPORTED_CLIENT', error: `UNSUPPORTED_CLIENT: this CLI adapter does not support read-only ${requiredCapability.toLowerCase()}.` };
     }
@@ -1484,6 +1488,17 @@ export abstract class LocalCliAdapterBase implements ProviderAdapter {
             error: `PROTOCOL_INVALID: ${review.reasonCode}`, stdoutEvidenceId: processResult.stdoutEvidenceId, stderrEvidenceId: processResult.stderrEvidenceId };
         }
         return { executionId: processResult.executionId, status: 'COMPLETED', outputProtocol: JSON.stringify(review.data), rawResponse: processResult.stdout,
+          stdoutEvidenceId: processResult.stdoutEvidenceId, stderrEvidenceId: processResult.stderrEvidenceId };
+      }
+
+      if (request.expectedProtocol === 'plan.v1') {
+        // A plan is a proposal for TaskService to apply; it never publishes the workspace.
+        const plan = parsePlanProtocol(protocolText);
+        if (!plan.success) {
+          return { executionId: processResult.executionId, status: 'FAILED', errorCode: 'PROTOCOL_INVALID', rawResponse: processResult.stdout,
+            error: `PROTOCOL_INVALID: ${plan.reasonCode}`, stdoutEvidenceId: processResult.stdoutEvidenceId, stderrEvidenceId: processResult.stderrEvidenceId };
+        }
+        return { executionId: processResult.executionId, status: 'COMPLETED', outputProtocol: JSON.stringify(plan.data), rawResponse: processResult.stdout,
           stdoutEvidenceId: processResult.stdoutEvidenceId, stderrEvidenceId: processResult.stderrEvidenceId };
       }
 

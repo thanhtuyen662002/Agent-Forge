@@ -215,7 +215,9 @@ export class DesktopAutomationService {
             continue;
           }
         }
-        // A task without Manager authority for its revision asks the Manager agent first.
+        // An approved contract with no tasks yet gets its planning record first (#245).
+        if (this.manager) { try { this.manager.ensurePlanningAnchor(project.id); } catch { /* next pass */ } }
+        // A task without Manager authority for its revision (or the plan) asks the Manager agent first.
         const toDecide = this.manager?.pendingDecision(project.id) ?? null;
         if (toDecide && !toDecide.deferred) {
           const manager = this.findAgent('MANAGER');
@@ -309,8 +311,10 @@ export class DesktopAutomationService {
 
   /** CODING tasks whose latest applied Manager decision authorizes their current revision. */
   private authorizedTasks(project: Project): Task[] {
+    const planningAnchor = this.repo.getProjectPlanningTaskId(project.id);
+    // The planning record is never dispatched to a coder, whatever authority it was given.
     return this.repo.getTasksByProject(project.id).filter((task) =>
-      task.state === 'CODING' && !this.repo.isTaskTrashed(task.id) && managerAuthorizesRevision(this.repo, task));
+      task.id !== planningAnchor && task.state === 'CODING' && !this.repo.isTaskTrashed(task.id) && managerAuthorizesRevision(this.repo, task));
   }
 
   /** Why work waits on the Manager: an open proposal, a failed Manager call, or no usable Manager agent. */

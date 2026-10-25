@@ -506,6 +506,7 @@ export const enUS: TranslationDictionary = {
       revision: 'revision {revision}',
       decisionEXECUTE: 'Start the coder',
       decisionBLOCK: 'Stop and ask the owner',
+      decisionPLAN: 'Create these tasks',
     },
     quota: {
       title: 'Provider quota (read-only)',

@@ -5,6 +5,7 @@ export interface ManagerProposalView {
   taskRevision: number;
   decision: string;
   instructions: string[];
+  plannedTasks: Array<{ title: string; description: string; acceptanceCriteria: string[]; priority: string; risk: string }>;
   createdAt: string;
 }
 
@@ -25,6 +26,11 @@ export function normalizeManagerPanelReply(reply: unknown): ManagerPanelState | 
     proposals.push({
       eventId: item.eventId, taskId: item.taskId, taskTitle: item.taskTitle, taskRevision: item.taskRevision, decision: item.decision,
       instructions: item.instructions.filter((line): line is string => typeof line === 'string'),
+      plannedTasks: Array.isArray(item.plannedTasks) ? item.plannedTasks.filter(isRecord).map((planned) => ({
+        title: String(planned.title ?? ''), description: String(planned.description ?? ''),
+        acceptanceCriteria: Array.isArray(planned.acceptanceCriteria) ? planned.acceptanceCriteria.filter((line): line is string => typeof line === 'string') : [],
+        priority: String(planned.priority ?? ''), risk: String(planned.risk ?? ''),
+      })) : [],
       createdAt: typeof item.createdAt === 'string' ? item.createdAt : '',
     });
   }

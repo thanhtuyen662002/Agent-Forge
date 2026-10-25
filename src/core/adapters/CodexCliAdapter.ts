@@ -87,7 +87,8 @@ export class CodexCliAdapter extends LocalCliAdapterBase {
   ): string[] {
     const modelName = request.runtimeBinding?.modelName;
     // A reviewer or Manager may read the isolated copy but never write to it.
-    const sandbox = request.expectedProtocol === 'review.v1' || request.expectedProtocol === 'manager.v1' ? 'read-only' : 'workspace-write';
+    const sandbox = request.expectedProtocol === 'review.v1' || request.expectedProtocol === 'manager.v1' || request.expectedProtocol === 'plan.v1'
+      ? 'read-only' : 'workspace-write';
     return ['exec', '--json', '--model', modelName ?? '', '--sandbox', sandbox];
   }
 

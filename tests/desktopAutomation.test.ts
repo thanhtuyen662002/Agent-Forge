@@ -16,6 +16,7 @@ import { DesktopAutomationService } from '../src/core/services/DesktopAutomation
 import { GitWorktreeService } from '../src/core/services/GitWorktreeService';
 import { WorktreeIntegrationService } from '../src/core/services/WorktreeIntegrationService';
 import { resolveTrustedExecutable } from '../src/core/services/ExecutableResolver';
+import { contractSha256 } from '../src/core/protocol/planProtocol';
 import { ProviderRegistry } from '../src/core/adapters/ProviderRegistry';
 import { captureRepositoryRoot } from '../src/core/services/RepositoryRootIdentity';
 import type { AgentExecutionRequest, AgentExecutionResult, ProviderAdapter } from '../src/core/adapters/ProviderAdapter';
@@ -64,7 +65,7 @@ describe('desktop automation runtime', () => {
         reviewRequests.push(request);
         return reviewReply(request);
       }
-      if (request.expectedProtocol === 'manager.v1') {
+      if (request.expectedProtocol === 'manager.v1' || request.expectedProtocol === 'plan.v1') {
         managerRequests.push(request);
         return managerReply(request);
       }
@@ -1108,5 +1109,169 @@ describe('desktop automation runtime', () => {
       const open = tasks.createTask({ projectId, title: 'Still open', description: null, priority: 'LOW', risk: 'LOW', acceptanceCriteria: ['x'], constraints: [] });
       expect(await service.getIntegration().discard(projectId, open.id)).toEqual({ success: false, errorCode: 'TASK_NOT_TERMINAL' });
     }, 180_000);
+  });
+  describe('Manager plans tasks from the approved contract (#245)', () => {
+    const contract = {
+      goal: 'Greet visitors', architecture_constraints: [], technical_constraints: [], security_requirements: [],
+      acceptance_criteria: ['A greeting is shown'], non_goals: [], definition_of_done: ['Tests pass'], testing_requirements: [], owner_policies: [],
+    };
+    const planningService = () => new DesktopAutomationService(repo, events, registry, {
+      worktreeRoot: path.join(tempDir, 'worktrees'), timer: fakeTimer, taskService: tasks, verificationService: verification,
+    });
+    const addManager = () => {
+      const created = new WorkspaceManagementService(repo).createAgent({
+        displayName: 'Codex manager', role: 'PRIMARY_MANAGER', connection: 'CODEX_CLI', modelName: 'gpt-5-codex', workerSlots: 1,
+      });
+      expect(created.success).toBe(true);
+      verify(created);
+    };
+    const planReply = (overrides: Record<string, unknown> = {}) => (request: AgentExecutionRequest): AgentExecutionResult => {
+      if (request.expectedProtocol === 'manager.v1') {
+        const task = repo.getTask(request.taskId)!;
+        return { executionId: request.runtimeBinding!.executionId!, status: 'COMPLETED', outputProtocol: JSON.stringify({
+          protocol: 'manager.v1', message_id: 'm', project_id: projectId, task_id: task.id, decision: 'EXECUTE', instructions: ['Go'],
+          expected_task_state: task.state, expected_revision: task.revision_count,
+        }) };
+      }
+      return { executionId: request.runtimeBinding!.executionId!, status: 'COMPLETED', outputProtocol: JSON.stringify({
+        protocol: 'plan.v1', message_id: 'p', project_id: projectId, contract_sha256: contractSha256(repo.getProjectMetadata(projectId)!.contract!),
+        tasks: [
+          { title: 'Add the greeting', description: 'Show a greeting', acceptance_criteria: ['Greeting shown'], priority: 'HIGH', risk: 'LOW' },
+          { title: 'Test the greeting', acceptance_criteria: ['A test covers it'] },
+        ],
+        ...overrides,
+      }) };
+    };
+    const realTasks = () => repo.getTasksByProject(projectId).filter((task) => task.id !== repo.getProjectPlanningTaskId(projectId));
+    const pass = async () => { await service.tick(); await service.drain(); };
+    beforeEach(() => { repo.updateProjectContract(projectId, contract); });
+
+    it('turns the approved contract into tasks and then starts the first one, without pasted JSON', async () => {
+      addManager();
+      repo.setProjectManagerMode(projectId, 'AUTO');
+      managerReply = planReply();
+      service = planningService();
+      await pass();
+
+      expect(managerRequests[0].expectedProtocol).toBe('plan.v1');
+      expect(managerRequests[0].instructions.join('\n')).toContain('Greet visitors');
+      const anchor = repo.getTask(repo.getProjectPlanningTaskId(projectId)!)!;
+      expect(anchor).toMatchObject({ title: 'Plan the project', state: 'APPROVED' });
+      expect(repo.isTaskTrashed(anchor.id)).toBe(true); // The planning record leaves the active task list.
+      expect(realTasks().map((task) => [task.title, task.state])).toEqual([['Add the greeting', 'PLANNED'], ['Test the greeting', 'PLANNED']]);
+
+      await pass();
+      expect(managerRequests[1].expectedProtocol).toBe('manager.v1');
+      expect(realTasks().find((task) => task.title === 'Add the greeting')!.state).toBe('CODING');
+      expect(repo.getTask(anchor.id)!.state).toBe('APPROVED'); // The planning record is never dispatched.
+    });
+
+    it('proposes the plan in approve mode and creates nothing until the owner approves', async () => {
+      addManager();
+      managerReply = planReply();
+      service = planningService();
+      await pass();
+
+      expect(realTasks()).toEqual([]);
+      const [proposal] = service.getManager()!.listProposals(projectId);
+      expect(proposal).toMatchObject({ decision: 'PLAN', instructions: ['Add the greeting', 'Test the greeting'] });
+      expect(proposal.plannedTasks[0]).toEqual({ title: 'Add the greeting', description: 'Show a greeting', acceptanceCriteria: ['Greeting shown'], priority: 'HIGH', risk: 'LOW' });
+      expect(statusOf()).toMatchObject({ phase: 'WAITING_FOR_MANAGER', reasonCode: 'MANAGER_PROPOSAL_PENDING' });
+      expect(await service.getManager()!.decideProposal(projectId, proposal.eventId, true)).toEqual({ success: true });
+      expect(realTasks()).toHaveLength(2);
+    });
+
+    it('refuses an approved plan whose contract changed after it was proposed', async () => {
+      addManager();
+      managerReply = planReply();
+      service = planningService();
+      await pass();
+      const [proposal] = service.getManager()!.listProposals(projectId);
+      repo.updateProjectContract(projectId, { ...contract, goal: 'Greet visitors in two languages' });
+
+      // A plan for an older contract closes; approving it creates nothing, and the new contract is planned again.
+      expect(await service.getManager()!.decideProposal(projectId, proposal.eventId, true)).toMatchObject({ success: false, errorCode: 'PROPOSAL_ALREADY_DECIDED' });
+      expect(realTasks()).toEqual([]);
+      await pass();
+      expect(managerRequests).toHaveLength(2);
+    });
+
+    it.each([
+      ['a malformed plan', { tasks: [] }, 'PLAN_PROTOCOL_INVALID'],
+      ['a plan for another project', { project_id: 'project-other' }, 'PLAN_FOR_OTHER_PROJECT'],
+    ])('creates nothing for %s and does not retry it', async (_name, overrides, reasonCode) => {
+      addManager();
+      repo.setProjectManagerMode(projectId, 'AUTO');
+      managerReply = planReply(overrides);
+      service = planningService();
+      await pass();
+      await pass();
+
+      expect(managerRequests).toHaveLength(1);
+      expect(realTasks()).toEqual([]);
+      expect(repo.getEventsByProject(projectId).find((e) => e.type === 'AUTOMATION_MANAGER_FAILED')!.structured_payload).toMatchObject({ reasonCode });
+    });
+
+    it('retries a plan that names the wrong contract hash while the contract is unchanged', async () => {
+      addManager();
+      repo.setProjectManagerMode(projectId, 'AUTO');
+      let calls = 0;
+      managerReply = (request) => planReply(calls++ === 0 ? { contract_sha256: 'a'.repeat(64) } : {})(request);
+      service = planningService();
+      await pass();
+      expect(repo.getEventsByProject(projectId).find((e) => e.type === 'AUTOMATION_MANAGER_FAILED')!.structured_payload)
+        .toMatchObject({ reasonCode: 'PLAN_HASH_MISMATCH', retryable: true });
+      expect(realTasks()).toEqual([]);
+    });
+
+    it('plans again once the owner edits the contract after a rejected plan', async () => {
+      addManager();
+      managerReply = planReply();
+      service = planningService();
+      await pass();
+      const [first] = service.getManager()!.listProposals(projectId);
+      await service.getManager()!.decideProposal(projectId, first.eventId, false);
+      await pass();
+      expect(managerRequests).toHaveLength(1); // The rejected plan is not asked again for the same contract.
+
+      repo.updateProjectContract(projectId, { ...contract, goal: 'Greet visitors politely' });
+      await pass();
+      expect(managerRequests).toHaveLength(2);
+      expect(managerRequests[1].instructions.join('\n')).toContain('Greet visitors politely');
+      expect(service.getManager()!.listProposals(projectId)).toHaveLength(1);
+    });
+
+    it('closes a plan proposal once the owner creates a task, and never plans then', async () => {
+      addManager();
+      managerReply = planReply();
+      service = planningService();
+      await pass();
+      expect(service.getManager()!.listProposals(projectId)).toHaveLength(1);
+      tasks.createTask({ projectId, title: 'Owner task', description: null, priority: 'LOW', risk: 'LOW', acceptanceCriteria: ['x'], constraints: [] });
+      expect(service.getManager()!.listProposals(projectId).filter((proposal) => proposal.decision === 'PLAN')).toEqual([]);
+    });
+
+    it('refuses any Manager decision for the planning record, so it is never dispatched', async () => {
+      addManager();
+      managerReply = planReply();
+      service = planningService();
+      await pass();
+      const anchorId = repo.getProjectPlanningTaskId(projectId)!;
+      const pasted = { protocol: 'manager.v1' as const, message_id: `owner-${crypto.randomUUID()}`, project_id: projectId, task_id: anchorId,
+        decision: 'EXECUTE' as const, priority: 'LOW' as const, risk: 'LOW' as const, instructions: [], acceptance_criteria: [], constraints: [],
+        review_issues: [], expected_task_state: 'PLANNED' as const, expected_revision: 0 };
+      expect((await tasks.applyManagerDecision(pasted, JSON.stringify(pasted))).success).toBe(false);
+      expect(repo.getTask(anchorId)!.state).toBe('PLANNED');
+    });
+
+    it('does not plan a project that already has tasks', async () => {
+      addManager();
+      tasks.createTask({ projectId, title: 'Owner task', description: null, priority: 'LOW', risk: 'LOW', acceptanceCriteria: ['x'], constraints: [] });
+      managerReply = planReply();
+      service = planningService();
+      await pass();
+      expect(repo.getProjectPlanningTaskId(projectId)).toBeNull();
+      expect(managerRequests.every((request) => request.expectedProtocol !== 'plan.v1')).toBe(true);
+    });
   });
 });
