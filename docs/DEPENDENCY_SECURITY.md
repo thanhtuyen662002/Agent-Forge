@@ -188,3 +188,18 @@ transitive undici copies to 6.29.1 and 7.30.1. One record remains: Electron
 44.6.0 (GHSA-jr5w-w6x2-84p9; fixed in 44.9.1). That is a same-major Electron
 runtime update, tracked by its own Issue because it changes the shipped binary
 and its packaging evidence.
+
+## Electron 44 security patch (#257)
+
+Issue [#257](https://github.com/thanhtuyen662002/Agent-Forge/issues/257)
+moves the exact Electron pin from 44.6.0 to 44.9.3, the latest 44.x patch.
+It includes the fix for
+[GHSA-jr5w-w6x2-84p9](https://github.com/advisories/GHSA-jr5w-w6x2-84p9)
+(fixed in 44.9.1). The 2026-10-25 full-lock `npm audit` reports zero
+vulnerable package records. The earlier 44.6.0 statements above remain
+historical evidence for their snapshots. The Windows runtime probes compare the
+installed Electron version against this lock, and Package Windows remains the
+packaging gate.
+
+Electron 45 (proposed by #251) remains a separate major upgrade. It is not
+part of #257.
