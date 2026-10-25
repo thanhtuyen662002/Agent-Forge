@@ -252,13 +252,15 @@ export const viVN: TranslationDictionary = {
       CODEX_CLI: 'Codex CLI',
       GEMINI_CLI: 'Gemini CLI',
       CLAUDE_CODE_CLI: 'Claude Code CLI',
+      ANTIGRAVITY_CLI: 'Antigravity CLI (Google)',
       OTHER: 'Nhà cung cấp khác',
     },
     connectionHelp: {
       MANUAL_BRIDGE: 'Bạn tự sao chép lệnh công việc sang cửa sổ chat và dán câu trả lời về. Không có gì chạy tự động.',
       CODEX_CLI: 'Chạy công cụ dòng lệnh Codex trên máy này. Codex phải được cài đặt và đăng nhập vào hồ sơ này.',
-      GEMINI_CLI: 'Chạy công cụ dòng lệnh Gemini trên máy này. Gemini phải được cài đặt và đăng nhập vào hồ sơ này.',
+      GEMINI_CLI: 'Chạy công cụ dòng lệnh Gemini trên máy này. Google đã ngừng cho đăng nhập Google cá nhân; chỉ dùng với khóa Gemini API. Tài khoản Google cá nhân hãy dùng Antigravity CLI.',
       CLAUDE_CODE_CLI: 'Chạy công cụ dòng lệnh Claude Code trên máy này, với đăng nhập riêng của tác tử. Cần cài Claude Code trước.',
+      ANTIGRAVITY_CLI: 'Chạy Antigravity CLI (agy) của Google: model Gemini cho tài khoản Google cá nhân. Đăng nhập Google dùng chung cho cả máy, nên mọi tác tử Antigravity dùng chung một tài khoản.',
       OTHER: 'Được cấu hình bên ngoài Trung tâm Tác tử.',
     },
     models: {
@@ -574,6 +576,7 @@ export const viVN: TranslationDictionary = {
       cli: {
         CODEX: 'Codex CLI',
         CLAUDE: 'Claude Code CLI',
+        ANTIGRAVITY: 'Antigravity CLI',
         GEMINI: 'Gemini CLI',
         OTHER: 'Khác',
       },

@@ -3,7 +3,7 @@ import type { Agent, ProviderResource } from '../core/types/domain';
 
 export type QuotaTone = 'GOOD' | 'WARN' | 'LOW' | 'UNKNOWN';
 export type QuotaWindowKind = 'FIVE_HOUR' | 'DAY' | 'WEEK' | 'MINUTES' | 'LIMIT';
-export type CliKind = 'CODEX' | 'CLAUDE' | 'GEMINI' | 'OTHER';
+export type CliKind = 'CODEX' | 'CLAUDE' | 'GEMINI' | 'ANTIGRAVITY' | 'OTHER';
 
 export interface QuotaWindowView {
   kind: QuotaWindowKind;
@@ -40,8 +40,9 @@ const CLI_BY_PROVIDER: Record<string, CliKind> = {
   'prov-codex-cli': 'CODEX',
   'prov-claude-code-cli': 'CLAUDE',
   'prov-gemini-cli': 'GEMINI',
+  'prov-antigravity-cli': 'ANTIGRAVITY',
 };
-const CLI_ORDER: CliKind[] = ['CODEX', 'CLAUDE', 'GEMINI', 'OTHER'];
+const CLI_ORDER: CliKind[] = ['CODEX', 'CLAUDE', 'GEMINI', 'ANTIGRAVITY', 'OTHER'];
 const USABLE_HEALTH = new Set(['AVAILABLE', 'LOW_QUOTA']);
 
 /** Router-style thresholds: more than half left is fine, under a fifth is low. */

@@ -122,9 +122,29 @@ export class NativeProfileResolver {
         };
       }
 
+      case 'antigravity': {
+        const profileDir = path.join(this.#baseProfilesDir, 'antigravity', profileId);
+        return {
+          provider: 'antigravity',
+          profileId,
+          profileRef: canonicalUri,
+          // The CLI keeps its state (conversations, settings, MCP config) under
+          // the user's home; the sign-in itself lives in the OS credential store.
+          envOverrides: {
+            USERPROFILE: profileDir,
+            HOME: profileDir,
+          },
+          profileDirectory: profileDir,
+          configurationStatus: 'EXPERIMENTAL_UNPROVEN',
+          runtimeIsolationStatus: 'PENDING_R5D',
+          notes:
+            'Antigravity CLI (#265): state is isolated per profile, but the Google sign-in is machine-wide (OS credential store), so all Antigravity agents share the account signed in to agy.',
+        };
+      }
+
       default: {
         throw new Error(
-          `[NativeProfileResolver] Unsupported native profile provider "${provider}". Supported providers: codex, gemini, claude.`
+          `[NativeProfileResolver] Unsupported native profile provider "${provider}". Supported providers: codex, gemini, claude, antigravity.`
         );
       }
     }

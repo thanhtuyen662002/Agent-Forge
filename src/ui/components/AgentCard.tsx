@@ -193,7 +193,7 @@ export const AgentCard: React.FC<AgentCardProps> = ({
       )}
 
       {/* Sign-in can only initialize a never-used UNKNOWN account; other states keep their recorded health. */}
-      {!removed && onSignIn && (entry?.connection === 'CODEX_CLI' || entry?.connection === 'CLAUDE_CODE_CLI' || entry?.connection === 'GEMINI_CLI') &&
+      {!removed && onSignIn && (entry?.connection === 'CODEX_CLI' || entry?.connection === 'CLAUDE_CODE_CLI' || entry?.connection === 'GEMINI_CLI' || entry?.connection === 'ANTIGRAVITY_CLI') &&
         (entry.account?.healthStatus === 'UNKNOWN' || entry.account?.healthStatus === 'AUTH_ERROR') && (
         <div className="p-2.5 rounded-lg border border-forge-cyan/40 bg-forge-cyan/5 text-xs text-slate-200 flex items-center justify-between gap-3">
           <span>{entry.account?.healthStatus === 'AUTH_ERROR' ? t('accountSignIn.expired') : t('accountSignIn.needed')}</span>

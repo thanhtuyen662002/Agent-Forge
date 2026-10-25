@@ -31,6 +31,7 @@ const CLI_PROVIDERS: Record<Exclude<AgentConnectionKind, 'MANUAL_BRIDGE'>, { id:
   CODEX_CLI: { id: 'prov-codex-cli', name: 'Codex CLI', profileProvider: 'codex' },
   GEMINI_CLI: { id: 'prov-gemini-cli', name: 'Gemini CLI', profileProvider: 'gemini' },
   CLAUDE_CODE_CLI: { id: 'prov-claude-code-cli', name: 'Claude Code CLI', profileProvider: 'claude' },
+  ANTIGRAVITY_CLI: { id: 'prov-antigravity-cli', name: 'Antigravity CLI', profileProvider: 'antigravity' },
 };
 
 const ROLE_CAPABILITIES: Record<FabricRole, Capability[]> = {
@@ -561,6 +562,7 @@ export class WorkspaceManagementService {
     if (provider.id === CLI_PROVIDERS.CODEX_CLI.id) return 'CODEX_CLI';
     if (provider.id === CLI_PROVIDERS.GEMINI_CLI.id) return 'GEMINI_CLI';
     if (provider.id === CLI_PROVIDERS.CLAUDE_CODE_CLI.id) return 'CLAUDE_CODE_CLI';
+    if (provider.id === CLI_PROVIDERS.ANTIGRAVITY_CLI.id) return 'ANTIGRAVITY_CLI';
     return 'OTHER';
   }
 }

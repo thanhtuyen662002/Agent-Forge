@@ -7,23 +7,24 @@ import type { Repository } from '../database/repositories';
 import { AccountHealthService } from './AccountHealthService';
 import { buildTrustedEnvironment, resolveTrustedExecutable } from './ExecutableResolver';
 import { ProcessRunner } from './ProcessRunner';
+import { classifyAntigravityFailure } from '../adapters/AntigravityCliAdapter';
 
 export type CliSignInErrorCode =
   | 'ACCOUNT_NOT_FOUND' | 'NOT_A_SUPPORTED_CLI_ACCOUNT' | 'PROFILE_UNAVAILABLE' | 'CLI_UNAVAILABLE' | 'UNSUPPORTED_PLATFORM';
 
 export type CliVerifyReason = 'VERIFIED' | 'NOT_SIGNED_IN' | 'NOT_A_SUBSCRIPTION_LOGIN' | 'VERIFY_FAILED' | 'ALREADY_IN_USE';
 
-type ProfileEnvKey = 'CLAUDE_CONFIG_DIR' | 'GEMINI_CLI_HOME';
 
 interface CliDriver {
   label: string;
-  profileProvider: 'claude' | 'gemini';
-  envKey: ProfileEnvKey;
+  profileProvider: 'claude' | 'gemini' | 'antigravity';
+  /** The variables that point the CLI at the account's profile. */
+  profileEnv: (profileDirectory: string) => Record<string, string>;
   loginArgs: string[];
   verify: (check: (args: string[], timeoutMs: number) => Promise<CliRunResult>, profileDirectory: string) => Promise<CliVerifyReason>;
 }
 
-export interface CliRunResult { exitCode: number | null; stdout: string }
+export interface CliRunResult { exitCode: number | null; stdout: string; stderr?: string }
 export interface CliRunner {
   /** Runs a short, non-interactive check in `cwd` with only the profile variable added to a minimal environment. */
   run(executable: string, args: string[], profileEnv: Record<string, string>, cwd: string, timeoutMs: number): Promise<CliRunResult>;
@@ -41,7 +42,7 @@ export class NodeCliRunner implements CliRunner {
       executable, args, cwd, timeoutMs, env: profileEnv, allowedEnvKeys: Object.keys(profileEnv), allowShell: false,
       maxStdoutBytes: 256 * 1024, maxStderrBytes: 64 * 1024, deferPersistence: true,
     });
-    return { exitCode: result.timedOut || result.cancelled ? null : result.exitCode, stdout: result.stdout };
+    return { exitCode: result.timedOut || result.cancelled ? null : result.exitCode, stdout: result.stdout, stderr: result.stderr };
   }
 
   public openTerminal(executable: string, args: string[], profileEnv: Record<string, string>, cwd: string): void {
@@ -62,7 +63,7 @@ export class NodeCliRunner implements CliRunner {
 
 const DRIVERS: Record<string, CliDriver> = {
   'prov-claude-code-cli': {
-    label: 'Claude Code', profileProvider: 'claude', envKey: 'CLAUDE_CONFIG_DIR', loginArgs: ['auth', 'login'],
+    label: 'Claude Code', profileProvider: 'claude', profileEnv: (directory) => ({ CLAUDE_CONFIG_DIR: directory }), loginArgs: ['auth', 'login'],
     // `claude auth status` prints JSON and exits 0 when signed in, 1 when not.
     async verify(check) {
       const result = await check(['auth', 'status'], 30_000);
@@ -78,13 +79,25 @@ const DRIVERS: Record<string, CliDriver> = {
     },
   },
   'prov-gemini-cli': {
-    label: 'Gemini', profileProvider: 'gemini', envKey: 'GEMINI_CLI_HOME', loginArgs: [],
+    label: 'Gemini', profileProvider: 'gemini', profileEnv: (directory) => ({ GEMINI_CLI_HOME: directory }), loginArgs: [],
     // Headless Gemini exits 41 without a cached login; a minimal read-only prompt proves the login works.
     async verify(check, profileDirectory) {
       if (!fs.existsSync(path.join(profileDirectory, '.gemini', 'oauth_creds.json'))) return 'NOT_SIGNED_IN'; // Presence only; never read.
       const result = await check(['-p', 'Reply with the single word OK.', '-o', 'json', '--approval-mode', 'plan'], 90_000);
       if (result.exitCode === 0) return 'VERIFIED';
       return result.exitCode === 41 ? 'NOT_SIGNED_IN' : 'VERIFY_FAILED';
+    },
+  },
+  'prov-antigravity-cli': {
+    // The Google sign-in is machine-wide (OS credential store); the terminal opens agy itself to sign in.
+    label: 'Antigravity', profileProvider: 'antigravity', profileEnv: (directory) => ({ USERPROFILE: directory, HOME: directory }), loginArgs: [],
+    // A minimal read-only prompt proves the sign-in. A quota error still proves it: the provider accepted the account.
+    async verify(check) {
+      const result = await check(['--output-format', 'json', '--mode', 'plan', '--disable-slash-commands', '-p', 'Reply with the single word OK.'], 90_000);
+      if (result.exitCode === 0) return 'VERIFIED';
+      const failure = classifyAntigravityFailure(result.stdout, result.stderr ?? '');
+      if (failure?.errorCode === 'QUOTA_EXHAUSTED') return 'VERIFIED';
+      return failure?.errorCode === 'AUTH_ERROR' ? 'NOT_SIGNED_IN' : 'VERIFY_FAILED';
     },
   },
 };
@@ -139,7 +152,7 @@ export class CliAccountConnectionService {
     }
     const executable = this.executableFor(account.provider_id);
     if (!executable || !path.isAbsolute(executable) || !fs.existsSync(executable)) return { ok: false, errorCode: 'CLI_UNAVAILABLE' };
-    return { ok: true, driver, executable, profileEnv: { [driver.envKey]: profileDirectory }, profileDirectory, profileRef: account.profile_ref, providerId: account.provider_id };
+    return { ok: true, driver, executable, profileEnv: driver.profileEnv(profileDirectory), profileDirectory, profileRef: account.profile_ref, providerId: account.provider_id };
   }
 
   /** Opens the CLI's sign-in in a terminal bound to this account's profile. */

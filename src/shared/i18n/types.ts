@@ -255,6 +255,7 @@ export interface TranslationDictionary {
       CODEX_CLI: string;
       GEMINI_CLI: string;
       CLAUDE_CODE_CLI: string;
+      ANTIGRAVITY_CLI: string;
       OTHER: string;
     };
     connectionHelp: {
@@ -262,6 +263,7 @@ export interface TranslationDictionary {
       CODEX_CLI: string;
       GEMINI_CLI: string;
       CLAUDE_CODE_CLI: string;
+      ANTIGRAVITY_CLI: string;
       OTHER: string;
     };
     models: {
@@ -577,6 +579,7 @@ export interface TranslationDictionary {
       cli: {
         CODEX: string;
         CLAUDE: string;
+        ANTIGRAVITY: string;
         GEMINI: string;
         OTHER: string;
       };
