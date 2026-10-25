@@ -103,6 +103,18 @@ describe('runtime IPC channels', () => {
     expect(automation.tick).toHaveBeenCalledTimes(1);
     await expect(handlers.get('automation:status')!(trusted, undefined)).resolves.toMatchObject({ success: true, status: { active: true } });
   });
+
+  it('reads and sets the unofficial-reader switch with a strict boolean (#250)', async () => {
+    let enabled = true;
+    const quota = { getUnofficialReadersEnabled: vi.fn(() => enabled), setUnofficialReadersEnabled: vi.fn((value: boolean) => { enabled = value; }) };
+    registerIpcHandlers({} as any, {} as any, {} as any, {} as any, {} as any, undefined, undefined, undefined, undefined, {} as any,
+      undefined, { quota: quota as any });
+    await expect(handlers.get('quota:getPreferences')!(trusted, undefined)).resolves.toEqual({ success: true, unofficialReaders: true });
+    await expect(handlers.get('quota:setPreferences')!(trusted, { unofficialReaders: 'no' })).resolves.toEqual({ success: false, errorCode: 'INVALID_INPUT' });
+    await expect(handlers.get('quota:setPreferences')!(trusted, { unofficialReaders: false })).resolves.toEqual({ success: true, unofficialReaders: false });
+    expect(quota.setUnofficialReadersEnabled).toHaveBeenCalledTimes(1);
+    await expect(handlers.get('quota:getPreferences')!(trusted, undefined)).resolves.toEqual({ success: true, unofficialReaders: false });
+  });
 });
 
 describe('runtime status in the renderer', () => {

@@ -1,9 +1,12 @@
+import fs from 'fs';
+import path from 'path';
 import { NativeProfileResolver } from '../credentials/NativeProfileResolver';
 import { Repository } from '../database/repositories';
 import type { ProviderAccount, ProviderResource } from '../types/domain';
 import type { QuotaObservation, QuotaObservationStatus, QuotaWindowObservation } from '../types/quota';
 import { AccountHealthService } from './AccountHealthService';
 import { CodexQuotaClient, type CodexQuotaReader, type CodexRateLimitResult, type CodexRateLimitWindow } from './CodexQuotaClient';
+import { ClaudeUsageReader, GeminiQuotaReader, type UnofficialQuotaReader, type UnofficialQuotaResult, type UnofficialQuotaWindow } from './UnofficialQuotaReaders';
 
 export interface QuotaPollHandle { unref?(): void }
 
@@ -14,6 +17,15 @@ export interface QuotaPollTimer {
 
 export interface AccountQuotaServiceOptions {
   codexReader?: CodexQuotaReader;
+  /** Unofficial readers (#250), chosen by the owner: they read the CLI's own saved sign-in. */
+  claudeReader?: UnofficialQuotaReader;
+  geminiReader?: UnofficialQuotaReader;
+  /**
+   * Where the owner's on/off choice for unofficial readers is kept. Without a
+   * file the choice lives in memory. A missing or unreadable file means on:
+   * the owner opted in (#250).
+   */
+  preferencesFile?: string;
   profileResolver?: Pick<NativeProfileResolver, 'resolve'>;
   timer?: QuotaPollTimer;
   now?: () => string;
@@ -43,7 +55,10 @@ function observeWindow(window: CodexRateLimitWindow): QuotaWindowObservation {
 }
 
 function copyObservation(observation: QuotaObservation): QuotaObservation {
-  return { ...observation, resourceIds: [...observation.resourceIds], secondary: observation.secondary ? { ...observation.secondary } : null };
+  return {
+    ...observation, resourceIds: [...observation.resourceIds], secondary: observation.secondary ? { ...observation.secondary } : null,
+    ...(observation.buckets ? { buckets: observation.buckets.map((bucket) => ({ ...bucket })) } : {}),
+  };
 }
 
 /**
@@ -53,6 +68,9 @@ function copyObservation(observation: QuotaObservation): QuotaObservation {
  */
 export class AccountQuotaService {
   private readonly reader: CodexQuotaReader;
+  private readonly unofficialReaders: Record<string, { provider: string; reader: UnofficialQuotaReader }>;
+  private readonly preferencesFile: string | undefined;
+  private unofficialEnabled: boolean;
   private readonly profileResolver: Pick<NativeProfileResolver, 'resolve'> | undefined;
   private readonly timer: QuotaPollTimer;
   private readonly now: () => string;
@@ -66,10 +84,47 @@ export class AccountQuotaService {
 
   constructor(private readonly repo: Repository, options: AccountQuotaServiceOptions = {}) {
     this.reader = options.codexReader ?? new CodexQuotaClient();
+    this.unofficialReaders = {
+      'prov-claude-code-cli': { provider: 'claude', reader: options.claudeReader ?? new ClaudeUsageReader() },
+      'prov-gemini-cli': { provider: 'gemini', reader: options.geminiReader ?? new GeminiQuotaReader() },
+    };
+    this.preferencesFile = options.preferencesFile;
+    this.unofficialEnabled = this.loadUnofficialPreference();
     this.profileResolver = options.profileResolver;
     this.timer = options.timer ?? nodeTimer;
     this.now = options.now ?? (() => new Date().toISOString());
     this.initializeVerifiedAccounts = options.initializeVerifiedAccounts === true;
+  }
+
+  /** Whether Claude Code / Gemini usage is read from their saved sign-in (#250). */
+  public getUnofficialReadersEnabled(): boolean {
+    return this.unofficialEnabled;
+  }
+
+  /** The owner's switch. Turning it off drops unofficial readings at once; nothing more is read. */
+  public setUnofficialReadersEnabled(enabled: boolean): void {
+    if (this.preferencesFile) {
+      fs.mkdirSync(path.dirname(this.preferencesFile), { recursive: true });
+      const temporary = `${this.preferencesFile}.${process.pid}.tmp`;
+      fs.writeFileSync(temporary, JSON.stringify({ unofficialReaders: enabled }), 'utf8');
+      fs.renameSync(temporary, this.preferencesFile);
+    }
+    this.unofficialEnabled = enabled;
+    if (!enabled) {
+      for (const [accountId, observation] of this.latest) {
+        if (observation.source === 'UNOFFICIAL') this.latest.delete(accountId);
+      }
+    }
+  }
+
+  private loadUnofficialPreference(): boolean {
+    if (!this.preferencesFile) return true;
+    try {
+      const value = JSON.parse(fs.readFileSync(this.preferencesFile, 'utf8')) as { unofficialReaders?: unknown };
+      return value.unofficialReaders !== false;
+    } catch {
+      return true;
+    }
   }
 
   /** Detached snapshots; callers cannot modify the service's cache. */
@@ -159,6 +214,41 @@ export class AccountQuotaService {
     return this.unknown(account.id, account.provider_id, 'UNSUPPORTED', 'No official usage reader for this CLI; limits appear when a run reaches them.');
   }
 
+  /**
+   * Claude Code / Gemini (#250): an unofficial reading of the saved sign-in.
+   * A recorded limit still wins while it runs. Without a reading, only what
+   * runs recorded is shown, as before.
+   */
+  private async readUnofficial(account: ProviderAccount, provider: string, reader: UnofficialQuotaReader): Promise<QuotaObservation> {
+    const observed = this.observedFromHealth(account);
+    if (observed.source === 'OBSERVED' || observed.status === 'UNAUTHENTICATED') return observed;
+    if (!this.unofficialEnabled || account.auth_mode !== 'NATIVE_PROFILE' || !account.profile_ref) return observed;
+    let result: UnofficialQuotaResult;
+    try {
+      const resolution = (this.profileResolver ?? new NativeProfileResolver()).resolve(account.profile_ref);
+      if (resolution.provider !== provider) return observed;
+      result = await reader.read(resolution.profileDirectory);
+    } catch {
+      return observed;
+    }
+    // Switched off while this read was running: the reading is discarded.
+    if (!this.unofficialEnabled) return observed;
+    if (result.status !== 'OK') {
+      return result.status === 'UNAUTHENTICATED'
+        ? this.unknown(account.id, account.provider_id, 'UNAUTHENTICATED', result.message)
+        : observed;
+    }
+    const toWindow = (window: UnofficialQuotaWindow): QuotaWindowObservation => ({
+      usedPercent: window.usedPercent, remainingPercent: 100 - window.usedPercent, resetsAt: window.resetsAt, windowMinutes: window.windowMinutes,
+    });
+    return {
+      accountId: account.id, providerId: account.provider_id, resourceIds: [], status: 'OK', source: 'UNOFFICIAL',
+      ...toWindow(result.primary), secondary: result.secondary ? toWindow(result.secondary) : null,
+      ...(result.buckets ? { buckets: result.buckets.map((bucket) => ({ ...toWindow(bucket), label: bucket.label })) } : {}),
+      planType: result.planType, observedAt: this.now(), message: null, healthStatus: null,
+    };
+  }
+
   private async readAccount(accountId: string): Promise<QuotaObservation> {
     const account = this.repo.getProviderAccount(accountId);
     if (!account || !account.enabled) {
@@ -167,7 +257,10 @@ export class AccountQuotaService {
       return observation;
     }
     let observation: QuotaObservation;
-    if (account.provider_id !== 'prov-codex-cli') {
+    const unofficial = this.unofficialReaders[account.provider_id];
+    if (unofficial) {
+      observation = await this.readUnofficial(account, unofficial.provider, unofficial.reader);
+    } else if (account.provider_id !== 'prov-codex-cli') {
       observation = this.observedFromHealth(account);
     } else {
       let result: CodexRateLimitResult;

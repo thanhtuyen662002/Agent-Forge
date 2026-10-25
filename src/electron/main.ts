@@ -180,7 +180,10 @@ app.whenReady().then(() => {
       verificationService: bootstrapInstance.verificationService,
     },
   );
-  quotaInstance = new AccountQuotaService(bootstrapInstance.repo, { initializeVerifiedAccounts: true });
+  quotaInstance = new AccountQuotaService(bootstrapInstance.repo, {
+    initializeVerifiedAccounts: true,
+    preferencesFile: path.join(userDataDir, 'quota-preferences.json'),
+  });
   const quotaForSignIn = quotaInstance;
   const automationForSignIn = automationInstance;
   signInInstance = new CodexAccountConnectionService(bootstrapInstance.repo, {

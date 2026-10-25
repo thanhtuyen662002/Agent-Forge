@@ -533,12 +533,39 @@ grouped by CLI, with a usable/total summary per CLI. Each card shows:
 | Source | Meaning |
 | --- | --- |
 | Official | Codex `account/rateLimits/read`. |
-| Observed from a run | Claude Code and Gemini have no official usage reader. When a run hits a usage limit, the recorded health shows that limit as exhausted until its recorded reset, and an expired sign-in shows as *Not signed in*. |
+| Unofficial (read like routers) | Claude Code and Gemini, read the way quota routers do (#250). See below. |
+| Observed from a run | When a run hits a usage limit, the recorded health shows that limit as exhausted until its recorded reset. An expired sign-in shows as *Not signed in*. A recorded limit or lost sign-in takes priority over an unofficial reading. |
 | Unknown | Nothing is known; no number is shown. |
 
-Observed values are never stored as provider-reported quota and never verify an
-account. Reading Claude or Gemini OAuth tokens to call their undocumented usage
-endpoints, as some routers do, is not done without the owner's explicit choice.
+**Unofficial Claude Code and Gemini readers (#250).** Neither CLI has an
+official usage API. The owner chose on 2026-10-25 to read them the way routers
+do. The switch **Read Claude Code and Gemini quota like routers do** on the
+Capacity page turns this off again. It is kept in `quota-preferences.json` in
+the app data folder. With it off, no sign-in file is opened and nothing is
+requested.
+
+- Claude Code reads `<CLAUDE_CONFIG_DIR>/.credentials.json`
+  (`claudeAiOauth.accessToken`) and calls `GET
+  https://api.anthropic.com/api/oauth/usage`. Its card shows the 5-hour and
+  7-day windows.
+- Gemini reads `<GEMINI_CLI_HOME>/.gemini/oauth_creds.json` (`access_token`)
+  and calls Code Assist `v1internal:loadCodeAssist` and then
+  `v1internal:retrieveUserQuota` on `cloudcode-pa.googleapis.com`. Its card
+  shows one bar per model bucket, tightest first, with the account's tier.
+
+Boundaries:
+
+- The token is only read, in memory. It is never refreshed, written, stored,
+  logged, shown or sent anywhere but those fixed provider hosts.
+- Redirects are refused. Every failure message is fixed text.
+- An expired token is left for the CLI to renew on its next run; the card asks
+  you to run that CLI once.
+- These endpoints are undocumented and may change or be blocked. Any failure
+  falls back to the observed or unknown state.
+
+Unofficial and observed values are display telemetry. They are never stored as
+provider-reported quota, never verify or recover an account, and never feed
+scheduling.
 
 New CLI accounts start `UNKNOWN` and cannot be leased. A successful
 authenticated read lets `AccountHealthService.initializeVerifiedAccount` (the

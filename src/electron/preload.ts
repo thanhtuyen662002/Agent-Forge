@@ -83,6 +83,8 @@ export interface OrchestratorApi {
   openCodexSignInPage: (sessionId: string) => Promise<any>;
   getQuotaObservations: () => Promise<any>;
   refreshQuota: () => Promise<any>;
+  getQuotaPreferences: () => Promise<any>;
+  setQuotaPreferences: (preferences: { unofficialReaders: boolean }) => Promise<any>;
   trashProject: (projectId: string) => Promise<any>;
   restoreProject: (projectId: string) => Promise<any>;
   trashTask: (taskId: string) => Promise<any>;
@@ -221,6 +223,8 @@ const api: OrchestratorApi = {
   openCodexSignInPage: (sessionId: string) => ipcRenderer.invoke('accounts:openCodexSignInPage', { sessionId }),
   getQuotaObservations: () => ipcRenderer.invoke('quota:list'),
   refreshQuota: () => ipcRenderer.invoke('quota:refresh'),
+  getQuotaPreferences: () => ipcRenderer.invoke('quota:getPreferences'),
+  setQuotaPreferences: (preferences: { unofficialReaders: boolean }) => ipcRenderer.invoke('quota:setPreferences', preferences),
   trashProject: (projectId: string) => ipcRenderer.invoke('trash:project', { projectId }),
   restoreProject: (projectId: string) => ipcRenderer.invoke('trash:restoreProject', { projectId }),
   trashTask: (taskId: string) => ipcRenderer.invoke('trash:task', { taskId }),

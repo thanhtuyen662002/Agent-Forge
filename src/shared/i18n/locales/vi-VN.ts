@@ -510,7 +510,7 @@ export const viVN: TranslationDictionary = {
     },
     quota: {
       title: 'Hạn ngạch nhà cung cấp (chỉ đọc)',
-      subtitle: 'Mỗi tài khoản một thẻ. Số của Codex là chính thức; Claude Code và Gemini không có cách đọc chính thức nên giới hạn của chúng hiện khi một lượt chạy chạm tới. Chưa rõ thì để trống.',
+      subtitle: 'Mỗi tài khoản một thẻ. Số của Codex là chính thức. Claude Code và Gemini không có cách đọc chính thức, nên được đọc như các router: dùng đăng nhập đã lưu của chính CLI (chỉ đọc, không gửi đi đâu khác). Chưa rõ thì để trống.',
       refresh: 'Làm mới từ nhà cung cấp',
       refreshing: 'Đang làm mới…',
       empty: 'Chưa có số liệu hạn ngạch.',
@@ -519,6 +519,8 @@ export const viVN: TranslationDictionary = {
       resetsAt: 'đặt lại lúc {time}',
       observedAt: 'kiểm tra lúc {time}',
       usableSummary: '{usable}/{total} dùng được',
+      unofficialToggle: 'Đọc hạn ngạch Claude Code và Gemini như các router (không chính thức)',
+      unofficialHint: 'Dùng đăng nhập đã lưu của chính CLI, chỉ gửi tới máy chủ Anthropic/Google. Không làm mới hay lưu token. Tắt thì không đọc gì.',
       usable: 'Dùng được',
       notUsable: 'Chưa dùng được',
       plan: 'gói {plan}',
@@ -536,6 +538,7 @@ export const viVN: TranslationDictionary = {
       source: {
         PROVIDER_REPORTED: 'Chính thức (CLI báo)',
         OBSERVED: 'Quan sát từ lượt chạy',
+        UNOFFICIAL: 'Không chính thức (đọc như router)',
         UNKNOWN: 'Chưa rõ',
       },
       window: {

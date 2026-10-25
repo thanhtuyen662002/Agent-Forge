@@ -510,7 +510,7 @@ export const enUS: TranslationDictionary = {
     },
     quota: {
       title: 'Provider quota (read-only)',
-      subtitle: 'One card per account. Codex numbers are official; Claude Code and Gemini have no official usage reader, so their limits appear when a run reaches them. Unknown stays unknown.',
+      subtitle: 'One card per account. Codex numbers are official. Claude Code and Gemini have no official usage reader, so they are read like quota routers do, from the CLI\'s own saved sign-in (read-only, sent nowhere else). Unknown stays unknown.',
       refresh: 'Refresh from provider',
       refreshing: 'Refreshing…',
       empty: 'No quota readings yet.',
@@ -519,6 +519,8 @@ export const enUS: TranslationDictionary = {
       resetsAt: 'resets {time}',
       observedAt: 'checked {time}',
       usableSummary: '{usable} of {total} usable',
+      unofficialToggle: 'Read Claude Code and Gemini quota like routers do (unofficial)',
+      unofficialHint: 'Uses the CLI\'s own saved sign-in, sent only to Anthropic/Google. Tokens are never refreshed or stored. Off means nothing is read.',
       usable: 'Usable',
       notUsable: 'Not usable',
       plan: 'plan {plan}',
@@ -536,6 +538,7 @@ export const enUS: TranslationDictionary = {
       source: {
         PROVIDER_REPORTED: 'Official (reported by the CLI)',
         OBSERVED: 'Observed from a run',
+        UNOFFICIAL: 'Unofficial (read like routers)',
         UNKNOWN: 'Unknown',
       },
       window: {
