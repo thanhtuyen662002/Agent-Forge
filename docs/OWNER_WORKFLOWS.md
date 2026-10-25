@@ -536,12 +536,12 @@ assignment is refused.
 Gemini CLI 0.65's personal *Sign in with Google* ("This client is no longer
 supported for Gemini Code Assist for individuals… migrate to the Antigravity
 suite"). Gemini CLI now remains for Gemini API-key use. Personal Google
-accounts use Antigravity's CLI (`%LOCALAPPDATA%gyingy.exe`) instead.
+accounts use Antigravity's CLI (`%LOCALAPPDATA%\agy\bin\agy.exe`) instead.
 
 Findings from agy 1.4.6 on the owner's machine:
 
 - **State and sign-in.** The CLI keeps its state (conversations, settings, MCP
-  config) under `<home>\.geminintigravity-cli`, so each agent's profile
+  config) under `<home>\.gemini\antigravity-cli`, so each agent's profile
   directory becomes its home and the owner's own agy state and settings are
   never used. The Google sign-in itself is **machine-wide**: a run with an empty
   home, `APPDATA` and `LOCALAPPDATA` was still signed in. All Antigravity agents
