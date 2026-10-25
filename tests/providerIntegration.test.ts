@@ -240,15 +240,13 @@ describe('PR #5 — Provider Integration Foundation', () => {
   });
 
   // 6 & 7. Antigravity automated adapter absent & mode is MANUAL_BRIDGE_ONLY
-  it('6-7. Antigravity automated adapter is not registered and mode is MANUAL_BRIDGE_ONLY', () => {
+  it('6-7. Antigravity CLI is an automated adapter since #265, alongside the manual bridge', () => {
     const bootstrapDir = path.join(tmpDir, 'bootstrap-antigravity-check');
     const bootstrap = BootstrapService.initialize(bootstrapDir);
 
-    expect(bootstrap.providerRegistry.has('prov-antigravity-cli')).toBe(false);
+    // Google moved personal Gemini use from Gemini CLI to Antigravity (#265).
+    expect(bootstrap.providerRegistry.has('prov-antigravity-cli')).toBe(true);
     expect(bootstrap.providerRegistry.has('prov-manual-bridge')).toBe(true);
-
-    const ANTIGRAVITY_AUTOMATION_MODE = 'MANUAL_BRIDGE_ONLY';
-    expect(ANTIGRAVITY_AUTOMATION_MODE).toBe('MANUAL_BRIDGE_ONLY');
 
     bootstrap.dbEngine.close();
   });
@@ -673,7 +671,7 @@ describe('PR #5 — Provider Integration Foundation', () => {
     expect(bootstrap.providerRegistry.has('prov-manual-bridge')).toBe(true);
     expect(bootstrap.providerRegistry.has('prov-codex-cli')).toBe(true);
     expect(bootstrap.providerRegistry.has('prov-gemini-cli')).toBe(true);
-    expect(bootstrap.providerRegistry.has('prov-antigravity-cli')).toBe(false);
+    expect(bootstrap.providerRegistry.has('prov-antigravity-cli')).toBe(true);
 
     bootstrap.dbEngine.close();
   });
@@ -819,11 +817,13 @@ describe('PR #5 — Provider Integration Foundation', () => {
     // Claude Code CLI is registered under its own ID since #242.
     expect(registry.resolve('prov-claude-code-cli').id).toBe('prov-claude-code-cli');
 
-    // Registered adapter count equals exactly 4
-    expect(registry.size).toBe(4);
+    // Antigravity CLI is registered under its own ID since #265.
+    expect(registry.resolve('prov-antigravity-cli').id).toBe('prov-antigravity-cli');
+
+    // Registered adapter count equals exactly 5
+    expect(registry.size).toBe(5);
 
     // Excluded providers are absent
-    expect(registry.has('prov-antigravity-cli')).toBe(false);
     expect(registry.has('prov-antigravity')).toBe(false);
     expect(registry.has('prov-claude-code')).toBe(false);
     expect(registry.has('prov-claude-cli')).toBe(false);

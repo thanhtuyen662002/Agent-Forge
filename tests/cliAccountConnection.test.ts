@@ -25,7 +25,7 @@ describe('Claude Code and Gemini account sign-in (#242)', () => {
   const service = (onVerified?: () => void) => new CliAccountConnectionService(repo, {
     runner, executableFor: (providerId) => path.join(tools, `${providerId}.exe`), profileResolver: resolver, onVerified,
   });
-  const addAgent = (connection: 'CLAUDE_CODE_CLI' | 'GEMINI_CLI' | 'CODEX_CLI') => {
+  const addAgent = (connection: 'CLAUDE_CODE_CLI' | 'GEMINI_CLI' | 'CODEX_CLI' | 'ANTIGRAVITY_CLI') => {
     const created = new WorkspaceManagementService(repo).createAgent({ displayName: `${connection} coder`, role: 'CODER', connection, modelName: 'model', workerSlots: 1 });
     if (!created.success) throw new Error('agent not created');
     return repo.getProviderResource(created.agent.provider_resource_id!)!.provider_account_id!;
@@ -35,7 +35,7 @@ describe('Claude Code and Gemini account sign-in (#242)', () => {
     tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'cli-sign-in-'));
     tools = path.join(tmpDir, 'tools');
     fs.mkdirSync(tools);
-    for (const id of ['prov-claude-code-cli', 'prov-gemini-cli']) fs.writeFileSync(path.join(tools, `${id}.exe`), '');
+    for (const id of ['prov-claude-code-cli', 'prov-gemini-cli', 'prov-antigravity-cli']) fs.writeFileSync(path.join(tools, `${id}.exe`), '');
     resolver = new NativeProfileResolver({ baseProfilesDir: path.join(tmpDir, 'profiles') });
     db = new Database(':memory:');
     db.pragma('foreign_keys = ON');
@@ -99,6 +99,27 @@ describe('Claude Code and Gemini account sign-in (#242)', () => {
     expect(await cli.verify(accountId)).toMatchObject({ verified: true, reasonCode: 'VERIFIED' });
     expect(calls.at(-1)!.args).toEqual(expect.arrayContaining(['--approval-mode', 'plan']));
     expect(repo.getProviderAccount(accountId)!.health_status).toBe('AVAILABLE');
+  });
+
+  it('signs Antigravity in through agy itself and verifies with a read-only prompt; a quota error still proves the sign-in (#265)', async () => {
+    const accountId = addAgent('ANTIGRAVITY_CLI');
+    const profileDir = resolver.resolve(repo.getProviderAccount(accountId)!.profile_ref!).profileDirectory;
+    const cli = service();
+    expect(cli.startSignIn(accountId)).toEqual({ success: true, cli: 'Antigravity' });
+    expect(calls[0]).toMatchObject({ kind: 'open', args: [] });
+    expect(calls[0].env).toEqual({ USERPROFILE: profileDir, HOME: profileDir });
+
+    nextRun = { exitCode: 3, stdout: '{"status":"ERROR","error":"Individual quota reached. Resets in 117h59m19s."}',
+      stderr: 'AGY_ERROR: {"status":"RESOURCE_EXHAUSTED","error_code":429,"short_error":"RESOURCE_EXHAUSTED (code 429): Individual quota reached."}' };
+    expect(await cli.verify(accountId)).toEqual({ success: true, verified: true, reasonCode: 'VERIFIED' });
+    expect(calls[1].args).toEqual(expect.arrayContaining(['--mode', 'plan', '-p']));
+    expect(calls[1].args.join(' ')).not.toMatch(/dangerously|accept-edits/);
+
+    const other = addAgent('ANTIGRAVITY_CLI');
+    nextRun = { exitCode: 1, stdout: '', stderr: 'AGY_ERROR: {"status":"UNAUTHENTICATED","error_code":401,"short_error":"not signed in"}' };
+    expect(await cli.verify(other)).toEqual({ success: true, verified: false, reasonCode: 'NOT_SIGNED_IN' });
+    nextRun = { exitCode: 1, stdout: '', stderr: 'boom' };
+    expect(await cli.verify(other)).toEqual({ success: true, verified: false, reasonCode: 'VERIFY_FAILED' });
   });
 
   it('refuses Codex accounts (they use device-code sign-in) and missing CLIs', async () => {

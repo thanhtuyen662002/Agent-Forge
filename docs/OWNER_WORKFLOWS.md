@@ -481,16 +481,18 @@ expired at runtime too, so the task is not blocked.
 
 ## Claude Code and Gemini CLI agents
 
-Agent Center offers four connections: Manual Bridge, **Codex CLI**, **Claude
-Code CLI** and **Gemini CLI** (#242). Each agent gets its own account and its
-own profile directory, so any number of accounts per CLI can run side by side
-without sharing a login:
+Agent Center offers five connections: Manual Bridge, **Codex CLI**, **Claude
+Code CLI**, **Antigravity CLI** (#265) and **Gemini CLI** (#242). Each agent gets
+its own account and its own profile directory, so any number of accounts per
+CLI can run side by side without sharing a login. The exception is Antigravity,
+described below.
 
 | CLI | Profile variable | Coder run | Reviewer / Manager run |
 | --- | --- | --- | --- |
 | Codex | `CODEX_HOME` | `--sandbox workspace-write` | `--sandbox read-only` |
 | Claude Code | `CLAUDE_CONFIG_DIR` | `claude -p --output-format json --permission-mode acceptEdits --tools Read,Edit,Write,Glob,Grep` | `--permission-mode dontAsk --tools Read,Glob,Grep` |
 | Gemini | `GEMINI_CLI_HOME` | `--approval-mode auto_edit` | `--approval-mode plan` |
+| Antigravity | `USERPROFILE` / `HOME` (state only) | `agy --output-format json --mode accept-edits --sandbox -p <prompt>` | `--mode plan` |
 
 All runs happen in the isolated provider workspace. Child processes get only a
 minimal environment, so host credentials such as `ANTHROPIC_API_KEY` never
@@ -529,6 +531,39 @@ or a read-only prompt for Gemini. The account then becomes `AVAILABLE` again
 and its failure code is cleared. Cooldowns, quota exhaustion and rate limits are
 never cleared this way, and an account with an unreleased lease or a running
 assignment is refused.
+
+**Antigravity CLI (#265).** In the first real trial (2026-10-25), Google refused
+Gemini CLI 0.65's personal *Sign in with Google* ("This client is no longer
+supported for Gemini Code Assist for individuals… migrate to the Antigravity
+suite"). Gemini CLI now remains for Gemini API-key use. Personal Google
+accounts use Antigravity's CLI (`%LOCALAPPDATA%\agy\bin\agy.exe`) instead.
+
+Findings from agy 1.4.6 on the owner's machine:
+
+- **State and sign-in.** The CLI keeps its state (conversations, settings, MCP
+  config) under `<home>\.gemini\antigravity-cli`, so each agent's profile
+  directory becomes its home and the owner's own agy state and settings are
+  never used. The Google sign-in itself is **machine-wide**: a run with an empty
+  home, `APPDATA` and `LOCALAPPDATA` was still signed in. All Antigravity agents
+  therefore share the account signed in to agy on this computer.
+- **Prompt and results.** The prompt is the value of `-p` (stdin stays empty).
+  Prompts beyond 24,000 characters are refused before spawn, because of the
+  Windows command-line limit. The result is one JSON object: `status`
+  `SUCCESS`/`ERROR`, `response`, `error`, `usage`.
+- **Failures.** A failure also prints `AGY_ERROR: {status, error_code,
+  short_error}` on stderr. `RESOURCE_EXHAUSTED`/`429` ("Individual quota
+  reached… Resets in 117h59m19s", exit 3) becomes `QUOTA_EXHAUSTED` with the
+  reset time; `UNAUTHENTICATED`/`401` becomes `AUTH_ERROR`. Only these CLI
+  fields are classified, never the model's text.
+- **Sign-in check.** *Sign in* opens agy itself in a terminal. *Check sign-in*
+  runs a one-line `--mode plan` prompt. A quota error still proves the sign-in,
+  because the provider accepted the account.
+- **Models.** The model picker lists models live from `agy models`, run in a
+  disposable home. Its first entry is the default.
+- **Quota.** There is no quota reader yet; a limit appears when a run reaches it.
+
+Live coder and review runs could not be checked yet, because the owner's
+Antigravity quota was exhausted (resets around 2026-10-30).
 
 ## Provider quota and account verification
 

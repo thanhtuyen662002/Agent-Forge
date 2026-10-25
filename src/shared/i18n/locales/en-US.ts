@@ -252,13 +252,15 @@ export const enUS: TranslationDictionary = {
       CODEX_CLI: 'Codex CLI',
       GEMINI_CLI: 'Gemini CLI',
       CLAUDE_CODE_CLI: 'Claude Code CLI',
+      ANTIGRAVITY_CLI: 'Antigravity CLI (Google)',
       OTHER: 'Other provider',
     },
     connectionHelp: {
       MANUAL_BRIDGE: 'You copy each work order to a chat window and paste the reply back. Nothing runs automatically.',
       CODEX_CLI: 'Runs the Codex command-line tool on this computer. Codex must be installed and signed in to this profile.',
-      GEMINI_CLI: 'Runs the Gemini command-line tool on this computer. Gemini must be installed and signed in to this profile.',
+      GEMINI_CLI: 'Runs the Gemini command-line tool on this computer. Google no longer allows personal Google sign-in; use it with a Gemini API key. For a personal Google account, use Antigravity CLI.',
       CLAUDE_CODE_CLI: 'Runs the Claude Code command-line tool on this computer, with this agent’s own sign-in. Claude Code must be installed.',
+      ANTIGRAVITY_CLI: 'Runs Google’s Antigravity CLI (agy): Gemini models for personal Google accounts. The Google sign-in is machine-wide, so all Antigravity agents share one account.',
       OTHER: 'Configured outside the Agent Center.',
     },
     models: {
@@ -574,6 +576,7 @@ export const enUS: TranslationDictionary = {
       cli: {
         CODEX: 'Codex CLI',
         CLAUDE: 'Claude Code CLI',
+        ANTIGRAVITY: 'Antigravity CLI',
         GEMINI: 'Gemini CLI',
         OTHER: 'Other',
       },

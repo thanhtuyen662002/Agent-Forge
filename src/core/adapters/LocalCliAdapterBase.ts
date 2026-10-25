@@ -1096,6 +1096,11 @@ export abstract class LocalCliAdapterBase implements ProviderAdapter {
     return lines.join('\n');
   }
 
+  /** What the child reads on stdin; undefined leaves the pipe open. */
+  protected buildStdin(prompt: string): string | undefined {
+    return this.useStdin ? prompt : undefined;
+  }
+
   protected buildExecutionArgs(request: AgentExecutionRequest, _prompt: string): string[] {
     // When using stdin, no extra arguments needed beyond default execution mode
     return [];
@@ -1377,7 +1382,7 @@ export abstract class LocalCliAdapterBase implements ProviderAdapter {
           projectId: request.projectId,
           taskId: request.taskId,
           attemptId: request.attemptId ?? null,
-          stdin: this.useStdin ? prompt : undefined,
+          stdin: this.buildStdin(prompt),
           executionId: isScheduled ? executionId : undefined,
         });
         processResult.stdout = redactSensitiveText(processResult.stdout);

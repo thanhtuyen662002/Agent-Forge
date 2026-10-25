@@ -15,7 +15,7 @@ import { MAX_AGENT_WORKER_SLOTS } from '../../core/types/workspace';
 import { Bot, Shield, Terminal, Wrench, Plus, RefreshCw } from 'lucide-react';
 
 const ROLE_OPTIONS: AgentRole[] = ['PRIMARY_MANAGER', 'BACKUP_MANAGER', 'CODER', 'REVIEWER', 'TOOL'];
-const CONNECTION_OPTIONS: AgentConnectionKind[] = ['MANUAL_BRIDGE', 'CODEX_CLI', 'CLAUDE_CODE_CLI', 'GEMINI_CLI'];
+const CONNECTION_OPTIONS: AgentConnectionKind[] = ['MANUAL_BRIDGE', 'CODEX_CLI', 'CLAUDE_CODE_CLI', 'ANTIGRAVITY_CLI', 'GEMINI_CLI'];
 
 const inputClass =
   'w-full bg-surface-card border border-surface-border rounded-lg px-3 py-2 text-sm text-white focus:outline-none focus:border-forge-cyan';

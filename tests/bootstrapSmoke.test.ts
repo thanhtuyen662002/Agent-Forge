@@ -68,13 +68,13 @@ describe('Bootstrap Smoke & Fresh Database Startup', () => {
     expect(agents.length).toBe(2);
     expect(agents.every((agent) => agent.current_task_id === null)).toBe(true);
 
-    // Assert provider registry initialized with registered adapters (Antigravity is MANUAL_BRIDGE_ONLY)
+    // Assert provider registry initialized with registered adapters (Antigravity CLI is automated since #265)
     expect(bootstrap.providerRegistry).toBeDefined();
-    expect(bootstrap.providerRegistry.size).toBe(4); // Manual Bridge, Codex, Gemini, Claude Code (#242)
+    expect(bootstrap.providerRegistry.size).toBe(5); // Manual Bridge, Codex, Gemini, Claude Code (#242), Antigravity (#265)
     expect(bootstrap.providerRegistry.has('prov-manual-bridge')).toBe(true);
     expect(bootstrap.providerRegistry.has('prov-codex-cli')).toBe(true);
     expect(bootstrap.providerRegistry.has('prov-gemini-cli')).toBe(true);
-    expect(bootstrap.providerRegistry.has('prov-antigravity-cli')).toBe(false);
+    expect(bootstrap.providerRegistry.has('prov-antigravity-cli')).toBe(true);
     expect(bootstrap.providerRoutingService).toBeDefined();
     expect(bootstrap.providerDispatchService).toBeDefined();
     expect(bootstrap.executionAuthorizationService).toBeDefined();

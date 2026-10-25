@@ -15,7 +15,7 @@ export interface ManagedAgent extends Agent {
  * adapter that is actually registered in the desktop ProviderRegistry; there
  * is no option for providers Agent Forge cannot run.
  */
-export const AgentConnectionKindEnum = z.enum(['MANUAL_BRIDGE', 'CODEX_CLI', 'GEMINI_CLI', 'CLAUDE_CODE_CLI']);
+export const AgentConnectionKindEnum = z.enum(['MANUAL_BRIDGE', 'CODEX_CLI', 'GEMINI_CLI', 'CLAUDE_CODE_CLI', 'ANTIGRAVITY_CLI']);
 export type AgentConnectionKind = z.infer<typeof AgentConnectionKindEnum>;
 
 /** Bounded like the self-host runtime (`MAX_AGY_WORKERS` accepts 1 or 2). */

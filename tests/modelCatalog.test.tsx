@@ -117,6 +117,20 @@ describe('model catalog (#263)', () => {
     expect((await catalogs.list('CODEX_CLI')).source).toBe('LIVE');
   });
 
+  it('lists Antigravity models live from `agy models`, falling back to the built-in list (#265)', async () => {
+    let reply: string | null = 'gemini-3.8-flash-high\tGemini 3.8 Flash (High)\nclaude-sonnet-4-6\tClaude Sonnet 4.6 (Thinking)\n';
+    const catalogs = new ModelCatalogService({ spawner, temporaryRoot: root, now: () => clock, readAntigravityModels: async () => reply });
+    const live = await catalogs.list('ANTIGRAVITY_CLI');
+    expect(live.source).toBe('LIVE');
+    expect(live.models.map((entry) => [entry.id, entry.isDefault])).toEqual([['gemini-3.8-flash-high', true], ['claude-sonnet-4-6', false]]);
+    reply = null;
+    clock += 11 * 60_000;
+    const fallback = await catalogs.list('ANTIGRAVITY_CLI');
+    expect(fallback.source).toBe('BUILT_IN');
+    expect(fallback.models.map((entry) => entry.id)).toEqual(BUILT_IN_MODELS.ANTIGRAVITY_CLI.map((entry) => entry.id));
+    expect(spawner.spawn).not.toHaveBeenCalled();
+  });
+
   it('falls back when no trusted Codex executable exists', async () => {
     const catalog = await new ModelCatalogService({ spawner, resolveCodexExecutable: () => null, temporaryRoot: root }).list('CODEX_CLI');
     expect(catalog.source).toBe('BUILT_IN');
