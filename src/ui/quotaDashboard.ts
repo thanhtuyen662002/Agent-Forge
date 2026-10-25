@@ -7,6 +7,8 @@ export type CliKind = 'CODEX' | 'CLAUDE' | 'GEMINI' | 'OTHER';
 
 export interface QuotaWindowView {
   kind: QuotaWindowKind;
+  /** A model bucket's name (Gemini), shown instead of the window kind. */
+  label: string | null;
   windowMinutes: number | null;
   remainingPercent: number | null;
   tone: QuotaTone;
@@ -67,8 +69,8 @@ export function countdown(resetsAt: string | null, now: number): { days: number;
   return { days: Math.floor(totalMinutes / 1440), hours: Math.floor((totalMinutes % 1440) / 60), minutes: totalMinutes % 60 };
 }
 
-const toWindow = (window: QuotaWindowObservation): QuotaWindowView => ({
-  kind: windowKind(window.windowMinutes), windowMinutes: window.windowMinutes, remainingPercent: window.remainingPercent,
+const toWindow = (window: QuotaWindowObservation & { label?: string }): QuotaWindowView => ({
+  kind: windowKind(window.windowMinutes), label: window.label ?? null, windowMinutes: window.windowMinutes, remainingPercent: window.remainingPercent,
   tone: toneFor(window.remainingPercent), resetsAt: window.resetsAt,
 });
 
@@ -84,11 +86,18 @@ export function buildQuotaGroups(observations: QuotaObservation[], resources: Pr
     const accountResources = resources.filter((resource) => bound.has(resource.id) || resource.provider_account_id === observation.accountId);
     const resourceIds = new Set(accountResources.map((resource) => resource.id));
     const windows: QuotaWindowView[] = [];
-    if (observation.status === 'OK') {
+    const bucketed = observation.status === 'OK' && !!observation.buckets?.length;
+    if (bucketed) {
+      windows.push(...observation.buckets!.map(toWindow));
+    } else if (observation.status === 'OK') {
       windows.push(toWindow(observation));
       if (observation.secondary) windows.push(toWindow(observation.secondary));
     }
-    const limited = observation.source === 'OBSERVED' && windows.some((window) => window.remainingPercent === 0);
+    // Windows exist only for OK readings, whatever their source. An exhausted
+    // window blocks use; per-model buckets block only when every model is out.
+    const exhausted = bucketed
+      ? windows.every((window) => window.remainingPercent === 0)
+      : windows.some((window) => window.remainingPercent === 0);
     return {
       accountId: observation.accountId,
       cli: CLI_BY_PROVIDER[observation.providerId] ?? 'OTHER',
@@ -98,8 +107,7 @@ export function buildQuotaGroups(observations: QuotaObservation[], resources: Pr
       status: observation.status,
       source: observation.source,
       healthStatus: observation.healthStatus,
-      usable: !!observation.healthStatus && USABLE_HEALTH.has(observation.healthStatus) && !limited &&
-        !(observation.source === 'PROVIDER_REPORTED' && windows.some((window) => window.remainingPercent === 0)),
+      usable: !!observation.healthStatus && USABLE_HEALTH.has(observation.healthStatus) && !exhausted,
       windows,
       observedAt: observation.observedAt,
     };

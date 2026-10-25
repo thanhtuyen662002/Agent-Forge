@@ -33,7 +33,7 @@ export const ProviderQuotaPanel: React.FC = () => {
       : left.hours > 0 ? t('runtime.quota.durationHours', { hours: left.hours, minutes: left.minutes })
         : t('runtime.quota.durationMinutes', { minutes: left.minutes });
   };
-  const windowLabel = (window: QuotaWindowView) => t(`runtime.quota.window.${window.kind}`, { minutes: window.windowMinutes ?? 0 });
+  const windowLabel = (window: QuotaWindowView) => window.label ?? t(`runtime.quota.window.${window.kind}`, { minutes: window.windowMinutes ?? 0 });
 
   return (
     <section aria-labelledby="provider-quota-title" className="bg-surface-card border border-surface-border rounded-xl p-5 space-y-4">
@@ -53,6 +53,21 @@ export const ProviderQuotaPanel: React.FC = () => {
           <span>{quota.refreshing ? t('runtime.quota.refreshing') : t('runtime.quota.refresh')}</span>
         </button>
       </div>
+      {quota.unofficialReaders !== null && (
+        <label className="flex items-start gap-2 text-xs text-slate-300">
+          <input
+            type="checkbox"
+            className="mt-0.5"
+            checked={quota.unofficialReaders}
+            disabled={quota.refreshing}
+            onChange={(event) => void quota.setUnofficial(event.target.checked, refreshData)}
+          />
+          <span>
+            {t('runtime.quota.unofficialToggle')}
+            <span className="block text-[11px] text-slate-500">{t('runtime.quota.unofficialHint')}</span>
+          </span>
+        </label>
+      )}
       {quota.failed && <p role="alert" className="text-xs text-rose-300">{t('runtime.quota.failed')}</p>}
       {groups.length === 0 ? (
         <p className="text-xs text-slate-500">{t('runtime.quota.empty')}</p>

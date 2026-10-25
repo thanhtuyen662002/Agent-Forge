@@ -522,6 +522,8 @@ export interface TranslationDictionary {
       resetsAt: string;
       observedAt: string;
       usableSummary: string;
+      unofficialToggle: string;
+      unofficialHint: string;
       usable: string;
       notUsable: string;
       plan: string;
@@ -539,6 +541,7 @@ export interface TranslationDictionary {
       source: {
         PROVIDER_REPORTED: string;
         OBSERVED: string;
+        UNOFFICIAL: string;
         UNKNOWN: string;
       };
       window: {

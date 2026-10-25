@@ -995,6 +995,24 @@ export function registerIpcHandlers(
     return sanitizeOutputValue({ success: true, observations: runtime.quota.getLatestObservations() });
   });
 
+  registerPrivilegedHandler('quota:getPreferences', async () => {
+    if (!runtime.quota) return { success: false, errorCode: 'QUOTA_UNAVAILABLE' };
+    return { success: true, unofficialReaders: runtime.quota.getUnofficialReadersEnabled() };
+  });
+
+  // The owner's switch for reading Claude Code / Gemini usage from their saved sign-in (#250).
+  registerPrivilegedHandler('quota:setPreferences', async (_, payload: unknown) => {
+    if (!runtime.quota) return { success: false, errorCode: 'QUOTA_UNAVAILABLE' };
+    const enabled = payload && typeof payload === 'object' ? (payload as { unofficialReaders?: unknown }).unofficialReaders : undefined;
+    if (typeof enabled !== 'boolean') return { success: false, errorCode: 'INVALID_INPUT' };
+    try {
+      runtime.quota.setUnofficialReadersEnabled(enabled);
+    } catch {
+      return { success: false, errorCode: 'QUOTA_PREFERENCES_UNWRITABLE' };
+    }
+    return { success: true, unofficialReaders: enabled };
+  });
+
   registerPrivilegedHandler('quota:refresh', async () => {
     if (!runtime.quota) return { success: false, errorCode: 'QUOTA_UNAVAILABLE' };
     const observations = await runtime.quota.refreshAll();

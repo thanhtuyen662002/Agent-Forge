@@ -85,6 +85,15 @@ export function useQuotaObservations() {
     api.getQuotaObservations().then(apply).catch(() => setFailed(true));
   }, [api]);
 
+  // The owner's switch for unofficial Claude Code / Gemini readers (#250); null until known.
+  const [unofficialReaders, setUnofficialReaders] = useState<boolean | null>(null);
+  useEffect(() => {
+    if (!api?.getQuotaPreferences) return;
+    api.getQuotaPreferences().then((reply: unknown) => {
+      if (isRecord(reply) && reply.success === true && typeof reply.unofficialReaders === 'boolean') setUnofficialReaders(reply.unofficialReaders);
+    }).catch(() => undefined);
+  }, [api]);
+
   const refresh = useCallback(async (afterRefresh?: () => Promise<void>) => {
     if (!api?.refreshQuota || refreshingRef.current) return;
     refreshingRef.current = true;
@@ -100,5 +109,19 @@ export function useQuotaObservations() {
     }
   }, [api]);
 
-  return { available: Boolean(api?.refreshQuota), observations, failed, refreshing, refresh };
+  /** Saves the switch, then refreshes so the cards match it. */
+  const setUnofficial = useCallback(async (enabled: boolean, afterRefresh?: () => Promise<void>) => {
+    if (!api?.setQuotaPreferences) return;
+    try {
+      const reply = await api.setQuotaPreferences({ unofficialReaders: enabled });
+      if (!isRecord(reply) || reply.success !== true || typeof reply.unofficialReaders !== 'boolean') { setFailed(true); return; }
+      setUnofficialReaders(reply.unofficialReaders);
+    } catch {
+      setFailed(true);
+      return;
+    }
+    await refresh(afterRefresh);
+  }, [api, refresh]);
+
+  return { available: Boolean(api?.refreshQuota), observations, failed, refreshing, refresh, unofficialReaders, setUnofficial };
 }
