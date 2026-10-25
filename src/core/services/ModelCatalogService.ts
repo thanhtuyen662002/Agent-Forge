@@ -134,7 +134,8 @@ export class ModelCatalogService {
     const executable = this.resolveCodexExecutable();
     // Windows command shims would need a shell; only a direct executable is launched.
     if (!executable || (process.platform === 'win32' && /\.(cmd|bat)$/i.test(executable))) return null;
-    const home = fs.mkdtempSync(path.join(this.temporaryRoot, 'agent-forge-models-'));
+    // Canonical path: Windows TEMP is often a DOS short name, while the CLI reports the long one.
+    const home = fs.realpathSync.native(fs.mkdtempSync(path.join(this.temporaryRoot, 'agent-forge-models-')));
     let child: CodexQuotaProcess;
     try {
       child = this.spawner.spawn(executable, ['app-server'], {

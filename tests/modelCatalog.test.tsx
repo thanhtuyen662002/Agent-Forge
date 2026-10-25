@@ -74,6 +74,23 @@ describe('model catalog (#263)', () => {
     expect(path.dirname(spawner.homes[0])).toBe(root); // Never the owner's or an agent's profile.
   });
 
+  it('matches the home the CLI reports when TEMP is an alias of the real folder', async () => {
+    // Windows TEMP is often a DOS short name; the CLI reports the canonical path.
+    const real = fs.mkdtempSync(path.join(os.tmpdir(), 'af-model-real-'));
+    const alias = path.join(root, 'alias');
+    try {
+      try { fs.symlinkSync(real, alias, 'junction'); } catch { return; }
+      const answer = spawner.spawn.getMockImplementation()!;
+      spawner.spawn.mockImplementation((executable, args, options) =>
+        answer(executable, args, { ...options, env: { ...options.env, CODEX_HOME: fs.realpathSync.native(options.env.CODEX_HOME!) } }));
+      const catalog = await new ModelCatalogService({ spawner, resolveCodexExecutable: () => path.join(os.tmpdir(), 'fake-codex.exe'), timeoutMs: 200, temporaryRoot: alias }).list('CODEX_CLI');
+      expect(catalog.source).toBe('LIVE');
+    } finally {
+      fs.rmSync(alias, { recursive: true, force: true });
+      fs.rmSync(real, { recursive: true, force: true });
+    }
+  });
+
   it('follows pages and caches a live list for a while', async () => {
     spawner.pages = [{ data: [LIVE_PAGE.data[0]], nextCursor: 'next' }, { data: [LIVE_PAGE.data[1]], nextCursor: null }];
     const catalogs = service();
