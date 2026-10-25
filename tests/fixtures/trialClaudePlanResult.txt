@@ -1,0 +1,61 @@
+```json
+{
+  "protocol": "plan.v1",
+  "message_id": "TSK-16C4FA6F-plan-1",
+  "project_id": "PROJ-190E6B10",
+  "contract_sha256": "3d3ea48833778c890568786a5b62c52629ce538acc20ee9661e6910b9d0dc70a",
+  "tasks": [
+    {
+      "title": "Thêm hàm slugify vào src/text.js",
+      "description": "Đọc src/text.js để nắm kiểu export hiện có (CommonJS hoặc ESM) rồi thêm hàm slugify(str) và export nó theo cùng kiểu. Hàm làm các bước sau. (1) Chuyển chuỗi về chữ thường. (2) Thay đ/Đ bằng d, vì đ không tách được bằng NFD. (3) Chuẩn hoá NFD và bỏ các dấu kết hợp trong khoảng \\u0300-\\u036f để bỏ dấu tiếng Việt. (4) Thay mỗi chuỗi ký tự không phải a-z0-9 bằng đúng một dấu gạch nối. (5) Bỏ gạch nối thừa ở hai đầu. Không dùng thư viện ngoài và không đổi hành vi của các hàm hiện có.",
+      "acceptance_criteria": [
+        "slugify(\"Xin Chào Việt Nam\") trả về \"xin-chao-viet-nam\"",
+        "slugify(\" Đường số 1!! \") trả về \"duong-so-1\"",
+        "slugify được export từ src/text.js cùng kiểu với các hàm hiện có",
+        "Không thêm dependency nào vào package.json"
+      ],
+      "constraints": [
+        "Không thêm thư viện ngoài",
+        "Không sửa hành vi các hàm hiện có trong src/text.js",
+        "Chỉ dùng API chuẩn của Node.js và JavaScript"
+      ],
+      "context_paths": ["src/text.js", "package.json"],
+      "priority": "high",
+      "risk": "low"
+    },
+    {
+      "title": "Thêm test cho slugify trong thư mục test",
+      "description": "Thêm test cho slugify bằng node:test và node:assert, theo đúng phong cách (kiểu import, tên file) của các test hiện có trong thư mục test. Nếu chưa có file test cho text.js thì tạo test/text.test.js, còn nếu có rồi thì bổ sung vào file đó. Các ca cần có: hai ví dụ trong tiêu chí nghiệm thu, đ/Đ, nhiều khoảng trắng hoặc ký tự đặc biệt liên tiếp chỉ ra một dấu gạch nối, gạch nối thừa ở hai đầu bị bỏ, chuỗi rỗng, và chuỗi chỉ gồm ký tự đặc biệt.",
+      "acceptance_criteria": [
+        "Test cho slugify nằm trong thư mục test và chạy được bằng node --test",
+        "Test bao gồm cả hai ví dụ trong tiêu chí nghiệm thu và các ca biên (đ/Đ, ký tự đặc biệt liên tiếp, gạch nối ở hai đầu, chuỗi rỗng)",
+        "Tất cả test mới đều qua"
+      ],
+      "constraints": [
+        "Không thêm thư viện test ngoài, chỉ dùng node:test và node:assert",
+        "Không sửa hoặc xoá các test cũ"
+      ],
+      "context_paths": ["test", "src/text.js", "package.json"],
+      "priority": "high",
+      "risk": "low"
+    },
+    {
+      "title": "Chạy toàn bộ test và xác nhận không hồi quy",
+      "description": "Chạy node --test ở thư mục gốc của dự án. Xác nhận các test cũ và test mới của slugify đều qua. Nếu có test cũ hỏng do thay đổi ở src/text.js thì sửa lại phần triển khai, không sửa test cũ.",
+      "acceptance_criteria": [
+        "node --test kết thúc với mã thoát 0",
+        "Các test cũ vẫn chạy qua",
+        "Test của slugify chạy qua"
+      ],
+      "constraints": [
+        "Không sửa hoặc xoá test cũ để làm cho test qua"
+      ],
+      "context_paths": ["src", "test", "package.json"],
+      "priority": "medium",
+      "risk": "low"
+    }
+  ]
+}
+```
+
+Tôi không duyệt được repo vì quyền Glob bị từ chối. Danh sách `context_paths` ở trên (`src/text.js`, `test`, `package.json`) là suy đoán từ nội dung hợp đồng, chưa kiểm tra bằng cách đọc cấu trúc thật.
