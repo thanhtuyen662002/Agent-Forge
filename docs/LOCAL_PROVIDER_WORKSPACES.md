@@ -93,3 +93,8 @@ Deployments that execute an intentionally hostile or multi-tenant provider
 must add an OS/container sandbox with filesystem, process, and network policy.
 The local workspace remains the application-level least-privilege boundary and
 the durable evidence/cleanup fence even when such a stronger sandbox is used.
+
+The Antigravity CLI (#265) runs in the same workspace with its own profile
+directory as its home, so per-agent CLI state stays separate. Its Google
+sign-in lives in the OS credential store and is shared machine-wide, which is
+not an isolation boundary between Antigravity agents.
