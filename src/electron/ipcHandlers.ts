@@ -11,6 +11,7 @@ import { VerificationService } from '../core/services/VerificationService';
 import { VerificationCapabilityService } from '../core/services/VerificationCapabilityService';
 import { VerificationCapabilityError, VerificationCapabilityPayload, VerificationCapabilityReference } from '../core/types/verificationCapability';
 import { ProtocolParser } from '../core/protocol/parser';
+import { validateContextPaths } from '../core/protocol/planProtocol';
 import { PackageGenerator } from '../core/protocol/packageGenerator';
 import { defaultArtifactStore } from '../core/services/ArtifactStore';
 import { EmergencyStopService } from '../core/services/EmergencyStopService';
@@ -40,6 +41,8 @@ import {
   UpdateResourceQuotaIpcSchema,
   ProjectScopedIpcSchema,
   TaskScopedIpcSchema,
+  TaskContextPathsIpcSchema,
+  SetTaskContextPathsIpcSchema,
   StartReviewIpcSchema,
   RunVerificationIpcSchema,
   EmergencyStopIpcSchema,
@@ -147,7 +150,7 @@ export function registerIpcHandlers(
   // project or task are refused before the handler runs; trashing also
   // invalidated its AUTHORIZED executions and dispatch re-checks the trash.
   const trashFencedChannels = new Set([
-    'project:importContract', 'project:transition', 'task:create', 'task:startReview',
+    'project:importContract', 'project:transition', 'task:create', 'task:startReview', 'task:setContextPaths',
     'protocol:generateWorkOrder', 'protocol:generateReviewPackage', 'verification:runTests',
     'verification:saveCommands', 'routing:routeTask', 'routing:authorizeTask',
     'routing:dispatchAuthorization', 'routing:generateAuthorizedWorkOrder',
@@ -381,6 +384,32 @@ export function registerIpcHandlers(
     if (!parsed.success) return [];
     if (repo.isProjectTrashed(parsed.data.projectId)) return [];
     return repo.getTasksByProject(parsed.data.projectId).filter((task) => !repo.isTaskTrashed(task.id));
+  });
+
+  // Task-scoped coder context (#261): the same validation as planning and dispatch.
+  const contextTask = (projectId: string, taskId: string) => {
+    const project = repo.getProject(projectId);
+    const task = repo.getTask(taskId);
+    return project && task && task.project_id === project.id ? { project, task } : null;
+  };
+
+  registerPrivilegedHandler('task:getContextPaths', async (_, payload: unknown) => {
+    const parsed = TaskContextPathsIpcSchema.safeParse(payload);
+    if (!parsed.success) return { success: false, errorCode: 'INVALID_INPUT' };
+    if (!contextTask(parsed.data.projectId, parsed.data.taskId)) return { success: false, errorCode: 'TASK_NOT_FOUND' };
+    return { success: true, paths: repo.getTaskContextPaths(parsed.data.projectId, parsed.data.taskId) };
+  });
+
+  registerPrivilegedHandler('task:setContextPaths', async (_, payload: unknown) => {
+    const parsed = SetTaskContextPathsIpcSchema.safeParse(payload);
+    if (!parsed.success) return { success: false, errorCode: 'INVALID_INPUT' };
+    const scoped = contextTask(parsed.data.projectId, parsed.data.taskId);
+    if (!scoped) return { success: false, errorCode: 'TASK_NOT_FOUND' };
+    const requested = parsed.data.paths.map((value) => value.trim()).filter(Boolean);
+    const check = validateContextPaths(scoped.project.repository_path, requested);
+    if (!check.ok) return { success: false, errorCode: check.reasonCode, path: check.path };
+    repo.setTaskContextPaths(scoped.project.id, scoped.task.id, check.paths);
+    return { success: true, paths: check.paths };
   });
 
   registerPrivilegedHandler('task:startReview', async (_, payload: unknown) => {

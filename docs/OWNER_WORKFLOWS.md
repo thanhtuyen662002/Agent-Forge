@@ -307,7 +307,16 @@ dispatch; the coder is then authorized for exactly those paths instead of the
 repository's top-level entries, so large repositories stay within the workspace
 bounds. A directory there is also where the coder may create new files (#240).
 A stored path that no longer exists stops the dispatch with
-`TASK_CONTEXT_INVALID`. Editing the paths by hand is a later follow-up.
+`TASK_CONTEXT_INVALID`.
+
+**Edit a task's context (#261).** The task view has a **Coder context** box
+with one repository path per line. Save validates every path with the same
+rules as planning and dispatch: inside the repository, existing, not a link,
+not policy-denied, at most 32. A rejection names the reason and the offending
+path, and nothing is stored. Duplicates and blank lines are dropped. An empty
+box clears the list, so the coder gets the repository's top-level entries
+again. A change applies from the next coder run, not to a run already in
+progress. A task in the trash cannot be changed.
 
 ## Automated verification after a completed coder run
 

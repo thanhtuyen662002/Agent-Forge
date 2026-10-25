@@ -133,6 +133,15 @@ export const TaskScopedIpcSchema = z.object({
   taskId: requiredIpcString(),
 });
 
+/** Task-scoped coder context (#261); paths are validated against the repository by the handler. */
+export const TaskContextPathsIpcSchema = z.object({
+  projectId: requiredIpcString(),
+  taskId: requiredIpcString(),
+});
+export const SetTaskContextPathsIpcSchema = TaskContextPathsIpcSchema.extend({
+  paths: ipcStringArray(),
+});
+
 const TaskMutationBindingIpcFields = {
   expectedRevision: z.number().int().min(0).max(1_000_000).optional(),
   expectedOwnershipEpoch: z.number().int().min(1).max(1_000_000_000).optional(),
