@@ -60,7 +60,7 @@ function getOrMaterializeTestRuntime(): string {
   const tempRuntimeDir = path.join(os.tmpdir(), `af-mcp-test-runtime-${Date.now()}-${crypto.randomUUID().slice(0, 8)}`);
   fs.mkdirSync(tempRuntimeDir, { recursive: true });
 
-  const tscBin = require.resolve('typescript/bin/tsc');
+  const tscBin = path.join(path.dirname(require.resolve('typescript/package.json')), 'bin', 'tsc');
   execFileSync(process.execPath, [tscBin, '-p', 'tsconfig.node.json', '--outDir', tempRuntimeDir], {
     cwd: projectRoot,
     stdio: 'pipe',
