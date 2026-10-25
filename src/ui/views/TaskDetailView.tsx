@@ -2,6 +2,7 @@ import React, { useState, useRef, useEffect } from 'react';
 import { useOrchestrator } from '../context/OrchestratorContext';
 import { useI18n } from '../context/I18nContext';
 import { ProgressIndicator } from '../components/ProgressIndicator';
+import { TaskContextEditor } from '../components/TaskContextEditor';
 import { UiActionResult, UiVerificationObservation, normalizeObservationResult, isVerificationObservation, uiActionFailure, uiActionFailureKey } from '../actionState';
 import {
   ArrowLeft,
@@ -167,6 +168,8 @@ export const TaskDetailView: React.FC = () => {
                 )}
               </div>
             </div>
+
+            {isElectron && validTask && <TaskContextEditor projectId={task.project_id} taskId={task.id} />}
           </div>
 
           {/* Right: Git State & Verification Runner */}

@@ -191,6 +191,25 @@ export interface TranslationDictionary {
     noDesc: string;
     criteriaTitle: string;
     noCriteria: string;
+    contextTitle: string;
+    contextHelp: string;
+    contextPlaceholder: string;
+    contextDefault: string;
+    contextCount: string;
+    contextSave: string;
+    contextSaving: string;
+    contextSaved: string;
+    contextError: {
+      CONTEXT_PATH_INVALID: string;
+      CONTEXT_PATH_MISSING: string;
+      CONTEXT_PATH_DENIED: string;
+      CONTEXT_PATH_LINK: string;
+      CONTEXT_LIMIT_EXCEEDED: string;
+      TASK_NOT_FOUND: string;
+      ENTITY_IN_TRASH: string;
+      LOAD_FAILED: string;
+      SAVE_FAILED: string;
+    };
     gitTruthTitle: string;
     baseShaLabel: string;
     currentShaLabel: string;
