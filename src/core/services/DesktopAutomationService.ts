@@ -19,6 +19,7 @@ import { AutomatedVerificationService, VERIFICATION_FAILED_EVENT, VERIFICATION_P
 import { ProductReviewService, type ReviewerCandidate } from './ProductReviewService';
 import { ProductManagerService, managerAuthorizesRevision, type PendingManagerDecision } from './ProductManagerService';
 import { WorktreeIntegrationService } from './WorktreeIntegrationService';
+import { validateContextPaths } from '../protocol/planProtocol';
 import type { Project, Task } from '../types/domain';
 import type { ManagedAgent } from '../types/workspace';
 import type { AutomationPhase, DesktopAutomationStatus, ProjectAutomationStatus } from '../types/desktopAutomation';
@@ -499,7 +500,16 @@ export class DesktopAutomationService {
       assignmentId = routing.selectedAssignmentId;
 
       // 3. Durable, assignment-bound context manifest of the repository's top-level entries.
-      const contextFiles = this.contextEntries(project.repository_path);
+      // Task-scoped context when the plan named it (#254), re-checked now; otherwise the top-level entries.
+      const scoped = this.repo.getTaskContextPaths(project.id, task.id);
+      let contextFiles: string[];
+      if (scoped.length > 0) {
+        const check = validateContextPaths(project.repository_path, scoped);
+        if (!check.ok) { releaseUnclaimed(); fail('TASK_CONTEXT_INVALID', `${check.reasonCode}: ${check.path}`); return; }
+        contextFiles = check.paths;
+      } else {
+        contextFiles = this.contextEntries(project.repository_path);
+      }
       if (contextFiles.length === 0) { releaseUnclaimed(); fail('NO_CONTEXT_FILES'); return; }
       const context = new ContextBuilderService(this.repo).buildContextSnapshot({
         projectId: project.id,

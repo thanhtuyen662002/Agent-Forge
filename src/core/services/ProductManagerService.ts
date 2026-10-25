@@ -11,7 +11,7 @@ import { createProductLeaseRecoveryMarkerEvent, createProductLeaseRecoveryResolv
 import type { AgentExecutionResult, RuntimeExecutionBinding } from '../adapters/ProviderAdapter';
 import type { AccountLease, Project, Task } from '../types/domain';
 import type { ManagerProtocol, PlanProtocol } from '../types/protocols';
-import { contractSha256, parsePlanProtocol } from '../protocol/planProtocol';
+import { contractSha256, parsePlanProtocol, validateContextPaths } from '../protocol/planProtocol';
 
 /** Marks Manager attempts so restart recovery only touches automated Manager calls. */
 export const MANAGER_ATTEMPT_MARKER = 'desktop-manager';
@@ -240,7 +240,7 @@ export class ProductManagerService {
 
   /** Open (undecided) proposals of a project, newest first, for the owner. */
   public listProposals(projectId: string): Array<{ eventId: string; taskId: string; taskTitle: string; taskRevision: number; decision: string; instructions: string[];
-    plannedTasks: Array<{ title: string; description: string; acceptanceCriteria: string[]; priority: string; risk: string }>; createdAt: string }> {
+    plannedTasks: Array<{ title: string; description: string; acceptanceCriteria: string[]; priority: string; risk: string; contextPaths: string[] }>; createdAt: string }> {
     const result = [];
     for (const task of this.repo.getTasksByProject(projectId)) {
       const proposal = this.openProposal(task);
@@ -251,7 +251,7 @@ export class ProductManagerService {
         instructions: payload.plan ? payload.plan.tasks.map((planned) => planned.title) : payload.decision?.instructions ?? [],
         // The owner sees exactly what would be created, not only titles.
         plannedTasks: payload.plan?.tasks.map((planned) => ({ title: planned.title, description: planned.description ?? '',
-          acceptanceCriteria: planned.acceptance_criteria, priority: planned.priority, risk: planned.risk })) ?? [],
+          acceptanceCriteria: planned.acceptance_criteria, priority: planned.priority, risk: planned.risk, contextPaths: planned.context_paths ?? [] })) ?? [],
         createdAt: proposal.timestamp });
     }
     return result.sort((a, b) => b.createdAt.localeCompare(a.createdAt));
@@ -482,6 +482,11 @@ export class ProductManagerService {
         // The contract is unchanged but the answer names another hash: a malformed answer, retried.
         if (parsed.data.contract_sha256.toLowerCase() !== contractHash) { finish('FAILED'); return failed('PLAN_HASH_MISMATCH', true, { attemptId }); }
         const plan = parsed.data;
+        // Task context paths are checked against the repository before anything is proposed (#254).
+        for (const planned of plan.tasks) {
+          const check = validateContextPaths(project!.repository_path, planned.context_paths);
+          if (!check.ok) { finish('FAILED'); return failed('PLAN_CONTEXT_PATH_INVALID', true, { attemptId, contextReason: check.reasonCode, path: check.path }); }
+        }
         proposalPayload = { plan, contractSha256: contractHash };
         apply = () => this.applyPlan(task.id, plan, contractHash!, snapshot);
         label = `a plan of ${plan.tasks.length} task(s)`;
@@ -574,10 +579,14 @@ export class ProductManagerService {
     }
     this.repo.runInImmediateTransaction(() => {
       for (const planned of plan.tasks) {
-        this.tasks.createTask({
+        // Re-checked at apply time: the repository may have changed since the proposal.
+        const context = validateContextPaths(project.repository_path, planned.context_paths ?? []);
+        if (!context.ok) throw new ManagerApplyError('PLAN_CONTEXT_PATH_INVALID', false);
+        const created = this.tasks.createTask({
           projectId: project.id, title: planned.title, description: planned.description || null, priority: planned.priority, risk: planned.risk,
           acceptanceCriteria: planned.acceptance_criteria, constraints: planned.constraints,
         });
+        if (context.paths.length > 0) this.repo.setTaskContextPaths(project.id, created.id, context.paths);
       }
       if (!this.transition(anchorId, 'APPROVE')) throw new ManagerApplyError('TASK_TRANSITION_REJECTED', false);
       // The planning record leaves the active task list; its plan stays in the events.
@@ -608,6 +617,7 @@ export class ProductManagerService {
       ...list('Non-goal', contract.non_goals),
       ...list('Owner policy', contract.owner_policies),
       'Each task needs a short title, a description and at least one acceptance criterion. Use at most 20 tasks.',
+      'For each task, list in "context_paths" the repository files or directories the coder needs (at most 32, relative paths); prefer directories for new files.',
       `Use exactly: project_id "${project.id}", contract_sha256 "${contractHash}".`,
     ];
   }

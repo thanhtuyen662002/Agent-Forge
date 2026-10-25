@@ -1175,7 +1175,7 @@ describe('desktop automation runtime', () => {
       expect(realTasks()).toEqual([]);
       const [proposal] = service.getManager()!.listProposals(projectId);
       expect(proposal).toMatchObject({ decision: 'PLAN', instructions: ['Add the greeting', 'Test the greeting'] });
-      expect(proposal.plannedTasks[0]).toEqual({ title: 'Add the greeting', description: 'Show a greeting', acceptanceCriteria: ['Greeting shown'], priority: 'HIGH', risk: 'LOW' });
+      expect(proposal.plannedTasks[0]).toEqual({ title: 'Add the greeting', description: 'Show a greeting', acceptanceCriteria: ['Greeting shown'], priority: 'HIGH', risk: 'LOW', contextPaths: [] });
       expect(statusOf()).toMatchObject({ phase: 'WAITING_FOR_MANAGER', reasonCode: 'MANAGER_PROPOSAL_PENDING' });
       expect(await service.getManager()!.decideProposal(projectId, proposal.eventId, true)).toEqual({ success: true });
       expect(realTasks()).toHaveLength(2);
@@ -1264,6 +1264,19 @@ describe('desktop automation runtime', () => {
       expect(repo.getTask(anchorId)!.state).toBe('PLANNED');
     });
 
+    it('stores validated context paths per planned task, and retries a plan naming a bad path (#254)', async () => {
+      addManager();
+      repo.setProjectManagerMode(projectId, 'AUTO');
+      let calls = 0;
+      managerReply = (request) => planReply({ tasks: [{ title: 'Edit the readme', acceptance_criteria: ['done'],
+        context_paths: [calls++ === 0 ? 'missing/dir' : 'README.md'] }] })(request);
+      service = planningService();
+      await pass();
+      expect(repo.getEventsByProject(projectId).find((e) => e.type === 'AUTOMATION_MANAGER_FAILED')!.structured_payload)
+        .toMatchObject({ reasonCode: 'PLAN_CONTEXT_PATH_INVALID', retryable: true, path: 'missing/dir' });
+      expect(realTasks()).toEqual([]);
+    });
+
     it('does not plan a project that already has tasks', async () => {
       addManager();
       tasks.createTask({ projectId, title: 'Owner task', description: null, priority: 'LOW', risk: 'LOW', acceptanceCriteria: ['x'], constraints: [] });
@@ -1273,5 +1286,34 @@ describe('desktop automation runtime', () => {
       expect(repo.getProjectPlanningTaskId(projectId)).toBeNull();
       expect(managerRequests.every((request) => request.expectedProtocol !== 'plan.v1')).toBe(true);
     });
+  });
+  describe.runIf(process.platform === 'win32')('task-scoped coder context (#254)', () => {
+    it('authorizes exactly the task context paths instead of the top-level entries', async () => {
+      verify(addCodexCoder());
+      fs.mkdirSync(path.join(repoDir, 'src'));
+      fs.writeFileSync(path.join(repoDir, 'src', 'app.ts'), 'export {};\n', 'utf8');
+      git('add', '.');
+      git('commit', '-m', 'add src');
+      const task = await approvedTask();
+      repo.setTaskContextPaths(projectId, task.id, ['src']);
+      await service.tick();
+      await service.drain();
+
+      const auth = repo.getExecutionAuthorizationsByTask(task.id)[0];
+      expect(JSON.parse(auth.canonical_payload_json!).contextFiles).toEqual(['src']);
+      expect(adapterCalls).toBe(1);
+    }, 90_000);
+
+    it('stops safely when a stored context path no longer exists', async () => {
+      verify(addCodexCoder());
+      const task = await approvedTask();
+      repo.setTaskContextPaths(projectId, task.id, ['gone']);
+      await service.tick();
+      await service.drain();
+
+      expect(adapterCalls).toBe(0);
+      expect(repo.getEventsByProject(projectId).find((e) => e.type === 'AUTOMATION_EXECUTION_FAILED')!.structured_payload)
+        .toMatchObject({ reasonCode: 'TASK_CONTEXT_INVALID' });
+    }, 90_000);
   });
 });
