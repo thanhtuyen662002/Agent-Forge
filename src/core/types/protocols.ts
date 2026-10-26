@@ -163,14 +163,15 @@ export const ReviewProtocolSchema = z.object({
   message_id: requiredProtocolString(),
   project_id: requiredProtocolString(),
   task_id: requiredProtocolString(),
-  task_revision: z.number().int().nonnegative(),
+  task_revision: z.preprocess((value) => (typeof value === 'string' && /^\d+$/.test(value.trim()) ? Number(value) : value), z.number().int().nonnegative()),
   verdict: upperCaseEnum(ReviewVerdictEnum),
   summary: requiredProtocolString(),
   issues: boundedArray(z.array(ReviewIssueSchema), MAX_PROTOCOL_ARRAY_ITEMS).optional().default([]),
   reviewed_head_sha: sha40(),
   reviewed_snapshot_sha: sha256Hex(),
   created_at: protocolString().optional(),
-}).strict().superRefine((review, ctx) => {
+  // Unknown fields are ignored, never read (models add notes such as "verification"; found in the real trials).
+}).superRefine((review, ctx) => {
   // A verdict must agree with its own issues.
   if (review.verdict === 'PASS' && review.issues.some((issue) => issue.severity === 'BLOCKER' || issue.severity === 'REQUIRED')) {
     ctx.addIssue({ code: 'custom', path: ['verdict'], message: 'PASS cannot carry BLOCKER or REQUIRED issues.' });
@@ -194,7 +195,7 @@ export const PlanTaskSchema = z.object({
   risk: upperCaseEnum(RiskLevelEnum).optional().default('MEDIUM'),
   /** Repository paths the coder needs for this task (#254); validated before use. */
   context_paths: boundedArray(z.array(requiredProtocolString()), 32).optional().default([]),
-}).strict();
+});
 export type PlanTask = z.infer<typeof PlanTaskSchema>;
 
 /**
@@ -209,7 +210,7 @@ export const PlanProtocolSchema = z.object({
   contract_sha256: z.string().regex(/^[0-9a-f]{64}$/i),
   tasks: boundedArray(z.array(PlanTaskSchema).min(1), 20),
   created_at: protocolString().optional(),
-}).strict();
+});
 export type PlanProtocol = z.infer<typeof PlanProtocolSchema>;
 
 // ==========================================

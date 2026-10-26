@@ -617,6 +617,9 @@ export class ProductManagerService {
       ...list('Non-goal', contract.non_goals),
       ...list('Owner policy', contract.owner_policies),
       'Each task needs a short title, a description and at least one acceptance criterion. Use at most 20 tasks.',
+      // Found in the fourth real trial: a tests-only task could not see the code task's changes.
+      'Tasks run in parallel from the same base commit and cannot see the changes of other tasks. Make every task self-contained: put a change and its tests in the same task, and prefer fewer, larger tasks over a chain of dependent ones.',
+      'Agent Forge runs the project test command itself after each coder run; do not create a task that only runs tests.',
       'For each task, list in "context_paths" the repository files or directories the coder needs (at most 32, relative paths); prefer directories for new files.',
       `Use exactly: project_id "${project.id}", contract_sha256 "${contractHash}".`,
     ];
