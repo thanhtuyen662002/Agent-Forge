@@ -150,6 +150,24 @@ describe('owner trash for projects and tasks', () => {
     expect(repo.isProjectTrashed('P1')).toBe(false);
   });
 
+  it('does not count an approved planning record already in the trash as active work (found in the trial)', () => {
+    project('P1', 'PAUSED');
+    task('PLAN', 'P1', 'APPROVED');
+    repo.insertTrashEntry('TASK', 'PLAN', 'P1', NOW); // The #245 planning record leaves the active list this way.
+    task('T1', 'P1', 'PLANNED');
+    expect(service.trashProject({ projectId: 'P1' })).toMatchObject({ success: true });
+    expect(repo.isProjectTrashed('P1')).toBe(true);
+  });
+
+  it('still blocks on live work of a task that is already in the trash', () => {
+    project('P1', 'PAUSED');
+    task('PLAN', 'P1', 'APPROVED');
+    repo.insertTrashEntry('TASK', 'PLAN', 'P1', NOW);
+    db.prepare("INSERT INTO task_leases (task_id, agent_id, lease_token, acquired_at, expires_at, heartbeat_at, released_at) VALUES ('PLAN', 'agent-w', 'token-w', ?, ?, ?, NULL)").run(NOW, NOW, NOW);
+    const result = service.trashProject({ projectId: 'P1' });
+    expect(result).toMatchObject({ success: false, errorCode: 'HAS_ACTIVE_WORK', blockers: [{ code: 'ACTIVE_TASK_LEASE', taskId: 'PLAN' }] });
+  });
+
   it('keeps trash across a database reopen', () => {
     project('P1');
     expect(service.trashProject({ projectId: 'P1' }).success).toBe(true);
