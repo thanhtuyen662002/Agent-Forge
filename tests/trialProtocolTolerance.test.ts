@@ -82,3 +82,30 @@ describe('coder.v1 and review.v1 tolerate the same slips (#271)', () => {
     expect(ReviewProtocolSchema.safeParse({ ...review, verdict: 'maybe' }).success).toBe(false);
   });
 });
+
+/** The fourth trial run: Codex wrote the code but reported coder.v1 without message_id and project_id. */
+describe('coder.v1 identifiers completed for the request\'s own task (#277)', () => {
+  const recorded = fs.readFileSync(path.join(__dirname, 'fixtures', 'trialCodexCoderResult.txt'), 'utf8');
+  const request = { taskId: 'TSK-1738B35F', projectId: 'PROJ-61404592' };
+
+  it('accepts the recorded Codex report once the missing identifiers are filled in', async () => {
+    const { completeCoderIdentifiers } = await import('../src/core/adapters/LocalCliAdapterBase');
+    const { ProtocolParser } = await import('../src/core/protocol/parser');
+    expect(ProtocolParser.parse(recorded).success).toBe(false); // As the trial saw it.
+    const parsed = ProtocolParser.parse(completeCoderIdentifiers(recorded, request, 'exec-1'));
+    expect(parsed.success).toBe(true);
+    if (parsed.data?.type !== 'coder.v1') throw new Error('not coder.v1');
+    expect(parsed.data.data).toMatchObject({ project_id: 'PROJ-61404592', task_id: 'TSK-1738B35F', message_id: 'coder-exec-1', status: 'COMPLETED' });
+  });
+
+  it('never rewrites a report for another task or project, and keeps a given message id', async () => {
+    const { completeCoderIdentifiers } = await import('../src/core/adapters/LocalCliAdapterBase');
+    const report = (extra: Record<string, unknown>) => JSON.stringify({ protocol: 'coder.v1', status: 'COMPLETED', ...extra });
+    const otherTask = report({ task_id: 'TSK-OTHER' });
+    expect(completeCoderIdentifiers(otherTask, request, 'e')).toBe(otherTask);
+    const otherProject = report({ task_id: 'TSK-1738B35F', project_id: 'PROJ-OTHER' });
+    expect(completeCoderIdentifiers(otherProject, request, 'e')).toBe(otherProject);
+    expect(JSON.parse(completeCoderIdentifiers(report({ task_id: 'TSK-1738B35F', message_id: 'm-7' }), request, 'e')).message_id).toBe('m-7');
+    expect(completeCoderIdentifiers('not json', request, 'e')).toBe('not json');
+  });
+});

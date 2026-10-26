@@ -1,0 +1,15 @@
+{
+  "protocol": "coder.v1",
+  "task_id": "TSK-1738B35F",
+  "status": "completed",
+  "summary": "Đã thêm slugify(str) vào src/text.js và export qua module.exports, giữ nguyên normalizeSpaces. Không sửa package.json hay thêm dependency.",
+  "verification": {
+    "examples": [
+      { "input": "Xin Chào Việt Nam", "output": "xin-chao-viet-nam", "passed": true },
+      { "input": "  Đường   số 1!! ", "output": "duong-so-1", "passed": true }
+    ],
+    "normalizeSpaces": "Kiểm tra thủ công đạt.",
+    "tests": "npm test thành công; không tìm thấy test nào (0 tests).",
+    "run-tests.js": "Không tồn tại."
+  }
+}
