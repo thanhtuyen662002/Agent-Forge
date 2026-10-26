@@ -409,7 +409,13 @@ export class WorkspaceManagementService {
       if (PROJECT_ACTIVE_STATUSES.has(project.status)) blockers.push({ code: 'PROJECT_RUNNING', reference: project.status });
       const tasks = this.repo.getTasksByProject(project.id);
       for (const task of tasks) {
-        for (const blocker of this.repo.getTaskTrashBlockers(task.id) as TrashBlocker[]) blockers.push({ ...blocker, taskId: task.id });
+        // A task already in the trash (such as the APPROVED planning record, #245)
+        // is not active work by its state; live leases or executions still block.
+        const trashed = this.repo.isTaskTrashed(task.id);
+        for (const blocker of this.repo.getTaskTrashBlockers(task.id) as TrashBlocker[]) {
+          if (trashed && blocker.code === 'TASK_ACTIVE_STATE') continue;
+          blockers.push({ ...blocker, taskId: task.id });
+        }
       }
       if (blockers.length > 0) throw new TrashError('HAS_ACTIVE_WORK', 'The project still has active work.', blockers);
 
