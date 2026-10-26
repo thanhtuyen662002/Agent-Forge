@@ -1100,7 +1100,7 @@ export abstract class LocalCliAdapterBase implements ProviderAdapter {
         ? 'Do not modify any file. Emit one valid JSON plan.v1 object (protocol, message_id, project_id, contract_sha256, tasks: [{title, description, acceptance_criteria, constraints, priority, risk, context_paths}]) using the exact identifiers given above. priority and risk are one of LOW, MEDIUM, HIGH, CRITICAL.'
       : request.expectedProtocol === 'manager.v1'
         ? 'Do not modify any file. Emit one valid JSON manager.v1 object (protocol, message_id, project_id, task_id, decision EXECUTE|BLOCK, instructions as an array of strings, expected_task_state, expected_revision) using the exact identifiers given above.'
-        : 'Emit a valid JSON coder.v1 protocol object conforming to the CoderProtocol schema upon task completion.');
+        : 'Agent Forge runs the project tests itself after you finish; if you cannot run them in your sandbox, that is not a blocker. When the work is done, end with one valid JSON coder.v1 object as your final message: protocol "coder.v1", message_id (any unique string), project_id and task_id using the exact identifiers given above, status COMPLETED|IN_PROGRESS|BLOCKED|FAILED, and the string arrays completed, remaining, files_claimed_changed, tests_claimed and blockers.');
 
     return lines.join('\n');
   }
@@ -1516,7 +1516,7 @@ export abstract class LocalCliAdapterBase implements ProviderAdapter {
           stdoutEvidenceId: processResult.stdoutEvidenceId, stderrEvidenceId: processResult.stderrEvidenceId };
       }
 
-      const parseResult = ProtocolParser.parse(protocolText);
+      const parseResult = ProtocolParser.parse(request.expectedProtocol === 'manager.v1' ? protocolText : completeCoderIdentifiers(protocolText, request, processResult.executionId));
 
       if (request.expectedProtocol === 'manager.v1') {
         // A Manager decision is advice for TaskService to validate; it never publishes the workspace.
@@ -1618,4 +1618,27 @@ export abstract class LocalCliAdapterBase implements ProviderAdapter {
     }
     ProcessRunner.cancel(executionId);
   }
+}
+
+/**
+ * Found in the fourth real trial: Codex wrote the code and reported coder.v1
+ * for the right task, but without message_id and project_id. Only those two
+ * are filled in, and only for this request's own task; a report that names
+ * another task or project is left unchanged so validation still rejects it.
+ */
+export function completeCoderIdentifiers(protocolText: string, request: Pick<AgentExecutionRequest, 'taskId' | 'projectId'>, executionId: string): string {
+  const json = ProtocolParser.extractJsonString(protocolText);
+  if (!json) return protocolText;
+  let value: unknown;
+  try { value = JSON.parse(json); } catch { return protocolText; }
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return protocolText;
+  const report = value as Record<string, unknown>;
+  if (report.protocol !== 'coder.v1' || report.task_id !== request.taskId) return protocolText;
+  if (report.project_id !== undefined && report.project_id !== request.projectId) return protocolText;
+  const completed = {
+    ...report,
+    project_id: request.projectId,
+    message_id: typeof report.message_id === 'string' && report.message_id.trim() ? report.message_id : `coder-${executionId}`,
+  };
+  return JSON.stringify(completed);
 }
