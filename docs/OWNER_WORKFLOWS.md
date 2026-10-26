@@ -450,6 +450,23 @@ Task progress is also refreshed on every automated transition. A task that
 passed tests and review now shows 100%; before, it kept the value from the
 Manager decision (24% in the real trial).
 
+### Project completion
+
+A finished project used to stay *running* forever, because nothing fired the
+final project transitions (found in trial 6). The automation pass now
+completes a RUNNING project on its own (`ALL_TASKS_DONE`, then `FINAL_PASS`,
+recorded as `AUTOMATION_PROJECT_COMPLETED`) when all of these hold:
+
+- every task is `DONE` or `CANCELLED`, and at least one is `DONE`;
+- no reviewed work is still waiting for the owner's branch or discard choice;
+- with automatic integration on, every reviewed branch has landed on the
+  default branch.
+
+A skipped merge keeps the project running, so its reason stays visible. Each
+task has already passed review of its verified, exact snapshot, so there is no
+separate project-level reviewer pass. The header then shows *project
+completed* (`PROJECT_COMPLETED`).
+
 ## Taking reviewed work: create a branch or discard
 
 When a task passes automated review it is `DONE`, and its changes are still

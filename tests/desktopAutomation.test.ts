@@ -1101,6 +1101,37 @@ describe('desktop automation runtime', () => {
       for (let i = 0; i < 3 && !service.getIntegration().list(projectId)[0]?.mergedInto; i += 1) { await service.tick(); await service.drain(); }
       expect(service.getIntegration().list(projectId)[0]).toMatchObject({ taskId: task.id, mergedInto: 'main' });
       expect(fs.readFileSync(path.join(repoDir, 'README.md'), 'utf8')).toContain('Hello from the coder');
+      // Everything is done, reviewed and integrated: the next pass completes the project (#283).
+      await service.tick(); await service.drain();
+      const project = repo.getProjectMetadata(projectId)!;
+      expect(project.status).toBe('COMPLETED');
+      expect(project.completed_at).toBeTruthy();
+      expect(repo.getEventsByProject(projectId).filter((e) => e.type === 'AUTOMATION_PROJECT_COMPLETED')).toHaveLength(1);
+      expect(statusOf()).toMatchObject({ phase: 'PROJECT_COMPLETED' });
+    }, 180_000);
+
+    it('keeps the project running while a skipped merge waits for the owner', async () => {
+      repo.setProjectAutoIntegrate(projectId, true);
+      const { task } = await runToDone();
+      fs.appendFileSync(path.join(repoDir, 'verify.js'), '// owner edit\n', 'utf8');
+      for (let i = 0; i < 3 && !service.getIntegration().list(projectId)[0]?.mergeSkipped; i += 1) { await service.tick(); await service.drain(); }
+      expect(service.getIntegration().list(projectId)[0]).toMatchObject({ taskId: task.id, mergeSkipped: 'OWNER_CHECKOUT_HAS_CHANGES' });
+      await service.tick(); await service.drain();
+      expect(repo.getProjectMetadata(projectId)!.status).toBe('RUNNING');
+      git('checkout', '--', 'verify.js');
+      expect(await service.getIntegration().mergeIntoDefault(projectId, task.id)).toMatchObject({ success: true });
+      await service.tick(); await service.drain();
+      expect(repo.getProjectMetadata(projectId)!.status).toBe('COMPLETED');
+    }, 180_000);
+
+    it('without automatic integration, completes only after the owner took the reviewed work', async () => {
+      const { task } = await runToDone();
+      await service.tick(); await service.drain();
+      expect(repo.getProjectMetadata(projectId)!.status).toBe('RUNNING'); // The work waits for the owner.
+      expect(await service.getIntegration().createBranch(projectId, task.id)).toMatchObject({ success: true });
+      await service.tick(); await service.drain();
+      expect(repo.getProjectMetadata(projectId)!.status).toBe('COMPLETED');
+      expect(git('branch', '--list', 'agent/*')).not.toBe(''); // The branch stays for the owner; nothing is merged.
     }, 180_000);
 
     it('refuses work that changed after it was reviewed', async () => {

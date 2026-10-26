@@ -29,7 +29,7 @@ export const AutomationStatusBadge: React.FC<{ projectId: string }> = ({ project
     ? 'text-emerald-300 border-emerald-700/50'
     : project?.phase === 'FAILED' ? 'text-rose-300 border-rose-700/50'
     : project?.phase === 'AWAITING_REVIEW' || project?.phase === 'VERIFYING' || project?.phase === 'REVIEWING' || project?.phase === 'DECIDING' ? 'text-forge-cyan border-forge-cyan/40'
-    : project?.phase === 'READY_FOR_INTEGRATION' ? 'text-emerald-300 border-emerald-700/50'
+    : project?.phase === 'READY_FOR_INTEGRATION' || project?.phase === 'PROJECT_COMPLETED' ? 'text-emerald-300 border-emerald-700/50'
     : 'text-amber-300 border-amber-700/40';
 
   return (

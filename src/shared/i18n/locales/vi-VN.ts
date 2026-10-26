@@ -486,6 +486,7 @@ export const viVN: TranslationDictionary = {
     statusUnavailable: 'không đọc được trạng thái',
     phases: {
       PROJECT_NOT_RUNNING: 'chưa chạy (bấm Start)',
+      PROJECT_COMPLETED: 'dự án đã hoàn thành: mọi nhiệm vụ đã xong và được duyệt',
       WAITING_FOR_MANAGER: 'đang chờ nhiệm vụ được duyệt',
       MANUAL_RELAY_REQUIRED: 'chỉ có lập trình viên Cầu nối Thủ công; bạn cần tự chuyển việc',
       WAITING_FOR_CAPACITY: 'đang chờ lập trình viên dùng được',
