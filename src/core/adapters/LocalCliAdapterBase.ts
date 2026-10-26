@@ -1095,7 +1095,7 @@ export abstract class LocalCliAdapterBase implements ProviderAdapter {
     lines.push('');
     lines.push('OUTPUT REQUIREMENT:');
     lines.push(request.expectedProtocol === 'review.v1'
-      ? 'Do not modify any file. Emit one valid JSON review.v1 object (protocol, message_id, project_id, task_id, task_revision, verdict PASS|FIX_REQUIRED|BLOCKED, summary, issues, reviewed_head_sha, reviewed_snapshot_sha) using the exact identifiers given above.'
+      ? 'Do not modify any file. Emit one valid JSON review.v1 object (protocol, message_id, project_id, task_id, task_revision, verdict PASS|FIX_REQUIRED|BLOCKED, summary, issues: [{severity BLOCKER|REQUIRED|OPTIONAL|NIT, title, description, file_path, line_number}], reviewed_head_sha, reviewed_snapshot_sha) using the exact identifiers given above. FIX_REQUIRED needs at least one issue; PASS allows only OPTIONAL or NIT issues.'
       : request.expectedProtocol === 'plan.v1'
         ? 'Do not modify any file. Emit one valid JSON plan.v1 object (protocol, message_id, project_id, contract_sha256, tasks: [{title, description, acceptance_criteria, constraints, priority, risk, context_paths}]) using the exact identifiers given above. priority and risk are one of LOW, MEDIUM, HIGH, CRITICAL.'
       : request.expectedProtocol === 'manager.v1'
