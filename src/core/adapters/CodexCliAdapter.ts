@@ -16,6 +16,24 @@ export interface CodexCliAdapterOptions extends LocalCliAdapterOptions {
   profileResolver?: NativeProfileResolver;
 }
 
+/**
+ * Found in the first real trial (2026-10-26, Codex 0.160 on Windows):
+ * - the isolated workspace is not a Git repository, so Codex refused to run
+ *   without `--skip-git-repo-check` ("Not inside a trusted directory");
+ * - an account profile has no `[windows] sandbox` setting, so Codex rejected
+ *   every command as "blocked by policy" and treated the workspace as
+ *   read-only. The unelevated restricted-token sandbox needs no admin setup;
+ * - workspace-write also allows TEMP by default, and the workspace itself
+ *   lives there, so other TEMP folders are excluded. Verified live: writes in
+ *   the workspace succeed; writes to D:\Projects or another TEMP folder are denied.
+ */
+export const CODEX_ISOLATION_ARGS = [
+  '--skip-git-repo-check',
+  '-c', 'windows.sandbox=unelevated', // Unquoted: Codex reads a non-TOML value as a literal string.
+  '-c', 'sandbox_workspace_write.exclude_tmpdir_env_var=true',
+  '-c', 'sandbox_workspace_write.exclude_slash_tmp=true',
+];
+
 export class CodexCliAdapter extends LocalCliAdapterBase {
   public readonly id: string = 'prov-codex-cli';
   public readonly name: string = 'Codex CLI';
@@ -89,7 +107,7 @@ export class CodexCliAdapter extends LocalCliAdapterBase {
     // A reviewer or Manager may read the isolated copy but never write to it.
     const sandbox = request.expectedProtocol === 'review.v1' || request.expectedProtocol === 'manager.v1' || request.expectedProtocol === 'plan.v1'
       ? 'read-only' : 'workspace-write';
-    return ['exec', '--json', '--model', modelName ?? '', '--sandbox', sandbox];
+    return ['exec', '--json', '--model', modelName ?? '', '--sandbox', sandbox, ...CODEX_ISOLATION_ARGS];
   }
 
   protected override classifyProviderProcessFailure(
