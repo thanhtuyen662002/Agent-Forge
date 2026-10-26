@@ -51,8 +51,11 @@ export type ContextPathCheck =
  * portable relative path inside the repository, exists, is not a link, and is
  * allowed by policy (sensitive names, .git and agent configuration are
  * denied). Duplicates are folded; at most 32 paths.
+ * With `skipMissing`, a path that does not exist yet (a file or directory the
+ * coder will create, found in trial 7) is dropped instead of failing the check;
+ * every containment, link and policy rejection stays.
  */
-export function validateContextPaths(repositoryRoot: string, paths: readonly string[]): ContextPathCheck {
+export function validateContextPaths(repositoryRoot: string, paths: readonly string[], options: { skipMissing?: boolean } = {}): ContextPathCheck {
   const result: string[] = [];
   const seen = new Set<string>();
   for (const raw of paths) {
@@ -67,11 +70,21 @@ export function validateContextPaths(repositoryRoot: string, paths: readonly str
     if (!inside || inside.startsWith('..') || path.isAbsolute(inside)) return { ok: false, reasonCode: 'CONTEXT_PATH_INVALID', path: relative };
     // Every component must be a real file or directory; a link could leave the repository.
     let current = repositoryRoot;
+    let missing = false;
     for (const part of inside.split(/[\\/]/)) {
       current = path.join(current, part);
       const stat = fs.lstatSync(current, { throwIfNoEntry: false });
-      if (!stat) return { ok: false, reasonCode: 'CONTEXT_PATH_MISSING', path: relative };
+      if (!stat) {
+        if (!options.skipMissing) return { ok: false, reasonCode: 'CONTEXT_PATH_MISSING', path: relative };
+        missing = true;
+        break;
+      }
       if (stat.isSymbolicLink()) return { ok: false, reasonCode: 'CONTEXT_PATH_LINK', path: relative };
+    }
+    if (missing) {
+      // Not created yet: only the name can be judged, and a sensitive one is still refused.
+      if (!PolicyService.evaluatePathAccess(absolute, repositoryRoot, false).allowed) return { ok: false, reasonCode: 'CONTEXT_PATH_DENIED', path: relative };
+      continue;
     }
     if (!PolicyService.evaluateRealPathAccess(absolute, repositoryRoot, false).allowed) return { ok: false, reasonCode: 'CONTEXT_PATH_DENIED', path: relative };
     result.push(relative);
