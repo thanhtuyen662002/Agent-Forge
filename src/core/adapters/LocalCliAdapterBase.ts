@@ -1099,7 +1099,7 @@ export abstract class LocalCliAdapterBase implements ProviderAdapter {
       : request.expectedProtocol === 'plan.v1'
         ? 'Do not modify any file. Emit one valid JSON plan.v1 object (protocol, message_id, project_id, contract_sha256, tasks: [{title, description, acceptance_criteria, constraints, priority, risk, context_paths}]) using the exact identifiers given above. priority and risk are one of LOW, MEDIUM, HIGH, CRITICAL.'
       : request.expectedProtocol === 'manager.v1'
-        ? 'Do not modify any file. Emit one valid JSON manager.v1 object (protocol, message_id, project_id, task_id, decision EXECUTE|BLOCK, instructions, expected_task_state, expected_revision) using the exact identifiers given above.'
+        ? 'Do not modify any file. Emit one valid JSON manager.v1 object (protocol, message_id, project_id, task_id, decision EXECUTE|BLOCK, instructions as an array of strings, expected_task_state, expected_revision) using the exact identifiers given above.'
         : 'Emit a valid JSON coder.v1 protocol object conforming to the CoderProtocol schema upon task completion.');
 
     return lines.join('\n');

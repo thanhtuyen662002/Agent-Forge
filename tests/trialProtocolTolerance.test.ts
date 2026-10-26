@@ -44,3 +44,41 @@ describe('protocol tolerance found in the first real trial (#268)', () => {
     expect(getLocalCliWorkspaceBase()).toBe(path.join(fs.realpathSync.native(os.tmpdir()), 'agent-forge-local-cli-workspaces'));
   });
 });
+
+/** The second trial run: Claude answered the Manager's START call with instructions as one text block. */
+describe('manager.v1 instructions as one text block (#271)', () => {
+  const recorded = fs.readFileSync(path.join(__dirname, 'fixtures', 'trialClaudeManagerResult.txt'), 'utf8');
+
+  it('accepts the recorded Claude decision and splits its instructions into lines', async () => {
+    const { ProtocolParser } = await import('../src/core/protocol/parser');
+    expect(JSON.parse(recorded).instructions).toEqual(expect.any(String));
+    const parsed = ProtocolParser.parse(recorded);
+    expect(parsed.success).toBe(true);
+    expect(parsed.data?.type).toBe('manager.v1');
+    if (parsed.data?.type !== 'manager.v1') return;
+    const data = parsed.data.data;
+    expect(data.decision).toBe('EXECUTE');
+    expect(data.instructions).toHaveLength(5);
+    expect(data.instructions[2]).toContain('Do not modify run-tests.js');
+  });
+
+  it('still rejects instructions that are neither text nor a list of text', () => {
+    const base = { protocol: 'manager.v1', message_id: 'm', project_id: 'p', task_id: 't', decision: 'EXECUTE' };
+    expect(ManagerProtocolSchema.safeParse({ ...base, instructions: 42 }).success).toBe(false);
+    expect(ManagerProtocolSchema.safeParse({ ...base, instructions: [{ step: 1 }] }).success).toBe(false);
+    expect(ManagerProtocolSchema.safeParse({ ...base, instructions: '  \n ' }).success && ManagerProtocolSchema.parse({ ...base, instructions: '  \n ' }).instructions).toEqual([]);
+  });
+});
+
+describe('coder.v1 and review.v1 tolerate the same slips (#271)', () => {
+  it('upper-cases status, verdict and severity, and splits text lists into lines', async () => {
+    const { CoderProtocolSchema, ReviewProtocolSchema } = await import('../src/core/types/protocols');
+    const coder = CoderProtocolSchema.parse({ protocol: 'coder.v1', message_id: 'm', project_id: 'p', task_id: 't', status: 'completed',
+      completed: 'Added slugify\nAdded tests', files_claimed_changed: ['src/text.js'], expected_task_state: 'coding' });
+    expect([coder.status, coder.completed, coder.expected_task_state]).toEqual(['COMPLETED', ['Added slugify', 'Added tests'], 'CODING']);
+    const review = ReviewProtocolSchema.parse({ protocol: 'review.v1', message_id: 'm', project_id: 'p', task_id: 't', task_revision: 0, verdict: 'fix_required',
+      summary: 's', issues: [{ severity: 'required', title: 'x', description: 'y' }], reviewed_head_sha: 'a'.repeat(40), reviewed_snapshot_sha: 'b'.repeat(64) });
+    expect([review.verdict, review.issues[0].severity]).toEqual(['FIX_REQUIRED', 'REQUIRED']);
+    expect(ReviewProtocolSchema.safeParse({ ...review, verdict: 'maybe' }).success).toBe(false);
+  });
+});
