@@ -46,7 +46,7 @@ describe('protocol tolerance found in the first real trial (#268)', () => {
 });
 
 /** The second trial run: Claude answered the Manager's START call with instructions as one text block. */
-describe('manager.v1 instructions as one text block (#270)', () => {
+describe('manager.v1 instructions as one text block (#271)', () => {
   const recorded = fs.readFileSync(path.join(__dirname, 'fixtures', 'trialClaudeManagerResult.txt'), 'utf8');
 
   it('accepts the recorded Claude decision and splits its instructions into lines', async () => {
@@ -70,7 +70,7 @@ describe('manager.v1 instructions as one text block (#270)', () => {
   });
 });
 
-describe('coder.v1 and review.v1 tolerate the same slips (#270)', () => {
+describe('coder.v1 and review.v1 tolerate the same slips (#271)', () => {
   it('upper-cases status, verdict and severity, and splits text lists into lines', async () => {
     const { CoderProtocolSchema, ReviewProtocolSchema } = await import('../src/core/types/protocols');
     const coder = CoderProtocolSchema.parse({ protocol: 'coder.v1', message_id: 'm', project_id: 'p', task_id: 't', status: 'completed',
