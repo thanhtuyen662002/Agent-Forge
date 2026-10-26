@@ -563,9 +563,10 @@ export class DesktopAutomationService {
       const scoped = this.repo.getTaskContextPaths(project.id, task.id);
       let contextFiles: string[];
       if (scoped.length > 0) {
-        const check = validateContextPaths(project.repository_path, scoped);
+        const check = validateContextPaths(project.repository_path, scoped, { skipMissing: true });
         if (!check.ok) { releaseUnclaimed(); fail('TASK_CONTEXT_INVALID', `${check.reasonCode}: ${check.path}`); return; }
-        contextFiles = check.paths;
+        // A scoped path that vanished since planning is dropped; with none left, the top-level entries.
+        contextFiles = check.paths.length > 0 ? check.paths : this.contextEntries(project.repository_path);
       } else {
         contextFiles = this.contextEntries(project.repository_path);
       }

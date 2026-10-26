@@ -1371,12 +1371,24 @@ describe('desktop automation runtime', () => {
       repo.setProjectManagerMode(projectId, 'AUTO');
       let calls = 0;
       managerReply = (request) => planReply({ tasks: [{ title: 'Edit the readme', acceptance_criteria: ['done'],
-        context_paths: [calls++ === 0 ? 'missing/dir' : 'README.md'] }] })(request);
+        context_paths: [calls++ === 0 ? '../outside' : 'README.md'] }] })(request);
       service = planningService();
       await pass();
       expect(repo.getEventsByProject(projectId).find((e) => e.type === 'AUTOMATION_MANAGER_FAILED')!.structured_payload)
-        .toMatchObject({ reasonCode: 'PLAN_CONTEXT_PATH_INVALID', retryable: true, path: 'missing/dir' });
+        .toMatchObject({ reasonCode: 'PLAN_CONTEXT_PATH_INVALID', retryable: true, path: '../outside' });
       expect(realTasks()).toEqual([]);
+    });
+
+    it('applies a plan that names a directory the coder will create, keeping only existing paths (#285)', async () => {
+      addManager();
+      repo.setProjectManagerMode(projectId, 'AUTO');
+      managerReply = planReply({ tasks: [{ title: 'Add the stats command', acceptance_criteria: ['done'], context_paths: ['bin', 'bin/stats.js', 'README.md'] }] });
+      service = planningService();
+      await pass();
+      expect(repo.getEventsByProject(projectId).some((e) => e.type === 'AUTOMATION_MANAGER_FAILED')).toBe(false);
+      const [task] = realTasks();
+      expect(task).toBeDefined();
+      expect(repo.getTaskContextPaths(projectId, task.id)).toEqual(['README.md']);
     });
 
     it('does not plan a project that already has tasks', async () => {
@@ -1406,10 +1418,23 @@ describe('desktop automation runtime', () => {
       expect(adapterCalls).toBe(1);
     }, 90_000);
 
-    it('stops safely when a stored context path no longer exists', async () => {
+    it('drops a stored context path that no longer exists and falls back to the top-level entries (#285)', async () => {
       verify(addCodexCoder());
       const task = await approvedTask();
       repo.setTaskContextPaths(projectId, task.id, ['gone']);
+      await service.tick();
+      await service.drain();
+
+      expect(adapterCalls).toBe(1);
+      expect(repo.getEventsByProject(projectId).some((e) => e.type === 'AUTOMATION_EXECUTION_FAILED')).toBe(false);
+    }, 90_000);
+
+    it('still stops when a stored context path became a denied one', async () => {
+      verify(addCodexCoder());
+      const task = await approvedTask();
+      fs.writeFileSync(path.join(repoDir, '.env'), 'SECRET=1
+', 'utf8');
+      repo.setTaskContextPaths(projectId, task.id, ['.env']);
       await service.tick();
       await service.drain();
 
