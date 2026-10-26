@@ -19,6 +19,7 @@ import { AutomatedVerificationService, VERIFICATION_FAILED_EVENT, VERIFICATION_P
 import { ProductReviewService, type ReviewerCandidate } from './ProductReviewService';
 import { ProductManagerService, managerAuthorizesRevision, type PendingManagerDecision } from './ProductManagerService';
 import { WorktreeIntegrationService } from './WorktreeIntegrationService';
+import { ProjectService } from './ProjectService';
 import { validateContextPaths } from '../protocol/planProtocol';
 import type { Project, Task } from '../types/domain';
 import type { ManagedAgent } from '../types/workspace';
@@ -50,6 +51,9 @@ export interface DesktopAutomationOptions {
   /** Lease heartbeat for automated reviews (tests shorten it). */
   reviewHeartbeatMs?: number;
 }
+
+/** Recorded when automation completes a project whose work is all done and reviewed (#283). */
+export const PROJECT_COMPLETED_EVENT = 'AUTOMATION_PROJECT_COMPLETED';
 
 type InFlightKind = 'EXECUTION' | 'VERIFICATION' | 'REVIEW' | 'MANAGER' | 'INTEGRATION';
 type AutomationRole = 'CODER' | 'REVIEWER' | 'MANAGER';
@@ -89,6 +93,7 @@ export class DesktopAutomationService {
   private readonly reviewer: ProductReviewService | null;
   private readonly manager: ProductManagerService | null;
   private readonly integration: WorktreeIntegrationService;
+  private readonly projects: ProjectService;
   /** Provider capabilities read on each pass; a reviewer needs an adapter that can REVIEW. */
   private readonly capabilities = new Map<string, readonly string[]>();
 
@@ -124,6 +129,7 @@ export class DesktopAutomationService {
       ? new ProductManagerService(repo, eventService, providerRegistry, options.taskService,
         { now: () => new Date(this.now()), heartbeatMs: options.reviewHeartbeatMs })
       : null;
+    this.projects = new ProjectService(repo, eventService);
   }
 
   /** Owner-controlled integration of reviewed work (#238). */
@@ -228,6 +234,8 @@ export class DesktopAutomationService {
             continue;
           }
         }
+        // Finished work completes the project instead of waiting for an owner action (#283).
+        if (this.completeIfFinished(project)) continue;
         // An approved contract with no tasks yet gets its planning record first (#245).
         if (this.manager) { try { this.manager.ensurePlanningAnchor(project.id); } catch { /* next pass */ } }
         // A task without Manager authority for its revision (or the plan) asks the Manager agent first.
@@ -278,6 +286,7 @@ export class DesktopAutomationService {
       return running.kind === 'VERIFICATION' || this.repo.getTask(running.taskId)?.state === 'VALIDATING'
         ? status('VERIFYING', running.taskId) : status('EXECUTING', running.taskId);
     }
+    if (project.status === 'COMPLETED') return status('PROJECT_COMPLETED');
     if (project.status !== 'RUNNING') return status('PROJECT_NOT_RUNNING');
 
     const tasks = this.repo.getTasksByProject(project.id).filter((task) => !this.repo.isTaskTrashed(task.id));
@@ -345,6 +354,34 @@ export class DesktopAutomationService {
 
   /** The mode (auto or approve) is read by the Manager service when the answer arrives, not at dispatch. */
   /** Branch from the exact reviewed snapshot, then the default branch; a skip leaves the branch for the owner. */
+  /**
+   * Completes a RUNNING project whose tasks are all settled (DONE or CANCELLED,
+   * at least one DONE): each DONE task already passed exact-head review of its
+   * verified work. Reviewed work still waiting for the owner, or, with automatic
+   * integration, work not yet on the default branch (including a skipped merge),
+   * keeps the project RUNNING so the reason stays visible.
+   */
+  private completeIfFinished(project: Project): boolean {
+    const tasks = this.repo.getTasksByProject(project.id).filter((task) => !this.repo.isTaskTrashed(task.id));
+    if (!tasks.some((task) => task.state === 'DONE') || !tasks.every((task) => task.state === 'DONE' || task.state === 'CANCELLED')) return false;
+    const entries = this.integration.list(project.id);
+    if (entries.some((entry) => entry.state === 'READY')) return false;
+    if (this.repo.getProjectAutoIntegrate(project.id) && entries.some((entry) => entry.state === 'BRANCH_CREATED' && !entry.mergedInto)) return false;
+    try {
+      this.repo.runInImmediateTransaction(() => {
+        this.projects.transitionStatus(project.id, 'ALL_TASKS_DONE');
+        this.projects.transitionStatus(project.id, 'FINAL_PASS');
+        this.eventService.record(project.id, PROJECT_COMPLETED_EVENT,
+          `All tasks of project ${project.name} are done and reviewed; automation completed the project.`,
+          { taskIds: tasks.filter((task) => task.state === 'DONE').map((task) => task.id), autoIntegrate: this.repo.getProjectAutoIntegrate(project.id) });
+      });
+      return true;
+    } catch {
+      // The project moved on (paused, stopped) since it was read; the next pass re-checks.
+      return false;
+    }
+  }
+
   private async integrate(projectId: string, taskId: string): Promise<void> {
     const entry = this.integration.list(projectId).find((item) => item.taskId === taskId);
     if (entry?.state === 'READY') {

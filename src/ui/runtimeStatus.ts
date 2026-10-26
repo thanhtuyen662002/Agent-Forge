@@ -3,7 +3,7 @@ import type { AutomationPhase, DesktopAutomationStatus, ProjectAutomationStatus 
 import type { QuotaObservation } from '../core/types/quota';
 
 const PHASES = new Set<AutomationPhase>([
-  'PROJECT_NOT_RUNNING', 'WAITING_FOR_MANAGER', 'MANUAL_RELAY_REQUIRED', 'WAITING_FOR_CAPACITY',
+  'PROJECT_NOT_RUNNING', 'PROJECT_COMPLETED', 'WAITING_FOR_MANAGER', 'MANUAL_RELAY_REQUIRED', 'WAITING_FOR_CAPACITY',
   'QUEUED', 'DECIDING', 'EXECUTING', 'VERIFYING', 'REVIEWING', 'AWAITING_REVIEW', 'READY_FOR_INTEGRATION', 'FAILED',
 ]);
 const isRecord = (value: unknown): value is Record<string, unknown> => !!value && typeof value === 'object' && !Array.isArray(value);

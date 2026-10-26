@@ -486,6 +486,7 @@ export const enUS: TranslationDictionary = {
     statusUnavailable: 'status unavailable',
     phases: {
       PROJECT_NOT_RUNNING: 'not running (press Start)',
+      PROJECT_COMPLETED: 'project completed: every task is done and reviewed',
       WAITING_FOR_MANAGER: 'waiting for an approved task',
       MANUAL_RELAY_REQUIRED: 'only Manual Bridge coders; relay work yourself',
       WAITING_FOR_CAPACITY: 'waiting for a usable coder',

@@ -6,6 +6,8 @@
 export type AutomationPhase =
   /** The project is not RUNNING, so automation does not dispatch. */
   | 'PROJECT_NOT_RUNNING'
+  /** Every task is done and reviewed (and integrated when opted in); automation completed the project (#283). */
+  | 'PROJECT_COMPLETED'
   /** No task is CODING with valid Manager EXECUTE/FIX_REQUIRED authority. */
   | 'WAITING_FOR_MANAGER'
   /** Approved work exists but only Manual Bridge coders are configured. */

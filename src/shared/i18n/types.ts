@@ -489,6 +489,7 @@ export interface TranslationDictionary {
     statusUnavailable: string;
     phases: {
       PROJECT_NOT_RUNNING: string;
+      PROJECT_COMPLETED: string;
       WAITING_FOR_MANAGER: string;
       MANUAL_RELAY_REQUIRED: string;
       WAITING_FOR_CAPACITY: string;
