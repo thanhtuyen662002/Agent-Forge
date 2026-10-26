@@ -26,7 +26,7 @@ describe('I18n Localization Foundation (PR #9)', () => {
     expect(viVN).toBeDefined();
     expect(viVN.app.title).toBe('Agent-Forge');
     expect(viVN.app.subtitle).toBe('Trung tâm Điều khiển Kỹ nghệ AI Cục bộ');
-    expect(viVN.nav.manualBridge).toBe('Điều phối & Cầu nối Thủ công');
+    expect(viVN.nav.manualBridge).toBe('Cầu nối thủ công');
     expect(viVN.routing.selectCandidates).toBe('Chọn Nhà cung cấp Ứng viên');
     expect(viVN.manualBridge.copyWorkOrder).toBe('1-Click Sao chép WorkOrder');
     expect(viVN.update.installButton).toBe('Khởi động lại và Cài đặt');

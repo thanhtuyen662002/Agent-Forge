@@ -112,10 +112,12 @@ export const TaskBoardView: React.FC = () => {
     cancelled: t('taskBoard.laneActions.none'),
     unknown: t('taskBoard.laneActions.integrity'),
   };
+  // The main flow is always shown; exception lanes (handoff, waiting, blocked, failed, cancelled, unknown) only when they hold tasks.
+  const CORE_LANES = new Set<TaskLaneId>(['planned', 'coding', 'validating', 'completed']);
   const columns = [
     ...TASK_LANE_STATE_GROUPS.map((group) => ({ id: group.id, label: laneLabels[group.id], color: laneColors[group.id] })),
     { id: 'unknown' as const, label: laneLabels.unknown, color: laneColors.unknown },
-  ];
+  ].filter((col) => CORE_LANES.has(col.id) || visibleTasks.some((task) => getTaskLaneId(task.state) === col.id));
 
   const handleCreateTask = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -147,7 +149,7 @@ export const TaskBoardView: React.FC = () => {
   };
 
   return (
-    <div className="p-8 space-y-6 max-w-7xl mx-auto h-full flex flex-col overflow-hidden">
+    <div className="px-6 py-6 space-y-5 h-full flex flex-col overflow-hidden">
       {/* Top Header */}
       <div className="flex items-center justify-between shrink-0">
         <div>
@@ -164,7 +166,7 @@ export const TaskBoardView: React.FC = () => {
           onClick={() => { setCreateError(null); setIsCreateModalOpen(true); }}
           disabled={!isElectron || !activeProject || creating}
           title={!isElectron ? t('actions.desktopRequired') : undefined}
-          className="px-4 py-2 bg-forge-cyan hover:bg-cyan-600 text-slate-950 font-mono font-bold text-xs rounded-lg shadow-lg flex items-center space-x-2 transition"
+          className="h-9 px-4 bg-forge-cyan hover:bg-cyan-500 text-slate-950 font-semibold text-sm rounded-lg flex items-center gap-2 transition disabled:opacity-50"
         >
           <Plus className="w-4 h-4" />
           <span>{t('taskBoard.newTask')}</span>
@@ -220,28 +222,28 @@ export const TaskBoardView: React.FC = () => {
       )}
 
       {/* Kanban Board Columns Grid */}
-      <div className="grid grid-cols-1 md:grid-cols-[repeat(3,minmax(240px,1fr))] xl:grid-cols-[repeat(5,minmax(240px,1fr))] gap-4 flex-1 overflow-x-auto pb-4">
+      <div className="flex gap-4 flex-1 min-h-0 overflow-x-auto pb-3">
         {columns.map((col) => {
           const colTasks = visibleTasks.filter((task) => getTaskLaneId(task.state) === col.id);
           return (
             <div
               key={col.id}
-              className={`bg-surface-card border-t-2 ${col.color} border-x border-b border-surface-border rounded-xl p-3.5 flex flex-col space-y-3 min-w-[240px]`}
+              className={`bg-surface-card border-t-2 ${col.color} border-x border-b border-surface-border rounded-xl p-3 flex flex-col gap-3 w-72 shrink-0 min-h-0`}
             >
-              <div className="flex items-center justify-between text-xs font-mono font-semibold text-slate-300 pb-1 border-b border-surface-border/50">
+              <div className="flex items-center justify-between px-1">
                 <div className="min-w-0">
-                  <span className="block">{col.label}</span>
-                  <span className="block text-[9px] font-normal text-slate-500 truncate">{laneActions[col.id]}</span>
+                  <span className="block text-sm font-semibold text-slate-200">{col.label}</span>
+                  <span className="block text-[11px] text-slate-500 truncate">{laneActions[col.id]}</span>
                 </div>
-                <span className="px-2 py-0.5 rounded-full bg-surface text-slate-400 text-[10px] shrink-0">
+                <span className="min-w-[1.5rem] text-center px-2 py-0.5 rounded-full bg-surface text-slate-300 text-xs tabular-nums shrink-0">
                   {colTasks.length}
                 </span>
               </div>
 
               {/* Task Cards Container */}
-              <div className="space-y-3 flex-1 overflow-y-auto pr-1">
+              <div className="space-y-2.5 flex-1 overflow-y-auto pr-0.5">
                 {colTasks.length === 0 ? (
-                  <div className="text-[11px] font-mono text-slate-600 text-center py-8">
+                  <div className="text-xs text-slate-600 text-center py-10 border border-dashed border-surface-border rounded-lg">
                     {t('taskBoard.emptyLane')}
                   </div>
                 ) : (
@@ -253,10 +255,14 @@ export const TaskBoardView: React.FC = () => {
                         setSelectedTaskId(task.id);
                         setActiveView('task-detail');
                       }}
-                      className="block w-full text-left bg-surface/80 hover:bg-surface border border-surface-border hover:border-forge-cyan/40 rounded-lg p-3.5 space-y-3 shadow transition cursor-pointer group"
+                      className="block w-full text-left bg-surface hover:bg-surface/60 border border-surface-border hover:border-forge-cyan/50 rounded-lg p-3 space-y-2.5 transition cursor-pointer group"
                     >
-                      <span className="flex items-center justify-between text-[10px] font-mono">
-                        <span className="text-forge-cyan font-bold">{task.id}</span>
+                      <span className="block text-sm font-medium text-slate-100 group-hover:text-white leading-snug line-clamp-2">
+                        {task.title}
+                      </span>
+
+                      <span className="flex items-center justify-between text-[11px]">
+                        <span className="font-mono text-slate-500">{task.id}</span>
                         <span
                           className={`px-1.5 py-0.5 rounded ${
                             task.priority === 'CRITICAL'
@@ -264,21 +270,17 @@ export const TaskBoardView: React.FC = () => {
                               : task.priority === 'HIGH'
                               ? 'bg-amber-500/20 text-amber-400'
                               : 'bg-slate-800 text-slate-400'
-                          }`}
+                          } text-[10px] font-medium`}
                         >
                           {task.priority}
                         </span>
                       </span>
 
-                      <span className="block text-xs font-semibold text-white group-hover:text-forge-cyan transition line-clamp-2">
-                        {task.title}
-                      </span>
+                      <ProgressIndicator percent={task.progress_cache_percent} size="sm" compact />
 
-                      <ProgressIndicator percent={task.progress_cache_percent} size="sm" />
-
-                      <span className="flex items-center justify-between text-[10px] font-mono text-slate-400 pt-1 border-t border-surface-border/50">
+                      <span className="flex items-center justify-between text-[11px] text-slate-500">
                         <span>{t('taskBoard.revLabel')}: {task.revision_count}/{task.max_revisions}</span>
-                        <span className="text-slate-300 font-medium">{task.state}</span>
+                        <span className="font-mono text-slate-400">{task.state}</span>
                       </span>
                     </button>
                     {TRASHABLE_STATES.has(task.state) && (
