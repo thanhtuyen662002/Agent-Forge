@@ -260,6 +260,7 @@ export class TaskService {
           summary: `Authorized autonomy transition ${trigger} moved task ${taskId} from ${binding.expectedState} to ${transition.nextState}.`,
           structured_payload: payload, timestamp: new Date().toISOString(),
         });
+        this.refreshTaskProgress(task.id);
         return { success: true, task: this.repo.getTask(task.id)! };
       });
     } catch (error) {
@@ -269,6 +270,32 @@ export class TaskService {
         error: error instanceof Error ? error.message : String(error),
       };
     }
+  }
+
+  /**
+   * Recomputes the cached progress from durable evidence only (found in the
+   * real trial: automated transitions never refreshed it, so a DONE task kept
+   * showing 24%).
+   */
+  private refreshTaskProgress(taskId: string): void {
+    const task = this.repo.getTask(taskId);
+    if (!task) return;
+    const latestTest = this.repo.getLatestTestRun(taskId);
+    const diffEvidence = this.repo.getLatestEvidence(taskId, 'GIT_DIFF');
+    const testEvidence = this.repo.getLatestEvidence(taskId, 'TEST_RESULT');
+    const hasLintConfig = this.repo.getVerificationCommandsByProject(task.project_id).some((c) => c.command_type === 'LINT' && c.enabled);
+    // The automated path keeps the coder's changes uncommitted in the managed worktree;
+    // a passed automated verification of that worktree is the evidence that they exist.
+    const verifiedChanges = this.repo.getEventsByProject(task.project_id)
+      .some((event) => event.task_id === taskId && event.type === 'AUTOMATION_VERIFICATION_PASSED');
+    const progress = ProgressService.calculateTaskProgress(task, {
+      hasGitDiff: Boolean(diffEvidence) || verifiedChanges,
+      testsPassed: latestTest?.exit_code === 0,
+      hasEvidence: Boolean(diffEvidence || testEvidence),
+      excludeUnconfiguredLint: !hasLintConfig,
+      lintPassed: false,
+    });
+    this.repo.updateTaskProgressCache(taskId, progress.percent);
   }
 
   public createTask(spec: TaskCreationSpec): Task {

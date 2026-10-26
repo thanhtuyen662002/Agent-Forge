@@ -417,6 +417,39 @@ any startup quarantine marker (`PRODUCT_LEASE_RECOVERY_REQUIRED`) for that
 lease. A late result from the old process is discarded because it no longer
 holds its lease.
 
+## Automatic integration into the default branch (opt-in)
+
+The owner asked for Agent Forge to manage Git itself, since waiting for the
+owner is not automation. **Code đã duyệt → "Tự động đưa code đã duyệt vào nhánh
+chính"** (`automation.auto_integrate`, per project, off by default) turns
+reviewed work into commits on the project's default branch without a click:
+
+1. After a PASS review, the next automation pass creates the branch exactly
+   as described below (same reviewed-snapshot checks). That pass runs before
+   any new Manager decision or coder run, so the next task starts from the
+   integrated code.
+2. The branch then lands on the default branch:
+   - **Fast-forward** when the default branch has not moved.
+   - **Merge commit** (authored by *Agent Forge*) when the default branch moved
+     and `git merge-tree --write-tree` proves the merge is conflict-free.
+   - **Owner has the default branch checked out:** Git's own `merge --ff-only`
+     or `merge --no-ff` runs in that checkout, only when it has no uncommitted
+     changes to tracked files, so the working tree follows.
+   - **Otherwise:** only the ref moves, with `update-ref` as a compare-and-swap
+     on the value inspected before.
+3. The merged branch is deleted with the safe `git branch -d`.
+
+Nothing is ever pushed, force-moved or rewritten. A conflict, uncommitted
+changes in the checkout, a default branch that moved during the attempt, or a
+missing default branch leaves the branch untouched. The reason is recorded
+(`AUTOMATION_INTEGRATION_MERGE_SKIPPED`) and shown, with **Đưa vào nhánh chính**
+to retry. A successful landing records `AUTOMATION_INTEGRATION_MERGED`. The
+same button integrates a branch that was created by hand.
+
+Task progress is also refreshed on every automated transition. A task that
+passed tests and review now shows 100%; before, it kept the value from the
+Manager decision (24% in the real trial).
+
 ## Taking reviewed work: create a branch or discard
 
 When a task passes automated review it is `DONE`, and its changes are still

@@ -539,6 +539,19 @@ export interface TranslationDictionary {
       removeLeftover: string;
       filesChanged: string;
       failed: string;
+      subtitleAuto: string;
+      autoToggle: string;
+      autoHint: string;
+      merged: string;
+      mergeNow: string;
+      skipped: {
+        MERGE_CONFLICT: string;
+        OWNER_CHECKOUT_HAS_CHANGES: string;
+        DEFAULT_BRANCH_MOVED: string;
+        DEFAULT_BRANCH_MISSING: string;
+        MERGE_FAILED: string;
+        OTHER: string;
+      };
     };
     managerPanel: {
       title: string;

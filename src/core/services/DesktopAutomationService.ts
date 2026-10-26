@@ -51,7 +51,7 @@ export interface DesktopAutomationOptions {
   reviewHeartbeatMs?: number;
 }
 
-type InFlightKind = 'EXECUTION' | 'VERIFICATION' | 'REVIEW' | 'MANAGER';
+type InFlightKind = 'EXECUTION' | 'VERIFICATION' | 'REVIEW' | 'MANAGER' | 'INTEGRATION';
 type AutomationRole = 'CODER' | 'REVIEWER' | 'MANAGER';
 /** Capability an agent's adapter must report for each automated role. */
 const ROLE_CAPABILITY: Partial<Record<AutomationRole, string>> = { REVIEWER: 'REVIEW', MANAGER: 'PLANNING' };
@@ -216,6 +216,18 @@ export class DesktopAutomationService {
             continue;
           }
         }
+        // Reviewed work lands on the default branch first when the owner opted in, so
+        // the next task starts from it (automatic integration).
+        if (this.repo.getProjectAutoIntegrate(project.id)) {
+          const ready = this.integration.hasReadyWork(project.id) ?? this.integration.hasUnmergedBranch(project.id);
+          if (ready) {
+            const integrate = this.integrate(project.id, ready)
+              .catch(() => undefined)
+              .finally(() => this.inFlight.delete(project.id));
+            this.inFlight.set(project.id, { kind: 'INTEGRATION', taskId: ready, agentId: '', promise: integrate });
+            continue;
+          }
+        }
         // An approved contract with no tasks yet gets its planning record first (#245).
         if (this.manager) { try { this.manager.ensurePlanningAnchor(project.id); } catch { /* next pass */ } }
         // A task without Manager authority for its revision (or the plan) asks the Manager agent first.
@@ -332,6 +344,16 @@ export class DesktopAutomationService {
   }
 
   /** The mode (auto or approve) is read by the Manager service when the answer arrives, not at dispatch. */
+  /** Branch from the exact reviewed snapshot, then the default branch; a skip leaves the branch for the owner. */
+  private async integrate(projectId: string, taskId: string): Promise<void> {
+    const entry = this.integration.list(projectId).find((item) => item.taskId === taskId);
+    if (entry?.state === 'READY') {
+      const created = await this.integration.createBranch(projectId, taskId);
+      if (!created.success) return;
+    }
+    await this.integration.mergeIntoDefault(projectId, taskId);
+  }
+
   private async runManager(pending: PendingManagerDecision, manager: CoderCandidate): Promise<void> {
     if (!this.manager) return;
     await this.manager.decide(pending, {

@@ -1017,11 +1017,32 @@ export function registerIpcHandlers(
     if (!projectId) return { success: false, errorCode: 'PROJECT_NOT_FOUND' };
     return sanitizeOutputValue({ success: true, entries: runtime.automation.getIntegration().list(projectId) });
   });
+  // Automatic integration into the default branch (owner opt-in per project).
+  registerPrivilegedHandler('integration:getAuto', async (_, payload: unknown) => {
+    const projectId = readProjectId(payload);
+    if (!projectId || !repo.getProject(projectId)) return { success: false, errorCode: 'PROJECT_NOT_FOUND' };
+    return { success: true, enabled: repo.getProjectAutoIntegrate(projectId) };
+  });
+  registerPrivilegedHandler('integration:setAuto', async (_, payload: unknown) => {
+    const projectId = readProjectId(payload);
+    const enabled = payload && typeof payload === 'object' ? (payload as { enabled?: unknown }).enabled : undefined;
+    if (!projectId || !repo.getProject(projectId)) return { success: false, errorCode: 'PROJECT_NOT_FOUND' };
+    if (typeof enabled !== 'boolean') return { success: false, errorCode: 'INVALID_INPUT' };
+    repo.setProjectAutoIntegrate(projectId, enabled);
+    if (enabled) void runtime.automation?.tick();
+    return { success: true, enabled };
+  });
   registerPrivilegedHandler('integration:createBranch', async (_, payload: unknown) => {
     const target = readIntegrationTarget(payload);
     if (!runtime.automation) return { success: false, errorCode: 'AUTOMATION_UNAVAILABLE' };
     if (!target) return { success: false, errorCode: 'TASK_NOT_FOUND' };
     return sanitizeOutputValue(await runtime.automation.getIntegration().createBranch(target.projectId, target.taskId));
+  });
+  registerPrivilegedHandler('integration:merge', async (_, payload: unknown) => {
+    const target = readIntegrationTarget(payload);
+    if (!runtime.automation) return { success: false, errorCode: 'AUTOMATION_UNAVAILABLE' };
+    if (!target) return { success: false, errorCode: 'TASK_NOT_FOUND' };
+    return sanitizeOutputValue(await runtime.automation.getIntegration().mergeIntoDefault(target.projectId, target.taskId));
   });
   registerPrivilegedHandler('integration:discard', async (_, payload: unknown) => {
     const target = readIntegrationTarget(payload);

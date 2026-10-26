@@ -10,10 +10,13 @@ interface IntegrationEntryView {
   branch: string | null;
   changedFiles: string[];
   leftoverCopy: boolean;
+  mergedInto: string | null;
+  mergeSkipped: string | null;
 }
 
 const isRecord = (value: unknown): value is Record<string, unknown> => !!value && typeof value === 'object' && !Array.isArray(value);
 const STATES = new Set(['READY', 'BRANCH_CREATED', 'DISCARDED']);
+const SKIP_REASONS = new Set(['MERGE_CONFLICT', 'OWNER_CHECKOUT_HAS_CHANGES', 'DEFAULT_BRANCH_MOVED', 'DEFAULT_BRANCH_MISSING', 'MERGE_FAILED']);
 
 /** Accepts only a well-formed `integration:list` reply; anything else is "unknown". */
 export function normalizeIntegrationReply(reply: unknown): IntegrationEntryView[] | null {
@@ -27,6 +30,8 @@ export function normalizeIntegrationReply(reply: unknown): IntegrationEntryView[
       branch: typeof item.branch === 'string' ? item.branch : null,
       changedFiles: Array.isArray(item.changedFiles) ? item.changedFiles.filter((file): file is string => typeof file === 'string') : [],
       leftoverCopy: item.leftoverCopy === true,
+      mergedInto: typeof item.mergedInto === 'string' ? item.mergedInto : null,
+      mergeSkipped: typeof item.mergeSkipped === 'string' && /^[A-Z_]{1,64}$/.test(item.mergeSkipped) ? item.mergeSkipped : null,
     });
   }
   return entries;
@@ -43,6 +48,7 @@ export const ReviewedWorkPanel: React.FC<{ projectId: string }> = ({ projectId }
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState<string | null>(null);
   const [confirming, setConfirming] = useState<string | null>(null);
+  const [autoIntegrate, setAutoIntegrate] = useState<boolean | null>(null);
   const current = useRef(projectId);
   current.current = projectId;
 
@@ -56,6 +62,17 @@ export const ReviewedWorkPanel: React.FC<{ projectId: string }> = ({ projectId }
   }, [api, projectId]);
 
   useEffect(() => {
+    let active = true;
+    setAutoIntegrate(null);
+    if (api?.getAutoIntegrate) {
+      Promise.resolve(api.getAutoIntegrate(projectId)).then((reply: unknown) => {
+        if (active && isRecord(reply) && reply.success === true && typeof reply.enabled === 'boolean') setAutoIntegrate(reply.enabled);
+      }).catch(() => undefined);
+    }
+    return () => { active = false; };
+  }, [api, projectId]);
+
+  useEffect(() => {
     setEntries(null);
     setError(null);
     void load();
@@ -65,7 +82,20 @@ export const ReviewedWorkPanel: React.FC<{ projectId: string }> = ({ projectId }
 
   if (!api?.getIntegrations) return null;
   const list = entries?.projectId === projectId ? entries.list : [];
-  if (list.length === 0) return null;
+  // The switch stays visible once known, so the owner can opt in before any work is ready.
+  if (list.length === 0 && autoIntegrate === null) return null;
+
+  const toggleAuto = async (enabled: boolean) => {
+    setError(null);
+    try {
+      const reply = await api.setAutoIntegrate(projectId, enabled);
+      if (isRecord(reply) && reply.success === true && typeof reply.enabled === 'boolean') setAutoIntegrate(reply.enabled);
+      else setError(t('runtime.integrationPanel.failed', { code: 'AUTO_INTEGRATE' }));
+    } catch {
+      setError(t('runtime.integrationPanel.failed', { code: 'AUTO_INTEGRATE' }));
+    }
+    await load();
+  };
 
   const act = async (taskId: string, action: () => Promise<unknown>) => {
     setBusy(taskId);
@@ -91,22 +121,44 @@ export const ReviewedWorkPanel: React.FC<{ projectId: string }> = ({ projectId }
           <GitBranch aria-hidden="true" className="w-5 h-5 text-forge-emerald" />
           {t('runtime.integrationPanel.title')}
         </h3>
-        <p className="text-xs text-slate-400">{t('runtime.integrationPanel.subtitle')}</p>
+        <p className="text-xs text-slate-400">{t(autoIntegrate ? 'runtime.integrationPanel.subtitleAuto' : 'runtime.integrationPanel.subtitle')}</p>
       </div>
+      {autoIntegrate !== null && api?.setAutoIntegrate && (
+        <label className="flex items-start gap-2 text-xs text-slate-300">
+          <input type="checkbox" className="mt-0.5" checked={autoIntegrate} onChange={(event) => void toggleAuto(event.target.checked)} />
+          <span>
+            {t('runtime.integrationPanel.autoToggle')}
+            <span className="block text-[11px] text-slate-500">{t('runtime.integrationPanel.autoHint')}</span>
+          </span>
+        </label>
+      )}
       {error && <p role="alert" className="text-xs text-rose-300">{error}</p>}
       <ul className="divide-y divide-surface-border">
         {list.map((entry) => (
           <li key={entry.taskId} className="py-3 flex flex-wrap items-center justify-between gap-3">
             <div className="min-w-0">
               <p className="text-sm text-slate-100 font-medium truncate">{entry.taskTitle}</p>
-              {entry.state === 'BRANCH_CREATED' && entry.branch && (
+              {entry.state === 'BRANCH_CREATED' && entry.mergedInto && (
+                <p className="text-xs text-emerald-300">{t('runtime.integrationPanel.merged', { branch: entry.mergedInto })}</p>
+              )}
+              {entry.state === 'BRANCH_CREATED' && !entry.mergedInto && entry.branch && (
                 <p className="text-xs text-emerald-300">{t('runtime.integrationPanel.branchCreated', { branch: entry.branch })}</p>
+              )}
+              {entry.state === 'BRANCH_CREATED' && entry.mergeSkipped && (
+                <p className="text-xs text-amber-300">{t(`runtime.integrationPanel.skipped.${SKIP_REASONS.has(entry.mergeSkipped) ? entry.mergeSkipped : 'OTHER'}`)}</p>
               )}
               {entry.state === 'BRANCH_CREATED' && entry.changedFiles.length > 0 && (
                 <p className="text-xs text-slate-400">{t('runtime.integrationPanel.filesChanged', { count: entry.changedFiles.length })}</p>
               )}
               {entry.state === 'DISCARDED' && <p className="text-xs text-slate-400">{t('runtime.integrationPanel.discarded')}</p>}
             </div>
+            {entry.state === 'BRANCH_CREATED' && !entry.mergedInto && api?.mergeIntegration && (
+              <button type="button" disabled={busy !== null}
+                onClick={() => void act(entry.taskId, () => api.mergeIntegration(projectId, entry.taskId))}
+                className="px-3 py-1.5 rounded-lg text-xs border border-emerald-600/50 text-emerald-300 bg-emerald-900/20 hover:bg-emerald-900/40 disabled:opacity-40">
+                {t('runtime.integrationPanel.mergeNow')}
+              </button>
+            )}
             {entry.state === 'BRANCH_CREATED' && entry.leftoverCopy && (
               <button type="button" disabled={busy !== null}
                 onClick={() => void act(entry.taskId, () => api.discardIntegration(projectId, entry.taskId))}
