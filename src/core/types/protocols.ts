@@ -11,10 +11,22 @@ import { boundedArray, boundedString, MAX_PROTOCOL_ARRAY_ITEMS, MAX_PROTOCOL_STR
 const protocolString = () => boundedString(z.string(), MAX_PROTOCOL_STRING_BYTES);
 const requiredProtocolString = () => boundedString(z.string().min(1), MAX_PROTOCOL_STRING_BYTES);
 const protocolStringArray = () => boundedArray(z.array(protocolString()), MAX_PROTOCOL_ARRAY_ITEMS);
+/**
+ * A list the model may also write as one text block (found in the first real
+ * trial: Claude sent manager.v1 `instructions` as a single string). Each
+ * non-empty line becomes one item; anything else is validated unchanged.
+ */
+const linesOrStringArray = () => z.preprocess(
+  (value) => (typeof value === 'string' ? value.split(/\r?\n/).map((line) => line.trim()).filter(Boolean) : value),
+  protocolStringArray(),
+);
 
 // ==========================================
 // 1. Manager Protocol Schema (manager.v1)
 // ==========================================
+
+/** Models often write enum values in lower case (`high`); the meaning is unambiguous (found in the first real trial). */
+const upperCaseEnum = <T extends z.ZodType>(schema: T) => z.preprocess((value) => (typeof value === 'string' ? value.trim().toUpperCase() : value), schema);
 
 export const ManagerDecisionEnum = z.enum([
   'CREATE_TASKS',
@@ -29,7 +41,7 @@ export const ManagerDecisionEnum = z.enum([
 export type ManagerDecision = z.infer<typeof ManagerDecisionEnum>;
 
 export const ReviewIssueSchema = z.object({
-  severity: ReviewIssueSeverityEnum,
+  severity: upperCaseEnum(ReviewIssueSeverityEnum),
   title: requiredProtocolString(),
   file_path: protocolString().nullable().optional(),
   line_number: z.number().int().nullable().optional(),
@@ -37,22 +49,19 @@ export const ReviewIssueSchema = z.object({
 });
 export type ReviewIssuePayload = z.infer<typeof ReviewIssueSchema>;
 
-/** Models often write enum values in lower case (`high`); the meaning is unambiguous (found in the first real trial). */
-const upperCaseEnum = <T extends z.ZodType>(schema: T) => z.preprocess((value) => (typeof value === 'string' ? value.trim().toUpperCase() : value), schema);
-
 export const ManagerProtocolSchema = z.object({
   protocol: z.literal('manager.v1'),
   message_id: requiredProtocolString(),
   project_id: requiredProtocolString(),
   task_id: protocolString().nullable().optional(),
-  decision: ManagerDecisionEnum,
+  decision: upperCaseEnum(ManagerDecisionEnum),
   priority: upperCaseEnum(PriorityEnum).optional().default('MEDIUM'),
   risk: upperCaseEnum(RiskLevelEnum).optional().default('MEDIUM'),
-  instructions: protocolStringArray().optional().default([]),
-  acceptance_criteria: protocolStringArray().optional().default([]),
-  constraints: protocolStringArray().optional().default([]),
+  instructions: linesOrStringArray().optional().default([]),
+  acceptance_criteria: linesOrStringArray().optional().default([]),
+  constraints: linesOrStringArray().optional().default([]),
   review_issues: boundedArray(z.array(ReviewIssueSchema), MAX_PROTOCOL_ARRAY_ITEMS).optional().default([]),
-  expected_task_state: TaskStateEnum.nullable().optional(),
+  expected_task_state: upperCaseEnum(TaskStateEnum.nullable()).optional(),
   expected_revision: z.number().int().nonnegative().nullable().optional(),
   created_at: protocolString().optional(),
 });
@@ -76,14 +85,14 @@ export const CoderProtocolSchema = z.object({
   project_id: requiredProtocolString(),
   task_id: requiredProtocolString(),
   attempt: z.number().int().positive().optional().default(1),
-  status: CoderStatusEnum,
-  completed: protocolStringArray().optional().default([]),
-  remaining: protocolStringArray().optional().default([]),
-  files_claimed_changed: protocolStringArray().optional().default([]),
-  tests_claimed: protocolStringArray().optional().default([]),
-  blockers: protocolStringArray().optional().default([]),
+  status: upperCaseEnum(CoderStatusEnum),
+  completed: linesOrStringArray().optional().default([]),
+  remaining: linesOrStringArray().optional().default([]),
+  files_claimed_changed: linesOrStringArray().optional().default([]),
+  tests_claimed: linesOrStringArray().optional().default([]),
+  blockers: linesOrStringArray().optional().default([]),
   review_requested: z.boolean().optional().default(true),
-  expected_task_state: TaskStateEnum.nullable().optional(),
+  expected_task_state: upperCaseEnum(TaskStateEnum.nullable()).optional(),
   expected_revision: z.number().int().nonnegative().nullable().optional(),
   created_at: protocolString().optional(),
 });
@@ -155,7 +164,7 @@ export const ReviewProtocolSchema = z.object({
   project_id: requiredProtocolString(),
   task_id: requiredProtocolString(),
   task_revision: z.number().int().nonnegative(),
-  verdict: ReviewVerdictEnum,
+  verdict: upperCaseEnum(ReviewVerdictEnum),
   summary: requiredProtocolString(),
   issues: boundedArray(z.array(ReviewIssueSchema), MAX_PROTOCOL_ARRAY_ITEMS).optional().default([]),
   reviewed_head_sha: sha40(),
