@@ -774,6 +774,10 @@ describe('R5F0C3 — Production Codex CLI Adapter Contract Suite', () => {
       expect(log.argv).toContain('gpt-4o');
       expect(log.argv).toContain('--sandbox');
       expect(log.argv).toContain('workspace-write');
+      // Trial fixes (Codex 0.160 on Windows): non-Git workspace, unelevated sandbox, no other TEMP folders.
+      expect(log.argv).toEqual(expect.arrayContaining(['--skip-git-repo-check', '-c', 'windows.sandbox=unelevated',
+        'sandbox_workspace_write.exclude_tmpdir_env_var=true', 'sandbox_workspace_write.exclude_slash_tmp=true']));
+      expect(log.argv.join(' ')).not.toMatch(/dangerously|bypass/);
 
       // Prompt is strictly ABSENT from argv
       for (const arg of log.argv) {
@@ -806,6 +810,7 @@ describe('R5F0C3 — Production Codex CLI Adapter Contract Suite', () => {
       const log = getLogs()[0];
       expect(log.argv).toContain('read-only');
       expect(log.argv).not.toContain('workspace-write');
+      expect(log.argv).toEqual(expect.arrayContaining(['--skip-git-repo-check', 'windows.sandbox=unelevated']));
       expect(log.stdin).toContain('Do not modify any file');
       expect(fs.existsSync(path.join(projectRepoDir, 'reviewer-wrote.txt'))).toBe(false);
     });
