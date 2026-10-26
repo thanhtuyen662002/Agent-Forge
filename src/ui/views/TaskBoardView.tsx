@@ -228,7 +228,7 @@ export const TaskBoardView: React.FC = () => {
           return (
             <div
               key={col.id}
-              className={`bg-surface-card border-t-2 ${col.color} border-x border-b border-surface-border rounded-xl p-3 flex flex-col gap-3 w-72 shrink-0 min-h-0`}
+              className={`bg-surface-card border-t-2 ${col.color} border-x border-b border-surface-border rounded-xl p-3 flex flex-col gap-3 w-[18rem] shrink-0 min-h-0`}
             >
               <div className="flex items-center justify-between px-1">
                 <div className="min-w-0">

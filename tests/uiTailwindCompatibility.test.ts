@@ -50,9 +50,10 @@ describe('compiled owner interface CSS after the dependency security upgrade', (
     expect(declarations('button:focus-visible')['outline-offset']).toBe('-2px');
   });
 
-  it('emits the existing horizontal Kanban scroll and responsive dashboard grid', () => {
+  it('emits the horizontal Kanban scroll with fixed-width lanes and the responsive dashboard grid', () => {
     expect(declarations('.overflow-x-auto')['overflow-x']).toBe('auto');
-    expect(declarations('.min-w-\\[240px\\]')['min-width']).toBe('240px');
+    expect(declarations('.w-\\[18rem\\]').width).toBe('18rem'); // #279: fixed lane width.
+    expect(declarations('.shrink-0')['flex-shrink']).toBe('0');
     expect(declarations('.lg\\:grid-cols-4')['grid-template-columns']).toBe('repeat(4, minmax(0, 1fr))');
   });
 });
