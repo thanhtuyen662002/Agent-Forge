@@ -526,7 +526,7 @@ export const viVN: TranslationDictionary = {
     },
     integrationPanel: {
       title: 'Code đã duyệt',
-      subtitle: 'Phần việc đã qua review tự động. Không có gì được merge: bạn chọn cách xử lý.',
+      subtitle: 'Phần việc đã qua review tự động. Bạn chọn cách xử lý, hoặc bật tự động đưa vào nhánh chính.',
       empty: 'Không có phần việc đã duyệt nào đang chờ.',
       create: 'Tạo nhánh',
       discard: 'Bỏ',
@@ -536,6 +536,19 @@ export const viVN: TranslationDictionary = {
       removeLeftover: 'Xóa bản sao còn sót',
       filesChanged: '{count} file thay đổi',
       failed: 'Không thực hiện được ({code}).',
+      subtitleAuto: 'Phần việc đã qua review được Agent Forge tự đưa vào nhánh chính. Không bao giờ push lên GitHub.',
+      autoToggle: 'Tự động đưa code đã duyệt vào nhánh chính',
+      autoHint: 'Sau khi review PASS, Agent Forge tạo commit và đưa vào nhánh chính của dự án (fast-forward, hoặc commit gộp khi không xung đột). Nếu có xung đột hoặc bạn đang sửa dở trên nhánh chính, nhánh được giữ lại để bạn xử lý. Không bao giờ push.',
+      merged: 'Đã đưa vào nhánh {branch}.',
+      mergeNow: 'Đưa vào nhánh chính',
+      skipped: {
+        MERGE_CONFLICT: 'Chưa tự đưa vào nhánh chính: có xung đột với thay đổi mới trên nhánh chính.',
+        OWNER_CHECKOUT_HAS_CHANGES: 'Chưa tự đưa vào nhánh chính: thư mục dự án có thay đổi chưa commit. Commit hoặc cất chúng rồi bấm Đưa vào nhánh chính.',
+        DEFAULT_BRANCH_MOVED: 'Chưa tự đưa vào nhánh chính: nhánh chính vừa thay đổi. Bấm Đưa vào nhánh chính để thử lại.',
+        DEFAULT_BRANCH_MISSING: 'Chưa tự đưa vào nhánh chính: không tìm thấy nhánh chính của dự án.',
+        MERGE_FAILED: 'Chưa tự đưa vào nhánh chính: Git không thực hiện được. Nhánh vẫn được giữ.',
+        OTHER: 'Chưa tự đưa vào nhánh chính. Nhánh vẫn được giữ.',
+      },
     },
     managerPanel: {
       title: 'Quyết định của Quản lý',

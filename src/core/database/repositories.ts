@@ -377,6 +377,34 @@ export class Repository {
       .run(projectId, JSON.stringify(taskId)).changes === 1;
   }
 
+  /**
+   * Automatic integration of reviewed work into the default branch (owner
+   * opt-in per project). Missing or malformed values mean off.
+   */
+  public getProjectAutoIntegrate(projectId: string): boolean {
+    const row = this.db
+      .prepare('SELECT value_json FROM project_settings WHERE project_id = ? AND key = ?')
+      .get(projectId, 'automation.auto_integrate') as { value_json?: unknown } | undefined;
+    try {
+      return typeof row?.value_json === 'string' && JSON.parse(row.value_json) === true;
+    } catch {
+      return false;
+    }
+  }
+
+  public setProjectAutoIntegrate(projectId: string, enabled: boolean): boolean {
+    if (typeof enabled !== 'boolean') throw new Error('AUTO_INTEGRATE_INVALID: value must be a boolean.');
+    if (!this.getProject(projectId)) throw new Error(`Project "${projectId}" not found.`);
+    this.db
+      .prepare(`
+        INSERT INTO project_settings (project_id, key, value_json)
+        VALUES (?, 'automation.auto_integrate', ?)
+        ON CONFLICT(project_id, key) DO UPDATE SET value_json = excluded.value_json
+      `)
+      .run(projectId, JSON.stringify(enabled));
+    return enabled;
+  }
+
   public setProjectManagerMode(projectId: string, mode: 'AUTO' | 'APPROVE'): 'AUTO' | 'APPROVE' {
     if (mode !== 'AUTO' && mode !== 'APPROVE') throw new Error('MANAGER_MODE_INVALID: value must be AUTO or APPROVE.');
     if (!this.getProject(projectId)) throw new Error(`Project "${projectId}" not found.`);

@@ -1032,6 +1032,77 @@ describe('desktop automation runtime', () => {
       expect(service.getIntegration().list(projectId)[0]).toMatchObject({ state: 'BRANCH_CREATED', branch });
     }, 180_000);
 
+    it('names branches readably for Vietnamese titles, cut at a word boundary (found in the trial)', () => {
+      const name = (title: string) => WorktreeIntegrationService.branchName({ title, id: 'TSK-552ADE2A', revision_count: 0 } as any);
+      expect(name('Thêm hàm slugify vào src/text.js kèm test')).toBe('agent/them-ham-slugify-vao-src-text-js-kem-552ade2a-r0');
+      expect(name('Đường số 1')).toBe('agent/duong-so-1-552ade2a-r0');
+    });
+
+    it('integrates reviewed work into the checked-out default branch with a fast-forward and reports 100% progress', async () => {
+      const { task } = await runToDone();
+      expect(repo.getTask(task.id)!.progress_cache_percent).toBe(100); // Refreshed on every automated transition.
+      const mainBefore = git('rev-parse', 'main');
+      const created = await service.getIntegration().createBranch(projectId, task.id);
+      expect(created).toMatchObject({ success: true });
+      const merged = await service.getIntegration().mergeIntoDefault(projectId, task.id);
+      expect(merged).toMatchObject({ success: true, commitSha: (created as any).commitSha });
+      expect(git('rev-parse', 'main')).toBe((created as any).commitSha);
+      expect(git('rev-parse', 'main^')).toBe(mainBefore);
+      expect(fs.readFileSync(path.join(repoDir, 'README.md'), 'utf8')).toContain('Hello from the coder'); // The checkout follows.
+      expect(git('status', '--porcelain')).toBe('');
+      expect(git('branch', '--list', 'agent/*')).toBe(''); // The merged branch is removed safely.
+      expect(service.getIntegration().list(projectId)[0]).toMatchObject({ state: 'BRANCH_CREATED', mergedInto: 'main', mergeSkipped: null });
+      expect(await service.getIntegration().mergeIntoDefault(projectId, task.id)).toEqual({ success: false, errorCode: 'ALREADY_MERGED' });
+    }, 180_000);
+
+    it('leaves the branch for the owner when the checkout has uncommitted changes, then integrates on request', async () => {
+      const { task } = await runToDone();
+      await service.getIntegration().createBranch(projectId, task.id);
+      const mainBefore = git('rev-parse', 'main');
+      fs.appendFileSync(path.join(repoDir, 'verify.js'), '// owner edit\n', 'utf8');
+      expect(await service.getIntegration().mergeIntoDefault(projectId, task.id)).toEqual({ success: false, errorCode: 'OWNER_CHECKOUT_HAS_CHANGES' });
+      expect(git('rev-parse', 'main')).toBe(mainBefore);
+      expect(fs.readFileSync(path.join(repoDir, 'verify.js'), 'utf8')).toContain('// owner edit'); // Never touched.
+      expect(service.getIntegration().list(projectId)[0]).toMatchObject({ mergedInto: null, mergeSkipped: 'OWNER_CHECKOUT_HAS_CHANGES' });
+      git('checkout', '--', 'verify.js');
+      expect(await service.getIntegration().mergeIntoDefault(projectId, task.id)).toMatchObject({ success: true });
+      expect(service.getIntegration().list(projectId)[0]).toMatchObject({ mergedInto: 'main', mergeSkipped: null });
+    }, 180_000);
+
+    it('creates a merge commit when the default branch moved without conflict, and keeps a conflicting branch', async () => {
+      const { task } = await runToDone();
+      await service.getIntegration().createBranch(projectId, task.id);
+      fs.writeFileSync(path.join(repoDir, 'OTHER.md'), 'owner work\n', 'utf8');
+      git('add', 'OTHER.md');
+      git('commit', '-m', 'owner work on main');
+      const moved = git('rev-parse', 'main');
+      expect(await service.getIntegration().mergeIntoDefault(projectId, task.id)).toMatchObject({ success: true });
+      expect(git('rev-list', '--parents', '-n', '1', 'main').split(' ')).toHaveLength(3); // A merge commit with two parents.
+      expect(git('rev-parse', 'main^1')).toBe(moved);
+      expect(fs.readFileSync(path.join(repoDir, 'README.md'), 'utf8')).toContain('Hello from the coder');
+      expect(fs.readFileSync(path.join(repoDir, 'OTHER.md'), 'utf8')).toBe('owner work\n');
+    }, 180_000);
+
+    it('keeps the branch when it conflicts with newer work on the default branch', async () => {
+      const { task } = await runToDone();
+      await service.getIntegration().createBranch(projectId, task.id);
+      fs.writeFileSync(path.join(repoDir, 'README.md'), '# Fixture\nOwner rewrote this line\n', 'utf8');
+      git('commit', '-am', 'owner edits README');
+      const before = git('rev-parse', 'main');
+      expect(await service.getIntegration().mergeIntoDefault(projectId, task.id)).toEqual({ success: false, errorCode: 'MERGE_CONFLICT' });
+      expect(git('rev-parse', 'main')).toBe(before);
+      expect(git('status', '--porcelain')).toBe('');
+      expect(git('branch', '--list', 'agent/*')).not.toBe('');
+    }, 180_000);
+
+    it('integrates automatically on the next pass when the owner opted in', async () => {
+      repo.setProjectAutoIntegrate(projectId, true);
+      const { task } = await runToDone();
+      for (let i = 0; i < 3 && !service.getIntegration().list(projectId)[0]?.mergedInto; i += 1) { await service.tick(); await service.drain(); }
+      expect(service.getIntegration().list(projectId)[0]).toMatchObject({ taskId: task.id, mergedInto: 'main' });
+      expect(fs.readFileSync(path.join(repoDir, 'README.md'), 'utf8')).toContain('Hello from the coder');
+    }, 180_000);
+
     it('refuses work that changed after it was reviewed', async () => {
       const { task, worktree } = await runToDone();
       fs.appendFileSync(path.join(worktree, 'README.md'), 'tampered\n', 'utf8');
