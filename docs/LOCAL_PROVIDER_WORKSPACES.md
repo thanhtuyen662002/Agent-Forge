@@ -45,8 +45,16 @@ Synchronization back to the source is limited to the authorized scope
 - **New files** are synchronized only inside a context path that was an
   explicitly authorized **directory** (for example `src`), including new
   nested directories. A new file anywhere else fails the execution with
-  `WORKSPACE_SYNC_OUT_OF_SCOPE`; authorizing only individual files allows no
-  new files.
+  `WORKSPACE_SYNC_OUT_OF_SCOPE`; authorizing only individual existing files
+  allows no new files.
+- An authorized context path that **does not exist yet** (a new file or
+  directory the task creates, for example `bin` or `bin/stats.js`, #287) is a
+  creation scope too. A file may be created exactly at that path or inside it.
+  Its name is still checked by policy, and it is written only through real
+  parent directories.
+- Recreating an existing repository file that was not part of the workspace
+  (for example `README.md` owned by another task) is out of scope and fails the
+  execution.
 - A new file with a policy-denied name (such as `.env*`), a link or special
   file anywhere in the workspace (`WORKSPACE_REPARSE_POINT`), or a new file
   whose path already exists in the source (`WORKSPACE_SYNC_CONFLICT`) fails
@@ -58,7 +66,9 @@ A review execution (`review.v1`) is never synchronized back. All source and
 workspace entries are preflighted before the first write; the source file's
 identity and SHA-256 hash are checked again, the replacement is written through
 a flushed temporary file, and the parent directory and target identity are
-revalidated before an atomic rename. If a later entry conflicts after an
+revalidated before an atomic rename. On Windows, a rename refused with EPERM,
+EBUSY or EACCES (a file held briefly by an antivirus or indexer, trial 7b) is
+retried up to 8 times with a short backoff; any other error fails. If a later entry conflicts after an
 earlier entry was written, earlier writes, creations and deletions are rolled
 back in reverse order only while their identity and provider-result hash still
 match (a created file is removed with the directories it created; a deleted

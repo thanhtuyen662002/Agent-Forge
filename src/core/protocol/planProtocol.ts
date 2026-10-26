@@ -43,7 +43,7 @@ export function contractSha256(contract: ProjectContract): string {
 export const MAX_TASK_CONTEXT_PATHS = 32;
 
 export type ContextPathCheck =
-  | { ok: true; paths: string[] }
+  | { ok: true; paths: string[]; newPaths?: string[] }
   | { ok: false; reasonCode: 'CONTEXT_PATH_INVALID' | 'CONTEXT_PATH_MISSING' | 'CONTEXT_PATH_DENIED' | 'CONTEXT_PATH_LINK' | 'CONTEXT_LIMIT_EXCEEDED'; path: string };
 
 /**
@@ -51,12 +51,14 @@ export type ContextPathCheck =
  * portable relative path inside the repository, exists, is not a link, and is
  * allowed by policy (sensitive names, .git and agent configuration are
  * denied). Duplicates are folded; at most 32 paths.
- * With `skipMissing`, a path that does not exist yet (a file or directory the
- * coder will create, found in trial 7) is dropped instead of failing the check;
- * every containment, link and policy rejection stays.
+ * With `allowMissing`, a path that does not exist yet (a file or directory the
+ * task will create, found in trial 7) is kept and also listed in `newPaths`:
+ * it is where the coder is authorized to create files (#240). Its name is
+ * still judged by policy, and every containment and link rejection stays.
  */
-export function validateContextPaths(repositoryRoot: string, paths: readonly string[], options: { skipMissing?: boolean } = {}): ContextPathCheck {
+export function validateContextPaths(repositoryRoot: string, paths: readonly string[], options: { allowMissing?: boolean } = {}): ContextPathCheck {
   const result: string[] = [];
+  const newPaths: string[] = [];
   const seen = new Set<string>();
   for (const raw of paths) {
     let relative: string;
@@ -75,7 +77,7 @@ export function validateContextPaths(repositoryRoot: string, paths: readonly str
       current = path.join(current, part);
       const stat = fs.lstatSync(current, { throwIfNoEntry: false });
       if (!stat) {
-        if (!options.skipMissing) return { ok: false, reasonCode: 'CONTEXT_PATH_MISSING', path: relative };
+        if (!options.allowMissing) return { ok: false, reasonCode: 'CONTEXT_PATH_MISSING', path: relative };
         missing = true;
         break;
       }
@@ -84,10 +86,12 @@ export function validateContextPaths(repositoryRoot: string, paths: readonly str
     if (missing) {
       // Not created yet: only the name can be judged, and a sensitive one is still refused.
       if (!PolicyService.evaluatePathAccess(absolute, repositoryRoot, false).allowed) return { ok: false, reasonCode: 'CONTEXT_PATH_DENIED', path: relative };
+      result.push(relative);
+      newPaths.push(relative);
       continue;
     }
     if (!PolicyService.evaluateRealPathAccess(absolute, repositoryRoot, false).allowed) return { ok: false, reasonCode: 'CONTEXT_PATH_DENIED', path: relative };
     result.push(relative);
   }
-  return { ok: true, paths: result };
+  return options.allowMissing ? { ok: true, paths: result, newPaths } : { ok: true, paths: result };
 }

@@ -484,7 +484,7 @@ export class ProductManagerService {
         const plan = parsed.data;
         // Task context paths are checked against the repository before anything is proposed (#254).
         for (const planned of plan.tasks) {
-          const check = validateContextPaths(project!.repository_path, planned.context_paths, { skipMissing: true });
+          const check = validateContextPaths(project!.repository_path, planned.context_paths, { allowMissing: true });
           if (!check.ok) { finish('FAILED'); return failed('PLAN_CONTEXT_PATH_INVALID', true, { attemptId, contextReason: check.reasonCode, path: check.path }); }
         }
         proposalPayload = { plan, contractSha256: contractHash };
@@ -580,7 +580,7 @@ export class ProductManagerService {
     this.repo.runInImmediateTransaction(() => {
       for (const planned of plan.tasks) {
         // Re-checked at apply time: the repository may have changed since the proposal.
-        const context = validateContextPaths(project.repository_path, planned.context_paths ?? [], { skipMissing: true });
+        const context = validateContextPaths(project.repository_path, planned.context_paths ?? [], { allowMissing: true });
         if (!context.ok) throw new ManagerApplyError('PLAN_CONTEXT_PATH_INVALID', false);
         const created = this.tasks.createTask({
           projectId: project.id, title: planned.title, description: planned.description || null, priority: planned.priority, risk: planned.risk,
@@ -620,7 +620,7 @@ export class ProductManagerService {
       // Found in the fourth real trial: a tests-only task could not see the code task's changes.
       'Tasks run in parallel from the same base commit and cannot see the changes of other tasks. Make every task self-contained: put a change and its tests in the same task, and prefer fewer, larger tasks over a chain of dependent ones.',
       'Agent Forge runs the project test command itself after each coder run; do not create a task that only runs tests.',
-      'For each task, list in "context_paths" the existing repository files or directories the coder needs (at most 32, relative paths). Files and directories the task will create do not exist yet: list their nearest existing parent directory instead.',
+      'For each task, list in "context_paths" (at most 32, relative paths) every existing file or directory the coder must read or change, and every new file or directory the task will create: the coder can change only listed files and create files only inside listed directories or at listed new paths.',
       `Use exactly: project_id "${project.id}", contract_sha256 "${contractHash}".`,
     ];
   }
