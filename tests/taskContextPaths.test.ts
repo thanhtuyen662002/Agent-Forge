@@ -32,14 +32,14 @@ describe('task context path validation (#254)', () => {
     expect(validateContextPaths(root, [candidate])).toMatchObject({ ok: false, reasonCode });
   });
 
-  it('with skipMissing, drops paths the coder will create but keeps every other rejection', () => {
-    expect(validateContextPaths(root, ['bin', 'src/feature', 'bin/stats.js', 'README.md'], { skipMissing: true }))
-      .toEqual({ ok: true, paths: ['src/feature', 'README.md'] });
-    expect(validateContextPaths(root, ['bin'], { skipMissing: true })).toEqual({ ok: true, paths: [] });
-    expect(validateContextPaths(root, ['bin', '../outside'], { skipMissing: true })).toMatchObject({ ok: false, reasonCode: 'CONTEXT_PATH_INVALID' });
-    expect(validateContextPaths(root, ['bin', '.env'], { skipMissing: true })).toMatchObject({ ok: false, reasonCode: 'CONTEXT_PATH_DENIED' });
-    expect(validateContextPaths(root, ['.env.local'], { skipMissing: true })).toMatchObject({ ok: false, reasonCode: 'CONTEXT_PATH_DENIED' });
-    expect(validateContextPaths(root, ['.git/new-file'], { skipMissing: true })).toMatchObject({ ok: false, reasonCode: 'CONTEXT_PATH_DENIED' });
+  it('with allowMissing, keeps paths the task will create as new paths but keeps every other rejection', () => {
+    expect(validateContextPaths(root, ['bin', 'src/feature', 'bin/stats.js', 'README.md'], { allowMissing: true }))
+      .toEqual({ ok: true, paths: ['bin', 'src/feature', 'bin/stats.js', 'README.md'], newPaths: ['bin', 'bin/stats.js'] });
+    expect(validateContextPaths(root, ['README.md'], { allowMissing: true })).toEqual({ ok: true, paths: ['README.md'], newPaths: [] });
+    expect(validateContextPaths(root, ['bin', '../outside'], { allowMissing: true })).toMatchObject({ ok: false, reasonCode: 'CONTEXT_PATH_INVALID' });
+    expect(validateContextPaths(root, ['bin', '.env'], { allowMissing: true })).toMatchObject({ ok: false, reasonCode: 'CONTEXT_PATH_DENIED' });
+    expect(validateContextPaths(root, ['.env.local'], { allowMissing: true })).toMatchObject({ ok: false, reasonCode: 'CONTEXT_PATH_DENIED' });
+    expect(validateContextPaths(root, ['.git/new-file'], { allowMissing: true })).toMatchObject({ ok: false, reasonCode: 'CONTEXT_PATH_DENIED' });
   });
 
   it('rejects a link, which could leave the repository', () => {

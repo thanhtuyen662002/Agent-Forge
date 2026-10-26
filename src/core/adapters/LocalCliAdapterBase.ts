@@ -78,11 +78,13 @@ interface LocalCliWorkspaceLease {
   readonly markerPath: string;
   readonly entries: ReadonlyArray<LocalCliWorkspaceEntry>;
   /**
-   * Canonical relative paths of explicitly authorized context directories.
-   * Only inside these may a provider create new files; deletions are limited
-   * to authorized entries.
+   * Canonical relative paths of explicitly authorized context directories,
+   * and of authorized paths that do not exist yet (new files or directories
+   * the task creates). Only inside these, or exactly at a new path, may a
+   * provider create files; deletions are limited to authorized entries.
    */
   readonly scopeDirectories: ReadonlyArray<string>;
+  readonly scopeNewPaths: ReadonlyArray<string>;
 }
 
 interface LocalCliWorkspaceMarker {
@@ -283,6 +285,28 @@ function localCliEnsureWorkspaceParent(parentPath: string, workspaceRoot: string
   }
 }
 
+/** Windows codes for a file held open briefly by another process (antivirus, indexer). */
+const LOCAL_CLI_TRANSIENT_RENAME_CODES = new Set(['EPERM', 'EBUSY', 'EACCES']);
+const LOCAL_CLI_RENAME_ATTEMPTS = 8;
+
+/**
+ * Found in trial 7: replacing README.md failed once on Windows while another
+ * process held it. The same rename is retried briefly; anything else, or a
+ * lock that outlasts the retries, still fails the write.
+ */
+function localCliRenameWithRetry(from: string, to: string): void {
+  for (let attempt = 1; ; attempt += 1) {
+    try {
+      fs.renameSync(from, to);
+      return;
+    } catch (error) {
+      const code = (error as NodeJS.ErrnoException | null)?.code;
+      if (process.platform !== 'win32' || !code || !LOCAL_CLI_TRANSIENT_RENAME_CODES.has(code) || attempt >= LOCAL_CLI_RENAME_ATTEMPTS) throw error;
+      Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 25 * attempt);
+    }
+  }
+}
+
 function localCliAtomicWrite(
   filePath: string,
   content: Buffer,
@@ -337,7 +361,7 @@ function localCliAtomicWrite(
     } else if (targetExists) {
       throw new LocalCliWorkspaceError('WORKSPACE_TARGET_EXISTS', `unexpected target already exists: ${relative}`);
     }
-    fs.renameSync(tempPath, filePath);
+    localCliRenameWithRetry(tempPath, filePath);
   } catch (error) {
     try { fs.unlinkSync(tempPath); } catch (cleanupError) { if (!localCliIsMissing(cleanupError)) { /* preserve rename failure */ } }
     if (error instanceof LocalCliWorkspaceError) throw error;
@@ -663,7 +687,7 @@ function localCliPrepareWorkspace(
       localCliAtomicWrite(target, source.buffer, workspaceRoot, entry.sourceMode);
     }
     return { executionId, ownerToken, ownershipDigest, sourceRoot: sourceRealRoot, workspaceRoot, workspaceIdentity, markerPath, entries,
-      scopeDirectories: localCliScopeDirectories(sourceRealRoot, contextFiles) };
+      ...localCliCreationScope(sourceRealRoot, contextFiles) };
   } catch (error) {
     activeLocalCliWorkspaces.delete(executionId);
     let cleanupFailed = false;
@@ -715,20 +739,25 @@ function localCliPrepareWorkspace(
 }
 
 /** Explicit context paths that are real directories inside the source root. */
-function localCliScopeDirectories(sourceRoot: string, contextFiles: string[]): string[] {
-  const scopes: string[] = [];
+function localCliCreationScope(sourceRoot: string, contextFiles: string[]): { scopeDirectories: string[]; scopeNewPaths: string[] } {
+  const scopeDirectories: string[] = [];
+  const scopeNewPaths: string[] = [];
   for (const rawPath of contextFiles) {
     const relative = localCliCanonicalRelative(rawPath);
     const absolute = path.resolve(sourceRoot, relative);
     if (!localCliContained(absolute, sourceRoot, false)) continue;
     try {
       const stat = fs.lstatSync(absolute);
-      if (stat.isDirectory() && !stat.isSymbolicLink() && localCliContained(localCliRealpath(absolute), sourceRoot, false)) scopes.push(relative);
+      if (stat.isDirectory() && !stat.isSymbolicLink() && localCliContained(localCliRealpath(absolute), sourceRoot, false)) scopeDirectories.push(relative);
     } catch (error) {
       if (!localCliIsMissing(error)) throw error;
+      // Authorized but not created yet (trial 7: a new `bin` directory). Every
+      // created file is still policy-checked and written through real parents only.
+      scopeDirectories.push(relative);
+      scopeNewPaths.push(relative);
     }
   }
-  return scopes;
+  return { scopeDirectories, scopeNewPaths };
 }
 
 const localCliFoldPath = (value: string): string => (process.platform === 'win32' || process.platform === 'darwin' ? value.toLocaleLowerCase('en-US') : value);
@@ -814,13 +843,14 @@ function localCliSynchronizeWorkspace(lease: LocalCliWorkspaceLease): void {
   // New files: only inside an explicitly authorized directory, never a policy-denied
   // name, never over an existing source path, and bounded in count and bytes.
   const scopes = lease.scopeDirectories.map((scope) => `${localCliFoldPath(scope)}/`);
+  const newPaths = new Set(lease.scopeNewPaths.map(localCliFoldPath));
   let createdCount = 0;
   let createdBytes = 0;
   for (const rawRelative of localCliScanWorkspaceFiles(lease.workspaceRoot)) {
     const relative = localCliCanonicalRelative(rawRelative);
     const folded = localCliFoldPath(relative);
     if (known.has(folded)) continue;
-    if (!scopes.some((scope) => folded.startsWith(scope))) {
+    if (!newPaths.has(folded) && !scopes.some((scope) => folded.startsWith(scope))) {
       throw new LocalCliWorkspaceError('WORKSPACE_SYNC_OUT_OF_SCOPE', `provider created a file outside its authorized directories: ${relative}`);
     }
     const targetPath = path.resolve(lease.sourceRoot, relative);
@@ -1100,7 +1130,7 @@ export abstract class LocalCliAdapterBase implements ProviderAdapter {
         ? 'Do not modify any file. Emit one valid JSON plan.v1 object (protocol, message_id, project_id, contract_sha256, tasks: [{title, description, acceptance_criteria, constraints, priority, risk, context_paths}]) using the exact identifiers given above. priority and risk are one of LOW, MEDIUM, HIGH, CRITICAL.'
       : request.expectedProtocol === 'manager.v1'
         ? 'Do not modify any file. Emit one valid JSON manager.v1 object (protocol, message_id, project_id, task_id, decision EXECUTE|BLOCK, instructions as an array of strings, expected_task_state, expected_revision) using the exact identifiers given above.'
-        : 'Agent Forge runs the project tests itself after you finish; if you cannot run them in your sandbox, that is not a blocker. When the work is done, end with one valid JSON coder.v1 object as your final message: protocol "coder.v1", message_id (any unique string), project_id and task_id using the exact identifiers given above, status COMPLETED|IN_PROGRESS|BLOCKED|FAILED, and the string arrays completed, remaining, files_claimed_changed, tests_claimed and blockers.');
+        : 'Your workspace holds only the CONTEXT FILES listed above. Do only this task: other tasks of the project handle the rest of its goal. Change only those files, and create new files only inside the listed directories or at listed paths that do not exist yet; any other new or recreated file makes Agent Forge reject the whole run. Agent Forge runs the project tests itself after you finish; if you cannot run them in your sandbox, that is not a blocker. When the work is done, end with one valid JSON coder.v1 object as your final message: protocol "coder.v1", message_id (any unique string), project_id and task_id using the exact identifiers given above, status COMPLETED|IN_PROGRESS|BLOCKED|FAILED, and the string arrays completed, remaining, files_claimed_changed, tests_claimed and blockers.');
 
     return lines.join('\n');
   }

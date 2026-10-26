@@ -1379,7 +1379,7 @@ describe('desktop automation runtime', () => {
       expect(realTasks()).toEqual([]);
     });
 
-    it('applies a plan that names a directory the coder will create, keeping only existing paths (#285)', async () => {
+    it('applies a plan that names a directory the coder will create, keeping it as a new path (#285, #287)', async () => {
       addManager();
       repo.setProjectManagerMode(projectId, 'AUTO');
       managerReply = planReply({ tasks: [{ title: 'Add the stats command', acceptance_criteria: ['done'], context_paths: ['bin', 'bin/stats.js', 'README.md'] }] });
@@ -1388,7 +1388,7 @@ describe('desktop automation runtime', () => {
       expect(repo.getEventsByProject(projectId).some((e) => e.type === 'AUTOMATION_MANAGER_FAILED')).toBe(false);
       const [task] = realTasks();
       expect(task).toBeDefined();
-      expect(repo.getTaskContextPaths(projectId, task.id)).toEqual(['README.md']);
+      expect(repo.getTaskContextPaths(projectId, task.id)).toEqual(['bin', 'bin/stats.js', 'README.md']);
     });
 
     it('does not plan a project that already has tasks', async () => {
@@ -1418,7 +1418,7 @@ describe('desktop automation runtime', () => {
       expect(adapterCalls).toBe(1);
     }, 90_000);
 
-    it('drops a stored context path that no longer exists and falls back to the top-level entries (#285)', async () => {
+    it('keeps a stored path that does not exist as a new path, adding the top-level entries when nothing else exists (#287)', async () => {
       verify(addCodexCoder());
       const task = await approvedTask();
       repo.setTaskContextPaths(projectId, task.id, ['gone']);
@@ -1426,6 +1426,9 @@ describe('desktop automation runtime', () => {
       await service.drain();
 
       expect(adapterCalls).toBe(1);
+      const contextFiles = JSON.parse(repo.getExecutionAuthorizationsByTask(task.id)[0].canonical_payload_json!).contextFiles as string[];
+      expect(contextFiles).toContain('gone');
+      expect(contextFiles).toContain('README.md');
       expect(repo.getEventsByProject(projectId).some((e) => e.type === 'AUTOMATION_EXECUTION_FAILED')).toBe(false);
     }, 90_000);
 

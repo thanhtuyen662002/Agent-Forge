@@ -63,6 +63,9 @@ describe('CLI coder file creation and deletion within its authorized scope (#240
       if (prompt.includes('CREATE_NEW')) write('src/new.ts', 'export const created = true;\\n');
       if (prompt.includes('CREATE_NESTED')) write('src/feature/deep/module.ts', 'export const nested = true;\\n');
       if (prompt.includes('CREATE_OUTSIDE')) write('outside.txt', 'not authorized\\n');
+      if (prompt.includes('CREATE_BIN')) write('bin/stats.js', 'console.log(1);\\n');
+      if (prompt.includes('CREATE_BIN_EXTRA')) write('bin/other.js', 'console.log(2);\\n');
+      if (prompt.includes('RECREATE_README')) write('README.md', '# Rewritten\\n');
       if (prompt.includes('CREATE_SENSITIVE')) write('src/.env.production', 'SECRET=1\\n');
       if (prompt.includes('DELETE_OBSOLETE')) fs.unlinkSync(path.join(cwd, 'src', 'obsolete.ts'));
       if (prompt.includes('CREATE_AGENT_CONFIG')) write('src/.claude/settings.json', '{"hooks":{}}');
@@ -196,6 +199,52 @@ describe('CLI coder file creation and deletion within its authorized scope (#240
     expect(fs.readFileSync(src('obsolete.ts'), 'utf8')).toBe('export const obsolete = 1;\n');
     expect(fs.existsSync(src('new.ts'))).toBe(false);
     expect(fs.existsSync(src('feature'))).toBe(false);
+  });
+
+  it('creates files inside an authorized directory that does not exist yet (#287)', async () => {
+    const result = await run(['CREATE_BIN', 'CREATE_NEW'], ['src', 'bin']);
+
+    expect(result.status).toBe('COMPLETED');
+    expect(fs.readFileSync(path.join(projectRoot, 'bin', 'stats.js'), 'utf8')).toBe('console.log(1);\n');
+    expect(fs.existsSync(src('new.ts'))).toBe(true);
+  });
+
+  it('creates exactly an authorized new file path, and nothing beside it (#287)', async () => {
+    expect((await run(['CREATE_BIN'], ['src', 'bin/stats.js'])).status).toBe('COMPLETED');
+    expect(fs.existsSync(path.join(projectRoot, 'bin', 'stats.js'))).toBe(true);
+    fs.rmSync(path.join(projectRoot, 'bin'), { recursive: true });
+
+    const result = await run(['CREATE_BIN', 'CREATE_BIN_EXTRA'], ['src', 'bin/stats.js']);
+    expect(result.status).toBe('FAILED');
+    expect(result.error).toContain('WORKSPACE_SYNC_OUT_OF_SCOPE');
+    expect(fs.existsSync(path.join(projectRoot, 'bin'))).toBe(false);
+  });
+
+  it('refuses to recreate an existing repository file the provider was not given', async () => {
+    const result = await run(['CREATE_NEW', 'RECREATE_README'], ['src']);
+
+    expect(result.status).toBe('FAILED');
+    expect(result.error).toContain('WORKSPACE_SYNC_OUT_OF_SCOPE');
+    expect(fs.readFileSync(path.join(projectRoot, 'README.md'), 'utf8')).toBe('# Project\n');
+    expect(fs.existsSync(src('new.ts'))).toBe(false);
+  });
+
+  it.runIf(process.platform === 'win32')('retries a replacement briefly held open by another process (#287)', async () => {
+    const originalRename = fs.renameSync.bind(fs);
+    let refusals = 0;
+    vi.spyOn(fs, 'renameSync').mockImplementation(((from: fs.PathLike, to: fs.PathLike) => {
+      if (String(to).endsWith(path.join('src', 'existing.ts')) && refusals < 2) {
+        refusals += 1;
+        throw Object.assign(new Error('operation not permitted'), { code: 'EPERM' });
+      }
+      return originalRename(from, to);
+    }) as typeof fs.renameSync);
+
+    const result = await run(['EDIT_EXISTING']);
+
+    expect(result.status).toBe('COMPLETED');
+    expect(refusals).toBe(2);
+    expect(fs.readFileSync(src('existing.ts'), 'utf8')).toContain('edited');
   });
 
   it('keeps refusing new files when only individual files were authorized', async () => {
