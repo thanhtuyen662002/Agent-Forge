@@ -1432,8 +1432,7 @@ describe('desktop automation runtime', () => {
     it('still stops when a stored context path became a denied one', async () => {
       verify(addCodexCoder());
       const task = await approvedTask();
-      fs.writeFileSync(path.join(repoDir, '.env'), 'SECRET=1
-', 'utf8');
+      fs.writeFileSync(path.join(repoDir, '.env'), 'SECRET=1', 'utf8');
       repo.setTaskContextPaths(projectId, task.id, ['.env']);
       await service.tick();
       await service.drain();
