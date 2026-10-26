@@ -73,7 +73,7 @@ describe('desktop profile inventory through the real provider and DOM', () => {
     expect(context.tasks).toEqual([]);
     expect(container.querySelector('header select')).toBeNull();
     expect(container.querySelector('header')?.textContent).toContain(getTranslation(locale, 'header.noProject'));
-    expect(container.querySelector('header')?.textContent).toContain(`2 ${getTranslation(locale, 'header.agentsConfigured')}`);
+    // The header no longer repeats dashboard metrics; it keeps the project and its actions.
     expect(container.textContent).not.toMatch(/PROJ-CORE|PROJ-DEMO|AUTH-014/);
     expect(container.querySelector('h2')?.textContent).toBe(getTranslation(locale, 'header.noProject'));
     expect(api.getTasks).not.toHaveBeenCalled();
@@ -91,8 +91,7 @@ describe('desktop profile inventory through the real provider and DOM', () => {
     expect(context.tasks[0]).toMatchObject({ id: 'stored-task-P1', state: 'DONE' });
     const selector = container.querySelector<HTMLSelectElement>('header select')!;
     expect(Array.from(selector.options, option => option.value)).toEqual(['P1', 'P2']);
-    expect(container.querySelector('header')?.textContent).toContain(`2 ${getTranslation(locale, 'header.agentsConfigured')}`);
-    expect(container.querySelector('header')?.textContent).toContain('PLANNING');
+    expect(container.querySelector('header')?.textContent).toContain('PLANNING'); // Raw status: no label for PLANNING.
     expect(container.textContent).toContain(getTranslation(locale, 'agentCard.actions.awaitingDispatch'));
     expect(Array.from(container.querySelectorAll('h3'), node => node.textContent)).toContain(getTranslation(locale, 'dashboard.agentsTitle'));
     await act(async () => {
@@ -110,7 +109,7 @@ describe('desktop profile inventory through the real provider and DOM', () => {
       ...defaultAgents[0], id: `agent-${index}`, status,
     })));
     await render('en-US');
-    expect(container.querySelector('header')?.textContent).toContain('5 Configured');
+    expect(context.agents).toHaveLength(5); // Every status counts; the count is shown on the dashboard, not the header.
     expect(context.tasks).toEqual([]);
   });
 });

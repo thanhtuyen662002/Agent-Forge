@@ -117,7 +117,7 @@ describe('native interactive rows and associated names', () => {
     fixture.locale = locale;
     await render(<Header />);
     assertLabels(container);
-    const emergency = button(fixture.translate('emergencyStop.button').toUpperCase());
+    const emergency = button(fixture.translate('emergencyStop.button'));
     expect(emergency.disabled).toBe(false);
     emergency.focus();
     expect(document.activeElement).toBe(emergency);

@@ -5,12 +5,15 @@ interface ProgressIndicatorProps {
   percent: number;
   showDetails?: boolean;
   size?: 'sm' | 'md' | 'lg';
+  /** Compact: the percentage beside the bar, without the project-progress label (task cards). */
+  compact?: boolean;
 }
 
 export const ProgressIndicator: React.FC<ProgressIndicatorProps> = ({
   percent,
   showDetails = false,
   size = 'md',
+  compact = false,
 }) => {
   const { t } = useI18n();
   const heightClass = size === 'sm' ? 'h-1.5' : size === 'lg' ? 'h-3' : 'h-2';
@@ -21,6 +24,23 @@ export const ProgressIndicator: React.FC<ProgressIndicatorProps> = ({
     if (val >= 30) return 'from-blue-500 to-indigo-500';
     return 'from-amber-500 to-cyan-500';
   };
+
+  const bar = (
+    <span className={`block w-full bg-surface-card rounded-full overflow-hidden border border-surface-border ${heightClass}`}>
+      <span
+        className={`block h-full bg-gradient-to-r ${getBarColor(percent)} transition-all duration-500 ease-out`}
+        style={{ width: `${Math.min(100, Math.max(0, percent))}%` }}
+      ></span>
+    </span>
+  );
+  if (compact) {
+    return (
+      <span className="flex items-center gap-2 w-full">
+        {bar}
+        <span className="text-[11px] text-slate-400 tabular-nums shrink-0">{percent}%</span>
+      </span>
+    );
+  }
 
   return (
     <span className="block w-full space-y-1.5">

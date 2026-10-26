@@ -1,51 +1,48 @@
 import React from 'react';
 import { useOrchestrator } from '../context/OrchestratorContext';
 import { useI18n } from '../context/I18nContext';
-import { UIDensityMode } from '../../core/types/domain';
-import { ShieldAlert, Play, Pause, FolderGit2, Activity, Cpu, Languages } from 'lucide-react';
+import { ShieldAlert, Play, Pause, FolderGit2 } from 'lucide-react';
 import { uiActionFailureKey } from '../actionState';
 import { AutomationStatusBadge } from './AutomationStatusBadge';
 
+/**
+ * One calm row: brand, the active project with its status and automation
+ * phase, then only the project's primary action and the emergency stop.
+ * View preferences (language, density) live in the sidebar footer.
+ */
 export const Header: React.FC = () => {
   const {
     activeProject,
     projects,
     setActiveProject,
     setActiveView,
-    densityMode,
-    setDensityMode,
     setIsEmergencyStopOpen,
     transitionProject,
     resumeProject,
-    tasks,
-    agents,
     isElectron,
     pendingActions,
     actionResults,
   } = useOrchestrator();
 
-  const { locale, setLocale, t } = useI18n();
+  const { t } = useI18n();
   const actionPending = pendingActions.includes('projectTransition');
   const actionResult = actionResults.projectTransition;
   const actionNotice = actionPending ? t('actions.pending') : actionResult
     ? actionResult.success ? t('actions.success') : t(uiActionFailureKey(actionResult.code))
     : null;
 
-  const doneTasks = tasks.filter((t) => t.state === 'DONE').length;
-  const configuredAgents = agents.length;
-
   const getStatusColor = (status?: string) => {
     switch (status) {
       case 'RUNNING':
-        return 'bg-emerald-500/20 text-emerald-400 border-emerald-500/30';
+        return 'bg-emerald-500/15 text-emerald-300 border-emerald-500/30';
       case 'PAUSED':
-        return 'bg-amber-500/20 text-amber-400 border-amber-500/30';
+        return 'bg-amber-500/15 text-amber-300 border-amber-500/30';
       case 'BLOCKED':
-        return 'bg-rose-500/20 text-rose-400 border-rose-500/30';
+        return 'bg-rose-500/15 text-rose-300 border-rose-500/30';
       case 'COMPLETED':
-        return 'bg-cyan-500/20 text-cyan-400 border-cyan-500/30';
+        return 'bg-cyan-500/15 text-cyan-300 border-cyan-500/30';
       default:
-        return 'bg-slate-700/50 text-slate-300 border-slate-600';
+        return 'bg-slate-700/40 text-slate-300 border-slate-600';
     }
   };
 
@@ -66,135 +63,87 @@ export const Header: React.FC = () => {
     }
   };
 
-  const getModeLabel = (mode: UIDensityMode) => {
-    switch (mode) {
-      case 'OWNER':
-        return t('header.modeOwner');
-      case 'ENGINEER':
-        return t('header.modeEngineer');
-      case 'DEBUG':
-        return t('header.modeDebug');
-      default:
-        return mode;
-    }
-  };
+  const primaryButton = 'h-8 px-3 text-xs font-semibold rounded-md flex items-center gap-1.5 transition whitespace-nowrap disabled:opacity-50';
 
   return (
-    <header className="h-16 bg-surface border-b border-surface-border px-6 flex items-center justify-between shrink-0 z-30">
-      {/* Left: Brand & Project Selector */}
-      <div className="flex items-center space-x-6">
-        <div className="flex items-center space-x-3">
-          <div className="w-8 h-8 rounded-lg bg-gradient-to-br from-forge-cyan to-forge-blue flex items-center justify-center shadow-lg shadow-cyan-900/30">
-            <span className="font-mono font-bold text-white text-sm">AF</span>
-          </div>
-          <div>
-            <h1 className="text-sm font-semibold text-white tracking-wide uppercase font-mono">{t('app.title')}</h1>
-            <span className="text-xs text-slate-400 block -mt-0.5">{t(isElectron ? 'app.modeDesktop' : 'actions.previewReadOnly')}</span>
-          </div>
+    <header className="h-14 bg-surface border-b border-surface-border px-4 flex items-center gap-4 shrink-0 z-30">
+      {/* Brand */}
+      <div className="flex items-center gap-2.5 shrink-0">
+        <div className="w-7 h-7 rounded-md bg-gradient-to-br from-forge-cyan to-forge-blue flex items-center justify-center">
+          <span className="font-mono font-bold text-white text-xs">AF</span>
         </div>
+        <span className="text-sm font-semibold text-white whitespace-nowrap">Agent Forge</span>
+        {!isElectron && (
+          <span className="text-[10px] px-1.5 py-0.5 rounded border border-surface-border text-slate-400 whitespace-nowrap">{t('actions.previewReadOnly')}</span>
+        )}
+      </div>
 
-        {/* Project Selector */}
-        <div className="flex items-center space-x-2 pl-4 border-l border-surface-border">
-          <FolderGit2 className="w-4 h-4 text-slate-400" />
-          {projects.length > 0 ? (
-            <>
-              <select
-                aria-label={t('header.projectSelectorLabel')}
-                value={activeProject?.id || ''}
-                disabled={pendingActions.length > 0}
-                onChange={(e) => {
-                  const selected = projects.find((p) => p.id === e.target.value);
-                  setActiveProject(selected || null);
-                }}
-                className="bg-surface-card border border-surface-border text-sm text-slate-200 rounded-md px-2.5 py-1.5 focus:outline-none focus:border-forge-cyan"
-              >
-                {projects.map((p) => (
-                  <option key={p.id} value={p.id}>
-                    {p.name} ({p.id})
-                  </option>
-                ))}
-              </select>
-
-              {activeProject && (
-                <div className={`px-2.5 py-1 rounded-full text-xs font-mono font-medium border flex items-center space-x-1.5 ${getStatusColor(activeProject.status)}`}>
-                  <span className="w-1.5 h-1.5 rounded-full bg-current animate-pulse"></span>
-                  <span>{getStatusLabel(activeProject.status)}</span>
-                </div>
-              )}
-              {activeProject && <AutomationStatusBadge projectId={activeProject.id} />}
-            </>
-          ) : (
-            <button
-              onClick={() => setActiveView('projects')}
-              className="text-xs font-mono text-slate-400 hover:text-forge-cyan transition flex items-center space-x-1.5 bg-surface-card border border-surface-border rounded-md px-2.5 py-1.5"
-              title={t('header.noProject')}
+      {/* Active project */}
+      <div className="flex items-center gap-2 min-w-0 flex-1 pl-4 border-l border-surface-border">
+        <FolderGit2 className="w-4 h-4 text-slate-500 shrink-0" aria-hidden="true" />
+        {projects.length > 0 ? (
+          <>
+            <select
+              aria-label={t('header.projectSelectorLabel')}
+              title={activeProject ? `${activeProject.name} (${activeProject.id})` : undefined}
+              value={activeProject?.id || ''}
+              disabled={pendingActions.length > 0}
+              onChange={(e) => {
+                const selected = projects.find((p) => p.id === e.target.value);
+                setActiveProject(selected || null);
+              }}
+              className="h-8 max-w-[16rem] min-w-0 truncate bg-surface-card border border-surface-border text-sm text-slate-100 rounded-md px-2 focus:outline-none focus:border-forge-cyan"
             >
-              <span>{t('header.noProject')}</span>
-            </button>
-          )}
-        </div>
-      </div>
+              {projects.map((p) => (
+                <option key={p.id} value={p.id}>
+                  {p.name}
+                </option>
+              ))}
+            </select>
 
-      {/* Middle: Quick Metrics */}
-      <div className="hidden lg:flex items-center space-x-8 text-xs font-mono text-slate-400">
-        <div className="flex items-center space-x-2">
-          <Activity className="w-4 h-4 text-forge-cyan" />
-          <span>
-            {t('nav.taskBoard')}: <strong className="text-slate-100">{doneTasks}/{tasks.length}</strong> {t('header.tasksDone')}
-          </span>
-        </div>
-        <div className="flex items-center space-x-2">
-          <Cpu className="w-4 h-4 text-forge-emerald" />
-          <span>
-            {t('nav.agentCenter')}: <strong className="text-slate-100">{configuredAgents}</strong> {t('header.agentsConfigured')}
-          </span>
-        </div>
-      </div>
-
-      {/* Right: UI Density Mode, Language Selector & Controls */}
-      <div className="flex items-center space-x-3">
-        {actionNotice && <span role={actionResult && !actionResult.success && !actionPending ? 'alert' : 'status'} className="max-w-48 text-[10px] leading-tight text-slate-200">{actionNotice}</span>}
-        {/* Language Selector */}
-        <div className="flex items-center bg-surface-card border border-surface-border rounded-lg p-1 text-xs font-mono">
+            {activeProject && (
+              <span className={`h-6 px-2 rounded-full text-[11px] font-medium border flex items-center gap-1.5 shrink-0 whitespace-nowrap ${getStatusColor(activeProject.status)}`}>
+                <span className={`w-1.5 h-1.5 rounded-full bg-current ${activeProject.status === 'RUNNING' ? 'animate-pulse' : ''}`}></span>
+                {getStatusLabel(activeProject.status)}
+              </span>
+            )}
+            {activeProject && (
+              <div className="min-w-0 hidden md:block">
+                <AutomationStatusBadge projectId={activeProject.id} />
+              </div>
+            )}
+          </>
+        ) : (
           <button
-            onClick={() => setLocale(locale === 'vi-VN' ? 'en-US' : 'vi-VN')}
-            aria-label={t('language.selectorLabel')}
-            title={t('language.selectorLabel')}
-            className="px-2 py-1 rounded flex items-center space-x-1.5 text-slate-300 hover:text-white transition"
+            onClick={() => setActiveView('projects')}
+            className="h-8 text-xs text-slate-300 hover:text-forge-cyan transition bg-surface-card border border-surface-border rounded-md px-2.5"
           >
-            <Languages className="w-3.5 h-3.5 text-forge-cyan" />
-            <span className="font-semibold">{locale === 'vi-VN' ? '🇻🇳 VI' : '🇺🇸 EN'}</span>
+            {t('header.noProject')}
           </button>
-        </div>
+        )}
+      </div>
 
-        {/* Density Mode Switch */}
-        <div className="bg-surface-card p-1 rounded-lg border border-surface-border flex items-center text-xs font-mono">
-          {(['OWNER', 'ENGINEER', 'DEBUG'] as UIDensityMode[]).map((mode) => (
-            <button
-              key={mode}
-              aria-pressed={densityMode === mode}
-              onClick={() => setDensityMode(mode)}
-              className={`px-2.5 py-1 rounded transition-all ${
-                densityMode === mode
-                  ? 'bg-forge-cyan/20 text-forge-cyan font-semibold shadow-sm'
-                  : 'text-slate-400 hover:text-slate-200'
-              }`}
-            >
-              {getModeLabel(mode)}
-            </button>
-          ))}
-        </div>
+      {/* Actions */}
+      <div className="flex items-center gap-2 shrink-0">
+        {actionNotice && (
+          <span
+            role={actionResult && !actionResult.success && !actionPending ? 'alert' : 'status'}
+            title={actionNotice}
+            className="max-w-[14rem] truncate text-xs text-slate-300 whitespace-nowrap"
+          >
+            {actionNotice}
+          </span>
+        )}
 
-        {/* Project Run/Pause Button */}
         {activeProject?.status === 'READY' && (
           <button
             onClick={() => transitionProject('START_PROJECT')}
             disabled={!isElectron || actionPending}
             aria-busy={actionPending}
             title={!isElectron ? t('actions.desktopRequired') : undefined}
-            className="px-3 py-1.5 bg-forge-emerald hover:bg-emerald-600 text-slate-950 font-semibold text-xs rounded-md flex items-center space-x-1.5 shadow-md shadow-emerald-950/40 transition"
+            className={`${primaryButton} bg-forge-emerald hover:bg-emerald-500 text-slate-950`}
           >
-            <Play className="w-3.5 h-3.5 fill-current" />
+            <Play className="w-3.5 h-3.5 fill-current" aria-hidden="true" />
             <span>{actionPending ? t('actions.pending') : t('header.startProject')}</span>
           </button>
         )}
@@ -205,9 +154,9 @@ export const Header: React.FC = () => {
             disabled={!isElectron || actionPending}
             aria-busy={actionPending}
             title={!isElectron ? t('actions.desktopRequired') : undefined}
-            className="px-3 py-1.5 bg-amber-500/20 border border-amber-500/40 hover:bg-amber-500/30 text-amber-300 font-semibold text-xs rounded-md flex items-center space-x-1.5 transition"
+            className={`${primaryButton} border border-amber-500/40 bg-amber-500/10 hover:bg-amber-500/20 text-amber-200`}
           >
-            <Pause className="w-3.5 h-3.5" />
+            <Pause className="w-3.5 h-3.5" aria-hidden="true" />
             <span>{actionPending ? t('actions.pending') : t('header.pause')}</span>
           </button>
         )}
@@ -218,22 +167,21 @@ export const Header: React.FC = () => {
             disabled={!isElectron || actionPending}
             aria-busy={actionPending}
             title={!isElectron ? t('actions.desktopRequired') : undefined}
-            className="px-3 py-1.5 bg-emerald-500/20 border border-emerald-500/40 hover:bg-emerald-500/30 text-emerald-300 font-semibold text-xs rounded-md flex items-center space-x-1.5 transition"
+            className={`${primaryButton} border border-emerald-500/40 bg-emerald-500/10 hover:bg-emerald-500/20 text-emerald-200`}
           >
-            <Play className="w-3.5 h-3.5 fill-current" />
+            <Play className="w-3.5 h-3.5 fill-current" aria-hidden="true" />
             <span>{actionPending ? t('actions.pending') : t('header.resume')}</span>
           </button>
         )}
 
-        {/* Emergency Stop Button */}
         <button
           onClick={() => setIsEmergencyStopOpen(true)}
           disabled={!isElectron}
           title={!isElectron ? t('actions.desktopRequired') : undefined}
-          className="px-3.5 py-1.5 bg-rose-600 hover:bg-rose-700 text-white font-mono font-bold text-xs rounded-md flex items-center space-x-2 shadow-lg shadow-rose-950/60 glow-rose transition"
+          className={`${primaryButton} bg-rose-600 hover:bg-rose-700 text-white`}
         >
-          <ShieldAlert className="w-4 h-4" />
-          <span>{t('emergencyStop.button').toUpperCase()}</span>
+          <ShieldAlert className="w-4 h-4" aria-hidden="true" />
+          <span>{t('emergencyStop.button')}</span>
         </button>
       </div>
     </header>
