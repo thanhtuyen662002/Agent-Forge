@@ -282,7 +282,9 @@ describe('R5J5 Quarantined Submission Adjudication and Verification Suite', () =
         projection_hash,
       };
     }
-  describe('Group 7F: Cancellation & Workspace Snapshots', () => {
+  // The disposition matrices (344, 345, 347) take 20-40 s on hosted Windows runners and
+  // timed out at the 30 s default, failing main CI twice on 2026-10-27 (#316).
+  describe('Group 7F: Cancellation & Workspace Snapshots', { timeout: 120_000 }, () => {
     it('328. Exact valid terminal recovery tuple for VERIFIED is accepted (ALREADY_RECONCILED NO_OP)', async () => {
       const { plaintextToken } = issueSubmissionSessionHelper(fixtures.repo, fixtures.authorizationId);
       const subId = crypto.randomUUID();
