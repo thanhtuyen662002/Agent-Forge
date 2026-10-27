@@ -453,10 +453,12 @@ export class ProductReviewService {
           })),
         });
         const task = this.repo.getTask(taskId)!;
-        const trigger: TaskTrigger | null = verdict.verdict === 'PASS' ? 'PASS_VERDICT'
-          : verdict.verdict === 'FIX_REQUIRED' ? (task.revision_count >= task.max_revisions ? 'MAX_REVISIONS_EXCEEDED' : 'FIX_VERDICT')
-            : null; // BLOCKED: the task stays REVIEWING for the Manager or owner.
-        if (trigger && !this.transition(taskId, trigger)) throw new Error('TASK_TRANSITION_REJECTED');
+        // BLOCKED (the reviewer could not judge, e.g. nothing was changed) goes back to
+        // the coder with the reviewer's notes, like FIX_REQUIRED: left in REVIEWING it
+        // stalled the project (#308). The revision bound still ends in NEEDS_HUMAN.
+        const trigger: TaskTrigger = verdict.verdict === 'PASS' ? 'PASS_VERDICT'
+          : task.revision_count >= task.max_revisions ? 'MAX_REVISIONS_EXCEEDED' : 'FIX_VERDICT';
+        if (!this.transition(taskId, trigger)) throw new Error('TASK_TRANSITION_REJECTED');
         // Review row, task transition and outcome event commit together or not at all.
         recordOutcome(reviewId);
       });

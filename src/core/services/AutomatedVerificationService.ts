@@ -117,6 +117,20 @@ export class AutomatedVerificationService {
     if (!before) return notRun('EVIDENCE_UNAVAILABLE');
     if (!this.transition(task.id, 'SUBMIT_REPORT')) return notRun('TASK_TRANSITION_REJECTED');
 
+    // The coder's own report counts (#308): a coder that says it is blocked or failed
+    // (found in VidFlow M1: "the files of the earlier tasks are missing") is not
+    // verified and reviewed as done; the task goes back for another revision.
+    const report = this.coderReport(auth);
+    if (report && (report.status === 'BLOCKED' || report.status === 'FAILED')) {
+      const reasonCode = `CODER_${report.status}`;
+      this.transition(task.id, 'TESTS_FAILED');
+      this.record(auth, VERIFICATION_FAILED_EVENT, `Automated verification of task ${task.id} did not run: the coder reported ${report.status}.`, {
+        reasonCode, blockers: report.blockers, testRunId: null, worktree,
+        headSha: before.headSha, snapshotSha: before.snapshotSha, changedFiles: before.changedFiles,
+      });
+      return { outcome: 'FAILED', reasonCode, testRunId: null };
+    }
+
     let testRunId: string | null = null;
     let passed = false;
     let reasonCode = 'TESTS_FAILED';
@@ -145,6 +159,25 @@ export class AutomatedVerificationService {
     this.record(auth, VERIFICATION_FAILED_EVENT, `Automated verification failed for task ${task.id}: ${reasonCode}.`,
       { reasonCode, testRunId, worktree, ...evidence });
     return { outcome: 'FAILED', reasonCode, testRunId };
+  }
+
+  /** The coder.v1 report of the run, when the coder gave one; only its status and blockers are read. */
+  private coderReport(auth: ExecutionAuthorization): { status: string; blockers: string[] } | null {
+    const settled = this.repo.getEventsByProject(auth.project_id).find((event) => event.task_id === auth.task_id &&
+      event.type === 'PRODUCT_EXECUTION_COMPLETED' && (event.structured_payload as { authorization_id?: unknown } | null)?.authorization_id === auth.id);
+    const payload = settled?.structured_payload as { result_payload?: { outputProtocol?: unknown } } | null | undefined;
+    const text = payload?.result_payload?.outputProtocol;
+    if (typeof text !== 'string') return null;
+    try {
+      const parsed = JSON.parse(text) as { protocol?: unknown; status?: unknown; blockers?: unknown };
+      if (parsed?.protocol !== 'coder.v1' || typeof parsed.status !== 'string') return null;
+      const blockers = Array.isArray(parsed.blockers)
+        ? parsed.blockers.filter((item): item is string => typeof item === 'string').slice(0, 5).map((item) => item.slice(0, 300))
+        : [];
+      return { status: parsed.status.toUpperCase(), blockers };
+    } catch {
+      return null;
+    }
   }
 
   private transition(taskId: string, trigger: TaskTrigger): boolean {

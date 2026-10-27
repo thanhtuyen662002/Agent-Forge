@@ -467,6 +467,18 @@ Task progress is also refreshed on every automated transition. A task that
 passed tests and review now shows 100%; before, it kept the value from the
 Manager decision (24% in the real trial).
 
+**Coder and reviewer BLOCKED (#308).** Automated verification first reads the
+coder's own `coder.v1` report; only its `status` and `blockers` are used.
+
+- **Coder reports BLOCKED or FAILED.** This happened when files from an earlier
+  task did not exist yet. The test command does not run. The task goes back
+  through `TESTS_FAILED` for the next revision, and `AUTOMATION_VERIFICATION_FAILED`
+  records `CODER_BLOCKED` or `CODER_FAILED` together with the blockers.
+- **Review returns BLOCKED.** A BLOCKED review verdict is handled like
+  FIX_REQUIRED: the task returns to the coder at the next revision with the
+  reviewer's notes. Earlier, it stayed in `REVIEWING` with nothing to pick it up.
+  The revision bound still ends in `NEEDS_HUMAN`.
+
 **Truthful progress and coder failover (#302).** Automated tasks also refresh
 their progress whenever a coder run of the current revision starts, settles or
 fails. The stages are:

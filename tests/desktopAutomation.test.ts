@@ -59,6 +59,8 @@ describe('desktop automation runtime', () => {
   let failingAccounts = new Set<string>();
   /** When set, coder runs wait for it, so concurrent runs can be counted. */
   let coderGate: Promise<void> | null = null;
+  /** The coder.v1 report the synthetic coder returns, when set. */
+  let coderOutput: string | null = null;
   let activeCoders = 0;
   let maxActiveCoders = 0;
   const synthetic = (id: string, capabilities: Array<'CODING' | 'REVIEW' | 'PLANNING'> = ['CODING', 'REVIEW', 'PLANNING']): ProviderAdapter => ({
@@ -89,7 +91,7 @@ describe('desktop automation runtime', () => {
       }
       const workspace = request.runtimeBinding?.workspace?.workingDirectory;
       if (coderEdits && workspace) coderEdits(workspace);
-      return { executionId: request.runtimeBinding?.executionId ?? 'x', status: 'COMPLETED', outputProtocol: 'coder.v1', rawResponse: 'Synthetic coder result' };
+      return { executionId: request.runtimeBinding?.executionId ?? 'x', status: 'COMPLETED', outputProtocol: coderOutput ?? 'coder.v1', rawResponse: 'Synthetic coder result' };
     },
     async cancel() {},
   });
@@ -135,6 +137,7 @@ describe('desktop automation runtime', () => {
     coderFailures = 0;
     failingAccounts = new Set();
     coderGate = null;
+    coderOutput = null;
     activeCoders = 0;
     maxActiveCoders = 0;
     healthy = true;
@@ -453,6 +456,24 @@ describe('desktop automation runtime', () => {
       expect(repo.getTask(task.id)!.state).toBe('REVIEW_READY');
     }, 90_000);
 
+    it('does not verify or review a run whose coder reported BLOCKED (#308)', async () => {
+      verify(addCodexCoder());
+      await configureTest(0);
+      const task = await approvedTask();
+      coderOutput = JSON.stringify({ protocol: 'coder.v1', message_id: 'm', project_id: projectId, task_id: task.id, status: 'BLOCKED',
+        completed: [], remaining: ['write the module'], files_claimed_changed: [], tests_claimed: [], blockers: ['src/db.ts from an earlier task is missing'] });
+      service = verifyingService();
+      await service.tick();
+      await service.drain();
+
+      const after = repo.getTask(task.id)!;
+      expect(after.state).toBe('CODING');
+      expect(after.revision_count).toBe(task.revision_count + 1);
+      const failed = repo.getEventsByProject(projectId).find((e) => e.type === 'AUTOMATION_VERIFICATION_FAILED')!;
+      expect(failed.structured_payload).toMatchObject({ reasonCode: 'CODER_BLOCKED', blockers: ['src/db.ts from an earlier task is missing'], testRunId: null });
+      expect(repo.getLatestTestRun(task.id)).toBeFalsy(); // The test command never ran.
+    }, 90_000);
+
     it('sends a failing verification back to the Manager at the next revision, never to review', async () => {
       verify(addCodexCoder());
       await configureTest(1);
@@ -677,13 +698,15 @@ describe('desktop automation runtime', () => {
       expect(reviewRequests).toHaveLength(1);
     }, 120_000);
 
-    it('records a BLOCKED verdict and leaves the task REVIEWING for the Manager or owner', async () => {
+    it('sends a BLOCKED verdict back to the coder at the next revision instead of stalling in REVIEWING (#308)', async () => {
       reviewReply = verdict('BLOCKED');
       const { task } = await runToReview();
 
-      expect(repo.getTask(task.id)!.state).toBe('REVIEWING');
+      const after = repo.getTask(task.id)!;
+      expect(after.state).toBe('CODING');
+      expect(after.revision_count).toBe(task.revision_count + 1);
       expect(repo.getReviewsByTask(task.id)[0].verdict).toBe('BLOCKED');
-      expect(statusOf()).toMatchObject({ phase: 'AWAITING_REVIEW', taskId: task.id, reasonCode: 'REVIEW_BLOCKED' });
+      expect(repo.getEventsByProject(projectId).some((e) => e.type === 'AUTOMATION_REVIEW_BLOCKED')).toBe(true);
     }, 120_000);
 
     it('escalates FIX_REQUIRED at the revision limit to NEEDS_HUMAN', async () => {
