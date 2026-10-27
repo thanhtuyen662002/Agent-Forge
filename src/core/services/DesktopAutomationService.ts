@@ -32,6 +32,13 @@ const SCHEDULABLE_ACCOUNT_HEALTH = new Set(['AVAILABLE', 'LOW_QUOTA']);
 
 /** Marks attempts created by this service so restart cleanup only touches its own work. */
 export const AUTOMATION_ATTEMPT_MARKER = 'desktop-automation';
+/**
+ * A failed coder run is retried for the same task revision (found in the
+ * real trials: one transient failure stopped a task for good), after a
+ * pause and a bounded number of times; settled runs bound it durably.
+ */
+export const MAX_EXECUTIONS_PER_REVISION = 3;
+export const EXECUTION_RETRY_AFTER_MS = 60_000;
 
 export interface DesktopAutomationOptions {
   /** Root under which each project's managed execution worktrees live. */
@@ -88,7 +95,7 @@ export class DesktopAutomationService {
   private handle: unknown = null;
   private ticking = false;
   private readonly inFlight = new Map<string, { kind: InFlightKind; taskId: string; agentId: string; promise: Promise<void> }>();
-  private readonly lastFailure = new Map<string, { taskId: string; revision: number; reasonCode: string }>();
+  private readonly lastFailure = new Map<string, { taskId: string; revision: number; reasonCode: string; at?: number; count?: number }>();
   private readonly verifier: AutomatedVerificationService | null;
   private readonly reviewer: ProductReviewService | null;
   private readonly manager: ProductManagerService | null;
@@ -405,13 +412,23 @@ export class DesktopAutomationService {
 
   /** Not already authorized, in flight, settled or failed for this exact revision. */
   private isDispatchable(task: Task): boolean {
+    const now = Date.parse(this.now());
     const failure = this.lastFailure.get(task.id);
-    if (failure && failure.revision === task.revision_count) return false;
+    if (failure && failure.revision === task.revision_count &&
+        ((failure.count ?? MAX_EXECUTIONS_PER_REVISION) >= MAX_EXECUTIONS_PER_REVISION || now - (failure.at ?? now) < EXECUTION_RETRY_AFTER_MS)) return false;
+    const settled: string[] = [];
     for (const auth of this.repo.getExecutionAuthorizationsByTask(task.id)) {
       if (auth.status === 'AUTHORIZED') return false;
       if (auth.status === 'DISPATCHED' && !auth.settled_at) return false;
-      if (auth.task_revision === task.revision_count && auth.lifecycle_version === 1 && auth.settled_at) return false;
+      if (auth.task_revision === task.revision_count && auth.lifecycle_version === 1 && auth.settled_at) {
+        // A completed run goes on to verification and review; failed runs may be retried.
+        if (auth.settlement_status === 'COMPLETED') return false;
+        settled.push(String(auth.settled_at));
+      }
     }
+    if (settled.length >= MAX_EXECUTIONS_PER_REVISION) return false;
+    const latest = settled.sort().at(-1);
+    if (latest && now - Date.parse(latest) < EXECUTION_RETRY_AFTER_MS) return false;
     return !this.repo.getAgentAssignmentsByTask(task.id).some((a) => a.status === 'ASSIGNED' || a.status === 'RUNNING');
   }
 
@@ -502,7 +519,9 @@ export class DesktopAutomationService {
 
   private async execute(project: Project, task: Task, coder: CoderCandidate): Promise<void> {
     const fail = (reasonCode: string, detail?: string) => {
-      this.lastFailure.set(task.id, { taskId: task.id, revision: task.revision_count, reasonCode });
+      const previous = this.lastFailure.get(task.id);
+      const count = previous?.revision === task.revision_count ? (previous.count ?? 1) + 1 : 1;
+      this.lastFailure.set(task.id, { taskId: task.id, revision: task.revision_count, reasonCode, at: Date.parse(this.now()), count });
       this.eventService.record(project.id, 'AUTOMATION_EXECUTION_FAILED',
         `Automated coder execution for task ${task.id} stopped: ${reasonCode}.`, { reasonCode, detail: detail ?? null }, task.id);
     };
