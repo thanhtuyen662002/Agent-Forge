@@ -81,6 +81,34 @@ describe('native owner verification capability IPC', () => {
     });
   });
 
+  describe('node --test discovery runner (#267)', () => {
+    it('approves node --test and npm test mapping to it, binding the executable but no test file', async () => {
+      native.confirm.mockResolvedValue({ response: 0 });
+      fs.mkdirSync(path.join(root, 'test'));
+      fs.writeFileSync(path.join(root, 'test', 'a.test.js'), 'require("node:test")("a", () => {});');
+      const saved = await save({ TEST: 'node --test' });
+      expect(saved.success).toBe(true);
+      expect(saved.commands[0].args).toEqual(['--test']);
+      const service = new VerificationCapabilityService(repo);
+      // The coder edits and adds tests: the capability stays valid.
+      fs.writeFileSync(path.join(root, 'test', 'a.test.js'), 'require("node:test")("edited", () => {});');
+      fs.writeFileSync(path.join(root, 'test', 'b.test.js'), 'require("node:test")("b", () => {});');
+      expect(() => service.validate(saved.commands[0].capability, 'P', saved.commands[0].executable, saved.commands[0].args, root)).not.toThrow();
+
+      fs.writeFileSync(path.join(root, 'package.json'), JSON.stringify({ scripts: { test: 'node --test test/' } }));
+      const viaNpm = await save({ TEST: 'npm test' });
+      expect(viaNpm.success).toBe(true);
+      expect(viaNpm.commands[0].args).toEqual(['--test', 'test/']);
+    });
+
+    it.each(['node --test ../outside', 'node --test C:/elsewhere', 'node --test --require ./hook.js', 'node --test --import ./hook.mjs',
+      'node --test --test-reporter-destination=out.txt', 'node --test --inspect'])('refuses %s', async (command) => {
+      native.confirm.mockResolvedValue({ response: 0 });
+      expect(await save({ TEST: command })).toMatchObject({ success: false });
+      expect(repo.getVerificationCommandsByProject('P')).toEqual([]);
+    });
+  });
+
   it('requires explicit native confirmation despite a trusted renderer frame', async () => {
     expect(await save({ TEST: 'node --version' })).toEqual({ success: false, error: 'OWNER_APPROVAL_REQUIRED' });
     expect(repo.getVerificationCommandsByProject('P')).toEqual([]);

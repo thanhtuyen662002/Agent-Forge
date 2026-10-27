@@ -820,6 +820,14 @@ export const viVN: TranslationDictionary = {
     noActiveProject: 'Chưa chọn dự án nào. Vui lòng chọn hoặc tạo dự án để cấu hình lệnh xác minh.',
     saveSuccess: 'Đã lưu các lệnh xác minh thành công.',
     saveFailed: 'Lưu lệnh xác minh thất bại.',
+    capabilityErrors: {
+      INVALID_VERIFICATION_CAPABILITY: 'Lệnh này không được phép chạy để kiểm thử. Dùng một lệnh như `node --test`, `npm test` (khi script test là một lệnh node đơn giản) hoặc `node run-tests.js`. Không dùng lệnh shell, `npx`, `node -e` hay cờ nạp mã như `--require`.',
+      CAPABILITY_PATH_ESCAPE: 'Đường dẫn trong lệnh phải nằm trong thư mục dự án (không dùng `..` hoặc đường dẫn tuyệt đối).',
+      OWNER_APPROVAL_REQUIRED: 'Bạn chưa bấm Approve trong hộp thoại xác nhận, nên lệnh chưa được lưu.',
+      CONTENT_HASH_CHANGED: 'Tệp script trong lệnh vừa thay đổi trong lúc duyệt. Hãy lưu lại.',
+      CAPABILITY_APPROVAL_IN_PROGRESS: 'Đang có một yêu cầu duyệt khác cho dự án này. Hãy đợi hộp thoại trước đóng lại.',
+      OTHER: 'Không lưu được lệnh ({code}).',
+    },
   },
   task: {
     title: 'Tiêu đề Nhiệm vụ',

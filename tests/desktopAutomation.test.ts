@@ -353,6 +353,30 @@ describe('desktop automation runtime', () => {
       expect(repo.getEventsByProject(projectId).filter((e) => e.type === 'AUTOMATION_VERIFICATION_PASSED')).toHaveLength(1);
     }, 90_000);
 
+    it('runs `node --test` over the tests the coder added and edited (#267)', async () => {
+      verify(addCodexCoder());
+      fs.mkdirSync(path.join(repoDir, 'test'));
+      fs.writeFileSync(path.join(repoDir, 'test', 'base.test.js'), "require('node:test')('base', () => {});\n", 'utf8');
+      git('add', 'test');
+      git('commit', '-m', 'add base test');
+      repo.createVerificationCommand({
+        id: `vc-${crypto.randomUUID()}`, project_id: projectId, name: 'Node test runner', command_type: 'TEST',
+        ...await approveFixtureCommand(repo, projectId, ['--test']), timeout_ms: 60_000, enabled: true,
+      });
+      // The coder edits the existing test and adds a new one, like a real coding task.
+      coderEdits = (worktree) => {
+        fs.appendFileSync(path.join(worktree, 'test', 'base.test.js'), "require('node:test')('edited', () => {});\n", 'utf8');
+        fs.writeFileSync(path.join(worktree, 'test', 'added.test.js'), "require('node:test')('added', () => {});\n", 'utf8');
+      };
+      const task = await approvedTask();
+      service = verifyingService();
+      await service.tick();
+      await service.drain();
+
+      expect(repo.getEventsByProject(projectId).some((e) => e.type === 'AUTOMATION_VERIFICATION_PASSED')).toBe(true);
+      expect(repo.getTask(task.id)!.state).toBe('REVIEW_READY');
+    }, 90_000);
+
     it('sends a failing verification back to the Manager at the next revision, never to review', async () => {
       verify(addCodexCoder());
       await configureTest(1);
