@@ -104,6 +104,13 @@ function bindFile(candidate: string) {
 
 export type ConfirmVerificationOwner = (proposal: Readonly<VerificationCapabilityPayload>) => Promise<boolean>;
 
+/** Flags of `node --test` that only shape how the discovered tests run (#267). */
+const NODE_TEST_RUNNER_FLAGS = [
+  /^--test$/, /^--test-only$/, /^--test-force-exit$/, /^--experimental-test-coverage$/,
+  /^--test-reporter=(?:spec|dot|tap|junit|lcov)$/, /^--test-concurrency=\d{1,3}$/, /^--test-timeout=\d{1,9}$/,
+  /^--test-name-pattern=.{1,200}$/, /^--test-skip-pattern=.{1,200}$/,
+];
+
 export class VerificationCapabilityService {
   constructor(private readonly repo: Repository, private readonly ownerPrincipal = getVerificationOwnerPrincipal) {}
 
@@ -161,7 +168,22 @@ export class VerificationCapabilityService {
       }
       const scripts: VerificationCapabilityPayload['scripts'] = [];
       const base = path.basename(canonicalExecutable).toLowerCase().replace(/\.exe$/, '');
-      if (/^(node|nodejs|python(?:\d+(?:\.\d+)?)?)$/.test(base)) {
+      if (/^(node|nodejs)$/.test(base) && args.includes('--test')) {
+        // Node's test runner discovers and runs the tests the worktree contains (#267):
+        // the coder's own new and edited tests are what verification must run, so test
+        // paths are confined to the project but never content-bound. Only test-runner
+        // flags are allowed; runtime hooks and inline code are refused above.
+        for (const argument of args) {
+          if (argument.startsWith('-')) {
+            if (!NODE_TEST_RUNNER_FLAGS.some((flag) => flag.test(argument))) throw new VerificationCapabilityError('INVALID_VERIFICATION_CAPABILITY');
+            continue;
+          }
+          const portable = argument.replace(/\\/g, '/');
+          if (path.isAbsolute(argument) || /^[a-zA-Z]:/.test(argument) || portable.split('/').includes('..')) {
+            throw new VerificationCapabilityError('CAPABILITY_PATH_ESCAPE');
+          }
+        }
+      } else if (/^(node|nodejs|python(?:\d+(?:\.\d+)?)?)$/.test(base)) {
         const index = args.findIndex((arg) => !arg.startsWith('-'));
         const indices = /^(node|nodejs)$/.test(base) && args.includes('--test')
           ? args.map((argument, position) => argument.startsWith('-') ? -1 : position).filter((position) => position >= 0)

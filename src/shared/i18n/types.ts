@@ -823,6 +823,14 @@ export interface TranslationDictionary {
     noActiveProject: string;
     saveSuccess: string;
     saveFailed: string;
+    capabilityErrors: {
+      INVALID_VERIFICATION_CAPABILITY: string;
+      CAPABILITY_PATH_ESCAPE: string;
+      OWNER_APPROVAL_REQUIRED: string;
+      CONTENT_HASH_CHANGED: string;
+      CAPABILITY_APPROVAL_IN_PROGRESS: string;
+      OTHER: string;
+    };
   };
   task: {
     title: string;

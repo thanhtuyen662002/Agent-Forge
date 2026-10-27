@@ -354,6 +354,23 @@ worktree changes while the command runs, the result is a failure
 (`WORKTREE_CHANGED_DURING_VERIFICATION`). A run is verified once. Settled work
 left unverified by a restart is picked up on the next pass.
 
+**Which test commands work (#267).** The usual choices are:
+
+- `node --test`, optionally followed by test folders or files and test-runner
+  flags such as `--test-reporter=spec`;
+- `npm test`, when the `test` script is one plain node command, for example
+  `node --test test/`;
+- a fixed runner such as `node run-tests.js`.
+
+With `node --test`, the executable is bound by identity, but the test files are
+not bound by content. The coder is expected to add and edit tests, and
+verification runs exactly the tests the worktree contains. Test paths must stay
+inside the project, and only test-runner flags are accepted (`--require`,
+`--import`, `-e` and other code-loading or inline flags are refused). A
+script named directly, as in `node verify.js`, stays hash-bound, so the coder
+must not edit it. A refused command shows a readable reason in Settings, with
+working alternatives.
+
 If no `TEST` command is approved, the task is not moved, and the header says
 the changes were not tested. Once the owner approves a `TEST` command, the same
 settled work is verified on the next pass. Verified work then goes to automated

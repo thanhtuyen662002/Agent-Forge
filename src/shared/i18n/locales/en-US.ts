@@ -820,6 +820,14 @@ export const enUS: TranslationDictionary = {
     noActiveProject: 'No active project selected. Select or create a project to configure verification commands.',
     saveSuccess: 'Verification commands saved successfully.',
     saveFailed: 'Failed to save verification commands.',
+    capabilityErrors: {
+      INVALID_VERIFICATION_CAPABILITY: 'This command is not allowed as a test command. Use a command such as `node --test`, `npm test` (when the test script is one simple node command) or `node run-tests.js`. Shell commands, `npx`, `node -e` and code-loading flags such as `--require` are refused.',
+      CAPABILITY_PATH_ESCAPE: 'Paths in the command must stay inside the project folder (no `..` or absolute paths).',
+      OWNER_APPROVAL_REQUIRED: 'Approve was not chosen in the confirmation dialog, so the command was not saved.',
+      CONTENT_HASH_CHANGED: 'A script in the command changed during approval. Save again.',
+      CAPABILITY_APPROVAL_IN_PROGRESS: 'Another approval for this project is open. Wait for that dialog to close.',
+      OTHER: 'The command could not be saved ({code}).',
+    },
   },
   task: {
     title: 'Task Title',
