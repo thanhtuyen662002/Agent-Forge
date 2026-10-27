@@ -74,21 +74,40 @@ jobs:
         shell: bash
         run: npm run build && npx @electron/rebuild -f -w better-sqlite3
 
-      - name: Package and publish the pre-release
+      - name: Package the installer and update metadata
         if: steps.fresh.outputs.publish == 'true'
         shell: bash
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: npx electron-builder --win nsis --publish always -c.publish.releaseType=prerelease
+        run: npx electron-builder --win nsis --publish never
 
-      - name: Name the release and record its source
+      # electron-builder's own publishing uploads artifacts concurrently and each
+      # upload races to create the release (#300). The release is created once,
+      # with every asset, under the exact names latest.yml references.
+      - name: Verify the update assets
+        if: steps.fresh.outputs.publish == 'true'
+        id: assets
+        shell: bash
+        run: |
+          cd release
+          test -f latest.yml
+          grep -qx "version: $DEV_VERSION" latest.yml
+          asset="$(sed -n 's/^path: //p' latest.yml | tr -d '\r')"
+          case "$asset" in ''|*/*|*\\*) echo "unexpected latest.yml path: $asset"; exit 1;; esac
+          built="AgentForge Setup $DEV_VERSION.exe"
+          test -f "$built" && test -f "$built.blockmap"
+          if [ "$built" != "$asset" ]; then cp "$built" "$asset"; cp "$built.blockmap" "$asset.blockmap"; fi
+          echo "asset=$asset" >> "$GITHUB_OUTPUT"
+
+      - name: Publish the pre-release with all assets at once
         if: steps.fresh.outputs.publish == 'true'
         shell: bash
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          ASSET: ${{ steps.assets.outputs.asset }}
         run: |
           notes="$(git log -1 --format='%s' "$TESTED_SHA")"
-          gh release edit "v$DEV_VERSION" --repo "$GITHUB_REPOSITORY" --prerelease \
+          cd release
+          gh release create "v$DEV_VERSION" "$ASSET" "$ASSET.blockmap" latest.yml \
+            --repo "$GITHUB_REPOSITORY" --prerelease --target "$TESTED_SHA" \
             --title "AgentForge $DEV_VERSION (dev channel, unsigned)" \
             --notes "$notes
 
