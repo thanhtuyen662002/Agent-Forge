@@ -265,7 +265,11 @@ account) gives the coder its authority, so tasks run without pasted JSON
 - a task is `PLANNED` and has no Manager decision yet, or
 - a task is `CODING` at a revision that no Manager decision authorizes. This
   happens after automated tests failed or the reviewer asked for fixes, and the
-  prompt then includes the review issues and the failed result.
+  prompt then includes the review issues and the failed result. Since #312 it
+  also includes what failed, not only the counts: the redacted test output,
+  starting at the runner's failure summary, with ANSI codes stripped, bounded
+  and marked as untrusted data. It also includes the blockers the coder
+  reported and the notes of a BLOCKED review.
 
 The call uses role-aware routing, a lease and a heartbeat. It runs read-only:
 no repository context is copied, and the CLI runs with `--sandbox read-only`.
