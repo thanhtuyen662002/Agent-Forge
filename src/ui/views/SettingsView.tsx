@@ -25,6 +25,16 @@ import { CommandParser } from '../../core/services/CommandParser';
 import { DEFAULT_MAX_REVISIONS, parseMaxRevisions } from '../../shared/revisionPolicy';
 import { ExternalAiConnectionPanel } from '../components/ExternalAiConnectionPanel';
 
+const CAPABILITY_ERRORS = new Set(['INVALID_VERIFICATION_CAPABILITY', 'CAPABILITY_PATH_ESCAPE', 'OWNER_APPROVAL_REQUIRED',
+  'CONTENT_HASH_CHANGED', 'CAPABILITY_APPROVAL_IN_PROGRESS']);
+
+/** An owner-readable reason, with a working alternative, instead of a bare capability code (#267). */
+export function capabilityErrorText(code: unknown, t: (key: string, params?: Record<string, string | number>) => string): string | null {
+  if (typeof code !== 'string' || !code) return null;
+  if (CAPABILITY_ERRORS.has(code)) return t(`settings.capabilityErrors.${code}`);
+  return /^[A-Z_]{1,64}$/.test(code) ? t('settings.capabilityErrors.OTHER', { code }) : code;
+}
+
 export const SettingsView: React.FC = () => {
   const { locale, setLocale, t } = useI18n();
   const { activeProject } = useOrchestrator();
@@ -328,7 +338,7 @@ export const SettingsView: React.FC = () => {
       }
 
       if (!commandRes?.success || !Array.isArray(commandRes.commands)) {
-        setSaveError(commandRes?.error || t('settings.saveFailed'));
+        setSaveError(capabilityErrorText(commandRes?.error, t) ?? t('settings.saveFailed'));
         return;
       }
 
