@@ -1,0 +1,96 @@
+name: Dev Channel Release
+
+# Owner request on 2026-10-27 (#298): every green main build is published as an
+# unsigned dev-channel GitHub pre-release, so installed apps can update
+# themselves. Production (stable) releases stay owner-controlled
+# (release-windows.yml). See docs/RELEASES.md.
+on:
+  workflow_run:
+    workflows: ['AgentForge CI']
+    types: [completed]
+    branches: [main]
+
+concurrency:
+  group: agentforge-dev-channel
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  publish:
+    name: Publish dev-channel pre-release
+    # Only a successful push CI of main in this repository, never a pull request or fork.
+    if: >-
+      github.event.workflow_run.conclusion == 'success' &&
+      github.event.workflow_run.event == 'push' &&
+      github.event.workflow_run.head_branch == 'main' &&
+      github.event.workflow_run.head_repository.full_name == github.repository
+    runs-on: windows-latest
+    permissions:
+      contents: write
+    env:
+      TESTED_SHA: ${{ github.event.workflow_run.head_sha }}
+      DEV_VERSION: 0.1.${{ github.run_number }}
+    steps:
+      - name: Checkout the exact tested commit
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.workflow_run.head_sha }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Publish only the current main head
+        id: fresh
+        shell: bash
+        run: |
+          git fetch --no-tags origin main
+          test "$(git rev-parse HEAD)" = "$TESTED_SHA"
+          if [ "$(git rev-parse origin/main)" = "$TESTED_SHA" ]; then
+            echo "publish=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "main moved past $TESTED_SHA; the newer commit's CI publishes instead."
+            echo "publish=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Setup Node.js 22.x
+        if: steps.fresh.outputs.publish == 'true'
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: '22.x'
+          cache: 'npm'
+
+      - name: Install dependencies
+        if: steps.fresh.outputs.publish == 'true'
+        run: npm ci
+
+      - name: Stamp the dev-channel version (CI only, never committed)
+        if: steps.fresh.outputs.publish == 'true'
+        shell: bash
+        run: npm version "$DEV_VERSION" --no-git-tag-version
+
+      - name: Build
+        if: steps.fresh.outputs.publish == 'true'
+        shell: bash
+        run: npm run build && npx @electron/rebuild -f -w better-sqlite3
+
+      - name: Package and publish the pre-release
+        if: steps.fresh.outputs.publish == 'true'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: npx electron-builder --win nsis --publish always -c.publish.releaseType=prerelease
+
+      - name: Name the release and record its source
+        if: steps.fresh.outputs.publish == 'true'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          notes="$(git log -1 --format='%s' "$TESTED_SHA")"
+          gh release edit "v$DEV_VERSION" --repo "$GITHUB_REPOSITORY" --prerelease \
+            --title "AgentForge $DEV_VERSION (dev channel, unsigned)" \
+            --notes "$notes
+
+          Source: $TESTED_SHA
+          Built from green main CI. Unsigned dev-channel build; installed apps update to it from Settings or the header."

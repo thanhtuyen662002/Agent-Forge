@@ -4,6 +4,7 @@ import { useI18n } from '../context/I18nContext';
 import { ShieldAlert, Play, Pause, FolderGit2 } from 'lucide-react';
 import { uiActionFailureKey } from '../actionState';
 import { AutomationStatusBadge } from './AutomationStatusBadge';
+import { UpdateNotice } from './UpdateNotice';
 
 /**
  * One calm row: brand, the active project with its status and automation
@@ -125,6 +126,7 @@ export const Header: React.FC = () => {
 
       {/* Actions */}
       <div className="flex items-center gap-2 shrink-0">
+        <UpdateNotice />
         {actionNotice && (
           <span
             role={actionResult && !actionResult.success && !actionPending ? 'alert' : 'status'}

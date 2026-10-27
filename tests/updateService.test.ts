@@ -246,7 +246,7 @@ describe('UpdateService & Installed-App Update Domain (PR #9)', () => {
 
   it('21. active unsafe workflow prevents unexpected restart and install', () => {
     const mockRepo: any = {
-      getAllProjects: () => [{ id: 'proj-1', name: 'Active Project' }],
+      getAllProjects: () => [{ id: 'proj-1', name: 'Active Project', status: 'RUNNING' }],
       getTasksByProject: () => [
         { id: 'tsk-1', title: 'Critical Coding Task', state: 'CODING' },
       ],
@@ -263,6 +263,23 @@ describe('UpdateService & Installed-App Update Domain (PR #9)', () => {
     }).toThrow(/UPDATE_RESTART_BLOCKED: Task "Critical Coding Task"/);
 
     expect(mockAdapter.quitAndInstallMock).not.toHaveBeenCalled();
+  });
+
+  it('21b. a paused or trashed project with a task left in CODING does not block updates, an in-flight coder run does (#298)', () => {
+    const stuck = { id: 'tsk-1', title: 'Old stuck task', state: 'CODING' };
+    let inFlight = false;
+    const mockRepo: any = {
+      getAllProjects: () => [{ id: 'paused', status: 'PAUSED' }, { id: 'trashed', status: 'RUNNING' }],
+      isProjectTrashed: (id: string) => id === 'trashed',
+      getTasksByProject: () => [stuck],
+      getExecutionAuthorizationsByTask: () => (inFlight ? [{ status: 'DISPATCHED', settled_at: null }] : [{ status: 'DISPATCHED', settled_at: 'x' }]),
+    };
+    updateService.setRepository(mockRepo);
+    mockAdapter.emit('update-available', { version: '0.2.0' });
+    mockAdapter.emit('update-downloaded', { version: '0.2.0' });
+    expect(updateService.getState().canInstall).toBe(true);
+    inFlight = true;
+    expect(updateService.getState().canInstall).toBe(false);
   });
 
   it('22. safe idle state permits explicit install request', () => {

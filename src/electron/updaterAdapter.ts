@@ -14,6 +14,8 @@ export class ElectronUpdaterAdapter extends EventEmitter implements IUpdateAdapt
     // Invariants: Never auto-download or auto-install without explicit Owner action
     autoUpdater.autoDownload = false;
     autoUpdater.autoInstallOnAppQuit = false;
+    // Builds from green main are published as dev-channel pre-releases (#298).
+    autoUpdater.allowPrerelease = true;
 
     // Attach native electron-updater event listeners
     autoUpdater.on('checking-for-update', () => {
