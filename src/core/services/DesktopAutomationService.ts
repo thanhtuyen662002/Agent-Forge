@@ -96,6 +96,7 @@ export class DesktopAutomationService {
   private ticking = false;
   private readonly inFlight = new Map<string, { kind: InFlightKind; taskId: string; agentId: string; promise: Promise<void> }>();
   private readonly lastFailure = new Map<string, { taskId: string; revision: number; reasonCode: string; at?: number; count?: number }>();
+  private readonly progressSignatures = new Map<string, string>();
   private readonly verifier: AutomatedVerificationService | null;
   private readonly reviewer: ProductReviewService | null;
   private readonly manager: ProductManagerService | null;
@@ -207,6 +208,7 @@ export class DesktopAutomationService {
       if (this.reviewer || this.manager) await this.refreshCapabilities();
       for (const project of this.runnableProjects()) {
         if (this.inFlight.size >= this.maxConcurrent) break;
+        this.refreshRunProgress(project);
         if (this.inFlight.has(project.id)) continue;
         // Settled work that was never verified (e.g. interrupted by a restart) comes first.
         const pending = this.pendingVerification(project);
@@ -259,7 +261,7 @@ export class DesktopAutomationService {
         }
         const task = this.nextEligibleTask(project);
         if (!task) continue;
-        const coder = this.findAgent('CODER');
+        const coder = this.findCoderFor(task);
         if (!coder) continue;
         // execute() reports its own failures; this catch only keeps an unexpected
         // throw from becoming an unhandled rejection in the main process.
@@ -326,7 +328,7 @@ export class DesktopAutomationService {
       if (sentBack) return status('WAITING_FOR_MANAGER', sentBack.id, 'REVIEW_FIX_REQUIRED');
       return status('WAITING_FOR_MANAGER', waiting?.taskId ?? null, waiting?.reasonCode ?? null);
     }
-    if (this.findAgent('CODER')) return status('QUEUED', eligible.id, this.isActive() ? null : 'AUTOMATION_STOPPED');
+    if (this.findCoderFor(eligible)) return status('QUEUED', eligible.id, this.isActive() ? null : 'AUTOMATION_STOPPED');
     if (this.hasUnverifiedCliCoder()) return status('WAITING_FOR_CAPACITY', eligible.id, 'ACCOUNT_NOT_VERIFIED');
     return this.hasManualCoder() ? status('MANUAL_RELAY_REQUIRED', eligible.id) : status('WAITING_FOR_CAPACITY', eligible.id, 'NO_CLI_CODER');
   }
@@ -426,10 +428,48 @@ export class DesktopAutomationService {
         settled.push(String(auth.settled_at));
       }
     }
-    if (settled.length >= MAX_EXECUTIONS_PER_REVISION) return false;
+    // Each coder account has its own bound (findCoderFor); this caps the revision overall.
+    if (settled.length >= MAX_EXECUTIONS_PER_REVISION * 3) return false;
     const latest = settled.sort().at(-1);
     if (latest && now - Date.parse(latest) < EXECUTION_RETRY_AFTER_MS) return false;
     return !this.repo.getAgentAssignmentsByTask(task.id).some((a) => a.status === 'ASSIGNED' || a.status === 'RUNNING');
+  }
+
+  /** Failed settled runs of the task's current revision, per coder account (#302). */
+  private failedRunsByAccount(task: Task): Map<string, number> {
+    const failures = new Map<string, number>();
+    for (const auth of this.repo.getExecutionAuthorizationsByTask(task.id)) {
+      if (auth.task_revision !== task.revision_count || auth.lifecycle_version !== 1 || !auth.settled_at ||
+          auth.settlement_status === 'COMPLETED' || !auth.selected_account_id) continue;
+      failures.set(auth.selected_account_id, (failures.get(auth.selected_account_id) ?? 0) + 1);
+    }
+    return failures;
+  }
+
+  /**
+   * The coder for a revision (#302): first one whose account has not failed it,
+   * then one under the per-account bound. One broken account (found with an
+   * Antigravity account Google asked to verify) never uses up the attempts of
+   * the other coders, and agents are no longer tried in display-name order only.
+   */
+  private findCoderFor(task: Task): CoderCandidate | null {
+    const failures = this.failedRunsByAccount(task);
+    const exhausted = new Set([...failures].filter(([, count]) => count >= MAX_EXECUTIONS_PER_REVISION).map(([accountId]) => accountId));
+    return this.findAgent('CODER', new Set(failures.keys())) ?? this.findAgent('CODER', exhausted);
+  }
+
+  /** Progress follows coder runs as they start, settle or fail, not only task transitions (#302). */
+  private refreshRunProgress(project: Project): void {
+    const tasks = this.options.taskService;
+    if (!tasks) return;
+    for (const task of this.repo.getTasksByProject(project.id)) {
+      if (task.state !== 'CODING' || this.repo.isTaskTrashed(task.id)) continue;
+      const signature = `${task.revision_count}:${this.repo.getExecutionAuthorizationsByTask(task.id)
+        .map((auth) => `${auth.id}/${auth.status}/${auth.settlement_status ?? ''}`).join(',')}`;
+      if (this.progressSignatures.get(task.id) === signature) continue;
+      this.progressSignatures.set(task.id, signature);
+      try { tasks.refreshProgress(task.id); } catch { /* next pass */ }
+    }
   }
 
   private settledForRevision(task: Task): 'COMPLETED' | 'FAILED' | null {
@@ -491,7 +531,8 @@ export class DesktopAutomationService {
    * that has a usable account and idle slot. A reviewer never uses the
    * account of the work it reviews.
    */
-  private findAgent(role: AutomationRole, excludedAccountId: string | null = null): CoderCandidate | null {
+  private findAgent(role: AutomationRole, excludedAccounts: string | ReadonlySet<string> | null = null): CoderCandidate | null {
+    const isExcluded = (accountId: string) => typeof excludedAccounts === 'string' ? accountId === excludedAccounts : excludedAccounts?.has(accountId) ?? false;
     const reserved = new Set([...this.inFlight.values()].map((item) => item.agentId));
     for (const agent of this.repo.getAllAgents()) {
       if (reserved.has(agent.id)) continue;
@@ -499,7 +540,7 @@ export class DesktopAutomationService {
       if (agent.removed_at || !roleMatches || agent.status === 'BUSY' || !agent.provider_resource_id || !agent.agent_profile_id) continue;
       const resource = this.repo.getProviderResource(agent.provider_resource_id);
       if (!resource?.enabled || !resource.provider_account_id) continue;
-      if (resource.provider_account_id === excludedAccountId) continue;
+      if (isExcluded(resource.provider_account_id)) continue;
       const provider = this.repo.getProvider(resource.provider_id);
       if (!provider?.enabled || provider.adapter_type !== 'LOCAL_CLI' || !this.providerRegistry.get(provider.id)) continue;
       const capability = ROLE_CAPABILITY[role];
@@ -518,9 +559,12 @@ export class DesktopAutomationService {
   }
 
   private async execute(project: Project, task: Task, coder: CoderCandidate): Promise<void> {
-    const fail = (reasonCode: string, detail?: string) => {
+    // A settled run is bounded durably per account (findCoderFor); only failures before
+    // any run settled count toward this in-memory bound (#302).
+    const fail = (reasonCode: string, detail?: string, settled = false) => {
       const previous = this.lastFailure.get(task.id);
-      const count = previous?.revision === task.revision_count ? (previous.count ?? 1) + 1 : 1;
+      const prior = previous?.revision === task.revision_count ? (previous.count ?? 1) : 0;
+      const count = settled ? prior : prior + 1;
       this.lastFailure.set(task.id, { taskId: task.id, revision: task.revision_count, reasonCode, at: Date.parse(this.now()), count });
       this.eventService.record(project.id, 'AUTOMATION_EXECUTION_FAILED',
         `Automated coder execution for task ${task.id} stopped: ${reasonCode}.`, { reasonCode, detail: detail ?? null }, task.id);
@@ -668,7 +712,7 @@ export class DesktopAutomationService {
         // AUTHORIZED; release it so the task is not blocked. Claimed work is owned
         // by settlement and recovery.
         releaseUnclaimed();
-        fail(result.status, result.errorCode ? String(result.errorCode) : undefined);
+        fail(result.status, result.errorCode ? String(result.errorCode) : undefined, Boolean(this.repo.getExecutionAuthorization(auth.id)?.settled_at));
         return;
       }
       this.lastFailure.delete(task.id);

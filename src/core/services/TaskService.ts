@@ -277,6 +277,11 @@ export class TaskService {
    * real trial: automated transitions never refreshed it, so a DONE task kept
    * showing 24%).
    */
+  /** Recomputes cached progress from durable evidence; desktop automation calls it as coder runs start and settle (#302). */
+  public refreshProgress(taskId: string): void {
+    this.refreshTaskProgress(taskId);
+  }
+
   private refreshTaskProgress(taskId: string): void {
     const task = this.repo.getTask(taskId);
     if (!task) return;
@@ -286,14 +291,23 @@ export class TaskService {
     const hasLintConfig = this.repo.getVerificationCommandsByProject(task.project_id).some((c) => c.command_type === 'LINT' && c.enabled);
     // The automated path keeps the coder's changes uncommitted in the managed worktree;
     // a passed automated verification of that worktree is the evidence that they exist.
-    const verifiedChanges = this.repo.getEventsByProject(task.project_id)
-      .some((event) => event.task_id === taskId && event.type === 'AUTOMATION_VERIFICATION_PASSED');
+    const taskEvents = this.repo.getEventsByProject(task.project_id).filter((event) => event.task_id === taskId);
+    const verifiedChanges = taskEvents.some((event) => event.type === 'AUTOMATION_VERIFICATION_PASSED');
+    // Automated tasks report what their coder runs actually did (#302).
+    const automated = taskEvents.some((event) => event.type.startsWith('AUTOMATION_'));
+    const runs = this.repo.getExecutionAuthorizationsByTask(taskId)
+      .filter((auth) => auth.task_revision === task.revision_count && auth.lifecycle_version === 1);
+    const coderCompleted = runs.some((auth) => auth.settlement_status === 'COMPLETED');
     const progress = ProgressService.calculateTaskProgress(task, {
       hasGitDiff: Boolean(diffEvidence) || verifiedChanges,
       testsPassed: latestTest?.exit_code === 0,
       hasEvidence: Boolean(diffEvidence || testEvidence),
       excludeUnconfiguredLint: !hasLintConfig,
       lintPassed: false,
+      ...(automated ? {
+        executionStarted: coderCompleted || runs.some((auth) => auth.status === 'DISPATCHED' && !auth.settled_at),
+        coderCompleted,
+      } : {}),
     });
     this.repo.updateTaskProgressCache(taskId, progress.percent);
   }

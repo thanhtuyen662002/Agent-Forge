@@ -55,6 +55,8 @@ describe('desktop automation runtime', () => {
   let healthy: boolean;
   /** The next coder runs that return FAILED (a provider failure). */
   let coderFailures = 0;
+  /** Coder accounts whose runs return FAILED (an account Google asked to verify). */
+  let failingAccounts = new Set<string>();
   const synthetic = (id: string, capabilities: Array<'CODING' | 'REVIEW' | 'PLANNING'> = ['CODING', 'REVIEW', 'PLANNING']): ProviderAdapter => ({
     id,
     name: 'Synthetic CLI coder',
@@ -72,8 +74,8 @@ describe('desktop automation runtime', () => {
         return managerReply(request);
       }
       adapterCalls += 1;
-      if (coderFailures > 0) {
-        coderFailures -= 1;
+      if (coderFailures > 0 || failingAccounts.has(request.runtimeBinding?.accountId ?? '')) {
+        if (coderFailures > 0) coderFailures -= 1;
         return { executionId: request.runtimeBinding?.executionId ?? 'x', status: 'FAILED', error: 'synthetic provider failure', rawResponse: '' };
       }
       const workspace = request.runtimeBinding?.workspace?.workingDirectory;
@@ -122,6 +124,7 @@ describe('desktop automation runtime', () => {
     registry.register(synthetic('prov-codex-cli'));
     adapterCalls = 0;
     coderFailures = 0;
+    failingAccounts = new Set();
     healthy = true;
     reviewRequests = [];
     reviewReply = () => { throw new Error('no review expected'); };
@@ -143,9 +146,9 @@ describe('desktop automation runtime', () => {
     await performSafeCleanup({ dbs: [db], tempDirs: [tempDir] });
   });
 
-  const addCodexCoder = () => {
+  const addCodexCoder = (displayName = 'Codex coder') => {
     const created = new WorkspaceManagementService(repo).createAgent({
-      displayName: 'Codex coder', role: 'CODER', connection: 'CODEX_CLI', modelName: 'gpt-5-codex', workerSlots: 1,
+      displayName, role: 'CODER', connection: 'CODEX_CLI', modelName: 'gpt-5-codex', workerSlots: 1,
     });
     expect(created.success).toBe(true);
     return created;
@@ -272,6 +275,31 @@ describe('desktop automation runtime', () => {
     await service.tick(); await service.drain();
     expect(adapterCalls).toBe(2); // A completed run is never repeated.
   }, 120_000);
+
+  it.runIf(process.platform === 'win32')('retries a failed run on another coder account and shows truthful progress (#302)', async () => {
+    const first = addCodexCoder('A coder');
+    const second = addCodexCoder('B coder');
+    verify(first);
+    verify(second);
+    const accountOf = (created: ReturnType<typeof addCodexCoder>) =>
+      repo.getProviderResource(created.success ? created.agent.provider_resource_id! : '')!.provider_account_id!;
+    failingAccounts.add(accountOf(first)); // Tried first: agents are listed by display name.
+    const task = await approvedTask();
+    let clock = Date.now();
+    service = new DesktopAutomationService(repo, events, registry, {
+      worktreeRoot: path.join(tempDir, 'worktrees'), timer: fakeTimer, taskService: tasks, now: () => new Date(clock).toISOString() });
+    await service.tick(); await service.drain();
+    expect(adapterCalls).toBe(1);
+    clock += 120_000;
+    await service.tick(); await service.drain();
+    expect(adapterCalls).toBe(2);
+    expect(repo.getExecutionAuthorizationsByTask(task.id).map((auth) => auth.selected_account_id).sort())
+      .toEqual([accountOf(first), accountOf(second)].sort());
+    expect(statusOf()).toMatchObject({ phase: 'AWAITING_REVIEW', taskId: task.id });
+    // The refresh on the next pass sees the settled, not yet verified run.
+    await service.tick();
+    expect(repo.getTask(task.id)!.progress_cache_percent).toBe(41);
+  }, 180_000);
 
   it.runIf(process.platform === 'win32')('stops retrying a revision after three failed runs (#295)', async () => {
     verify(addCodexCoder());

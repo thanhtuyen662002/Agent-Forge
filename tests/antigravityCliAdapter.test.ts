@@ -39,6 +39,10 @@ describe('Antigravity CLI output contract (#265)', () => {
     expect(parseAntigravityResult(SUCCESS_STDOUT)).toMatchObject({ status: 'SUCCESS', response: 'OK\n' });
     expect(classifyAntigravityFailure(QUOTA_STDOUT, QUOTA_STDERR)).toEqual({ errorCode: 'QUOTA_EXHAUSTED', error: 'Antigravity quota reached; resets in 117h59m19s.' });
     expect(classifyAntigravityFailure('', 'AGY_ERROR: {"status":"UNAUTHENTICATED","error_code":401}')?.errorCode).toBe('AUTH_ERROR');
+    // Observed 2026-10-27 (#302): Google asks to verify the account.
+    const ineligible = JSON.stringify({ conversation_id: '', status: 'ERROR', response: '',
+      error: 'Eligibility check failed: Your current account is not eligible for Antigravity. Verify your account to continue.' });
+    expect(classifyAntigravityFailure(ineligible, '')).toMatchObject({ errorCode: 'AUTH_ERROR' });
     // The model's own text is never classified.
     expect(classifyAntigravityFailure('{"status":"SUCCESS","response":"I added rate limit handling for 429 and quota reached cases"}', '')).toBeNull();
     expect(classifyAntigravityFailure('', 'some unexpected crash')).toBeNull();

@@ -28,6 +28,13 @@ export class ProgressService {
       lintPassed?: boolean;
       hasEvidence?: boolean;
       excludeUnconfiguredLint?: boolean;
+      /**
+       * Automated tasks only (#302): whether a coder run of the current revision is
+       * in flight or completed, and whether one completed. Undefined keeps the
+       * state-based in-flight credit of the manual flow.
+       */
+      executionStarted?: boolean;
+      coderCompleted?: boolean;
     } = {}
   ): ProgressBreakdown {
     const weights = {
@@ -60,9 +67,11 @@ export class ProgressService {
       breakdown.implementation = weights.implementation;
       earned += weights.implementation;
     } else if (['CODING', 'VALIDATING', 'REVIEW_READY', 'REVIEWING'].includes(task.state)) {
-      // In-flight coding without verified diff evidence yet
-      breakdown.implementation = 10;
-      earned += 10;
+      // In-flight coding without verified diff evidence yet. An automated task that
+      // was approved but never ran earns nothing here; a settled run earns more (#302).
+      const credit = options.coderCompleted ? 25 : options.executionStarted === false ? 0 : 10;
+      breakdown.implementation = credit;
+      earned += credit;
     }
 
     // 3. Targeted Testing: awarded ONLY if real TestRun exit_code == 0
