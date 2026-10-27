@@ -631,8 +631,26 @@ Findings from agy 1.4.6 on the owner's machine:
   config) under `<home>\.gemini\antigravity-cli`, so each agent's profile
   directory becomes its home and the owner's own agy state and settings are
   never used. The Google sign-in itself is **machine-wide**: a run with an empty
-  home, `APPDATA` and `LOCALAPPDATA` was still signed in. All Antigravity agents
-  therefore share the account signed in to agy on this computer.
+  home, `APPDATA` and `LOCALAPPDATA` was still signed in. agy keeps it only in
+  the Windows Credential Manager entry `gemini:antigravity`, and
+  `ANTIGRAVITY_CREDENTIAL_SCOPE` does not change that.
+- **Several Antigravity accounts (#304).** Each Antigravity account gets its own
+  Credential Manager slot, `AgentForge/antigravity/<accountId>`.
+  - **Sign-in.** Starting an account's sign-in in Agent Center sets the current
+    machine-wide entry aside and clears it, so agy asks for a fresh Google
+    sign-in. When **Kiểm tra** passes, the new sign-in becomes that account's
+    slot, and the previous entry returns.
+  - **Each run.** The account's slot is swapped into `gemini:antigravity`. After
+    the run, the possibly refreshed token is saved back to the slot, and the
+    previous entry is restored.
+  - **Serialized runs.** Antigravity runs therefore take turns, one account at a
+    time; Codex and Claude still run side by side.
+  - **Recovery.** A swap interrupted by a crash is restored when the app starts.
+  - **Without a slot.** An account that has no slot yet (signed in before #304)
+    uses the machine-wide sign-in. Sign it in again in Agent Center to give it
+    its own.
+  - **Shared entry.** Using agy or the Antigravity IDE by hand while Agent Forge
+    runs an Antigravity task shares the same entry. Wait for the task to finish.
 - **Prompt and results.** The prompt is the value of `-p` (stdin stays empty).
   Prompts beyond 24,000 characters are refused before spawn, because of the
   Windows command-line limit. The result is one JSON object: `status`

@@ -71,6 +71,20 @@ Agent-Forge guarantees:
    - Bearer Tokens & JWTs (`Bearer\s+[A-Za-z0-9-_=]+\.[A-Za-z0-9-_=]+\.?[A-Za-z0-9-_.+/=]*`)
    - Private Keys (`-----BEGIN (?:RSA )?PRIVATE KEY-----`)
    - Generic API Keys (`[a-zA-Z0-9_-]{32,}`)
+3. **Antigravity credential slots (#304).** agy keeps one machine-wide Google
+   sign-in in the Windows Credential Manager (`gemini:antigravity`). To run
+   several Antigravity accounts, Agent Forge copies that entry, as an opaque blob,
+   between `gemini:antigravity` and its own entries
+   `AgentForge/antigravity/<accountId>` and `AgentForge/antigravity/__stash`.
+   This is the one place Agent Forge writes a credential, and it does so at the
+   owner's request.
+   - **Where blobs live:** they stay inside the Credential Manager of the
+     current Windows user, which protects them with DPAPI. They are never parsed,
+     refreshed, logged, written to a file or database, or sent anywhere.
+   - **Entry names:** slot names are fixed and validated, so an account id cannot
+     address another entry.
+   - **Restoring:** every swap is restored in `finally`, and a leftover stash is
+     restored at startup.
 
 ---
 

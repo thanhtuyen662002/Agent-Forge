@@ -21,6 +21,7 @@ import { ProviderRoutingService } from './ProviderRoutingService';
 import { ProviderDispatchService } from './ProviderDispatchService';
 import { ExecutionAuthorizationService } from './ExecutionAuthorizationService';
 import { CoderSubmissionAdjudicationService } from './CoderSubmissionAdjudicationService';
+import type { AntigravityCredentialSlots } from '../credentials/AntigravityCredentialSlots';
 
 export interface BootstrapResult {
   db: Database.Database;
@@ -117,7 +118,7 @@ export class BootstrapService {
     }
   }
 
-  public static initialize(userDataDir: string): BootstrapResult {
+  public static initialize(userDataDir: string, options: { antigravitySlots?: AntigravityCredentialSlots | null } = {}): BootstrapResult {
     const dbDir = path.join(userDataDir, 'database');
     const artifactsDir = path.join(userDataDir, 'artifacts');
 
@@ -154,7 +155,7 @@ export class BootstrapService {
     providerRegistry.register(new CodexCliAdapter({ repo, artifactStore }));
     providerRegistry.register(new GeminiCliAdapter({ repo, artifactStore }));
     providerRegistry.register(new ClaudeCodeCliAdapter({ repo, artifactStore }));
-    providerRegistry.register(new AntigravityCliAdapter({ repo, artifactStore }));
+    providerRegistry.register(new AntigravityCliAdapter({ repo, artifactStore, credentialSlots: options.antigravitySlots ?? null }));
 
     // 6. Initialize Provider Routing, Authorization & Dispatch Services
     const providerRoutingService = new ProviderRoutingService(repo, providerRegistry, eventService);

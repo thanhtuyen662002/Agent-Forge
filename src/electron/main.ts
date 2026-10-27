@@ -16,6 +16,8 @@ import { AccountQuotaService } from '../core/services/AccountQuotaService';
 import { CodexAccountConnectionService } from '../core/services/CodexAccountConnectionService';
 import { CliAccountConnectionService } from '../core/services/CliAccountConnectionService';
 import { AgentForgeMcpServer } from './mcpServer';
+import { AntigravityCredentialSlots } from '../core/credentials/AntigravityCredentialSlots';
+import { WindowsCredentialVault } from '../core/credentials/WindowsCredentialVault';
 
 let mainWindow: BrowserWindow | null = null;
 let bootstrapInstance: BootstrapResult | null = null;
@@ -158,7 +160,11 @@ app.whenReady().then(() => {
     rendererFilePath: rendererTarget.type === 'file' ? rendererTarget.target : undefined,
     devServerUrl: rendererTarget.type === 'url' ? rendererTarget.target : undefined,
   };
-  bootstrapInstance = BootstrapService.initialize(userDataDir);
+  // Antigravity keeps one machine-wide sign-in; each account gets its own slot (#304).
+  // A swap interrupted by a crash is restored before anything runs.
+  const antigravitySlots = process.platform === 'win32' ? new AntigravityCredentialSlots(new WindowsCredentialVault()) : null;
+  try { antigravitySlots?.recover(); } catch { /* the vault is unavailable; runs use the machine-wide sign-in */ }
+  bootstrapInstance = BootstrapService.initialize(userDataDir, { antigravitySlots });
 
   // Initialize UpdateService with packaged/unsigned configuration
   const updateAdapter = app.isPackaged ? new ElectronUpdaterAdapter() : undefined;
@@ -206,6 +212,7 @@ app.whenReady().then(() => {
       return adapter?.getExecutablePath?.() ?? null;
     },
     onVerified: async () => { await automationForSignIn.tick(); },
+    antigravitySlots,
   });
 
   // Local MCP server for external AIs (#289): off until the owner enables it.
