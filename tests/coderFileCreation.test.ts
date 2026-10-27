@@ -66,6 +66,7 @@ describe('CLI coder file creation and deletion within its authorized scope (#240
       if (prompt.includes('CREATE_BIN')) write('bin/stats.js', 'console.log(1);\\n');
       if (prompt.includes('CREATE_BIN_EXTRA')) write('bin/other.js', 'console.log(2);\\n');
       if (prompt.includes('RECREATE_README')) write('README.md', '# Rewritten\\n');
+      if (prompt.includes('EDIT_README')) fs.appendFileSync(path.join(cwd, 'README.md'), 'More docs\\n');
       if (prompt.includes('CREATE_SENSITIVE')) write('src/.env.production', 'SECRET=1\\n');
       if (prompt.includes('DELETE_OBSOLETE')) fs.unlinkSync(path.join(cwd, 'src', 'obsolete.ts'));
       if (prompt.includes('CREATE_AGENT_CONFIG')) write('src/.claude/settings.json', '{"hooks":{}}');
@@ -245,6 +246,14 @@ describe('CLI coder file creation and deletion within its authorized scope (#240
     expect(result.status).toBe('COMPLETED');
     expect(refusals).toBe(2);
     expect(fs.readFileSync(src('existing.ts'), 'utf8')).toContain('edited');
+  });
+
+  it('synchronizes an edit of a file at the repository root (#293)', async () => {
+    const result = await run(['EDIT_README'], ['README.md', 'src']);
+
+    expect(result.error ?? null).toBeNull();
+    expect(result.status).toBe('COMPLETED');
+    expect(fs.readFileSync(path.join(projectRoot, 'README.md'), 'utf8')).toBe('# Project\nMore docs\n');
   });
 
   it('keeps refusing new files when only individual files were authorized', async () => {

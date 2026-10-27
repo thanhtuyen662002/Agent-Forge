@@ -42,6 +42,17 @@ function api(): ReturnType<typeof loadNative> {
   try { return native ??= loadNative(); } catch { unavailable(); }
 }
 
+const FILE_SHARE_READ = 0x1;
+const FILE_SHARE_WRITE = 0x2;
+/**
+ * The selected root itself also shares write access, so a file directly in it
+ * can be replaced atomically (a rename into a directory opens that directory
+ * for writing; found in trial 7b with README.md). Delete access is still never
+ * shared: the root cannot be renamed, removed or replaced, and the pinned
+ * child keeps it non-empty, so it cannot become a junction.
+ */
+const ROOT_SHARE = FILE_SHARE_READ | FILE_SHARE_WRITE;
+
 /** Read-only name lease: captured ordinary ancestry plus a pinned root child. */
 export class WindowsRepositoryRootLease {
   private readonly handles: bigint[] = [];
@@ -60,13 +71,13 @@ export class WindowsRepositoryRootLease {
     return info;
   }
 
-  private ordinaryRelative(parent: bigint, name: string, directory: boolean): bigint {
+  private ordinaryRelative(parent: bigint, name: string, directory: boolean, share = FILE_SHARE_READ): bigint {
     if (!name || name.length > 255 || name === '.' || name === '..' || /[\\/:\x00-\x1f\x7f*?"<>|]/.test(name) || /[. ]$/.test(name)) unavailable();
     const output: (bigint | null)[] = [null];
     const objectAttributes = { length: api().attributesSize, root: parent,
       name: { length: name.length * 2, maximumLength: (name.length + 1) * 2, buffer: name },
       attributes: 0x40, securityDescriptor: null, securityQuality: null };
-    const status = api().relative(output, 0x100081, objectAttributes, {}, null, 0, 1, 1,
+    const status = api().relative(output, 0x100081, objectAttributes, {}, null, 0, share, 1,
       0x200020 | (directory ? 1 : 0x40), null, 0);
     const handle = output[0];
     if (status < 0 || handle === null || handle === 0n || handle === -1n) {
@@ -95,13 +106,14 @@ export class WindowsRepositoryRootLease {
     const lease = new WindowsRepositoryRootLease(identity);
     try {
       const first = identity.components[0];
-      const root = api().create(first.path, 0x81, 1, null, 3, 0x02200000, null) as bigint | null;
+      const leaf = identity.components.length - 1;
+      const root = api().create(first.path, 0x81, leaf === 0 ? ROOT_SHARE : FILE_SHARE_READ, null, 3, 0x02200000, null) as bigint | null;
       if (root === null || root === 0n || root === -1n || root === 0xffffffffffffffffn) unavailable();
       lease.handles.push(root);
       lease.matchComponent(root, first);
       let parent = root;
-      for (const component of identity.components.slice(1)) {
-        parent = lease.ordinaryRelative(parent, path.basename(component.path), true);
+      for (const [offset, component] of identity.components.slice(1).entries()) {
+        parent = lease.ordinaryRelative(parent, path.basename(component.path), true, offset + 1 === leaf ? ROOT_SHARE : FILE_SHARE_READ);
         lease.matchComponent(parent, component);
       }
       // Every ancestor contains its already-pinned next component. The final
