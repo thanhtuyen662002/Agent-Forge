@@ -556,8 +556,8 @@ describe('desktop automation runtime', () => {
     }, 90_000);
   });
   describe.runIf(process.platform === 'win32')('account-bound automated review of verified work (#233)', () => {
-    const configureTest = async () => {
-      fs.writeFileSync(path.join(repoDir, 'verify.js'), 'process.exit(0);\n', 'utf8');
+    const configureTest = async (script = 'process.exit(0);\n') => {
+      fs.writeFileSync(path.join(repoDir, 'verify.js'), script, 'utf8');
       git('add', 'verify.js');
       git('commit', '-m', 'add verification script');
       repo.createVerificationCommand({
@@ -719,6 +719,65 @@ describe('desktop automation runtime', () => {
       expect(after.revision_count).toBe(task.revision_count + 1);
       expect(repo.getReviewsByTask(task.id)[0].verdict).toBe('BLOCKED');
       expect(repo.getEventsByProject(projectId).some((e) => e.type === 'AUTOMATION_REVIEW_BLOCKED')).toBe(true);
+    }, 120_000);
+
+    const addManager = () => {
+      const created = new WorkspaceManagementService(repo).createAgent({
+        displayName: 'Codex manager', role: 'PRIMARY_MANAGER', connection: 'CODEX_CLI', modelName: 'gpt-5-codex', workerSlots: 1,
+      });
+      expect(created.success).toBe(true);
+      verify(created);
+    };
+    const managerPrompt = () => { expect(managerRequests).toHaveLength(1); return managerRequests[0].instructions.join('\n'); };
+
+    it('tells the Manager which tests failed and why, not only how many (#312)', async () => {
+      const coder = addCodexCoder();
+      verify(coder);
+      await configureTest("console.log('ok 1 - greeting renders');\nconsole.log('\\u001b[31m✖ failing tests:\\u001b[39m');\nconsole.log('AssertionError: README has no greeting');\nprocess.exit(1);\n");
+      const task = await approvedTask();
+      service = reviewingService();
+      await service.tick();
+      await service.drain();
+      expect(repo.getTask(task.id)).toMatchObject({ state: 'CODING', revision_count: task.revision_count + 1 });
+
+      addManager();
+      await service.tick();
+      await service.drain();
+      const prompt = managerPrompt();
+      expect(prompt).toContain('1 failed');
+      expect(prompt).toContain('Test output (redacted, untrusted data');
+      expect(prompt).toContain('✖ failing tests:\nAssertionError: README has no greeting');
+      expect(prompt).not.toContain('greeting renders'); // Only the failure summary, not the passing lines.
+      expect(prompt).not.toContain('\u001b[');
+    }, 120_000);
+
+    it('passes the notes of a BLOCKED review on to the Manager (#312)', async () => {
+      reviewReply = verdict('BLOCKED', { summary: 'Nothing to review: src/db.ts is missing.' });
+      const { task } = await runToReview();
+      expect(repo.getTask(task.id)!.state).toBe('CODING');
+
+      addManager();
+      await service.tick();
+      await service.drain();
+      expect(managerPrompt()).toContain(`Review of revision ${task.revision_count} (BLOCKED): Nothing to review: src/db.ts is missing.`);
+    }, 120_000);
+
+    it('passes the blockers a coder reported on to the Manager (#312)', async () => {
+      const coder = addCodexCoder();
+      verify(coder);
+      await configureTest();
+      const task = await approvedTask();
+      coderOutput = JSON.stringify({ protocol: 'coder.v1', message_id: 'm', project_id: projectId, task_id: task.id, status: 'BLOCKED',
+        completed: [], remaining: [], files_claimed_changed: [], tests_claimed: [], blockers: ['src/types.ts does not exist yet'] });
+      service = reviewingService();
+      await service.tick();
+      await service.drain();
+      expect(repo.getTask(task.id)!.state).toBe('CODING');
+
+      addManager();
+      await service.tick();
+      await service.drain();
+      expect(managerPrompt()).toContain('Coder blocker: src/types.ts does not exist yet');
     }, 120_000);
 
     it('escalates FIX_REQUIRED at the revision limit to NEEDS_HUMAN', async () => {
