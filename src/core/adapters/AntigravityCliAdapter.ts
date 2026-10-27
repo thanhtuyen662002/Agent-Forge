@@ -167,6 +167,10 @@ export function classifyAntigravityFailure(stdout: string, stderr: string): { er
       /not signed in|sign in required|please (?:sign|log) in|login required|authentication (?:failed|required)|auth_revoked|failed to load cli credentials/i.test(message)) {
     return { errorCode: 'AUTH_ERROR', error: 'Antigravity is not signed in on this machine, or the sign-in expired.' };
   }
+  // Observed 2026-10-27 (#302): Google asks to verify the account before Antigravity runs.
+  if (/eligibility check failed|not eligible for antigravity|verify your account/i.test(message)) {
+    return { errorCode: 'AUTH_ERROR', error: 'Google asks to verify this Antigravity account in the browser before it can run (sign in again from Agent Center).' };
+  }
   if (status === 'RESOURCE_EXHAUSTED' || code === 429 || /quota reached|rate limit/i.test(message)) {
     const resets = /resets in ([0-9hms ]{2,20})/i.exec(message);
     return { errorCode: 'QUOTA_EXHAUSTED', error: resets ? `Antigravity quota reached; resets in ${resets[1].trim()}.` : 'Antigravity quota reached.' };

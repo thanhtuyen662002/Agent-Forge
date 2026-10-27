@@ -86,4 +86,13 @@ describe('ProgressService Measurable Evidence Gates', () => {
     const avg = ProgressService.calculateProjectProgress([t1, t2]);
     expect(avg).toBe(75);
   });
+
+  it('reports what automated coder runs actually did (#302)', () => {
+    const coding = { ...baseTask, state: 'CODING' as const };
+    const options = { excludeUnconfiguredLint: true };
+    expect(ProgressService.calculateTaskProgress(coding, { ...options, executionStarted: false }).percent).toBe(12); // Approved, never ran.
+    expect(ProgressService.calculateTaskProgress(coding, { ...options, executionStarted: true }).percent).toBe(24); // Running.
+    expect(ProgressService.calculateTaskProgress(coding, { ...options, executionStarted: true, coderCompleted: true }).percent).toBe(41); // Run settled, not verified.
+    expect(ProgressService.calculateTaskProgress(coding, options).percent).toBe(24); // Manual flow keeps its rule.
+  });
 });

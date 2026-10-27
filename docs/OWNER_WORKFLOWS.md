@@ -467,6 +467,26 @@ Task progress is also refreshed on every automated transition. A task that
 passed tests and review now shows 100%; before, it kept the value from the
 Manager decision (24% in the real trial).
 
+**Truthful progress and coder failover (#302).** Automated tasks also refresh
+their progress whenever a coder run of the current revision starts, settles or
+fails. The stages are:
+
+| Stage | Progress |
+| --- | --- |
+| Approved, but no run yet, or the last run failed | 12% |
+| A run is in flight | 24% |
+| A run settled with completion, not yet verified | about 41% |
+| Verified | about 88% |
+| Done | 100% |
+
+The manual flow keeps its earlier rule.
+
+A failed run is retried, preferring a coder account that has not failed this
+revision. Each account has its own bound of three failed runs per revision, so
+one broken account cannot use up the attempts of the others. An Antigravity
+account that Google asks to verify ("not eligible … verify your account") is
+recorded as `AUTH_ERROR` and is skipped until it is signed in again.
+
 ### Project completion
 
 A finished project used to stay *running* forever, because nothing fired the
