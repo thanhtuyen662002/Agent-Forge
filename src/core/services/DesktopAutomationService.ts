@@ -207,6 +207,7 @@ export class DesktopAutomationService {
       // Reviews interrupted by a previous process are fenced or released first.
       // A failure here is retried on the next pass and never stops dispatch.
       try { this.reviewer?.recoverAbandonedReviews(); } catch { /* next pass */ }
+      try { this.reviewer?.releaseStaleBlockedReviews(); } catch { /* next pass */ }
       try { this.manager?.recoverAbandoned(); } catch { /* next pass */ }
       if (this.reviewer || this.manager) await this.refreshCapabilities();
       for (const project of this.runnableProjects()) {

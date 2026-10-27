@@ -348,6 +348,23 @@ export class ProductReviewService {
    * released through the guarded recovery primitive and the attempt ends
    * INTERRUPTED. No verdict is ever inferred and nothing is retried.
    */
+  /**
+   * A BLOCKED verdict recorded before #308 left its task in REVIEWING, with nothing
+   * to pick it up (found in VidFlow M1). Such a task now goes back to the coder,
+   * like a new BLOCKED verdict; the revision bound still ends in NEEDS_HUMAN (#310).
+   */
+  public releaseStaleBlockedReviews(): number {
+    let released = 0;
+    for (const project of this.repo.getAllProjects()) {
+      if (project.status !== 'RUNNING' || this.repo.isProjectTrashed(project.id)) continue;
+      for (const task of this.repo.getTasksByProject(project.id)) {
+        if (task.state !== 'REVIEWING' || this.repo.isTaskTrashed(task.id) || this.reviewReason(task) !== 'REVIEW_BLOCKED') continue;
+        if (this.transition(task.id, task.revision_count >= task.max_revisions ? 'MAX_REVISIONS_EXCEEDED' : 'FIX_VERDICT')) released += 1;
+      }
+    }
+    return released;
+  }
+
   public recoverAbandonedReviews(): number {
     let recovered = 0;
     for (const project of this.repo.getAllProjects()) {

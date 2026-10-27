@@ -410,7 +410,7 @@ review row and the task transition are written in one transaction:
 | --- | --- |
 | `PASS` | `PASS_VERDICT`: the task is `DONE`. The changes stay in the retained worktree; nothing is merged. |
 | `FIX_REQUIRED` | `FIX_VERDICT`: back to `CODING` at the next revision (or `NEEDS_HUMAN` at the revision limit). The Manager must authorize the next revision. |
-| `BLOCKED` | Recorded; the task stays `REVIEWING` for the Manager or owner. |
+| `BLOCKED` | Handled like `FIX_REQUIRED` (#308): back to `CODING` at the next revision (or `NEEDS_HUMAN` at the revision limit). |
 
 A provider failure, a malformed or wrong-protocol answer, or a verdict for a
 stale snapshot or another revision is recorded as `AUTOMATION_REVIEW_FAILED`
@@ -478,6 +478,8 @@ coder's own `coder.v1` report; only its `status` and `blockers` are used.
   FIX_REQUIRED: the task returns to the coder at the next revision with the
   reviewer's notes. Earlier, it stayed in `REVIEWING` with nothing to pick it up.
   The revision bound still ends in `NEEDS_HUMAN`.
+  A task already left in `REVIEWING` by a BLOCKED verdict from before the
+  update is released the same way on the next automation tick (#310).
 
 **Truthful progress and coder failover (#302).** Automated tasks also refresh
 their progress whenever a coder run of the current revision starts, settles or
