@@ -53,6 +53,8 @@ describe('desktop automation runtime', () => {
   const fakeTimer = { setInterval: () => 'handle', clearInterval: () => undefined };
 
   let healthy: boolean;
+  /** The next coder runs that return FAILED (a provider failure). */
+  let coderFailures = 0;
   const synthetic = (id: string, capabilities: Array<'CODING' | 'REVIEW' | 'PLANNING'> = ['CODING', 'REVIEW', 'PLANNING']): ProviderAdapter => ({
     id,
     name: 'Synthetic CLI coder',
@@ -70,6 +72,10 @@ describe('desktop automation runtime', () => {
         return managerReply(request);
       }
       adapterCalls += 1;
+      if (coderFailures > 0) {
+        coderFailures -= 1;
+        return { executionId: request.runtimeBinding?.executionId ?? 'x', status: 'FAILED', error: 'synthetic provider failure', rawResponse: '' };
+      }
       const workspace = request.runtimeBinding?.workspace?.workingDirectory;
       if (coderEdits && workspace) coderEdits(workspace);
       return { executionId: request.runtimeBinding?.executionId ?? 'x', status: 'COMPLETED', outputProtocol: 'coder.v1', rawResponse: 'Synthetic coder result' };
@@ -115,6 +121,7 @@ describe('desktop automation runtime', () => {
     registry = new ProviderRegistry();
     registry.register(synthetic('prov-codex-cli'));
     adapterCalls = 0;
+    coderFailures = 0;
     healthy = true;
     reviewRequests = [];
     reviewReply = () => { throw new Error('no review expected'); };
@@ -244,6 +251,44 @@ describe('desktop automation runtime', () => {
     expect(repo.getAgentAssignmentsByTask(task.id).map((a) => a.status)).toEqual(['FAILED']);
     expect(repo.getTaskAttemptsByTask(task.id).map((a) => a.status)).toEqual(['FAILED']);
   }, 60_000);
+
+  it.runIf(process.platform === 'win32')('retries a failed coder run after a pause, at most three runs per revision (#295)', async () => {
+    verify(addCodexCoder());
+    const task = await approvedTask();
+    let clock = Date.now();
+    service = new DesktopAutomationService(repo, events, registry, {
+      worktreeRoot: path.join(tempDir, 'worktrees'), timer: fakeTimer, now: () => new Date(clock).toISOString() });
+    coderFailures = 1;
+    await service.tick(); await service.drain();
+    expect(adapterCalls).toBe(1);
+    expect(statusOf()).toMatchObject({ phase: 'FAILED', taskId: task.id });
+    await service.tick(); await service.drain();
+    expect(adapterCalls).toBe(1); // Inside the retry pause.
+    clock += 120_000; // Settlement times come from the real clock; well past the pause.
+    await service.tick(); await service.drain();
+    expect(adapterCalls).toBe(2);
+    expect(statusOf()).toMatchObject({ phase: 'AWAITING_REVIEW', taskId: task.id });
+    clock += 61_000;
+    await service.tick(); await service.drain();
+    expect(adapterCalls).toBe(2); // A completed run is never repeated.
+  }, 120_000);
+
+  it.runIf(process.platform === 'win32')('stops retrying a revision after three failed runs (#295)', async () => {
+    verify(addCodexCoder());
+    const task = await approvedTask();
+    let clock = Date.now();
+    service = new DesktopAutomationService(repo, events, registry, {
+      worktreeRoot: path.join(tempDir, 'worktrees'), timer: fakeTimer, now: () => new Date(clock).toISOString() });
+    coderFailures = 10;
+    for (let i = 0; i < 5; i += 1) { await service.tick(); await service.drain(); clock += 61_000; }
+    expect(adapterCalls).toBe(3);
+    expect(statusOf()).toMatchObject({ phase: 'FAILED', taskId: task.id });
+    // A fresh process (in-memory history gone) is still bounded by the settled runs.
+    service = new DesktopAutomationService(repo, events, registry, {
+      worktreeRoot: path.join(tempDir, 'worktrees'), timer: fakeTimer, now: () => new Date(clock).toISOString() });
+    await service.tick(); await service.drain();
+    expect(adapterCalls).toBe(3);
+  }, 180_000);
 
   it.runIf(process.platform === 'win32')('runs the real product chain once and then waits for review', async () => {
     verify(addCodexCoder());
@@ -1266,6 +1311,17 @@ describe('desktop automation runtime', () => {
       expect(managerRequests[1].expectedProtocol).toBe('manager.v1');
       expect(realTasks().find((task) => task.title === 'Add the greeting')!.state).toBe('CODING');
       expect(repo.getTask(anchor.id)!.state).toBe('APPROVED'); // The planning record is never dispatched.
+    });
+
+    it('tells the Manager tasks run in order on integrated code when automatic integration is on (#295)', async () => {
+      addManager();
+      repo.setProjectAutoIntegrate(projectId, true);
+      managerReply = planReply();
+      service = planningService();
+      await pass();
+      const instructions = managerRequests[0].instructions.join(' ');
+      expect(instructions).toContain('Tasks run one at a time in the listed order');
+      expect(instructions).not.toContain('Tasks run in parallel');
     });
 
     it('proposes the plan in approve mode and creates nothing until the owner approves', async () => {
