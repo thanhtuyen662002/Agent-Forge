@@ -618,7 +618,8 @@ export class ProductManagerService {
       ...list('Owner policy', contract.owner_policies),
       'Each task needs a short title, a description and at least one acceptance criterion. Use at most 20 tasks.',
       // Found in the fourth real trial: a tests-only task could not see the code task's changes.
-      ...(this.repo.getProjectAutoIntegrate(project.id)
+      // Sequential only with automatic integration and one task at a time (#295, #306).
+      ...(this.repo.getProjectAutoIntegrate(project.id) && this.repo.getProjectParallelTasks(project.id) === 1
         // Found in the MCP trial: a README task could not see the module the task before it created.
         ? ['Tasks run one at a time in the listed order, and each starts from the integrated code of the tasks before it. Put a change and its tests in the same task. When a task relies on files an earlier task creates, list those files in its context_paths too.']
         : ['Tasks run in parallel from the same base commit and cannot see the changes of other tasks. Make every task self-contained: put a change and its tests in the same task, and prefer fewer, larger tasks over a chain of dependent ones.']),

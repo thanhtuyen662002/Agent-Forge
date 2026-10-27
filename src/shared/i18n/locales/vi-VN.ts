@@ -552,6 +552,8 @@ export const viVN: TranslationDictionary = {
       },
     },
     managerPanel: {
+      parallelLabel: 'Số task chạy song song',
+      parallelHint: '1 = làm lần lượt, task sau thấy code của task trước. Nhiều hơn 1 = nhiều coder làm cùng lúc các task độc lập; Quản lý sẽ chia task tự đứng riêng.',
       title: 'Quyết định của Quản lý',
       subtitle: 'Đề xuất của tác tử Quản lý tự động cho dự án này.',
       modeLabel: 'Chế độ Quản lý',

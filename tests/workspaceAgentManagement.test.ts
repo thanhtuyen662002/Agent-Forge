@@ -108,7 +108,7 @@ describe('owner agent roster management', () => {
     [{ displayName: '   ' }],
     [{ role: 'OWNER' }],
     [{ connection: 'CHATGPT_WEB' }],
-    [{ workerSlots: 3 }],
+    [{ workerSlots: 11 }],
     [{ profileId: 'a..b' }],
     [{ profileId: 'bad/name' }],
     [{ modelName: '' }],
@@ -190,6 +190,30 @@ describe('owner agent roster management', () => {
     });
     db.prepare("UPDATE account_leases SET released_at = '2026-10-01T00:30:00.000Z' WHERE id = 'lease-1'").run();
     expect(service.removeAgent({ agentId: result.agent.id }).success).toBe(true);
+  });
+
+  it('resizes worker slots up to 10, reusing disabled slots, and never takes a busy one (#306)', () => {
+    const result = createCodex({ workerSlots: 1 });
+    if (!result.success) throw new Error('setup failed');
+    const id = result.agent.id;
+    const accountId = repo.getProviderResource(result.agent.provider_resource_id!)!.provider_account_id!;
+    const active = () => repo.getWorkerSlotsByAccount(accountId).filter((slot) => slot.status !== 'DISABLED').map((slot) => slot.slot_index).sort((a, b) => a - b);
+
+    expect(service.updateAgent({ agentId: id, workerSlots: 10 }).success).toBe(true);
+    expect(active()).toEqual([1, 2, 3, 4, 5, 6, 7, 8, 9, 10]);
+    expect(repo.getProviderAccount(accountId)!.concurrency_limit).toBe(10);
+
+    expect(service.updateAgent({ agentId: id, workerSlots: 3 }).success).toBe(true);
+    expect(active()).toEqual([1, 2, 3]);
+    expect(service.updateAgent({ agentId: id, workerSlots: 4 }).success).toBe(true);
+    expect(active()).toEqual([1, 2, 3, 4]);
+    expect(repo.getWorkerSlotsByAccount(accountId)).toHaveLength(10); // Disabled slots are reused, not duplicated.
+
+    const fourth = repo.getWorkerSlotsByAccount(accountId).find((slot) => slot.slot_index === 4)!;
+    repo.updateWorkerSlotStatus(fourth.id, 'LEASED');
+    expect(service.updateAgent({ agentId: id, workerSlots: 2 })).toMatchObject({ success: false, errorCode: 'AGENT_HAS_ACTIVE_WORK' });
+    expect(active()).toEqual([1, 2, 3, 4]);
+    expect(service.updateAgent({ agentId: id, workerSlots: 11 })).toMatchObject({ success: false, errorCode: 'INVALID_INPUT' });
   });
 
   it('edits names and instructions, but locks the model while work is active', () => {

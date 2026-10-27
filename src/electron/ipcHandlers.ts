@@ -107,6 +107,7 @@ export const MCP_INVOKABLE_CHANNELS: ReadonlySet<string> = new Set([
   'task:list', 'task:get', 'task:create', 'events:list', 'agents:roster',
   'verification:getCommands', 'verification:saveCommands',
   'automation:status', 'automation:managerDecisions', 'automation:setManagerMode', 'automation:decideManagerProposal',
+  'automation:getParallelTasks', 'automation:setParallelTasks',
   'integration:list', 'integration:getAuto', 'integration:setAuto', 'integration:merge',
   'control:resume',
 ]);
@@ -1035,6 +1036,21 @@ export function registerIpcHandlers(
     repo.setProjectManagerMode(projectId, mode);
     void runtime.automation?.tick();
     return { success: true, mode };
+  });
+  // How many of the project's tasks coders work on at once (#306).
+  registerPrivilegedHandler('automation:getParallelTasks', async (_, payload: unknown) => {
+    const projectId = readProjectId(payload);
+    if (!projectId) return { success: false, errorCode: 'PROJECT_NOT_FOUND' };
+    return { success: true, parallelTasks: repo.getProjectParallelTasks(projectId) };
+  });
+  registerPrivilegedHandler('automation:setParallelTasks', async (_, payload: unknown) => {
+    const projectId = readProjectId(payload);
+    const count = payload && typeof payload === 'object' ? (payload as { parallelTasks?: unknown }).parallelTasks : undefined;
+    if (!projectId) return { success: false, errorCode: 'PROJECT_NOT_FOUND' };
+    if (typeof count !== 'number' || !Number.isInteger(count) || count < 1 || count > 10) return { success: false, errorCode: 'PARALLEL_TASKS_INVALID' };
+    repo.setProjectParallelTasks(projectId, count);
+    void runtime.automation?.tick();
+    return { success: true, parallelTasks: count };
   });
   registerPrivilegedHandler('automation:decideManagerProposal', async (_, payload: unknown) => {
     const manager = runtime.automation?.getManager();

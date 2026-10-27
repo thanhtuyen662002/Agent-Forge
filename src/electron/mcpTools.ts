@@ -180,6 +180,7 @@ export const MCP_TOOLS: readonly McpToolDefinition[] = [
         projectId: str('Project ID.'),
         managerMode: { type: 'string', enum: ['AUTO', 'APPROVE'], description: 'Manager mode.' },
         autoIntegrate: { type: 'boolean', description: 'Integrate reviewed work into the default branch automatically.' },
+        parallelTasks: { type: 'integer', minimum: 1, maximum: 10, description: 'How many tasks coders work on at once (1 = one after another).' },
       },
       required: ['projectId'],
       additionalProperties: false,
@@ -189,6 +190,7 @@ export const MCP_TOOLS: readonly McpToolDefinition[] = [
       const result: Record<string, unknown> = {};
       if (args.managerMode !== undefined) result.managerMode = expectSuccess(await registry.invoke('automation:setManagerMode', { projectId, mode: args.managerMode }));
       if (args.autoIntegrate !== undefined) result.autoIntegrate = expectSuccess(await registry.invoke('integration:setAuto', { projectId, enabled: args.autoIntegrate }));
+      if (args.parallelTasks !== undefined) result.parallelTasks = expectSuccess(await registry.invoke('automation:setParallelTasks', { projectId, parallelTasks: args.parallelTasks }));
       return result;
     },
   },

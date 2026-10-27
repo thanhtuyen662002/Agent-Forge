@@ -552,6 +552,8 @@ export const enUS: TranslationDictionary = {
       },
     },
     managerPanel: {
+      parallelLabel: 'Parallel tasks',
+      parallelHint: '1 = one after another; each task sees the code of the tasks before it. More than 1 = coders work on independent tasks at once; the Manager plans self-contained tasks.',
       title: 'Manager decisions',
       subtitle: 'Proposals from the automated Manager agent for this project.',
       modeLabel: 'Manager mode',

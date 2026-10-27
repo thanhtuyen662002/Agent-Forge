@@ -115,7 +115,7 @@ describe('local MCP server (#289)', () => {
     await call('set_project_plan', { projectId: 'PROJ-1', goal: 'Add stats', acceptance_criteria: ['countWords works'], owner_policies: ['Do not edit run-tests.js'] });
     await call('approve_plan', { projectId: 'PROJ-1' });
     await call('set_test_command', { projectId: 'PROJ-1', command: 'node run-tests.js' });
-    await call('configure_automation', { projectId: 'PROJ-1', managerMode: 'AUTO', autoIntegrate: true });
+    await call('configure_automation', { projectId: 'PROJ-1', managerMode: 'AUTO', autoIntegrate: true, parallelTasks: 3 });
     await call('start_project', { projectId: 'PROJ-1' });
 
     expect(calls).toEqual([
@@ -126,6 +126,7 @@ describe('local MCP server (#289)', () => {
       { channel: 'verification:saveCommands', payload: { projectId: 'PROJ-1', commands: { TEST: 'node run-tests.js' } } },
       { channel: 'automation:setManagerMode', payload: { projectId: 'PROJ-1', mode: 'AUTO' } },
       { channel: 'integration:setAuto', payload: { projectId: 'PROJ-1', enabled: true } },
+      { channel: 'automation:setParallelTasks', payload: { projectId: 'PROJ-1', parallelTasks: 3 } },
       { channel: 'project:transition', payload: { projectId: 'PROJ-1', trigger: 'START_PROJECT' } },
     ]);
   });

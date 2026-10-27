@@ -19,7 +19,8 @@ export const AgentConnectionKindEnum = z.enum(['MANUAL_BRIDGE', 'CODEX_CLI', 'GE
 export type AgentConnectionKind = z.infer<typeof AgentConnectionKindEnum>;
 
 /** Bounded like the self-host runtime (`MAX_AGY_WORKERS` accepts 1 or 2). */
-export const MAX_AGENT_WORKER_SLOTS = 2;
+/** A high-quota account can work on several tasks at once (#306). */
+export const MAX_AGENT_WORKER_SLOTS = 10;
 
 const ownerText = (max: number) =>
   z
@@ -64,6 +65,7 @@ export const UpdateAgentIpcSchema = z
     agentId: ownerText(200),
     displayName: ownerText(80).optional(),
     modelName: ownerText(120).optional(),
+    workerSlots: z.number().int().min(1).max(MAX_AGENT_WORKER_SLOTS).optional(),
     instructions: optionalInstructions,
   })
   .strict();

@@ -86,6 +86,7 @@ export const AgentCenterView: React.FC = () => {
       connection: entry.connection === 'OTHER' ? 'MANUAL_BRIDGE' : entry.connection,
       modelName: entry.resource?.modelName ?? '',
       instructions: entry.agentProfile?.instructions ?? '',
+      workerSlots: Math.max(1, entry.workerSlots.filter((slot) => slot.status !== 'DISABLED').length),
     });
     setFormError(null);
     setFormMode({ kind: 'edit', entry });
@@ -117,6 +118,8 @@ export const AgentCenterView: React.FC = () => {
         agentId: original.agent.id,
         displayName: form.displayName,
         ...(original.resource && form.modelName !== original.resource.modelName ? { modelName: form.modelName } : {}),
+        ...(original.connection !== 'MANUAL_BRIDGE' && original.connection !== 'OTHER' &&
+          form.workerSlots !== original.workerSlots.filter((slot) => slot.status !== 'DISABLED').length ? { workerSlots: form.workerSlots } : {}),
         instructions: form.instructions.trim() ? form.instructions : null,
       });
     }
@@ -352,22 +355,25 @@ export const AgentCenterView: React.FC = () => {
                       />
                       <p id="agent-profile-help" className="mt-1 text-xs text-slate-400">{t('agentCenter.form.profileHelp')}</p>
                     </div>
-                    <div>
-                      <label htmlFor="agent-slots" className="block text-slate-300 mb-1">{t('agentCenter.form.slotsLabel')}</label>
-                      <select
-                        id="agent-slots"
-                        value={form.workerSlots}
-                        aria-describedby="agent-slots-help"
-                        onChange={(event) => setForm({ ...form, workerSlots: Number(event.target.value) })}
-                        className={inputClass}
-                      >
-                        {Array.from({ length: MAX_AGENT_WORKER_SLOTS }, (_, index) => index + 1).map((count) => (
-                          <option key={count} value={count}>{count}</option>
-                        ))}
-                      </select>
-                      <p id="agent-slots-help" className="mt-1 text-xs text-slate-400">{t('agentCenter.form.slotsHelp', { max: MAX_AGENT_WORKER_SLOTS })}</p>
-                    </div>
                   </>
+                )}
+                {/* Parallel work per agent, also editable later (#306). */}
+                {(editing ? editing.connection !== 'MANUAL_BRIDGE' && editing.connection !== 'OTHER' : isCliConnection) && (
+                <div>
+                  <label htmlFor="agent-slots" className="block text-slate-300 mb-1">{t('agentCenter.form.slotsLabel')}</label>
+                  <select
+                    id="agent-slots"
+                    value={form.workerSlots}
+                    aria-describedby="agent-slots-help"
+                    onChange={(event) => setForm({ ...form, workerSlots: Number(event.target.value) })}
+                    className={inputClass}
+                  >
+                    {Array.from({ length: MAX_AGENT_WORKER_SLOTS }, (_, index) => index + 1).map((count) => (
+                      <option key={count} value={count}>{count}</option>
+                    ))}
+                  </select>
+                  <p id="agent-slots-help" className="mt-1 text-xs text-slate-400">{t('agentCenter.form.slotsHelp', { max: MAX_AGENT_WORKER_SLOTS })}</p>
+                </div>
                 )}
                 {!editing && <p className="text-xs text-slate-500">{t('agentCenter.form.healthUnknownNote')}</p>}
               </fieldset>
