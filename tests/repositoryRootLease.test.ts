@@ -105,6 +105,16 @@ describe('captured repository read lease', () => {
     expect(git(lease.cwd, ['rev-parse', 'HEAD'])).toBe(head);
   });
 
+  it('lets a file directly in the leased root be replaced atomically while the root stays pinned', () => {
+    lease = RepositoryRootLease.acquire(captureRepositoryRoot(repository));
+    const temp = path.join(repository, '.replacement.tmp');
+    fs.writeFileSync(temp, 'replaced');
+    fs.renameSync(temp, path.join(repository, 'tracked.txt'));
+    expect(fs.readFileSync(path.join(repository, 'tracked.txt'), 'utf8')).toBe('replaced');
+    if (process.platform === 'win32') expect(() => fs.renameSync(repository, repository + '-moved')).toThrow();
+    expect(() => lease!.assertActive()).not.toThrow();
+  });
+
   it.runIf(process.platform === 'win32')('denies a real attributes-only junction attack after acquisition and preserves outside bytes', () => {
     const outside = path.join(fixture, 'outside');
     const empty = path.join(fixture, 'empty-control');
