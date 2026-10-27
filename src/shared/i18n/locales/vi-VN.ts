@@ -1296,4 +1296,14 @@ export const viVN: TranslationDictionary = {
     codexConfigLabel: 'Codex, bước 2: thêm vào tệp ~/.codex/config.toml',
     tryIt: 'Sau đó, hãy nói với AI, ví dụ: "Dùng Agent Forge tạo dự án cho thư mục D:/Projects/my-app, viết kế hoạch để thêm ..., rồi chạy và báo tiến độ cho tôi."',
   },
+  updateNotice: {
+    update: 'Cập nhật lên {version}',
+    hint: 'Tải bản mới rồi tự khởi động lại để cài. Dữ liệu và cài đặt được giữ nguyên.',
+    downloading: 'Đang tải bản mới {percent}%',
+    restarting: 'Đang khởi động lại để cập nhật…',
+    waiting: 'Bản mới đã tải xong, chờ việc đang chạy dừng',
+    waitingHint: 'Agent Forge sẽ tự khởi động lại để cập nhật khi không còn tác tử nào đang làm việc. Bạn có thể tạm dừng dự án để cập nhật ngay.',
+    failed: 'Không cập nhật được. Bấm để thử lại, hoặc xem Cài đặt → Cập nhật.',
+    retry: 'Thử cập nhật lại',
+  },
 };

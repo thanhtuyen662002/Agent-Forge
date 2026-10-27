@@ -1296,4 +1296,14 @@ export const enUS: TranslationDictionary = {
     codexConfigLabel: 'Codex, step 2: add to ~/.codex/config.toml',
     tryIt: 'Then tell the AI, for example: "Use Agent Forge to create a project for D:/Projects/my-app, write a plan to add ..., then start it and report progress to me."',
   },
+  updateNotice: {
+    update: 'Update to {version}',
+    hint: 'Downloads the new version, then restarts to install it. Data and settings are kept.',
+    downloading: 'Downloading update {percent}%',
+    restarting: 'Restarting to update…',
+    waiting: 'Update downloaded, waiting for running work to stop',
+    waitingHint: 'Agent Forge restarts to update by itself once no agent is working. Pause the project to update now.',
+    failed: 'The update failed. Click to retry, or see Settings → Updates.',
+    retry: 'Retry update',
+  },
 };

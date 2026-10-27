@@ -41,6 +41,13 @@ type AdapterListener = {
  * UpdateService manages the installed application update lifecycle.
  * Maintains strict separation from task execution and provider dispatch authority.
  */
+const ACTIVE_TASK_STATES = new Set(['CODING', 'VALIDATING', 'DISPATCHED', 'REVIEWING']);
+
+/** A scheduled check runs only when it cannot discard an update already found or downloaded (#298). */
+export function shouldCheckForUpdates(state: string): boolean {
+  return state === 'IDLE' || state === 'NO_UPDATE_AVAILABLE' || state === 'ERROR';
+}
+
 export class UpdateService extends EventEmitter {
   private state: UpdateState = 'IDLE';
   private currentVersion: string;
@@ -326,12 +333,17 @@ export class UpdateService extends EventEmitter {
     }
 
     try {
-      // Check for active projects/tasks in critical execution states
-      const projects = this.repository.getAllProjects();
-      for (const project of projects) {
-        const tasks = this.repository.getTasksByProject(project.id);
-        for (const task of tasks) {
-          if (task.state === 'CODING' || task.state === 'VALIDATING' || task.state === 'DISPATCHED') {
+      // Work can be running in a RUNNING project, or a coder run can still be in
+      // flight anywhere. A paused or trashed project with a task left in CODING
+      // runs nothing and must not block updates forever (#298).
+      const repository = this.repository;
+      for (const project of repository.getAllProjects()) {
+        if (repository.isProjectTrashed?.(project.id)) continue;
+        const running = project.status === 'RUNNING';
+        for (const task of repository.getTasksByProject(project.id)) {
+          const inFlight = repository.getExecutionAuthorizationsByTask?.(task.id)
+            ?.some((auth) => auth.status === 'DISPATCHED' && !auth.settled_at) ?? false;
+          if (inFlight || (running && ACTIVE_TASK_STATES.has(task.state))) {
             return {
               safe: false,
               reason: `Task "${task.title}" (${task.id}) is currently in state ${task.state}. Restarting now may interrupt active execution.`,

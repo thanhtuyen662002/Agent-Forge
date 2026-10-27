@@ -181,4 +181,4 @@ While developing the product, preserve these established invariants unless an Is
 - provider failures do not silently become task success;
 - secrets stay outside Git and sanitized evidence;
 - protected `main` and required CI checks are not bypassed;
-- release publication remains owner-controlled unless repository policy is explicitly changed.
+- production (stable) release publication remains owner-controlled unless repository policy is explicitly changed. At the owner's request (2026-10-27, #298), unsigned **dev-channel pre-releases** are published automatically from green `main` by `.github/workflows/dev-channel.yml` so installed apps can update themselves; see `docs/RELEASES.md`.

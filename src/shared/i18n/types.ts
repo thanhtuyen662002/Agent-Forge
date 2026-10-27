@@ -1299,4 +1299,14 @@ export interface TranslationDictionary {
     codexConfigLabel: string;
     tryIt: string;
   };
+  updateNotice: {
+    update: string;
+    hint: string;
+    downloading: string;
+    restarting: string;
+    waiting: string;
+    waitingHint: string;
+    failed: string;
+    retry: string;
+  };
 }

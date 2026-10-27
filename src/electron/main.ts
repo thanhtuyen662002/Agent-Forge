@@ -9,7 +9,7 @@ import {
   RendererTarget,
   resolveRendererTarget,
 } from './pathHelper';
-import { UpdateService } from '../core/services/UpdateService';
+import { UpdateService, shouldCheckForUpdates } from '../core/services/UpdateService';
 import { ElectronUpdaterAdapter } from './updaterAdapter';
 import { DesktopAutomationService } from '../core/services/DesktopAutomationService';
 import { AccountQuotaService } from '../core/services/AccountQuotaService';
@@ -233,6 +233,7 @@ app.whenReady().then(() => {
   void mcpInstance.start();
   automationInstance.start();
   quotaInstance.start();
+  scheduleUpdateChecks();
   void quotaInstance.refreshAll();
 
   // Create Desktop Window
@@ -244,6 +245,22 @@ app.whenReady().then(() => {
     }
   });
 });
+
+/**
+ * Dev-channel updates (#298): a check shortly after start and every 4 hours.
+ * An update already found or downloaded is never re-checked away; installing
+ * stays the owner's one click.
+ */
+function scheduleUpdateChecks(): void {
+  if (!app.isPackaged) return;
+  const check = () => {
+    const service = updateServiceInstance;
+    if (!service || !shouldCheckForUpdates(service.getState().state)) return;
+    void service.checkForUpdates().catch(() => undefined);
+  };
+  setTimeout(check, 30_000).unref?.();
+  setInterval(check, 4 * 60 * 60_000).unref?.();
+}
 
 app.on('window-all-closed', () => {
   if (process.platform !== 'darwin') {
