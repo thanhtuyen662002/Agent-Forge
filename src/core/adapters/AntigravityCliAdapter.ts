@@ -8,9 +8,12 @@ import { AgentExecutionRequest, AgentExecutionResult, RuntimeErrorCode } from '.
 import { NativeProfileResolver } from '../credentials/NativeProfileResolver';
 import { parseNativeProfileRef } from '../credentials/NativeProfileRef';
 import { ProcessRunResult } from '../services/ProcessRunner';
+import type { AntigravityCredentialSlots } from '../credentials/AntigravityCredentialSlots';
 
 export interface AntigravityCliAdapterOptions extends LocalCliAdapterOptions {
   profileResolver?: NativeProfileResolver;
+  /** Per-account sign-ins (#304); without it every run uses the machine-wide sign-in. */
+  credentialSlots?: AntigravityCredentialSlots | null;
 }
 
 /** Windows command lines are limited to 32,767 characters; the prompt travels as an argument. */
@@ -29,11 +32,13 @@ export class AntigravityCliAdapter extends LocalCliAdapterBase {
   public readonly name: string = 'Antigravity CLI';
 
   readonly #profileResolver: NativeProfileResolver;
+  readonly #credentialSlots: AntigravityCredentialSlots | null;
 
   constructor(options?: AntigravityCliAdapterOptions) {
     // The prompt is the value of `-p`; stdin stays empty.
     super({ timeoutMs: 20 * 60_000, ...options, useStdin: false });
     this.#profileResolver = options?.profileResolver ?? new NativeProfileResolver();
+    this.#credentialSlots = options?.credentialSlots ?? null;
   }
 
   protected getDefaultExecutable(): string {
@@ -110,7 +115,9 @@ export class AntigravityCliAdapter extends LocalCliAdapterBase {
     } catch (error) {
       return fail(`PROFILE_RESOLUTION_FAILED: ${error instanceof Error ? error.message : 'profile could not be resolved'}`);
     }
-    return super.execute(request);
+    // agy reads one machine-wide sign-in: each run swaps in its own account's sign-in, one run at a time (#304).
+    const slots = this.#credentialSlots;
+    return slots ? slots.withAccount(request.runtimeBinding.accountId, () => super.execute(request)) : super.execute(request);
   }
 }
 

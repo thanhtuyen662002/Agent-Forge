@@ -1,3 +1,4 @@
+import type { AntigravityCredentialSlots } from '../credentials/AntigravityCredentialSlots';
 import { spawn } from 'child_process';
 import fs from 'fs';
 import os from 'os';
@@ -108,6 +109,8 @@ export interface CliAccountConnectionOptions {
   executableFor: (providerId: string) => string | null;
   profileResolver?: Pick<NativeProfileResolver, 'resolve'>;
   onVerified?: (accountId: string) => void | Promise<void>;
+  /** Per-account Antigravity sign-ins (#304): agy itself keeps only one machine-wide sign-in. */
+  antigravitySlots?: AntigravityCredentialSlots | null;
 }
 
 /**
@@ -123,12 +126,14 @@ export class CliAccountConnectionService {
   private readonly runner: CliRunner;
   private readonly executableFor: (providerId: string) => string | null;
   private readonly profileResolver: Pick<NativeProfileResolver, 'resolve'>;
+  private readonly antigravitySlots: AntigravityCredentialSlots | null;
   private readonly onVerified: CliAccountConnectionOptions['onVerified'];
 
   constructor(private readonly repo: Repository, options: CliAccountConnectionOptions) {
     this.runner = options.runner ?? new NodeCliRunner();
     this.executableFor = options.executableFor;
     this.profileResolver = options.profileResolver ?? new NativeProfileResolver();
+    this.antigravitySlots = options.antigravitySlots ?? null;
     this.onVerified = options.onVerified;
   }
 
@@ -156,10 +161,12 @@ export class CliAccountConnectionService {
   }
 
   /** Opens the CLI's sign-in in a terminal bound to this account's profile. */
-  public startSignIn(accountId: string): { success: true; cli: string } | { success: false; errorCode: CliSignInErrorCode } {
+  public async startSignIn(accountId: string): Promise<{ success: true; cli: string } | { success: false; errorCode: CliSignInErrorCode }> {
     const prepared = this.prepare(accountId);
     if (!prepared.ok) return { success: false, errorCode: prepared.errorCode };
     try {
+      // The machine-wide sign-in is set aside, so agy asks for this account's own sign-in (#304).
+      if (prepared.providerId === 'prov-antigravity-cli' && this.antigravitySlots) await this.antigravitySlots.prepareSignIn(accountId);
       this.runner.openTerminal(prepared.executable, prepared.driver.loginArgs, prepared.profileEnv, prepared.profileDirectory);
     } catch (error) {
       return { success: false, errorCode: error instanceof Error && error.message === 'UNSUPPORTED_PLATFORM' ? 'UNSUPPORTED_PLATFORM' : 'CLI_UNAVAILABLE' };
@@ -175,8 +182,12 @@ export class CliAccountConnectionService {
     const cwd = fs.mkdtempSync(path.join(os.tmpdir(), 'agent-forge-cli-check-'));
     let reason: CliVerifyReason;
     try {
-      reason = await prepared.driver.verify(
+      const check = () => prepared.driver.verify(
         (args, timeoutMs) => this.runner.run(prepared.executable, args, prepared.profileEnv, cwd, timeoutMs), prepared.profileDirectory);
+      // Antigravity: the check runs on this account's own sign-in, and a fresh sign-in becomes its slot (#304).
+      reason = prepared.providerId === 'prov-antigravity-cli' && this.antigravitySlots
+        ? await this.antigravitySlots.checkSignIn(accountId, check, (result) => result === 'VERIFIED')
+        : await check();
     } catch {
       reason = 'VERIFY_FAILED';
     } finally {

@@ -8,6 +8,8 @@ import { Repository } from '../src/core/database/repositories';
 import { NativeProfileResolver } from '../src/core/credentials/NativeProfileResolver';
 import { WorkspaceManagementService } from '../src/core/services/WorkspaceManagementService';
 import { CliAccountConnectionService, type CliRunner, type CliRunResult } from '../src/core/services/CliAccountConnectionService';
+import { ANTIGRAVITY_LIVE_TARGET, AntigravityCredentialSlots, antigravitySlotTarget } from '../src/core/credentials/AntigravityCredentialSlots';
+import type { CredentialRecord, CredentialVault } from '../src/core/credentials/WindowsCredentialVault';
 
 /** #242: Claude Code and Gemini sign-in through the CLI's own flow and check. */
 describe('Claude Code and Gemini account sign-in (#242)', () => {
@@ -53,7 +55,7 @@ describe('Claude Code and Gemini account sign-in (#242)', () => {
     let verifiedCallbacks = 0;
     const cli = service(() => { verifiedCallbacks += 1; });
 
-    expect(cli.startSignIn(accountId)).toEqual({ success: true, cli: 'Claude Code' });
+    expect(await cli.startSignIn(accountId)).toEqual({ success: true, cli: 'Claude Code' });
     expect(calls[0]).toMatchObject({ kind: 'open', args: ['auth', 'login'] });
     expect(calls[0].env).toEqual({ CLAUDE_CONFIG_DIR: profileDir }); // Only the profile variable is added.
     expect(calls[0].executable).toBe(path.join(tools, 'prov-claude-code-cli.exe'));
@@ -85,7 +87,7 @@ describe('Claude Code and Gemini account sign-in (#242)', () => {
     const accountId = addAgent('GEMINI_CLI');
     const profileDir = resolver.resolve(repo.getProviderAccount(accountId)!.profile_ref!).profileDirectory;
     const cli = service();
-    expect(cli.startSignIn(accountId)).toEqual({ success: true, cli: 'Gemini' });
+    expect(await cli.startSignIn(accountId)).toEqual({ success: true, cli: 'Gemini' });
     expect(calls[0].env).toEqual({ GEMINI_CLI_HOME: profileDir });
 
     expect(await cli.verify(accountId)).toEqual({ success: true, verified: false, reasonCode: 'NOT_SIGNED_IN' });
@@ -101,11 +103,35 @@ describe('Claude Code and Gemini account sign-in (#242)', () => {
     expect(repo.getProviderAccount(accountId)!.health_status).toBe('AVAILABLE');
   });
 
+  it('gives each Antigravity account its own sign-in although agy keeps one machine-wide (#304)', async () => {
+    const entries = new Map<string, CredentialRecord>();
+    const vault: CredentialVault = {
+      read: (t) => entries.get(t) ?? null, write: (t, r) => { entries.set(t, r); }, remove: (t) => { entries.delete(t); },
+    };
+    const cred = (s: string): CredentialRecord => ({ userName: 'antigravity', comment: null, persist: 2, blob: Buffer.from(s) });
+    entries.set(ANTIGRAVITY_LIVE_TARGET, cred('owner'));
+    const antigravitySlots = new AntigravityCredentialSlots(vault);
+    const cli = new CliAccountConnectionService(repo, { runner, executableFor: (id) => path.join(tools, `${id}.exe`), profileResolver: resolver, antigravitySlots });
+    const first = addAgent('ANTIGRAVITY_CLI');
+    const second = addAgent('ANTIGRAVITY_CLI');
+
+    for (const [accountId, secret] of [[first, 'first'], [second, 'second']] as const) {
+      expect(await cli.startSignIn(accountId)).toEqual({ success: true, cli: 'Antigravity' });
+      expect(entries.has(ANTIGRAVITY_LIVE_TARGET)).toBe(false); // agy asks for a fresh sign-in.
+      entries.set(ANTIGRAVITY_LIVE_TARGET, cred(secret)); // The owner signs in with this account.
+      nextRun = { exitCode: 0, stdout: '{"status":"OK"}' };
+      expect(await cli.verify(accountId)).toMatchObject({ verified: true });
+    }
+    expect(entries.get(antigravitySlotTarget(first))!.blob.toString()).toBe('first');
+    expect(entries.get(antigravitySlotTarget(second))!.blob.toString()).toBe('second');
+    expect(entries.get(ANTIGRAVITY_LIVE_TARGET)!.blob.toString()).toBe('owner');
+  });
+
   it('signs Antigravity in through agy itself and verifies with a read-only prompt; a quota error still proves the sign-in (#265)', async () => {
     const accountId = addAgent('ANTIGRAVITY_CLI');
     const profileDir = resolver.resolve(repo.getProviderAccount(accountId)!.profile_ref!).profileDirectory;
     const cli = service();
-    expect(cli.startSignIn(accountId)).toEqual({ success: true, cli: 'Antigravity' });
+    expect(await cli.startSignIn(accountId)).toEqual({ success: true, cli: 'Antigravity' });
     expect(calls[0]).toMatchObject({ kind: 'open', args: [] });
     expect(calls[0].env).toEqual({ USERPROFILE: profileDir, HOME: profileDir });
 
@@ -123,10 +149,10 @@ describe('Claude Code and Gemini account sign-in (#242)', () => {
   });
 
   it('refuses Codex accounts (they use device-code sign-in) and missing CLIs', async () => {
-    expect(service().startSignIn(addAgent('CODEX_CLI'))).toEqual({ success: false, errorCode: 'NOT_A_SUPPORTED_CLI_ACCOUNT' });
+    expect(await service().startSignIn(addAgent('CODEX_CLI'))).toEqual({ success: false, errorCode: 'NOT_A_SUPPORTED_CLI_ACCOUNT' });
     const claude = addAgent('CLAUDE_CODE_CLI');
     const noCli = new CliAccountConnectionService(repo, { runner, executableFor: () => path.join(tools, 'missing.exe'), profileResolver: resolver });
-    expect(noCli.startSignIn(claude)).toEqual({ success: false, errorCode: 'CLI_UNAVAILABLE' });
+    expect(await noCli.startSignIn(claude)).toEqual({ success: false, errorCode: 'CLI_UNAVAILABLE' });
     expect(calls).toEqual([]);
   });
 
