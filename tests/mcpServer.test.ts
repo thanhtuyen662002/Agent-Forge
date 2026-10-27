@@ -27,7 +27,8 @@ describe('local MCP server (#289)', () => {
     const target = new URL(url);
     return new Promise((resolve, reject) => {
       const payload = body === undefined ? undefined : JSON.stringify(body);
-      const req = http.request({ host: '127.0.0.1', port: target.port, path: target.pathname, method,
+      // A fresh connection per request: no reuse of a socket the server closed.
+      const req = http.request({ host: '127.0.0.1', port: target.port, path: target.pathname, method, agent: false,
         headers: { 'Content-Type': 'application/json', Accept: 'application/json, text/event-stream', Authorization: `Bearer ${token}`, ...headers } }, (res) => {
         const chunks: Buffer[] = [];
         res.on('data', (chunk) => chunks.push(chunk));

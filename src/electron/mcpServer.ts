@@ -136,9 +136,13 @@ export class AgentForgeMcpServer implements McpSettingsControl {
   }
 
   private async handle(req: http.IncomingMessage, res: http.ServerResponse): Promise<void> {
+    let bodyRead = false;
     const reply = (status: number, body?: unknown, headers: Record<string, string> = {}) => {
-      if (body === undefined) { res.writeHead(status, headers).end(); return; }
-      res.writeHead(status, { 'Content-Type': 'application/json', ...headers }).end(JSON.stringify(body));
+      // A request answered before its body was read closes its connection, so a
+      // kept-alive socket is never reused with unread bytes.
+      const connection: Record<string, string> = bodyRead ? {} : { Connection: 'close' };
+      if (body === undefined) { res.writeHead(status, { ...connection, ...headers }).end(); return; }
+      res.writeHead(status, { 'Content-Type': 'application/json', ...connection, ...headers }).end(JSON.stringify(body));
     };
     try {
       const host = String(req.headers.host ?? '').toLowerCase();
@@ -151,7 +155,7 @@ export class AgentForgeMcpServer implements McpSettingsControl {
       if (req.method !== 'POST') { reply(405, { error: 'METHOD_NOT_ALLOWED' }, { Allow: 'POST' }); return; }
 
       let body: unknown;
-      try { body = JSON.parse(await readBody(req)); }
+      try { const raw = await readBody(req); bodyRead = true; body = JSON.parse(raw); }
       catch (error) {
         if (error instanceof BodyTooLargeError) { reply(413, { error: 'PAYLOAD_TOO_LARGE' }); return; }
         reply(400, rpcError(null, -32700, 'Parse error'));
