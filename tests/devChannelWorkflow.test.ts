@@ -27,8 +27,16 @@ describe('dev-channel release workflow', () => {
   it('stamps the version in CI only and publishes a pre-release, never the stable channel', () => {
     expect(workflow).toContain('DEV_VERSION: 0.1.${{ github.run_number }}');
     expect(workflow).toContain('npm version "$DEV_VERSION" --no-git-tag-version');
-    expect(workflow).toContain('-c.publish.releaseType=prerelease');
     expect(workflow).not.toMatch(/git (commit|push)/);
-    expect(workflow).toContain('--prerelease');
+  });
+
+  it('creates the release once, with the installer, blockmap and latest.yml (#300)', () => {
+    expect(workflow).not.toContain('--publish always');
+    expect(workflow).toContain('npx electron-builder --win nsis --publish never');
+    expect(workflow.match(/gh release create/g)).toHaveLength(1);
+    expect(workflow).toContain('gh release create "v$DEV_VERSION" "$ASSET" "$ASSET.blockmap" latest.yml');
+    expect(workflow).toContain('--prerelease --target "$TESTED_SHA"');
+    expect(workflow).toContain('grep -qx "version: $DEV_VERSION" latest.yml');
+    expect(workflow).toContain('test -f "$built" && test -f "$built.blockmap"');
   });
 });
