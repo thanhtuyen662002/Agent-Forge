@@ -1276,4 +1276,27 @@ export interface TranslationDictionary {
       FIX_REQUIRED: string;
     };
   };
+  externalAi: {
+    title: string;
+    subtitle: string;
+    toggle: string;
+    warning: string;
+    unavailable: string;
+    running: string;
+    errors: {
+      PORT_IN_USE: string;
+      START_FAILED: string;
+      OTHER: string;
+    };
+    token: string;
+    show: string;
+    hide: string;
+    regenerate: string;
+    copy: string;
+    copied: string;
+    claudeLabel: string;
+    codexTokenLabel: string;
+    codexConfigLabel: string;
+    tryIt: string;
+  };
 }

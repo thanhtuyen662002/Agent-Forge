@@ -8,7 +8,7 @@ import Database from 'better-sqlite3';
 import { MigrationRunner } from '../src/core/database/migrations';
 import { Repository } from '../src/core/database/repositories';
 import { VerificationCapabilityService } from '../src/core/services/VerificationCapabilityService';
-import { registerIpcHandlers, IpcSenderTrustError } from '../src/electron/ipcHandlers';
+import { registerIpcHandlers, IpcSenderTrustError, type IpcHandlerRegistry } from '../src/electron/ipcHandlers';
 
 const native = vi.hoisted(() => ({
   handlers: new Map<string, (event: unknown, payload: unknown) => Promise<any>>(),
@@ -24,6 +24,7 @@ describe('native owner verification capability IPC', () => {
   let root: string;
   let database: Database.Database;
   let repo: Repository;
+  let registry: IpcHandlerRegistry;
   const trusted = { senderFrame: { url: 'http://localhost:5173/settings' } };
   const save = (commands: unknown, extra = {}) => native.handlers.get('verification:saveCommands')!(trusted, { projectId: 'P', commands, ...extra });
   beforeEach(() => {
@@ -39,13 +40,45 @@ describe('native owner verification capability IPC', () => {
     if (!fs.existsSync(path.join(root, '.git'))) initializeFixtureGit('git', ['init', '-q', '--template=', '--initial-branch=main'], { cwd: root, stdio: 'ignore', windowsHide: true });
     repo.createProject({ id: 'P', name: 'Owned test project', repository_path: root, default_branch: 'main',
       description: null, status: 'READY', contract: null, created_at: now, updated_at: now, started_at: null, completed_at: null }, captureRepositoryRoot(root));
-    registerIpcHandlers(repo, {} as any, {} as any, {} as any, {} as any, undefined, undefined, undefined, undefined, {} as any);
+    registry = registerIpcHandlers(repo, {} as any, {} as any, {} as any, {} as any, undefined, undefined, undefined, undefined, {} as any);
   });
   afterEach(() => {
     database.close();
     vi.restoreAllMocks();
     if (fs.realpathSync.native(root) !== root || !path.basename(root).startsWith('af-cap-ipc-')) throw new Error('FIXTURE_BOUNDARY_CHANGED');
     fs.rmSync(root, { recursive: true, force: true });
+  });
+
+  describe('authenticated local MCP caller (#289)', () => {
+    it('approves on the owner delegation without the native dialog, and still refuses unsafe commands', async () => {
+      const saved = await registry.invoke('verification:saveCommands', { projectId: 'P', commands: { TEST: 'node --version' } }) as any;
+      expect(saved.success).toBe(true);
+      expect(native.confirm).not.toHaveBeenCalled();
+      expect(repo.getVerificationCommandsByProject('P')).toHaveLength(1);
+      expect(await registry.invoke('verification:saveCommands', { projectId: 'P', commands: { TEST: 'node -e evil()' } })).toMatchObject({ success: false });
+    });
+
+    it('keeps the trash fence', async () => {
+      repo.insertTrashEntry('PROJECT', 'P', 'P', new Date().toISOString());
+      expect(await registry.invoke('verification:saveCommands', { projectId: 'P', commands: { TEST: 'node --version' } }))
+        .toMatchObject({ success: false, errorCode: 'ENTITY_IN_TRASH' });
+    });
+
+    it('refuses every channel outside its allow-list', async () => {
+      for (const channel of ['mcp:getSettings', 'mcp:regenerateToken', 'dialog:selectRepository', 'accounts:startCliSignIn', 'update:installAndRestart', 'no:such']) {
+        await expect(registry.invoke(channel, {})).rejects.toThrow('MCP_CHANNEL_NOT_ALLOWED');
+      }
+    });
+
+    it('checks a named repository like the native folder picker', async () => {
+      expect(await registry.selectRepositoryPath(root)).toMatchObject({ success: true, selectionId: expect.any(String) });
+      const plain = fs.realpathSync.native(fs.mkdtempSync(path.join(os.tmpdir(), 'af-cap-ipc-plain-')));
+      try {
+        expect(await registry.selectRepositoryPath(plain)).toMatchObject({ success: false });
+      } finally {
+        fs.rmSync(plain, { recursive: true, force: true });
+      }
+    });
   });
 
   it('requires explicit native confirmation despite a trusted renderer frame', async () => {
