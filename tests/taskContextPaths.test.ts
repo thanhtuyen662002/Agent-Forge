@@ -42,6 +42,18 @@ describe('task context path validation (#254)', () => {
     expect(validateContextPaths(root, ['.git/new-file'], { allowMissing: true })).toMatchObject({ ok: false, reasonCode: 'CONTEXT_PATH_DENIED' });
   });
 
+  it('accepts a trailing separator or a leading ./ written by the Manager (#291)', () => {
+    expect(validateContextPaths(root, ['src/feature/', './README.md', 'src\\feature\\'])).toEqual({ ok: true, paths: ['src/feature', 'README.md'] });
+    expect(validateContextPaths(root, ['../outside/'])).toMatchObject({ ok: false, reasonCode: 'CONTEXT_PATH_INVALID' });
+    expect(validateContextPaths(root, ['.env/'])).toMatchObject({ ok: false, reasonCode: 'CONTEXT_PATH_DENIED' });
+    expect(validateContextPaths(root, ['src/*.ts'])).toMatchObject({ ok: false });
+  });
+
+  it('when planning, drops patterns and the repository root instead of failing the plan (#291)', () => {
+    expect(validateContextPaths(root, ['src/*.ts', '.', './', 'README.md', 'test/'], { allowMissing: true }))
+      .toEqual({ ok: true, paths: ['README.md', 'test'], newPaths: ['test'] });
+  });
+
   it('rejects a link, which could leave the repository', () => {
     const outside = fs.mkdtempSync(path.join(os.tmpdir(), 'task-context-outside-'));
     try {
