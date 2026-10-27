@@ -304,13 +304,18 @@ describe('issued capability process boundary', () => {
 
   it('starts the exact approved executable with the boundary environment', async () => {
     const script = path.join(root, 'environment.js');
-    fs.writeFileSync(script, "process.stdout.write(JSON.stringify({value:process.env.AF_CAPABILITY_SENTINEL??null,profile:process.env.USERPROFILE??null,home:process.env.HOME??null,path:process.env.PATH}));");
+    fs.writeFileSync(script, "const fs=require('fs');process.stdout.write(JSON.stringify({value:process.env.AF_CAPABILITY_SENTINEL??null,profile:process.env.USERPROFILE??null,home:process.env.HOME??null,homedir:require('os').homedir(),entries:fs.readdirSync(process.env.USERPROFILE),appdata:fs.statSync(process.env.APPDATA).isDirectory(),path:process.env.PATH}));");
     const { payload, boundary } = await approve(['environment.js']);
     const result = await ProcessRunner.execute({ executable: payload.executable.path, args: payload.args, cwd: root, timeoutMs: 10000,
       verificationBoundary: boundary, env: { AF_CAPABILITY_SENTINEL: 'fixture-value-must-not-inherit' }, allowedEnvKeys: ['AF_CAPABILITY_SENTINEL'] });
     expect(result.processStart).toBe('STARTED_PROVEN');
     expect(result.exitCode).toBe(0);
-    expect(JSON.parse(result.stdout)).toEqual({ value: null, profile: '', home: '', path: boundary.environment.PATH });
+    // A fresh, empty profile of its own (#314): os.homedir() works, nothing of the owner's profile is inherited.
+    const profile = boundary.environment.USERPROFILE;
+    expect(profile.startsWith(path.join(fs.realpathSync.native(os.tmpdir()), 'agent-forge-verification') + path.sep)).toBe(true);
+    expect(profile).not.toBe(os.homedir());
+    expect(JSON.parse(result.stdout)).toEqual({ value: null, profile, home: profile, homedir: profile, entries: ['AppData'], appdata: true, path: boundary.environment.PATH });
+    expect(fs.existsSync(profile)).toBe(false); // Removed once the run ended.
     expect(boundary.environment).not.toHaveProperty('NODE_OPTIONS');
   });
 

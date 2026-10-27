@@ -36,7 +36,7 @@ export class AntigravityCliAdapter extends LocalCliAdapterBase {
 
   constructor(options?: AntigravityCliAdapterOptions) {
     // The prompt is the value of `-p`; stdin stays empty.
-    super({ timeoutMs: 20 * 60_000, ...options, useStdin: false });
+    super({ ...options, useStdin: false });
     this.#profileResolver = options?.profileResolver ?? new NativeProfileResolver();
     this.#credentialSlots = options?.credentialSlots ?? null;
   }

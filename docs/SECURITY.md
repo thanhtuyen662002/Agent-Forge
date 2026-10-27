@@ -37,6 +37,8 @@ interface ProcessExecutionOptions {
 1. **`shell: false` By Default**: Commands are spawned directly with argument vectors, preventing shell expansion, piping, and command chaining (`&&`, `||`, `;`, `|`).
 2. **Path Sanitization**: `cwd` must resolve to an allowed subpath inside the project repository.
 3. **Emergency Stop Hook**: All spawned processes register their PID in a tracked registry. Emergency Stop invokes process-tree termination.
+4. **Isolated verification profile (#314)**: Project test and lint commands never see the owner's profile. Each verification boundary gets its own fresh, empty profile under the temp directory: `USERPROFILE`, `HOME`, `APPDATA` and `LOCALAPPDATA` point there. That lets `os.homedir()` work, and the profile is removed, without following links, once the run ends.
+5. **CLI run limit**: A coder, reviewer or Manager CLI run is stopped after 20 minutes (`DEFAULT_CLI_RUN_TIMEOUT_MS`). The earlier 2-minute default cut off ordinary coding runs.
 
 ---
 
