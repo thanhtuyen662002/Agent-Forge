@@ -16,6 +16,7 @@ export const ManagerDecisionsPanel: React.FC<{ projectId: string }> = ({ project
   const [loadFailed, setLoadFailed] = useState(false);
   const [actionFailed, setActionFailed] = useState(false);
   const [busy, setBusy] = useState(false);
+  const [parallel, setParallel] = useState<{ projectId: string; count: number } | null>(null);
   const currentProject = useRef(projectId);
   currentProject.current = projectId;
 
@@ -27,6 +28,9 @@ export const ManagerDecisionsPanel: React.FC<{ projectId: string }> = ({ project
       if (currentProject.current !== requested) return; // A reply for a project no longer shown.
       setState(next ? { projectId: requested, panel: next } : null);
       setLoadFailed(next === null);
+      const reply = api.getParallelTasks ? await api.getParallelTasks(requested) : null;
+      const count = reply?.success === true && Number.isInteger(reply.parallelTasks) ? reply.parallelTasks : null;
+      if (currentProject.current === requested && count !== null && count >= 1 && count <= 10) setParallel({ projectId: requested, count });
     } catch {
       if (currentProject.current === requested) setLoadFailed(true);
     }
@@ -77,6 +81,26 @@ export const ManagerDecisionsPanel: React.FC<{ projectId: string }> = ({ project
             >
               <option value="APPROVE">{t('runtime.managerPanel.modeApprove')}</option>
               <option value="AUTO">{t('runtime.managerPanel.modeAuto')}</option>
+            </select>
+          </label>
+        )}
+        {parallel?.projectId === projectId && (
+          <label className="text-xs text-slate-300 flex items-center gap-2" title={t('runtime.managerPanel.parallelHint')}>
+            <span>{t('runtime.managerPanel.parallelLabel')}</span>
+            <select
+              value={parallel.count}
+              disabled={busy}
+              onChange={(event) => {
+                const count = Number(event.target.value);
+                void run(async () => {
+                  const reply = await api.setParallelTasks(projectId, count);
+                  if (reply?.success) setParallel({ projectId, count });
+                  return reply;
+                });
+              }}
+              className="bg-surface border border-surface-border rounded-md px-2 py-1 text-slate-100"
+            >
+              {Array.from({ length: 10 }, (_, index) => index + 1).map((count) => <option key={count} value={count}>{count}</option>)}
             </select>
           </label>
         )}

@@ -288,6 +288,8 @@ export class WorkspaceManagementService {
         }
       }
 
+      if (input.workerSlots !== undefined) this.resizeWorkerSlots(agent, input.workerSlots, nowIso);
+
       if (input.displayName !== undefined && input.displayName !== agent.display_name) {
         this.repo.updateAgentDisplayName(agent.id, input.displayName);
       }
@@ -315,6 +317,39 @@ export class WorkspaceManagementService {
       }
       return agent.id;
     });
+  }
+
+  /**
+   * Changes how many tasks a CLI agent works on at once (#306). Growing reuses
+   * disabled slots, then adds new ones; shrinking disables only idle,
+   * unassigned slots, so running work keeps its slot.
+   */
+  private resizeWorkerSlots(agent: ManagedAgent, count: number, nowIso: string): void {
+    const resource = agent.provider_resource_id ? this.repo.getProviderResource(agent.provider_resource_id) : null;
+    const accountId = resource?.provider_account_id;
+    if (!resource || !accountId) {
+      throw new AgentManagementError('INVALID_INPUT', 'Manual Bridge agents are relayed by the owner and use no worker slots.');
+    }
+    const slots = this.repo.getWorkerSlotsByAccount(accountId)
+      .filter((slot) => slot.provider_resource_id === resource.id)
+      .sort((a, b) => a.slot_index - b.slot_index);
+    const surplus = slots.filter((slot) => slot.slot_index > count && slot.status !== 'DISABLED');
+    if (surplus.some((slot) => slot.status !== 'IDLE' || slot.current_assignment_id || slot.current_execution_id)) {
+      throw new AgentManagementError('AGENT_HAS_ACTIVE_WORK', 'A slot to remove is still working; try again when it is idle.');
+    }
+    for (const slot of surplus) this.repo.updateWorkerSlotStatus(slot.id, 'DISABLED');
+    const suffix = accountId.replace(/^acct-/, '');
+    for (let index = 1; index <= count; index += 1) {
+      const existing = slots.find((slot) => slot.slot_index === index);
+      if (existing?.status === 'DISABLED') this.repo.updateWorkerSlotStatus(existing.id, 'IDLE', null, null);
+      else if (!existing) {
+        this.repo.createWorkerSlot({
+          id: `slot-${suffix}-${index}`, provider_account_id: accountId, provider_resource_id: resource.id, slot_index: index,
+          status: 'IDLE', current_assignment_id: null, current_execution_id: null, heartbeat_at: null, created_at: nowIso, updated_at: nowIso,
+        });
+      }
+    }
+    this.repo.updateProviderAccount(accountId, { concurrency_limit: count });
   }
 
   public removeAgent(payload: unknown): AgentManagementResult {

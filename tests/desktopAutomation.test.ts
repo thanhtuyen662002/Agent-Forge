@@ -57,6 +57,10 @@ describe('desktop automation runtime', () => {
   let coderFailures = 0;
   /** Coder accounts whose runs return FAILED (an account Google asked to verify). */
   let failingAccounts = new Set<string>();
+  /** When set, coder runs wait for it, so concurrent runs can be counted. */
+  let coderGate: Promise<void> | null = null;
+  let activeCoders = 0;
+  let maxActiveCoders = 0;
   const synthetic = (id: string, capabilities: Array<'CODING' | 'REVIEW' | 'PLANNING'> = ['CODING', 'REVIEW', 'PLANNING']): ProviderAdapter => ({
     id,
     name: 'Synthetic CLI coder',
@@ -74,6 +78,11 @@ describe('desktop automation runtime', () => {
         return managerReply(request);
       }
       adapterCalls += 1;
+      if (coderGate) {
+        activeCoders += 1;
+        maxActiveCoders = Math.max(maxActiveCoders, activeCoders);
+        try { await coderGate; } finally { activeCoders -= 1; }
+      }
       if (coderFailures > 0 || failingAccounts.has(request.runtimeBinding?.accountId ?? '')) {
         if (coderFailures > 0) coderFailures -= 1;
         return { executionId: request.runtimeBinding?.executionId ?? 'x', status: 'FAILED', error: 'synthetic provider failure', rawResponse: '' };
@@ -125,6 +134,9 @@ describe('desktop automation runtime', () => {
     adapterCalls = 0;
     coderFailures = 0;
     failingAccounts = new Set();
+    coderGate = null;
+    activeCoders = 0;
+    maxActiveCoders = 0;
     healthy = true;
     reviewRequests = [];
     reviewReply = () => { throw new Error('no review expected'); };
@@ -146,9 +158,9 @@ describe('desktop automation runtime', () => {
     await performSafeCleanup({ dbs: [db], tempDirs: [tempDir] });
   });
 
-  const addCodexCoder = (displayName = 'Codex coder') => {
+  const addCodexCoder = (displayName = 'Codex coder', workerSlots = 1) => {
     const created = new WorkspaceManagementService(repo).createAgent({
-      displayName, role: 'CODER', connection: 'CODEX_CLI', modelName: 'gpt-5-codex', workerSlots: 1,
+      displayName, role: 'CODER', connection: 'CODEX_CLI', modelName: 'gpt-5-codex', workerSlots,
     });
     expect(created.success).toBe(true);
     return created;
@@ -300,6 +312,42 @@ describe('desktop automation runtime', () => {
     await service.tick();
     expect(repo.getTask(task.id)!.progress_cache_percent).toBe(41);
   }, 180_000);
+
+  describe.runIf(process.platform === 'win32')('parallel tasks per project (#306)', () => {
+    const runParallel = async (parallelTasks: number, maxConcurrentExecutions = 10) => {
+      verify(addCodexCoder('Codex coder', 3)); // One agent, three worker slots.
+      for (let i = 0; i < 3; i += 1) await approvedTask();
+      repo.setProjectParallelTasks(projectId, parallelTasks);
+      let release!: () => void;
+      coderGate = new Promise<void>((resolve) => { release = resolve; });
+      service = new DesktopAutomationService(repo, events, registry, { worktreeRoot: path.join(tempDir, 'worktrees'), timer: fakeTimer, maxConcurrentExecutions });
+      await service.tick();
+      // Give every started run time to reach the coder.
+      for (let i = 0; i < 400 && activeCoders < Math.min(parallelTasks, maxConcurrentExecutions); i += 1) await new Promise((r) => setTimeout(r, 100));
+      await new Promise((r) => setTimeout(r, 300));
+      const concurrent = activeCoders;
+      release();
+      await service.drain();
+      return concurrent;
+    };
+
+    it('runs three tasks at once on one agent with three slots', async () => {
+      const c = await runParallel(3);
+      expect(c).toBe(3);
+      expect(maxActiveCoders).toBe(3);
+      expect(adapterCalls).toBe(3);
+    }, 180_000);
+
+    it('keeps one task at a time with the default setting', async () => {
+      expect(await runParallel(1)).toBe(1);
+      expect(maxActiveCoders).toBe(1);
+    }, 180_000);
+
+    it('never exceeds the global cap', async () => {
+      expect(await runParallel(3, 2)).toBe(2);
+      expect(maxActiveCoders).toBe(2);
+    }, 180_000);
+  });
 
   it.runIf(process.platform === 'win32')('stops retrying a revision after three failed runs (#295)', async () => {
     verify(addCodexCoder());
@@ -1374,6 +1422,16 @@ describe('desktop automation runtime', () => {
       const instructions = managerRequests[0].instructions.join(' ');
       expect(instructions).toContain('Tasks run one at a time in the listed order');
       expect(instructions).not.toContain('Tasks run in parallel');
+    });
+
+    it('tells the Manager to plan self-contained tasks when several run at once (#306)', async () => {
+      addManager();
+      repo.setProjectAutoIntegrate(projectId, true);
+      repo.setProjectParallelTasks(projectId, 3);
+      managerReply = planReply();
+      service = planningService();
+      await pass();
+      expect(managerRequests[0].instructions.join(' ')).toContain('Tasks run in parallel');
     });
 
     it('proposes the plan in approve mode and creates nothing until the owner approves', async () => {

@@ -184,6 +184,8 @@ app.whenReady().then(() => {
     bootstrapInstance.providerRegistry,
     {
       worktreeRoot: path.join(userDataDir, 'worktrees'),
+      // Up to 10 operations at once; each project's own setting and each agent's slots bound it further (#306).
+      maxConcurrentExecutions: 10,
       taskService: bootstrapInstance.taskService,
       verificationService: bootstrapInstance.verificationService,
     },

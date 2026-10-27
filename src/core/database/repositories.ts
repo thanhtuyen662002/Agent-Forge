@@ -405,6 +405,32 @@ export class Repository {
     return enabled;
   }
 
+  /** How many of the project's tasks coders may work on at once (#306); 1 when unset. */
+  public getProjectParallelTasks(projectId: string): number {
+    const row = this.db
+      .prepare('SELECT value_json FROM project_settings WHERE project_id = ? AND key = ?')
+      .get(projectId, 'automation.parallel_tasks') as { value_json?: unknown } | undefined;
+    try {
+      const value = typeof row?.value_json === 'string' ? JSON.parse(row.value_json) : 1;
+      return Number.isInteger(value) && value >= 1 && value <= 10 ? value : 1;
+    } catch {
+      return 1;
+    }
+  }
+
+  public setProjectParallelTasks(projectId: string, count: number): number {
+    if (!Number.isInteger(count) || count < 1 || count > 10) throw new Error('PARALLEL_TASKS_INVALID: value must be an integer from 1 to 10.');
+    if (!this.getProject(projectId)) throw new Error(`Project "${projectId}" not found.`);
+    this.db
+      .prepare(`
+        INSERT INTO project_settings (project_id, key, value_json)
+        VALUES (?, 'automation.parallel_tasks', ?)
+        ON CONFLICT(project_id, key) DO UPDATE SET value_json = excluded.value_json
+      `)
+      .run(projectId, JSON.stringify(count));
+    return count;
+  }
+
   public setProjectManagerMode(projectId: string, mode: 'AUTO' | 'APPROVE'): 'AUTO' | 'APPROVE' {
     if (mode !== 'AUTO' && mode !== 'APPROVE') throw new Error('MANAGER_MODE_INVALID: value must be AUTO or APPROVE.');
     if (!this.getProject(projectId)) throw new Error(`Project "${projectId}" not found.`);

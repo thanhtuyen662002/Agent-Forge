@@ -78,6 +78,8 @@ export interface OrchestratorApi {
   setAutoIntegrate: (projectId: string, enabled: boolean) => Promise<any>;
   mergeIntegration: (projectId: string, taskId: string) => Promise<any>;
   getMcpSettings: () => Promise<any>;
+  getParallelTasks: (projectId: string) => Promise<any>;
+  setParallelTasks: (projectId: string, parallelTasks: number) => Promise<any>;
   setMcpEnabled: (enabled: boolean) => Promise<any>;
   regenerateMcpToken: () => Promise<any>;
   createIntegrationBranch: (projectId: string, taskId: string) => Promise<any>;
@@ -226,6 +228,8 @@ const api: OrchestratorApi = {
   setAutoIntegrate: (projectId: string, enabled: boolean) => ipcRenderer.invoke('integration:setAuto', { projectId, enabled }),
   mergeIntegration: (projectId: string, taskId: string) => ipcRenderer.invoke('integration:merge', { projectId, taskId }),
   getMcpSettings: () => ipcRenderer.invoke('mcp:getSettings'),
+  getParallelTasks: (projectId: string) => ipcRenderer.invoke('automation:getParallelTasks', { projectId }),
+  setParallelTasks: (projectId: string, parallelTasks: number) => ipcRenderer.invoke('automation:setParallelTasks', { projectId, parallelTasks }),
   setMcpEnabled: (enabled: boolean) => ipcRenderer.invoke('mcp:setEnabled', { enabled }),
   regenerateMcpToken: () => ipcRenderer.invoke('mcp:regenerateToken'),
   createIntegrationBranch: (projectId: string, taskId: string) => ipcRenderer.invoke('integration:createBranch', { projectId, taskId }),

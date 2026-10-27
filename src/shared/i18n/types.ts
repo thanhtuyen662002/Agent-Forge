@@ -555,6 +555,8 @@ export interface TranslationDictionary {
       };
     };
     managerPanel: {
+      parallelLabel: string;
+      parallelHint: string;
       title: string;
       subtitle: string;
       modeLabel: string;

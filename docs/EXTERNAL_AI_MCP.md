@@ -53,7 +53,7 @@ across restarts.
 | `set_project_plan` | Saves the plan (contract): goal, acceptance criteria, tests, non-goals, rules for the agents, … |
 | `approve_plan` | Approves the saved plan |
 | `set_test_command` | Sets and approves the verification command, for example `node run-tests.js` |
-| `configure_automation` | Sets Manager mode `AUTO`/`APPROVE` and automatic integration into the default branch |
+| `configure_automation` | Sets Manager mode `AUTO`/`APPROVE`, automatic integration into the default branch, and `parallelTasks` (1–10 tasks at once, #306) |
 | `start_project` / `pause_project` / `resume_project` | Controls the project |
 | `add_task` | Adds a task by hand |
 | `list_events` | Returns the latest events, newest last |

@@ -487,6 +487,27 @@ one broken account cannot use up the attempts of the others. An Antigravity
 account that Google asks to verify ("not eligible … verify your account") is
 recorded as `AUTH_ERROR` and is skipped until it is signed in again.
 
+### Parallel tasks and worker slots (#306)
+
+- **Worker slots.** A CLI agent can have up to **10 worker slots**, the number of
+  tasks it works on at once. The count can be changed later in Agent Center.
+  Growing reuses disabled slots, then adds new ones. Shrinking disables only
+  idle slots; a slot that is still working refuses with `AGENT_HAS_ACTIVE_WORK`.
+- **Parallel tasks per project.** **Số task chạy song song** in the Manager panel
+  sets the project's `automation.parallel_tasks` (1–10, default 1). MCP sets it
+  with `configure_automation` and `parallelTasks`.
+  - **With 1,** tasks run one after another, and with automatic integration each
+    task sees the code of the tasks before it (#295).
+  - **With N > 1,** up to N coder runs of different tasks run at once next to the
+    project's single lane (verification, review, integration, Manager). The
+    Manager is then told to plan self-contained tasks.
+  - **Separation.** Each run keeps its own attempt, authorization, lease, slot and
+    worktree, and a task is never in two runs.
+- **Limits.**
+  - An agent is used by at most as many operations as it has enabled slots.
+  - At most 10 operations run across all projects.
+  - Antigravity runs still take turns, because they share one sign-in (#304).
+
 ### Project completion
 
 A finished project used to stay *running* forever, because nothing fired the

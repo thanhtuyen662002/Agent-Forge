@@ -94,9 +94,12 @@ export class DesktopAutomationService {
   private readonly resolveGit: () => string | null;
   private handle: unknown = null;
   private ticking = false;
-  private readonly inFlight = new Map<string, { kind: InFlightKind; taskId: string; agentId: string; promise: Promise<void> }>();
+  /** Keyed by project for its main lane, and by project#task for extra coder runs (#306). */
+  private readonly inFlight = new Map<string, { projectId: string; kind: InFlightKind; taskId: string; agentId: string; promise: Promise<void> }>();
   private readonly lastFailure = new Map<string, { taskId: string; revision: number; reasonCode: string; at?: number; count?: number }>();
   private readonly progressSignatures = new Map<string, string>();
+  /** Slots bound to runs that have not leased them yet, so parallel runs pick different slots (#306). */
+  private readonly boundSlots = new Map<string, string>();
   private readonly verifier: AutomatedVerificationService | null;
   private readonly reviewer: ProductReviewService | null;
   private readonly manager: ProductManagerService | null;
@@ -112,7 +115,7 @@ export class DesktopAutomationService {
     private readonly options: DesktopAutomationOptions,
   ) {
     this.intervalMs = Math.max(1_000, options.intervalMs ?? 15_000);
-    this.maxConcurrent = Math.min(2, Math.max(1, options.maxConcurrentExecutions ?? 1));
+    this.maxConcurrent = Math.min(10, Math.max(1, options.maxConcurrentExecutions ?? 1));
     this.now = options.now ?? (() => new Date().toISOString());
     this.timer = options.timer ?? {
       setInterval: (fn, ms) => { const h = setInterval(fn, ms); h.unref?.(); return h; },
@@ -209,70 +212,99 @@ export class DesktopAutomationService {
       for (const project of this.runnableProjects()) {
         if (this.inFlight.size >= this.maxConcurrent) break;
         this.refreshRunProgress(project);
-        if (this.inFlight.has(project.id)) continue;
-        // Settled work that was never verified (e.g. interrupted by a restart) comes first.
-        const pending = this.pendingVerification(project);
-        if (pending) {
-          const verify = this.runVerification(project, pending.id)
-            .catch(() => undefined)
-            .finally(() => this.inFlight.delete(project.id));
-          this.inFlight.set(project.id, { kind: 'VERIFICATION', taskId: pending.task_id, agentId: '', promise: verify });
-          continue;
-        }
-        // Verified work goes to an account-bound reviewer on a different account.
-        const toReview = this.reviewer?.pendingReview(project.id) ?? null;
-        if (toReview && !toReview.deferred) {
-          const reviewer = this.findAgent('REVIEWER', this.reviewer!.coderAccountOf(toReview.work));
-          if (reviewer) {
-            const review = this.runReview(project, toReview.task.id, toReview.work, reviewer)
-              .catch(() => undefined)
-              .finally(() => this.inFlight.delete(project.id));
-            this.inFlight.set(project.id, { kind: 'REVIEW', taskId: toReview.task.id, agentId: reviewer.agent.id, promise: review });
-            continue;
-          }
-        }
-        // Reviewed work lands on the default branch first when the owner opted in, so
-        // the next task starts from it (automatic integration).
-        if (this.repo.getProjectAutoIntegrate(project.id)) {
-          const ready = this.integration.hasReadyWork(project.id) ?? this.integration.hasUnmergedBranch(project.id);
-          if (ready) {
-            const integrate = this.integrate(project.id, ready)
-              .catch(() => undefined)
-              .finally(() => this.inFlight.delete(project.id));
-            this.inFlight.set(project.id, { kind: 'INTEGRATION', taskId: ready, agentId: '', promise: integrate });
-            continue;
-          }
-        }
-        // Finished work completes the project instead of waiting for an owner action (#283).
-        if (this.completeIfFinished(project)) continue;
-        // An approved contract with no tasks yet gets its planning record first (#245).
-        if (this.manager) { try { this.manager.ensurePlanningAnchor(project.id); } catch { /* next pass */ } }
-        // A task without Manager authority for its revision (or the plan) asks the Manager agent first.
-        const toDecide = this.manager?.pendingDecision(project.id) ?? null;
-        if (toDecide && !toDecide.deferred) {
-          const manager = this.findAgent('MANAGER');
-          if (manager) {
-            const decide = this.runManager(toDecide, manager)
-              .catch(() => undefined)
-              .finally(() => this.inFlight.delete(project.id));
-            this.inFlight.set(project.id, { kind: 'MANAGER', taskId: toDecide.task.id, agentId: manager.agent.id, promise: decide });
-            continue;
-          }
-        }
-        const task = this.nextEligibleTask(project);
-        if (!task) continue;
-        const coder = this.findCoderFor(task);
-        if (!coder) continue;
-        // execute() reports its own failures; this catch only keeps an unexpected
-        // throw from becoming an unhandled rejection in the main process.
-        const promise = this.execute(project, task, coder)
-          .catch(() => { this.lastFailure.set(task.id, { taskId: task.id, revision: task.revision_count, reasonCode: 'INTERNAL_ERROR' }); })
-          .finally(() => this.inFlight.delete(project.id));
-        this.inFlight.set(project.id, { kind: 'EXECUTION', taskId: task.id, agentId: coder.agent.id, promise });
+        if (!this.inFlight.has(project.id)) this.startMainLane(project);
+        this.startExtraRuns(project);
       }
     } finally {
       this.ticking = false;
     }
+  }
+
+  /**
+   * The project's single lane: unverified work, then review, integration,
+   * completion, planning and Manager decisions, then one coder run.
+   */
+  private startMainLane(project: Project): void {
+    // Settled work that was never verified (e.g. interrupted by a restart) comes first.
+    const pending = this.pendingVerification(project);
+    if (pending) {
+      const verify = this.runVerification(project, pending.id)
+        .catch(() => undefined)
+        .finally(() => this.inFlight.delete(project.id));
+      this.inFlight.set(project.id, { projectId: project.id, kind: 'VERIFICATION', taskId: pending.task_id, agentId: '', promise: verify });
+      return;
+    }
+    // Verified work goes to an account-bound reviewer on a different account.
+    const toReview = this.reviewer?.pendingReview(project.id) ?? null;
+    if (toReview && !toReview.deferred) {
+      const reviewer = this.findAgent('REVIEWER', this.reviewer!.coderAccountOf(toReview.work));
+      if (reviewer) {
+        const review = this.runReview(project, toReview.task.id, toReview.work, reviewer)
+          .catch(() => undefined)
+          .finally(() => this.inFlight.delete(project.id));
+        this.inFlight.set(project.id, { projectId: project.id, kind: 'REVIEW', taskId: toReview.task.id, agentId: reviewer.agent.id, promise: review });
+        return;
+      }
+    }
+    // Reviewed work lands on the default branch first when the owner opted in, so
+    // the next task starts from it (automatic integration).
+    if (this.repo.getProjectAutoIntegrate(project.id)) {
+      const ready = this.integration.hasReadyWork(project.id) ?? this.integration.hasUnmergedBranch(project.id);
+      if (ready) {
+        const integrate = this.integrate(project.id, ready)
+          .catch(() => undefined)
+          .finally(() => this.inFlight.delete(project.id));
+        this.inFlight.set(project.id, { projectId: project.id, kind: 'INTEGRATION', taskId: ready, agentId: '', promise: integrate });
+        return;
+      }
+    }
+    // Finished work completes the project instead of waiting for an owner action (#283).
+    if (this.completeIfFinished(project)) return;
+    // An approved contract with no tasks yet gets its planning record first (#245).
+    if (this.manager) { try { this.manager.ensurePlanningAnchor(project.id); } catch { /* next pass */ } }
+    // A task without Manager authority for its revision (or the plan) asks the Manager agent first.
+    const toDecide = this.manager?.pendingDecision(project.id) ?? null;
+    if (toDecide && !toDecide.deferred) {
+      const manager = this.findAgent('MANAGER');
+      if (manager) {
+        const decide = this.runManager(toDecide, manager)
+          .catch(() => undefined)
+          .finally(() => this.inFlight.delete(project.id));
+        this.inFlight.set(project.id, { projectId: project.id, kind: 'MANAGER', taskId: toDecide.task.id, agentId: manager.agent.id, promise: decide });
+        return;
+      }
+    }
+    const task = this.nextEligibleTask(project);
+    if (!task) return;
+    const coder = this.findCoderFor(task);
+    if (!coder) return;
+    this.startExecution(project, task, coder, project.id);
+  }
+
+  /** Up to N - 1 more coder runs of other tasks next to the main lane, when the owner allows N > 1 (#306). */
+  private startExtraRuns(project: Project): void {
+    const parallel = this.repo.getProjectParallelTasks(project.id);
+    if (parallel <= 1) return;
+    while (this.inFlight.size < this.maxConcurrent && this.executionsOf(project.id) < parallel) {
+      const task = this.nextEligibleTask(project);
+      if (!task) return;
+      const coder = this.findCoderFor(task);
+      if (!coder) return;
+      this.startExecution(project, task, coder, `${project.id}#${task.id}`);
+    }
+  }
+
+  private startExecution(project: Project, task: Task, coder: CoderCandidate, key: string): void {
+    // execute() reports its own failures; this catch only keeps an unexpected
+    // throw from becoming an unhandled rejection in the main process.
+    const promise = this.execute(project, task, coder)
+      .catch(() => { this.lastFailure.set(task.id, { taskId: task.id, revision: task.revision_count, reasonCode: 'INTERNAL_ERROR' }); })
+      .finally(() => { this.inFlight.delete(key); this.boundSlots.delete(task.id); });
+    this.inFlight.set(key, { projectId: project.id, kind: 'EXECUTION', taskId: task.id, agentId: coder.agent.id, promise });
+  }
+
+  private executionsOf(projectId: string): number {
+    return [...this.inFlight.values()].filter((item) => item.projectId === projectId && item.kind === 'EXECUTION').length;
   }
 
   public getStatus(): DesktopAutomationStatus {
@@ -288,7 +320,9 @@ export class DesktopAutomationService {
   private projectStatus(project: Project): ProjectAutomationStatus {
     const status = (phase: AutomationPhase, taskId: string | null = null, reasonCode: string | null = null): ProjectAutomationStatus =>
       ({ projectId: project.id, phase, taskId, reasonCode, updatedAt: this.now() });
-    const running = this.inFlight.get(project.id);
+    // The main lane first; otherwise an extra coder run of the project (#306).
+    const running = this.inFlight.get(project.id) ??
+      [...this.inFlight.values()].find((item) => item.projectId === project.id && item.kind === 'EXECUTION');
     if (running) {
       if (running.kind === 'REVIEW') return status('REVIEWING', running.taskId);
       if (running.kind === 'MANAGER') return status('DECIDING', running.taskId);
@@ -409,7 +443,9 @@ export class DesktopAutomationService {
   }
 
   private nextEligibleTask(project: Project): Task | null {
-    return this.authorizedTasks(project).find((task) => this.isDispatchable(task)) ?? null;
+    // A task is never in two runs, even before its authorization exists (#306).
+    const running = new Set([...this.inFlight.values()].filter((item) => item.kind === 'EXECUTION').map((item) => item.taskId));
+    return this.authorizedTasks(project).find((task) => !running.has(task.id) && this.isDispatchable(task)) ?? null;
   }
 
   /** Not already authorized, in flight, settled or failed for this exact revision. */
@@ -533,9 +569,10 @@ export class DesktopAutomationService {
    */
   private findAgent(role: AutomationRole, excludedAccounts: string | ReadonlySet<string> | null = null): CoderCandidate | null {
     const isExcluded = (accountId: string) => typeof excludedAccounts === 'string' ? accountId === excludedAccounts : excludedAccounts?.has(accountId) ?? false;
-    const reserved = new Set([...this.inFlight.values()].map((item) => item.agentId));
+    // An agent serves as many operations at once as it has enabled worker slots (#306).
+    const inFlightByAgent = new Map<string, number>();
+    for (const item of this.inFlight.values()) if (item.agentId) inFlightByAgent.set(item.agentId, (inFlightByAgent.get(item.agentId) ?? 0) + 1);
     for (const agent of this.repo.getAllAgents()) {
-      if (reserved.has(agent.id)) continue;
       const roleMatches = role === 'MANAGER' ? agent.role === 'PRIMARY_MANAGER' || agent.role === 'BACKUP_MANAGER' : agent.role === role;
       if (agent.removed_at || !roleMatches || agent.status === 'BUSY' || !agent.provider_resource_id || !agent.agent_profile_id) continue;
       const resource = this.repo.getProviderResource(agent.provider_resource_id);
@@ -548,9 +585,10 @@ export class DesktopAutomationService {
       const account = this.repo.getProviderAccount(resource.provider_account_id);
       if (!account?.enabled || !SCHEDULABLE_ACCOUNT_HEALTH.has(account.health_status)) continue;
       if (account.cooldown_until && Date.parse(account.cooldown_until) > Date.parse(this.now())) continue;
-      const idleSlot = this.repo.getWorkerSlotsByAccount(account.id).some((slot) =>
-        slot.provider_resource_id === resource.id && slot.status === 'IDLE' && !slot.current_assignment_id && !slot.current_execution_id);
+      const slots = this.repo.getWorkerSlotsByAccount(account.id).filter((slot) => slot.provider_resource_id === resource.id);
+      const idleSlot = slots.some((slot) => slot.status === 'IDLE' && !slot.current_assignment_id && !slot.current_execution_id);
       if (!idleSlot) continue;
+      if ((inFlightByAgent.get(agent.id) ?? 0) >= slots.filter((slot) => slot.status !== 'DISABLED').length) continue;
       const agentProfile = this.repo.getAgentProfile(agent.agent_profile_id);
       if (!agentProfile?.enabled) continue;
       return { agent, agentProfileId: agentProfile.id, roleProfileId: agentProfile.role_profile_id, accountId: account.id, resourceId: resource.id };
@@ -663,6 +701,7 @@ export class DesktopAutomationService {
         fail('NO_IDLE_SLOT');
         return;
       }
+      this.boundSlots.set(task.id, slotId);
       const head = await GitService.getHeadSha(project.repository_path);
       if (head.status !== 'SUCCESS' || !head.sha) {
         releaseUnclaimed();
@@ -786,6 +825,7 @@ export class DesktopAutomationService {
   /** Same eligibility and ordering as WorkerSlotLeaseService fresh allocation. */
   private chooseIdleSlot(coder: CoderCandidate): string | null {
     const unreleased = new Set(this.repo.getUnreleasedAccountLeasesByAccount(coder.accountId).map((lease) => lease.worker_slot_id));
+    for (const slotId of this.boundSlots.values()) unreleased.add(slotId);
     const eligible = this.repo.getWorkerSlotsByAccount(coder.accountId)
       .filter((slot) => slot.status === 'IDLE' && !slot.current_assignment_id && !slot.current_execution_id &&
         !unreleased.has(slot.id) && (slot.provider_resource_id === null || slot.provider_resource_id === coder.resourceId))
