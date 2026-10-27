@@ -698,6 +698,18 @@ describe('desktop automation runtime', () => {
       expect(reviewRequests).toHaveLength(1);
     }, 120_000);
 
+    it('releases a task left in REVIEWING by a BLOCKED verdict from before #308 (#310)', async () => {
+      const task = await approvedTask();
+      db.prepare("UPDATE tasks SET state = 'REVIEWING' WHERE id = ?").run(task.id);
+      events.record(projectId, 'AUTOMATION_REVIEW_BLOCKED', 'Automated review: BLOCKED.', { verdict: 'BLOCKED' }, task.id);
+      service = reviewingService();
+      await service.tick();
+      await service.drain();
+      const after = repo.getTask(task.id)!;
+      expect(after.state).toBe('CODING');
+      expect(after.revision_count).toBe(task.revision_count + 1);
+    }, 60_000);
+
     it('sends a BLOCKED verdict back to the coder at the next revision instead of stalling in REVIEWING (#308)', async () => {
       reviewReply = verdict('BLOCKED');
       const { task } = await runToReview();
