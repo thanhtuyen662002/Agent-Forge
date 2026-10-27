@@ -61,8 +61,14 @@ export function validateContextPaths(repositoryRoot: string, paths: readonly str
   const newPaths: string[] = [];
   const seen = new Set<string>();
   for (const raw of paths) {
+    // Found with the real Manager: "test/" for a directory. A trailing separator
+    // and a leading "./" change nothing about the path, so they are dropped.
+    const written = typeof raw === 'string' ? raw.replace(/^\.[\\/]/, '').replace(/(?<=[^\\/])[\\/]+$/, '') : raw;
+    // A pattern such as "src/*.js" names no single path; planning drops it instead of failing.
+    // So does the repository root itself (".", "./"), which adds nothing.
+    if (options.allowMissing && typeof written === 'string' && (/[*?]/.test(written) || written === '' || written === '.')) continue;
     let relative: string;
-    try { relative = canonicalizePortableRelativePath(raw); } catch { return { ok: false, reasonCode: 'CONTEXT_PATH_INVALID', path: String(raw) }; }
+    try { relative = canonicalizePortableRelativePath(written); } catch { return { ok: false, reasonCode: 'CONTEXT_PATH_INVALID', path: String(raw) }; }
     const key = relative.toLowerCase();
     if (seen.has(key)) continue;
     seen.add(key);
