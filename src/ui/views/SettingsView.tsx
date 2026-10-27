@@ -23,6 +23,7 @@ import {
 import { UpdateStateSummary } from '../../core/types/domain';
 import { CommandParser } from '../../core/services/CommandParser';
 import { DEFAULT_MAX_REVISIONS, parseMaxRevisions } from '../../shared/revisionPolicy';
+import { ExternalAiConnectionPanel } from '../components/ExternalAiConnectionPanel';
 
 export const SettingsView: React.FC = () => {
   const { locale, setLocale, t } = useI18n();
@@ -464,6 +465,9 @@ export const SettingsView: React.FC = () => {
           </button>
         </div>
       </div>
+
+      {/* External AI connection over the local MCP server (#289) */}
+      <ExternalAiConnectionPanel />
 
       {/* 2. Software Updates (PR #9 Installed-App Update Foundation) */}
       <div className="bg-surface-card border border-surface-border rounded-xl p-6 shadow-lg space-y-6">

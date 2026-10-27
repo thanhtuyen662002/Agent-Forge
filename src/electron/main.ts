@@ -15,6 +15,7 @@ import { DesktopAutomationService } from '../core/services/DesktopAutomationServ
 import { AccountQuotaService } from '../core/services/AccountQuotaService';
 import { CodexAccountConnectionService } from '../core/services/CodexAccountConnectionService';
 import { CliAccountConnectionService } from '../core/services/CliAccountConnectionService';
+import { AgentForgeMcpServer } from './mcpServer';
 
 let mainWindow: BrowserWindow | null = null;
 let bootstrapInstance: BootstrapResult | null = null;
@@ -22,6 +23,7 @@ let updateServiceInstance: UpdateService | null = null;
 let automationInstance: DesktopAutomationService | null = null;
 let quotaInstance: AccountQuotaService | null = null;
 let signInInstance: CodexAccountConnectionService | null = null;
+let mcpInstance: AgentForgeMcpServer | null = null;
 
 function createWindow(
   userDataDir: string,
@@ -206,8 +208,14 @@ app.whenReady().then(() => {
     onVerified: async () => { await automationForSignIn.tick(); },
   });
 
+  // Local MCP server for external AIs (#289): off until the owner enables it.
+  mcpInstance = new AgentForgeMcpServer({
+    settingsFile: path.join(userDataDir, 'mcp-settings.json'),
+    version: typeof app.getVersion === 'function' ? app.getVersion() : '0.1.0',
+  });
+
   // Register Typed & Validated IPC Handlers
-  registerIpcHandlers(
+  const ipcRegistry = registerIpcHandlers(
     bootstrapInstance.repo,
     bootstrapInstance.projectService,
     bootstrapInstance.taskService,
@@ -219,8 +227,10 @@ app.whenReady().then(() => {
     updateServiceInstance,
     undefined,
     navigationPolicy,
-    { automation: automationInstance, quota: quotaInstance, signIn: signInInstance, cliSignIn },
+    { automation: automationInstance, quota: quotaInstance, signIn: signInInstance, cliSignIn, mcp: mcpInstance },
   );
+  mcpInstance.attach(ipcRegistry);
+  void mcpInstance.start();
   automationInstance.start();
   quotaInstance.start();
   void quotaInstance.refreshAll();
@@ -247,6 +257,7 @@ app.on('before-quit', () => {
   automationInstance?.stop();
   quotaInstance?.stop();
   signInInstance?.dispose();
+  void mcpInstance?.stop();
   if (bootstrapInstance) {
     try {
       bootstrapInstance.dbEngine.close();

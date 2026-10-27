@@ -93,6 +93,38 @@ export class IpcSenderTrustError extends Error {
 
 type PrivilegedIpcHandler = (event: unknown, payload: unknown) => unknown | Promise<unknown>;
 
+/**
+ * The event handed to handlers for a call from the local MCP server (#289).
+ * A renderer never produces it; the MCP server authenticated the caller with
+ * the owner's token before invoking.
+ */
+const MCP_CALLER_EVENT = Object.freeze({ agentForgeMcpCaller: true });
+const isMcpCaller = (event: unknown): boolean => event === MCP_CALLER_EVENT;
+
+/** Channels an authenticated MCP caller may invoke; never credentials, sign-in, release or MCP settings. */
+export const MCP_INVOKABLE_CHANNELS: ReadonlySet<string> = new Set([
+  'project:list', 'project:get', 'project:create', 'project:importContract', 'project:transition',
+  'task:list', 'task:get', 'task:create', 'events:list', 'agents:roster',
+  'verification:getCommands', 'verification:saveCommands',
+  'automation:status', 'automation:managerDecisions', 'automation:setManagerMode', 'automation:decideManagerProposal',
+  'integration:list', 'integration:getAuto', 'integration:setAuto', 'integration:merge',
+  'control:resume',
+]);
+
+export interface IpcHandlerRegistry {
+  /** Runs a registered handler for the authenticated local MCP server, with the same fences as the renderer. */
+  invoke(channel: string, payload?: unknown): Promise<unknown>;
+  /** The native repository dialog's checks for a path the MCP caller names; returns a single-use selection. */
+  selectRepositoryPath(repositoryPath: string): Promise<unknown>;
+}
+
+/** Owner controls for the local MCP server, served to the renderer only (#289). */
+export interface McpSettingsControl {
+  getSettings(): unknown;
+  setEnabled(enabled: boolean): Promise<unknown>;
+  regenerateToken(): Promise<unknown>;
+}
+
 function safeEvidenceOutput(evidence: Evidence): Evidence {
   const safe = sanitizeOutputValue(evidence) as Evidence;
   // Only descriptive summary can change. Bytes and the metadata identifying
@@ -140,9 +172,9 @@ export function registerIpcHandlers(
   rendererPolicy: RendererNavigationPolicyOptions = resolveRendererNavigationPolicy({ isPackaged: false }),
   runtime: {
     automation?: DesktopAutomationService; quota?: AccountQuotaService; signIn?: CodexAccountConnectionService; cliSignIn?: CliAccountConnectionService;
-    models?: ModelCatalogService;
+    models?: ModelCatalogService; mcp?: McpSettingsControl;
   } = {},
-): void {
+): IpcHandlerRegistry {
   const adjService =
     coderSubmissionAdjudicationService ||
     new CoderSubmissionAdjudicationService(repo, repo.getDatabase(), verificationService);
@@ -175,11 +207,9 @@ export function registerIpcHandlers(
     return trashRejection(record.projectId ?? record.expectedProjectId, taskId);
   };
 
+  const fencedHandlers = new Map<string, (event: unknown, payload: unknown) => Promise<unknown>>();
   const registerPrivilegedHandler = (channel: string, handler: PrivilegedIpcHandler): void => {
-    ipcMain.handle(channel, async (event, payload) => {
-      if (!isTrustedIpcSender(event, rendererPolicy)) {
-        throw new IpcSenderTrustError();
-      }
+    const run = async (event: unknown, payload: unknown): Promise<unknown> => {
       if (trashFencedChannels.has(channel)) {
         const rejected = trashFence(payload);
         if (rejected) return rejected;
@@ -190,23 +220,23 @@ export function registerIpcHandlers(
         if (error instanceof OutputSanitizationError) throw new OutputSanitizationError(error.code);
         throw sanitizedDiagnosticError(error);
       }
+    };
+    fencedHandlers.set(channel, run);
+    ipcMain.handle(channel, async (event, payload) => {
+      if (!isTrustedIpcSender(event, rendererPolicy)) {
+        throw new IpcSenderTrustError();
+      }
+      return run(event, payload);
     });
   };
   const capabilityApprovalsInProgress = new Set<string>();
   // ==========================================
   // Trusted Repository Selection Dialog
   // ==========================================
-  registerPrivilegedHandler('dialog:selectRepository', async () => {
-    const { canceled, filePaths } = await dialog.showOpenDialog({
-      properties: ['openDirectory'],
-    });
-
-    if (canceled || filePaths.length === 0) {
-      return { success: false, cancelled: true };
-    }
-
+  // The same checks for a directory the owner picked or the MCP caller named (#289).
+  const selectRepository = async (chosenPath: string) => {
     try {
-      const rootIdentity = captureRepositoryRoot(filePaths[0]);
+      const rootIdentity = captureRepositoryRoot(chosenPath);
       const selectedPath = rootIdentity.canonicalPath;
 
       // Validate path against security policy
@@ -233,7 +263,7 @@ export function registerIpcHandlers(
       }
 
       // Issue short-lived, single-use selection token
-      const token = RepositorySelectionService.issueToken(filePaths[0], rootIdentity);
+      const token = RepositorySelectionService.issueToken(chosenPath, rootIdentity);
 
       return {
         success: true,
@@ -244,6 +274,16 @@ export function registerIpcHandlers(
       if (!(error instanceof RepositoryRootError)) throw error;
       return { success: false, errorCode: error.code, errorDetail: error.message, error: error.message };
     }
+  };
+  registerPrivilegedHandler('dialog:selectRepository', async () => {
+    const { canceled, filePaths } = await dialog.showOpenDialog({
+      properties: ['openDirectory'],
+    });
+
+    if (canceled || filePaths.length === 0) {
+      return { success: false, cancelled: true };
+    }
+    return selectRepository(filePaths[0]);
   });
 
   // ==========================================
@@ -812,7 +852,7 @@ export function registerIpcHandlers(
     return { success: true, commands };
   });
 
-  registerPrivilegedHandler('verification:saveCommands', async (_, payload: unknown) => {
+  registerPrivilegedHandler('verification:saveCommands', async (event, payload: unknown) => {
     const parsed = SaveVerificationCommandsIpcSchema.safeParse(payload);
     if (!parsed.success) {
       return { success: false, error: parsed.error.issues.map((i) => i.message).join(', ') };
@@ -848,17 +888,21 @@ export function registerIpcHandlers(
         }
       }
       // Only a native backend dialog can grant approval. Renderer fields never
-      // authorize a command, even when the sender frame is trusted.
-      const decision = await dialog.showMessageBox({
-        type: 'warning', title: 'Approve verification capabilities',
-        message: `Save verification commands for ${project.name}?`,
-        detail: `These commands run with your OS permissions. Approval binds the displayed executable, files and exact arguments.\n\n${JSON.stringify({
-          project_root: project.repository_path,
-          commands: Object.fromEntries(types.filter((type) => type in parsed.data.commands).map((type) => [type, proposals[type] ?? null])),
-        }, null, 2)}`,
-        buttons: ['Approve', 'Cancel'], defaultId: 1, cancelId: 1, noLink: true,
-      });
-      if (decision.response !== 0) throw new VerificationCapabilityError('OWNER_APPROVAL_REQUIRED');
+      // authorize a command, even when the sender frame is trusted. The local MCP
+      // caller acts on the owner's explicit delegation (enabling the server), and
+      // its CLI agent can already run commands on this machine (#289).
+      if (!isMcpCaller(event)) {
+        const decision = await dialog.showMessageBox({
+          type: 'warning', title: 'Approve verification capabilities',
+          message: `Save verification commands for ${project.name}?`,
+          detail: `These commands run with your OS permissions. Approval binds the displayed executable, files and exact arguments.\n\n${JSON.stringify({
+            project_root: project.repository_path,
+            commands: Object.fromEntries(types.filter((type) => type in parsed.data.commands).map((type) => [type, proposals[type] ?? null])),
+          }, null, 2)}`,
+          buttons: ['Approve', 'Cancel'], defaultId: 1, cancelId: 1, noLink: true,
+        });
+        if (decision.response !== 0) throw new VerificationCapabilityError('OWNER_APPROVAL_REQUIRED');
+      }
       for (const type of types) {
         const proposal = proposals[type];
         if (!proposal) continue;
@@ -1606,4 +1650,28 @@ export function registerIpcHandlers(
       return { success: false, error: scrubbed.code, message: scrubbed.message };
     }
   });
+  // Local MCP server settings (#289): renderer only, never invokable over MCP.
+  registerPrivilegedHandler('mcp:getSettings', async () => {
+    if (!runtime.mcp) return { success: false, errorCode: 'MCP_UNAVAILABLE' };
+    return { success: true, settings: runtime.mcp.getSettings() };
+  });
+  registerPrivilegedHandler('mcp:setEnabled', async (_, payload: unknown) => {
+    const enabled = payload && typeof payload === 'object' ? (payload as { enabled?: unknown }).enabled : undefined;
+    if (!runtime.mcp) return { success: false, errorCode: 'MCP_UNAVAILABLE' };
+    if (typeof enabled !== 'boolean') return { success: false, errorCode: 'INVALID_INPUT' };
+    return runtime.mcp.setEnabled(enabled);
+  });
+  registerPrivilegedHandler('mcp:regenerateToken', async () => {
+    if (!runtime.mcp) return { success: false, errorCode: 'MCP_UNAVAILABLE' };
+    return runtime.mcp.regenerateToken();
+  });
+
+  return {
+    invoke: async (channel, payload) => {
+      const run = MCP_INVOKABLE_CHANNELS.has(channel) ? fencedHandlers.get(channel) : undefined;
+      if (!run) throw new Error(`MCP_CHANNEL_NOT_ALLOWED: ${channel}`);
+      return run(MCP_CALLER_EVENT, payload);
+    },
+    selectRepositoryPath: (repositoryPath) => selectRepository(repositoryPath),
+  };
 }
