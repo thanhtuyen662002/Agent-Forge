@@ -56,6 +56,20 @@ function fileIdentity(stat: fs.BigIntStats, pathComparison = false): string {
 }
 
 /** Reject aliases before opening, then retain descriptor identity while hashing. */
+/** Removes a tree without ever entering a link: a symlink or junction is removed itself. */
+function removeTreeWithoutFollowingLinks(target: string): void {
+  const stat = fs.lstatSync(target, { throwIfNoEntry: false });
+  if (!stat) return;
+  if (stat.isSymbolicLink()) {
+    try { fs.unlinkSync(target); } catch { fs.rmdirSync(target); }
+  } else if (stat.isDirectory()) {
+    for (const entry of fs.readdirSync(target)) removeTreeWithoutFollowingLinks(path.join(target, entry));
+    fs.rmdirSync(target);
+  } else {
+    fs.unlinkSync(target);
+  }
+}
+
 function canonicalPath(candidate: string, directory: boolean): { path: string; identity: string } {
   if (typeof candidate !== 'string' || !path.isAbsolute(candidate) || candidate.length > 4096 || /[\u0000-\u001f\u007f]/.test(candidate)) {
     throw new VerificationCapabilityError('INVALID_VERIFICATION_CAPABILITY');
@@ -297,13 +311,30 @@ export class VerificationCapabilityService {
     const selectedIdentity = this.repo.getProjectRepositoryIdentity(projectId);
     const runtimeIdentity = samePath(root, selectedIdentity.canonicalPath) ? selectedIdentity : captureRepositoryRoot(root);
     this.validate(captured, projectId, executable, capturedArgs, root, authorizationId);
-    // Windows process creation fills an omitted USERPROFILE from the host.
-    // Explicit empty values prevent ambient profile/config inheritance.
+    // Windows process creation fills an omitted USERPROFILE from the host, and an
+    // empty one makes os.homedir() fail (VidFlow M1, #314). Each boundary gets a
+    // fresh, empty profile of its own, so nothing of the owner's profile is inherited.
+    const temp = fs.realpathSync.native(os.tmpdir());
+    const profile = path.join(temp, 'agent-forge-verification', crypto.randomUUID());
     const environment: Record<string, string> = {
       LANG: 'C.UTF-8', LC_ALL: 'C.UTF-8',
-      USERPROFILE: '', HOME: '', APPDATA: '', LOCALAPPDATA: '',
+      USERPROFILE: profile, HOME: profile,
+      APPDATA: path.join(profile, 'AppData', 'Roaming'), LOCALAPPDATA: path.join(profile, 'AppData', 'Local'),
     };
-    const temp = fs.realpathSync.native(os.tmpdir());
+    let profileUsers = 0;
+    const openProfile = () => {
+      if (profileUsers === 0) {
+        fs.mkdirSync(environment.APPDATA, { recursive: true });
+        fs.mkdirSync(environment.LOCALAPPDATA, { recursive: true });
+      }
+      profileUsers += 1;
+    };
+    const closeProfile = () => {
+      profileUsers -= 1;
+      if (profileUsers === 0) {
+        try { removeTreeWithoutFollowingLinks(profile); } catch { /* Best effort: it lies under the temp directory. */ }
+      }
+    };
     environment.TEMP = temp;
     environment.TMP = temp;
     if (process.platform === 'win32') {
@@ -322,16 +353,25 @@ export class VerificationCapabilityService {
     return issueVerificationProcessBoundary(environment, assertInvocation, (actualExecutable, actualArgs, cwd) => {
       const selected = RepositoryRootLease.acquire(selectedIdentity);
       let runtimeLease: RepositoryRootLease | undefined;
+      let profileOpen = false;
       try {
         runtimeLease = runtimeIdentity === selectedIdentity ? selected : RepositoryRootLease.acquire(runtimeIdentity);
         assertInvocation(actualExecutable, actualArgs, cwd);
         selected.assertActive();
         runtimeLease.assertActive();
+        openProfile();
+        profileOpen = true;
         const invocation = runtimeLease;
+        let closed = false;
         return { cwd: invocation.cwd,
           assertActive: () => { selected.assertActive(); invocation.assertActive(); },
-          close: () => { invocation.close(); selected.close(); } };
+          close: () => {
+            if (closed) return;
+            closed = true;
+            try { invocation.close(); selected.close(); } finally { closeProfile(); }
+          } };
       } catch (error) {
+        if (profileOpen) closeProfile();
         runtimeLease?.close(); selected.close(); throw error;
       }
     });

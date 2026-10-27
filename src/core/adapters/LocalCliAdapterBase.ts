@@ -974,6 +974,9 @@ function localCliSynchronizeWorkspace(lease: LocalCliWorkspaceLease): void {
   }
 }
 
+/** How long one CLI run (coder, reviewer or Manager) may take before it is stopped. */
+export const DEFAULT_CLI_RUN_TIMEOUT_MS = 20 * 60_000;
+
 export interface LocalCliAdapterOptions {
   executable?: string;
   timeoutMs?: number;
@@ -998,7 +1001,9 @@ export abstract class LocalCliAdapterBase implements ProviderAdapter {
 
   constructor(options?: LocalCliAdapterOptions) {
     this.executable = options?.executable || this.getDefaultExecutable();
-    this.timeoutMs = options?.timeoutMs ?? 120000;
+    // Two minutes cut off ordinary coding runs (VidFlow M1: Codex runs took up to
+    // 1m50s and the next one timed out), so CLI runs get as long as Antigravity (#314).
+    this.timeoutMs = options?.timeoutMs ?? DEFAULT_CLI_RUN_TIMEOUT_MS;
     this.useStdin = options?.useStdin ?? true;
     this.env = options?.env;
     this.repo = options?.repo;
