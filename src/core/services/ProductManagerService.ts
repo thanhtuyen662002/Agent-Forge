@@ -10,7 +10,7 @@ import { ProtocolParser } from '../protocol/parser';
 import { createProductLeaseRecoveryMarkerEvent, createProductLeaseRecoveryResolvedEvent } from './ProductLeaseRecoveryScanner';
 import type { AgentExecutionResult, RuntimeExecutionBinding } from '../adapters/ProviderAdapter';
 import type { AccountLease, Project, Task } from '../types/domain';
-import type { ManagerProtocol, PlanProtocol } from '../types/protocols';
+import { MAX_PLAN_TASKS, type ManagerProtocol, type PlanProtocol } from '../types/protocols';
 import { contractSha256, parsePlanProtocol, validateContextPaths } from '../protocol/planProtocol';
 
 /** Marks Manager attempts so restart recovery only touches automated Manager calls. */
@@ -635,7 +635,7 @@ export class ProductManagerService {
       ...list('Definition of done', contract.definition_of_done),
       ...list('Non-goal', contract.non_goals),
       ...list('Owner policy', contract.owner_policies),
-      'Each task needs a short title, a description and at least one acceptance criterion. Use at most 20 tasks.',
+      `Each task needs a short title, a description and at least one acceptance criterion. Use at most ${MAX_PLAN_TASKS} tasks.`,
       // Found in the fourth real trial: a tests-only task could not see the code task's changes.
       // Sequential only with automatic integration and one task at a time (#295, #306).
       ...(this.repo.getProjectAutoIntegrate(project.id) && this.repo.getProjectParallelTasks(project.id) === 1
