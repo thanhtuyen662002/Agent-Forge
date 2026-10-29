@@ -462,7 +462,9 @@ function buildValidObservation(
   };
 }
 
-describe('R5H4 Durable Provider Health Observation Contract', () => {
+// File-backed migrations and worktree cases took 31-37 s on hosted Windows runners and
+// timed out at the 30 s default on PR #319 (#322).
+describe('R5H4 Durable Provider Health Observation Contract', { timeout: 120_000 }, () => {
   let tempBaseDir: string;
   let repoDir: string;
   let managedDir: string;
