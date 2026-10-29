@@ -141,9 +141,9 @@ describe('local MCP server (#289)', () => {
   it('configures the verification environment through the existing handler (#336)', async () => {
     await server.setEnabled(true);
     replies['verification:setEnvironment'] = { success: true, env: { VIDFLOW_FFMPEG: 'C:/ffmpeg.exe' }, installDependencies: true };
-    expect((await call('configure_verification', { projectId: 'PROJ-1', installDependencies: true, env: { VIDFLOW_FFMPEG: 'C:/ffmpeg.exe' } })).isError).toBe(false);
+    expect((await call('configure_verification', { projectId: 'PROJ-1', installDependencies: true, testTimeoutSeconds: 480, env: { VIDFLOW_FFMPEG: 'C:/ffmpeg.exe' } })).isError).toBe(false);
     expect(calls).toEqual([{ channel: 'verification:setEnvironment',
-      payload: { projectId: 'PROJ-1', installDependencies: true, env: { VIDFLOW_FFMPEG: 'C:/ffmpeg.exe' } } }]);
+      payload: { projectId: 'PROJ-1', installDependencies: true, testTimeoutSeconds: 480, env: { VIDFLOW_FFMPEG: 'C:/ffmpeg.exe' } } }]);
   });
 
   it('reads and sets a task context through the existing handlers (#324)', async () => {

@@ -272,6 +272,7 @@ export const MCP_TOOLS: readonly McpToolDefinition[] = [
       properties: {
         projectId: str('Project ID.'),
         installDependencies: { type: 'boolean' },
+        testTimeoutSeconds: { type: 'integer', minimum: 10, maximum: 600, description: 'How long one test run may take (default 120).' },
         env: { type: 'object', additionalProperties: { type: 'string' }, description: 'Variable name to value; replaces the whole set.' },
       },
       required: ['projectId'],
@@ -281,6 +282,7 @@ export const MCP_TOOLS: readonly McpToolDefinition[] = [
       return expectSuccess(await registry.invoke('verification:setEnvironment', {
         projectId: text(args, 'projectId'),
         ...(args.installDependencies !== undefined ? { installDependencies: args.installDependencies } : {}),
+        ...(args.testTimeoutSeconds !== undefined ? { testTimeoutSeconds: args.testTimeoutSeconds } : {}),
         ...(args.env !== undefined ? { env: args.env } : {}),
       }));
     },
