@@ -406,6 +406,45 @@ export class Repository {
   }
 
   /** How many of the project's tasks coders may work on at once (#306); 1 when unset. */
+  /** Owner-set variables added to project verification (#336); validated on write. */
+  public getProjectVerificationEnv(projectId: string): Record<string, string> {
+    const row = this.db
+      .prepare('SELECT value_json FROM project_settings WHERE project_id = ? AND key = ?')
+      .get(projectId, 'verification.env') as { value_json?: unknown } | undefined;
+    try {
+      const value = typeof row?.value_json === 'string' ? JSON.parse(row.value_json) : {};
+      return value && typeof value === 'object' && !Array.isArray(value)
+        ? Object.fromEntries(Object.entries(value).filter((entry): entry is [string, string] => typeof entry[1] === 'string'))
+        : {};
+    } catch {
+      return {};
+    }
+  }
+
+  public setProjectVerificationEnv(projectId: string, env: Record<string, string>): void {
+    if (!this.getProject(projectId)) throw new Error(`Project "${projectId}" not found.`);
+    this.db.prepare(`
+      INSERT INTO project_settings (project_id, key, value_json) VALUES (?, 'verification.env', ?)
+      ON CONFLICT(project_id, key) DO UPDATE SET value_json = excluded.value_json
+    `).run(projectId, JSON.stringify(env));
+  }
+
+  /** Whether verification installs the project's locked npm dependencies first (#336); off unless the owner opts in. */
+  public getProjectInstallDependencies(projectId: string): boolean {
+    const row = this.db
+      .prepare('SELECT value_json FROM project_settings WHERE project_id = ? AND key = ?')
+      .get(projectId, 'verification.install_dependencies') as { value_json?: unknown } | undefined;
+    return row?.value_json === 'true';
+  }
+
+  public setProjectInstallDependencies(projectId: string, enabled: boolean): void {
+    if (!this.getProject(projectId)) throw new Error(`Project "${projectId}" not found.`);
+    this.db.prepare(`
+      INSERT INTO project_settings (project_id, key, value_json) VALUES (?, 'verification.install_dependencies', ?)
+      ON CONFLICT(project_id, key) DO UPDATE SET value_json = excluded.value_json
+    `).run(projectId, enabled ? 'true' : 'false');
+  }
+
   public getProjectParallelTasks(projectId: string): number {
     const row = this.db
       .prepare('SELECT value_json FROM project_settings WHERE project_id = ? AND key = ?')

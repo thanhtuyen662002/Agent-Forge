@@ -319,6 +319,22 @@ describe('issued capability process boundary', () => {
     expect(boundary.environment).not.toHaveProperty('NODE_OPTIONS');
   });
 
+  it('adds the owner-set project variables to the boundary environment, and nothing that fails validation (#336)', async () => {
+    const script = path.join(root, 'tool-env.js');
+    fs.writeFileSync(script, "process.stdout.write(JSON.stringify({tool:process.env.VIDFLOW_FFMPEG??null,path:process.env.PATH}));");
+    repo.setProjectVerificationEnv('P', { VIDFLOW_FFMPEG: 'C:\\Tools\\ffmpeg.exe' });
+    let { payload, boundary } = await approve(['tool-env.js']);
+    let result = await ProcessRunner.execute({ executable: payload.executable.path, args: payload.args, cwd: root, timeoutMs: 10000, verificationBoundary: boundary });
+    expect(JSON.parse(result.stdout)).toEqual({ tool: 'C:\\Tools\\ffmpeg.exe', path: boundary.environment.PATH });
+
+    // A stored set that no longer validates (here it would replace PATH) adds nothing at all.
+    repo.setProjectVerificationEnv('P', { VIDFLOW_FFMPEG: 'C:\\Tools\\ffmpeg.exe', PATH: 'C:\\evil' });
+    ({ payload, boundary } = await approve(['tool-env.js']));
+    result = await ProcessRunner.execute({ executable: payload.executable.path, args: payload.args, cwd: root, timeoutMs: 10000, verificationBoundary: boundary });
+    expect(JSON.parse(result.stdout).tool).toBeNull();
+    expect(boundary.environment.PATH).not.toBe('C:\\evil');
+  });
+
   it.runIf(process.platform === 'win32')('holds the selected native root through an actual running verification child and releases it only after exit', async () => {
     const started = path.join(root, 'child-started');
     const release = path.join(root, 'release-child');

@@ -265,6 +265,27 @@ export const MCP_TOOLS: readonly McpToolDefinition[] = [
     },
   },
   {
+    name: 'configure_verification',
+    description: 'Project test environment (#336): installDependencies runs npm ci for the locked dependencies before tests (into a shared folder beside the worktrees); env adds plain variables such as tool paths (e.g. VIDFLOW_FFMPEG). Credential-like and process-steering names are refused.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        projectId: str('Project ID.'),
+        installDependencies: { type: 'boolean' },
+        env: { type: 'object', additionalProperties: { type: 'string' }, description: 'Variable name to value; replaces the whole set.' },
+      },
+      required: ['projectId'],
+      additionalProperties: false,
+    },
+    async run(args, registry) {
+      return expectSuccess(await registry.invoke('verification:setEnvironment', {
+        projectId: text(args, 'projectId'),
+        ...(args.installDependencies !== undefined ? { installDependencies: args.installDependencies } : {}),
+        ...(args.env !== undefined ? { env: args.env } : {}),
+      }));
+    },
+  },
+  {
     name: 'retry_task',
     description: 'Retry a task in NEEDS_HUMAN (it used all its revisions) with 3 more revisions, or a CODING task whose coder runs all failed (automation phase FAILED); the Manager first reads why the last revision failed.',
     inputSchema: {
