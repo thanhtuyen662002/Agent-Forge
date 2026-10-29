@@ -795,9 +795,7 @@ export class DesktopAutomationService {
   private verificationReason(taskId: string): string | null {
     const task = this.repo.getTask(taskId);
     if (!task) return null;
-    const latest = this.repo.getEventsByProject(task.project_id)
-      .filter((event) => event.task_id === taskId &&
-        [VERIFICATION_PASSED_EVENT, VERIFICATION_FAILED_EVENT, VERIFICATION_SKIPPED_EVENT].includes(event.type))
+    const latest = this.repo.getProjectEventsOfTypes(task.project_id, [VERIFICATION_PASSED_EVENT, VERIFICATION_FAILED_EVENT, VERIFICATION_SKIPPED_EVENT], taskId)
       .sort((a, b) => b.timestamp.localeCompare(a.timestamp))[0];
     if (!latest) return null;
     if (latest.type === VERIFICATION_PASSED_EVENT) return 'VERIFIED';

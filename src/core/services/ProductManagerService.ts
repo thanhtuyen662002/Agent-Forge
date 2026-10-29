@@ -710,8 +710,7 @@ export class ProductManagerService {
     const previous = task.revision_count - 1;
     const revisionOf = (authorizationId: unknown) =>
       typeof authorizationId === 'string' ? this.repo.getExecutionAuthorization(authorizationId)?.task_revision ?? null : null;
-    const events = this.repo.getEventsByProject(task.project_id)
-      .filter((event) => event.task_id === task.id)
+    const events = this.repo.getAllProjectEvents(task.project_id, task.id)
       .sort((a, b) => b.timestamp.localeCompare(a.timestamp));
     const lines: string[] = [];
     // A BLOCKED review also sends the task back (#308), so its notes count too (#312).

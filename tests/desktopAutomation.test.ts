@@ -710,6 +710,18 @@ describe('desktop automation runtime', () => {
       expect(after.revision_count).toBe(task.revision_count + 1);
     }, 60_000);
 
+    it('still sees an old verdict after more than 100 newer project events (#320)', async () => {
+      const task = await approvedTask();
+      db.prepare("UPDATE tasks SET state = 'REVIEWING' WHERE id = ?").run(task.id);
+      events.record(projectId, 'AUTOMATION_REVIEW_BLOCKED', 'Automated review: BLOCKED.', { verdict: 'BLOCKED' }, task.id);
+      for (let index = 0; index < 150; index += 1) events.record(projectId, 'FIXTURE_NOISE', `Noise ${index}`, {}, null);
+      expect(repo.getEventsByProject(projectId).some((e) => e.type === 'AUTOMATION_REVIEW_BLOCKED')).toBe(false); // Outside the display window.
+      service = reviewingService();
+      await service.tick();
+      await service.drain();
+      expect(repo.getTask(task.id)).toMatchObject({ state: 'CODING', revision_count: task.revision_count + 1 });
+    }, 60_000);
+
     it('sends a BLOCKED verdict back to the coder at the next revision instead of stalling in REVIEWING (#308)', async () => {
       reviewReply = verdict('BLOCKED');
       const { task } = await runToReview();
