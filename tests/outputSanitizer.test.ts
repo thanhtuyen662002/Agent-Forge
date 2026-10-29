@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import { OUTPUT_MAX_STRUCTURE_DEPTH, OUTPUT_MAX_STRUCTURE_NODES, OUTPUT_MAX_TEXT_CHARACTERS,
-  OutputSanitizationError, redactSensitiveText, REDACTED_SECRET, sanitizeOutputValue } from '../src/shared/security/secretRedaction';
+  OutputSanitizationError, redactJsonLines, redactSensitiveText, REDACTED_JSON_LINE, REDACTED_SECRET, sanitizeOutputValue } from '../src/shared/security/secretRedaction';
 
 // Every credential-shaped value is synthetic. Failures report labels/booleans
 // rather than original values; the protected test runner remains mandatory.
@@ -71,6 +71,24 @@ describe('bounded shared output sanitizer', () => {
     '%70%61%73%73%77%6f%72%64%3d%5bREDACTED_SECRET%5d' + opaque,
   ])('rejects unbounded credential members or an incomplete marker %# with a fixed error', text => {
     expect(() => redactSensitiveText(text)).toThrow('OUTPUT_REDACTION_UNSAFE: Durable output could not be sanitized safely.');
+  });
+
+  it('drops only the unsafe events of a JSONL stream and keeps the rest (#326)', () => {
+    const unsafe = JSON.stringify({ type: 'item.completed', item: { type: 'command_execution', aggregated_output: 'export const auth = {\n  first: "' + opaque + '",\n  second: "x"\n};' } });
+    const report = JSON.stringify({ type: 'item.completed', item: { type: 'agent_message', text: '{"protocol":"coder.v1","status":"COMPLETED"}' } });
+    const scalar = JSON.stringify({ type: 'item.completed', item: { type: 'agent_message', text: 'password=' + opaque } });
+    expect(() => redactSensitiveText([unsafe, report].join('\n'))).toThrow('OUTPUT_REDACTION_UNSAFE');
+    const safe = redactJsonLines(['{"type":"thread.started"}', unsafe, '', scalar, report].join('\n'))!;
+    expect(safe.split('\n')).toEqual(['{"type":"thread.started"}', REDACTED_JSON_LINE, '', expect.stringContaining(REDACTED_SECRET), report]);
+    expect(safe.includes(opaque)).toBe(false);
+  });
+
+  it.each([
+    ['plain text', 'export const auth = {\n  first: "' + opaque + '"\n};'],
+    ['a non-object JSON line', '["auth={"]\n' + JSON.stringify({ type: 'x' })],
+    ['a multi-line JSON value', '{"auth": {\n"first": "' + opaque + '"}}'],
+  ])('keeps failing closed for %s (#326)', (_name, text) => {
+    expect(redactJsonLines(text)).toBeNull();
   });
 
   it('redacts sensitive structured keys including encoded/camel-case names without mutating input', () => {

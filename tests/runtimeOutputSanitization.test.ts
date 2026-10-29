@@ -124,6 +124,20 @@ describe('real process output and durable observation sanitization', () => {
     }
   });
 
+  it('completes a JSONL stream whose unsafe event is dropped alone (#326)', async () => {
+    const unsafe = JSON.stringify({ type: 'item.completed', item: { aggregated_output: 'api_key:{first:"' + secret + '",second:"x"}' } });
+    const report = JSON.stringify({ type: 'item.completed', item: { type: 'agent_message', text: 'coder report' } });
+    const result = await ProcessRunner.execute({ executable: process.execPath, args: [script(unsafe + '\n' + report + '\n')],
+      cwd: root, repo, artifactStore: artifacts, projectId: 'runtime-output-project' });
+    expect(result.errorCode ?? null).toBeNull();
+    expect(result.exitCode).toBe(0);
+    expect(result.stdout.includes(secret)).toBe(false);
+    expect(result.stdout).toContain('agent_forge.redacted');
+    expect(result.stdout).toContain(report);
+    expect(repo.getProcessRun(result.executionId).status).toBe('COMPLETED');
+    assertEvidence(result.stdoutEvidenceId, result.stdout);
+  });
+
   it('retries a durable fence without converting unsafe zero-exit output into COMPLETED', async () => {
     const update = vi.spyOn(repo, 'updateProcessRun').mockImplementationOnce(() => { throw new Error('password=' + secret); });
     let rejected = false;
