@@ -59,7 +59,7 @@ across restarts.
 | `list_events` | Returns the latest events, newest last |
 | `integrate_reviewed_work` | Integrates one task's reviewed work now |
 | `decide_manager_proposal` | Approves or rejects a Manager proposal in `APPROVE` mode |
-| `retry_task` | Retries a `NEEDS_HUMAN` task with 3 more revisions (#318) |
+| `retry_task` | Retries a `NEEDS_HUMAN` task with 3 more revisions, or a `CODING` task whose coder runs all failed (#318) |
 
 Every tool calls the same main-process handler as the desktop UI. Validation,
 the trash fence and output sanitization are therefore identical. A handler

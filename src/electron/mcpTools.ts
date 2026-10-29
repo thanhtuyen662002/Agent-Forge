@@ -266,7 +266,7 @@ export const MCP_TOOLS: readonly McpToolDefinition[] = [
   },
   {
     name: 'retry_task',
-    description: 'Retry a task in NEEDS_HUMAN (it used all its revisions) with 3 more revisions; the Manager first reads why the last revision failed.',
+    description: 'Retry a task in NEEDS_HUMAN (it used all its revisions) with 3 more revisions, or a CODING task whose coder runs all failed (automation phase FAILED); the Manager first reads why the last revision failed.',
     inputSchema: {
       type: 'object',
       properties: { projectId: str('Project ID.'), taskId: str('Task ID.') },

@@ -1056,7 +1056,7 @@ export function registerIpcHandlers(
   registerPrivilegedHandler('task:retry', async (_, payload: unknown) => {
     const target = readIntegrationTarget(payload);
     if (!target) return { success: false, errorCode: 'TASK_NOT_FOUND' };
-    const result = taskService.retryNeedsHumanTask(target.projectId, target.taskId);
+    const result = taskService.retryTask(target.projectId, target.taskId);
     if (result.success) void runtime.automation?.tick();
     return sanitizeOutputValue(result);
   });

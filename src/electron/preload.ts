@@ -77,6 +77,8 @@ export interface OrchestratorApi {
   getAutoIntegrate: (projectId: string) => Promise<any>;
   setAutoIntegrate: (projectId: string, enabled: boolean) => Promise<any>;
   mergeIntegration: (projectId: string, taskId: string) => Promise<any>;
+  /** Owner retry of a NEEDS_HUMAN task, or of a coding task whose coder retries ran out (#318). */
+  retryTask: (projectId: string, taskId: string) => Promise<any>;
   getMcpSettings: () => Promise<any>;
   getParallelTasks: (projectId: string) => Promise<any>;
   setParallelTasks: (projectId: string, parallelTasks: number) => Promise<any>;

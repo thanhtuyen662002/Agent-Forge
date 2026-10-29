@@ -218,6 +218,8 @@ export const enUS: TranslationDictionary = {
     retryHint: 'It used all its revisions. Retry gives it {count} more: the Manager first reads why the last revision failed.',
     retryButton: 'Retry with {count} more revisions',
     retryFailed: 'The task could not be retried ({code}).',
+    retryCoderHint: 'The coder runs of this revision failed and automation stopped retrying. Retry lets the coders try again.',
+    retryCoderButton: 'Retry the coder',
     noTaskSelected: 'No task selected. Return to Task Board.',
     testsComplete: 'Tests Complete: {passed} Passed, {failed} Failed (Exit Code {exitCode}).',
     testsFailed: 'Verification failed: {passed} Passed, {failed} Failed (Exit Code {exitCode}).',

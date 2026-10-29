@@ -369,6 +369,28 @@ describe('desktop automation runtime', () => {
     expect(adapterCalls).toBe(3);
   }, 180_000);
 
+  it.runIf(process.platform === 'win32')('lets the owner retry a coding task whose coder retries ran out (#318)', async () => {
+    verify(addCodexCoder());
+    const task = await approvedTask();
+    let clock = Date.now();
+    service = new DesktopAutomationService(repo, events, registry, {
+      worktreeRoot: path.join(tempDir, 'worktrees'), timer: fakeTimer, now: () => new Date(clock).toISOString() });
+    coderFailures = 3;
+    for (let i = 0; i < 4; i += 1) { await service.tick(); await service.drain(); clock += 61_000; }
+    expect(adapterCalls).toBe(3);
+    expect(statusOf()).toMatchObject({ phase: 'FAILED', taskId: task.id });
+
+    expect(tasks.retryTask(projectId, task.id)).toMatchObject({ success: true, task: { state: 'CODING', revision_count: task.revision_count } });
+    // The service clock runs ahead of real time here; the retry happens on it.
+    db.prepare("UPDATE events SET timestamp = ? WHERE type = 'OWNER_TASK_RETRIED'").run(new Date(clock).toISOString());
+    clock += 1_000;
+    await service.tick(); await service.drain();
+    expect(adapterCalls).toBe(4); // The coder runs again; this time it succeeds.
+    expect(statusOf()).toMatchObject({ phase: 'AWAITING_REVIEW', taskId: task.id });
+    // A task with a completed run is not retried.
+    expect(tasks.retryTask(projectId, task.id)).toMatchObject({ success: false, errorCode: 'TASK_NOT_RETRYABLE' });
+  }, 180_000);
+
   it.runIf(process.platform === 'win32')('runs the real product chain once and then waits for review', async () => {
     verify(addCodexCoder());
     const task = await approvedTask();
@@ -793,12 +815,12 @@ describe('desktop automation runtime', () => {
       const { task } = await runToReview((taskId) => { db.prepare('UPDATE tasks SET max_revisions = 1 WHERE id = ?').run(taskId); });
       const stuck = repo.getTask(task.id)!;
       expect(stuck).toMatchObject({ state: 'NEEDS_HUMAN', revision_count: 1, max_revisions: 1 });
-      expect(tasks.retryNeedsHumanTask('PROJ-OTHER', task.id)).toMatchObject({ success: false, errorCode: 'TASK_NOT_FOUND' });
+      expect(tasks.retryTask('PROJ-OTHER', task.id)).toMatchObject({ success: false, errorCode: 'TASK_NOT_FOUND' });
 
-      const retried = tasks.retryNeedsHumanTask(projectId, task.id);
+      const retried = tasks.retryTask(projectId, task.id);
       expect(retried).toMatchObject({ success: true, task: { state: 'CODING', revision_count: 1, max_revisions: 4 } });
       expect(repo.getEventsByProject(projectId).filter((e) => e.type === 'OWNER_TASK_RETRIED')).toHaveLength(1);
-      expect(tasks.retryNeedsHumanTask(projectId, task.id)).toMatchObject({ success: false, errorCode: 'TASK_NOT_NEEDS_HUMAN' });
+      expect(tasks.retryTask(projectId, task.id)).toMatchObject({ success: false, errorCode: 'TASK_NOT_RETRYABLE' });
 
       addManager();
       await service.tick();
@@ -810,9 +832,9 @@ describe('desktop automation runtime', () => {
     it('never retries a trashed NEEDS_HUMAN task or changes it when a step fails (#318)', async () => {
       reviewReply = verdict('FIX_REQUIRED');
       const { task } = await runToReview((taskId) => { db.prepare('UPDATE tasks SET max_revisions = 1 WHERE id = ?').run(taskId); });
-      expect(tasks.retryNeedsHumanTask(projectId, task.id, 0)).toMatchObject({ success: false, errorCode: 'RETRY_REVISIONS_INVALID' });
+      expect(tasks.retryTask(projectId, task.id, 0)).toMatchObject({ success: false, errorCode: 'RETRY_REVISIONS_INVALID' });
       db.prepare('UPDATE tasks SET ownership_epoch = 0 WHERE id = ?').run(task.id); // An invalid epoch makes the transition binding fail.
-      expect(tasks.retryNeedsHumanTask(projectId, task.id)).toMatchObject({ success: false });
+      expect(tasks.retryTask(projectId, task.id)).toMatchObject({ success: false });
       expect(repo.getTask(task.id)).toMatchObject({ state: 'NEEDS_HUMAN', max_revisions: 1 }); // Rolled back.
     }, 120_000);
 

@@ -218,6 +218,8 @@ export const viVN: TranslationDictionary = {
     retryHint: 'Task đã dùng hết số lần sửa. Chạy lại sẽ cho thêm {count} lần: Manager đọc lý do lần trước hỏng rồi hướng dẫn coder.',
     retryButton: 'Chạy lại, thêm {count} lần sửa',
     retryFailed: 'Không chạy lại được task ({code}).',
+    retryCoderHint: 'Các lượt chạy của coder ở lần sửa này đều hỏng nên tự động hóa đã ngừng thử. Chạy lại để coder thử tiếp.',
+    retryCoderButton: 'Cho coder chạy lại',
     noTaskSelected: 'Chưa chọn nhiệm vụ nào. Quay lại Bảng Nhiệm vụ.',
     testsComplete: 'Kiểm thử Hoàn tất: {passed} Đạt, {failed} Thất bại (Mã thoát {exitCode}).',
     testsFailed: 'Xác minh thất bại: {passed} Đạt, {failed} Thất bại (Mã thoát {exitCode}).',
